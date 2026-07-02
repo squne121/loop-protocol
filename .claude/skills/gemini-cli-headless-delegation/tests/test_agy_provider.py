@@ -58,6 +58,30 @@ def _agy_request(**kwargs: Any) -> dict[str, Any]:
     return base
 
 
+def _write_serena_manifest(root: Path, pinned_ref: str = "0123456789abcdef") -> None:
+    manifest_path = root / rgh.SERENA_TOOL_MANIFEST_RELATIVE_PATH
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "schema": "serena_tool_manifest_v1",
+        "source": "https://github.com/oraios/serena",
+        "pinned_ref": pinned_ref,
+        "generated_at_utc": "2026-07-02T00:00:00Z",
+        "mcp_command": [
+            "uvx",
+            "--from",
+            f"git+https://github.com/oraios/serena@{pinned_ref}",
+            "serena",
+        "start-mcp-server",
+        "--project-from-cwd",
+        ],
+        "read_only_allowlist": sorted(rgh.SERENA_READ_ONLY_TOOLS),
+        "dangerous_denylist": sorted(rgh.SERENA_DANGEROUS_TOOLS),
+        "known_tools": sorted(rgh.SERENA_READ_ONLY_TOOLS | rgh.SERENA_DANGEROUS_TOOLS),
+        "notes": [],
+    }
+    manifest_path.write_text(__import__("json").dumps(manifest), encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # AC1: no_tools profile — agy returns response text + result.json via wrapper
 # ---------------------------------------------------------------------------
@@ -148,11 +172,156 @@ def test_ac7_agy_grounded_research_rejected() -> None:
 
 
 def test_ac7_agy_local_asset_research_rejected() -> None:
-    """AC7: provider=agy with local_asset_research -> unsupported_provider_profile."""
+    """AC7: provider=agy with local_asset_research requires local_asset_research context files."""
     req = _agy_request(tool_profile="local_asset_research")
-    result = rgh.run_delegation(req)
+    with patch.object(rgh, "_validate_local_asset_research_settings", lambda: []):  # type: ignore[call-arg]
+        result = rgh.run_delegation(req)
     assert result["ok"] is False
-    assert result["failure_class"] == "unsupported_provider_profile"
+    assert result["failure_reason"].startswith("context_files must contain at least 1 item(s)")
+    assert result["failure_class"].startswith("context_files must contain at least 1 item(s)")
+
+
+def test_ac7_agy_local_asset_research_success_with_wrapper_validation(tmp_path, monkeypatch) -> None:
+    """AC7: provider=agy + local_asset_research succeeds after wrapper-side validation."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    context_file = repo_root / "context.md"
+    context_file.write_text("local asset content", encoding="utf-8")
+    _write_serena_manifest(repo_root)
+
+    monkeypatch.setattr(rgh, "_repo_root", lambda: repo_root)  # type: ignore[call-arg]
+    monkeypatch.setattr(rgh, "_validate_local_asset_research_settings", lambda: [])  # type: ignore[call-arg]
+
+    captured_prompt: dict[str, str] = {}
+
+    def _fake_live_evidence(context_paths, root, manifest):
+        return [
+            {
+                "path": "context.md",
+                "content": __import__("json").dumps(
+                    {
+                        "schema": "wrapper_serena_evidence_v1",
+                        "evidence": [
+                            {
+                                "tool_name": "find_file",
+                                "query": {"file_mask": "context.md"},
+                                "repo_relative_path": "context.md",
+                                "line_range": [1, 1],
+                                "content_snippet": "context.md",
+                                "byte_size": 10,
+                                "sha256": "0" * 64,
+                                "redaction_status": "checked_no_credential_pattern",
+                                "manifest_id": "serena_tool_manifest_v1:0123456789abcdef",
+                                "source_kind": "serena_mcp_read_only_evidence",
+                            },
+                            {
+                                "tool_name": "search_for_pattern",
+                                "query": {"substring_pattern": "local_asset_research"},
+                                "repo_relative_path": "context.md",
+                                "line_range": [1, 1],
+                                "content_snippet": "local asset content",
+                                "byte_size": 19,
+                                "sha256": "1" * 64,
+                                "redaction_status": "checked_no_credential_pattern",
+                                "manifest_id": "serena_tool_manifest_v1:0123456789abcdef",
+                                "source_kind": "serena_mcp_read_only_evidence",
+                            },
+                            {
+                                "tool_name": "get_symbols_overview",
+                                "query": {"relative_path": "context.md"},
+                                "repo_relative_path": "context.md",
+                                "line_range": [1, 1],
+                                "content_snippet": "[]",
+                                "byte_size": 2,
+                                "sha256": "2" * 64,
+                                "redaction_status": "checked_no_credential_pattern",
+                                "manifest_id": "serena_tool_manifest_v1:0123456789abcdef",
+                                "source_kind": "serena_mcp_read_only_evidence",
+                            },
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                "evidence": {"source_kind": "serena_mcp_read_only_evidence"},
+            }
+        ]
+
+    def _run_agy(prompt: str, timeout_sec: int = rgh.DEFAULT_TIMEOUT_SEC) -> subprocess.CompletedProcess:
+        captured_prompt["value"] = prompt
+        return _make_completed(0, stdout="LOOP_AGY_SMOKE_OK")
+
+    req = _agy_request(
+        tool_profile="local_asset_research",
+        context_files=["context.md"],
+        prompt="Summarize local repository evidence.",
+    )
+    with patch.object(rgh, "_run_agy", side_effect=_run_agy), patch.object(
+        rgh,
+        "_collect_live_serena_read_only_evidence",
+        side_effect=_fake_live_evidence,
+    ):
+        result = rgh.run_delegation(req, request_path=repo_root / "request.json")
+
+    assert result["ok"] is True
+    assert result["response_text"] == "LOOP_AGY_SMOKE_OK"
+    assert result["provider"] == "agy"
+    assert result["safety_mode"] == "degraded_wrapper_only"
+    assert "AGY is executed in prompt-only wrapper-side evidence mode" in captured_prompt["value"]
+    assert "BEGIN LOCAL ASSET EVIDENCE: context.md" in captured_prompt["value"]
+    assert '"repo_relative_path": "context.md"' in captured_prompt["value"]
+    assert '"source_kind": "serena_mcp_read_only_evidence"' in captured_prompt["value"]
+    assert '"tool_name": "find_file"' in captured_prompt["value"]
+    assert '"tool_name": "search_for_pattern"' in captured_prompt["value"]
+    assert '"tool_name": "get_symbols_overview"' in captured_prompt["value"]
+    assert "wrapper_serena_context_file" not in captured_prompt["value"]
+    assert str(repo_root) not in captured_prompt["value"]
+    assert "mcpServers" not in captured_prompt["value"]
+    assert "Operator objective:" in captured_prompt["value"]
+
+
+def test_ac7_context_file_test_double_does_not_claim_live_serena(tmp_path, monkeypatch) -> None:
+    """AC7: direct context-file fallback evidence must not use live MCP source_kind."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    context_file = repo_root / "context.md"
+    context_file.write_text("local asset content", encoding="utf-8")
+    _write_serena_manifest(repo_root)
+    manifest = rgh.load_serena_tool_manifest(repo_root)
+
+    documents = rgh._collect_serena_read_only_evidence([context_file], repo_root, manifest)
+
+    assert documents
+    assert "serena_mcp_test_double_evidence" in documents[0]["content"]
+    assert "serena_mcp_read_only_evidence" not in documents[0]["content"]
+
+
+def test_ac7_agy_local_asset_research_rejects_context_outside_repo_before_read(tmp_path, monkeypatch) -> None:
+    """AC7: outside-repo local_asset_research context is rejected before payload read."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _write_serena_manifest(repo_root)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+
+    monkeypatch.setattr(rgh, "_repo_root", lambda: repo_root)  # type: ignore[call-arg]
+    monkeypatch.setattr(rgh, "_validate_local_asset_research_settings", lambda: [])  # type: ignore[call-arg]
+
+    original_read_text = Path.read_text
+
+    def guarded_read_text(path: Path, *args: Any, **kwargs: Any) -> str:
+        if path == outside:
+            raise AssertionError("outside repo context must not be read")
+        return original_read_text(path, *args, **kwargs)
+
+    with patch.object(Path, "read_text", guarded_read_text):
+        result = rgh.run_delegation(
+            _agy_request(tool_profile="local_asset_research", context_files=[str(outside)]),
+            request_path=repo_root / "request.json",
+        )
+
+    assert result["ok"] is False
+    assert result["failure_reason"].startswith("local_asset_research context file must be inside repository")
+    assert result["failure_class"] == "local_asset_research context file must be inside repository"
 
 
 def test_ac7_agy_github_research_rejected() -> None:

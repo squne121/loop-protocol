@@ -1,9 +1,4 @@
 {
-  "mcp": {
-    "allowed": [
-      "serena"
-    ]
-  },
   "mcpServers": {
     "serena": {
       "command": "uvx",
