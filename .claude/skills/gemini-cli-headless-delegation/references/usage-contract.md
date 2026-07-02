@@ -104,16 +104,16 @@
 
 AGY prompt に渡す local asset context は、以下を持つ JSON evidence envelope に限定する。
 
-- `tool_name`
-- `query`
-- `repo_relative_path`
-- `line_range`
-- `content_snippet`
-- `byte_size`
-- `sha256`
-- `redaction_status`
-- `manifest_id`
-- `source_kind`
+- `tool_name`: wrapper 側の取得経路名。
+- `query`: 取得対象を示す query または selector。
+- `repo_relative_path`: repo root からの相対パス。
+- `line_range`: evidence の行範囲。
+- `content_snippet`: AGY へ渡す bounded snippet。
+- `byte_size`: snippet の byte 数。
+- `sha256`: snippet 内容の hash。
+- `redaction_status`: credential-like payload 検査の状態。
+- `manifest_id`: Serena contract / manifest の照合元。
+- `source_kind`: wrapper-side evidence であることを示す分類。
 
 上記が未検証 MCP 設定、危険 tool、または Windows wrapper / repo 外読み取りを含む場合、wrapper は fail-closed として `ok: false`、`failure_reason`、`warnings` を返す。曖昧に `grounded_research` へ流用してはならない。
 
