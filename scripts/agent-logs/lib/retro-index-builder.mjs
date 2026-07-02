@@ -287,11 +287,17 @@ function checkPublicObservationSources(payload, markerDigest) {
     } catch (error) {
       return {
         reportDigest: markerDigest ? `sha256:${markerDigest}` : 'sha256:invalid',
-        reason: error?.code === 'observation_source.evidence_mode'
-          ? 'report_observation_sources_evidence_mode'
-          : error?.code === 'observation_source.ref_kind'
-            ? 'report_observation_sources_ref_kind'
-            : 'report_observation_sources_projection_digest_mismatch',
+        reason: (
+          (typeof error?.code === 'string' && error.code.startsWith('observation_source.reason_code'))
+          || error?.code === 'observation_source.reason_codes_too_many'
+          || error?.code === 'observation_source.reason_codes_type'
+        )
+          ? 'report_observation_sources_reason_codes_invalid'
+          : error?.code === 'observation_source.evidence_mode'
+            ? 'report_observation_sources_evidence_mode'
+            : error?.code === 'observation_source.ref_kind'
+              ? 'report_observation_sources_ref_kind'
+              : 'report_observation_sources_projection_digest_mismatch',
       }
     }
 
