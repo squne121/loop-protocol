@@ -7,9 +7,15 @@ Consumed by both worktree_scope_guard.py and local_main_branch_guard.py
 so the two guards never split-brain on which executor commands are allowed.
 
 This module is SEPARATE from the preflight.run policy (run_refinement_preflight.py).
-Command ID: termination_report.publish
+Command IDs: termination_report.publish, issue_body.update, issue_comment.publish,
+contract_snapshot.publish
 
-Issue #1166.
+Issue #1166 (termination_report.publish).
+Issue #1284 extends the same executor lane to issue metadata mutation
+(issue_body.update / issue_comment.publish / contract_snapshot.publish) so that
+these mutations can run from root/default branch without an issue-specific
+worktree. Input file namespace for the new command ids is unified under
+``artifacts/{issue_number}/issue-metadata/{command-id}/``.
 """
 
 from __future__ import annotations
@@ -23,9 +29,33 @@ import shlex
 TRUSTED_REPO = "squne121/loop-protocol"
 EXECUTOR_SCRIPT = "scripts/agent-guards/controlled_skill_mutation_exec.py"
 COMMAND_ID_PUBLISH = "termination_report.publish"
+COMMAND_ID_ISSUE_BODY_UPDATE = "issue_body.update"
+COMMAND_ID_ISSUE_COMMENT_PUBLISH = "issue_comment.publish"
+COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH = "contract_snapshot.publish"
 
-# Allowed write roots for termination_report.publish (relative to project root)
+# Allowed write roots for all commands (relative to project root)
 ALLOWED_WRITE_ROOTS = ["artifacts/"]
+
+# Issue #1284: input file namespace for the 3 new command ids is unified under
+# artifacts/{issue_number}/issue-metadata/{command-id}/
+ISSUE_METADATA_NAMESPACE_SEGMENT = "issue-metadata"
+
+# Per-command-id input schema (AC10). Command id ↔ schema mismatch is denied
+# before mutation.
+INPUT_SCHEMA_BY_COMMAND: dict = {
+    COMMAND_ID_PUBLISH: "TERMINATION_REPORT_INPUT_V1",
+    COMMAND_ID_ISSUE_BODY_UPDATE: "ISSUE_BODY_UPDATE_INPUT_V1",
+    COMMAND_ID_ISSUE_COMMENT_PUBLISH: "ISSUE_COMMENT_PUBLISH_INPUT_V1",
+    COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH: "CONTRACT_SNAPSHOT_PUBLISH_INPUT_V1",
+}
+
+ALL_COMMAND_IDS = frozenset(INPUT_SCHEMA_BY_COMMAND)
+
+# Command ids that keep the legacy (Issue #1166) mandatory LOOP_ISSUE_NUMBER env
+# binding. New command ids (Issue #1284 AC15) treat LOOP_ISSUE_NUMBER as
+# optional-but-must-match-if-present, since controlled metadata mutation may run
+# from root without an issue-specific worktree/session env.
+ENV_BINDING_MANDATORY_COMMAND_IDS = frozenset({COMMAND_ID_PUBLISH})
 
 # Environment variables that the executor sanitizes (removes from child env)
 ENV_SANITIZE_KEYS = [
@@ -69,6 +99,105 @@ CONTROLLED_SKILL_MUTATION_COMMAND_POLICY: dict = {
         "idempotency": {
             "marker_file_pattern": "artifacts/{issue_number}/termination_report_published.marker.json",
             "marker_field": "comment_id",
+        },
+        "env_sanitize": ENV_SANITIZE_KEYS,
+    },
+    COMMAND_ID_ISSUE_BODY_UPDATE: {
+        "command_id": COMMAND_ID_ISSUE_BODY_UPDATE,
+        "description": "Update GitHub issue body with stale-write precondition (controlled remote mutation)",
+        "executor_script": EXECUTOR_SCRIPT,
+        "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+        "input_namespace": (
+            f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{COMMAND_ID_ISSUE_BODY_UPDATE}/"
+        ),
+        "input_schema": INPUT_SCHEMA_BY_COMMAND[COMMAND_ID_ISSUE_BODY_UPDATE],
+        "github_mutation": {
+            "edit_issue_body": True,
+            "requires_repo": TRUSTED_REPO,
+            "requires_explicit_repo_flag": True,
+        },
+        "precondition": {
+            "previous_body_sha256_must_match_readback": True,
+            "previous_updated_at_must_match_readback": True,
+        },
+        "postcondition": {
+            "no_tracked_source_changes": True,
+            "no_lockfile_changes": True,
+            "no_settings_changes": True,
+            "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+            "new_body_sha256_must_match_readback": True,
+        },
+        "idempotency": {
+            "marker_file_pattern": (
+                f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/"
+                f"{COMMAND_ID_ISSUE_BODY_UPDATE}/issue_body_update.marker.json"
+            ),
+            "marker_field": "new_body_sha256",
+        },
+        "env_sanitize": ENV_SANITIZE_KEYS,
+    },
+    COMMAND_ID_ISSUE_COMMENT_PUBLISH: {
+        "command_id": COMMAND_ID_ISSUE_COMMENT_PUBLISH,
+        "description": "Publish a GitHub issue comment with marker readback (controlled remote mutation)",
+        "executor_script": EXECUTOR_SCRIPT,
+        "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+        "input_namespace": (
+            f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{COMMAND_ID_ISSUE_COMMENT_PUBLISH}/"
+        ),
+        "input_schema": INPUT_SCHEMA_BY_COMMAND[COMMAND_ID_ISSUE_COMMENT_PUBLISH],
+        "github_mutation": {
+            "comment_on_issue": True,
+            "requires_repo": TRUSTED_REPO,
+            "requires_explicit_repo_flag": True,
+        },
+        "postcondition": {
+            "no_tracked_source_changes": True,
+            "no_lockfile_changes": True,
+            "no_settings_changes": True,
+            "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+        },
+        "idempotency": {
+            "marker_file_pattern": (
+                f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/"
+                f"{COMMAND_ID_ISSUE_COMMENT_PUBLISH}/issue_comment_publish.marker.json"
+            ),
+            "marker_field": "comment_id",
+        },
+        "env_sanitize": ENV_SANITIZE_KEYS,
+    },
+    COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH: {
+        "command_id": COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
+        "description": (
+            "Publish Contract Snapshot comment via ensure_contract_snapshot.py "
+            "(controlled remote mutation; publisher authority fixed to "
+            ".claude/skills/impl-review-loop/scripts/ensure_contract_snapshot.py)"
+        ),
+        "executor_script": EXECUTOR_SCRIPT,
+        "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+        "input_namespace": (
+            f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH}/"
+        ),
+        "input_schema": INPUT_SCHEMA_BY_COMMAND[COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH],
+        "publisher_script": (
+            ".claude/skills/impl-review-loop/scripts/ensure_contract_snapshot.py"
+        ),
+        "github_mutation": {
+            "comment_on_issue": True,
+            "requires_repo": TRUSTED_REPO,
+            "requires_explicit_repo_flag": True,
+        },
+        "postcondition": {
+            "no_tracked_source_changes": True,
+            "no_lockfile_changes": True,
+            "no_settings_changes": True,
+            "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+        },
+        "idempotency": {
+            "marker_file_pattern": (
+                f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/"
+                f"{COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH}/contract-snapshot-{{issue_number}}.json"
+            ),
+            "marker_field": "contract_snapshot_url",
         },
         "env_sanitize": ENV_SANITIZE_KEYS,
     },
