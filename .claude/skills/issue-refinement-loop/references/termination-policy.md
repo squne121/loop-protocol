@@ -524,8 +524,23 @@ TERMINATION_REPORT_RENDER_RESULT_V1:
 `route` 値そのものを blockers_summary に転記し、`scope_signal_guard_reason_code` 単独の表示より
 具体的な次アクションが人間に伝わるようにする。
 
-renderer（`render_termination_report.py`）の callsite integration は上記「callsite integration」節の通り
-follow-up Issue に委譲されるが、`scope_signal_guard_decision_v2` は `plan_refinement_loop.py` が
-既に出力しているため、callsite integration 前でも `LOOP_STATE_BUILD_RESULT_V1.scope_signal_guard_decision_v2`
+本セクションは policy-only ではなく renderer 実装済みである（#1090 AC6 / PR #1294 review Blocker 3 対応）。
+`render_termination_report.py` は `TERMINATION_REPORT_INPUT_V1` の optional フィールド
+`scope_signal_guard_decision_v2` を受け取り、`normalize_input()` が route（`human_judgment_required` /
+`security_risk_gate_required` / `invalid_scope_delta_approval`）のとき以下の blocker 行を
+`blockers_summary` に追記してから rendering する（regression test:
+`tests/test_scope_signal_guard_lane_split.py::TestTerminationReportIntegration`）。
+
+- `scope_signal_guard_route:<route>`
+- `missing_approval_field:<true|false>`
+- `suggested_contract_patch:<定型文>`（`suggested_contract_patch` が非 null の場合のみ）
+
+orchestrator は termination payload 組み立て時に
+`LOOP_STATE_BUILD_RESULT_V1.scope_signal_guard_decision_v2`
 （`build_loop_state.py` が pass-through する envelope フィールド。`LOOP_STATE_V1` 本体のスキーマは変更しない）
-から参照可能である。
+をそのまま renderer 入力の `scope_signal_guard_decision_v2` に渡せばよい。
+
+`LOOP_STATE_BUILD_RESULT_V1` envelope の consumer 契約: `scope_signal_guard_decision_v2` は
+top-level の additive フィールドであり、envelope consumer は unknown top-level field を
+reject せず無視できること（`additionalProperties: false` の closed schema で envelope を
+検証する consumer を置かないこと）を契約とする。

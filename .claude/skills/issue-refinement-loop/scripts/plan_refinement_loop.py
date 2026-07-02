@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 try:
     import yaml as _yaml_module
@@ -99,11 +100,27 @@ TRUSTED_AUTHOR_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 
 # #558 owns the security gate itself; this is a narrow deterministic
 # fail-closed check applied regardless of scope delta approval.
+# The path/term vocabulary mirrors the real-security-risk examples listed
+# in #558 (secrets, tokens, credentials, auth / access-control surfaces,
+# CI supply-chain paths) without implementing the gate itself.
 SECURITY_SENSITIVE_PATH_PREFIXES = (
     ".claude/hooks/",
+    ".claude/agents/",
+    ".codex/agents/",
     ".github/workflows/",
+    ".github/actions/",
+    ".github/dependabot.yml",
+    ".github/CODEOWNERS",
+    "docs/dev/secret-policy.md",
 )
-SECURITY_SENSITIVE_TERMS = ("secret", "token", "permission", "credential")
+# Word-boundary regex (not raw substring) so that e.g. "author" does not
+# match "auth" and "tokenizer" does not match "token".
+_SECURITY_SENSITIVE_TERM_RE = re.compile(
+    r"(?<![a-z0-9])("
+    r"secret|token|permission|credential|auth|oidc"
+    r"|access[-_]?control|deploy[-_]?key|private[-_]?key"
+    r")(?![a-z0-9])"
+)
 
 SUGGESTED_CONTRACT_PATCH_TEMPLATE = (
     "OWNER/MEMBER/COLLABORATOR being a trusted author must post an "
@@ -712,7 +729,29 @@ def _delta_projection_to_evidence_spans(delta_result: dict[str, Any]) -> list[di
     return evidence_spans
 
 
-def _detect_scope_signals(issue_body: str, known_context: dict | None) -> tuple[bool, str, list]:
+def _compute_scope_signal_delta_result(known_context: dict) -> dict[str, Any]:
+    """Compute the scope_signal_delta result once, fail-closed on any error.
+
+    Shared by the legacy scope_signal_guard projection and the
+    SCOPE_SIGNAL_GUARD_DECISION_V2 build (#1090) so both consume the SAME
+    delta result; a delta failure raises ScopeSignalDeltaError (fail-closed
+    plan) instead of being silently swallowed by either consumer.
+    """
+    if compute_scope_signal_delta is None:
+        raise ScopeSignalDeltaError("scope_signal_delta helper is unavailable")
+    if not isinstance(known_context.get("scope_signal_delta_input"), dict):
+        raise ScopeSignalDeltaError("scope_signal_delta_input must be an object")
+    try:
+        return compute_scope_signal_delta(known_context["scope_signal_delta_input"])
+    except Exception as exc:
+        raise ScopeSignalDeltaError(f"scope_signal_delta_input is invalid: {exc}") from exc
+
+
+def _detect_scope_signals(
+    issue_body: str,
+    known_context: dict | None,
+    precomputed_delta: "dict[str, Any] | None" = None,
+) -> tuple[bool, str, list]:
     """
     Detect scope signals (new_in_scope_area, new_allowed_path_layer, new_unverifiable_ac).
 
@@ -721,25 +760,22 @@ def _detect_scope_signals(issue_body: str, known_context: dict | None) -> tuple[
     Precedence: new_unverifiable_ac > new_allowed_path_layer > new_in_scope_area > none
     """
     if known_context and "scope_signal_delta_input" in known_context:
-        if compute_scope_signal_delta is None:
-            raise ScopeSignalDeltaError("scope_signal_delta helper is unavailable")
-        if not isinstance(known_context.get("scope_signal_delta_input"), dict):
-            raise ScopeSignalDeltaError("scope_signal_delta_input must be an object")
-        try:
-            delta_result = compute_scope_signal_delta(known_context["scope_signal_delta_input"])
-            projection = delta_result.get("legacy_scope_signal_guard", {})
-            evidence_spans = _delta_projection_to_evidence_spans(delta_result)
-            if projection.get("triggered"):
-                if _is_anchor_reframe_context(known_context):
-                    return (False, SCOPE_SIGNAL_REASON_ANCHOR_REFRAME, evidence_spans)
-                return (
-                    True,
-                    projection.get("reason_code", SCOPE_SIGNAL_REASON_NO_SIGNAL),
-                    evidence_spans,
-                )
-            return (False, SCOPE_SIGNAL_REASON_NO_SIGNAL, [])
-        except Exception as exc:
-            raise ScopeSignalDeltaError(f"scope_signal_delta_input is invalid: {exc}") from exc
+        delta_result = (
+            precomputed_delta
+            if precomputed_delta is not None
+            else _compute_scope_signal_delta_result(known_context)
+        )
+        projection = delta_result.get("legacy_scope_signal_guard", {})
+        evidence_spans = _delta_projection_to_evidence_spans(delta_result)
+        if projection.get("triggered"):
+            if _is_anchor_reframe_context(known_context):
+                return (False, SCOPE_SIGNAL_REASON_ANCHOR_REFRAME, evidence_spans)
+            return (
+                True,
+                projection.get("reason_code", SCOPE_SIGNAL_REASON_NO_SIGNAL),
+                evidence_spans,
+            )
+        return (False, SCOPE_SIGNAL_REASON_NO_SIGNAL, [])
 
     evidence_spans = []
     sections = _extract_sections(issue_body)
@@ -856,12 +892,10 @@ def _is_security_sensitive_scope_delta(added_paths: list[str], rationale_text: "
         for prefix in SECURITY_SENSITIVE_PATH_PREFIXES:
             if normalized.startswith(prefix):
                 return True
-        lower_path = normalized.lower()
-        if any(term in lower_path for term in SECURITY_SENSITIVE_TERMS):
+        if _SECURITY_SENSITIVE_TERM_RE.search(normalized.lower()):
             return True
     if rationale_text:
-        lower_text = rationale_text.lower()
-        if any(term in lower_text for term in SECURITY_SENSITIVE_TERMS):
+        if _SECURITY_SENSITIVE_TERM_RE.search(rationale_text.lower()):
             return True
     return False
 
@@ -880,14 +914,9 @@ def _extract_scope_delta_approval_evidence(known_context: "dict | None") -> "dic
     return evidence
 
 
-def _validate_scope_delta_approval(evidence: "dict | None", current_issue_number: "int | None") -> dict:
-    """AC2/AC8/AC9: validate scope delta approval evidence, fail-closed.
-
-    Returns a dict with: present, valid, status, missing_approval_field,
-    suggested_contract_patch, comment_id, comment_url, body_sha256,
-    author_association, created_at, issue_url.
-    """
-    base = {
+def _base_approval_result() -> dict:
+    """Missing-approval baseline for the scope_delta_approval artifact field."""
+    return {
         "present": False,
         "valid": False,
         "status": "missing",
@@ -899,7 +928,91 @@ def _validate_scope_delta_approval(evidence: "dict | None", current_issue_number
         "author_association": None,
         "created_at": None,
         "issue_url": None,
+        "required_rerun": [],
     }
+
+
+def _expected_repo_for_issue(issue: "dict | None", known_context: "dict | None") -> "str | None":
+    """Derive the expected `owner/name` repo for AC8 structural URL validation.
+
+    Sources (in order): known_context.repo, issue.html_url / issue.url
+    (GitHub issue URL forms). Returns None when the repo cannot be
+    established — evidence-based approval then fails closed.
+    """
+    if known_context:
+        repo = known_context.get("repo")
+        if isinstance(repo, str) and repo.count("/") == 1 and all(repo.split("/")):
+            return repo
+    for key in ("html_url", "url"):
+        candidate = (issue or {}).get(key)
+        if not isinstance(candidate, str) or not candidate:
+            continue
+        parsed = urlparse(candidate)
+        if parsed.scheme != "https":
+            continue
+        parts = [p for p in parsed.path.split("/") if p]
+        if parsed.netloc == "github.com" and len(parts) >= 4 and parts[2] == "issues":
+            return f"{parts[0]}/{parts[1]}"
+        if parsed.netloc == "api.github.com" and len(parts) >= 5 and parts[0] == "repos" and parts[3] == "issues":
+            return f"{parts[1]}/{parts[2]}"
+    return None
+
+
+def _parse_github_issue_comment_url(url: "str | None") -> "dict | None":
+    """Parse a GitHub issue comment URL structurally (no substring checks).
+
+    Accepts only https://github.com/<owner>/<repo>/issues/<n>#issuecomment-<id>.
+    PR review discussion URLs (#discussion_r...) and /pull/ paths are rejected
+    (returns None), as are non-GitHub hosts and malformed fragments.
+    """
+    if not isinstance(url, str) or not url:
+        return None
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.netloc != "github.com":
+        return None
+    parts = [p for p in parsed.path.split("/") if p]
+    if len(parts) != 4 or parts[2] != "issues":
+        return None
+    if not parts[3].isdigit():
+        return None
+    fragment_match = re.fullmatch(r"issuecomment-(\d+)", parsed.fragment or "")
+    if fragment_match is None:
+        return None
+    return {
+        "owner": parts[0],
+        "repo": parts[1],
+        "issue_number": int(parts[3]),
+        "comment_id": fragment_match.group(1),
+    }
+
+
+def _issue_url_matches(issue_url: "str | None", expected_repo: str, issue_number: int) -> bool:
+    """AC8: structural check that evidence.issue_url points at the target issue."""
+    if not isinstance(issue_url, str) or not issue_url:
+        return False
+    expected_api = f"https://api.github.com/repos/{expected_repo}/issues/{issue_number}"
+    expected_html = f"https://github.com/{expected_repo}/issues/{issue_number}"
+    return issue_url.lower() in (expected_api.lower(), expected_html.lower())
+
+
+def _validate_scope_delta_approval(
+    evidence: "dict | None",
+    current_issue_number: "int | None",
+    expected_repo: "str | None" = None,
+) -> dict:
+    """AC2/AC8/AC9: validate scope delta approval evidence, fail-closed.
+
+    Returns a dict with: present, valid, status, missing_approval_field,
+    suggested_contract_patch, comment_id, comment_url, body_sha256,
+    author_association, created_at, issue_url, required_rerun.
+
+    AC8 is enforced structurally: comment_url must be the target issue's own
+    GitHub issue comment URL (owner/repo/issue_number/comment_id all
+    verified), issue_url must point at the same issue, and PR review
+    discussion URLs / external hosts are rejected. When expected_repo cannot
+    be established the approval fails closed as invalid.
+    """
+    base = _base_approval_result()
     if evidence is None:
         return base
 
@@ -910,6 +1023,8 @@ def _validate_scope_delta_approval(evidence: "dict | None", current_issue_number
     base["author_association"] = evidence.get("author_association")
     base["created_at"] = evidence.get("created_at")
     base["issue_url"] = evidence.get("issue_url")
+    required_rerun = evidence.get("required_rerun")
+    base["required_rerun"] = required_rerun if isinstance(required_rerun, list) else []
 
     marker_present = bool(evidence.get("marker_present"))
     if not marker_present:
@@ -917,24 +1032,95 @@ def _validate_scope_delta_approval(evidence: "dict | None", current_issue_number
         base["missing_approval_field"] = True
         return base
 
-    # AC8: approval only valid for the current issue's own comment URL.
-    target_issue_number = evidence.get("target_issue_number")
-    if current_issue_number is not None and target_issue_number != current_issue_number:
+    def _invalid() -> dict:
         base["status"] = "invalid_scope_delta_approval"
         base["missing_approval_field"] = False
         base["suggested_contract_patch"] = None
         return base
+
+    # AC8: approval only valid for the current issue's own comment URL.
+    target_issue_number = evidence.get("target_issue_number")
+    if current_issue_number is not None and target_issue_number != current_issue_number:
+        return _invalid()
+
+    # AC8: structural comment_url validation (host / owner / repo / issue /
+    # comment id), fail-closed when the runtime repo cannot be established.
+    parsed_comment = _parse_github_issue_comment_url(evidence.get("comment_url"))
+    if parsed_comment is None:
+        return _invalid()
+    if expected_repo is None:
+        return _invalid()
+    expected_parts = expected_repo.lower().split("/", 1)
+    if [parsed_comment["owner"].lower(), parsed_comment["repo"].lower()] != expected_parts:
+        return _invalid()
+    if current_issue_number is not None and parsed_comment["issue_number"] != current_issue_number:
+        return _invalid()
+    evidence_comment_id = evidence.get("comment_id")
+    if evidence_comment_id is None or str(evidence_comment_id) != parsed_comment["comment_id"]:
+        return _invalid()
+    if current_issue_number is not None and not _issue_url_matches(
+        evidence.get("issue_url"), expected_repo, current_issue_number
+    ):
+        return _invalid()
 
     # AC9: only OWNER/MEMBER/COLLABORATOR are trusted authors.
     author_association = evidence.get("author_association")
     if author_association not in TRUSTED_AUTHOR_ASSOCIATIONS:
-        base["status"] = "invalid_scope_delta_approval"
+        return _invalid()
+
+    base["valid"] = True
+    base["status"] = "approved"
+    base["missing_approval_field"] = False
+    base["suggested_contract_patch"] = None
+    return base
+
+
+def _project_scope_delta_decision_to_approval(known_context: "dict | None") -> dict:
+    """Blocker 1 (#1294 review): adapter from the production anchor approval path.
+
+    `run_refinement_preflight.py` validates the anchor comment URL
+    structurally (`_validate_anchor_comment_url`) and classifies the
+    ANCHOR_SCOPE_REFRAME_V1 payload into `known_context.scope_delta_decision`
+    (#920/#1027 contract). This adapter projects that upstream-verified
+    decision into the v2 `scope_delta_approval` shape so trusted anchor
+    approvals reach `proceed_with_notes` without a parallel
+    `scope_delta_approval_evidence` producer.
+    """
+    base = _base_approval_result()
+    decision = (known_context or {}).get("scope_delta_decision")
+    if not isinstance(decision, dict):
+        return base
+    if decision.get("status") == "not_applicable":
+        # No anchor reframe was attempted at all: same lane as missing.
+        return base
+
+    base["present"] = True
+    base["comment_url"] = decision.get("anchor_comment_url")
+    base["body_sha256"] = decision.get("anchor_comment_hash")
+    base["author_association"] = decision.get("anchor_author_association")
+    required_rerun = decision.get("required_rerun")
+    base["required_rerun"] = required_rerun if isinstance(required_rerun, list) else []
+
+    if (
+        decision.get("status") == "approved_by_trusted_anchor"
+        and decision.get("implementation_go") is False
+        and decision.get("anchor_author_association") in TRUSTED_AUTHOR_ASSOCIATIONS
+    ):
+        base["valid"] = True
+        base["status"] = "approved"
         base["missing_approval_field"] = False
         base["suggested_contract_patch"] = None
         return base
 
-    base["valid"] = True
-    base["status"] = "approved"
+    if decision.get("reason") == "no_anchor_scope_reframe_v1_payload":
+        # A comment exists but carries no reframe marker: same lane as
+        # missing_marker (AC3), keep the suggested contract patch.
+        base["status"] = "missing_marker"
+        return base
+
+    # Reframe attempted but rejected upstream (untrusted author, wrong
+    # repo/issue, schema invalid): AC8/AC9 invalid lane.
+    base["status"] = "invalid_scope_delta_approval"
     base["missing_approval_field"] = False
     base["suggested_contract_patch"] = None
     return base
@@ -954,11 +1140,14 @@ def _decide_scope_signal_route(
     means a reframe was attempted but failed the target-issue (AC8) or
     trusted-author (AC9) check -> invalid_scope_delta_approval.
     """
+    if security_sensitive:
+        # AC13: security-sensitive fail-closed gate is never overridden by
+        # approval, and takes precedence over not_triggered so that a
+        # sensitive path added within an already-allowed layer (no
+        # new_allowed_path_layer signal) still gates.
+        return SCOPE_ROUTE_SECURITY_RISK_GATE_REQUIRED
     if not triggered:
         return SCOPE_ROUTE_NOT_TRIGGERED
-    if security_sensitive:
-        # AC13: security-sensitive fail-closed gate is never overridden by approval.
-        return SCOPE_ROUTE_SECURITY_RISK_GATE_REQUIRED
     if approval["status"] in ("missing", "missing_marker"):
         # AC3: no reframe present at all.
         return SCOPE_ROUTE_HUMAN_JUDGMENT_REQUIRED
@@ -975,14 +1164,35 @@ def _build_scope_signal_guard_decision_v2(
     added_paths: list[str],
     known_context: "dict | None",
     issue_number: "int | None",
+    issue: "dict | None" = None,
 ) -> dict:
-    """AC1/AC10: build SCOPE_SIGNAL_GUARD_DECISION_V2 artifact."""
+    """AC1/AC10: build SCOPE_SIGNAL_GUARD_DECISION_V2 artifact.
+
+    `scope_signal_triggered` / `scope_signal_reason` are the RAW
+    (pre-anchor-reframe-exclusion) signal from the shared delta projection,
+    so a trusted anchor approval routes to proceed_with_notes instead of
+    collapsing to not_triggered (Blocker 1, PR #1294 review).
+    """
     path_layers = sorted({_classify_path_layer(p) for p in (added_paths or [])})
     evidence = _extract_scope_delta_approval_evidence(known_context)
-    approval = _validate_scope_delta_approval(evidence, issue_number)
+    if evidence is not None:
+        expected_repo = _expected_repo_for_issue(issue, known_context)
+        approval = _validate_scope_delta_approval(evidence, issue_number, expected_repo)
+    else:
+        approval = _project_scope_delta_decision_to_approval(known_context)
     rationale_text = evidence.get("rationale") if evidence else None
     security_sensitive = _is_security_sensitive_scope_delta(added_paths, rationale_text)
     route = _decide_scope_signal_route(scope_signal_triggered, security_sensitive, approval)
+
+    if route == SCOPE_ROUTE_NOT_TRIGGERED:
+        # No scope signal: never emit "approval missing" diagnostics that
+        # could mislead downstream consumers reading only these fields.
+        approval = {
+            **approval,
+            "status": "not_required",
+            "missing_approval_field": False,
+            "suggested_contract_patch": None,
+        }
 
     return {
         "schema_version": "SCOPE_SIGNAL_GUARD_DECISION_V2",
@@ -1005,6 +1215,7 @@ def _build_scope_signal_guard_decision_v2(
             "author_association": approval["author_association"],
             "created_at": approval["created_at"],
             "issue_url": approval["issue_url"],
+            "required_rerun": approval["required_rerun"],
         },
         "security_sensitive": security_sensitive,
         "route": route,
@@ -1673,9 +1884,18 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                 )
             )
 
+        # Compute the scope_signal_delta result ONCE (fail-closed via
+        # ScopeSignalDeltaError) and share it between the legacy
+        # scope_signal_guard projection and the v2 lane split. A v2 build
+        # failure is NOT swallowed: it propagates to the fail-closed
+        # internal-error plan instead of silently omitting the artifact.
+        scope_signal_delta_result = None
+        if known_context and "scope_signal_delta_input" in known_context:
+            scope_signal_delta_result = _compute_scope_signal_delta_result(known_context)
+
         # Determine scope signal guard using _detect_scope_signals
         scope_signal_triggered, scope_signal_reason, scope_signal_evidence = _detect_scope_signals(
-            issue_body, known_context
+            issue_body, known_context, precomputed_delta=scope_signal_delta_result
         )
 
         # AC1/AC10 (#1090): opt-in SCOPE_SIGNAL_GUARD_DECISION_V2 lane split.
@@ -1683,25 +1903,27 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
         # since that is the only source of a normalized added-paths list;
         # this keeps all pre-existing golden fixtures byte-identical.
         scope_signal_guard_decision_v2 = None
-        if (
-            known_context
-            and isinstance(known_context.get("scope_signal_delta_input"), dict)
-            and compute_scope_signal_delta is not None
-        ):
-            try:
-                _delta_for_v2 = compute_scope_signal_delta(known_context["scope_signal_delta_input"])
-                _added_paths = (
-                    _delta_for_v2.get("sections", {}).get("allowed_paths", {}).get("added", [])
-                )
-                scope_signal_guard_decision_v2 = _build_scope_signal_guard_decision_v2(
-                    scope_signal_triggered,
-                    scope_signal_reason,
-                    _added_paths,
-                    known_context,
-                    issue_number,
-                )
-            except Exception:
-                scope_signal_guard_decision_v2 = None
+        if scope_signal_delta_result is not None:
+            _projection = scope_signal_delta_result.get("legacy_scope_signal_guard") or {}
+            _raw_triggered = bool(_projection.get("triggered"))
+            _raw_reason = (
+                _projection.get("reason_code", SCOPE_SIGNAL_REASON_NO_SIGNAL)
+                if _raw_triggered
+                else SCOPE_SIGNAL_REASON_NO_SIGNAL
+            )
+            _added_paths = (
+                (scope_signal_delta_result.get("sections") or {})
+                .get("allowed_paths", {})
+                .get("added", [])
+            )
+            scope_signal_guard_decision_v2 = _build_scope_signal_guard_decision_v2(
+                _raw_triggered,
+                _raw_reason,
+                _added_paths,
+                known_context,
+                issue_number,
+                issue,
+            )
 
         # Build output
         plan = {

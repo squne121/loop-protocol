@@ -210,3 +210,13 @@ jsonschema 検証対象外）。`build_loop_state()` 関数の戻り値は
 
 `LOOP_STATE_V1.scope_signal_guard`（`triggered` / `excluded_by_anchor_reframe` / `reason_code`）の
 既存 3 フィールドの意味・値は変更しない。
+
+**envelope consumer 契約（unknown top-level field 許容）**: `LOOP_STATE_BUILD_RESULT_V1` の
+consumer は unknown top-level field を reject せず無視すること。`additionalProperties: false`
+の closed schema で envelope 全体を検証する consumer を置いてはならない（JSON Schema の
+`additionalProperties` は同一 subschema で宣言された property しか認識しないため、
+closed schema は additive 拡張と両立しない）。closed schema 検証が必要な consumer は
+v2 フィールドを読む前に該当 field を projection で取り出すこと。
+また `build_loop_state.py` の CLI stdout / artifact 書き込みは `allow_nan=False` の
+strict JSON で出力する（`NaN` / `Infinity` を含む payload は fail する。#1086 の
+strict JSON policy と整合）。

@@ -130,7 +130,7 @@ def load_json(path: Path) -> tuple[Optional[dict[str, Any]], str]:
 def write_json_deterministic(path: Path, obj: Any) -> None:
     """Write JSON with sort_keys=True, ensure_ascii=False, indent=2."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    content = json.dumps(obj, sort_keys=True, ensure_ascii=False, indent=2) + "\n"
+    content = json.dumps(obj, sort_keys=True, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     path.write_text(content, encoding="utf-8")
 
 
@@ -565,7 +565,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 schema_hash=None,
             ),
         )
-        print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2))
+        print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2, allow_nan=False))
         return 2
 
     review, review_err = load_json_object(review_path)
@@ -586,7 +586,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 schema_hash=None,
             ),
         )
-        print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2))
+        print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2, allow_nan=False))
         return 2
 
     # Load optional blockers history — must be a JSON array (fail-closed)
@@ -648,7 +648,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             warnings=warnings,
             provenance=provenance,
         )
-        print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2))
+        print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2, allow_nan=False))
         return 2
 
     assert loop_state is not None
@@ -667,7 +667,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 warnings=warnings,
                 provenance=provenance,
             )
-            print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2))
+            print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2, allow_nan=False))
             return 1
     else:
         validation_errors = [
@@ -686,7 +686,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             warnings=warnings,
             provenance=provenance,
         )
-        print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2))
+        print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2, allow_nan=False))
         return 1
 
     # --- Write output ---
@@ -702,7 +702,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         provenance=provenance,
         scope_signal_guard_decision_v2=scope_signal_guard_decision_v2,
     )
-    print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2))
+    print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2, allow_nan=False))
     return 0
 
 

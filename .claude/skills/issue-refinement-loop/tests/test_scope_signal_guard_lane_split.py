@@ -123,6 +123,10 @@ def _base_input(
             "title": "Test",
             "body": ISSUE_BODY_TEMPLATE,
             "labels": [],
+            # AC8: the planner derives the expected owner/repo for structural
+            # comment_url validation from issue.html_url (fail-closed when
+            # underivable).
+            "html_url": f"https://github.com/squne121/loop-protocol/issues/{issue_number}",
         },
         "comments": None,
         "known_context": known_context,
@@ -243,6 +247,121 @@ class TestAnchorApprovalRouting:
         assert decision["raw_signal"]["triggered"] is False
         assert decision["route"] == "not_triggered"
 
+    def test_v2_not_triggered_uses_approval_status_not_required(self, planner_module):
+        # PR #1294 review: no scope signal must not leave misleading
+        # "approval missing" diagnostics in the artifact.
+        input_data = _base_input(1, _delta_input("- `docs/foo.md`", "- `docs/foo.md`"))
+        plan, exit_code = planner_module.plan_refinement_loop(input_data)
+        assert exit_code == 0
+        approval = plan["scope_signal_guard_decision_v2"]["scope_delta_approval"]
+        assert approval["status"] == "not_required"
+        assert approval["missing_approval_field"] is False
+        assert approval["suggested_contract_patch"] is None
+
+
+class TestScopeDeltaDecisionAdapter:
+    """PR #1294 review Blocker 1: production preflight path (scope_delta_decision)
+    must project into v2 scope_delta_approval and reach proceed_with_notes."""
+
+    @staticmethod
+    def _preflight_known_context(issue_number: int, delta_input: dict) -> dict:
+        # Exactly what run_refinement_preflight.py propagates for a trusted
+        # anchor (#920/#1027 contract): scope_delta_decision + anchor context,
+        # WITHOUT any scope_delta_approval_evidence.
+        anchor_url = (
+            f"https://github.com/squne121/loop-protocol/issues/{issue_number}"
+            "#issuecomment-777001"
+        )
+        return {
+            "scope_signal_delta_input": delta_input,
+            "anchor_reframe": True,
+            "anchor_comment_url": anchor_url,
+            "anchor_comment_hash": "b" * 64,
+            "scope_delta_decision": {
+                "status": "approved_by_trusted_anchor",
+                "implementation_go": False,
+                "anchor_author_association": "OWNER",
+                "anchor_comment_url": anchor_url,
+                "anchor_comment_hash": "b" * 64,
+                "allowed_path_deltas": ["src/systems/EnemySpawnSystem.ts"],
+                "required_rerun": ["contract_review", "refinement_preflight"],
+            },
+        }
+
+    def test_preflight_scope_delta_decision_projects_to_v2_proceed_with_notes(self, planner_module):
+        issue_number = 985
+        delta_input = _delta_input(
+            "- `docs/foo.md`", "- `docs/foo.md`\n- `src/systems/EnemySpawnSystem.ts`"
+        )
+        input_data = _base_input(issue_number, delta_input)
+        input_data["known_context"] = self._preflight_known_context(issue_number, delta_input)
+        plan, exit_code = planner_module.plan_refinement_loop(input_data)
+        assert exit_code == 0
+        decision = plan["scope_signal_guard_decision_v2"]
+        # Raw signal stays pre-exclusion even though the legacy guard is
+        # suppressed by anchor_reframe_exclusion.
+        assert decision["raw_signal"]["triggered"] is True
+        assert decision["route"] == "proceed_with_notes"
+        approval = decision["scope_delta_approval"]
+        assert approval["valid"] is True
+        assert approval["status"] == "approved"
+        assert approval["comment_url"].endswith("#issuecomment-777001")
+        assert approval["body_sha256"] == "b" * 64
+        assert approval["author_association"] == "OWNER"
+        assert approval["required_rerun"] == ["contract_review", "refinement_preflight"]
+        # Legacy guard keeps the post-exclusion view (unchanged contract).
+        legacy = plan["decisions"]["scope_signal_guard"]
+        assert legacy["triggered"] is False
+        assert legacy["reason_code"] == "anchor_reframe_exclusion"
+
+    def test_fail_closed_scope_delta_decision_projects_to_invalid(self, planner_module):
+        issue_number = 985
+        delta_input = _delta_input(
+            "- `docs/foo.md`", "- `docs/foo.md`\n- `src/systems/EnemySpawnSystem.ts`"
+        )
+        input_data = _base_input(issue_number, delta_input)
+        input_data["known_context"] = {
+            "scope_signal_delta_input": delta_input,
+            "scope_delta_decision": {
+                "status": "fail_closed",
+                "reason": "untrusted_author_association: 'CONTRIBUTOR'",
+                "implementation_go": False,
+                "anchor_author_association": "CONTRIBUTOR",
+                "anchor_comment_url": "https://github.com/squne121/loop-protocol/issues/985#issuecomment-1",
+                "anchor_comment_hash": "c" * 64,
+                "allowed_path_deltas": [],
+                "required_rerun": [],
+            },
+        }
+        plan, exit_code = planner_module.plan_refinement_loop(input_data)
+        assert exit_code == 0
+        assert plan["scope_signal_guard_decision_v2"]["route"] == "invalid_scope_delta_approval"
+
+    def test_no_payload_scope_delta_decision_is_missing_marker_lane(self, planner_module):
+        issue_number = 985
+        delta_input = _delta_input(
+            "- `docs/foo.md`", "- `docs/foo.md`\n- `src/systems/EnemySpawnSystem.ts`"
+        )
+        input_data = _base_input(issue_number, delta_input)
+        input_data["known_context"] = {
+            "scope_signal_delta_input": delta_input,
+            "scope_delta_decision": {
+                "status": "fail_closed",
+                "reason": "no_anchor_scope_reframe_v1_payload",
+                "implementation_go": False,
+                "anchor_author_association": "OWNER",
+                "anchor_comment_url": "https://github.com/squne121/loop-protocol/issues/985#issuecomment-2",
+                "anchor_comment_hash": "d" * 64,
+                "allowed_path_deltas": [],
+                "required_rerun": [],
+            },
+        }
+        plan, exit_code = planner_module.plan_refinement_loop(input_data)
+        assert exit_code == 0
+        decision = plan["scope_signal_guard_decision_v2"]
+        assert decision["route"] == "human_judgment_required"
+        assert decision["scope_delta_approval"]["status"] == "missing_marker"
+
 
 class TestRegressionFixtures:
     """AC5/AC11/AC12: #985 / #1060 regression fixtures, non-overlapping with #1086."""
@@ -332,8 +451,7 @@ class TestApprovalValidityBoundaries:
 
     def test_ac8_external_url_evidence_uses_target_issue_number_mismatch(self, planner_module):
         # Approval evidence pointing at a different repo/issue's comment URL
-        # is represented via target_issue_number mismatch (the normalized
-        # evidence contract never carries a raw external URL as "valid").
+        # fails both the target_issue_number check and the structural URL check.
         input_data = _base_input(
             985,
             _delta_input("- `docs/foo.md`", "- `docs/foo.md`\n- `src/systems/EnemySpawnSystem.ts`"),
@@ -346,6 +464,76 @@ class TestApprovalValidityBoundaries:
         assert exit_code == 0
         decision = plan["scope_signal_guard_decision_v2"]
         assert decision["route"] == "invalid_scope_delta_approval"
+
+    def test_v2_rejects_external_comment_url_even_if_target_issue_number_matches(self, planner_module):
+        # PR #1294 review Blocker 2 attack example: target_issue_number matches
+        # but comment_url is an external host and issue_url is another repo.
+        input_data = _base_input(
+            1090,
+            _delta_input("- `docs/foo.md`", "- `docs/foo.md`\n- `src/systems/EnemySpawnSystem.ts`"),
+            scope_delta_approval_evidence=_trusted_evidence(
+                1090,
+                comment_url="https://evil.example/some/comment",
+                issue_url="https://github.com/other/repo/issues/1090",
+            ),
+        )
+        plan, exit_code = planner_module.plan_refinement_loop(input_data)
+        assert exit_code == 0
+        decision = plan["scope_signal_guard_decision_v2"]
+        assert decision["route"] == "invalid_scope_delta_approval"
+        assert decision["scope_delta_approval"]["valid"] is False
+
+    def test_v2_rejects_other_repo_url_even_if_issue_number_matches(self, planner_module):
+        # Consistent other-repo comment_url + issue_url pair must still be
+        # rejected against the runtime repo derived from issue.html_url.
+        input_data = _base_input(
+            1090,
+            _delta_input("- `docs/foo.md`", "- `docs/foo.md`\n- `src/systems/EnemySpawnSystem.ts`"),
+            scope_delta_approval_evidence=_trusted_evidence(
+                1090,
+                comment_url="https://github.com/other/repo/issues/1090#issuecomment-123456",
+                issue_url="https://github.com/other/repo/issues/1090",
+            ),
+        )
+        plan, exit_code = planner_module.plan_refinement_loop(input_data)
+        assert exit_code == 0
+        assert plan["scope_signal_guard_decision_v2"]["route"] == "invalid_scope_delta_approval"
+
+    def test_v2_rejects_pr_review_comment_url(self, planner_module):
+        input_data = _base_input(
+            1090,
+            _delta_input("- `docs/foo.md`", "- `docs/foo.md`\n- `src/systems/EnemySpawnSystem.ts`"),
+            scope_delta_approval_evidence=_trusted_evidence(
+                1090,
+                comment_url="https://github.com/squne121/loop-protocol/pull/1090#discussion_r123456",
+            ),
+        )
+        plan, exit_code = planner_module.plan_refinement_loop(input_data)
+        assert exit_code == 0
+        assert plan["scope_signal_guard_decision_v2"]["route"] == "invalid_scope_delta_approval"
+
+    def test_v2_rejects_comment_id_fragment_mismatch(self, planner_module):
+        input_data = _base_input(
+            1090,
+            _delta_input("- `docs/foo.md`", "- `docs/foo.md`\n- `src/systems/EnemySpawnSystem.ts`"),
+            scope_delta_approval_evidence=_trusted_evidence(1090, comment_id=999999),
+        )
+        plan, exit_code = planner_module.plan_refinement_loop(input_data)
+        assert exit_code == 0
+        assert plan["scope_signal_guard_decision_v2"]["route"] == "invalid_scope_delta_approval"
+
+    def test_v2_fails_closed_when_runtime_repo_underivable(self, planner_module):
+        # Without issue.html_url / known_context.repo the expected repo cannot
+        # be established: evidence-based approval must fail closed (AC8).
+        input_data = _base_input(
+            1090,
+            _delta_input("- `docs/foo.md`", "- `docs/foo.md`\n- `src/systems/EnemySpawnSystem.ts`"),
+            scope_delta_approval_evidence=_trusted_evidence(1090),
+        )
+        del input_data["issue"]["html_url"]
+        plan, exit_code = planner_module.plan_refinement_loop(input_data)
+        assert exit_code == 0
+        assert plan["scope_signal_guard_decision_v2"]["route"] == "invalid_scope_delta_approval"
 
     @pytest.mark.parametrize("author_association", ["CONTRIBUTOR", "NONE", None, "", "owner"])
     def test_ac9_untrusted_author_association_is_invalid(self, planner_module, author_association):
@@ -484,6 +672,69 @@ class TestSecuritySensitiveGate:
         assert decision["route"] == "proceed_with_notes"
         assert decision["security_sensitive"] is False
 
+    @pytest.mark.parametrize(
+        "sensitive_path",
+        [
+            ".github/actions/setup-node/action.yml",
+            ".github/dependabot.yml",
+            ".github/CODEOWNERS",
+            "docs/dev/secret-policy.md",
+            ".codex/agents/reviewer.md",
+            ".claude/agents/implementation-worker.md",
+        ],
+    )
+    def test_558_aligned_sensitive_paths_not_overridable_by_approval(
+        self, planner_module, sensitive_path
+    ):
+        # PR #1294 review Blocker 4: #558-aligned security-sensitive paths
+        # must route to security_risk_gate_required even with trusted approval.
+        input_data = _base_input(
+            42,
+            _delta_input("- `docs/foo.md`", f"- `docs/foo.md`\n- `{sensitive_path}`"),
+            scope_delta_approval_evidence=_trusted_evidence(42),
+        )
+        plan, exit_code = planner_module.plan_refinement_loop(input_data)
+        assert exit_code == 0
+        assert plan["scope_signal_guard_decision_v2"]["route"] == "security_risk_gate_required"
+
+    @pytest.mark.parametrize(
+        "rationale",
+        [
+            "update auth flow for the deploy job",
+            "tighten access-control on the runner",
+            "change access_control defaults",
+            "switch CI to OIDC federation",
+            "rotate the deploy-key",
+            "embed a private-key for signing",
+        ],
+    )
+    def test_558_aligned_sensitive_terms_not_overridable_by_approval(
+        self, planner_module, rationale
+    ):
+        input_data = _base_input(
+            42,
+            _delta_input("- `src/existing.ts`", "- `src/existing.ts`\n- `docs/dev/new-notes.md`"),
+            scope_delta_approval_evidence=_trusted_evidence(42, rationale=rationale),
+        )
+        plan, exit_code = planner_module.plan_refinement_loop(input_data)
+        assert exit_code == 0
+        assert plan["scope_signal_guard_decision_v2"]["route"] == "security_risk_gate_required"
+
+    def test_word_boundary_author_is_not_auth_false_positive(self, planner_module):
+        # "author" must not be treated as the security term "auth".
+        input_data = _base_input(
+            42,
+            _delta_input("- `src/existing.ts`", "- `src/existing.ts`\n- `docs/dev/new-notes.md`"),
+            scope_delta_approval_evidence=_trusted_evidence(
+                42, rationale="add an author attribution note to docs"
+            ),
+        )
+        plan, exit_code = planner_module.plan_refinement_loop(input_data)
+        assert exit_code == 0
+        decision = plan["scope_signal_guard_decision_v2"]
+        assert decision["security_sensitive"] is False
+        assert decision["route"] == "proceed_with_notes"
+
 
 class TestFailClosedSafetyPreserved:
     """AC7: existing fail-closed safety (legacy scope_signal_guard) is unchanged."""
@@ -511,3 +762,84 @@ class TestFailClosedSafetyPreserved:
         assert exit_code == 0
         assert plan["fail_closed"]["required"] is True
         assert "scope_signal_guard_decision_v2" not in plan
+
+    def test_v2_delta_failure_is_fail_closed_not_silent_absent(self, planner_module):
+        # PR #1294 review: a delta failure must produce a fail-closed plan,
+        # never a "normal" plan that silently omits the v2 artifact.
+        input_data = _base_input(985, {"before_body": 123, "current_body": None})
+        plan, exit_code = planner_module.plan_refinement_loop(input_data)
+        assert exit_code == 0
+        assert plan["fail_closed"]["required"] is True
+        assert "scope_signal_guard_decision_v2" not in plan
+        # The plan must NOT contain a normal decisions payload pretending
+        # the guard evaluation succeeded.
+        assert plan["decisions"].get("scope_signal_guard") is None or plan["fail_closed"]["required"]
+
+
+class TestTerminationReportIntegration:
+    """#1090 AC6 (PR #1294 review Blocker 3): the rendered termination report
+    surfaces missing_approval_field and suggested_contract_patch."""
+
+    @pytest.fixture(scope="class")
+    def renderer_module(self):
+        return _load_module("render_termination_report_1090", "render_termination_report.py")
+
+    def test_termination_report_includes_missing_approval_field_and_suggested_patch(
+        self, planner_module, renderer_module
+    ):
+        # End-to-end: planner produces the v2 decision, renderer consumes it.
+        input_data = _base_input(
+            985,
+            _delta_input("- `docs/foo.md`", "- `docs/foo.md`\n- `src/systems/EnemySpawnSystem.ts`"),
+        )
+        plan, exit_code = planner_module.plan_refinement_loop(input_data)
+        assert exit_code == 0
+        decision = plan["scope_signal_guard_decision_v2"]
+        assert decision["route"] == "human_judgment_required"
+
+        result = renderer_module.render(
+            {
+                "termination_reason": "human_escalation",
+                "termination_cause": "human_judgment_required",
+                "issue_number": 985,
+                "iteration": 1,
+                "blockers_summary": [
+                    "scope_signal_guard_triggered",
+                    "scope_signal_guard_reason_code:new_allowed_path_layer",
+                ],
+                "scope_signal_guard_decision_v2": decision,
+            }
+        )
+        assert result["publishable"] is True
+        body = result["body"]
+        assert "scope_signal_guard_route:human_judgment_required" in body
+        assert "missing_approval_field:true" in body
+        assert "ANCHOR_SCOPE_REFRAME" in body  # suggested_contract_patch text
+
+    def test_termination_report_not_polluted_for_proceed_with_notes(self, renderer_module):
+        result = renderer_module.render(
+            {
+                "termination_reason": "human_escalation",
+                "termination_cause": "human_judgment_required",
+                "issue_number": 985,
+                "blockers_summary": ["some_other_blocker"],
+                "scope_signal_guard_decision_v2": {
+                    "route": "proceed_with_notes",
+                    "scope_delta_approval": {
+                        "missing_approval_field": False,
+                        "suggested_contract_patch": None,
+                    },
+                },
+            }
+        )
+        assert result["publishable"] is True
+        assert "scope_signal_guard_route" not in result["body"]
+
+    def test_termination_report_rejects_non_object_decision(self, renderer_module):
+        with pytest.raises(Exception):
+            renderer_module.render(
+                {
+                    "termination_reason": "human_escalation",
+                    "scope_signal_guard_decision_v2": "not-an-object",
+                }
+            )

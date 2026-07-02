@@ -177,14 +177,14 @@ scope_signal_delta_input:
 scope_signal_guard_decision_v2:
   schema_version: SCOPE_SIGNAL_GUARD_DECISION_V2
   raw_signal:
-    triggered: true | false
-    reason_code: new_in_scope_area | new_allowed_path_layer | new_unverifiable_ac | anchor_reframe_exclusion | no_scope_signal
+    triggered: true | false          # anchor reframe exclusion 適用「前」の raw 判定
+    reason_code: new_in_scope_area | new_allowed_path_layer | new_unverifiable_ac | no_scope_signal
   scope_context:
     path_layer: [runtime | docs | skill | hook | agent | test_fixture | unknown]
   scope_delta_approval:
     present: true | false
     valid: true | false
-    status: missing | missing_marker | invalid_scope_delta_approval | approved
+    status: missing | missing_marker | invalid_scope_delta_approval | approved | not_required
     missing_approval_field: true | false
     suggested_contract_patch: <string | null>
     comment_id: <int | null>
@@ -193,9 +193,23 @@ scope_signal_guard_decision_v2:
     author_association: OWNER | MEMBER | COLLABORATOR | null
     created_at: <ISO-8601 | null>
     issue_url: <string | null>
+    required_rerun: [contract_review | refinement_preflight | allowed_paths_gate]
   security_sensitive: true | false
   route: proceed_with_notes | human_judgment_required | security_risk_gate_required | invalid_scope_delta_approval | not_triggered
 ```
+
+`raw_signal` は `scope_signal_delta.py` の `legacy_scope_signal_guard` projection そのもの
+（anchor reframe exclusion 適用前）である。trusted anchor approval が存在するケースでも
+`raw_signal.triggered=true` のまま `route` 側で `proceed_with_notes` に分岐する
+（legacy `decisions.scope_signal_guard` は従来通り exclusion 適用後の値を保持する）。
+`route=not_triggered` の場合、`scope_delta_approval.status` は `not_required` に正規化され、
+`missing_approval_field=false` / `suggested_contract_patch=null` になる（scope signal が
+無いのに「approval 欠落」診断を残さない）。
+
+`scope_signal_delta_input` が存在するのに v2 artifact の生成に失敗した場合は、
+silent omit せず fail-closed（`ScopeSignalDeltaError` → fail_closed plan、
+またはその他の例外 → `planner_internal_error` fail_closed plan）とする。
+legacy projection と v2 は同一の delta 計算結果を共有し、二重計算しない。
 
 ### scope_context.path_layer 分類（AC1）
 
@@ -216,18 +230,26 @@ scope_signal_guard_decision_v2:
 
 `_decide_scope_signal_route()` は以下の優先順位で route を決定する。
 
-1. `raw_signal.triggered=false` → `not_triggered`
-2. security-sensitive path/term を含む → `security_risk_gate_required`（approval があっても override 不可、AC13）
+1. security-sensitive path/term を含む → `security_risk_gate_required`（approval があっても override 不可、AC13。`raw_signal.triggered=false` でも added path が security-sensitive なら gate する）
+2. `raw_signal.triggered=false` → `not_triggered`
 3. Scope Delta Approval が存在しない、または marker（`ANCHOR_SCOPE_REFRAME` / `Scope Delta Approval` / `Allowed Paths Expansion Rationale`）が確認できない → `human_judgment_required`（AC3）
 4. Scope Delta Approval は存在するが対象 Issue 不一致（AC8）または `author_association` が信頼できない（AC9） → `invalid_scope_delta_approval`
 5. 上記いずれにも該当しない（trusted anchor による有効な approval） → `proceed_with_notes`（AC2/AC4/AC12。実装 go ではなく contract-review rerun required）
 
 ### security-sensitive fail-closed gate（セキュリティ機微判定, AC13）
 
-`_is_security_sensitive_scope_delta()` は以下を deterministic に判定する（#558 の security gate 本体とは別の、狭い fail-closed チェック）。
+`_is_security_sensitive_scope_delta()` は以下を deterministic に判定する（#558 の security gate 本体とは別の、狭い fail-closed チェック。検出語彙・path は #558 の real-security-risk 例と整合させる）。
 
-- 追加パスが `.claude/hooks/` または `.github/workflows/` から始まる
-- 追加パス文字列、または承認 evidence の `rationale` に `secret` / `token` / `permission` / `credential` のいずれかが含まれる（大文字小文字を区別しない）
+- 追加パスが以下の security-sensitive path prefix から始まる:
+  `.claude/hooks/` / `.claude/agents/` / `.codex/agents/` / `.github/workflows/` /
+  `.github/actions/` / `.github/dependabot.yml` / `.github/CODEOWNERS` /
+  `docs/dev/secret-policy.md`
+- 追加パス文字列、または承認 evidence の `rationale` に以下の security term が
+  word-boundary 一致で含まれる（大文字小文字を区別しない。`author` が `auth` に
+  誤マッチしないよう部分文字列一致は使わない）:
+  `secret` / `token` / `permission` / `credential` / `auth` / `oidc` /
+  `access-control`（`access_control` / `accesscontrol` 表記含む） /
+  `deploy-key` / `private-key`
 
 該当する場合は Scope Delta Approval の有無・valid/invalid に関わらず `security_risk_gate_required` を返す。
 
@@ -237,11 +259,29 @@ scope_signal_guard_decision_v2:
 「OWNER/MEMBER/COLLABORATOR が ANCHOR_SCOPE_REFRAME コメントを投稿する」ことを促す定型文を返す。
 承認が valid な場合（`status: approved`）は `suggested_contract_patch: null`。
 
-### known_context.scope_delta_approval_evidence 入力契約（AC8/AC9/AC10）
+### 承認 evidence の入力経路（AC8/AC9/AC10）
 
 `scope_signal_guard_decision_v2` の承認判定は、raw anchor comment body を直接読まない。
-呼び出し側（orchestrator/checker）が以下の正規化済み evidence を `known_context.scope_delta_approval_evidence`
-として渡す。
+入力経路は以下の 2 つで、両方が同じ `scope_delta_approval` shape に正規化される。
+
+**経路 1（本番 producer / 既定）: `known_context.scope_delta_decision`**
+
+`run_refinement_preflight.py` が anchor comment URL を構造検証
+（`_validate_anchor_comment_url`: owner/repo/issue/comment id の一致・PR review comment 拒否・
+`issue_url` REST field 照合）した上で `ANCHOR_SCOPE_REFRAME_V1` を分類して生成する
+`known_context.scope_delta_decision` を、planner が v2 `scope_delta_approval` に投影する（adapter）。
+
+- `status: approved_by_trusted_anchor`（`implementation_go: false` かつ信頼済み author）は `status: approved` に投影する
+- `reason: no_anchor_scope_reframe_v1_payload` は marker 未検出として `status: missing_marker` に投影する（AC3 lane）
+- `status: not_applicable` は reframe 未試行として `status: missing` に投影する
+- その他の `fail_closed`（信頼できない author、repo / issue 不一致、schema 不正）は `status: invalid_scope_delta_approval` に投影する
+
+投影フィールド: `comment_url ← anchor_comment_url` / `body_sha256 ← anchor_comment_hash` /
+`author_association ← anchor_author_association` / `required_rerun ← required_rerun`。
+
+**経路 2（fixture / 直接 evidence）: `known_context.scope_delta_approval_evidence`**
+
+呼び出し側（orchestrator/checker/fixture）が以下の正規化済み evidence を渡す。
 
 ```yaml
 scope_delta_approval_evidence:
@@ -254,11 +294,24 @@ scope_delta_approval_evidence:
   created_at: <ISO-8601 | null>
   issue_url: <string | null>
   rationale: <string | null>          # security-sensitive term 判定にも使用
+  required_rerun: [<string>]          # optional
 ```
 
-`target_issue_number` が実行中の Issue と一致しない場合（別 Issue / PR / 外部 URL 由来のコメント）は
-`invalid_scope_delta_approval` として fail-closed になる（AC8）。`author_association` が
-`OWNER` / `MEMBER` / `COLLABORATOR` のいずれでもない場合も同様に fail-closed（AC9）。
+経路 2 では planner 自身が AC8 を構造検証する（producer 検証済み前提を置かない）。
+
+- `comment_url` は `https://github.com/<owner>/<repo>/issues/<issue_number>#issuecomment-<id>`
+  構造のみ有効。PR review discussion URL（`#discussion_r...`）、`/pull/` path、
+  github.com 以外の host は `invalid_scope_delta_approval`
+- `<owner>/<repo>` は実行中 repo（`known_context.repo`、なければ `issue.html_url` / `issue.url`
+  から導出）と一致すること。実行中 repo が導出できない場合も fail-closed で invalid
+- URL 中の issue 番号・`target_issue_number` は実行中 Issue と一致すること
+- fragment の comment id と `evidence.comment_id` が一致すること
+- `issue_url` は同じ repo/issue の GitHub issue URL
+  （`https://api.github.com/repos/<owner>/<repo>/issues/<n>` または
+  `https://github.com/<owner>/<repo>/issues/<n>`）と一致すること
+
+`author_association` が `OWNER` / `MEMBER` / `COLLABORATOR` のいずれでもない場合も
+fail-closed（AC9）。両経路が同時に存在する場合は経路 2（明示 evidence）を優先する。
 
 ### opt-in ガード（既存 golden fixture 非破壊）
 
