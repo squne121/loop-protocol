@@ -935,3 +935,96 @@ class TestAC2ContractMalformedSeparatePath:
         assert required_contract_keys == [], (
             f"required_contract_keys must be [] when YAML parse fails, got {required_contract_keys}"
         )
+
+
+class TestScopeSignalDeltaPlannerIntegration:
+    @staticmethod
+    def _allowed_paths_delta_input() -> dict[str, Any]:
+        allowed_paths_before = (
+            "## Allowed Paths\n"
+            "- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n"
+        )
+        allowed_paths_after = (
+            "## Allowed Paths\n"
+            "- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n"
+            "- `docs/dev/workflow.md`\n"
+        )
+        return {
+            "before_body": allowed_paths_before,
+            "current_body": allowed_paths_before,
+            "after_body": allowed_paths_after,
+            "source_refs": {
+                "before": "fixture:before",
+                "current": "fixture:current",
+                "after": "fixture:after",
+            },
+        }
+
+    def test_planner_consumes_scope_signal_delta_projection(self):
+        input_data = fixture_to_input("no_repo_fact_claim", "negative", 7)
+        input_data["known_context"] = {
+            "scope_signal_delta_input": self._allowed_paths_delta_input()
+        }
+        output, _ = run_planner(input_data)
+        assert output["decisions"]["scope_signal_guard"]["triggered"] is True
+        assert output["decisions"]["scope_signal_guard"]["reason_code"] == "new_allowed_path_layer"
+
+    def test_planner_scope_signal_delta_honors_trusted_anchor_projection(self):
+        input_data = fixture_to_input("no_repo_fact_claim", "negative", 7)
+        input_data["known_context"] = {
+            "scope_signal_delta_input": self._allowed_paths_delta_input(),
+            "scope_delta_decision": {
+                "status": "approved_by_trusted_anchor",
+                "implementation_go": False,
+                "required_rerun": ["contract_review", "refinement_preflight"]
+            }
+        }
+        output, _ = run_planner(input_data)
+        assert output["decisions"]["scope_signal_guard"]["triggered"] is False
+        assert output["decisions"]["scope_signal_guard"]["reason_code"] == "anchor_reframe_exclusion"
+
+    def test_planner_scope_signal_delta_preserves_provenance(self):
+        input_data = fixture_to_input("no_repo_fact_claim", "negative", 7)
+        input_data["known_context"] = {
+            "scope_signal_delta_input": self._allowed_paths_delta_input()
+        }
+        output, _ = run_planner(input_data)
+        evidence = output["decisions"]["scope_signal_guard"]["evidence_spans"]
+        assert evidence
+        assert evidence[0]["source"] == "scope_signal_delta_after_body"
+        assert evidence[0]["source_ref"] == "fixture:after"
+
+    def test_planner_classification_only_does_not_suppress_scope_signal_delta(self):
+        input_data = fixture_to_input("no_repo_fact_claim", "negative", 7)
+        input_data["known_context"] = {
+            "classification": "feedback_update_required",
+            "anchor_comment_url": "https://github.com/owner/repo/issues/7#issuecomment-123456",
+            "anchor_reframe": True,
+            "scope_signal_delta_input": self._allowed_paths_delta_input(),
+        }
+        output, _ = run_planner(input_data)
+        assert output["decisions"]["scope_signal_guard"]["triggered"] is True
+        assert output["decisions"]["scope_signal_guard"]["reason_code"] == "new_allowed_path_layer"
+
+    def test_planner_scope_signal_delta_invalid_input_fail_closed(self):
+        input_data = fixture_to_input("no_repo_fact_claim", "negative", 7)
+        input_data["known_context"] = {
+            "scope_signal_delta_input": {
+                "before_body": (
+                    "## Allowed Paths\n"
+                    "- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n"
+                ),
+                "current_body": (
+                    "## Allowed Paths\n"
+                    "- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n"
+                ),
+                "after_body": "## Allowed Paths\n- `docs/dev/workflow.md`\n",
+                "source_refs": {
+                    "before": "fixture:before",
+                    "current": "fixture:current",
+                },
+            }
+        }
+        output, _ = run_planner(input_data)
+        assert output["fail_closed"]["required"] is True
+        assert output["fail_closed"]["reason_codes"] == ["ambiguous_scope_signal"]

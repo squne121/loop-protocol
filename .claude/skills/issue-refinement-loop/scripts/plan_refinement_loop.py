@@ -36,6 +36,15 @@ try:
 except ImportError:
     _YAML_AVAILABLE = False
 
+try:
+    from scope_signal_delta import compute_scope_signal_delta
+except ImportError:  # pragma: no cover - subprocess/CLI fallback path
+    compute_scope_signal_delta = None
+
+
+class ScopeSignalDeltaError(RuntimeError):
+    """Raised when scope_signal_delta_input exists but cannot be consumed safely."""
+
 
 # ---------------------------------------------------------------------------
 # Schema constants
@@ -630,12 +639,42 @@ def _is_anchor_reframe_context(known_context: dict | None) -> bool:
     """Check if known_context indicates anchor reframe exclusion."""
     if not known_context:
         return False
+    has_scope_signal_delta_input = "scope_signal_delta_input" in known_context
+    scope_delta_decision = known_context.get("scope_delta_decision")
+    if isinstance(scope_delta_decision, dict):
+        if (
+            scope_delta_decision.get("status") == "approved_by_trusted_anchor"
+            and scope_delta_decision.get("implementation_go") is False
+            and scope_delta_decision.get("required_rerun")
+        ):
+            return True
+    if has_scope_signal_delta_input:
+        return False
     classification = known_context.get("classification")
     if classification in ("feedback_update_required", "reframe_in_place"):
         return True
     if known_context.get("anchor_comment_url") and known_context.get("anchor_reframe", False):
         return True
     return False
+
+
+def _delta_projection_to_evidence_spans(delta_result: dict[str, Any]) -> list[dict[str, Any]]:
+    projection = delta_result.get("legacy_scope_signal_guard", {})
+    source_refs = (delta_result.get("inputs") or {}).get("source_refs") or {}
+    evidence_spans = []
+    for line in projection.get("triggering_lines", []):
+        body_version = line["body_version"]
+        source_ref = source_refs.get(body_version)
+        evidence_spans.append(
+            {
+                "source": f"scope_signal_delta_{body_version}_body",
+                "source_ref": source_ref,
+                "start_line": line["start_line"],
+                "end_line": line["end_line"],
+                "text_sha256": line["text_sha256"].removeprefix("sha256:"),
+            }
+        )
+    return evidence_spans
 
 
 def _detect_scope_signals(issue_body: str, known_context: dict | None) -> tuple[bool, str, list]:
@@ -646,6 +685,27 @@ def _detect_scope_signals(issue_body: str, known_context: dict | None) -> tuple[
 
     Precedence: new_unverifiable_ac > new_allowed_path_layer > new_in_scope_area > none
     """
+    if known_context and "scope_signal_delta_input" in known_context:
+        if compute_scope_signal_delta is None:
+            raise ScopeSignalDeltaError("scope_signal_delta helper is unavailable")
+        if not isinstance(known_context.get("scope_signal_delta_input"), dict):
+            raise ScopeSignalDeltaError("scope_signal_delta_input must be an object")
+        try:
+            delta_result = compute_scope_signal_delta(known_context["scope_signal_delta_input"])
+            projection = delta_result.get("legacy_scope_signal_guard", {})
+            evidence_spans = _delta_projection_to_evidence_spans(delta_result)
+            if projection.get("triggered"):
+                if _is_anchor_reframe_context(known_context):
+                    return (False, SCOPE_SIGNAL_REASON_ANCHOR_REFRAME, evidence_spans)
+                return (
+                    True,
+                    projection.get("reason_code", SCOPE_SIGNAL_REASON_NO_SIGNAL),
+                    evidence_spans,
+                )
+            return (False, SCOPE_SIGNAL_REASON_NO_SIGNAL, [])
+        except Exception as exc:
+            raise ScopeSignalDeltaError(f"scope_signal_delta_input is invalid: {exc}") from exc
+
     evidence_spans = []
     sections = _extract_sections(issue_body)
 
@@ -1444,6 +1504,56 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
         }
 
         return plan, 0
+
+    except ScopeSignalDeltaError as e:
+        fail_closed_plan = {
+            "schema_version": SCHEMA_VERSION,
+            "source": {
+                "issue_number": issue_number if "issue_number" in locals() else None,
+                "issue_body_sha256": issue_body_sha256 if "issue_body_sha256" in locals() else None,
+                "comments_sha256": comments_sha256 if "comments_sha256" in locals() else None,
+                "known_context_sha256": known_context_sha256 if "known_context_sha256" in locals() else None,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            "decisions": {
+                "investigation_policy": {
+                    "required": False,
+                    "reason_code": INVESTIGATION_REASON_UNKNOWN_SCHEMA,
+                    "target_paths": [],
+                    "repo_claims": [],
+                    "evidence_spans": [],
+                    "confidence": CONFIDENCE_UNKNOWN,
+                },
+                "web_research_policy": {
+                    "required": False,
+                    "reason_code": WEB_RESEARCH_REASON_UNKNOWN_SCHEMA,
+                    "critical_external_claims": [],
+                    "evidence_spans": [],
+                    "confidence": CONFIDENCE_UNKNOWN,
+                },
+                "scope_delta_decision": None,
+                "scope_signal_guard": {
+                    "triggered": False,
+                    "reason_code": SCOPE_SIGNAL_REASON_NO_SIGNAL,
+                    "excluded_by_anchor_reframe": False,
+                    "evidence_spans": [],
+                },
+                "delivery_rollup": {
+                    "applicable": False,
+                    "unmaterialized_slots": [],
+                    "evidence_spans": [],
+                },
+                "follow_up_materialization": {
+                    "candidates": [],
+                },
+            },
+            "fail_closed": {
+                "required": True,
+                "reason_codes": [FAIL_CLOSED_REASON_AMBIGUOUS_SIGNAL],
+                "human_message": str(e),
+            },
+        }
+        return fail_closed_plan, 0
 
     except Exception as e:
         # Internal error - B3: Return schema-valid decisions with unknown confidence
