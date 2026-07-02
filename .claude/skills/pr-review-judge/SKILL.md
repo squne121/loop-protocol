@@ -3,9 +3,9 @@ name: pr-review-judge
 description: implementation child issue に紐づく PR をレビューし、linked issue の contract と PR diff / 証跡を照合して APPROVE / REQUEST_CHANGES を判定する。self-authored PR は `gh pr review --comment` のみを使う。
 ---
 
-# PR Review Judge
+# PR Review Judge（PRレビュー判定）
 
-## Input
+## Input（入力）
 
 - `PR番号` または `PR URL`（必須）
 - `reviewed_head_sha`（任意）
@@ -38,9 +38,9 @@ description: implementation child issue に紐づく PR をレビューし、lin
 
 優先順位:
 
-1. `TEST_VERDICT_MACHINE`
-2. `CI_CHECK_RUN_SCOPED`
-3. `PR_BODY_SELF_REPORT`（単独では APPROVE 不可）
+1. 最優先は `TEST_VERDICT_MACHINE`
+2. 次点は `CI_CHECK_RUN_SCOPED`
+3. 補助報告は `PR_BODY_SELF_REPORT`（単独では APPROVE 不可）
 
 - APPROVE 禁止条件
   - `verification_skipped_count > 0`
@@ -73,7 +73,7 @@ uv run --locked python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summar
 - scope 混入（無関係修正）: blocker
 - immediate runtime AC: `## Runtime Verification Evidence` と artifact/log 証跡
 
-### 4.5) Schema Consumer Inventory Gate
+### 4.5) `Schema Consumer Inventory` の有無と妥当性を判定
 
 PR が schema を変更しうると判断される場合:
 
@@ -82,11 +82,11 @@ PR が schema を変更しうると判断される場合:
 
 `schema_change` / `uncertain` だが表記不足なら `REQUEST_CHANGES`。
 
-### 4.6) Safety Claim Gate
+### 4.6) Safety Claim Gate（Safety Claim の判定ゲート）
 
 `.claude/skills/**`, 権限・サンドボックス系差分、または安全ワード/本文条件を満たすと safety-sensitive。
 
-`Safety-sensitive` は `Safety Claim Matrix` 必須。
+`Safety-sensitive` 判定になった場合は `Safety Claim Matrix` を必須とする。
 
 `Not controlled` 列が非空の際は bounded な主張であること、証跡一致、必要 follow-up があることを確認。
 
@@ -98,10 +98,10 @@ PR が schema を変更しうると判断される場合:
 `required_auto_actions` を機械的に決定（`mechanical: true` のみ）。
 意味論的不足（`mechanical: false`）は常に `blockers` 側へ残す。
 
-- `Closes` 不足: `ensure_closing_keyword`
-- PR body hygiene 欠陥: `update_pr_body_hygiene`
-- `BEHIND` + `MERGEABLE`: `update_branch`
-- `Safety Claim Matrix`、`Schema Consumer Inventory` の欠落は `mechanical: false` の blocker として扱う。
+- `Closes` 不足時は `ensure_closing_keyword`
+- PR body hygiene 欠陥時は `update_pr_body_hygiene`
+- `BEHIND` + `MERGEABLE` 時は `update_branch`
+- `Safety Claim Matrix` と `Schema Consumer Inventory` の欠落は `mechanical: false` の blocker として扱う。
 
 `merge_ready` は `verdict == APPROVE` かつ blockers なし かつ required_auto_actions 空 かつ mergeability が CLEAN/UNSTABLE であるときのみ true。
 
@@ -116,50 +116,50 @@ merge_ready は impl-review-loop の終端条件。
 - `LOOP_VERDICT_V2` を `gh pr review --comment` 等で投稿
 - self-authored でも常に `--comment`
 
-## Output Contract
+## Output Contract（出力契約）
 
 最小に必要な fields:
 
-- `verdict: APPROVE | REQUEST_CHANGES`
-- `reviewed_head_sha`
-- `merge_ready`
-- `mergeability.mergeable / merge_state_status`
-- `blockers[]`
-- `required_auto_actions[]`（object）
-- `auto_fix_applied`
-- `follow_up_issue_requests[]`
+- verdict 値: `verdict: APPROVE | REQUEST_CHANGES`
+- レビュー対象 head: `reviewed_head_sha`
+- merge 可否: `merge_ready`
+- merge 状態: `mergeability.mergeable / merge_state_status`
+- blocker 一覧: `blockers[]`
+- 自動対応一覧: `required_auto_actions[]`（object）
+- 自動修正結果: `auto_fix_applied`
+- follow-up 要求: `follow_up_issue_requests[]`
 
 `LOOP_VERDICT_V2` は `snake_case` を厳守し、`recommendations`（camelCase）を出さない。
 
 ### required_auto_actions 結果 schema（要点）
 
-- `kind`: `ensure_closing_keyword` | `update_pr_body_hygiene` | `update_branch`
-- `executor`: `implementation-worker`
-- `skill`: `open-pr.update_pr` | `implement-issue.update_branch`
+- 種別 `kind`: `ensure_closing_keyword` | `update_pr_body_hygiene` | `update_branch`
+- 実行者 `executor`: `implementation-worker`
+- 使用 skill `skill`: `open-pr.update_pr` | `implement-issue.update_branch`
 - `mechanical`: `true` 固定（false の場合は `blockers`）
 - `blocking_merge_ready: true`
-- `expected_head_sha`（update_branch の場合のみ必須）
+- `expected_head_sha`（`update_branch` の場合のみ必須）
 
-### consumer_inventory
+### consumer_inventory（消費先一覧）
 
 - `impl-review-loop` が本 `pr-review-judge` の出力を受け取り、`merge_ready` が true かつ blocker が無い場合にループを終了する。
 - `pr-reviewer` は `allowed_paths` / `contract` 監査結果を `LOOP_VERDICT_V2.allowed_paths_gate` として受け渡す。
 - `consumer_inventory` の完全置換は #631/#632 のランタイム挙動完了まで行わない（既存消費者の振る舞いを維持）。
 
-### ALLOWED_PATHS_GATE_RESULT_V1
+### ALLOWED_PATHS_GATE_RESULT_V1（Allowed Paths 判定結果）
 
 PR review 後に `allowed_paths_review_gate.py` を使って changed files の契約違反を再計算。
 snapshot freshness 用の `contract_fingerprint.base_sha_at_snapshot` と、local fallback changed files 算出用の
 `diff_base_sha` は別物として扱う。local fallback の `changed_files_source` は
 `git_diff_current_merge_base_head` で、snapshot base を changed files diff には使わない。
 
-`status` は `ok | fail_closed | stale_snapshot | indeterminate`。
+`status` は判定状態として `ok | fail_closed | stale_snapshot | indeterminate` を取る。
 
-`indeterminate/fail_closed` は merge-blocking。
+`indeterminate/fail_closed` は merge-blocking 状態として扱う。
 
-## Output Constraint (OUTPUT_BUDGET_V1)
+## Output Constraint（OUTPUT_BUDGET_V1 出力制約）
 
-`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` を遵守。
+出力上限は `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` を遵守。
 
 `LOOP_VERDICT_V2` の全フィールドは維持。
 
@@ -167,14 +167,14 @@ snapshot freshness 用の `contract_fingerprint.base_sha_at_snapshot` と、loca
 
 - `references/evidence-policy.md`: 証拠優先度、`PR_BODY_SELF_REPORT_ONLY_APPROVE_PROHIBITED`、APPROVE 禁止条件。
 - `references/ci-verdict-summary.md`: `ci_verdict_summary.py` の判定規則。
-- `references/ac-evidence-checks.md`: AC coverage / Allowed Paths / runtime evidence / placeholder 判定。
+- `references/ac-evidence-checks.md`: AC coverage、Allowed Paths、runtime evidence、placeholder 判定。
 - `references/schema-consumer-gate.md`: schema_change_applicability と `Schema Consumer Inventory` 判定。
 - `references/safety-claim-gate.md`: safety-sensitive 判定と `Safety Claim Matrix` 要件。
-- `references/loop-verdict-v2-schema.md`: `LOOP_VERDICT_V2` 必須フィールド。
-- `references/allowed-paths-gate.md`: `ALLOWED_PATHS_GATE_RESULT_V1` 再計算手順。
+- `references/loop-verdict-v2-schema.md`: `LOOP_VERDICT_V2` の必須フィールド。
+- `references/allowed-paths-gate.md`: `ALLOWED_PATHS_GATE_RESULT_V1` の再計算手順。
 - `references/required-auto-actions.md`: required_auto_actions の object schema と merge_ready への反映。
 - `references/verdict-output-template.md`: コメントテンプレート。
-- `references/deterministic-gates.md`: G1–G5 重要 gate。
+- `references/deterministic-gates.md`: G1–G5 の重要 gate。
 
 ## Verdict コメントテンプレート
 
@@ -198,11 +198,11 @@ auto_fix_applied: []
 follow_up_issue_requests: []
 ````
 
-## Related
+## Related（関連資料）
 
-- `.claude/skills/implement-issue/SKILL.md`
-- `.claude/skills/impl-review-loop/SKILL.md`
-- `.claude/agents/pr-reviewer.md`
-- `.claude/agents/test-runner.md`
-- `.github/pull_request_template.md`
-- `docs/dev/schema-governance.md`
+- 実装フロー: `.claude/skills/implement-issue/SKILL.md`
+- 反復フロー: `.claude/skills/impl-review-loop/SKILL.md`
+- reviewer agent: `.claude/agents/pr-reviewer.md`
+- test runner agent: `.claude/agents/test-runner.md`
+- PR template: `.github/pull_request_template.md`
+- schema governance: `docs/dev/schema-governance.md`
