@@ -63,7 +63,7 @@
 | `provider` | `"agy"` 固定。 |
 | `tool_profile` | `"no_tools"`、`"proposal_only"`、または `"local_asset_research"` のみ。 |
 | `prompt` | 必須。空文字・空白のみは `agy_empty_prompt` で拒否。 |
-| `context_files` | `local_asset_research` 時は必須。repo 境界とシンボリックリンク境界検証後に wrapper が evidence を集約し、AGY へ prompt 注入する。 |
+| `context_files` | `local_asset_research` 時は必須。repo 境界とシンボリックリンク境界検証後に wrapper が repo-relative JSON evidence envelope を集約し、AGY へ prompt 注入する。 |
 | `model` | 指定禁止。`unsupported_provider_option` で拒否。 |
 | `post_to_issue_url` | 指定禁止。`provider_forbids_post_to_issue_url` で拒否。 |
 | `grounded_research` / `github_research` | 使用禁止。`unsupported_provider_profile` で拒否。 |
@@ -88,19 +88,32 @@
 | `proposal_only` | isolated temp cwd | bounded draft text (`implementation_draft` / `issue_authoring_draft` / `patch_proposal` / `command_plan`) | file edit/write、shell execution、GitHub write / `post_to_issue_url`、repo 探索、実装完了を装う報告 |
 | `github_research` | repo root | wrapper が許可コマンドを `gh` で実行し結果を `inline_context` に prepend。Gemini は結果を解釈して報告を返す | `post_to_issue_url`、gh write コマンド（issue comment/edit/create/close 等）、`gh api` 非 GET method、shell 実行、file edit/write |
 
-`local_asset_research` は `no_tools` と違い Serena MCP を使えるが、対象は repo 内の read-only ローカル資産調査だけである。`grounded_research` と違い外部 Web grounding は使わない。
+`local_asset_research` は `no_tools` と違い Serena contract を wrapper 側で検証し、repo 内の read-only ローカル資産調査だけを扱う。AGY 本体には repo root、MCP 設定、direct tool access、absolute path を渡さない。`grounded_research` と違い外部 Web grounding は使わない。
 
 `proposal_only` は `no_tools` と同じ isolated temp cwd で動くが、目的は調査結果そのものではなく「Codex 側 worker が採用・修正・実行できる下書き」を返すことにある。最終 file edit / shell 実行 / GitHub mutation は Codex 側に残し、Gemini 側には proposal text だけを持たせる。
 
-`local_asset_research` の `context_files` は、絶対パス・相対パスのどちらでも `Path.resolve()` 後の symlink 解決済みパスが repo root 配下にある場合だけ許可される。repo 外へ解決される絶対パス、`../` 参照、symlink は `failure_reason` / `warnings` に理由を残して fail-closed する。
+`local_asset_research` の `context_files` は、絶対パス・相対パスのどちらでも `Path.resolve()` 後の symlink 解決済みパスが repo root 配下にある場合だけ許可される。repo 外へ解決される絶対パス、`../` 参照、symlink は `failure_reason` / `warnings` に理由を残して fail-closed する。境界検証に失敗した場合、wrapper は payload bounds や prompt build のための `stat()` / `read_text()` に進まない。
 
 `local_asset_research` は `.gemini/settings.json` の以下を wrapper が machine-checkable に確認できる場合だけ実行する:
 
 - `mcp.allowed` が `["serena"]` である。
-- `mcpServers.serena.command` が `uvx` で、`args` に `serena` と `--project-from-cwd` が含まれる。
+- `mcpServers.serena.command` が `uvx` で、`args` に `serena`、`--project-from-cwd`、pin 済みの `git+https://github.com/oraios/serena@<commit>` または `serena==<version>` が含まれる。
 - `mcpServers.serena.trust` が `false` である。
 - `mcpServers.serena.includeTools` が `find_file` / `find_referencing_symbols` / `find_symbol` / `get_symbols_overview` / `list_dir` / `search_for_pattern` のみである。
-- `execute_shell_command`、`write_file`、`read_file_content`、`read_memory`、`write_memory` などの危険 tool は `excludeTools` で denylist されている。
+- `execute_shell_command`、`write_file`、`read_file`、`read_file_content`、`replace_content`、`replace_in_files`、`rename_symbol`、`safe_delete_symbol`、`read_memory`、`write_memory`、`delete_memory`、`edit_memory` などの危険 tool は `excludeTools` で denylist されている。
+
+AGY prompt に渡す local asset context は、以下を持つ JSON evidence envelope に限定する。
+
+- `tool_name`
+- `query`
+- `repo_relative_path`
+- `line_range`
+- `content_snippet`
+- `byte_size`
+- `sha256`
+- `redaction_status`
+- `manifest_id`
+- `source_kind`
 
 上記が未検証 MCP 設定、危険 tool、または Windows wrapper / repo 外読み取りを含む場合、wrapper は fail-closed として `ok: false`、`failure_reason`、`warnings` を返す。曖昧に `grounded_research` へ流用してはならない。
 

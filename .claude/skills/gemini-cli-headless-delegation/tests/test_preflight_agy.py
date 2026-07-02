@@ -47,7 +47,18 @@ def _make_happy_run(module):
     return fake_run
 
 
-def _write_settings(root: Path, *, include_tools: list[str], exclude_tools: list[str] | None = None) -> None:
+def _write_settings(
+    root: Path,
+    *,
+    include_tools: list[str],
+    exclude_tools: list[str] | None = None,
+    pinned: bool = True,
+) -> None:
+    serena_source = (
+        "git+https://github.com/oraios/serena@0123456789abcdef"
+        if pinned
+        else "git+https://github.com/oraios/serena"
+    )
     settings_dir = root / ".gemini"
     settings_dir.mkdir(parents=True, exist_ok=True)
     settings = {
@@ -57,7 +68,7 @@ def _write_settings(root: Path, *, include_tools: list[str], exclude_tools: list
         "mcpServers": {
             "serena": {
                 "command": "uvx",
-                "args": ["uvx", "serena", "--project-from-cwd"],
+                "args": ["--from", serena_source, "serena", "--project-from-cwd"],
                 "trust": False,
                 "includeTools": include_tools,
                 "excludeTools": exclude_tools or [],
@@ -527,3 +538,22 @@ def test_local_asset_research_contract_validation_rejects_unknown_tool(monkeypat
     assert result["failure_class"] == "local_asset_contract_invalid"
     assert result["local_asset_research"]["ok"] is False
     assert any("unknown_tool_policy" in item for item in result["local_asset_research"]["errors"])
+
+
+def test_local_asset_research_contract_validation_rejects_unpinned_serena(monkeypatch, tmp_path):
+    """--local-asset-research rejects an unpinned Serena source."""
+    module = load_module()
+    monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)  # type: ignore[call-arg]
+    _write_settings(
+        tmp_path,
+        include_tools=sorted(module.SERENA_READ_ONLY_TOOLS),
+        exclude_tools=sorted(module.SERENA_DANGEROUS_TOOLS),
+        pinned=False,
+    )
+
+    monkeypatch.setattr(module, "_run", _make_happy_run(module))
+    result = module.run_preflight(validate_local_asset_contract=True)
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "local_asset_contract_invalid"
+    assert any("pinned_serena_version_or_commit" in item for item in result["local_asset_research"]["errors"])

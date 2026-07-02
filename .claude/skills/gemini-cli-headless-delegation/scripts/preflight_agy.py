@@ -36,17 +36,25 @@ SERENA_DANGEROUS_TOOLS = frozenset({
     "insert_at_line",
     "insert_before_symbol",
     "prepare_for_new_conversation",
+    "read_file",
     "read_file_content",
     "read_memory",
+    "replace_content",
+    "replace_in_files",
     "remove_project",
     "replace_lines",
     "replace_regex",
     "replace_symbol_body",
+    "rename_symbol",
     "restart_language_server",
+    "safe_delete_symbol",
     "switch_modes",
     "think_about_collected_information",
     "think_about_task_adherence",
     "think_about_whether_you_are_done",
+    "delete_memory",
+    "edit_memory",
+    "rename_memory",
     "write_file",
     "write_memory",
 })
@@ -113,6 +121,18 @@ def _validate_local_asset_serena_contract(repo_root: Path | None = None) -> list
     if command != "uvx" or not isinstance(args, list) or "serena" not in args or "--project-from-cwd" not in args:
         errors.append(
             "local_asset_research requires WSL-local Serena MCP command: uvx ... serena ... --project-from-cwd"
+        )
+    elif not any(
+        isinstance(arg, str)
+        and (
+            (arg.startswith("git+https://github.com/oraios/serena@") and len(arg.rsplit("@", 1)[-1]) >= 7)
+            or re.search(r"\bserena==[A-Za-z0-9_.!-]+", arg)
+        )
+        for arg in args
+    ):
+        errors.append(
+            "local_asset_research requires pinned_serena_version_or_commit in "
+            ".gemini/settings.json mcpServers.serena.args"
         )
 
     trust = serena.get("trust", False)

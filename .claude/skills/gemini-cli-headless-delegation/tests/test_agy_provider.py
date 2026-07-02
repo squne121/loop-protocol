@@ -185,12 +185,16 @@ def test_ac7_agy_local_asset_research_success_with_wrapper_validation(tmp_path, 
     assert result["response_text"] == "LOOP_AGY_SMOKE_OK"
     assert result["provider"] == "agy"
     assert result["safety_mode"] == "degraded_wrapper_only"
-    assert "AGY is executed in degraded wrapper-only mode" in captured_prompt["value"]
+    assert "AGY is executed in prompt-only wrapper-side evidence mode" in captured_prompt["value"]
+    assert "BEGIN LOCAL ASSET EVIDENCE: context.md" in captured_prompt["value"]
+    assert '"repo_relative_path": "context.md"' in captured_prompt["value"]
+    assert '"source_kind": "wrapper_side_serena_evidence"' in captured_prompt["value"]
+    assert str(repo_root) not in captured_prompt["value"]
     assert "Operator objective:" in captured_prompt["value"]
 
 
-def test_ac7_agy_local_asset_research_rejects_context_outside_repo(tmp_path, monkeypatch) -> None:
-    """AC7: provider=agy local_asset_research rejects context outside repository."""
+def test_ac7_agy_local_asset_research_rejects_context_outside_repo_before_read(tmp_path, monkeypatch) -> None:
+    """AC7: outside-repo local_asset_research context is rejected before payload read."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     outside = tmp_path / "outside.txt"
@@ -199,10 +203,18 @@ def test_ac7_agy_local_asset_research_rejects_context_outside_repo(tmp_path, mon
     monkeypatch.setattr(rgh, "_repo_root", lambda: repo_root)  # type: ignore[call-arg]
     monkeypatch.setattr(rgh, "_validate_local_asset_research_settings", lambda: [])  # type: ignore[call-arg]
 
-    result = rgh.run_delegation(
-        _agy_request(tool_profile="local_asset_research", context_files=[str(outside)]),
-        request_path=repo_root / "request.json",
-    )
+    original_read_text = Path.read_text
+
+    def guarded_read_text(path: Path, *args: Any, **kwargs: Any) -> str:
+        if path == outside:
+            raise AssertionError("outside repo context must not be read")
+        return original_read_text(path, *args, **kwargs)
+
+    with patch.object(Path, "read_text", guarded_read_text):
+        result = rgh.run_delegation(
+            _agy_request(tool_profile="local_asset_research", context_files=[str(outside)]),
+            request_path=repo_root / "request.json",
+        )
 
     assert result["ok"] is False
     assert result["failure_reason"].startswith("local_asset_research context file must be inside repository")
