@@ -94,14 +94,15 @@
 
 `local_asset_research` の `context_files` は、絶対パス・相対パスのどちらでも `Path.resolve()` 後の symlink 解決済みパスが repo root 配下にある場合だけ許可される。repo 外へ解決される絶対パス、`../` 参照、symlink は `failure_reason` / `warnings` に理由を残して fail-closed する。境界検証に失敗した場合、wrapper は payload bounds や prompt build のための `stat()` / `read_text()` に進まない。
 
-`local_asset_research` は `.gemini/settings.json` と checked-in `.claude/skills/gemini-cli-headless-delegation/references/serena-tool-manifest.json` の以下を wrapper が machine-checkable に確認できる場合だけ実行する:
+`local_asset_research` は `.agents/mcp_config.json`、互換確認用の `.gemini/settings.json`、checked-in `.claude/skills/gemini-cli-headless-delegation/references/serena-tool-manifest.json` の以下を wrapper が machine-checkable に確認できる場合だけ実行する。AGY 用の MCP 起動設定の正本は `.agents/mcp_config.json` であり、AGY 本体へこの config を渡すのではなく wrapper 側の SerenaMCP stdio probe/retrieval だけが使用する:
 
-- `mcp.allowed` が `["serena"]` である。
-- `mcpServers.serena.command` が `uvx` で、`args` に `serena`、`--project-from-cwd`、pin 済みの `git+https://github.com/oraios/serena@<commit>` または `serena==<version>` が含まれる。
-- `mcpServers.serena.trust` が `false` である。
-- `mcpServers.serena.includeTools` が `find_file` / `find_referencing_symbols` / `find_symbol` / `get_symbols_overview` / `list_dir` / `search_for_pattern` のみである。
+- `.gemini/settings.json` の `mcp.allowed` が `["serena"]` である。
+- `.agents/mcp_config.json` と `.gemini/settings.json` の `mcpServers.serena.command` が `uvx` で、`args` に `serena`、`--project-from-cwd`、pin 済みの `git+https://github.com/oraios/serena@<commit>` または `serena==<version>` が含まれる。
+- `.agents/mcp_config.json` と `.gemini/settings.json` の `mcpServers.serena.trust` が `false` である。
+- `.agents/mcp_config.json` と `.gemini/settings.json` の `mcpServers.serena.includeTools` が `find_file` / `find_referencing_symbols` / `find_symbol` / `get_symbols_overview` / `list_dir` / `search_for_pattern` のみである。
 - `execute_shell_command`、`write_file`、`read_file`、`read_file_content`、`replace_content`、`replace_in_files`、`rename_symbol`、`safe_delete_symbol`、`read_memory`、`write_memory`、`delete_memory`、`edit_memory` などの危険 tool は `excludeTools` で denylist されている。
 - `includeTools` / `excludeTools` / pinned ref は manifest と exact/superset 照合し、unknown tool または drift は fail-closed する。
+- `--live-serena` preflight は `.agents/mcp_config.json` の pinned command から SerenaMCP stdio server を起動し、`initialize`、`tools/list`、`find_file`、`search_for_pattern`、`get_symbols_overview` の transcript と evidence count を返す。
 
 AGY prompt に渡す local asset context は、以下を持つ JSON evidence envelope に限定する。
 
@@ -114,7 +115,7 @@ AGY prompt に渡す local asset context は、以下を持つ JSON evidence env
 - `sha256`: snippet 内容の hash。
 - `redaction_status`: credential-like payload 検査の状態。
 - `manifest_id`: Serena manifest schema/ref の照合元。
-- `source_kind`: `serena_mcp_read_only_evidence`。`context_files` の direct read fallback は `manual_context_file_evidence` として扱い、SerenaMCP retrieval success evidence と混同しない。
+- `source_kind`: live SerenaMCP stdio retrieval のみ `serena_mcp_read_only_evidence`。test double / direct context fallback は `serena_mcp_test_double_evidence` または `manual_context_file_evidence` として扱い、SerenaMCP retrieval success evidence と混同しない。
 
 上記が未検証 MCP 設定、危険 tool、または Windows wrapper / repo 外読み取りを含む場合、wrapper は fail-closed として `ok: false`、`failure_reason`、`warnings` を返す。曖昧に `grounded_research` へ流用してはならない。
 

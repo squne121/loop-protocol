@@ -68,7 +68,7 @@ def _write_settings(
         "mcpServers": {
             "serena": {
                 "command": "uvx",
-                "args": ["--from", serena_source, "serena", "--project-from-cwd"],
+                "args": ["--from", serena_source, "serena", "start-mcp-server", "--project-from-cwd"],
                 "trust": False,
                 "includeTools": include_tools,
                 "excludeTools": exclude_tools or [],
@@ -76,6 +76,13 @@ def _write_settings(
         },
     }
     (settings_dir / "settings.json").write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    agents_dir = root / ".agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    agy_mcp_config = {"mcpServers": settings["mcpServers"]}
+    (agents_dir / "mcp_config.json").write_text(
+        json.dumps(agy_mcp_config, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _write_manifest(
@@ -97,7 +104,8 @@ def _write_manifest(
             "--from",
             f"git+https://github.com/oraios/serena@{pinned_ref}",
             "serena",
-            "--project-from-cwd",
+        "start-mcp-server",
+        "--project-from-cwd",
         ],
         "read_only_allowlist": sorted(module.SERENA_READ_ONLY_TOOLS),
         "dangerous_denylist": sorted(module.SERENA_DANGEROUS_TOOLS),
@@ -549,6 +557,49 @@ def test_local_asset_research_contract_validation_success(monkeypatch, tmp_path)
     assert result["local_asset_research"]["ok"] is True
     assert result["local_asset_research"]["status"] == "ok"
     assert result["local_asset_research"]["unknown_tool_policy"] == module.LOCAL_ASSET_SERENA_TOOL_POLICY
+    assert result["local_asset_research"]["config_path"] == ".agents/mcp_config.json"
+
+
+def test_local_asset_research_live_serena_result_surface(monkeypatch, tmp_path):
+    """AC10: --live-serena returns called tools, transcript, and evidence count."""
+    module = load_module()
+    monkeypatch.chdir(tmp_path)
+    _write_manifest(module, tmp_path)
+    _write_settings(
+        tmp_path,
+        include_tools=sorted(module.SERENA_READ_ONLY_TOOLS),
+        exclude_tools=sorted(module.SERENA_DANGEROUS_TOOLS),
+    )
+    monkeypatch.setattr(module, "_run", _make_happy_run(module))
+
+    def fake_live(repo_root, manifest, mcp_config_path=None, timeout_sec=60.0):
+        return {
+            "ok": True,
+            "transport": "mcp_stdio",
+            "server_started": True,
+            "initialized": True,
+            "tools_list_checked": True,
+            "tools_seen": ["find_file", "search_for_pattern", "get_symbols_overview"],
+            "called_tools": ["find_file", "search_for_pattern", "get_symbols_overview"],
+            "evidence_envelope_count": 3,
+            "transcript": [
+                {"event": "mcp_server_launch"},
+                {"event": "mcp_response", "method": "tools/list"},
+                {"event": "evidence_envelope_created", "tool_name": "find_file"},
+            ],
+        }
+
+    monkeypatch.setattr(module, "_call_serena_mcp_live", fake_live)
+    result = module.run_preflight(validate_local_asset_contract=True, live_serena=True)
+
+    assert result["ok"] is True
+    assert result["local_asset_research"]["serena"]["called_tools"] == [
+        "find_file",
+        "search_for_pattern",
+        "get_symbols_overview",
+    ]
+    assert result["local_asset_research"]["serena"]["evidence_envelope_count"] == 3
+    assert result["local_asset_research"]["live_transcript"][0]["event"] == "mcp_server_launch"
 
 
 def test_local_asset_research_contract_validation_rejects_unknown_tool(monkeypatch, tmp_path):

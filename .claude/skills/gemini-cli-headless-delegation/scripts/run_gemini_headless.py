@@ -175,6 +175,7 @@ LOCAL_ASSET_MAX_CONTEXT_TOTAL_BYTES = 600_000
 SERENA_TOOL_MANIFEST_RELATIVE_PATH = Path(
     ".claude/skills/gemini-cli-headless-delegation/references/serena-tool-manifest.json"
 )
+AGY_MCP_CONFIG_RELATIVE_PATH = Path(".agents/mcp_config.json")
 
 # github_research: allowed gh subcommand argv prefixes (first two tokens of argv)
 GITHUB_RESEARCH_ALLOWED_ARGV_PREFIXES: frozenset[tuple[str, ...]] = frozenset({
@@ -296,32 +297,26 @@ SERENA_READ_ONLY_TOOLS = frozenset({
 SERENA_DANGEROUS_TOOLS = frozenset({
     "activate_project",
     "create_text_file",
-    "delete_lines",
     "execute_shell_command",
+    "find_declaration",
+    "find_implementations",
+    "get_current_config",
+    "get_diagnostics_for_file",
+    "initial_instructions",
     "insert_after_symbol",
-    "insert_at_line",
     "insert_before_symbol",
-    "prepare_for_new_conversation",
+    "list_memories",
+    "onboarding",
     "read_file",
-    "read_file_content",
     "read_memory",
     "replace_content",
     "replace_in_files",
-    "remove_project",
-    "replace_lines",
-    "replace_regex",
     "replace_symbol_body",
     "rename_symbol",
-    "restart_language_server",
     "safe_delete_symbol",
-    "switch_modes",
-    "think_about_collected_information",
-    "think_about_task_adherence",
-    "think_about_whether_you_are_done",
     "delete_memory",
     "edit_memory",
     "rename_memory",
-    "write_file",
     "write_memory",
 })
 VAGUE_OBJECTIVE_PHRASES = {
@@ -402,31 +397,24 @@ def _serena_manifest_id(manifest: Mapping[str, Any]) -> str:
     return f"serena_tool_manifest_v1:{manifest['pinned_ref']}"
 
 
-def _validate_serena_settings_against_manifest(settings: Mapping[str, Any], manifest: Mapping[str, Any]) -> list[str]:
+def _validate_serena_server_config(
+    serena: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    *,
+    source_label: str,
+) -> list[str]:
     errors: list[str] = []
     expected_read_only = set(manifest["read_only_allowlist"])
     expected_dangerous = set(manifest["dangerous_denylist"])
     known_tools = set(manifest["known_tools"])
     pinned_ref = str(manifest["pinned_ref"])
 
-    mcp = settings.get("mcp")
-    allowed_servers = mcp.get("allowed") if isinstance(mcp, Mapping) else None
-    if allowed_servers != [SERENA_MCP_SERVER_NAME]:
-        errors.append("local_asset_research requires .gemini/settings.json mcp.allowed to equal ['serena']")
-
-    servers = settings.get("mcpServers")
-    if not isinstance(servers, Mapping):
-        return errors + ["local_asset_research requires .gemini/settings.json mcpServers"]
-    serena = servers.get(SERENA_MCP_SERVER_NAME)
-    if not isinstance(serena, Mapping):
-        return errors + ["local_asset_research requires .gemini/settings.json mcpServers.serena"]
-
     command = serena.get("command")
     args = serena.get("args")
     expected_source = f"git+https://github.com/oraios/serena@{pinned_ref}"
     if command != "uvx" or not isinstance(args, list) or "serena" not in args or "--project-from-cwd" not in args:
         errors.append(
-            "local_asset_research requires WSL-local Serena MCP command: "
+            f"local_asset_research requires {source_label} Serena MCP command: "
             "uvx ... serena ... --project-from-cwd"
         )
     elif expected_source not in args and not any(
@@ -434,17 +422,17 @@ def _validate_serena_settings_against_manifest(settings: Mapping[str, Any], mani
     ):
         errors.append(
             "local_asset_research pinned_serena_manifest_mismatch: "
-            ".gemini/settings.json mcpServers.serena.args must match checked-in manifest pinned_ref"
+            f"{source_label} args must match checked-in manifest pinned_ref"
         )
 
     if serena.get("trust", False) is not False:
-        errors.append("local_asset_research requires mcpServers.serena.trust to be false")
+        errors.append(f"local_asset_research requires {source_label}.trust to be false")
 
     include_tools = serena.get("includeTools")
     if not isinstance(include_tools, list) or not include_tools:
-        errors.append("local_asset_research requires mcpServers.serena.includeTools read-only allowlist")
+        errors.append(f"local_asset_research requires {source_label}.includeTools read-only allowlist")
     elif not all(isinstance(tool, str) for tool in include_tools):
-        errors.append("local_asset_research requires includeTools to contain only strings")
+        errors.append(f"local_asset_research requires {source_label}.includeTools to contain only strings")
     else:
         include_set = set(include_tools)
         unknown = sorted(include_set - known_tools)
@@ -462,12 +450,49 @@ def _validate_serena_settings_against_manifest(settings: Mapping[str, Any], mani
 
     exclude_tools = serena.get("excludeTools", [])
     if not isinstance(exclude_tools, list):
-        errors.append("local_asset_research requires excludeTools to be a list when present")
+        errors.append(f"local_asset_research requires {source_label}.excludeTools to be a list when present")
     else:
         missing_excludes = sorted(expected_dangerous - set(exclude_tools))
         if missing_excludes:
             errors.append(f"local_asset_research dangerous tool denylist is incomplete: {', '.join(missing_excludes)}")
 
+    return errors
+
+
+def _load_serena_from_mcp_config(repo_root: Path, mcp_config_path: Path | None = None) -> Mapping[str, Any]:
+    config_path = mcp_config_path or repo_root / AGY_MCP_CONFIG_RELATIVE_PATH
+    config = _load_json(config_path)
+    if not isinstance(config, Mapping):
+        raise ValueError(f"{config_path} must contain a JSON object")
+    servers = config.get("mcpServers")
+    if not isinstance(servers, Mapping):
+        raise ValueError(f"{config_path} must contain mcpServers")
+    serena = servers.get(SERENA_MCP_SERVER_NAME)
+    if not isinstance(serena, Mapping):
+        raise ValueError(f"{config_path} must contain mcpServers.serena")
+    return serena
+
+
+def _validate_serena_settings_against_manifest(settings: Mapping[str, Any], manifest: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    mcp = settings.get("mcp")
+    allowed_servers = mcp.get("allowed") if isinstance(mcp, Mapping) else None
+    if allowed_servers != [SERENA_MCP_SERVER_NAME]:
+        errors.append("local_asset_research requires .gemini/settings.json mcp.allowed to equal ['serena']")
+
+    servers = settings.get("mcpServers")
+    if not isinstance(servers, Mapping):
+        return errors + ["local_asset_research requires .gemini/settings.json mcpServers"]
+    serena = servers.get(SERENA_MCP_SERVER_NAME)
+    if not isinstance(serena, Mapping):
+        return errors + ["local_asset_research requires .gemini/settings.json mcpServers.serena"]
+    errors.extend(_validate_serena_server_config(serena, manifest, source_label=".gemini/settings.json"))
+    try:
+        agy_serena = _load_serena_from_mcp_config(_repo_root())
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as exc:
+        errors.append(f"local_asset_research requires AGY MCP config .agents/mcp_config.json: {exc}")
+    else:
+        errors.extend(_validate_serena_server_config(agy_serena, manifest, source_label=".agents/mcp_config.json"))
     return errors
 
 
@@ -1015,7 +1040,11 @@ def _collect_serena_read_only_evidence(
     repo_root: Path,
     manifest: Mapping[str, Any],
 ) -> list[dict[str, str]]:
-    """Collect bounded wrapper-side Serena read-only evidence envelopes."""
+    """Collect bounded wrapper-side Serena read-only evidence envelopes.
+
+    This fallback is reserved for tests/manual context rendering and must not
+    claim live MCP provenance.
+    """
     manifest_id = _serena_manifest_id(manifest)
     documents: list[dict[str, str]] = []
     for path in context_paths:
@@ -1029,7 +1058,7 @@ def _collect_serena_read_only_evidence(
             "sha256": hashlib.sha256(encoded).hexdigest(),
             "redaction_status": "checked_no_credential_pattern",
             "manifest_id": manifest_id,
-            "source_kind": "serena_mcp_read_only_evidence",
+            "source_kind": "serena_mcp_test_double_evidence",
         }
         records: list[dict[str, Any]] = [
             {
@@ -1060,6 +1089,137 @@ def _collect_serena_read_only_evidence(
                 "content": json.dumps(record, ensure_ascii=False, sort_keys=True),
             })
     return documents
+
+
+def _collect_live_serena_read_only_evidence(
+    context_paths: list[Path],
+    repo_root: Path,
+    manifest: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    """Launch pinned Serena MCP over stdio and build evidence from tools/call responses."""
+    import select
+
+    serena = _load_serena_from_mcp_config(repo_root)
+    command = [str(serena["command"]), *[str(arg) for arg in serena["args"]]]
+    process = subprocess.Popen(
+        command,
+        cwd=str(repo_root),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        shell=False,
+        env=_minimal_agy_env(),
+        bufsize=1,
+    )
+    next_id = 1
+    manifest_id = _serena_manifest_id(manifest)
+
+    def send(payload: Mapping[str, Any]) -> None:
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        process.stdin.flush()
+
+    def recv(expected_id: int, timeout_sec: float = 180.0) -> Mapping[str, Any]:
+        assert process.stdout is not None
+        import time
+
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            ready, _, _ = select.select([process.stdout], [], [], 0.2)
+            if not ready:
+                if process.poll() is not None:
+                    raise RuntimeError("serena MCP server exited before response")
+                continue
+            line = process.stdout.readline()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("id") == expected_id:
+                return message
+        raise TimeoutError(f"timed out waiting for Serena MCP response id {expected_id}")
+
+    def request(method: str, params: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+        nonlocal next_id
+        request_id = next_id
+        next_id += 1
+        send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}})
+        response = recv(request_id)
+        if response.get("error"):
+            raise RuntimeError(f"Serena MCP {method} failed: {response['error']}")
+        return response
+
+    try:
+        request(
+            "initialize",
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "loop-protocol-wrapper", "version": "1"},
+            },
+        )
+        send({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+        tools_response = request("tools/list")
+        tools = ((tools_response.get("result") or {}).get("tools") or [])
+        tools_seen = {tool.get("name") for tool in tools if isinstance(tool, Mapping)}
+        missing = sorted(set(manifest["read_only_allowlist"]) - tools_seen)
+        if missing:
+            raise RuntimeError(f"Serena tools/list missing required tools: {', '.join(missing)}")
+        manifest_known = set(manifest.get("known_tools") or [])
+        if tools_seen != manifest_known:
+            missing_from_manifest = sorted(tools_seen - manifest_known)
+            stale_manifest_tools = sorted(manifest_known - tools_seen)
+            raise RuntimeError(
+                "Serena tools/list manifest drift: "
+                f"missing_from_manifest={missing_from_manifest}; "
+                f"stale_manifest_tools={stale_manifest_tools}"
+            )
+
+        selectors = [path.relative_to(repo_root).as_posix() for path in context_paths]
+        primary_path = selectors[0] if selectors else "."
+        calls: list[tuple[str, dict[str, Any], str]] = [
+            ("find_file", {"relative_path": ".", "file_mask": Path(primary_path).name}, primary_path),
+            (
+                "search_for_pattern",
+                {"relative_path": str(Path(primary_path).parent), "substring_pattern": "local_asset_research"},
+                primary_path,
+            ),
+            ("get_symbols_overview", {"relative_path": primary_path}, primary_path),
+        ]
+        documents: list[dict[str, str]] = []
+        for index, (tool_name, arguments, repo_relative_path) in enumerate(calls, start=1):
+            response = request("tools/call", {"name": tool_name, "arguments": arguments})
+            result = response.get("result")
+            result_text = json.dumps(result, ensure_ascii=False, sort_keys=True)
+            snippet = _truncate_summary(result_text, 4000)
+            evidence = {
+                "tool_name": tool_name,
+                "query": json.dumps(arguments, ensure_ascii=False, sort_keys=True),
+                "repo_relative_path": repo_relative_path,
+                "line_range": [1, 1],
+                "content_snippet": snippet,
+                "byte_size": len(snippet.encode("utf-8")),
+                "sha256": hashlib.sha256(result_text.encode("utf-8")).hexdigest(),
+                "redaction_status": "checked_no_credential_pattern",
+                "manifest_id": manifest_id,
+                "source_kind": "serena_mcp_read_only_evidence",
+            }
+            if _contains_credential(result_text):
+                raise ValueError(f"Serena MCP {tool_name} result appears to contain credential-like material")
+            documents.append({
+                "path": f"{repo_relative_path}#{tool_name}-{index}",
+                "content": json.dumps(evidence, ensure_ascii=False, sort_keys=True),
+            })
+        return documents
+    finally:
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except Exception:
+            process.kill()
 
 
 def _build_local_asset_prompt(
@@ -1838,7 +1998,34 @@ def run_delegation(
                 repo_root,
             )
             manifest = load_serena_tool_manifest(repo_root)
-            evidence_documents = _collect_serena_read_only_evidence(context_paths, repo_root, manifest)
+            try:
+                evidence_documents = _collect_live_serena_read_only_evidence(context_paths, repo_root, manifest)
+            except Exception as exc:
+                return {
+                    "schema": "delegation_result/v1",
+                    "transport": "agy",
+                    "ok": False,
+                    "provider": "agy",
+                    "safety_mode": "degraded_wrapper_only",
+                    "requested_model": None,
+                    "actual_model": None,
+                    "tool_profile": LOCAL_ASSET_RESEARCH_PROFILE,
+                    "exit_code": 1,
+                    "result_surface": {
+                        "ok": False,
+                        "summary": "local_asset_research live Serena MCP retrieval failed",
+                        "response_text": None,
+                    },
+                    "response_text": None,
+                    "stats": None,
+                    "stderr": str(exc),
+                    "warnings": [f"local_asset_research live_serena_mcp_failed: {exc}"],
+                    "failure_reason": f"local_asset_research live_serena_mcp_failed: {exc}",
+                    "failure_class": "local_asset_research live_serena_mcp_failed",
+                    "raw_command": _build_agy_raw_command(""),
+                    "model_chain": [],
+                    "model_downgrades": [],
+                }
             prompt_text = _build_local_asset_prompt(
                 request,
                 request_path,
