@@ -149,6 +149,9 @@ merge_ready は impl-review-loop の終端条件。
 ### ALLOWED_PATHS_GATE_RESULT_V1
 
 PR review 後に `allowed_paths_review_gate.py` を使って changed files の契約違反を再計算。
+snapshot freshness 用の `contract_fingerprint.base_sha_at_snapshot` と、local fallback changed files 算出用の
+`diff_base_sha` は別物として扱う。local fallback の `changed_files_source` は
+`git_diff_current_merge_base_head` で、snapshot base を changed files diff には使わない。
 
 `status` は `ok | fail_closed | stale_snapshot | indeterminate`。
 

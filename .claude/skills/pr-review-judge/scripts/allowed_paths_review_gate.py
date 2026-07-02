@@ -7,7 +7,7 @@ against linked issue's Allowed Paths snapshot. Producer role: review_subagent.
 
 Key principles:
 - Worker transcript / report is NOT an input
-- changed_files_source is git_diff_base_head (triple-dot merge-base..head)
+- changed_files_source is git_diff_current_merge_base_head (triple-dot merge-base..head)
 - head_sha != reviewed_head_sha -> indeterminate (merge-blocking)
 - contract fingerprint and execution context are separated for freshness detection
 - review mode requires explicit snapshot bindings and expected fingerprint
@@ -41,7 +41,7 @@ class ExecutionContext:
 
     worktree_root: str
     generated_at: str
-    tool_version: str = "1.2.0"
+    tool_version: str = "1.3.0"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -74,10 +74,11 @@ class AllowedPathsGateResult:
     worker_report_used_as_canonical: bool = False
     pr_number: int = 0
     base_ref: str = ""
+    diff_base_sha: str = ""
     base_sha: str = ""
     head_sha: str = ""
     reviewed_head_sha: str = ""
-    changed_files_source: str = "git_diff_base_head"
+    changed_files_source: str = "git_diff_current_merge_base_head"
     allowed_paths_source: str = ""
     changed_files_count: int = 0
     changed_files: List[str] = field(default_factory=list)
@@ -97,6 +98,7 @@ class AllowedPathsGateResult:
             "worker_report_used_as_canonical": self.worker_report_used_as_canonical,
             "pr_number": self.pr_number,
             "base_ref": self.base_ref,
+            "diff_base_sha": self.diff_base_sha,
             "base_sha": self.base_sha,
             "head_sha": self.head_sha,
             "reviewed_head_sha": self.reviewed_head_sha,
@@ -219,7 +221,8 @@ class AllowedPathsGateEvaluator:
         *,
         pr_number: int,
         base_ref: str,
-        base_sha: str,
+        base_sha_at_snapshot: str,
+        diff_base_sha: str,
         head_sha: str,
         reviewed_head_sha: str,
         allowed_paths: List[str],
@@ -231,7 +234,8 @@ class AllowedPathsGateEvaluator:
     ):
         self.pr_number = pr_number
         self.base_ref = base_ref
-        self.base_sha = base_sha
+        self.base_sha_at_snapshot = base_sha_at_snapshot
+        self.diff_base_sha = diff_base_sha
         self.head_sha = head_sha
         self.reviewed_head_sha = reviewed_head_sha
         self.allowed_paths = allowed_paths
@@ -266,14 +270,14 @@ class AllowedPathsGateEvaluator:
             contract_body_sha256=self.contract_body_sha256,
             allowed_paths_normalized_sha256=self.compute_allowed_paths_hash(),
             base_ref=self.base_ref,
-            base_sha_at_snapshot=self.base_sha,
+            base_sha_at_snapshot=self.base_sha_at_snapshot,
         )
         return json.loads(fingerprint.to_normalized_json())
 
     def get_changed_files_from_git(self) -> List[str]:
         try:
             result = subprocess.run(
-                ["git", "diff", "--name-only", f"{self.base_sha}...{self.head_sha}"],
+                ["git", "diff", "--name-only", f"{self.diff_base_sha}...{self.head_sha}"],
                 capture_output=True,
                 text=True,
                 check=True,
@@ -288,7 +292,8 @@ class AllowedPathsGateEvaluator:
             produced_at=now,
             pr_number=self.pr_number,
             base_ref=self.base_ref,
-            base_sha=self.base_sha,
+            diff_base_sha=self.diff_base_sha,
+            base_sha=self.diff_base_sha,
             head_sha=self.head_sha,
             reviewed_head_sha=self.reviewed_head_sha,
         )
@@ -377,7 +382,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate PR allowed paths gate deterministically")
     parser.add_argument("--pr-number", type=int, required=True, help="PR number")
     parser.add_argument("--base-ref", required=True, help="Base branch name (e.g., main)")
-    parser.add_argument("--base-sha", required=True, help="Base SHA (at snapshot time)")
+    parser.add_argument(
+        "--base-sha-at-snapshot",
+        required=True,
+        help="Snapshot freshness binding SHA from the linked issue contract",
+    )
+    parser.add_argument(
+        "--diff-base-sha",
+        help="Changed-files diff base SHA for the local fallback (merge-base(current_base_tip, head_sha))",
+    )
+    parser.add_argument(
+        "--base-sha",
+        help="Deprecated alias for --diff-base-sha; retained for backward compatibility",
+    )
     parser.add_argument("--head-sha", required=True, help="Current head SHA")
     parser.add_argument("--reviewed-head-sha", required=True, help="Head SHA at review time")
     parser.add_argument(
@@ -399,10 +416,15 @@ def main() -> None:
     parser.add_argument("--format", choices=["json", "yaml"], default="json", help="Output format")
     args = parser.parse_args()
 
+    diff_base_sha = args.diff_base_sha or args.base_sha
+    if not diff_base_sha:
+        parser.error("--diff-base-sha is required (or --base-sha as a deprecated alias)")
+
     evaluator = AllowedPathsGateEvaluator(
         pr_number=args.pr_number,
         base_ref=args.base_ref,
-        base_sha=args.base_sha,
+        base_sha_at_snapshot=args.base_sha_at_snapshot,
+        diff_base_sha=diff_base_sha,
         head_sha=args.head_sha,
         reviewed_head_sha=args.reviewed_head_sha,
         allowed_paths=args.allowed_paths,

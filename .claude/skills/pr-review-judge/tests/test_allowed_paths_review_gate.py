@@ -2,6 +2,7 @@
 """Tests for allowed_paths_review_gate.py."""
 
 from pathlib import Path
+import subprocess
 from unittest.mock import patch
 import sys
 
@@ -16,7 +17,8 @@ from allowed_paths_review_gate import AllowedPathsGateEvaluator, AllowedPathsMat
 BASE_ARGS = {
     "pr_number": 123,
     "base_ref": "main",
-    "base_sha": "abc123",
+    "base_sha_at_snapshot": "abc123",
+    "diff_base_sha": "abc123",
     "head_sha": "def456",
     "reviewed_head_sha": "def456",
     "allowed_paths": ["src/**"],
@@ -113,7 +115,8 @@ class TestAllowedPathsMatcher:
         base = {
             "pr_number": 1,
             "base_ref": "main",
-            "base_sha": "abc",
+            "base_sha_at_snapshot": "abc",
+            "diff_base_sha": "abc",
             "head_sha": "def",
             "reviewed_head_sha": "def",
             "contract_body_sha256": "sha",
@@ -197,7 +200,9 @@ class TestHeadShaBinding:
         mock_get_changed_files.return_value = ["src/main.ts"]
         evaluator = make_evaluator(expected_contract_fingerprint="SELF")
         result = evaluator.evaluate()
-        assert result.changed_files_source == "git_diff_base_head"
+        assert result.changed_files_source == "git_diff_current_merge_base_head"
+        assert result.diff_base_sha == "abc123"
+        assert result.base_sha == "abc123"
 
 
 class TestAllowedPathsValidation:
@@ -236,15 +241,36 @@ class TestAllowedPathsValidation:
         mock_get_changed_files.assert_not_called()
 
     @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-    def test_base_sha_change_is_stale(self, mock_get_changed_files):
+    def test_base_sha_at_snapshot_change_is_stale(self, mock_get_changed_files):
         mock_get_changed_files.return_value = ["src/main.ts"]
         expected_fp = make_evaluator(
-            base_sha="base_at_snapshot",
+            base_sha_at_snapshot="base_at_snapshot",
             expected_contract_fingerprint="SELF").compute_contract_fingerprint(
         )
-        evaluator = make_evaluator(base_sha="base_moved_forward", expected_contract_fingerprint=expected_fp)
+        evaluator = make_evaluator(
+            base_sha_at_snapshot="base_moved_forward",
+            expected_contract_fingerprint=expected_fp,
+        )
         result = evaluator.evaluate()
         assert result.status == GateStatus.STALE_SNAPSHOT.value
+
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
+    def test_diff_base_sha_does_not_affect_freshness(self, mock_get_changed_files):
+        mock_get_changed_files.return_value = ["src/main.ts"]
+        expected_fp = make_evaluator(
+            base_sha_at_snapshot="base_at_snapshot",
+            diff_base_sha="diff_base_at_snapshot",
+            expected_contract_fingerprint="SELF",
+        ).compute_contract_fingerprint()
+        evaluator = make_evaluator(
+            base_sha_at_snapshot="base_at_snapshot",
+            diff_base_sha="diff_base_after_update_branch",
+            expected_contract_fingerprint=expected_fp,
+        )
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.OK.value
+        assert result.contract_fingerprint["base_sha_at_snapshot"] == "base_at_snapshot"
+        assert result.diff_base_sha == "diff_base_after_update_branch"
 
     @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
     def test_missing_allowed_paths_is_indeterminate(self, mock_get_changed_files):
@@ -288,7 +314,111 @@ class TestAllowedPathsValidation:
         evaluator = make_evaluator(expected_contract_fingerprint="SELF", allowed_paths=["allowed_by_contract/**"])
         result = evaluator.evaluate()
         assert result.changed_files == ["actual/changed/file.ts"]
-        assert result.changed_files_source == "git_diff_base_head"
+        assert result.changed_files_source == "git_diff_current_merge_base_head"
+
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
+    def test_result_schema_includes_diff_base_sha_and_snapshot_fingerprint(self, mock_get_changed_files):
+        mock_get_changed_files.return_value = ["src/main.ts"]
+        evaluator = make_evaluator(
+            base_sha_at_snapshot="snapshot_sha",
+            diff_base_sha="merge_base_sha",
+            expected_contract_fingerprint="SELF",
+        )
+        result = evaluator.evaluate().to_dict()
+        assert result["diff_base_sha"] == "merge_base_sha"
+        assert result["base_sha"] == "merge_base_sha"
+        assert result["contract_fingerprint"]["base_sha_at_snapshot"] == "snapshot_sha"
+
+
+def _git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _write(repo: Path, relative_path: str, content: str) -> None:
+    path = repo / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def _commit(repo: Path, message: str) -> str:
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", message)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _create_update_branch_repo(tmp_path: Path) -> dict[str, str | Path]:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.name", "Test User")
+    _git(repo, "config", "user.email", "test@example.com")
+
+    _write(repo, "README.md", "base\n")
+    base_sha_at_snapshot = _commit(repo, "base")
+
+    _git(repo, "checkout", "-b", "feature")
+    _write(repo, "allowed/feature.txt", "feature change\n")
+    _commit(repo, "feature change")
+
+    _git(repo, "checkout", "main")
+    _write(repo, "outside/unrelated.txt", "main side change\n")
+    current_base_tip = _commit(repo, "main unrelated change")
+
+    _git(repo, "checkout", "feature")
+    _git(repo, "merge", "--no-ff", "main", "-m", "update branch")
+    head_sha = _git(repo, "rev-parse", "HEAD")
+
+    return {
+        "repo": repo,
+        "base_sha_at_snapshot": base_sha_at_snapshot,
+        "diff_base_sha": _git(repo, "merge-base", current_base_tip, head_sha),
+        "head_sha": head_sha,
+        "reviewed_head_sha": head_sha,
+    }
+
+
+class TestUpdateBranchGitDag:
+    def test_update_branch_no_false_positive(self, tmp_path, monkeypatch):
+        fixture = _create_update_branch_repo(tmp_path)
+        monkeypatch.chdir(fixture["repo"])
+        evaluator = make_evaluator(
+            base_sha_at_snapshot=fixture["base_sha_at_snapshot"],
+            diff_base_sha=fixture["diff_base_sha"],
+            head_sha=fixture["head_sha"],
+            reviewed_head_sha=fixture["reviewed_head_sha"],
+            allowed_paths=["allowed/**"],
+            expected_contract_fingerprint="SELF",
+        )
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.OK.value
+        assert result.changed_files == ["allowed/feature.txt"]
+        assert "outside/unrelated.txt" not in result.changed_files
+
+    def test_update_branch_true_violation_blocks(self, tmp_path, monkeypatch):
+        fixture = _create_update_branch_repo(tmp_path)
+        repo = fixture["repo"]
+        _write(repo, "forbidden/violation.txt", "feature violation\n")
+        _commit(repo, "feature violation")
+        head_sha = _git(repo, "rev-parse", "HEAD")
+        monkeypatch.chdir(repo)
+        evaluator = make_evaluator(
+            base_sha_at_snapshot=fixture["base_sha_at_snapshot"],
+            diff_base_sha=_git(repo, "merge-base", fixture["diff_base_sha"], head_sha),
+            head_sha=head_sha,
+            reviewed_head_sha=head_sha,
+            allowed_paths=["allowed/**"],
+            expected_contract_fingerprint="SELF",
+        )
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.FAIL_CLOSED.value
+        assert any(item["file"] == "forbidden/violation.txt" for item in result.violations)
 
 
 class TestSingleSourceOfTruth:

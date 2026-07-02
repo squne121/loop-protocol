@@ -1,6 +1,9 @@
 # ALLOWED_PATHS_GATE_RESULT_V1（pr-review-judge 消費）
 
-`git diff --name-only <base>...<head>` を取得し、contract の `Allowed Paths` と照合。
+snapshot freshness 用の `base_sha_at_snapshot` と、changed files 算出用の `diff_base_sha` を分離して扱う。
+local fallback は `changed_files_source: git_diff_current_merge_base_head` とし、
+`git diff --name-only <diff_base_sha>...<head>` で changed files を取得して contract の `Allowed Paths` と照合する。
+`diff_base_sha` は `git merge-base <current_base_tip> <head_sha>` 相当の SHA を指し、snapshot base を diff 算出には使わない。
 
 Status 定義:
 
@@ -18,6 +21,13 @@ Status 定義:
 ## 結果反映
 
 `indeterminate/fail_closed` は merge-blocking として扱い、`REQUEST_CHANGES` 経路。
+
+## provenance
+
+- `contract_fingerprint.base_sha_at_snapshot`: snapshot freshness 判定専用
+- `diff_base_sha`: changed files 算出専用
+- `base_sha`: `diff_base_sha` の backward-compatible alias
+- `changed_files_source`: `git_diff_current_merge_base_head` など source authority が分かる値
 
 ## matcher v2 grammar（マッチャ v2 文法）
 
