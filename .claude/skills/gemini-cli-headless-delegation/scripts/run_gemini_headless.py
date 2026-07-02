@@ -162,11 +162,15 @@ def resolve_model_chain(
     return list(default_chain), None
 ALLOWED_TOOL_PROFILES = {"no_tools", "grounded_research", "local_asset_research", "proposal_only", "github_research"}
 SUPPORTED_PROVIDERS: frozenset[str] = frozenset({"gemini", "agy"})
-AGY_SUPPORTED_PROFILES: frozenset[str] = frozenset({"no_tools", "proposal_only"})
+AGY_SUPPORTED_PROFILES: frozenset[str] = frozenset({"no_tools", "proposal_only", "local_asset_research"})
 LOCAL_ASSET_RESEARCH_PROFILE = "local_asset_research"
 GROUNDED_RESEARCH_PROFILE = "grounded_research"
 PROPOSAL_ONLY_PROFILE = "proposal_only"
 GITHUB_RESEARCH_PROFILE = "github_research"
+SERENA_TOOL_CONTRACT_UNKNOWN_POLICY = "exact_match"
+LOCAL_ASSET_MAX_CONTEXT_FILES = 32
+LOCAL_ASSET_MAX_CONTEXT_BYTES = 200_000
+LOCAL_ASSET_MAX_CONTEXT_TOTAL_BYTES = 600_000
 
 # github_research: allowed gh subcommand argv prefixes (first two tokens of argv)
 GITHUB_RESEARCH_ALLOWED_ARGV_PREFIXES: frozenset[tuple[str, ...]] = frozenset({
@@ -877,6 +881,136 @@ def _read_context_files(context_files: list[str], base_dir: Path) -> list[dict[s
     return contexts
 
 
+def _validate_local_asset_context_files(
+    context_files: Any,
+    request_path: Path | None,
+    repo_root: Path,
+) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(context_files, list):
+        errors.append("local_asset_research requires context_files to be a list")
+        return errors
+    if len(context_files) == 0:
+        errors.append("local_asset_research requires at least one context file")
+        return errors
+
+    base_dir = request_path.parent if request_path is not None else Path.cwd()
+    for raw_path in context_files:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            errors.append("local_asset_research context files must be non-empty strings")
+            continue
+        candidate = _resolve_context_file(raw_path, base_dir)
+        for ancestor in [candidate] + list(candidate.parents):
+            if ancestor.is_symlink():
+                errors.append(
+                    "local_asset_research context file must not include symlink paths: "
+                    f"{_truncate_repr(raw_path)}"
+                )
+                break
+        else:
+            resolved = candidate.resolve()
+            if not _is_relative_to(resolved, repo_root):
+                errors.append(
+                    "local_asset_research context file must be inside repository: "
+                    f"{_truncate_repr(raw_path)} -> {_truncate_repr(str(resolved))}"
+                )
+                continue
+            if not candidate.exists():
+                errors.append(f"missing context file: {_truncate_repr(raw_path)}")
+            elif not candidate.is_file():
+                errors.append(f"context file is not a file: {_truncate_repr(raw_path)}")
+    return errors
+
+
+def _build_local_asset_prompt(request: Mapping[str, Any], request_path: Path | None) -> str:
+    """Build an explicit local asset prompt with repo-anchored context injection."""
+    objective = str(request.get("objective") or request.get("prompt") or "Local asset research request.")
+    prompt_hint = str(request.get("prompt") or "").strip()
+
+    raw_instructions = request.get("instructions")
+    if isinstance(raw_instructions, list) and len(raw_instructions) >= 2:
+        instructions = [str(item) for item in raw_instructions if isinstance(item, str) and item.strip()]
+    else:
+        instructions = [
+            f"Execute this request: {prompt_hint}" if prompt_hint else "Perform local repository asset research.",
+            "Use only the provided context files and local repository evidence.",
+        ]
+
+    base_request = {
+        "objective": objective,
+        "instructions": instructions,
+        "tool_profile": LOCAL_ASSET_RESEARCH_PROFILE,
+        "output_sections": request.get("output_sections") or ["response"],
+        "inline_context": request.get("inline_context"),
+    }
+
+    context_files = request.get("context_files", [])
+    context_documents: list[dict[str, str]] = []
+    if isinstance(context_files, list):
+        base_dir = request_path.parent if request_path is not None else Path.cwd()
+        context_documents = _read_context_files(context_files, base_dir=base_dir)
+    return build_prompt(base_request, context_documents)
+
+
+def _validate_agy_local_asset_payload_bounds(context_files: list[str], request_path: Path | None) -> list[str]:
+    """Validate AGY local-asset evidence bounds (path safety + payload policy)."""
+    errors: list[str] = []
+    if len(context_files) > LOCAL_ASSET_MAX_CONTEXT_FILES:
+        errors.append(
+            f"local_asset_research context file count must not exceed {LOCAL_ASSET_MAX_CONTEXT_FILES}; "
+            f"got {len(context_files)}"
+        )
+
+    base_dir = request_path.parent if request_path is not None else Path.cwd()
+    total_bytes = 0
+    for raw_path in context_files:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        path = _resolve_context_file(raw_path, base_dir)
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            # Presence/shape checks are handled by _validate_local_asset_context_files;
+            # missing files are not re-reported here.
+            errors.append(f"local_asset_research cannot stat context file {_truncate_repr(raw_path)}: {exc}")
+            continue
+        total_bytes += size
+        if size > LOCAL_ASSET_MAX_CONTEXT_BYTES:
+            errors.append(f"local_asset_research context file is too large: {_truncate_repr(raw_path)}")
+        if total_bytes > LOCAL_ASSET_MAX_CONTEXT_TOTAL_BYTES:
+            errors.append(
+                f"local_asset_research total context payload exceeds {LOCAL_ASSET_MAX_CONTEXT_TOTAL_BYTES} bytes"
+            )
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            errors.append(f"local_asset_research cannot read context file {_truncate_repr(raw_path)}: {exc}")
+            continue
+        if _contains_credential(text):
+            errors.append(
+                (
+                    "local_asset_research context file appears to contain "
+                    "credential-like material: "
+                    f"{_truncate_repr(raw_path)}"
+                )
+            )
+
+    return errors
+
+
+def _build_local_asset_prompt_for_agy(request: Mapping[str, Any], request_path: Path | None) -> str:
+    """Wrap a local_asset_research prompt for AGY hardened execution."""
+    prompt_hint = str(request.get("prompt") or "").strip()
+    if not prompt_hint:
+        prompt_hint = "Perform local repository asset research."
+    return (
+        "AGY is executed in degraded wrapper-only mode (no repo path, "
+        "no MCP/server access, no shell execution). "
+        "Use only the evidence below.\n\n"
+        f"{prompt_hint}"
+    )
+
+
 def build_prompt(request: Mapping[str, Any], context_documents: list[dict[str, str]]) -> str:
     lines: list[str] = []
     lines.append("You are a Gemini CLI headless delegation worker.")
@@ -1415,12 +1549,14 @@ def _normalize_acp_result(
 
 
 def _validate_agy_request(request: Mapping[str, Any]) -> list[str]:
-    """Minimal validation for provider=agy requests.
+    """Validation for provider=agy requests.
 
-    agy requests do not require schema/context_files/instructions/output_sections.
-    Only provider-specific constraints are enforced here.
+    no_tools / proposal_only use the legacy minimal path.
+    local_asset_research uses _validate_agy_local_asset_request for full checks.
     """
     errors: list[str] = []
+    if request.get("schema") != "delegation_request_v1":
+        errors.append("schema must equal delegation_request_v1 for provider=agy")
     tool_profile = request.get("tool_profile")
     if tool_profile not in AGY_SUPPORTED_PROFILES:
         errors.append(
@@ -1437,6 +1573,22 @@ def _validate_agy_request(request: Mapping[str, Any]) -> list[str]:
     prompt = request.get("prompt")
     if not prompt or not str(prompt).strip():
         errors.append("agy_empty_prompt: provider=agy requires a non-empty 'prompt' field")
+    return errors
+
+
+def _validate_agy_local_asset_request(request: Mapping[str, Any], request_path: Path | None = None) -> list[str]:
+    """Full validation path for provider=agy + local_asset_research."""
+    errors: list[str] = []
+    errors.extend(validate_request(request, request_path=request_path))
+    context_files = request.get("context_files")
+    if not isinstance(context_files, list) or len(context_files) == 0:
+        errors.append("local_asset_research requires at least one context file")
+        return errors
+    repo_root = _repo_root().resolve()
+    errors.extend(_validate_local_asset_context_files(context_files, request_path, repo_root))
+    errors.extend(_validate_local_asset_research_settings())
+    # Reject secret-like / oversized evidence before wrapper builds prompt.
+    errors.extend(_validate_agy_local_asset_payload_bounds(context_files, request_path))
     return errors
 
 
@@ -1488,8 +1640,11 @@ def run_delegation(
         }
 
     if provider == "agy":
-        agy_errors = _validate_agy_request(request)
         tool_profile_str = str(request.get("tool_profile", "unknown"))
+        tool_profile = tool_profile_str
+        agy_errors = _validate_agy_request(request)
+        if tool_profile == LOCAL_ASSET_RESEARCH_PROFILE:
+            agy_errors = agy_errors + _validate_agy_local_asset_request(request, request_path=request_path)
         if agy_errors:
             return {
                 "schema": "delegation_result/v1",
@@ -1517,7 +1672,26 @@ def run_delegation(
                 "model_chain": [],
                 "model_downgrades": [],
             }
-        prompt_text = request.get("prompt") or ""
+        # local_asset_research uses wrapper-side Serena evidence + prompt injection.
+        if tool_profile == LOCAL_ASSET_RESEARCH_PROFILE:
+            prompt_text = _build_local_asset_prompt(request, request_path)
+            prompt_hint = str(request.get("prompt") or "").strip()
+            if prompt_hint:
+                prompt_text = f"{prompt_text}\n\nOperator objective:\n{prompt_hint}"
+            prompt_text = _build_local_asset_prompt_for_agy(
+                {
+                    "prompt": prompt_text,
+                    "tool_profile": LOCAL_ASSET_RESEARCH_PROFILE,
+                    "instructions": request.get("instructions", []),
+                    "context_files": request.get("context_files", []),
+                    "output_sections": request.get("output_sections", ["response"]),
+                    "inline_context": request.get("inline_context"),
+                },
+                request_path=request_path,
+            )
+        else:
+            prompt_text = request.get("prompt") or ""
+
         try:
             timeout_sec_agy = int(request.get("timeout_sec", DEFAULT_TIMEOUT_SEC))
         except (TypeError, ValueError):

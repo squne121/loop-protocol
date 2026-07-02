@@ -6,6 +6,7 @@ importlib-based module load + monkeypatch / subprocess mock.
 
 from __future__ import annotations
 
+import json
 import importlib.util
 import subprocess
 from pathlib import Path
@@ -44,6 +45,26 @@ def _make_happy_run(module):
         raise AssertionError(f"unexpected command: {argv}")
 
     return fake_run
+
+
+def _write_settings(root: Path, *, include_tools: list[str], exclude_tools: list[str] | None = None) -> None:
+    settings_dir = root / ".gemini"
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    settings = {
+        "mcp": {
+            "allowed": ["serena"],
+        },
+        "mcpServers": {
+            "serena": {
+                "command": "uvx",
+                "args": ["uvx", "serena", "--project-from-cwd"],
+                "trust": False,
+                "includeTools": include_tools,
+                "excludeTools": exclude_tools or [],
+            },
+        },
+    }
+    (settings_dir / "settings.json").write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -468,3 +489,41 @@ def test_resolved_path_is_masked(monkeypatch):
 
     assert module._mask_resolved_path("/home/tester/bin/agy") == "$HOME/bin/agy"
     assert module._mask_resolved_path("/usr/local/bin/agy") == "agy"
+
+
+def test_local_asset_research_contract_validation_success(monkeypatch, tmp_path):
+    """--local-asset-research succeeds when Serena contract is valid."""
+    module = load_module()
+    monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)  # type: ignore[call-arg]
+    _write_settings(
+        tmp_path,
+        include_tools=sorted(module.SERENA_READ_ONLY_TOOLS),
+        exclude_tools=sorted(module.SERENA_DANGEROUS_TOOLS),
+    )
+
+    monkeypatch.setattr(module, "_run", _make_happy_run(module))
+    result = module.run_preflight(validate_local_asset_contract=True)
+
+    assert result["ok"] is True
+    assert result["local_asset_research"]["ok"] is True
+    assert result["local_asset_research"]["status"] == "ok"
+    assert result["local_asset_research"]["unknown_tool_policy"] == module.LOCAL_ASSET_SERENA_TOOL_POLICY
+
+
+def test_local_asset_research_contract_validation_rejects_unknown_tool(monkeypatch, tmp_path):
+    """--local-asset-research rejects unknown tools / drift in Serena allowlist."""
+    module = load_module()
+    monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)  # type: ignore[call-arg]
+    _write_settings(
+        tmp_path,
+        include_tools=["find_file", "find_referencing_symbols", "unknown_serena_tool"],
+        exclude_tools=sorted(module.SERENA_DANGEROUS_TOOLS),
+    )
+
+    monkeypatch.setattr(module, "_run", _make_happy_run(module))
+    result = module.run_preflight(validate_local_asset_contract=True)
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "local_asset_contract_invalid"
+    assert result["local_asset_research"]["ok"] is False
+    assert any("unknown_tool_policy" in item for item in result["local_asset_research"]["errors"])

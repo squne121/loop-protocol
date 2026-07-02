@@ -148,11 +148,65 @@ def test_ac7_agy_grounded_research_rejected() -> None:
 
 
 def test_ac7_agy_local_asset_research_rejected() -> None:
-    """AC7: provider=agy with local_asset_research -> unsupported_provider_profile."""
+    """AC7: provider=agy with local_asset_research requires local_asset_research context files."""
     req = _agy_request(tool_profile="local_asset_research")
-    result = rgh.run_delegation(req)
+    with patch.object(rgh, "_validate_local_asset_research_settings", lambda: []):  # type: ignore[call-arg]
+        result = rgh.run_delegation(req)
     assert result["ok"] is False
-    assert result["failure_class"] == "unsupported_provider_profile"
+    assert result["failure_reason"].startswith("context_files must contain at least 1 item(s)")
+    assert result["failure_class"].startswith("context_files must contain at least 1 item(s)")
+
+
+def test_ac7_agy_local_asset_research_success_with_wrapper_validation(tmp_path, monkeypatch) -> None:
+    """AC7: provider=agy + local_asset_research succeeds after wrapper-side validation."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    context_file = repo_root / "context.md"
+    context_file.write_text("local asset content", encoding="utf-8")
+
+    monkeypatch.setattr(rgh, "_repo_root", lambda: repo_root)  # type: ignore[call-arg]
+    monkeypatch.setattr(rgh, "_validate_local_asset_research_settings", lambda: [])  # type: ignore[call-arg]
+
+    captured_prompt: dict[str, str] = {}
+
+    def _run_agy(prompt: str, timeout_sec: int = rgh.DEFAULT_TIMEOUT_SEC) -> subprocess.CompletedProcess:
+        captured_prompt["value"] = prompt
+        return _make_completed(0, stdout="LOOP_AGY_SMOKE_OK")
+
+    req = _agy_request(
+        tool_profile="local_asset_research",
+        context_files=["context.md"],
+        prompt="Summarize local repository evidence.",
+    )
+    with patch.object(rgh, "_run_agy", side_effect=_run_agy):
+        result = rgh.run_delegation(req, request_path=repo_root / "request.json")
+
+    assert result["ok"] is True
+    assert result["response_text"] == "LOOP_AGY_SMOKE_OK"
+    assert result["provider"] == "agy"
+    assert result["safety_mode"] == "degraded_wrapper_only"
+    assert "AGY is executed in degraded wrapper-only mode" in captured_prompt["value"]
+    assert "Operator objective:" in captured_prompt["value"]
+
+
+def test_ac7_agy_local_asset_research_rejects_context_outside_repo(tmp_path, monkeypatch) -> None:
+    """AC7: provider=agy local_asset_research rejects context outside repository."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+
+    monkeypatch.setattr(rgh, "_repo_root", lambda: repo_root)  # type: ignore[call-arg]
+    monkeypatch.setattr(rgh, "_validate_local_asset_research_settings", lambda: [])  # type: ignore[call-arg]
+
+    result = rgh.run_delegation(
+        _agy_request(tool_profile="local_asset_research", context_files=[str(outside)]),
+        request_path=repo_root / "request.json",
+    )
+
+    assert result["ok"] is False
+    assert result["failure_reason"].startswith("local_asset_research context file must be inside repository")
+    assert result["failure_class"] == "local_asset_research context file must be inside repository"
 
 
 def test_ac7_agy_github_research_rejected() -> None:

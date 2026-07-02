@@ -18,6 +18,39 @@ SMOKE_TIMEOUT_SECONDS = 20
 NONINTERACTIVE_FLAGS = ["-p", "--print", "--prompt"]
 UNEXPECTED_CAPABILITY_KEYWORDS = ["chat", "--output-format"]
 SMOKE_SAMPLE_MAX_CHARS = 500
+LOCAL_ASSET_SERENA_TOOL_POLICY = "exact_match"
+SERENA_READ_ONLY_TOOLS = frozenset({
+    "find_file",
+    "find_referencing_symbols",
+    "find_symbol",
+    "get_symbols_overview",
+    "list_dir",
+    "search_for_pattern",
+})
+SERENA_DANGEROUS_TOOLS = frozenset({
+    "activate_project",
+    "create_text_file",
+    "delete_lines",
+    "execute_shell_command",
+    "insert_after_symbol",
+    "insert_at_line",
+    "insert_before_symbol",
+    "prepare_for_new_conversation",
+    "read_file_content",
+    "read_memory",
+    "remove_project",
+    "replace_lines",
+    "replace_regex",
+    "replace_symbol_body",
+    "restart_language_server",
+    "switch_modes",
+    "think_about_collected_information",
+    "think_about_task_adherence",
+    "think_about_whether_you_are_done",
+    "write_file",
+    "write_memory",
+})
+SERENA_KNOWN_TOOLS = frozenset(SERENA_READ_ONLY_TOOLS | SERENA_DANGEROUS_TOOLS)
 SECRET_ENV_KEYS = (
     "AGY_API_KEY",
     "GEMINI_API_KEY",
@@ -35,6 +68,91 @@ FLAG_PATTERNS: dict[str, re.Pattern[str]] = {
     "--print": re.compile(r"(?<![\w-])--print(?![\w-])"),
     "--prompt": re.compile(r"(?<![\w-])--prompt(?![\w-])"),
 }
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[4]
+
+
+def _load_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _validate_local_asset_serena_contract(repo_root: Path | None = None) -> list[str]:
+    root = repo_root or _repo_root()
+    settings_path = root / ".gemini" / "settings.json"
+    errors: list[str] = []
+
+    try:
+        settings = _load_json(settings_path)
+    except FileNotFoundError:
+        return [f"local_asset_research requires {settings_path}"]
+    except json.JSONDecodeError as exc:
+        return [f"local_asset_research requires valid JSON in {settings_path}: {exc}"]
+    if not isinstance(settings, dict):
+        return [f"local_asset_research requires {settings_path} to contain a JSON object"]
+
+    mcp = settings.get("mcp")
+    allowed = mcp.get("allowed") if isinstance(mcp, dict) else None
+    if allowed != ["serena"]:
+        errors.append("local_asset_research requires .gemini/settings.json mcp.allowed to equal ['serena']")
+
+    servers = settings.get("mcpServers")
+    if not isinstance(servers, dict):
+        errors.append("local_asset_research requires .gemini/settings.json mcpServers")
+        return errors
+
+    serena = servers.get("serena")
+    if not isinstance(serena, dict):
+        errors.append("local_asset_research requires .gemini/settings.json mcpServers.serena")
+        return errors
+
+    command = serena.get("command")
+    args = serena.get("args")
+    if command != "uvx" or not isinstance(args, list) or "serena" not in args or "--project-from-cwd" not in args:
+        errors.append(
+            "local_asset_research requires WSL-local Serena MCP command: uvx ... serena ... --project-from-cwd"
+        )
+
+    trust = serena.get("trust", False)
+    if trust is not False:
+        errors.append("local_asset_research requires mcpServers.serena.trust to be false")
+
+    include_tools = serena.get("includeTools")
+    if not isinstance(include_tools, list) or not include_tools:
+        errors.append("local_asset_research requires mcpServers.serena.includeTools read-only allowlist")
+        return errors
+    if not all(isinstance(tool, str) for tool in include_tools):
+        errors.append("local_asset_research requires includeTools to contain only strings")
+        return errors
+
+    include_set = set(include_tools)
+    unknown_tools = sorted(include_set - SERENA_KNOWN_TOOLS)
+    if unknown_tools:
+        errors.append(
+            f"local_asset_research unknown_tool_policy({LOCAL_ASSET_SERENA_TOOL_POLICY}) failed: "
+            f"unknown tools in includeTools: {', '.join(unknown_tools)}"
+        )
+    if include_set != set(SERENA_READ_ONLY_TOOLS):
+        missing = sorted(SERENA_READ_ONLY_TOOLS - include_set)
+        unexpected = sorted(include_set - SERENA_READ_ONLY_TOOLS)
+        if missing:
+            errors.append(f"local_asset_research read-only includeTools is incomplete: {', '.join(missing)}")
+        if unexpected:
+            errors.append(
+                f"local_asset_research has unverified MCP tools in includeTools: {', '.join(unexpected)}"
+            )
+
+    exclude_tools = serena.get("excludeTools", [])
+    if not isinstance(exclude_tools, list):
+        errors.append("local_asset_research requires excludeTools to be a list when present")
+        return errors
+    if not SERENA_DANGEROUS_TOOLS.issubset(set(exclude_tools)):
+        missing_excludes = sorted(SERENA_DANGEROUS_TOOLS - set(exclude_tools))
+        errors.append(f"local_asset_research dangerous tool denylist is incomplete: {', '.join(missing_excludes)}")
+
+    return errors
 
 
 def _minimal_agy_env() -> dict[str, str]:
@@ -180,7 +298,7 @@ def _run_smoke(agy_bin: str) -> dict[str, Any]:
     return smoke
 
 
-def run_preflight() -> dict[str, Any]:
+def run_preflight(*, validate_local_asset_contract: bool = False) -> dict[str, Any]:
     """Run version → help → smoke checks for agy binary.
 
     Returns an agy_preflight_result/v1 dict.
@@ -303,6 +421,25 @@ def run_preflight() -> dict[str, Any]:
         result["recovery_action"] = "check agy configuration and rerun preflight"
         return result
 
+    if validate_local_asset_contract:
+        contract_errors = _validate_local_asset_serena_contract()
+        local_asset_result = {
+            "ok": not contract_errors,
+            "errors": contract_errors,
+            "unknown_tool_policy": LOCAL_ASSET_SERENA_TOOL_POLICY,
+        }
+        if local_asset_result["ok"]:
+            local_asset_result["status"] = "ok"
+        else:
+            result["failure_reason"] = local_asset_result["errors"][0]
+            result["failure_class"] = "local_asset_contract_invalid"
+            result["recovery_action"] = "fix .gemini/settings.json Serena contract for local_asset_research"
+        result["local_asset_research"] = local_asset_result
+
+    if result.get("local_asset_research") is not None and not result["local_asset_research"]["ok"]:
+        result["ok"] = False
+        return result
+
     result["ok"] = True
     return result
 
@@ -323,6 +460,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Print the preflight result JSON to stdout.",
     )
     parser.add_argument(
+        "--local-asset-research",
+        action="store_true",
+        dest="local_asset_research",
+        default=False,
+        help="Also validate .gemini settings local_asset_research Serena tool contract.",
+    )
+    parser.add_argument(
         "--output-file",
         required=False,
         type=Path,
@@ -331,7 +475,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    result = run_preflight()
+    result = run_preflight(validate_local_asset_contract=args.local_asset_research)
 
     if args.json_stdout:
         print(json.dumps(result, ensure_ascii=False, indent=2))
