@@ -45,6 +45,21 @@ def _sha(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _contract_snapshot_input(issue_number: int, **overrides) -> dict:
+    """CONTRACT_SNAPSHOT_PUBLISH_INPUT_V1 with all Blocker-4-required fields bound."""
+    data = {
+        "schema": "CONTRACT_SNAPSHOT_PUBLISH_INPUT_V1",
+        "issue_number": issue_number,
+        "repo": TRUSTED_REPO,
+        "target_issue_body_sha256": _sha("current issue body"),
+        "expected_latest_contract_review_status": "go",
+        "expected_contract_marker": "<!-- CONTRACT_REVIEW_MARKER -->",
+        "operation_reason": "contract_snapshot_publish",
+    }
+    data.update(overrides)
+    return data
+
+
 @pytest.fixture()
 def tmp_project(tmp_path):
     executor_dir = tmp_path / "scripts" / "agent-guards"
@@ -289,12 +304,118 @@ class TestIssueBodyUpdate:
         assert rc == 0
 
 
+class TestIssueBodyUpdateMarkerAuthority:
+    """Blocker 1: local marker is cache/audit only, never remote-mutation authority."""
+
+    def _write_marker(self, tmp_project, issue_number, command_id, new_body_sha256, repo=TRUSTED_REPO):
+        mp = _exec._issue_metadata_marker_path(
+            tmp_project, issue_number, command_id, "issue_body_update.marker.json"
+        )
+        mp.parent.mkdir(parents=True, exist_ok=True)
+        mp.write_text(json.dumps({
+            "schema": "ISSUE_BODY_UPDATE_MARKER_V1",
+            "issue_number": issue_number,
+            "repo": repo,
+            "new_body_sha256": new_body_sha256,
+        }))
+        return mp
+
+    def test_local_marker_remote_hash_mismatch_denied(self, tmp_project, monkeypatch):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        new_body = "new body text"
+        rel = _write_input(
+            tmp_project, 1284, COMMAND_ID_ISSUE_BODY_UPDATE, "in.json",
+            {
+                "schema": "ISSUE_BODY_UPDATE_INPUT_V1",
+                "issue_number": 1284,
+                "previous_body_sha256": _sha("old body"),
+                "previous_updated_at": "2026-01-01T00:00:00Z",
+                "new_body": new_body,
+                "new_body_sha256": _sha(new_body),
+            },
+        )
+        self._write_marker(tmp_project, 1284, COMMAND_ID_ISSUE_BODY_UPDATE, _sha(new_body))
+        with patch.object(_exec, "_fetch_issue_body_and_updated_at",
+                           return_value=("SOMEONE ELSE EDITED THIS", "2026-02-01T00:00:00Z", "")):
+            with patch.object(_exec, "_patch_issue_body") as mock_patch:
+                rc = _exec.main([
+                    "--command-id", COMMAND_ID_ISSUE_BODY_UPDATE,
+                    "--issue-number", "1284",
+                    "--input-file", rel,
+                    "--repo", TRUSTED_REPO,
+                ])
+        assert rc == 1
+        mock_patch.assert_not_called()
+
+    def test_local_marker_remote_hash_match_ok(self, tmp_project, monkeypatch):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        new_body = "new body text"
+        rel = _write_input(
+            tmp_project, 1284, COMMAND_ID_ISSUE_BODY_UPDATE, "in.json",
+            {
+                "schema": "ISSUE_BODY_UPDATE_INPUT_V1",
+                "issue_number": 1284,
+                "previous_body_sha256": _sha("old body"),
+                "previous_updated_at": "2026-01-01T00:00:00Z",
+                "new_body": new_body,
+                "new_body_sha256": _sha(new_body),
+            },
+        )
+        self._write_marker(tmp_project, 1284, COMMAND_ID_ISSUE_BODY_UPDATE, _sha(new_body))
+        with patch.object(_exec, "_fetch_issue_body_and_updated_at",
+                           return_value=(new_body, "2026-02-01T00:00:00Z", "")):
+            with patch.object(_exec, "_patch_issue_body") as mock_patch:
+                rc = _exec.main([
+                    "--command-id", COMMAND_ID_ISSUE_BODY_UPDATE,
+                    "--issue-number", "1284",
+                    "--input-file", rel,
+                    "--repo", TRUSTED_REPO,
+                ])
+        assert rc == 0
+        mock_patch.assert_not_called()
+
+    def test_local_marker_repo_issue_metadata_mismatch_denied(self, tmp_project, monkeypatch):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        new_body = "new body text"
+        rel = _write_input(
+            tmp_project, 1284, COMMAND_ID_ISSUE_BODY_UPDATE, "in.json",
+            {
+                "schema": "ISSUE_BODY_UPDATE_INPUT_V1",
+                "issue_number": 1284,
+                "previous_body_sha256": _sha("old body"),
+                "previous_updated_at": "2026-01-01T00:00:00Z",
+                "new_body": new_body,
+                "new_body_sha256": _sha(new_body),
+            },
+        )
+        # Marker file claims a different repo -- must not be trusted.
+        self._write_marker(
+            tmp_project, 1284, COMMAND_ID_ISSUE_BODY_UPDATE, _sha(new_body), repo="evil/repo"
+        )
+        with patch.object(_exec, "_fetch_issue_body_and_updated_at") as mock_fetch:
+            with patch.object(_exec, "_patch_issue_body") as mock_patch:
+                rc = _exec.main([
+                    "--command-id", COMMAND_ID_ISSUE_BODY_UPDATE,
+                    "--issue-number", "1284",
+                    "--input-file", rel,
+                    "--repo", TRUSTED_REPO,
+                ])
+        assert rc in (1, 2)
+        mock_patch.assert_not_called()
+        mock_fetch.assert_not_called()
+
+
 # =============================================================================
 # AC4/AC14: readback mismatch not success (issue_comment.publish)
 # =============================================================================
 
 class TestIssueCommentPublish:
     def test_ac4_readback_mismatch_not_success(self, tmp_project, monkeypatch):
+        """No remote marker present pre-mutation (proceed to post), but
+        post-mutation readback fails -> not success."""
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
         monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
         rel = _write_input(
@@ -304,60 +425,125 @@ class TestIssueCommentPublish:
         )
         with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
             with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
-                with patch.object(_exec, "_post_gh_comment", return_value=("url", "1", "")):
-                    with patch.object(_exec, "_readback_by_marker_literal",
-                                       return_value={"error": "marker_not_found"}):
-                        rc = _exec.main([
-                            "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
-                            "--issue-number", "1284",
-                            "--input-file", rel,
-                            "--repo", TRUSTED_REPO,
-                        ])
-        assert rc == 1
-
-    def test_ac14_duplicate_marker_not_success(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
-        rel = _write_input(
-            tmp_project, 1284, COMMAND_ID_ISSUE_COMMENT_PUBLISH, "in.json",
-            {"schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1", "issue_number": 1284,
-             "comment_body": "hi <!-- marker-x -->", "marker": "<!-- marker-x -->"},
-        )
-        with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
-            with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
-                with patch.object(_exec, "_post_gh_comment", return_value=("url", "1", "")):
-                    with patch.object(_exec, "_readback_by_marker_literal",
-                                       return_value={"error": "marker_found_2_times"}):
-                        rc = _exec.main([
-                            "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
-                            "--issue-number", "1284",
-                            "--input-file", rel,
-                            "--repo", TRUSTED_REPO,
-                        ])
-        assert rc == 1
-
-    def test_issue_comment_publish_success_path(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
-        rel = _write_input(
-            tmp_project, 1284, COMMAND_ID_ISSUE_COMMENT_PUBLISH, "in.json",
-            {"schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1", "issue_number": 1284,
-             "comment_body": "hi <!-- marker-x -->", "marker": "<!-- marker-x -->"},
-        )
-        with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
-            with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
-                with patch.object(_exec, "_post_gh_comment", return_value=("https://ex", "1", "")):
-                    with patch.object(_exec, "_readback_by_marker_literal",
-                                       return_value={"comment_id": "1", "comment_url": "https://ex",
-                                                      "body_sha256": "abc"}):
-                        with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
+                with patch.object(_exec, "_find_marker_matches", return_value=([], "")):
+                    with patch.object(_exec, "_post_gh_comment", return_value=("url", "1", "")):
+                        with patch.object(_exec, "_readback_by_marker_literal",
+                                           return_value={"error": "marker_not_found"}):
                             rc = _exec.main([
                                 "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
                                 "--issue-number", "1284",
                                 "--input-file", rel,
                                 "--repo", TRUSTED_REPO,
-                                "--json",
                             ])
+        assert rc == 1
+
+    def test_ac14_pre_mutation_duplicate_denied_before_post(self, tmp_project, monkeypatch):
+        """Blocker 3: remote already has >1 marker match -> deny BEFORE mutation.
+        _post_gh_comment must never be called."""
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        rel = _write_input(
+            tmp_project, 1284, COMMAND_ID_ISSUE_COMMENT_PUBLISH, "in.json",
+            {"schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1", "issue_number": 1284,
+             "comment_body": "hi <!-- marker-x -->", "marker": "<!-- marker-x -->"},
+        )
+        with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
+            with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
+                with patch.object(
+                    _exec, "_find_marker_matches",
+                    return_value=([{"id": "1", "body": "x"}, {"id": "2", "body": "y"}], ""),
+                ):
+                    with patch.object(_exec, "_post_gh_comment") as mock_post:
+                        rc = _exec.main([
+                            "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
+                            "--issue-number", "1284",
+                            "--input-file", rel,
+                            "--repo", TRUSTED_REPO,
+                        ])
+        assert rc == 1
+        mock_post.assert_not_called()
+
+    def test_remote_marker_exists_local_marker_missing_post_not_called(self, tmp_project, monkeypatch):
+        """Blocker 3 additional test: remote already has the exact marker with
+        matching body identity, local marker file is missing -> no-op success,
+        _post_gh_comment not called."""
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        comment_body = "hi <!-- marker-x -->"
+        rel = _write_input(
+            tmp_project, 1284, COMMAND_ID_ISSUE_COMMENT_PUBLISH, "in.json",
+            {"schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1", "issue_number": 1284,
+             "comment_body": comment_body, "marker": "<!-- marker-x -->"},
+        )
+        remote_comment = {"id": "42", "url": "https://ex/42", "body": comment_body}
+        with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
+            with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
+                with patch.object(_exec, "_find_marker_matches", return_value=([remote_comment], "")):
+                    with patch.object(_exec, "_post_gh_comment") as mock_post:
+                        rc = _exec.main([
+                            "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
+                            "--issue-number", "1284",
+                            "--input-file", rel,
+                            "--repo", TRUSTED_REPO,
+                            "--json",
+                        ])
+        assert rc == 0
+        mock_post.assert_not_called()
+        mp = _exec._issue_metadata_marker_path(
+            tmp_project, 1284, COMMAND_ID_ISSUE_COMMENT_PUBLISH, "issue_comment_publish.marker.json"
+        )
+        assert mp.exists()
+
+    def test_remote_marker_body_sha256_mismatch_conflict_before_mutation(self, tmp_project, monkeypatch):
+        """Blocker 2/3: remote marker exists but body identity differs from the
+        input's expected comment_body -> conflict BEFORE mutation, no post."""
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        rel = _write_input(
+            tmp_project, 1284, COMMAND_ID_ISSUE_COMMENT_PUBLISH, "in.json",
+            {"schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1", "issue_number": 1284,
+             "comment_body": "hi <!-- marker-x -->", "marker": "<!-- marker-x -->"},
+        )
+        remote_comment = {"id": "42", "url": "https://ex/42", "body": "DIFFERENT BODY <!-- marker-x -->"}
+        with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
+            with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
+                with patch.object(_exec, "_find_marker_matches", return_value=([remote_comment], "")):
+                    with patch.object(_exec, "_post_gh_comment") as mock_post:
+                        rc = _exec.main([
+                            "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
+                            "--issue-number", "1284",
+                            "--input-file", rel,
+                            "--repo", TRUSTED_REPO,
+                        ])
+        assert rc == 1
+        mock_post.assert_not_called()
+
+    def test_issue_comment_publish_success_path(self, tmp_project, monkeypatch):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        comment_body = "hi <!-- marker-x -->"
+        rel = _write_input(
+            tmp_project, 1284, COMMAND_ID_ISSUE_COMMENT_PUBLISH, "in.json",
+            {"schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1", "issue_number": 1284,
+             "comment_body": comment_body, "marker": "<!-- marker-x -->"},
+        )
+        import hashlib
+        expected_sha = hashlib.sha256(comment_body.encode()).hexdigest()
+        with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
+            with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
+                with patch.object(_exec, "_find_marker_matches", return_value=([], "")):
+                    with patch.object(_exec, "_post_gh_comment", return_value=("https://ex", "1", "")):
+                        with patch.object(_exec, "_readback_by_marker_literal",
+                                           return_value={"comment_id": "1", "comment_url": "https://ex",
+                                                          "body_sha256": expected_sha}):
+                            with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
+                                rc = _exec.main([
+                                    "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
+                                    "--issue-number", "1284",
+                                    "--input-file", rel,
+                                    "--repo", TRUSTED_REPO,
+                                    "--json",
+                                ])
         assert rc == 0
 
 
@@ -374,20 +560,23 @@ class TestTrackedDiff:
             {"schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1", "issue_number": 1284,
              "comment_body": "hi <!-- marker-x -->", "marker": "<!-- marker-x -->"},
         )
+        import hashlib
+        expected_sha = hashlib.sha256("hi <!-- marker-x -->".encode()).hexdigest()
         with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
             with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
-                with patch.object(_exec, "_post_gh_comment", return_value=("https://ex", "1", "")):
-                    with patch.object(_exec, "_readback_by_marker_literal",
-                                       return_value={"comment_id": "1", "comment_url": "https://ex",
-                                                      "body_sha256": "abc"}):
-                        with patch.object(_exec, "_check_no_tracked_changes",
-                                           return_value=["M:src/tracked_file.py"]):
-                            rc = _exec.main([
-                                "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
-                                "--issue-number", "1284",
-                                "--input-file", rel,
-                                "--repo", TRUSTED_REPO,
-                            ])
+                with patch.object(_exec, "_find_marker_matches", return_value=([], "")):
+                    with patch.object(_exec, "_post_gh_comment", return_value=("https://ex", "1", "")):
+                        with patch.object(_exec, "_readback_by_marker_literal",
+                                           return_value={"comment_id": "1", "comment_url": "https://ex",
+                                                          "body_sha256": expected_sha}):
+                            with patch.object(_exec, "_check_no_tracked_changes",
+                                               return_value=["M:src/tracked_file.py"]):
+                                rc = _exec.main([
+                                    "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
+                                    "--issue-number", "1284",
+                                    "--input-file", rel,
+                                    "--repo", TRUSTED_REPO,
+                                ])
         assert rc == 1
 
 
@@ -403,7 +592,7 @@ class TestContractSnapshotPublish:
         monkeypatch.delenv("LOOP_ISSUE_NUMBER", raising=False)
         rel = _write_input(
             tmp_project, 1284, COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH, "in.json",
-            {"schema": "CONTRACT_SNAPSHOT_PUBLISH_INPUT_V1", "issue_number": 1284},
+            _contract_snapshot_input(1284),
         )
         pub_result = {
             "status": "ok",
@@ -413,15 +602,18 @@ class TestContractSnapshotPublish:
         fake_proc = type("P", (), {"stdout": json.dumps(pub_result), "stderr": "", "returncode": 0})()
         with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
             with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
-                with patch("subprocess.run", return_value=fake_proc):
-                    with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
-                        rc = _exec.main([
-                            "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
-                            "--issue-number", "1284",
-                            "--input-file", rel,
-                            "--repo", TRUSTED_REPO,
-                            "--json",
-                        ])
+                with patch.object(_exec, "_check_contract_snapshot_module_realpaths", return_value=[]):
+                    with patch.object(_exec, "_fetch_issue_body_and_updated_at",
+                                       return_value=("current issue body", "2026-01-01T00:00:00Z", "")):
+                        with patch("subprocess.run", return_value=fake_proc):
+                            with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
+                                rc = _exec.main([
+                                    "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
+                                    "--issue-number", "1284",
+                                    "--input-file", rel,
+                                    "--repo", TRUSTED_REPO,
+                                    "--json",
+                                ])
         assert rc == 0
 
     def test_ac8_contract_snapshot_publisher_authority_fixed(self):
@@ -434,7 +626,7 @@ class TestContractSnapshotPublish:
         monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
         rel = _write_input(
             tmp_project, 1284, COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH, "in.json",
-            {"schema": "CONTRACT_SNAPSHOT_PUBLISH_INPUT_V1", "issue_number": 1284},
+            _contract_snapshot_input(1284),
         )
         pub_result = {"status": "ok", "contract_snapshot_url": "https://ex", "post_status": "posted"}
         fake_proc = type("P", (), {"stdout": json.dumps(pub_result), "stderr": "", "returncode": 0})()
@@ -447,38 +639,185 @@ class TestContractSnapshotPublish:
 
         with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
             with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
-                with patch("subprocess.run", side_effect=_fake_run):
-                    with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
-                        rc = _exec.main([
-                            "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
-                            "--issue-number", "1284",
-                            "--input-file", rel,
-                            "--repo", TRUSTED_REPO,
-                        ])
+                with patch.object(_exec, "_check_contract_snapshot_module_realpaths", return_value=[]):
+                    with patch.object(_exec, "_fetch_issue_body_and_updated_at",
+                                       return_value=("current issue body", "2026-01-01T00:00:00Z", "")):
+                        with patch("subprocess.run", side_effect=_fake_run):
+                            with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
+                                rc = _exec.main([
+                                    "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
+                                    "--issue-number", "1284",
+                                    "--input-file", rel,
+                                    "--repo", TRUSTED_REPO,
+                                ])
         assert rc == 0
         assert isinstance(captured["cmd"], list)
         assert captured["kwargs"].get("shell") is False
         assert str(_exec.PROJECT_ROOT / _exec._ENSURE_CONTRACT_SNAPSHOT_REL) in captured["cmd"]
+        # Blocker 5: sanitized env passed explicitly, no PYTHONPATH/PYTHONHOME leak.
+        child_env = captured["kwargs"].get("env")
+        assert child_env is not None
+        assert "PYTHONPATH" not in child_env
+        assert "PYTHONHOME" not in child_env
+        assert child_env.get("GH_PROMPT_DISABLED") == "1"
 
     def test_contract_snapshot_publish_failure_not_success(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
         monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
         rel = _write_input(
             tmp_project, 1284, COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH, "in.json",
-            {"schema": "CONTRACT_SNAPSHOT_PUBLISH_INPUT_V1", "issue_number": 1284},
+            _contract_snapshot_input(1284),
         )
         pub_result = {"status": "human_judgment", "contract_snapshot_url": None}
         fake_proc = type("P", (), {"stdout": json.dumps(pub_result), "stderr": "", "returncode": 0})()
         with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
             with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
-                with patch("subprocess.run", return_value=fake_proc):
+                with patch.object(_exec, "_check_contract_snapshot_module_realpaths", return_value=[]):
+                    with patch.object(_exec, "_fetch_issue_body_and_updated_at",
+                                       return_value=("current issue body", "2026-01-01T00:00:00Z", "")):
+                        with patch("subprocess.run", return_value=fake_proc):
+                            rc = _exec.main([
+                                "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
+                                "--issue-number", "1284",
+                                "--input-file", rel,
+                                "--repo", TRUSTED_REPO,
+                            ])
+        assert rc == 1
+
+    def test_contract_snapshot_publish_missing_required_field_rc2(self, tmp_project, monkeypatch):
+        """Blocker 4: {schema, issue_number}-only input is no longer sufficient
+        to launch ensure_contract_snapshot.py --mode auto --post."""
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        rel = _write_input(
+            tmp_project, 1284, COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH, "in.json",
+            {"schema": "CONTRACT_SNAPSHOT_PUBLISH_INPUT_V1", "issue_number": 1284},
+        )
+        rc = _exec.main([
+            "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
+            "--issue-number", "1284",
+            "--input-file", rel,
+            "--repo", TRUSTED_REPO,
+        ])
+        assert rc == 2
+
+    def test_contract_snapshot_publish_missing_expected_status_rc2(self, tmp_project, monkeypatch):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        data = _contract_snapshot_input(1284)
+        del data["expected_latest_contract_review_status"]
+        rel = _write_input(tmp_project, 1284, COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH, "in.json", data)
+        rc = _exec.main([
+            "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
+            "--issue-number", "1284",
+            "--input-file", rel,
+            "--repo", TRUSTED_REPO,
+        ])
+        assert rc == 2
+
+    def test_contract_snapshot_publish_target_body_sha256_mismatch(self, tmp_project, monkeypatch):
+        """target_issue_body_sha256 must match the live Issue body -- prevents
+        publishing a snapshot against a stale/edited Issue body."""
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        rel = _write_input(
+            tmp_project, 1284, COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH, "in.json",
+            _contract_snapshot_input(1284),
+        )
+        with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
+            with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
+                with patch.object(_exec, "_check_contract_snapshot_module_realpaths", return_value=[]):
+                    with patch.object(_exec, "_fetch_issue_body_and_updated_at",
+                                       return_value=("EDITED BODY", "2026-01-02T00:00:00Z", "")):
+                        with patch("subprocess.run") as mock_run:
+                            rc = _exec.main([
+                                "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
+                                "--issue-number", "1284",
+                                "--input-file", rel,
+                                "--repo", TRUSTED_REPO,
+                            ])
+        assert rc == 1
+        mock_run.assert_not_called()
+
+    def test_contract_snapshot_publish_realpath_mismatch_denied(self, tmp_project, monkeypatch):
+        """Blocker 5: ensure_contract_snapshot.py / run_contract_review_once.py /
+        contract_review_result_parser.py module chain must resolve to canonical
+        paths under project_root, mirroring the legacy publisher check."""
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        rel = _write_input(
+            tmp_project, 1284, COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH, "in.json",
+            _contract_snapshot_input(1284),
+        )
+        with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
+            with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
+                with patch("subprocess.run") as mock_run:
                     rc = _exec.main([
                         "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
                         "--issue-number", "1284",
                         "--input-file", rel,
                         "--repo", TRUSTED_REPO,
                     ])
+        # run_contract_review_once.py / contract_review_result_parser.py do not
+        # exist in the tmp_project fixture -> module_missing -> deny.
+        assert rc == 2
+        mock_run.assert_not_called()
+
+    def test_contract_snapshot_publish_ok_but_marker_missing_rc1(self, tmp_project, monkeypatch):
+        """Publisher reports ok with a contract_snapshot_url, but the postcondition
+        (no tracked changes outside the command's write root) fails -> not success."""
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        rel = _write_input(
+            tmp_project, 1284, COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH, "in.json",
+            _contract_snapshot_input(1284),
+        )
+        pub_result = {"status": "ok", "contract_snapshot_url": "https://ex", "post_status": "posted"}
+        fake_proc = type("P", (), {"stdout": json.dumps(pub_result), "stderr": "", "returncode": 0})()
+        with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
+            with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
+                with patch.object(_exec, "_check_contract_snapshot_module_realpaths", return_value=[]):
+                    with patch.object(_exec, "_fetch_issue_body_and_updated_at",
+                                       return_value=("current issue body", "2026-01-01T00:00:00Z", "")):
+                        with patch("subprocess.run", return_value=fake_proc):
+                            with patch.object(_exec, "_check_no_tracked_changes",
+                                               return_value=["??:artifacts/1284/unexpected.json"]):
+                                rc = _exec.main([
+                                    "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
+                                    "--issue-number", "1284",
+                                    "--input-file", rel,
+                                    "--repo", TRUSTED_REPO,
+                                ])
         assert rc == 1
+
+
+# =============================================================================
+# Blocker 5: contract_snapshot.publish env sanitizer (unit-level)
+# =============================================================================
+
+class TestContractSnapshotEnvSanitizer:
+    def test_metadata_sanitized_env_removes_pythonpath_pythonhome(self, monkeypatch):
+        monkeypatch.setenv("PYTHONPATH", "/evil/path")
+        monkeypatch.setenv("PYTHONHOME", "/evil/home")
+        env = _exec._build_metadata_sanitized_env()
+        assert "PYTHONPATH" not in env
+        assert "PYTHONHOME" not in env
+
+    def test_metadata_sanitized_env_removes_editor_browser(self, monkeypatch):
+        monkeypatch.setenv("EDITOR", "vim")
+        monkeypatch.setenv("VISUAL", "vim")
+        monkeypatch.setenv("BROWSER", "firefox")
+        monkeypatch.setenv("GH_EDITOR", "vim")
+        env = _exec._build_metadata_sanitized_env()
+        assert "EDITOR" not in env
+        assert "VISUAL" not in env
+        assert "BROWSER" not in env
+        assert "GH_EDITOR" not in env
+
+    def test_metadata_sanitized_env_disables_prompts(self):
+        env = _exec._build_metadata_sanitized_env()
+        assert env.get("GH_PROMPT_DISABLED") == "1"
+        assert env.get("GH_NO_UPDATE_NOTIFIER") == "1"
 
 
 # =============================================================================

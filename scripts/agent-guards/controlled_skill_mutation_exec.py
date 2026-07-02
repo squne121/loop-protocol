@@ -5,30 +5,43 @@ controlled_skill_mutation_exec.py
 Single executor for CONTROLLED_SKILL_MUTATION_COMMAND_POLICY entries.
 Invoked by agents via the exact argv form defined in controlled_skill_mutation_policy.py.
 
-Design: Direct script allow for publish_termination_report.py is denied. Only this
-executor is allow-listed in settings.json. The executor enforces:
-  - command_id whitelist (termination_report.publish only)
+Design: Direct script allow for publish_termination_report.py / ensure_contract_snapshot.py
+is denied. Only this executor is allow-listed in settings.json. It handles four
+command ids: termination_report.publish (legacy, Issue #1166), and issue_body.update /
+issue_comment.publish / contract_snapshot.publish (Issue #1284 issue metadata mutation
+lane). The executor enforces:
+  - command_id whitelist (ALL_COMMAND_IDS)
   - repo binding (--repo must be TRUSTED_REPO)
   - git remote origin binding (must match TRUSTED_REPO)
-  - issue binding (--issue-number must match LOOP_ISSUE_NUMBER env -- mandatory)
-  - input-file binding (must be in active issue artifact subtree, no symlinks, no hardlinks)
-  - input-file JSON validation (schema + issue_number field cross-check)
+  - issue binding (--issue-number must match LOOP_ISSUE_NUMBER env -- mandatory for
+    termination_report.publish, optional-but-matching for the Issue #1284 command ids)
+  - input-file binding (must be in the active issue/command-id artifact subtree,
+    no symlinks, no hardlinks)
+  - input-file JSON validation (schema + issue_number field cross-check, plus
+    per-command-id field schemas for the Issue #1284 command ids)
   - gh binary discovery (trusted path only)
   - environment sanitization (PUBLISH_ARTIFACT_DIR / PYTHONPATH / PYTHONHOME /
     GH_EDITOR / EDITOR / VISUAL / BROWSER overridden/removed)
-  - module realpath inspection (publisher / renderer / prose_boundary canonical path check,
-    missing=deny, import origin check)
-  - idempotency (marker file pre-check; no double-post)
-  - exec marker injection (deterministic marker for comment read-back)
-  - postcondition (git status --porcelain=v1 must show no changes outside artifacts/)
+  - module realpath inspection (publisher / renderer / prose_boundary canonical path
+    check for termination_report.publish; ensure_contract_snapshot.py /
+    run_contract_review_once.py / contract_review_result_parser.py canonical path
+    check for contract_snapshot.publish -- missing=deny)
+  - remote-state-is-authority idempotency: local marker files are cache/audit only.
+    issue_body.update and issue_comment.publish always readback GitHub before
+    declaring success; a local marker never substitutes for a remote check.
+  - exec marker injection (deterministic marker for comment read-back, legacy command)
+  - pre-mutation marker precheck for issue_comment.publish (no POST before remote
+    marker state is known -- a failed transaction must not leave a side effect)
+  - postcondition (git status --porcelain=v1 must show no changes outside the
+    command-id-scoped artifact write root)
   - comment read-back by marker (comment id / url / body hash recorded)
 
 Exit codes:
   0 - publish succeeded
-  1 - publish failed or idempotency marker already set
-  2 - validation error (wrong args, wrong issue, wrong file, etc.)
+  1 - publish failed, stale/mismatched state detected, or idempotency marker already set
+  2 - validation error (wrong args, wrong issue, wrong file, missing schema fields, etc.)
 
-Issue #1166.
+Issue #1166 / Issue #1284.
 """
 
 from __future__ import annotations
@@ -79,6 +92,12 @@ from controlled_skill_mutation_policy import (
 
 _ENSURE_CONTRACT_SNAPSHOT_REL = (
     ".claude/skills/impl-review-loop/scripts/ensure_contract_snapshot.py"
+)
+_RUN_CONTRACT_REVIEW_ONCE_REL = (
+    ".claude/skills/issue-contract-review/scripts/run_contract_review_once.py"
+)
+_CONTRACT_REVIEW_RESULT_PARSER_REL = (
+    ".claude/skills/issue-contract-review/scripts/contract_review_result_parser.py"
 )
 
 # -- Result schema -------------------------------------------------------------
@@ -156,6 +175,51 @@ def _build_sanitized_env(
         env["CONTROLLED_EXEC_MARKER"] = exec_marker
 
     return env
+
+
+# -- Issue #1284 Blocker 5: generic metadata-command env sanitizer -------------
+
+
+def _build_metadata_sanitized_env() -> dict[str, str]:
+    """Build a sanitized environment for issue-metadata publisher subprocesses
+    (contract_snapshot.publish). Equivalent boundary to _build_sanitized_env()
+    minus the PUBLISH_ARTIFACT_DIR override, which is legacy-publisher-specific.
+    """
+    env = os.environ.copy()
+    for key in ENV_SANITIZE_KEYS:
+        env.pop(key, None)
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    env["GH_PROMPT_DISABLED"] = "1"
+    env["GH_NO_UPDATE_NOTIFIER"] = "1"
+    return env
+
+
+# -- Issue #1284 Blocker 5: contract_snapshot.publish module realpath check ----
+
+
+def _check_contract_snapshot_module_realpaths(project_root: Path) -> list[str]:
+    """Return list of realpath violations for the contract_snapshot.publish
+    publisher module chain. Missing modules are treated as errors (missing=deny),
+    mirroring _check_module_realpaths() for the legacy termination_report.publish
+    command.
+    """
+    errors = []
+    for rel in (
+        _ENSURE_CONTRACT_SNAPSHOT_REL,
+        _RUN_CONTRACT_REVIEW_ONCE_REL,
+        _CONTRACT_REVIEW_RESULT_PARSER_REL,
+    ):
+        canonical = (project_root / rel).resolve()
+        if not canonical.exists():
+            errors.append(f"module_missing: {rel} not found at {canonical}")
+            continue
+        if not str(canonical).startswith(str(project_root)):
+            errors.append(
+                f"module_shadowing: {rel} resolved to {canonical}, "
+                f"expected under {project_root}"
+            )
+    return errors
 
 
 # -- Module realpath inspection ------------------------------------------------
@@ -383,9 +447,24 @@ def _validate_issue_comment_publish_fields(data: dict) -> str:
 
 
 def _validate_contract_snapshot_publish_fields(data: dict, repo: str) -> str:
-    declared_repo = data.get("repo", repo)
+    """Issue #1284 Blocker 4: CONTRACT_SNAPSHOT_PUBLISH_INPUT_V1 must bind repo /
+    target_issue_body_sha256 / expected_latest_contract_review_status /
+    expected_contract_marker / operation_reason. An input file with only
+    {schema, issue_number} is no longer sufficient to launch
+    ensure_contract_snapshot.py --mode auto --post.
+    """
+    declared_repo = data.get("repo")
     if declared_repo != repo:
         return f"contract_snapshot_publish_repo_mismatch: {declared_repo!r} != {repo!r}"
+    for field in (
+        "target_issue_body_sha256",
+        "expected_latest_contract_review_status",
+        "expected_contract_marker",
+        "operation_reason",
+    ):
+        val = data.get(field)
+        if not isinstance(val, str) or not val:
+            return f"contract_snapshot_publish_field_invalid: {field!r}"
     return ""
 
 
@@ -502,6 +581,39 @@ def _readback_by_marker(
         return {"error": f"readback_exception:{exc}"}
 
 
+# -- Issue #1284: HTTP error classification (same granularity as
+# ensure_contract_snapshot.py's classify_post_http_error / _extract_http_status)
+
+
+def _extract_http_status(stderr: str) -> int | None:
+    """Extract HTTP status code from gh CLI stderr."""
+    m = _re.search(r"HTTP (\d{3})", stderr or "")
+    if m:
+        return int(m.group(1))
+    for code in (403, 404, 410, 422, 429, 503):
+        if str(code) in (stderr or ""):
+            return code
+    return None
+
+
+def _classify_gh_error(prefix: str, stderr: str) -> str:
+    """Classify a gh api failure into a deterministic error code.
+
+    403 -> permission_denied, 404/410 -> ambiguous_no_retry, 422 -> validation_failed,
+    429/503 -> rate_limited, unknown -> the raw truncated stderr.
+    """
+    status = _extract_http_status(stderr)
+    if status == 403:
+        return f"{prefix}_permission_denied_http_403"
+    if status in (404, 410):
+        return f"{prefix}_ambiguous_no_retry_http_{status}"
+    if status == 422:
+        return f"{prefix}_validation_failed_http_422"
+    if status in (429, 503):
+        return f"{prefix}_rate_limited_http_{status}"
+    return f"{prefix}: {stderr.strip()[:200]}"
+
+
 # -- Issue #1284: issue body / comment mutation helpers ------------------------
 
 
@@ -548,7 +660,7 @@ def _patch_issue_body(
             except OSError:
                 pass
         if out.returncode != 0:
-            return f"gh_api_patch_failed: {out.stderr.strip()[:200]}"
+            return _classify_gh_error("gh_api_patch_failed", out.stderr or "")
         return ""
     except Exception as exc:
         return f"gh_api_patch_exception: {exc}"
@@ -579,7 +691,7 @@ def _post_gh_comment(
             except OSError:
                 pass
         if out.returncode != 0:
-            return "", "", f"gh_api_post_comment_failed: {out.stderr.strip()[:200]}"
+            return "", "", _classify_gh_error("gh_api_post_comment_failed", out.stderr or "")
         try:
             resp = json.loads(out.stdout)
         except Exception as exc:
@@ -592,11 +704,17 @@ def _post_gh_comment(
 # -- Postcondition check -------------------------------------------------------
 
 
-def _check_no_tracked_changes(project_root: Path, issue_number: int) -> list[str]:
+def _check_no_tracked_changes(
+    project_root: Path, issue_number: int, allowed_prefix: str | None = None
+) -> list[str]:
     """Return list of violations (staged, unstaged, untracked source files). Empty = OK (AC14).
 
     Uses git status --porcelain=v1 --untracked-files=all.
-    Allows writes inside artifacts/{issue_number}/.
+    Allows writes inside allowed_prefix. Defaults to artifacts/{issue_number}/
+    (legacy termination_report.publish write root). Issue #1284 Blocker 6: new
+    command ids pass a command-id-scoped prefix
+    (artifacts/{issue_number}/issue-metadata/{command_id}/) so the postcondition
+    cannot be satisfied by writes to a sibling command's namespace.
     """
     try:
         out = subprocess.run(
@@ -609,7 +727,8 @@ def _check_no_tracked_changes(project_root: Path, issue_number: int) -> list[str
         if out.returncode != 0:
             return [f"git_status_failed: {out.stderr.strip()[:100]}"]
 
-        allowed_prefix = f"artifacts/{issue_number}/"
+        if allowed_prefix is None:
+            allowed_prefix = f"artifacts/{issue_number}/"
         violations = []
         for line in out.stdout.splitlines():
             if len(line) < 4:
@@ -761,7 +880,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command_id == COMMAND_ID_ISSUE_COMMENT_PUBLISH:
         return _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail, _ok)
     if args.command_id == COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH:
-        return _run_contract_snapshot_publish(args, input_data, _fail, _ok)
+        return _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok)
 
     return _fail(f"unhandled_command_id: {args.command_id!r}")  # pragma: no cover — defensive
 
@@ -868,17 +987,7 @@ def _run_issue_body_update(args, input_data, gh_bin, _fail, _ok) -> int:
     marker_path = _issue_metadata_marker_path(
         PROJECT_ROOT, args.issue_number, args.command_id, "issue_body_update.marker.json"
     )
-    if marker_path.exists():
-        try:
-            existing = json.loads(marker_path.read_text())
-        except Exception:
-            existing = {}
-        if existing.get("new_body_sha256") == input_data["new_body_sha256"]:
-            return _ok({
-                "status_detail": "already_applied",
-                "new_body_sha256": existing.get("new_body_sha256"),
-                "idempotency_marker_found": True,
-            })
+    write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
 
     if args.dry_run:
         result = {"schema": RESULT_SCHEMA, "status": "dry_run_ok", "command_id": args.command_id,
@@ -887,11 +996,42 @@ def _run_issue_body_update(args, input_data, gh_bin, _fail, _ok) -> int:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
-    # -- AC9: stale-write precondition — readback must match previous_* --------
+    # -- Blocker 1: local marker is cache/audit only, never remote-mutation
+    # authority. Marker metadata is checked for consistency, but success or
+    # failure is decided by a fresh remote readback below.
+    marker_data = None
+    if marker_path.exists():
+        try:
+            marker_data = json.loads(marker_path.read_text())
+        except Exception:
+            return _fail("issue_body_update_marker_corrupt")
+        if (
+            marker_data.get("issue_number") != args.issue_number
+            or marker_data.get("repo") != args.repo
+        ):
+            return _fail("issue_body_update_marker_metadata_mismatch")
+
+    # -- Readback current remote state (authority for both the marker-hit path
+    # and the normal stale-write precondition path).
     body, updated_at, err = _fetch_issue_body_and_updated_at(args.issue_number, args.repo, gh_bin)
     if err:
         return _fail(err, status="failed")
     current_body_sha256 = "sha256:" + hashlib.sha256((body or "").encode("utf-8")).hexdigest()
+
+    if marker_data is not None:
+        if current_body_sha256 == input_data["new_body_sha256"]:
+            return _ok({
+                "status_detail": "already_applied",
+                "new_body_sha256": current_body_sha256,
+                "idempotency_marker_found": True,
+            })
+        return _fail(
+            f"stale_marker_remote_mismatch: current={current_body_sha256} "
+            f"expected={input_data['new_body_sha256']}",
+            status="failed",
+        )
+
+    # -- AC9: stale-write precondition — readback must match previous_* --------
     if current_body_sha256 != input_data["previous_body_sha256"]:
         return _fail(
             f"stale_precondition_body_sha256_mismatch: current={current_body_sha256} "
@@ -924,8 +1064,9 @@ def _run_issue_body_update(args, input_data, gh_bin, _fail, _ok) -> int:
             status="failed",
         )
 
-    # -- AC14: postcondition -- no tracked/staged/untracked source file changes
-    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number)
+    # -- AC14 / Blocker 6: postcondition -- no changes outside this command's
+    # own write root (artifacts/{issue}/issue-metadata/issue_body.update/).
+    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
     if changed:
         return _fail(
             "postcondition_tracked_changes_detected",
@@ -937,6 +1078,7 @@ def _run_issue_body_update(args, input_data, gh_bin, _fail, _ok) -> int:
     marker_path.write_text(json.dumps({
         "schema": "ISSUE_BODY_UPDATE_MARKER_V1",
         "issue_number": args.issue_number,
+        "repo": args.repo,
         "new_body_sha256": actual_new_sha256,
         "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }, ensure_ascii=False, indent=2))
@@ -953,21 +1095,12 @@ def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail,
         return _fail(field_err)
 
     marker = input_data["marker"]
+    comment_body = input_data["comment_body"]
+    expected_body_sha256 = hashlib.sha256(comment_body.encode()).hexdigest()
     marker_path = _issue_metadata_marker_path(
         PROJECT_ROOT, args.issue_number, args.command_id, "issue_comment_publish.marker.json"
     )
-    if marker_path.exists():
-        try:
-            existing = json.loads(marker_path.read_text())
-        except Exception:
-            existing = {}
-        if existing.get("marker") == marker:
-            return _ok({
-                "status_detail": "already_published",
-                "comment_id": existing.get("comment_id"),
-                "comment_url": existing.get("comment_url"),
-                "idempotency_marker_found": True,
-            })
+    write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
 
     if args.dry_run:
         result = {"schema": RESULT_SCHEMA, "status": "dry_run_ok", "command_id": args.command_id,
@@ -976,18 +1109,62 @@ def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail,
             print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
+    def _write_marker(comment_id, comment_url) -> None:
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps({
+            "schema": "ISSUE_COMMENT_PUBLISH_MARKER_V1",
+            "issue_number": args.issue_number,
+            "repo": args.repo,
+            "marker": marker,
+            "comment_id": comment_id,
+            "comment_url": comment_url,
+            "published_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }, ensure_ascii=False, indent=2))
+
+    # -- Blocker 2/3: pre-mutation remote marker precheck. A local marker file
+    # is never authority by itself; remote GitHub state decides no-op vs. post
+    # vs. conflict, and this check runs BEFORE any POST so a failed transaction
+    # never leaves a remote side effect.
+    matches, list_err = _find_marker_matches(marker, args.issue_number, args.repo, gh_bin)
+    if list_err:
+        return _fail(f"marker_precheck_failed: {list_err}", status="failed")
+
+    if len(matches) > 1:
+        return _fail("duplicate_marker_conflict_pre_mutation", status="failed")
+
+    if len(matches) == 1:
+        c = matches[0]
+        remote_body_sha256 = hashlib.sha256(c.get("body", "").encode()).hexdigest()
+        if remote_body_sha256 != expected_body_sha256:
+            return _fail("remote_marker_identity_conflict_pre_mutation", status="failed")
+        # No-op: already published by a prior run (or another agent). Refresh
+        # the local cache/audit marker but do not POST again.
+        _write_marker(c.get("id", ""), c.get("url", ""))
+        return _ok({
+            "status_detail": "already_published",
+            "comment_id": c.get("id", ""),
+            "comment_url": c.get("url", ""),
+            "body_sha256": remote_body_sha256,
+            "idempotency_marker_written": True,
+        })
+
+    # -- matches == 0: no remote marker yet, proceed to post --------------------
     comment_url, comment_id, post_err = _post_gh_comment(
-        args.issue_number, args.repo, input_data["comment_body"], gh_bin
+        args.issue_number, args.repo, comment_body, gh_bin
     )
     if post_err:
         return _fail(post_err, status="failed")
 
-    # -- AC4/AC14: readback by marker — false success not allowed ---------------
+    # -- AC4/AC14: postcondition readback by marker — false success not allowed -
     readback = _readback_by_marker_literal(marker, args.issue_number, args.repo, gh_bin)
     if "error" in readback:
         return _fail(f"readback_failed: {readback['error']}", status="failed")
+    if readback.get("body_sha256") != expected_body_sha256:
+        return _fail("postcondition_body_sha256_mismatch", status="failed")
 
-    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number)
+    # -- AC14 / Blocker 6: postcondition -- no changes outside this command's
+    # own write root (artifacts/{issue}/issue-metadata/issue_comment.publish/).
+    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
     if changed:
         return _fail(
             "postcondition_tracked_changes_detected",
@@ -995,15 +1172,7 @@ def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail,
             status="failed",
         )
 
-    marker_path.parent.mkdir(parents=True, exist_ok=True)
-    marker_path.write_text(json.dumps({
-        "schema": "ISSUE_COMMENT_PUBLISH_MARKER_V1",
-        "issue_number": args.issue_number,
-        "marker": marker,
-        "comment_id": readback.get("comment_id"),
-        "comment_url": readback.get("comment_url"),
-        "published_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    }, ensure_ascii=False, indent=2))
+    _write_marker(readback.get("comment_id"), readback.get("comment_url"))
 
     return _ok({
         "comment_id": readback.get("comment_id"),
@@ -1011,6 +1180,28 @@ def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail,
         "body_sha256": readback.get("body_sha256"),
         "idempotency_marker_written": True,
     })
+
+
+def _find_marker_matches(marker_literal: str, issue_number: int, repo: str, gh_bin: str) -> tuple[list[dict], str]:
+    """List all remote comments containing marker_literal. Returns (matches, error).
+
+    Used as the pre-mutation precheck for issue_comment.publish (Blocker 3):
+    the caller must know remote marker count/identity BEFORE deciding whether
+    to POST, so that a failed transaction never leaves a remote side effect.
+    """
+    try:
+        out = subprocess.run(
+            [gh_bin, "issue", "view", str(issue_number), "--repo", repo, "--json", "comments"],
+            capture_output=True, text=True, timeout=15, shell=False,
+        )
+        if out.returncode != 0:
+            return [], f"gh_failed_rc_{out.returncode}"
+        data = json.loads(out.stdout)
+        comments = data.get("comments", [])
+        matches = [c for c in comments if marker_literal in c.get("body", "")]
+        return matches, ""
+    except Exception as exc:
+        return [], f"marker_list_exception:{exc}"
 
 
 def _readback_by_marker_literal(marker_literal: str, issue_number: int, repo: str, gh_bin: str) -> dict:
@@ -1042,10 +1233,20 @@ def _readback_by_marker_literal(marker_literal: str, issue_number: int, repo: st
         return {"error": f"readback_exception:{exc}"}
 
 
-def _run_contract_snapshot_publish(args, input_data, _fail, _ok) -> int:
+def _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok) -> int:
+    # -- Blocker 4: input schema binding (repo / target_issue_body_sha256 /
+    # expected_latest_contract_review_status / expected_contract_marker /
+    # operation_reason) — an under-specified input can no longer launch
+    # ensure_contract_snapshot.py --mode auto --post.
     field_err = _validate_contract_snapshot_publish_fields(input_data, args.repo)
     if field_err:
         return _fail(field_err)
+
+    # -- Blocker 5: publisher module chain realpath / shadowing check, same
+    # rigor as the legacy termination_report.publish command.
+    realpath_errors = _check_contract_snapshot_module_realpaths(PROJECT_ROOT)
+    if realpath_errors:
+        return _fail("module_shadowing_detected", realpath_errors)
 
     if args.dry_run:
         result = {"schema": RESULT_SCHEMA, "status": "dry_run_ok", "command_id": args.command_id,
@@ -1054,6 +1255,20 @@ def _run_contract_snapshot_publish(args, input_data, _fail, _ok) -> int:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
+    # -- target_issue_body_sha256 precondition: refuse to publish a contract
+    # snapshot against an Issue body that has moved since the caller computed
+    # its expected state.
+    body, _updated_at, body_err = _fetch_issue_body_and_updated_at(args.issue_number, args.repo, gh_bin)
+    if body_err:
+        return _fail(body_err, status="failed")
+    current_body_sha256 = "sha256:" + hashlib.sha256((body or "").encode("utf-8")).hexdigest()
+    if current_body_sha256 != input_data["target_issue_body_sha256"]:
+        return _fail(
+            f"target_issue_body_sha256_mismatch: current={current_body_sha256} "
+            f"expected={input_data['target_issue_body_sha256']}",
+            status="failed",
+        )
+
     publisher = PROJECT_ROOT / _ENSURE_CONTRACT_SNAPSHOT_REL
     if not publisher.exists():
         return _fail(f"publisher_missing: {publisher}", status="failed")
@@ -1061,6 +1276,7 @@ def _run_contract_snapshot_publish(args, input_data, _fail, _ok) -> int:
     artifact_dir = _issue_metadata_marker_path(
         PROJECT_ROOT, args.issue_number, args.command_id, ""
     ).parent
+    write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
     cmd = [
         sys.executable,
         str(publisher),
@@ -1070,9 +1286,13 @@ def _run_contract_snapshot_publish(args, input_data, _fail, _ok) -> int:
         "--post",
         "--artifact-dir", str(artifact_dir),
     ]
+    # -- Blocker 5: sanitized env (PYTHONPATH / PYTHONHOME / editor / browser /
+    # prompt overrides removed), same boundary as _build_sanitized_env().
+    sanitized_env = _build_metadata_sanitized_env()
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=180, cwd=str(PROJECT_ROOT), shell=False,
+            cmd, capture_output=True, text=True, timeout=180, cwd=str(PROJECT_ROOT),
+            shell=False, env=sanitized_env,
         )
     except subprocess.TimeoutExpired:
         return _fail("publisher_timeout_180s", status="failed")
@@ -1095,7 +1315,9 @@ def _run_contract_snapshot_publish(args, input_data, _fail, _ok) -> int:
             status="failed",
         )
 
-    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number)
+    # -- AC14 / Blocker 6: postcondition -- no changes outside this command's
+    # own write root (artifacts/{issue}/issue-metadata/contract_snapshot.publish/).
+    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
     if changed:
         return _fail(
             "postcondition_tracked_changes_detected",
