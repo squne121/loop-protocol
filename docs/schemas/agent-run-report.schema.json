@@ -690,6 +690,35 @@
           "if": {
             "properties": {
               "availability": {
+                "const": "available"
+              }
+            },
+            "required": [
+              "availability"
+            ]
+          },
+          "then": {
+            "properties": {
+              "safety": {
+                "type": "object",
+                "properties": {
+                  "reason_codes": {
+                    "type": "array",
+                    "not": {
+                      "contains": {
+                        "const": "source_unavailable"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "availability": {
                 "const": "unavailable"
               }
             }
@@ -723,6 +752,39 @@
                     "type": "array",
                     "contains": {
                       "const": "source_unavailable"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "capability_verdict": {
+                "enum": [
+                  "supported",
+                  "unsupported",
+                  "unverified"
+                ]
+              }
+            },
+            "required": [
+              "capability_verdict"
+            ]
+          },
+          "then": {
+            "properties": {
+              "safety": {
+                "type": "object",
+                "properties": {
+                  "reason_codes": {
+                    "type": "array",
+                    "not": {
+                      "contains": {
+                        "const": "partial_projection"
+                      }
                     }
                   }
                 }

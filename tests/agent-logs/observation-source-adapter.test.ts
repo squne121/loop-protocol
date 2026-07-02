@@ -230,6 +230,97 @@ describe('observation-source adapter', () => {
         reason_codes: ['source-unavailable'],
       },
     }))).toThrow(/match \^\[a-z\]\[a-z0-9_\]\{0,79\}\$/i)
+
+    expect(() => buildObservationSourceFromInput(createInput({
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: ['source.unavailable'],
+      },
+    }))).toThrow(/match \^\[a-z\]\[a-z0-9_\]\{0,79\}\$/i)
+
+    expect(() => buildObservationSourceFromInput(createInput({
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: ['source/unavailable'],
+      },
+    }))).toThrow(/match \^\[a-z\]\[a-z0-9_\]\{0,79\}\$/i)
+  })
+
+  it('GIVEN html marker markdown fence empty string or non-array reason codes WHEN adapted THEN it fails closed', () => {
+    expect(() => buildObservationSourceFromInput(createInput({
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: ['<!-- CHATGPT_RETRO_CONTEXT_V1 start -->'],
+      },
+    }))).toThrow(/match \^\[a-z\]\[a-z0-9_\]\{0,79\}\$/i)
+
+    expect(() => buildObservationSourceFromInput(createInput({
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: ['```'],
+      },
+    }))).toThrow(/match \^\[a-z\]\[a-z0-9_\]\{0,79\}\$/i)
+
+    expect(() => buildObservationSourceFromInput(createInput({
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: [''],
+      },
+    }))).toThrow(/match \^\[a-z\]\[a-z0-9_\]\{0,79\}\$/i)
+
+    expect(() => buildObservationSourceFromInput(createInput({
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: 123,
+      },
+    }))).toThrow(/must be an array/i)
+  })
+
+  it('GIVEN non-string reason code item WHEN adapted THEN it fails closed', () => {
+    expect(() => buildObservationSourceFromInput(createInput({
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: [123],
+      },
+    }))).toThrow(/must be a string/i)
+  })
+
+  it('GIVEN semantic inverse drift in reason codes WHEN adapted THEN it fails closed', () => {
+    expect(() => buildObservationSourceFromInput(createInput({
+      availability: 'available',
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: ['source_unavailable'],
+      },
+    }))).toThrow(/must not include source_unavailable/i)
+
+    expect(() => buildObservationSourceFromInput(createInput({
+      capability_verdict: 'supported',
+      availability: 'available',
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: ['partial_projection'],
+      },
+    }))).toThrow(/must not include partial_projection/i)
+
+    expect(() => buildObservationSourceFromInput(createInput({
+      capability_verdict: 'unsupported',
+      availability: 'unavailable',
+      safety: {
+        verdict: 'blocked',
+        raw_values_emitted: false,
+        reason_codes: ['source_unavailable', 'partial_projection'],
+      },
+    }))).toThrow(/must not include partial_projection/i)
   })
 
   it('GIVEN too many reason codes WHEN adapted THEN it fails closed', () => {
