@@ -112,7 +112,16 @@ class TestRegistryScope:
     """AC8: registry contains only the expected command IDs."""
 
     def test_only_known_command_ids(self):
-        known_ids = {COMMAND_ID_PUBLISH}
+        # Issue #1284 extends the shared registry with issue metadata mutation
+        # command ids (issue_body.update / issue_comment.publish /
+        # contract_snapshot.publish). This scope-pin is updated deliberately as
+        # part of that Issue's explicit In Scope registry extension.
+        known_ids = {
+            COMMAND_ID_PUBLISH,
+            "issue_body.update",
+            "issue_comment.publish",
+            "contract_snapshot.publish",
+        }
         actual_ids = set(CONTROLLED_SKILL_MUTATION_COMMAND_POLICY.keys())
         assert actual_ids == known_ids, (
             f"Unexpected extra entries: {actual_ids - known_ids}"
