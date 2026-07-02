@@ -507,3 +507,25 @@ TERMINATION_REPORT_RENDER_RESULT_V1:
 
 本フロー（`render_termination_report.py` の呼び出し）は follow-up Issue に委譲する。
 本 policy セクションは renderer ライブラリの規約として機能し、callsite integration 前でも実効性がある。
+
+
+### scope_signal_guard 停止時の missing approval field / suggested contract patch（#1090 AC6）
+
+`scope_signal_guard.triggered=true` かつ `scope_signal_guard_decision_v2.route` が
+`human_judgment_required` である termination は、`scope_signal_guard_reason_code` だけでなく
+以下の追加情報を termination artifact / blockers_summary に含める。
+
+- `missing_approval_field`: `scope_signal_guard_decision_v2.scope_delta_approval.missing_approval_field`
+  （`true` の場合、Scope Delta Approval コメントが未投稿または marker 未検出であることを示す）
+- `suggested_contract_patch`: `scope_signal_guard_decision_v2.scope_delta_approval.suggested_contract_patch`
+  （OWNER/MEMBER/COLLABORATOR に ANCHOR_SCOPE_REFRAME コメント投稿を促す定型文。`status: approved` の場合は `null`）
+
+`route` が `security_risk_gate_required` または `invalid_scope_delta_approval` の場合も同様に
+`route` 値そのものを blockers_summary に転記し、`scope_signal_guard_reason_code` 単独の表示より
+具体的な次アクションが人間に伝わるようにする。
+
+renderer（`render_termination_report.py`）の callsite integration は上記「callsite integration」節の通り
+follow-up Issue に委譲されるが、`scope_signal_guard_decision_v2` は `plan_refinement_loop.py` が
+既に出力しているため、callsite integration 前でも `LOOP_STATE_BUILD_RESULT_V1.scope_signal_guard_decision_v2`
+（`build_loop_state.py` が pass-through する envelope フィールド。`LOOP_STATE_V1` 本体のスキーマは変更しない）
+から参照可能である。

@@ -189,3 +189,20 @@ Use `build_refinement_phase_state.py` to generate `ISSUE_REFINEMENT_PHASE_STATE_
 
 The generated `ISSUE_REFINEMENT_PHASE_STATE_V1` contains `scope_signal_semantics.hard_stop_eligible`
 which determines whether `scope_signal_guard.triggered` is a hard stop in the current phase.
+
+
+## scope_signal_guard_decision_v2（build_loop_state.py の envelope pass-through, #1090）
+
+`build_loop_state.py` は `plan['scope_signal_guard_decision_v2']`（#1090, opt-in。
+`references/scope-signal-guard.md` 参照）が存在する場合、それをそのまま
+`LOOP_STATE_BUILD_RESULT_V1.scope_signal_guard_decision_v2` として CLI 出力 envelope に含める。
+
+**`LOOP_STATE_V1` 本体（`loop_state.schema.json` で検証される部分）には含めない。**
+`schemas/loop_state.schema.json` は本 Issue の Allowed Paths 外であり、
+`additionalProperties: false` の既存スキーマを変更せずに lane 情報を surfaces する必要があるため、
+`_make_build_result()` が構築する CLI envelope 側にのみ追加する（`LOOP_STATE_BUILD_RESULT_V1` は
+jsonschema 検証対象外）。`build_loop_state()` 関数の戻り値は
+`(loop_state, blocked_reasons, scope_signal_guard_decision_v2)` の 3-tuple になる。
+
+`LOOP_STATE_V1.scope_signal_guard`（`triggered` / `excluded_by_anchor_reframe` / `reason_code`）の
+既存 3 フィールドの意味・値は変更しない。

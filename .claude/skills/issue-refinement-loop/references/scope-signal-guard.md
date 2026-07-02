@@ -165,3 +165,104 @@ scope_signal_delta_input:
 - raw anchor comment body を planner input に流さない（normalized decision / hash / provenance のみ渡す）
 - `CONTRIBUTOR` / `NONE` を trusted anchor として扱わない
 - phase-sensitive routing を bypass して hard stop を早期発火させない
+
+
+## SCOPE_SIGNAL_GUARD_DECISION_V2（escalation lane split, #1090）
+
+`plan_refinement_loop.py` は `known_context.scope_signal_delta_input` が与えられた場合に限り、
+`REFINEMENT_LOOP_PLAN_V1` のトップレベルに追加フィールド `scope_signal_guard_decision_v2` を出力する
+（既存の `decisions.scope_signal_guard` の意味・値は変更しない。additive のみ）。
+
+```yaml
+scope_signal_guard_decision_v2:
+  schema_version: SCOPE_SIGNAL_GUARD_DECISION_V2
+  raw_signal:
+    triggered: true | false
+    reason_code: new_in_scope_area | new_allowed_path_layer | new_unverifiable_ac | anchor_reframe_exclusion | no_scope_signal
+  scope_context:
+    path_layer: [runtime | docs | skill | hook | agent | test_fixture | unknown]
+  scope_delta_approval:
+    present: true | false
+    valid: true | false
+    status: missing | missing_marker | invalid_scope_delta_approval | approved
+    missing_approval_field: true | false
+    suggested_contract_patch: <string | null>
+    comment_id: <int | null>
+    comment_url: <string | null>
+    body_sha256: <sha256 | null>
+    author_association: OWNER | MEMBER | COLLABORATOR | null
+    created_at: <ISO-8601 | null>
+    issue_url: <string | null>
+  security_sensitive: true | false
+  route: proceed_with_notes | human_judgment_required | security_risk_gate_required | invalid_scope_delta_approval | not_triggered
+```
+
+### scope_context.path_layer 分類（AC1）
+
+`_classify_path_layer()` は Allowed Paths delta（`scope_signal_delta.py` が返す `sections.allowed_paths.added`）
+の各パスを以下の優先順位で分類する。
+
+| 優先順位 | prefix | path_layer |
+|---|---|---|
+| 1 | `.claude/hooks/` | `hook` |
+| 2 | `.claude/agents/` | `agent` |
+| 3 | `.claude/skills/` | `skill` |
+| 4 | `docs/` | `docs` |
+| 5 | `src/` | `runtime` |
+| 6 | `tests/` / `fixtures/`（部分一致含む） | `test_fixture` |
+| — | 上記いずれにも一致しない | `unknown` |
+
+### route 決定（AC2/AC3/AC4/AC8/AC9/AC13）
+
+`_decide_scope_signal_route()` は以下の優先順位で route を決定する。
+
+1. `raw_signal.triggered=false` → `not_triggered`
+2. security-sensitive path/term を含む → `security_risk_gate_required`（approval があっても override 不可、AC13）
+3. Scope Delta Approval が存在しない、または marker（`ANCHOR_SCOPE_REFRAME` / `Scope Delta Approval` / `Allowed Paths Expansion Rationale`）が確認できない → `human_judgment_required`（AC3）
+4. Scope Delta Approval は存在するが対象 Issue 不一致（AC8）または `author_association` が信頼できない（AC9） → `invalid_scope_delta_approval`
+5. 上記いずれにも該当しない（trusted anchor による有効な approval） → `proceed_with_notes`（AC2/AC4/AC12。実装 go ではなく contract-review rerun required）
+
+### security-sensitive fail-closed gate（AC13）
+
+`_is_security_sensitive_scope_delta()` は以下を deterministic に判定する（#558 の security gate 本体とは別の、狭い fail-closed チェック）。
+
+- 追加パスが `.claude/hooks/` または `.github/workflows/` から始まる
+- 追加パス文字列、または承認 evidence の `rationale` に `secret` / `token` / `permission` / `credential` のいずれかが含まれる（大文字小文字を区別しない）
+
+該当する場合は Scope Delta Approval の有無・valid/invalid に関わらず `security_risk_gate_required` を返す。
+
+### missing approval の診断情報（AC6）
+
+`scope_delta_approval.missing_approval_field=true` のとき、`suggested_contract_patch` に
+「OWNER/MEMBER/COLLABORATOR が ANCHOR_SCOPE_REFRAME コメントを投稿する」ことを促す定型文を返す。
+承認が valid な場合（`status: approved`）は `suggested_contract_patch: null`。
+
+### known_context.scope_delta_approval_evidence 入力契約（AC8/AC9/AC10）
+
+`scope_signal_guard_decision_v2` の承認判定は、raw anchor comment body を直接読まない。
+呼び出し側（orchestrator/checker）が以下の正規化済み evidence を `known_context.scope_delta_approval_evidence`
+として渡す。
+
+```yaml
+scope_delta_approval_evidence:
+  marker_present: true | false        # ANCHOR_SCOPE_REFRAME 系 marker を検出済みか
+  target_issue_number: <int>          # コメントが投稿された Issue 番号
+  author_association: OWNER | MEMBER | COLLABORATOR | CONTRIBUTOR | NONE | null
+  comment_id: <int | null>
+  comment_url: <string | null>        # 対象 Issue のコメント URL のみ有効（AC8）
+  body_sha256: <sha256 | null>
+  created_at: <ISO-8601 | null>
+  issue_url: <string | null>
+  rationale: <string | null>          # security-sensitive term 判定にも使用
+```
+
+`target_issue_number` が実行中の Issue と一致しない場合（別 Issue / PR / 外部 URL 由来のコメント）は
+`invalid_scope_delta_approval` として fail-closed になる（AC8）。`author_association` が
+`OWNER` / `MEMBER` / `COLLABORATOR` のいずれでもない場合も同様に fail-closed（AC9）。
+
+### opt-in ガード（既存 golden fixture 非破壊）
+
+`scope_signal_guard_decision_v2` は `known_context.scope_signal_delta_input` が与えられた場合にのみ
+`REFINEMENT_LOOP_PLAN_V1` に追加される。これにより `schemas/refinement_loop_plan_v1.json`
+（本 Issue の Allowed Paths 外）を変更せずに additive な出力拡張を実現している。
+`scope_signal_delta_input` を使わない既存呼び出し元は、この新フィールドを一切目にしない。
