@@ -179,6 +179,69 @@ def validate_loop_state(
 
 
 # ---------------------------------------------------------------------------
+# critical_external_claims projection
+# ---------------------------------------------------------------------------
+
+
+def _project_critical_external_claims(
+    claims_raw: Any,
+) -> tuple[Optional[list[str]], list[str]]:
+    """Project ExternalClaim[] (object[] per refinement_loop_plan_v1.json) into
+    the string[] shape required by loop_state.schema.json's
+    web_research_policy.critical_external_claims.
+
+    Each element of claims_raw is expected to be an ExternalClaim object with a
+    non-empty string 'claim' field. Only the 'claim' text is kept; 'affects'
+    and 'source_hint' are not part of the LOOP_STATE_V1 contract.
+
+    fail-closed: any element that cannot be projected (non-object item,
+    missing 'claim', empty 'claim', or non-string 'claim') produces an error
+    instead of being silently stringified or dropped.
+
+    Returns (projected_claims, errors). If errors is non-empty,
+    projected_claims is None.
+    """
+    if not isinstance(claims_raw, list):
+        return None, [
+            "critical_external_claims_invalid_type: expected a list, got "
+            f"{type(claims_raw).__name__}"
+        ]
+
+    projected: list[str] = []
+    errors: list[str] = []
+
+    for idx, item in enumerate(claims_raw):
+        if not isinstance(item, dict):
+            errors.append(
+                f"critical_external_claims[{idx}]_not_object: expected an object, "
+                f"got {type(item).__name__}"
+            )
+            continue
+
+        claim = item.get("claim")
+        if not isinstance(claim, str):
+            errors.append(
+                f"critical_external_claims[{idx}]_claim_not_string: 'claim' must "
+                f"be a string, got {type(claim).__name__}"
+            )
+            continue
+
+        if claim.strip() == "":
+            errors.append(
+                f"critical_external_claims[{idx}]_claim_empty: 'claim' must be "
+                "a non-empty string"
+            )
+            continue
+
+        projected.append(claim)
+
+    if errors:
+        return None, errors
+
+    return projected, []
+
+
+# ---------------------------------------------------------------------------
 # Builder core
 # ---------------------------------------------------------------------------
 
@@ -261,12 +324,21 @@ def build_loop_state(
         return None, blocked
 
     web_research_policy_raw = decisions.get("web_research_policy", {})
+
+    critical_external_claims_raw = web_research_policy_raw.get(
+        "critical_external_claims", []
+    )
+    projected_claims, projection_errors = _project_critical_external_claims(
+        critical_external_claims_raw
+    )
+    if projection_errors:
+        blocked.extend(projection_errors)
+        return None, blocked
+
     web_research_policy = {
         "required": bool(web_research_policy_raw.get("required", False)),
         "reason": web_research_policy_raw.get("reason_code"),
-        "critical_external_claims": list(
-            web_research_policy_raw.get("critical_external_claims", [])
-        ),
+        "critical_external_claims": projected_claims,
         "skip_reason": None,
     }
     if not web_research_policy_raw.get("required", False):
