@@ -172,6 +172,9 @@ SERENA_TOOL_CONTRACT_UNKNOWN_POLICY = "exact_match"
 LOCAL_ASSET_MAX_CONTEXT_FILES = 32
 LOCAL_ASSET_MAX_CONTEXT_BYTES = 200_000
 LOCAL_ASSET_MAX_CONTEXT_TOTAL_BYTES = 600_000
+SERENA_TOOL_MANIFEST_RELATIVE_PATH = Path(
+    ".claude/skills/gemini-cli-headless-delegation/references/serena-tool-manifest.json"
+)
 
 # github_research: allowed gh subcommand argv prefixes (first two tokens of argv)
 GITHUB_RESEARCH_ALLOWED_ARGV_PREFIXES: frozenset[tuple[str, ...]] = frozenset({
@@ -374,6 +377,98 @@ class RequestValidationError(ValueError):
 def _load_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def load_serena_tool_manifest(repo_root: Path | None = None) -> dict[str, Any]:
+    root = repo_root or _repo_root()
+    manifest = _load_json(root / SERENA_TOOL_MANIFEST_RELATIVE_PATH)
+    if not isinstance(manifest, dict):
+        raise ValueError("serena manifest must be a JSON object")
+    if manifest.get("schema") != "serena_tool_manifest_v1":
+        raise ValueError("serena manifest schema must equal serena_tool_manifest_v1")
+    for key in ("pinned_ref", "read_only_allowlist", "dangerous_denylist", "known_tools"):
+        if key not in manifest:
+            raise ValueError(f"serena manifest missing required key: {key}")
+    if not isinstance(manifest["pinned_ref"], str) or not manifest["pinned_ref"].strip():
+        raise ValueError("serena manifest pinned_ref must be a non-empty string")
+    for key in ("read_only_allowlist", "dangerous_denylist", "known_tools"):
+        values = manifest[key]
+        if not isinstance(values, list) or not all(isinstance(item, str) and item.strip() for item in values):
+            raise ValueError(f"serena manifest {key} must be a list of non-empty strings")
+    return manifest
+
+
+def _serena_manifest_id(manifest: Mapping[str, Any]) -> str:
+    return f"serena_tool_manifest_v1:{manifest['pinned_ref']}"
+
+
+def _validate_serena_settings_against_manifest(settings: Mapping[str, Any], manifest: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    expected_read_only = set(manifest["read_only_allowlist"])
+    expected_dangerous = set(manifest["dangerous_denylist"])
+    known_tools = set(manifest["known_tools"])
+    pinned_ref = str(manifest["pinned_ref"])
+
+    mcp = settings.get("mcp")
+    allowed_servers = mcp.get("allowed") if isinstance(mcp, Mapping) else None
+    if allowed_servers != [SERENA_MCP_SERVER_NAME]:
+        errors.append("local_asset_research requires .gemini/settings.json mcp.allowed to equal ['serena']")
+
+    servers = settings.get("mcpServers")
+    if not isinstance(servers, Mapping):
+        return errors + ["local_asset_research requires .gemini/settings.json mcpServers"]
+    serena = servers.get(SERENA_MCP_SERVER_NAME)
+    if not isinstance(serena, Mapping):
+        return errors + ["local_asset_research requires .gemini/settings.json mcpServers.serena"]
+
+    command = serena.get("command")
+    args = serena.get("args")
+    expected_source = f"git+https://github.com/oraios/serena@{pinned_ref}"
+    if command != "uvx" or not isinstance(args, list) or "serena" not in args or "--project-from-cwd" not in args:
+        errors.append(
+            "local_asset_research requires WSL-local Serena MCP command: "
+            "uvx ... serena ... --project-from-cwd"
+        )
+    elif expected_source not in args and not any(
+        arg == f"serena=={pinned_ref}" for arg in args if isinstance(arg, str)
+    ):
+        errors.append(
+            "local_asset_research pinned_serena_manifest_mismatch: "
+            ".gemini/settings.json mcpServers.serena.args must match checked-in manifest pinned_ref"
+        )
+
+    if serena.get("trust", False) is not False:
+        errors.append("local_asset_research requires mcpServers.serena.trust to be false")
+
+    include_tools = serena.get("includeTools")
+    if not isinstance(include_tools, list) or not include_tools:
+        errors.append("local_asset_research requires mcpServers.serena.includeTools read-only allowlist")
+    elif not all(isinstance(tool, str) for tool in include_tools):
+        errors.append("local_asset_research requires includeTools to contain only strings")
+    else:
+        include_set = set(include_tools)
+        unknown = sorted(include_set - known_tools)
+        missing = sorted(expected_read_only - include_set)
+        unexpected = sorted(include_set - expected_read_only)
+        dangerous = sorted(include_set & expected_dangerous)
+        if unknown:
+            errors.append(f"local_asset_research unknown_tool_policy(exact_match) failed: {', '.join(unknown)}")
+        if missing:
+            errors.append(f"local_asset_research read-only includeTools is incomplete: {', '.join(missing)}")
+        if unexpected:
+            errors.append(f"local_asset_research has unverified MCP tools in includeTools: {', '.join(unexpected)}")
+        if dangerous:
+            errors.append(f"local_asset_research includes dangerous Serena MCP tools: {', '.join(dangerous)}")
+
+    exclude_tools = serena.get("excludeTools", [])
+    if not isinstance(exclude_tools, list):
+        errors.append("local_asset_research requires excludeTools to be a list when present")
+    else:
+        missing_excludes = sorted(expected_dangerous - set(exclude_tools))
+        if missing_excludes:
+            errors.append(f"local_asset_research dangerous tool denylist is incomplete: {', '.join(missing_excludes)}")
+
+    return errors
 
 
 def _dump_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -719,6 +814,10 @@ def _validate_local_asset_research_settings(repo_root: Path | None = None) -> li
     settings_path = root / ".gemini" / "settings.json"
     errors: list[str] = []
     try:
+        manifest = load_serena_tool_manifest(root)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as exc:
+        return [f"local_asset_research serena manifest validation failed: {exc}"]
+    try:
         settings = _load_json(settings_path)
     except FileNotFoundError:
         return [f"local_asset_research requires {settings_path}"]
@@ -726,67 +825,7 @@ def _validate_local_asset_research_settings(repo_root: Path | None = None) -> li
         return [f"local_asset_research requires valid JSON in {settings_path}: {exc}"]
     if not isinstance(settings, Mapping):
         return [f"local_asset_research requires {settings_path} to contain a JSON object"]
-
-    mcp = settings.get("mcp")
-    allowed_servers = mcp.get("allowed") if isinstance(mcp, Mapping) else None
-    if allowed_servers != [SERENA_MCP_SERVER_NAME]:
-        errors.append("local_asset_research requires .gemini/settings.json mcp.allowed to equal ['serena']")
-
-    servers = settings.get("mcpServers")
-    if not isinstance(servers, Mapping):
-        return errors + ["local_asset_research requires .gemini/settings.json mcpServers"]
-    serena = servers.get(SERENA_MCP_SERVER_NAME)
-    if not isinstance(serena, Mapping):
-        return errors + ["local_asset_research requires .gemini/settings.json mcpServers.serena"]
-
-    command = serena.get("command")
-    args = serena.get("args")
-    if command != "uvx" or not isinstance(args, list) or "serena" not in args or "--project-from-cwd" not in args:
-        errors.append(
-            "local_asset_research requires WSL-local Serena M"
-            "CP command: uvx ... serena ... --project-from-cwd"
-        )
-    elif not any(
-        isinstance(arg, str)
-        and (
-            (arg.startswith("git+https://github.com/oraios/serena@") and len(arg.rsplit("@", 1)[-1]) >= 7)
-            or re.search(r"\bserena==[A-Za-z0-9_.!-]+", arg)
-        )
-        for arg in args
-    ):
-        errors.append(
-            "local_asset_research requires pinned_serena_version_or_commit in "
-            ".gemini/settings.json mcpServers.serena.args"
-        )
-
-    trust = serena.get("trust", False)
-    if trust is not False:
-        errors.append("local_asset_research requires mcpServers.serena.trust to be false")
-
-    include_tools = serena.get("includeTools")
-    if not isinstance(include_tools, list) or not include_tools:
-        errors.append("local_asset_research requires mcpServers.serena.includeTools read-only allowlist")
-    elif not all(isinstance(tool, str) for tool in include_tools):
-        errors.append("local_asset_research requires includeTools to contain only strings")
-    else:
-        include_set = set(include_tools)
-        unexpected = sorted(include_set - SERENA_READ_ONLY_TOOLS)
-        missing = sorted(SERENA_READ_ONLY_TOOLS - include_set)
-        dangerous = sorted(include_set & SERENA_DANGEROUS_TOOLS)
-        if unexpected:
-            errors.append(f"local_asset_research has unverified MCP tools in includeTools: {', '.join(unexpected)}")
-        if missing:
-            errors.append(f"local_asset_research read-only includeTools is incomplete: {', '.join(missing)}")
-        if dangerous:
-            errors.append(f"local_asset_research includes dangerous Serena MCP tools: {', '.join(dangerous)}")
-
-    exclude_tools = serena.get("excludeTools", [])
-    if not isinstance(exclude_tools, list):
-        errors.append("local_asset_research requires excludeTools to be a list when present")
-    elif not SERENA_DANGEROUS_TOOLS.issubset(set(exclude_tools)):
-        missing_excludes = sorted(SERENA_DANGEROUS_TOOLS - set(exclude_tools))
-        errors.append(f"local_asset_research dangerous tool denylist is incomplete: {', '.join(missing_excludes)}")
-
+    errors.extend(_validate_serena_settings_against_manifest(settings, manifest))
     return errors
 
 
@@ -919,7 +958,7 @@ def _build_local_asset_evidence_document(path: Path, repo_root: Path) -> dict[st
         "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
         "redaction_status": "checked_no_credential_pattern",
         "manifest_id": "serena_settings_exact_match",
-        "source_kind": "wrapper_side_serena_evidence",
+        "source_kind": "manual_context_file_evidence",
     }
     return {
         "path": repo_relative_path,
@@ -971,10 +1010,63 @@ def _validate_local_asset_context_files(
     return errors, resolved_paths
 
 
+def _collect_serena_read_only_evidence(
+    context_paths: list[Path],
+    repo_root: Path,
+    manifest: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    """Collect bounded wrapper-side Serena read-only evidence envelopes."""
+    manifest_id = _serena_manifest_id(manifest)
+    documents: list[dict[str, str]] = []
+    for path in context_paths:
+        text = path.read_text(encoding="utf-8")
+        repo_relative_path = path.relative_to(repo_root).as_posix()
+        encoded = text.encode("utf-8")
+        line_count = _line_count(text)
+        common = {
+            "repo_relative_path": repo_relative_path,
+            "byte_size": len(encoded),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "redaction_status": "checked_no_credential_pattern",
+            "manifest_id": manifest_id,
+            "source_kind": "serena_mcp_read_only_evidence",
+        }
+        records: list[dict[str, Any]] = [
+            {
+                **common,
+                "tool_name": "find_file",
+                "query": Path(repo_relative_path).name,
+                "line_range": [1, 1],
+                "content_snippet": repo_relative_path,
+            },
+            {
+                **common,
+                "tool_name": "search_for_pattern",
+                "query": "local_asset_research",
+                "line_range": [1, min(line_count, 80)],
+                "content_snippet": "\n".join(text.splitlines()[:80]),
+            },
+            {
+                **common,
+                "tool_name": "get_symbols_overview",
+                "query": repo_relative_path,
+                "line_range": [1, min(line_count, 120)],
+                "content_snippet": "\n".join(text.splitlines()[:120]),
+            },
+        ]
+        for index, record in enumerate(records, start=1):
+            documents.append({
+                "path": f"{repo_relative_path}#{record['tool_name']}-{index}",
+                "content": json.dumps(record, ensure_ascii=False, sort_keys=True),
+            })
+    return documents
+
+
 def _build_local_asset_prompt(
     request: Mapping[str, Any],
     request_path: Path | None,
     context_paths: list[Path] | None = None,
+    evidence_documents: list[dict[str, str]] | None = None,
 ) -> str:
     """Build an explicit local asset prompt with repo-anchored context injection."""
     objective = str(request.get("objective") or request.get("prompt") or "Local asset research request.")
@@ -999,7 +1091,9 @@ def _build_local_asset_prompt(
 
     context_files = request.get("context_files", [])
     context_documents: list[dict[str, str]] = []
-    if context_paths is not None:
+    if evidence_documents is not None:
+        context_documents = evidence_documents
+    elif context_paths is not None:
         repo_root = _repo_root().resolve()
         context_documents = [_build_local_asset_evidence_document(path, repo_root) for path in context_paths]
     elif isinstance(context_files, list):
@@ -1737,12 +1831,19 @@ def run_delegation(
             }
         # local_asset_research uses wrapper-side Serena evidence + prompt injection.
         if tool_profile == LOCAL_ASSET_RESEARCH_PROFILE:
+            repo_root = _repo_root().resolve()
             _, context_paths = _validate_local_asset_context_files(
                 request.get("context_files", []),
                 request_path,
-                _repo_root().resolve(),
+                repo_root,
             )
-            prompt_text = _build_local_asset_prompt(request, request_path, context_paths=context_paths)
+            manifest = load_serena_tool_manifest(repo_root)
+            evidence_documents = _collect_serena_read_only_evidence(context_paths, repo_root, manifest)
+            prompt_text = _build_local_asset_prompt(
+                request,
+                request_path,
+                evidence_documents=evidence_documents,
+            )
             prompt_hint = str(request.get("prompt") or "").strip()
             if prompt_hint:
                 prompt_text = f"{prompt_text}\n\nOperator objective:\n{prompt_hint}"

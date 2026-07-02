@@ -19,6 +19,9 @@ NONINTERACTIVE_FLAGS = ["-p", "--print", "--prompt"]
 UNEXPECTED_CAPABILITY_KEYWORDS = ["chat", "--output-format"]
 SMOKE_SAMPLE_MAX_CHARS = 500
 LOCAL_ASSET_SERENA_TOOL_POLICY = "exact_match"
+SERENA_TOOL_MANIFEST_RELATIVE_PATH = Path(
+    ".claude/skills/gemini-cli-headless-delegation/references/serena-tool-manifest.json"
+)
 SERENA_READ_ONLY_TOOLS = frozenset({
     "find_file",
     "find_referencing_symbols",
@@ -87,10 +90,32 @@ def _load_json(path: Path) -> Any:
         return json.load(handle)
 
 
+def load_serena_tool_manifest(repo_root: Path | None = None) -> dict[str, Any]:
+    root = repo_root or _repo_root()
+    manifest = _load_json(root / SERENA_TOOL_MANIFEST_RELATIVE_PATH)
+    if not isinstance(manifest, dict):
+        raise ValueError("serena manifest must be a JSON object")
+    if manifest.get("schema") != "serena_tool_manifest_v1":
+        raise ValueError("serena manifest schema must equal serena_tool_manifest_v1")
+    for key in ("pinned_ref", "read_only_allowlist", "dangerous_denylist", "known_tools"):
+        value = manifest.get(key)
+        if key == "pinned_ref":
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("serena manifest pinned_ref must be a non-empty string")
+            continue
+        if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+            raise ValueError(f"serena manifest {key} must be a list of non-empty strings")
+    return manifest
+
+
 def _validate_local_asset_serena_contract(repo_root: Path | None = None) -> list[str]:
     root = repo_root or _repo_root()
     settings_path = root / ".gemini" / "settings.json"
     errors: list[str] = []
+    try:
+        manifest = load_serena_tool_manifest(root)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as exc:
+        return [f"local_asset_research serena manifest validation failed: {exc}"]
 
     try:
         settings = _load_json(settings_path)
@@ -100,6 +125,11 @@ def _validate_local_asset_serena_contract(repo_root: Path | None = None) -> list
         return [f"local_asset_research requires valid JSON in {settings_path}: {exc}"]
     if not isinstance(settings, dict):
         return [f"local_asset_research requires {settings_path} to contain a JSON object"]
+
+    expected_read_only = set(manifest["read_only_allowlist"])
+    expected_dangerous = set(manifest["dangerous_denylist"])
+    known_tools = set(manifest["known_tools"])
+    pinned_ref = str(manifest["pinned_ref"])
 
     mcp = settings.get("mcp")
     allowed = mcp.get("allowed") if isinstance(mcp, dict) else None
@@ -118,21 +148,17 @@ def _validate_local_asset_serena_contract(repo_root: Path | None = None) -> list
 
     command = serena.get("command")
     args = serena.get("args")
+    expected_source = f"git+https://github.com/oraios/serena@{pinned_ref}"
     if command != "uvx" or not isinstance(args, list) or "serena" not in args or "--project-from-cwd" not in args:
         errors.append(
             "local_asset_research requires WSL-local Serena MCP command: uvx ... serena ... --project-from-cwd"
         )
-    elif not any(
-        isinstance(arg, str)
-        and (
-            (arg.startswith("git+https://github.com/oraios/serena@") and len(arg.rsplit("@", 1)[-1]) >= 7)
-            or re.search(r"\bserena==[A-Za-z0-9_.!-]+", arg)
-        )
-        for arg in args
+    elif expected_source not in args and not any(
+        arg == f"serena=={pinned_ref}" for arg in args if isinstance(arg, str)
     ):
         errors.append(
-            "local_asset_research requires pinned_serena_version_or_commit in "
-            ".gemini/settings.json mcpServers.serena.args"
+            "local_asset_research pinned_serena_manifest_mismatch: "
+            ".gemini/settings.json mcpServers.serena.args must match checked-in manifest pinned_ref"
         )
 
     trust = serena.get("trust", False)
@@ -148,15 +174,15 @@ def _validate_local_asset_serena_contract(repo_root: Path | None = None) -> list
         return errors
 
     include_set = set(include_tools)
-    unknown_tools = sorted(include_set - SERENA_KNOWN_TOOLS)
+    unknown_tools = sorted(include_set - known_tools)
     if unknown_tools:
         errors.append(
             f"local_asset_research unknown_tool_policy({LOCAL_ASSET_SERENA_TOOL_POLICY}) failed: "
             f"unknown tools in includeTools: {', '.join(unknown_tools)}"
         )
-    if include_set != set(SERENA_READ_ONLY_TOOLS):
-        missing = sorted(SERENA_READ_ONLY_TOOLS - include_set)
-        unexpected = sorted(include_set - SERENA_READ_ONLY_TOOLS)
+    if include_set != expected_read_only:
+        missing = sorted(expected_read_only - include_set)
+        unexpected = sorted(include_set - expected_read_only)
         if missing:
             errors.append(f"local_asset_research read-only includeTools is incomplete: {', '.join(missing)}")
         if unexpected:
@@ -168,8 +194,8 @@ def _validate_local_asset_serena_contract(repo_root: Path | None = None) -> list
     if not isinstance(exclude_tools, list):
         errors.append("local_asset_research requires excludeTools to be a list when present")
         return errors
-    if not SERENA_DANGEROUS_TOOLS.issubset(set(exclude_tools)):
-        missing_excludes = sorted(SERENA_DANGEROUS_TOOLS - set(exclude_tools))
+    if not expected_dangerous.issubset(set(exclude_tools)):
+        missing_excludes = sorted(expected_dangerous - set(exclude_tools))
         errors.append(f"local_asset_research dangerous tool denylist is incomplete: {', '.join(missing_excludes)}")
 
     return errors

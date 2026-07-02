@@ -58,6 +58,29 @@ def _agy_request(**kwargs: Any) -> dict[str, Any]:
     return base
 
 
+def _write_serena_manifest(root: Path, pinned_ref: str = "0123456789abcdef") -> None:
+    manifest_path = root / rgh.SERENA_TOOL_MANIFEST_RELATIVE_PATH
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "schema": "serena_tool_manifest_v1",
+        "source": "https://github.com/oraios/serena",
+        "pinned_ref": pinned_ref,
+        "generated_at_utc": "2026-07-02T00:00:00Z",
+        "mcp_command": [
+            "uvx",
+            "--from",
+            f"git+https://github.com/oraios/serena@{pinned_ref}",
+            "serena",
+            "--project-from-cwd",
+        ],
+        "read_only_allowlist": sorted(rgh.SERENA_READ_ONLY_TOOLS),
+        "dangerous_denylist": sorted(rgh.SERENA_DANGEROUS_TOOLS),
+        "known_tools": sorted(rgh.SERENA_READ_ONLY_TOOLS | rgh.SERENA_DANGEROUS_TOOLS),
+        "notes": [],
+    }
+    manifest_path.write_text(__import__("json").dumps(manifest), encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # AC1: no_tools profile — agy returns response text + result.json via wrapper
 # ---------------------------------------------------------------------------
@@ -163,6 +186,7 @@ def test_ac7_agy_local_asset_research_success_with_wrapper_validation(tmp_path, 
     repo_root.mkdir()
     context_file = repo_root / "context.md"
     context_file.write_text("local asset content", encoding="utf-8")
+    _write_serena_manifest(repo_root)
 
     monkeypatch.setattr(rgh, "_repo_root", lambda: repo_root)  # type: ignore[call-arg]
     monkeypatch.setattr(rgh, "_validate_local_asset_research_settings", lambda: [])  # type: ignore[call-arg]
@@ -188,8 +212,13 @@ def test_ac7_agy_local_asset_research_success_with_wrapper_validation(tmp_path, 
     assert "AGY is executed in prompt-only wrapper-side evidence mode" in captured_prompt["value"]
     assert "BEGIN LOCAL ASSET EVIDENCE: context.md" in captured_prompt["value"]
     assert '"repo_relative_path": "context.md"' in captured_prompt["value"]
-    assert '"source_kind": "wrapper_side_serena_evidence"' in captured_prompt["value"]
+    assert '"source_kind": "serena_mcp_read_only_evidence"' in captured_prompt["value"]
+    assert '"tool_name": "find_file"' in captured_prompt["value"]
+    assert '"tool_name": "search_for_pattern"' in captured_prompt["value"]
+    assert '"tool_name": "get_symbols_overview"' in captured_prompt["value"]
+    assert "wrapper_serena_context_file" not in captured_prompt["value"]
     assert str(repo_root) not in captured_prompt["value"]
+    assert "mcpServers" not in captured_prompt["value"]
     assert "Operator objective:" in captured_prompt["value"]
 
 
@@ -197,6 +226,7 @@ def test_ac7_agy_local_asset_research_rejects_context_outside_repo_before_read(t
     """AC7: outside-repo local_asset_research context is rejected before payload read."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
+    _write_serena_manifest(repo_root)
     outside = tmp_path / "outside.txt"
     outside.write_text("secret", encoding="utf-8")
 
