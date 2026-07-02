@@ -75,8 +75,6 @@ from controlled_skill_mutation_policy import (  # noqa: E402
     CONTROLLED_SKILL_MUTATION_COMMAND_POLICY,
     ALL_COMMAND_IDS,
     TRUSTED_REPO as CSM_TRUSTED_REPO,
-    EXECUTOR_SCRIPT as CSM_EXECUTOR_SCRIPT,
-    ISSUE_METADATA_NAMESPACE_SEGMENT,
 )
 
 _CODEX_ROOT = os.path.dirname(os.path.dirname(_HERE))

@@ -13,14 +13,12 @@ import sys
 import time
 from pathlib import Path
 
-import pytest
 
 _GUARDS_DIR = Path(__file__).resolve().parent.parent
 if str(_GUARDS_DIR) not in sys.path:
     sys.path.insert(0, str(_GUARDS_DIR))
 
 import pretool_fastpath_classifier as fp  # noqa: E402
-from controlled_skill_mutation_policy import ALL_COMMAND_IDS  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -297,7 +295,6 @@ class TestAC8ControlledSkillMutationExecutorReasonCode:
         from local_main_branch_guard import (
             REASON_CONTROLLED_SKILL_MUTATION_EXECUTOR,
             REASON_DETERMINISTIC_CHECKER,
-            evaluate,
         )
 
         # Build a minimal local git repo whose root is treated as local-root
