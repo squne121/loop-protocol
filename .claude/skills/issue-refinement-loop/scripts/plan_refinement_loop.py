@@ -77,6 +77,41 @@ SCOPE_SIGNAL_REASON_NEW_UNVERIFIABLE_AC = "new_unverifiable_ac"
 SCOPE_SIGNAL_REASON_ANCHOR_REFRAME = "anchor_reframe_exclusion"
 SCOPE_SIGNAL_REASON_NO_SIGNAL = "no_scope_signal"
 
+# ---------------------------------------------------------------------------
+# SCOPE_SIGNAL_GUARD_DECISION_V2 (#1090) -- escalation lane split
+# ---------------------------------------------------------------------------
+
+PATH_LAYER_RUNTIME = "runtime"
+PATH_LAYER_DOCS = "docs"
+PATH_LAYER_SKILL = "skill"
+PATH_LAYER_HOOK = "hook"
+PATH_LAYER_AGENT = "agent"
+PATH_LAYER_TEST_FIXTURE = "test_fixture"
+PATH_LAYER_UNKNOWN = "unknown"
+
+SCOPE_ROUTE_PROCEED_WITH_NOTES = "proceed_with_notes"
+SCOPE_ROUTE_HUMAN_JUDGMENT_REQUIRED = "human_judgment_required"
+SCOPE_ROUTE_SECURITY_RISK_GATE_REQUIRED = "security_risk_gate_required"
+SCOPE_ROUTE_INVALID_SCOPE_DELTA_APPROVAL = "invalid_scope_delta_approval"
+SCOPE_ROUTE_NOT_TRIGGERED = "not_triggered"
+
+TRUSTED_AUTHOR_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+
+# #558 owns the security gate itself; this is a narrow deterministic
+# fail-closed check applied regardless of scope delta approval.
+SECURITY_SENSITIVE_PATH_PREFIXES = (
+    ".claude/hooks/",
+    ".github/workflows/",
+)
+SECURITY_SENSITIVE_TERMS = ("secret", "token", "permission", "credential")
+
+SUGGESTED_CONTRACT_PATCH_TEMPLATE = (
+    "OWNER/MEMBER/COLLABORATOR being a trusted author must post an "
+    "ANCHOR_SCOPE_REFRAME (or `Scope Delta Approval` / "
+    "`Allowed Paths Expansion Rationale`) comment on this issue. "
+    "See references/scope-signal-guard.md."
+)
+
 FAIL_CLOSED_REASON_MALFORMED_CONTRACT = "malformed_machine_readable_contract"
 FAIL_CLOSED_REASON_MISSING_SECTION = "missing_required_section"
 FAIL_CLOSED_REASON_MISSING_PARENT_SECTION = "missing_required_parent_section"
@@ -787,6 +822,195 @@ def _detect_scope_signals(issue_body: str, known_context: dict | None) -> tuple[
     return (False, SCOPE_SIGNAL_REASON_NO_SIGNAL, [])
 
 
+def _classify_path_layer(path: str) -> str:
+    """AC1: classify an Allowed Path entry into a coarse scope_context.path_layer.
+
+    Precedence matters: more specific prefixes (.claude/hooks, .claude/agents,
+    .claude/skills) are checked before the generic tests/fixtures bucket.
+    """
+    normalized = (path or "").strip().replace("\\", "/").rstrip("/")
+    if normalized.startswith(".claude/hooks/") or normalized == ".claude/hooks":
+        return PATH_LAYER_HOOK
+    if normalized.startswith(".claude/agents/") or normalized == ".claude/agents":
+        return PATH_LAYER_AGENT
+    if normalized.startswith(".claude/skills/") or normalized == ".claude/skills":
+        return PATH_LAYER_SKILL
+    if normalized.startswith("docs/"):
+        return PATH_LAYER_DOCS
+    if normalized.startswith("src/"):
+        return PATH_LAYER_RUNTIME
+    if (
+        normalized.startswith("tests/")
+        or normalized.startswith("fixtures/")
+        or "/tests/" in normalized
+        or "/fixtures/" in normalized
+    ):
+        return PATH_LAYER_TEST_FIXTURE
+    return PATH_LAYER_UNKNOWN
+
+
+def _is_security_sensitive_scope_delta(added_paths: list[str], rationale_text: "str | None") -> bool:
+    """AC13: deterministic security-sensitive gate, not overridable by approval."""
+    for path in added_paths or []:
+        normalized = (path or "").strip()
+        for prefix in SECURITY_SENSITIVE_PATH_PREFIXES:
+            if normalized.startswith(prefix):
+                return True
+        lower_path = normalized.lower()
+        if any(term in lower_path for term in SECURITY_SENSITIVE_TERMS):
+            return True
+    if rationale_text:
+        lower_text = rationale_text.lower()
+        if any(term in lower_text for term in SECURITY_SENSITIVE_TERMS):
+            return True
+    return False
+
+
+def _extract_scope_delta_approval_evidence(known_context: "dict | None") -> "dict | None":
+    """AC10: read normalized (non-raw) approval evidence from known_context.
+
+    The evidence dict is produced upstream (orchestrator/checker) from the
+    ANCHOR_SCOPE_REFRAME comment; this function never parses raw comment body.
+    """
+    if not known_context:
+        return None
+    evidence = known_context.get("scope_delta_approval_evidence")
+    if not isinstance(evidence, dict):
+        return None
+    return evidence
+
+
+def _validate_scope_delta_approval(evidence: "dict | None", current_issue_number: "int | None") -> dict:
+    """AC2/AC8/AC9: validate scope delta approval evidence, fail-closed.
+
+    Returns a dict with: present, valid, status, missing_approval_field,
+    suggested_contract_patch, comment_id, comment_url, body_sha256,
+    author_association, created_at, issue_url.
+    """
+    base = {
+        "present": False,
+        "valid": False,
+        "status": "missing",
+        "missing_approval_field": True,
+        "suggested_contract_patch": SUGGESTED_CONTRACT_PATCH_TEMPLATE,
+        "comment_id": None,
+        "comment_url": None,
+        "body_sha256": None,
+        "author_association": None,
+        "created_at": None,
+        "issue_url": None,
+    }
+    if evidence is None:
+        return base
+
+    base["present"] = True
+    base["comment_id"] = evidence.get("comment_id")
+    base["comment_url"] = evidence.get("comment_url")
+    base["body_sha256"] = evidence.get("body_sha256")
+    base["author_association"] = evidence.get("author_association")
+    base["created_at"] = evidence.get("created_at")
+    base["issue_url"] = evidence.get("issue_url")
+
+    marker_present = bool(evidence.get("marker_present"))
+    if not marker_present:
+        base["status"] = "missing_marker"
+        base["missing_approval_field"] = True
+        return base
+
+    # AC8: approval only valid for the current issue's own comment URL.
+    target_issue_number = evidence.get("target_issue_number")
+    if current_issue_number is not None and target_issue_number != current_issue_number:
+        base["status"] = "invalid_scope_delta_approval"
+        base["missing_approval_field"] = False
+        base["suggested_contract_patch"] = None
+        return base
+
+    # AC9: only OWNER/MEMBER/COLLABORATOR are trusted authors.
+    author_association = evidence.get("author_association")
+    if author_association not in TRUSTED_AUTHOR_ASSOCIATIONS:
+        base["status"] = "invalid_scope_delta_approval"
+        base["missing_approval_field"] = False
+        base["suggested_contract_patch"] = None
+        return base
+
+    base["valid"] = True
+    base["status"] = "approved"
+    base["missing_approval_field"] = False
+    base["suggested_contract_patch"] = None
+    return base
+
+
+def _decide_scope_signal_route(
+    triggered: bool,
+    security_sensitive: bool,
+    approval: dict,
+) -> str:
+    """AC2/AC3/AC4/AC8/AC9/AC13: decide the escalation lane.
+
+    status="missing" (no evidence at all) and status="missing_marker"
+    (evidence present but no ANCHOR_SCOPE_REFRAME/Scope Delta Approval/
+    Allowed Paths Expansion Rationale marker) both mean "no reframe" (AC3)
+    -> human_judgment_required. status="invalid_scope_delta_approval"
+    means a reframe was attempted but failed the target-issue (AC8) or
+    trusted-author (AC9) check -> invalid_scope_delta_approval.
+    """
+    if not triggered:
+        return SCOPE_ROUTE_NOT_TRIGGERED
+    if security_sensitive:
+        # AC13: security-sensitive fail-closed gate is never overridden by approval.
+        return SCOPE_ROUTE_SECURITY_RISK_GATE_REQUIRED
+    if approval["status"] in ("missing", "missing_marker"):
+        # AC3: no reframe present at all.
+        return SCOPE_ROUTE_HUMAN_JUDGMENT_REQUIRED
+    if approval["status"] == "invalid_scope_delta_approval":
+        # AC8/AC9: reframe present but invalid (wrong issue / untrusted author).
+        return SCOPE_ROUTE_INVALID_SCOPE_DELTA_APPROVAL
+    # AC2/AC4/AC12: valid trusted anchor approval -- proceed with contract-review rerun required.
+    return SCOPE_ROUTE_PROCEED_WITH_NOTES
+
+
+def _build_scope_signal_guard_decision_v2(
+    scope_signal_triggered: bool,
+    scope_signal_reason: str,
+    added_paths: list[str],
+    known_context: "dict | None",
+    issue_number: "int | None",
+) -> dict:
+    """AC1/AC10: build SCOPE_SIGNAL_GUARD_DECISION_V2 artifact."""
+    path_layers = sorted({_classify_path_layer(p) for p in (added_paths or [])})
+    evidence = _extract_scope_delta_approval_evidence(known_context)
+    approval = _validate_scope_delta_approval(evidence, issue_number)
+    rationale_text = evidence.get("rationale") if evidence else None
+    security_sensitive = _is_security_sensitive_scope_delta(added_paths, rationale_text)
+    route = _decide_scope_signal_route(scope_signal_triggered, security_sensitive, approval)
+
+    return {
+        "schema_version": "SCOPE_SIGNAL_GUARD_DECISION_V2",
+        "raw_signal": {
+            "triggered": scope_signal_triggered,
+            "reason_code": scope_signal_reason,
+        },
+        "scope_context": {
+            "path_layer": path_layers,
+        },
+        "scope_delta_approval": {
+            "present": approval["present"],
+            "valid": approval["valid"],
+            "status": approval["status"],
+            "missing_approval_field": approval["missing_approval_field"],
+            "suggested_contract_patch": approval["suggested_contract_patch"],
+            "comment_id": approval["comment_id"],
+            "comment_url": approval["comment_url"],
+            "body_sha256": approval["body_sha256"],
+            "author_association": approval["author_association"],
+            "created_at": approval["created_at"],
+            "issue_url": approval["issue_url"],
+        },
+        "security_sensitive": security_sensitive,
+        "route": route,
+    }
+
+
 def _check_malformed_contract(issue_body: str) -> bool:
     """Check if machine-readable contract is malformed (has YAML but missing required fields)."""
     # If there's no YAML block, it's not malformed - just missing
@@ -1454,6 +1678,31 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
             issue_body, known_context
         )
 
+        # AC1/AC10 (#1090): opt-in SCOPE_SIGNAL_GUARD_DECISION_V2 lane split.
+        # Only computed when known_context carries scope_signal_delta_input,
+        # since that is the only source of a normalized added-paths list;
+        # this keeps all pre-existing golden fixtures byte-identical.
+        scope_signal_guard_decision_v2 = None
+        if (
+            known_context
+            and isinstance(known_context.get("scope_signal_delta_input"), dict)
+            and compute_scope_signal_delta is not None
+        ):
+            try:
+                _delta_for_v2 = compute_scope_signal_delta(known_context["scope_signal_delta_input"])
+                _added_paths = (
+                    _delta_for_v2.get("sections", {}).get("allowed_paths", {}).get("added", [])
+                )
+                scope_signal_guard_decision_v2 = _build_scope_signal_guard_decision_v2(
+                    scope_signal_triggered,
+                    scope_signal_reason,
+                    _added_paths,
+                    known_context,
+                    issue_number,
+                )
+            except Exception:
+                scope_signal_guard_decision_v2 = None
+
         # Build output
         plan = {
             "schema_version": SCHEMA_VERSION,
@@ -1502,6 +1751,9 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                 "human_message": "",
             },
         }
+
+        if scope_signal_guard_decision_v2 is not None:
+            plan["scope_signal_guard_decision_v2"] = scope_signal_guard_decision_v2
 
         return plan, 0
 

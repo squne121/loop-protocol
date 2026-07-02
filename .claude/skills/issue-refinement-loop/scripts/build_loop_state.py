@@ -306,12 +306,17 @@ def build_loop_state(
     iteration: int,
     max_iterations: int = 3,
     blockers_history: Optional[list[Any]] = None,
-) -> tuple[Optional[dict[str, Any]], list[str]]:
+) -> tuple[Optional[dict[str, Any]], list[str], Optional[dict[str, Any]]]:
     """
     Build LOOP_STATE_V1 from planner and review results.
 
-    Returns (loop_state_dict, blocked_reasons).
+    Returns (loop_state_dict, blocked_reasons, scope_signal_guard_decision_v2).
     If blocked_reasons is non-empty, loop_state_dict is None.
+    scope_signal_guard_decision_v2 (#1090) is a pass-through projection of
+    plan['scope_signal_guard_decision_v2'] when present; it is NOT part of
+    the schema-validated LOOP_STATE_V1 object (schemas/loop_state.schema.json
+    is outside this Allowed Paths set) and is surfaced only in the CLI's
+    LOOP_STATE_BUILD_RESULT_V1 envelope.
 
     Constraints:
     - Does NOT compute next_action (AC7)
@@ -356,7 +361,7 @@ def build_loop_state(
             )
 
     if blocked:
-        return None, blocked
+        return None, blocked, None
 
     # --- Extract from planner ---
     decisions = plan.get("decisions")
@@ -364,7 +369,7 @@ def build_loop_state(
         blocked.append(
             "missing_required_field: planner artifact is missing 'decisions' field"
         )
-        return None, blocked
+        return None, blocked, None
 
     # Validate required decision sub-fields (fail-closed)
     for field in REQUIRED_DECISION_FIELDS:
@@ -374,7 +379,7 @@ def build_loop_state(
             )
 
     if blocked:
-        return None, blocked
+        return None, blocked, None
 
     web_research_policy_raw = decisions.get("web_research_policy", {})
     if not isinstance(web_research_policy_raw, dict):
@@ -382,14 +387,14 @@ def build_loop_state(
             "web_research_policy_invalid_type: expected an object, got "
             f"{type(web_research_policy_raw).__name__}"
         )
-        return None, blocked
+        return None, blocked, None
 
     if "critical_external_claims" not in web_research_policy_raw:
         blocked.append(
             "missing_required_field: web_research_policy is missing required "
             "field 'critical_external_claims'"
         )
-        return None, blocked
+        return None, blocked, None
 
     critical_external_claims_raw = web_research_policy_raw["critical_external_claims"]
     projected_claims, projection_errors = _project_critical_external_claims(
@@ -397,7 +402,7 @@ def build_loop_state(
     )
     if projection_errors:
         blocked.extend(projection_errors)
-        return None, blocked
+        return None, blocked, None
 
     web_research_policy = {
         "required": bool(web_research_policy_raw.get("required", False)),
@@ -439,11 +444,11 @@ def build_loop_state(
         blocked.append(
             "missing_required_field: review artifact is missing 'VERDICT' (or 'verdict') field"
         )
-        return None, blocked
+        return None, blocked, None
 
     if verdict not in VALID_VERDICTS:
         blocked.append(f"unknown_verdict: verdict={verdict!r} is not in {sorted(VALID_VERDICTS)}")
-        return None, blocked
+        return None, blocked, None
 
     # --- Assemble LOOP_STATE_V1 ---
     loop_state: dict[str, Any] = {
@@ -460,7 +465,11 @@ def build_loop_state(
         "blockers_history": blockers_history if blockers_history is not None else [],
     }
 
-    return loop_state, []
+    scope_signal_guard_decision_v2 = plan.get("scope_signal_guard_decision_v2")
+    if not isinstance(scope_signal_guard_decision_v2, dict):
+        scope_signal_guard_decision_v2 = None
+
+    return loop_state, [], scope_signal_guard_decision_v2
 
 
 # ---------------------------------------------------------------------------
@@ -618,7 +627,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     # --- Build LOOP_STATE ---
-    loop_state, blocked_reasons = build_loop_state(
+    loop_state, blocked_reasons, scope_signal_guard_decision_v2 = build_loop_state(
         plan=plan,
         review=review,
         issue_number=args.issue_number,
@@ -691,6 +700,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         errors=[],
         warnings=warnings,
         provenance=provenance,
+        scope_signal_guard_decision_v2=scope_signal_guard_decision_v2,
     )
     print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2))
     return 0
@@ -725,6 +735,7 @@ def _make_build_result(
     warnings: list[str],
     provenance: dict[str, Any],
     loop_state_sha256: Optional[str] = None,
+    scope_signal_guard_decision_v2: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "schema": BUILD_RESULT_SCHEMA,
@@ -735,6 +746,10 @@ def _make_build_result(
         "warnings": warnings,
         "provenance": provenance,
     }
+    if scope_signal_guard_decision_v2 is not None:
+        # #1090 AC1/AC10: opt-in pass-through of the escalation lane
+        # decision. Not part of LOOP_STATE_V1 (schema unchanged).
+        result["scope_signal_guard_decision_v2"] = scope_signal_guard_decision_v2
     return result
 
 
