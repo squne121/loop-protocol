@@ -221,8 +221,9 @@ class AllowedPathsGateEvaluator:
         *,
         pr_number: int,
         base_ref: str,
-        base_sha_at_snapshot: str,
-        diff_base_sha: str,
+        base_sha_at_snapshot: Optional[str] = None,
+        diff_base_sha: Optional[str] = None,
+        base_sha: Optional[str] = None,
         head_sha: str,
         reviewed_head_sha: str,
         allowed_paths: List[str],
@@ -232,10 +233,19 @@ class AllowedPathsGateEvaluator:
         expected_contract_fingerprint: Optional[Dict[str, Any]],
         issue_number: int = 0,
     ):
+        # Backward-compatible constructor aliasing for older tests/callers that
+        # still pass only `base_sha`. New code should pass both explicit fields.
+        resolved_diff_base_sha = diff_base_sha or base_sha
+        resolved_base_sha_at_snapshot = base_sha_at_snapshot or base_sha
+        if not resolved_diff_base_sha:
+            raise TypeError("diff_base_sha is required (or base_sha as a deprecated alias)")
+        if not resolved_base_sha_at_snapshot:
+            raise TypeError("base_sha_at_snapshot is required (or base_sha as a deprecated alias)")
+
         self.pr_number = pr_number
         self.base_ref = base_ref
-        self.base_sha_at_snapshot = base_sha_at_snapshot
-        self.diff_base_sha = diff_base_sha
+        self.base_sha_at_snapshot = resolved_base_sha_at_snapshot
+        self.diff_base_sha = resolved_diff_base_sha
         self.head_sha = head_sha
         self.reviewed_head_sha = reviewed_head_sha
         self.allowed_paths = allowed_paths
