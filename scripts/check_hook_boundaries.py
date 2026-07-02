@@ -29,6 +29,13 @@ import yaml
 REPO_ROOT = Path(__file__).parent.parent
 DOCS_PATH = REPO_ROOT / "docs" / "dev" / "hook-boundaries.md"
 SETTINGS_PATH = REPO_ROOT / ".claude" / "settings.json"
+CODEX_HOOKS_PATH = REPO_ROOT / ".codex" / "hooks.json"
+
+# Issue #1289: name of the shared fast-path classifier library. It must NEVER
+# appear as its own PreToolUse hook command in either .claude/settings.json or
+# .codex/hooks.json (it is imported by existing guards, not registered as an
+# independent hook).
+_FASTPATH_CLASSIFIER_MODULE_NAME = "pretool_fastpath_classifier"
 
 # ─── manifest 抽出 ────────────────────────────────────────────────────────────
 
@@ -423,6 +430,65 @@ def check_drift(
     return errors
 
 
+def load_codex_hooks_topology(path: Path = CODEX_HOOKS_PATH) -> dict[str, int]:
+    """Issue #1289 (AC4/AC6): return a snapshot of .codex/hooks.json PreToolUse
+    hook counts per matcher. Used to detect topology drift (e.g. an accidental
+    independent pretool_fastpath_classifier hook registration) without
+    requiring a full field-by-field .codex/.claude parity match (the two
+    manifests intentionally use different command wrapper forms)."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    pretool = data.get("hooks", {}).get("PreToolUse", [])
+    counts: dict[str, int] = {}
+    for entry in pretool:
+        matcher = entry.get("matcher", "<none>")
+        counts[matcher] = counts.get(matcher, 0) + len(entry.get("hooks", []))
+    return counts
+
+
+def check_codex_hooks_no_fastpath_classifier(path: Path = CODEX_HOOKS_PATH) -> list[str]:
+    """Issue #1289 AC6: pretool_fastpath_classifier must never be registered as
+    its own PreToolUse hook command in .codex/hooks.json."""
+    errors: list[str] = []
+    if not path.exists():
+        errors.append(f"[error] .codex/hooks.json が見つかりません: {path}")
+        return errors
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for event, event_entries in data.get("hooks", {}).items():
+        if not isinstance(event_entries, list):
+            continue
+        for entry in event_entries:
+            for hook in entry.get("hooks", []):
+                command = hook.get("command", "")
+                if _FASTPATH_CLASSIFIER_MODULE_NAME in command:
+                    errors.append(
+                        f"[codex:fastpath_topology] {_FASTPATH_CLASSIFIER_MODULE_NAME} は "
+                        f".codex/hooks.json の独立 PreToolUse hook として登録されてはいけません "
+                        f"(event={event!r} command={command!r})"
+                    )
+    return errors
+
+
+def check_settings_no_fastpath_classifier(path: Path = SETTINGS_PATH) -> list[str]:
+    """Issue #1289 AC6: same check for .claude/settings.json."""
+    errors: list[str] = []
+    if not path.exists():
+        return errors
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for event, event_entries in data.get("hooks", {}).items():
+        if not isinstance(event_entries, list):
+            continue
+        for entry in event_entries:
+            for hook in entry.get("hooks", []):
+                command = hook.get("command", "")
+                if _FASTPATH_CLASSIFIER_MODULE_NAME in command:
+                    errors.append(
+                        f"[settings:fastpath_topology] {_FASTPATH_CLASSIFIER_MODULE_NAME} は "
+                        f".claude/settings.json の独立 PreToolUse hook として登録されてはいけません "
+                        f"(event={event!r} command={command!r})"
+                    )
+    return errors
+
+
 def validate_narrative_consistency(docs_text: str) -> list[str]:
     """
     本文の説明表・telemetry 説明が current topology と一致しているか検証する。
@@ -485,6 +551,12 @@ def main() -> int:
     drift_errors = check_drift(manifest_entries, settings_entries)
     errors.extend(drift_errors)
     errors.extend(validate_narrative_consistency(docs_text))
+
+    # Issue #1289 (AC4/AC6): .codex/hooks.json is also in scope now — verify
+    # the shared fast-path classifier was never registered as an independent
+    # PreToolUse hook in either manifest.
+    errors.extend(check_codex_hooks_no_fastpath_classifier())
+    errors.extend(check_settings_no_fastpath_classifier())
 
     # 結果出力
     if errors:

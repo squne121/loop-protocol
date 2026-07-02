@@ -48,6 +48,7 @@ from local_main_branch_guard import (  # noqa: E402
     REASON_UNPARSEABLE,
     REASON_INLINE_OVERRIDE,
     REASON_DETERMINISTIC_CHECKER,
+    REASON_CONTROLLED_SKILL_MUTATION_EXECUTOR,
     REASON_GITHUB_REMOTE_OPS,
     REASON_GH_MUTATION,
     REASON_SKILL_RUNTIME_EXECUTOR,
@@ -1804,8 +1805,8 @@ class TestControlledSkillMutationPolicy:
         assert result["status"] == "allow", (
             f"controlled_skill_mutation_exec.py with valid argv must be allowed; result={result}"
         )
-        assert result["reason_code"] == REASON_DETERMINISTIC_CHECKER, (
-            "executor must be allowed as deterministic_checker"
+        assert result["reason_code"] == REASON_CONTROLLED_SKILL_MUTATION_EXECUTOR, (
+            "executor must be allowed as controlled_skill_mutation_executor"
         )
 
     def test_publish_termination_executor_missing_repo_denied(self, tmp_git_repo: Path):
