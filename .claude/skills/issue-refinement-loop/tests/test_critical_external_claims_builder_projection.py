@@ -54,7 +54,7 @@ def run_builder(
         "--iteration", str(iteration),
         "--out", str(out),
     ]
-    return subprocess.run(argv, capture_output=True, text=True)
+    return subprocess.run(argv, capture_output=True, text=True, timeout=30)
 
 
 def load_build_result(result: subprocess.CompletedProcess) -> dict[str, Any]:
@@ -92,6 +92,7 @@ def _run_real_planner_with_non_empty_claims(tmp_path: Path) -> Path:
         input=json.dumps(input_data, ensure_ascii=False),
         capture_output=True,
         text=True,
+        timeout=30,
     )
     assert result.returncode == 0, (
         f"planner exited with {result.returncode}:\n{result.stdout}\n{result.stderr}"
@@ -274,6 +275,10 @@ def test_build_loop_state_rejects_external_claim_with_empty_claim_text(tmp_path)
     assert result.returncode != 0, "Builder must fail-closed on empty claim text"
     build_result = load_build_result(result)
     assert build_result["status"] == "invalid"
+    assert build_result["errors"], "errors[] must be populated"
+    assert any(
+        "claim_empty" in err["message"] for err in build_result["errors"]
+    ), f"Expected a claim_empty error, got: {build_result['errors']}"
     assert not out.exists(), "Output file must not be written when projection fails"
 
 
@@ -300,6 +305,10 @@ def test_build_loop_state_rejects_external_claim_with_non_string_claim(tmp_path)
     assert result.returncode != 0, "Builder must fail-closed on non-string claim (no silent stringify)"
     build_result = load_build_result(result)
     assert build_result["status"] == "invalid"
+    assert build_result["errors"], "errors[] must be populated"
+    assert any(
+        "claim_not_string" in err["message"] for err in build_result["errors"]
+    ), f"Expected a claim_not_string error, got: {build_result['errors']}"
     assert not out.exists(), "Output file must not be written when projection fails"
 
 
@@ -316,3 +325,227 @@ def test_empty_critical_external_claims_still_projects_to_empty_list(tmp_path):
     assert result.returncode == 0
     loop_state = json.loads(out.read_text(encoding="utf-8"))
     assert loop_state["web_research_policy"]["critical_external_claims"] == []
+
+
+# ---------------------------------------------------------------------------
+# Additional AC4-style fail-closed tests: full ExternalClaim schema validation
+# ---------------------------------------------------------------------------
+
+
+def test_build_loop_state_rejects_external_claim_missing_affects(tmp_path):
+    """ExternalClaim missing required 'affects' key must fail-closed."""
+    planner_data = _base_planner_data()
+    planner_data["decisions"]["web_research_policy"]["required"] = True
+    planner_data["decisions"]["web_research_policy"]["reason_code"] = "critical_external_spec_claim"
+    planner_data["decisions"]["web_research_policy"]["critical_external_claims"] = [
+        {"claim": "Verify auth flow", "source_hint": None},  # missing 'affects'
+    ]
+
+    planner_file = tmp_path / "planner_result.json"
+    _write_json(planner_file, planner_data)
+
+    out = tmp_path / "loop_state.json"
+    result = run_builder(
+        planner_file=planner_file,
+        review_file=_review_approve_file(),
+        issue_number=1024,
+        iteration=0,
+        out=out,
+    )
+    assert result.returncode != 0, "Builder must fail-closed on missing 'affects'"
+    build_result = load_build_result(result)
+    assert build_result["status"] == "invalid"
+    assert build_result["errors"], "errors[] must be populated"
+    assert any(
+        "missing_required_keys" in err["message"] for err in build_result["errors"]
+    ), f"Expected a missing_required_keys error, got: {build_result['errors']}"
+    assert not out.exists(), "Output file must not be written when projection fails"
+
+
+def test_build_loop_state_rejects_external_claim_missing_source_hint(tmp_path):
+    """ExternalClaim missing required 'source_hint' key must fail-closed."""
+    planner_data = _base_planner_data()
+    planner_data["decisions"]["web_research_policy"]["required"] = True
+    planner_data["decisions"]["web_research_policy"]["reason_code"] = "critical_external_spec_claim"
+    planner_data["decisions"]["web_research_policy"]["critical_external_claims"] = [
+        {"claim": "Verify auth flow", "affects": "VC"},  # missing 'source_hint'
+    ]
+
+    planner_file = tmp_path / "planner_result.json"
+    _write_json(planner_file, planner_data)
+
+    out = tmp_path / "loop_state.json"
+    result = run_builder(
+        planner_file=planner_file,
+        review_file=_review_approve_file(),
+        issue_number=1024,
+        iteration=0,
+        out=out,
+    )
+    assert result.returncode != 0, "Builder must fail-closed on missing 'source_hint'"
+    build_result = load_build_result(result)
+    assert build_result["status"] == "invalid"
+    assert build_result["errors"], "errors[] must be populated"
+    assert any(
+        "missing_required_keys" in err["message"] for err in build_result["errors"]
+    ), f"Expected a missing_required_keys error, got: {build_result['errors']}"
+    assert not out.exists(), "Output file must not be written when projection fails"
+
+
+def test_build_loop_state_rejects_external_claim_with_unknown_affects(tmp_path):
+    """ExternalClaim with an 'affects' value outside the schema enum must fail-closed."""
+    planner_data = _base_planner_data()
+    planner_data["decisions"]["web_research_policy"]["required"] = True
+    planner_data["decisions"]["web_research_policy"]["reason_code"] = "critical_external_spec_claim"
+    planner_data["decisions"]["web_research_policy"]["critical_external_claims"] = [
+        {"claim": "Verify auth flow", "affects": "NotARealValue", "source_hint": None},
+    ]
+
+    planner_file = tmp_path / "planner_result.json"
+    _write_json(planner_file, planner_data)
+
+    out = tmp_path / "loop_state.json"
+    result = run_builder(
+        planner_file=planner_file,
+        review_file=_review_approve_file(),
+        issue_number=1024,
+        iteration=0,
+        out=out,
+    )
+    assert result.returncode != 0, "Builder must fail-closed on unknown 'affects' enum value"
+    build_result = load_build_result(result)
+    assert build_result["status"] == "invalid"
+    assert build_result["errors"], "errors[] must be populated"
+    assert any(
+        "affects_invalid" in err["message"] for err in build_result["errors"]
+    ), f"Expected an affects_invalid error, got: {build_result['errors']}"
+    assert not out.exists(), "Output file must not be written when projection fails"
+
+
+def test_build_loop_state_rejects_external_claim_with_extra_property(tmp_path):
+    """ExternalClaim with an additional (unknown) property must fail-closed
+    (additionalProperties: false)."""
+    planner_data = _base_planner_data()
+    planner_data["decisions"]["web_research_policy"]["required"] = True
+    planner_data["decisions"]["web_research_policy"]["reason_code"] = "critical_external_spec_claim"
+    planner_data["decisions"]["web_research_policy"]["critical_external_claims"] = [
+        {
+            "claim": "Verify auth flow",
+            "affects": "VC",
+            "source_hint": None,
+            "extra_field": "not allowed",
+        },
+    ]
+
+    planner_file = tmp_path / "planner_result.json"
+    _write_json(planner_file, planner_data)
+
+    out = tmp_path / "loop_state.json"
+    result = run_builder(
+        planner_file=planner_file,
+        review_file=_review_approve_file(),
+        issue_number=1024,
+        iteration=0,
+        out=out,
+    )
+    assert result.returncode != 0, "Builder must fail-closed on unknown extra property"
+    build_result = load_build_result(result)
+    assert build_result["status"] == "invalid"
+    assert build_result["errors"], "errors[] must be populated"
+    assert any(
+        "unknown_keys" in err["message"] for err in build_result["errors"]
+    ), f"Expected an unknown_keys error, got: {build_result['errors']}"
+    assert not out.exists(), "Output file must not be written when projection fails"
+
+
+def test_build_loop_state_rejects_missing_critical_external_claims_field(tmp_path):
+    """web_research_policy missing the required 'critical_external_claims' key
+    must fail-closed with a structured missing_required_field error, not
+    silently default to an empty list."""
+    planner_data = _base_planner_data()
+    planner_data["decisions"]["web_research_policy"] = {
+        "required": False,
+        "reason_code": "no_critical_external_claim",
+        "evidence_spans": [],
+        "confidence": "deterministic",
+        # 'critical_external_claims' intentionally omitted
+    }
+
+    planner_file = tmp_path / "planner_result.json"
+    _write_json(planner_file, planner_data)
+
+    out = tmp_path / "loop_state.json"
+    result = run_builder(
+        planner_file=planner_file,
+        review_file=_review_approve_file(),
+        issue_number=1024,
+        iteration=0,
+        out=out,
+    )
+    assert result.returncode != 0, "Builder must fail-closed on missing 'critical_external_claims'"
+    build_result = load_build_result(result)
+    assert build_result["status"] == "invalid"
+    assert build_result["errors"], "errors[] must be populated"
+    assert any(
+        "missing_required_field" in err["message"] for err in build_result["errors"]
+    ), f"Expected a missing_required_field error, got: {build_result['errors']}"
+    assert not out.exists(), "Output file must not be written when projection fails"
+
+
+def test_build_loop_state_trims_projected_claim_text(tmp_path):
+    """Projected claim text must be trimmed of surrounding whitespace, both
+    for the fail/pass decision and for the value written to output."""
+    planner_data = _base_planner_data()
+    planner_data["decisions"]["web_research_policy"]["required"] = True
+    planner_data["decisions"]["web_research_policy"]["reason_code"] = "critical_external_spec_claim"
+    planner_data["decisions"]["web_research_policy"]["critical_external_claims"] = [
+        {"claim": "  Verify against official API documentation  ", "affects": "VC", "source_hint": None},
+    ]
+
+    planner_file = tmp_path / "planner_result.json"
+    _write_json(planner_file, planner_data)
+
+    out = tmp_path / "loop_state.json"
+    result = run_builder(
+        planner_file=planner_file,
+        review_file=_review_approve_file(),
+        issue_number=1024,
+        iteration=0,
+        out=out,
+    )
+    assert result.returncode == 0, f"Build failed:\n{result.stdout}\n{result.stderr}"
+    build_result = load_build_result(result)
+    assert build_result["status"] == "ok"
+
+    loop_state = json.loads(out.read_text(encoding="utf-8"))
+    projected = loop_state["web_research_policy"]["critical_external_claims"]
+    assert projected == ["Verify against official API documentation"]
+
+
+def test_build_loop_state_rejects_non_object_web_research_policy_without_traceback(tmp_path):
+    """If 'web_research_policy' itself is not an object (e.g. a list), the
+    builder must fail-closed with a structured diagnostic message rather than
+    raising an unhandled exception / traceback."""
+    planner_data = _base_planner_data()
+    planner_data["decisions"]["web_research_policy"] = ["not", "an", "object"]
+
+    planner_file = tmp_path / "planner_result.json"
+    _write_json(planner_file, planner_data)
+
+    out = tmp_path / "loop_state.json"
+    result = run_builder(
+        planner_file=planner_file,
+        review_file=_review_approve_file(),
+        issue_number=1024,
+        iteration=0,
+        out=out,
+    )
+    assert result.returncode != 0, "Builder must fail-closed on non-object web_research_policy"
+    assert "Traceback" not in result.stderr, f"Unexpected traceback:\n{result.stderr}"
+    build_result = load_build_result(result)
+    assert build_result["status"] == "invalid"
+    assert build_result["errors"], "errors[] must be populated"
+    assert any(
+        "web_research_policy_invalid_type" in err["message"] for err in build_result["errors"]
+    ), f"Expected a web_research_policy_invalid_type error, got: {build_result['errors']}"
+    assert not out.exists(), "Output file must not be written when projection fails"
