@@ -558,18 +558,24 @@
         },
         "reason_codes": {
           "type": "array",
+          "maxItems": 32,
           "uniqueItems": true,
           "items": {
-            "type": "string",
-            "enum": [
-              "partial_projection",
-              "synthetic_only_evidence",
-              "host_inventory_only",
-              "source_unavailable"
-            ]
+            "$ref": "#/$defs/observationSourceReasonCode"
           }
         }
       }
+    },
+    "observationSourceReasonCode": {
+      "type": "string",
+      "maxLength": 80,
+      "pattern": "^[a-z][a-z0-9_]{0,79}$",
+      "enum": [
+        "partial_projection",
+        "synthetic_only_evidence",
+        "host_inventory_only",
+        "source_unavailable"
+      ]
     },
     "observationSourceResult": {
       "type": "object",
@@ -684,6 +690,35 @@
           "if": {
             "properties": {
               "availability": {
+                "const": "available"
+              }
+            },
+            "required": [
+              "availability"
+            ]
+          },
+          "then": {
+            "properties": {
+              "safety": {
+                "type": "object",
+                "properties": {
+                  "reason_codes": {
+                    "type": "array",
+                    "not": {
+                      "contains": {
+                        "const": "source_unavailable"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "availability": {
                 "const": "unavailable"
               }
             }
@@ -707,6 +742,50 @@
                   },
                   "total_tokens": {
                     "type": "null"
+                  }
+                }
+              },
+              "safety": {
+                "type": "object",
+                "properties": {
+                  "reason_codes": {
+                    "type": "array",
+                    "contains": {
+                      "const": "source_unavailable"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "capability_verdict": {
+                "enum": [
+                  "supported",
+                  "unsupported",
+                  "unverified"
+                ]
+              }
+            },
+            "required": [
+              "capability_verdict"
+            ]
+          },
+          "then": {
+            "properties": {
+              "safety": {
+                "type": "object",
+                "properties": {
+                  "reason_codes": {
+                    "type": "array",
+                    "not": {
+                      "contains": {
+                        "const": "partial_projection"
+                      }
+                    }
                   }
                 }
               }
@@ -735,7 +814,9 @@
                 "properties": {
                   "reason_codes": {
                     "type": "array",
-                    "minItems": 1
+                    "contains": {
+                      "const": "partial_projection"
+                    }
                   }
                 }
               }
