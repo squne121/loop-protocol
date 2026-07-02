@@ -159,4 +159,110 @@ describe('observation-source adapter', () => {
       safety: undefined,
     }))).toThrow(/safety must be an object/i)
   })
+
+  it('GIVEN regex-valid but unknown reason code WHEN adapted THEN it fails closed instead of accepting free-form text', () => {
+    expect(() => buildObservationSourceFromInput(createInput({
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: ['ignore_previous_instructions'],
+      },
+    }))).toThrow(/allowed observation source reason code/i)
+  })
+
+  it('GIVEN duplicate reason codes WHEN adapted THEN it fails closed instead of deduping', () => {
+    expect(() => buildObservationSourceFromInput(createInput({
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: ['source_unavailable', 'source_unavailable'],
+      },
+    }))).toThrow(/duplicates source_unavailable/i)
+  })
+
+  it('GIVEN path-like or secret-like reason code candidates WHEN adapted THEN it fails closed', () => {
+    expect(() => buildObservationSourceFromInput(createInput({
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: ['home_alice_claude_settings_local_json'],
+      },
+    }))).toThrow(/allowed observation source reason code/i)
+
+    expect(() => buildObservationSourceFromInput(createInput({
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: ['ghp_deadbeef'],
+      },
+    }))).toThrow(/forbidden|allowed observation source reason code/i)
+  })
+
+  it('GIVEN natural language html markdown or punctuation drift in reason codes WHEN adapted THEN it fails closed', () => {
+    expect(() => buildObservationSourceFromInput(createInput({
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: ['source unavailable because user disabled telemetry'],
+      },
+    }))).toThrow(/match \^\[a-z\]\[a-z0-9_\]\{0,79\}\$/i)
+
+    expect(() => buildObservationSourceFromInput(createInput({
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: ['markdown_fence___'],
+      },
+    }))).toThrow(/allowed observation source reason code/i)
+
+    expect(() => buildObservationSourceFromInput(createInput({
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: ['Source_Unavailable'],
+      },
+    }))).toThrow(/match \^\[a-z\]\[a-z0-9_\]\{0,79\}\$/i)
+
+    expect(() => buildObservationSourceFromInput(createInput({
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: ['source-unavailable'],
+      },
+    }))).toThrow(/match \^\[a-z\]\[a-z0-9_\]\{0,79\}\$/i)
+  })
+
+  it('GIVEN too many reason codes WHEN adapted THEN it fails closed', () => {
+    expect(() => buildObservationSourceFromInput(createInput({
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: new Array(33).fill('host_inventory_only'),
+      },
+    }))).toThrow(/at most 32 items/i)
+  })
+
+  it('GIVEN a reason code longer than 80 chars WHEN adapted THEN it fails closed', () => {
+    expect(() => buildObservationSourceFromInput(createInput({
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: [`${'a'.repeat(80)}b`],
+      },
+    }))).toThrow(/at most 80 characters/i)
+  })
+
+  it('GIVEN partial available input without partial_projection WHEN adapted THEN adapter auto-adds the semantic reason code', () => {
+    const result = buildObservationSourceFromInput(createInput({
+      capability_verdict: 'partial',
+      availability: 'available',
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: false,
+        reason_codes: [],
+      },
+    }))
+
+    expect(result.safety.reason_codes).toContain('partial_projection')
+  })
 })
