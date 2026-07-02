@@ -11,18 +11,15 @@
     "observation_sources": [
       {
         "schema_version": "observation_source_result/v1",
-        "source_kind": "claude_code",
-        "capability_verdict": "unverified",
+        "source_kind": "google_antigravity",
+        "capability_verdict": "unsupported",
         "availability": "unavailable",
         "projection_mode": "not_projected",
         "safety": {
           "verdict": "blocked",
           "raw_values_emitted": false,
           "forbidden_field_scan": "pass",
-          "reason_codes": [
-            "source_unavailable",
-            "synthetic_only_evidence"
-          ]
+          "reason_codes": []
         },
         "metrics": {
           "trace_count": null,
@@ -40,12 +37,12 @@
             "workflow_run_url": null,
             "schema_ref": null,
             "ref": null,
-            "digest": "sha256:c2d65836dfa49fd0e22e22fecaf0a6320ac5b0ce76e7dfedb959fb1f23252fe8",
+            "digest": "sha256:9e00c7c3d57273be1683af188c6d5ce4c257b0981a8b72f6217dac2758884379",
             "validation_verdict": "pass"
           },
-          "source_projection_digest": "sha256:c2d65836dfa49fd0e22e22fecaf0a6320ac5b0ce76e7dfedb959fb1f23252fe8",
+          "source_projection_digest": "sha256:9e00c7c3d57273be1683af188c6d5ce4c257b0981a8b72f6217dac2758884379",
           "validator_id": "agent-run-report-schema",
-          "validator_policy_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "validator_policy_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
           "evidence_mode": "synthetic_only",
           "checked_at": "2026-06-29T12:00:00Z"
         }
@@ -87,7 +84,7 @@
       "command_label": "pnpm test",
       "exit_code": 0,
       "verdict": "pass",
-      "summary": "unverified observation source remains a valid unavailable signal",
+      "summary": "unavailable observation source fixture is intentionally invalid because source_unavailable is missing",
       "artifact_ref": null
     }
   ],

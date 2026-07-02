@@ -103,6 +103,13 @@ function assertObservationSourcesRuntime(report) {
       if (error?.code === 'observation_source.evidence_mode') {
         throw runtimeError('report.observation_sources_evidence_mode', error.message)
       }
+      if (
+        (typeof error?.code === 'string' && error.code.startsWith('observation_source.reason_code'))
+        || error?.code === 'observation_source.reason_codes_too_many'
+        || error?.code === 'observation_source.reason_codes_type'
+      ) {
+        throw runtimeError('report.observation_sources_reason_codes_invalid', error.message)
+      }
       if (error?.code === 'observation_source.projection_digest_mismatch' || error?.code === 'observation_source.ref_digest_mismatch') {
         throw runtimeError('report.observation_sources_projection_digest_mismatch', error.message)
       }

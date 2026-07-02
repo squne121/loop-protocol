@@ -217,6 +217,9 @@ public surface では `observation_sources` が runtime で要求される。
 - `source_kind` と `capability_verdict` は `docs/dev/agent-observation-capability.md` の SSOT に従う
 - `unsupported` と `unverified` はそのまま adapter 入力の availability signal 扱いとし、`availability: unavailable` として扱う
 - `availability: unavailable` では metrics はすべて `null`、`reason_codes` には `source_unavailable` を補完
+- `public_safety.observation_sources[].safety.reason_codes` は free-form text を禁止し、`source_unavailable` / `partial_projection` / `synthetic_only_evidence` / `host_inventory_only` だけを許す closed allowlist contract とする
+- reason code 自体は `^[a-z][a-z0-9_]{0,79}$` と `maxLength: 80` を invariant とし、array 全体は `maxItems: 32` と `uniqueItems: true` を満たす。unknown/free-form/path-like/secret-like/prompt-like value は fail closed にする
+- `capability_verdict: partial` かつ `availability: available` では `reason_codes` に `partial_projection` を必須とし、`validate-final-report.mjs` / `retro-index-builder.mjs` は reason code contract violation を digest mismatch とは別 reason として拒否する
 - current producer contract は **single-source projection** を前提とする。現時点では aggregate producer を追加していないため、本ドキュメントでは aggregate metrics と呼ばない
 - `observation_sources` の `provenance.source_projection_digest` が public projection の canonical JSON sha256 を持つこと
 - `validate-final-report.mjs` と `retro-index-builder.mjs` は `provenance.source_projection_digest` と `provenance.ref.digest` を canonicalized public projection から再計算し、一致しない report を fail closed にする

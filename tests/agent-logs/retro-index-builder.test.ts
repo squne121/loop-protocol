@@ -410,6 +410,50 @@ describe('retro index builder', () => {
     ])
   })
 
+  it('GIVEN embedded report with regex-valid but unknown observation reason code WHEN buildRetroIndex runs THEN verdict becomes blocked with reason-code-specific reason', () => {
+    const report = createValidReport()
+    report.public_safety.observation_sources = [
+      refreshObservationSourceDigest({
+        ...report.public_safety.observation_sources[0],
+        safety: {
+          ...report.public_safety.observation_sources[0].safety,
+          reason_codes: ['ignore_previous_instructions'],
+        },
+      }),
+    ]
+    const body = buildAgentRunReportCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        issueNumber: 935,
+        prNumber: null,
+        runId: 'run-935-obs-reason-code',
+      },
+      payloadMarkdown: renderPublicMarkdown(report),
+    }).body
+
+    const result = buildRetroIndex({
+      parentIssue: 928,
+      sourceComments: [{
+        html_url: 'https://github.com/squne121/loop-protocol/issues/935#issuecomment-4713122674',
+        body,
+        linkedPrHints: [955],
+        linkedIssueHints: [935],
+        branchHint: null,
+      }],
+      parentChildIssueNumbers: [935],
+      prMetadataByNumber: new Map(),
+      associatedPrByMergeSha: new Map(),
+    })
+
+    expect(result.index.generation_verdict).toBe('blocked')
+    expect(result.blockedReasons).toEqual([
+      {
+        report_digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u),
+        reason: 'report_observation_sources_reason_codes_invalid',
+      },
+    ])
+  })
+
   it('GIVEN embedded report with duplicate observation source_kind WHEN buildRetroIndex runs THEN verdict becomes blocked with duplicate source_kind reason', () => {
     const duplicateKinds = {
       ...withObservationSource({}),
@@ -663,6 +707,11 @@ describe('retro index builder', () => {
     const unavailableMetricsSource = refreshObservationSourceDigest({
       ...createObservationSource(),
       availability: 'unavailable',
+      safety: {
+        ...createObservationSource().safety,
+        verdict: 'blocked',
+        reason_codes: ['source_unavailable'],
+      },
       metrics: {
         trace_count: 1,
         span_count: null,
