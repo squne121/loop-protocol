@@ -1960,6 +1960,13 @@ def _decide_bash(
     # Issue #1166: controlled skill mutation executor from main root is allowed.
     # Shared policy function (AC4/AC17): same is_controlled_skill_mutation_exec_command
     # as consumed by local_main_branch_guard — no split-brain allowlist.
+    # Issue #1284 AC5: this same exact-command-class allow covers the 3 issue
+    # metadata mutation command ids (issue_body.update / issue_comment.publish /
+    # contract_snapshot.publish) since is_controlled_skill_mutation_exec_command
+    # only validates executor script identity + argv shape, not the --command-id
+    # value — no separate allowlist entry is required per command id. Raw
+    # `gh issue edit` / `gh issue comment` remain classified as `mutating` by
+    # _classify_gh below and are still blocked in this state.
     if _CSM_POLICY_AVAILABLE and _is_csm_exec_command(command, _pr):
         _allow()
     if issue and _is_direct_publish_termination_command(command, _pr):

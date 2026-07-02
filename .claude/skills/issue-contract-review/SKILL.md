@@ -87,7 +87,7 @@ VC 実行前に静的に弾くカテゴリ:
 
 ### 6) Worktree / Branch preflight
 
-`git worktree list` と branch 競合をチェック。
+`git worktree list` と branch 競合をチェック（`implement-issue` が使う worktree/branch の命名衝突確認のみ。本 skill 自身は worktree を作らない）。
 
 ### 7) 実行結果の出力
 
@@ -97,7 +97,7 @@ VC 実行前に静的に弾くカテゴリ:
 
 ### status: `go`
 
-- Contract Snapshot（issue body 参照情報）をコメント投稿
+- Contract Snapshot（issue body 参照情報）をコメント投稿。**Issue #1284**: この投稿は issue-specific worktree を作らず、root/default branch から controlled metadata executor（`scripts/agent-guards/controlled_skill_mutation_exec.py --command-id contract_snapshot.publish`）経由で実行する。raw `gh issue comment` / `gh issue edit` は本 skill の production path では使わない
 - `implement-issue` へ handoff 可能
 
 ### status: `blocked`
@@ -161,6 +161,14 @@ VC 実行前に静的に弾くカテゴリ:
 - branch / PR / worktree を本 skill で作らない
 - `pnpm test` を含む回帰失敗は blocked
 - `.claude/skills/**` や `.codex` を触る場合は Stop 条件で一度停止
+- **Issue #1284**: Issue body / comment / Contract Snapshot の metadata mutation は
+  issue-specific worktree ではなく controlled metadata executor lane
+  （`scripts/agent-guards/controlled_skill_mutation_exec.py`、command id
+  `contract_snapshot.publish` / `issue_body.update` / `issue_comment.publish`）から
+  root/default branch で実行する。raw `gh issue edit` / `gh issue comment` を本 skill
+  の production path で直接呼ばない。`local_main_branch_guard.py` の既存 raw gh
+  allowlist は本 skill の成功経路の認可根拠として使わない（
+  `worktree_scope_guard.py` の controlled executor exact command class allow が根拠）
 
 ## github_metadata_assert（GitHub metadata の安全な readback assertion）
 

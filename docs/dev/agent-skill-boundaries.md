@@ -1409,3 +1409,77 @@ Claude Code permission syntax の制約上 `*` を使用しているが、settin
 ### OUTPUT_BUDGET_V1
 
 routing-critical フィールド: `CONTROLLED_SKILL_MUTATION_COMMAND_POLICY` の全 key は必須。
+
+## Issue metadata mutation executor lane（Issue #1284）
+
+（Issue #1284 — Issue body/comment mutation と Contract Snapshot 投稿を、issue-specific
+worktree ではなく Issue #1166 と同じ controlled executor lane から実行できるようにする拡張。）
+
+`scripts/agent-guards/controlled_skill_mutation_policy.py` の
+`CONTROLLED_SKILL_MUTATION_COMMAND_POLICY` に 3 command id を追加する:
+
+- `issue_body.update` — Issue body の stale-write 防止付き更新
+- `issue_comment.publish` — marker readback 付き Issue コメント投稿
+- `contract_snapshot.publish` — publisher authority を
+  `.claude/skills/impl-review-loop/scripts/ensure_contract_snapshot.py` に固定した
+  Contract Snapshot 投稿
+
+### Input file namespace（AC11）
+
+3 command id の input file は `artifacts/{issue_number}/` 直下ではなく、
+`artifacts/{issue_number}/issue-metadata/{command-id}/` subtree に統一する
+（`termination_report.publish` の legacy namespace `artifacts/{issue_number}/` は
+そのまま維持し、split-brain を避けるため command id ごとに subtree を分離する）。
+
+### Per-command input schema（AC10）
+
+| command_id | input schema |
+|---|---|
+| `issue_body.update` | `ISSUE_BODY_UPDATE_INPUT_V1` |
+| `issue_comment.publish` | `ISSUE_COMMENT_PUBLISH_INPUT_V1` |
+| `contract_snapshot.publish` | `CONTRACT_SNAPSHOT_PUBLISH_INPUT_V1` |
+
+command id と schema の不一致は mutation 前に deny される
+（`_load_and_validate_input_json` が command id ごとの期待 schema を照合する）。
+
+### issue_body.update の stale-write 防止（AC9）
+
+input は `previous_body_sha256` / `previous_updated_at` / `new_body` / `new_body_sha256` を含む。
+executor は mutation 直前に issue body/updatedAt を readback し、両方が input の
+`previous_*` と一致しない限り mutation しない。mutation 後も body_sha256 を再取得し、
+`new_body_sha256` と一致しない限り success にしない（片側のみ一致するズレも成功にしない）。
+
+### issue_comment.publish の readback（AC4/AC14）
+
+input の `marker` 文字列が `comment_body` に埋め込まれていることを事前検証し、
+投稿後は marker でコメントを検索する。marker が見つからない・複数見つかる場合は
+success にしない。
+
+### contract_snapshot.publish の publisher authority 固定（AC8）
+
+executor は `ensure_contract_snapshot.py` を
+`subprocess.run([sys.executable, <path>, "--issue-number", ..., "--repo", ...,
+"--mode", "auto", "--post", "--artifact-dir", <policy 束縛 subtree>], shell=False)`
+の argv-list 形式でのみ呼び出す。`--artifact-dir` は executor が
+`artifacts/{issue_number}/issue-metadata/contract_snapshot.publish/` に固定して渡し、
+呼び出し元が任意の書き込み先を指定することはできない。
+`issue-contract-review` skill の production path（scripts/ 配下）に direct `--post`
+呼び出しが存在しないことは
+`.claude/skills/issue-contract-review/tests/test_contract_review_no_worktree_creation.py`
+の negative test で固定する。
+
+### env binding（AC15）
+
+`termination_report.publish`（legacy）は `LOOP_ISSUE_NUMBER` 環境変数が必須のまま。
+新 3 command id は `LOOP_ISSUE_NUMBER` が存在しない場合でも `--issue-number` と
+repo binding のみで実行でき、存在する場合のみ `--issue-number` との一致を必須とする
+（`_check_issue_env_binding` が command id ごとに分岐する）。
+
+### hook allow（AC5）
+
+`worktree_scope_guard.py` の `is_controlled_skill_mutation_exec_command` による
+exact command class allow は executor script identity + argv 形状のみを検証し、
+`--command-id` の値には依存しない。そのため新 3 command id は追加の allowlist entry
+なしで同じ allow 経路に乗る。raw `gh issue edit` / `gh issue comment` は
+`_classify_gh` により引き続き `mutating` に分類され、active issue + no-matching-worktree
+状態では block される。
