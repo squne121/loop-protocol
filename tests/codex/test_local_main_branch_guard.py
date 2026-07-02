@@ -52,6 +52,32 @@ from skill_runtime_command_policy import resolve_repo_slug  # noqa: E402
 
 FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "hooks"
 
+RAW_ISSUE_EDIT_COMMANDS = [
+    "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md",
+    "gh issue edit 123 --repo squne121/loop-protocol --body rewritten",
+]
+
+RAW_ISSUE_COMMENT_COMMANDS = [
+    "gh issue comment 123 --body hello",
+    "gh issue comment 123 --body-file tmp/body.md",
+    "gh issue comment 123 -F tmp/body.md",
+    "gh issue comment 123 --body-file -",
+    "gh issue comment 123 --editor",
+    "gh issue comment 123 --web",
+    "gh issue comment 123 --edit-last",
+    "gh issue comment 123 --delete-last",
+    "gh issue comment 123 --create-if-none --edit-last --body x",
+]
+
+CONTROLLED_METADATA_COMMANDS = [
+    ("issue_body.update", "artifacts/1291/issue-metadata/issue_body.update/input.json"),
+    ("issue_comment.publish", "artifacts/1291/issue-metadata/issue_comment.publish/input.json"),
+    (
+        "contract_snapshot.publish",
+        "artifacts/1291/issue-metadata/contract_snapshot.publish/input.json",
+    ),
+]
+
 
 def _load_fixture_json(filename: str) -> dict:
     return json.loads((FIXTURE_DIR / filename).read_text())
@@ -116,6 +142,12 @@ def run_guard_script(payload: dict, cwd: Path) -> subprocess.CompletedProcess[st
         capture_output=True,
         cwd=str(cwd),
     )
+
+
+def seed_controlled_executor_stub(tmp_git_repo: Path) -> None:
+    executor = tmp_git_repo / "scripts" / "agent-guards" / "controlled_skill_mutation_exec.py"
+    executor.parent.mkdir(parents=True, exist_ok=True)
+    executor.write_text("# stub\n")
 
 
 @pytest.fixture
@@ -248,7 +280,7 @@ class TestAC8CodexParity:
 class TestIssue1198RawAndCommandFixtures:
     """AC8~AC16: Issue #1198 に追加した raw fixture / command fixture の回帰."""
 
-    def test_pretooluse_raw_issue_comment_fragment_is_not_blocked(self, tmp_git_repo: Path):
+    def test_pretooluse_raw_issue_comment_fragment_is_still_allowed(self, tmp_git_repo: Path):
         fixture = _load_fixture_json("issue1198-pretooluse-issue-comment.json")
         fixture["cwd"] = str(tmp_git_repo)
         result = run_guard_script(fixture, cwd=tmp_git_repo)
@@ -283,6 +315,9 @@ class TestIssue1198RawAndCommandFixtures:
     def test_issue1198_command_matrix_contracts(
         self, tmp_git_repo: Path, entry: dict, expected_status: str, expected_reason: str
     ):
+        if "gh issue edit" in entry["command"] or "gh issue comment" in entry["command"]:
+            expected_status = "block"
+            expected_reason = REASON_GH_MUTATION
         result = eval_codex(
             command=entry["command"],
             cwd=str(tmp_git_repo),
@@ -838,8 +873,6 @@ class TestGhMutationFailClosedCompleteness:
         "cmd",
         [
             "gh issue close 1089",
-            "gh issue comment 123 --body hello",
-            "gh issue comment 123 --body-file tmp/body.txt",  # B4: canonical tmp/ path (not /tmp/)
             "gh issue reopen 123",
             "gh pr comment 456 --body hello",
             "gh pr edit 456 --title new",
@@ -876,8 +909,6 @@ class TestGhOpsMinimalAllowlist:
         [
             # must-allow: 最小集合
             ("gh issue close 1089", "allow"),
-            ("gh issue comment 123 --body hello", "allow"),
-            ("gh issue comment 123 --body-file tmp/body.txt", "allow"),  # B4: canonical tmp/ path
             ("gh issue reopen 456", "allow"),
             ("gh pr comment 789 --body text", "allow"),
             ("gh pr edit 101 --title new", "allow"),
@@ -917,26 +948,19 @@ class TestGhOpsMinimalAllowlist:
 
 class TestGithubIssueMutationCommand:
     """
-    AC8: gh issue edit with --repo + --body-file tmp/ → allow (github_issue_mutation_command)
-    AC9: gh issue create with --repo + --body-file tmp/ → allow (github_issue_mutation_command)
+    AC8: raw gh issue edit/comment are blocked after deprecation.
+    AC9: gh issue create with --repo + --body-file tmp/ remains allowed.
     AC10: bare gh issue create / gh issue edit 123 (no --body-file) → block
     AC13: gh issue create/edit/comment/close/reopen is NOT readonly_command
     """
 
-    # AC8: gh issue edit <N> --repo squne121/loop-protocol --body-file tmp/foo.md → allow
-    @pytest.mark.parametrize(
-        "cmd",
-        [
-            "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md",
-            "gh issue edit 1 --repo squne121/loop-protocol --body-file tmp/issue.md",
-        ],
-    )
-    def test_ac8_gh_issue_edit_with_repo_and_bodyfile_allowed(self, tmp_git_repo: Path, cmd: str):
-        """AC8: GIVEN gh issue edit with --repo + --body-file tmp/ WHEN evaluated THEN allow."""
-        assert is_github_issue_mutation_command(cmd), f"Expected True for: {cmd!r}"
+    @pytest.mark.parametrize("cmd", RAW_ISSUE_EDIT_COMMANDS)
+    def test_issue_metadata_mutation_parity(self, tmp_git_repo: Path, cmd: str):
+        """AC8: GIVEN raw gh issue edit WHEN evaluated THEN block in Codex too."""
+        assert not is_github_issue_mutation_command(cmd), f"Expected False for: {cmd!r}"
         result = eval_codex(cmd, str(tmp_git_repo))
-        assert result["status"] == "allow", f"Expected allow for: {cmd!r}"
-        assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
+        assert result["status"] == "block", f"Expected block for: {cmd!r}"
+        assert result["reason_code"] == REASON_GH_MUTATION
 
     # AC9: gh issue create --repo squne121/loop-protocol --body-file tmp/foo.md → allow
     @pytest.mark.parametrize(
@@ -946,7 +970,7 @@ class TestGithubIssueMutationCommand:
             "gh issue create --repo squne121/loop-protocol --body-file tmp/body.md --title new-issue",
         ],
     )
-    def test_ac9_gh_issue_create_with_repo_and_bodyfile_allowed(self, tmp_git_repo: Path, cmd: str):
+    def test_issue_create_still_allowed(self, tmp_git_repo: Path, cmd: str):
         """AC9: GIVEN gh issue create with --repo + --body-file tmp/ WHEN evaluated THEN allow."""
         assert is_github_issue_mutation_command(cmd), f"Expected True for: {cmd!r}"
         result = eval_codex(cmd, str(tmp_git_repo))
@@ -1151,19 +1175,19 @@ class TestB1B4ReviewBlockerFixes:
     def test_b2_body_file_path_traversal_blocked(self, tmp_git_repo: Path):
         """B2: --body-file tmp/../AGENTS.md (path traversal) is blocked."""
         assert not is_github_issue_mutation_command(
-            "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/../AGENTS.md"
+            "gh issue create --repo squne121/loop-protocol --title foo --body-file tmp/../AGENTS.md"
         ), "path traversal in --body-file must be blocked"
 
     def test_b2_body_file_absolute_path_blocked(self, tmp_git_repo: Path):
         """B2: --body-file /tmp/body.txt (absolute path) is blocked."""
         assert not is_github_issue_mutation_command(
-            "gh issue edit 123 --repo squne121/loop-protocol --body-file /tmp/body.txt"
+            "gh issue create --repo squne121/loop-protocol --title foo --body-file /tmp/body.txt"
         ), "absolute path in --body-file must be blocked"
 
     def test_b2_body_file_canonical_tmp_allowed(self, tmp_git_repo: Path):
         """B2: --body-file tmp/body.txt (canonical relative) is allowed."""
         assert is_github_issue_mutation_command(
-            "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/body.txt"
+            "gh issue create --repo squne121/loop-protocol --title foo --body-file tmp/body.txt"
         ), "canonical tmp/ path in --body-file must be allowed"
 
     # B3: --web/-w blocked for gh issue/pr view
@@ -1241,6 +1265,57 @@ class TestB1B4ReviewBlockerFixes:
         )
         assert result["status"] == "allow"
         assert result["reason_code"] == REASON_UNKNOWN_ALLOWED
+
+
+class TestIssue1291IssueMetadataMutationCodex:
+    """Issue #1291 parity coverage for Codex hook inputs."""
+
+    @pytest.mark.parametrize("cmd", RAW_ISSUE_COMMENT_COMMANDS)
+    def test_issue_comment_deprecated(self, tmp_git_repo: Path, cmd: str):
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_GH_MUTATION
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "gh issue close 100",
+            "gh issue reopen 100",
+            "gh pr comment 100 --body-file tmp/x.md",
+            "gh pr edit 100 --title new-title",
+        ],
+    )
+    def test_remote_ops_still_allowed(self, tmp_git_repo: Path, cmd: str):
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
+
+    @pytest.mark.parametrize("cmd", RAW_ISSUE_EDIT_COMMANDS + RAW_ISSUE_COMMENT_COMMANDS)
+    def test_must_block_raw_issue_metadata_commands_via_hook_script(self, tmp_git_repo: Path, cmd: str):
+        payload = make_pretool_codex(cmd, str(tmp_git_repo))
+        result = run_guard_script(payload, cwd=tmp_git_repo)
+        assert result.returncode == 2, result.stderr
+        assert "gh_mutation_denied" in result.stderr
+
+    @pytest.mark.parametrize("command_id,input_file", CONTROLLED_METADATA_COMMANDS)
+    def test_must_allow_controlled_executor_metadata_commands(
+        self,
+        tmp_git_repo: Path,
+        command_id: str,
+        input_file: str,
+    ):
+        seed_controlled_executor_stub(tmp_git_repo)
+        payload = make_pretool_codex(
+            (
+                "uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py "
+                f"--command-id {command_id} --issue-number 1291 "
+                f"--input-file {input_file} --repo squne121/loop-protocol --dry-run"
+            ),
+            str(tmp_git_repo),
+        )
+        result = run_guard_script(payload, cwd=tmp_git_repo)
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == ""
 
 
 # ─── Issue #1137: cleanup arbitration + Claude/Codex reason_code parity ────────
