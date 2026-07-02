@@ -167,7 +167,7 @@ scope_signal_delta_input:
 - phase-sensitive routing を bypass して hard stop を早期発火させない
 
 
-## SCOPE_SIGNAL_GUARD_DECISION_V2（escalation lane split, #1090）
+## SCOPE_SIGNAL_GUARD_DECISION_V2（エスカレーション lane 分割契約, #1090）
 
 `plan_refinement_loop.py` は `known_context.scope_signal_delta_input` が与えられた場合に限り、
 `REFINEMENT_LOOP_PLAN_V1` のトップレベルに追加フィールド `scope_signal_guard_decision_v2` を出力する
@@ -212,7 +212,7 @@ scope_signal_guard_decision_v2:
 | 6 | `tests/` / `fixtures/`（部分一致含む） | `test_fixture` |
 | — | 上記いずれにも一致しない | `unknown` |
 
-### route 決定（AC2/AC3/AC4/AC8/AC9/AC13）
+### route 決定ロジック（AC2/AC3/AC4/AC8/AC9/AC13）
 
 `_decide_scope_signal_route()` は以下の優先順位で route を決定する。
 
@@ -222,7 +222,7 @@ scope_signal_guard_decision_v2:
 4. Scope Delta Approval は存在するが対象 Issue 不一致（AC8）または `author_association` が信頼できない（AC9） → `invalid_scope_delta_approval`
 5. 上記いずれにも該当しない（trusted anchor による有効な approval） → `proceed_with_notes`（AC2/AC4/AC12。実装 go ではなく contract-review rerun required）
 
-### security-sensitive fail-closed gate（AC13）
+### security-sensitive fail-closed gate（セキュリティ機微判定, AC13）
 
 `_is_security_sensitive_scope_delta()` は以下を deterministic に判定する（#558 の security gate 本体とは別の、狭い fail-closed チェック）。
 

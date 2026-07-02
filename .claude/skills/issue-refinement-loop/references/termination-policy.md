@@ -1,6 +1,6 @@
-# Termination Policy
+# Termination Policy（終了ポリシー）
 
-## Loop end conditions
+## Loop end conditions（loop 終了条件）
 
 | condition | termination_reason |
 |---|---|
@@ -11,7 +11,7 @@
 | Any step requires human review | `human_escalation` |
 | `final_classification == superseded_by_decision` and close / replacement flow completed | `superseded_by_decision` |
 
-## Contract Hygiene Repair Routing Predicate
+## Contract Hygiene Repair Routing Predicate（契約 hygiene 修復ルーティング述語）
 
 `ISSUE_AUTHOR_RESULT_V1.contract_hygiene_repair_applied` フラグによる iteration accounting ルール。
 
@@ -23,7 +23,7 @@
 
 **重要**: orchestrator は C4/C9 の具体修復知識を持たない。`contract_hygiene_repair_applied: true` フラグのみで routing を判断する。修復の詳細は `edit-issue` skill および `issue-author` SubAgent の責務。
 
-## Handoff State: `refinement_approved_gate_pending` / `implementation_ready`
+## Handoff State（引き渡し状態）: `refinement_approved_gate_pending` / `implementation_ready`
 
 `issue-reviewer` が `approve` を返しただけでは `implementation_ready` とならない。  
 以下の 2 段階を経て初めて handoff 状態が `implementation_ready` に遷移する:
@@ -56,7 +56,7 @@ reviewer が `approve` を返しても、最新の `CONTRACT_REVIEW_RESULT_V1.st
 - `next_action: human_judgment` の場合は `human_escalation` とする（`CONTRACT_REVIEW_RESULT_V1.status` は `go | blocked` のみ。`human_judgment` は `next_action` フィールドで表現）
 - 本ルールは `issue-refinement-loop/SKILL.md` が本ファイルを normative reference として消費するため、SKILL.md を変更せずとも実効性がある
 
-### implement-issue Handoff Gate
+### implement-issue Handoff Gate（引き渡しゲート）
 
 | `CONTRACT_REVIEW_RESULT_V1` フィールド | handoff 判定 |
 |---|---|
@@ -66,7 +66,7 @@ reviewer が `approve` を返しても、最新の `CONTRACT_REVIEW_RESULT_V1.st
 
 `CONTRACT_REVIEW_RESULT_V1.status` の有効値は `go | blocked`。`human_judgment` は `next_action` フィールドに現れる（`status` フィールドには存在しない）。
 
-### Contract Snapshot Idempotency
+### Contract Snapshot Idempotency（スナップショットの冪等性）
 
 - contract-review snapshot comment は Issue body の `body_sha256` を含む
 - `body_sha256` が現在の Issue body と一致しない場合（stale result）、その snapshot は無効とする
@@ -76,11 +76,11 @@ reviewer が `approve` を返しても、最新の `CONTRACT_REVIEW_RESULT_V1.st
 **Note（policy-only — follow-up 依存）**: `body_sha256` フィールドの producer-side 実装（`issue-contract-review/SKILL.md` の `CONTRACT_REVIEW_RESULT_V1` 出力への追加）は本 Issue のスコープ外。現時点では本セクションは policy constraint として機能し、実装は follow-up Issue で対応する（`issue-contract-review` の out-of-scope 修正として別 Issue を起票すること）。
 それまでの間、consumer 側は `CONTRACT_REVIEW_RESULT_V1.generated_at` と Issue の `updated_at` の比較を用いた暫定的な stale 検知を行う。
 
-## Human Escalation on max_iterations
+## Human Escalation on max_iterations（イテレーション上限時のエスカレーション）
 
 `iteration + 1 >= max_iterations` かつ approve なしの場合は `human_escalation` で停止し、全 iteration 分の blocker summary を終了コメントに添付する。`max_iterations=3` 既定では、3 回目の `needs-fix` で停止する。
 
-### TERMINATION_REPORT_INPUT_V1 normalization
+### TERMINATION_REPORT_INPUT_V1 の正規化（normalization）
 
 - `termination_reason: human_escalation` かつ `termination_cause` omitted / `null` の場合、renderer / publisher は `Cause: none` を出さず `human_judgment_required` を fallback cause として扱う
 - caller が `max_iterations_exceeded` などの valid `termination_cause` を明示した場合は上書きしない
@@ -103,7 +103,7 @@ human_escalation の入力例（termination_cause と blockers_summary を明示
 }
 ```
 
-legacy alias example:
+legacy alias 例（旧形式の呼び出し元）:
 
 ```json
 {
@@ -174,19 +174,19 @@ termination payload を組み立てる前に、現在の phase が `hard_stop_el
 
 上記は `render_termination_report.py` の `_validate_input()` に `Invalid termination_cause` として reject される（#919 修正済み regression test: `test_scope_signal_guard_termination.py::TestAC3`）。
 
-## Additional stop rules
+## Additional stop rules（追加の停止規則）
 
 - anchor comment fact-check が未完了のまま stale approval を使おうとした場合
 - scope change signal が新規追加された場合
 - required external research が critical claim を unresolved のまま残した場合
 
-## Must not
+## Must not（禁止事項）
 
 - `approve` 以外を success 扱いして silently finish しない
 - `max_iterations` を超えて自動ループしない
 - hard stop 条件（`state/needs-human`、scope change 等）をスキップしない
 
-## Termination Result Schema（LOOP_TERMINATION_RESULT_V1）
+## Termination Result Schema（終了結果スキーマ, LOOP_TERMINATION_RESULT_V1）
 
 `human_escalation` 終了時は以下の構造で終了コメントを出力する:
 
@@ -203,7 +203,7 @@ LOOP_TERMINATION_RESULT_V1:
       blockers: []
 ```
 
-## Termination Comment（全 termination reason 共通）
+## Termination Comment（終了コメント。全 termination reason 共通）
 
 すべての termination reason（`approved` / `human_escalation` / `superseded_by_decision`）で、終了コメントに `FOLLOW_UP_MATERIALIZATION_RESULT_V1` を含める。follow-up が存在しない場合も空配列で出力する（`follow_up_issues: []` / `note_only_observations: []`）。
 
@@ -217,7 +217,7 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
 
 詳細 schema は `docs/dev/agent-skill-boundaries.md` の `FOLLOW_UP_MATERIALIZATION_RESULT_V1` を参照。`issue-refinement-loop` は thin orchestrator として raw context を保持せず、materialization 結果のみを報告する（`docs/dev/agent-skill-boundaries.md` の `ORCHESTRATOR_IO_BOUNDARY_V1` 参照）。
 
-## Loop Policy（LOOP_POLICY_V1）
+## Loop Policy（loop 動作方針の定義, LOOP_POLICY_V1）
 
 ```yaml
 LOOP_POLICY_V1:
@@ -254,12 +254,12 @@ LOOP_POLICY_V1:
     - unsafe_mutation
 ```
 
-## LOOP_HANDOFF_RESULT_V1 — Terminal Contract (SSOT)
+## LOOP_HANDOFF_RESULT_V1 — Terminal Contract（終端契約, SSOT）
 
 `issue-refinement-loop` が `approved` 終了するとき、終了コメントに `LOOP_HANDOFF_RESULT_V1` marker を出力する。  
 本セクションが `LOOP_HANDOFF_RESULT_V1` の唯一の SSOT である。
 
-### Output Format
+### Output Format（出力形式）
 
 出力は HTML comment と fenced YAML block の 2 要素で構成する:
 
@@ -275,7 +275,7 @@ LOOP_HANDOFF_RESULT_V1:
 `<!-- LOOP_HANDOFF_RESULT_V1 -->` HTML comment が marker の開始行を示す。  
 fenced YAML ブロックが marker の内容を保持する。
 
-### Schema（JSON Schema: `schemas/loop_handoff_result_v1.json`）
+### Schema（スキーマ定義: `schemas/loop_handoff_result_v1.json`）
 
 ```yaml
 LOOP_HANDOFF_RESULT_V1:
@@ -320,7 +320,7 @@ LOOP_HANDOFF_RESULT_V1:
 
 **Note**: 上記 4 フィールド（`checked_body_sha256` / `checker_exit_code` / `missing_sections` / `missing_contract_keys`）はスキーマの SSOT として本セクションが定義する。これら 4 フィールド + attempt counter に対する runtime enforcement（`max_rewrite_attempts` 制限・no-progress detection）は #664 で `decide_rewrite_route.py` として実装済みであり、その orchestrator からの invocation 手順は直下の「Rewrite Loop Runtime Router」セクションが normative SSOT となる。
 
-### Rewrite Loop Runtime Router（#664 / #814）
+### Rewrite Loop Runtime Router（リライトループの実行時ルーター, #664 / #814）
 
 Step 4（Rewrite）の rewrite ループにおいて、orchestrator は **checker を実行するたびに** `decide_rewrite_route.py` を呼び出し、その出力に従って routing する。これにより `max_rewrite_attempts` 超過・body hash 変化なし・missing set の単調減少なしを runtime で確定的に強制する（planner payload の値を宣言するだけでなく、実経路で enforcement する）。
 
@@ -397,7 +397,7 @@ checker exit 1（needs-fix）はインフラ障害でなく正常系として ro
 
 `auto_fixes.required` / `auto_fixes.skipped` の各エントリは `kind` / `executor` / `result` / `evidence`（`before` / `after` / `comment_url`）を含む。`result: skipped` または `evidence` 欠如 → `impl_ready` 禁止。
 
-### Routing Rules
+### Routing Rules（ルーティング規則）
 
 | 条件 | `status` | `routing_action` |
 |---|---|---|
@@ -413,7 +413,7 @@ checker exit 1（needs-fix）はインフラ障害でなく正常系として ro
 
 scope / goal / AC への semantic change が検出されたとき、`issue-refinement-loop` は `LOOP_HANDOFF_RESULT_V1.status: human_judgment_required` / `routing_action: ask_human` で停止し、人間の判断を仰ぐ。Semantic change の検出は `references/scope-signal-guard.md` の guard 定義を参照する。
 
-### Hygiene Delegation Contract（routing 定義のみ）
+### Hygiene Delegation Contract（委譲契約, routing 定義のみ）
 
 以下の 5 種 hygiene は implementation-worker (repair mode) に委譲する:
 
@@ -428,11 +428,11 @@ scope / goal / AC への semantic change が検出されたとき、`issue-refin
 各委譲は `auto_fixes.required` エントリとして記録し、`result: applied` かつ `evidence` 完備のものだけが `impl_ready` に貢献する。
 
 
-## Termination Report Render Flow（#656 規約）
+## Termination Report Render Flow（終了レポート描画フロー, #656 規約）
 
 終了レポートの生成は `render_termination_report.py` が担い、以下のフローに従う。
 
-### TERMINATION_REPORT_INPUT_V1
+### TERMINATION_REPORT_INPUT_V1（入力スキーマ）
 
 ```yaml
 TERMINATION_REPORT_INPUT_V1:
@@ -443,7 +443,7 @@ TERMINATION_REPORT_INPUT_V1:
   blockers_summary: []      # 任意（human_escalation 時に使用）
 ```
 
-### TERMINATION_REPORT_RENDER_RESULT_V1
+### TERMINATION_REPORT_RENDER_RESULT_V1（出力スキーマ）
 
 ```yaml
 TERMINATION_REPORT_RENDER_RESULT_V1:
@@ -492,7 +492,7 @@ TERMINATION_REPORT_RENDER_RESULT_V1:
 
 `needs_fix_at_iteration_limit` / `max_iterations_exceeded` は `termination_cause` として扱う。`termination_reason` に設定してはならない。
 
-### GFM Fence Injection 防御（dynamic fence）
+### GFM Fence Injection 攻撃への防御策（動的フェンス, dynamic fence）
 
 - `_make_dynamic_fence(content)`: コンテンツ内の最長バッククォート列 + 1 の長さを持つ fence を生成（最小 3）
 - これにより adversarial input（` ``` ` 含む blockers_summary 等）がテンプレート構造を破壊しない
@@ -503,13 +503,13 @@ TERMINATION_REPORT_RENDER_RESULT_V1:
 - stderr: diagnostics のみ（guard fail メッセージ・内部エラー等）
 - `publishable=false` 時でも stderr にも投稿可能 markdown 本文を出力しない
 
-### callsite integration
+### callsite integration（呼び出し元統合）
 
 本フロー（`render_termination_report.py` の呼び出し）は follow-up Issue に委譲する。
 本 policy セクションは renderer ライブラリの規約として機能し、callsite integration 前でも実効性がある。
 
 
-### scope_signal_guard 停止時の missing approval field / suggested contract patch（#1090 AC6）
+### scope_signal_guard 停止時の承認欠落情報 missing approval field / suggested contract patch の追記（#1090 AC6）
 
 `scope_signal_guard.triggered=true` かつ `scope_signal_guard_decision_v2.route` が
 `human_judgment_required` である termination は、`scope_signal_guard_reason_code` だけでなく

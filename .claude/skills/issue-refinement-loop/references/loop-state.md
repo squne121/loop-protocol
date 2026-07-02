@@ -6,17 +6,18 @@ owner: issue-refinement-loop orchestrator
 moved_from: SKILL.md##LOOP_STATE Summary
 must_not: re-implement routing logic — use decide_next_loop_action.py
 schema: schemas/loop_state.schema.json
+note_ja: このファイルは LOOP_STATE_V1 スキーマのフィールド定義とルーティング意味論を日本語で解説する。
 ---
 
-# LOOP_STATE Reference
+# LOOP_STATE リファレンス
 
-Full field definitions and routing semantics for the `LOOP_STATE_V1` schema.
-The canonical machine-readable schema is `schemas/loop_state.schema.json`.
+`LOOP_STATE_V1` スキーマの全フィールド定義とルーティング意味論。
+正本となる機械可読スキーマは `schemas/loop_state.schema.json` である。
 
-## Building LOOP_STATE_V1
+## LOOP_STATE_V1 の構築
 
-Use `build_loop_state.py` to construct `LOOP_STATE_V1` from planner and review results.
-**Do not write LOOP_STATE JSON by hand** — use the builder to ensure schema validation and provenance.
+`LOOP_STATE_V1` を planner と review の結果から構築するには `build_loop_state.py` を使う。
+**LOOP_STATE の JSON を手書きしてはならない** — スキーマ検証と provenance を保証するため builder を使うこと。
 
 ```bash
 uv run python3 .claude/skills/issue-refinement-loop/scripts/build_loop_state.py \
@@ -30,168 +31,171 @@ uv run python3 .claude/skills/issue-refinement-loop/scripts/build_loop_state.py 
   --out <output path>
 ```
 
-The builder outputs `LOOP_STATE_BUILD_RESULT_V1` (stdout JSON) with:
+builder は以下を含む `LOOP_STATE_BUILD_RESULT_V1`（stdout JSON）を出力する。
 - `status`: `ok` | `invalid`
-- `loop_state_path`: where the validated LOOP_STATE_V1 was written
-- `loop_state_sha256`: content hash for integrity checking
-- `errors[]`: schema validation errors (path, message, schema_path)
-- `provenance`: planner/review input hashes and source metadata
+- `loop_state_path`: 検証済み LOOP_STATE_V1 の書き込み先
+- `loop_state_sha256`: 整合性確認用のコンテンツハッシュ
+- `errors[]`: スキーマ検証エラー（path, message, schema_path）
+- `provenance`: planner/review 入力のハッシュとソースメタデータ
 
-Builder constraints:
-- Does NOT determine `next_action` (that is `decide_next_loop_action.py`'s job)
-- Does NOT perform GitHub mutations (`gh` commands)
-- Validates output against `schemas/loop_state.schema.json` using `iter_errors()` (all errors collected)
-- Input is file paths only — raw JSON strings are rejected
+builder の制約:
+- `next_action` を決定しない（それは `decide_next_loop_action.py` の役割）
+- GitHub mutation（`gh` コマンド）を実行しない
+- `iter_errors()` を使い `schemas/loop_state.schema.json` に対して出力を検証する（全エラーを収集）
+- 入力はファイルパスのみ — 生の JSON 文字列は拒否される
 
-## Field Index
+## フィールド一覧
 
 | field | type | routing_critical | description |
 |---|---|---|---|
 | `schema_version` | string const | no | `"loop_state/v1"` |
-| `issue_number` | int | no | Target issue number |
-| `iteration` | int (0-indexed) | yes | Current iteration count |
-| `max_iterations` | int (default 3) | yes | Upper bound; escalates to human at `iteration >= max_iterations` |
-| `last_verdict` | `approve\|needs-fix\|null` | yes | Most recent review verdict |
-| `blockers_history` | array | yes | All iteration blocker lists for escalation summary |
-| `improvements_applied` | array of string | no | Rewrite notes per iteration |
-| `removed_state_labels` | array of string | no | Labels removed for hygiene |
-| `termination_reason` | enum\|null | yes | Why the loop ended |
-| `scope_rollup_decision` | string\|null | yes | Output of scope rollup preflight |
-| `anchor_comment` | object | yes | Snapshot + classification of anchor comment |
-| `investigation_policy` | object | yes | Whether codebase investigation is required |
-| `scope_signal_guard` | object | yes | Whether scope change signal was detected |
-| `web_research_policy` | object | yes | Whether web research is required |
-| `web_research` | object | no | Web research execution state |
-| `product_spec_context` | object | yes | Product/Spec work kind signal |
-| `delivery_rollup` | object | yes | Parent delivery rollup applicability |
-| `follow_up_materialization` | object | yes | Follow-up issue candidates |
-| `superseded_decision` | object | yes | If this issue was superseded by a human decision |
+| `issue_number` | int | no | 対象 Issue 番号 |
+| `iteration` | int (0-indexed) | yes | 現在のイテレーション数 |
+| `max_iterations` | int (default 3) | yes | 上限。`iteration >= max_iterations` で人間へエスカレーション |
+| `last_verdict` | `approve\|needs-fix\|null` | yes | 直近の review 判定 |
+| `blockers_history` | array | yes | エスカレーション要約用の全イテレーション blocker リスト |
+| `improvements_applied` | array of string | no | イテレーションごとの rewrite メモ |
+| `removed_state_labels` | array of string | no | hygiene のため削除された label |
+| `termination_reason` | enum\|null | yes | loop が終了した理由 |
+| `scope_rollup_decision` | string\|null | yes | scope rollup preflight の出力 |
+| `anchor_comment` | object | yes | anchor comment のスナップショットと分類 |
+| `investigation_policy` | object | yes | コードベース調査が必要かどうか |
+| `scope_signal_guard` | object | yes | scope 変更シグナルが検出されたかどうか |
+| `web_research_policy` | object | yes | web research が必要かどうか |
+| `web_research` | object | no | web research の実行状態 |
+| `product_spec_context` | object | yes | Product/Spec 作業種別シグナル |
+| `delivery_rollup` | object | yes | parent delivery rollup の適用可否 |
+| `follow_up_materialization` | object | yes | follow-up issue 候補 |
+| `superseded_decision` | object | yes | 本 Issue が人間判断により supersede された場合の情報 |
 
-## LOOP_STATE_V1 Field Mapping from Builder Inputs
+## Builder 入力から LOOP_STATE_V1 フィールドへのマッピング
 
 | LOOP_STATE_V1 field | Source |
 |---|---|
-| `issue_number` | CLI `--issue-number` (validated against planner/review artifacts) |
+| `issue_number` | CLI `--issue-number`（planner/review artifact と照合検証） |
 | `iteration` | CLI `--iteration` |
-| `max_iterations` | CLI `--max-iterations` (default 3) |
+| `max_iterations` | CLI `--max-iterations`（デフォルト 3） |
 | `web_research_policy` | `REFINEMENT_LOOP_PLAN_V1.decisions.web_research_policy` |
 | `scope_signal_guard` | `REFINEMENT_LOOP_PLAN_V1.decisions.scope_signal_guard` |
 | `delivery_rollup` | `REFINEMENT_LOOP_PLAN_V1.decisions.delivery_rollup` |
 | `follow_up_materialization` | `REFINEMENT_LOOP_PLAN_V1.decisions.follow_up_materialization` |
 | `last_verdict` | `ISSUE_REVIEW_RESULT_COMPACT_V1.VERDICT` |
-| `blockers_history` | CLI `--blockers-history-file` or empty array |
-| `termination_reason` | Always `null` (builder does not terminate the loop) |
+| `blockers_history` | CLI `--blockers-history-file` または空配列 |
+| `termination_reason` | 常に `null`（builder は loop を終了させない） |
 
-## Routing Semantics
+## ルーティング意味論
 
-### iteration / max_iterations
+### iteration / max_iterations（イテレーション数と上限）
 
-`iteration` is the current 0-indexed round number passed to `decide_next_loop_action.py`.
-Continuation is possible as long as a next round exists: `iteration + 1 < max_iterations`.
+`iteration` は `decide_next_loop_action.py` に渡される現在の 0-indexed ラウンド番号である。
+次のラウンドが存在する限り継続可能: `iteration + 1 < max_iterations`。
 
 | condition | next action |
 |---|---|
-| `last_verdict == approve` | `proceed_to_step_4_5` (child/follow-up materialization) |
-| `last_verdict == needs-fix` AND `iteration + 1 < max_iterations` | `continue_to_step_4` (rewrite) |
-| `last_verdict == needs-fix` AND `iteration + 1 >= max_iterations` | `human_escalation` |
-| `termination_reason != null` | loop already terminated — no action |
+| `last_verdict == approve` | `proceed_to_step_4_5`（child/follow-up materialization） |
+| `last_verdict == needs-fix` かつ `iteration + 1 < max_iterations` | `continue_to_step_4`（rewrite） |
+| `last_verdict == needs-fix` かつ `iteration + 1 >= max_iterations` | `human_escalation` |
+| `termination_reason != null` | loop はすでに終了 — アクションなし |
 
-### termination_reason values
+### termination_reason の値
 
 | value | meaning |
 |---|---|
-| `approved` | Review issued `approve` verdict |
-| `human_escalation` | `max_iterations` exceeded or hard stop signal |
-| `superseded_by_decision` | Human anchor comment superseded the loop |
-| `null` | Loop not yet terminated |
+| `approved` | review が `approve` 判定を出した |
+| `human_escalation` | `max_iterations` 超過、または hard stop シグナル |
+| `superseded_by_decision` | 人間の anchor comment が loop を supersede した |
+| `null` | loop はまだ終了していない |
 
-### scope_rollup_decision
+### scope_rollup_decision（rollup 判断）
 
-Set at Step 0 (before any iteration). If non-null, the orchestrator records the rollup decision but does not stop — the planner may still proceed if rollup is advisory.
+Step 0（イテレーション開始前）で設定される。非 null の場合、orchestrator は rollup 判断を記録するが停止しない — rollup が advisory であれば planner は処理を継続してよい。
 
-### scope_signal_guard
+### scope_signal_guard（scope 変更シグナル）
 
 | field | meaning |
 |---|---|
-| `triggered` | A scope change signal was detected |
-| `excluded_by_anchor_reframe` | The signal was excluded by an anchor comment reframe |
-| `reason_code` | Detailed reason code from planner |
+| `triggered` | scope 変更シグナルが検出された |
+| `excluded_by_anchor_reframe` | シグナルが anchor comment reframe により除外された |
+| `reason_code` | planner からの詳細な理由コード |
 
-`scope_signal_guard.triggered` is **phase-sensitive**. Its meaning depends on the current
-`ISSUE_REFINEMENT_PHASE_STATE_V1.scope_signal_semantics.triggered_meaning`:
+`scope_signal_guard.triggered` は **phase-sensitive** である。その意味は現在の
+`ISSUE_REFINEMENT_PHASE_STATE_V1.scope_signal_semantics.triggered_meaning` に依存する。
 
 | phase | triggered_meaning | hard_stop_eligible | effect |
 |---|---|---|---|
-| `preflight` | `continue_investigation` | false | Signal seen during preflight → proceed to investigation/review; do NOT call `decide_next_loop_action.py` |
-| `investigation` | `continue_investigation` | false | Signal seen during investigation → continue; not a hard stop |
-| `review` | `continue_investigation` | false | Pre-rewrite phase; do NOT call `decide_next_loop_action.py`; route directly based on VERDICT |
-| `post_rewrite_check` | `hard_stop_candidate` | true | Signal in post-rewrite → `human_escalation` |
-| `decide_next_action` | `hard_stop_candidate` | true | Signal in routing phase → `human_escalation` |
-| `rewrite` | `ignored` | false | Signal during rewrite → ignored |
-| `publish` / `terminate` | `ignored` | false | Signal during publish/terminate → ignored |
+| `preflight` | `continue_investigation` | false | preflight 中のシグナル → investigation/review へ進む。`decide_next_loop_action.py` を呼ばない |
+| `investigation` | `continue_investigation` | false | investigation 中のシグナル → 継続。hard stop ではない |
+| `review` | `continue_investigation` | false | rewrite 前 phase。`decide_next_loop_action.py` を呼ばず、VERDICT に基づき直接ルーティングする |
+| `post_rewrite_check` | `hard_stop_candidate` | true | rewrite 後のシグナル → `human_escalation` |
+| `decide_next_action` | `hard_stop_candidate` | true | routing phase 中のシグナル → `human_escalation` |
+| `rewrite` | `ignored` | false | rewrite 中のシグナル → 無視 |
+| `publish` / `terminate` | `ignored` | false | publish/terminate 中のシグナル → 無視 |
 
-**Phase contract**: `LOOP_STATE_V1` does NOT contain a `phase` field. Phase is tracked separately
-via `ISSUE_REFINEMENT_PHASE_STATE_V1` (generated by `build_refinement_phase_state.py`).
+**Phase contract**: `LOOP_STATE_V1` は `phase` フィールドを持たない。phase は
+`ISSUE_REFINEMENT_PHASE_STATE_V1`（`build_refinement_phase_state.py` が生成）で別途追跡される。
 
-When `triggered == true` AND `excluded_by_anchor_reframe == false` AND
-`hard_stop_eligible == true` (i.e., phase is `post_rewrite_check` or `decide_next_action`),
-the loop stops with `human_escalation`. The `review` phase is explicitly not
-hard-stop eligible; route it directly by `VERDICT` without invoking
-`decide_next_loop_action.py`. See `references/scope-signal-guard.md` for signal
-taxonomy and phase-gate rules.
+`triggered == true` かつ `excluded_by_anchor_reframe == false` かつ
+`hard_stop_eligible == true`（つまり phase が `post_rewrite_check` または `decide_next_action`）の場合、
+loop は `human_escalation` で停止する。`review` phase は明示的に hard-stop の対象外であり、
+`decide_next_loop_action.py` を呼ばずに `VERDICT` に基づき直接ルーティングする。シグナルの分類と
+phase-gate ルールについては `references/scope-signal-guard.md` を参照。
 
-### delivery_rollup
+### delivery_rollup（配送 rollup）
 
 | field | meaning |
 |---|---|
-| `applicable` | This is a delivery-rollup parent issue |
-| `unmaterialized_slots` | Child issue slots not yet created |
+| `applicable` | 本 Issue が delivery-rollup parent issue である |
+| `unmaterialized_slots` | まだ作成されていない child issue slot |
 
-If `applicable == true` AND `unmaterialized_slots` is non-empty, the orchestrator performs child materialization in Step 4.5 before terminating.
+`applicable == true` かつ `unmaterialized_slots` が非空の場合、orchestrator は Step 4.5 で
+終了前に child materialization を行う。
 
-### follow_up_materialization
+### follow_up_materialization（follow-up 具体化）
 
-`candidates` is a list of follow-up issue proposals. Dedupe uses `dedupe_key` (not title). Candidates are materialized in Step 4.5 after approval.
+`candidates` は follow-up issue 提案のリストである。重複排除は `dedupe_key`（title ではない）を使う。
+候補は承認後に Step 4.5 で materialize される。
 
-### superseded_decision
+### superseded_decision（supersede 判断）
 
-If a human anchor comment supersedes the loop (e.g., closes the issue as won't fix, or redirects to an alternative), `superseded_decision` captures the summary. The loop terminates with `termination_reason: superseded_by_decision`.
+人間の anchor comment が loop を supersede した場合（例: Issue を won't fix としてクローズ、または
+代替案へリダイレクト）、`superseded_decision` がその要約を保持する。loop は
+`termination_reason: superseded_by_decision` で終了する。
 
-## Next Action Script
+## 次アクション決定スクリプト（Next Action Script）
 
-Use `decide_next_loop_action.py` to compute the next action from the current LOOP_STATE.
-**Phase gate**: always pass `--phase-state-file` in phases where routing is permitted.
-In `preflight` and `investigation` phases, do NOT call `decide_next_loop_action.py`.
+現在の LOOP_STATE から次のアクションを計算するには `decide_next_loop_action.py` を使う。
+**Phase gate**: routing が許可されている phase では常に `--phase-state-file` を渡すこと。
+`preflight` と `investigation` の phase では `decide_next_loop_action.py` を呼ばないこと。
 
-**Registry id**: `decide.run` (ISSUE_REFINEMENT_COMMAND_REGISTRY_V1)
+**Registry id（レジストリID）**: `decide.run` (ISSUE_REFINEMENT_COMMAND_REGISTRY_V1)
 
 ```json
 {"id":"decide.run","argv":["uv","run","python3",".claude/skills/issue-refinement-loop/scripts/decide_next_loop_action.py","--loop-state-file","<path>","--review-result-verdict","<verdict>","--max-iterations","<N>","--phase-state-file","<phase_path>"],"shell":false,"cwd_policy":"repo_root"}
 ```
 
 Exit codes:
-- `0`: pass — `NEXT_ACTION` is actionable
-- `1`: warn — `NEXT_ACTION` is actionable but has notes
-- `2`: human_escalation — stop and report
-- `3`: inconsistent_state — state file is corrupt or contradictory
+- `0`: pass — `NEXT_ACTION` は実行可能
+- `1`: warn — `NEXT_ACTION` は実行可能だが notes あり
+- `2`: human_escalation — 停止して報告
+- `3`: inconsistent_state — state file が壊れているか矛盾している
 
-Priority: `inconsistent_state (3)` > `human_escalation (2)` > `warn (1)` > `pass (0)`.
+優先順位: `inconsistent_state (3)` > `human_escalation (2)` > `warn (1)` > `pass (0)`。
 
-## Phase State Generation
+## Phase State の生成
 
-Use `build_refinement_phase_state.py` to generate `ISSUE_REFINEMENT_PHASE_STATE_V1`:
+`ISSUE_REFINEMENT_PHASE_STATE_V1` を生成するには `build_refinement_phase_state.py` を使う。
 
-**Registry id**: `phase_state.build` (ISSUE_REFINEMENT_COMMAND_REGISTRY_V1)
+**Registry id（レジストリID）**: `phase_state.build` (ISSUE_REFINEMENT_COMMAND_REGISTRY_V1)
 
 ```json
 {"id":"phase_state.build","argv":["uv","run","python3",".claude/skills/issue-refinement-loop/scripts/build_refinement_phase_state.py","--phase","<phase_name>","--source-kind","<kind>","--source-path","<artifact_path>","--output-path","<output_path>"],"shell":false,"cwd_policy":"repo_root"}
 ```
 
-The generated `ISSUE_REFINEMENT_PHASE_STATE_V1` contains `scope_signal_semantics.hard_stop_eligible`
-which determines whether `scope_signal_guard.triggered` is a hard stop in the current phase.
+生成された `ISSUE_REFINEMENT_PHASE_STATE_V1` は `scope_signal_semantics.hard_stop_eligible` を含み、
+これが現在の phase で `scope_signal_guard.triggered` が hard stop になるかどうかを決定する。
 
 
-## scope_signal_guard_decision_v2（build_loop_state.py の envelope pass-through, #1090）
+## scope_signal_guard_decision_v2（build_loop_state.py の envelope pass-through 拡張フィールド, #1090）
 
 `build_loop_state.py` は `plan['scope_signal_guard_decision_v2']`（#1090, opt-in。
 `references/scope-signal-guard.md` 参照）が存在する場合、それをそのまま
