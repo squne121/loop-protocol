@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,45 @@ SMOKE_TIMEOUT_SECONDS = 20
 NONINTERACTIVE_FLAGS = ["-p", "--print", "--prompt"]
 UNEXPECTED_CAPABILITY_KEYWORDS = ["chat", "--output-format"]
 SMOKE_SAMPLE_MAX_CHARS = 500
+LOCAL_ASSET_SERENA_TOOL_POLICY = "exact_match"
+SERENA_TOOL_MANIFEST_RELATIVE_PATH = Path(
+    ".claude/skills/gemini-cli-headless-delegation/references/serena-tool-manifest.json"
+)
+AGY_MCP_CONFIG_RELATIVE_PATH = Path(".agents/mcp_config.json")
+SERENA_READ_ONLY_TOOLS = frozenset({
+    "find_file",
+    "find_referencing_symbols",
+    "find_symbol",
+    "get_symbols_overview",
+    "list_dir",
+    "search_for_pattern",
+})
+SERENA_DANGEROUS_TOOLS = frozenset({
+    "activate_project",
+    "create_text_file",
+    "execute_shell_command",
+    "find_declaration",
+    "find_implementations",
+    "get_current_config",
+    "get_diagnostics_for_file",
+    "initial_instructions",
+    "insert_after_symbol",
+    "insert_before_symbol",
+    "list_memories",
+    "onboarding",
+    "read_file",
+    "read_memory",
+    "replace_content",
+    "replace_in_files",
+    "replace_symbol_body",
+    "rename_symbol",
+    "safe_delete_symbol",
+    "delete_memory",
+    "edit_memory",
+    "rename_memory",
+    "write_memory",
+})
+SERENA_KNOWN_TOOLS = frozenset(SERENA_READ_ONLY_TOOLS | SERENA_DANGEROUS_TOOLS)
 SECRET_ENV_KEYS = (
     "AGY_API_KEY",
     "GEMINI_API_KEY",
@@ -35,6 +75,343 @@ FLAG_PATTERNS: dict[str, re.Pattern[str]] = {
     "--print": re.compile(r"(?<![\w-])--print(?![\w-])"),
     "--prompt": re.compile(r"(?<![\w-])--prompt(?![\w-])"),
 }
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[4]
+
+
+def _load_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def load_serena_tool_manifest(repo_root: Path | None = None) -> dict[str, Any]:
+    root = repo_root or _repo_root()
+    manifest = _load_json(root / SERENA_TOOL_MANIFEST_RELATIVE_PATH)
+    if not isinstance(manifest, dict):
+        raise ValueError("serena manifest must be a JSON object")
+    if manifest.get("schema") != "serena_tool_manifest_v1":
+        raise ValueError("serena manifest schema must equal serena_tool_manifest_v1")
+    for key in ("pinned_ref", "read_only_allowlist", "dangerous_denylist", "known_tools"):
+        value = manifest.get(key)
+        if key == "pinned_ref":
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("serena manifest pinned_ref must be a non-empty string")
+            continue
+        if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+            raise ValueError(f"serena manifest {key} must be a list of non-empty strings")
+    return manifest
+
+
+def _load_serena_server_config(repo_root: Path, mcp_config_path: Path | None = None) -> dict[str, Any]:
+    config_path = mcp_config_path or repo_root / AGY_MCP_CONFIG_RELATIVE_PATH
+    config = _load_json(config_path)
+    if not isinstance(config, dict):
+        raise ValueError(f"{config_path} must contain a JSON object")
+    servers = config.get("mcpServers")
+    if not isinstance(servers, dict):
+        raise ValueError(f"{config_path} must contain mcpServers")
+    serena = servers.get("serena")
+    if not isinstance(serena, dict):
+        raise ValueError(f"{config_path} must contain mcpServers.serena")
+    return serena
+
+
+def _validate_serena_server_config(
+    serena: dict[str, Any],
+    manifest: dict[str, Any],
+    *,
+    source_label: str,
+) -> list[str]:
+    errors: list[str] = []
+    expected_read_only = set(manifest["read_only_allowlist"])
+    expected_dangerous = set(manifest["dangerous_denylist"])
+    known_tools = set(manifest["known_tools"])
+    pinned_ref = str(manifest["pinned_ref"])
+    expected_source = f"git+https://github.com/oraios/serena@{pinned_ref}"
+
+    command = serena.get("command")
+    args = serena.get("args")
+    if command != "uvx" or not isinstance(args, list) or "serena" not in args or "--project-from-cwd" not in args:
+        errors.append(
+            f"local_asset_research requires {source_label} Serena command: "
+            "uvx ... serena ... --project-from-cwd"
+        )
+    elif expected_source not in args and not any(
+        arg == f"serena=={pinned_ref}" for arg in args if isinstance(arg, str)
+    ):
+        errors.append(
+            f"local_asset_research pinned_serena_manifest_mismatch: {source_label} args must match manifest pinned_ref"
+        )
+
+    if serena.get("trust", False) is not False:
+        errors.append(f"local_asset_research requires {source_label}.trust to be false")
+
+    include_tools = serena.get("includeTools")
+    if not isinstance(include_tools, list) or not include_tools:
+        errors.append(f"local_asset_research requires {source_label}.includeTools read-only allowlist")
+    elif not all(isinstance(tool, str) for tool in include_tools):
+        errors.append(f"local_asset_research requires {source_label}.includeTools to contain only strings")
+    else:
+        include_set = set(include_tools)
+        unknown_tools = sorted(include_set - known_tools)
+        if unknown_tools:
+            errors.append(
+                f"local_asset_research unknown_tool_policy({LOCAL_ASSET_SERENA_TOOL_POLICY}) failed: "
+                f"unknown tools in {source_label}.includeTools: {', '.join(unknown_tools)}"
+            )
+        if include_set != expected_read_only:
+            missing = sorted(expected_read_only - include_set)
+            unexpected = sorted(include_set - expected_read_only)
+            if missing:
+                errors.append(f"local_asset_research read-only includeTools is incomplete: {', '.join(missing)}")
+            if unexpected:
+                errors.append(
+                    f"local_asset_research has unverified MCP tools in includeTools: {', '.join(unexpected)}"
+                )
+
+    exclude_tools = serena.get("excludeTools", [])
+    if not isinstance(exclude_tools, list):
+        errors.append(f"local_asset_research requires {source_label}.excludeTools to be a list when present")
+    elif not expected_dangerous.issubset(set(exclude_tools)):
+        missing_excludes = sorted(expected_dangerous - set(exclude_tools))
+        errors.append(f"local_asset_research dangerous tool denylist is incomplete: {', '.join(missing_excludes)}")
+
+    return errors
+
+
+def _validate_local_asset_serena_contract(
+    repo_root: Path | None = None,
+    mcp_config_path: Path | None = None,
+) -> list[str]:
+    root = repo_root or _repo_root()
+    settings_path = root / ".gemini" / "settings.json"
+    errors: list[str] = []
+    try:
+        manifest = load_serena_tool_manifest(root)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as exc:
+        return [f"local_asset_research serena manifest validation failed: {exc}"]
+
+    try:
+        settings = _load_json(settings_path)
+    except FileNotFoundError:
+        return [f"local_asset_research requires {settings_path}"]
+    except json.JSONDecodeError as exc:
+        return [f"local_asset_research requires valid JSON in {settings_path}: {exc}"]
+    if not isinstance(settings, dict):
+        return [f"local_asset_research requires {settings_path} to contain a JSON object"]
+
+    mcp = settings.get("mcp")
+    allowed = mcp.get("allowed") if isinstance(mcp, dict) else None
+    if allowed != ["serena"]:
+        errors.append("local_asset_research requires .gemini/settings.json mcp.allowed to equal ['serena']")
+
+    servers = settings.get("mcpServers")
+    if not isinstance(servers, dict):
+        errors.append("local_asset_research requires .gemini/settings.json mcpServers")
+        return errors
+
+    serena = servers.get("serena")
+    if not isinstance(serena, dict):
+        errors.append("local_asset_research requires .gemini/settings.json mcpServers.serena")
+        return errors
+
+    errors.extend(_validate_serena_server_config(serena, manifest, source_label=".gemini/settings.json"))
+    try:
+        agy_serena = _load_serena_server_config(root, mcp_config_path)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as exc:
+        errors.append(f"local_asset_research requires AGY MCP config .agents/mcp_config.json: {exc}")
+        return errors
+    errors.extend(_validate_serena_server_config(agy_serena, manifest, source_label=".agents/mcp_config.json"))
+
+    return errors
+
+
+def _safe_json_size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+
+
+def _call_serena_mcp_live(
+    repo_root: Path,
+    manifest: dict[str, Any],
+    mcp_config_path: Path | None = None,
+    *,
+    timeout_sec: float = 180.0,
+) -> dict[str, Any]:
+    serena = _load_serena_server_config(repo_root, mcp_config_path)
+    command = [str(serena["command"]), *[str(arg) for arg in serena["args"]]]
+    transcript: list[dict[str, Any]] = []
+    called_tools: list[str] = []
+    tools_seen: list[str] = []
+
+    def event(payload: dict[str, Any]) -> None:
+        transcript.append(payload)
+
+    event({
+        "event": "mcp_server_launch",
+        "server": "serena",
+        "transport": "stdio",
+        "command_sha256": hashlib.sha256("\0".join(command).encode("utf-8")).hexdigest(),
+        "pinned_ref": manifest["pinned_ref"],
+        "cwd_kind": "repo_root",
+        "config_path": ".agents/mcp_config.json",
+    })
+
+    process = subprocess.Popen(
+        command,
+        cwd=str(repo_root),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        shell=False,
+        env=_minimal_agy_env(),
+        bufsize=1,
+    )
+
+    next_id = 1
+
+    def send(payload: dict[str, Any]) -> None:
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        process.stdin.flush()
+        if "id" in payload:
+            event({
+                "event": "mcp_request",
+                "id": payload["id"],
+                "method": payload.get("method"),
+                "params": payload.get("params", {}),
+            })
+        else:
+            event({"event": "mcp_notification", "method": payload.get("method")})
+
+    def recv(expected_id: int) -> dict[str, Any]:
+        assert process.stdout is not None
+        import select
+        import time
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            ready, _, _ = select.select([process.stdout], [], [], 0.2)
+            if not ready:
+                if process.poll() is not None:
+                    raise RuntimeError("serena MCP server exited before response")
+                continue
+            line = process.stdout.readline()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("id") != expected_id:
+                continue
+            result = message.get("result")
+            event({
+                "event": "mcp_response",
+                "id": expected_id,
+                "result_sha256": hashlib.sha256(json.dumps(result, sort_keys=True).encode("utf-8")).hexdigest(),
+                "bounded_result_sample": _redact_output_sample(json.dumps(result, ensure_ascii=False)[:500]),
+            })
+            return message
+        raise TimeoutError(f"timed out waiting for MCP response id {expected_id}")
+
+    try:
+        initialize_id = next_id
+        next_id += 1
+        send({
+            "jsonrpc": "2.0",
+            "id": initialize_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "loop-protocol-preflight", "version": "1"},
+            },
+        })
+        initialize_response = recv(initialize_id)
+        send({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+
+        tools_id = next_id
+        next_id += 1
+        send({"jsonrpc": "2.0", "id": tools_id, "method": "tools/list", "params": {}})
+        tools_response = recv(tools_id)
+        tools = ((tools_response.get("result") or {}).get("tools") or [])
+        tools_seen = sorted(
+            tool.get("name")
+            for tool in tools
+            if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+        )
+
+        missing = sorted(set(manifest["read_only_allowlist"]) - set(tools_seen))
+        if missing:
+            raise RuntimeError(f"Serena tools/list missing required tools: {', '.join(missing)}")
+        manifest_known = sorted(manifest.get("known_tools") or [])
+        if tools_seen != manifest_known:
+            missing_from_manifest = sorted(set(tools_seen) - set(manifest_known))
+            stale_manifest_tools = sorted(set(manifest_known) - set(tools_seen))
+            raise RuntimeError(
+                "Serena tools/list manifest drift: "
+                f"missing_from_manifest={missing_from_manifest}; "
+                f"stale_manifest_tools={stale_manifest_tools}"
+            )
+
+        calls = [
+            ("find_file", {"relative_path": ".", "file_mask": "run_gemini_headless.py"}),
+            (
+                "search_for_pattern",
+                {
+                    "relative_path": ".claude/skills/gemini-cli-headless-delegation/scripts",
+                    "substring_pattern": "_validate_agy_local_asset_request",
+                },
+            ),
+            (
+                "get_symbols_overview",
+                {"relative_path": ".claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py"},
+            ),
+        ]
+        evidence_count = 0
+        for tool_name, arguments in calls:
+            call_id = next_id
+            next_id += 1
+            send({
+                "jsonrpc": "2.0",
+                "id": call_id,
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": arguments},
+            })
+            response = recv(call_id)
+            called_tools.append(tool_name)
+            result = response.get("result")
+            result_text = json.dumps(result, ensure_ascii=False, sort_keys=True)
+            event({
+                "event": "evidence_envelope_created",
+                "source_kind": "serena_mcp_read_only_evidence",
+                "tool_name": tool_name,
+                "response_sha256": hashlib.sha256(result_text.encode("utf-8")).hexdigest(),
+                "repo_relative_path": arguments.get("relative_path", "."),
+                "byte_size": _safe_json_size(result),
+            })
+            evidence_count += 1
+
+        return {
+            "ok": True,
+            "transport": "stdio",
+            "pinned_ref": manifest["pinned_ref"],
+            "server_started": True,
+            "initialized": bool(initialize_response.get("result")),
+            "tools_list_checked": True,
+            "tools_seen": tools_seen,
+            "called_tools": called_tools,
+            "evidence_envelope_count": evidence_count,
+            "transcript": transcript,
+        }
+    finally:
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except Exception:
+            process.kill()
 
 
 def _minimal_agy_env() -> dict[str, str]:
@@ -180,7 +557,12 @@ def _run_smoke(agy_bin: str) -> dict[str, Any]:
     return smoke
 
 
-def run_preflight() -> dict[str, Any]:
+def run_preflight(
+    *,
+    validate_local_asset_contract: bool = False,
+    live_serena: bool = False,
+    mcp_config_path: Path | None = None,
+) -> dict[str, Any]:
     """Run version → help → smoke checks for agy binary.
 
     Returns an agy_preflight_result/v1 dict.
@@ -303,6 +685,44 @@ def run_preflight() -> dict[str, Any]:
         result["recovery_action"] = "check agy configuration and rerun preflight"
         return result
 
+    if validate_local_asset_contract:
+        repo_root = _repo_root()
+        manifest: dict[str, Any] | None = None
+        try:
+            manifest = load_serena_tool_manifest(repo_root)
+        except (FileNotFoundError, json.JSONDecodeError, ValueError) as exc:
+            manifest = None
+            contract_errors = [f"local_asset_research serena manifest validation failed: {exc}"]
+        else:
+            contract_errors = _validate_local_asset_serena_contract(repo_root, mcp_config_path)
+        local_asset_result = {
+            "ok": not contract_errors,
+            "errors": contract_errors,
+            "unknown_tool_policy": LOCAL_ASSET_SERENA_TOOL_POLICY,
+            "config_path": str((mcp_config_path or AGY_MCP_CONFIG_RELATIVE_PATH).as_posix()),
+        }
+        if live_serena and not contract_errors and manifest is not None:
+            try:
+                serena_result = _call_serena_mcp_live(repo_root, manifest, mcp_config_path)
+                local_asset_result["serena"] = {
+                    key: value for key, value in serena_result.items() if key != "transcript"
+                }
+                local_asset_result["live_transcript"] = serena_result["transcript"]
+            except Exception as exc:
+                local_asset_result["ok"] = False
+                local_asset_result["errors"] = [f"local_asset_research live_serena_probe_failed: {exc}"]
+        if local_asset_result["ok"]:
+            local_asset_result["status"] = "ok"
+        else:
+            result["failure_reason"] = local_asset_result["errors"][0]
+            result["failure_class"] = "local_asset_contract_invalid"
+            result["recovery_action"] = "fix .agents/mcp_config.json Serena contract for local_asset_research"
+        result["local_asset_research"] = local_asset_result
+
+    if result.get("local_asset_research") is not None and not result["local_asset_research"]["ok"]:
+        result["ok"] = False
+        return result
+
     result["ok"] = True
     return result
 
@@ -323,6 +743,27 @@ def main(argv: list[str] | None = None) -> int:
         help="Print the preflight result JSON to stdout.",
     )
     parser.add_argument(
+        "--local-asset-research",
+        action="store_true",
+        dest="local_asset_research",
+        default=False,
+        help="Also validate local_asset_research Serena tool contract.",
+    )
+    parser.add_argument(
+        "--mcp-config",
+        required=False,
+        type=Path,
+        default=None,
+        help="AGY project MCP config path. Defaults to .agents/mcp_config.json.",
+    )
+    parser.add_argument(
+        "--live-serena",
+        action="store_true",
+        dest="live_serena",
+        default=False,
+        help="Launch the pinned Serena MCP server and run live read-only tool calls.",
+    )
+    parser.add_argument(
         "--output-file",
         required=False,
         type=Path,
@@ -331,7 +772,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    result = run_preflight()
+    result = run_preflight(
+        validate_local_asset_contract=args.local_asset_research,
+        live_serena=args.live_serena,
+        mcp_config_path=args.mcp_config,
+    )
 
     if args.json_stdout:
         print(json.dumps(result, ensure_ascii=False, indent=2))

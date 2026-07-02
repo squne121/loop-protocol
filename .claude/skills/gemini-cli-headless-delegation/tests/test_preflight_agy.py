@@ -6,6 +6,7 @@ importlib-based module load + monkeypatch / subprocess mock.
 
 from __future__ import annotations
 
+import json
 import importlib.util
 import subprocess
 from pathlib import Path
@@ -44,6 +45,74 @@ def _make_happy_run(module):
         raise AssertionError(f"unexpected command: {argv}")
 
     return fake_run
+
+
+def _write_settings(
+    root: Path,
+    *,
+    include_tools: list[str],
+    exclude_tools: list[str] | None = None,
+    pinned: bool = True,
+) -> None:
+    serena_source = (
+        "git+https://github.com/oraios/serena@0123456789abcdef"
+        if pinned
+        else "git+https://github.com/oraios/serena"
+    )
+    settings_dir = root / ".gemini"
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    settings = {
+        "mcp": {
+            "allowed": ["serena"],
+        },
+        "mcpServers": {
+            "serena": {
+                "command": "uvx",
+                "args": ["--from", serena_source, "serena", "start-mcp-server", "--project-from-cwd"],
+                "trust": False,
+                "includeTools": include_tools,
+                "excludeTools": exclude_tools or [],
+            },
+        },
+    }
+    (settings_dir / "settings.json").write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    agents_dir = root / ".agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    agy_mcp_config = {"mcpServers": settings["mcpServers"]}
+    (agents_dir / "mcp_config.json").write_text(
+        json.dumps(agy_mcp_config, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _write_manifest(
+    module,
+    root: Path,
+    *,
+    pinned_ref: str = "0123456789abcdef",
+    known_tools: list[str] | None = None,
+) -> None:
+    path = root / module.SERENA_TOOL_MANIFEST_RELATIVE_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "schema": "serena_tool_manifest_v1",
+        "source": "https://github.com/oraios/serena",
+        "pinned_ref": pinned_ref,
+        "generated_at_utc": "2026-07-02T00:00:00Z",
+        "mcp_command": [
+            "uvx",
+            "--from",
+            f"git+https://github.com/oraios/serena@{pinned_ref}",
+            "serena",
+        "start-mcp-server",
+        "--project-from-cwd",
+        ],
+        "read_only_allowlist": sorted(module.SERENA_READ_ONLY_TOOLS),
+        "dangerous_denylist": sorted(module.SERENA_DANGEROUS_TOOLS),
+        "known_tools": known_tools or sorted(module.SERENA_READ_ONLY_TOOLS | module.SERENA_DANGEROUS_TOOLS),
+        "notes": [],
+    }
+    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -468,3 +537,144 @@ def test_resolved_path_is_masked(monkeypatch):
 
     assert module._mask_resolved_path("/home/tester/bin/agy") == "$HOME/bin/agy"
     assert module._mask_resolved_path("/usr/local/bin/agy") == "agy"
+
+
+def test_local_asset_research_contract_validation_success(monkeypatch, tmp_path):
+    """--local-asset-research succeeds when Serena contract is valid."""
+    module = load_module()
+    monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)  # type: ignore[call-arg]
+    _write_manifest(module, tmp_path)
+    _write_settings(
+        tmp_path,
+        include_tools=sorted(module.SERENA_READ_ONLY_TOOLS),
+        exclude_tools=sorted(module.SERENA_DANGEROUS_TOOLS),
+    )
+
+    monkeypatch.setattr(module, "_run", _make_happy_run(module))
+    result = module.run_preflight(validate_local_asset_contract=True)
+
+    assert result["ok"] is True
+    assert result["local_asset_research"]["ok"] is True
+    assert result["local_asset_research"]["status"] == "ok"
+    assert result["local_asset_research"]["unknown_tool_policy"] == module.LOCAL_ASSET_SERENA_TOOL_POLICY
+    assert result["local_asset_research"]["config_path"] == ".agents/mcp_config.json"
+
+
+def test_local_asset_research_live_serena_result_surface(monkeypatch, tmp_path):
+    """AC10: --live-serena returns called tools, transcript, and evidence count."""
+    module = load_module()
+    monkeypatch.chdir(tmp_path)
+    _write_manifest(module, tmp_path)
+    _write_settings(
+        tmp_path,
+        include_tools=sorted(module.SERENA_READ_ONLY_TOOLS),
+        exclude_tools=sorted(module.SERENA_DANGEROUS_TOOLS),
+    )
+    monkeypatch.setattr(module, "_run", _make_happy_run(module))
+
+    def fake_live(repo_root, manifest, mcp_config_path=None, timeout_sec=60.0):
+        return {
+            "ok": True,
+            "transport": "mcp_stdio",
+            "server_started": True,
+            "initialized": True,
+            "tools_list_checked": True,
+            "tools_seen": ["find_file", "search_for_pattern", "get_symbols_overview"],
+            "called_tools": ["find_file", "search_for_pattern", "get_symbols_overview"],
+            "evidence_envelope_count": 3,
+            "transcript": [
+                {"event": "mcp_server_launch"},
+                {"event": "mcp_response", "method": "tools/list"},
+                {"event": "evidence_envelope_created", "tool_name": "find_file"},
+            ],
+        }
+
+    monkeypatch.setattr(module, "_call_serena_mcp_live", fake_live)
+    result = module.run_preflight(validate_local_asset_contract=True, live_serena=True)
+
+    assert result["ok"] is True
+    assert result["local_asset_research"]["serena"]["called_tools"] == [
+        "find_file",
+        "search_for_pattern",
+        "get_symbols_overview",
+    ]
+    assert result["local_asset_research"]["serena"]["evidence_envelope_count"] == 3
+    assert result["local_asset_research"]["live_transcript"][0]["event"] == "mcp_server_launch"
+
+
+def test_local_asset_research_contract_validation_rejects_unknown_tool(monkeypatch, tmp_path):
+    """--local-asset-research rejects unknown tools / drift in Serena allowlist."""
+    module = load_module()
+    monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)  # type: ignore[call-arg]
+    _write_manifest(module, tmp_path)
+    _write_settings(
+        tmp_path,
+        include_tools=["find_file", "find_referencing_symbols", "unknown_serena_tool"],
+        exclude_tools=sorted(module.SERENA_DANGEROUS_TOOLS),
+    )
+
+    monkeypatch.setattr(module, "_run", _make_happy_run(module))
+    result = module.run_preflight(validate_local_asset_contract=True)
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "local_asset_contract_invalid"
+    assert result["local_asset_research"]["ok"] is False
+    assert any("unknown_tool_policy" in item for item in result["local_asset_research"]["errors"])
+
+
+def test_local_asset_research_contract_validation_rejects_unpinned_serena(monkeypatch, tmp_path):
+    """--local-asset-research rejects an unpinned Serena source."""
+    module = load_module()
+    monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)  # type: ignore[call-arg]
+    _write_manifest(module, tmp_path)
+    _write_settings(
+        tmp_path,
+        include_tools=sorted(module.SERENA_READ_ONLY_TOOLS),
+        exclude_tools=sorted(module.SERENA_DANGEROUS_TOOLS),
+        pinned=False,
+    )
+
+    monkeypatch.setattr(module, "_run", _make_happy_run(module))
+    result = module.run_preflight(validate_local_asset_contract=True)
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "local_asset_contract_invalid"
+    assert any("pinned_serena_manifest_mismatch" in item for item in result["local_asset_research"]["errors"])
+
+
+def test_local_asset_research_contract_validation_rejects_manifest_settings_mismatch(monkeypatch, tmp_path):
+    """--local-asset-research rejects a manifest/settings pinned_ref mismatch."""
+    module = load_module()
+    monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)  # type: ignore[call-arg]
+    _write_manifest(module, tmp_path, pinned_ref="abcdef0123456789")
+    _write_settings(
+        tmp_path,
+        include_tools=sorted(module.SERENA_READ_ONLY_TOOLS),
+        exclude_tools=sorted(module.SERENA_DANGEROUS_TOOLS),
+        pinned=True,
+    )
+
+    monkeypatch.setattr(module, "_run", _make_happy_run(module))
+    result = module.run_preflight(validate_local_asset_contract=True)
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "local_asset_contract_invalid"
+    assert any("pinned_serena_manifest_mismatch" in item for item in result["local_asset_research"]["errors"])
+
+
+def test_local_asset_research_contract_validation_rejects_missing_manifest(monkeypatch, tmp_path):
+    """--local-asset-research requires the checked-in Serena manifest."""
+    module = load_module()
+    monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)  # type: ignore[call-arg]
+    _write_settings(
+        tmp_path,
+        include_tools=sorted(module.SERENA_READ_ONLY_TOOLS),
+        exclude_tools=sorted(module.SERENA_DANGEROUS_TOOLS),
+    )
+
+    monkeypatch.setattr(module, "_run", _make_happy_run(module))
+    result = module.run_preflight(validate_local_asset_contract=True)
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "local_asset_contract_invalid"
+    assert any("serena manifest validation failed" in item for item in result["local_asset_research"]["errors"])
