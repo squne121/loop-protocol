@@ -11,8 +11,8 @@
     "observation_sources": [
       {
         "schema_version": "observation_source_result/v1",
-        "source_kind": "claude_code",
-        "capability_verdict": "unverified",
+        "source_kind": "google_antigravity",
+        "capability_verdict": "unsupported",
         "availability": "unavailable",
         "projection_mode": "not_projected",
         "safety": {
@@ -21,7 +21,7 @@
           "forbidden_field_scan": "pass",
           "reason_codes": [
             "source_unavailable",
-            "synthetic_only_evidence"
+            "partial_projection"
           ]
         },
         "metrics": {
@@ -40,12 +40,12 @@
             "workflow_run_url": null,
             "schema_ref": null,
             "ref": null,
-            "digest": "sha256:c2d65836dfa49fd0e22e22fecaf0a6320ac5b0ce76e7dfedb959fb1f23252fe8",
+            "digest": "sha256:2ba4362f34f7e7c8fbdb336cfef6ee0da15e64cd4e84dd7f069a126df5229192",
             "validation_verdict": "pass"
           },
-          "source_projection_digest": "sha256:c2d65836dfa49fd0e22e22fecaf0a6320ac5b0ce76e7dfedb959fb1f23252fe8",
+          "source_projection_digest": "sha256:2ba4362f34f7e7c8fbdb336cfef6ee0da15e64cd4e84dd7f069a126df5229192",
           "validator_id": "agent-run-report-schema",
-          "validator_policy_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "validator_policy_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
           "evidence_mode": "synthetic_only",
           "checked_at": "2026-06-29T12:00:00Z"
         }
@@ -87,7 +87,7 @@
       "command_label": "pnpm test",
       "exit_code": 0,
       "verdict": "pass",
-      "summary": "unverified observation source remains a valid unavailable signal",
+      "summary": "unsupported observation source must not carry partial_projection",
       "artifact_ref": null
     }
   ],

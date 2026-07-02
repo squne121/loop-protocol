@@ -214,6 +214,24 @@ describe('generated agent run report', () => {
     expect(() => validateFinalReport(report)).toThrow(/raw_values_emitted must be false/)
   })
 
+  it('GIVEN a generated report with regex-valid but unknown observation reason code WHEN validateFinalReport is called THEN it fails closed with a reason-code error', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'invalid-public-observation-source-reason-code-promptlike.json'))
+
+    expect(() => validateFinalReport(report)).toThrow(/allowed observation source reason code/i)
+  })
+
+  it('GIVEN a generated report with unavailable observation source missing source_unavailable WHEN validateFinalReport is called THEN it fails closed', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'invalid-public-observation-source-reason-code-unavailable-missing.json'))
+
+    expect(() => validateFinalReport(report)).toThrow(/must include source_unavailable/i)
+  })
+
+  it('GIVEN a generated report with partial available observation source missing partial_projection WHEN validateFinalReport is called THEN it fails closed', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'invalid-public-observation-source-partial-available-missing-reason.json'))
+
+    expect(() => validateFinalReport(report)).toThrow(/must include partial_projection/i)
+  })
+
   it('GIVEN a generated report without token_usage source extensions WHEN passed through the current validator THEN C0 token source admission keeps existing none semantics valid', () => {
     const report = readJson(resolve(REPORT_FIXTURES_DIR, 'valid-basic.json'))
 
