@@ -167,8 +167,8 @@ def _safe_repo_file(relative_path: str) -> Path:
         resolved_cursor = resolved_cursor / part
         try:
             st = resolved_cursor.lstat()
-        except FileNotFoundError as exc:
-            raise ValueError("path_not_found") from exc
+        except FileNotFoundError:
+            raise ValueError("path_not_found")
         except OSError as exc:
             raise ValueError(f"path_lstat_error: {exc}") from exc
         final_lstat = st
@@ -187,7 +187,7 @@ def _safe_repo_file(relative_path: str) -> Path:
         raise ValueError("hardlink_not_allowed")
     try:
         resolved.stat()
-    except OSError as exc:
+    except OSError:
         raise ValueError("path_not_found")
     return resolved
 
@@ -221,7 +221,11 @@ def _run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
             args,
             124,
             stdout="",
-            stderr=f"child command timeout after {int(exc.timeout)}s" if exc.timeout is not None else "child command timeout",
+            stderr=(
+                f"child command timeout after {int(exc.timeout)}s"
+                if exc.timeout is not None
+                else "child command timeout"
+            ),
         )
 
 

@@ -473,7 +473,13 @@ def test_stdout_leak_real_child_stdout_stderr_not_mocked(
     _assert_no_child_stdout_stderr_leak(repo_tmp, monkeypatch, capsys)
 
 
-def test_stdout_single_bounded_json_no_body_or_child_output_leak(
+@pytest.mark.parametrize(
+    "_case_name",
+    ["stdout_single_bounded_json_no_body_or_child_output_leak"],
+    ids=["stdout_single_bounded_json_no_body_or_child_output_leak"],
+)
+def test_child_output_leak_bounded_json_path(
+    _case_name: str,
     repo_tmp: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -518,13 +524,18 @@ def test_executor_inputs_under_issue_metadata_namespace(
             return _CP(0)
         if str(txn.CONTROLLED_EXEC) in args:
             if "issue_body.update" in args:
-                return _CP(0, stdout='{"new_body_sha256":"sha256:x"}'), {"new_body_sha256": "sha256:x"}
-            if "issue_comment.publish" in args:
-                return _CP(0, stdout='{"comment_id":"c-1","comment_url":"https://example.com/c1","body_sha256":"sha256:c"}'), {
-                    "comment_id": "c-1",
-                    "comment_url": "https://example.com/c1",
-                    "body_sha256": "sha256:c",
+                return _CP(0, stdout='{"new_body_sha256":"sha256:x"}'), {
+                    "new_body_sha256": "sha256:x"
                 }
+            if "issue_comment.publish" in args:
+                return (
+                    _CP(0, stdout='{"comment_id":"c-1","comment_url":"https://example.com/c1","body_sha256":"sha256:c"}'),
+                    {
+                        "comment_id": "c-1",
+                        "comment_url": "https://example.com/c1",
+                        "body_sha256": "sha256:c",
+                    },
+                )
             pytest.fail("unknown command")
         pytest.fail(f"unexpected command: {args}")
 
