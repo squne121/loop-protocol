@@ -38,6 +38,15 @@ permissionMode: acceptEdits
   success / no_change / fail-closed / human judgment へ routing する
 - `title_update.required == true` は v1 scope 外。別 routing に切り分ける
 
+## readiness_forwarding_payload 契約
+
+- `readiness_forwarding_payload` は `READINESS_FORWARDING_PAYLOAD_V1` として渡す
+- `READINESS_FORWARDING_PAYLOAD_V1.readiness_result.status` の許可値は
+  `status: go | needs_fix | human_judgment | input_or_runtime_error`
+- `status: go` の場合は pre-author static readiness blocker がない candidate body として扱う
+- `status: needs_fix` の場合は `errors[]` と `readiness_result_ref` を source of truth にして candidate body を作り直す
+- `status: human_judgment` または `status: input_or_runtime_error` の場合は helper 実行を急がず fail-closed で owner 判断へ送る
+
 ## 既存 Issue 更新フロー (Existing Issue Flow)
 
 1. current issue body と reviewer feedback を読み、candidate body を repo-relative file に保存する
@@ -53,6 +62,11 @@ permissionMode: acceptEdits
 - `failed_no_mutation` → candidate body / readiness / stale precondition を見直す
 - `failed_after_mutation` → helper result に含まれる sha / artifact ref を source of truth にして follow-up 判断する
 - `human_judgment` → owner 判断を要求する
+
+## fail-closed terminal result の確認項目
+
+- `checked_body_sha256` と `checker_exit_code` を readback し、rewrite 直後の検査対象本文と checker 結果の組を確認する
+- `missing_sections` と `missing_contract_keys` が残っている場合は、freeform rewrite に進まず制約付き rewrite の不足として扱う
 
 ## Rewrite 制約
 

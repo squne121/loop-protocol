@@ -33,6 +33,12 @@ dependency_policy:
 - `comment_mode`（任意）: success comment を controlled publish するかどうかの指定
 - `title_update`（任意）: v1 では `required: true` を受け取っても no-mutation fail にする
 
+`READINESS_FORWARDING_PAYLOAD_V1.readiness_result.status` は
+`status: go | needs_fix | human_judgment | input_or_runtime_error`
+だけを受け付ける。`status: go` の場合は pre-author static readiness blocker なし、
+`status: needs_fix` の場合は `errors[]` と `readiness_result_ref` を candidate body 修正の正本に使う。
+`status: human_judgment | input_or_runtime_error` の場合は fail-closed で helper の mutation 段へ進めない。
+
 ## 入力契約
 
 `docs/dev/agent-skill-boundaries.md` の `ISSUE_EDIT_TXN_INPUT_V1` を正本とする。
