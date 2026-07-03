@@ -61,12 +61,19 @@
 |---|---|
 | `schema` | `"delegation_request_v1"` 固定。 |
 | `provider` | `"agy"` 固定。 |
-| `tool_profile` | `"no_tools"`、`"proposal_only"`、または `"local_asset_research"` のみ。 |
+| `tool_profile` | `"no_tools"`、`"proposal_only"`、`"local_asset_research"`、または `"grounded_research"`。 |
 | `prompt` | 必須。空文字・空白のみは `agy_empty_prompt` で拒否。 |
 | `context_files` | `local_asset_research` 時は必須。repo 境界とシンボリックリンク境界検証後に wrapper が repo-relative JSON evidence envelope を集約し、AGY へ prompt 注入する。 |
 | `model` | 指定禁止。`unsupported_provider_option` で拒否。 |
 | `post_to_issue_url` | 指定禁止。`provider_forbids_post_to_issue_url` で拒否。 |
-| `grounded_research` / `github_research` | 使用禁止。`unsupported_provider_profile` で拒否。 |
+| `grounded_research` | `agy` ネイティブの WebSearch / grounding を使用。 |
+| `github_research` | 使用禁止。`unsupported_provider_profile` で拒否。 |
+
+`provider=agy + grounded_research` は `implemented_agy_native_websearch_grounding` として扱う。
+`wrapper_side_google_search_grounding: forbidden` であり、wrapper は Gemini API Google Search / Google Search grounding API / wrapper-side Web retrieval を呼ばない。
+`raw_transcript_included: false`、`raw_credential_included: false`、`repo_absolute_path_included: false` を evidence envelope の不変条件とする。
+`agy_grounded_research_redaction_status` は `redaction_status: checked_no_credential_pattern` を返す。
+quota exceeded は `agy_grounded_research_quota_exhausted` として blocked にし、1 query / 1 URL / timeout / no retry storm を守る。
 
 `objective` / `instructions` / `output_sections` / `context_files` は、既存 caller 互換のため指定されていてもよいが、
 `provider=agy` 実行時の primary contract は、`prompt` / `tool_profile` に加え、`context_files` の wrapper-side 検証結果（repo-boundary / drift）を含めて扱う。

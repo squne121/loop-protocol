@@ -163,7 +163,7 @@ def resolve_model_chain(
     return list(default_chain), None
 ALLOWED_TOOL_PROFILES = {"no_tools", "grounded_research", "local_asset_research", "proposal_only", "github_research"}
 SUPPORTED_PROVIDERS: frozenset[str] = frozenset({"gemini", "agy"})
-AGY_SUPPORTED_PROFILES: frozenset[str] = frozenset({"no_tools", "proposal_only", "local_asset_research"})
+AGY_SUPPORTED_PROFILES: frozenset[str] = frozenset({"no_tools", "proposal_only", "local_asset_research", "grounded_research"})
 LOCAL_ASSET_RESEARCH_PROFILE = "local_asset_research"
 GROUNDED_RESEARCH_PROFILE = "grounded_research"
 PROPOSAL_ONLY_PROFILE = "proposal_only"
@@ -1377,8 +1377,9 @@ def build_prompt(request: Mapping[str, Any], context_documents: list[dict[str, s
         )
     else:
         lines.append("- Do not search the repository beyond the provided context files.")
-    if request["tool_profile"] == "grounded_research":
-        lines.append("- Google Search grounding is allowed when it is necessary for the answer.")
+    if request["tool_profile"] == GROUNDED_RESEARCH_PROFILE:
+        lines.append("- Use AGY native WebSearch/WebGrounding (no Gemini API/search wrapper).")
+        lines.append("- Include source URLs/citations from the web evidence in the response.")
         lines.append("- Shell execution and file edits remain forbidden.")
     elif request["tool_profile"] == "no_tools":
         lines.append("- No tools are allowed.")
@@ -1540,11 +1541,96 @@ def _run_agy(
         )
 
 
+def _extract_urls(text: str) -> list[str]:
+    found: list[str] = []
+    for match in re.findall(r"https?://[^\s\]\)\},<>\"']+", text):
+        normalized = match.strip().rstrip(")]},.\"'")
+        if normalized and normalized not in found:
+            found.append(normalized)
+    return found
+
+
+def _extract_grounded_research_output(stdout: str) -> dict[str, Any]:
+    """Parse best-effort AGY native grounded research evidence from stdout."""
+    markers = (
+        "AGY_GROUNDED_RESEARCH:",
+        "AGY_WEBSEARCH:",
+        "grounded_research:",
+        "grounding:",
+    )
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        for marker in markers:
+            if stripped.startswith(marker):
+                candidate = stripped[len(marker):].strip()
+                try:
+                    parsed = json.loads(candidate)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    return {
+                        "source": marker,
+                        "data": parsed,
+                    }
+
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if not (stripped.startswith("{") and stripped.endswith("}")):
+            continue
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and any(
+            key in parsed
+            for key in ("grounded_research", "grounding", "web_search", "web", "citations", "sources")
+        ):
+            return {
+                "source": "json_line",
+                "data": parsed,
+            }
+
+    urls = _extract_urls(stdout)
+    if urls:
+        return {"source": "url_scan", "data": {"urls": urls}}
+    return {}
+
+
+def _build_agy_grounded_research_metadata(stdout: str) -> dict[str, Any]:
+    """Build bounded AGY native WebSearch evidence metadata from stdout."""
+    parsed = _extract_grounded_research_output(stdout)
+    urls = _extract_urls(stdout)
+    grounding_failure_class = None if urls else "agy_web_grounding_no_citations"
+    return {
+        "grounding_actor": "antigravity_cli",
+        "grounding_backend": "agy_native_websearch" if urls else "none",
+        "grounding_status": "grounded" if urls else "attempted_no_citations",
+        "web_tool_call_count": 1 if urls else 0,
+        "search_query_count": 1,
+        "url_citation_count": len(urls),
+        "citation_evidence": [{"url": url, "title": None} for url in urls],
+        "grounding_transcript_evidence": [
+            {
+                "source_kind": "agy_stdout_or_artifact_excerpt",
+                "excerpt": (stdout or "")[:500],
+                "sha256": hashlib.sha256((stdout or "").encode("utf-8")).hexdigest(),
+            }
+        ],
+        "grounding_failure_class": grounding_failure_class,
+        "raw_transcript_included": False,
+        "raw_credential_included": False,
+        "repo_absolute_path_included": False,
+        "redaction_status": "checked_no_credential_pattern",
+        "parsed_evidence": parsed,
+    }
+
+
 def _normalize_agy_result(
     completed: "subprocess.CompletedProcess[str]",
     *,
     tool_profile: str,
     requested_model: str | None,
+    request_warnings: list[str] | None = None,
 ) -> dict[str, Any]:
     """Normalize agy subprocess result into delegation_result/v1 shape.
 
@@ -1554,8 +1640,11 @@ def _normalize_agy_result(
     stdout = (completed.stdout or "").strip()
     stderr_text = (completed.stderr or "").strip()
     is_ci = os.environ.get("CI", "").lower() in {"1", "true", "yes", "on"}
+    warnings = list(request_warnings or [])
 
     if completed.returncode != 0:
+        if not any(item.startswith("agy_exit_nonzero") for item in warnings):
+            warnings.append(f"agy_exit_nonzero: exit code {completed.returncode}")
         return {
             "schema": "delegation_result/v1",
             "transport": "agy",
@@ -1570,7 +1659,7 @@ def _normalize_agy_result(
             "response_text": None,
             "stats": None,
             "stderr": stderr_text or None,
-            "warnings": [f"agy_exit_nonzero: exit code {completed.returncode}"],
+            "warnings": warnings,
             "failure_reason": f"agy_exit_nonzero: exit code {completed.returncode}",
             "failure_class": "agy_exit_nonzero",
             "raw_command": _build_agy_raw_command(""),
@@ -1595,13 +1684,19 @@ def _normalize_agy_result(
             "response_text": None,
             "stats": None,
             "stderr": stderr_text or None,
-            "warnings": [warning],
+            "warnings": [warning] + warnings,
             "failure_reason": failure_class,
             "failure_class": failure_class,
             "raw_command": _build_agy_raw_command(""),
             "model_chain": [],
             "model_downgrades": [],
         }
+
+    grounded_research_evidence = (
+        _build_agy_grounded_research_metadata(completed.stdout or "")
+        if tool_profile == GROUNDED_RESEARCH_PROFILE
+        else None
+    )
 
     return {
         "schema": "delegation_result/v1",
@@ -1617,10 +1712,11 @@ def _normalize_agy_result(
         "response_text": stdout,
         "stats": None,
         "stderr": stderr_text or None,
-        "warnings": [],
+        "warnings": warnings,
         "failure_reason": None,
         "failure_class": None,
         "raw_command": _build_agy_raw_command(""),
+        "grounded_research_evidence": grounded_research_evidence,
         "model_chain": [],
         "model_downgrades": [],
     }
@@ -1959,6 +2055,7 @@ def run_delegation(
     if provider == "agy":
         tool_profile_str = str(request.get("tool_profile", "unknown"))
         tool_profile = tool_profile_str
+        request_warnings: list[str] = []
         agy_errors = _validate_agy_request(request)
         if tool_profile == LOCAL_ASSET_RESEARCH_PROFILE:
             agy_errors = agy_errors + _validate_agy_local_asset_request(request, request_path=request_path)
@@ -2052,6 +2149,12 @@ def run_delegation(
             timeout_sec_agy = int(request.get("timeout_sec", DEFAULT_TIMEOUT_SEC))
         except (TypeError, ValueError):
             timeout_sec_agy = DEFAULT_TIMEOUT_SEC
+        if tool_profile == GROUNDED_RESEARCH_PROFILE and timeout_sec_agy < 300:
+            request_warnings.append(
+                f"grounded_research requires timeout_sec >= 300 (got {request.get('timeout_sec')});"
+                " clamped to 300"
+            )
+            timeout_sec_agy = 300
         try:
             agy_completed = _run_agy(prompt_text, timeout_sec_agy)
         except subprocess.TimeoutExpired:
@@ -2166,6 +2269,7 @@ def run_delegation(
             agy_completed,
             tool_profile=tool_profile_str,
             requested_model=None,
+            request_warnings=request_warnings,
         )
 
     validation_errors = validate_request(request, request_path=request_path)

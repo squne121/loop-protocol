@@ -11,7 +11,7 @@ disable-model-invocation: true
 | tool_profile | 用途 |
 |---|---|
 | `no_tools` | ツール不使用・コンテキスト読み取り専用 |
-| `grounded_research` | Google Search grounding あり（timeout_sec: 300+ 推奨） |
+| `grounded_research` | AGY native WebSearch/WebGrounding（timeout_sec: 300+ 推奨） |
 | `local_asset_research` | Serena MCP read-only によるローカル資産調査 |
 | `proposal_only` | 実装案・Issue 本文案・patch proposal のドラフト生成 |
 | `github_research` | GitHub read-only 調査（gh コマンド allowlist）|
@@ -37,11 +37,16 @@ disable-model-invocation: true
    ```
    または手動で `delegation_request_v1` JSON を作成する（`references/usage-contract.md` 参照）。
 
-2. **preflight を実行する（必須）**:
-   ```bash
-   uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/preflight_gemini_headless.py \
-     --output-file tmp/gemini-headless-preflight.json
-   ```
+2. **preflight を実行する（必要に応じて agy の grounded_research 検証を含める）**:
+```bash
+uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/preflight_gemini_headless.py \
+  --output-file tmp/gemini-headless-preflight.json
+```
+`agy` の grounded_research を含む検証が必要な場合:
+```bash
+uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/preflight_agy.py \
+  --grounded-research --json
+```
    `ok: false` → `failure_reason` / `next_action` を確認して修正する。
 
 3. **`scripts/run_gemini_headless.py` で request を検証・実行する**:

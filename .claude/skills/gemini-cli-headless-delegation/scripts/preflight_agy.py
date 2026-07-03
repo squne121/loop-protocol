@@ -16,6 +16,8 @@ from typing import Any
 EXPECTED_SMOKE = "LOOP_AGY_SMOKE_OK"
 SMOKE_PROMPT = f"Return exactly: {EXPECTED_SMOKE}"
 SMOKE_TIMEOUT_SECONDS = 20
+GROUNDING_PROBE_PROMPT = "Search for: latest reliable updates on web sources and return 3 source URLs."
+GROUNDING_TIMEOUT_SECONDS = 40
 NONINTERACTIVE_FLAGS = ["-p", "--print", "--prompt"]
 UNEXPECTED_CAPABILITY_KEYWORDS = ["chat", "--output-format"]
 SMOKE_SAMPLE_MAX_CHARS = 500
@@ -447,6 +449,15 @@ def _redact_output_sample(text: str) -> str:
     return sample[:SMOKE_SAMPLE_MAX_CHARS]
 
 
+def _extract_urls(text: str) -> list[str]:
+    found: list[str] = []
+    for match in re.findall(r"https?://[^\s\]\)\},<>\"']+", text):
+        normalized = match.strip().rstrip(")]},.\"'")
+        if normalized and normalized not in found:
+            found.append(normalized)
+    return found
+
+
 def _mask_resolved_path(path: str | None) -> str | None:
     """Return a sanitized resolved path suitable for JSON evidence."""
     if not path:
@@ -557,11 +568,70 @@ def _run_smoke(agy_bin: str) -> dict[str, Any]:
     return smoke
 
 
+def _run_grounded_research_smoke(agy_bin: str) -> dict[str, Any]:
+    """Run a bounded AGY native WebSearch/grounding probe.
+
+    This smoke intentionally favors a lightweight query and records evidence
+    samples so caller can verify that web search output can be produced.
+    """
+    argv = [agy_bin, "-p", GROUNDING_PROBE_PROMPT]
+    result: dict[str, Any] = {
+        "ok": False,
+        "argv": argv,
+        "exit_code": None,
+        "timed_out": False,
+        "failure_reason": None,
+        "failure_class": None,
+        "stdout_sample": "",
+        "stderr_sample": "",
+        "evidence_urls": [],
+        "web_tool_call_count": 0,
+        "url_citation_count": 0,
+        "stdout_line_count": 0,
+    }
+
+    with tempfile.TemporaryDirectory(prefix="agy-preflight-grounding-") as temp_dir:
+        try:
+            proc = _run(argv, cwd=Path(temp_dir), timeout=GROUNDING_TIMEOUT_SECONDS)
+            result["exit_code"] = proc.returncode
+            result["stdout_sample"] = _redact_output_sample(proc.stdout)
+            result["stderr_sample"] = _redact_output_sample(proc.stderr)
+            stdout = proc.stdout or ""
+            result["stdout_line_count"] = len([line for line in stdout.splitlines() if line.strip()])
+            urls = _extract_urls(stdout)
+            result["evidence_urls"] = urls
+            result["url_citation_count"] = len(urls)
+            result["web_tool_call_count"] = 1 if urls else 0
+
+            if proc.returncode != 0:
+                result["failure_reason"] = f"agy_grounded_research check failed: exit {proc.returncode}"
+                result["failure_class"] = "agy_grounded_research_exit_nonzero"
+            elif not result["evidence_urls"] and not stdout.strip():
+                is_ci = os.environ.get("CI", "").lower() in {"1", "true", "yes", "on"}
+                result["failure_reason"] = (
+                    "agy_grounded_research output empty"
+                    + (" in CI" if is_ci else "")
+                )
+                result["failure_class"] = "agy_output_missing" if is_ci else "agy_empty_stdout"
+            elif not result["evidence_urls"]:
+                result["failure_reason"] = "agy_grounded_research no_evidence_urls_found"
+                result["failure_class"] = "agy_grounded_research_no_evidence"
+            else:
+                result["ok"] = True
+        except subprocess.TimeoutExpired:
+            result["timed_out"] = True
+            result["failure_reason"] = "agy grounded_research timed out"
+            result["failure_class"] = "client_subprocess_timeout"
+
+    return result
+
+
 def run_preflight(
     *,
     validate_local_asset_contract: bool = False,
     live_serena: bool = False,
     mcp_config_path: Path | None = None,
+    grounded_research: bool = False,
 ) -> dict[str, Any]:
     """Run version → help → smoke checks for agy binary.
 
@@ -594,6 +664,11 @@ def run_preflight(
             "timed_out": False,
             "stdout_sample": "",
             "stderr_sample": "",
+        },
+        "grounded_research": {
+            "ok": False,
+            "requested": grounded_research,
+            "check": None,
         },
         "warnings": [],
     }
@@ -685,6 +760,16 @@ def run_preflight(
         result["recovery_action"] = "check agy configuration and rerun preflight"
         return result
 
+    if grounded_research:
+        grounded_result = _run_grounded_research_smoke(agy_bin)
+        result["grounded_research"]["check"] = grounded_result
+        if not grounded_result["ok"]:
+            result["failure_reason"] = grounded_result.get("failure_reason") or "agy grounded_research probe failed"
+            result["failure_class"] = grounded_result.get("failure_class") or "agy_grounded_research_failed"
+            result["recovery_action"] = "check AGY WebSearch/WebGrounding connectivity and rerun preflight"
+            return result
+        result["grounded_research"]["ok"] = True
+
     if validate_local_asset_contract:
         repo_root = _repo_root()
         manifest: dict[str, Any] | None = None
@@ -764,6 +849,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Launch the pinned Serena MCP server and run live read-only tool calls.",
     )
     parser.add_argument(
+        "--grounded-research",
+        "--live-websearch",
+        "--discover-web-grounding",
+        action="store_true",
+        dest="grounded_research",
+        default=False,
+        help="Run a bounded AGY native WebSearch/WebGrounding probe.",
+    )
+    parser.add_argument(
         "--output-file",
         required=False,
         type=Path,
@@ -776,6 +870,7 @@ def main(argv: list[str] | None = None) -> int:
         validate_local_asset_contract=args.local_asset_research,
         live_serena=args.live_serena,
         mcp_config_path=args.mcp_config,
+        grounded_research=args.grounded_research,
     )
 
     if args.json_stdout:

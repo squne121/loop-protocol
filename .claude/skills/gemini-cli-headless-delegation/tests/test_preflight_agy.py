@@ -374,6 +374,102 @@ def test_json_output(monkeypatch, tmp_path):
     assert exit_code_fail == 1
 
 
+def test_grounded_research_probe_success(monkeypatch, tmp_path):
+    """--grounded-research runs a bounded AGY websearch probe and returns evidence URLs."""
+    module = load_module()
+    monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)  # type: ignore[call-arg]
+
+    def fake_run(argv, cwd=None, timeout=None):
+        if argv == [module._resolve_binary(), "--version"]:
+            return _FakeCompleted(0, "agy 1.0.0\n", "")
+        if argv == [module._resolve_binary(), "--help"]:
+            return _FakeCompleted(
+                0,
+                "Usage: agy [OPTIONS]\n"
+                "  -p, --print, --prompt  Non-interactive mode\n",
+                "",
+            )
+        if argv[:2] == [module._resolve_binary(), "-p"]:
+            if argv[2] == module.SMOKE_PROMPT:
+                return _FakeCompleted(0, "LOOP_AGY_SMOKE_OK\n", "")
+            return _FakeCompleted(0, "Sources: https://example.com/one https://example.com/two\n", "")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+
+    result = module.run_preflight(grounded_research=True)
+
+    assert result["ok"] is True
+    assert result["grounded_research"]["ok"] is True
+    check = result["grounded_research"]["check"]
+    assert check["ok"] is True
+    assert "https://example.com/one" in (check["evidence_urls"] or [])
+    assert check["web_tool_call_count"] == 1
+    assert check["url_citation_count"] == 2
+    assert check["stdout_line_count"] > 0
+
+
+def test_grounded_research_probe_fails_when_no_urls(monkeypatch, tmp_path):
+    """--grounded-research fails with explicit failure_class if no web evidence URL is found."""
+    module = load_module()
+    monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)  # type: ignore[call-arg]
+
+    def fake_run(argv, cwd=None, timeout=None):
+        if argv == [module._resolve_binary(), "--version"]:
+            return _FakeCompleted(0, "agy 1.0.0\n", "")
+        if argv == [module._resolve_binary(), "--help"]:
+            return _FakeCompleted(
+                0,
+                "Usage: agy [OPTIONS]\n"
+                "  -p, --print, --prompt  Non-interactive mode\n",
+                "",
+            )
+        if argv[:2] == [module._resolve_binary(), "-p"]:
+            if argv[2] == module.SMOKE_PROMPT:
+                return _FakeCompleted(0, "LOOP_AGY_SMOKE_OK\n", "")
+            return _FakeCompleted(0, "No web result returned.\n", "")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+
+    result = module.run_preflight(grounded_research=True)
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_grounded_research_no_evidence"
+    assert result["grounded_research"]["check"]["failure_reason"] == "agy_grounded_research no_evidence_urls_found"
+    assert result["grounded_research"]["ok"] is False
+
+
+def test_agy_grounded_research_quota_exhausted_bounded_no_retry_storm(monkeypatch, tmp_path):
+    """agy_grounded_research_quota_exhausted: bounded probe has no retry storm."""
+    module = load_module()
+    monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)  # type: ignore[call-arg]
+    grounded_calls = {"count": 0}
+
+    def fake_run(argv, cwd=None, timeout=None):
+        if argv == [module._resolve_binary(), "--version"]:
+            return _FakeCompleted(0, "agy 1.0.0\n", "")
+        if argv == [module._resolve_binary(), "--help"]:
+            return _FakeCompleted(
+                0,
+                "Usage: agy [OPTIONS]\n"
+                "  -p, --print, --prompt  Non-interactive mode\n",
+                "",
+            )
+        if argv[:2] == [module._resolve_binary(), "-p"]:
+            if argv[2] == module.SMOKE_PROMPT:
+                return _FakeCompleted(0, "LOOP_AGY_SMOKE_OK\n", "")
+            grounded_calls["count"] += 1
+            return _FakeCompleted(1, "", "quota_exhausted")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+
+    result = module.run_preflight(grounded_research=True)
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_grounded_research_exit_nonzero"
+    assert grounded_calls["count"] == 1
 # ---------------------------------------------------------------------------
 # Extra: test_help_flag_parser_no_false_positives
 # --prompting / --printable must NOT trigger -p / --print.
