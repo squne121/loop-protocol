@@ -105,13 +105,36 @@ except Exception:  # pragma: no cover - defensive fail-closed
 # Shared library, NOT an independent PreToolUse hook. Used only to enrich the
 # telemetry payload with a bounded fast-path classification; never changes the
 # allow/block decision or reason_code of this guard (AC1/AC2/AC6).
-try:
-    import pretool_fastpath_classifier as _fastpath
+#
+# Import note: pretool_fastpath_classifier.py imports is_readonly_command /
+# _parse_gh_api_command back from THIS module (they are defined further below
+# in this file). If this module is imported first (e.g. `import
+# local_main_branch_guard` from a caller, before anything imports the
+# classifier), a top-level `import pretool_fastpath_classifier` here would
+# create a circular import that reaches back into a not-yet-fully-initialized
+# local_main_branch_guard module and fails to resolve those two names,
+# permanently latching _FASTPATH_AVAILABLE = False for the whole process. To
+# avoid this ordering hazard, the classifier is imported lazily on first use
+# inside _compute_fastpath() instead of at module load time.
+_fastpath: Any = None
+_FASTPATH_AVAILABLE: bool | None = None  # None = not yet attempted
 
-    _FASTPATH_AVAILABLE = True
-except Exception:  # pragma: no cover - defensive fail-closed
-    _fastpath = None  # type: ignore[assignment]
-    _FASTPATH_AVAILABLE = False
+
+def _ensure_fastpath_imported() -> bool:
+    """Lazily import pretool_fastpath_classifier on first use. Safe to call
+    regardless of import order (Issue #1289 fix — see note above)."""
+    global _fastpath, _FASTPATH_AVAILABLE
+    if _FASTPATH_AVAILABLE is not None:
+        return _FASTPATH_AVAILABLE
+    try:
+        import pretool_fastpath_classifier as _fastpath_module
+
+        _fastpath = _fastpath_module
+        _FASTPATH_AVAILABLE = True
+    except Exception:  # pragma: no cover - defensive fail-closed
+        _fastpath = None
+        _FASTPATH_AVAILABLE = False
+    return _FASTPATH_AVAILABLE
 
 # ─── Worktree bootstrap executor policy (Issue #1209) ────────────────────────
 try:
@@ -1541,7 +1564,7 @@ def evaluate(
         nonlocal _fastpath_cache
         if _fastpath_cache is not False:
             return _fastpath_cache  # type: ignore[return-value]
-        if not _FASTPATH_AVAILABLE:
+        if not _ensure_fastpath_imported():
             _fastpath_cache = None
             return None
         try:

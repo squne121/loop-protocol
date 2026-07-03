@@ -52,6 +52,7 @@ import re
 import shlex
 import sys
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import Any
 
 _HERE = os.path.dirname(os.path.realpath(__file__))
@@ -139,17 +140,56 @@ def _is_readonly_intersection(cmd: str) -> bool:
     return bool(_lmb_is_readonly_command(cmd)) and _wsg_classify_bash(cmd) == "read_only"
 
 
+# Fixed, closed-vocabulary command-kind labels for the bounded telemetry
+# summary. NEVER derived from raw command tokens (Issue #1289 Blocker 3):
+# raw tokens can carry search queries (`rg <secret>`), file paths, issue
+# body fragments, or secret-like values (e.g. `ghp_...`), all of which must
+# never reach the summary/telemetry payload.
+_SEARCH_BINARIES = frozenset({"rg", "grep", "egrep", "fgrep", "ag"})
+_FILE_DISPLAY_BINARIES = frozenset({"cat", "head", "tail", "less", "more"})
+_GH_SUBCOMMAND_LABELS = frozenset({"issue", "pr", "repo", "run", "workflow", "api", "release"})
+
+
 def _bounded_summary(cmd: str) -> str:
-    """A bounded, non-raw-body summary for telemetry dedupe (AC1)."""
+    """A bounded, closed-vocabulary summary for telemetry dedupe (AC1).
+
+    Built exclusively from a fixed command-kind label taxonomy — never from
+    raw command tokens. Query strings, paths, issue body text, URL
+    fragments, and secret-like values must never appear here (Issue #1289
+    Blocker 3).
+    """
     stripped = cmd.strip()
     try:
         tokens = shlex.split(stripped)
     except ValueError:
         tokens = stripped.split()
-    head = " ".join(tokens[:2]) if tokens else ""
-    if len(head) > 40:
-        head = head[:40] + "…"
-    return f"readonly_display:{head}" if head else "readonly_display"
+    if not tokens:
+        return "readonly_display"
+
+    binary = os.path.basename(tokens[0])
+
+    if binary == "git":
+        subcmd = tokens[1] if len(tokens) > 1 else None
+        if subcmd and re.fullmatch(r"[a-z][a-z0-9_-]*", subcmd):
+            return f"readonly_display:git:{subcmd}"
+        return "readonly_display:git"
+
+    if binary == "gh":
+        subcmd = tokens[1] if len(tokens) > 1 else None
+        action = tokens[2] if len(tokens) > 2 else None
+        if subcmd in _GH_SUBCOMMAND_LABELS:
+            if action and re.fullmatch(r"[a-z][a-z0-9_-]*", action):
+                return f"readonly_display:gh:{subcmd}:{action}"
+            return f"readonly_display:gh:{subcmd}"
+        return "readonly_display:gh"
+
+    if binary in _SEARCH_BINARIES:
+        return "readonly_display:search"
+
+    if binary in _FILE_DISPLAY_BINARIES:
+        return "readonly_display:file-display"
+
+    return "readonly_display:other"
 
 
 # ── exact_controlled_executor: shape vs authorized ─────────────────────────
@@ -189,6 +229,51 @@ def _stable_policy_hash(entry: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
+def _is_safe_namespaced_input_file(input_file: str | None, expected_prefix: str) -> bool:
+    """Reject any --input-file value that is not a single, literal path
+    segment directly under ``expected_prefix`` (Issue #1289 Blocker 2 fix).
+
+    A raw ``str.startswith(expected_prefix)`` check is insufficient: a value
+    like ``artifacts/1291/issue-metadata/issue_body.update/../../evil.json``
+    also satisfies ``startswith(expected_prefix)`` as a plain string, but
+    resolves *outside* the namespace once ``..`` segments are applied. This
+    helper fails closed on absolute paths, backslashes, NUL bytes, the stdin
+    marker ``-``, ``.``/``..`` path components, and any nested subdirectory
+    beneath the expected namespace (i.e. the value must be exactly
+    ``expected_prefix`` + one leaf filename, no more path segments).
+    """
+    if not input_file:
+        return False
+    if input_file == "-":
+        return False
+    if "\\" in input_file or "\x00" in input_file:
+        return False
+    if input_file.startswith("/"):
+        return False
+    if input_file.startswith("./") or input_file.startswith("../"):
+        return False
+
+    # Split on the raw string ourselves rather than via PurePosixPath: Path
+    # objects silently collapse single "." segments (e.g.
+    # "artifacts/1166/./x.json" -> parts without the "." at all), which would
+    # let a disguised "./" traversal slip past a parts-based "." check.
+    raw_parts = input_file.split("/")
+    if any(part in (".", "..") for part in raw_parts):
+        return False
+    if not input_file.startswith(expected_prefix):
+        return False
+
+    prefix_parts = tuple(PurePosixPath(expected_prefix).parts)
+    parts = tuple(PurePosixPath(input_file).parts)
+    if parts[: len(prefix_parts)] != prefix_parts:
+        return False
+    # Exactly one path segment (the leaf filename) beyond the namespace
+    # prefix — no nested subdirectories smuggled in under the prefix.
+    if len(parts) != len(prefix_parts) + 1:
+        return False
+    return True
+
+
 def _classify_controlled_skill_mutation(cmd: str, project_root: str) -> FastpathClassification | None:
     """Returns a classification if cmd matches the controlled_skill_mutation_exec.py
     shape (authorized or shape-only), else None (not this executor at all)."""
@@ -216,7 +301,7 @@ def _classify_controlled_skill_mutation(cmd: str, project_root: str) -> Fastpath
     namespace = entry.get("input_namespace")
     if namespace and issue_number:
         expected_prefix = namespace.format(issue_number=issue_number)
-        if not (input_file or "").startswith(expected_prefix):
+        if not _is_safe_namespaced_input_file(input_file, expected_prefix):
             return FastpathClassification(
                 CLASS_EXACT_SHAPE, command_id=command_id, internal_shape_only=True
             )
@@ -224,7 +309,7 @@ def _classify_controlled_skill_mutation(cmd: str, project_root: str) -> Fastpath
         # Legacy command id (termination_report.publish) has no explicit
         # input_namespace entry — require the artifacts/{issue_number}/ prefix.
         expected_prefix = f"artifacts/{issue_number}/"
-        if not (input_file or "").startswith(expected_prefix):
+        if not _is_safe_namespaced_input_file(input_file, expected_prefix):
             return FastpathClassification(
                 CLASS_EXACT_SHAPE, command_id=command_id, internal_shape_only=True
             )

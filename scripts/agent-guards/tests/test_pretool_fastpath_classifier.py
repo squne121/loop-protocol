@@ -8,8 +8,10 @@ Commands (each test below is invoked individually via `pytest -k <name>`).
 
 from __future__ import annotations
 
+import importlib.util
 import subprocess
 import sys
+import textwrap
 import time
 from pathlib import Path
 
@@ -324,3 +326,174 @@ class TestAC8ControlledSkillMutationExecutorReasonCode:
         # REASON_DETERMINISTIC_CHECKER (distinct string values).
         assert REASON_CONTROLLED_SKILL_MUTATION_EXECUTOR != REASON_DETERMINISTIC_CHECKER
         assert REASON_CONTROLLED_SKILL_MUTATION_EXECUTOR == "controlled_skill_mutation_executor"
+
+
+# =============================================================================
+# Blocker 1 (PR #1299 review fix_delta): import-order independence.
+#
+# local_main_branch_guard.py imports pretool_fastpath_classifier.py, which in
+# turn imports is_readonly_command / _parse_gh_api_command back from
+# local_main_branch_guard.py. If local_main_branch_guard is imported FIRST in
+# a fresh process (before anything imports the classifier module directly),
+# a naive top-level `import pretool_fastpath_classifier` inside
+# local_main_branch_guard.py would previously latch _FASTPATH_AVAILABLE=False
+# forever, silently disabling evaluate()["fastpath"] enrichment. This test
+# must run in a fresh subprocess (not this pytest process, which has already
+# imported pretool_fastpath_classifier directly above) to exercise the real
+# import-order hazard.
+# =============================================================================
+
+
+class TestBlocker1ImportOrderIndependence:
+    def test_fastpath_available_when_local_main_branch_guard_imported_first(self):
+        script = textwrap.dedent(
+            f"""
+            import sys
+            sys.path.insert(0, {str(_GUARDS_DIR)!r})
+
+            # Import local_main_branch_guard FIRST, before anything imports
+            # pretool_fastpath_classifier directly — this is the ordering
+            # that previously triggered the circular-import hazard.
+            import local_main_branch_guard as lmb
+
+            result = lmb.evaluate("git status", {str(REPO_ROOT)!r})
+            fastpath = result.get("fastpath")
+            assert fastpath is not None, (
+                "fastpath enrichment must not be permanently disabled by "
+                "import order"
+            )
+            assert fastpath["classification"] == "readonly_display", fastpath
+            print("OK")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, (
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+        assert "OK" in proc.stdout
+
+
+# =============================================================================
+# Blocker 2 (PR #1299 review fix_delta): --input-file path traversal must
+# fold into mutation_or_unknown, never exact_controlled_executor_authorized.
+# =============================================================================
+
+
+class TestBlocker2InputFilePathTraversal:
+    def test_path_traversal_and_malformed_input_file_rejected(self):
+        malicious_input_files = [
+            # Traversal that escapes the namespace while still matching a
+            # naive str.startswith(expected_prefix) check.
+            "artifacts/1166/../../evil.json",
+            "artifacts/1166/../1166/../../etc/passwd",
+            "artifacts/1166/subdir/../../../evil.json",
+            # Absolute path.
+            "/etc/passwd",
+            # Backslash (Windows-style separator smuggling).
+            "artifacts\\1166\\evil.json",
+            # NUL byte.
+            "artifacts/1166/evil.json\x00.txt",
+            # Leading ./ relative marker.
+            "./artifacts/1166/termination_report_input.json",
+            # Bare "." / ".." components.
+            "artifacts/1166/./termination_report_input.json",
+            "artifacts/1166/..",
+            # Stdin marker.
+            "-",
+            # Nested subdirectory beneath the namespace prefix (not a bare
+            # leaf filename).
+            "artifacts/1166/nested/dir/termination_report_input.json",
+        ]
+        for input_file in malicious_input_files:
+            cmd = _publish_cmd(input_file=input_file)
+            result = fp.classify(cmd, str(REPO_ROOT), str(REPO_ROOT))
+            assert result.classification == fp.CLASS_MUTATION_OR_UNKNOWN, (
+                input_file,
+                result,
+            )
+
+        # Sanity: a legitimate, single-segment leaf filename under the
+        # namespace prefix must still classify as authorized.
+        legit = fp.classify(_publish_cmd(), str(REPO_ROOT), str(REPO_ROOT))
+        assert legit.classification == fp.CLASS_EXACT_AUTHORIZED
+
+
+# =============================================================================
+# Blocker 3 (PR #1299 review fix_delta): readonly_display summary must never
+# leak search queries / paths / secret-like values — only fixed labels.
+# =============================================================================
+
+
+class TestBlocker3SummaryNoSecretLeak:
+    def test_search_and_display_summaries_use_fixed_labels_only(self):
+        secret_token = "ghp_1234567890ABCDEFsecretvalue"
+        cases = [
+            (f"rg {secret_token} .", "readonly_display:search"),
+            ("grep SECRET_TOKEN .env.example", "readonly_display:search"),
+            ("cat some/secret/path.txt", "readonly_display:file-display"),
+            ("head -n 5 some/secret/path.txt", "readonly_display:file-display"),
+            ("git status", "readonly_display:git:status"),
+            ("git diff", "readonly_display:git:diff"),
+            ("gh issue view 1289", "readonly_display:gh:issue:view"),
+        ]
+        for cmd, expected_summary in cases:
+            result = fp.classify(cmd, str(REPO_ROOT), str(REPO_ROOT))
+            assert result.classification == fp.CLASS_READONLY_DISPLAY, (cmd, result)
+            assert result.display_summary == expected_summary, (cmd, result)
+            serialized = repr(result.to_telemetry_dict())
+            assert secret_token not in serialized
+            assert "SECRET_TOKEN" not in serialized
+            assert ".env.example" not in serialized
+            assert "some/secret/path.txt" not in serialized
+
+
+# =============================================================================
+# Major (PR #1299 review fix_delta): .codex/hooks.json PreToolUse topology
+# must be verified against a fixed expected count, not just absence of the
+# classifier module name (which cannot detect other hook additions/removals).
+# =============================================================================
+
+
+def _load_check_hook_boundaries():
+    checker_path = REPO_ROOT / "scripts" / "check_hook_boundaries.py"
+    spec = importlib.util.spec_from_file_location(
+        "check_hook_boundaries_for_fastpath_test", checker_path
+    )
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)  # type: ignore[attr-defined]
+    return module
+
+
+class TestMajorCodexHooksTopologyCheck:
+    def test_current_topology_matches_frozen_expectation(self):
+        checker = _load_check_hook_boundaries()
+        errors = checker.check_codex_hooks_pretool_topology()
+        assert errors == []
+
+    def test_topology_drift_is_detected_and_fails_closed(self):
+        checker = _load_check_hook_boundaries()
+        actual = checker.load_codex_hooks_topology()
+        assert actual, "expected at least one PreToolUse matcher in .codex/hooks.json"
+
+        # Mutate a copy: bump one matcher's count by one (simulating an
+        # undetected added hook) and verify the check fails closed.
+        drifted_expected = dict(actual)
+        first_matcher = next(iter(drifted_expected))
+        drifted_expected[first_matcher] += 1
+
+        errors = checker.check_codex_hooks_pretool_topology(expected=drifted_expected)
+        assert errors, "topology drift must be reported, not silently accepted"
+        assert any("pretool_topology" in err for err in errors)
+
+        # Also verify a removed-matcher case fails closed.
+        removed_expected = dict(actual)
+        del removed_expected[first_matcher]
+        errors2 = checker.check_codex_hooks_pretool_topology(expected=removed_expected)
+        assert errors2

@@ -37,6 +37,18 @@ CODEX_HOOKS_PATH = REPO_ROOT / ".codex" / "hooks.json"
 # independent hook).
 _FASTPATH_CLASSIFIER_MODULE_NAME = "pretool_fastpath_classifier"
 
+# Issue #1289 (fix_delta Major): fixed, fail-closed expected snapshot of
+# .codex/hooks.json PreToolUse hook counts per matcher. A string-only check
+# for the classifier module name (check_codex_hooks_no_fastpath_classifier)
+# cannot detect *other* hook additions/removals — only an explicit topology
+# count comparison can. Any drift from this frozen snapshot (added, removed,
+# or reordered PreToolUse hook entries under any matcher) must fail closed
+# and require an explicit update to this constant plus reviewer sign-off.
+EXPECTED_CODEX_PRETOOL_TOPOLOGY: dict[str, int] = {
+    "^Bash$": 5,
+    "^(apply_patch|Edit|Write)$": 3,
+}
+
 # ─── manifest 抽出 ────────────────────────────────────────────────────────────
 
 MANIFEST_PATTERN = re.compile(
@@ -445,6 +457,31 @@ def load_codex_hooks_topology(path: Path = CODEX_HOOKS_PATH) -> dict[str, int]:
     return counts
 
 
+def check_codex_hooks_pretool_topology(
+    path: Path = CODEX_HOOKS_PATH,
+    expected: dict[str, int] | None = None,
+) -> list[str]:
+    """Issue #1289 (fix_delta Major): fail-closed comparison of the current
+    .codex/hooks.json PreToolUse hook count per matcher against a frozen
+    expected snapshot. This detects any topology drift (added/removed
+    PreToolUse hooks under any matcher) that the classifier-name-only check
+    above cannot see."""
+    if expected is None:
+        expected = EXPECTED_CODEX_PRETOOL_TOPOLOGY
+    errors: list[str] = []
+    if not path.exists():
+        errors.append(f"[error] .codex/hooks.json が見つかりません: {path}")
+        return errors
+    actual = load_codex_hooks_topology(path)
+    if actual != expected:
+        errors.append(
+            "[codex:pretool_topology] .codex/hooks.json の PreToolUse hook "
+            f"topology が期待値と一致しません: expected={expected!r} actual={actual!r} "
+            "（意図した hook 追加/削除であれば EXPECTED_CODEX_PRETOOL_TOPOLOGY を更新しレビューを受けること）"
+        )
+    return errors
+
+
 def check_codex_hooks_no_fastpath_classifier(path: Path = CODEX_HOOKS_PATH) -> list[str]:
     """Issue #1289 AC6: pretool_fastpath_classifier must never be registered as
     its own PreToolUse hook command in .codex/hooks.json."""
@@ -557,6 +594,7 @@ def main() -> int:
     # PreToolUse hook in either manifest.
     errors.extend(check_codex_hooks_no_fastpath_classifier())
     errors.extend(check_settings_no_fastpath_classifier())
+    errors.extend(check_codex_hooks_pretool_topology())
 
     # 結果出力
     if errors:
