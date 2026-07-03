@@ -121,7 +121,7 @@ SubAgent（役割）── Skill（作業手順）
 | Skill | 手順 | 呼び出し元の例 |
 |---|---|---|
 | `create-issue` | 新規 Issue 起票の手順（Template Guard / Outcome Quality Guard / scope 重複チェック / `gh issue create`） | `issue-author` SubAgent、main session、`issue-refinement-loop`、`post-merge-cleanup` |
-| `edit-issue` | 既存 Issue 本文更新の手順（バックアップ / Guard / 差分閾値 / `gh issue edit --body-file`）| `issue-author` SubAgent、`issue-refinement-loop`、`post-merge-cleanup`、`review-issue`（needs-fix 適用時） |
+| `edit-issue` | 既存 Issue 本文更新の transaction 手順（candidate body / guard / readiness / controlled executor / bounded result）| `issue-author` SubAgent、`issue-refinement-loop`、`post-merge-cleanup`、`review-issue`（needs-fix 適用時） |
 | `review-issue` | Issue 本文の品質を決定論的にチェックして verdict と差分提案を返す | main session、`issue-reviewer` SubAgent（`issue-refinement-loop` loop worker 経由） |
 | `issue-contract-review` | 実装着手直前に作業計画・コンテクスト・開発フロー適合性を preflight | main session、`implement-issue` の手前 |
 | `issue-refinement-loop` | Issue 改善 4 段ループのオーケストレーター | main session |
@@ -1483,3 +1483,180 @@ exact command class allow は executor script identity + argv 形状のみを検
 なしで同じ allow 経路に乗る。raw `gh issue edit` / `gh issue comment` は
 `_classify_gh` により引き続き `mutating` に分類され、active issue + no-matching-worktree
 状態では block される。
+
+## edit-issue transaction helper contracts（Issue #1287）
+
+既存 Issue body/comment mutation の consumer contract は `edit_issue_txn.py` に集約する。
+権限境界は helper input/result schema と controlled executor command id で固定する。
+
+### ISSUE_EDIT_TXN_INPUT_V1
+
+```yaml
+type: object
+additionalProperties: false
+required:
+  - schema
+  - issue_number
+  - repo
+  - new_body_file
+  - readiness_forwarding_payload
+  - comment_mode
+  - expected_previous_body_sha256
+  - expected_previous_updated_at
+  - title_update
+properties:
+  schema:
+    const: ISSUE_EDIT_TXN_INPUT_V1
+  issue_number:
+    type: integer
+  repo:
+    type: string
+  new_body_file:
+    type: string
+  readiness_forwarding_payload:
+    type: object
+    additionalProperties: false
+    required: [readiness_result]
+    properties:
+      readiness_result:
+        type: object
+        additionalProperties: false
+        required:
+          - status
+          - body_sha256
+          - source_checks
+          - errors
+          - readiness_result_ref
+        properties:
+          status:
+            enum: [go, needs_fix, human_judgment, input_or_runtime_error]
+          body_sha256:
+            type: string
+          source_checks:
+            type: array
+            items:
+              type: string
+          errors:
+            type: array
+            items:
+              type: object
+          readiness_result_ref:
+            type: string
+  comment_mode:
+    type: object
+    additionalProperties: false
+    required: [mode]
+    properties:
+      mode:
+        enum: [skip, publish]
+      comment_body_file:
+        type: [string, "null"]
+      marker:
+        type: [string, "null"]
+  expected_previous_body_sha256:
+    type: string
+  expected_previous_updated_at:
+    type: string
+  title_update:
+    type: object
+    additionalProperties: false
+    required: [required, proposed_title, reason]
+    properties:
+      required:
+        type: boolean
+      proposed_title:
+        type: [string, "null"]
+      reason:
+        type: [string, "null"]
+```
+
+- `title_update.required == true` は v1 では no-mutation failure に倒す
+- helper が生成する executor authority file は
+  `artifacts/{issue_number}/issue-metadata/{command-id}/` 配下のみ
+
+### ISSUE_EDIT_TXN_RESULT_V1
+
+```yaml
+type: object
+additionalProperties: false
+required:
+  - schema
+  - status
+  - issue_number
+  - repo
+  - mutation_started
+  - rollback_attempted
+  - body_update
+  - comment_publish
+  - errors
+properties:
+  schema:
+    const: ISSUE_EDIT_TXN_RESULT_V1
+  status:
+    enum: [ok, no_change, failed_no_mutation, failed_after_mutation, human_judgment]
+  issue_number:
+    type: [integer, "null"]
+  repo:
+    type: [string, "null"]
+  mutation_started:
+    type: boolean
+  rollback_attempted:
+    const: false
+  body_update:
+    type: object
+    additionalProperties: false
+    required:
+      - attempted
+      - status
+      - previous_body_sha256
+      - new_body_sha256
+      - remote_current_body_sha256
+      - artifact_ref
+    properties:
+      attempted:
+        type: boolean
+      status:
+        enum: [not_run, ok, failed]
+      previous_body_sha256:
+        type: [string, "null"]
+      new_body_sha256:
+        type: [string, "null"]
+      remote_current_body_sha256:
+        type: [string, "null"]
+      artifact_ref:
+        type: [string, "null"]
+  comment_publish:
+    type: object
+    additionalProperties: false
+    required:
+      - attempted
+      - status
+      - comment_id
+      - comment_url
+      - artifact_ref
+    properties:
+      attempted:
+        type: boolean
+      status:
+        enum: [not_run, ok, failed]
+      comment_id:
+        type: [string, "null"]
+      comment_url:
+        type: [string, "null"]
+      artifact_ref:
+        type: [string, "null"]
+  errors:
+    type: array
+    items:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+```
+
+- stdout は exactly one bounded JSON object とし、old/new issue body や raw child stdout/stderr を含めない
+- body/comment mutation authority は `issue_body.update` / `issue_comment.publish` に限定する

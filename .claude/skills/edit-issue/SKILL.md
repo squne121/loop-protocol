@@ -1,459 +1,118 @@
 ---
 name: edit-issue
-description: 既存 GitHub Issue 本文の更新手順。reviewer フィードバックや人間判断結果を反映して `gh issue edit` で本文を書き戻すまでの一連の手順を提供する。issue-author SubAgent や main session が「Issue ◯◯ の本文を修正して」「Issue 本文を更新して」「edit issue」などのトリガーで使う。`create-issue`（新規起票）に対する **既存 Issue 修正版**で、Template Guard / Outcome Quality Guard / 必須セクション保持を起票と同じ基準で適用する。
+description: 既存 GitHub Issue 本文更新を transaction helper に集約する手順。reviewer フィードバックや人間判断結果を反映し、controlled executor lane を使って body/comment mutation を 1 transaction として実行する。issue-author SubAgent や main session が「Issue ◯◯ の本文を修正して」「Issue 本文を更新して」「edit issue」などのトリガーで使う。
 ---
 
 # Edit Issue
 
-既存 Issue 本文を `gh issue edit` で安全に書き戻す手順。
-`create-issue`（新規起票手順）と対をなし、共通参照 [`../create-issue/references/body-authoring.md`](../create-issue/references/body-authoring.md) の guideline を踏襲する。
+既存 Issue body/comment mutation の production path を
+`.claude/skills/edit-issue/scripts/edit_issue_txn.py` に集約する。
+呼び出し側は candidate body と readiness context を用意し、helper の
+JSON result を次の routing に使う。本文の書き戻し authority は
+`issue_body.update` / `issue_comment.publish` の controlled executor command id
+だけに限定する。
+
+## Dependency Policy
+
+```yaml
+dependency_policy:
+  required_for_txn_helper: "#1284 / PR #1295"
+  required_for_end_to_end_raw_mutation_removal: "#1291 / PR #1298"
+```
+
+- `required_for_txn_helper` は transaction helper 自体の前提。
+- `required_for_end_to_end_raw_mutation_removal` は local main guard 側の allowlist 整理を含む別 dependency。
+- 本 skill の success は helper consumer 移行を意味し、repo 全体の raw mutation 経路排除完了とは同義にしない。
 
 ## Inputs
 
 - `issue_number`（必須）
-- `reviewer_feedback_url` または `reviewer_feedback_text`（任意。なければ最新コメントから抽出）
-- `readiness_forwarding_payload`（任意）: `READINESS_FORWARDING_PAYLOAD_V1`
-  ```yaml
-  READINESS_FORWARDING_PAYLOAD_V1:
-    readiness_result:
-      status: go | needs_fix | human_judgment | input_or_runtime_error
-      body_sha256: <sha256>
-      source_checks:
-        - contract_readiness_check.py --mode preflight-static
-      errors: []
-      readiness_result_ref: <artifact-or-path>
-  ```
-- `title_update`（任意）: タイトル更新が必要な場合に指定する
-  ```yaml
-  title_update:
-    required: true | false
-    proposed_title: string | null   # required=true の場合のみ設定
-    reason: string | null           # required=true の場合のみ設定
-  ```
+- `reviewer_feedback_url` または `reviewer_feedback_text`（任意）
+- `readiness_forwarding_payload`（必須）: `READINESS_FORWARDING_PAYLOAD_V1`
+- `new_body_file`（必須）: candidate issue body を保存した repo-relative file
+- `comment_mode`（任意）: success comment を controlled publish するかの指定
+- `title_update`（任意）: v1 では `required: true` を受け取っても no-mutation fail にする
 
-## Procedure
+## Input Contract
 
-### 1. バックアップ取得（必須）
+`docs/dev/agent-skill-boundaries.md` の `ISSUE_EDIT_TXN_INPUT_V1` を正本とする。
+呼び出し側は以下のような JSON を repo 配下に書き、helper に渡す。
 
-```bash
-ISSUE_NUMBER=<issue_number>
-STDOUT=$(uv run --locked python3 .claude/skills/edit-issue/scripts/backup-and-parse-issue.py "$ISSUE_NUMBER")
-METADATA_FILE=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['metadata_file'])" <(echo "$STDOUT"))
-# metadata ファイルから REPO / OLD_TITLE / BACKUP_FILE を読み込む（body は含まない）
-REPO=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['repo'])" "$METADATA_FILE")
-OLD_TITLE=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['title'])" "$METADATA_FILE")
-BACKUP_FILE=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['backup_file'])" "$METADATA_FILE")
-```
-
-`backup-and-parse-issue.py` は以下を実行する:
-1. `gh issue view <N> --repo <repo> --json title,body` を subprocess 配列形式で呼び出す
-2. body を `tmp/issue_<N>_backup_<ts>.md` に保存する
-3. metadata（issue_number / repo / backup_file / title）を `tmp/issue_<N>_backup_<ts>.json` に保存する（body は含まない）
-4. stdout には `{"metadata_file": "tmp/issue_<N>_backup_<ts>.json"}` のみ出力する
-
-このバックアップは後続の全ステップで abort 時の復旧に使う。
-
-**title の backup / rollback**:
-- `OLD_TITLE` は metadata ファイルから取得する（inline `gh issue view` は使用しない — Guardrails 参照）。
-- Step 7（abort 時復旧）では body バックアップと共に `--title "$OLD_TITLE"` を使って元のタイトルに戻す（`title_update.required == true` の場合）。
-
-**rollback 共通関数（Step 1 で定義、Step 5 失敗時・Step 7 の双方で使用）**:
-
-```bash
-rollback_issue_edit() {
-  if [ "${TITLE_UPDATE_REQUIRED:-false}" = "true" ]; then
-    gh issue edit "$ISSUE_NUMBER" --repo "$REPO" \
-      --title "$OLD_TITLE" \
-      --body-file "$BACKUP_FILE" 2>/dev/null \
-      || echo "[CRITICAL] rollback failed: old_title=$OLD_TITLE backup=$BACKUP_FILE" >&2
-  else
-    gh issue edit "$ISSUE_NUMBER" --repo "$REPO" \
-      --body-file "$BACKUP_FILE" 2>/dev/null \
-      || echo "[CRITICAL] rollback failed: $BACKUP_FILE" >&2
-  fi
+```json
+{
+  "schema": "ISSUE_EDIT_TXN_INPUT_V1",
+  "issue_number": 1287,
+  "repo": "squne121/loop-protocol",
+  "new_body_file": "tmp/issue_1287_new.md",
+  "readiness_forwarding_payload": {
+    "readiness_result": {
+      "status": "go",
+      "body_sha256": "sha256:...",
+      "source_checks": ["contract_readiness_check.py --mode static"],
+      "errors": [],
+      "readiness_result_ref": "artifacts/.../readiness.json"
+    }
+  },
+  "comment_mode": {
+    "mode": "skip"
+  },
+  "expected_previous_body_sha256": "sha256:...",
+  "expected_previous_updated_at": "2026-07-03T10:40:51Z",
+  "title_update": {
+    "required": false,
+    "proposed_title": null,
+    "reason": null
+  }
 }
 ```
 
-### 2. レビューフィードバックの収集
+## Procedure
 
-`reviewer_feedback_url` 指定時:
-```bash
-COMMENT_ID=<id extracted from reviewer_feedback_url by caller>
-mkdir -p tmp
-gh api "/repos/$REPO/issues/comments/$COMMENT_ID" --jq '.body' > tmp/reviewer_feedback.md
-```
+### 1. candidate body と readiness context を準備する
 
-`COMMENT_ID` は `reviewer_feedback_url` の末尾 `issuecomment-<id>` 部分を安全にパースして指定すること。
+- `reviewer_feedback_url` / `reviewer_feedback_text` と `readiness_forwarding_payload` を使って candidate body を生成する
+- candidate body は repo-relative file に保存する
+- `title_update.required == true` が必要なら本文修正ではなく別 routing に分岐する
+- body authoring rule は [`../create-issue/references/body-authoring.md`](../create-issue/references/body-authoring.md) を使う
 
-未指定時: Issue コメント一覧から最新の改善提案コメント（`review-issue` などの skill 由来）を `gh issue view <番号> --comments` で取得して使う。
-
-### 3. 改善後の本文を生成
-
-reviewer feedback に基づき以下を満たす形で本文を更新:
-
-- テンプレ構造を維持（`.github/ISSUE_TEMPLATE/{種別}.yml` の必須セクションが残っている）
-- AC / VC 番号一致を確認（[`../create-issue/references/body-authoring.md`](../create-issue/references/body-authoring.md) §VC 作成ガイダンス参照）
-- **VC_SINGLE_COMMAND_GUARDRAIL**: VC に shell control operator（&&, ||, |, ;, &）を含む compound shell を書かない。詳細は [`../create-issue/references/body-authoring.md#VC_SINGLE_COMMAND_GUARDRAIL`](../create-issue/references/body-authoring.md#VC_SINGLE_COMMAND_GUARDRAIL) を参照。
-- Machine-Readable Contract block の YAML key を破壊しない（値のみ更新）
-- 削除確認パターン、決定論的 VC の原則を適用
-- implementation issue を更新する場合は `docs/dev/workflow.md` の canonical contract を正本とし、`template auto-labels` / `consumer ready contract` / `triage profile` の区別を崩さない
-- implementation issue では state/queued を ready gate として再導入しないこと。body/title 更新だけで metadata drift を解消できない場合は human escalation に留める
-- `readiness_forwarding_payload.readiness_result.status: go` の場合は pre-author static readiness blocker なしとして扱い、通常の edit フローを継続する
-- `readiness_forwarding_payload.readiness_result.status: needs_fix` の場合は `errors[]` と `readiness_result_ref` を consumer-side 修正入力として扱い、reviewer summary より優先して反映する
-- `readiness_forwarding_payload.readiness_result.status: human_judgment | input_or_runtime_error` の場合は fail-closed とし、Step 5 の mutation を実行しない
-
-#### 3a. ISSUE_TEMPLATE を読み込んで required ラベルを列挙する
-
-本文を書き換える前に、対象 ISSUE_TEMPLATE の `validations.required: true` ラベルを動的に列挙して、必須セクションの網羅性を確認する。
-
-`guard-issue-body.py` の `load_required_labels()` 関数が `.github/ISSUE_TEMPLATE/{issue_kind}.yml` を `yaml.safe_load()` でパースし、`type: markdown` 要素を除外したうえで `validations.required: true` の `attributes.label` を返す。issue_kind は以下の優先順で解決する:
-
-1. `--issue-kind` CLI 引数（`implementation` / `research` / `parent`）
-2. 本文の Machine-Readable Contract fenced yaml 内の `issue_kind` フィールド
-3. どちらも解決不能なら `template_guard` を fail（pass にしない）
+### 2. helper を起動する
 
 ```bash
-# yq を使う場合（利用可能なら優先）
-yq '.body[] | select(.type != "markdown") | select(.validations.required == true) | .attributes.label' \
-  .github/ISSUE_TEMPLATE/<種別>.yml
-
-# python3 を使う場合（guard-issue-body.py の load_required_labels と同等）
-uv run --locked python3 -c "
-import yaml
-with open('.github/ISSUE_TEMPLATE/<種別>.yml') as f:
-    t = yaml.safe_load(f)
-required = [
-    i['attributes']['label'] for i in t.get('body', [])
-    if i.get('type') != 'markdown' and i.get('validations', {}).get('required')
-]
-print('\n'.join(required))
-"
+uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py \
+  --input-file tmp/issue_<N>_txn_input.json
 ```
 
-列挙した全ラベルが更新後の本文に `## <ラベル>` として存在することを確認すること。
-
-対応する `.yml` が存在しない種別を渡された場合、`guard_template()` は pass ではなく fail を返す。
-
-#### 3b. AC 番号と VC コメント # AC<n> の照合
-
-AC 件数と VC の `# AC<n>` コメント件数が一致しているかを確認する（`guard-issue-body.py` の AC/VC alignment check と同じロジックを手動で事前確認）。
-
-```bash
-# 更新後の本文ファイルに対して実行する
-AC_COUNT=$(awk '/^## Acceptance Criteria/{flag=1; next} /^## /{flag=0} flag && /- \[ \] AC[0-9]/' "$NEW_BODY" | wc -l)
-VC_AC_COUNT=$(rg -c "# AC[0-9]" "$NEW_BODY" || echo 0)
-[ "$AC_COUNT" -eq "$VC_AC_COUNT" ] \
-  && echo "PASS: AC/VC 番号一致 ($AC_COUNT 件)" \
-  || echo "FAIL: AC=$AC_COUNT / VC AC コメント=$VC_AC_COUNT"
-```
-
-不一致の場合は本文を修正してから次へ進む。
-
-#### 3c. rg を用いた VC 構築
-
-VC コマンドを作成または更新する場合は `rg` を使う。Perl 互換正規表現が必要な場合は `-P` フラグを付ける（`grep -P` は GNU grep 限定だが `rg -P` は ripgrep 組み込みのため移植性が高い）。
-
-```bash
-# 基本形: 特定パターンが存在することを確認
-rg -n "<pattern>" <file>
-
-# Perl 互換正規表現が必要な場合
-rg -Pn "<perl-compatible-pattern>" <file>
-
-# 見出し配下の内容確認（2 段パイプ）
-rg -nA 20 "^## <見出し>" <file> | rg "<content-pattern>"
-```
-
-`grep` は GNU 拡張差や Perl 互換構文の扱いが環境によって分かれるため、VC での使用を避ける。
-
-#### 3d. baseline で全 VC が fail することを確認
-
-本文を書き戻す前に、実装前の状態（baseline）で VC が fail することを確認する。fail しない VC は「実装によって変化しない」ため VC として意味がない。
-
-```bash
-# 各 VC コマンドを実行して exit code を確認する
-# exit code 非ゼロ（fail）であれば baseline check 通過
-<VC コマンド>; echo "Exit: $?"
-
-# rg を使う VC の場合、マッチなし = exit 1 = fail = baseline 確認 OK
-rg -n "<pattern>" <file>; echo "Exit: $?"  # 0 なら実装済みの可能性
-```
-
-baseline で pass する VC が存在する場合は、VC のコンテキスト見出し固定が不足している可能性がある（ex. 別セクションの既存記述に誤マッチ）。VC パターンを tighten してから proceed すること。
-
-更新後の本文全体を tmp ファイルに保存:
-```bash
-mkdir -p tmp
-NEW_BODY="tmp/issue_${ISSUE_NUMBER}_new_$(date +%s).md"
-# <更新後の本文全体を $NEW_BODY に Write ツールで書き出す>
-```
-
-### 4. Guard を適用（create-issue と同じ基準）
-
-以下のスクリプト呼び出し 1 回で全ガードを適用する。1 つでも fail なら abort してバックアップから復旧。
-
-`--issue-kind` 引数で issue_kind を明示する。指定しない場合は本文の Machine-Readable Contract の `issue_kind` フィールドから自動取得する。
-
-```bash
-uv run --locked python3 .claude/skills/edit-issue/scripts/guard-issue-body.py "$NEW_BODY" \
-  --orig-file "$BACKUP_FILE" \
-  --issue-kind <implementation|research|parent> \
-  --format yaml
-```
-
-`guard-issue-body.py` は以下を順に検証する:
-
-- **Template Guard**: `.github/ISSUE_TEMPLATE/{issue_kind}.yml` の `validations.required: true` ラベルを動的に取得し、`## <ラベル>` 形式で本文に存在するか確認する。`type: markdown` 要素は除外する。対応 `.yml` が存在しない種別は pass ではなく fail。
-- **Outcome Quality Guard**: Outcome が成果物形式と完了条件を含むか（動作状態のみパターンを検出）
-- **差分閾値（削減率 50% 超で abort）**: `--orig-file` 指定時のみ適用
-- **AC/VC 番号一致**: AC 件数と VC の `# AC<N>` コメント件数が一致するか。ただし issue_kind が `Verification Commands` を必須セクションに持たない種別（例: `parent`）では自動的に `skipped: true` を返して pass 扱いにする（ハードコードではなく ISSUE_TEMPLATE の required ラベルで動的判定）。
-
-スクリプトが exit 2 を返した場合は abort し、ステップ 7 の復旧処理へ進む。
-
-### 4.3. issue_contract_hygiene_autofix を実行（C4/C9 trivial format repair）
-
-`guard-issue-body.py` が pass した後、`contract_readiness_check` の前に `issue_contract_hygiene_autofix.py` を実行して C4/C9 の trivial format blocker を補正する。
-
-```bash
-uv run --locked python3 .claude/skills/edit-issue/scripts/issue_contract_hygiene_autofix.py \
-  --body-file "$NEW_BODY" --out-file "$NEW_BODY"
-HYGIENE_EXIT=$?
-# exit 0: 補正あり（$NEW_BODY がインプレースで更新されている）
-#   → contract_hygiene_repair_applied: true として ISSUE_AUTHOR_RESULT_V1 に記録
-# exit 1: 補正なし（trivial blocker が存在しないか sha256 変化なし）
-#   → contract_hygiene_repair_applied: false
-# exit 2: trivial 以外の blocker または autofixable 判定不能
-#   → 補正せず続行（contract_hygiene_repair_applied: false）
-if [ "$HYGIENE_EXIT" -eq 0 ]; then
-  CONTRACT_HYGIENE_REPAIR_APPLIED=true
-else
-  CONTRACT_HYGIENE_REPAIR_APPLIED=false
-fi
-```
-
-補正ありの場合（`exit 0`）、`$NEW_BODY` は更新済みのため後続の `contract_readiness_check`（Step 4.5）は補正済み本文に対して実行される。
-
-### 4.5. contract_readiness_check を fail-closed で実行
-
-`guard-issue-body.py` が pass した後、mutation 前に contract readiness を確認する。
-`status: go` 以外（`needs_fix` / `human_judgment`）の場合は `gh issue edit` を実行しない（fail-closed）。
-
-```bash
-uv run --locked python3 .claude/skills/issue-contract-review/scripts/contract_readiness_check.py \
-  --body-file "$NEW_BODY" --mode static
-READINESS_EXIT=$?
-# exit 0 = go, exit 1 = needs_fix, exit 2 = human_judgment
-if [ "$READINESS_EXIT" -ne 0 ]; then
-  echo "[ABORT] contract_readiness_check failed (exit $READINESS_EXIT). Not proceeding with gh issue edit." >&2
-  exit "$READINESS_EXIT"
-fi
-```
-
-### 5. body-file 経由で `gh issue edit` を実行
-
-top-level `title_update.required == true` の場合、`--title` オプションを同時に指定して body とタイトルを 1 コマンド（single command / co-update）で更新する。`title_update.required` の値に応じて排他的に分岐し、body-only 更新と title+body 更新が両方実行されることがないようにする。
-
-`rollback_issue_edit()` は Step 1 で定義済み。
-
-```bash
-# TITLE_UPDATE_REQUIRED は top-level title_update.required から設定する（true / false）
-# PROPOSED_TITLE は top-level title_update.proposed_title から設定する（required=true 時のみ）
-if [ "${TITLE_UPDATE_REQUIRED:-false}" = "true" ]; then
-  test -n "${PROPOSED_TITLE:-}" || {
-    echo "[ERROR] title_update.required=true だが PROPOSED_TITLE が空です" >&2
-    mkdir -p tmp
-    echo "## edit-issue: failed
-- status: failed
-- reason: title_update.required=true だが PROPOSED_TITLE が空
-- issue_number: ${ISSUE_NUMBER}
-- backup_file: ${BACKUP_FILE}" > tmp/edit_issue_error.md
-    # ISSUE_EDIT_RESULT_V1 として失敗を記録（Step 7 の rollback_issue_edit は不要 — 編集未着手）
-    exit 2
-  }
-  gh issue edit "$ISSUE_NUMBER" --repo "$REPO" \
-    --title "$PROPOSED_TITLE" \
-    --body-file "$NEW_BODY"
-  EDIT_EXIT=$?
-else
-  gh issue edit "$ISSUE_NUMBER" --repo "$REPO" \
-    --body-file "$NEW_BODY"
-  EDIT_EXIT=$?
-fi
-
-if [ "$EDIT_EXIT" -ne 0 ]; then
-  echo "[ERROR] gh issue edit 失敗。バックアップから自動復元します。" >&2
-  rollback_issue_edit
-  exit "$EDIT_EXIT"
-fi
-```
-
-### 5.5. postcondition: ready tuple 検証（implementation issue のみ）
-
-Step 5 の mutation が成功した後、成功 comment（Step 6）を投稿する前に、GitHub 上の最終状態を read-back して implementation issue の ready tuple を `guard-issue-body.py --check-ready-tuple` で検証する。
-
-**適用条件**: `issue_kind == "implementation"` の場合のみ実行する。research / parent 種別ではスキップする。
-
-```bash
-# Step 5.5: gh issue view で読み戻し → guard-issue-body.py --check-ready-tuple で検証
-if [ "${ISSUE_KIND:-}" = "implementation" ]; then
-  READBACK_JSON=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json title,labels)
-  READBACK_TITLE=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['title'])" "$READBACK_JSON")
-  LABEL_ARGS=""
-  while IFS= read -r lname; do
-    LABEL_ARGS="$LABEL_ARGS --label $lname"
-  done < <(python3 -c "import json,sys; [print(l['name']) for l in json.loads(sys.argv[1])['labels']]" "$READBACK_JSON")
-
-  uv run --locked python3 .claude/skills/edit-issue/scripts/guard-issue-body.py "$NEW_BODY" \
-    --issue-kind implementation \
-    --check-ready-tuple \
-    --title "$READBACK_TITLE" \
-    $LABEL_ARGS
-  READY_TUPLE_EXIT=$?
-
-  if [ "$READY_TUPLE_EXIT" -ne 0 ]; then
-    # 失敗時の分岐:
-    # - edit によって title/label を壊した場合 → rollback を試みる
-    # - 元から ready tuple が壊れていた場合 → rollback せず fail comment + stop
-    #   (判定: BACKUP_FILE の title/labels を比較して壊した側を確認する)
-    #
-    # 簡易判定: BACKUP_FILE を参照して元から壊れていたか確認できない場合は
-    # rollback せず fail comment を投稿して停止する（safe-side: rollback しない）
-    mkdir -p tmp
-    echo "## edit-issue: Step 5.5 postcondition FAILED
-- status: failed
-- reason: implementation issue ready tuple validation failed after edit
-- issue_number: ${ISSUE_NUMBER}
-- title: ${READBACK_TITLE}
-- labels: ${READBACK_LABELS:-unknown}
-- guard_exit: ${READY_TUPLE_EXIT}
-- action: manual fix required (check title prefix and phase/implementation label)" > tmp/edit_issue_error.md
-    gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body-file tmp/edit_issue_error.md
-    echo "[ERROR] Step 5.5: ready tuple validation failed. Not proceeding to Step 6." >&2
-    exit "$READY_TUPLE_EXIT"
-  fi
-fi
-```
-
-**失敗時の扱い**:
-- edit によって title/label を壊した場合: rollback を試みる（`rollback_issue_edit()` を呼ぶ）
-- 元から ready tuple が壊れていた（edit 前から非 canonical だった）場合: rollback せず fail comment + stop
-- いずれも Step 6 の「成功コメント」は投稿しない
-
-成功時のみ Step 6 に進む。
-
-### 6. 変更経緯コメントを投稿
-
-```bash
-mkdir -p tmp
-gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body-file tmp/edit_issue_comment.md
-```
-
-コメント本文（`tmp/edit_issue_comment.md`）には変更セクション一覧・変更理由・Guard 結果サマリを含める。
-
-### 7. abort 時の復旧
-
-ステップ 4, 5 のいずれかで fail した場合（Step 1 で定義した `rollback_issue_edit()` 共通関数を使用する）:
-
-```bash
-# rollback_issue_edit は Step 1 で定義済み。
-# title_update.required == true の場合: --title "$OLD_TITLE" --body-file "$BACKUP_FILE" で復旧
-# title_update.required == false の場合: --body-file "$BACKUP_FILE" のみで復旧
-# OLD_TITLE は Step 1 で metadata ファイルから取得した元タイトル
-rollback_issue_edit
-
-mkdir -p tmp
-gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body-file tmp/edit_issue_error.md
-```
-
-## Output (ISSUE_EDIT_RESULT_V1)
-
-```yaml
-ISSUE_EDIT_RESULT_V1:
-  status: ok | failed
-  generated_at: <ISO 8601>
-  generated_by: edit-issue
-  issue_url: https://github.com/<owner>/<repo>/issues/<番号>
-  guards:
-    template_guard: pass | fail
-    outcome_quality_guard: pass | fail
-    diff_threshold_check:
-      passed: true | false
-      orig_lines: <int>
-      new_lines: <int>
-    ac_vc_alignment:
-      passed: true | false
-      ac_count: <int>
-      vc_ac_comment_count: <int>
-  update_applied: true | false
-  backup_file: tmp/issue_<番号>_backup_<epoch>.md
-  title_update:  # optional（ISSUE_EDIT_RESULT_V1 の optional field）。top-level title_update.required == true の場合のみ設定する。タイトル更新が不要な場合（superseded_by_decision / structural-only needs-fix / AC/VC 整形のみ）は省略してよい。
-    applied: true | false
-    old_title: <変更前タイトル>
-    new_title: <変更後タイトル>
-  warnings: []
-  errors: []
-```
-
-## Delivery-rollup Parent Body Update Mode
-
-`CHILD_MATERIALIZATION_PLAN_V2` の `parent_body_updates` を使って、delivery-rollup parent の body drift（`(未起票)` placeholder が残ったまま）を修正するための特化手順。通常の edit-issue フロー（backup / guard / rollback）をそのまま踏む。
-
-### 入力
-
-```yaml
-edit_mode: delivery-rollup-parent-update
-input: CHILD_MATERIALIZATION_PLAN_V2   # plan_child_materialization.py の出力
-```
-
-### 手順
-
-1. plan の `parent_body_updates` を取得する（空なら本 mode はスキップ）。
-
-2. 通常手順のステップ 1（バックアップ取得）を実行する — 変更前 body を `tmp/issue_<N>_backup_<ts>.md` に保存。
-
-3. バックアップから新 body を生成する:
-   - `parent_body_updates[*].old_line` を `parent_body_updates[*].new_line` に一括置換する
-   - 各エントリの `expected_match_count` が指定されている場合、実際の置換件数と一致しない場合は abort する（fail-closed）
-   - 許容される placeholder 置換:
-     - `(未起票)` を `#<issue_number>` に置換
-     - stale child list エントリの状態同期
-   - 禁止: Outcome / In Scope / Acceptance Criteria の意味変更、無関係な prose の書き換え
-
-4. 通常手順のステップ 4（guard-issue-body.py による Guard）を実行する:
-   - 差分閾値チェック（削減率 50% 超で abort）
-   - Template Guard / AC-VC 番号一致チェック
-
-5. 通常手順のステップ 5（`gh issue edit --body-file`）を実行する。失敗時は `rollback_issue_edit()` で復元。
-
-6. 通常手順のステップ 6（変更経緯コメント投稿）を実行する。コメントには `CHILD_MATERIALIZATION_PLAN_V2` の `required_issue_edits` サマリを含める。
-
-### 制約
-
-- `plan_child_materialization.py` は read-only であり、本 mode の内部では実行しない（呼び出し元が plan を渡す）
-- guard で abort した場合は `rollback_issue_edit()` を呼びバックアップから復元する
-- Outcome / In Scope / AC の意味を変える置換は forbidden（guard で検出されなくても実施しない）
-
-## Constraints
-
-- **body-file 経由必須**: `--body "<inline>"` は使わない（クォート崩壊・HEREDOC 由来エスケープのリスク）
-- **バックアップ必須**: ステップ 1 を省略しない
-- **abort 時自動復旧**: 4, 5 の fail で必ずバックアップから書き戻し試行
-- **Machine-Readable Contract block 保持**: YAML key を破壊しない（値のみ更新）
+helper は以下の固定順序で進む。
+
+1. current issue readback
+2. candidate body load
+3. stale precondition check
+4. guard
+5. hygiene autofix
+6. static readiness check
+7. `issue_body.update` 用 input file 生成
+8. controlled body update
+9. final readback
+10. optional `issue_comment.publish`
+11. bounded result 出力
+
+### 3. failure routing
+
+- `title_update.required == true` → `failed_no_mutation`
+- stale precondition / guard / readiness failure → `failed_no_mutation`
+- body update 後の final readback failure → `failed_after_mutation`
+- body update 成功後の comment publish failure → `failed_after_mutation`
+- `readiness_forwarding_payload.readiness_result.status` が `human_judgment` または `input_or_runtime_error` → `human_judgment`
+
+### 4. Output
+
+`docs/dev/agent-skill-boundaries.md` の `ISSUE_EDIT_TXN_RESULT_V1` を返す。
+helper stdout は最後の 1 JSON object のみで、old/new issue body や child stdout/stderr を含めない。
 
 ## Guardrails
 
-- **scripts entrypoint 経由統一**: バックアップ取得（title + body）・Guard 判定は必ず `.claude/skills/edit-issue/scripts/` のスクリプト経由で実行する。`OLD_TITLE` / `REPO` / `BACKUP_FILE` は `backup-and-parse-issue.py` が出力する metadata ファイルから取得すること（inline `gh issue view --json title` による取得は禁止）
-- **inline `gh` / `jq` / `grep` / `awk` / heredoc 使用禁止**: Step 1（バックアップ・title 取得含む）および Step 4（Guard）での inline bash パイプラインは使用しない。`gh issue edit --body-file` / `gh issue comment` 等の編集・通知系コマンドは引き続き inline で使用してよい
-- **スクリプトは `subprocess.run([...])` 配列形式のみ**: `shell=True` 禁止
-- **外部入力の validation**: issue_number は `^\d+$`、ファイルパスは `^[A-Za-z0-9._/-]+$` で検証済み
-
-## Related
-
-- `.claude/skills/create-issue/SKILL.md` — 新規起票手順（対）
-- [`.claude/skills/create-issue/references/body-authoring.md`](../create-issue/references/body-authoring.md) — VC 作成 / Anchor Verification / Contract block 等の共通ガイドライン
-- `.claude/agents/issue-author.md` — 本 skill を使う「Issue 起票・修正の役割」SubAgent
-- `.claude/skills/review-issue/SKILL.md` — `needs-fix` 結果を本 skill で本文へ反映
-
-## 出力制約 (OUTPUT_BUDGET_V1)
-
-`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
+- existing issue body/comment mutation の production path は `edit_issue_txn.py` 経由に限定する
+- helper は `issue_body.update` / `issue_comment.publish` 以外の mutation command id を使わない
+- `title_update` は v1 scope 外。controlled title executor が無い限り no-mutation fail にする
+- executor input は `artifacts/{issue_number}/issue-metadata/{command-id}/` 配下だけに生成する
+- helper は `capture_output=True, text=True, shell=False` で子プロセスを起動し、bounded diagnostics だけを result に残す
