@@ -7,8 +7,7 @@
     ".claude/skills/impl-review-loop/scripts/tests/",
     ".claude/skills/implement-issue/tests/",
     ".claude/skills/open-pr/tests/",
-    ".claude/skills/edit-issue/tests/test_guard_issue_body.py",
-    ".claude/skills/edit-issue/tests/test_issue_contract_hygiene_autofix.py",
+    ".claude/skills/edit-issue/tests/",
     ".claude/skills/create-issue/tests/",
     ".claude/skills/create-issue/scripts/tests/",
     ".claude/skills/ssot-discovery/tests/test_match_ssot_registry.py",
@@ -63,6 +62,7 @@
     "schemas_tests_inclusion": "schemas/tests/ is included exactly once here; it was previously missing from the generator pytest_args, causing the executed target set and the ci_test_selection artifact to drift (Issue #1064).",
     "dedicated_lanes_excluded": "tests/codex/test_local_main_branch_guard.py runs in its own codex execpolicy step (needs the pinned codex CLI context) and is intentionally NOT in targets to avoid double execution. tests/codex/test_execpolicy_matrix.py is included here so python-test and ci_test_selection/v1 both treat the pure-Python execpolicy contract coverage as part of the shared python lane, while the dedicated Codex CLI step keeps only the runtime guard test isolated. The Node-backed lane (pnpm test / e2e) and the hook-discovery collect-only guard remain separate steps; this plan only governs the unified python pytest suite.",
     "ignore_deselect_contract": "ignore/deselect preserve the hook-discovery contract: test_secret_boundary_contract.py is ignored (tracked by #412) and the two non-hermetic generate_session_manifest wrapper tests are deselected.",
-    "node_test_lane": "test_session_manifest_debounce.mjs (AC4 virtual-clock tests) runs in the dedicated node-backed-hook-tests CI lane via `node --test` (Issue #1141 AC6). It is NOT in the pytest targets."
+    "node_test_lane": "test_session_manifest_debounce.mjs (AC4 virtual-clock tests) runs in the dedicated node-backed-hook-tests CI lane via `node --test` (Issue #1141 AC6). It is NOT in the pytest targets.",
+    "edit_issue_tests_directory_coverage": "Issue #1303: individual file targets test_guard_issue_body.py / test_issue_contract_hygiene_autofix.py were replaced by the directory target .claude/skills/edit-issue/tests/ so newly added tests in that directory (e.g. test_edit_issue_txn.py from PR #1301 / Issue #1287) are covered by the python-test lane and the ci_test_selection/v1 artifact without requiring a plan edit per new test file."
   }
 }

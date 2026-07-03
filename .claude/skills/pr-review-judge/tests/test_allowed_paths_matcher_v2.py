@@ -122,9 +122,26 @@ def _make_evaluator(allowed_paths):
     return evaluator
 
 
-@patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-def test_ac8_evaluator_returns_ok_not_indeterminate(mock_get_changed_files):
-    mock_get_changed_files.return_value = [".claude/skills/pr-review-judge/SKILL.md"]
+@patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+def test_ac8_evaluator_returns_ok_not_indeterminate(mock_get_records):
+    # NOTE (Issue #1300 review Blocker 1): the canonical local-fallback
+    # source is now `git diff --name-status -M -z`
+    # (get_changed_file_records_from_git()), not the deprecated
+    # `get_changed_files_from_git()` (--name-only) alias. This AC is about
+    # the matcher v2 grammar, not rename provenance, so we patch the
+    # canonical dispatch method directly with an equivalent
+    # ChangedFileRecord instead of relying on the deprecated alias.
+    from allowed_paths_review_gate import ChangedFileRecord, SOURCE_GIT_NAME_STATUS_Z
+
+    mock_get_records.return_value = [
+        ChangedFileRecord(
+            path=".claude/skills/pr-review-judge/SKILL.md",
+            status="modified",
+            previous_path=None,
+            source=SOURCE_GIT_NAME_STATUS_Z,
+            provenance_complete=True,
+        )
+    ]
     evaluator = _make_evaluator(allowed_paths=[".claude/skills/**/SKILL.md"])
     result = evaluator.evaluate()
     assert result.status == GateStatus.OK.value
