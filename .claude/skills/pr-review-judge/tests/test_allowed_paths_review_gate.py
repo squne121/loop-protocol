@@ -11,7 +11,15 @@ import pytest
 import_path = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(import_path))
 
-from allowed_paths_review_gate import AllowedPathsGateEvaluator, AllowedPathsMatcher, GateStatus
+from allowed_paths_review_gate import (  # noqa: E402
+    AllowedPathsGateEvaluator,
+    AllowedPathsMatcher,
+    ChangedFileRecord,
+    GateStatus,
+    SOURCE_GIT_NAME_STATUS_Z,
+    SOURCE_PR_FILES_API,
+    parse_git_diff_name_status_z,
+)
 
 
 BASE_ARGS = {
@@ -28,6 +36,16 @@ BASE_ARGS = {
     "contract_source_id": "456789",
     "issue_number": 758,
 }
+
+
+def _record(path, status="modified", previous_path=None, source=SOURCE_GIT_NAME_STATUS_Z):
+    return ChangedFileRecord(
+        path=path,
+        status=status,
+        previous_path=previous_path,
+        source=source,
+        provenance_complete=True,
+    )
 
 
 def make_evaluator(**overrides):
@@ -167,9 +185,9 @@ class TestContractFingerprintAndExecutionContext:
         )
         assert fp1 != fp2
 
-    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-    def test_execution_context_does_not_affect_freshness(self, mock_get_changed_files):
-        mock_get_changed_files.return_value = ["src/main.ts"]
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_execution_context_does_not_affect_freshness(self, mock_get_records):
+        mock_get_records.return_value = [_record("src/main.ts")]
         evaluator = make_evaluator(expected_contract_fingerprint="SELF")
         result = evaluator.evaluate()
         assert result.status == GateStatus.OK.value
@@ -185,8 +203,8 @@ class TestContractFingerprintAndExecutionContext:
 
 
 class TestHeadShaBinding:
-    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-    def test_head_sha_mismatch_is_indeterminate(self, mock_get_changed_files):
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_head_sha_mismatch_is_indeterminate(self, mock_get_records):
         evaluator = make_evaluator(
             head_sha="current_sha",
             reviewed_head_sha="reviewed_sha",
@@ -194,28 +212,28 @@ class TestHeadShaBinding:
         )
         result = evaluator.evaluate()
         assert result.status == GateStatus.INDETERMINATE.value
-        mock_get_changed_files.assert_not_called()
+        mock_get_records.assert_not_called()
 
-    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-    def test_head_sha_match_allows_evaluation(self, mock_get_changed_files):
-        mock_get_changed_files.return_value = ["src/main.ts"]
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_head_sha_match_allows_evaluation(self, mock_get_records):
+        mock_get_records.return_value = [_record("src/main.ts")]
         evaluator = make_evaluator(expected_contract_fingerprint="SELF")
         result = evaluator.evaluate()
         assert result.status == GateStatus.OK.value
         assert len(result.violations) == 0
 
-    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-    def test_result_has_correct_changed_files_source(self, mock_get_changed_files):
-        mock_get_changed_files.return_value = ["src/main.ts"]
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_result_has_correct_changed_files_source(self, mock_get_records):
+        mock_get_records.return_value = [_record("src/main.ts")]
         evaluator = make_evaluator(expected_contract_fingerprint="SELF")
         result = evaluator.evaluate()
-        assert result.changed_files_source == "git_diff_current_merge_base_head"
+        assert result.changed_files_source == SOURCE_GIT_NAME_STATUS_Z
         assert result.diff_base_sha == "abc123"
         assert result.base_sha == "abc123"
 
-    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-    def test_diff_base_sha_must_equal_current_merge_base(self, mock_get_changed_files):
-        mock_get_changed_files.return_value = ["src/main.ts"]
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_diff_base_sha_must_equal_current_merge_base(self, mock_get_records):
+        mock_get_records.return_value = [_record("src/main.ts")]
         evaluator = make_evaluator(
             diff_base_sha="provided_diff_base",
             computed_merge_base_sha="computed_merge_base",
@@ -226,35 +244,39 @@ class TestHeadShaBinding:
         assert result.changed_files_source == "git_diff_unvalidated_diff_base_head"
         assert "provided=provided_diff_base" in result.reason
         assert "computed=computed_merge_base" in result.reason
-        mock_get_changed_files.assert_not_called()
+        mock_get_records.assert_not_called()
 
 
 class TestAllowedPathsValidation:
-    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-    def test_changed_file_outside_allowed_paths_is_fail_closed(self, mock_get_changed_files):
-        mock_get_changed_files.return_value = ["forbidden/bad.ts"]
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_changed_file_outside_allowed_paths_is_fail_closed(self, mock_get_records):
+        mock_get_records.return_value = [_record("forbidden/bad.ts")]
         evaluator = make_evaluator(expected_contract_fingerprint="SELF", allowed_paths=["src/**", "tests/**"])
         result = evaluator.evaluate()
         assert result.status == GateStatus.FAIL_CLOSED.value
         assert result.violations[0]["file"] == "forbidden/bad.ts"
+        assert result.violations[0]["path_role"] == "filename"
 
-    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-    def test_exact_allowed_file_is_ok(self, mock_get_changed_files):
-        mock_get_changed_files.return_value = ["src/main.ts"]
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_exact_allowed_file_is_ok(self, mock_get_records):
+        mock_get_records.return_value = [_record("src/main.ts")]
         evaluator = make_evaluator(expected_contract_fingerprint="SELF", allowed_paths=["src/main.ts"])
         result = evaluator.evaluate()
         assert result.status == GateStatus.OK.value
 
-    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-    def test_recursive_allowed_file_is_ok(self, mock_get_changed_files):
-        mock_get_changed_files.return_value = ["src/components/Button.ts", "src/utils/helpers.ts"]
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_recursive_allowed_file_is_ok(self, mock_get_records):
+        mock_get_records.return_value = [
+            _record("src/components/Button.ts"),
+            _record("src/utils/helpers.ts"),
+        ]
         evaluator = make_evaluator(expected_contract_fingerprint="SELF")
         result = evaluator.evaluate()
         assert result.status == GateStatus.OK.value
 
-    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-    def test_contract_snapshot_body_sha_change_is_stale(self, mock_get_changed_files):
-        mock_get_changed_files.return_value = ["src/main.ts"]
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_contract_snapshot_body_sha_change_is_stale(self, mock_get_records):
+        mock_get_records.return_value = [_record("src/main.ts")]
         expected_fp = make_evaluator(
             contract_body_sha256="old_contract_sha",
             expected_contract_fingerprint="SELF").compute_contract_fingerprint(
@@ -262,11 +284,11 @@ class TestAllowedPathsValidation:
         evaluator = make_evaluator(expected_contract_fingerprint=expected_fp)
         result = evaluator.evaluate()
         assert result.status == GateStatus.STALE_SNAPSHOT.value
-        mock_get_changed_files.assert_not_called()
+        mock_get_records.assert_not_called()
 
-    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-    def test_base_sha_at_snapshot_change_is_stale(self, mock_get_changed_files):
-        mock_get_changed_files.return_value = ["src/main.ts"]
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_base_sha_at_snapshot_change_is_stale(self, mock_get_records):
+        mock_get_records.return_value = [_record("src/main.ts")]
         expected_fp = make_evaluator(
             base_sha_at_snapshot="base_at_snapshot",
             expected_contract_fingerprint="SELF").compute_contract_fingerprint(
@@ -278,9 +300,9 @@ class TestAllowedPathsValidation:
         result = evaluator.evaluate()
         assert result.status == GateStatus.STALE_SNAPSHOT.value
 
-    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-    def test_diff_base_sha_does_not_affect_freshness(self, mock_get_changed_files):
-        mock_get_changed_files.return_value = ["src/main.ts"]
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_diff_base_sha_does_not_affect_freshness(self, mock_get_records):
+        mock_get_records.return_value = [_record("src/main.ts")]
         expected_fp = make_evaluator(
             base_sha_at_snapshot="base_at_snapshot",
             diff_base_sha="diff_base_at_snapshot",
@@ -296,56 +318,56 @@ class TestAllowedPathsValidation:
         assert result.contract_fingerprint["base_sha_at_snapshot"] == "base_at_snapshot"
         assert result.diff_base_sha == "diff_base_after_update_branch"
 
-    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-    def test_missing_allowed_paths_is_indeterminate(self, mock_get_changed_files):
-        mock_get_changed_files.return_value = ["src/main.ts"]
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_missing_allowed_paths_is_indeterminate(self, mock_get_records):
+        mock_get_records.return_value = [_record("src/main.ts")]
         evaluator = make_evaluator(allowed_paths=[], expected_contract_fingerprint="SELF")
         result = evaluator.evaluate()
         assert result.status == GateStatus.INDETERMINATE.value
-        mock_get_changed_files.assert_not_called()
+        mock_get_records.assert_not_called()
 
-    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-    def test_missing_expected_contract_fingerprint_is_indeterminate(self, mock_get_changed_files):
-        mock_get_changed_files.return_value = ["src/main.ts"]
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_missing_expected_contract_fingerprint_is_indeterminate(self, mock_get_records):
+        mock_get_records.return_value = [_record("src/main.ts")]
         evaluator = make_evaluator(expected_contract_fingerprint=None)
         result = evaluator.evaluate()
         assert result.status == GateStatus.INDETERMINATE.value
         assert result.reason == "expected_contract_fingerprint_missing (merge-blocking)"
-        mock_get_changed_files.assert_not_called()
+        mock_get_records.assert_not_called()
 
-    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-    def test_missing_contract_source_id_is_indeterminate(self, mock_get_changed_files):
-        mock_get_changed_files.return_value = ["src/main.ts"]
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_missing_contract_source_id_is_indeterminate(self, mock_get_records):
+        mock_get_records.return_value = [_record("src/main.ts")]
         evaluator = make_evaluator(contract_source_id="", expected_contract_fingerprint="SELF")
         result = evaluator.evaluate()
         assert result.status == GateStatus.INDETERMINATE.value
         assert result.reason == "contract_source_kind/source_id missing (merge-blocking)"
-        mock_get_changed_files.assert_not_called()
+        mock_get_records.assert_not_called()
 
-    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-    def test_invalid_allowed_pattern_is_indeterminate(self, mock_get_changed_files):
-        mock_get_changed_files.return_value = ["src/main.ts"]
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_invalid_allowed_pattern_is_indeterminate(self, mock_get_records):
+        mock_get_records.return_value = [_record("src/main.ts")]
         expected_fp = make_evaluator(expected_contract_fingerprint="SELF").compute_contract_fingerprint()
         evaluator = make_evaluator(allowed_paths=["src/**suffix"], expected_contract_fingerprint=expected_fp)
         result = evaluator.evaluate()
         assert result.status == GateStatus.INDETERMINATE.value
         assert "invalid allowed path pattern" in result.reason
-        mock_get_changed_files.assert_not_called()
+        mock_get_records.assert_not_called()
 
-    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-    def test_worker_report_is_not_input(self, mock_get_changed_files):
-        mock_get_changed_files.return_value = ["actual/changed/file.ts"]
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_worker_report_is_not_input(self, mock_get_records):
+        mock_get_records.return_value = [_record("actual/changed/file.ts")]
         evaluator = make_evaluator(expected_contract_fingerprint="SELF", allowed_paths=["allowed_by_contract/**"])
         result = evaluator.evaluate()
         assert result.changed_files == ["actual/changed/file.ts"]
-        assert result.changed_files_source == "git_diff_current_merge_base_head"
+        assert result.changed_files_source == SOURCE_GIT_NAME_STATUS_Z
 
-    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
     def test_changed_files_source_does_not_claim_current_merge_base_when_unvalidated(
         self,
-        mock_get_changed_files,
+        mock_get_records,
     ):
-        mock_get_changed_files.return_value = ["src/main.ts"]
+        mock_get_records.return_value = [_record("src/main.ts")]
         evaluator = make_evaluator(
             diff_base_sha="provided_diff_base",
             computed_merge_base_sha="computed_merge_base",
@@ -354,11 +376,11 @@ class TestAllowedPathsValidation:
         result = evaluator.evaluate()
         assert result.status == GateStatus.INDETERMINATE.value
         assert result.changed_files_source == "git_diff_unvalidated_diff_base_head"
-        mock_get_changed_files.assert_not_called()
+        mock_get_records.assert_not_called()
 
-    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
-    def test_result_schema_includes_diff_base_sha_and_snapshot_fingerprint(self, mock_get_changed_files):
-        mock_get_changed_files.return_value = ["src/main.ts"]
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_result_schema_includes_diff_base_sha_and_snapshot_fingerprint(self, mock_get_records):
+        mock_get_records.return_value = [_record("src/main.ts")]
         evaluator = make_evaluator(
             base_sha_at_snapshot="snapshot_sha",
             diff_base_sha="merge_base_sha",
@@ -368,6 +390,199 @@ class TestAllowedPathsValidation:
         assert result["diff_base_sha"] == "merge_base_sha"
         assert result["base_sha"] == "merge_base_sha"
         assert result["contract_fingerprint"]["base_sha_at_snapshot"] == "snapshot_sha"
+
+
+class TestChangedFileRecord:
+    """AC1: ChangedFileRecord captures filename / status / previous_filename."""
+
+    def test_changed_file_record_fields(self):
+        record = ChangedFileRecord(
+            path="allowed/new.txt",
+            status="renamed",
+            previous_path="allowed/old.txt",
+            source=SOURCE_GIT_NAME_STATUS_Z,
+            provenance_complete=True,
+        )
+        assert record.path == "allowed/new.txt"
+        assert record.status == "renamed"
+        assert record.previous_path == "allowed/old.txt"
+        assert record.provenance_complete is True
+
+    def test_parse_git_diff_name_status_z_non_rename(self):
+        raw = "M\0src/main.ts\0A\0src/new.ts\0"
+        records = parse_git_diff_name_status_z(raw, source=SOURCE_GIT_NAME_STATUS_Z)
+        assert records[0].path == "src/main.ts"
+        assert records[0].status == "modified"
+        assert records[0].previous_path is None
+        assert records[1].path == "src/new.ts"
+        assert records[1].status == "added"
+
+    def test_parse_git_diff_name_status_z_rename(self):
+        raw = "R100\0allowed/old.txt\0allowed/new.txt\0"
+        records = parse_git_diff_name_status_z(raw, source=SOURCE_GIT_NAME_STATUS_Z)
+        assert len(records) == 1
+        assert records[0].status == "renamed"
+        assert records[0].previous_path == "allowed/old.txt"
+        assert records[0].path == "allowed/new.txt"
+
+    def test_parse_git_diff_name_status_z_malformed_rename_raises(self):
+        raw = "R100\0allowed/old.txt\0"
+        with pytest.raises(ValueError):
+            parse_git_diff_name_status_z(raw, source=SOURCE_GIT_NAME_STATUS_Z)
+
+    def test_parse_git_diff_name_status_z_unknown_status_raises(self):
+        raw = "Z\0some/path.txt\0"
+        with pytest.raises(ValueError):
+            parse_git_diff_name_status_z(raw, source=SOURCE_GIT_NAME_STATUS_Z)
+
+
+class TestRenamePreviousFilenameProvenance:
+    """AC2-AC7: rename previous_filename provenance audits both old and new paths."""
+
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_rename_previous_filename_audits_old_and_new_paths(self, mock_get_records):
+        mock_get_records.return_value = [
+            _record("allowed/new.txt", status="renamed", previous_path="allowed/old.txt")
+        ]
+        evaluator = make_evaluator(expected_contract_fingerprint="SELF", allowed_paths=["allowed/**"])
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.OK.value
+        audited = {(entry["path"], entry["path_role"]) for entry in result.audited_paths}
+        assert ("allowed/new.txt", "filename") in audited
+        assert ("allowed/old.txt", "previous_filename") in audited
+        assert result.changed_file_records[0]["status"] == "renamed"
+
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_rename_previous_filename_outside_to_inside_fails_closed(self, mock_get_records):
+        # Rename destination is inside Allowed Paths but the source is outside —
+        # this must NOT be a false green (Issue #1300 core scenario).
+        mock_get_records.return_value = [
+            _record("allowed/new.txt", status="renamed", previous_path="outside/old.txt")
+        ]
+        evaluator = make_evaluator(expected_contract_fingerprint="SELF", allowed_paths=["allowed/**"])
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.FAIL_CLOSED.value
+        assert any(
+            v["path_role"] == "previous_filename" and v["file"] == "outside/old.txt"
+            for v in result.violations
+        )
+
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_rename_previous_filename_inside_to_outside_fails_closed(self, mock_get_records):
+        mock_get_records.return_value = [
+            _record("outside/new.txt", status="renamed", previous_path="allowed/old.txt")
+        ]
+        evaluator = make_evaluator(expected_contract_fingerprint="SELF", allowed_paths=["allowed/**"])
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.FAIL_CLOSED.value
+        assert any(
+            v["path_role"] == "filename" and v["file"] == "outside/new.txt"
+            for v in result.violations
+        )
+
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_rename_previous_filename_inside_to_inside_ok(self, mock_get_records):
+        mock_get_records.return_value = [
+            _record("allowed/new.txt", status="renamed", previous_path="allowed/old.txt")
+        ]
+        evaluator = make_evaluator(expected_contract_fingerprint="SELF", allowed_paths=["allowed/**"])
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.OK.value
+        assert result.violations == []
+
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_name_only_source_with_rename_metadata_missing_is_indeterminate(self, mock_get_records):
+        # A source that only claims a rename but cannot supply previous_path
+        # (e.g. filename-only sources) must never fall back to `ok`.
+        mock_get_records.return_value = [
+            ChangedFileRecord(
+                path="allowed/new.txt",
+                status="renamed",
+                previous_path=None,
+                source="git_diff_current_merge_base_head_name_only",
+                provenance_complete=False,
+            )
+        ]
+        evaluator = make_evaluator(expected_contract_fingerprint="SELF", allowed_paths=["allowed/**"])
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.INDETERMINATE.value
+        assert "previous_path" in result.reason
+
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
+    def test_previous_filename_invalid_path_is_indeterminate(self, mock_get_records):
+        mock_get_records.return_value = [
+            _record("allowed/new.txt", status="renamed", previous_path="../escape.txt")
+        ]
+        evaluator = make_evaluator(expected_contract_fingerprint="SELF", allowed_paths=["allowed/**"])
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.INDETERMINATE.value
+
+
+class TestPrFilesApiSource:
+    """AC8: GitHub PR files API pagination / file limit / missing previous_filename."""
+
+    def test_pr_files_pagination_incomplete_is_indeterminate(self):
+        evaluator = make_evaluator(
+            expected_contract_fingerprint="SELF",
+            allowed_paths=["allowed/**"],
+            pr_files_data={
+                "records": [{"filename": "allowed/new.txt", "status": "modified"}],
+                "pagination_complete": False,
+                "file_limit_reached": False,
+            },
+        )
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.INDETERMINATE.value
+        assert "pagination" in result.reason
+        assert result.changed_files_source == SOURCE_PR_FILES_API
+
+    def test_pr_files_file_limit_reached_is_indeterminate(self):
+        evaluator = make_evaluator(
+            expected_contract_fingerprint="SELF",
+            allowed_paths=["allowed/**"],
+            pr_files_data={
+                "records": [{"filename": "allowed/new.txt", "status": "modified"}],
+                "pagination_complete": True,
+                "file_limit_reached": True,
+            },
+        )
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.INDETERMINATE.value
+
+    def test_pr_files_renamed_record_missing_previous_filename_is_indeterminate(self):
+        evaluator = make_evaluator(
+            expected_contract_fingerprint="SELF",
+            allowed_paths=["allowed/**"],
+            pr_files_data={
+                "records": [{"filename": "allowed/new.txt", "status": "renamed"}],
+                "pagination_complete": True,
+                "file_limit_reached": False,
+            },
+        )
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.INDETERMINATE.value
+
+    def test_pr_files_rename_with_previous_filename_audits_both_paths(self):
+        evaluator = make_evaluator(
+            expected_contract_fingerprint="SELF",
+            allowed_paths=["allowed/**"],
+            pr_files_data={
+                "records": [
+                    {
+                        "filename": "allowed/new.txt",
+                        "status": "renamed",
+                        "previous_filename": "allowed/old.txt",
+                    }
+                ],
+                "pagination_complete": True,
+                "file_limit_reached": False,
+            },
+        )
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.OK.value
+        audited = {(entry["path"], entry["path_role"]) for entry in result.audited_paths}
+        assert ("allowed/new.txt", "filename") in audited
+        assert ("allowed/old.txt", "previous_filename") in audited
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -409,6 +624,39 @@ def _create_update_branch_repo(tmp_path: Path) -> dict[str, str | Path]:
 
     _git(repo, "checkout", "main")
     _write(repo, "outside/unrelated.txt", "main side change\n")
+    current_base_tip = _commit(repo, "main unrelated change")
+
+    _git(repo, "checkout", "feature")
+    _git(repo, "merge", "--no-ff", "main", "-m", "update branch")
+    head_sha = _git(repo, "rev-parse", "HEAD")
+
+    return {
+        "repo": repo,
+        "base_sha_at_snapshot": base_sha_at_snapshot,
+        "current_base_sha": current_base_tip,
+        "diff_base_sha": _git(repo, "merge-base", current_base_tip, head_sha),
+        "head_sha": head_sha,
+        "reviewed_head_sha": head_sha,
+    }
+
+
+def _create_update_branch_rename_repo(tmp_path: Path) -> dict[str, str | Path]:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.name", "Test User")
+    _git(repo, "config", "user.email", "test@example.com")
+
+    _write(repo, "outside/old.txt", "rename target content\n")
+    base_sha_at_snapshot = _commit(repo, "base")
+
+    _git(repo, "checkout", "-b", "feature")
+    (repo / "allowed").mkdir(parents=True, exist_ok=True)
+    _git(repo, "mv", "outside/old.txt", "allowed/new.txt")
+    _commit(repo, "rename outside to allowed")
+
+    _git(repo, "checkout", "main")
+    _write(repo, "main_side/unrelated.txt", "main side change\n")
     current_base_tip = _commit(repo, "main unrelated change")
 
     _git(repo, "checkout", "feature")
@@ -482,6 +730,68 @@ class TestUpdateBranchGitDag:
         assert result.status == GateStatus.INDETERMINATE.value
         assert result.changed_files_source == "git_diff_unvalidated_diff_base_head"
         assert "does not match current merge-base" in result.reason
+
+    def test_git_name_status_z_rename_old_and_new_paths_audited(self, tmp_path, monkeypatch):
+        # AC9: real `git diff --name-status -M -z` fixture (deterministic local
+        # fallback) — proves the rename is parsed from a genuine git repo, not
+        # merely from a hand-constructed ChangedFileRecord.
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git(repo, "init", "-b", "main")
+        _git(repo, "config", "user.name", "Test User")
+        _git(repo, "config", "user.email", "test@example.com")
+        _write(repo, "allowed/old.txt", "identical content\n")
+        base_sha = _commit(repo, "base")
+        _git(repo, "mv", "allowed/old.txt", "allowed/new.txt")
+        head_sha = _commit(repo, "rename")
+        monkeypatch.chdir(repo)
+        evaluator = make_evaluator(
+            base_sha_at_snapshot=base_sha,
+            current_base_sha=base_sha,
+            diff_base_sha=base_sha,
+            head_sha=head_sha,
+            reviewed_head_sha=head_sha,
+            allowed_paths=["allowed/**"],
+            expected_contract_fingerprint="SELF",
+            stub_merge_base=False,
+        )
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.OK.value
+        assert result.changed_files_source == SOURCE_GIT_NAME_STATUS_Z
+        assert result.changed_file_records[0]["status"] == "renamed"
+        audited = {(entry["path"], entry["path_role"]) for entry in result.audited_paths}
+        assert ("allowed/new.txt", "filename") in audited
+        assert ("allowed/old.txt", "previous_filename") in audited
+
+
+class TestUpdateBranchRenameDag:
+    def test_update_branch_rename_outside_to_inside_no_false_green(self, tmp_path, monkeypatch):
+        # AC10: update_branch-style DAG with a rename that crosses the Allowed
+        # Paths boundary — base-side unrelated file must not leak into
+        # changed_file_records / audited_paths, and the previous_filename
+        # violation must fail_closed (not a false green).
+        fixture = _create_update_branch_rename_repo(tmp_path)
+        monkeypatch.chdir(fixture["repo"])
+        evaluator = make_evaluator(
+            base_sha_at_snapshot=fixture["base_sha_at_snapshot"],
+            current_base_sha=fixture["current_base_sha"],
+            diff_base_sha=fixture["diff_base_sha"],
+            head_sha=fixture["head_sha"],
+            reviewed_head_sha=fixture["reviewed_head_sha"],
+            allowed_paths=["allowed/**"],
+            expected_contract_fingerprint="SELF",
+            stub_merge_base=False,
+        )
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.FAIL_CLOSED.value
+        assert any(
+            v["path_role"] == "previous_filename" and v["file"] == "outside/old.txt"
+            for v in result.violations
+        )
+        audited_paths = {entry["path"] for entry in result.audited_paths}
+        assert "main_side/unrelated.txt" not in audited_paths
+        record_paths = {record["path"] for record in result.changed_file_records}
+        assert "main_side/unrelated.txt" not in record_paths
 
 
 class TestSingleSourceOfTruth:

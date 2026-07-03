@@ -8,10 +8,20 @@ against linked issue's Allowed Paths snapshot. Producer role: review_subagent.
 Key principles:
 - Worker transcript / report is NOT an input
 - changed_files_source is git_diff_current_merge_base_head (triple-dot merge-base..head)
+  before rename-aware canonicalization; after validation it becomes the rename-aware
+  source authority (git_diff_name_status_find_renames_z local fallback, or
+  github_pull_request_files_api_with_previous_filename when PR files API data is supplied)
 - head_sha != reviewed_head_sha -> indeterminate (merge-blocking)
 - contract fingerprint and execution context are separated for freshness detection
 - review mode requires explicit snapshot bindings and expected fingerprint
 - Allowed Paths matcher uses repo-relative POSIX normalization with fail-closed invalid input handling
+- rename / previous_filename path provenance (Issue #1300): the post-image
+  filename-only list is NOT the canonical input for Allowed Paths determination.
+  Canonical input is `audited_paths[]`, derived from structured
+  `changed_file_records[]` (ChangedFileRecord), which include both the current
+  path and — for renames — the previous path. `gh_pr_diff_name_only` and
+  `git_diff_current_merge_base_head_name_only` are insufficient_for_rename_provenance
+  and must not be used as the rename provenance source.
 """
 
 import argparse
@@ -23,7 +33,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class GateStatus(Enum):
@@ -35,13 +45,68 @@ class GateStatus(Enum):
     INDETERMINATE = "indeterminate"
 
 
+# ─── Rename provenance source policy (Issue #1300) ───────────────────────────
+#
+# preferred_oracle: github_pull_request_files_api_with_previous_filename
+# deterministic_local_fallback: git_diff_name_status_find_renames_z
+# insufficient_for_rename_provenance: gh_pr_diff_name_only,
+#   git_diff_current_merge_base_head_name_only
+# forbidden: git_diff_snapshot_base_head, post_image_filename_only_for_rename_gate
+
+SOURCE_GIT_NAME_STATUS_Z = "git_diff_name_status_find_renames_z"
+SOURCE_PR_FILES_API = "github_pull_request_files_api_with_previous_filename"
+SOURCE_NAME_ONLY_INSUFFICIENT = "git_diff_current_merge_base_head_name_only"
+
+PATH_ROLE_FILENAME = "filename"
+PATH_ROLE_PREVIOUS_FILENAME = "previous_filename"
+
+_GIT_STATUS_LETTER_MAP = {
+    "A": "added",
+    "M": "modified",
+    "D": "removed",
+    "T": "type_changed",
+    "U": "unmerged",
+    "X": "unknown",
+    "B": "broken",
+}
+
+_PR_FILES_STATUS_MAP = {
+    "added": "added",
+    "removed": "removed",
+    "modified": "modified",
+    "renamed": "renamed",
+    "copied": "copied",
+    "changed": "type_changed",
+    "unchanged": "unchanged",
+}
+
+
+@dataclass
+class ChangedFileRecord:
+    """Structured changed-file record with rename/previous-path provenance.
+
+    Represents either a `git diff --name-status -M -z` record (local
+    deterministic fallback) or a GitHub PR files API record (preferred
+    oracle, when supplied via --pr-files-json).
+    """
+
+    path: str
+    status: str
+    previous_path: Optional[str]
+    source: str
+    provenance_complete: bool
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 @dataclass
 class ExecutionContext:
     """Execution context (audit log only, NOT used for freshness judgment)."""
 
     worktree_root: str
     generated_at: str
-    tool_version: str = "1.4.0"
+    tool_version: str = "1.5.0"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -82,6 +147,8 @@ class AllowedPathsGateResult:
     allowed_paths_source: str = ""
     changed_files_count: int = 0
     changed_files: List[str] = field(default_factory=list)
+    changed_file_records: List[Dict[str, Any]] = field(default_factory=list)
+    audited_paths: List[Dict[str, Any]] = field(default_factory=list)
     allowed_paths_list: List[str] = field(default_factory=list)
     violations: List[Dict[str, Any]] = field(default_factory=list)
     contract_fingerprint: Dict[str, Any] = field(default_factory=dict)
@@ -106,6 +173,8 @@ class AllowedPathsGateResult:
             "allowed_paths_source": self.allowed_paths_source,
             "changed_files_count": self.changed_files_count,
             "changed_files": self.changed_files,
+            "changed_file_records": self.changed_file_records,
+            "audited_paths": self.audited_paths,
             "allowed_paths_list": self.allowed_paths_list,
             "violations": self.violations,
             "contract_fingerprint": self.contract_fingerprint,
@@ -213,6 +282,65 @@ class AllowedPathsMatcher:
         return False
 
 
+def parse_git_diff_name_status_z(raw: str, source: str) -> List[ChangedFileRecord]:
+    """Parse `git diff --name-status -M -z` (or -C) output into ChangedFileRecord list.
+
+    NUL-separated tokens. Non-rename/copy records: "<status>\\0<path>\\0".
+    Rename/copy records: "<status><score>\\0<old_path>\\0<new_path>\\0".
+    Raises ValueError on malformed status, missing paths, or unknown status
+    (fail-closed — caller must treat this as indeterminate, never as a
+    filename-only fallback).
+    """
+    tokens = [tok for tok in raw.split("\0") if tok != ""]
+    records: List[ChangedFileRecord] = []
+    i = 0
+    while i < len(tokens):
+        status_token = tokens[i]
+        i += 1
+        if not status_token:
+            raise ValueError("malformed git diff --name-status record: empty status token")
+        letter = status_token[0]
+        if letter in ("R", "C"):
+            if i + 1 >= len(tokens):
+                raise ValueError(
+                    f"malformed rename/copy record for status {status_token!r}: missing old/new path"
+                )
+            old_path = tokens[i]
+            new_path = tokens[i + 1]
+            i += 2
+            if not old_path or not new_path:
+                raise ValueError(f"malformed rename/copy record: empty path for status {status_token!r}")
+            status_name = "renamed" if letter == "R" else "copied"
+            records.append(
+                ChangedFileRecord(
+                    path=new_path,
+                    status=status_name,
+                    previous_path=old_path,
+                    source=source,
+                    provenance_complete=True,
+                )
+            )
+        elif letter in _GIT_STATUS_LETTER_MAP:
+            if i >= len(tokens):
+                raise ValueError(f"malformed record for status {status_token!r}: missing path")
+            path = tokens[i]
+            i += 1
+            if not path:
+                raise ValueError(f"malformed record: empty path for status {status_token!r}")
+            records.append(
+                ChangedFileRecord(
+                    path=path,
+                    status=_GIT_STATUS_LETTER_MAP[letter],
+                    previous_path=None,
+                    source=source,
+                    provenance_complete=True,
+                )
+            )
+        else:
+            raise ValueError(f"unknown git diff --name-status status: {status_token!r}")
+    return records
+
+
 class AllowedPathsGateEvaluator:
     """Main evaluator for PR allowed paths gate."""
 
@@ -232,6 +360,7 @@ class AllowedPathsGateEvaluator:
         contract_source_id: str,
         expected_contract_fingerprint: Optional[Dict[str, Any]],
         issue_number: int = 0,
+        pr_files_data: Optional[Dict[str, Any]] = None,
     ):
         self.pr_number = pr_number
         self.base_ref = base_ref
@@ -246,6 +375,7 @@ class AllowedPathsGateEvaluator:
         self.contract_source_id = contract_source_id
         self.expected_contract_fingerprint = expected_contract_fingerprint
         self.issue_number = issue_number
+        self.pr_files_data = pr_files_data
         self.validated_diff_base_sha: Optional[str] = None
 
     def canonicalize_allowed_paths(self) -> List[str]:
@@ -303,6 +433,14 @@ class AllowedPathsGateEvaluator:
         return computed_diff_base_sha
 
     def get_changed_files_from_git(self) -> List[str]:
+        """DEPRECATED post-image-only alias (git diff --name-only).
+
+        Retained only for external/backward compatibility. NOT used by
+        evaluate() for Allowed Paths canonical determination — this source
+        is `insufficient_for_rename_provenance` (Issue #1300) because it
+        cannot represent rename previous_filename. Canonical determination
+        uses get_changed_file_records() / ChangedFileRecord instead.
+        """
         if not self.validated_diff_base_sha:
             raise RuntimeError("validated diff base SHA is unavailable")
         try:
@@ -315,6 +453,136 @@ class AllowedPathsGateEvaluator:
         except subprocess.CalledProcessError as exc:
             raise RuntimeError(f"git diff failed: {exc.stderr}") from exc
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def get_changed_file_records_from_git(self) -> List[ChangedFileRecord]:
+        """Deterministic local fallback: `git diff --name-status -M -z`.
+
+        `-z` avoids newline/tab ambiguity in paths (security-sensitive gate).
+        `-M` enables rename detection so R* records carry both old and new
+        paths, which get_changed_file_records() audits as
+        (filename, previous_filename) pairs.
+        """
+        if not self.validated_diff_base_sha:
+            raise RuntimeError("validated diff base SHA is unavailable")
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "diff",
+                    "--name-status",
+                    "-M",
+                    "-z",
+                    f"{self.validated_diff_base_sha}...{self.head_sha}",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(f"git diff failed: {exc.stderr}") from exc
+        return parse_git_diff_name_status_z(result.stdout, source=SOURCE_GIT_NAME_STATUS_Z)
+
+    def get_changed_file_records_from_pr_files_api(self) -> List[ChangedFileRecord]:
+        """Preferred oracle: GitHub PR files API records (external input).
+
+        Requires the caller to have completed pagination and to supply
+        `previous_filename` for every `status: renamed` record; otherwise
+        this raises (evaluate() converts this into `indeterminate`).
+        """
+        data = self.pr_files_data
+        if not isinstance(data, dict):
+            raise ValueError("pr_files_json must be a JSON object")
+        if not data.get("pagination_complete", False):
+            raise ValueError(
+                f"{SOURCE_PR_FILES_API} pagination incomplete: pagination_complete must be true"
+            )
+        if data.get("file_limit_reached", False):
+            raise ValueError(f"{SOURCE_PR_FILES_API} file_limit_reached is true")
+        raw_records = data.get("records")
+        if not isinstance(raw_records, list):
+            raise ValueError("pr_files_json 'records' must be a list")
+
+        records: List[ChangedFileRecord] = []
+        for raw in raw_records:
+            if not isinstance(raw, dict):
+                raise ValueError("malformed pr_files_json record: not an object")
+            filename = raw.get("filename")
+            status_raw = raw.get("status")
+            previous_filename = raw.get("previous_filename")
+            if not filename or not status_raw:
+                raise ValueError("pr_files_json record missing filename/status")
+            status = _PR_FILES_STATUS_MAP.get(status_raw, "unknown")
+            if status == "renamed" and not previous_filename:
+                raise ValueError(
+                    f"renamed record missing previous_filename for {filename!r} "
+                    f"({SOURCE_PR_FILES_API})"
+                )
+            records.append(
+                ChangedFileRecord(
+                    path=filename,
+                    status=status,
+                    previous_path=previous_filename,
+                    source=SOURCE_PR_FILES_API,
+                    provenance_complete=True,
+                )
+            )
+        return records
+
+    def get_changed_file_records(self) -> List[ChangedFileRecord]:
+        """Canonical changed-file record source dispatch.
+
+        Uses the preferred oracle (GitHub PR files API, when
+        --pr-files-json was supplied); otherwise falls back to the
+        deterministic local `git diff --name-status -M -z` parser.
+        """
+        if self.pr_files_data is not None:
+            return self.get_changed_file_records_from_pr_files_api()
+        return self.get_changed_file_records_from_git()
+
+    @staticmethod
+    def build_audited_paths(
+        records: List[ChangedFileRecord],
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Build audited_paths[] from changed_file_records[].
+
+        Returns (audited_paths, indeterminate_reason). If
+        indeterminate_reason is not None, the caller must treat the whole
+        gate result as `indeterminate` (a rename record with unavailable
+        previous_path, or an invalid repo-relative path, must never be
+        silently dropped or treated as `ok`).
+        """
+        audited: List[Dict[str, Any]] = []
+        for idx, record in enumerate(records):
+            if record.status == "renamed" and not record.previous_path:
+                return [], (
+                    f"rename record missing previous_path for {record.path!r} "
+                    "(indeterminate — filename-only fallback is forbidden for renames)"
+                )
+            normalized_path = AllowedPathsMatcher.normalize_path(record.path)
+            if normalized_path is None:
+                return [], f"invalid path in changed file record: {record.path!r} (indeterminate)"
+            audited.append(
+                {
+                    "path": normalized_path,
+                    "path_role": PATH_ROLE_FILENAME,
+                    "source_record_index": idx,
+                }
+            )
+            if record.previous_path:
+                normalized_previous = AllowedPathsMatcher.normalize_path(record.previous_path)
+                if normalized_previous is None:
+                    return [], (
+                        f"invalid previous_path in changed file record: "
+                        f"{record.previous_path!r} (indeterminate)"
+                    )
+                audited.append(
+                    {
+                        "path": normalized_previous,
+                        "path_role": PATH_ROLE_PREVIOUS_FILENAME,
+                        "source_record_index": idx,
+                    }
+                )
+        return audited, None
 
     def evaluate(self) -> AllowedPathsGateResult:
         now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -377,18 +645,31 @@ class AllowedPathsGateEvaluator:
 
         result.diff_base_sha = validated_diff_base_sha
         result.base_sha = validated_diff_base_sha
-        result.changed_files_source = "git_diff_current_merge_base_head"
+        result.changed_files_source = (
+            SOURCE_PR_FILES_API if self.pr_files_data is not None else SOURCE_GIT_NAME_STATUS_Z
+        )
 
         try:
-            changed_files = self.get_changed_files_from_git()
+            changed_file_records = self.get_changed_file_records()
         except Exception as exc:
             result.status = GateStatus.INDETERMINATE.value
-            result.reason = f"Failed to get changed files: {exc}"
+            result.reason = f"Failed to get changed file records: {exc}"
             result.errors.append(result.reason)
             return result
 
-        result.changed_files = changed_files
-        result.changed_files_count = len(changed_files)
+        audited_paths, indeterminate_reason = self.build_audited_paths(changed_file_records)
+        if indeterminate_reason is not None:
+            result.status = GateStatus.INDETERMINATE.value
+            result.reason = indeterminate_reason
+            result.errors.append(result.reason)
+            return result
+
+        result.changed_file_records = [record.to_dict() for record in changed_file_records]
+        result.audited_paths = audited_paths
+        # Backward-compatible post-image alias — NOT the canonical input for
+        # Allowed Paths determination (see audited_paths / build_audited_paths).
+        result.changed_files = list(dict.fromkeys(record.path for record in changed_file_records))
+        result.changed_files_count = len(result.changed_files)
         result.allowed_paths_source = "linked_issue_contract_snapshot"
 
         try:
@@ -404,9 +685,15 @@ class AllowedPathsGateEvaluator:
             }
 
         violations = []
-        for file_path in changed_files:
-            if not AllowedPathsMatcher.is_file_allowed(file_path, result.allowed_paths_list):
-                violations.append({"file": file_path, "reason": "not in allowed_paths"})
+        for entry in audited_paths:
+            if not AllowedPathsMatcher.is_file_allowed(entry["path"], result.allowed_paths_list):
+                violations.append(
+                    {
+                        "file": entry["path"],
+                        "path_role": entry["path_role"],
+                        "reason": "not in allowed_paths",
+                    }
+                )
 
         result.violations = violations
         if violations:
@@ -454,6 +741,19 @@ def main() -> None:
         help="JSON object captured at snapshot time"
     )
     parser.add_argument("--issue-number", type=int, default=0, help="Linked issue number")
+    parser.add_argument(
+        "--pr-files-json",
+        type=json.loads,
+        default=None,
+        help=(
+            "Optional JSON object representing the GitHub PR files API response: "
+            '{"records": [{"filename": str, "status": str, '
+            '"previous_filename": str|null}], "pagination_complete": bool, '
+            '"file_limit_reached": bool}. When supplied this is the preferred '
+            f"oracle ({SOURCE_PR_FILES_API}); otherwise the deterministic local "
+            f"fallback ({SOURCE_GIT_NAME_STATUS_Z}) is used."
+        ),
+    )
     parser.add_argument("--format", choices=["json", "yaml"], default="json", help="Output format")
     args = parser.parse_args()
 
@@ -471,6 +771,7 @@ def main() -> None:
         contract_source_id=args.contract_source_id,
         expected_contract_fingerprint=args.expected_contract_fingerprint,
         issue_number=args.issue_number,
+        pr_files_data=args.pr_files_json,
     )
 
     result = evaluator.evaluate()

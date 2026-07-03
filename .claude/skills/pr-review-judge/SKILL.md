@@ -157,11 +157,22 @@ snapshot freshness 用の `contract_fingerprint.base_sha_at_snapshot` と、loca
 
 `indeterminate/fail_closed` は merge-blocking 状態として扱う。
 
-changed files source hierarchy は `github_pull_request_files_api` / `gh_pr_diff_name_only` を preferred oracle、
-`git_diff_current_merge_base_head` を deterministic local fallback、`git_diff_snapshot_base_head` を禁止経路とする。
+changed files source hierarchy は `github_pull_request_files_api_with_previous_filename` を preferred oracle、
+`git_diff_name_status_find_renames_z` を deterministic local fallback とする。
+`gh_pr_diff_name_only` / `git_diff_current_merge_base_head_name_only` は rename provenance では
+insufficient_for_rename_provenance であり、`git_diff_snapshot_base_head` は禁止経路である。
 local fallback は `current_base_sha` と `head_sha` から evaluator 内で `git merge-base` を検証できた場合だけ
-`git_diff_current_merge_base_head` を名乗る。`LOOP_VERDICT_V2.allowed_paths_gate` consumer への保証は script output の
+`git_diff_name_status_find_renames_z` を名乗る。`LOOP_VERDICT_V2.allowed_paths_gate` consumer への保証は script output の
 provenance に限り、verdict schema 自体が詳細 provenance を直接 carry するとまでは主張しない。
+
+### rename / previous_filename provenance（Issue #1300）
+
+canonical な判定 input は `audited_paths[]`（`changed_file_records[]` から派生）であり、`changed_files[]` は
+post-image filename のみの backward-compatible alias に過ぎない。`status: renamed` の record は rename 元
+（`previous_filename` ロール）と rename 先（`filename` ロール）の両方を `audited_paths` に含め、双方を
+Allowed Paths 判定対象とする。rename 元・先のどちらかが Allowed Paths 外なら `fail_closed`（false green 禁止）。
+`status: renamed` なのに `previous_filename` を取得できない場合は `indeterminate` とし、filename-only fallback
+で `ok` に倒してはならない。詳細は `references/allowed-paths-gate.md` を参照する。
 
 ## Output Constraint（OUTPUT_BUDGET_V1 出力制約）
 
