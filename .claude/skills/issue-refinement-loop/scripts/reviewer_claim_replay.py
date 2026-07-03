@@ -359,6 +359,42 @@ def _save_state(state_file: str | None, state: dict[str, Any]) -> None:
     )
 
 
+# LEGACY_VERDICT_MAP_V1 -- backward-compatibility mapping for consumers that
+# only understand the pre-#1286 verdict set documented in
+# `issue-refinement-loop/SKILL.md` Step 2a (`deterministic_fail_confirmed`,
+# `reviewer_claim_unbacked_by_deterministic_checker`,
+# `reviewer_false_positive_suspected`, `input_or_runtime_error`) plus the
+# pre-existing `checker_artifact_inconsistency` verdict. New verdicts
+# introduced by Issue #1286 (`taxonomy_gap`, `checker_gap`,
+# `checker_gap_repeated`) are downgraded to the semantically-closest legacy
+# verdict here so that a routing table which has not been updated for the
+# new values still receives a value it recognizes and routes safely. The
+# top-level `verdict` field itself is NOT changed by this mapping -- it keeps
+# emitting the precise Issue #1286 value so that machine-actionable routing
+# (`fix_checker_artifact` for checker/taxonomy gaps) is not lost. SKILL.md
+# Step 2a update is Out of Scope for Issue #1286 (Allowed Paths do not
+# include SKILL.md); this additive field is the compatibility mechanism
+# instead.
+_LEGACY_VERDICT_MAP_V1: dict[str, str] = {
+    "deterministic_fail_confirmed": "deterministic_fail_confirmed",
+    "checker_artifact_inconsistency": "checker_artifact_inconsistency",
+    "reviewer_claim_unbacked_by_deterministic_checker": "reviewer_claim_unbacked_by_deterministic_checker",
+    "reviewer_false_positive_suspected": "reviewer_false_positive_suspected",
+    "input_or_runtime_error": "input_or_runtime_error",
+    # New Issue #1286 verdicts -> legacy fallback with matching `routing`
+    # semantics (same consume/rerun/escalation behavior as the legacy value
+    # it maps to):
+    "taxonomy_gap": "checker_artifact_inconsistency",
+    "checker_gap": "reviewer_claim_unbacked_by_deterministic_checker",
+    "checker_gap_repeated": "reviewer_false_positive_suspected",
+}
+
+
+def _legacy_verdict(verdict: str) -> str:
+    """Map a verdict to the pre-#1286 SKILL.md Step 2a compatible value."""
+    return _LEGACY_VERDICT_MAP_V1.get(verdict, "input_or_runtime_error")
+
+
 def _has_deterministic_check_failure(kind: str, review_result: dict[str, Any]) -> bool:
     check_name = _deterministic_check_for(kind)
     if not check_name:
@@ -389,6 +425,7 @@ def analyze(
             {
                 "schema": SCHEMA,
                 "verdict": "input_or_runtime_error",
+                "verdict_legacy_v1": _legacy_verdict("input_or_runtime_error"),
                 "routing": "human_judgment_required",
                 "should_consume_iteration": False,
                 "blockers": [],
@@ -564,6 +601,7 @@ def analyze(
         {
             "schema": SCHEMA,
             "verdict": verdict,
+            "verdict_legacy_v1": _legacy_verdict(verdict),
             "routing": routing,
             "should_consume_iteration": should_consume_iteration,
             "body_sha256": body_sha256,
@@ -643,6 +681,7 @@ def main() -> int:
                 {
                     "schema": SCHEMA,
                     "verdict": "input_or_runtime_error",
+                    "verdict_legacy_v1": _legacy_verdict("input_or_runtime_error"),
                     "routing": "human_judgment_required",
                     "error": str(exc),
                 },

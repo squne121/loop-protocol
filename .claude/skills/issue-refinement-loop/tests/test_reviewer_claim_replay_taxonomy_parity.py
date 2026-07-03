@@ -17,6 +17,15 @@ domain keys through a single table-driven taxonomy
   escalation.
 - AC5: `--dump-taxonomy` prints the taxonomy as JSON, and this test detects
   drift in the checker / reviewer code / readiness category sets.
+
+Backward compatibility: `analyze()` also emits a `verdict_legacy_v1` field
+that downgrades the new Issue #1286 verdicts (`taxonomy_gap`, `checker_gap`,
+`checker_gap_repeated`) to the pre-#1286 verdict set documented in
+`issue-refinement-loop/SKILL.md` Step 2a, so a routing table that has not
+been updated for the new values still receives a value it recognizes with
+matching routing semantics. `SKILL.md` update itself is Out of Scope for
+Issue #1286 (not in Allowed Paths); `test_legacy_verdict_mapping_full_parity`
+below pins the full mapping.
 """
 
 from __future__ import annotations
@@ -162,6 +171,10 @@ def test_ac3_checker_backed_blocker_no_reviewer_rerun():
     # a subsequent identical replay would otherwise be misclassified as a
     # repeated reviewer claim.
     assert next_state["consecutive_unbacked_count"] == 0
+    # Backward-compat: a consumer that only understands the pre-#1286
+    # SKILL.md Step 2a verdict set must still receive a recognized value
+    # with matching routing semantics (fix_checker_artifact family).
+    assert result["verdict_legacy_v1"] == "checker_artifact_inconsistency"
 
 
 # --------------------------------------------------------------------------
@@ -192,6 +205,9 @@ def test_ac4_unknown_blocker_checker_gap_single_rerun():
     assert first["routing"] == "downgrade_to_non_blocking"
     assert first["should_consume_iteration"] is False
     assert next_state["consecutive_unbacked_count"] == 1
+    # Backward-compat: checker_gap downgrades to the legacy "unbacked"
+    # verdict (same downgrade_to_non_blocking routing semantics).
+    assert first["verdict_legacy_v1"] == "reviewer_claim_unbacked_by_deterministic_checker"
 
     # Second occurrence, same lane (same code + same body hash) -> escalate,
     # do not grant a second rerun.
@@ -206,6 +222,9 @@ def test_ac4_unknown_blocker_checker_gap_single_rerun():
     assert second["routing"] == "human_escalation"
     assert second["should_consume_iteration"] is False
     assert next_state_2["consecutive_unbacked_count"] == 2
+    # Backward-compat: checker_gap_repeated downgrades to the legacy
+    # false-positive-suspected verdict (same human_escalation routing).
+    assert second["verdict_legacy_v1"] == "reviewer_false_positive_suspected"
 
 
 # --------------------------------------------------------------------------
@@ -277,6 +296,44 @@ def test_ac5_dump_taxonomy_json_drift_detection():
     # must not silently diverge from the live REVIEWER_CHECKER_TAXONOMY_V1
     # used by analyze()).
     assert entries == REVIEWER_CHECKER_TAXONOMY_V1
+
+
+# --------------------------------------------------------------------------
+# Backward compatibility (PR #1304 review fix_delta): verdict_legacy_v1 must
+# downgrade every new Issue #1286 verdict to a value already documented in
+# SKILL.md Step 2a, with routing semantics preserved (no unbacked "unknown"
+# fallback for a value this module itself produces).
+# --------------------------------------------------------------------------
+
+
+def test_legacy_verdict_mapping_full_parity():
+    from reviewer_claim_replay import _legacy_verdict  # noqa: WPS433
+
+    expected = {
+        "deterministic_fail_confirmed": "deterministic_fail_confirmed",
+        "checker_artifact_inconsistency": "checker_artifact_inconsistency",
+        "reviewer_claim_unbacked_by_deterministic_checker": (
+            "reviewer_claim_unbacked_by_deterministic_checker"
+        ),
+        "reviewer_false_positive_suspected": "reviewer_false_positive_suspected",
+        "input_or_runtime_error": "input_or_runtime_error",
+        "taxonomy_gap": "checker_artifact_inconsistency",
+        "checker_gap": "reviewer_claim_unbacked_by_deterministic_checker",
+        "checker_gap_repeated": "reviewer_false_positive_suspected",
+    }
+    for verdict, legacy in expected.items():
+        assert _legacy_verdict(verdict) == legacy, verdict
+
+    # The legacy mapping's codomain must be exactly the pre-#1286 SKILL.md
+    # Step 2a documented verdict set (plus the pre-existing
+    # checker_artifact_inconsistency) -- never one of the new-only values.
+    assert set(expected.values()) == {
+        "deterministic_fail_confirmed",
+        "checker_artifact_inconsistency",
+        "reviewer_claim_unbacked_by_deterministic_checker",
+        "reviewer_false_positive_suspected",
+        "input_or_runtime_error",
+    }
 
 
 def test_ac5_dump_taxonomy_does_not_require_other_args():
