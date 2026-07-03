@@ -62,6 +62,48 @@ from local_main_branch_guard import (  # noqa: E402
 )
 from skill_runtime_command_policy import resolve_repo_slug  # noqa: E402
 
+RAW_ISSUE_EDIT_COMMANDS = [
+    "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md",
+    "gh issue edit 123 --repo squne121/loop-protocol --body rewritten",
+    "gh issue edit 123 --repo squne121/loop-protocol --title new",
+    "gh issue edit 123 --repo squne121/loop-protocol --add-label bug",
+    "gh issue edit 123 --repo squne121/loop-protocol --remove-label bug",
+    "gh issue edit 123 --repo squne121/loop-protocol --add-assignee @me",
+    "gh issue edit 123 --repo squne121/loop-protocol --milestone v1",
+    "gh issue edit 123 --repo squne121/loop-protocol --remove-milestone",
+    "gh issue edit 123 --repo squne121/loop-protocol --add-project Roadmap",
+    "gh issue edit 123 --repo squne121/loop-protocol --add-sub-issue 124",
+    "gh issue edit 123 --repo squne121/loop-protocol --add-blocked-by 200",
+    "gh issue edit 123 --repo squne121/loop-protocol --add-blocking 300",
+]
+
+RAW_ISSUE_COMMENT_COMMANDS = [
+    "gh issue comment 123 --body hello",
+    "gh issue comment 123 --body-file tmp/body.md",
+    "gh issue comment 123 -F tmp/body.md",
+    "gh issue comment 123 --body-file -",
+    "gh issue comment 123 --editor",
+    "gh issue comment 123 --web",
+    "gh issue comment 123 --edit-last",
+    "gh issue comment 123 --delete-last",
+    "gh issue comment 123 --create-if-none --edit-last --body x",
+]
+
+CONTROLLED_METADATA_COMMANDS = [
+    (
+        "issue_body.update",
+        "artifacts/1291/issue-metadata/issue_body.update/input.json",
+    ),
+    (
+        "issue_comment.publish",
+        "artifacts/1291/issue-metadata/issue_comment.publish/input.json",
+    ),
+    (
+        "contract_snapshot.publish",
+        "artifacts/1291/issue-metadata/contract_snapshot.publish/input.json",
+    ),
+]
+
 
 # ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -123,6 +165,25 @@ def make_pretool_input(command: str, cwd: str) -> str:
         "tool_input": {"command": command},
         "cwd": cwd,
     })
+
+
+def run_claude_hook_script(payload: dict, cwd: Path) -> subprocess.CompletedProcess[str]:
+    """Run the Claude hook wrapper with stdin JSON and return the subprocess result."""
+    script = REPO_ROOT / ".claude" / "hooks" / "local_main_branch_guard.sh"
+    return subprocess.run(
+        [str(script)],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        cwd=str(cwd),
+    )
+
+
+def seed_controlled_executor_stub(tmp_git_repo: Path) -> None:
+    """Create the canonical executor path in a temporary repo for real-hook tests."""
+    executor = tmp_git_repo / "scripts" / "agent-guards" / "controlled_skill_mutation_exec.py"
+    executor.parent.mkdir(parents=True, exist_ok=True)
+    executor.write_text("# stub\n")
 
 
 def eval_in_local_root(
@@ -600,7 +661,6 @@ class TestAC12AlreadyDriftedAllowlist:
     @pytest.mark.parametrize("cmd", [
         # post-merge-cleanup 最小集合のコマンドは drifted 状態でも allow（Step 9.7a が Step 13 より先）
         "gh issue close 123",
-        "gh issue comment 123 --body text",
         "gh pr edit 988 --title new",
         "gh pr comment 988 --body text",
     ])
@@ -1462,6 +1522,9 @@ class TestGhMutationReasonCodeClaude:
         captured = capsys.readouterr()
         assert "HOOK_COMMAND_REPAIR_HINT_V1:" in captured.err
         assert 'reason_code: "gh_mutation_denied"' in captured.err
+        assert "gh issue edit" not in captured.err
+        assert "gh issue comment" not in captured.err
+        assert "tmp/<body>.md" not in captured.err
 
 
 class TestProjectTmpPolicyClaude:
@@ -1485,8 +1548,6 @@ class TestGhOpsMinimalAllowlistClaude:
     @pytest.mark.parametrize("cmd,expected", [
         # must-allow: 最小集合
         ("gh issue close 1089", "allow"),
-        ("gh issue comment 123 --body hello", "allow"),
-        ("gh issue comment 123 --body-file tmp/body.txt", "allow"),  # B4: canonical tmp/ path
         ("gh issue reopen 456", "allow"),
         ("gh pr comment 789 --body text", "allow"),
         ("gh pr edit 101 --title new", "allow"),
@@ -1521,37 +1582,31 @@ class TestGhOpsMinimalAllowlistClaude:
 
 class TestGithubIssueMutationCommandClaude:
     """
-    AC8: gh issue edit with --repo + --body-file tmp/ → allow (github_issue_mutation_command)
-    AC9: gh issue create with --repo + --body-file tmp/ → allow (github_issue_mutation_command)
-    AC10: bare gh issue create / gh issue edit 123 (no --body-file) → block
+    AC8: raw gh issue edit/comment are blocked after deprecation.
+    AC9: gh issue create with --repo + --body-file tmp/ remains allowed.
+    AC10: bare gh issue create / any gh issue edit without the new lane → block.
     AC13: gh issue create/edit/comment/close/reopen is NOT readonly_command
     """
 
-    # AC8: gh issue edit <N> --repo squne121/loop-protocol --body-file tmp/foo.md → allow
-    @pytest.mark.parametrize("cmd", [
-        "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md",
-        "gh issue edit 1 --repo squne121/loop-protocol --body-file tmp/issue.md",
-    ])
-    def test_ac8_gh_issue_edit_with_repo_and_bodyfile_allowed(self, tmp_git_repo: Path, cmd: str):
-        """AC8: GIVEN gh issue edit with --repo + --body-file tmp/ WHEN evaluated THEN allow."""
-        assert is_github_issue_mutation_command(cmd), f"Expected True for: {cmd!r}"
+    @pytest.mark.parametrize("cmd", RAW_ISSUE_EDIT_COMMANDS)
+    def test_issue_edit_deprecated(self, tmp_git_repo: Path, cmd: str):
+        """AC8: GIVEN raw gh issue edit WHEN evaluated THEN block."""
+        assert not is_github_issue_mutation_command(cmd), f"Expected False for: {cmd!r}"
         result = eval_in_local_root(cmd, str(tmp_git_repo))
-        assert result["status"] == "allow", f"Expected allow for: {cmd!r}"
-        assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
+        assert result["status"] == "block", f"Expected block for: {cmd!r}"
+        assert result["reason_code"] == REASON_GH_MUTATION
 
-    # AC9: gh issue create --repo squne121/loop-protocol --body-file tmp/foo.md → allow
     @pytest.mark.parametrize("cmd", [
         "gh issue create --repo squne121/loop-protocol --title foo --body-file tmp/foo.md",
         "gh issue create --repo squne121/loop-protocol --body-file tmp/body.md --title new-issue",
     ])
-    def test_ac9_gh_issue_create_with_repo_and_bodyfile_allowed(self, tmp_git_repo: Path, cmd: str):
+    def test_issue_create_still_allowed(self, tmp_git_repo: Path, cmd: str):
         """AC9: GIVEN gh issue create with --repo + --body-file tmp/ WHEN evaluated THEN allow."""
         assert is_github_issue_mutation_command(cmd), f"Expected True for: {cmd!r}"
         result = eval_in_local_root(cmd, str(tmp_git_repo))
         assert result["status"] == "allow", f"Expected allow for: {cmd!r}"
         assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
 
-    # AC10: bare gh issue create / gh issue edit 123 (no --body-file) → block
     @pytest.mark.parametrize("cmd", [
         "gh issue create",                                          # bare create
         "gh issue edit 123",                                        # bare edit, no --body-file
@@ -1560,7 +1615,7 @@ class TestGithubIssueMutationCommandClaude:
         "gh issue create --body-file tmp/foo.md",                   # no --repo
         "gh issue edit 123 --body-file tmp/foo.md",                 # no --repo
         "gh issue create --repo squne121/loop-protocol --body-file tmp/foo.md --editor",  # interactive
-        "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md --web",   # interactive
+        "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md --web",   # deprecated
         "gh issue create --repo squne121/loop-protocol --body-file -",  # stdin
         "gh issue edit 123 --repo squne121/loop-protocol --body-file /tmp/foo.md",  # /tmp not tmp/
         "gh issue edit 123 --repo other-org/other-repo --body-file tmp/foo.md",    # wrong repo
@@ -1693,13 +1748,13 @@ class TestB1B4ReviewBlockerFixesClaude:
     def test_b2_body_file_path_traversal_blocked(self, tmp_git_repo: Path):
         """B2: --body-file tmp/../AGENTS.md (path traversal) is blocked."""
         assert not is_github_issue_mutation_command(
-            "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/../AGENTS.md"
+            "gh issue create --repo squne121/loop-protocol --title foo --body-file tmp/../AGENTS.md"
         ), "path traversal in --body-file must be blocked"
 
     def test_b2_body_file_absolute_path_blocked(self, tmp_git_repo: Path):
         """B2: --body-file /tmp/body.txt (absolute path) is blocked."""
         assert not is_github_issue_mutation_command(
-            "gh issue edit 123 --repo squne121/loop-protocol --body-file /tmp/body.txt"
+            "gh issue create --repo squne121/loop-protocol --title foo --body-file /tmp/body.txt"
         ), "absolute path in --body-file must be blocked"
 
     # B3: --web/-w blocked for gh issue/pr view
@@ -1839,3 +1894,124 @@ class TestControlledSkillMutationPolicy:
         assert hasattr(lmbg, "_CSM_POLICY_AVAILABLE"), (
             "local_main_branch_guard must have _CSM_POLICY_AVAILABLE attribute (Issue #1166 AC17)"
         )
+
+
+class TestIssue1291IssueMetadataMutationClaude:
+    """Issue #1291 regression coverage for raw issue mutation deprecation."""
+
+    @pytest.mark.parametrize("cmd", RAW_ISSUE_COMMENT_COMMANDS)
+    def test_issue_comment_deprecated(self, tmp_git_repo: Path, cmd: str):
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_GH_MUTATION
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "gh issue close 100",
+            "gh issue reopen 100",
+            "gh pr comment 100 --body-file tmp/x.md",
+            "gh pr edit 100 --title new-title",
+        ],
+    )
+    def test_remote_ops_still_allowed(self, tmp_git_repo: Path, cmd: str):
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
+
+    @pytest.mark.parametrize("cmd", RAW_ISSUE_EDIT_COMMANDS + RAW_ISSUE_COMMENT_COMMANDS)
+    def test_must_block_raw_issue_metadata_commands_via_real_hook(self, tmp_git_repo: Path, cmd: str):
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": cmd},
+            "cwd": str(tmp_git_repo),
+        }
+        result = run_claude_hook_script(payload, cwd=tmp_git_repo)
+        assert result.returncode == 2, result.stderr
+        assert "gh_mutation_denied" in result.stderr
+
+    @pytest.mark.parametrize("command_id,input_file", CONTROLLED_METADATA_COMMANDS)
+    def test_must_allow_controlled_executor_metadata_commands(
+        self,
+        tmp_git_repo: Path,
+        command_id: str,
+        input_file: str,
+    ):
+        seed_controlled_executor_stub(tmp_git_repo)
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": (
+                    "uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py "
+                    f"--command-id {command_id} --issue-number 1291 "
+                    f"--input-file {input_file} --repo squne121/loop-protocol --dry-run"
+                )
+            },
+            "cwd": str(tmp_git_repo),
+        }
+        eval_result = eval_in_local_root(payload["tool_input"]["command"], str(tmp_git_repo))
+        assert eval_result["status"] == "allow"
+        assert eval_result["reason_code"] == REASON_DETERMINISTIC_CHECKER
+        assert eval_result["parser_stage"] == "controlled_skill_mutation"
+        assert eval_result["rule_id"] == "controlled_skill_mutation"
+        result = run_claude_hook_script(payload, cwd=tmp_git_repo)
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == ""
+
+    def test_repair_hint_does_not_suggest_raw_issue_mutation(self, capsys):
+        from local_main_branch_guard import _emit_block_stderr
+
+        _emit_block_stderr(
+            reason_code=REASON_GH_MUTATION,
+            current_branch_kind="default",
+            current_is_default=True,
+            target_branch_kind=None,
+            hook_flavor="claude",
+        )
+        captured = capsys.readouterr().err
+        assert "gh issue edit" not in captured
+        assert "gh issue comment" not in captured
+        assert "tmp/<body>.md" not in captured
+        assert "controlled_skill_mutation_exec.py" in captured
+
+    def test_post_merge_cleanup_does_not_use_raw_issue_body_or_comment_mutation(self):
+        roots = [
+            REPO_ROOT / ".claude" / "skills" / "post-merge-cleanup",
+            REPO_ROOT / "scripts" / "agent-ops" / "cleanup_exec.py",
+            REPO_ROOT / "scripts" / "agent-ops" / "classify-git-state.py",
+        ]
+        allowed_shell_prefixes = (
+            "gh issue close ",
+            "gh issue reopen ",
+            "uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py ",
+        )
+        allowed_explicit_comment_markers = ("forbidden example", "allow comments/examples only explicitly")
+
+        for root in roots:
+            paths = [root] if root.is_file() else list(root.rglob("*"))
+            for path in paths:
+                if not path.is_file():
+                    continue
+                content = path.read_text(encoding="utf-8", errors="ignore")
+                for lineno, line in enumerate(content.splitlines(), start=1):
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    if "gh issue edit" in stripped or "gh issue comment" in stripped:
+                        if stripped.startswith(("#", "//")):
+                            assert any(marker in stripped for marker in allowed_explicit_comment_markers), (
+                                f"unexpected raw issue mutation comment at {path}:{lineno}: {stripped}"
+                            )
+                            continue
+                        assert stripped.startswith(allowed_shell_prefixes), (
+                            f"forbidden raw issue mutation command at {path}:{lineno}: {stripped}"
+                        )
+                    if "--body-file tmp/" in stripped or "--body-file=tmp/" in stripped:
+                        if stripped.startswith(("#", "//")):
+                            assert any(marker in stripped for marker in allowed_explicit_comment_markers), (
+                                f"unexpected tmp body-file comment at {path}:{lineno}: {stripped}"
+                            )
+                            continue
+                        assert "controlled_skill_mutation_exec.py" in stripped, (
+                            f"forbidden tmp body-file usage at {path}:{lineno}: {stripped}"
+                        )
