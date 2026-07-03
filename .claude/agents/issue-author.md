@@ -27,7 +27,7 @@ permissionMode: acceptEdits
 | 起票 + 即時修正 | ユーザー要求 + 追記内容 | `create-issue` → `edit-issue` |
 | child materialization | `task: materialize_children` + `CHILD_MATERIALIZATION_PLAN_V2` | `create-issue` + `edit-issue` |
 
-## Existing Issue Mutation Policy
+## 既存 Issue 更新ポリシー (Existing Issue Mutation Policy)
 
 - 既存 Issue body/comment mutation の authority は
   `.claude/skills/edit-issue/scripts/edit_issue_txn.py` が消費する
@@ -38,7 +38,7 @@ permissionMode: acceptEdits
   success / no_change / fail-closed / human judgment へ routing する
 - `title_update.required == true` は v1 scope 外。別 routing に切り分ける
 
-## Existing Issue Flow
+## 既存 Issue 更新フロー (Existing Issue Flow)
 
 1. current issue body と reviewer feedback を読み、candidate body を repo-relative file に保存する
 2. `READINESS_FORWARDING_PAYLOAD_V1` を組み立てる
@@ -46,7 +46,7 @@ permissionMode: acceptEdits
 4. `uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file <file>` を起動する
 5. `ISSUE_EDIT_TXN_RESULT_V1.status` を確認する
 
-## Result Routing
+## 結果ルーティング (Result Routing)
 
 - `ok` → readback success
 - `no_change` → 本文は既に要求を満たす
@@ -54,7 +54,7 @@ permissionMode: acceptEdits
 - `failed_after_mutation` → helper result に含まれる sha / artifact ref を source of truth にして follow-up 判断する
 - `human_judgment` → owner 判断を要求する
 
-## Rewrite Constraints
+## Rewrite 制約
 
 - reviewer feedback の意味を弱めない
 - baseline fail を消すために AC/VC を曖昧化しない
@@ -62,9 +62,11 @@ permissionMode: acceptEdits
   `docs/dev/agent-skill-boundaries.md` の schema 定義に置く
 - detailed mutation procedure をこの agent 定義へ重複記載しない
 
-## FAIL_CLOSED_REWRITE_CONSTRAINTS_V1 Rewrite Payload Contract
+## FAIL_CLOSED_REWRITE_CONSTRAINTS_V1 の rewrite payload 契約
 
 `issue-refinement-loop` が `fail_closed.required == true` の状態から rewrite を依頼する場合、以下のスキーマの入力を受け取る。
+このセクションでは fail-closed な rewrite 契約を定義し、自由な追記ではなく制約付き更新だけを受け付ける。
+要するに、必要なセクション追加と必須キー補完だけを安全に許可し、広い自由記述の書き換えはここでは扱わない。
 
 ```yaml
 FAIL_CLOSED_REWRITE_CONSTRAINTS_V1:
@@ -84,7 +86,7 @@ FAIL_CLOSED_REWRITE_CONSTRAINTS_V1:
   no_progress_route: "human_judgment_required"
 ```
 
-### Rewrite 実行ルール
+### Rewrite 実行ルール (Rewrite Rules)
 
 1. `required_sections` の各セクションを Issue 本文に追加する
 2. `required_contract_keys` の各キーを Machine-Readable Contract YAML ブロックに追加する

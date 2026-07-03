@@ -228,7 +228,12 @@ def _write_issue_metadata_input(issue_number: int, command_id: str, payload: dic
     return str(relative).replace("\\", "/")
 
 
-def _invoke_controlled_exec(command_id: str, issue_number: int, repo: str, input_ref: str) -> subprocess.CompletedProcess[str]:
+def _invoke_controlled_exec(
+    command_id: str,
+    issue_number: int,
+    repo: str,
+    input_ref: str,
+) -> subprocess.CompletedProcess[str]:
     return _run_command(
         [
             sys.executable,
@@ -344,7 +349,10 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
     current_sha = _sha256_text(current_body)
     state.previous_body_sha256 = current_sha
     state.remote_current_body_sha256 = current_sha
-    if current_sha != input_data["expected_previous_body_sha256"] or current_updated_at != input_data["expected_previous_updated_at"]:
+    if (
+        current_sha != input_data["expected_previous_body_sha256"]
+        or current_updated_at != input_data["expected_previous_updated_at"]
+    ):
         state.errors.append(
             {
                 "code": "stale_precondition_before_mutation",
@@ -391,7 +399,13 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
 
     tmp_dir = REPO_ROOT / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, dir=str(tmp_dir), encoding="utf-8") as tmp_body:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".md",
+        delete=False,
+        dir=str(tmp_dir),
+        encoding="utf-8",
+    ) as tmp_body:
         tmp_body.write(new_body)
         candidate_path = Path(tmp_body.name)
 

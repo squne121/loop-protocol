@@ -57,7 +57,9 @@ def _minimal_input(repo_tmp: Path, *, comment_mode: dict | None = None, title_re
 
 
 def test_schema_contracts_are_closed() -> None:
-    docs = (Path(__file__).resolve().parents[4] / "docs" / "dev" / "agent-skill-boundaries.md").read_text(encoding="utf-8")
+    docs = (
+        Path(__file__).resolve().parents[4] / "docs" / "dev" / "agent-skill-boundaries.md"
+    ).read_text(encoding="utf-8")
     assert "### ISSUE_EDIT_TXN_INPUT_V1" in docs
     assert "### ISSUE_EDIT_TXN_RESULT_V1" in docs
     assert docs.count("additionalProperties: false") >= 2
@@ -276,7 +278,11 @@ def test_executor_inputs_under_issue_metadata_namespace(repo_tmp: Path, monkeypa
     calls: list[str] = []
 
     def _fetch(*_args: object, **_kwargs: object) -> tuple[dict | None, str]:
-        return {"title": "old", "body": "old issue body" if not calls else "new issue body", "updatedAt": "2026-07-03T10:40:51Z"}, ""
+        return {
+            "title": "old",
+            "body": "old issue body" if not calls else "new issue body",
+            "updatedAt": "2026-07-03T10:40:51Z",
+        }, ""
 
     def _run(args: list[str]) -> _CP:
         if str(txn.GUARD_SCRIPT) in args:
