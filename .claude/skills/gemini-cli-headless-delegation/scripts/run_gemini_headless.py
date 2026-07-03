@@ -1385,8 +1385,18 @@ def build_prompt(request: Mapping[str, Any], context_documents: list[dict[str, s
     else:
         lines.append("- Do not search the repository beyond the provided context files.")
     if request["tool_profile"] == GROUNDED_RESEARCH_PROFILE:
-        lines.append("- Use AGY native WebSearch/WebGrounding (no Gemini API/search wrapper).")
-        lines.append("- Include source URLs/citations from the web evidence in the response.")
+        # Issue #1266 Blocker 2: build_prompt() is provider-agnostic (it is only reached
+        # for provider=gemini in practice, since provider=agy returns early in
+        # run_delegation() before build_prompt() is ever called — see the agy early
+        # dispatch above). Gate the AGY-specific instruction text on provider=="agy" so
+        # the existing gemini grounded_research prompt text is never silently replaced
+        # by AGY wording (Issue #1266 Out of Scope: no full replacement of existing
+        # gemini grounded_research behavior).
+        if request.get("provider") == "agy":
+            lines.append("- Use AGY native WebSearch/WebGrounding (no Gemini API/search wrapper).")
+            lines.append("- Include source URLs/citations from the web evidence in the response.")
+        else:
+            lines.append("- Google Search grounding is allowed when it is necessary for the answer.")
         lines.append("- Shell execution and file edits remain forbidden.")
     elif request["tool_profile"] == "no_tools":
         lines.append("- No tools are allowed.")

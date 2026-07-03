@@ -466,6 +466,93 @@ def _extract_urls(text: str) -> list[str]:
     return found
 
 
+# Recognized structured web tool-call names (mirrors run_gemini_headless.py's
+# RECOGNIZED_WEB_TOOL_NAMES — Issue #1266 Blocker 1 reopened: this preflight smoke path
+# had not been migrated to the structured tool_calls trace requirement).
+RECOGNIZED_WEB_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "web_search",
+        "websearch",
+        "browser_navigate",
+        "browser",
+        "url_read",
+        "read_url",
+        "fetch_url",
+        "fetch",
+    }
+)
+
+
+def _extract_grounded_research_output(stdout: str) -> dict[str, Any]:
+    """Parse best-effort structured AGY native grounded research evidence from stdout.
+
+    Mirrors run_gemini_headless.py's `_extract_grounded_research_output`. Only a
+    structured JSON payload (via a recognized marker line or a bare JSON line) is
+    considered machine-verifiable; a bare URL string is never treated as structured
+    evidence by this function (Issue #1266 Blocker 1).
+    """
+    markers = (
+        "AGY_GROUNDED_RESEARCH:",
+        "AGY_WEBSEARCH:",
+        "grounded_research:",
+        "grounding:",
+    )
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        for marker in markers:
+            if stripped.startswith(marker):
+                candidate = stripped[len(marker):].strip()
+                try:
+                    parsed = json.loads(candidate)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    return {"source": marker, "data": parsed}
+
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if not (stripped.startswith("{") and stripped.endswith("}")):
+            continue
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and any(
+            key in parsed
+            for key in ("grounded_research", "grounding", "web_search", "web", "citations", "sources", "tool_calls")
+        ):
+            return {"source": "json_line", "data": parsed}
+
+    return {}
+
+
+def _extract_recognized_tool_calls(parsed: dict[str, Any] | None) -> list[dict[str, str]]:
+    """Extract machine-verifiable web tool-call trace entries from structured evidence.
+
+    Only structured `tool_calls` entries whose name is in RECOGNIZED_WEB_TOOL_NAMES count
+    as machine-verifiable evidence. A bare URL string appearing in stdout without this
+    structured trace is NOT a tool-call trace (Issue #1266 Blocker 1).
+    """
+    if not isinstance(parsed, dict):
+        return []
+    data = parsed.get("data")
+    if not isinstance(data, dict):
+        return []
+    calls = data.get("tool_calls")
+    if not isinstance(calls, list):
+        return []
+    recognized: list[dict[str, str]] = []
+    for call in calls:
+        name: Any = None
+        if isinstance(call, dict):
+            name = call.get("name") or call.get("tool")
+        elif isinstance(call, str):
+            name = call
+        if isinstance(name, str) and name.strip().lower() in RECOGNIZED_WEB_TOOL_NAMES:
+            recognized.append({"name": name.strip().lower()})
+    return recognized
+
+
 def _mask_resolved_path(path: str | None) -> str | None:
     """Return a sanitized resolved path suitable for JSON evidence."""
     if not path:
@@ -581,6 +668,14 @@ def _run_grounded_research_smoke(agy_bin: str) -> dict[str, Any]:
 
     This smoke intentionally favors a lightweight query and records evidence
     samples so caller can verify that web search output can be produced.
+
+    Success requires a machine-verifiable structured `tool_calls` trace naming a
+    recognized web tool (see RECOGNIZED_WEB_TOOL_NAMES). A bare URL string appearing in
+    stdout without this structured trace is weak evidence only and is never treated as
+    proof of a WebSearch tool-call execution; `web_tool_call_count` is never inferred
+    from a URL count alone (Issue #1266 Blocker 1 — this preflight smoke path had not
+    been migrated to the same fail-closed contract already applied to
+    run_gemini_headless.py).
     """
     argv = [agy_bin, "-p", GROUNDING_PROBE_PROMPT]
     result: dict[str, Any] = {
@@ -596,6 +691,7 @@ def _run_grounded_research_smoke(agy_bin: str) -> dict[str, Any]:
         "web_tool_call_count": 0,
         "url_citation_count": 0,
         "stdout_line_count": 0,
+        "tool_calls_verified": False,
     }
 
     with tempfile.TemporaryDirectory(prefix="agy-preflight-grounding-") as temp_dir:
@@ -611,7 +707,11 @@ def _run_grounded_research_smoke(agy_bin: str) -> dict[str, Any]:
             urls = _extract_urls(stdout)[:1]
             result["evidence_urls"] = urls
             result["url_citation_count"] = len(urls)
-            result["web_tool_call_count"] = 1 if urls else 0
+
+            parsed = _extract_grounded_research_output(stdout)
+            tool_calls = _extract_recognized_tool_calls(parsed)
+            result["tool_calls_verified"] = bool(tool_calls)
+            result["web_tool_call_count"] = min(len(tool_calls), 1)
 
             combined_output = "\n".join([stdout, stderr])
             if _QUOTA_EXHAUSTED_RE.search(combined_output) or _HTTP_429_RE.search(combined_output):
@@ -620,16 +720,25 @@ def _run_grounded_research_smoke(agy_bin: str) -> dict[str, Any]:
             elif proc.returncode != 0:
                 result["failure_reason"] = f"agy_grounded_research check failed: exit {proc.returncode}"
                 result["failure_class"] = "agy_grounded_research_exit_nonzero"
-            elif not result["evidence_urls"] and not stdout.strip():
+            elif not urls and not stdout.strip():
                 is_ci = os.environ.get("CI", "").lower() in {"1", "true", "yes", "on"}
                 result["failure_reason"] = (
                     "agy_grounded_research output empty"
                     + (" in CI" if is_ci else "")
                 )
                 result["failure_class"] = "agy_output_missing" if is_ci else "agy_empty_stdout"
-            elif not result["evidence_urls"]:
+            elif not urls:
                 result["failure_reason"] = "agy_grounded_research no_evidence_urls_found"
                 result["failure_class"] = "agy_grounded_research_no_evidence"
+            elif not tool_calls:
+                # Issue #1266 Blocker 1: a bare URL string is never treated as proof of a
+                # WebSearch tool-call execution without a machine-verifiable structured
+                # tool_calls trace naming a recognized web tool.
+                result["web_tool_call_count"] = 0
+                result["failure_reason"] = (
+                    "agy_grounded_research no machine-verifiable web tool-call trace found"
+                )
+                result["failure_class"] = "agy_web_grounding_tool_call_missing"
             else:
                 result["ok"] = True
         except subprocess.TimeoutExpired:

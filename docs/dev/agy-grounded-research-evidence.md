@@ -2,7 +2,7 @@
 
 Issue: `#1266`（対象 Issue）
 Provider/profile: `provider=agy + tool_profile=grounded_research`（プロバイダ / プロファイル）
-Captured at: `2026-07-03T17:40:13Z`（取得日時）
+Captured at: `2026-07-03T18:13:31Z`（取得日時）
 
 ## Command（実行コマンド）
 
@@ -15,11 +15,11 @@ uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/pr
 ```yaml
 agy_web_grounding_evidence_v1:
   grounding_actor: antigravity_cli
-  grounding_backend: agy_native_websearch
+  grounding_backend: none
   prompt_shape: bounded_websearch_probe
   agy_cli_version: "1.0.16"
   command_exit_code: 0
-  web_tool_call_count: 1
+  web_tool_call_count: 0
   search_query_count: 1
   url_citation_count: 1
   search_queries:
@@ -30,13 +30,13 @@ agy_web_grounding_evidence_v1:
       cited_text_snippet: null
   transcript_evidence:
     - source_kind: agy_stdout_or_artifact_excerpt
-      excerpt: "https://www.reuters.com  ***  ### Summary of Work * **Search Execution**: Queried the web for reliable news sources, identifying Reuters as a highly-rated global wire service. * **Result**: Returned the exact homepage URL for Reuters."
-      sha256: "ac8223645845b1d798b16653e918b35a550a652a554ace138c8e4c59d1100aa6"
+      excerpt: "https://www.reuters.com"
+      sha256: "6dbd117ec219649286b3485c6f3c7824062d564faed9aa7ba4da643885be2d18"
   redaction_status: checked_no_secret_pattern
   raw_transcript_included: false
   raw_credential_included: false
   repo_absolute_path_included: false
-  failure_class: null
+  failure_class: "agy_web_grounding_tool_call_missing"
 ```
 
 ## Boundary Claim（境界主張）

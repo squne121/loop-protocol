@@ -1684,6 +1684,53 @@ def test_build_prompt_github_research_includes_read_only_constraint():
 
 
 # ---------------------------------------------------------------------------
+# Issue #1266 Blocker 2: build_prompt() grounded_research text must be gated by
+# provider, so provider=gemini requests never see AGY-specific wording (and
+# vice versa).
+# ---------------------------------------------------------------------------
+
+
+def test_build_prompt_grounded_research_gemini_provider_keeps_gemini_wording():
+    """provider=gemini (default) grounded_research prompt uses Google Search grounding
+    wording, never the AGY-specific instruction text."""
+    module = load_module()
+    request = {
+        "objective": "Investigate the latest release notes at example.com/releases",
+        "instructions": ["Summarize the release.", "List breaking changes."],
+        "tool_profile": "grounded_research",
+        "output_sections": ["Summary"],
+        "context_files": [],
+        "model": "gemini-3-flash-preview",
+    }
+
+    prompt = module.build_prompt(request, [])
+
+    assert "Google Search grounding is allowed when it is necessary for the answer." in prompt
+    assert "AGY native WebSearch/WebGrounding" not in prompt
+
+
+def test_build_prompt_grounded_research_agy_provider_uses_agy_wording():
+    """provider=agy grounded_research prompt uses AGY-specific instruction text (defense
+    in depth; provider=agy currently returns early in run_delegation() before
+    build_prompt() is called, but build_prompt() itself must not leak AGY wording into
+    provider=gemini requests — see the gemini-provider counterpart test above)."""
+    module = load_module()
+    request = {
+        "objective": "Investigate the latest release notes at example.com/releases",
+        "instructions": ["Summarize the release.", "List breaking changes."],
+        "tool_profile": "grounded_research",
+        "output_sections": ["Summary"],
+        "context_files": [],
+        "provider": "agy",
+    }
+
+    prompt = module.build_prompt(request, [])
+
+    assert "AGY native WebSearch/WebGrounding" in prompt
+    assert "Google Search grounding is allowed when it is necessary for the answer." not in prompt
+
+
+# ---------------------------------------------------------------------------
 # Iteration 3 — Finding 1 HIGH: --method=VALUE / -X=VALUE bypass guard
 # ---------------------------------------------------------------------------
 

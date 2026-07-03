@@ -375,7 +375,11 @@ def test_json_output(monkeypatch, tmp_path):
 
 
 def test_grounded_research_probe_success(monkeypatch, tmp_path):
-    """--grounded-research runs a bounded AGY websearch probe and returns evidence URLs."""
+    """--grounded-research runs a bounded AGY websearch probe and returns evidence URLs.
+
+    Success requires a machine-verifiable structured `tool_calls` trace naming a
+    recognized web tool — a bare URL string alone is never sufficient (Issue #1266
+    Blocker 1, reopened in preflight_agy.py)."""
     module = load_module()
     monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)  # type: ignore[call-arg]
 
@@ -392,7 +396,12 @@ def test_grounded_research_probe_success(monkeypatch, tmp_path):
         if argv[:2] == [module._resolve_binary(), "-p"]:
             if argv[2] == module.SMOKE_PROMPT:
                 return _FakeCompleted(0, "LOOP_AGY_SMOKE_OK\n", "")
-            return _FakeCompleted(0, "Sources: https://example.com/one https://example.com/two\n", "")
+            return _FakeCompleted(
+                0,
+                "Sources: https://example.com/one https://example.com/two\n"
+                'AGY_GROUNDED_RESEARCH: {"tool_calls": [{"name": "web_search"}]}\n',
+                "",
+            )
         raise AssertionError(f"unexpected command: {argv}")
 
     monkeypatch.setattr(module, "_run", fake_run)
@@ -409,6 +418,46 @@ def test_grounded_research_probe_success(monkeypatch, tmp_path):
     assert check["web_tool_call_count"] == 1
     assert check["url_citation_count"] == 1
     assert check["stdout_line_count"] > 0
+    assert check["tool_calls_verified"] is True
+
+
+def test_grounded_research_probe_fails_when_url_only_no_tool_call_trace(monkeypatch, tmp_path):
+    """A bare URL string with no structured tool_calls trace is fail-closed with
+    grounding_failure_class agy_web_grounding_tool_call_missing (Issue #1266 Blocker 1,
+    reopened in preflight_agy.py: URL presence alone must never be treated as a
+    web tool-call execution proof)."""
+    module = load_module()
+    monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)  # type: ignore[call-arg]
+
+    def fake_run(argv, cwd=None, timeout=None):
+        if argv == [module._resolve_binary(), "--version"]:
+            return _FakeCompleted(0, "agy 1.0.0\n", "")
+        if argv == [module._resolve_binary(), "--help"]:
+            return _FakeCompleted(
+                0,
+                "Usage: agy [OPTIONS]\n"
+                "  -p, --print, --prompt  Non-interactive mode\n",
+                "",
+            )
+        if argv[:2] == [module._resolve_binary(), "-p"]:
+            if argv[2] == module.SMOKE_PROMPT:
+                return _FakeCompleted(0, "LOOP_AGY_SMOKE_OK\n", "")
+            return _FakeCompleted(0, "Sources: https://example.com/one\n", "")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+
+    result = module.run_preflight(grounded_research=True)
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_web_grounding_tool_call_missing"
+    check = result["grounded_research"]["check"]
+    assert check["ok"] is False
+    assert check["failure_class"] == "agy_web_grounding_tool_call_missing"
+    assert check["web_tool_call_count"] == 0
+    assert check["tool_calls_verified"] is False
+    # A bare URL is still surfaced as weak/unverified evidence for audit purposes only.
+    assert check["evidence_urls"] == ["https://example.com/one"]
 
 
 def test_grounded_research_probe_fails_when_no_urls(monkeypatch, tmp_path):
