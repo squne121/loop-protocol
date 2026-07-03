@@ -22,6 +22,26 @@ Key principles:
   path and — for renames — the previous path. `gh_pr_diff_name_only` and
   `git_diff_current_merge_base_head_name_only` are insufficient_for_rename_provenance
   and must not be used as the rename provenance source.
+- the deterministic local fallback (`git diff --name-status -M -z`, Issue
+  #1300 review Blocker 1) IS the canonical source for changed_file_records
+  when no PR files API data is supplied -- it is not a best-effort
+  enrichment layered on top of `git diff --name-only`. Subprocess failure
+  or a parse error (malformed/unknown status) is fail-closed: it raises
+  and is converted to `indeterminate` by evaluate(), never silently
+  degraded to "no renames" (Issue #1300 review Blocker 2).
+- `build_audited_paths()` rejects any ChangedFileRecord with
+  `provenance_complete: false` or with a `source` outside
+  `{git_diff_name_status_find_renames_z, github_pull_request_files_api_with_previous_filename}`
+  as `indeterminate`, even when the path itself is inside Allowed Paths
+  (Issue #1300 review Blocker 3 -- otherwise an insufficient-provenance
+  record could silently bypass the gate as `ok`).
+- NOTE (Issue #1300 review Blocker 4, scope decision): this script does
+  NOT implement a GitHub PR files API pagination adapter. `--pr-files-json`
+  only accepts an already-paginated JSON object supplied by the caller;
+  building that JSON via `gh api --paginate` (or equivalent) is explicitly
+  OUT OF SCOPE for this PR and tracked as a follow-up. Today the
+  operative, exercised path is the deterministic local fallback
+  (`git_diff_name_status_find_renames_z`).
 """
 
 import argparse
@@ -48,7 +68,12 @@ class GateStatus(Enum):
 # ─── Rename provenance source policy (Issue #1300) ───────────────────────────
 #
 # preferred_oracle: github_pull_request_files_api_with_previous_filename
+#   (NOTE: this script does not implement the pagination adapter that would
+#   populate --pr-files-json from the live GitHub API -- see Issue #1300
+#   review Blocker 4. Callers must supply an already-paginated JSON object.
+#   Building that adapter is out of scope for this PR / a follow-up.)
 # deterministic_local_fallback: git_diff_name_status_find_renames_z
+#   (this is the operative source today -- canonical, not best-effort.)
 # insufficient_for_rename_provenance: gh_pr_diff_name_only,
 #   git_diff_current_merge_base_head_name_only
 # forbidden: git_diff_snapshot_base_head, post_image_filename_only_for_rename_gate
@@ -435,11 +460,14 @@ class AllowedPathsGateEvaluator:
     def get_changed_files_from_git(self) -> List[str]:
         """DEPRECATED post-image-only alias (git diff --name-only).
 
-        Retained only for external/backward compatibility. NOT used by
-        evaluate() for Allowed Paths canonical determination — this source
-        is `insufficient_for_rename_provenance` (Issue #1300) because it
+        Retained ONLY for external/backward compatibility (e.g. callers
+        that need a bare filename list). NOT used internally by
+        get_changed_file_records_from_git() / evaluate() -- this source is
+        `insufficient_for_rename_provenance` (Issue #1300) because it
         cannot represent rename previous_filename. Canonical determination
-        uses get_changed_file_records() / ChangedFileRecord instead.
+        uses get_changed_file_records() / ChangedFileRecord, whose local
+        fallback is built directly from `git diff --name-status -M -z`
+        (see get_changed_file_records_from_git()), never from this method.
         """
         if not self.validated_diff_base_sha:
             raise RuntimeError("validated diff base SHA is unavailable")
@@ -454,23 +482,25 @@ class AllowedPathsGateEvaluator:
             raise RuntimeError(f"git diff failed: {exc.stderr}") from exc
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
-    def get_rename_aware_status_map_from_git(self) -> Dict[str, Tuple[str, Optional[str]]]:
-        """Best-effort rename/status enrichment: `git diff --name-status -M -z`.
+    def get_changed_file_records_from_git(self) -> List[ChangedFileRecord]:
+        """Deterministic local fallback -- CANONICAL source when no PR files
+        API data is supplied (Issue #1300 Blocker 1 remediation).
 
-        `-z` avoids newline/tab ambiguity in paths (security-sensitive gate).
-        `-M` enables rename detection so R* records carry both old and new
-        paths. Returns a mapping of `path -> (status, previous_path)`.
+        Built directly from `git diff --name-status -M -z <base>...<head>`,
+        NOT from the post-image-only `get_changed_files_from_git()` alias.
+        `-z` avoids newline/tab ambiguity in paths (security-sensitive
+        gate). `-M` enables rename detection so R* records carry both old
+        and new paths.
 
-        This is deliberately best-effort (empty dict on failure): it is used
-        to *enrich* the authoritative file list from
-        `get_changed_files_from_git()` with rename/status metadata, not as
-        the sole source of truth for which files changed. Both calls use the
-        same validated diff range, so in practice they succeed or fail
-        together; a failure here degrades rename detection gracefully
-        instead of forcing the whole gate to `indeterminate`.
+        Fail-closed (Issue #1302 review Blocker 2): a subprocess failure or
+        a parse error (malformed/unknown status token) is NEVER silently
+        degraded into an empty rename map / `modified` status. Both
+        failure modes raise and propagate to the caller, which
+        (`evaluate()`) converts any exception here into `indeterminate` --
+        it must never be treated as "no renames occurred".
         """
         if not self.validated_diff_base_sha:
-            return {}
+            raise RuntimeError("validated diff base SHA is unavailable")
         try:
             result = subprocess.run(
                 [
@@ -485,41 +515,18 @@ class AllowedPathsGateEvaluator:
                 text=True,
                 check=True,
             )
-        except subprocess.CalledProcessError:
-            return {}
-        try:
-            records = parse_git_diff_name_status_z(result.stdout, source=SOURCE_GIT_NAME_STATUS_Z)
-        except ValueError:
-            return {}
-        return {record.path: (record.status, record.previous_path) for record in records}
-
-    def get_changed_file_records_from_git(self) -> List[ChangedFileRecord]:
-        """Deterministic local fallback, built on top of the authoritative
-        post-image file list from `get_changed_files_from_git()` (kept for
-        external/backward compatibility -- callers/tests may override that
-        method), enriched with rename/status metadata via
-        `get_rename_aware_status_map_from_git()` when available.
-
-        Files with no rename/status metadata are treated as `modified`
-        with no previous_path -- accurate for the plain-list backward
-        compatibility case (Issue #1300 follow-up), since a bare filename
-        list carries no rename information to begin with.
-        """
-        filenames = self.get_changed_files_from_git()
-        status_map = self.get_rename_aware_status_map_from_git()
-        records: List[ChangedFileRecord] = []
-        for path in filenames:
-            status, previous_path = status_map.get(path, ("modified", None))
-            records.append(
-                ChangedFileRecord(
-                    path=path,
-                    status=status,
-                    previous_path=previous_path,
-                    source=SOURCE_GIT_NAME_STATUS_Z,
-                    provenance_complete=True,
-                )
-            )
-        return records
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                "git diff --name-status -M -z failed (fail-closed -- NOT "
+                f"treated as no-renames): {exc.stderr}"
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(
+                f"git diff --name-status -M -z could not be executed (fail-closed): {exc}"
+            ) from exc
+        # parse_git_diff_name_status_z raises ValueError on malformed/unknown
+        # status tokens -- intentionally NOT caught here (fail-closed).
+        return parse_git_diff_name_status_z(result.stdout, source=SOURCE_GIT_NAME_STATUS_Z)
 
     def get_changed_file_records_from_pr_files_api(self) -> List[ChangedFileRecord]:
         """Preferred oracle: GitHub PR files API records (external input).
@@ -550,7 +557,9 @@ class AllowedPathsGateEvaluator:
             previous_filename = raw.get("previous_filename")
             if not filename or not status_raw:
                 raise ValueError("pr_files_json record missing filename/status")
-            status = _PR_FILES_STATUS_MAP.get(status_raw, "unknown")
+            if status_raw not in _PR_FILES_STATUS_MAP:
+                raise ValueError(f"unknown pr_files_json status: {status_raw!r}")
+            status = _PR_FILES_STATUS_MAP[status_raw]
             if status == "renamed" and not previous_filename:
                 raise ValueError(
                     f"renamed record missing previous_filename for {filename!r} "
@@ -596,6 +605,18 @@ class AllowedPathsGateEvaluator:
                 return [], (
                     f"rename record missing previous_path for {record.path!r} "
                     "(indeterminate — filename-only fallback is forbidden for renames)"
+                )
+            if not record.provenance_complete:
+                return [], (
+                    f"changed file provenance incomplete for {record.path!r} "
+                    "(indeterminate — insufficient/incomplete source must not be "
+                    "silently treated as ok)"
+                )
+            if record.source not in (SOURCE_GIT_NAME_STATUS_Z, SOURCE_PR_FILES_API):
+                return [], (
+                    f"insufficient or unknown changed file source {record.source!r} "
+                    f"for {record.path!r} (indeterminate — name-only/unrecognized "
+                    "sources must not be treated as ok)"
                 )
             normalized_path = AllowedPathsMatcher.normalize_path(record.path)
             if normalized_path is None:

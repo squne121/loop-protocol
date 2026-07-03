@@ -585,6 +585,136 @@ class TestPrFilesApiSource:
         assert ("allowed/old.txt", "previous_filename") in audited
 
 
+class TestGitNameStatusZFailClosed:
+    """PR #1302 review Blocker 2: `git diff --name-status -M -z` subprocess
+    failure / parse errors must be indeterminate, never silently degraded
+    into an empty rename map / `modified` status."""
+
+    @patch("allowed_paths_review_gate.subprocess.run")
+    def test_git_name_status_z_subprocess_failure_is_indeterminate_not_ok(self, mock_run):
+        mock_run.side_effect = subprocess.CalledProcessError(
+            returncode=128, cmd=["git", "diff", "--name-status", "-M", "-z"], stderr="fatal: bad revision"
+        )
+        evaluator = make_evaluator(expected_contract_fingerprint="SELF")
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.INDETERMINATE.value
+        assert result.changed_file_records == []
+        assert result.audited_paths == []
+
+    @patch("allowed_paths_review_gate.subprocess.run")
+    def test_git_name_status_z_parser_error_is_indeterminate_not_modified(self, mock_run):
+        malformed = subprocess.CompletedProcess(
+            args=["git", "diff", "--name-status", "-M", "-z"],
+            returncode=0,
+            stdout="Z\0some/path.txt\0",
+            stderr="",
+        )
+        mock_run.return_value = malformed
+        evaluator = make_evaluator(expected_contract_fingerprint="SELF")
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.INDETERMINATE.value
+        assert result.changed_file_records == []
+        assert result.audited_paths == []
+
+    @patch("allowed_paths_review_gate.subprocess.run")
+    def test_git_name_status_z_unknown_status_in_evaluate_is_indeterminate(self, mock_run):
+        unknown_status = subprocess.CompletedProcess(
+            args=["git", "diff", "--name-status", "-M", "-z"],
+            returncode=0,
+            stdout="Q\0some/path.txt\0",
+            stderr="",
+        )
+        mock_run.return_value = unknown_status
+        evaluator = make_evaluator(expected_contract_fingerprint="SELF")
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.INDETERMINATE.value
+        assert "unknown git diff --name-status status" in "".join(result.errors)
+
+
+class TestProvenanceCompletenessAndSourceHardening:
+    """PR #1302 review Blocker 3 + High: build_audited_paths() and the PR
+    files API adapter must reject provenance_complete=False / insufficient
+    or unknown source records as indeterminate, even when the path itself
+    would otherwise be inside Allowed Paths (bypass prevention)."""
+
+    def test_provenance_incomplete_record_is_indeterminate_even_if_path_allowed(self):
+        records = [
+            ChangedFileRecord(
+                path="src/main.ts",
+                status="modified",
+                previous_path=None,
+                source=SOURCE_GIT_NAME_STATUS_Z,
+                provenance_complete=False,
+            )
+        ]
+        audited, reason = AllowedPathsGateEvaluator.build_audited_paths(records)
+        assert audited == []
+        assert reason is not None
+        assert "provenance incomplete" in reason
+
+    def test_insufficient_source_record_is_indeterminate_even_if_path_allowed(self):
+        records = [
+            ChangedFileRecord(
+                path="src/main.ts",
+                status="modified",
+                previous_path=None,
+                source="git_diff_current_merge_base_head_name_only",
+                provenance_complete=True,
+            )
+        ]
+        audited, reason = AllowedPathsGateEvaluator.build_audited_paths(records)
+        assert audited == []
+        assert reason is not None
+        assert "insufficient or unknown changed file source" in reason
+
+    def test_unrecognized_source_record_is_indeterminate(self):
+        records = [
+            ChangedFileRecord(
+                path="src/main.ts",
+                status="modified",
+                previous_path=None,
+                source="some_future_unvetted_source",
+                provenance_complete=True,
+            )
+        ]
+        audited, reason = AllowedPathsGateEvaluator.build_audited_paths(records)
+        assert audited == []
+        assert reason is not None
+
+    def test_pr_files_unknown_status_is_indeterminate(self):
+        evaluator = make_evaluator(
+            expected_contract_fingerprint="SELF",
+            allowed_paths=["allowed/**"],
+            pr_files_data={
+                "records": [{"filename": "allowed/new.txt", "status": "bogus_status"}],
+                "pagination_complete": True,
+                "file_limit_reached": False,
+            },
+        )
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.INDETERMINATE.value
+        assert "unknown pr_files_json status" in "".join(result.errors)
+
+    def test_pr_files_record_with_provenance_incomplete_is_indeterminate(self):
+        # Even the preferred oracle must go through the same
+        # build_audited_paths() hardening -- a hand-constructed record
+        # claiming provenance_complete=False must never be treated as ok.
+        records = [
+            ChangedFileRecord(
+                path="allowed/new.txt",
+                status="modified",
+                previous_path=None,
+                source=SOURCE_PR_FILES_API,
+                provenance_complete=False,
+            )
+        ]
+        audited, reason = AllowedPathsGateEvaluator.build_audited_paths(records)
+        assert audited == []
+        assert reason is not None
+        assert "provenance incomplete" in reason
+
+
+
 def _git(repo: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", *args],
