@@ -433,7 +433,7 @@ def test_needs_fix_forwarding_does_not_mutate_without_resolution_evidence(
     assert result["errors"][0]["code"] == "readiness_needs_fix_without_resolution_evidence"
 
 
-def test_stdout_leak_real_child_stdout_stderr_not_mocked(
+def _assert_no_child_stdout_stderr_leak(
     repo_tmp: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -463,6 +463,22 @@ def test_stdout_leak_real_child_stdout_stderr_not_mocked(
     assert parsed["schema"] == txn.RESULT_SCHEMA
     assert parsed["errors"][0]["message"] != secret
     assert len(parsed["errors"][0]["message"]) <= 240
+
+
+def test_stdout_leak_real_child_stdout_stderr_not_mocked(
+    repo_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _assert_no_child_stdout_stderr_leak(repo_tmp, monkeypatch, capsys)
+
+
+def test_stdout_single_bounded_json_no_body_or_child_output_leak(
+    repo_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _assert_no_child_stdout_stderr_leak(repo_tmp, monkeypatch, capsys)
 
 
 def test_executor_inputs_under_issue_metadata_namespace(
