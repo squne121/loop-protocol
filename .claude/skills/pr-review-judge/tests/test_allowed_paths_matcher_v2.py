@@ -101,7 +101,9 @@ def _make_evaluator(allowed_paths):
     snapshot_args = dict(
         pr_number=1233,
         base_ref="main",
-        base_sha="basesha",
+        base_sha_at_snapshot="snapshotsha",
+        current_base_sha="currentbasesha",
+        diff_base_sha="mergebasesha",
         head_sha="headsha",
         reviewed_head_sha="headsha",
         allowed_paths=allowed_paths,
@@ -112,9 +114,12 @@ def _make_evaluator(allowed_paths):
         issue_number=1233,
     )
     snapshot = AllowedPathsGateEvaluator(**snapshot_args)
+    snapshot.compute_current_merge_base_sha = lambda: snapshot.diff_base_sha
     args = dict(snapshot_args)
     args["expected_contract_fingerprint"] = snapshot.compute_contract_fingerprint()
-    return AllowedPathsGateEvaluator(**args)
+    evaluator = AllowedPathsGateEvaluator(**args)
+    evaluator.compute_current_merge_base_sha = lambda: evaluator.diff_base_sha
+    return evaluator
 
 
 @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
