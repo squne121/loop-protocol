@@ -1,6 +1,24 @@
 # ALLOWED_PATHS_GATE_RESULT_V1（pr-review-judge 消費）
 
-`git diff --name-only <base>...<head>` を取得し、contract の `Allowed Paths` と照合。
+snapshot freshness 用の `base_sha_at_snapshot` と、changed files 算出用の `diff_base_sha` を分離して扱う。
+local fallback は `changed_files_source: git_diff_current_merge_base_head` とし、
+`git diff --name-only <diff_base_sha>...<head>` で changed files を取得して contract の `Allowed Paths` と照合する。
+`diff_base_sha` は `git merge-base <current_base_tip> <head_sha>` 相当の SHA を指し、snapshot base を diff 算出には使わない。
+
+```yaml
+changed_files_source_policy:
+  preferred_oracle:
+    - github_pull_request_files_api
+    - gh_pr_diff_name_only
+  deterministic_local_fallback:
+    - git_diff_current_merge_base_head
+  forbidden:
+    - git_diff_snapshot_base_head
+```
+
+local fallback は `current_base_sha` と `head_sha` から evaluator 内で `git merge-base` を計算・検証できた場合だけ
+`git_diff_current_merge_base_head` を名乗る。外部入力の `diff_base_sha` が計算値と一致しない場合は
+`indeterminate` とし、snapshot base を diff 算出へ流用してはならない。
 
 Status 定義:
 
@@ -19,14 +37,21 @@ Status 定義:
 
 `indeterminate/fail_closed` は merge-blocking として扱い、`REQUEST_CHANGES` 経路。
 
+## provenance（由来情報）
+
+- `contract_fingerprint.base_sha_at_snapshot`: snapshot freshness 判定専用
+- `diff_base_sha`: changed files 算出専用
+- `base_sha`: `diff_base_sha` の backward-compatible alias
+- `changed_files_source`: `git_diff_current_merge_base_head` など source authority が分かる値
+
 ## matcher v2 grammar（マッチャ v2 文法）
 
 matcher v2 grammar は、外部 dependency なしの segment-based マッチャである。
 パターンとパスを `/` で segment に分割し、各 segment を以下の規則で照合する。
 
-- literal segment: 完全一致する 1 segment
-- `*`: ちょうど 1 segment に一致する
-- `**`: segment 全体としてのみ許可し、0 個以上の segment に一致する（動的計画法で再帰的に照合）
+- literal segment: ちょうど 1 つの segment に完全一致するリテラルである
+- `*`: ちょうど 1 つの segment に一致する
+- `**`: segment 全体としてのみ許可し、0 個以上の segment に一致する（動的計画法で再帰的に照合する）
 
 partial-segment glob（`*.md`, `foo*`, `**suffix`, `***`）は invalid であり、fail-closed として扱う。
 invalid path（absolute, backslash, `..`, empty segment）も fail-closed である。
