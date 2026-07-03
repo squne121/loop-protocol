@@ -185,7 +185,11 @@ def test_ac7_agy_grounded_research_supported() -> None:
     evidence = result["grounded_research_evidence"] or {}
     assert evidence["parsed_evidence"].get("source") == "json_line"
     assert isinstance(evidence["parsed_evidence"].get("data"), dict)
-    assert evidence["parsed_evidence"]["data"].get("grounding") == {"queries": ["AGY WebSearch"], "sources": [{"url": "https://example.com", "title": "example"}]}
+    expected_grounding = {
+        "queries": ["AGY WebSearch"],
+        "sources": [{"url": "https://example.com", "title": "example"}],
+    }
+    assert evidence["parsed_evidence"]["data"].get("grounding") == expected_grounding
     assert result["grounded_research_evidence"]["grounding_actor"] == "antigravity_cli"
     assert result["grounded_research_evidence"]["grounding_backend"] == "agy_native_websearch"
     assert result["grounded_research_evidence"]["web_tool_call_count"] == 1
@@ -252,7 +256,9 @@ def test_agy_grounded_research_redacts_evidence_envelope() -> None:
     assert evidence["raw_credential_included"] is False
     assert evidence["repo_absolute_path_included"] is False
     assert evidence["redaction_status"] == "checked_no_credential_pattern"
-    assert "agy_web_grounding_parse_error" not in evidence["grounding_failure_class"] if evidence["grounding_failure_class"] else True
+    failure_class = evidence["grounding_failure_class"]
+    if failure_class:
+        assert "agy_web_grounding_parse_error" not in failure_class
 
 
 def test_ac7_agy_local_asset_research_rejected() -> None:

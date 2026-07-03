@@ -163,7 +163,14 @@ def resolve_model_chain(
     return list(default_chain), None
 ALLOWED_TOOL_PROFILES = {"no_tools", "grounded_research", "local_asset_research", "proposal_only", "github_research"}
 SUPPORTED_PROVIDERS: frozenset[str] = frozenset({"gemini", "agy"})
-AGY_SUPPORTED_PROFILES: frozenset[str] = frozenset({"no_tools", "proposal_only", "local_asset_research", "grounded_research"})
+AGY_SUPPORTED_PROFILES: frozenset[str] = frozenset(
+    {
+        "no_tools",
+        "proposal_only",
+        "local_asset_research",
+        "grounded_research",
+    }
+)
 LOCAL_ASSET_RESEARCH_PROFILE = "local_asset_research"
 GROUNDED_RESEARCH_PROFILE = "grounded_research"
 PROPOSAL_ONLY_PROFILE = "proposal_only"

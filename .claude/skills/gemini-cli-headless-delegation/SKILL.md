@@ -18,7 +18,7 @@ disable-model-invocation: true
 
 詳細は `references/usage-contract.md`（SSOT）・`references/model-routing.md`・`references/result-surface.md` を参照。
 
-## Workflow
+## Workflow（作業手順）
 
 0. **setup_check で依存ツール・trusted folder・Serena MCP・settings.json を確認する（必須）**:
    ```bash
@@ -56,7 +56,7 @@ uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/pr
    ```
    validate-only（Gemini CLI 未実行）は `--validate-only` を指定する。結果は `result_surface.summary` / `.primary_artifact` / `.next_action` を優先参照する。
 
-## Grounded Research Retry Policy（governance）
+## Grounded Research Retry Policy（再試行運用ガバナンス）
 
 このセクションは `tool_profile: grounded_research` における **wrapper-level retry の運用境界**を定義する governance 文書である。wrapper script (`scripts/run_gemini_headless.py`) の実 retry 挙動・retry 回数・`delegation_result_v1` の attempt フィールド仕様は `references/usage-contract.md` および `references/model-routing.md` を SSOT とし、本セクションはそれらと衝突しない範囲の運用方針のみを定める。
 
@@ -101,7 +101,7 @@ uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/se
 - API key 暫定運用は #104 が完了するまでのブリッジであり、agy 移行が完了したら不要になる。
 - agy 移行の進捗は `docs/dev/current-focus.md` および #104 を参照。
 
-## Core Rules
+## Core Rules（基本ルール）
 
 ### Delegation Boundary
 - Gemini 側の `file write` / `shell edit` / GitHub mutation は禁止。
