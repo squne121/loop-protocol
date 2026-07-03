@@ -83,7 +83,7 @@ Allowed Paths gate を fail-closed に保つための segment-only な safe subs
 そのため `docs/**/*.md`、`**.js`、`**/*-post.md` のような partial-segment glob は、
 外部仕様では一般的でも本 matcher では invalid / fail-closed である。
 
-## rename / previous_filename provenance（Issue #1300）
+## リネーム元 provenance（`previous_filename`）監査（Issue #1300）
 
 rename を示す `ChangedFileRecord`（`status: renamed`）は、post-image path（`filename` ロール）と
 pre-image path（`previous_filename` ロール）の両方を `audited_paths` に追加し、双方を Allowed Paths 判定に含める。

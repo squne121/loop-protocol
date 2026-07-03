@@ -165,7 +165,7 @@ local fallback は `current_base_sha` と `head_sha` から evaluator 内で `gi
 `git_diff_name_status_find_renames_z` を名乗る。`LOOP_VERDICT_V2.allowed_paths_gate` consumer への保証は script output の
 provenance に限り、verdict schema 自体が詳細 provenance を直接 carry するとまでは主張しない。
 
-### rename / previous_filename provenance（Issue #1300）
+### リネーム元 provenance（`previous_filename`）監査（Issue #1300）
 
 canonical な判定 input は `audited_paths[]`（`changed_file_records[]` から派生）であり、`changed_files[]` は
 post-image filename のみの backward-compatible alias に過ぎない。`status: renamed` の record は rename 元
