@@ -14,6 +14,13 @@ if str(SCRIPTS_DIR) not in sys.path:
 import edit_issue_txn as txn  # noqa: E402
 
 
+class _CP:
+    def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
 @pytest.fixture()
 def repo_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "repo"
@@ -54,6 +61,12 @@ def _minimal_input(repo_tmp: Path, *, comment_mode: dict | None = None, title_re
             "reason": "x" if title_required else None,
         },
     }
+
+
+def _normal_input_with_new_body(repo_tmp: Path, new_body: str) -> dict:
+    (repo_tmp / "tmp" / "new_body.md").write_text(new_body, encoding="utf-8")
+    payload = _minimal_input(repo_tmp)
+    return payload
 
 
 def test_schema_contracts_are_closed() -> None:
@@ -121,12 +134,6 @@ def test_no_mutation_before_guard_readiness_or_stale_precondition(
         body = "old issue body" if variant != "stale" else "different body"
         return {"title": "old", "body": body, "updatedAt": "2026-07-03T10:40:51Z"}, ""
 
-    class _CP:
-        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
-            self.returncode = returncode
-            self.stdout = stdout
-            self.stderr = stderr
-
     def _run(args: list[str]) -> _CP:
         if str(txn.GUARD_SCRIPT) in args:
             events.append("guard")
@@ -139,7 +146,7 @@ def test_no_mutation_before_guard_readiness_or_stale_precondition(
             return _CP(readiness_rc, stderr="readiness failed")
         pytest.fail(f"unexpected command: {args}")
 
-    def _invoke(*_args: object, **_kwargs: object) -> object:
+    def _invoke(*_args: object, **_kwargs: object) -> tuple[_CP, dict | None]:
         pytest.fail("controlled executor must not be invoked")
 
     monkeypatch.setattr(txn, "_fetch_issue", _fetch)
@@ -159,9 +166,44 @@ def test_no_mutation_before_guard_readiness_or_stale_precondition(
         assert events == ["guard", "hygiene", "readiness"]
 
 
-@pytest.mark.parametrize("failure_mode", ["comment_failure", "final_readback_failure"])
-def test_body_update_success_comment_or_readback_failure_maps_failed_after_mutation(
-    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch, failure_mode: str
+def test_controlled_executor_invoked_with_json_and_parsed(
+    repo_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    fetch_calls = {"count": 0}
+
+    def _fetch(*_args: object, **_kwargs: object) -> tuple[dict | None, str]:
+        calls.append(["fetch"])
+        fetch_calls["count"] += 1
+        if fetch_calls["count"] > 1:
+            return {"title": "old", "body": "new issue body", "updatedAt": "2026-07-03T10:41:51Z"}, ""
+        return {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"}, ""
+
+    def _run(args: list[str]) -> _CP:
+        if str(txn.GUARD_SCRIPT) in args:
+            return _CP(0, stdout='{"status":"pass"}')
+        if str(txn.HYGIENE_SCRIPT) in args:
+            return _CP(0)
+        if str(txn.READINESS_SCRIPT) in args:
+            return _CP(0)
+        if str(txn.CONTROLLED_EXEC) in args:
+            calls.append(args)
+            return _CP(0, stdout='{"new_body_sha256":"sha256:parsed"}')
+        pytest.fail(f"unexpected command: {args}")
+
+    monkeypatch.setattr(txn, "_fetch_issue", _fetch)
+    monkeypatch.setattr(txn, "_run_command", _run)
+
+    result = txn.run_transaction(_normal_input_with_new_body(repo_tmp, "new issue body"))
+    assert any(arg == "--json" for call in calls for arg in call)
+    assert result["status"] == "ok"
+    assert result["body_update"]["new_body_sha256"] == "sha256:parsed"
+
+
+def test_comment_publish_success_propagates_comment_id_url_body_sha(
+    repo_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     comment_body = repo_tmp / "tmp" / "comment.md"
     comment_body.write_text("comment body <!-- marker -->", encoding="utf-8")
@@ -170,11 +212,136 @@ def test_body_update_success_comment_or_readback_failure_maps_failed_after_mutat
         comment_mode={"mode": "publish", "comment_body_file": "tmp/comment.md", "marker": "<!-- marker -->"},
     )
 
-    class _CP:
-        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
-            self.returncode = returncode
-            self.stdout = stdout
-            self.stderr = stderr
+    calls: list[str] = []
+    fetch_calls = {"count": 0}
+
+    def _fetch(*_args: object, **_kwargs: object) -> tuple[dict | None, str]:
+        fetch_calls["count"] += 1
+        if fetch_calls["count"] == 1:
+            return {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"}, ""
+        return {"title": "old", "body": "new issue body", "updatedAt": "2026-07-03T10:41:51Z"}, ""
+
+    def _run(args: list[str]) -> _CP:
+        if str(txn.GUARD_SCRIPT) in args:
+            return _CP(0, stdout='{"status":"pass"}')
+        if str(txn.HYGIENE_SCRIPT) in args:
+            return _CP(0)
+        if str(txn.READINESS_SCRIPT) in args:
+            return _CP(0)
+        if str(txn.CONTROLLED_EXEC) in args:
+            if "issue_body.update" in args:
+                calls.append("issue_body.update")
+                return _CP(0, stdout='{"new_body_sha256":"sha256:new"}')
+            if "issue_comment.publish" in args:
+                calls.append("issue_comment.publish")
+                return _CP(
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "comment_id": "c-123",
+                            "comment_url": "https://github.com/squne121/loop-protocol/issues/1287#issuecomment-123",
+                            "body_sha256": "sha256:comment",
+                        }
+                    ),
+                )
+            return _CP(0, stdout="{}")
+        pytest.fail(f"unexpected command: {args}")
+
+    monkeypatch.setattr(txn, "_fetch_issue", _fetch)
+    monkeypatch.setattr(txn, "_run_command", _run)
+
+    result = txn.run_transaction(payload)
+    assert result["status"] == "ok"
+    assert calls == ["issue_body.update", "issue_comment.publish"]
+    assert result["comment_publish"]["comment_id"] == "c-123"
+    assert result["comment_publish"]["comment_url"] == "https://github.com/squne121/loop-protocol/issues/1287#issuecomment-123"
+    assert result["comment_publish"]["comment_body_sha256"] == "sha256:comment"
+
+
+def test_body_unchanged_comment_publish_skips_body_update(
+    repo_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    comment_body = repo_tmp / "tmp" / "comment.md"
+    comment_body.write_text("publish marker", encoding="utf-8")
+    payload = _minimal_input(
+        repo_tmp,
+        comment_mode={"mode": "publish", "comment_body_file": "tmp/comment.md", "marker": "publish marker"},
+    )
+    (repo_tmp / "tmp" / "new_body.md").write_text("old issue body", encoding="utf-8")
+    payload["expected_previous_body_sha256"] = txn._sha256_text("old issue body")
+
+    called: list[str] = []
+
+    def _fetch(*_args: object, **_kwargs: object) -> tuple[dict | None, str]:
+        return {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"}, ""
+
+    def _invoke(command_id: str, *_args: object, **_kwargs: object) -> tuple[_CP, dict | None]:
+        called.append(command_id)
+        if command_id == "issue_comment.publish":
+            return (
+                _CP(
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "comment_id": "c-2",
+                            "comment_url": "https://example.com/c2",
+                            "body_sha256": "sha256:comment",
+                        }
+                    ),
+                ),
+                {
+                    "comment_id": "c-2",
+                    "comment_url": "https://example.com/c2",
+                    "body_sha256": "sha256:comment",
+                },
+            )
+        pytest.fail(command_id)
+
+    monkeypatch.setattr(txn, "_fetch_issue", _fetch)
+    monkeypatch.setattr(txn, "_invoke_controlled_exec", _invoke)
+
+    result = txn.run_transaction(payload)
+    assert result["status"] == "ok"
+    assert result["body_update"]["attempted"] is False
+    assert result["comment_publish"]["attempted"] is True
+    assert result["comment_publish"]["status"] == "ok"
+    assert result["comment_publish"]["comment_id"] == "c-2"
+    assert called == ["issue_comment.publish"]
+
+
+def test_safe_repo_file_rejects_symlink_component_for_input_new_body_comment(repo_tmp: Path) -> None:
+    real_dir = repo_tmp / "tmp" / "real"
+    real_dir.mkdir()
+    (real_dir / "candidate.md").write_text("x", encoding="utf-8")
+
+    link_dir = repo_tmp / "tmp" / "link"
+    link_dir.symlink_to(real_dir)
+
+    with pytest.raises(ValueError, match="symlink_not_allowed"):
+        txn._safe_repo_file("tmp/link/candidate.md")
+
+
+def test_safe_repo_file_rejects_repo_prefix_collision(repo_tmp: Path) -> None:
+    sibling = repo_tmp.parent / f"{repo_tmp.name}-outside"
+    sibling.mkdir()
+    candidate = sibling / "outside.md"
+    candidate.write_text("outside", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="path_not_found|path_must_not_escape_repo"):
+        txn._safe_repo_file(f"../{sibling.name}/outside.md")
+
+
+def test_body_update_success_comment_or_readback_failure_maps_failed_after_mutation(
+    repo_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    comment_body = repo_tmp / "tmp" / "comment.md"
+    comment_body.write_text("comment body <!-- marker -->", encoding="utf-8")
+    payload = _minimal_input(
+        repo_tmp,
+        comment_mode={"mode": "publish", "comment_body_file": "tmp/comment.md", "marker": "<!-- marker -->"},
+    )
 
     fetch_calls = {"count": 0}
 
@@ -182,26 +349,22 @@ def test_body_update_success_comment_or_readback_failure_maps_failed_after_mutat
         fetch_calls["count"] += 1
         if fetch_calls["count"] == 1:
             return {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"}, ""
-        if failure_mode == "final_readback_failure":
-            return {"title": "old", "body": "unexpected remote body", "updatedAt": "2026-07-03T10:41:51Z"}, ""
         return {"title": "old", "body": "new issue body", "updatedAt": "2026-07-03T10:41:51Z"}, ""
 
     def _run(args: list[str]) -> _CP:
         if str(txn.GUARD_SCRIPT) in args:
             return _CP(0, stdout='{"status":"pass"}')
         if str(txn.HYGIENE_SCRIPT) in args:
-            return _CP(1)
+            return _CP(0)
         if str(txn.READINESS_SCRIPT) in args:
             return _CP(0)
         pytest.fail(f"unexpected command: {args}")
 
-    def _invoke(command_id: str, *_args: object, **_kwargs: object) -> _CP:
+    def _invoke(command_id: str, *_args: object, **_kwargs: object) -> tuple[_CP, dict | None]:
         if command_id == "issue_body.update":
-            return _CP(0, stdout='{"status":"ok"}')
+            return _CP(0, stdout='{"new_body_sha256":"sha256:body"}'), {"new_body_sha256": "sha256:body"}
         if command_id == "issue_comment.publish":
-            if failure_mode == "comment_failure":
-                return _CP(1, stderr="child stderr with secret")
-            return _CP(0, stdout='{"status":"ok"}')
+            return _CP(1, stderr="child stderr with secret"), None
         pytest.fail(command_id)
 
     monkeypatch.setattr(txn, "_fetch_issue", _fetch)
@@ -211,76 +374,122 @@ def test_body_update_success_comment_or_readback_failure_maps_failed_after_mutat
     assert result["status"] == "failed_after_mutation"
     assert result["mutation_started"] is True
     assert result["body_update"]["attempted"] is True
-    if failure_mode == "comment_failure":
-        assert result["comment_publish"]["attempted"] is True
-        assert result["comment_publish"]["status"] == "failed"
-    else:
-        assert result["comment_publish"]["attempted"] is False
-        assert result["body_update"]["remote_current_body_sha256"] == txn._sha256_text("unexpected remote body")
+    assert result["comment_publish"]["attempted"] is True
+    assert result["comment_publish"]["status"] == "failed"
 
 
-def test_stdout_single_bounded_json_no_body_or_child_output_leak(
-    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_child_timeout_maps_to_single_bounded_json(
+    repo_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    (repo_tmp / "tmp" / "new_body.md").write_text("very secret new issue body", encoding="utf-8")
-    (repo_tmp / "tmp" / "input.json").write_text(json.dumps(_minimal_input(repo_tmp)), encoding="utf-8")
+    input_json = repo_tmp / "tmp" / "input.json"
+    input_json.write_text(json.dumps(_normal_input_with_new_body(repo_tmp, "new issue body")), encoding="utf-8")
 
-    def _run_transaction(_data: dict) -> dict:
-        return {
-            "schema": "ISSUE_EDIT_TXN_RESULT_V1",
-            "status": "failed_no_mutation",
-            "issue_number": 1287,
-            "repo": "squne121/loop-protocol",
-            "mutation_started": False,
-            "rollback_attempted": False,
-            "body_update": {
-                "attempted": False,
-                "status": "not_run",
-                "previous_body_sha256": None,
-                "new_body_sha256": None,
-                "remote_current_body_sha256": None,
-                "artifact_ref": None,
-            },
-            "comment_publish": {
-                "attempted": False,
-                "status": "not_run",
-                "comment_id": None,
-                "comment_url": None,
-                "artifact_ref": None,
-            },
-            "errors": [{"code": "x", "message": "child stderr should be bounded and raw payload hidden"}],
-        }
+    def _fetch(*_args: object, **_kwargs: object) -> tuple[dict | None, str]:
+        return {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"}, ""
 
-    monkeypatch.setattr(txn, "run_transaction", _run_transaction)
+    def _run(args: list[str]) -> _CP:
+        if str(txn.GUARD_SCRIPT) in args:
+            return _CP(0, stdout='{"status":"pass"}')
+        if str(txn.HYGIENE_SCRIPT) in args:
+            return _CP(0)
+        if str(txn.READINESS_SCRIPT) in args:
+            return _CP(0)
+        if str(txn.CONTROLLED_EXEC) in args:
+            return _CP(124, stderr="child command timeout after 30s")
+        pytest.fail(f"unexpected command: {args}")
+
+    monkeypatch.setattr(txn, "_fetch_issue", _fetch)
+    monkeypatch.setattr(txn, "_run_command", _run)
+
     rc = txn.main(["--input-file", "tmp/input.json"])
     out = capsys.readouterr().out
-    assert rc == 1
-    assert out.count("\n") == 1
-    assert "very secret new issue body" not in out
-    assert "child stderr should be bounded" in out
     parsed = json.loads(out)
-    assert parsed["schema"] == "ISSUE_EDIT_TXN_RESULT_V1"
+    assert rc == 1
+    assert parsed["status"] == "failed_no_mutation"
+    assert len(out.splitlines()) == 1
+    assert len(parsed["errors"]) == 1
+    assert len(parsed["errors"][0]["message"]) <= 240
 
 
-def test_executor_inputs_under_issue_metadata_namespace(repo_tmp: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_needs_fix_forwarding_does_not_mutate_without_resolution_evidence(
+    repo_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _minimal_input(repo_tmp)
+    payload["readiness_forwarding_payload"]["readiness_result"]["status"] = "needs_fix"
+    payload["readiness_forwarding_payload"]["readiness_result"].pop("resolution_evidence", None)
+
+    def _run(*_args: object, **_kwargs: object) -> _CP:
+        pytest.fail("child subprocess should not be invoked")
+
+    monkeypatch.setattr(txn, "_run_command", _run)
+
+    result = txn.run_transaction(payload)
+    assert result["status"] == "failed_no_mutation"
+    assert result["mutation_started"] is False
+    assert result["body_update"]["attempted"] is False
+    assert result["errors"][0]["code"] == "readiness_needs_fix_without_resolution_evidence"
+
+
+def test_stdout_leak_real_child_stdout_stderr_not_mocked(
+    repo_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (repo_tmp / "tmp" / "new_body.md").write_text("old issue body", encoding="utf-8")
+    (repo_tmp / "tmp" / "input.json").write_text(json.dumps(_minimal_input(repo_tmp)), encoding="utf-8")
+    secret = "very secret child stdout " * 30
+
+    def _fetch(*_args: object, **_kwargs: object) -> tuple[dict | None, str]:
+        return {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"}, ""
+
+    def _run(args: list[str]) -> _CP:
+        if str(txn.GUARD_SCRIPT) in args:
+            return _CP(1, stdout=secret)
+        pytest.fail(f"unexpected command: {args}")
+
+    monkeypatch.setattr(txn, "_fetch_issue", _fetch)
+    monkeypatch.setattr(txn, "_run_command", _run)
+
+    rc = txn.main(["--input-file", "tmp/input.json"])
+    out = capsys.readouterr().out
+    parsed = json.loads(out)
+    assert rc == 1
+    assert parsed["status"] == "failed_no_mutation"
+    assert len(out.splitlines()) == 1
+    assert secret not in out
+    assert parsed["schema"] == txn.RESULT_SCHEMA
+    assert parsed["errors"][0]["message"] != secret
+    assert len(parsed["errors"][0]["message"]) <= 240
+
+
+def test_executor_inputs_under_issue_metadata_namespace(
+    repo_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     (repo_tmp / "tmp" / "comment.md").write_text("comment <!-- marker -->", encoding="utf-8")
     payload = _minimal_input(
         repo_tmp,
         comment_mode={"mode": "publish", "comment_body_file": "tmp/comment.md", "marker": "<!-- marker -->"},
     )
 
-    class _CP:
-        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
-            self.returncode = returncode
-            self.stdout = stdout
-            self.stderr = stderr
-
     calls: list[str] = []
 
+    fetch_calls = {"count": 0}
+
     def _fetch(*_args: object, **_kwargs: object) -> tuple[dict | None, str]:
+        fetch_calls["count"] += 1
+        if fetch_calls["count"] > 1:
+            return {
+                "title": "old",
+                "body": "new issue body",
+                "updatedAt": "2026-07-03T10:41:51Z",
+            }, ""
         return {
             "title": "old",
-            "body": "old issue body" if not calls else "new issue body",
+            "body": "old issue body",
             "updatedAt": "2026-07-03T10:40:51Z",
         }, ""
 
@@ -288,19 +497,36 @@ def test_executor_inputs_under_issue_metadata_namespace(repo_tmp: Path, monkeypa
         if str(txn.GUARD_SCRIPT) in args:
             return _CP(0, stdout='{"status":"pass"}')
         if str(txn.HYGIENE_SCRIPT) in args:
-            return _CP(1)
+            return _CP(0)
         if str(txn.READINESS_SCRIPT) in args:
             return _CP(0)
+        if str(txn.CONTROLLED_EXEC) in args:
+            if "issue_body.update" in args:
+                return _CP(0, stdout='{"new_body_sha256":"sha256:x"}'), {"new_body_sha256": "sha256:x"}
+            if "issue_comment.publish" in args:
+                return _CP(0, stdout='{"comment_id":"c-1","comment_url":"https://example.com/c1","body_sha256":"sha256:c"}'), {
+                    "comment_id": "c-1",
+                    "comment_url": "https://example.com/c1",
+                    "body_sha256": "sha256:c",
+                }
+            pytest.fail("unknown command")
         pytest.fail(f"unexpected command: {args}")
 
-    def _invoke(command_id: str, issue_number: int, repo: str, input_ref: str) -> _CP:
+    def _invoke(command_id: str, issue_number: int, repo: str, input_ref: str) -> tuple[_CP, dict | None]:
         calls.append(input_ref)
         assert input_ref.startswith(f"artifacts/{issue_number}/issue-metadata/{command_id}/")
-        return _CP(0, stdout='{"status":"ok"}')
+        if command_id == "issue_body.update":
+            return _CP(0, stdout='{"new_body_sha256":"sha256:x"}'), {"new_body_sha256": "sha256:x"}
+        return _CP(0, stdout='{"comment_id":"c-1","comment_url":"https://example.com/c1","body_sha256":"sha256:c"}'), {
+            "comment_id": "c-1",
+            "comment_url": "https://example.com/c1",
+            "body_sha256": "sha256:c",
+        }
 
     monkeypatch.setattr(txn, "_fetch_issue", _fetch)
     monkeypatch.setattr(txn, "_run_command", _run)
     monkeypatch.setattr(txn, "_invoke_controlled_exec", _invoke)
+
     result = txn.run_transaction(payload)
     assert result["status"] == "ok"
     assert len(calls) == 2

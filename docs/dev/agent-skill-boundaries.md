@@ -1542,6 +1542,8 @@ properties:
               type: object
           readiness_result_ref:
             type: string
+          resolution_evidence:
+            type: [string, "null"]
   comment_mode:
     type: object
     additionalProperties: false
@@ -1633,6 +1635,7 @@ properties:
       - status
       - comment_id
       - comment_url
+      - comment_body_sha256
       - artifact_ref
     properties:
       attempted:
@@ -1642,6 +1645,8 @@ properties:
       comment_id:
         type: [string, "null"]
       comment_url:
+        type: [string, "null"]
+      comment_body_sha256:
         type: [string, "null"]
       artifact_ref:
         type: [string, "null"]

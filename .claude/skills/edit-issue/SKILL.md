@@ -17,7 +17,7 @@ JSON result を次のルーティング判断に使う。本文の書き戻し a
 ```yaml
 dependency_policy:
   required_for_txn_helper: "#1284 / PR #1295"
-  required_for_end_to_end_raw_mutation_removal: "#1291 / PR #1298"
+  required_for_end_to_end_raw_mutation_removal: "#1291 / PR #1298 (merged)"
 ```
 
 - `required_for_txn_helper` は transaction helper 自体の前提条件。
@@ -36,7 +36,7 @@ dependency_policy:
 `READINESS_FORWARDING_PAYLOAD_V1.readiness_result.status` は
 `status: go | needs_fix | human_judgment | input_or_runtime_error`
 だけを受け付ける。`status: go` の場合は pre-author static readiness blocker なし、
-`status: needs_fix` の場合は `errors[]` と `readiness_result_ref` を candidate body 修正の正本に使う。
+`status: needs_fix` の場合は `errors[]`、`readiness_result_ref`、`resolution_evidence` を candidate body 修正の正本に使う。
 `status: human_judgment | input_or_runtime_error` の場合は fail-closed で helper の mutation 段へ進めない。
 
 ## 入力契約
@@ -56,7 +56,8 @@ dependency_policy:
       "body_sha256": "sha256:...",
       "source_checks": ["contract_readiness_check.py --mode static"],
       "errors": [],
-      "readiness_result_ref": "artifacts/.../readiness.json"
+      "readiness_result_ref": "artifacts/.../readiness.json",
+      "resolution_evidence": "artifacts/.../resolution_evidence.json"
     }
   },
   "comment_mode": {

@@ -65,8 +65,9 @@ permissionMode: acceptEdits
 
 ## fail-closed terminal result の確認項目
 
-- `checked_body_sha256` と `checker_exit_code` を readback し、rewrite 直後の検査対象本文と checker 結果の組を確認する
-- `missing_sections` と `missing_contract_keys` が残っている場合は、freeform rewrite に進まず制約付き rewrite の不足として扱う
+- helper 結果の `comment_publish.comment_id` / `comment_publish.comment_url` / `comment_publish.comment_body_sha256` を readback し、
+  失敗時には `errors` の code/message を follow-up routing の一次情報として扱う
+- `failed_after_mutation` 時は `body_update.artifact_ref` / `comment_publish.artifact_ref` を source of truth として扱う
 
 ## Rewrite 制約
 

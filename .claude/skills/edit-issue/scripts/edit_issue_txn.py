@@ -33,6 +33,7 @@ READINESS_SCRIPT = (
 INPUT_SCHEMA = "ISSUE_EDIT_TXN_INPUT_V1"
 RESULT_SCHEMA = "ISSUE_EDIT_TXN_RESULT_V1"
 READINESS_ALLOWED = {"go", "needs_fix", "human_judgment", "input_or_runtime_error"}
+CONTROLLED_EXEC_TIMEOUT_SECONDS = 30
 TOP_LEVEL_KEYS = frozenset(
     {
         "schema",
@@ -47,8 +48,24 @@ TOP_LEVEL_KEYS = frozenset(
     }
 )
 READINESS_KEYS = frozenset({"readiness_result"})
+READINESS_RESULT_REQUIRED_KEYS = frozenset(
+    {
+        "status",
+        "body_sha256",
+        "source_checks",
+        "errors",
+        "readiness_result_ref",
+    }
+)
 READINESS_RESULT_KEYS = frozenset(
-    {"status", "body_sha256", "source_checks", "errors", "readiness_result_ref"}
+    {
+        "status",
+        "body_sha256",
+        "source_checks",
+        "errors",
+        "readiness_result_ref",
+        "resolution_evidence",
+    }
 )
 TITLE_UPDATE_KEYS = frozenset({"required", "proposed_title", "reason"})
 COMMENT_MODE_KEYS = frozenset({"mode", "comment_body_file", "marker"})
@@ -107,6 +124,9 @@ def _validate_input_payload(data: dict[str, Any]) -> None:
     if not isinstance(readiness_result, dict):
         raise ValueError("readiness_result_invalid")
     _require_closed_keys(readiness_result, READINESS_RESULT_KEYS, "readiness_result")
+    missing_readiness_required = sorted(READINESS_RESULT_REQUIRED_KEYS - set(readiness_result))
+    if missing_readiness_required:
+        raise ValueError(f"readiness_result_missing_required_keys: {', '.join(missing_readiness_required)}")
     if readiness_result.get("status") not in READINESS_ALLOWED:
         raise ValueError("readiness_status_invalid")
 
@@ -136,18 +156,50 @@ def _safe_repo_file(relative_path: str) -> Path:
     if candidate.is_absolute():
         raise ValueError("path_must_be_relative")
     normalized = Path(os.path.normpath(relative_path))
-    if normalized.parts and normalized.parts[0] == "..":
-        raise ValueError("path_must_not_escape_repo")
-    resolved = (REPO_ROOT / normalized).resolve()
-    if not str(resolved).startswith(str(REPO_ROOT)):
-        raise ValueError("path_must_resolve_under_repo")
-    if not resolved.exists() or not resolved.is_file():
+    if not normalized.parts:
         raise ValueError("path_not_found")
-    if resolved.is_symlink():
-        raise ValueError("symlink_not_allowed")
-    if os.stat(resolved).st_nlink != 1:
+    if ".." in normalized.parts:
+        raise ValueError("path_must_not_escape_repo")
+    repo_root = REPO_ROOT.resolve()
+    resolved_cursor = repo_root
+    final_lstat = None
+    for part in normalized.parts:
+        resolved_cursor = resolved_cursor / part
+        try:
+            st = resolved_cursor.lstat()
+        except FileNotFoundError as exc:
+            raise ValueError("path_not_found") from exc
+        except OSError as exc:
+            raise ValueError(f"path_lstat_error: {exc}") from exc
+        final_lstat = st
+        if resolved_cursor.is_symlink():
+            raise ValueError(f"symlink_not_allowed: {resolved_cursor}")
+    try:
+        resolved = resolved_cursor.resolve()
+        resolved.relative_to(repo_root)
+    except ValueError as exc:
+        raise ValueError("path_must_resolve_under_repo") from exc
+    except OSError as exc:
+        raise ValueError(f"path_resolve_error: {exc}") from exc
+    if final_lstat is None or not resolved.is_file():
+        raise ValueError("path_not_file")
+    if final_lstat.st_nlink != 1:
         raise ValueError("hardlink_not_allowed")
+    try:
+        resolved.stat()
+    except OSError as exc:
+        raise ValueError("path_not_found")
     return resolved
+
+
+def _parse_controlled_exec_output(text: str) -> dict[str, Any] | None:
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _read_text_file(relative_path: str) -> str:
@@ -155,7 +207,22 @@ def _read_text_file(relative_path: str) -> str:
 
 
 def _run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, capture_output=True, text=True, shell=False, cwd=str(REPO_ROOT))
+    try:
+        return subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            shell=False,
+            cwd=str(REPO_ROOT),
+            timeout=CONTROLLED_EXEC_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            args,
+            124,
+            stdout="",
+            stderr=f"child command timeout after {int(exc.timeout)}s" if exc.timeout is not None else "child command timeout",
+        )
 
 
 def _child_error(cp: subprocess.CompletedProcess[str], code: str) -> dict[str, str]:
@@ -186,6 +253,9 @@ def _render_result(
     body_status: str,
     comment_attempted: bool,
     comment_status: str,
+    comment_id: str | None,
+    comment_url: str | None,
+    comment_body_sha256: str | None,
     previous_body_sha256: str | None,
     requested_new_body_sha256: str | None,
     remote_current_body_sha256: str | None,
@@ -211,8 +281,9 @@ def _render_result(
         "comment_publish": {
             "attempted": comment_attempted,
             "status": comment_status,
-            "comment_id": None,
-            "comment_url": None,
+            "comment_id": comment_id,
+            "comment_url": comment_url,
+            "comment_body_sha256": comment_body_sha256,
             "artifact_ref": comment_input_ref,
         },
         "errors": _truncate_errors(errors),
@@ -233,8 +304,8 @@ def _invoke_controlled_exec(
     issue_number: int,
     repo: str,
     input_ref: str,
-) -> subprocess.CompletedProcess[str]:
-    return _run_command(
+) -> tuple[subprocess.CompletedProcess[str], dict[str, Any] | None]:
+    cp = _run_command(
         [
             sys.executable,
             str(CONTROLLED_EXEC),
@@ -246,8 +317,68 @@ def _invoke_controlled_exec(
             input_ref,
             "--repo",
             repo,
+            "--json",
         ]
     )
+    return cp, _parse_controlled_exec_output(cp.stdout)
+
+
+def _extract_comment_publish_result(
+    result: dict[str, Any] | None,
+) -> tuple[str | None, str | None, str | None]:
+    if not result:
+        return None, None, None
+    comment_id = result.get("comment_id")
+    comment_url = result.get("comment_url")
+    comment_body_sha256 = result.get("body_sha256")
+    normalized_comment_id = comment_id if isinstance(comment_id, str) and comment_id else None
+    normalized_comment_url = comment_url if isinstance(comment_url, str) and comment_url else None
+    normalized_comment_body_sha256 = (
+        comment_body_sha256 if isinstance(comment_body_sha256, str) and comment_body_sha256 else None
+    )
+    return normalized_comment_id, normalized_comment_url, normalized_comment_body_sha256
+
+
+def _run_comment_publish(
+    state: TxnState,
+    comment_mode: dict[str, Any],
+) -> bool:
+    if comment_mode.get("mode") != "publish":
+        return True
+
+    state.comment_attempted = True
+    comment_body = _read_text_file(comment_mode["comment_body_file"])
+    marker = comment_mode["marker"]
+    if marker not in comment_body:
+        state.comment_status = "failed"
+        state.errors.append(
+            {
+                "code": "comment_marker_not_embedded_in_body",
+                "message": "comment body must contain marker before executor invocation",
+            }
+        )
+        return False
+
+    comment_input = {
+        "schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1",
+        "issue_number": state.issue_number,
+        "comment_body": comment_body,
+        "marker": marker,
+    }
+    state.comment_input_ref = _write_issue_metadata_input(
+        state.issue_number, "issue_comment.publish", comment_input
+    )
+    comment_cp, comment_result = _invoke_controlled_exec(
+        "issue_comment.publish", state.issue_number, state.repo, state.comment_input_ref
+    )
+    state.comment_id, state.comment_url, state.comment_body_sha256 = _extract_comment_publish_result(comment_result)
+    if comment_cp.returncode != 0:
+        state.comment_status = "failed"
+        state.errors.append(_child_error(comment_cp, "issue_comment_publish_failed"))
+        return False
+
+    state.comment_status = "ok"
+    return True
 
 
 @dataclass
@@ -262,6 +393,9 @@ class TxnState:
     body_status: str = "not_run"
     comment_attempted: bool = False
     comment_status: str = "not_run"
+    comment_id: str | None = None
+    comment_url: str | None = None
+    comment_body_sha256: str | None = None
     body_input_ref: str | None = None
     comment_input_ref: str | None = None
     errors: list[dict[str, str]] | None = None
@@ -296,10 +430,14 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             remote_current_body_sha256=None,
             body_input_ref=None,
             comment_input_ref=None,
+            comment_id=None,
+            comment_url=None,
+            comment_body_sha256=None,
             errors=state.errors,
         )
 
-    forwarded_status = input_data["readiness_forwarding_payload"]["readiness_result"]["status"]
+    readiness_result = input_data["readiness_forwarding_payload"]["readiness_result"]
+    forwarded_status = readiness_result["status"]
     if forwarded_status in {"human_judgment", "input_or_runtime_error"}:
         state.errors.append(
             {
@@ -321,6 +459,36 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             remote_current_body_sha256=None,
             body_input_ref=None,
             comment_input_ref=None,
+            comment_id=None,
+            comment_url=None,
+            comment_body_sha256=None,
+            errors=state.errors,
+        )
+
+    if forwarded_status == "needs_fix" and not readiness_result.get("resolution_evidence"):
+        state.errors.append(
+            {
+                "code": "readiness_needs_fix_without_resolution_evidence",
+                "message": "forwarded readiness status=needs_fix without resolution_evidence",
+            }
+        )
+        return _render_result(
+            status="failed_no_mutation",
+            issue_number=state.issue_number,
+            repo=state.repo,
+            mutation_started=False,
+            body_attempted=False,
+            body_status="not_run",
+            comment_attempted=False,
+            comment_status="not_run",
+            previous_body_sha256=None,
+            requested_new_body_sha256=None,
+            remote_current_body_sha256=None,
+            body_input_ref=None,
+            comment_input_ref=None,
+            comment_id=None,
+            comment_url=None,
+            comment_body_sha256=None,
             errors=state.errors,
         )
 
@@ -341,6 +509,9 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             remote_current_body_sha256=None,
             body_input_ref=None,
             comment_input_ref=None,
+            comment_id=None,
+            comment_url=None,
+            comment_body_sha256=None,
             errors=state.errors,
         )
 
@@ -373,13 +544,59 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             remote_current_body_sha256=current_sha,
             body_input_ref=None,
             comment_input_ref=None,
+            comment_id=None,
+            comment_url=None,
+            comment_body_sha256=None,
             errors=state.errors,
         )
 
     new_body = _read_text_file(input_data["new_body_file"])
     requested_new_sha = _sha256_text(new_body)
     state.requested_new_body_sha256 = requested_new_sha
-    if requested_new_sha == current_sha and input_data.get("comment_mode", {}).get("mode", "skip") == "skip":
+    comment_mode = input_data.get("comment_mode", {"mode": "skip"})
+    if requested_new_sha == current_sha and comment_mode.get("mode") == "publish":
+        if not _run_comment_publish(state, comment_mode):
+            return _render_result(
+                status="failed_after_mutation",
+                issue_number=state.issue_number,
+                repo=state.repo,
+                mutation_started=state.comment_attempted,
+                body_attempted=False,
+                body_status="not_run",
+                comment_attempted=state.comment_attempted,
+                comment_status=state.comment_status,
+                previous_body_sha256=current_sha,
+                requested_new_body_sha256=requested_new_sha,
+                remote_current_body_sha256=current_sha,
+                body_input_ref=None,
+                comment_input_ref=state.comment_input_ref,
+                comment_id=state.comment_id,
+                comment_url=state.comment_url,
+                comment_body_sha256=state.comment_body_sha256,
+                errors=state.errors,
+            )
+
+        return _render_result(
+            status="ok",
+            issue_number=state.issue_number,
+            repo=state.repo,
+            mutation_started=True,
+            body_attempted=False,
+            body_status="not_run",
+            comment_attempted=True,
+            comment_status="ok",
+            previous_body_sha256=current_sha,
+            requested_new_body_sha256=requested_new_sha,
+            remote_current_body_sha256=current_sha,
+            body_input_ref=None,
+            comment_input_ref=state.comment_input_ref,
+            comment_id=state.comment_id,
+            comment_url=state.comment_url,
+            comment_body_sha256=state.comment_body_sha256,
+            errors=[],
+        )
+
+    if requested_new_sha == current_sha and comment_mode.get("mode", "skip") == "skip":
         return _render_result(
             status="no_change",
             issue_number=state.issue_number,
@@ -394,6 +611,9 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             remote_current_body_sha256=current_sha,
             body_input_ref=None,
             comment_input_ref=None,
+            comment_id=None,
+            comment_url=None,
+            comment_body_sha256=None,
             errors=[],
         )
 
@@ -427,6 +647,9 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
                 remote_current_body_sha256=current_sha,
                 body_input_ref=None,
                 comment_input_ref=None,
+                comment_id=None,
+                comment_url=None,
+                comment_body_sha256=None,
                 errors=state.errors,
             )
 
@@ -449,6 +672,9 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
                 remote_current_body_sha256=current_sha,
                 body_input_ref=None,
                 comment_input_ref=None,
+                comment_id=None,
+                comment_url=None,
+                comment_body_sha256=None,
                 errors=state.errors,
             )
 
@@ -475,6 +701,9 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
                 remote_current_body_sha256=current_sha,
                 body_input_ref=None,
                 comment_input_ref=None,
+                comment_id=None,
+                comment_url=None,
+                comment_body_sha256=None,
                 errors=state.errors,
             )
 
@@ -488,7 +717,9 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
         }
         state.body_input_ref = _write_issue_metadata_input(state.issue_number, "issue_body.update", body_input)
         state.body_attempted = True
-        body_cp = _invoke_controlled_exec("issue_body.update", state.issue_number, state.repo, state.body_input_ref)
+        body_cp, body_result = _invoke_controlled_exec(
+            "issue_body.update", state.issue_number, state.repo, state.body_input_ref
+        )
         if body_cp.returncode != 0:
             refreshed_issue, _ = _fetch_issue(state.issue_number, state.repo)
             refreshed_body = (refreshed_issue or {}).get("body", current_body)
@@ -512,6 +743,9 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
                     remote_current_body_sha256=refreshed_sha,
                     body_input_ref=state.body_input_ref,
                     comment_input_ref=None,
+                    comment_id=None,
+                    comment_url=None,
+                    comment_body_sha256=None,
                     errors=state.errors,
                 )
             return _render_result(
@@ -528,11 +762,21 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
                 remote_current_body_sha256=refreshed_sha,
                 body_input_ref=state.body_input_ref,
                 comment_input_ref=None,
+                comment_id=None,
+                comment_url=None,
+                comment_body_sha256=None,
                 errors=state.errors,
             )
 
         state.mutation_started = True
         state.body_status = "ok"
+        body_result_sha = requested_new_sha
+        if body_result is not None:
+            parsed_sha = body_result.get("new_body_sha256")
+            if isinstance(parsed_sha, str) and parsed_sha:
+                body_result_sha = parsed_sha
+                state.requested_new_body_sha256 = parsed_sha
+
         final_issue, final_error = _fetch_issue(state.issue_number, state.repo)
         if final_issue is None:
             state.errors.append({"code": "final_readback_failed", "message": final_error})
@@ -546,10 +790,13 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
                 comment_attempted=False,
                 comment_status="not_run",
                 previous_body_sha256=current_sha,
-                requested_new_body_sha256=requested_new_sha,
+                requested_new_body_sha256=body_result_sha,
                 remote_current_body_sha256=None,
                 body_input_ref=state.body_input_ref,
                 comment_input_ref=None,
+                comment_id=None,
+                comment_url=None,
+                comment_body_sha256=None,
                 errors=state.errors,
             )
 
@@ -572,73 +819,36 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
                 comment_attempted=False,
                 comment_status="not_run",
                 previous_body_sha256=current_sha,
-                requested_new_body_sha256=requested_new_sha,
+                requested_new_body_sha256=body_result_sha,
                 remote_current_body_sha256=final_sha,
                 body_input_ref=state.body_input_ref,
                 comment_input_ref=None,
+                comment_id=None,
+                comment_url=None,
+                comment_body_sha256=None,
                 errors=state.errors,
             )
 
-        comment_mode = input_data.get("comment_mode", {"mode": "skip"})
-        if comment_mode.get("mode", "skip") == "publish":
-            comment_body = _read_text_file(comment_mode["comment_body_file"])
-            marker = comment_mode["marker"]
-            if marker not in comment_body:
-                state.errors.append(
-                    {
-                        "code": "comment_marker_not_embedded_in_body",
-                        "message": "comment body must contain marker before executor invocation",
-                    }
-                )
-                return _render_result(
-                    status="failed_after_mutation",
-                    issue_number=state.issue_number,
-                    repo=state.repo,
-                    mutation_started=True,
-                    body_attempted=True,
-                    body_status="ok",
-                    comment_attempted=False,
-                    comment_status="not_run",
-                    previous_body_sha256=current_sha,
-                    requested_new_body_sha256=requested_new_sha,
-                    remote_current_body_sha256=final_sha,
-                    body_input_ref=state.body_input_ref,
-                    comment_input_ref=None,
-                    errors=state.errors,
-                )
-            comment_input = {
-                "schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1",
-                "issue_number": state.issue_number,
-                "comment_body": comment_body,
-                "marker": marker,
-            }
-            state.comment_input_ref = _write_issue_metadata_input(
-                state.issue_number, "issue_comment.publish", comment_input
+        if comment_mode.get("mode") == "publish" and not _run_comment_publish(state, comment_mode):
+            return _render_result(
+                status="failed_after_mutation",
+                issue_number=state.issue_number,
+                repo=state.repo,
+                mutation_started=True,
+                body_attempted=True,
+                body_status="ok",
+                comment_attempted=state.comment_attempted,
+                comment_status=state.comment_status,
+                previous_body_sha256=current_sha,
+                requested_new_body_sha256=body_result_sha,
+                remote_current_body_sha256=final_sha,
+                body_input_ref=state.body_input_ref,
+                comment_input_ref=state.comment_input_ref,
+                comment_id=state.comment_id,
+                comment_url=state.comment_url,
+                comment_body_sha256=state.comment_body_sha256,
+                errors=state.errors,
             )
-            state.comment_attempted = True
-            comment_cp = _invoke_controlled_exec(
-                "issue_comment.publish", state.issue_number, state.repo, state.comment_input_ref
-            )
-            if comment_cp.returncode != 0:
-                state.comment_status = "failed"
-                state.errors.append(_child_error(comment_cp, "issue_comment_publish_failed"))
-                return _render_result(
-                    status="failed_after_mutation",
-                    issue_number=state.issue_number,
-                    repo=state.repo,
-                    mutation_started=True,
-                    body_attempted=True,
-                    body_status="ok",
-                    comment_attempted=True,
-                    comment_status="failed",
-                    previous_body_sha256=current_sha,
-                    requested_new_body_sha256=requested_new_sha,
-                    remote_current_body_sha256=final_sha,
-                    body_input_ref=state.body_input_ref,
-                    comment_input_ref=state.comment_input_ref,
-                    errors=state.errors,
-                )
-            state.comment_status = "ok"
 
         return _render_result(
             status="ok",
@@ -650,10 +860,13 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             comment_attempted=state.comment_attempted,
             comment_status=state.comment_status,
             previous_body_sha256=current_sha,
-            requested_new_body_sha256=requested_new_sha,
+            requested_new_body_sha256=body_result_sha,
             remote_current_body_sha256=state.remote_current_body_sha256,
             body_input_ref=state.body_input_ref,
             comment_input_ref=state.comment_input_ref,
+            comment_id=state.comment_id,
+            comment_url=state.comment_url,
+            comment_body_sha256=state.comment_body_sha256,
             errors=[],
         )
     finally:
@@ -693,6 +906,9 @@ def main(argv: list[str] | None = None) -> int:
             remote_current_body_sha256=None,
             body_input_ref=None,
             comment_input_ref=None,
+            comment_id=None,
+            comment_url=None,
+            comment_body_sha256=None,
             errors=[{"code": "txn_input_or_runtime_error", "message": str(exc)}],
         )
         exit_code = 1
