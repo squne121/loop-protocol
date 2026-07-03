@@ -91,9 +91,18 @@ READINESS_CLEAN = {
     "errors": [],
 }
 
+# NOTE (PR #1304 iteration-4 fix_delta, Blocker 2): every review-result
+# fixture below now carries a `body_sha256` matching the paired readiness
+# fixture's `body_sha256` ("sha256:body-a"), because `analyze()` now fails
+# closed (`reason_code: body_sha_missing` / `body_sha_mismatch`) instead of
+# silently falling back to the readiness artifact's hash when the review
+# artifact carries none. See `test_body_hash_*` below for the fail-closed
+# behavior itself.
+
 COMPACT_C4 = {
     "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
     "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+    "body_sha256": "sha256:body-a",
     "blocking_issues": [{"code": "C4", "message": "missing $ prefix"}],
     "structured_blockers": [],
     "findings": [],
@@ -102,6 +111,7 @@ COMPACT_C4 = {
 COMPACT_MISSING_SECTION = {
     "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
     "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+    "body_sha256": "sha256:body-a",
     "blocking_issues": [{"code": "missing_section", "message": "missing section"}],
     "structured_blockers": [],
     "findings": [],
@@ -110,6 +120,7 @@ COMPACT_MISSING_SECTION = {
 COMPACT_C9 = {
     "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
     "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+    "body_sha256": "sha256:body-a",
     "blocking_issues": [{"code": "rva_immediate_field_missing", "message": "missing runtime applicability"}],
     "structured_blockers": [],
     "findings": [],
@@ -192,6 +203,7 @@ def test_lp010_requires_exact_lp010_match():
     review = {
         "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
         "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+        "body_sha256": "sha256:body-a",
         "blocking_issues": [{"code": "LP010", "message": "ac/vc mismatch"}],
         "structured_blockers": [],
     }
@@ -210,6 +222,7 @@ def test_c5_maps_to_ac_vc_number_mismatch_and_reconstructs_lp010():
     review = {
         "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
         "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+        "body_sha256": "sha256:body-a",
         "blocking_issues": [{"code": "C5", "message": "ac/vc mismatch"}],
         "structured_blockers": [],
     }
@@ -230,6 +243,7 @@ def test_c5_checker_gap_with_failed_deterministic_check_is_inconsistency():
     review = {
         "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
         "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+        "body_sha256": "sha256:body-a",
         "blocking_issues": [{"code": "C5", "message": "ac/vc mismatch"}],
         "structured_blockers": [],
         "deterministic_checks": {"C5_ac_vc_number_alignment": "fail"},
@@ -278,6 +292,7 @@ def test_c5_checker_gap_with_failed_deterministic_check_is_inconsistency():
             {
                 "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
                 "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+                "body_sha256": "sha256:body-a",
                 "blocking_issues": [{"code": "C5", "message": "ac/vc mismatch"}],
                 "structured_blockers": [],
             },
@@ -486,6 +501,7 @@ def test_mixed_supported_and_unsupported_findings_do_not_promote_all_blockers():
     review = {
         "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
         "issue_url": COMPACT_C4["issue_url"],
+        "body_sha256": "sha256:body-a",
         "blocking_issues": [
             {"code": "C4", "message": "missing $ prefix"},
             {"code": "missing_section", "message": "missing section"},
@@ -517,6 +533,15 @@ def test_mixed_supported_and_unsupported_findings_do_not_promote_all_blockers():
     unbacked = [item for item in result["blockers"] if not item["deterministic_backed"]]
     assert len(unbacked) == 1
     assert unbacked[0]["reviewer_blocker_code"] == "missing_section"
+    # PR #1304 iteration-4 fix_delta (High item): the grouped
+    # taxonomy_gap_blockers / checker_gap_blockers arrays must never
+    # contain a blocker that also appears in rewrite_ready_blockers (the
+    # only list a Step 4 issue-author rewrite payload may consume from).
+    rewrite_ready_codes = {b["reviewer_blocker_code"] for b in result["rewrite_ready_blockers"]}
+    taxonomy_gap_codes = {b["reviewer_blocker_code"] for b in result["taxonomy_gap_blockers"]}
+    checker_gap_codes = {b["reviewer_blocker_code"] for b in result["checker_gap_blockers"]}
+    assert rewrite_ready_codes.isdisjoint(taxonomy_gap_codes)
+    assert rewrite_ready_codes.isdisjoint(checker_gap_codes)
 
 
 def test_stale_or_wrong_schema_evidence_fails_closed():
@@ -671,3 +696,229 @@ def test_cli_stdout_is_compact_json(tmp_path: Path):
     assert proc.returncode == 0
     assert "\n" not in proc.stdout.strip()
     assert len(proc.stdout.encode("utf-8")) <= 2048
+
+
+# ---------------------------------------------------------------------------
+# Body hash fail-closed contract (PR #1304 iteration-4 fix_delta, human
+# review Blocker 2): `analyze()` must not silently fall back to the
+# readiness artifact's body hash when the review artifact carries neither
+# `producer_body_sha256` nor `body_sha256` -- and must reject a mismatch
+# between the two artifacts' hashes rather than proceeding to taxonomy
+# classification.
+# ---------------------------------------------------------------------------
+
+
+def test_body_hash_missing_on_review_side_fails_closed():
+    review = {
+        "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
+        "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+        # No `producer_body_sha256` / `body_sha256` at all.
+        "blocking_issues": [{"code": "C4", "message": "missing $ prefix"}],
+        "structured_blockers": [],
+    }
+    result, next_state = analyze(
+        review_result=review,
+        readiness_result=READINESS_CLEAN,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={"consecutive_unbacked_count": 1},
+    )
+    assert result["verdict"] == "input_or_runtime_error"
+    assert result["verdict_detail_v1"] == "input_or_runtime_error"
+    assert result["routing"] == "human_judgment_required"
+    assert result["reason_code"] == "body_sha_missing"
+    assert result["blockers"] == []
+    # State must not advance -- a subsequent, correctly-paired replay must
+    # not be misclassified as a repeated reviewer claim.
+    assert next_state == {"consecutive_unbacked_count": 1}
+
+
+def test_body_hash_missing_on_readiness_side_fails_closed():
+    readiness_missing_hash = {
+        "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+        "body_sha256": "",
+        "errors": [],
+    }
+    result, _ = analyze(
+        review_result=COMPACT_C4,
+        readiness_result=readiness_missing_hash,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
+    assert result["reason_code"] == "body_sha_missing"
+    assert result["routing"] == "human_judgment_required"
+
+
+def test_producer_body_sha256_mismatch_fails_closed_not_taxonomy_gap():
+    # A stale review artifact (fewer/older body hash) paired with a fresh
+    # readiness artifact must not be misclassified as `taxonomy_gap` --
+    # this is the exact scenario the previous unconditional readiness-hash
+    # fallback allowed through.
+    stale_review = {
+        "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
+        "issue_url": "https://github.com/squne121/loop-protocol/issues/1286",
+        "producer_body_sha256": "sha256:stale-review-body",
+        "blocking_issues": [{"code": "C5", "message": "ac/vc mismatch"}],
+        "structured_blockers": [],
+        "deterministic_checks": {"C5_ac_vc_number_alignment": "fail"},
+    }
+    fresh_readiness = {
+        "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+        "body_sha256": "sha256:fresh-readiness-body",
+        "errors": [],
+    }
+    result, next_state = analyze(
+        review_result=stale_review,
+        readiness_result=fresh_readiness,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={"consecutive_unbacked_count": 0},
+    )
+    assert result["verdict"] != "checker_artifact_inconsistency"
+    assert result["verdict_detail_v1"] != "taxonomy_gap"
+    assert result["verdict"] == "input_or_runtime_error"
+    assert result["verdict_detail_v1"] == "input_or_runtime_error"
+    assert result["reason_code"] == "body_sha_mismatch"
+    assert result["routing"] == "human_judgment_required"
+    assert result["should_consume_iteration"] is False
+    assert next_state == {"consecutive_unbacked_count": 0}
+
+
+def test_producer_body_sha256_takes_priority_over_legacy_body_sha256():
+    # `producer_body_sha256` is the canonical field (compact_review_result.py
+    # writes it); a stale/legacy `body_sha256` value on the same artifact
+    # must not override it.
+    review = {
+        **COMPACT_C4,
+        "producer_body_sha256": "sha256:body-a",
+        "body_sha256": "sha256:different-legacy-value",
+    }
+    result, _ = analyze(
+        review_result=review,
+        readiness_result=READINESS_LP001,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
+    # producer_body_sha256 ("sha256:body-a") matches readiness body_sha256,
+    # so this must proceed to normal classification, not fail closed.
+    assert result["reason_code"] is None
+    assert result["verdict"] == "reviewer_claim_unbacked_by_deterministic_checker"
+
+
+def test_legacy_body_sha256_fallback_used_when_producer_field_absent():
+    review = {
+        "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
+        "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+        "body_sha256": "sha256:body-a",
+        "blocking_issues": [{"code": "C4", "message": "missing $ prefix"}],
+        "structured_blockers": [],
+    }
+    result, _ = analyze(
+        review_result=review,
+        readiness_result=READINESS_LP001,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
+    assert result["reason_code"] is None
+    assert result["verdict"] == "reviewer_claim_unbacked_by_deterministic_checker"
+
+
+# ---------------------------------------------------------------------------
+# taxonomy_gap_blockers / checker_gap_blockers / unbacked_blockers grouping
+# (PR #1304 iteration-4 fix_delta, High item)
+# ---------------------------------------------------------------------------
+
+
+def test_checker_gap_blocker_is_grouped_separately_from_rewrite_ready():
+    review = {
+        "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
+        "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+        "body_sha256": "sha256:body-a",
+        "blocking_issues": [{"code": "z9_unregistered", "message": "??"}],
+        "structured_blockers": [],
+    }
+    result, _ = analyze(
+        review_result=review,
+        readiness_result=READINESS_CLEAN,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
+    assert result["rewrite_ready_blockers"] == []
+    assert result["taxonomy_gap_blockers"] == []
+    assert len(result["checker_gap_blockers"]) == 1
+    assert result["checker_gap_blockers"][0]["reviewer_blocker_code"] == "z9_unregistered"
+    assert result["unbacked_blockers"] == []
+
+
+def test_unbacked_blocker_is_grouped_in_unbacked_blockers():
+    result, _ = analyze(
+        review_result=COMPACT_C4,
+        readiness_result=READINESS_LP001,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
+    assert result["rewrite_ready_blockers"] == []
+    assert result["taxonomy_gap_blockers"] == []
+    assert result["checker_gap_blockers"] == []
+    assert len(result["unbacked_blockers"]) == 1
+    assert result["unbacked_blockers"][0]["reviewer_blocker_code"] == "C4"
+
+
+# ---------------------------------------------------------------------------
+# 2048-byte trimming must preserve blocker-level taxonomy_gap / checker_gap
+# classification (PR #1304 iteration-4 fix_delta, High item)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_trimming_preserves_taxonomy_gap_and_checker_gap_fields(tmp_path: Path):
+    # Build a review artifact with enough blockers / long messages to force
+    # the CLI's 2048-byte trim path, mixing a checker_gap blocker with an
+    # unbacked one.
+    review = {
+        "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
+        "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+        "body_sha256": "sha256:body-a",
+        "blocking_issues": [
+            {
+                "code": f"z_unregistered_{i}",
+                "message": "x" * 200,
+            }
+            for i in range(6)
+        ],
+        "structured_blockers": [],
+    }
+    review_path = tmp_path / "review.json"
+    readiness_path = tmp_path / "readiness.json"
+    review_path.write_text(json.dumps(review), encoding="utf-8")
+    readiness_path.write_text(json.dumps(READINESS_CLEAN), encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--review-result-file",
+            str(review_path),
+            "--readiness-result-file",
+            str(readiness_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 0
+    payload = json.loads(proc.stdout)
+    assert len(proc.stdout.encode("utf-8")) <= 2048
+    # Top-level verdict_detail_v1 must survive trimming.
+    assert "verdict_detail_v1" in payload
+    # Each trimmed blocker entry must still carry taxonomy_gap / checker_gap.
+    assert payload["blockers"], "trimmed output must still include some blockers"
+    for blocker in payload["blockers"]:
+        assert "taxonomy_gap" in blocker
+        assert "checker_gap" in blocker
+        assert "normalized_kind" in blocker
+        assert "checker_artifact_inconsistency" in blocker
