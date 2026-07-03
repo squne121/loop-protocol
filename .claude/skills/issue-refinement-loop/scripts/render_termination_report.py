@@ -67,6 +67,37 @@ VALID_TERMINATION_CAUSES = frozenset({
 
 GUARD_FAIL_REASON_CODE = "guard_fail_limit_exceeded"
 
+# #1090 AC6: scope_signal_guard_decision_v2 routes that must surface
+# missing-approval diagnostics in the termination report blockers.
+SCOPE_SIGNAL_GUARD_V2_BLOCKER_ROUTES = frozenset({
+    "human_judgment_required",
+    "security_risk_gate_required",
+    "invalid_scope_delta_approval",
+})
+
+
+def _scope_signal_guard_v2_blocker_lines(decision: dict[str, Any]) -> list[str]:
+    """#1090 AC6: project SCOPE_SIGNAL_GUARD_DECISION_V2 into blocker strings.
+
+    Emits the route itself, the missing_approval_field flag, and (when
+    present) the suggested_contract_patch so the termination report tells a
+    human the concrete next action, not just scope_signal_guard_reason_code.
+    """
+    route = decision.get("route")
+    if route not in SCOPE_SIGNAL_GUARD_V2_BLOCKER_ROUTES:
+        return []
+    approval = decision.get("scope_delta_approval") or {}
+    if not isinstance(approval, dict):
+        approval = {}
+    lines = [
+        f"scope_signal_guard_route:{route}",
+        f"missing_approval_field:{'true' if approval.get('missing_approval_field') else 'false'}",
+    ]
+    patch = approval.get("suggested_contract_patch")
+    if isinstance(patch, str) and patch:
+        lines.append(f"suggested_contract_patch:{patch}")
+    return lines
+
 
 # ---------------------------------------------------------------------------
 # Dynamic fence helper (AC8: GFM fence injection prevention)
@@ -261,11 +292,36 @@ def normalize_input(raw: Any) -> dict[str, Any]:
     - alias conflicts fail closed
     - `human_escalation` without an explicit cause falls back to
       `human_judgment_required`
+    - `scope_signal_guard_decision_v2` (optional, #1090 AC6) is projected
+      into `blockers_summary` entries (route / missing_approval_field /
+      suggested_contract_patch) and then removed from the payload
     """
     if not isinstance(raw, dict):
         raise InputValidationError("Input must be a JSON object")
 
     data = dict(raw)
+
+    if "scope_signal_guard_decision_v2" in data:
+        decision = data.pop("scope_signal_guard_decision_v2")
+        if decision is not None:
+            if not isinstance(decision, dict):
+                raise InputValidationError(
+                    "scope_signal_guard_decision_v2 must be an object or null"
+                )
+            extra = _scope_signal_guard_v2_blocker_lines(decision)
+            if extra:
+                existing = data.get("blockers_summary")
+                if existing is None:
+                    existing = []
+                if not isinstance(existing, list):
+                    raise InputValidationError(
+                        "blockers_summary must be list or null"
+                    )
+                merged = list(existing)
+                for line in extra:
+                    if line not in merged:
+                        merged.append(line)
+                data["blockers_summary"] = merged
 
     if "blocker_summary" in data:
         blocker_summary = data["blocker_summary"]
