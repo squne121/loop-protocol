@@ -164,7 +164,7 @@ def test_d10_build_raw_command_contains_model():
 
 
 # ---------------------------------------------------------------------------
-# D-11  grounded_research → "Google Search grounding is allowed" injected
+# D-11  grounded_research → "AGY native WebSearch" injected
 #        no_tools → NOT injected
 # (note: implemented via build_prompt text injection, not --tools CLI flag)
 # ---------------------------------------------------------------------------
@@ -179,7 +179,7 @@ def test_d11_grounded_research_prompt_contains_google_search():
         "model": "gemini-3-flash-preview",
     }
     prompt = module.build_prompt(request, [])
-    assert "Google Search grounding is allowed" in prompt
+    assert "AGY native WebSearch" in prompt
 
 
 def test_d11_no_tools_prompt_does_not_contain_google_search():
@@ -192,7 +192,7 @@ def test_d11_no_tools_prompt_does_not_contain_google_search():
         "model": "gemini-3-flash-preview",
     }
     prompt = module.build_prompt(request, [])
-    assert "Google Search grounding is allowed" not in prompt
+    assert "AGY native WebSearch" not in prompt
 
 
 # ---------------------------------------------------------------------------
