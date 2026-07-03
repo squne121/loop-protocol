@@ -4,6 +4,11 @@ reviewer_claim_replay.py - REVIEWER_CLAIM_REPLAY_V1
 
 Arbitrates reviewer blockers against deterministic artifacts before a
 `needs-fix` verdict consumes another refinement-loop iteration.
+
+Reviewer codes / deterministic check names / readiness rule ids / readiness
+categories / domain keys are normalized through a single table-driven
+taxonomy (`REVIEWER_CHECKER_TAXONOMY_V1`) so that adding coverage for a new
+reviewer blocker requires only a table entry, not new branching logic.
 """
 
 from __future__ import annotations
@@ -14,46 +19,134 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import jsonschema as _jsonschema
+
 SCHEMA = "REVIEWER_CLAIM_REPLAY_V1"
 STATE_SCHEMA = "REVIEWER_CLAIM_REPLAY_STATE_V1"
+TAXONOMY_SCHEMA = "REVIEWER_CHECKER_TAXONOMY_V1"
 
-VC_COMMAND_RULE_IDS = frozenset({"VCS001", "LP011", "LP016"})
-VC_COMMAND_CATEGORIES = frozenset(
-    {"non_dollar_command", "compound_shell", "compound_command_disallowed", "no_commands_extracted"}
-)
-LP010_RULE_IDS = frozenset({"LP010"})
-MISSING_SECTION_RULE_IDS = frozenset({"LP001"})
-RVA_CATEGORIES = frozenset({"rva_immediate_field_missing"})
-
-KIND_ALIASES = {
-    "c4": "vc_command_format",
-    "vc_command_format": "vc_command_format",
-    "vc command format": "vc_command_format",
-    "missing $ prefix": "vc_command_format",
-    "missing_$_prefix": "vc_command_format",
-    "lp010": "ac_vc_number_mismatch",
-    "ac_vc_number_mismatch": "ac_vc_number_mismatch",
-    "missing_required_section": "missing_section",
-    "missing_section": "missing_section",
-    "c5": "ac_vc_number_mismatch",
-    "rva_immediate_field_missing": "rva_immediate_field_missing",
-}
-KIND_TO_DETERMINISTIC_DOMAIN_KEY = {
-    "vc_command_format": "vc_command_format",
-    "ac_vc_number_mismatch": "vc_number_alignment",
-    "missing_section": "required_sections",
-    "rva_immediate_field_missing": "runtime_applicability",
-}
 VALID_FINDING_KINDS = frozenset(
     {"deterministic_domain_blocker", "checker_gap", "heuristic_concern"}
 )
 VALID_ARTIFACT_SCHEMAS = frozenset({"REVIEW_ISSUE_RESULT_V1", "CHECK_ISSUE_CONTRACT_V1"})
-KIND_TO_DETERMINISTIC_CHECK = {
-    "vc_command_format": "C4_vc_commands_present",
-    "ac_vc_number_mismatch": "C5_ac_vc_number_alignment",
-    "missing_section": "C1_required_sections",
-    "rva_immediate_field_missing": "C9_runtime_applicability_present",
+
+# REVIEWER_CHECKER_TAXONOMY_V1 -- table-driven parity between:
+#   - reviewer_codes: raw `reviewer_blocker_code` strings a reviewer may emit
+#   - deterministic_checks: `deterministic_checks` dict key(s) in the review artifact
+#   - readiness_rule_ids / readiness_categories: `errors[]` entries in the
+#     ISSUE_CONTRACT_READINESS_RESULT_V1 artifact that back this entry
+#   - domain_keys: `deterministic_domain_key` values used by structured findings
+#
+# Adding coverage for a new reviewer blocker / checker pair is a table
+# addition, not a code change (Issue #1286 In Scope).
+REVIEWER_CHECKER_TAXONOMY_V1: list[dict[str, Any]] = [
+    {
+        "entry_id": "vc_command_format",
+        "reviewer_codes": [
+            "c4",
+            "vc_command_format",
+            "vc command format",
+            "missing $ prefix",
+            "missing_$_prefix",
+        ],
+        "deterministic_checks": ["C4_vc_commands_present"],
+        "readiness_rule_ids": ["VCS001", "LP011", "LP016"],
+        "readiness_rule_id_source_check": None,
+        "readiness_categories": [
+            "non_dollar_command",
+            "compound_shell",
+            "compound_command_disallowed",
+            "no_commands_extracted",
+        ],
+        "readiness_category_source_check": "contract_readiness_check",
+        "domain_keys": ["vc_command_format"],
+    },
+    {
+        "entry_id": "ac_vc_number_mismatch",
+        "reviewer_codes": ["lp010", "ac_vc_number_mismatch", "c5"],
+        "deterministic_checks": ["C5_ac_vc_number_alignment"],
+        "readiness_rule_ids": ["LP010"],
+        "readiness_rule_id_source_check": None,
+        "readiness_categories": [],
+        "readiness_category_source_check": None,
+        "domain_keys": ["vc_number_alignment"],
+    },
+    {
+        "entry_id": "missing_section",
+        "reviewer_codes": ["missing_required_section", "missing_section"],
+        "deterministic_checks": ["C1_required_sections"],
+        "readiness_rule_ids": ["LP001"],
+        "readiness_rule_id_source_check": "validate_issue_body",
+        "readiness_categories": [],
+        "readiness_category_source_check": None,
+        "domain_keys": ["required_sections"],
+    },
+    {
+        "entry_id": "rva_immediate_field_missing",
+        "reviewer_codes": ["c9", "rva_immediate_field_missing"],
+        "deterministic_checks": ["C9_runtime_applicability_present"],
+        "readiness_rule_ids": [],
+        "readiness_rule_id_source_check": None,
+        "readiness_categories": ["rva_immediate_field_missing"],
+        "readiness_category_source_check": "contract_readiness_check",
+        "domain_keys": ["runtime_applicability"],
+    },
+]
+
+TAXONOMY_BY_ENTRY_ID: dict[str, dict[str, Any]] = {
+    entry["entry_id"]: entry for entry in REVIEWER_CHECKER_TAXONOMY_V1
 }
+
+
+def _normalize_blocker_code(code: str) -> str:
+    return " ".join(code.strip().lower().split())
+
+
+def _build_taxonomy_lookup() -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for entry in REVIEWER_CHECKER_TAXONOMY_V1:
+        entry_id = entry["entry_id"]
+        keys: list[str] = (
+            list(entry["reviewer_codes"])
+            + list(entry["deterministic_checks"])
+            + list(entry["domain_keys"])
+            + [entry_id]
+        )
+        for raw_key in keys:
+            normalized = _normalize_blocker_code(str(raw_key))
+            existing = lookup.get(normalized)
+            if existing is not None and existing != entry_id:
+                raise ValueError(
+                    f"taxonomy key collision: {normalized!r} maps to both "
+                    f"{existing!r} and {entry_id!r}"
+                )
+            lookup[normalized] = entry_id
+    return lookup
+
+
+TAXONOMY_LOOKUP: dict[str, str] = _build_taxonomy_lookup()
+
+
+def normalize_taxonomy_key(raw: str) -> str | None:
+    """Normalize a reviewer code / deterministic check name / domain key /
+    entry id to its canonical taxonomy entry_id, or None if unregistered."""
+    return TAXONOMY_LOOKUP.get(_normalize_blocker_code(str(raw)))
+
+
+def _domain_key_for(kind: str) -> str | None:
+    entry = TAXONOMY_BY_ENTRY_ID.get(kind)
+    if entry is None:
+        return None
+    domain_keys = entry["domain_keys"]
+    return domain_keys[0] if domain_keys else None
+
+
+def _deterministic_check_for(kind: str) -> str | None:
+    entry = TAXONOMY_BY_ENTRY_ID.get(kind)
+    if entry is None:
+        return None
+    checks = entry["deterministic_checks"]
+    return checks[0] if checks else None
 
 
 def _reject_nonfinite_json(token: str) -> None:
@@ -65,16 +158,22 @@ def _strict_json_loads(text: str) -> dict[str, Any]:
 
 
 def _strict_json_dumps(payload: Any) -> str:
-    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
-
-
-def _normalize_blocker_code(code: str) -> str:
-    return " ".join(code.strip().lower().split())
+    # sort_keys=True (PR #1304 iteration-4 fix_delta, Medium item): stable
+    # key ordering so `--dump-taxonomy` output (and any other JSON emitted
+    # by this module) is byte-for-byte reproducible across runs, which is
+    # what regression / drift tests rely on.
+    return json.dumps(
+        payload,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+    )
 
 
 def _classify_blocker(blocker: dict[str, Any]) -> str:
     code = str(blocker.get("reviewer_blocker_code") or "")
-    return KIND_ALIASES.get(_normalize_blocker_code(code), "unknown_blocker_type")
+    return normalize_taxonomy_key(code) or "unknown_blocker_type"
 
 
 def _load_json_file(path: str, label: str) -> dict[str, Any]:
@@ -119,7 +218,14 @@ def _extract_findings(review_result: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _matching_readiness_errors(kind: str, readiness_result: dict[str, Any]) -> list[dict[str, Any]]:
+    entry = TAXONOMY_BY_ENTRY_ID.get(kind)
+    if entry is None:
+        return []
     matches: list[dict[str, Any]] = []
+    rule_ids = frozenset(entry["readiness_rule_ids"])
+    rule_id_source_check = entry.get("readiness_rule_id_source_check")
+    categories = frozenset(entry["readiness_categories"])
+    category_source_check = entry.get("readiness_category_source_check")
     for err in readiness_result.get("errors", []):
         if not isinstance(err, dict):
             continue
@@ -127,20 +233,12 @@ def _matching_readiness_errors(kind: str, readiness_result: dict[str, Any]) -> l
         category = str(err.get("category") or "")
         source_check = str(err.get("source_check") or "")
 
-        if kind == "vc_command_format":
-            if rule_id in VC_COMMAND_RULE_IDS:
-                matches.append(err)
-            elif source_check == "contract_readiness_check" and category in VC_COMMAND_CATEGORIES:
-                matches.append(err)
-        elif kind == "ac_vc_number_mismatch" and rule_id in LP010_RULE_IDS:
+        if rule_id in rule_ids and (rule_id_source_check is None or source_check == rule_id_source_check):
             matches.append(err)
-        elif kind == (
-            "missing_section"
-        ) and source_check == "validate_issue_body" and rule_id in MISSING_SECTION_RULE_IDS:
-            matches.append(err)
-        elif kind == (
-            "rva_immediate_field_missing"
-        ) and source_check == "contract_readiness_check" and category in RVA_CATEGORIES:
+            continue
+        if category in categories and (
+            category_source_check is None or source_check == category_source_check
+        ):
             matches.append(err)
     return matches
 
@@ -159,7 +257,9 @@ def _matching_vc_preflight(kind: str, vc_preflight_result: dict[str, Any] | None
         raise ValueError("vc-preflight-result-file.results must be a list")
     if kind != "vc_command_format":
         return []
-    return [item for item in results if isinstance(item, dict) and item.get("category") in VC_COMMAND_CATEGORIES]
+    entry = TAXONOMY_BY_ENTRY_ID.get(kind)
+    categories = frozenset(entry["readiness_categories"]) if entry else frozenset()
+    return [item for item in results if isinstance(item, dict) and item.get("category") in categories]
 
 
 def _matching_vc_syntax(kind: str, vc_syntax_result: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -170,11 +270,14 @@ def _matching_vc_syntax(kind: str, vc_syntax_result: dict[str, Any] | None) -> l
         raise ValueError("vc-syntax-result-file.errors must be a list")
     if kind != "vc_command_format":
         return []
+    entry = TAXONOMY_BY_ENTRY_ID.get(kind)
+    rule_ids = frozenset(entry["readiness_rule_ids"]) if entry else frozenset()
+    categories = frozenset(entry["readiness_categories"]) if entry else frozenset()
     return [
         item
         for item in errors
         if isinstance(item, dict)
-        and (item.get("rule_id") in VC_COMMAND_RULE_IDS or item.get("category") in VC_COMMAND_CATEGORIES)
+        and (item.get("rule_id") in rule_ids or item.get("category") in categories)
     ]
 
 
@@ -214,7 +317,7 @@ def _is_valid_checker_evidence(entry: dict[str, Any], body_sha256: str) -> bool:
 
 
 def _matching_findings(kind: str, findings: list[dict[str, Any]], body_sha256: str) -> list[dict[str, Any]]:
-    deterministic_domain_key = KIND_TO_DETERMINISTIC_DOMAIN_KEY.get(kind)
+    deterministic_domain_key = _domain_key_for(kind)
     if deterministic_domain_key is None:
         return []
 
@@ -268,14 +371,99 @@ def _save_state(state_file: str | None, state: dict[str, Any]) -> None:
     )
 
 
+# LEGACY_VERDICT_MAP_V1 -- the pre-#1286 verdict set documented in
+# `issue-refinement-loop/SKILL.md` Step 2a (`deterministic_fail_confirmed`,
+# `reviewer_claim_unbacked_by_deterministic_checker`,
+# `reviewer_false_positive_suspected`, `input_or_runtime_error`) plus the
+# pre-existing `checker_artifact_inconsistency` verdict.
+#
+# The top-level `verdict` field returned by `analyze()` is ALWAYS one of
+# these legacy values (PR #1304 iteration-2 fix_delta): SKILL.md Step 2a's
+# routing table only understands this set, and is Out of Scope to update
+# for Issue #1286 (not in Allowed Paths). New verdicts introduced by Issue
+# #1286 (`taxonomy_gap`, `checker_gap`, `checker_gap_repeated`) are mapped
+# here to the semantically-closest legacy value with matching routing
+# semantics (same consume/rerun/escalation behavior), so a consumer that
+# has not been updated for the new values still receives a value it
+# recognizes and routes safely.
+#
+# The precise Issue #1286 classification (including the new-only values)
+# is NOT lost: it is carried in the secondary `verdict_detail_v1` field
+# (see `analyze()`), which a `taxonomy_gap` / `checker_gap`-aware consumer
+# can read without requiring the primary `verdict` field to carry a value
+# outside the legacy set.
+#
+# NOTE on `checker_artifact_inconsistency` / `fix_checker_artifact`
+# (PR #1304 iteration-4 fix_delta, human-review Blocker 1): this verdict
+# value and routing lane predate Issue #1286 -- they were introduced by
+# commit 65dad59b ("fail-closed checker artifacts for review-issue
+# findings", #1058), later touched by #1086, and are NOT new to this PR.
+# `issue-refinement-loop/SKILL.md` Step 2a has never enumerated this value
+# (verified via `git log --follow` + `git show <commit>:.claude/skills/
+# issue-refinement-loop/SKILL.md` across the #1058 / #1086 history and the
+# pre-#1286 `main` tip); this is a pre-existing undocumented-consumer gap
+# in `SKILL.md`, not a regression introduced by the Issue #1286 taxonomy
+# work. `SKILL.md` is outside this Issue's Allowed Paths, so closing that
+# pre-existing documentation gap is Out of Scope here (see PR body).
+_LEGACY_VERDICT_MAP_V1: dict[str, str] = {
+    "deterministic_fail_confirmed": "deterministic_fail_confirmed",
+    "checker_artifact_inconsistency": "checker_artifact_inconsistency",
+    "reviewer_claim_unbacked_by_deterministic_checker": "reviewer_claim_unbacked_by_deterministic_checker",
+    "reviewer_false_positive_suspected": "reviewer_false_positive_suspected",
+    "input_or_runtime_error": "input_or_runtime_error",
+    # New Issue #1286 verdicts -> legacy fallback with matching `routing`
+    # semantics (same consume/rerun/escalation behavior as the legacy value
+    # it maps to):
+    "taxonomy_gap": "checker_artifact_inconsistency",
+    "checker_gap": "reviewer_claim_unbacked_by_deterministic_checker",
+    "checker_gap_repeated": "reviewer_false_positive_suspected",
+}
+
+
+def _legacy_verdict(verdict: str) -> str:
+    """Map a precise verdict to the pre-#1286 SKILL.md Step 2a compatible
+    value. This is the value emitted as the top-level `verdict` field."""
+    return _LEGACY_VERDICT_MAP_V1.get(verdict, "input_or_runtime_error")
+
+
 def _has_deterministic_check_failure(kind: str, review_result: dict[str, Any]) -> bool:
-    check_name = KIND_TO_DETERMINISTIC_CHECK.get(kind)
+    check_name = _deterministic_check_for(kind)
     if not check_name:
         return False
     deterministic_checks = review_result.get("deterministic_checks", {})
     if not isinstance(deterministic_checks, dict):
         return False
     return deterministic_checks.get(check_name) == "fail"
+
+
+def _body_hash_error(
+    reason_code: str, issue_url: str, previous_state: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Fail-closed error result for a review/readiness body hash contract
+    violation (PR #1304 iteration-4 fix_delta, human-review Blocker 2).
+
+    Does NOT advance `consecutive_unbacked_count` -- `previous_state` is
+    returned unchanged so a subsequent, correctly-paired replay is not
+    misclassified as a repeated reviewer claim.
+    """
+    return (
+        {
+            "schema": SCHEMA,
+            "verdict": _legacy_verdict("input_or_runtime_error"),
+            "verdict_detail_v1": "input_or_runtime_error",
+            "routing": "human_judgment_required",
+            "should_consume_iteration": False,
+            "reason_code": reason_code,
+            "issue_url": issue_url,
+            "blockers": [],
+            "rewrite_ready_blockers": [],
+            "taxonomy_gap_blockers": [],
+            "checker_gap_blockers": [],
+            "unbacked_blockers": [],
+            "error": f"review/readiness body hash contract violation: {reason_code}",
+        },
+        previous_state,
+    )
 
 
 def analyze(
@@ -286,20 +474,51 @@ def analyze(
     vc_preflight_result: dict[str, Any] | None,
     previous_state: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    previous_state = previous_state or {}
+    issue_url = str(review_result.get("issue_url") or "")
+
+    # Body hash contract (PR #1304 iteration-4 fix_delta, human-review
+    # Blocker 2): the compact review artifact's canonical body hash field
+    # is `producer_body_sha256` (see `compact_review_result.py`);
+    # `body_sha256` is kept only as a back-compat fallback for callers
+    # that pass the raw (non-compact) `REVIEW_ISSUE_RESULT_V1` shape.
+    #
+    # Previously this fell back unconditionally to the *readiness*
+    # artifact's body hash whenever the review artifact carried neither
+    # field, which let a stale review artifact be paired with a fresh
+    # readiness artifact and pass the "same body hash" check below by
+    # construction (the readiness hash was being compared against
+    # itself). Both hashes must now be present and must match, or this
+    # fails closed instead of proceeding to taxonomy classification.
+    readiness_body_sha256 = str(readiness_result.get("body_sha256") or "")
+    review_body_sha256 = str(
+        review_result.get("producer_body_sha256")
+        or review_result.get("body_sha256")
+        or ""
+    )
+    if not readiness_body_sha256 or not review_body_sha256:
+        return _body_hash_error("body_sha_missing", issue_url, previous_state)
+    if review_body_sha256 != readiness_body_sha256:
+        return _body_hash_error("body_sha_mismatch", issue_url, previous_state)
+    body_sha256 = readiness_body_sha256
+
     blockers = _extract_review_blockers(review_result)
     findings = _extract_findings(review_result)
-    body_sha256 = str(readiness_result.get("body_sha256") or "")
-    issue_url = str(review_result.get("issue_url") or "")
-    previous_state = previous_state or {}
 
     if not blockers:
         return (
             {
                 "schema": SCHEMA,
-                "verdict": "input_or_runtime_error",
+                "verdict": _legacy_verdict("input_or_runtime_error"),
+                "verdict_detail_v1": "input_or_runtime_error",
                 "routing": "human_judgment_required",
                 "should_consume_iteration": False,
+                "reason_code": None,
                 "blockers": [],
+                "rewrite_ready_blockers": [],
+                "taxonomy_gap_blockers": [],
+                "checker_gap_blockers": [],
+                "unbacked_blockers": [],
                 "error": "review-result has no blocker entries",
             },
             previous_state,
@@ -308,9 +527,13 @@ def analyze(
     blocker_results: list[dict[str, Any]] = []
     rewrite_ready_blockers: list[dict[str, Any]] = []
     inconsistency_blockers: list[dict[str, Any]] = []
+    taxonomy_gap_blockers: list[dict[str, Any]] = []
+    checker_gap_blockers: list[dict[str, Any]] = []
+    unbacked_blockers: list[dict[str, Any]] = []
     for blocker in blockers:
         kind = _classify_blocker(blocker)
-        matched_findings = _matching_findings(kind, findings, body_sha256)
+        is_known = kind in TAXONOMY_BY_ENTRY_ID
+        matched_findings = _matching_findings(kind, findings, body_sha256) if is_known else []
         evidence: list[dict[str, Any]] = []
         deterministic_backed = False
         if matched_findings:
@@ -323,7 +546,7 @@ def analyze(
                     deterministic_backed = True
                     evidence.extend(finding["checker_evidence"])
         fallback_evidence: list[dict[str, Any]] = []
-        if not deterministic_backed and (
+        if is_known and not deterministic_backed and (
             not matched_findings
             or all(
                 finding["finding_kind"] in {"checker_gap", "heuristic_concern"}
@@ -356,11 +579,42 @@ def analyze(
         )
         if has_inconsistency:
             evidence = list(fallback_evidence)
+
+        # taxonomy_gap: the deterministic checker for a *known* taxonomy
+        # entry has failed for the same body hash the reviewer analyzed,
+        # but there is neither a structured finding nor fallback readiness
+        # evidence to corroborate it (a mapping / artifact gap). This must
+        # not be routed back through the reviewer-rerun lanes below --
+        # it is a machine-actionable checker/taxonomy gap, not a reviewer
+        # false-positive candidate (Issue #1286 AC3).
+        taxonomy_gap = (
+            is_known
+            and not deterministic_backed
+            and not has_inconsistency
+            and not matched_findings
+            and _has_deterministic_check_failure(kind, review_result)
+            and bool(body_sha256)
+            and review_body_sha256 == body_sha256
+        )
+
+        if deterministic_backed:
+            bucket = "rewrite_ready"
+        elif has_inconsistency:
+            bucket = "checker_artifact_inconsistency"
+        elif taxonomy_gap:
+            bucket = "taxonomy_gap"
+        elif not is_known:
+            bucket = "checker_gap"
+        else:
+            bucket = "unbacked"
+
         blocker_result = {
             "reviewer_blocker_code": blocker["reviewer_blocker_code"],
             "normalized_kind": kind,
             "deterministic_backed": deterministic_backed,
             "checker_artifact_inconsistency": has_inconsistency,
+            "taxonomy_gap": taxonomy_gap,
+            "checker_gap": bucket == "checker_gap",
             "message": blocker.get("message"),
             "line_start": blocker.get("line_start"),
             "line_end": blocker.get("line_end"),
@@ -368,10 +622,16 @@ def analyze(
             "matched_findings": matched_findings,
         }
         blocker_results.append(blocker_result)
-        if deterministic_backed:
+        if bucket == "rewrite_ready":
             rewrite_ready_blockers.append(blocker_result)
-        elif has_inconsistency:
+        elif bucket == "checker_artifact_inconsistency":
             inconsistency_blockers.append(blocker_result)
+        elif bucket == "taxonomy_gap":
+            taxonomy_gap_blockers.append(blocker_result)
+        elif bucket == "checker_gap":
+            checker_gap_blockers.append(blocker_result)
+        else:
+            unbacked_blockers.append(blocker_result)
 
     primary = blocker_results[0]
     same_lane = (
@@ -382,24 +642,54 @@ def analyze(
     prior_count = int(previous_state.get("consecutive_unbacked_count", 0))
 
     if rewrite_ready_blockers:
-        verdict = "deterministic_fail_confirmed"
+        verdict_detail = "deterministic_fail_confirmed"
         routing = "proceed_to_rewrite"
         should_consume_iteration = True
         next_count = 0
     elif inconsistency_blockers:
-        verdict = "checker_artifact_inconsistency"
+        verdict_detail = "checker_artifact_inconsistency"
         routing = "fix_checker_artifact"
         should_consume_iteration = False
         next_count = 0
+    elif taxonomy_gap_blockers:
+        # Deterministic check fail confirmed for the same body hash but
+        # unbacked by structured evidence -- block without returning to
+        # the reviewer-rerun lane (Issue #1286 AC3). This is a new-in
+        # Issue #1286 classification; the top-level `verdict` field still
+        # downgrades to the legacy `checker_artifact_inconsistency` value
+        # (same `fix_checker_artifact` routing semantics) so a consumer
+        # that only understands the legacy verdict set routes correctly.
+        verdict_detail = "taxonomy_gap"
+        routing = "fix_checker_artifact"
+        should_consume_iteration = False
+        next_count = 0
+    elif checker_gap_blockers:
+        # Reviewer blocker code is unregistered in the taxonomy entirely.
+        # Allow exactly one reviewer rerun for the same lane before
+        # escalating to a human (Issue #1286 AC4).
+        next_count = prior_count + 1 if same_lane else 1
+        if next_count >= 2:
+            verdict_detail = "checker_gap_repeated"
+            routing = "human_escalation"
+        else:
+            verdict_detail = "checker_gap"
+            routing = "downgrade_to_non_blocking"
+        should_consume_iteration = False
     else:
         next_count = prior_count + 1 if same_lane else 1
-        verdict = (
+        verdict_detail = (
             "reviewer_false_positive_suspected"
             if next_count >= 2
             else "reviewer_claim_unbacked_by_deterministic_checker"
         )
-        routing = "human_escalation" if verdict == "reviewer_false_positive_suspected" else "downgrade_to_non_blocking"
+        routing = (
+            "human_escalation"
+            if verdict_detail == "reviewer_false_positive_suspected"
+            else "downgrade_to_non_blocking"
+        )
         should_consume_iteration = False
+
+    verdict = _legacy_verdict(verdict_detail)
 
     next_state = {
         "schema": STATE_SCHEMA,
@@ -414,25 +704,192 @@ def analyze(
         {
             "schema": SCHEMA,
             "verdict": verdict,
+            "verdict_detail_v1": verdict_detail,
             "routing": routing,
             "should_consume_iteration": should_consume_iteration,
+            "reason_code": None,
             "body_sha256": body_sha256,
             "issue_url": issue_url,
             "blockers": blocker_results,
             "rewrite_ready_blockers": rewrite_ready_blockers,
+            "taxonomy_gap_blockers": taxonomy_gap_blockers,
+            "checker_gap_blockers": checker_gap_blockers,
+            "unbacked_blockers": unbacked_blockers,
         },
         next_state,
     )
 
 
+# ---------------------------------------------------------------------------
+# Taxonomy dump / schema invariants (PR #1304 iteration-4 fix_delta, Medium
+# item): `dump_taxonomy()` is the single producer of the `--dump-taxonomy`
+# CLI payload, `TAXONOMY_DUMP_SCHEMA_V1` pins its structure (required keys,
+# `additionalProperties: false` so an unknown key is rejected rather than
+# silently dumped), and `taxonomy_invariant_violations()` detects duplicate
+# reviewer codes / checker names / domain keys / readiness rule ids /
+# (source_check, category) pairs across entries -- none of which are
+# caught by the entry_id-keyed `TAXONOMY_BY_ENTRY_ID` dict comprehension
+# alone (a duplicate `entry_id` would silently overwrite instead of
+# raising).
+# ---------------------------------------------------------------------------
+
+
+def dump_taxonomy() -> dict[str, Any]:
+    """Return the REVIEWER_CHECKER_TAXONOMY_V1 dump payload (the same
+    object printed by `--dump-taxonomy`)."""
+    return {"schema": TAXONOMY_SCHEMA, "entries": REVIEWER_CHECKER_TAXONOMY_V1}
+
+
+TAXONOMY_ENTRY_SCHEMA_V1: dict[str, Any] = {
+    "type": "object",
+    "required": [
+        "entry_id",
+        "reviewer_codes",
+        "deterministic_checks",
+        "readiness_rule_ids",
+        "readiness_rule_id_source_check",
+        "readiness_categories",
+        "readiness_category_source_check",
+        "domain_keys",
+    ],
+    "additionalProperties": False,
+    "properties": {
+        "entry_id": {"type": "string", "minLength": 1},
+        "reviewer_codes": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "deterministic_checks": {"type": "array", "items": {"type": "string"}},
+        "readiness_rule_ids": {"type": "array", "items": {"type": "string"}},
+        "readiness_rule_id_source_check": {"type": ["string", "null"]},
+        "readiness_categories": {"type": "array", "items": {"type": "string"}},
+        "readiness_category_source_check": {"type": ["string", "null"]},
+        "domain_keys": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+    },
+}
+
+TAXONOMY_DUMP_SCHEMA_V1: dict[str, Any] = {
+    "type": "object",
+    "required": ["schema", "entries"],
+    "additionalProperties": False,
+    "properties": {
+        "schema": {"const": TAXONOMY_SCHEMA},
+        "entries": {"type": "array", "items": TAXONOMY_ENTRY_SCHEMA_V1},
+    },
+}
+
+
+def validate_taxonomy_dump(payload: dict[str, Any]) -> None:
+    """Raise `jsonschema.ValidationError` if `payload` does not match
+    `TAXONOMY_DUMP_SCHEMA_V1` (required keys present, no unknown keys)."""
+    _jsonschema.validate(instance=payload, schema=TAXONOMY_DUMP_SCHEMA_V1)
+
+
+def _find_duplicates(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    dupes: list[str] = []
+    for value in values:
+        if value in seen and value not in dupes:
+            dupes.append(value)
+        seen.add(value)
+    return dupes
+
+
+def taxonomy_invariant_violations(taxonomy: list[dict[str, Any]] | None = None) -> list[str]:
+    """Return a list of human-readable invariant violations for `taxonomy`
+    (defaults to `REVIEWER_CHECKER_TAXONOMY_V1`). An empty list means every
+    invariant holds:
+
+    - `entry_id` is unique
+    - `reviewer_codes` values are unique across entries
+    - `deterministic_checks` values are unique across entries
+    - `domain_keys` values are unique across entries
+    - `readiness_rule_ids` values are unique across entries (no allowlist)
+    - `(readiness_category_source_check, category)` pairs are unique
+      across entries
+    """
+    entries = REVIEWER_CHECKER_TAXONOMY_V1 if taxonomy is None else taxonomy
+    violations: list[str] = []
+
+    entry_ids = [str(entry.get("entry_id")) for entry in entries]
+    for dupe in _find_duplicates(entry_ids):
+        violations.append(f"duplicate entry_id: {dupe!r}")
+
+    all_reviewer_codes: list[str] = []
+    all_deterministic_checks: list[str] = []
+    all_domain_keys: list[str] = []
+    all_readiness_rule_ids: list[str] = []
+    category_pairs: list[tuple[str | None, str]] = []
+    for entry in entries:
+        all_reviewer_codes.extend(str(code) for code in entry.get("reviewer_codes", []))
+        all_deterministic_checks.extend(str(check) for check in entry.get("deterministic_checks", []))
+        all_domain_keys.extend(str(key) for key in entry.get("domain_keys", []))
+        all_readiness_rule_ids.extend(str(rule_id) for rule_id in entry.get("readiness_rule_ids", []))
+        source_check = entry.get("readiness_category_source_check")
+        category_pairs.extend(
+            (source_check, str(category)) for category in entry.get("readiness_categories", [])
+        )
+
+    for dupe in _find_duplicates(all_reviewer_codes):
+        violations.append(f"duplicate reviewer_code across entries: {dupe!r}")
+    for dupe in _find_duplicates(all_deterministic_checks):
+        violations.append(f"duplicate deterministic_check across entries: {dupe!r}")
+    for dupe in _find_duplicates(all_domain_keys):
+        violations.append(f"duplicate domain_key across entries: {dupe!r}")
+    for dupe in _find_duplicates(all_readiness_rule_ids):
+        violations.append(f"duplicate readiness_rule_id across entries: {dupe!r}")
+
+    seen_pairs: set[tuple[str | None, str]] = set()
+    for pair in category_pairs:
+        if pair in seen_pairs:
+            violations.append(f"duplicate (source_check, category) pair: {pair!r}")
+        seen_pairs.add(pair)
+
+    return violations
+
+
+def _validate_taxonomy_invariants() -> None:
+    """Fail fast at import time if `REVIEWER_CHECKER_TAXONOMY_V1` itself
+    violates its documented invariants or dump schema."""
+    violations = taxonomy_invariant_violations()
+    if violations:
+        raise ValueError(
+            f"REVIEWER_CHECKER_TAXONOMY_V1 invariant violations: {violations}"
+        )
+    validate_taxonomy_dump(dump_taxonomy())
+
+
+_validate_taxonomy_invariants()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Replay reviewer blockers against deterministic artifacts")
-    parser.add_argument("--review-result-file", required=True)
-    parser.add_argument("--readiness-result-file", required=True)
+    parser.add_argument("--review-result-file")
+    parser.add_argument("--readiness-result-file")
     parser.add_argument("--vc-syntax-result-file")
     parser.add_argument("--vc-preflight-result-file")
     parser.add_argument("--state-file")
+    parser.add_argument(
+        "--dump-taxonomy",
+        action="store_true",
+        help="Print REVIEWER_CHECKER_TAXONOMY_V1 as JSON and exit (no other args required)",
+    )
     args = parser.parse_args()
+
+    if args.dump_taxonomy:
+        print(_strict_json_dumps(dump_taxonomy()), flush=True)
+        return 0
+
+    if not args.review_result_file or not args.readiness_result_file:
+        print(
+            _strict_json_dumps(
+                {
+                    "schema": SCHEMA,
+                    "verdict": "input_or_runtime_error",
+                    "routing": "human_judgment_required",
+                    "error": "--review-result-file and --readiness-result-file required unless --dump-taxonomy",
+                }
+            ),
+            flush=True,
+        )
+        return 1
 
     try:
         review_result = _load_json_file(args.review_result_file, "review-result-file")
@@ -464,7 +921,8 @@ def main() -> int:
             _strict_json_dumps(
                 {
                     "schema": SCHEMA,
-                    "verdict": "input_or_runtime_error",
+                    "verdict": _legacy_verdict("input_or_runtime_error"),
+                    "verdict_detail_v1": "input_or_runtime_error",
                     "routing": "human_judgment_required",
                     "error": str(exc),
                 },
@@ -475,15 +933,36 @@ def main() -> int:
 
     output = _strict_json_dumps(result)
     if len(output.encode("utf-8")) > 2048:
-        trimmed = dict(result)
-        trimmed["blockers"] = [
-            {
+
+        def _compact_blocker(blocker: dict[str, Any]) -> dict[str, Any]:
+            return {
                 "reviewer_blocker_code": blocker["reviewer_blocker_code"],
                 "normalized_kind": blocker["normalized_kind"],
                 "deterministic_backed": blocker["deterministic_backed"],
                 "checker_artifact_inconsistency": blocker["checker_artifact_inconsistency"],
+                # PR #1304 iteration-4 fix_delta (High item): the trimmed
+                # payload must not drop blocker-level taxonomy_gap /
+                # checker_gap classification -- `verdict_detail_v1`
+                # (top-level, preserved below via `dict(result)`) only
+                # tells you the *aggregate* classification, not which
+                # individual blocker(s) triggered it.
+                "taxonomy_gap": blocker["taxonomy_gap"],
+                "checker_gap": blocker["checker_gap"],
             }
-            for blocker in result["blockers"][:2]
+
+        trimmed = dict(result)
+        trimmed["blockers"] = [_compact_blocker(b) for b in result["blockers"][:2]]
+        trimmed["rewrite_ready_blockers"] = [
+            _compact_blocker(b) for b in result["rewrite_ready_blockers"][:2]
+        ]
+        trimmed["taxonomy_gap_blockers"] = [
+            _compact_blocker(b) for b in result["taxonomy_gap_blockers"][:2]
+        ]
+        trimmed["checker_gap_blockers"] = [
+            _compact_blocker(b) for b in result["checker_gap_blockers"][:2]
+        ]
+        trimmed["unbacked_blockers"] = [
+            _compact_blocker(b) for b in result["unbacked_blockers"][:2]
         ]
         output = _strict_json_dumps(trimmed)
     print(output, flush=True)
