@@ -1484,7 +1484,7 @@ exact command class allow は executor script identity + argv 形状のみを検
 `_classify_gh` により引き続き `mutating` に分類され、active issue + no-matching-worktree
 状態では block される。
 
-## edit-issue transaction helper contracts（Issue #1287）
+## edit-issue 向け transaction helper の契約定義（Issue #1287）
 
 既存 Issue body/comment mutation の consumer contract は `edit_issue_txn.py` に集約する。
 権限境界は helper input/result schema と controlled executor command id で固定する。
