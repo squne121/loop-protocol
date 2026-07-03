@@ -35,6 +35,7 @@ from local_main_branch_guard import (  # noqa: E402
     REASON_UNPARSEABLE,
     REASON_GH_API,
     REASON_DETERMINISTIC_CHECKER,
+    REASON_CONTROLLED_SKILL_MUTATION_EXECUTOR,
     REASON_GITHUB_REMOTE_OPS,
     REASON_GH_MUTATION,
     REASON_SKILL_RUNTIME_EXECUTOR,
@@ -1325,7 +1326,10 @@ class TestIssue1291IssueMetadataMutationCodex:
         )
         eval_result = eval_codex(payload["tool_input"]["command"], str(tmp_git_repo))
         assert eval_result["status"] == "allow"
-        assert eval_result["reason_code"] == REASON_DETERMINISTIC_CHECKER
+        # NOTE: PR #1299 (Issue #1289) split the shared deterministic_checker
+        # reason_code so controlled_skill_mutation_exec.py invocations report
+        # their own dedicated reason_code (see REASON_CONTROLLED_SKILL_MUTATION_EXECUTOR).
+        assert eval_result["reason_code"] == REASON_CONTROLLED_SKILL_MUTATION_EXECUTOR
         assert eval_result["parser_stage"] == "controlled_skill_mutation"
         assert eval_result["rule_id"] == "controlled_skill_mutation"
         result = run_guard_script(payload, cwd=tmp_git_repo)
