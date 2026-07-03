@@ -59,6 +59,69 @@ CHECK_ISSUE_CONTRACT_SCRIPT = os.path.normpath(
     os.path.join(_SCRIPT_DIR, "../../review-issue/scripts/check_issue_contract.py")
 )
 
+# Issue #1285: VC baseline-fail pytest command shape canonicalization.
+# Cross-skill script location (issue-contract-review owns the compiler; this
+# script only loads and invokes it — no logic duplication).
+VC_BASELINE_SHAPE_COMPILER_SCRIPT = os.path.normpath(
+    os.path.join(_SCRIPT_DIR, "../../issue-contract-review/scripts/vc_baseline_shape_compiler.py")
+)
+
+
+def _load_vc_baseline_shape_compiler():
+    """Load vc_baseline_shape_compiler.py as a module (cross-skill import by path)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "vc_baseline_shape_compiler", VC_BASELINE_SHAPE_COMPILER_SCRIPT
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load spec for {VC_BASELINE_SHAPE_COMPILER_SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def repair_vc_baseline_shape(lines: list[str], repo_root: str) -> tuple[list[str], bool]:
+    """Apply VC baseline-fail pytest command shape canonicalization.
+
+    Delegates the actual detection/rewrite logic to
+    vc_baseline_shape_compiler.compile_body() (Issue #1285) and applies any
+    "changed" rewrites in place. Returns (new_lines, repaired).
+
+    Fails open (returns lines unchanged, repaired=False) if the compiler
+    module cannot be loaded, so this optional repair never blocks the
+    existing C4/C9 autofix behavior.
+    """
+    try:
+        compiler = _load_vc_baseline_shape_compiler()
+    except Exception as e:  # pragma: no cover - defensive fail-open
+        print(
+            f"[WARN] vc_baseline_shape_compiler could not be loaded: {e}; skipping VC shape repair",
+            file=sys.stderr,
+        )
+        return lines, False
+
+    body = "".join(lines)
+    from pathlib import Path as _Path
+
+    result = compiler.compile_body(body, _Path(repo_root))
+    if result.get("status") != "changed" or not result.get("rewrites"):
+        return lines, False
+
+    new_lines = lines[:]
+    repaired = False
+    for rw in result["rewrites"]:
+        idx = rw["line_number"] - 1
+        if idx < 0 or idx >= len(new_lines):
+            continue
+        original_line = new_lines[idx]
+        stripped = original_line.rstrip("\n")
+        leading_ws = len(stripped) - len(stripped.lstrip())
+        indent = stripped[:leading_ws]
+        new_lines[idx] = f"{indent}$ {rw['suggested_command']}\n"
+        repaired = True
+    return new_lines, repaired
+
 
 def sha256_of(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -492,6 +555,10 @@ def main() -> int:
     lines, c9_result, c9_reason = repair_c9(lines)
     c9_repaired = (c9_result == C9Result.OK)
 
+    # Apply VC baseline-fail pytest command shape repair (Issue #1285)
+    repo_root_for_vc_shape = os.path.normpath(os.path.join(_SCRIPT_DIR, "../../../.."))
+    lines, vc_shape_repaired = repair_vc_baseline_shape(lines, repo_root_for_vc_shape)
+
     # If C9 is not autofixable (runtime/unknown paths or missing Allowed Paths) → exit 2
     if c9_result == C9Result.NOT_AUTOFIXABLE:
         print(
@@ -525,7 +592,7 @@ def main() -> int:
         sys.stdout.write(new_body)
 
     print(
-        f"status: repaired  c4={c4_repaired}  c9={c9_repaired}  "
+        f"status: repaired  c4={c4_repaired}  c9={c9_repaired}  vc_shape={vc_shape_repaired}  "
         f"original_sha256={original_sha256[:16]}...  new_sha256={new_sha256[:16]}...",
         file=sys.stderr,
     )

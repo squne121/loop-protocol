@@ -142,6 +142,20 @@ Issue 起票時に動作検証の適用判定セクションを記載する。`r
 > 動作検証 AC（`runtime-verification: true`）を含む VC の設計は `docs/dev/runtime-verification-policy.md` を参照すること。
 > SKIP 規約（exit 77）・証跡保存フォーマット・テストシナリオ最小セット・Stop Condition 連動が定義されている。
 
+### pytest baseline-fail VC の canonical form（marker: pytest_baseline_fail_canonical_rules）
+
+pytest で baseline-fail（`expected_baseline_fail`）を表す VC は、**まだ存在しないテストファイルへの node-id** で記述する（`missing_new_test_file.py::test_name`）。既存ファイルに対する `-k <未作成関数>` や既存ファイルへの missing node-id は禁止形であり、`vc_baseline_shape_compiler.py`（`.claude/skills/issue-contract-review/scripts/vc_baseline_shape_compiler.py`）が machine-readable な rewrite hint を返す。
+
+| 禁止形 | 推奨形（canonical） | 理由 |
+|---|---|---|
+| `pytest existing_test_file.py -k test_new_name` | `pytest missing_new_test_file.py::test_new_name` | 既存ファイルへの `-k` 新規テスト名指定は pytest exit 5（no tests collected）で `vc_no_tests_collected` として hard block される |
+| `pytest existing_test_file.py::test_missing_name` | `pytest missing_new_test_file.py::test_missing_name` | 既存ファイルへの missing node-id は判定不能（ファイル自体は存在するため baseline-fail の意味が曖昧になる） |
+| `pytest existing_test_file.py -k "test_a or test_b"`（boolean / class selector / parametrized selector） | 対象 AC を分割し、それぞれ missing-file node-id で記述する | 複合 `-k` 式は `not_autofixable`（compiler が安全に書き換えられない） |
+
+- `-k` の書き換え対象は単一 bare `test_*` identifier のみ。boolean 式・class selector・parametrized selector は書き換えない。
+- 既存ファイルの missing node-id 判定は `ast.parse()` による静的解析（top-level `def test_*` のみ）に限定する。class/method や parametrization は対象外。
+- 生成される missing-file node-id は Allowed Paths に含まれる場合のみ提案される。安全な候補が無い場合は書き換えない。
+
 ## VC_SINGLE_COMMAND_GUARDRAIL
 
 Issue body の VC（Verification Commands）は **shell control operator に依存しない単一コマンド** で記述する。

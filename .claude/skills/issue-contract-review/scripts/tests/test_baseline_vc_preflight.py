@@ -781,22 +781,27 @@ def test_pytest_exit4_missing_file_expected_fail():
     assert found, f"Expected expected_baseline_fail/go. Got: {[r['category'] + '/' + r['decision'] for r in results]}"
 
 
-def test_pytest_exit5_no_tests_collected_expected_fail():
-    """AC3: pytest exit 5 + no tests collected → expected_baseline_fail / go"""
+def test_pytest_exit5_no_tests_collected_hard_block():
+    """AC7 (#1285): pytest exit 5 (no tests collected) is a hard block
+    (vc_no_tests_collected / blocked), NOT expected_baseline_fail. This
+    replaces the prior test that incorrectly expected exit 5 to resolve to
+    expected_baseline_fail/go; the current baseline_vc_preflight.py contract
+    always classifies exit 5 as vc_no_tests_collected/blocked so authors are
+    forced to rewrite the VC into canonical missing-file node-id form
+    instead of relying on -k/path selectors that collect zero tests."""
     fixture = Path(__file__).parent / "fixtures" / "pytest_exit5_no_tests.md"
     data = run_preflight(str(fixture))
 
     results = data["results"]
     assert len(results) > 0, "Expected at least one result"
 
-    # Should be classified as expected_baseline_fail with decision go
     found = any(
-        r["classification"] == "expected_fail"
-        and r["category"] == "expected_baseline_fail"
-        and r["decision"] == "go"
+        r["classification"] == "blocked"
+        and r["category"] == "vc_no_tests_collected"
+        and r["decision"] == "blocked"
         for r in results
     )
-    assert found, f"Expected expected_baseline_fail/go. Got: {[r['category'] + '/' + r['decision'] for r in results]}"
+    assert found, f"Expected vc_no_tests_collected/blocked. Got: {[r['category'] + '/' + r['decision'] for r in results]}"
 
 
 def test_pytest_exit4_usage_error_not_expected():

@@ -2,5 +2,5 @@
 
 ```bash
 # AC1
-$ pytest --collect-only -q nonexistent_dir
+$ pytest --collect-only -q docs
 ```
