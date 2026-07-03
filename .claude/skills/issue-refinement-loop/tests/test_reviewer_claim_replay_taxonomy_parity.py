@@ -18,14 +18,16 @@ domain keys through a single table-driven taxonomy
 - AC5: `--dump-taxonomy` prints the taxonomy as JSON, and this test detects
   drift in the checker / reviewer code / readiness category sets.
 
-Backward compatibility: `analyze()` also emits a `verdict_legacy_v1` field
-that downgrades the new Issue #1286 verdicts (`taxonomy_gap`, `checker_gap`,
-`checker_gap_repeated`) to the pre-#1286 verdict set documented in
-`issue-refinement-loop/SKILL.md` Step 2a, so a routing table that has not
-been updated for the new values still receives a value it recognizes with
-matching routing semantics. `SKILL.md` update itself is Out of Scope for
-Issue #1286 (not in Allowed Paths); `test_legacy_verdict_mapping_full_parity`
-below pins the full mapping.
+Backward compatibility (PR #1304 iteration-2 fix_delta): the top-level
+`verdict` field ALWAYS returns one of the pre-#1286 verdict set documented
+in `issue-refinement-loop/SKILL.md` Step 2a (a routing table that has not
+been updated for the new Issue #1286 values still receives a value it
+recognizes, with matching routing semantics). The precise Issue #1286
+classification (including the new-only `taxonomy_gap` / `checker_gap` /
+`checker_gap_repeated` values) is carried in the secondary
+`verdict_detail_v1` field instead. `SKILL.md` update itself is Out of Scope
+for Issue #1286 (not in Allowed Paths);
+`test_legacy_verdict_mapping_full_parity` below pins the full mapping.
 """
 
 from __future__ import annotations
@@ -161,7 +163,8 @@ def test_ac3_checker_backed_blocker_no_reviewer_rerun():
         vc_preflight_result=None,
         previous_state={},
     )
-    assert result["verdict"] == "taxonomy_gap"
+    # Precise Issue #1286 classification is carried in verdict_detail_v1.
+    assert result["verdict_detail_v1"] == "taxonomy_gap"
     assert result["should_consume_iteration"] is False
     # Must not be routed through either reviewer-rerun lane.
     assert result["routing"] not in ("downgrade_to_non_blocking", "human_escalation")
@@ -171,10 +174,12 @@ def test_ac3_checker_backed_blocker_no_reviewer_rerun():
     # a subsequent identical replay would otherwise be misclassified as a
     # repeated reviewer claim.
     assert next_state["consecutive_unbacked_count"] == 0
-    # Backward-compat: a consumer that only understands the pre-#1286
-    # SKILL.md Step 2a verdict set must still receive a recognized value
-    # with matching routing semantics (fix_checker_artifact family).
-    assert result["verdict_legacy_v1"] == "checker_artifact_inconsistency"
+    # Backward-compat: the top-level `verdict` field is ALWAYS a value a
+    # consumer that only understands the pre-#1286 SKILL.md Step 2a verdict
+    # set recognizes, with matching routing semantics (fix_checker_artifact
+    # family) -- SKILL.md's routing table itself is not updated for
+    # taxonomy_gap (Issue #1286 Allowed Paths do not include SKILL.md).
+    assert result["verdict"] == "checker_artifact_inconsistency"
 
 
 # --------------------------------------------------------------------------
@@ -201,13 +206,16 @@ def test_ac4_unknown_blocker_checker_gap_single_rerun():
     )
     assert first["blockers"][0]["normalized_kind"] == "unknown_blocker_type"
     assert first["blockers"][0]["checker_gap"] is True
-    assert first["verdict"] == "checker_gap"
+    # Precise Issue #1286 classification lives in verdict_detail_v1.
+    assert first["verdict_detail_v1"] == "checker_gap"
     assert first["routing"] == "downgrade_to_non_blocking"
     assert first["should_consume_iteration"] is False
     assert next_state["consecutive_unbacked_count"] == 1
-    # Backward-compat: checker_gap downgrades to the legacy "unbacked"
-    # verdict (same downgrade_to_non_blocking routing semantics).
-    assert first["verdict_legacy_v1"] == "reviewer_claim_unbacked_by_deterministic_checker"
+    # Backward-compat: the top-level `verdict` field downgrades checker_gap
+    # to the legacy "unbacked" verdict (same downgrade_to_non_blocking
+    # routing semantics) -- SKILL.md Step 2a's routing table is not
+    # updated for checker_gap (Allowed Paths do not include SKILL.md).
+    assert first["verdict"] == "reviewer_claim_unbacked_by_deterministic_checker"
 
     # Second occurrence, same lane (same code + same body hash) -> escalate,
     # do not grant a second rerun.
@@ -218,13 +226,14 @@ def test_ac4_unknown_blocker_checker_gap_single_rerun():
         vc_preflight_result=None,
         previous_state=next_state,
     )
-    assert second["verdict"] == "checker_gap_repeated"
+    assert second["verdict_detail_v1"] == "checker_gap_repeated"
     assert second["routing"] == "human_escalation"
     assert second["should_consume_iteration"] is False
     assert next_state_2["consecutive_unbacked_count"] == 2
-    # Backward-compat: checker_gap_repeated downgrades to the legacy
-    # false-positive-suspected verdict (same human_escalation routing).
-    assert second["verdict_legacy_v1"] == "reviewer_false_positive_suspected"
+    # Backward-compat: the top-level `verdict` field downgrades
+    # checker_gap_repeated to the legacy false-positive-suspected verdict
+    # (same human_escalation routing semantics).
+    assert second["verdict"] == "reviewer_false_positive_suspected"
 
 
 # --------------------------------------------------------------------------

@@ -359,22 +359,27 @@ def _save_state(state_file: str | None, state: dict[str, Any]) -> None:
     )
 
 
-# LEGACY_VERDICT_MAP_V1 -- backward-compatibility mapping for consumers that
-# only understand the pre-#1286 verdict set documented in
+# LEGACY_VERDICT_MAP_V1 -- the pre-#1286 verdict set documented in
 # `issue-refinement-loop/SKILL.md` Step 2a (`deterministic_fail_confirmed`,
 # `reviewer_claim_unbacked_by_deterministic_checker`,
 # `reviewer_false_positive_suspected`, `input_or_runtime_error`) plus the
-# pre-existing `checker_artifact_inconsistency` verdict. New verdicts
-# introduced by Issue #1286 (`taxonomy_gap`, `checker_gap`,
-# `checker_gap_repeated`) are downgraded to the semantically-closest legacy
-# verdict here so that a routing table which has not been updated for the
-# new values still receives a value it recognizes and routes safely. The
-# top-level `verdict` field itself is NOT changed by this mapping -- it keeps
-# emitting the precise Issue #1286 value so that machine-actionable routing
-# (`fix_checker_artifact` for checker/taxonomy gaps) is not lost. SKILL.md
-# Step 2a update is Out of Scope for Issue #1286 (Allowed Paths do not
-# include SKILL.md); this additive field is the compatibility mechanism
-# instead.
+# pre-existing `checker_artifact_inconsistency` verdict.
+#
+# The top-level `verdict` field returned by `analyze()` is ALWAYS one of
+# these legacy values (PR #1304 iteration-2 fix_delta): SKILL.md Step 2a's
+# routing table only understands this set, and is Out of Scope to update
+# for Issue #1286 (not in Allowed Paths). New verdicts introduced by Issue
+# #1286 (`taxonomy_gap`, `checker_gap`, `checker_gap_repeated`) are mapped
+# here to the semantically-closest legacy value with matching routing
+# semantics (same consume/rerun/escalation behavior), so a consumer that
+# has not been updated for the new values still receives a value it
+# recognizes and routes safely.
+#
+# The precise Issue #1286 classification (including the new-only values)
+# is NOT lost: it is carried in the secondary `verdict_detail_v1` field
+# (see `analyze()`), which a `taxonomy_gap` / `checker_gap`-aware consumer
+# can read without requiring the primary `verdict` field to carry a value
+# outside the legacy set.
 _LEGACY_VERDICT_MAP_V1: dict[str, str] = {
     "deterministic_fail_confirmed": "deterministic_fail_confirmed",
     "checker_artifact_inconsistency": "checker_artifact_inconsistency",
@@ -391,7 +396,8 @@ _LEGACY_VERDICT_MAP_V1: dict[str, str] = {
 
 
 def _legacy_verdict(verdict: str) -> str:
-    """Map a verdict to the pre-#1286 SKILL.md Step 2a compatible value."""
+    """Map a precise verdict to the pre-#1286 SKILL.md Step 2a compatible
+    value. This is the value emitted as the top-level `verdict` field."""
     return _LEGACY_VERDICT_MAP_V1.get(verdict, "input_or_runtime_error")
 
 
@@ -424,8 +430,8 @@ def analyze(
         return (
             {
                 "schema": SCHEMA,
-                "verdict": "input_or_runtime_error",
-                "verdict_legacy_v1": _legacy_verdict("input_or_runtime_error"),
+                "verdict": _legacy_verdict("input_or_runtime_error"),
+                "verdict_detail_v1": "input_or_runtime_error",
                 "routing": "human_judgment_required",
                 "should_consume_iteration": False,
                 "blockers": [],
@@ -549,20 +555,24 @@ def analyze(
     prior_count = int(previous_state.get("consecutive_unbacked_count", 0))
 
     if rewrite_ready_blockers:
-        verdict = "deterministic_fail_confirmed"
+        verdict_detail = "deterministic_fail_confirmed"
         routing = "proceed_to_rewrite"
         should_consume_iteration = True
         next_count = 0
     elif inconsistency_blockers:
-        verdict = "checker_artifact_inconsistency"
+        verdict_detail = "checker_artifact_inconsistency"
         routing = "fix_checker_artifact"
         should_consume_iteration = False
         next_count = 0
     elif taxonomy_gap_blockers:
         # Deterministic check fail confirmed for the same body hash but
         # unbacked by structured evidence -- block without returning to
-        # the reviewer-rerun lane (Issue #1286 AC3).
-        verdict = "taxonomy_gap"
+        # the reviewer-rerun lane (Issue #1286 AC3). This is a new-in
+        # Issue #1286 classification; the top-level `verdict` field still
+        # downgrades to the legacy `checker_artifact_inconsistency` value
+        # (same `fix_checker_artifact` routing semantics) so a consumer
+        # that only understands the legacy verdict set routes correctly.
+        verdict_detail = "taxonomy_gap"
         routing = "fix_checker_artifact"
         should_consume_iteration = False
         next_count = 0
@@ -572,21 +582,27 @@ def analyze(
         # escalating to a human (Issue #1286 AC4).
         next_count = prior_count + 1 if same_lane else 1
         if next_count >= 2:
-            verdict = "checker_gap_repeated"
+            verdict_detail = "checker_gap_repeated"
             routing = "human_escalation"
         else:
-            verdict = "checker_gap"
+            verdict_detail = "checker_gap"
             routing = "downgrade_to_non_blocking"
         should_consume_iteration = False
     else:
         next_count = prior_count + 1 if same_lane else 1
-        verdict = (
+        verdict_detail = (
             "reviewer_false_positive_suspected"
             if next_count >= 2
             else "reviewer_claim_unbacked_by_deterministic_checker"
         )
-        routing = "human_escalation" if verdict == "reviewer_false_positive_suspected" else "downgrade_to_non_blocking"
+        routing = (
+            "human_escalation"
+            if verdict_detail == "reviewer_false_positive_suspected"
+            else "downgrade_to_non_blocking"
+        )
         should_consume_iteration = False
+
+    verdict = _legacy_verdict(verdict_detail)
 
     next_state = {
         "schema": STATE_SCHEMA,
@@ -601,7 +617,7 @@ def analyze(
         {
             "schema": SCHEMA,
             "verdict": verdict,
-            "verdict_legacy_v1": _legacy_verdict(verdict),
+            "verdict_detail_v1": verdict_detail,
             "routing": routing,
             "should_consume_iteration": should_consume_iteration,
             "body_sha256": body_sha256,
@@ -680,8 +696,8 @@ def main() -> int:
             _strict_json_dumps(
                 {
                     "schema": SCHEMA,
-                    "verdict": "input_or_runtime_error",
-                    "verdict_legacy_v1": _legacy_verdict("input_or_runtime_error"),
+                    "verdict": _legacy_verdict("input_or_runtime_error"),
+                    "verdict_detail_v1": "input_or_runtime_error",
                     "routing": "human_judgment_required",
                     "error": str(exc),
                 },
