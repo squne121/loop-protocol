@@ -70,6 +70,7 @@ REASON_RTK_HELP_COMMAND = "rtk_help_command"
 REASON_RTK_PROXY = "rtk_proxy_requires_review"
 REASON_INLINE_OVERRIDE = "inline_env_override_not_allowed"
 REASON_DETERMINISTIC_CHECKER = "deterministic_checker_command"
+REASON_CONTROLLED_SKILL_MUTATION_EXECUTOR = "controlled_skill_mutation_executor"
 REASON_GITHUB_REMOTE_OPS = "github_remote_ops_command"
 REASON_GH_MUTATION = "gh_mutation_denied"
 REASON_WORKTREE_BOOTSTRAP_EXECUTOR = "worktree_bootstrap_executor_command"
@@ -100,6 +101,41 @@ except Exception:  # pragma: no cover - defensive fail-closed
 
     _CSM_POLICY_AVAILABLE = False
 
+# ─── Shared PreToolUse fast-path classifier (Issue #1289) ────────────────────
+# Shared library, NOT an independent PreToolUse hook. Used only to enrich the
+# telemetry payload with a bounded fast-path classification; never changes the
+# allow/block decision or reason_code of this guard (AC1/AC2/AC6).
+#
+# Import note: pretool_fastpath_classifier.py imports is_readonly_command /
+# _parse_gh_api_command back from THIS module (they are defined further below
+# in this file). If this module is imported first (e.g. `import
+# local_main_branch_guard` from a caller, before anything imports the
+# classifier), a top-level `import pretool_fastpath_classifier` here would
+# create a circular import that reaches back into a not-yet-fully-initialized
+# local_main_branch_guard module and fails to resolve those two names,
+# permanently latching _FASTPATH_AVAILABLE = False for the whole process. To
+# avoid this ordering hazard, the classifier is imported lazily on first use
+# inside _compute_fastpath() instead of at module load time.
+_fastpath: Any = None
+_FASTPATH_AVAILABLE: bool | None = None  # None = not yet attempted
+
+
+def _ensure_fastpath_imported() -> bool:
+    """Lazily import pretool_fastpath_classifier on first use. Safe to call
+    regardless of import order (Issue #1289 fix — see note above)."""
+    global _fastpath, _FASTPATH_AVAILABLE
+    if _FASTPATH_AVAILABLE is not None:
+        return _FASTPATH_AVAILABLE
+    try:
+        import pretool_fastpath_classifier as _fastpath_module
+
+        _fastpath = _fastpath_module
+        _FASTPATH_AVAILABLE = True
+    except Exception:  # pragma: no cover - defensive fail-closed
+        _fastpath = None
+        _FASTPATH_AVAILABLE = False
+    return _FASTPATH_AVAILABLE
+
 # ─── Worktree bootstrap executor policy (Issue #1209) ────────────────────────
 try:
     from worktree_bootstrap_command_policy import (
@@ -126,7 +162,7 @@ GITHUB_CMD_CLASS_ISSUE_MUTATION = "github_issue_mutation_command"
 GITHUB_CMD_CLASS_PR_METADATA = "github_pr_metadata_command"
 GITHUB_CMD_CLASS_DESTRUCTIVE = "github_destructive_command"
 
-# Trusted repository slug for gh issue create/edit mutation allowlist.
+# Trusted repository slug for gh issue create mutation allowlist.
 TRUSTED_REPO_SLUG = "squne121/loop-protocol"
 
 COMMAND_KIND_UNKNOWN = "unknown_command"
@@ -924,8 +960,6 @@ def is_github_remote_ops_command(cmd: str) -> bool:
 
     許可対象（post-merge-cleanup 最小集合）:
       - gh issue close <N>              N は数値 issue 番号必須
-      - gh issue comment <N> --body <V> / --body-file tmp/...
-                        N は数値、body 値必須、canonical tmp/ パス
       - gh issue reopen <N>             N は数値 issue 番号必須
       - gh pr comment <N> --body <V> / --body-file tmp/...
                         N は数値、body 値必須、canonical tmp/ パス
@@ -967,20 +1001,6 @@ def is_github_remote_ops_command(cmd: str) -> bool:
         if subcommand == "close":
             return len(tokens) >= 4 and tokens[3].isdigit()
 
-        # B4: gh issue comment <N> --body <V> OR --body-file tmp/...
-        if subcommand == "comment":
-            if len(tokens) < 4 or not tokens[3].isdigit():
-                return False
-            has_body_val = _has_body_value(tokens[4:])
-            body_file = _find_body_file_value(tokens)
-            if body_file is not None:
-                # body-file present: canonical path required
-                if not _is_safe_tmp_body_file(body_file):
-                    return False
-                return True
-            # --body-file absent: --body must have value
-            return has_body_val
-
         # gh issue reopen <N>
         if subcommand == "reopen":
             return len(tokens) >= 4 and tokens[3].isdigit()
@@ -1016,26 +1036,27 @@ def is_github_remote_ops_command(cmd: str) -> bool:
 
 def is_github_issue_mutation_command(cmd: str) -> bool:
     """
-    Classify gh issue create/edit as github_issue_mutation_command → allow.
+    Classify gh issue create as github_issue_mutation_command → allow.
 
     Allow conditions (ALL must be satisfied):
-      1. Command is `gh issue create` or `gh issue edit <N>`
+      1. Command is `gh issue create`
       2. --repo squne121/loop-protocol present (exact match)
       3. --body-file <path> present where path is canonical tmp/ path and is NOT "-"
       4. No interactive flags: --editor / -e / --web / -w
-      5. For `gh issue edit <N>`: N must be a digit (non-interactive)
-      6. B1: For `gh issue create`: --title with actual value is required
+      5. B1: `gh issue create` requires --title with actual value
 
     Block conditions (any one triggers block → return False):
       - --body-file - (stdin)
       - --editor / -e / --web / -w
       - Missing --repo or wrong repo
       - Missing --body-file
-      - bare `gh issue create` or `gh issue edit` without digit N
+      - Any `gh issue edit ...`
+      - bare `gh issue create`
       - B1: `gh issue create` without --title value
       - B2: --body-file with path traversal (tmp/../...) or absolute path
 
-    Note: gh issue comment/close/reopen remain handled by is_github_remote_ops_command.
+    Note: gh issue close/reopen remain handled by is_github_remote_ops_command.
+    Raw gh issue comment intentionally falls through to gh_mutation_denied.
     """
     cmd = cmd.strip()
     tokens = tokenize_command(cmd)
@@ -1045,7 +1066,7 @@ def is_github_issue_mutation_command(cmd: str) -> bool:
         return False
 
     subcommand = tokens[2]
-    if subcommand not in ("create", "edit"):
+    if subcommand != "create":
         return False
 
     args = tokens[3:]
@@ -1055,21 +1076,13 @@ def is_github_issue_mutation_command(cmd: str) -> bool:
     if any(t in INTERACTIVE_FLAGS for t in args):
         return False
 
-    # For `gh issue edit <N>`: N must be a digit
-    if subcommand == "edit":
-        if not args or not args[0].isdigit():
-            return False
-        args = args[1:]  # skip the issue number
-
-    # B1: For `gh issue create`: --title with a real value is required
-    if subcommand == "create":
-        title_val = _find_flag_value(list(args), "--title")
-        if not title_val:
-            return False
+    # B1: gh issue create requires --title with a real value
+    title_val = _find_flag_value(list(args), "--title")
+    if not title_val:
+        return False
 
     allowed_flags = {"--repo", "--body-file"}
-    if subcommand == "create":
-        allowed_flags.add("--title")
+    allowed_flags.add("--title")
 
     # Check --repo matches trusted slug and reject mutation-expanding flags.
     has_trusted_repo = False
@@ -1520,6 +1533,24 @@ def evaluate(
     wrapper = None
     inner_argv_redacted: list[str] | None = None
     current_branch: str | None = None
+    _fastpath_cache: dict[str, Any] | None | bool = False  # False = not computed yet
+
+    def _compute_fastpath() -> dict[str, Any] | None:
+        # Issue #1289: fastpath is a bounded telemetry enrichment only — it
+        # NEVER influences status/reason_code and is best-effort (never raises).
+        nonlocal _fastpath_cache
+        if _fastpath_cache is not False:
+            return _fastpath_cache  # type: ignore[return-value]
+        if not _ensure_fastpath_imported():
+            _fastpath_cache = None
+            return None
+        try:
+            root = _resolve_project_root(cwd) or cwd
+            result = _fastpath.classify(cmd, cwd, root)
+            _fastpath_cache = result.to_telemetry_dict()
+        except Exception:  # pragma: no cover - defensive fail-open telemetry
+            _fastpath_cache = None
+        return _fastpath_cache
 
     # Helper to emit canonicalized result dictionaries.
     def _emit(
@@ -1533,7 +1564,7 @@ def evaluate(
         argv_tokens: list[str] | None = None,
         inner_tokens: list[str] | None = None,
     ) -> dict[str, Any]:
-        return _result(
+        res = _result(
             status=status,
             reason_code=reason_code,
             current_branch=current_branch,
@@ -1549,6 +1580,8 @@ def evaluate(
             event_kind=event_kind,
             decision_source=local_rule_id or reason_code,
         )
+        res["fastpath"] = _compute_fastpath()
+        return res
 
     # Step 1: Check if we are in local root context
     if not is_local_root_context(cwd):
@@ -1909,7 +1942,7 @@ def evaluate(
             inner_tokens=inner_argv_redacted,
         )
 
-    # Step 9.6b: github_issue_mutation_command — gh issue create/edit with strict constraints.
+    # Step 9.6b: github_issue_mutation_command — gh issue create with strict constraints.
     # --repo squne121/loop-protocol and --body-file tmp/... required; interactive flags blocked.
     if is_github_issue_mutation_command(normalized_cmd):
         return _emit(
@@ -2084,7 +2117,7 @@ def evaluate(
     if _CSM_POLICY_AVAILABLE and _csm_exec_command(normalized_cmd, project_root or ""):
         return _emit(
             status="allow",
-            reason_code=REASON_DETERMINISTIC_CHECKER,
+            reason_code=REASON_CONTROLLED_SKILL_MUTATION_EXECUTOR,
             target_branch=None,
             target_branch_kind=None,
             local_parser_stage="controlled_skill_mutation",
@@ -2355,7 +2388,12 @@ def _emit_block_stderr(
     hint_suggested = None
     hint_verify = None
     if reason_code == REASON_GH_MUTATION:
-        hint_suggested = "rtk gh issue edit <issue> --repo squne121/loop-protocol --body-file tmp/<body>.md"
+        hint_suggested = (
+            "uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py "
+            "--command-id issue_body.update --issue-number <issue> "
+            "--input-file artifacts/<issue>/issue-metadata/issue_body.update/input.json "
+            "--repo squne121/loop-protocol --dry-run"
+        )
     elif reason_code == REASON_UNPARSEABLE:
         hint_suggested = "git branch --show-current"
     elif reason_code == REASON_UNKNOWN_COMMAND:
