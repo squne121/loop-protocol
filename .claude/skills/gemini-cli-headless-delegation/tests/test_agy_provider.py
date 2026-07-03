@@ -204,6 +204,36 @@ def test_ac7_agy_grounded_research_supported() -> None:
     assert result["grounded_research_evidence"]["url_citation_count"] == 1
 
 
+def test_agy_grounded_research_forbids_gemini_google_search() -> None:
+    """AC4: provider=agy + grounded_research never dispatches through the Gemini CLI/API path.
+
+    Proves behaviorally (not by inspection) that the agy branch of
+    run_delegation() returns before reaching _run_gemini() (the Gemini CLI
+    subprocess call) or the ACP transport (run_gemini_acp.run_acp()). There is
+    no Gemini API-level ``google_search`` / ``GenerationConfig`` grounding
+    tool constructed anywhere in run_gemini_headless.py; the only grounding
+    surface for provider=agy is agy's own native WebSearch via ``_run_agy``.
+    """
+    grounded_output = (
+        "Response from AGY.\n"
+        '{"grounding":{"queries":["AGY WebSearch"],"sources":[{"url":"https://example.com","title":"example"}]}}'
+    )
+    completed = _make_completed(0, stdout=grounded_output)
+    with patch.object(rgh, "_run_agy", return_value=completed) as mock_agy, patch.object(
+        rgh,
+        "_run_gemini",
+        side_effect=AssertionError(
+            "_run_gemini (Gemini CLI/API path) must not be called for provider=agy"
+        ),
+    ):
+        result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=300))
+
+    mock_agy.assert_called_once()
+    assert result["ok"] is True
+    assert result["provider"] == "agy"
+    assert result["grounded_research_evidence"] is not None
+
+
 def test_agy_grounded_research_no_citation_fail_closed() -> None:
     """provider=agy + grounded_research without a tool-call trace is fail-closed at both
     nested evidence and top-level result (Issue #1266 Blocker 1 / Blocker 2)."""
