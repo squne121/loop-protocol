@@ -1019,7 +1019,8 @@ def is_github_issue_mutation_command(cmd: str) -> bool:
       - B1: `gh issue create` without --title value
       - B2: --body-file with path traversal (tmp/../...) or absolute path
 
-    Note: gh issue comment/close/reopen remain handled by is_github_remote_ops_command.
+    Note: gh issue close/reopen remain handled by is_github_remote_ops_command.
+    Raw gh issue comment intentionally falls through to gh_mutation_denied.
     """
     cmd = cmd.strip()
     tokens = tokenize_command(cmd)

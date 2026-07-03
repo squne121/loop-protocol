@@ -65,6 +65,16 @@ from skill_runtime_command_policy import resolve_repo_slug  # noqa: E402
 RAW_ISSUE_EDIT_COMMANDS = [
     "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md",
     "gh issue edit 123 --repo squne121/loop-protocol --body rewritten",
+    "gh issue edit 123 --repo squne121/loop-protocol --title new",
+    "gh issue edit 123 --repo squne121/loop-protocol --add-label bug",
+    "gh issue edit 123 --repo squne121/loop-protocol --remove-label bug",
+    "gh issue edit 123 --repo squne121/loop-protocol --add-assignee @me",
+    "gh issue edit 123 --repo squne121/loop-protocol --milestone v1",
+    "gh issue edit 123 --repo squne121/loop-protocol --remove-milestone",
+    "gh issue edit 123 --repo squne121/loop-protocol --add-project Roadmap",
+    "gh issue edit 123 --repo squne121/loop-protocol --add-sub-issue 124",
+    "gh issue edit 123 --repo squne121/loop-protocol --add-blocked-by 200",
+    "gh issue edit 123 --repo squne121/loop-protocol --add-blocking 300",
 ]
 
 RAW_ISSUE_COMMENT_COMMANDS = [
@@ -1939,6 +1949,11 @@ class TestIssue1291IssueMetadataMutationClaude:
             },
             "cwd": str(tmp_git_repo),
         }
+        eval_result = eval_in_local_root(payload["tool_input"]["command"], str(tmp_git_repo))
+        assert eval_result["status"] == "allow"
+        assert eval_result["reason_code"] == REASON_DETERMINISTIC_CHECKER
+        assert eval_result["parser_stage"] == "controlled_skill_mutation"
+        assert eval_result["rule_id"] == "controlled_skill_mutation"
         result = run_claude_hook_script(payload, cwd=tmp_git_repo)
         assert result.returncode == 0, result.stderr
         assert result.stderr == ""
@@ -1965,19 +1980,12 @@ class TestIssue1291IssueMetadataMutationClaude:
             REPO_ROOT / "scripts" / "agent-ops" / "cleanup_exec.py",
             REPO_ROOT / "scripts" / "agent-ops" / "classify-git-state.py",
         ]
-        forbidden = [
-            "gh issue edit",
-            "gh issue comment",
-            "--body-file tmp/",
-            "--body-file=tmp/",
-        ]
-        allowed_context = {
-            "gh issue close",
-            "gh issue reopen",
-            "issue_comment.publish",
-            "issue_body.update",
-            "contract_snapshot.publish",
-        }
+        allowed_shell_prefixes = (
+            "gh issue close ",
+            "gh issue reopen ",
+            "uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py ",
+        )
+        allowed_explicit_comment_markers = ("forbidden example", "allow comments/examples only explicitly")
 
         for root in roots:
             paths = [root] if root.is_file() else list(root.rglob("*"))
@@ -1985,9 +1993,25 @@ class TestIssue1291IssueMetadataMutationClaude:
                 if not path.is_file():
                     continue
                 content = path.read_text(encoding="utf-8", errors="ignore")
-                for needle in forbidden:
-                    if needle in content:
-                        context = content[max(0, content.index(needle) - 120): content.index(needle) + 120]
-                        assert any(token in context for token in allowed_context), (
-                            f"forbidden raw issue mutation reference found in {path}: {needle}"
+                for lineno, line in enumerate(content.splitlines(), start=1):
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    if "gh issue edit" in stripped or "gh issue comment" in stripped:
+                        if stripped.startswith(("#", "//")):
+                            assert any(marker in stripped for marker in allowed_explicit_comment_markers), (
+                                f"unexpected raw issue mutation comment at {path}:{lineno}: {stripped}"
+                            )
+                            continue
+                        assert stripped.startswith(allowed_shell_prefixes), (
+                            f"forbidden raw issue mutation command at {path}:{lineno}: {stripped}"
+                        )
+                    if "--body-file tmp/" in stripped or "--body-file=tmp/" in stripped:
+                        if stripped.startswith(("#", "//")):
+                            assert any(marker in stripped for marker in allowed_explicit_comment_markers), (
+                                f"unexpected tmp body-file comment at {path}:{lineno}: {stripped}"
+                            )
+                            continue
+                        assert "controlled_skill_mutation_exec.py" in stripped, (
+                            f"forbidden tmp body-file usage at {path}:{lineno}: {stripped}"
                         )
