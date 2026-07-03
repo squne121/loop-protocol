@@ -81,32 +81,70 @@ def _load_vc_baseline_shape_compiler():
     return module
 
 
-def repair_vc_baseline_shape(lines: list[str], repo_root: str) -> tuple[list[str], bool]:
+# Sentinel result codes for repair_vc_baseline_shape() (Issue #1305 review
+# Blocker 3): VC shape repair is a completion condition of Issue #1285, not
+# an optional best-effort repair, so compiler load failure must fail closed
+# (exit 2), not fail open.
+class VcShapeResult:
+    OK = "ok"                                    # repaired, or safely no-op
+    NO_VC_SECTION = "no_vc_section"               # no VC section at all -> safe no-op
+    LOAD_FAILED = "compiler_load_failed"          # compiler module load failed -> fail-closed
+    UNSAFE_MIXED = "unsafe_mixed_changed_and_warnings"  # partial-rewrite would leave broken lines -> fail-closed
+
+
+def _body_has_verification_commands_section(lines: list[str]) -> bool:
+    """Return True iff the body has a literal ## Verification Commands heading.
+
+    Self-contained (no compiler import needed) so this check works even when
+    the compiler module itself cannot be loaded.
+    """
+    for line in lines:
+        if line.rstrip() == "## Verification Commands":
+            return True
+    return False
+
+
+def repair_vc_baseline_shape(
+    lines: list[str], repo_root: str
+) -> tuple[list[str], bool, str, Optional[str]]:
     """Apply VC baseline-fail pytest command shape canonicalization.
 
     Delegates the actual detection/rewrite logic to
     vc_baseline_shape_compiler.compile_body() (Issue #1285) and applies any
-    "changed" rewrites in place. Returns (new_lines, repaired).
+    "changed" rewrites in place. Returns (new_lines, repaired, status, reason)
+    where status is one of the VcShapeResult constants above.
 
-    Fails open (returns lines unchanged, repaired=False) if the compiler
-    module cannot be loaded, so this optional repair never blocks the
-    existing C4/C9 autofix behavior.
+    Fail-closed contract (Issue #1305 review Blocker 3):
+      - No ``## Verification Commands`` section at all -> safe no-op
+        (VcShapeResult.NO_VC_SECTION); there is nothing to canonicalize.
+      - Compiler module cannot be imported/loaded -> fail-closed
+        (VcShapeResult.LOAD_FAILED). The caller (main()) must exit 2, not
+        silently skip this repair.
+      - compile_body() reports status == "changed" together with any
+        not_autofixable warnings (a body where some pytest VC lines are
+        rewritable and others are not) -> fail-closed
+        (VcShapeResult.UNSAFE_MIXED). Applying only the safe subset would
+        report success while leaving a still-broken VC shape behind, so
+        autofix only applies when the entire body is safely rewritable.
     """
+    if not _body_has_verification_commands_section(lines):
+        return lines, False, VcShapeResult.NO_VC_SECTION, None
+
     try:
         compiler = _load_vc_baseline_shape_compiler()
-    except Exception as e:  # pragma: no cover - defensive fail-open
-        print(
-            f"[WARN] vc_baseline_shape_compiler could not be loaded: {e}; skipping VC shape repair",
-            file=sys.stderr,
-        )
-        return lines, False
+    except Exception as e:
+        return lines, False, VcShapeResult.LOAD_FAILED, str(e)
 
     body = "".join(lines)
     from pathlib import Path as _Path
 
     result = compiler.compile_body(body, _Path(repo_root))
+
+    if result.get("status") == "changed" and result.get("warnings"):
+        return lines, False, VcShapeResult.UNSAFE_MIXED, "; ".join(result["warnings"])
+
     if result.get("status") != "changed" or not result.get("rewrites"):
-        return lines, False
+        return lines, False, VcShapeResult.OK, None
 
     new_lines = lines[:]
     repaired = False
@@ -120,7 +158,7 @@ def repair_vc_baseline_shape(lines: list[str], repo_root: str) -> tuple[list[str
         indent = stripped[:leading_ws]
         new_lines[idx] = f"{indent}$ {rw['suggested_command']}\n"
         repaired = True
-    return new_lines, repaired
+    return new_lines, repaired, VcShapeResult.OK, None
 
 
 def sha256_of(text: str) -> str:
@@ -551,13 +589,35 @@ def main() -> int:
     # Apply C4 repair
     lines, c4_repaired = repair_c4_in_vc_block(lines)
 
+    # Apply VC baseline-fail pytest command shape repair (Issue #1285).
+    # Ordered before C9 (Issue #1305 review Blocker 4) so that a VC-shape
+    # load failure or unsafe-mixed body fails closed before C9 does any
+    # further (possibly redundant) work, and so C9's own not_autofixable
+    # fail-closed path can be exercised together with VC shape repair in the
+    # same run.
+    repo_root_for_vc_shape = os.path.normpath(os.path.join(_SCRIPT_DIR, "../../../.."))
+    lines, vc_shape_repaired, vc_shape_status, vc_shape_reason = repair_vc_baseline_shape(
+        lines, repo_root_for_vc_shape
+    )
+    if vc_shape_status == VcShapeResult.LOAD_FAILED:
+        print(
+            "[ERROR] vc_baseline_shape_compiler could not be loaded; failing closed "
+            f"(reason_code=vc_shape_compiler_load_failed): {vc_shape_reason}",
+            file=sys.stderr,
+        )
+        return 2
+    if vc_shape_status == VcShapeResult.UNSAFE_MIXED:
+        print(
+            "[ERROR] VC baseline shape has both rewritable and not_autofixable pytest "
+            "command lines; failing closed rather than applying a partial rewrite "
+            f"(reason_code=vc_shape_mixed_changed_and_warnings): {vc_shape_reason}",
+            file=sys.stderr,
+        )
+        return 2
+
     # Apply C9 repair
     lines, c9_result, c9_reason = repair_c9(lines)
     c9_repaired = (c9_result == C9Result.OK)
-
-    # Apply VC baseline-fail pytest command shape repair (Issue #1285)
-    repo_root_for_vc_shape = os.path.normpath(os.path.join(_SCRIPT_DIR, "../../../.."))
-    lines, vc_shape_repaired = repair_vc_baseline_shape(lines, repo_root_for_vc_shape)
 
     # If C9 is not autofixable (runtime/unknown paths or missing Allowed Paths) → exit 2
     if c9_result == C9Result.NOT_AUTOFIXABLE:

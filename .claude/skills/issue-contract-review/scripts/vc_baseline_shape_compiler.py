@@ -75,6 +75,7 @@ REASON_DASH_K_COMPLEX = "pytest_dash_k_complex_expression"
 REASON_COMPLEX_NODE_ID = "pytest_complex_node_id_on_existing_file"
 REASON_NO_SAFE_CANDIDATE = "pytest_no_safe_missing_file_candidate"
 REASON_AST_PARSE_FAILED = "pytest_ast_parse_failed"
+REASON_UNSUPPORTED_CLI_SYNTAX = "pytest_unsupported_cli_syntax"
 
 # AC1 constraint: -k value must be a single bare `test_*` identifier. Anything
 # else (boolean expression, class selector, parametrized selector, quoted
@@ -156,10 +157,27 @@ def shlex_safe_tokens(cmd: str) -> list[str]:
 # ─── pytest command parsing ──────────────────────────────────────────────────
 
 
+# This compiler intentionally only understands a narrow pytest invocation
+# shape: `pytest <single path_or_node_id> [-k <value>] [<safe boolean flags>]`.
+# Any other CLI syntax (value-taking flags other than -k, multiple positional
+# path arguments, repeated -k, etc.) is marked "ambiguous" so
+# classify_pytest_command() fails closed to not_autofixable instead of
+# silently mis-parsing (Issue #1305 review Blocker 5).
+_SAFE_BOOLEAN_FLAGS = {
+    "-q", "-qq", "-v", "-vv", "-vvv", "-s", "-x", "-l",
+    "--tb=short", "--tb=long", "--tb=no", "--tb=line", "--tb=native",
+    "--no-header", "--disable-warnings", "-ra", "-rA",
+}
+
+
 def _parse_pytest_command(cmd: str) -> Optional[dict]:
     """Parse a pytest invocation into its structural parts.
 
     Returns None if `cmd` does not contain a recognizable `pytest` token.
+    The returned dict always carries an "ambiguous" bool: True when the
+    command uses CLI syntax this narrow parser does not understand well
+    enough to safely rewrite (see _SAFE_BOOLEAN_FLAGS above). Callers must
+    treat ambiguous=True as not_autofixable rather than attempting a rewrite.
     """
     tokens = shlex_safe_tokens(cmd)
     if "pytest" not in tokens:
@@ -171,6 +189,7 @@ def _parse_pytest_command(cmd: str) -> Optional[dict]:
     path_arg: Optional[str] = None
     k_value: Optional[str] = None
     other_flags: list[str] = []
+    ambiguous = False
 
     i = 0
     while i < len(rest):
@@ -178,10 +197,14 @@ def _parse_pytest_command(cmd: str) -> Optional[dict]:
         if tok == "-k":
             if i + 1 >= len(rest):
                 return None
+            if k_value is not None:
+                ambiguous = True
             k_value = rest[i + 1]
             i += 2
             continue
         if tok.startswith("-"):
+            if tok not in _SAFE_BOOLEAN_FLAGS:
+                ambiguous = True
             other_flags.append(tok)
             i += 1
             continue
@@ -189,6 +212,9 @@ def _parse_pytest_command(cmd: str) -> Optional[dict]:
             path_arg = tok
             i += 1
             continue
+        # A second positional token (e.g. multiple test paths) is outside
+        # this compiler's narrow understood shape.
+        ambiguous = True
         other_flags.append(tok)
         i += 1
 
@@ -200,6 +226,7 @@ def _parse_pytest_command(cmd: str) -> Optional[dict]:
         "path_arg": path_arg,
         "k_value": k_value,
         "other_flags": other_flags,
+        "ambiguous": ambiguous,
     }
 
 
@@ -219,6 +246,96 @@ def _collect_top_level_test_defs(py_path: Path) -> tuple[set[str], bool]:
     return funcs, True
 
 
+# ─── Allowed Paths matcher (Issue #1305 review Blocker 2) ───────────────────
+#
+# Self-contained subset of the same "directory allow" semantics as
+# `.claude/skills/pr-review-judge/scripts/allowed_paths_review_gate.py`'s
+# `AllowedPathsMatcher` (exact-file match, trailing-slash directory-prefix
+# allow via `/**`, `*`/`**` segment globs, POSIX normalization, fail-closed
+# on absolute paths / `..` traversal / backslashes). Duplicated here
+# (not cross-imported) to keep this compiler self-contained, but the
+# semantics MUST stay in lockstep with the review gate's matcher.
+
+
+def _normalize_repo_relative_path(path: str) -> Optional[str]:
+    """Normalize a repo-relative POSIX path; reject invalid input."""
+    if not path:
+        return None
+    if "\\" in path:
+        return None
+    if path.startswith("/"):
+        return None
+    normalized = path[2:] if path.startswith("./") else path
+    if normalized in {"", "."}:
+        return None
+    segments = normalized.split("/")
+    if ".." in segments:
+        return None
+    if "" in segments:
+        return None
+    return normalized
+
+
+def _normalize_allowed_pattern(pattern: str) -> Optional[str]:
+    """Normalize an Allowed Paths entry. Trailing `/` means "directory allow"
+    and is rewritten to a `<dir>/**` glob pattern."""
+    if pattern.endswith("/"):
+        bare = pattern[:-1]
+        if bare.endswith("/") or "*" in bare:
+            return None
+        normalized_bare = _normalize_repo_relative_path(bare)
+        if normalized_bare is None:
+            return None
+        return normalized_bare + "/**"
+    normalized = _normalize_repo_relative_path(pattern)
+    if normalized is None:
+        return None
+    for segment in normalized.split("/"):
+        if "*" in segment and segment not in ("*", "**"):
+            return None
+    return normalized
+
+
+def _pattern_matches(file_path: str, pattern: str) -> bool:
+    """Segment-based glob match: literal segment / `*` (one segment) /
+    `**` (zero or more segments)."""
+    file_parts = file_path.split("/")
+    pattern_parts = pattern.split("/")
+    n, m = len(file_parts), len(pattern_parts)
+    dp = [[False] * (m + 1) for _ in range(n + 1)]
+    dp[n][m] = True
+    for j in range(m - 1, -1, -1):
+        if pattern_parts[j] == "**":
+            dp[n][j] = dp[n][j + 1]
+    for i in range(n - 1, -1, -1):
+        for j in range(m - 1, -1, -1):
+            segment = pattern_parts[j]
+            if segment == "**":
+                dp[i][j] = dp[i][j + 1] or dp[i + 1][j]
+            elif segment == "*":
+                dp[i][j] = dp[i + 1][j + 1]
+            else:
+                dp[i][j] = segment == file_parts[i] and dp[i + 1][j + 1]
+    return dp[0][0]
+
+
+def _is_allowed_path(rel: str, allowed_paths: set[str]) -> bool:
+    """Return True iff `rel` is allowed under the Issue's Allowed Paths,
+    honoring exact-file matches AND trailing-slash directory-prefix allows
+    (and any `*`/`**` glob entries), mirroring allowed_paths_review_gate.py's
+    matcher semantics (Issue #1305 review Blocker 2)."""
+    normalized_file = _normalize_repo_relative_path(rel)
+    if normalized_file is None:
+        return False
+    for pattern in allowed_paths:
+        normalized_pattern = _normalize_allowed_pattern(pattern)
+        if normalized_pattern is None:
+            continue
+        if _pattern_matches(normalized_file, normalized_pattern):
+            return True
+    return False
+
+
 def _synthesize_candidate(
     existing_path: Path,
     repo_root: Path,
@@ -228,9 +345,11 @@ def _synthesize_candidate(
     """Synthesize a canonical missing-file candidate path.
 
     Only returns a candidate that is (a) not already used in this run,
-    (b) present verbatim in the Issue's Allowed Paths, and (c) does not
-    already exist on the baseline (it must genuinely be a *missing* file so
-    the resulting node-id is a real expected_baseline_fail).
+    (b) allowed by the Issue's Allowed Paths (exact-file match OR
+    trailing-slash directory-prefix allow OR `*`/`**` glob match — see
+    _is_allowed_path()), and (c) does not already exist on the baseline (it
+    must genuinely be a *missing* file so the resulting node-id is a real
+    expected_baseline_fail).
     """
     try:
         rel_dir = existing_path.parent.relative_to(repo_root)
@@ -244,7 +363,7 @@ def _synthesize_candidate(
         rel = str(rel_dir / name).replace("\\", "/")
         if rel in used:
             continue
-        if rel not in allowed_paths:
+        if not _is_allowed_path(rel, allowed_paths):
             continue
         candidate_path = repo_root / rel
         if candidate_path.exists():
@@ -277,6 +396,12 @@ def classify_pytest_command(
     if parsed is None:
         return None
 
+    if parsed.get("ambiguous"):
+        # Unsupported/unrecognized CLI syntax (value-taking flags other than
+        # -k, multiple positional path args, repeated -k, etc.) — fail
+        # closed rather than risk mis-parsing (Issue #1305 review Blocker 5).
+        return {"status": STATUS_NOT_AUTOFIXABLE, "reason_code": REASON_UNSUPPORTED_CLI_SYNTAX}
+
     path_arg = parsed["path_arg"]
     k_value = parsed["k_value"]
 
@@ -291,8 +416,14 @@ def classify_pytest_command(
     # ── AC2 / AC4: node-id form ──────────────────────────────────────────
     if node_id is not None:
         if not file_exists:
-            # missing_new_test_file.py::test_name → already canonical (AC4)
-            return {"status": STATUS_ALREADY_CANONICAL}
+            # missing_new_test_file.py::test_name is only already_canonical
+            # when the node-id itself is a simple top-level function form;
+            # a missing file with a class/method or parametrized selector is
+            # not a canonical shape this compiler recognizes (Issue #1305
+            # review Blocker 6).
+            if _SIMPLE_NODE_ID_RE.match(node_id):
+                return {"status": STATUS_ALREADY_CANONICAL}
+            return {"status": STATUS_NOT_AUTOFIXABLE, "reason_code": REASON_COMPLEX_NODE_ID}
 
         if not _SIMPLE_NODE_ID_RE.match(node_id):
             # class selector / parametrized selector on an existing file (AC3)

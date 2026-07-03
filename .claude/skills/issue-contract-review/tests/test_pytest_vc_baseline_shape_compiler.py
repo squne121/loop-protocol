@@ -263,6 +263,145 @@ def test_invalid_input_missing_vc_section(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# Blocker 2 (PR #1305 review): Allowed Paths "directory allow" semantics —
+# trailing-slash entries must be treated as a directory prefix, matching
+# allowed_paths_review_gate.py's AllowedPathsMatcher, not bare string equality.
+# ---------------------------------------------------------------------------
+
+
+def test_allowed_paths_directory_prefix_allows_candidate(tmp_path: Path):
+    """GIVEN Allowed Paths=['some_dir/'] (trailing-slash directory allow) /
+    WHEN a candidate missing-file path lives under that directory /
+    THEN the compiler treats it as allowed and emits a rewrite (changed)."""
+    compiler = _load_compiler()
+
+    pkg_dir = tmp_path / "some_dir"
+    pkg_dir.mkdir()
+    existing = pkg_dir / "test_existing.py"
+    existing.write_text("def test_alpha():\n    assert True\n", encoding="utf-8")
+
+    body = _make_body(
+        vc_bash_block="$ pytest some_dir/test_existing.py -k test_new_name",
+        allowed_paths=["some_dir/"],
+    )
+
+    result = compiler.compile_body(body, tmp_path)
+    assert result["status"] == "changed"
+    assert len(result["rewrites"]) == 1
+    assert "some_dir/test_existing_new_test.py::test_new_name" in result["rewrites"][0]["suggested_command"]
+
+
+def test_allowed_paths_directory_prefix_rejects_outside_directory(tmp_path: Path):
+    """GIVEN Allowed Paths=['other_dir/'] (a different directory prefix) /
+    WHEN the candidate missing-file path lives under `some_dir/` /
+    THEN it is not_autofixable (never invent a path outside Allowed Paths)."""
+    compiler = _load_compiler()
+
+    pkg_dir = tmp_path / "some_dir"
+    pkg_dir.mkdir()
+    existing = pkg_dir / "test_existing.py"
+    existing.write_text("def test_alpha():\n    assert True\n", encoding="utf-8")
+
+    body = _make_body(
+        vc_bash_block="$ pytest some_dir/test_existing.py -k test_new_name",
+        allowed_paths=["other_dir/"],
+    )
+
+    result = compiler.compile_body(body, tmp_path)
+    assert result["status"] == "not_autofixable"
+    assert result["rewrites"] == []
+
+
+# ---------------------------------------------------------------------------
+# Blocker 5 (PR #1305 review): unsupported/ambiguous pytest CLI syntax must
+# fail closed to not_autofixable rather than being silently mis-parsed.
+# ---------------------------------------------------------------------------
+
+
+def test_unsupported_cli_syntax_value_taking_flag_not_autofixable(tmp_path: Path):
+    """GIVEN a pytest invocation using a value-taking flag this narrow parser
+    does not understand (`--rootdir <path>`) / WHEN compiled / THEN
+    not_autofixable (fail closed instead of mis-parsing the path arg)."""
+    compiler = _load_compiler()
+
+    pkg_dir = tmp_path / "some_dir"
+    pkg_dir.mkdir()
+    existing = pkg_dir / "test_existing.py"
+    existing.write_text("def test_alpha():\n    assert True\n", encoding="utf-8")
+
+    body = _make_body(
+        vc_bash_block="$ pytest --rootdir some_dir some_dir/test_existing.py -k test_new_name",
+        allowed_paths=["some_dir/test_existing.py", "some_dir/test_existing_new_test.py"],
+    )
+
+    result = compiler.compile_body(body, tmp_path)
+    assert result["status"] == "not_autofixable"
+    assert result["rewrites"] == []
+    assert "pytest_unsupported_cli_syntax" in result["warnings"][0]
+
+
+def test_unsupported_cli_syntax_multiple_path_args_not_autofixable(tmp_path: Path):
+    """GIVEN a pytest invocation with two positional path arguments /
+    WHEN compiled / THEN not_autofixable (multiple test paths are outside
+    this compiler's understood shape)."""
+    compiler = _load_compiler()
+
+    pkg_dir = tmp_path / "some_dir"
+    pkg_dir.mkdir()
+    existing = pkg_dir / "test_existing.py"
+    existing.write_text("def test_alpha():\n    assert True\n", encoding="utf-8")
+    other = pkg_dir / "test_other.py"
+    other.write_text("def test_beta():\n    assert True\n", encoding="utf-8")
+
+    body = _make_body(
+        vc_bash_block="$ pytest some_dir/test_existing.py some_dir/test_other.py -k test_new_name",
+        allowed_paths=["some_dir/test_existing.py", "some_dir/test_other.py"],
+    )
+
+    result = compiler.compile_body(body, tmp_path)
+    assert result["status"] == "not_autofixable"
+    assert result["rewrites"] == []
+
+
+# ---------------------------------------------------------------------------
+# Blocker 6 (PR #1305 review): missing-file node-id must also be validated
+# against the simple top-level function node-id shape; a missing file with a
+# class/method or parametrized selector is not a canonical shape.
+# ---------------------------------------------------------------------------
+
+
+def test_missing_file_complex_node_id_not_autofixable(tmp_path: Path):
+    """GIVEN missing_file.py::TestClass::test_method (missing file, but a
+    class/method selector, not a simple top-level function node-id) /
+    WHEN compiled / THEN not_autofixable, NOT already_canonical."""
+    compiler = _load_compiler()
+
+    body = _make_body(
+        vc_bash_block="$ pytest some_dir/missing_new_test_file.py::TestClass::test_method",
+        allowed_paths=["some_dir/missing_new_test_file.py"],
+    )
+
+    result = compiler.compile_body(body, tmp_path)
+    assert result["status"] == "not_autofixable"
+    assert result["rewrites"] == []
+
+
+def test_missing_file_parametrized_node_id_not_autofixable(tmp_path: Path):
+    """GIVEN missing_file.py::test_name[case1] (missing file, parametrized
+    selector) / WHEN compiled / THEN not_autofixable, NOT already_canonical."""
+    compiler = _load_compiler()
+
+    body = _make_body(
+        vc_bash_block="$ pytest some_dir/missing_new_test_file.py::test_name[case1]",
+        allowed_paths=["some_dir/missing_new_test_file.py"],
+    )
+
+    result = compiler.compile_body(body, tmp_path)
+    assert result["status"] == "not_autofixable"
+    assert result["rewrites"] == []
+
+
+# ---------------------------------------------------------------------------
 # AC5: issue_contract_hygiene_autofix.py wiring + sha256 no_change on rerun
 # ---------------------------------------------------------------------------
 
