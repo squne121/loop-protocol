@@ -107,3 +107,17 @@ FAIL_CLOSED_REWRITE_CONSTRAINTS_V1:
 2. `required_contract_keys` の各キーを Machine-Readable Contract YAML ブロックに追加する
 3. `rewrite_constraints.freeform_rewrite_forbidden == true` の場合、スコープ外の変更を行わない
 4. `never_override_reason_codes` に該当する reason code が存在する場合は rewrite を実施せず `status: failed` を返す
+
+### ISSUE_AUTHOR_RESULT_V1 への追加フィールド（fail_closed rewrite 時のみ）
+
+`FAIL_CLOSED_REWRITE_CONSTRAINTS_V1` に基づく fail_closed rewrite が完了した場合、
+`ISSUE_AUTHOR_RESULT_V1`（create-issue / AC・VC rewrite の結果契約であり、
+既存 Issue mutation 用の `ISSUE_EDIT_TXN_RESULT_V1` とは別スキーマ）に以下を追加で報告する。
+
+```yaml
+# ISSUE_AUTHOR_RESULT_V1 の追加フィールド（fail_closed rewrite 時のみ）
+checked_body_sha256: <sha256>   # pre-mutation dry-run checker に渡した本文の SHA256
+checker_exit_code: <int>        # post-mutation fresh checker の exit code
+missing_sections: []            # rewrite 後も残っている不足セクション（空 = 解消済み）
+missing_contract_keys: []       # rewrite 後も残っている不足 contract キー（空 = 解消済み）
+```
