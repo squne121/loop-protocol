@@ -66,14 +66,15 @@
 | `context_files` | `local_asset_research` 時は必須。repo 境界とシンボリックリンク境界検証後に wrapper が repo-relative JSON evidence envelope を集約し、AGY へ prompt 注入する。 |
 | `model` | 指定禁止。`unsupported_provider_option` で拒否。 |
 | `post_to_issue_url` | 指定禁止。`provider_forbids_post_to_issue_url` で拒否。 |
-| `grounded_research` | `agy` ネイティブの WebSearch / grounding を使用。 |
+| `grounded_research` | `agy` ネイティブの WebSearch/WebGrounding（`agy -p` 実行）を使用。 Gemini API `google_search` tool や Google Search grounding API は呼ばない（Gemini provider の `grounded_research` とは別の provider-specific 実装）。 |
 | `github_research` | 使用禁止。`unsupported_provider_profile` で拒否。 |
 
 `provider=agy + grounded_research` は `implemented_agy_native_websearch_grounding` として扱う。
 `wrapper_side_google_search_grounding: forbidden` であり、wrapper は Gemini API Google Search / Google Search grounding API / wrapper-side Web retrieval を呼ばない。
 `raw_transcript_included: false`、`raw_credential_included: false`、`repo_absolute_path_included: false` を evidence envelope の不変条件とする。
-`agy_grounded_research_redaction_status` は `redaction_status: checked_no_credential_pattern` を返す。
-quota exceeded は `agy_grounded_research_quota_exhausted` として blocked にし、1 query / 1 URL / timeout / no retry storm を守る。
+`redaction_status` は正常時 `checked_no_secret_pattern` を返す。secret-like pattern / repo absolute path / HOME path を実際に runtime scan した結果であり（自己申告の固定値ではない）、検出時は `agy_web_grounding_redaction_failed` で fail-closed する。
+stdout に URL 文字列があるだけでは WebSearch 実行証跡として扱わない。machine-verifiable な構造化 `tool_calls` トレース（`web_search` / `browser_navigate` / `url_read` 等の認識済み tool 名を含む）が無い場合は `grounding_status: attempted_no_web_tool_call` / `grounding_backend: none` / `grounding_failure_class: agy_web_grounding_tool_call_missing` として fail-closed する。`web_tool_call_count` は URL 件数から推定しない。
+quota exceeded（`RESOURCE_EXHAUSTED` / HTTP 429 / `quota_exhausted` / `Individual quota reached`）は `agy_web_grounding_quota_exhausted`（preflight smoke では `agy_grounded_research_quota_exhausted`）として blocked にし、1 query / 1 URL / timeout / no retry storm を守る。
 
 `objective` / `instructions` / `output_sections` / `context_files` は、既存 caller 互換のため指定されていてもよいが、
 `provider=agy` 実行時の primary contract は、`prompt` / `tool_profile` に加え、`context_files` の wrapper-side 検証結果（repo-boundary / drift）を含めて扱う。
@@ -90,7 +91,7 @@ quota exceeded は `agy_grounded_research_quota_exhausted` として blocked に
 | Profile | 入口 | 許可される外部/ローカル能力 | 禁止事項 |
 |---|---|---|---|
 | `no_tools` | isolated temp cwd | `context_files` と `inline_context` のみ | tools、repo 探索、shell execution、file edit/write |
-| `grounded_research` | isolated temp cwd | Google Search grounding | shell execution、file edit/write、repo 探索、Serena MCP |
+| `grounded_research` | isolated temp cwd | gemini: Google Search grounding（Gemini API tool）。agy: AGY ネイティブ WebSearch/WebGrounding（`agy -p` 実行、Gemini API 不使用）| shell execution、file edit/write、repo 探索、Serena MCP |
 | `local_asset_research` | repo root | Serena MCP の read-only tool による WSL-local ローカル資産調査 | Google Search、shell execution、file edit/write、GitHub write、repo 外の任意読み取り、`post_to_issue_url` |
 | `proposal_only` | isolated temp cwd | bounded draft text (`implementation_draft` / `issue_authoring_draft` / `patch_proposal` / `command_plan`) | file edit/write、shell execution、GitHub write / `post_to_issue_url`、repo 探索、実装完了を装う報告 |
 | `github_research` | repo root | wrapper が許可コマンドを `gh` で実行し結果を `inline_context` に prepend。Gemini は結果を解釈して報告を返す | `post_to_issue_url`、gh write コマンド（issue comment/edit/create/close 等）、`gh api` 非 GET method、shell 実行、file edit/write |

@@ -11,7 +11,7 @@ disable-model-invocation: true
 | tool_profile | 用途 |
 |---|---|
 | `no_tools` | ツール不使用・コンテキスト読み取り専用 |
-| `grounded_research` | AGY native WebSearch/WebGrounding（timeout_sec: 300+ 推奨） |
+| `grounded_research` | provider-aware: `provider=gemini`（既定）は Gemini API Google Search grounding、`provider=agy` は AGY native WebSearch/WebGrounding（`agy -p`、Gemini API 不使用、timeout_sec: 300+ 推奨）。両者は別実装であり、AGY 側は machine-verifiable tool-call トレース必須。詳細は `references/provider-mapping.md` / `references/usage-contract.md` 参照。 |
 | `local_asset_research` | Serena MCP read-only によるローカル資産調査 |
 | `proposal_only` | 実装案・Issue 本文案・patch proposal のドラフト生成 |
 | `github_research` | GitHub read-only 調査（gh コマンド allowlist）|

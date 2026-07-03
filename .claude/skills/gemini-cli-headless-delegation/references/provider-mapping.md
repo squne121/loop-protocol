@@ -81,7 +81,7 @@ Gemini CLI と同様に wrapper 経由で呼び出すが、出力形式・cwd po
 |---|---|---|
 | `no_tools` | supported | isolated temp cwd から agy を呼び出す。ファイル編集・shell 実行なし。 |
 | `proposal_only` | supported | isolated temp cwd から agy を呼び出す。返却は draft text のみ。 |
-| `grounded_research` | **supported** | AGY native WebSearch/WebGrounding を使用。wrapper は最小限の `grounded` 証跡（標準出力由来 URL）を採取し、失敗時は `agy_grounded_research_*` 系で fail-closed。 |
+| `grounded_research` | **supported** | AGY native WebSearch/WebGrounding （`agy -p`、Gemini API `google_search` 不使用）を使用。`grounded` 判定には構造化 `tool_calls` トレース（認識済み web tool 名）が必須で、stdout 中の bare URL 文字列だけでは実行証跡と扱わない（トレース欠如は `agy_web_grounding_tool_call_missing` で fail-closed）。quota exhaustion / secret・repo path leakage も専用 failure class で fail-closed する。 |
 | `local_asset_research` | supported | wrapper 側だけが pinned SerenaMCP read-only retrieval を実行し、repo-relative JSON evidence envelope だけを prompt-only で AGY に渡す。 |
 | `github_research` | **unsupported_provider_profile** | agy は GitHub アクセス機能を持たない。fail-closed。 |
 

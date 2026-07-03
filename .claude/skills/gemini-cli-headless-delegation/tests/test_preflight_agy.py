@@ -403,9 +403,11 @@ def test_grounded_research_probe_success(monkeypatch, tmp_path):
     assert result["grounded_research"]["ok"] is True
     check = result["grounded_research"]["check"]
     assert check["ok"] is True
-    assert "https://example.com/one" in (check["evidence_urls"] or [])
+    # Issue #1266 Major 1: 1 query / 1 URL quota-bound contract — evidence is clamped to 1
+    # URL even when AGY returns more than one.
+    assert check["evidence_urls"] == ["https://example.com/one"]
     assert check["web_tool_call_count"] == 1
-    assert check["url_citation_count"] == 2
+    assert check["url_citation_count"] == 1
     assert check["stdout_line_count"] > 0
 
 
@@ -441,7 +443,9 @@ def test_grounded_research_probe_fails_when_no_urls(monkeypatch, tmp_path):
 
 
 def test_agy_grounded_research_quota_exhausted_bounded_no_retry_storm(monkeypatch, tmp_path):
-    """agy_grounded_research_quota_exhausted: bounded probe has no retry storm."""
+    """agy_grounded_research_quota_exhausted: bounded probe has no retry storm and is
+    classified via the dedicated quota-exhaustion classifier, not a generic exit_nonzero
+    (Issue #1266 Major 1)."""
     module = load_module()
     monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)  # type: ignore[call-arg]
     grounded_calls = {"count": 0}
@@ -468,12 +472,92 @@ def test_agy_grounded_research_quota_exhausted_bounded_no_retry_storm(monkeypatc
     result = module.run_preflight(grounded_research=True)
 
     assert result["ok"] is False
-    assert result["failure_class"] == "agy_grounded_research_exit_nonzero"
+    assert result["failure_class"] == "agy_grounded_research_quota_exhausted"
     assert grounded_calls["count"] == 1
+
+
+def test_agy_grounded_research_quota_exhausted_resource_exhausted_text(monkeypatch, tmp_path):
+    """RESOURCE_EXHAUSTED in stdout (exit 0) is also classified as quota exhaustion, not
+    treated as a successful probe (Issue #1266 Major 1)."""
+    module = load_module()
+    monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)  # type: ignore[call-arg]
+
+    def fake_run(argv, cwd=None, timeout=None):
+        if argv == [module._resolve_binary(), "--version"]:
+            return _FakeCompleted(0, "agy 1.0.0\n", "")
+        if argv == [module._resolve_binary(), "--help"]:
+            return _FakeCompleted(
+                0,
+                "Usage: agy [OPTIONS]\n"
+                "  -p, --print, --prompt  Non-interactive mode\n",
+                "",
+            )
+        if argv[:2] == [module._resolve_binary(), "-p"]:
+            if argv[2] == module.SMOKE_PROMPT:
+                return _FakeCompleted(0, "LOOP_AGY_SMOKE_OK\n", "")
+            return _FakeCompleted(0, "RESOURCE_EXHAUSTED: Individual quota reached", "")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+
+    result = module.run_preflight(grounded_research=True)
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_grounded_research_quota_exhausted"
 # ---------------------------------------------------------------------------
 # Extra: test_help_flag_parser_no_false_positives
 # --prompting / --printable must NOT trigger -p / --print.
 # ---------------------------------------------------------------------------
+
+
+def test_evidence_doc_is_generated_from_preflight_json_not_hand_authored(monkeypatch, tmp_path):
+    """docs/dev/agy-grounded-research-evidence.md must be generated from the same
+    grounded_research preflight JSON as the PR body — no independently hand-authored
+    citation list or placeholder sha256 (Issue #1266 Blocker 4)."""
+    module = load_module()
+    monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)  # type: ignore[call-arg]
+
+    def fake_run(argv, cwd=None, timeout=None):
+        if argv == [module._resolve_binary(), "--version"]:
+            return _FakeCompleted(0, "agy 1.0.0\n", "")
+        if argv == [module._resolve_binary(), "--help"]:
+            return _FakeCompleted(
+                0,
+                "Usage: agy [OPTIONS]\n"
+                "  -p, --print, --prompt  Non-interactive mode\n",
+                "",
+            )
+        if argv[:2] == [module._resolve_binary(), "-p"]:
+            if argv[2] == module.SMOKE_PROMPT:
+                return _FakeCompleted(0, "LOOP_AGY_SMOKE_OK\n", "")
+            return _FakeCompleted(0, "Source: https://example.com/one reliable-update\n", "")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+
+    result = module.run_preflight(grounded_research=True)
+    envelope = module.build_evidence_envelope(result, issue_number=1266, captured_at="2026-07-04T00:00:00Z")
+    markdown = module.render_evidence_markdown(envelope)
+
+    evidence = envelope["agy_web_grounding_evidence_v1"]
+    check = result["grounded_research"]["check"]
+
+    # Parity: every rendered value traces back to the exact same preflight result — no
+    # independently authored citation list, count, or placeholder sha256.
+    assert evidence["url_citation_count"] == check["url_citation_count"]
+    assert evidence["web_tool_call_count"] == check["web_tool_call_count"]
+    assert [c["url"] for c in evidence["citations"]] == check["evidence_urls"]
+    assert evidence["command_exit_code"] == check["exit_code"]
+    assert evidence["agy_cli_version"] == result["agy"]["version"]
+    assert evidence["transcript_evidence"][0]["sha256"] == module.hashlib.sha256(
+        check["stdout_sample"].encode("utf-8")
+    ).hexdigest()
+    assert evidence["transcript_evidence"][0]["sha256"] != "captured_in_preflight_stdout_sample"
+
+    for citation in evidence["citations"]:
+        assert citation["url"] in markdown
+    assert f"agy_cli_version: \"{result['agy']['version']}\"" in markdown
+    assert "captured_in_preflight_stdout_sample" not in markdown
 
 
 def test_help_flag_parser_no_false_positives():

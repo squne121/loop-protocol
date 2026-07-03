@@ -1557,6 +1557,110 @@ def _extract_urls(text: str) -> list[str]:
     return found
 
 
+RECOGNIZED_WEB_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "web_search",
+        "websearch",
+        "browser_navigate",
+        "browser",
+        "url_read",
+        "read_url",
+        "fetch_url",
+        "fetch",
+    }
+)
+_QUOTA_EXHAUSTED_RE = re.compile(
+    r"RESOURCE_EXHAUSTED|quota[_ ]exhausted|Individual quota reached",
+    re.IGNORECASE,
+)
+_GOOGLE_API_KEY_RE = re.compile(r"AIza[0-9A-Za-z_\-]{35}")
+_REDACTION_PLACEHOLDER = "<redacted>"
+
+
+def _scan_redaction_violations(text: str) -> list[str]:
+    """Detect credential-like patterns and absolute paths in *text* (fail-closed check).
+
+    This performs an actual runtime scan of the provided text — it does NOT rely on a
+    self-reported boolean. See Issue #1266 Blocker 3.
+    """
+    violations: list[str] = []
+    if not text:
+        return violations
+    if _contains_credential(text) or _GOOGLE_API_KEY_RE.search(text):
+        violations.append("credential_like_pattern_detected")
+    repo_root_str = str(_repo_root())
+    if repo_root_str and repo_root_str in text:
+        violations.append("repo_absolute_path_detected")
+    home = os.environ.get("HOME")
+    if home and home in text:
+        violations.append("home_absolute_path_detected")
+    return violations
+
+
+def _redact_text(text: str) -> str:
+    """Return *text* with credential-like patterns and HOME/repo paths substituted."""
+    redacted = _CREDENTIAL_REGEX.sub(_REDACTION_PLACEHOLDER, text or "")
+    redacted = _GOOGLE_API_KEY_RE.sub(_REDACTION_PLACEHOLDER, redacted)
+    home = os.environ.get("HOME")
+    if home:
+        redacted = redacted.replace(home, "$HOME")
+    repo_root_str = str(_repo_root())
+    if repo_root_str:
+        redacted = redacted.replace(repo_root_str, "<repo_root>")
+    return redacted
+
+
+def _extract_recognized_tool_calls(parsed: dict[str, Any] | None) -> list[dict[str, str]]:
+    """Extract machine-verifiable web tool-call trace entries from structured AGY evidence.
+
+    Only structured `tool_calls` entries whose name is in RECOGNIZED_WEB_TOOL_NAMES count as
+    machine-verifiable evidence. A bare URL string appearing in stdout without this structured
+    trace is NOT a tool-call trace (Issue #1266 Blocker 1).
+    """
+    if not isinstance(parsed, dict):
+        return []
+    data = parsed.get("data")
+    if not isinstance(data, dict):
+        return []
+    calls = data.get("tool_calls")
+    if not isinstance(calls, list):
+        return []
+    recognized: list[dict[str, str]] = []
+    for call in calls:
+        name: Any = None
+        if isinstance(call, dict):
+            name = call.get("name") or call.get("tool")
+        elif isinstance(call, str):
+            name = call
+        if isinstance(name, str) and name.strip().lower() in RECOGNIZED_WEB_TOOL_NAMES:
+            recognized.append({"name": name.strip().lower()})
+    return recognized
+
+
+def _extract_structured_citations(parsed: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Extract citation url/title pairs from structured AGY evidence (sources/citations keys)."""
+    if not isinstance(parsed, dict):
+        return []
+    data = parsed.get("data")
+    if not isinstance(data, dict):
+        return []
+    citations: list[dict[str, Any]] = []
+    for key in ("sources", "citations"):
+        entries = data.get(key)
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, dict) and isinstance(entry.get("url"), str) and entry["url"].strip():
+                    citations.append({"url": entry["url"], "title": entry.get("title")})
+    grounding = data.get("grounding")
+    if isinstance(grounding, dict):
+        nested_sources = grounding.get("sources")
+        if isinstance(nested_sources, list):
+            for entry in nested_sources:
+                if isinstance(entry, dict) and isinstance(entry.get("url"), str) and entry["url"].strip():
+                    citations.append({"url": entry["url"], "title": entry.get("title")})
+    return citations
+
+
 def _extract_grounded_research_output(stdout: str) -> dict[str, Any]:
     """Parse best-effort AGY native grounded research evidence from stdout."""
     markers = (
@@ -1604,30 +1708,117 @@ def _extract_grounded_research_output(stdout: str) -> dict[str, Any]:
 
 
 def _build_agy_grounded_research_metadata(stdout: str) -> dict[str, Any]:
-    """Build bounded AGY native WebSearch evidence metadata from stdout."""
+    """Build bounded AGY native WebSearch evidence metadata from stdout (fail-closed).
+
+    Classification order:
+    1. Redaction violations (secret / repo path / HOME path) -> agy_web_grounding_redaction_failed.
+    2. Quota exhaustion signals -> agy_web_grounding_quota_exhausted.
+    3. No machine-verifiable web tool-call trace -> agy_web_grounding_tool_call_missing
+       (a bare URL string in stdout is weak evidence only and is never treated as a
+       WebSearch tool-call execution proof; `web_tool_call_count` is never inferred from a
+       URL count — see Issue #1266 Blocker 1).
+    4. Tool-call trace present but no citation -> agy_web_grounding_no_citations.
+    5. Tool-call trace + citation -> grounded (bounded to 1 citation / 1 tool call per the
+       1 query / 1 URL quota contract).
+    """
+    stdout = stdout or ""
+    redacted_excerpt = _redact_text(stdout)[:500]
+    excerpt_sha256 = hashlib.sha256(redacted_excerpt.encode("utf-8")).hexdigest()
+    transcript_evidence = [
+        {
+            "source_kind": "agy_stdout_or_artifact_excerpt",
+            "excerpt": redacted_excerpt,
+            "sha256": excerpt_sha256,
+        }
+    ]
+
+    def _fail_closed(
+        *,
+        grounding_status: str,
+        grounding_backend: str,
+        grounding_failure_class: str,
+        redaction_status: str = "checked_no_secret_pattern",
+        raw_credential_included: bool = False,
+        repo_absolute_path_included: bool = False,
+        parsed_evidence: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "grounding_actor": "antigravity_cli",
+            "grounding_backend": grounding_backend,
+            "grounding_status": grounding_status,
+            "web_tool_call_count": 0,
+            "search_query_count": 0,
+            "url_citation_count": 0,
+            "citation_evidence": [],
+            "grounding_transcript_evidence": transcript_evidence,
+            "grounding_failure_class": grounding_failure_class,
+            "raw_transcript_included": False,
+            "raw_credential_included": raw_credential_included,
+            "repo_absolute_path_included": repo_absolute_path_included,
+            "redaction_status": redaction_status,
+            "parsed_evidence": parsed_evidence,
+        }
+
+    violations = _scan_redaction_violations(stdout)
+    if violations:
+        return _fail_closed(
+            grounding_status="failed",
+            grounding_backend="none",
+            grounding_failure_class="agy_web_grounding_redaction_failed",
+            redaction_status="redaction_failed",
+            raw_credential_included="credential_like_pattern_detected" in violations,
+            repo_absolute_path_included=any(
+                v in violations for v in ("repo_absolute_path_detected", "home_absolute_path_detected")
+            ),
+        )
+
+    if _QUOTA_EXHAUSTED_RE.search(stdout):
+        return _fail_closed(
+            grounding_status="failed",
+            grounding_backend="none",
+            grounding_failure_class="agy_web_grounding_quota_exhausted",
+        )
+
     parsed = _extract_grounded_research_output(stdout)
-    urls = _extract_urls(stdout)
-    grounding_failure_class = None if urls else "agy_web_grounding_no_citations"
+    tool_calls = _extract_recognized_tool_calls(parsed)
+
+    if not tool_calls:
+        return _fail_closed(
+            grounding_status="attempted_no_web_tool_call",
+            grounding_backend="none",
+            grounding_failure_class="agy_web_grounding_tool_call_missing",
+            parsed_evidence=parsed or None,
+        )
+
+    structured_citations = _extract_structured_citations(parsed)
+    # Bounded to 1 citation / 1 tool call (Issue #1266 quota-bound contract: 1 query / 1 URL).
+    citation_evidence = structured_citations[:1]
+    url_citation_count = len(citation_evidence)
+    web_tool_call_count = min(len(tool_calls), 1)
+
+    if url_citation_count > 0:
+        grounding_status = "grounded"
+        grounding_backend = "agy_native_websearch"
+        grounding_failure_class = None
+    else:
+        grounding_status = "attempted_no_citations"
+        grounding_backend = "agy_native_websearch"
+        grounding_failure_class = "agy_web_grounding_no_citations"
+
     return {
         "grounding_actor": "antigravity_cli",
-        "grounding_backend": "agy_native_websearch" if urls else "none",
-        "grounding_status": "grounded" if urls else "attempted_no_citations",
-        "web_tool_call_count": 1 if urls else 0,
+        "grounding_backend": grounding_backend,
+        "grounding_status": grounding_status,
+        "web_tool_call_count": web_tool_call_count,
         "search_query_count": 1,
-        "url_citation_count": len(urls),
-        "citation_evidence": [{"url": url, "title": None} for url in urls],
-        "grounding_transcript_evidence": [
-            {
-                "source_kind": "agy_stdout_or_artifact_excerpt",
-                "excerpt": (stdout or "")[:500],
-                "sha256": hashlib.sha256((stdout or "").encode("utf-8")).hexdigest(),
-            }
-        ],
+        "url_citation_count": url_citation_count,
+        "citation_evidence": citation_evidence,
+        "grounding_transcript_evidence": transcript_evidence,
         "grounding_failure_class": grounding_failure_class,
         "raw_transcript_included": False,
         "raw_credential_included": False,
         "repo_absolute_path_included": False,
-        "redaction_status": "checked_no_credential_pattern",
+        "redaction_status": "checked_no_secret_pattern",
         "parsed_evidence": parsed,
     }
 
@@ -1705,23 +1896,37 @@ def _normalize_agy_result(
         else None
     )
 
+    top_level_ok = True
+    top_level_failure_class: str | None = None
+    top_level_failure_reason: str | None = None
+    if grounded_research_evidence is not None:
+        nested_failure_class = grounded_research_evidence.get("grounding_failure_class")
+        if nested_failure_class:
+            # Issue #1266 Blocker 2: nested grounding_failure_class must not be masked by a
+            # top-level ok=True. fail-closed propagates to the outer delegation_result/v1.
+            top_level_ok = False
+            top_level_failure_class = nested_failure_class
+            top_level_failure_reason = (
+                f"{nested_failure_class}: AGY grounded_research fail-closed evidence check failed"
+            )
+
     return {
         "schema": "delegation_result/v1",
         "transport": "agy",
         "provider": "agy",
         "safety_mode": "degraded_wrapper_only",
-        "ok": True,
+        "ok": top_level_ok,
         "requested_model": requested_model,
         "actual_model": "agy-default",
         "tool_profile": tool_profile,
         "exit_code": 0,
-        "result_surface": _build_result_surface(ok=True, response_text=stdout),
+        "result_surface": _build_result_surface(ok=top_level_ok, response_text=stdout),
         "response_text": stdout,
         "stats": None,
         "stderr": stderr_text or None,
         "warnings": warnings,
-        "failure_reason": None,
-        "failure_class": None,
+        "failure_reason": top_level_failure_reason,
+        "failure_class": top_level_failure_class,
         "raw_command": _build_agy_raw_command(""),
         "grounded_research_evidence": grounded_research_evidence,
         "model_chain": [],

@@ -164,11 +164,17 @@ def test_ac6_missing_provider_defaults_to_gemini() -> None:
 
 
 def test_ac7_agy_grounded_research_supported() -> None:
-    """AC7: provider=agy + grounded_research is supported and returns websearch evidence."""
+    """AC7: provider=agy + grounded_research is supported and returns websearch evidence.
+
+    Success requires a machine-verifiable `tool_calls` trace with a recognized web tool
+    name (e.g. `web_search`) in addition to a structured citation — a bare URL string is
+    not sufficient (Issue #1266 Blocker 1).
+    """
     captured_timeout: dict[str, int | None] = {"value": None}
     grounded_output = (
         "Response from AGY.\n"
-        '{"grounding":{"queries":["AGY WebSearch"],"sources":[{"url":"https://example.com","title":"example"}]}}'
+        '{"grounding":{"queries":["AGY WebSearch"],"sources":[{"url":"https://example.com","title":"example"}]},'
+        '"tool_calls":[{"name":"web_search"}]}'
     )
 
     def _run_agy(prompt: str, timeout_sec: int = rgh.DEFAULT_TIMEOUT_SEC) -> subprocess.CompletedProcess:
@@ -179,6 +185,7 @@ def test_ac7_agy_grounded_research_supported() -> None:
         result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
 
     assert result["ok"] is True
+    assert result["failure_class"] is None
     assert result["provider"] == "agy"
     assert captured_timeout["value"] == 300
     assert result["grounded_research_evidence"] is not None
@@ -192,25 +199,30 @@ def test_ac7_agy_grounded_research_supported() -> None:
     assert evidence["parsed_evidence"]["data"].get("grounding") == expected_grounding
     assert result["grounded_research_evidence"]["grounding_actor"] == "antigravity_cli"
     assert result["grounded_research_evidence"]["grounding_backend"] == "agy_native_websearch"
+    assert result["grounded_research_evidence"]["grounding_status"] == "grounded"
     assert result["grounded_research_evidence"]["web_tool_call_count"] == 1
     assert result["grounded_research_evidence"]["url_citation_count"] == 1
 
 
 def test_agy_grounded_research_no_citation_fail_closed() -> None:
-    """provider=agy + grounded_research without URL citations is explicit fail-closed metadata."""
+    """provider=agy + grounded_research without a tool-call trace is fail-closed at both
+    nested evidence and top-level result (Issue #1266 Blocker 1 / Blocker 2)."""
     result = rgh._normalize_agy_result(
         _make_completed(0, stdout="Grounded answer without a citation URL."),
         tool_profile="grounded_research",
         requested_model=None,
     )
     evidence = result["grounded_research_evidence"]
-    assert evidence["grounding_status"] == "attempted_no_citations"
-    assert evidence["grounding_failure_class"] == "agy_web_grounding_no_citations"
+    assert evidence["grounding_status"] == "attempted_no_web_tool_call"
+    assert evidence["grounding_failure_class"] == "agy_web_grounding_tool_call_missing"
     assert evidence["url_citation_count"] == 0
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_web_grounding_tool_call_missing"
 
 
 def test_agy_grounded_research_no_web_tool_call_fail_closed() -> None:
-    """provider=agy + grounded_research exposes missing web tool calls as fail-closed metadata."""
+    """provider=agy + grounded_research exposes missing web tool calls as fail-closed metadata
+    at both nested evidence and top-level result (Issue #1266 Blocker 2)."""
     result = rgh._normalize_agy_result(
         _make_completed(0, stdout="No web tool call evidence."),
         tool_profile="grounded_research",
@@ -218,11 +230,104 @@ def test_agy_grounded_research_no_web_tool_call_fail_closed() -> None:
     )
     evidence = result["grounded_research_evidence"]
     assert evidence["web_tool_call_count"] == 0
-    assert evidence["grounding_failure_class"] == "agy_web_grounding_no_citations"
+    assert evidence["grounding_failure_class"] == "agy_web_grounding_tool_call_missing"
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_web_grounding_tool_call_missing"
+
+
+def test_agy_grounded_research_url_without_tool_trace_fail_closed() -> None:
+    """A bare URL string in stdout without a machine-verifiable tool-call trace must NOT be
+    treated as a WebSearch execution proof (Issue #1266 Blocker 1)."""
+    result = rgh._normalize_agy_result(
+        _make_completed(0, stdout="Here is a helpful link: https://example.com/article"),
+        tool_profile="grounded_research",
+        requested_model=None,
+    )
+    evidence = result["grounded_research_evidence"]
+    assert evidence["grounding_backend"] == "none"
+    assert evidence["grounding_status"] == "attempted_no_web_tool_call"
+    assert evidence["grounding_failure_class"] == "agy_web_grounding_tool_call_missing"
+    assert evidence["web_tool_call_count"] == 0
+    assert evidence["url_citation_count"] == 0
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_web_grounding_tool_call_missing"
+
+
+def test_agy_grounded_research_prompt_echo_url_not_counted_as_citation() -> None:
+    """A URL that only appears because AGY echoed the prompt back must not be counted as a
+    citation, and without a tool-call trace the result stays fail-closed (Issue #1266 Major 3
+    test #2)."""
+    prompt_echo_stdout = (
+        "You asked: Search for: latest reliable news and return exactly one source URL.\n"
+        "I cannot access the web right now."
+    )
+    result = rgh._normalize_agy_result(
+        _make_completed(0, stdout=prompt_echo_stdout),
+        tool_profile="grounded_research",
+        requested_model=None,
+    )
+    evidence = result["grounded_research_evidence"]
+    assert evidence["web_tool_call_count"] == 0
+    assert evidence["url_citation_count"] == 0
+    assert evidence["grounding_failure_class"] == "agy_web_grounding_tool_call_missing"
+    assert result["ok"] is False
+
+
+def test_agy_grounded_research_secret_like_token_redaction_fail_closed() -> None:
+    """A secret-like token in AGY stdout is fail-closed via agy_web_grounding_redaction_failed
+    and never emitted into the evidence excerpt (Issue #1266 Blocker 3 / Major 3 test #3)."""
+    leaking_stdout = "Debug token: ghp_" + ("a" * 36) + " while browsing https://example.com"
+    result = rgh._normalize_agy_result(
+        _make_completed(0, stdout=leaking_stdout),
+        tool_profile="grounded_research",
+        requested_model=None,
+    )
+    evidence = result["grounded_research_evidence"]
+    assert evidence["grounding_failure_class"] == "agy_web_grounding_redaction_failed"
+    assert evidence["redaction_status"] == "redaction_failed"
+    assert evidence["raw_credential_included"] is True
+    for entry in evidence["grounding_transcript_evidence"]:
+        assert "ghp_" + ("a" * 36) not in entry["excerpt"]
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_web_grounding_redaction_failed"
+
+
+def test_agy_grounded_research_repo_absolute_path_redaction_fail_closed() -> None:
+    """A repo absolute path in AGY stdout is fail-closed via agy_web_grounding_redaction_failed
+    (Issue #1266 Blocker 3 / Major 3 test #3)."""
+    repo_root = str(rgh._repo_root())
+    leaking_stdout = f"Reading file at {repo_root}/secret_notes.md"
+    result = rgh._normalize_agy_result(
+        _make_completed(0, stdout=leaking_stdout),
+        tool_profile="grounded_research",
+        requested_model=None,
+    )
+    evidence = result["grounded_research_evidence"]
+    assert evidence["grounding_failure_class"] == "agy_web_grounding_redaction_failed"
+    assert evidence["repo_absolute_path_included"] is True
+    for entry in evidence["grounding_transcript_evidence"]:
+        assert repo_root not in entry["excerpt"]
+    assert result["ok"] is False
+
+
+def test_agy_grounded_research_quota_exhausted_stderr_signal_fail_closed() -> None:
+    """RESOURCE_EXHAUSTED / HTTP 429 signals in stdout are classified as
+    agy_web_grounding_quota_exhausted, not a generic no-citation failure (Issue #1266 Major 1 /
+    Major 3 test #4)."""
+    result = rgh._normalize_agy_result(
+        _make_completed(0, stdout="RESOURCE_EXHAUSTED: Individual quota reached for WebSearch tool."),
+        tool_profile="grounded_research",
+        requested_model=None,
+    )
+    evidence = result["grounded_research_evidence"]
+    assert evidence["grounding_failure_class"] == "agy_web_grounding_quota_exhausted"
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_web_grounding_quota_exhausted"
 
 
 def test_agy_grounded_research_capability_missing_fail_closed() -> None:
-    """provider=agy + grounded_research keeps capability-missing evidence non-grounded."""
+    """provider=agy + grounded_research keeps capability-missing evidence non-grounded at both
+    nested evidence and top-level result (Issue #1266 Blocker 2)."""
     result = rgh._normalize_agy_result(
         _make_completed(0, stdout="WebSearch capability unavailable."),
         tool_profile="grounded_research",
@@ -230,22 +335,29 @@ def test_agy_grounded_research_capability_missing_fail_closed() -> None:
     )
     evidence = result["grounded_research_evidence"]
     assert evidence["grounding_backend"] == "none"
-    assert evidence["grounding_failure_class"] == "agy_web_grounding_no_citations"
+    assert evidence["grounding_failure_class"] == "agy_web_grounding_tool_call_missing"
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_web_grounding_tool_call_missing"
 
 
 def test_agy_grounded_research_quota_exhausted_fail_closed() -> None:
-    """provider=agy + grounded_research can carry quota failure text without claiming grounded success."""
+    """provider=agy + grounded_research classifies quota exhaustion text as
+    agy_web_grounding_quota_exhausted (not a generic no-citation failure), fail-closed at both
+    nested evidence and top-level result (Issue #1266 Major 1 / Blocker 2)."""
     result = rgh._normalize_agy_result(
         _make_completed(0, stdout="quota exhausted before WebSearch citation generation."),
         tool_profile="grounded_research",
         requested_model=None,
     )
     evidence = result["grounded_research_evidence"]
-    assert evidence["grounding_failure_class"] == "agy_web_grounding_no_citations"
+    assert evidence["grounding_failure_class"] == "agy_web_grounding_quota_exhausted"
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_web_grounding_quota_exhausted"
 
 
 def test_agy_grounded_research_redacts_evidence_envelope() -> None:
-    """agy_grounded_research_redaction_status: evidence envelope excludes raw transcript and credentials."""
+    """agy_grounded_research_redaction_status: evidence envelope excludes raw transcript and
+    credentials, using the contract's checked_no_secret_pattern literal (Issue #1266 Blocker 3)."""
     result = rgh._normalize_agy_result(
         _make_completed(0, stdout="Source https://example.com"),
         tool_profile="grounded_research",
@@ -255,7 +367,7 @@ def test_agy_grounded_research_redacts_evidence_envelope() -> None:
     assert evidence["raw_transcript_included"] is False
     assert evidence["raw_credential_included"] is False
     assert evidence["repo_absolute_path_included"] is False
-    assert evidence["redaction_status"] == "checked_no_credential_pattern"
+    assert evidence["redaction_status"] == "checked_no_secret_pattern"
     failure_class = evidence["grounding_failure_class"]
     if failure_class:
         assert "agy_web_grounding_parse_error" not in failure_class

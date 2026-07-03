@@ -2,7 +2,7 @@
 
 Issue: `#1266`（対象 Issue）
 Provider/profile: `provider=agy + tool_profile=grounded_research`（プロバイダ / プロファイル）
-Captured at: `2026-07-03T15:43:xxZ`（取得日時）
+Captured at: `2026-07-03T17:40:13Z`（取得日時）
 
 ## Command（実行コマンド）
 
@@ -21,27 +21,22 @@ agy_web_grounding_evidence_v1:
   command_exit_code: 0
   web_tool_call_count: 1
   search_query_count: 1
-  url_citation_count: 3
+  url_citation_count: 1
   search_queries:
-    - "latest reliable updates on web sources"
+    - "Search for: latest reliable news and return exactly one source URL."
   citations:
-    - url: "https://www.reuters.com/fact-check/"
-      title: "Reuters Fact Check"
-      cited_text_snippet: "reliable source URL returned by AGY bounded probe"
-    - url: "https://apnews.com/hub/ap-fact-check"
-      title: "Associated Press Fact Check"
-      cited_text_snippet: "reliable source URL returned by AGY bounded probe"
-    - url: "https://toolbox.google.com/factcheck/explorer"
-      title: "Google Fact Check Explorer"
-      cited_text_snippet: "reliable source URL returned by AGY bounded probe"
+    - url: "https://www.reuters.com"
+      title: null
+      cited_text_snippet: null
   transcript_evidence:
     - source_kind: agy_stdout_or_artifact_excerpt
-      excerpt: "Here are three reliable source URLs for finding the latest verified updates and fact-checks on web sources"
-      sha256: "captured_in_preflight_stdout_sample"
+      excerpt: "https://www.reuters.com  ***  ### Summary of Work * **Search Execution**: Queried the web for reliable news sources, identifying Reuters as a highly-rated global wire service. * **Result**: Returned the exact homepage URL for Reuters."
+      sha256: "ac8223645845b1d798b16653e918b35a550a652a554ace138c8e4c59d1100aa6"
   redaction_status: checked_no_secret_pattern
   raw_transcript_included: false
   raw_credential_included: false
   repo_absolute_path_included: false
+  failure_class: null
 ```
 
 ## Boundary Claim（境界主張）
