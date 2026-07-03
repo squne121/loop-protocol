@@ -214,9 +214,12 @@ def test_agy_grounded_research_forbids_gemini_google_search() -> None:
     tool constructed anywhere in run_gemini_headless.py; the only grounding
     surface for provider=agy is agy's own native WebSearch via ``_run_agy``.
     """
+    # Includes a machine-verifiable tool_calls trace (Issue #1266 Blocker 1) so this AC4 test's
+    # ok=True assertion reflects a genuine grounded result, not a bare URL scan.
     grounded_output = (
         "Response from AGY.\n"
-        '{"grounding":{"queries":["AGY WebSearch"],"sources":[{"url":"https://example.com","title":"example"}]}}'
+        '{"grounding":{"queries":["AGY WebSearch"],"sources":[{"url":"https://example.com","title":"example"}]},'
+        '"tool_calls":[{"name":"web_search"}]}'
     )
     completed = _make_completed(0, stdout=grounded_output)
     with patch.object(rgh, "_run_agy", return_value=completed) as mock_agy, patch.object(
