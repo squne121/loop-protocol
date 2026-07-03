@@ -70,6 +70,7 @@ REASON_RTK_HELP_COMMAND = "rtk_help_command"
 REASON_RTK_PROXY = "rtk_proxy_requires_review"
 REASON_INLINE_OVERRIDE = "inline_env_override_not_allowed"
 REASON_DETERMINISTIC_CHECKER = "deterministic_checker_command"
+REASON_CONTROLLED_SKILL_MUTATION_EXECUTOR = "controlled_skill_mutation_executor"
 REASON_GITHUB_REMOTE_OPS = "github_remote_ops_command"
 REASON_GH_MUTATION = "gh_mutation_denied"
 REASON_WORKTREE_BOOTSTRAP_EXECUTOR = "worktree_bootstrap_executor_command"
@@ -99,6 +100,41 @@ except Exception:  # pragma: no cover - defensive fail-closed
         return False
 
     _CSM_POLICY_AVAILABLE = False
+
+# ─── Shared PreToolUse fast-path classifier (Issue #1289) ────────────────────
+# Shared library, NOT an independent PreToolUse hook. Used only to enrich the
+# telemetry payload with a bounded fast-path classification; never changes the
+# allow/block decision or reason_code of this guard (AC1/AC2/AC6).
+#
+# Import note: pretool_fastpath_classifier.py imports is_readonly_command /
+# _parse_gh_api_command back from THIS module (they are defined further below
+# in this file). If this module is imported first (e.g. `import
+# local_main_branch_guard` from a caller, before anything imports the
+# classifier), a top-level `import pretool_fastpath_classifier` here would
+# create a circular import that reaches back into a not-yet-fully-initialized
+# local_main_branch_guard module and fails to resolve those two names,
+# permanently latching _FASTPATH_AVAILABLE = False for the whole process. To
+# avoid this ordering hazard, the classifier is imported lazily on first use
+# inside _compute_fastpath() instead of at module load time.
+_fastpath: Any = None
+_FASTPATH_AVAILABLE: bool | None = None  # None = not yet attempted
+
+
+def _ensure_fastpath_imported() -> bool:
+    """Lazily import pretool_fastpath_classifier on first use. Safe to call
+    regardless of import order (Issue #1289 fix — see note above)."""
+    global _fastpath, _FASTPATH_AVAILABLE
+    if _FASTPATH_AVAILABLE is not None:
+        return _FASTPATH_AVAILABLE
+    try:
+        import pretool_fastpath_classifier as _fastpath_module
+
+        _fastpath = _fastpath_module
+        _FASTPATH_AVAILABLE = True
+    except Exception:  # pragma: no cover - defensive fail-closed
+        _fastpath = None
+        _FASTPATH_AVAILABLE = False
+    return _FASTPATH_AVAILABLE
 
 # ─── Worktree bootstrap executor policy (Issue #1209) ────────────────────────
 try:
@@ -1497,6 +1533,24 @@ def evaluate(
     wrapper = None
     inner_argv_redacted: list[str] | None = None
     current_branch: str | None = None
+    _fastpath_cache: dict[str, Any] | None | bool = False  # False = not computed yet
+
+    def _compute_fastpath() -> dict[str, Any] | None:
+        # Issue #1289: fastpath is a bounded telemetry enrichment only — it
+        # NEVER influences status/reason_code and is best-effort (never raises).
+        nonlocal _fastpath_cache
+        if _fastpath_cache is not False:
+            return _fastpath_cache  # type: ignore[return-value]
+        if not _ensure_fastpath_imported():
+            _fastpath_cache = None
+            return None
+        try:
+            root = _resolve_project_root(cwd) or cwd
+            result = _fastpath.classify(cmd, cwd, root)
+            _fastpath_cache = result.to_telemetry_dict()
+        except Exception:  # pragma: no cover - defensive fail-open telemetry
+            _fastpath_cache = None
+        return _fastpath_cache
 
     # Helper to emit canonicalized result dictionaries.
     def _emit(
@@ -1510,7 +1564,7 @@ def evaluate(
         argv_tokens: list[str] | None = None,
         inner_tokens: list[str] | None = None,
     ) -> dict[str, Any]:
-        return _result(
+        res = _result(
             status=status,
             reason_code=reason_code,
             current_branch=current_branch,
@@ -1526,6 +1580,8 @@ def evaluate(
             event_kind=event_kind,
             decision_source=local_rule_id or reason_code,
         )
+        res["fastpath"] = _compute_fastpath()
+        return res
 
     # Step 1: Check if we are in local root context
     if not is_local_root_context(cwd):
@@ -2061,7 +2117,7 @@ def evaluate(
     if _CSM_POLICY_AVAILABLE and _csm_exec_command(normalized_cmd, project_root or ""):
         return _emit(
             status="allow",
-            reason_code=REASON_DETERMINISTIC_CHECKER,
+            reason_code=REASON_CONTROLLED_SKILL_MUTATION_EXECUTOR,
             target_branch=None,
             target_branch_kind=None,
             local_parser_stage="controlled_skill_mutation",
