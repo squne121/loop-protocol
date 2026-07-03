@@ -801,7 +801,8 @@ def test_pytest_exit5_no_tests_collected_hard_block():
         and r["decision"] == "blocked"
         for r in results
     )
-    assert found, f"Expected vc_no_tests_collected/blocked. Got: {[r['category'] + '/' + r['decision'] for r in results]}"
+    got = [r["category"] + "/" + r["decision"] for r in results]
+    assert found, f"Expected vc_no_tests_collected/blocked. Got: {got}"
 
 
 def test_pytest_exit4_usage_error_not_expected():
