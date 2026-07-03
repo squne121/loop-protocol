@@ -789,7 +789,7 @@ def test_pytest_exit5_no_tests_collected_hard_block():
     always classifies exit 5 as vc_no_tests_collected/blocked so authors are
     forced to rewrite the VC into canonical missing-file node-id form
     instead of relying on -k/path selectors that collect zero tests."""
-    fixture = Path(__file__).parent / "fixtures" / "pytest_exit5_no_tests.md"
+    fixture = Path(__file__).parent.parent.parent / "tests" / "fixtures" / "pytest_exit5_no_tests.md"
     data = run_preflight(str(fixture))
 
     results = data["results"]
