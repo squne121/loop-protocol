@@ -454,16 +454,23 @@ class AllowedPathsGateEvaluator:
             raise RuntimeError(f"git diff failed: {exc.stderr}") from exc
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
-    def get_changed_file_records_from_git(self) -> List[ChangedFileRecord]:
-        """Deterministic local fallback: `git diff --name-status -M -z`.
+    def get_rename_aware_status_map_from_git(self) -> Dict[str, Tuple[str, Optional[str]]]:
+        """Best-effort rename/status enrichment: `git diff --name-status -M -z`.
 
         `-z` avoids newline/tab ambiguity in paths (security-sensitive gate).
         `-M` enables rename detection so R* records carry both old and new
-        paths, which get_changed_file_records() audits as
-        (filename, previous_filename) pairs.
+        paths. Returns a mapping of `path -> (status, previous_path)`.
+
+        This is deliberately best-effort (empty dict on failure): it is used
+        to *enrich* the authoritative file list from
+        `get_changed_files_from_git()` with rename/status metadata, not as
+        the sole source of truth for which files changed. Both calls use the
+        same validated diff range, so in practice they succeed or fail
+        together; a failure here degrades rename detection gracefully
+        instead of forcing the whole gate to `indeterminate`.
         """
         if not self.validated_diff_base_sha:
-            raise RuntimeError("validated diff base SHA is unavailable")
+            return {}
         try:
             result = subprocess.run(
                 [
@@ -478,9 +485,41 @@ class AllowedPathsGateEvaluator:
                 text=True,
                 check=True,
             )
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(f"git diff failed: {exc.stderr}") from exc
-        return parse_git_diff_name_status_z(result.stdout, source=SOURCE_GIT_NAME_STATUS_Z)
+        except subprocess.CalledProcessError:
+            return {}
+        try:
+            records = parse_git_diff_name_status_z(result.stdout, source=SOURCE_GIT_NAME_STATUS_Z)
+        except ValueError:
+            return {}
+        return {record.path: (record.status, record.previous_path) for record in records}
+
+    def get_changed_file_records_from_git(self) -> List[ChangedFileRecord]:
+        """Deterministic local fallback, built on top of the authoritative
+        post-image file list from `get_changed_files_from_git()` (kept for
+        external/backward compatibility -- callers/tests may override that
+        method), enriched with rename/status metadata via
+        `get_rename_aware_status_map_from_git()` when available.
+
+        Files with no rename/status metadata are treated as `modified`
+        with no previous_path -- accurate for the plain-list backward
+        compatibility case (Issue #1300 follow-up), since a bare filename
+        list carries no rename information to begin with.
+        """
+        filenames = self.get_changed_files_from_git()
+        status_map = self.get_rename_aware_status_map_from_git()
+        records: List[ChangedFileRecord] = []
+        for path in filenames:
+            status, previous_path = status_map.get(path, ("modified", None))
+            records.append(
+                ChangedFileRecord(
+                    path=path,
+                    status=status,
+                    previous_path=previous_path,
+                    source=SOURCE_GIT_NAME_STATUS_Z,
+                    provenance_complete=True,
+                )
+            )
+        return records
 
     def get_changed_file_records_from_pr_files_api(self) -> List[ChangedFileRecord]:
         """Preferred oracle: GitHub PR files API records (external input).
