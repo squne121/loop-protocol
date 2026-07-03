@@ -157,6 +157,12 @@ snapshot freshness 用の `contract_fingerprint.base_sha_at_snapshot` と、loca
 
 `indeterminate/fail_closed` は merge-blocking 状態として扱う。
 
+changed files source hierarchy は `github_pull_request_files_api` / `gh_pr_diff_name_only` を preferred oracle、
+`git_diff_current_merge_base_head` を deterministic local fallback、`git_diff_snapshot_base_head` を禁止経路とする。
+local fallback は `current_base_sha` と `head_sha` から evaluator 内で `git merge-base` を検証できた場合だけ
+`git_diff_current_merge_base_head` を名乗る。`LOOP_VERDICT_V2.allowed_paths_gate` consumer への保証は script output の
+provenance に限り、verdict schema 自体が詳細 provenance を直接 carry するとまでは主張しない。
+
 ## Output Constraint（OUTPUT_BUDGET_V1 出力制約）
 
 出力上限は `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` を遵守。

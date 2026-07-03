@@ -18,6 +18,7 @@ BASE_ARGS = {
     "pr_number": 123,
     "base_ref": "main",
     "base_sha_at_snapshot": "abc123",
+    "current_base_sha": "current_base_sha",
     "diff_base_sha": "abc123",
     "head_sha": "def456",
     "reviewed_head_sha": "def456",
@@ -30,6 +31,8 @@ BASE_ARGS = {
 
 
 def make_evaluator(**overrides):
+    stub_merge_base = overrides.pop("stub_merge_base", True)
+    computed_merge_base_sha = overrides.pop("computed_merge_base_sha", None)
     args = dict(BASE_ARGS)
     args.update(overrides)
     if args.get("expected_contract_fingerprint") == "SELF":
@@ -38,7 +41,12 @@ def make_evaluator(**overrides):
         snapshot_args["expected_contract_fingerprint"] = None
         snapshot = AllowedPathsGateEvaluator(**snapshot_args)
         args["expected_contract_fingerprint"] = snapshot.compute_contract_fingerprint()
-    return AllowedPathsGateEvaluator(**args)
+    evaluator = AllowedPathsGateEvaluator(**args)
+    if stub_merge_base:
+        evaluator.compute_current_merge_base_sha = lambda: (
+            computed_merge_base_sha or args["diff_base_sha"]
+        )
+    return evaluator
 
 
 class TestAllowedPathsMatcher:
@@ -116,6 +124,7 @@ class TestAllowedPathsMatcher:
             "pr_number": 1,
             "base_ref": "main",
             "base_sha_at_snapshot": "abc",
+            "current_base_sha": "current_base",
             "diff_base_sha": "abc",
             "head_sha": "def",
             "reviewed_head_sha": "def",
@@ -203,6 +212,21 @@ class TestHeadShaBinding:
         assert result.changed_files_source == "git_diff_current_merge_base_head"
         assert result.diff_base_sha == "abc123"
         assert result.base_sha == "abc123"
+
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
+    def test_diff_base_sha_must_equal_current_merge_base(self, mock_get_changed_files):
+        mock_get_changed_files.return_value = ["src/main.ts"]
+        evaluator = make_evaluator(
+            diff_base_sha="provided_diff_base",
+            computed_merge_base_sha="computed_merge_base",
+            expected_contract_fingerprint="SELF",
+        )
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.INDETERMINATE.value
+        assert result.changed_files_source == "git_diff_unvalidated_diff_base_head"
+        assert "provided=provided_diff_base" in result.reason
+        assert "computed=computed_merge_base" in result.reason
+        mock_get_changed_files.assert_not_called()
 
 
 class TestAllowedPathsValidation:
@@ -317,6 +341,22 @@ class TestAllowedPathsValidation:
         assert result.changed_files_source == "git_diff_current_merge_base_head"
 
     @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
+    def test_changed_files_source_does_not_claim_current_merge_base_when_unvalidated(
+        self,
+        mock_get_changed_files,
+    ):
+        mock_get_changed_files.return_value = ["src/main.ts"]
+        evaluator = make_evaluator(
+            diff_base_sha="provided_diff_base",
+            computed_merge_base_sha="computed_merge_base",
+            expected_contract_fingerprint="SELF",
+        )
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.INDETERMINATE.value
+        assert result.changed_files_source == "git_diff_unvalidated_diff_base_head"
+        mock_get_changed_files.assert_not_called()
+
+    @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
     def test_result_schema_includes_diff_base_sha_and_snapshot_fingerprint(self, mock_get_changed_files):
         mock_get_changed_files.return_value = ["src/main.ts"]
         evaluator = make_evaluator(
@@ -378,6 +418,7 @@ def _create_update_branch_repo(tmp_path: Path) -> dict[str, str | Path]:
     return {
         "repo": repo,
         "base_sha_at_snapshot": base_sha_at_snapshot,
+        "current_base_sha": current_base_tip,
         "diff_base_sha": _git(repo, "merge-base", current_base_tip, head_sha),
         "head_sha": head_sha,
         "reviewed_head_sha": head_sha,
@@ -390,11 +431,13 @@ class TestUpdateBranchGitDag:
         monkeypatch.chdir(fixture["repo"])
         evaluator = make_evaluator(
             base_sha_at_snapshot=fixture["base_sha_at_snapshot"],
+            current_base_sha=fixture["current_base_sha"],
             diff_base_sha=fixture["diff_base_sha"],
             head_sha=fixture["head_sha"],
             reviewed_head_sha=fixture["reviewed_head_sha"],
             allowed_paths=["allowed/**"],
             expected_contract_fingerprint="SELF",
+            stub_merge_base=False,
         )
         result = evaluator.evaluate()
         assert result.status == GateStatus.OK.value
@@ -410,15 +453,35 @@ class TestUpdateBranchGitDag:
         monkeypatch.chdir(repo)
         evaluator = make_evaluator(
             base_sha_at_snapshot=fixture["base_sha_at_snapshot"],
-            diff_base_sha=_git(repo, "merge-base", fixture["diff_base_sha"], head_sha),
+            current_base_sha=fixture["current_base_sha"],
+            diff_base_sha=_git(repo, "merge-base", fixture["current_base_sha"], head_sha),
             head_sha=head_sha,
             reviewed_head_sha=head_sha,
             allowed_paths=["allowed/**"],
             expected_contract_fingerprint="SELF",
+            stub_merge_base=False,
         )
         result = evaluator.evaluate()
         assert result.status == GateStatus.FAIL_CLOSED.value
         assert any(item["file"] == "forbidden/violation.txt" for item in result.violations)
+
+    def test_stale_snapshot_base_as_diff_base_is_rejected_or_indeterminate(self, tmp_path, monkeypatch):
+        fixture = _create_update_branch_repo(tmp_path)
+        monkeypatch.chdir(fixture["repo"])
+        evaluator = make_evaluator(
+            base_sha_at_snapshot=fixture["base_sha_at_snapshot"],
+            current_base_sha=fixture["current_base_sha"],
+            diff_base_sha=fixture["base_sha_at_snapshot"],
+            head_sha=fixture["head_sha"],
+            reviewed_head_sha=fixture["reviewed_head_sha"],
+            allowed_paths=["allowed/**"],
+            expected_contract_fingerprint="SELF",
+            stub_merge_base=False,
+        )
+        result = evaluator.evaluate()
+        assert result.status == GateStatus.INDETERMINATE.value
+        assert result.changed_files_source == "git_diff_unvalidated_diff_base_head"
+        assert "does not match current merge-base" in result.reason
 
 
 class TestSingleSourceOfTruth:

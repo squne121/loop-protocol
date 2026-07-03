@@ -41,7 +41,7 @@ class ExecutionContext:
 
     worktree_root: str
     generated_at: str
-    tool_version: str = "1.3.0"
+    tool_version: str = "1.4.0"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -78,7 +78,7 @@ class AllowedPathsGateResult:
     base_sha: str = ""
     head_sha: str = ""
     reviewed_head_sha: str = ""
-    changed_files_source: str = "git_diff_current_merge_base_head"
+    changed_files_source: str = "git_diff_unvalidated_diff_base_head"
     allowed_paths_source: str = ""
     changed_files_count: int = 0
     changed_files: List[str] = field(default_factory=list)
@@ -221,9 +221,9 @@ class AllowedPathsGateEvaluator:
         *,
         pr_number: int,
         base_ref: str,
-        base_sha_at_snapshot: Optional[str] = None,
+        base_sha_at_snapshot: str,
+        current_base_sha: str,
         diff_base_sha: Optional[str] = None,
-        base_sha: Optional[str] = None,
         head_sha: str,
         reviewed_head_sha: str,
         allowed_paths: List[str],
@@ -233,19 +233,11 @@ class AllowedPathsGateEvaluator:
         expected_contract_fingerprint: Optional[Dict[str, Any]],
         issue_number: int = 0,
     ):
-        # Backward-compatible constructor aliasing for older tests/callers that
-        # still pass only `base_sha`. New code should pass both explicit fields.
-        resolved_diff_base_sha = diff_base_sha or base_sha
-        resolved_base_sha_at_snapshot = base_sha_at_snapshot or base_sha
-        if not resolved_diff_base_sha:
-            raise TypeError("diff_base_sha is required (or base_sha as a deprecated alias)")
-        if not resolved_base_sha_at_snapshot:
-            raise TypeError("base_sha_at_snapshot is required (or base_sha as a deprecated alias)")
-
         self.pr_number = pr_number
         self.base_ref = base_ref
-        self.base_sha_at_snapshot = resolved_base_sha_at_snapshot
-        self.diff_base_sha = resolved_diff_base_sha
+        self.base_sha_at_snapshot = base_sha_at_snapshot
+        self.current_base_sha = current_base_sha
+        self.diff_base_sha = diff_base_sha
         self.head_sha = head_sha
         self.reviewed_head_sha = reviewed_head_sha
         self.allowed_paths = allowed_paths
@@ -254,6 +246,7 @@ class AllowedPathsGateEvaluator:
         self.contract_source_id = contract_source_id
         self.expected_contract_fingerprint = expected_contract_fingerprint
         self.issue_number = issue_number
+        self.validated_diff_base_sha: Optional[str] = None
 
     def canonicalize_allowed_paths(self) -> List[str]:
         canonicalized: List[str] = []
@@ -284,10 +277,37 @@ class AllowedPathsGateEvaluator:
         )
         return json.loads(fingerprint.to_normalized_json())
 
-    def get_changed_files_from_git(self) -> List[str]:
+    def compute_current_merge_base_sha(self) -> str:
         try:
             result = subprocess.run(
-                ["git", "diff", "--name-only", f"{self.diff_base_sha}...{self.head_sha}"],
+                ["git", "merge-base", self.current_base_sha, self.head_sha],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(f"git merge-base failed: {exc.stderr}") from exc
+        merge_base_sha = result.stdout.strip()
+        if not merge_base_sha:
+            raise RuntimeError("git merge-base returned an empty SHA")
+        return merge_base_sha
+
+    def validate_diff_base_sha(self) -> str:
+        computed_diff_base_sha = self.compute_current_merge_base_sha()
+        if self.diff_base_sha and self.diff_base_sha != computed_diff_base_sha:
+            raise ValueError(
+                "diff_base_sha does not match current merge-base: "
+                f"provided={self.diff_base_sha} computed={computed_diff_base_sha}"
+            )
+        self.validated_diff_base_sha = computed_diff_base_sha
+        return computed_diff_base_sha
+
+    def get_changed_files_from_git(self) -> List[str]:
+        if not self.validated_diff_base_sha:
+            raise RuntimeError("validated diff base SHA is unavailable")
+        try:
+            result = subprocess.run(
+                ["git", "diff", "--name-only", f"{self.validated_diff_base_sha}...{self.head_sha}"],
                 capture_output=True,
                 text=True,
                 check=True,
@@ -302,8 +322,6 @@ class AllowedPathsGateEvaluator:
             produced_at=now,
             pr_number=self.pr_number,
             base_ref=self.base_ref,
-            diff_base_sha=self.diff_base_sha,
-            base_sha=self.diff_base_sha,
             head_sha=self.head_sha,
             reviewed_head_sha=self.reviewed_head_sha,
         )
@@ -348,6 +366,18 @@ class AllowedPathsGateEvaluator:
             result.reason = "contract fingerprint diverged from snapshot (stale_snapshot, merge-blocking)"
             result.errors.append(result.reason)
             return result
+
+        try:
+            validated_diff_base_sha = self.validate_diff_base_sha()
+        except Exception as exc:
+            result.status = GateStatus.INDETERMINATE.value
+            result.reason = f"Failed to validate diff base: {exc}"
+            result.errors.append(result.reason)
+            return result
+
+        result.diff_base_sha = validated_diff_base_sha
+        result.base_sha = validated_diff_base_sha
+        result.changed_files_source = "git_diff_current_merge_base_head"
 
         try:
             changed_files = self.get_changed_files_from_git()
@@ -398,12 +428,13 @@ def main() -> None:
         help="Snapshot freshness binding SHA from the linked issue contract",
     )
     parser.add_argument(
-        "--diff-base-sha",
-        help="Changed-files diff base SHA for the local fallback (merge-base(current_base_tip, head_sha))",
+        "--current-base-sha",
+        required=True,
+        help="Current base branch tip SHA used to validate the local fallback merge-base",
     )
     parser.add_argument(
-        "--base-sha",
-        help="Deprecated alias for --diff-base-sha; retained for backward compatibility",
+        "--diff-base-sha",
+        help="Optional externally supplied merge-base SHA; must equal git merge-base(current_base_sha, head_sha)",
     )
     parser.add_argument("--head-sha", required=True, help="Current head SHA")
     parser.add_argument("--reviewed-head-sha", required=True, help="Head SHA at review time")
@@ -426,15 +457,12 @@ def main() -> None:
     parser.add_argument("--format", choices=["json", "yaml"], default="json", help="Output format")
     args = parser.parse_args()
 
-    diff_base_sha = args.diff_base_sha or args.base_sha
-    if not diff_base_sha:
-        parser.error("--diff-base-sha is required (or --base-sha as a deprecated alias)")
-
     evaluator = AllowedPathsGateEvaluator(
         pr_number=args.pr_number,
         base_ref=args.base_ref,
         base_sha_at_snapshot=args.base_sha_at_snapshot,
-        diff_base_sha=diff_base_sha,
+        current_base_sha=args.current_base_sha,
+        diff_base_sha=args.diff_base_sha,
         head_sha=args.head_sha,
         reviewed_head_sha=args.reviewed_head_sha,
         allowed_paths=args.allowed_paths,
