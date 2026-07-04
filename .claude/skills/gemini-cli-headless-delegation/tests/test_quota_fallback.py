@@ -148,10 +148,23 @@ def test_both_providers_exhausted_reports_provider_fallback_exhausted() -> None:
 
 
 @pytest.mark.parametrize(
-    "failure_class",
-    ["gh_auth_required", "request_schema_invalid", "github_research_command_denied", None],
+    ("failure_class", "expected_fallback_reason"),
+    [
+        ("gh_auth_required", "stop_if:non_retryable_failure_class:gh_auth_required"),
+        ("request_schema_invalid", "stop_if:non_retryable_failure_class:request_schema_invalid"),
+        (
+            "github_research_command_denied",
+            "stop_if:non_retryable_failure_class:github_research_command_denied",
+        ),
+        (None, "stop_if:non_retryable_failure_class:missing_failure_class"),
+    ],
 )
-def test_non_retryable_gemini_failure_does_not_fall_back(failure_class: str | None) -> None:
+def test_non_retryable_gemini_failure_does_not_fall_back(
+    failure_class: str | None, expected_fallback_reason: str
+) -> None:
+    """Issue #1270 fix_delta Blocker 3: a non-retryable failure on the FIRST
+    provider attempt must still surface a descriptive fallback_reason (never
+    a bare None, which would be indistinguishable from success)."""
     calls: list[str] = []
 
     def fake_run_delegation(request, request_path=None, _routing=None):
@@ -163,6 +176,7 @@ def test_non_retryable_gemini_failure_does_not_fall_back(failure_class: str | No
 
     assert calls == ["gemini"]
     assert result["selected_provider"] == "gemini"
+    assert result["fallback_reason"] == expected_fallback_reason
 
 
 def test_post_to_issue_url_stops_fallback_even_on_failure() -> None:
@@ -370,6 +384,158 @@ def _minimal_delegation_request(tmp_path: Path, **overrides) -> dict:
     }
     base.update(overrides)
     return base
+
+
+def test_non_retryable_first_provider_sets_stop_fallback_reason() -> None:
+    """Issue #1270 fix_delta Blocker 3 (dedicated regression, named per fix_delta
+    spec): the very first provider attempt failing with a non-retryable
+    failure_class must produce a descriptive fallback_reason, not None."""
+    calls: list[str] = []
+
+    def fake_run_delegation(request, request_path=None, _routing=None):
+        calls.append(request["provider"])
+        return _result(False, failure_class="auth_missing_or_expired")
+
+    with patch.object(rgh, "run_delegation", side_effect=fake_run_delegation):
+        result = rgh.provider_auto_dispatch(BASE_REQUEST)
+
+    assert calls == ["gemini"]
+    assert result["fallback_reason"] == "stop_if:non_retryable_failure_class:auth_missing_or_expired"
+    assert result["provider_attempts"][0]["stopped_by"] == result["fallback_reason"]
+
+
+def test_provider_attempts_include_failure_reason_exit_code_retryable_decision() -> None:
+    """Issue #1270 fix_delta Blocker 4: provider_attempts[] must carry enough
+    audit-trail detail (failure_reason, exit_code, retryable_for_provider_fallback,
+    model_chain, attempts_by_model, post_to_issue_url visibility) to
+    reconstruct the fallback decision without re-running anything."""
+
+    def fake_run_delegation(request, request_path=None, _routing=None):
+        return {
+            "schema": "delegation_result/v1",
+            "ok": False,
+            "failure_class": "model_chain_exhausted",
+            "failure_reason": "model_chain_exhausted: all models in chain failed with quota errors",
+            "exit_code": 1,
+            "model_downgrades": [{"from": "gemini-3-flash-preview", "to": "gemini-2.5-flash", "reason": "x"}],
+            "model_chain": ["gemini-3-flash-preview", "gemini-2.5-flash"],
+            "attempts_by_model": {"gemini-3-flash-preview": 3, "gemini-2.5-flash": 3},
+            "response_text": None,
+        }
+
+    with patch.object(rgh, "run_delegation", side_effect=fake_run_delegation):
+        result = rgh.provider_auto_dispatch(BASE_REQUEST)
+
+    gemini_attempt = result["provider_attempts"][0]
+    assert gemini_attempt["failure_reason"] == "model_chain_exhausted: all models in chain failed with quota errors"
+    assert gemini_attempt["exit_code"] == 1
+    assert gemini_attempt["retryable_for_provider_fallback"] is True
+    assert gemini_attempt["model_chain"] == ["gemini-3-flash-preview", "gemini-2.5-flash"]
+    assert gemini_attempt["attempts_by_model"] == {"gemini-3-flash-preview": 3, "gemini-2.5-flash": 3}
+    assert gemini_attempt["post_to_issue_url_requested"] is False
+    assert result["attempts_by_model"]["gemini-3-flash-preview"] >= 3
+
+
+def test_provider_auto_policy_yaml_and_python_constants_are_in_sync() -> None:
+    """Issue #1270 fix_delta Blocker 5: config/model_routing.yaml's
+    provider_auto_policy_v1 block must stay in sync with the Python constants
+    (PROVIDER_AUTO_*) that are the actual runtime enforcement. Covers every
+    key in the YAML block (runtime_order, setup_check_order,
+    eligible_profiles, retryable_failure_classes, stop_if, result_fields),
+    not just the subset previously checked."""
+    routing = rgh.load_model_routing()
+    policy = routing["provider_auto_policy_v1"]
+
+    assert tuple(policy["runtime_order"]) == rgh.PROVIDER_AUTO_RUNTIME_ORDER
+    assert set(policy["eligible_profiles"]) == rgh.PROVIDER_AUTO_ELIGIBLE_PROFILES
+    assert policy["schema_version"] == rgh.PROVIDER_AUTO_FALLBACK_POLICY_VERSION
+
+    for provider, classes in policy["retryable_failure_classes"].items():
+        assert set(classes) == rgh.PROVIDER_AUTO_RETRYABLE_FAILURE_CLASSES.get(provider), (
+            f"retryable_failure_classes mismatch for provider={provider!r}"
+        )
+    assert set(policy["retryable_failure_classes"]) == set(rgh.PROVIDER_AUTO_RETRYABLE_FAILURE_CLASSES)
+
+    # stop_if: compare against the named Python constant (source of truth),
+    # not a second hand-written literal.
+    assert set(policy["stop_if"]) == set(rgh.PROVIDER_AUTO_STOP_IF)
+
+    # result_fields: compare against the named Python constant, AND verify
+    # every field is actually attached to a real finalized provider="auto"
+    # result (both success and unsupported-profile paths).
+    assert set(policy["result_fields"]) == set(rgh.PROVIDER_AUTO_RESULT_FIELDS)
+
+    def fake_run_delegation(request, request_path=None, _routing=None):
+        return _result(True)
+
+    with patch.object(rgh, "run_delegation", side_effect=fake_run_delegation):
+        auto_result = rgh.provider_auto_dispatch(BASE_REQUEST)
+
+    for field in policy["result_fields"]:
+        assert field in auto_result, f"result_fields[{field!r}] missing from provider=auto result"
+
+
+def test_agy_permission_error_normalizes_to_taxonomy_class() -> None:
+    """Issue #1270 fix_delta Blocker 6: run_delegation()'s PermissionError
+    except-branch for provider=agy must normalize to the SAME
+    agy_permission_denied class that _classify_agy_failure() already uses
+    for stdout/stderr-detected 403/forbidden signals -- not the undocumented
+    agy_permission_error."""
+    module = rgh
+
+    def raise_permission_error(prompt, timeout_sec):
+        raise PermissionError("permission denied executing agy")
+
+    with patch.object(module, "_run_agy", side_effect=raise_permission_error):
+        result = module.run_delegation({
+            "schema": "delegation_request_v1",
+            "provider": "agy",
+            "tool_profile": "no_tools",
+            "prompt": "hello",
+        })
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_permission_denied"
+    # Must match the SAME class _classify_agy_failure() emits for stdout/stderr
+    # 403/forbidden signals (canonical, single class regardless of signal origin).
+    assert result["failure_class"] == module._classify_agy_failure(1, "", "permission denied: 403 forbidden")
+
+
+def test_post_to_issue_url_post_failure_does_not_fallback_but_is_visible() -> None:
+    """Issue #1270 fix_delta Major: provider=auto + post_to_issue_url +
+    first provider ok=True (Gemini succeeded) + post-processing (gh issue
+    comment) failure must:
+      1. NOT fall back to the second provider (idempotency guard -- a real
+         GitHub post attempt already happened).
+      2. Surface as ok=False (not silently ok=True with a hidden post
+         failure) while still keeping the failure visible via post_result /
+         post_failure_class.
+    """
+    calls: list[str] = []
+    request = dict(BASE_REQUEST, post_to_issue_url="https://github.com/o/r/issues/1")
+
+    def fake_run_delegation(req, request_path=None, _routing=None):
+        calls.append(req["provider"])
+        return {
+            "schema": "delegation_result/v1",
+            "ok": False,  # run_delegation() already flips ok False on post failure
+            "failure_class": "post_to_issue_url_failed",
+            "failure_reason": "post_to_issue_url: gh issue comment failed (exit 1)",
+            "post_result": "failed: some gh error",
+            "post_failure_class": "post_to_issue_url_failed",
+            "model_downgrades": [],
+            "response_text": "the gemini response",
+        }
+
+    with patch.object(rgh, "run_delegation", side_effect=fake_run_delegation):
+        result = rgh.provider_auto_dispatch(request)
+
+    assert calls == ["gemini"]
+    assert result["ok"] is False
+    assert result["post_result"] == "failed: some gh error"
+    assert result["post_failure_class"] == "post_to_issue_url_failed"
+    assert result["fallback_reason"] == "stop_if:request_has_post_to_issue_url"
+    assert result["provider_attempts"][0]["post_result"] == "failed: some gh error"
 
 
 def test_model_chain_exhausted_sets_top_level_failure_class(tmp_path: Path) -> None:

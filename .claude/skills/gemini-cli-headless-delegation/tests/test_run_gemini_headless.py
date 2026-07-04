@@ -653,8 +653,13 @@ def test_run_delegation_post_to_issue_failure_keeps_inline_result_surface(tmp_pa
 
     result = module.run_delegation(request, request_path=tmp_path / "request.json")
 
-    assert result["ok"] is True
+    # Issue #1270 fix_delta (Major): a Gemini success followed by a failed
+    # non-idempotent GitHub comment post must NOT surface as ok=True — the
+    # caller-visible contract covers the whole delegation, including any
+    # requested post-processing.
+    assert result["ok"] is False
     assert result["post_result"] == "failed: gh comment failed"
+    assert result["post_failure_class"] == "post_to_issue_url_failed"
     assert result["result_surface"]["summary"] == "Fallback summary"
     assert result["result_surface"]["primary_artifact_type"] == "inline_response_text"
     assert result["result_surface"]["primary_artifact"] == "response_text"
@@ -718,6 +723,132 @@ def test_model_capacity_exhausted_retries_and_fails(tmp_path, valid_request, mon
     assert result["ok"] is False
     assert call_count["n"] == module.RETRY_LIMIT + 1
     assert any("retryable capacity failure" in w for w in result["warnings"])
+
+
+def test_retry_budget_same_model_attempts_controls_gemini_calls(tmp_path, valid_request, monkeypatch):
+    """Issue #1270 fix_delta Blocker 1: retry_budget.same_model_attempts must
+    actually control how many times _run_gemini() is invoked for the same
+    model, instead of the hardcoded RETRY_LIMIT + 1."""
+    module = load_module()
+    call_count = {"n": 0}
+
+    class CapacityFailed:
+        returncode = 1
+        stdout = ""
+        stderr = "MODEL_CAPACITY_EXHAUSTED"
+
+    def mock_run_gemini(command, timeout_sec, prompt=None, cwd=None):
+        call_count["n"] += 1
+        return CapacityFailed()
+
+    monkeypatch.setattr(module, "_run_gemini", mock_run_gemini)
+    monkeypatch.setattr(module.time, "sleep", lambda _: None)
+
+    routing = {
+        "default_chain": ["gemini-3-flash-preview"],
+        "roles": {},
+        "providers": {
+            "gemini": {
+                "retry_budget": {
+                    "same_model_attempts": 1,
+                    "retryable_failure_classes": ["model_capacity_exhausted"],
+                }
+            }
+        },
+    }
+
+    result = module.run_delegation(valid_request, request_path=tmp_path / "request.json", _routing=routing)
+
+    assert result["ok"] is False
+    assert call_count["n"] == 1
+
+
+def test_retry_budget_backoff_values_control_sleep(tmp_path, valid_request, monkeypatch):
+    """Issue #1270 fix_delta Blocker 1: initial_backoff_seconds /
+    max_backoff_seconds from retry_budget must drive time.sleep(), not the
+    previous hardcoded min(2**attempt, 4)."""
+    module = load_module()
+
+    class CapacityFailed:
+        returncode = 1
+        stdout = ""
+        stderr = "MODEL_CAPACITY_EXHAUSTED"
+
+    def mock_run_gemini(command, timeout_sec, prompt=None, cwd=None):
+        return CapacityFailed()
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(module, "_run_gemini", mock_run_gemini)
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    routing = {
+        "default_chain": ["gemini-3-flash-preview"],
+        "roles": {},
+        "providers": {
+            "gemini": {
+                "retry_budget": {
+                    "same_model_attempts": 3,
+                    "initial_backoff_seconds": 10,
+                    "max_backoff_seconds": 15,
+                    "jitter": False,
+                    "retryable_failure_classes": ["model_capacity_exhausted"],
+                }
+            }
+        },
+    }
+
+    result = module.run_delegation(valid_request, request_path=tmp_path / "request.json", _routing=routing)
+
+    assert result["ok"] is False
+    # attempt 0 -> min(10 * 2**0, 15) = 10; attempt 1 -> min(10 * 2**1, 15) = 15 (clamped)
+    assert sleep_calls == [10, 15]
+
+
+def test_attempts_by_model_counts_every_gemini_invocation(tmp_path, valid_request, monkeypatch):
+    """Issue #1270 fix_delta Blocker 2: attempts_by_model must be a real,
+    measured count of every _run_gemini() invocation per model, not a
+    lower-bound estimate derived from model_downgrades."""
+    module = load_module()
+    call_count = {"n": 0}
+
+    class CapacityFailed:
+        returncode = 1
+        stdout = ""
+        stderr = "MODEL_CAPACITY_EXHAUSTED"
+
+    def mock_run_gemini(command, timeout_sec, prompt=None, cwd=None):
+        call_count["n"] += 1
+        return CapacityFailed()
+
+    monkeypatch.setattr(module, "_run_gemini", mock_run_gemini)
+    monkeypatch.setattr(module.time, "sleep", lambda _: None)
+
+    # request must NOT pin an explicit "model" -- resolve_model_chain()
+    # short-circuits to a single-entry chain when request["model"] is set,
+    # which would bypass the multi-model routing this test exercises.
+    request_without_explicit_model = dict(valid_request)
+    request_without_explicit_model.pop("model", None)
+
+    routing = {
+        "default_chain": ["model-a", "model-b"],
+        "roles": {},
+        "providers": {
+            "gemini": {
+                "retry_budget": {
+                    "same_model_attempts": 2,
+                    "retryable_failure_classes": ["model_capacity_exhausted"],
+                }
+            }
+        },
+    }
+
+    result = module.run_delegation(
+        request_without_explicit_model, request_path=tmp_path / "request.json", _routing=routing
+    )
+
+    assert result["ok"] is False
+    assert result["attempts_by_model"] == {"model-a": 2, "model-b": 2}
+    assert call_count["n"] == 4
 
 
 def test_missing_context_file_returns_not_ok(tmp_path):

@@ -51,7 +51,10 @@ roles:
 # authoritative enforcement lives in the Python constants of the same name
 # (PROVIDER_AUTO_*) in run_gemini_headless.py -- this YAML block is not
 # re-parsed at runtime, it exists so the policy is discoverable in docs/config
-# per the Issue #1270 Outcome. Keep both in sync when editing either.
+# per the Issue #1270 Outcome. Keep both in sync when editing either --
+# test_provider_auto_policy_yaml_and_python_constants_are_in_sync() in
+# tests/test_quota_fallback.py compares every key below against the Python
+# constants and fails closed on drift.
 #
 # setup_check_order (setup_check.py --provider auto) is agy-first and is a
 # SEPARATE policy from runtime_order below -- see references/model-routing.md
@@ -89,10 +92,11 @@ provider_auto_policy_v1:
     - attempts_by_model
   idempotency_guard: >-
     Provider fallback stops permanently once any provider attempt for a
-    request has reached (or would reach) idempotent post-processing --
-    concretely, request.post_to_issue_url is set. No later provider attempt
-    is made after that point, even if the attempt that reached
-    post-processing failed, to avoid duplicate GitHub comment posts.
+    request has reached (or would reach) non-idempotent post-processing --
+    concretely, request.post_to_issue_url is set (a `gh issue comment` post
+    is NOT idempotent; retrying it against a second provider would create a
+    duplicate comment). No later provider attempt is made after that point,
+    even if the attempt that reached post-processing failed.
 
 # providers.<name>.retry_budget (Issue #1270 AC2)
 #

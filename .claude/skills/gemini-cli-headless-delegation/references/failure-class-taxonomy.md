@@ -96,11 +96,13 @@ stdout / stderr の両方から判別する failure_class。`_normalize_agy_resu
 | `agy_capacity_exhausted` | AGY 側のモデル capacity 不足（`MODEL_CAPACITY_EXHAUSTED` / `overloaded` / `UNAVAILABLE`） | yes |
 | `agy_web_grounding_quota_exhausted` | grounded_research の web grounding quota 枯渇（`Individual quota reached` 等。既存 `preflight_agy.py` の `_QUOTA_EXHAUSTED_RE` と同じ検出対象を一般化） | yes |
 | `agy_auth_required` | AGY 認証未完了 / 失効 | no |
-| `agy_permission_denied` | AGY 権限不足（403 / forbidden） | no |
+| `agy_permission_denied` | AGY 権限不足（403 / forbidden、または `agy` exec 時の OS `PermissionError`。fix_delta Blocker 6: `run_delegation()` の `PermissionError` except 節は `_classify_agy_failure()` と同一のこのクラスへ正規化する） | no |
+| `agy_not_found` | `agy` バイナリが `PATH` に見つからない（`run_delegation()` の `FileNotFoundError` except 節。terminal / non-retryable — `cli_missing` の AGY 版に相当） | no |
 | `agy_timeout` | subprocess タイムアウト | no |
 | `agy_exit_nonzero` | non-zero exit だが既知の quota/auth/permission signal にマッチしない一般失敗 | no |
 | `agy_empty_stdout` | 非 CI 環境で exit 0 だが stdout が空 | no |
 | `agy_output_missing` | CI 環境で exit 0 だが stdout が空（`agy_empty_stdout` と同一原因、CI 判定のみ異なる。#1274: `warnings[0]` の leading token は必ず `failure_class` と一致させる） | no |
+| `agy_unexpected_error` | AGY 実行時の未分類例外（terminal / non-retryable） | no |
 
 ### provider_auto_policy_v1 fallback classes（フォールバック分類、Issue #1270）
 
@@ -351,6 +353,7 @@ quota_dimension:
     - rpm            # Requests Per Minute
     - tpm            # Tokens Per Minute
     - rpd            # Requests Per Day（枯渇時は retry_scope: next_model）
+    - spend          # 課金上限 / budget exceeded
     - model_capacity # モデル処理キャパシティ（capacity 系 429）
     - unknown        # 種別不明
 
@@ -431,7 +434,14 @@ classification_confidence:
 2. **backoff retry group**（Retryable）: exponential backoff retry 可。
    - 対象: `quota_or_rate_limited`, `model_capacity_exhausted`,
      `transient_api_error`, `network_error`, `client_subprocess_timeout`
-   - 既存実装: `RETRY_LIMIT = 2`、`time.sleep(min(2**attempt, 4))` で backoff
+   - 実装（Issue #1270 fix_delta Blocker 1）: `config/model_routing.yaml` の
+     `providers.gemini.retry_budget`（`get_retry_budget()`）が同一モデルの
+     試行回数（`same_model_attempts`）と backoff（`initial_backoff_seconds` /
+     `max_backoff_seconds` / `jitter`）を決定する。`RETRY_LIMIT` は
+     `retry_budget` 未設定時の default 生成にのみ使われるフォールバック定数。
+   - `retryable_failure_classes` が同一モデル retry の可否を決定する（
+     attempt 単位で `_classify_gemini_retry_failure_class()` が分類し、
+     このリストに含まれる場合のみ retry する）。
    - `quota_or_rate_limited` で `quota_dimension: rpd` の場合は `retry_scope: next_model`
    - quota / capacity exhaustion 時は model downgrade（`retry_scope: next_model`）
    - `retry_after_ms` が設定されている場合は API hint を優先する
