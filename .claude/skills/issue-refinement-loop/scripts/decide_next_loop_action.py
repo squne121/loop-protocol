@@ -238,17 +238,30 @@ def decide_next_action(
         scope_signal_guard_decision_v2: Optional SCOPE_SIGNAL_GUARD_DECISION_V2
             sidecar (#1090/#1323). NOT part of LOOP_STATE_V1 (loop_state.schema.json
             additionalProperties:false) -- passed as a separate argument, same
-            pattern as phase_state. When route == "contract_update_required",
-            this router returns NEXT_ACTION: proceed_with_contract_update
-            without touching termination_reason (loop stays open, Issue
-            contract update happens out-of-band, then refinement re-runs).
+            pattern as phase_state. When
+            scope_signal_guard_decision_v2.scope_delta_authority.route.action
+            == "contract_update_required" (the SCOPE_DELTA_AUTHORITY_V1 nested
+            route emitted by classify_scope_delta_authority() in
+            scope_signal_delta.py), this router returns
+            NEXT_ACTION: proceed_with_contract_update without touching
+            termination_reason (loop stays open, Issue contract update
+            happens out-of-band, then refinement re-runs).
+
+            NOTE (PR #1332 review fix): the top-level
+            scope_signal_guard_decision_v2["route"] field is a DIFFERENT,
+            pre-existing (#1090) enum (not_triggered / human_judgment_required
+            / invalid_scope_delta_approval / proceed_with_notes) used for the
+            ANCHOR_SCOPE_REFRAME_V1 lane split. It never takes the value
+            "contract_update_required" and must not be conflated with the
+            nested scope_delta_authority.route.action checked here.
 
     Returns:
         (status, next_action, commands, blockers, termination_cause_hint)
 
     Priority order:
         1. inconsistent_state — corrupt/contradictory state fields
-        2. proceed_with_contract_update — scope_signal_guard_decision_v2.route
+        2. proceed_with_contract_update —
+           scope_signal_guard_decision_v2.scope_delta_authority.route.action
            == contract_update_required (#1323, non-destructive branch)
         3. human_escalation  — max_iterations exceeded or hard stop signal
         4. routing on verdict
@@ -296,10 +309,24 @@ def decide_next_action(
     # Non-destructive: termination_reason is left untouched (loop keeps
     # running); this only redirects the immediate next step toward a
     # contract update + refinement re-run instead of human_escalation.
-    if (
-        isinstance(scope_signal_guard_decision_v2, dict)
-        and scope_signal_guard_decision_v2.get("route") == "contract_update_required"
-    ):
+    #
+    # PR #1332 review fix (P0): read the NESTED
+    # scope_delta_authority.route.action produced by
+    # classify_scope_delta_authority() in scope_signal_delta.py -- NOT the
+    # top-level scope_signal_guard_decision_v2["route"], which is a
+    # different, pre-existing (#1090) enum for the ANCHOR_SCOPE_REFRAME_V1
+    # lane split and never equals "contract_update_required".
+    _scope_delta_authority = (
+        scope_signal_guard_decision_v2.get("scope_delta_authority")
+        if isinstance(scope_signal_guard_decision_v2, dict)
+        else None
+    )
+    _authority_route_action = (
+        _scope_delta_authority.get("route", {}).get("action")
+        if isinstance(_scope_delta_authority, dict)
+        else None
+    )
+    if _authority_route_action == "contract_update_required":
         return (
             STATUS_PASS,
             ACTION_PROCEED_WITH_CONTRACT_UPDATE,

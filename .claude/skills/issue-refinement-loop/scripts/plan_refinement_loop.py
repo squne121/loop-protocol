@@ -1928,11 +1928,17 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
             if classify_scope_delta_authority is not None and known_context and (
                 "scope_delta_authority_evidence" in known_context
             ):
+                # PR #1332 review fix (P0/P1): expected_repo is now mandatory
+                # for classify_scope_delta_authority's URL/repo cross-check
+                # (AC16 hardening) -- reuse the same repo-derivation helper
+                # already used for the #1090 scope_delta_approval evidence
+                # path so cross-repo spoofed evidence fails closed here too.
                 scope_signal_guard_decision_v2["scope_delta_authority"] = classify_scope_delta_authority(
                     known_context.get("scope_delta_authority_evidence"),
                     triggered=_raw_triggered,
                     target_issue_number=issue_number,
                     base_issue_body_sha256=issue_body_sha256,
+                    expected_repo=_expected_repo_for_issue(issue, known_context),
                 )
 
         # Build output

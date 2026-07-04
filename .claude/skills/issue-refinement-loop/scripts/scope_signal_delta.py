@@ -513,6 +513,7 @@ REASON_CHANGES_EXTERNAL_SERVICE_BOUNDARY = "changes_external_service_boundary"
 REASON_DESTRUCTIVE_OR_NON_IDEMPOTENT_OPERATION = "destructive_or_non_idempotent_operation"
 REASON_AI_INFERRED_SCOPE_DELTA = "ai_inferred_scope_delta"
 REASON_UNTRUSTED_AUTHOR_ASSOCIATION = "untrusted_author_association"
+REASON_MISSING_BASE_ISSUE_BODY_SHA256 = "missing_base_issue_body_sha256"
 
 NEXT_STEP_RERUN_REFINEMENT_AFTER_CONTRACT_UPDATE = "rerun_refinement_after_contract_update"
 
@@ -642,38 +643,65 @@ def validate_scope_delta_authority_evidence_url(
     target_issue_number=None,
     expected_repo=None,
 ) -> bool:
-    """AC16: fail-closed structural URL validation for issue_comment evidence.
+    """AC16: fail-closed structural URL validation for issue_comment /
+    pull_request_review evidence.
 
     Non issue_comment/pull_request_review source_kind values are not subject
     to this check (parent_issue / related_issue / agent_inferred evidence do
     not carry an issue-comment URL to validate).
+
+    PR #1332 review fix (P0/P1):
+    - issue_comment evidence now requires `expected_repo` to be provided by
+      the caller (classify_scope_delta_authority) so that a same-issue-number
+      URL from a *different* repository is fail-closed rejected rather than
+      silently accepted when the caller forgets to pass expected_repo.
+    - pull_request_review evidence is not yet structurally verifiable against
+      `pull_request_url` / `_links.pull_request` (SCOPE_DELTA_AUTHORITY_EVIDENCE_V1
+      does not carry those fields today), so it is fail-closed rejected
+      unconditionally until a follow-up adds that verification. A genuine
+      issue-comment URL mislabeled as pull_request_review is still detected
+      and rejected explicitly for a clearer reason, but the net effect (not
+      accepted) is unchanged.
     """
     source_kind = evidence.get("source_kind")
     if source_kind not in ("issue_comment", "pull_request_review"):
         return True
     if source_kind == "pull_request_review":
-        comment_url = evidence.get("comment_url")
-        if isinstance(comment_url, str) and comment_url and parse_issue_comment_url(comment_url) is not None:
-            # A genuine issue-comment URL mislabeled as pull_request_review.
-            return False
-        return True
+        # Fail-closed: pull_request_review evidence cannot yet be verified
+        # against pull_request_url / _links.pull_request / repo / PR number,
+        # so it is never accepted (AC16 hardening, PR #1332 review).
+        return False
+
+    if not expected_repo:
+        # Fail-closed: repo/owner cross-check is mandatory for issue_comment
+        # evidence. Without expected_repo we cannot rule out a same-issue-
+        # number URL pointed at a different repository.
+        return False
 
     parsed = parse_issue_comment_url(evidence.get("comment_url"))
     if parsed is None:
         return False
-    if expected_repo:
-        expected_parts = expected_repo.lower().split("/", 1)
-        if [parsed["owner"].lower(), parsed["repo"].lower()] != expected_parts:
-            return False
+    expected_parts = expected_repo.lower().split("/", 1)
+    if [parsed["owner"].lower(), parsed["repo"].lower()] != expected_parts:
+        return False
     if target_issue_number is not None and parsed["issue_number"] != target_issue_number:
         return False
     issue_url = evidence.get("issue_url")
-    if issue_url and expected_repo and target_issue_number is not None:
+    if issue_url and target_issue_number is not None:
         expected_html = f"https://github.com/{expected_repo}/issues/{target_issue_number}"
         expected_api = f"https://api.github.com/repos/{expected_repo}/issues/{target_issue_number}"
         if issue_url.lower() not in (expected_html.lower(), expected_api.lower()):
             return False
     return True
+
+
+class ContractPatchPlanBaseShaMissingError(ValueError):
+    """Raised by build_contract_patch_plan_v1() when base_issue_body_sha256
+    is missing (PR #1332 review fix, P1). CONTRACT_PATCH_PLAN_V1 is applied
+    against a specific Issue body snapshot by issue-author/edit-issue; a null
+    base sha256 would let a stale or mismatched Issue body be patched
+    (wrong section, lost concurrent edits) with no way to detect it.
+    """
 
 
 def build_contract_patch_plan_v1(
@@ -688,7 +716,18 @@ def build_contract_patch_plan_v1(
     Generation-only: `forbidden` always lists direct_github_write and
     implementation_phase_transition so the plan can never be mistaken for an
     executed write. Callers (issue-author / edit-issue skill) apply the plan.
+
+    PR #1332 review fix (P1): base_issue_body_sha256 is mandatory and
+    non-null (contract_patch_plan_v1.schema.json now requires a non-empty
+    string) -- callers must resolve a real Issue body sha256 before a
+    contract_update_required route can be materialized into a patch plan.
     """
+    if not base_issue_body_sha256:
+        raise ContractPatchPlanBaseShaMissingError(
+            "base_issue_body_sha256 is required (non-null, non-empty) to "
+            "build a CONTRACT_PATCH_PLAN_V1 -- refusing to generate a patch "
+            "plan against an unresolved Issue body snapshot"
+        )
     return {
         "schema_version": CONTRACT_PATCH_PLAN_SCHEMA_VERSION,
         "target_issue_number": target_issue_number,
@@ -737,10 +776,24 @@ def derive_contract_patch_operations(evidence_list: list) -> list:
 
 
 def _patch_source_evidence_entry(evidence: dict) -> dict:
+    # PR #1332 review fix (P1): carry source_comment_id / extracted_text_sha256
+    # / captured_at so issue-author/edit-issue can detect a stale or
+    # mismatched source comment before applying an operation derived from it.
+    # extracted_text_sha256 hashes only the already-extracted directive
+    # texts (never the raw comment body, AC14).
+    extracted_directives = evidence.get("extracted_directives") or []
+    extracted_text_sha256 = (
+        _sha256("\n".join(extracted_directives)) if extracted_directives else None
+    )
     return {
         "source_ref": evidence.get("source_ref") or evidence.get("comment_url"),
         "source_body_sha256": evidence.get("body_sha256"),
         "author_association": evidence.get("author_association"),
+        "source_comment_id": evidence.get("comment_id"),
+        "extracted_text_sha256": extracted_text_sha256,
+        "captured_at": evidence.get("captured_at"),
+        "start_line": evidence.get("start_line"),
+        "end_line": evidence.get("end_line"),
     }
 
 
@@ -868,12 +921,20 @@ def classify_scope_delta_authority(
     triggered: bool = True,
     target_issue_number=None,
     base_issue_body_sha256=None,
+    expected_repo=None,
 ) -> dict:
     """AC1-AC19: classify scope_delta_authority for a scope signal delta.
 
     `evidence` is normalized SCOPE_DELTA_AUTHORITY_EVIDENCE_V1 (single dict or
     a list for multiple reviewers). Never parses raw comment bodies -- only
     consumes already-extracted markers/directives/boundary_flags (AC14).
+
+    `expected_repo` (PR #1332 review fix, P0/P1): the `owner/name` repo the
+    caller expects evidence to originate from. It is forwarded to
+    validate_scope_delta_authority_evidence_url() so that a same-issue-number
+    URL from a *different* repository is fail-closed rejected (AC16
+    hardening). When omitted, issue_comment evidence is fail-closed rejected
+    by the URL validator (repo cross-check cannot be skipped silently).
     """
     if not triggered:
         return _build_scope_delta_authority_result(
@@ -901,7 +962,9 @@ def classify_scope_delta_authority(
     evidence_list = [
         item
         for item in evidence_list
-        if validate_scope_delta_authority_evidence_url(item, target_issue_number=target_issue_number)
+        if validate_scope_delta_authority_evidence_url(
+            item, target_issue_number=target_issue_number, expected_repo=expected_repo
+        )
     ]
 
     if not evidence_list:
@@ -992,6 +1055,23 @@ def classify_scope_delta_authority(
 
     confidence = primary["confidence"]
     if confidence == DIRECTIVE_CONFIDENCE_EXPLICIT:
+        # PR #1332 review fix (P1): a CONTRACT_PATCH_PLAN_V1 can only be
+        # generated against a resolved Issue body snapshot. Without
+        # base_issue_body_sha256, claiming contract_update_required would
+        # imply "safe to proceed" while the patch plan itself cannot be
+        # safely built (build_contract_patch_plan_v1 fail-closes on this) --
+        # so fail closed to human_escalation instead of raising.
+        if not base_issue_body_sha256:
+            return _build_scope_delta_authority_result(
+                authority_category=AUTHORITY_CATEGORY_HUMAN_REVIEW_DIRECTIVE,
+                provenance=_provenance_from_evidence(primary_evidence),
+                directive=_directive_from_evidence(primary_evidence, DIRECTIVE_CONFIDENCE_EXPLICIT),
+                boundary_flags=boundary_flags,
+                route_action=SCOPE_DELTA_AUTHORITY_ROUTE_HUMAN_ESCALATION,
+                reason_code=REASON_MISSING_BASE_ISSUE_BODY_SHA256,
+                implementation_allowed=False,
+                next_step=None,
+            )
         result = _build_scope_delta_authority_result(
             authority_category=AUTHORITY_CATEGORY_HUMAN_REVIEW_DIRECTIVE,
             provenance=_provenance_from_evidence(primary_evidence),

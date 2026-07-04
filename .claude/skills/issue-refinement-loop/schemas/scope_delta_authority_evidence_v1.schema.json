@@ -21,7 +21,7 @@
     "ambiguity_flags",
     "boundary_flags"
   ],
-  "additionalProperties": true,
+  "additionalProperties": false,
   "properties": {
     "schema_version": {
       "type": "string",

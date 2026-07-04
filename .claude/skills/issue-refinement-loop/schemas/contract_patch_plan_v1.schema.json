@@ -19,12 +19,23 @@
       "const": "CONTRACT_PATCH_PLAN_V1"
     },
     "target_issue_number": { "type": ["integer", "null"], "minimum": 1 },
-    "base_issue_body_sha256": { "type": ["string", "null"] },
+    "base_issue_body_sha256": {
+      "description": "PR #1332 review fix (P1): non-null and required whenever this plan is generated for a contract_update_required route -- build_contract_patch_plan_v1() (the sole producer) fails closed rather than emitting a plan with a null base sha256, to prevent downstream stale-issue-body / wrong-section application.",
+      "type": "string",
+      "minLength": 1
+    },
     "source_evidence": {
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["source_ref", "source_body_sha256", "author_association"],
+        "required": [
+          "source_ref",
+          "source_body_sha256",
+          "author_association",
+          "source_comment_id",
+          "extracted_text_sha256",
+          "captured_at"
+        ],
         "additionalProperties": false,
         "properties": {
           "source_ref": { "type": ["string", "null"] },
@@ -32,7 +43,15 @@
           "author_association": {
             "type": ["string", "null"],
             "enum": ["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR", "NONE", null]
-          }
+          },
+          "source_comment_id": { "type": ["integer", "string", "null"] },
+          "extracted_text_sha256": {
+            "description": "sha256 of the deterministically-joined extracted_directives text for this evidence entry (never the raw comment body, AC14).",
+            "type": ["string", "null"]
+          },
+          "captured_at": { "type": ["string", "null"], "format": "date-time" },
+          "start_line": { "type": ["integer", "null"], "minimum": 1 },
+          "end_line": { "type": ["integer", "null"], "minimum": 1 }
         }
       }
     },
