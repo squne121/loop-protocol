@@ -36,6 +36,14 @@ from vc_contract_syntax import (
 )
 
 
+# Issue #1333 AC1: per-command timeout の named constant。
+# 実測 test_baseline_vc_preflight.py 実行時間（約58秒、real 0m59.376s）を
+# 安全マージン込みで上回る値（>= 90）を維持する。--timeout-seconds の
+# argparse default はこの定数を参照し、run_contract_review_once.py 側も
+# この定数を import して drift を防ぐ（AC2/AC3 参照）。
+DEFAULT_TIMEOUT_SECONDS = 90
+
+
 def get_issue_body(issue_number: int, repo: str) -> Tuple[Optional[str], Optional[str]]:
     """
     GitHub API から Issue body を取得
@@ -2512,7 +2520,12 @@ def main() -> int:
     parser.add_argument("--repo", default="squne121/loop-protocol", help="GitHub repo (owner/name)")
     parser.add_argument("--body-file", help="Path to Issue body file (for testing)")
     parser.add_argument("--cwd", default=".", help="Working directory for command execution")
-    parser.add_argument("--timeout-seconds", type=int, default=90, help="Timeout per command")
+    parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help="Timeout per command",
+    )
     parser.add_argument("--max-head-lines", type=int, default=20, help="Max lines for stdout/stderr")
     # B8: contract-review-fragment format support
     parser.add_argument(
