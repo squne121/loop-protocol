@@ -173,9 +173,22 @@ class TestC9StructuredBlocker:
     C9 deterministic entry with self-checker evidence; GIVEN a WARN-path body THEN no C9 entry is added.
     """
 
-    def test_c9_fail_emits_structured_blocker_with_deterministic_evidence(self):
-        """GIVEN c9_fail_issue.md WHEN checker runs THEN a C9 structured_blocker with deterministic evidence
-        is present (filtered by code/domain key, not positional index).
+    def test_c9_fail_emits_structured_blocker_code(self):
+        """GIVEN c9_fail_issue.md WHEN checker runs THEN structured_blockers contains an entry whose
+        code is "C9" (filtered by code/domain key, not positional index). Corresponds to Issue #1314 AC1.
+        """
+        output = run_checker("c9_fail_issue.md")
+        c9_blockers = [
+            b
+            for b in output["structured_blockers"]
+            if b["code"] == "C9" and b["deterministic_domain_key"] == "runtime_applicability"
+        ]
+        assert c9_blockers, f"Expected a C9 structured blocker, got: {output['structured_blockers']}"
+
+    def test_c9_structured_blocker_evidence_is_valid_deterministic_evidence(self):
+        """GIVEN c9_fail_issue.md WHEN checker runs THEN the C9 structured_blocker entry has
+        finding_kind == "deterministic_domain_blocker" and its checker_evidence contains all required
+        keys. Corresponds to Issue #1314 AC2.
         """
         output = run_checker("c9_fail_issue.md")
         c9_blockers = [

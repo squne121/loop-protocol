@@ -415,7 +415,7 @@ def test_missing_section_with_lp005_only_is_unbacked():
     assert result["should_consume_iteration"] is False
 
 
-def test_c9_deterministic_structured_blocker_confirms_fail_without_checker_gap():
+def test_c9_blocker_is_deterministic_backed_not_checker_gap():
     """GIVEN a producer-derived compact review result whose structured_blockers/findings
     carry C9 deterministic evidence (post narrow-approval check_issue_contract.py fix)
     WHEN analyze() replays it THEN the verdict is deterministic_fail_confirmed, the
