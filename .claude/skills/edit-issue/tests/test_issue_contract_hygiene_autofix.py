@@ -538,3 +538,260 @@ def test_check_non_c4_c9_blockers_fail_closed_on_non_json(monkeypatch):
     # Fail-closed: keep the non-C4/C9 blocker guard active, do not fail open.
     assert has_other is True
     assert codes == ["check_error"]
+
+
+# ---------------------------------------------------------------------------
+# Blocker 3 (PR #1305 review): VC baseline shape repair fails CLOSED when the
+# compiler module cannot be loaded (this repair is a completion condition of
+# Issue #1285, not optional/best-effort).
+# ---------------------------------------------------------------------------
+
+
+def test_repair_vc_baseline_shape_load_failure_fails_closed(monkeypatch):
+    """GIVEN vc_baseline_shape_compiler.py cannot be loaded (import/load error) /
+    WHEN repair_vc_baseline_shape() runs / THEN it fails closed
+    (VcShapeResult.LOAD_FAILED), never silently skipping the repair."""
+    module = _load_autofix_module()
+
+    def fake_loader():
+        raise ImportError("compiler module intentionally broken for this test")
+
+    monkeypatch.setattr(module, "_load_vc_baseline_shape_compiler", fake_loader)
+
+    lines = [
+        "## Verification Commands\n",
+        "\n",
+        "```bash\n",
+        "$ pytest some_dir/test_existing.py -k test_new_name\n",
+        "```\n",
+    ]
+    new_lines, repaired, status, reason = module.repair_vc_baseline_shape(lines, ".")
+
+    assert status == module.VcShapeResult.LOAD_FAILED
+    assert repaired is False
+    assert new_lines == lines
+    assert reason is not None
+
+
+def test_repair_vc_baseline_shape_no_vc_section_is_safe_noop(monkeypatch):
+    """GIVEN a body with no ## Verification Commands section at all /
+    WHEN repair_vc_baseline_shape() runs / THEN it is a safe no-op
+    (VcShapeResult.NO_VC_SECTION) without even attempting to load the
+    compiler module."""
+    module = _load_autofix_module()
+
+    def fail_loader():
+        raise AssertionError("compiler must not be loaded when there is no VC section")
+
+    monkeypatch.setattr(module, "_load_vc_baseline_shape_compiler", fail_loader)
+
+    lines = ["## Outcome\n", "Something.\n"]
+    new_lines, repaired, status, reason = module.repair_vc_baseline_shape(lines, ".")
+
+    assert status == module.VcShapeResult.NO_VC_SECTION
+    assert repaired is False
+    assert new_lines == lines
+    assert reason is None
+
+
+def test_main_fails_closed_on_vc_shape_compiler_load_failure(monkeypatch, tmp_path: Path):
+    """GIVEN VC_BASELINE_SHAPE_COMPILER_SCRIPT points at a nonexistent file /
+    WHEN main() runs (in-process) on a body containing a pytest VC command /
+    THEN main() returns exit code 2 (fail-closed) instead of the previous
+    fail-open [WARN]+continue behavior (Issue #1305 review Blocker 3)."""
+    import io
+
+    module = _load_autofix_module()
+    monkeypatch.setattr(
+        module, "VC_BASELINE_SHAPE_COMPILER_SCRIPT", str(tmp_path / "does_not_exist.py")
+    )
+
+    body = _wrap_body(
+        vc_block=textwrap.dedent("""\
+            ```bash
+            # AC1
+            $ pytest .claude/agents/issue-author.md -k test_new_name
+            ```"""),
+        allowed_paths="- .claude/agents/issue-author.md\n",
+        rva_block=_RVA_BLOCK,
+    )
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT)])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(body))
+
+    exit_code = module.main()
+    assert exit_code == 2
+
+
+# ---------------------------------------------------------------------------
+# Blocker 4 (PR #1305 review): repair order is C4 -> VC shape -> C9 -> sha256
+# guard, so C4 (adding $ prefixes) runs before VC shape detection (which only
+# scans $-prefixed lines), and a C9 not_autofixable failure never lets a VC
+# shape partial rewrite leak into stdout.
+# ---------------------------------------------------------------------------
+
+
+def _make_blocker4_probe(repo_root: Path, leaf_name: str) -> tuple[Path, str, str]:
+    """Create a real probe test file under `scripts/<leaf_name>/` (a
+    non-runtime-whitelisted prefix, so C9 repair can classify it) for VC
+    shape repair to target.
+
+    Returns (probe_file_path, existing_repo_relative_path,
+    candidate_repo_relative_path).
+    """
+    probe_dir = repo_root / "scripts" / leaf_name
+    probe_dir.mkdir(exist_ok=True)
+    probe_file = probe_dir / f"test_existing_{leaf_name}.py"
+    probe_file.write_text("def test_alpha():\n    pass\n", encoding="utf-8")
+    existing_repo_file = f"scripts/{leaf_name}/test_existing_{leaf_name}.py"
+    candidate = f"scripts/{leaf_name}/test_existing_{leaf_name}_new_test.py"
+    return probe_file, existing_repo_file, candidate
+
+
+def test_combined_c4_vc_shape_c9_repaired_together():
+    """GIVEN a body needing C4 ($ prefix), a VC baseline shape rewrite, and
+    C9 (missing RVA) all at once / WHEN autofix runs / THEN all three
+    repairs are applied together in a single pass, proving VC shape
+    detection (which only recognizes $-prefixed lines) runs AFTER C4 adds
+    the missing $ prefix (Issue #1305 review Blocker 4)."""
+    repo_root = SCRIPT.parents[4]
+    probe_file, existing_repo_file, candidate = _make_blocker4_probe(
+        repo_root, "blocker4_combined_probe"
+    )
+    try:
+        body = _wrap_body(
+            vc_block=textwrap.dedent(f"""\
+                ```bash
+                # AC1
+                test -f {existing_repo_file}
+                pytest {existing_repo_file} -k test_new_blocker4_combined
+                ```"""),
+            allowed_paths=f"- {existing_repo_file}\n- {candidate}\n",
+            rva_block="",
+        )
+        code, out, err = run_autofix(body)
+        assert code == 0, f"Expected exit 0, got {code}. stderr={err}"
+        assert "$ test -f" in out
+        assert candidate in out
+        assert "::test_new_blocker4_combined" in out
+        assert "## Runtime Verification Applicability" in out
+        assert "decision: not_applicable" in out
+        assert "c4=True" in err
+        assert "vc_shape=True" in err
+        assert "c9=True" in err
+
+        # 2nd run on the repaired body: everything is now canonical/present
+        # -> sha256 guard -> no_change (exit 1). This also exercises the
+        # idempotency requirement from Blocker 4.
+        code2, out2, err2 = run_autofix(out)
+        assert code2 == 1, f"Expected exit 1 (no_change) on 2nd run, got {code2}. stderr={err2}"
+    finally:
+        probe_file.unlink(missing_ok=True)
+        try:
+            probe_file.parent.rmdir()
+        except OSError:
+            pass  # never remove the shared "scripts/" parent directory
+
+
+def test_vc_shape_only_repair_reported_alone():
+    """GIVEN a body needing ONLY the VC baseline shape rewrite (C4/$-prefix
+    and C9/RVA are both already satisfied) / WHEN autofix runs / THEN only
+    vc_shape is reported as repaired."""
+    repo_root = SCRIPT.parents[4]
+    probe_file, existing_repo_file, candidate = _make_blocker4_probe(
+        repo_root, "blocker4_vcshape_only_probe"
+    )
+    try:
+        body = _wrap_body(
+            vc_block=textwrap.dedent(f"""\
+                ```bash
+                # AC1
+                $ pytest {existing_repo_file} -k test_new_blocker4_vcshape_only
+                ```"""),
+            allowed_paths=f"- {existing_repo_file}\n- {candidate}\n",
+            rva_block=_RVA_BLOCK,
+        )
+        code, out, err = run_autofix(body)
+        assert code == 0, f"Expected exit 0, got {code}. stderr={err}"
+        assert candidate in out
+        assert "c4=False" in err
+        assert "vc_shape=True" in err
+        assert "c9=False" in err
+    finally:
+        probe_file.unlink(missing_ok=True)
+        try:
+            probe_file.parent.rmdir()
+        except OSError:
+            pass  # never remove the shared "scripts/" parent directory
+
+
+def test_c9_not_autofixable_suppresses_vc_shape_partial_output():
+    """GIVEN a body where VC shape repair WOULD succeed but C9 is
+    not_autofixable (a runtime path is present in Allowed Paths) /
+    WHEN autofix runs / THEN main() exits 2 and stdout is empty — the VC
+    shape rewrite must never leak out as a partial/silent success when a
+    later-stage repair fails closed (Issue #1305 review Blocker 4)."""
+    repo_root = SCRIPT.parents[4]
+    probe_file, existing_repo_file, candidate = _make_blocker4_probe(
+        repo_root, "blocker4_c9blocked_probe"
+    )
+    try:
+        body = _wrap_body(
+            vc_block=textwrap.dedent(f"""\
+                ```bash
+                # AC1
+                $ pytest {existing_repo_file} -k test_new_blocker4_c9blocked
+                ```"""),
+            # src/ is a runtime path prefix -> C9 not_autofixable.
+            allowed_paths=f"- {existing_repo_file}\n- {candidate}\n- src/main.ts\n",
+            rva_block="",
+        )
+        code, out, err = run_autofix(body)
+        assert code == 2, f"Expected exit 2 (C9 not_autofixable), got {code}. stderr={err}"
+        assert out == "", "stdout must be empty; no partial VC shape rewrite may leak out"
+        assert candidate not in out
+    finally:
+        probe_file.unlink(missing_ok=True)
+        try:
+            probe_file.parent.rmdir()
+        except OSError:
+            pass  # never remove the shared "scripts/" parent directory
+
+
+# ---------------------------------------------------------------------------
+# High risk (PR #1305 review): compile_body() status == "changed" together
+# with not_autofixable warnings on OTHER lines in the same body must not be
+# partially applied — autofix fails closed instead.
+# ---------------------------------------------------------------------------
+
+
+def test_vc_shape_mixed_changed_and_not_autofixable_fails_closed():
+    """GIVEN a body with two pytest VC lines where one is safely rewritable
+    (changed) and the other is not_autofixable (complex -k expression) /
+    WHEN autofix runs / THEN it fails closed (exit 2) rather than silently
+    applying only the safe rewrite and leaving the other line broken."""
+    repo_root = SCRIPT.parents[4]
+    probe_file, existing_repo_file, candidate = _make_blocker4_probe(
+        repo_root, "blocker4_mixed_probe"
+    )
+    try:
+        body = _wrap_body(
+            vc_block=textwrap.dedent(f"""\
+                ```bash
+                # AC1
+                $ pytest {existing_repo_file} -k test_new_blocker4_mixed
+                # AC2
+                $ pytest {existing_repo_file} -k "test_alpha or test_beta"
+                ```"""),
+            allowed_paths=f"- {existing_repo_file}\n- {candidate}\n",
+            rva_block=_RVA_BLOCK,
+        )
+        code, out, err = run_autofix(body)
+        assert code == 2, f"Expected exit 2 (mixed changed+not_autofixable), got {code}. stderr={err}"
+        assert out == ""
+        assert "vc_shape_mixed_changed_and_warnings" in err
+    finally:
+        probe_file.unlink(missing_ok=True)
+        try:
+            probe_file.parent.rmdir()
+        except OSError:
+            pass  # never remove the shared "scripts/" parent directory
