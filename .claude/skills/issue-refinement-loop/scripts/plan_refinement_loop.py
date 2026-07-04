@@ -747,6 +747,33 @@ def _compute_scope_signal_delta_result(known_context: dict) -> dict[str, Any]:
         raise ScopeSignalDeltaError(f"scope_signal_delta_input is invalid: {exc}") from exc
 
 
+_SCOPE_SIGNAL_LINE_PATH_TOKEN_RE = re.compile(
+    r"`([^`\n]+)`|((?:\.claude|docs|src|scripts|tests|\.github)/[^\s`]+)"
+)
+
+
+def _line_layer_prefixes(line: str, prefixes) -> set:
+    """Extract the set of known layer prefixes that a line's path tokens start with.
+
+    A single path token (backtick-quoted or bare) may contain more than one of
+    the known prefixes as an embedded substring (e.g. a test file nested under
+    a skill directory such as ".claude/skills/<skill>/tests/<file>.py" contains
+    both ".claude/" and "tests/"). Counting that as two independent layer
+    mentions is a false positive (Issue #1327). This helper instead extracts
+    whole path-like tokens and only attributes a prefix to a token when the
+    token itself *starts with* that prefix, so a prefix appearing mid-token
+    never counts as an additional layer.
+    """
+    found = set()
+    for match in _SCOPE_SIGNAL_LINE_PATH_TOKEN_RE.finditer(line):
+        candidate = (match.group(1) or match.group(2) or "").strip()
+        for prefix in prefixes:
+            if candidate.startswith(prefix):
+                found.add(prefix)
+                break
+    return found
+
+
 def _detect_scope_signals(
     issue_body: str,
     known_context: dict | None,
@@ -832,16 +859,25 @@ def _detect_scope_signals(
         return (True, SCOPE_SIGNAL_REASON_NEW_PATH_LAYER, evidence_spans)
 
     # 3. Check new_in_scope_area
+    #
+    # Note: a single path token (e.g. a backtick-quoted or bare path) may
+    # contain more than one of the known prefixes as an embedded substring
+    # (for example ".claude/skills/<skill>/tests/<file>.py" contains both
+    # ".claude/" and "tests/"). Counting that as two independent layer
+    # mentions is a false positive (Issue #1327). We instead extract whole
+    # path-like tokens per line and only attribute a prefix to a token when
+    # the token itself *starts with* that prefix, so nested substrings
+    # within a single token never count as extra layers.
     layer_prefixes_in_scope = set()
     for line in in_scope.splitlines():
-        for prefix in [".claude/", "docs/", "src/", "scripts/", "tests/", ".github/"]:
-            if prefix in line:
-                layer_prefixes_in_scope.add(prefix)
+        layer_prefixes_in_scope |= _line_layer_prefixes(
+            line, (".claude/", "docs/", "src/", "scripts/", "tests/", ".github/")
+        )
 
     if len(layer_prefixes_in_scope) >= 2:
         # Find evidence line
         for line_num, line in enumerate(in_scope.splitlines(), start=1):
-            if any(p in line for p in layer_prefixes_in_scope):
+            if _line_layer_prefixes(line, tuple(layer_prefixes_in_scope)):
                 evidence_spans.append({
                     "source": "issue_body",
                     "source_ref": None,

@@ -158,6 +158,10 @@ scope_signal_delta_input:
 
 `new_allowed_path_layer` は `after.allowed_path_layers - before.allowed_path_layers` が非空の場合のみ発火する。既存 layer の再掲、並び替え、空白差分、fenced code 内の path mention は signal にしない。
 
+### 単一パス文字列内の複数 prefix 判定ルール（Issue #1327）
+
+In Scope / Allowed Paths の layer 判定は、単一のパス文字列内に複数の prefix（例: `.claude/` と `tests/`）が同時に含まれていても、それを複数の独立した layer 言及として数えない。判定はパス文字列全体（バッククォート引用または裸の パス token）の先頭が prefix と一致するかどうかで行い、token 内部に埋め込まれた 別 prefix の出現（例: `.claude/skills/<skill>/tests/<file>.py` に含まれる `tests/`）は無視する。`plan_refinement_loop.py` の `_detect_scope_signals()` legacy fallback と `scope_signal_delta.py` の `_extract_in_scope_layers()` は この規則で prefix を抽出する。
+
 ## 禁止事項（Must not）
 
 - scope signal を見て自動で scope 拡大を承認しない

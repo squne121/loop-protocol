@@ -204,8 +204,24 @@ def _extract_in_scope_layers(text: str) -> list[dict[str, Any]]:
                 fence_len = 0
             continue
 
+        # Note: a single path token (e.g. a backtick-quoted or bare path) may
+        # contain more than one of the known prefixes as an embedded
+        # substring (for example ".claude/skills/<skill>/tests/<file>.py"
+        # contains both ".claude/" and "tests/"). Counting that as two
+        # independent layer mentions is a false positive (Issue #1327). We
+        # instead extract whole path-like tokens via PATH_TOKEN_RE and only
+        # attribute a prefix to a token when the token itself *starts with*
+        # that prefix, so a prefix appearing mid-token never counts as an
+        # extra layer.
+        line_prefixes: set[str] = set()
+        for match in PATH_TOKEN_RE.finditer(raw_line):
+            candidate = _normalize_path(match.group("path") or match.group("bare") or "")
+            for prefix in prefixes:
+                if candidate.startswith(prefix):
+                    line_prefixes.add(prefix)
+                    break
         for prefix in prefixes:
-            if prefix in raw_line:
+            if prefix in line_prefixes:
                 items.append(
                     {
                         "value": prefix.rstrip("/"),
