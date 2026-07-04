@@ -3224,7 +3224,9 @@ def run_delegation(
             base_result["post_failure_class"] = "post_to_issue_url_error"
             base_result["ok"] = False
             base_result["failure_class"] = base_result.get("failure_class") or "post_to_issue_url_error"
-            base_result["failure_reason"] = base_result.get("failure_reason") or f"post_to_issue_url: unexpected error: {exc}"
+            base_result["failure_reason"] = base_result.get(
+                "failure_reason"
+            ) or f"post_to_issue_url: unexpected error: {exc}"
 
         base_result["result_surface"] = _build_result_surface(
             ok=content_ok,
