@@ -19,7 +19,8 @@ Input:
 
 Output (stdout, budget < 2000 bytes):
   STATUS: pass | warn | human_escalation | inconsistent_state | router_error
-  NEXT_ACTION: continue_to_step_4 | proceed_to_step_4_5 | human_escalation | terminate | rebuild_phase_state
+  NEXT_ACTION: continue_to_step_4 | proceed_to_step_4_5 | human_escalation |
+               terminate | rebuild_phase_state | proceed_with_contract_update
   COMMANDS: (optional) argv-array invocation hints
   BLOCKERS: (optional) blocker codes
 
@@ -69,6 +70,7 @@ ACTION_PROCEED_TO_STEP_4_5 = "proceed_to_step_4_5"
 ACTION_HUMAN_ESCALATION = "human_escalation"
 ACTION_TERMINATE = "terminate"
 ACTION_REBUILD_PHASE_STATE = "rebuild_phase_state"
+ACTION_PROCEED_WITH_CONTRACT_UPDATE = "proceed_with_contract_update"
 
 # Status constants
 STATUS_PASS = "pass"
@@ -224,6 +226,7 @@ def decide_next_action(
     loop_state: dict[str, Any],
     review_verdict: Optional[str],
     max_iterations_override: Optional[int] = None,
+    scope_signal_guard_decision_v2: Optional[dict[str, Any]] = None,
 ) -> tuple[str, str, list[str], list[str], Optional[str]]:
     """
     Determine the next action for the refinement loop.
@@ -232,14 +235,36 @@ def decide_next_action(
         loop_state: Validated LOOP_STATE_V1 dict (read-only).
         review_verdict: "approve" | "needs-fix" | None
         max_iterations_override: If provided, overrides loop_state["max_iterations"].
+        scope_signal_guard_decision_v2: Optional SCOPE_SIGNAL_GUARD_DECISION_V2
+            sidecar (#1090/#1323). NOT part of LOOP_STATE_V1 (loop_state.schema.json
+            additionalProperties:false) -- passed as a separate argument, same
+            pattern as phase_state. When
+            scope_signal_guard_decision_v2.scope_delta_authority.route.action
+            == "contract_update_required" (the SCOPE_DELTA_AUTHORITY_V1 nested
+            route emitted by classify_scope_delta_authority() in
+            scope_signal_delta.py), this router returns
+            NEXT_ACTION: proceed_with_contract_update without touching
+            termination_reason (loop stays open, Issue contract update
+            happens out-of-band, then refinement re-runs).
+
+            NOTE (PR #1332 review fix): the top-level
+            scope_signal_guard_decision_v2["route"] field is a DIFFERENT,
+            pre-existing (#1090) enum (not_triggered / human_judgment_required
+            / invalid_scope_delta_approval / proceed_with_notes) used for the
+            ANCHOR_SCOPE_REFRAME_V1 lane split. It never takes the value
+            "contract_update_required" and must not be conflated with the
+            nested scope_delta_authority.route.action checked here.
 
     Returns:
         (status, next_action, commands, blockers, termination_cause_hint)
 
     Priority order:
         1. inconsistent_state — corrupt/contradictory state fields
-        2. human_escalation  — max_iterations exceeded or hard stop signal
-        3. routing on verdict
+        2. proceed_with_contract_update —
+           scope_signal_guard_decision_v2.scope_delta_authority.route.action
+           == contract_update_required (#1323, non-destructive branch)
+        3. human_escalation  — max_iterations exceeded or hard stop signal
+        4. routing on verdict
     """
     iteration: int = loop_state.get("iteration", 0)
     max_iterations: int = (
@@ -280,7 +305,37 @@ def decide_next_action(
             None,
         )
 
-    # --- Priority 2: scope signal guard hard stop ---
+    # --- Priority 2 (#1323): explicit human-review contract-update directive.
+    # Non-destructive: termination_reason is left untouched (loop keeps
+    # running); this only redirects the immediate next step toward a
+    # contract update + refinement re-run instead of human_escalation.
+    #
+    # PR #1332 review fix (P0): read the NESTED
+    # scope_delta_authority.route.action produced by
+    # classify_scope_delta_authority() in scope_signal_delta.py -- NOT the
+    # top-level scope_signal_guard_decision_v2["route"], which is a
+    # different, pre-existing (#1090) enum for the ANCHOR_SCOPE_REFRAME_V1
+    # lane split and never equals "contract_update_required".
+    _scope_delta_authority = (
+        scope_signal_guard_decision_v2.get("scope_delta_authority")
+        if isinstance(scope_signal_guard_decision_v2, dict)
+        else None
+    )
+    _authority_route_action = (
+        _scope_delta_authority.get("route", {}).get("action")
+        if isinstance(_scope_delta_authority, dict)
+        else None
+    )
+    if _authority_route_action == "contract_update_required":
+        return (
+            STATUS_PASS,
+            ACTION_PROCEED_WITH_CONTRACT_UPDATE,
+            [],
+            [],
+            None,
+        )
+
+    # --- Priority 3: scope signal guard hard stop ---
     if scope_signal.get("triggered") and not scope_signal.get(
         "excluded_by_anchor_reframe", False
     ):
@@ -417,7 +472,60 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "ISSUE_REFINEMENT_ROUTER_ERROR_V1 is emitted and exit 3 is returned."
         ),
     )
+    sig_group = parser.add_mutually_exclusive_group()
+    sig_group.add_argument(
+        "--scope-signal-guard-decision-v2-file",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Path to a SCOPE_SIGNAL_GUARD_DECISION_V2 JSON sidecar (#1090/#1323). "
+            "NOT part of LOOP_STATE_V1 (loop_state.schema.json additionalProperties:false); "
+            "when route == contract_update_required this router returns "
+            "NEXT_ACTION: proceed_with_contract_update without touching termination_reason."
+        ),
+    )
+    sig_group.add_argument(
+        "--scope-signal-guard-decision-v2-json",
+        metavar="JSON",
+        default=None,
+        help="Inline SCOPE_SIGNAL_GUARD_DECISION_V2 JSON string (alternative to the file form).",
+    )
     return parser.parse_args(argv)
+
+
+def _load_scope_signal_guard_decision_v2(
+    args: argparse.Namespace,
+) -> tuple[Optional[dict[str, Any]], str]:
+    """Load the optional SCOPE_SIGNAL_GUARD_DECISION_V2 sidecar (#1090/#1323).
+
+    Returns (data, error_msg). error_msg is '' on success (including the
+    "not provided" case, where data is None). Malformed input is a soft
+    failure (warning only, sidecar treated as absent) -- this sidecar is
+    additive/optional and must never fail-closed the whole router.
+    """
+    if getattr(args, "scope_signal_guard_decision_v2_file", None):
+        path = Path(args.scope_signal_guard_decision_v2_file)
+        if not path.exists():
+            return None, f"scope_signal_guard_decision_v2 file not found: {path}"
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            return None, f"Invalid scope_signal_guard_decision_v2 file: {e}"
+        if not isinstance(data, dict):
+            return None, "scope_signal_guard_decision_v2 must be a JSON object"
+        return data, ""
+
+    if getattr(args, "scope_signal_guard_decision_v2_json", None):
+        try:
+            data = json.loads(args.scope_signal_guard_decision_v2_json)
+        except json.JSONDecodeError as e:
+            return None, f"Invalid inline scope_signal_guard_decision_v2 JSON: {e}"
+        if not isinstance(data, dict):
+            return None, "scope_signal_guard_decision_v2 must be a JSON object"
+        return data, ""
+
+    return None, ""
 
 
 def _load_loop_state(args: argparse.Namespace) -> tuple[Optional[dict[str, Any]], str]:
@@ -551,12 +659,20 @@ def main(argv: Optional[list[str]] = None) -> None:
     else:
         verdict = cli_verdict
 
+    # Load optional SCOPE_SIGNAL_GUARD_DECISION_V2 sidecar (#1090/#1323).
+    # Soft-fail: a malformed/missing sidecar never blocks the router; it is
+    # simply treated as absent (BLOCKERS records the parse warning).
+    scope_signal_guard_decision_v2, sidecar_load_error = _load_scope_signal_guard_decision_v2(args)
+    sidecar_warning: list[str] = [sidecar_load_error] if sidecar_load_error else []
+
     # Compute next action
     status, next_action, commands, blockers, termination_cause_hint = decide_next_action(
         loop_state=loop_state,
         review_verdict=verdict,
         max_iterations_override=args.max_iterations,
+        scope_signal_guard_decision_v2=scope_signal_guard_decision_v2,
     )
+    blockers = list(blockers) + sidecar_warning
 
     # Emit output
     print(_format_output(status, next_action, commands, blockers, termination_cause_hint))
