@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Preflight Gemini CLI headless support for the delegation skill."""
+"""Preflight Gemini CLI headless support for the delegation skill.
+
+Auth / OAuth-sunset detection SSOT (Issue #1267): the sole source of truth for
+classifying Gemini CLI OAuth sunset / ineligible-tier / auth-failure states is
+`check_auth()` in `setup_check.py` (same skill directory). This module
+intentionally does NOT duplicate `_is_oauth_sunset` / `_is_ineligible_tier`
+classification logic here — callers that need OAuth sunset detection must go
+through `setup_check.check_auth()`, not re-derive it from this preflight's
+smoke/help output.
+"""
 
 from __future__ import annotations
 
