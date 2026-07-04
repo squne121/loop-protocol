@@ -300,6 +300,125 @@ session_recording_script_contract:
 
 ---
 
+## クラウド Pilot 成功条件契約（Cloud Pilot Success Contract）— #1153 Child E 拡張 (#1260)
+
+本セクションは `#246`（session recording pilot の start/smoke gate）を **supersede せず**、
+`#1153` Child E（Latitude Cloud adoption decision）のための拡張 contract を machine-readable に固定する。
+`20 runs / 7 days` のような run count 単独では Cloud pilot の採用判断を出さず、
+`cloud_pilot_success_contract_v1` という単一 schema block の下に success / adoption 判定要素を定義する。
+`#1261`（distribution / argv / remote cleanup gate）と `#1220`（Latitude real-pilot 例外判断）は
+Cloud adoption の hard blocker として明示する。hook 実行成功（`hook_exit_zero` 等）は
+capture 成功の証拠として扱わない。checker / schema / negative fixture の実装は本 Issue の
+Allowed Paths では行わず、別 follow-up Issue に切り出す。
+
+```yaml
+cloud_pilot_contract_relationship_v1:
+  issue_246_relationship: extension
+  issue_246_is_hard_prerequisite: true
+  supersedes_issue_246: false
+  child_e_role: latitude_cloud_adoption_extension
+  canonical_start_gate: "#246 SESSION_RECORDING_SMOKE_VERDICT/v1 + latitude:real-pilot:preflight"
+
+hard_blockers:
+  distribution_gate_issue: "#1261"
+  distribution_gate_required_state: completed
+  real_pilot_decision_issue: "#1220"
+  real_pilot_decision_required: approve_timeboxed_real_pilot
+  argv_exposure_state_allowed:
+    - absent_verified
+  remote_cleanup_state_required: machine_verified
+  if_remote_cleanup_state_unknown:
+    cloud_adoption_allowed: false
+
+cloud_pilot_success_contract_v1:
+  schema: cloud_pilot_success_contract/v1
+  parent_issue: "#1153"
+  decision_enum:
+    - adopt_cloud
+    - adopt_self_host
+    - conditional_adoption
+    - withdraw
+  eligible_run_definition:
+    included:
+      - real_development_session
+      - allowed_issue_label_matched
+      - within_activation_window
+      - latitude_real_pilot_preflight_allow
+    excluded:
+      - synthetic_fixture
+      - policy_validation_only
+      - duplicate_retry_duplicate
+      - manual_replay
+  duplicate_retry_exclusion:
+    rule: exclude_duplicate_retry_from_eligible_and_attempted_success_counts
+    definition: >
+      同一 run の再試行が duplicate retry と判定された場合、eligible_run_definition の
+      excluded に分類し、attempted_runs_denominator の分母からも除外する。
+  attempted_runs_denominator:
+    includes:
+      - eligible_started_run
+      - trace_missing
+      - upload_failed
+      - local_spool_remaining_nonzero
+      - provider_visibility_unknown
+    excludes:
+      - duplicate_retry_duplicate
+      - synthetic_fixture
+  trace_arrival_rate:
+    definition: "eligible_started_run のうち provider 側で trace 到達が確認できた比率"
+    unit: ratio_0_to_1
+  request_to_span_coverage:
+    definition: "eligible request ごとに期待される root span または相関 span が存在する比率"
+    unit: ratio_0_to_1
+  local_spool_remaining:
+    definition: "upload 未完了のまま local spool に残存した trace/span の件数"
+    unit: count
+  upload_retry_count:
+    definition: "trace/span upload の retry 発生回数"
+    unit: count
+  end_to_end_latency:
+    definition: "hook 発火から provider 側 trace 反映までの経過時間"
+    unit: seconds
+  hook_overhead_baseline:
+    definition: "telemetry hook 導入前後の実行時間差分ベースライン"
+    unit: seconds
+  credits_per_eligible_run:
+    definition: "eligible run 1 件あたりの Cloud pilot 消費 credit"
+    unit: credits
+  redaction_false_negative_count:
+    definition: "redaction が想定通り機能しなかった件数（0 が必須）"
+    unit: count
+    required_value: 0
+  retention_and_delete_verification:
+    definition: "provider-side retention policy と delete 実行結果の machine-verified 証跡"
+    verification_state_enum:
+      - machine_verified
+      - human_attested
+      - unknown
+    pass_requires: machine_verified
+  human_intervention_count:
+    definition: "pilot 期間中に人間が手動介入した回数"
+    unit: count
+  predeclared_stop_thresholds:
+    definition: "pilot 開始前に事前宣言した停止基準（超過時は即時停止）"
+    required_fields:
+      - max_eligible_runs
+      - max_credits
+      - max_redaction_false_negative_count
+      - rollback_deadline
+  missing_trace_counts_as_failure_or_degraded: true
+
+hook_success_is_not_capture_evidence: true
+
+cloud_pilot_checker_follow_up_required:
+  value: true
+  in_this_issue: docs_only_contract_definition
+  requires_follow_up_issue: true
+  follow_up_issue_ref: "(未起票。#1260 クローズ前に issue-author で起票し、この値を issue 番号に更新する)"
+```
+
+---
+
 ## VITE_ 環境変数の取り扱い
 
 Vite は `VITE_` プレフィックスを持つ環境変数を **client bundle に静的に展開する**（公式ドキュメント: [Env Variables and Modes](https://vitejs.dev/guide/env-and-mode.html)）。
