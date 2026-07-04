@@ -4,6 +4,7 @@ status: draft
 related_issue: "#268"
 created_at: "2026-05-23"
 updated_at: "2026-05-23"
+概要: "本文書は failure_class の分類体系と retry policy を定義する仕様文書である"
 ---
 
 # failure_class Taxonomy and Retry Policy
@@ -30,7 +31,7 @@ Issue #71 の refinement-loop で判明した問題:
 
 `failure_class` フィールドは `nullable: true` で成功時は `null`。
 
-### Non-retryable failures（fail-close）
+### Non-retryable failures（再試行不可能な失敗）
 
 これらは retry しても同じ結果になる構成・認証・スキーマ問題。
 即時 fail-close して human intervention または config 修正を求める。
@@ -57,7 +58,7 @@ Issue #71 の refinement-loop で判明した問題:
 | `github_research_command_denied` | `github_research` で禁止 gh subcommand が検出された | request_validation | `github_research_command_denied` / `is not in the allowed subcommand list` | none |
 | `api_deadline_exceeded` | prompt / context が大きすぎて API deadline を超過（request 調整が必要）| api_backend | `DEADLINE_EXCEEDED` / `context length exceeded` / `prompt too large` | reduce_request_size |
 
-### Retryable failures（backoff retry 可）
+### Retryable failures（再試行可能な失敗、backoff retry 可）
 
 これらは一時的な状態変化で解消される可能性がある。
 exponential backoff retry が有効。
@@ -70,7 +71,7 @@ exponential backoff retry が有効。
 | `network_error` | ネットワーク到達不能・ソケットタイムアウト | cli_process | `connection refused` / `socket timeout` / `network unreachable` | `same_request_after_backoff` |
 | `client_subprocess_timeout` | `timeout_sec` 超過による subprocess タイムアウト（プロセス stall / ネットワーク stall） | cli_process | `subprocess.TimeoutExpired` / exit code 124 | `same_request_after_backoff`（timeout_sec 拡大を要検討） |
 
-### Terminal / exhausted failures
+### Terminal / exhausted failures（終端・枯渇状態の失敗）
 
 retry budget 枯渇や model chain 全滅など、これ以上 retry しても意味がない状態。
 Human escalation を推奨。
@@ -82,7 +83,59 @@ Human escalation を推奨。
 | `unknown_cli_failure` | non-zero exit code だが既知パターンにマッチしない |
 | `unknown_api_error` | Gemini envelope に `error` オブジェクトが含まれるが既知分類不能 |
 
-### Conditionally retryable
+### AGY provider failure classes（AGY プロバイダの失敗分類、Issue #1270）
+
+`provider=agy` の `_classify_agy_failure()`（`run_gemini_headless.py`）が
+stdout / stderr の両方から判別する failure_class。`_normalize_agy_result()`
+の non-zero exit 分岐がこの分類器を使う（以前は `agy_exit_nonzero` に
+一律丸められていた）。
+
+| `failure_class` | 意味 | retryable（provider fallback 対象） |
+|---|---|---|
+| `agy_rate_limited` | AGY 側の rate limit / quota 系エラー（`RESOURCE_EXHAUSTED` / `429` / `rate limit`） | yes |
+| `agy_capacity_exhausted` | AGY 側のモデル capacity 不足（`MODEL_CAPACITY_EXHAUSTED` / `overloaded` / `UNAVAILABLE`） | yes |
+| `agy_web_grounding_quota_exhausted` | grounded_research の web grounding quota 枯渇（`Individual quota reached` 等。既存 `preflight_agy.py` の `_QUOTA_EXHAUSTED_RE` と同じ検出対象を一般化） | yes |
+| `agy_auth_required` | AGY 認証未完了 / 失効 | no |
+| `agy_permission_denied` | AGY 権限不足（403 / forbidden、または `agy` exec 時の OS `PermissionError`。fix_delta Blocker 6: `run_delegation()` の `PermissionError` except 節は `_classify_agy_failure()` と同一のこのクラスへ正規化する） | no |
+| `agy_not_found` | `agy` バイナリが `PATH` に見つからない（`run_delegation()` の `FileNotFoundError` except 節。terminal / non-retryable — `cli_missing` の AGY 版に相当） | no |
+| `agy_timeout` | subprocess タイムアウト | no |
+| `agy_exit_nonzero` | non-zero exit だが既知の quota/auth/permission signal にマッチしない一般失敗 | no |
+| `agy_empty_stdout` | 非 CI 環境で exit 0 だが stdout が空 | no |
+| `agy_output_missing` | CI 環境で exit 0 だが stdout が空（`agy_empty_stdout` と同一原因、CI 判定のみ異なる。#1274: `warnings[0]` の leading token は必ず `failure_class` と一致させる） | no |
+| `agy_unexpected_error` | AGY 実行時の未分類例外（terminal / non-retryable） | no |
+
+### provider_auto_policy_v1 fallback classes（フォールバック分類、Issue #1270）
+
+`provider=auto`（`provider_auto_dispatch()`）が provider fallback の
+可否判断・停止理由に使う top-level クラス。`provider_auto_policy_v1`
+の `retryable_failure_classes` / `stop_if` に対応する（
+`config/model_routing.yaml` 参照）。
+
+| `failure_class` / `fallback_reason` token | 意味 | fallback 可否 |
+|---|---|---|
+| `quota_or_rate_limited` | Gemini 側の quota/rate-limit（provider fallback 対象） | yes（次 provider へ） |
+| `model_capacity_exhausted` | Gemini 側の単一モデル capacity 不足（同一 provider 内 model downgrade で先に処理される） | yes（chain 全滅なら次 provider へ） |
+| `model_chain_exhausted` | Gemini の model_chain 全滅（provider fallback の主要トリガー） | yes（次 provider へ） |
+| `provider_profile_unsupported` | `tool_profile` が `provider_auto_policy_v1.eligible_profiles`（v1: `no_tools` / `proposal_only`）外 | no（dispatch 自体を行わない） |
+| `provider_fallback_exhausted` | `runtime_order` の全 provider が retryable failure_class で失敗した（これ以上 fallback 先がない） | no（terminal） |
+
+**Gemini / AGY / canonical class 対応表（正規クラス対応表）**
+
+| 概念 | Gemini 側 | AGY 側 |
+|---|---|---|
+| quota / rate limit | `quota_or_rate_limited` | `agy_rate_limited` |
+| model capacity 不足 | `model_capacity_exhausted` | `agy_capacity_exhausted` |
+| chain / provider 全滅 | `model_chain_exhausted` | (該当なし。AGY は単一 model のため provider fallback がそのまま終端) |
+| web grounding quota | (該当なし。web grounding は AGY grounded_research 専用) | `agy_web_grounding_quota_exhausted` |
+| 認証失効 | `auth_missing_or_expired` | `agy_auth_required` |
+| 権限不足 | `permission_denied` | `agy_permission_denied` |
+
+`post_to_issue_url` を含む request、認証/権限/schema/policy 失敗、
+`provider_profile_unsupported` はいずれも provider fallback の
+stop condition であり、上記の「fallback 可否: no」に対応する
+（`run_gemini_headless.py` の `provider_auto_dispatch()` 参照）。
+
+### Conditionally retryable（条件付きで再試行可能）
 
 状況依存で retry 可否が変わるクラス。
 
@@ -91,7 +144,7 @@ Human escalation を推奨。
 | `output_parse_error` | Gemini CLI の JSON 出力が parse できない | 最大 1 回まで retry。CLI version incompatibility / stdout-stderr 混線の場合は retry 不可なので `classification_confidence: low` + human escalation |
 | `empty_response` | `response_text` が空（API 呼び出し自体は成功） | 最大 1 回まで retry |
 
-### ACP transport failure classes（`transport_details.failure_class`）
+### ACP transport failure classes（ACP トランスポートの失敗分類、`transport_details.failure_class`）
 
 ACP transport の failure は `transport_details.failure_class` に格納され、
 headless_json fallback が可能なものと不可なものが区別されている（`transport-acp.md` 参照）。
@@ -300,6 +353,7 @@ quota_dimension:
     - rpm            # Requests Per Minute
     - tpm            # Tokens Per Minute
     - rpd            # Requests Per Day（枯渇時は retry_scope: next_model）
+    - spend          # 課金上限 / budget exceeded
     - model_capacity # モデル処理キャパシティ（capacity 系 429）
     - unknown        # 種別不明
 
@@ -380,7 +434,14 @@ classification_confidence:
 2. **backoff retry group**（Retryable）: exponential backoff retry 可。
    - 対象: `quota_or_rate_limited`, `model_capacity_exhausted`,
      `transient_api_error`, `network_error`, `client_subprocess_timeout`
-   - 既存実装: `RETRY_LIMIT = 2`、`time.sleep(min(2**attempt, 4))` で backoff
+   - 実装（Issue #1270 fix_delta Blocker 1）: `config/model_routing.yaml` の
+     `providers.gemini.retry_budget`（`get_retry_budget()`）が同一モデルの
+     試行回数（`same_model_attempts`）と backoff（`initial_backoff_seconds` /
+     `max_backoff_seconds` / `jitter`）を決定する。`RETRY_LIMIT` は
+     `retry_budget` 未設定時の default 生成にのみ使われるフォールバック定数。
+   - `retryable_failure_classes` が同一モデル retry の可否を決定する（
+     attempt 単位で `_classify_gemini_retry_failure_class()` が分類し、
+     このリストに含まれる場合のみ retry する）。
    - `quota_or_rate_limited` で `quota_dimension: rpd` の場合は `retry_scope: next_model`
    - quota / capacity exhaustion 時は model downgrade（`retry_scope: next_model`）
    - `retry_after_ms` が設定されている場合は API hint を優先する

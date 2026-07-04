@@ -43,3 +43,88 @@ roles:
       - gemini-3-pro-preview
       - gemini-3-flash-preview
       - gemini-2.5-flash
+
+# provider_auto_policy_v1 (Issue #1270)
+#
+# Fixed v1 policy for runtime provider="auto" dispatch in run_gemini_headless.py
+# (see provider_auto_dispatch()). This block documents the policy; the
+# authoritative enforcement lives in the Python constants of the same name
+# (PROVIDER_AUTO_*) in run_gemini_headless.py -- this YAML block is not
+# re-parsed at runtime, it exists so the policy is discoverable in docs/config
+# per the Issue #1270 Outcome. Keep both in sync when editing either --
+# test_provider_auto_policy_yaml_and_python_constants_are_in_sync() in
+# tests/test_quota_fallback.py compares every key below against the Python
+# constants and fails closed on drift.
+#
+# setup_check_order (setup_check.py --provider auto) is agy-first and is a
+# SEPARATE policy from runtime_order below -- see references/model-routing.md
+# for why the two orders intentionally differ.
+provider_auto_policy_v1:
+  schema_version: v1
+  runtime_order:
+    - gemini
+    - agy
+  setup_check_order:
+    - agy
+    - gemini
+  eligible_profiles:
+    - no_tools
+    - proposal_only
+  retryable_failure_classes:
+    gemini:
+      - quota_or_rate_limited
+      - model_capacity_exhausted
+      - model_chain_exhausted
+    agy:
+      - agy_rate_limited
+      - agy_capacity_exhausted
+      - agy_web_grounding_quota_exhausted
+  stop_if:
+    - request_validation_failed
+    - auth_or_permission_failed
+    - request_has_post_to_issue_url
+    - provider_profile_unsupported
+  result_fields:
+    - selected_provider
+    - provider_attempts
+    - fallback_reason
+    - fallback_policy_version
+    - attempts_by_model
+  idempotency_guard: >-
+    Provider fallback stops permanently once any provider attempt for a
+    request has reached (or would reach) non-idempotent post-processing --
+    concretely, request.post_to_issue_url is set (a `gh issue comment` post
+    is NOT idempotent; retrying it against a second provider would create a
+    duplicate comment). No later provider attempt is made after that point,
+    even if the attempt that reached post-processing failed.
+
+# providers.<name>.retry_budget (Issue #1270 AC2)
+#
+# Provider-scoped retry budget, distinct from roles.<role>.model_chain above.
+# model_chain answers "which models, in what order"; retry_budget answers
+# "how many attempts / how much backoff per provider" independent of role.
+# Validated fail-closed by load_model_routing() -- unknown keys, wrong types,
+# and negative attempt/backoff counts raise ValueError.
+providers:
+  gemini:
+    retry_budget:
+      same_model_attempts: 3
+      same_provider_attempts: 1
+      initial_backoff_seconds: 1
+      max_backoff_seconds: 4
+      jitter: false
+      retryable_failure_classes:
+        - quota_or_rate_limited
+        - model_capacity_exhausted
+        - model_chain_exhausted
+  agy:
+    retry_budget:
+      same_model_attempts: 1
+      same_provider_attempts: 1
+      initial_backoff_seconds: 2
+      max_backoff_seconds: 10
+      jitter: false
+      retryable_failure_classes:
+        - agy_rate_limited
+        - agy_capacity_exhausted
+        - agy_web_grounding_quota_exhausted
