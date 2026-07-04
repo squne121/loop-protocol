@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SCOPE_DELTA_AUTHORITY_EVIDENCE_V1",
+  "description": "Normalized (non-raw) evidence of a scope delta authority source, produced by run_refinement_preflight.py from GitHub comment metadata (#1323). Never carries the raw comment body (AC14).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "source_kind",
+    "source_ref",
+    "source_issue_number",
+    "comment_id",
+    "comment_url",
+    "issue_url",
+    "body_sha256",
+    "author_login",
+    "author_type",
+    "author_association",
+    "captured_at",
+    "directive_markers",
+    "extracted_directives",
+    "ambiguity_flags",
+    "boundary_flags"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "SCOPE_DELTA_AUTHORITY_EVIDENCE_V1"
+    },
+    "source_kind": {
+      "type": "string",
+      "enum": [
+        "issue_comment",
+        "pull_request_review",
+        "parent_issue",
+        "related_issue",
+        "generated_by_agent"
+      ]
+    },
+    "source_ref": { "type": "string" },
+    "source_issue_number": { "type": "integer", "minimum": 1 },
+    "comment_id": { "type": ["integer", "string", "null"] },
+    "comment_url": { "type": ["string", "null"] },
+    "issue_url": { "type": ["string", "null"] },
+    "body_sha256": { "type": "string" },
+    "author_login": { "type": ["string", "null"] },
+    "author_type": {
+      "type": "string",
+      "enum": ["User", "Bot", "Organization", "unknown"]
+    },
+    "author_association": {
+      "type": ["string", "null"],
+      "enum": ["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR", "NONE", null]
+    },
+    "captured_at": { "type": "string", "format": "date-time" },
+    "directive_markers": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "extracted_directives": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "ambiguity_flags": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "boundary_flags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "expands_allowed_paths",
+          "changes_permission_boundary",
+          "changes_external_service_boundary",
+          "destructive_or_non_idempotent_operation",
+          "requires_issue_split"
+        ]
+      }
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["explicit", "ambiguous", "conflicting", "inferred"]
+    }
+  }
+}

@@ -38,9 +38,10 @@ except ImportError:
     _YAML_AVAILABLE = False
 
 try:
-    from scope_signal_delta import compute_scope_signal_delta
+    from scope_signal_delta import classify_scope_delta_authority, compute_scope_signal_delta
 except ImportError:  # pragma: no cover - subprocess/CLI fallback path
     compute_scope_signal_delta = None
+    classify_scope_delta_authority = None
 
 
 class ScopeSignalDeltaError(RuntimeError):
@@ -1924,6 +1925,15 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                 issue_number,
                 issue,
             )
+            if classify_scope_delta_authority is not None and known_context and (
+                "scope_delta_authority_evidence" in known_context
+            ):
+                scope_signal_guard_decision_v2["scope_delta_authority"] = classify_scope_delta_authority(
+                    known_context.get("scope_delta_authority_evidence"),
+                    triggered=_raw_triggered,
+                    target_issue_number=issue_number,
+                    base_issue_body_sha256=issue_body_sha256,
+                )
 
         # Build output
         plan = {
