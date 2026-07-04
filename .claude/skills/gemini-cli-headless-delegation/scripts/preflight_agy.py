@@ -16,9 +16,19 @@ from typing import Any
 EXPECTED_SMOKE = "LOOP_AGY_SMOKE_OK"
 SMOKE_PROMPT = f"Return exactly: {EXPECTED_SMOKE}"
 SMOKE_TIMEOUT_SECONDS = 20
+GROUNDING_PROBE_PROMPT = "Search for: latest reliable news and return exactly one source URL."
+GROUNDING_TIMEOUT_SECONDS = 40
 NONINTERACTIVE_FLAGS = ["-p", "--print", "--prompt"]
 UNEXPECTED_CAPABILITY_KEYWORDS = ["chat", "--output-format"]
 SMOKE_SAMPLE_MAX_CHARS = 500
+_QUOTA_EXHAUSTED_RE = re.compile(
+    r"RESOURCE_EXHAUSTED|quota[_ ]exhausted|Individual quota reached",
+    re.IGNORECASE,
+)
+_HTTP_429_RE = re.compile(
+    r"(?:HTTP\s+|status[:\s]+|code[:\s]+|error[:\s]+)429\b",
+    re.IGNORECASE,
+)
 LOCAL_ASSET_SERENA_TOOL_POLICY = "exact_match"
 SERENA_TOOL_MANIFEST_RELATIVE_PATH = Path(
     ".claude/skills/gemini-cli-headless-delegation/references/serena-tool-manifest.json"
@@ -447,6 +457,102 @@ def _redact_output_sample(text: str) -> str:
     return sample[:SMOKE_SAMPLE_MAX_CHARS]
 
 
+def _extract_urls(text: str) -> list[str]:
+    found: list[str] = []
+    for match in re.findall(r"https?://[^\s\]\)\},<>\"']+", text):
+        normalized = match.strip().rstrip(")]},.\"'")
+        if normalized and normalized not in found:
+            found.append(normalized)
+    return found
+
+
+# Recognized structured web tool-call names (mirrors run_gemini_headless.py's
+# RECOGNIZED_WEB_TOOL_NAMES — Issue #1266 Blocker 1 reopened: this preflight smoke path
+# had not been migrated to the structured tool_calls trace requirement).
+RECOGNIZED_WEB_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "web_search",
+        "websearch",
+        "browser_navigate",
+        "browser",
+        "url_read",
+        "read_url",
+        "fetch_url",
+        "fetch",
+    }
+)
+
+
+def _extract_grounded_research_output(stdout: str) -> dict[str, Any]:
+    """Parse best-effort structured AGY native grounded research evidence from stdout.
+
+    Mirrors run_gemini_headless.py's `_extract_grounded_research_output`. Only a
+    structured JSON payload (via a recognized marker line or a bare JSON line) is
+    considered machine-verifiable; a bare URL string is never treated as structured
+    evidence by this function (Issue #1266 Blocker 1).
+    """
+    markers = (
+        "AGY_GROUNDED_RESEARCH:",
+        "AGY_WEBSEARCH:",
+        "grounded_research:",
+        "grounding:",
+    )
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        for marker in markers:
+            if stripped.startswith(marker):
+                candidate = stripped[len(marker):].strip()
+                try:
+                    parsed = json.loads(candidate)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    return {"source": marker, "data": parsed}
+
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if not (stripped.startswith("{") and stripped.endswith("}")):
+            continue
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and any(
+            key in parsed
+            for key in ("grounded_research", "grounding", "web_search", "web", "citations", "sources", "tool_calls")
+        ):
+            return {"source": "json_line", "data": parsed}
+
+    return {}
+
+
+def _extract_recognized_tool_calls(parsed: dict[str, Any] | None) -> list[dict[str, str]]:
+    """Extract machine-verifiable web tool-call trace entries from structured evidence.
+
+    Only structured `tool_calls` entries whose name is in RECOGNIZED_WEB_TOOL_NAMES count
+    as machine-verifiable evidence. A bare URL string appearing in stdout without this
+    structured trace is NOT a tool-call trace (Issue #1266 Blocker 1).
+    """
+    if not isinstance(parsed, dict):
+        return []
+    data = parsed.get("data")
+    if not isinstance(data, dict):
+        return []
+    calls = data.get("tool_calls")
+    if not isinstance(calls, list):
+        return []
+    recognized: list[dict[str, str]] = []
+    for call in calls:
+        name: Any = None
+        if isinstance(call, dict):
+            name = call.get("name") or call.get("tool")
+        elif isinstance(call, str):
+            name = call
+        if isinstance(name, str) and name.strip().lower() in RECOGNIZED_WEB_TOOL_NAMES:
+            recognized.append({"name": name.strip().lower()})
+    return recognized
+
+
 def _mask_resolved_path(path: str | None) -> str | None:
     """Return a sanitized resolved path suitable for JSON evidence."""
     if not path:
@@ -557,11 +663,98 @@ def _run_smoke(agy_bin: str) -> dict[str, Any]:
     return smoke
 
 
+def _run_grounded_research_smoke(agy_bin: str) -> dict[str, Any]:
+    """Run a bounded AGY native WebSearch/grounding probe.
+
+    This smoke intentionally favors a lightweight query and records evidence
+    samples so caller can verify that web search output can be produced.
+
+    Success requires a machine-verifiable structured `tool_calls` trace naming a
+    recognized web tool (see RECOGNIZED_WEB_TOOL_NAMES). A bare URL string appearing in
+    stdout without this structured trace is weak evidence only and is never treated as
+    proof of a WebSearch tool-call execution; `web_tool_call_count` is never inferred
+    from a URL count alone (Issue #1266 Blocker 1 — this preflight smoke path had not
+    been migrated to the same fail-closed contract already applied to
+    run_gemini_headless.py).
+    """
+    argv = [agy_bin, "-p", GROUNDING_PROBE_PROMPT]
+    result: dict[str, Any] = {
+        "ok": False,
+        "argv": argv,
+        "exit_code": None,
+        "timed_out": False,
+        "failure_reason": None,
+        "failure_class": None,
+        "stdout_sample": "",
+        "stderr_sample": "",
+        "evidence_urls": [],
+        "web_tool_call_count": 0,
+        "url_citation_count": 0,
+        "stdout_line_count": 0,
+        "tool_calls_verified": False,
+    }
+
+    with tempfile.TemporaryDirectory(prefix="agy-preflight-grounding-") as temp_dir:
+        try:
+            proc = _run(argv, cwd=Path(temp_dir), timeout=GROUNDING_TIMEOUT_SECONDS)
+            result["exit_code"] = proc.returncode
+            result["stdout_sample"] = _redact_output_sample(proc.stdout)
+            result["stderr_sample"] = _redact_output_sample(proc.stderr)
+            stdout = proc.stdout or ""
+            stderr = proc.stderr or ""
+            result["stdout_line_count"] = len([line for line in stdout.splitlines() if line.strip()])
+            # Bounded to 1 URL (Issue #1266 Major 1: 1 query / 1 URL quota-bound contract).
+            urls = _extract_urls(stdout)[:1]
+            result["evidence_urls"] = urls
+            result["url_citation_count"] = len(urls)
+
+            parsed = _extract_grounded_research_output(stdout)
+            tool_calls = _extract_recognized_tool_calls(parsed)
+            result["tool_calls_verified"] = bool(tool_calls)
+            result["web_tool_call_count"] = min(len(tool_calls), 1)
+
+            combined_output = "\n".join([stdout, stderr])
+            if _QUOTA_EXHAUSTED_RE.search(combined_output) or _HTTP_429_RE.search(combined_output):
+                result["failure_reason"] = "agy_grounded_research quota exhausted"
+                result["failure_class"] = "agy_grounded_research_quota_exhausted"
+            elif proc.returncode != 0:
+                result["failure_reason"] = f"agy_grounded_research check failed: exit {proc.returncode}"
+                result["failure_class"] = "agy_grounded_research_exit_nonzero"
+            elif not urls and not stdout.strip():
+                is_ci = os.environ.get("CI", "").lower() in {"1", "true", "yes", "on"}
+                result["failure_reason"] = (
+                    "agy_grounded_research output empty"
+                    + (" in CI" if is_ci else "")
+                )
+                result["failure_class"] = "agy_output_missing" if is_ci else "agy_empty_stdout"
+            elif not urls:
+                result["failure_reason"] = "agy_grounded_research no_evidence_urls_found"
+                result["failure_class"] = "agy_grounded_research_no_evidence"
+            elif not tool_calls:
+                # Issue #1266 Blocker 1: a bare URL string is never treated as proof of a
+                # WebSearch tool-call execution without a machine-verifiable structured
+                # tool_calls trace naming a recognized web tool.
+                result["web_tool_call_count"] = 0
+                result["failure_reason"] = (
+                    "agy_grounded_research no machine-verifiable web tool-call trace found"
+                )
+                result["failure_class"] = "agy_web_grounding_tool_call_missing"
+            else:
+                result["ok"] = True
+        except subprocess.TimeoutExpired:
+            result["timed_out"] = True
+            result["failure_reason"] = "agy grounded_research timed out"
+            result["failure_class"] = "client_subprocess_timeout"
+
+    return result
+
+
 def run_preflight(
     *,
     validate_local_asset_contract: bool = False,
     live_serena: bool = False,
     mcp_config_path: Path | None = None,
+    grounded_research: bool = False,
 ) -> dict[str, Any]:
     """Run version → help → smoke checks for agy binary.
 
@@ -594,6 +787,11 @@ def run_preflight(
             "timed_out": False,
             "stdout_sample": "",
             "stderr_sample": "",
+        },
+        "grounded_research": {
+            "ok": False,
+            "requested": grounded_research,
+            "check": None,
         },
         "warnings": [],
     }
@@ -685,6 +883,16 @@ def run_preflight(
         result["recovery_action"] = "check agy configuration and rerun preflight"
         return result
 
+    if grounded_research:
+        grounded_result = _run_grounded_research_smoke(agy_bin)
+        result["grounded_research"]["check"] = grounded_result
+        if not grounded_result["ok"]:
+            result["failure_reason"] = grounded_result.get("failure_reason") or "agy grounded_research probe failed"
+            result["failure_class"] = grounded_result.get("failure_class") or "agy_grounded_research_failed"
+            result["recovery_action"] = "check AGY WebSearch/WebGrounding connectivity and rerun preflight"
+            return result
+        result["grounded_research"]["ok"] = True
+
     if validate_local_asset_contract:
         repo_root = _repo_root()
         manifest: dict[str, Any] | None = None
@@ -727,6 +935,131 @@ def run_preflight(
     return result
 
 
+def build_evidence_envelope(
+    result: dict[str, Any],
+    *,
+    issue_number: int,
+    captured_at: str,
+) -> dict[str, Any]:
+    """Build the checked-in `agy_web_grounding_evidence_v1` envelope directly from a
+    `run_preflight(grounded_research=True)` result.
+
+    This is the single source of truth for checked-in evidence: every field is read from
+    *result* (no independent/hand-authored values), so the generated markdown and the PR body
+    can never drift from the same underlying preflight run (Issue #1266 Blocker 4).
+    """
+    check = ((result.get("grounded_research") or {}).get("check")) or {}
+    urls = check.get("evidence_urls") or []
+    stdout_sample = check.get("stdout_sample") or ""
+    return {
+        "issue_number": issue_number,
+        "captured_at": captured_at,
+        "agy_web_grounding_evidence_v1": {
+            "grounding_actor": "antigravity_cli",
+            "grounding_backend": "agy_native_websearch" if check.get("ok") else "none",
+            "prompt_shape": "bounded_websearch_probe",
+            "agy_cli_version": result.get("agy", {}).get("version"),
+            "command_exit_code": check.get("exit_code"),
+            "web_tool_call_count": check.get("web_tool_call_count", 0),
+            "search_query_count": 1,
+            "url_citation_count": check.get("url_citation_count", 0),
+            "search_queries": [GROUNDING_PROBE_PROMPT],
+            "citations": [{"url": url, "title": None, "cited_text_snippet": None} for url in urls],
+            "transcript_evidence": [
+                {
+                    "source_kind": "agy_stdout_or_artifact_excerpt",
+                    "excerpt": stdout_sample,
+                    "sha256": hashlib.sha256(stdout_sample.encode("utf-8")).hexdigest(),
+                }
+            ],
+            "redaction_status": "checked_no_secret_pattern",
+            "raw_transcript_included": False,
+            "raw_credential_included": False,
+            "repo_absolute_path_included": False,
+            "failure_class": check.get("failure_class"),
+        },
+    }
+
+
+def _yaml_scalar(value: Any) -> str:
+    """Render *value* as a bounded single-line YAML scalar (null / quoted string)."""
+    if value is None:
+        return "null"
+    text_value = str(value).strip().replace("\n", " ").replace('"', "'")
+    return f'"{text_value}"'
+
+
+def render_evidence_markdown(envelope: dict[str, Any]) -> str:
+    """Render the checked-in evidence markdown document from *envelope*.
+
+    *envelope* must come from `build_evidence_envelope()` so that every value (citations,
+    sha256, exit code) is traceable to the exact preflight run that produced it.
+    """
+    evidence = envelope["agy_web_grounding_evidence_v1"]
+    citations_lines = "\n".join(
+        f'    - url: {_yaml_scalar(citation["url"])}\n'
+        f'      title: {_yaml_scalar(citation["title"])}\n'
+        f'      cited_text_snippet: {_yaml_scalar(citation["cited_text_snippet"])}'
+        for citation in evidence["citations"]
+    ) or "    []"
+    transcript = evidence["transcript_evidence"][0]
+    lines = [
+        "# Live AGY Native WebSearch Evidence",
+        "",
+        f"Issue: `#{envelope['issue_number']}`（対象 Issue）",
+        "Provider/profile: `provider=agy + tool_profile=grounded_research`（プロバイダ / プロファイル）",
+        f"Captured at: `{envelope['captured_at']}`（取得日時）",
+        "",
+        "## Command（実行コマンド）",
+        "",
+        "```bash",
+        "uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/preflight_agy.py "
+        "--grounded-research --json",
+        "```",
+        "",
+        "## Sanitized Result（サニタイズ済み結果）",
+        "",
+        "```yaml",
+        "agy_web_grounding_evidence_v1:",
+        f"  grounding_actor: {evidence['grounding_actor']}",
+        f"  grounding_backend: {evidence['grounding_backend']}",
+        f"  prompt_shape: {evidence['prompt_shape']}",
+        f'  agy_cli_version: "{evidence["agy_cli_version"]}"',
+        f"  command_exit_code: {evidence['command_exit_code']}",
+        f"  web_tool_call_count: {evidence['web_tool_call_count']}",
+        f"  search_query_count: {evidence['search_query_count']}",
+        f"  url_citation_count: {evidence['url_citation_count']}",
+        "  search_queries:",
+        *[f'    - "{query}"' for query in evidence["search_queries"]],
+        "  citations:",
+        citations_lines,
+        "  transcript_evidence:",
+        "    - source_kind: agy_stdout_or_artifact_excerpt",
+        f"      excerpt: {_yaml_scalar(transcript['excerpt'])}",
+        f'      sha256: "{transcript["sha256"]}"',
+        f"  redaction_status: {evidence['redaction_status']}",
+        f"  raw_transcript_included: {str(evidence['raw_transcript_included']).lower()}",
+        f"  raw_credential_included: {str(evidence['raw_credential_included']).lower()}",
+        f"  repo_absolute_path_included: {str(evidence['repo_absolute_path_included']).lower()}",
+        f"  failure_class: {_yaml_scalar(evidence['failure_class'])}",
+        "```",
+        "",
+        "## Boundary Claim（境界主張）",
+        "",
+        "This evidence was produced by AGY native `agy -p` execution through "
+        "`preflight_agy.py --grounded-research`.",
+        "It is not Gemini API Google Search grounding, not wrapper-side web retrieval, and not "
+        "fixture-only evidence.",
+        "この証跡は AGY ネイティブの `agy -p` "
+        "実行を通じて取得したものであり、"
+        "Gemini API の Google Search grounding でも wrapper 側の Web "
+        "取得でもなく、fixture のみの証跡でも"
+        "ないことを明示する。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point for CLI invocation.
 
@@ -764,11 +1097,37 @@ def main(argv: list[str] | None = None) -> int:
         help="Launch the pinned Serena MCP server and run live read-only tool calls.",
     )
     parser.add_argument(
+        "--grounded-research",
+        "--live-websearch",
+        "--discover-web-grounding",
+        action="store_true",
+        dest="grounded_research",
+        default=False,
+        help="Run a bounded AGY native WebSearch/WebGrounding probe.",
+    )
+    parser.add_argument(
         "--output-file",
         required=False,
         type=Path,
         default=None,
         help="Path to write the preflight result JSON.",
+    )
+    parser.add_argument(
+        "--render-evidence-doc",
+        required=False,
+        type=Path,
+        default=None,
+        help=(
+            "Render docs/dev/agy-grounded-research-evidence.md from this run's grounded_research "
+            "result and write it to the given path. Requires --grounded-research."
+        ),
+    )
+    parser.add_argument(
+        "--evidence-issue-number",
+        required=False,
+        type=int,
+        default=1266,
+        help="Issue number to record in the rendered evidence doc.",
     )
     args = parser.parse_args(argv)
 
@@ -776,6 +1135,7 @@ def main(argv: list[str] | None = None) -> int:
         validate_local_asset_contract=args.local_asset_research,
         live_serena=args.live_serena,
         mcp_config_path=args.mcp_config,
+        grounded_research=args.grounded_research,
     )
 
     if args.json_stdout:
@@ -786,6 +1146,21 @@ def main(argv: list[str] | None = None) -> int:
         with args.output_file.open("w", encoding="utf-8") as fh:
             json.dump(result, fh, ensure_ascii=False, indent=2)
             fh.write("\n")
+
+    if args.render_evidence_doc is not None:
+        import datetime
+
+        if not args.grounded_research:
+            raise SystemExit("--render-evidence-doc requires --grounded-research")
+        captured_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        envelope = build_evidence_envelope(
+            result,
+            issue_number=args.evidence_issue_number,
+            captured_at=captured_at,
+        )
+        markdown = render_evidence_markdown(envelope)
+        args.render_evidence_doc.parent.mkdir(parents=True, exist_ok=True)
+        args.render_evidence_doc.write_text(markdown, encoding="utf-8")
 
     return 0 if result["ok"] else 1
 
