@@ -101,6 +101,63 @@ uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/se
 - API key 暫定運用は #104 が完了するまでのブリッジであり、agy 移行が完了したら不要になる。
 - agy 移行の進捗は `docs/dev/current-focus.md` および #104 を参照。
 
+## AGY 認証診断・既知の環境課題（WSL2 / non-TTY）（Issue #1267）
+
+`preflight_agy.py` の `run_preflight()` は、すべての `agy_preflight_result/v1`
+（success / CLI missing / smoke failure / timeout / grounded・local-asset sub-check
+failure のいずれでも）に `auth: agy_auth_diagnostics_v1` を含める。
+`setup_check.py --provider agy --json` はこの `auth` オブジェクトを
+`agy_preflight.auth` にそのまま surfacing する（schema drift なし。SSOT は
+`preflight_agy.py`）。
+
+`agy_auth_diagnostics_v1` は以下を含む:
+
+- `auth_mode`（`unknown` / `system_keyring_cached` / `google_sign_in_required` /
+  `api_key_env_present` / `unauthenticated` / `auth_probe_failed`）と
+  `auth_mode_confidence`（`observed` / `inferred` / `unknown`）
+- `keyring`（`available` / `backend_hint` / `failure_class`）
+- `tty`（`stdin_isatty` / `stdout_isatty` / `stderr_isatty` / `noninteractive_mode`）
+- `platform`（`os` / `is_wsl` / `wsl_hint`）
+- `recovery_action`
+
+診断用の env snapshot（`DBUS_SESSION_BUS_ADDRESS_present` 等の boolean のみ）と、
+agy subprocess 実行用の minimal env（`_minimal_agy_env()`）は分離されている。
+診断結果に環境変数の値そのものが含まれることはない。
+
+### 既知の問題 1: WSL2 での keyring 未到達 / OAuth 再認証
+
+WSL2 環境ではデフォルトで D-Bus session bus が起動していないため、
+`DBUS_SESSION_BUS_ADDRESS` が未設定なことが多く、secret-service 経由の
+system keyring バックエンドに到達できない（`auth.keyring.failure_class:
+system_keyring_unavailable`、`auth.platform.is_wsl: true`）。この状態では agy が
+キャッシュ済み認証情報を読めず、再認証（Google Sign-In）が要求されることがある。
+
+recovery action:
+
+```bash
+# D-Bus session を起動してから agy / preflight を実行する
+dbus-launch --exit-with-session -- \
+  uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/preflight_agy.py --json
+```
+
+D-Bus session を用意できない場合は、対話的な TTY セッションで一度
+`agy` の認証（Google Sign-In）を完了させてから、non-TTY で `agy -p` を実行する。
+
+### 既知の問題 2: `agy -p` の non-TTY 実行時 silent stdout drop
+
+`agy -p` を non-TTY（`stdin_isatty`/`stdout_isatty` が false）で実行すると、
+認証が必要な状態でも exit code 0 かつ空 stdout を返すことがある
+（`smoke.failure_class: agy_empty_stdout` / CI では `agy_output_missing`）。
+これは "silent" な失敗であり、stderr/stdout に明示的な auth/keyring 証跡が
+ない限り auth failure として再分類されない（`agy_empty_stdout` /
+`agy_output_missing` は output-surface failure のまま維持される — Issue #1267
+Required Result Contract）。
+
+recovery action: 対話的 TTY セッションで `agy` の認証状態を確認・再ログインし、
+その後 non-TTY 実行を再試行する。stderr に `keyring` / `sign in` /
+`interactive login required` 等の文言が含まれる場合は、
+`auth.auth_mode` / `auth.recovery_action` を優先的に参照する。
+
 ## Core Rules（基本ルール）
 
 ### Delegation Boundary
