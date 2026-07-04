@@ -692,6 +692,20 @@ class TestInputValidation:
 # #1311: LOOP_HANDOFF_RESULT_V1 marker generation
 # ---------------------------------------------------------------------------
 
+def _make_skipped_auto_fix_item(kind: str = "metadata_hygiene") -> dict:
+    """A single valid auto_fixes.skipped entry (schema definitions.auto_fix_item)."""
+    return {
+        "kind": kind,
+        "executor": "implementation-worker",
+        "result": "skipped",
+        "evidence": {
+            "before": "before-state",
+            "after": "after-state",
+            "comment_url": "https://github.com/o/r/issues/1#issuecomment-2",
+        },
+    }
+
+
 def _make_loop_handoff(
     *,
     status: str = "impl_ready",
@@ -702,6 +716,7 @@ def _make_loop_handoff(
     latest_comment_url: str = "https://github.com/o/r/issues/1#issuecomment-1",
     metadata_ready: bool = True,
     auto_fixes_result: str = "auto_fixed",
+    auto_fixes_skipped: list[dict] | None = None,
 ) -> dict:
     return {
         "status": status,
@@ -720,7 +735,7 @@ def _make_loop_handoff(
         "auto_fixes": {
             "result": auto_fixes_result,
             "required": [],
-            "skipped": [],
+            "skipped": auto_fixes_skipped if auto_fixes_skipped is not None else [],
         },
         "blockers": blockers if blockers is not None else [],
         "permissions": {"unavailable": []},
@@ -810,21 +825,53 @@ class TestLoopHandoffRoutingRulesMatrix:
     blocked (plus human_judgment_required for full table coverage)."""
 
     def test_render_termination_report_routing_rules_matrix(self):
+        # Each case is built to be consistent with exactly one Routing Rules
+        # row (references/termination-policy.md): impl_ready via all
+        # invariants satisfied; blocked via a bad gate_result + non-empty
+        # blockers; human_judgment_required via non-empty auto_fixes.skipped
+        # with an otherwise-clean payload (blockers must stay empty, since a
+        # non-empty blockers list forces blocked/blocked regardless of the
+        # other fields per _validate_loop_handoff_policy()).
         cases = [
-            ("impl_ready", "run_impl_review_loop"),
-            ("blocked", "blocked"),
-            ("human_judgment_required", "ask_human"),
+            (
+                "impl_ready",
+                "run_impl_review_loop",
+                dict(
+                    contract_review_status="go",
+                    gate_result="fresh_go",
+                    blockers=[],
+                    auto_fixes_result="auto_fixed",
+                    auto_fixes_skipped=[],
+                ),
+            ),
+            (
+                "blocked",
+                "blocked",
+                dict(
+                    contract_review_status="blocked",
+                    gate_result="missing_go",
+                    blockers=[{"kind": "x", "description": "y"}],
+                    auto_fixes_result="blocked",
+                    auto_fixes_skipped=[],
+                ),
+            ),
+            (
+                "human_judgment_required",
+                "ask_human",
+                dict(
+                    contract_review_status="go",
+                    gate_result="fresh_go",
+                    blockers=[],
+                    auto_fixes_result="human_judgment_required",
+                    auto_fixes_skipped=[_make_skipped_auto_fix_item()],
+                ),
+            ),
         ]
-        for status, routing_action in cases:
+        for status, routing_action, overrides in cases:
             loop_handoff = _make_loop_handoff(
                 status=status,
                 routing_action=routing_action,
-                contract_review_status="blocked" if status == "blocked" else "go",
-                gate_result="missing_go" if status == "blocked" else "fresh_go",
-                blockers=[{"kind": "x", "description": "y"}] if status != "impl_ready" else [],
-                auto_fixes_result=(
-                    "auto_fixed" if status == "impl_ready" else status
-                ),
+                **overrides,
             )
             data = _make_input("approved", issue_number=1)
             data["loop_handoff"] = loop_handoff
@@ -851,6 +898,180 @@ class TestLoopHandoffRoutingRulesMatrix:
         data["loop_handoff"] = loop_handoff
         with pytest.raises(rtr.InputValidationError):
             rtr.render(data)
+
+    def test_render_termination_report_human_judgment_required_with_missing_go_rejected(self):
+        """Blocker (reviewer #1317): a payload declaring
+        status=human_judgment_required/routing_action=ask_human while
+        contract_review.gate_result=missing_go (a gate result the Routing
+        Rules table reserves for status=blocked/routing_action=blocked) must
+        be rejected, not silently accepted as valid."""
+        loop_handoff = _make_loop_handoff(
+            status="human_judgment_required",
+            routing_action="ask_human",
+            contract_review_status="blocked",
+            gate_result="missing_go",
+            blockers=[],
+            auto_fixes_result="human_judgment_required",
+            auto_fixes_skipped=[],
+        )
+        data = _make_input("approved", issue_number=1)
+        data["loop_handoff"] = loop_handoff
+        with pytest.raises(rtr.InputValidationError):
+            rtr.render(data)
+
+    def test_render_termination_report_impl_ready_with_nonempty_skipped_rejected(self):
+        """status=impl_ready with a non-empty auto_fixes.skipped violates both
+        the schema's allOf/if-then clause and the auto_fixes.skipped ->
+        human_judgment_required/ask_human Routing Rules row."""
+        loop_handoff = _make_loop_handoff(
+            status="impl_ready",
+            routing_action="run_impl_review_loop",
+            contract_review_status="go",
+            gate_result="fresh_go",
+            blockers=[],
+            auto_fixes_result="human_judgment_required",
+            auto_fixes_skipped=[_make_skipped_auto_fix_item()],
+        )
+        data = _make_input("approved", issue_number=1)
+        data["loop_handoff"] = loop_handoff
+        with pytest.raises(rtr.InputValidationError):
+            rtr.render(data)
+
+    def test_render_termination_report_impl_ready_metadata_false_without_auto_fix_evidence_rejected(self):
+        """status=impl_ready with metadata.title_prefix_ready=false and no
+        applied metadata_hygiene/template_hygiene auto_fixes.required entry
+        must be rejected (references/termination-policy.md impl_ready
+        definition items 3-4)."""
+        loop_handoff = _make_loop_handoff(
+            status="impl_ready",
+            routing_action="run_impl_review_loop",
+            contract_review_status="go",
+            gate_result="fresh_go",
+            blockers=[],
+            metadata_ready=False,
+            auto_fixes_result="auto_fixed",
+            auto_fixes_skipped=[],
+        )
+        data = _make_input("approved", issue_number=1)
+        data["loop_handoff"] = loop_handoff
+        with pytest.raises(rtr.InputValidationError):
+            rtr.render(data)
+
+    def test_render_termination_report_impl_ready_metadata_false_with_applied_auto_fix_accepted(self):
+        """status=impl_ready with metadata.title_prefix_ready=false /
+        phase_label_ready=false is allowed when auto_fixes.required contains
+        an applied metadata_hygiene entry with evidence (title prefix / phase
+        label unreadiness alone must not block impl_ready when a worker
+        auto-fix was applied)."""
+        loop_handoff = _make_loop_handoff(
+            status="impl_ready",
+            routing_action="run_impl_review_loop",
+            contract_review_status="go",
+            gate_result="fresh_go",
+            blockers=[],
+            metadata_ready=False,
+            auto_fixes_result="auto_fixed",
+            auto_fixes_skipped=[],
+        )
+        loop_handoff["auto_fixes"]["required"] = [
+            {
+                "kind": "metadata_hygiene",
+                "executor": "implementation-worker",
+                "result": "applied",
+                "evidence": {
+                    "before": "no title prefix",
+                    "after": "[Impl] title prefix",
+                    "comment_url": "https://github.com/o/r/issues/1#issuecomment-3",
+                },
+            }
+        ]
+        data = _make_input("approved", issue_number=1)
+        data["loop_handoff"] = loop_handoff
+        result = rtr.render(data)
+        assert result["publishable"] is True, result.get("reason_code")
+
+
+class TestLoopHandoffWrapperFormAccepted:
+    """High 2 (reviewer #1317): the schema's canonical wrapper form
+    ``{"LOOP_HANDOFF_RESULT_V1": {...}}`` must be accepted in addition to the
+    bare inner object, without synthesizing/deriving any field from a
+    partial payload."""
+
+    def test_render_termination_report_wrapper_form_loop_handoff_accepted(self):
+        inner = _make_loop_handoff()
+        data = _make_input("approved", issue_number=1)
+        data["loop_handoff"] = {"LOOP_HANDOFF_RESULT_V1": inner}
+        result = rtr.render(data)
+        assert result["publishable"] is True, result.get("reason_code")
+        parsed = _extract_marker_yaml_block(result["body"])
+        assert parsed["LOOP_HANDOFF_RESULT_V1"]["status"] == "impl_ready"
+
+    def test_render_termination_report_wrapper_form_and_bare_form_equivalent(self):
+        inner = _make_loop_handoff()
+        data_bare = _make_input("approved", issue_number=1)
+        data_bare["loop_handoff"] = inner
+        result_bare = rtr.render(data_bare)
+
+        data_wrapped = _make_input("approved", issue_number=1)
+        data_wrapped["loop_handoff"] = {"LOOP_HANDOFF_RESULT_V1": inner}
+        result_wrapped = rtr.render(data_wrapped)
+
+        assert result_bare["publishable"] is True
+        assert result_wrapped["publishable"] is True
+        assert _extract_marker_yaml_block(result_bare["body"]) == _extract_marker_yaml_block(
+            result_wrapped["body"]
+        )
+
+    def test_render_termination_report_wrapper_form_does_not_synthesize_partial_payload(self):
+        """A minimal/partial wrapper payload (missing required inner fields)
+        must still fail closed -- normalization must not derive/synthesize
+        the missing fields."""
+        data = _make_input("approved", issue_number=1)
+        data["loop_handoff"] = {"LOOP_HANDOFF_RESULT_V1": {"status": "impl_ready"}}
+        with pytest.raises(rtr.InputValidationError):
+            rtr.render(data)
+
+    def test_render_termination_report_ambiguous_wrapper_shape_rejected(self):
+        """A dict with the wrapper key plus an extra sibling key is ambiguous
+        and must be rejected rather than silently unwrapped."""
+        inner = _make_loop_handoff()
+        data = _make_input("approved", issue_number=1)
+        data["loop_handoff"] = {
+            "LOOP_HANDOFF_RESULT_V1": inner,
+            "unexpected_sibling_key": "nope",
+        }
+        with pytest.raises(rtr.InputValidationError):
+            rtr.render(data)
+
+
+class TestLoopHandoffDateTimeFormatRejected:
+    """Medium (reviewer #1317): invalid date-time strings in loop_handoff
+    generated_at fields must be rejected even though jsonschema's default
+    FormatChecker does not register a "date-time" checker without an
+    optional dependency (rfc3339-validator / strict-rfc3339)."""
+
+    def test_render_termination_report_invalid_generated_at_rejected(self):
+        loop_handoff = _make_loop_handoff()
+        loop_handoff["generated_at"] = "not-a-date-time"
+        data = _make_input("approved", issue_number=1)
+        data["loop_handoff"] = loop_handoff
+        with pytest.raises(rtr.InputValidationError):
+            rtr.render(data)
+
+    def test_render_termination_report_invalid_contract_review_generated_at_rejected(self):
+        loop_handoff = _make_loop_handoff()
+        loop_handoff["contract_review"]["generated_at"] = "not-a-date-time"
+        data = _make_input("approved", issue_number=1)
+        data["loop_handoff"] = loop_handoff
+        with pytest.raises(rtr.InputValidationError):
+            rtr.render(data)
+
+    def test_render_termination_report_valid_generated_at_accepted(self):
+        loop_handoff = _make_loop_handoff()
+        data = _make_input("approved", issue_number=1)
+        data["loop_handoff"] = loop_handoff
+        result = rtr.render(data)
+        assert result["publishable"] is True, result.get("reason_code")
 
 
 class TestLoopHandoffNonApprovedOmitsMarker:

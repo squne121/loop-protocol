@@ -63,14 +63,27 @@ LOOP_HANDOFF_SCHEMA_PATH = (
     _SKILLS_ROOT / "issue-refinement-loop" / "schemas" / "loop_handoff_result_v1.json"
 )
 
-# references/termination-policy.md "Routing Rules" table (minimum fixed subset
-# enforced here as a policy-level validator; the schema itself only encodes the
-# impl_ready -> run_impl_review_loop pairing via its allOf/if/then clause).
+# references/termination-policy.md "Routing Rules" table (fixed subset
+# retained as documentation; the actual enforcement is now done field-by-field
+# in _validate_loop_handoff_policy() below, since this simple top-level map
+# cannot express the gate_result / blockers / auto_fixes.skipped consistency
+# rules the Routing Rules table requires).
 LOOP_HANDOFF_ROUTING_RULES: dict[str, str] = {
     "impl_ready": "run_impl_review_loop",
     "blocked": "blocked",
     "human_judgment_required": "ask_human",
 }
+
+# gate_result values that are never compatible with status=impl_ready and
+# always require status=blocked / routing_action=blocked per the Routing
+# Rules table (references/termination-policy.md).
+_BAD_GATE_RESULTS = frozenset(
+    {"missing_go", "stale_go", "invalidated_by_request_changes", "blocked"}
+)
+
+# auto_fixes.required kinds that count as metadata-readiness auto-fix
+# evidence (references/termination-policy.md impl_ready definition, item 3/4).
+_METADATA_READY_AUTO_FIX_KINDS = frozenset({"metadata_hygiene", "template_hygiene"})
 
 _loop_handoff_schema_cache: dict[str, Any] | None = None
 
@@ -84,30 +97,182 @@ def _get_loop_handoff_schema() -> dict[str, Any]:
     return _loop_handoff_schema_cache
 
 
-def _validate_routing_rules(loop_handoff: dict[str, Any]) -> str:
+def _normalize_loop_handoff(loop_handoff: Any) -> Any:
     """
-    Policy-level validator for references/termination-policy.md Routing Rules.
+    Accept both the bare LOOP_HANDOFF_RESULT_V1 inner object and the schema's
+    canonical wrapper form ``{"LOOP_HANDOFF_RESULT_V1": {...}}``, returning the
+    inner object in both cases.
 
-    Fixes at least the impl_ready/run_impl_review_loop and blocked/blocked
-    pairings (plus human_judgment_required/ask_human) as a decision-authored
-    constraint on top of jsonschema structural validation.
+    Does not synthesize or derive any field from a partial/minimal payload:
+    if the wrapper's value is not itself a dict, or the shape is otherwise
+    ambiguous (e.g. extra sibling keys alongside the wrapper key), the input
+    is returned unchanged so that downstream schema validation rejects it
+    (fail-closed) rather than silently guessing at intent.
+    """
+    if (
+        isinstance(loop_handoff, dict)
+        and set(loop_handoff.keys()) == {"LOOP_HANDOFF_RESULT_V1"}
+        and isinstance(loop_handoff["LOOP_HANDOFF_RESULT_V1"], dict)
+    ):
+        return loop_handoff["LOOP_HANDOFF_RESULT_V1"]
+    return loop_handoff
+
+
+def _validate_loop_handoff_policy(loop_handoff: dict[str, Any]) -> str:
+    """
+    Policy-level validator for references/termination-policy.md Routing Rules
+    and the impl_ready definition.
+
+    This function is a pure *verifier*: it checks whether the caller-supplied
+    status/routing_action is consistent with the other loop_handoff fields
+    (contract_review.gate_result, blockers, auto_fixes.skipped, permissions,
+    metadata + auto_fixes.required evidence). It never derives or synthesizes
+    status/routing_action from those fields -- it only rejects combinations
+    that the Routing Rules table declares impossible. Combinations that the
+    table cannot decide purely from these fields (e.g. status=
+    human_judgment_required due to a semantic scope/goal/AC change, which
+    has no dedicated field here) are left unrejected by this function.
+
+    Returns "" on success, an error message string otherwise.
     """
     status = loop_handoff.get("status")
     routing_action = loop_handoff.get("routing_action")
-    expected = LOOP_HANDOFF_ROUTING_RULES.get(status)
-    if expected is not None and routing_action != expected:
-        return (
-            f"loop_handoff routing rule violation: status={status!r} requires "
-            f"routing_action={expected!r} per references/termination-policy.md "
-            f"Routing Rules, got routing_action={routing_action!r}"
-        )
+
+    contract_review = loop_handoff.get("contract_review")
+    contract_review = contract_review if isinstance(contract_review, dict) else {}
+    gate_result = contract_review.get("gate_result")
+
+    blockers = loop_handoff.get("blockers")
+    blockers = blockers if isinstance(blockers, list) else []
+
+    auto_fixes = loop_handoff.get("auto_fixes")
+    auto_fixes = auto_fixes if isinstance(auto_fixes, dict) else {}
+    skipped = auto_fixes.get("skipped")
+    skipped = skipped if isinstance(skipped, list) else []
+    required = auto_fixes.get("required")
+    required = required if isinstance(required, list) else []
+
+    permissions = loop_handoff.get("permissions")
+    permissions = permissions if isinstance(permissions, dict) else {}
+    unavailable = permissions.get("unavailable")
+    unavailable = unavailable if isinstance(unavailable, list) else []
+
+    metadata = loop_handoff.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+
+    if gate_result in _BAD_GATE_RESULTS:
+        if status != "blocked" or routing_action != "blocked":
+            return (
+                f"loop_handoff policy violation: contract_review.gate_result={gate_result!r} "
+                "requires status=blocked and routing_action=blocked per "
+                "references/termination-policy.md Routing Rules "
+                f"(got status={status!r} routing_action={routing_action!r})"
+            )
+
+    if blockers:
+        if status != "blocked" or routing_action != "blocked":
+            return (
+                "loop_handoff policy violation: non-empty blockers requires "
+                "status=blocked and routing_action=blocked per "
+                "references/termination-policy.md Routing Rules "
+                f"(got status={status!r} routing_action={routing_action!r})"
+            )
+
+    if skipped:
+        if status != "human_judgment_required" or routing_action != "ask_human":
+            return (
+                "loop_handoff policy violation: non-empty auto_fixes.skipped requires "
+                "status=human_judgment_required and routing_action=ask_human per "
+                "references/termination-policy.md Routing Rules "
+                f"(got status={status!r} routing_action={routing_action!r})"
+            )
+
+    if status == "impl_ready":
+        # The schema's allOf/if-then clause already structurally enforces:
+        # routing_action == run_impl_review_loop, contract_review.status ==
+        # go, contract_review.gate_result == fresh_go, blockers == [],
+        # permissions.unavailable == [], auto_fixes.skipped == [] (all of
+        # these are top-level required properties, so the "then" clause's
+        # sibling constraints always apply once status == impl_ready).
+        #
+        # The metadata readiness / auto-fix evidence fallback (impl_ready
+        # definition items 3-4 in references/termination-policy.md) is not
+        # expressible in that schema clause and is enforced here instead.
+        for ready_key in ("title_prefix_ready", "phase_label_ready"):
+            if metadata.get(ready_key):
+                continue
+            applied = any(
+                isinstance(item, dict)
+                and item.get("kind") in _METADATA_READY_AUTO_FIX_KINDS
+                and item.get("result") == "applied"
+                and isinstance(item.get("evidence"), dict)
+                for item in required
+            )
+            if not applied:
+                return (
+                    f"loop_handoff policy violation: status=impl_ready requires "
+                    f"metadata.{ready_key}=true, or an applied auto_fixes.required "
+                    f"entry (kind in {sorted(_METADATA_READY_AUTO_FIX_KINDS)}) with "
+                    f"evidence, but metadata.{ready_key}=false and no matching "
+                    "applied auto-fix entry was found"
+                )
+
+        if unavailable:
+            return (
+                "loop_handoff policy violation: status=impl_ready requires "
+                f"permissions.unavailable to be empty, got {unavailable!r}"
+            )
+
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# date-time field validation (Medium: jsonschema's FormatChecker does not
+# register a "date-time" checker unless an optional dependency such as
+# rfc3339-validator / strict-rfc3339 is installed, so schema-level format
+# validation silently no-ops for these fields without one. This supplements
+# it with a dependency-free structural + calendar check.)
+# ---------------------------------------------------------------------------
+
+_DATE_TIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def _is_valid_date_time(value: Any) -> bool:
+    """Minimal dependency-free RFC3339 date-time validator."""
+    if not isinstance(value, str) or not _DATE_TIME_RE.match(value):
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_loop_handoff_date_time_fields(loop_handoff: dict[str, Any]) -> str:
+    """Validate generated_at date-time fields. Returns "" on success."""
+    generated_at = loop_handoff.get("generated_at")
+    if generated_at is not None and not _is_valid_date_time(generated_at):
+        return f"loop_handoff.generated_at is not a valid date-time: {generated_at!r}"
+
+    contract_review = loop_handoff.get("contract_review")
+    if isinstance(contract_review, dict):
+        cr_generated_at = contract_review.get("generated_at")
+        if cr_generated_at is not None and not _is_valid_date_time(cr_generated_at):
+            return (
+                "loop_handoff.contract_review.generated_at is not a valid "
+                f"date-time: {cr_generated_at!r}"
+            )
+
     return ""
 
 
 def _validate_loop_handoff(loop_handoff: Any) -> str:
     """
     Validate a loop_handoff payload against schemas/loop_handoff_result_v1.json
-    (jsonschema Draft7Validator + FormatChecker) and the Routing Rules policy.
+    (jsonschema Draft7Validator + FormatChecker), the date-time fields, and
+    the Routing Rules / impl_ready policy.
 
     Returns "" on success, an error message string otherwise. This function is
     the sole responsibility boundary for loop_handoff acceptance: it does not
@@ -129,7 +294,11 @@ def _validate_loop_handoff(loop_handoff: Any) -> str:
             f"(path: {list(first.path)})"
         )
 
-    return _validate_routing_rules(loop_handoff)
+    date_time_err = _validate_loop_handoff_date_time_fields(loop_handoff)
+    if date_time_err:
+        return date_time_err
+
+    return _validate_loop_handoff_policy(loop_handoff)
 
 
 def _render_loop_handoff_marker(loop_handoff: dict[str, Any]) -> str:
@@ -403,11 +572,18 @@ def normalize_input(raw: Any) -> dict[str, Any]:
     - `scope_signal_guard_decision_v2` (optional, #1090 AC6) is projected
       into `blockers_summary` entries (route / missing_approval_field /
       suggested_contract_patch) and then removed from the payload
+    - `loop_handoff` (optional, #1311) accepts either the bare inner object
+      or the schema's canonical wrapper form
+      ``{"LOOP_HANDOFF_RESULT_V1": {...}}`` and is normalized to the inner
+      object (see _normalize_loop_handoff)
     """
     if not isinstance(raw, dict):
         raise InputValidationError("Input must be a JSON object")
 
     data = dict(raw)
+
+    if "loop_handoff" in data and data["loop_handoff"] is not None:
+        data["loop_handoff"] = _normalize_loop_handoff(data["loop_handoff"])
 
     if "scope_signal_guard_decision_v2" in data:
         decision = data.pop("scope_signal_guard_decision_v2")

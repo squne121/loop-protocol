@@ -1062,3 +1062,67 @@ class TestLoopHandoffWiring:
         renderer_call = mock_run.call_args_list[0]
         sent_payload = json.loads(renderer_call.kwargs.get("input"))
         assert "loop_handoff" not in sent_payload
+
+
+# ---------------------------------------------------------------------------
+# High 1 (reviewer #1317): --input-file wiring must preserve loop_handoff
+# through main()'s CLI entry point, not just publish()'s direct call.
+# ---------------------------------------------------------------------------
+
+class TestInputFilePreservesLoopHandoff:
+    """High 1: verify the --input-file code path (main()) forwards the full
+    loop_handoff payload to the renderer subprocess unmodified, with a deep
+    equality assertion on the whole loop_handoff object (not just status)."""
+
+    def test_publish_termination_report_input_file_preserves_loop_handoff(
+        self, tmp_path, monkeypatch
+    ):
+        loop_handoff = {
+            "status": "impl_ready",
+            "routing_action": "run_impl_review_loop",
+            "contract_review": {
+                "status": "go",
+                "gate_result": "fresh_go",
+                "latest_comment_url": "https://example.com/c",
+                "generated_at": "2026-07-04T00:00:00Z",
+                "body_sha256": "sha256:" + "a" * 64,
+            },
+            "metadata": {"title_prefix_ready": True, "phase_label_ready": True},
+            "auto_fixes": {"result": "auto_fixed", "required": [], "skipped": []},
+            "blockers": [],
+            "permissions": {"unavailable": []},
+            "generated_at": "2026-07-04T00:00:00Z",
+        }
+        input_data = _make_input("approved", issue_number=1311)
+        input_data["loop_handoff"] = loop_handoff
+
+        input_file = tmp_path / "termination_report_input.json"
+        input_file.write_text(json.dumps(input_data), encoding="utf-8")
+
+        fake_proc = _fake_renderer_proc(_make_render_result())
+
+        argv = [
+            "publish_termination_report.py",
+            "--issue-number",
+            "1311",
+            "--repo",
+            "squne121/loop-protocol",
+            "--input-file",
+            str(input_file),
+        ]
+        monkeypatch.setattr(sys, "argv", argv)
+
+        with patch("subprocess.run", return_value=fake_proc) as mock_run:
+            with patch.object(pub, "_post_github_comment", return_value=0):
+                exit_code = pub.main()
+
+        assert exit_code == 0
+
+        renderer_call = mock_run.call_args_list[0]
+        sent_input = renderer_call.kwargs.get("input")
+        assert sent_input is not None
+        sent_payload = json.loads(sent_input)
+
+        # Deep equality on the whole loop_handoff object, not just status --
+        # the --input-file code path must not drop/filter/mutate any field.
+        assert sent_payload["loop_handoff"] == loop_handoff
