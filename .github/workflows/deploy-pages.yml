@@ -390,7 +390,9 @@ jobs:
               if (( SECONDS >= deadline )); then
                 echo "ERROR: URL did not become live before deadline: $url" >&2
                 echo "last_status=$status" >&2
-                [ -s "${output}.tmp" ] && head -c 800 "${output}.tmp" >&2 || true
+                if [ -s "${output}.tmp" ]; then
+                  head -c 800 "${output}.tmp" >&2
+                fi
                 return 1
               fi
 
