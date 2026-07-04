@@ -117,6 +117,72 @@ COMPACT_MISSING_SECTION = {
     "findings": [],
 }
 
+COMPACT_C9_DETERMINISTIC = {
+    # Producer-derived shape: mirrors what `check_issue_contract.py`'s C9
+    # FAIL/LEGACY_MISSING path (post narrow-approval fix) actually emits via
+    # `_append_findings(..., finding_kind=REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,
+    # checker_evidence=_make_self_checker_evidence(...), reviewer_blocker_code="C9")`,
+    # then compacted by `compact_review_result.py` into the
+    # ISSUE_REVIEW_RESULT_COMPACT_V1 shape consumed here.
+    #
+    # NOTE (PR #1319 reviewer blocker fix, #1314): `compact_review_result.py`
+    # emits the canonical body-hash field as `producer_body_sha256`
+    # (`"producer_body_sha256": raw_result.get("body_sha256")`); the bare
+    # `body_sha256` key is only a back-compat fallback consumed in
+    # `reviewer_claim_replay.py`. This fixture must exercise the canonical
+    # producer shape, not the fallback, so it carries `producer_body_sha256`
+    # here, matching `READINESS_CLEAN["body_sha256"]` ("sha256:body-a").
+    "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
+    "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+    "producer_body_sha256": "sha256:body-a",
+    "blocking_issues": [
+        "## Runtime Verification Applicability セクションがない（レガシー Issue）"
+    ],
+    "structured_blockers": [
+        {
+            "code": "C9",
+            "message": "## Runtime Verification Applicability セクションがない（レガシー Issue）",
+            "finding_kind": "deterministic_domain_blocker",
+            "deterministic_domain_key": "runtime_applicability",
+            "blocking": True,
+            "checker_evidence": [
+                {
+                    "source_check": "check_issue_contract",
+                    "rule_id": "C9_runtime_applicability_present",
+                    "category": "runtime_applicability",
+                    "artifact_path": "check_issue_contract.py",
+                    "artifact_schema": "CHECK_ISSUE_CONTRACT_V1",
+                    "body_sha256": "sha256:body-a",
+                    "iteration_id": "check_issue_contract_current",
+                    "line_start": None,
+                    "line_end": None,
+                }
+            ],
+        }
+    ],
+    "findings": [
+        {
+            "finding_kind": "deterministic_domain_blocker",
+            "deterministic_domain_key": "runtime_applicability",
+            "blocking": True,
+            "checker_evidence": [
+                {
+                    "source_check": "check_issue_contract",
+                    "rule_id": "C9_runtime_applicability_present",
+                    "category": "runtime_applicability",
+                    "artifact_path": "check_issue_contract.py",
+                    "artifact_schema": "CHECK_ISSUE_CONTRACT_V1",
+                    "body_sha256": "sha256:body-a",
+                    "iteration_id": "check_issue_contract_current",
+                    "line_start": None,
+                    "line_end": None,
+                }
+            ],
+            "message": "## Runtime Verification Applicability セクションがない（レガシー Issue）",
+        }
+    ],
+}
+
 COMPACT_C9 = {
     "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
     "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
@@ -355,6 +421,51 @@ def test_missing_section_with_lp005_only_is_unbacked():
     )
     assert result["verdict"] == "reviewer_claim_unbacked_by_deterministic_checker"
     assert result["should_consume_iteration"] is False
+
+
+def test_c9_blocker_is_deterministic_backed_not_checker_gap():
+    """GIVEN a producer-derived compact review result whose structured_blockers/findings
+    carry C9 deterministic evidence (post narrow-approval check_issue_contract.py fix)
+    WHEN analyze() replays it THEN the verdict is deterministic_fail_confirmed, the
+    blocker normalizes to rva_immediate_field_missing, it is deterministic_backed, and
+    it is NOT classified as a checker_gap (readiness artifact intentionally has no
+    errors -- the backing comes entirely from the review artifact's own structured
+    evidence, not from readiness fallback).
+    """
+    result, _ = analyze(
+        review_result=COMPACT_C9_DETERMINISTIC,
+        readiness_result=READINESS_CLEAN,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
+    assert result["verdict"] == "deterministic_fail_confirmed"
+    assert result["should_consume_iteration"] is True
+
+    blocker = result["blockers"][0]
+    assert blocker["normalized_kind"] == "rva_immediate_field_missing"
+    assert blocker["deterministic_backed"] is True
+    assert blocker["checker_gap"] is False
+    assert blocker["checker_artifact_inconsistency"] is False
+    assert blocker["taxonomy_gap"] is False
+    assert blocker["evidence"][0]["rule_id"] == "C9_runtime_applicability_present"
+    assert blocker["evidence"][0]["category"] == "runtime_applicability"
+    assert blocker["evidence"][0]["body_sha256"] == result["body_sha256"]
+
+    # PR #1319 reviewer blocker fix (#1314): assert directly against the
+    # fixture's own `findings[*].checker_evidence` (the canonical producer
+    # shape), not only against the derived `blocker["evidence"]`, so this
+    # test actually exercises the `producer_body_sha256` canonical field
+    # instead of silently passing through the `body_sha256` back-compat
+    # fallback path in `reviewer_claim_replay.py`.
+    for finding in COMPACT_C9_DETERMINISTIC["findings"]:
+        for evidence_entry in finding["checker_evidence"]:
+            assert evidence_entry["rule_id"] == "C9_runtime_applicability_present"
+            assert evidence_entry["category"] == "runtime_applicability"
+            assert evidence_entry["body_sha256"] == result["body_sha256"]
+
+    assert len(result["rewrite_ready_blockers"]) == 1
+    assert result["rewrite_ready_blockers"][0]["normalized_kind"] == "rva_immediate_field_missing"
 
 
 def test_second_unbacked_same_body_becomes_false_positive():
