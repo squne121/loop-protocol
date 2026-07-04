@@ -19,7 +19,8 @@ Input:
 
 Output (stdout, budget < 2000 bytes):
   STATUS: pass | warn | human_escalation | inconsistent_state | router_error
-  NEXT_ACTION: continue_to_step_4 | proceed_to_step_4_5 | human_escalation | terminate | rebuild_phase_state | proceed_with_contract_update
+  NEXT_ACTION: continue_to_step_4 | proceed_to_step_4_5 | human_escalation |
+               terminate | rebuild_phase_state | proceed_with_contract_update
   COMMANDS: (optional) argv-array invocation hints
   BLOCKERS: (optional) blocker codes
 
