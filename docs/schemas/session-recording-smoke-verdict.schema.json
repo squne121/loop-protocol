@@ -1,0 +1,325 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/squne121/loop-protocol/docs/schemas/session-recording-smoke-verdict.schema.json",
+  "title": "session_recording_smoke_verdict/v1",
+  "description": "Issue #246 の session recording pilot smoke test の final verdict を機械的に記録するための SSOT schema。",
+  "type": "object",
+  "required": [
+    "schema",
+    "issue",
+    "completion_state",
+    "recommendation",
+    "followup_issue",
+    "legacy_evidence_excluded",
+    "authoritative_count",
+    "ac_results",
+    "token_usage",
+    "github_secret_scanning",
+    "stop_conditions_triggered",
+    "evidence_refs"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "session_recording_smoke_verdict/v1",
+      "description": "schema バージョン識別子"
+    },
+    "issue": {
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": 1
+        },
+        {
+          "type": "string",
+          "minLength": 1
+        }
+      ],
+      "description": "smoke test の対象 Issue 番号（例: 246）"
+    },
+    "completion_state": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "fail",
+        "blocked"
+      ],
+      "description": "smoke test 全体の完了状態"
+    },
+    "recommendation": {
+      "type": "string",
+      "minLength": 1,
+      "description": "final verdict に基づく推奨アクション（自由記述）"
+    },
+    "followup_issue": {
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": 1
+        },
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "final verdict を記録する follow-up Issue 番号（例: 本 Issue #1312）。未確定時は null。"
+    },
+    "legacy_evidence_excluded": {
+      "type": "boolean",
+      "description": "secret_policy を欠く legacy agent_session_manifest evidence を authoritative_count から除外したか"
+    },
+    "authoritative_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "legacy evidence を除外した後の authoritative evidence 件数"
+    },
+    "ac_results": {
+      "type": "object",
+      "required": [
+        "AC0",
+        "AC1",
+        "AC2",
+        "AC3",
+        "AC4",
+        "AC5",
+        "AC6"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "AC0": {
+          "$ref": "#/$defs/ac_verdict"
+        },
+        "AC1": {
+          "$ref": "#/$defs/ac_verdict"
+        },
+        "AC2": {
+          "$ref": "#/$defs/ac_verdict"
+        },
+        "AC3": {
+          "$ref": "#/$defs/ac_verdict"
+        },
+        "AC4": {
+          "$ref": "#/$defs/ac_verdict"
+        },
+        "AC5": {
+          "$ref": "#/$defs/ac_verdict"
+        },
+        "AC6": {
+          "$ref": "#/$defs/ac_verdict"
+        }
+      },
+      "description": "#246 の AC0 から AC6 に対する verdict map"
+    },
+    "token_usage": {
+      "type": "object",
+      "required": [
+        "availability",
+        "source",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "availability": {
+          "type": "string",
+          "enum": [
+            "measured",
+            "estimated",
+            "unavailable"
+          ],
+          "description": "トークン使用量の取得状況。AI self-report は禁止。unavailable の場合は数値フィールドを null にする（0 偽装禁止）"
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "provider_api",
+            "tool_log",
+            "entire_cli",
+            "manual_report",
+            "none"
+          ],
+          "description": "トークン情報の取得元。manual_report は AI self-report を意味しない（人間による手動記録のみ）"
+        },
+        "prompt_tokens": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "completion_tokens": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "total_tokens": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "availability": {
+                "const": "unavailable"
+              }
+            },
+            "required": [
+              "availability"
+            ]
+          },
+          "then": {
+            "properties": {
+              "prompt_tokens": {
+                "type": "null"
+              },
+              "completion_tokens": {
+                "type": "null"
+              },
+              "total_tokens": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "github_secret_scanning": {
+      "type": "object",
+      "required": [
+        "status",
+        "unavailable_reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail",
+            "unavailable"
+          ],
+          "description": "GitHub Secret Scanning API 呼び出し結果"
+        },
+        "unavailable_reason": {
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "permission_missing",
+                "feature_disabled",
+                "not_checked"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "status が unavailable の場合の理由コード。status が pass/fail の場合は null。"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "unavailable"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "unavailable_reason": {
+                "type": "string",
+                "enum": [
+                  "permission_missing",
+                  "feature_disabled",
+                  "not_checked"
+                ]
+              }
+            },
+            "required": [
+              "unavailable_reason"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "pass",
+                  "fail"
+                ]
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "unavailable_reason": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "stop_conditions_triggered": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "smoke test 実行中に発火した Stop Condition の一覧（なければ空配列）"
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "GitHub Issue/PR コメント、生成済み artifact、manifest コメント等の証跡参照 URL またはパスの一覧"
+    }
+  },
+  "$defs": {
+    "ac_verdict": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "fail",
+        "skip",
+        "blocked",
+        "not_applicable"
+      ]
+    }
+  }
+}

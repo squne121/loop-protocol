@@ -25,6 +25,7 @@
     "policy:check:session": "uv run --locked python .claude/scripts/check_session_recording_policy.py docs/dev/session-recording-policy.md",
     "policy:check": "pnpm run policy:check:secret && pnpm run policy:check:session",
     "manifest:check": "node scripts/check-agent-session-manifests.mjs",
+    "smoke-verdict:check": "node scripts/check-session-recording-smoke-verdict.mjs",
     "agent-run-report:check": "node scripts/check-agent-run-reports.mjs",
     "agent-run:start": "node scripts/agent-logs/start-agent-run.mjs",
     "agent-run:finalize": "node scripts/agent-logs/finalize-agent-run.mjs",

@@ -1,0 +1,31 @@
+{
+  "schema": "session_recording_smoke_verdict/v1",
+  "issue": 246,
+  "completion_state": "blocked",
+  "recommendation": "invalid: prompt_tokens must be null when unavailable, not 0.",
+  "followup_issue": 1312,
+  "legacy_evidence_excluded": false,
+  "authoritative_count": 1,
+  "ac_results": {
+    "AC0": "pass",
+    "AC1": "pass",
+    "AC2": "pass",
+    "AC3": "pass",
+    "AC4": "pass",
+    "AC5": "pass",
+    "AC6": "pass"
+  },
+  "token_usage": {
+    "availability": "unavailable",
+    "source": "none",
+    "prompt_tokens": 0,
+    "completion_tokens": null,
+    "total_tokens": null
+  },
+  "github_secret_scanning": {
+    "status": "unavailable",
+    "unavailable_reason": "not_checked"
+  },
+  "stop_conditions_triggered": [],
+  "evidence_refs": []
+}
