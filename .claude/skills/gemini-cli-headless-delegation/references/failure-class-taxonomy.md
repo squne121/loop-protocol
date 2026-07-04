@@ -4,6 +4,7 @@ status: draft
 related_issue: "#268"
 created_at: "2026-05-23"
 updated_at: "2026-05-23"
+概要: "本文書は failure_class の分類体系と retry policy を定義する仕様文書である"
 ---
 
 # failure_class Taxonomy and Retry Policy
@@ -30,7 +31,7 @@ Issue #71 の refinement-loop で判明した問題:
 
 `failure_class` フィールドは `nullable: true` で成功時は `null`。
 
-### Non-retryable failures（fail-close）
+### Non-retryable failures（再試行不可能な失敗）
 
 これらは retry しても同じ結果になる構成・認証・スキーマ問題。
 即時 fail-close して human intervention または config 修正を求める。
@@ -57,7 +58,7 @@ Issue #71 の refinement-loop で判明した問題:
 | `github_research_command_denied` | `github_research` で禁止 gh subcommand が検出された | request_validation | `github_research_command_denied` / `is not in the allowed subcommand list` | none |
 | `api_deadline_exceeded` | prompt / context が大きすぎて API deadline を超過（request 調整が必要）| api_backend | `DEADLINE_EXCEEDED` / `context length exceeded` / `prompt too large` | reduce_request_size |
 
-### Retryable failures（backoff retry 可）
+### Retryable failures（再試行可能な失敗、backoff retry 可）
 
 これらは一時的な状態変化で解消される可能性がある。
 exponential backoff retry が有効。
@@ -70,7 +71,7 @@ exponential backoff retry が有効。
 | `network_error` | ネットワーク到達不能・ソケットタイムアウト | cli_process | `connection refused` / `socket timeout` / `network unreachable` | `same_request_after_backoff` |
 | `client_subprocess_timeout` | `timeout_sec` 超過による subprocess タイムアウト（プロセス stall / ネットワーク stall） | cli_process | `subprocess.TimeoutExpired` / exit code 124 | `same_request_after_backoff`（timeout_sec 拡大を要検討） |
 
-### Terminal / exhausted failures
+### Terminal / exhausted failures（終端・枯渇状態の失敗）
 
 retry budget 枯渇や model chain 全滅など、これ以上 retry しても意味がない状態。
 Human escalation を推奨。
@@ -82,7 +83,7 @@ Human escalation を推奨。
 | `unknown_cli_failure` | non-zero exit code だが既知パターンにマッチしない |
 | `unknown_api_error` | Gemini envelope に `error` オブジェクトが含まれるが既知分類不能 |
 
-### AGY provider failure classes（Issue #1270）
+### AGY provider failure classes（AGY プロバイダの失敗分類、Issue #1270）
 
 `provider=agy` の `_classify_agy_failure()`（`run_gemini_headless.py`）が
 stdout / stderr の両方から判別する failure_class。`_normalize_agy_result()`
@@ -101,7 +102,7 @@ stdout / stderr の両方から判別する failure_class。`_normalize_agy_resu
 | `agy_empty_stdout` | 非 CI 環境で exit 0 だが stdout が空 | no |
 | `agy_output_missing` | CI 環境で exit 0 だが stdout が空（`agy_empty_stdout` と同一原因、CI 判定のみ異なる。#1274: `warnings[0]` の leading token は必ず `failure_class` と一致させる） | no |
 
-### provider_auto_policy_v1 fallback classes（Issue #1270）
+### provider_auto_policy_v1 fallback classes（フォールバック分類、Issue #1270）
 
 `provider=auto`（`provider_auto_dispatch()`）が provider fallback の
 可否判断・停止理由に使う top-level クラス。`provider_auto_policy_v1`
@@ -116,7 +117,7 @@ stdout / stderr の両方から判別する failure_class。`_normalize_agy_resu
 | `provider_profile_unsupported` | `tool_profile` が `provider_auto_policy_v1.eligible_profiles`（v1: `no_tools` / `proposal_only`）外 | no（dispatch 自体を行わない） |
 | `provider_fallback_exhausted` | `runtime_order` の全 provider が retryable failure_class で失敗した（これ以上 fallback 先がない） | no（terminal） |
 
-**Gemini / AGY / canonical class 対応表**
+**Gemini / AGY / canonical class 対応表（正規クラス対応表）**
 
 | 概念 | Gemini 側 | AGY 側 |
 |---|---|---|
@@ -132,7 +133,7 @@ stdout / stderr の両方から判別する failure_class。`_normalize_agy_resu
 stop condition であり、上記の「fallback 可否: no」に対応する
 （`run_gemini_headless.py` の `provider_auto_dispatch()` 参照）。
 
-### Conditionally retryable
+### Conditionally retryable（条件付きで再試行可能）
 
 状況依存で retry 可否が変わるクラス。
 
@@ -141,7 +142,7 @@ stop condition であり、上記の「fallback 可否: no」に対応する
 | `output_parse_error` | Gemini CLI の JSON 出力が parse できない | 最大 1 回まで retry。CLI version incompatibility / stdout-stderr 混線の場合は retry 不可なので `classification_confidence: low` + human escalation |
 | `empty_response` | `response_text` が空（API 呼び出し自体は成功） | 最大 1 回まで retry |
 
-### ACP transport failure classes（`transport_details.failure_class`）
+### ACP transport failure classes（ACP トランスポートの失敗分類、`transport_details.failure_class`）
 
 ACP transport の failure は `transport_details.failure_class` に格納され、
 headless_json fallback が可能なものと不可なものが区別されている（`transport-acp.md` 参照）。
