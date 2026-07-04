@@ -101,6 +101,81 @@ uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/se
 - API key 暫定運用は #104 が完了するまでのブリッジであり、agy 移行が完了したら不要になる。
 - agy 移行の進捗は `docs/dev/current-focus.md` および #104 を参照。
 
+## AGY 認証診断・既知の環境課題（WSL2 / non-TTY）（Issue #1267）
+
+`preflight_agy.py` の `run_preflight()` は、すべての `agy_preflight_result/v1`
+（success / CLI missing / smoke failure / timeout / grounded・local-asset sub-check
+failure のいずれでも）に `auth: agy_auth_diagnostics_v1` を含める。
+`setup_check.py --provider agy --json` はこの `auth` オブジェクトを
+`agy_preflight.auth` にそのまま surfacing する（schema drift なし。SSOT は
+`preflight_agy.py`）。
+
+`agy_auth_diagnostics_v1` は以下を含む:
+
+- `auth_mode`（`unknown` / `system_keyring_cached` / `google_sign_in_required` /
+  `api_key_env_present` / `unauthenticated` / `auth_probe_failed`）— 推定された認証状態と、
+  `auth_mode_confidence`（`observed` / `inferred` / `unknown`）— その確信度
+- `keyring`（`available` / `backend_hint` / `failure_class`）— system keyring への到達可否
+- `tty`（`stdin_isatty` / `stdout_isatty` / `stderr_isatty` / `noninteractive_mode`）— 端末接続状態
+- `platform`（`os` / `is_wsl` / `wsl_hint`）— 実行環境（WSL 判定を含む）
+- `recovery_action` — 人間が次に取るべき復旧手順の説明文
+
+診断用の env snapshot（`DBUS_SESSION_BUS_ADDRESS_present` 等の boolean のみ）と、
+agy subprocess 実行用の minimal env（`_minimal_agy_env()`）は分離されている。
+診断結果に環境変数の値そのものが含まれることはない。
+
+### 既知の問題 1: WSL2 での keyring 未到達 / OAuth 再認証
+
+WSL2 環境ではデフォルトで D-Bus session bus が起動していないため、
+`DBUS_SESSION_BUS_ADDRESS` が未設定なことが多く、secret-service 経由の
+system keyring バックエンドに到達できない（`auth.keyring.failure_class:
+system_keyring_unavailable`、`auth.platform.is_wsl: true`）。この状態では agy が
+キャッシュ済み認証情報を読めず、再認証（Google Sign-In）が要求されることがある。
+
+recovery action（推奨される復旧手順）:
+
+headless Linux（WSL2 含む）での keyring 運用は、D-Bus session を起動するだけでは
+不十分なことが多い。GNOME Keyring daemon 自体の起動・unlock・**同一 D-Bus
+session 内での実行**が必要になる:
+
+```bash
+# 1. D-Bus session に入る（起動のみで抜けてしまう dbus-launch --exit-with-session
+#    より、以降のコマンドを同一 session 内で実行できる dbus-run-session を推奨する）
+dbus-run-session -- sh -c '
+  # 2. GNOME Keyring daemon を起動し、secret-service backend を unlock する
+  eval "$(gnome-keyring-daemon --start --components=secrets)"
+  export GNOME_KEYRING_CONTROL
+
+  # 3. 同じ shell/session 内で preflight を実行する
+  uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/preflight_agy.py --json
+'
+```
+
+`dbus-launch --exit-with-session` は D-Bus session bus を一時的に起動するだけで
+GNOME Keyring daemon の起動・unlock は行わないため、上記の
+`dbus-run-session` + `gnome-keyring-daemon --start` の代替（簡易的な bus 起動確認
+用途）としてのみ位置づける。daemon の unlock を伴わない場合、`auth.keyring.available`
+は `null`（`secret_service_dbus_session_present` — Issue #1267 fix_delta Blocker
+2）のまま変わらないことに注意する。
+
+D-Bus session / keyring daemon を用意できない場合は、対話的な TTY セッションで一度
+`agy` の認証（Google Sign-In）を完了させてから、non-TTY で `agy -p` を実行する。
+
+### 既知の問題 2: `agy -p` の non-TTY 実行時 silent stdout drop
+
+`agy -p` を non-TTY（`stdin_isatty`/`stdout_isatty` が false）で実行すると、
+認証が必要な状態でも exit code 0 かつ空 stdout を返すことがある
+（`smoke.failure_class: agy_empty_stdout` / CI では `agy_output_missing`）。
+これは "silent" な失敗であり、stderr/stdout に明示的な auth/keyring 証跡が
+ない限り auth failure として再分類されない（`agy_empty_stdout` /
+`agy_output_missing` は output-surface failure のまま維持される — Issue #1267
+Required Result Contract）。
+
+recovery action: 対話的 TTY セッションで `agy` の認証状態を確認・再ログインし、
+その後 non-TTY 実行を再試行する。stderr に `keyring` / `sign in` /
+`interactive login required` 等の文言が含まれる場合は、
+`auth.auth_mode` / `auth.recovery_action` を優先的に参照する。
+
 ## Core Rules（基本ルール）
 
 ### Delegation Boundary
