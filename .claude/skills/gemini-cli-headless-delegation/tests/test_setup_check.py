@@ -1026,3 +1026,43 @@ def test_auto_provider_preserves_agy_auth_failure_class(monkeypatch, tmp_path):
     assert agy_attempt["auth_failure_class"] == "google_sign_in_required"
     # #1270 scope guard: no runtime fallback *policy* field is implemented here.
     assert "fallback_policy" not in result
+
+
+# ---------------------------------------------------------------------------
+# Issue #1267 fix_delta iteration 2 Blocker 1: tools-missing stub must still
+# surface a schema-conformant auth object (not a partial hand-authored stub).
+# ---------------------------------------------------------------------------
+
+
+def test_agy_provider_tools_missing_still_surfaces_auth(monkeypatch, tmp_path):
+    """Blocker 1: when required agy tools are missing, run_all_checks(provider=
+    'agy') must still surface `agy_preflight.auth` conforming to
+    agy_auth_diagnostics_v1 (checked/auth_mode/keyring/tty/platform), not a bare
+    stub missing the auth field entirely."""
+    sc = load_setup_check()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    def fake_run(command: list[str], timeout: int | None = None):
+        tool = command[0]
+        if tool == "agy" and "--version" in command:
+            raise FileNotFoundError("agy: command not found")
+        versions = {"python3": "Python 3.12.0\n", "uv": "uv 0.7.0\n"}
+        if tool in versions and "--version" in command:
+            return _make_completed(0, stdout=versions[tool])
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(sc, "_run", fake_run)
+
+    result = sc.run_all_checks(repo_root=repo_root, provider="agy")
+
+    assert result["ok"] is False
+    assert result["agy_preflight"]["failure_class"] == "cli_missing"
+    auth = result["agy_preflight"].get("auth")
+    assert auth is not None, "agy_preflight.auth must be present even when agy tools are missing"
+    assert auth["checked"] is True
+    assert "auth_mode" in auth
+    assert "auth_mode_confidence" in auth
+    assert "keyring" in auth
+    assert "tty" in auth
+    assert "platform" in auth

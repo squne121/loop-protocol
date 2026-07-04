@@ -617,13 +617,23 @@ def _run_gemini_provider_checks(repo_root: Path | None = None, fix: bool = False
 
 def _run_agy_provider_checks(repo_root: Path | None = None, fix: bool = False) -> dict[str, Any]:
     tools_result = check_tools(AGY_REQUIRED_TOOLS)
-    agy_preflight = check_agy_preflight() if tools_result["ok"] else {
-        "schema": "agy_preflight_result/v1",
-        "ok": False,
-        "failure_reason": "agy preflight skipped because required agy tools are missing",
-        "failure_class": "cli_missing",
-        "recovery_action": "install missing agy prerequisites first",
-    }
+    if tools_result["ok"]:
+        agy_preflight = check_agy_preflight()
+    else:
+        # Issue #1267 fix_delta Blocker 1: every agy_preflight_result/v1 path —
+        # including this tools-missing stub, which returns before
+        # check_agy_preflight() would ever run — must include a schema-conformant
+        # `auth` object. Reuse preflight_agy.py's builder (SSOT) instead of hand
+        # authoring a partial stub without auth.
+        module = _load_preflight_agy_module()
+        agy_preflight = {
+            "schema": "agy_preflight_result/v1",
+            "ok": False,
+            "failure_reason": "agy preflight skipped because required agy tools are missing",
+            "failure_class": "cli_missing",
+            "recovery_action": "install missing agy prerequisites first",
+            "auth": module.build_auth_diagnostics(),
+        }
     unsupported_fix = bool(fix)
     ok = tools_result["ok"] and agy_preflight["ok"] and not unsupported_fix
     exit_code = 0 if ok else 1

@@ -220,7 +220,16 @@ def _detect_keyring(env_snapshot: dict[str, bool], platform_info: dict[str, Any]
         or env_snapshot.get("WAYLAND_DISPLAY_present", False)
     )
     if dbus_present:
-        return {"available": True, "backend_hint": "secret_service_dbus", "failure_class": None}
+        # Issue #1267 fix_delta Blocker 2: a D-Bus session being present does NOT
+        # prove a keyring backend is installed, its daemon is running, or it is
+        # unlocked. Treat this as a weak hint only — `available` stays unknown
+        # (null) until an actual keyring probe or explicit AGY evidence confirms
+        # it either way.
+        return {
+            "available": None,
+            "backend_hint": "secret_service_dbus_session_present",
+            "failure_class": None,
+        }
     if platform_info.get("is_wsl"):
         # WSL2 known issue: no D-Bus session bus by default → secret-service keyring
         # backends are unreachable (Issue #1267 Notes for Reviewer).
@@ -340,6 +349,23 @@ def _build_auth_diagnostics(
         "platform": platform_info,
         "recovery_action": recovery_action,
     }
+
+
+def build_auth_diagnostics(
+    *,
+    combined_output: str = "",
+    smoke_ok: bool | None = None,
+) -> dict[str, Any]:
+    """Public wrapper for `_build_auth_diagnostics` (Issue #1267 fix_delta Blocker 1).
+
+    Exposed so callers that never invoke `run_preflight()` at all (e.g.
+    `setup_check.py`'s agy-tools-missing stub, which returns before
+    `check_agy_preflight()` would run) can still attach a schema-conformant
+    `agy_auth_diagnostics_v1` object instead of a partial hand-authored stub.
+    This is the same builder `run_preflight()` uses internally — no duplicated
+    auth/keyring/TTY/platform diagnostics logic.
+    """
+    return _build_auth_diagnostics(combined_output=combined_output, smoke_ok=smoke_ok)
 
 
 def _repo_root() -> Path:
@@ -690,6 +716,33 @@ def _minimal_agy_env() -> dict[str, str]:
     return env
 
 
+# Issue #1267 fix_delta Blocker 3: agy prints a full Google OAuth authorization
+# URL (accounts.google.com/... with code/state/token query params) when it
+# requires interactive re-auth over Remote/SSH. That URL — and any bearer-like
+# query parameters — must never appear in stdout_sample/stderr_sample/failure_reason.
+_OAUTH_URL_RE = re.compile(
+    r"https?://[^\s\"'<>]*(?:accounts\.google\.com|oauth2?|/o/oauth)[^\s\"'<>]*",
+    re.IGNORECASE,
+)
+_OAUTH_QUERY_PARAM_RE = re.compile(
+    r"(?i)\b(code|state|token|access_token|refresh_token|id_token|authuser)=[^&\s\"'<>]+"
+)
+
+
+def _redact_auth_url(text: str) -> str:
+    """Redact OAuth/authorization URLs and their query parameters.
+
+    Applied to every stdout/stderr sample and to any failure_reason derived from
+    raw agy output, so a leaked Google Sign-In URL (or its code/state/token query
+    parameters) never reaches result JSON, logs, or PR/issue comments.
+    """
+    if not text:
+        return text
+    redacted = _OAUTH_URL_RE.sub("<redacted-oauth-url>", text)
+    redacted = _OAUTH_QUERY_PARAM_RE.sub(lambda m: f"{m.group(1)}=<redacted>", redacted)
+    return redacted
+
+
 def _redact_output_sample(text: str) -> str:
     """Return a bounded, redacted sample for stdout/stderr capture."""
     sample = text or ""
@@ -708,6 +761,11 @@ def _redact_output_sample(text: str) -> str:
 
     sample = re.sub(r"\bgh[pousr]_[A-Za-z0-9_]{8,}\b", "<redacted>", sample)
     sample = re.sub(r"\bsk-[A-Za-z0-9_-]{20,}\b", "<redacted>", sample)
+
+    # Auth/OAuth URL redaction MUST happen before truncation (Issue #1267 fix_delta
+    # Blocker 3), otherwise a truncated-but-unredacted URL/query-param prefix could
+    # still leak.
+    sample = _redact_auth_url(sample)
 
     return sample[:SMOKE_SAMPLE_MAX_CHARS]
 
@@ -908,7 +966,11 @@ def _run_smoke(agy_bin: str) -> dict[str, Any]:
                 smoke["failure_reason"] = "agy_output_missing"
                 smoke["failure_class"] = "agy_output_missing" if is_ci else "agy_empty_stdout"
             elif stdout.strip() != EXPECTED_SMOKE:
-                smoke["failure_reason"] = f"agy_output_mismatch: got {stdout.strip()!r}"
+                # Issue #1267 fix_delta Blocker 3: never embed raw (unredacted) agy
+                # stdout in failure_reason — it may contain an OAuth authorization
+                # URL. Reuse the same redaction+truncation path as stdout_sample.
+                redacted_mismatch_sample = _redact_output_sample(stdout.strip())
+                smoke["failure_reason"] = f"agy_output_mismatch: got {redacted_mismatch_sample!r}"
                 smoke["failure_class"] = "agy_output_mismatch"
             else:
                 smoke["ok"] = True
