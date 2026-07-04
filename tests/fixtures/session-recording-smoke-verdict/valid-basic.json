@@ -1,0 +1,34 @@
+{
+  "schema": "session_recording_smoke_verdict/v1",
+  "issue": 246,
+  "completion_state": "pass",
+  "recommendation": "close #246 and record #1312 as the followup_issue for the final verdict.",
+  "followup_issue": 1312,
+  "legacy_evidence_excluded": true,
+  "authoritative_count": 2,
+  "ac_results": {
+    "AC0": "pass",
+    "AC1": "pass",
+    "AC2": "pass",
+    "AC3": "pass",
+    "AC4": "pass",
+    "AC5": "pass",
+    "AC6": "pass"
+  },
+  "token_usage": {
+    "availability": "measured",
+    "source": "provider_api",
+    "prompt_tokens": 12000,
+    "completion_tokens": 3500,
+    "total_tokens": 15500
+  },
+  "github_secret_scanning": {
+    "status": "pass",
+    "unavailable_reason": null
+  },
+  "stop_conditions_triggered": [],
+  "evidence_refs": [
+    "https://github.com/squne121/loop-protocol/issues/246#issuecomment-1",
+    "artifacts/agent-session-manifest-ci.json"
+  ]
+}

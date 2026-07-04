@@ -907,3 +907,344 @@ def test_local_asset_research_contract_validation_rejects_missing_manifest(monke
     assert result["ok"] is False
     assert result["failure_class"] == "local_asset_contract_invalid"
     assert any("serena manifest validation failed" in item for item in result["local_asset_research"]["errors"])
+
+
+# ---------------------------------------------------------------------------
+# Issue #1267: agy_auth_diagnostics_v1 — auth mode / keyring / TTY / WSL2 diagnostics
+# ---------------------------------------------------------------------------
+
+
+def test_auth_diagnostics_present_in_every_result_path(monkeypatch):
+    """AC2: every agy_preflight_result/v1 path (here: cli_missing) includes auth."""
+    module = load_module()
+
+    def fake_run(argv, cwd=None, timeout=None):
+        raise FileNotFoundError("agy not found")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    result = module.run_preflight()
+
+    assert result["failure_class"] == "cli_missing"
+    assert result["auth"]["checked"] is True
+    assert "auth_mode" in result["auth"]
+    assert "keyring" in result["auth"]
+    assert "tty" in result["auth"]
+    assert "platform" in result["auth"]
+
+
+def test_auth_diagnostics_noninteractive_tty_detected(monkeypatch):
+    """GIVEN stdin/stdout/stderr are not a TTY
+    WHEN _detect_tty is called
+    THEN noninteractive_mode is True and all isatty flags are False."""
+    module = load_module()
+
+    class _NonTTYStream:
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(module.sys, "stdin", _NonTTYStream())
+    monkeypatch.setattr(module.sys, "stdout", _NonTTYStream())
+    monkeypatch.setattr(module.sys, "stderr", _NonTTYStream())
+
+    tty_info = module._detect_tty()
+
+    assert tty_info["stdin_isatty"] is False
+    assert tty_info["stdout_isatty"] is False
+    assert tty_info["stderr_isatty"] is False
+    assert tty_info["noninteractive_mode"] is True
+
+
+def test_auth_diagnostics_wsl2_detected_via_env(monkeypatch):
+    """GIVEN WSL_DISTRO_NAME is present
+    WHEN _detect_platform is called
+    THEN is_wsl is True with a wsl_hint, and no env value leaks into the hint."""
+    module = load_module()
+
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu-22.04")
+    platform_info = module._detect_platform()
+
+    assert platform_info["is_wsl"] is True
+    assert platform_info["wsl_hint"] == "env:WSL_DISTRO_NAME"
+    assert "Ubuntu-22.04" not in str(platform_info)
+
+
+def test_auth_diagnostics_keyring_unavailable_on_wsl_without_dbus(monkeypatch):
+    """GIVEN WSL2 platform AND no D-Bus session bus
+    WHEN _detect_keyring is called
+    THEN failure_class is system_keyring_unavailable (known WSL2 issue)."""
+    module = load_module()
+
+    env_snapshot = {
+        "DBUS_SESSION_BUS_ADDRESS_present": False,
+        "DISPLAY_present": False,
+        "WAYLAND_DISPLAY_present": False,
+        "WSL_INTEROP_present": True,
+        "WSL_DISTRO_NAME_present": True,
+    }
+    platform_info = {"os": "linux", "is_wsl": True, "wsl_hint": "env:WSL_DISTRO_NAME"}
+
+    keyring_info = module._detect_keyring(env_snapshot, platform_info)
+
+    assert keyring_info["available"] is False
+    assert keyring_info["failure_class"] == "system_keyring_unavailable"
+
+
+def test_auth_diagnostics_dbus_missing_hint_without_wsl(monkeypatch):
+    """GIVEN no D-Bus session bus and no display, not WSL
+    WHEN _detect_keyring is called
+    THEN failure_class is system_keyring_probe_unsupported (unknown, not asserted False)."""
+    module = load_module()
+
+    env_snapshot = {
+        "DBUS_SESSION_BUS_ADDRESS_present": False,
+        "DISPLAY_present": False,
+        "WAYLAND_DISPLAY_present": False,
+        "WSL_INTEROP_present": False,
+        "WSL_DISTRO_NAME_present": False,
+    }
+    platform_info = {"os": "linux", "is_wsl": False, "wsl_hint": None}
+
+    keyring_info = module._detect_keyring(env_snapshot, platform_info)
+
+    assert keyring_info["available"] is None
+    assert keyring_info["failure_class"] == "system_keyring_probe_unsupported"
+
+
+def test_auth_signal_google_sign_in_required(monkeypatch):
+    """GIVEN agy stderr mentions Google Sign-In requirement
+    WHEN smoke fails with this stderr
+    THEN failure_class is reclassified to google_sign_in_required (explicit evidence)."""
+    module = load_module()
+
+    def fake_run(argv, cwd=None, timeout=None):
+        bin_ = module._resolve_binary()
+        if argv == [bin_, "--version"]:
+            return _FakeCompleted(0, "agy 1.0.0\n", "")
+        if argv == [bin_, "--help"]:
+            return _FakeCompleted(0, "  -p, --print, --prompt  mode\n", "")
+        if argv[:2] == [bin_, "-p"]:
+            return _FakeCompleted(1, "", "Error: please sign in with your Google account to continue.")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    result = module.run_preflight()
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "google_sign_in_required"
+    assert result["smoke"]["failure_class"] == "google_sign_in_required"
+    assert result["auth"]["auth_mode"] == "google_sign_in_required"
+    assert result["auth"]["auth_mode_confidence"] == "observed"
+
+
+def test_auth_signal_keyring_locked_reclassifies_smoke_failure(monkeypatch):
+    """GIVEN agy stderr mentions the keyring being locked
+    WHEN smoke fails with this stderr
+    THEN failure_class is reclassified to system_keyring_locked."""
+    module = load_module()
+
+    def fake_run(argv, cwd=None, timeout=None):
+        bin_ = module._resolve_binary()
+        if argv == [bin_, "--version"]:
+            return _FakeCompleted(0, "agy 1.0.0\n", "")
+        if argv == [bin_, "--help"]:
+            return _FakeCompleted(0, "  -p, --print, --prompt  mode\n", "")
+        if argv[:2] == [bin_, "-p"]:
+            return _FakeCompleted(1, "", "Error: the system keyring is locked; cannot read credentials.")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    result = module.run_preflight()
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "system_keyring_locked"
+    assert result["auth"]["keyring"]["failure_class"] == "system_keyring_locked"
+    assert result["auth"]["keyring"]["available"] is False
+
+
+def test_empty_stdout_is_not_reclassified_as_auth_failure(monkeypatch):
+    """Required Result Contract: empty stdout with no auth/keyring evidence in
+    stderr/stdout MUST remain an output-surface failure (agy_empty_stdout), not an
+    auth failure."""
+    import os
+
+    module = load_module()
+    original_ci = os.environ.get("CI")
+    os.environ.pop("CI", None)
+
+    def fake_run(argv, cwd=None, timeout=None):
+        bin_ = module._resolve_binary()
+        if argv == [bin_, "--version"]:
+            return _FakeCompleted(0, "agy 1.0.0\n", "")
+        if argv == [bin_, "--help"]:
+            return _FakeCompleted(0, "  -p, --print, --prompt  mode\n", "")
+        if argv[:2] == [bin_, "-p"]:
+            return _FakeCompleted(0, "", "")  # exit 0, empty stdout, empty stderr
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    result = module.run_preflight()
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_empty_stdout"
+    assert result["smoke"]["failure_class"] == "agy_empty_stdout"
+
+    if original_ci is None:
+        os.environ.pop("CI", None)
+    else:
+        os.environ["CI"] = original_ci
+
+
+def test_auth_diagnostics_redacts_env_values_and_secrets(monkeypatch):
+    """AC4: auth diagnostics must never include raw env var values, only booleans,
+    and secrets in stderr must remain redacted in the surfaced result."""
+    module = load_module()
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+    monkeypatch.setenv("AGY_API_KEY", "sk-SENTINEL-DO-NOT-LEAK-0001")
+
+    def fake_run(argv, cwd=None, timeout=None):
+        bin_ = module._resolve_binary()
+        if argv == [bin_, "--version"]:
+            return _FakeCompleted(0, "agy 1.0.0\n", "")
+        if argv == [bin_, "--help"]:
+            return _FakeCompleted(0, "  -p, --print, --prompt  mode\n", "")
+        if argv[:2] == [bin_, "-p"]:
+            return _FakeCompleted(
+                1,
+                "",
+                "auth failed: credential sk-SENTINEL-DO-NOT-LEAK-0001 rejected, keyring backend not found",
+            )
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    result = module.run_preflight()
+
+    serialized = json.dumps(result)
+    assert "unix:path=/run/user/1000/bus" not in serialized
+    assert "sk-SENTINEL-DO-NOT-LEAK-0001" not in serialized
+    assert result["auth"]["keyring"]["failure_class"] == "system_keyring_backend_missing"
+
+
+
+# ---------------------------------------------------------------------------
+# Issue #1267 fix_delta iteration 2: Blocker 2 / Blocker 3 regression coverage
+# ---------------------------------------------------------------------------
+
+
+def test_dbus_presence_does_not_imply_keyring_available(monkeypatch):
+    """Blocker 2: DBUS_SESSION_BUS_ADDRESS presence alone must NOT be treated as
+    proof that a keyring backend is available. `available` stays None (unknown)
+    with only a weak backend_hint, since D-Bus session presence does not prove
+    the backend is installed, its daemon is running, or it is unlocked."""
+    module = load_module()
+
+    env_snapshot = {
+        "DBUS_SESSION_BUS_ADDRESS_present": True,
+        "DISPLAY_present": False,
+        "WAYLAND_DISPLAY_present": False,
+        "WSL_INTEROP_present": False,
+        "WSL_DISTRO_NAME_present": False,
+    }
+    platform_info = {"os": "linux", "is_wsl": False, "wsl_hint": None}
+
+    keyring_info = module._detect_keyring(env_snapshot, platform_info)
+
+    assert keyring_info["available"] is None
+    assert keyring_info["failure_class"] is None
+    assert keyring_info["backend_hint"] == "secret_service_dbus_session_present"
+    assert keyring_info["backend_hint"] != "secret_service_dbus"
+
+
+def test_smoke_success_without_observed_keyring_keeps_keyring_available_unknown(monkeypatch):
+    """Blocker 2: a successful smoke check (no explicit auth/keyring evidence in
+    stdout/stderr) must not assert keyring.available is True — only auth_mode is
+    inferred as system_keyring_cached; keyring.available stays unknown (None)
+    unless it was actually observed."""
+    module = load_module()
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+    for key in ("AGY_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+
+    monkeypatch.setattr(module, "_run", _make_happy_run(module))
+    result = module.run_preflight()
+
+    assert result["ok"] is True
+    assert result["auth"]["auth_mode"] == "system_keyring_cached"
+    assert result["auth"]["auth_mode_confidence"] == "inferred"
+    assert result["auth"]["keyring"]["available"] is None
+    assert result["auth"]["keyring"]["backend_hint"] == "secret_service_dbus_session_present"
+
+
+def test_auth_url_is_redacted_from_stdout_sample_and_failure_reason(monkeypatch):
+    """Blocker 3: a Google OAuth authorization URL printed by agy (Remote/SSH
+    re-auth prompt) must never appear verbatim in stdout_sample or
+    failure_reason — including the agy_output_mismatch path, which previously
+    embedded raw stdout directly."""
+    module = load_module()
+    oauth_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth?"
+        "client_id=abc123&redirect_uri=http://localhost&"
+        "code=SUPER-SECRET-AUTH-CODE&state=STATE-VALUE-XYZ"
+    )
+
+    def fake_run(argv, cwd=None, timeout=None):
+        bin_ = module._resolve_binary()
+        if argv == [bin_, "--version"]:
+            return _FakeCompleted(0, "agy 1.0.0\n", "")
+        if argv == [bin_, "--help"]:
+            return _FakeCompleted(0, "  -p, --print, --prompt  mode\n", "")
+        if argv[:2] == [bin_, "-p"]:
+            return _FakeCompleted(0, f"Please open this URL to continue: {oauth_url}\n", "")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    result = module.run_preflight()
+
+    serialized = json.dumps(result)
+    assert oauth_url not in serialized
+    assert "SUPER-SECRET-AUTH-CODE" not in serialized
+    assert "STATE-VALUE-XYZ" not in serialized
+    assert "accounts.google.com" not in serialized
+    assert "<redacted-oauth-url>" in result["smoke"]["stdout_sample"]
+    assert "<redacted-oauth-url>" in (result["smoke"]["failure_reason"] or "")
+
+
+def test_oauth_query_params_are_redacted_before_truncate(monkeypatch):
+    """Blocker 3: OAuth-related query parameters (code/state/token/access_token/
+    refresh_token/id_token/authuser) are redacted even outside a recognized OAuth
+    URL host, and redaction happens before the sample is truncated."""
+    module = load_module()
+    text = (
+        "auth callback params: code=RAW-CODE-VALUE&state=RAW-STATE-VALUE&"
+        "access_token=RAW-ACCESS-TOKEN&refresh_token=RAW-REFRESH-TOKEN&"
+        "id_token=RAW-ID-TOKEN&authuser=0&token=RAW-TOKEN-VALUE"
+    )
+
+    redacted = module._redact_output_sample(text)
+
+    for raw_value in (
+        "RAW-CODE-VALUE",
+        "RAW-STATE-VALUE",
+        "RAW-ACCESS-TOKEN",
+        "RAW-REFRESH-TOKEN",
+        "RAW-ID-TOKEN",
+        "RAW-TOKEN-VALUE",
+    ):
+        assert raw_value not in redacted
+    assert "code=<redacted>" in redacted
+    assert "state=<redacted>" in redacted
+    assert "access_token=<redacted>" in redacted
+    assert "refresh_token=<redacted>" in redacted
+    assert "id_token=<redacted>" in redacted
+    assert "token=<redacted>" in redacted
+
+
+def test_wsl2_recovery_docs_include_keyring_daemon_or_unlock_step():
+    """Blocker 4: SKILL.md recovery docs for WSL2/headless keyring must not stop
+    at merely starting a D-Bus session bus (dbus-launch); they must also cover
+    starting/unlocking the GNOME Keyring daemon within the same session."""
+    skill_md = Path(__file__).resolve().parent.parent / "SKILL.md"
+    text = skill_md.read_text(encoding="utf-8")
+
+    assert "gnome-keyring-daemon" in text
+    assert "unlock" in text
+    assert "dbus-run-session" in text

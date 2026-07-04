@@ -7,8 +7,10 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -85,6 +87,285 @@ FLAG_PATTERNS: dict[str, re.Pattern[str]] = {
     "--print": re.compile(r"(?<![\w-])--print(?![\w-])"),
     "--prompt": re.compile(r"(?<![\w-])--prompt(?![\w-])"),
 }
+
+# ---------------------------------------------------------------------------
+# Auth/keyring/TTY diagnostics (Issue #1267 — agy_auth_diagnostics_v1 schema)
+#
+# SSOT for this schema is this module: setup_check.py surfaces the same object
+# unmodified at agy_preflight.auth (no schema drift — see setup_check.py
+# `_extract_agy_auth_failure_class`). preflight_gemini_headless.py's OAuth-sunset
+# detection has a separate SSOT (setup_check.check_auth()) and does not reuse this
+# schema, since it targets the Gemini CLI, not agy.
+# ---------------------------------------------------------------------------
+
+# Env vars whose *presence* (never their value) is recorded as a diagnostic
+# signal. Distinct from _minimal_agy_env(), which is the allowlisted env used to
+# actually execute the agy subprocess — diagnostics never leak env values.
+_DIAGNOSTIC_ENV_PRESENCE_KEYS = (
+    "DBUS_SESSION_BUS_ADDRESS",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "WSL_INTEROP",
+    "WSL_DISTRO_NAME",
+)
+
+_KEYRING_FAILURE_CLASSES = frozenset({
+    "system_keyring_unavailable",
+    "system_keyring_locked",
+    "system_keyring_backend_missing",
+    "system_keyring_access_denied",
+})
+
+# Recovery action templates keyed by failure class / auth signal (Issue #1267 AC3/AC7).
+_AUTH_RECOVERY_ACTIONS: dict[str, str] = {
+    "system_keyring_unavailable": (
+        "Start a D-Bus session (e.g. `dbus-launch`) or configure a system keyring "
+        "backend before running agy. On WSL2 this is a known issue — see "
+        "SKILL.md 'AGY 認証診断・既知の環境課題' for the recovery command."
+    ),
+    "system_keyring_locked": (
+        "Unlock the system keyring (e.g. `gnome-keyring-daemon --unlock`) and rerun preflight."
+    ),
+    "system_keyring_backend_missing": (
+        "Install a keyring backend (e.g. gnome-keyring, or a supported python-keyring "
+        "backend) and rerun preflight."
+    ),
+    "system_keyring_access_denied": (
+        "Check keyring file/socket permissions for the current user and rerun preflight."
+    ),
+    "system_keyring_probe_unsupported": (
+        "No display/D-Bus session was detected; keyring probing is unsupported in this "
+        "environment (headless/CI without a session bus)."
+    ),
+    "google_sign_in_required": (
+        "Run agy's interactive auth login (Google Sign-In) once in a TTY session, then "
+        "rerun preflight non-interactively."
+    ),
+    "noninteractive_auth_prompt_required": (
+        "agy requires an interactive browser-based auth prompt; complete auth login in an "
+        "interactive TTY session before running agy -p non-interactively (Issue #1267 known "
+        "issue: agy -p can silently drop stdout when auth is required in non-TTY mode)."
+    ),
+    "agy_auth_unknown": (
+        "agy output looked auth-related but did not match a known pattern; inspect "
+        "smoke.stdout_sample / smoke.stderr_sample directly."
+    ),
+}
+
+
+def _diagnostic_env_snapshot() -> dict[str, bool]:
+    """Return boolean-only presence flags for diagnostic env vars.
+
+    Never returns the env var *values* — only whether each is present — so this
+    snapshot is safe to include directly in agy_auth_diagnostics_v1 output.
+    """
+    return {
+        f"{key}_present": bool(os.environ.get(key))
+        for key in _DIAGNOSTIC_ENV_PRESENCE_KEYS
+    }
+
+
+def _detect_platform() -> dict[str, Any]:
+    """Detect OS and WSL2 status without leaking env var values."""
+    system = platform.system().lower()
+    os_name = {"linux": "linux", "windows": "windows", "darwin": "macos"}.get(system, "unknown")
+    is_wsl = False
+    wsl_hint: str | None = None
+    if os_name == "linux":
+        if os.environ.get("WSL_DISTRO_NAME"):
+            is_wsl = True
+            wsl_hint = "env:WSL_DISTRO_NAME"
+        elif os.environ.get("WSL_INTEROP"):
+            is_wsl = True
+            wsl_hint = "env:WSL_INTEROP"
+        else:
+            try:
+                proc_version = Path("/proc/version").read_text(encoding="utf-8", errors="ignore").lower()
+                if "microsoft" in proc_version or "wsl" in proc_version:
+                    is_wsl = True
+                    wsl_hint = "proc_version"
+            except OSError:
+                pass
+    return {"os": os_name, "is_wsl": is_wsl, "wsl_hint": wsl_hint}
+
+
+def _detect_tty() -> dict[str, Any]:
+    """Detect isatty() state for stdin/stdout/stderr (non-interactive mode signal)."""
+    def _isatty(stream: Any) -> bool:
+        try:
+            return bool(stream.isatty())
+        except (AttributeError, ValueError, OSError):
+            return False
+
+    stdin_isatty = _isatty(sys.stdin)
+    stdout_isatty = _isatty(sys.stdout)
+    stderr_isatty = _isatty(sys.stderr)
+    return {
+        "stdin_isatty": stdin_isatty,
+        "stdout_isatty": stdout_isatty,
+        "stderr_isatty": stderr_isatty,
+        "noninteractive_mode": not (stdin_isatty and stdout_isatty),
+    }
+
+
+def _detect_keyring(env_snapshot: dict[str, bool], platform_info: dict[str, Any]) -> dict[str, Any]:
+    """Infer system keyring availability from boolean env presence + platform hints.
+
+    This is a best-effort *inference*, not a live keyring probe — no keyring backend
+    is contacted. `available: null` means "could not be inferred" (Issue #1267 schema).
+    """
+    dbus_present = env_snapshot.get("DBUS_SESSION_BUS_ADDRESS_present", False)
+    display_present = (
+        env_snapshot.get("DISPLAY_present", False)
+        or env_snapshot.get("WAYLAND_DISPLAY_present", False)
+    )
+    if dbus_present:
+        # Issue #1267 fix_delta Blocker 2: a D-Bus session being present does NOT
+        # prove a keyring backend is installed, its daemon is running, or it is
+        # unlocked. Treat this as a weak hint only — `available` stays unknown
+        # (null) until an actual keyring probe or explicit AGY evidence confirms
+        # it either way.
+        return {
+            "available": None,
+            "backend_hint": "secret_service_dbus_session_present",
+            "failure_class": None,
+        }
+    if platform_info.get("is_wsl"):
+        # WSL2 known issue: no D-Bus session bus by default → secret-service keyring
+        # backends are unreachable (Issue #1267 Notes for Reviewer).
+        return {
+            "available": False,
+            "backend_hint": None,
+            "failure_class": "system_keyring_unavailable",
+        }
+    if not display_present:
+        return {"available": None, "backend_hint": None, "failure_class": "system_keyring_probe_unsupported"}
+    return {"available": None, "backend_hint": None, "failure_class": None}
+
+
+def _classify_auth_signal(raw_text: str) -> str | None:
+    """Classify agy stdout/stderr text for explicit auth/keyring evidence.
+
+    Returns ``None`` when no explicit evidence is found. Callers MUST NOT reclassify
+    an empty-stdout / output-missing failure as an auth failure without this evidence
+    (Issue #1267 Required Result Contract: agy_empty_stdout / agy_output_missing stay
+    output-surface failures unless this function finds explicit auth/keyring text).
+    """
+    if not raw_text:
+        return None
+    text = raw_text.lower()
+
+    if "keyring" in text:
+        if "locked" in text:
+            return "system_keyring_locked"
+        if "permission denied" in text or "access denied" in text:
+            return "system_keyring_access_denied"
+        if "no recommended backend" in text or (
+            "backend" in text and ("missing" in text or "not found" in text or "unavailable" in text)
+        ):
+            return "system_keyring_backend_missing"
+        if "unavailable" in text or "not found" in text or "no such file" in text:
+            return "system_keyring_unavailable"
+
+    if ("sign in" in text or "sign-in" in text) and "google" in text:
+        return "google_sign_in_required"
+    if "google login" in text and ("required" in text or "no longer" in text):
+        return "google_sign_in_required"
+
+    if (
+        ("please open" in text and "browser" in text)
+        or "waiting for authentication" in text
+        or "interactive login required" in text
+        or ("requires" in text and "browser" in text and "interactive" in text)
+    ):
+        return "noninteractive_auth_prompt_required"
+
+    if any(
+        kw in text
+        for kw in ("credential", "unauthorized", "unauthenticated", "not logged in", "login required", "auth")
+    ):
+        return "agy_auth_unknown"
+
+    return None
+
+
+def _build_auth_diagnostics(
+    *,
+    combined_output: str = "",
+    smoke_ok: bool | None = None,
+) -> dict[str, Any]:
+    """Build the agy_auth_diagnostics_v1 object (Issue #1267 Auth Diagnostics Schema).
+
+    Included in every agy_preflight_result/v1 response (success, CLI missing, smoke
+    failure, timeout, grounded/local-asset sub-check failure).
+    """
+    tty_info = _detect_tty()
+    platform_info = _detect_platform()
+    env_snapshot = _diagnostic_env_snapshot()
+    keyring_info = _detect_keyring(env_snapshot, platform_info)
+    auth_signal = _classify_auth_signal(combined_output)
+
+    if auth_signal is not None:
+        if auth_signal in _KEYRING_FAILURE_CLASSES:
+            keyring_info = {
+                "available": False,
+                "backend_hint": keyring_info.get("backend_hint"),
+                "failure_class": auth_signal,
+            }
+            auth_mode = "unauthenticated"
+        elif auth_signal == "agy_auth_unknown":
+            auth_mode = "auth_probe_failed"
+        elif auth_signal == "google_sign_in_required":
+            auth_mode = "google_sign_in_required"
+        else:
+            auth_mode = "unauthenticated"
+        auth_mode_confidence = "observed"
+    elif smoke_ok is True:
+        if os.environ.get("AGY_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+            auth_mode, auth_mode_confidence = "api_key_env_present", "inferred"
+        else:
+            auth_mode, auth_mode_confidence = "system_keyring_cached", "inferred"
+    elif keyring_info.get("failure_class"):
+        auth_mode, auth_mode_confidence = "unauthenticated", "inferred"
+    else:
+        auth_mode, auth_mode_confidence = "unknown", "unknown"
+
+    recovery_action: str | None = None
+    if auth_signal is not None:
+        recovery_action = _AUTH_RECOVERY_ACTIONS.get(auth_signal)
+    elif keyring_info.get("failure_class"):
+        recovery_action = _AUTH_RECOVERY_ACTIONS.get(keyring_info["failure_class"])
+
+    return {
+        "checked": True,
+        "auth_mode": auth_mode,
+        "auth_mode_confidence": auth_mode_confidence,
+        "keyring": {
+            "available": keyring_info.get("available"),
+            "backend_hint": keyring_info.get("backend_hint"),
+            "failure_class": keyring_info.get("failure_class"),
+        },
+        "tty": tty_info,
+        "platform": platform_info,
+        "recovery_action": recovery_action,
+    }
+
+
+def build_auth_diagnostics(
+    *,
+    combined_output: str = "",
+    smoke_ok: bool | None = None,
+) -> dict[str, Any]:
+    """Public wrapper for `_build_auth_diagnostics` (Issue #1267 fix_delta Blocker 1).
+
+    Exposed so callers that never invoke `run_preflight()` at all (e.g.
+    `setup_check.py`'s agy-tools-missing stub, which returns before
+    `check_agy_preflight()` would run) can still attach a schema-conformant
+    `agy_auth_diagnostics_v1` object instead of a partial hand-authored stub.
+    This is the same builder `run_preflight()` uses internally — no duplicated
+    auth/keyring/TTY/platform diagnostics logic.
+    """
+    return _build_auth_diagnostics(combined_output=combined_output, smoke_ok=smoke_ok)
 
 
 def _repo_root() -> Path:
@@ -435,6 +716,33 @@ def _minimal_agy_env() -> dict[str, str]:
     return env
 
 
+# Issue #1267 fix_delta Blocker 3: agy prints a full Google OAuth authorization
+# URL (accounts.google.com/... with code/state/token query params) when it
+# requires interactive re-auth over Remote/SSH. That URL — and any bearer-like
+# query parameters — must never appear in stdout_sample/stderr_sample/failure_reason.
+_OAUTH_URL_RE = re.compile(
+    r"https?://[^\s\"'<>]*(?:accounts\.google\.com|oauth2?|/o/oauth)[^\s\"'<>]*",
+    re.IGNORECASE,
+)
+_OAUTH_QUERY_PARAM_RE = re.compile(
+    r"(?i)\b(code|state|token|access_token|refresh_token|id_token|authuser)=[^&\s\"'<>]+"
+)
+
+
+def _redact_auth_url(text: str) -> str:
+    """Redact OAuth/authorization URLs and their query parameters.
+
+    Applied to every stdout/stderr sample and to any failure_reason derived from
+    raw agy output, so a leaked Google Sign-In URL (or its code/state/token query
+    parameters) never reaches result JSON, logs, or PR/issue comments.
+    """
+    if not text:
+        return text
+    redacted = _OAUTH_URL_RE.sub("<redacted-oauth-url>", text)
+    redacted = _OAUTH_QUERY_PARAM_RE.sub(lambda m: f"{m.group(1)}=<redacted>", redacted)
+    return redacted
+
+
 def _redact_output_sample(text: str) -> str:
     """Return a bounded, redacted sample for stdout/stderr capture."""
     sample = text or ""
@@ -453,6 +761,11 @@ def _redact_output_sample(text: str) -> str:
 
     sample = re.sub(r"\bgh[pousr]_[A-Za-z0-9_]{8,}\b", "<redacted>", sample)
     sample = re.sub(r"\bsk-[A-Za-z0-9_-]{20,}\b", "<redacted>", sample)
+
+    # Auth/OAuth URL redaction MUST happen before truncation (Issue #1267 fix_delta
+    # Blocker 3), otherwise a truncated-but-unredacted URL/query-param prefix could
+    # still leak.
+    sample = _redact_auth_url(sample)
 
     return sample[:SMOKE_SAMPLE_MAX_CHARS]
 
@@ -653,10 +966,27 @@ def _run_smoke(agy_bin: str) -> dict[str, Any]:
                 smoke["failure_reason"] = "agy_output_missing"
                 smoke["failure_class"] = "agy_output_missing" if is_ci else "agy_empty_stdout"
             elif stdout.strip() != EXPECTED_SMOKE:
-                smoke["failure_reason"] = f"agy_output_mismatch: got {stdout.strip()!r}"
+                # Issue #1267 fix_delta Blocker 3: never embed raw (unredacted) agy
+                # stdout in failure_reason — it may contain an OAuth authorization
+                # URL. Reuse the same redaction+truncation path as stdout_sample.
+                redacted_mismatch_sample = _redact_output_sample(stdout.strip())
+                smoke["failure_reason"] = f"agy_output_mismatch: got {redacted_mismatch_sample!r}"
                 smoke["failure_class"] = "agy_output_mismatch"
             else:
                 smoke["ok"] = True
+
+            if not smoke["ok"]:
+                # Issue #1267 Required Result Contract: only reclassify as an
+                # auth/keyring failure when stderr/stdout contains explicit evidence.
+                # Empty stdout (agy_empty_stdout / agy_output_missing) MUST remain an
+                # output-surface failure otherwise.
+                combined = "\n".join(part for part in [proc.stdout, proc.stderr] if part)
+                auth_signal = _classify_auth_signal(combined)
+                if auth_signal:
+                    smoke["failure_class"] = auth_signal
+                    smoke["failure_reason"] = (
+                        f"{smoke['failure_reason']} (auth evidence detected: {auth_signal})"
+                    )
         except subprocess.TimeoutExpired:
             smoke["timed_out"] = True
 
@@ -795,6 +1125,9 @@ def run_preflight(
         },
         "warnings": [],
     }
+    # Issue #1267: auth is attached to every return path. It is initialised here
+    # (no agy output yet) and refined with smoke output evidence below.
+    result["auth"] = _build_auth_diagnostics()
 
     # Step 1: version check
     try:
@@ -871,6 +1204,14 @@ def run_preflight(
 
     result["smoke"] = smoke
 
+    combined_smoke_output = "\n".join(
+        part for part in [smoke.get("stdout_sample", ""), smoke.get("stderr_sample", "")] if part
+    )
+    result["auth"] = _build_auth_diagnostics(
+        combined_output=combined_smoke_output,
+        smoke_ok=smoke.get("ok"),
+    )
+
     if smoke["timed_out"]:
         result["failure_reason"] = "agy smoke check timed out"
         result["failure_class"] = "client_subprocess_timeout"
@@ -880,7 +1221,9 @@ def run_preflight(
     if not smoke["ok"]:
         result["failure_reason"] = smoke.get("failure_reason") or "agy smoke check failed"
         result["failure_class"] = smoke.get("failure_class") or "agy_output_missing"
-        result["recovery_action"] = "check agy configuration and rerun preflight"
+        result["recovery_action"] = (
+            result["auth"].get("recovery_action") or "check agy configuration and rerun preflight"
+        )
         return result
 
     if grounded_research:

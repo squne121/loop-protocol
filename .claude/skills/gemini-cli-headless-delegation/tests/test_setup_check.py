@@ -915,3 +915,154 @@ def test_auth_status_always_in_auth_status_values():
             f"status '{result.get('status')}' not in AUTH_STATUS_VALUES for scenario: "
             f"rc={returncode_or_exc!r} stderr={stderr!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #1267: agy_auth_diagnostics_v1 surfacing (setup_check.py must not
+# reconstruct the schema — SSOT is preflight_agy.py).
+# ---------------------------------------------------------------------------
+
+
+def test_agy_provider_auth_diagnostics_surfaced(monkeypatch, tmp_path):
+    """AC1/AC2: setup_check.py --provider agy --json surfaces agy_preflight.auth
+    unmodified from preflight_agy.py's agy_auth_diagnostics_v1 object (no drift)."""
+    sc = load_setup_check()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    fake_auth = {
+        "checked": True,
+        "auth_mode": "system_keyring_cached",
+        "auth_mode_confidence": "inferred",
+        "keyring": {"available": True, "backend_hint": "secret_service_dbus", "failure_class": None},
+        "tty": {
+            "stdin_isatty": False,
+            "stdout_isatty": False,
+            "stderr_isatty": False,
+            "noninteractive_mode": True,
+        },
+        "platform": {"os": "linux", "is_wsl": False, "wsl_hint": None},
+        "recovery_action": None,
+    }
+
+    def fake_run(command: list[str], timeout: int | None = None):
+        tool = command[0]
+        versions = {"agy": "agy 1.0.14\n", "python3": "Python 3.12.0\n", "uv": "uv 0.7.0\n"}
+        if tool in versions and "--version" in command:
+            return _make_completed(0, stdout=versions[tool])
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(sc, "_run", fake_run)
+    monkeypatch.setattr(
+        sc,
+        "check_agy_preflight",
+        lambda: {"schema": "agy_preflight_result/v1", "ok": True, "failure_class": None, "auth": fake_auth},
+    )
+
+    result = sc.run_all_checks(repo_root=repo_root, provider="agy")
+
+    assert result["ok"] is True
+    assert result["agy_preflight"]["auth"] == fake_auth, (
+        "setup_check.py must surface agy_preflight.auth unmodified (no schema drift)"
+    )
+
+
+def test_auto_provider_preserves_agy_auth_failure_class(monkeypatch, tmp_path):
+    """AC6: provider=auto preserves the AGY attempt's auth/keyring failure class in
+    provider_attempts, and does not implement runtime fallback policy (#1270)."""
+    sc = load_setup_check()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    monkeypatch.setattr(
+        sc,
+        "_run_agy_provider_checks",
+        lambda repo_root=None, fix=False: {
+            "ok": False,
+            "exit_code": 1,
+            "provider": "agy",
+            "selected_provider": "agy",
+            "agy_preflight": {
+                "failure_class": "google_sign_in_required",
+                "auth": {
+                    "checked": True,
+                    "auth_mode": "google_sign_in_required",
+                    "auth_mode_confidence": "observed",
+                    "keyring": {"available": None, "backend_hint": None, "failure_class": None},
+                    "tty": {
+                        "stdin_isatty": False,
+                        "stdout_isatty": False,
+                        "stderr_isatty": False,
+                        "noninteractive_mode": True,
+                    },
+                    "platform": {"os": "linux", "is_wsl": True, "wsl_hint": "env:WSL_DISTRO_NAME"},
+                    "recovery_action": "Run agy's interactive auth login (Google Sign-In).",
+                },
+            },
+            "tools": {"ok": True, "versions": {"agy": "agy 1.0.14"}},
+            "skipped_gemini_checks": [],
+        },
+    )
+    monkeypatch.setattr(
+        sc,
+        "_run_gemini_provider_checks",
+        lambda repo_root=None, fix=False: {
+            "ok": True,
+            "exit_code": 0,
+            "provider": "gemini",
+            "selected_provider": "gemini",
+            "tools": {"ok": True, "versions": {"gemini": "0.1.0"}},
+            "trusted_folders": {"ok": True, "status": "already_trusted"},
+            "serena_mcp": {"ok": True, "status": "available"},
+            "gemini_settings": {"ok": True, "status": "exists"},
+            "auth": {"ok": True, "status": "authenticated"},
+        },
+    )
+
+    result = sc.run_all_checks(repo_root=repo_root, provider="auto")
+
+    assert result["selected_provider"] == "gemini"
+    agy_attempt = next(entry for entry in result["provider_attempts"] if entry["provider"] == "agy")
+    assert agy_attempt["auth_failure_class"] == "google_sign_in_required"
+    # #1270 scope guard: no runtime fallback *policy* field is implemented here.
+    assert "fallback_policy" not in result
+
+
+# ---------------------------------------------------------------------------
+# Issue #1267 fix_delta iteration 2 Blocker 1: tools-missing stub must still
+# surface a schema-conformant auth object (not a partial hand-authored stub).
+# ---------------------------------------------------------------------------
+
+
+def test_agy_provider_tools_missing_still_surfaces_auth(monkeypatch, tmp_path):
+    """Blocker 1: when required agy tools are missing, run_all_checks(provider=
+    'agy') must still surface `agy_preflight.auth` conforming to
+    agy_auth_diagnostics_v1 (checked/auth_mode/keyring/tty/platform), not a bare
+    stub missing the auth field entirely."""
+    sc = load_setup_check()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    def fake_run(command: list[str], timeout: int | None = None):
+        tool = command[0]
+        if tool == "agy" and "--version" in command:
+            raise FileNotFoundError("agy: command not found")
+        versions = {"python3": "Python 3.12.0\n", "uv": "uv 0.7.0\n"}
+        if tool in versions and "--version" in command:
+            return _make_completed(0, stdout=versions[tool])
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(sc, "_run", fake_run)
+
+    result = sc.run_all_checks(repo_root=repo_root, provider="agy")
+
+    assert result["ok"] is False
+    assert result["agy_preflight"]["failure_class"] == "cli_missing"
+    auth = result["agy_preflight"].get("auth")
+    assert auth is not None, "agy_preflight.auth must be present even when agy tools are missing"
+    assert auth["checked"] is True
+    assert "auth_mode" in auth
+    assert "auth_mode_confidence" in auth
+    assert "keyring" in auth
+    assert "tty" in auth
+    assert "platform" in auth

@@ -171,9 +171,38 @@ def _load_preflight_agy_module():
 
 
 def check_agy_preflight() -> dict[str, Any]:
-    """Run provider-aware agy preflight through the sibling script."""
+    """Run provider-aware agy preflight through the sibling script.
+
+    The returned dict already includes an `auth` key conforming to the
+    `agy_auth_diagnostics_v1` schema (auth mode, keyring availability/diagnostics,
+    TTY condition — Issue #1267). preflight_agy.py is the SSOT for this schema;
+    this function surfaces it unmodified at agy_preflight.auth without re-deriving
+    or reconstructing the auth/keyring diagnostics (schema drift is not permitted).
+    """
     module = _load_preflight_agy_module()
     return module.run_preflight()
+
+
+def _extract_agy_auth_failure_class(agy_preflight: dict[str, Any]) -> str | None:
+    """Extract the AGY attempt's auth/keyring failure class for observability.
+
+    Reads `agy_preflight['auth']` (the `agy_auth_diagnostics_v1` object whose SSOT is
+    preflight_agy.py) and returns a single machine-readable failure class string, or
+    None when no auth/keyring failure is present. This is diagnostics/observability
+    only — it does NOT implement provider=auto runtime fallback policy, which remains
+    #1270's scope (Issue #1267 Out of Scope).
+    """
+    auth = agy_preflight.get("auth") if isinstance(agy_preflight, dict) else None
+    if not isinstance(auth, dict):
+        return None
+    keyring = auth.get("keyring")
+    keyring_failure_class = keyring.get("failure_class") if isinstance(keyring, dict) else None
+    if keyring_failure_class:
+        return keyring_failure_class
+    auth_mode = auth.get("auth_mode")
+    if auth_mode in {"google_sign_in_required", "unauthenticated", "auth_probe_failed"}:
+        return auth_mode
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -588,13 +617,23 @@ def _run_gemini_provider_checks(repo_root: Path | None = None, fix: bool = False
 
 def _run_agy_provider_checks(repo_root: Path | None = None, fix: bool = False) -> dict[str, Any]:
     tools_result = check_tools(AGY_REQUIRED_TOOLS)
-    agy_preflight = check_agy_preflight() if tools_result["ok"] else {
-        "schema": "agy_preflight_result/v1",
-        "ok": False,
-        "failure_reason": "agy preflight skipped because required agy tools are missing",
-        "failure_class": "cli_missing",
-        "recovery_action": "install missing agy prerequisites first",
-    }
+    if tools_result["ok"]:
+        agy_preflight = check_agy_preflight()
+    else:
+        # Issue #1267 fix_delta Blocker 1: every agy_preflight_result/v1 path —
+        # including this tools-missing stub, which returns before
+        # check_agy_preflight() would ever run — must include a schema-conformant
+        # `auth` object. Reuse preflight_agy.py's builder (SSOT) instead of hand
+        # authoring a partial stub without auth.
+        module = _load_preflight_agy_module()
+        agy_preflight = {
+            "schema": "agy_preflight_result/v1",
+            "ok": False,
+            "failure_reason": "agy preflight skipped because required agy tools are missing",
+            "failure_class": "cli_missing",
+            "recovery_action": "install missing agy prerequisites first",
+            "auth": module.build_auth_diagnostics(),
+        }
     unsupported_fix = bool(fix)
     ok = tools_result["ok"] and agy_preflight["ok"] and not unsupported_fix
     exit_code = 0 if ok else 1
@@ -639,10 +678,15 @@ def _run_auto_provider_checks(repo_root: Path | None = None, fix: bool = False) 
         }
     provider_attempts: list[dict[str, Any]] = []
     agy_result = _run_agy_provider_checks(repo_root=repo_root, fix=fix)
+    # Issue #1267 AC6: preserve the AGY attempt's auth/keyring/TTY failure class in
+    # provider_attempts (machine-readable attempt detail). This does not implement
+    # provider=auto runtime fallback *policy* — the existing agy→gemini fallback
+    # sequencing below is unchanged; only diagnostics are added.
     provider_attempts.append({
         "provider": "agy",
         "ok": agy_result["ok"],
         "exit_code": agy_result["exit_code"],
+        "auth_failure_class": _extract_agy_auth_failure_class(agy_result.get("agy_preflight") or {}),
     })
     if agy_result["ok"]:
         agy_result["provider"] = "auto"
