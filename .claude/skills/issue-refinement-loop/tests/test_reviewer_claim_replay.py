@@ -124,9 +124,17 @@ COMPACT_C9_DETERMINISTIC = {
     # checker_evidence=_make_self_checker_evidence(...), reviewer_blocker_code="C9")`,
     # then compacted by `compact_review_result.py` into the
     # ISSUE_REVIEW_RESULT_COMPACT_V1 shape consumed here.
+    #
+    # NOTE (PR #1319 reviewer blocker fix, #1314): `compact_review_result.py`
+    # emits the canonical body-hash field as `producer_body_sha256`
+    # (`"producer_body_sha256": raw_result.get("body_sha256")`); the bare
+    # `body_sha256` key is only a back-compat fallback consumed in
+    # `reviewer_claim_replay.py`. This fixture must exercise the canonical
+    # producer shape, not the fallback, so it carries `producer_body_sha256`
+    # here, matching `READINESS_CLEAN["body_sha256"]` ("sha256:body-a").
     "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
     "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
-    "body_sha256": "sha256:body-a",
+    "producer_body_sha256": "sha256:body-a",
     "blocking_issues": [
         "## Runtime Verification Applicability セクションがない（レガシー Issue）"
     ],
@@ -443,6 +451,18 @@ def test_c9_blocker_is_deterministic_backed_not_checker_gap():
     assert blocker["evidence"][0]["rule_id"] == "C9_runtime_applicability_present"
     assert blocker["evidence"][0]["category"] == "runtime_applicability"
     assert blocker["evidence"][0]["body_sha256"] == result["body_sha256"]
+
+    # PR #1319 reviewer blocker fix (#1314): assert directly against the
+    # fixture's own `findings[*].checker_evidence` (the canonical producer
+    # shape), not only against the derived `blocker["evidence"]`, so this
+    # test actually exercises the `producer_body_sha256` canonical field
+    # instead of silently passing through the `body_sha256` back-compat
+    # fallback path in `reviewer_claim_replay.py`.
+    for finding in COMPACT_C9_DETERMINISTIC["findings"]:
+        for evidence_entry in finding["checker_evidence"]:
+            assert evidence_entry["rule_id"] == "C9_runtime_applicability_present"
+            assert evidence_entry["category"] == "runtime_applicability"
+            assert evidence_entry["body_sha256"] == result["body_sha256"]
 
     assert len(result["rewrite_ready_blockers"]) == 1
     assert result["rewrite_ready_blockers"][0]["normalized_kind"] == "rva_immediate_field_missing"
