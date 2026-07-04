@@ -281,6 +281,13 @@ def publish(
     Returns 0 on successful post, 1 on fail-closed (no gh call).
     To override the renderer path in tests, set publish_termination_report.RENDERER_SCRIPT
     directly before calling publish().
+
+    #1311: loop_handoff (optional, TERMINATION_REPORT_INPUT_V1 field) is read
+    from input_data by normalize_input() (dict pass-through, no filtering)
+    and forwarded unmodified to the renderer subprocess via _invoke_renderer().
+    This function does not interpret, derive, or validate loop_handoff itself --
+    schema (schemas/loop_handoff_result_v1.json) and Routing Rules policy
+    validation are render_termination_report.py's exclusive responsibility.
     """
     try:
         normalized_input = normalize_input(input_data)
