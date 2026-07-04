@@ -241,7 +241,7 @@ jobs:
           VITE_LOOP_RUN_ATTEMPT: ${{ github.run_attempt }}
           VITE_LOOP_PAGE_URL: https://${{ github.repository_owner }}.github.io${{ steps.vite-base.outputs.base }}
           VITE_LOOP_ARTIFACT_URL: "unknown"
-          VITE_LOOP_ARTIFACT_NAMES: gh-pages-pr-${{ github.event.number }}
+          VITE_LOOP_ARTIFACT_NAMES: gh-pages-pr-${{ github.event.number }}-dist,playtest-evidence-provenance-pr-${{ github.event.number }}
           VITE_LOOP_ARTIFACT_DIGEST_OR_ATTESTATION: "unavailable-in-deploy-pages"
           VITE_LOOP_RETENTION_DAYS: "90"
           VITE_LOOP_SCREENSHOT_PATH: "manual_capture_required"
@@ -294,6 +294,9 @@ jobs:
       # (artifact url/digest/retention) are NOT knowable at bundle build time
       # and are therefore emitted into playtest-evidence-provenance.json only
       # (kept OUT of the bundle), not re-injected into VITE_* envs.
+      # This provenance JSON is an evidence manifest for playtest/reproducibility
+      # trail purposes only; it is NOT a signed artifact attestation (no
+      # actions/attest / sigstore signing is performed here).
       - name: Upload PR dist bundle artifact
         id: upload-dist
         uses: actions/upload-artifact@v7
@@ -333,6 +336,16 @@ jobs:
           }
           JSON
           cat provenance_artifacts/playtest-evidence-provenance.json
+          jq -e '
+            .schema == "playtest_evidence_provenance/v1"
+            and (.commit_sha.value | test("^[0-9a-f]{40}$") or . == "unknown")
+            and (.run_id.value | test("^[0-9]+$") or . == "unknown")
+            and (.run_attempt.value | test("^[0-9]+$") or . == "unknown")
+            and (.page_url.value | startswith("https://") or . == "unknown")
+            and (.artifact_url.value | startswith("https://") or . == "unknown")
+            and (.artifact_digest_or_attestation.value | test("^[0-9a-f]{64}$") or . == "unknown")
+            and .retention_days.value == "90"
+          ' provenance_artifacts/playtest-evidence-provenance.json
       - name: Upload PR playtest-evidence-provenance artifact
         uses: actions/upload-artifact@v7
         with:
@@ -352,12 +365,50 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          fetch_pages_url_with_bounded_retry() {
+            local url="$1"
+            local output="$2"
+            local deadline=$((SECONDS + 180))
+            local status="000"
+
+            while :; do
+              status="$(
+                curl -sS -L \
+                  -H 'Cache-Control: no-cache' \
+                  --max-time 20 \
+                  -o "${output}.tmp" \
+                  -w '%{http_code}' \
+                  "$url" || true
+              )"
+
+              if [ "$status" = "200" ]; then
+                mv "${output}.tmp" "$output"
+                return 0
+              fi
+
+              if (( SECONDS >= deadline )); then
+                echo "ERROR: URL did not become live before deadline: $url" >&2
+                echo "last_status=$status" >&2
+                [ -s "${output}.tmp" ] && head -c 800 "${output}.tmp" >&2 || true
+                return 1
+              fi
+
+              case "$status" in
+                000|403|404|408|429|500|502|503|504|522|524)
+                  sleep 5
+                  ;;
+                *)
+                  echo "ERROR: non-retriable HTTP status $status for $url" >&2
+                  return 1
+                  ;;
+              esac
+            done
+          }
+
           base="${{ steps.vite-base.outputs.base }}"
           preview_url="https://${GITHUB_REPOSITORY_OWNER}.github.io${base}"
-          curl -fsSL --retry 5 --retry-delay 10 --max-time 90 \
-            -H 'Cache-Control: no-cache' \
-            "${preview_url}?cache_bust=${GITHUB_SHA}" \
-            -o /tmp/preview-index.html
+          fetch_pages_url_with_bounded_retry "${preview_url}?cache_bust=${GITHUB_SHA}" /tmp/preview-index.html
           grep -F "${base}assets/" /tmp/preview-index.html
           if grep -qE 'src="/assets/|href="/assets/' /tmp/preview-index.html; then exit 1; fi
           mapfile -t asset_paths < <(grep -oE '(src|href)="[^"]+assets/[^"]+"' /tmp/preview-index.html | sed -E 's/^[^"]+"([^"]+)"/\1/' | sort -u)
@@ -373,7 +424,7 @@ jobs:
                 exit 1
                 ;;
             esac
-            curl -fsSL --retry 5 --retry-delay 10 --max-time 90 -o /dev/null "https://${GITHUB_REPOSITORY_OWNER}.github.io${asset_path}"
+            fetch_pages_url_with_bounded_retry "https://${GITHUB_REPOSITORY_OWNER}.github.io${asset_path}" /tmp/preview-asset.bin
           done
       - name: Comment preview URL on PR
         if: ${{ always() }}
