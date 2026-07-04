@@ -43,6 +43,85 @@ DEFAULT_MODEL_ROUTING: dict[str, Any] = {
 
 _DEFAULT_MODEL_ROUTING_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "model_routing.yaml"
 
+# --- retry_budget schema (Issue #1270 AC2) -----------------------------------
+# Provider-scoped retry budget schema for config/model_routing.yaml
+# `providers.<provider>.retry_budget`. Deliberately separate from the
+# `roles.<role>.model_chain` schema above: model_chain answers "which models,
+# in what order"; retry_budget answers "how many attempts / how much backoff
+# per provider", independent of which role/model is in use.
+_RETRY_BUDGET_INT_KEYS: frozenset[str] = frozenset({
+    "same_model_attempts",
+    "same_provider_attempts",
+    "initial_backoff_seconds",
+    "max_backoff_seconds",
+})
+_RETRY_BUDGET_BOOL_KEYS: frozenset[str] = frozenset({"jitter"})
+_RETRY_BUDGET_LIST_KEYS: frozenset[str] = frozenset({"retryable_failure_classes"})
+_RETRY_BUDGET_KNOWN_KEYS: frozenset[str] = (
+    _RETRY_BUDGET_INT_KEYS | _RETRY_BUDGET_BOOL_KEYS | _RETRY_BUDGET_LIST_KEYS
+)
+DEFAULT_RETRY_BUDGET: dict[str, Any] = {
+    "same_model_attempts": RETRY_LIMIT + 1,
+    "same_provider_attempts": 1,
+    "initial_backoff_seconds": 1,
+    "max_backoff_seconds": 4,
+    "retryable_failure_classes": ["quota_or_rate_limited", "model_capacity_exhausted"],
+}
+
+
+def _validate_retry_budget(provider_name: str, retry_budget: Any) -> None:
+    """Fail-closed validation of providers[<name>].retry_budget.
+
+    Validates type, required-key absence handling (all keys optional --
+    unset keys fall back to DEFAULT_RETRY_BUDGET via get_retry_budget()),
+    and rejects any unknown key so silently-misspelled config never
+    degrades into an ignored no-op.
+    """
+    if not isinstance(retry_budget, dict):
+        raise ValueError(f"model_routing providers[{provider_name!r}].retry_budget must be a mapping")
+    unknown_keys = set(retry_budget) - _RETRY_BUDGET_KNOWN_KEYS
+    if unknown_keys:
+        raise ValueError(
+            f"model_routing providers[{provider_name!r}].retry_budget has unknown key(s): "
+            f"{sorted(unknown_keys)}; allowed keys: {sorted(_RETRY_BUDGET_KNOWN_KEYS)}"
+        )
+    for key in _RETRY_BUDGET_INT_KEYS:
+        if key not in retry_budget:
+            continue
+        value = retry_budget[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"model_routing providers[{provider_name!r}].retry_budget[{key!r}] "
+                f"must be a non-negative int, got {value!r}"
+            )
+    for key in _RETRY_BUDGET_BOOL_KEYS:
+        if key in retry_budget and not isinstance(retry_budget[key], bool):
+            raise ValueError(
+                f"model_routing providers[{provider_name!r}].retry_budget[{key!r}] must be a bool"
+            )
+    for key in _RETRY_BUDGET_LIST_KEYS:
+        if key not in retry_budget:
+            continue
+        value = retry_budget[key]
+        if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+            raise ValueError(
+                f"model_routing providers[{provider_name!r}].retry_budget[{key!r}] "
+                f"must be a list of non-empty strings"
+            )
+
+
+def get_retry_budget(routing: dict[str, Any], provider: str) -> dict[str, Any]:
+    """Return the effective retry_budget for *provider*, merging configured
+    values (if any) over DEFAULT_RETRY_BUDGET. Never raises -- validation
+    already happened fail-closed inside load_model_routing()."""
+    providers = routing.get("providers", {})
+    provider_cfg = providers.get(provider, {}) if isinstance(providers, dict) else {}
+    configured = provider_cfg.get("retry_budget", {}) if isinstance(provider_cfg, dict) else {}
+    merged = dict(DEFAULT_RETRY_BUDGET)
+    if isinstance(configured, dict):
+        merged.update(configured)
+    return merged
+
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Deep-merge *override* into *base* (non-destructive copy)."""
@@ -121,6 +200,18 @@ def load_model_routing(config_path: Path | None = None) -> dict[str, Any]:
                     f"model_routing roles[{role_name!r}].model_chain contains invalid entry: {entry!r}"
                 )
 
+    # Validate providers[*].retry_budget (Issue #1270 AC2) -- fail-closed on
+    # unknown keys / wrong types. `providers` itself is optional; when absent,
+    # get_retry_budget() falls back to DEFAULT_RETRY_BUDGET for every provider.
+    providers = routing.get("providers", {})
+    if not isinstance(providers, dict):
+        raise ValueError("model_routing providers must be a mapping when present")
+    for provider_name, provider_cfg in providers.items():
+        if not isinstance(provider_cfg, dict):
+            raise ValueError(f"model_routing providers[{provider_name!r}] must be a mapping")
+        if "retry_budget" in provider_cfg:
+            _validate_retry_budget(provider_name, provider_cfg["retry_budget"])
+
     return routing
 
 
@@ -162,7 +253,83 @@ def resolve_model_chain(
         return [], "empty_chain: default_chain is empty"
     return list(default_chain), None
 ALLOWED_TOOL_PROFILES = {"no_tools", "grounded_research", "local_asset_research", "proposal_only", "github_research"}
-SUPPORTED_PROVIDERS: frozenset[str] = frozenset({"gemini", "agy"})
+SUPPORTED_PROVIDERS: frozenset[str] = frozenset({"gemini", "agy", "auto"})
+
+# --- provider_auto_policy_v1 (Issue #1270) -----------------------------------
+# Runtime provider="auto" dispatch policy. Mirrors the provider_auto_policy_v1
+# block documented in config/model_routing.yaml. Kept as Python constants
+# (rather than loaded from YAML) because these are fixed v1 safety boundaries,
+# not per-deployment tunables -- retry_budget numbers are the tunable part and
+# DO come from model_routing.yaml (see load_model_routing()).
+#
+# setup_check_order (setup_check.py --provider auto) is agy-first; this
+# runtime_order is intentionally gemini-first and DIFFERS from setup order.
+# The two are separate policies (setup diagnostics vs. runtime dispatch) and
+# are not required to match -- see references/model-routing.md.
+PROVIDER_AUTO_FALLBACK_POLICY_VERSION = "v1"
+PROVIDER_AUTO_RUNTIME_ORDER: tuple[str, ...] = ("gemini", "agy")
+PROVIDER_AUTO_ELIGIBLE_PROFILES: frozenset[str] = frozenset({"no_tools", "proposal_only"})
+PROVIDER_AUTO_RETRYABLE_FAILURE_CLASSES: dict[str, frozenset[str]] = {
+    "gemini": frozenset({
+        "quota_or_rate_limited",
+        "model_capacity_exhausted",
+        "model_chain_exhausted",
+    }),
+    "agy": frozenset({
+        "agy_rate_limited",
+        "agy_capacity_exhausted",
+        "agy_web_grounding_quota_exhausted",
+    }),
+}
+
+# --- AGY generic failure classifier (Issue #1270 / supersedes #1274 gap) ----
+# Generalizes AGY stdout/stderr quota-or-capacity detection beyond the
+# grounded_research-only _QUOTA_EXHAUSTED_RE in preflight_agy.py so that
+# provider_auto_dispatch() can decide whether an AGY failure is fallback-safe.
+_AGY_WEB_GROUNDING_QUOTA_RE = re.compile(
+    r"Individual quota reached|web[_ -]?grounding.{0,20}quota|grounding.{0,20}quota[_ ]exhausted",
+    re.IGNORECASE,
+)
+_AGY_AUTH_REQUIRED_RE = re.compile(
+    r"not authenticated|auth(?:entication)? required|please (?:log|sign) ?in|unauthenticated|\b401\b",
+    re.IGNORECASE,
+)
+_AGY_PERMISSION_DENIED_RE = re.compile(
+    r"permission denied|forbidden|\b403\b",
+    re.IGNORECASE,
+)
+_AGY_CAPACITY_EXHAUSTED_RE = re.compile(
+    r"MODEL_CAPACITY_EXHAUSTED|capacity[_ ]exhausted|model.{0,10}overloaded|\bUNAVAILABLE\b",
+    re.IGNORECASE,
+)
+_AGY_RATE_LIMITED_RE = re.compile(
+    r"RESOURCE_EXHAUSTED|rate[_ -]?limit|quota[_ ]exhausted|\b429\b",
+    re.IGNORECASE,
+)
+
+
+def _classify_agy_failure(returncode: int, stdout: str, stderr: str) -> str:
+    """Classify an AGY subprocess failure into a canonical failure_class.
+
+    Inspects both stdout and stderr (AGY may emit diagnostic text on either
+    stream). Order matters: web-grounding quota is checked first because its
+    message can also contain generic quota wording that would otherwise be
+    misclassified as the broader ``agy_rate_limited`` class.
+    """
+    combined = f"{stdout}\n{stderr}"
+    if not combined.strip():
+        return "agy_output_missing" if returncode == 0 else "agy_exit_nonzero"
+    if _AGY_WEB_GROUNDING_QUOTA_RE.search(combined):
+        return "agy_web_grounding_quota_exhausted"
+    if _AGY_AUTH_REQUIRED_RE.search(combined):
+        return "agy_auth_required"
+    if _AGY_PERMISSION_DENIED_RE.search(combined):
+        return "agy_permission_denied"
+    if _AGY_CAPACITY_EXHAUSTED_RE.search(combined):
+        return "agy_capacity_exhausted"
+    if _AGY_RATE_LIMITED_RE.search(combined):
+        return "agy_rate_limited"
+    return "agy_exit_nonzero" if returncode != 0 else "agy_output_missing"
 AGY_SUPPORTED_PROFILES: frozenset[str] = frozenset(
     {
         "no_tools",
@@ -1851,8 +2018,15 @@ def _normalize_agy_result(
     warnings = list(request_warnings or [])
 
     if completed.returncode != 0:
-        if not any(item.startswith("agy_exit_nonzero") for item in warnings):
-            warnings.append(f"agy_exit_nonzero: exit code {completed.returncode}")
+        # Issue #1270: classify quota/capacity/auth/permission failures
+        # generically from stdout+stderr instead of always defaulting to
+        # agy_exit_nonzero, so provider_auto_dispatch() can decide fallback
+        # eligibility. Falls back to "agy_exit_nonzero" when no known signal
+        # is detected (preserves prior behavior for generic failures).
+        failure_class = _classify_agy_failure(completed.returncode, stdout, stderr_text)
+        warning = f"{failure_class}: exit code {completed.returncode}"
+        if not any(item.startswith(failure_class) for item in warnings):
+            warnings.append(warning)
         return {
             "schema": "delegation_result/v1",
             "transport": "agy",
@@ -1868,16 +2042,19 @@ def _normalize_agy_result(
             "stats": None,
             "stderr": stderr_text or None,
             "warnings": warnings,
-            "failure_reason": f"agy_exit_nonzero: exit code {completed.returncode}",
-            "failure_class": "agy_exit_nonzero",
+            "failure_reason": warning,
+            "failure_class": failure_class,
             "raw_command": _build_agy_raw_command(""),
             "model_chain": [],
             "model_downgrades": [],
         }
 
     if not stdout:
+        # Issue #1270 / #1274: warnings[0] leading token must match failure_class
+        # (previously the warning always said "agy_output_missing" even when
+        # failure_class was "agy_empty_stdout" in non-CI environments).
         failure_class = "agy_output_missing" if is_ci else "agy_empty_stdout"
-        warning = "agy_output_missing: exit 0 but stdout was empty"
+        warning = f"{failure_class}: exit 0 but stdout was empty"
         return {
             "schema": "delegation_result/v1",
             "transport": "agy",
@@ -2242,10 +2419,18 @@ def run_delegation(
     # fallback calls run_delegation() with transport="headless_json", which
     # does not re-enter the ACP branch.
 
+    # --- provider early dispatch: auto ---
+    # provider="auto" is a meta-provider: it re-enters run_delegation() once
+    # per candidate in PROVIDER_AUTO_RUNTIME_ORDER with a concrete provider
+    # substituted in. It must be dispatched BEFORE the agy/unknown_provider
+    # checks below (auto is not gemini and not agy).
+    provider = request.get("provider", "gemini")
+    if provider == "auto":
+        return provider_auto_dispatch(request, request_path=request_path, _routing=_routing)
+
     # --- provider early dispatch: agy ---
     # agy provider uses a separate minimal validation path and is dispatched
     # BEFORE the full Gemini validation (which requires context_files etc.)
-    provider = request.get("provider", "gemini")
     if provider not in SUPPORTED_PROVIDERS:
         return {
             "schema": "delegation_result/v1",
@@ -2765,7 +2950,10 @@ def run_delegation(
         break
 
     if chain_exhausted:
-        # All models in chain exhausted with quota errors
+        # All models in chain exhausted with quota errors.
+        # Issue #1270: top-level failure_class must be set (not just
+        # reason_code) so provider_auto_dispatch() can classify this as a
+        # provider-level retryable failure eligible for fallback.
         base_result.update({
             "ok": False,
             "actual_model": final_model,
@@ -2773,6 +2961,7 @@ def run_delegation(
             "warnings": warnings,
             "failure_reason": "model_chain_exhausted: all models in chain failed with quota errors",
             "reason_code": "model_chain_exhausted",
+            "failure_class": "model_chain_exhausted",
             "raw_command": last_command,
             "model_chain": list(model_chain),
             "model_downgrades": model_downgrades,
@@ -2852,6 +3041,11 @@ def run_delegation(
     )
     if reason_code:
         base_result["reason_code"] = reason_code
+    if not ok and rate_limit_warnings:
+        # Issue #1270: surface quota_or_rate_limited as a top-level
+        # failure_class distinct from model_capacity_exhausted /
+        # model_chain_exhausted, per the retryable_failure_classes taxonomy.
+        base_result["failure_class"] = "quota_or_rate_limited"
 
     # AC-5: post_to_issue_url が指定されており、ok=True の場合のみ gh issue comment を実行する
     post_to_issue_url = request.get("post_to_issue_url")
@@ -2887,6 +3081,190 @@ def run_delegation(
         )
 
     return base_result
+
+
+def _provider_auto_unsupported_profile_result(
+    request: Mapping[str, Any],
+    tool_profile: str,
+) -> dict[str, Any]:
+    """Stop-condition result for provider="auto" with an ineligible tool_profile.
+
+    No provider attempt is made at all (fail-closed before any dispatch) --
+    this is the ``provider_profile_unsupported`` / ``stop_if`` condition from
+    provider_auto_policy_v1, not a per-provider failure.
+    """
+    message = (
+        f"provider_profile_unsupported: provider=auto (v1) only supports "
+        f"tool_profile in {sorted(PROVIDER_AUTO_ELIGIBLE_PROFILES)}, got {tool_profile!r}"
+    )
+    return {
+        "schema": "delegation_result/v1",
+        "provider": "auto",
+        "ok": False,
+        "requested_model": str(request.get("model", DEFAULT_MODEL)),
+        "actual_model": "unknown",
+        "tool_profile": tool_profile,
+        "exit_code": 1,
+        "result_surface": {
+            "mode": "artifact-first",
+            "summary": None,
+            "primary_artifact_type": "none",
+            "primary_artifact": None,
+            "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
+        },
+        "response_text": None,
+        "stats": None,
+        "stderr": message,
+        "warnings": [message],
+        "failure_reason": message,
+        "failure_class": "provider_profile_unsupported",
+        "raw_command": [],
+        "model_chain": [],
+        "model_downgrades": [],
+        "selected_provider": None,
+        "provider_attempts": [],
+        "fallback_reason": "stop_if:provider_profile_unsupported",
+        "fallback_policy_version": PROVIDER_AUTO_FALLBACK_POLICY_VERSION,
+        "attempts_by_model": {},
+    }
+
+
+def _attempts_by_model_from_provider_attempts(
+    provider_attempts: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Flatten per-provider model_downgrades into a {model_id: attempt_count} map.
+
+    Every model that appears as either the "from" or "to" side of a downgrade
+    event counts as at least one attempt; the final (non-downgraded) model of
+    each provider attempt is not separately trackable here (the underlying
+    run_delegation() call does not report it independent of model_downgrades),
+    so this map is a lower bound on real attempt counts, sufficient for
+    result-surface observability (AC4) without over-claiming precision.
+    """
+    attempts_by_model: dict[str, int] = {}
+    for attempt in provider_attempts:
+        for downgrade in attempt.get("model_downgrades") or []:
+            for key in ("from", "to"):
+                model_id = downgrade.get(key)
+                if model_id:
+                    attempts_by_model[model_id] = attempts_by_model.get(model_id, 0) + 1
+    return attempts_by_model
+
+
+def _provider_auto_finalize(
+    result: dict[str, Any],
+    *,
+    selected_provider: str,
+    provider_attempts: list[dict[str, Any]],
+    fallback_reason: str | None,
+) -> dict[str, Any]:
+    """Attach provider_auto_policy_v1 result-surface fields to *result*.
+
+    Does not mutate the underlying provider result's own failure_reason /
+    failure_class -- those continue to describe the *last attempted*
+    provider's own outcome. The provider_attempts[] list is the auditable
+    record of every provider that was tried.
+    """
+    finalized = dict(result)
+    finalized["provider"] = "auto"
+    finalized["selected_provider"] = selected_provider
+    finalized["provider_attempts"] = provider_attempts
+    finalized["fallback_reason"] = fallback_reason
+    finalized["fallback_policy_version"] = PROVIDER_AUTO_FALLBACK_POLICY_VERSION
+    finalized["attempts_by_model"] = _attempts_by_model_from_provider_attempts(provider_attempts)
+    return finalized
+
+
+def provider_auto_dispatch(
+    request: Mapping[str, Any],
+    request_path: Path | None = None,
+    _routing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Runtime provider="auto" dispatcher (Issue #1270 / provider_auto_policy_v1).
+
+    Two phases are kept structurally separate:
+
+      1. Model downgrade -- entirely consumed *inside* a single provider's
+         own run_delegation() call (the existing per-model retry / downgrade
+         loop for Gemini; a single attempt for AGY). This function never
+         re-implements that loop; it only observes its outcome via
+         model_downgrades / failure_class.
+      2. Provider fallback -- this function's own loop over
+         PROVIDER_AUTO_RUNTIME_ORDER. It only advances to the next provider
+         when the *previous* provider's failure_class is a provider-level
+         retryable class (quota/capacity family). Any other failure
+         (validation, auth, permission, unsupported profile) stops
+         immediately with no fallback -- this is the fail-closed default
+         because unset/unknown failure_class values are never members of
+         PROVIDER_AUTO_RETRYABLE_FAILURE_CLASSES.
+
+    Stop conditions (idempotency guard -- AC5):
+      - tool_profile not in PROVIDER_AUTO_ELIGIBLE_PROFILES: no attempt made.
+      - request.get("post_to_issue_url") is set: after the FIRST provider
+        attempt (successful or not), fallback never proceeds further, because
+        a provider attempt reaching post-processing (a real, non-idempotent
+        GitHub comment) must not be retried against a second provider.
+    """
+    tool_profile = str(request.get("tool_profile", "unknown"))
+    if tool_profile not in PROVIDER_AUTO_ELIGIBLE_PROFILES:
+        return _provider_auto_unsupported_profile_result(request, tool_profile)
+
+    has_post_to_issue_url = bool(request.get("post_to_issue_url"))
+    provider_attempts: list[dict[str, Any]] = []
+    result: dict[str, Any] | None = None
+    fallback_reason: str | None = None
+
+    for index, candidate_provider in enumerate(PROVIDER_AUTO_RUNTIME_ORDER):
+        attempt_request = dict(request)
+        attempt_request["provider"] = candidate_provider
+        result = run_delegation(attempt_request, request_path=request_path, _routing=_routing)
+        provider_attempts.append({
+            "provider": candidate_provider,
+            "ok": bool(result.get("ok")),
+            "failure_class": result.get("failure_class"),
+            "model_downgrades": result.get("model_downgrades") or [],
+        })
+
+        if result.get("ok"):
+            fallback_reason = None if index == 0 else fallback_reason
+            break
+
+        if has_post_to_issue_url:
+            # Idempotency guard (AC5): a request that can trigger a real
+            # GitHub post must not be retried against a second provider,
+            # even though this attempt failed.
+            fallback_reason = "stop_if:request_has_post_to_issue_url"
+            break
+
+        failure_class = result.get("failure_class")
+        retryable = PROVIDER_AUTO_RETRYABLE_FAILURE_CLASSES.get(candidate_provider, frozenset())
+        is_last = index == len(PROVIDER_AUTO_RUNTIME_ORDER) - 1
+
+        if failure_class not in retryable:
+            # Non-retryable (auth / permission / schema / policy / unknown) --
+            # stop immediately regardless of position in runtime_order.
+            fallback_reason = (
+                None if index == 0 else f"stop_if:non_retryable_failure_class:{failure_class}"
+            )
+            break
+
+        if is_last:
+            # Retryable failure class, but no more candidate providers left.
+            fallback_reason = "provider_fallback_exhausted"
+            break
+
+        # Retryable provider-level failure and candidates remain -- fall
+        # through the loop to attempt the next provider.
+        fallback_reason = f"retryable_failure_class:{failure_class}"
+
+    assert result is not None  # PROVIDER_AUTO_RUNTIME_ORDER is never empty
+    selected_provider = provider_attempts[-1]["provider"]
+    return _provider_auto_finalize(
+        result,
+        selected_provider=selected_provider,
+        provider_attempts=provider_attempts,
+        fallback_reason=fallback_reason,
+    )
 
 
 _COMPACT_EXCLUDED_FIELDS = ("stats", "raw_command")

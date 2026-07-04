@@ -82,6 +82,56 @@ Human escalation を推奨。
 | `unknown_cli_failure` | non-zero exit code だが既知パターンにマッチしない |
 | `unknown_api_error` | Gemini envelope に `error` オブジェクトが含まれるが既知分類不能 |
 
+### AGY provider failure classes（Issue #1270）
+
+`provider=agy` の `_classify_agy_failure()`（`run_gemini_headless.py`）が
+stdout / stderr の両方から判別する failure_class。`_normalize_agy_result()`
+の non-zero exit 分岐がこの分類器を使う（以前は `agy_exit_nonzero` に
+一律丸められていた）。
+
+| `failure_class` | 意味 | retryable（provider fallback 対象） |
+|---|---|---|
+| `agy_rate_limited` | AGY 側の rate limit / quota 系エラー（`RESOURCE_EXHAUSTED` / `429` / `rate limit`） | yes |
+| `agy_capacity_exhausted` | AGY 側のモデル capacity 不足（`MODEL_CAPACITY_EXHAUSTED` / `overloaded` / `UNAVAILABLE`） | yes |
+| `agy_web_grounding_quota_exhausted` | grounded_research の web grounding quota 枯渇（`Individual quota reached` 等。既存 `preflight_agy.py` の `_QUOTA_EXHAUSTED_RE` と同じ検出対象を一般化） | yes |
+| `agy_auth_required` | AGY 認証未完了 / 失効 | no |
+| `agy_permission_denied` | AGY 権限不足（403 / forbidden） | no |
+| `agy_timeout` | subprocess タイムアウト | no |
+| `agy_exit_nonzero` | non-zero exit だが既知の quota/auth/permission signal にマッチしない一般失敗 | no |
+| `agy_empty_stdout` | 非 CI 環境で exit 0 だが stdout が空 | no |
+| `agy_output_missing` | CI 環境で exit 0 だが stdout が空（`agy_empty_stdout` と同一原因、CI 判定のみ異なる。#1274: `warnings[0]` の leading token は必ず `failure_class` と一致させる） | no |
+
+### provider_auto_policy_v1 fallback classes（Issue #1270）
+
+`provider=auto`（`provider_auto_dispatch()`）が provider fallback の
+可否判断・停止理由に使う top-level クラス。`provider_auto_policy_v1`
+の `retryable_failure_classes` / `stop_if` に対応する（
+`config/model_routing.yaml` 参照）。
+
+| `failure_class` / `fallback_reason` token | 意味 | fallback 可否 |
+|---|---|---|
+| `quota_or_rate_limited` | Gemini 側の quota/rate-limit（provider fallback 対象） | yes（次 provider へ） |
+| `model_capacity_exhausted` | Gemini 側の単一モデル capacity 不足（同一 provider 内 model downgrade で先に処理される） | yes（chain 全滅なら次 provider へ） |
+| `model_chain_exhausted` | Gemini の model_chain 全滅（provider fallback の主要トリガー） | yes（次 provider へ） |
+| `provider_profile_unsupported` | `tool_profile` が `provider_auto_policy_v1.eligible_profiles`（v1: `no_tools` / `proposal_only`）外 | no（dispatch 自体を行わない） |
+| `provider_fallback_exhausted` | `runtime_order` の全 provider が retryable failure_class で失敗した（これ以上 fallback 先がない） | no（terminal） |
+
+**Gemini / AGY / canonical class 対応表**
+
+| 概念 | Gemini 側 | AGY 側 |
+|---|---|---|
+| quota / rate limit | `quota_or_rate_limited` | `agy_rate_limited` |
+| model capacity 不足 | `model_capacity_exhausted` | `agy_capacity_exhausted` |
+| chain / provider 全滅 | `model_chain_exhausted` | (該当なし。AGY は単一 model のため provider fallback がそのまま終端) |
+| web grounding quota | (該当なし。web grounding は AGY grounded_research 専用) | `agy_web_grounding_quota_exhausted` |
+| 認証失効 | `auth_missing_or_expired` | `agy_auth_required` |
+| 権限不足 | `permission_denied` | `agy_permission_denied` |
+
+`post_to_issue_url` を含む request、認証/権限/schema/policy 失敗、
+`provider_profile_unsupported` はいずれも provider fallback の
+stop condition であり、上記の「fallback 可否: no」に対応する
+（`run_gemini_headless.py` の `provider_auto_dispatch()` 参照）。
+
 ### Conditionally retryable
 
 状況依存で retry 可否が変わるクラス。
