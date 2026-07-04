@@ -9,6 +9,7 @@ export type PhaseTransitionIntent =
   | 'save_progress'
   | 'reset_sortie'
   | 'start_sortie'
+  | 'purchase_upgrade'
   | 'sortie_terminal'
   | 'confirm_result'
   | 'legacy_claim_reward'
@@ -38,6 +39,7 @@ export const LOOP_PHASE_TRANSITIONS = {
     save_progress: 'preparation',
     reset_sortie: 'preparation',
     start_sortie: 'running',
+    purchase_upgrade: 'preparation',
   },
   running: {
     sortie_terminal: 'result',

@@ -10,3 +10,4 @@ export * from './SortieSystem'
 export * from './PhaseTransitionSystem'
 
 export * from './RewardSystem'
+export * from './UpgradeSystem'
