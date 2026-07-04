@@ -36,7 +36,8 @@ contain two of the known layer prefixes as an embedded substring.
 
 ## In Scope
 
-- gemini-cli-headless-delegation スキルの `.claude/skills/gemini-cli-headless-delegation/tests/test_quota_fallback.py` を確認する
+- gemini-cli-headless-delegation スキルの
+  `.claude/skills/gemini-cli-headless-delegation/tests/test_quota_fallback.py` を確認する
 
 ## Parent Issue
 
