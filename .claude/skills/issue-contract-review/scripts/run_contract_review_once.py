@@ -66,8 +66,12 @@ from baseline_vc_preflight import DEFAULT_TIMEOUT_SECONDS as _VC_PREFLIGHT_PER_C
 
 # Issue #1333 AC2: _VC_PREFLIGHT_TIMEOUT は per-command timeout の named
 # constant から関係式として導出する（単純な独立リテラル引き上げは禁止）。
-# _VC_PREFLIGHT_MAX_COMMAND_BUDGET: Issue #1328 のように複数 AC が同一の
-# 重い VC コマンドを重複参照するケースを踏まえた、直列実行の想定上限コマンド数。
+# _VC_PREFLIGHT_MAX_COMMAND_BUDGET: Issue #1333 の暫定的な wrapper timeout
+# budget（直列実行の想定上限コマンド数）。Issue #1328 のような、同一の重い
+# VC コマンドが多数の AC から重複参照される構造への根本対策（dedup/replay・
+# bounded parallel execution による総実行時間削減）は Issue #1338 で扱う。
+# 本定数は #1328 型のケースを timeout 側だけで完全に吸収することを意図した
+# ものではない。
 # _VC_PREFLIGHT_OVERHEAD_SECONDS: subprocess 起動・JSON parse 等の固定オーバーヘッド。
 _VC_PREFLIGHT_MAX_COMMAND_BUDGET = 6
 _VC_PREFLIGHT_OVERHEAD_SECONDS = 60
