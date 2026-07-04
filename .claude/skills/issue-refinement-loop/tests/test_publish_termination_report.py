@@ -997,3 +997,68 @@ class TestExecMarkerInjection:
         original_end_pos = body.find(original_body) + len(original_body)
         assert marker_pos > original_end_pos - 1  # marker is after original body
 
+
+
+
+# ---------------------------------------------------------------------------
+# #1311: loop_handoff input wiring (AC3)
+# ---------------------------------------------------------------------------
+
+class TestLoopHandoffWiring:
+    """AC3: publish() forwards the loop_handoff field from input_data to the
+    renderer subprocess unmodified (via normalize_input's dict pass-through)."""
+
+    def test_loop_handoff_forwarded_to_renderer_subprocess(self):
+        loop_handoff = {
+            "status": "impl_ready",
+            "routing_action": "run_impl_review_loop",
+            "contract_review": {
+                "status": "go",
+                "gate_result": "fresh_go",
+                "latest_comment_url": "https://example.com/c",
+                "generated_at": "2026-07-04T00:00:00Z",
+                "body_sha256": "sha256:" + "a" * 64,
+            },
+            "metadata": {"title_prefix_ready": True, "phase_label_ready": True},
+            "auto_fixes": {"result": "auto_fixed", "required": [], "skipped": []},
+            "blockers": [],
+            "permissions": {"unavailable": []},
+            "generated_at": "2026-07-04T00:00:00Z",
+        }
+        input_data = _make_input("approved", issue_number=1311)
+        input_data["loop_handoff"] = loop_handoff
+
+        fake_proc = _fake_renderer_proc(_make_render_result())
+
+        with patch("subprocess.run", return_value=fake_proc) as mock_run:
+            with patch.object(pub, "_post_github_comment", return_value=0):
+                pub.publish(
+                    issue_number=1311,
+                    input_data=input_data,
+                    repo="squne121/loop-protocol",
+                )
+
+        renderer_call = mock_run.call_args_list[0]
+        sent_input = renderer_call.kwargs.get("input")
+        assert sent_input is not None
+        sent_payload = json.loads(sent_input)
+        assert "loop_handoff" in sent_payload
+        assert sent_payload["loop_handoff"]["status"] == "impl_ready"
+
+    def test_missing_loop_handoff_does_not_break_forwarding(self):
+        input_data = _make_input("approved", issue_number=42)
+        assert "loop_handoff" not in input_data
+
+        fake_proc = _fake_renderer_proc(_make_render_result())
+
+        with patch("subprocess.run", return_value=fake_proc) as mock_run:
+            with patch.object(pub, "_post_github_comment", return_value=0):
+                pub.publish(
+                    issue_number=42,
+                    input_data=input_data,
+                    repo="squne121/loop-protocol",
+                )
+
+        renderer_call = mock_run.call_args_list[0]
+        sent_payload = json.loads(renderer_call.kwargs.get("input"))
+        assert "loop_handoff" not in sent_payload

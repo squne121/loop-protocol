@@ -35,6 +35,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import jsonschema
+import yaml
+
 # ---------------------------------------------------------------------------
 # prose_boundary_policy import (public API only, read-only reference)
 # ---------------------------------------------------------------------------
@@ -51,6 +54,111 @@ from prose_boundary_policy import classify_block, iter_markdown_blocks  # noqa: 
 
 SCHEMA_VERSION = 1
 RESULT_SCHEMA = "TERMINATION_REPORT_RENDER_RESULT_V1"
+
+# #1311: LOOP_HANDOFF_RESULT_V1 marker constants.
+# SSOT for the schema and the Routing Rules table is
+# .claude/skills/issue-refinement-loop/references/termination-policy.md
+LOOP_HANDOFF_MARKER = "<!-- LOOP_HANDOFF_RESULT_V1 -->"
+LOOP_HANDOFF_SCHEMA_PATH = (
+    _SKILLS_ROOT / "issue-refinement-loop" / "schemas" / "loop_handoff_result_v1.json"
+)
+
+# references/termination-policy.md "Routing Rules" table (minimum fixed subset
+# enforced here as a policy-level validator; the schema itself only encodes the
+# impl_ready -> run_impl_review_loop pairing via its allOf/if/then clause).
+LOOP_HANDOFF_ROUTING_RULES: dict[str, str] = {
+    "impl_ready": "run_impl_review_loop",
+    "blocked": "blocked",
+    "human_judgment_required": "ask_human",
+}
+
+_loop_handoff_schema_cache: dict[str, Any] | None = None
+
+
+def _get_loop_handoff_schema() -> dict[str, Any]:
+    """Load and cache schemas/loop_handoff_result_v1.json (read-only reference)."""
+    global _loop_handoff_schema_cache
+    if _loop_handoff_schema_cache is None:
+        with open(LOOP_HANDOFF_SCHEMA_PATH, encoding="utf-8") as f:
+            _loop_handoff_schema_cache = json.load(f)
+    return _loop_handoff_schema_cache
+
+
+def _validate_routing_rules(loop_handoff: dict[str, Any]) -> str:
+    """
+    Policy-level validator for references/termination-policy.md Routing Rules.
+
+    Fixes at least the impl_ready/run_impl_review_loop and blocked/blocked
+    pairings (plus human_judgment_required/ask_human) as a decision-authored
+    constraint on top of jsonschema structural validation.
+    """
+    status = loop_handoff.get("status")
+    routing_action = loop_handoff.get("routing_action")
+    expected = LOOP_HANDOFF_ROUTING_RULES.get(status)
+    if expected is not None and routing_action != expected:
+        return (
+            f"loop_handoff routing rule violation: status={status!r} requires "
+            f"routing_action={expected!r} per references/termination-policy.md "
+            f"Routing Rules, got routing_action={routing_action!r}"
+        )
+    return ""
+
+
+def _validate_loop_handoff(loop_handoff: Any) -> str:
+    """
+    Validate a loop_handoff payload against schemas/loop_handoff_result_v1.json
+    (jsonschema Draft7Validator + FormatChecker) and the Routing Rules policy.
+
+    Returns "" on success, an error message string otherwise. This function is
+    the sole responsibility boundary for loop_handoff acceptance: it does not
+    derive status/routing_action, it only validates a fully-formed payload.
+    """
+    if not isinstance(loop_handoff, dict):
+        return f"loop_handoff must be an object, got {type(loop_handoff).__name__}"
+
+    schema = _get_loop_handoff_schema()
+    validator = jsonschema.Draft7Validator(
+        schema, format_checker=jsonschema.FormatChecker()
+    )
+    wrapped = {"LOOP_HANDOFF_RESULT_V1": loop_handoff}
+    errors = sorted(validator.iter_errors(wrapped), key=lambda e: list(e.path))
+    if errors:
+        first = errors[0]
+        return (
+            f"loop_handoff schema validation failed: {first.message} "
+            f"(path: {list(first.path)})"
+        )
+
+    return _validate_routing_rules(loop_handoff)
+
+
+def _render_loop_handoff_marker(loop_handoff: dict[str, Any]) -> str:
+    """
+    Render the LOOP_HANDOFF_RESULT_V1 marker block.
+
+    Output: <!-- LOOP_HANDOFF_RESULT_V1 --> HTML comment followed by a fenced
+    YAML block generated via yaml.safe_dump (no hand-written string
+    concatenation). Uses a dynamic fence (_make_dynamic_fence) so that
+    backtick/tilde sequences embedded in loop_handoff string fields cannot
+    break out of the fence (fence injection defense, mirrors blockers_summary
+    handling in _render_normal_template).
+    """
+    payload = {"LOOP_HANDOFF_RESULT_V1": loop_handoff}
+    yaml_text = yaml.safe_dump(
+        payload,
+        sort_keys=False,
+        allow_unicode=True,
+        default_flow_style=False,
+    ).rstrip("\n")
+    fence = _make_dynamic_fence(yaml_text)
+
+    lines = [
+        LOOP_HANDOFF_MARKER,
+        f"{fence}yaml",
+        yaml_text,
+        fence,
+    ]
+    return "\n".join(lines)
 
 VALID_TERMINATION_REASONS = frozenset({
     "approved",
@@ -369,10 +477,21 @@ def render(data: dict[str, Any]) -> dict[str, Any]:
     termination_reason: str = data["termination_reason"]
     termination_cause: str | None = data.get("termination_cause")
 
+    # #1311: LOOP_HANDOFF_RESULT_V1 marker is only emitted on approved
+    # termination and only when a validated loop_handoff payload was provided.
+    # loop_handoff is validated up-front in _validate_input() regardless of
+    # termination_reason (fail-closed even for non-approved payloads).
+    loop_handoff = data.get("loop_handoff")
+    attach_loop_handoff_marker = (
+        termination_reason == "approved" and loop_handoff is not None
+    )
+
     attempts_log: list[dict] = []
 
     # Attempt 1: normal template
     body1 = _render_normal_template(data)
+    if attach_loop_handoff_marker:
+        body1 = body1 + "\n" + _render_loop_handoff_marker(loop_handoff) + "\n"
     ok1, errs1 = _run_guard(body1)
     attempts_log.append({
         "attempt": 1,
@@ -395,7 +514,14 @@ def render(data: dict[str, Any]) -> dict[str, Any]:
     print(f"[render_termination_report] attempt 1 guard fail: {errs1}", file=sys.stderr)
 
     # Attempt 2: fallback minimal template
+    # #1311: the marker (when applicable) is attached to the fallback body too,
+    # so that a fallback-template render still carries LOOP_HANDOFF_RESULT_V1.
+    # If this attempt also fails the guard, the whole render fails closed
+    # (publishable=false, body=None) rather than silently dropping the marker
+    # to force a "success".
     body2 = _render_fallback_minimal_template(data)
+    if attach_loop_handoff_marker:
+        body2 = body2 + "\n" + _render_loop_handoff_marker(loop_handoff) + "\n"
     ok2, errs2 = _run_guard(body2)
     attempts_log.append({
         "attempt": 2,
@@ -514,6 +640,15 @@ def _validate_input(raw: Any) -> tuple[dict[str, Any] | None, str]:
         # Each element must be a string (B3)
         if not all(isinstance(x, str) for x in blockers_summary):
             return None, "blockers_summary must be a list of strings"
+
+    # #1311: loop_handoff is validated regardless of termination_reason
+    # (fail-closed even when termination_reason != "approved" — an invalid
+    # loop_handoff payload must not be silently ignored).
+    loop_handoff = data.get("loop_handoff")
+    if loop_handoff is not None:
+        loop_handoff_err = _validate_loop_handoff(loop_handoff)
+        if loop_handoff_err:
+            return None, loop_handoff_err
 
     return data, ""
 

@@ -22,6 +22,11 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import jsonschema
+import pytest
+import re as _re
+import yaml
+
 
 # ---------------------------------------------------------------------------
 # Import the module under test
@@ -680,3 +685,332 @@ class TestInputValidation:
         validated, err = rtr._validate_input(data)
         assert err != "", "bool must not be accepted as iteration"
         assert validated is None
+
+
+
+# ---------------------------------------------------------------------------
+# #1311: LOOP_HANDOFF_RESULT_V1 marker generation
+# ---------------------------------------------------------------------------
+
+def _make_loop_handoff(
+    *,
+    status: str = "impl_ready",
+    routing_action: str = "run_impl_review_loop",
+    contract_review_status: str = "go",
+    gate_result: str = "fresh_go",
+    blockers: list[dict] | None = None,
+    latest_comment_url: str = "https://github.com/o/r/issues/1#issuecomment-1",
+    metadata_ready: bool = True,
+    auto_fixes_result: str = "auto_fixed",
+) -> dict:
+    return {
+        "status": status,
+        "routing_action": routing_action,
+        "contract_review": {
+            "status": contract_review_status,
+            "gate_result": gate_result,
+            "latest_comment_url": latest_comment_url,
+            "generated_at": "2026-07-04T00:00:00Z",
+            "body_sha256": "sha256:" + "a" * 64,
+        },
+        "metadata": {
+            "title_prefix_ready": metadata_ready,
+            "phase_label_ready": metadata_ready,
+        },
+        "auto_fixes": {
+            "result": auto_fixes_result,
+            "required": [],
+            "skipped": [],
+        },
+        "blockers": blockers if blockers is not None else [],
+        "permissions": {"unavailable": []},
+        "generated_at": "2026-07-04T00:00:00Z",
+    }
+
+
+def _load_loop_handoff_schema() -> dict:
+    schema_path = (
+        Path(__file__).resolve().parent.parent / "schemas" / "loop_handoff_result_v1.json"
+    )
+    import json as _json
+
+    return _json.loads(schema_path.read_text(encoding="utf-8"))
+
+
+def _extract_marker_yaml_block(body: str) -> dict:
+    """Extract and parse the fenced YAML block following the marker HTML comment."""
+    pattern = (
+        r"^<!-- LOOP_HANDOFF_RESULT_V1 -->" + "\n"
+        r"(`{3,}|~{3,})yaml" + "\n"
+        r"(.*?)" + "\n"
+        r"\1\s*$"
+    )
+    m = _re.search(pattern, body, _re.DOTALL | _re.MULTILINE)
+    assert m is not None, "LOOP_HANDOFF_RESULT_V1 marker block not found in body:\n" + body
+    return yaml.safe_load(m.group(2))
+
+
+class TestLoopHandoffMarkerApproved:
+    """AC1: approved + loop_handoff -> marker + fenced YAML block emitted."""
+
+    def test_render_termination_report_approved_with_loop_handoff_emits_marker(self):
+        loop_handoff = _make_loop_handoff()
+        result = rtr.render(_make_input("approved", issue_number=1311))
+        # baseline: no loop_handoff -> no marker (sanity check before positive case)
+        assert rtr.LOOP_HANDOFF_MARKER not in result["body"]
+
+        data = _make_input("approved", issue_number=1311)
+        data["loop_handoff"] = loop_handoff
+        result = rtr.render(data)
+
+        assert result["publishable"] is True
+        assert rtr.LOOP_HANDOFF_MARKER in result["body"]
+        parsed = _extract_marker_yaml_block(result["body"])
+        assert parsed["LOOP_HANDOFF_RESULT_V1"]["status"] == "impl_ready"
+        assert parsed["LOOP_HANDOFF_RESULT_V1"]["routing_action"] == "run_impl_review_loop"
+
+        # Guard must still pass with the marker attached
+        ok, errs = rtr._run_guard(result["body"])
+        assert ok, f"marker body failed guard: {errs}"
+
+
+class TestLoopHandoffMarkerOmittedWithoutInput:
+    """AC2: approved without loop_handoff -> no marker, back-compat preserved."""
+
+    def test_render_termination_report_approved_without_loop_handoff_omits_marker(self):
+        data = _make_input("approved", issue_number=42)
+        assert "loop_handoff" not in data
+        result = rtr.render(data)
+
+        assert result["publishable"] is True
+        assert rtr.LOOP_HANDOFF_MARKER not in result["body"]
+        # No exception raised, no extra required field errors
+        assert result["reason_code"] is None
+
+
+class TestLoopHandoffSchemaValid:
+    """AC4: marker YAML block validates against schemas/loop_handoff_result_v1.json."""
+
+    def test_render_termination_report_loop_handoff_schema_valid(self):
+        loop_handoff = _make_loop_handoff()
+        data = _make_input("approved", issue_number=1311)
+        data["loop_handoff"] = loop_handoff
+        result = rtr.render(data)
+
+        parsed = _extract_marker_yaml_block(result["body"])
+        schema = _load_loop_handoff_schema()
+        validator = jsonschema.Draft7Validator(schema, format_checker=jsonschema.FormatChecker())
+        errors = list(validator.iter_errors(parsed))
+        assert errors == [], f"schema validation errors: {errors}"
+
+
+class TestLoopHandoffRoutingRulesMatrix:
+    """AC5: status/routing_action pairing follows the Routing Rules table
+    (references/termination-policy.md), fixed for at least impl_ready and
+    blocked (plus human_judgment_required for full table coverage)."""
+
+    def test_render_termination_report_routing_rules_matrix(self):
+        cases = [
+            ("impl_ready", "run_impl_review_loop"),
+            ("blocked", "blocked"),
+            ("human_judgment_required", "ask_human"),
+        ]
+        for status, routing_action in cases:
+            loop_handoff = _make_loop_handoff(
+                status=status,
+                routing_action=routing_action,
+                contract_review_status="blocked" if status == "blocked" else "go",
+                gate_result="missing_go" if status == "blocked" else "fresh_go",
+                blockers=[{"kind": "x", "description": "y"}] if status != "impl_ready" else [],
+                auto_fixes_result=(
+                    "auto_fixed" if status == "impl_ready" else status
+                ),
+            )
+            data = _make_input("approved", issue_number=1)
+            data["loop_handoff"] = loop_handoff
+            result = rtr.render(data)
+            assert result["publishable"] is True, (
+                f"status={status} routing_action={routing_action} should render: "
+                f"{result.get('reason_code')}"
+            )
+            parsed = _extract_marker_yaml_block(result["body"])
+            assert parsed["LOOP_HANDOFF_RESULT_V1"]["status"] == status
+            assert parsed["LOOP_HANDOFF_RESULT_V1"]["routing_action"] == routing_action
+
+    def test_render_termination_report_routing_rules_mismatch_rejected(self):
+        # status=blocked with routing_action=run_impl_review_loop violates the
+        # Routing Rules table and must fail closed (InputValidationError).
+        loop_handoff = _make_loop_handoff(
+            status="blocked",
+            routing_action="run_impl_review_loop",
+            contract_review_status="blocked",
+            gate_result="missing_go",
+            blockers=[{"kind": "x", "description": "y"}],
+        )
+        data = _make_input("approved", issue_number=1)
+        data["loop_handoff"] = loop_handoff
+        with pytest.raises(rtr.InputValidationError):
+            rtr.render(data)
+
+
+class TestLoopHandoffNonApprovedOmitsMarker:
+    """AC6: non-approved termination_reason never emits the marker, even if a
+    valid loop_handoff payload is supplied."""
+
+    def test_render_termination_report_non_approved_omits_marker_even_with_loop_handoff(self):
+        loop_handoff = _make_loop_handoff()
+        for reason, cause in [
+            ("human_escalation", "human_judgment_required"),
+            ("superseded_by_decision", None),
+        ]:
+            data = _make_input(reason, termination_cause=cause, issue_number=1)
+            data["loop_handoff"] = loop_handoff
+            result = rtr.render(data)
+            assert result["publishable"] is True
+            assert rtr.LOOP_HANDOFF_MARKER not in result["body"], (
+                f"marker leaked for termination_reason={reason!r}"
+            )
+
+
+class TestLoopHandoffFailClosed:
+    """loop_handoff must fail closed (InputValidationError) on invalid payloads,
+    regardless of termination_reason (non-approved included, per reviewer note 6)."""
+
+    def test_invalid_loop_handoff_missing_required_field_approved(self):
+        loop_handoff = _make_loop_handoff()
+        del loop_handoff["contract_review"]
+        data = _make_input("approved", issue_number=1)
+        data["loop_handoff"] = loop_handoff
+        with pytest.raises(rtr.InputValidationError):
+            rtr.render(data)
+
+    def test_invalid_loop_handoff_additional_property_rejected(self):
+        loop_handoff = _make_loop_handoff()
+        loop_handoff["unexpected_extra_field"] = "nope"
+        data = _make_input("approved", issue_number=1)
+        data["loop_handoff"] = loop_handoff
+        with pytest.raises(rtr.InputValidationError):
+            rtr.render(data)
+
+    def test_invalid_loop_handoff_non_dict_rejected(self):
+        data = _make_input("approved", issue_number=1)
+        data["loop_handoff"] = "not-a-dict"
+        with pytest.raises(rtr.InputValidationError):
+            rtr.render(data)
+
+    def test_invalid_loop_handoff_rejected_even_when_non_approved(self):
+        # Reviewer note 6: silently ignoring an invalid loop_handoff on
+        # non-approved termination_reason is not acceptable; must still
+        # fail closed.
+        data = _make_input(
+            "human_escalation",
+            termination_cause="human_judgment_required",
+            issue_number=1,
+        )
+        data["loop_handoff"] = {"status": "impl_ready"}  # missing required fields
+        with pytest.raises(rtr.InputValidationError):
+            rtr.render(data)
+
+
+class TestLoopHandoffFenceInjectionRegression:
+    """
+    Reviewer note 5: backtick / tilde / HTML-comment / shell-looking text
+    embedded in loop_handoff string fields must not break the marker out of
+    its fence, must not duplicate the marker as a standalone line, and the
+    fenced YAML must still parse cleanly.
+    """
+
+    ADVERSARIAL_PAYLOADS = [
+        "```shell\nrm -rf /\n```",
+        "~~~shell\nrm -rf /\n~~~",
+        "<!-- LOOP_HANDOFF_RESULT_V1 --> injected duplicate marker",
+        "$ pnpm test && rg 'secret'",
+        "``````six-backtick-run``````",
+    ]
+
+    def test_adversarial_string_fields_do_not_break_marker(self):
+        for adversarial in self.ADVERSARIAL_PAYLOADS:
+            loop_handoff = _make_loop_handoff(
+                latest_comment_url="https://example.com/x",
+                blockers=[],
+            )
+            loop_handoff["contract_review"]["body_sha256"] = "sha256:" + "a" * 64
+            loop_handoff["metadata"]["title_prefix_ready"] = True
+            # Inject adversarial content into a free-form string field.
+            loop_handoff["contract_review"]["latest_comment_url"] = adversarial
+
+            data = _make_input("approved", issue_number=1)
+            data["loop_handoff"] = loop_handoff
+            result = rtr.render(data)
+
+            assert result["publishable"] is True, (
+                f"adversarial payload broke render: {adversarial!r} "
+                f"reason_code={result.get('reason_code')}"
+            )
+            body = result["body"]
+
+            # Marker appears exactly once as a standalone line.
+            marker_lines = [
+                line for line in body.splitlines() if line.strip() == rtr.LOOP_HANDOFF_MARKER
+            ]
+            assert len(marker_lines) == 1, (
+                f"expected exactly 1 standalone marker line for {adversarial!r}, "
+                f"got {len(marker_lines)}"
+            )
+
+            # YAML block still parses.
+            parsed = _extract_marker_yaml_block(body)
+            assert parsed["LOOP_HANDOFF_RESULT_V1"]["status"] == "impl_ready"
+
+            # Guard passes (no shell_command / vc_command leak).
+            ok, errs = rtr._run_guard(body)
+            assert ok, f"guard failed for adversarial payload {adversarial!r}: {errs}"
+            for block_text, _ in rtr.iter_markdown_blocks(body):
+                kind = rtr.classify_block(block_text)
+                assert kind not in ("shell_command", "vc_command"), (
+                    f"adversarial payload leaked as {kind!r}: {block_text[:80]!r}"
+                )
+
+
+class TestLoopHandoffFallbackTemplateRetainsMarker:
+    """
+    Reviewer note 3: the marker must not disappear when the normal template
+    fails guard and the fallback template is used; if both templates fail
+    guard even with the marker attached, the whole render fails closed
+    (publishable=false) rather than dropping the marker to force a success.
+    """
+
+    def test_fallback_template_still_carries_marker_when_normal_fails_guard(self):
+        loop_handoff = _make_loop_handoff()
+        data = _make_input("approved", issue_number=1)
+        data["loop_handoff"] = loop_handoff
+
+        call_count = {"n": 0}
+        real_guard = rtr._run_guard
+
+        def _guard_fail_first_attempt_only(body: str):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return False, ["forced failure on attempt 1"]
+            return real_guard(body)
+
+        with patch.object(rtr, "_run_guard", side_effect=_guard_fail_first_attempt_only):
+            result = rtr.render(data)
+
+        assert result["attempts"] == 2
+        assert result["publishable"] is True
+        assert rtr.LOOP_HANDOFF_MARKER in result["body"]
+
+    def test_both_attempts_guard_fail_drops_marker_via_publishable_false(self):
+        loop_handoff = _make_loop_handoff()
+        data = _make_input("approved", issue_number=1)
+        data["loop_handoff"] = loop_handoff
+
+        with patch.object(rtr, "_run_guard", return_value=(False, ["forced failure"])):
+            result = rtr.render(data)
+
+        # Both attempts failed guard -> fail closed, marker not silently
+        # "succeeded" without it.
+        assert result["publishable"] is False
+        assert result["body"] is None
+        assert result["reason_code"] == rtr.GUARD_FAIL_REASON_CODE
