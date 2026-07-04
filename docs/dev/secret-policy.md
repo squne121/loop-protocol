@@ -408,6 +408,57 @@ cloud_pilot_success_contract_v1:
       - rollback_deadline
   missing_trace_counts_as_failure_or_degraded: true
 
+  gate_evidence_contract:
+    session_recording_smoke:
+      issue: "#246"
+      required_marker_schema: SESSION_RECORDING_SMOKE_VERDICT/v1
+      required_verdict_for_real_pilot: pass
+      blocked_verdict_is_not_success: true
+      evidence_digest_required: true
+    latitude_real_pilot_decision:
+      issue: "#1220"
+      required_marker_schema: LATITUDE_PILOT_EXCEPTION_V1
+      required_decision: approve_timeboxed_real_pilot
+      decision_digest_required: true
+    latitude_distribution_gate:
+      issue: "#1261"
+      required_marker_schema: LATITUDE_DISTRIBUTION_GATE_V1
+      required_state: completed
+      evidence_digest_required: true
+
+  decision_rules_v1:
+    thresholds_must_be_declared_before_first_eligible_run: true
+    required_threshold_fields:
+      - trace_arrival_rate_min
+      - request_to_span_coverage_min
+      - upload_retry_count_max
+      - end_to_end_latency_p95_max_seconds
+      - hook_overhead_baseline_delta_max_seconds
+      - credits_per_eligible_run_max
+      - human_intervention_count_max
+      - max_eligible_runs
+      - max_credits
+      - rollback_deadline
+    fail_closed_conditions:
+      - missing_trace_counts_as_failure_or_degraded_not_true
+      - redaction_false_negative_count_gt_0
+      - retention_and_delete_verification_not_machine_verified
+      - argv_exposure_state_not_absent_verified
+      - remote_cleanup_state_not_machine_verified
+      - required_metric_availability_unknown
+
+  duplicate_retry_identity:
+    required: true
+    fields:
+      - pilot_run_id
+      - retry_group_id
+      - original_started_at
+      - command_intent_digest
+    manual_relabel_after_result_known_allowed: false
+
+  cloud_adoption_allowed_now: false
+  not_adoption_ready_until_1261_1326_and_artifact_placement_complete: true
+
 hook_success_is_not_capture_evidence: true
 
 cloud_pilot_checker_follow_up_required:
@@ -415,6 +466,9 @@ cloud_pilot_checker_follow_up_required:
   in_this_issue: docs_only_contract_definition
   requires_follow_up_issue: true
   follow_up_issue_ref: "#1326"
+  artifact_placement_decision_pending: true
+  artifact_placement_follow_up_required: true
+  artifact_placement_follow_up_issue_ref: "#1330"
 ```
 
 ---
