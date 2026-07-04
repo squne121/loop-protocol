@@ -81,7 +81,7 @@ Gemini CLI と同様に wrapper 経由で呼び出すが、出力形式・cwd po
 |---|---|---|
 | `no_tools` | supported | isolated temp cwd から agy を呼び出す。ファイル編集・shell 実行なし。 |
 | `proposal_only` | supported | isolated temp cwd から agy を呼び出す。返却は draft text のみ。 |
-| `grounded_research` | **unsupported_provider_profile** | `provider=agy` の初期実装では未対応。wrapper が Google Search grounding contract を agy に対してまだ検証・公開していない（wrapper サポート境界）。fail-closed。 |
+| `grounded_research` | **supported** | AGY native WebSearch/WebGrounding （`agy -p`、Gemini API `google_search` 不使用）を使用。`grounded` 判定には構造化 `tool_calls` トレース（認識済み web tool 名）が必須で、stdout 中の bare URL 文字列だけでは実行証跡と扱わない（トレース欠如は `agy_web_grounding_tool_call_missing` で fail-closed）。quota exhaustion / secret・repo path leakage も専用 failure class で fail-closed する。 |
 | `local_asset_research` | supported | wrapper 側だけが pinned SerenaMCP read-only retrieval を実行し、repo-relative JSON evidence envelope だけを prompt-only で AGY に渡す。 |
 | `github_research` | **unsupported_provider_profile** | agy は GitHub アクセス機能を持たない。fail-closed。 |
 
@@ -133,12 +133,7 @@ agy の stdout text は wrapper 側で `delegation_result/v1` スキーマに正
 
 以下のプロファイルは `provider=agy` で `unsupported_provider_profile` として fail-closed する。
 
-- `grounded_research` : Google Search grounding 向けで現状は非対応。
 - `github_research` : GitHub 調査契約がないため現状は非対応。
-
-`grounded_research` は `provider=agy` の初期実装では unsupported である。
-理由は、この wrapper が agy に対する Google Search grounding contract をまだ検証・公開していないためであり、
-agy 製品そのものの永続的な制限とみなしてはいけない。
 
 `github_research` は agy 対応 contract が未定義のため fail-closed とする。
 
