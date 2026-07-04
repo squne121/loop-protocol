@@ -11,14 +11,14 @@ disable-model-invocation: true
 | tool_profile | 用途 |
 |---|---|
 | `no_tools` | ツール不使用・コンテキスト読み取り専用 |
-| `grounded_research` | Google Search grounding あり（timeout_sec: 300+ 推奨） |
+| `grounded_research` | provider-aware: `provider=gemini`（既定）は Gemini API Google Search grounding、`provider=agy` は AGY native WebSearch/WebGrounding（`agy -p`、Gemini API 不使用、timeout_sec: 300+ 推奨）。両者は別実装であり、AGY 側は machine-verifiable tool-call トレース必須。詳細は `references/provider-mapping.md` / `references/usage-contract.md` 参照。 |
 | `local_asset_research` | Serena MCP read-only によるローカル資産調査 |
 | `proposal_only` | 実装案・Issue 本文案・patch proposal のドラフト生成 |
 | `github_research` | GitHub read-only 調査（gh コマンド allowlist）|
 
 詳細は `references/usage-contract.md`（SSOT）・`references/model-routing.md`・`references/result-surface.md` を参照。
 
-## Workflow
+## Workflow（作業手順）
 
 0. **setup_check で依存ツール・trusted folder・Serena MCP・settings.json を確認する（必須）**:
    ```bash
@@ -37,11 +37,16 @@ disable-model-invocation: true
    ```
    または手動で `delegation_request_v1` JSON を作成する（`references/usage-contract.md` 参照）。
 
-2. **preflight を実行する（必須）**:
-   ```bash
-   uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/preflight_gemini_headless.py \
-     --output-file tmp/gemini-headless-preflight.json
-   ```
+2. **preflight を実行する（必要に応じて agy の grounded_research 検証を含める）**:
+```bash
+uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/preflight_gemini_headless.py \
+  --output-file tmp/gemini-headless-preflight.json
+```
+`agy` の grounded_research を含む検証が必要な場合:
+```bash
+uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/preflight_agy.py \
+  --grounded-research --json
+```
    `ok: false` → `failure_reason` / `next_action` を確認して修正する。
 
 3. **`scripts/run_gemini_headless.py` で request を検証・実行する**:
@@ -51,7 +56,7 @@ disable-model-invocation: true
    ```
    validate-only（Gemini CLI 未実行）は `--validate-only` を指定する。結果は `result_surface.summary` / `.primary_artifact` / `.next_action` を優先参照する。
 
-## Grounded Research Retry Policy（governance）
+## Grounded Research Retry Policy（再試行運用ガバナンス）
 
 このセクションは `tool_profile: grounded_research` における **wrapper-level retry の運用境界**を定義する governance 文書である。wrapper script (`scripts/run_gemini_headless.py`) の実 retry 挙動・retry 回数・`delegation_result_v1` の attempt フィールド仕様は `references/usage-contract.md` および `references/model-routing.md` を SSOT とし、本セクションはそれらと衝突しない範囲の運用方針のみを定める。
 
@@ -96,7 +101,7 @@ uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/se
 - API key 暫定運用は #104 が完了するまでのブリッジであり、agy 移行が完了したら不要になる。
 - agy 移行の進捗は `docs/dev/current-focus.md` および #104 を参照。
 
-## Core Rules
+## Core Rules（基本ルール）
 
 ### Delegation Boundary
 - Gemini 側の `file write` / `shell edit` / GitHub mutation は禁止。

@@ -164,9 +164,15 @@ def test_d10_build_raw_command_contains_model():
 
 
 # ---------------------------------------------------------------------------
-# D-11  grounded_research → "Google Search grounding is allowed" injected
-#        no_tools → NOT injected
+# D-11  grounded_research (provider=gemini, the default) → "Google Search grounding"
+#        injected; no_tools → NOT injected
 # (note: implemented via build_prompt text injection, not --tools CLI flag)
+#
+# Issue #1266 Blocker 2: build_prompt()'s grounded_research text is gated on
+# request["provider"] == "agy" so provider=gemini (default/omitted) requests keep the
+# original Google Search grounding wording rather than the AGY-specific instruction text.
+# See test_run_gemini_headless.py::test_build_prompt_grounded_research_agy_provider_uses_agy_wording
+# for the provider=agy counterpart.
 # ---------------------------------------------------------------------------
 
 def test_d11_grounded_research_prompt_contains_google_search():
@@ -179,7 +185,8 @@ def test_d11_grounded_research_prompt_contains_google_search():
         "model": "gemini-3-flash-preview",
     }
     prompt = module.build_prompt(request, [])
-    assert "Google Search grounding is allowed" in prompt
+    assert "Google Search grounding is allowed when it is necessary for the answer." in prompt
+    assert "AGY native WebSearch" not in prompt
 
 
 def test_d11_no_tools_prompt_does_not_contain_google_search():
@@ -192,7 +199,7 @@ def test_d11_no_tools_prompt_does_not_contain_google_search():
         "model": "gemini-3-flash-preview",
     }
     prompt = module.build_prompt(request, [])
-    assert "Google Search grounding is allowed" not in prompt
+    assert "AGY native WebSearch" not in prompt
 
 
 # ---------------------------------------------------------------------------
