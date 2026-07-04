@@ -178,3 +178,73 @@ echo "verify scope detection"
         scope_signal_guard = output["decisions"]["scope_signal_guard"]
         assert scope_signal_guard["triggered"] is True
         assert scope_signal_guard["reason_code"] == "new_in_scope_area"
+
+    def test_single_bullet_two_independent_path_tokens_still_triggers(self):
+        """B4 (legacy fallback side, Issue #1327 iteration-2): a *single*
+        In Scope bullet that references two independent path tokens (not two
+        embedded prefixes within one token) must still trigger
+        new_in_scope_area. This is distinct from
+        test_two_separate_bullets_still_trigger_new_in_scope_area (which uses
+        two separate bullets); here both tokens are on the same line."""
+        same_bullet_body = """# Test Issue: Same Bullet Two Independent Tokens
+
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: research
+parent_issue: none
+goal_ref: "single bullet with 2 independent path tokens must still trigger"
+change_kind: research-only
+```
+
+## Outcome
+
+A single In Scope bullet references two independent path tokens that each
+belong to a different layer.
+
+## In Scope
+
+- `.claude/skills/foo` と `docs/foo.md` を更新する
+
+## Parent Issue
+
+none
+
+## Out of Scope
+
+- 実装コード変更
+
+## Acceptance Criteria
+
+- AC1: Scope detection identifies multiple layers in a single bullet
+
+## Verification Commands
+
+```bash
+echo "verify scope detection"
+```
+
+## Stop Conditions
+
+- Outcome / Scope / AC が検索可能な形で記載されていない場合は即停止
+- Allowed Paths 外への書き込みを試みた場合は即停止
+- 権限不足により操作が完了できない場合は即停止
+- 成果物の書き込みに失敗した場合は即停止
+
+## Allowed Paths
+
+- なし
+
+## Handoff Contract
+
+- `Current Objective`
+- `Bounded Current Context`
+- `Open Questions`
+- `Next Action`
+- `Artifact Refs`
+"""
+        output = _run_planner(same_bullet_body)
+        scope_signal_guard = output["decisions"]["scope_signal_guard"]
+        assert scope_signal_guard["triggered"] is True
+        assert scope_signal_guard["reason_code"] == "new_in_scope_area"

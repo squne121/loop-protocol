@@ -160,7 +160,9 @@ scope_signal_delta_input:
 
 ### 単一パス文字列内の複数 prefix 判定ルール（Issue #1327）
 
-In Scope / Allowed Paths の layer 判定は、単一のパス文字列内に複数の prefix（例: `.claude/` と `tests/`）が同時に含まれていても、それを複数の独立した layer 言及として数えない。判定はパス文字列全体（バッククォート引用または裸の パス token）の先頭が prefix と一致するかどうかで行い、token 内部に埋め込まれた 別 prefix の出現（例: `.claude/skills/<skill>/tests/<file>.py` に含まれる `tests/`）は無視する。`plan_refinement_loop.py` の `_detect_scope_signals()` legacy fallback と `scope_signal_delta.py` の `_extract_in_scope_layers()` は この規則で prefix を抽出する。
+In Scope layer 判定は、単一のパス文字列内に複数の prefix（例: `.claude/` と `tests/`）が同時に含まれていても、それを複数の独立した layer 言及として数えない。判定はパス文字列全体（バッククォート引用または裸の パス token）の先頭が prefix と一致するかどうかで行い、token 内部に埋め込まれた 別 prefix の出現（例: `.claude/skills/<skill>/tests/<file>.py` に含まれる `tests/`）は無視する。`plan_refinement_loop.py` の `_detect_scope_signals()` legacy fallback（In Scope の判定経路）と `scope_signal_delta.py` の `_extract_in_scope_layers()` はこの規則で prefix を抽出する。
+
+この規則が及ぶのは **In Scope の layer 判定のみ** である。Allowed Paths の layer 判定（`_detect_scope_signals()` の new_allowed_path_layer 経路が使う、バッククォート内の先頭トップレベルディレクトリ名だけを拾う別の positional regex ロジック）は本 Issue（#1327）のスコープ外であり、本ルールの対象では ない。Allowed Paths 側の同種の誤検知は別 Issue で扱う。
 
 ## 禁止事項（Must not）
 
