@@ -1097,8 +1097,6 @@ def test_empty_stdout_is_not_reclassified_as_auth_failure(monkeypatch):
 def test_auth_diagnostics_redacts_env_values_and_secrets(monkeypatch):
     """AC4: auth diagnostics must never include raw env var values, only booleans,
     and secrets in stderr must remain redacted in the surfaced result."""
-    import os
-
     module = load_module()
     monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
     monkeypatch.setenv("AGY_API_KEY", "sk-SENTINEL-DO-NOT-LEAK-0001")

@@ -113,12 +113,12 @@ failure のいずれでも）に `auth: agy_auth_diagnostics_v1` を含める。
 `agy_auth_diagnostics_v1` は以下を含む:
 
 - `auth_mode`（`unknown` / `system_keyring_cached` / `google_sign_in_required` /
-  `api_key_env_present` / `unauthenticated` / `auth_probe_failed`）と
-  `auth_mode_confidence`（`observed` / `inferred` / `unknown`）
-- `keyring`（`available` / `backend_hint` / `failure_class`）
-- `tty`（`stdin_isatty` / `stdout_isatty` / `stderr_isatty` / `noninteractive_mode`）
-- `platform`（`os` / `is_wsl` / `wsl_hint`）
-- `recovery_action`
+  `api_key_env_present` / `unauthenticated` / `auth_probe_failed`）— 推定された認証状態と、
+  `auth_mode_confidence`（`observed` / `inferred` / `unknown`）— その確信度
+- `keyring`（`available` / `backend_hint` / `failure_class`）— system keyring への到達可否
+- `tty`（`stdin_isatty` / `stdout_isatty` / `stderr_isatty` / `noninteractive_mode`）— 端末接続状態
+- `platform`（`os` / `is_wsl` / `wsl_hint`）— 実行環境（WSL 判定を含む）
+- `recovery_action` — 人間が次に取るべき復旧手順の説明文
 
 診断用の env snapshot（`DBUS_SESSION_BUS_ADDRESS_present` 等の boolean のみ）と、
 agy subprocess 実行用の minimal env（`_minimal_agy_env()`）は分離されている。
@@ -132,7 +132,7 @@ system keyring バックエンドに到達できない（`auth.keyring.failure_c
 system_keyring_unavailable`、`auth.platform.is_wsl: true`）。この状態では agy が
 キャッシュ済み認証情報を読めず、再認証（Google Sign-In）が要求されることがある。
 
-recovery action:
+recovery action（推奨される復旧手順）:
 
 ```bash
 # D-Bus session を起動してから agy / preflight を実行する

@@ -1159,7 +1159,9 @@ def run_preflight(
     if not smoke["ok"]:
         result["failure_reason"] = smoke.get("failure_reason") or "agy smoke check failed"
         result["failure_class"] = smoke.get("failure_class") or "agy_output_missing"
-        result["recovery_action"] = result["auth"].get("recovery_action") or "check agy configuration and rerun preflight"
+        result["recovery_action"] = (
+            result["auth"].get("recovery_action") or "check agy configuration and rerun preflight"
+        )
         return result
 
     if grounded_research:
