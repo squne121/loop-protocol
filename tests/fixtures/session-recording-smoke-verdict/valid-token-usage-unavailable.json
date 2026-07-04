@@ -1,0 +1,35 @@
+{
+  "schema": "session_recording_smoke_verdict/v1",
+  "issue": 246,
+  "completion_state": "blocked",
+  "recommendation": "defer #246 close until real-pilot activation evidence is available.",
+  "followup_issue": "1312",
+  "legacy_evidence_excluded": false,
+  "authoritative_count": 1,
+  "ac_results": {
+    "AC0": "pass",
+    "AC1": "pass",
+    "AC2": "not_applicable",
+    "AC3": "blocked",
+    "AC4": "skip",
+    "AC5": "pass",
+    "AC6": "pass"
+  },
+  "token_usage": {
+    "availability": "unavailable",
+    "source": "none",
+    "prompt_tokens": null,
+    "completion_tokens": null,
+    "total_tokens": null
+  },
+  "github_secret_scanning": {
+    "status": "unavailable",
+    "unavailable_reason": "permission_missing"
+  },
+  "stop_conditions_triggered": [
+    "external_service_permission_missing"
+  ],
+  "evidence_refs": [
+    "artifacts/session-recording-smoke-verdict-1312.json"
+  ]
+}

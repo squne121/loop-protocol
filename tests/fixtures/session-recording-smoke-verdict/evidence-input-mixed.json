@@ -1,0 +1,109 @@
+[
+  {
+    "source_kind": "agent_session_manifest_script",
+    "source_ref": "artifacts/agent-session-manifest-ci.json",
+    "generation_argv": ["--manifest-id", "asm-11111111-1111-4111-8111-111111111111", "--recorded-at", "2026-07-01T00:00:00Z"],
+    "manifest": {
+      "schema": "agent_session_manifest/v1",
+      "manifest_id": "asm-11111111-1111-4111-8111-111111111111",
+      "recorded_at": "2026-07-01T00:00:00Z",
+      "repository": "squne121/loop-protocol",
+      "actor": { "type": "ai_agent", "name": "implementation-worker" },
+      "phase": { "main_loop": "impl", "ledger_phase": "implementation", "phase_instance_id": "issue-1312:impl:001" },
+      "token_usage": { "availability": "unavailable", "source": "none", "prompt": null, "completion": null, "total": null },
+      "evidence": [
+        { "source_kind": "artifact", "source_ref": "artifacts/agent-session-manifest-ci.json", "source_sha256": null, "visibility": "private_artifact" }
+      ],
+      "redaction": { "raw_transcript_included": false, "local_paths_included": false, "secret_scan_status": "clean" },
+      "secret_policy": {
+        "value_exposed": false,
+        "mode": "presence_only",
+        "producer_contract": {
+          "declared": true,
+          "id": "presence_only_no_secret_values",
+          "version": "v1",
+          "claims": { "secret_values_not_serialized": true, "presence_only": true }
+        },
+        "runtime_boundary": { "attested": false, "evidence_ref": null }
+      }
+    }
+  },
+  {
+    "source_kind": "agent_session_manifest_script",
+    "source_ref": "artifacts/agent-session-manifest-default.json",
+    "generation_argv": [],
+    "manifest": {
+      "schema": "agent_session_manifest/v1",
+      "manifest_id": "asm-22222222-2222-4222-8222-222222222222",
+      "recorded_at": "2026-07-01T00:00:00Z",
+      "repository": "squne121/loop-protocol",
+      "actor": { "type": "ai_agent", "name": "implementation-worker" },
+      "phase": { "main_loop": "impl", "ledger_phase": "implementation", "phase_instance_id": "issue-1312:impl:002" },
+      "token_usage": { "availability": "unavailable", "source": "none", "prompt": null, "completion": null, "total": null },
+      "evidence": [
+        { "source_kind": "artifact", "source_ref": "artifacts/agent-session-manifest-default.json", "source_sha256": null, "visibility": "private_artifact" }
+      ],
+      "redaction": { "raw_transcript_included": false, "local_paths_included": false, "secret_scan_status": "clean" },
+      "secret_policy": {
+        "value_exposed": false,
+        "mode": "presence_only",
+        "producer_contract": {
+          "declared": true,
+          "id": "presence_only_no_secret_values",
+          "version": "v1",
+          "claims": { "secret_values_not_serialized": true, "presence_only": true }
+        },
+        "runtime_boundary": { "attested": false, "evidence_ref": null }
+      }
+    }
+  },
+  {
+    "source_kind": "agent_session_manifest_generic",
+    "source_ref": "https://github.com/squne121/loop-protocol/issues/246#issuecomment-legacy",
+    "manifest": {
+      "schema": "agent_session_manifest/v1",
+      "manifest_id": "asm-33333333-3333-4333-8333-333333333333",
+      "recorded_at": "2026-01-01T00:00:00Z",
+      "repository": "squne121/loop-protocol",
+      "actor": { "type": "ai_agent", "name": "implementation-worker" },
+      "phase": { "main_loop": "impl", "ledger_phase": "implementation", "phase_instance_id": "issue-246:impl:001" },
+      "token_usage": { "availability": "unavailable", "source": "none", "prompt": null, "completion": null, "total": null },
+      "evidence": [
+        { "source_kind": "artifact", "source_ref": "artifacts/legacy-manifest.json", "source_sha256": null, "visibility": "private_artifact" }
+      ],
+      "redaction": { "raw_transcript_included": false, "local_paths_included": false, "secret_scan_status": "clean" }
+    }
+  },
+  {
+    "source_kind": "negative_control",
+    "source_ref": "https://github.com/squne121/loop-protocol/issues/246#issuecomment-negative",
+    "manifest": {
+      "schema": "agent_session_manifest/v1",
+      "manifest_id": "asm-44444444-4444-4444-8444-444444444444",
+      "recorded_at": "2026-01-01T00:00:00Z",
+      "repository": "squne121/loop-protocol",
+      "actor": { "type": "ai_agent", "name": "implementation-worker" },
+      "phase": { "main_loop": "impl", "ledger_phase": "implementation", "phase_instance_id": "issue-246:impl:002" },
+      "token_usage": { "availability": "unavailable", "source": "none", "prompt": null, "completion": null, "total": null },
+      "evidence": [
+        { "source_kind": "transcript", "source_ref": "https://github.com/squne121/loop-protocol/issues/246#issuecomment-negative", "source_sha256": null, "visibility": "public_github_comment" }
+      ],
+      "redaction": { "raw_transcript_included": false, "local_paths_included": false, "secret_scan_status": "clean" },
+      "secret_policy": {
+        "value_exposed": false,
+        "mode": "presence_only",
+        "producer_contract": {
+          "declared": true,
+          "id": "presence_only_no_secret_values",
+          "version": "v1",
+          "claims": { "secret_values_not_serialized": true, "presence_only": true }
+        },
+        "runtime_boundary": { "attested": false, "evidence_ref": null }
+      }
+    }
+  },
+  {
+    "source_kind": "github_comment",
+    "source_ref": "https://github.com/squne121/loop-protocol/issues/246#issuecomment-plain"
+  }
+]
