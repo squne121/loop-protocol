@@ -1921,8 +1921,18 @@ def run_checks(
             result,
             issues,
             deterministic_domain_key="runtime_applicability",
-            finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
+            finding_kind=REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,
             blocking=True,
+            checker_evidence=(
+                _make_self_checker_evidence(
+                    result,
+                    rule_id="C9_runtime_applicability_present",
+                    category="runtime_applicability",
+                )
+                if issues
+                else []
+            ),
+            reviewer_blocker_code="C9",
         )
     elif checks.C9_runtime_applicability_present == CheckResult.WARN:
         for msg in issues:

@@ -168,6 +168,98 @@ class TestC9Fail:
         )
 
 
+class TestC9StructuredBlocker:
+    """GIVEN c9_fail_issue.md (FAIL/LEGACY_MISSING) WHEN checker runs THEN structured_blockers carries a
+    C9 deterministic entry with self-checker evidence; GIVEN a WARN-path body THEN no C9 entry is added.
+    """
+
+    def test_c9_fail_emits_structured_blocker_code(self):
+        """GIVEN c9_fail_issue.md WHEN checker runs THEN structured_blockers contains an entry whose
+        code is "C9" (filtered by code/domain key, not positional index). Corresponds to Issue #1314 AC1.
+        """
+        output = run_checker("c9_fail_issue.md")
+        c9_blockers = [
+            b
+            for b in output["structured_blockers"]
+            if b["code"] == "C9" and b["deterministic_domain_key"] == "runtime_applicability"
+        ]
+        assert c9_blockers, f"Expected a C9 structured blocker, got: {output['structured_blockers']}"
+
+    def test_c9_structured_blocker_evidence_is_valid_deterministic_evidence(self):
+        """GIVEN c9_fail_issue.md WHEN checker runs THEN the C9 structured_blocker entry has
+        finding_kind == "deterministic_domain_blocker" and its checker_evidence contains all required
+        keys. Corresponds to Issue #1314 AC2.
+        """
+        output = run_checker("c9_fail_issue.md")
+        c9_blockers = [
+            b
+            for b in output["structured_blockers"]
+            if b["code"] == "C9" and b["deterministic_domain_key"] == "runtime_applicability"
+        ]
+        assert c9_blockers, f"Expected a C9 structured blocker, got: {output['structured_blockers']}"
+        blocker = c9_blockers[0]
+        assert blocker["finding_kind"] == "deterministic_domain_blocker"
+        assert blocker["blocking"] is True
+        assert blocker["checker_evidence"], "Expected non-empty checker_evidence for C9 deterministic blocker"
+        evidence = blocker["checker_evidence"][0]
+        for key in (
+            "source_check",
+            "rule_id",
+            "category",
+            "artifact_path",
+            "artifact_schema",
+            "body_sha256",
+            "iteration_id",
+        ):
+            assert key in evidence, f"Missing checker_evidence key: {key}"
+        assert evidence["rule_id"] == "C9_runtime_applicability_present"
+        assert evidence["category"] == "runtime_applicability"
+        assert evidence["body_sha256"] == output["body_sha256"]
+
+    def test_c9_findings_entry_is_deterministic_domain_blocker(self):
+        """GIVEN c9_fail_issue.md WHEN checker runs THEN the runtime_applicability finding is a blocking
+        deterministic_domain_blocker (not a heuristic_concern).
+        """
+        output = run_checker("c9_fail_issue.md")
+        findings = [f for f in output["findings"] if f["deterministic_domain_key"] == "runtime_applicability"]
+        assert findings, "Expected runtime_applicability finding"
+        assert findings[0]["finding_kind"] == "deterministic_domain_blocker"
+        assert findings[0]["blocking"] is True
+
+    def test_c9_warn_does_not_emit_structured_blocker(self):
+        """GIVEN a research issue missing RVA (WARN path) WHEN checker runs THEN no C9 structured_blocker
+        is added to structured_blockers.
+        """
+        body = """## Machine-Readable Contract
+```yaml
+contract_schema_version: v1
+issue_kind: research
+parent_issue: none
+goal_ref: "research"
+change_kind: docs
+```
+
+## Outcome
+調査結果が記録される。
+
+## Stop Conditions
+- [ ] stop 1
+- [ ] stop 2
+- [ ] stop 3
+- [ ] stop 4
+- [ ] stop 5
+- [ ] stop 6
+"""
+        result = checker.run_checks(body, labels="", title="research issue")
+        payload = checker.result_to_dict(result)
+        c9_blockers = [
+            b
+            for b in payload["structured_blockers"]
+            if b["code"] == "C9" and b["deterministic_domain_key"] == "runtime_applicability"
+        ]
+        assert c9_blockers == [], f"Expected no C9 structured_blocker on WARN path, got: {c9_blockers}"
+
+
 class TestC11Fail:
     """GIVEN a fixture with decision: immediate but no runtime-verification tags WHEN checker runs THEN C11 fails."""
 
