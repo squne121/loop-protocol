@@ -2801,3 +2801,18 @@ def test_is_uv_runtime_smoke_rejects_duplicate_options():
         ["uv", "run", "--isolated", "--isolated", "--locked", "--no-default-groups", "python",
          "scripts/ci/runtime_dependency_smoke.py"]
     )
+
+
+def test_timeout_seconds_default_is_90():
+    """Issue #1333 AC1: --timeout-seconds のデフォルト値が90秒であることを確認する
+
+    実測 real 0m59.376s の test_baseline_vc_preflight.py pytest 実行を
+    安全マージン込みで上回るデフォルトを維持することを保証する回帰テスト。
+    """
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    with open(script_path) as f:
+        script_content = f.read()
+
+    assert (
+        'parser.add_argument("--timeout-seconds", type=int, default=90,' in script_content
+    ), "--timeout-seconds のデフォルト値が90になっていない"

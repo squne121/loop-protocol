@@ -2512,7 +2512,7 @@ def main() -> int:
     parser.add_argument("--repo", default="squne121/loop-protocol", help="GitHub repo (owner/name)")
     parser.add_argument("--body-file", help="Path to Issue body file (for testing)")
     parser.add_argument("--cwd", default=".", help="Working directory for command execution")
-    parser.add_argument("--timeout-seconds", type=int, default=30, help="Timeout per command")
+    parser.add_argument("--timeout-seconds", type=int, default=90, help="Timeout per command")
     parser.add_argument("--max-head-lines", type=int, default=20, help="Max lines for stdout/stderr")
     # B8: contract-review-fragment format support
     parser.add_argument(

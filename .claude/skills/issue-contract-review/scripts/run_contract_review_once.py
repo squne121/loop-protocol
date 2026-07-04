@@ -58,7 +58,7 @@ if str(_EVALUATE_PRODUCT_SPEC_GATE_PY) not in sys.path:
 from evaluate_product_spec_gate import evaluate_product_spec_payload  # noqa: E402
 
 # VC_PREFLIGHT_TIMEOUT_SECS: baseline_vc_preflight may take up to 120s per VC
-_VC_PREFLIGHT_TIMEOUT = 180
+_VC_PREFLIGHT_TIMEOUT = 600
 _DEFAULT_TIMEOUT = 30
 
 _IDEMPOTENCY_MARKER_PREFIX = "<!-- loop-protocol:contract-review-once"
