@@ -22,6 +22,7 @@ describe('PhaseTransitionSystem', () => {
         save_progress: 'preparation',
         reset_sortie: 'preparation',
         start_sortie: 'running',
+        purchase_upgrade: 'preparation',
       },
       running: {
         sortie_terminal: 'result',
