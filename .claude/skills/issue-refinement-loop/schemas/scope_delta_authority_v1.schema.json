@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SCOPE_DELTA_AUTHORITY_V1",
+  "description": "Additive classification of scope delta authority (who/what authorized a scope change) attached to scope_signal_guard_decision_v2 (#1090) by #1323. Supersedes #1008/#1011.",
+  "type": "object",
+  "required": ["schema_version", "authority_category", "provenance", "directive", "boundary_flags", "route"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "SCOPE_DELTA_AUTHORITY_V1"
+    },
+    "authority_category": {
+      "type": "string",
+      "enum": [
+        "ai_inferred",
+        "human_review_directive",
+        "existing_parent_contract",
+        "related_issue_dependency"
+      ]
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["source_kind", "source_ref", "body_sha256", "author_association"],
+      "additionalProperties": false,
+      "properties": {
+        "source_kind": {
+          "type": ["string", "null"],
+          "enum": [
+            "issue_comment",
+            "pull_request_review",
+            "parent_issue",
+            "related_issue",
+            "generated_by_agent",
+            null
+          ]
+        },
+        "source_ref": { "type": ["string", "null"] },
+        "body_sha256": { "type": ["string", "null"] },
+        "author_association": {
+          "type": ["string", "null"],
+          "enum": ["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR", "NONE", null]
+        }
+      }
+    },
+    "directive": {
+      "type": "object",
+      "required": ["confidence", "extracted_markers"],
+      "additionalProperties": false,
+      "properties": {
+        "confidence": {
+          "type": ["string", "null"],
+          "enum": ["explicit", "ambiguous", "conflicting", "inferred", null]
+        },
+        "extracted_markers": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "boundary_flags": {
+      "type": "object",
+      "required": [
+        "expands_allowed_paths",
+        "changes_permission_boundary",
+        "changes_external_service_boundary",
+        "destructive_or_non_idempotent_operation",
+        "requires_issue_split"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "expands_allowed_paths": { "type": "boolean" },
+        "changes_permission_boundary": { "type": "boolean" },
+        "changes_external_service_boundary": { "type": "boolean" },
+        "destructive_or_non_idempotent_operation": { "type": "boolean" },
+        "requires_issue_split": { "type": "boolean" }
+      }
+    },
+    "route": {
+      "type": "object",
+      "required": ["action", "reason_code", "implementation_allowed", "next_step"],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["contract_update_required", "human_escalation", "not_triggered"]
+        },
+        "reason_code": {
+          "type": ["string", "null"],
+          "enum": [
+            "explicit_human_contract_directive",
+            "ambiguous_human_directive",
+            "conflicting_human_directives",
+            "requires_issue_split",
+            "expands_allowed_paths",
+            "changes_permission_boundary",
+            "changes_external_service_boundary",
+            "destructive_or_non_idempotent_operation",
+            "ai_inferred_scope_delta",
+            "untrusted_author_association",
+            null
+          ]
+        },
+        "implementation_allowed": { "type": "boolean" },
+        "next_step": {
+          "type": ["string", "null"],
+          "enum": ["rerun_refinement_after_contract_update", null]
+        }
+      }
+    },
+    "contract_patch_plan": {
+      "$ref": "contract_patch_plan_v1.schema.json"
+    }
+  }
+}
