@@ -414,7 +414,7 @@ cloud_pilot_checker_follow_up_required:
   value: true
   in_this_issue: docs_only_contract_definition
   requires_follow_up_issue: true
-  follow_up_issue_ref: "(未起票。#1260 クローズ前に issue-author で起票し、この値を issue 番号に更新する)"
+  follow_up_issue_ref: "#1326"
 ```
 
 ---
