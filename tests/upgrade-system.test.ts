@@ -6,6 +6,8 @@ import { purchaseUpgrade, quoteUpgrade } from '../src/systems/UpgradeSystem'
 import type { UpgradeDefinition } from '../src/data/upgrades'
 import type { GameStorage, SaveResult } from '../src/storage/LocalGameStorage'
 
+const RESOURCE_CAP = 9_999_999
+
 const VALID_DEFINITION: UpgradeDefinition = {
   definitionId: 'weapon_power_plus_1',
   schemaVersion: 1,
@@ -73,6 +75,7 @@ describe('quoteUpgrade', () => {
     { name: 'Infinity cost', overrides: { cost: Number.POSITIVE_INFINITY } },
     { name: 'fractional cost', overrides: { cost: 1.5 } },
     { name: 'unsafe integer cost', overrides: { cost: Number.MAX_SAFE_INTEGER + 1 } },
+    { name: 'cost above RESOURCE_CAP', overrides: { cost: RESOURCE_CAP + 1 } },
     { name: 'wrong availability.phase', overrides: { availability: { phase: 'running', repeatable: false } } },
     { name: 'wrong availability.repeatable', overrides: { availability: { phase: 'preparation', repeatable: true } } },
   ])(
@@ -90,6 +93,18 @@ describe('quoteUpgrade', () => {
       })
     },
   )
+
+  it('GIVEN a cost exactly at RESOURCE_CAP WHEN quoteUpgrade is called THEN the cost bound is inclusive and definition validity is unaffected by the bound', () => {
+    const state = withResources(RESOURCE_CAP)
+    const atCap = {
+      ...VALID_DEFINITION,
+      cost: RESOURCE_CAP,
+    } as unknown as UpgradeDefinition
+
+    const result = quoteUpgrade(state, VALID_DEFINITION.definitionId, atCap)
+
+    expect(result.ok).toBe(true)
+  })
 
   it.each([
     { name: 'wrong effect.target', effect: { target: 'progress.resources', operation: 'add', value: 1 } },
@@ -113,6 +128,23 @@ describe('quoteUpgrade', () => {
       })
     },
   )
+
+  it('GIVEN an effect.value that would overflow weaponPowerAfter past Number.MAX_SAFE_INTEGER WHEN quoteUpgrade is called THEN it returns invalid-definition', () => {
+    const state = withResources(1000)
+    const overflowing = {
+      ...VALID_DEFINITION,
+      effect: {
+        target: 'progress.weaponPower',
+        operation: 'add',
+        value: Number.MAX_SAFE_INTEGER,
+      },
+    } as unknown as UpgradeDefinition
+
+    expect(quoteUpgrade(state, VALID_DEFINITION.definitionId, overflowing)).toEqual({
+      ok: false,
+      reason: 'invalid-definition',
+    })
+  })
 
   it('GIVEN a non-preparation phase WHEN quoteUpgrade is called THEN it returns not-preparation', () => {
     const state = withResources(100)
@@ -141,6 +173,27 @@ describe('quoteUpgrade', () => {
       reason: 'insufficient-resources',
     })
   })
+
+  it.each([
+    { name: 'negative weaponPower', overrides: { weaponPower: -3 } },
+    { name: 'NaN weaponPower', overrides: { weaponPower: Number.NaN } },
+    { name: 'fractional weaponPower', overrides: { weaponPower: 1.5 } },
+    { name: 'zero weaponPower', overrides: { weaponPower: 0 } },
+    { name: 'negative resources', overrides: { resources: -1 } },
+    { name: 'NaN resources', overrides: { resources: Number.NaN } },
+    { name: 'resources above RESOURCE_CAP', overrides: { resources: RESOURCE_CAP + 1 } },
+  ])(
+    'GIVEN a corrupt progress state ($name) WHEN quoteUpgrade is called THEN it returns invalid-state without sanitizing to a default',
+    ({ overrides }) => {
+      const state = withResources(1000)
+      Object.assign(state.progress, overrides)
+
+      expect(quoteUpgrade(state, VALID_DEFINITION.definitionId, VALID_DEFINITION)).toEqual({
+        ok: false,
+        reason: 'invalid-state',
+      })
+    },
+  )
 })
 
 describe('purchaseUpgrade', () => {
@@ -209,6 +262,39 @@ describe('purchaseUpgrade', () => {
     expect(storage.save).toHaveBeenCalledTimes(0)
   })
 
+  it('GIVEN a definition cost above RESOURCE_CAP WHEN purchaseUpgrade is called THEN it returns invalid-definition with no mutation and no storage.save call', () => {
+    const state = withResources(RESOURCE_CAP)
+    const storage = createFakeStorage()
+    const overCap = { ...VALID_DEFINITION, cost: RESOURCE_CAP + 1 } as unknown as UpgradeDefinition
+    const before = JSON.parse(JSON.stringify(state))
+
+    const result = purchaseUpgrade(state, VALID_DEFINITION.definitionId, overCap, storage)
+
+    expect(result).toEqual({ ok: false, reason: 'invalid-definition' })
+    expect(state).toEqual(before)
+    expect(storage.save).toHaveBeenCalledTimes(0)
+  })
+
+  it('GIVEN an effect.value that would overflow weaponPowerAfter past Number.MAX_SAFE_INTEGER WHEN purchaseUpgrade is called THEN it returns invalid-definition with no mutation and no storage.save call', () => {
+    const state = withResources(1000)
+    const storage = createFakeStorage()
+    const overflowing = {
+      ...VALID_DEFINITION,
+      effect: {
+        target: 'progress.weaponPower',
+        operation: 'add',
+        value: Number.MAX_SAFE_INTEGER,
+      },
+    } as unknown as UpgradeDefinition
+    const before = JSON.parse(JSON.stringify(state))
+
+    const result = purchaseUpgrade(state, VALID_DEFINITION.definitionId, overflowing, storage)
+
+    expect(result).toEqual({ ok: false, reason: 'invalid-definition' })
+    expect(state).toEqual(before)
+    expect(storage.save).toHaveBeenCalledTimes(0)
+  })
+
   it('GIVEN already-purchased state WHEN purchaseUpgrade is called THEN it rejects without calling storage.save', () => {
     const state = withResources(1000, 2)
     const storage = createFakeStorage()
@@ -240,18 +326,24 @@ describe('purchaseUpgrade', () => {
     expect(storage.save).toHaveBeenCalledTimes(0)
   })
 
-  it('GIVEN an invalid (NaN) resources state WHEN purchaseUpgrade is called THEN it fails closed (insufficient-resources) without calling storage.save', () => {
+  it('GIVEN an invalid (NaN) resources state WHEN purchaseUpgrade is called THEN it fails closed (invalid-state) without calling storage.save or mutating state', () => {
     const state = withResources(0)
     state.progress.resources = Number.NaN
     const storage = createFakeStorage()
+    // NaN cannot round-trip through JSON.stringify/parse (becomes null), so
+    // no-mutation is asserted on the concrete fields instead of a full
+    // before/after snapshot equality.
+    const weaponPowerBefore = state.progress.weaponPower
 
     const result = purchaseUpgrade(state, VALID_DEFINITION.definitionId, VALID_DEFINITION, storage)
 
-    expect(result).toEqual({ ok: false, reason: 'insufficient-resources' })
+    expect(result).toEqual({ ok: false, reason: 'invalid-state' })
+    expect(Number.isNaN(state.progress.resources)).toBe(true)
+    expect(state.progress.weaponPower).toBe(weaponPowerBefore)
     expect(storage.save).toHaveBeenCalledTimes(0)
   })
 
-  it('GIVEN an invalid (negative) weaponPower state WHEN purchaseUpgrade is called THEN it sanitizes to the default and still requires sufficient resources without calling storage.save', () => {
+  it('GIVEN an invalid (negative) weaponPower state and insufficient resources WHEN purchaseUpgrade is called THEN it fails closed (invalid-state) without calling storage.save', () => {
     const state = withResources(50)
     state.progress.weaponPower = -3
 
@@ -259,7 +351,26 @@ describe('purchaseUpgrade', () => {
 
     const result = purchaseUpgrade(state, VALID_DEFINITION.definitionId, VALID_DEFINITION, storage)
 
-    expect(result).toEqual({ ok: false, reason: 'insufficient-resources' })
+    expect(result).toEqual({ ok: false, reason: 'invalid-state' })
+    expect(storage.save).toHaveBeenCalledTimes(0)
+  })
+
+  // Blocker 1 (iteration 2 PR review, https://github.com/squne121/loop-protocol/pull/1318#issuecomment-4881477117):
+  // an invalid negative weaponPower combined with SUFFICIENT resources must
+  // not be sanitized to DEFAULT_WEAPON_POWER and then purchased/saved. Prior
+  // to this fix, evaluateUpgrade() silently coerced weaponPower to 1 and then
+  // treated resources as sufficient, resulting in a purchase being persisted
+  // from corrupt state.
+  it('GIVEN an invalid (negative) weaponPower state and sufficient resources WHEN purchaseUpgrade is called THEN it fails without saving or mutating state', () => {
+    const state = withResources(1000)
+    state.progress.weaponPower = -3
+    const storage = createFakeStorage()
+    const before = JSON.parse(JSON.stringify(state))
+
+    const result = purchaseUpgrade(state, VALID_DEFINITION.definitionId, VALID_DEFINITION, storage)
+
+    expect(result).toEqual({ ok: false, reason: 'invalid-state' })
+    expect(state).toEqual(before)
     expect(storage.save).toHaveBeenCalledTimes(0)
   })
 
