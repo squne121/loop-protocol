@@ -2323,6 +2323,10 @@ def main(argv: list[str] | None = None) -> None:
     sys.exit(exit_code)
 
 
+if __name__ == "__main__":
+    main()
+
+
 # ---------------------------------------------------------------------------
 # SCOPE_DELTA_AUTHORITY_EVIDENCE_V1 (#1323) -- freeform human review comment
 # evidence builder (independent of the structured ANCHOR_SCOPE_REFRAME_V1
@@ -2407,7 +2411,3 @@ def _build_scope_delta_authority_evidence(
         "boundary_flags": boundary_flag_names,
         "confidence": confidence,
     }
-
-
-if __name__ == "__main__":
-    main()
