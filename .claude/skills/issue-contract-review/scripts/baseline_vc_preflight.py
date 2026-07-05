@@ -36,6 +36,14 @@ from vc_contract_syntax import (
 )
 
 
+# Issue #1333 AC1: per-command timeout の named constant。
+# 実測 test_baseline_vc_preflight.py 実行時間（約58秒、real 0m59.376s）を
+# 安全マージン込みで上回る値（>= 90）を維持する。--timeout-seconds の
+# argparse default はこの定数を参照し、run_contract_review_once.py 側も
+# この定数を import して drift を防ぐ（AC2/AC3 参照）。
+DEFAULT_TIMEOUT_SECONDS = 90
+
+
 def get_issue_body(issue_number: int, repo: str) -> Tuple[Optional[str], Optional[str]]:
     """
     GitHub API から Issue body を取得
@@ -758,33 +766,26 @@ def _rg_has_include_option(argv: List[str]) -> bool:
     return False
 
 
-def _rg_has_broad_search_path(argv: List[str], allowed_paths: Optional[List[str]] = None) -> bool:
+def _rg_extract_path_operands(argv: List[str]) -> List[str]:
     """
-    AC2 (Issue #648): Detect if an `rg` command has a broad or unbounded search path.
+    Extract positional PATH operands from an `rg` argv, correctly skipping
+    PATTERN, value-taking flags (`-e`/`--regexp`, `-g`/`--glob`, etc.), and
+    honoring `--` as an end-of-options marker.
 
-    Containment-based logic (replaces fixed _BROAD_RG_PATHS list):
+    This is the mature argv parser originally embedded in
+    `_rg_has_broad_search_path()` (Issue #648), extracted so it can be reused
+    by other callers (e.g. `_candidate_new_allowed_path_target()`, Issue #1328)
+    without duplicating the parsing logic.
 
-    - No positional path argument → broad (ブロック)
-    - '.' or '/' path → always broad (ブロック)
+    Does NOT validate argv[0] is 'rg'; callers are expected to check that
+    themselves (e.g. via `Path(argv[0]).name == "rg"`).
 
-    When allowed_paths is given (from Issue body ## Allowed Paths):
-    - rg_path == allowed_path (same) → 許可
-    - rg_path is a parent of some allowed_path (allowed.startswith(rg_path+"/")) → ブロック (broad)
-    - allowed_path is a parent of rg_path (rg_path.startswith(allowed+"/")) → 許可 (narrowed)
-    - rg_path not covered by any allowed_path at all → ブロック
-
-    When allowed_paths is None or empty (fallback):
-    - Only '.' and '/' are blocked (conservative behavior preserved).
-
-    This function only inspects rg commands (argv[0] basename 'rg').
-    grep / egrep / fgrep are NOT in scope.
-
-    Returns True if the rg command has a broad/unbounded search path.
+    Returns the list of raw (un-normalized) path operand strings, in the
+    order they appear in argv. Returns an empty list if no path operand is
+    found (i.e. the command searches the entire repo from cwd).
     """
     if not argv:
-        return False
-    if Path(argv[0]).name != "rg":
-        return False
+        return []
 
     # Collect positional path arguments (non-option, non-pattern args after pattern)
     # For rg: rg [options] PATTERN [PATH ...]
@@ -823,11 +824,20 @@ def _rg_has_broad_search_path(argv: List[str], allowed_paths: Optional[List[str]
         "--threads", "-j",
         "--max-filesize",
         "--context-separator",
+        "-f", "--file",  # Issue #1328 Blocker 3: -f/--file PATTERNFILE is value-taking
         # NOTE: -l (--files-with-matches) is boolean, intentionally excluded here
     ])
 
+    # Issue #1328 Blocker 3: -f/--file PATTERNFILE supplies the pattern from a
+    # file, just like -e/--regexp supplies it inline. In both cases there is
+    # no positional PATTERN argument to skip, so all remaining positionals
+    # are PATH operands.
     explicit_pattern_given = any(
-        arg in ("-e", "--regexp") or arg.startswith("--regexp=") or (arg.startswith("-e") and len(arg) > 2)
+        arg in ("-e", "--regexp", "-f", "--file")
+        or arg.startswith("--regexp=")
+        or arg.startswith("--file=")
+        or (arg.startswith("-e") and len(arg) > 2)
+        or (arg.startswith("-f") and len(arg) > 2 and not arg.startswith("--"))
         for arg in argv[1:]
     )
 
@@ -904,6 +914,41 @@ def _rg_has_broad_search_path(argv: List[str], allowed_paths: Optional[List[str]
             path_args.append(arg)
             i += 1
             continue
+
+    return path_args
+
+
+def _rg_has_broad_search_path(argv: List[str], allowed_paths: Optional[List[str]] = None) -> bool:
+    """
+    AC2 (Issue #648): Detect if an `rg` command has a broad or unbounded search path.
+
+    Containment-based logic (replaces fixed _BROAD_RG_PATHS list):
+
+    - No positional path argument → broad (ブロック)
+    - '.' or '/' path → always broad (ブロック)
+
+    When allowed_paths is given (from Issue body ## Allowed Paths):
+    - rg_path == allowed_path (same) → 許可
+    - rg_path is a parent of some allowed_path (allowed.startswith(rg_path+"/")) → ブロック (broad)
+    - allowed_path is a parent of rg_path (rg_path.startswith(allowed+"/")) → 許可 (narrowed)
+    - rg_path not covered by any allowed_path at all → ブロック
+
+    When allowed_paths is None or empty (fallback):
+    - Only '.' and '/' are blocked (conservative behavior preserved).
+
+    This function only inspects rg commands (argv[0] basename 'rg').
+    grep / egrep / fgrep are NOT in scope.
+
+    Returns True if the rg command has a broad/unbounded search path.
+    """
+    if not argv:
+        return False
+    if Path(argv[0]).name != "rg":
+        return False
+
+    # Path operand extraction is delegated to _rg_extract_path_operands()
+    # (Issue #1328: shared argv parser, no duplicated parsing logic).
+    path_args = _rg_extract_path_operands(argv)
 
     # No path arguments: searches the entire repo → broad
     if not path_args:
@@ -1727,8 +1772,10 @@ def _candidate_new_allowed_path_target(
                 continue
             candidates.append(a)
     elif prog == "rg":
-        non_opt = [a for a in argv[1:] if not a.startswith("-")]
-        candidates.extend(non_opt[1:])
+        # Issue #1328 (AC7): use the mature argv parser shared with
+        # _rg_has_broad_search_path() instead of a naive non_opt[1:] split,
+        # so -e/--regexp/--glob/--/value-taking flags are handled correctly.
+        candidates.extend(_rg_extract_path_operands(argv))
     else:
         return None
 
@@ -2064,6 +2111,137 @@ def classify_static_command(
     return None  # proceed to execution
 
 
+# Issue #1328: whitelist of stderr patterns that indicate `rg` failed because the
+# target PATH does not exist (missing file/directory), as opposed to a
+# regex/option/config/permission error.
+_RG_STDERR_MISSING_PATH_PATTERNS = (
+    re.compile(r"No such file or directory"),
+    re.compile(r"\(os error 2\)"),
+)
+
+# Issue #1328: blacklist of stderr patterns that indicate `rg` failed for a
+# reason OTHER than a missing path (invalid regex / unsupported option /
+# config error / permission denied). If any of these match, the failure must
+# NOT be treated as a deterministic "missing path" expected_fail, even if a
+# missing-path pattern also happens to be present in the same stderr (AC10).
+_RG_STDERR_ERROR_NOT_MISSING_PATH_PATTERNS = (
+    re.compile(r"regex parse error"),
+    re.compile(r"unrecognized flag"),
+    re.compile(r"unrecognized option"),
+    re.compile(r"error:\s*unclosed"),
+    re.compile(r"error:\s*found argument"),
+    re.compile(r"error:\s*invalid"),
+    re.compile(r"Permission denied"),
+    re.compile(r"\(os error 13\)"),
+    re.compile(r"bad config"),
+)
+
+
+def _rg_stderr_indicates_missing_path(stderr: str) -> bool:
+    """Issue #1328: True if stderr matches a known 'target path does not exist'
+    pattern for `rg` (e.g. "No such file or directory (os error 2)")."""
+    return any(pattern.search(stderr) for pattern in _RG_STDERR_MISSING_PATH_PATTERNS)
+
+
+def _rg_stderr_indicates_error_not_missing_path(stderr: str) -> bool:
+    """Issue #1328: True if stderr matches a known non-missing-path `rg` error
+    pattern (invalid regex / unsupported option / config error / permission
+    denied)."""
+    return any(pattern.search(stderr) for pattern in _RG_STDERR_ERROR_NOT_MISSING_PATH_PATTERNS)
+
+
+def _is_rg_missing_path_error(stderr: str) -> bool:
+    """Issue #1328: True only if stderr strictly indicates a missing-path error
+    (whitelist match) AND does not also match any non-missing-path error
+    pattern (blacklist). AC10: whitelist+blacklist co-occurrence returns False
+    (conservative; do not treat as deterministic missing-path expected_fail)."""
+    return _rg_stderr_indicates_missing_path(stderr) and not _rg_stderr_indicates_error_not_missing_path(stderr)
+
+
+def _normalize_repo_relative_path_strict(path: str) -> Optional[str]:
+    """Issue #1328 (OWNER Blocker 2): strict repo-relative POSIX path
+    normalization, mirroring `AllowedPathsMatcher.normalize_path()` in
+    `.claude/skills/pr-review-judge/scripts/allowed_paths_review_gate.py`.
+    Fail-closed: returns None (reject) for absolute paths, paths containing a
+    backslash, `..` segments, and empty segments (e.g. `docs//new/file.md`).
+    Reimplemented here (not imported) to keep this script's dependency
+    surface self-contained; the two normalization rules are covered by
+    parity tests and MUST stay in sync."""
+    if not path:
+        return None
+    if "\\" in path:
+        return None
+    if path.startswith("/"):
+        return None
+
+    normalized = path[2:] if path.startswith("./") else path
+    if normalized in ("", "."):
+        return None
+    segments = normalized.split("/")
+    if ".." in segments:
+        return None
+    if "" in segments:
+        return None
+    return normalized
+
+
+def _rg_path_operands_all_within_allowed_paths(path_operands: List[str], allowed_paths: List[str]) -> bool:
+    """Issue #1328: True iff every rg path operand is equal to, or nested
+    under, one of the (normalized) Allowed Paths. Empty path_operands ->
+    False (a broad/whole-repo search is never "within" Allowed Paths).
+
+    OWNER Blocker 2: both path operands and Allowed Paths entries are
+    normalized via `_normalize_repo_relative_path_strict()` (fail-closed);
+    absolute paths, backslashes, `..` segments, and empty segments are
+    rejected instead of being accepted via naive string-prefix matching."""
+    if not path_operands:
+        return False
+    norm_allowed: List[str] = []
+    for ap in allowed_paths:
+        candidate = ap.strip()
+        if not candidate:
+            continue
+        if candidate != "/":
+            candidate = candidate.rstrip("/")
+        normalized_ap = _normalize_repo_relative_path_strict(candidate)
+        if normalized_ap is not None:
+            norm_allowed.append(normalized_ap)
+    if not norm_allowed:
+        return False
+
+    def _in_allowed(p: str) -> bool:
+        normalized_p = _normalize_repo_relative_path_strict(p)
+        if normalized_p is None:
+            return False
+        return any(normalized_p == a or normalized_p.startswith(a + "/") for a in norm_allowed)
+
+    return all(_in_allowed(p) for p in path_operands)
+
+
+# Issue #1328 (OWNER Blocker 1): matches a single `rg` stderr line of the form
+# `rg: <path>: No such file or directory (os error 2)`, capturing <path>, so
+# the missing path(s) reported by rg can be compared against the argv path
+# operands (preventing false-green on multi-path invocations where one path
+# matched and produced stdout while a different path was missing).
+_RG_STDERR_MISSING_PATH_LINE = re.compile(
+    r"^rg:\s*(.+?):\s*No such file or directory(?:\s*\(os error 2\))?\s*$",
+    re.MULTILINE,
+)
+
+
+def _rg_stderr_extract_missing_paths(stderr: str) -> List[str]:
+    """Issue #1328 (OWNER Blocker 1): extract path(s) that rg reported as
+    missing directly from stderr lines matching `_RG_STDERR_MISSING_PATH_LINE`.
+    Returns raw (un-normalized) path strings in first-appearance order,
+    deduplicated. Returns an empty list if no such line is found."""
+    seen: List[str] = []
+    for m in _RG_STDERR_MISSING_PATH_LINE.finditer(stderr):
+        candidate = m.group(1).strip()
+        if candidate and candidate not in seen:
+            seen.append(candidate)
+    return seen
+
+
 def classify_result(
     exit_code: int,
     stdout: str,
@@ -2071,6 +2249,8 @@ def classify_result(
     command: str,
     cwd: Optional[str] = None,
     runner_env_delta: Optional[Dict[str, str]] = None,
+    allowed_paths: Optional[List[str]] = None,
+    static_policy_passed: bool = True,
 ) -> Tuple[str, str, str, Optional[str], str]:
     """
     VC 実行結果を分類。
@@ -2081,13 +2261,22 @@ def classify_result(
         stderr: command standard error
         command: original command string
         cwd: working directory (threaded to _is_regression_gate_command)
+        allowed_paths: Issue body ## Allowed Paths list (Issue #1328). Required
+            (non-empty) for the deterministic `new_file_missing_expected`
+            classification; without it, rg exit_code==2 never resolves to that
+            category regardless of stderr content (AC9).
+        static_policy_passed: whether classify_static_command() already ran and
+            returned None (not statically blocked) for this command. Defaults
+            to True for backward compatibility with existing call sites that
+            only invoke classify_result() after a static_result is None.
 
     戻り値: (classification, category, decision, fix_hint, scope_class)
       classification: expected_fail | unexpected_pass | blocked | human_judgment | expected_pass | skipped
       category: file_not_found_expected | expected_baseline_fail | unexpected_pass |
                 env_missing_dep | file_not_found_unrunnable | timeout |
                 compound_command_disallowed | unsupported_shell_syntax |
-                unsafe_command | command_not_allowed | unknown | regression_gate
+                unsafe_command | command_not_allowed | unknown | regression_gate |
+                new_file_missing_expected
       decision: go | blocked | human_judgment
       fix_hint: nullable hint
       scope_class: baseline_fail_expected | regression_gate | pr_review_only | runtime_only
@@ -2201,6 +2390,60 @@ def classify_result(
             "Script or file being executed does not exist",
             "baseline_fail_expected"
         )
+
+    # AC1/AC2/AC3/AC4/AC5/AC9/AC10 (Issue #1328): rg exit_code==2 against a
+    # missing file/dir that is fully contained within Allowed Paths, with
+    # stderr strictly indicating a "missing path" error (not invalid regex /
+    # unsupported option / config error / permission denied), is a
+    # deterministic expected_fail. This is a narrow special case: any
+    # condition below not satisfied falls through to the existing branches
+    # (usually the terminal Unknown fallback -> human_judgment).
+    # OWNER Blocker 1: additionally require stdout to be empty (no matches
+    # were found anywhere) AND require the stderr-reported missing path(s) to
+    # exactly match the full set of argv path operands. Without this, a
+    # multi-path invocation where one path matched (non-empty stdout) and a
+    # DIFFERENT path was missing would be misclassified as a deterministic
+    # baseline fail, even though the VC actually found a match.
+    if (
+        exit_code == 2
+        and static_policy_passed
+        and allowed_paths
+        and stdout.strip() == ""
+    ):
+        try:
+            _rg_argv_for_missing_path = shlex.split(command)
+        except ValueError:
+            _rg_argv_for_missing_path = []
+        if _rg_argv_for_missing_path and Path(_rg_argv_for_missing_path[0]).name == "rg":
+            _rg_path_operands = _rg_extract_path_operands(_rg_argv_for_missing_path)
+            if (
+                _rg_path_operands_all_within_allowed_paths(_rg_path_operands, allowed_paths)
+                and _is_rg_missing_path_error(stderr)
+            ):
+                _rg_missing_from_stderr = _rg_stderr_extract_missing_paths(stderr)
+                _norm_operands = {
+                    n for n in (
+                        _normalize_repo_relative_path_strict(p) for p in _rg_path_operands
+                    ) if n is not None
+                }
+                _norm_missing = {
+                    n for n in (
+                        _normalize_repo_relative_path_strict(p) for p in _rg_missing_from_stderr
+                    ) if n is not None
+                }
+                # OWNER Blocker 1: the missing-path set reported by stderr must be
+                # non-empty and must equal (not merely overlap with) the full set
+                # of path operands -- either a single missing path, or every
+                # operand accounted for as missing. This rejects "one operand
+                # matched, a different operand was missing" false-green cases.
+                if _norm_missing and _norm_operands == _norm_missing:
+                    return (
+                        "expected_fail",
+                        "new_file_missing_expected",
+                        "go",
+                        None,
+                        "baseline_fail_expected",
+                    )
 
     # env_missing_dep: command not found (127), permission denied (126), ModuleNotFoundError, etc.
     if exit_code in (126, 127):
@@ -2342,6 +2585,7 @@ def compute_confidence(category: str) -> str:
         "regex_literal_pipe_suspected",  # AC3: Issue #589
         "rg_option_mismatch",            # AC1: Issue #648
         "broad_search_path_unbounded",   # AC2: Issue #648
+        "new_file_missing_expected",     # AC11: Issue #1328
     }
     medium_confidence = {"timeout", "unexpected_pass"}
 
@@ -2512,7 +2756,12 @@ def main() -> int:
     parser.add_argument("--repo", default="squne121/loop-protocol", help="GitHub repo (owner/name)")
     parser.add_argument("--body-file", help="Path to Issue body file (for testing)")
     parser.add_argument("--cwd", default=".", help="Working directory for command execution")
-    parser.add_argument("--timeout-seconds", type=int, default=30, help="Timeout per command")
+    parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help="Timeout per command",
+    )
     parser.add_argument("--max-head-lines", type=int, default=20, help="Max lines for stdout/stderr")
     # B8: contract-review-fragment format support
     parser.add_argument(
@@ -2944,6 +3193,8 @@ def main() -> int:
                         command,
                         cwd=args.cwd,
                         runner_env_delta=runner_env_delta,
+                        allowed_paths=allowed_paths_from_body,
+                        static_policy_passed=True,
                     )
 
                     # Issue #889: Apply baseline-expect annotation post-execution re-mapping
