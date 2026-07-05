@@ -11,6 +11,15 @@ AC6: result includes worktree_absent_after_removal: True
 AC7: branch_only_force_delete_denied reason code defined; actions_taken: ["branch_delete"]
 AC8: bare git branch -D still denied by hook (regression gate in test_local_main_branch_guard.py)
 AC9: CLI shape unchanged — test that cleanup_exec.py exists (separate VC: test -f ...)
+
+Issue #1337 (squash-merge head-OID equivalence):
+AC1: squash merge, path-scoped content match -> authorized (verify_cleanup_authorization)
+AC2: squash merge, path-scoped content mismatch -> pr_head_oid_mismatch
+AC6: unrelated base change outside the local delta path set must not cause a false match
+AC7: extra unmerged local-only files (outside the squashed merge commit) -> rejected
+AC8: missing/null mergeCommit -> fail-closed, no squash-equivalence fallback attempted
+AC9: verified dict carries additive head_equivalence_* / pr_merge_commit_oid /
+     local_delta_paths_count fields without changing head_oid_match semantics
 """
 
 from __future__ import annotations
@@ -945,3 +954,231 @@ class TestMaterializeRefusesBranchOnly:
             capture_output=True, text=True,
         )
         assert out.returncode == 0, "branch must still exist after materialize refusal"
+
+
+# ─── Issue #1337: squash-merge head-OID equivalence ───────────────────────────
+
+
+@pytest.fixture
+def repo_for_squash_equivalence(tmp_path):
+    """Temp git repo with a linked worktree on a feature branch (Issue #1337).
+
+    The feature branch is checked out as a REAL git worktree (under
+    .claude/worktrees/) so verify_cleanup_authorization's catalog + clean-worktree
+    checks pass, exactly like repo_with_worktree. The squash commit is then
+    created directly on main in the ROOT repo (not the worktree) to represent
+    what GitHub's squash-merge would have produced.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git("init", "-q", "-b", "main", cwd=root)
+    _git("config", "user.email", "t@t.com", cwd=root)
+    _git("config", "user.name", "T", cwd=root)
+    _git("remote", "add", "origin", "https://github.com/squne121/loop-protocol.git", cwd=root)
+    (root / "shared.txt").write_text("base v1\n")
+    _git("add", "shared.txt", cwd=root)
+    _git("commit", "-q", "-m", "seed", cwd=root)
+
+    branch_name = "issue-1337-feature"
+    wt_parent = root / ".claude" / "worktrees"
+    wt_parent.mkdir(parents=True, exist_ok=True)
+    wt_path = wt_parent / "issue-1337-feature"
+    _git("worktree", "add", "-q", "-b", branch_name, str(wt_path), "main", cwd=root)
+    (wt_path / "feature.txt").write_text("feature-A\n")
+    _git("add", "feature.txt", cwd=wt_path)
+    _git("commit", "-q", "-m", "add feature", cwd=wt_path)
+    local_tip = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", f"refs/heads/{branch_name}"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    yield {
+        "root": str(root),
+        "branch_name": branch_name,
+        "local_tip": local_tip,
+        "worktree_path": str(wt_path),
+    }
+
+    if wt_path.exists():
+        subprocess.run(
+            ["git", "-C", str(root), "worktree", "remove", "--force", str(wt_path)],
+            capture_output=True,
+        )
+
+
+def _commit_on_main(root, filename, content, message):
+    (Path(root) / filename).write_text(content)
+    _git("add", filename, cwd=root)
+    _git("commit", "-q", "-m", message, cwd=root)
+    return subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+
+def test_verify_cleanup_authorization_accepts_squash_merge_path_scoped_match(
+    repo_for_squash_equivalence
+):
+    """GIVEN squash commit with identical feature.txt content WHEN verified THEN authorized."""
+    repo = repo_for_squash_equivalence
+    merge_commit_oid = _commit_on_main(
+        repo["root"], "feature.txt", "feature-A\n", "squash: add feature (#1337)"
+    )
+    fake_pr = _make_merged_pr(repo["branch_name"], "f" * 40, linked_issue=1337)
+    fake_pr["mergeCommit"] = {"oid": merge_commit_oid}
+    req = _make_req(repo, linked_issue=1337)
+
+    with (
+        patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+        patch.object(_ce, "_pr_state", return_value=fake_pr),
+    ):
+        ok, reason, verified = verify_cleanup_authorization(req, repo["root"], Deadline(30.0))
+
+    assert ok is True, f"Expected authorized, reason={reason}, verified={verified}"
+    assert verified["head_equivalence_authorized"] is True
+    assert verified["head_equivalence_mode"] == "squash_merge_delta_match"
+    assert verified["pr_merge_commit_oid"] == merge_commit_oid
+    assert verified["local_delta_paths_count"] == 1
+
+def test_verify_cleanup_authorization_rejects_squash_merge_content_mismatch(
+    repo_for_squash_equivalence
+):
+    """GIVEN squash commit with DIFFERENT feature.txt content WHEN verified THEN pr_head_oid_mismatch."""
+    repo = repo_for_squash_equivalence
+    merge_commit_oid = _commit_on_main(
+        repo["root"], "feature.txt", "feature-B (different)\n", "squash: add feature (#1337)"
+    )
+    fake_pr = _make_merged_pr(repo["branch_name"], "f" * 40)
+    fake_pr["mergeCommit"] = {"oid": merge_commit_oid}
+    req = _make_req(repo, linked_issue=1337)
+
+    with (
+        patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+        patch.object(_ce, "_pr_state", return_value=fake_pr),
+    ):
+        ok, reason, verified = verify_cleanup_authorization(req, repo["root"], Deadline(30.0))
+
+    assert ok is False
+    assert reason == HEAD_OID_MISMATCH
+    assert verified["head_equivalence_authorized"] is False
+
+def test_squash_merge_unrelated_base_change_does_not_false_match(
+    repo_for_squash_equivalence
+):
+    """GIVEN unrelated base change AND a real feature.txt mismatch WHEN verified THEN still rejected.
+
+    The unrelated ``shared.txt`` diff (base evolved after the branch forked)
+    must not mask a genuine content mismatch in the local branch's own path
+    set — path-set-restricted comparison must not be fooled by noise.
+    """
+    repo = repo_for_squash_equivalence
+    # Unrelated base change: shared.txt evolves on main, NOT touched by the
+    # local branch at all (local branch never modified shared.txt).
+    _commit_on_main(repo["root"], "shared.txt", "base v2 (unrelated change)\n", "unrelated base change")
+    # The "squash commit" on top of that unrelated change has a MISMATCHED
+    # feature.txt content relative to the local branch tip.
+    merge_commit_oid = _commit_on_main(
+        repo["root"], "feature.txt", "feature-B (mismatch)\n", "squash: add feature (#1337)"
+    )
+    fake_pr = _make_merged_pr(repo["branch_name"], "f" * 40)
+    fake_pr["mergeCommit"] = {"oid": merge_commit_oid}
+    req = _make_req(repo, linked_issue=1337)
+
+    with (
+        patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+        patch.object(_ce, "_pr_state", return_value=fake_pr),
+    ):
+        ok, reason, verified = verify_cleanup_authorization(req, repo["root"], Deadline(30.0))
+
+    assert ok is False, (
+        f"unrelated base change noise must not mask the real feature.txt mismatch: {verified}"
+    )
+    assert reason == HEAD_OID_MISMATCH
+    assert verified["head_equivalence_authorized"] is False
+
+def test_squash_merge_rejects_extra_unmerged_local_files(repo_for_squash_equivalence):
+    """GIVEN local branch has an extra file never captured by the squash commit WHEN verified THEN rejected."""
+    repo = repo_for_squash_equivalence
+    # The squash commit only captures the ORIGINAL feature.txt content.
+    merge_commit_oid = _commit_on_main(
+        repo["root"], "feature.txt", "feature-A\n", "squash: add feature (#1337)"
+    )
+    # Local branch keeps evolving AFTER what got merged: an extra local-only
+    # file that was never part of the squashed PR content. The branch is
+    # already checked out in the linked worktree (not root), so commit there.
+    (Path(repo["worktree_path"]) / "extra.txt").write_text("local-only, never merged\n")
+    _git("add", "extra.txt", cwd=repo["worktree_path"])
+    _git("commit", "-q", "-m", "extra unmerged local commit", cwd=repo["worktree_path"])
+    new_local_tip = subprocess.run(
+        ["git", "-C", repo["root"], "rev-parse", f"refs/heads/{repo['branch_name']}"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    fake_pr = _make_merged_pr(repo["branch_name"], "f" * 40)
+    fake_pr["mergeCommit"] = {"oid": merge_commit_oid}
+    req = _make_req(repo, linked_issue=1337)
+    req["branch_name"] = repo["branch_name"]
+
+    with (
+        patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+        patch.object(_ce, "_pr_state", return_value=fake_pr),
+    ):
+        ok, reason, verified = verify_cleanup_authorization(req, repo["root"], Deadline(30.0))
+
+    assert ok is False, f"extra unmerged local file must cause rejection: {verified}"
+    assert reason == HEAD_OID_MISMATCH
+    assert verified["local_delta_paths_count"] == 2  # feature.txt + extra.txt
+    assert verified["head_equivalence_authorized"] is False
+    assert new_local_tip != repo["local_tip"]
+
+def test_squash_merge_missing_merge_commit_falls_back_to_reject(
+    repo_for_squash_equivalence
+):
+    """GIVEN mergeCommit missing/null WHEN OID mismatch THEN fail-closed without squash fallback."""
+    repo = repo_for_squash_equivalence
+    fake_pr = _make_merged_pr(repo["branch_name"], "f" * 40)
+    fake_pr["mergeCommit"] = None
+    req = _make_req(repo, linked_issue=1337)
+
+    with (
+        patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+        patch.object(_ce, "_pr_state", return_value=fake_pr),
+    ):
+        ok, reason, verified = verify_cleanup_authorization(req, repo["root"], Deadline(30.0))
+
+    assert ok is False
+    assert reason == HEAD_OID_MISMATCH
+    assert verified["head_equivalence_authorized"] is False
+    assert verified["head_equivalence_mode"] is None
+    assert verified["pr_merge_commit_oid"] is None
+    assert verified["local_delta_paths_count"] is None
+
+def test_verified_dict_contains_additive_head_equivalence_fields(
+    repo_for_squash_equivalence
+):
+    """GIVEN squash-equivalence authorized WHEN verified THEN additive fields present, head_oid_match unchanged."""
+    repo = repo_for_squash_equivalence
+    merge_commit_oid = _commit_on_main(
+        repo["root"], "feature.txt", "feature-A\n", "squash: add feature (#1337)"
+    )
+    fake_pr = _make_merged_pr(repo["branch_name"], "f" * 40, linked_issue=1337)
+    fake_pr["mergeCommit"] = {"oid": merge_commit_oid}
+    req = _make_req(repo, linked_issue=1337)
+
+    with (
+        patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+        patch.object(_ce, "_pr_state", return_value=fake_pr),
+    ):
+        ok, reason, verified = verify_cleanup_authorization(req, repo["root"], Deadline(30.0))
+
+    assert ok is True, f"reason={reason}, verified={verified}"
+    # Additive fields present and correct.
+    assert verified["head_equivalence_authorized"] is True
+    assert verified["head_equivalence_mode"] == "squash_merge_delta_match"
+    assert verified["pr_merge_commit_oid"] == merge_commit_oid
+    assert verified["local_delta_paths_count"] == 1
+    # Existing head_oid_match semantics unchanged: it reflects the LITERAL
+    # exact-SHA comparison only, so it stays False for a squash-equivalence
+    # authorized case (headRefOid != local branch tip by construction here).
+    assert verified["head_oid_match"] is False

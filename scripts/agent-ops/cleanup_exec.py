@@ -166,7 +166,8 @@ def _pr_state(pr_number: int, project_root: str, repo_slug: str | None, deadline
         return None
     args = [gh, "pr", "view", str(pr_number), "--json",
             "state,mergedAt,headRefName,headRefOid,baseRefName,"
-            "headRepositoryOwner,isCrossRepository,closingIssuesReferences"]
+            "headRepositoryOwner,isCrossRepository,closingIssuesReferences,"
+            "mergeCommit"]
     if repo_slug:
         args += ["--repo", repo_slug]
     try:
@@ -182,6 +183,113 @@ def _pr_state(pr_number: int, project_root: str, repo_slug: str | None, deadline
         return json.loads(out.stdout)
     except (json.JSONDecodeError, ValueError):
         return None
+
+
+def _merge_base(
+    project_root: str, local_tip: str, default_branch: str, deadline: Deadline
+) -> str | None:
+    """Return the merge-base commit of ``local_tip`` and ``default_branch`` (Issue #1337).
+
+    Used to compute the path set the local branch introduced relative to where
+    it diverged from the default branch, BEFORE the (possible) squash merge.
+    """
+    try:
+        out = _git(["-C", project_root, "merge-base", local_tip, default_branch], deadline, 10.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else None
+
+
+def _squash_equivalence_path_set(
+    project_root: str, merge_base: str, local_tip: str, deadline: Deadline
+) -> list[str] | None:
+    """Return the path set changed by the local branch (``merge_base..local_tip``)."""
+    try:
+        out = _git(
+            ["-C", project_root, "diff", "--name-only", f"{merge_base}..{local_tip}"],
+            deadline, 15.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    return [line for line in out.stdout.splitlines() if line]
+
+
+def _squash_content_matches(
+    project_root: str, merge_commit_oid: str, local_tip: str, paths: list[str], deadline: Deadline
+) -> bool:
+    """Return True iff ``local_tip`` and ``merge_commit_oid`` agree on ``paths``.
+
+    Restricted to ``paths`` (the local branch's own delta) so unrelated base
+    changes or unrelated other-PR content never affect the comparison — this is
+    the fix for the squash-merge false-positive ``pr_head_oid_mismatch`` (Issue #1337).
+    """
+    if not paths:
+        return False
+    try:
+        out = _git(
+            ["-C", project_root, "diff", "--name-only", merge_commit_oid, local_tip, "--", *paths],
+            deadline, 15.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if out.returncode != 0:
+        return False
+    return out.stdout.strip() == ""
+
+
+def _resolve_head_equivalence(
+    pr: dict, local_tip: str | None, project_root: str, default_branch: str, deadline: Deadline,
+) -> tuple[bool, dict]:
+    """Authorize head OID either by exact match or squash-merge delta equivalence.
+
+    Issue #1337: GitHub squash merge always mints a brand-new commit SHA for the
+    default branch, so ``headRefOid`` (really the merge commit) never equals the
+    feature branch tip even when content is identical. This resolver keeps the
+    existing exact-match fail-closed behavior for non-squash merges, and ONLY
+    attempts the squash-equivalence fallback when ``mergeCommit`` is present
+    (fail-closed otherwise). Returns ``(authorized, additive_fields)`` where
+    ``additive_fields`` always carries the four additive ``verified`` keys.
+    """
+    additive: dict = {
+        "head_equivalence_authorized": False,
+        "head_equivalence_mode": None,
+        "pr_merge_commit_oid": None,
+        "local_delta_paths_count": None,
+    }
+
+    head_ref_oid = pr.get("headRefOid")
+    if local_tip and head_ref_oid and head_ref_oid == local_tip:
+        additive["head_equivalence_authorized"] = True
+        additive["head_equivalence_mode"] = "exact_oid"
+        return True, additive
+
+    # Exact match failed. Only attempt the squash-equivalence fallback when
+    # mergeCommit is present — missing/null mergeCommit keeps the existing
+    # fail-closed pr_head_oid_mismatch rejection (Issue #1337 AC8).
+    merge_commit = pr.get("mergeCommit")
+    merge_commit_oid = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
+    additive["pr_merge_commit_oid"] = merge_commit_oid
+    if not local_tip or not merge_commit_oid:
+        return False, additive
+
+    merge_base = _merge_base(project_root, local_tip, default_branch, deadline)
+    if not merge_base:
+        return False, additive
+    paths = _squash_equivalence_path_set(project_root, merge_base, local_tip, deadline)
+    if paths is None:
+        return False, additive
+    additive["local_delta_paths_count"] = len(paths)
+    if not paths:
+        # No local delta relative to merge_base — nothing to authorize on.
+        return False, additive
+    if not _squash_content_matches(project_root, merge_commit_oid, local_tip, paths, deadline):
+        return False, additive
+
+    additive["head_equivalence_authorized"] = True
+    additive["head_equivalence_mode"] = "squash_merge_delta_match"
+    return True, additive
 
 
 def verify_cleanup_authorization(req: dict, project_root: str, deadline: Deadline) -> tuple[bool, str | None, dict]:
@@ -202,6 +310,11 @@ def verify_cleanup_authorization(req: dict, project_root: str, deadline: Deadlin
         "head_repo_match": False,
         "base_branch_match": False,
         "head_oid_match": False,
+        # Additive squash-merge equivalence fields (Issue #1337).
+        "head_equivalence_authorized": False,
+        "head_equivalence_mode": None,
+        "pr_merge_commit_oid": None,
+        "local_delta_paths_count": None,
     }
     branch_name = req["branch_name"]
     worktree_real = os.path.realpath(req["worktree_path"])
@@ -267,9 +380,13 @@ def verify_cleanup_authorization(req: dict, project_root: str, deadline: Deadlin
     # Blocker 5: the PR head sha must equal the LOCAL branch tip — a same-named
     # branch at a different commit must not authorize the deletion.
     local_tip = _local_branch_tip(project_root, branch_name, deadline)
-    if not local_tip or pr.get("headRefOid") != local_tip:
+    verified["head_oid_match"] = bool(local_tip and pr.get("headRefOid") == local_tip)
+    head_authorized, equivalence_fields = _resolve_head_equivalence(
+        pr, local_tip, project_root, default, deadline
+    )
+    verified.update(equivalence_fields)
+    if not head_authorized:
         return False, HEAD_OID_MISMATCH, verified
-    verified["head_oid_match"] = True
     linked = req.get("linked_issue_number")
     if linked is not None:
         refs = {r.get("number") for r in (pr.get("closingIssuesReferences") or [])}
@@ -315,6 +432,11 @@ def verify_branch_only_cleanup_authorization(
         "pr_head_oid": None,
         "head_oid_match": False,
         "branch_only_force_delete_used": False,
+        # Additive squash-merge equivalence fields (Issue #1337).
+        "head_equivalence_authorized": False,
+        "head_equivalence_mode": None,
+        "pr_merge_commit_oid": None,
+        "local_delta_paths_count": None,
         # Standard PR authorization fields (AC5 coverage)
         "pr_merged": False,
         "head_branch_match": False,
@@ -392,9 +514,13 @@ def verify_branch_only_cleanup_authorization(
     # PR head OID must match local branch tip (AC3)
     pr_head_oid = pr.get("headRefOid")
     verified["pr_head_oid"] = pr_head_oid
-    if not local_tip or pr_head_oid != local_tip:
+    verified["head_oid_match"] = bool(local_tip and pr_head_oid == local_tip)
+    head_authorized, equivalence_fields = _resolve_head_equivalence(
+        pr, local_tip, project_root, default, deadline
+    )
+    verified.update(equivalence_fields)
+    if not head_authorized:
         return False, HEAD_OID_MISMATCH, verified
-    verified["head_oid_match"] = True
     # Linked issue check (AC5)
     linked = req.get("linked_issue_number")
     if linked is not None:
