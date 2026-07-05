@@ -1368,6 +1368,92 @@ def _emit_failure_result(
     return result, exit_code
 
 
+# ---------------------------------------------------------------------------
+# SCOPE_DELTA_AUTHORITY_EVIDENCE_V1 (#1323) -- freeform human review comment
+# evidence builder (independent of the structured ANCHOR_SCOPE_REFRAME_V1
+# payload consumed by _classify_anchor_scope_reframe above).
+# ---------------------------------------------------------------------------
+
+
+def _build_scope_delta_authority_evidence(
+    *,
+    comment_payload: dict,
+    comment_body: str,
+    repo: str,
+    issue_number: int,
+    anchor_url: str,
+    captured_at: str,
+):
+    """#1323: build SCOPE_DELTA_AUTHORITY_EVIDENCE_V1 from an anchor comment.
+
+    Unlike _classify_anchor_scope_reframe (which requires a structured
+    ANCHOR_SCOPE_REFRAME_V1 fenced yaml payload), this works on freeform
+    human review comments (e.g. Issue #1270's Revised Acceptance Criteria
+    comment) so explicit human-review directives are not silently dropped
+    just because they are not machine-formatted.
+
+    Returns None (fail-closed) when the anchor URL does not structurally
+    resolve to an issue-comment on `issue_number` in `repo` (AC16). Never
+    forwards the raw comment body -- only sha256 + extracted markers /
+    directives / boundary flags (AC14).
+    """
+    try:
+        from scope_signal_delta import (
+            classify_directive_confidence,
+            detect_boundary_flags,
+            extract_directive_items,
+            extract_directive_markers,
+            parse_issue_comment_url,
+        )
+    except ImportError:
+        return None
+
+    parsed = parse_issue_comment_url(anchor_url)
+    if parsed is None:
+        return None
+    if f"{parsed['owner']}/{parsed['repo']}".lower() != repo.lower():
+        return None
+    if parsed["issue_number"] != issue_number:
+        return None
+
+    author_association = comment_payload.get("author_association")
+    user = comment_payload.get("user")
+    if isinstance(user, dict):
+        author_login = user.get("login")
+        author_type = user.get("type") or "unknown"
+    else:
+        author_login = comment_payload.get("author_login")
+        author_type = comment_payload.get("author_type") or "unknown"
+
+    markers = extract_directive_markers(comment_body)
+    directives = extract_directive_items(comment_body)
+    confidence = classify_directive_confidence(comment_body, markers)
+    boundary_flags_map = detect_boundary_flags(comment_body)
+    boundary_flag_names = [name for name, value in boundary_flags_map.items() if value]
+
+    issue_url = f"https://github.com/{repo}/issues/{issue_number}"
+
+    return {
+        "schema_version": "SCOPE_DELTA_AUTHORITY_EVIDENCE_V1",
+        "source_kind": "issue_comment",
+        "source_ref": anchor_url,
+        "source_issue_number": issue_number,
+        "comment_id": comment_payload.get("id"),
+        "comment_url": anchor_url,
+        "issue_url": issue_url,
+        "body_sha256": _sha256(comment_body),
+        "author_login": author_login,
+        "author_type": author_type,
+        "author_association": author_association,
+        "captured_at": captured_at,
+        "directive_markers": markers,
+        "extracted_directives": directives,
+        "ambiguity_flags": [] if confidence != "ambiguous" else ["structured_list_missing"],
+        "boundary_flags": boundary_flag_names,
+        "confidence": confidence,
+    }
+
+
 def run_preflight(
     issue_number: int,
     repo: str,
@@ -2325,89 +2411,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-
-
-# ---------------------------------------------------------------------------
-# SCOPE_DELTA_AUTHORITY_EVIDENCE_V1 (#1323) -- freeform human review comment
-# evidence builder (independent of the structured ANCHOR_SCOPE_REFRAME_V1
-# payload consumed by _classify_anchor_scope_reframe above).
-# ---------------------------------------------------------------------------
-
-
-def _build_scope_delta_authority_evidence(
-    *,
-    comment_payload: dict,
-    comment_body: str,
-    repo: str,
-    issue_number: int,
-    anchor_url: str,
-    captured_at: str,
-):
-    """#1323: build SCOPE_DELTA_AUTHORITY_EVIDENCE_V1 from an anchor comment.
-
-    Unlike _classify_anchor_scope_reframe (which requires a structured
-    ANCHOR_SCOPE_REFRAME_V1 fenced yaml payload), this works on freeform
-    human review comments (e.g. Issue #1270's Revised Acceptance Criteria
-    comment) so explicit human-review directives are not silently dropped
-    just because they are not machine-formatted.
-
-    Returns None (fail-closed) when the anchor URL does not structurally
-    resolve to an issue-comment on `issue_number` in `repo` (AC16). Never
-    forwards the raw comment body -- only sha256 + extracted markers /
-    directives / boundary flags (AC14).
-    """
-    try:
-        from scope_signal_delta import (
-            classify_directive_confidence,
-            detect_boundary_flags,
-            extract_directive_items,
-            extract_directive_markers,
-            parse_issue_comment_url,
-        )
-    except ImportError:
-        return None
-
-    parsed = parse_issue_comment_url(anchor_url)
-    if parsed is None:
-        return None
-    if f"{parsed['owner']}/{parsed['repo']}".lower() != repo.lower():
-        return None
-    if parsed["issue_number"] != issue_number:
-        return None
-
-    author_association = comment_payload.get("author_association")
-    user = comment_payload.get("user")
-    if isinstance(user, dict):
-        author_login = user.get("login")
-        author_type = user.get("type") or "unknown"
-    else:
-        author_login = comment_payload.get("author_login")
-        author_type = comment_payload.get("author_type") or "unknown"
-
-    markers = extract_directive_markers(comment_body)
-    directives = extract_directive_items(comment_body)
-    confidence = classify_directive_confidence(comment_body, markers)
-    boundary_flags_map = detect_boundary_flags(comment_body)
-    boundary_flag_names = [name for name, value in boundary_flags_map.items() if value]
-
-    issue_url = f"https://github.com/{repo}/issues/{issue_number}"
-
-    return {
-        "schema_version": "SCOPE_DELTA_AUTHORITY_EVIDENCE_V1",
-        "source_kind": "issue_comment",
-        "source_ref": anchor_url,
-        "source_issue_number": issue_number,
-        "comment_id": comment_payload.get("id"),
-        "comment_url": anchor_url,
-        "issue_url": issue_url,
-        "body_sha256": _sha256(comment_body),
-        "author_login": author_login,
-        "author_type": author_type,
-        "author_association": author_association,
-        "captured_at": captured_at,
-        "directive_markers": markers,
-        "extracted_directives": directives,
-        "ambiguity_flags": [] if confidence != "ambiguous" else ["structured_list_missing"],
-        "boundary_flags": boundary_flag_names,
-        "confidence": confidence,
-    }
