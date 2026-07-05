@@ -329,10 +329,22 @@ def _agy_completed_ok():
     )
 
 
+def _fail_gemini(*args, **kwargs):
+    raise AssertionError("_run_gemini must not be called for provider=agy")
+
+
 def test_agy_no_tools_fixture_run_delegation_result_shape(monkeypatch):
     module = load_module()
     request = json.loads((FIXTURES_DIR / "agy_no_tools_smoke_request.json").read_text(encoding="utf-8"))
-    monkeypatch.setattr(module, "_run_agy", lambda prompt, timeout_sec: _agy_completed_ok())
+    seen: dict[str, object] = {}
+
+    def _fake_run_agy(prompt, timeout_sec):
+        seen["prompt"] = prompt
+        seen["timeout_sec"] = timeout_sec
+        return _agy_completed_ok()
+
+    monkeypatch.setattr(module, "_run_gemini", _fail_gemini)
+    monkeypatch.setattr(module, "_run_agy", _fake_run_agy)
 
     result = module.run_delegation(request, request_path=FIXTURES_DIR / "agy_no_tools_smoke_request.json")
 
@@ -342,11 +354,24 @@ def test_agy_no_tools_fixture_run_delegation_result_shape(monkeypatch):
     assert result["transport"] == "agy"
     assert result["response_text"] == "LOOP_AGY_SMOKE_OK"
 
+    # PR #1345 fix_delta Blocker 1: pin provider isolation and prompt redaction.
+    assert seen["prompt"] == request["prompt"]
+    assert result["raw_command"] == ["agy", "-p", "<prompt>"]
+    assert request["prompt"] not in json.dumps(result, ensure_ascii=False)
+
 
 def test_agy_proposal_only_fixture_run_delegation_result_shape(monkeypatch):
     module = load_module()
     request = json.loads((FIXTURES_DIR / "agy_proposal_only_smoke_request.json").read_text(encoding="utf-8"))
-    monkeypatch.setattr(module, "_run_agy", lambda prompt, timeout_sec: _agy_completed_ok())
+    seen: dict[str, object] = {}
+
+    def _fake_run_agy(prompt, timeout_sec):
+        seen["prompt"] = prompt
+        seen["timeout_sec"] = timeout_sec
+        return _agy_completed_ok()
+
+    monkeypatch.setattr(module, "_run_gemini", _fail_gemini)
+    monkeypatch.setattr(module, "_run_agy", _fake_run_agy)
 
     result = module.run_delegation(request, request_path=FIXTURES_DIR / "agy_proposal_only_smoke_request.json")
 
@@ -355,3 +380,8 @@ def test_agy_proposal_only_fixture_run_delegation_result_shape(monkeypatch):
     assert result["safety_mode"] == "degraded_wrapper_only"
     assert result["transport"] == "agy"
     assert result["response_text"] == "LOOP_AGY_SMOKE_OK"
+
+    # PR #1345 fix_delta Blocker 1: pin provider isolation and prompt redaction.
+    assert seen["prompt"] == request["prompt"]
+    assert result["raw_command"] == ["agy", "-p", "<prompt>"]
+    assert request["prompt"] not in json.dumps(result, ensure_ascii=False)

@@ -943,3 +943,15 @@ def test_agy_empty_stdout_warning_matches_failure_class_in_ci():
         result = rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None)
     assert result["failure_class"] == "agy_output_missing"
     assert result["warnings"][0].startswith("agy_output_missing")
+
+
+def test_agy_empty_stdout_warning_matches_failure_class_when_ci_unset(monkeypatch):
+    """PR #1345 fix_delta Blocker 2: CI unset (not merely empty) must also take the
+    non-CI (agy_empty_stdout) branch, distinct from the CI="" case already covered
+    by test_agy_empty_stdout_warning_matches_failure_class above."""
+    monkeypatch.delenv("CI", raising=False)
+    completed = _make_completed(0, stdout="")
+    result = rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None)
+
+    assert result["failure_class"] == "agy_empty_stdout"
+    assert result["warnings"][0].startswith("agy_empty_stdout")
