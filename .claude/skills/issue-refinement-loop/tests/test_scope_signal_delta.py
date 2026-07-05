@@ -17,6 +17,7 @@ FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "scope_signal_delt
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 delta = importlib.import_module("scope_signal_delta")
+plan = importlib.import_module("plan_refinement_loop")
 
 
 def _load_fixture(name: str) -> dict:
@@ -123,3 +124,92 @@ def test_invalid_input_contract(payload: dict, message: str):
     result = _run_cli(payload)
     assert result.returncode == 2
     assert message in result.stderr
+
+
+# --- Issue #1327 iteration-2 (B1/B2/B4): nested-prefix / cross-implementation ---
+# regression coverage for _extract_in_scope_layers() itself (not only the
+# plan_refinement_loop.py legacy fallback subprocess path).
+
+_B1_PREFIXES = (".claude/", "docs/", "src/", "scripts/", "tests/", ".github/")
+
+
+def test_nested_prefix_not_double_counted_in_delta_helper():
+    """B1-1: before already has `.claude`; after adds a single path token that
+    also contains `tests/` as an embedded substring
+    (`.claude/skills/foo/tests/test_bar.py`). `tests` must not appear in
+    added_layers because the token itself does not start with `tests/`."""
+    payload = _load_fixture("nested_prefix_not_double_counted")
+    result = delta.compute_scope_signal_delta(payload)
+    added_layers = result["sections"]["in_scope"]["added_layers"]
+    assert "tests" not in added_layers
+    assert added_layers == []
+    assert result["legacy_scope_signal_guard"]["triggered"] is False
+    assert result["legacy_scope_signal_guard"]["reason_code"] == "no_scope_signal"
+
+
+def test_single_nested_token_with_empty_before_yields_claude_layer_only():
+    """B1-2: before is empty; after has only the single nested path token.
+    The resulting after-side layer set must be exactly {".claude"}, not
+    {".claude", "tests"}."""
+    payload = _load_fixture("single_token_no_before")
+    result = delta.compute_scope_signal_delta(payload)
+    after_layers = set(result["sections"]["in_scope"]["after_layers"])
+    assert after_layers == {".claude"}
+    assert "tests" not in after_layers
+
+
+def test_fenced_code_nested_path_ignored_in_scope_section():
+    """B1-3: a nested path mentioned only inside a fenced code block within
+    the In Scope section must not be extracted as a layer at all."""
+    payload = _load_fixture("fenced_code_nested_path_ignored_in_scope")
+    result = delta.compute_scope_signal_delta(payload)
+    assert result["sections"]["in_scope"]["before_layers"] == []
+    assert result["sections"]["in_scope"]["after_layers"] == []
+    assert result["sections"]["in_scope"]["added_layers"] == []
+    assert result["legacy_scope_signal_guard"]["triggered"] is False
+    assert result["legacy_scope_signal_guard"]["reason_code"] == "no_scope_signal"
+
+
+def test_multiple_independent_tokens_same_bullet_triggers_in_delta_helper():
+    """B4 (delta side): a single bullet referencing two independent path
+    tokens (`.claude/skills/foo` and `docs/foo.md`) must still trigger
+    new_in_scope_area (true-positive must not be broken by the nested-prefix
+    fix)."""
+    payload = _load_fixture("multiple_independent_tokens_same_bullet")
+    result = delta.compute_scope_signal_delta(payload)
+    after_layers = set(result["sections"]["in_scope"]["after_layers"])
+    assert after_layers == {".claude", "docs"}
+    assert result["legacy_scope_signal_guard"]["triggered"] is True
+    assert result["legacy_scope_signal_guard"]["reason_code"] == "new_in_scope_area"
+
+
+@pytest.mark.parametrize(
+    ("line", "expected_layers"),
+    [
+        (
+            "- `.claude/skills/foo/tests/test_bar.py` の配置を確認する",
+            {".claude"},
+        ),
+        (
+            "- `.claude/skills/foo` と `docs/foo.md` を更新する",
+            {".claude", "docs"},
+        ),
+        (
+            "| `.claude/skills/foo` | done | 備考 |",
+            {".claude"},
+        ),
+    ],
+)
+def test_legacy_fallback_and_delta_helper_tokenization_agree(
+    line: str, expected_layers: set[str]
+):
+    """B2: plan_refinement_loop.py's legacy fallback tokenizer
+    (`_line_layer_prefixes`) and scope_signal_delta.py's delta helper
+    tokenizer (`_extract_in_scope_layers` via `PATH_TOKEN_RE`) must agree on
+    the set of layer prefixes extracted from the same In Scope line,
+    including markdown table rows that contain `|` delimiters."""
+    legacy_layers = {p.rstrip("/") for p in plan._line_layer_prefixes(line, _B1_PREFIXES)}
+    delta_items = delta._extract_in_scope_layers(f"## In Scope\n{line}\n")
+    delta_layers = {item["value"] for item in delta_items}
+    assert legacy_layers == expected_layers
+    assert delta_layers == expected_layers
