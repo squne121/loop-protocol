@@ -2033,26 +2033,35 @@ def run_checks(
 
 
 def fetch_issue_body(issue_number: int, repo: str) -> tuple[str, str, str]:
-    """Fetch issue body, labels, and title from GitHub."""
+    """Fetch issue body, labels, and title from GitHub.
+
+    Uses plain --json output (parsed as JSON) rather than --jq string
+    concatenation: gh's --jq raw-string rendering appends its own trailing
+    newline to the output, which previously landed inside the extracted body
+    unless stripped -- and stripping silently diverged body_sha256 from the
+    canonical raw-body hash used by contract_readiness_check.py /
+    run_refinement_preflight.py, causing spurious body_sha_mismatch in
+    reviewer_claim_replay.
+    """
     cmd = [
         "gh", "issue", "view", str(issue_number),
         "--repo", repo,
         "--json", "title,body,labels",
-        "--jq", '.title + "\n---LABELS---\n" + (.labels | map(.name) | join(",")) + "\n---BODY---\n" + .body',
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"ERROR: gh issue view failed: {result.stderr}", file=sys.stderr)
         sys.exit(2)
 
-    output = result.stdout
-    parts = output.split("\n---LABELS---\n", 1)
-    title = parts[0].strip() if parts else ""
-    rest = parts[1] if len(parts) > 1 else ""
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: gh issue view returned invalid JSON: {exc}", file=sys.stderr)
+        sys.exit(2)
 
-    label_parts = rest.split("\n---BODY---\n", 1)
-    labels = label_parts[0].strip() if label_parts else ""
-    body = label_parts[1].strip() if len(label_parts) > 1 else ""
+    title = payload.get("title") or ""
+    body = payload.get("body") or ""
+    labels = ",".join(label.get("name", "") for label in payload.get("labels") or [])
 
     return body, labels, title
 
