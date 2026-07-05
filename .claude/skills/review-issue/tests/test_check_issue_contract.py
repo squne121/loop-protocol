@@ -1310,3 +1310,57 @@ No docs/product scope.
             "not_applicable requires decision=pass" in issue
             for issue in result.blocking_issues
         )
+
+
+class TestFetchIssueBodyRawParity:
+    """PR #1342 review fix: fetch_issue_body() は gh --json の body field を
+    そのまま返し、raw body hash (contract_readiness_check.py 等が使う
+    canonical hash) と一致すること（trailing newline を .strip() で
+    削除しない）。"""
+
+    def test_fetch_issue_body_preserves_raw_body_trailing_newline(self, monkeypatch):
+        import hashlib
+
+        body = "line1\nline2\n"
+        payload = {
+            "title": "T",
+            "body": body,
+            "labels": [{"name": "enhancement"}, {"name": "phase/implementation"}],
+        }
+
+        def fake_run(*args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args[0],
+                returncode=0,
+                stdout=json.dumps(payload, ensure_ascii=False) + "\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(checker.subprocess, "run", fake_run)
+
+        fetched_body, labels, title = checker.fetch_issue_body(
+            1261,
+            "squne121/loop-protocol",
+        )
+
+        assert fetched_body == body
+        assert labels == "enhancement,phase/implementation"
+        assert title == "T"
+        assert checker._sha256_prefixed(fetched_body) == (
+            "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+        )
+
+    def test_fetch_issue_body_rejects_non_object_json(self, monkeypatch):
+        def fake_run(*args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args[0],
+                returncode=0,
+                stdout=json.dumps([1, 2, 3]) + "\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(checker.subprocess, "run", fake_run)
+
+        with pytest.raises(SystemExit) as exc_info:
+            checker.fetch_issue_body(1261, "squne121/loop-protocol")
+        assert exc_info.value.code == 2

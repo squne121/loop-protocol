@@ -2059,9 +2059,18 @@ def fetch_issue_body(issue_number: int, repo: str) -> tuple[str, str, str]:
         print(f"ERROR: gh issue view returned invalid JSON: {exc}", file=sys.stderr)
         sys.exit(2)
 
+    if not isinstance(payload, dict):
+        print("ERROR: gh issue view returned non-object JSON", file=sys.stderr)
+        sys.exit(2)
+
+    raw_labels = payload.get("labels") or []
+    if not isinstance(raw_labels, list):
+        print("ERROR: gh issue view labels field is not a list", file=sys.stderr)
+        sys.exit(2)
+
     title = payload.get("title") or ""
     body = payload.get("body") or ""
-    labels = ",".join(label.get("name", "") for label in payload.get("labels") or [])
+    labels = ",".join(label.get("name", "") for label in raw_labels)
 
     return body, labels, title
 
