@@ -31,6 +31,32 @@ from skill_runtime_command_policy import (
 )
 
 
+# Volatile roots that other concurrent local sessions/agents may legitimately
+# write to while this executor's own child command is running. Changes under
+# these roots must never be attributed to the child command's own subprocess
+# (Issue #1343): the executor only ever runs a single child process whose own
+# allowed writes are scoped to the target issue's artifact root, so any other
+# concurrent repo-wide drift under these roots is peer-session noise, not a
+# self-write violation.
+_VOLATILE_PEER_SESSION_ROOT_RELS = (
+    ".claude/worktrees",
+    ".claude/artifacts/issue-refinement-loop",
+)
+
+
+def _volatile_peer_session_roots(project_root: str) -> list[Path]:
+    root = Path(project_root)
+    return [root / Path(rel) for rel in _VOLATILE_PEER_SESSION_ROOT_RELS]
+
+
+def _is_volatile_peer_session_path(rel_path: str) -> bool:
+    normalized = rel_path.replace(os.sep, "/")
+    for prefix in _VOLATILE_PEER_SESSION_ROOT_RELS:
+        if normalized == prefix or normalized.startswith(prefix + "/"):
+            return True
+    return False
+
+
 def _is_symlink_path(path: Path) -> bool:
     current = Path(path.anchor) if path.is_absolute() else Path()
     for part in path.parts:
@@ -96,6 +122,7 @@ def _git_status_paths(project_root: str) -> set[str]:
 def _snapshot_repo_paths(project_root: str, issue_number: str) -> dict[str, tuple[str, int, int]]:
     root = Path(project_root)
     allowed_root = _allowed_artifact_root(project_root, issue_number)
+    peer_roots = _volatile_peer_session_roots(project_root)
     allowed_parent_dirs: set[Path] = set()
     for parent in allowed_root.parents:
         allowed_parent_dirs.add(parent)
@@ -113,9 +140,19 @@ def _snapshot_repo_paths(project_root: str, issue_number: str) -> dict[str, tupl
             for name in dirnames
             if (current_path / name) != root / ".git"
         ]
+        # Prune volatile peer-session roots entirely so that concurrent
+        # local sessions/agents writing under them are never walked into
+        # (and therefore never contribute snapshot drift for this command).
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if (current_path / name) not in peer_roots
+        ]
         for name in ["."] + dirnames + filenames:
             path = current_path if name == "." else current_path / name
             if path == root / ".git":
+                continue
+            if path in peer_roots:
                 continue
             if path == allowed_root or path.is_relative_to(allowed_root):
                 continue
@@ -281,6 +318,7 @@ def _find_unauthorized_repo_changes(
         path
         for path in (after_status - before_status)
         if not _is_under_allowed_artifact_root(project_root, issue_number, path)
+        and not _is_volatile_peer_session_path(path)
     }
     if new_status_paths:
         return sorted(
