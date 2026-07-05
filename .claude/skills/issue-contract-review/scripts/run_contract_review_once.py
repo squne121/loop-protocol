@@ -57,8 +57,28 @@ if str(_EVALUATE_PRODUCT_SPEC_GATE_PY) not in sys.path:
 
 from evaluate_product_spec_gate import evaluate_product_spec_payload  # noqa: E402
 
-# VC_PREFLIGHT_TIMEOUT_SECS: baseline_vc_preflight may take up to 120s per VC
-_VC_PREFLIGHT_TIMEOUT = 180
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+# Issue #1333 AC2/AC3: baseline_vc_preflight.py の DEFAULT_TIMEOUT_SECONDS を
+# import し、per-command timeout の単一の正本として参照する（drift防止）。
+from baseline_vc_preflight import DEFAULT_TIMEOUT_SECONDS as _VC_PREFLIGHT_PER_COMMAND_TIMEOUT  # noqa: E402
+
+# Issue #1333 AC2: _VC_PREFLIGHT_TIMEOUT は per-command timeout の named
+# constant から関係式として導出する（単純な独立リテラル引き上げは禁止）。
+# _VC_PREFLIGHT_MAX_COMMAND_BUDGET: Issue #1333 の暫定的な wrapper timeout
+# budget（直列実行の想定上限コマンド数）。Issue #1328 のような、同一の重い
+# VC コマンドが多数の AC から重複参照される構造への根本対策（dedup/replay・
+# bounded parallel execution による総実行時間削減）は Issue #1338 で扱う。
+# 本定数は #1328 型のケースを timeout 側だけで完全に吸収することを意図した
+# ものではない。
+# _VC_PREFLIGHT_OVERHEAD_SECONDS: subprocess 起動・JSON parse 等の固定オーバーヘッド。
+_VC_PREFLIGHT_MAX_COMMAND_BUDGET = 6
+_VC_PREFLIGHT_OVERHEAD_SECONDS = 60
+_VC_PREFLIGHT_TIMEOUT = (
+    _VC_PREFLIGHT_PER_COMMAND_TIMEOUT * _VC_PREFLIGHT_MAX_COMMAND_BUDGET
+    + _VC_PREFLIGHT_OVERHEAD_SECONDS
+)
 _DEFAULT_TIMEOUT = 30
 
 _IDEMPOTENCY_MARKER_PREFIX = "<!-- loop-protocol:contract-review-once"
@@ -434,6 +454,8 @@ def run_once(
             str(issue_number),
             "--repo",
             repo,
+            "--timeout-seconds",
+            str(_VC_PREFLIGHT_PER_COMMAND_TIMEOUT),
         ],
         timeout=_VC_PREFLIGHT_TIMEOUT,
     )
