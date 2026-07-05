@@ -47,6 +47,18 @@ Environment overrides (fixture mode only):
   SRRS_LAT_MANAGED_HOOK         'present' | 'absent' | 'unknown'
   SRRS_LAT_BACKUP_CREDENTIAL    'present' | 'absent' | 'unknown'
   SRRS_LAT_LSTAT_STATE          'normal' | 'unsafe_metadata' | 'unknown'
+
+  #1261 distribution evidence / argv exposure / remote cleanup gate overrides:
+  SRRS_LAT_RESOLUTION_SOURCE       'local_lockfile' | 'project_local_install' | 'npm_cache'
+                                   | 'global_install' | 'npx_only' | 'unknown'
+  SRRS_LAT_RESOLVED_REGISTRY_ORIGIN  '<url>' | 'unknown'
+  SRRS_LAT_LOCKFILE_DIGEST         'sha256:<64hex>' | '' (empty = not set)
+  SRRS_LAT_TARBALL_SHA256         'sha256:<64hex>' | '' (empty = not set)
+  SRRS_LAT_ENTRYPOINT_SHA256       'sha256:<64hex>' | '' (empty = not set)
+  SRRS_LAT_PRELOAD_SHA256          'sha256:<64hex>' | '' (empty = not set)
+  SRRS_LAT_HOOK_COMMAND_SHA256     'sha256:<64hex>' | '' (empty = not set)
+  SRRS_LAT_ARGV_EXPOSURE_STATE     'absent_verified' | 'possible' | 'unknown'
+  SRRS_LAT_REMOTE_CLEANUP_STATE    'machine_verified' | 'human_attested' | 'unknown'
 """
 from __future__ import annotations
 
@@ -82,6 +94,25 @@ RC_DIAGNOSTIC_LOGGING = "latitude_diagnostic_logging_enabled"
 RC_EXPOSURE_POSSIBLE = "latitude_exposure_possible_or_confirmed"
 RC_WINDOWS_HOST = "latitude_windows_host_not_inspected"
 RC_SRRS_OVERRIDE_REJECTED = "latitude_srrs_override_rejected"
+# #1261: distribution / argv exposure / remote cleanup evidence gate reason codes
+RC_NPX_ONLY_UNPINNED = "latitude_npx_only_without_exact_version"
+RC_RESOLUTION_SOURCE_UNKNOWN = "latitude_resolution_source_unknown"
+RC_ARGV_EXPOSURE_STATE_UNKNOWN = "latitude_argv_exposure_state_unknown"
+RC_REMOTE_CLEANUP_NOT_MACHINE_VERIFIED = "latitude_remote_cleanup_state_not_machine_verified"
+RC_HOOK_COMMAND_DIGEST_MISSING = "latitude_hook_command_digest_missing"
+
+# #1261: closed enums for the Latitude distribution / argv exposure / remote
+# cleanup evidence gate (LATITUDE_DISTRIBUTION_GATE_V1, docs/dev/secret-policy.md).
+RESOLUTION_SOURCE_ENUM = {
+    "local_lockfile",
+    "project_local_install",
+    "npm_cache",
+    "global_install",
+    "npx_only",
+    "unknown",
+}
+ARGV_EXPOSURE_STATE_ENUM = {"absent_verified", "possible", "unknown"}
+REMOTE_CLEANUP_STATE_ENUM = {"machine_verified", "human_attested", "unknown"}
 
 # Known Latitude hook command patterns (for presence detection)
 _LATITUDE_HOOK_PATTERNS = [
@@ -814,27 +845,68 @@ def check_settings_backup(
 
 
 def check_distribution(repo_root: Path, execution_profile: str) -> dict[str, Any]:
-    """AC9, AC26: Check Latitude package distribution integrity."""
+    """AC9, AC26, #1261: Check Latitude package distribution integrity and evidence.
+
+    #1261: adds resolution_source (closed enum), resolved_registry_origin,
+    lockfile_digest, tarball_sha256, installed_entrypoint_sha256, preload_sha256
+    and hook_command_sha256 to the distribution evidence, matching the
+    LATITUDE_DISTRIBUTION_GATE_V1 shape documented in docs/dev/secret-policy.md.
+    """
     dist_spec_override = _get_env_override("SRRS_LAT_DIST_SPEC")
     integrity_override = _get_env_override("SRRS_LAT_DIST_INTEGRITY")
     provenance_override = _get_env_override("SRRS_LAT_DIST_PROVENANCE")
+    resolution_source_override = _get_env_override("SRRS_LAT_RESOLUTION_SOURCE")
+    registry_origin_override = _get_env_override("SRRS_LAT_RESOLVED_REGISTRY_ORIGIN")
+    lockfile_digest_override = _get_env_override("SRRS_LAT_LOCKFILE_DIGEST")
+    tarball_override = _get_env_override("SRRS_LAT_TARBALL_SHA256")
+    entrypoint_override = _get_env_override("SRRS_LAT_ENTRYPOINT_SHA256")
+    preload_override = _get_env_override("SRRS_LAT_PRELOAD_SHA256")
+    hook_command_override = _get_env_override("SRRS_LAT_HOOK_COMMAND_SHA256")
+
+    # #1261: the new evidence overrides are only asserted when a caller opts in
+    # by setting at least one of them, so pre-existing callers that only use the
+    # legacy SRRS_LAT_DIST_SPEC/INTEGRITY/PROVENANCE overrides keep their prior
+    # reason_codes (no unrelated regression).
+    new_evidence_overrides = [
+        resolution_source_override, registry_origin_override, lockfile_digest_override,
+        tarball_override, entrypoint_override, preload_override, hook_command_override,
+    ]
+    new_evidence_requested = any(v is not None for v in new_evidence_overrides)
 
     if (dist_spec_override is not None
             or integrity_override is not None
-            or provenance_override is not None):
+            or provenance_override is not None
+            or new_evidence_requested):
         spec = (dist_spec_override or "unknown").strip()
         integrity = (integrity_override or "unknown").strip()
         provenance = (provenance_override or "unknown").strip()
+        resolution_source = (resolution_source_override or "unknown").strip()
+        if resolution_source not in RESOLUTION_SOURCE_ENUM:
+            resolution_source = "unknown"
+        registry_origin = (registry_origin_override or "unknown").strip()
+        lockfile_digest = lockfile_digest_override.strip() if lockfile_digest_override else None
+        tarball_sha256 = tarball_override.strip() if tarball_override else None
+        installed_entrypoint_sha256 = entrypoint_override.strip() if entrypoint_override else None
+        preload_sha256 = preload_override.strip() if preload_override else None
+        hook_command_sha256 = hook_command_override.strip() if hook_command_override else None
 
         # B4 fix: use _is_version_pinned for correct scoped package handling
         is_unpinned = spec in ("unpinned", "unknown") or not _is_version_pinned(spec)
         provenance_unknown = provenance == "unknown"
+        is_npx_only = resolution_source == "npx_only"
 
         reason_codes = []
         if is_unpinned:
             reason_codes.append(RC_DISTRIBUTION_UNPINNED)
         if provenance_unknown:
             reason_codes.append(RC_DISTRIBUTION_PROVENANCE_UNKNOWN)
+        if new_evidence_requested:
+            if is_npx_only and is_unpinned:
+                reason_codes.append(RC_NPX_ONLY_UNPINNED)
+            if resolution_source_override is not None and resolution_source == "unknown":
+                reason_codes.append(RC_RESOLUTION_SOURCE_UNKNOWN)
+            if not hook_command_sha256:
+                reason_codes.append(RC_HOOK_COMMAND_DIGEST_MISSING)
 
         result_state = "unpinned" if is_unpinned else (
             "unverified" if provenance_unknown else "verified"
@@ -847,13 +919,20 @@ def check_distribution(repo_root: Path, execution_profile: str) -> dict[str, Any
             "registry_signature_verified": (integrity == "verified"),
             "provenance_verified": (provenance == "verified"),
             "provenance_source_ref": None,
+            "resolved_registry_origin": registry_origin if registry_origin != "unknown" else None,
+            "resolution_source": resolution_source,
+            "lockfile_digest": lockfile_digest,
+            "tarball_sha256": tarball_sha256,
+            "installed_entrypoint_sha256": installed_entrypoint_sha256,
+            "preload_sha256": preload_sha256,
+            "hook_command_sha256": hook_command_sha256,
             "reason_codes": reason_codes,
             "checked_surfaces": ["package_distribution"],
         }
 
     # B4 fix: In host mode, attempt to check npm/npx for actual Latitude package
     if execution_profile == "host":
-        return _check_distribution_host()
+        return _check_distribution_host(repo_root)
 
     return {
         "state": "not_installed",
@@ -862,66 +941,118 @@ def check_distribution(repo_root: Path, execution_profile: str) -> dict[str, Any
         "registry_signature_verified": None,
         "provenance_verified": None,
         "provenance_source_ref": None,
+        "resolved_registry_origin": None,
+        "resolution_source": "unknown",
+        "lockfile_digest": None,
+        "tarball_sha256": None,
+        "installed_entrypoint_sha256": None,
+        "preload_sha256": None,
+        "hook_command_sha256": None,
         "reason_codes": [],
         "checked_surfaces": ["package_distribution"],
     }
 
 
-def _check_distribution_host() -> dict[str, Any]:
-    """B4: Check Latitude distribution in host mode via npm/npx."""
-    inspection_gaps: list[str] = []
-    state = "unknown"
-    reason_codes: list[str] = []
+_LAT_PACKAGES = (
+    "@latitude-data/claude-code-telemetry",
+    "@latitude-so/claude-code",
+    "latitude-claude",
+)
 
-    # Try npm list to check if Latitude package is installed globally
-    lat_packages = [
-        "@latitude-data/claude-code-telemetry",
-        "@latitude-so/claude-code",
-        "latitude-claude",
-    ]
+
+def _classify_resolution_source_host(repo_root: Path, pkg: str) -> str:
+    """#1261: best-effort, presence-only classification of npm resolution source.
+
+    Never reads shell history / terminal scrollback. Only inspects repo-local
+    lockfiles, repo-local node_modules, and npm's own cache/global-install
+    inventory commands (subprocess, stdout not forwarded to caller).
+    """
+    for lockfile_name in ("package-lock.json", "npm-shrinkwrap.json"):
+        lockfile = repo_root / lockfile_name
+        if lockfile.is_file():
+            try:
+                text = lockfile.read_text(encoding="utf-8", errors="replace")
+                if pkg in text:
+                    return "local_lockfile"
+            except OSError:
+                pass
+
+    if (repo_root / "node_modules" / pkg).is_dir():
+        return "project_local_install"
+
+    try:
+        result = subprocess.run(
+            ["npm", "cache", "ls", pkg],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0 and pkg in (result.stdout or ""):
+            return "npm_cache"
+    except (OSError, FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    try:
+        result = subprocess.run(
+            ["npm", "list", "-g", "--depth=0", "--json", pkg],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0 and pkg in (result.stdout or ""):
+            return "global_install"
+    except (OSError, FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    return "unknown"
+
+
+def _check_distribution_host(repo_root: Path | None = None) -> dict[str, Any]:
+    """B4, #1261: Check Latitude distribution in host mode.
+
+    Classifies resolution_source from repo-local evidence only (lockfile /
+    node_modules / npm cache / global install). Cryptographic evidence
+    (registry signature, provenance attestation, tarball/entrypoint/preload/
+    hook-command digests) is not computed here (requires real registry
+    network access and an isolated install tree, out of scope for this
+    checker) and stays None/fail-closed, matching the fail-closed contract:
+    unknown evidence must never be treated as verified.
+    """
+    root = repo_root if repo_root is not None else Path.cwd()
+    inspection_gaps = ["registry_signature", "provenance_attestation",
+                        "tarball_sha256", "installed_entrypoint_sha256",
+                        "preload_sha256", "hook_command_sha256"]
 
     found_spec = None
-    for pkg in lat_packages:
-        try:
-            result = subprocess.run(
-                ["npm", "list", "-g", "--depth=0", "--json", pkg],
-                capture_output=True, text=True, timeout=15,
-            )
-            if result.returncode == 0 and pkg in (result.stdout or ""):
-                # Package found globally
-                found_spec = pkg
-                break
-        except (OSError, FileNotFoundError, subprocess.TimeoutExpired):
-            inspection_gaps.append("npm_global_list")
+    resolution_source = "unknown"
+    for pkg in _LAT_PACKAGES:
+        source = _classify_resolution_source_host(root, pkg)
+        if source != "unknown":
+            found_spec = pkg
+            resolution_source = source
+            break
 
-    if found_spec is None:
-        # Not found via npm list — mark as unknown (could be npx-only)
-        state = "unknown"
-        reason_codes.append(RC_RUNTIME_STATE_UNKNOWN)
-        inspection_gaps.append("package_distribution")
-        return {
-            "state": state,
-            "package_spec": None,
-            "dist_integrity": None,
-            "registry_signature_verified": None,
-            "provenance_verified": None,
-            "provenance_source_ref": None,
-            "reason_codes": reason_codes,
-            "checked_surfaces": [],
-            "inspection_gaps": inspection_gaps,
-        }
-
-    return {
+    base = {
         "state": "unknown",
         "package_spec": found_spec,
         "dist_integrity": None,
         "registry_signature_verified": None,
         "provenance_verified": None,
         "provenance_source_ref": None,
-        "reason_codes": [RC_RUNTIME_STATE_UNKNOWN],
+        "resolved_registry_origin": None,
+        "resolution_source": resolution_source,
+        "lockfile_digest": None,
+        "tarball_sha256": None,
+        "installed_entrypoint_sha256": None,
+        "preload_sha256": None,
+        "hook_command_sha256": None,
         "checked_surfaces": ["package_distribution"],
-        "inspection_gaps": ["registry_signature", "provenance_attestation"],
+        "inspection_gaps": inspection_gaps,
     }
+
+    if found_spec is None:
+        base["reason_codes"] = [RC_RUNTIME_STATE_UNKNOWN, RC_RESOLUTION_SOURCE_UNKNOWN]
+        base["inspection_gaps"] = ["package_distribution"] + inspection_gaps
+    else:
+        base["reason_codes"] = [RC_RUNTIME_STATE_UNKNOWN]
+
+    return base
 
 
 def check_destination_transport(execution_profile: str) -> dict[str, Any]:
@@ -1008,28 +1139,60 @@ def check_destination_transport(execution_profile: str) -> dict[str, Any]:
 
 
 def check_argv_credential(execution_profile: str) -> dict[str, Any]:
-    """AC28: Detect if credential was passed via argv."""
+    """AC28, #1261 AC5: Detect if credential was passed via argv.
+
+    #1261: exposes `argv_exposure_state` as its own closed-enum field
+    (absent_verified | possible | unknown), independent of the legacy
+    `state` key kept for backward compatibility with existing callers.
+    """
+    exposure_override = _get_env_override("SRRS_LAT_ARGV_EXPOSURE_STATE")
+    if exposure_override is not None:
+        state = exposure_override.strip()
+        if state not in ARGV_EXPOSURE_STATE_ENUM:
+            state = "unknown"
+        rcs = [RC_EXPOSURE_POSSIBLE] if state == "possible" else (
+            [RC_ARGV_EXPOSURE_STATE_UNKNOWN] if state == "unknown" else []
+        )
+        return {"state": state, "argv_exposure_state": state, "reason_codes": rcs}
+
     override = _get_env_override("SRRS_LAT_ARGV_CREDENTIAL")
     if override is not None:
-        state = override.strip()
-        rcs = [RC_EXPOSURE_POSSIBLE] if state == "present" else []
-        return {"state": state, "reason_codes": rcs}
+        legacy_state = override.strip()
+        state = "possible" if legacy_state == "present" else "absent_verified"
+        rcs = [RC_EXPOSURE_POSSIBLE] if state == "possible" else []
+        return {"state": state, "argv_exposure_state": state, "reason_codes": rcs}
 
     # B1 fix: only read real /proc in host mode
     if execution_profile != "host":
-        return {"state": "unknown", "reason_codes": [RC_RUNTIME_STATE_UNKNOWN]}
+        return {
+            "state": "unknown",
+            "argv_exposure_state": "unknown",
+            "reason_codes": [RC_RUNTIME_STATE_UNKNOWN],
+        }
 
     try:
         cmdline = Path("/proc/self/cmdline").read_bytes().decode("utf-8", errors="replace")
         for arg in cmdline.split("\0"):
             if re.match(r"--api[-_]?key", arg, re.IGNORECASE):
-                return {"state": "possible", "reason_codes": [RC_EXPOSURE_POSSIBLE]}
+                return {
+                    "state": "possible",
+                    "argv_exposure_state": "possible",
+                    "reason_codes": [RC_EXPOSURE_POSSIBLE],
+                }
             if re.match(r"--latitude[-_]?key", arg, re.IGNORECASE):
-                return {"state": "possible", "reason_codes": [RC_EXPOSURE_POSSIBLE]}
+                return {
+                    "state": "possible",
+                    "argv_exposure_state": "possible",
+                    "reason_codes": [RC_EXPOSURE_POSSIBLE],
+                }
     except OSError:
-        return {"state": "unknown", "reason_codes": [RC_RUNTIME_STATE_UNKNOWN]}
+        return {
+            "state": "unknown",
+            "argv_exposure_state": "unknown",
+            "reason_codes": [RC_RUNTIME_STATE_UNKNOWN],
+        }
 
-    return {"state": "absent", "reason_codes": []}
+    return {"state": "absent_verified", "argv_exposure_state": "absent_verified", "reason_codes": []}
 
 
 def check_containment_and_exposure(execution_profile: str) -> dict[str, Any]:
@@ -1125,6 +1288,29 @@ def check_remote_trace(execution_profile: str) -> dict[str, Any]:
         return {"state": state, "reason_codes": rcs}
     # Default: unknown (requires human attestation)
     return {"state": "unknown", "reason_codes": [RC_REMOTE_TRACE_UNKNOWN]}
+
+
+def check_remote_cleanup_state(execution_profile: str) -> dict[str, Any]:
+    """#1261 AC7: provider-side retention/delete verification.
+
+    Independent of `remote_trace_state` (which answers "is there a trace"):
+    `remote_cleanup_state` answers "has provider-side retention/delete been
+    machine-verified". `human_attested` is NOT a substitute for
+    `machine_verified` (docs/dev/secret-policy.md). No provider API
+    integration exists yet, so the unoverridden default is `unknown`
+    (fail-closed) and carries no reason_code by itself — the strict
+    real-pilot preflight predicate is what enforces the block for
+    Cloud pilot close readiness.
+    """
+    del execution_profile  # no execution-profile-specific real check exists yet
+    override = _get_env_override("SRRS_LAT_REMOTE_CLEANUP_STATE")
+    if override is not None:
+        state = override.strip()
+        if state not in REMOTE_CLEANUP_STATE_ENUM:
+            state = "unknown"
+        rcs = [] if state == "machine_verified" else [RC_REMOTE_CLEANUP_NOT_MACHINE_VERIFIED]
+        return {"state": state, "reason_codes": rcs}
+    return {"state": "unknown", "reason_codes": []}
 
 
 def check_secrets_mode_policy(
@@ -1303,6 +1489,7 @@ def check_latitude_component(
     containment_exposure = check_containment_and_exposure(execution_profile)
     uninstall = check_uninstall_state(repo_root, execution_profile, home_root)
     remote_trace = check_remote_trace(execution_profile)
+    remote_cleanup = check_remote_cleanup_state(execution_profile)
 
     # B6: policy mode check
     policy_check = check_secrets_mode_policy(repo_root, cred["state"])
@@ -1326,7 +1513,8 @@ def check_latitude_component(
     # Collect all reason codes
     all_rcs: list[str] = []
     for sub in [cred, hook, preload, proc, local_storage, backup, argv,
-                containment_exposure, uninstall, remote_trace, policy_check]:
+                containment_exposure, uninstall, remote_trace, remote_cleanup,
+                policy_check]:
         all_rcs.extend(sub.get("reason_codes", []))
     all_rcs.extend(dist.get("reason_codes", []))
     all_rcs.extend(dest_transport.get("reason_codes", []))
@@ -1386,16 +1574,25 @@ def check_latitude_component(
         "exposure_state": containment_exposure["exposure_state"],
         "uninstall_state": uninstall["state"],
         "remote_trace_state": remote_trace["state"],
+        # #1261: argv_exposure_state / remote_cleanup_state are independent,
+        # closed-enum top-level fields consumed by the strict real-pilot
+        # preflight predicate (direct field assertion, not summary-only).
+        "argv_exposure_state": argv.get("argv_exposure_state", argv.get("state", "unknown")),
+        "remote_cleanup_state": remote_cleanup["state"],
         "distribution": {
+            "state": dist.get("state"),
             "package_spec": dist.get("package_spec"),
             "dist_integrity": dist.get("dist_integrity"),
             "registry_signature_verified": dist.get("registry_signature_verified"),
             "provenance_verified": dist.get("provenance_verified"),
             "provenance_source_ref": dist.get("provenance_source_ref"),
-            "tarball_sha256": None,
-            "installed_entrypoint_sha256": None,
-            "preload_sha256": None,
-            "resolution_source": "unknown",
+            "resolved_registry_origin": dist.get("resolved_registry_origin"),
+            "resolution_source": dist.get("resolution_source", "unknown"),
+            "lockfile_digest": dist.get("lockfile_digest"),
+            "tarball_sha256": dist.get("tarball_sha256"),
+            "installed_entrypoint_sha256": dist.get("installed_entrypoint_sha256"),
+            "preload_sha256": dist.get("preload_sha256"),
+            "hook_command_sha256": dist.get("hook_command_sha256"),
         },
         "reason_codes": all_rcs,
         "checked_surfaces": all_surfaces,

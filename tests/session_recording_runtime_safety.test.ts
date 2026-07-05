@@ -918,6 +918,70 @@ describe('runtime safety #1157: AC9 distribution unpinned', () => {
 })
 
 // ============================================================================
+// #1261 AC1/AC2/AC3/AC4: distribution evidence completeness + resolution_source
+// closed enum + npx_only_without_exact_version reason code.
+// ============================================================================
+
+describe('runtime safety #1261: distribution evidence fields are surfaced directly', () => {
+  it('GIVEN full distribution evidence overrides WHEN verifier runs THEN all evidence fields are echoed on components.latitude.distribution', () => {
+    const result = runVerifierJson({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_DIST_SPEC: 'npx @latitude-data/claude-code-telemetry@1.2.3',
+      SRRS_LAT_DIST_INTEGRITY: 'verified',
+      SRRS_LAT_DIST_PROVENANCE: 'verified',
+      SRRS_LAT_RESOLUTION_SOURCE: 'local_lockfile',
+      SRRS_LAT_RESOLVED_REGISTRY_ORIGIN: 'https://registry.npmjs.org',
+      SRRS_LAT_LOCKFILE_DIGEST: `sha256:${'1'.repeat(64)}`,
+      SRRS_LAT_TARBALL_SHA256: `sha256:${'2'.repeat(64)}`,
+      SRRS_LAT_ENTRYPOINT_SHA256: `sha256:${'3'.repeat(64)}`,
+      SRRS_LAT_PRELOAD_SHA256: `sha256:${'4'.repeat(64)}`,
+      SRRS_LAT_HOOK_COMMAND_SHA256: `sha256:${'5'.repeat(64)}`,
+      SRRS_LAT_ARGV_EXPOSURE_STATE: 'absent_verified',
+      SRRS_LAT_REMOTE_CLEANUP_STATE: 'machine_verified',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const dist = lat?.['distribution'] as Record<string, unknown>
+    expect(dist?.['resolution_source']).toBe('local_lockfile')
+    expect(dist?.['resolved_registry_origin']).toBe('https://registry.npmjs.org')
+    expect(dist?.['lockfile_digest']).toBe(`sha256:${'1'.repeat(64)}`)
+    expect(dist?.['tarball_sha256']).toBe(`sha256:${'2'.repeat(64)}`)
+    expect(dist?.['installed_entrypoint_sha256']).toBe(`sha256:${'3'.repeat(64)}`)
+    expect(dist?.['preload_sha256']).toBe(`sha256:${'4'.repeat(64)}`)
+    expect(dist?.['hook_command_sha256']).toBe(`sha256:${'5'.repeat(64)}`)
+    expect(lat?.['argv_exposure_state']).toBe('absent_verified')
+    expect(lat?.['remote_cleanup_state']).toBe('machine_verified')
+  })
+
+  it('GIVEN resolution_source=npx_only AND unpinned spec WHEN verifier runs THEN latitude_npx_only_without_exact_version reason code present', () => {
+    const result = runVerifierJson({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_DIST_SPEC: 'npx -y @latitude-data/claude-code-telemetry',
+      SRRS_LAT_DIST_INTEGRITY: 'unknown',
+      SRRS_LAT_DIST_PROVENANCE: 'unknown',
+      SRRS_LAT_RESOLUTION_SOURCE: 'npx_only',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('npx_only_without_exact_version'))).toBe(true)
+    const dist = lat?.['distribution'] as Record<string, unknown>
+    expect(dist?.['resolution_source']).toBe('npx_only')
+  })
+
+  it('GIVEN resolution_source not in closed enum WHEN verifier runs THEN it is normalized to unknown (AC4 closed enum)', () => {
+    const result = runVerifierJson({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_DIST_SPEC: 'npx @latitude-data/claude-code-telemetry@1.2.3',
+      SRRS_LAT_DIST_INTEGRITY: 'verified',
+      SRRS_LAT_DIST_PROVENANCE: 'verified',
+      SRRS_LAT_RESOLUTION_SOURCE: 'totally_bogus_source',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const dist = lat?.['distribution'] as Record<string, unknown>
+    expect(dist?.['resolution_source']).toBe('unknown')
+  })
+})
+
+// ============================================================================
 // AC10: no credential values in stdout/JSON
 // ============================================================================
 
@@ -1698,10 +1762,19 @@ function makeStrictPreflightFixture(
       latitude: {
         verdict: 'safe',
         inspection_complete: true,
+        argv_exposure_state: 'absent_verified',
+        remote_cleanup_state: 'machine_verified',
         distribution: {
           state: 'verified',
           registry_signature_verified: true,
           provenance_verified: true,
+          resolution_source: 'local_lockfile',
+          resolved_registry_origin: 'https://registry.npmjs.org',
+          lockfile_digest: `sha256:${'b'.repeat(64)}`,
+          tarball_sha256: `sha256:${'c'.repeat(64)}`,
+          installed_entrypoint_sha256: `sha256:${'d'.repeat(64)}`,
+          preload_sha256: `sha256:${'e'.repeat(64)}`,
+          hook_command_sha256: `sha256:${'f'.repeat(64)}`,
         },
       },
     },
@@ -2149,6 +2222,112 @@ describe('runtime safety #1258: latitude:real-pilot:preflight strict gate', () =
     }))
     expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
     expect(result.json?.['verdict']).toBe('fail_closed')
+  })
+
+  // ==========================================================================
+  // #1261: distribution evidence completeness / argv exposure / remote cleanup
+  // direct field assertions (AC1, AC2, AC3, AC4, AC5, AC7).
+  // ==========================================================================
+
+  it('GIVEN resolution_source=unknown (AC4 closed enum, unresolved) WHEN strict predicate runs THEN fail_closed', () => {
+    const positive = makeStrictPreflightFixture() as { components: { latitude: Record<string, unknown> } }
+    const baseDist = positive.components.latitude['distribution'] as Record<string, unknown>
+    const result = runPreflightPredicate(makeStrictPreflightFixture({
+      components: {
+        latitude: {
+          ...positive.components.latitude,
+          distribution: { ...baseDist, resolution_source: 'unknown' },
+        },
+      },
+    }))
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(result.json?.['decision']).toBe('deny')
+    expect(result.json?.['verdict']).toBe('fail_closed')
+  })
+
+  it('GIVEN resolution_source not in the closed enum (AC4 drift) WHEN strict predicate runs THEN fail_closed', () => {
+    const positive = makeStrictPreflightFixture() as { components: { latitude: Record<string, unknown> } }
+    const baseDist = positive.components.latitude['distribution'] as Record<string, unknown>
+    const result = runPreflightPredicate(makeStrictPreflightFixture({
+      components: {
+        latitude: {
+          ...positive.components.latitude,
+          distribution: { ...baseDist, resolution_source: 'not_a_real_enum_value' },
+        },
+      },
+    }))
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(result.json?.['verdict']).toBe('fail_closed')
+  })
+
+  for (const missingField of [
+    'resolved_registry_origin',
+    'lockfile_digest',
+    'tarball_sha256',
+    'installed_entrypoint_sha256',
+    'preload_sha256',
+    'hook_command_sha256',
+  ]) {
+    it(`GIVEN ${missingField} missing (AC3 evidence completeness) WHEN strict predicate runs THEN fail_closed`, () => {
+      const positive = makeStrictPreflightFixture() as { components: { latitude: Record<string, unknown> } }
+      const baseDist = { ...(positive.components.latitude['distribution'] as Record<string, unknown>) }
+      delete baseDist[missingField]
+      const result = runPreflightPredicate(makeStrictPreflightFixture({
+        components: {
+          latitude: { ...positive.components.latitude, distribution: baseDist },
+        },
+      }))
+      expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+      expect(result.json?.['verdict']).toBe('fail_closed')
+    })
+  }
+
+  for (const badArgvState of ['possible', 'unknown']) {
+    it(`GIVEN argv_exposure_state=${badArgvState} (AC5) WHEN strict predicate runs THEN fail_closed`, () => {
+      const positive = makeStrictPreflightFixture() as { components: { latitude: Record<string, unknown> } }
+      const result = runPreflightPredicate(makeStrictPreflightFixture({
+        components: {
+          latitude: { ...positive.components.latitude, argv_exposure_state: badArgvState },
+        },
+      }))
+      expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+      expect(result.json?.['decision']).toBe('deny')
+      expect(result.json?.['verdict']).toBe('fail_closed')
+    })
+  }
+
+  for (const badCleanupState of ['human_attested', 'unknown']) {
+    it(`GIVEN remote_cleanup_state=${badCleanupState} (AC7, human_attested is not a substitute for machine_verified) WHEN strict predicate runs THEN fail_closed`, () => {
+      const positive = makeStrictPreflightFixture() as { components: { latitude: Record<string, unknown> } }
+      const result = runPreflightPredicate(makeStrictPreflightFixture({
+        components: {
+          latitude: { ...positive.components.latitude, remote_cleanup_state: badCleanupState },
+        },
+      }))
+      expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+      expect(result.json?.['decision']).toBe('deny')
+      expect(result.json?.['verdict']).toBe('fail_closed')
+    })
+  }
+
+  it('GIVEN unpinned npx invocation with no distribution digests (AC1, AC2 npx_only_without_exact_version) WHEN real-pilot env flow runs THEN blocked or fail_closed (never allow)', () => {
+    const result = runRealPilotPreflight({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_PILOT_DECISION: 'approve_timeboxed_real_pilot',
+      SRRS_LAT_PILOT_MARKER_COUNT: '1',
+      SRRS_LAT_PILOT_ACTIVATION_FIELDS: 'complete',
+      SRRS_LAT_PILOT_DIST_DIGESTS: 'complete',
+      SRRS_LAT_PILOT_REMOTE_CLEANUP: 'machine_verified',
+      SRRS_LAT_PILOT_ARGV_EXPOSURE: 'absent_verified',
+      // floating npx invocation, no version pin at all
+      SRRS_LAT_DIST_SPEC: 'npx -y @latitude-data/claude-code-telemetry',
+      SRRS_LAT_DIST_INTEGRITY: 'unknown',
+      SRRS_LAT_DIST_PROVENANCE: 'unknown',
+      SRRS_LAT_RESOLUTION_SOURCE: 'npx_only',
+    })
+    expect(result.json?.['decision']).not.toBe('allow')
+    expect(['blocked', 'fail_closed']).toContain(result.json?.['verdict'])
+    expect(result.exitCode).not.toBe(EXIT_PASS)
   })
 })
 

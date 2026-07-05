@@ -1087,8 +1087,34 @@ def _is_truthy(value: Any) -> bool:
     return value is True
 
 
+# #1261: closed enum for the distribution resolution_source field. Kept in sync
+# with .claude/scripts/lib/latitude_telemetry_safety.RESOLUTION_SOURCE_ENUM
+# (duplicated here so this module has no import-time dependency on lib/ for
+# the --preflight-input-json self-contained re-evaluation mode).
+_RESOLUTION_SOURCE_ENUM = {
+    "local_lockfile",
+    "project_local_install",
+    "npm_cache",
+    "global_install",
+    "npx_only",
+    "unknown",
+}
+
+
+def _evidence_sha256_ok(value: Any) -> bool:
+    """#1261: True iff value is a well-formed `sha256:<64hex>` digest string."""
+    return isinstance(value, str) and SOURCE_DIGEST_SHA256_RE.fullmatch(value) is not None
+
+
 def _evaluate_real_pilot_preflight_output(output: dict[str, Any]) -> tuple[str, int, bool]:
-    """Evaluate a single verifier JSON object as the strict real-pilot predicate."""
+    """Evaluate a single verifier JSON object as the strict real-pilot predicate.
+
+    #1261: direct field assertion over Latitude distribution / argv exposure /
+    remote cleanup evidence. A single summary field (`distribution.state`)
+    is no longer sufficient by itself — every required evidence field is
+    asserted directly so that missing/unknown lower-level evidence cannot be
+    hidden behind a `verified` summary state.
+    """
     execution_profile = output.get("execution_profile")
     verdict = output.get("verdict")
     policy = output.get("policy")
@@ -1116,6 +1142,16 @@ def _evaluate_real_pilot_preflight_output(output: dict[str, Any]) -> tuple[str, 
         and SOURCE_DIGEST_SHA256_RE.fullmatch(source_digest) is not None
     )
     pilot_reason_codes_ok = isinstance(pilot_reason_codes, list) and len(pilot_reason_codes) == 0
+
+    resolution_source = dist.get("resolution_source")
+    resolution_source_ok = (
+        isinstance(resolution_source, str)
+        and resolution_source in _RESOLUTION_SOURCE_ENUM
+        and resolution_source != "unknown"
+    )
+    argv_exposure_state = latitude.get("argv_exposure_state")
+    remote_cleanup_state = latitude.get("remote_cleanup_state")
+
     preflight_ready = all([
         output.get("decision") == "allow",
         output.get("verdict") == "safe",
@@ -1131,6 +1167,21 @@ def _evaluate_real_pilot_preflight_output(output: dict[str, Any]) -> tuple[str, 
         dist.get("state") == "verified",
         dist.get("registry_signature_verified") is True,
         dist.get("provenance_verified") is True,
+        # #1261 AC3/AC4: distribution evidence must be complete, not just a
+        # verified summary state.
+        resolution_source_ok,
+        isinstance(dist.get("resolved_registry_origin"), str)
+        and bool(dist.get("resolved_registry_origin")),
+        isinstance(dist.get("lockfile_digest"), str) and bool(dist.get("lockfile_digest")),
+        _evidence_sha256_ok(dist.get("tarball_sha256")),
+        _evidence_sha256_ok(dist.get("installed_entrypoint_sha256")),
+        _evidence_sha256_ok(dist.get("preload_sha256")),
+        _evidence_sha256_ok(dist.get("hook_command_sha256")),
+        # #1261 AC5: argv_exposure_state must be positively cleared.
+        argv_exposure_state == "absent_verified",
+        # #1261 AC7: remote_cleanup_state must be machine-verified
+        # (human_attested is explicitly NOT a substitute).
+        remote_cleanup_state == "machine_verified",
     ])
 
     if preflight_ready:

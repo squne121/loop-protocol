@@ -319,8 +319,16 @@ real session 開始可否（`real_session_start_gate`）の正本は、`docs/dev
   Claude Code hook は matching する全 hook が並列実行されるため、hook の通過を activation 証明にしない。
 - `latitude:real-pilot:preflight` は上記 host verifier JSON を strict mode で再評価する
   sole real-pilot pre-session gate であり、`decision: allow` 単独や fixture PASS を allow 根拠にしない。
-- `latitude:real-pilot:preflight` は #1261 完了まで distribution / argv / remote cleanup evidence を
-  充足済みとみなさず、blocked または fail_closed のまま維持する。
+- `latitude:real-pilot:preflight`（#1261 実装後）は `components.latitude.distribution.state` の
+  summary field だけでなく、`resolution_source`（closed enum・`unknown` 不可）、
+  `resolved_registry_origin`、`lockfile_digest`、`tarball_sha256`、`installed_entrypoint_sha256`、
+  `preload_sha256`、`hook_command_sha256`（すべて `sha256:<64hex>`）、
+  `components.latitude.argv_exposure_state`（`absent_verified` 必須）、
+  `components.latitude.remote_cleanup_state`（`machine_verified` 必須、`human_attested` は代替不可）を
+  直接 assert する。host mode の real npm registry signature / provenance attestation 検証と
+  installed entrypoint / preload / hook command の実 sha256 計算、provider-side retention の
+  real machine verification は follow-up Issue の対象であり、それまでは host 実行時にこれらの
+  evidence field が `unknown` / `None` のまま fail-closed になる（false-green にはならない）。
 - `security:session-recording` は CI / policy / smoke bundle であり、host readiness proof ではない。
 - `security:session-recording:host` は pre-activation local preflight 専用であり、
   `SRRS_*` override を reject する。generic CI required gate には組み込まない。
