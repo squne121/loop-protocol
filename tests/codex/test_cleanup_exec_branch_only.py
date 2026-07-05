@@ -20,6 +20,11 @@ AC7: extra unmerged local-only files (outside the squashed merge commit) -> reje
 AC8: missing/null mergeCommit -> fail-closed, no squash-equivalence fallback attempted
 AC9: verified dict carries additive head_equivalence_* / pr_merge_commit_oid /
      local_delta_paths_count fields without changing head_oid_match semantics
+
+PR #1344 review follow-up (P1/P2 hardening):
+- branch-only destructive path squash-equivalence coverage (P1 blocker 3)
+- merge-commit-object-missing / git-error / non-squash (2+ parent) commit
+  fail-closed regressions (P2)
 """
 
 from __future__ import annotations
@@ -1006,6 +1011,52 @@ def repo_for_squash_equivalence(tmp_path):
         )
 
 
+@pytest.fixture
+def repo_branch_only_for_squash_equivalence(tmp_path):
+    """Branch-only state repo combined with a squash-mergeable feature branch (PR #1344 P1 blocker 3).
+
+    Same shape as ``repo_for_squash_equivalence`` but the linked worktree is
+    removed after the feature commit lands, leaving a branch-only state (the
+    worktree is absent from both disk and the git catalog, while
+    refs/heads/<branch_name> still exists) — exactly the destructive path
+    exercised by ``verify_branch_only_cleanup_authorization`` /
+    ``_perform_branch_only``.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git("init", "-q", "-b", "main", cwd=root)
+    _git("config", "user.email", "t@t.com", cwd=root)
+    _git("config", "user.name", "T", cwd=root)
+    _git("remote", "add", "origin", "https://github.com/squne121/loop-protocol.git", cwd=root)
+    (root / "shared.txt").write_text("base v1\n")
+    _git("add", "shared.txt", cwd=root)
+    _git("commit", "-q", "-m", "seed", cwd=root)
+
+    branch_name = "issue-1337-branch-only-feature"
+    wt_parent = root / ".claude" / "worktrees"
+    wt_parent.mkdir(parents=True, exist_ok=True)
+    wt_path = wt_parent / branch_name
+    _git("worktree", "add", "-q", "-b", branch_name, str(wt_path), "main", cwd=root)
+    (wt_path / "feature.txt").write_text("feature-A\n")
+    _git("add", "feature.txt", cwd=wt_path)
+    _git("commit", "-q", "-m", "add feature", cwd=wt_path)
+    local_tip = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", f"refs/heads/{branch_name}"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    # Remove worktree so branch exists but worktree is gone (branch-only state).
+    _git("worktree", "remove", str(wt_path), cwd=root)
+    assert not wt_path.exists(), "worktree should have been removed"
+
+    yield {
+        "root": str(root),
+        "branch_name": branch_name,
+        "local_tip": local_tip,
+        "worktree_path": str(wt_path),
+    }
+
+
 def _commit_on_main(root, filename, content, message):
     (Path(root) / filename).write_text(content)
     _git("add", filename, cwd=root)
@@ -1182,3 +1233,186 @@ def test_verified_dict_contains_additive_head_equivalence_fields(
     # exact-SHA comparison only, so it stays False for a squash-equivalence
     # authorized case (headRefOid != local branch tip by construction here).
     assert verified["head_oid_match"] is False
+
+
+# ─── PR #1344 review follow-up: branch-only destructive path coverage (P1 blocker 3) ──
+
+
+class TestBranchOnlySquashEquivalence:
+    """PR #1344 P1 blocker 3: squash-equivalence must be directly exercised on the
+    destructive branch-only path (verify_branch_only_cleanup_authorization /
+    _perform_branch_only), not only via verify_cleanup_authorization."""
+
+    def test_verify_branch_only_accepts_squash_merge_path_scoped_match(
+        self, repo_branch_only_for_squash_equivalence
+    ):
+        """GIVEN branch-only state + squash commit with matching content WHEN verified THEN authorized."""
+        repo = repo_branch_only_for_squash_equivalence
+        merge_commit_oid = _commit_on_main(
+            repo["root"], "feature.txt", "feature-A\n", "squash: add feature (#1337)"
+        )
+        fake_pr = _make_merged_pr(repo["branch_name"], "f" * 40, linked_issue=1337)
+        fake_pr["mergeCommit"] = {"oid": merge_commit_oid}
+        req = _make_req(repo, linked_issue=1337)
+
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            ok, reason, verified = verify_branch_only_cleanup_authorization(
+                req, repo["root"], Deadline(30.0)
+            )
+
+        assert ok is True, f"Expected authorized, reason={reason}, verified={verified}"
+        assert verified["head_equivalence_authorized"] is True
+        assert verified["head_equivalence_mode"] == "squash_merge_delta_match"
+        assert verified["pr_merge_commit_oid"] == merge_commit_oid
+        assert verified["branch_only_force_delete_used"] is True
+
+    def test_verify_branch_only_rejects_squash_merge_content_mismatch(
+        self, repo_branch_only_for_squash_equivalence
+    ):
+        """GIVEN branch-only state + squash commit with DIFFERENT content WHEN verified THEN rejected."""
+        repo = repo_branch_only_for_squash_equivalence
+        merge_commit_oid = _commit_on_main(
+            repo["root"], "feature.txt", "feature-B (different)\n", "squash: add feature (#1337)"
+        )
+        fake_pr = _make_merged_pr(repo["branch_name"], "f" * 40, linked_issue=1337)
+        fake_pr["mergeCommit"] = {"oid": merge_commit_oid}
+        req = _make_req(repo, linked_issue=1337)
+
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            ok, reason, verified = verify_branch_only_cleanup_authorization(
+                req, repo["root"], Deadline(30.0)
+            )
+
+        assert ok is False
+        assert reason == HEAD_OID_MISMATCH
+        assert verified["head_equivalence_authorized"] is False
+        assert verified["branch_only_force_delete_used"] is False
+
+    def test_branch_only_run_deletes_branch_after_squash_equivalence(
+        self, repo_branch_only_for_squash_equivalence
+    ):
+        """GIVEN branch-only squash-equivalence authorized WHEN run() called THEN branch deleted, status ok."""
+        repo = repo_branch_only_for_squash_equivalence
+        merge_commit_oid = _commit_on_main(
+            repo["root"], "feature.txt", "feature-A\n", "squash: add feature (#1337)"
+        )
+        fake_pr = _make_merged_pr(repo["branch_name"], "f" * 40, linked_issue=1337)
+        fake_pr["mergeCommit"] = {"oid": merge_commit_oid}
+        req = _make_req(repo, linked_issue=1337)
+
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            result = run(req, project_root=repo["root"])
+
+        assert result["status"] == "ok", f"Expected ok, got: {result}"
+        assert result["actions_taken"] == [OP_BRANCH_DELETE]
+        assert result.get("branch_only") is True
+        check = subprocess.run(
+            ["git", "-C", repo["root"], "rev-parse", "--verify",
+             f"refs/heads/{repo['branch_name']}"],
+            capture_output=True,
+        )
+        assert check.returncode != 0, "Branch should have been deleted"
+
+
+# ─── PR #1344 review follow-up: fail-closed regressions for missing object / git error / non-squash (P2) ──
+
+
+def test_squash_merge_merge_commit_object_missing_rejects(repo_for_squash_equivalence):
+    """GIVEN mergeCommit.oid present but the commit object does NOT exist locally WHEN verified THEN fail-closed."""
+    repo = repo_for_squash_equivalence
+    fake_pr = _make_merged_pr(repo["branch_name"], "f" * 40, linked_issue=1337)
+    # A syntactically valid but non-existent commit SHA (never committed in this repo).
+    fake_pr["mergeCommit"] = {"oid": "0" * 40}
+    req = _make_req(repo, linked_issue=1337)
+
+    with (
+        patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+        patch.object(_ce, "_pr_state", return_value=fake_pr),
+    ):
+        ok, reason, verified = verify_cleanup_authorization(req, repo["root"], Deadline(30.0))
+
+    assert ok is False
+    assert reason == HEAD_OID_MISMATCH
+    assert verified["head_equivalence_authorized"] is False
+    assert verified["pr_merge_commit_oid"] == "0" * 40
+
+
+def test_squash_merge_git_diff_error_rejects(repo_for_squash_equivalence):
+    """GIVEN merge-base resolution errors during squash-equivalence resolution WHEN verified THEN fail-closed."""
+    repo = repo_for_squash_equivalence
+    merge_commit_oid = _commit_on_main(
+        repo["root"], "feature.txt", "feature-A\n", "squash: add feature (#1337)"
+    )
+    fake_pr = _make_merged_pr(repo["branch_name"], "f" * 40, linked_issue=1337)
+    fake_pr["mergeCommit"] = {"oid": merge_commit_oid}
+    req = _make_req(repo, linked_issue=1337)
+
+    # Simulate a git error during merge-base resolution (e.g. git process failure):
+    # _merge_bases returns None on git error, which must fail-closed rather than
+    # be treated as "zero bases" (already-rejected) or "one base" (proceed).
+    with (
+        patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+        patch.object(_ce, "_pr_state", return_value=fake_pr),
+        patch.object(_ce, "_merge_bases", return_value=None),
+    ):
+        ok, reason, verified = verify_cleanup_authorization(req, repo["root"], Deadline(30.0))
+
+    assert ok is False
+    assert reason == HEAD_OID_MISMATCH
+    assert verified["head_equivalence_authorized"] is False
+
+
+def test_non_squash_merge_commit_oid_mismatch_rejects_even_if_paths_match(
+    repo_for_squash_equivalence
+):
+    """GIVEN merge commit has 2+ parents (a normal merge, NOT a squash) WHEN verified THEN fail-closed,
+    even though its tree content happens to match the local branch's own paths."""
+    repo = repo_for_squash_equivalence
+    # Build a genuine two-parent merge commit on main whose feature.txt content
+    # matches the local branch's feature.txt content exactly (so if the code
+    # only checked path content, it would be wrongly authorized) — but it is
+    # NOT a squash commit (git rev-list --parents reports 2 parents).
+    other_branch = "unrelated-other-branch"
+    _git("checkout", "-b", other_branch, cwd=repo["root"])
+    (Path(repo["root"]) / "feature.txt").write_text("feature-A\n")
+    _git("add", "feature.txt", cwd=repo["root"])
+    _git("commit", "-q", "-m", "other branch adds same feature content", cwd=repo["root"])
+    _git("checkout", "main", cwd=repo["root"])
+    merge_result = subprocess.run(
+        ["git", "-C", repo["root"], "merge", "--no-ff", "-m", "merge other branch", other_branch],
+        capture_output=True, text=True,
+    )
+    assert merge_result.returncode == 0, f"merge failed: {merge_result.stderr}"
+    merge_commit_oid = subprocess.run(
+        ["git", "-C", repo["root"], "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    rev_list_tokens = subprocess.run(
+        ["git", "-C", repo["root"], "rev-list", "--parents", "-n", "1", merge_commit_oid],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip().split()
+    parent_count = len(rev_list_tokens) - 1  # first token is the commit itself
+    assert parent_count == 2, "sanity: must be a genuine 2-parent merge commit"
+
+    fake_pr = _make_merged_pr(repo["branch_name"], "f" * 40, linked_issue=1337)
+    fake_pr["mergeCommit"] = {"oid": merge_commit_oid}
+    req = _make_req(repo, linked_issue=1337)
+
+    with (
+        patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+        patch.object(_ce, "_pr_state", return_value=fake_pr),
+    ):
+        ok, reason, verified = verify_cleanup_authorization(req, repo["root"], Deadline(30.0))
+
+    assert ok is False, f"non-squash (2-parent) merge commit must fail-closed: {verified}"
+    assert reason == HEAD_OID_MISMATCH
+    assert verified["head_equivalence_authorized"] is False

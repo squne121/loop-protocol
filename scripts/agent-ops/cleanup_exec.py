@@ -27,6 +27,14 @@ cleanup state (worktree removed from both disk and catalog, branch still present
 and, if so, authorizes a ``git branch -D`` branch-only cleanup.
 ``verify_cleanup_authorization`` is NOT changed and ``materialize_cleanup_contract``
 cannot reach the branch-only verifier.
+
+Squash-merge head-OID equivalence (Issue #1337): GitHub squash merge always mints
+a brand-new commit SHA for the default branch, so ``headRefOid`` never equals the
+feature branch tip even when content is identical. ``_resolve_head_equivalence()``
+authorizes cleanup via delta-equivalence ONLY when the candidate merge commit is
+verified to be a genuine squash-shaped commit (object exists locally AND has
+EXACTLY ONE parent). Normal merge commits (2+ parents) always fail-closed to the
+existing exact-OID comparison.
 """
 
 from __future__ import annotations
@@ -185,58 +193,105 @@ def _pr_state(pr_number: int, project_root: str, repo_slug: str | None, deadline
         return None
 
 
-def _merge_base(
-    project_root: str, local_tip: str, default_branch: str, deadline: Deadline
-) -> str | None:
-    """Return the merge-base commit of ``local_tip`` and ``default_branch`` (Issue #1337).
+def _commit_object_exists(project_root: str, commit_oid: str, deadline: Deadline) -> bool:
+    """Return True iff ``commit_oid`` resolves to a real commit object locally (Issue #1337 P1).
 
-    Used to compute the path set the local branch introduced relative to where
-    it diverged from the default branch, BEFORE the (possible) squash merge.
+    Guards against treating an unresolvable/unknown ``mergeCommit.oid`` (e.g. the
+    local clone does not have the object, or GitHub returned something that is
+    not actually a commit) as a squash-equivalence candidate.
     """
     try:
-        out = _git(["-C", project_root, "merge-base", local_tip, default_branch], deadline, 10.0)
+        out = _git(["-C", project_root, "cat-file", "-e", f"{commit_oid}^{{commit}}"], deadline, 5.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return out.returncode == 0
+
+
+def _commit_parents(project_root: str, commit_oid: str, deadline: Deadline) -> list[str] | None:
+    """Return the parent SHAs of ``commit_oid`` via ``git rev-list --parents -n 1`` (Issue #1337 P1).
+
+    The output is ``"<commit> [parent...]"``; the first token is the commit
+    itself. Returns ``None`` on git error so callers fail-closed. A squash
+    commit (or any normal single-parent commit) has exactly ONE parent; a
+    normal (non-squash) merge commit has TWO OR MORE.
+    """
+    try:
+        out = _git(["-C", project_root, "rev-list", "--parents", "-n", "1", commit_oid], deadline, 10.0)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else None
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+    tokens = out.stdout.strip().split()
+    return tokens[1:]
+
+
+def _merge_bases(project_root: str, ref_a: str, ref_b: str, deadline: Deadline) -> list[str] | None:
+    """Return ALL merge-base commits between ``ref_a`` and ``ref_b`` (Issue #1337 P1).
+
+    ``git merge-base`` can report more than one best common ancestor for
+    criss-crossed histories. Callers must fail-closed unless there is EXACTLY
+    ONE merge-base, since the path-set computation below assumes a single,
+    unambiguous origin point.
+    """
+    try:
+        out = _git(["-C", project_root, "merge-base", "--all", ref_a, ref_b], deadline, 10.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    return [line for line in out.stdout.splitlines() if line.strip()]
 
 
 def _squash_equivalence_path_set(
     project_root: str, merge_base: str, local_tip: str, deadline: Deadline
 ) -> list[str] | None:
-    """Return the path set changed by the local branch (``merge_base..local_tip``)."""
+    """Return the path set changed by the local branch (``merge_base..local_tip``).
+
+    Issue #1337 P1 fix: uses ``git diff --name-only -z`` (NUL-separated output)
+    instead of ``--name-only`` + ``splitlines()`` so filenames containing
+    newlines or other special characters are handled correctly.
+    """
     try:
         out = _git(
-            ["-C", project_root, "diff", "--name-only", f"{merge_base}..{local_tip}"],
+            ["-C", project_root, "diff", "--name-only", "-z", merge_base, local_tip],
             deadline, 15.0,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
     if out.returncode != 0:
         return None
-    return [line for line in out.stdout.splitlines() if line]
+    return [p for p in out.stdout.split("\0") if p]
 
 
 def _squash_content_matches(
     project_root: str, merge_commit_oid: str, local_tip: str, paths: list[str], deadline: Deadline
-) -> bool:
+) -> bool | None:
     """Return True iff ``local_tip`` and ``merge_commit_oid`` agree on ``paths``.
 
     Restricted to ``paths`` (the local branch's own delta) so unrelated base
     changes or unrelated other-PR content never affect the comparison — this is
     the fix for the squash-merge false-positive ``pr_head_oid_mismatch`` (Issue #1337).
+
+    Issue #1337 P1 fix: uses ``git diff --quiet --no-ext-diff`` instead of
+    ``--name-only`` + empty-stdout inspection. Exit code 0 means the paths
+    match, 1 means they differ, and any other exit code is a git error — the
+    caller must fail-closed (``None``) rather than treat it as a mismatch or
+    a match.
     """
     if not paths:
         return False
     try:
         out = _git(
-            ["-C", project_root, "diff", "--name-only", merge_commit_oid, local_tip, "--", *paths],
+            ["-C", project_root, "diff", "--quiet", "--no-ext-diff", local_tip, merge_commit_oid, "--", *paths],
             deadline, 15.0,
         )
     except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode == 0:
+        return True
+    if out.returncode == 1:
         return False
-    if out.returncode != 0:
-        return False
-    return out.stdout.strip() == ""
+    return None
 
 
 def _resolve_head_equivalence(
@@ -248,10 +303,20 @@ def _resolve_head_equivalence(
     default branch, so ``headRefOid`` (really the merge commit) never equals the
     feature branch tip even when content is identical. This resolver keeps the
     existing exact-match fail-closed behavior for non-squash merges, and ONLY
-    attempts the squash-equivalence fallback when ``mergeCommit`` is present
-    (fail-closed otherwise). Returns ``(authorized, additive_fields)`` where
-    ``additive_fields`` always carries the four additive ``verified`` keys.
+    attempts the squash-equivalence fallback when ``mergeCommit`` is present AND
+    verified to be a genuine squash-shaped commit (object exists locally, exactly
+    ONE parent). A normal merge commit (2+ parents) always fails closed to
+    ``pr_head_oid_mismatch``, even if its ``oid`` happens to be present.
+
+    Returns ``(authorized, additive_fields)`` where ``additive_fields`` always
+    carries the four additive ``verified`` keys.
+
+    ``default_branch`` is retained in the signature for call-site compatibility
+    but is no longer used to compute the path-set origin (Issue #1337 P1 —
+    the origin is now the squash commit's own single parent, not the current
+    default branch tip).
     """
+    del default_branch  # no longer used — origin is the squash commit's own parent (P1 fix)
     additive: dict = {
         "head_equivalence_authorized": False,
         "head_equivalence_mode": None,
@@ -261,7 +326,9 @@ def _resolve_head_equivalence(
 
     head_ref_oid = pr.get("headRefOid")
     if local_tip and head_ref_oid and head_ref_oid == local_tip:
-        additive["head_equivalence_authorized"] = True
+        # Issue #1337 P2 fix: exact OID match is a literal comparison, not a
+        # squash-equivalence authorization — keep head_equivalence_authorized
+        # False and record the mode as exact_oid for diagnostics clarity.
         additive["head_equivalence_mode"] = "exact_oid"
         return True, additive
 
@@ -274,9 +341,28 @@ def _resolve_head_equivalence(
     if not local_tip or not merge_commit_oid:
         return False, additive
 
-    merge_base = _merge_base(project_root, local_tip, default_branch, deadline)
-    if not merge_base:
+    # Issue #1337 P1 fix: verify the merge commit object actually exists
+    # locally before treating it as a squash-equivalence candidate.
+    if not _commit_object_exists(project_root, merge_commit_oid, deadline):
         return False, additive
+
+    # Issue #1337 P1 fix: only commits with EXACTLY ONE parent are
+    # squash-equivalence candidates. A normal merge commit (2+ parents) must
+    # fail-closed rather than fall back to delta-equivalence.
+    parents = _commit_parents(project_root, merge_commit_oid, deadline)
+    if not parents or len(parents) != 1:
+        return False, additive
+    squash_parent = parents[0]
+
+    # Issue #1337 P1 fix: compute the path-set origin from the squash commit's
+    # own single parent, not the current default branch tip (which is
+    # default-branch-dependent and ambiguous with rewritten/rebased history).
+    # If more than one merge-base is reported, fail-closed rather than guess.
+    bases = _merge_bases(project_root, squash_parent, local_tip, deadline)
+    if not bases or len(bases) != 1:
+        return False, additive
+    merge_base = bases[0]
+
     paths = _squash_equivalence_path_set(project_root, merge_base, local_tip, deadline)
     if paths is None:
         return False, additive
@@ -284,7 +370,8 @@ def _resolve_head_equivalence(
     if not paths:
         # No local delta relative to merge_base — nothing to authorize on.
         return False, additive
-    if not _squash_content_matches(project_root, merge_commit_oid, local_tip, paths, deadline):
+    content_match = _squash_content_matches(project_root, merge_commit_oid, local_tip, paths, deadline)
+    if content_match is not True:
         return False, additive
 
     additive["head_equivalence_authorized"] = True
