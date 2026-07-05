@@ -824,11 +824,20 @@ def _rg_extract_path_operands(argv: List[str]) -> List[str]:
         "--threads", "-j",
         "--max-filesize",
         "--context-separator",
+        "-f", "--file",  # Issue #1328 Blocker 3: -f/--file PATTERNFILE is value-taking
         # NOTE: -l (--files-with-matches) is boolean, intentionally excluded here
     ])
 
+    # Issue #1328 Blocker 3: -f/--file PATTERNFILE supplies the pattern from a
+    # file, just like -e/--regexp supplies it inline. In both cases there is
+    # no positional PATTERN argument to skip, so all remaining positionals
+    # are PATH operands.
     explicit_pattern_given = any(
-        arg in ("-e", "--regexp") or arg.startswith("--regexp=") or (arg.startswith("-e") and len(arg) > 2)
+        arg in ("-e", "--regexp", "-f", "--file")
+        or arg.startswith("--regexp=")
+        or arg.startswith("--file=")
+        or (arg.startswith("-e") and len(arg) > 2)
+        or (arg.startswith("-f") and len(arg) > 2 and not arg.startswith("--"))
         for arg in argv[1:]
     )
 
@@ -2149,21 +2158,88 @@ def _is_rg_missing_path_error(stderr: str) -> bool:
     return _rg_stderr_indicates_missing_path(stderr) and not _rg_stderr_indicates_error_not_missing_path(stderr)
 
 
+def _normalize_repo_relative_path_strict(path: str) -> Optional[str]:
+    """Issue #1328 (OWNER Blocker 2): strict repo-relative POSIX path
+    normalization, mirroring `AllowedPathsMatcher.normalize_path()` in
+    `.claude/skills/pr-review-judge/scripts/allowed_paths_review_gate.py`.
+    Fail-closed: returns None (reject) for absolute paths, paths containing a
+    backslash, `..` segments, and empty segments (e.g. `docs//new/file.md`).
+    Reimplemented here (not imported) to keep this script's dependency
+    surface self-contained; the two normalization rules are covered by
+    parity tests and MUST stay in sync."""
+    if not path:
+        return None
+    if "\\" in path:
+        return None
+    if path.startswith("/"):
+        return None
+
+    normalized = path[2:] if path.startswith("./") else path
+    if normalized in ("", "."):
+        return None
+    segments = normalized.split("/")
+    if ".." in segments:
+        return None
+    if "" in segments:
+        return None
+    return normalized
+
+
 def _rg_path_operands_all_within_allowed_paths(path_operands: List[str], allowed_paths: List[str]) -> bool:
     """Issue #1328: True iff every rg path operand is equal to, or nested
     under, one of the (normalized) Allowed Paths. Empty path_operands ->
-    False (a broad/whole-repo search is never "within" Allowed Paths)."""
+    False (a broad/whole-repo search is never "within" Allowed Paths).
+
+    OWNER Blocker 2: both path operands and Allowed Paths entries are
+    normalized via `_normalize_repo_relative_path_strict()` (fail-closed);
+    absolute paths, backslashes, `..` segments, and empty segments are
+    rejected instead of being accepted via naive string-prefix matching."""
     if not path_operands:
         return False
-    norm_allowed = [p.strip().lstrip("./").rstrip("/") for p in allowed_paths if p.strip()]
+    norm_allowed: List[str] = []
+    for ap in allowed_paths:
+        candidate = ap.strip()
+        if not candidate:
+            continue
+        if candidate != "/":
+            candidate = candidate.rstrip("/")
+        normalized_ap = _normalize_repo_relative_path_strict(candidate)
+        if normalized_ap is not None:
+            norm_allowed.append(normalized_ap)
     if not norm_allowed:
         return False
 
     def _in_allowed(p: str) -> bool:
-        pp = p.strip().lstrip("./").rstrip("/")
-        return any(pp == a or pp.startswith(a + "/") for a in norm_allowed)
+        normalized_p = _normalize_repo_relative_path_strict(p)
+        if normalized_p is None:
+            return False
+        return any(normalized_p == a or normalized_p.startswith(a + "/") for a in norm_allowed)
 
     return all(_in_allowed(p) for p in path_operands)
+
+
+# Issue #1328 (OWNER Blocker 1): matches a single `rg` stderr line of the form
+# `rg: <path>: No such file or directory (os error 2)`, capturing <path>, so
+# the missing path(s) reported by rg can be compared against the argv path
+# operands (preventing false-green on multi-path invocations where one path
+# matched and produced stdout while a different path was missing).
+_RG_STDERR_MISSING_PATH_LINE = re.compile(
+    r"^rg:\s*(.+?):\s*No such file or directory(?:\s*\(os error 2\))?\s*$",
+    re.MULTILINE,
+)
+
+
+def _rg_stderr_extract_missing_paths(stderr: str) -> List[str]:
+    """Issue #1328 (OWNER Blocker 1): extract path(s) that rg reported as
+    missing directly from stderr lines matching `_RG_STDERR_MISSING_PATH_LINE`.
+    Returns raw (un-normalized) path strings in first-appearance order,
+    deduplicated. Returns an empty list if no such line is found."""
+    seen: List[str] = []
+    for m in _RG_STDERR_MISSING_PATH_LINE.finditer(stderr):
+        candidate = m.group(1).strip()
+        if candidate and candidate not in seen:
+            seen.append(candidate)
+    return seen
 
 
 def classify_result(
@@ -2322,7 +2398,18 @@ def classify_result(
     # deterministic expected_fail. This is a narrow special case: any
     # condition below not satisfied falls through to the existing branches
     # (usually the terminal Unknown fallback -> human_judgment).
-    if exit_code == 2 and static_policy_passed and allowed_paths:
+    # OWNER Blocker 1: additionally require stdout to be empty (no matches
+    # were found anywhere) AND require the stderr-reported missing path(s) to
+    # exactly match the full set of argv path operands. Without this, a
+    # multi-path invocation where one path matched (non-empty stdout) and a
+    # DIFFERENT path was missing would be misclassified as a deterministic
+    # baseline fail, even though the VC actually found a match.
+    if (
+        exit_code == 2
+        and static_policy_passed
+        and allowed_paths
+        and stdout.strip() == ""
+    ):
         try:
             _rg_argv_for_missing_path = shlex.split(command)
         except ValueError:
@@ -2333,13 +2420,30 @@ def classify_result(
                 _rg_path_operands_all_within_allowed_paths(_rg_path_operands, allowed_paths)
                 and _is_rg_missing_path_error(stderr)
             ):
-                return (
-                    "expected_fail",
-                    "new_file_missing_expected",
-                    "go",
-                    None,
-                    "baseline_fail_expected",
-                )
+                _rg_missing_from_stderr = _rg_stderr_extract_missing_paths(stderr)
+                _norm_operands = {
+                    n for n in (
+                        _normalize_repo_relative_path_strict(p) for p in _rg_path_operands
+                    ) if n is not None
+                }
+                _norm_missing = {
+                    n for n in (
+                        _normalize_repo_relative_path_strict(p) for p in _rg_missing_from_stderr
+                    ) if n is not None
+                }
+                # OWNER Blocker 1: the missing-path set reported by stderr must be
+                # non-empty and must equal (not merely overlap with) the full set
+                # of path operands -- either a single missing path, or every
+                # operand accounted for as missing. This rejects "one operand
+                # matched, a different operand was missing" false-green cases.
+                if _norm_missing and _norm_operands == _norm_missing:
+                    return (
+                        "expected_fail",
+                        "new_file_missing_expected",
+                        "go",
+                        None,
+                        "baseline_fail_expected",
+                    )
 
     # env_missing_dep: command not found (127), permission denied (126), ModuleNotFoundError, etc.
     if exit_code in (126, 127):

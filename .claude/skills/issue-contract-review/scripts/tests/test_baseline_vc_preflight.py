@@ -3047,3 +3047,159 @@ def test_rg_path_operands_all_within_allowed_paths_empty_operands_is_false():
     from baseline_vc_preflight import _rg_path_operands_all_within_allowed_paths
 
     assert _rg_path_operands_all_within_allowed_paths([], ["docs/new/file.md"]) is False
+
+
+# --- Issue #1328 follow-up (OWNER adversarial review): harden the false-green
+# boundary and align Allowed Paths containment with the existing fail-closed
+# gate grammar. ---
+
+
+def test_rg_exit2_with_stdout_match_and_missing_path_is_not_new_file_missing_expected():
+    """OWNER Blocker 1: a multi-path rg invocation where one path produced a
+    match (non-empty stdout) and a DIFFERENT path was missing must NOT be
+    classified as new_file_missing_expected. Issue #1328's AC1 only covers a
+    single new/missing Allowed Paths file with no matches anywhere; it must
+    not be broadened to "some paths matched, some were missing"."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="docs/allowed/existing.md:foo\n",
+        stderr="rg: docs/allowed/missing.md: No such file or directory (os error 2)",
+        command="rg foo docs/allowed/existing.md docs/allowed/missing.md",
+        allowed_paths=["docs/allowed/existing.md", "docs/allowed/missing.md"],
+        static_policy_passed=True,
+    )
+    assert category != "new_file_missing_expected", f"Unexpected new_file_missing_expected: {category}"
+
+
+def test_rg_exit2_partial_missing_among_multiple_allowed_paths_not_expected_fail():
+    """OWNER Blocker 1: even with empty stdout, if only SOME of the multiple
+    path operands are reported missing in stderr (not the full operand set),
+    the ambiguous case must not be classified as new_file_missing_expected."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="",
+        stderr="rg: docs/allowed/missing.md: No such file or directory (os error 2)",
+        command="rg foo docs/allowed/existing.md docs/allowed/missing.md",
+        allowed_paths=["docs/allowed/existing.md", "docs/allowed/missing.md"],
+        static_policy_passed=True,
+    )
+    assert category != "new_file_missing_expected", f"Unexpected new_file_missing_expected: {category}"
+
+
+def test_rg_exit2_missing_path_mismatched_with_argv_operand_not_expected_fail():
+    """OWNER Blocker 1: if the path reported missing in stderr does not match
+    the (single) argv path operand at all, do not classify as
+    new_file_missing_expected (defensive; should not normally occur but must
+    fail closed if it does)."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="",
+        stderr="rg: docs/allowed/other-file.md: No such file or directory (os error 2)",
+        command="rg foo docs/allowed/missing.md",
+        allowed_paths=["docs/allowed/missing.md", "docs/allowed/other-file.md"],
+        static_policy_passed=True,
+    )
+    assert category != "new_file_missing_expected", f"Unexpected new_file_missing_expected: {category}"
+
+
+def test_normalize_repo_relative_path_strict_rejects_unsafe_paths():
+    """OWNER Blocker 2: _normalize_repo_relative_path_strict() rejects
+    absolute paths, backslash-containing paths, '..' segments, and empty
+    segments, mirroring AllowedPathsMatcher.normalize_path() in
+    allowed_paths_review_gate.py."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _normalize_repo_relative_path_strict
+
+    assert _normalize_repo_relative_path_strict("docs/new/file.md") == "docs/new/file.md"
+    assert _normalize_repo_relative_path_strict("./docs/new/file.md") == "docs/new/file.md"
+    assert _normalize_repo_relative_path_strict("/docs/new/file.md") is None
+    assert _normalize_repo_relative_path_strict("../docs/new/file.md") is None
+    assert _normalize_repo_relative_path_strict("docs/../new/file.md") is None
+    assert _normalize_repo_relative_path_strict("docs\\new\\file.md") is None
+    assert _normalize_repo_relative_path_strict("docs//new/file.md") is None
+    assert _normalize_repo_relative_path_strict("") is None
+    assert _normalize_repo_relative_path_strict(".") is None
+
+
+def test_rg_exit2_allowed_paths_containment_rejects_traversal_and_absolute():
+    """OWNER Blocker 2: rg exit_code==2 against a path operand that is an
+    Allowed-Paths-adjacent traversal ('../') or absolute path must not be
+    classified as new_file_missing_expected, even if a naive string-prefix
+    match would have allowed it."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    # '..' traversal path operand
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="",
+        stderr="rg: docs/allowed/../new/file.md: No such file or directory (os error 2)",
+        command="rg foo docs/allowed/../new/file.md",
+        allowed_paths=["docs/allowed/../new/file.md"],
+        static_policy_passed=True,
+    )
+    assert category != "new_file_missing_expected", f"Unexpected new_file_missing_expected: {category}"
+
+    # empty-segment path operand (docs//new/file.md)
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="",
+        stderr="rg: docs//new/file.md: No such file or directory (os error 2)",
+        command="rg foo docs//new/file.md",
+        allowed_paths=["docs//new/file.md"],
+        static_policy_passed=True,
+    )
+    assert category != "new_file_missing_expected", f"Unexpected new_file_missing_expected: {category}"
+
+
+def test_rg_extract_path_operands_handles_file_flag():
+    """OWNER Blocker 3: -f/--file PATTERNFILE is a value-taking flag; its value
+    must not be misidentified as PATTERN or as a PATH operand, and the
+    trailing path operand must still be extracted correctly."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _rg_extract_path_operands
+
+    assert _rg_extract_path_operands(["rg", "-f", "patterns.txt", "docs/new/file.md"]) == ["docs/new/file.md"]
+    assert _rg_extract_path_operands(["rg", "--file", "patterns.txt", "docs/new/file.md"]) == ["docs/new/file.md"]
+    assert _rg_extract_path_operands(["rg", "--file=patterns.txt", "docs/new/file.md"]) == ["docs/new/file.md"]
+    # multiple -f occurrences (rg supports repeated -f) with multiple paths
+    assert _rg_extract_path_operands(
+        ["rg", "-f", "p1.txt", "-f", "p2.txt", "docs/a", "docs/b"]
+    ) == ["docs/a", "docs/b"]
+
+
+def test_rg_exit2_missing_file_via_file_flag_command_is_expected_fail():
+    """OWNER Blocker 3: end-to-end classify_result() check that a `rg -f
+    patterns.txt docs/new/file.md` command against a missing Allowed Paths
+    file is still classified new_file_missing_expected (the -f fix must not
+    regress the AC1 happy path when -f is used instead of an inline pattern)."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="",
+        stderr="rg: docs/new/file.md: No such file or directory (os error 2)",
+        command="rg -f patterns.txt docs/new/file.md",
+        allowed_paths=["docs/new/file.md"],
+        static_policy_passed=True,
+    )
+    assert classification == "expected_fail"
+    assert category == "new_file_missing_expected"
+    assert decision == "go"
