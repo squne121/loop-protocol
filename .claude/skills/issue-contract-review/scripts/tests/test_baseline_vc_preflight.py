@@ -2801,3 +2801,405 @@ def test_is_uv_runtime_smoke_rejects_duplicate_options():
         ["uv", "run", "--isolated", "--isolated", "--locked", "--no-default-groups", "python",
          "scripts/ci/runtime_dependency_smoke.py"]
     )
+
+
+# --- Issue #1328: rg exit_code==2 new-file-missing-Allowed-Path deterministic classification ---
+
+
+def test_ac1_rg_exit2_missing_file_in_allowed_paths_is_expected_fail():
+    """AC1: rg against a single new Allowed Paths file (missing) with exit_code 2
+    and a missing-path stderr is classified expected_fail/new_file_missing_expected/go."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="",
+        stderr="rg: docs/new/file.md: No such file or directory (os error 2)",
+        command="rg foo docs/new/file.md",
+        allowed_paths=["docs/new/file.md"],
+        static_policy_passed=True,
+    )
+    assert classification == "expected_fail", f"Expected expected_fail, got {classification}"
+    assert category == "new_file_missing_expected", f"Expected new_file_missing_expected, got {category}"
+    assert decision == "go", f"Expected go, got {decision}"
+    assert scope_class == "baseline_fail_expected"
+
+
+def test_ac2_rg_exit2_missing_file_outside_allowed_paths_not_expected_fail():
+    """AC2: if the missing path is outside Allowed Paths, do not classify as
+    new_file_missing_expected; remain human_judgment/blocked."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="",
+        stderr="rg: docs/new/file.md: No such file or directory (os error 2)",
+        command="rg foo docs/new/file.md",
+        allowed_paths=["docs/other/file.md"],
+        static_policy_passed=True,
+    )
+    assert category != "new_file_missing_expected", f"Unexpected new_file_missing_expected: {category}"
+    assert classification in ("human_judgment", "blocked"), (
+        f"Expected human_judgment or blocked, got {classification}"
+    )
+
+
+def test_ac3_rg_exit2_invalid_regex_not_expected_fail():
+    """AC3: rg invalid regex (unclosed group) exit_code 2 must not be classified
+    as new_file_missing_expected."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="",
+        stderr="rg: regex parse error:\n    (?:(unclosed)\n    ^\nerror: unclosed group",
+        command="rg '(?:(unclosed' docs/new/file.md",
+        allowed_paths=["docs/new/file.md"],
+        static_policy_passed=True,
+    )
+    assert category != "new_file_missing_expected", f"Unexpected new_file_missing_expected: {category}"
+    assert classification in ("human_judgment", "blocked"), (
+        f"Expected human_judgment or blocked, got {classification}"
+    )
+
+
+def test_ac4_rg_exit2_unsupported_option_not_expected_fail():
+    """AC4: rg unsupported option (unrecognized flag) exit_code 2 must not be
+    classified as new_file_missing_expected."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="",
+        stderr="rg: unrecognized flag --not-a-real-flag",
+        command="rg --not-a-real-flag foo docs/new/file.md",
+        allowed_paths=["docs/new/file.md"],
+        static_policy_passed=True,
+    )
+    assert category != "new_file_missing_expected", f"Unexpected new_file_missing_expected: {category}"
+    assert classification in ("human_judgment", "blocked"), (
+        f"Expected human_judgment or blocked, got {classification}"
+    )
+
+
+def test_ac5_rg_extract_path_operands_handles_flags_and_multiple_paths():
+    """AC5: _rg_extract_path_operands correctly extracts path operands from an
+    rg argv containing -e, --regexp, --glob, --, value-taking options, and
+    multiple paths (without misclassifying flag values as paths)."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _rg_extract_path_operands
+
+    argv = [
+        "rg",
+        "-e", "pattern with spaces",
+        "--glob", "*.py",
+        "--type", "py",
+        "-C", "3",
+        "--",
+        "docs/a", "docs/b/c.md",
+    ]
+    assert _rg_extract_path_operands(argv) == ["docs/a", "docs/b/c.md"]
+
+    # --regexp= form and multiple positional paths without --
+    argv2 = ["rg", "--regexp=foo", "docs/x", "docs/y"]
+    assert _rg_extract_path_operands(argv2) == ["docs/x", "docs/y"]
+
+    # No path operand at all (whole-repo search)
+    argv3 = ["rg", "foo"]
+    assert _rg_extract_path_operands(argv3) == []
+
+
+def test_ac6_test_flag_file_not_found_expected_regression():
+    """AC6: existing `test -f` / `test -d` / `test -s` file_not_found_expected
+    classification is unaffected by the Issue #1328 changes."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=1,
+        stdout="",
+        stderr="",
+        command="test -f /nonexistent/new-allowed-path.py",
+        allowed_paths=["nonexistent/new-allowed-path.py"],
+        static_policy_passed=True,
+    )
+    assert classification == "expected_fail"
+    assert category == "file_not_found_expected"
+    assert decision == "go"
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=1,
+        stdout="",
+        stderr="",
+        command="test -d /nonexistent/new-allowed-dir",
+        allowed_paths=["nonexistent/new-allowed-dir"],
+        static_policy_passed=True,
+    )
+    assert classification == "expected_fail"
+    assert category == "file_not_found_expected"
+    assert decision == "go"
+
+
+def test_ac7_candidate_new_allowed_path_target_uses_mature_rg_parser():
+    """AC7: _candidate_new_allowed_path_target() delegates rg path-operand
+    extraction to the mature argv parser (correctly skipping -e/--glob/--
+    value-taking flags) instead of a naive non_opt[1:] split."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _candidate_new_allowed_path_target
+
+    # Naive non_opt[1:] extraction would have misparsed this (e.g. treating
+    # the --glob value or the pattern as the path), but the mature parser
+    # correctly isolates the single trailing path operand.
+    command = "rg -e foo --glob '*.py' --type py -- docs/new/allowed-file.md"
+    target = _candidate_new_allowed_path_target(command, ["docs/new/allowed-file.md"], ".")
+    assert target == "docs/new/allowed-file.md", f"Expected docs/new/allowed-file.md, got {target!r}"
+
+
+def test_ac9_rg_exit2_missing_path_without_allowed_paths_arg_not_expected_fail():
+    """AC9: classify_result() called without the allowed_paths argument (default
+    None) never classifies rg exit_code==2 as new_file_missing_expected, even
+    when stderr is a missing-path pattern."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="",
+        stderr="rg: docs/new/file.md: No such file or directory (os error 2)",
+        command="rg foo docs/new/file.md",
+    )
+    assert category != "new_file_missing_expected", f"Unexpected new_file_missing_expected: {category}"
+
+
+def test_ac10_rg_exit2_mixed_missing_path_and_invalid_regex_stderr_not_expected_fail():
+    """AC10: stderr with BOTH a missing-path pattern and an invalid-regex /
+    unsupported-option pattern must not be classified as
+    new_file_missing_expected (blacklist wins)."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    mixed_stderr = (
+        "rg: docs/new/file.md: No such file or directory (os error 2)\n"
+        "rg: regex parse error: bad pattern"
+    )
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="",
+        stderr=mixed_stderr,
+        command="rg foo docs/new/file.md",
+        allowed_paths=["docs/new/file.md"],
+        static_policy_passed=True,
+    )
+    assert category != "new_file_missing_expected", f"Unexpected new_file_missing_expected: {category}"
+
+
+def test_ac11_new_file_missing_expected_is_high_confidence():
+    """AC11: new_file_missing_expected category is in compute_confidence()'s
+    high confidence set."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import compute_confidence
+
+    assert compute_confidence("new_file_missing_expected") == "high"
+
+
+def test_rg_stderr_indicates_missing_path_whitelist():
+    """Direct unit test of the whitelist/blacklist helper functions (Issue #1328)."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import (
+        _rg_stderr_indicates_missing_path,
+        _rg_stderr_indicates_error_not_missing_path,
+        _is_rg_missing_path_error,
+    )
+
+    missing_dir_stderr = "rg: /tmp/no_such_dir_xyz/: No such file or directory (os error 2)"
+    assert _rg_stderr_indicates_missing_path(missing_dir_stderr)
+    assert not _rg_stderr_indicates_error_not_missing_path(missing_dir_stderr)
+    assert _is_rg_missing_path_error(missing_dir_stderr)
+
+    permission_stderr = "rg: /tmp/permtest/f.txt: Permission denied (os error 13)"
+    assert not _is_rg_missing_path_error(permission_stderr)
+    assert _rg_stderr_indicates_error_not_missing_path(permission_stderr)
+
+    unsupported_option_stderr = "rg: unrecognized flag --not-a-real-flag"
+    assert not _is_rg_missing_path_error(unsupported_option_stderr)
+
+
+def test_rg_path_operands_all_within_allowed_paths_empty_operands_is_false():
+    """A broad rg search (no path operand extracted) must never be treated as
+    'within Allowed Paths' — it is always False regardless of allowed_paths."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _rg_path_operands_all_within_allowed_paths
+
+    assert _rg_path_operands_all_within_allowed_paths([], ["docs/new/file.md"]) is False
+
+
+# --- Issue #1328 follow-up (OWNER adversarial review): harden the false-green
+# boundary and align Allowed Paths containment with the existing fail-closed
+# gate grammar. ---
+
+
+def test_rg_exit2_with_stdout_match_and_missing_path_is_not_new_file_missing_expected():
+    """OWNER Blocker 1: a multi-path rg invocation where one path produced a
+    match (non-empty stdout) and a DIFFERENT path was missing must NOT be
+    classified as new_file_missing_expected. Issue #1328's AC1 only covers a
+    single new/missing Allowed Paths file with no matches anywhere; it must
+    not be broadened to "some paths matched, some were missing"."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="docs/allowed/existing.md:foo\n",
+        stderr="rg: docs/allowed/missing.md: No such file or directory (os error 2)",
+        command="rg foo docs/allowed/existing.md docs/allowed/missing.md",
+        allowed_paths=["docs/allowed/existing.md", "docs/allowed/missing.md"],
+        static_policy_passed=True,
+    )
+    assert category != "new_file_missing_expected", f"Unexpected new_file_missing_expected: {category}"
+
+
+def test_rg_exit2_partial_missing_among_multiple_allowed_paths_not_expected_fail():
+    """OWNER Blocker 1: even with empty stdout, if only SOME of the multiple
+    path operands are reported missing in stderr (not the full operand set),
+    the ambiguous case must not be classified as new_file_missing_expected."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="",
+        stderr="rg: docs/allowed/missing.md: No such file or directory (os error 2)",
+        command="rg foo docs/allowed/existing.md docs/allowed/missing.md",
+        allowed_paths=["docs/allowed/existing.md", "docs/allowed/missing.md"],
+        static_policy_passed=True,
+    )
+    assert category != "new_file_missing_expected", f"Unexpected new_file_missing_expected: {category}"
+
+
+def test_rg_exit2_missing_path_mismatched_with_argv_operand_not_expected_fail():
+    """OWNER Blocker 1: if the path reported missing in stderr does not match
+    the (single) argv path operand at all, do not classify as
+    new_file_missing_expected (defensive; should not normally occur but must
+    fail closed if it does)."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="",
+        stderr="rg: docs/allowed/other-file.md: No such file or directory (os error 2)",
+        command="rg foo docs/allowed/missing.md",
+        allowed_paths=["docs/allowed/missing.md", "docs/allowed/other-file.md"],
+        static_policy_passed=True,
+    )
+    assert category != "new_file_missing_expected", f"Unexpected new_file_missing_expected: {category}"
+
+
+def test_normalize_repo_relative_path_strict_rejects_unsafe_paths():
+    """OWNER Blocker 2: _normalize_repo_relative_path_strict() rejects
+    absolute paths, backslash-containing paths, '..' segments, and empty
+    segments, mirroring AllowedPathsMatcher.normalize_path() in
+    allowed_paths_review_gate.py."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _normalize_repo_relative_path_strict
+
+    assert _normalize_repo_relative_path_strict("docs/new/file.md") == "docs/new/file.md"
+    assert _normalize_repo_relative_path_strict("./docs/new/file.md") == "docs/new/file.md"
+    assert _normalize_repo_relative_path_strict("/docs/new/file.md") is None
+    assert _normalize_repo_relative_path_strict("../docs/new/file.md") is None
+    assert _normalize_repo_relative_path_strict("docs/../new/file.md") is None
+    assert _normalize_repo_relative_path_strict("docs\\new\\file.md") is None
+    assert _normalize_repo_relative_path_strict("docs//new/file.md") is None
+    assert _normalize_repo_relative_path_strict("") is None
+    assert _normalize_repo_relative_path_strict(".") is None
+
+
+def test_rg_exit2_allowed_paths_containment_rejects_traversal_and_absolute():
+    """OWNER Blocker 2: rg exit_code==2 against a path operand that is an
+    Allowed-Paths-adjacent traversal ('../') or absolute path must not be
+    classified as new_file_missing_expected, even if a naive string-prefix
+    match would have allowed it."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    # '..' traversal path operand
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="",
+        stderr="rg: docs/allowed/../new/file.md: No such file or directory (os error 2)",
+        command="rg foo docs/allowed/../new/file.md",
+        allowed_paths=["docs/allowed/../new/file.md"],
+        static_policy_passed=True,
+    )
+    assert category != "new_file_missing_expected", f"Unexpected new_file_missing_expected: {category}"
+
+    # empty-segment path operand (docs//new/file.md)
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="",
+        stderr="rg: docs//new/file.md: No such file or directory (os error 2)",
+        command="rg foo docs//new/file.md",
+        allowed_paths=["docs//new/file.md"],
+        static_policy_passed=True,
+    )
+    assert category != "new_file_missing_expected", f"Unexpected new_file_missing_expected: {category}"
+
+
+def test_rg_extract_path_operands_handles_file_flag():
+    """OWNER Blocker 3: -f/--file PATTERNFILE is a value-taking flag; its value
+    must not be misidentified as PATTERN or as a PATH operand, and the
+    trailing path operand must still be extracted correctly."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _rg_extract_path_operands
+
+    assert _rg_extract_path_operands(["rg", "-f", "patterns.txt", "docs/new/file.md"]) == ["docs/new/file.md"]
+    assert _rg_extract_path_operands(["rg", "--file", "patterns.txt", "docs/new/file.md"]) == ["docs/new/file.md"]
+    assert _rg_extract_path_operands(["rg", "--file=patterns.txt", "docs/new/file.md"]) == ["docs/new/file.md"]
+    # multiple -f occurrences (rg supports repeated -f) with multiple paths
+    assert _rg_extract_path_operands(
+        ["rg", "-f", "p1.txt", "-f", "p2.txt", "docs/a", "docs/b"]
+    ) == ["docs/a", "docs/b"]
+
+
+def test_rg_exit2_missing_file_via_file_flag_command_is_expected_fail():
+    """OWNER Blocker 3: end-to-end classify_result() check that a `rg -f
+    patterns.txt docs/new/file.md` command against a missing Allowed Paths
+    file is still classified new_file_missing_expected (the -f fix must not
+    regress the AC1 happy path when -f is used instead of an inline pattern)."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="",
+        stderr="rg: docs/new/file.md: No such file or directory (os error 2)",
+        command="rg -f patterns.txt docs/new/file.md",
+        allowed_paths=["docs/new/file.md"],
+        static_policy_passed=True,
+    )
+    assert classification == "expected_fail"
+    assert category == "new_file_missing_expected"
+    assert decision == "go"
