@@ -79,7 +79,7 @@
 
 - id: runtime-verification-policy
   path: docs/dev/runtime-verification-policy.md
-  title: Runtime Verification Policy
+  title: Runtime Verification Policy（動作検証ポリシー）
   keywords: [runtime, verification, policy, skip, exit77, immediate, deferred, not_applicable]
   description: 動作検証 AC の運用規約
 
@@ -122,7 +122,7 @@
 
 - id: product-spec-lifecycle
   path: docs/dev/product-spec-lifecycle.md
-  title: Product Spec Lifecycle
+  title: Product Spec Lifecycle（プロダクト仕様のライフサイクル）
   keywords: [product-spec, lifecycle, docs/product, compact-spec, scoped-loading, diff-first, token-policy, ears, spec-delta, tasks-md, staging-artifact, archive, supersede, ssot-registry, registry-entry, directory-mapping]
   description: docs/product/** の作成・更新・archive・supersede・registry 登録・compact spec・diff-first 更新・EARS 採用・playtest feedback から spec delta issue への変換。workflow.md との責務境界定義を含む
   sections:
@@ -166,7 +166,7 @@
 
 - id: movement-projectile
   path: docs/product/features/movement-projectile.md
-  title: Movement + Projectile 最小仕様
+  title: Movement + Projectile 最小仕様（移動と発射体の最小仕様）
   keywords: [movement, projectile, combat, player, aim, fire, cooldown, arena, coordinate, diagonal_normalization, boundary_clamp, PointerEvent, GameState.projectiles, speed_px_per_sec, lifetime_ms, monotonic_counter, fixed_timestep, 60hz, raf]
   description: player 移動・aim・fire・projectile の最小ライフサイクルを固定する feature spec（status: draft）。#1 実装の前提仕様
   sections:
@@ -223,9 +223,9 @@
 
 - id: game-design
   path: docs/product/game-design.md
-  title: Game Design Document (GDD v0.1)
+  title: Game Design Document (GDD v0.1)（ゲームデザイン文書）
   keywords: [game-design, gdd, core-loop, sortie-loop, screens, progression, rewards, non-goals, downstream-boundaries, open-questions, playtest-hypotheses, design-pillars, localized-intervention, reverse-engineering, analysis-data, combat-readability, compact-spec, ears]
-  description: GDD-level design の正本。Core Loop / Sortie Loop / Screens / Progression / Rewards / Non-Goals / Downstream Boundaries / Open Questions / Playtest Hypotheses を保持し、game-logic.md / mvp-scope.md / playtest-protocol.md の上位制約として機能する（実装定数は委譲、game-thesis.md 未マージ時は fallback draft）
+  description: GDD-level design の正本。Core Loop / Sortie Loop / Screens / Progression / Rewards / Non-Goals / Downstream Boundaries / Open Questions / Playtest Hypotheses（コアループ・出撃ループ・画面・進行・報酬・非ゴール・下流境界・未解決の問い・プレイテスト仮説）を保持し、game-logic.md / mvp-scope.md / playtest-protocol.md の上位制約として機能する（実装定数は委譲、game-thesis.md 未マージ時は fallback draft）
   sections:
     - "## Intent"
     - "## Authority and Fallbacks"
@@ -263,9 +263,9 @@
 
 - id: mvp-scope
   path: docs/product/mvp-scope.md
-  title: MVP Scope Definition
+  title: MVP Scope Definition（MVP スコープ定義）
   keywords: [mvp-scope, mvp, scope, hypotheses, success-criteria, failure-criteria, pivot-criteria, playtest, downstream-boundaries]
-  description: MVP に含める / 含めない境界、検証仮説、success / failure / pivot criteria を定義する draft product spec。status: accepted になるまでは実装判断の normative source ではない
+  description: MVP に含める / 含めない境界、検証仮説、success / failure / pivot criteria（成功基準・失敗基準・方向転換基準）を定義する draft product spec。status: accepted になるまでは実装判断の normative source ではない
   sections:
     - "## 状態注記 / Status Note"
     - "## 目的 / Intent"
@@ -311,9 +311,9 @@
 
 - id: combat-core
   path: docs/product/features/combat-core.md
-  title: Combat Core Feature Spec
+  title: Combat Core Feature Spec（戦闘コア機能仕様）
   keywords: [combat, collision, hitbox, enemy, projectile, damage, defeat, CombatSystem, CollisionSystem, CollisionPair, EnemyState, contactDamage, defeatedAtTick, M2]
-  description: M2 Combat MVP Gate の前提仕様。CollisionSystem/CombatSystem 責務境界・CollisionPair 型・EnemyState フィールド・defeat policy・deterministic order の正本
+  description: M2 Combat MVP Gate の前提仕様。CollisionSystem/CombatSystem 責務境界・CollisionPair 型・EnemyState フィールド・defeat policy・deterministic order の正本（衝突・当たり判定・撃破ロジックと決定論的処理順序の仕様）
   sections:
     - "## Non-Goals"
     - "## EnemyState"
@@ -402,7 +402,7 @@ directory_mappings:
 
 ---
 
-## Derived Artifacts
+## Derived Artifacts（派生成果物）
 
 `docs/` SSOT の下位に位置する derived workbench artifacts を管理する。
 derived artifact は `docs/` SSOT に矛盾した場合、`docs/` が勝つ（conflict_rule: docs-ssot-wins）。

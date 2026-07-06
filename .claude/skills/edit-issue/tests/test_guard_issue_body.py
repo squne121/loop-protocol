@@ -343,6 +343,10 @@ pnpm typecheck
 - nested SubAgent delegation が必要になった場合
 - 外部サービス利用・権限昇格・既存テスト大規模改変が必要になった場合
 
+## Required Design References
+
+- docs/dev/agent-skill-boundaries.md
+
 ## Required Skills
 
 - Python / pytest

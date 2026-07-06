@@ -377,6 +377,7 @@ _DEFAULT_SECTION_TEXT = {
     "Out of Scope": "- 本 child のスコープ外の変更",
     "Required Skills": "なし",
     "Scope Delta（任意）": "N/A",
+    "Required Design References": "- docs/dev/agent-skill-boundaries.md",
 }
 
 
@@ -403,6 +404,15 @@ def required_section_labels(kind: str) -> list[str]:
             label = item.get("attributes", {}).get("label", "").removesuffix("*").strip()
             if label:
                 labels.append(label)
+
+    # #1346 AC9: authoring 経路 (create_issue_txn.py 経由の implementation body 生成) では
+    # ISSUE_TEMPLATE の validations.required フラグに関わらず Required Design References を
+    # 必須化する。validate_issue_body.py の _load_required_section_labels() と同じ特例を
+    # ここでも適用し、必須セクション一覧が乖離しないようにする（implementation.yml の
+    # required-design-references は AC7 の理由で validations.required: false のため）。
+    if kind == "implementation" and "Required Design References" not in labels:
+        labels.append("Required Design References")
+
     _require(len(labels) > 0, f"ISSUE_TEMPLATE/{kind}.yml yields no required labels")
     return labels
 
