@@ -152,22 +152,10 @@ def test_parallel_exclude_overlapping_ignore_raises(tmp_path):
 
 
 def test_real_plan_serial_lane_has_debounce():
-    """After #1141, the debounce test itself is deterministic and does not need
-    parallel_exclude quarantine. Issue #1346 registered a *different* entry
-    (the AC4 Required Design References test, quarantined because adding it
-    shifted xdist worker-bucket assignment and exposed a pre-existing,
-    unrelated test-isolation bug elsewhere) so parallel_exclude is no longer
-    empty, but it must contain exactly that one known entry and must not
-    contain the debounce test."""
+    """After #1141, debounce test is deterministic; parallel_exclude is empty."""
     plan = mod.load_plan(_PLAN_PATH)
     lane = mod.serial_lane_argv(plan)
-    known_entry = (
-        ".claude/skills/issue-contract-review/scripts/tests/"
-        "test_required_design_references.py"
-    )
-    assert plan["parallel_exclude"] == [known_entry]
-    assert lane[:3] == ["-n", "0", known_entry]
-    assert not any("session_manifest_debounce" in a for a in lane)
+    assert lane == []
     par = mod.run_argv(plan, mode="parallel")
     assert not any(a.startswith("--ignore=") and "session_manifest_debounce" in a for a in par)
 
