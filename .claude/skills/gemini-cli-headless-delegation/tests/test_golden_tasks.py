@@ -290,3 +290,98 @@ def test_d13_r0_mock_response_contains_sections(tmp_path, monkeypatch):
     assert "Summary" in result["response_text"]
     assert "Findings" in result["response_text"]
     assert "Evidence" in result["response_text"]
+
+
+# ---------------------------------------------------------------------------
+# AGY fixture validation (Issue #1274 AC1/AC2)
+#
+# AGY prompt-first fixtures use _validate_agy_request() rather than
+# validate_request(): the AGY provider dispatch in run_delegation() takes an
+# early-branch minimal contract (schema/tool_profile/prompt) distinct from the
+# full Gemini delegation_request_v1 contract that validate_request() enforces
+# (objective/instructions/output_sections/context_files required). See the
+# Contract Review comment on Issue #1274 for the rationale.
+# ---------------------------------------------------------------------------
+
+def test_agy_no_tools_fixture_validates():
+    module = load_module()
+    request = json.loads((FIXTURES_DIR / "agy_no_tools_smoke_request.json").read_text(encoding="utf-8"))
+    errors = module._validate_agy_request(request)
+    assert errors == []
+
+
+def test_agy_proposal_only_fixture_validates():
+    module = load_module()
+    request = json.loads((FIXTURES_DIR / "agy_proposal_only_smoke_request.json").read_text(encoding="utf-8"))
+    errors = module._validate_agy_request(request)
+    assert errors == []
+
+
+# ---------------------------------------------------------------------------
+# AGY fixture end-to-end run_delegation() result shape (Issue #1274 AC3)
+# ---------------------------------------------------------------------------
+
+def _agy_completed_ok():
+    import subprocess
+
+    return subprocess.CompletedProcess(
+        args=["agy", "-p", "prompt"], returncode=0, stdout="LOOP_AGY_SMOKE_OK", stderr=""
+    )
+
+
+def _fail_gemini(*args, **kwargs):
+    raise AssertionError("_run_gemini must not be called for provider=agy")
+
+
+def test_agy_no_tools_fixture_run_delegation_result_shape(monkeypatch):
+    module = load_module()
+    request = json.loads((FIXTURES_DIR / "agy_no_tools_smoke_request.json").read_text(encoding="utf-8"))
+    seen: dict[str, object] = {}
+
+    def _fake_run_agy(prompt, timeout_sec):
+        seen["prompt"] = prompt
+        seen["timeout_sec"] = timeout_sec
+        return _agy_completed_ok()
+
+    monkeypatch.setattr(module, "_run_gemini", _fail_gemini)
+    monkeypatch.setattr(module, "_run_agy", _fake_run_agy)
+
+    result = module.run_delegation(request, request_path=FIXTURES_DIR / "agy_no_tools_smoke_request.json")
+
+    assert result["ok"] is True
+    assert result["provider"] == "agy"
+    assert result["safety_mode"] == "degraded_wrapper_only"
+    assert result["transport"] == "agy"
+    assert result["response_text"] == "LOOP_AGY_SMOKE_OK"
+
+    # PR #1345 fix_delta Blocker 1: pin provider isolation and prompt redaction.
+    assert seen["prompt"] == request["prompt"]
+    assert result["raw_command"] == ["agy", "-p", "<prompt>"]
+    assert request["prompt"] not in json.dumps(result, ensure_ascii=False)
+
+
+def test_agy_proposal_only_fixture_run_delegation_result_shape(monkeypatch):
+    module = load_module()
+    request = json.loads((FIXTURES_DIR / "agy_proposal_only_smoke_request.json").read_text(encoding="utf-8"))
+    seen: dict[str, object] = {}
+
+    def _fake_run_agy(prompt, timeout_sec):
+        seen["prompt"] = prompt
+        seen["timeout_sec"] = timeout_sec
+        return _agy_completed_ok()
+
+    monkeypatch.setattr(module, "_run_gemini", _fail_gemini)
+    monkeypatch.setattr(module, "_run_agy", _fake_run_agy)
+
+    result = module.run_delegation(request, request_path=FIXTURES_DIR / "agy_proposal_only_smoke_request.json")
+
+    assert result["ok"] is True
+    assert result["provider"] == "agy"
+    assert result["safety_mode"] == "degraded_wrapper_only"
+    assert result["transport"] == "agy"
+    assert result["response_text"] == "LOOP_AGY_SMOKE_OK"
+
+    # PR #1345 fix_delta Blocker 1: pin provider isolation and prompt redaction.
+    assert seen["prompt"] == request["prompt"]
+    assert result["raw_command"] == ["agy", "-p", "<prompt>"]
+    assert request["prompt"] not in json.dumps(result, ensure_ascii=False)
