@@ -114,6 +114,12 @@ def _body_with_rdr(rdr_section_body: str) -> str:
     return _BASE_IMPLEMENTATION_BODY.format(rdr_section=rdr_section)
 
 
+def _body_with_rdr_heading(heading: str, rdr_section_body: str) -> str:
+    """AC10: build a body using a custom (e.g. Japanese) RDR heading text."""
+    rdr_section = f"## {heading}\n\n{rdr_section_body}\n"
+    return _BASE_IMPLEMENTATION_BODY.format(rdr_section=rdr_section)
+
+
 def _body_without_rdr_section() -> str:
     return _BASE_IMPLEMENTATION_BODY.format(rdr_section="")
 
@@ -249,3 +255,86 @@ def test_rdr_error_shape_matches_schema():
     for err in rdr_errors:
         missing = required_keys - err.keys()
         assert not missing, f"RDR001 error missing keys: {missing}"
+# ---------------------------------------------------------------------------
+# AC10 (#1346): heading extraction shares HEADING_POLICY accepted forms
+# ---------------------------------------------------------------------------
+
+
+def test_rdr_japanese_heading_parenthesis_form_detected():
+    """AC10: '必要設計リファレンス (Required Design References)' heading form (registered
+    in prose_boundary_policy.HEADING_POLICY accepted_forms) is detected by RDR001,
+    not just the plain English heading."""
+    data, _ = run_readiness_with_body(
+        _body_with_rdr_heading(
+            "必要設計リファレンス (Required Design References)",
+            "- docs/dev/agent-skill-boundaries.md#Parallel Agent Runtime Safety",
+        )
+    )
+    rdr_errors = [
+        e for e in data["errors"] if e.get("category") == "required_design_references_missing_or_empty"
+    ]
+    assert not rdr_errors, f"Unexpected RDR001 errors for valid Japanese-heading reference: {rdr_errors}"
+
+
+def test_rdr_japanese_heading_fullwidth_parenthesis_form_empty_needs_fix():
+    """AC10: '必要設計リファレンス（Required Design References）' (fullwidth parens) heading
+    form is also recognised, and an empty section under that heading still needs_fix."""
+    data, _ = run_readiness_with_body(
+        _body_with_rdr_heading("必要設計リファレンス（Required Design References）", "")
+    )
+    rule_ids = [e["rule_id"] for e in data["errors"]]
+    assert "RDR001" in rule_ids, rule_ids
+    assert data["status"] == "needs_fix"
+
+
+# ---------------------------------------------------------------------------
+# AC11 (#1346): design-doc path judgment narrowed to docs/**, .claude/skills/**/SKILL.md,
+# .claude/skills/**/references/**/*.md; with Path.exists() check; autofixable: False
+# ---------------------------------------------------------------------------
+
+
+def test_rdr_src_path_only_needs_fix():
+    """AC11: a src/ path reference alone (previously accepted) must now be rejected —
+    src/ and scripts/ paths are implementation paths, not design-doc references."""
+    data, _ = run_readiness_with_body(_body_with_rdr("- src/some/module.ts"))
+    rule_ids = [e["rule_id"] for e in data["errors"]]
+    assert "RDR001" in rule_ids, rule_ids
+    assert data["status"] == "needs_fix"
+
+
+def test_rdr_scripts_path_only_needs_fix():
+    """AC11: a scripts/ path reference alone must now be rejected."""
+    data, _ = run_readiness_with_body(_body_with_rdr("- scripts/agent-ops/some_tool.py"))
+    rule_ids = [e["rule_id"] for e in data["errors"]]
+    assert "RDR001" in rule_ids, rule_ids
+    assert data["status"] == "needs_fix"
+
+
+def test_rdr_nonexistent_docs_path_needs_fix():
+    """AC11: a syntactically-valid docs/ path that does not exist in the repo must
+    still be rejected (Path.exists() check)."""
+    data, _ = run_readiness_with_body(_body_with_rdr("- docs/dev/this-file-does-not-exist.md"))
+    rule_ids = [e["rule_id"] for e in data["errors"]]
+    assert "RDR001" in rule_ids, rule_ids
+    assert data["status"] == "needs_fix"
+
+
+def test_rdr_skill_md_reference_passes():
+    """AC11: a .claude/skills/**/SKILL.md reference is accepted when it exists."""
+    data, _ = run_readiness_with_body(
+        _body_with_rdr("- .claude/skills/issue-contract-review/SKILL.md")
+    )
+    rdr_errors = [
+        e for e in data["errors"] if e.get("category") == "required_design_references_missing_or_empty"
+    ]
+    assert not rdr_errors, f"Unexpected RDR001 errors for existing SKILL.md reference: {rdr_errors}"
+
+
+def test_rdr_error_autofixable_is_false():
+    """AC11: RDR001 autofixable must be False (correct reference requires human
+    judgment, not a mechanical fix)."""
+    data, _ = run_readiness_with_body(_body_with_rdr(""))
+    rdr_errors = [e for e in data["errors"] if e["rule_id"] == "RDR001"]
+    assert rdr_errors, "Expected at least one RDR001 error"
+    for err in rdr_errors:
+        assert err["autofixable"] is False, err

@@ -46,6 +46,15 @@ _VALIDATE_ISSUE_BODY_PY = (
 )
 _BASELINE_VC_PREFLIGHT_PY = _SCRIPTS_DIR / "baseline_vc_preflight.py"
 
+# AC10 (#1346): share heading detection with prose_boundary_policy.py's HEADING_POLICY
+# so RDR001 section extraction recognises the same accepted forms (incl. Japanese
+# headings) as the prose-boundary guard, instead of an independent English-only regex.
+_CREATE_ISSUE_SCRIPTS_DIR = _REPO_ROOT / ".claude" / "skills" / "create-issue" / "scripts"
+if str(_CREATE_ISSUE_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS_DIR))
+
+from prose_boundary_policy import HEADING_POLICY  # noqa: E402
+
 # Required fields for `decision: immediate` in Runtime Verification Applicability section
 _RVA_IMMEDIATE_REQUIRED_FIELDS = [
     "applicable_acs",
@@ -611,8 +620,26 @@ def check_rva_immediate_fields(body: str) -> list[dict]:
 # AC4 (#1346): Required Design References check (implementation issues only)
 # ---------------------------------------------------------------------------
 
+# AC10 (#1346): build the RDR heading regex from prose_boundary_policy.py's
+# HEADING_POLICY accepted_forms so this static checker recognises the same heading
+# variants (including Japanese forms) as the authoring-side prose boundary guard.
+_RDR_ACCEPTED_HEADINGS = HEADING_POLICY["Required Design References"]["accepted_forms"]
+_RDR_HEADING_ALT = "|".join(re.escape(h) for h in _RDR_ACCEPTED_HEADINGS)
+_RDR_SECTION_RE = re.compile(
+    rf"^##\s+(?:{_RDR_HEADING_ALT})\s*$(.+?)(?=^##|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+# AC11 (#1346): design-doc path references must point at an actual, narrowly-scoped
+# design-doc location (docs/**/*.md|yml, .claude/skills/**/SKILL.md,
+# .claude/skills/**/references/**/*.md). src/ and scripts/ are intentionally excluded:
+# those are implementation paths, not design-doc references.
 _REQUIRED_DESIGN_REFERENCES_PATH_RE = re.compile(
-    r"(?:^|[\s(`\[])(docs/|\.claude/|src/|scripts/)[\w\-./]+\.(?:md|py|ts|tsx|yml|yaml)",
+    r"(?:^|[\s(`\[])("
+    r"docs/[\w\-./]+\.(?:md|yml)"
+    r"|\.claude/skills/[\w\-./]+/SKILL\.md"
+    r"|\.claude/skills/[\w\-./]+/references/[\w\-./]+\.md"
+    r")"
 )
 
 _PLACEHOLDER_ONLY_VALUES = {"", "n/a", "none", "なし", "-"}
@@ -654,11 +681,7 @@ def check_required_design_references(body: str) -> list[dict]:
     if _extract_issue_kind(body) != "implementation":
         return []
 
-    section_match = re.search(
-        r"^##\s+Required Design References\s*$(.+?)(?=^##|\Z)",
-        body,
-        re.MULTILINE | re.DOTALL,
-    )
+    section_match = _RDR_SECTION_RE.search(body)
     if not section_match:
         return []
 
@@ -670,7 +693,16 @@ def check_required_design_references(body: str) -> list[dict]:
     is_placeholder_only = (not non_empty_lines) or all(
         line.lower().lstrip("- ").strip() in _PLACEHOLDER_ONLY_VALUES for line in non_empty_lines
     )
-    has_path_ref = bool(_REQUIRED_DESIGN_REFERENCES_PATH_RE.search(section_content))
+
+    # AC11 (#1346): a candidate path is only a valid design-doc reference when it
+    # (a) matches the narrowed docs/**|.claude/skills/**/SKILL.md|.claude/skills/**/references/**
+    #     shape, and (b) actually exists in the repo (Path.exists()).
+    has_path_ref = False
+    for match in _REQUIRED_DESIGN_REFERENCES_PATH_RE.finditer(section_content):
+        candidate = match.group(1)
+        if (_REPO_ROOT / candidate).exists():
+            has_path_ref = True
+            break
 
     if is_placeholder_only or not has_path_ref:
         errors = [
@@ -684,12 +716,15 @@ def check_required_design_references(body: str) -> list[dict]:
                 "line_end": section_start_line + section_content.count("\n"),
                 "minimal_context": non_empty_lines[:3],
                 "fix_hint": (
-                    "Add at least one repo-relative design-doc path reference "
-                    "(e.g. docs/dev/agent-skill-boundaries.md) to Required Design "
+                    "Add at least one repo-relative, *existing* design-doc path reference "
+                    "(e.g. docs/dev/agent-skill-boundaries.md, .claude/skills/<skill>/SKILL.md, "
+                    "or .claude/skills/<skill>/references/<doc>.md) to Required Design "
                     "References. Do not leave it empty / N/A / none only. "
                     "See body-authoring.md#Required Design References Authoring Guidance."
                 ),
-                "autofixable": True,
+                # AC11 (#1346): not autofixable — the correct design-doc reference requires
+                # human judgment about which SSOT the issue actually depends on.
+                "autofixable": False,
             }
         ]
         return errors
