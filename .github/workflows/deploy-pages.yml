@@ -375,6 +375,13 @@ jobs:
           # much longer worst-case wall time than intended when there are
           # multiple assets (Issue #1357).
           #
+          # overall_deadline is a hard wall-clock deadline: both the per-curl
+          # --max-time and the inter-attempt sleep are capped to the
+          # remaining budget so that a slow/hanging curl call or a long
+          # backoff sleep cannot push the total runtime past
+          # overall_deadline. If no time remains before issuing a request,
+          # fail fast instead of calling curl.
+          #
           # Retry backoff uses an exponential delay bounded between
           # initial_delay and max_delay (attempt-based), replacing the
           # previous fixed 5-second sleep.
@@ -389,6 +396,7 @@ jobs:
             local output="$3"
             local initial_delay=2
             local max_delay=20
+            local curl_max_time=20
             local attempt=0
             local status="000"
             local tag
@@ -402,11 +410,23 @@ jobs:
             while :; do
               attempt=$((attempt + 1))
               local elapsed=$SECONDS
+              local remaining=$((overall_deadline - SECONDS))
+
+              if (( remaining <= 0 )); then
+                echo "ERROR: overall deadline already exceeded before request: $url" >&2
+                echo "${tag} attempt=${attempt} elapsed=${elapsed}s status=${status} action=deadline-exceeded" >&2
+                return 1
+              fi
+
+              local attempt_max_time=$curl_max_time
+              if (( remaining < attempt_max_time )); then
+                attempt_max_time=$remaining
+              fi
 
               status="$(
                 curl -sS -L \
                   -H 'Cache-Control: no-cache' \
-                  --max-time 20 \
+                  --max-time "$attempt_max_time" \
                   -o "${output}.tmp" \
                   -w '%{http_code}' \
                   "$url" || true
@@ -428,22 +448,46 @@ jobs:
               fi
 
               case "$status" in
-                # These statuses are treated as transient and retried:
-                # 000 (curl-level connect/reset failure before an HTTP status
-                # was returned), 403 (Pages CDN can return a spurious
-                # forbidden response while a deployment is still
-                # propagating), 404 (Pages publish lag before the file is
-                # served), 408 (request timeout), 409 (Pages deployment
-                # conflict while a concurrent publish is in flight), 425 (too
-                # early -- origin not yet ready to process the request), 429
-                # (rate limited), 500/502/503/504/522/524 (origin or edge
-                # unavailable / timed out while the deployment propagates).
+                # Retry-eligible statuses. Only 404 has been observed in
+                # practice for this issue (Issue #1357: GitHub Pages preview
+                # subdirectory publish lag before the file becomes servable).
+                # The remaining codes are defensive retries for
+                # failure modes that have NOT been observed for this repo's
+                # Pages/CDN setup, kept as a safety margin against
+                # known GitHub Pages/CDN transient behaviors documented
+                # elsewhere:
+                #   000 - curl-level connect/reset failure before any HTTP
+                #         status was returned (defensive, unobserved here).
+                #   403 - Pages CDN can return a spurious forbidden response
+                #         while a deployment is still propagating
+                #         (defensive, unobserved here).
+                #   404 - Pages publish lag before the file is served
+                #         (OBSERVED for this issue).
+                #   408 - request timeout (defensive, unobserved here).
+                #   409 - Pages deployment conflict while a concurrent
+                #         publish is in flight (defensive, unobserved here).
+                #   425 - too early; origin not yet ready to process the
+                #         request. Not a documented Pages-readiness signal,
+                #         kept as a defensive retry only (unobserved here).
+                #   429 - rate limited (defensive, unobserved here).
+                #   500/502/503/504/522/524 - origin or edge unavailable /
+                #         timed out while the deployment propagates
+                #         (defensive, unobserved here).
                 # 400/401 and any other status are treated as non-retriable
                 # and fail fast below.
                 000|403|404|408|409|425|429|500|502|503|504|522|524)
                   local next_sleep=$((initial_delay * (2 ** (attempt - 1))))
                   if (( next_sleep > max_delay )); then
                     next_sleep=$max_delay
+                  fi
+                  remaining=$((overall_deadline - SECONDS))
+                  if (( remaining <= 0 )); then
+                    echo "ERROR: overall deadline exceeded before retry sleep: $url" >&2
+                    echo "${tag} attempt=${attempt} elapsed=${elapsed}s status=${status} action=deadline-exceeded" >&2
+                    return 1
+                  fi
+                  if (( next_sleep > remaining )); then
+                    next_sleep=$remaining
                   fi
                   echo "${tag} attempt=${attempt} elapsed=${elapsed}s status=${status} action=retry next_sleep=${next_sleep}s" >&2
                   sleep "$next_sleep"
@@ -477,7 +521,7 @@ jobs:
                 exit 1
                 ;;
             esac
-            fetch_pages_url_with_bounded_retry "preview-asset" "https://${GITHUB_REPOSITORY_OWNER}.github.io${asset_path}" /tmp/preview-asset.bin
+            fetch_pages_url_with_bounded_retry "preview-asset" "https://${GITHUB_REPOSITORY_OWNER}.github.io${asset_path}?cache_bust=${GITHUB_SHA}" /tmp/preview-asset.bin
           done
       - name: Comment preview URL on PR
         if: ${{ always() }}
