@@ -1665,3 +1665,56 @@ properties:
 
 - stdout は exactly one bounded JSON object とし、old/new issue body や raw child stdout/stderr を含めない
 - body/comment mutation authority は `issue_body.update` / `issue_comment.publish` に限定する
+
+## Parallel Agent Runtime Safety（並列エージェント実行安全性）
+
+複数エージェント（SubAgent / worktree agent / 手動セッション）が同一 repo checkout を並行操作する際の安全境界を定義する（#1343 follow-up）。
+`skill_runtime_exec.py` 自体の実装変更は本セクションの対象外（#1343 の Scope）。
+
+### repo-wide snapshot は自プロセス副作用とみなさない
+
+`git status` / `git diff` / ファイル一覧取得のような **repo 全体スナップショット系コマンド** の出力には、他エージェント（別 worktree・別セッション）が並行して書き込んだ変更が写り込むことがある。
+これは自プロセスが引き起こした副作用ではなく、並行実行している別プロセスの書き込みが同一 working tree に反映された結果である。
+executor / hook の postcondition 判定・rollback 判定は、snapshot 系コマンドの出力全体を「自分が引き起こした変更」として扱ってはならない。判定スコープは自プロセスが書き込んだ `allowed_write_roots` 配下に限定する。
+
+### volatile roots（揮発性ルート）の扱い
+
+以下のパスは複数エージェントの並行書き込みで内容が揮発的に変化しうる root として扱う。executor の postcondition 判定・fail-closed 判定では、これらの root 配下の変化のみを理由に単独で fail させない。
+
+- `.claude/worktrees/**`（各 worktree agent の作業ツリー。同時に複数存在しうる）
+- `.claude/artifacts/**`（複数 skill が並行して artifact を書き込む共有領域）
+- `.guard_shadow_log.jsonl`（hook が並行 append するログファイル）
+
+executor / hook がこれらの root 配下の変化を検知した場合、`allowed_write_roots` に含まれるか、または既知の volatile root かを区別して判定し、他プロセス起因の変化と自プロセス逸脱を混同しない。
+
+### 検出保証の二段階区分（Strict attribution mode / Race-tolerant stdlib mode）
+
+並列実行安全性を主張する executor / hook が「self-write（自プロセスの逸脱書き込み）をどこまで検出できるか」は実装手段に依存する。
+両者を区別せず一律に「volatile root への self-write も fail-close せよ」と要求すると、PR #1349（Closes #1343）が採用した
+race-tolerant stdlib 実装の既知の制限（Known Limitation）と矛盾する。そのため保証水準を以下の二段階に分けて明記する。
+
+#### Strict attribution mode（将来課題・実装は本セクションの対象外）
+
+- 前提: `strace` 等 OS-level のプロセス単位トレースを用い、「どのプロセスがどのパスに書き込んだか」を厳密に区別できる実装。
+- 要求: volatile root（`.claude/worktrees/**` 等）への書き込みであっても、それが自プロセス由来であり `allowed_write_roots` 外であれば fail-close する。
+- 現状: 本 repo の executor / hook（`skill_runtime_exec.py` 等）は標準ライブラリのみで動作する方針（#1343 Out of Scope）であり、strict attribution mode は未実装。
+  実装が必要になった場合は、本セクションを Required Design References に含めた別 Issue として起票する（本セクション自体は strict attribution の実装を要求しない）。
+
+#### Race-tolerant stdlib mode（現行実装。PR #1349 Option B）
+
+- 前提: repo-wide snapshot（`git status` / `git diff` 等）の before/after 差分に基づく、標準ライブラリのみの実装。プロセス単位の attribution は行わない。
+- 既知の制限（Known Limitation）: volatile peer-session root（`.claude/worktrees/**`、`.claude/artifacts/issue-refinement-loop/**` 等）への
+  **自プロセスの** `allowed_write_roots` 外の書き込みは、他プロセス（peer session）由来の正当な並行書き込みと区別できないため検出されない
+  （PR #1349 Safety Claim Matrix の Known Limitation を参照）。これは実装の見落としではなく、
+  「他プロセスの並行書き込みを自プロセスの逸脱と誤認して fail させる」peer-session false positive（#1349 が修正した回帰）を避けるために
+  明示的に受容したトレードオフである。
+- negative test 要求: 並列実行安全性を主張する executor / hook の実装は、以下の negative test を最低 1 件含めることを要求する。
+  - 「自プロセスが `allowed_write_roots` 外の **non-volatile な outside path**（`.claude/worktrees/**` 等の volatile root に含まれない
+    任意の repo path。例: `.cache/outside.txt`）に書き込んだ場合は fail-closed する」ことを確認する test
+  - volatile root の除外ロジックが「常に fail を握りつぶす」設計になっていないこと（他プロセス起因の変化は許容しつつ、
+    non-volatile path への自プロセス起因の逸脱は検出する）を確認する test
+  - **volatile root 配下への自プロセスの self-write 検出を要求する negative test は race-tolerant stdlib mode の対象外**
+    （Known Limitation としてテストで明示することは許容されるが、それを fail-close させることは要求しない。
+    strict attribution mode 導入までの既知の制限として扱う）。
+- non-volatile outside path に対する negative test を伴わない「並列実行対応」の主張は、self-write bypass
+  （自分の逸脱を volatile root 除外ロジックで隠蔽する抜け穴）を作りうるため、レビューで reject する。

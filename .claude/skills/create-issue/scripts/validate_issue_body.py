@@ -242,6 +242,17 @@ def _load_required_section_labels(kind: str) -> list[str]:
             label = item.get("attributes", {}).get("label", "").removesuffix("*").strip()
             if label:
                 labels.append(label)
+
+    # AC9 (#1346): authoring 経路 (create_issue_txn.py 経由の --kind implementation) では
+    # ISSUE_TEMPLATE の validations.required フラグに関わらず Required Design References を
+    # 必須化する。implementation.yml の required-design-references フィールドは AC7 (#1346) で
+    # scope_signal_guard の template-driven required-section 回帰 (plan_refinement_loop.py の
+    # resolve_issue_template 経由) を避けるため validations.required: false に設定されているが、
+    # authoring 経路の必須化はこの関数で独立に担保する。contract_readiness_check.py
+    # (既存 issue 向け、寛容な挙動) はこの関数を呼ばないため影響しない。
+    if kind == "implementation" and "Required Design References" not in labels:
+        labels.append("Required Design References")
+
     return labels
 
 

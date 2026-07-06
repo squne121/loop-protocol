@@ -46,6 +46,15 @@ _VALIDATE_ISSUE_BODY_PY = (
 )
 _BASELINE_VC_PREFLIGHT_PY = _SCRIPTS_DIR / "baseline_vc_preflight.py"
 
+# AC10 (#1346): share heading detection with prose_boundary_policy.py's HEADING_POLICY
+# so RDR001 section extraction recognises the same accepted forms (incl. Japanese
+# headings) as the prose-boundary guard, instead of an independent English-only regex.
+_CREATE_ISSUE_SCRIPTS_DIR = _REPO_ROOT / ".claude" / "skills" / "create-issue" / "scripts"
+if str(_CREATE_ISSUE_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS_DIR))
+
+from prose_boundary_policy import HEADING_POLICY  # noqa: E402
+
 # Required fields for `decision: immediate` in Runtime Verification Applicability section
 _RVA_IMMEDIATE_REQUIRED_FIELDS = [
     "applicable_acs",
@@ -608,6 +617,122 @@ def check_rva_immediate_fields(body: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# AC4 (#1346): Required Design References check (implementation issues only)
+# ---------------------------------------------------------------------------
+
+# AC10 (#1346): build the RDR heading regex from prose_boundary_policy.py's
+# HEADING_POLICY accepted_forms so this static checker recognises the same heading
+# variants (including Japanese forms) as the authoring-side prose boundary guard.
+_RDR_ACCEPTED_HEADINGS = HEADING_POLICY["Required Design References"]["accepted_forms"]
+_RDR_HEADING_ALT = "|".join(re.escape(h) for h in _RDR_ACCEPTED_HEADINGS)
+_RDR_SECTION_RE = re.compile(
+    rf"^##\s+(?:{_RDR_HEADING_ALT})\s*$(.+?)(?=^##|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+# AC11 (#1346): design-doc path references must point at an actual, narrowly-scoped
+# design-doc location (docs/**/*.md|yml, .claude/skills/**/SKILL.md,
+# .claude/skills/**/references/**/*.md). src/ and scripts/ are intentionally excluded:
+# those are implementation paths, not design-doc references.
+_REQUIRED_DESIGN_REFERENCES_PATH_RE = re.compile(
+    r"(?:^|[\s(`\[])("
+    r"docs/[\w\-./]+\.(?:md|yml)"
+    r"|\.claude/skills/[\w\-./]+/SKILL\.md"
+    r"|\.claude/skills/[\w\-./]+/references/[\w\-./]+\.md"
+    r")"
+)
+
+_PLACEHOLDER_ONLY_VALUES = {"", "n/a", "none", "なし", "-"}
+
+
+def _extract_issue_kind(body: str) -> Optional[str]:
+    """Extract `issue_kind` from the `## Machine-Readable Contract` YAML block.
+
+    Self-contained regex extraction — does NOT forward --kind to
+    validate_issue_body.py (AC6: keep responsibility boundaries intact,
+    do not change existing kind-agnostic fixture behavior).
+    """
+    mrc_match = re.search(
+        r"^##\s+Machine-Readable Contract\s*$(.+?)(?=^##|\Z)",
+        body,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not mrc_match:
+        return None
+    kind_match = re.search(r"^\s*issue_kind:\s*(\S+)", mrc_match.group(1), re.MULTILINE)
+    if not kind_match:
+        return None
+    return kind_match.group(1).strip().strip('"').strip("'")
+
+
+def check_required_design_references(body: str) -> list[dict]:
+    """
+    AC4: For `issue_kind: implementation` issues, validate the
+    `## Required Design References` section (when present) is not
+    empty / N/A / none-only, and contains at least one repo-relative
+    design-doc path reference (e.g. docs/dev/agent-skill-boundaries.md).
+
+    Mirrors the RVA precedent (check_rva_immediate_fields): when the
+    section is entirely absent, this function returns no errors here
+    (existence enforcement is a template / review-issue concern, not this
+    static checker — AC6: do not regress existing go fixtures that predate
+    this section).
+    """
+    if _extract_issue_kind(body) != "implementation":
+        return []
+
+    section_match = _RDR_SECTION_RE.search(body)
+    if not section_match:
+        return []
+
+    section_content = section_match.group(1)
+    section_start_line = body[: section_match.start()].count("\n") + 1
+
+    stripped = section_content.strip()
+    non_empty_lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    is_placeholder_only = (not non_empty_lines) or all(
+        line.lower().lstrip("- ").strip() in _PLACEHOLDER_ONLY_VALUES for line in non_empty_lines
+    )
+
+    # AC11 (#1346): a candidate path is only a valid design-doc reference when it
+    # (a) matches the narrowed docs/**|.claude/skills/**/SKILL.md|.claude/skills/**/references/**
+    #     shape, and (b) actually exists in the repo (Path.exists()).
+    has_path_ref = False
+    for match in _REQUIRED_DESIGN_REFERENCES_PATH_RE.finditer(section_content):
+        candidate = match.group(1)
+        if (_REPO_ROOT / candidate).exists():
+            has_path_ref = True
+            break
+
+    if is_placeholder_only or not has_path_ref:
+        errors = [
+            {
+                "rule_id": "RDR001",
+                "severity": "error",
+                "source_check": "contract_readiness_check",
+                "category": "required_design_references_missing_or_empty",
+                "section": "Required Design References",
+                "line_start": section_start_line,
+                "line_end": section_start_line + section_content.count("\n"),
+                "minimal_context": non_empty_lines[:3],
+                "fix_hint": (
+                    "Add at least one repo-relative, *existing* design-doc path reference "
+                    "(e.g. docs/dev/agent-skill-boundaries.md, .claude/skills/<skill>/SKILL.md, "
+                    "or .claude/skills/<skill>/references/<doc>.md) to Required Design "
+                    "References. Do not leave it empty / N/A / none only. "
+                    "See body-authoring.md#Required Design References Authoring Guidance."
+                ),
+                # AC11 (#1346): not autofixable — the correct design-doc reference requires
+                # human judgment about which SSOT the issue actually depends on.
+                "autofixable": False,
+            }
+        ]
+        return errors
+
+    return []
+
+
+# ---------------------------------------------------------------------------
 # Static VC syntax check (compound command detection without execution)
 # ---------------------------------------------------------------------------
 
@@ -782,6 +907,7 @@ def build_result(
 
     validate_errors = map_validate_errors_to_readiness_errors(validate_result)
     rva_errors = check_rva_immediate_fields(body)
+    rdr_errors = check_required_design_references(body)
 
     preflight_errors: list[dict] = []
     preflight_aggregate = "go"
@@ -795,7 +921,7 @@ def build_result(
     if mode in ("static", "preflight-static"):
         static_vc_errors = check_vc_static_syntax(body)
 
-    all_errors = validate_errors + rva_errors + static_vc_errors + preflight_errors
+    all_errors = validate_errors + rva_errors + rdr_errors + static_vc_errors + preflight_errors
 
     overall_status = compute_aggregate_status(
         validate_errors,
@@ -804,6 +930,8 @@ def build_result(
         static_vc_errors,
         preflight_aggregate,
     )
+    if rdr_errors:
+        overall_status = _raise_status(overall_status, "needs_fix")
 
     fix_hint: Optional[str] = None
     minimal_context: list = []
