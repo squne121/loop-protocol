@@ -362,6 +362,7 @@ jobs:
       # runs the live asset check as a hard gate for every PR.
       - name: Verify preview assets are live
         id: preview-assets-live
+        timeout-minutes: 7
         shell: bash
         run: |
           set -euo pipefail
@@ -423,6 +424,7 @@ jobs:
                 attempt_max_time=$remaining
               fi
 
+              rm -f "${output}.tmp"
               status="$(
                 curl -sS -L \
                   -H 'Cache-Control: no-cache' \
@@ -451,11 +453,11 @@ jobs:
                 # Retry-eligible statuses. Only 404 has been observed in
                 # practice for this issue (Issue #1357: GitHub Pages preview
                 # subdirectory publish lag before the file becomes servable).
-                # The remaining codes are defensive retries for
-                # failure modes that have NOT been observed for this repo's
-                # Pages/CDN setup, kept as a safety margin against
-                # known GitHub Pages/CDN transient behaviors documented
-                # elsewhere:
+                # The remaining codes below are defensive retries against
+                # possible transient Pages/CDN behavior only. They are not
+                # observed for #1357 and are not treated as a documented
+                # GitHub Pages readiness contract -- they are kept purely as
+                # a conservative safety margin:
                 #   000 - curl-level connect/reset failure before any HTTP
                 #         status was returned (defensive, unobserved here).
                 #   403 - Pages CDN can return a spurious forbidden response
