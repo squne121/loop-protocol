@@ -600,7 +600,7 @@ gh issue list --search "<関連語>" --state open --json number,title,url
 
 `create_issue_txn.py --blocked-by` で blocker を指定して起票する（コマンド詳細は `create-issue/SKILL.md` の Blocker / Blocked-by 設定手順を参照）。
 
-## Required Design References Authoring Guidance（Required Design References 執筆ガイド）
+## Required Design References Authoring Guidance（Required Design References セクションの執筆ガイダンス・設計文書参照ガイド）
 
 Issue 本文の `## Required Design References` は、本 Issue の実装が前提とする **設計ドキュメント（SSOT）への repo 相対パス参照** を列挙するセクションである。
 
