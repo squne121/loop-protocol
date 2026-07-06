@@ -457,7 +457,7 @@ jobs:
             done
           }
 
-          overall_deadline=$((SECONDS + 240))
+          overall_deadline=$((SECONDS + 300))
 
           base="${{ steps.vite-base.outputs.base }}"
           preview_url="https://${GITHUB_REPOSITORY_OWNER}.github.io${base}"
