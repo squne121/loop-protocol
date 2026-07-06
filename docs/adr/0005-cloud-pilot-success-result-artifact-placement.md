@@ -88,7 +88,7 @@ cloud_pilot_success_result_placement_decision_v1:
   cloud_pilot_success_result_checker_follow_up_required: true
   in_this_issue: design_decision_and_docs_only
   requires_follow_up_issue: true
-  follow_up_issue_ref: TBD_after_decision
+  follow_up_issue_ref: "#1364"
   follow_up_issue_materialization_required_before_close: true
 
   cloud_adoption_allowed_now: false
@@ -123,6 +123,28 @@ marker_schema:
       - decision
       - metrics
       - safety
+    gate_refs_schema:
+      session_recording_smoke:
+        issue: "#246"
+        required_marker_schema: SESSION_RECORDING_SMOKE_VERDICT/v1
+        required_verdict: pass
+        evidence_digest_required: true
+      latitude_real_pilot_decision:
+        issue: "#1220"
+        required_marker_schema: LATITUDE_PILOT_EXCEPTION_V1
+        required_decision: approve_timeboxed_real_pilot
+        decision_digest_required: true
+      latitude_distribution_gate:
+        issue: "#1261"
+        required_marker_schema: LATITUDE_DISTRIBUTION_GATE_V1
+        required_fields:
+          argv_exposure_state: absent_verified
+          remote_cleanup_state: machine_verified
+      success_contract_checker:
+        issue: "#1326"
+        required_state: completed
+        required_checker_result: pass
+      missing_or_unknown_gate_ref: fail_closed
   target_fields:
     - repo
     - target (issue:<N> または pull_request:<N>)
@@ -133,6 +155,26 @@ marker_schema:
     one_match: update_existing_comment_by_comment_id
     multiple_matches: fail_closed
     stale_digest_mismatch: fail_closed
+  target_schema:
+    repo:
+      pattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    target:
+      type: object
+      required:
+        - kind
+        - number
+        - marker_value
+      properties:
+        kind:
+          enum: [issue, pull_request]
+        number:
+          type: integer
+          minimum: 1
+        marker_value:
+          pattern: "^(issue|pull_request):[1-9][0-9]*$"
+    result_id:
+      pattern: "^cloud-pilot-success-result-[a-z0-9][a-z0-9._-]{0,79}$"
+    page_budget_exhausted: fail_closed
 ```
 
 ### `schema_path`
@@ -182,6 +224,26 @@ digest_policy:
     - stderr
   digest_publication_allowed: true
   raw_source_digest_publication_allowed: false
+  canonicalization_profile:
+    name: cloud_pilot_success_result_public_projection_c14n/v1
+    encoding: utf8
+    unicode_normalization: NFC
+    newline: lf
+    object_key_order: lexical_by_unicode_codepoint
+    omit_absent_optional_fields: true
+    preserve_array_order: true
+    timestamp_format: rfc3339_utc_z
+    number_format: json_integer_or_decimal_no_exponent
+    digest_prefix: "sha256:"
+    digest_input_excludes:
+      - marker_lines
+      - markdown_fence
+      - raw_trace_body
+      - raw_span_body
+      - raw_event_body
+      - raw_prompt
+      - raw_tool_input
+      - raw_tool_output
 ```
 
 既存の `provenance.source_projection_digest` 再計算 fail-closed 方針（`docs/dev/agent-run-report.md` の observation_sources runtime 受け入れ節を参照）と整合させる。
@@ -249,6 +311,30 @@ raw_trace_body_publication_forbidden_fields:
   - shell_history
   - terminal_scrollback
   - provider_console_url_unredacted
+
+raw_trace_body_publication_forbidden_fields_extension:
+  additional_forbidden_or_projected_fields:
+    - tracestate
+    - trace_state
+    - baggage
+    - span_links
+    - exception.stacktrace
+    - exception.message
+    - db.statement
+    - http.request.body
+    - http.response.body
+    - url.full
+    - server.address
+    - client.address
+    - user.id
+    - enduser.id
+    - session.id
+  trace_id_publication_policy:
+    raw_trace_id_publication_forbidden: true
+    required_transform: public_correlation_id
+    format_validation_required: true
+    all_zero_trace_id_rejected: true
+    digest_required: true
 ```
 
 public projection は raw span attributes/events をそのまま出さず、count / coverage / latency / digest / closed enum reason code へ落とす。このリストへの参照は `docs/dev/secret-policy.md` にも追記する（AC8）。
