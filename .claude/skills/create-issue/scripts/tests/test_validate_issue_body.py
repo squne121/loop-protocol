@@ -14,6 +14,7 @@ from validate_issue_body import (
     _extract_vc_ac_numbers,
     _extract_section,
     _validate_lp031_kind_mismatch,
+    _load_required_section_labels,
 )
 
 
@@ -1115,6 +1116,84 @@ test -f foo.py
         result = validate_issue_body(body, kind="implementation", title=None)
         lp031_errors = [e for e in result.errors if e.rule_id == "LP031" and "mismatch" not in e.message]
         assert len(lp031_errors) == 0, "No title => no LP031 title check"
+
+
+class TestAC9RequiredDesignReferencesAuthoring:
+    """AC9 (#1346): authoring-path (validate_issue_body.py --kind implementation)
+    must require 'Required Design References' regardless of ISSUE_TEMPLATE's
+    validations.required flag (forced to false for AC7 to avoid the
+    scope_signal_guard template-driven required-section regression).
+    """
+
+    def test_required_section_labels_includes_rdr_for_implementation_kind(self):
+        """AC9: _load_required_section_labels('implementation') must include
+        'Required Design References' even though the template field itself is
+        validations.required: false."""
+        labels = _load_required_section_labels("implementation")
+        assert "Required Design References" in labels, labels
+
+    def test_required_section_labels_unaffected_for_research_kind(self):
+        """AC9: non-implementation kinds are not affected by this authoring-only rule."""
+        labels = _load_required_section_labels("research")
+        assert "Required Design References" not in labels, labels
+
+    def test_validate_issue_body_flags_missing_rdr_for_implementation_kind(self):
+        """AC9: validate_issue_body(kind='implementation') on a body lacking the
+        Required Design References section reports an LP001 error mentioning it."""
+        body = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+parent_issue: "none"
+goal_ref: "test"
+change_kind: docs
+```
+
+## Acceptance Criteria
+
+- [ ] AC1: test
+
+## Verification Commands
+
+```bash
+test -f foo.py  # AC1
+```
+
+## Allowed Paths
+
+- foo.py
+"""
+        result = validate_issue_body(body, kind="implementation")
+        assert result.status == "fail"
+        lp001_errors = [e for e in result.errors if e.rule_id == "LP001"]
+        assert any("Required Design References" in e.message for e in lp001_errors), (
+            [e.message for e in lp001_errors]
+        )
+
+    def test_validate_issue_body_no_rdr_flag_when_kind_omitted(self):
+        """AC9: without --kind, this authoring-only rule does not apply (legacy
+        fixtures / contract_readiness_check.py callers which do not pass --kind
+        remain unaffected)."""
+        body = """\
+## Acceptance Criteria
+
+- [ ] AC1: test
+
+## Verification Commands
+
+```bash
+test -f foo.py  # AC1
+```
+
+## Allowed Paths
+
+- foo.py
+"""
+        result = validate_issue_body(body, kind=None)
+        lp001_errors = [e for e in result.errors if e.rule_id == "LP001"]
+        assert not any("Required Design References" in e.message for e in lp001_errors)
 
 
 if __name__ == "__main__":
