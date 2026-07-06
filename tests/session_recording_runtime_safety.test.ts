@@ -1769,6 +1769,15 @@ function makeStrictPreflightFixture(
           registry_signature_verified: true,
           provenance_verified: true,
           resolution_source: 'local_lockfile',
+          // #1261 follow-up (PR #1352 REQUEST_CHANGES #4): the strict
+          // predicate now also asserts package_spec (exact semver),
+          // dist_integrity (SRI format), and npx_invocation != floating, so
+          // the base positive fixture must carry well-formed values for all
+          // three (previously only asserted resolution_source + digests).
+          package_spec: '@latitude-data/claude-code-telemetry@1.2.3',
+          dist_integrity:
+            'sha512-' + 'a'.repeat(88) + '==',
+          npx_invocation: 'absent',
           resolved_registry_origin: 'https://registry.npmjs.org',
           lockfile_digest: `sha256:${'b'.repeat(64)}`,
           tarball_sha256: `sha256:${'c'.repeat(64)}`,
@@ -2309,6 +2318,121 @@ describe('runtime safety #1258: latitude:real-pilot:preflight strict gate', () =
       expect(result.json?.['verdict']).toBe('fail_closed')
     })
   }
+
+  // ==========================================================================
+  // PR #1352 REQUEST_CHANGES fix_delta: negative fixtures for the strengthened
+  // strict predicate (floating npx block, malformed digest, registry
+  // mismatch, exact-semver-missing package_spec). remote_cleanup_state
+  // human_attested is already covered by the badCleanupState loop above.
+  // ==========================================================================
+
+  it('GIVEN distribution.npx_invocation=floating (even with every digest well-formed) WHEN strict predicate runs THEN fail_closed (never allow via digest-only fixture)', () => {
+    const positive = makeStrictPreflightFixture() as { components: { latitude: Record<string, unknown> } }
+    const baseDist = positive.components.latitude['distribution'] as Record<string, unknown>
+    const result = runPreflightPredicate(makeStrictPreflightFixture({
+      components: {
+        latitude: {
+          ...positive.components.latitude,
+          distribution: { ...baseDist, npx_invocation: 'floating' },
+        },
+      },
+    }))
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(result.json?.['decision']).toBe('deny')
+    expect(result.json?.['verdict']).toBe('fail_closed')
+  })
+
+  for (const malformedField of [
+    'lockfile_digest',
+    'tarball_sha256',
+    'installed_entrypoint_sha256',
+    'preload_sha256',
+    'hook_command_sha256',
+  ]) {
+    it(`GIVEN ${malformedField} is a malformed (non sha256:<64hex>) digest WHEN strict predicate runs THEN fail_closed`, () => {
+      const positive = makeStrictPreflightFixture() as { components: { latitude: Record<string, unknown> } }
+      const baseDist = positive.components.latitude['distribution'] as Record<string, unknown>
+      const result = runPreflightPredicate(makeStrictPreflightFixture({
+        components: {
+          latitude: {
+            ...positive.components.latitude,
+            distribution: { ...baseDist, [malformedField]: 'sha256:not-64-hex-chars' },
+          },
+        },
+      }))
+      expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+      expect(result.json?.['decision']).toBe('deny')
+      expect(result.json?.['verdict']).toBe('fail_closed')
+    })
+  }
+
+  it('GIVEN resolved_registry_origin is not an approved registry (registry mismatch) WHEN strict predicate runs THEN fail_closed', () => {
+    const positive = makeStrictPreflightFixture() as { components: { latitude: Record<string, unknown> } }
+    const baseDist = positive.components.latitude['distribution'] as Record<string, unknown>
+    const result = runPreflightPredicate(makeStrictPreflightFixture({
+      components: {
+        latitude: {
+          ...positive.components.latitude,
+          distribution: { ...baseDist, resolved_registry_origin: 'https://evil-registry.example.com' },
+        },
+      },
+    }))
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(result.json?.['decision']).toBe('deny')
+    expect(result.json?.['verdict']).toBe('fail_closed')
+  })
+
+  for (const badSpec of [
+    '@latitude-data/claude-code-telemetry',
+    '@latitude-data/claude-code-telemetry@latest',
+    'npx -y @latitude-data/claude-code-telemetry',
+  ]) {
+    it(`GIVEN package_spec=${badSpec} (exact semver missing) WHEN strict predicate runs THEN fail_closed`, () => {
+      const positive = makeStrictPreflightFixture() as { components: { latitude: Record<string, unknown> } }
+      const baseDist = positive.components.latitude['distribution'] as Record<string, unknown>
+      const result = runPreflightPredicate(makeStrictPreflightFixture({
+        components: {
+          latitude: {
+            ...positive.components.latitude,
+            distribution: { ...baseDist, package_spec: badSpec },
+          },
+        },
+      }))
+      expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+      expect(result.json?.['decision']).toBe('deny')
+      expect(result.json?.['verdict']).toBe('fail_closed')
+    })
+  }
+
+  it('GIVEN dist_integrity is not SRI-formatted WHEN strict predicate runs THEN fail_closed', () => {
+    const positive = makeStrictPreflightFixture() as { components: { latitude: Record<string, unknown> } }
+    const baseDist = positive.components.latitude['distribution'] as Record<string, unknown>
+    const result = runPreflightPredicate(makeStrictPreflightFixture({
+      components: {
+        latitude: {
+          ...positive.components.latitude,
+          distribution: { ...baseDist, dist_integrity: 'not-a-sri-digest' },
+        },
+      },
+    }))
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(result.json?.['decision']).toBe('deny')
+    expect(result.json?.['verdict']).toBe('fail_closed')
+  })
+
+  it('GIVEN argv_exposure_state cannot be verified (scan inconclusive, AC5 unknown) WHEN strict predicate runs THEN fail_closed (never allow)', () => {
+    // Functional-level (not strict-predicate JSON re-evaluation) coverage:
+    // the legacy SRRS_LAT_ARGV_CREDENTIAL override no longer promotes
+    // 'absent' to 'absent_verified' -- it must fall back to 'unknown'
+    // (fail-closed) because a single boolean override cannot positively
+    // assert that a presence-only scan over relevant processes completed.
+    const result = runVerifierJson({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_ARGV_CREDENTIAL: 'absent',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    expect(lat?.['argv_exposure_state']).toBe('unknown')
+  })
 
   it('GIVEN unpinned npx invocation with no distribution digests (AC1, AC2 npx_only_without_exact_version) WHEN real-pilot env flow runs THEN blocked or fail_closed (never allow)', () => {
     const result = runRealPilotPreflight({

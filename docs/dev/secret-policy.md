@@ -315,11 +315,15 @@ session_recording_script_contract:
 # Consumer: latitude:real-pilot:preflight allow_requires (above) and the
 # Cloud Pilot Success Contract gate_evidence_contract.latitude_distribution_gate
 # (below). `state: completed` here means "the checker directly asserts every
-# field below" (this PR); it does NOT mean the cryptographic evidence
-# (registry signature / provenance / tarball / entrypoint / preload / hook
-# digests) is machine-verified against a real npm registry in host mode yet —
-# that remains fail-closed (`unknown`) until a follow-up Issue wires real
-# `npm audit signatures` + isolated-install hashing.
+# field below, including exact-semver / SRI / approved-registry-origin /
+# npx_invocation field-level validation" (PR #1352 fix_delta); it does NOT
+# mean the cryptographic evidence (registry signature / provenance / tarball /
+# entrypoint / preload / hook digests) is machine-verified against a real npm
+# registry in host mode yet, nor that host execution evidence
+# (`pnpm run security:session-recording:host` / `pnpm run policy:check` logs)
+# has been attached to a PR — those remain fail-closed (`unknown`) / pending
+# until a follow-up Issue wires real `npm audit signatures` + isolated-install
+# hashing and a host run is actually performed and attached.
 ```yaml
 LATITUDE_DISTRIBUTION_GATE_V1:
   schema: LATITUDE_DISTRIBUTION_GATE_V1
@@ -327,7 +331,9 @@ LATITUDE_DISTRIBUTION_GATE_V1:
   state: completed
   package_name: "@latitude-data/claude-code-telemetry"
   package_spec: "@latitude-data/claude-code-telemetry@x.y.z"
+  package_spec_must_be_exact_semver: true
   resolved_registry_origin: "https://registry.npmjs.org"
+  resolved_registry_origin_must_be_approved: true
   resolution_source_enum:
     - local_lockfile
     - project_local_install
@@ -336,8 +342,21 @@ LATITUDE_DISTRIBUTION_GATE_V1:
     - npx_only
     - unknown
   npx_only_without_exact_version_blocked: true
+  # PR #1352 fix_delta: npx_invocation is independent of resolution_source.
+  # Claude settings hook-command parsing (read-only, floating `npx -y <pkg>`
+  # detection) takes priority over lockfile/node_modules/npm-cache/global
+  # inventory checks, because a floating npx invocation re-resolves the
+  # package from the registry on every run regardless of what happens to be
+  # cached or lockfile-pinned locally.
+  npx_invocation_enum:
+    - exact_version
+    - floating
+    - absent
+    - unknown
+  npx_invocation_floating_always_blocked: true
   lockfile_digest: "sha256:<64hex>"
   dist_integrity: "sha512-..."
+  dist_integrity_must_be_sri_format: true
   npm_registry_signature_verified: true
   provenance_verified: true
   tarball_sha256: "sha256:<64hex>"
@@ -348,6 +367,8 @@ LATITUDE_DISTRIBUTION_GATE_V1:
     - absent_verified
     - possible
     - unknown
+  argv_exposure_state_producer: relevant_process_argv_scan
+  argv_exposure_state_never_reads: [checker_self_argv, shell_history, terminal_scrollback]
   remote_cleanup_state_enum:
     - machine_verified
     - human_attested
@@ -357,6 +378,16 @@ LATITUDE_DISTRIBUTION_GATE_V1:
     - allow
     - blocked
     - fail_closed
+  reason_codes_v2:
+    - latitude_npx_invocation_floating
+    - latitude_registry_origin_missing_or_mismatch
+    - latitude_lockfile_digest_missing_or_malformed
+    - latitude_tarball_digest_missing_or_malformed
+    - latitude_entrypoint_digest_missing_or_malformed
+    - latitude_preload_digest_missing_or_malformed
+    - latitude_package_spec_not_exact
+    - latitude_dist_integrity_malformed
+  host_execution_evidence_status: pending   # #1261 remains open until host logs are attached
 ```
 
 ---

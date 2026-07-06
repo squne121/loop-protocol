@@ -319,16 +319,35 @@ real session 開始可否（`real_session_start_gate`）の正本は、`docs/dev
   Claude Code hook は matching する全 hook が並列実行されるため、hook の通過を activation 証明にしない。
 - `latitude:real-pilot:preflight` は上記 host verifier JSON を strict mode で再評価する
   sole real-pilot pre-session gate であり、`decision: allow` 単独や fixture PASS を allow 根拠にしない。
-- `latitude:real-pilot:preflight`（#1261 実装後）は `components.latitude.distribution.state` の
-  summary field だけでなく、`resolution_source`（closed enum・`unknown` 不可）、
-  `resolved_registry_origin`、`lockfile_digest`、`tarball_sha256`、`installed_entrypoint_sha256`、
-  `preload_sha256`、`hook_command_sha256`（すべて `sha256:<64hex>`）、
+- `latitude:real-pilot:preflight`（#1261 実装後、PR #1352 fix_delta 反映）は
+  `components.latitude.distribution.state` の summary field だけでなく、`resolution_source`
+  （closed enum・`unknown` 不可）、`package_spec`（exact semver 必須。`npx` prefix を正規化した上で
+  `<name>@x.y.z` 形式を強制）、`dist_integrity`（SRI 形式必須）、`resolved_registry_origin`
+  （approved registry origin と一致必須）、`lockfile_digest`、`tarball_sha256`、
+  `installed_entrypoint_sha256`、`preload_sha256`、`hook_command_sha256`（すべて `sha256:<64hex>`）、
+  `npx_invocation`（closed enum。`floating` は常に block）、
   `components.latitude.argv_exposure_state`（`absent_verified` 必須）、
   `components.latitude.remote_cleanup_state`（`machine_verified` 必須、`human_attested` は代替不可）を
-  直接 assert する。host mode の real npm registry signature / provenance attestation 検証と
+  直接 assert する。
+- `npx_invocation` の判定は Claude settings hook command の read-only parsing を最優先とする。
+  floating `npx -y @latitude-data/claude-code-telemetry` のような version 未固定の npx 起動は、
+  lockfile / node_modules / npm cache / npm global list による分類より優先して
+  `resolution_source: npx_only` + `npx_invocation: floating` として検出し、
+  `latitude_npx_invocation_floating` reason_code とともに real pilot preflight を block する。
+- `argv_exposure_state` の host mode 検査は、checker 自身の argv（`/proc/self/cmdline`）ではなく、
+  Claude Code / node / bun / npx / npm / Latitude telemetry package を含む command line を持つ
+  関連プロセス群への presence-only scan とする。shell history / terminal scrollback は読まない。
+  scan が完了できない（`/proc` 読み取り不可・関連プロセス特定不可・権限不足）場合は
+  `unknown`（fail-closed）とし、`absent_verified` は positive scan が完了した場合にのみ返す。
+  legacy override `SRRS_LAT_ARGV_CREDENTIAL` も、`present` 以外の値（`absent` を含む）は
+  `unknown` に寄せ、単一の boolean override から `absent_verified` を断定しない。
+- host mode の real npm registry signature / provenance attestation 検証と
   installed entrypoint / preload / hook command の実 sha256 計算、provider-side retention の
-  real machine verification は follow-up Issue の対象であり、それまでは host 実行時にこれらの
-  evidence field が `unknown` / `None` のまま fail-closed になる（false-green にはならない）。
+  real machine verification は follow-up Issue（#1351）の対象であり、それまでは host 実行時に
+  これらの evidence field が `unknown` / `None` のまま fail-closed になる（false-green にはならない）。
+- #1261 は本 PR（#1352）の fix_delta 反映後も、`pnpm run security:session-recording:host` /
+  `pnpm run policy:check` の host 実行ログが未添付である限り open のままとし、この PR 単体では
+  close しない。host 実行証跡が添付された時点で改めて #1261 の close 判断を行う。
 - `security:session-recording` は CI / policy / smoke bundle であり、host readiness proof ではない。
 - `security:session-recording:host` は pre-activation local preflight 専用であり、
   `SRRS_*` override を reject する。generic CI required gate には組み込まない。

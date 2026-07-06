@@ -1099,11 +1099,44 @@ _RESOLUTION_SOURCE_ENUM = {
     "npx_only",
     "unknown",
 }
+# #1261 follow-up (PR #1352 REQUEST_CHANGES #2/#4): closed enum for the
+# npx_invocation field. Kept in sync with
+# .claude/scripts/lib/latitude_telemetry_safety.NPX_INVOCATION_ENUM.
+_NPX_INVOCATION_ENUM = {"exact_version", "floating", "absent", "unknown"}
+# #1261 follow-up: approved npm registry origins for resolved_registry_origin.
+# Kept in sync with
+# .claude/scripts/lib/latitude_telemetry_safety._APPROVED_REGISTRY_ORIGINS.
+_APPROVED_REGISTRY_ORIGINS = {"https://registry.npmjs.org"}
+_NPX_PREFIX_RE = re.compile(r"^npx\s+(?:-y|--yes)?\s*", re.IGNORECASE)
+_EXACT_SEMVER_SPEC_RE = re.compile(
+    r"^(@[\w.\-]+/[\w.\-]+|[\w.\-]+)@\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?$"
+)
+_SRI_DIGEST_RE = re.compile(r"^sha(256|384|512)-[A-Za-z0-9+/]+={0,2}$")
 
 
 def _evidence_sha256_ok(value: Any) -> bool:
     """#1261: True iff value is a well-formed `sha256:<64hex>` digest string."""
     return isinstance(value, str) and SOURCE_DIGEST_SHA256_RE.fullmatch(value) is not None
+
+
+def _package_spec_exact_ok(value: Any) -> bool:
+    """#1261 follow-up: True iff value normalizes (stripping a leading
+    `npx`/`npx -y` prefix) to `<name>@x.y.z` exact semver.
+    """
+    if not isinstance(value, str):
+        return False
+    normalized = _NPX_PREFIX_RE.sub("", value).strip()
+    return _EXACT_SEMVER_SPEC_RE.fullmatch(normalized) is not None
+
+
+def _dist_integrity_ok(value: Any) -> bool:
+    """#1261 follow-up: True iff value looks like a Subresource Integrity digest."""
+    return isinstance(value, str) and _SRI_DIGEST_RE.fullmatch(value) is not None
+
+
+def _registry_origin_ok(value: Any) -> bool:
+    """#1261 follow-up: resolved_registry_origin must be an approved npm registry."""
+    return isinstance(value, str) and value in _APPROVED_REGISTRY_ORIGINS
 
 
 def _evaluate_real_pilot_preflight_output(output: dict[str, Any]) -> tuple[str, int, bool]:
@@ -1152,6 +1185,9 @@ def _evaluate_real_pilot_preflight_output(output: dict[str, Any]) -> tuple[str, 
     argv_exposure_state = latitude.get("argv_exposure_state")
     remote_cleanup_state = latitude.get("remote_cleanup_state")
 
+    npx_invocation = dist.get("npx_invocation")
+    npx_invocation_ok = npx_invocation != "floating"
+
     preflight_ready = all([
         output.get("decision") == "allow",
         output.get("verdict") == "safe",
@@ -1177,6 +1213,17 @@ def _evaluate_real_pilot_preflight_output(output: dict[str, Any]) -> tuple[str, 
         _evidence_sha256_ok(dist.get("installed_entrypoint_sha256")),
         _evidence_sha256_ok(dist.get("preload_sha256")),
         _evidence_sha256_ok(dist.get("hook_command_sha256")),
+        # #1261 follow-up (PR #1352 REQUEST_CHANGES #4): field-level strength,
+        # not just presence. A digest-shaped placeholder is not accepted
+        # unless the underlying evidence field is itself well-formed.
+        _evidence_sha256_ok(dist.get("lockfile_digest")),
+        _package_spec_exact_ok(dist.get("package_spec")),
+        _dist_integrity_ok(dist.get("dist_integrity")),
+        _registry_origin_ok(dist.get("resolved_registry_origin")),
+        # #1261 follow-up (PR #1352 REQUEST_CHANGES #2): a floating
+        # `npx -y <pkg>` invocation is always blocked, even if every other
+        # digest field happens to be well-formed (adversarial fixture guard).
+        npx_invocation_ok,
         # #1261 AC5: argv_exposure_state must be positively cleared.
         argv_exposure_state == "absent_verified",
         # #1261 AC7: remote_cleanup_state must be machine-verified
@@ -1657,6 +1704,30 @@ def main() -> int:
                         "latitude": {
                             "applicability": "applicable",
                             "verdict": "fail_closed",
+                            # #1261 follow-up (PR #1352 REQUEST_CHANGES P1):
+                            # keep this generic SRRS_* override-rejection shape
+                            # in sync with the SRRS_LAT_*-specific rejection
+                            # path in check_latitude_component (lib/) so
+                            # consumers never see a shape drift between the
+                            # two fail_closed producers.
+                            "argv_exposure_state": "unknown",
+                            "remote_cleanup_state": "unknown",
+                            "distribution": {
+                                "state": "unknown",
+                                "package_spec": None,
+                                "dist_integrity": None,
+                                "registry_signature_verified": None,
+                                "provenance_verified": None,
+                                "provenance_source_ref": None,
+                                "resolved_registry_origin": None,
+                                "resolution_source": "unknown",
+                                "npx_invocation": "unknown",
+                                "lockfile_digest": None,
+                                "tarball_sha256": None,
+                                "installed_entrypoint_sha256": None,
+                                "preload_sha256": None,
+                                "hook_command_sha256": None,
+                            },
                             "reason_codes": ["latitude_srrs_override_rejected"],
                             "raw_values_emitted": False,
                         },

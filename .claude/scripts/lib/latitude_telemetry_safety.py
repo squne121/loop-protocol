@@ -100,6 +100,16 @@ RC_RESOLUTION_SOURCE_UNKNOWN = "latitude_resolution_source_unknown"
 RC_ARGV_EXPOSURE_STATE_UNKNOWN = "latitude_argv_exposure_state_unknown"
 RC_REMOTE_CLEANUP_NOT_MACHINE_VERIFIED = "latitude_remote_cleanup_state_not_machine_verified"
 RC_HOOK_COMMAND_DIGEST_MISSING = "latitude_hook_command_digest_missing"
+# PR #1352 REQUEST_CHANGES follow-up: per-field reason codes so missing/malformed
+# evidence is never silently absorbed into a single generic code.
+RC_NPX_INVOCATION_FLOATING = "latitude_npx_invocation_floating"
+RC_REGISTRY_ORIGIN_MISSING_OR_MISMATCH = "latitude_registry_origin_missing_or_mismatch"
+RC_LOCKFILE_DIGEST_MISSING_OR_MALFORMED = "latitude_lockfile_digest_missing_or_malformed"
+RC_TARBALL_DIGEST_MISSING_OR_MALFORMED = "latitude_tarball_digest_missing_or_malformed"
+RC_ENTRYPOINT_DIGEST_MISSING_OR_MALFORMED = "latitude_entrypoint_digest_missing_or_malformed"
+RC_PRELOAD_DIGEST_MISSING_OR_MALFORMED = "latitude_preload_digest_missing_or_malformed"
+RC_PACKAGE_SPEC_NOT_EXACT = "latitude_package_spec_not_exact"
+RC_DIST_INTEGRITY_MALFORMED = "latitude_dist_integrity_malformed"
 
 # #1261: closed enums for the Latitude distribution / argv exposure / remote
 # cleanup evidence gate (LATITUDE_DISTRIBUTION_GATE_V1, docs/dev/secret-policy.md).
@@ -113,6 +123,45 @@ RESOLUTION_SOURCE_ENUM = {
 }
 ARGV_EXPOSURE_STATE_ENUM = {"absent_verified", "possible", "unknown"}
 REMOTE_CLEANUP_STATE_ENUM = {"machine_verified", "human_attested", "unknown"}
+# PR #1352 REQUEST_CHANGES follow-up: npx_invocation is independent of
+# resolution_source so a floating `npx -y <pkg>` invocation (no exact version
+# pin) can be blocked even when other evidence looks complete.
+NPX_INVOCATION_ENUM = {"exact_version", "floating", "absent", "unknown"}
+_EVIDENCE_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_APPROVED_REGISTRY_ORIGINS = {"https://registry.npmjs.org"}
+_NPX_PREFIX_RE = re.compile(r"^npx\s+(?:-y|--yes)?\s*", re.IGNORECASE)
+_EXACT_SEMVER_SPEC_RE = re.compile(
+    r"^(@[\w.\-]+/[\w.\-]+|[\w.\-]+)@\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?$"
+)
+_SRI_DIGEST_RE = re.compile(r"^sha(256|384|512)-[A-Za-z0-9+/]+={0,2}$")
+
+
+def _is_evidence_sha256(value: Any) -> bool:
+    """#1261 follow-up: True iff value is a well-formed `sha256:<64hex>` digest."""
+    return isinstance(value, str) and _EVIDENCE_SHA256_RE.fullmatch(value) is not None
+
+
+def _is_exact_semver_spec(value: Any) -> bool:
+    """#1261 follow-up: True iff value normalizes to `<name>@x.y.z` exact semver.
+
+    Strips a leading `npx`/`npx -y` prefix (the distribution checker stores the
+    raw hook/dist spec, which may include the npx invocation prefix) before
+    validating the exact-semver suffix.
+    """
+    if not isinstance(value, str):
+        return False
+    normalized = _NPX_PREFIX_RE.sub("", value).strip()
+    return _EXACT_SEMVER_SPEC_RE.fullmatch(normalized) is not None
+
+
+def _is_sri_digest(value: Any) -> bool:
+    """#1261 follow-up: True iff value looks like a Subresource Integrity digest."""
+    return isinstance(value, str) and _SRI_DIGEST_RE.fullmatch(value) is not None
+
+
+def _is_approved_registry_origin(value: Any) -> bool:
+    """#1261 follow-up: resolved_registry_origin must be an approved npm registry."""
+    return isinstance(value, str) and value in _APPROVED_REGISTRY_ORIGINS
 
 # Known Latitude hook command patterns (for presence detection)
 _LATITUDE_HOOK_PATTERNS = [
@@ -862,6 +911,7 @@ def check_distribution(repo_root: Path, execution_profile: str) -> dict[str, Any
     entrypoint_override = _get_env_override("SRRS_LAT_ENTRYPOINT_SHA256")
     preload_override = _get_env_override("SRRS_LAT_PRELOAD_SHA256")
     hook_command_override = _get_env_override("SRRS_LAT_HOOK_COMMAND_SHA256")
+    npx_invocation_override = _get_env_override("SRRS_LAT_NPX_INVOCATION")
 
     # #1261: the new evidence overrides are only asserted when a caller opts in
     # by setting at least one of them, so pre-existing callers that only use the
@@ -895,6 +945,22 @@ def check_distribution(repo_root: Path, execution_profile: str) -> dict[str, Any
         provenance_unknown = provenance == "unknown"
         is_npx_only = resolution_source == "npx_only"
 
+        # #1261 follow-up (PR #1352 REQUEST_CHANGES): npx_invocation is a
+        # closed-enum field independent of resolution_source. It can be set
+        # explicitly for tests; otherwise it is derived from is_npx_only /
+        # is_unpinned so a floating `npx -y <pkg>` (no exact version) is
+        # always classified as `floating`, never silently `absent`/`unknown`.
+        if npx_invocation_override is not None:
+            npx_invocation = npx_invocation_override.strip()
+            if npx_invocation not in NPX_INVOCATION_ENUM:
+                npx_invocation = "unknown"
+        elif is_npx_only:
+            npx_invocation = "floating" if is_unpinned else "exact_version"
+        elif resolution_source == "unknown":
+            npx_invocation = "unknown"
+        else:
+            npx_invocation = "absent"
+
         reason_codes = []
         if is_unpinned:
             reason_codes.append(RC_DISTRIBUTION_UNPINNED)
@@ -903,10 +969,28 @@ def check_distribution(repo_root: Path, execution_profile: str) -> dict[str, Any
         if new_evidence_requested:
             if is_npx_only and is_unpinned:
                 reason_codes.append(RC_NPX_ONLY_UNPINNED)
+            if npx_invocation == "floating":
+                reason_codes.append(RC_NPX_INVOCATION_FLOATING)
             if resolution_source_override is not None and resolution_source == "unknown":
                 reason_codes.append(RC_RESOLUTION_SOURCE_UNKNOWN)
             if not hook_command_sha256:
                 reason_codes.append(RC_HOOK_COMMAND_DIGEST_MISSING)
+            # #1261 follow-up: per-field reason codes for missing/malformed
+            # evidence (PR #1352 REQUEST_CHANGES P1).
+            if not _is_approved_registry_origin(registry_origin if registry_origin != "unknown" else None):
+                reason_codes.append(RC_REGISTRY_ORIGIN_MISSING_OR_MISMATCH)
+            if not _is_evidence_sha256(lockfile_digest):
+                reason_codes.append(RC_LOCKFILE_DIGEST_MISSING_OR_MALFORMED)
+            if not _is_evidence_sha256(tarball_sha256):
+                reason_codes.append(RC_TARBALL_DIGEST_MISSING_OR_MALFORMED)
+            if not _is_evidence_sha256(installed_entrypoint_sha256):
+                reason_codes.append(RC_ENTRYPOINT_DIGEST_MISSING_OR_MALFORMED)
+            if not _is_evidence_sha256(preload_sha256):
+                reason_codes.append(RC_PRELOAD_DIGEST_MISSING_OR_MALFORMED)
+            if spec not in ("unpinned", "unknown") and not _is_exact_semver_spec(spec):
+                reason_codes.append(RC_PACKAGE_SPEC_NOT_EXACT)
+            if integrity != "unknown" and not _is_sri_digest(integrity):
+                reason_codes.append(RC_DIST_INTEGRITY_MALFORMED)
 
         result_state = "unpinned" if is_unpinned else (
             "unverified" if provenance_unknown else "verified"
@@ -921,6 +1005,7 @@ def check_distribution(repo_root: Path, execution_profile: str) -> dict[str, Any
             "provenance_source_ref": None,
             "resolved_registry_origin": registry_origin if registry_origin != "unknown" else None,
             "resolution_source": resolution_source,
+            "npx_invocation": npx_invocation,
             "lockfile_digest": lockfile_digest,
             "tarball_sha256": tarball_sha256,
             "installed_entrypoint_sha256": installed_entrypoint_sha256,
@@ -943,6 +1028,7 @@ def check_distribution(repo_root: Path, execution_profile: str) -> dict[str, Any
         "provenance_source_ref": None,
         "resolved_registry_origin": None,
         "resolution_source": "unknown",
+        "npx_invocation": "unknown",
         "lockfile_digest": None,
         "tarball_sha256": None,
         "installed_entrypoint_sha256": None,
@@ -960,33 +1046,93 @@ _LAT_PACKAGES = (
 )
 
 
-def _classify_resolution_source_host(repo_root: Path, pkg: str) -> str:
+def _read_claude_settings_text_host(repo_root: Path) -> list[str]:
+    """#1261 follow-up: read-only text of Claude settings surfaces (host mode).
+
+    Returns the raw text of any settings.json files that exist, so the caller
+    can pattern-match hook commands. Never reads shell history / terminal
+    scrollback; only the same settings.json surfaces `check_hook_state`
+    already inspects (repo-project settings first, then real user home).
+    """
+    texts: list[str] = []
+    candidates = [repo_root / ".claude" / "settings.json"]
+    try:
+        candidates.append(Path.home() / ".claude" / "settings.json")
+    except RuntimeError:
+        pass
+    for settings_path in candidates:
+        if settings_path.is_file():
+            try:
+                texts.append(settings_path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+    return texts
+
+
+def _find_npx_invocation_for_package(text: str, pkg: str) -> str | None:
+    """#1261 follow-up: return 'floating' or 'exact_version' for an
+    `npx -y <pkg>[@version]` invocation of `pkg` found in `text`, else None.
+
+    A floating invocation (no version pin at all, e.g. the upstream
+    `npx -y @latitude-data/claude-code-telemetry` install/Stop-hook command)
+    is classified `floating` even when other repo-local evidence (lockfile,
+    node_modules, npm cache) looks like a pinned install, because npx always
+    re-resolves against the registry at invocation time.
+    """
+    pattern = re.compile(
+        r"npx\s+(?:-y|--yes)\s+" + re.escape(pkg) + r"(@(\S+))?",
+        re.IGNORECASE,
+    )
+    m = pattern.search(text)
+    if m is None:
+        return None
+    version = m.group(2)
+    if version and _is_version_pinned(f"{pkg}@{version}"):
+        return "exact_version"
+    return "floating"
+
+
+def _classify_resolution_source_host(repo_root: Path, pkg: str) -> tuple[str, str]:
     """#1261: best-effort, presence-only classification of npm resolution source.
 
-    Never reads shell history / terminal scrollback. Only inspects repo-local
-    lockfiles, repo-local node_modules, and npm's own cache/global-install
-    inventory commands (subprocess, stdout not forwarded to caller).
+    Returns (resolution_source, npx_invocation). Never reads shell history /
+    terminal scrollback. Hook-command parsing (Claude settings.json, read-only)
+    takes priority over repo-local lockfiles / node_modules / npm's own
+    cache/global-install inventory commands (subprocess, stdout not forwarded
+    to caller): a floating `npx -y <pkg>` Stop hook re-resolves the package
+    from the registry on every invocation regardless of what happens to be
+    cached or lockfile-pinned in the repo, so it must be surfaced as
+    `npx_only` / `floating` and not hidden behind a `local_lockfile` or
+    `npm_cache` classification (PR #1352 REQUEST_CHANGES #2).
     """
+    for text in _read_claude_settings_text_host(repo_root):
+        invocation = _find_npx_invocation_for_package(text, pkg)
+        if invocation is not None:
+            return "npx_only", invocation
+
     for lockfile_name in ("package-lock.json", "npm-shrinkwrap.json"):
         lockfile = repo_root / lockfile_name
         if lockfile.is_file():
             try:
-                text = lockfile.read_text(encoding="utf-8", errors="replace")
-                if pkg in text:
-                    return "local_lockfile"
+                lock_text = lockfile.read_text(encoding="utf-8", errors="replace")
+                if pkg in lock_text:
+                    return "local_lockfile", "absent"
             except OSError:
                 pass
 
     if (repo_root / "node_modules" / pkg).is_dir():
-        return "project_local_install"
+        return "project_local_install", "absent"
 
+    # Auxiliary evidence only: `npm cache ls` inspects npm's general package
+    # cache, not the npx-specific cache (`npm cache npx ls/info`), so it is
+    # only consulted when no hook-based npx invocation was found above.
     try:
         result = subprocess.run(
             ["npm", "cache", "ls", pkg],
             capture_output=True, text=True, timeout=15,
         )
         if result.returncode == 0 and pkg in (result.stdout or ""):
-            return "npm_cache"
+            return "npm_cache", "absent"
     except (OSError, FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
@@ -996,23 +1142,23 @@ def _classify_resolution_source_host(repo_root: Path, pkg: str) -> str:
             capture_output=True, text=True, timeout=15,
         )
         if result.returncode == 0 and pkg in (result.stdout or ""):
-            return "global_install"
+            return "global_install", "absent"
     except (OSError, FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
-    return "unknown"
+    return "unknown", "unknown"
 
 
 def _check_distribution_host(repo_root: Path | None = None) -> dict[str, Any]:
     """B4, #1261: Check Latitude distribution in host mode.
 
-    Classifies resolution_source from repo-local evidence only (lockfile /
-    node_modules / npm cache / global install). Cryptographic evidence
-    (registry signature, provenance attestation, tarball/entrypoint/preload/
-    hook-command digests) is not computed here (requires real registry
-    network access and an isolated install tree, out of scope for this
-    checker) and stays None/fail-closed, matching the fail-closed contract:
-    unknown evidence must never be treated as verified.
+    Classifies resolution_source from repo-local evidence (Claude settings
+    hook command / lockfile / node_modules / npm cache / global install).
+    Cryptographic evidence (registry signature, provenance attestation,
+    tarball/entrypoint/preload/hook-command digests) is not computed here
+    (requires real registry network access and an isolated install tree, out
+    of scope for this checker) and stays None/fail-closed, matching the
+    fail-closed contract: unknown evidence must never be treated as verified.
     """
     root = repo_root if repo_root is not None else Path.cwd()
     inspection_gaps = ["registry_signature", "provenance_attestation",
@@ -1021,11 +1167,13 @@ def _check_distribution_host(repo_root: Path | None = None) -> dict[str, Any]:
 
     found_spec = None
     resolution_source = "unknown"
+    npx_invocation = "unknown"
     for pkg in _LAT_PACKAGES:
-        source = _classify_resolution_source_host(root, pkg)
+        source, invocation = _classify_resolution_source_host(root, pkg)
         if source != "unknown":
             found_spec = pkg
             resolution_source = source
+            npx_invocation = invocation
             break
 
     base = {
@@ -1037,6 +1185,7 @@ def _check_distribution_host(repo_root: Path | None = None) -> dict[str, Any]:
         "provenance_source_ref": None,
         "resolved_registry_origin": None,
         "resolution_source": resolution_source,
+        "npx_invocation": npx_invocation,
         "lockfile_digest": None,
         "tarball_sha256": None,
         "installed_entrypoint_sha256": None,
@@ -1046,11 +1195,16 @@ def _check_distribution_host(repo_root: Path | None = None) -> dict[str, Any]:
         "inspection_gaps": inspection_gaps,
     }
 
+    reason_codes: list[str] = []
     if found_spec is None:
-        base["reason_codes"] = [RC_RUNTIME_STATE_UNKNOWN, RC_RESOLUTION_SOURCE_UNKNOWN]
+        reason_codes = [RC_RUNTIME_STATE_UNKNOWN, RC_RESOLUTION_SOURCE_UNKNOWN]
         base["inspection_gaps"] = ["package_distribution"] + inspection_gaps
     else:
-        base["reason_codes"] = [RC_RUNTIME_STATE_UNKNOWN]
+        reason_codes = [RC_RUNTIME_STATE_UNKNOWN]
+        if npx_invocation == "floating":
+            reason_codes.append(RC_NPX_ONLY_UNPINNED)
+            reason_codes.append(RC_NPX_INVOCATION_FLOATING)
+    base["reason_codes"] = reason_codes
 
     return base
 
@@ -1138,12 +1292,115 @@ def check_destination_transport(execution_profile: str) -> dict[str, Any]:
     }
 
 
+_ARGV_CREDENTIAL_PATTERNS = [
+    re.compile(r"--api[-_]?key", re.IGNORECASE),
+    re.compile(r"--latitude[-_]?key", re.IGNORECASE),
+]
+
+# #1261 follow-up (PR #1352 REQUEST_CHANGES #3): only inspect processes whose
+# comm/cmdline plausibly belongs to Claude Code / the Latitude telemetry
+# toolchain. Never widen this to an unrelated process (or shell history).
+_ARGV_RELEVANT_PROCESS_PATTERNS = [
+    re.compile(r"\bclaude\b", re.IGNORECASE),
+    re.compile(r"\bnode\b", re.IGNORECASE),
+    re.compile(r"\bbun\b", re.IGNORECASE),
+    re.compile(r"\bnpx\b", re.IGNORECASE),
+    re.compile(r"\bnpm\b", re.IGNORECASE),
+    re.compile(r"latitude", re.IGNORECASE),
+]
+
+
+def _is_argv_relevant_process(cmdline_args: list[str]) -> bool:
+    joined = " ".join(cmdline_args)
+    return any(pat.search(joined) for pat in _ARGV_RELEVANT_PROCESS_PATTERNS)
+
+
+def _cmdline_has_credential_flag(cmdline_args: list[str]) -> bool:
+    for arg in cmdline_args:
+        for pat in _ARGV_CREDENTIAL_PATTERNS:
+            if pat.match(arg):
+                return True
+    return False
+
+
+def _check_argv_credential_host(proc_root: Path | None = None) -> dict[str, Any]:
+    """#1261 follow-up: presence-only argv credential scan over relevant
+    processes (Claude Code / node / bun / npx / npm / Latitude), never the
+    checker's own argv (`/proc/self/cmdline`) and never shell history /
+    terminal scrollback (PR #1352 REQUEST_CHANGES #3).
+
+    Returns `absent_verified` only when the scan actually completed over
+    every discoverable relevant process without a permission gap. Any
+    enumeration failure, permission error, or inability to isolate relevant
+    processes falls back to `unknown` (fail-closed) rather than
+    `absent_verified`.
+    """
+    actual_proc_root = proc_root if proc_root is not None else Path("/proc")
+    try:
+        pid_dirs = [p for p in actual_proc_root.iterdir() if p.name.isdigit()]
+    except OSError:
+        return {
+            "state": "unknown",
+            "argv_exposure_state": "unknown",
+            "reason_codes": [RC_ARGV_EXPOSURE_STATE_UNKNOWN],
+        }
+
+    inspected_any_relevant = False
+    inspection_gap = False
+    for pid_dir in pid_dirs:
+        cmdline_file = pid_dir / "cmdline"
+        try:
+            raw = cmdline_file.read_bytes().decode("utf-8", errors="replace")
+        except PermissionError:
+            # Cannot tell if this PID was relevant -> counts as a gap.
+            inspection_gap = True
+            continue
+        except OSError:
+            continue
+        cmdline_args = [a for a in raw.split("\0") if a]
+        if not cmdline_args:
+            continue
+        if not _is_argv_relevant_process(cmdline_args):
+            continue
+        inspected_any_relevant = True
+        if _cmdline_has_credential_flag(cmdline_args):
+            return {
+                "state": "possible",
+                "argv_exposure_state": "possible",
+                "reason_codes": [RC_EXPOSURE_POSSIBLE],
+            }
+
+    if inspection_gap:
+        return {
+            "state": "unknown",
+            "argv_exposure_state": "unknown",
+            "reason_codes": [RC_ARGV_EXPOSURE_STATE_UNKNOWN],
+        }
+
+    # No credential flag found. Only claim `absent_verified` (a positive
+    # safety claim) when the scan actually inspected at least one relevant
+    # process without gaps; otherwise the absence is unverified.
+    if inspected_any_relevant:
+        return {"state": "absent_verified", "argv_exposure_state": "absent_verified", "reason_codes": []}
+    return {
+        "state": "unknown",
+        "argv_exposure_state": "unknown",
+        "reason_codes": [RC_ARGV_EXPOSURE_STATE_UNKNOWN],
+    }
+
+
 def check_argv_credential(execution_profile: str) -> dict[str, Any]:
     """AC28, #1261 AC5: Detect if credential was passed via argv.
 
     #1261: exposes `argv_exposure_state` as its own closed-enum field
     (absent_verified | possible | unknown), independent of the legacy
     `state` key kept for backward compatibility with existing callers.
+
+    #1261 follow-up (PR #1352 REQUEST_CHANGES #3): host-mode inspection is
+    presence-only over relevant processes (Claude Code / node / bun / npx /
+    npm / Latitude), never the checker's own argv and never shell history /
+    terminal scrollback. `absent_verified` is only ever returned when that
+    scan actually completed; otherwise the state is `unknown` (fail-closed).
     """
     exposure_override = _get_env_override("SRRS_LAT_ARGV_EXPOSURE_STATE")
     if exposure_override is not None:
@@ -1157,10 +1414,24 @@ def check_argv_credential(execution_profile: str) -> dict[str, Any]:
 
     override = _get_env_override("SRRS_LAT_ARGV_CREDENTIAL")
     if override is not None:
+        # #1261 follow-up: `present` is the only value that can positively
+        # assert exposure. Anything else (including the legacy `absent`
+        # value) is NOT sufficient to claim a positive `absent_verified`
+        # safety claim from a single boolean override, so it maps to
+        # `unknown` (fail-closed) rather than `absent_verified`
+        # (PR #1352 REQUEST_CHANGES #3).
         legacy_state = override.strip()
-        state = "possible" if legacy_state == "present" else "absent_verified"
-        rcs = [RC_EXPOSURE_POSSIBLE] if state == "possible" else []
-        return {"state": state, "argv_exposure_state": state, "reason_codes": rcs}
+        if legacy_state == "present":
+            return {
+                "state": "possible",
+                "argv_exposure_state": "possible",
+                "reason_codes": [RC_EXPOSURE_POSSIBLE],
+            }
+        return {
+            "state": "unknown",
+            "argv_exposure_state": "unknown",
+            "reason_codes": [RC_ARGV_EXPOSURE_STATE_UNKNOWN],
+        }
 
     # B1 fix: only read real /proc in host mode
     if execution_profile != "host":
@@ -1170,29 +1441,7 @@ def check_argv_credential(execution_profile: str) -> dict[str, Any]:
             "reason_codes": [RC_RUNTIME_STATE_UNKNOWN],
         }
 
-    try:
-        cmdline = Path("/proc/self/cmdline").read_bytes().decode("utf-8", errors="replace")
-        for arg in cmdline.split("\0"):
-            if re.match(r"--api[-_]?key", arg, re.IGNORECASE):
-                return {
-                    "state": "possible",
-                    "argv_exposure_state": "possible",
-                    "reason_codes": [RC_EXPOSURE_POSSIBLE],
-                }
-            if re.match(r"--latitude[-_]?key", arg, re.IGNORECASE):
-                return {
-                    "state": "possible",
-                    "argv_exposure_state": "possible",
-                    "reason_codes": [RC_EXPOSURE_POSSIBLE],
-                }
-    except OSError:
-        return {
-            "state": "unknown",
-            "argv_exposure_state": "unknown",
-            "reason_codes": [RC_RUNTIME_STATE_UNKNOWN],
-        }
-
-    return {"state": "absent_verified", "argv_exposure_state": "absent_verified", "reason_codes": []}
+    return _check_argv_credential_host()
 
 
 def check_containment_and_exposure(execution_profile: str) -> dict[str, Any]:
@@ -1358,12 +1607,20 @@ def _compute_latitude_verdict(
     remote_trace_state: str,
     all_reason_codes: list[str],
     inspection_gaps: list[str],
+    argv_exposure_state: str = "unknown",
+    remote_cleanup_state: str = "unknown",
 ) -> tuple[str, bool]:
     """Compute latitude component verdict per Issue contract Verdict Rules.
 
     Returns (verdict, inspection_complete).
     B7 fix: verdict and inspection_complete are computed independently.
     Gap presence makes inspection_complete=False regardless of verdict.
+
+    #1261 follow-up (PR #1352 REQUEST_CHANGES #5): argv_exposure_state and
+    remote_cleanup_state are independent top-level #1261 fields, kept in
+    sync with the `unknown` fail-closed detection here so
+    `components.latitude.verdict` cannot read `safe` while either field (or
+    the distribution summary state) is unresolved.
     """
     # B7 fix: inspection_complete is independent of verdict
     inspection_complete = len(inspection_gaps) == 0
@@ -1379,8 +1636,9 @@ def _compute_latitude_verdict(
             active_process_state, local_storage_state,
             uninstall_state, remote_trace_state,
             containment_state, exposure_state,
+            argv_exposure_state,
         ]
-    )
+    ) or remote_cleanup_state == "unknown" or dist_state == "unknown"
 
     if not any_present and not any_unknown and not any_rc:
         return "not_applicable", inspection_complete
@@ -1458,16 +1716,28 @@ def check_latitude_component(
                 "exposure_state": "unknown",
                 "uninstall_state": "unknown",
                 "remote_trace_state": "unknown",
+                # #1261 follow-up (PR #1352 REQUEST_CHANGES P1): the
+                # override-rejection fail_closed path must expose the same
+                # #1261 top-level fields (with null/unknown values) as the
+                # normal path, so consumers never see a shape drift between
+                # the two fail_closed producers.
+                "argv_exposure_state": "unknown",
+                "remote_cleanup_state": "unknown",
                 "distribution": {
+                    "state": "unknown",
                     "package_spec": None,
                     "dist_integrity": None,
                     "registry_signature_verified": None,
                     "provenance_verified": None,
                     "provenance_source_ref": None,
+                    "resolved_registry_origin": None,
+                    "resolution_source": "unknown",
+                    "npx_invocation": "unknown",
+                    "lockfile_digest": None,
                     "tarball_sha256": None,
                     "installed_entrypoint_sha256": None,
                     "preload_sha256": None,
-                    "resolution_source": "unknown",
+                    "hook_command_sha256": None,
                 },
                 "reason_codes": [RC_SRRS_OVERRIDE_REJECTED],
                 "checked_surfaces": [],
@@ -1538,6 +1808,9 @@ def check_latitude_component(
     all_surfaces = list(dict.fromkeys(all_surfaces))
     all_gaps = list(dict.fromkeys(all_gaps))
 
+    argv_exposure_state_value = argv.get("argv_exposure_state", argv.get("state", "unknown"))
+    remote_cleanup_state_value = remote_cleanup["state"]
+
     verdict, inspection_complete = _compute_latitude_verdict(
         credential_state=cred["state"],
         hook_state=hook["state"],
@@ -1556,6 +1829,8 @@ def check_latitude_component(
         remote_trace_state=remote_trace["state"],
         all_reason_codes=all_rcs,
         inspection_gaps=all_gaps,
+        argv_exposure_state=argv_exposure_state_value,
+        remote_cleanup_state=remote_cleanup_state_value,
     )
 
     return {
@@ -1588,6 +1863,7 @@ def check_latitude_component(
             "provenance_source_ref": dist.get("provenance_source_ref"),
             "resolved_registry_origin": dist.get("resolved_registry_origin"),
             "resolution_source": dist.get("resolution_source", "unknown"),
+            "npx_invocation": dist.get("npx_invocation", "unknown"),
             "lockfile_digest": dist.get("lockfile_digest"),
             "tarball_sha256": dist.get("tarball_sha256"),
             "installed_entrypoint_sha256": dist.get("installed_entrypoint_sha256"),
