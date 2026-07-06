@@ -333,6 +333,17 @@ HEADING_POLICY: dict[str, dict] = {
         "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
         "contract_checker_kind": "Runtime Verification Applicability",
     },
+    "Required Design References": {
+        "canonical_en": "Required Design References",
+        "canonical_ja": "必要設計リファレンス",
+        "accepted_forms": [
+            "Required Design References",
+            "必要設計リファレンス (Required Design References)",
+            "必要設計リファレンス（Required Design References）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Required Design References",
+    },
 }
 
 # canonical_en のセット（高速ルックアップ用）
