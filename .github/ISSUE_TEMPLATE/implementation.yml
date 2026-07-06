@@ -181,7 +181,7 @@ body:
         - docs/dev/agent-skill-boundaries.md#Parallel Agent Runtime Safety
         - docs/dev/workflow.md
     validations:
-      required: true
+      required: false
 
   - type: textarea
     id: scope-delta
