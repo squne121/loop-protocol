@@ -311,11 +311,13 @@ non-TTY / pipe 環境で `agy -p` が exit 0 かつ stdout 空になった場合
 agy が TTY 検出により出力を抑制した可能性があるため、**fail-closed** として扱う。
 stdout が空の場合や sentinel 不一致の場合に PASS として扱う設計は禁止（partial / silent response を PASS に変換しない）。
 
-## isolated temp cwd / minimal env / shell=False の制約
+## 隔離済み一時作業ディレクトリ・最小環境変数・shell=False の制約
 
 `run_gemini_headless.py` の `_run_agy()` は agy 呼び出しのたびに `tempfile.TemporaryDirectory()` で
-**isolated temp cwd** を生成し、その cwd から `subprocess.run(..., shell=False)` で agy を起動する。
-`shell=False` により shell injection の余地を排除し、repo root を cwd として渡さない。
+**隔離された一時作業ディレクトリ（isolated temp cwd）** を生成し、その作業ディレクトリから
+`subprocess.run(..., shell=False)` で agy を起動する。
+`shell=False` を指定することでシェル経由のコマンド注入（shell injection）の余地を排除し、
+リポジトリのルートディレクトリを起動時の cwd として渡さない安全側の設計を採る。
 
 ## minimal env と認証境界 / 認証依存の注意
 
