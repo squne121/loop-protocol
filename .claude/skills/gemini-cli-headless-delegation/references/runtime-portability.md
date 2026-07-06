@@ -207,10 +207,10 @@ uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/setup_check
 
 ### 恒久対応: agy (Antigravity CLI) 移行
 
-**恒久対応は parent Issue #104 の agy 移行**である。
-API key 暫定運用は #104 の agy provider 実装が完了したら不要になる。
+**恒久対応は parent Issue #1265 の agy 移行である。**
+`#104` は本移行の恒久正本ではない。API key 暫定運用は #1265 配下の child issue 群による agy provider 実装が完了したら不要になる。
 
-- agy 移行の進捗は #104 を参照。
+- agy 移行の進捗は #1265 と `.claude/skills/gemini-cli-headless-delegation/references/` 配下の current references（本ファイル、`provider-mapping.md`、`usage-contract.md`）を参照する。
 - agy が利用可能になったら `gemini-cli-headless-delegation` skill の provider を切り替える。
 
 ---
@@ -310,6 +310,12 @@ ${AGY_BIN:-agy} --version
 non-TTY / pipe 環境で `agy -p` が exit 0 かつ stdout 空になった場合は、
 agy が TTY 検出により出力を抑制した可能性があるため、**fail-closed** として扱う。
 stdout が空の場合や sentinel 不一致の場合に PASS として扱う設計は禁止（partial / silent response を PASS に変換しない）。
+
+## isolated temp cwd / minimal env / shell=False の制約
+
+`run_gemini_headless.py` の `_run_agy()` は agy 呼び出しのたびに `tempfile.TemporaryDirectory()` で
+**isolated temp cwd** を生成し、その cwd から `subprocess.run(..., shell=False)` で agy を起動する。
+`shell=False` により shell injection の余地を排除し、repo root を cwd として渡さない。
 
 ## minimal env と認証境界 / 認証依存の注意
 
