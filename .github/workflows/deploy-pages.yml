@@ -366,13 +366,43 @@ jobs:
         run: |
           set -euo pipefail
 
+          # fetch_pages_url_with_bounded_retry polls a GitHub Pages preview
+          # URL until it responds 200 OK, or until the shared overall_deadline
+          # (set once below, before the first call) is reached. The index
+          # page and every discovered asset share this single overall
+          # deadline instead of each URL getting its own independent 180s
+          # budget -- this prevents per-URL deadlines from stacking into a
+          # much longer worst-case wall time than intended when there are
+          # multiple assets (Issue #1357).
+          #
+          # Retry backoff uses an exponential delay bounded between
+          # initial_delay and max_delay (attempt-based), replacing the
+          # previous fixed 5-second sleep.
+          #
+          # Structured log line format (one line per attempt, written to
+          # stderr): "label=preview-index|preview-asset attempt=<n>
+          # elapsed=<s>s status=<code> action=<live|retry|fail-fast|
+          # deadline-exceeded> [next_sleep=<s>s]"
           fetch_pages_url_with_bounded_retry() {
-            local url="$1"
-            local output="$2"
-            local deadline=$((SECONDS + 180))
+            local label="$1"
+            local url="$2"
+            local output="$3"
+            local initial_delay=2
+            local max_delay=20
+            local attempt=0
             local status="000"
+            local tag
+
+            case "$label" in
+              preview-index) tag="label=preview-index" ;;
+              preview-asset) tag="label=preview-asset" ;;
+              *) tag="label=${label}" ;;
+            esac
 
             while :; do
+              attempt=$((attempt + 1))
+              local elapsed=$SECONDS
+
               status="$(
                 curl -sS -L \
                   -H 'Cache-Control: no-cache' \
@@ -384,12 +414,13 @@ jobs:
 
               if [ "$status" = "200" ]; then
                 mv "${output}.tmp" "$output"
+                echo "${tag} attempt=${attempt} elapsed=${elapsed}s status=200 action=live" >&2
                 return 0
               fi
 
-              if (( SECONDS >= deadline )); then
-                echo "ERROR: URL did not become live before deadline: $url" >&2
-                echo "last_status=$status" >&2
+              if (( SECONDS >= overall_deadline )); then
+                echo "ERROR: URL did not become live before overall deadline: $url" >&2
+                echo "${tag} attempt=${attempt} elapsed=${elapsed}s status=${status} action=deadline-exceeded" >&2
                 if [ -s "${output}.tmp" ]; then
                   head -c 800 "${output}.tmp" >&2
                 fi
@@ -397,20 +428,40 @@ jobs:
               fi
 
               case "$status" in
-                000|403|404|408|429|500|502|503|504|522|524)
-                  sleep 5
+                # These statuses are treated as transient and retried:
+                # 000 (curl-level connect/reset failure before an HTTP status
+                # was returned), 403 (Pages CDN can return a spurious
+                # forbidden response while a deployment is still
+                # propagating), 404 (Pages publish lag before the file is
+                # served), 408 (request timeout), 409 (Pages deployment
+                # conflict while a concurrent publish is in flight), 425 (too
+                # early -- origin not yet ready to process the request), 429
+                # (rate limited), 500/502/503/504/522/524 (origin or edge
+                # unavailable / timed out while the deployment propagates).
+                # 400/401 and any other status are treated as non-retriable
+                # and fail fast below.
+                000|403|404|408|409|425|429|500|502|503|504|522|524)
+                  local next_sleep=$((initial_delay * (2 ** (attempt - 1))))
+                  if (( next_sleep > max_delay )); then
+                    next_sleep=$max_delay
+                  fi
+                  echo "${tag} attempt=${attempt} elapsed=${elapsed}s status=${status} action=retry next_sleep=${next_sleep}s" >&2
+                  sleep "$next_sleep"
                   ;;
                 *)
                   echo "ERROR: non-retriable HTTP status $status for $url" >&2
+                  echo "${tag} attempt=${attempt} elapsed=${elapsed}s status=${status} action=fail-fast" >&2
                   return 1
                   ;;
               esac
             done
           }
 
+          overall_deadline=$((SECONDS + 240))
+
           base="${{ steps.vite-base.outputs.base }}"
           preview_url="https://${GITHUB_REPOSITORY_OWNER}.github.io${base}"
-          fetch_pages_url_with_bounded_retry "${preview_url}?cache_bust=${GITHUB_SHA}" /tmp/preview-index.html
+          fetch_pages_url_with_bounded_retry "preview-index" "${preview_url}?cache_bust=${GITHUB_SHA}" /tmp/preview-index.html
           grep -F "${base}assets/" /tmp/preview-index.html
           if grep -qE 'src="/assets/|href="/assets/' /tmp/preview-index.html; then exit 1; fi
           mapfile -t asset_paths < <(grep -oE '(src|href)="[^"]+assets/[^"]+"' /tmp/preview-index.html | sed -E 's/^[^"]+"([^"]+)"/\1/' | sort -u)
@@ -426,7 +477,7 @@ jobs:
                 exit 1
                 ;;
             esac
-            fetch_pages_url_with_bounded_retry "https://${GITHUB_REPOSITORY_OWNER}.github.io${asset_path}" /tmp/preview-asset.bin
+            fetch_pages_url_with_bounded_retry "preview-asset" "https://${GITHUB_REPOSITORY_OWNER}.github.io${asset_path}" /tmp/preview-asset.bin
           done
       - name: Comment preview URL on PR
         if: ${{ always() }}
