@@ -1,4 +1,5 @@
 ---
+summary_ja: "本 ADR は Issue #1330 の OWNER 敵対的レビュー決定に基づき、cloud_pilot_success_result/v1 の正本 artifact placement を machine-readable に固定するものである。"
 adr_id: "0005"
 title: "cloud_pilot_success_result/v1 の正本 artifact placement — hybrid_reference_from_agent_run_report を採用する"
 status: accepted
@@ -18,7 +19,6 @@ superseded_by: null
 # ADR 0005: cloud_pilot_success_result/v1 の正本 artifact placement — hybrid_reference_from_agent_run_report を採用する
 
 ## Context
-
 PR #1325 の OWNER レビュー（REQUEST_CHANGES, P2, https://github.com/squne121/loop-protocol/pull/1325#issuecomment-4882061533）は、`cloud_pilot_success_result/v1`（Cloud pilot 実行結果を記録する artifact）の正本配置が未決定のまま `follow_up_issue_required` として残されていることを指摘した。これを受けて起票された Issue #1330 に対する OWNER 敵対的レビュー（https://github.com/squne121/loop-protocol/issues/1330#issuecomment-4892894141）が、本 ADR が固定する決定内容の一次情報源である。
 
 `cloud_pilot_success_contract_v1`（#1260）は Cloud pilot の採用判断（`adopt_cloud` / `adopt_self_host` / `conditional_adoption` / `withdraw`）に必要な多数の metrics・gate・fail-closed 条件を定義している。この決定の実行結果（result）をどこに正本として置くかが未決定だと、以下のいずれかの誤りが起きる。
@@ -27,7 +27,6 @@ PR #1325 の OWNER レビュー（REQUEST_CHANGES, P2, https://github.com/squne1
 - standalone artifact のみとして扱い、`#1153` の GitHub retrospective 導線から result が孤立する
 
 ## Considered Options
-
 **Option A: `embed_in_agent_run_report_v1`** — Cloud pilot result 本体を `agent_run_report/v1` に直接埋め込む
 - メリット: 参照が 1 ファイルに閉じる
 - デメリット: `docs/schemas/agent-run-report.schema.json` は top-level `additionalProperties: false` であり、`observationSourceMetrics` も `additionalProperties: false`（許可 field は `trace_count` / `span_count` / `prompt_tokens` / `completion_tokens` / `total_tokens` の 5 つのみ）。result 本体を embed するには schema 本体変更が必須になり、#1330 の Stop Condition（agent_run_report/v1 schema 本体変更禁止）と衝突する。**reject**
@@ -41,7 +40,6 @@ PR #1325 の OWNER レビュー（REQUEST_CHANGES, P2, https://github.com/squne1
 - デメリット: result 本体と reference の 2 つを整合させる digest / upsert 運用が必要になる
 
 ## Decision
-
 **Option C（`hybrid_reference_from_agent_run_report`）を採用する。**
 
 ```yaml
@@ -256,7 +254,6 @@ raw_trace_body_publication_forbidden_fields:
 public projection は raw span attributes/events をそのまま出さず、count / coverage / latency / digest / closed enum reason code へ落とす。このリストへの参照は `docs/dev/secret-policy.md` にも追記する（AC8）。
 
 ## Consequences
-
 ### 肯定的影響
 
 - `agent_run_report/v1` の既存 schema（`additionalProperties: false`）を変更せずに Cloud pilot result を GitHub retrospective 導線から参照可能にできる
@@ -275,7 +272,6 @@ public projection は raw span attributes/events をそのまま出さず、coun
 - `cloud_adoption_allowed_now: false` は #1326（`cloud_pilot_success_contract_v1` checker 実装）および本 Issue の follow-up checker 実装が完了するまで維持する
 
 ## References
-
 - Issue #1330（本 ADR の実装 Issue）
 - Issue #1153（parent — Cloud pilot 採用判断の親 Issue）
 - Issue #1260（`cloud_pilot_success_contract_v1` 定義 Issue）
