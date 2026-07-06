@@ -322,7 +322,6 @@ SSOT 追加時の参照先を集約した索引。AI エージェントは実装
 |---|---|
 | Issue 駆動開発フロー・1 Issue 1 PR | `docs/dev/workflow.md`（本ドキュメント） |
 | SubAgent / Skill 責務境界 | `docs/dev/agent-skill-boundaries.md` |
-| 並列エージェント実行安全性（repo-wide snapshot の扱い・volatile roots・self-write bypass 防止） | `docs/dev/agent-skill-boundaries.md#Parallel Agent Runtime Safety` |
 | `gh` CLI 利用規約・ラベル運用 | `docs/dev/github-ops.md` |
 | GitHub Milestone 作成・割当・close・rollup | `docs/dev/milestone-ops.md` |
 | アーキテクチャ分離原則・60Hz タイムステップ | `docs/adr/0001-architecture-baseline.md` |
