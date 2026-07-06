@@ -914,3 +914,44 @@ def test_agy_file_not_found_returns_failure_class() -> None:
     assert result["ok"] is False
     assert result.get("failure_class") == "agy_not_found"
     assert "agy_not_found" in (result.get("failure_reason") or "")
+
+
+# ---------------------------------------------------------------------------
+# Issue #1274 AC4/AC5: warnings[0] leading token must match failure_class in
+# both non-CI and CI empty-stdout branches. This is a regression test for the
+# fix already merged in #1331 (_normalize_agy_result empty-stdout warning
+# construction). AC5 additionally requires this coverage located in
+# test_agy_provider.py per the Issue #1274 specified location (duplicate of
+# the equivalent test_quota_fallback.py coverage is intentional per Issue
+# #1274 scope).
+# ---------------------------------------------------------------------------
+
+
+def test_agy_empty_stdout_warning_matches_failure_class():
+    """AC4: non-CI empty stdout produces warnings[0] starting with agy_empty_stdout."""
+    with patch.dict(os.environ, {"CI": ""}, clear=False):
+        completed = _make_completed(0, stdout="")
+        result = rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None)
+    assert result["failure_class"] == "agy_empty_stdout"
+    assert result["warnings"][0].startswith("agy_empty_stdout")
+
+
+def test_agy_empty_stdout_warning_matches_failure_class_in_ci():
+    """AC5: CI empty stdout produces warnings[0] starting with agy_output_missing."""
+    with patch.dict(os.environ, {"CI": "1"}, clear=False):
+        completed = _make_completed(0, stdout="")
+        result = rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None)
+    assert result["failure_class"] == "agy_output_missing"
+    assert result["warnings"][0].startswith("agy_output_missing")
+
+
+def test_agy_empty_stdout_warning_matches_failure_class_when_ci_unset(monkeypatch):
+    """PR #1345 fix_delta Blocker 2: CI unset (not merely empty) must also take the
+    non-CI (agy_empty_stdout) branch, distinct from the CI="" case already covered
+    by test_agy_empty_stdout_warning_matches_failure_class above."""
+    monkeypatch.delenv("CI", raising=False)
+    completed = _make_completed(0, stdout="")
+    result = rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None)
+
+    assert result["failure_class"] == "agy_empty_stdout"
+    assert result["warnings"][0].startswith("agy_empty_stdout")
