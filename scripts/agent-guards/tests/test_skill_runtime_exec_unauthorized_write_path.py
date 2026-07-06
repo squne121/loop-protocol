@@ -143,6 +143,23 @@ def main() -> int:
         outside = Path(".cache")
         outside.mkdir(parents=True, exist_ok=True)
         (outside / "outside.txt").write_text("self-write")
+    if os.environ.get("SKILL_RUNTIME_TEST_SELF_WRITE_WORKTREES") == "ignored":
+        # Issue #1343 AC5: a self-write into a volatile peer-session root
+        # (.claude/worktrees/**) is a known, accepted limitation of the
+        # stdlib-only race-tolerant hotfix (strict attribution is out of
+        # scope; see Notes for Reviewer on Issue #1343).
+        self_worktree_path = Path(".claude") / "worktrees" / "issue-9999-self" / "self-write.txt"
+        self_worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        self_worktree_path.write_text("self-write-into-volatile-worktrees-root")
+    if os.environ.get("SKILL_RUNTIME_TEST_SELF_WRITE_OTHER_ISSUE_ARTIFACTS") == "ignored":
+        # Issue #1343 AC5: a self-write into another issue's artifact root
+        # under .claude/artifacts/issue-refinement-loop/** is likewise a
+        # known, accepted limitation (excluded from detection by design).
+        self_other_artifact_path = (
+            Path(".claude") / "artifacts" / "issue-refinement-loop" / "1337" / "self-write.json"
+        )
+        self_other_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        self_other_artifact_path.write_text('{"self_write": true}')
     artifact_dir = Path(".claude") / "artifacts" / "issue-refinement-loop" / args.issue_number
     artifact_dir.mkdir(parents=True, exist_ok=True)
     payload = {"issue_number": args.issue_number, "repo": args.repo}
@@ -259,3 +276,63 @@ def test_self_write_inside_allowed_roots_still_succeeds(tmp_path: Path) -> None:
         "issue_number": "1228",
         "repo": "squne121/loop-protocol",
     }
+
+
+def test_self_write_to_worktrees_is_known_unsupported_in_stdlib_mode(tmp_path: Path) -> None:
+    """GIVEN the executed child command itself (not a peer session) writes
+    outside its allowed_write_roots into the volatile peer-session root
+    .claude/worktrees/**
+    WHEN the command completes
+    THEN skill_runtime_exec.py does NOT fail with unauthorized_write_path
+    (the self-write silently succeeds).
+
+    KNOWN LIMITATION (Issue #1343 AC3/AC5, adopted via human REQUEST_CHANGES
+    on PR #1349, Option B): volatile peer-session roots
+    (.claude/worktrees/** and .claude/artifacts/issue-refinement-loop/**)
+    are excluded from the before/after snapshot diff entirely so that
+    concurrent peer sessions are never misattributed to this command's own
+    child process (AC1/AC2). The unavoidable side effect is that this
+    executor cannot distinguish a peer-session write from a self-write into
+    those same roots. Strict attribution (e.g. process-level syscall
+    tracing) is explicitly out of scope for this stdlib-only race-tolerant
+    hotfix and is deferred to a separate follow-up issue if ever needed.
+    This test documents the gap so it is not mistaken for an oversight.
+    """
+    repo = _make_repo(tmp_path)
+    _install_skill_runtime_exec_fixture(repo)
+    result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SELF_WRITE_WORKTREES": "ignored"})
+    assert result.returncode == 0, result.stderr
+    self_write_path = repo / ".claude" / "worktrees" / "issue-9999-self" / "self-write.txt"
+    assert self_write_path.exists()
+    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
+    assert artifact.exists()
+
+
+def test_self_write_to_other_issue_artifacts_is_known_unsupported_in_stdlib_mode(
+    tmp_path: Path,
+) -> None:
+    """GIVEN the executed child command itself (not a peer session) writes
+    outside its allowed_write_roots into another issue's artifact root under
+    .claude/artifacts/issue-refinement-loop/<other issue>/**
+    WHEN the command completes
+    THEN skill_runtime_exec.py does NOT fail with unauthorized_write_path
+    (the self-write silently succeeds).
+
+    KNOWN LIMITATION (Issue #1343 AC3/AC5, adopted via human REQUEST_CHANGES
+    on PR #1349, Option B): see
+    test_self_write_to_worktrees_is_known_unsupported_in_stdlib_mode for the
+    full rationale. This test documents the equivalent gap for the
+    .claude/artifacts/issue-refinement-loop/** volatile peer-session root.
+    """
+    repo = _make_repo(tmp_path)
+    _install_skill_runtime_exec_fixture(repo)
+    result = _run_executor(
+        repo, {"SKILL_RUNTIME_TEST_SELF_WRITE_OTHER_ISSUE_ARTIFACTS": "ignored"}
+    )
+    assert result.returncode == 0, result.stderr
+    self_write_path = (
+        repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1337" / "self-write.json"
+    )
+    assert self_write_path.exists()
+    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
+    assert artifact.exists()
