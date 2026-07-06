@@ -18,5 +18,7 @@
   "SRRS_LAT_DESTINATION_STATE": "approved_cloud",
   "SRRS_LAT_DIAGNOSTIC_LOG": "disabled",
   "SRRS_LAT_PILOT_DECISION": "approve_synthetic_only",
-  "SRRS_LAT_PILOT_MARKER_COUNT": "1"
+  "SRRS_LAT_PILOT_MARKER_COUNT": "1",
+  "SRRS_LAT_ARGV_EXPOSURE_STATE": "absent_verified",
+  "SRRS_LAT_REMOTE_CLEANUP_STATE": "machine_verified"
 }

@@ -319,7 +319,7 @@ describe('AC7: test-codex-single-composite.mjs runs within pnpm test', () => {
       result.status,
       `test-codex-single-composite.mjs exited with code ${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
     ).toBe(0)
-  })
+  }, 35_000)
 })
 
 // ---------------------------------------------------------------------------

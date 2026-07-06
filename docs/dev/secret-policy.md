@@ -285,10 +285,22 @@ session_recording_script_contract:
       components.latitude.distribution.state: verified
       registry_signature_verified: true
       provenance_verified: true
+      # #1261: direct field assertion — a `verified` summary state is not
+      # sufficient by itself; every required evidence field below must also
+      # be present and valid (closed enum / non-empty digest).
+      components.latitude.distribution.resolution_source: "local_lockfile | project_local_install | npm_cache | global_install (not unknown, not npx_only-unpinned)"
+      components.latitude.distribution.resolved_registry_origin: non_empty_string
+      components.latitude.distribution.lockfile_digest: "sha256:<64hex>"
+      components.latitude.distribution.tarball_sha256: "sha256:<64hex>"
+      components.latitude.distribution.installed_entrypoint_sha256: "sha256:<64hex>"
+      components.latitude.distribution.preload_sha256: "sha256:<64hex>"
+      components.latitude.distribution.hook_command_sha256: "sha256:<64hex>"
+      components.latitude.argv_exposure_state: absent_verified
+      components.latitude.remote_cleanup_state: machine_verified
     blocked_or_fail_closed_until:
-      - "#1261 による distribution exact package provenance"
-      - "#1261 による argv exposure cleanup evidence"
-      - "#1261 による remote cleanup machine verification"
+      - "host checker が npm registry の real signature / provenance attestation を machine-verify する経路（現状 registry_signature_verified / provenance_verified は host mode で常に unknown のまま fail-closed）"
+      - "host checker が installed entrypoint / preload / hook command の実 sha256 を計算する経路（現状 host mode では None のまま fail-closed）"
+      - "provider-side retention / delete の real machine verification（remote_cleanup_state を machine_verified にできる経路が未実装、常に unknown または human_attested 止まり）"
     exit_semantics:
       blocked:
         exit_code: 1
@@ -296,6 +308,86 @@ session_recording_script_contract:
       fail_closed:
         exit_code: 2
         meaning: malformed_or_unknown_or_non_host_input
+
+# #1261: LATITUDE_DISTRIBUTION_GATE_V1 — machine-readable distribution / argv
+# exposure / remote cleanup evidence shape. Producer: components.latitude
+# (session_recording_runtime_safety/v2, .claude/scripts/lib/latitude_telemetry_safety.py).
+# Consumer: latitude:real-pilot:preflight allow_requires (above) and the
+# Cloud Pilot Success Contract gate_evidence_contract.latitude_distribution_gate
+# (below). `state: completed` here means "the checker directly asserts every
+# field below, including exact-semver / SRI / approved-registry-origin /
+# npx_invocation field-level validation" (PR #1352 fix_delta); it does NOT
+# mean the cryptographic evidence (registry signature / provenance / tarball /
+# entrypoint / preload / hook digests) is machine-verified against a real npm
+# registry in host mode yet, nor that host execution evidence
+# (`pnpm run security:session-recording:host` / `pnpm run policy:check` logs)
+# has been attached to a PR — those remain fail-closed (`unknown`) / pending
+# until a follow-up Issue wires real `npm audit signatures` + isolated-install
+# hashing and a host run is actually performed and attached.
+```yaml
+LATITUDE_DISTRIBUTION_GATE_V1:
+  schema: LATITUDE_DISTRIBUTION_GATE_V1
+  issue: "#1261"
+  state: completed
+  package_name: "@latitude-data/claude-code-telemetry"
+  package_spec: "@latitude-data/claude-code-telemetry@x.y.z"
+  package_spec_must_be_exact_semver: true
+  resolved_registry_origin: "https://registry.npmjs.org"
+  resolved_registry_origin_must_be_approved: true
+  resolution_source_enum:
+    - local_lockfile
+    - project_local_install
+    - npm_cache
+    - global_install
+    - npx_only
+    - unknown
+  npx_only_without_exact_version_blocked: true
+  # PR #1352 fix_delta: npx_invocation is independent of resolution_source.
+  # Claude settings hook-command parsing (read-only, floating `npx -y <pkg>`
+  # detection) takes priority over lockfile/node_modules/npm-cache/global
+  # inventory checks, because a floating npx invocation re-resolves the
+  # package from the registry on every run regardless of what happens to be
+  # cached or lockfile-pinned locally.
+  npx_invocation_enum:
+    - exact_version
+    - floating
+    - absent
+    - unknown
+  npx_invocation_floating_always_blocked: true
+  lockfile_digest: "sha256:<64hex>"
+  dist_integrity: "sha512-..."
+  dist_integrity_must_be_sri_format: true
+  npm_registry_signature_verified: true
+  provenance_verified: true
+  tarball_sha256: "sha256:<64hex>"
+  installed_entrypoint_sha256: "sha256:<64hex>"
+  preload_sha256: "sha256:<64hex>"
+  hook_command_sha256: "sha256:<64hex>"
+  argv_exposure_state_enum:
+    - absent_verified
+    - possible
+    - unknown
+  argv_exposure_state_producer: relevant_process_argv_scan
+  argv_exposure_state_never_reads: [checker_self_argv, shell_history, terminal_scrollback]
+  remote_cleanup_state_enum:
+    - machine_verified
+    - human_attested
+    - unknown
+  evidence_digest_required: false   # follow-up: canonical-JSON evidence_digest producer
+  decision_enum:
+    - allow
+    - blocked
+    - fail_closed
+  reason_codes_v2:
+    - latitude_npx_invocation_floating
+    - latitude_registry_origin_missing_or_mismatch
+    - latitude_lockfile_digest_missing_or_malformed
+    - latitude_tarball_digest_missing_or_malformed
+    - latitude_entrypoint_digest_missing_or_malformed
+    - latitude_preload_digest_missing_or_malformed
+    - latitude_package_spec_not_exact
+    - latitude_dist_integrity_malformed
+  host_execution_evidence_status: pending   # #1261 remains open until host logs are attached
 ```
 
 ---
