@@ -170,6 +170,20 @@ body:
       required: true
 
   - type: textarea
+    id: required-design-references
+    attributes:
+      label: Required Design References
+      description: |
+        本 Issue の実装が前提とする設計ドキュメント（repo 相対パス）を列挙する。
+        `docs/dev/agent-skill-boundaries.md` のような SSOT 文書への参照を含める。
+        該当なしの場合でも "N/A" のみで済ませず、判断根拠となった SSOT へのリンクを記載すること。
+      placeholder: |
+        - docs/dev/agent-skill-boundaries.md#Parallel Agent Runtime Safety
+        - docs/dev/workflow.md
+    validations:
+      required: true
+
+  - type: textarea
     id: scope-delta
     attributes:
       label: Scope Delta（任意）

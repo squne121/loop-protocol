@@ -36,12 +36,13 @@
 - id: agent-skill-boundaries
   path: docs/dev/agent-skill-boundaries.md
   title: Agent / Skill 責務境界
-  keywords: [agent, skill, subagent, 責務, role, control-plane, data-plane, loop_state, 人間承認]
-  description: SubAgent / Skill 責務境界・オーケストレーター設計原則・ループ内人間承認原則
+  keywords: [agent, skill, subagent, 責務, role, control-plane, data-plane, loop_state, 人間承認, parallel, concurrent, race, 並列実行, volatile-roots]
+  description: SubAgent / Skill 責務境界・オーケストレーター設計原則・ループ内人間承認原則・並列エージェント実行安全性
   sections:
     - "## SubAgent 役割分類と permissionMode 一覧"
     - "## オーケストレーター設計原則"
     - "## Loop Sequencing & Preconditions"
+    - "## Parallel Agent Runtime Safety"
 
 - id: github-ops
   path: docs/dev/github-ops.md

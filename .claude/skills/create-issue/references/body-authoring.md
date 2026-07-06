@@ -600,6 +600,15 @@ gh issue list --search "<関連語>" --state open --json number,title,url
 
 `create_issue_txn.py --blocked-by` で blocker を指定して起票する（コマンド詳細は `create-issue/SKILL.md` の Blocker / Blocked-by 設定手順を参照）。
 
+## Required Design References Authoring Guidance（Required Design References 執筆ガイド）
+
+Issue 本文の `## Required Design References` は、本 Issue の実装が前提とする **設計ドキュメント（SSOT）への repo 相対パス参照** を列挙するセクションである。
+
+- 空・`N/A` のみ・`none` のみで済ませない。少なくとも 1 件の repo 相対パス（例: `docs/dev/agent-skill-boundaries.md`）を含める
+- 参照は `docs/`, `.claude/`, `src/`, `scripts/` 配下の実在ファイルへの相対パスで書く。抽象的な説明文だけでは `contract_readiness_check.py` の静的検査（`RDR001`）で `needs_fix` になる
+- 見出しアンカー（例: `docs/dev/agent-skill-boundaries.md#Parallel Agent Runtime Safety`）を付けてもよい
+- `## Required Skills`（ドメイン知識スキル）とは別概念。`## Required Design References` は SSOT ドキュメントへの参照専用
+
 ## 関連
 
 - `.claude/skills/create-issue/SKILL.md` — 新規起票でこの参照を使う

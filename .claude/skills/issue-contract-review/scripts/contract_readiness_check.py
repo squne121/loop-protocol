@@ -608,6 +608,96 @@ def check_rva_immediate_fields(body: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# AC4 (#1346): Required Design References check (implementation issues only)
+# ---------------------------------------------------------------------------
+
+_REQUIRED_DESIGN_REFERENCES_PATH_RE = re.compile(
+    r"(?:^|[\s(`\[])(docs/|\.claude/|src/|scripts/)[\w\-./]+\.(?:md|py|ts|tsx|yml|yaml)",
+)
+
+_PLACEHOLDER_ONLY_VALUES = {"", "n/a", "none", "なし", "-"}
+
+
+def _extract_issue_kind(body: str) -> Optional[str]:
+    """Extract `issue_kind` from the `## Machine-Readable Contract` YAML block.
+
+    Self-contained regex extraction — does NOT forward --kind to
+    validate_issue_body.py (AC6: keep responsibility boundaries intact,
+    do not change existing kind-agnostic fixture behavior).
+    """
+    mrc_match = re.search(
+        r"^##\s+Machine-Readable Contract\s*$(.+?)(?=^##|\Z)",
+        body,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not mrc_match:
+        return None
+    kind_match = re.search(r"^\s*issue_kind:\s*(\S+)", mrc_match.group(1), re.MULTILINE)
+    if not kind_match:
+        return None
+    return kind_match.group(1).strip().strip('"').strip("'")
+
+
+def check_required_design_references(body: str) -> list[dict]:
+    """
+    AC4: For `issue_kind: implementation` issues, validate the
+    `## Required Design References` section (when present) is not
+    empty / N/A / none-only, and contains at least one repo-relative
+    design-doc path reference (e.g. docs/dev/agent-skill-boundaries.md).
+
+    Mirrors the RVA precedent (check_rva_immediate_fields): when the
+    section is entirely absent, this function returns no errors here
+    (existence enforcement is a template / review-issue concern, not this
+    static checker — AC6: do not regress existing go fixtures that predate
+    this section).
+    """
+    if _extract_issue_kind(body) != "implementation":
+        return []
+
+    section_match = re.search(
+        r"^##\s+Required Design References\s*$(.+?)(?=^##|\Z)",
+        body,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not section_match:
+        return []
+
+    section_content = section_match.group(1)
+    section_start_line = body[: section_match.start()].count("\n") + 1
+
+    stripped = section_content.strip()
+    non_empty_lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    is_placeholder_only = (not non_empty_lines) or all(
+        line.lower().lstrip("- ").strip() in _PLACEHOLDER_ONLY_VALUES for line in non_empty_lines
+    )
+    has_path_ref = bool(_REQUIRED_DESIGN_REFERENCES_PATH_RE.search(section_content))
+
+    if is_placeholder_only or not has_path_ref:
+        errors = [
+            {
+                "rule_id": "RDR001",
+                "severity": "error",
+                "source_check": "contract_readiness_check",
+                "category": "required_design_references_missing_or_empty",
+                "section": "Required Design References",
+                "line_start": section_start_line,
+                "line_end": section_start_line + section_content.count("\n"),
+                "minimal_context": non_empty_lines[:3],
+                "fix_hint": (
+                    "Add at least one repo-relative design-doc path reference "
+                    "(e.g. docs/dev/agent-skill-boundaries.md) to Required Design "
+                    "References. Do not leave it empty / N/A / none only. "
+                    "See body-authoring.md#Required Design References Authoring Guidance."
+                ),
+                "autofixable": True,
+            }
+        ]
+        return errors
+
+    return []
+
+
+# ---------------------------------------------------------------------------
 # Static VC syntax check (compound command detection without execution)
 # ---------------------------------------------------------------------------
 
@@ -782,6 +872,7 @@ def build_result(
 
     validate_errors = map_validate_errors_to_readiness_errors(validate_result)
     rva_errors = check_rva_immediate_fields(body)
+    rdr_errors = check_required_design_references(body)
 
     preflight_errors: list[dict] = []
     preflight_aggregate = "go"
@@ -795,7 +886,7 @@ def build_result(
     if mode in ("static", "preflight-static"):
         static_vc_errors = check_vc_static_syntax(body)
 
-    all_errors = validate_errors + rva_errors + static_vc_errors + preflight_errors
+    all_errors = validate_errors + rva_errors + rdr_errors + static_vc_errors + preflight_errors
 
     overall_status = compute_aggregate_status(
         validate_errors,
@@ -804,6 +895,8 @@ def build_result(
         static_vc_errors,
         preflight_aggregate,
     )
+    if rdr_errors:
+        overall_status = _raise_status(overall_status, "needs_fix")
 
     fix_hint: Optional[str] = None
     minimal_context: list = []
