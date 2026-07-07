@@ -20,13 +20,31 @@
 - `uv` が利用可能であること（テスト実行用）
 - Google アカウントによる認証が完了していること
 
-### `provider=agy`
+### `provider=agy`（共通前提 / 全 tool_profile 共通）
 
 - `agy` CLI がインストール済みであること（`agy --version` で確認）
 - Python 3.10+ が利用可能であること
 - `uv` が利用可能であること（`setup_check.py` / `preflight_agy.py` 実行用）
-- Node.js / `gemini` CLI / `uvx` / Serena MCP / `.gemini/settings.json` / trustedFolders / Gemini OAuth は不要
+- Node.js / `gemini` CLI / trustedFolders / Gemini OAuth は不要（`agy` (Antigravity CLI) は Google OAuth 経由の Gemini CLI 認証を使わない）
 - `setup_check.py --provider agy --json` は check-only で、`.gemini/` や trustedFolders を変更しない
+
+> **注意**: 上記は `no_tools` / `proposal_only` / `grounded_research` の共通前提であり、
+> `tool_profile=local_asset_research` を使う場合は下記「`provider=agy` + `local_asset_research` の wrapper-side Serena 前提」が別途必要になる。
+> `uvx` / Serena MCP を「不要」とするのは誤りであり、`local_asset_research` では wrapper 側が必須で使用する。
+
+### `provider=agy` + `local_asset_research`（wrapper-side Serena 前提）
+
+`tool_profile=local_asset_research` を使う場合のみ、上記共通前提に加えて以下が必要になる。
+**agy 自身が Serena MCP を呼び出すわけではない。** wrapper（`run_gemini_headless.py`）側が pinned Serena MCP server を
+`subprocess.Popen(command, cwd=repo_root, stdin=PIPE, stdout=PIPE, stderr=PIPE, text=True, shell=False, env=_minimal_agy_env(), bufsize=1)`
+で起動し、`initialize` → `notifications/initialized` → `tools/list` → read-only `tools/call` の順に MCP JSON-RPC を実行して
+repo-relative な read-only evidence envelope を構築し、それだけを agy への prompt に含める。
+
+- `uvx` が利用可能であること（pinned Serena MCP server の起動に使う。`.agents/mcp_config.json` の `command`/`args` を正本とする）
+- `.agents/mcp_config.json` が存在し、`mcpServers.serena` に pinned Serena ref（`git+https://github.com/oraios/serena@<pinned_ref>`）、`trust: false`、`includeTools`（read-only allowlist）、`excludeTools`（dangerous denylist）が設定されていること
+- `references/serena-tool-manifest.json`（`serena_tool_manifest_v1`）の `pinned_ref` / `read_only_allowlist` / `dangerous_denylist` / `known_tools` と、実際に起動した Serena MCP の `tools/list` 応答が一致していること。drift（`known_tools` に存在しない tool が返る、または manifest 記載の tool が消えている）は fail-closed する
+- 互換用に `.gemini/settings.json` にも同じ Serena 設定（`mcp.allowed == ["serena"]` と `mcpServers.serena`）を用意すること。`preflight_gemini_headless.py` / `run_gemini_headless.py._validate_local_asset_research_settings` は `.gemini/settings.json` と `.agents/mcp_config.json` の両方を検証する
+- Gemini OAuth / trustedFolders は Serena MCP 起動そのものには不要（Serena は wrapper が直接起動する子プロセスであり、Gemini CLI 経由ではない）
 
 ## Claude Code (WSL2) での実行手順 / Execution from Claude Code
 
@@ -73,28 +91,29 @@ cat <result.json>
 
 `local_asset_research` プロファイルを使用するには Serena MCP が起動可能である必要がある。
 インストールは `uvx` 経由で行い、明示的な `pip install` は不要。
+正本は `.agents/mcp_config.json` の `mcpServers.serena` であり、pinned ref・`includeTools`・`excludeTools` を
+`references/serena-tool-manifest.json`（`serena_tool_manifest_v1`）と一致させる必要がある。
 
 ```bash
-# 起動可能性を確認（--help で終了するため実際のインストールは行われない）
-uvx --from git+https://github.com/oraios/serena serena-mcp-server --help
+# 起動可能性を確認（pinned ref を明示。--help で終了するため実際のインストールは行われない）
+uvx --from git+https://github.com/oraios/serena@<pinned_ref> serena start-mcp-server --project-from-cwd --help
 ```
 
-### `.gemini/settings.json` テンプレ
+### `.agents/mcp_config.json`（正本 / AGY 用 MCP 設定）
 
-リポジトリルートの `.gemini/settings.json` が存在しない場合、`setup_check.py` が以下のテンプレを自動生成する（既存ファイルは上書きしない）:
+`.agents/mcp_config.json` は AGY provider が参照する MCP サーバー設定の正本であり、`local_asset_research` の
+wrapper-side Serena 起動はこのファイルの `mcpServers.serena` を読む（`run_gemini_headless.py._load_serena_from_mcp_config`）。
 
 ```json
 {
-  "mcp": {
-    "allowed": ["serena"]
-  },
   "mcpServers": {
     "serena": {
       "command": "uvx",
       "args": [
         "--from",
-        "git+https://github.com/oraios/serena",
-        "serena-mcp-server",
+        "git+https://github.com/oraios/serena@<pinned_ref>",
+        "serena",
+        "start-mcp-server",
         "--project-from-cwd"
       ],
       "trust": false,
@@ -105,13 +124,40 @@ uvx --from git+https://github.com/oraios/serena serena-mcp-server --help
         "get_symbols_overview",
         "list_dir",
         "search_for_pattern"
+      ],
+      "excludeTools": [
+        "activate_project", "create_text_file", "delete_memory", "edit_memory",
+        "execute_shell_command", "find_declaration", "find_implementations",
+        "get_current_config", "get_diagnostics_for_file", "initial_instructions",
+        "insert_after_symbol", "insert_before_symbol", "list_memories", "onboarding",
+        "read_file", "read_memory", "rename_memory", "rename_symbol",
+        "replace_content", "replace_in_files", "replace_symbol_body",
+        "safe_delete_symbol", "write_memory"
       ]
     }
   }
 }
 ```
 
-この設定は `preflight_gemini_headless.py` の `_validate_local_asset_research_settings` が要求する条件と完全に一致している。
+`<pinned_ref>` は `references/serena-tool-manifest.json` の `pinned_ref` フィールドの値を使う（`git ls-remote` で取得した commit SHA を pin する）。
+`command`/`args` は `uvx ... serena start-mcp-server --project-from-cwd` の形（サブコマンドをハイフンで連結した単一トークン名の旧テンプレは現行 contract ではない）。
+`includeTools` は read-only allowlist（manifest の `read_only_allowlist` と一致）、`excludeTools` は dangerous denylist（manifest の `dangerous_denylist` と一致）を必ず含める。
+`trust` は必ず `false` にする。
+
+### `.gemini/settings.json`（互換用）
+
+`.gemini/settings.json` は Gemini CLI 側の互換設定として引き続き必要であり、`.agents/mcp_config.json` と同じ
+`mcpServers.serena` 設定（pinned ref・`includeTools`・`excludeTools`）を持たせる。
+`preflight_gemini_headless.py` / `run_gemini_headless.py._validate_local_asset_research_settings` は
+`.gemini/settings.json` と `.agents/mcp_config.json` の **両方** を、`references/serena-tool-manifest.json` に対して
+machine-checkable に検証する（`mcp.allowed == ["serena"]`、pinned ref 一致、`includeTools` が read-only allowlist と完全一致、
+`excludeTools` が dangerous denylist を含む、のいずれかに違反すると fail-closed）。
+
+> **既知の未解消差分**: `setup_check.py --fix` が `.gemini/settings.json` 不在時に自動生成するテンプレ（`_SETTINGS_TEMPLATE`）は
+> 本書執筆時点で unpinned（commit ref を含まない source 指定）かつ `excludeTools` を含まない旧形式のままであり、
+> 上記の pinned manifest 検証をそのままでは満たさない。この自動生成テンプレの更新は本 Issue の Allowed Paths（`scripts/setup_check.py` は対象外）を
+> 超えるため、本書では「実際に repo に存在する `.gemini/settings.json` / `.agents/mcp_config.json` が満たすべき正しい形」を記述するに留め、
+> `setup_check.py --fix` のテンプレ自体の追随は別 Issue で扱う。
 
 ## Trusted Folder の programmatic 登録手順
 

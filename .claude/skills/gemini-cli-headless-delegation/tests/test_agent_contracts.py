@@ -407,3 +407,93 @@ class TestReferencesDocsRuntimeDrift:
         assert "provider=agy" in text and "OAuth" in text, (
             "usage-contract.md に provider=agy の OAuth 系認証前提が明記されていない"
         )
+
+    # -----------------------------------------------------------------------
+    # PR #1362 OWNER REQUEST_CHANGES (#1268 fix_delta) 追加テスト
+    # -----------------------------------------------------------------------
+
+    def test_runtime_portability_no_serena_mcp_server_command_token(self):
+        text = _read(RUNTIME_PORTABILITY_MD)
+        assert "serena-mcp-server" not in text, (
+            "runtime-portability.md に旧コマンド名 'serena-mcp-server' が残っている。"
+            " 現行 contract は 'serena start-mcp-server' である。"
+        )
+
+    def test_runtime_portability_no_unpinned_serena_source(self):
+        text = _read(RUNTIME_PORTABILITY_MD)
+        unpinned = re.findall(r"git\+https://github\.com/oraios/serena(?!@)", text)
+        assert not unpinned, (
+            "runtime-portability.md に unpinned 'git+https://github.com/oraios/serena'"
+            "（@<ref> なし）が残っている。pinned ref を明示すること。"
+        )
+
+    def test_runtime_portability_mentions_agy_mcp_config_contract(self):
+        text = _read(RUNTIME_PORTABILITY_MD)
+        for token in (
+            ".agents/mcp_config.json",
+            "excludeTools",
+            "pinned_ref",
+            "serena start-mcp-server",
+        ):
+            assert token in text, (
+                f"runtime-portability.md に現行 Serena MCP contract のトークン"
+                f" '{token}' が含まれていない"
+            )
+
+    def test_runtime_portability_separates_common_and_local_asset_research_prereqs(self):
+        text = _read(RUNTIME_PORTABILITY_MD)
+        assert "provider=agy`（共通前提" in text, (
+            "runtime-portability.md に provider=agy の共通前提の節見出しがない"
+        )
+        assert "local_asset_research`（wrapper-side Serena 前提）" in text, (
+            "runtime-portability.md に provider=agy + local_asset_research の"
+            " wrapper-side Serena 前提を分離した節見出しがない"
+        )
+
+    def test_provider_mapping_tool_profiles_table_has_github_research_row(self):
+        text = _read(PROVIDER_MAPPING_MD)
+        assert re.search(r"\|\s*`github_research`\s*\|", text), (
+            "provider-mapping.md の Tool Profiles 表に github_research 行がない"
+        )
+
+    def test_provider_mapping_no_unconditional_no_model_fallback_claim(self):
+        text = _read(PROVIDER_MAPPING_MD)
+        assert "既定は `gemini-3-flash-preview` で、別 model への自動 fallback はしない" not in text, (
+            "provider-mapping.md に model fallback なしという無条件記述が残っている。"
+            " 明示 model 指定時 / role・model_chain 時 / provider=auto 時を分けて記述すること。"
+        )
+
+    def test_provider_mapping_documents_provider_auto_policy(self):
+        text = _read(PROVIDER_MAPPING_MD)
+        assert "provider_auto_policy_v1" in text, (
+            "provider-mapping.md に provider_auto_policy_v1 の説明がない"
+        )
+        assert 'provider=auto`' in text or "provider=\"auto\"" in text, (
+            "provider-mapping.md に runtime provider=auto の説明がない"
+        )
+
+    def test_provider_mapping_distinguishes_setup_check_auto_from_runtime_auto(self):
+        text = _read(PROVIDER_MAPPING_MD)
+        assert "setup_check.py --provider auto" in text and "provider_auto_dispatch" in text, (
+            "provider-mapping.md が setup_check.py --provider auto（環境 probe）と"
+            " runtime provider=auto（provider_auto_dispatch）を区別して記述していない"
+        )
+
+    def test_usage_contract_documents_provider_auto_result_fields(self):
+        text = _read(USAGE_CONTRACT_MD)
+        for field in (
+            "selected_provider",
+            "provider_attempts",
+            "fallback_reason",
+            "fallback_policy_version",
+            "attempts_by_model",
+        ):
+            assert field in text, (
+                f"usage-contract.md に provider=auto の result field '{field}' が"
+                " 明記されていない"
+            )
+        assert re.search(r"provider=\"auto\".*場合のみ存在|provider=\"auto\"\s*の場合のみ", text), (
+            "usage-contract.md が provider=auto の result field を条件付き field として"
+            " 明記していない"
+        )
+

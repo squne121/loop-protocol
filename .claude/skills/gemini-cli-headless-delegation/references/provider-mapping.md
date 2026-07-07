@@ -16,7 +16,9 @@ uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_
 ### 補足: Headless JSON / model / trusted / sandbox の注意点
 
 - `headless JSON` は `request.json` / `result.json` のファイル契約として扱い、`stream-json` を想定しない。wrapper 出力は request/response JSON ファイルです。
-- `model` は request の `model` フィールドで明示可能。既定は `gemini-3-flash-preview` で、別 model への自動 fallback はしない。
+- `model` は request の `model` フィールドで明示可能。**明示 `model` 指定時はそのモデルのみを試行し、quota 枯渇でも別 model へ降格しない**。
+  - `role` / `model_chain`（`model` 未指定時）では、quota 枯渇時に同一 provider 内で下位モデルへ自動降格するチェーンが存在する。正本は `references/model-routing.md`。
+  - runtime `provider=auto` では、上記 model 降格とは別フェーズとして provider 自体（gemini → agy）を切り替える `provider_auto_policy_v1` が適用される。詳細は本ファイル下部の「runtime `provider=auto`」節を参照。
 - `trusted` は preflight で `trusted workspace` と認証状態を検査し、未成立時は `ok: false` で実行停止する（fail-closed）。
 - sandbox は `no_tools` / `grounded_research` は `isolated temp cwd`、`local_asset_research` は確認済み MCP 構成時のみ repo root 起動とする。
 
@@ -28,6 +30,7 @@ uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_
 | `grounded_research` | Gemini CLI を isolated temp cwd から起動し、Google Search grounding を許可する。 | 外部調査のみ。repo 探索はしない。 |
 | `local_asset_research` | `.gemini/settings.json` の Serena allowlist を確認したうえで repo root から起動する。 | WSL 上の Serena MCP を使った read-only ローカル資産調査のみ。 |
 | `proposal_only` | Gemini CLI を isolated temp cwd から起動し、bounded draft text だけを返す。 | `implementation_draft` / `issue_authoring_draft` / `patch_proposal` / `command_plan` のみ。最終 write は Codex 側で行う。 |
+| `github_research` | Gemini 側: wrapper が request の `gh_commands`（argv ベースの許可コマンドリスト）を pre-exec で実行し、その出力を `inline_context` に前置してから Gemini CLI を起動する。AGY 側: `unsupported_provider_profile` として fail-closed（`AGY_SUPPORTED_PROFILES` に含まれない）。 | `gh_commands` は `tool_profile=github_research` でのみ許可される（それ以外の profile で指定すると validation で拒否）。GitHub read-only 調査のみで、書込は許可しない。 |
 
 `local_asset_research` は `grounded_research` とは意図的に分離している。
 Web 調査プロファイルではないため、Serena MCP 検証に失敗したときの fallback 先として使ってはならない。
@@ -65,7 +68,7 @@ uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_
 - `proposal_only` は実装代行ではなく下書き委譲である。`post_to_issue_url`、file write、shell edit、GitHub mutation を request に含めた場合は fail-closed にする。
 - `proposal_only` は `implementation_draft` と `issue_authoring_draft` の両用途で再利用できるが、最終 write owner は常に Codex 側 worker / main thread に残す。
 - Gemini CLI は OAuth / Google アカウント認証で使う。headless 実行前に cached credential、trusted workspace、`.env`、MCP 設定が repo-local contract と矛盾しないことを確認する。
-- 429 / `MODEL_CAPACITY_EXHAUSTED` は同一 model 内だけ限定回数リトライし、別 model へ自動切替しない。
+- 429 / `MODEL_CAPACITY_EXHAUSTED` は、明示 `model` 指定時は同一 model 内だけ限定回数リトライし、別 model へ自動切替しない。`role` / `model_chain` 指定時は同一 provider 内で下位モデルへの自動降格が存在する（正本: `references/model-routing.md`）。runtime `provider=auto` の provider 自体の切替は `provider_auto_policy_v1` に従う（別フェーズ、下記参照）。
 - `--output-format json` / `stream-json` は Codex 側の契約範囲外。必要なら wrapper 外の別 contract で検討し、現状は `result.json` による headless JSON 契約に限定する。
 
 ## agy 対応マトリクス（Provider Matrix: agy / Antigravity CLI）
@@ -166,3 +169,43 @@ agy 自体の --approval-mode plan 相当の動作は前提にしない。
 agy 優先の fallback 順序を確認できる。
 `setup_check.py --provider agy --fix` は `.gemini/` や trustedFolders を変更せず、
 `unsupported_provider_option` として fail-closed に扱う。
+
+## runtime `provider=auto`（`provider_auto_policy_v1` ポリシー）
+
+`run_gemini_headless.py` の `provider_auto_dispatch()` は、request の `provider` が `"auto"` のときに使われる
+**実行時の provider fallback ポリシー**（`provider_auto_policy_v1`、正本は `config/model_routing.yaml` の
+`provider_auto_policy_v1` ブロックと `run_gemini_headless.py` の `PROVIDER_AUTO_*` 定数）である。
+これは前節の model downgrade（`model_chain` 内での同一 provider 内の model 降格）とは **別フェーズ** であり、
+`provider_auto_dispatch()` は model downgrade ループを再実装せず、各 provider 呼び出しの結果（`failure_class` 等）を観測するだけである。
+
+| 項目 | 値 |
+|---|---|
+| `runtime_order`（`PROVIDER_AUTO_RUNTIME_ORDER`） | `("gemini", "agy")` — gemini を先に試行する |
+| `eligible_profiles`（`PROVIDER_AUTO_ELIGIBLE_PROFILES`） | `{"no_tools", "proposal_only"}` のみ。それ以外の `tool_profile` では provider 試行自体を行わず `provider_profile_unsupported` で即時 fail-closed する |
+| `retryable_failure_classes` | gemini: `quota_or_rate_limited` / `model_capacity_exhausted` / `model_chain_exhausted`。agy: `agy_rate_limited` / `agy_capacity_exhausted` / `agy_web_grounding_quota_exhausted`。これら以外の failure（validation / auth / permission 等）は fallback せず即座に停止する（fail-closed デフォルト） |
+| `stop_if`（`PROVIDER_AUTO_STOP_IF`） | `request_validation_failed` / `auth_or_permission_failed` / `request_has_post_to_issue_url` / `provider_profile_unsupported`。特に `post_to_issue_url` 指定時は非冪等な GitHub 投稿の重複を避けるため、最初の provider 試行が post-processing に到達した時点で以降の fallback を行わない |
+| `fallback_policy_version`（`PROVIDER_AUTO_FALLBACK_POLICY_VERSION`） | `"v1"` |
+
+### result field（`provider=auto` 専用の条件付き field）
+
+`provider_auto_dispatch()` の結果には、通常の `delegation_result/v1` core field に加えて以下が付与される
+（`PROVIDER_AUTO_RESULT_FIELDS` / `_provider_auto_finalize()`）。フィールド定義の詳細は `references/usage-contract.md` を参照。
+
+- `selected_provider`: 最終的に採用した provider 名（`"gemini"` / `"agy"`）。provider 未選択（stop_if で即時停止）の場合は `null`
+- `provider_attempts`: 試行した各 provider の結果を記録した list（監査可能な履歴）
+- `fallback_reason`: fallback が発生した理由、または stop_if による即時停止理由（例: `"stop_if:provider_profile_unsupported"`）
+- `fallback_policy_version`: 適用したポリシーの version（`"v1"` 固定）
+- `attempts_by_model`: `provider_attempts[]` 内の各 provider が実際に試行した `{model_id: attempt_count}` を集計した map（`_attempts_by_model_from_provider_attempts()` が計算する実測値であり、推定値ではない）
+
+### `setup_check.py --provider auto` と runtime `provider=auto` は別ポリシー
+
+**この 2 つを混同しないこと。**
+
+| 項目 | `setup_check.py --provider auto` | runtime `provider=auto`（`provider_auto_dispatch()`） |
+|---|---|---|
+| 性質 | 環境 probe（診断のみ、副作用なし） | 実行時 provider fallback（実際に Gemini / agy を呼び出す） |
+| 順序 | agy-first（`setup_check_order`） | gemini-first（`runtime_order` / `PROVIDER_AUTO_RUNTIME_ORDER`） |
+| 目的 | どちらの provider が使える状態か診断する | quota/capacity 系失敗時に別 provider へ切り替えて委譲を完了させる |
+| `--fix` | `unsupported_provider_option` で拒否（副作用対象が曖昧なため） | 該当なし（runtime dispatch に `--fix` 相当の概念はない） |
+
+2 つの順序が意図的に異なる理由: `setup_check_order` は「まず agy が使えるかを優先的に確認したい」という診断上の関心であるのに対し、`runtime_order` は「Gemini を既定 provider として維持しつつ quota/capacity 失敗時のみ agy にフォールバックする」という実行時の安全側デフォルトである。両者は独立したポリシーであり、一致している必要はない（`config/model_routing.yaml` の `provider_auto_policy_v1` ブロックのコメントを参照）。なお `references/model-routing.md` は現時点では model downgrade / role / model_chain のみを扱い、`provider_auto_policy_v1` 自体は未記載であることに注意する（本節が現状の唯一の docs 上の説明）。
