@@ -226,7 +226,10 @@ def _producer_vc_preflight_result(
     result = {
         "ac": "AC2",
         "line": 12,
-        "raw_command": "uv run --locked pytest .claude/skills/issue-refinement-loop/tests/test_reviewer_claim_replay.py -v",
+        "raw_command": (
+            "uv run --locked pytest "
+            ".claude/skills/issue-refinement-loop/tests/test_reviewer_claim_replay.py -v"
+        ),
         "command_hash": "sha256:command-a",
         "classification": "unexpected_pass",
         "category": "unexpected_pass",
