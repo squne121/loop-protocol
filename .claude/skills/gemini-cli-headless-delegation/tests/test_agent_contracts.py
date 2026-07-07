@@ -5,7 +5,9 @@ forbidden patterns) before runtime.
 """
 from __future__ import annotations
 
+import importlib.util
 import re
+import types
 from pathlib import Path
 
 import pytest
@@ -16,6 +18,30 @@ SKILLS_DIR = REPO_ROOT / ".claude" / "skills"
 
 WEB_RESEARCHER_MD = AGENTS_DIR / "web-researcher.md"
 ISSUE_REFINEMENT_LOOP_MD = SKILLS_DIR / "issue-refinement-loop" / "SKILL.md"
+
+GEMINI_SKILL_DIR = SKILLS_DIR / "gemini-cli-headless-delegation"
+REFERENCES_DIR = GEMINI_SKILL_DIR / "references"
+PROVIDER_MAPPING_MD = REFERENCES_DIR / "provider-mapping.md"
+RUNTIME_PORTABILITY_MD = REFERENCES_DIR / "runtime-portability.md"
+USAGE_CONTRACT_MD = REFERENCES_DIR / "usage-contract.md"
+RUN_GEMINI_HEADLESS_PY = GEMINI_SKILL_DIR / "scripts" / "run_gemini_headless.py"
+
+
+def _load_run_gemini_headless() -> types.ModuleType:
+    """Load run_gemini_headless.py under a unique module name (hermetic).
+
+    Uses a distinct name from other test files\' module loads
+    (e.g. test_agy_provider.py uses "run_gemini_headless") to avoid
+    sys.modules collisions when both test files run in the same session.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "run_gemini_headless_docs_drift_check", RUN_GEMINI_HEADLESS_PY
+    )
+    assert spec is not None
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    return mod
 
 
 def _read(path: Path) -> str:
@@ -277,3 +303,197 @@ class TestIssueRefinementLoop:
         assert "ハルシネーション" in text or "エビデンス" in text, (
             "Step 1b トリガーにハルシネーション切り分け条件が含まれていない"
         )
+
+
+# ---------------------------------------------------------------------------
+# references/*.md 固有: provider-mapping / runtime-portability / usage-contract
+# の docs/runtime drift 検査（Issue #1268）
+# ---------------------------------------------------------------------------
+
+
+class TestReferencesDocsRuntimeDrift:
+    """provider-mapping.md / runtime-portability.md / usage-contract.md が
+    run_gemini_headless.py の現行実装と矛盾しないことを検査する。"""
+
+    def test_provider_mapping_exists(self):
+        assert PROVIDER_MAPPING_MD.exists(), f"{PROVIDER_MAPPING_MD} が存在しない"
+
+    def test_runtime_portability_exists(self):
+        assert RUNTIME_PORTABILITY_MD.exists(), f"{RUNTIME_PORTABILITY_MD} が存在しない"
+
+    def test_usage_contract_exists(self):
+        assert USAGE_CONTRACT_MD.exists(), f"{USAGE_CONTRACT_MD} が存在しない"
+
+    def test_usage_contract_no_delegation_result_v1_underscore(self):
+        text = _read(USAGE_CONTRACT_MD)
+        assert "delegation_result_v1" not in text, (
+            "usage-contract.md に古いアンダースコア表記 delegation_result_v1 が残っている。"
+            " delegation_result/v1 に統一すること。"
+        )
+
+    def test_usage_contract_has_delegation_result_slash_v1(self):
+        text = _read(USAGE_CONTRACT_MD)
+        assert "delegation_result/v1" in text, (
+            "usage-contract.md に正規の delegation_result/v1 表記がない"
+        )
+
+    def test_runtime_portability_no_legacy_104_permanent_reference(self):
+        text = _read(RUNTIME_PORTABILITY_MD)
+        assert "恒久対応は parent Issue #104" not in text, (
+            "runtime-portability.md が parent Issue #104 を恒久対応の正本として"
+            " 参照したままになっている。#1265 / current references に更新すること。"
+        )
+
+    def test_runtime_portability_mentions_shell_false(self):
+        text = _read(RUNTIME_PORTABILITY_MD)
+        assert "shell=False" in text, (
+            "runtime-portability.md に agy 実行の shell=False 制約が明記されていない"
+        )
+
+    def test_usage_contract_post_to_issue_url_is_issue_only(self):
+        text = _read(USAGE_CONTRACT_MD)
+        assert "GitHub Issue/PR" not in text, (
+            "usage-contract.md の post_to_issue_url が Issue/PR 両対応であるかのように"
+            " 記述されている。GitHub Issue URL only（pulls/<number> 不可）と明記すること。"
+        )
+
+    def test_usage_contract_gh_commands_not_claimed_for_non_github_research(self):
+        text = _read(USAGE_CONTRACT_MD)
+        assert not re.search(
+            r"local_asset_research.*完全実装済み|proposal_only.*完全実装済み",
+            text,
+        ), (
+            "usage-contract.md が gh_commands は local_asset_research / proposal_only"
+            " でも完全実装済みと記述している。runtime は tool_profile='github_research'"
+            " のみ許可し、それ以外は fail-closed であるため記述を修正すること。"
+        )
+
+    def test_usage_contract_gh_commands_github_research_only_stated(self):
+        text = _read(USAGE_CONTRACT_MD)
+        assert "gh_commands is only allowed with tool_profile" in text, (
+            "usage-contract.md に gh_commands が github_research profile のみ許可される"
+            " runtime の fail-closed メッセージが明記されていない"
+        )
+
+    def test_provider_mapping_github_research_unsupported_for_agy(self):
+        text = _read(PROVIDER_MAPPING_MD)
+        assert re.search(
+            r"`github_research`\s*\|\s*\*\*unsupported_provider_profile\*\*", text
+        ), (
+            "provider-mapping.md の agy 対応表で github_research が"
+            " unsupported_provider_profile と明記されていない"
+        )
+
+    def test_provider_mapping_agy_supported_profiles_match_runtime(self):
+        """provider-mapping.md の agy supported profile 一覧が
+        run_gemini_headless.AGY_SUPPORTED_PROFILES と一致することを確認する。"""
+        rgh = _load_run_gemini_headless()
+        text = _read(PROVIDER_MAPPING_MD)
+        for profile in rgh.AGY_SUPPORTED_PROFILES:
+            assert re.search(
+                rf"`{re.escape(profile)}`\s*\|\s*(supported|\*\*supported\*\*)", text
+            ), (
+                f"provider-mapping.md の agy 対応表に runtime AGY_SUPPORTED_PROFILES の"
+                f" '{profile}' が supported として記載されていない"
+            )
+        # github_research is intentionally excluded from AGY_SUPPORTED_PROFILES.
+        assert rgh.GITHUB_RESEARCH_PROFILE not in rgh.AGY_SUPPORTED_PROFILES, (
+            "runtime AGY_SUPPORTED_PROFILES に github_research が含まれるようになった。"
+            " docs 側の unsupported 記述を見直すこと。"
+        )
+
+    def test_usage_contract_agy_auth_precondition_documented(self):
+        text = _read(USAGE_CONTRACT_MD)
+        assert "provider=agy" in text and "OAuth" in text, (
+            "usage-contract.md に provider=agy の OAuth 系認証前提が明記されていない"
+        )
+
+    # -----------------------------------------------------------------------
+    # PR #1362 OWNER REQUEST_CHANGES (#1268 fix_delta) 追加テスト
+    # -----------------------------------------------------------------------
+
+    def test_runtime_portability_no_serena_mcp_server_command_token(self):
+        text = _read(RUNTIME_PORTABILITY_MD)
+        assert "serena-mcp-server" not in text, (
+            "runtime-portability.md に旧コマンド名 'serena-mcp-server' が残っている。"
+            " 現行 contract は 'serena start-mcp-server' である。"
+        )
+
+    def test_runtime_portability_no_unpinned_serena_source(self):
+        text = _read(RUNTIME_PORTABILITY_MD)
+        unpinned = re.findall(r"git\+https://github\.com/oraios/serena(?!@)", text)
+        assert not unpinned, (
+            "runtime-portability.md に unpinned 'git+https://github.com/oraios/serena'"
+            "（@<ref> なし）が残っている。pinned ref を明示すること。"
+        )
+
+    def test_runtime_portability_mentions_agy_mcp_config_contract(self):
+        text = _read(RUNTIME_PORTABILITY_MD)
+        for token in (
+            ".agents/mcp_config.json",
+            "excludeTools",
+            "pinned_ref",
+            "serena start-mcp-server",
+        ):
+            assert token in text, (
+                f"runtime-portability.md に現行 Serena MCP contract のトークン"
+                f" '{token}' が含まれていない"
+            )
+
+    def test_runtime_portability_separates_common_and_local_asset_research_prereqs(self):
+        text = _read(RUNTIME_PORTABILITY_MD)
+        assert "provider=agy`（共通前提" in text, (
+            "runtime-portability.md に provider=agy の共通前提の節見出しがない"
+        )
+        assert "local_asset_research`（wrapper-side Serena 前提）" in text, (
+            "runtime-portability.md に provider=agy + local_asset_research の"
+            " wrapper-side Serena 前提を分離した節見出しがない"
+        )
+
+    def test_provider_mapping_tool_profiles_table_has_github_research_row(self):
+        text = _read(PROVIDER_MAPPING_MD)
+        assert re.search(r"\|\s*`github_research`\s*\|", text), (
+            "provider-mapping.md の Tool Profiles 表に github_research 行がない"
+        )
+
+    def test_provider_mapping_no_unconditional_no_model_fallback_claim(self):
+        text = _read(PROVIDER_MAPPING_MD)
+        assert "既定は `gemini-3-flash-preview` で、別 model への自動 fallback はしない" not in text, (
+            "provider-mapping.md に model fallback なしという無条件記述が残っている。"
+            " 明示 model 指定時 / role・model_chain 時 / provider=auto 時を分けて記述すること。"
+        )
+
+    def test_provider_mapping_documents_provider_auto_policy(self):
+        text = _read(PROVIDER_MAPPING_MD)
+        assert "provider_auto_policy_v1" in text, (
+            "provider-mapping.md に provider_auto_policy_v1 の説明がない"
+        )
+        assert 'provider=auto`' in text or "provider=\"auto\"" in text, (
+            "provider-mapping.md に runtime provider=auto の説明がない"
+        )
+
+    def test_provider_mapping_distinguishes_setup_check_auto_from_runtime_auto(self):
+        text = _read(PROVIDER_MAPPING_MD)
+        assert "setup_check.py --provider auto" in text and "provider_auto_dispatch" in text, (
+            "provider-mapping.md が setup_check.py --provider auto（環境 probe）と"
+            " runtime provider=auto（provider_auto_dispatch）を区別して記述していない"
+        )
+
+    def test_usage_contract_documents_provider_auto_result_fields(self):
+        text = _read(USAGE_CONTRACT_MD)
+        for field in (
+            "selected_provider",
+            "provider_attempts",
+            "fallback_reason",
+            "fallback_policy_version",
+            "attempts_by_model",
+        ):
+            assert field in text, (
+                f"usage-contract.md に provider=auto の result field '{field}' が"
+                " 明記されていない"
+            )
+        assert re.search(r"provider=\"auto\".*場合のみ存在|provider=\"auto\"\s*の場合のみ", text), (
+            "usage-contract.md が provider=auto の result field を条件付き field として"
+            " 明記していない"
+        )
+

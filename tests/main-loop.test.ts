@@ -13,10 +13,13 @@ import {
   runLoadGame,
   runNextSortieHandler,
   runProgressionSave,
+  runUpgradeWeaponHandler,
 } from '../src/main'
 import { resolvePhaseTransition } from '../src/systems/PhaseTransitionSystem'
 import { createInputState, mapInputToCommands } from '../src/input'
 import type { SaveResult } from '../src/storage'
+import { upgradeDefinitions } from '../src/data/upgrades'
+import type { HudUpgradeStatusCopy } from '../src/ui/HudController'
 
 const FIXED_DT = defaultSimulationConfig.fixedDeltaMs
 const MAX_SKIP = defaultSimulationConfig.maxFrameSkip
@@ -435,5 +438,197 @@ describe('AC5/AC6: runProgressionSave with reward-claim reason', () => {
       'Result confirmed; progress not saved.',
       expect.stringContaining('may be lost after reload'),
     )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Issue #1282: runUpgradeWeaponHandler — purchase eligibility, feedback mapping,
+// and same-render-pass hasLoadableSnapshot update (AC3, AC4, AC6)
+// ---------------------------------------------------------------------------
+
+describe('Issue #1282: runUpgradeWeaponHandler — synchronous purchase feedback (AC3, AC4, AC6)', () => {
+  it('GIVEN preparation with enough resources WHEN runUpgradeWeaponHandler purchases THEN storage.save is called once, resources/weaponPower update, purchased is true, and renderHud is invoked synchronously with the updated state (AC6)', () => {
+    const state = createInitialGameState()
+    state.loopPhase = 'preparation'
+    state.progress.resources = 150
+    state.progress.weaponPower = 1
+    const save = vi.fn(() => ({ ok: true as const, reason: 'saved' as const }))
+
+    let renderedResources: number | null = null
+    let renderedWeaponPower: number | null = null
+    const renderHud = vi.fn(() => {
+      renderedResources = state.progress.resources
+      renderedWeaponPower = state.progress.weaponPower
+    })
+    let copy: HudUpgradeStatusCopy | null = null
+
+    const purchased = runUpgradeWeaponHandler(state, upgradeDefinitions[0], { save }, {
+      setUpgradeStatusCopy: (c) => {
+        copy = c
+      },
+      markLoadableSnapshot: vi.fn(),
+      renderHud,
+    })
+
+    expect(purchased).toBe(true)
+    expect(save).toHaveBeenCalledTimes(1)
+    expect(state.progress.resources).toBe(50)
+    expect(state.progress.weaponPower).toBe(2)
+    expect(renderHud).toHaveBeenCalledTimes(1)
+    expect(renderedResources).toBe(50)
+    expect(renderedWeaponPower).toBe(2)
+    expect(copy).toEqual({
+      status: 'Upgrade installed.',
+      summary: 'Weapon Power increased. Resources were saved.',
+    })
+  })
+
+  it('GIVEN preparation with enough resources WHEN runUpgradeWeaponHandler purchases THEN markLoadableSnapshot() is invoked before renderHud() so hasLoadableSnapshot-equivalent state is already true at render time (AC6 regression)', () => {
+    // Regression test for PR #1365 iteration-2 OWNER REQUEST_CHANGES: the
+    // previous seam shape (`renderHud` only, with the caller updating
+    // `hasLoadableSnapshot` after receiving the handler's return value) let
+    // the synchronous render observe a stale `hasLoadableSnapshot === false`,
+    // because the caller-side assignment ran AFTER seam.renderHud() had
+    // already fired. This test fails against that shape (there is no
+    // markLoadableSnapshot seam member to invoke before renderHud) and only
+    // passes once markLoadableSnapshot() is called by the production handler
+    // before renderHud() on every successful purchase.
+    const state = createInitialGameState()
+    state.loopPhase = 'preparation'
+    state.progress.resources = 150
+    state.progress.weaponPower = 1
+    const save = vi.fn(() => ({ ok: true as const, reason: 'saved' as const }))
+
+    // Mirrors the production seam wiring in main.ts: markLoadableSnapshot()
+    // sets a local flag, and renderHud() captures the flag's value at the
+    // moment it is invoked. If markLoadableSnapshot() is not called before
+    // renderHud(), renderedHasLoadableSnapshot will be false — proving the
+    // false-green (stale render) bug.
+    let hasLoadableSnapshot = false
+    let renderedHasLoadableSnapshot: boolean | null = null
+    const renderHudCallOrder: string[] = []
+    const renderHud = vi.fn(() => {
+      renderHudCallOrder.push('renderHud')
+      renderedHasLoadableSnapshot = hasLoadableSnapshot
+    })
+
+    const purchased = runUpgradeWeaponHandler(state, upgradeDefinitions[0], { save }, {
+      setUpgradeStatusCopy: vi.fn(),
+      markLoadableSnapshot: () => {
+        renderHudCallOrder.push('markLoadableSnapshot')
+        hasLoadableSnapshot = true
+      },
+      renderHud,
+    })
+
+    expect(purchased).toBe(true)
+    expect(renderHud).toHaveBeenCalledTimes(1)
+    // markLoadableSnapshot() must run strictly before renderHud() (AC6: no
+    // next-rAF wait — the flag must already be true inside the same
+    // synchronous render pass).
+    expect(renderHudCallOrder).toEqual(['markLoadableSnapshot', 'renderHud'])
+    expect(renderedHasLoadableSnapshot).toBe(true)
+  })
+
+  it('GIVEN insufficient resources WHEN runUpgradeWeaponHandler is called THEN purchaseUpgrade (storage.save) is not invoked and feedback maps to the AC4 "Not enough resources." copy', () => {
+    const state = createInitialGameState()
+    state.loopPhase = 'preparation'
+    state.progress.resources = 10
+    const save = vi.fn(() => ({ ok: true as const, reason: 'saved' as const }))
+    const renderHud = vi.fn()
+    let copy: HudUpgradeStatusCopy | null = null
+
+    const purchased = runUpgradeWeaponHandler(state, upgradeDefinitions[0], { save }, {
+      setUpgradeStatusCopy: (c) => {
+        copy = c
+      },
+      markLoadableSnapshot: vi.fn(),
+      renderHud,
+    })
+
+    expect(purchased).toBe(false)
+    expect(save).not.toHaveBeenCalled()
+    expect(copy).toEqual({
+      status: 'Not enough resources.',
+      summary: 'Earn 100 resources before upgrading.',
+    })
+    expect(renderHud).toHaveBeenCalledTimes(1)
+  })
+
+  it('GIVEN a non-preparation phase WHEN runUpgradeWeaponHandler is called THEN feedback maps to the hangar copy without leaking the raw loopPhase value (AC4, AC5)', () => {
+    const state = createInitialGameState()
+    state.loopPhase = 'running'
+    const save = vi.fn(() => ({ ok: true as const, reason: 'saved' as const }))
+    let copy: HudUpgradeStatusCopy | null = null
+
+    const purchased = runUpgradeWeaponHandler(state, upgradeDefinitions[0], { save }, {
+      setUpgradeStatusCopy: (c) => {
+        copy = c
+      },
+      markLoadableSnapshot: vi.fn(),
+      renderHud: vi.fn(),
+    })
+
+    expect(purchased).toBe(false)
+    expect(save).not.toHaveBeenCalled()
+    expect(copy?.status).toBe('Upgrade available in hangar.')
+    expect(copy?.summary).toBe('Return to preparation before upgrading.')
+    expect(copy?.status).not.toContain('running')
+    expect(copy?.summary).not.toContain('running')
+  })
+
+  it('GIVEN an already-purchased upgrade WHEN runUpgradeWeaponHandler is called THEN purchase is rejected and feedback maps to the "already installed" copy', () => {
+    const state = createInitialGameState()
+    state.loopPhase = 'preparation'
+    state.progress.resources = 500
+    state.progress.weaponPower = 5
+    const save = vi.fn(() => ({ ok: true as const, reason: 'saved' as const }))
+    let copy: HudUpgradeStatusCopy | null = null
+
+    const purchased = runUpgradeWeaponHandler(state, upgradeDefinitions[0], { save }, {
+      setUpgradeStatusCopy: (c) => {
+        copy = c
+      },
+      markLoadableSnapshot: vi.fn(),
+      renderHud: vi.fn(),
+    })
+
+    expect(purchased).toBe(false)
+    expect(save).not.toHaveBeenCalled()
+    expect(copy).toEqual({
+      status: 'Upgrade already installed.',
+      summary: 'Weapon Power is already upgraded.',
+    })
+  })
+
+  it('GIVEN a failing storage.save() WHEN runUpgradeWeaponHandler purchases THEN resources/weaponPower are left untouched (atomic seam) and feedback maps to the write-error copy', () => {
+    const state = createInitialGameState()
+    state.loopPhase = 'preparation'
+    state.progress.resources = 150
+    state.progress.weaponPower = 1
+    const save = vi.fn(() => ({
+      ok: false as const,
+      reason: 'write-error' as const,
+      errorName: 'QuotaExceededError',
+    }))
+    let copy: HudUpgradeStatusCopy | null = null
+
+    const purchased = runUpgradeWeaponHandler(state, upgradeDefinitions[0], { save }, {
+      setUpgradeStatusCopy: (c) => {
+        copy = c
+      },
+      markLoadableSnapshot: vi.fn(),
+      renderHud: vi.fn(),
+    })
+
+    expect(purchased).toBe(false)
+    expect(save).toHaveBeenCalledTimes(1)
+    // Atomic seam: state.progress must be untouched on save failure
+    expect(state.progress.resources).toBe(150)
+    expect(state.progress.weaponPower).toBe(1)
+    expect(copy).toEqual({
+      status: 'Upgrade not saved.',
+      summary: 'No resources were spent. Check browser storage and try again.',
+    })
   })
 })
