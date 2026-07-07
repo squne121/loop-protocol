@@ -666,6 +666,45 @@ def test_unexpected_pass_maps_to_needs_fix():
     )
 
 
+def test_existing_file_missing_node_id_noncanonical_maps_to_needs_fix():
+    """PR #1366 review (Blocker 1) / Issue #1347: existing_file_missing_node_id_noncanonical
+    from baseline_vc_preflight must map to needs_fix (body-author fixable), not
+    fall through to human_judgment via the unmapped-category default."""
+    synthetic_preflight = {
+        "schema": "baseline_vc_preflight/v1",
+        "status": "blocked",
+        "results": [
+            {
+                "ac": "AC1",
+                "command": "uv run pytest existing_file.py::test_new_case -q",
+                "raw_command": "uv run pytest existing_file.py::test_new_case -q",
+                "exit_code": 4,
+                "classification": "blocked",
+                "category": "existing_file_missing_node_id_noncanonical",
+                "decision": "blocked",
+                "confidence": "high",
+                "scope_class": "baseline_fail_expected",
+                "line": 42,
+                "fix_hint": (
+                    "This pytest VC references a NEW test function on an EXISTING "
+                    "file (<file>::<new_test_name>), which is a non-canonical VC "
+                    "shape (Issue #1285 / PR #1305). Rewrite the VC to reference a "
+                    "not-yet-created test file (missing_new_test_file.py::test_name) "
+                    "instead of adding a new test function to an existing file."
+                ),
+                "stdout_head": [],
+                "stderr_head": [],
+            }
+        ],
+        "errors": [],
+    }
+    errors, aggregate = map_preflight_result_to_errors(synthetic_preflight)
+    assert aggregate == "needs_fix", f"Expected needs_fix, got {aggregate}"
+    assert any(
+        e["category"] == "existing_file_missing_node_id_noncanonical" for e in errors
+    ), f"existing_file_missing_node_id_noncanonical not found in errors: {errors}"
+
+
 def test_compound_command_maps_to_needs_fix():
     """AC3 unit: synthetic compound_command_disallowed result → needs_fix."""
     synthetic_preflight = {
