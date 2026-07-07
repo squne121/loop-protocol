@@ -350,7 +350,7 @@ export function createHudController(
     render(state, isPaused, upgradeView) {
       hp.textContent = `${formatCombatNumber(state.player.hp)}/${formatCombatNumber(state.player.maxHp)}`
       resources.textContent = `${state.progress.resources}`
-      weaponPowerField.textContent = `${state.progress.weaponPower}`
+      weaponPowerField.textContent = `${upgradeView?.weaponPower ?? state.progress.weaponPower}`
       shots.textContent = `${state.player.shotsFired}`
       cooldown.textContent = `${Math.ceil(state.player.weaponCooldownMs)} ms`
       assistStatus.textContent = getAssistStatusCopy(state)

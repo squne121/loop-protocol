@@ -244,6 +244,14 @@ export type UpgradeWeaponHandlerSeam = {
   /** Stores the player-facing copy for the most recent purchase attempt (AC4, AC5). */
   setUpgradeStatusCopy: (copy: HudUpgradeStatusCopy) => void
   /**
+   * Marks a loadable snapshot as available (AC6). Must be invoked, when the
+   * purchase succeeded, BEFORE `renderHud()` so `hasLoadableSnapshot` is
+   * already true by the time the synchronous render reads it — the caller
+   * must not update this state only after receiving this function's return
+   * value.
+   */
+  markLoadableSnapshot: () => void
+  /**
    * Renders the HUD synchronously (AC6). Must be invoked before this function
    * returns so resources/weaponPower/hasLoadableSnapshot land in the same
    * render pass — the caller must not wait for the next requestAnimationFrame.
@@ -277,6 +285,10 @@ export function runUpgradeWeaponHandler(
   const result = purchaseUpgrade(state, definition.definitionId, definition, storage)
   if (result.ok) {
     seam.setUpgradeStatusCopy(getUpgradeStatusCopy('ok'))
+    // AC6: mark the loadable snapshot BEFORE renderHud() so the synchronous
+    // render below observes hasLoadableSnapshot === true in the same pass —
+    // the caller must not defer this until after this function returns.
+    seam.markLoadableSnapshot()
   } else {
     seam.setUpgradeStatusCopy(getUpgradeStatusCopy(result.reason))
   }
@@ -548,23 +560,24 @@ const hud = commandRail ? createHudController(commandRail, {
   },
   onUpgradeWeapon() {
     // Delegated to runUpgradeWeaponHandler seam for testability (Issue #1282).
-    const purchased = runUpgradeWeaponHandler(state, upgradeDefinition, storage, {
+    // AC6: markLoadableSnapshot() is invoked by the seam BEFORE renderHud()
+    // so hasLoadableSnapshot is already true when the synchronous render below
+    // reads it — do NOT gate this on the handler's return value after the
+    // fact (that would run one render pass too late).
+    runUpgradeWeaponHandler(state, upgradeDefinition, storage, {
       setUpgradeStatusCopy(copy) {
         upgradeStatusCopy = copy
+      },
+      markLoadableSnapshot() {
+        // purchaseUpgrade() is the atomic save seam (state.progress is only
+        // committed after storage.save() succeeds), so no additional
+        // runProgressionSave()/persistProgressionSnapshot() call is needed.
+        hasLoadableSnapshot = true
       },
       renderHud() {
         hud?.render(state, productPause.isPaused, buildUpgradeView())
       },
     })
-
-    if (purchased) {
-      // AC6: hasLoadableSnapshot updates in the SAME synchronous render pass as
-      // the resources/weaponPower change — purchaseUpgrade() itself is the
-      // atomic save seam (state.progress is only committed after storage.save()
-      // succeeds), so no additional runProgressionSave()/persistProgressionSnapshot()
-      // call is needed or wanted here.
-      hasLoadableSnapshot = true
-    }
   },
 }) : null
 

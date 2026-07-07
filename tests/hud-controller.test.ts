@@ -700,6 +700,35 @@ describe('Issue #1282: HUD upgrade purchase surface (AC1, AC2, AC3, AC5)', () =>
     expect(container.querySelector('[data-field="weapon-power"]')?.textContent).toBe('3')
   })
 
+  it('GIVEN an upgradeView with a weaponPower distinct from state.progress.weaponPower WHEN render called THEN the Weapon Power stat displays upgradeView.weaponPower (view-model-driven, not a direct state read)', () => {
+    // Regression test for PR #1365 iteration-2 P2 fix_delta: HudController.render()
+    // must read weaponPower from the upgrade view model (when provided) instead
+    // of reaching into state.progress directly, so the view-model boundary
+    // documented for the rest of HudUpgradeViewModel is not silently broken
+    // for this one field.
+    const state = createState('preparation')
+    state.progress.weaponPower = 1
+
+    hudController.render(state, false, {
+      definitionId: 'weapon_power_plus_1',
+      cost: 100,
+      weaponPower: 9,
+      buttonDisabled: false,
+      statusCopy: null,
+    })
+
+    expect(container.querySelector('[data-field="weapon-power"]')?.textContent).toBe('9')
+  })
+
+  it('GIVEN no upgradeView WHEN render called THEN the Weapon Power stat falls back to state.progress.weaponPower', () => {
+    const state = createState('preparation')
+    state.progress.weaponPower = 4
+
+    hudController.render(state, false)
+
+    expect(container.querySelector('[data-field="weapon-power"]')?.textContent).toBe('4')
+  })
+
   it('GIVEN an upgradeView WHEN render called THEN the Upgrade weapon button, cost, and a role=status/aria-live=polite/aria-atomic=true live region are present (AC2)', () => {
     hudController.render(createState('preparation'), false, {
       definitionId: 'weapon_power_plus_1',

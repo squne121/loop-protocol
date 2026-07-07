@@ -466,6 +466,7 @@ describe('Issue #1282: runUpgradeWeaponHandler — synchronous purchase feedback
       setUpgradeStatusCopy: (c) => {
         copy = c
       },
+      markLoadableSnapshot: vi.fn(),
       renderHud,
     })
 
@@ -482,6 +483,53 @@ describe('Issue #1282: runUpgradeWeaponHandler — synchronous purchase feedback
     })
   })
 
+  it('GIVEN preparation with enough resources WHEN runUpgradeWeaponHandler purchases THEN markLoadableSnapshot() is invoked before renderHud() so hasLoadableSnapshot-equivalent state is already true at render time (AC6 regression)', () => {
+    // Regression test for PR #1365 iteration-2 OWNER REQUEST_CHANGES: the
+    // previous seam shape (`renderHud` only, with the caller updating
+    // `hasLoadableSnapshot` after receiving the handler's return value) let
+    // the synchronous render observe a stale `hasLoadableSnapshot === false`,
+    // because the caller-side assignment ran AFTER seam.renderHud() had
+    // already fired. This test fails against that shape (there is no
+    // markLoadableSnapshot seam member to invoke before renderHud) and only
+    // passes once markLoadableSnapshot() is called by the production handler
+    // before renderHud() on every successful purchase.
+    const state = createInitialGameState()
+    state.loopPhase = 'preparation'
+    state.progress.resources = 150
+    state.progress.weaponPower = 1
+    const save = vi.fn(() => ({ ok: true as const, reason: 'saved' as const }))
+
+    // Mirrors the production seam wiring in main.ts: markLoadableSnapshot()
+    // sets a local flag, and renderHud() captures the flag's value at the
+    // moment it is invoked. If markLoadableSnapshot() is not called before
+    // renderHud(), renderedHasLoadableSnapshot will be false — proving the
+    // false-green (stale render) bug.
+    let hasLoadableSnapshot = false
+    let renderedHasLoadableSnapshot: boolean | null = null
+    const renderHudCallOrder: string[] = []
+    const renderHud = vi.fn(() => {
+      renderHudCallOrder.push('renderHud')
+      renderedHasLoadableSnapshot = hasLoadableSnapshot
+    })
+
+    const purchased = runUpgradeWeaponHandler(state, upgradeDefinitions[0], { save }, {
+      setUpgradeStatusCopy: vi.fn(),
+      markLoadableSnapshot: () => {
+        renderHudCallOrder.push('markLoadableSnapshot')
+        hasLoadableSnapshot = true
+      },
+      renderHud,
+    })
+
+    expect(purchased).toBe(true)
+    expect(renderHud).toHaveBeenCalledTimes(1)
+    // markLoadableSnapshot() must run strictly before renderHud() (AC6: no
+    // next-rAF wait — the flag must already be true inside the same
+    // synchronous render pass).
+    expect(renderHudCallOrder).toEqual(['markLoadableSnapshot', 'renderHud'])
+    expect(renderedHasLoadableSnapshot).toBe(true)
+  })
+
   it('GIVEN insufficient resources WHEN runUpgradeWeaponHandler is called THEN purchaseUpgrade (storage.save) is not invoked and feedback maps to the AC4 "Not enough resources." copy', () => {
     const state = createInitialGameState()
     state.loopPhase = 'preparation'
@@ -494,6 +542,7 @@ describe('Issue #1282: runUpgradeWeaponHandler — synchronous purchase feedback
       setUpgradeStatusCopy: (c) => {
         copy = c
       },
+      markLoadableSnapshot: vi.fn(),
       renderHud,
     })
 
@@ -516,6 +565,7 @@ describe('Issue #1282: runUpgradeWeaponHandler — synchronous purchase feedback
       setUpgradeStatusCopy: (c) => {
         copy = c
       },
+      markLoadableSnapshot: vi.fn(),
       renderHud: vi.fn(),
     })
 
@@ -539,6 +589,7 @@ describe('Issue #1282: runUpgradeWeaponHandler — synchronous purchase feedback
       setUpgradeStatusCopy: (c) => {
         copy = c
       },
+      markLoadableSnapshot: vi.fn(),
       renderHud: vi.fn(),
     })
 
@@ -566,6 +617,7 @@ describe('Issue #1282: runUpgradeWeaponHandler — synchronous purchase feedback
       setUpgradeStatusCopy: (c) => {
         copy = c
       },
+      markLoadableSnapshot: vi.fn(),
       renderHud: vi.fn(),
     })
 
