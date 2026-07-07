@@ -91,6 +91,16 @@ REVIEWER_CHECKER_TAXONOMY_V1: list[dict[str, Any]] = [
         "readiness_category_source_check": "contract_readiness_check",
         "domain_keys": ["runtime_applicability"],
     },
+    {
+        "entry_id": "unexpected_pass",
+        "reviewer_codes": ["unexpected_pass"],
+        "deterministic_checks": [],
+        "readiness_rule_ids": [],
+        "readiness_rule_id_source_check": None,
+        "readiness_categories": ["unexpected_pass"],
+        "readiness_category_source_check": "baseline_vc_preflight",
+        "domain_keys": ["vc_unexpected_pass"],
+    },
 ]
 
 TAXONOMY_BY_ENTRY_ID: dict[str, dict[str, Any]] = {
@@ -255,8 +265,6 @@ def _matching_vc_preflight(kind: str, vc_preflight_result: dict[str, Any] | None
     results = vc_preflight_result.get("results", [])
     if not isinstance(results, list):
         raise ValueError("vc-preflight-result-file.results must be a list")
-    if kind != "vc_command_format":
-        return []
     entry = TAXONOMY_BY_ENTRY_ID.get(kind)
     categories = frozenset(entry["readiness_categories"]) if entry else frozenset()
     return [item for item in results if isinstance(item, dict) and item.get("category") in categories]

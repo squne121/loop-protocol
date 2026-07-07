@@ -85,6 +85,20 @@ READINESS_C9 = {
     ],
 }
 
+READINESS_UNEXPECTED_PASS = {
+    "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+    "body_sha256": "sha256:body-a",
+    "errors": [
+        {
+            "rule_id": "",
+            "source_check": "baseline_vc_preflight",
+            "category": "unexpected_pass",
+            "line_start": 12,
+            "line_end": 12,
+        }
+    ],
+}
+
 READINESS_CLEAN = {
     "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
     "body_sha256": "sha256:body-a",
@@ -188,6 +202,15 @@ COMPACT_C9 = {
     "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
     "body_sha256": "sha256:body-a",
     "blocking_issues": [{"code": "rva_immediate_field_missing", "message": "missing runtime applicability"}],
+    "structured_blockers": [],
+    "findings": [],
+}
+
+COMPACT_UNEXPECTED_PASS = {
+    "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
+    "issue_url": "https://github.com/squne121/loop-protocol/issues/1368",
+    "body_sha256": "sha256:body-a",
+    "blocking_issues": [{"code": "unexpected_pass", "message": "unexpected pass"}],
     "structured_blockers": [],
     "findings": [],
 }
@@ -551,6 +574,42 @@ def test_vc_preflight_category_backs_c4():
     )
     assert result["verdict"] == "deterministic_fail_confirmed"
     assert result["blockers"][0]["evidence"][0]["source_check"] == "baseline_vc_preflight"
+
+
+def test_unexpected_pass_readiness_category_is_deterministic_backed():
+    result, _ = analyze(
+        review_result=COMPACT_UNEXPECTED_PASS,
+        readiness_result=READINESS_UNEXPECTED_PASS,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
+    assert result["verdict"] == "deterministic_fail_confirmed"
+    assert result["should_consume_iteration"] is True
+    blocker = result["blockers"][0]
+    assert blocker["normalized_kind"] == "unexpected_pass"
+    assert blocker["evidence"][0]["source_check"] == "baseline_vc_preflight"
+    assert blocker["evidence"][0]["category"] == "unexpected_pass"
+
+
+def test_unexpected_pass_vc_preflight_category_is_deterministic_backed():
+    preflight = {
+        "schema": "baseline_vc_preflight/v1",
+        "results": [{"category": "unexpected_pass", "line_start": 12, "line_end": 12}],
+    }
+    result, _ = analyze(
+        review_result=COMPACT_UNEXPECTED_PASS,
+        readiness_result=READINESS_CLEAN,
+        vc_syntax_result=None,
+        vc_preflight_result=preflight,
+        previous_state={},
+    )
+    assert result["verdict"] == "deterministic_fail_confirmed"
+    assert result["should_consume_iteration"] is True
+    blocker = result["blockers"][0]
+    assert blocker["normalized_kind"] == "unexpected_pass"
+    assert blocker["evidence"][0]["source_check"] == "baseline_vc_preflight"
+    assert blocker["evidence"][0]["category"] == "unexpected_pass"
 
 
 def test_checker_gap_does_not_suppress_fallback_evidence_search():
