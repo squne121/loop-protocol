@@ -406,6 +406,86 @@ else
 fi
 ```
 
+## delegation_audit_v1: 監査ログ / Delegation Audit Log
+
+`run_gemini_headless.py` の全実行に対して、`delegation_audit_v1` という専用の closed schema を持つ
+UTF-8 JSON Lines（JSONL）監査ログを出力できる。既存の `--output-file` / `--output-format json|ndjson` /
+stdout / stderr の結果ストリームとはファイルレベルで完全に分離されており、`delegation_result/v1` の
+契約を一切変更しない（Issue #1272）。
+
+### 有効化方法（明示指定のみ / 暗黙有効化しない）
+
+以下のいずれかを明示指定した場合にのみ監査ログが有効になる。指定がなければ何も書き込まれない。
+
+```bash
+# CLI フラグで指定
+uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
+  --request-file <request.json> \
+  --output-file <result.json> \
+  --audit-log tmp/delegation-audit.jsonl
+
+# 環境変数で指定（CLI フラグが優先される）
+export DELEGATION_AUDIT_LOG_PATH=tmp/delegation-audit.jsonl
+uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
+  --request-file <request.json> \
+  --output-file <result.json>
+```
+
+### レコード構造 / JSONL format
+
+1 行 1 JSON object、append-only。`run_delegation()` の 1 回の呼び出し（トップレベル呼び出しのみ。
+`provider=auto` のフォールバック内部で再入する呼び出しは監査を再発行しない）につき、同一 `run_id` を
+持つ `record_type: "start"` レコードが 1 件、`record_type: "end"` レコードが 1 件、必ずペアで出力される。
+
+start / end とも `schema` フィールドは `delegation_audit_v1` に固定される。start は
+`provider_requested` / `tool_profile` を必須キーとして持ち、end は `ok` / `failure_class` /
+`failure_reason` / `actual_model` / `tool_profile` を必須キーとして持つ。上記以外のキーは
+record_type ごとの許可済みキー集合に含まれるオプションキーのみで、それ以外のキーが混入した
+レコードは closed schema 違反として拒否される（`validate_delegation_audit_record()`）。
+
+### 秘匿情報 masking 方針 / redaction policy
+
+監査ログに書き込まれる全ての文字列値は、既存の `_redact_text()` / `_CREDENTIAL_REGEX` による
+credential masking に加えて、`$HOME` 配下の絶対パスと repo 絶対パスをそれぞれ `<HOME>` /
+`<REPO_ROOT>` に置換する（`_audit_mask_text()`）。raw prompt・raw credential・raw transcript・
+HOME path・repo absolute path はいずれも監査ログに出力されない。
+
+**redaction-before-truncate**: `failure_reason` は masking を適用した後に 500 文字へ切り詰める
+（`_audit_prepare_failure_reason()`）。切り詰めを先に行うと credential の断片が正規表現の
+検出範囲外に残ってしまう可能性があるため、順序は固定である。
+
+`grounded_research` の `grounding_transcript_evidence` / `citation_evidence` のような raw evidence
+フィールドは監査ログに一切含めない（`grounded_metadata` は `grounding_status` /
+`grounding_backend` / 各種 count / `grounding_failure_class` など public-safe な subset のみ）。
+
+### audit failure policy（監査書き込み失敗時の挙動）
+
+監査ログの書き込み自体が失敗した場合（ディスク書き込みエラー等）、デフォルトでは
+delegation 本体の成否には一切影響しない（best-effort。stderr に warning を出力するのみ）。
+
+`DELEGATION_AUDIT_REQUIRED=1` を明示指定した場合のみ fail-closed になり、監査ログの
+書き込み失敗（または record 自体が schema 違反で構築できない場合）は例外として上位に伝播する。
+
+```bash
+# 監査書き込み失敗を fail-closed 扱いにする（オプトイン）
+export DELEGATION_AUDIT_REQUIRED=1
+```
+
+### field-to-metric mapping
+
+| audit フィールド | 由来 | 用途 |
+|---|---|---|
+| `run_id` | 呼び出しごとに生成される UUID4 hex | start/end のペアリングキー |
+| `provider_requested` / `tool_profile` | request の該当フィールドをそのまま記録 | 監視ダッシュボード上の provider / profile 別集計軸 |
+| `ok` / `failure_class` / `failure_reason` | `delegation_result/v1` の同名フィールド（failure_reason は masking + truncate 済み） | 成功率・失敗クラス分布の集計 |
+| `selected_provider` / `provider_attempts` / `fallback_reason` / `fallback_policy_version` / `attempts_by_model` | `provider_auto_policy_v1`（#1270）の `PROVIDER_AUTO_RESULT_FIELDS` と同一の集合。`provider_attempts[].failure_reason` も同じ masking + truncate を適用 | provider=auto のフォールバック発生率・provider 別成功率の監視 |
+| `model_downgrades` | Gemini モデルチェーンのダウングレード履歴 | モデルダウングレード発生率の監視 |
+| `post_result.request_success` / `post_result.posting_success` | `post_request_success` / `post_posting_success`（Issue #1272 で追加。content 生成成功と GitHub post 成功を分離） | post_to_issue_url 経路の request 成功率 / posting 成功率を別軸で監視 |
+| `grounded_metadata` | `grounded_research_evidence` の public-safe subset（Issue #1266） | grounded_research の web grounding 成功率・citation 数の監視 |
+| `local_asset_metadata` | `local_asset_research` プロファイル使用時の `context_files_count` / Serena retrieval 失敗フラグ | local_asset_research（Serena 経由）の失敗率監視 |
+| `auth_diagnostics_metadata` | AGY の認証系 `failure_class`（`agy_auth_required` / `agy_permission_denied`）から導出（Issue #1267 territory） | 認証起因の失敗率監視 |
+| `parent_run_id` / `subtask_id` / `attempt_id` | Issue #1273（fan-out）向けの予約フィールド。request に指定があれば伝播、無ければ出力されない | 将来の並列実行 orchestrator が subtask を親 run に紐付けるための予約領域 |
+
 ## Out of Scope / 対象外
 
 - CodexCLI 向け実行手順（Followup Issue 扱い）

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import warnings
 from pathlib import Path
 from typing import Any, Mapping
@@ -2483,7 +2484,456 @@ def _validate_agy_local_asset_request(request: Mapping[str, Any], request_path: 
     return errors
 
 
-def run_delegation(
+# ---------------------------------------------------------------------------
+# delegation_audit_v1 (Issue #1272)
+# ---------------------------------------------------------------------------
+# Closed-schema, independent JSONL audit stream for every top-level
+# run_delegation() invocation. Deliberately separate from the
+# delegation_result/v1 return value and from --output-file / --output-format
+# / stdout / stderr: audit records are only ever written to the path resolved
+# by _resolve_audit_log_path() (CLI --audit-log or DELEGATION_AUDIT_LOG_PATH
+# env var), and only when that path resolves to non-empty.
+#
+# Exactly one "start" record and one "end" record, sharing the same run_id,
+# are emitted per top-level run_delegation() call -- nested re-entrant calls
+# (provider="auto" fallback attempts) go through _run_delegation_core()
+# directly and never emit their own pair (see run_delegation() below and
+# provider_auto_dispatch()).
+
+DELEGATION_AUDIT_SCHEMA_VERSION = "delegation_audit_v1"
+
+_AUDIT_RECORD_TYPES: frozenset[str] = frozenset({"start", "end"})
+
+_AUDIT_START_REQUIRED_KEYS: frozenset[str] = frozenset({
+    "schema",
+    "record_type",
+    "run_id",
+    "ts",
+    "provider_requested",
+    "tool_profile",
+})
+_AUDIT_START_OPTIONAL_KEYS: frozenset[str] = frozenset({
+    "role",
+    "model_requested",
+    "parent_run_id",
+    "subtask_id",
+    "attempt_id",
+})
+_AUDIT_START_ALL_KEYS: frozenset[str] = _AUDIT_START_REQUIRED_KEYS | _AUDIT_START_OPTIONAL_KEYS
+
+_AUDIT_END_REQUIRED_KEYS: frozenset[str] = frozenset({
+    "schema",
+    "record_type",
+    "run_id",
+    "ts",
+    "ok",
+    "failure_class",
+    "failure_reason",
+    "actual_model",
+    "tool_profile",
+})
+_AUDIT_END_OPTIONAL_KEYS: frozenset[str] = frozenset({
+    "selected_provider",
+    "provider_attempts",
+    "fallback_reason",
+    "fallback_policy_version",
+    "attempts_by_model",
+    "model_downgrades",
+    "post_result",
+    "grounded_metadata",
+    "local_asset_metadata",
+    "auth_diagnostics_metadata",
+    "parent_run_id",
+    "subtask_id",
+    "attempt_id",
+})
+_AUDIT_END_ALL_KEYS: frozenset[str] = _AUDIT_END_REQUIRED_KEYS | _AUDIT_END_OPTIONAL_KEYS
+
+_AUDIT_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+# Reserved fan-out fields (Issue #1273 / AC8) -- always optional, never
+# required, on either record type.
+_AUDIT_RESERVED_FANOUT_KEYS: tuple[str, ...] = ("parent_run_id", "subtask_id", "attempt_id")
+
+# AGY failure classes that indicate an authentication/authorization problem
+# (Issue #1267 agy_auth_diagnostics_v1 territory). Reused here, rather than
+# re-implemented, so the audit auth_diagnostics_metadata reflects the same
+# failure_class enum _classify_agy_failure() already produces.
+_AGY_AUTH_RELATED_FAILURE_CLASSES: frozenset[str] = frozenset({
+    "agy_auth_required",
+    "agy_permission_denied",
+})
+
+# Public-safe subset of _build_agy_grounded_research_metadata()'s output
+# (Issue #1266). Deliberately excludes citation_evidence and
+# grounding_transcript_evidence, which may carry raw model transcript text.
+_GROUNDED_METADATA_PUBLIC_SAFE_KEYS: tuple[str, ...] = (
+    "grounding_actor",
+    "grounding_backend",
+    "grounding_status",
+    "web_tool_call_count",
+    "search_query_count",
+    "url_citation_count",
+    "grounding_failure_class",
+    "raw_transcript_included",
+    "raw_credential_included",
+    "repo_absolute_path_included",
+)
+
+_AUDIT_FAILURE_REASON_MAX_LEN = 500
+
+_AUDIT_LOG_PATH_ENV_VAR = "DELEGATION_AUDIT_LOG_PATH"
+_AUDIT_REQUIRED_ENV_VAR = "DELEGATION_AUDIT_REQUIRED"
+
+# CLI --audit-log takes priority over the env var; both are "明示" activation
+# per AC3 (never enabled implicitly).
+_AUDIT_LOG_OVERRIDE: Path | None = None
+
+
+def set_audit_log_path_override(path: Path | None) -> None:
+    """Set (or clear, with None) the CLI-provided --audit-log path.
+
+    Exposed as a module-level function (rather than a private-only global)
+    so tests can drive it deterministically without relying on env var
+    mutation.
+    """
+    global _AUDIT_LOG_OVERRIDE
+    _AUDIT_LOG_OVERRIDE = path
+
+
+def _resolve_audit_log_path() -> Path | None:
+    """Resolve the delegation_audit_v1 JSONL output path, or None if
+    audit logging is not explicitly enabled (AC3: --audit-log or explicit
+    env var only -- never enabled implicitly)."""
+    if _AUDIT_LOG_OVERRIDE is not None:
+        return _AUDIT_LOG_OVERRIDE
+    raw = os.environ.get(_AUDIT_LOG_PATH_ENV_VAR, "").strip()
+    if not raw:
+        return None
+    return Path(raw)
+
+
+def _audit_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _audit_new_run_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _audit_mask_text(text_value: str) -> str:
+    """Redaction-before-truncate building block (AC4): credential masking
+    reuses _redact_text(); HOME and repo-absolute-path masking are audit-log
+    specific (the delegation_result/v1 contract does not mask these)."""
+    if not text_value:
+        return text_value
+    masked = _redact_text(text_value)
+    home = os.path.expanduser("~")
+    if home and home != "~":
+        masked = masked.replace(home, "<HOME>")
+    try:
+        repo_root = str(_repo_root())
+    except Exception:  # pylint: disable=broad-except
+        repo_root = ""
+    if repo_root:
+        masked = masked.replace(repo_root, "<REPO_ROOT>")
+    return masked
+
+
+def _audit_prepare_failure_reason(raw: Any) -> str | None:
+    """Mask THEN truncate (never the reverse -- truncating first could cut a
+    credential mid-token and let the remaining fragment slip past the
+    redaction regex, Issue #1272 AC4)."""
+    if not raw:
+        return None
+    masked = _audit_mask_text(str(raw))
+    return masked[:_AUDIT_FAILURE_REASON_MAX_LEN]
+
+
+def _audit_redact_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _audit_mask_text(value)
+    if isinstance(value, dict):
+        return {key: _audit_redact_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_audit_redact_value(item) for item in value]
+    return value
+
+
+def validate_delegation_audit_record(record: Mapping[str, Any]) -> list[str]:
+    """Fail-closed validator for a single delegation_audit_v1 record.
+
+    Returns a list of human-readable errors (empty == valid). Enforces a
+    *closed* schema: any key outside the allowed set for the record's
+    record_type is rejected (Issue #1272 AC1), required keys/types are
+    checked, and the redaction invariant (AC4) is checked on every string
+    leaf via _scan_redaction_violations().
+    """
+    errors: list[str] = []
+    if not isinstance(record, Mapping):
+        return ["record must be a mapping"]
+
+    if record.get("schema") != DELEGATION_AUDIT_SCHEMA_VERSION:
+        errors.append(f"schema must equal {DELEGATION_AUDIT_SCHEMA_VERSION!r}")
+
+    record_type = record.get("record_type")
+    if record_type not in _AUDIT_RECORD_TYPES:
+        errors.append(f"record_type must be one of {sorted(_AUDIT_RECORD_TYPES)}")
+        return errors  # cannot validate further without a known record_type
+
+    allowed_keys = _AUDIT_START_ALL_KEYS if record_type == "start" else _AUDIT_END_ALL_KEYS
+    required_keys = _AUDIT_START_REQUIRED_KEYS if record_type == "start" else _AUDIT_END_REQUIRED_KEYS
+
+    unknown_keys = set(record) - allowed_keys
+    if unknown_keys:
+        errors.append(f"unknown key(s) for record_type={record_type!r}: {sorted(unknown_keys)}")
+
+    missing_keys = required_keys - set(record)
+    if missing_keys:
+        errors.append(f"missing required key(s) for record_type={record_type!r}: {sorted(missing_keys)}")
+
+    run_id = record.get("run_id")
+    if not isinstance(run_id, str) or not run_id.strip():
+        errors.append("run_id must be a non-empty string")
+
+    ts = record.get("ts")
+    if not isinstance(ts, str) or not _AUDIT_TS_RE.match(ts):
+        errors.append("ts must be an ISO-8601 UTC string matching YYYY-MM-DDTHH:MM:SSZ")
+
+    if record_type == "start":
+        if not isinstance(record.get("provider_requested"), str):
+            errors.append("provider_requested must be a string")
+        if not isinstance(record.get("tool_profile"), str):
+            errors.append("tool_profile must be a string")
+        if "role" in record and record["role"] is not None and not isinstance(record["role"], str):
+            errors.append("role must be a string when present")
+        if "model_requested" in record and record["model_requested"] is not None and not isinstance(
+            record["model_requested"], str
+        ):
+            errors.append("model_requested must be a string when present")
+    else:
+        if not isinstance(record.get("ok"), bool):
+            errors.append("ok must be a bool")
+        if record.get("failure_class") is not None and not isinstance(record["failure_class"], str):
+            errors.append("failure_class must be a string or null")
+        if record.get("failure_reason") is not None and not isinstance(record["failure_reason"], str):
+            errors.append("failure_reason must be a string or null")
+        if not isinstance(record.get("actual_model"), str):
+            errors.append("actual_model must be a string")
+        if not isinstance(record.get("tool_profile"), str):
+            errors.append("tool_profile must be a string")
+        if "provider_attempts" in record and record["provider_attempts"] is not None:
+            if not isinstance(record["provider_attempts"], list) or not all(
+                isinstance(item, dict) for item in record["provider_attempts"]
+            ):
+                errors.append("provider_attempts must be a list of objects when present")
+        if "attempts_by_model" in record and record["attempts_by_model"] is not None and not isinstance(
+            record["attempts_by_model"], dict
+        ):
+            errors.append("attempts_by_model must be an object when present")
+        if "model_downgrades" in record and record["model_downgrades"] is not None and not isinstance(
+            record["model_downgrades"], list
+        ):
+            errors.append("model_downgrades must be a list when present")
+        if "post_result" in record and record["post_result"] is not None and not isinstance(
+            record["post_result"], dict
+        ):
+            errors.append("post_result must be an object when present")
+
+    for reserved_key in _AUDIT_RESERVED_FANOUT_KEYS:
+        if reserved_key in record and record[reserved_key] is not None and not isinstance(
+            record[reserved_key], str
+        ):
+            errors.append(f"{reserved_key} must be a string when present")
+
+    for key, leaf_value in record.items():
+        if isinstance(leaf_value, str):
+            violations = _scan_redaction_violations(leaf_value)
+            if violations:
+                errors.append(f"redaction invariant violated for key={key!r}: {violations}")
+
+    return errors
+
+
+def _audit_build_start_record(run_id: str, request: Mapping[str, Any]) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "schema": DELEGATION_AUDIT_SCHEMA_VERSION,
+        "record_type": "start",
+        "run_id": run_id,
+        "ts": _audit_now_iso(),
+        "provider_requested": str(request.get("provider", "gemini")),
+        "tool_profile": str(request.get("tool_profile", "unknown")),
+    }
+    role = request.get("role")
+    if role is not None:
+        record["role"] = str(role)
+    model_requested = request.get("model")
+    if model_requested is not None:
+        record["model_requested"] = str(model_requested)
+    for reserved_key in _AUDIT_RESERVED_FANOUT_KEYS:
+        value = request.get(reserved_key)
+        if value is not None:
+            record[reserved_key] = str(value)
+    return _audit_redact_value(record)
+
+
+def _audit_public_safe_provider_attempts(attempts: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(attempts, list):
+        return None
+    safe: list[dict[str, Any]] = []
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        safe_attempt = dict(attempt)
+        if "failure_reason" in safe_attempt:
+            safe_attempt["failure_reason"] = _audit_prepare_failure_reason(safe_attempt.get("failure_reason"))
+        safe.append(safe_attempt)
+    return safe
+
+
+def _audit_build_grounded_metadata(result: Mapping[str, Any]) -> dict[str, Any] | None:
+    evidence = result.get("grounded_research_evidence")
+    if not isinstance(evidence, dict):
+        return None
+    return {
+        key: evidence.get(key)
+        for key in _GROUNDED_METADATA_PUBLIC_SAFE_KEYS
+        if key in evidence
+    }
+
+
+def _audit_build_local_asset_metadata(
+    request: Mapping[str, Any], result: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    tool_profile = str(result.get("tool_profile") or request.get("tool_profile") or "")
+    if tool_profile != LOCAL_ASSET_RESEARCH_PROFILE:
+        return None
+    context_files = request.get("context_files")
+    context_files_count = len(context_files) if isinstance(context_files, list) else 0
+    failure_class = result.get("failure_class")
+    return {
+        "profile": tool_profile,
+        "context_files_count": context_files_count,
+        "serena_retrieval_failed": bool(
+            isinstance(failure_class, str) and "live_serena_mcp_failed" in failure_class
+        ),
+    }
+
+
+def _audit_build_auth_diagnostics_metadata(result: Mapping[str, Any]) -> dict[str, Any] | None:
+    failure_class = result.get("failure_class")
+    if failure_class in _AGY_AUTH_RELATED_FAILURE_CLASSES:
+        return {"auth_failure_class": failure_class}
+    return None
+
+
+def _audit_build_post_result(result: Mapping[str, Any]) -> dict[str, Any] | None:
+    if "post_request_success" not in result:
+        return None
+    return {
+        "post_requested": True,
+        "request_success": bool(result.get("post_request_success")),
+        "posting_success": result.get("post_posting_success"),
+        "post_failure_class": result.get("post_failure_class"),
+    }
+
+
+def _build_delegation_audit_record(
+    run_id: str, request: Mapping[str, Any], result: Mapping[str, Any]
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "schema": DELEGATION_AUDIT_SCHEMA_VERSION,
+        "record_type": "end",
+        "run_id": run_id,
+        "ts": _audit_now_iso(),
+        "ok": bool(result.get("ok", False)),
+        "failure_class": result.get("failure_class"),
+        "failure_reason": _audit_prepare_failure_reason(result.get("failure_reason")),
+        "actual_model": str(result.get("actual_model", "unknown")),
+        "tool_profile": str(result.get("tool_profile", request.get("tool_profile", "unknown"))),
+    }
+    # selected_provider is only present on provider="auto" results; once it
+    # is present, fallback_reason and fallback_policy_version are recorded
+    # even when fallback_reason is None (first-provider success), so the
+    # audit end record always exposes the full provider_auto_policy_v1 field
+    # set together rather than silently dropping a null fallback_reason.
+    if "selected_provider" in result and result["selected_provider"] is not None:
+        record["selected_provider"] = result["selected_provider"]
+        record["fallback_reason"] = result.get("fallback_reason")
+        record["fallback_policy_version"] = result.get("fallback_policy_version")
+    provider_attempts = _audit_public_safe_provider_attempts(result.get("provider_attempts"))
+    if provider_attempts is not None:
+        record["provider_attempts"] = provider_attempts
+    if result.get("attempts_by_model"):
+        record["attempts_by_model"] = result["attempts_by_model"]
+    if result.get("model_downgrades"):
+        record["model_downgrades"] = result["model_downgrades"]
+    post_result = _audit_build_post_result(result)
+    if post_result is not None:
+        record["post_result"] = post_result
+    grounded_metadata = _audit_build_grounded_metadata(result)
+    if grounded_metadata is not None:
+        record["grounded_metadata"] = grounded_metadata
+    local_asset_metadata = _audit_build_local_asset_metadata(request, result)
+    if local_asset_metadata is not None:
+        record["local_asset_metadata"] = local_asset_metadata
+    auth_diagnostics_metadata = _audit_build_auth_diagnostics_metadata(result)
+    if auth_diagnostics_metadata is not None:
+        record["auth_diagnostics_metadata"] = auth_diagnostics_metadata
+    for reserved_key in _AUDIT_RESERVED_FANOUT_KEYS:
+        value = request.get(reserved_key)
+        if value is not None:
+            record[reserved_key] = str(value)
+    return _audit_redact_value(record)
+
+
+def _audit_handle_failure(message: str) -> None:
+    """Audit failure policy (AC9): best-effort by default (a broken audit
+    sink must never break delegation itself), fail-closed only when the
+    caller has opted in via DELEGATION_AUDIT_REQUIRED=1."""
+    if os.environ.get(_AUDIT_REQUIRED_ENV_VAR, "").strip() == "1":
+        raise RuntimeError(f"delegation_audit_v1 failure (fail-closed): {message}")
+    sys.stderr.write(f"[gemini-headless] warning: delegation_audit_v1: {message}\n")
+
+
+def _audit_write_record(path: Path, record: Mapping[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=True, sort_keys=True))
+            fh.write("\n")
+    except OSError as exc:
+        _audit_handle_failure(f"write failed: {exc}")
+
+
+def _audit_begin(request: Mapping[str, Any]) -> dict[str, Any] | None:
+    audit_path = _resolve_audit_log_path()
+    if audit_path is None:
+        return None
+    run_id = _audit_new_run_id()
+    start_record = _audit_build_start_record(run_id, request)
+    errors = validate_delegation_audit_record(start_record)
+    if errors:
+        _audit_handle_failure(f"invalid start record: {errors}")
+        return {"run_id": run_id, "path": audit_path, "disabled": True}
+    _audit_write_record(audit_path, start_record)
+    return {"run_id": run_id, "path": audit_path, "disabled": False}
+
+
+def _audit_end(
+    state: dict[str, Any] | None, request: Mapping[str, Any], result: Mapping[str, Any]
+) -> None:
+    if state is None or state.get("disabled"):
+        return
+    end_record = _build_delegation_audit_record(state["run_id"], request, result)
+    errors = validate_delegation_audit_record(end_record)
+    if errors:
+        _audit_handle_failure(f"invalid end record: {errors}")
+        return
+    _audit_write_record(state["path"], end_record)
+
+
+def _run_delegation_core(
     request: Mapping[str, Any],
     request_path: Path | None = None,
     _routing: dict[str, Any] | None = None,
@@ -3188,6 +3638,13 @@ def run_delegation(
         # artifact even when post-processing subsequently fails.
         content_ok = bool(base_result["ok"])
         response_text = base_result.get("response_text") or ""
+        # Issue #1272 AC7: record request success (did the underlying
+        # Gemini/AGY call itself succeed) separately from posting success
+        # (did the gh issue comment mutation succeed), so delegation_audit_v1
+        # can distinguish the two instead of collapsing both into a single
+        # post_result string.
+        base_result["post_request_success"] = content_ok
+        base_result["post_posting_success"] = None
         try:
             post_proc = subprocess.run(
                 ["gh", "issue", "comment", str(post_to_issue_url), "--body", response_text],
@@ -3199,6 +3656,7 @@ def run_delegation(
                 # gh issue comment は成功時に comment URL を stdout に出力する
                 base_result["comment_url"] = post_proc.stdout.strip()
                 base_result["post_result"] = "success"
+                base_result["post_posting_success"] = True
             else:
                 # Major fix_delta: a Gemini success (ok=True) followed by a
                 # failed non-idempotent GitHub comment post must NOT surface
@@ -3211,6 +3669,7 @@ def run_delegation(
                     f" (exit {post_proc.returncode}): {post_proc.stderr.strip()}"
                 )
                 base_result["post_result"] = f"failed: {post_proc.stderr.strip()}"
+                base_result["post_posting_success"] = False
                 base_result["post_failure_class"] = "post_to_issue_url_failed"
                 base_result["ok"] = False
                 base_result["failure_class"] = base_result.get("failure_class") or "post_to_issue_url_failed"
@@ -3221,6 +3680,7 @@ def run_delegation(
         except Exception as exc:
             base_result["warnings"].append(f"post_to_issue_url: unexpected error: {exc}")
             base_result["post_result"] = f"error: {exc}"
+            base_result["post_posting_success"] = False
             base_result["post_failure_class"] = "post_to_issue_url_error"
             base_result["ok"] = False
             base_result["failure_class"] = base_result.get("failure_class") or "post_to_issue_url_error"
@@ -3237,6 +3697,42 @@ def run_delegation(
         )
 
     return base_result
+
+
+# Re-entrancy depth counter (Issue #1272): provider_auto_dispatch() and the
+# ACP fallback both re-enter run_delegation() by name (existing tests patch
+# rgh.run_delegation directly, so the public name/signature cannot change).
+# Only the outermost call -- depth == 1 -- emits a delegation_audit_v1
+# start/end pair; nested re-entrant calls see depth > 1 and skip audit
+# entirely, so each top-level invocation still produces exactly one pair.
+_AUDIT_REENTRANCY_DEPTH = 0
+
+
+def run_delegation(
+    request: Mapping[str, Any],
+    request_path: Path | None = None,
+    _routing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Public entry point for a single delegation invocation.
+
+    Wraps :func:`_run_delegation_core` with delegation_audit_v1 start/end
+    record emission (Issue #1272). Exactly one start record and one end
+    record, sharing a single run_id, are emitted per top-level invocation --
+    nested re-entrant calls (provider="auto" fallback attempts inside
+    provider_auto_dispatch() re-enter this same function) are detected via a
+    depth counter and do not each emit their own pair.
+    """
+    global _AUDIT_REENTRANCY_DEPTH
+    _AUDIT_REENTRANCY_DEPTH += 1
+    is_top_level_call = _AUDIT_REENTRANCY_DEPTH == 1
+    try:
+        audit_state = _audit_begin(request) if is_top_level_call else None
+        result = _run_delegation_core(request, request_path=request_path, _routing=_routing)
+        if is_top_level_call:
+            _audit_end(audit_state, request, result)
+        return result
+    finally:
+        _AUDIT_REENTRANCY_DEPTH -= 1
 
 
 def _provider_auto_unsupported_profile_result(
@@ -3500,6 +3996,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Request JSON file path (positional shorthand for --request-file).",
     )
+    parser.add_argument(
+        "--audit-log",
+        required=False,
+        type=Path,
+        default=None,
+        help=(
+            "Write delegation_audit_v1 JSONL start/end records to this path "
+            "(append-only, UTF-8 JSON Lines, one object per line). Independent "
+            "of --output-file / --output-format. Also activatable via the "
+            "DELEGATION_AUDIT_LOG_PATH environment variable; disabled unless "
+            "one of the two is explicitly set (Issue #1272 AC3)."
+        ),
+    )
     return parser
 
 
@@ -3521,6 +4030,8 @@ def _print_stdout_summary(result: dict[str, Any], output_file: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    if args.audit_log is not None:
+        set_audit_log_path_override(args.audit_log)
 
     # Resolve request file: prefer --request-file, fall back to positional argument.
     request_file: Path | None = args.request_file or args.request_file_positional
