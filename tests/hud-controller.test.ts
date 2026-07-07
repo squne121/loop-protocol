@@ -4,7 +4,7 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { createHudController } from '../src/ui/HudController'
+import { createHudController, getUpgradeStatusCopy } from '../src/ui/HudController'
 import {
   runNextSortieHandler,
   runConfirmResultHandler,
@@ -666,5 +666,201 @@ describe('Issue #914: HUD action harness — next-sortie and confirm-result', ()
     expect(container.querySelector('[data-field="status"]')?.textContent).toBe('Result confirmed.')
     expect(container.querySelector('[data-field="command"]')?.textContent).toBe('Progress saved locally.')
     expect(fakeProgressionStorageSave).toHaveBeenCalledTimes(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Issue #1282: HUD upgrade purchase surface (AC1, AC2, AC3, AC4, AC5)
+// ---------------------------------------------------------------------------
+
+describe('Issue #1282: HUD upgrade purchase surface (AC1, AC2, AC3, AC5)', () => {
+  let container: HTMLElement
+  let onUpgradeWeapon: ReturnType<typeof vi.fn>
+  let hudController: ReturnType<typeof createHudController>
+
+  beforeEach(() => {
+    container = document.createElement('div')
+    onUpgradeWeapon = vi.fn()
+    hudController = createHudController(container, {
+      onStartSortie: vi.fn(),
+      onClaimReward: vi.fn(),
+      onNextSortie: vi.fn(),
+      onReset: vi.fn(),
+      onTogglePause: vi.fn(),
+      onUpgradeWeapon,
+    })
+  })
+
+  it('GIVEN state.progress.weaponPower WHEN render called THEN the Weapon Power stat displays it (AC1)', () => {
+    const state = createState('preparation')
+    state.progress.weaponPower = 3
+
+    hudController.render(state, false)
+
+    expect(container.querySelector('[data-field="weapon-power"]')?.textContent).toBe('3')
+  })
+
+  it('GIVEN an upgradeView with a weaponPower distinct from state.progress.weaponPower WHEN render called THEN the Weapon Power stat displays upgradeView.weaponPower (view-model-driven, not a direct state read)', () => {
+    // Regression test for PR #1365 iteration-2 P2 fix_delta: HudController.render()
+    // must read weaponPower from the upgrade view model (when provided) instead
+    // of reaching into state.progress directly, so the view-model boundary
+    // documented for the rest of HudUpgradeViewModel is not silently broken
+    // for this one field.
+    const state = createState('preparation')
+    state.progress.weaponPower = 1
+
+    hudController.render(state, false, {
+      definitionId: 'weapon_power_plus_1',
+      cost: 100,
+      weaponPower: 9,
+      buttonDisabled: false,
+      statusCopy: null,
+    })
+
+    expect(container.querySelector('[data-field="weapon-power"]')?.textContent).toBe('9')
+  })
+
+  it('GIVEN no upgradeView WHEN render called THEN the Weapon Power stat falls back to state.progress.weaponPower', () => {
+    const state = createState('preparation')
+    state.progress.weaponPower = 4
+
+    hudController.render(state, false)
+
+    expect(container.querySelector('[data-field="weapon-power"]')?.textContent).toBe('4')
+  })
+
+  it('GIVEN an upgradeView WHEN render called THEN the Upgrade weapon button, cost, and a role=status/aria-live=polite/aria-atomic=true live region are present (AC2)', () => {
+    hudController.render(createState('preparation'), false, {
+      definitionId: 'weapon_power_plus_1',
+      cost: 100,
+      weaponPower: 1,
+      buttonDisabled: false,
+      statusCopy: null,
+    })
+
+    const upgradeButton = queryButton(container, 'upgrade-weapon')
+    expect(upgradeButton.textContent).toBe('Upgrade weapon')
+    expect(container.querySelector('[data-field="upgrade-cost"]')?.textContent).toBe('Cost: 100')
+
+    const upgradeStatus = container.querySelector('[data-field="upgrade-status"]')
+    expect(upgradeStatus?.getAttribute('role')).toBe('status')
+    expect(upgradeStatus?.getAttribute('aria-live')).toBe('polite')
+    expect(upgradeStatus?.getAttribute('aria-atomic')).toBe('true')
+  })
+
+  it('GIVEN upgradeView.buttonDisabled=false during a non-preparation phase WHEN render called THEN the button reflects quoteUpgrade()-derived state, not a HUD-local phase check (AC3)', () => {
+    hudController.render(createState('running'), false, {
+      definitionId: 'weapon_power_plus_1',
+      cost: 100,
+      weaponPower: 1,
+      buttonDisabled: false,
+      statusCopy: null,
+    })
+
+    expect(queryButton(container, 'upgrade-weapon').disabled).toBe(false)
+  })
+
+  it('GIVEN upgradeView.buttonDisabled=true during preparation phase WHEN render called THEN the button is disabled (AC3)', () => {
+    hudController.render(createState('preparation'), false, {
+      definitionId: 'weapon_power_plus_1',
+      cost: 100,
+      weaponPower: 1,
+      buttonDisabled: true,
+      statusCopy: null,
+    })
+
+    expect(queryButton(container, 'upgrade-weapon').disabled).toBe(true)
+  })
+
+  it('GIVEN no upgradeView WHEN render called THEN the upgrade button is disabled and cost/status fields are empty (fail-closed default)', () => {
+    hudController.render(createState('preparation'), false)
+
+    expect(queryButton(container, 'upgrade-weapon').disabled).toBe(true)
+    expect(container.querySelector('[data-field="upgrade-cost"]')?.textContent).toBe('')
+    expect(container.querySelector('[data-field="upgrade-status"]')?.textContent).toBe('')
+  })
+
+  it('GIVEN an enabled upgrade button WHEN it is clicked THEN onUpgradeWeapon fires exactly once', () => {
+    hudController.render(createState('preparation'), false, {
+      definitionId: 'weapon_power_plus_1',
+      cost: 100,
+      weaponPower: 1,
+      buttonDisabled: false,
+      statusCopy: null,
+    })
+
+    queryButton(container, 'upgrade-weapon').click()
+
+    expect(onUpgradeWeapon).toHaveBeenCalledTimes(1)
+  })
+
+  it('GIVEN a disabled upgrade button WHEN it is clicked THEN onUpgradeWeapon is not invoked', () => {
+    hudController.render(createState('preparation'), false, {
+      definitionId: 'weapon_power_plus_1',
+      cost: 100,
+      weaponPower: 1,
+      buttonDisabled: true,
+      statusCopy: null,
+    })
+
+    queryButton(container, 'upgrade-weapon').click()
+
+    expect(onUpgradeWeapon).not.toHaveBeenCalled()
+  })
+
+  it('GIVEN each purchase outcome reason WHEN getUpgradeStatusCopy builds player-facing copy THEN it matches the AC4 mapping table', () => {
+    expect(getUpgradeStatusCopy('ok')).toEqual({
+      status: 'Upgrade installed.',
+      summary: 'Weapon Power increased. Resources were saved.',
+    })
+    expect(getUpgradeStatusCopy('insufficient-resources')).toEqual({
+      status: 'Not enough resources.',
+      summary: 'Earn 100 resources before upgrading.',
+    })
+    expect(getUpgradeStatusCopy('already-purchased')).toEqual({
+      status: 'Upgrade already installed.',
+      summary: 'Weapon Power is already upgraded.',
+    })
+    expect(getUpgradeStatusCopy('not-preparation')).toEqual({
+      status: 'Upgrade available in hangar.',
+      summary: 'Return to preparation before upgrading.',
+    })
+    expect(getUpgradeStatusCopy('write-error')).toEqual({
+      status: 'Upgrade not saved.',
+      summary: 'No resources were spent. Check browser storage and try again.',
+    })
+    expect(getUpgradeStatusCopy('storage-unavailable')).toEqual({
+      status: 'Upgrade not saved.',
+      summary: 'No resources were spent. Check browser storage and try again.',
+    })
+    expect(getUpgradeStatusCopy('invalid-definition')).toEqual({
+      status: 'Upgrade unavailable.',
+      summary: 'Current upgrade data could not be applied.',
+    })
+    expect(getUpgradeStatusCopy('invalid-state')).toEqual({
+      status: 'Upgrade unavailable.',
+      summary: 'Current upgrade data could not be applied.',
+    })
+  })
+
+  it('does not leak internal upgrade failure reason', () => {
+    hudController.render(createState('preparation'), false, {
+      definitionId: 'weapon_power_plus_1',
+      cost: 100,
+      weaponPower: 1,
+      buttonDisabled: true,
+      statusCopy: getUpgradeStatusCopy('insufficient-resources'),
+    })
+
+    const textSurface = container.textContent ?? ''
+    expect(textSurface).not.toContain('insufficient-resources')
+    expect(textSurface).not.toContain('already-purchased')
+    expect(textSurface).not.toContain('not-preparation')
+    expect(textSurface).not.toContain('invalid-definition')
+    expect(textSurface).not.toContain('invalid-state')
+    expect(textSurface).not.toContain('write-error')
+    expect(textSurface).not.toContain('storage-unavailable')
+    expect(textSurface).toContain('Not enough resources.')
+    expect(textSurface).toContain('Earn 100 resources before upgrading.')
   })
 })

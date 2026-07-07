@@ -474,9 +474,9 @@ class TestBlocker3SummaryNoSecretLeak:
 
 
 # =============================================================================
-# Major (PR #1299 review fix_delta): .codex/hooks.json PreToolUse topology
-# must be verified against a fixed expected count, not just absence of the
-# classifier module name (which cannot detect other hook additions/removals).
+# Major (PR #1299 / #1367 review fix_delta): .codex/hooks.json PreToolUse
+# topology must be verified against a fixed expected handler matrix, not just
+# absence of the classifier module name.
 # =============================================================================
 
 
@@ -503,11 +503,18 @@ class TestMajorCodexHooksTopologyCheck:
         actual = checker.load_codex_hooks_topology()
         assert actual, "expected at least one PreToolUse matcher in .codex/hooks.json"
 
-        # Mutate a copy: bump one matcher's count by one (simulating an
-        # undetected added hook) and verify the check fails closed.
-        drifted_expected = dict(actual)
+        # Mutate a copy: add one handler to a matcher and verify exact topology
+        # validation fails closed.
+        drifted_expected = {matcher: list(hooks) for matcher, hooks in actual.items()}
         first_matcher = next(iter(drifted_expected))
-        drifted_expected[first_matcher] += 1
+        drifted_expected[first_matcher] = drifted_expected[first_matcher] + [
+            {
+                "type": "command",
+                "command": "echo unexpected",
+                "timeout": 1,
+                "statusMessage": "Unexpected hook",
+            }
+        ]
 
         errors = checker.check_codex_hooks_pretool_topology(expected=drifted_expected)
         assert errors, "topology drift must be reported, not silently accepted"

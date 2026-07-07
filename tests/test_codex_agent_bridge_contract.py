@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,8 @@ FIXTURE_PATHS = [
     ".claude/agents",
     ".claude/skills",
     ".codex",
+    "scripts/agent-guards/git_mutation_command_policy.py",
+    "scripts/agent-guards/hook_repair_hints.py",
     "scripts/check-codex-agents.mjs",
     "scripts/check_codex_agent_config.py",
     "scripts/check_claude_codex_agent_parity.py",
@@ -126,6 +129,18 @@ def _copy_fixture_repo(tmp_path: Path) -> Path:
         else:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
+    web_researcher = repo / ".claude/agents/web-researcher.md"
+    web_researcher.write_text(
+        web_researcher.read_text(encoding="utf-8")
+        + "\n<!-- fixture parity token: grounded_research_or_direct_web -->\n",
+        encoding="utf-8",
+    )
+    issue_author = repo / ".claude/agents/issue-author.md"
+    issue_author.write_text(
+        issue_author.read_text(encoding="utf-8")
+        + "\n## 出力契約（ISSUE_AUTHOR_RESULT_COMPACT_V1）\n\nfixture parity marker.\n",
+        encoding="utf-8",
+    )
     return repo
 
 
@@ -148,6 +163,7 @@ def _run_js_validator(repo: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["node", "scripts/check-codex-agents.mjs"],
         cwd=repo,
+        env={**os.environ, "CODEX_ALLOW_NO_CODEX": "1"},
         text=True,
         capture_output=True,
         check=False,
@@ -202,6 +218,33 @@ def test_python_cli_detects_missing_subagent_hook_via_subprocess(tmp_path: Path)
     assert ".codex/hooks.json: missing hooks for SubagentStart" in result.stdout
 
 
+def test_python_cli_detects_extra_hooks_root_metadata_via_subprocess(tmp_path: Path):
+    repo = _copy_fixture_repo(tmp_path)
+    hooks_path = repo / ".codex/hooks.json"
+    hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+    hooks["fastpathContract"] = {}
+    hooks_path.write_text(json.dumps(hooks, indent=2), encoding="utf-8")
+
+    result = _run_python_validator(repo)
+
+    assert result.returncode == 1
+    assert ".codex/hooks.json: root keys must be exactly" in result.stdout
+
+
+def test_python_cli_detects_extra_pretool_handler_field_via_subprocess(tmp_path: Path):
+    repo = _copy_fixture_repo(tmp_path)
+    hooks_path = repo / ".codex/hooks.json"
+    hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+    hooks["hooks"]["PreToolUse"][0]["hooks"][0]["async"] = True
+    hooks_path.write_text(json.dumps(hooks, indent=2), encoding="utf-8")
+
+    result = _run_python_validator(repo)
+
+    assert result.returncode == 1
+    assert "must exactly match expected PreToolUse handler matrix" in result.stdout
+    assert "keys must be exactly" in result.stdout
+
+
 def test_python_cli_detects_parity_failure_via_subprocess(tmp_path: Path):
     repo = _copy_fixture_repo(tmp_path)
     (repo / ".claude/agents/issue-author.md").unlink()
@@ -216,7 +259,7 @@ def test_js_cli_passes_on_fixture_repo(tmp_path: Path):
     repo = _copy_fixture_repo(tmp_path)
     result = _run_js_validator(repo)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "ok 10 agents validated" in result.stdout
+    assert "ok 13 agents validated" in result.stdout
 
 
 def test_js_cli_detects_missing_marker_via_subprocess(tmp_path: Path):

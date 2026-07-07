@@ -29,12 +29,20 @@ import {
   clampPlayerToArena,
   claimPendingReward,
   confirmResult,
+  purchaseUpgrade,
+  quoteUpgrade,
   type PhaseTransitionIntent,
   resolvePhaseTransition,
   runSortieSimulationStep,
   startSortie,
 } from './systems'
-import { createHudController } from './ui'
+import { upgradeDefinitions } from './data/upgrades'
+import {
+  createHudController,
+  getUpgradeStatusCopy,
+  type HudUpgradeStatusCopy,
+  type HudUpgradeViewModel,
+} from './ui'
 import {
   createProductPauseState,
   toggleProductPause,
@@ -232,6 +240,64 @@ export function createTransitionedInitialGameState(
   return nextState
 }
 
+export type UpgradeWeaponHandlerSeam = {
+  /** Stores the player-facing copy for the most recent purchase attempt (AC4, AC5). */
+  setUpgradeStatusCopy: (copy: HudUpgradeStatusCopy) => void
+  /**
+   * Marks a loadable snapshot as available (AC6). Must be invoked, when the
+   * purchase succeeded, BEFORE `renderHud()` so `hasLoadableSnapshot` is
+   * already true by the time the synchronous render reads it — the caller
+   * must not update this state only after receiving this function's return
+   * value.
+   */
+  markLoadableSnapshot: () => void
+  /**
+   * Renders the HUD synchronously (AC6). Must be invoked before this function
+   * returns so resources/weaponPower/hasLoadableSnapshot land in the same
+   * render pass — the caller must not wait for the next requestAnimationFrame.
+   */
+  renderHud: () => void
+}
+
+/**
+ * Testable seam for the onUpgradeWeapon handler (Issue #1282, AC3, AC4, AC6).
+ *
+ * `quoteUpgrade()` is the sole purchase-eligibility authority (AC3): this
+ * function never re-derives eligibility from `state.loopPhase` itself.
+ * `purchaseUpgrade()` — the atomic save seam — is invoked only when the quote
+ * is `ok`. Returns `true` iff the purchase succeeded so the caller can update
+ * `hasLoadableSnapshot` in the same synchronous pass (AC6). `seam.renderHud()`
+ * is always invoked exactly once, synchronously, before this function returns.
+ */
+export function runUpgradeWeaponHandler(
+  state: GameState,
+  definition: (typeof upgradeDefinitions)[number],
+  storage: Pick<ReturnType<typeof createLocalGameStorage>, 'save'>,
+  seam: UpgradeWeaponHandlerSeam,
+): boolean {
+  const quote = quoteUpgrade(state, definition.definitionId, definition)
+  if (!quote.ok) {
+    seam.setUpgradeStatusCopy(getUpgradeStatusCopy(quote.reason))
+    seam.renderHud()
+    return false
+  }
+
+  const result = purchaseUpgrade(state, definition.definitionId, definition, storage)
+  if (result.ok) {
+    seam.setUpgradeStatusCopy(getUpgradeStatusCopy('ok'))
+    // AC6: mark the loadable snapshot BEFORE renderHud() so the synchronous
+    // render below observes hasLoadableSnapshot === true in the same pass —
+    // the caller must not defer this until after this function returns.
+    seam.markLoadableSnapshot()
+  } else {
+    seam.setUpgradeStatusCopy(getUpgradeStatusCopy(result.reason))
+  }
+
+  // AC6: render synchronously here (do not wait for the next requestAnimationFrame).
+  seam.renderHud()
+  return result.ok
+}
+
 // ---------------------------------------------------------------------------
 // App shell
 // ---------------------------------------------------------------------------
@@ -308,6 +374,36 @@ const renderer = canvas ? createCanvasRenderer(canvas) : null
 // Product pause state (runtime-local, not persisted) — AC10, AC11
 const productPause = createProductPauseState()
 const inputState = createInputState()
+
+// Issue #1282: M4 minimal upgrade catalog only has a single definition
+// (weapon_power_plus_1). HUD upgrade purchase surface targets it directly;
+// a definitionId selector is out of scope here (single-item catalog).
+const upgradeDefinition = upgradeDefinitions[0]
+
+/**
+ * Player-facing feedback for the most recent upgrade purchase attempt
+ * (Issue #1282, AC4/AC5). `null` until the player first interacts with the
+ * upgrade surface. Never holds a raw internal enum value — only the
+ * translated HudUpgradeStatusCopy pair.
+ */
+let upgradeStatusCopy: HudUpgradeStatusCopy | null = null
+
+/**
+ * Builds the upgrade purchase view model passed to hud.render() (AC2, AC3,
+ * AC6). Re-evaluates `quoteUpgrade()` against the live `state` on every call
+ * so the button's disabled state is always derived from the atomic purchase
+ * core's own eligibility check — never from a HUD-local phase check.
+ */
+function buildUpgradeView(): HudUpgradeViewModel {
+  const quote = quoteUpgrade(state, upgradeDefinition.definitionId, upgradeDefinition)
+  return {
+    definitionId: upgradeDefinition.definitionId,
+    cost: upgradeDefinition.cost,
+    weaponPower: state.progress.weaponPower,
+    buttonDisabled: !quote.ok,
+    statusCopy: upgradeStatusCopy,
+  }
+}
 
 /** Toggle pause and reset firing state to prevent held-fire bleed (AC5). */
 function handleTogglePause(): void {
@@ -462,6 +558,27 @@ const hud = commandRail ? createHudController(commandRail, {
   onTogglePause() {
     handleTogglePause()
   },
+  onUpgradeWeapon() {
+    // Delegated to runUpgradeWeaponHandler seam for testability (Issue #1282).
+    // AC6: markLoadableSnapshot() is invoked by the seam BEFORE renderHud()
+    // so hasLoadableSnapshot is already true when the synchronous render below
+    // reads it — do NOT gate this on the handler's return value after the
+    // fact (that would run one render pass too late).
+    runUpgradeWeaponHandler(state, upgradeDefinition, storage, {
+      setUpgradeStatusCopy(copy) {
+        upgradeStatusCopy = copy
+      },
+      markLoadableSnapshot() {
+        // purchaseUpgrade() is the atomic save seam (state.progress is only
+        // committed after storage.save() succeeds), so no additional
+        // runProgressionSave()/persistProgressionSnapshot() call is needed.
+        hasLoadableSnapshot = true
+      },
+      renderHud() {
+        hud?.render(state, productPause.isPaused, buildUpgradeView())
+      },
+    })
+  },
 }) : null
 
 // B1: startup probe failure is non-fatal — title_menu state is always the starting point.
@@ -558,7 +675,7 @@ function frame(now: number): void {
   }
 
   // AC4: render and HUD continue regardless of pause state
-  hud.render(state, productPause.isPaused)
+  hud.render(state, productPause.isPaused, buildUpgradeView())
   renderer.render(state)
   window.requestAnimationFrame(frame)
 }

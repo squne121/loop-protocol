@@ -36,17 +36,71 @@ CODEX_HOOKS_PATH = REPO_ROOT / ".codex" / "hooks.json"
 # .codex/hooks.json (it is imported by existing guards, not registered as an
 # independent hook).
 _FASTPATH_CLASSIFIER_MODULE_NAME = "pretool_fastpath_classifier"
+_CHECK_CODEX_AGENTS_PRETOOL = (
+    'rtk pnpm exec node "$(git rev-parse --show-toplevel)/scripts/check-codex-agents.mjs" '
+    "--hook-pretool"
+)
+_SESSION_RECORDING_PRETOOL = (
+    'rtk pnpm exec node "$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs" '
+    "--event PreToolUse"
+)
 
-# Issue #1289 (fix_delta Major): fixed, fail-closed expected snapshot of
-# .codex/hooks.json PreToolUse hook counts per matcher. A string-only check
-# for the classifier module name (check_codex_hooks_no_fastpath_classifier)
-# cannot detect *other* hook additions/removals — only an explicit topology
-# count comparison can. Any drift from this frozen snapshot (added, removed,
-# or reordered PreToolUse hook entries under any matcher) must fail closed
-# and require an explicit update to this constant plus reviewer sign-off.
-EXPECTED_CODEX_PRETOOL_TOPOLOGY: dict[str, int] = {
-    "^Bash$": 5,
-    "^(apply_patch|Edit|Write)$": 3,
+# Issue #1367: fixed, fail-closed expected snapshot of .codex/hooks.json
+# PreToolUse hook entries. Drift in order, command, timeout, statusMessage,
+# type, or extra handler fields must fail closed.
+EXPECTED_CODEX_PRETOOL_TOPOLOGY: dict[str, list[dict[str, Any]]] = {
+    "^Bash$": [
+        {
+            "type": "command",
+            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/local_main_branch_guard.sh"',
+            "timeout": 10,
+            "statusMessage": "Checking local root branch policy",
+        },
+        {
+            "type": "command",
+            "command": 'python3 "$(git rev-parse --show-toplevel)/.claude/hooks/worktree_scope_guard.py"',
+            "timeout": 20,
+            "statusMessage": "Checking worktree cleanup scope policy (shared core)",
+        },
+        {
+            "type": "command",
+            "command": _CHECK_CODEX_AGENTS_PRETOOL,
+            "timeout": 30,
+            "statusMessage": "Checking LOOP_PROTOCOL Bash guardrail",
+        },
+        {
+            "type": "command",
+            "command": _SESSION_RECORDING_PRETOOL,
+            "timeout": 30,
+            "statusMessage": "Checking Codex session-recording PreToolUse guard",
+        },
+        {
+            "type": "command",
+            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/ci_test_performance_advisory.sh"',
+            "timeout": 10,
+            "statusMessage": "Checking CI/test-lane path advisory",
+        },
+    ],
+    "^(apply_patch|Edit|Write)$": [
+        {
+            "type": "command",
+            "command": _CHECK_CODEX_AGENTS_PRETOOL,
+            "timeout": 30,
+            "statusMessage": "Checking LOOP_PROTOCOL patch guardrail",
+        },
+        {
+            "type": "command",
+            "command": _SESSION_RECORDING_PRETOOL,
+            "timeout": 30,
+            "statusMessage": "Checking Codex session-recording patch guard",
+        },
+        {
+            "type": "command",
+            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/ci_test_performance_advisory.sh"',
+            "timeout": 10,
+            "statusMessage": "Checking CI/test-lane path advisory",
+        },
+    ],
 }
 
 # ─── manifest 抽出 ────────────────────────────────────────────────────────────
@@ -442,30 +496,23 @@ def check_drift(
     return errors
 
 
-def load_codex_hooks_topology(path: Path = CODEX_HOOKS_PATH) -> dict[str, int]:
-    """Issue #1289 (AC4/AC6): return a snapshot of .codex/hooks.json PreToolUse
-    hook counts per matcher. Used to detect topology drift (e.g. an accidental
-    independent pretool_fastpath_classifier hook registration) without
-    requiring a full field-by-field .codex/.claude parity match (the two
-    manifests intentionally use different command wrapper forms)."""
+def load_codex_hooks_topology(path: Path = CODEX_HOOKS_PATH) -> dict[str, list[dict[str, Any]]]:
+    """Return the exact .codex/hooks.json PreToolUse topology per matcher."""
     data = json.loads(path.read_text(encoding="utf-8"))
     pretool = data.get("hooks", {}).get("PreToolUse", [])
-    counts: dict[str, int] = {}
+    topology: dict[str, list[dict[str, Any]]] = {}
     for entry in pretool:
         matcher = entry.get("matcher", "<none>")
-        counts[matcher] = counts.get(matcher, 0) + len(entry.get("hooks", []))
-    return counts
+        topology[matcher] = entry.get("hooks", [])
+    return topology
 
 
 def check_codex_hooks_pretool_topology(
     path: Path = CODEX_HOOKS_PATH,
-    expected: dict[str, int] | None = None,
+    expected: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[str]:
-    """Issue #1289 (fix_delta Major): fail-closed comparison of the current
-    .codex/hooks.json PreToolUse hook count per matcher against a frozen
-    expected snapshot. This detects any topology drift (added/removed
-    PreToolUse hooks under any matcher) that the classifier-name-only check
-    above cannot see."""
+    """Fail-closed comparison of the current .codex/hooks.json PreToolUse
+    topology against the frozen expected handler matrix."""
     if expected is None:
         expected = EXPECTED_CODEX_PRETOOL_TOPOLOGY
     errors: list[str] = []
