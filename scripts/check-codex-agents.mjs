@@ -347,6 +347,107 @@ function assert(condition, message, failures) {
   }
 }
 
+const compositeBase =
+  'rtk pnpm exec node "$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs"';
+const checkCodexAgentsBase =
+  'rtk pnpm exec node "$(git rev-parse --show-toplevel)/scripts/check-codex-agents.mjs"';
+
+const expectedCommandHookKeys = ['command', 'statusMessage', 'timeout', 'type'];
+
+function assertExactCommandHook(scope, hook, expected, failures) {
+  const actualKeys = hook && typeof hook === 'object' && !Array.isArray(hook) ? Object.keys(hook).sort() : [];
+  assert(
+    JSON.stringify(actualKeys) === JSON.stringify(expectedCommandHookKeys),
+    `${scope}: hook keys must be exactly ${JSON.stringify(expectedCommandHookKeys)}, got ${JSON.stringify(actualKeys)}`,
+    failures,
+  );
+  assert(hook?.type === 'command', `${scope}: type must be command`, failures);
+  assert(hook?.command === expected.command, `${scope}: command must exactly match expected handler`, failures);
+  assert(hook?.timeout === expected.timeout, `${scope}: timeout must be ${expected.timeout}`, failures);
+  assert(
+    hook?.statusMessage === expected.statusMessage,
+    `${scope}: statusMessage must be ${expected.statusMessage}`,
+    failures,
+  );
+}
+
+function assertExactHookEntry(eventName, entry, expectedMatcher, expectedHooks, failures) {
+  assert(Boolean(entry), `hooks.json: missing ${eventName} matcher ${expectedMatcher}`, failures);
+  if (!entry) {
+    return;
+  }
+  assert(entry?.matcher === expectedMatcher, `hooks.json: ${eventName} matcher must be ${expectedMatcher}`, failures);
+  const hooks = entry?.hooks ?? [];
+  assert(Array.isArray(hooks), `hooks.json: ${eventName} ${expectedMatcher} hooks must be an array`, failures);
+  if (!Array.isArray(hooks)) {
+    return;
+  }
+  assert(
+    hooks.length === expectedHooks.length,
+    `hooks.json: ${eventName} ${expectedMatcher} must have exactly ${expectedHooks.length} hooks`,
+    failures,
+  );
+  if (hooks.length !== expectedHooks.length) {
+    return;
+  }
+  for (const [index, expected] of expectedHooks.entries()) {
+    assertExactCommandHook(`hooks.json: ${eventName} ${expectedMatcher} hook ${index}`, hooks[index], expected, failures);
+  }
+}
+
+const expectedPreToolUseEntries = new Map([
+  [
+    '^Bash$',
+    [
+      {
+        command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/local_main_branch_guard.sh"',
+        timeout: 10,
+        statusMessage: 'Checking local root branch policy',
+      },
+      {
+        command: 'python3 "$(git rev-parse --show-toplevel)/.claude/hooks/worktree_scope_guard.py"',
+        timeout: 20,
+        statusMessage: 'Checking worktree cleanup scope policy (shared core)',
+      },
+      {
+        command: `${checkCodexAgentsBase} --hook-pretool`,
+        timeout: 30,
+        statusMessage: 'Checking LOOP_PROTOCOL Bash guardrail',
+      },
+      {
+        command: `${compositeBase} --event PreToolUse`,
+        timeout: 30,
+        statusMessage: 'Checking Codex session-recording PreToolUse guard',
+      },
+      {
+        command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/ci_test_performance_advisory.sh"',
+        timeout: 10,
+        statusMessage: 'Checking CI/test-lane path advisory',
+      },
+    ],
+  ],
+  [
+    '^(apply_patch|Edit|Write)$',
+    [
+      {
+        command: `${checkCodexAgentsBase} --hook-pretool`,
+        timeout: 30,
+        statusMessage: 'Checking LOOP_PROTOCOL patch guardrail',
+      },
+      {
+        command: `${compositeBase} --event PreToolUse`,
+        timeout: 30,
+        statusMessage: 'Checking Codex session-recording patch guard',
+      },
+      {
+        command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/ci_test_performance_advisory.sh"',
+        timeout: 10,
+        statusMessage: 'Checking CI/test-lane path advisory',
+      },
+    ],
+  ],
+]);
+
 // ---------------------------------------------------------------------------
 // hooks.json structural validation (JSON.parse-based, not string includes)
 // ---------------------------------------------------------------------------
@@ -360,6 +461,14 @@ function validateHooksJson(hooksPath, failures) {
   }
 
   assert(parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed), 'hooks.json: root must be an object', failures);
+  if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const rootKeys = Object.keys(parsed).sort();
+    assert(
+      JSON.stringify(rootKeys) === JSON.stringify(['hooks']),
+      `hooks.json: root keys must be exactly ["hooks"], got ${JSON.stringify(rootKeys)}`,
+      failures,
+    );
+  }
   assert(Array.isArray(parsed?.hooks?.SubagentStart), 'hooks.json: must have hooks.SubagentStart array', failures);
   assert(Array.isArray(parsed?.hooks?.PreToolUse), 'hooks.json: must have hooks.PreToolUse array', failures);
 
@@ -377,41 +486,14 @@ function validateHooksJson(hooksPath, failures) {
   }
 
   const preToolEntries = parsed?.hooks?.PreToolUse ?? [];
-  const expectedMatchers = new Map([
-    ['^Bash$', 'Checking LOOP_PROTOCOL Bash guardrail'],
-    ['^(apply_patch|Edit|Write)$', 'Checking LOOP_PROTOCOL patch guardrail'],
-  ]);
-  for (const [matcher, expectedStatusMessage] of expectedMatchers) {
+  assert(
+    preToolEntries.length === expectedPreToolUseEntries.size,
+    `hooks.json: PreToolUse must have exactly ${expectedPreToolUseEntries.size} matcher entries`,
+    failures,
+  );
+  for (const [matcher, expectedHooks] of expectedPreToolUseEntries) {
     const entry = preToolEntries.find((candidate) => candidate?.matcher === matcher);
-    assert(Boolean(entry), `hooks.json: missing PreToolUse matcher ${matcher}`, failures);
-    if (!entry) {
-      continue;
-    }
-    const hooks = entry?.hooks ?? [];
-    // PreToolUse matchers must have exactly 2 hooks (active handler inventory, #783):
-    //   1. scripts/check-codex-agents.mjs --hook-pretool (rtk bypass guard / Allowed Paths enforcement)
-    //   2. .codex/hooks/session-recording-composite.mjs --event PreToolUse (session recording guard)
-    assert(hooks.length >= 2, `hooks.json: matcher ${matcher} must have at least 2 hooks (check-codex-agents + session-recording-composite)`, failures);
-    const pretoolHook = hooks.find((h) => h?.command?.includes('--hook-pretool'));
-    assert(
-      Boolean(pretoolHook),
-      `hooks.json: matcher ${matcher} must have a hook command including --hook-pretool`,
-      failures,
-    );
-    assert(
-      pretoolHook?.statusMessage === expectedStatusMessage,
-      `hooks.json: matcher ${matcher} statusMessage must be ${expectedStatusMessage}`,
-      failures,
-    );
-    // Verify session-recording-composite.mjs --event PreToolUse is an active handler (#783)
-    const sessionRecordingHook = hooks.find(
-      (h) => h?.command?.includes('session-recording-composite.mjs') && h?.command?.includes('--event PreToolUse'),
-    );
-    assert(
-      Boolean(sessionRecordingHook),
-      `hooks.json: matcher ${matcher} must have session-recording-composite.mjs --event PreToolUse as an active handler (Fix 4 #783)`,
-      failures,
-    );
+    assertExactHookEntry('PreToolUse', entry, matcher, expectedHooks, failures);
   }
 
   // AC3: structural validation for PermissionRequest, Stop, SubagentStop.

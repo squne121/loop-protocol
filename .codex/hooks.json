@@ -1,13 +1,4 @@
 {
-  "fastpathContract": {
-    "_comment": "Issue #1289: pretool_fastpath_classifier.py is a shared library imported by local_main_branch_guard (invoked via the local_main_branch_guard.sh command below); it is NOT registered as its own PreToolUse hook entry here. classification vocabulary: readonly_display / exact_controlled_executor_authorized / mutation_or_unknown. failPolicy: fail_open (telemetry only, never changes the allow/block decision of the guard chain below). stdoutContract: silent (pure Python function; the calling guard's own stdout/stderr contract is unchanged).",
-    "module": "scripts/agent-guards/pretool_fastpath_classifier.py",
-    "classification": ["readonly_display", "exact_controlled_executor_authorized", "mutation_or_unknown"],
-    "failPolicy": "fail_open",
-    "stdoutContract": "silent",
-    "stderrContract": "silent",
-    "registeredAsIndependentHook": false
-  },
   "hooks": {
     "SubagentStart": [
       {

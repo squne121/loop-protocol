@@ -21,6 +21,63 @@ MAX_BRIDGE_BODY_LINES = 3
 CODEX_ONLY_ALLOWED_AGENTS = {"spark-skim", "spark-worker", "spark-deep"}
 CODEX_ONLY_PARITY_REASON = "manual_codex_spark_agent"
 CODEX_ONLY_MODEL = "gpt-5.3-codex-spark"
+EXPECTED_HOOK_KEYS = ["command", "statusMessage", "timeout", "type"]
+CHECK_CODEX_AGENTS_BASE = 'rtk pnpm exec node "$(git rev-parse --show-toplevel)/scripts/check-codex-agents.mjs"'
+COMPOSITE_BASE = 'rtk pnpm exec node "$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs"'
+EXPECTED_PRETOOL_HOOKS = {
+    "^Bash$": [
+        {
+            "type": "command",
+            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/local_main_branch_guard.sh"',
+            "timeout": 10,
+            "statusMessage": "Checking local root branch policy",
+        },
+        {
+            "type": "command",
+            "command": 'python3 "$(git rev-parse --show-toplevel)/.claude/hooks/worktree_scope_guard.py"',
+            "timeout": 20,
+            "statusMessage": "Checking worktree cleanup scope policy (shared core)",
+        },
+        {
+            "type": "command",
+            "command": f"{CHECK_CODEX_AGENTS_BASE} --hook-pretool",
+            "timeout": 30,
+            "statusMessage": "Checking LOOP_PROTOCOL Bash guardrail",
+        },
+        {
+            "type": "command",
+            "command": f"{COMPOSITE_BASE} --event PreToolUse",
+            "timeout": 30,
+            "statusMessage": "Checking Codex session-recording PreToolUse guard",
+        },
+        {
+            "type": "command",
+            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/ci_test_performance_advisory.sh"',
+            "timeout": 10,
+            "statusMessage": "Checking CI/test-lane path advisory",
+        },
+    ],
+    "^(apply_patch|Edit|Write)$": [
+        {
+            "type": "command",
+            "command": f"{CHECK_CODEX_AGENTS_BASE} --hook-pretool",
+            "timeout": 30,
+            "statusMessage": "Checking LOOP_PROTOCOL patch guardrail",
+        },
+        {
+            "type": "command",
+            "command": f"{COMPOSITE_BASE} --event PreToolUse",
+            "timeout": 30,
+            "statusMessage": "Checking Codex session-recording patch guard",
+        },
+        {
+            "type": "command",
+            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/ci_test_performance_advisory.sh"',
+            "timeout": 10,
+            "statusMessage": "Checking CI/test-lane path advisory",
+        },
+    ],
+}
 
 
 def route_tokens_to_skill_surfaces(route: str) -> list[str]:
@@ -176,7 +233,7 @@ def assert_required_fields(expectations: dict) -> list[str]:
                 f"{expected['path']}: developer_instructions missing repo_local_skill_surface"
             )
         expected_route_surfaces = route_tokens_to_skill_surfaces(expected.get("runtime_followup_route", ""))
-        if expected_skill_surfaces != expected_route_surfaces:
+        if expected_skill_surfaces and expected_skill_surfaces != expected_route_surfaces:
             failures.append(
                 f"{expected['path']}: expected fixture route/surface mismatch"
                 f" {expected_route_surfaces!r} vs {expected_skill_surfaces!r}"
@@ -215,7 +272,7 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
                 f" {expected_skill_surfaces!r} got {actual_skill_surfaces!r}"
             )
         route_surface_paths = route_tokens_to_skill_surfaces(expected["runtime_followup_route"])
-        if actual_skill_surfaces != route_surface_paths:
+        if expected_skill_surfaces and actual_skill_surfaces != route_surface_paths:
             failures.append(
                 f"{expected['path']}: runtime_followup_route"
                 f" {expected['runtime_followup_route']!r} must map to"
@@ -247,6 +304,8 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
     if config.get("agents", {}).get("max_depth") != 1:
         failures.append(".codex/config.toml: [agents].max_depth must be 1")
 
+    if sorted(hooks.keys()) != ["hooks"]:
+        failures.append(f".codex/hooks.json: root keys must be exactly ['hooks'], got {sorted(hooks.keys())!r}")
     hooks_root = hooks.get("hooks", {})
     subagent_entries = hooks_root.get("SubagentStart")
     if not isinstance(subagent_entries, list) or not subagent_entries:
@@ -269,22 +328,29 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
     if not isinstance(pretool_entries, list) or not pretool_entries:
         failures.append(".codex/hooks.json: missing hooks for PreToolUse")
         pretool_entries = []
-    expected_matchers = {
-        "^Bash$": "Checking LOOP_PROTOCOL Bash guardrail",
-        "^(apply_patch|Edit|Write)$": "Checking LOOP_PROTOCOL patch guardrail",
-    }
     actual_matchers = {entry.get("matcher"): entry for entry in pretool_entries if isinstance(entry, dict)}
-    for matcher, status_message in expected_matchers.items():
+    if len(actual_matchers) != len(EXPECTED_PRETOOL_HOOKS):
+        failures.append(
+            f".codex/hooks.json: PreToolUse must have exactly {len(EXPECTED_PRETOOL_HOOKS)} matcher entries"
+        )
+    for matcher, expected_hooks in EXPECTED_PRETOOL_HOOKS.items():
         entry = actual_matchers.get(matcher)
         if entry is None:
             failures.append(f".codex/hooks.json: missing PreToolUse matcher {matcher}")
             continue
-        commands = [hook.get("command") for hook in entry.get("hooks", []) if isinstance(hook.get("command"), str)]
-        if not commands or not any("--hook-pretool" in command for command in commands):
-            failures.append(f".codex/hooks.json: matcher {matcher} must route at least one command with --hook-pretool")
-        hook_status = entry.get("hooks", [{}])[0].get("statusMessage") if entry.get("hooks") else None
-        if hook_status != status_message:
-            failures.append(f".codex/hooks.json: matcher {matcher} must use statusMessage {status_message!r}")
+        hooks_for_matcher = entry.get("hooks", [])
+        if not isinstance(hooks_for_matcher, list):
+            failures.append(f".codex/hooks.json: matcher {matcher} hooks must be a list")
+            continue
+        if hooks_for_matcher != expected_hooks:
+            failures.append(
+                f".codex/hooks.json: matcher {matcher} must exactly match expected PreToolUse handler matrix"
+            )
+        for index, hook in enumerate(hooks_for_matcher):
+            if sorted(hook.keys()) != EXPECTED_HOOK_KEYS:
+                failures.append(
+                    f".codex/hooks.json: matcher {matcher} hook {index} keys must be exactly {EXPECTED_HOOK_KEYS!r}"
+                )
 
     all_commands: list[str] = []
     for event_name in expectations["required_hook_events"]:
