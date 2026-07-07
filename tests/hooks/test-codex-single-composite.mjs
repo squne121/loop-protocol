@@ -15,8 +15,8 @@
  * are covered there as direct Vitest assertions (AC2-AC8). Run this script
  * manually during PR review to smoke-test the composite hook end to end.
  *
- * These tests invoke the composite hook in-process via a test harness that
- * stubs stdin input and captures stdout.
+ * These tests spawn the composite hook as a child process, feed stdin, and
+ * capture stdout/stderr. They are manual-only and are not nested inside pnpm test.
  */
 
 /* global process */
@@ -159,7 +159,7 @@ process.stdout.write('\n[Suite] SubagentStop event — malformed payload (record
 
 // ---------------------------------------------------------------------------
 // Test suite: PreToolUse event — allow path (no violation)
-// Claude hook stdout policy: empty on allow path
+// Codex Hooks stdout policy: empty on allow path
 // ---------------------------------------------------------------------------
 process.stdout.write('\n[Suite] PreToolUse event — allow path\n')
 {
@@ -182,7 +182,7 @@ process.stdout.write('\n[Suite] PreToolUse event — allow path\n')
 
 // ---------------------------------------------------------------------------
 // Test suite: PreToolUse event — block path (forbidden path)
-// Claude hook stdout policy: event-specific JSON on block path
+// Codex Hooks stdout policy: event-specific JSON on block path
 // ---------------------------------------------------------------------------
 process.stdout.write('\n[Suite] PreToolUse event — block path (forbidden path)\n')
 {
@@ -208,6 +208,24 @@ process.stdout.write('\n[Suite] PreToolUse event — block path (forbidden path)
   assert(
     'deny decision is "deny"',
     r.parsedJson?.hookSpecificOutput?.permissionDecision === 'deny',
+    `parsedJson: ${JSON.stringify(r.parsedJson)}`,
+  )
+  assert(
+    'hookEventName is PreToolUse',
+    r.parsedJson?.hookSpecificOutput?.hookEventName === 'PreToolUse',
+    `parsedJson: ${JSON.stringify(r.parsedJson)}`,
+  )
+  assert(
+    'permissionDecisionReason is string',
+    typeof r.parsedJson?.hookSpecificOutput?.permissionDecisionReason === 'string',
+    `parsedJson: ${JSON.stringify(r.parsedJson)}`,
+  )
+  assert(
+    'stdout does not leak Stop common fields',
+    r.parsedJson !== null &&
+      !Object.prototype.hasOwnProperty.call(r.parsedJson, 'continue') &&
+      !Object.prototype.hasOwnProperty.call(r.parsedJson, 'stopReason') &&
+      !Object.prototype.hasOwnProperty.call(r.parsedJson, 'suppressOutput'),
     `parsedJson: ${JSON.stringify(r.parsedJson)}`,
   )
 }
