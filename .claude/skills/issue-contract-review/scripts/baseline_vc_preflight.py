@@ -568,14 +568,17 @@ def _is_pytest_invocation(command: str) -> bool:
 
 
 _MISSING_NODE_ID_ERROR_RE = re.compile(
-    r"error:\s+not found:\s+\S+::\S+"
+    r"error:\s+not found:\s+(?P<nodeid>\S+::\S+)",
+    re.IGNORECASE,
 )
 _NO_MATCH_IN_MODULE_RE = re.compile(
     r"no match in any of"
 )
 
 
-def _is_existing_file_missing_node_id_error(stdout: str, stderr: str) -> bool:
+def _is_existing_file_missing_node_id_error(
+    stdout: str, stderr: str, cwd: Optional[str] = None
+) -> bool:
     """Issue #1347: detect pytest's "existing file, missing node-id" error shape.
 
     Distinguishes the case where a pytest node-id references a file that DOES
@@ -587,14 +590,28 @@ def _is_existing_file_missing_node_id_error(stdout: str, stderr: str) -> bool:
         ERROR: file or directory not found: missing_file.py
     Callers must ensure this is only invoked in a context where the FILE part
     is already known to exist (e.g. after _is_regression_gate_command()
-    returned True), so this helper only needs to check the stdout/stderr error
-    message shape, not re-derive file existence itself.
+    returned True); this helper additionally re-validates that the file part
+    of the node-id actually exists on disk (case-insensitively matching the
+    "not found" error text and requiring the "no match in any of" companion
+    text), so it does not rely solely on the caller's prior check.
+
+    PR #1366 review (Major 3): the error-message match is now case-insensitive
+    and requires BOTH the missing-node-id error text AND the "no match in any
+    of" companion text (AND, not OR) before re-deriving file existence from
+    the node-id's file part, resolved against `cwd`.
     """
     combined = f"{stdout}\n{stderr}"
-    return bool(
-        _MISSING_NODE_ID_ERROR_RE.search(combined)
-        or _NO_MATCH_IN_MODULE_RE.search(combined)
-    )
+    match = _MISSING_NODE_ID_ERROR_RE.search(combined)
+    if not match:
+        return False
+    if not _NO_MATCH_IN_MODULE_RE.search(combined):
+        return False
+
+    file_part = match.group("nodeid").split("::", 1)[0]
+    p = Path(file_part)
+    if not p.is_absolute():
+        p = Path(cwd or Path.cwd()) / p
+    return p.exists()
 
 
 def _is_regression_gate_command(command: str, cwd: Optional[str] = None) -> bool:
@@ -2314,7 +2331,7 @@ def classify_result(
                 env_missing_dep | file_not_found_unrunnable | timeout |
                 compound_command_disallowed | unsupported_shell_syntax |
                 unsafe_command | command_not_allowed | unknown | regression_gate |
-                new_file_missing_expected
+                new_file_missing_expected | existing_file_missing_node_id_noncanonical
       decision: go | blocked | human_judgment
       fix_hint: nullable hint
       scope_class: baseline_fail_expected | regression_gate | pr_review_only | runtime_only
@@ -2392,7 +2409,7 @@ def classify_result(
                 # as expected_baseline_fail/go, and must be distinguishable
                 # from the generic `unknown` / `human_judgment` fallback so
                 # diagnostics can identify this specific shape.
-                if exit_code == 4 and _is_existing_file_missing_node_id_error(stdout, stderr):
+                if exit_code == 4 and _is_existing_file_missing_node_id_error(stdout, stderr, cwd=cwd):
                     return (
                         "blocked",
                         "existing_file_missing_node_id_noncanonical",

@@ -1409,6 +1409,15 @@ def test_pytest_exit4_new_test_on_existing_file_is_noncanonical_category(tmp_pat
         "Must NOT be expected_baseline_fail-equivalent (expected_fail classification)"
     )
     assert decision != "go", "Must NOT be decision=go"
+    assert decision == "blocked", f"Expected decision=blocked, got {decision!r}"
+    assert scope_class == "baseline_fail_expected", (
+        f"Expected scope_class=baseline_fail_expected, got {scope_class!r}"
+    )
+    assert fix_hint is not None, "fix_hint must not be None for this non-canonical category"
+    assert "missing_new_test_file.py::test_name" in fix_hint, (
+        f"fix_hint must guide the author to the canonical missing-file node-id shape, "
+        f"got: {fix_hint!r}"
+    )
 
 
 def test_pytest_exit4_missing_file_still_expected_baseline_fail(tmp_path):
@@ -1440,6 +1449,63 @@ def test_pytest_exit4_missing_file_still_expected_baseline_fail(tmp_path):
     assert category == "expected_baseline_fail"
     assert decision == "go"
 
+
+def test_pytest_exit4_existing_file_missing_node_id_real_subprocess(tmp_path):
+    """PR #1366 review (Major 4): reproduce the existing-file / missing node-id
+    shape with a REAL pytest subprocess (not a hand-written stderr string), and
+    feed its actual exit_code/stdout/stderr through classify_result(). This
+    guards against the classifier's regex drifting from pytest's real error
+    message shape (as opposed to only testing against a hand-authored fixture)."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    test_file = tmp_path / "test_existing_file_real.py"
+    test_file.write_text("def test_missing():\n    assert True\n")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", f"{test_file}::test_missing", "-q"],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+        timeout=60,
+    )
+
+    # Sanity: this collected node-id DOES exist, so this run must PASS (exit 0),
+    # establishing a baseline before we run the deliberately-missing node-id below.
+    assert result.returncode == 0, (
+        f"Sanity baseline (existing node-id) unexpectedly failed: "
+        f"exit={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    missing_node_id_result = subprocess.run(
+        [sys.executable, "-m", "pytest", f"{test_file}::test_not_yet_implemented", "-q"],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+        timeout=60,
+    )
+
+    assert missing_node_id_result.returncode == 4, (
+        f"Expected pytest exit 4 (usage error / not found) for a missing node-id, "
+        f"got exit={missing_node_id_result.returncode} "
+        f"stdout={missing_node_id_result.stdout!r} stderr={missing_node_id_result.stderr!r}"
+    )
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=missing_node_id_result.returncode,
+        stdout=missing_node_id_result.stdout,
+        stderr=missing_node_id_result.stderr,
+        command=f"uv run pytest {test_file}::test_not_yet_implemented -q",
+        cwd=str(tmp_path),
+    )
+
+    assert category == "existing_file_missing_node_id_noncanonical", (
+        f"Expected existing_file_missing_node_id_noncanonical from a REAL pytest "
+        f"subprocess run, got category={category!r} classification={classification!r} "
+        f"stdout={missing_node_id_result.stdout!r} stderr={missing_node_id_result.stderr!r}"
+    )
+    assert decision == "blocked", f"Expected decision=blocked, got {decision!r}"
 
 
 def test_command_substitution_is_not_run(monkeypatch):
