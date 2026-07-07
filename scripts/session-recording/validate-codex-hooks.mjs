@@ -108,6 +108,12 @@ function main() {
   const repoRoot = resolve(process.cwd())
   const parsed = loadJson(jsonPath)
   const failures = []
+  const rootKeys = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? Object.keys(parsed).sort() : []
+  assert(
+    JSON.stringify(rootKeys) === JSON.stringify(['hooks']),
+    `hooks.json root keys must be exactly ["hooks"], got ${JSON.stringify(rootKeys)}`,
+    failures,
+  )
   const hooks = parsed?.hooks ?? {}
   const compositeBase =
     'rtk pnpm exec node "$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs"'
@@ -142,8 +148,16 @@ function main() {
       '^Bash$',
       [
         { command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/local_main_branch_guard.sh"', timeout: 10 },
+        {
+          command: 'python3 "$(git rev-parse --show-toplevel)/.claude/hooks/worktree_scope_guard.py"',
+          timeout: 20,
+        },
         { command: `${checkCodexAgentsBase} --hook-pretool` },
         { command: `${compositeBase} --event PreToolUse` },
+        {
+          command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/ci_test_performance_advisory.sh"',
+          timeout: 10,
+        },
       ],
       failures,
     )
@@ -154,6 +168,10 @@ function main() {
       [
         { command: `${checkCodexAgentsBase} --hook-pretool` },
         { command: `${compositeBase} --event PreToolUse` },
+        {
+          command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/ci_test_performance_advisory.sh"',
+          timeout: 10,
+        },
       ],
       failures,
     )

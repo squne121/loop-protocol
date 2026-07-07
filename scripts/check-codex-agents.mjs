@@ -360,6 +360,14 @@ function validateHooksJson(hooksPath, failures) {
   }
 
   assert(parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed), 'hooks.json: root must be an object', failures);
+  if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const rootKeys = Object.keys(parsed).sort();
+    assert(
+      JSON.stringify(rootKeys) === JSON.stringify(['hooks']),
+      `hooks.json: root keys must be exactly ["hooks"], got ${JSON.stringify(rootKeys)}`,
+      failures,
+    );
+  }
   assert(Array.isArray(parsed?.hooks?.SubagentStart), 'hooks.json: must have hooks.SubagentStart array', failures);
   assert(Array.isArray(parsed?.hooks?.PreToolUse), 'hooks.json: must have hooks.PreToolUse array', failures);
 

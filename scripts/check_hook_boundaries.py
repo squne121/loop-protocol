@@ -505,6 +505,27 @@ def check_codex_hooks_no_fastpath_classifier(path: Path = CODEX_HOOKS_PATH) -> l
     return errors
 
 
+def check_codex_hooks_root_keys(path: Path = CODEX_HOOKS_PATH) -> list[str]:
+    errors: list[str] = []
+    if not path.exists():
+        return [f"[codex:root_keys] .codex/hooks.json が見つかりません: {path}"]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return [f"[codex:root_keys] .codex/hooks.json の JSON parse に失敗: {exc}"]
+
+    if not isinstance(data, dict):
+        return ["[codex:root_keys] .codex/hooks.json root は object である必要があります"]
+
+    root_keys = sorted(data.keys())
+    if root_keys != ["hooks"]:
+        errors.append(
+            "[codex:root_keys] .codex/hooks.json root keys must be exactly "
+            f"['hooks'], got {root_keys}"
+        )
+    return errors
+
+
 def check_settings_no_fastpath_classifier(path: Path = SETTINGS_PATH) -> list[str]:
     """Issue #1289 AC6: same check for .claude/settings.json."""
     errors: list[str] = []
@@ -592,6 +613,7 @@ def main() -> int:
     # Issue #1289 (AC4/AC6): .codex/hooks.json is also in scope now — verify
     # the shared fast-path classifier was never registered as an independent
     # PreToolUse hook in either manifest.
+    errors.extend(check_codex_hooks_root_keys())
     errors.extend(check_codex_hooks_no_fastpath_classifier())
     errors.extend(check_settings_no_fastpath_classifier())
     errors.extend(check_codex_hooks_pretool_topology())
