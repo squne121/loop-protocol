@@ -1,5 +1,6 @@
 import type { GameState } from '../state'
 import { formatCombatNumber } from '../render/renderUtils'
+import type { UpgradePurchaseFailureReason } from '../systems/UpgradeSystem'
 
 export interface HudActions {
   onNewGame?(): void
@@ -18,6 +19,8 @@ export interface HudActions {
   canLoadGame?(): boolean
   /** Called when the pause/resume button is clicked (AC1). */
   onTogglePause(): void
+  /** Upgrade weapon purchase action (Issue #1282). Caller owns quoteUpgrade/purchaseUpgrade orchestration. */
+  onUpgradeWeapon?(): void
   // ---------------------------------------------------------------------------
   // Backward-compat aliases (deprecated — use onSave / onLoadGame / canLoadGame)
   // ---------------------------------------------------------------------------
@@ -29,9 +32,81 @@ export interface HudActions {
   canQuickLoad?(): boolean
 }
 
+/**
+ * Player-facing copy for a purchase outcome (Issue #1282, AC4). `status` is a
+ * short headline; `summary` is the longer explanation. Internal enum values
+ * (`UpgradeFailureReason` / `UpgradePurchaseFailureReason`) must never reach
+ * the DOM directly — this table is the single translation boundary.
+ */
+export interface HudUpgradeStatusCopy {
+  status: string
+  summary: string
+}
+
+/** All outcomes an upgrade purchase attempt can report to the HUD. */
+export type HudUpgradeOutcomeReason = 'ok' | UpgradePurchaseFailureReason
+
+const UPGRADE_STATUS_COPY_BY_REASON: Record<HudUpgradeOutcomeReason, HudUpgradeStatusCopy> = {
+  ok: {
+    status: 'Upgrade installed.',
+    summary: 'Weapon Power increased. Resources were saved.',
+  },
+  'insufficient-resources': {
+    status: 'Not enough resources.',
+    summary: 'Earn 100 resources before upgrading.',
+  },
+  'already-purchased': {
+    status: 'Upgrade already installed.',
+    summary: 'Weapon Power is already upgraded.',
+  },
+  'not-preparation': {
+    status: 'Upgrade available in hangar.',
+    summary: 'Return to preparation before upgrading.',
+  },
+  'write-error': {
+    status: 'Upgrade not saved.',
+    summary: 'No resources were spent. Check browser storage and try again.',
+  },
+  'storage-unavailable': {
+    status: 'Upgrade not saved.',
+    summary: 'No resources were spent. Check browser storage and try again.',
+  },
+  'invalid-definition': {
+    status: 'Upgrade unavailable.',
+    summary: 'Current upgrade data could not be applied.',
+  },
+  'invalid-state': {
+    status: 'Upgrade unavailable.',
+    summary: 'Current upgrade data could not be applied.',
+  },
+}
+
+/**
+ * Translates a `quoteUpgrade()` / `purchaseUpgrade()` outcome reason (or
+ * `'ok'`) into player-facing copy (AC4). This is the single lookup table for
+ * upgrade purchase feedback so the mapping cannot drift between callers.
+ */
+export function getUpgradeStatusCopy(reason: HudUpgradeOutcomeReason): HudUpgradeStatusCopy {
+  return UPGRADE_STATUS_COPY_BY_REASON[reason]
+}
+
+/**
+ * View model handed to `HudController.render()` describing the current
+ * upgrade purchase surface (AC2, AC3, AC6). Built by the caller (main.ts) from
+ * `quoteUpgrade()` so the HUD never re-derives purchase eligibility itself
+ * (AC3: `quoteUpgrade()` result is the authority, not a HUD-local phase check).
+ */
+export interface HudUpgradeViewModel {
+  definitionId: string
+  cost: number
+  weaponPower: number
+  buttonDisabled: boolean
+  statusCopy: HudUpgradeStatusCopy | null
+}
+
 export interface HudController {
   /** Render the HUD. isPaused is the runtime-local product pause flag (AC1, AC4). */
-  render(state: GameState, isPaused: boolean): void
+  render(state: GameState, isPaused: boolean, upgradeView?: HudUpgradeViewModel): void
 }
 
 function getMissionPhaseCopy(loopPhase: GameState['loopPhase']): string {
@@ -122,6 +197,7 @@ export function createHudController(
       <dl class="stat-grid">
         <div><dt>Hull</dt><dd data-field="hp"></dd></div>
         <div><dt>Resources</dt><dd data-field="resources"></dd></div>
+        <div><dt>Weapon Power</dt><dd data-field="weapon-power"></dd></div>
         <div><dt>Shots</dt><dd data-field="shots"></dd></div>
         <div><dt>Cooldown</dt><dd data-field="cooldown"></dd></div>
       </dl>
@@ -142,6 +218,18 @@ export function createHudController(
       <p
         class="status-copy"
         data-field="assist-status"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      ></p>
+    </section>
+    <section class="panel">
+      <p class="eyebrow">Armory</p>
+      <button type="button" data-action="upgrade-weapon">Upgrade weapon</button>
+      <p class="status-copy status-copy--muted" data-field="upgrade-cost"></p>
+      <p
+        class="status-copy"
+        data-field="upgrade-status"
         role="status"
         aria-live="polite"
         aria-atomic="true"
@@ -222,9 +310,15 @@ export function createHudController(
   container
     .querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')
     ?.addEventListener('click', actions.onTogglePause)
+  if (actions.onUpgradeWeapon) {
+    container
+      .querySelector<HTMLButtonElement>('[data-action="upgrade-weapon"]')
+      ?.addEventListener('click', actions.onUpgradeWeapon)
+  }
 
   const hp = queryField(container, 'hp')
   const resources = queryField(container, 'resources')
+  const weaponPowerField = queryField(container, 'weapon-power')
   const shots = queryField(container, 'shots')
   const cooldown = queryField(container, 'cooldown')
   const assistStatus = queryField(container, 'assist-status')
@@ -236,6 +330,8 @@ export function createHudController(
   const sortieKills = queryField(container, 'sortie-kills')
   const sortieDuration = queryField(container, 'sortie-duration')
   const sortieResult = queryField(container, 'sortie-result')
+  const upgradeCostField = queryField(container, 'upgrade-cost')
+  const upgradeStatusField = queryField(container, 'upgrade-status')
   const newGameButton = queryAction(container, 'new-game')
   const startSortieButton = queryAction(container, 'start-sortie')
   const assistPlayerButton = queryAction(container, 'assist-player')
@@ -246,11 +342,13 @@ export function createHudController(
   const loadGameButton = queryAction(container, 'load-game')
   const resetButton = queryAction(container, 'reset')
   const togglePauseButton = queryAction(container, 'toggle-pause')
+  const upgradeWeaponButton = queryAction(container, 'upgrade-weapon')
 
   return {
-    render(state, isPaused) {
+    render(state, isPaused, upgradeView) {
       hp.textContent = `${formatCombatNumber(state.player.hp)}/${formatCombatNumber(state.player.maxHp)}`
       resources.textContent = `${state.progress.resources}`
+      weaponPowerField.textContent = `${state.progress.weaponPower}`
       shots.textContent = `${state.player.shotsFired}`
       cooldown.textContent = `${Math.ceil(state.player.weaponCooldownMs)} ms`
       assistStatus.textContent = getAssistStatusCopy(state)
@@ -277,6 +375,21 @@ export function createHudController(
       const canLoad = (actions.canLoadGame ?? actions.canQuickLoad)?.() ?? false
       loadGameButton.disabled = !isMenuPhase || !canLoad
       resetButton.disabled = state.loopPhase !== 'preparation'
+
+      // Upgrade weapon (AC2, AC3, AC6): `quoteUpgrade()` result (via upgradeView.buttonDisabled)
+      // is the sole authority for purchase eligibility — this render step never
+      // re-derives eligibility from state.loopPhase itself.
+      if (upgradeView) {
+        upgradeWeaponButton.disabled = upgradeView.buttonDisabled
+        upgradeCostField.textContent = `Cost: ${upgradeView.cost}`
+        upgradeStatusField.textContent = upgradeView.statusCopy
+          ? `${upgradeView.statusCopy.status} ${upgradeView.statusCopy.summary}`
+          : ''
+      } else {
+        upgradeWeaponButton.disabled = true
+        upgradeCostField.textContent = ''
+        upgradeStatusField.textContent = ''
+      }
 
       // AC1: aria-pressed reflects current pause state; label is fixed to avoid ARIA conflict
       // aria-label updates to describe the current action (not current state)
