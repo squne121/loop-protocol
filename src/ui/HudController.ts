@@ -197,7 +197,6 @@ export function createHudController(
       <dl class="stat-grid">
         <div><dt>Hull</dt><dd data-field="hp"></dd></div>
         <div><dt>Resources</dt><dd data-field="resources"></dd></div>
-        <div><dt>Weapon Power</dt><dd data-field="weapon-power"></dd></div>
         <div><dt>Shots</dt><dd data-field="shots"></dd></div>
         <div><dt>Cooldown</dt><dd data-field="cooldown"></dd></div>
       </dl>
@@ -225,6 +224,9 @@ export function createHudController(
     </section>
     <section class="panel">
       <p class="eyebrow">Armory</p>
+      <dl class="stat-grid">
+        <div><dt>Weapon Power</dt><dd data-field="weapon-power"></dd></div>
+      </dl>
       <button type="button" data-action="upgrade-weapon">Upgrade weapon</button>
       <p class="status-copy status-copy--muted" data-field="upgrade-cost"></p>
       <p
