@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 HOOKS_JSON = REPO_ROOT / ".codex" / "hooks.json"
 CONFIG_TOML = REPO_ROOT / ".codex" / "config.toml"
 CHECK_SCRIPT = REPO_ROOT / "scripts" / "check-codex-agents.mjs"
+VALIDATE_CODEX_HOOKS_SCRIPT = REPO_ROOT / "scripts" / "session-recording" / "validate-codex-hooks.mjs"
 
 
 def _run_validator(env_override: dict | None = None) -> subprocess.CompletedProcess:
@@ -27,6 +28,15 @@ def _run_validator(env_override: dict | None = None) -> subprocess.CompletedProc
         capture_output=True,
         text=True,
         env=env,
+        cwd=str(REPO_ROOT),
+    )
+
+
+def _run_hooks_validator(hooks_json: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["node", str(VALIDATE_CODEX_HOOKS_SCRIPT), str(hooks_json)],
+        capture_output=True,
+        text=True,
         cwd=str(REPO_ROOT),
     )
 
@@ -215,8 +225,49 @@ def test_hooks_json_root_structure():
     """AC5 corollary: hooks.json root must be {hooks: {...}} structure."""
     data = load_hooks()
     assert isinstance(data, dict), "hooks.json root must be a JSON object"
-    assert "hooks" in data, "hooks.json must have a 'hooks' key at root"
+    assert sorted(data.keys()) == ["hooks"], (
+        f"hooks.json root keys must be exactly ['hooks'], got {sorted(data.keys())}"
+    )
     assert isinstance(data["hooks"], dict), "hooks.json 'hooks' value must be an object"
+
+
+def test_hooks_json_extra_root_metadata_rejected_by_validators(tmp_path):
+    """AC5 negative: fastpathContract root metadata must fail all active hooks validators."""
+    fixture_root = _make_fixture_repo(tmp_path)
+    patched = load_hooks()
+    patched["fastpathContract"] = {}
+    fixture_hooks = fixture_root / ".codex" / "hooks.json"
+    fixture_hooks.write_text(json.dumps(patched))
+
+    agent_result = _run_validator(env_override={"REPO_ROOT_OVERRIDE": str(fixture_root)})
+    assert agent_result.returncode != 0, (
+        "check-codex-agents.mjs must reject extra root keys in hooks.json.\n"
+        f"stdout: {agent_result.stdout}\nstderr: {agent_result.stderr}"
+    )
+    assert "root keys must be exactly" in (agent_result.stdout + agent_result.stderr)
+
+    hooks_result = _run_hooks_validator(fixture_hooks)
+    assert hooks_result.returncode != 0, (
+        "validate-codex-hooks.mjs must reject extra root keys in hooks.json.\n"
+        f"stdout: {hooks_result.stdout}\nstderr: {hooks_result.stderr}"
+    )
+    assert "root keys must be exactly" in (hooks_result.stdout + hooks_result.stderr)
+
+
+def test_hooks_json_extra_handler_field_rejected_by_hooks_validator(tmp_path):
+    """AC3 negative: extra handler fields such as async must fail exact field-set validation."""
+    fixture_root = _make_fixture_repo(tmp_path)
+    patched = load_hooks()
+    patched["hooks"]["PreToolUse"][0]["hooks"][0]["async"] = True
+    fixture_hooks = fixture_root / ".codex" / "hooks.json"
+    fixture_hooks.write_text(json.dumps(patched))
+
+    result = _run_hooks_validator(fixture_hooks)
+    assert result.returncode != 0, (
+        "validate-codex-hooks.mjs must reject async/extra handler fields.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "keys must be exactly" in (result.stdout + result.stderr)
 
 
 # ---------------------------------------------------------------------------

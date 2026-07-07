@@ -31,6 +31,25 @@ function findEntryByMatcher(entries, matcher) {
   return (entries ?? []).find((entry) => entry?.matcher === matcher) ?? null
 }
 
+function assertExactCommandHook(eventName, expectedMatcher, hook, expected, index, failures) {
+  const label = `${eventName} ${expectedMatcher} hook ${index}`
+  const expectedKeys = ['command', 'statusMessage', 'timeout', 'type']
+  const actualKeys = hook && typeof hook === 'object' && !Array.isArray(hook) ? Object.keys(hook).sort() : []
+  assert(
+    JSON.stringify(actualKeys) === JSON.stringify(expectedKeys),
+    `${label} keys must be exactly ${JSON.stringify(expectedKeys)}, got ${JSON.stringify(actualKeys)}`,
+    failures,
+  )
+  assert(hook?.type === 'command', `${label} type must be command`, failures)
+  assert(hook?.command === expected.command, `${label} command must exactly match expected handler`, failures)
+  assert(hook?.timeout === expected.timeout, `${label} timeout must be ${expected.timeout}`, failures)
+  assert(
+    hook?.statusMessage === expected.statusMessage,
+    `${label} statusMessage must be ${expected.statusMessage}`,
+    failures,
+  )
+}
+
 function assertExactCompositeHandler(eventName, entries, expectedMatcher, expectedCommand, failures) {
   assert(Array.isArray(entries), `hooks.${eventName} must exist`, failures)
   if (!Array.isArray(entries)) {
@@ -46,9 +65,14 @@ function assertExactCompositeHandler(eventName, entries, expectedMatcher, expect
 
   const [{ matcher, hook }] = flattened
   assert(matcher === expectedMatcher, `${eventName} matcher must be exactly ${expectedMatcher}`, failures)
-  assert(hook?.type === 'command', `${eventName} hook type must be command`, failures)
-  assert(hook?.timeout === 30, `${eventName} timeout must be 30`, failures)
-  assert(hook?.command === expectedCommand, `${eventName} command must exactly match the composite handler`, failures)
+  assertExactCommandHook(
+    eventName,
+    expectedMatcher,
+    hook,
+    { command: expectedCommand, timeout: 30, statusMessage: expectedStatusMessages[eventName] },
+    0,
+    failures,
+  )
 }
 
 function assertEntryHookShape(eventName, entry, expectedMatcher, expectedCommands, failures) {
@@ -70,19 +94,14 @@ function assertEntryHookShape(eventName, entry, expectedMatcher, expectedCommand
 
   for (const [index, expected] of expectedCommands.entries()) {
     const hook = hooks[index]
-    assert(hook?.type === 'command', `${eventName} ${expectedMatcher} hook ${index} type must be command`, failures)
-    const expectedTimeout = expected.timeout ?? 30
-    assert(
-      hook?.timeout === expectedTimeout,
-      `${eventName} ${expectedMatcher} hook ${index} timeout must be ${expectedTimeout}`,
-      failures,
-    )
-    assert(
-      hook?.command === expected.command,
-      `${eventName} ${expectedMatcher} hook ${index} command must exactly match expected handler`,
-      failures,
-    )
+    assertExactCommandHook(eventName, expectedMatcher, hook, expected, index, failures)
   }
+}
+
+const expectedStatusMessages = {
+  SubagentStart: 'Loading LOOP_PROTOCOL subagent guardrail',
+  Stop: 'Writing Codex session-recording Stop manifest',
+  SubagentStop: 'Writing Codex session-recording SubagentStop manifest',
 }
 
 function validateDocs(repoRoot, failures) {
@@ -108,6 +127,12 @@ function main() {
   const repoRoot = resolve(process.cwd())
   const parsed = loadJson(jsonPath)
   const failures = []
+  const rootKeys = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? Object.keys(parsed).sort() : []
+  assert(
+    JSON.stringify(rootKeys) === JSON.stringify(['hooks']),
+    `hooks.json root keys must be exactly ["hooks"], got ${JSON.stringify(rootKeys)}`,
+    failures,
+  )
   const hooks = parsed?.hooks ?? {}
   const compositeBase =
     'rtk pnpm exec node "$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs"'
@@ -141,9 +166,31 @@ function main() {
       bashEntry,
       '^Bash$',
       [
-        { command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/local_main_branch_guard.sh"', timeout: 10 },
-        { command: `${checkCodexAgentsBase} --hook-pretool` },
-        { command: `${compositeBase} --event PreToolUse` },
+        {
+          command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/local_main_branch_guard.sh"',
+          timeout: 10,
+          statusMessage: 'Checking local root branch policy',
+        },
+        {
+          command: 'python3 "$(git rev-parse --show-toplevel)/.claude/hooks/worktree_scope_guard.py"',
+          timeout: 20,
+          statusMessage: 'Checking worktree cleanup scope policy (shared core)',
+        },
+        {
+          command: `${checkCodexAgentsBase} --hook-pretool`,
+          timeout: 30,
+          statusMessage: 'Checking LOOP_PROTOCOL Bash guardrail',
+        },
+        {
+          command: `${compositeBase} --event PreToolUse`,
+          timeout: 30,
+          statusMessage: 'Checking Codex session-recording PreToolUse guard',
+        },
+        {
+          command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/ci_test_performance_advisory.sh"',
+          timeout: 10,
+          statusMessage: 'Checking CI/test-lane path advisory',
+        },
       ],
       failures,
     )
@@ -152,8 +199,21 @@ function main() {
       patchEntry,
       '^(apply_patch|Edit|Write)$',
       [
-        { command: `${checkCodexAgentsBase} --hook-pretool` },
-        { command: `${compositeBase} --event PreToolUse` },
+        {
+          command: `${checkCodexAgentsBase} --hook-pretool`,
+          timeout: 30,
+          statusMessage: 'Checking LOOP_PROTOCOL patch guardrail',
+        },
+        {
+          command: `${compositeBase} --event PreToolUse`,
+          timeout: 30,
+          statusMessage: 'Checking Codex session-recording patch guard',
+        },
+        {
+          command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/ci_test_performance_advisory.sh"',
+          timeout: 10,
+          statusMessage: 'Checking CI/test-lane path advisory',
+        },
       ],
       failures,
     )
@@ -172,8 +232,16 @@ function main() {
       bashEntry,
       '^Bash$',
       [
-        { command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/local_main_branch_guard.sh"', timeout: 10 },
-        { command: `${compositeBase} --event PermissionRequest` },
+        {
+          command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/local_main_branch_guard.sh"',
+          timeout: 10,
+          statusMessage: 'Checking local root branch policy',
+        },
+        {
+          command: `${compositeBase} --event PermissionRequest`,
+          timeout: 30,
+          statusMessage: 'Checking Codex session-recording PermissionRequest guard',
+        },
       ],
       failures,
     )
@@ -181,7 +249,13 @@ function main() {
       'PermissionRequest',
       patchEntry,
       '^(apply_patch|Edit|Write)$',
-      [{ command: `${compositeBase} --event PermissionRequest` }],
+      [
+        {
+          command: `${compositeBase} --event PermissionRequest`,
+          timeout: 30,
+          statusMessage: 'Checking Codex session-recording PermissionRequest guard',
+        },
+      ],
       failures,
     )
   }

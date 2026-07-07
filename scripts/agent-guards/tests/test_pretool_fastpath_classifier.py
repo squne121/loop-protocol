@@ -9,6 +9,7 @@ Commands (each test below is invoked individually via `pytest -k <name>`).
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 import textwrap
@@ -170,9 +171,29 @@ class TestAC4HookBoundaryManifest:
         assert "mutation_or_unknown" in docs_text
 
         codex_hooks_path = REPO_ROOT / ".codex" / "hooks.json"
-        codex_text = codex_hooks_path.read_text(encoding="utf-8")
-        assert "pretool_fastpath_classifier" in codex_text
-        assert "readonly_display" in codex_text
+        codex_hooks = json.loads(codex_hooks_path.read_text(encoding="utf-8"))
+        assert sorted(codex_hooks.keys()) == ["hooks"]
+
+        hook_commands = [
+            hook.get("command", "")
+            for entries in codex_hooks["hooks"].values()
+            for entry in entries
+            for hook in entry.get("hooks", [])
+        ]
+        assert not any("pretool_fastpath_classifier" in command for command in hook_commands)
+
+    def test_fastpath_contract_root_metadata_is_rejected_by_validators(self, tmp_path):
+        codex_hooks_path = REPO_ROOT / ".codex" / "hooks.json"
+        codex_hooks = json.loads(codex_hooks_path.read_text(encoding="utf-8"))
+        codex_hooks["fastpathContract"] = {}
+
+        fixture_hooks = tmp_path / "hooks.json"
+        fixture_hooks.write_text(json.dumps(codex_hooks), encoding="utf-8")
+
+        checker = _load_check_hook_boundaries()
+        errors = checker.check_codex_hooks_root_keys(path=fixture_hooks)
+        assert errors
+        assert any("root keys must be exactly" in error for error in errors)
 
 
 # =============================================================================
@@ -453,9 +474,9 @@ class TestBlocker3SummaryNoSecretLeak:
 
 
 # =============================================================================
-# Major (PR #1299 review fix_delta): .codex/hooks.json PreToolUse topology
-# must be verified against a fixed expected count, not just absence of the
-# classifier module name (which cannot detect other hook additions/removals).
+# Major (PR #1299 / #1367 review fix_delta): .codex/hooks.json PreToolUse
+# topology must be verified against a fixed expected handler matrix, not just
+# absence of the classifier module name.
 # =============================================================================
 
 
@@ -482,11 +503,18 @@ class TestMajorCodexHooksTopologyCheck:
         actual = checker.load_codex_hooks_topology()
         assert actual, "expected at least one PreToolUse matcher in .codex/hooks.json"
 
-        # Mutate a copy: bump one matcher's count by one (simulating an
-        # undetected added hook) and verify the check fails closed.
-        drifted_expected = dict(actual)
+        # Mutate a copy: add one handler to a matcher and verify exact topology
+        # validation fails closed.
+        drifted_expected = {matcher: list(hooks) for matcher, hooks in actual.items()}
         first_matcher = next(iter(drifted_expected))
-        drifted_expected[first_matcher] += 1
+        drifted_expected[first_matcher] = drifted_expected[first_matcher] + [
+            {
+                "type": "command",
+                "command": "echo unexpected",
+                "timeout": 1,
+                "statusMessage": "Unexpected hook",
+            }
+        ]
 
         errors = checker.check_codex_hooks_pretool_topology(expected=drifted_expected)
         assert errors, "topology drift must be reported, not silently accepted"
