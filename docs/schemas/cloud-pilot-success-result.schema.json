@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/squne121/loop-protocol/docs/schemas/cloud-pilot-success-result.schema.json",
+  "title": "cloud_pilot_success_result/v1",
+  "description": "Payload schema for the cloud_pilot_success_result/v1 artifact (ADR 0005, hybrid_reference_from_agent_run_report). This schema validates ONLY the closed shape of the payload object. digest recomputation, marker constraints, gate evidence field-level checks and forbidden-field scanning are semantic checker responsibilities (see scripts/check-cloud-pilot-success-result.mjs), not schema responsibilities.",
+  "type": "object",
+  "required": [
+    "schema",
+    "result_id",
+    "parent_issue",
+    "contract_issue",
+    "placement_issue",
+    "target",
+    "evidence_mode",
+    "decision_ready",
+    "decision",
+    "gate_refs",
+    "metrics",
+    "safety",
+    "generated_at"
+  ],
+  "properties": {
+    "schema": {
+      "const": "cloud_pilot_success_result/v1"
+    },
+    "result_id": {
+      "type": "string",
+      "pattern": "^cloud-pilot-success-result-[a-z0-9][a-z0-9._-]{0,79}$"
+    },
+    "parent_issue": {
+      "type": "string",
+      "pattern": "^#[1-9][0-9]*$"
+    },
+    "contract_issue": {
+      "type": "string",
+      "pattern": "^#[1-9][0-9]*$"
+    },
+    "placement_issue": {
+      "type": "string",
+      "pattern": "^#[1-9][0-9]*$"
+    },
+    "target": {
+      "type": "object",
+      "required": ["kind", "number", "marker_value"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": ["issue", "pull_request"]
+        },
+        "number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "marker_value": {
+          "type": "string",
+          "pattern": "^(issue|pull_request):[1-9][0-9]*$"
+        }
+      }
+    },
+    "evidence_mode": {
+      "enum": ["fixture_only", "real_pilot_verified"]
+    },
+    "decision_ready": {
+      "type": "boolean"
+    },
+    "decision": {
+      "enum": [
+        "pending_fixture_only",
+        "adopt_cloud",
+        "adopt_self_host",
+        "conditional_adoption",
+        "withdraw"
+      ]
+    },
+    "cloud_adoption_allowed_now": {
+      "type": ["boolean", "null"]
+    },
+    "gate_refs": {
+      "type": "object",
+      "required": [
+        "session_recording_smoke",
+        "latitude_real_pilot_decision",
+        "latitude_distribution_gate",
+        "success_contract_checker"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "session_recording_smoke": {
+          "type": "object",
+          "required": ["issue", "state", "verdict", "evidence_digest"],
+          "additionalProperties": false,
+          "properties": {
+            "issue": { "type": "string", "const": "#246" },
+            "state": { "enum": ["completed", "open", "unknown", "synthetic"] },
+            "verdict": { "enum": ["pass", "fail", "unknown"] },
+            "evidence_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+          }
+        },
+        "latitude_real_pilot_decision": {
+          "type": "object",
+          "required": ["issue", "state", "decision", "decision_digest"],
+          "additionalProperties": false,
+          "properties": {
+            "issue": { "type": "string", "const": "#1220" },
+            "state": { "enum": ["completed", "open", "unknown", "synthetic"] },
+            "decision": { "enum": ["approve_timeboxed_real_pilot", "deny", "pending"] },
+            "decision_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+          }
+        },
+        "latitude_distribution_gate": {
+          "type": "object",
+          "required": ["issue", "state", "argv_exposure_state", "remote_cleanup_state"],
+          "additionalProperties": false,
+          "properties": {
+            "issue": { "type": "string", "const": "#1261" },
+            "state": { "enum": ["completed", "open", "unknown", "synthetic"] },
+            "argv_exposure_state": { "enum": ["absent_verified", "present", "unknown"] },
+            "remote_cleanup_state": { "enum": ["machine_verified", "unverified", "unknown"] }
+          }
+        },
+        "success_contract_checker": {
+          "type": "object",
+          "required": ["issue", "state", "checker_result", "presented_as_real_target"],
+          "additionalProperties": false,
+          "properties": {
+            "issue": { "type": "string", "const": "#1326" },
+            "state": { "enum": ["completed", "open", "unknown", "synthetic"] },
+            "checker_result": { "enum": ["pass", "fail", "unknown"] },
+            "presented_as_real_target": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "required": ["duration_seconds", "cost_usd"],
+      "additionalProperties": false,
+      "properties": {
+        "duration_seconds": { "type": "number", "minimum": 0 },
+        "cost_usd": { "type": "number", "minimum": 0 }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "required": ["redaction_status", "verdict", "blocked_reasons"],
+      "additionalProperties": false,
+      "properties": {
+        "redaction_status": { "enum": ["clean", "unknown"] },
+        "verdict": { "enum": ["pass", "fail"] },
+        "blocked_reasons": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "generated_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "public_correlation_id": {
+      "type": "string",
+      "pattern": "^cpsr-pub-[0-9a-f]{16}$"
+    },
+    "diagnostic_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {}
+    },
+    "upsert_probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existing_comment_match_count": { "type": "integer", "minimum": 0 },
+        "digest_freshness": { "enum": ["current", "stale"] },
+        "page_budget_exhausted": { "type": "boolean" },
+        "matched_author_allowed": { "type": "boolean" },
+        "match_fields_verified": { "type": "boolean" }
+      }
+    }
+  },
+  "unevaluatedProperties": false
+}
