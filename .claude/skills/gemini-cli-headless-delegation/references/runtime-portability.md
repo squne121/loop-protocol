@@ -471,7 +471,7 @@ delegation 本体の成否には一切影響しない（best-effort。stderr に
 export DELEGATION_AUDIT_REQUIRED=1
 ```
 
-### field-to-metric mapping
+### field-to-metric mapping / フィールドと監視指標の対応
 
 | audit フィールド | 由来 | 用途 |
 |---|---|---|
