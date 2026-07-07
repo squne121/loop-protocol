@@ -29,6 +29,14 @@ related_tests: []
 - exact internal state、telemetry、raw reward state、開発用 controls は `debug panel` に隔離する。
 - 本書は docs-only architecture artifact であり、runtime 実装を直接変更しない。
 
+## title / preparation / running / result / pause Mapping
+
+- title screen: `title_menu` phase を `menu overlay` として扱い、`LoopPhase` は表示しない。開始導線（例: `出撃開始`、`編成確認`）は可読語彙で提示する。
+- preparation: mission briefing、loadout、`ready` gating を `menu overlay + DOM HUD overlay` で統合する。`combat` 以外の生データ（LoopPhase 等）は非表示。
+- running: combat 中の状態把握を `DOM HUD overlay` + `Canvas combat layer` で分担する。数値系は integer-only / non-fractional policy を維持し、`Claim reward` 等の内部語彙は非表示。
+- result: `debrief` を結果確認（勝敗ラベル、報酬差分、次行動導線）として `menu overlay` に一本化する。`combat` 生データは overlay summary へ要約して差し替える。
+- pause: `pause` は `productPause.isPaused` 起点の interruption overlay として定義し、Menu layer 上で `resume` / `settings` / `cancel` の最低操作を提供する。`LoopPhase` は pause 中の説明に露出しない。
+
 ## Surface Taxonomy
 
 | Surface | Role | Allowed | Forbidden |
