@@ -265,9 +265,25 @@ def _matching_vc_preflight(kind: str, vc_preflight_result: dict[str, Any] | None
     results = vc_preflight_result.get("results", [])
     if not isinstance(results, list):
         raise ValueError("vc-preflight-result-file.results must be a list")
+    if str(vc_preflight_result.get("status") or "") != "blocked":
+        return []
     entry = TAXONOMY_BY_ENTRY_ID.get(kind)
     categories = frozenset(entry["readiness_categories"]) if entry else frozenset()
-    return [item for item in results if isinstance(item, dict) and item.get("category") in categories]
+    matches: list[dict[str, Any]] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        if item.get("category") not in categories:
+            continue
+        if item.get("decision") != "blocked":
+            continue
+        if kind == "unexpected_pass" and (
+            item.get("classification") != "unexpected_pass"
+            or item.get("category") != "unexpected_pass"
+        ):
+            continue
+        matches.append(item)
+    return matches
 
 
 def _matching_vc_syntax(kind: str, vc_syntax_result: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -290,17 +306,45 @@ def _matching_vc_syntax(kind: str, vc_syntax_result: dict[str, Any] | None) -> l
 
 
 def _evidence(source_check: str, payload: dict[str, Any], body_sha256: str) -> dict[str, Any]:
+    line_start = payload.get("line_start")
+    line_end = payload.get("line_end")
+    if line_start is None and line_end is None and payload.get("line") is not None:
+        line_start = payload.get("line")
+        line_end = payload.get("line")
     return {
         "source_check": source_check,
         "rule_id": payload.get("rule_id"),
         "category": payload.get("category"),
         "artifact_path": payload.get("artifact_path", source_check or "unknown_artifact"),
         "artifact_schema": payload.get("artifact_schema", "CHECK_ISSUE_CONTRACT_V1"),
-        "line_start": payload.get("line_start"),
-        "line_end": payload.get("line_end"),
+        "line_start": line_start,
+        "line_end": line_end,
         "body_sha256": body_sha256,
         "iteration_id": payload.get("iteration_id", "legacy_replay_evidence"),
+        "ac": payload.get("ac"),
+        "raw_command": payload.get("raw_command"),
+        "command_hash": payload.get("command_hash"),
+        "classification": payload.get("classification"),
+        "decision": payload.get("decision"),
+        "scope_class": payload.get("scope_class"),
+        "confidence": payload.get("confidence"),
     }
+
+
+def _validate_vc_preflight_body_sha256(
+    vc_preflight_result: dict[str, Any] | None, body_sha256: str
+) -> str | None:
+    if vc_preflight_result is None:
+        return None
+    source = vc_preflight_result.get("source")
+    if not isinstance(source, dict):
+        return "vc_preflight_body_sha_missing"
+    vc_body_sha256 = str(source.get("body_sha256") or "")
+    if not vc_body_sha256:
+        return "vc_preflight_body_sha_missing"
+    if vc_body_sha256 != body_sha256:
+        return "vc_preflight_body_sha_mismatch"
+    return None
 
 
 def _is_valid_checker_evidence(entry: dict[str, Any], body_sha256: str) -> bool:
@@ -509,6 +553,9 @@ def analyze(
     if review_body_sha256 != readiness_body_sha256:
         return _body_hash_error("body_sha_mismatch", issue_url, previous_state)
     body_sha256 = readiness_body_sha256
+    vc_preflight_body_sha_error = _validate_vc_preflight_body_sha256(vc_preflight_result, body_sha256)
+    if vc_preflight_body_sha_error is not None:
+        return _body_hash_error(vc_preflight_body_sha_error, issue_url, previous_state)
 
     blockers = _extract_review_blockers(review_result)
     findings = _extract_findings(review_result)

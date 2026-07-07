@@ -216,6 +216,40 @@ COMPACT_UNEXPECTED_PASS = {
 }
 
 
+def _producer_vc_preflight_result(
+    *,
+    body_sha256: str = "sha256:body-a",
+    status: str = "blocked",
+    result_overrides: dict | None = None,
+    source_overrides: dict | None = None,
+) -> dict:
+    result = {
+        "ac": "AC2",
+        "line": 12,
+        "raw_command": "uv run --locked pytest .claude/skills/issue-refinement-loop/tests/test_reviewer_claim_replay.py -v",
+        "command_hash": "sha256:command-a",
+        "classification": "unexpected_pass",
+        "category": "unexpected_pass",
+        "decision": "blocked",
+        "scope_class": "baseline_fail_expected",
+        "confidence": "high",
+    }
+    if result_overrides:
+        result.update(result_overrides)
+
+    source = {"kind": "body_file", "body_sha256": body_sha256}
+    if source_overrides:
+        source.update(source_overrides)
+
+    return {
+        "schema": "baseline_vc_preflight/v1",
+        "source": source,
+        "status": status,
+        "results": [result],
+        "errors": [],
+    }
+
+
 def _finding(
     *,
     finding_kind: str,
@@ -561,10 +595,13 @@ def test_body_hash_change_resets_consecutive_count():
 
 
 def test_vc_preflight_category_backs_c4():
-    preflight = {
-        "schema": "baseline_vc_preflight/v1",
-        "results": [{"category": "compound_command_disallowed", "line_start": 10, "line_end": 10}],
-    }
+    preflight = _producer_vc_preflight_result(
+        result_overrides={
+            "line": 10,
+            "classification": "compound_command_disallowed",
+            "category": "compound_command_disallowed",
+        }
+    )
     result, _ = analyze(
         review_result=COMPACT_C4,
         readiness_result=READINESS_CLEAN,
@@ -593,10 +630,7 @@ def test_unexpected_pass_readiness_category_is_deterministic_backed():
 
 
 def test_unexpected_pass_vc_preflight_category_is_deterministic_backed():
-    preflight = {
-        "schema": "baseline_vc_preflight/v1",
-        "results": [{"category": "unexpected_pass", "line_start": 12, "line_end": 12}],
-    }
+    preflight = _producer_vc_preflight_result()
     result, _ = analyze(
         review_result=COMPACT_UNEXPECTED_PASS,
         readiness_result=READINESS_CLEAN,
@@ -610,6 +644,59 @@ def test_unexpected_pass_vc_preflight_category_is_deterministic_backed():
     assert blocker["normalized_kind"] == "unexpected_pass"
     assert blocker["evidence"][0]["source_check"] == "baseline_vc_preflight"
     assert blocker["evidence"][0]["category"] == "unexpected_pass"
+    assert blocker["evidence"][0]["classification"] == "unexpected_pass"
+    assert blocker["evidence"][0]["decision"] == "blocked"
+    assert blocker["evidence"][0]["line_start"] == 12
+    assert blocker["evidence"][0]["line_end"] == 12
+
+
+def test_unexpected_pass_vc_preflight_requires_matching_source_body_sha256():
+    preflight = _producer_vc_preflight_result(body_sha256="sha256:old")
+    result, _ = analyze(
+        review_result=COMPACT_UNEXPECTED_PASS,
+        readiness_result=READINESS_CLEAN,
+        vc_syntax_result=None,
+        vc_preflight_result=preflight,
+        previous_state={},
+    )
+    assert result["verdict"] == "input_or_runtime_error"
+    assert result["verdict_detail_v1"] == "input_or_runtime_error"
+    assert result["should_consume_iteration"] is False
+    assert result["reason_code"] == "vc_preflight_body_sha_mismatch"
+
+
+def test_unexpected_pass_vc_preflight_missing_source_body_sha256_is_input_error():
+    preflight = _producer_vc_preflight_result(source_overrides={"body_sha256": ""})
+    result, _ = analyze(
+        review_result=COMPACT_UNEXPECTED_PASS,
+        readiness_result=READINESS_CLEAN,
+        vc_syntax_result=None,
+        vc_preflight_result=preflight,
+        previous_state={},
+    )
+    assert result["verdict"] == "input_or_runtime_error"
+    assert result["verdict_detail_v1"] == "input_or_runtime_error"
+    assert result["should_consume_iteration"] is False
+    assert result["reason_code"] == "vc_preflight_body_sha_missing"
+
+
+def test_unexpected_pass_vc_preflight_category_only_spoof_is_unbacked():
+    preflight = _producer_vc_preflight_result(
+        result_overrides={
+            "classification": "expected_fail",
+            "decision": "go",
+        }
+    )
+    result, _ = analyze(
+        review_result=COMPACT_UNEXPECTED_PASS,
+        readiness_result=READINESS_CLEAN,
+        vc_syntax_result=None,
+        vc_preflight_result=preflight,
+        previous_state={},
+    )
+    assert result["verdict"] == "reviewer_claim_unbacked_by_deterministic_checker"
+    assert result["should_consume_iteration"] is False
+    assert result["blockers"][0]["evidence"] == []
 
 
 def test_checker_gap_does_not_suppress_fallback_evidence_search():
@@ -624,10 +711,13 @@ def test_checker_gap_does_not_suppress_fallback_evidence_search():
             )
         ],
     }
-    preflight = {
-        "schema": "baseline_vc_preflight/v1",
-        "results": [{"category": "compound_command_disallowed", "line_start": 10, "line_end": 10}],
-    }
+    preflight = _producer_vc_preflight_result(
+        result_overrides={
+            "line": 10,
+            "classification": "compound_command_disallowed",
+            "category": "compound_command_disallowed",
+        }
+    )
     result, _ = analyze(
         review_result=review,
         readiness_result=READINESS_CLEAN,
