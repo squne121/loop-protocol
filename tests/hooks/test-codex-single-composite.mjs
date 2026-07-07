@@ -8,10 +8,15 @@
  * - Stop / SubagentStop allow path: stdout is valid JSON {"continue": true/false}
  * - Stop / SubagentStop session recording failure: stdout is {"continue": true}
  * - PreToolUse allow path: stdout is empty or valid JSON with hookSpecificOutput
- * - PermissionRequest allow path: stdout is empty or valid JSON with hookSpecificOutput
+ * - PreToolUse block path: stdout is the OpenAI Codex Hooks PreToolUse deny schema
  *
- * These tests invoke the composite hook in-process via a test harness that
- * stubs stdin input and captures stdout.
+ * This script is a standalone manual smoke (Issue #1354). It is not spawned
+ * from pnpm test / tests/hooks/hooks-stdout-policy.test.ts; the cases above
+ * are covered there as direct Vitest assertions (AC2-AC8). Run this script
+ * manually during PR review to smoke-test the composite hook end to end.
+ *
+ * These tests spawn the composite hook as a child process, feed stdin, and
+ * capture stdout/stderr. They are manual-only and are not nested inside pnpm test.
  */
 
 /* global process */
@@ -24,6 +29,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const repoRoot = resolve(__dirname, '..', '..')
 const compositeHook = resolve(repoRoot, '.codex', 'hooks', 'session-recording-composite.mjs')
 const fixturesDir = resolve(repoRoot, 'tests', 'fixtures', 'hooks')
+
+// spawnSync timeout for the composite hook subprocess invoked below (Issue #1354).
+const COMPOSITE_HOOK_SPAWN_TIMEOUT_MS = 10000
 
 let passed = 0
 let failed = 0
@@ -48,7 +56,7 @@ function runHook(event, stdinContent) {
   const result = spawnSync(process.execPath, [compositeHook, '--event', event], {
     input: typeof stdinContent === 'string' ? stdinContent : JSON.stringify(stdinContent),
     encoding: 'utf8',
-    timeout: 10000,
+    timeout: COMPOSITE_HOOK_SPAWN_TIMEOUT_MS,
     env: {
       ...process.env,
       // Override producer script to a no-op for tests
@@ -151,7 +159,7 @@ process.stdout.write('\n[Suite] SubagentStop event — malformed payload (record
 
 // ---------------------------------------------------------------------------
 // Test suite: PreToolUse event — allow path (no violation)
-// Claude hook stdout policy: empty on allow path
+// Codex Hooks stdout policy: empty on allow path
 // ---------------------------------------------------------------------------
 process.stdout.write('\n[Suite] PreToolUse event — allow path\n')
 {
@@ -174,7 +182,7 @@ process.stdout.write('\n[Suite] PreToolUse event — allow path\n')
 
 // ---------------------------------------------------------------------------
 // Test suite: PreToolUse event — block path (forbidden path)
-// Claude hook stdout policy: event-specific JSON on block path
+// Codex Hooks stdout policy: event-specific JSON on block path
 // ---------------------------------------------------------------------------
 process.stdout.write('\n[Suite] PreToolUse event — block path (forbidden path)\n')
 {
@@ -200,6 +208,24 @@ process.stdout.write('\n[Suite] PreToolUse event — block path (forbidden path)
   assert(
     'deny decision is "deny"',
     r.parsedJson?.hookSpecificOutput?.permissionDecision === 'deny',
+    `parsedJson: ${JSON.stringify(r.parsedJson)}`,
+  )
+  assert(
+    'hookEventName is PreToolUse',
+    r.parsedJson?.hookSpecificOutput?.hookEventName === 'PreToolUse',
+    `parsedJson: ${JSON.stringify(r.parsedJson)}`,
+  )
+  assert(
+    'permissionDecisionReason is string',
+    typeof r.parsedJson?.hookSpecificOutput?.permissionDecisionReason === 'string',
+    `parsedJson: ${JSON.stringify(r.parsedJson)}`,
+  )
+  assert(
+    'stdout does not leak Stop common fields',
+    r.parsedJson !== null &&
+      !Object.prototype.hasOwnProperty.call(r.parsedJson, 'continue') &&
+      !Object.prototype.hasOwnProperty.call(r.parsedJson, 'stopReason') &&
+      !Object.prototype.hasOwnProperty.call(r.parsedJson, 'suppressOutput'),
     `parsedJson: ${JSON.stringify(r.parsedJson)}`,
   )
 }
