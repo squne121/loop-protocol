@@ -1,5 +1,5 @@
 ---
-title: Schema Governance
+title: Schema Governance  # スキーマ変更のガバナンスルール定義
 status: active
 related_issue: "#135"
 ---
@@ -116,7 +116,7 @@ notes:
   - "token_usage.availability: unavailable を 0 と偽装しないこと（docs/schemas/agent-session-manifest.md 参照）"
 ```
 
-## #934 public-surface boundary cleanup note
+## #934 public-surface boundary cleanup note（公開境界クリーンアップ注記）
 
 - #934 は public-surface boundary cleanup であり、`agent_session_manifest/v1` の live public posting を拡張する issue ではない。
 - #934 で固定する consumer-facing contract は「manifest 本文は Issue / PR comment に出さない」「公開コメントでは opaque ref のみ許可」「`agent_run_report/v1` / `agent_retro_index/v1` は #935 schema/redaction validator と #937 exact marker upsert guard が揃うまで dry-run only / not live public posting」という境界である。
@@ -132,7 +132,7 @@ PR が schema を変更するか否かを判定する基準:
 | `not_schema_change` | Allowed Paths 内の変更がすべて内部ロジック・コメント・説明文のみで、consumer 境界をまたぐ contract に変更がない |
 | `uncertain` | PR diff を見ただけでは consumer 境界への影響が判断できない場合。fail-closed として schema_change 相当の検査を適用する |
 
-## Schema Consumer Inventory 義務
+## Schema Consumer Inventory の記載義務
 
 schema を変更する PR（`schema_change` または `uncertain`）では、以下の **Schema Consumer Inventory** を PR 本文に必ず記載しなければならない。
 
