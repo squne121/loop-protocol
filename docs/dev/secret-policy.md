@@ -713,5 +713,6 @@ fail-closed とし、実装を停止する。
 ## 関連文書
 
 - `docs/dev/session-recording-policy.md` — session 記録 Kill Switch policy (#242)
+- `docs/adr/0005-cloud-pilot-success-result-artifact-placement.md` — cloud_pilot_success_result/v1 の artifact placement 決定。raw_trace_body_publication_forbidden_fields はこの ADR を正本とする（#1330）
 - `CLAUDE.md` — プロジェクト入口
 - `.claude/rules/project-constitution.md` — 運用ルールの正本

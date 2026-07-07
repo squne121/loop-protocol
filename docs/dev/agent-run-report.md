@@ -227,6 +227,8 @@ public surface では `observation_sources` が runtime で要求される。
 
 `real_pilot_verified` は observation source の生成や検証出力では禁止とする。`provenance.evidence_mode` は #1220 承認前は `synthetic_only` 固定で、runtime validator / retro builder の両方が fail closed で拒否する。
 
+`agent_run_report/v1` への Cloud pilot 統合は opaque reference のみ（`github_comment` / `observation_projection_digest`）、inline result body / inline metrics は禁止とする。`cloud_pilot_success_result/v1` の正本配置・placement 決定の詳細は `docs/adr/0005-cloud-pilot-success-result-artifact-placement.md`（#1330）を参照する。
+
 ### Remaining Parent Gaps / Out of Scope（今回の成功条件に含めない項目）
 
 以下は current repo reality では **#1245 の成功条件に含めない**。
