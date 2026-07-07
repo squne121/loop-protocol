@@ -319,6 +319,10 @@ _PREFLIGHT_CATEGORY_TO_READINESS: dict[str, str] = {
     # Issue #899: strict-mode annotation violations are body-author-fixable
     "inline_baseline_expect_invalid_placement": "needs_fix",
     "missing_baseline_expect_for_new_allowed_path": "needs_fix",
+    # PR #1366 review (Blocker 1) / Issue #1347: existing-file missing node-id is a
+    # non-canonical VC shape that the Issue body author can fix by rewriting the VC
+    # to reference a not-yet-created test file instead → needs_fix (not human_judgment).
+    "existing_file_missing_node_id_noncanonical": "needs_fix",
 }
 
 

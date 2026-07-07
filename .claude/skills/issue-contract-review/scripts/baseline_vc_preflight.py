@@ -567,6 +567,53 @@ def _is_pytest_invocation(command: str) -> bool:
     return False
 
 
+_MISSING_NODE_ID_ERROR_RE = re.compile(
+    r"error:\s+not found:\s+(?P<nodeid>\S+::\S+)",
+    re.IGNORECASE,
+)
+_NO_MATCH_IN_MODULE_RE = re.compile(
+    r"no match in any of"
+)
+
+
+def _is_existing_file_missing_node_id_error(
+    stdout: str, stderr: str, cwd: Optional[str] = None
+) -> bool:
+    """Issue #1347: detect pytest's "existing file, missing node-id" error shape.
+
+    Distinguishes the case where a pytest node-id references a file that DOES
+    exist on disk but a test function (or class::function) within it that does
+    NOT exist, e.g.:
+        ERROR: not found: /path/existing_file.py::test_new_case
+        (no match in any of [<Module existing_file.py>])
+    from the genuinely-missing-file case, whose pytest error is instead:
+        ERROR: file or directory not found: missing_file.py
+    Callers must ensure this is only invoked in a context where the FILE part
+    is already known to exist (e.g. after _is_regression_gate_command()
+    returned True); this helper additionally re-validates that the file part
+    of the node-id actually exists on disk (case-insensitively matching the
+    "not found" error text and requiring the "no match in any of" companion
+    text), so it does not rely solely on the caller's prior check.
+
+    PR #1366 review (Major 3): the error-message match is now case-insensitive
+    and requires BOTH the missing-node-id error text AND the "no match in any
+    of" companion text (AND, not OR) before re-deriving file existence from
+    the node-id's file part, resolved against `cwd`.
+    """
+    combined = f"{stdout}\n{stderr}"
+    match = _MISSING_NODE_ID_ERROR_RE.search(combined)
+    if not match:
+        return False
+    if not _NO_MATCH_IN_MODULE_RE.search(combined):
+        return False
+
+    file_part = match.group("nodeid").split("::", 1)[0]
+    p = Path(file_part)
+    if not p.is_absolute():
+        p = Path(cwd or Path.cwd()) / p
+    return p.exists()
+
+
 def _is_regression_gate_command(command: str, cwd: Optional[str] = None) -> bool:
     """
     AC4: regression_gate prefix detection.
@@ -647,12 +694,20 @@ def _is_regression_gate_command(command: str, cwd: Optional[str] = None) -> bool
         i += 1
 
     # B2: Check if any positional argument exists and is a valid path
+    # Issue #1347: pytest positional args may be node-ids of the form
+    # <file>::<test_name> (or <file>::<Class>::<test_name>). The node-id
+    # suffix after "::" is never itself a filesystem path, so it must be
+    # stripped before the existence check; otherwise a command referencing a
+    # NEW test function on an EXISTING file (e.g. existing_file.py::test_new)
+    # is incorrectly treated as "path does not exist" even though the file
+    # portion is real.
     for arg in positional_args:
+        file_part = arg.split("::", 1)[0]
         # Handle both relative and absolute paths
-        if Path(arg).is_absolute():
-            test_path = Path(arg)
+        if Path(file_part).is_absolute():
+            test_path = Path(file_part)
         else:
-            test_path = Path(cwd) / arg
+            test_path = Path(cwd) / file_part
         if test_path.exists():
             return True
 
@@ -2276,7 +2331,7 @@ def classify_result(
                 env_missing_dep | file_not_found_unrunnable | timeout |
                 compound_command_disallowed | unsupported_shell_syntax |
                 unsafe_command | command_not_allowed | unknown | regression_gate |
-                new_file_missing_expected
+                new_file_missing_expected | existing_file_missing_node_id_noncanonical
       decision: go | blocked | human_judgment
       fix_hint: nullable hint
       scope_class: baseline_fail_expected | regression_gate | pr_review_only | runtime_only
@@ -2341,6 +2396,31 @@ def classify_result(
                 # pytest exit 4 + file not found → expected_baseline_fail (env/path missing)
                 if exit_code == 4 and re.search(r"error:\s+file or directory not found:", combined_lower):
                     return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
+
+                # Issue #1347: pytest exit 4 where the referenced FILE exists
+                # (this branch is only reached when _is_regression_gate_command()
+                # already confirmed the file portion exists) but the node-id
+                # (test function) does not, e.g.:
+                #   ERROR: not found: <path>/existing_file.py::test_new_case
+                #   (no match in any of [<Module existing_file.py>])
+                # This is a non-canonical VC shape (Issue #1285 / PR #1305:
+                # existing-file missing node-id is forbidden; the canonical
+                # form is a missing-file node-id). It must NOT be classified
+                # as expected_baseline_fail/go, and must be distinguishable
+                # from the generic `unknown` / `human_judgment` fallback so
+                # diagnostics can identify this specific shape.
+                if exit_code == 4 and _is_existing_file_missing_node_id_error(stdout, stderr, cwd=cwd):
+                    return (
+                        "blocked",
+                        "existing_file_missing_node_id_noncanonical",
+                        "blocked",
+                        "This pytest VC references a NEW test function on an EXISTING "
+                        "file (<file>::<new_test_name>), which is a non-canonical VC "
+                        "shape (Issue #1285 / PR #1305). Rewrite the VC to reference a "
+                        "not-yet-created test file (missing_new_test_file.py::test_name) "
+                        "instead of adding a new test function to an existing file.",
+                        "baseline_fail_expected",
+                    )
 
                 # B5: pytest exit 5 → vc_no_tests_collected / blocked
                 # exit 5 is "no tests collected" — -k condition mismatch or wrong path
