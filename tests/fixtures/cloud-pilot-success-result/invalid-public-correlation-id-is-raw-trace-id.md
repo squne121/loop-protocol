@@ -1,5 +1,6 @@
-# cloud_pilot_success_result/v1 fixture
+# cloud_pilot_success_result/v1 フィクスチャ（負例）
 
+この fixture は public_correlation_id に生の trace_id がそのまま使われた不正を検証するための負例であり、checker が拒否することを確認するためのものである。以下のマーカー行はチェッカーが参照する契約でありバイト単位で変更しない。
 <!-- CLOUD_PILOT_SUCCESS_RESULT_V1 repo=squne121/loop-protocol target=issue:1153 parent_issue=1153 result_id=cloud-pilot-success-result-fixture-only-baseline -->
 
 ```json
@@ -57,4 +58,5 @@
 }
 ```
 
+この digest 値は fixture の内容から算出された既存の値であり、意図的な不正フィールドを含んだまま保持している。
 <!-- CLOUD_PILOT_SUCCESS_RESULT_DIGEST_V1 sha256=e0f69340ef8249991126a13ddce1f92942013cb2f8a90aa01fa46f040264e497 -->

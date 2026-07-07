@@ -1,5 +1,6 @@
-# cloud_pilot_success_result/v1 fixture
+# cloud_pilot_success_result/v1 フィクスチャ（負例）
 
+この fixture は cloud_pilot_success_result/v1 の digest 正規化（canonicalization）の不整合を検証するための負例であり、checker が拒否することを確認するためのものである。以下のマーカー行はチェッカーが参照する契約でありバイト単位で変更しない。
 <!-- CLOUD_PILOT_SUCCESS_RESULT_V1 repo=squne121/loop-protocol target=issue:1153 parent_issue=1153 result_id=cloud-pilot-success-result-fixture-only-baseline -->
 
 ```json
@@ -56,4 +57,5 @@
 }
 ```
 
+この digest 値は fixture の内容から算出された既存の値であり、意図的な不正フィールドを含んだまま保持している。
 <!-- CLOUD_PILOT_SUCCESS_RESULT_DIGEST_V1 sha256=a9b223f9ab67341716277765f81574b3d8d43bc0975a77f41cdae9a2dd6a1f24 -->

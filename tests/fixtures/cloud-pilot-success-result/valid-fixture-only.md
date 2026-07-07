@@ -1,5 +1,6 @@
-# cloud_pilot_success_result/v1 fixture
+# cloud_pilot_success_result/v1 フィクスチャ（正例）
 
+この fixture は cloud_pilot_success_result/v1 の最小構成の正例であり、checker が受理することを確認するためのものである。以下のマーカー行はチェッカーが参照する契約でありバイト単位で変更しない。
 <!-- CLOUD_PILOT_SUCCESS_RESULT_V1 repo=squne121/loop-protocol target=issue:1153 parent_issue=1153 result_id=cloud-pilot-success-result-fixture-only-baseline -->
 
 ```json
@@ -56,4 +57,5 @@
 }
 ```
 
+この digest 値は fixture の内容から正しく算出された値である。
 <!-- CLOUD_PILOT_SUCCESS_RESULT_DIGEST_V1 sha256=cd113fc84136f937c4ecb9d0386bc94746a2fac1b96896b38283b62d24e9a671 -->

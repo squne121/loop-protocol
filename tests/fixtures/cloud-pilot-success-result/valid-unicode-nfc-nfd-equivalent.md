@@ -1,5 +1,6 @@
-# cloud_pilot_success_result/v1 fixture
+# cloud_pilot_success_result/v1 フィクスチャ（正例）
 
+この fixture は Unicode NFC/NFD 表現の違いが正規化により同一 digest として受理される正例である。以下のマーカー行はチェッカーが参照する契約でありバイト単位で変更しない。
 <!-- CLOUD_PILOT_SUCCESS_RESULT_V1 repo=squne121/loop-protocol target=issue:1153 parent_issue=1153 result_id=cloud-pilot-success-result-fixture-only-baseline -->
 
 ```json
@@ -59,4 +60,5 @@
 }
 ```
 
+この digest 値は fixture の内容から正しく算出された値である。
 <!-- CLOUD_PILOT_SUCCESS_RESULT_DIGEST_V1 sha256=99ebcdb7a2effdf4e04388be2445f0e1dd20bd519a9ce82e77cb4f20b6f65c0b -->
