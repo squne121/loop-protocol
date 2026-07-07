@@ -90,7 +90,7 @@
           "required": ["issue", "state", "verdict", "evidence_digest"],
           "additionalProperties": false,
           "properties": {
-            "issue": { "type": "string", "pattern": "^#[1-9][0-9]*$" },
+            "issue": { "type": "string", "const": "#246" },
             "state": { "enum": ["completed", "open", "unknown", "synthetic"] },
             "verdict": { "enum": ["pass", "fail", "unknown"] },
             "evidence_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
@@ -101,7 +101,7 @@
           "required": ["issue", "state", "decision", "decision_digest"],
           "additionalProperties": false,
           "properties": {
-            "issue": { "type": "string", "pattern": "^#[1-9][0-9]*$" },
+            "issue": { "type": "string", "const": "#1220" },
             "state": { "enum": ["completed", "open", "unknown", "synthetic"] },
             "decision": { "enum": ["approve_timeboxed_real_pilot", "deny", "pending"] },
             "decision_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
@@ -112,7 +112,7 @@
           "required": ["issue", "state", "argv_exposure_state", "remote_cleanup_state"],
           "additionalProperties": false,
           "properties": {
-            "issue": { "type": "string", "pattern": "^#[1-9][0-9]*$" },
+            "issue": { "type": "string", "const": "#1261" },
             "state": { "enum": ["completed", "open", "unknown", "synthetic"] },
             "argv_exposure_state": { "enum": ["absent_verified", "present", "unknown"] },
             "remote_cleanup_state": { "enum": ["machine_verified", "unverified", "unknown"] }
@@ -123,7 +123,7 @@
           "required": ["issue", "state", "checker_result", "presented_as_real_target"],
           "additionalProperties": false,
           "properties": {
-            "issue": { "type": "string", "pattern": "^#[1-9][0-9]*$" },
+            "issue": { "type": "string", "const": "#1326" },
             "state": { "enum": ["completed", "open", "unknown", "synthetic"] },
             "checker_result": { "enum": ["pass", "fail", "unknown"] },
             "presented_as_real_target": { "type": "boolean" }
@@ -155,20 +155,26 @@
     },
     "generated_at": {
       "type": "string",
-      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
     },
     "public_correlation_id": {
-      "type": "string"
+      "type": "string",
+      "pattern": "^cpsr-pub-[0-9a-f]{16}$"
     },
     "diagnostic_context": {
-      "type": "object"
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {}
     },
     "upsert_probe": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "existing_comment_match_count": {},
-        "digest_freshness": { "enum": ["current", "stale"] }
+        "existing_comment_match_count": { "type": "integer", "minimum": 0 },
+        "digest_freshness": { "enum": ["current", "stale"] },
+        "page_budget_exhausted": { "type": "boolean" },
+        "matched_author_allowed": { "type": "boolean" },
+        "match_fields_verified": { "type": "boolean" }
       }
     }
   },

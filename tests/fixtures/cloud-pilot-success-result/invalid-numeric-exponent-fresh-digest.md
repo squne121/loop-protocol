@@ -1,6 +1,6 @@
-# cloud_pilot_success_result/v1 フィクスチャ（正例）
+# cloud_pilot_success_result/v1 フィクスチャ（負例）
 
-この fixture は Unicode NFC/NFD 表現の違いが正規化により同一 digest として受理される正例である。以下のマーカー行はチェッカーが参照する契約でありバイト単位で変更しない。
+この fixture は metrics.duration_seconds を指数表記(1.5e2)で記述した負例であり、JSON.parse による正規化後の digest が一致(fresh)していても raw JSON text の指数表記自体を checker が拒否することを確認するためのものである（OWNER Blocker 4, fix_delta iteration 2）。以下のマーカー行はチェッカーが参照する契約でありバイト単位で変更しない。
 <!-- CLOUD_PILOT_SUCCESS_RESULT_V1 repo=squne121/loop-protocol target=issue:1153 parent_issue=1153 result_id=cloud-pilot-success-result-fixture-only-baseline -->
 
 ```json
@@ -45,17 +45,17 @@
     }
   },
   "metrics": {
-    "duration_seconds": 120,
+    "duration_seconds": 1.5e2,
     "cost_usd": 0.42
   },
   "safety": {
     "redaction_status": "clean",
     "verdict": "pass",
-    "blocked_reasons": ["café verified"]
+    "blocked_reasons": []
   },
   "generated_at": "2026-07-06T12:00:00Z"
 }
 ```
 
-この digest 値は fixture の内容から正しく算出された値である（diagnostic_context は fix_delta iteration 2 で closed object 化されたため、unicode 検証対象を safety.blocked_reasons に移動した）。
-<!-- CLOUD_PILOT_SUCCESS_RESULT_DIGEST_V1 sha256=31be3dad07f2fb0cbc0825c5e120117b22f62f8f1f5e6aff93cb08605a44719a -->
+この digest 値は JSON.parse により 1.5e2 が 150 へ正規化された後の canonical 表現から正しく再計算された fresh digest である。raw JSON text の指数表記(1.5e2)自体を独立した scanner で検知して拒否することが本 fixture の意図である。
+<!-- CLOUD_PILOT_SUCCESS_RESULT_DIGEST_V1 sha256=21e676c08a4f007122518ea97a2ccc419c1daaafc37de8436b45d1a0027449a0 -->

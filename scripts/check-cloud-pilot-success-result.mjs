@@ -47,6 +47,10 @@ const SCHEMA_FILE = resolve(REPO_ROOT, 'docs/schemas/cloud-pilot-success-result.
 const OUTER_MARKER_NAME = 'CLOUD_PILOT_SUCCESS_RESULT_V1'
 const DIGEST_MARKER_NAME = 'CLOUD_PILOT_SUCCESS_RESULT_DIGEST_V1'
 
+// OWNER Blocker 3 (fix_delta iteration 2): outer marker repo must be bound to
+// this fixed repository identity, not merely pattern-shaped.
+const EXPECTED_MARKER_REPO = 'squne121/loop-protocol'
+
 const OUTER_MARKER_RE = new RegExp(
   `<!--\\s*${OUTER_MARKER_NAME}\\s+repo=(\\S+)\\s+target=(\\S+)\\s+parent_issue=(\\S+)\\s+result_id=(\\S+)\\s*-->`,
 )
@@ -133,6 +137,13 @@ function classifySchemaError(error) {
   }
   if (error.keyword === 'additionalProperties' || error.keyword === 'unevaluatedProperties') {
     return 'schema.unevaluated_property'
+  }
+  if (
+    error.keyword === 'const'
+    && typeof error.instancePath === 'string'
+    && error.instancePath.startsWith('/gate_refs/')
+  ) {
+    return 'gate_ref.identity_mismatch'
   }
   if (typeof error.instancePath === 'string' && error.instancePath.startsWith('/target')) {
     return 'target.marker_mismatch'
@@ -269,6 +280,23 @@ export function scanCloudPilotSuccessResultForbiddenFields(payload) {
   return { valid: errors.length === 0, errors }
 }
 
+// ── adoption-readiness signal (OWNER Blocker 1, fix_delta iteration 2) ──────
+// Any of these signals means the payload is claiming (or bypassing toward)
+// real adoption-ready status, regardless of evidence_mode/decision_ready
+// combination used to reach it. This is intentionally an inclusive OR so a
+// payload cannot escape the strict gate_refs.success_contract_checker
+// requirement by only flipping one of the fields.
+function isAdoptionReadySignal(payload) {
+  const scc = payload?.gate_refs?.success_contract_checker
+  return (
+    payload?.decision_ready === true
+    || payload?.evidence_mode === 'real_pilot_verified'
+    || payload?.decision === 'adopt_cloud'
+    || payload?.cloud_adoption_allowed_now === true
+    || scc?.presented_as_real_target === true
+  )
+}
+
 // ── gate_refs field-level evidence checks (OWNER Blocker 1 / issue AC6/AC12) ─
 function checkGateRefs(payload) {
   const errors = []
@@ -313,14 +341,38 @@ function checkGateRefs(payload) {
     }
   }
 
+  // OWNER Blocker 1: success_contract_checker completion is required whenever
+  // ANY adoption-ready signal is present, not only when
+  // presented_as_real_target is explicitly true. This closes the
+  // decision_ready:true bypass documented in fix_delta iteration 2.
   const scc = gateRefs.success_contract_checker
-  if (scc && scc.presented_as_real_target === true) {
-    if (scc.state !== 'completed' || scc.checker_result !== 'pass') {
+  if (isAdoptionReadySignal(payload)) {
+    const sccReady = !!scc && scc.issue === '#1326' && scc.state === 'completed' && scc.checker_result === 'pass'
+    if (!sccReady) {
       errors.push({
         path: 'gate_refs.success_contract_checker',
         code: 'gate_ref.not_completed',
-        message: 'success_contract_checker (#1326) gate_ref presented as a real target requires state="completed" and checker_result="pass"',
+        message: 'adoption-ready payload (decision_ready/real_pilot_verified/adopt_cloud/cloud_adoption_allowed_now/presented_as_real_target) requires success_contract_checker (#1326) state="completed" and checker_result="pass"',
       })
+    }
+
+    // All four gates must be in a completed state once an adoption-ready
+    // signal is present (not only success_contract_checker).
+    const requiredGateNames = [
+      'session_recording_smoke',
+      'latitude_real_pilot_decision',
+      'latitude_distribution_gate',
+      'success_contract_checker',
+    ]
+    for (const gateName of requiredGateNames) {
+      const gate = gateRefs[gateName]
+      if (!gate || gate.state !== 'completed') {
+        errors.push({
+          path: `gate_refs.${gateName}.state`,
+          code: 'gate_ref.not_completed',
+          message: `adoption-ready payload requires gate_refs.${gateName}.state = "completed"`,
+        })
+      }
     }
   }
 
@@ -330,6 +382,36 @@ function checkGateRefs(payload) {
 // ── evidence_mode / adoption-readiness guard (OWNER Blocker 1 / AC11) ───────
 function checkEvidenceMode(payload) {
   const errors = []
+  const evidenceMode = payload?.evidence_mode
+
+  if (evidenceMode === 'fixture_only') {
+    // fixture_only is semantically pending: it must never present itself as
+    // adoption-ready, regardless of decision_ready/decision/cloud_adoption_allowed_now
+    // values an untrusted payload author may inject.
+    if (payload?.decision_ready !== false) {
+      errors.push({
+        path: 'decision_ready',
+        code: 'evidence_mode.violation',
+        message: 'evidence_mode = "fixture_only" requires decision_ready = false (adoption-ready bypass forbidden)',
+      })
+    }
+    if (payload?.decision !== 'pending_fixture_only') {
+      errors.push({
+        path: 'decision',
+        code: 'evidence_mode.violation',
+        message: 'evidence_mode = "fixture_only" requires decision = "pending_fixture_only"',
+      })
+    }
+    if (payload?.cloud_adoption_allowed_now === true) {
+      errors.push({
+        path: 'cloud_adoption_allowed_now',
+        code: 'evidence_mode.violation',
+        message: 'evidence_mode = "fixture_only" forbids cloud_adoption_allowed_now = true',
+      })
+    }
+    return errors
+  }
+
   if (payload?.decision_ready !== true) {
     if (payload?.decision === 'adopt_cloud') {
       errors.push({
@@ -370,6 +452,83 @@ function checkTargetKindMismatch(payload, markerTarget) {
   return errors
 }
 
+// ── outer marker <-> payload binding (OWNER Blocker 3, fix_delta iteration 2) ─
+// Verifies that the outer <!-- CLOUD_PILOT_SUCCESS_RESULT_V1 --> marker
+// attributes (repo/target/parent_issue/result_id) are fully bound to the
+// payload fields they are supposed to describe, and that payload.target's
+// own kind/number and marker_value are mutually consistent. This runs as a
+// semantic check prior to digest recomputation.
+function checkMarkerBinding(payload, marker) {
+  const errors = []
+  if (!marker) {
+    return errors
+  }
+  const { markerRepo, markerTarget, markerParentIssue, markerResultId } = marker
+
+  if (markerRepo !== EXPECTED_MARKER_REPO) {
+    errors.push({
+      path: 'markdown.outer_marker',
+      code: 'marker.binding_mismatch',
+      message: `outer marker repo=${markerRepo} does not match expected repo=${EXPECTED_MARKER_REPO}`,
+    })
+  }
+
+  const expectedParentIssue = `#${markerParentIssue}`
+  if (payload?.parent_issue !== expectedParentIssue) {
+    errors.push({
+      path: 'parent_issue',
+      code: 'marker.binding_mismatch',
+      message: `outer marker parent_issue=${markerParentIssue} does not match payload.parent_issue=${payload?.parent_issue}`,
+    })
+  }
+
+  if (payload?.result_id !== markerResultId) {
+    errors.push({
+      path: 'result_id',
+      code: 'marker.binding_mismatch',
+      message: `outer marker result_id=${markerResultId} does not match payload.result_id=${payload?.result_id}`,
+    })
+  }
+
+  if (payload?.target && payload.target.marker_value !== markerTarget) {
+    errors.push({
+      path: 'target.marker_value',
+      code: 'marker.binding_mismatch',
+      message: `outer marker target=${markerTarget} does not match payload.target.marker_value=${payload?.target?.marker_value}`,
+    })
+  }
+
+  if (payload?.target && typeof payload.target.kind === 'string' && payload.target.number !== undefined) {
+    const expectedMarkerValue = `${payload.target.kind}:${payload.target.number}`
+    if (payload.target.marker_value !== expectedMarkerValue) {
+      errors.push({
+        path: 'target.marker_value',
+        code: 'target.marker_value_mismatch',
+        message: `payload.target.marker_value=${payload.target.marker_value} does not match payload.target.kind:number=${expectedMarkerValue}`,
+      })
+    }
+  }
+
+  return errors
+}
+
+// ── canonicalization: raw numeric-token exponent scanner (OWNER Blocker 4) ──
+// JSON.parse() silently normalizes exponent notation (1.5e2 -> 150) before
+// the digest is recomputed, so a payload authored with exponent notation can
+// produce a digest that matches a "fresh" recomputation even though the
+// canonicalization profile forbids exponent tokens. This scans the RAW JSON
+// text (before JSON.parse) for exponent-notation number tokens, ignoring
+// string literal contents.
+const NUMBER_EXPONENT_TOKEN_RE = /-?\d+(?:\.\d+)?[eE][+-]?\d+/
+
+function stripJsonStringLiterals(jsonText) {
+  return jsonText.replace(/"(?:[^"\\]|\\.)*"/g, (match) => 'x'.repeat(match.length))
+}
+
+function scanNumericExponentTokens(jsonText) {
+  return NUMBER_EXPONENT_TOKEN_RE.test(stripJsonStringLiterals(jsonText))
+}
+
 // ── upsert_probe declarative simulation (OWNER Blocker 6 / AC18) ───────────
 // Real GitHub comment list/upsert is Out of Scope for this Issue (see
 // docs/adr/0005-...md github_comment_upsert_policy). Because the checker only
@@ -384,17 +543,53 @@ function checkUpsertProbe(payload) {
   if (!probe || typeof probe !== 'object') {
     return errors
   }
-  if (
-    Object.prototype.hasOwnProperty.call(probe, 'existing_comment_match_count')
-    && probe.existing_comment_match_count !== 0
-    && probe.existing_comment_match_count !== 1
-  ) {
+  const has = (key) => Object.prototype.hasOwnProperty.call(probe, key)
+
+  if (has('existing_comment_match_count') && probe.existing_comment_match_count > 1) {
     errors.push({
       path: 'upsert_probe.existing_comment_match_count',
       code: 'marker.duplicate_comment',
-      message: 'github_comment_upsert_policy requires zero_matches=create or one_match=update; multiple_matches is fail_closed',
+      message: 'github_comment_upsert_policy requires zero_matches=create or one_match=update; multiple_matches (>1) is fail_closed',
     })
   }
+
+  // OWNER Blocker 5 (fix_delta iteration 2): digest_freshness = "stale" is
+  // fail_closed even when the recomputed digest happens to equal the stored
+  // digest byte-for-byte, because "stale" asserts the upstream GitHub comment
+  // list observation is out of date and cannot be trusted regardless of the
+  // local digest comparison outcome.
+  if (has('digest_freshness') && probe.digest_freshness !== 'current') {
+    errors.push({
+      path: 'upsert_probe.digest_freshness',
+      code: 'digest.stale',
+      message: 'github_comment_upsert_policy requires digest_freshness = "current"; stale freshness is fail_closed regardless of digest comparison',
+    })
+  }
+
+  if (has('page_budget_exhausted') && probe.page_budget_exhausted === true) {
+    errors.push({
+      path: 'upsert_probe.page_budget_exhausted',
+      code: 'upsert_probe.page_budget_exhausted',
+      message: 'github_comment_upsert_policy requires page_budget_exhausted = false; exhausted pagination cannot be trusted to have observed all existing comments',
+    })
+  }
+
+  if (has('matched_author_allowed') && probe.matched_author_allowed !== true) {
+    errors.push({
+      path: 'upsert_probe.matched_author_allowed',
+      code: 'upsert_probe.author_not_allowed',
+      message: 'github_comment_upsert_policy requires matched_author_allowed = true for update targets',
+    })
+  }
+
+  if (has('match_fields_verified') && probe.match_fields_verified !== true) {
+    errors.push({
+      path: 'upsert_probe.match_fields_verified',
+      code: 'upsert_probe.fields_unverified',
+      message: 'github_comment_upsert_policy requires match_fields_verified = true before treating a comment as the canonical match',
+    })
+  }
+
   return errors
 }
 
@@ -508,6 +703,7 @@ export function extractCloudPilotSuccessResultCandidate(markdown) {
   return {
     ok: true,
     payload,
+    jsonText,
     markerRepo: outerMatch[1],
     markerTarget: outerMatch[2],
     markerParentIssue: outerMatch[3],
@@ -523,17 +719,26 @@ export function validateCloudPilotSuccessResultMarkdown(markdown) {
     return { valid: false, errors: [extraction.error] }
   }
 
-  const { payload, markerTarget, digest } = extraction
+  const { payload, jsonText, markerRepo, markerTarget, markerParentIssue, markerResultId, digest } = extraction
   const errors = []
 
   const schemaResult = validatePayloadAgainstSchema(payload)
   errors.push(...schemaResult.errors)
 
   errors.push(...checkTargetKindMismatch(payload, markerTarget))
+  errors.push(...checkMarkerBinding(payload, { markerRepo, markerTarget, markerParentIssue, markerResultId }))
   errors.push(...checkGateRefs(payload))
   errors.push(...checkEvidenceMode(payload))
   errors.push(...checkUpsertProbe(payload))
   errors.push(...scanForbiddenFields(payload))
+
+  if (scanNumericExponentTokens(jsonText)) {
+    errors.push({
+      path: 'markdown.json',
+      code: 'digest.canonicalization_violation',
+      message: 'numeric literal uses exponent notation (e/E); the canonicalization profile forbids exponent number tokens even when the recomputed digest matches',
+    })
+  }
 
   const recomputedDigest = computeCloudPilotSuccessResultDigest(payload)
   const storedDigest = `sha256:${digest}`
@@ -581,17 +786,25 @@ function getDefaultCheckPatterns() {
 }
 
 async function main() {
-  const explicitTargets = process.argv.slice(2)
+  const rawArgs = process.argv.slice(2)
+  // OWNER Blocker 7 (fix_delta iteration 2): the default no-file path used to
+  // be fail-open (exit 0, "skipped") whenever CI!=='true'. That silently
+  // passes if the fixtures directory disappears, a glob breaks, or cwd/ref
+  // drifts. The checker is now fail-closed by default; --allow-empty is an
+  // explicit opt-in that the standard `pnpm run cloud-pilot-success-result:check`
+  // invocation does NOT use.
+  const allowEmpty = rawArgs.includes('--allow-empty')
+  const explicitTargets = rawArgs.filter((arg) => arg !== '--allow-empty')
   const patterns = explicitTargets.length > 0 ? explicitTargets : getDefaultCheckPatterns()
   const files = await expandPatterns(patterns)
 
   if (files.length === 0) {
-    if (explicitTargets.length > 0 || process.env.CI === 'true') {
-      console.error('cloud-pilot-success-result:check: no files found')
-      process.exit(1)
+    if (allowEmpty) {
+      console.log('cloud-pilot-success-result:check: no files found (--allow-empty) - skipped')
+      process.exit(0)
     }
-    console.log('cloud-pilot-success-result:check: no files found (default targets) - skipped')
-    process.exit(0)
+    console.error('cloud-pilot-success-result:check: no files found')
+    process.exit(1)
   }
 
   const outsideRepoFile = files.find((file) => !isWithinRepo(file))

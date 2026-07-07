@@ -71,6 +71,18 @@ const invalidFixtureTable: Array<{ fixture: string; code: string }> = [
   { fixture: 'invalid-raw-trace-id-in-string.md', code: 'trace_id.raw_forbidden' },
   { fixture: 'invalid-all-zero-trace-id.md', code: 'trace_id.raw_forbidden' },
   { fixture: 'invalid-public-correlation-id-is-raw-trace-id.md', code: 'trace_id.raw_forbidden' },
+  // fix_delta iteration 2 (OWNER Blockers 1-8): adversarial mutation fixtures,
+  // each computed with a genuinely fresh digest so a mismatched/stale digest
+  // is never the reason the fixture fails.
+  { fixture: 'invalid-fixture-only-adoption-ready-bypass.md', code: 'evidence_mode.violation' },
+  { fixture: 'invalid-gate-identity-drift.md', code: 'gate_ref.identity_mismatch' },
+  { fixture: 'invalid-outer-parent-issue-mismatch.md', code: 'marker.binding_mismatch' },
+  { fixture: 'invalid-outer-result-id-mismatch.md', code: 'marker.binding_mismatch' },
+  { fixture: 'invalid-target-marker-value-kind-mismatch.md', code: 'target.marker_value_mismatch' },
+  { fixture: 'invalid-upsert-probe-stale-freshness-fresh-digest.md', code: 'digest.stale' },
+  { fixture: 'invalid-generated-at-utc-offset.md', code: 'schema.invalid' },
+  { fixture: 'invalid-numeric-exponent-fresh-digest.md', code: 'digest.canonicalization_violation' },
+  { fixture: 'invalid-diagnostic-context-unknown-field.md', code: 'schema.unevaluated_property' },
 ]
 
 describe('cloud_pilot_success_result/v1 checker: negative fixtures (AC5-AC9, AC12-AC13, AC15-AC19, AC20)', () => {

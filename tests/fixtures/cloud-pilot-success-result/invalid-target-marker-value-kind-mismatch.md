@@ -1,6 +1,6 @@
-# cloud_pilot_success_result/v1 フィクスチャ（正例）
+# cloud_pilot_success_result/v1 フィクスチャ（負例）
 
-この fixture は Unicode NFC/NFD 表現の違いが正規化により同一 digest として受理される正例である。以下のマーカー行はチェッカーが参照する契約でありバイト単位で変更しない。
+この fixture は payload.target.marker_value が payload.target.kind:number 自体と食い違う負例であり、checker が拒否することを確認するためのものである（OWNER Blocker 3, fix_delta iteration 2）。以下のマーカー行はチェッカーが参照する契約でありバイト単位で変更しない。
 <!-- CLOUD_PILOT_SUCCESS_RESULT_V1 repo=squne121/loop-protocol target=issue:1153 parent_issue=1153 result_id=cloud-pilot-success-result-fixture-only-baseline -->
 
 ```json
@@ -13,7 +13,7 @@
   "target": {
     "kind": "issue",
     "number": 1153,
-    "marker_value": "issue:1153"
+    "marker_value": "pull_request:1153"
   },
   "evidence_mode": "fixture_only",
   "decision_ready": false,
@@ -51,11 +51,11 @@
   "safety": {
     "redaction_status": "clean",
     "verdict": "pass",
-    "blocked_reasons": ["café verified"]
+    "blocked_reasons": []
   },
   "generated_at": "2026-07-06T12:00:00Z"
 }
 ```
 
-この digest 値は fixture の内容から正しく算出された値である（diagnostic_context は fix_delta iteration 2 で closed object 化されたため、unicode 検証対象を safety.blocked_reasons に移動した）。
-<!-- CLOUD_PILOT_SUCCESS_RESULT_DIGEST_V1 sha256=31be3dad07f2fb0cbc0825c5e120117b22f62f8f1f5e6aff93cb08605a44719a -->
+この digest 値はこの fixture の内容（target.marker_value と kind:number の不一致を含む）から正しく再計算された fresh digest である。
+<!-- CLOUD_PILOT_SUCCESS_RESULT_DIGEST_V1 sha256=ff7c208ab5fa60a84d386dce681053eff4413c6e27e00fedb52884ea605e21a2 -->
