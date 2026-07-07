@@ -8,7 +8,12 @@
  * - Stop / SubagentStop allow path: stdout is valid JSON {"continue": true/false}
  * - Stop / SubagentStop session recording failure: stdout is {"continue": true}
  * - PreToolUse allow path: stdout is empty or valid JSON with hookSpecificOutput
- * - PermissionRequest allow path: stdout is empty or valid JSON with hookSpecificOutput
+ * - PreToolUse block path: stdout is the OpenAI Codex Hooks PreToolUse deny schema
+ *
+ * This script is a standalone manual smoke (Issue #1354). It is not spawned
+ * from pnpm test / tests/hooks/hooks-stdout-policy.test.ts; the cases above
+ * are covered there as direct Vitest assertions (AC2-AC8). Run this script
+ * manually during PR review to smoke-test the composite hook end to end.
  *
  * These tests invoke the composite hook in-process via a test harness that
  * stubs stdin input and captures stdout.
@@ -24,6 +29,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const repoRoot = resolve(__dirname, '..', '..')
 const compositeHook = resolve(repoRoot, '.codex', 'hooks', 'session-recording-composite.mjs')
 const fixturesDir = resolve(repoRoot, 'tests', 'fixtures', 'hooks')
+
+// spawnSync timeout for the composite hook subprocess invoked below (Issue #1354).
+const COMPOSITE_HOOK_SPAWN_TIMEOUT_MS = 10000
 
 let passed = 0
 let failed = 0
@@ -48,7 +56,7 @@ function runHook(event, stdinContent) {
   const result = spawnSync(process.execPath, [compositeHook, '--event', event], {
     input: typeof stdinContent === 'string' ? stdinContent : JSON.stringify(stdinContent),
     encoding: 'utf8',
-    timeout: 10000,
+    timeout: COMPOSITE_HOOK_SPAWN_TIMEOUT_MS,
     env: {
       ...process.env,
       // Override producer script to a no-op for tests

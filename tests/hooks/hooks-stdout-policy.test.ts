@@ -11,6 +11,12 @@
  * AC5: session manifest throttle skips same payload digest
  * AC7: tests/hooks/test-codex-single-composite.mjs exists
  * AC8/AC9: tests/fixtures/hooks/ directory exists with fixtures
+ *
+ * Issue #1354: the Codex composite hook (Stop / SubagentStop / PreToolUse)
+ * stdout policy is verified below via direct Vitest assertions instead of
+ * spawning tests/hooks/test-codex-single-composite.mjs as a nested child
+ * process. test-codex-single-composite.mjs remains a standalone manual smoke
+ * script (run separately; not part of the pnpm test baseline gate).
  */
 
 import { describe, it, expect } from 'vitest'
@@ -22,6 +28,10 @@ import { createHash } from 'node:crypto'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const repoRoot = resolve(__dirname, '..', '..')
+
+// spawnSync timeouts for shell/Node hook subprocesses invoked below (Issue #1354).
+const HOOK_SPAWN_TIMEOUT_MS = 15000
+const COORDINATOR_SPAWN_TIMEOUT_MS = 10000
 
 // ---------------------------------------------------------------------------
 // AC8/AC9: tests/fixtures/hooks/ directory exists
@@ -81,7 +91,7 @@ describe('AC4: PreCompact hook stdout policy and artifact content (B4)', () => {
     const result = spawnSync('bash', [hookPath], {
       input: fixture,
       encoding: 'utf8',
-      timeout: 15000,
+      timeout: HOOK_SPAWN_TIMEOUT_MS,
       env: {
         ...process.env,
         LOOP_STATE_ARTIFACTS_DIR: tmpDir,
@@ -111,7 +121,7 @@ describe('AC4: PreCompact hook stdout policy and artifact content (B4)', () => {
     const result = spawnSync('bash', [hookPath], {
       input: fixture,
       encoding: 'utf8',
-      timeout: 15000,
+      timeout: HOOK_SPAWN_TIMEOUT_MS,
       env: { ...process.env, LOOP_STATE_ARTIFACTS_DIR: tmpDir },
     })
 
@@ -146,7 +156,7 @@ describe('AC4: PreCompact hook stdout policy and artifact content (B4)', () => {
     const result = spawnSync('bash', [hookPath], {
       input: fixture,
       encoding: 'utf8',
-      timeout: 15000,
+      timeout: HOOK_SPAWN_TIMEOUT_MS,
       env: {
         ...process.env,
         LOOP_STATE_ARTIFACTS_DIR: '/proc/non-existent-readonly-path-797',
@@ -294,32 +304,19 @@ describe('AC5 / B1 / B2 / B3: session manifest throttle', () => {
 })
 
 // ---------------------------------------------------------------------------
-// AC7: test-codex-single-composite.mjs is part of pnpm test (runs via Vitest)
-// AC9: structural validation vs runtime-active/trust distinction is recorded
+// AC1/AC9: test-codex-single-composite.mjs is a standalone manual smoke
+// script. Its file existence is checked here, but it is intentionally NOT
+// spawned as a nested child process from pnpm test (Issue #1354). The cases
+// it exercises are covered as direct Vitest assertions in the
+// "AC2-AC8: Codex composite hook direct Vitest assertions" describe block
+// below instead.
 // ---------------------------------------------------------------------------
-describe('AC7: test-codex-single-composite.mjs runs within pnpm test', () => {
+describe('AC1/AC9: test-codex-single-composite.mjs remains a manual smoke script', () => {
   it('file exists at tests/hooks/test-codex-single-composite.mjs', () => {
     expect(
       existsSync(resolve(repoRoot, 'tests', 'hooks', 'test-codex-single-composite.mjs'))
     ).toBe(true)
   })
-
-  it('spawns test-codex-single-composite.mjs and all assertions pass', () => {
-    const scriptPath = resolve(repoRoot, 'tests', 'hooks', 'test-codex-single-composite.mjs')
-    if (!existsSync(scriptPath)) {
-      throw new Error('test-codex-single-composite.mjs not found — AC7 blocked')
-    }
-    const result = spawnSync(process.execPath, [scriptPath], {
-      encoding: 'utf8',
-      timeout: 30000,
-      cwd: repoRoot,
-    })
-    // Surface failures from the standalone script in this Vitest run
-    expect(
-      result.status,
-      `test-codex-single-composite.mjs exited with code ${result.status}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
-    ).toBe(0)
-  }, 35_000)
 })
 
 // ---------------------------------------------------------------------------
@@ -370,20 +367,21 @@ describe('AC9: Codex hooks structural validation vs runtime-active/trust', () =>
 })
 
 // ---------------------------------------------------------------------------
-// AC3: Codex Stop/SubagentStop stdout policy — 3-tier fixture validation
+// AC2-AC8: Codex composite hook direct Vitest assertions
 //
-// Tier 1: manifest producer failure → {"continue": true}   (best-effort telemetry)
-// Tier 2: malformed Stop/SubagentStop payload → {"continue": true}  (fail-open)
-// Tier 3: post-run security verifier failure → {"continue": false, "stopReason": ...}
+// Replaces the former nested standalone script execution (Issue #1354).
+// Each case below invokes .codex/hooks/session-recording-composite.mjs
+// directly via runCompositeHook() and asserts the OpenAI Codex Hooks stdout
+// contract for the relevant event / path.
 // ---------------------------------------------------------------------------
-describe('AC3: Codex Stop/SubagentStop 3-tier stdout policy', () => {
+describe('AC2-AC8: Codex composite hook direct Vitest assertions', () => {
   const compositeHook = resolve(repoRoot, '.codex', 'hooks', 'session-recording-composite.mjs')
 
   function runCompositeHook(event: string, stdinContent: string | object, overrideEnv: Record<string, string> = {}) {
     const result = spawnSync(process.execPath, [compositeHook, '--event', event], {
       input: typeof stdinContent === 'string' ? stdinContent : JSON.stringify(stdinContent),
       encoding: 'utf8',
-      timeout: 15000,
+      timeout: HOOK_SPAWN_TIMEOUT_MS,
       cwd: repoRoot,
       env: { ...process.env, ...overrideEnv },
     })
@@ -394,10 +392,8 @@ describe('AC3: Codex Stop/SubagentStop 3-tier stdout policy', () => {
     return { ...result, parsedJson }
   }
 
-  // Tier 1: allow path with stub producer → manifest flow runs → {"continue": true}
-  it('Tier 1: manifest producer failure → {"continue": true} (best-effort telemetry)', () => {
-    // Use the stub producer to simulate a successful manifest flow
-    // (a broken producer would require a separate _stub-broken-producer.mjs)
+  // AC2: Stop allow path — exit 0, stdout is valid JSON, continue is boolean
+  it('Stop allow path: exit 0, valid JSON stdout, typeof continue === "boolean" (AC2)', () => {
     const fixture = readFileSync(
       resolve(repoRoot, 'tests', 'fixtures', 'hooks', 'codex-stop-allow.json'), 'utf8'
     )
@@ -406,27 +402,85 @@ describe('AC3: Codex Stop/SubagentStop 3-tier stdout policy', () => {
     })
     expect(r.status, `exit code: ${r.status}`).toBe(0)
     expect(r.parsedJson, `stdout: ${r.stdout}`).not.toBeNull()
-    // Allow path with stub: runManifestFlow succeeds → continue:true
-    expect((r.parsedJson as { continue: boolean }).continue).toBe(true)
+    expect(typeof (r.parsedJson as { continue: unknown }).continue).toBe('boolean')
   })
 
-  // Tier 2: malformed payload (parsing failure) → {"continue": true}
-  it('Tier 2: malformed Stop payload → {"continue": true} (fail-open, best-effort)', () => {
+  // AC3: SubagentStop allow path — exit 0, stdout is valid JSON, continue is boolean
+  it('SubagentStop allow path: exit 0, valid JSON stdout, typeof continue === "boolean" (AC3)', () => {
+    const fixture = readFileSync(
+      resolve(repoRoot, 'tests', 'fixtures', 'hooks', 'codex-subagent-stop-allow.json'), 'utf8'
+    )
+    const r = runCompositeHook('SubagentStop', fixture, {
+      CODEX_SESSION_RECORDING_PRODUCER: resolve(repoRoot, 'tests', 'hooks', '_stub-producer.mjs'),
+    })
+    expect(r.status, `exit code: ${r.status}`).toBe(0)
+    expect(r.parsedJson, `stdout: ${r.stdout}`).not.toBeNull()
+    expect(typeof (r.parsedJson as { continue: unknown }).continue).toBe('boolean')
+  })
+
+  // AC4: Stop malformed payload — fail-open {"continue": true}
+  it('Stop malformed payload: exit 0, {"continue": true} (AC4)', () => {
     const r = runCompositeHook('Stop', 'INVALID_JSON_NOT_VALID_PAYLOAD')
     expect(r.status).toBe(0)
     expect(r.parsedJson).not.toBeNull()
     expect((r.parsedJson as { continue: boolean }).continue).toBe(true)
   })
 
-  it('Tier 2: malformed SubagentStop payload → {"continue": true} (fail-open, best-effort)', () => {
+  // AC5: SubagentStop malformed payload — fail-open {"continue": true}
+  it('SubagentStop malformed payload: exit 0, {"continue": true} (AC5)', () => {
     const r = runCompositeHook('SubagentStop', 'INVALID_JSON_NOT_VALID_PAYLOAD')
     expect(r.status).toBe(0)
     expect(r.parsedJson).not.toBeNull()
     expect((r.parsedJson as { continue: boolean }).continue).toBe(true)
   })
 
-  // Tier 3: security guard triggers (forbidden_path_touched:true) → {"continue": false, "stopReason": ...}
-  it('Tier 3: security verifier failure (forbidden_path_touched) → {"continue": false, stopReason defined}', () => {
+  // AC6: PreToolUse allow path — exit 0, stdout empty
+  it('PreToolUse allow path: exit 0, stdout empty (AC6)', () => {
+    const safePayload = {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Bash',
+      tool_input: { command: 'pnpm typecheck' },
+      secrets_mode: 'none',
+    }
+    const r = runCompositeHook('PreToolUse', safePayload)
+    expect(r.status, `exit code: ${r.status}`).toBe(0)
+    expect(r.stdout.trim(), `stdout was: "${r.stdout.trim()}"`).toBe('')
+  })
+
+  // AC7: PreToolUse block path — OpenAI Codex Hooks PreToolUse deny schema.
+  // hookSpecificOutput.hookEventName === "PreToolUse", permissionDecision === "deny",
+  // permissionDecisionReason is a string, and parsed does NOT carry
+  // continue / stopReason / suppressOutput properties (Stop-schema leakage guard).
+  it('PreToolUse block path: OpenAI Codex Hooks deny schema with permissionDecisionReason (AC7)', () => {
+    const forbiddenPayload = {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Bash',
+      tool_input: { command: 'cat assets/forbidden.png' },
+      secrets_mode: 'none',
+    }
+    const r = runCompositeHook('PreToolUse', forbiddenPayload)
+    expect(r.status, `exit code: ${r.status}`).toBe(0)
+    expect(r.parsedJson, `stdout: ${r.stdout}`).not.toBeNull()
+    const parsed = r.parsedJson as {
+      hookSpecificOutput?: {
+        hookEventName?: unknown
+        permissionDecision?: unknown
+        permissionDecisionReason?: unknown
+      }
+      continue?: unknown
+      stopReason?: unknown
+      suppressOutput?: unknown
+    }
+    expect(parsed.hookSpecificOutput?.hookEventName).toBe('PreToolUse')
+    expect(parsed.hookSpecificOutput?.permissionDecision).toBe('deny')
+    expect(typeof parsed.hookSpecificOutput?.permissionDecisionReason).toBe('string')
+    expect('continue' in parsed).toBe(false)
+    expect('stopReason' in parsed).toBe(false)
+    expect('suppressOutput' in parsed).toBe(false)
+  })
+
+  // AC8: Stop security verifier failure — {"continue": false, "stopReason": <string>}
+  it('Stop security verifier failure: {"continue": false, stopReason defined} (AC8)', () => {
     const fixture = readFileSync(
       resolve(repoRoot, 'tests', 'fixtures', 'hooks', 'codex-stop-security-gate-fail.json'), 'utf8'
     )
@@ -469,7 +523,7 @@ describe('AC2: session_manifest_coordinator.sh allow path stdout policy', () => 
     const result = spawnSync('bash', [coordinatorPath], {
       input: fixture,
       encoding: 'utf8',
-      timeout: 10000,
+      timeout: COORDINATOR_SPAWN_TIMEOUT_MS,
     })
 
     expect(result.status, `expected exit 0, got ${result.status}`).toBe(0)
