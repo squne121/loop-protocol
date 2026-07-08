@@ -195,7 +195,10 @@ managed skill（`create-issue`）が `gh issue create` を実行する際:
 - `--body-file tmp/<path>` 必須（tmp/ 相対パス、`-` は不可）
 - `--title <value>` 必須
 - interactive フラグ（`--editor` / `-e` / `--web` / `-w`）は block
-raw `gh issue edit` / `gh issue comment` / `gh api -f body=...` は `gh_mutation_denied` でブロックされる。
+raw `gh issue edit` / `gh issue comment` は `gh_mutation_denied` でブロックされる。
+`gh api -f body=...` / `gh api graphql -f query='mutation { ... }'` /
+`gh api --method POST ...` のような allowlist 外 `gh api` は
+`github_api_command` (`gh_api_not_allowed`) でブロックされる。
 これらの条件を満たさない `gh issue create` も `gh_mutation_denied` でブロックされる。
 
 ## issue-refinement-loop Producer / Publisher 責務分割（#1154 / #1165 / #1166、producer/publisher の責務境界）

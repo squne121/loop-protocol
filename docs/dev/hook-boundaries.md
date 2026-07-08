@@ -148,7 +148,10 @@ hook_boundaries_manifest_v1:
       2. リダイレクトは `>` のみ（`>>` は不可）
       3. 先は `tmp/` から始まる（src/, docs/, .env, .git は不可）
       4. lhs にシェルメタキャラ（|, ;, &&, ||, backtick, $()）なし
-      raw `gh issue edit` / `gh issue comment` / `gh api -f body=...` は `gh_mutation_denied` で block される。
+      raw `gh issue edit` / `gh issue comment` は `gh_mutation_denied` で block される。
+      `gh api -f body=...` / `gh api graphql -f query='mutation { ... }'` /
+      `gh api --method POST ...` のような allowlist 外 `gh api` は
+      `github_api_command` (`gh_api_not_allowed`) で block される。
 
   - handler_id: worktree_scope_guard
     event: PreToolUse

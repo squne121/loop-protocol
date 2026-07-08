@@ -50,6 +50,7 @@ from local_main_branch_guard import (  # noqa: E402
     REASON_DETERMINISTIC_CHECKER,
     REASON_CONTROLLED_SKILL_MUTATION_EXECUTOR,
     REASON_GITHUB_REMOTE_OPS,
+    REASON_GH_API,
     REASON_GH_MUTATION,
     REASON_SKILL_RUNTIME_EXECUTOR,
     is_github_issue_mutation_command,
@@ -88,6 +89,13 @@ RAW_ISSUE_COMMENT_COMMANDS = [
     "gh issue comment 123 --edit-last",
     "gh issue comment 123 --delete-last",
     "gh issue comment 123 --create-if-none --edit-last --body x",
+]
+
+REVIEWER_GH_MUTATION_REGRESSIONS = [
+    ("gh api repos/squne121/loop-protocol/issues/1395/comments -f body=bad", REASON_GH_API),
+    ("gh api graphql -f query='mutation { __typename }'", REASON_GH_API),
+    ("gh api --method POST repos/squne121/loop-protocol/issues/comments/1", REASON_GH_API),
+    ("gh issue comment 1395 --body bad", REASON_GH_MUTATION),
 ]
 
 CONTROLLED_METADATA_COMMANDS = [
@@ -1843,6 +1851,15 @@ class TestB1B4ReviewBlockerFixesClaude:
         result = eval_in_local_root("gh pr edit 123 --body-file tmp/body.txt", str(tmp_git_repo))
         assert result["status"] == "allow", "gh pr edit --body-file tmp/... must be allowed"
         assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
+
+    @pytest.mark.parametrize(("cmd", "expected_reason"), REVIEWER_GH_MUTATION_REGRESSIONS)
+    def test_b4_reviewer_gh_mutation_regressions(
+        self, tmp_git_repo: Path, cmd: str, expected_reason: str
+    ):
+        """Reviewer 指摘の raw mutation-like gh commands は fail-closed で block される。"""
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == expected_reason
 
 
 # =============================================================================

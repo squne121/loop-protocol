@@ -80,6 +80,13 @@ RAW_ISSUE_COMMENT_COMMANDS = [
     "gh issue comment 123 --create-if-none --edit-last --body x",
 ]
 
+REVIEWER_GH_MUTATION_REGRESSIONS = [
+    ("gh api repos/squne121/loop-protocol/issues/1395/comments -f body=bad", REASON_GH_API),
+    ("gh api graphql -f query='mutation { __typename }'", REASON_GH_API),
+    ("gh api --method POST repos/squne121/loop-protocol/issues/comments/1", REASON_GH_API),
+    ("gh issue comment 1395 --body bad", REASON_GH_MUTATION),
+]
+
 CONTROLLED_METADATA_COMMANDS = [
     ("issue_body.update", "artifacts/1291/issue-metadata/issue_body.update/input.json"),
     ("issue_comment.publish", "artifacts/1291/issue-metadata/issue_comment.publish/input.json"),
@@ -1283,6 +1290,15 @@ class TestB1B4ReviewBlockerFixes:
         result = eval_codex("gh pr edit 123 --body-file tmp/body.txt", str(tmp_git_repo))
         assert result["status"] == "allow", "gh pr edit --body-file tmp/... must be allowed"
         assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
+
+    @pytest.mark.parametrize(("cmd", "expected_reason"), REVIEWER_GH_MUTATION_REGRESSIONS)
+    def test_b4_reviewer_gh_mutation_regressions(
+        self, tmp_git_repo: Path, cmd: str, expected_reason: str
+    ):
+        """Reviewer 指摘の raw mutation-like gh commands は Codex parity でも block される。"""
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == expected_reason
 
     @pytest.mark.parametrize("cmd", [
         "gh issue edit 1198 --repo squne121/loop-protocol --body-file tmp/x.md --add-label foo",
