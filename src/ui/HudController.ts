@@ -213,7 +213,7 @@ export function createHudController(
     </section>
     <section class="panel">
       <p class="eyebrow">Wingmates</p>
-      <button type="button" data-action="assist-player" aria-label="Assist allies">Assist allies</button>
+      <button type="button" data-action="assist-player" data-battle-interactive="true" aria-label="Assist allies">Assist allies</button>
       <p
         class="status-copy"
         data-field="assist-status"
@@ -227,7 +227,7 @@ export function createHudController(
       <dl class="stat-grid">
         <div><dt>Weapon Power</dt><dd data-field="weapon-power"></dd></div>
       </dl>
-      <button type="button" data-action="upgrade-weapon">Upgrade weapon</button>
+      <button type="button" data-action="upgrade-weapon" data-battle-interactive="true">Upgrade weapon</button>
       <p class="status-copy status-copy--muted" data-field="upgrade-cost"></p>
       <p
         class="status-copy"
@@ -246,16 +246,17 @@ export function createHudController(
       <p class="status-copy" data-field="pause-status" role="status" aria-live="polite" aria-atomic="true"></p>
     </section>
     <section class="panel panel--actions">
-      <button type="button" data-action="new-game">Begin new run</button>
-      <button type="button" data-action="start-sortie">Launch sortie</button>
-      <button type="button" data-action="claim-reward">Collect payout</button>
-      <button type="button" data-action="confirm-result">Return to hangar</button>
-      <button type="button" data-action="next-sortie">Prepare next sortie</button>
-      <button type="button" data-action="save">Save progress</button>
-      <button type="button" data-action="load-game">Open save</button>
+      <button type="button" data-action="new-game" data-battle-interactive="true">Begin new run</button>
+      <button type="button" data-action="start-sortie" data-battle-interactive="true">Launch sortie</button>
+      <button type="button" data-action="claim-reward" data-battle-interactive="true">Collect payout</button>
+      <button type="button" data-action="confirm-result" data-battle-interactive="true">Return to hangar</button>
+      <button type="button" data-action="next-sortie" data-battle-interactive="true">Prepare next sortie</button>
+      <button type="button" data-action="save" data-battle-interactive="true">Save progress</button>
+      <button type="button" data-action="load-game" data-battle-interactive="true">Open save</button>
       <button
         type="button"
         data-action="reset"
+        data-battle-interactive="true"
         title="Reset sortie is a destructive boundary and is only available during preparation."
       >
         Reset sortie
@@ -263,6 +264,7 @@ export function createHudController(
       <button
         type="button"
         data-action="toggle-pause"
+        data-battle-interactive="true"
         aria-pressed="false"
         aria-label="Pause simulation"
         title="Pause or resume simulation. Also toggled by Escape."
