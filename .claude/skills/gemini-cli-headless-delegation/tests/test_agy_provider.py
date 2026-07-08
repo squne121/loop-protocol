@@ -430,56 +430,56 @@ def test_ac7_agy_local_asset_research_success_with_wrapper_validation(tmp_path, 
     captured_prompt: dict[str, str] = {}
 
     def _fake_live_evidence(context_paths, root, manifest):
-        return [
+        evidence_records = [
             {
-                "path": "context.md",
-                "content": __import__("json").dumps(
-                    {
-                        "schema": "wrapper_serena_evidence_v1",
-                        "evidence": [
-                            {
-                                "tool_name": "find_file",
-                                "query": {"file_mask": "context.md"},
-                                "repo_relative_path": "context.md",
-                                "line_range": [1, 1],
-                                "content_snippet": "context.md",
-                                "byte_size": 10,
-                                "sha256": "0" * 64,
-                                "redaction_status": "checked_no_credential_pattern",
-                                "manifest_id": "serena_tool_manifest_v1:0123456789abcdef",
-                                "source_kind": "serena_mcp_read_only_evidence",
-                            },
-                            {
-                                "tool_name": "search_for_pattern",
-                                "query": {"substring_pattern": "local_asset_research"},
-                                "repo_relative_path": "context.md",
-                                "line_range": [1, 1],
-                                "content_snippet": "local asset content",
-                                "byte_size": 19,
-                                "sha256": "1" * 64,
-                                "redaction_status": "checked_no_credential_pattern",
-                                "manifest_id": "serena_tool_manifest_v1:0123456789abcdef",
-                                "source_kind": "serena_mcp_read_only_evidence",
-                            },
-                            {
-                                "tool_name": "get_symbols_overview",
-                                "query": {"relative_path": "context.md"},
-                                "repo_relative_path": "context.md",
-                                "line_range": [1, 1],
-                                "content_snippet": "[]",
-                                "byte_size": 2,
-                                "sha256": "2" * 64,
-                                "redaction_status": "checked_no_credential_pattern",
-                                "manifest_id": "serena_tool_manifest_v1:0123456789abcdef",
-                                "source_kind": "serena_mcp_read_only_evidence",
-                            },
-                        ],
-                    },
-                    ensure_ascii=False,
-                ),
-                "evidence": {"source_kind": "serena_mcp_read_only_evidence"},
-            }
+                "tool_name": "find_file",
+                "query": {"file_mask": "context.md"},
+                "repo_relative_path": "context.md",
+                "line_range": [1, 1],
+                "content_snippet": "context.md",
+                "byte_size": 10,
+                "sha256": "0" * 64,
+                "redaction_status": "checked_no_credential_pattern",
+                "manifest_id": "serena_tool_manifest_v1:0123456789abcdef",
+                "source_kind": "serena_mcp_read_only_evidence",
+            },
+            {
+                "tool_name": "search_for_pattern",
+                "query": {"substring_pattern": "local_asset_research"},
+                "repo_relative_path": "context.md",
+                "line_range": [1, 1],
+                "content_snippet": "local asset content",
+                "byte_size": 19,
+                "sha256": "1" * 64,
+                "redaction_status": "checked_no_credential_pattern",
+                "manifest_id": "serena_tool_manifest_v1:0123456789abcdef",
+                "source_kind": "serena_mcp_read_only_evidence",
+            },
+            {
+                "tool_name": "get_symbols_overview",
+                "query": {"relative_path": "context.md"},
+                "repo_relative_path": "context.md",
+                "line_range": [1, 1],
+                "content_snippet": "[]",
+                "byte_size": 2,
+                "sha256": "2" * 64,
+                "redaction_status": "checked_no_credential_pattern",
+                "manifest_id": "serena_tool_manifest_v1:0123456789abcdef",
+                "source_kind": "serena_mcp_read_only_evidence",
+            },
         ]
+        return {
+            "status": "success",
+            "context_text": "local asset context prepared",
+            "evidence_document": __import__("json").dumps(
+                {
+                    "schema": "wrapper_serena_evidence_v1",
+                    "evidence": evidence_records,
+                },
+                ensure_ascii=False,
+            ),
+            "evidence": {"source_kind": "serena_mcp_read_only_evidence"},
+        }
 
     def _run_agy(prompt: str, timeout_sec: int = rgh.DEFAULT_TIMEOUT_SEC) -> subprocess.CompletedProcess:
         captured_prompt["value"] = prompt

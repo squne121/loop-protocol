@@ -1,5 +1,5 @@
 ---
-title: Schema Governance
+title: Schema Governance  # スキーマ変更のガバナンスルール定義
 status: active
 related_issue: "#135"
 ---
@@ -46,6 +46,7 @@ related_issue: "#135"
 | `agent_session_manifest/v1` | `docs/schemas/agent-session-manifest.md` | Claude Code hook-based ledger, human/AI GitHub Issue or PR comment | pr-review-judge, impl-review-loop, pilot smoke test issue, future aggregation script | `rg -n "agent_session_manifest/v1\|agent_session_manifest:v1\|agent-session-manifest" .` |
 | `PR_REVIEW_GATE_RESULT_V1` | `.claude/skills/pr-review-judge/references/pr-review-gate-result-schema.yml` | check_pr_review_gates.py | pr-review-judge, impl-review-loop | `rg -n "PR_REVIEW_GATE_RESULT_V1\|schema_version.*RESULT" .` |
 | `TERMINATION_REPORT_RENDER_RESULT_V1` | `.claude/skills/issue-refinement-loop/scripts/render_termination_report.py` | render_termination_report.py | publish_termination_report.py, issue-refinement-loop Step 5 | `rg -n "TERMINATION_REPORT_RENDER_RESULT_V1" .claude/skills/issue-refinement-loop/` |
+| `delegation_audit_v1` | `.claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py`（`--audit-log` / `DELEGATION_AUDIT_LOG_PATH` で明示有効化する監査ログ JSONL） | run_gemini_headless.py（`run_delegation()` トップレベル呼び出し） | `.claude/skills/gemini-cli-headless-delegation/tests/test_delegation_audit_schema.py`（本 PR で追加した唯一の consumer。既存 `delegation_result/v1` の consumer とはファイルレベルで分離） | `rg -n "delegation_audit_v1\|DELEGATION_AUDIT_LOG_PATH\|_build_delegation_audit_record" .claude/skills/gemini-cli-headless-delegation` |
 
 ## TERMINATION_REPORT_RENDER_RESULT_V1 詳細登録
 
@@ -115,7 +116,7 @@ notes:
   - "token_usage.availability: unavailable を 0 と偽装しないこと（docs/schemas/agent-session-manifest.md 参照）"
 ```
 
-## #934 public-surface boundary cleanup note
+## #934 public-surface boundary cleanup note（公開境界クリーンアップ注記）
 
 - #934 は public-surface boundary cleanup であり、`agent_session_manifest/v1` の live public posting を拡張する issue ではない。
 - #934 で固定する consumer-facing contract は「manifest 本文は Issue / PR comment に出さない」「公開コメントでは opaque ref のみ許可」「`agent_run_report/v1` / `agent_retro_index/v1` は #935 schema/redaction validator と #937 exact marker upsert guard が揃うまで dry-run only / not live public posting」という境界である。
@@ -131,7 +132,7 @@ PR が schema を変更するか否かを判定する基準:
 | `not_schema_change` | Allowed Paths 内の変更がすべて内部ロジック・コメント・説明文のみで、consumer 境界をまたぐ contract に変更がない |
 | `uncertain` | PR diff を見ただけでは consumer 境界への影響が判断できない場合。fail-closed として schema_change 相当の検査を適用する |
 
-## Schema Consumer Inventory 義務
+## Schema Consumer Inventory の記載義務
 
 schema を変更する PR（`schema_change` または `uncertain`）では、以下の **Schema Consumer Inventory** を PR 本文に必ず記載しなければならない。
 
