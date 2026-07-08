@@ -1374,6 +1374,44 @@ class TestExactAllowlistClaude:
         )
         assert result["status"] == "block"
 
+    def test_rtk_wrapped_skill_runtime_executor_is_allowed(self, tmp_git_repo: Path):
+        result = eval_in_local_root(
+            "rtk uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 981 --repo squne121/loop-protocol",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_SKILL_RUNTIME_EXECUTOR
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "rtk run uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 981 --repo squne121/loop-protocol",
+            'rtk bash -lc "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 981 --repo squne121/loop-protocol"',
+            "rtk uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py --issue-number 981 --repo squne121/loop-protocol",
+            "rtk gh issue edit 981 --repo squne121/loop-protocol --body-file tmp/body.md",
+        ],
+    )
+    def test_rtk_noncanonical_or_mutating_commands_are_blocked(self, tmp_git_repo: Path, command: str):
+        result = eval_in_local_root(command, str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_issue_refinement_direct_repair_hint_uses_exact_executor(self, tmp_git_repo: Path):
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": (
+                    "uv run python3 .claude/skills/issue-refinement-loop/scripts/"
+                    "run_refinement_preflight.py --issue-number 981 --repo squne121/loop-protocol"
+                )
+            },
+            "cwd": str(tmp_git_repo),
+        }
+        result = run_claude_hook_script(payload, tmp_git_repo)
+        assert result.returncode == 2
+        assert "HOOK_COMMAND_REPAIR_HINT_V1:" in result.stderr
+        assert "skill_runtime_exec.py --command-id preflight.run" in result.stderr
+        assert "run_refinement_preflight.py" not in result.stderr
+
     @pytest.mark.parametrize(
         ("remote_url", "expected"),
         [
