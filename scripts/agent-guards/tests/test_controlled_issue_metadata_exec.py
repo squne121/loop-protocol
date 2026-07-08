@@ -215,7 +215,7 @@ class TestEnvBinding:
 # =============================================================================
 
 class TestIssueBodyUpdate:
-    def test_ac9_issue_body_update_stale_write_prevented(self, tmp_project, monkeypatch):
+    def test_ac9_issue_body_update_stale_write_prevented(self, tmp_project, monkeypatch, capsys):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
         monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
         new_body = "new body text"
@@ -239,11 +239,15 @@ class TestIssueBodyUpdate:
                     "--issue-number", "1284",
                     "--input-file", rel,
                     "--repo", TRUSTED_REPO,
+                    "--json",
                 ])
         assert rc == 1
         mock_patch.assert_not_called()
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "failed"
+        assert payload["reason"].startswith("stale_precondition_body_sha256_mismatch")
 
-    def test_ac9_partial_match_not_success(self, tmp_project, monkeypatch):
+    def test_ac9_partial_match_not_success(self, tmp_project, monkeypatch, capsys):
         """updatedAt matches but body hash doesn't (or vice versa) → still not success."""
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
         monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
@@ -267,9 +271,13 @@ class TestIssueBodyUpdate:
                     "--issue-number", "1284",
                     "--input-file", rel,
                     "--repo", TRUSTED_REPO,
+                    "--json",
                 ])
         assert rc == 1
         mock_patch.assert_not_called()
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "failed"
+        assert payload["reason"].startswith("stale_precondition_updated_at_mismatch")
 
     def test_issue_body_update_success_path(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
@@ -320,7 +328,9 @@ class TestIssueBodyUpdateMarkerAuthority:
         }))
         return mp
 
-    def test_local_marker_remote_hash_mismatch_denied(self, tmp_project, monkeypatch):
+    def test_issue_body_update_stale_marker_remote_body_changed_falls_to_stale_body_precondition_no_patch(
+        self, tmp_project, monkeypatch
+    ):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
         monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
         new_body = "new body text"
@@ -348,7 +358,9 @@ class TestIssueBodyUpdateMarkerAuthority:
         assert rc == 1
         mock_patch.assert_not_called()
 
-    def test_local_marker_remote_hash_match_ok(self, tmp_project, monkeypatch):
+    def test_issue_body_update_stale_marker_remote_already_new_returns_already_applied_no_patch(
+        self, tmp_project, monkeypatch, capsys
+    ):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
         monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
         new_body = "new body text"
@@ -372,11 +384,89 @@ class TestIssueBodyUpdateMarkerAuthority:
                     "--issue-number", "1284",
                     "--input-file", rel,
                     "--repo", TRUSTED_REPO,
+                    "--json",
                 ])
         assert rc == 0
         mock_patch.assert_not_called()
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status_detail"] == "already_applied"
+        assert payload["marker_state"] == "already_applied_remote_authority"
 
-    def test_local_marker_repo_issue_metadata_mismatch_denied(self, tmp_project, monkeypatch):
+    def test_issue_body_update_stale_marker_remote_matches_previous_preconditions_patches_once(
+        self, tmp_project, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        new_body = "new body text"
+        rel = _write_input(
+            tmp_project, 1284, COMMAND_ID_ISSUE_BODY_UPDATE, "in.json",
+            {
+                "schema": "ISSUE_BODY_UPDATE_INPUT_V1",
+                "issue_number": 1284,
+                "previous_body_sha256": _sha("old body"),
+                "previous_updated_at": "2026-01-01T00:00:00Z",
+                "new_body": new_body,
+                "new_body_sha256": _sha(new_body),
+            },
+        )
+        self._write_marker(tmp_project, 1284, COMMAND_ID_ISSUE_BODY_UPDATE, _sha("different body"))
+        readbacks = iter([
+            ("old body", "2026-01-01T00:00:00Z", ""),
+            (new_body, "2026-01-01T00:00:01Z", ""),
+        ])
+        with patch.object(_exec, "_fetch_issue_body_and_updated_at",
+                           side_effect=lambda *a, **k: next(readbacks)):
+            with patch.object(_exec, "_patch_issue_body", return_value="") as mock_patch:
+                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
+                    rc = _exec.main([
+                        "--command-id", COMMAND_ID_ISSUE_BODY_UPDATE,
+                        "--issue-number", "1284",
+                        "--input-file", rel,
+                        "--repo", TRUSTED_REPO,
+                        "--json",
+                    ])
+        assert rc == 0
+        mock_patch.assert_called_once()
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["marker_state"] == "stale_local_marker_recovered"
+
+    def test_issue_body_update_stale_marker_remote_updated_at_changed_falls_to_stale_updated_at_no_patch(
+        self, tmp_project, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        new_body = "new body text"
+        rel = _write_input(
+            tmp_project, 1284, COMMAND_ID_ISSUE_BODY_UPDATE, "in.json",
+            {
+                "schema": "ISSUE_BODY_UPDATE_INPUT_V1",
+                "issue_number": 1284,
+                "previous_body_sha256": _sha("old body"),
+                "previous_updated_at": "2026-01-01T00:00:00Z",
+                "new_body": new_body,
+                "new_body_sha256": _sha(new_body),
+            },
+        )
+        self._write_marker(tmp_project, 1284, COMMAND_ID_ISSUE_BODY_UPDATE, _sha("different body"))
+        with patch.object(_exec, "_fetch_issue_body_and_updated_at",
+                           return_value=("old body", "2026-02-01T00:00:00Z", "")):
+            with patch.object(_exec, "_patch_issue_body") as mock_patch:
+                rc = _exec.main([
+                    "--command-id", COMMAND_ID_ISSUE_BODY_UPDATE,
+                    "--issue-number", "1284",
+                    "--input-file", rel,
+                    "--repo", TRUSTED_REPO,
+                    "--json",
+                ])
+        assert rc == 1
+        mock_patch.assert_not_called()
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "failed"
+        assert payload["reason"].startswith("stale_precondition_updated_at_mismatch")
+
+    def test_issue_body_update_marker_metadata_mismatch_still_denies_before_remote_readback(
+        self, tmp_project, monkeypatch, capsys
+    ):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
         monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
         new_body = "new body text"
@@ -402,8 +492,89 @@ class TestIssueBodyUpdateMarkerAuthority:
                     "--issue-number", "1284",
                     "--input-file", rel,
                     "--repo", TRUSTED_REPO,
+                    "--json",
                 ])
-        assert rc in (1, 2)
+        assert rc == 2
+        mock_patch.assert_not_called()
+        mock_fetch.assert_not_called()
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "error"
+        assert payload["reason"] == "issue_body_update_marker_metadata_mismatch"
+
+    def test_issue_body_update_marker_issue_number_mismatch_still_denies_before_remote_readback(
+        self, tmp_project, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        new_body = "new body text"
+        rel = _write_input(
+            tmp_project, 1284, COMMAND_ID_ISSUE_BODY_UPDATE, "in.json",
+            {
+                "schema": "ISSUE_BODY_UPDATE_INPUT_V1",
+                "issue_number": 1284,
+                "previous_body_sha256": _sha("old body"),
+                "previous_updated_at": "2026-01-01T00:00:00Z",
+                "new_body": new_body,
+                "new_body_sha256": _sha(new_body),
+            },
+        )
+        marker_path = _exec._issue_metadata_marker_path(
+            tmp_project, 1284, COMMAND_ID_ISSUE_BODY_UPDATE, "issue_body_update.marker.json"
+        )
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps({
+            "schema": "ISSUE_BODY_UPDATE_MARKER_V1",
+            "issue_number": 9999,
+            "repo": TRUSTED_REPO,
+            "new_body_sha256": _sha(new_body),
+        }))
+        with patch.object(_exec, "_fetch_issue_body_and_updated_at") as mock_fetch:
+            with patch.object(_exec, "_patch_issue_body") as mock_patch:
+                rc = _exec.main([
+                    "--command-id", COMMAND_ID_ISSUE_BODY_UPDATE,
+                    "--issue-number", "1284",
+                    "--input-file", rel,
+                    "--repo", TRUSTED_REPO,
+                    "--json",
+                ])
+        assert rc == 2
+        mock_patch.assert_not_called()
+        mock_fetch.assert_not_called()
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "error"
+        assert payload["reason"] == "issue_body_update_marker_metadata_mismatch"
+
+    def test_issue_body_update_corrupt_marker_still_denies_before_mutation(
+        self, tmp_project, monkeypatch
+    ):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        new_body = "new body text"
+        rel = _write_input(
+            tmp_project, 1284, COMMAND_ID_ISSUE_BODY_UPDATE, "in.json",
+            {
+                "schema": "ISSUE_BODY_UPDATE_INPUT_V1",
+                "issue_number": 1284,
+                "previous_body_sha256": _sha("old body"),
+                "previous_updated_at": "2026-01-01T00:00:00Z",
+                "new_body": new_body,
+                "new_body_sha256": _sha(new_body),
+            },
+        )
+        marker_path = _exec._issue_metadata_marker_path(
+            tmp_project, 1284, COMMAND_ID_ISSUE_BODY_UPDATE, "issue_body_update.marker.json"
+        )
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text("{not-json")
+        with patch.object(_exec, "_fetch_issue_body_and_updated_at") as mock_fetch:
+            with patch.object(_exec, "_patch_issue_body") as mock_patch:
+                rc = _exec.main([
+                    "--command-id", COMMAND_ID_ISSUE_BODY_UPDATE,
+                    "--issue-number", "1284",
+                    "--input-file", rel,
+                    "--repo", TRUSTED_REPO,
+                ])
+        assert rc == 2
         mock_patch.assert_not_called()
         mock_fetch.assert_not_called()
 
