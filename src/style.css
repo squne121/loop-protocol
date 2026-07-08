@@ -87,6 +87,8 @@ button:focus-visible {
 }
 
 .battle-stage {
+  position: relative;
+  isolation: isolate;
   border-radius: 28px;
   overflow: hidden;
 }
@@ -112,6 +114,27 @@ button:focus-visible {
   width: 100%;
   height: auto;
   aspect-ratio: 16 / 9;
+}
+
+.battle-ui-layer,
+.battle-hud-layer,
+.battle-screen-layer {
+  position: absolute;
+  inset: 0;
+}
+
+.battle-ui-layer {
+  pointer-events: none;
+  z-index: 2;
+}
+
+.battle-hud-layer,
+.battle-screen-layer {
+  pointer-events: none;
+}
+
+.battle-ui-layer [data-battle-interactive='true'] {
+  pointer-events: auto;
 }
 
 .command-rail {
