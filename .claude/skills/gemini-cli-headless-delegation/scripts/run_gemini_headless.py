@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import warnings
 from pathlib import Path
 from typing import Any, Mapping
@@ -698,9 +699,12 @@ def _dump_json(path: Path, payload: Mapping[str, Any]) -> None:
 def _append_ndjson(path: Path, payload: Mapping[str, Any]) -> None:
     """Append a single JSON object as one line to an NDJSON file (newline-delimited JSON)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=False))
-        handle.write("\n")
+    encoded_line = (json.dumps(payload, ensure_ascii=False, sort_keys=False) + "\n").encode("utf-8")
+    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.write(fd, encoded_line)
+    finally:
+        os.close(fd)
 
 
 def _normalize_text(value: str) -> str:
@@ -1287,7 +1291,7 @@ def _collect_live_serena_read_only_evidence(
     context_paths: list[Path],
     repo_root: Path,
     manifest: Mapping[str, Any],
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
     """Launch pinned Serena MCP over stdio and build evidence from tools/call responses."""
     import select
 
@@ -1357,6 +1361,7 @@ def _collect_live_serena_read_only_evidence(
         tools_response = request("tools/list")
         tools = ((tools_response.get("result") or {}).get("tools") or [])
         tools_seen = {tool.get("name") for tool in tools if isinstance(tool, Mapping)}
+        tools_seen_names = sorted(str(name) for name in tools_seen if isinstance(name, str))
         missing = sorted(set(manifest["read_only_allowlist"]) - tools_seen)
         if missing:
             raise RuntimeError(f"Serena tools/list missing required tools: {', '.join(missing)}")
@@ -1405,13 +1410,160 @@ def _collect_live_serena_read_only_evidence(
                 "path": f"{repo_relative_path}#{tool_name}-{index}",
                 "content": json.dumps(evidence, ensure_ascii=False, sort_keys=True),
             })
-        return documents
+        serena_metadata = {
+            "retrieval_mode": "live_serena_mcp",
+            "serena_manifest_id": manifest_id,
+            "serena_pinned_ref": manifest.get("pinned_ref"),
+            "read_only_allowlist_sha256": _sha256_stable_json(list(manifest.get("read_only_allowlist", []))),
+            "dangerous_denylist_sha256": _sha256_stable_json(list(manifest.get("dangerous_denylist", []))),
+            "live_tools_list_sha256": _sha256_stable_json(tools_seen_names),
+            "manifest_drift_failed": False,
+            "context_files_count": len(context_paths),
+            "evidence_record_count": len(documents),
+        }
+        return documents, serena_metadata
     finally:
         try:
             process.terminate()
             process.wait(timeout=5)
         except Exception:
             process.kill()
+
+
+def _coerce_live_serena_retrieval_result(
+    result: Any,
+    context_paths: list[Path],
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Normalize wrapper result formats from live Serena retrieval.
+
+    Newer wrappers return ``(documents, metadata)`` while some existing
+    test doubles still return a dict envelope with ``status`` / ``evidence_document``.
+    Preserve success behavior by accepting both and deriving public-safe metadata
+    from the evidence payload when fields are missing.
+    """
+
+    def _fallback_context_path(index: int) -> str:
+        if context_paths:
+            return context_paths[min(index, len(context_paths) - 1)].name
+        return "local_asset_research"
+
+    if isinstance(result, tuple):
+        if len(result) != 2:
+            raise ValueError("local_asset_research live_serena_mcp returned unexpected tuple shape")
+        documents, metadata = result
+        if not isinstance(documents, list):
+            raise ValueError("local_asset_research live_serena_mcp returned non-list documents")
+        normalized_metadata: dict[str, Any] = {}
+        if metadata is not None:
+            if not isinstance(metadata, Mapping):
+                raise ValueError("local_asset_research live_serena_mcp returned non-mapping metadata")
+            normalized_metadata = dict(metadata)
+        return documents, normalized_metadata
+
+    if isinstance(result, list):
+        return [
+            {
+                "path": str(
+                    doc.get("path") if isinstance(doc, Mapping) and "path" in doc else _fallback_context_path(i)
+                ),
+                "content": json.dumps(doc, ensure_ascii=False, sort_keys=True),
+            }
+            for i, doc in enumerate(result)
+        ], {}
+
+    if not isinstance(result, Mapping):
+        raise ValueError(
+            "local_asset_research live_serena_mcp returned unsupported evidence payload type"
+        )
+
+    status = str(result.get("status") or "success").strip().lower()
+    retrieval_status = "succeeded" if status in {"success", "succeeded", "ok"} else "failed"
+    evidence_payload = result.get("evidence")
+    evidence_records: list[Mapping[str, Any]] = []
+
+    if isinstance(evidence_payload, str):
+        try:
+            parsed_payload = json.loads(evidence_payload)
+        except json.JSONDecodeError:
+            parsed_payload = None
+        else:
+            if isinstance(parsed_payload, Mapping):
+                evidence_payload = parsed_payload
+
+    if isinstance(evidence_payload, Mapping):
+        candidate = evidence_payload.get("evidence")
+        if isinstance(candidate, list):
+            evidence_records = [item for item in candidate if isinstance(item, Mapping)]
+    elif isinstance(evidence_payload, list):
+        evidence_records = [item for item in evidence_payload if isinstance(item, Mapping)]
+
+    evidence_document = result.get("evidence_document")
+    if not evidence_records and isinstance(evidence_document, str):
+        try:
+            parsed = json.loads(evidence_document)
+        except json.JSONDecodeError:
+            parsed = None
+        else:
+            if isinstance(parsed, Mapping):
+                candidate = parsed.get("evidence")
+                if isinstance(candidate, list):
+                    evidence_records = [item for item in candidate if isinstance(item, Mapping)]
+
+    documents: list[dict[str, str]] = []
+    for index, item in enumerate(evidence_records):
+        if not isinstance(item, Mapping):
+            continue
+        path = item.get("path")
+        if not isinstance(path, str) or not path:
+            path = item.get("repo_relative_path")
+        if not isinstance(path, str) or not path:
+            path = _fallback_context_path(index)
+        documents.append({
+            "path": path,
+            "content": json.dumps(item, ensure_ascii=False, sort_keys=True),
+        })
+
+    if not documents:
+        context_text = result.get("context_text")
+        documents = [
+            {
+                "path": _fallback_context_path(0),
+                "content": str(context_text) if context_text is not None else "",
+            }
+        ]
+
+    manifest_id = _find_first_manifest_id(evidence_records)
+    return documents, {
+        "retrieval_status": retrieval_status,
+        "retrieval_mode": "live_serena_mcp",
+        "serena_manifest_id": manifest_id,
+        "serena_pinned_ref": (
+            manifest_id.split(":", 1)[1]
+            if manifest_id and manifest_id.startswith("serena_tool_manifest_v1:")
+            else None
+        ),
+        "context_files_count": len(context_paths),
+        "evidence_record_count": len(documents),
+        "manifest_drift_failed": False,
+        "failure_class": (
+            result.get("failure_class")
+            if retrieval_status == "failed"
+            else None
+        ),
+    }
+
+
+def _find_first_manifest_id(records: list[Mapping[str, Any]]) -> str | None:
+    for item in records:
+        manifest_id = item.get("manifest_id")
+        if isinstance(manifest_id, str) and manifest_id.strip():
+            return manifest_id
+        source = item.get("source")
+        if isinstance(source, Mapping):
+            source_manifest = source.get("manifest_id")
+            if isinstance(source_manifest, str) and source_manifest.strip():
+                return source_manifest
+    return None
 
 
 def _build_local_asset_prompt(
@@ -2442,6 +2594,8 @@ def _validate_agy_request(request: Mapping[str, Any]) -> list[str]:
     local_asset_research uses _validate_agy_local_asset_request for full checks.
     """
     errors: list[str] = []
+    if request.get("post_to_issue_url"):
+        errors.append("provider_forbids_post_to_issue_url: provider=agy forbids post_to_issue_url for all profiles")
     if request.get("schema") != "delegation_request_v1":
         errors.append("schema must equal delegation_request_v1 for provider=agy")
     tool_profile = request.get("tool_profile")
@@ -2450,8 +2604,6 @@ def _validate_agy_request(request: Mapping[str, Any]) -> list[str]:
             f"unsupported_provider_profile: provider=agy only supports profiles "
             f"{sorted(AGY_SUPPORTED_PROFILES)}, got {tool_profile!r}"
         )
-    if request.get("post_to_issue_url"):
-        errors.append("provider_forbids_post_to_issue_url: provider=agy forbids post_to_issue_url for all profiles")
     if request.get("model"):
         errors.append(
             "unsupported_provider_option: provider=agy does not support explicit model selection"
@@ -2483,7 +2635,781 @@ def _validate_agy_local_asset_request(request: Mapping[str, Any], request_path: 
     return errors
 
 
-def run_delegation(
+# ---------------------------------------------------------------------------
+# delegation_audit_v1 (Issue #1272)
+# ---------------------------------------------------------------------------
+# Closed-schema, independent JSONL audit stream for every top-level
+# run_delegation() invocation. Deliberately separate from the
+# delegation_result/v1 return value and from --output-file / --output-format
+# / stdout / stderr: audit records are only ever written to the path resolved
+# by _resolve_audit_log_path() (CLI --audit-log or DELEGATION_AUDIT_LOG_PATH
+# env var), and only when that path resolves to non-empty.
+#
+# Exactly one "start" record and one "end" record, sharing the same run_id,
+# are emitted per top-level run_delegation() call -- nested re-entrant calls
+# (provider="auto" fallback attempts) go through _run_delegation_core()
+# directly and never emit their own pair (see run_delegation() below and
+# provider_auto_dispatch()).
+
+DELEGATION_AUDIT_SCHEMA_VERSION = "delegation_audit_v1"
+
+_AUDIT_RECORD_TYPES: frozenset[str] = frozenset({"start", "end"})
+
+_AUDIT_START_REQUIRED_KEYS: frozenset[str] = frozenset({
+    "schema",
+    "record_type",
+    "run_id",
+    "ts",
+    "provider_requested",
+    "tool_profile",
+})
+_AUDIT_START_OPTIONAL_KEYS: frozenset[str] = frozenset({
+    "role",
+    "model_requested",
+    "parent_run_id",
+    "subtask_id",
+    "attempt_id",
+})
+_AUDIT_START_ALL_KEYS: frozenset[str] = _AUDIT_START_REQUIRED_KEYS | _AUDIT_START_OPTIONAL_KEYS
+
+_AUDIT_END_REQUIRED_KEYS: frozenset[str] = frozenset({
+    "schema",
+    "record_type",
+    "run_id",
+    "ts",
+    "ok",
+    "failure_class",
+    "failure_reason",
+    "actual_model",
+    "tool_profile",
+})
+_AUDIT_END_OPTIONAL_KEYS: frozenset[str] = frozenset({
+    "selected_provider",
+    "provider_attempts",
+    "fallback_reason",
+    "fallback_policy_version",
+    "attempts_by_model",
+    "model_downgrades",
+    "post_result",
+    "grounded_metadata",
+    "local_asset_metadata",
+    "auth_diagnostics_metadata",
+    "parent_run_id",
+    "subtask_id",
+    "attempt_id",
+})
+_AUDIT_END_ALL_KEYS: frozenset[str] = _AUDIT_END_REQUIRED_KEYS | _AUDIT_END_OPTIONAL_KEYS
+
+
+def _sha256_stable_json(value: Any) -> str:
+    serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+_AUDIT_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+# Reserved fan-out fields (Issue #1273 / AC8) -- always optional, never
+# required, on either record type.
+_AUDIT_RESERVED_FANOUT_KEYS: tuple[str, ...] = ("parent_run_id", "subtask_id", "attempt_id")
+
+# AGY failure classes that indicate an authentication/authorization problem
+# (Issue #1267 agy_auth_diagnostics_v1 territory). Reused here, rather than
+# re-implemented, so the audit auth_diagnostics_metadata reflects the same
+# failure_class enum _classify_agy_failure() already produces.
+_AGY_AUTH_RELATED_FAILURE_CLASSES: frozenset[str] = frozenset({
+    "agy_auth_required",
+    "agy_permission_denied",
+})
+
+# Public-safe subset of _build_agy_grounded_research_metadata()'s output
+# (Issue #1266). Deliberately excludes citation_evidence and
+# grounding_transcript_evidence, which may carry raw model transcript text.
+_GROUNDED_METADATA_PUBLIC_SAFE_KEYS: tuple[str, ...] = (
+    "grounding_actor",
+    "grounding_backend",
+    "grounding_status",
+    "web_tool_call_count",
+    "search_query_count",
+    "url_citation_count",
+    "grounding_failure_class",
+    "raw_transcript_included",
+    "raw_credential_included",
+    "repo_absolute_path_included",
+)
+
+_AUDIT_FAILURE_REASON_MAX_LEN = 500
+
+_AUDIT_LOG_PATH_ENV_VAR = "DELEGATION_AUDIT_LOG_PATH"
+_AUDIT_REQUIRED_ENV_VAR = "DELEGATION_AUDIT_REQUIRED"
+
+# CLI --audit-log takes priority over the env var; both are "明示" activation
+# per AC3 (never enabled implicitly).
+_AUDIT_LOG_OVERRIDE: Path | None = None
+
+
+def set_audit_log_path_override(path: Path | None) -> None:
+    """Set (or clear, with None) the CLI-provided --audit-log path.
+
+    Exposed as a module-level function (rather than a private-only global)
+    so tests can drive it deterministically without relying on env var
+    mutation.
+    """
+    global _AUDIT_LOG_OVERRIDE
+    _AUDIT_LOG_OVERRIDE = path
+
+
+def _resolve_audit_log_path() -> Path | None:
+    """Resolve the delegation_audit_v1 JSONL output path, or None if
+    audit logging is not explicitly enabled (AC3: --audit-log or explicit
+    env var only -- never enabled implicitly)."""
+    if _AUDIT_LOG_OVERRIDE is not None:
+        return _AUDIT_LOG_OVERRIDE
+    raw = os.environ.get(_AUDIT_LOG_PATH_ENV_VAR, "").strip()
+    if not raw:
+        return None
+    return Path(raw)
+
+
+def _audit_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _audit_new_run_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _audit_mask_text(text_value: str) -> str:
+    """Redaction-before-truncate building block (AC4): credential masking
+    reuses _redact_text(); HOME and repo-absolute-path masking are audit-log
+    specific (the delegation_result/v1 contract does not mask these)."""
+    if not text_value:
+        return text_value
+    masked = _redact_text(text_value)
+    home = os.path.expanduser("~")
+    if home and home != "~":
+        masked = masked.replace(home, "<HOME>")
+    try:
+        repo_root = str(_repo_root())
+    except Exception:  # pylint: disable=broad-except
+        repo_root = ""
+    if repo_root:
+        masked = masked.replace(repo_root, "<REPO_ROOT>")
+    return masked
+
+
+def _audit_prepare_failure_reason(raw: Any) -> str | None:
+    """Mask THEN truncate (never the reverse -- truncating first could cut a
+    credential mid-token and let the remaining fragment slip past the
+    redaction regex, Issue #1272 AC4)."""
+    if not raw:
+        return None
+    masked = _audit_mask_text(str(raw))
+    return masked[:_AUDIT_FAILURE_REASON_MAX_LEN]
+
+
+def _audit_redact_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _audit_mask_text(value)
+    if isinstance(value, dict):
+        return {key: _audit_redact_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_audit_redact_value(item) for item in value]
+    return value
+
+
+def _iter_string_leaves(value: Any, path: str = "record") -> list[tuple[str, str]]:
+    leaves: list[tuple[str, str]] = []
+    if isinstance(value, str):
+        leaves.append((path, value))
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            leaves.extend(_iter_string_leaves(item, f"{path}.{key}"))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            leaves.extend(_iter_string_leaves(item, f"{path}[{index}]"))
+    return leaves
+
+
+def validate_delegation_audit_record(record: Mapping[str, Any]) -> list[str]:
+    """Fail-closed validator for a single delegation_audit_v1 record.
+
+    Returns a list of human-readable errors (empty == valid). Enforces a
+    *closed* schema: any key outside the allowed set for the record's
+    record_type is rejected (Issue #1272 AC1), required keys/types are
+    checked, and the redaction invariant (AC4) is checked on every string
+    leaf via _scan_redaction_violations().
+    """
+    errors: list[str] = []
+    if not isinstance(record, Mapping):
+        return ["record must be a mapping"]
+
+    if record.get("schema") != DELEGATION_AUDIT_SCHEMA_VERSION:
+        errors.append(f"schema must equal {DELEGATION_AUDIT_SCHEMA_VERSION!r}")
+
+    record_type = record.get("record_type")
+    if record_type not in _AUDIT_RECORD_TYPES:
+        errors.append(f"record_type must be one of {sorted(_AUDIT_RECORD_TYPES)}")
+        return errors  # cannot validate further without a known record_type
+
+    allowed_keys = _AUDIT_START_ALL_KEYS if record_type == "start" else _AUDIT_END_ALL_KEYS
+    required_keys = _AUDIT_START_REQUIRED_KEYS if record_type == "start" else _AUDIT_END_REQUIRED_KEYS
+
+    unknown_keys = set(record) - allowed_keys
+    if unknown_keys:
+        errors.append(f"unknown key(s) for record_type={record_type!r}: {sorted(unknown_keys)}")
+
+    missing_keys = required_keys - set(record)
+    if missing_keys:
+        errors.append(f"missing required key(s) for record_type={record_type!r}: {sorted(missing_keys)}")
+
+    run_id = record.get("run_id")
+    if not isinstance(run_id, str) or not run_id.strip():
+        errors.append("run_id must be a non-empty string")
+
+    ts = record.get("ts")
+    if not isinstance(ts, str) or not _AUDIT_TS_RE.match(ts):
+        errors.append("ts must be an ISO-8601 UTC string matching YYYY-MM-DDTHH:MM:SSZ")
+
+    if record_type == "start":
+        if not isinstance(record.get("provider_requested"), str):
+            errors.append("provider_requested must be a string")
+        if not isinstance(record.get("tool_profile"), str):
+            errors.append("tool_profile must be a string")
+        if "role" in record and record["role"] is not None and not isinstance(record["role"], str):
+            errors.append("role must be a string when present")
+        if "model_requested" in record and record["model_requested"] is not None and not isinstance(
+            record["model_requested"], str
+        ):
+            errors.append("model_requested must be a string when present")
+    else:
+        if not isinstance(record.get("ok"), bool):
+            errors.append("ok must be a bool")
+        if record.get("failure_class") is not None and not isinstance(record["failure_class"], str):
+            errors.append("failure_class must be a string or null")
+        if record.get("failure_reason") is not None and not isinstance(record["failure_reason"], str):
+            errors.append("failure_reason must be a string or null")
+        if not isinstance(record.get("actual_model"), str):
+            errors.append("actual_model must be a string")
+        if not isinstance(record.get("tool_profile"), str):
+            errors.append("tool_profile must be a string")
+        if "provider_attempts" in record and record["provider_attempts"] is not None:
+            if not isinstance(record["provider_attempts"], list) or not all(
+                isinstance(item, dict) for item in record["provider_attempts"]
+            ):
+                errors.append("provider_attempts must be a list of objects when present")
+        if "attempts_by_model" in record and record["attempts_by_model"] is not None and not isinstance(
+            record["attempts_by_model"], dict
+        ):
+            errors.append("attempts_by_model must be an object when present")
+        if "model_downgrades" in record and record["model_downgrades"] is not None and not isinstance(
+            record["model_downgrades"], list
+        ):
+            errors.append("model_downgrades must be a list when present")
+        if "post_result" in record and record["post_result"] is not None and not isinstance(
+            record["post_result"], dict
+        ):
+            errors.append("post_result must be an object when present")
+        elif isinstance(record.get("post_result"), dict):
+            post_result = record["post_result"]
+            allowed_post_keys = {
+                "post_requested",
+                "post_allowed",
+                "post_target_type",
+                "request_success",
+                "posting_success",
+                "post_result",
+                "post_failure_class",
+            }
+            unknown_post_keys = set(post_result) - allowed_post_keys
+            if unknown_post_keys:
+                errors.append(f"post_result has unknown key(s): {sorted(unknown_post_keys)}")
+            required_post_keys = {
+                "post_requested",
+                "post_allowed",
+                "post_target_type",
+                "request_success",
+                "posting_success",
+                "post_result",
+                "post_failure_class",
+            }
+            missing_post_keys = required_post_keys - set(post_result)
+            if missing_post_keys:
+                errors.append(f"post_result missing required key(s): {sorted(missing_post_keys)}")
+            if "post_requested" in post_result and not isinstance(post_result["post_requested"], bool):
+                errors.append("post_result.post_requested must be a bool")
+            if "post_allowed" in post_result and not isinstance(post_result["post_allowed"], bool):
+                errors.append("post_result.post_allowed must be a bool")
+            if "post_target_type" in post_result and post_result["post_target_type"] != "issue_only":
+                errors.append("post_result.post_target_type must equal 'issue_only'")
+            if "request_success" in post_result and not isinstance(post_result["request_success"], bool):
+                errors.append("post_result.request_success must be a bool")
+            if (
+                "posting_success" in post_result
+                and post_result["posting_success"] is not None
+                and not isinstance(post_result["posting_success"], bool)
+            ):
+                errors.append("post_result.posting_success must be a bool or null")
+            if "post_result" in post_result and not isinstance(post_result["post_result"], str):
+                errors.append("post_result.post_result must be a string")
+            if (
+                "post_failure_class" in post_result
+                and post_result["post_failure_class"] is not None
+                and not isinstance(post_result["post_failure_class"], str)
+            ):
+                errors.append("post_result.post_failure_class must be a string or null")
+        if "grounded_metadata" in record and record["grounded_metadata"] is not None:
+            grounded = record["grounded_metadata"]
+            if not isinstance(grounded, dict):
+                errors.append("grounded_metadata must be an object when present")
+            else:
+                unknown_grounded_keys = set(grounded) - set(_GROUNDED_METADATA_PUBLIC_SAFE_KEYS)
+                if unknown_grounded_keys:
+                    errors.append(f"grounded_metadata has unknown key(s): {sorted(unknown_grounded_keys)}")
+        if "local_asset_metadata" in record and record["local_asset_metadata"] is not None:
+            local_asset = record["local_asset_metadata"]
+            if not isinstance(local_asset, dict):
+                errors.append("local_asset_metadata must be an object when present")
+            else:
+                allowed_local_asset_keys = {
+                    "profile",
+                    "retrieval_status",
+                    "retrieval_mode",
+                    "serena_manifest_id",
+                    "serena_pinned_ref",
+                    "read_only_allowlist_sha256",
+                    "dangerous_denylist_sha256",
+                    "live_tools_list_sha256",
+                    "manifest_drift_failed",
+                    "context_files_count",
+                    "evidence_record_count",
+                    "failure_class",
+                }
+                unknown_local_asset_keys = set(local_asset) - allowed_local_asset_keys
+                if unknown_local_asset_keys:
+                    errors.append(
+                        f"local_asset_metadata has unknown key(s): {sorted(unknown_local_asset_keys)}"
+                    )
+                if not isinstance(local_asset.get("profile"), str):
+                    errors.append("local_asset_metadata.profile must be a string")
+                context_files_count = local_asset.get("context_files_count")
+                if isinstance(context_files_count, bool) or not isinstance(context_files_count, int):
+                    errors.append("local_asset_metadata.context_files_count must be an int")
+                retrieval_status = local_asset.get("retrieval_status")
+                if retrieval_status is not None and retrieval_status not in {"succeeded", "failed", "not_applicable"}:
+                    errors.append(
+                        "local_asset_metadata.retrieval_status must be one of "
+                        "{'succeeded', 'failed', 'not_applicable'} when present"
+                    )
+                if "retrieval_mode" in local_asset and (
+                    not isinstance(local_asset.get("retrieval_mode"), str)
+                    or not local_asset.get("retrieval_mode").strip()
+                ):
+                    errors.append("local_asset_metadata.retrieval_mode must be a non-empty string")
+                for key in (
+                    "serena_manifest_id",
+                    "serena_pinned_ref",
+                    "read_only_allowlist_sha256",
+                    "dangerous_denylist_sha256",
+                    "live_tools_list_sha256",
+                    "failure_class",
+                ):
+                    if key in local_asset and not isinstance(local_asset.get(key), str):
+                        errors.append(f"local_asset_metadata.{key} must be a string when present")
+                if (
+                    "manifest_drift_failed" in local_asset
+                    and not isinstance(local_asset.get("manifest_drift_failed"), bool)
+                ):
+                    errors.append("local_asset_metadata.manifest_drift_failed must be a bool when present")
+                evidence_record_count = local_asset.get("evidence_record_count")
+                if evidence_record_count is not None and (
+                    isinstance(evidence_record_count, bool) or not isinstance(evidence_record_count, int)
+                ):
+                    errors.append("local_asset_metadata.evidence_record_count must be an int when present")
+        if "auth_diagnostics_metadata" in record and record["auth_diagnostics_metadata"] is not None:
+            auth_diagnostics = record["auth_diagnostics_metadata"]
+            if not isinstance(auth_diagnostics, dict):
+                errors.append("auth_diagnostics_metadata must be an object when present")
+            else:
+                unknown_auth_keys = set(auth_diagnostics) - {
+                    "schema",
+                    "auth_failure_class",
+                    "auth_mode",
+                    "keyring_available",
+                    "tty_mode",
+                    "dbus_session_bus_present",
+                    "xdg_runtime_dir_present",
+                    "ssh_session_detected",
+                    "recovery_action",
+                }
+                if unknown_auth_keys:
+                    errors.append(
+                        f"auth_diagnostics_metadata has unknown key(s): {sorted(unknown_auth_keys)}"
+                    )
+                if auth_diagnostics.get("auth_failure_class") not in _AGY_AUTH_RELATED_FAILURE_CLASSES:
+                    errors.append(
+                        "auth_diagnostics_metadata.auth_failure_class must be one of "
+                        f"{sorted(_AGY_AUTH_RELATED_FAILURE_CLASSES)}"
+                    )
+                if not isinstance(auth_diagnostics.get("keyring_available"), bool):
+                    errors.append("auth_diagnostics_metadata.keyring_available must be a bool")
+                if not isinstance(auth_diagnostics.get("tty_mode"), bool):
+                    errors.append("auth_diagnostics_metadata.tty_mode must be a bool")
+                if not isinstance(auth_diagnostics.get("dbus_session_bus_present"), bool):
+                    errors.append("auth_diagnostics_metadata.dbus_session_bus_present must be a bool")
+                if not isinstance(auth_diagnostics.get("xdg_runtime_dir_present"), bool):
+                    errors.append("auth_diagnostics_metadata.xdg_runtime_dir_present must be a bool")
+                if not isinstance(auth_diagnostics.get("ssh_session_detected"), bool):
+                    errors.append("auth_diagnostics_metadata.ssh_session_detected must be a bool")
+                if "auth_mode" in auth_diagnostics and not isinstance(auth_diagnostics.get("auth_mode"), str):
+                    errors.append("auth_diagnostics_metadata.auth_mode must be a string")
+                if (
+                    "recovery_action" in auth_diagnostics
+                    and auth_diagnostics.get("recovery_action") is not None
+                    and not isinstance(auth_diagnostics.get("recovery_action"), str)
+                ):
+                    errors.append("auth_diagnostics_metadata.recovery_action must be a string when present")
+                if auth_diagnostics.get("schema") != "agy_auth_diagnostics_v1":
+                    errors.append("auth_diagnostics_metadata.schema must equal 'agy_auth_diagnostics_v1'")
+        if "provider_attempts" in record and isinstance(record.get("provider_attempts"), list):
+            for index, attempt in enumerate(record["provider_attempts"]):
+                if not isinstance(attempt, dict):
+                    continue
+                allowed_attempt_keys = {
+                    "provider",
+                    "ok",
+                    "failure_class",
+                    "failure_reason",
+                    "exit_code",
+                    "retryable_for_provider_fallback",
+                    "model_downgrades",
+                    "model_chain",
+                    "attempts_by_model",
+                    "post_to_issue_url_requested",
+                    "post_result",
+                    "stopped_by",
+                }
+                unknown_attempt_keys = set(attempt) - allowed_attempt_keys
+                if unknown_attempt_keys:
+                    errors.append(
+                        f"provider_attempts[{index}] has unknown key(s): {sorted(unknown_attempt_keys)}"
+                    )
+                if not isinstance(attempt.get("provider"), str):
+                    errors.append(f"provider_attempts[{index}].provider must be a string")
+                if not isinstance(attempt.get("ok"), bool):
+                    errors.append(f"provider_attempts[{index}].ok must be a bool")
+                if attempt.get("failure_class") is not None and not isinstance(attempt["failure_class"], str):
+                    errors.append(f"provider_attempts[{index}].failure_class must be a string or null")
+                if attempt.get("failure_reason") is not None and not isinstance(attempt["failure_reason"], str):
+                    errors.append(f"provider_attempts[{index}].failure_reason must be a string or null")
+                exit_code = attempt.get("exit_code")
+                if exit_code is not None and (isinstance(exit_code, bool) or not isinstance(exit_code, int)):
+                    errors.append(f"provider_attempts[{index}].exit_code must be an int or null")
+                retryable = attempt.get("retryable_for_provider_fallback")
+                if retryable is not None and not isinstance(retryable, bool):
+                    errors.append(
+                        f"provider_attempts[{index}].retryable_for_provider_fallback must be a bool or null"
+                    )
+                if attempt.get("model_chain") is not None and (
+                    not isinstance(attempt["model_chain"], list)
+                    or not all(isinstance(item, str) for item in attempt["model_chain"])
+                ):
+                    errors.append(f"provider_attempts[{index}].model_chain must be a list of strings or null")
+                attempt_counts = attempt.get("attempts_by_model")
+                if attempt_counts is not None:
+                    if not isinstance(attempt_counts, dict):
+                        errors.append(f"provider_attempts[{index}].attempts_by_model must be an object or null")
+                    else:
+                        for model_name, count in attempt_counts.items():
+                            if not isinstance(model_name, str):
+                                errors.append(
+                                    f"provider_attempts[{index}].attempts_by_model keys must be strings"
+                                )
+                                break
+                            if isinstance(count, bool) or not isinstance(count, int):
+                                errors.append(
+                                    f"provider_attempts[{index}].attempts_by_model values must be ints"
+                                )
+                                break
+                post_requested = attempt.get("post_to_issue_url_requested")
+                if post_requested is not None and not isinstance(post_requested, bool):
+                    errors.append(
+                        f"provider_attempts[{index}].post_to_issue_url_requested must be a bool or null"
+                    )
+                if attempt.get("post_result") is not None and not isinstance(attempt["post_result"], str):
+                    errors.append(f"provider_attempts[{index}].post_result must be a string or null")
+                if attempt.get("stopped_by") is not None and not isinstance(attempt["stopped_by"], str):
+                    errors.append(f"provider_attempts[{index}].stopped_by must be a string or null")
+        if "attempts_by_model" in record and isinstance(record.get("attempts_by_model"), dict):
+            for model_name, count in record["attempts_by_model"].items():
+                if not isinstance(model_name, str):
+                    errors.append("attempts_by_model keys must be strings")
+                    break
+                if isinstance(count, bool) or not isinstance(count, int):
+                    errors.append("attempts_by_model values must be ints")
+                    break
+
+    for reserved_key in _AUDIT_RESERVED_FANOUT_KEYS:
+        if reserved_key in record and record[reserved_key] is not None and not isinstance(
+            record[reserved_key], str
+        ):
+            errors.append(f"{reserved_key} must be a string when present")
+
+    for path, leaf_value in _iter_string_leaves(record):
+        violations = _scan_redaction_violations(leaf_value)
+        if violations:
+            errors.append(f"redaction invariant violated for path={path!r}: {violations}")
+
+    return errors
+
+
+def _audit_build_start_record(run_id: str, request: Mapping[str, Any]) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "schema": DELEGATION_AUDIT_SCHEMA_VERSION,
+        "record_type": "start",
+        "run_id": run_id,
+        "ts": _audit_now_iso(),
+        "provider_requested": str(request.get("provider", "gemini")),
+        "tool_profile": str(request.get("tool_profile", "unknown")),
+    }
+    role = request.get("role")
+    if role is not None:
+        record["role"] = str(role)
+    model_requested = request.get("model")
+    if model_requested is not None:
+        record["model_requested"] = str(model_requested)
+    for reserved_key in _AUDIT_RESERVED_FANOUT_KEYS:
+        value = request.get(reserved_key)
+        if value is not None:
+            record[reserved_key] = str(value)
+    return _audit_redact_value(record)
+
+
+def _audit_public_safe_provider_attempts(attempts: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(attempts, list):
+        return None
+    safe: list[dict[str, Any]] = []
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        safe_attempt = dict(attempt)
+        if "failure_reason" in safe_attempt:
+            safe_attempt["failure_reason"] = _audit_prepare_failure_reason(safe_attempt.get("failure_reason"))
+        safe.append(safe_attempt)
+    return safe
+
+
+def _audit_build_grounded_metadata(result: Mapping[str, Any]) -> dict[str, Any] | None:
+    evidence = result.get("grounded_research_evidence")
+    if not isinstance(evidence, dict):
+        return None
+    return {
+        key: evidence.get(key)
+        for key in _GROUNDED_METADATA_PUBLIC_SAFE_KEYS
+        if key in evidence
+    }
+
+
+def _audit_build_local_asset_metadata(
+    request: Mapping[str, Any], result: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    tool_profile = str(result.get("tool_profile") or request.get("tool_profile") or "")
+    if tool_profile != LOCAL_ASSET_RESEARCH_PROFILE:
+        return None
+    context_files = request.get("context_files")
+    context_files_count = len(context_files) if isinstance(context_files, list) else 0
+    failure_class = result.get("failure_class")
+    evidence_metadata = result.get("local_asset_retrieval_metadata")
+    if not isinstance(evidence_metadata, Mapping):
+        evidence_metadata = {}
+    evidence_context_files_count = evidence_metadata.get("context_files_count", context_files_count)
+    payload: dict[str, Any] = {
+        "profile": tool_profile,
+        "context_files_count": evidence_context_files_count,
+        "retrieval_status": (
+            evidence_metadata.get("retrieval_status")
+            if isinstance(evidence_metadata.get("retrieval_status"), str)
+            else (
+                (
+                    "failed"
+                    if isinstance(failure_class, str)
+                    and "live_serena_mcp_failed" in failure_class
+                    else "succeeded"
+                )
+            )
+        ),
+        "retrieval_mode": evidence_metadata.get("retrieval_mode"),
+        "serena_manifest_id": evidence_metadata.get("serena_manifest_id"),
+        "serena_pinned_ref": evidence_metadata.get("serena_pinned_ref"),
+        "read_only_allowlist_sha256": evidence_metadata.get("read_only_allowlist_sha256"),
+        "dangerous_denylist_sha256": evidence_metadata.get("dangerous_denylist_sha256"),
+        "live_tools_list_sha256": evidence_metadata.get("live_tools_list_sha256"),
+        "manifest_drift_failed": evidence_metadata.get("manifest_drift_failed"),
+        "evidence_record_count": evidence_metadata.get("evidence_record_count"),
+        "failure_class": evidence_metadata.get("failure_class", failure_class),
+    }
+    return {k: v for k, v in payload.items() if v is not None}
+
+
+def _audit_build_auth_diagnostics_metadata(result: Mapping[str, Any]) -> dict[str, Any] | None:
+    failure_class = result.get("failure_class")
+    if not isinstance(failure_class, str) or failure_class not in _AGY_AUTH_RELATED_FAILURE_CLASSES:
+        return None
+    recovery_action = None
+    if failure_class == "agy_auth_required":
+        recovery_action = "re-authenticate_credentials"
+    elif failure_class == "agy_permission_denied":
+        recovery_action = "check_auth_credential_permissions"
+    return {
+        "schema": "agy_auth_diagnostics_v1",
+        "auth_failure_class": failure_class,
+        "auth_mode": os.environ.get("AGY_AUTH_MODE", "default"),
+        "keyring_available": "KEYRING_SESSION_KEYRING" in os.environ
+        or "GNOME_KEYRING_CONTROL" in os.environ
+        or "KDE_FULL_SESSION" in os.environ,
+        "tty_mode": sys.stdin.isatty(),
+        "dbus_session_bus_present": bool(os.environ.get("DBUS_SESSION_BUS_ADDRESS")),
+        "xdg_runtime_dir_present": bool(os.environ.get("XDG_RUNTIME_DIR")),
+        "ssh_session_detected": bool(
+            os.environ.get("SSH_CLIENT")
+            or os.environ.get("SSH_CONNECTION")
+            or os.environ.get("SSH_TTY")
+        ),
+        "recovery_action": recovery_action,
+    }
+
+
+def _audit_build_post_result(request: Mapping[str, Any], result: Mapping[str, Any]) -> dict[str, Any] | None:
+    if not request.get("post_to_issue_url"):
+        return None
+    failure_class = result.get("failure_class")
+    agy_forbidden_post = (
+        request.get("provider") == "agy"
+        and failure_class in {"provider_forbids_post_to_issue_url", "agy_post_to_issue_url_forbidden"}
+    )
+    post_allowed = not agy_forbidden_post
+    request_success = bool(result.get("post_request_success")) if post_allowed else False
+    posting_success = result.get("post_posting_success") if post_allowed else None
+    post_result_value = result.get("post_result")
+    if not post_allowed:
+        post_result_value = "forbidden"
+    return {
+        "post_requested": True,
+        "post_allowed": post_allowed,
+        "post_target_type": "issue_only",
+        "request_success": request_success,
+        "posting_success": posting_success,
+        "post_result": post_result_value or "not_attempted",
+        "post_failure_class": (
+            "agy_post_to_issue_url_forbidden"
+            if agy_forbidden_post
+            else result.get("post_failure_class")
+        ),
+    }
+
+
+def _build_delegation_audit_record(
+    run_id: str, request: Mapping[str, Any], result: Mapping[str, Any]
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "schema": DELEGATION_AUDIT_SCHEMA_VERSION,
+        "record_type": "end",
+        "run_id": run_id,
+        "ts": _audit_now_iso(),
+        "ok": bool(result.get("ok", False)),
+        "failure_class": result.get("failure_class"),
+        "failure_reason": _audit_prepare_failure_reason(result.get("failure_reason")),
+        "actual_model": str(result.get("actual_model", "unknown")),
+        "tool_profile": str(result.get("tool_profile", request.get("tool_profile", "unknown"))),
+    }
+    # selected_provider is only present on provider="auto" results; once it
+    # is present, fallback_reason and fallback_policy_version are recorded
+    # even when fallback_reason is None (first-provider success), so the
+    # audit end record always exposes the full provider_auto_policy_v1 field
+    # set together rather than silently dropping a null fallback_reason.
+    if "selected_provider" in result and result["selected_provider"] is not None:
+        record["selected_provider"] = result["selected_provider"]
+        record["fallback_reason"] = result.get("fallback_reason")
+        record["fallback_policy_version"] = result.get("fallback_policy_version")
+    provider_attempts = _audit_public_safe_provider_attempts(result.get("provider_attempts"))
+    if provider_attempts is not None:
+        record["provider_attempts"] = provider_attempts
+    if result.get("attempts_by_model"):
+        record["attempts_by_model"] = result["attempts_by_model"]
+    if result.get("model_downgrades"):
+        record["model_downgrades"] = result["model_downgrades"]
+    post_result = _audit_build_post_result(request, result)
+    if post_result is not None:
+        record["post_result"] = post_result
+    grounded_metadata = _audit_build_grounded_metadata(result)
+    if grounded_metadata is not None:
+        record["grounded_metadata"] = grounded_metadata
+    local_asset_metadata = _audit_build_local_asset_metadata(request, result)
+    if local_asset_metadata is not None:
+        record["local_asset_metadata"] = local_asset_metadata
+    auth_diagnostics_metadata = _audit_build_auth_diagnostics_metadata(result)
+    if auth_diagnostics_metadata is not None:
+        record["auth_diagnostics_metadata"] = auth_diagnostics_metadata
+    for reserved_key in _AUDIT_RESERVED_FANOUT_KEYS:
+        value = request.get(reserved_key)
+        if value is not None:
+            record[reserved_key] = str(value)
+    return _audit_redact_value(record)
+
+
+def _audit_handle_failure(message: str) -> None:
+    """Audit failure policy (AC9): best-effort by default (a broken audit
+    sink must never break delegation itself), fail-closed only when the
+    caller has opted in via DELEGATION_AUDIT_REQUIRED=1."""
+    if os.environ.get(_AUDIT_REQUIRED_ENV_VAR, "").strip() == "1":
+        raise RuntimeError(f"delegation_audit_v1 failure (fail-closed): {message}")
+    sys.stderr.write(f"[gemini-headless] warning: delegation_audit_v1: {message}\n")
+
+
+def _audit_write_record(path: Path, record: Mapping[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        encoded_line = (json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n").encode("utf-8")
+        fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            offset = 0
+            while offset < len(encoded_line):
+                written = os.write(fd, encoded_line[offset:])
+                if written <= 0:
+                    raise RuntimeError("partial write returned 0 bytes")
+                offset += written
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        _audit_handle_failure(f"write failed: {exc}")
+
+
+def _audit_begin(request: Mapping[str, Any]) -> dict[str, Any] | None:
+    audit_path = _resolve_audit_log_path()
+    if audit_path is None:
+        return None
+    run_id = _audit_new_run_id()
+    start_record = _audit_build_start_record(run_id, request)
+    errors = validate_delegation_audit_record(start_record)
+    if errors:
+        _audit_handle_failure(f"invalid start record: {errors}")
+        return {"run_id": run_id, "path": audit_path, "disabled": True}
+    _audit_write_record(audit_path, start_record)
+    return {"run_id": run_id, "path": audit_path, "disabled": False}
+
+
+def _audit_end(
+    state: dict[str, Any] | None, request: Mapping[str, Any], result: Mapping[str, Any]
+) -> None:
+    if state is None or state.get("disabled"):
+        return
+    end_record = _build_delegation_audit_record(state["run_id"], request, result)
+    errors = validate_delegation_audit_record(end_record)
+    if errors:
+        _audit_handle_failure(f"invalid end record: {errors}")
+        return
+    _audit_write_record(state["path"], end_record)
+
+
+def _run_delegation_core(
     request: Mapping[str, Any],
     request_path: Path | None = None,
     _routing: dict[str, Any] | None = None,
@@ -2573,6 +3499,7 @@ def run_delegation(
                 "model_downgrades": [],
             }
         # local_asset_research uses wrapper-side Serena evidence + prompt injection.
+        local_asset_retrieval_metadata: dict[str, Any] | None = None
         if tool_profile == LOCAL_ASSET_RESEARCH_PROFILE:
             repo_root = _repo_root().resolve()
             _, context_paths = _validate_local_asset_context_files(
@@ -2582,8 +3509,22 @@ def run_delegation(
             )
             manifest = load_serena_tool_manifest(repo_root)
             try:
-                evidence_documents = _collect_live_serena_read_only_evidence(context_paths, repo_root, manifest)
+                local_asset_result = _collect_live_serena_read_only_evidence(
+                    context_paths, repo_root, manifest
+                )
+                evidence_documents, local_asset_retrieval_metadata = _coerce_live_serena_retrieval_result(
+                    local_asset_result,
+                    context_paths=context_paths,
+                )
+                if local_asset_retrieval_metadata is not None:
+                    local_asset_retrieval_metadata = {
+                        **local_asset_retrieval_metadata,
+                        "retrieval_status": "succeeded",
+                        "context_files_count": len(context_paths),
+                        "failure_class": None,
+                    }
             except Exception as exc:
+                manifest_id = _serena_manifest_id(manifest)
                 return {
                     "schema": "delegation_result/v1",
                     "transport": "agy",
@@ -2608,6 +3549,23 @@ def run_delegation(
                     "raw_command": _build_agy_raw_command(""),
                     "model_chain": [],
                     "model_downgrades": [],
+                    "local_asset_retrieval_metadata": {
+                        "retrieval_status": "failed",
+                        "retrieval_mode": "live_serena_mcp",
+                        "serena_manifest_id": manifest_id,
+                        "serena_pinned_ref": manifest.get("pinned_ref"),
+                        "read_only_allowlist_sha256": _sha256_stable_json(
+                            list(manifest.get("read_only_allowlist", []))
+                        ),
+                        "dangerous_denylist_sha256": _sha256_stable_json(
+                            list(manifest.get("dangerous_denylist", []))
+                        ),
+                        "live_tools_list_sha256": None,
+                        "manifest_drift_failed": True,
+                        "context_files_count": len(context_paths),
+                        "evidence_record_count": 0,
+                        "failure_class": "local_asset_research live_serena_mcp_failed",
+                    },
                 }
             prompt_text = _build_local_asset_prompt(
                 request,
@@ -2669,6 +3627,7 @@ def run_delegation(
                 "raw_command": _build_agy_raw_command(""),
                 "model_chain": [],
                 "model_downgrades": [],
+                "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
             }
         except FileNotFoundError:
             return {
@@ -2696,6 +3655,7 @@ def run_delegation(
                 "raw_command": _build_agy_raw_command(""),
                 "model_chain": [],
                 "model_downgrades": [],
+                "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
             }
         except PermissionError:
             return {
@@ -2731,6 +3691,7 @@ def run_delegation(
                 "raw_command": _build_agy_raw_command(""),
                 "model_chain": [],
                 "model_downgrades": [],
+                "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
             }
         except Exception as exc:
             return {
@@ -2758,13 +3719,17 @@ def run_delegation(
                 "raw_command": _build_agy_raw_command(""),
                 "model_chain": [],
                 "model_downgrades": [],
+                "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
             }
-        return _normalize_agy_result(
+        result = _normalize_agy_result(
             agy_completed,
             tool_profile=tool_profile_str,
             requested_model=None,
             request_warnings=request_warnings,
         )
+        if local_asset_retrieval_metadata is not None:
+            result["local_asset_retrieval_metadata"] = local_asset_retrieval_metadata
+        return result
 
     validation_errors = validate_request(request, request_path=request_path)
     requested_model = str(request.get("model", DEFAULT_MODEL))
@@ -3188,6 +4153,13 @@ def run_delegation(
         # artifact even when post-processing subsequently fails.
         content_ok = bool(base_result["ok"])
         response_text = base_result.get("response_text") or ""
+        # Issue #1272 AC7: record request success (did the underlying
+        # Gemini/AGY call itself succeed) separately from posting success
+        # (did the gh issue comment mutation succeed), so delegation_audit_v1
+        # can distinguish the two instead of collapsing both into a single
+        # post_result string.
+        base_result["post_request_success"] = content_ok
+        base_result["post_posting_success"] = None
         try:
             post_proc = subprocess.run(
                 ["gh", "issue", "comment", str(post_to_issue_url), "--body", response_text],
@@ -3199,6 +4171,7 @@ def run_delegation(
                 # gh issue comment は成功時に comment URL を stdout に出力する
                 base_result["comment_url"] = post_proc.stdout.strip()
                 base_result["post_result"] = "success"
+                base_result["post_posting_success"] = True
             else:
                 # Major fix_delta: a Gemini success (ok=True) followed by a
                 # failed non-idempotent GitHub comment post must NOT surface
@@ -3211,6 +4184,7 @@ def run_delegation(
                     f" (exit {post_proc.returncode}): {post_proc.stderr.strip()}"
                 )
                 base_result["post_result"] = f"failed: {post_proc.stderr.strip()}"
+                base_result["post_posting_success"] = False
                 base_result["post_failure_class"] = "post_to_issue_url_failed"
                 base_result["ok"] = False
                 base_result["failure_class"] = base_result.get("failure_class") or "post_to_issue_url_failed"
@@ -3221,6 +4195,7 @@ def run_delegation(
         except Exception as exc:
             base_result["warnings"].append(f"post_to_issue_url: unexpected error: {exc}")
             base_result["post_result"] = f"error: {exc}"
+            base_result["post_posting_success"] = False
             base_result["post_failure_class"] = "post_to_issue_url_error"
             base_result["ok"] = False
             base_result["failure_class"] = base_result.get("failure_class") or "post_to_issue_url_error"
@@ -3237,6 +4212,54 @@ def run_delegation(
         )
 
     return base_result
+
+
+# Re-entrancy depth counter (Issue #1272): provider_auto_dispatch() and the
+# ACP fallback both re-enter run_delegation() by name (existing tests patch
+# rgh.run_delegation directly, so the public name/signature cannot change).
+# Only the outermost call -- depth == 1 -- emits a delegation_audit_v1
+# start/end pair; nested re-entrant calls see depth > 1 and skip audit
+# entirely, so each top-level invocation still produces exactly one pair.
+_AUDIT_REENTRANCY_DEPTH = 0
+
+
+def run_delegation(
+    request: Mapping[str, Any],
+    request_path: Path | None = None,
+    _routing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Public entry point for a single delegation invocation.
+
+    Wraps :func:`_run_delegation_core` with delegation_audit_v1 start/end
+    record emission (Issue #1272). Exactly one start record and one end
+    record, sharing a single run_id, are emitted per top-level invocation --
+    nested re-entrant calls (provider="auto" fallback attempts inside
+    provider_auto_dispatch() re-enter this same function) are detected via a
+    depth counter and do not each emit their own pair.
+    """
+    global _AUDIT_REENTRANCY_DEPTH
+    _AUDIT_REENTRANCY_DEPTH += 1
+    is_top_level_call = _AUDIT_REENTRANCY_DEPTH == 1
+    audit_state: dict[str, Any] | None = None
+    try:
+        audit_state = _audit_begin(request) if is_top_level_call else None
+        result = _run_delegation_core(request, request_path=request_path, _routing=_routing)
+        if is_top_level_call:
+            _audit_end(audit_state, request, result)
+        return result
+    except Exception as exc:
+        if is_top_level_call:
+            unexpected_result = {
+                "ok": False,
+                "failure_class": "unexpected_exception",
+                "failure_reason": str(exc),
+                "actual_model": "unknown",
+                "tool_profile": str(request.get("tool_profile", "unknown")),
+            }
+            _audit_end(audit_state, request, unexpected_result)
+        raise
+    finally:
+        _AUDIT_REENTRANCY_DEPTH -= 1
 
 
 def _provider_auto_unsupported_profile_result(
@@ -3500,6 +4523,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Request JSON file path (positional shorthand for --request-file).",
     )
+    parser.add_argument(
+        "--audit-log",
+        required=False,
+        type=Path,
+        default=None,
+        help=(
+            "Write delegation_audit_v1 JSONL start/end records to this path "
+            "(append-only, UTF-8 JSON Lines, one object per line). Independent "
+            "of --output-file / --output-format. Also activatable via the "
+            "DELEGATION_AUDIT_LOG_PATH environment variable; disabled unless "
+            "one of the two is explicitly set (Issue #1272 AC3)."
+        ),
+    )
     return parser
 
 
@@ -3521,67 +4557,72 @@ def _print_stdout_summary(result: dict[str, Any], output_file: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    previous_audit_log_override = _AUDIT_LOG_OVERRIDE
+    set_audit_log_path_override(args.audit_log)
 
-    # Resolve request file: prefer --request-file, fall back to positional argument.
-    request_file: Path | None = args.request_file or args.request_file_positional
+    try:
+        # Resolve request file: prefer --request-file, fall back to positional argument.
+        request_file: Path | None = args.request_file or args.request_file_positional
 
-    # --validate-only mode: validate request JSON without executing Gemini CLI.
-    if args.validate_only:
+        # --validate-only mode: validate request JSON without executing Gemini CLI.
+        if args.validate_only:
+            if request_file is None:
+                print("[gemini-headless] error: --validate-only requires a request file (--request-file or positional)")
+                return 1
+            try:
+                request = _load_json(request_file)
+            except Exception as exc:  # pylint: disable=broad-except
+                print(f"[gemini-headless] error: cannot load request file: {exc}")
+                return 1
+            if not isinstance(request, Mapping):
+                print("[gemini-headless] error: request file must contain a JSON object")
+                return 1
+            errors = validate_request(request, request_path=request_file)
+            if errors:
+                print(f"[gemini-headless] validation FAIL: {errors[0]}")
+                for err in errors[1:]:
+                    print(f"  {err}")
+                return 1
+            print("[gemini-headless] validation OK")
+            return 0
+
+        # Normal execution mode: --request-file and --output-file are required.
         if request_file is None:
-            print("[gemini-headless] error: --validate-only requires a request file (--request-file or positional)")
+            print("[gemini-headless] error: --request-file is required")
             return 1
-        try:
-            request = _load_json(request_file)
-        except Exception as exc:  # pylint: disable=broad-except
-            print(f"[gemini-headless] error: cannot load request file: {exc}")
+        if args.output_file is None:
+            print("[gemini-headless] error: --output-file is required")
             return 1
+
+        request = _load_json(request_file)
         if not isinstance(request, Mapping):
-            print("[gemini-headless] error: request file must contain a JSON object")
-            return 1
-        errors = validate_request(request, request_path=request_file)
-        if errors:
-            print(f"[gemini-headless] validation FAIL: {errors[0]}")
-            for err in errors[1:]:
-                print(f"  {err}")
-            return 1
-        print("[gemini-headless] validation OK")
-        return 0
-
-    # Normal execution mode: --request-file and --output-file are required.
-    if request_file is None:
-        print("[gemini-headless] error: --request-file is required")
-        return 1
-    if args.output_file is None:
-        print("[gemini-headless] error: --output-file is required")
-        return 1
-
-    request = _load_json(request_file)
-    if not isinstance(request, Mapping):
-        result = {
-            "schema": "delegation_result/v1",
-            "ok": False,
-            "requested_model": DEFAULT_MODEL,
-            "actual_model": "unknown",
-            "tool_profile": "unknown",
-            "exit_code": 1,
-            "result_surface": _build_result_surface(ok=False, response_text=None),
-            "response_text": None,
-            "stats": None,
-            "stderr": "request file must contain a JSON object",
-            "warnings": ["request file must contain a JSON object"],
-            "failure_reason": "request file must contain a JSON object",
-            "raw_command": [],
-        }
-    else:
-        result = run_delegation(request, request_path=request_file)
-    if args.compact:
-        result = _apply_compact(result)
-    if args.output_format == "ndjson":
-        _append_ndjson(args.output_file, result)
-    else:
-        _dump_json(args.output_file, result)
-    _print_stdout_summary(result, args.output_file)
-    return 0 if result["ok"] else 1
+            result = {
+                "schema": "delegation_result/v1",
+                "ok": False,
+                "requested_model": DEFAULT_MODEL,
+                "actual_model": "unknown",
+                "tool_profile": "unknown",
+                "exit_code": 1,
+                "result_surface": _build_result_surface(ok=False, response_text=None),
+                "response_text": None,
+                "stats": None,
+                "stderr": "request file must contain a JSON object",
+                "warnings": ["request file must contain a JSON object"],
+                "failure_reason": "request file must contain a JSON object",
+                "raw_command": [],
+            }
+        else:
+            result = run_delegation(request, request_path=request_file)
+        if args.compact:
+            result = _apply_compact(result)
+        if args.output_format == "ndjson":
+            _append_ndjson(args.output_file, result)
+        else:
+            _dump_json(args.output_file, result)
+        _print_stdout_summary(result, args.output_file)
+        return 0 if result["ok"] else 1
+    finally:
+        set_audit_log_path_override(previous_audit_log_override)
 
 
 if __name__ == "__main__":
