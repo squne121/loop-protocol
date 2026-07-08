@@ -184,19 +184,22 @@ SubAgent（役割）── Skill（作業手順）
 |---|---|---|
 | `display_readonly_command` | `readonly_command` | `gh issue view`, `gh pr view`, `gh issue list` |
 | `readonly_artifact_export_command` | `readonly_command` | `gh issue view <N> ... > tmp/<file>` |
-| `github_issue_mutation_command` | `github_remote_ops_command` | `gh issue create/edit`（--repo + --body-file 必須） |
+| `github_issue_mutation_command` | `github_remote_ops_command` | `gh issue create`（--repo + --body-file 必須） |
 | `github_pr_metadata_command` | `github_remote_ops_command` | `gh pr comment/edit`（post-merge-cleanup 最小集合） |
 | `github_destructive_command` | `gh_mutation_denied` | `gh pr merge`, `gh pr checkout`, `gh pr update-branch` |
 
 ### github_issue_mutation_command の allow 条件
 
-managed skill（`create-issue` / `edit-issue`）が `gh issue create` / `gh issue edit` を実行する際:
+managed skill（`create-issue`）が `gh issue create` を実行する際:
 - `--repo squne121/loop-protocol` 必須（完全一致）
 - `--body-file tmp/<path>` 必須（tmp/ 相対パス、`-` は不可）
+- `--title <value>` 必須
 - interactive フラグ（`--editor` / `-e` / `--web` / `-w`）は block
-- `gh issue edit <N>`: N は数値必須
-
-これらの条件を満たさない `gh issue create/edit` は `gh_mutation_denied` でブロックされる。
+raw `gh issue edit` / `gh issue comment` は `gh_mutation_denied` でブロックされる。
+`gh api -f body=...` / `gh api graphql -f query='mutation { ... }'` /
+`gh api --method POST ...` のような allowlist 外 `gh api` は
+`github_api_command` (`gh_api_not_allowed`) でブロックされる。
+これらの条件を満たさない `gh issue create` も `gh_mutation_denied` でブロックされる。
 
 ## issue-refinement-loop Producer / Publisher 責務分割（#1154 / #1165 / #1166、producer/publisher の責務境界）
 

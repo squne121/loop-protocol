@@ -1000,6 +1000,7 @@ def _run_issue_body_update(args, input_data, gh_bin, _fail, _ok) -> int:
     # authority. Marker metadata is checked for consistency, but success or
     # failure is decided by a fresh remote readback below.
     marker_data = None
+    marker_state = "absent"
     if marker_path.exists():
         try:
             marker_data = json.loads(marker_path.read_text())
@@ -1022,14 +1023,11 @@ def _run_issue_body_update(args, input_data, gh_bin, _fail, _ok) -> int:
         if current_body_sha256 == input_data["new_body_sha256"]:
             return _ok({
                 "status_detail": "already_applied",
+                "marker_state": "already_applied_remote_authority",
                 "new_body_sha256": current_body_sha256,
                 "idempotency_marker_found": True,
             })
-        return _fail(
-            f"stale_marker_remote_mismatch: current={current_body_sha256} "
-            f"expected={input_data['new_body_sha256']}",
-            status="failed",
-        )
+        marker_state = "stale_local_marker_recovered"
 
     # -- AC9: stale-write precondition — readback must match previous_* --------
     if current_body_sha256 != input_data["previous_body_sha256"]:
@@ -1086,6 +1084,7 @@ def _run_issue_body_update(args, input_data, gh_bin, _fail, _ok) -> int:
     return _ok({
         "new_body_sha256": actual_new_sha256,
         "idempotency_marker_written": True,
+        "marker_state": marker_state,
     })
 
 
