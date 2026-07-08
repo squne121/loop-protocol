@@ -635,7 +635,7 @@ def test_audit_agy_forbidden_post_to_issue_url_surfaces_forbidden_post_result(tm
     result = rgh.run_delegation(request)
 
     assert result["ok"] is False
-    assert result["failure_class"] == "agy_post_to_issue_url_forbidden"
+    assert result["failure_class"] == "provider_forbids_post_to_issue_url"
     end = _read_jsonl(audit_path)[1]
     assert end["post_result"] == {
         "post_requested": True,

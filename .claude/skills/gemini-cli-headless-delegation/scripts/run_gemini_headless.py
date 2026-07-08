@@ -2447,7 +2447,7 @@ def _validate_agy_request(request: Mapping[str, Any]) -> list[str]:
     """
     errors: list[str] = []
     if request.get("post_to_issue_url"):
-        errors.append("agy_post_to_issue_url_forbidden: provider=agy forbids post_to_issue_url for all profiles")
+        errors.append("provider_forbids_post_to_issue_url: provider=agy forbids post_to_issue_url for all profiles")
     if request.get("schema") != "delegation_request_v1":
         errors.append("schema must equal delegation_request_v1 for provider=agy")
     tool_profile = request.get("tool_profile")
@@ -3012,7 +3012,11 @@ def _audit_build_post_result(request: Mapping[str, Any], result: Mapping[str, An
     if not request.get("post_to_issue_url"):
         return None
     failure_class = result.get("failure_class")
-    post_allowed = failure_class != "agy_post_to_issue_url_forbidden"
+    agy_forbidden_post = (
+        request.get("provider") == "agy"
+        and failure_class in {"provider_forbids_post_to_issue_url", "agy_post_to_issue_url_forbidden"}
+    )
+    post_allowed = not agy_forbidden_post
     request_success = bool(result.get("post_request_success")) if post_allowed else False
     posting_success = result.get("post_posting_success") if post_allowed else None
     post_result_value = result.get("post_result")
@@ -3025,9 +3029,7 @@ def _audit_build_post_result(request: Mapping[str, Any], result: Mapping[str, An
         "request_success": request_success,
         "posting_success": posting_success,
         "post_result": post_result_value or "not_attempted",
-        "post_failure_class": (
-            "agy_post_to_issue_url_forbidden" if not post_allowed else result.get("post_failure_class")
-        ),
+        "post_failure_class": "agy_post_to_issue_url_forbidden" if agy_forbidden_post else result.get("post_failure_class"),
     }
 
 
