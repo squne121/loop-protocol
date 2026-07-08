@@ -167,6 +167,17 @@ button:focus-visible {
   align-items: flex-start;
 }
 
+.battle-hud-layer[data-battle-hud-layout='result-header'] .panel:not(.panel--actions):not(.panel--pause-status) {
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 .battle-hud-layer[data-battle-hud-layout='result-header'] .panel--actions {
   display: flex;
   flex-wrap: wrap;

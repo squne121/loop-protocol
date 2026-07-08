@@ -344,6 +344,15 @@ const commandRail = battleOverlay?.commandRail ?? null
 const battleHudLayer = battleOverlay?.hudLayer ?? null
 const battleScreenLayer = battleOverlay?.screenLayer ?? null
 
+function syncBattleOverlayLayout(): void {
+  const appShell = commandRail?.closest<HTMLElement>('.app-shell') ?? null
+  if (!appShell || !commandRail) return
+
+  const useOverlayHudLayout = state.loopPhase !== 'result'
+  appShell.toggleAttribute('data-battle-layout', useOverlayHudLayout)
+  commandRail.hidden = useOverlayHudLayout
+}
+
 if ((!canvas || !commandRail || !battleHudLayer || !battleScreenLayer) && !isTestRuntime) {
   throw new Error('Application shell is incomplete.')
 }
@@ -589,6 +598,7 @@ const hud = battleHudLayer ? createHudController(battleHudLayer, {
         hasLoadableSnapshot = true
       },
       renderHud() {
+        syncBattleOverlayLayout()
         hud?.render(state, productPause.isPaused, buildUpgradeView())
       },
     })
@@ -689,6 +699,7 @@ function frame(now: number): void {
   }
 
   // AC4: render and HUD continue regardless of pause state
+  syncBattleOverlayLayout()
   hud.render(state, productPause.isPaused, buildUpgradeView())
   renderer.render(state)
   window.requestAnimationFrame(frame)
@@ -735,8 +746,7 @@ function persistProgressionSnapshot(
 }
 
 function resizeArena(currentState: typeof state): void {
-  const usesOverlayHudLayout = commandRail?.hasAttribute('data-battle-placeholder') ?? false
-  const safeSidebar = window.innerWidth > 980 && !usesOverlayHudLayout ? 380 : 32
+  const safeSidebar = window.innerWidth > 980 ? 380 : 32
   const width = Math.min(960, Math.max(640, window.innerWidth - safeSidebar))
   currentState.arena.width = width
   currentState.arena.height = Math.round(width * 0.5625)

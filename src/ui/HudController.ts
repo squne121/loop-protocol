@@ -347,31 +347,12 @@ export function createHudController(
   const resetButton = queryAction(container, 'reset')
   const togglePauseButton = queryAction(container, 'toggle-pause')
   const upgradeWeaponButton = queryAction(container, 'upgrade-weapon')
-  const panels = Array.from(container.querySelectorAll<HTMLElement>(':scope > .panel'))
-  const persistentPanels = new Set<HTMLElement>(
-    panels.filter(
-      (panel) =>
-        panel.classList.contains('panel--actions') || panel.classList.contains('panel--pause-status'),
-    ),
-  )
 
   return {
     render(state, isPaused, upgradeView) {
       container.dataset.battleHudLayout = state.loopPhase === 'result'
         ? 'result-header'
         : 'overlay-stack'
-
-      const resultLayout = state.loopPhase === 'result'
-      for (const panel of panels) {
-        const keepVisible = !resultLayout || persistentPanels.has(panel)
-        panel.hidden = !keepVisible
-        panel.setAttribute('aria-hidden', keepVisible ? 'false' : 'true')
-        if (keepVisible) {
-          panel.removeAttribute('inert')
-        } else {
-          panel.setAttribute('inert', '')
-        }
-      }
 
       hp.textContent = `${formatCombatNumber(state.player.hp)}/${formatCombatNumber(state.player.maxHp)}`
       resources.textContent = `${state.progress.resources}`

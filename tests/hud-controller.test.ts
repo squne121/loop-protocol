@@ -325,9 +325,6 @@ describe('HudController', () => {
     hudController.render(createState('result'), false)
 
     expect(container.dataset.battleHudLayout).toBe('result-header')
-    expect(container.querySelector('.panel--actions')?.hasAttribute('hidden')).toBe(false)
-    expect(container.querySelector('.panel--pause-status')?.hasAttribute('hidden')).toBe(false)
-    expect(container.querySelector('.panel--accent')?.hidden).toBe(true)
   })
 
   it('GIVEN active assist without assigned target WHEN render called THEN assist status reports signal sent', () => {
