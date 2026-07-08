@@ -129,17 +129,17 @@ hook_boundaries_manifest_v1:
       |---|---|---|---|
       | display_readonly_command | readonly_command | gh issue view, gh pr view, gh issue list | DISPLAY_READONLY_PATTERNS に合致 |
       | readonly_artifact_export_command | readonly_command | gh issue view <N> ... > tmp/<file> | `>` で tmp/ 先へのリダイレクトのみ |
-      | github_issue_mutation_command | github_remote_ops_command | gh issue create/edit | --repo squne121/loop-protocol + --body-file tmp/... 必須 |
+      | github_issue_mutation_command | github_remote_ops_command | gh issue create | --repo squne121/loop-protocol + --body-file tmp/... 必須 |
       | github_pr_metadata_command | github_remote_ops_command | gh pr comment/edit | is_github_remote_ops_command で判定 |
       | github_destructive_command | gh_mutation_denied | gh pr merge, gh pr checkout | 上記以外の gh issue/pr mutation |
 
       ### github_issue_mutation_command の allow 条件
 
-      `gh issue create` または `gh issue edit <N>` が以下の条件をすべて満たす場合のみ allow:
+      `gh issue create` が以下の条件をすべて満たす場合のみ allow:
       1. `--repo squne121/loop-protocol` が存在する（完全一致）
       2. `--body-file tmp/<path>` が存在する（tmp/ から始まる相対パス、"-" は不可）
       3. interactive フラグ不在: `--editor` / `-e` / `--web` / `-w`
-      4. `gh issue edit <N>`: N は数値
+      4. `--title <value>` が存在する
 
       ### readonly_artifact_export_command の allow 条件
 
@@ -148,6 +148,10 @@ hook_boundaries_manifest_v1:
       2. リダイレクトは `>` のみ（`>>` は不可）
       3. 先は `tmp/` から始まる（src/, docs/, .env, .git は不可）
       4. lhs にシェルメタキャラ（|, ;, &&, ||, backtick, $()）なし
+      raw `gh issue edit` / `gh issue comment` は `gh_mutation_denied` で block される。
+      `gh api -f body=...` / `gh api graphql -f query='mutation { ... }'` /
+      `gh api --method POST ...` のような allowlist 外 `gh api` は
+      `github_api_command` (`gh_api_not_allowed`) で block される。
 
   - handler_id: worktree_scope_guard
     event: PreToolUse
