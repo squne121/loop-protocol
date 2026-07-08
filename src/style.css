@@ -133,8 +133,46 @@ button:focus-visible {
   pointer-events: none;
 }
 
+.battle-hud-layer {
+  display: grid;
+  align-content: start;
+  gap: 16px;
+  padding: 18px 22px 22px;
+}
+
 .battle-ui-layer [data-battle-interactive='true'] {
   pointer-events: auto;
+}
+
+.battle-hud-layer[data-battle-hud-layout='result-header'] {
+  display: flex;
+  justify-content: flex-end;
+  align-items: flex-start;
+}
+
+.battle-hud-layer[data-battle-hud-layout='result-header'] .panel:not(.panel--actions):not(.panel--pause-status) {
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.battle-hud-layer[data-battle-hud-layout='result-header'] .panel--actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.battle-hud-layer[data-battle-hud-layout='result-header'] .panel--actions button:disabled {
+  display: none;
 }
 
 .command-rail {

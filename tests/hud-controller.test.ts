@@ -306,6 +306,18 @@ describe('HudController', () => {
     )
   })
 
+  it('GIVEN running WHEN render called THEN HUD keeps overlay-stack layout', () => {
+    hudController.render(createState('running'), false)
+
+    expect(container.dataset.battleHudLayout).toBe('overlay-stack')
+  })
+
+  it('GIVEN result WHEN render called THEN HUD exposes result-header layout for canvas-safe actions', () => {
+    hudController.render(createState('result'), false)
+
+    expect(container.dataset.battleHudLayout).toBe('result-header')
+  })
+
   it('GIVEN active assist without assigned target WHEN render called THEN assist status reports signal sent', () => {
     const state = createState('running')
     state.allies = [createDefaultAllyState(1)]
