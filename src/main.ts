@@ -38,8 +38,10 @@ import {
 } from './systems'
 import { upgradeDefinitions } from './data/upgrades'
 import {
+  configureBattleOverlayFoundation,
   createHudController,
   getUpgradeStatusCopy,
+  resolveBattleOverlayElements,
   type HudUpgradeStatusCopy,
   type HudUpgradeViewModel,
 } from './ui'
@@ -321,16 +323,28 @@ if (app) {
         <p class="battle-stage__copy">WASD to reposition. Hold pointer down to pressure the firing lane.</p>
       </div>
       <canvas class="battle-stage__canvas" aria-label="Battle arena" tabindex="0"></canvas>
+      <!-- Interactive HUD descendants opt in via data-battle-interactive="true". -->
+      <div class="battle-ui-layer" data-battle-ui-root>
+        <div class="battle-hud-layer" data-battle-layer="hud"></div>
+        <div class="battle-screen-layer" data-battle-layer="screen" hidden inert></div>
+      </div>
     </section>
     <aside class="command-rail" aria-label="Command rail"></aside>
   </div>
 `
 }
 
-const canvas = app?.querySelector<HTMLCanvasElement>('.battle-stage__canvas') ?? null
-const commandRail = app?.querySelector<HTMLElement>('.command-rail') ?? null
+const battleOverlay = app ? resolveBattleOverlayElements(app) : null
+if (battleOverlay) {
+  configureBattleOverlayFoundation(battleOverlay)
+}
 
-if ((!canvas || !commandRail) && !isTestRuntime) {
+const canvas = battleOverlay?.canvas ?? null
+const commandRail = battleOverlay?.commandRail ?? null
+const battleHudLayer = battleOverlay?.hudLayer ?? null
+const battleScreenLayer = battleOverlay?.screenLayer ?? null
+
+if ((!canvas || !commandRail || !battleHudLayer || !battleScreenLayer) && !isTestRuntime) {
   throw new Error('Application shell is incomplete.')
 }
 
@@ -424,7 +438,7 @@ function handleTogglePause(): void {
   setHudFeedback('Paused', 'Simulation frozen. Rendering and HUD continue.')
 }
 
-const hud = commandRail ? createHudController(commandRail, {
+const hud = battleHudLayer ? createHudController(battleHudLayer, {
   onNewGame() {
     // AC1: title_menu → preparation (New Game). Separate from onStartSortie (AC2).
     const nextState = createTransitionedInitialGameState(state.loopPhase, 'new_game')
