@@ -294,6 +294,7 @@ def test_ac5_dump_taxonomy_json_drift_detection():
         "ac_vc_number_mismatch",
         "missing_section",
         "rva_immediate_field_missing",
+        "unexpected_pass",
     }
 
     # Pin deterministic_checks (checker name) parity per entry.
@@ -302,6 +303,7 @@ def test_ac5_dump_taxonomy_json_drift_detection():
         "ac_vc_number_mismatch": ["C5_ac_vc_number_alignment"],
         "missing_section": ["C1_required_sections"],
         "rva_immediate_field_missing": ["C9_runtime_applicability_present"],
+        "unexpected_pass": [],
     }
     for entry_id, expected in expected_checks.items():
         assert entries_by_id[entry_id]["deterministic_checks"] == expected, entry_id
@@ -324,6 +326,10 @@ def test_ac5_dump_taxonomy_json_drift_detection():
     assert set(entries_by_id["rva_immediate_field_missing"]["readiness_categories"]) == {
         "rva_immediate_field_missing"
     }
+    assert entries_by_id["unexpected_pass"]["readiness_categories"] == ["unexpected_pass"]
+    assert entries_by_id["unexpected_pass"]["readiness_category_source_check"] == (
+        "baseline_vc_preflight"
+    )
 
     # The in-process constant and the CLI-dumped JSON must be identical --
     # this is the actual "drift" the CLI flag is meant to catch (the dump
