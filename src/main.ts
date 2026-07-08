@@ -735,7 +735,8 @@ function persistProgressionSnapshot(
 }
 
 function resizeArena(currentState: typeof state): void {
-  const safeSidebar = window.innerWidth > 980 ? 380 : 32
+  const usesOverlayHudLayout = commandRail?.hasAttribute('data-battle-placeholder') ?? false
+  const safeSidebar = window.innerWidth > 980 && !usesOverlayHudLayout ? 380 : 32
   const width = Math.min(960, Math.max(640, window.innerWidth - safeSidebar))
   currentState.arena.width = width
   currentState.arena.height = Math.round(width * 0.5625)

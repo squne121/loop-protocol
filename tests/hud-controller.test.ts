@@ -231,6 +231,15 @@ describe('HudController', () => {
     expect(interactiveButtons.every((button) => button.dataset.battleInteractive === 'true')).toBe(true)
   })
 
+  it('GIVEN running WHEN render called THEN disabled overlay buttons remain present but are inert-ready hit-test surfaces', () => {
+    hudController.render(createState('running'), false)
+
+    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
+    expect(queryButton(container, 'start-sortie').dataset.battleInteractive).toBe('true')
+    expect(queryButton(container, 'claim-reward').disabled).toBe(true)
+    expect(queryButton(container, 'claim-reward').dataset.battleInteractive).toBe('true')
+  })
+
   it('GIVEN running with ally and living enemy WHEN render called THEN assist status reports ready and assist button is reachable', () => {
     const state = createState('running')
     state.allies = [createDefaultAllyState(1)]
@@ -316,6 +325,9 @@ describe('HudController', () => {
     hudController.render(createState('result'), false)
 
     expect(container.dataset.battleHudLayout).toBe('result-header')
+    expect(container.querySelector('.panel--actions')?.hasAttribute('hidden')).toBe(false)
+    expect(container.querySelector('.panel--pause-status')?.hasAttribute('hidden')).toBe(false)
+    expect(container.querySelector('.panel--accent')?.hidden).toBe(true)
   })
 
   it('GIVEN active assist without assigned target WHEN render called THEN assist status reports signal sent', () => {

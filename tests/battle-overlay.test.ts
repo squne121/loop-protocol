@@ -48,8 +48,22 @@ describe('battleOverlay', () => {
     configureBattleOverlayFoundation(overlay!)
 
     expect(overlay?.commandRail.children).toHaveLength(0)
+    expect(overlay?.commandRail.hidden).toBe(true)
     expect(overlay?.commandRail.getAttribute('data-battle-placeholder')).toBe('true')
+    expect(document.querySelector('.app-shell')?.getAttribute('data-battle-layout')).toBe('overlay-hud')
     expect(overlay?.screenLayer.hidden).toBe(true)
     expect(overlay?.screenLayer.hasAttribute('inert')).toBe(true)
+    expect(overlay?.screenLayer.getAttribute('aria-hidden')).toBe('true')
+  })
+
+  it('GIVEN a stray battle-hud-layer outside battle-ui-layer WHEN resolved THEN resolver fails closed', () => {
+    renderShell()
+    document.body.insertAdjacentHTML(
+      'beforeend',
+      '<div class="battle-hud-layer" data-battle-layer="hud"></div>',
+    )
+    document.querySelector('.battle-ui-layer .battle-hud-layer')?.remove()
+
+    expect(resolveBattleOverlayElements(document)).toBeNull()
   })
 })

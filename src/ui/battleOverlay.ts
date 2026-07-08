@@ -9,11 +9,18 @@ export interface BattleOverlayElements {
 
 export function resolveBattleOverlayElements(root: ParentNode): BattleOverlayElements | null {
   const battleStage = root.querySelector<HTMLElement>('.battle-stage')
-  const canvas = root.querySelector<HTMLCanvasElement>('.battle-stage__canvas')
+  const canvas = battleStage?.querySelector<HTMLCanvasElement>(':scope > .battle-stage__canvas') ?? null
   const commandRail = root.querySelector<HTMLElement>('.command-rail')
-  const uiLayer = root.querySelector<HTMLElement>('.battle-ui-layer')
-  const hudLayer = root.querySelector<HTMLElement>('.battle-hud-layer')
-  const screenLayer = root.querySelector<HTMLElement>('.battle-screen-layer')
+  const uiLayer =
+    battleStage?.querySelector<HTMLElement>(':scope > .battle-ui-layer[data-battle-ui-root]') ??
+    null
+  const hudLayer =
+    uiLayer?.querySelector<HTMLElement>(':scope > .battle-hud-layer[data-battle-layer="hud"]') ??
+    null
+  const screenLayer =
+    uiLayer?.querySelector<HTMLElement>(
+      ':scope > .battle-screen-layer[data-battle-layer="screen"]',
+    ) ?? null
 
   if (!battleStage || !canvas || !commandRail || !uiLayer || !hudLayer || !screenLayer) {
     return null
@@ -30,9 +37,17 @@ export function resolveBattleOverlayElements(root: ParentNode): BattleOverlayEle
 }
 
 export function configureBattleOverlayFoundation(elements: Pick<BattleOverlayElements, 'commandRail' | 'screenLayer'>): void {
+  const appShell = elements.commandRail.closest<HTMLElement>('.app-shell')
+
+  if (appShell) {
+    appShell.setAttribute('data-battle-layout', 'overlay-hud')
+  }
+
   elements.commandRail.replaceChildren()
+  elements.commandRail.hidden = true
   elements.commandRail.setAttribute('aria-hidden', 'true')
   elements.commandRail.setAttribute('data-battle-placeholder', 'true')
   elements.screenLayer.hidden = true
   elements.screenLayer.setAttribute('inert', '')
+  elements.screenLayer.setAttribute('aria-hidden', 'true')
 }
