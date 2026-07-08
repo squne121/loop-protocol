@@ -213,6 +213,24 @@ describe('HudController', () => {
     expect(queryButton(container, 'assist-player').disabled).toBe(false)
   })
 
+  it('GIVEN the HUD action surface WHEN rendered THEN interactive buttons opt in via data-battle-interactive', () => {
+    // Overlay inactivity is enforced by the shell layer via hidden/inert;
+    // this test covers the complementary HUD-side pointer opt-in contract.
+    hudController.render(createState('preparation'), false, {
+      definitionId: 'weapon_power_plus_1',
+      cost: 100,
+      weaponPower: 1,
+      buttonDisabled: false,
+      statusCopy: null,
+    })
+
+    const interactiveButtons = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('[data-action]'),
+    )
+    expect(interactiveButtons.length).toBeGreaterThan(0)
+    expect(interactiveButtons.every((button) => button.dataset.battleInteractive === 'true')).toBe(true)
+  })
+
   it('GIVEN running with ally and living enemy WHEN render called THEN assist status reports ready and assist button is reachable', () => {
     const state = createState('running')
     state.allies = [createDefaultAllyState(1)]
