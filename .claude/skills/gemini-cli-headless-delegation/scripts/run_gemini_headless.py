@@ -3029,7 +3029,11 @@ def _audit_build_post_result(request: Mapping[str, Any], result: Mapping[str, An
         "request_success": request_success,
         "posting_success": posting_success,
         "post_result": post_result_value or "not_attempted",
-        "post_failure_class": "agy_post_to_issue_url_forbidden" if agy_forbidden_post else result.get("post_failure_class"),
+        "post_failure_class": (
+            "agy_post_to_issue_url_forbidden"
+            if agy_forbidden_post
+            else result.get("post_failure_class")
+        ),
     }
 
 
