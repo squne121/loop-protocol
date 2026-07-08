@@ -46,6 +46,27 @@ repo-relative な read-only evidence envelope を構築し、それだけを agy
 - 互換用に `.gemini/settings.json` にも同じ Serena 設定（`mcp.allowed == ["serena"]` と `mcpServers.serena`）を用意すること。`preflight_gemini_headless.py` / `run_gemini_headless.py._validate_local_asset_research_settings` は `.gemini/settings.json` と `.agents/mcp_config.json` の両方を検証する
 - Gemini OAuth / trustedFolders は Serena MCP 起動そのものには不要（Serena は wrapper が直接起動する子プロセスであり、Gemini CLI 経由ではない）
 
+### delegation_audit_v1 公開安全フィールド（監査ログ）
+
+- `local_asset_metadata`（`tool_profile=local_asset_research` 時）:
+  - `retrieval_status`: `succeeded` / `failed` / `not_applicable`
+  - `retrieval_mode`: `live_serena_mcp`（実行時）
+  - `serena_manifest_id`: `serena_tool_manifest_v1:<pinned_ref>`
+  - `serena_pinned_ref`: manifest の pinned ref
+  - `read_only_allowlist_sha256`: `read_only_allowlist` の JSON SHA-256
+  - `dangerous_denylist_sha256`: `dangerous_denylist` の JSON SHA-256
+  - `live_tools_list_sha256`: live `tools/list` 応答 tool 名配列の JSON SHA-256
+  - `manifest_drift_failed`: manifest 整合性逸脱検知
+  - `context_files_count`: 対象 context ファイル件数
+  - `evidence_record_count`: Serena 証跡レコード件数
+  - `failure_class`: 取得系失敗分類
+
+- `auth_diagnostics_metadata`（AGY 認証関連失敗）:
+  - `schema`: `agy_auth_diagnostics_v1`
+  - `auth_failure_class`: `agy_auth_required` / `agy_permission_denied`
+  - `auth_mode`, `keyring_available`, `tty_mode`, `dbus_session_bus_present`, `xdg_runtime_dir_present`, `ssh_session_detected`, `recovery_action`
+
+
 ## Claude Code (WSL2) での実行手順 / Execution from Claude Code
 
 ### 1. Preflight で環境確認

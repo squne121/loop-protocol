@@ -1291,7 +1291,7 @@ def _collect_live_serena_read_only_evidence(
     context_paths: list[Path],
     repo_root: Path,
     manifest: Mapping[str, Any],
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
     """Launch pinned Serena MCP over stdio and build evidence from tools/call responses."""
     import select
 
@@ -1361,6 +1361,7 @@ def _collect_live_serena_read_only_evidence(
         tools_response = request("tools/list")
         tools = ((tools_response.get("result") or {}).get("tools") or [])
         tools_seen = {tool.get("name") for tool in tools if isinstance(tool, Mapping)}
+        tools_seen_names = sorted(str(name) for name in tools_seen if isinstance(name, str))
         missing = sorted(set(manifest["read_only_allowlist"]) - tools_seen)
         if missing:
             raise RuntimeError(f"Serena tools/list missing required tools: {', '.join(missing)}")
@@ -1409,7 +1410,18 @@ def _collect_live_serena_read_only_evidence(
                 "path": f"{repo_relative_path}#{tool_name}-{index}",
                 "content": json.dumps(evidence, ensure_ascii=False, sort_keys=True),
             })
-        return documents
+        serena_metadata = {
+            "retrieval_mode": "live_serena_mcp",
+            "serena_manifest_id": manifest_id,
+            "serena_pinned_ref": manifest.get("pinned_ref"),
+            "read_only_allowlist_sha256": _sha256_stable_json(list(manifest.get("read_only_allowlist", []))),
+            "dangerous_denylist_sha256": _sha256_stable_json(list(manifest.get("dangerous_denylist", []))),
+            "live_tools_list_sha256": _sha256_stable_json(tools_seen_names),
+            "manifest_drift_failed": False,
+            "context_files_count": len(context_paths),
+            "evidence_record_count": len(documents),
+        }
+        return documents, serena_metadata
     finally:
         try:
             process.terminate()
@@ -2552,6 +2564,11 @@ _AUDIT_END_OPTIONAL_KEYS: frozenset[str] = frozenset({
 })
 _AUDIT_END_ALL_KEYS: frozenset[str] = _AUDIT_END_REQUIRED_KEYS | _AUDIT_END_OPTIONAL_KEYS
 
+
+def _sha256_stable_json(value: Any) -> str:
+    serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
 _AUDIT_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 # Reserved fan-out fields (Issue #1273 / AC8) -- always optional, never
@@ -2816,7 +2833,20 @@ def validate_delegation_audit_record(record: Mapping[str, Any]) -> list[str]:
             if not isinstance(local_asset, dict):
                 errors.append("local_asset_metadata must be an object when present")
             else:
-                allowed_local_asset_keys = {"profile", "context_files_count", "serena_retrieval_failed"}
+                allowed_local_asset_keys = {
+                    "profile",
+                    "retrieval_status",
+                    "retrieval_mode",
+                    "serena_manifest_id",
+                    "serena_pinned_ref",
+                    "read_only_allowlist_sha256",
+                    "dangerous_denylist_sha256",
+                    "live_tools_list_sha256",
+                    "manifest_drift_failed",
+                    "context_files_count",
+                    "evidence_record_count",
+                    "failure_class",
+                }
                 unknown_local_asset_keys = set(local_asset) - allowed_local_asset_keys
                 if unknown_local_asset_keys:
                     errors.append(
@@ -2827,14 +2857,53 @@ def validate_delegation_audit_record(record: Mapping[str, Any]) -> list[str]:
                 context_files_count = local_asset.get("context_files_count")
                 if isinstance(context_files_count, bool) or not isinstance(context_files_count, int):
                     errors.append("local_asset_metadata.context_files_count must be an int")
-                if not isinstance(local_asset.get("serena_retrieval_failed"), bool):
-                    errors.append("local_asset_metadata.serena_retrieval_failed must be a bool")
+                retrieval_status = local_asset.get("retrieval_status")
+                if retrieval_status is not None and retrieval_status not in {"succeeded", "failed", "not_applicable"}:
+                    errors.append(
+                        "local_asset_metadata.retrieval_status must be one of "
+                        "{'succeeded', 'failed', 'not_applicable'} when present"
+                    )
+                if "retrieval_mode" in local_asset and (
+                    not isinstance(local_asset.get("retrieval_mode"), str)
+                    or not local_asset.get("retrieval_mode").strip()
+                ):
+                    errors.append("local_asset_metadata.retrieval_mode must be a non-empty string")
+                for key in (
+                    "serena_manifest_id",
+                    "serena_pinned_ref",
+                    "read_only_allowlist_sha256",
+                    "dangerous_denylist_sha256",
+                    "live_tools_list_sha256",
+                    "failure_class",
+                ):
+                    if key in local_asset and not isinstance(local_asset.get(key), str):
+                        errors.append(f"local_asset_metadata.{key} must be a string when present")
+                if (
+                    "manifest_drift_failed" in local_asset
+                    and not isinstance(local_asset.get("manifest_drift_failed"), bool)
+                ):
+                    errors.append("local_asset_metadata.manifest_drift_failed must be a bool when present")
+                evidence_record_count = local_asset.get("evidence_record_count")
+                if evidence_record_count is not None and (
+                    isinstance(evidence_record_count, bool) or not isinstance(evidence_record_count, int)
+                ):
+                    errors.append("local_asset_metadata.evidence_record_count must be an int when present")
         if "auth_diagnostics_metadata" in record and record["auth_diagnostics_metadata"] is not None:
             auth_diagnostics = record["auth_diagnostics_metadata"]
             if not isinstance(auth_diagnostics, dict):
                 errors.append("auth_diagnostics_metadata must be an object when present")
             else:
-                unknown_auth_keys = set(auth_diagnostics) - {"auth_failure_class"}
+                unknown_auth_keys = set(auth_diagnostics) - {
+                    "schema",
+                    "auth_failure_class",
+                    "auth_mode",
+                    "keyring_available",
+                    "tty_mode",
+                    "dbus_session_bus_present",
+                    "xdg_runtime_dir_present",
+                    "ssh_session_detected",
+                    "recovery_action",
+                }
                 if unknown_auth_keys:
                     errors.append(
                         f"auth_diagnostics_metadata has unknown key(s): {sorted(unknown_auth_keys)}"
@@ -2844,6 +2913,26 @@ def validate_delegation_audit_record(record: Mapping[str, Any]) -> list[str]:
                         "auth_diagnostics_metadata.auth_failure_class must be one of "
                         f"{sorted(_AGY_AUTH_RELATED_FAILURE_CLASSES)}"
                     )
+                if not isinstance(auth_diagnostics.get("keyring_available"), bool):
+                    errors.append("auth_diagnostics_metadata.keyring_available must be a bool")
+                if not isinstance(auth_diagnostics.get("tty_mode"), bool):
+                    errors.append("auth_diagnostics_metadata.tty_mode must be a bool")
+                if not isinstance(auth_diagnostics.get("dbus_session_bus_present"), bool):
+                    errors.append("auth_diagnostics_metadata.dbus_session_bus_present must be a bool")
+                if not isinstance(auth_diagnostics.get("xdg_runtime_dir_present"), bool):
+                    errors.append("auth_diagnostics_metadata.xdg_runtime_dir_present must be a bool")
+                if not isinstance(auth_diagnostics.get("ssh_session_detected"), bool):
+                    errors.append("auth_diagnostics_metadata.ssh_session_detected must be a bool")
+                if "auth_mode" in auth_diagnostics and not isinstance(auth_diagnostics.get("auth_mode"), str):
+                    errors.append("auth_diagnostics_metadata.auth_mode must be a string")
+                if (
+                    "recovery_action" in auth_diagnostics
+                    and auth_diagnostics.get("recovery_action") is not None
+                    and not isinstance(auth_diagnostics.get("recovery_action"), str)
+                ):
+                    errors.append("auth_diagnostics_metadata.recovery_action must be a string when present")
+                if auth_diagnostics.get("schema") != "agy_auth_diagnostics_v1":
+                    errors.append("auth_diagnostics_metadata.schema must equal 'agy_auth_diagnostics_v1'")
         if "provider_attempts" in record and isinstance(record.get("provider_attempts"), list):
             for index, attempt in enumerate(record["provider_attempts"]):
                 if not isinstance(attempt, dict):
@@ -2992,20 +3081,64 @@ def _audit_build_local_asset_metadata(
     context_files = request.get("context_files")
     context_files_count = len(context_files) if isinstance(context_files, list) else 0
     failure_class = result.get("failure_class")
-    return {
+    evidence_metadata = result.get("local_asset_retrieval_metadata")
+    if not isinstance(evidence_metadata, Mapping):
+        evidence_metadata = {}
+    evidence_context_files_count = evidence_metadata.get("context_files_count", context_files_count)
+    payload: dict[str, Any] = {
         "profile": tool_profile,
-        "context_files_count": context_files_count,
-        "serena_retrieval_failed": bool(
-            isinstance(failure_class, str) and "live_serena_mcp_failed" in failure_class
+        "context_files_count": evidence_context_files_count,
+        "retrieval_status": (
+            evidence_metadata.get("retrieval_status")
+            if isinstance(evidence_metadata.get("retrieval_status"), str)
+            else (
+                (
+                    "failed"
+                    if isinstance(failure_class, str)
+                    and "live_serena_mcp_failed" in failure_class
+                    else "succeeded"
+                )
+            )
         ),
+        "retrieval_mode": evidence_metadata.get("retrieval_mode"),
+        "serena_manifest_id": evidence_metadata.get("serena_manifest_id"),
+        "serena_pinned_ref": evidence_metadata.get("serena_pinned_ref"),
+        "read_only_allowlist_sha256": evidence_metadata.get("read_only_allowlist_sha256"),
+        "dangerous_denylist_sha256": evidence_metadata.get("dangerous_denylist_sha256"),
+        "live_tools_list_sha256": evidence_metadata.get("live_tools_list_sha256"),
+        "manifest_drift_failed": evidence_metadata.get("manifest_drift_failed"),
+        "evidence_record_count": evidence_metadata.get("evidence_record_count"),
+        "failure_class": evidence_metadata.get("failure_class", failure_class),
     }
+    return {k: v for k, v in payload.items() if v is not None}
 
 
 def _audit_build_auth_diagnostics_metadata(result: Mapping[str, Any]) -> dict[str, Any] | None:
     failure_class = result.get("failure_class")
-    if failure_class in _AGY_AUTH_RELATED_FAILURE_CLASSES:
-        return {"auth_failure_class": failure_class}
-    return None
+    if not isinstance(failure_class, str) or failure_class not in _AGY_AUTH_RELATED_FAILURE_CLASSES:
+        return None
+    recovery_action = None
+    if failure_class == "agy_auth_required":
+        recovery_action = "re-authenticate_credentials"
+    elif failure_class == "agy_permission_denied":
+        recovery_action = "check_auth_credential_permissions"
+    return {
+        "schema": "agy_auth_diagnostics_v1",
+        "auth_failure_class": failure_class,
+        "auth_mode": os.environ.get("AGY_AUTH_MODE", "default"),
+        "keyring_available": "KEYRING_SESSION_KEYRING" in os.environ
+        or "GNOME_KEYRING_CONTROL" in os.environ
+        or "KDE_FULL_SESSION" in os.environ,
+        "tty_mode": sys.stdin.isatty(),
+        "dbus_session_bus_present": bool(os.environ.get("DBUS_SESSION_BUS_ADDRESS")),
+        "xdg_runtime_dir_present": bool(os.environ.get("XDG_RUNTIME_DIR")),
+        "ssh_session_detected": bool(
+            os.environ.get("SSH_CLIENT")
+            or os.environ.get("SSH_CONNECTION")
+            or os.environ.get("SSH_TTY")
+        ),
+        "recovery_action": recovery_action,
+    }
 
 
 def _audit_build_post_result(request: Mapping[str, Any], result: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -3101,7 +3234,12 @@ def _audit_write_record(path: Path, record: Mapping[str, Any]) -> None:
         encoded_line = (json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n").encode("utf-8")
         fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
         try:
-            os.write(fd, encoded_line)
+            offset = 0
+            while offset < len(encoded_line):
+                written = os.write(fd, encoded_line[offset:])
+                if written <= 0:
+                    raise RuntimeError("partial write returned 0 bytes")
+                offset += written
         finally:
             os.close(fd)
     except OSError as exc:
@@ -3225,6 +3363,7 @@ def _run_delegation_core(
                 "model_downgrades": [],
             }
         # local_asset_research uses wrapper-side Serena evidence + prompt injection.
+        local_asset_retrieval_metadata: dict[str, Any] | None = None
         if tool_profile == LOCAL_ASSET_RESEARCH_PROFILE:
             repo_root = _repo_root().resolve()
             _, context_paths = _validate_local_asset_context_files(
@@ -3234,8 +3373,18 @@ def _run_delegation_core(
             )
             manifest = load_serena_tool_manifest(repo_root)
             try:
-                evidence_documents = _collect_live_serena_read_only_evidence(context_paths, repo_root, manifest)
+                evidence_documents, local_asset_retrieval_metadata = _collect_live_serena_read_only_evidence(
+                    context_paths, repo_root, manifest
+                )
+                if local_asset_retrieval_metadata is not None:
+                    local_asset_retrieval_metadata = {
+                        **local_asset_retrieval_metadata,
+                        "retrieval_status": "succeeded",
+                        "context_files_count": len(context_paths),
+                        "failure_class": None,
+                    }
             except Exception as exc:
+                manifest_id = _serena_manifest_id(manifest)
                 return {
                     "schema": "delegation_result/v1",
                     "transport": "agy",
@@ -3260,6 +3409,23 @@ def _run_delegation_core(
                     "raw_command": _build_agy_raw_command(""),
                     "model_chain": [],
                     "model_downgrades": [],
+                    "local_asset_retrieval_metadata": {
+                        "retrieval_status": "failed",
+                        "retrieval_mode": "live_serena_mcp",
+                        "serena_manifest_id": manifest_id,
+                        "serena_pinned_ref": manifest.get("pinned_ref"),
+                        "read_only_allowlist_sha256": _sha256_stable_json(
+                            list(manifest.get("read_only_allowlist", []))
+                        ),
+                        "dangerous_denylist_sha256": _sha256_stable_json(
+                            list(manifest.get("dangerous_denylist", []))
+                        ),
+                        "live_tools_list_sha256": None,
+                        "manifest_drift_failed": True,
+                        "context_files_count": len(context_paths),
+                        "evidence_record_count": 0,
+                        "failure_class": "local_asset_research live_serena_mcp_failed",
+                    },
                 }
             prompt_text = _build_local_asset_prompt(
                 request,
@@ -3321,6 +3487,7 @@ def _run_delegation_core(
                 "raw_command": _build_agy_raw_command(""),
                 "model_chain": [],
                 "model_downgrades": [],
+                "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
             }
         except FileNotFoundError:
             return {
@@ -3348,6 +3515,7 @@ def _run_delegation_core(
                 "raw_command": _build_agy_raw_command(""),
                 "model_chain": [],
                 "model_downgrades": [],
+                "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
             }
         except PermissionError:
             return {
@@ -3383,6 +3551,7 @@ def _run_delegation_core(
                 "raw_command": _build_agy_raw_command(""),
                 "model_chain": [],
                 "model_downgrades": [],
+                "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
             }
         except Exception as exc:
             return {
@@ -3410,13 +3579,17 @@ def _run_delegation_core(
                 "raw_command": _build_agy_raw_command(""),
                 "model_chain": [],
                 "model_downgrades": [],
+                "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
             }
-        return _normalize_agy_result(
+        result = _normalize_agy_result(
             agy_completed,
             tool_profile=tool_profile_str,
             requested_model=None,
             request_warnings=request_warnings,
         )
+        if local_asset_retrieval_metadata is not None:
+            result["local_asset_retrieval_metadata"] = local_asset_retrieval_metadata
+        return result
 
     validation_errors = validate_request(request, request_path=request_path)
     requested_model = str(request.get("model", DEFAULT_MODEL))
@@ -4245,8 +4418,7 @@ def _print_stdout_summary(result: dict[str, Any], output_file: Path) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     previous_audit_log_override = _AUDIT_LOG_OVERRIDE
-    if args.audit_log is not None:
-        set_audit_log_path_override(args.audit_log)
+    set_audit_log_path_override(args.audit_log)
 
     try:
         # Resolve request file: prefer --request-file, fall back to positional argument.

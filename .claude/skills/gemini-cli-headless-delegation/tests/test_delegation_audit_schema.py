@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import types
 from pathlib import Path
 from unittest.mock import patch
@@ -95,6 +96,12 @@ def _core_result(**overrides) -> dict:
     }
     result.update(overrides)
     return result
+
+
+def _completed_process(
+    returncode: int = 0, stdout: str = "", stderr: str = ""
+) -> rgh.subprocess.CompletedProcess[str]:
+    return rgh.subprocess.CompletedProcess(args=("agy",), returncode=returncode, stdout=stdout, stderr=stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +331,101 @@ def test_audit_start_end_pairing_across_failure_paths(tmp_path, path_name):
         assert rgh.validate_delegation_audit_record(record) == []
 
 
+def test_audit_start_end_pairing_across_malformed_validation_failure_real_branch(tmp_path):
+    audit_path = tmp_path / "audit.jsonl"
+    rgh.set_audit_log_path_override(audit_path)
+    request = _base_request()
+    request.pop("objective")
+
+    returned = rgh.run_delegation(request)
+
+    assert returned["ok"] is False
+    assert returned["failure_class"] == "request_validation_failed"
+    records = _read_jsonl(audit_path)
+    assert len(records) == 2
+    assert records[0]["record_type"] == "start"
+    assert records[1]["record_type"] == "end"
+
+
+def test_audit_start_end_pairing_across_unknown_provider_real_branch(tmp_path):
+    audit_path = tmp_path / "audit.jsonl"
+    rgh.set_audit_log_path_override(audit_path)
+    request = _base_request(provider="bogus")
+
+    returned = rgh.run_delegation(request)
+
+    assert returned["ok"] is False
+    assert returned["failure_class"] == "unknown_provider"
+    records = _read_jsonl(audit_path)
+    assert len(records) == 2
+
+
+def test_audit_start_end_pairing_across_agg_real_failure_branches(tmp_path, monkeypatch):
+    audit_path = tmp_path / "audit.jsonl"
+    rgh.set_audit_log_path_override(audit_path)
+    request = _base_request(
+        provider="agy",
+        tool_profile="no_tools",
+        model=None,
+        prompt="collect evidence for error handling",
+    )
+
+    for error, failure_class in [
+        (subprocess.TimeoutExpired(cmd=["agy"], timeout=0.0), "agy_timeout"),
+        (FileNotFoundError("agy not found"), "agy_not_found"),
+        (PermissionError("permission denied"), "agy_permission_denied"),
+    ]:
+        monkeypatch.setattr(rgh, "_run_agy", lambda prompt, timeout_sec, _e=error: (_ for _ in ()).throw(_e))
+        returned = rgh.run_delegation(request)
+        assert returned["ok"] is False
+        assert returned["failure_class"] == failure_class
+        records = _read_jsonl(audit_path)
+        assert records[-1]["failure_class"] == failure_class
+        audit_path.unlink()
+
+
+def test_audit_start_end_pairing_grounded_redaction_and_serena_fail_real_branches(tmp_path, monkeypatch):
+    audit_path = tmp_path / "audit.jsonl"
+    rgh.set_audit_log_path_override(audit_path)
+    secret = "ghp_" + ("x" * 36)
+    monkeypatch.setattr(
+        rgh,
+        "_run_agy",
+        lambda prompt, timeout_sec: _completed_process(returncode=0, stdout=f"{secret} grounded output"),
+    )
+    returned = rgh.run_delegation(
+        _base_request(
+            provider="agy",
+            tool_profile="grounded_research",
+            model=None,
+            prompt="collect evidence",
+        )
+    )
+    assert returned["failure_class"] == "agy_web_grounding_redaction_failed"
+    records = _read_jsonl(audit_path)
+    assert records[-1]["failure_class"] == "agy_web_grounding_redaction_failed"
+
+    monkeypatch.setattr(rgh, "_validate_agy_local_asset_request", lambda request, request_path=None: [])
+
+    def _serena_fail(context_paths, repo_root, manifest):
+        raise RuntimeError("local serena mcp down")
+
+    monkeypatch.setattr(rgh, "_collect_live_serena_read_only_evidence", _serena_fail)
+    monkeypatch.chdir(tmp_path)
+    context_file = tmp_path / "context.md"
+    context_file.write_text("context", encoding="utf-8")
+    returned = rgh.run_delegation(
+        _base_request(
+            provider="agy",
+            tool_profile="local_asset_research",
+            context_files=["context.md"],
+            model=None,
+            prompt="collect local asset evidence for validation branch",
+        )
+    )
+    assert returned["failure_class"] == "local_asset_research live_serena_mcp_failed"
+
+
 def test_audit_provider_auto_fallback_emits_single_pair_not_one_per_attempt(tmp_path):
     """provider="auto" re-enters run_delegation() once per candidate inside
     provider_auto_dispatch() -- only the outermost call may emit an audit
@@ -390,6 +492,35 @@ def test_audit_log_is_jsonl_one_object_per_line_append_only(tmp_path):
     for line in lines:
         parsed = json.loads(line)  # each line must be exactly one JSON object
         assert parsed["schema"] == "delegation_audit_v1"
+
+
+def test_audit_write_record_handles_partial_os_write(tmp_path, monkeypatch):
+    audit_path = tmp_path / "audit_partial.jsonl"
+    payload = {
+        "schema": "delegation_audit_v1",
+        "record_type": "start",
+        "run_id": "x",
+        "ts": "2026-07-09T00:00:00Z",
+        "provider_requested": "gemini",
+        "tool_profile": "no_tools",
+    }
+
+    original_write = rgh.os.write
+    state = {"calls": 0}
+
+    def fake_write(fd, data):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            original_write(fd, data[:1])
+            return 1
+        return original_write(fd, data)
+
+    monkeypatch.setattr(rgh.os, "write", fake_write)
+    rgh._audit_write_record(audit_path, payload)
+    assert state["calls"] >= 2
+    assert audit_path.exists()
+    decoded_records = _read_jsonl(audit_path)
+    assert decoded_records[0]["run_id"] == "x"
 
 
 def test_audit_log_separate_from_result_output_file(tmp_path):
@@ -566,8 +697,9 @@ def test_audit_includes_grounding_serena_auth_public_safe_fields(tmp_path):
     serena_end = _read_jsonl(audit_path)[1]
     local_meta = serena_end["local_asset_metadata"]
     assert local_meta["profile"] == "local_asset_research"
+    assert local_meta["retrieval_status"] == "failed"
     assert local_meta["context_files_count"] == 2
-    assert local_meta["serena_retrieval_failed"] is True
+    assert local_meta["failure_class"] == "local_asset_research live_serena_mcp_failed"
 
     # -- auth diagnostics: derived from the existing AGY auth failure_class
     # enum (Issue #1267 territory), public-safe (no raw AGY output). --
@@ -582,6 +714,9 @@ def test_audit_includes_grounding_serena_auth_public_safe_fields(tmp_path):
     auth_end = _read_jsonl(audit_path)[1]
     auth_meta = auth_end["auth_diagnostics_metadata"]
     assert auth_meta["auth_failure_class"] == "agy_permission_denied"
+    assert auth_meta["schema"] == "agy_auth_diagnostics_v1"
+    assert isinstance(auth_meta["keyring_available"], bool)
+    assert isinstance(auth_meta["tty_mode"], bool)
 
 
 # ---------------------------------------------------------------------------
@@ -773,6 +908,8 @@ def test_runtime_portability_doc_documents_delegation_audit_v1():
     text = doc_path.read_text(encoding="utf-8")
     assert "delegation_audit_v1" in text
     assert "DELEGATION_AUDIT_LOG_PATH" in text or "--audit-log" in text
+    assert "local_asset_metadata" in text
+    assert "agy_auth_diagnostics_v1" in text
 
 
 def test_main_audit_log_override_is_scoped_per_invocation(tmp_path, monkeypatch):
@@ -826,6 +963,51 @@ def test_main_audit_log_override_is_scoped_per_invocation(tmp_path, monkeypatch)
     assert exit_code_two == 0
     assert len(first_records) == 2
     assert _read_jsonl(audit_path) == first_records
+
+
+def test_main_with_pre_set_audit_override_does_not_leak_without_audit_log_arg(tmp_path, monkeypatch):
+    request_file = tmp_path / "request.json"
+    context_file = tmp_path / "context.md"
+    context_file.write_text("context", encoding="utf-8")
+    request_file.write_text(
+        json.dumps(
+            {
+                "schema": "delegation_request_v1",
+                "objective": "Investigate build failure in logs/build.log",
+                "instructions": ["Summarize the failure.", "List likely root causes."],
+                "tool_profile": "no_tools",
+                "output_sections": ["Summary"],
+                "context_files": ["context.md"],
+                "model": "gemini-3-flash-preview",
+            }
+        ),
+        encoding="utf-8",
+    )
+    output_one = tmp_path / "result.json"
+    pre_set_path = tmp_path / "pre_set_audit.jsonl"
+
+    class GeminiSuccess:
+        returncode = 0
+        stdout = json.dumps({"response": "ok"})
+        stderr = ""
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        rgh, "_run_gemini", lambda command, timeout_sec, prompt=None, cwd=None: GeminiSuccess()
+    )
+
+    rgh.set_audit_log_path_override(pre_set_path)
+    exit_code = rgh.main(
+        [
+            "--request-file",
+            str(request_file),
+            "--output-file",
+            str(output_one),
+        ]
+    )
+
+    assert exit_code == 0
+    assert not pre_set_path.exists()
 
 
 def test_ci_python_test_plan_coverage_confirmed():
