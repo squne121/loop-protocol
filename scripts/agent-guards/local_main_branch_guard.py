@@ -2394,6 +2394,12 @@ def _emit_block_stderr(
             "--input-file artifacts/<issue>/issue-metadata/issue_body.update/input.json "
             "--repo squne121/loop-protocol --dry-run"
         )
+    elif reason_code == REASON_UNPARSEABLE and rule_id == "issue_refinement_direct":
+        hint_suggested = (
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run --issue-number <issue> "
+            "--repo squne121/loop-protocol"
+        )
     elif reason_code == REASON_UNPARSEABLE:
         hint_suggested = "git branch --show-current"
     elif reason_code == REASON_UNKNOWN_COMMAND:
