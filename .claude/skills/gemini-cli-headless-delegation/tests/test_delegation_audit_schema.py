@@ -184,6 +184,64 @@ def test_delegation_audit_v1_end_ok_must_be_bool():
     assert any("ok must be a bool" in e for e in errors)
 
 
+def test_delegation_audit_v1_nested_redaction_violation_is_rejected():
+    record = {
+        "schema": "delegation_audit_v1",
+        "record_type": "end",
+        "run_id": "abc123",
+        "ts": "2026-07-07T00:00:00Z",
+        "ok": False,
+        "failure_class": "unexpected_exception",
+        "failure_reason": "unexpected",
+        "actual_model": "unknown",
+        "tool_profile": "no_tools",
+        "provider_attempts": [
+            {
+                "provider": "gemini",
+                "ok": False,
+                "failure_class": "unexpected_exception",
+                "failure_reason": "repo path leak: " + str(rgh._repo_root()),
+                "exit_code": 1,
+                "retryable_for_provider_fallback": False,
+                "model_downgrades": [],
+                "model_chain": [],
+                "attempts_by_model": {},
+                "post_to_issue_url_requested": False,
+                "post_result": None,
+                "stopped_by": "stop_if:non_retryable_failure_class:unexpected_exception",
+            }
+        ],
+    }
+    errors = rgh.validate_delegation_audit_record(record)
+    assert any("provider_attempts[0].failure_reason" in e for e in errors)
+
+
+def test_delegation_audit_v1_post_result_closed_schema_rejects_unknown_key():
+    record = {
+        "schema": "delegation_audit_v1",
+        "record_type": "end",
+        "run_id": "abc123",
+        "ts": "2026-07-07T00:00:00Z",
+        "ok": False,
+        "failure_class": "agy_post_to_issue_url_forbidden",
+        "failure_reason": "forbidden",
+        "actual_model": "unknown",
+        "tool_profile": "no_tools",
+        "post_result": {
+            "post_requested": True,
+            "post_allowed": False,
+            "post_target_type": "issue_only",
+            "request_success": False,
+            "posting_success": None,
+            "post_result": "forbidden",
+            "post_failure_class": "agy_post_to_issue_url_forbidden",
+            "extra": "not allowed",
+        },
+    }
+    errors = rgh.validate_delegation_audit_record(record)
+    assert any("post_result has unknown key" in e for e in errors)
+
+
 # ---------------------------------------------------------------------------
 # AC2: start/end pairing across every named failure path
 # ---------------------------------------------------------------------------
@@ -554,10 +612,40 @@ def test_audit_post_result_separates_request_and_posting_success(tmp_path):
     end = _read_jsonl(audit_path)[1]
     post_result = end["post_result"]
     assert post_result["post_requested"] is True
+    assert post_result["post_allowed"] is True
+    assert post_result["post_target_type"] == "issue_only"
     assert post_result["request_success"] is True
     assert post_result["posting_success"] is False
+    assert post_result["post_result"] == "failed: some gh error"
     assert post_result["post_failure_class"] == "post_to_issue_url_failed"
     assert end["ok"] is False
+
+
+def test_audit_agy_forbidden_post_to_issue_url_surfaces_forbidden_post_result(tmp_path):
+    audit_path = tmp_path / "audit.jsonl"
+    rgh.set_audit_log_path_override(audit_path)
+    request = _base_request(
+        provider="agy",
+        tool_profile="no_tools",
+        model=None,
+        prompt="Return a short summary.",
+        post_to_issue_url="https://github.com/owner/repo/issues/1",
+    )
+
+    result = rgh.run_delegation(request)
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_post_to_issue_url_forbidden"
+    end = _read_jsonl(audit_path)[1]
+    assert end["post_result"] == {
+        "post_requested": True,
+        "post_allowed": False,
+        "post_target_type": "issue_only",
+        "request_success": False,
+        "posting_success": None,
+        "post_result": "forbidden",
+        "post_failure_class": "agy_post_to_issue_url_forbidden",
+    }
 
 
 def test_audit_post_result_absent_when_post_not_requested(tmp_path):
@@ -614,6 +702,31 @@ def test_run_delegation_real_post_to_issue_url_populates_separated_success_field
     assert result["post_failure_class"] == "post_to_issue_url_failed"
 
 
+def test_run_delegation_unexpected_exception_writes_redacted_audit_end_record(tmp_path):
+    audit_path = tmp_path / "audit.jsonl"
+    rgh.set_audit_log_path_override(audit_path)
+    secret = "ghp_" + ("z" * 36)
+    leaked_path = str(rgh._repo_root())
+    request = _base_request()
+
+    with patch.object(
+        rgh,
+        "_run_delegation_core",
+        side_effect=RuntimeError(f"boom {secret} at {leaked_path}/private"),
+    ):
+        with pytest.raises(RuntimeError):
+            rgh.run_delegation(request)
+
+    records = _read_jsonl(audit_path)
+    assert len(records) == 2
+    end = records[1]
+    assert end["record_type"] == "end"
+    assert end["failure_class"] == "unexpected_exception"
+    assert secret not in (end["failure_reason"] or "")
+    assert leaked_path not in (end["failure_reason"] or "")
+    assert rgh.validate_delegation_audit_record(end) == []
+
+
 # ---------------------------------------------------------------------------
 # AC8: parent_run_id / subtask_id / attempt_id reserved fan-out fields
 # (Issue #1273)
@@ -660,6 +773,59 @@ def test_runtime_portability_doc_documents_delegation_audit_v1():
     text = doc_path.read_text(encoding="utf-8")
     assert "delegation_audit_v1" in text
     assert "DELEGATION_AUDIT_LOG_PATH" in text or "--audit-log" in text
+
+
+def test_main_audit_log_override_is_scoped_per_invocation(tmp_path, monkeypatch):
+    request_file = tmp_path / "request.json"
+    context_file = tmp_path / "context.md"
+    context_file.write_text("context", encoding="utf-8")
+    request_file.write_text(
+        json.dumps(
+            {
+                "schema": "delegation_request_v1",
+                "objective": "Investigate build failure in logs/build.log",
+                "instructions": ["Summarize the failure.", "List likely root causes."],
+                "tool_profile": "no_tools",
+                "output_sections": ["Summary"],
+                "context_files": ["context.md"],
+                "model": "gemini-3-flash-preview",
+            }
+        ),
+        encoding="utf-8",
+    )
+    audit_path = tmp_path / "audit.jsonl"
+    output_one = tmp_path / "result-1.json"
+    output_two = tmp_path / "result-2.json"
+
+    class GeminiSuccess:
+        returncode = 0
+        stdout = json.dumps({"response": "same answer"})
+        stderr = ""
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        rgh, "_run_gemini", lambda command, timeout_sec, prompt=None, cwd=None: GeminiSuccess()
+    )
+
+    exit_code_one = rgh.main(
+        [
+            "--request-file", str(request_file),
+            "--output-file", str(output_one),
+            "--audit-log", str(audit_path),
+        ]
+    )
+    first_records = _read_jsonl(audit_path)
+    exit_code_two = rgh.main(
+        [
+            "--request-file", str(request_file),
+            "--output-file", str(output_two),
+        ]
+    )
+
+    assert exit_code_one == 0
+    assert exit_code_two == 0
+    assert len(first_records) == 2
+    assert _read_jsonl(audit_path) == first_records
 
 
 def test_ci_python_test_plan_coverage_confirmed():

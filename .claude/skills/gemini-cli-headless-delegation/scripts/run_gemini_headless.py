@@ -699,9 +699,12 @@ def _dump_json(path: Path, payload: Mapping[str, Any]) -> None:
 def _append_ndjson(path: Path, payload: Mapping[str, Any]) -> None:
     """Append a single JSON object as one line to an NDJSON file (newline-delimited JSON)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=False))
-        handle.write("\n")
+    encoded_line = (json.dumps(payload, ensure_ascii=False, sort_keys=False) + "\n").encode("utf-8")
+    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.write(fd, encoded_line)
+    finally:
+        os.close(fd)
 
 
 def _normalize_text(value: str) -> str:
@@ -2443,6 +2446,8 @@ def _validate_agy_request(request: Mapping[str, Any]) -> list[str]:
     local_asset_research uses _validate_agy_local_asset_request for full checks.
     """
     errors: list[str] = []
+    if request.get("post_to_issue_url"):
+        errors.append("agy_post_to_issue_url_forbidden: provider=agy forbids post_to_issue_url for all profiles")
     if request.get("schema") != "delegation_request_v1":
         errors.append("schema must equal delegation_request_v1 for provider=agy")
     tool_profile = request.get("tool_profile")
@@ -2451,8 +2456,6 @@ def _validate_agy_request(request: Mapping[str, Any]) -> list[str]:
             f"unsupported_provider_profile: provider=agy only supports profiles "
             f"{sorted(AGY_SUPPORTED_PROFILES)}, got {tool_profile!r}"
         )
-    if request.get("post_to_issue_url"):
-        errors.append("provider_forbids_post_to_issue_url: provider=agy forbids post_to_issue_url for all profiles")
     if request.get("model"):
         errors.append(
             "unsupported_provider_option: provider=agy does not support explicit model selection"
@@ -2660,6 +2663,19 @@ def _audit_redact_value(value: Any) -> Any:
     return value
 
 
+def _iter_string_leaves(value: Any, path: str = "record") -> list[tuple[str, str]]:
+    leaves: list[tuple[str, str]] = []
+    if isinstance(value, str):
+        leaves.append((path, value))
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            leaves.extend(_iter_string_leaves(item, f"{path}.{key}"))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            leaves.extend(_iter_string_leaves(item, f"{path}[{index}]"))
+    return leaves
+
+
 def validate_delegation_audit_record(record: Mapping[str, Any]) -> list[str]:
     """Fail-closed validator for a single delegation_audit_v1 record.
 
@@ -2739,6 +2755,172 @@ def validate_delegation_audit_record(record: Mapping[str, Any]) -> list[str]:
             record["post_result"], dict
         ):
             errors.append("post_result must be an object when present")
+        elif isinstance(record.get("post_result"), dict):
+            post_result = record["post_result"]
+            allowed_post_keys = {
+                "post_requested",
+                "post_allowed",
+                "post_target_type",
+                "request_success",
+                "posting_success",
+                "post_result",
+                "post_failure_class",
+            }
+            unknown_post_keys = set(post_result) - allowed_post_keys
+            if unknown_post_keys:
+                errors.append(f"post_result has unknown key(s): {sorted(unknown_post_keys)}")
+            required_post_keys = {
+                "post_requested",
+                "post_allowed",
+                "post_target_type",
+                "request_success",
+                "posting_success",
+                "post_result",
+                "post_failure_class",
+            }
+            missing_post_keys = required_post_keys - set(post_result)
+            if missing_post_keys:
+                errors.append(f"post_result missing required key(s): {sorted(missing_post_keys)}")
+            if "post_requested" in post_result and not isinstance(post_result["post_requested"], bool):
+                errors.append("post_result.post_requested must be a bool")
+            if "post_allowed" in post_result and not isinstance(post_result["post_allowed"], bool):
+                errors.append("post_result.post_allowed must be a bool")
+            if "post_target_type" in post_result and post_result["post_target_type"] != "issue_only":
+                errors.append("post_result.post_target_type must equal 'issue_only'")
+            if "request_success" in post_result and not isinstance(post_result["request_success"], bool):
+                errors.append("post_result.request_success must be a bool")
+            if (
+                "posting_success" in post_result
+                and post_result["posting_success"] is not None
+                and not isinstance(post_result["posting_success"], bool)
+            ):
+                errors.append("post_result.posting_success must be a bool or null")
+            if "post_result" in post_result and not isinstance(post_result["post_result"], str):
+                errors.append("post_result.post_result must be a string")
+            if (
+                "post_failure_class" in post_result
+                and post_result["post_failure_class"] is not None
+                and not isinstance(post_result["post_failure_class"], str)
+            ):
+                errors.append("post_result.post_failure_class must be a string or null")
+        if "grounded_metadata" in record and record["grounded_metadata"] is not None:
+            grounded = record["grounded_metadata"]
+            if not isinstance(grounded, dict):
+                errors.append("grounded_metadata must be an object when present")
+            else:
+                unknown_grounded_keys = set(grounded) - set(_GROUNDED_METADATA_PUBLIC_SAFE_KEYS)
+                if unknown_grounded_keys:
+                    errors.append(f"grounded_metadata has unknown key(s): {sorted(unknown_grounded_keys)}")
+        if "local_asset_metadata" in record and record["local_asset_metadata"] is not None:
+            local_asset = record["local_asset_metadata"]
+            if not isinstance(local_asset, dict):
+                errors.append("local_asset_metadata must be an object when present")
+            else:
+                allowed_local_asset_keys = {"profile", "context_files_count", "serena_retrieval_failed"}
+                unknown_local_asset_keys = set(local_asset) - allowed_local_asset_keys
+                if unknown_local_asset_keys:
+                    errors.append(
+                        f"local_asset_metadata has unknown key(s): {sorted(unknown_local_asset_keys)}"
+                    )
+                if not isinstance(local_asset.get("profile"), str):
+                    errors.append("local_asset_metadata.profile must be a string")
+                context_files_count = local_asset.get("context_files_count")
+                if isinstance(context_files_count, bool) or not isinstance(context_files_count, int):
+                    errors.append("local_asset_metadata.context_files_count must be an int")
+                if not isinstance(local_asset.get("serena_retrieval_failed"), bool):
+                    errors.append("local_asset_metadata.serena_retrieval_failed must be a bool")
+        if "auth_diagnostics_metadata" in record and record["auth_diagnostics_metadata"] is not None:
+            auth_diagnostics = record["auth_diagnostics_metadata"]
+            if not isinstance(auth_diagnostics, dict):
+                errors.append("auth_diagnostics_metadata must be an object when present")
+            else:
+                unknown_auth_keys = set(auth_diagnostics) - {"auth_failure_class"}
+                if unknown_auth_keys:
+                    errors.append(
+                        f"auth_diagnostics_metadata has unknown key(s): {sorted(unknown_auth_keys)}"
+                    )
+                if auth_diagnostics.get("auth_failure_class") not in _AGY_AUTH_RELATED_FAILURE_CLASSES:
+                    errors.append(
+                        "auth_diagnostics_metadata.auth_failure_class must be one of "
+                        f"{sorted(_AGY_AUTH_RELATED_FAILURE_CLASSES)}"
+                    )
+        if "provider_attempts" in record and isinstance(record.get("provider_attempts"), list):
+            for index, attempt in enumerate(record["provider_attempts"]):
+                if not isinstance(attempt, dict):
+                    continue
+                allowed_attempt_keys = {
+                    "provider",
+                    "ok",
+                    "failure_class",
+                    "failure_reason",
+                    "exit_code",
+                    "retryable_for_provider_fallback",
+                    "model_downgrades",
+                    "model_chain",
+                    "attempts_by_model",
+                    "post_to_issue_url_requested",
+                    "post_result",
+                    "stopped_by",
+                }
+                unknown_attempt_keys = set(attempt) - allowed_attempt_keys
+                if unknown_attempt_keys:
+                    errors.append(
+                        f"provider_attempts[{index}] has unknown key(s): {sorted(unknown_attempt_keys)}"
+                    )
+                if not isinstance(attempt.get("provider"), str):
+                    errors.append(f"provider_attempts[{index}].provider must be a string")
+                if not isinstance(attempt.get("ok"), bool):
+                    errors.append(f"provider_attempts[{index}].ok must be a bool")
+                if attempt.get("failure_class") is not None and not isinstance(attempt["failure_class"], str):
+                    errors.append(f"provider_attempts[{index}].failure_class must be a string or null")
+                if attempt.get("failure_reason") is not None and not isinstance(attempt["failure_reason"], str):
+                    errors.append(f"provider_attempts[{index}].failure_reason must be a string or null")
+                exit_code = attempt.get("exit_code")
+                if exit_code is not None and (isinstance(exit_code, bool) or not isinstance(exit_code, int)):
+                    errors.append(f"provider_attempts[{index}].exit_code must be an int or null")
+                retryable = attempt.get("retryable_for_provider_fallback")
+                if retryable is not None and not isinstance(retryable, bool):
+                    errors.append(
+                        f"provider_attempts[{index}].retryable_for_provider_fallback must be a bool or null"
+                    )
+                if attempt.get("model_chain") is not None and (
+                    not isinstance(attempt["model_chain"], list)
+                    or not all(isinstance(item, str) for item in attempt["model_chain"])
+                ):
+                    errors.append(f"provider_attempts[{index}].model_chain must be a list of strings or null")
+                attempt_counts = attempt.get("attempts_by_model")
+                if attempt_counts is not None:
+                    if not isinstance(attempt_counts, dict):
+                        errors.append(f"provider_attempts[{index}].attempts_by_model must be an object or null")
+                    else:
+                        for model_name, count in attempt_counts.items():
+                            if not isinstance(model_name, str):
+                                errors.append(
+                                    f"provider_attempts[{index}].attempts_by_model keys must be strings"
+                                )
+                                break
+                            if isinstance(count, bool) or not isinstance(count, int):
+                                errors.append(
+                                    f"provider_attempts[{index}].attempts_by_model values must be ints"
+                                )
+                                break
+                post_requested = attempt.get("post_to_issue_url_requested")
+                if post_requested is not None and not isinstance(post_requested, bool):
+                    errors.append(
+                        f"provider_attempts[{index}].post_to_issue_url_requested must be a bool or null"
+                    )
+                if attempt.get("post_result") is not None and not isinstance(attempt["post_result"], str):
+                    errors.append(f"provider_attempts[{index}].post_result must be a string or null")
+                if attempt.get("stopped_by") is not None and not isinstance(attempt["stopped_by"], str):
+                    errors.append(f"provider_attempts[{index}].stopped_by must be a string or null")
+        if "attempts_by_model" in record and isinstance(record.get("attempts_by_model"), dict):
+            for model_name, count in record["attempts_by_model"].items():
+                if not isinstance(model_name, str):
+                    errors.append("attempts_by_model keys must be strings")
+                    break
+                if isinstance(count, bool) or not isinstance(count, int):
+                    errors.append("attempts_by_model values must be ints")
+                    break
 
     for reserved_key in _AUDIT_RESERVED_FANOUT_KEYS:
         if reserved_key in record and record[reserved_key] is not None and not isinstance(
@@ -2746,11 +2928,10 @@ def validate_delegation_audit_record(record: Mapping[str, Any]) -> list[str]:
         ):
             errors.append(f"{reserved_key} must be a string when present")
 
-    for key, leaf_value in record.items():
-        if isinstance(leaf_value, str):
-            violations = _scan_redaction_violations(leaf_value)
-            if violations:
-                errors.append(f"redaction invariant violated for key={key!r}: {violations}")
+    for path, leaf_value in _iter_string_leaves(record):
+        violations = _scan_redaction_violations(leaf_value)
+        if violations:
+            errors.append(f"redaction invariant violated for path={path!r}: {violations}")
 
     return errors
 
@@ -2827,14 +3008,26 @@ def _audit_build_auth_diagnostics_metadata(result: Mapping[str, Any]) -> dict[st
     return None
 
 
-def _audit_build_post_result(result: Mapping[str, Any]) -> dict[str, Any] | None:
-    if "post_request_success" not in result:
+def _audit_build_post_result(request: Mapping[str, Any], result: Mapping[str, Any]) -> dict[str, Any] | None:
+    if not request.get("post_to_issue_url"):
         return None
+    failure_class = result.get("failure_class")
+    post_allowed = failure_class != "agy_post_to_issue_url_forbidden"
+    request_success = bool(result.get("post_request_success")) if post_allowed else False
+    posting_success = result.get("post_posting_success") if post_allowed else None
+    post_result_value = result.get("post_result")
+    if not post_allowed:
+        post_result_value = "forbidden"
     return {
         "post_requested": True,
-        "request_success": bool(result.get("post_request_success")),
-        "posting_success": result.get("post_posting_success"),
-        "post_failure_class": result.get("post_failure_class"),
+        "post_allowed": post_allowed,
+        "post_target_type": "issue_only",
+        "request_success": request_success,
+        "posting_success": posting_success,
+        "post_result": post_result_value or "not_attempted",
+        "post_failure_class": (
+            "agy_post_to_issue_url_forbidden" if not post_allowed else result.get("post_failure_class")
+        ),
     }
 
 
@@ -2868,7 +3061,7 @@ def _build_delegation_audit_record(
         record["attempts_by_model"] = result["attempts_by_model"]
     if result.get("model_downgrades"):
         record["model_downgrades"] = result["model_downgrades"]
-    post_result = _audit_build_post_result(result)
+    post_result = _audit_build_post_result(request, result)
     if post_result is not None:
         record["post_result"] = post_result
     grounded_metadata = _audit_build_grounded_metadata(result)
@@ -2899,9 +3092,12 @@ def _audit_handle_failure(message: str) -> None:
 def _audit_write_record(path: Path, record: Mapping[str, Any]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=True, sort_keys=True))
-            fh.write("\n")
+        encoded_line = (json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n").encode("utf-8")
+        fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, encoded_line)
+        finally:
+            os.close(fd)
     except OSError as exc:
         _audit_handle_failure(f"write failed: {exc}")
 
@@ -3725,12 +3921,24 @@ def run_delegation(
     global _AUDIT_REENTRANCY_DEPTH
     _AUDIT_REENTRANCY_DEPTH += 1
     is_top_level_call = _AUDIT_REENTRANCY_DEPTH == 1
+    audit_state: dict[str, Any] | None = None
     try:
         audit_state = _audit_begin(request) if is_top_level_call else None
         result = _run_delegation_core(request, request_path=request_path, _routing=_routing)
         if is_top_level_call:
             _audit_end(audit_state, request, result)
         return result
+    except Exception as exc:
+        if is_top_level_call:
+            unexpected_result = {
+                "ok": False,
+                "failure_class": "unexpected_exception",
+                "failure_reason": str(exc),
+                "actual_model": "unknown",
+                "tool_profile": str(request.get("tool_profile", "unknown")),
+            }
+            _audit_end(audit_state, request, unexpected_result)
+        raise
     finally:
         _AUDIT_REENTRANCY_DEPTH -= 1
 
@@ -4030,69 +4238,73 @@ def _print_stdout_summary(result: dict[str, Any], output_file: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    previous_audit_log_override = _AUDIT_LOG_OVERRIDE
     if args.audit_log is not None:
         set_audit_log_path_override(args.audit_log)
 
-    # Resolve request file: prefer --request-file, fall back to positional argument.
-    request_file: Path | None = args.request_file or args.request_file_positional
+    try:
+        # Resolve request file: prefer --request-file, fall back to positional argument.
+        request_file: Path | None = args.request_file or args.request_file_positional
 
-    # --validate-only mode: validate request JSON without executing Gemini CLI.
-    if args.validate_only:
+        # --validate-only mode: validate request JSON without executing Gemini CLI.
+        if args.validate_only:
+            if request_file is None:
+                print("[gemini-headless] error: --validate-only requires a request file (--request-file or positional)")
+                return 1
+            try:
+                request = _load_json(request_file)
+            except Exception as exc:  # pylint: disable=broad-except
+                print(f"[gemini-headless] error: cannot load request file: {exc}")
+                return 1
+            if not isinstance(request, Mapping):
+                print("[gemini-headless] error: request file must contain a JSON object")
+                return 1
+            errors = validate_request(request, request_path=request_file)
+            if errors:
+                print(f"[gemini-headless] validation FAIL: {errors[0]}")
+                for err in errors[1:]:
+                    print(f"  {err}")
+                return 1
+            print("[gemini-headless] validation OK")
+            return 0
+
+        # Normal execution mode: --request-file and --output-file are required.
         if request_file is None:
-            print("[gemini-headless] error: --validate-only requires a request file (--request-file or positional)")
+            print("[gemini-headless] error: --request-file is required")
             return 1
-        try:
-            request = _load_json(request_file)
-        except Exception as exc:  # pylint: disable=broad-except
-            print(f"[gemini-headless] error: cannot load request file: {exc}")
+        if args.output_file is None:
+            print("[gemini-headless] error: --output-file is required")
             return 1
+
+        request = _load_json(request_file)
         if not isinstance(request, Mapping):
-            print("[gemini-headless] error: request file must contain a JSON object")
-            return 1
-        errors = validate_request(request, request_path=request_file)
-        if errors:
-            print(f"[gemini-headless] validation FAIL: {errors[0]}")
-            for err in errors[1:]:
-                print(f"  {err}")
-            return 1
-        print("[gemini-headless] validation OK")
-        return 0
-
-    # Normal execution mode: --request-file and --output-file are required.
-    if request_file is None:
-        print("[gemini-headless] error: --request-file is required")
-        return 1
-    if args.output_file is None:
-        print("[gemini-headless] error: --output-file is required")
-        return 1
-
-    request = _load_json(request_file)
-    if not isinstance(request, Mapping):
-        result = {
-            "schema": "delegation_result/v1",
-            "ok": False,
-            "requested_model": DEFAULT_MODEL,
-            "actual_model": "unknown",
-            "tool_profile": "unknown",
-            "exit_code": 1,
-            "result_surface": _build_result_surface(ok=False, response_text=None),
-            "response_text": None,
-            "stats": None,
-            "stderr": "request file must contain a JSON object",
-            "warnings": ["request file must contain a JSON object"],
-            "failure_reason": "request file must contain a JSON object",
-            "raw_command": [],
-        }
-    else:
-        result = run_delegation(request, request_path=request_file)
-    if args.compact:
-        result = _apply_compact(result)
-    if args.output_format == "ndjson":
-        _append_ndjson(args.output_file, result)
-    else:
-        _dump_json(args.output_file, result)
-    _print_stdout_summary(result, args.output_file)
-    return 0 if result["ok"] else 1
+            result = {
+                "schema": "delegation_result/v1",
+                "ok": False,
+                "requested_model": DEFAULT_MODEL,
+                "actual_model": "unknown",
+                "tool_profile": "unknown",
+                "exit_code": 1,
+                "result_surface": _build_result_surface(ok=False, response_text=None),
+                "response_text": None,
+                "stats": None,
+                "stderr": "request file must contain a JSON object",
+                "warnings": ["request file must contain a JSON object"],
+                "failure_reason": "request file must contain a JSON object",
+                "raw_command": [],
+            }
+        else:
+            result = run_delegation(request, request_path=request_file)
+        if args.compact:
+            result = _apply_compact(result)
+        if args.output_format == "ndjson":
+            _append_ndjson(args.output_file, result)
+        else:
+            _dump_json(args.output_file, result)
+        _print_stdout_summary(result, args.output_file)
+        return 0 if result["ok"] else 1
+    finally:
+        set_audit_log_path_override(previous_audit_log_override)
 
 
 if __name__ == "__main__":
