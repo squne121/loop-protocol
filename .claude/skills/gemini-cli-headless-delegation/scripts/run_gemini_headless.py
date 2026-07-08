@@ -1430,6 +1430,142 @@ def _collect_live_serena_read_only_evidence(
             process.kill()
 
 
+def _coerce_live_serena_retrieval_result(
+    result: Any,
+    context_paths: list[Path],
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Normalize wrapper result formats from live Serena retrieval.
+
+    Newer wrappers return ``(documents, metadata)`` while some existing
+    test doubles still return a dict envelope with ``status`` / ``evidence_document``.
+    Preserve success behavior by accepting both and deriving public-safe metadata
+    from the evidence payload when fields are missing.
+    """
+
+    def _fallback_context_path(index: int) -> str:
+        if context_paths:
+            return context_paths[min(index, len(context_paths) - 1)].name
+        return "local_asset_research"
+
+    if isinstance(result, tuple):
+        if len(result) != 2:
+            raise ValueError("local_asset_research live_serena_mcp returned unexpected tuple shape")
+        documents, metadata = result
+        if not isinstance(documents, list):
+            raise ValueError("local_asset_research live_serena_mcp returned non-list documents")
+        normalized_metadata: dict[str, Any] = {}
+        if metadata is not None:
+            if not isinstance(metadata, Mapping):
+                raise ValueError("local_asset_research live_serena_mcp returned non-mapping metadata")
+            normalized_metadata = dict(metadata)
+        return documents, normalized_metadata
+
+    if isinstance(result, list):
+        return [
+            {
+                "path": str(
+                    doc.get("path") if isinstance(doc, Mapping) and "path" in doc else _fallback_context_path(i)
+                ),
+                "content": json.dumps(doc, ensure_ascii=False, sort_keys=True),
+            }
+            for i, doc in enumerate(result)
+        ], {}
+
+    if not isinstance(result, Mapping):
+        raise ValueError(
+            "local_asset_research live_serena_mcp returned unsupported evidence payload type"
+        )
+
+    status = str(result.get("status") or "success").strip().lower()
+    retrieval_status = "succeeded" if status in {"success", "succeeded", "ok"} else "failed"
+    evidence_payload = result.get("evidence")
+    evidence_records: list[Mapping[str, Any]] = []
+
+    if isinstance(evidence_payload, str):
+        try:
+            parsed_payload = json.loads(evidence_payload)
+        except json.JSONDecodeError:
+            parsed_payload = None
+        else:
+            if isinstance(parsed_payload, Mapping):
+                evidence_payload = parsed_payload
+
+    if isinstance(evidence_payload, Mapping):
+        candidate = evidence_payload.get("evidence")
+        if isinstance(candidate, list):
+            evidence_records = [item for item in candidate if isinstance(item, Mapping)]
+    elif isinstance(evidence_payload, list):
+        evidence_records = [item for item in evidence_payload if isinstance(item, Mapping)]
+
+    evidence_document = result.get("evidence_document")
+    if not evidence_records and isinstance(evidence_document, str):
+        try:
+            parsed = json.loads(evidence_document)
+        except json.JSONDecodeError:
+            parsed = None
+        else:
+            if isinstance(parsed, Mapping):
+                candidate = parsed.get("evidence")
+                if isinstance(candidate, list):
+                    evidence_records = [item for item in candidate if isinstance(item, Mapping)]
+
+    documents: list[dict[str, str]] = []
+    for index, item in enumerate(evidence_records):
+        if not isinstance(item, Mapping):
+            continue
+        path = item.get("path")
+        if not isinstance(path, str) or not path:
+            path = item.get("repo_relative_path")
+        if not isinstance(path, str) or not path:
+            path = _fallback_context_path(index)
+        documents.append({
+            "path": path,
+            "content": json.dumps(item, ensure_ascii=False, sort_keys=True),
+        })
+
+    if not documents:
+        context_text = result.get("context_text")
+        documents = [
+            {
+                "path": _fallback_context_path(0),
+                "content": str(context_text) if context_text is not None else "",
+            }
+        ]
+
+    manifest_id = _find_first_manifest_id(evidence_records)
+    return documents, {
+        "retrieval_status": retrieval_status,
+        "retrieval_mode": "live_serena_mcp",
+        "serena_manifest_id": manifest_id,
+        "serena_pinned_ref": (
+            manifest_id.split(":", 1)[1]
+            if manifest_id and manifest_id.startswith("serena_tool_manifest_v1:")
+            else None
+        ),
+        "context_files_count": len(context_paths),
+        "evidence_record_count": len(documents),
+        "manifest_drift_failed": False,
+        "failure_class": (
+            result.get("failure_class")
+            if retrieval_status == "failed"
+            else None
+        ),
+    }
+
+
+def _find_first_manifest_id(records: list[Mapping[str, Any]]) -> str | None:
+    for item in records:
+        manifest_id = item.get("manifest_id")
+        if isinstance(manifest_id, str) and manifest_id.strip():
+            return manifest_id
+        source = item.get("source")
+        if isinstance(source, Mapping):
+            source_manifest = source.get("manifest_id")
+            if isinstance(source_manifest, str) and source_manifest.strip():
+                return source_manifest
+    return None
+
+
 def _build_local_asset_prompt(
     request: Mapping[str, Any],
     request_path: Path | None,
@@ -3373,8 +3509,12 @@ def _run_delegation_core(
             )
             manifest = load_serena_tool_manifest(repo_root)
             try:
-                evidence_documents, local_asset_retrieval_metadata = _collect_live_serena_read_only_evidence(
+                local_asset_result = _collect_live_serena_read_only_evidence(
                     context_paths, repo_root, manifest
+                )
+                evidence_documents, local_asset_retrieval_metadata = _coerce_live_serena_retrieval_result(
+                    local_asset_result,
+                    context_paths=context_paths,
                 )
                 if local_asset_retrieval_metadata is not None:
                     local_asset_retrieval_metadata = {
