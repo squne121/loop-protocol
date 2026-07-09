@@ -101,6 +101,20 @@ REVIEWER_CHECKER_TAXONOMY_V1: list[dict[str, Any]] = [
         "readiness_category_source_check": "baseline_vc_preflight",
         "domain_keys": ["vc_unexpected_pass"],
     },
+    {
+        "entry_id": "broad_search_path_unbounded",
+        "reviewer_codes": [
+            "vcp_broad_search_path_un",
+            "VCP_BROAD_SEARCH_PATH_UN",
+            "broad_search_path_unbounded",
+        ],
+        "deterministic_checks": [],
+        "readiness_rule_ids": ["VCP_BROAD_SEARCH_PATH_UN"],
+        "readiness_rule_id_source_check": "baseline_vc_preflight",
+        "readiness_categories": ["broad_search_path_unbounded"],
+        "readiness_category_source_check": "baseline_vc_preflight",
+        "domain_keys": ["broad_search_path_unbounded"],
+    },
 ]
 
 TAXONOMY_BY_ENTRY_ID: dict[str, dict[str, Any]] = {

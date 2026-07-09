@@ -156,6 +156,57 @@ def test_ac2_c9_aliases_normalize_to_single_entry():
 
 
 # --------------------------------------------------------------------------
+# Issue #1406 regression: vcp_broad_search_path_un / VCP_BROAD_SEARCH_PATH_UN /
+# broad_search_path_unbounded all normalize to the same taxonomy entry, and
+# a matching readiness error (VCP_BROAD_SEARCH_PATH_UN, baseline_vc_preflight)
+# is classified as deterministic_fail_confirmed (not checker_gap).
+# --------------------------------------------------------------------------
+
+
+def test_issue_1406_broad_search_path_aliases_normalize_to_single_entry():
+    assert normalize_taxonomy_key("vcp_broad_search_path_un") == "broad_search_path_unbounded"
+    assert normalize_taxonomy_key("VCP_BROAD_SEARCH_PATH_UN") == "broad_search_path_unbounded"
+    assert normalize_taxonomy_key("broad_search_path_unbounded") == "broad_search_path_unbounded"
+
+    for alias in (
+        "vcp_broad_search_path_un",
+        "VCP_BROAD_SEARCH_PATH_UN",
+        "broad_search_path_unbounded",
+    ):
+        review = {
+            "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
+            "issue_url": "https://github.com/squne121/loop-protocol/issues/1406",
+            "body_sha256": "sha256:body-a",
+            "blocking_issues": [{"code": alias, "message": "rg broad search path"}],
+            "structured_blockers": [],
+        }
+        readiness = {
+            "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+            "body_sha256": "sha256:body-a",
+            "errors": [
+                {
+                    "rule_id": "VCP_BROAD_SEARCH_PATH_UN",
+                    "source_check": "baseline_vc_preflight",
+                    "category": "broad_search_path_unbounded",
+                    "line_start": 20,
+                    "line_end": 20,
+                }
+            ],
+        }
+        result, _ = analyze(
+            review_result=review,
+            readiness_result=readiness,
+            vc_syntax_result=None,
+            vc_preflight_result=None,
+            previous_state={},
+        )
+        assert result["blockers"][0]["normalized_kind"] == "broad_search_path_unbounded", alias
+        assert result["verdict_detail_v1"] == "deterministic_fail_confirmed", alias
+        assert result["should_consume_iteration"] is True, alias
+        assert result["blockers"][0]["checker_gap"] is False, alias
+
+
+# --------------------------------------------------------------------------
 # AC3: deterministic-check-fail blocker (same body hash) never returns to a
 # reviewer-rerun lane, even when structured findings / fallback evidence are
 # both absent (the checker/taxonomy-artifact gap scenario from Issue #1277).
@@ -295,6 +346,7 @@ def test_ac5_dump_taxonomy_json_drift_detection():
         "missing_section",
         "rva_immediate_field_missing",
         "unexpected_pass",
+        "broad_search_path_unbounded",
     }
 
     # Pin deterministic_checks (checker name) parity per entry.
@@ -304,6 +356,7 @@ def test_ac5_dump_taxonomy_json_drift_detection():
         "missing_section": ["C1_required_sections"],
         "rva_immediate_field_missing": ["C9_runtime_applicability_present"],
         "unexpected_pass": [],
+        "broad_search_path_unbounded": [],
     }
     for entry_id, expected in expected_checks.items():
         assert entries_by_id[entry_id]["deterministic_checks"] == expected, entry_id
@@ -330,6 +383,23 @@ def test_ac5_dump_taxonomy_json_drift_detection():
     assert entries_by_id["unexpected_pass"]["readiness_category_source_check"] == (
         "baseline_vc_preflight"
     )
+
+    # Pin the Issue #1406 broad_search_path_unbounded entry: rule_id /
+    # readiness_category / their respective source_check fields, and that
+    # its domain_keys do not collide with any existing entry.
+    broad_entry = entries_by_id["broad_search_path_unbounded"]
+    assert broad_entry["readiness_rule_ids"] == ["VCP_BROAD_SEARCH_PATH_UN"]
+    assert broad_entry["readiness_rule_id_source_check"] == "baseline_vc_preflight"
+    assert broad_entry["readiness_categories"] == ["broad_search_path_unbounded"]
+    assert broad_entry["readiness_category_source_check"] == "baseline_vc_preflight"
+    assert broad_entry["deterministic_checks"] == []
+    all_other_domain_keys = {
+        key
+        for entry_id, entry in entries_by_id.items()
+        if entry_id != "broad_search_path_unbounded"
+        for key in entry["domain_keys"]
+    }
+    assert not set(broad_entry["domain_keys"]) & all_other_domain_keys
 
     # The in-process constant and the CLI-dumped JSON must be identical --
     # this is the actual "drift" the CLI flag is meant to catch (the dump
