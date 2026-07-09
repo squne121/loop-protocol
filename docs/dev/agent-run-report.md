@@ -452,6 +452,8 @@ hook_coexistence_pass_requires:
 
 ## #1405 Parent Closure Proof Contract / #1153 親 Issue クロージャ証明契約
 
+This section defines the parent closure proof contract for #1153（本節は #1153 の親 Issue クロージャ証明契約を定義する）。
+
 `agent_operation_session_index/v1`（`docs/schemas/agent-operation-session-index.schema.json`）は、
 1 件の Issue / PR operation と、その operation を裏付ける `agent_run_report/v1` GitHub comment・
 `agent_retro_index/v1` GitHub comment・`CHATGPT_RETRO_CONTEXT_V1` marker comment を接続する
