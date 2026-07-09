@@ -54,12 +54,22 @@ def build_hook_command_repair_hint(
             "PUBLISH_SAFETY_STOP_REPORT_V1 を残して停止"
         )
     elif reason_code == "stale_remote_head":
-        safe_action = "fetch/readback 後に expected_remote_head と current_remote_head を照合し、一致時のみ bounded publish lane を再試行する"
+        safe_action = (
+            "fetch/readback 後に expected_remote_head と current_remote_head を照合し、"
+            "一致時のみ bounded publish lane を再試行する"
+        )
         verification_command = verification_command or (
-            f"uv run --locked python3 scripts/agent-ops/git_ref_probe.py --branch {target_branch or '<branch>'} --remote origin --json"
+            "uv run --locked python3 scripts/agent-ops/git_ref_probe.py "
+            f"--branch {target_branch or '<branch>'} --remote origin --json"
         )
         stop_condition = "expected_remote_head != current_remote_head の場合は safety stop"
-        forbidden.extend(["git " + "push --force-with-lease", "bash -lc 'git " + "push ...'", "rtk run git " + "push ..."])
+        forbidden.extend(
+            [
+                "git " + "push --force-with-lease",
+                "bash -lc 'git " + "push ...'",
+                "rtk run git " + "push ...",
+            ]
+        )
     elif reason_code == "local_head_mismatch":
         safe_action = "declared publish head と local head を再同期し、review 済み head 以外は publish しない"
         verification_command = verification_command or "git rev-parse HEAD"

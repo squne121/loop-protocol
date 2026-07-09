@@ -387,7 +387,10 @@ def _publish_safety_stop_result(
         command_class=COMMAND_CLASS_RTK_GIT_PUSH,
         reason_code=reason_code,
         suggested_command=None,
-        verification_command=f"uv run --locked python3 scripts/agent-ops/git_ref_probe.py --branch {target_branch} --remote origin --json",
+        verification_command=(
+            "uv run --locked python3 scripts/agent-ops/git_ref_probe.py "
+            f"--branch {target_branch} --remote origin --json"
+        ),
         expected_remote_head=expected_remote_head,
         current_remote_head=current_remote_head,
         local_head=local_head,
