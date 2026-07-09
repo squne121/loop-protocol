@@ -450,7 +450,7 @@ hook_coexistence_pass_requires:
 - real prompt / real trace export / real Cloud pilot は禁止のままとする。
 - `unsupported` / `unverified` は失敗ではなく Child C0/C1 の input availability として扱う。
 
-## #1405 Parent Closure Proof Contract / #1153 parent closure proof
+## #1405 Parent Closure Proof Contract / #1153 親 Issue クロージャ証明契約
 
 `agent_operation_session_index/v1`（`docs/schemas/agent-operation-session-index.schema.json`）は、
 1 件の Issue / PR operation と、その operation を裏付ける `agent_run_report/v1` GitHub comment・
