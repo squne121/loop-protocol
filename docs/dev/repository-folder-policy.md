@@ -65,10 +65,9 @@ REPOSITORY_FOLDER_POLICY_V1:
 
 ## フォルダ運用変更の変更動線
 
-folder policy を変える PR では次を同時に更新する。
+この folder policy を変更する PR では、関連する定義と運用文書の整合を崩さないため、次の更新を同じ変更セットでそろえる。
 
 1. この `docs/dev/repository-folder-policy.md`
-2. hook registration と advisory/blocker docs
-3. `schemas/` と producer/tests
-4. cleanup skill / related operator docs
-
+2. hook registration と advisory/blocker docs。hook の案内文や判定条件が policy とずれないようにする。
+3. `schemas/` と producer/tests。機械可読な定義と検証系も同じ policy に追従させる。
+4. cleanup skill / related operator docs。cleanup 実行者が参照する手順書や運用説明も同時に更新する。
