@@ -25,6 +25,7 @@ dist-ssr
 
 # NotebookLM local assets
 .nlm-local/
+# REPOSITORY_FOLDER_POLICY_V1: tmp/ is the repo-approved local temporary workspace.
 tmp/
 tmp/nlm/
 
@@ -51,6 +52,7 @@ tmp/edit_issue_*.md
 # .system/ は ESLint では eslint.config.mjs 側で ignore 済みだが、git status / dirty tree に残り続けるため除外
 .claude/skills/.system/
 .claude/skills/*-workspace/
+.claude/tmp/
 .claude/worktrees/
 .claude/plans/
 # 個人ローカル上書き（API キー / ローカルパス / 好み等）。共有設定は .claude/settings.json に残す

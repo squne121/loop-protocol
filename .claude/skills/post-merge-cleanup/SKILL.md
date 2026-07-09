@@ -105,6 +105,34 @@ uv run --locked python3 .claude/skills/post-merge-cleanup/scripts/classify-git-s
 - **報告対象（削除しない）**: `status.staged` / `status.unstaged` / `status.untracked` に値があるもの
 - この時点では削除しない。分類結果はステップ 6 のレポートで返す
 
+#### TEMP_CLEANUP_SAFETY_RULES_V1
+
+```yaml
+TEMP_CLEANUP_SAFETY_RULES_V1:
+  never_delete:
+    - "tmp/"
+    - ".claude/tmp/"
+    - ".claude/worktrees/"
+  may_delete_without_human:
+    - "owned session subdirectory under tmp/ or .claude/tmp/ only when ownership marker matches"
+  root_temporary_residue:
+    cleanup_required:
+      - ".tmp/"
+      - ".temp/"
+      - ".tmp-*/"
+    report_only:
+      - "marker 不明の .tmp/**"
+      - "marker 不明の .temp/**"
+      - "marker 不明の .tmp-*/**"
+  required_checks:
+    - "relative path only"
+    - "Path.resolve(strict=False) under approved root"
+    - "git ls-files confirms untracked before deletion"
+```
+
+- `root temporary residue` は cleanup-required または report-only として分類し、marker 不明の `.tmp/**` は自動削除しない。
+- `tmp/`、`.claude/tmp/`、`.claude/worktrees/` の root 全体削除は自動実行対象にしない。
+
 ### 2. main を origin/main に整合
 
 ```bash

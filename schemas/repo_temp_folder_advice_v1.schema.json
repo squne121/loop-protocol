@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.local/schemas/repo_temp_folder_advice_v1.schema.json",
+  "title": "Repo Temp Folder Advice V1",
+  "description": "Schema for REPO_TEMP_FOLDER_ADVICE_V1 inner payload emitted via hookSpecificOutput.additionalContext when a root temporary alias such as .tmp/ or .temp/ is detected.",
+  "type": "object",
+  "required": [
+    "schema",
+    "block",
+    "reason_code",
+    "observed_path",
+    "approved_replacement",
+    "approved_temporary_roots",
+    "cleanup_required",
+    "policy_doc",
+    "message_ja"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "REPO_TEMP_FOLDER_ADVICE_V1"
+    },
+    "block": {
+      "type": "boolean",
+      "const": false
+    },
+    "reason_code": {
+      "type": "string",
+      "const": "root_temporary_alias"
+    },
+    "observed_path": {
+      "type": "string",
+      "pattern": "^\\.(tmp(?:-[^/]+)?|temp)/$"
+    },
+    "approved_replacement": {
+      "type": "string",
+      "const": "tmp/"
+    },
+    "approved_temporary_roots": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["tmp/", ".claude/tmp/"]
+      },
+      "minItems": 2,
+      "uniqueItems": true
+    },
+    "cleanup_required": {
+      "type": "boolean",
+      "const": true
+    },
+    "policy_doc": {
+      "type": "string",
+      "const": "docs/dev/repository-folder-policy.md"
+    },
+    "message_ja": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}
