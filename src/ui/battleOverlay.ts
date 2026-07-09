@@ -36,17 +36,25 @@ export function resolveBattleOverlayElements(root: ParentNode): BattleOverlayEle
   }
 }
 
-export function configureBattleOverlayFoundation(elements: Pick<BattleOverlayElements, 'commandRail' | 'screenLayer'>): void {
+export function syncBattleOverlayPlaceholderRail(
+  elements: Pick<BattleOverlayElements, 'commandRail'>,
+): void {
   const appShell = elements.commandRail.closest<HTMLElement>('.app-shell')
 
   if (appShell) {
     appShell.setAttribute('data-battle-layout', 'overlay-hud')
   }
 
-  elements.commandRail.replaceChildren()
   elements.commandRail.hidden = true
   elements.commandRail.setAttribute('aria-hidden', 'true')
   elements.commandRail.setAttribute('data-battle-placeholder', 'true')
+}
+
+export function configureBattleOverlayFoundation(
+  elements: Pick<BattleOverlayElements, 'commandRail' | 'screenLayer'>,
+): void {
+  elements.commandRail.replaceChildren()
+  syncBattleOverlayPlaceholderRail(elements)
   elements.screenLayer.hidden = true
   elements.screenLayer.setAttribute('inert', '')
   elements.screenLayer.setAttribute('aria-hidden', 'true')

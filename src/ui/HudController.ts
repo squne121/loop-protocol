@@ -350,10 +350,6 @@ export function createHudController(
 
   return {
     render(state, isPaused, upgradeView) {
-      container.dataset.battleHudLayout = state.loopPhase === 'result'
-        ? 'result-header'
-        : 'overlay-stack'
-
       hp.textContent = `${formatCombatNumber(state.player.hp)}/${formatCombatNumber(state.player.maxHp)}`
       resources.textContent = `${state.progress.resources}`
       weaponPowerField.textContent = `${upgradeView?.weaponPower ?? state.progress.weaponPower}`

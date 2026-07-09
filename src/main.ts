@@ -42,6 +42,7 @@ import {
   createHudController,
   getUpgradeStatusCopy,
   resolveBattleOverlayElements,
+  syncBattleOverlayPlaceholderRail,
   type HudUpgradeStatusCopy,
   type HudUpgradeViewModel,
 } from './ui'
@@ -345,12 +346,8 @@ const battleHudLayer = battleOverlay?.hudLayer ?? null
 const battleScreenLayer = battleOverlay?.screenLayer ?? null
 
 function syncBattleOverlayLayout(): void {
-  const appShell = commandRail?.closest<HTMLElement>('.app-shell') ?? null
-  if (!appShell || !commandRail) return
-
-  const useOverlayHudLayout = state.loopPhase !== 'result'
-  appShell.toggleAttribute('data-battle-layout', useOverlayHudLayout)
-  commandRail.hidden = useOverlayHudLayout
+  if (!commandRail) return
+  syncBattleOverlayPlaceholderRail({ commandRail })
 }
 
 if ((!canvas || !commandRail || !battleHudLayer || !battleScreenLayer) && !isTestRuntime) {

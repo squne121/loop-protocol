@@ -315,16 +315,19 @@ describe('HudController', () => {
     )
   })
 
-  it('GIVEN running WHEN render called THEN HUD keeps overlay-stack layout', () => {
+  it('GIVEN running WHEN render called THEN HUD renders without a result-specific layout override', () => {
     hudController.render(createState('running'), false)
 
-    expect(container.dataset.battleHudLayout).toBe('overlay-stack')
+    expect(container.dataset.battleHudLayout).toBeUndefined()
   })
 
-  it('GIVEN result WHEN render called THEN HUD exposes result-header layout for canvas-safe actions', () => {
+  it('GIVEN result WHEN render called THEN HUD keeps its action surface in the shared overlay shell', () => {
     hudController.render(createState('result'), false)
 
-    expect(container.dataset.battleHudLayout).toBe('result-header')
+    expect(container.dataset.battleHudLayout).toBeUndefined()
+    expect(queryButton(container, 'confirm-result').disabled).toBe(false)
+    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
+    expect(container.querySelectorAll('[data-action]').length).toBeGreaterThan(0)
   })
 
   it('GIVEN active assist without assigned target WHEN render called THEN assist status reports signal sent', () => {
