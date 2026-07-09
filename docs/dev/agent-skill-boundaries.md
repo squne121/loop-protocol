@@ -174,7 +174,7 @@ SubAgent（役割）── Skill（作業手順）
 | `gemini-cli-headless-delegation` | Gemini CLI への headless 委譲手順。file evidence の structure (REPO_EVIDENCE_REF_V1) と verification contract が定義されている。検証契約の置き場。 |
 | `nlm-skill` | NotebookLM CLI / MCP 操作（既存導入） |
 
-## Repository Folder Policy Change Route
+## Repository Folder Policy Change Route（リポジトリフォルダポリシー変更ルート）
 
 - repo-approved temporary workspace の正本は `docs/dev/repository-folder-policy.md` とする。
 - `.tmp/` / `.temp/` / `.tmp-*` の扱いを変える変更は、hook advisory・schema・tests・cleanup docs を同一 PR で更新する。
