@@ -87,7 +87,7 @@ CLI の詳細オプションは `docs/dev/agent-run-report.md` の「ChatGPT Con
 
 詳細な Stop Conditions は `docs/dev/agent-run-report.md` の「Phase Stop Conditions」セクションを参照。
 
-## Hook Boundary Policy
+## Hook Boundary Policy（フック境界ポリシー）
 
 hook は diagnostic/prevention レイヤーであり、カノニカルゲートではない。
 post-run verifier が canonical gate である。
