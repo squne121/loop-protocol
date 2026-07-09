@@ -1,3 +1,4 @@
+import { spawnSync } from 'child_process'
 import { readFileSync } from 'fs'
 import { resolve } from 'path'
 import { describe, expect, it } from 'vitest'
@@ -7,6 +8,8 @@ import {
 } from '../scripts/check-chatgpt-retro-e2e-proof.mjs'
 
 const FIXTURES_DIR = resolve(__dirname, 'fixtures/chatgpt-retro-e2e-proof')
+const REPO_ROOT = resolve(__dirname, '..')
+const CHECKER_SCRIPT = resolve(REPO_ROOT, 'scripts/check-chatgpt-retro-e2e-proof.mjs')
 
 function readFixture(name: string) {
   return readFileSync(resolve(FIXTURES_DIR, name), 'utf-8')
@@ -33,6 +36,12 @@ describe('chatgpt_retro_execution_proof/v1 checker: valid fixture (AC2, AC4, AC1
     const [proof] = extractJsonBlocks(markdown)
     expect(proof.evidence_mode.value).toBe('synthetic_route_proof')
     expect(proof.evidence_mode.real_pilot_verified_claimed).toBe(false)
+  })
+
+  it('GIVEN valid-pr-retro-proof.md (target.kind = pull_request) WHEN validated THEN checker returns valid (P0-5, Issue #1405 OWNER review: a PR-target E2E proof fixture must exist)', () => {
+    const result = validateFixture('valid-pr-retro-proof.md')
+    expect(result.errors).toEqual([])
+    expect(result.valid).toBe(true)
   })
 })
 
@@ -96,6 +105,32 @@ describe('chatgpt_retro_execution_proof/v1 checker: negative fixtures (AC4, AC7-
     expect(result.errors.some((e: { code: string }) => e.code === 'evidence_refs.unresolvable')).toBe(true)
   })
 
+  it('GIVEN a github_comment evidence_ref matching an in-repo comment URL by string but carrying a mismatched digest THEN evidence_refs.unresolvable is raised (P0-4, Issue #1405 OWNER review: no more permissive any-issue/pull-URL fallback)', () => {
+    const markdown = mutateMarkdown((_proof, retroResult) => {
+      retroResult.findings[0].evidence_refs[0] = {
+        kind: 'github_comment',
+        ref: 'https://github.com/squne121/loop-protocol/issues/1405#issuecomment-4930000020',
+        digest: computeChatgptRetroExecutionProofDigest('tampered-evidence-ref-digest'),
+      }
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'evidence_refs.unresolvable')).toBe(true)
+  })
+
+  it('GIVEN a repo_file evidence_ref outside the allowlisted path prefixes THEN evidence_refs.unresolvable is raised (P0-4, Issue #1405 OWNER review)', () => {
+    const markdown = mutateMarkdown((_proof, retroResult) => {
+      retroResult.findings[0].evidence_refs.push({
+        kind: 'repo_file',
+        ref: 'package.json',
+        digest: computeChatgptRetroExecutionProofDigest('package.json'),
+      })
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'evidence_refs.unresolvable')).toBe(true)
+  })
+
   it('GIVEN resolve_live_status not "resolved" and verdict "approve" THEN verdict.resolver_not_resolved is raised', () => {
     const markdown = mutateMarkdown((proof) => {
       proof.chatgpt_context.resolve_live_status = 'stale'
@@ -115,13 +150,20 @@ describe('chatgpt_retro_execution_proof/v1 checker: negative fixtures (AC4, AC7-
     expect(result.errors.some((e: { code: string }) => e.code === 'verdict.real_capture_claim_forbidden')).toBe(true)
   })
 
-  it('GIVEN real_pilot_verified_claimed = true without allowed_real_pilot_upgrade THEN evidence_mode.real_pilot_verified_without_approval is raised', () => {
+  it('GIVEN real_pilot_verified_claimed = true THEN both schema const AND the explicit semantic gate fail closed (P0-3, Issue #1405 OWNER review: real pilot flags are fixed false for this synthetic-only proof kind)', () => {
+    // real_pilot_verified_claimed is now `const: false` in the schema, so setting it
+    // true fails schema validation directly (which also short-circuits the
+    // schema-gated cross-field checks such as the legacy
+    // evidence_mode.real_pilot_verified_without_approval semantic check further
+    // below). validateChatgptContextGovernanceInvariants() runs independently of the
+    // schema-valid gate and asserts the same invariant defense-in-depth.
     const markdown = mutateMarkdown((proof) => {
       proof.evidence_mode.real_pilot_verified_claimed = true
     })
     const result = validateChatgptRetroE2eProofMarkdown(markdown)
     expect(result.valid).toBe(false)
-    expect(result.errors.some((e: { code: string }) => e.code === 'evidence_mode.real_pilot_verified_without_approval')).toBe(true)
+    expect(result.errors.some((e: { code: string }) => e.code === 'schema.invalid')).toBe(true)
+    expect(result.errors.some((e: { code: string }) => e.code === 'evidence_mode.real_pilot_flag_forbidden')).toBe(true)
   })
 
   it('GIVEN a stale resolved_comment_set_digest THEN digest.stale is raised (fixture-mode staleness re-verification, AC10)', () => {
@@ -133,16 +175,35 @@ describe('chatgpt_retro_execution_proof/v1 checker: negative fixtures (AC4, AC7-
     expect(result.errors.some((e: { code: string }) => e.code === 'digest.stale')).toBe(true)
   })
 
-  it('GIVEN local_file_access_used = true THEN schema-level requirement is not violated by itself but downstream governance treats it as untrusted (const only enforced on safety fields)', () => {
-    // local_file_access_used / latitude_direct_access_used are plain booleans in
-    // the schema (not const) because the checker's own semantic gates, not the
-    // schema shape, are what must fail closed on a true value. This fixture
-    // exercises the negative branch via forbidden_field / safety const drift.
+  it('GIVEN safety.local_absolute_path_present = true THEN schema const violation fails closed', () => {
     const markdown = mutateMarkdown((proof) => {
       proof.safety.local_absolute_path_present = true
     })
     const result = validateChatgptRetroE2eProofMarkdown(markdown)
     expect(result.valid).toBe(false)
+  })
+
+  it('GIVEN chatgpt_context.local_file_access_used = true THEN both schema const AND the explicit semantic gate fail closed (P0-2, Issue #1405 OWNER review)', () => {
+    // local_file_access_used / latitude_direct_access_used / raw_trace_access_used
+    // are now `const: false` in the schema (not plain booleans), and
+    // validateChatgptContextGovernanceInvariants() independently re-asserts the
+    // same invariant so a future schema loosening cannot silently reopen it.
+    const markdown = mutateMarkdown((proof) => {
+      proof.chatgpt_context.local_file_access_used = true
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'schema.invalid')).toBe(true)
+    expect(result.errors.some((e: { code: string }) => e.code === 'chatgpt_context.local_file_access_forbidden')).toBe(true)
+  })
+
+  it('GIVEN chatgpt_context.github_connector_only = false THEN both schema const AND the explicit semantic gate fail closed (P0-2, Issue #1405 OWNER review)', () => {
+    const markdown = mutateMarkdown((proof) => {
+      proof.chatgpt_context.github_connector_only = false
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'chatgpt_context.github_connector_only_required')).toBe(true)
   })
 
   it('GIVEN raw_values_emitted = true in safety THEN schema const violation fails closed', () => {
@@ -197,6 +258,33 @@ describe('chatgpt_retro_execution_proof/v1 checker: negative fixtures (AC4, AC7-
     const result = validateChatgptRetroE2eProofMarkdown(malformed)
     expect(result.valid).toBe(false)
     expect(result.errors.some((e: { code: string }) => e.code === 'marker.constraint_violation')).toBe(true)
+  })
+})
+
+describe('chatgpt_retro_execution_proof/v1 checker CLI: process exit code (P1-3, Issue #1405 OWNER review)', () => {
+  // As with the agent-operation-session-index checker CLI test, this spawns the
+  // real CLI entry point (child_process.spawnSync) so a regression in main()'s
+  // `failures` counter or process.exit wiring is caught even though the in-memory
+  // exported functions above are also independently tested.
+  it('GIVEN valid-issue-retro-proof.md WHEN the CLI is invoked THEN it exits 0', () => {
+    const result = spawnSync(
+      'node',
+      [CHECKER_SCRIPT, resolve(FIXTURES_DIR, 'valid-issue-retro-proof.md')],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain('PASS')
+  })
+
+  it('GIVEN invalid-local-file-access-used.md (chatgpt_context.local_file_access_used = true) WHEN the CLI is invoked THEN it exits non-zero', () => {
+    const result = spawnSync(
+      'node',
+      [CHECKER_SCRIPT, resolve(FIXTURES_DIR, 'invalid-local-file-access-used.md')],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain('FAIL')
+    expect(result.stderr).toContain('chatgpt_context.local_file_access_forbidden')
   })
 })
 

@@ -119,16 +119,20 @@
           "pattern": "^sha256:[0-9a-f]{64}$"
         },
         "local_file_access_used": {
-          "type": "boolean"
+          "type": "boolean",
+          "const": false
         },
         "latitude_direct_access_used": {
-          "type": "boolean"
+          "type": "boolean",
+          "const": false
         },
         "raw_trace_access_used": {
-          "type": "boolean"
+          "type": "boolean",
+          "const": false
         },
         "github_connector_only": {
-          "type": "boolean"
+          "type": "boolean",
+          "const": true
         },
         "proof_strength": {
           "type": "object",
@@ -352,29 +356,27 @@
       "properties": {
         "value": {
           "type": "string",
-          "enum": [
-            "synthetic_route_proof",
-            "real_pilot_verified"
-          ]
+          "const": "synthetic_route_proof"
         },
         "marker_prerequisite_evidence_mode": {
           "type": "string",
-          "enum": [
-            "synthetic_only",
-            "real_pilot_verified"
-          ]
+          "const": "synthetic_only"
         },
         "real_runtime_capture_claimed": {
-          "type": "boolean"
+          "type": "boolean",
+          "const": false
         },
         "real_pilot_verified_claimed": {
-          "type": "boolean"
+          "type": "boolean",
+          "const": false
         },
         "allowed_real_pilot_upgrade": {
-          "type": "boolean"
+          "type": "boolean",
+          "const": false
         },
         "cloud_pilot_claimed": {
-          "type": "boolean"
+          "type": "boolean",
+          "const": false
         }
       }
     }

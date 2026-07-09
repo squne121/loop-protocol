@@ -1,3 +1,4 @@
+import { spawnSync } from 'child_process'
 import { readFileSync } from 'fs'
 import { resolve } from 'path'
 import { describe, expect, it } from 'vitest'
@@ -7,6 +8,8 @@ import {
 } from '../scripts/check-agent-operation-session-index.mjs'
 
 const FIXTURES_DIR = resolve(__dirname, 'fixtures/agent-operation-session-index')
+const REPO_ROOT = resolve(__dirname, '..')
+const CHECKER_SCRIPT = resolve(REPO_ROOT, 'scripts/check-agent-operation-session-index.mjs')
 
 function readFixture(name: string) {
   return JSON.parse(readFileSync(resolve(FIXTURES_DIR, name), 'utf-8'))
@@ -110,6 +113,32 @@ describe('agent_operation_session_index/v1 checker: negative fixtures (AC3 seman
     const result = validateAgentOperationSessionIndex(mutated)
     expect(result.valid).toBe(false)
     expect(result.errors.some((e: { code: string }) => e.code.startsWith('path.'))).toBe(true)
+  })
+})
+
+describe('agent_operation_session_index/v1 checker CLI: process exit code (P0-1, Issue #1405 OWNER review)', () => {
+  // Regression guard for a false-green class of bug: in-memory function-level tests
+  // alone cannot catch a `failures` counter regression in main()'s CLI wiring. This
+  // spawns the real CLI entry point (child_process.spawnSync) against fixture files
+  // and asserts the actual process.exit code, not just the exported validator result.
+  it('GIVEN a valid fixture file WHEN the CLI is invoked THEN it exits 0', () => {
+    const result = spawnSync('node', [CHECKER_SCRIPT, resolve(FIXTURES_DIR, 'valid-issue-operation.json')], {
+      cwd: REPO_ROOT,
+      encoding: 'utf-8',
+    })
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain('PASS')
+  })
+
+  it('GIVEN an invalid fixture file (missing required properties) WHEN the CLI is invoked THEN it exits non-zero (schema.required)', () => {
+    const result = spawnSync(
+      'node',
+      [CHECKER_SCRIPT, resolve(FIXTURES_DIR, 'invalid-missing-required.json')],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain('FAIL')
+    expect(result.stderr).toContain('schema.required')
   })
 })
 

@@ -435,26 +435,124 @@ function extractCommentUrlNumber(url, kindSegment) {
   return match ? Number(match[1]) : null
 }
 
+// Allowed path prefixes for evidence_refs kind: repo_file (P0-4). Bounded to the
+// docs/tests/scripts trees this checker's own artifacts live under; a repo_file
+// reference outside these prefixes is not resolvable evidence for a retro proof.
+const ALLOWED_REPO_FILE_PREFIXES = ['docs/', 'tests/fixtures/', 'scripts/']
+const SHA256_DIGEST_RE = /^sha256:[0-9a-f]{64}$/
+
+// isResolvableEvidenceRef (P0-4, Issue #1405 OWNER review): narrowed allowlist-closed
+// resolver. github_comment refs must exactly match one of the two comment URLs the
+// proof itself declares AND carry a digest equal to the corresponding payload digest
+// (operation_index_ref.payload_digest / chatgpt_context.marker_digest). Arbitrary
+// issue/pull comment URLs are no longer accepted as a generic fallback.
+//
+// Note (bounded scope): marker refs.run_reports[*].comment_url / refs.retro_index
+// resolution described in the OWNER review requires a live-resolved marker payload
+// that is not part of chatgpt_retro_execution_proof/v1's current schema shape (no
+// "refs" object is carried on the proof). Extending resolution to those additional
+// marker-derived comment URLs is deferred to a follow-up issue that also extends the
+// marker payload schema; this checker only resolves what the proof itself declares.
 function isResolvableEvidenceRef(ref, proof) {
-  if (!ref || typeof ref !== 'object') {
+  if (!ref || typeof ref !== 'object' || typeof ref.ref !== 'string') {
     return false
   }
   if (ref.kind === 'github_comment') {
-    return ref.ref === proof?.operation_index_ref?.comment_url
-      || ref.ref === proof?.chatgpt_context?.marker_comment_url
-      || /^https:\/\/github\.com\/squne121\/loop-protocol\/(issues|pull)\/[0-9]+#issuecomment-[0-9]+$/.test(ref.ref)
+    if (ref.ref === proof?.operation_index_ref?.comment_url) {
+      return typeof ref.digest === 'string' && ref.digest === proof?.operation_index_ref?.payload_digest
+    }
+    if (ref.ref === proof?.chatgpt_context?.marker_comment_url) {
+      return typeof ref.digest === 'string' && ref.digest === proof?.chatgpt_context?.marker_digest
+    }
+    return false
   }
   if (ref.kind === 'github_issue' || ref.kind === 'github_pr') {
     return /^https:\/\/github\.com\/squne121\/loop-protocol\/(issues|pull)\/[0-9]+$/.test(ref.ref)
   }
   if (ref.kind === 'repo_file') {
+    if (typeof ref.digest !== 'string' || !SHA256_DIGEST_RE.test(ref.digest)) {
+      return false
+    }
+    if (!ALLOWED_REPO_FILE_PREFIXES.some((prefix) => ref.ref.startsWith(prefix))) {
+      return false
+    }
     const candidate = resolve(REPO_ROOT, ref.ref)
     return candidate.startsWith(`${REPO_ROOT}/`) && existsSync(candidate)
   }
   if (ref.kind === 'web_doc') {
-    return typeof ref.ref === 'string' && /^https:\/\//.test(ref.ref)
+    if (typeof ref.digest !== 'string' || !SHA256_DIGEST_RE.test(ref.digest)) {
+      return false
+    }
+    return /^https:\/\//.test(ref.ref)
   }
   return false
+}
+
+// validateChatgptContextGovernanceInvariants (P0-2/P0-3, Issue #1405 OWNER review):
+// explicit semantic gate for the connector-only / synthetic-route invariants, in
+// addition to (not instead of) the schema-level const constraints. Kept as an
+// independent check so a future schema loosening cannot silently reopen these
+// invariants without this checker also failing closed.
+export function validateChatgptContextGovernanceInvariants(proof) {
+  const errors = []
+  const ctx = proof?.chatgpt_context
+  if (ctx) {
+    if (ctx.local_file_access_used !== false) {
+      errors.push({
+        path: 'chatgpt_context.local_file_access_used',
+        code: 'chatgpt_context.local_file_access_forbidden',
+        message: 'chatgpt_context.local_file_access_used must be false (GitHub-connector-only proof)',
+      })
+    }
+    if (ctx.latitude_direct_access_used !== false) {
+      errors.push({
+        path: 'chatgpt_context.latitude_direct_access_used',
+        code: 'chatgpt_context.latitude_direct_access_forbidden',
+        message: 'chatgpt_context.latitude_direct_access_used must be false (GitHub-connector-only proof)',
+      })
+    }
+    if (ctx.raw_trace_access_used !== false) {
+      errors.push({
+        path: 'chatgpt_context.raw_trace_access_used',
+        code: 'chatgpt_context.raw_trace_access_forbidden',
+        message: 'chatgpt_context.raw_trace_access_used must be false (GitHub-connector-only proof)',
+      })
+    }
+    if (ctx.github_connector_only !== true) {
+      errors.push({
+        path: 'chatgpt_context.github_connector_only',
+        code: 'chatgpt_context.github_connector_only_required',
+        message: 'chatgpt_context.github_connector_only must be true (GitHub-connector-only proof)',
+      })
+    }
+  }
+  const mode = proof?.evidence_mode
+  if (mode) {
+    if (mode.value !== 'synthetic_route_proof') {
+      errors.push({
+        path: 'evidence_mode.value',
+        code: 'evidence_mode.non_synthetic_scope_forbidden',
+        message: 'evidence_mode.value must be synthetic_route_proof (real pilot route is out of scope for this proof kind)',
+      })
+    }
+    if (mode.marker_prerequisite_evidence_mode !== 'synthetic_only') {
+      errors.push({
+        path: 'evidence_mode.marker_prerequisite_evidence_mode',
+        code: 'evidence_mode.non_synthetic_prerequisite_forbidden',
+        message: 'evidence_mode.marker_prerequisite_evidence_mode must be synthetic_only',
+      })
+    }
+    for (const field of ['real_runtime_capture_claimed', 'real_pilot_verified_claimed', 'allowed_real_pilot_upgrade', 'cloud_pilot_claimed']) {
+      if (mode[field] !== false) {
+        errors.push({
+          path: `evidence_mode.${field}`,
+          code: 'evidence_mode.real_pilot_flag_forbidden',
+          message: `evidence_mode.${field} must be false (real pilot claims are out of scope for this proof kind)`,
+        })
+      }
+    }
+  }
+  return { valid: errors.length === 0, errors }
 }
 
 // ── digest_profile: fixture-mode comment-universe recomputation (AC10) ─────
@@ -487,6 +585,7 @@ export function validateChatgptRetroExecutionProof(proof, retroResult) {
   errors.push(...scanChatgptRetroE2eProofForbiddenFields(proof).errors)
   errors.push(...scanChatgptRetroE2eProofForbiddenFields(retroResult).errors)
   errors.push(...scanChatgptRetrospectiveResultFreeFormText(retroResult).errors)
+  errors.push(...validateChatgptContextGovernanceInvariants(proof).errors)
 
   if (proofSchemaResult.valid && retroSchemaResult.valid) {
     // digest.marker_mismatch
