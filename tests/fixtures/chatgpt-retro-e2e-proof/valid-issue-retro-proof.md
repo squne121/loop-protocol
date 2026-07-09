@@ -1,4 +1,5 @@
 <!-- RETRO_E2E_PROOF_V1 start -->
+<!-- 以下は #1405 の synthetic route proof を示す固定フィクスチャの本文である -->
 ```json
 {
   "schema": "chatgpt_retro_execution_proof/v1",
@@ -74,8 +75,10 @@
 }
 ```
 <!-- RETRO_E2E_PROOF_V1 end -->
+<!-- 上記は固定フィクスチャの終端マーカーである -->
 
 <!-- CHATGPT_RETROSPECTIVE_RESULT_V1 start -->
+<!-- 以下は参照される chatgpt_retrospective_result/v1 の固定フィクスチャである -->
 ```json
 {
   "schema": "chatgpt_retrospective_result/v1",
@@ -111,3 +114,4 @@
 }
 ```
 <!-- CHATGPT_RETROSPECTIVE_RESULT_V1 end -->
+<!-- 上記は固定フィクスチャの終端マーカーである -->
