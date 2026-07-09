@@ -1,0 +1,382 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "chatgpt_retro_execution_proof/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "proof_kind",
+    "repo",
+    "parent_issue",
+    "target",
+    "operation_index_ref",
+    "chatgpt_context",
+    "retrospective_result",
+    "safety",
+    "evidence_mode"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "chatgpt_retro_execution_proof/v1"
+    },
+    "proof_kind": {
+      "type": "string",
+      "const": "RETRO_E2E_PROOF_V1"
+    },
+    "repo": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+      "maxLength": 200
+    },
+    "parent_issue": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "number"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "issue",
+            "pull_request"
+          ]
+        },
+        "number": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "operation_index_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "comment_url",
+        "payload_digest",
+        "validation_verdict"
+      ],
+      "properties": {
+        "comment_url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://github\\.com/squne121/loop-protocol/(issues|pull)/[0-9]+#issuecomment-[0-9]+$",
+          "maxLength": 300
+        },
+        "payload_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "validation_verdict": {
+          "type": "string",
+          "const": "pass"
+        }
+      }
+    },
+    "chatgpt_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "marker_comment_url",
+        "marker_digest",
+        "resolve_live_status",
+        "resolve_live_output_digest",
+        "local_file_access_used",
+        "latitude_direct_access_used",
+        "raw_trace_access_used",
+        "github_connector_only",
+        "proof_strength",
+        "resolver_evidence"
+      ],
+      "properties": {
+        "marker_comment_url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://github\\.com/squne121/loop-protocol/(issues|pull)/[0-9]+#issuecomment-[0-9]+$",
+          "maxLength": 300
+        },
+        "marker_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "resolve_live_status": {
+          "type": "string",
+          "enum": [
+            "resolved",
+            "pending",
+            "stale",
+            "error"
+          ]
+        },
+        "resolve_live_output_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "local_file_access_used": {
+          "type": "boolean"
+        },
+        "latitude_direct_access_used": {
+          "type": "boolean"
+        },
+        "raw_trace_access_used": {
+          "type": "boolean"
+        },
+        "github_connector_only": {
+          "type": "boolean"
+        },
+        "proof_strength": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "context_resolvability",
+            "retrospective_result_schema",
+            "connector_only_execution",
+            "local_file_non_use",
+            "latitude_direct_non_use",
+            "machine_verifies_actual_chatgpt_tool_boundary"
+          ],
+          "properties": {
+            "context_resolvability": {
+              "type": "string",
+              "const": "machine_verified"
+            },
+            "retrospective_result_schema": {
+              "type": "string",
+              "const": "machine_verified"
+            },
+            "connector_only_execution": {
+              "type": "string",
+              "enum": [
+                "machine_verified",
+                "declared_by_session_operator"
+              ]
+            },
+            "local_file_non_use": {
+              "type": "string",
+              "enum": [
+                "machine_verified",
+                "declared_by_session_operator"
+              ]
+            },
+            "latitude_direct_non_use": {
+              "type": "string",
+              "enum": [
+                "machine_verified",
+                "declared_by_session_operator"
+              ]
+            },
+            "machine_verifies_actual_chatgpt_tool_boundary": {
+              "type": "boolean",
+              "const": false
+            }
+          }
+        },
+        "resolver_evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "command",
+            "command_args_digest",
+            "resolver_version_digest",
+            "checked_at",
+            "status",
+            "marker_comment_url",
+            "marker_digest",
+            "payload_digest",
+            "evidence_ref_count",
+            "source_manifest_count",
+            "page_budget_exhausted",
+            "reference_page_budget_exhausted",
+            "resolved_comment_set_digest"
+          ],
+          "properties": {
+            "command": {
+              "type": "string",
+              "const": "pnpm chatgpt-retro-context:resolve-live"
+            },
+            "command_args_digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "resolver_version_digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "checked_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "resolved",
+                "pending",
+                "stale",
+                "error"
+              ]
+            },
+            "marker_comment_url": {
+              "type": "string",
+              "format": "uri",
+              "pattern": "^https://github\\.com/squne121/loop-protocol/(issues|pull)/[0-9]+#issuecomment-[0-9]+$",
+              "maxLength": 300
+            },
+            "marker_digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "payload_digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "evidence_ref_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "source_manifest_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "page_budget_exhausted": {
+              "type": "boolean"
+            },
+            "reference_page_budget_exhausted": {
+              "type": "boolean"
+            },
+            "resolved_comment_set_digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            }
+          }
+        }
+      }
+    },
+    "retrospective_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "payload_digest",
+        "validation_verdict",
+        "verdict"
+      ],
+      "properties": {
+        "schema": {
+          "type": "string",
+          "const": "chatgpt_retrospective_result/v1"
+        },
+        "payload_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "validation_verdict": {
+          "type": "string",
+          "const": "pass"
+        },
+        "verdict": {
+          "type": "string",
+          "enum": [
+            "approve",
+            "request_changes",
+            "blocked",
+            "insufficient_evidence"
+          ]
+        }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "raw_values_emitted",
+        "forbidden_fields_scan",
+        "prompt_excerpt_present",
+        "tool_io_excerpt_present",
+        "local_absolute_path_present",
+        "credential_value_present",
+        "free_form_instruction_trusted",
+        "issue_or_pr_body_treated_as_untrusted_evidence"
+      ],
+      "properties": {
+        "raw_values_emitted": {
+          "type": "boolean",
+          "const": false
+        },
+        "forbidden_fields_scan": {
+          "type": "string",
+          "const": "pass"
+        },
+        "prompt_excerpt_present": {
+          "type": "boolean",
+          "const": false
+        },
+        "tool_io_excerpt_present": {
+          "type": "boolean",
+          "const": false
+        },
+        "local_absolute_path_present": {
+          "type": "boolean",
+          "const": false
+        },
+        "credential_value_present": {
+          "type": "boolean",
+          "const": false
+        },
+        "free_form_instruction_trusted": {
+          "type": "boolean",
+          "const": false
+        },
+        "issue_or_pr_body_treated_as_untrusted_evidence": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    },
+    "evidence_mode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "value",
+        "marker_prerequisite_evidence_mode",
+        "real_runtime_capture_claimed",
+        "real_pilot_verified_claimed",
+        "allowed_real_pilot_upgrade",
+        "cloud_pilot_claimed"
+      ],
+      "properties": {
+        "value": {
+          "type": "string",
+          "enum": [
+            "synthetic_route_proof",
+            "real_pilot_verified"
+          ]
+        },
+        "marker_prerequisite_evidence_mode": {
+          "type": "string",
+          "enum": [
+            "synthetic_only",
+            "real_pilot_verified"
+          ]
+        },
+        "real_runtime_capture_claimed": {
+          "type": "boolean"
+        },
+        "real_pilot_verified_claimed": {
+          "type": "boolean"
+        },
+        "allowed_real_pilot_upgrade": {
+          "type": "boolean"
+        },
+        "cloud_pilot_claimed": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}
