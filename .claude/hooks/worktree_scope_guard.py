@@ -64,7 +64,7 @@ from skill_runtime_command_policy import (  # noqa: E402
     resolve_repo_slug,
 )
 from git_mutation_command_policy import classify_rtk_git_mutation  # noqa: E402
-from hook_repair_hints import render_hook_command_repair_hint  # noqa: E402
+from hook_repair_hints import render_hook_command_repair_hint, render_publish_safety_stop_report  # noqa: E402
 
 # Issue #1241 marker: HOOK_COMMAND_REPAIR_HINT_V1 is rendered via hook_repair_hints.py.
 
@@ -731,7 +731,13 @@ def _block(expected_worktree: str, actual_cwd: str) -> None:
     sys.exit(2)
 
 
-def _block_with_reason(expected_worktree: str, actual_cwd: str, reason_code: str, command_class: str) -> None:
+def _block_with_reason(
+    expected_worktree: str,
+    actual_cwd: str,
+    reason_code: str,
+    command_class: str,
+    policy_result: object | None = None,
+) -> None:
     lines = [
         "[worktree_scope_guard] blocked: mutation outside active issue worktree",
         f"expected_worktree: {expected_worktree or '<unresolved>'}",
@@ -739,9 +745,36 @@ def _block_with_reason(expected_worktree: str, actual_cwd: str, reason_code: str
         *render_hook_command_repair_hint(
             blocked_command_class=command_class,
             reason_code=reason_code,
+            expected_remote_head=getattr(policy_result, "expected_remote_head", None),
+            current_remote_head=getattr(policy_result, "current_remote_head", None),
+            local_head=getattr(policy_result, "local_head", None),
+            verified_head=getattr(policy_result, "verified_head", None),
+            declared_publish_head=getattr(policy_result, "declared_publish_head", None),
+            allowed_paths_gate_status=getattr(policy_result, "allowed_paths_gate_status", None),
+            target_branch=getattr(policy_result, "target_branch", None),
+            required_decisions=getattr(policy_result, "required_decisions", ()),
         ),
     ]
-    sys.stderr.write("\n".join(lines[:10]) + "\n")
+    if getattr(policy_result, "target_branch", None) and reason_code in {
+        "stale_remote_head",
+        "local_head_mismatch",
+        "mixed_head_contamination",
+    }:
+        lines.extend(
+            render_publish_safety_stop_report(
+                issue_number=os.environ.get("LOOP_ISSUE_NUMBER", "<unknown>"),
+                blocked_command_class=command_class,
+                reason_code=reason_code,
+                target_branch=getattr(policy_result, "target_branch"),
+                expected_remote_head=getattr(policy_result, "expected_remote_head", None),
+                current_remote_head=getattr(policy_result, "current_remote_head", None),
+                local_head=getattr(policy_result, "local_head", None),
+                verified_head=getattr(policy_result, "verified_head", None),
+                allowed_paths_gate_status=getattr(policy_result, "allowed_paths_gate_status", None),
+                required_decisions=getattr(policy_result, "required_decisions", ()),
+            )
+        )
+    sys.stderr.write("\n".join(lines) + "\n")
     sys.exit(2)
 
 
@@ -1984,6 +2017,7 @@ def _decide_bash(
                 cwd,
                 bounded_rtk_git.reason_code,
                 bounded_rtk_git.command_class,
+                bounded_rtk_git,
             )
         if not issue:
             _block_with_reason("<issue-context-required>", cwd, "issue_context_required", bounded_rtk_git.command_class)

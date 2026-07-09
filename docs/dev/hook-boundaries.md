@@ -186,6 +186,12 @@ hook_boundaries_manifest_v1:
       bootstrap 系の追加 allowlist はこの PR では導入しない。
       Issue #1241 以降は issue worktree publish path の `rtk git add/commit/push` だけを shared bounded
       policy で解釈し、deny 時は `HOOK_COMMAND_REPAIR_HINT_V1` を stderr に返す。
+      Issue #1402 以降は strict publish lane 用 env binding
+      (`LOOP_PUBLISH_EXPECTED_REMOTE_HEAD`, `LOOP_PUBLISH_DECLARED_PUBLISH_HEAD`,
+      `LOOP_PUBLISH_VERIFIED_HEAD`, `LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS`)
+      が揃った場合、shared policy は `PUBLISH_LANE_DECISION_V1` を評価し、
+      `stale_remote_head` / `local_head_mismatch` / `mixed_head_contamination` /
+      `unsafe_wrapper_route` を `PUBLISH_SAFETY_STOP_REPORT_V1` とともに返す。
 
   - handler_id: guard-japanese-prose
     event: PreToolUse
@@ -425,6 +431,7 @@ repair hint は agent steering 用の bounded diagnostics であり、authorizat
 ```yaml
 HOOK_COMMAND_REPAIR_HINT_V1:
   blocked_command_class: "rtk_git_add"
+  boundary_layer: "worktree_scope_guard_denied"
   reason_code: "git_add_requires_explicit_pathspec"
   safe_action: "broad pathspec をやめて 1 file 単位の pathspec を使う"
   suggested_command: "rtk git add <allowed-path-file>"
@@ -441,7 +448,7 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 | `git_add_outside_allowed_paths` | Issue contract の Allowed Paths に戻す | `rtk git add <allowed-path-file>` / `git diff --name-only` |
 | `allowed_paths_missing_for_git_mutation` | runtime に Allowed Paths binding がある状態へ戻す | `git diff --cached --name-only` / `git diff --cached --name-only` |
 | `commit_staged_changes_outside_allowed_paths` | staged diff を Allowed Paths subset に戻す | `rtk git commit -m "issue-1241 update"` / `git diff --cached --name-only` |
-| `push_refspec_requires_active_branch` | active branch と一致する refspec だけを使う | `rtk git push origin HEAD:refs/heads/<active-branch>` / `git branch --show-current` |
+| `push_refspec_requires_active_branch` | remote head 照合後、active branch と一致する refspec だけを使う | `rtk git <publish> origin HEAD:refs/heads/<active-branch>` / `git branch --show-current` |
 | `issue_context_required` | issue 未解決の root / unrelated cwd では mutation しない | `git worktree list` / `git branch --show-current` |
 | `target_dir_outside_worktree` | active issue worktree 配下へ戻る | `git status --short` / `git branch --show-current` |
 | `no_matching_worktree` / `ambiguous_worktree` | worktree catalog を 1 件に特定する | `git worktree list` / `git branch --show-current` |
@@ -452,6 +459,7 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 - `HOOK_COMMAND_REPAIR_HINT_V1` は direct `rtk git ...` の exact / bounded 形だけを示し、`bash -lc`、`env FOO=... rtk git ...`、`command rtk git ...` の wrapper 展開は suggestion に使わない。
 - `suggested_command` は authorization を付与しない。rules / hooks / post-run verifier が独立に reject できる。
 - `allowed_paths_missing_for_git_mutation` は fail-closed 理由であり、Issue contract の Allowed Paths binding が runtime に見えていない状態を示す。
+- branch publish failure では `boundary_layer` と `reason_code` を分離し、`expected_remote_head` / `current_remote_head` / `local_head` / `verified_head` の比較が崩れたら `PUBLISH_SAFETY_STOP_REPORT_V1` に倒す。
 
 ---
 

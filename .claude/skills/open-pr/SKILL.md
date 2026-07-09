@@ -200,6 +200,13 @@ uv run --locked python3 .claude/skills/open-pr/scripts/open_pr.py \
 | `E_LINKED_ISSUE_STATE_UNKNOWN` | linked issue の state 取得失敗 | gh 認証 / linked_issue 番号を確認 |
 | `E_GH_FAILURE` | `gh pr create` 失敗 | stderr の詳細を確認、リポジトリ権限 / ブランチ存在 / リモート push 済みを確認 |
 
+### Branch publish failure の扱い
+
+`E_GH_FAILURE` が branch 未公開または remote head drift に起因する場合、存在しない step file を参照せず、本 `SKILL.md` と
+`scripts/open_pr.py` の wrapper 結果を正本にする。復旧前に `impl-review-loop` の Publish Failure Safety Lane を参照し、
+`expected_remote_head`、`current_remote_head`、`local_head`、`verified_head`、`allowed_paths_gate_status` を比較する。
+比較が崩れた場合は `PUBLISH_SAFETY_STOP_REPORT_V1` を残し、force update / reset へ進まない。
+
 ## Guardrails
 
 - `publish: yes` 未指定で PR を作成しない（人間承認 fail-closed）

@@ -44,6 +44,8 @@ SKILL.md / SubAgent 定義に書くとコンテクスト汚染になるため、
 - `HOOK_COMMAND_REPAIR_HINT_V1` は agent steering 用の bounded diagnostics であり、rules / hooks の authorization を上書きしない。
 - `HOOK_COMMAND_REPAIR_HINT_V1` が `suggested_command` を返しても、それは `direct rtk git ...` の exact / bounded repair 候補に限る。wrapper 展開や bypass shell を agent が自動採用してはならない。
 - `allowed_paths_missing_for_git_mutation` や `issue_context_required` は runtime contract 未解決の停止信号として扱い、agent は publish を続行せず binding/source-of-truth を確認する。
+- publish retry は branch 名一致だけで green 扱いせず、`PUBLISH_LANE_DECISION_V1` の `expected_remote_head` / `current_remote_head` / `local_head` / `verified_head` / `declared_publish_head` / `allowed_paths_gate_status` を read-only preflight で揃えてから判断する。
+- `PUBLISH_SAFETY_STOP_REPORT_V1` の `reason_code` は少なくとも `branch_mismatch` / `stale_remote_head` / `local_head_mismatch` / `mixed_head_contamination` / `unsafe_wrapper_route` を使い、manual remote update への暗黙フォールバックを禁止する。
 
 ### Prompt examples（プロンプト例）
 

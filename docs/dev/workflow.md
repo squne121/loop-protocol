@@ -221,6 +221,15 @@ implementation_triage_profile:
 - stale な prior result を `go` として流用して `impl-review-loop` / `implement-issue` へ handoff してはならない
 - Issue 本文の変更は `body_sha256` の変化として検出される（`issue-contract-review` の snapshot idempotency 機構参照）
 
+### branch publish retry の safety stop
+
+branch publish が hook / approval 境界で止まった場合、agent は manual remote update に暗黙フォールバックせず、まず fetch/readback を行って `PUBLISH_LANE_DECISION_V1` を評価する。
+
+- 比較対象: `expected_remote_head` / `current_remote_head` / `local_head` / `verified_head` / `declared_publish_head` / `allowed_paths_gate_status`
+- `status: allow_retry` の場合だけ bounded publish command を再試行する
+- `branch_mismatch` / `stale_remote_head` / `local_head_mismatch` / `mixed_head_contamination` / `unsafe_wrapper_route` のいずれかなら `PUBLISH_SAFETY_STOP_REPORT_V1` を残して停止する
+- strict lane を hook に束縛する場合は `LOOP_PUBLISH_EXPECTED_REMOTE_HEAD` / `LOOP_PUBLISH_DECLARED_PUBLISH_HEAD` / `LOOP_PUBLISH_VERIFIED_HEAD` / `LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS` をセットする
+
 ### Scope Collision Preflight
 
 Allowed Paths overlap 単独では hard stop ではない。OPEN な他 Implementation Issue と Allowed Paths が重複する場合は、即停止ではなく Scope Collision Preflight を実施し、以下の class を判定する。
