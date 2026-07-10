@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "types": ["node", "vite/client", "@playwright/test"],
+    "noEmit": true
+  },
+  "include": ["./**/*.ts", "./**/*.d.ts"],
+  // assist-player-affordance.spec.ts / m2-combat-mvp.spec.ts have pre-existing
+  // type errors unrelated to Issue #1385 (never type-checked before this
+  // Issue added this tsconfig.json — see Issue #1385 review Blocker 5), and
+  // both files are outside this Issue's Allowed Paths, so they cannot be
+  // fixed in this PR. Tracked as a follow-up: re-include once fixed.
+  "exclude": [
+    "__screenshots__",
+    "assist-player-affordance.spec.ts",
+    "m2-combat-mvp.spec.ts"
+  ]
+}
