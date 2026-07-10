@@ -854,7 +854,7 @@ entries:
       followup_issue_required: true
     last_verified:
       commit: "2198d01374caedd3ad86a42e9dbb45ea285d4bb3"
-      command_id: "test_temp_residue_classifier"
+      command_id: "lint_catalog_yaml"
 
   - schema_id: "temp_residue_owner/v1"
     format: json_schema
@@ -903,4 +903,4 @@ entries:
       followup_issue_required: true
     last_verified:
       commit: "2198d01374caedd3ad86a42e9dbb45ea285d4bb3"
-      command_id: "test_temp_residue_classifier"
+      command_id: "lint_catalog_yaml"

@@ -681,7 +681,11 @@ def classify_root(
         if _contains_surrogate(child.name):
             ctx.scan_incomplete = True
             ctx.errors.append(
-                {"reason_code": "invalid_filename_encoding", "message": "undecodable filename skipped", "path": root_rel}
+                {
+                    "reason_code": "invalid_filename_encoding",
+                    "message": "undecodable filename skipped",
+                    "path": root_rel,
+                }
             )
             entries.append(
                 _make_entry(
