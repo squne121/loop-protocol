@@ -132,6 +132,7 @@ TEMP_CLEANUP_SAFETY_RULES_V1:
 
 - `root temporary residue` は cleanup-required または report-only として分類し、marker 不明の `.tmp/**` は自動削除しない。
 - `tmp/`、`.claude/tmp/`、`.claude/worktrees/` の root 全体削除は自動実行対象にしない。
+- 現時点では `classify-git-state.py` 自体に root temporary residue 専用 field や ownership marker 解析は無い。したがって本 Skill が規定する deterministic behavior は operator rule と unresolved report の境界であり、専用 classifier 実装は follow-up scope として扱う。
 
 ### 2. main を origin/main に整合
 

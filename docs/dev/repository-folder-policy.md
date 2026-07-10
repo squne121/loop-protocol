@@ -1,7 +1,10 @@
 # Repository Folder Policy
 
 repo 直下や `.claude/` 配下で AI エージェントが扱う一時フォルダの正本。
-未承認 alias を advisory-only hook で誘導し、cleanup authority を deterministic に保つ。
+未承認 alias を advisory-only hook で誘導し、cleanup authority の運用ルールを deterministic に定義する。
+この文書は operator contract の正本であり、cleanup classifier の専用構造化 field 実装完了までは
+「ownership marker 付き session subdirectory だけを削除候補にできる」「marker 不明 residue は report-only」
+という運用制約を要求する。
 
 ## REPOSITORY_FOLDER_POLICY_V1
 
@@ -61,6 +64,7 @@ REPOSITORY_FOLDER_POLICY_V1:
 - `.tmp/`、`.temp/`、`.tmp-*` は作業を block しない。ただし hook は `REPO_TEMP_FOLDER_ADVICE_V1` を返し、`tmp/` または `.claude/tmp/` への移行を案内する。
 - `tmp/` と `.claude/tmp/` は repo-approved local temporary workspace として使えるが、終了時に自分の session subdirectory を削除するか、残置理由を報告する。
 - `.claude/worktrees/` は managed worktree root であり、agent が ad hoc temporary workspace の代替として使わない。cleanup は `cleanup_exec.py` の認可境界に限定する。
+- 現行の repo-side cleanup classifier は root temporary residue 専用の structured output まではまだ持たない。ownership marker 不明の `.tmp/**` / `.temp/**` / `.tmp-*/**` は report-only とし、自動削除済みを主張しない。
 - deploy/release/preview artifact へ temporary folder を含めたい場合は、この文書と consumer docs を同一 PR で更新し、別 issue で publication rule を明示する。
 
 ## フォルダ運用変更の変更動線

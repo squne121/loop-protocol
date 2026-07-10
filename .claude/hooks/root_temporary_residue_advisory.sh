@@ -12,7 +12,7 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 0
 fi
 
-if ! python3 "$POLICY" --emit-hook-envelope; then
+if ! python3 "$POLICY" --repo-root "$REPO_ROOT" --emit-hook-envelope; then
   exit 0
 fi
 

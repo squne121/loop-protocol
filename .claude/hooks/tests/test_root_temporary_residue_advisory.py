@@ -12,32 +12,35 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 HOOK = REPO_ROOT / ".claude" / "hooks" / "root_temporary_residue_advisory.sh"
 
 TRIGGER_PATHS = [
-    ".tmp/result.json",
-    ".temp/cache/index.txt",
-    ".tmp-agent/session/output.md",
+    str(REPO_ROOT / ".tmp" / "result.json"),
+    str(REPO_ROOT / ".temp" / "cache" / "index.txt"),
+    str(REPO_ROOT / ".tmp-agent" / "session" / "output.md"),
 ]
 NON_TRIGGER_PATHS = [
-    "tmp/session/output.md",
-    ".claude/tmp/session/output.md",
-    "docs/dev/repository-folder-policy.md",
+    str(REPO_ROOT / "tmp" / "session" / "output.md"),
+    str(REPO_ROOT / ".claude" / "tmp" / "session" / "output.md"),
+    str(REPO_ROOT / "docs" / "dev" / "repository-folder-policy.md"),
 ]
 
 
-def _make_input_write(file_path: str = "") -> str:
-    return json.dumps({"tool_name": "Write", "tool_input": {"file_path": file_path}})
+def _make_input_write(file_path: str = "", *, cwd: Path = REPO_ROOT) -> str:
+    return json.dumps(
+        {"cwd": str(cwd), "tool_name": "Write", "tool_input": {"file_path": file_path}}
+    )
 
 
-def _make_input_edit(file_path: str = "") -> str:
+def _make_input_edit(file_path: str = "", *, cwd: Path = REPO_ROOT) -> str:
     return json.dumps(
         {
+            "cwd": str(cwd),
             "tool_name": "Edit",
             "tool_input": {"file_path": file_path, "old_string": "a", "new_string": "b"},
         }
     )
 
 
-def _make_input_bash(command: str = "") -> str:
-    return json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+def _make_input_bash(command: str = "", *, cwd: Path = REPO_ROOT) -> str:
+    return json.dumps({"cwd": str(cwd), "tool_name": "Bash", "tool_input": {"command": command}})
 
 
 def _run_hook(stdin_data: str) -> subprocess.CompletedProcess:
@@ -71,17 +74,23 @@ def test_write_tmp_alias_triggers_advisory(trigger_path: str):
 
 
 def test_edit_tmp_alias_triggers_advisory():
-    result = _run_hook(_make_input_edit(".tmp/session/notes.md"))
+    result = _run_hook(_make_input_edit(str(REPO_ROOT / ".tmp" / "session" / "notes.md")))
     assert result.returncode == 0
     inner = _parse_inner(result)
     assert inner["observed_path"] == ".tmp/"
 
 
-def test_bash_tmp_alias_triggers_advisory():
-    result = _run_hook(_make_input_bash("mkdir -p .temp/cache"))
+def test_bash_root_escape_from_subdirectory_triggers_advisory():
+    result = _run_hook(_make_input_bash("mkdir -p ../.temp/cache", cwd=REPO_ROOT / "src"))
     assert result.returncode == 0
     inner = _parse_inner(result)
     assert inner["observed_path"] == ".temp/"
+
+
+def test_bash_local_tmp_in_subdirectory_is_silent():
+    result = _run_hook(_make_input_bash("mkdir -p .tmp/cache", cwd=REPO_ROOT / "src"))
+    assert result.returncode == 0
+    assert result.stdout.strip() == ""
 
 
 @pytest.mark.parametrize("non_trigger_path", NON_TRIGGER_PATHS)
