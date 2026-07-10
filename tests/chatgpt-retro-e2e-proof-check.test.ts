@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest'
 import {
   computeChatgptRetroExecutionProofDigest,
   validateChatgptRetroE2eProofMarkdown,
+  validateChatgptRetroE2eProofMarkdownLive,
 } from '../scripts/check-chatgpt-retro-e2e-proof.mjs'
 
 const FIXTURES_DIR = resolve(__dirname, 'fixtures/chatgpt-retro-e2e-proof')
@@ -24,6 +25,63 @@ function extractJsonBlocks(markdown: string) {
   return matches.map((m) => JSON.parse(m[1]))
 }
 
+function splitPrReviewFixture(markdown: string) {
+  const liveFixtureStart = markdown.indexOf('<!-- LIVE_GITHUB_COMMENT_FIXTURE ')
+  if (liveFixtureStart === -1) {
+    return { mainBody: markdown.trim(), liveFixtureTail: '' }
+  }
+  return {
+    mainBody: markdown.slice(0, liveFixtureStart).trim(),
+    liveFixtureTail: markdown.slice(liveFixtureStart).trim(),
+  }
+}
+
+function mutatePrReviewMarkdown(mutator: (proof: Record<string, unknown>, retroResult: Record<string, unknown>) => void) {
+  const markdown = readFixture('valid-pr-review-retro-proof.md')
+  const { liveFixtureTail } = splitPrReviewFixture(markdown)
+  const [proof, retroResult] = extractJsonBlocks(markdown)
+  mutator(proof, retroResult)
+  const rebuilt = [
+    '<!-- RETRO_E2E_PROOF_V1 start -->',
+    '```json',
+    JSON.stringify(proof, null, 2),
+    '```',
+    '<!-- RETRO_E2E_PROOF_V1 end -->',
+    '',
+    '<!-- CHATGPT_RETROSPECTIVE_RESULT_V1 start -->',
+    '```json',
+    JSON.stringify(retroResult, null, 2),
+    '```',
+    '<!-- CHATGPT_RETROSPECTIVE_RESULT_V1 end -->',
+  ].join('\n')
+  return liveFixtureTail ? `${rebuilt}\n\n${liveFixtureTail}\n` : `${rebuilt}\n`
+}
+
+function replaceLiveCommentFixture(markdown: string, commentUrl: string, mutator: (body: string) => string) {
+  const escapedUrl = commentUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const pattern = new RegExp(
+    `<!-- LIVE_GITHUB_COMMENT_FIXTURE url=${escapedUrl} start -->\\n\`\`\`\`text\\n([\\s\\S]*?)\\n\`\`\`\`\\n<!-- LIVE_GITHUB_COMMENT_FIXTURE end -->`,
+    'u',
+  )
+  return markdown.replace(pattern, (_match, body) => [
+    `<!-- LIVE_GITHUB_COMMENT_FIXTURE url=${commentUrl} start -->`,
+    '````text',
+    mutator(body),
+    '````',
+    '<!-- LIVE_GITHUB_COMMENT_FIXTURE end -->',
+  ].join('\n'))
+}
+
+async function validatePrReviewFixtureLive(markdown: string) {
+  return validateChatgptRetroE2eProofMarkdownLive(markdown, {
+    githubClient: {
+      async getIssueComment() {
+        throw new Error('unexpected live GitHub fetch in fixture-backed test')
+      },
+    },
+  })
+}
+
 describe('chatgpt_retro_execution_proof/v1 checker: valid fixture (AC2, AC4, AC10)', () => {
   it('GIVEN valid-issue-retro-proof.md WHEN validated THEN checker returns valid', () => {
     const result = validateFixture('valid-issue-retro-proof.md')
@@ -40,6 +98,12 @@ describe('chatgpt_retro_execution_proof/v1 checker: valid fixture (AC2, AC4, AC1
 
   it('GIVEN valid-pr-retro-proof.md (target.kind = pull_request) WHEN validated THEN checker returns valid (P0-5, Issue #1405 OWNER review: a PR-target E2E proof fixture must exist)', () => {
     const result = validateFixture('valid-pr-retro-proof.md')
+    expect(result.errors).toEqual([])
+    expect(result.valid).toBe(true)
+  })
+
+  it('GIVEN valid-pr-review-retro-proof.md WHEN validated in live mode THEN checker revalidates the live-fetched operation index and PR review surface artifacts', async () => {
+    const result = await validatePrReviewFixtureLive(readFixture('valid-pr-review-retro-proof.md'))
     expect(result.errors).toEqual([])
     expect(result.valid).toBe(true)
   })
@@ -175,6 +239,70 @@ describe('chatgpt_retro_execution_proof/v1 checker: negative fixtures (AC4, AC7-
     expect(result.errors.some((e: { code: string }) => e.code === 'digest.stale')).toBe(true)
   })
 
+  it('GIVEN an embedded operation index payload whose digest does not match operation_index_ref.payload_digest THEN operation_index.payload_digest_mismatch is raised', () => {
+    const markdown = mutateMarkdown((proof) => {
+      proof.operation_index_ref.embedded_payload = {
+        schema: 'agent_operation_session_index/v1',
+        repo: 'squne121/loop-protocol',
+      }
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'operation_index.payload_digest_mismatch')).toBe(true)
+  })
+
+  it('GIVEN an embedded operation index payload whose source resolver status is not resolved THEN operation_index.source_resolver_unresolved is raised', () => {
+    const markdown = readFixture('valid-pr-review-retro-proof.md').replace('"status": "resolved"', '"status": "missing"')
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'operation_index.source_resolver_unresolved')).toBe(true)
+  })
+
+  it('GIVEN a PR review proof in live_comment_fetch mode without operation_index_ref.embedded_payload THEN the schema-level checker still accepts the proof envelope', () => {
+    const markdown = mutatePrReviewMarkdown((proof) => {
+      delete proof.operation_index_ref.embedded_payload
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+
+  it('GIVEN resolve_live_status is resolved but resolver_evidence.status is error THEN resolver_evidence.status_mismatch is raised', () => {
+    const markdown = mutatePrReviewMarkdown((proof) => {
+      proof.chatgpt_context.resolver_evidence.status = 'error'
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'resolver_evidence.status_mismatch')).toBe(true)
+  })
+
+  it('GIVEN resolve_live_status is resolved but resolver_evidence.page_budget_exhausted is true THEN resolver_evidence.page_budget_exhausted is raised', () => {
+    const markdown = mutatePrReviewMarkdown((proof) => {
+      proof.chatgpt_context.resolver_evidence.page_budget_exhausted = true
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'resolver_evidence.page_budget_exhausted')).toBe(true)
+  })
+
+  it('GIVEN the embedded operation index target number differs from proof.target.number THEN operation_index.target_mismatch is raised', () => {
+    const markdown = mutatePrReviewMarkdown((proof) => {
+      proof.operation_index_ref.embedded_payload.target.number = 1412
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'operation_index.target_mismatch')).toBe(true)
+  })
+
+  it('GIVEN operation_index_ref.comment_url points at a different pull request than proof.target THEN operation_index.comment_url_target_mismatch is raised', () => {
+    const markdown = mutatePrReviewMarkdown((proof) => {
+      proof.operation_index_ref.comment_url = 'https://github.com/squne121/loop-protocol/pull/1412#issuecomment-4935400001'
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'operation_index.comment_url_target_mismatch')).toBe(true)
+  })
+
   it('GIVEN safety.local_absolute_path_present = true THEN schema const violation fails closed', () => {
     const markdown = mutateMarkdown((proof) => {
       proof.safety.local_absolute_path_present = true
@@ -258,6 +386,94 @@ describe('chatgpt_retro_execution_proof/v1 checker: negative fixtures (AC4, AC7-
     const result = validateChatgptRetroE2eProofMarkdown(malformed)
     expect(result.valid).toBe(false)
     expect(result.errors.some((e: { code: string }) => e.code === 'marker.constraint_violation')).toBe(true)
+  })
+})
+
+describe('chatgpt_retro_execution_proof/v1 checker: live comment revalidation for PR review proofs (P0-2, P0-5)', () => {
+  const operationIndexCommentUrl = 'https://github.com/squne121/loop-protocol/pull/1411#issuecomment-4935400001'
+  const liveProofCommentUrl = 'https://github.com/squne121/loop-protocol/pull/1423#issuecomment-4939400001'
+
+  it('GIVEN the live-proof artifact comment is absent THEN live_proof.comment_fetch_failed is raised', async () => {
+    const markdown = readFixture('valid-pr-review-retro-proof.md').replace(
+      new RegExp(`\\n<!-- LIVE_GITHUB_COMMENT_FIXTURE url=${liveProofCommentUrl.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')} start -->[\\s\\S]*?<!-- LIVE_GITHUB_COMMENT_FIXTURE end -->`, 'u'),
+      '',
+    )
+    const result = await validateChatgptRetroE2eProofMarkdownLive(markdown, {
+      githubClient: {
+        async getIssueComment() {
+          throw new Error('comment not found')
+        },
+      },
+    })
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'live_proof.comment_fetch_failed')).toBe(true)
+  })
+
+  it('GIVEN the operation-index comment marker is missing THEN operation_index.comment_marker_missing is raised', async () => {
+    const markdown = replaceLiveCommentFixture(readFixture('valid-pr-review-retro-proof.md'), operationIndexCommentUrl, (body) =>
+      body.replace('<!-- AGENT_OPERATION_SESSION_INDEX_V1 start -->', '<!-- AGENT_OPERATION_SESSION_INDEX_V1 removed -->'),
+    )
+    const result = await validatePrReviewFixtureLive(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'operation_index.comment_marker_missing')).toBe(true)
+  })
+
+  it('GIVEN the live-proof payload digest does not match the fetched payload THEN live_proof.payload_digest_mismatch is raised', async () => {
+    const markdown = mutatePrReviewMarkdown((proof, retroResult) => {
+      proof.pr_review_surface_live_proof_ref.payload_digest = computeChatgptRetroExecutionProofDigest('tampered-live-proof')
+      retroResult.findings[0].evidence_refs[1].digest = proof.pr_review_surface_live_proof_ref.payload_digest
+    })
+    const result = await validatePrReviewFixtureLive(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'live_proof.payload_digest_mismatch')).toBe(true)
+  })
+
+  it('GIVEN the live-fetched operation-index payload target tuple mismatches the proof target THEN operation_index.target_mismatch is raised', async () => {
+    const markdown = replaceLiveCommentFixture(readFixture('valid-pr-review-retro-proof.md'), operationIndexCommentUrl, (body) =>
+      body.replace('"number": 1411', '"number": 1412'),
+    )
+    const result = await validatePrReviewFixtureLive(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'operation_index.target_mismatch')).toBe(true)
+  })
+
+  it('GIVEN the live-proof artifact schema marker block is malformed THEN live_proof.comment_marker_missing is raised', async () => {
+    const markdown = replaceLiveCommentFixture(readFixture('valid-pr-review-retro-proof.md'), liveProofCommentUrl, (body) =>
+      body.replace('<!-- PR_REVIEW_SURFACE_LIVE_PROOF_V1 start -->', '<!-- PR_REVIEW_SURFACE_LIVE_PROOF_V1 removed -->'),
+    )
+    const result = await validatePrReviewFixtureLive(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'live_proof.comment_marker_missing')).toBe(true)
+  })
+
+  it('GIVEN the live-proof artifact payload schema is invalid THEN schema.invalid is raised', async () => {
+    const markdown = replaceLiveCommentFixture(readFixture('valid-pr-review-retro-proof.md'), liveProofCommentUrl, (body) =>
+      body.replace('"schema": "PR_REVIEW_SURFACE_LIVE_PROOF_V1"', '"schema": "PR_REVIEW_SURFACE_LIVE_PROOF_V0"'),
+    )
+    const result = await validatePrReviewFixtureLive(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'schema.invalid')).toBe(true)
+  })
+
+  it('GIVEN the live-fetched operation-index source object digest is mutated THEN the live checker fails closed before accepting the source object set', async () => {
+    const markdown = replaceLiveCommentFixture(readFixture('valid-pr-review-retro-proof.md'), operationIndexCommentUrl, (body) =>
+      body.replace(
+        '"digest": "sha256:426c49e94d9d2f9a23498c19390d702605fe66fd4bc90e720535ca7a71be4536"',
+        '"digest": "sha256:deadbeef4d9d2f9a23498c19390d702605fe66fd4bc90e720535ca7a71be4536"',
+      ),
+    )
+    const result = await validatePrReviewFixtureLive(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => ['operation_index.validation_failed', 'operation_index.payload_digest_mismatch'].includes(e.code))).toBe(true)
+  })
+
+  it('GIVEN the live-proof artifact evidence target mismatches the proof target THEN live_proof.target_mismatch is raised', async () => {
+    const markdown = replaceLiveCommentFixture(readFixture('valid-pr-review-retro-proof.md'), liveProofCommentUrl, (body) =>
+      body.replace('"number": 1411', '"number": 1412'),
+    )
+    const result = await validatePrReviewFixtureLive(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'live_proof.target_mismatch')).toBe(true)
   })
 })
 

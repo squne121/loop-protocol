@@ -48,6 +48,11 @@ import {
   scanPublicSafety,
   validateChatgptRetrospectiveResultAgainstSchema,
 } from './lib/agent-run-report-validation.mjs'
+import { GhCliIssueCommentsClient } from './agent-logs/lib/github-comments.mjs'
+import {
+  computeAgentOperationSessionIndexPayloadDigest,
+  validateAgentOperationSessionIndex,
+} from './check-agent-operation-session-index.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 export const REPO_ROOT = resolve(__dirname, '..')
@@ -70,6 +75,10 @@ const PROOF_START_MARKER = '<!-- RETRO_E2E_PROOF_V1 start -->'
 const PROOF_END_MARKER = '<!-- RETRO_E2E_PROOF_V1 end -->'
 const RESULT_START_MARKER = '<!-- CHATGPT_RETROSPECTIVE_RESULT_V1 start -->'
 const RESULT_END_MARKER = '<!-- CHATGPT_RETROSPECTIVE_RESULT_V1 end -->'
+const OPERATION_INDEX_COMMENT_START_MARKER = '<!-- AGENT_OPERATION_SESSION_INDEX_V1 start -->'
+const OPERATION_INDEX_COMMENT_END_MARKER = '<!-- AGENT_OPERATION_SESSION_INDEX_V1 end -->'
+const PR_REVIEW_SURFACE_LIVE_PROOF_START_MARKER = '<!-- PR_REVIEW_SURFACE_LIVE_PROOF_V1 start -->'
+const PR_REVIEW_SURFACE_LIVE_PROOF_END_MARKER = '<!-- PR_REVIEW_SURFACE_LIVE_PROOF_V1 end -->'
 
 // forbidden_keys_extra (Issue #1405 In Scope, OWNER review indication 7)
 const FORBIDDEN_KEYS_EXTRA = [
@@ -323,6 +332,23 @@ function collectRuntimeCaptureClaimTexts(retroResult) {
   return texts
 }
 
+function filterPublicSafetyErrors(errors) {
+  return errors.filter((error) => {
+    if (error.code !== 'secret.token_like_hex40') {
+      return true
+    }
+    if (
+      error.path === 'operation_index_ref.embedded_payload.operation.source.commit_id'
+      || error.path === 'operation_index_ref.embedded_payload.verification.operation_source_resolver.target_commit'
+      || error.path === 'pr_review_surface_live_proof_ref.proof_target_head_sha'
+      || /^operation_index_ref\.embedded_payload\.verification\.operation_source_resolver\.object_catalog\.(reviews_by_id|review_comments_by_id)\.[^.]+\.commit_id$/u.test(error.path)
+    ) {
+      return false
+    }
+    return true
+  })
+}
+
 // ── markdown extraction (marker uniqueness + fence matching) ───────────────
 function extractMarkedJsonBlock(markdown, startMarker, endMarker) {
   const lines = markdown.split('\n')
@@ -427,6 +453,41 @@ function extractMarkedJsonBlock(markdown, startMarker, endMarker) {
   }
 }
 
+function extractLiveGithubCommentFixtures(markdown) {
+  const lines = markdown.split('\n')
+  const fixtures = new Map()
+  for (let i = 0; i < lines.length; i += 1) {
+    const startMatch = lines[i].match(/^<!-- LIVE_GITHUB_COMMENT_FIXTURE url=(?<url>\S+) start -->$/u)
+    if (!startMatch?.groups?.url) {
+      continue
+    }
+    const openFenceLine = lines[i + 1] ?? ''
+    const openFenceMatch = openFenceLine.match(/^(`{3,})text\s*$/u)
+    if (!openFenceMatch) {
+      continue
+    }
+    const fence = openFenceMatch[1]
+    let closingFenceLine = -1
+    let endMarkerLine = -1
+    for (let j = i + 2; j < lines.length; j += 1) {
+      if (closingFenceLine === -1 && lines[j] === fence) {
+        closingFenceLine = j
+        continue
+      }
+      if (closingFenceLine !== -1 && lines[j] === '<!-- LIVE_GITHUB_COMMENT_FIXTURE end -->') {
+        endMarkerLine = j
+        break
+      }
+    }
+    if (closingFenceLine === -1 || endMarkerLine === -1) {
+      continue
+    }
+    fixtures.set(startMatch.groups.url, lines.slice(i + 2, closingFenceLine).join('\n'))
+    i = endMarkerLine
+  }
+  return fixtures
+}
+
 function extractCommentUrlNumber(url, kindSegment) {
   if (typeof url !== 'string') {
     return null
@@ -460,6 +521,9 @@ function isResolvableEvidenceRef(ref, proof) {
   if (ref.kind === 'github_comment') {
     if (ref.ref === proof?.operation_index_ref?.comment_url) {
       return typeof ref.digest === 'string' && ref.digest === proof?.operation_index_ref?.payload_digest
+    }
+    if (ref.ref === proof?.pr_review_surface_live_proof_ref?.comment_url) {
+      return typeof ref.digest === 'string' && ref.digest === proof?.pr_review_surface_live_proof_ref?.payload_digest
     }
     if (ref.ref === proof?.chatgpt_context?.marker_comment_url) {
       return typeof ref.digest === 'string' && ref.digest === proof?.chatgpt_context?.marker_digest
@@ -568,6 +632,371 @@ export function computeFixtureModeResolvedCommentSetDigest(proof) {
   return computeChatgptRetroExecutionProofDigest(urls)
 }
 
+function parseGitHubCommentUrl(url) {
+  if (typeof url !== 'string') {
+    return null
+  }
+  const match = url.match(/^https:\/\/github\.com\/(?<repo>[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/(?<segment>issues|pull)\/(?<number>[0-9]+)#issuecomment-(?<commentId>[0-9]+)$/u)
+  if (!match?.groups) {
+    return null
+  }
+  return {
+    repo: match.groups.repo,
+    targetKind: match.groups.segment === 'issues' ? 'issue' : 'pull_request',
+    targetNumber: Number(match.groups.number),
+    commentId: Number(match.groups.commentId),
+  }
+}
+
+function isPrReviewOperationKind(kind) {
+  return [
+    'pr_review_submitted',
+    'pr_review_comment_created',
+    'pr_review_thread_resolved',
+  ].includes(kind)
+}
+
+function getPrReviewOperationKind(proof) {
+  if (isPrReviewOperationKind(proof?.operation_index_ref?.embedded_payload?.operation?.kind)) {
+    return proof.operation_index_ref.embedded_payload.operation.kind
+  }
+  return 'pr_review_comment_created'
+}
+
+function isPrReviewLiveProofRequired(proof) {
+  return proof?.target?.kind === 'pull_request'
+}
+
+function normalizeValidationError(error) {
+  return {
+    path: error.path,
+    code: error.code,
+    message: error.message,
+  }
+}
+
+async function resolveGithubCommentBody(commentUrl, fixtureBodies, githubClient) {
+  if (fixtureBodies.has(commentUrl)) {
+    return { ok: true, body: fixtureBodies.get(commentUrl), source: 'fixture' }
+  }
+  const parsed = parseGitHubCommentUrl(commentUrl)
+  if (!parsed) {
+    return {
+      ok: false,
+      error: {
+        path: 'comment_url',
+        code: 'comment_url.invalid',
+        message: `comment_url is not a valid GitHub issue comment URL: ${commentUrl}`,
+      },
+    }
+  }
+  if (!githubClient) {
+    return {
+      ok: false,
+      error: {
+        path: 'comment_url',
+        code: 'comment_fetch.unavailable',
+        message: `live GitHub comment fetch is required for ${commentUrl}`,
+      },
+    }
+  }
+  try {
+    const response = await githubClient.getIssueComment({
+      repo: parsed.repo,
+      commentId: parsed.commentId,
+    })
+    return {
+      ok: true,
+      body: typeof response?.body === 'string' ? response.body : '',
+      source: 'github',
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      error: {
+        path: 'comment_url',
+        code: 'comment_fetch.failed',
+        message: error instanceof Error ? error.message : String(error),
+      },
+    }
+  }
+}
+
+function validatePrReviewSurfaceLiveProofShape(payload) {
+  const errors = []
+  const topLevelKeys = new Set([
+    'schema',
+    'repo',
+    'proof_target_pr',
+    'proof_target_head_sha',
+    'contract_snapshot_url',
+    'evidence_target',
+    'operation_index',
+    'selected_objects',
+    'pagination',
+    'projection_digest',
+    'target_commit',
+    'public_safe',
+  ])
+  function requireString(path, value) {
+    if (typeof value !== 'string' || value.length === 0) {
+      errors.push({ path, code: 'schema.invalid', message: `${path} must be a non-empty string` })
+    }
+  }
+  function requireBoolean(path, value) {
+    if (typeof value !== 'boolean') {
+      errors.push({ path, code: 'schema.invalid', message: `${path} must be a boolean` })
+    }
+  }
+  function requireInteger(path, value) {
+    if (!Number.isInteger(value) || value <= 0) {
+      errors.push({ path, code: 'schema.invalid', message: `${path} must be a positive integer` })
+    }
+  }
+  function requireExactKeys(path, value, allowedKeys) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      errors.push({ path, code: 'schema.invalid', message: `${path} must be an object` })
+      return
+    }
+    for (const key of Object.keys(value)) {
+      if (!allowedKeys.has(key)) {
+        errors.push({ path: `${path}.${key}`, code: 'schema.invalid', message: `${path}.${key} is not allowed` })
+      }
+    }
+  }
+
+  if (payload?.schema !== 'PR_REVIEW_SURFACE_LIVE_PROOF_V1') {
+    errors.push({ path: 'schema', code: 'schema.invalid', message: 'schema must be PR_REVIEW_SURFACE_LIVE_PROOF_V1' })
+  }
+  requireExactKeys('root', payload, topLevelKeys)
+  requireString('repo', payload?.repo)
+  requireInteger('proof_target_pr', payload?.proof_target_pr)
+  requireString('proof_target_head_sha', payload?.proof_target_head_sha)
+  requireString('contract_snapshot_url', payload?.contract_snapshot_url)
+  requireExactKeys('evidence_target', payload?.evidence_target, new Set(['kind', 'number']))
+  requireString('evidence_target.kind', payload?.evidence_target?.kind)
+  requireInteger('evidence_target.number', payload?.evidence_target?.number)
+  requireExactKeys('operation_index', payload?.operation_index, new Set([
+    'comment_url',
+    'payload_digest',
+    'revalidated',
+    'payload_digest_valid',
+    'schema_valid',
+    'semantic_valid',
+    'target_tuple_valid',
+  ]))
+  requireString('operation_index.comment_url', payload?.operation_index?.comment_url)
+  requireString('operation_index.payload_digest', payload?.operation_index?.payload_digest)
+  requireBoolean('operation_index.revalidated', payload?.operation_index?.revalidated)
+  requireBoolean('operation_index.payload_digest_valid', payload?.operation_index?.payload_digest_valid)
+  requireBoolean('operation_index.schema_valid', payload?.operation_index?.schema_valid)
+  requireBoolean('operation_index.semantic_valid', payload?.operation_index?.semantic_valid)
+  requireBoolean('operation_index.target_tuple_valid', payload?.operation_index?.target_tuple_valid)
+  requireExactKeys('selected_objects', payload?.selected_objects, new Set(['review_id', 'review_comment_id', 'review_thread_node_id']))
+  requireInteger('selected_objects.review_id', payload?.selected_objects?.review_id)
+  requireInteger('selected_objects.review_comment_id', payload?.selected_objects?.review_comment_id)
+  requireString('selected_objects.review_thread_node_id', payload?.selected_objects?.review_thread_node_id)
+  requireExactKeys('pagination', payload?.pagination, new Set(['reviews_complete', 'review_comments_complete', 'review_threads_complete', 'thread_comments_complete']))
+  requireString('projection_digest', payload?.projection_digest)
+  requireString('target_commit', payload?.target_commit)
+  requireBoolean('public_safe', payload?.public_safe)
+  for (const key of ['reviews_complete', 'review_comments_complete', 'review_threads_complete', 'thread_comments_complete']) {
+    requireBoolean(`pagination.${key}`, payload?.pagination?.[key])
+  }
+  return { valid: errors.length === 0, errors }
+}
+
+function compareLiveProofAgainstOperationIndex(liveProofPayload, operationIndexPayload, proof, fetchedDigest) {
+  const errors = []
+  const resolver = operationIndexPayload?.verification?.operation_source_resolver
+  const source = operationIndexPayload?.operation?.source
+  const opKind = operationIndexPayload?.operation?.kind
+  const reviewObject = resolver?.object_catalog?.reviews_by_id?.[String(source?.review_id)]
+  const reviewCommentObject = resolver?.object_catalog?.review_comments_by_id?.[String(source?.comment_id)]
+  const threadObject = resolver?.object_catalog?.review_threads_by_node_id?.[source?.thread_node_id ?? resolver?.source_catalog?.review_thread_node_ids?.[0]]
+
+  if (liveProofPayload?.repo !== proof.repo) {
+    errors.push({ path: 'repo', code: 'live_proof.repo_mismatch', message: 'live proof repo must match proof.repo' })
+  }
+  if (liveProofPayload?.evidence_target?.kind !== proof.target.kind || liveProofPayload?.evidence_target?.number !== proof.target.number) {
+    errors.push({ path: 'evidence_target', code: 'live_proof.target_mismatch', message: 'live proof evidence_target must match proof.target' })
+  }
+  if (liveProofPayload?.operation_index?.comment_url !== proof.operation_index_ref.comment_url) {
+    errors.push({ path: 'operation_index.comment_url', code: 'live_proof.operation_index_url_mismatch', message: 'live proof operation_index.comment_url must match proof.operation_index_ref.comment_url' })
+  }
+  if (liveProofPayload?.operation_index?.payload_digest !== proof.operation_index_ref.payload_digest) {
+    errors.push({ path: 'operation_index.payload_digest', code: 'live_proof.operation_index_digest_mismatch', message: 'live proof operation_index.payload_digest must match proof.operation_index_ref.payload_digest' })
+  }
+  if (liveProofPayload?.operation_index?.payload_digest !== fetchedDigest) {
+    errors.push({ path: 'operation_index.payload_digest', code: 'live_proof.fetched_digest_mismatch', message: 'live proof operation_index.payload_digest must match the fetched operation index payload digest' })
+  }
+  if (liveProofPayload?.projection_digest !== resolver?.evidence_projection_digest) {
+    errors.push({ path: 'projection_digest', code: 'live_proof.projection_digest_mismatch', message: 'live proof projection_digest must match operation source resolver evidence_projection_digest' })
+  }
+  if (liveProofPayload?.target_commit !== resolver?.target_commit) {
+    errors.push({ path: 'target_commit', code: 'live_proof.target_commit_mismatch', message: 'live proof target_commit must match operation source resolver target_commit' })
+  }
+  if (liveProofPayload?.selected_objects?.review_id !== reviewObject?.id) {
+    errors.push({ path: 'selected_objects.review_id', code: 'live_proof.review_id_mismatch', message: 'live proof selected review_id must match object catalog' })
+  }
+  const expectedReviewCommentId = opKind === 'pr_review_comment_created' ? source?.comment_id : resolver?.source_catalog?.review_comment_ids?.[0]
+  if (liveProofPayload?.selected_objects?.review_comment_id !== expectedReviewCommentId) {
+    errors.push({ path: 'selected_objects.review_comment_id', code: 'live_proof.review_comment_id_mismatch', message: 'live proof selected review_comment_id must match object catalog' })
+  }
+  const expectedThreadId = opKind === 'pr_review_thread_resolved' ? source?.thread_node_id : resolver?.source_catalog?.review_thread_node_ids?.[0]
+  if (liveProofPayload?.selected_objects?.review_thread_node_id !== expectedThreadId) {
+    errors.push({ path: 'selected_objects.review_thread_node_id', code: 'live_proof.review_thread_id_mismatch', message: 'live proof selected review_thread_node_id must match object catalog' })
+  }
+  for (const key of ['reviews_complete', 'review_comments_complete', 'review_threads_complete', 'thread_comments_complete']) {
+    if (liveProofPayload?.pagination?.[key] !== resolver?.pagination?.[key]) {
+      errors.push({ path: `pagination.${key}`, code: 'live_proof.pagination_mismatch', message: `live proof pagination.${key} must match operation source resolver` })
+    }
+  }
+  if (liveProofPayload?.public_safe !== true) {
+    errors.push({ path: 'public_safe', code: 'live_proof.public_safe_required', message: 'live proof public_safe must be true' })
+  }
+  if (threadObject && liveProofPayload?.selected_objects?.review_thread_node_id !== threadObject.thread_node_id) {
+    errors.push({ path: 'selected_objects.review_thread_node_id', code: 'live_proof.review_thread_object_mismatch', message: 'live proof review thread id must match fetched thread object' })
+  }
+  if (reviewCommentObject && expectedReviewCommentId === reviewCommentObject.id && liveProofPayload?.selected_objects?.review_comment_id !== reviewCommentObject.id) {
+    errors.push({ path: 'selected_objects.review_comment_id', code: 'live_proof.review_comment_object_mismatch', message: 'live proof review comment id must match fetched review comment object' })
+  }
+  return { valid: errors.length === 0, errors }
+}
+
+async function revalidateOperationIndexFromComment(proof, fixtureBodies, githubClient) {
+  const fetchedComment = await resolveGithubCommentBody(proof.operation_index_ref.comment_url, fixtureBodies, githubClient)
+  if (!fetchedComment.ok) {
+    return {
+      valid: false,
+      errors: [{
+        path: 'operation_index_ref.comment_url',
+        code: 'operation_index.comment_fetch_failed',
+        message: fetchedComment.error.message,
+      }],
+    }
+  }
+  const extraction = extractMarkedJsonBlock(fetchedComment.body, OPERATION_INDEX_COMMENT_START_MARKER, OPERATION_INDEX_COMMENT_END_MARKER)
+  if (!extraction.ok) {
+    return {
+      valid: false,
+      errors: [{
+        path: 'operation_index_ref.comment_url',
+        code: 'operation_index.comment_marker_missing',
+        message: extraction.error.message,
+      }],
+    }
+  }
+  const fetchedPayload = extraction.payload
+  const validation = validateAgentOperationSessionIndex(fetchedPayload)
+  const errors = validation.errors.map((error) => ({
+    path: `operation_index_ref.live_payload${error.path === 'root' ? '' : `.${error.path}`}`,
+    code: 'operation_index.validation_failed',
+    message: error.message,
+  }))
+  const recomputedDigest = computeAgentOperationSessionIndexPayloadDigest(fetchedPayload)
+  if (proof.operation_index_ref.payload_digest !== recomputedDigest) {
+    errors.push({
+      path: 'operation_index_ref.payload_digest',
+      code: 'operation_index.payload_digest_mismatch',
+      message: 'operation_index_ref.payload_digest does not match the live-fetched operation index payload digest',
+    })
+  }
+  if (fetchedPayload?.repo !== proof.repo || fetchedPayload?.parent_issue !== proof.parent_issue) {
+    errors.push({
+      path: 'operation_index_ref.live_payload',
+      code: 'operation_index.identity_mismatch',
+      message: 'live-fetched operation index payload must match proof.repo and proof.parent_issue',
+    })
+  }
+  if (fetchedPayload?.target?.kind !== proof.target?.kind || fetchedPayload?.target?.number !== proof.target?.number) {
+    errors.push({
+      path: 'operation_index_ref.live_payload.target',
+      code: 'operation_index.target_mismatch',
+      message: 'live-fetched operation index payload target must match proof.target',
+    })
+  }
+  return {
+    valid: errors.length === 0,
+    errors,
+    payload: fetchedPayload,
+    payloadDigest: recomputedDigest,
+  }
+}
+
+async function revalidatePrReviewSurfaceLiveProofArtifact(proof, operationIndexPayload, operationIndexPayloadDigest, fixtureBodies, githubClient) {
+  if (!proof?.pr_review_surface_live_proof_ref) {
+    return {
+      valid: false,
+      errors: [{
+        path: 'pr_review_surface_live_proof_ref',
+        code: 'live_proof.required',
+        message: 'pr_review_surface_live_proof_ref is required for PR review live proof validation',
+      }],
+    }
+  }
+  const fetchedComment = await resolveGithubCommentBody(proof.pr_review_surface_live_proof_ref.comment_url, fixtureBodies, githubClient)
+  if (!fetchedComment.ok) {
+    return {
+      valid: false,
+      errors: [{
+        path: 'pr_review_surface_live_proof_ref.comment_url',
+        code: 'live_proof.comment_fetch_failed',
+        message: fetchedComment.error.message,
+      }],
+    }
+  }
+  const extraction = extractMarkedJsonBlock(fetchedComment.body, PR_REVIEW_SURFACE_LIVE_PROOF_START_MARKER, PR_REVIEW_SURFACE_LIVE_PROOF_END_MARKER)
+  if (!extraction.ok) {
+    return {
+      valid: false,
+      errors: [{
+        path: 'pr_review_surface_live_proof_ref.comment_url',
+        code: 'live_proof.comment_marker_missing',
+        message: extraction.error.message,
+      }],
+    }
+  }
+  const payload = extraction.payload
+  const errors = validatePrReviewSurfaceLiveProofShape(payload).errors
+  const recomputedDigest = computeChatgptRetroExecutionProofDigest(payload)
+  if (proof.pr_review_surface_live_proof_ref.payload_digest !== recomputedDigest) {
+    errors.push({
+      path: 'pr_review_surface_live_proof_ref.payload_digest',
+      code: 'live_proof.payload_digest_mismatch',
+      message: 'pr_review_surface_live_proof_ref.payload_digest must match the fetched live proof payload digest',
+    })
+  }
+  if (proof.pr_review_surface_live_proof_ref.proof_target_head_sha !== payload.proof_target_head_sha) {
+    errors.push({
+      path: 'proof_target_head_sha',
+      code: 'live_proof.head_sha_mismatch',
+      message: 'live proof proof_target_head_sha must match pr_review_surface_live_proof_ref.proof_target_head_sha',
+    })
+  }
+  if (proof.pr_review_surface_live_proof_ref.contract_snapshot_url !== payload.contract_snapshot_url) {
+    errors.push({
+      path: 'contract_snapshot_url',
+      code: 'live_proof.contract_snapshot_mismatch',
+      message: 'live proof contract_snapshot_url must match pr_review_surface_live_proof_ref.contract_snapshot_url',
+    })
+  }
+  const liveProofCommentTarget = parseGitHubCommentUrl(proof.pr_review_surface_live_proof_ref.comment_url)
+  if (!liveProofCommentTarget || liveProofCommentTarget.repo !== proof.repo || liveProofCommentTarget.targetKind !== 'pull_request' || liveProofCommentTarget.targetNumber !== payload.proof_target_pr) {
+    errors.push({
+      path: 'pr_review_surface_live_proof_ref.comment_url',
+      code: 'live_proof.comment_url_target_mismatch',
+      message: 'pr_review_surface_live_proof_ref.comment_url must match proof.repo and payload.proof_target_pr',
+    })
+  }
+  errors.push(...compareLiveProofAgainstOperationIndex(payload, operationIndexPayload, proof, operationIndexPayloadDigest).errors)
+  return {
+    valid: errors.length === 0,
+    errors,
+    payload,
+  }
+}
+
 export function validateChatgptRetroExecutionProof(proof, retroResult) {
   const errors = []
 
@@ -580,7 +1009,7 @@ export function validateChatgptRetroExecutionProof(proof, retroResult) {
     path: `retrospective_result_payload${error.path === 'root' ? '' : `.${error.path}`}`,
   })))
 
-  errors.push(...scanPublicSafety(proof).errors)
+  errors.push(...filterPublicSafetyErrors(scanPublicSafety(proof).errors))
   errors.push(...scanPublicSafety(retroResult).errors)
   errors.push(...scanChatgptRetroE2eProofForbiddenFields(proof).errors)
   errors.push(...scanChatgptRetroE2eProofForbiddenFields(retroResult).errors)
@@ -588,6 +1017,7 @@ export function validateChatgptRetroExecutionProof(proof, retroResult) {
   errors.push(...validateChatgptContextGovernanceInvariants(proof).errors)
 
   if (proofSchemaResult.valid && retroSchemaResult.valid) {
+    const operationIndexRevalidationMode = proof.operation_index_ref?.revalidation_mode ?? 'legacy_comment_digest_only'
     // digest.marker_mismatch
     if (retroResult.input_marker_digest !== proof.chatgpt_context.marker_digest) {
       errors.push({
@@ -604,6 +1034,78 @@ export function validateChatgptRetroExecutionProof(proof, retroResult) {
         path: 'retrospective_result.payload_digest',
         code: 'digest.retrospective_result_mismatch',
         message: 'proof.retrospective_result.payload_digest does not match the recomputed digest of the referenced payload',
+      })
+    }
+
+    if (operationIndexRevalidationMode === 'embedded_payload' && !proof.operation_index_ref?.embedded_payload) {
+      errors.push({
+        path: 'operation_index_ref.embedded_payload',
+        code: 'operation_index.embedded_payload_required',
+        message: 'operation_index_ref.embedded_payload is required until live comment fetch/revalidation is implemented',
+      })
+    }
+
+    if (proof.operation_index_ref?.embedded_payload) {
+      const operationIndexValidation = validateAgentOperationSessionIndex(proof.operation_index_ref.embedded_payload)
+      if (!operationIndexValidation.valid) {
+        for (const error of operationIndexValidation.errors) {
+          errors.push({
+            path: `operation_index_ref.embedded_payload${error.path === 'root' ? '' : `.${error.path}`}`,
+            code: 'operation_index.validation_failed',
+            message: error.message,
+          })
+        }
+      }
+
+      const recomputedOperationIndexDigest = computeAgentOperationSessionIndexPayloadDigest(proof.operation_index_ref.embedded_payload)
+      if (proof.operation_index_ref.payload_digest !== recomputedOperationIndexDigest) {
+        errors.push({
+          path: 'operation_index_ref.payload_digest',
+          code: 'operation_index.payload_digest_mismatch',
+          message: 'operation_index_ref.payload_digest does not match the embedded operation index payload digest',
+        })
+      }
+
+      if (
+        isPrReviewOperationKind(proof.operation_index_ref.embedded_payload?.operation?.kind)
+        && proof.operation_index_ref.embedded_payload?.verification?.operation_source_resolver?.status !== 'resolved'
+      ) {
+        errors.push({
+          path: 'operation_index_ref.embedded_payload.verification.operation_source_resolver.status',
+          code: 'operation_index.source_resolver_unresolved',
+          message: 'embedded operation index payload must carry verification.operation_source_resolver.status = "resolved"',
+        })
+      }
+
+      if (
+        (operationIndexRevalidationMode === 'embedded_payload' || isPrReviewOperationKind(proof.operation_index_ref.embedded_payload?.operation?.kind))
+        && (proof.operation_index_ref.embedded_payload?.repo !== proof.repo || proof.operation_index_ref.embedded_payload?.parent_issue !== proof.parent_issue)
+      ) {
+        errors.push({
+          path: 'operation_index_ref.embedded_payload',
+          code: 'operation_index.identity_mismatch',
+          message: 'embedded operation index payload must match proof.repo and proof.parent_issue',
+        })
+      }
+
+      if (
+        (operationIndexRevalidationMode === 'embedded_payload' || isPrReviewOperationKind(proof.operation_index_ref.embedded_payload?.operation?.kind))
+        && (proof.operation_index_ref.embedded_payload?.target?.kind !== proof.target?.kind || proof.operation_index_ref.embedded_payload?.target?.number !== proof.target?.number)
+      ) {
+        errors.push({
+          path: 'operation_index_ref.embedded_payload.target',
+          code: 'operation_index.target_mismatch',
+          message: 'embedded operation index payload target must match proof.target',
+        })
+      }
+    }
+
+    const operationIndexCommentTarget = parseGitHubCommentUrl(proof.operation_index_ref?.comment_url)
+    if (!operationIndexCommentTarget || operationIndexCommentTarget.repo !== proof.repo || operationIndexCommentTarget.targetKind !== proof.target.kind || operationIndexCommentTarget.targetNumber !== proof.target.number) {
+      errors.push({
+        path: 'operation_index_ref.comment_url',
+        code: 'operation_index.comment_url_target_mismatch',
+        message: 'operation_index_ref.comment_url must match proof.repo and proof.target',
       })
     }
 
@@ -636,6 +1138,30 @@ export function validateChatgptRetroExecutionProof(proof, retroResult) {
         path: 'retrospective_result_payload.verdict',
         code: 'verdict.resolver_not_resolved',
         message: 'verdict "approve" is forbidden when chatgpt_context.resolve_live_status is not "resolved"',
+      })
+    }
+
+    if (proof.chatgpt_context.resolve_live_status !== proof.chatgpt_context.resolver_evidence.status) {
+      errors.push({
+        path: 'chatgpt_context.resolver_evidence.status',
+        code: 'resolver_evidence.status_mismatch',
+        message: 'chatgpt_context.resolve_live_status must match chatgpt_context.resolver_evidence.status',
+      })
+    }
+
+    if (proof.chatgpt_context.resolve_live_status === 'resolved' && proof.chatgpt_context.resolver_evidence.page_budget_exhausted !== false) {
+      errors.push({
+        path: 'chatgpt_context.resolver_evidence.page_budget_exhausted',
+        code: 'resolver_evidence.page_budget_exhausted',
+        message: 'page_budget_exhausted must be false when chatgpt_context.resolve_live_status is "resolved"',
+      })
+    }
+
+    if (proof.chatgpt_context.resolve_live_status === 'resolved' && proof.chatgpt_context.resolver_evidence.reference_page_budget_exhausted !== false) {
+      errors.push({
+        path: 'chatgpt_context.resolver_evidence.reference_page_budget_exhausted',
+        code: 'resolver_evidence.reference_page_budget_exhausted',
+        message: 'reference_page_budget_exhausted must be false when chatgpt_context.resolve_live_status is "resolved"',
       })
     }
 
@@ -684,6 +1210,45 @@ export function validateChatgptRetroE2eProofMarkdown(markdown) {
     return { valid: false, errors: [resultExtraction.error] }
   }
   return validateChatgptRetroExecutionProof(proofExtraction.payload, resultExtraction.payload)
+}
+
+export async function validateChatgptRetroE2eProofMarkdownLive(markdown, { githubClient = null } = {}) {
+  const proofExtraction = extractMarkedJsonBlock(markdown, PROOF_START_MARKER, PROOF_END_MARKER)
+  if (!proofExtraction.ok) {
+    return { valid: false, errors: [proofExtraction.error] }
+  }
+  const resultExtraction = extractMarkedJsonBlock(markdown, RESULT_START_MARKER, RESULT_END_MARKER)
+  if (!resultExtraction.ok) {
+    return { valid: false, errors: [resultExtraction.error] }
+  }
+  const baseResult = validateChatgptRetroExecutionProof(proofExtraction.payload, resultExtraction.payload)
+  const proof = proofExtraction.payload
+  const fixtureBodies = extractLiveGithubCommentFixtures(markdown)
+  const client = githubClient ?? (fixtureBodies.size === 0 ? new GhCliIssueCommentsClient() : null)
+  const errors = [...baseResult.errors]
+
+  if (proof?.operation_index_ref?.revalidation_mode === 'live_comment_fetch') {
+    const operationIndexResult = await revalidateOperationIndexFromComment(proof, fixtureBodies, client)
+    errors.push(...operationIndexResult.errors)
+    if (operationIndexResult.valid && isPrReviewLiveProofRequired(proof)) {
+      const liveProofResult = await revalidatePrReviewSurfaceLiveProofArtifact(
+        proof,
+        operationIndexResult.payload,
+        operationIndexResult.payloadDigest,
+        fixtureBodies,
+        client,
+      )
+      errors.push(...liveProofResult.errors)
+    } else if (isPrReviewLiveProofRequired(proof) && !proof?.pr_review_surface_live_proof_ref) {
+      errors.push({
+        path: 'pr_review_surface_live_proof_ref',
+        code: 'live_proof.required',
+        message: 'pr_review_surface_live_proof_ref is required for PR review live proof validation',
+      })
+    }
+  }
+
+  return { valid: errors.length === 0, errors: errors.map(normalizeValidationError) }
 }
 
 function printUsage() {
@@ -738,7 +1303,7 @@ async function main() {
   for (const file of files) {
     const shortPath = file.replace(`${REPO_ROOT}/`, '')
     const markdown = readFileSync(file, 'utf-8')
-    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    const result = await validateChatgptRetroE2eProofMarkdownLive(markdown)
     if (result.valid) {
       console.log(`PASS ${shortPath}`)
       continue

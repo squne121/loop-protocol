@@ -76,6 +76,52 @@
         "validation_verdict": {
           "type": "string",
           "const": "pass"
+        },
+        "revalidation_mode": {
+          "type": "string",
+          "enum": [
+            "legacy_comment_digest_only",
+            "embedded_payload",
+            "live_comment_fetch"
+          ]
+        },
+        "embedded_payload": {
+          "type": "object"
+        }
+      }
+    },
+    "pr_review_surface_live_proof_ref": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "comment_url",
+        "payload_digest",
+        "proof_target_head_sha",
+        "contract_snapshot_url"
+      ],
+      "properties": {
+        "comment_url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://github\\.com/squne121/loop-protocol/pull/[0-9]+#issuecomment-[0-9]+$",
+          "maxLength": 300
+        },
+        "payload_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "proof_target_head_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "contract_snapshot_url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://github\\.com/squne121/loop-protocol/issues/[0-9]+#issuecomment-[0-9]+$",
+          "maxLength": 300
         }
       }
     },

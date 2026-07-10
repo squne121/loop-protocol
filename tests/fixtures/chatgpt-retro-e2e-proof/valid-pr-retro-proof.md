@@ -12,8 +12,55 @@
   },
   "operation_index_ref": {
     "comment_url": "https://github.com/squne121/loop-protocol/pull/1153#issuecomment-4930000030",
-    "payload_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
-    "validation_verdict": "pass"
+    "payload_digest": "sha256:246cb54162c0164206347ac33ddf89da3692c041635df43a3356cb918d603eb8",
+    "validation_verdict": "pass",
+    "embedded_payload": {
+      "schema": "agent_operation_session_index/v1",
+      "repo": "squne121/loop-protocol",
+      "parent_issue": 1153,
+      "target": {
+        "kind": "pull_request",
+        "number": 1299
+      },
+      "operation": {
+        "kind": "pr_comment",
+        "github_event_ref": {
+          "kind": "github_comment",
+          "ref": "https://github.com/squne121/loop-protocol/pull/1299#issuecomment-4930000010",
+          "digest": "sha256:be38f0f5c6a85f16f863bb699b2de17fd9f29ff55a7b78562270733521692b15"
+        },
+        "occurred_at": "2026-07-02T09:30:00Z"
+      },
+      "agent_run": {
+        "run_id": "run-1405-pr-001",
+        "agent_surface": "claude_code",
+        "evidence_mode": "synthetic_route_proof",
+        "capability_verdict": "supported",
+        "raw_values_emitted": false
+      },
+      "public_artifacts": {
+        "run_report_comment_url": "https://github.com/squne121/loop-protocol/pull/1299#issuecomment-4930000011",
+        "run_report_payload_digest": "sha256:d1c9dcb2a5a5731bd1d00f35fb52f0e65f099eded93be7e0373315d45af7540e",
+        "retro_index_comment_url": "https://github.com/squne121/loop-protocol/pull/1299#issuecomment-4930000012",
+        "retro_index_payload_digest": "sha256:6a8f5f21a9e0735007d06726c3023408949ae924e5f2e8359c3d5956468e7485",
+        "retro_index_source_set_digest": "sha256:62c67b28f53662ef4765d33a50319a9fc18cfe3de7e4aed896fa4c314ccafd93",
+        "chatgpt_marker_comment_url": "https://github.com/squne121/loop-protocol/pull/1299#issuecomment-4930000013",
+        "chatgpt_marker_digest": "sha256:6d422b49d8d840de070b79ecb0933cae0cf1966059f1f722fdd66463fc108cd1"
+      },
+      "verification": {
+        "resolver_command": "pnpm chatgpt-retro-context:resolve-live",
+        "resolver_status": "resolved",
+        "checked_at": "2026-07-02T09:35:00Z",
+        "checker_version": "check-agent-operation-session-index.mjs@1405",
+        "public_safe": true,
+        "semantic_checks": [
+          "target.kind_url_alignment",
+          "public_artifacts.number_alignment",
+          "event_kind_mapping",
+          "raw_values_emitted_false"
+        ]
+      }
+    }
   },
   "chatgpt_context": {
     "marker_comment_url": "https://github.com/squne121/loop-protocol/pull/1153#issuecomment-4930000031",
@@ -50,7 +97,7 @@
   },
   "retrospective_result": {
     "schema": "chatgpt_retrospective_result/v1",
-    "payload_digest": "sha256:0010519bac08dd3b89a2f986d082b663149d73726f5fa00dcc545d2c64b31ae6",
+    "payload_digest": "sha256:f1f62c4437380bf08f35553fb36ecf397eeffaccc78da0f0869b9c37ee0beefe",
     "validation_verdict": "pass",
     "verdict": "approve"
   },
@@ -97,7 +144,7 @@
         {
           "kind": "github_comment",
           "ref": "https://github.com/squne121/loop-protocol/pull/1153#issuecomment-4930000030",
-          "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+          "digest": "sha256:246cb54162c0164206347ac33ddf89da3692c041635df43a3356cb918d603eb8"
         },
         {
           "kind": "github_comment",
