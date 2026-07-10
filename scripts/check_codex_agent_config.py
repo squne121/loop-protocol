@@ -56,6 +56,12 @@ EXPECTED_PRETOOL_HOOKS = {
             "timeout": 10,
             "statusMessage": "Checking CI/test-lane path advisory",
         },
+        {
+            "type": "command",
+            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/root_temporary_residue_advisory.sh"',
+            "timeout": 10,
+            "statusMessage": "Checking root temporary residue advisory",
+        },
     ],
     "^(apply_patch|Edit|Write)$": [
         {
@@ -75,6 +81,12 @@ EXPECTED_PRETOOL_HOOKS = {
             "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/ci_test_performance_advisory.sh"',
             "timeout": 10,
             "statusMessage": "Checking CI/test-lane path advisory",
+        },
+        {
+            "type": "command",
+            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/root_temporary_residue_advisory.sh"',
+            "timeout": 10,
+            "statusMessage": "Checking root temporary residue advisory",
         },
     ],
 }
