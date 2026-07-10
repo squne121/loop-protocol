@@ -315,6 +315,9 @@
         }
       }
     },
+    "scope_signal_guard_decision_v2": {
+      "type": "object"
+    },
     "fail_closed": {
       "type": "object",
       "required": [
@@ -383,6 +386,20 @@
             "null"
           ],
           "description": "comment_id or other reference, null for issue_body"
+        },
+        "body_version": {
+          "type": "string",
+          "enum": [
+            "before",
+            "current",
+            "after"
+          ]
+        },
+        "coordinate_space": {
+          "type": "string",
+          "enum": [
+            "body_absolute_1_based"
+          ]
         },
         "start_line": {
           "type": "integer",

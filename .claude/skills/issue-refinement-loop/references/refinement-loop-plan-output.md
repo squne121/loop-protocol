@@ -121,6 +121,7 @@ The `plan_refinement_loop.py` script analyzes Issue body, comments, and known co
 - `triggered`: True if new scope signals detected
 - `excluded_by_anchor_reframe`: True if anchor comment reframe excludes this signal
 - `reason_code`: Type of signal (or `anchor_reframe_exclusion` if excluded)
+- `evidence_spans`: delta-based provenance is recorded as `source: known_context` plus `body_version`, `coordinate_space: body_absolute_1_based`, and the matching `source_ref`
 
 **Use in SKILL.md**: If triggered and NOT excluded, consider human escalation for scope confirmation.
 

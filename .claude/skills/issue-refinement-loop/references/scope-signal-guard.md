@@ -155,8 +155,11 @@ scope_signal_delta_input:
 - `after_body`: proposed rewrite body または fixture が与える candidate body
 - `source_refs.*`: issue URL / artifact path / fixture path / comment id の provenance
 - planner が projection を `evidence_spans` へ写す場合も、`body_version` に対応する `source_ref` を保持する
+- `run_refinement_preflight.py` の preflight producer は hard-stop 対象 phase で `scope_signal_delta_input` を省略せず、少なくとも current body を `before/current/after` に束ねた baseline 付き payload を渡す。producer が payload を供給できない状態で `new_allowed_path_layer` 判定だけを legacy fallback に戻してはならない
 
 `new_allowed_path_layer` は `after.allowed_path_layers - before.allowed_path_layers` が非空の場合のみ発火する。既存 layer の再掲、並び替え、空白差分、fenced code 内の path mention は signal にしない。
+
+planner が `REFINEMENT_LOOP_PLAN_V1.decisions.scope_signal_guard.evidence_spans` へ写す delta provenance は、`source: known_context` を使い、`body_version` / `coordinate_space: body_absolute_1_based` / `source_ref` を併記する。line number は source body 全体に対する 1-based absolute line を使い、`text_sha256` はその raw line を hash した値と一致させる。
 
 ### 単一パス文字列内の複数 prefix 判定ルール（Issue #1327）
 

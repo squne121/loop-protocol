@@ -17,6 +17,7 @@ import hashlib
 import json
 import re
 import sys
+from dataclasses import dataclass
 from typing import Any
 
 SCHEMA_VERSION = "scope_signal_delta/v1"
@@ -44,6 +45,12 @@ PATH_TOKEN_RE = re.compile(r"`(?P<path>[^`\n]+)`|(?P<bare>(?:\.claude|docs|src|s
 
 INPUT_REQUIRED_FIELDS = ("before_body", "current_body", "after_body", "source_refs")
 INPUT_SOURCE_REF_KEYS = ("before", "current", "after")
+
+
+@dataclass(frozen=True)
+class SourceLine:
+    number: int
+    text: str
 
 
 def _sha256(text: str) -> str:
@@ -133,6 +140,44 @@ def _find_section_line_offset(text: str, section_name: str) -> int:
     return 1
 
 
+def _iter_section_lines(text: str, section_name: str) -> list[SourceLine]:
+    lines: list[SourceLine] = []
+    current_section: str | None = None
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+
+    for index, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not in_fence:
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                fence_char = stripped[0]
+                fence_len = len(stripped) - len(stripped.lstrip(fence_char))
+                in_fence = True
+                if current_section == section_name:
+                    lines.append(SourceLine(index, line))
+                continue
+        else:
+            if stripped and all(ch == fence_char for ch in stripped) and len(stripped) >= fence_len:
+                in_fence = False
+                fence_char = ""
+                fence_len = 0
+                if current_section == section_name:
+                    lines.append(SourceLine(index, line))
+                continue
+            if current_section == section_name:
+                lines.append(SourceLine(index, line))
+            continue
+
+        if line.startswith("## "):
+            current_section = line[3:].strip()
+            continue
+        if current_section == section_name:
+            lines.append(SourceLine(index, line))
+
+    return lines
+
+
 def _normalize_path(path: str) -> str:
     normalized = path.strip().strip("`").strip()
     normalized = normalized.rstrip("/")
@@ -140,15 +185,13 @@ def _normalize_path(path: str) -> str:
 
 
 def _extract_path_items(text: str, section_name: str) -> list[dict[str, Any]]:
-    sections = _extract_sections(text)
-    section_text = sections.get(section_name, "")
-    section_start = _find_section_line_offset(text, section_name)
     items: list[dict[str, Any]] = []
     in_fence = False
     fence_char = ""
     fence_len = 0
 
-    for local_line, raw_line in enumerate(section_text.splitlines(), start=0):
+    for source_line in _iter_section_lines(text, section_name):
+        raw_line = source_line.text
         stripped = raw_line.strip()
         if not in_fence:
             if stripped.startswith("```") or stripped.startswith("~~~"):
@@ -171,8 +214,8 @@ def _extract_path_items(text: str, section_name: str) -> list[dict[str, Any]]:
             items.append(
                 {
                     "value": normalized,
-                    "start_line": section_start + local_line,
-                    "end_line": section_start + local_line,
+                    "start_line": source_line.number,
+                    "end_line": source_line.number,
                     "text_sha256": _sha256(raw_line),
                 }
             )
@@ -180,16 +223,14 @@ def _extract_path_items(text: str, section_name: str) -> list[dict[str, Any]]:
 
 
 def _extract_in_scope_layers(text: str) -> list[dict[str, Any]]:
-    sections = _extract_sections(text)
-    section_text = sections.get("In Scope", "")
-    section_start = _find_section_line_offset(text, "In Scope")
     items: list[dict[str, Any]] = []
     in_fence = False
     fence_char = ""
     fence_len = 0
     prefixes = (".claude/", "docs/", "src/", "scripts/", "tests/", ".github/")
 
-    for local_line, raw_line in enumerate(section_text.splitlines(), start=0):
+    for source_line in _iter_section_lines(text, "In Scope"):
+        raw_line = source_line.text
         stripped = raw_line.strip()
         if not in_fence:
             if stripped.startswith("```") or stripped.startswith("~~~"):
@@ -225,8 +266,8 @@ def _extract_in_scope_layers(text: str) -> list[dict[str, Any]]:
                 items.append(
                     {
                         "value": prefix.rstrip("/"),
-                        "start_line": section_start + local_line,
-                        "end_line": section_start + local_line,
+                        "start_line": source_line.number,
+                        "end_line": source_line.number,
                         "text_sha256": _sha256(raw_line),
                     }
                 )
@@ -234,19 +275,17 @@ def _extract_in_scope_layers(text: str) -> list[dict[str, Any]]:
 
 
 def _extract_ac_items(text: str) -> list[dict[str, Any]]:
-    sections = _extract_sections(text)
-    section_text = sections.get("Acceptance Criteria", "")
-    section_start = _find_section_line_offset(text, "Acceptance Criteria")
     items: list[dict[str, Any]] = []
-    for local_line, raw_line in enumerate(section_text.splitlines(), start=0):
+    for source_line in _iter_section_lines(text, "Acceptance Criteria"):
+        raw_line = source_line.text
         stripped = raw_line.lstrip()
         if stripped.startswith("- [ ]") or stripped.startswith("- [x]"):
             normalized = re.sub(r"\s+", " ", stripped).strip()
             items.append(
                 {
                     "value": normalized,
-                    "start_line": section_start + local_line,
-                    "end_line": section_start + local_line,
+                    "start_line": source_line.number,
+                    "end_line": source_line.number,
                     "text_sha256": _sha256(raw_line),
                     "is_low_verifiability": any(keyword in raw_line for keyword in SUBJECTIVE_KEYWORDS),
                 }

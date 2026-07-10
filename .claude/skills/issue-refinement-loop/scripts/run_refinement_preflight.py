@@ -886,6 +886,43 @@ def _build_planner_input(
     return planner_input
 
 
+def _issue_body_source_ref(issue: dict[str, Any], issue_number: int, repo: str) -> str:
+    html_url = issue.get("html_url")
+    if isinstance(html_url, str) and html_url:
+        return html_url
+    url = issue.get("url")
+    if isinstance(url, str) and url:
+        return url
+    return f"https://github.com/{repo}/issues/{issue_number}"
+
+
+def _ensure_scope_signal_delta_input(
+    *,
+    issue: dict[str, Any],
+    known_context: Optional[dict[str, Any]],
+    issue_number: int,
+    repo: str,
+) -> dict[str, Any]:
+    merged = dict(known_context) if known_context else {}
+    merged.setdefault("current_phase", "preflight")
+    if "scope_signal_delta_input" in merged:
+        return merged
+
+    body = issue.get("body", "") or ""
+    source_ref = _issue_body_source_ref(issue, issue_number, repo)
+    merged["scope_signal_delta_input"] = {
+        "before_body": body,
+        "current_body": body,
+        "after_body": body,
+        "source_refs": {
+            "before": source_ref,
+            "current": source_ref,
+            "after": source_ref,
+        },
+    }
+    return merged
+
+
 def _invoke_repair(body: str) -> dict:
     """
     Invoke repair_issue_contract.py (dry-run) to pre-process the Issue body
@@ -1715,6 +1752,12 @@ def run_preflight(
     _repair_result = _invoke_repair(issue.get("body", "") or "")
 
     # --- Invoke planner ---
+    known_context = _ensure_scope_signal_delta_input(
+        issue=issue,
+        known_context=known_context,
+        issue_number=issue_number,
+        repo=repo,
+    )
     planner_input_dict = _build_planner_input(
         issue,
         comments,

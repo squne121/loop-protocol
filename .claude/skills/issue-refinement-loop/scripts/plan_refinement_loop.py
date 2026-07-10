@@ -44,6 +44,12 @@ except ImportError:  # pragma: no cover - subprocess/CLI fallback path
     classify_scope_delta_authority = None
 
 
+@dataclass(frozen=True)
+class SourceLine:
+    number: int
+    text: str
+
+
 class ScopeSignalDeltaError(RuntimeError):
     """Raised when scope_signal_delta_input exists but cannot be consumed safely."""
 
@@ -78,6 +84,9 @@ SCOPE_SIGNAL_REASON_NEW_PATH_LAYER = "new_allowed_path_layer"
 SCOPE_SIGNAL_REASON_NEW_UNVERIFIABLE_AC = "new_unverifiable_ac"
 SCOPE_SIGNAL_REASON_ANCHOR_REFRAME = "anchor_reframe_exclusion"
 SCOPE_SIGNAL_REASON_NO_SIGNAL = "no_scope_signal"
+SCOPE_SIGNAL_REASON_MISSING_DELTA_INPUT = "missing_scope_signal_delta_input"
+
+_HARD_STOP_SCOPE_SIGNAL_PHASES = frozenset({"preflight", "post_rewrite_check", "decide_next_action"})
 
 # ---------------------------------------------------------------------------
 # SCOPE_SIGNAL_GUARD_DECISION_V2 (#1090) -- escalation lane split
@@ -720,10 +729,12 @@ def _delta_projection_to_evidence_spans(delta_result: dict[str, Any]) -> list[di
         source_ref = source_refs.get(body_version)
         evidence_spans.append(
             {
-                "source": f"scope_signal_delta_{body_version}_body",
+                "source": "known_context",
                 "source_ref": source_ref,
                 "start_line": line["start_line"],
                 "end_line": line["end_line"],
+                "body_version": body_version,
+                "coordinate_space": "body_absolute_1_based",
                 "text_sha256": line["text_sha256"].removeprefix("sha256:"),
             }
         )
@@ -775,6 +786,62 @@ def _line_layer_prefixes(line: str, prefixes) -> set:
     return found
 
 
+def _iter_section_source_lines(text: str, section_name: str) -> list[SourceLine]:
+    lines: list[SourceLine] = []
+    current_section: str | None = None
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+
+    for index, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not in_fence:
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                fence_char = stripped[0]
+                fence_len = len(stripped) - len(stripped.lstrip(fence_char))
+                in_fence = True
+                if current_section == section_name:
+                    lines.append(SourceLine(index, line))
+                continue
+        else:
+            if stripped and all(ch == fence_char for ch in stripped) and len(stripped) >= fence_len:
+                in_fence = False
+                fence_char = ""
+                fence_len = 0
+                if current_section == section_name:
+                    lines.append(SourceLine(index, line))
+                continue
+            if current_section == section_name:
+                lines.append(SourceLine(index, line))
+            continue
+
+        if line.startswith("## "):
+            current_section = line[3:].strip()
+            continue
+        if current_section == section_name:
+            lines.append(SourceLine(index, line))
+
+    return lines
+
+
+def _legacy_allowed_path_prefixes(issue_body: str) -> set[str]:
+    prefixes: set[str] = set()
+    for source_line in _iter_section_source_lines(issue_body, "Allowed Paths"):
+        match = re.search(r"`([^/`]+)/", source_line.text)
+        if match:
+            prefixes.add(match.group(1))
+    return prefixes
+
+
+def _requires_delta_fail_closed(issue_body: str, known_context: dict | None) -> bool:
+    if not known_context or "scope_signal_delta_input" in known_context:
+        return False
+    current_phase = known_context.get("current_phase")
+    if current_phase not in _HARD_STOP_SCOPE_SIGNAL_PHASES:
+        return False
+    return len(_legacy_allowed_path_prefixes(issue_body)) >= 2
+
+
 def _detect_scope_signals(
     issue_body: str,
     known_context: dict | None,
@@ -787,6 +854,11 @@ def _detect_scope_signals(
 
     Precedence: new_unverifiable_ac > new_allowed_path_layer > new_in_scope_area > none
     """
+    if _requires_delta_fail_closed(issue_body, known_context):
+        raise ScopeSignalDeltaError(
+            "scope_signal_delta_input is required for new_allowed_path_layer in hard-stop phases"
+        )
+
     if known_context and "scope_signal_delta_input" in known_context:
         delta_result = (
             precomputed_delta
@@ -807,6 +879,9 @@ def _detect_scope_signals(
 
     evidence_spans = []
     sections = _extract_sections(issue_body)
+    acceptance_criteria_lines = _iter_section_source_lines(issue_body, "Acceptance Criteria")
+    allowed_path_lines = _iter_section_source_lines(issue_body, "Allowed Paths")
+    in_scope_lines = _iter_section_source_lines(issue_body, "In Scope")
 
     in_scope = sections.get("In Scope", "")
     allowed_paths = sections.get("Allowed Paths", "")
@@ -819,14 +894,15 @@ def _detect_scope_signals(
     ]
 
     # 1. Check new_unverifiable_ac (highest precedence)
-    for line_num, line in enumerate(acceptance_criteria.splitlines(), start=1):
+    for source_line in acceptance_criteria_lines:
+        line = source_line.text
         if line.lstrip().startswith("- [ ]") or line.lstrip().startswith("- [x]"):
             if any(kw in line for kw in subjective_keywords):
                 evidence_spans.append({
                     "source": "issue_body",
                     "source_ref": None,
-                    "start_line": line_num,
-                    "end_line": line_num,
+                    "start_line": source_line.number,
+                    "end_line": source_line.number,
                     "text_sha256": _sha256(line),
                 })
                 # Check exclusion
@@ -837,20 +913,21 @@ def _detect_scope_signals(
 
     # 2. Check new_allowed_path_layer
     top_level_prefixes = set()
-    for line in allowed_paths.splitlines():
-        match = re.search(r'`([^/`]+)/', line)
+    for source_line in allowed_path_lines:
+        match = re.search(r'`([^/`]+)/', source_line.text)
         if match:
             top_level_prefixes.add(match.group(1))
 
     if len(top_level_prefixes) >= 2:
         # Find evidence line
-        for line_num, line in enumerate(allowed_paths.splitlines(), start=1):
+        for source_line in allowed_path_lines:
+            line = source_line.text
             if any(p in line for p in top_level_prefixes):
                 evidence_spans.append({
                     "source": "issue_body",
                     "source_ref": None,
-                    "start_line": line_num,
-                    "end_line": line_num,
+                    "start_line": source_line.number,
+                    "end_line": source_line.number,
                     "text_sha256": _sha256(line),
                 })
                 break
@@ -870,20 +947,21 @@ def _detect_scope_signals(
     # the token itself *starts with* that prefix, so nested substrings
     # within a single token never count as extra layers.
     layer_prefixes_in_scope = set()
-    for line in in_scope.splitlines():
+    for source_line in in_scope_lines:
         layer_prefixes_in_scope |= _line_layer_prefixes(
-            line, (".claude/", "docs/", "src/", "scripts/", "tests/", ".github/")
+            source_line.text, (".claude/", "docs/", "src/", "scripts/", "tests/", ".github/")
         )
 
     if len(layer_prefixes_in_scope) >= 2:
         # Find evidence line
-        for line_num, line in enumerate(in_scope.splitlines(), start=1):
+        for source_line in in_scope_lines:
+            line = source_line.text
             if _line_layer_prefixes(line, tuple(layer_prefixes_in_scope)):
                 evidence_spans.append({
                     "source": "issue_body",
                     "source_ref": None,
-                    "start_line": line_num,
-                    "end_line": line_num,
+                    "start_line": source_line.number,
+                    "end_line": source_line.number,
                     "text_sha256": _sha256(line),
                 })
                 break
