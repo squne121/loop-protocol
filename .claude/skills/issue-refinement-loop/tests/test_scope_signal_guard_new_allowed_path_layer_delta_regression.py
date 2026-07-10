@@ -196,8 +196,16 @@ def test_section_blank_lines_and_crlf_keep_absolute_line_numbers():
 def test_delta_positive_planner_output_validates_refinement_loop_plan_schema():
     payload = _load_fixture("new_allowed_path_layer")
     issue_body = _valid_issue_body(
-        allowed_paths="- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n- `docs/dev/workflow.md`",
-        in_scope="- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py` の scope 判定更新\n- `docs/dev/workflow.md` への契約追記",
+        allowed_paths=(
+            "- `.claude/skills/issue-refinement-loop/scripts/"
+            "plan_refinement_loop.py`\n"
+            "- `docs/dev/workflow.md`"
+        ),
+        in_scope=(
+            "- `.claude/skills/issue-refinement-loop/scripts/"
+            "plan_refinement_loop.py` の scope 判定更新\n"
+            "- `docs/dev/workflow.md` への契約追記"
+        ),
         acceptance_criteria="- [ ] AC1: Existing scope remains stable",
     )
     output, exit_code = plan.plan_refinement_loop(
@@ -233,8 +241,16 @@ def test_issue_1385_replay_uses_delta_or_fails_closed_without_baseline():
 def test_planner_true_positive_new_allowed_path_layer_not_new_in_scope_area():
     payload = _load_fixture("new_allowed_path_layer")
     issue_body = _valid_issue_body(
-        allowed_paths="- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n- `docs/dev/workflow.md`",
-        in_scope="- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py` の scope 判定更新\n- `docs/dev/workflow.md` への契約追記",
+        allowed_paths=(
+            "- `.claude/skills/issue-refinement-loop/scripts/"
+            "plan_refinement_loop.py`\n"
+            "- `docs/dev/workflow.md`"
+        ),
+        in_scope=(
+            "- `.claude/skills/issue-refinement-loop/scripts/"
+            "plan_refinement_loop.py` の scope 判定更新\n"
+            "- `docs/dev/workflow.md` への契約追記"
+        ),
         acceptance_criteria="- [ ] AC1: Existing scope remains stable",
     )
     output, exit_code = plan.plan_refinement_loop(
