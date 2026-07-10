@@ -525,6 +525,24 @@ jobs:
             esac
             fetch_pages_url_with_bounded_retry "preview-asset" "https://${GITHUB_REPOSITORY_OWNER}.github.io${asset_path}?cache_bust=${GITHUB_SHA}" /tmp/preview-asset.bin
           done
+      - name: Install Playwright browser for preview smoke
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Verify preview playability (direct + iframe)
+        env:
+          PREVIEW_URL: https://${{ github.repository_owner }}.github.io${{ steps.vite-base.outputs.base }}
+        run: |
+          set -euo pipefail
+          pnpm exec node scripts/ci/preview_playability_smoke.mjs \
+            --url "$PREVIEW_URL" \
+            --output-dir artifacts/preview-playability-smoke
+      - name: Upload preview playability smoke artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: preview-playability-smoke-pr-${{ github.event.number }}
+          path: artifacts/preview-playability-smoke/
+          if-no-files-found: error
+          retention-days: 90
       - name: Comment preview URL on PR
         if: ${{ always() }}
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
