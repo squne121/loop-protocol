@@ -60,7 +60,7 @@ REPOSITORY_FOLDER_POLICY_V1:
     guidance: advisory_only_replace_with_tmp
 ```
 
-## Root Class / Marker Effect Matrix（Issue #1417）
+## Root Class / Marker Effect Matrix（Issue #1417 の分類マトリクス）
 
 `temp_residue_classifier.py` が各 root class・child の `recommendation` をどう決定するかの正本表。
 `eligible_for_delete` は常に advisory であり、削除権限そのものではない。
