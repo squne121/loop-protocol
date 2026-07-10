@@ -123,11 +123,11 @@ git branch -d worktree-<slug>
 
 Note: `research.yml` の `state/queued` は Known residual。#275 が `.github/ISSUE_TEMPLATE/research.yml` の writer cleanup を所有するため、本表の research 行も #275 完了時に同期更新する。
 
-### Implementation issue canonical contract
+### Implementation issue canonical contract（実装 Issue の正規契約）
 
 implementation issue では、以下 3 つを別概念として扱う。
 
-#### Template auto-labels
+#### Template auto-labels（テンプレート自動ラベル）
 
 ```yaml
 implementation_template_auto_labels:
@@ -140,7 +140,7 @@ implementation_template_auto_labels:
 - 正本は `.github/ISSUE_TEMPLATE/implementation.yml`
 - 自動付与ラベルは classification / routing 用であり、そのまま AI 着手可否の state machine に使わない
 
-#### Consumer ready contract
+#### Consumer ready contract（consumer 着手可能契約）
 
 ```yaml
 implementation_consumer_ready_contract:
@@ -162,7 +162,7 @@ implementation_consumer_ready_contract:
 - `impl-review-loop` / `implement-issue` / `issue-contract-review` はこの contract を正本として着手可否を判定する
 - `triage-required` は補助ラベルであり、consumer ready contract の必須条件ではない
 
-#### Triage profile
+#### Triage profile（triage プロファイル）
 
 ```yaml
 implementation_triage_profile:
@@ -180,7 +180,7 @@ implementation_triage_profile:
 
 - triage 完了後も ready 判定の primary signal は dependency close 状態と contract review 結果である
 
-#### Deprecated legacy labels
+#### Deprecated legacy labels（非推奨 legacy ラベル）
 
 - `state/queued` は deprecated / legacy であり、template auto-labels にも consumer ready contract にも含めない
 - `state/queued` 不在だけで BLOCKED 判定しない
@@ -198,7 +198,7 @@ implementation_triage_profile:
 
 `impl-review-loop` が GitHub Issue contract を作業計画の正本として扱い、追加の実装計画承認を要求しないための着手条件を以下に定義する。
 
-### Hard gate
+### Hard gate（強制ゲート）
 
 以下をすべて満たした場合のみ着手できる。
 
@@ -206,7 +206,7 @@ implementation_triage_profile:
   - この判定には DoR 準拠・VC preflight・GitHub native dependency または `Depends on #N` で表現された blocker / dependency の全 close・human escalation 非該当の確認を含む（詳細は `issue-contract-review` skill 参照）
 - `state/needs-human` 等の human escalation 条件が残っていないこと
 
-### Codex custom-agent dispatch guardrail
+### Codex custom-agent dispatch guardrail（Codex custom-agent 委譲ガードレール）
 
 - Codex CLI では `impl-review-loop` / `post-merge-cleanup` の root thread は control-plane のみを担当し、data-plane 操作は明示 spawn した custom agent に委譲する
 - repo-side deterministic guardrail の正本は `.codex/agents/*.toml`、`.codex/hooks.json`、dispatch validator、`SUBAGENT_LAUNCH_LEDGER_V1` fixture 群、`--audit-mode` で監査する generated ledger artifact とする
@@ -221,7 +221,16 @@ implementation_triage_profile:
 - stale な prior result を `go` として流用して `impl-review-loop` / `implement-issue` へ handoff してはならない
 - Issue 本文の変更は `body_sha256` の変化として検出される（`issue-contract-review` の snapshot idempotency 機構参照）
 
-### Scope Collision Preflight
+### branch publish retry の safety stop（publish 再試行の安全停止）
+
+branch publish が hook / approval 境界で止まった場合、agent は manual remote update に暗黙フォールバックせず、まず live readback を行って `PUBLISH_LANE_DECISION_V1` を評価する。
+
+- 比較対象: `expected_remote_head` / `current_remote_head` / `local_head` / `verified_head` / `declared_publish_head` / `allowed_paths_gate_status` / `remote_readback_source` / `decision_inputs_complete`
+- `status: allow_retry` の場合だけ bounded publish command を再試行する
+- `branch_mismatch` / `stale_remote_head` / `local_head_mismatch` / `remote_fast_forward_by_same_scope` / `remote_head_scope_contamination` / `allowed_paths_gate_not_ok` / `publish_guard_context_missing` / `publish_guard_context_invalid` のいずれかなら `PUBLISH_SAFETY_STOP_REPORT_V1` を残して停止する
+- strict lane を hook に束縛する場合は `LOOP_PUBLISH_EXPECTED_REMOTE_HEAD` / `LOOP_PUBLISH_CURRENT_REMOTE_HEAD` / `LOOP_PUBLISH_DECLARED_PUBLISH_HEAD` / `LOOP_PUBLISH_VERIFIED_HEAD` / `LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS` / `LOOP_PUBLISH_REMOTE_READBACK_SOURCE` をセットする
+
+### Scope Collision Preflight（スコープ衝突の事前確認）
 
 Allowed Paths overlap 単独では hard stop ではない。OPEN な他 Implementation Issue と Allowed Paths が重複する場合は、即停止ではなく Scope Collision Preflight を実施し、以下の class を判定する。
 
@@ -313,7 +322,7 @@ GitHub full-text search の false positive は候補 Issue body の `## Allowed 
 | GitHub Milestone 操作 | `docs/dev/milestone-ops.md` |
 | 運用単位（issue-refinement-loop / impl-review-loop 等）の状態機械・SubAgent 契約・escalation 方針の変更 | `docs/dev/workflows/*.md`（derived_design_note） |
 
-## SSOT Routing Table
+## SSOT Routing Table（SSOT ルーティング表）
 
 SSOT 追加時の参照先を集約した索引。AI エージェントは実装着手前に対象トピックの SSOT を本表から確認する。
 カタログの正本は `docs/dev/ssot-registry.md` を参照すること。

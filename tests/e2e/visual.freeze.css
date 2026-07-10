@@ -1,0 +1,52 @@
+/**
+ * visual.freeze.css — shared VRT determinism stylesheet (Issue #1385).
+ *
+ * Test-only. This file MUST NOT be imported by src/style.css or bundled into
+ * the production app. It is intended to be passed to Playwright's
+ * `toHaveScreenshot({ stylePath })` (see tests/e2e/visual-utils.ts) so that
+ * screenshot comparisons are not disturbed by animations, transitions, text
+ * carets, smooth scrolling, or transient evidence-panel content.
+ *
+ * Scope (AC1):
+ * - Suppress animation / transition / caret-color / scroll-behavior on every
+ *   element and pseudo-element, repo-wide.
+ * - Hide ONLY elements explicitly opted in via `data-visual-mask="true"`.
+ *   Do not blanket-hide `role="status"` / `[data-field]` — those are the
+ *   actual VRT subjects and must remain visible so regressions are caught.
+ * - The legacy self-explanation evidence card (`data-self-explanation-card`)
+ *   and other volatile/evidence surfaces opt in via `data-visual-volatile`.
+ */
+
+*,
+*::before,
+*::after {
+  animation: none !important;
+  animation-delay: 0s !important;
+  animation-duration: 0s !important;
+  animation-iteration-count: 1 !important;
+  transition: none !important;
+  transition-delay: 0s !important;
+  transition-duration: 0s !important;
+  caret-color: transparent !important;
+  scroll-behavior: auto !important;
+}
+
+/*
+ * Volatile / evidence surfaces (transient timestamps, playtest evidence
+ * panels, self-explanation cards). These are never the VRT subject, so
+ * hiding them is safe by construction, not by locator luck.
+ */
+[data-self-explanation-card='true'],
+[data-visual-volatile='true'] {
+  visibility: hidden !important;
+}
+
+/*
+ * Scenario-level opt-in mask (AC1, AC3). Scenario fixtures set this
+ * attribute explicitly (e.g. to mask a running-duration field whose display
+ * authority is not yet `elapsedTicks * fixedDeltaMs`). Only elements that
+ * explicitly opt in are hidden — this must never be a blanket field mask.
+ */
+[data-visual-mask='true'] {
+  visibility: hidden !important;
+}
