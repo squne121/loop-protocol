@@ -109,8 +109,10 @@ post-run verifier が canonical gate である。
 `agent_retro_index` の `entries[].report_comment_url` が指す run report と
 同じ GitHub comment chain を、operation 起点で辿れるようにする補完 index である。
 
-checker: `pnpm agent-operation-session-index:check`（`scripts/check-agent-operation-session-index.mjs`）。
-`chatgpt_retro_execution_proof/v1` との関係（#1153 parent closure proof）は
-`docs/dev/agent-run-report.md` の「#1405 Parent Closure Proof Contract」セクションを参照。
+checker は `pnpm agent-operation-session-index:check`（`scripts/check-agent-operation-session-index.mjs`）を使う。
+`chatgpt_retro_execution_proof/v1` との関係、特に #1153 の parent closure proof との結び付きは、
+`docs/dev/agent-run-report.md` の「#1405 Parent Closure Proof Contract」セクションを参照すること。
 
-PR review surface の public verification は、review / review comment / resolved thread の selected object IDs、pagination completeness、projection digest、operation index revalidation 結果を含む `PR_REVIEW_SURFACE_LIVE_PROOF_V1` comment として残す。
+PR review surface の公開検証証跡は、review・review comment・resolved thread それぞれの selected object IDs、
+pagination の完全性、projection digest、operation index の再検証結果を含む
+`PR_REVIEW_SURFACE_LIVE_PROOF_V1` comment として残し、後続 checker が機械的に再確認できる形を維持する。
