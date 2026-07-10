@@ -427,10 +427,18 @@ export function createHudController(
       if (s.result !== null) {
         const durationSec = (s.result.durationMs / 1000).toFixed(1)
         sortieDuration.textContent = `${durationSec}s`
+        // Timer / Volatile Text Policy (Issue #1385): result.durationMs is the
+        // authoritative duration source here, so it is not masked for VRT.
+        sortieDuration.removeAttribute('data-visual-mask')
       } else {
         // running or idle: elapsedTicks / 60 Hz approximation (display only)
         const approxSec = (s.elapsedTicks / 60).toFixed(1)
         sortieDuration.textContent = `${approxSec}s`
+        // Timer / Volatile Text Policy (Issue #1385): this approximation is
+        // NOT the elapsedTicks * fixedDeltaMs display authority, so it is
+        // masked from VRT captures (see tests/e2e/visual.freeze.css) until
+        // the running-duration display is derived from that authority.
+        sortieDuration.setAttribute('data-visual-mask', 'true')
       }
 
       // Result (AC9, AC10): both Canvas overlay and HUD use result.outcome as authority
