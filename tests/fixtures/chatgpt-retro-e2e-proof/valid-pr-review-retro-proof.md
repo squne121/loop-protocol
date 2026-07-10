@@ -185,7 +185,7 @@
   },
   "retrospective_result": {
     "schema": "chatgpt_retrospective_result/v1",
-    "payload_digest": "sha256:6ccee4ac39932309c988247fdf72e520315835c5a3c91101e5eb46e7acd05789",
+    "payload_digest": "sha256:55c74659056736387d0181bb4ace796871c0a861db2346e221a863660e0c44a2",
     "validation_verdict": "pass",
     "verdict": "approve"
   },
@@ -244,8 +244,8 @@
           "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
         }
       ],
-      "claim": "The public-safe operation index payload was revalidated with validateAgentOperationSessionIndex(), and the embedded PR review surface evidence kept review submission, diff review comment, and resolved thread IDs inside a complete pagination boundary.",
-      "recommendation": "Retain the public-safe projection digest and the embedded operation index payload together so future proof checks can fail closed without raw review bodies."
+      "claim": "The public-safe operation index payload was revalidated with validateAgentOperationSessionIndex(), and the embedded PR review surface evidence kept review submission, diff review comment, and resolved thread IDs inside a complete pagination boundary. これは公開安全な投影だけで review surface の再検証が閉じることを示す補足である。",
+      "recommendation": "Retain the public-safe projection digest and the embedded operation index payload together so future proof checks can fail closed without raw review bodies. 将来の proof check でも raw review body を露出せずに fail closed できるよう、この組み合わせを維持する。"
     }
   ],
   "follow_up_issue_candidates": [],
@@ -254,6 +254,7 @@
 ```
 <!-- CHATGPT_RETROSPECTIVE_RESULT_V1 end -->
 
+以下は operation index comment を live fetch したときの public-safe fixture 本文である。
 <!-- LIVE_GITHUB_COMMENT_FIXTURE url=https://github.com/squne121/loop-protocol/pull/1411#issuecomment-4935400001 start -->
 ````text
 <!-- AGENT_OPERATION_SESSION_INDEX_V1 start -->
@@ -391,6 +392,7 @@
 ````
 <!-- LIVE_GITHUB_COMMENT_FIXTURE end -->
 
+以下は PR_REVIEW_SURFACE_LIVE_PROOF_V1 comment を live fetch したときの public-safe fixture 本文である。
 <!-- LIVE_GITHUB_COMMENT_FIXTURE url=https://github.com/squne121/loop-protocol/pull/1423#issuecomment-4939400001 start -->
 ````text
 <!-- PR_REVIEW_SURFACE_LIVE_PROOF_V1 start -->
