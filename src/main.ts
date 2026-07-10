@@ -37,6 +37,7 @@ import {
   startSortie,
 } from './systems'
 import { upgradeDefinitions } from './data/upgrades'
+import { SORTIE_DURATION_MS } from './systems/SortieSystem'
 import {
   configureBattleOverlayFoundation,
   createHudController,
@@ -613,6 +614,292 @@ if (canvas) {
   window.addEventListener('resize', () => resizeArena(state))
 }
 
+// ---------------------------------------------------------------------------
+// Visual scenario fixture (E2E/VRT only, Issue #1385)
+// - Canonical fixture shape: `tests/e2e/visual-utils.ts` type-imports
+//   `VisualScenarioFixture` FROM this module (single source of truth), so
+//   `pnpm typecheck:e2e` catches drift instead of relying on a manually
+//   kept-in-sync mirror.
+// - Honored ONLY when import.meta.env.VITE_E2E_MODE === 'true' — tree-shaken
+//   out of production builds. Production dist/** MUST NOT contain
+//   '__LOOP_VISUAL_SCENARIO__'.
+// - Detected and applied BEFORE `maybeAutoStartRuntime()` (further down):
+//   running maybeAutoStartRuntime() first would call startSortie() and
+//   mutate tick/HP/reward/evidence state that a fixture would then only
+//   partially overwrite (Issue #1385 review, additional指摘6).
+// - While a fixture is active, `frame()` (further down) freezes
+//   `advanceSimulationLoop()` entirely via `visualScenarioActive`, so the
+//   normal RAF simulation loop cannot tick a running fixture's deliberately
+//   -set `elapsedTicks` past `targetTicks` and self-transition running ->
+//   result on the very next frame (Issue #1385 review, Blocker 1).
+// - Takes explicit precedence over legacy __E2E_SHORT_SORTIE__ /
+//   __E2E_PLAYER_HP_OVERRIDE__: when a visual scenario fixture is present,
+//   the legacy flags are ignored (a console warning documents the conflict
+//   instead of silently mixing both fixture sources).
+// ---------------------------------------------------------------------------
+
+/** Named viewport labels a visual scenario fixture may request. `tests/e2e/visual-utils.ts`'s `VIEWPORT_LABELS` is typed `Record<VisualScenarioViewportLabel, ...>`, so adding/removing a label here is a compile error there until kept in sync. */
+export type VisualScenarioViewportLabel = 'desktop-1280x720'
+
+const VISUAL_SCENARIO_VIEWPORT_LABELS: readonly VisualScenarioViewportLabel[] = [
+  'desktop-1280x720',
+]
+
+/** Fixed-step sortie state for the 'running' loopPhase visual scenarios. */
+export interface RunningVisualSortie {
+  status: 'running'
+  elapsedTicks: number
+  fixedDeltaMs: number
+}
+
+/** Terminal sortie state for the 'result' loopPhase visual scenarios. */
+export interface TimeoutVisualSortie {
+  status: 'timeout'
+  elapsedTicks: number
+  fixedDeltaMs: number
+  /** Terminal duration authority (Timer / Volatile Text Policy). */
+  durationMs: number
+  kills: number
+}
+
+interface VisualScenarioFixtureCommon {
+  paused: boolean
+  player: { hp: number; maxHp: number }
+  progress: { resources: number; weaponPower: number }
+  /** Transient HUD copy (status line / last command summary). */
+  telemetry: { status: string; summary: string }
+  /** Fixed label describing the intended capture viewport. */
+  viewportLabel: VisualScenarioViewportLabel
+}
+
+/**
+ * Deterministic visual scenario fixture, installed as
+ * `window.__LOOP_VISUAL_SCENARIO__` before the app's first render (see
+ * `installVisualScenario()` in `tests/e2e/visual-utils.ts`, which
+ * type-imports this interface — this module is the single source of truth
+ * for the fixture contract, Issue #1385 review additional指摘9). A
+ * discriminated union on `name` (additional指摘7) so an invalid
+ * name/loopPhase/sortie-status combination is a compile-time error for
+ * fixture authors, not just a runtime one.
+ */
+export type VisualScenarioFixture =
+  | (VisualScenarioFixtureCommon & {
+      name: 'running-hud'
+      loopPhase: 'running'
+      sortie: RunningVisualSortie
+    })
+  | (VisualScenarioFixtureCommon & {
+      name: 'running-hud-paused'
+      loopPhase: 'running'
+      sortie: RunningVisualSortie
+    })
+  | (VisualScenarioFixtureCommon & {
+      name: 'result-timeout'
+      loopPhase: 'result'
+      sortie: TimeoutVisualSortie
+    })
+  | (VisualScenarioFixtureCommon & {
+      name: 'final-no-command-rail'
+      loopPhase: 'result'
+      sortie: TimeoutVisualSortie
+    })
+
+const VISUAL_SCENARIO_NAMES = [
+  'running-hud',
+  'running-hud-paused',
+  'result-timeout',
+  'final-no-command-rail',
+] as const
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+/**
+ * Runtime validator (Issue #1385 review, additional指摘7): `window.__LOOP_VISUAL_SCENARIO__`
+ * is caller-controlled test-only data, so its compile-time type is not
+ * trusted. Fails closed (throws) on any unknown scenario name, mismatched
+ * loopPhase/sortie shape, or unknown viewportLabel rather than silently
+ * proceeding with a partially-applied or ambiguous fixture.
+ */
+function parseVisualScenarioFixture(raw: unknown): VisualScenarioFixture {
+  if (typeof raw !== 'object' || raw === null) {
+    throw new Error('[visual-scenario] fixture must be an object.')
+  }
+  const fixture = raw as Record<string, unknown>
+
+  if (!VISUAL_SCENARIO_NAMES.includes(fixture.name as (typeof VISUAL_SCENARIO_NAMES)[number])) {
+    throw new Error(`[visual-scenario] unknown scenario name: ${String(fixture.name)}`)
+  }
+  const name = fixture.name as (typeof VISUAL_SCENARIO_NAMES)[number]
+
+  if (typeof fixture.paused !== 'boolean') {
+    throw new Error('[visual-scenario] "paused" must be a boolean.')
+  }
+  if (
+    !VISUAL_SCENARIO_VIEWPORT_LABELS.includes(fixture.viewportLabel as VisualScenarioViewportLabel)
+  ) {
+    throw new Error(`[visual-scenario] unknown viewportLabel: ${String(fixture.viewportLabel)}`)
+  }
+  const viewportLabel = fixture.viewportLabel as VisualScenarioViewportLabel
+
+  const player = fixture.player as Record<string, unknown> | undefined
+  if (!player || !isFiniteNumber(player.hp) || !isFiniteNumber(player.maxHp)) {
+    throw new Error('[visual-scenario] "player.hp"/"player.maxHp" must be finite numbers.')
+  }
+
+  const progress = fixture.progress as Record<string, unknown> | undefined
+  if (!progress || !isFiniteNumber(progress.resources) || !isFiniteNumber(progress.weaponPower)) {
+    throw new Error(
+      '[visual-scenario] "progress.resources"/"progress.weaponPower" must be finite numbers.',
+    )
+  }
+
+  const telemetry = fixture.telemetry as Record<string, unknown> | undefined
+  if (!telemetry || typeof telemetry.status !== 'string' || typeof telemetry.summary !== 'string') {
+    throw new Error('[visual-scenario] "telemetry.status"/"telemetry.summary" must be strings.')
+  }
+
+  const sortie = fixture.sortie as Record<string, unknown> | undefined
+  if (!sortie || !isFiniteNumber(sortie.elapsedTicks) || !isFiniteNumber(sortie.fixedDeltaMs)) {
+    throw new Error(
+      '[visual-scenario] "sortie.elapsedTicks"/"sortie.fixedDeltaMs" must be finite numbers.',
+    )
+  }
+
+  const common: VisualScenarioFixtureCommon = {
+    paused: fixture.paused as boolean,
+    player: { hp: player.hp as number, maxHp: player.maxHp as number },
+    progress: {
+      resources: progress.resources as number,
+      weaponPower: progress.weaponPower as number,
+    },
+    telemetry: { status: telemetry.status as string, summary: telemetry.summary as string },
+    viewportLabel,
+  }
+
+  if (name === 'running-hud' || name === 'running-hud-paused') {
+    if (sortie.status !== 'running') {
+      throw new Error(`[visual-scenario] scenario "${name}" requires sortie.status "running".`)
+    }
+    return {
+      ...common,
+      name,
+      loopPhase: 'running',
+      sortie: {
+        status: 'running',
+        elapsedTicks: sortie.elapsedTicks as number,
+        fixedDeltaMs: sortie.fixedDeltaMs as number,
+      },
+    }
+  }
+
+  if (sortie.status !== 'timeout') {
+    throw new Error(`[visual-scenario] scenario "${name}" requires sortie.status "timeout".`)
+  }
+  if (!isFiniteNumber(sortie.durationMs) || !isFiniteNumber(sortie.kills)) {
+    throw new Error(
+      '[visual-scenario] "sortie.durationMs"/"sortie.kills" must be finite numbers for a timeout scenario.',
+    )
+  }
+  return {
+    ...common,
+    name,
+    loopPhase: 'result',
+    sortie: {
+      status: 'timeout',
+      elapsedTicks: sortie.elapsedTicks as number,
+      fixedDeltaMs: sortie.fixedDeltaMs as number,
+      durationMs: sortie.durationMs as number,
+      kills: sortie.kills as number,
+    },
+  }
+}
+
+/**
+ * Applies a deterministic visual scenario fixture to game state (AC3).
+ * Fixes loopPhase, pause state, sortie state, hull (player hp/maxHp),
+ * resources/upgrades (progress), and transient telemetry copy in a single
+ * synchronous pass. `targetTicks` is set with headroom above both
+ * `elapsedTicks` and the production sortie duration (`SORTIE_DURATION_MS`)
+ * so a running fixture's structural invariant (`elapsedTicks < targetTicks`)
+ * cannot be violated by rounding (Issue #1385 review, Blocker 1); the caller
+ * additionally freezes the RAF simulation loop while a visual scenario is
+ * active (`visualScenarioActive`, see `frame()` below) so `elapsedTicks`
+ * never advances past the fixture's deliberately-set value in the first
+ * place — the `targetTicks` headroom is defense-in-depth, not the only
+ * safeguard.
+ */
+function applyVisualScenarioFixture(fixture: VisualScenarioFixture): void {
+  state.loopPhase = fixture.loopPhase
+  productPause.isPaused = fixture.paused
+  state.player.hp = fixture.player.hp
+  state.player.maxHp = fixture.player.maxHp
+  state.progress.resources = fixture.progress.resources
+  state.progress.weaponPower = fixture.progress.weaponPower
+  state.telemetry.status = fixture.telemetry.status
+  state.telemetry.lastCommandSummary = fixture.telemetry.summary
+
+  if (fixture.sortie.status === 'timeout') {
+    state.sortie = {
+      status: 'timeout',
+      elapsedTicks: fixture.sortie.elapsedTicks,
+      targetTicks: fixture.sortie.elapsedTicks,
+      result: {
+        outcome: 'timeout',
+        endReason: 'timeout',
+        durationMs: fixture.sortie.durationMs,
+        kills: fixture.sortie.kills,
+        shotsFired: state.player.shotsFired,
+        playerHpRemaining: fixture.player.hp,
+      },
+    }
+    return
+  }
+
+  state.sortie = {
+    status: 'running',
+    elapsedTicks: fixture.sortie.elapsedTicks,
+    targetTicks: Math.max(
+      fixture.sortie.elapsedTicks + 1,
+      Math.ceil(SORTIE_DURATION_MS / fixture.sortie.fixedDeltaMs),
+    ),
+    result: null,
+  }
+}
+
+// Detected BEFORE maybeAutoStartRuntime() (below) so a visual scenario
+// fixture — not the normal E2E auto-start — is the sole authority over
+// loopPhase/sortie/player/progress/telemetry state (Issue #1385 review,
+// additional指摘6).
+let visualScenarioActive = false
+
+if (import.meta.env.VITE_E2E_MODE === 'true') {
+  const e2eScenarioFlag = window as Window & { __LOOP_VISUAL_SCENARIO__?: unknown }
+
+  if (e2eScenarioFlag.__LOOP_VISUAL_SCENARIO__ !== undefined) {
+    const legacyFlags = window as Window & {
+      __E2E_SHORT_SORTIE__?: boolean
+      __E2E_PLAYER_HP_OVERRIDE__?: number
+    }
+    if (
+      legacyFlags.__E2E_SHORT_SORTIE__ === true ||
+      typeof legacyFlags.__E2E_PLAYER_HP_OVERRIDE__ === 'number'
+    ) {
+      // Documented precedence (Issue #1385): __LOOP_VISUAL_SCENARIO__ fully
+      // determines phase/sortie/player/progress/telemetry state, so legacy
+      // E2E flags are ignored rather than silently combined.
+      console.warn(
+        '[visual-scenario] __LOOP_VISUAL_SCENARIO__ takes precedence over ' +
+          '__E2E_SHORT_SORTIE__ / __E2E_PLAYER_HP_OVERRIDE__; legacy flags ignored.',
+      )
+    }
+    const fixture = parseVisualScenarioFixture(e2eScenarioFlag.__LOOP_VISUAL_SCENARIO__)
+    visualScenarioActive = true
+    applyVisualScenarioFixture(fixture)
+  }
+}
+
 // AC2: Escape key toggles pause/resume; event.repeat guard prevents multi-toggle on held key
 // AC3: P key only when canvas has focus (document.activeElement === canvas) — WCAG 2.1.4
 // AC8: visibilitychange hidden → auto-pause during running phase only; visible → no auto-resume
@@ -644,130 +931,36 @@ if (app) {
     // AC8: visible restoration does NOT auto-resume
   })
 
-  maybeAutoStartRuntime()
-}
-
-
-// ---------------------------------------------------------------------------
-// Visual scenario fixture (E2E/VRT only, Issue #1385)
-// - Mirrors VisualScenarioFixture in tests/e2e/visual-utils.ts. Kept in sync
-//   manually: that module is test-only (imports @playwright/test) and is
-//   never imported from src/, so the production bundle never depends on it.
-// - Honored ONLY when import.meta.env.VITE_E2E_MODE === 'true' — tree-shaken
-//   out of production builds, matching the __LOOP_E2E__ / legacy E2E flag
-//   pattern below. Production dist/** MUST NOT contain
-//   '__LOOP_VISUAL_SCENARIO__'.
-// - Read exactly once, synchronously, in the block below — before the first
-//   requestAnimationFrame render (the `frame()` bootstrap further down).
-// - Takes explicit precedence over legacy __E2E_SHORT_SORTIE__ /
-//   __E2E_PLAYER_HP_OVERRIDE__: when a visual scenario fixture is present,
-//   the legacy flags are ignored (a console warning documents the conflict
-//   instead of silently mixing both fixture sources).
-// ---------------------------------------------------------------------------
-
-/** Mirrors VisualScenarioName in tests/e2e/visual-utils.ts. */
-type VisualScenarioName =
-  | 'running-hud'
-  | 'running-hud-paused'
-  | 'result-timeout'
-  | 'final-no-command-rail'
-
-/** Mirrors VisualScenarioFixture in tests/e2e/visual-utils.ts. */
-interface VisualScenarioFixture {
-  name: VisualScenarioName
-  loopPhase: 'preparation' | 'running' | 'result'
-  paused: boolean
-  sortie: {
-    status: 'running' | 'timeout'
-    elapsedTicks: number
-    fixedDeltaMs: number
-    durationMs?: number
-    kills: number
-  }
-  player: { hp: number; maxHp: number }
-  progress: { resources: number; weaponPower: number }
-  telemetry: { status: string; summary: string }
-  viewportLabel: string
-  visualMask?: { duration?: boolean; evidencePanel?: boolean }
-}
-
-/**
- * Applies a deterministic visual scenario fixture to game state (AC3).
- * Fixes loopPhase, pause state, sortie state, hull (player hp/maxHp),
- * resources/upgrades (progress), and transient telemetry copy in a single
- * synchronous pass.
- */
-function applyVisualScenarioFixture(fixture: VisualScenarioFixture): void {
-  state.loopPhase = fixture.loopPhase
-  productPause.isPaused = fixture.paused
-  state.player.hp = fixture.player.hp
-  state.player.maxHp = fixture.player.maxHp
-  state.progress.resources = fixture.progress.resources
-  state.progress.weaponPower = fixture.progress.weaponPower
-  state.telemetry.status = fixture.telemetry.status
-  state.telemetry.lastCommandSummary = fixture.telemetry.summary
-
-  if (fixture.sortie.status === 'timeout') {
-    state.sortie = {
-      status: 'timeout',
-      elapsedTicks: fixture.sortie.elapsedTicks,
-      targetTicks: fixture.sortie.elapsedTicks,
-      result: {
-        outcome: 'timeout',
-        endReason: 'timeout',
-        durationMs:
-          fixture.sortie.durationMs ?? fixture.sortie.elapsedTicks * fixture.sortie.fixedDeltaMs,
-        kills: fixture.sortie.kills,
-        shotsFired: state.player.shotsFired,
-        playerHpRemaining: fixture.player.hp,
-      },
-    }
-    return
-  }
-
-  state.sortie = {
-    status: 'running',
-    elapsedTicks: fixture.sortie.elapsedTicks,
-    targetTicks: fixture.sortie.elapsedTicks,
-    result: null,
-  }
-}
-
-// E2E compile-time fixture overrides — only active in VITE_E2E_MODE builds.
-// These are injected via page.addInitScript() in Playwright tests before the
-// page script runs. Window flags are read once at initialisation time.
-if (import.meta.env.VITE_E2E_MODE === 'true') {
-  const e2eFlags = window as Window & {
-    __E2E_SHORT_SORTIE__?: boolean
-    __E2E_PLAYER_HP_OVERRIDE__?: number
-    __LOOP_VISUAL_SCENARIO__?: VisualScenarioFixture
-  }
-
-  const visualScenario = e2eFlags.__LOOP_VISUAL_SCENARIO__
-
-  if (visualScenario) {
-    if (
-      e2eFlags.__E2E_SHORT_SORTIE__ === true ||
-      typeof e2eFlags.__E2E_PLAYER_HP_OVERRIDE__ === 'number'
-    ) {
-      // Documented precedence (Issue #1385): __LOOP_VISUAL_SCENARIO__ fully
-      // determines phase/sortie/player/progress/telemetry state, so legacy
-      // E2E flags are ignored rather than silently combined.
-      console.warn(
-        '[visual-scenario] __LOOP_VISUAL_SCENARIO__ takes precedence over ' +
-          '__E2E_SHORT_SORTIE__ / __E2E_PLAYER_HP_OVERRIDE__; legacy flags ignored.',
-      )
-    }
-    applyVisualScenarioFixture(visualScenario)
+  if (visualScenarioActive) {
+    // The visual scenario fixture (detected above, before any auto-start
+    // side effect) is already applied — do not auto-start a sortie or
+    // double-apply legacy E2E overrides on top of it (Issue #1385 review,
+    // additional指摘6).
   } else {
-    // Short sortie: override targetTicks to ~0.5s for deterministic timeout E2E
-    if (e2eFlags.__E2E_SHORT_SORTIE__ === true && state.loopPhase === 'running' && state.sortie.status === 'running') {
-      state.sortie.targetTicks = Math.ceil(500 / defaultSimulationConfig.fixedDeltaMs)
-    }
-    // Player HP override: set hp/maxHp for deterministic defeat E2E
-    if (typeof e2eFlags.__E2E_PLAYER_HP_OVERRIDE__ === 'number') {
-      state.player.hp = e2eFlags.__E2E_PLAYER_HP_OVERRIDE__
-      state.player.maxHp = e2eFlags.__E2E_PLAYER_HP_OVERRIDE__
+    maybeAutoStartRuntime()
+
+    // E2E compile-time legacy fixture overrides — only active in
+    // VITE_E2E_MODE builds, and only when no visual scenario fixture is
+    // present. Only meaningful once maybeAutoStartRuntime() has possibly
+    // transitioned to 'running'.
+    if (import.meta.env.VITE_E2E_MODE === 'true') {
+      const legacyFlags = window as Window & {
+        __E2E_SHORT_SORTIE__?: boolean
+        __E2E_PLAYER_HP_OVERRIDE__?: number
+      }
+      // Short sortie: override targetTicks to ~0.5s for deterministic timeout E2E
+      if (
+        legacyFlags.__E2E_SHORT_SORTIE__ === true &&
+        state.loopPhase === 'running' &&
+        state.sortie.status === 'running'
+      ) {
+        state.sortie.targetTicks = Math.ceil(500 / defaultSimulationConfig.fixedDeltaMs)
+      }
+      // Player HP override: set hp/maxHp for deterministic defeat E2E
+      if (typeof legacyFlags.__E2E_PLAYER_HP_OVERRIDE__ === 'number') {
+        state.player.hp = legacyFlags.__E2E_PLAYER_HP_OVERRIDE__
+        state.player.maxHp = legacyFlags.__E2E_PLAYER_HP_OVERRIDE__
+      }
     }
   }
 }
@@ -786,7 +979,10 @@ function frame(now: number): void {
   // AC4: while paused, do not advance the simulation accumulator.
   // Pass deltaMs=0 so advanceSimulationLoop executes 0 steps.
   // The accumulator is also reset on pause entry (below) to prevent catch-up.
-  if (!productPause.isPaused) {
+  // BLOCKER 1 (Issue #1385 review): also freeze while a visual scenario
+  // fixture is active — a running fixture's `elapsedTicks` is deliberately
+  // set and must not be advanced by the ordinary RAF simulation loop.
+  if (!productPause.isPaused && !visualScenarioActive) {
     const result = advanceSimulationLoop(
       accumulatorMs,
       deltaMs,
@@ -795,8 +991,9 @@ function frame(now: number): void {
     )
     accumulatorMs = result.accumulatorMs
   } else {
-    // AC5: reset accumulator each frame while paused so wall-clock duration
-    // does not build up and trigger catch-up steps on resume.
+    // AC5: reset accumulator each frame while paused or visual-scenario
+    // -frozen so wall-clock duration does not build up and trigger
+    // catch-up steps on resume.
     accumulatorMs = 0
   }
 
