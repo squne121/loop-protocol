@@ -648,6 +648,91 @@ if (app) {
 }
 
 
+// ---------------------------------------------------------------------------
+// Visual scenario fixture (E2E/VRT only, Issue #1385)
+// - Mirrors VisualScenarioFixture in tests/e2e/visual-utils.ts. Kept in sync
+//   manually: that module is test-only (imports @playwright/test) and is
+//   never imported from src/, so the production bundle never depends on it.
+// - Honored ONLY when import.meta.env.VITE_E2E_MODE === 'true' — tree-shaken
+//   out of production builds, matching the __LOOP_E2E__ / legacy E2E flag
+//   pattern below. Production dist/** MUST NOT contain
+//   '__LOOP_VISUAL_SCENARIO__'.
+// - Read exactly once, synchronously, in the block below — before the first
+//   requestAnimationFrame render (the `frame()` bootstrap further down).
+// - Takes explicit precedence over legacy __E2E_SHORT_SORTIE__ /
+//   __E2E_PLAYER_HP_OVERRIDE__: when a visual scenario fixture is present,
+//   the legacy flags are ignored (a console warning documents the conflict
+//   instead of silently mixing both fixture sources).
+// ---------------------------------------------------------------------------
+
+/** Mirrors VisualScenarioName in tests/e2e/visual-utils.ts. */
+type VisualScenarioName =
+  | 'running-hud'
+  | 'running-hud-paused'
+  | 'result-timeout'
+  | 'final-no-command-rail'
+
+/** Mirrors VisualScenarioFixture in tests/e2e/visual-utils.ts. */
+interface VisualScenarioFixture {
+  name: VisualScenarioName
+  loopPhase: 'preparation' | 'running' | 'result'
+  paused: boolean
+  sortie: {
+    status: 'running' | 'timeout'
+    elapsedTicks: number
+    fixedDeltaMs: number
+    durationMs?: number
+    kills: number
+  }
+  player: { hp: number; maxHp: number }
+  progress: { resources: number; weaponPower: number }
+  telemetry: { status: string; summary: string }
+  viewportLabel: string
+  visualMask?: { duration?: boolean; evidencePanel?: boolean }
+}
+
+/**
+ * Applies a deterministic visual scenario fixture to game state (AC3).
+ * Fixes loopPhase, pause state, sortie state, hull (player hp/maxHp),
+ * resources/upgrades (progress), and transient telemetry copy in a single
+ * synchronous pass.
+ */
+function applyVisualScenarioFixture(fixture: VisualScenarioFixture): void {
+  state.loopPhase = fixture.loopPhase
+  productPause.isPaused = fixture.paused
+  state.player.hp = fixture.player.hp
+  state.player.maxHp = fixture.player.maxHp
+  state.progress.resources = fixture.progress.resources
+  state.progress.weaponPower = fixture.progress.weaponPower
+  state.telemetry.status = fixture.telemetry.status
+  state.telemetry.lastCommandSummary = fixture.telemetry.summary
+
+  if (fixture.sortie.status === 'timeout') {
+    state.sortie = {
+      status: 'timeout',
+      elapsedTicks: fixture.sortie.elapsedTicks,
+      targetTicks: fixture.sortie.elapsedTicks,
+      result: {
+        outcome: 'timeout',
+        endReason: 'timeout',
+        durationMs:
+          fixture.sortie.durationMs ?? fixture.sortie.elapsedTicks * fixture.sortie.fixedDeltaMs,
+        kills: fixture.sortie.kills,
+        shotsFired: state.player.shotsFired,
+        playerHpRemaining: fixture.player.hp,
+      },
+    }
+    return
+  }
+
+  state.sortie = {
+    status: 'running',
+    elapsedTicks: fixture.sortie.elapsedTicks,
+    targetTicks: fixture.sortie.elapsedTicks,
+    result: null,
+  }
+}
+
 // E2E compile-time fixture overrides — only active in VITE_E2E_MODE builds.
 // These are injected via page.addInitScript() in Playwright tests before the
 // page script runs. Window flags are read once at initialisation time.
@@ -655,15 +740,35 @@ if (import.meta.env.VITE_E2E_MODE === 'true') {
   const e2eFlags = window as Window & {
     __E2E_SHORT_SORTIE__?: boolean
     __E2E_PLAYER_HP_OVERRIDE__?: number
+    __LOOP_VISUAL_SCENARIO__?: VisualScenarioFixture
   }
-  // Short sortie: override targetTicks to ~0.5s for deterministic timeout E2E
-  if (e2eFlags.__E2E_SHORT_SORTIE__ === true && state.loopPhase === 'running' && state.sortie.status === 'running') {
-    state.sortie.targetTicks = Math.ceil(500 / defaultSimulationConfig.fixedDeltaMs)
-  }
-  // Player HP override: set hp/maxHp for deterministic defeat E2E
-  if (typeof e2eFlags.__E2E_PLAYER_HP_OVERRIDE__ === 'number') {
-    state.player.hp = e2eFlags.__E2E_PLAYER_HP_OVERRIDE__
-    state.player.maxHp = e2eFlags.__E2E_PLAYER_HP_OVERRIDE__
+
+  const visualScenario = e2eFlags.__LOOP_VISUAL_SCENARIO__
+
+  if (visualScenario) {
+    if (
+      e2eFlags.__E2E_SHORT_SORTIE__ === true ||
+      typeof e2eFlags.__E2E_PLAYER_HP_OVERRIDE__ === 'number'
+    ) {
+      // Documented precedence (Issue #1385): __LOOP_VISUAL_SCENARIO__ fully
+      // determines phase/sortie/player/progress/telemetry state, so legacy
+      // E2E flags are ignored rather than silently combined.
+      console.warn(
+        '[visual-scenario] __LOOP_VISUAL_SCENARIO__ takes precedence over ' +
+          '__E2E_SHORT_SORTIE__ / __E2E_PLAYER_HP_OVERRIDE__; legacy flags ignored.',
+      )
+    }
+    applyVisualScenarioFixture(visualScenario)
+  } else {
+    // Short sortie: override targetTicks to ~0.5s for deterministic timeout E2E
+    if (e2eFlags.__E2E_SHORT_SORTIE__ === true && state.loopPhase === 'running' && state.sortie.status === 'running') {
+      state.sortie.targetTicks = Math.ceil(500 / defaultSimulationConfig.fixedDeltaMs)
+    }
+    // Player HP override: set hp/maxHp for deterministic defeat E2E
+    if (typeof e2eFlags.__E2E_PLAYER_HP_OVERRIDE__ === 'number') {
+      state.player.hp = e2eFlags.__E2E_PLAYER_HP_OVERRIDE__
+      state.player.maxHp = e2eFlags.__E2E_PLAYER_HP_OVERRIDE__
+    }
   }
 }
 
