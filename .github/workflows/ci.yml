@@ -1238,6 +1238,22 @@ jobs:
           printf '{"step_id":"pytest_node_backed_hook_tests","phase_id":"pytest_node_backed_hooks","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
+      - name: pytest_session_recording_codex_hook_adapter (timed)
+        # Issue #1420 fix_delta 2: dedicated node-backed-hook-tests lane for
+        # tests/session_recording/codex/test_hook_adapter.py. This job already
+        # runs pnpm install, so the Node child-process dependency
+        # (codex-hook-adapter.mjs / ajv / ajv-formats) is available here.
+        # Independent of the fixed 2-nodeid disjointness/exact-match invariant
+        # check below (do not touch that block).
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest -q tests/session_recording/codex/test_hook_adapter.py -p no:xdist
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_session_recording_codex_hook_adapter","phase_id":"pytest_session_recording_codex_hook_adapter","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
       - name: node --test session_manifest_debounce (AC4/AC6, Node 22) (timed)
         # Issue #1141 AC6: virtual-clock unit tests for flushLoop DI core.
         # Node 22 is guaranteed by the setup-node-pnpm composite action (default

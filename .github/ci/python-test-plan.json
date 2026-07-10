@@ -34,8 +34,7 @@
     "scripts/tests/test_e501_migration_guard.py",
     "tests/context_mode/",
     "tests/test_summarize_agent_transcript.py",
-    "tests/agent_ops/",
-    "tests/session_recording/codex/test_hook_adapter.py"
+    "tests/agent_ops/"
   ],
   "ignore": [
     ".claude/hooks/tests/test_secret_boundary_contract.py"
@@ -57,6 +56,12 @@
         "lane_id": "codex-execpolicy",
         "paths": [
           "tests/codex/test_local_main_branch_guard.py"
+        ]
+      },
+      {
+        "provider_job": "node-backed-hook-tests",
+        "paths": [
+          "tests/session_recording/codex/test_hook_adapter.py"
         ]
       }
     ]
