@@ -449,3 +449,53 @@ hook_coexistence_pass_requires:
 - `docs/dev/secret-policy.md` は変更しない。
 - real prompt / real trace export / real Cloud pilot は禁止のままとする。
 - `unsupported` / `unverified` は失敗ではなく Child C0/C1 の input availability として扱う。
+
+## #1405 Parent Closure Proof Contract / #1153 親 Issue クロージャ証明契約
+
+This section defines the parent closure proof contract for #1153（本節は #1153 の親 Issue クロージャ証明契約を定義する）。
+
+`agent_operation_session_index/v1`（`docs/schemas/agent-operation-session-index.schema.json`）は、
+1 件の Issue / PR operation と、その operation を裏付ける `agent_run_report/v1` GitHub comment・
+`agent_retro_index/v1` GitHub comment・`CHATGPT_RETRO_CONTEXT_V1` marker comment を接続する
+public-safe index である。#1405 はこの index と `chatgpt_retro_execution_proof/v1`
+（`docs/schemas/chatgpt-retro-execution-proof.schema.json`）を追加し、
+「ChatGPT が GitHub connector だけでレトロスペクティブ可能である」ことの
+synthetic route proof（`evidence_mode: synthetic_route_proof`）を machine-readable に閉じる。
+
+#1153 の parent closure rule に、以下の `retro_e2e_proof_required` 契約を追加する。
+
+```yaml
+retro_e2e_proof_required:
+  required: true
+  minimum_targets:
+    issue_operation: 1
+    pull_request_operation: 1
+  required_artifacts:
+    - agent_operation_session_index/v1
+    - agent_run_report/v1 GitHub comment
+    - agent_retro_index/v1 GitHub comment
+    - CHATGPT_RETRO_CONTEXT_V1 GitHub marker comment
+    - chatgpt_retro_execution_proof/v1
+    - chatgpt_retrospective_result/v1
+  required_resolver_status: resolved
+  chatgpt_access_boundary:
+    github_connector_only: true
+    local_file_access_used: false
+    latitude_direct_access_used: false
+    raw_trace_access_used: false
+  safety:
+    raw_values_emitted: false
+    forbidden_fields_scan: pass
+  real_capture_claim_allowed: false
+```
+
+- #1153 を close する前に、少なくとも 1 件の Issue target と 1 件の PR target
+  （`operation.kind: pr_comment` 限定。`pr_review` / `pr_review_addressed` は resolver 対応後の follow-up）
+  で live GitHub comment chain を作成し、`resolve-live status: resolved` と
+  ChatGPT connector-only retrospective result を GitHub 上に残すこと（本 Issue の Runtime Verification
+  Applicability は `deferred`。live 検証証跡は PR verification comment として任意に添付し、CI 必須条件にはしない）。
+- `evidence_mode: synthetic_route_proof` は real Latitude / EntireCLI / Cloud pilot 証明ではない。
+  `real_pilot_verified` は #1220 `LATITUDE_PILOT_EXCEPTION_V1` が `approve_timeboxed_real_pilot` であり、
+  かつ #1261 の distribution / argv / remote cleanup gate が machine-verified である場合のみ許可する。
+- checker: `pnpm agent-operation-session-index:check` / `pnpm chatgpt-retro-e2e-proof:check`
+  （`scripts/check-agent-operation-session-index.mjs` / `scripts/check-chatgpt-retro-e2e-proof.mjs`）
