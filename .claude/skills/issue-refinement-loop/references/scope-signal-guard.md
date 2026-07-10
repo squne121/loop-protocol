@@ -155,11 +155,15 @@ scope_signal_delta_input:
 - `after_body`: proposed rewrite body または fixture が与える candidate body
 - `source_refs.*`: issue URL / artifact path / fixture path / comment id の provenance
 - planner が projection を `evidence_spans` へ写す場合も、`body_version` に対応する `source_ref` を保持する
-- `run_refinement_preflight.py` の preflight producer は hard-stop 対象 phase で `scope_signal_delta_input` を省略せず、少なくとも current body を `before/current/after` に束ねた baseline 付き payload を渡す。producer が payload を供給できない状態で `new_allowed_path_layer` 判定だけを legacy fallback に戻してはならない
+- `run_refinement_preflight.py` の preflight producer は hard-stop 対象 phase で immutable previous snapshot を baseline として使う。`before=current=after` を自動生成してはならない
+- previous snapshot が未保存の初回実行では `scope_signal_delta_input` を捏造せず、省略したまま planner の `missing_scope_signal_delta_input` fail-closed に委ねる
+- `source_refs.before/current/after` は `.claude/artifacts/issue-refinement-loop/<issue>/snapshots/` 配下の immutable artifact ref を使い、同じ body でも previous と current の provenance を区別できるようにする
 
 `new_allowed_path_layer` は `after.allowed_path_layers - before.allowed_path_layers` が非空の場合のみ発火する。既存 layer の再掲、並び替え、空白差分、fenced code 内の path mention は signal にしない。
 
 planner が `REFINEMENT_LOOP_PLAN_V1.decisions.scope_signal_guard.evidence_spans` へ写す delta provenance は、`source: known_context` を使い、`body_version` / `coordinate_space: body_absolute_1_based` / `source_ref` を併記する。line number は source body 全体に対する 1-based absolute line を使い、`text_sha256` はその raw line を hash した値と一致させる。
+
+`scope_signal_delta.py` は GFM subset scanner を共有し、`Acceptance Criteria` / `Allowed Paths` / `In Scope` の semantic extractor には fence 外 raw line だけを渡す。0〜3 space indent の H2、closing hashes 付き H2、backtick / tilde fence、opener 以上の closer 長、4-space indent の非-fence を区別して扱う。
 
 ### 単一パス文字列内の複数 prefix 判定ルール（Issue #1327）
 
@@ -193,7 +197,7 @@ scope_signal_guard_decision_v2:
   scope_delta_approval:
     present: true | false
     valid: true | false
-    status: missing | missing_marker | invalid_scope_delta_approval | approved | not_required
+    status: missing | missing_marker | invalid_scope_delta_approval | approved_by_trusted_anchor | fail_closed | not_required
     missing_approval_field: true | false
     suggested_contract_patch: <string | null>
     comment_id: <int | null>

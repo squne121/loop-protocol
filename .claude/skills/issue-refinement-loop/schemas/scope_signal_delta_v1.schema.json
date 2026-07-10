@@ -177,6 +177,7 @@
       "required": [
         "body_version",
         "source_ref",
+        "coordinate_space",
         "start_line",
         "end_line",
         "text_sha256"
@@ -202,6 +203,12 @@
         "text_sha256": {
           "type": "string",
           "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "coordinate_space": {
+          "type": "string",
+          "enum": [
+            "body_absolute_1_based"
+          ]
         },
         "source_ref": {
           "type": [

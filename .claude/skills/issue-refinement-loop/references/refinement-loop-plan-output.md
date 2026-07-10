@@ -156,6 +156,7 @@
 - `malformed_machine_readable_contract`: YAML block に `contract_schema_version` がない
 - `missing_required_section`: Outcome などの重要 section がない
 - `missing_required_contract_key`: Machine-Readable Contract に必須 key がない
+- `missing_scope_signal_delta_input`: hard-stop phase で immutable baseline 付き `scope_signal_delta_input` を供給できなかった
 - `unknown_input_schema`: 入力が `REFINEMENT_LOOP_PLANNER_INPUT_V1` に一致しない
 - `planner_internal_error`: planner 実行中に予期しない例外が起きた
 - `unknown_issue_kind`: `issue_kind` が SSOT allowlist にない
@@ -206,6 +207,10 @@
 - `override_policy.never_override_reason_codes`: 人間指示があっても override できない reason code
 - `max_rewrite_attempts`: loop router が強制する rewrite 上限
 - `no_progress_route`: rewrite しても前進しないときの遷移先
+
+## `scope_signal_guard_decision_v2` の schema 注記
+
+`scope_signal_guard_decision_v2` は任意 object ではなく、`raw_signal` / `scope_context` / `scope_delta_approval` / `security_sensitive` / `route` を必須とする strict schema です。`scope_delta_authority` を含む場合も nested object は `additionalProperties: false` で拘束され、unknown enum や欠落 field は schema validation で reject されます。
 
 ## `human_decision_reframe` override contract（人間判断 override 契約）
 

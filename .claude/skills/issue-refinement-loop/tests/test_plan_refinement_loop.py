@@ -135,15 +135,18 @@ def run_planner(input_data: dict[str, Any]) -> tuple[dict[str, Any], int]:
 def normalize_legacy_scope_signal_golden(
     fixture_name: str, golden: dict[str, Any], output: dict[str, Any]
 ) -> dict[str, Any]:
-    """Keep historical goldens stable while absolute issue-body coordinates migrate.
+    """Patch the two legacy goldens to fixed body-absolute line numbers.
 
-    Issue #1413 changes legacy scope-signal evidence to body-absolute line numbers.
-    The old goldens for the legacy issue_body path encoded section-relative `1`.
-    Those fixtures are outside the current Allowed Paths, so the comparison here
-    normalizes the two known legacy fixtures to the runtime-produced absolute lines.
-    Dedicated regression tests assert the absolute coordinates directly.
+    The golden JSON fixtures live outside Issue #1413 Allowed Paths, so this
+    helper performs a deterministic in-test normalization instead of mutating
+    those files. The expected line values are fixed from the source fixtures,
+    not copied from runtime output.
     """
-    if fixture_name not in {"anchor_reframe_exclusion", "new_in_scope_area"}:
+    expected_lines = {
+        "anchor_reframe_exclusion": 19,
+        "new_in_scope_area": 19,
+    }
+    if fixture_name not in expected_lines:
         return golden
 
     normalized = json.loads(json.dumps(golden))
@@ -152,14 +155,9 @@ def normalize_legacy_scope_signal_golden(
         .get("scope_signal_guard", {})
         .get("evidence_spans", [])
     )
-    output_spans = (
-        output.get("decisions", {})
-        .get("scope_signal_guard", {})
-        .get("evidence_spans", [])
-    )
-    if golden_spans and output_spans:
-        golden_spans[0]["start_line"] = output_spans[0]["start_line"]
-        golden_spans[0]["end_line"] = output_spans[0]["end_line"]
+    if golden_spans:
+        golden_spans[0]["start_line"] = expected_lines[fixture_name]
+        golden_spans[0]["end_line"] = expected_lines[fixture_name]
     return normalized
 
 

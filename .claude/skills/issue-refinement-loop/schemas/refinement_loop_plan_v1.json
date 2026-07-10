@@ -316,7 +316,7 @@
       }
     },
     "scope_signal_guard_decision_v2": {
-      "type": "object"
+      "$ref": "#/definitions/ScopeSignalGuardDecisionV2"
     },
     "fail_closed": {
       "type": "object",
@@ -338,6 +338,7 @@
               "malformed_machine_readable_contract",
               "missing_required_section",
               "ambiguous_scope_signal",
+              "missing_scope_signal_delta_input",
               "unknown_input_schema",
               "planner_internal_error",
               "missing_required_contract_key",
@@ -412,6 +413,379 @@
         "text_sha256": {
           "type": "string",
           "pattern": "^[a-f0-9]{64}$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "source": {
+                "const": "known_context"
+              }
+            },
+            "required": [
+              "source"
+            ]
+          },
+          "then": {
+            "required": [
+              "body_version",
+              "coordinate_space"
+            ]
+          }
+        }
+      ]
+    },
+    "ScopeSignalGuardDecisionV2": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "raw_signal",
+        "scope_context",
+        "scope_delta_approval",
+        "security_sensitive",
+        "route"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "const": "SCOPE_SIGNAL_GUARD_DECISION_V2"
+        },
+        "raw_signal": {
+          "type": "object",
+          "required": [
+            "triggered",
+            "reason_code"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "triggered": {
+              "type": "boolean"
+            },
+            "reason_code": {
+              "type": "string",
+              "enum": [
+                "new_in_scope_area",
+                "new_allowed_path_layer",
+                "new_unverifiable_ac",
+                "no_scope_signal"
+              ]
+            }
+          }
+        },
+        "scope_context": {
+          "type": "object",
+          "required": [
+            "path_layer"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "path_layer": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "runtime",
+                  "docs",
+                  "skill",
+                  "hook",
+                  "agent",
+                  "test_fixture",
+                  "unknown"
+                ]
+              }
+            }
+          }
+        },
+        "scope_delta_approval": {
+          "type": "object",
+          "required": [
+            "present",
+            "valid",
+            "status",
+            "missing_approval_field",
+            "suggested_contract_patch",
+            "comment_id",
+            "comment_url",
+            "body_sha256",
+            "author_association",
+            "created_at",
+            "issue_url",
+            "required_rerun"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "present": {
+              "type": "boolean"
+            },
+            "valid": {
+              "type": "boolean"
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "missing",
+                "missing_marker",
+                "invalid_scope_delta_approval",
+                "approved_by_trusted_anchor",
+                "fail_closed",
+                "not_required"
+              ]
+            },
+            "missing_approval_field": {
+              "type": "boolean"
+            },
+            "suggested_contract_patch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "comment_id": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "comment_url": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "body_sha256": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "author_association": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "created_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "issue_url": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "required_rerun": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "security_sensitive": {
+          "type": "boolean"
+        },
+        "route": {
+          "type": "string",
+          "enum": [
+            "proceed_with_notes",
+            "human_judgment_required",
+            "security_risk_gate_required",
+            "invalid_scope_delta_approval",
+            "not_triggered"
+          ]
+        },
+        "scope_delta_authority": {
+          "type": "object",
+          "required": [
+            "schema_version",
+            "authority_category",
+            "provenance",
+            "directive",
+            "boundary_flags",
+            "route"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "schema_version": {
+              "type": "string",
+              "const": "SCOPE_DELTA_AUTHORITY_V1"
+            },
+            "authority_category": {
+              "type": "string",
+              "enum": [
+                "ai_inferred",
+                "human_review_directive",
+                "existing_parent_contract",
+                "related_issue_dependency"
+              ]
+            },
+            "provenance": {
+              "type": "object",
+              "required": [
+                "source_kind",
+                "source_ref",
+                "body_sha256",
+                "author_association"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "source_kind": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "issue_comment",
+                    "pull_request_review",
+                    "parent_issue",
+                    "related_issue",
+                    "generated_by_agent",
+                    null
+                  ]
+                },
+                "source_ref": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "body_sha256": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "author_association": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "OWNER",
+                    "MEMBER",
+                    "COLLABORATOR",
+                    "CONTRIBUTOR",
+                    "NONE",
+                    null
+                  ]
+                }
+              }
+            },
+            "directive": {
+              "type": "object",
+              "required": [
+                "confidence",
+                "extracted_markers"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "confidence": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "explicit",
+                    "ambiguous",
+                    "conflicting",
+                    "inferred",
+                    null
+                  ]
+                },
+                "extracted_markers": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "boundary_flags": {
+              "type": "object",
+              "required": [
+                "expands_allowed_paths",
+                "changes_permission_boundary",
+                "changes_external_service_boundary",
+                "destructive_or_non_idempotent_operation",
+                "requires_issue_split"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "expands_allowed_paths": {
+                  "type": "boolean"
+                },
+                "changes_permission_boundary": {
+                  "type": "boolean"
+                },
+                "changes_external_service_boundary": {
+                  "type": "boolean"
+                },
+                "destructive_or_non_idempotent_operation": {
+                  "type": "boolean"
+                },
+                "requires_issue_split": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "route": {
+              "type": "object",
+              "required": [
+                "action",
+                "reason_code",
+                "implementation_allowed",
+                "next_step"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "type": "string",
+                  "enum": [
+                    "contract_update_required",
+                    "human_escalation",
+                    "not_triggered"
+                  ]
+                },
+                "reason_code": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "explicit_human_contract_directive",
+                    "ambiguous_human_directive",
+                    "conflicting_human_directives",
+                    "requires_issue_split",
+                    "expands_allowed_paths",
+                    "changes_permission_boundary",
+                    "changes_external_service_boundary",
+                    "destructive_or_non_idempotent_operation",
+                    "ai_inferred_scope_delta",
+                    "untrusted_author_association",
+                    null
+                  ]
+                },
+                "implementation_allowed": {
+                  "type": "boolean"
+                },
+                "next_step": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "rerun_refinement_after_contract_update",
+                    null
+                  ]
+                }
+              }
+            }
+          }
         }
       }
     },

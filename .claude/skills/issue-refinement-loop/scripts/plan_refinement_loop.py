@@ -38,10 +38,17 @@ except ImportError:
     _YAML_AVAILABLE = False
 
 try:
-    from scope_signal_delta import classify_scope_delta_authority, compute_scope_signal_delta
+    from scope_signal_delta import (
+        classify_scope_delta_authority,
+        compute_scope_signal_delta,
+        extract_sections as delta_extract_sections,
+        iter_section_lines as delta_iter_section_lines,
+    )
 except ImportError:  # pragma: no cover - subprocess/CLI fallback path
     compute_scope_signal_delta = None
     classify_scope_delta_authority = None
+    delta_extract_sections = None
+    delta_iter_section_lines = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +59,10 @@ class SourceLine:
 
 class ScopeSignalDeltaError(RuntimeError):
     """Raised when scope_signal_delta_input exists but cannot be consumed safely."""
+
+    def __init__(self, message: str, reason_code: str = "ambiguous_scope_signal"):
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +427,8 @@ def _canonical_json(obj: Any) -> str:
 
 
 def _extract_sections(text: str) -> dict[str, str]:
+    if delta_extract_sections is not None:
+        return delta_extract_sections(text)
     """Extract markdown sections (e.g., ## Outcome) from text.
 
     AC4: fenced-code-aware — headings inside ``` or ~~~ fences are NOT treated
@@ -787,6 +800,8 @@ def _line_layer_prefixes(line: str, prefixes) -> set:
 
 
 def _iter_section_source_lines(text: str, section_name: str) -> list[SourceLine]:
+    if delta_iter_section_lines is not None:
+        return delta_iter_section_lines(text, section_name, semantic_only=False)
     lines: list[SourceLine] = []
     current_section: str | None = None
     in_fence = False
@@ -824,27 +839,81 @@ def _iter_section_source_lines(text: str, section_name: str) -> list[SourceLine]
     return lines
 
 
-def _legacy_allowed_path_prefixes(issue_body: str) -> set[str]:
-    prefixes: set[str] = set()
-    for source_line in _iter_section_source_lines(issue_body, "Allowed Paths"):
-        match = re.search(r"`([^/`]+)/", source_line.text)
-        if match:
-            prefixes.add(match.group(1))
-    return prefixes
+def _iter_section_semantic_lines(text: str, section_name: str) -> list[SourceLine]:
+    if delta_iter_section_lines is not None:
+        return delta_iter_section_lines(text, section_name, semantic_only=True)
+    return _iter_section_source_lines(text, section_name)
 
 
-def _requires_delta_fail_closed(issue_body: str, known_context: dict | None) -> bool:
-    if not known_context or "scope_signal_delta_input" in known_context:
+def _valid_scope_signal_source_ref(value: Any, *, issue_number: int | None) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    if issue_number is None:
+        return True
+    if not value.startswith("artifact:"):
+        return False
+    return f"/issue-refinement-loop/{issue_number}/snapshots/" in value
+
+
+def _has_valid_scope_signal_delta_input(
+    issue_number: int | None,
+    known_context: dict | None,
+) -> bool:
+    if not isinstance(known_context, dict):
+        return False
+    payload = known_context.get("scope_signal_delta_input")
+    if not isinstance(payload, dict):
+        return False
+    for field in ("before_body", "current_body", "after_body"):
+        if not isinstance(payload.get(field), str):
+            return False
+    source_refs = payload.get("source_refs")
+    if not isinstance(source_refs, dict):
+        return False
+    if not _valid_scope_signal_source_ref(source_refs.get("before"), issue_number=issue_number):
+        return False
+    if not _valid_scope_signal_source_ref(source_refs.get("current"), issue_number=issue_number):
+        return False
+    after_ref = source_refs.get("after")
+    if after_ref is not None and not _valid_scope_signal_source_ref(after_ref, issue_number=issue_number):
+        return False
+    if (
+        payload["before_body"] == payload["current_body"]
+        and source_refs.get("before") == source_refs.get("current")
+    ):
+        return False
+    return True
+
+
+def _scope_signal_delta_required(issue_body: str, known_context: dict | None) -> bool:
+    if isinstance(known_context, dict) and "scope_signal_delta_required" in known_context:
+        return bool(known_context["scope_signal_delta_required"])
+    lowered = issue_body.lower()
+    return any(
+        token in lowered
+        for token in ("scope_signal_guard", "scope_signal_delta_input", "new_allowed_path_layer")
+    )
+
+
+def _requires_delta_fail_closed(
+    issue_number: int | None,
+    issue_body: str,
+    known_context: dict | None,
+) -> bool:
+    if not known_context:
+        return False
+    if not _scope_signal_delta_required(issue_body, known_context):
         return False
     current_phase = known_context.get("current_phase")
     if current_phase not in _HARD_STOP_SCOPE_SIGNAL_PHASES:
         return False
-    return len(_legacy_allowed_path_prefixes(issue_body)) >= 2
+    return not _has_valid_scope_signal_delta_input(issue_number, known_context)
 
 
 def _detect_scope_signals(
-    issue_body: str,
-    known_context: dict | None,
+    issue_number_or_body: int | str,
+    issue_body_or_known_context: str | dict | None,
+    known_context: dict | None = None,
     precomputed_delta: "dict[str, Any] | None" = None,
 ) -> tuple[bool, str, list]:
     """
@@ -854,9 +923,18 @@ def _detect_scope_signals(
 
     Precedence: new_unverifiable_ac > new_allowed_path_layer > new_in_scope_area > none
     """
-    if _requires_delta_fail_closed(issue_body, known_context):
+    if isinstance(issue_number_or_body, int):
+        issue_number = issue_number_or_body
+        issue_body = str(issue_body_or_known_context)
+    else:
+        issue_number = None
+        issue_body = issue_number_or_body
+        known_context = issue_body_or_known_context if isinstance(issue_body_or_known_context, dict) else None
+
+    if _requires_delta_fail_closed(issue_number, issue_body, known_context):
         raise ScopeSignalDeltaError(
-            "scope_signal_delta_input is required for new_allowed_path_layer in hard-stop phases"
+            "scope_signal_delta_input is required for new_allowed_path_layer in hard-stop phases",
+            reason_code=SCOPE_SIGNAL_REASON_MISSING_DELTA_INPUT,
         )
 
     if known_context and "scope_signal_delta_input" in known_context:
@@ -878,9 +956,9 @@ def _detect_scope_signals(
         return (False, SCOPE_SIGNAL_REASON_NO_SIGNAL, [])
 
     evidence_spans = []
-    acceptance_criteria_lines = _iter_section_source_lines(issue_body, "Acceptance Criteria")
-    allowed_path_lines = _iter_section_source_lines(issue_body, "Allowed Paths")
-    in_scope_lines = _iter_section_source_lines(issue_body, "In Scope")
+    acceptance_criteria_lines = _iter_section_semantic_lines(issue_body, "Acceptance Criteria")
+    allowed_path_lines = _iter_section_semantic_lines(issue_body, "Allowed Paths")
+    in_scope_lines = _iter_section_semantic_lines(issue_body, "In Scope")
 
     # Subjective keywords indicating unverifiable AC
     subjective_keywords = [
@@ -2005,7 +2083,10 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
 
         # Determine scope signal guard using _detect_scope_signals
         scope_signal_triggered, scope_signal_reason, scope_signal_evidence = _detect_scope_signals(
-            issue_body, known_context, precomputed_delta=scope_signal_delta_result
+            issue_number,
+            issue_body,
+            known_context,
+            precomputed_delta=scope_signal_delta_result,
         )
 
         # AC1/AC10 (#1090): opt-in SCOPE_SIGNAL_GUARD_DECISION_V2 lane split.
@@ -2105,6 +2186,7 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
         return plan, 0
 
     except ScopeSignalDeltaError as e:
+        reason_code = getattr(e, "reason_code", FAIL_CLOSED_REASON_AMBIGUOUS_SIGNAL)
         fail_closed_plan = {
             "schema_version": SCHEMA_VERSION,
             "source": {
@@ -2148,7 +2230,7 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
             },
             "fail_closed": {
                 "required": True,
-                "reason_codes": [FAIL_CLOSED_REASON_AMBIGUOUS_SIGNAL],
+                "reason_codes": [reason_code],
                 "human_message": str(e),
             },
         }

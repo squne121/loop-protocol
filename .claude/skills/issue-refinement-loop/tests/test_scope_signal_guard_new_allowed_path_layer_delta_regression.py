@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import json
 import sys
+from unittest import mock
 from pathlib import Path
 
 import jsonschema
@@ -97,6 +98,97 @@ def _raw_line(body: str, line_number: int) -> str:
     return body.splitlines()[line_number - 1]
 
 
+def _fixture_input(issue_body: str) -> dict:
+    return {
+        "schema_version": "refinement_preflight_input/v1",
+        "issue_number": 1413,
+        "repo": "squne121/loop-protocol",
+        "now": "2026-07-10T00:00:00+00:00",
+        "issue": {
+            "number": 1413,
+            "title": "実装: regression",
+            "body": issue_body,
+            "labels": ["phase/implementation"],
+        },
+        "comments": [],
+        "anchor_comment_urls": [],
+        "known_context": {
+            "scope_signal_delta_required": True,
+        },
+    }
+
+
+def _raw_snapshot(issue_body: str, fetched_at: str) -> dict:
+    return {
+        "schema_version": "raw_issue_snapshot/v1",
+        "fetched_at": fetched_at,
+        "issue_number": 1413,
+        "repo": "squne121/loop-protocol",
+        "issue": {
+            "number": 1413,
+            "title": "実装: regression",
+            "body": issue_body,
+            "labels": ["phase/implementation"],
+            "html_url": "https://github.com/squne121/loop-protocol/issues/1413",
+        },
+        "comments": [],
+    }
+
+
+def _run_preflight_fixture(
+    tmp_path: Path,
+    *,
+    current_body: str,
+    previous_body: str | None = None,
+) -> tuple[dict, int, dict]:
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(
+        json.dumps(_fixture_input(current_body), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    if previous_body is not None:
+        preflight._materialize_immutable_snapshot(
+            tmp_path,
+            1413,
+            _raw_snapshot(previous_body, "2026-07-09T00:00:00+00:00"),
+        )
+    with mock.patch.object(preflight, "_find_repo_root", return_value=tmp_path):
+        result, exit_code = preflight.run_preflight(
+            issue_number=1413,
+            repo="squne121/loop-protocol",
+            anchor_comment_urls=[],
+            fixture_path=fixture_path,
+        )
+    planner_input = _load_json(
+        tmp_path
+        / ".claude"
+        / "artifacts"
+        / "issue-refinement-loop"
+        / "1413"
+        / "planner_input.json"
+    )
+    return result, exit_code, planner_input
+
+
+def _valid_delta_input(name: str) -> dict:
+    payload = json.loads(json.dumps(_load_fixture(name)))
+    payload["source_refs"] = {
+        "before": (
+            "artifact:/tmp/.claude/artifacts/issue-refinement-loop/1413/"
+            "snapshots/raw_issue_snapshot_prev.json#repo=squne121/loop-protocol&issue_number=1413"
+        ),
+        "current": (
+            "artifact:/tmp/.claude/artifacts/issue-refinement-loop/1413/"
+            "snapshots/raw_issue_snapshot_current.json#repo=squne121/loop-protocol&issue_number=1413"
+        ),
+        "after": (
+            "artifact:/tmp/.claude/artifacts/issue-refinement-loop/1413/"
+            "snapshots/raw_issue_snapshot_after.json#repo=squne121/loop-protocol&issue_number=1413"
+        ),
+    }
+    return payload
+
+
 def test_delta_no_change_two_top_level_dirs_returns_no_scope_signal():
     payload = _load_fixture("issue_1385_replay")
     result = delta.compute_scope_signal_delta(payload)
@@ -117,37 +209,65 @@ def test_delta_added_docs_layer_triggers_new_allowed_path_layer():
 
 def test_missing_delta_input_in_hard_stop_phase_is_fail_closed():
     issue_body = _valid_issue_body(
+        allowed_paths="- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`",
+        in_scope="- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py` の既存修正を維持する",
+        acceptance_criteria="- [ ] AC1: Existing scope remains stable",
+    )
+    output, exit_code = plan.plan_refinement_loop(
+        _planner_input(
+            issue_body,
+            {"current_phase": "preflight", "scope_signal_delta_required": True},
+        )
+    )
+    assert exit_code == 0
+    assert output["fail_closed"]["required"] is True
+    assert output["fail_closed"]["reason_codes"] == ["missing_scope_signal_delta_input"]
+
+
+def test_preflight_without_previous_snapshot_blocks_with_missing_scope_signal_delta_input(tmp_path: Path):
+    issue_body = _valid_issue_body(
+        allowed_paths="- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`",
+        in_scope="- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py` の既存修正を維持する",
+        acceptance_criteria="- [ ] AC1: Existing scope remains stable",
+    )
+    result, exit_code, planner_input = _run_preflight_fixture(
+        tmp_path,
+        current_body=issue_body,
+        previous_body=None,
+    )
+    assert exit_code == preflight.EXIT_BLOCKED
+    assert result["status"] == "blocked"
+    assert result["planner_fail_closed_reason_codes"] == ["missing_scope_signal_delta_input"]
+    assert planner_input["known_context"]["current_phase"] == "preflight"
+    assert "scope_signal_delta_input" not in planner_input["known_context"]
+
+
+def test_preflight_builds_scope_signal_delta_input_for_hard_stop_phase(tmp_path: Path):
+    issue_body = _valid_issue_body(
         allowed_paths="- `src/main.ts`\n- `tests/main.test.ts`",
         in_scope="- `src/main.ts` と `tests/main.test.ts` の既存修正を維持する",
         acceptance_criteria="- [ ] AC1: Existing scope remains stable",
     )
-    output, exit_code = plan.plan_refinement_loop(
-        _planner_input(issue_body, {"current_phase": "preflight"})
+    result, exit_code, planner_input = _run_preflight_fixture(
+        tmp_path,
+        current_body=issue_body,
+        previous_body=issue_body,
     )
-    assert exit_code == 0
-    assert output["fail_closed"]["required"] is True
-    assert output["fail_closed"]["reason_codes"] == ["ambiguous_scope_signal"]
+    assert exit_code in (preflight.EXIT_PASS, preflight.EXIT_WARN)
+    assert result["status"] in ("pass", "warn")
+    delta_input = planner_input["known_context"]["scope_signal_delta_input"]
+    assert planner_input["known_context"]["current_phase"] == "preflight"
+    assert delta_input["before_body"] == issue_body
+    assert delta_input["current_body"] == issue_body
+    assert delta_input["after_body"] == issue_body
+    assert delta_input["source_refs"]["before"].startswith("artifact:")
+    assert delta_input["source_refs"]["current"].startswith("artifact:")
+    assert delta_input["source_refs"]["before"] != delta_input["source_refs"]["current"]
 
-
-def test_preflight_builds_scope_signal_delta_input_for_hard_stop_phase():
-    issue = {
-        "number": 1413,
-        "title": "実装: regression",
-        "body": _load_fixture("issue_1385_replay")["after_body"],
-        "html_url": "https://github.com/squne121/loop-protocol/issues/1413",
-    }
-    known_context = preflight._ensure_scope_signal_delta_input(
-        issue=issue,
-        known_context=None,
-        issue_number=1413,
-        repo="squne121/loop-protocol",
-    )
-    delta_input = known_context["scope_signal_delta_input"]
-    assert known_context["current_phase"] == "preflight"
-    assert delta_input["before_body"] == issue["body"]
-    assert delta_input["current_body"] == issue["body"]
-    assert delta_input["after_body"] == issue["body"]
-    assert delta_input["source_refs"]["after"] == issue["html_url"]
+    output, planner_exit_code = plan.plan_refinement_loop(planner_input)
+    assert planner_exit_code == 0
+    assert output["decisions"]["scope_signal_guard"]["triggered"] is False
+    assert output["decisions"]["scope_signal_guard"]["reason_code"] == "no_scope_signal"
 
 
 def test_evidence_spans_are_body_absolute_and_hash_raw_lines():
@@ -175,6 +295,7 @@ def test_evidence_spans_are_body_absolute_and_hash_raw_lines():
         assert signal["triggered"] is True
         line = signal["triggering_lines"][0]
         raw_line = _raw_line(after_body, line["start_line"])
+        assert line["coordinate_space"] == "body_absolute_1_based"
         assert line["start_line"] == line["end_line"]
         assert line["text_sha256"] == _line_sha(raw_line)
 
@@ -189,12 +310,13 @@ def test_section_blank_lines_and_crlf_keep_absolute_line_numbers():
     result = delta.compute_scope_signal_delta(payload)
     signal = next(item for item in result["signals"] if item["reason_code"] == "new_allowed_path_layer")
     line = signal["triggering_lines"][0]
+    assert line["coordinate_space"] == "body_absolute_1_based"
     assert line["start_line"] == 3
     assert line["end_line"] == 3
 
 
 def test_delta_positive_planner_output_validates_refinement_loop_plan_schema():
-    payload = _load_fixture("new_allowed_path_layer")
+    payload = _valid_delta_input("new_allowed_path_layer")
     issue_body = _valid_issue_body(
         allowed_paths=(
             "- `.claude/skills/issue-refinement-loop/scripts/"
@@ -217,7 +339,7 @@ def test_delta_positive_planner_output_validates_refinement_loop_plan_schema():
 
 
 def test_issue_1385_replay_uses_delta_or_fails_closed_without_baseline():
-    payload = _load_fixture("issue_1385_replay")
+    payload = _valid_delta_input("issue_1385_replay")
     issue_body = _valid_issue_body(
         allowed_paths="- `src/main.ts`\n- `tests/main.test.ts`",
         in_scope="- `src/main.ts` と `tests/main.test.ts` の既存修正を維持する",
@@ -231,15 +353,18 @@ def test_issue_1385_replay_uses_delta_or_fails_closed_without_baseline():
     assert with_delta["decisions"]["scope_signal_guard"]["reason_code"] == "no_scope_signal"
 
     without_delta, exit_code = plan.plan_refinement_loop(
-        _planner_input(issue_body, {"current_phase": "preflight"})
+        _planner_input(
+            issue_body,
+            {"current_phase": "preflight", "scope_signal_delta_required": True},
+        )
     )
     assert exit_code == 0
     assert without_delta["fail_closed"]["required"] is True
-    assert without_delta["fail_closed"]["reason_codes"] == ["ambiguous_scope_signal"]
+    assert without_delta["fail_closed"]["reason_codes"] == ["missing_scope_signal_delta_input"]
 
 
 def test_planner_true_positive_new_allowed_path_layer_not_new_in_scope_area():
-    payload = _load_fixture("new_allowed_path_layer")
+    payload = _valid_delta_input("new_allowed_path_layer")
     issue_body = _valid_issue_body(
         allowed_paths=(
             "- `.claude/skills/issue-refinement-loop/scripts/"
@@ -265,3 +390,105 @@ def test_planner_true_positive_new_allowed_path_layer_not_new_in_scope_area():
     assert decision["reason_code"] == "new_allowed_path_layer"
     assert decision["evidence_spans"][0]["source"] == "known_context"
     assert decision["evidence_spans"][0]["body_version"] == "after"
+
+
+def test_preflight_e2e_current_docs_layer_triggers_new_allowed_path_layer(tmp_path: Path):
+    previous_body = _valid_issue_body(
+        allowed_paths="- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`",
+        in_scope="- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py` の既存修正を維持する",
+        acceptance_criteria="- [ ] AC1: Existing scope remains stable",
+    )
+    current_body = _valid_issue_body(
+        allowed_paths=(
+            "- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n"
+            "- `docs/dev/workflow.md`"
+        ),
+        in_scope=(
+            "- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py` の既存修正を維持する\n"
+            "- `docs/dev/workflow.md` の契約を改善する"
+        ),
+        acceptance_criteria="- [ ] AC1: Existing scope remains stable",
+    )
+    _, exit_code, planner_input = _run_preflight_fixture(
+        tmp_path,
+        current_body=current_body,
+        previous_body=previous_body,
+    )
+    assert exit_code in (preflight.EXIT_PASS, preflight.EXIT_WARN)
+    output, planner_exit_code = plan.plan_refinement_loop(planner_input)
+    assert planner_exit_code == 0
+    assert output["decisions"]["scope_signal_guard"]["triggered"] is True
+    assert output["decisions"]["scope_signal_guard"]["reason_code"] == "new_allowed_path_layer"
+
+
+def test_preflight_e2e_sensitive_path_routes_to_security_gate(tmp_path: Path):
+    previous_body = _valid_issue_body(
+        allowed_paths="- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`",
+        in_scope="- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py` の既存修正を維持する",
+        acceptance_criteria="- [ ] AC1: Existing scope remains stable",
+    )
+    current_body = _valid_issue_body(
+        allowed_paths=(
+            "- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n"
+            "- `.github/workflows/python-test.yml`"
+        ),
+        in_scope=(
+            "- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py` の既存修正を維持する\n"
+            "- `.github/workflows/python-test.yml` を更新する"
+        ),
+        acceptance_criteria="- [ ] AC1: Existing scope remains stable",
+    )
+    _, exit_code, planner_input = _run_preflight_fixture(
+        tmp_path,
+        current_body=current_body,
+        previous_body=previous_body,
+    )
+    assert exit_code in (preflight.EXIT_PASS, preflight.EXIT_WARN)
+    output, planner_exit_code = plan.plan_refinement_loop(planner_input)
+    assert planner_exit_code == 0
+    assert output["scope_signal_guard_decision_v2"]["route"] == "security_risk_gate_required"
+
+
+def test_scope_signal_guard_decision_v2_schema_rejects_missing_required_fields():
+    payload = _valid_delta_input("new_allowed_path_layer")
+    issue_body = _valid_issue_body(
+        allowed_paths=(
+            "- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n"
+            "- `docs/dev/workflow.md`"
+        ),
+        in_scope="- `docs/dev/workflow.md` への契約追記",
+        acceptance_criteria="- [ ] AC1: Existing scope remains stable",
+    )
+    output, exit_code = plan.plan_refinement_loop(
+        _planner_input(issue_body, {"scope_signal_delta_input": payload, "current_phase": "preflight"})
+    )
+    assert exit_code == 0
+    invalid = json.loads(json.dumps(output))
+    invalid["scope_signal_guard_decision_v2"] = {"schema_version": "SCOPE_SIGNAL_GUARD_DECISION_V2"}
+    validator = jsonschema.Draft202012Validator(_load_plan_schema())
+    errors = list(validator.iter_errors(invalid))
+    assert errors
+    assert any("raw_signal" in error.message for error in errors)
+
+
+def test_scope_signal_guard_decision_v2_schema_rejects_unknown_enum_and_extra_fields():
+    payload = _valid_delta_input("new_allowed_path_layer")
+    issue_body = _valid_issue_body(
+        allowed_paths=(
+            "- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n"
+            "- `docs/dev/workflow.md`"
+        ),
+        in_scope="- `docs/dev/workflow.md` への契約追記",
+        acceptance_criteria="- [ ] AC1: Existing scope remains stable",
+    )
+    output, exit_code = plan.plan_refinement_loop(
+        _planner_input(issue_body, {"scope_signal_delta_input": payload, "current_phase": "preflight"})
+    )
+    assert exit_code == 0
+    invalid = json.loads(json.dumps(output))
+    invalid["scope_signal_guard_decision_v2"]["route"] = "bogus"
+    invalid["scope_signal_guard_decision_v2"]["unexpected"] = True
+    validator = jsonschema.Draft202012Validator(_load_plan_schema())
+    errors = list(validator.iter_errors(invalid))
+    assert errors
+    assert any("bogus" in error.message or "unexpected" in error.message for error in errors)

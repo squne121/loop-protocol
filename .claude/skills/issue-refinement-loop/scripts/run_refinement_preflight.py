@@ -896,9 +896,137 @@ def _issue_body_source_ref(issue: dict[str, Any], issue_number: int, repo: str) 
     return f"https://github.com/{repo}/issues/{issue_number}"
 
 
+def _issue_artifact_dir(repo_root: Path, issue_number: int) -> Path:
+    return repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+
+
+def _snapshot_archive_dir(repo_root: Path, issue_number: int) -> Path:
+    return _issue_artifact_dir(repo_root, issue_number) / "snapshots"
+
+
+def _snapshot_body(snapshot: dict[str, Any]) -> str:
+    issue = snapshot.get("issue")
+    if not isinstance(issue, dict):
+        return ""
+    body = issue.get("body", "")
+    return body if isinstance(body, str) else ""
+
+
+def _snapshot_fetched_at(snapshot: dict[str, Any]) -> str:
+    value = snapshot.get("fetched_at", "")
+    return value if isinstance(value, str) else ""
+
+
+def _snapshot_archive_path(repo_root: Path, issue_number: int, snapshot: dict[str, Any]) -> Path:
+    fetched_at = _snapshot_fetched_at(snapshot) or "unknown"
+    safe_fetched_at = re.sub(r"[^0-9A-Za-z_-]+", "_", fetched_at)
+    body_sha = _sha256(_snapshot_body(snapshot))
+    return _snapshot_archive_dir(repo_root, issue_number) / (
+        f"raw_issue_snapshot_{safe_fetched_at}_{body_sha}.json"
+    )
+
+
+def _snapshot_source_ref(snapshot_path: Path, snapshot: dict[str, Any]) -> str:
+    repo = snapshot.get("repo")
+    issue_number = snapshot.get("issue_number")
+    body_sha = _sha256(_snapshot_body(snapshot))
+    fetched_at = _snapshot_fetched_at(snapshot)
+    return (
+        f"artifact:{snapshot_path.resolve()}"
+        f"#repo={repo}&issue_number={issue_number}"
+        f"&body_sha256={body_sha}&fetched_at={fetched_at}"
+    )
+
+
+def _load_valid_issue_snapshot(path: Path, issue_number: int, repo: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema_version") != "raw_issue_snapshot/v1":
+        return None
+    if payload.get("issue_number") != issue_number or payload.get("repo") != repo:
+        return None
+    issue = payload.get("issue")
+    if not isinstance(issue, dict) or not isinstance(issue.get("body"), str):
+        return None
+    return payload
+
+
+def _materialize_immutable_snapshot(
+    repo_root: Path,
+    issue_number: int,
+    snapshot: dict[str, Any],
+) -> Path:
+    archive_dir = _snapshot_archive_dir(repo_root, issue_number)
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = _snapshot_archive_path(repo_root, issue_number, snapshot)
+    if not archive_path.exists():
+        archive_path.write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
+    return archive_path
+
+
+def _find_previous_immutable_snapshot(
+    repo_root: Path,
+    issue_number: int,
+    repo: str,
+    current_snapshot: dict[str, Any],
+) -> tuple[dict[str, Any], str] | None:
+    archive_dir = _snapshot_archive_dir(repo_root, issue_number)
+    candidates: list[tuple[datetime, dict[str, Any], Path]] = []
+    current_fetched_at = _snapshot_fetched_at(current_snapshot)
+    try:
+        current_sort_key = datetime.fromisoformat(current_fetched_at.replace("Z", "+00:00"))
+    except ValueError:
+        current_sort_key = None
+    if archive_dir.exists():
+        for path in archive_dir.glob("raw_issue_snapshot_*.json"):
+            snapshot = _load_valid_issue_snapshot(path, issue_number, repo)
+            if snapshot is None:
+                continue
+            fetched_at = _snapshot_fetched_at(snapshot)
+            try:
+                sort_key = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
+            except ValueError:
+                sort_key = datetime.fromtimestamp(0, tz=timezone.utc)
+            if current_sort_key is not None and sort_key >= current_sort_key:
+                continue
+            candidates.append((sort_key, snapshot, path))
+
+    if not candidates:
+        legacy_path = _issue_artifact_dir(repo_root, issue_number) / "raw_issue_snapshot.json"
+        snapshot = _load_valid_issue_snapshot(legacy_path, issue_number, repo)
+        if snapshot is not None:
+            path = _materialize_immutable_snapshot(repo_root, issue_number, snapshot)
+            candidates.append(
+                (
+                    datetime.fromisoformat(
+                        _snapshot_fetched_at(snapshot).replace("Z", "+00:00")
+                    )
+                    if _snapshot_fetched_at(snapshot)
+                    else datetime.fromtimestamp(0, tz=timezone.utc),
+                    snapshot,
+                    path,
+                )
+            )
+
+    if not candidates:
+        return None
+
+    _, snapshot, path = max(candidates, key=lambda item: item[0])
+    return snapshot, _snapshot_source_ref(path, snapshot)
+
+
 def _ensure_scope_signal_delta_input(
     *,
+    repo_root: Path,
     issue: dict[str, Any],
+    raw_snapshot: dict[str, Any],
     known_context: Optional[dict[str, Any]],
     issue_number: int,
     repo: str,
@@ -908,16 +1036,27 @@ def _ensure_scope_signal_delta_input(
     if "scope_signal_delta_input" in merged:
         return merged
 
-    body = issue.get("body", "") or ""
-    source_ref = _issue_body_source_ref(issue, issue_number, repo)
+    previous_snapshot = _find_previous_immutable_snapshot(
+        repo_root,
+        issue_number,
+        repo,
+        raw_snapshot,
+    )
+    if previous_snapshot is None:
+        return merged
+
+    previous_raw_snapshot, previous_source_ref = previous_snapshot
+    current_body = issue.get("body", "") or ""
+    current_archive_path = _snapshot_archive_path(repo_root, issue_number, raw_snapshot)
+    current_source_ref = _snapshot_source_ref(current_archive_path, raw_snapshot)
     merged["scope_signal_delta_input"] = {
-        "before_body": body,
-        "current_body": body,
-        "after_body": body,
+        "before_body": _snapshot_body(previous_raw_snapshot),
+        "current_body": current_body,
+        "after_body": current_body,
         "source_refs": {
-            "before": source_ref,
-            "current": source_ref,
-            "after": source_ref,
+            "before": previous_source_ref,
+            "current": current_source_ref,
+            "after": current_source_ref,
         },
     }
     return merged
@@ -1129,13 +1268,14 @@ def _write_artifacts(
       - planner_input.json       (planner stdin JSON, byte-stable)
       - refinement_preflight_result_v1.json (canonical result)
     """
-    artifact_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+    artifact_dir = _issue_artifact_dir(repo_root, issue_number)
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     snapshot_path = artifact_dir / "raw_issue_snapshot.json"
     snapshot_path.write_text(
         json.dumps(raw_snapshot, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
     )
+    _materialize_immutable_snapshot(repo_root, issue_number, raw_snapshot)
 
     planner_input_path = artifact_dir / "planner_input.json"
     planner_input_path.write_text(
@@ -1753,7 +1893,9 @@ def run_preflight(
 
     # --- Invoke planner ---
     known_context = _ensure_scope_signal_delta_input(
+        repo_root=repo_root,
         issue=issue,
+        raw_snapshot=raw_snapshot,
         known_context=known_context,
         issue_number=issue_number,
         repo=repo,
@@ -1868,16 +2010,12 @@ def run_preflight(
         rc = fail_closed.get("rewrite_constraints", {})
         if not isinstance(rc, dict):
             blockers.append(f"{BLOCKER_REWRITE_CONSTRAINTS_NON_STRING_PAYLOAD}: rewrite_constraints must be an object")
-            planner_fail_closed_reason_codes = []
-            required_sections = []
-            required_contract_keys = []
             rewrite_constraints = _build_safe_rewrite_constraints([], [])
             reason_codes_ok = False
+        elif not rc.get("schema_version"):
+            rewrite_constraints = _build_safe_rewrite_constraints([], [])
         elif reason_codes_ok:
             if not _ensure_json_serializable(rc, "planner.fail_closed.rewrite_constraints", blockers):
-                planner_fail_closed_reason_codes = []
-                required_sections = []
-                required_contract_keys = []
                 rewrite_constraints = _build_safe_rewrite_constraints([], [])
                 reason_codes_ok = False
             else:
@@ -1894,9 +2032,6 @@ def run_preflight(
                 if sections_ok and keys_ok:
                     rewrite_constraints = rc
                 else:
-                    planner_fail_closed_reason_codes = []
-                    required_sections = []
-                    required_contract_keys = []
                     rewrite_constraints = _build_safe_rewrite_constraints([], [])
                     reason_codes_ok = False
 
