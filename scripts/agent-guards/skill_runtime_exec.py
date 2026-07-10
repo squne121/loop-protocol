@@ -31,27 +31,43 @@ from skill_runtime_command_policy import (
 )
 
 
-# Volatile roots that other concurrent local sessions/agents may legitimately
+# Roots that other concurrent local sessions/agents/hooks may legitimately
 # write to while this executor's own child command is running. Changes under
 # these roots must never be attributed to the child command's own subprocess
-# (Issue #1343): the executor only ever runs a single child process whose own
-# allowed writes are scoped to the target issue's artifact root, so any other
-# concurrent repo-wide drift under these roots is peer-session noise, not a
-# self-write violation.
-_VOLATILE_PEER_SESSION_ROOT_RELS = (
+# (Issue #1343, Issue #1409): the executor only ever runs a single child
+# process whose own allowed writes are scoped to the target issue's artifact
+# root, so any other concurrent repo-wide drift under these roots is
+# unattributable -- it may originate from a peer session/agent (Issue #1343)
+# or from this same session's own asynchronous PostToolUse/SubagentStop hook
+# machinery (Issue #1409: `.claude/hooks/session_manifest_debounce.mjs` /
+# `.claude/hooks/generate_session_manifest_from_hook.mjs` writing under the
+# hook-owned subtree `artifacts/session-manifest-runtime/`). Either way, the
+# executor cannot distinguish "who" wrote it in stdlib-only race-tolerant
+# mode, so this symbol is named for that shared property (unattributable),
+# not for a single cause (peer-session).
+#
+# NOTE: `artifacts/session-manifest-runtime` is the *only* addition for
+# Issue #1409 -- the repo-root `artifacts/` directory as a whole remains
+# fully audited, because `artifacts/{issue}/issue-metadata/{command-id}/`
+# is a controlled-mutation input/marker namespace whose provenance still
+# needs to be tracked (OWNER REQUEST_CHANGES on the original repo-wide
+# `artifacts/` exclusion proposal, see
+# https://github.com/squne121/loop-protocol/issues/1409#issuecomment-4935283248).
+_RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS = (
     ".claude/worktrees",
     ".claude/artifacts/issue-refinement-loop",
+    "artifacts/session-manifest-runtime",
 )
 
 
-def _volatile_peer_session_roots(project_root: str) -> list[Path]:
+def _race_tolerant_unattributable_roots(project_root: str) -> list[Path]:
     root = Path(project_root)
-    return [root / Path(rel) for rel in _VOLATILE_PEER_SESSION_ROOT_RELS]
+    return [root / Path(rel) for rel in _RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS]
 
 
-def _is_volatile_peer_session_path(rel_path: str) -> bool:
+def _is_race_tolerant_unattributable_path(rel_path: str) -> bool:
     normalized = rel_path.replace(os.sep, "/")
-    for prefix in _VOLATILE_PEER_SESSION_ROOT_RELS:
+    for prefix in _RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS:
         if normalized == prefix or normalized.startswith(prefix + "/"):
             return True
     return False
@@ -119,15 +135,125 @@ def _git_status_paths(project_root: str) -> set[str]:
     return paths
 
 
+def _strict_ancestor_of_race_tolerant_root(rel_path: str) -> bool:
+    """True when `rel_path` (a directory-status entry, e.g. `artifacts/`) is a
+    strict ancestor of at least one race-tolerant-unattributable root, but is
+    not itself one of those roots.
+
+    Issue #1409 REQUEST_CHANGES (P1): Git's `--ignored=matching` collapses an
+    entire ignored directory tree into a single status entry for the
+    ignore-pattern-matched directory itself (e.g. `!! artifacts/`), not its
+    descendants, whenever that ignored directory does not yet exist in the
+    before-snapshot. Because the real repo's `.gitignore` ignores
+    `artifacts/` as a whole, a cold-start creation of
+    `artifacts/session-manifest-runtime/**` is folded and reported as the
+    parent `artifacts/` entry rather than the excluded subtree -- this helper
+    identifies that folding so the caller can expand it instead of
+    fail-closing on the collapsed ancestor path.
+    """
+    normalized = rel_path.replace(os.sep, "/").rstrip("/")
+    for root in _RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS:
+        if normalized != root and root.startswith(normalized + "/"):
+            return True
+    return False
+
+
+def _expand_folded_ignored_status_dir(project_root: str, rel_dir: str) -> set[str]:
+    """Expand a single Git-status-folded ignored-directory entry (e.g.
+    `artifacts/`) into its actual leaf file paths via a *targeted*
+    (path-restricted, not repo-wide) `--ignored=traditional` scan. Restricting
+    the scan to `rel_dir` keeps this bounded and avoids reintroducing a
+    repo-wide `--ignored=traditional` walk (explicitly rejected as an
+    unbounded alternative in Issue #1409 REQUEST_CHANGES)."""
+    git = shutil.which("git") or "git"
+    out = subprocess.run(
+        [
+            git,
+            "-C",
+            project_root,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=traditional",
+            "-z",
+            "--",
+            rel_dir,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if out.returncode != 0:
+        raise RuntimeError("git_status_failed")
+    paths: set[str] = set()
+    for field in (f for f in out.stdout.split("\0") if f):
+        if len(field) < 4:
+            continue
+        paths.add(field[3:])
+    return paths
+
+
+def _is_real_nonsymlink_dir(project_root: str, rel_dir: str) -> bool:
+    path = Path(project_root) / rel_dir.rstrip("/")
+    try:
+        if not path.is_dir():
+            return False
+    except OSError:
+        return False
+    return not _is_symlink_path(path)
+
+
+def _expand_new_status_paths(project_root: str, new_raw_paths: set[str]) -> set[str]:
+    """Expand any newly-appeared folded-ignored-ancestor entries (see
+    `_strict_ancestor_of_race_tolerant_root`) into their real leaf paths so
+    that race-tolerant-root exclusion can be applied precisely, instead of
+    fail-closing on the collapsed ancestor directory itself.
+
+    Safety (Issue #1409 REQUEST_CHANGES P1): expansion only happens when the
+    collapsed entry is confirmed on disk to be a real, non-symlink directory.
+    If the entry has instead been substituted by a file or a symlink (parent
+    substitution), expansion is skipped and the raw entry is kept as-is so it
+    fails closed via the normal unauthorized-path path.
+    """
+    expanded: set[str] = set()
+    for path in new_raw_paths:
+        if path.endswith("/") and _strict_ancestor_of_race_tolerant_root(path):
+            if _is_real_nonsymlink_dir(project_root, path):
+                expanded.update(_expand_folded_ignored_status_dir(project_root, path))
+                continue
+        expanded.add(path)
+    return expanded
+
+
 def _snapshot_repo_paths(project_root: str, issue_number: str) -> dict[str, tuple[str, int, int]]:
     root = Path(project_root)
     allowed_root = _allowed_artifact_root(project_root, issue_number)
-    peer_roots = _volatile_peer_session_roots(project_root)
+    peer_roots = _race_tolerant_unattributable_roots(project_root)
     allowed_parent_dirs: set[Path] = set()
     for parent in allowed_root.parents:
         allowed_parent_dirs.add(parent)
         if parent == root:
             break
+    # Issue #1409: also skip recording the directory-node entry (its own
+    # mtime/size) for every ancestor of each race-tolerant-unattributable
+    # root. Without this, a *new* top-level ancestor directory (e.g.
+    # `artifacts/`, when it does not yet exist before the child command
+    # runs and is first created by a peer/hook write under
+    # `artifacts/session-manifest-runtime/**`) would itself appear as a
+    # brand-new snapshot entry and be misreported as an unauthorized write,
+    # even though the pruning above already fully excludes the peer root's
+    # own contents. `.claude/worktrees` and
+    # `.claude/artifacts/issue-refinement-loop` never hit this gap because
+    # their ancestor (`.claude`) already coincides with an ancestor of this
+    # issue's own `allowed_root`; `artifacts/session-manifest-runtime`'s
+    # ancestor (`artifacts`) does not share that coincidence, so it needs
+    # its own explicit ancestor-skip set.
+    for peer_root in peer_roots:
+        for parent in peer_root.parents:
+            allowed_parent_dirs.add(parent)
+            if parent == root:
+                break
 
     snapshot: dict[str, tuple[str, int, int]] = {}
     for current_root, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
@@ -314,11 +440,18 @@ def _find_unauthorized_repo_changes(
 ) -> str | None:
     after_snapshot = _snapshot_repo_paths(project_root, issue_number)
     after_status = _git_status_paths(project_root)
+    new_raw_status_paths = after_status - before_status
+    # Issue #1409 REQUEST_CHANGES (P1): expand any collapsed ignored-ancestor
+    # directory entries (e.g. `!! artifacts/`) into their real leaf paths
+    # before applying race-tolerant-root exclusion, so cold-start creation of
+    # a race-tolerant subtree under an ignored parent is not misreported as
+    # an unauthorized write to the collapsed parent itself.
+    expanded_new_status_paths = _expand_new_status_paths(project_root, new_raw_status_paths)
     new_status_paths = {
         path
-        for path in (after_status - before_status)
+        for path in expanded_new_status_paths
         if not _is_under_allowed_artifact_root(project_root, issue_number, path)
-        and not _is_volatile_peer_session_path(path)
+        and not _is_race_tolerant_unattributable_path(path)
     }
     if new_status_paths:
         return sorted(
