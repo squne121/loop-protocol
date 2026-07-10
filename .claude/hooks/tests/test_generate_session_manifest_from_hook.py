@@ -60,7 +60,7 @@ def test_wrapper_stdout_is_silent_and_artifact_path_is_overridable(tmp_path: Pat
 
     assert result.returncode == 0
     assert result.stdout == ""
-    assert any((tmp_path / "artifacts").glob("private-agent-session-manifest-stop-*.json"))
+    assert any((tmp_path / "artifacts" / "manifests").glob("private-agent-session-manifest-stop-*.json"))
 
 
 def test_wrapper_stderr_redacts_posix_windows_and_wsl_paths(tmp_path: Path):
