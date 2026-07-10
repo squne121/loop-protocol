@@ -878,14 +878,9 @@ def _detect_scope_signals(
         return (False, SCOPE_SIGNAL_REASON_NO_SIGNAL, [])
 
     evidence_spans = []
-    sections = _extract_sections(issue_body)
     acceptance_criteria_lines = _iter_section_source_lines(issue_body, "Acceptance Criteria")
     allowed_path_lines = _iter_section_source_lines(issue_body, "Allowed Paths")
     in_scope_lines = _iter_section_source_lines(issue_body, "In Scope")
-
-    in_scope = sections.get("In Scope", "")
-    allowed_paths = sections.get("Allowed Paths", "")
-    acceptance_criteria = sections.get("Acceptance Criteria", "")
 
     # Subjective keywords indicating unverifiable AC
     subjective_keywords = [

@@ -1,16 +1,16 @@
-# REFINEMENT_LOOP_PLAN_V1 Output Guide
+# REFINEMENT_LOOP_PLAN_V1 出力ガイド
 
-## Overview
+## 概要
 
-The `plan_refinement_loop.py` script analyzes Issue body, comments, and known context to produce a deterministic JSON plan describing:
+`plan_refinement_loop.py` は Issue 本文、コメント、既知コンテキストを解析し、次の判断を表す決定論的な JSON plan を返します。
 
-- Policy decisions for investigation (codebase fact-checking)
-- Policy decisions for web research (external specification verification)
-- Scope signal guarding (anchor reframe exclusions)
-- Delivery rollup child materialization slots
-- Follow-up issue candidates for out-of-scope work
+- 調査ステップが必要かどうか
+- 外部仕様の検証が必要かどうか
+- scope signal guard が発火しているかどうか
+- delivery rollup の child materialization が残っているかどうか
+- out-of-scope 作業を follow-up issue 候補として残すかどうか
 
-## Input (REFINEMENT_LOOP_PLANNER_INPUT_V1)
+## 入力 (`REFINEMENT_LOOP_PLANNER_INPUT_V1`)
 
 ```json
 {
@@ -30,7 +30,7 @@ The `plan_refinement_loop.py` script analyzes Issue body, comments, and known co
 }
 ```
 
-## Output (REFINEMENT_LOOP_PLAN_V1)
+## 出力 (`REFINEMENT_LOOP_PLAN_V1`)
 
 ```json
 {
@@ -93,79 +93,80 @@ The `plan_refinement_loop.py` script analyzes Issue body, comments, and known co
 }
 ```
 
-## Decision Fields Explained
+## 各 decision field の意味
 
-### investigation_policy
+### `investigation_policy`
 
-- `required`: True if codebase fact-checking is needed
-- `reason_code`: Why investigation is needed (or `no_repo_fact_claim` if not)
-- `target_paths`: Extracted file/directory paths from Outcome/InScope/AC/VC
-- `repo_claims`: Text spans claiming repo facts
-- `evidence_spans`: Pointers to source evidence in issue body/comments
-- `confidence`: `deterministic` if decision is clear, `unknown` otherwise
+- `required`: codebase fact-checking が必要なら `true`
+- `reason_code`: 調査が必要になった理由。不要な場合は `no_repo_fact_claim`
+- `target_paths`: Outcome / In Scope / AC / VC から抽出した path
+- `repo_claims`: repo 事実を主張している text span
+- `evidence_spans`: Issue 本文やコメント内の根拠位置
+- `confidence`: 判定が明確なら `deterministic`、曖昧なら `unknown`
 
-**Use in SKILL.md**: Set `LOOP_STATE.investigation_policy` from this decision and trigger Step 1 (codebase-investigator) if `required == true`.
+`SKILL.md` ではこの値を `LOOP_STATE.investigation_policy` に反映し、`required == true` のときに Step 1 (`codebase-investigator`) を起動します。
 
-### web_research_policy
+### `web_research_policy`
 
-- `required`: True if external specification verification is needed
-- `reason_code`: Why research is needed (keywords like "official", "API", "auth", "migration")
-- `critical_external_claims`: Extracted claims about external systems
-- `evidence_spans`: Source evidence
-- `confidence`: Deterministic or unknown
+- `required`: 外部仕様の検証が必要なら `true`
+- `reason_code`: なぜ外部調査が必要かを表す理由コード
+- `critical_external_claims`: 外部システムに関する主張を抽出した一覧
+- `evidence_spans`: 根拠位置
+- `confidence`: `deterministic` または `unknown`
 
-**Use in SKILL.md**: Set `LOOP_STATE.web_research_policy` from this decision and trigger Step 1b (web-researcher) if `required == true`.
+`SKILL.md` ではこの値を `LOOP_STATE.web_research_policy` に反映し、`required == true` のときに Step 1b (`web-researcher`) を起動します。
 
-### scope_signal_guard
+### `scope_signal_guard`
 
-- `triggered`: True if new scope signals detected
-- `excluded_by_anchor_reframe`: True if anchor comment reframe excludes this signal
-- `reason_code`: Type of signal (or `anchor_reframe_exclusion` if excluded)
-- `evidence_spans`: delta-based provenance is recorded as `source: known_context` plus `body_version`, `coordinate_space: body_absolute_1_based`, and the matching `source_ref`
+- `triggered`: 新しい scope signal が検出されたら `true`
+- `excluded_by_anchor_reframe`: anchor comment による reframe で signal が除外される場合は `true`
+- `reason_code`: signal の種類。除外時は `anchor_reframe_exclusion`
+- `evidence_spans`: delta-based provenance を保持します。現在は `source: known_context` に加えて、`body_version`、`coordinate_space: body_absolute_1_based`、対応する `source_ref` を含めます。
 
-**Use in SKILL.md**: If triggered and NOT excluded, consider human escalation for scope confirmation.
+`SKILL.md` では、発火していて anchor で除外されていない場合に human escalation 候補として扱います。
 
-### delivery_rollup
+### `delivery_rollup`
 
-- `applicable`: True if parent issue has unmaterialized child slots
-- `unmaterialized_slots`: List of `{child_title_hint, marker, body_line}`
-- Marker types: `未起票` (Japanese), `unmaterialized`, `TBD`
+- `applicable`: parent issue に未 materialize の child slot があるとき `true`
+- `unmaterialized_slots`: `{child_title_hint, marker, body_line}` の配列
+- `marker`: `未起票`、`unmaterialized`、`TBD` などの slot marker
 
-**Use in SKILL.md**: Use for tracking child issue materialization status.
+`SKILL.md` では child issue materialization の追跡に使います。
 
-### follow_up_materialization
+### `follow_up_materialization`
 
-- `candidates`: List of out-of-scope work that could become follow-up issues
-- Each candidate has `{dedupe_key, summary, source_evidence}`
-- `dedupe_key` is first 16 chars of sha256(summary) for deduplication
+- `candidates`: out-of-scope work を follow-up issue 化できる候補一覧
+- 各候補は `{dedupe_key, summary, source_evidence}` を持ちます
+- `dedupe_key` は `sha256(summary)` の先頭 16 文字で、重複候補の統合に使います
 
-**Use in SKILL.md**: Reference candidates in post-approval comments or documentation.
+`SKILL.md` では post-approval comment や補助ドキュメントで候補を参照します。
 
-## fail_closed Handling
+## `fail_closed` の扱い
 
-When `fail_closed.required == true`:
+`fail_closed.required == true` の場合は、planner が構造的な問題を検出しています。
 
-1. The planner detected a structural issue (malformed contract, missing Outcome section, unknown schema)
-2. Output is still valid JSON, but should not be used for decisions
-3. Human escalation is required with `fail_closed.reason_codes` and `human_message`
-4. The orchestrator should NOT attempt to infer missing policy
-5. `fail_closed.rewrite_constraints` contains `FAIL_CLOSED_REWRITE_CONSTRAINTS_V1` — the orchestrator MUST forward this payload to `issue-author` when routing to Rewrite
+1. malformed contract や Outcome 欠落など、plan をそのまま判断に使えない状態です。
+2. 出力自体は valid JSON ですが、decision の根拠として使ってはいけません。
+3. `fail_closed.reason_codes` と `human_message` を添えて human escalation が必要です。
+4. orchestrator は不足している policy を推測して補完してはいけません。
+5. `fail_closed.rewrite_constraints` に含まれる `FAIL_CLOSED_REWRITE_CONSTRAINTS_V1` を Rewrite ルートへそのまま forward する必要があります。
 
-**reason_codes**:
-- `malformed_machine_readable_contract`: YAML block missing `contract_schema_version`
-- `missing_required_section`: Outcome or other critical section missing
-- `missing_required_contract_key`: Machine-Readable Contract missing required keys (`contract_schema_version`, `issue_kind`)
-- `unknown_input_schema`: Input didn't match `REFINEMENT_LOOP_PLANNER_INPUT_V1`
-- `planner_internal_error`: Unexpected exception during processing
-- `unknown_issue_kind`: `issue_kind` field present but not in SSOT allowlist
-- `issue_kind_policy_load_error`: ISSUE_KIND_POLICY_V1 SSOT could not be loaded
-- `contract_schema_parse_error`: Machine-Readable Contract YAML could not be parsed
-- `template_resolution_error`: Issue template file could not be resolved or loaded
-- `checker_internal_error`: Internal error in the contract checker
+### `reason_codes`
 
-## FAIL_CLOSED_REWRITE_CONSTRAINTS_V1
+- `malformed_machine_readable_contract`: YAML block に `contract_schema_version` がない
+- `missing_required_section`: Outcome などの重要 section がない
+- `missing_required_contract_key`: Machine-Readable Contract に必須 key がない
+- `unknown_input_schema`: 入力が `REFINEMENT_LOOP_PLANNER_INPUT_V1` に一致しない
+- `planner_internal_error`: planner 実行中に予期しない例外が起きた
+- `unknown_issue_kind`: `issue_kind` が SSOT allowlist にない
+- `issue_kind_policy_load_error`: ISSUE_KIND_POLICY_V1 を読めなかった
+- `contract_schema_parse_error`: Machine-Readable Contract YAML を parse できなかった
+- `template_resolution_error`: Issue template を解決または読込できなかった
+- `checker_internal_error`: contract checker 側の内部エラー
 
-When `fail_closed.required == true`, the planner includes `fail_closed.rewrite_constraints` with the following schema:
+## `FAIL_CLOSED_REWRITE_CONSTRAINTS_V1`
+
+`fail_closed.required == true` のとき、planner は `fail_closed.rewrite_constraints` に次の schema を含めます。
 
 ```json
 {
@@ -194,46 +195,58 @@ When `fail_closed.required == true`, the planner includes `fail_closed.rewrite_c
 }
 ```
 
-### Field Semantics
+### field semantics（各 field の意味）
 
-- `required_sections`: sections that must be added to the Issue body (missing from template check)
-- `required_contract_keys`: keys that must be present in the Machine-Readable Contract block
-- `rewrite_constraints.freeform_rewrite_forbidden`: `issue-author` MUST NOT accept freeform rewrite requests; only structured repair against `must_add_sections` / `must_add_contract_keys`
-- `override_policy.allowed_reason_codes`: reason codes that `human_decision_reframe` can override
-- `override_policy.never_override_reason_codes`: reason codes that are always blocked (no override)
-- `max_rewrite_attempts`: loop router enforces this limit; after N attempts without progress, routes to `human_judgment_required`
-- `no_progress_route`: destination when rewrite produces no forward progress
+以下は各 field の実務上の意味づけです。
 
-## human_decision_reframe Override Contract
+- `required_sections`: Issue 本文に追加しなければならない section
+- `required_contract_keys`: Machine-Readable Contract block に必須の key
+- `rewrite_constraints.freeform_rewrite_forbidden`: `issue-author` は自由記述の全面改稿を受け入れてはいけません
+- `override_policy.allowed_reason_codes`: `human_decision_reframe` が override できる reason code
+- `override_policy.never_override_reason_codes`: 人間指示があっても override できない reason code
+- `max_rewrite_attempts`: loop router が強制する rewrite 上限
+- `no_progress_route`: rewrite しても前進しないときの遷移先
 
-`human_decision_reframe` is the mechanism by which a human anchor comment overrides a `fail_closed` verdict. This is NOT a validation bypass — it is a permission to continue rewriting under the constraint of `FAIL_CLOSED_REWRITE_CONSTRAINTS_V1`.
+## `human_decision_reframe` override contract（人間判断 override 契約）
 
-### Override is permitted when:
-1. The `fail_closed.reason_codes` contain only codes in `override_policy.allowed_reason_codes`
-2. The human anchor comment explicitly acknowledges the missing sections/keys
-3. The rewrite is constrained to `FAIL_CLOSED_REWRITE_CONSTRAINTS_V1.rewrite_constraints`
+この section では override の許可条件と禁止条件を整理します。
 
-### Override is NEVER permitted when:
-- Any `fail_closed.reason_code` is in `override_policy.never_override_reason_codes`
-- `unknown_issue_kind`, `issue_kind_policy_load_error`, `contract_schema_parse_error`, `template_resolution_error`, `checker_internal_error` always block, regardless of human instruction
+`human_decision_reframe` は `fail_closed` verdict を無視する bypass ではありません。`FAIL_CLOSED_REWRITE_CONSTRAINTS_V1` に従った structured rewrite を続行してよい、という人間判断です。
 
-### Post-override Rewrite Contract
-After `human_decision_reframe` triggers Rewrite:
-1. The orchestrator forwards `FAIL_CLOSED_REWRITE_CONSTRAINTS_V1` to `issue-author`
-2. `issue-author` executes structured repair (adds missing sections/keys)
-3. After `issue-author` completes, a contract checker re-runs automatically (pre-mutation dry-run + post-mutation fresh check)
-4. If `post-mutation fresh checker` exits non-zero: Rewrite loop continues (up to `max_rewrite_attempts`)
-5. If `max_rewrite_attempts` exceeded with no progress: route to `human_judgment_required`
+### override が許可される条件
 
-### Terminal Result Fields (AC11)
-The terminal/handoff result must include:
-- `checked_body_sha256`: SHA256 of the Issue body that was checked
-- `checker_exit_code`: exit code of the post-mutation checker
-- `missing_sections`: list of sections still missing after rewrite (empty if all resolved)
-- `missing_contract_keys`: list of contract keys still missing after rewrite (empty if all resolved)
+1. `fail_closed.reason_codes` が `override_policy.allowed_reason_codes` のみで構成されている
+2. 人間の anchor comment が、不足 section や不足 key を明示的に認識している
+3. rewrite が `FAIL_CLOSED_REWRITE_CONSTRAINTS_V1.rewrite_constraints` に制約されている
 
-## Idempotency Guarantee
+### override が禁止される条件
 
-Same input (same issue body + comments + known_context) will always produce identical JSON output (except for `generated_at` timestamp).
+- `fail_closed.reason_codes` に `override_policy.never_override_reason_codes` が 1 つでも含まれる
+- `unknown_issue_kind`、`issue_kind_policy_load_error`、`contract_schema_parse_error`、`template_resolution_error`、`checker_internal_error` は常に blocking
 
-The planner sorts all multi-value fields (`target_paths`, `repo_claims`, etc.) consistently to ensure reproducible output across runs.
+### override 後の rewrite contract（override 後の rewrite 契約）
+
+override 後も rewrite の手順は制約付きで進めます。
+
+1. orchestrator は `FAIL_CLOSED_REWRITE_CONSTRAINTS_V1` を `issue-author` に forward する
+2. `issue-author` は不足 section / key の structured repair だけを行う
+3. repair 後は contract checker を自動再実行する
+4. post-mutation checker が non-zero の場合は、`max_rewrite_attempts` の範囲で rewrite loop を継続する
+5. 上限超過または no progress の場合は `human_judgment_required` に遷移する
+
+### terminal result fields (`AC11`)（終端結果 field）
+
+handoff や terminate 時に残す必須 field をここで確認します。
+
+terminal または handoff result には次を必ず含めます。
+
+- `checked_body_sha256`: 検査対象 Issue body の SHA256
+- `checker_exit_code`: post-mutation checker の exit code
+- `missing_sections`: rewrite 後も不足している section 一覧
+- `missing_contract_keys`: rewrite 後も不足している contract key 一覧
+
+## 冪等性の保証
+
+同じ入力、つまり同じ Issue body・comments・known_context に対しては、`generated_at` を除いて常に同じ JSON が生成されます。
+
+multi-value field である `target_paths` や `repo_claims` などは安定順序で sort されるため、実行ごとの差分が発生しない設計です。
