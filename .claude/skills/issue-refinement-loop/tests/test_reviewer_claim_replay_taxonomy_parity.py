@@ -190,6 +190,17 @@ def test_issue_1406_broad_search_path_aliases_normalize_to_single_entry():
                     "category": "broad_search_path_unbounded",
                     "line_start": 20,
                     "line_end": 20,
+                    # PR #1412 review (Blocker 2): source_payload must reflect
+                    # the real baseline_vc_preflight.py producer shape for
+                    # this readiness error to be adopted as broad-path
+                    # evidence (strict AND-match, not category/rule_id
+                    # label-only).
+                    "source_payload": {
+                        "classification": "blocked",
+                        "category": "broad_search_path_unbounded",
+                        "decision": "blocked",
+                        "scope_class": "baseline_fail_expected",
+                    },
                 }
             ],
         }

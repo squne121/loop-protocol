@@ -1203,6 +1203,15 @@ READINESS_VCP_BROAD_SEARCH_PATH_UN = {
             "category": "broad_search_path_unbounded",
             "line_start": 15,
             "line_end": 15,
+            # PR #1412 review (Blocker 2): source_payload must reflect the
+            # real baseline_vc_preflight.py producer shape for this
+            # readiness error to be adopted as broad-path evidence.
+            "source_payload": {
+                "classification": "blocked",
+                "category": "broad_search_path_unbounded",
+                "decision": "blocked",
+                "scope_class": "baseline_fail_expected",
+            },
         }
     ],
 }
@@ -1240,7 +1249,7 @@ def test_broad_search_path_unbounded_readiness_error_is_deterministic_backed():
 def test_broad_search_path_unbounded_direct_vc_preflight_producer_shape_is_deterministic_backed():
     preflight = _producer_vc_preflight_result(
         result_overrides={
-            "classification": "broad_search_path_unbounded",
+            "classification": "blocked",
             "category": "broad_search_path_unbounded",
             "decision": "blocked",
         }
@@ -1264,7 +1273,7 @@ def test_broad_search_path_unbounded_vc_preflight_requires_matching_source_body_
     preflight = _producer_vc_preflight_result(
         body_sha256="sha256:old",
         result_overrides={
-            "classification": "broad_search_path_unbounded",
+            "classification": "blocked",
             "category": "broad_search_path_unbounded",
             "decision": "blocked",
         },
