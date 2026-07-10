@@ -26,7 +26,6 @@ Synchronization design (no fixed-sleep polling):
 import json
 import os
 import shutil
-import stat
 import subprocess
 import sys
 import threading
