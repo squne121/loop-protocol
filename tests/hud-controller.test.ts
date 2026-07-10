@@ -213,6 +213,33 @@ describe('HudController', () => {
     expect(queryButton(container, 'assist-player').disabled).toBe(false)
   })
 
+  it('GIVEN the HUD action surface WHEN rendered THEN interactive buttons opt in via data-battle-interactive', () => {
+    // Overlay inactivity is enforced by the shell layer via hidden/inert;
+    // this test covers the complementary HUD-side pointer opt-in contract.
+    hudController.render(createState('preparation'), false, {
+      definitionId: 'weapon_power_plus_1',
+      cost: 100,
+      weaponPower: 1,
+      buttonDisabled: false,
+      statusCopy: null,
+    })
+
+    const interactiveButtons = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('[data-action]'),
+    )
+    expect(interactiveButtons.length).toBeGreaterThan(0)
+    expect(interactiveButtons.every((button) => button.dataset.battleInteractive === 'true')).toBe(true)
+  })
+
+  it('GIVEN running WHEN render called THEN disabled overlay buttons remain present but are inert-ready hit-test surfaces', () => {
+    hudController.render(createState('running'), false)
+
+    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
+    expect(queryButton(container, 'start-sortie').dataset.battleInteractive).toBe('true')
+    expect(queryButton(container, 'claim-reward').disabled).toBe(true)
+    expect(queryButton(container, 'claim-reward').dataset.battleInteractive).toBe('true')
+  })
+
   it('GIVEN running with ally and living enemy WHEN render called THEN assist status reports ready and assist button is reachable', () => {
     const state = createState('running')
     state.allies = [createDefaultAllyState(1)]
@@ -286,6 +313,21 @@ describe('HudController', () => {
     expect(container.querySelector('[data-field="assist-status"]')?.textContent).toBe(
       'No target to assist.',
     )
+  })
+
+  it('GIVEN running WHEN render called THEN HUD renders without a result-specific layout override', () => {
+    hudController.render(createState('running'), false)
+
+    expect(container.dataset.battleHudLayout).toBeUndefined()
+  })
+
+  it('GIVEN result WHEN render called THEN HUD keeps its action surface in the shared overlay shell', () => {
+    hudController.render(createState('result'), false)
+
+    expect(container.dataset.battleHudLayout).toBeUndefined()
+    expect(queryButton(container, 'confirm-result').disabled).toBe(false)
+    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
+    expect(container.querySelectorAll('[data-action]').length).toBeGreaterThan(0)
   })
 
   it('GIVEN active assist without assigned target WHEN render called THEN assist status reports signal sent', () => {
