@@ -1,4 +1,5 @@
 <!-- RETRO_E2E_PROOF_V1 start -->
+このブロックは public-safe な RETRO_E2E proof fixture を保持する。
 ```json
 {
   "schema": "chatgpt_retro_execution_proof/v1",
@@ -163,6 +164,7 @@
 <!-- RETRO_E2E_PROOF_V1 end -->
 
 <!-- CHATGPT_RETROSPECTIVE_RESULT_V1 start -->
+このブロックは retrospective result の fixture を保持する。
 ```json
 {
   "schema": "chatgpt_retrospective_result/v1",
