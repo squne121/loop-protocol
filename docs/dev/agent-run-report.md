@@ -58,7 +58,10 @@ Stop Condition に到達する前に次フェーズへ進まない。
 - `chatgpt-retro-context:resolve-live` は issue / pull request target を issue comments endpoint として扱い、marker comment だけでなく参照先 run report / retro index comment まで live fetch して digest chain を再検証する live resolver である
 - pull request target では追加で PR review / review comment / review thread の public-safe projection を取得し、pagination 完全性・ID catalog・object catalog・projection digest を返す
 - PR review surface を closure proof へ算入するときは、comment chain と review surface の両方が `resolved` であること、`page_budget_exhausted === false` / `reference_page_budget_exhausted === false` であることを同時に満たす
-- `chatgpt_retro_execution_proof/v1` で PR review surface を再検証するときは `operation_index_ref.revalidation_mode: embedded_payload` を使い、`embedded_payload` の tuple（repo / parent_issue / target）と operation index comment URL を proof target に bind する
+- `chatgpt_retro_execution_proof/v1` で PR review surface を再検証するときは `operation_index_ref.revalidation_mode: live_comment_fetch` を使い、operation index comment を live fetch して marker 抽出、payload digest 再計算、schema/semantic 再検証、tuple（repo / parent_issue / target）照合を fail closed で行う
+- `embedded_payload` は互換モードの public-safe snapshot として保持してよいが、PR review live proof の closure 判定は embedded snapshot 単独では満たさない
+- PR review surface の durable public artifact は `PR_REVIEW_SURFACE_LIVE_PROOF_V1` marker comment とし、selected object IDs、pagination 完全性、projection digest、operation index の再検証結果、proof target head SHA、contract snapshot URL だけを含める
+- `PR_REVIEW_SURFACE_LIVE_PROOF_V1` comment には raw diff hunk、raw API response、review body、secret、trace を含めない
 - `chatgpt-retro-context:resolve-live` は `resolved | missing | blocked_duplicate | blocked_malformed | blocked_malformed_marker_syntax | blocked_invalid_reference_chain | blocked_page_budget_exhausted | blocked_stale_write` の structured result を返す
 - `chatgpt-retro-context:post` の blocked state は helper 内部では throw / nonzero exit を使うが、CLI surface では `error_code` を持つ machine-readable JSON を stdout に返す
 

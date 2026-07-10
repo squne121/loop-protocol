@@ -116,3 +116,8 @@ checker は `pnpm agent-operation-session-index:check`（`scripts/check-agent-op
 PR review surface の公開検証証跡は、review・review comment・resolved thread それぞれの selected object IDs、
 pagination の完全性、projection digest、operation index の再検証結果を含む
 `PR_REVIEW_SURFACE_LIVE_PROOF_V1` comment として残し、後続 checker が機械的に再確認できる形を維持する。
+
+この live proof comment は public-safe projection 専用の耐久証跡であり、`chatgpt_retro_execution_proof/v1` の
+`pr_review_surface_live_proof_ref` から参照される。checker は comment URL、proof target PR/head SHA、contract snapshot、
+operation index digest、selected object IDs、pagination 完全性を fail closed で突き合わせるため、
+埋め込み snapshot だけではなく公開 comment 自体を残しておく必要がある。
