@@ -82,43 +82,6 @@ _ANCHOR_KNOWN_CONTEXT_REFRAME_IN_PLACE = {
 }
 
 
-def _scope_signal_delta_input() -> dict:
-    before_body = """\
-## Outcome
-
-Test with scope signal.
-
-## Allowed Paths
-
-- `.claude/skills/foo/bar.py`
-
-## Acceptance Criteria
-
-- [ ] AC1
-"""
-    return {
-        "before_body": before_body,
-        "current_body": _BODY_WITH_SCOPE_SIGNAL,
-        "after_body": _BODY_WITH_SCOPE_SIGNAL,
-        "source_refs": {"before": "fixture:before", "current": "fixture:current", "after": "fixture:after"},
-    }
-
-
-def _trusted_anchor_scope_delta_context(base: dict) -> dict:
-    context = dict(base)
-    context["scope_signal_delta_input"] = _scope_signal_delta_input()
-    context["scope_delta_decision"] = {
-        "status": "approved_by_trusted_anchor",
-        "implementation_go": False,
-        "anchor_author_association": "OWNER",
-        "anchor_comment_url": context.get("anchor_comment_url"),
-        "anchor_comment_hash": "b" * 64,
-        "allowed_path_deltas": ["docs/dev/something.md"],
-        "required_rerun": ["contract_review", "refinement_preflight"],
-    }
-    return context
-
-
 # ---------------------------------------------------------------------------
 # AC7: phase-sensitive semantics
 # ---------------------------------------------------------------------------
@@ -139,9 +102,8 @@ class TestPhaseSensitiveSemantics:
         AC7: When known_context indicates anchor reframe, scope signal is suppressed.
         triggered=False, reason_code=anchor_reframe_exclusion.
         """
-        known_context = _trusted_anchor_scope_delta_context(_ANCHOR_KNOWN_CONTEXT_REFRAME)
         triggered, reason, evidence = planner._detect_scope_signals(
-            _BODY_WITH_SCOPE_SIGNAL, known_context
+            _BODY_WITH_SCOPE_SIGNAL, _ANCHOR_KNOWN_CONTEXT_REFRAME
         )
         assert triggered is False
         assert reason == planner.SCOPE_SIGNAL_REASON_ANCHOR_REFRAME
@@ -150,9 +112,8 @@ class TestPhaseSensitiveSemantics:
         """
         AC7: Without anchor reframe context, scope signal IS triggered (2+ path layers).
         """
-        known_context = {"scope_signal_delta_input": _scope_signal_delta_input()}
         triggered, reason, evidence = planner._detect_scope_signals(
-            _BODY_WITH_SCOPE_SIGNAL, known_context
+            _BODY_WITH_SCOPE_SIGNAL, None
         )
         assert triggered is True
         assert reason == planner.SCOPE_SIGNAL_REASON_NEW_PATH_LAYER
@@ -161,9 +122,8 @@ class TestPhaseSensitiveSemantics:
         """
         AC7: classification=reframe_in_place also suppresses scope signal.
         """
-        known_context = _trusted_anchor_scope_delta_context(_ANCHOR_KNOWN_CONTEXT_REFRAME_IN_PLACE)
         triggered, reason, evidence = planner._detect_scope_signals(
-            _BODY_WITH_SCOPE_SIGNAL, known_context
+            _BODY_WITH_SCOPE_SIGNAL, _ANCHOR_KNOWN_CONTEXT_REFRAME_IN_PLACE
         )
         assert triggered is False
         assert reason == planner.SCOPE_SIGNAL_REASON_ANCHOR_REFRAME
@@ -200,7 +160,7 @@ class TestPhaseSensitiveSemantics:
         AC7: Injecting phase into known_context does not change scope signal suppression.
         """
         for _phase in NON_HARD_STOP_PHASES:
-            kc = _trusted_anchor_scope_delta_context(_ANCHOR_KNOWN_CONTEXT_REFRAME)
+            kc = dict(_ANCHOR_KNOWN_CONTEXT_REFRAME)
             kc["current_phase"] = _phase
             triggered, reason, _ = planner._detect_scope_signals(
                 _BODY_WITH_SCOPE_SIGNAL, kc
@@ -218,7 +178,7 @@ class TestPhaseSensitiveSemantics:
         Planner suppresses based on known_context anchor reframe flag, not phase.
         """
         for _phase in HARD_STOP_PHASES:
-            kc = _trusted_anchor_scope_delta_context(_ANCHOR_KNOWN_CONTEXT_REFRAME)
+            kc = dict(_ANCHOR_KNOWN_CONTEXT_REFRAME)
             kc["current_phase"] = _phase
             triggered, reason, _ = planner._detect_scope_signals(
                 _BODY_WITH_SCOPE_SIGNAL, kc
@@ -245,9 +205,8 @@ class TestExcludedByAnchorReframeAdapter:
         AC8: excluded_by_anchor_reframe=true when anchor reframe context present and scope triggered.
         _detect_scope_signals returns (False, anchor_reframe_exclusion, ...) meaning exclusion occurred.
         """
-        known_context = _trusted_anchor_scope_delta_context(_ANCHOR_KNOWN_CONTEXT_REFRAME)
         triggered, reason, evidence = planner._detect_scope_signals(
-            _BODY_WITH_SCOPE_SIGNAL, known_context
+            _BODY_WITH_SCOPE_SIGNAL, _ANCHOR_KNOWN_CONTEXT_REFRAME
         )
         # excluded_by_anchor_reframe is True when reason_code == SCOPE_SIGNAL_REASON_ANCHOR_REFRAME
         excluded_by_anchor_reframe = (reason == planner.SCOPE_SIGNAL_REASON_ANCHOR_REFRAME)
@@ -257,9 +216,8 @@ class TestExcludedByAnchorReframeAdapter:
         """
         AC8: excluded_by_anchor_reframe=false when no anchor context (scope fires normally).
         """
-        known_context = {"scope_signal_delta_input": _scope_signal_delta_input()}
         triggered, reason, evidence = planner._detect_scope_signals(
-            _BODY_WITH_SCOPE_SIGNAL, known_context
+            _BODY_WITH_SCOPE_SIGNAL, None
         )
         excluded_by_anchor_reframe = (reason == planner.SCOPE_SIGNAL_REASON_ANCHOR_REFRAME)
         assert excluded_by_anchor_reframe is False
@@ -299,9 +257,8 @@ class TestExcludedByAnchorReframeAdapter:
         # This is the "after" state: the field shows False when triggered is False.
         # But the reason_code=anchor_reframe_exclusion is the canonical signal.
 
-        known_context = _trusted_anchor_scope_delta_context(_ANCHOR_KNOWN_CONTEXT_REFRAME)
         triggered, reason, _ = planner._detect_scope_signals(
-            _BODY_WITH_SCOPE_SIGNAL, known_context
+            _BODY_WITH_SCOPE_SIGNAL, _ANCHOR_KNOWN_CONTEXT_REFRAME
         )
         # Per planner code: excluded_by_anchor_reframe = triggered AND reason == anchor_reframe
         excluded_by_anchor_reframe_field = (
