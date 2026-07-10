@@ -160,7 +160,7 @@ def test_ten_events_queued_then_forced_flush_calls_producer_exactly_once(
     env = make_env(tmp_path, producer)
     debounce_dir = Path(env["SESSION_MANIFEST_DEBOUNCE_DIR"])
     events_dir = debounce_dir / "events"
-    lock_path = debounce_dir / "worker.lock"
+    lock_path = debounce_dir / "locks" / "worker.lock"
 
     # AC1: suppress the autonomous worker by writing a live lock owned by us.
     write_active_lock(lock_path)
@@ -255,7 +255,7 @@ def test_readonly_bash_not_queued_with_suppressed_worker(tmp_path: Path):
     env = make_env(tmp_path, producer)
 
     debounce_dir = Path(env["SESSION_MANIFEST_DEBOUNCE_DIR"])
-    lock_path = debounce_dir / "worker.lock"
+    lock_path = debounce_dir / "locks" / "worker.lock"
     write_active_lock(lock_path)
 
     for _ in range(5):
@@ -290,7 +290,7 @@ def test_delta_sanitization_no_absolute_paths_in_spool(tmp_path: Path):
     env = make_env(tmp_path, producer)
 
     debounce_dir = Path(env["SESSION_MANIFEST_DEBOUNCE_DIR"])
-    lock_path = debounce_dir / "worker.lock"
+    lock_path = debounce_dir / "locks" / "worker.lock"
     write_active_lock(lock_path)
 
     result = run_front_gate(
@@ -357,7 +357,8 @@ def test_flush_with_stale_lock_recovers_and_flushes(tmp_path: Path):
     )
 
     # Write a stale lock: dead PID and ancient heartbeat.
-    lock_path = debounce_dir / "worker.lock"
+    lock_path = debounce_dir / "locks" / "worker.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path.write_text(
         json.dumps(
             {
@@ -413,7 +414,7 @@ def test_flush_does_not_steal_live_lock(tmp_path: Path):
         encoding="utf-8",
     )
 
-    lock_path = debounce_dir / "worker.lock"
+    lock_path = debounce_dir / "locks" / "worker.lock"
     write_active_lock(lock_path)
 
     result = run_flush(env)
@@ -439,7 +440,7 @@ def test_stdout_silent_during_enqueue(tmp_path: Path):
     env = make_env(tmp_path, producer)
 
     debounce_dir = Path(env["SESSION_MANIFEST_DEBOUNCE_DIR"])
-    lock_path = debounce_dir / "worker.lock"
+    lock_path = debounce_dir / "locks" / "worker.lock"
     write_active_lock(lock_path)
 
     result = run_front_gate(

@@ -10,9 +10,16 @@ import { spawn, spawnSync } from 'node:child_process'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const SCRIPT_PATH = fileURLToPath(import.meta.url)
 const REPO_ROOT = resolve(process.env.CLAUDE_PROJECT_DIR ?? resolve(__dirname, '..', '..'))
-const STATE_DIR = process.env.SESSION_MANIFEST_DEBOUNCE_DIR ?? join(REPO_ROOT, 'artifacts', 'session-manifest-debounce')
+// Issue #1409: default runtime state lives under the hook-owned subtree
+// artifacts/session-manifest-runtime/ (events/ + locks/), which the
+// privileged skill runtime executor (scripts/agent-guards/skill_runtime_exec.py) excludes from its
+// before/after repo-wide snapshot diff so this hook's own async writes
+// are never misattributed to a concurrently-running privileged child
+// command as an unauthorized_write_path violation.
+const STATE_DIR = process.env.SESSION_MANIFEST_DEBOUNCE_DIR ?? join(REPO_ROOT, 'artifacts', 'session-manifest-runtime')
 const EVENTS_DIR = join(STATE_DIR, 'events')
-const WORKER_LOCK = join(STATE_DIR, 'worker.lock')
+const LOCKS_DIR = join(STATE_DIR, 'locks')
+const WORKER_LOCK = join(LOCKS_DIR, 'worker.lock')
 const WINDOW_MS = Number.parseInt(process.env.SESSION_MANIFEST_DEBOUNCE_WINDOW_MS ?? '400', 10)
 const FLUSH_WAIT_MS = Number.parseInt(process.env.SESSION_MANIFEST_DEBOUNCE_FLUSH_WAIT_MS ?? '3000', 10)
 const LOCK_POLL_MS = Number.parseInt(process.env.SESSION_MANIFEST_DEBOUNCE_LOCK_POLL_MS ?? '100', 10)
@@ -54,6 +61,7 @@ function readStdin() {
 
 function ensureStateDir() {
   mkdirSync(EVENTS_DIR, { recursive: true })
+  mkdirSync(LOCKS_DIR, { recursive: true })
 }
 
 function nowMs() {
