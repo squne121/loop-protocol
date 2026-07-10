@@ -98,7 +98,7 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
 uv run --locked python3 .claude/skills/post-merge-cleanup/scripts/classify-git-state.py --format yaml
 ```
 
-`classify-git-state.py` は `git status --short` / `git stash list` / `git branch -vv` / `git worktree list --porcelain` を subprocess 配列形式で実行し、YAML 構造化出力を返す。`--format json` では加えて `scripts/agent-ops/temp_residue_classifier.py`（Issue #1417）の read-only 出力を `temp_residue_classification` field として含む（`temp_residue_classification/v1`。classifier 実行自体が失敗した場合は `null` を返し、entries が空の成功結果と区別する）。
+`classify-git-state.py` は `git status --short` / `git stash list` / `git branch -vv` / `git worktree list --porcelain` を subprocess 配列形式で実行し、YAML 構造化出力を返す。`--format yaml`（デフォルト）と `--format json` のどちらでも `scripts/agent-ops/temp_residue_classifier.py`（Issue #1417）の read-only 出力を `temp_residue_classification` field として含む（`temp_residue_classification/v1`。classifier 実行自体が失敗した場合は `null` を返し、entries が空の成功結果と明確に区別する。`null` を成功として扱ってはならない）。
 
 分類結果の読み方:
 - **削除可能**: `branches[*].gone == true` のブランチ / 対応 worktree（ステップ 3 で処理）
@@ -108,14 +108,22 @@ uv run --locked python3 .claude/skills/post-merge-cleanup/scripts/classify-git-s
 
 #### TEMP_CLEANUP_SAFETY_RULES_V1
 
+**現在の本 Skill / SubAgent の authority は read-only advisory のみである。** `temp_residue_classifier.py` の
+`recommendation: eligible_for_delete` は marker が valid であっても deletion authorization ではなく、本
+Skill / SubAgent はこのセクションのいかなる項目についても filesystem からの削除を一切実行しない
+（Issue #1417 PR #1427 review — marker を deletion authority に昇格させない）。
+
 ```yaml
 TEMP_CLEANUP_SAFETY_RULES_V1:
   never_delete:
     - "tmp/"
     - ".claude/tmp/"
     - ".claude/worktrees/"
-  may_delete_without_human:
-    - "owned session subdirectory under tmp/ or .claude/tmp/ only when ownership marker matches"
+  may_delete_without_human: []
+  advisory_candidates_for_future_executor_recheck:
+    - "owned session subdirectory under tmp/ or .claude/tmp/ only when ownership marker matches — advisory only; NOT an authorization for this Skill/SubAgent or any current executor to delete"
+  current_skill_authority:
+    temp_residue: report_only
   root_temporary_residue:
     cleanup_required:
       - ".tmp/"
@@ -125,16 +133,16 @@ TEMP_CLEANUP_SAFETY_RULES_V1:
       - "marker 不明の .tmp/**"
       - "marker 不明の .temp/**"
       - "marker 不明の .tmp-*/**"
-      - "denied alias（.tmp/ .temp/ .tmp-*/）配下は valid marker があっても常に report_only（初期実装のポリシー。Issue #1417）"
+      - "denied alias（.tmp/ .temp/ .tmp-*/）配下は valid marker があっても常に report_only_unconditionally（初期実装のポリシー。Issue #1417）"
   required_checks:
     - "relative path only"
-    - "Path.resolve(strict=False) under approved root"
-    - "git ls-files confirms untracked before deletion"
+    - "repo-relative path under an approved root, resolved via dir-fd chain (not pathname-based Path.resolve)"
+    - "git ls-files / git status confirms untracked before any future executor considers deletion"
 ```
 
 - `root temporary residue` は `scripts/agent-ops/temp_residue_classifier.py` が `temp_residue_classification/v1` として read-only 分類する（Issue #1417）。分類は `report_only` または `eligible_for_delete` の `recommendation` を返すのみで、filesystem mutation は一切行わない。
 - `tmp/`、`.claude/tmp/`、`.claude/worktrees/` の root 全体削除は自動実行対象にしない。
-- `eligible_for_delete` は「実削除 executor が削除直前に再検査してよい候補」を意味する advisory であり、classifier の serialized 出力単体を deletion authorization として扱ってはならない。実削除 executor（marker replay 防止・dir-fd I/O・postcondition 検証を含む）は本 Skill の scope 外であり、必要になった時点で別 Issue として設計する。
+- `eligible_for_delete` は「実削除 executor が削除直前に再検査してよい候補」を意味する advisory であり、classifier の serialized 出力単体を deletion authorization として扱ってはならない。ownership marker が valid であることも同様に deletion authorization ではない（accidental-isolation モデルの advisory hint に過ぎない）。実削除 executor（marker replay 防止・dir-fd I/O・postcondition 検証を含む）は本 Skill の scope 外であり、必要になった時点で別 Issue として設計する。それまでの間、本 Skill / SubAgent は `temp_residue_classification` の内容に関わらず一切の削除を実行しない。
 
 ### 2. main を origin/main に整合
 

@@ -3,12 +3,15 @@
 classify-git-state.py
 
 git status / git stash list / git branch -vv / git worktree list を実行し、
-YAML 構造化出力を返す。`--format json` では加えて read-only な
-`temp_residue_classification/v1`（Issue #1417,
+YAML 構造化出力を返す。`--format yaml`（デフォルト）/ `--format json` の
+どちらでも read-only な `temp_residue_classification/v1`（Issue #1417,
 scripts/agent-ops/temp_residue_classifier.py）を `temp_residue_classification`
-field として含める。分類器 の実行に失敗した場合は
-`temp_residue_classification: null` を返し、classifier failure を
-empty result（scan_status: ok かつ entries: []）と明確に区別する。
+field として含める（Issue #1417 PR #1427 review: 以前は `--format json` の
+場合にのみ含まれており、SKILL.md の Procedure が案内する既定の
+`--format yaml` 実行経路では分類結果が計算コストだけ発生して破棄されていた）。
+分類器の実行に失敗した場合は `temp_residue_classification: null` を返し、
+classifier failure を empty result（scan_status: ok かつ entries: []）と
+明確に区別する。呼び出し側は `null` を成功として扱ってはならない。
 
 Usage:
     python3 classify-git-state.py [--format yaml|json]
@@ -165,10 +168,10 @@ def main() -> None:
         "stashes": parse_stash_list(stash_raw),
         "branches": parse_branch_vv(branch_raw),
         "worktrees": parse_worktree_list(worktree_raw),
+        "temp_residue_classification": classify_temp_residue(),
     }
 
     if args.format == "json":
-        state["temp_residue_classification"] = classify_temp_residue()
         print(json.dumps(state, ensure_ascii=False, indent=2))
     else:
         # Simple YAML-like output

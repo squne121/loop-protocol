@@ -853,8 +853,8 @@ entries:
       required_for_breaking_change: true
       followup_issue_required: true
     last_verified:
-      commit: "ce6df511a08d87852168b4b03fa94d65100b04ab"
-      command_id: "lint_catalog_yaml"
+      commit: "2198d01374caedd3ad86a42e9dbb45ea285d4bb3"
+      command_id: "test_temp_residue_classifier"
 
   - schema_id: "temp_residue_owner/v1"
     format: json_schema
@@ -902,5 +902,5 @@ entries:
       required_for_breaking_change: true
       followup_issue_required: true
     last_verified:
-      commit: "ce6df511a08d87852168b4b03fa94d65100b04ab"
-      command_id: "lint_catalog_yaml"
+      commit: "2198d01374caedd3ad86a42e9dbb45ea285d4bb3"
+      command_id: "test_temp_residue_classifier"

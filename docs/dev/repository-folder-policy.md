@@ -6,6 +6,12 @@ root temporary residue の read-only 分類は `scripts/agent-ops/temp_residue_c
 （`temp_residue_classification/v1`、Issue #1417）が実装済みだが、これは read-only な advisory
 observation にとどまる。「ownership marker 付き session subdirectory だけを削除候補にできる」
 「marker 不明 residue は report-only」という運用制約は、実削除 executor が別途実装されるまで変わらない。
+以下の表の `cleanup_authority` 列は将来の実削除 executor に対する **運用方針** を示すものであり、
+現在の `post-merge-cleanup` Skill / SubAgent 自体の権限ではない。現在の Skill / SubAgent の authority は
+常に `report_only`（削除を一切実行しない）であり、これは `.claude/skills/post-merge-cleanup/SKILL.md` の
+`TEMP_CLEANUP_SAFETY_RULES_V1.current_skill_authority` が正本として明示する。ownership marker が valid
+であることは、将来の実削除 executor に対する advisory hint であって、いかなる現行コンポーネントに対する
+deletion authorization でもない。
 
 ## REPOSITORY_FOLDER_POLICY_V1
 
@@ -39,7 +45,7 @@ REPOSITORY_FOLDER_POLICY_V1:
     folder_class: root_temporary_alias
     git_tracking: untracked_residue
     lifecycle: cleanup_required_or_report_only
-    cleanup_authority: report_only_without_owned_marker
+    cleanup_authority: report_only_unconditionally
     publication_rule: never_publish
     guidance: advisory_only_replace_with_tmp
 
@@ -47,7 +53,7 @@ REPOSITORY_FOLDER_POLICY_V1:
     folder_class: root_temporary_alias
     git_tracking: untracked_residue
     lifecycle: cleanup_required_or_report_only
-    cleanup_authority: report_only_without_owned_marker
+    cleanup_authority: report_only_unconditionally
     publication_rule: never_publish
     guidance: advisory_only_replace_with_tmp
 
@@ -55,7 +61,7 @@ REPOSITORY_FOLDER_POLICY_V1:
     folder_class: root_temporary_alias
     git_tracking: untracked_residue
     lifecycle: cleanup_required_or_report_only
-    cleanup_authority: report_only_without_owned_marker
+    cleanup_authority: report_only_unconditionally
     publication_rule: never_publish
     guidance: advisory_only_replace_with_tmp
 ```

@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -400,11 +401,22 @@ class TestGitStateMixedUnknown:
         (repo / "tmp").mkdir()
         (repo / "tmp" / "session-x").mkdir()
 
+        real_run = subprocess.run
+
         def fake_run(argv, *args, **kwargs):
-            raise OSError("git unavailable")
+            # Only the batched git-state-index calls (ls-files / status) are
+            # simulated as unavailable here; project_root validation
+            # (`rev-parse --show-toplevel`) and repository slug resolution
+            # must keep working so this test isolates git_state_unknown
+            # specifically, rather than also collapsing project_root
+            # validation (covered separately by TestProjectRootValidation).
+            if argv and argv[0] == "git" and len(argv) > 1 and argv[1] in ("ls-files", "status"):
+                raise OSError("git unavailable")
+            return real_run(argv, *args, **kwargs)
 
         monkeypatch.setattr(classifier_mod.subprocess, "run", fake_run)
         result = _run_classify(repo)
+        assert result["project_root"]["validated"] is True
         entry = _entry(result, "tmp/session-x")
         assert entry["tracked_state"] == "unknown"
         assert entry["ignored_state"] == "unknown"
@@ -455,6 +467,7 @@ class TestScanLimitsPartial:
         assert result["scan_status"] == "partial"
         assert result["errors"]
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
     def test_scan_limits_partial_permission_denied_yields_scan_error(self, repo: Path):
         (repo / "tmp").mkdir()
         session = repo / "tmp" / "session-noperm"
@@ -464,7 +477,12 @@ class TestScanLimitsPartial:
         (session / "locked").chmod(0o000)
         try:
             result = _run_classify(repo)
-            assert result["scan_status"] in ("ok", "partial", "error")
+            assert result["scan_status"] == "partial"
+            entry = _entry(result, "tmp/session-noperm")
+            assert entry["recommendation"] == "report_only"
+            assert "scan_incomplete" in entry["reason_codes"]
+            assert "permission_denied" in entry["reason_codes"]
+            assert any(e.get("reason_code") == "permission_denied" for e in result["errors"])
         finally:
             (session / "locked").chmod(0o700)
 
@@ -532,7 +550,27 @@ class TestPostMergeCleanupIntegration:
         payload = json.loads(proc.stdout)
         assert "temp_residue_classification" in payload
         trc = payload["temp_residue_classification"]
-        assert trc is None or trc.get("schema") == "temp_residue_classification/v1"
+        # A controlled test fixture (real git repo, readable cwd) must always
+        # produce a successful classifier run; `null` here would silently
+        # mask a classifier failure as success (Issue #1417 PR #1427 review).
+        assert trc is not None, "classifier failure (null) must not be treated as success"
+        assert trc.get("schema") == "temp_residue_classification/v1"
+
+    def test_post_merge_cleanup_integration_yaml_format_also_includes_field(self, repo: Path, monkeypatch):
+        """The default (`--format yaml`) execution path used by
+        post-merge-cleanup/SKILL.md step 1 must also carry the classification,
+        not only `--format json` (Issue #1417 PR #1427 review)."""
+        script = REPO_ROOT / ".claude" / "skills" / "post-merge-cleanup" / "scripts" / "classify-git-state.py"
+        monkeypatch.chdir(repo)
+        proc = subprocess.run(
+            [sys.executable, str(script), "--format", "yaml"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "temp_residue_classification:" in proc.stdout
+        assert "schema: temp_residue_classification/v1" in proc.stdout
 
     def test_post_merge_cleanup_integration_empty_result_distinguished_from_failure(self, repo: Path, monkeypatch):
         script = REPO_ROOT / ".claude" / "skills" / "post-merge-cleanup" / "scripts" / "classify-git-state.py"
@@ -549,3 +587,293 @@ class TestPostMergeCleanupIntegration:
         assert trc is not None
         assert trc["scan_status"] in ("ok", "partial", "error")
         assert trc["entries"] == [] or isinstance(trc["entries"], list)
+
+    def test_post_merge_cleanup_integration_classifier_failure_yields_null(
+        self, repo: Path, monkeypatch
+    ):
+        """When the classifier itself raises (import/exec failure),
+        `classify_temp_residue()` must catch it and surface `None` — never a
+        fabricated success-shaped payload — so `is not None` reliably
+        distinguishes a real run from a failed one."""
+        script_path = REPO_ROOT / ".claude" / "skills" / "post-merge-cleanup" / "scripts" / "classify-git-state.py"
+        spec = importlib.util.spec_from_file_location("classify_git_state_under_test", script_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["classify_git_state_under_test"] = module
+        spec.loader.exec_module(module)
+
+        monkeypatch.chdir(repo)
+
+        fake_mod = types.ModuleType("temp_residue_classifier")
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("simulated classifier construction failure")
+
+        fake_mod.ScanLimits = _boom
+        monkeypatch.setitem(sys.modules, "temp_residue_classifier", fake_mod)
+
+        result = module.classify_temp_residue()
+        assert result is None
+
+
+# --------------------------------------------------------------------------- #
+# symlink_component_escape (Issue #1417 PR #1427 review P0-1)
+# --------------------------------------------------------------------------- #
+class TestSymlinkComponentEscape:
+    def test_symlink_component_escape_claude_symlink_is_not_followed(self, repo: Path, tmp_path: Path):
+        """`.claude` itself being a symlink to an out-of-repo directory must
+        not let the classifier traverse outside the repository."""
+        outside = tmp_path / "outside-secret"
+        outside.mkdir()
+        (outside / "tmp").mkdir()
+        (outside / "tmp" / "leaked").mkdir()
+        (repo / ".claude").symlink_to(outside, target_is_directory=True)
+        result = _run_classify(repo)
+        for entry in result["entries"]:
+            assert "leaked" not in entry["path"]
+            assert "outside-secret" not in entry["path"]
+
+    def test_symlink_component_escape_mid_scan_root_swap_is_refused(self, repo: Path, tmp_path: Path):
+        """A component swapped to a symlink between project_root resolution
+        and the walk (simulated by pre-creating the symlink before the run)
+        must be refused via O_NOFOLLOW, not silently followed."""
+        outside = tmp_path / "outside-secret-2"
+        outside.mkdir()
+        (repo / "tmp").symlink_to(outside, target_is_directory=True)
+        result = _run_classify(repo)
+        entry = _entry(result, "tmp")
+        assert entry["entry_type"] == "symlink"
+        assert entry["recommendation"] == "report_only"
+
+
+# --------------------------------------------------------------------------- #
+# invalid_filename_encoding (Issue #1417 PR #1427 review P0-4)
+# --------------------------------------------------------------------------- #
+class TestInvalidFilenameEncoding:
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX raw byte filenames only")
+    def test_invalid_filename_encoding_undecodable_name_is_skipped_safely(self, repo: Path):
+        (repo / "tmp").mkdir()
+        bad_name = os.fsdecode(b"session-\xff\xfe")
+        os.mkdir(os.path.join(str(repo / "tmp"), bad_name))
+        result = _run_classify(repo)
+        assert result["scan_status"] == "partial"
+        assert any(e.get("reason_code") == "invalid_filename_encoding" for e in result["errors"])
+        # The emitted JSON payload itself must be strict UTF-8 encodable.
+        json.dumps(result, ensure_ascii=False).encode("utf-8", errors="strict")
+        for entry in result["entries"]:
+            entry["path"].encode("utf-8", errors="strict")
+
+
+# --------------------------------------------------------------------------- #
+# project_root_validation (Issue #1417 PR #1427 review P0-5)
+# --------------------------------------------------------------------------- #
+class TestProjectRootValidation:
+    def test_project_root_validation_git_totally_unavailable_fails_closed(self, repo: Path, monkeypatch):
+        """If `git` itself is unavailable, project_root cannot be validated,
+        so the whole scan must fail closed (no entries), not merely mark
+        git-derived fields as unknown while still emitting candidates."""
+        (repo / "tmp").mkdir()
+        (repo / "tmp" / "session-x").mkdir()
+
+        def fake_run(*_args, **_kwargs):
+            raise OSError("git unavailable")
+
+        monkeypatch.setattr(classifier_mod.subprocess, "run", fake_run)
+        result = _run_classify(repo)
+        assert result["project_root"]["validated"] is False
+        assert result["entries"] == []
+        assert result["scan_status"] in ("partial", "error")
+
+    def test_project_root_validation_non_git_directory_is_not_validated(self, tmp_path: Path):
+        plain_dir = tmp_path / "not-a-repo"
+        plain_dir.mkdir()
+        result = _run_classify(plain_dir, session_id="session-a")
+        assert result["project_root"]["validated"] is False
+        assert result["scan_status"] in ("partial", "error")
+        assert result["entries"] == []
+
+    def test_project_root_validation_explicit_root_not_toplevel_is_not_validated(self, repo: Path):
+        (repo / "tmp").mkdir()
+        subdir = repo / "tmp"
+        result = classifier_mod.run_classification(str(subdir), classifier_mod.ScanLimits(), "session-a")
+        assert result["project_root"]["validated"] is False
+        assert result["entries"] == []
+
+    def test_project_root_validation_success_marks_validated_true(self, repo: Path):
+        (repo / "tmp").mkdir()
+        result = _run_classify(repo)
+        assert result["project_root"]["validated"] is True
+
+
+# --------------------------------------------------------------------------- #
+# git_state_batched_index (Issue #1417 PR #1427 review P0-3)
+# --------------------------------------------------------------------------- #
+class TestGitStateBatchedIndex:
+    def test_git_state_batched_index_uses_at_most_two_git_subprocess_calls_for_state(self, repo: Path):
+        (repo / "tmp").mkdir()
+        for i in range(10):
+            session = repo / "tmp" / f"session-{i}"
+            session.mkdir()
+            (session / "f.txt").write_text("x\n")
+
+        real_run = subprocess.run
+        git_state_calls: list[list[str]] = []
+
+        def spy_run(argv, *args, **kwargs):
+            if argv and argv[0] == "git" and len(argv) > 1 and argv[1] in ("ls-files", "status"):
+                git_state_calls.append(list(argv))
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch("subprocess.run", side_effect=spy_run):
+            _run_classify(repo)
+
+        assert len(git_state_calls) == 2, git_state_calls
+
+    def test_git_state_batched_index_deadline_before_git_calls_yields_unknown(self, repo: Path):
+        (repo / "tmp").mkdir()
+        (repo / "tmp" / "session-x").mkdir()
+        result = _run_classify(repo, deadline_seconds=0.0)
+        assert result["scan_status"] == "partial"
+        assert result["errors"]
+
+
+# --------------------------------------------------------------------------- #
+# max_depth_completion_state (Issue #1417 PR #1427 review P0-2)
+# --------------------------------------------------------------------------- #
+class TestMaxDepthCompletionState:
+    def test_max_depth_completion_state_truncation_marks_scan_incomplete(self, repo: Path):
+        (repo / "tmp").mkdir()
+        session = repo / "tmp" / "session-deep"
+        session.mkdir()
+        _write_marker(session, _make_valid_marker("session-a", "tmp/session-deep"))
+        nested = session
+        for i in range(5):
+            nested = nested / f"level-{i}"
+            nested.mkdir()
+        result = _run_classify(repo, max_depth=1)
+        assert result["scan_status"] == "partial"
+        entry = _entry(result, "tmp/session-deep")
+        assert entry["recommendation"] == "report_only"
+        assert "scan_incomplete" in entry["reason_codes"]
+        assert any(e.get("reason_code") == "max_depth_exceeded" for e in result["errors"])
+
+    def test_max_depth_completion_state_within_bound_is_not_marked_incomplete(self, repo: Path):
+        (repo / "tmp").mkdir()
+        session = repo / "tmp" / "session-shallow"
+        session.mkdir()
+        _write_marker(session, _make_valid_marker("session-a", "tmp/session-shallow"))
+        (session / "f.txt").write_text("x\n")
+        result = _run_classify(repo, max_depth=32)
+        entry = _entry(result, "tmp/session-shallow")
+        assert "scan_incomplete" not in entry["reason_codes"]
+        assert entry["recommendation"] == "eligible_for_delete"
+
+
+# --------------------------------------------------------------------------- #
+# marker_toctou_and_schema_parity (Issue #1417 PR #1427 review P0-6)
+# --------------------------------------------------------------------------- #
+class TestMarkerTOCTOUAndSchemaParity:
+    def test_marker_toctou_hard_linked_marker_is_untrusted(self, tmp_path: Path):
+        marker_path = tmp_path / marker_mod.MARKER_FILENAME
+        marker_path.write_text(json.dumps(_make_valid_marker("s", "tmp/session-1")))
+        marker_path.chmod(0o600)
+        other = tmp_path / "other-link.json"
+        os.link(str(marker_path), str(other))
+        result = marker_mod.read_marker_file(str(marker_path))
+        assert result.state == marker_mod.STATE_UNTRUSTED
+
+    def test_marker_toctou_dir_fd_relative_read_matches_path_based_read(self, tmp_path: Path):
+        marker = _make_valid_marker("session-a", "tmp/session-1")
+        _write_marker(tmp_path, marker)
+        path_result = marker_mod.read_marker_file(str(tmp_path / marker_mod.MARKER_FILENAME))
+        fd = os.open(str(tmp_path), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fd_result = marker_mod.read_marker_file_at(fd)
+        finally:
+            os.close(fd)
+        assert path_result.state == fd_result.state == marker_mod.STATE_VALID
+        assert path_result.data == fd_result.data
+
+    def test_marker_toctou_dir_fd_relative_symlink_rejected(self, tmp_path: Path):
+        real = tmp_path / "real.json"
+        real.write_text(json.dumps(_make_valid_marker("s", "tmp/session-1")))
+        link = tmp_path / marker_mod.MARKER_FILENAME
+        link.symlink_to(real)
+        fd = os.open(str(tmp_path), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            result = marker_mod.read_marker_file_at(fd)
+        finally:
+            os.close(fd)
+        assert result.state == marker_mod.STATE_UNTRUSTED
+
+    def test_marker_schema_parity_marker_id_non_hex_suffix_rejected_by_both(self):
+        """`tro-!!!!!!!!` is 12 chars (passes a naive length-only check) but
+        must be rejected by the Python validator exactly as it would be by
+        the JSON Schema's `^tro-[0-9a-fA-F-]{8,}$` pattern."""
+        marker = _make_valid_marker("s", "tmp/session-1")
+        marker["marker_id"] = "tro-!!!!!!!!"
+        ok, reason = marker_mod.validate_marker_schema(marker)
+        assert not ok
+        assert reason == "marker_id_invalid"
+
+    def test_marker_schema_parity_session_id_over_256_chars_rejected(self):
+        marker = _make_valid_marker("s" * 257, "tmp/session-1")
+        ok, reason = marker_mod.validate_marker_schema(marker)
+        assert not ok
+        assert reason == "session_id_invalid"
+
+    def test_marker_schema_parity_target_relpath_outside_approved_roots_rejected(self):
+        marker = _make_valid_marker("s", "tmp/session-1")
+        marker["target_relpath"] = "not-approved/session-1"
+        ok, reason = marker_mod.validate_marker_schema(marker)
+        assert not ok
+        assert reason == "target_relpath_invalid"
+
+    def test_marker_schema_parity_jsonschema_agrees_with_python_validator(self):
+        """Positive/negative corpus cross-checked against the JSON Schema
+        directly, when jsonschema is available."""
+        pytest.importorskip("jsonschema")
+        from jsonschema import Draft202012Validator
+
+        schema_path = REPO_ROOT / "schemas" / "temp_residue_owner_v1.schema.json"
+        with schema_path.open() as f:
+            schema = json.load(f)
+        validator = Draft202012Validator(schema)
+
+        positive = [_make_valid_marker("s", "tmp/session-1")]
+        negative = []
+        bad1 = _make_valid_marker("s", "tmp/session-1")
+        bad1["marker_id"] = "tro-!!!!!!!!"
+        negative.append(bad1)
+        bad2 = _make_valid_marker("s" * 257, "tmp/session-1")
+        negative.append(bad2)
+        bad3 = _make_valid_marker("s", "tmp/session-1")
+        bad3["target_relpath"] = "not-approved/session-1"
+        negative.append(bad3)
+
+        for marker in positive:
+            schema_ok = validator.is_valid(marker)
+            py_ok, _ = marker_mod.validate_marker_schema(marker)
+            assert schema_ok is True
+            assert py_ok is True
+        for marker in negative:
+            schema_ok = validator.is_valid(marker)
+            py_ok, _ = marker_mod.validate_marker_schema(marker)
+            assert schema_ok is False
+            assert py_ok is False
+
+    def test_marker_schema_parity_repository_none_does_not_wildcard_match(self):
+        """An unresolved expected_repository (origin unknown) must never
+        wildcard-match every marker's repository field."""
+        marker = _make_valid_marker("session-a", "tmp/session-1", repository="squne121/loop-protocol")
+        result_data = marker_mod.MarkerResult(
+            state=marker_mod.STATE_VALID, data=marker, reason=None
+        )
+        evaluated = marker_mod._evaluate_marker_result(
+            result_data,
+            current_session_id="session-a",
+            expected_target_relpath="tmp/session-1",
+            expected_repository=None,
+            now=None,
+        )
+        assert evaluated.state == marker_mod.STATE_MISMATCH
