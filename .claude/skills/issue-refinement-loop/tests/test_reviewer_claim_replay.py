@@ -1185,3 +1185,107 @@ def test_cli_trimming_preserves_taxonomy_gap_and_checker_gap_fields(tmp_path: Pa
         assert "checker_gap" in blocker
         assert "normalized_kind" in blocker
         assert "checker_artifact_inconsistency" in blocker
+
+
+# --------------------------------------------------------------------------
+# Issue #1406 regression: VCP_BROAD_SEARCH_PATH_UN readiness error (or
+# equivalent direct vc_preflight_result category) backs the
+# broad_search_path_unbounded taxonomy entry as deterministic_fail_confirmed.
+# --------------------------------------------------------------------------
+
+READINESS_VCP_BROAD_SEARCH_PATH_UN = {
+    "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+    "body_sha256": "sha256:body-a",
+    "errors": [
+        {
+            "rule_id": "VCP_BROAD_SEARCH_PATH_UN",
+            "source_check": "baseline_vc_preflight",
+            "category": "broad_search_path_unbounded",
+            "line_start": 15,
+            "line_end": 15,
+            # PR #1412 review (Blocker 2): source_payload must reflect the
+            # real baseline_vc_preflight.py producer shape for this
+            # readiness error to be adopted as broad-path evidence.
+            "source_payload": {
+                "classification": "blocked",
+                "category": "broad_search_path_unbounded",
+                "decision": "blocked",
+                "scope_class": "baseline_fail_expected",
+            },
+        }
+    ],
+}
+
+COMPACT_BROAD_SEARCH_PATH_UNBOUNDED = {
+    "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
+    "issue_url": "https://github.com/squne121/loop-protocol/issues/1406",
+    "body_sha256": "sha256:body-a",
+    "blocking_issues": [
+        {"code": "VCP_BROAD_SEARCH_PATH_UN", "message": "rg broad search path unbounded"}
+    ],
+    "structured_blockers": [],
+    "findings": [],
+}
+
+
+def test_broad_search_path_unbounded_readiness_error_is_deterministic_backed():
+    result, _ = analyze(
+        review_result=COMPACT_BROAD_SEARCH_PATH_UNBOUNDED,
+        readiness_result=READINESS_VCP_BROAD_SEARCH_PATH_UN,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
+    assert result["verdict"] == "deterministic_fail_confirmed"
+    assert result["verdict_detail_v1"] == "deterministic_fail_confirmed"
+    assert result["should_consume_iteration"] is True
+    blocker = result["blockers"][0]
+    assert blocker["normalized_kind"] == "broad_search_path_unbounded"
+    assert blocker["checker_gap"] is False
+    assert blocker["evidence"][0]["rule_id"] == "VCP_BROAD_SEARCH_PATH_UN"
+    assert blocker["evidence"][0]["source_check"] == "baseline_vc_preflight"
+
+
+def test_broad_search_path_unbounded_direct_vc_preflight_producer_shape_is_deterministic_backed():
+    preflight = _producer_vc_preflight_result(
+        result_overrides={
+            "classification": "blocked",
+            "category": "broad_search_path_unbounded",
+            "decision": "blocked",
+        }
+    )
+    result, _ = analyze(
+        review_result=COMPACT_BROAD_SEARCH_PATH_UNBOUNDED,
+        readiness_result=READINESS_CLEAN,
+        vc_syntax_result=None,
+        vc_preflight_result=preflight,
+        previous_state={},
+    )
+    assert result["verdict"] == "deterministic_fail_confirmed"
+    assert result["should_consume_iteration"] is True
+    blocker = result["blockers"][0]
+    assert blocker["normalized_kind"] == "broad_search_path_unbounded"
+    assert blocker["evidence"][0]["source_check"] == "baseline_vc_preflight"
+    assert blocker["evidence"][0]["category"] == "broad_search_path_unbounded"
+
+
+def test_broad_search_path_unbounded_vc_preflight_requires_matching_source_body_sha256():
+    preflight = _producer_vc_preflight_result(
+        body_sha256="sha256:old",
+        result_overrides={
+            "classification": "blocked",
+            "category": "broad_search_path_unbounded",
+            "decision": "blocked",
+        },
+    )
+    result, _ = analyze(
+        review_result=COMPACT_BROAD_SEARCH_PATH_UNBOUNDED,
+        readiness_result=READINESS_CLEAN,
+        vc_syntax_result=None,
+        vc_preflight_result=preflight,
+        previous_state={},
+    )
+    assert result["verdict"] == "input_or_runtime_error"
+    assert result["verdict_detail_v1"] == "input_or_runtime_error"
+    assert result["should_consume_iteration"] is False
+    assert result["reason_code"] == "vc_preflight_body_sha_mismatch"

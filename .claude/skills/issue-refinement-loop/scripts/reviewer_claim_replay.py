@@ -101,6 +101,20 @@ REVIEWER_CHECKER_TAXONOMY_V1: list[dict[str, Any]] = [
         "readiness_category_source_check": "baseline_vc_preflight",
         "domain_keys": ["vc_unexpected_pass"],
     },
+    {
+        "entry_id": "broad_search_path_unbounded",
+        "reviewer_codes": [
+            "vcp_broad_search_path_un",
+            "VCP_BROAD_SEARCH_PATH_UN",
+            "broad_search_path_unbounded",
+        ],
+        "deterministic_checks": [],
+        "readiness_rule_ids": ["VCP_BROAD_SEARCH_PATH_UN"],
+        "readiness_rule_id_source_check": "baseline_vc_preflight",
+        "readiness_categories": ["broad_search_path_unbounded"],
+        "readiness_category_source_check": "baseline_vc_preflight",
+        "domain_keys": ["broad_search_path_unbounded"],
+    },
 ]
 
 TAXONOMY_BY_ENTRY_ID: dict[str, dict[str, Any]] = {
@@ -227,6 +241,32 @@ def _extract_findings(review_result: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in findings if isinstance(item, dict)]
 
 
+# PR #1412 review (High item): readiness rule_id is generated as
+# `f"VCP_{category.upper()[:20]}"` (contract_readiness_check.py), so distinct
+# categories can truncate to the same rule_id (e.g. broad_search_path_unbounded
+# / broad_search_path_unrelated both -> VCP_BROAD_SEARCH_PATH_UN). For entries
+# in this set, _matching_readiness_errors() requires rule_id AND category (not
+# OR) to match, plus a producer-shape source_payload (Blocker 2), before
+# treating a readiness error as broad-path evidence.
+_STRICT_READINESS_SOURCE_PAYLOAD_KINDS = frozenset({"broad_search_path_unbounded"})
+
+
+def _has_valid_broad_search_source_payload(err: dict[str, Any]) -> bool:
+    """PR #1412 review (Blocker 2): a readiness error's `source_payload` must
+    reflect the real baseline_vc_preflight.py producer shape for the
+    broad_search_path_unbounded category, not just carry a matching
+    rule_id/category label pair."""
+    payload = err.get("source_payload")
+    if not isinstance(payload, dict):
+        return False
+    return (
+        payload.get("classification") == "blocked"
+        and payload.get("category") == "broad_search_path_unbounded"
+        and payload.get("decision") == "blocked"
+        and payload.get("scope_class") == "baseline_fail_expected"
+    )
+
+
 def _matching_readiness_errors(kind: str, readiness_result: dict[str, Any]) -> list[dict[str, Any]]:
     entry = TAXONOMY_BY_ENTRY_ID.get(kind)
     if entry is None:
@@ -236,12 +276,24 @@ def _matching_readiness_errors(kind: str, readiness_result: dict[str, Any]) -> l
     rule_id_source_check = entry.get("readiness_rule_id_source_check")
     categories = frozenset(entry["readiness_categories"])
     category_source_check = entry.get("readiness_category_source_check")
+    strict_source_payload = kind in _STRICT_READINESS_SOURCE_PAYLOAD_KINDS
     for err in readiness_result.get("errors", []):
         if not isinstance(err, dict):
             continue
         rule_id = str(err.get("rule_id") or "")
         category = str(err.get("category") or "")
         source_check = str(err.get("source_check") or "")
+
+        if strict_source_payload:
+            rule_id_ok = rule_id in rule_ids and (
+                rule_id_source_check is None or source_check == rule_id_source_check
+            )
+            category_ok = category in categories and (
+                category_source_check is None or source_check == category_source_check
+            )
+            if rule_id_ok and category_ok and _has_valid_broad_search_source_payload(err):
+                matches.append(err)
+            continue
 
         if rule_id in rule_ids and (rule_id_source_check is None or source_check == rule_id_source_check):
             matches.append(err)
@@ -259,6 +311,16 @@ def _validate_minimal_schema(payload: dict[str, Any], label: str, required_keys:
         raise ValueError(f"{label} missing required keys: {', '.join(missing)}")
 
 
+# PR #1412 review (Blocker 1): kinds in this set require the direct
+# vc_preflight_result artifact to match baseline_vc_preflight.py's real
+# producer shape exactly (schema + classification + scope_class), not just
+# category/decision, before it is treated as deterministic evidence. A
+# schema mismatch is an artifact contract violation and fails closed
+# (ValueError -> input_or_runtime_error) rather than silently falling back
+# to "unbacked".
+_STRICT_VC_PREFLIGHT_PRODUCER_SHAPE_KINDS = frozenset({"broad_search_path_unbounded"})
+
+
 def _matching_vc_preflight(kind: str, vc_preflight_result: dict[str, Any] | None) -> list[dict[str, Any]]:
     if vc_preflight_result is None:
         return []
@@ -267,6 +329,15 @@ def _matching_vc_preflight(kind: str, vc_preflight_result: dict[str, Any] | None
         raise ValueError("vc-preflight-result-file.results must be a list")
     if str(vc_preflight_result.get("status") or "") != "blocked":
         return []
+    if (
+        kind in _STRICT_VC_PREFLIGHT_PRODUCER_SHAPE_KINDS
+        and vc_preflight_result.get("schema") != "baseline_vc_preflight/v1"
+    ):
+        raise ValueError(
+            "vc-preflight-result-file has an unsupported schema for "
+            f"{kind!r} evidence (expected 'baseline_vc_preflight/v1', "
+            f"got {vc_preflight_result.get('schema')!r})"
+        )
     entry = TAXONOMY_BY_ENTRY_ID.get(kind)
     categories = frozenset(entry["readiness_categories"]) if entry else frozenset()
     matches: list[dict[str, Any]] = []
@@ -280,6 +351,13 @@ def _matching_vc_preflight(kind: str, vc_preflight_result: dict[str, Any] | None
         if kind == "unexpected_pass" and (
             item.get("classification") != "unexpected_pass"
             or item.get("category") != "unexpected_pass"
+        ):
+            continue
+        if kind == "broad_search_path_unbounded" and (
+            item.get("classification") != "blocked"
+            or item.get("category") != "broad_search_path_unbounded"
+            or item.get("decision") != "blocked"
+            or item.get("scope_class") != "baseline_fail_expected"
         ):
             continue
         matches.append(item)

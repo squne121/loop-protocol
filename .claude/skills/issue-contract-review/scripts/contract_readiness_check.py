@@ -323,6 +323,11 @@ _PREFLIGHT_CATEGORY_TO_READINESS: dict[str, str] = {
     # non-canonical VC shape that the Issue body author can fix by rewriting the VC
     # to reference a not-yet-created test file instead → needs_fix (not human_judgment).
     "existing_file_missing_node_id_noncanonical": "needs_fix",
+    # Issue #1406 (Blocker 2, PR #1412 review): a Verification Command with an
+    # unbounded `rg` search path (no explicit path argument, so it recurses
+    # over the whole repo) is a body-author-fixable VC-scope problem, not an
+    # environment/tooling issue -> needs_fix (not human_judgment).
+    "broad_search_path_unbounded": "needs_fix",
 }
 
 

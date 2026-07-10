@@ -393,6 +393,41 @@ hook_boundaries_manifest_v1:
       失敗時（jq 不在・JSON parse error 等）も exit 0（fail-open）で継続する。
       block してはならない（AC2）。fail_open を維持する。
 
+  - handler_id: root_temporary_residue_advisory
+    event: PreToolUse
+    matcher: "Bash|Write|Edit|MultiEdit"
+    command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/root_temporary_residue_advisory.sh"
+    args: []
+    timeout: 10
+    classification: warning
+    fail_policy: fail_open
+    script_exit_contract:
+      normal: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: PreToolUse
+      exit_2_effect: blocks_tool_call
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
+    stdout_contract: hookSpecificOutput_additionalContext_on_match_silent_otherwise
+    stderr_contract: silent_or_minimal_on_failure
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
+    agent_action:
+      on_match: emit_advisory_and_proceed
+      on_no_match: proceed_silently
+      on_any_failure: proceed
+    notes: >
+      repo root の `.tmp/`、`.temp/`、`.tmp-*` を検出した場合に
+      REPO_TEMP_FOLDER_ADVICE_V1 を stdout に出力する non-blocking advisory。
+      stdout 形式は hookSpecificOutput.additionalContext ラッパーに準拠する:
+      { "hookSpecificOutput": { "hookEventName": "PreToolUse", "additionalContext": "REPO_TEMP_FOLDER_ADVICE_V1 {inner_json}" } }
+      inner payload スキーマ: schemas/repo_temp_folder_advice_v1.schema.json
+      block: false を固定し、tool call を止めずに `tmp/` または `.claude/tmp/` への移行を案内する。
+      local_main_branch_guard の classification: blocker は維持し、この hook に deny logic を混在させない。
+
   - handler_id: save_loop_state_before_compaction
     event: PreCompact
     matcher: null
