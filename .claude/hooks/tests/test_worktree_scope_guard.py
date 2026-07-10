@@ -2604,3 +2604,83 @@ def _add_guard_paths(mod, guard_py):
         p = str(repo / sub)
         if p not in sys.path:
             sys.path.insert(0, p)
+
+
+def test_publish_lane_push_allowed_when_remote_and_reviewed_heads_match(tmp_path):
+    repo = _make_repo_with_worktree(tmp_path, issue="942")
+    _git("update-ref", "refs/remotes/origin/issue-942-x", "HEAD", cwd=repo["worktree"])
+    head = _git("rev-parse", "HEAD", cwd=repo["worktree"]).stdout.strip()
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": "rtk git " + "push origin HEAD:refs/heads/issue-942-x"},
+        "cwd": str(repo["worktree"]),
+    }
+    r = _run_guard(
+        payload,
+        repo["root"],
+        issue="942",
+        extra_env={
+            "LOOP_PUBLISH_EXPECTED_REMOTE_HEAD": head,
+            "LOOP_PUBLISH_CURRENT_REMOTE_HEAD": head,
+            "LOOP_PUBLISH_DECLARED_PUBLISH_HEAD": head,
+            "LOOP_PUBLISH_VERIFIED_HEAD": head,
+            "LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS": "ok",
+            "LOOP_PUBLISH_REMOTE_READBACK_SOURCE": "fetch_then_show_ref",
+        },
+    )
+    assert r.returncode == 0, r.stderr
+
+
+def test_publish_lane_push_denies_missing_strict_context(tmp_path):
+    repo = _make_repo_with_worktree(tmp_path, issue="942")
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": "rtk git " + "push origin HEAD:refs/heads/issue-942-x"},
+        "cwd": str(repo["worktree"]),
+    }
+    r = _run_guard(payload, repo["root"], issue="942")
+
+    assert r.returncode == 2, r.stderr
+    assert "PUBLISH_SAFETY_STOP_REPORT_V1:" in r.stderr
+    assert "publish_guard_context_missing" in r.stderr
+    assert "decision_inputs_complete: false" in r.stderr
+
+
+def test_publish_lane_push_emits_safety_stop_report_for_fast_forward_remote_head(tmp_path):
+    repo = _make_repo_with_worktree(tmp_path, issue="942")
+    expected_head = _git("rev-parse", "HEAD", cwd=repo["worktree"]).stdout.strip()
+    main = repo["root"]
+    (main / "README.md").write_text("next\n")
+    _git("add", "README.md", cwd=main)
+    _git("commit", "-q", "-m", "next", cwd=main)
+    remote_head = _git("rev-parse", "HEAD", cwd=main).stdout.strip()
+    _git("reset", "--hard", expected_head, cwd=repo["worktree"])
+    _git("update-ref", "refs/remotes/origin/issue-942-x", remote_head, cwd=repo["worktree"])
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": "rtk git " + "push origin HEAD:refs/heads/issue-942-x"},
+        "cwd": str(repo["worktree"]),
+    }
+    r = _run_guard(
+        payload,
+        repo["root"],
+        issue="942",
+        extra_env={
+            "LOOP_PUBLISH_EXPECTED_REMOTE_HEAD": expected_head,
+            "LOOP_PUBLISH_CURRENT_REMOTE_HEAD": remote_head,
+            "LOOP_PUBLISH_DECLARED_PUBLISH_HEAD": expected_head,
+            "LOOP_PUBLISH_VERIFIED_HEAD": expected_head,
+            "LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS": "ok",
+            "LOOP_PUBLISH_REMOTE_READBACK_SOURCE": "fetch_then_show_ref",
+            "LOOP_PR_NUMBER": "1410",
+        },
+    )
+    assert r.returncode == 2, r.stderr
+    assert "PUBLISH_SAFETY_STOP_REPORT_V1:" in r.stderr
+    assert "remote_fast_forward_by_same_scope" in r.stderr
+    assert 'pr_number: "1410"' in r.stderr
+    assert "declared_publish_head" in r.stderr
+    assert 'remote_readback_source: "fetch_then_show_ref"' in r.stderr
+    assert "decision_inputs_complete: true" in r.stderr
+    assert expected_head in r.stderr
+    assert remote_head in r.stderr

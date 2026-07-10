@@ -10,11 +10,24 @@ _GUARDS_DIR = Path(__file__).resolve().parent.parent
 if str(_GUARDS_DIR) not in sys.path:
     sys.path.insert(0, str(_GUARDS_DIR))
 
-from git_mutation_command_policy import classify_rtk_git_mutation
+from git_mutation_command_policy import classify_rtk_git_mutation, evaluate_publish_lane
 
 
 def _init_repo(repo: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
+
+
+def _commit(repo: Path, path: str, body: str) -> str:
+    target = repo / path
+    target.write_text(body)
+    subprocess.run(["git", "add", path], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", body], cwd=repo, check=True)
+    return (
+        subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True)
+        .stdout.strip()
+    )
 
 
 def test_rtk_git_add_explicit_file_allowed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -137,3 +150,189 @@ def test_rtk_git_push_requires_active_branch_when_enabled(tmp_path: Path):
     assert result is not None
     assert result.status == "deny"
     assert result.reason_code == "push_refspec_requires_active_branch"
+
+
+def _publish_lane(**overrides):
+    data = {
+        "remote": "origin",
+        "active_branch": "worktree-issue-1402-agent-publish-lane",
+        "target_branch": "worktree-issue-1402-agent-publish-lane",
+        "expected_remote_head": "a" * 40,
+        "current_remote_head": "a" * 40,
+        "local_head": "b" * 40,
+        "verified_head": "b" * 40,
+        "declared_publish_head": "b" * 40,
+        "allowed_paths_gate_status": "ok",
+        "remote_readback_source": "ls_remote",
+        "decision_inputs_complete": True,
+        "boundary_layer": "worktree_scope_guard_denied",
+        "issue_number": 1402,
+        "pr_number": "1403",
+    }
+    data.update(overrides)
+    return evaluate_publish_lane(**data)
+
+
+def test_publish_lane_allows_only_matching_remote_branch_and_heads():
+    decision = _publish_lane()
+
+    assert decision.status == "allow_retry"
+    assert decision.publish_failure_reason == {
+        "boundary_layer": "worktree_scope_guard_denied",
+        "reason_code": "remote_write_requires_approval",
+    }
+    assert decision.allowed_command == (
+        "rtk git " + "push origin HEAD:refs/heads/worktree-issue-1402-agent-publish-lane"
+    )
+    assert decision.required_human_decision == []
+
+
+def test_publish_lane_blocks_wrong_remote_and_wrong_branch():
+    wrong_remote = _publish_lane(remote="upstream")
+    wrong_branch = _publish_lane(active_branch="main")
+
+    assert wrong_remote.status == "safety_stop"
+    assert wrong_remote.allowed_command is None
+    assert wrong_remote.publish_failure_reason["reason_code"] == "branch_mismatch"
+    assert wrong_branch.status == "safety_stop"
+    assert wrong_branch.allowed_command is None
+    assert wrong_branch.publish_failure_reason["reason_code"] == "branch_mismatch"
+
+
+def test_publish_lane_blocks_stale_and_mixed_remote_head():
+    stale = _publish_lane(expected_remote_head="a" * 40, current_remote_head="b" * 40, local_head="b" * 40)
+    mixed = _publish_lane(expected_remote_head="a" * 40, current_remote_head="c" * 40, local_head="b" * 40)
+
+    assert stale.status == "safety_stop"
+    assert stale.publish_failure_reason["reason_code"] == "stale_remote_head"
+    assert stale.allowed_command is None
+    assert mixed.status == "safety_stop"
+    assert mixed.publish_failure_reason["reason_code"] == "remote_head_scope_contamination"
+    assert mixed.allowed_command is None
+
+
+def test_publish_lane_blocks_local_or_reviewed_head_mismatch():
+    declared_mismatch = _publish_lane(declared_publish_head="c" * 40)
+    reviewed_mismatch = _publish_lane(verified_head="c" * 40)
+
+    assert declared_mismatch.status == "safety_stop"
+    assert declared_mismatch.publish_failure_reason["reason_code"] == "local_head_mismatch"
+    assert declared_mismatch.allowed_command is None
+    assert reviewed_mismatch.status == "safety_stop"
+    assert reviewed_mismatch.publish_failure_reason["reason_code"] == "local_head_mismatch"
+    assert reviewed_mismatch.allowed_command is None
+
+
+def test_publish_lane_blocks_allowed_paths_gate_not_ok():
+    decision = _publish_lane(allowed_paths_gate_status="indeterminate")
+
+    assert decision.status == "safety_stop"
+    assert decision.publish_failure_reason["reason_code"] == "allowed_paths_gate_not_ok"
+    assert decision.allowed_command is None
+
+
+def test_publish_lane_blocks_incomplete_or_invalid_readback_source():
+    incomplete = _publish_lane(decision_inputs_complete=False)
+    invalid_source = _publish_lane(remote_readback_source="show_ref_without_fetch")
+
+    assert incomplete.status == "safety_stop"
+    assert incomplete.publish_failure_reason["reason_code"] == "publish_guard_context_invalid"
+    assert invalid_source.status == "safety_stop"
+    assert invalid_source.publish_failure_reason["reason_code"] == "publish_guard_context_invalid"
+    assert invalid_source.allowed_command is None
+
+
+def test_rtk_git_push_requires_strict_publish_context(tmp_path: Path):
+    _init_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "topic"], cwd=tmp_path, check=True)
+    result = classify_rtk_git_mutation(
+        "rtk git " + "push origin HEAD:refs/heads/topic",
+        cwd=str(tmp_path),
+        require_active_branch_push=True,
+    )
+
+    assert result is not None
+    assert result.status == "deny"
+    assert result.reason_code == "publish_guard_context_missing"
+    assert result.decision_inputs_complete is False
+
+
+def test_rtk_git_push_rejects_partial_or_abbreviated_publish_context(
+    tmp_path: Path, monkeypatch
+):
+    _init_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "topic"], cwd=tmp_path, check=True)
+    monkeypatch.setenv("LOOP_PUBLISH_EXPECTED_REMOTE_HEAD", "a" * 7)
+    monkeypatch.setenv("LOOP_PUBLISH_CURRENT_REMOTE_HEAD", "a" * 40)
+    monkeypatch.setenv("LOOP_PUBLISH_DECLARED_PUBLISH_HEAD", "a" * 40)
+    monkeypatch.setenv("LOOP_PUBLISH_VERIFIED_HEAD", "a" * 40)
+    monkeypatch.setenv("LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS", "ok")
+    monkeypatch.setenv("LOOP_PUBLISH_REMOTE_READBACK_SOURCE", "ls_remote")
+
+    result = classify_rtk_git_mutation(
+        "rtk git " + "push origin HEAD:refs/heads/topic",
+        cwd=str(tmp_path),
+        require_active_branch_push=True,
+    )
+
+    assert result is not None
+    assert result.status == "deny"
+    assert result.reason_code == "publish_guard_context_invalid"
+    assert result.decision_inputs_complete is False
+
+
+def test_rtk_git_push_ls_remote_overrides_stale_env_current_head(
+    tmp_path: Path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    remote = tmp_path / "remote.git"
+    repo.mkdir()
+    _init_repo(repo)
+    subprocess.run(["git", "checkout", "-q", "-b", "topic"], cwd=repo, check=True)
+    head = _commit(repo, "tracked.txt", "initial")
+    subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=repo, check=True)
+    subprocess.run(["git", "pu" + "sh", "origin", "HEAD:refs/heads/topic"], cwd=repo, check=True)
+
+    monkeypatch.setenv("LOOP_PUBLISH_EXPECTED_REMOTE_HEAD", head)
+    monkeypatch.setenv("LOOP_PUBLISH_CURRENT_REMOTE_HEAD", "c" * 40)
+    monkeypatch.setenv("LOOP_PUBLISH_DECLARED_PUBLISH_HEAD", head)
+    monkeypatch.setenv("LOOP_PUBLISH_VERIFIED_HEAD", head)
+    monkeypatch.setenv("LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS", "ok")
+    monkeypatch.setenv("LOOP_PUBLISH_REMOTE_READBACK_SOURCE", "ls_remote")
+
+    result = classify_rtk_git_mutation(
+        "rtk git " + "push origin HEAD:refs/heads/topic",
+        cwd=str(repo),
+        require_active_branch_push=True,
+    )
+
+    assert result is not None
+    assert result.status == "allow"
+    assert result.current_remote_head == head
+    assert result.remote_readback_source == "ls_remote"
+
+
+def test_rtk_git_push_classifies_fast_forward_remote_drift(tmp_path: Path, monkeypatch):
+    _init_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "topic"], cwd=tmp_path, check=True)
+    expected = _commit(tmp_path, "tracked.txt", "initial")
+    current = _commit(tmp_path, "tracked.txt", "next")
+    subprocess.run(["git", "reset", "--hard", expected], cwd=tmp_path, check=True)
+
+    monkeypatch.setenv("LOOP_PUBLISH_EXPECTED_REMOTE_HEAD", expected)
+    monkeypatch.setenv("LOOP_PUBLISH_CURRENT_REMOTE_HEAD", current)
+    monkeypatch.setenv("LOOP_PUBLISH_DECLARED_PUBLISH_HEAD", expected)
+    monkeypatch.setenv("LOOP_PUBLISH_VERIFIED_HEAD", expected)
+    monkeypatch.setenv("LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS", "ok")
+    monkeypatch.setenv("LOOP_PUBLISH_REMOTE_READBACK_SOURCE", "fetch_then_show_ref")
+
+    result = classify_rtk_git_mutation(
+        "rtk git " + "push origin HEAD:refs/heads/topic",
+        cwd=str(tmp_path),
+        require_active_branch_push=True,
+    )
+
+    assert result is not None
+    assert result.status == "deny"
+    assert result.reason_code == "remote_fast_forward_by_same_scope"
