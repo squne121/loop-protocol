@@ -337,11 +337,17 @@ function runManifestFlow(eventName, payload) {
     throw new Error(`${eventName}: synthetic canary leaked into public surface`)
   }
 
+  // AC2: when CODEX_HOOK_MANIFEST_ROOT is set, honor it as the manifest write-target
+  // override (used by the test suite to isolate per-test manifest directories under
+  // pytest-xdist parallel execution). Unset/empty falls back to the production default.
+  const manifestRootOverride = process.env.CODEX_HOOK_MANIFEST_ROOT || undefined
+
   writeCodexSessionManifest({
     manifest,
     repoRoot,
     eventName,
     fileName,
+    manifestRoot: manifestRootOverride,
   })
 
   const verification = verifyCodexPostRun(payload, { repoRoot })

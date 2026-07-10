@@ -14,8 +14,14 @@ export function writeCodexSessionManifest({
   eventName,
   now = Date.now(),
   fileName = buildCodexManifestFileName(now),
+  manifestRoot,
 }) {
-  const root = resolve(repoRoot, 'tmp', 'session-manifests', 'codex', eventName.toLowerCase())
+  // AC1/AC2: when `manifestRoot` is provided, write under `<manifestRoot>/<eventName>/`.
+  // When omitted (undefined/null/empty), fall back to the existing repoRoot-based
+  // default path to preserve production hook behavior (back-compat).
+  const root = manifestRoot
+    ? resolve(manifestRoot, eventName.toLowerCase())
+    : resolve(repoRoot, 'tmp', 'session-manifests', 'codex', eventName.toLowerCase())
   mkdirSync(root, { recursive: true })
   const finalPath = join(root, fileName)
   const tempPath = join(root, `${fileName}.tmp`)
