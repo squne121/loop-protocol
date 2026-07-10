@@ -56,6 +56,12 @@ Stop Condition に到達する前に次フェーズへ進まない。
 - `chatgpt-retro-context:post` は `CHATGPT_RETRO_CONTEXT_V1` / `CHATGPT_RETRO_CONTEXT_DIGEST_V1` の 2-line marker contract に従って marker comment を create / noop / supersede する
 - `chatgpt-retro-context:resolve-fixture` は fixture JSON から marker 導線を検証する静的 resolver である
 - `chatgpt-retro-context:resolve-live` は issue / pull request target を issue comments endpoint として扱い、marker comment だけでなく参照先 run report / retro index comment まで live fetch して digest chain を再検証する live resolver である
+- pull request target では追加で PR review / review comment / review thread の public-safe projection を取得し、pagination 完全性・ID catalog・object catalog・projection digest を返す
+- PR review surface を closure proof へ算入するときは、comment chain と review surface の両方が `resolved` であること、`page_budget_exhausted === false` / `reference_page_budget_exhausted === false` であることを同時に満たす
+- `chatgpt_retro_execution_proof/v1` で PR review surface を再検証するときは `operation_index_ref.revalidation_mode: live_comment_fetch` を使い、operation index comment を live fetch して marker 抽出、payload digest 再計算、schema/semantic 再検証、tuple（repo / parent_issue / target）照合を fail closed で行う
+- `embedded_payload` は互換モードの public-safe snapshot として保持してよいが、PR review live proof の closure 判定は embedded snapshot 単独では満たさない
+- PR review surface の durable public artifact は `PR_REVIEW_SURFACE_LIVE_PROOF_V1` marker comment とし、selected object IDs、pagination 完全性、projection digest、operation index の再検証結果、proof target head SHA、contract snapshot URL だけを含める
+- `PR_REVIEW_SURFACE_LIVE_PROOF_V1` comment には raw diff hunk、raw API response、review body、secret、trace を含めない
 - `chatgpt-retro-context:resolve-live` は `resolved | missing | blocked_duplicate | blocked_malformed | blocked_malformed_marker_syntax | blocked_invalid_reference_chain | blocked_page_budget_exhausted | blocked_stale_write` の structured result を返す
 - `chatgpt-retro-context:post` の blocked state は helper 内部では throw / nonzero exit を使うが、CLI surface では `error_code` を持つ machine-readable JSON を stdout に返す
 
@@ -79,6 +85,7 @@ Stop Condition に到達する前に次フェーズへ進まない。
 - outer digest は payload markdown 全体の sha256 である
 - inner `canonicalization.payload_digest` は JSON payload の canonical digest である
 - `resolve-live` は outer 2-line marker の ownership を確認した後、inner payload・run report comment・retro index comment・source-set digest を live 再検証する
+- pull request target の `resolved` は comment chain だけでなく review surface pagination も complete であることを含む
 
 ## Review Correction Loop / レビュー修正ループ
 
@@ -490,7 +497,8 @@ retro_e2e_proof_required:
 ```
 
 - #1153 を close する前に、少なくとも 1 件の Issue target と 1 件の PR target
-  （`operation.kind: pr_comment` 限定。`pr_review` / `pr_review_addressed` は resolver 対応後の follow-up）
+  （`operation.kind: pr_comment` に加え、`pr_review_submitted` / `pr_review_comment_created` /
+  `pr_review_thread_resolved` を public-safe projection として再検証できること）
   で live GitHub comment chain を作成し、`resolve-live status: resolved` と
   ChatGPT connector-only retrospective result を GitHub 上に残すこと（本 Issue の Runtime Verification
   Applicability は `deferred`。live 検証証跡は PR verification comment として任意に添付し、CI 必須条件にはしない）。

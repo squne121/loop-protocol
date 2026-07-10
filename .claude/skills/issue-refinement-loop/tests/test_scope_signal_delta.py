@@ -96,6 +96,68 @@ def test_cli_round_trip():
     assert parsed["legacy_scope_signal_guard"]["reason_code"] == "new_allowed_path_layer"
 
 
+@pytest.mark.parametrize("fence", ["```", "~~~"])
+def test_fenced_acceptance_criteria_checkbox_is_ignored(fence: str):
+    payload = {
+        "before_body": "## Allowed Paths\n\n",
+        "current_body": (
+            "## Allowed Paths\n\n"
+            "- `docs/dev/workflow.md`\n\n"
+            "## Acceptance Criteria\n\n"
+            f"{fence}text\n"
+            "- [ ] AC1: 品質を改善する\n"
+            f"{fence}\n"
+        ),
+        "after_body": (
+            "## Allowed Paths\n\n"
+            "- `docs/dev/workflow.md`\n\n"
+            "## Acceptance Criteria\n\n"
+            f"{fence}text\n"
+            "- [ ] AC1: 品質を改善する\n"
+            f"{fence}\n"
+        ),
+        "source_refs": {"before": "fixture:before", "current": "fixture:current", "after": "fixture:after"},
+    }
+    result = delta.compute_scope_signal_delta(payload)
+    ac_signal = next(item for item in result["signals"] if item["reason_code"] == "new_unverifiable_ac")
+    path_signal = next(item for item in result["signals"] if item["reason_code"] == "new_allowed_path_layer")
+    assert ac_signal["triggered"] is False
+    assert path_signal["triggered"] is True
+
+
+def test_iter_section_lines_recognizes_indented_h2_and_closing_hashes():
+    body = (
+        "   ## Acceptance Criteria ###\n"
+        "\n"
+        "- [ ] AC1: 品質を改善する\n"
+    )
+    lines = delta.iter_section_lines(body, "Acceptance Criteria", semantic_only=True)
+    assert [line.text for line in lines] == ["", "- [ ] AC1: 品質を改善する"]
+
+
+def test_iter_section_lines_requires_closer_length_to_match_outer_fence():
+    body = (
+        "## Acceptance Criteria\n\n"
+        "````text\n"
+        "- [ ] AC1: 品質を改善する\n"
+        "```\n"
+        "````\n"
+        "- [ ] AC2: 既存スコープを維持する\n"
+    )
+    lines = delta.iter_section_lines(body, "Acceptance Criteria", semantic_only=True)
+    assert [line.text for line in lines] == ["", "- [ ] AC2: 既存スコープを維持する"]
+
+
+def test_four_space_indented_fence_marker_is_not_treated_as_fence_opener():
+    body = (
+        "## Acceptance Criteria\n\n"
+        "    ```text\n"
+        "- [ ] AC1: 品質を改善する\n"
+    )
+    lines = delta.iter_section_lines(body, "Acceptance Criteria", semantic_only=True)
+    assert any(line.text == "- [ ] AC1: 品質を改善する" for line in lines)
+
+
 @pytest.mark.parametrize(
     ("payload", "message"),
     [

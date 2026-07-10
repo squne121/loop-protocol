@@ -103,12 +103,21 @@ post-run verifier が canonical gate である。
 | アーティファクト | 単位 | 責務 |
 |---|---|---|
 | `agent_retro_index` | 複数ラン横断 | friction パターン・フォローアップ Issue の集約 |
-| `agent_operation_session_index/v1` | 単一 Issue/PR operation | operation（issue_comment / pr_comment 等）と agent run / public artifact（run report・retro index・`CHATGPT_RETRO_CONTEXT_V1` marker）の対応関係を machine-readable に固定する |
+| `agent_operation_session_index/v1` | 単一 Issue/PR operation | operation（issue_comment / pr_comment / pr_review_submitted / pr_review_comment_created / pr_review_thread_resolved 等）と agent run / public artifact（run report・retro index・`CHATGPT_RETRO_CONTEXT_V1` marker・PR review surface projection / object catalog）の対応関係を machine-readable に固定する |
 
 `agent_operation_session_index/v1` は `agent_retro_index` を置き換えず、
 `agent_retro_index` の `entries[].report_comment_url` が指す run report と
 同じ GitHub comment chain を、operation 起点で辿れるようにする補完 index である。
 
-checker: `pnpm agent-operation-session-index:check`（`scripts/check-agent-operation-session-index.mjs`）。
-`chatgpt_retro_execution_proof/v1` との関係（#1153 parent closure proof）は
-`docs/dev/agent-run-report.md` の「#1405 Parent Closure Proof Contract」セクションを参照。
+checker は `pnpm agent-operation-session-index:check`（`scripts/check-agent-operation-session-index.mjs`）を使う。
+`chatgpt_retro_execution_proof/v1` との関係、特に #1153 の parent closure proof との結び付きは、
+`docs/dev/agent-run-report.md` の「#1405 Parent Closure Proof Contract」セクションを参照すること。
+
+PR review surface の公開検証証跡は、review・review comment・resolved thread それぞれの selected object IDs、
+pagination の完全性、projection digest、operation index の再検証結果を含む
+`PR_REVIEW_SURFACE_LIVE_PROOF_V1` comment として残し、後続 checker が機械的に再確認できる形を維持する。
+
+この live proof comment は public-safe projection 専用の耐久証跡であり、`chatgpt_retro_execution_proof/v1` の
+`pr_review_surface_live_proof_ref` から参照される。checker は comment URL、proof target PR/head SHA、contract snapshot、
+operation index digest、selected object IDs、pagination 完全性を fail closed で突き合わせるため、
+埋め込み snapshot だけではなく公開 comment 自体を残しておく必要がある。

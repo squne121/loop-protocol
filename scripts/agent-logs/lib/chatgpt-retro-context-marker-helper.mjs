@@ -535,6 +535,167 @@ function buildReferenceChainFromParsedMarker(parsedMarker, comments) {
   }
 }
 
+function computePublicSafeProjectionDigest(payload) {
+  return `sha256:${sha256Hex(stableStringify(payload))}`
+}
+
+function withProjectionDigest(payload) {
+  return {
+    ...payload,
+    digest: computePublicSafeProjectionDigest(payload),
+  }
+}
+
+async function listAllPullRequestReviewsStructured(client, {
+  repo,
+  pullNumber,
+  perPage = 100,
+  maxPages = 100,
+}) {
+  const reviews = []
+  for (let page = 1; page <= maxPages; page += 1) {
+    const pageResult = await client.listPullRequestReviewsPage({ repo, pullNumber, page, perPage })
+    reviews.push(...(pageResult.items ?? []))
+    if (pageResult.hasNextPage === false) {
+      return { reviews, pageCount: page, pageBudgetExhausted: false }
+    }
+  }
+  return { reviews, pageCount: maxPages, pageBudgetExhausted: true }
+}
+
+async function listAllPullRequestReviewCommentsStructured(client, {
+  repo,
+  pullNumber,
+  perPage = 100,
+  maxPages = 100,
+}) {
+  const comments = []
+  for (let page = 1; page <= maxPages; page += 1) {
+    const pageResult = await client.listPullRequestReviewCommentsPage({ repo, pullNumber, page, perPage })
+    comments.push(...(pageResult.items ?? []))
+    if (pageResult.hasNextPage === false) {
+      return { comments, pageCount: page, pageBudgetExhausted: false }
+    }
+  }
+  return { comments, pageCount: maxPages, pageBudgetExhausted: true }
+}
+
+async function listAllPullRequestReviewThreadsStructured(client, {
+  repo,
+  pullNumber,
+  first = 100,
+  maxPages = 100,
+}) {
+  const threads = []
+  let after = null
+  for (let page = 1; page <= maxPages; page += 1) {
+    const pageResult = await client.listPullRequestReviewThreadsPage({ repo, pullNumber, first, after })
+    threads.push(...(pageResult.items ?? []))
+    if (pageResult.hasNextPage !== true) {
+      return { threads, pageCount: page, pageBudgetExhausted: false }
+    }
+    after = pageResult.endCursor
+  }
+  return { threads, pageCount: maxPages, pageBudgetExhausted: true }
+}
+
+function buildPrReviewSurfaceSummary({ pullNumber, reviews, reviewComments, reviewThreads }) {
+  const normalizedReviews = reviews.map((review) => withProjectionDigest({
+    id: review.id,
+    node_id: review.node_id,
+    pull_number: pullNumber,
+    state: review.state,
+    commit_id: review.commit_id,
+    submitted_at: review.submitted_at,
+    html_url: review.html_url,
+  }))
+  const normalizedReviewComments = reviewComments.map((comment) => withProjectionDigest({
+    id: comment.id,
+    node_id: comment.node_id,
+    pull_request_review_id: comment.pull_request_review_id,
+    pull_number: pullNumber,
+    path: comment.path,
+    line: comment.line,
+    commit_id: comment.commit_id,
+    created_at: comment.created_at,
+    updated_at: comment.updated_at,
+    html_url: comment.html_url,
+  }))
+  const normalizedReviewThreads = reviewThreads.map((thread) => withProjectionDigest({
+    thread_node_id: thread.id,
+    pull_number: pullNumber,
+    path: thread.path,
+    line: thread.line,
+    is_resolved: thread.isResolved,
+    is_outdated: thread.isOutdated,
+    subject_type: thread.subjectType,
+    observed_at: thread.observed_at ?? null,
+    comment_count: thread.comments?.totalCount ?? 0,
+    thread_comments_complete: thread.comments?.pageInfo?.hasNextPage !== true,
+  }))
+  return {
+    review_ids: normalizedReviews.map((review) => review.id),
+    review_comment_ids: normalizedReviewComments.map((comment) => comment.id),
+    review_thread_node_ids: normalizedReviewThreads.map((thread) => thread.thread_node_id),
+    review_count: normalizedReviews.length,
+    review_comment_count: normalizedReviewComments.length,
+    review_thread_count: normalizedReviewThreads.length,
+    resolved_thread_count: normalizedReviewThreads.filter((thread) => thread.is_resolved).length,
+    sample_review: normalizedReviews[0] ?? null,
+    sample_review_comment: normalizedReviewComments[0] ?? null,
+    sample_review_thread: normalizedReviewThreads.find((thread) => thread.is_resolved) ?? normalizedReviewThreads[0] ?? null,
+    object_catalog: {
+      reviews_by_id: Object.fromEntries(normalizedReviews.map((review) => [String(review.id), review])),
+      review_comments_by_id: Object.fromEntries(normalizedReviewComments.map((comment) => [String(comment.id), {
+        review_id: comment.pull_request_review_id,
+        ...comment,
+      }])),
+      review_threads_by_node_id: Object.fromEntries(normalizedReviewThreads.map((thread) => [thread.thread_node_id, thread])),
+    },
+    projection_digest: computePublicSafeProjectionDigest({
+      reviews: normalizedReviews,
+      review_comments: normalizedReviewComments,
+      review_threads: normalizedReviewThreads,
+    }),
+  }
+}
+
+async function resolvePullRequestReviewSurfaceLive(client, { repo, pullNumber }) {
+  const reviewsResult = await listAllPullRequestReviewsStructured(client, { repo, pullNumber })
+  const commentsResult = await listAllPullRequestReviewCommentsStructured(client, { repo, pullNumber })
+  const threadsResult = await listAllPullRequestReviewThreadsStructured(client, { repo, pullNumber })
+
+  const threadCommentsComplete = threadsResult.threads.every((thread) => thread.comments?.pageInfo?.hasNextPage !== true)
+  const pagination = {
+    reviews_complete: !reviewsResult.pageBudgetExhausted,
+    review_comments_complete: !commentsResult.pageBudgetExhausted,
+    review_threads_complete: !threadsResult.pageBudgetExhausted,
+    thread_comments_complete: threadCommentsComplete,
+  }
+  const surfaceSummary = buildPrReviewSurfaceSummary({
+    pullNumber,
+    reviews: reviewsResult.reviews,
+    reviewComments: commentsResult.comments,
+    reviewThreads: threadsResult.threads,
+  })
+
+  return {
+    status: Object.values(pagination).every((value) => value === true) ? 'resolved' : 'blocked_page_budget_exhausted',
+    pagination,
+    ...surfaceSummary,
+  }
+}
+
+function aggregatePullRequestContextStatus(commentChainStatus, prReviewSurfaceStatus) {
+  if (commentChainStatus === 'resolved' && prReviewSurfaceStatus === 'resolved') {
+    return 'resolved'
+  }
+  if (commentChainStatus !== 'resolved') {
+    return commentChainStatus
+  }
+  return prReviewSurfaceStatus
+}
+
 export async function resolveChatgptRetroContextLive(client, {
   repo,
   targetType,
@@ -560,9 +721,38 @@ export async function resolveChatgptRetroContextLive(client, {
     endpoint: listed.endpoint,
     pagination_mode: listed.pagination_mode,
   }
+  const prReviewSurface = ownership.targetType === 'pull_request'
+    ? await resolvePullRequestReviewSurfaceLive(client, {
+        repo: ownership.repo,
+        pullNumber: ownership.targetNumber,
+      })
+    : null
+
+  function maybeReturnPullRequestSurfaceResolution(commentChainStatus, extras = {}) {
+    if (prReviewSurface?.status !== 'resolved') {
+      return null
+    }
+    return {
+      status: aggregatePullRequestContextStatus(commentChainStatus, prReviewSurface.status),
+      comment_chain_status: commentChainStatus,
+      repo: ownership.repo,
+      target,
+      parent_issue: ownership.parentIssue,
+      marker_comment_url: extras.marker_comment_url ?? markerCommentUrl,
+      pagination,
+      comment_count: listed.comments.length,
+      matched_comment_count: extras.matched_comment_count ?? 0,
+      marker_comment: extras.marker_comment ?? null,
+      digest: extras.digest ?? null,
+      payload_digest: extras.payload_digest ?? null,
+      evidence_ref_count: extras.evidence_ref_count ?? 0,
+      source_manifest_count: extras.source_manifest_count ?? 0,
+      pr_review_surface: prReviewSurface,
+    }
+  }
 
   if (listed.page_budget_exhausted) {
-    return {
+    return maybeReturnPullRequestSurfaceResolution('blocked_page_budget_exhausted') ?? {
       status: 'blocked_page_budget_exhausted',
       repo: ownership.repo,
       target,
@@ -582,7 +772,13 @@ export async function resolveChatgptRetroContextLive(client, {
     return isMarkerLikeComment(comment?.body) && !parsed.ownership
   })
   if (malformedMarkerLike) {
-    return {
+    return maybeReturnPullRequestSurfaceResolution('blocked_malformed_marker_syntax', {
+      marker_comment_url: commentUrlFromResponse(malformedMarkerLike),
+      marker_comment: {
+        id: malformedMarkerLike?.id ?? null,
+        url: commentUrlFromResponse(malformedMarkerLike),
+      },
+    }) ?? {
       status: 'blocked_malformed_marker_syntax',
       repo: ownership.repo,
       target,
@@ -601,7 +797,15 @@ export async function resolveChatgptRetroContextLive(client, {
   const matches = parsedComments.filter((entry) => entry.ownership && ownershipEquals(entry.ownership, ownership))
   const malformed = matches.find((entry) => entry.malformed)
   if (malformed) {
-    return {
+    return maybeReturnPullRequestSurfaceResolution('blocked_malformed', {
+      marker_comment_url: commentUrlFromResponse(malformed.comment),
+      matched_comment_count: matches.length,
+      marker_comment: {
+        id: malformed.comment?.id ?? null,
+        url: commentUrlFromResponse(malformed.comment),
+      },
+      digest: malformed.digest,
+    }) ?? {
       status: 'blocked_malformed',
       repo: ownership.repo,
       target,
@@ -619,7 +823,9 @@ export async function resolveChatgptRetroContextLive(client, {
   }
 
   if (matches.length >= 2) {
-    return {
+    return maybeReturnPullRequestSurfaceResolution('blocked_duplicate', {
+      matched_comment_count: matches.length,
+    }) ?? {
       status: 'blocked_duplicate',
       repo: ownership.repo,
       target,
@@ -635,7 +841,7 @@ export async function resolveChatgptRetroContextLive(client, {
 
   const [match] = matches
   if (!match) {
-    return {
+    return maybeReturnPullRequestSurfaceResolution('missing') ?? {
       status: 'missing',
       repo: ownership.repo,
       target,
@@ -651,7 +857,15 @@ export async function resolveChatgptRetroContextLive(client, {
 
   const resolvedUrl = commentUrlFromResponse(match.comment)
   if (markerCommentUrl !== null && resolvedUrl !== markerCommentUrl) {
-    return {
+    return maybeReturnPullRequestSurfaceResolution('blocked_stale_write', {
+      marker_comment_url: markerCommentUrl,
+      matched_comment_count: 1,
+      marker_comment: {
+        id: match.comment?.id ?? null,
+        url: resolvedUrl,
+      },
+      digest: match.digest,
+    }) ?? {
       status: 'blocked_stale_write',
       repo: ownership.repo,
       target,
@@ -670,7 +884,15 @@ export async function resolveChatgptRetroContextLive(client, {
 
   const referenceUniverse = await loadReferencedCommentUniverse(client, ownership, resolvedUrl)
   if (referenceUniverse.page_budget_exhausted || referenceUniverse.pagination_exhausted) {
-    return {
+    return maybeReturnPullRequestSurfaceResolution('blocked_page_budget_exhausted', {
+      marker_comment_url: resolvedUrl,
+      matched_comment_count: 1,
+      marker_comment: {
+        id: match.comment?.id ?? null,
+        url: resolvedUrl,
+      },
+      digest: match.digest,
+    }) ?? {
       status: 'blocked_page_budget_exhausted',
       repo: ownership.repo,
       target,
@@ -694,8 +916,11 @@ export async function resolveChatgptRetroContextLive(client, {
 
   try {
     const referenceChain = buildReferenceChainFromParsedMarker(match, referenceUniverse.comments)
+    const status = prReviewSurface && prReviewSurface.status !== 'resolved'
+      ? prReviewSurface.status
+      : 'resolved'
     return {
-      status: 'resolved',
+      status,
       repo: ownership.repo,
       target,
       parent_issue: ownership.parentIssue,
@@ -716,6 +941,7 @@ export async function resolveChatgptRetroContextLive(client, {
       payload_digest: referenceChain.payload.canonicalization?.payload_digest ?? null,
       evidence_ref_count: referenceChain.sources.evidence_refs.length,
       source_manifest_count: referenceChain.manifest.length,
+      pr_review_surface: prReviewSurface,
     }
   } catch (error) {
     return {

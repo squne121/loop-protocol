@@ -352,6 +352,14 @@ function parseLinkHeader(linkHeader) {
   }).filter(Boolean)
 }
 
+function splitRepo(repo) {
+  const [owner, name] = String(repo).split('/')
+  if (!owner || !name) {
+    throw runtimeError('github_comments.repo', 'repo must be an owner/name string')
+  }
+  return { owner, name }
+}
+
 export class GhCliIssueCommentsClient {
   async listIssueComments({ repo, issueNumber, page, perPage }) {
     const response = await this.listIssueCommentsPage({ repo, issueNumber, page, perPage })
@@ -404,6 +412,84 @@ export class GhCliIssueCommentsClient {
       `repos/${repo}/issues/comments/${commentId}`,
     ])
     return response.body
+  }
+
+  async listPullRequestReviewsPage({ repo, pullNumber, page, perPage }) {
+    const response = runGhApi([
+      '-H', 'Accept: application/vnd.github+json',
+      '-H', 'X-GitHub-Api-Version: 2022-11-28',
+      `repos/${repo}/pulls/${pullNumber}/reviews?per_page=${perPage}&page=${page}`,
+    ])
+    const links = parseLinkHeader(response.headers.link)
+    return {
+      items: Array.isArray(response.body) ? response.body : [],
+      hasNextPage: links.some((link) => link.rel === 'next'),
+    }
+  }
+
+  async listPullRequestReviewCommentsPage({ repo, pullNumber, page, perPage }) {
+    const response = runGhApi([
+      '-H', 'Accept: application/vnd.github+json',
+      '-H', 'X-GitHub-Api-Version: 2022-11-28',
+      `repos/${repo}/pulls/${pullNumber}/comments?per_page=${perPage}&page=${page}`,
+    ])
+    const links = parseLinkHeader(response.headers.link)
+    return {
+      items: Array.isArray(response.body) ? response.body : [],
+      hasNextPage: links.some((link) => link.rel === 'next'),
+    }
+  }
+
+  async listPullRequestReviewThreadsPage({ repo, pullNumber, first, after }) {
+    const { owner, name } = splitRepo(repo)
+    const query = [
+      'query($owner: String!, $name: String!, $pullNumber: Int!, $first: Int!, $after: String) {',
+      '  repository(owner: $owner, name: $name) {',
+      '    pullRequest(number: $pullNumber) {',
+      '      reviewThreads(first: $first, after: $after) {',
+      '        nodes {',
+      '          id',
+      '          isResolved',
+      '          isOutdated',
+      '          path',
+      '          line',
+      '          subjectType',
+      '          comments(first: 100) {',
+      '            totalCount',
+      '            pageInfo { hasNextPage }',
+      '            nodes {',
+      '              id',
+      '              commit { oid }',
+      '              pullRequestReview { id }',
+      '              path',
+      '              line',
+      '              createdAt',
+      '              updatedAt',
+      '              url',
+      '            }',
+      '          }',
+      '        }',
+      '        pageInfo { hasNextPage endCursor }',
+      '      }',
+      '    }',
+      '  }',
+      '}',
+    ].join('\n')
+    const response = runGhApi([
+      'graphql',
+      '-F', `owner=${owner}`,
+      '-F', `name=${name}`,
+      '-F', `pullNumber=${pullNumber}`,
+      '-F', `first=${first}`,
+      '-F', `after=${after ?? ''}`,
+      '-f', `query=${query}`,
+    ])
+    const reviewThreads = response.body?.data?.repository?.pullRequest?.reviewThreads
+    return {
+      items: Array.isArray(reviewThreads?.nodes) ? reviewThreads.nodes : [],
+      hasNextPage: reviewThreads?.pageInfo?.hasNextPage === true,
+      endCursor: reviewThreads?.pageInfo?.endCursor ?? null,
+    }
   }
 }
 
