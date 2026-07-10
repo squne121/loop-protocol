@@ -3,7 +3,12 @@
 classify-git-state.py
 
 git status / git stash list / git branch -vv / git worktree list を実行し、
-YAML 構造化出力を返す。
+YAML 構造化出力を返す。`--format json` では加えて read-only な
+`temp_residue_classification/v1`（Issue #1417,
+scripts/agent-ops/temp_residue_classifier.py）を `temp_residue_classification`
+field として含める。分類器 の実行に失敗した場合は
+`temp_residue_classification: null` を返し、classifier failure を
+empty result（scan_status: ok かつ entries: []）と明確に区別する。
 
 Usage:
     python3 classify-git-state.py [--format yaml|json]
@@ -15,6 +20,7 @@ Exit codes:
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 
@@ -111,6 +117,32 @@ def parse_worktree_list(raw: str) -> list:
     return worktrees
 
 
+def classify_temp_residue() -> dict | None:
+    """Best-effort, read-only invocation of temp_residue_classifier.py.
+
+    Returns the ``temp_residue_classification/v1`` payload dict, or ``None``
+    if the classifier itself could not run (import/exec failure). ``None``
+    must be treated by consumers as "classifier failure", distinct from a
+    successful run that found zero entries (``entries: []`` with
+    ``scan_status: ok``).
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    agent_ops_dir = os.path.normpath(
+        os.path.join(script_dir, "..", "..", "..", "..", "scripts", "agent-ops")
+    )
+    if agent_ops_dir not in sys.path:
+        sys.path.insert(0, agent_ops_dir)
+    try:
+        import temp_residue_classifier as trc  # noqa: PLC0415
+    except ImportError:
+        return None
+    try:
+        limits = trc.ScanLimits()
+        return trc.run_classification(None, limits, os.environ.get("LOOP_PROTOCOL_SESSION_ID"))
+    except Exception:
+        return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Classify git state into structured output"
@@ -136,6 +168,7 @@ def main() -> None:
     }
 
     if args.format == "json":
+        state["temp_residue_classification"] = classify_temp_residue()
         print(json.dumps(state, ensure_ascii=False, indent=2))
     else:
         # Simple YAML-like output
