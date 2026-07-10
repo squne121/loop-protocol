@@ -58,7 +58,17 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 
 const REPO_ROOT = resolve(process.env.CLAUDE_PROJECT_DIR ?? resolve(__dirname, '..', '..'))
 const PRODUCER_SCRIPT = process.env.SESSION_MANIFEST_PRODUCER_SCRIPT ?? join(REPO_ROOT, 'scripts', 'generate-session-manifest.mjs')
-const ARTIFACTS_DIR = process.env.SESSION_MANIFEST_ARTIFACTS_DIR ?? join(REPO_ROOT, 'artifacts')
+// Issue #1409: SESSION_MANIFEST_ARTIFACTS_DIR is the base runtime directory
+// (default: the hook-owned subtree artifacts/session-manifest-runtime/,
+// which the privileged skill runtime executor excludes from its before/
+// after repo-wide snapshot diff). Final manifests / locks / temp files are
+// each written under their own dedicated subdirectory of this base so a
+// caller overriding SESSION_MANIFEST_ARTIFACTS_DIR (e.g. tests) still gets
+// the manifests/, locks/, tmp/ separation.
+const ARTIFACTS_BASE_DIR = process.env.SESSION_MANIFEST_ARTIFACTS_DIR ?? join(REPO_ROOT, 'artifacts', 'session-manifest-runtime')
+const MANIFESTS_DIR = join(ARTIFACTS_BASE_DIR, 'manifests')
+const LOCKS_DIR = join(ARTIFACTS_BASE_DIR, 'locks')
+const TMP_DIR = join(ARTIFACTS_BASE_DIR, 'tmp')
 const REPOSITORY = 'squne121/loop-protocol'
 
 // Event-type to phase mapping
@@ -154,9 +164,9 @@ function normalizePayloadForDigest(payload) {
  * Ensure artifacts directory exists.
  */
 function ensureArtifactsDir() {
-  if (!existsSync(ARTIFACTS_DIR)) {
-    mkdirSync(ARTIFACTS_DIR, { recursive: true })
-  }
+  mkdirSync(MANIFESTS_DIR, { recursive: true })
+  mkdirSync(LOCKS_DIR, { recursive: true })
+  mkdirSync(TMP_DIR, { recursive: true })
 }
 
 /**
@@ -241,8 +251,8 @@ function releaseLock(lockPath) {
  */
 function hasDuplicateArtifact(stableKeySegment) {
   try {
-    if (!existsSync(ARTIFACTS_DIR)) return false
-    const files = readdirSync(ARTIFACTS_DIR)
+    if (!existsSync(MANIFESTS_DIR)) return false
+    const files = readdirSync(MANIFESTS_DIR)
     return files.some((f) => f.includes(stableKeySegment) && f.endsWith('.json'))
   } catch {
     return false
@@ -421,7 +431,7 @@ async function main() {
   ensureArtifactsDir()
 
   // Acquire exclusive lock for this stable key to prevent parallel duplicate generation (B3)
-  const lockPath = join(ARTIFACTS_DIR, `.lock-${stableKeySegment}`)
+  const lockPath = join(LOCKS_DIR, `.lock-${stableKeySegment}`)
   _activeLockPath = lockPath
   const lockAcquired = tryAcquireLock(lockPath)
   if (!lockAcquired) {
@@ -474,7 +484,7 @@ async function main() {
   const baseFilename = `private-agent-session-manifest-${eventNameLower}-${timestamp}-${stableKeySegment}.json`
 
   // Evidence source ref uses relative path (no absolute paths in public output)
-  const evidenceSourceRef = `artifacts/${baseFilename}`
+  const evidenceSourceRef = `artifacts/session-manifest-runtime/manifests/${baseFilename}`
 
   // Build actor name enriched with available context
   // Limit to reasonable length to avoid producer validation issues
@@ -523,8 +533,8 @@ async function main() {
   const contentHash = sha256(manifestJson)
 
   // Atomic write: write to temp file, then rename to final filename
-  const finalPath = join(ARTIFACTS_DIR, baseFilename)
-  const tmpPath = join(ARTIFACTS_DIR, `.tmp-${randomUUID()}`)
+  const finalPath = join(MANIFESTS_DIR, baseFilename)
+  const tmpPath = join(TMP_DIR, `.tmp-${randomUUID()}`)
 
   try {
     writeFileSync(tmpPath, manifestJson, { encoding: 'utf8', flag: 'wx' })
