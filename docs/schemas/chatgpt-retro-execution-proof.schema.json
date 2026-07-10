@@ -77,6 +77,13 @@
           "type": "string",
           "const": "pass"
         },
+        "revalidation_mode": {
+          "type": "string",
+          "enum": [
+            "legacy_comment_digest_only",
+            "embedded_payload"
+          ]
+        },
         "embedded_payload": {
           "type": "object"
         }

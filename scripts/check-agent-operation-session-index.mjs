@@ -72,6 +72,18 @@ function isPrReviewOperationKind(kind) {
   return Object.hasOwn(PR_REVIEW_OPERATION_KIND_TO_SOURCE_KIND, kind)
 }
 
+function compareObjectFields(errors, sourcePath, expectedPath, sourceObject, expectedObject, fields) {
+  for (const field of fields) {
+    if (sourceObject?.[field] !== expectedObject?.[field]) {
+      errors.push({
+        path: `${sourcePath}.${field}`,
+        code: 'source.object_mismatch',
+        message: `${sourcePath}.${field} must match ${expectedPath}.${field}`,
+      })
+    }
+  }
+}
+
 function createAjv() {
   const ajv = new Ajv2020({ strict: true, allErrors: true })
   ajvFormats(ajv)
@@ -230,6 +242,14 @@ export function validateAgentOperationSessionIndexSemantics(index) {
       })
     }
 
+    if (verification?.resolver_status !== 'resolved') {
+      errors.push({
+        path: 'verification.resolver_status',
+        code: 'resolver.status_not_resolved',
+        message: 'verification.resolver_status must be "resolved" for PR review operations',
+      })
+    }
+
     const pagination = resolver?.pagination
     if (pagination && Object.entries(pagination).some(([, complete]) => complete !== true)) {
       errors.push({
@@ -240,6 +260,7 @@ export function validateAgentOperationSessionIndexSemantics(index) {
     }
 
     const sourceCatalog = resolver?.source_catalog
+    const objectCatalog = resolver?.object_catalog
     if (sourceCatalog) {
       if (hasDuplicateValues(sourceCatalog.review_ids ?? [])) {
         errors.push({
@@ -286,6 +307,24 @@ export function validateAgentOperationSessionIndexSemantics(index) {
           message: 'review_id must exist in verification.operation_source_resolver.source_catalog.review_ids',
         })
       }
+      const reviewObject = objectCatalog?.reviews_by_id?.[String(source.review_id)]
+      if (!reviewObject) {
+        errors.push({
+          path: 'verification.operation_source_resolver.object_catalog.reviews_by_id',
+          code: 'source.object_missing',
+          message: 'review_id must exist in verification.operation_source_resolver.object_catalog.reviews_by_id',
+        })
+      } else {
+        compareObjectFields(errors, 'operation.source', 'verification.operation_source_resolver.object_catalog.reviews_by_id', source, reviewObject, [
+          'node_id',
+          'pull_number',
+          'state',
+          'commit_id',
+          'submitted_at',
+          'html_url',
+          'digest',
+        ])
+      }
     }
 
     if (source?.kind === 'github_pull_request_review_comment') {
@@ -310,6 +349,27 @@ export function validateAgentOperationSessionIndexSemantics(index) {
           message: 'comment_id must exist in verification.operation_source_resolver.source_catalog.review_comment_ids',
         })
       }
+      const commentObject = objectCatalog?.review_comments_by_id?.[String(source.comment_id)]
+      if (!commentObject) {
+        errors.push({
+          path: 'verification.operation_source_resolver.object_catalog.review_comments_by_id',
+          code: 'source.object_missing',
+          message: 'comment_id must exist in verification.operation_source_resolver.object_catalog.review_comments_by_id',
+        })
+      } else {
+        compareObjectFields(errors, 'operation.source', 'verification.operation_source_resolver.object_catalog.review_comments_by_id', source, commentObject, [
+          'node_id',
+          'review_id',
+          'pull_number',
+          'path',
+          'line',
+          'commit_id',
+          'created_at',
+          'updated_at',
+          'html_url',
+          'digest',
+        ])
+      }
     }
 
     if (source?.kind === 'github_pull_request_review_thread') {
@@ -327,6 +387,30 @@ export function validateAgentOperationSessionIndexSemantics(index) {
           message: 'thread_node_id must exist in verification.operation_source_resolver.source_catalog.review_thread_node_ids',
         })
       }
+      const threadObject = objectCatalog?.review_threads_by_node_id?.[source.thread_node_id]
+      if (!threadObject) {
+        errors.push({
+          path: 'verification.operation_source_resolver.object_catalog.review_threads_by_node_id',
+          code: 'source.object_missing',
+          message: 'thread_node_id must exist in verification.operation_source_resolver.object_catalog.review_threads_by_node_id',
+        })
+      } else {
+        compareObjectFields(errors, 'operation.source', 'verification.operation_source_resolver.object_catalog.review_threads_by_node_id', source, threadObject, [
+          'pull_number',
+          'path',
+          'line',
+          'subject_type',
+          'is_resolved',
+          'digest',
+        ])
+        if (source.origin?.observed_at !== threadObject.observed_at) {
+          errors.push({
+            path: 'operation.source.origin.observed_at',
+            code: 'source.object_mismatch',
+            message: 'operation.source.origin.observed_at must match verification.operation_source_resolver.object_catalog.review_threads_by_node_id.observed_at',
+          })
+        }
+      }
     }
   }
 
@@ -341,10 +425,14 @@ export function validateAgentOperationSessionIndex(payload) {
     if (error.code !== 'secret.token_like_hex40') {
       return true
     }
-    return ![
-      'operation.source.commit_id',
-      'verification.operation_source_resolver.target_commit',
-    ].includes(error.path)
+    if (
+      error.path === 'operation.source.commit_id'
+      || error.path === 'verification.operation_source_resolver.target_commit'
+      || /^verification\.operation_source_resolver\.object_catalog\.(reviews_by_id|review_comments_by_id)\.[^.]+\.commit_id$/u.test(error.path)
+    ) {
+      return false
+    }
+    return true
   })
   const errors = [
     ...schemaResult.errors,

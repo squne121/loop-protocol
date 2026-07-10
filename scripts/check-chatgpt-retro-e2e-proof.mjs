@@ -332,10 +332,14 @@ function filterPublicSafetyErrors(errors) {
     if (error.code !== 'secret.token_like_hex40') {
       return true
     }
-    return ![
-      'operation_index_ref.embedded_payload.operation.source.commit_id',
-      'operation_index_ref.embedded_payload.verification.operation_source_resolver.target_commit',
-    ].includes(error.path)
+    if (
+      error.path === 'operation_index_ref.embedded_payload.operation.source.commit_id'
+      || error.path === 'operation_index_ref.embedded_payload.verification.operation_source_resolver.target_commit'
+      || /^operation_index_ref\.embedded_payload\.verification\.operation_source_resolver\.object_catalog\.(reviews_by_id|review_comments_by_id)\.[^.]+\.commit_id$/u.test(error.path)
+    ) {
+      return false
+    }
+    return true
   })
 }
 
@@ -584,6 +588,30 @@ export function computeFixtureModeResolvedCommentSetDigest(proof) {
   return computeChatgptRetroExecutionProofDigest(urls)
 }
 
+function parseGitHubCommentUrl(url) {
+  if (typeof url !== 'string') {
+    return null
+  }
+  const match = url.match(/^https:\/\/github\.com\/(?<repo>[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/(?<segment>issues|pull)\/(?<number>[0-9]+)#issuecomment-(?<commentId>[0-9]+)$/u)
+  if (!match?.groups) {
+    return null
+  }
+  return {
+    repo: match.groups.repo,
+    targetKind: match.groups.segment === 'issues' ? 'issue' : 'pull_request',
+    targetNumber: Number(match.groups.number),
+    commentId: Number(match.groups.commentId),
+  }
+}
+
+function isPrReviewOperationKind(kind) {
+  return [
+    'pr_review_submitted',
+    'pr_review_comment_created',
+    'pr_review_thread_resolved',
+  ].includes(kind)
+}
+
 export function validateChatgptRetroExecutionProof(proof, retroResult) {
   const errors = []
 
@@ -604,6 +632,7 @@ export function validateChatgptRetroExecutionProof(proof, retroResult) {
   errors.push(...validateChatgptContextGovernanceInvariants(proof).errors)
 
   if (proofSchemaResult.valid && retroSchemaResult.valid) {
+    const operationIndexRevalidationMode = proof.operation_index_ref?.revalidation_mode ?? 'legacy_comment_digest_only'
     // digest.marker_mismatch
     if (retroResult.input_marker_digest !== proof.chatgpt_context.marker_digest) {
       errors.push({
@@ -620,6 +649,14 @@ export function validateChatgptRetroExecutionProof(proof, retroResult) {
         path: 'retrospective_result.payload_digest',
         code: 'digest.retrospective_result_mismatch',
         message: 'proof.retrospective_result.payload_digest does not match the recomputed digest of the referenced payload',
+      })
+    }
+
+    if (operationIndexRevalidationMode === 'embedded_payload' && !proof.operation_index_ref?.embedded_payload) {
+      errors.push({
+        path: 'operation_index_ref.embedded_payload',
+        code: 'operation_index.embedded_payload_required',
+        message: 'operation_index_ref.embedded_payload is required until live comment fetch/revalidation is implemented',
       })
     }
 
@@ -644,13 +681,50 @@ export function validateChatgptRetroExecutionProof(proof, retroResult) {
         })
       }
 
-      if (proof.operation_index_ref.embedded_payload?.verification?.operation_source_resolver?.status !== 'resolved') {
+      if (
+        isPrReviewOperationKind(proof.operation_index_ref.embedded_payload?.operation?.kind)
+        && proof.operation_index_ref.embedded_payload?.verification?.operation_source_resolver?.status !== 'resolved'
+      ) {
         errors.push({
           path: 'operation_index_ref.embedded_payload.verification.operation_source_resolver.status',
           code: 'operation_index.source_resolver_unresolved',
           message: 'embedded operation index payload must carry verification.operation_source_resolver.status = "resolved"',
         })
       }
+
+      if (
+        operationIndexRevalidationMode === 'embedded_payload'
+        && (proof.operation_index_ref.embedded_payload?.repo !== proof.repo || proof.operation_index_ref.embedded_payload?.parent_issue !== proof.parent_issue)
+      ) {
+        errors.push({
+          path: 'operation_index_ref.embedded_payload',
+          code: 'operation_index.identity_mismatch',
+          message: 'embedded operation index payload must match proof.repo and proof.parent_issue',
+        })
+      }
+
+      if (
+        operationIndexRevalidationMode === 'embedded_payload'
+        && (proof.operation_index_ref.embedded_payload?.target?.kind !== proof.target?.kind || proof.operation_index_ref.embedded_payload?.target?.number !== proof.target?.number)
+      ) {
+        errors.push({
+          path: 'operation_index_ref.embedded_payload.target',
+          code: 'operation_index.target_mismatch',
+          message: 'embedded operation index payload target must match proof.target',
+        })
+      }
+    }
+
+    const operationIndexCommentTarget = parseGitHubCommentUrl(proof.operation_index_ref?.comment_url)
+    if (
+      operationIndexRevalidationMode === 'embedded_payload'
+      && (!operationIndexCommentTarget || operationIndexCommentTarget.repo !== proof.repo || operationIndexCommentTarget.targetKind !== proof.target.kind || operationIndexCommentTarget.targetNumber !== proof.target.number)
+    ) {
+      errors.push({
+        path: 'operation_index_ref.comment_url',
+        code: 'operation_index.comment_url_target_mismatch',
+        message: 'operation_index_ref.comment_url must match proof.repo and proof.target',
+      })
     }
 
     // target.mismatch
@@ -682,6 +756,30 @@ export function validateChatgptRetroExecutionProof(proof, retroResult) {
         path: 'retrospective_result_payload.verdict',
         code: 'verdict.resolver_not_resolved',
         message: 'verdict "approve" is forbidden when chatgpt_context.resolve_live_status is not "resolved"',
+      })
+    }
+
+    if (proof.chatgpt_context.resolve_live_status !== proof.chatgpt_context.resolver_evidence.status) {
+      errors.push({
+        path: 'chatgpt_context.resolver_evidence.status',
+        code: 'resolver_evidence.status_mismatch',
+        message: 'chatgpt_context.resolve_live_status must match chatgpt_context.resolver_evidence.status',
+      })
+    }
+
+    if (proof.chatgpt_context.resolve_live_status === 'resolved' && proof.chatgpt_context.resolver_evidence.page_budget_exhausted !== false) {
+      errors.push({
+        path: 'chatgpt_context.resolver_evidence.page_budget_exhausted',
+        code: 'resolver_evidence.page_budget_exhausted',
+        message: 'page_budget_exhausted must be false when chatgpt_context.resolve_live_status is "resolved"',
+      })
+    }
+
+    if (proof.chatgpt_context.resolve_live_status === 'resolved' && proof.chatgpt_context.resolver_evidence.reference_page_budget_exhausted !== false) {
+      errors.push({
+        path: 'chatgpt_context.resolver_evidence.reference_page_budget_exhausted',
+        code: 'resolver_evidence.reference_page_budget_exhausted',
+        message: 'reference_page_budget_exhausted must be false when chatgpt_context.resolve_live_status is "resolved"',
       })
     }
 

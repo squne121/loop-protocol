@@ -119,6 +119,14 @@ describe('agent_operation_session_index/v1 checker: negative fixtures (AC3 seman
     expect(result.valid).toBe(true)
   })
 
+  it('GIVEN a PR review operation whose top-level verification.resolver_status is not resolved THEN resolver.status_not_resolved is raised', () => {
+    const mutated = cloneFixture('valid-pr-review-submitted.json')
+    mutated.verification.resolver_status = 'stale'
+    const result = validateAgentOperationSessionIndexSemantics(mutated)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e) => e.code === 'resolver.status_not_resolved')).toBe(true)
+  })
+
   it('GIVEN a run_id containing a local absolute path THEN public safety scan fails', () => {
     const mutated = cloneFixture('valid-issue-operation.json')
     mutated.agent_run.run_id = '/home/squne/projects/LOOP_PROTOCOL/run-1405'
@@ -182,6 +190,23 @@ describe('agent_operation_session_index/v1 checker: negative fixtures (AC3 seman
     const result = validateAgentOperationSessionIndex(mutated)
     expect(result.valid).toBe(false)
     expect(result.errors.some((e: { code: string }) => e.code === 'schema.invalid')).toBe(true)
+  })
+
+  it('GIVEN a PR review comment source path differs from the resolver object catalog THEN source.object_mismatch is raised', () => {
+    const mutated = cloneFixture('valid-pr-review-comment-created.json')
+    mutated.operation.source.path = 'docs/dev/agent-run-report.md'
+    const result = validateAgentOperationSessionIndexSemantics(mutated)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e) => e.code === 'source.object_mismatch')).toBe(true)
+  })
+
+  it('GIVEN source.commit_id and resolver.target_commit are jointly mutated away from the resolver object catalog THEN source.object_mismatch is raised', () => {
+    const mutated = cloneFixture('valid-pr-review-submitted.json')
+    mutated.operation.source.commit_id = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    mutated.verification.operation_source_resolver.target_commit = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    const result = validateAgentOperationSessionIndexSemantics(mutated)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e) => e.code === 'source.object_mismatch')).toBe(true)
   })
 })
 

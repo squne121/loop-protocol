@@ -478,7 +478,8 @@
             "evidence_projection_digest",
             "target_commit",
             "pagination",
-            "source_catalog"
+            "source_catalog",
+            "object_catalog"
           ],
           "properties": {
             "command": {
@@ -558,6 +559,113 @@
                     "type": "string",
                     "pattern": "^PRRT_[A-Za-z0-9_]+$",
                     "maxLength": 200
+                  }
+                }
+              }
+            },
+            "object_catalog": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "reviews_by_id",
+                "review_comments_by_id",
+                "review_threads_by_node_id"
+              ],
+              "properties": {
+                "reviews_by_id": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "patternProperties": {
+                    "^[0-9]+$": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "id",
+                        "node_id",
+                        "pull_number",
+                        "state",
+                        "commit_id",
+                        "submitted_at",
+                        "html_url",
+                        "digest"
+                      ],
+                      "properties": {
+                        "id": { "type": "integer", "minimum": 1 },
+                        "node_id": { "type": "string", "pattern": "^PRR_[A-Za-z0-9_]+$", "maxLength": 200 },
+                        "pull_number": { "type": "integer", "minimum": 1 },
+                        "state": { "type": "string", "enum": ["APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"] },
+                        "commit_id": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+                        "submitted_at": { "type": "string", "format": "date-time" },
+                        "html_url": { "type": "string", "format": "uri", "pattern": "^https://github\\.com/squne121/loop-protocol/pull/[0-9]+#pullrequestreview-[0-9]+$", "maxLength": 300 },
+                        "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+                      }
+                    }
+                  }
+                },
+                "review_comments_by_id": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "patternProperties": {
+                    "^[0-9]+$": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "id",
+                        "node_id",
+                        "review_id",
+                        "pull_number",
+                        "path",
+                        "line",
+                        "commit_id",
+                        "created_at",
+                        "updated_at",
+                        "html_url",
+                        "digest"
+                      ],
+                      "properties": {
+                        "id": { "type": "integer", "minimum": 1 },
+                        "node_id": { "type": "string", "pattern": "^PRRC_[A-Za-z0-9_]+$", "maxLength": 200 },
+                        "review_id": { "type": "integer", "minimum": 1 },
+                        "pull_number": { "type": "integer", "minimum": 1 },
+                        "path": { "type": "string", "minLength": 1, "maxLength": 300 },
+                        "line": { "type": "integer", "minimum": 1 },
+                        "commit_id": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" },
+                        "html_url": { "type": "string", "format": "uri", "pattern": "^https://github\\.com/squne121/loop-protocol/pull/[0-9]+#discussion_r[0-9]+$", "maxLength": 300 },
+                        "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+                      }
+                    }
+                  }
+                },
+                "review_threads_by_node_id": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "patternProperties": {
+                    "^PRRT_[A-Za-z0-9_]+$": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "thread_node_id",
+                        "pull_number",
+                        "path",
+                        "line",
+                        "is_resolved",
+                        "subject_type",
+                        "observed_at",
+                        "digest"
+                      ],
+                      "properties": {
+                        "thread_node_id": { "type": "string", "pattern": "^PRRT_[A-Za-z0-9_]+$", "maxLength": 200 },
+                        "pull_number": { "type": "integer", "minimum": 1 },
+                        "path": { "type": "string", "minLength": 1, "maxLength": 300 },
+                        "line": { "type": "integer", "minimum": 1 },
+                        "is_resolved": { "type": "boolean" },
+                        "subject_type": { "type": "string", "enum": ["LINE", "FILE"] },
+                        "observed_at": { "type": ["string", "null"], "format": "date-time" },
+                        "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+                      }
+                    }
                   }
                 }
               }

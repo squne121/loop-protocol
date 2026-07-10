@@ -12,8 +12,9 @@
   },
   "operation_index_ref": {
     "comment_url": "https://github.com/squne121/loop-protocol/pull/1411#issuecomment-4935400001",
-    "payload_digest": "sha256:b44eb3fc3993e5b4e221fef5e4721fab5659f50f5ee007a8e43c39e895e462de",
+    "payload_digest": "sha256:2fa520960798463ba3892b9c45ccc97c38be8f0bbc4d33ee2ae2e6209aa30de9",
     "validation_verdict": "pass",
+    "revalidation_mode": "embedded_payload",
     "embedded_payload": {
       "schema": "agent_operation_session_index/v1",
       "repo": "squne121/loop-protocol",
@@ -97,6 +98,47 @@
             "review_thread_node_ids": [
               "PRRT_kwDOSfQcDc6P4Sca"
             ]
+          },
+          "object_catalog": {
+            "reviews_by_id": {
+              "4671349811": {
+                "id": 4671349811,
+                "node_id": "PRR_kwDOSfQcDc8AAAABFm8kMw",
+                "pull_number": 1411,
+                "state": "COMMENTED",
+                "commit_id": "5190a306c3795bd2762ca218dd173a663207cfad",
+                "submitted_at": "2026-07-10T12:27:19Z",
+                "html_url": "https://github.com/squne121/loop-protocol/pull/1411#pullrequestreview-4671349811",
+                "digest": "sha256:7819347ab764d34f64f319f8164a43a670db3aaedf0f02e73051531c9c62f22d"
+              }
+            },
+            "review_comments_by_id": {
+              "3558855703": {
+                "id": 3558855703,
+                "node_id": "PRRC_kwDOSfQcDc7UH9QX",
+                "review_id": 4671349811,
+                "pull_number": 1411,
+                "path": "docs/dev/agent-retro-index.md",
+                "line": 100,
+                "commit_id": "5190a306c3795bd2762ca218dd173a663207cfad",
+                "created_at": "2026-07-10T12:27:19Z",
+                "updated_at": "2026-07-10T12:27:19Z",
+                "html_url": "https://github.com/squne121/loop-protocol/pull/1411#discussion_r3558855703",
+                "digest": "sha256:426c49e94d9d2f9a23498c19390d702605fe66fd4bc90e720535ca7a71be4536"
+              }
+            },
+            "review_threads_by_node_id": {
+              "PRRT_kwDOSfQcDc6P4Sca": {
+                "thread_node_id": "PRRT_kwDOSfQcDc6P4Sca",
+                "pull_number": 1411,
+                "path": "docs/dev/agent-retro-index.md",
+                "line": 100,
+                "is_resolved": true,
+                "subject_type": "LINE",
+                "observed_at": "2026-07-10T12:27:59Z",
+                "digest": "sha256:d71d93048e5ae356f8e1780ab8a0cb3544f37b529345ff487f928f8ef33732ec"
+              }
+            }
           }
         }
       }
@@ -137,7 +179,7 @@
   },
   "retrospective_result": {
     "schema": "chatgpt_retrospective_result/v1",
-    "payload_digest": "sha256:c7464e37000d7e6fbec9b0fcff5e252bd3cdd1780e57f5af3190fb66ba08a147",
+    "payload_digest": "sha256:3db9ea5b9bcb68cda23c21f170f8cb597ec613561b565d077fb0e9eba8b8a6aa",
     "validation_verdict": "pass",
     "verdict": "approve"
   },
@@ -183,7 +225,7 @@
         {
           "kind": "github_comment",
           "ref": "https://github.com/squne121/loop-protocol/pull/1411#issuecomment-4935400001",
-          "digest": "sha256:b44eb3fc3993e5b4e221fef5e4721fab5659f50f5ee007a8e43c39e895e462de"
+          "digest": "sha256:2fa520960798463ba3892b9c45ccc97c38be8f0bbc4d33ee2ae2e6209aa30de9"
         },
         {
           "kind": "github_comment",

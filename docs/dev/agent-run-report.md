@@ -56,7 +56,9 @@ Stop Condition に到達する前に次フェーズへ進まない。
 - `chatgpt-retro-context:post` は `CHATGPT_RETRO_CONTEXT_V1` / `CHATGPT_RETRO_CONTEXT_DIGEST_V1` の 2-line marker contract に従って marker comment を create / noop / supersede する
 - `chatgpt-retro-context:resolve-fixture` は fixture JSON から marker 導線を検証する静的 resolver である
 - `chatgpt-retro-context:resolve-live` は issue / pull request target を issue comments endpoint として扱い、marker comment だけでなく参照先 run report / retro index comment まで live fetch して digest chain を再検証する live resolver である
-- pull request target では追加で PR review / review comment / review thread の public-safe projection を取得し、pagination 完全性・ID catalog・projection digest を返す
+- pull request target では追加で PR review / review comment / review thread の public-safe projection を取得し、pagination 完全性・ID catalog・object catalog・projection digest を返す
+- PR review surface を closure proof へ算入するときは、comment chain と review surface の両方が `resolved` であること、`page_budget_exhausted === false` / `reference_page_budget_exhausted === false` であることを同時に満たす
+- `chatgpt_retro_execution_proof/v1` で PR review surface を再検証するときは `operation_index_ref.revalidation_mode: embedded_payload` を使い、`embedded_payload` の tuple（repo / parent_issue / target）と operation index comment URL を proof target に bind する
 - `chatgpt-retro-context:resolve-live` は `resolved | missing | blocked_duplicate | blocked_malformed | blocked_malformed_marker_syntax | blocked_invalid_reference_chain | blocked_page_budget_exhausted | blocked_stale_write` の structured result を返す
 - `chatgpt-retro-context:post` の blocked state は helper 内部では throw / nonzero exit を使うが、CLI surface では `error_code` を持つ machine-readable JSON を stdout に返す
 

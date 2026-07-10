@@ -24,6 +24,25 @@ function extractJsonBlocks(markdown: string) {
   return matches.map((m) => JSON.parse(m[1]))
 }
 
+function mutatePrReviewMarkdown(mutator: (proof: Record<string, unknown>, retroResult: Record<string, unknown>) => void) {
+  const markdown = readFixture('valid-pr-review-retro-proof.md')
+  const [proof, retroResult] = extractJsonBlocks(markdown)
+  mutator(proof, retroResult)
+  return [
+    '<!-- RETRO_E2E_PROOF_V1 start -->',
+    '```json',
+    JSON.stringify(proof, null, 2),
+    '```',
+    '<!-- RETRO_E2E_PROOF_V1 end -->',
+    '',
+    '<!-- CHATGPT_RETROSPECTIVE_RESULT_V1 start -->',
+    '```json',
+    JSON.stringify(retroResult, null, 2),
+    '```',
+    '<!-- CHATGPT_RETROSPECTIVE_RESULT_V1 end -->',
+  ].join('\n')
+}
+
 describe('chatgpt_retro_execution_proof/v1 checker: valid fixture (AC2, AC4, AC10)', () => {
   it('GIVEN valid-issue-retro-proof.md WHEN validated THEN checker returns valid', () => {
     const result = validateFixture('valid-issue-retro-proof.md')
@@ -198,6 +217,51 @@ describe('chatgpt_retro_execution_proof/v1 checker: negative fixtures (AC4, AC7-
     const result = validateChatgptRetroE2eProofMarkdown(markdown)
     expect(result.valid).toBe(false)
     expect(result.errors.some((e: { code: string }) => e.code === 'operation_index.source_resolver_unresolved')).toBe(true)
+  })
+
+  it('GIVEN a PR review proof without operation_index_ref.embedded_payload THEN operation_index.embedded_payload_required is raised', () => {
+    const markdown = mutatePrReviewMarkdown((proof) => {
+      delete proof.operation_index_ref.embedded_payload
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'operation_index.embedded_payload_required')).toBe(true)
+  })
+
+  it('GIVEN resolve_live_status is resolved but resolver_evidence.status is error THEN resolver_evidence.status_mismatch is raised', () => {
+    const markdown = mutatePrReviewMarkdown((proof) => {
+      proof.chatgpt_context.resolver_evidence.status = 'error'
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'resolver_evidence.status_mismatch')).toBe(true)
+  })
+
+  it('GIVEN resolve_live_status is resolved but resolver_evidence.page_budget_exhausted is true THEN resolver_evidence.page_budget_exhausted is raised', () => {
+    const markdown = mutatePrReviewMarkdown((proof) => {
+      proof.chatgpt_context.resolver_evidence.page_budget_exhausted = true
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'resolver_evidence.page_budget_exhausted')).toBe(true)
+  })
+
+  it('GIVEN the embedded operation index target number differs from proof.target.number THEN operation_index.target_mismatch is raised', () => {
+    const markdown = mutatePrReviewMarkdown((proof) => {
+      proof.operation_index_ref.embedded_payload.target.number = 1412
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'operation_index.target_mismatch')).toBe(true)
+  })
+
+  it('GIVEN operation_index_ref.comment_url points at a different pull request than proof.target THEN operation_index.comment_url_target_mismatch is raised', () => {
+    const markdown = mutatePrReviewMarkdown((proof) => {
+      proof.operation_index_ref.comment_url = 'https://github.com/squne121/loop-protocol/pull/1412#issuecomment-4935400001'
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'operation_index.comment_url_target_mismatch')).toBe(true)
   })
 
   it('GIVEN safety.local_absolute_path_present = true THEN schema const violation fails closed', () => {

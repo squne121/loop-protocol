@@ -539,6 +539,13 @@ function computePublicSafeProjectionDigest(payload) {
   return `sha256:${sha256Hex(stableStringify(payload))}`
 }
 
+function withProjectionDigest(payload) {
+  return {
+    ...payload,
+    digest: computePublicSafeProjectionDigest(payload),
+  }
+}
+
 async function listAllPullRequestReviewsStructured(client, {
   repo,
   pullNumber,
@@ -593,7 +600,7 @@ async function listAllPullRequestReviewThreadsStructured(client, {
 }
 
 function buildPrReviewSurfaceSummary({ pullNumber, reviews, reviewComments, reviewThreads }) {
-  const normalizedReviews = reviews.map((review) => ({
+  const normalizedReviews = reviews.map((review) => withProjectionDigest({
     id: review.id,
     node_id: review.node_id,
     pull_number: pullNumber,
@@ -602,7 +609,7 @@ function buildPrReviewSurfaceSummary({ pullNumber, reviews, reviewComments, revi
     submitted_at: review.submitted_at,
     html_url: review.html_url,
   }))
-  const normalizedReviewComments = reviewComments.map((comment) => ({
+  const normalizedReviewComments = reviewComments.map((comment) => withProjectionDigest({
     id: comment.id,
     node_id: comment.node_id,
     pull_request_review_id: comment.pull_request_review_id,
@@ -614,7 +621,7 @@ function buildPrReviewSurfaceSummary({ pullNumber, reviews, reviewComments, revi
     updated_at: comment.updated_at,
     html_url: comment.html_url,
   }))
-  const normalizedReviewThreads = reviewThreads.map((thread) => ({
+  const normalizedReviewThreads = reviewThreads.map((thread) => withProjectionDigest({
     thread_node_id: thread.id,
     pull_number: pullNumber,
     path: thread.path,
@@ -622,6 +629,7 @@ function buildPrReviewSurfaceSummary({ pullNumber, reviews, reviewComments, revi
     is_resolved: thread.isResolved,
     is_outdated: thread.isOutdated,
     subject_type: thread.subjectType,
+    observed_at: thread.observed_at ?? null,
     comment_count: thread.comments?.totalCount ?? 0,
     thread_comments_complete: thread.comments?.pageInfo?.hasNextPage !== true,
   }))
@@ -636,6 +644,14 @@ function buildPrReviewSurfaceSummary({ pullNumber, reviews, reviewComments, revi
     sample_review: normalizedReviews[0] ?? null,
     sample_review_comment: normalizedReviewComments[0] ?? null,
     sample_review_thread: normalizedReviewThreads.find((thread) => thread.is_resolved) ?? normalizedReviewThreads[0] ?? null,
+    object_catalog: {
+      reviews_by_id: Object.fromEntries(normalizedReviews.map((review) => [String(review.id), review])),
+      review_comments_by_id: Object.fromEntries(normalizedReviewComments.map((comment) => [String(comment.id), {
+        review_id: comment.pull_request_review_id,
+        ...comment,
+      }])),
+      review_threads_by_node_id: Object.fromEntries(normalizedReviewThreads.map((thread) => [thread.thread_node_id, thread])),
+    },
     projection_digest: computePublicSafeProjectionDigest({
       reviews: normalizedReviews,
       review_comments: normalizedReviewComments,
@@ -668,6 +684,16 @@ async function resolvePullRequestReviewSurfaceLive(client, { repo, pullNumber })
     pagination,
     ...surfaceSummary,
   }
+}
+
+function aggregatePullRequestContextStatus(commentChainStatus, prReviewSurfaceStatus) {
+  if (commentChainStatus === 'resolved' && prReviewSurfaceStatus === 'resolved') {
+    return 'resolved'
+  }
+  if (commentChainStatus !== 'resolved') {
+    return commentChainStatus
+  }
+  return prReviewSurfaceStatus
 }
 
 export async function resolveChatgptRetroContextLive(client, {
@@ -707,7 +733,7 @@ export async function resolveChatgptRetroContextLive(client, {
       return null
     }
     return {
-      status: 'resolved',
+      status: aggregatePullRequestContextStatus(commentChainStatus, prReviewSurface.status),
       comment_chain_status: commentChainStatus,
       repo: ownership.repo,
       target,
