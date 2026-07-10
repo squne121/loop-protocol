@@ -223,12 +223,12 @@ implementation_triage_profile:
 
 ### branch publish retry の safety stop（publish 再試行の安全停止）
 
-branch publish が hook / approval 境界で止まった場合、agent は manual remote update に暗黙フォールバックせず、まず fetch/readback を行って `PUBLISH_LANE_DECISION_V1` を評価する。
+branch publish が hook / approval 境界で止まった場合、agent は manual remote update に暗黙フォールバックせず、まず live readback を行って `PUBLISH_LANE_DECISION_V1` を評価する。
 
-- 比較対象: `expected_remote_head` / `current_remote_head` / `local_head` / `verified_head` / `declared_publish_head` / `allowed_paths_gate_status`
+- 比較対象: `expected_remote_head` / `current_remote_head` / `local_head` / `verified_head` / `declared_publish_head` / `allowed_paths_gate_status` / `remote_readback_source` / `decision_inputs_complete`
 - `status: allow_retry` の場合だけ bounded publish command を再試行する
-- `branch_mismatch` / `stale_remote_head` / `local_head_mismatch` / `mixed_head_contamination` / `unsafe_wrapper_route` のいずれかなら `PUBLISH_SAFETY_STOP_REPORT_V1` を残して停止する
-- strict lane を hook に束縛する場合は `LOOP_PUBLISH_EXPECTED_REMOTE_HEAD` / `LOOP_PUBLISH_DECLARED_PUBLISH_HEAD` / `LOOP_PUBLISH_VERIFIED_HEAD` / `LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS` をセットする
+- `branch_mismatch` / `stale_remote_head` / `local_head_mismatch` / `remote_head_scope_contamination` / `allowed_paths_gate_not_ok` / `publish_guard_context_missing` / `publish_guard_context_invalid` のいずれかなら `PUBLISH_SAFETY_STOP_REPORT_V1` を残して停止する
+- strict lane を hook に束縛する場合は `LOOP_PUBLISH_EXPECTED_REMOTE_HEAD` / `LOOP_PUBLISH_CURRENT_REMOTE_HEAD` / `LOOP_PUBLISH_DECLARED_PUBLISH_HEAD` / `LOOP_PUBLISH_VERIFIED_HEAD` / `LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS` / `LOOP_PUBLISH_REMOTE_READBACK_SOURCE` をセットする
 
 ### Scope Collision Preflight（スコープ衝突の事前確認）
 

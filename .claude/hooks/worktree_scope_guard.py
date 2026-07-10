@@ -752,14 +752,13 @@ def _block_with_reason(
             declared_publish_head=getattr(policy_result, "declared_publish_head", None),
             allowed_paths_gate_status=getattr(policy_result, "allowed_paths_gate_status", None),
             target_branch=getattr(policy_result, "target_branch", None),
+            pr_number=getattr(policy_result, "pr_number", None),
+            remote_readback_source=getattr(policy_result, "remote_readback_source", None),
+            decision_inputs_complete=getattr(policy_result, "decision_inputs_complete", None),
             required_decisions=getattr(policy_result, "required_decisions", ()),
         ),
     ]
-    if getattr(policy_result, "target_branch", None) and reason_code in {
-        "stale_remote_head",
-        "local_head_mismatch",
-        "mixed_head_contamination",
-    }:
+    if getattr(policy_result, "target_branch", None) and command_class == "rtk_git_push":
         lines.extend(
             render_publish_safety_stop_report(
                 issue_number=os.environ.get("LOOP_ISSUE_NUMBER", "<unknown>"),
@@ -770,7 +769,11 @@ def _block_with_reason(
                 current_remote_head=getattr(policy_result, "current_remote_head", None),
                 local_head=getattr(policy_result, "local_head", None),
                 verified_head=getattr(policy_result, "verified_head", None),
+                declared_publish_head=getattr(policy_result, "declared_publish_head", None),
                 allowed_paths_gate_status=getattr(policy_result, "allowed_paths_gate_status", None),
+                pr_number=getattr(policy_result, "pr_number", None),
+                remote_readback_source=getattr(policy_result, "remote_readback_source", None),
+                decision_inputs_complete=getattr(policy_result, "decision_inputs_complete", None),
                 required_decisions=getattr(policy_result, "required_decisions", ()),
             )
         )

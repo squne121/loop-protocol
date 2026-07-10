@@ -163,6 +163,8 @@ def _publish_lane(**overrides):
         "verified_head": "b" * 40,
         "declared_publish_head": "b" * 40,
         "allowed_paths_gate_status": "ok",
+        "remote_readback_source": "ls_remote",
+        "decision_inputs_complete": True,
         "boundary_layer": "worktree_scope_guard_denied",
         "issue_number": 1402,
         "pr_number": "1403",
@@ -205,7 +207,7 @@ def test_publish_lane_blocks_stale_and_mixed_remote_head():
     assert stale.publish_failure_reason["reason_code"] == "stale_remote_head"
     assert stale.allowed_command is None
     assert mixed.status == "safety_stop"
-    assert mixed.publish_failure_reason["reason_code"] == "mixed_head_contamination"
+    assert mixed.publish_failure_reason["reason_code"] == "remote_head_scope_contamination"
     assert mixed.allowed_command is None
 
 
@@ -221,9 +223,59 @@ def test_publish_lane_blocks_local_or_reviewed_head_mismatch():
     assert reviewed_mismatch.allowed_command is None
 
 
-def test_publish_lane_blocks_unsafe_wrapper_route_when_gate_not_ok():
+def test_publish_lane_blocks_allowed_paths_gate_not_ok():
     decision = _publish_lane(allowed_paths_gate_status="indeterminate")
 
     assert decision.status == "safety_stop"
-    assert decision.publish_failure_reason["reason_code"] == "unsafe_wrapper_route"
+    assert decision.publish_failure_reason["reason_code"] == "allowed_paths_gate_not_ok"
     assert decision.allowed_command is None
+
+
+def test_publish_lane_blocks_incomplete_or_invalid_readback_source():
+    incomplete = _publish_lane(decision_inputs_complete=False)
+    invalid_source = _publish_lane(remote_readback_source="show_ref_without_fetch")
+
+    assert incomplete.status == "safety_stop"
+    assert incomplete.publish_failure_reason["reason_code"] == "publish_guard_context_invalid"
+    assert invalid_source.status == "safety_stop"
+    assert invalid_source.publish_failure_reason["reason_code"] == "publish_guard_context_invalid"
+    assert invalid_source.allowed_command is None
+
+
+def test_rtk_git_push_requires_strict_publish_context(tmp_path: Path):
+    _init_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "topic"], cwd=tmp_path, check=True)
+    result = classify_rtk_git_mutation(
+        "rtk git " + "push origin HEAD:refs/heads/topic",
+        cwd=str(tmp_path),
+        require_active_branch_push=True,
+    )
+
+    assert result is not None
+    assert result.status == "deny"
+    assert result.reason_code == "publish_guard_context_missing"
+    assert result.decision_inputs_complete is False
+
+
+def test_rtk_git_push_rejects_partial_or_abbreviated_publish_context(
+    tmp_path: Path, monkeypatch
+):
+    _init_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "topic"], cwd=tmp_path, check=True)
+    monkeypatch.setenv("LOOP_PUBLISH_EXPECTED_REMOTE_HEAD", "a" * 7)
+    monkeypatch.setenv("LOOP_PUBLISH_CURRENT_REMOTE_HEAD", "a" * 40)
+    monkeypatch.setenv("LOOP_PUBLISH_DECLARED_PUBLISH_HEAD", "a" * 40)
+    monkeypatch.setenv("LOOP_PUBLISH_VERIFIED_HEAD", "a" * 40)
+    monkeypatch.setenv("LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS", "ok")
+    monkeypatch.setenv("LOOP_PUBLISH_REMOTE_READBACK_SOURCE", "ls_remote")
+
+    result = classify_rtk_git_mutation(
+        "rtk git " + "push origin HEAD:refs/heads/topic",
+        cwd=str(tmp_path),
+        require_active_branch_push=True,
+    )
+
+    assert result is not None
+    assert result.status == "deny"
+    assert result.reason_code == "publish_guard_context_invalid"
+    assert result.decision_inputs_complete is False

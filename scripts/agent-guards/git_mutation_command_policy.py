@@ -18,12 +18,13 @@ from pathlib import Path
 
 ALLOWED_RTK_GIT_SUBCOMMANDS = frozenset({"add", "commit", "push"})
 DENIED_PUSH_FLAGS = frozenset({"--force", "-f", "--tags", "--all", "--mirror", "--delete"})
+ALLOWED_REMOTE_READBACK_SOURCES = frozenset({"ls_remote", "github_branch_api", "fetch_then_show_ref"})
 COMMAND_CLASS_RTK_GIT_ADD = "rtk_git_add"
 COMMAND_CLASS_RTK_GIT_COMMIT = "rtk_git_commit"
 COMMAND_CLASS_RTK_GIT_PUSH = "rtk_git_push"
 COMMAND_CLASS_RTK_GIT_UNKNOWN = "rtk_git_unknown"
 ALLOWED_ALLOWED_PATHS_GATE_STATUSES = frozenset({"ok", "fail_closed", "indeterminate"})
-_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 @dataclass(frozen=True)
@@ -40,15 +41,21 @@ class GitMutationPolicyResult:
     declared_publish_head: str | None = None
     allowed_paths_gate_status: str | None = None
     target_branch: str | None = None
+    pr_number: str | None = None
+    remote_readback_source: str | None = None
+    decision_inputs_complete: bool | None = None
     required_decisions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class PublishGuardContext:
     expected_remote_head: str
+    current_remote_head: str
     declared_publish_head: str
     verified_head: str
     allowed_paths_gate_status: str
+    remote_readback_source: str
+    decision_inputs_complete: bool
 
 
 @dataclass(frozen=True)
@@ -65,6 +72,8 @@ class PublishLaneDecision:
     verified_head: str
     declared_publish_head: str
     allowed_paths_gate_status: str
+    remote_readback_source: str
+    decision_inputs_complete: bool
     allowed_command: str | None
     postcondition: str
     required_human_decision: list[str]
@@ -81,6 +90,8 @@ def evaluate_publish_lane(
     verified_head: str,
     declared_publish_head: str,
     allowed_paths_gate_status: str,
+    remote_readback_source: str,
+    decision_inputs_complete: bool,
     boundary_layer: str,
     issue_number: int | None = None,
     pr_number: str | None = None,
@@ -92,9 +103,15 @@ def evaluate_publish_lane(
         reason_code = "branch_mismatch"
     elif active_branch != target_branch:
         reason_code = "branch_mismatch"
+    elif not decision_inputs_complete:
+        reason_code = "publish_guard_context_invalid"
+    elif remote_readback_source not in ALLOWED_REMOTE_READBACK_SOURCES:
+        reason_code = "publish_guard_context_invalid"
+    elif allowed_paths_gate_status != "ok":
+        reason_code = "allowed_paths_gate_not_ok"
     elif expected_remote_head != current_remote_head:
         reason_code = (
-            "mixed_head_contamination"
+            "remote_head_scope_contamination"
             if current_remote_head not in {expected_remote_head, local_head}
             else "stale_remote_head"
         )
@@ -102,8 +119,6 @@ def evaluate_publish_lane(
         reason_code = "local_head_mismatch"
     elif local_head != verified_head:
         reason_code = "local_head_mismatch"
-    elif allowed_paths_gate_status != "ok":
-        reason_code = "unsafe_wrapper_route"
 
     publish_failure_reason = {
         "boundary_layer": boundary_layer,
@@ -124,6 +139,8 @@ def evaluate_publish_lane(
             verified_head=verified_head,
             declared_publish_head=declared_publish_head,
             allowed_paths_gate_status=allowed_paths_gate_status,
+            remote_readback_source=remote_readback_source,
+            decision_inputs_complete=decision_inputs_complete,
             allowed_command=None,
             postcondition="remote branch head == local_head",
             required_human_decision=[
@@ -144,6 +161,8 @@ def evaluate_publish_lane(
         verified_head=verified_head,
         declared_publish_head=declared_publish_head,
         allowed_paths_gate_status=allowed_paths_gate_status,
+        remote_readback_source=remote_readback_source,
+        decision_inputs_complete=decision_inputs_complete,
         allowed_command=allowed_command,
         postcondition="remote branch head == local_head",
         required_human_decision=[],
@@ -227,27 +246,45 @@ def _extract_git_argv(tokens: list[str]) -> list[str] | None:
     return None
 
 
-def _load_publish_guard_context() -> PublishGuardContext | None:
+def _load_publish_guard_context() -> tuple[PublishGuardContext | None, str | None]:
     expected_remote_head = os.environ.get("LOOP_PUBLISH_EXPECTED_REMOTE_HEAD", "").strip().lower()
+    current_remote_head = os.environ.get("LOOP_PUBLISH_CURRENT_REMOTE_HEAD", "").strip().lower()
     declared_publish_head = os.environ.get("LOOP_PUBLISH_DECLARED_PUBLISH_HEAD", "").strip().lower()
     verified_head = os.environ.get("LOOP_PUBLISH_VERIFIED_HEAD", "").strip().lower()
     allowed_paths_gate_status = os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS", "").strip().lower()
-    if not any((expected_remote_head, declared_publish_head, verified_head, allowed_paths_gate_status)):
-        return None
+    remote_readback_source = os.environ.get("LOOP_PUBLISH_REMOTE_READBACK_SOURCE", "").strip().lower()
+    fields = (
+        expected_remote_head,
+        current_remote_head,
+        declared_publish_head,
+        verified_head,
+        allowed_paths_gate_status,
+        remote_readback_source,
+    )
+    if not any(fields):
+        return None, "publish_guard_context_missing"
+    if not all(fields):
+        return None, "publish_guard_context_invalid"
     if not (
         _SHA_RE.fullmatch(expected_remote_head or "")
+        and _SHA_RE.fullmatch(current_remote_head or "")
         and _SHA_RE.fullmatch(declared_publish_head or "")
         and _SHA_RE.fullmatch(verified_head or "")
     ):
-        return None
+        return None, "publish_guard_context_invalid"
     if allowed_paths_gate_status not in ALLOWED_ALLOWED_PATHS_GATE_STATUSES:
-        return None
+        return None, "publish_guard_context_invalid"
+    if remote_readback_source not in ALLOWED_REMOTE_READBACK_SOURCES:
+        return None, "publish_guard_context_invalid"
     return PublishGuardContext(
         expected_remote_head=expected_remote_head,
+        current_remote_head=current_remote_head,
         declared_publish_head=declared_publish_head,
         verified_head=verified_head,
         allowed_paths_gate_status=allowed_paths_gate_status,
-    )
+        remote_readback_source=remote_readback_source,
+        decision_inputs_complete=True,
+    ), None
 
 
 def _load_allowed_paths() -> list[str] | None:
@@ -381,6 +418,9 @@ def _publish_safety_stop_result(
     verified_head: str,
     declared_publish_head: str,
     allowed_paths_gate_status: str,
+    pr_number: str | None,
+    remote_readback_source: str | None,
+    decision_inputs_complete: bool,
 ) -> GitMutationPolicyResult:
     return GitMutationPolicyResult(
         status="deny",
@@ -398,6 +438,9 @@ def _publish_safety_stop_result(
         declared_publish_head=declared_publish_head,
         allowed_paths_gate_status=allowed_paths_gate_status,
         target_branch=target_branch,
+        pr_number=pr_number,
+        remote_readback_source=remote_readback_source,
+        decision_inputs_complete=decision_inputs_complete,
         required_decisions=(
             "PR branch を linked issue 専用 head へ戻す",
             "混入 commit を別 PR / 別 branch へ退避する",
@@ -545,20 +588,38 @@ def classify_rtk_git_mutation(
                 suggested_command="rtk git push origin HEAD:refs/heads/<active-branch>",
                 verification_command="git branch --show-current",
             )
-    publish_guard = _load_publish_guard_context()
+    publish_guard, publish_guard_error = _load_publish_guard_context()
+    local_head = _current_head(cwd)
+    if publish_guard is None:
+        return _publish_safety_stop_result(
+            reason_code=publish_guard_error or "publish_guard_context_missing",
+            target_branch=target_branch,
+            expected_remote_head=os.environ.get("LOOP_PUBLISH_EXPECTED_REMOTE_HEAD", "").strip().lower(),
+            current_remote_head=os.environ.get("LOOP_PUBLISH_CURRENT_REMOTE_HEAD", "").strip().lower(),
+            local_head=local_head,
+            verified_head=os.environ.get("LOOP_PUBLISH_VERIFIED_HEAD", "").strip().lower(),
+            declared_publish_head=os.environ.get("LOOP_PUBLISH_DECLARED_PUBLISH_HEAD", "").strip().lower(),
+            allowed_paths_gate_status=(
+                os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS", "").strip().lower()
+                or "indeterminate"
+            ),
+            pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+            remote_readback_source=os.environ.get("LOOP_PUBLISH_REMOTE_READBACK_SOURCE", "").strip().lower(),
+            decision_inputs_complete=False,
+        )
     if publish_guard is not None:
-        local_head = _current_head(cwd)
-        current_remote_head = _remote_tracking_head(cwd, "origin", target_branch) or ""
         decision = evaluate_publish_lane(
             remote="origin",
             active_branch=_current_branch(cwd) or "",
             target_branch=target_branch,
             expected_remote_head=publish_guard.expected_remote_head,
-            current_remote_head=current_remote_head,
+            current_remote_head=publish_guard.current_remote_head,
             local_head=local_head or "",
             verified_head=publish_guard.verified_head,
             declared_publish_head=publish_guard.declared_publish_head,
             allowed_paths_gate_status=publish_guard.allowed_paths_gate_status,
+            remote_readback_source=publish_guard.remote_readback_source,
+            decision_inputs_complete=publish_guard.decision_inputs_complete,
             boundary_layer="worktree_scope_guard_denied",
             issue_number=int(os.environ.get("LOOP_ISSUE_NUMBER", "0") or "0"),
             pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
@@ -568,21 +629,27 @@ def classify_rtk_git_mutation(
                 reason_code=decision.publish_failure_reason["reason_code"],
                 target_branch=target_branch,
                 expected_remote_head=publish_guard.expected_remote_head,
-                current_remote_head=current_remote_head,
+                current_remote_head=publish_guard.current_remote_head,
                 local_head=local_head,
                 verified_head=publish_guard.verified_head,
                 declared_publish_head=publish_guard.declared_publish_head,
                 allowed_paths_gate_status=publish_guard.allowed_paths_gate_status,
+                pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+                remote_readback_source=publish_guard.remote_readback_source,
+                decision_inputs_complete=publish_guard.decision_inputs_complete,
             )
     return GitMutationPolicyResult(
         status="allow",
         command_class=COMMAND_CLASS_RTK_GIT_PUSH,
         reason_code="rtk_git_push_allowed",
         expected_remote_head=publish_guard.expected_remote_head if publish_guard else None,
-        current_remote_head=_remote_tracking_head(cwd, "origin", target_branch) if publish_guard else None,
-        local_head=_current_head(cwd) if publish_guard else None,
+        current_remote_head=publish_guard.current_remote_head,
+        local_head=local_head,
         verified_head=publish_guard.verified_head if publish_guard else None,
         declared_publish_head=publish_guard.declared_publish_head if publish_guard else None,
         allowed_paths_gate_status=publish_guard.allowed_paths_gate_status if publish_guard else None,
         target_branch=target_branch,
+        pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+        remote_readback_source=publish_guard.remote_readback_source,
+        decision_inputs_complete=publish_guard.decision_inputs_complete,
     )

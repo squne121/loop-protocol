@@ -187,11 +187,11 @@ hook_boundaries_manifest_v1:
       Issue #1241 以降は issue worktree publish path の `rtk git add/commit/push` だけを shared bounded
       policy で解釈し、deny 時は `HOOK_COMMAND_REPAIR_HINT_V1` を stderr に返す。
       Issue #1402 以降は strict publish lane 用 env binding
-      (`LOOP_PUBLISH_EXPECTED_REMOTE_HEAD`, `LOOP_PUBLISH_DECLARED_PUBLISH_HEAD`,
-      `LOOP_PUBLISH_VERIFIED_HEAD`, `LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS`)
-      が揃った場合、shared policy は `PUBLISH_LANE_DECISION_V1` を評価し、
-      `stale_remote_head` / `local_head_mismatch` / `mixed_head_contamination` /
-      `unsafe_wrapper_route` を `PUBLISH_SAFETY_STOP_REPORT_V1` とともに返す。
+      (`LOOP_PUBLISH_EXPECTED_REMOTE_HEAD`, `LOOP_PUBLISH_CURRENT_REMOTE_HEAD`,
+      `LOOP_PUBLISH_DECLARED_PUBLISH_HEAD`, `LOOP_PUBLISH_VERIFIED_HEAD`,
+      `LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS`, `LOOP_PUBLISH_REMOTE_READBACK_SOURCE`)
+      が全て揃った場合だけ allow retry を検討する。欠落・partial・malformed な場合、shared policy は
+      `publish_guard_context_missing` / `publish_guard_context_invalid` の `PUBLISH_SAFETY_STOP_REPORT_V1` とともに停止する。
 
   - handler_id: guard-japanese-prose
     event: PreToolUse
@@ -448,7 +448,9 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 | `git_add_outside_allowed_paths` | Issue contract の Allowed Paths に戻す | `rtk git add <allowed-path-file>` / `git diff --name-only` |
 | `allowed_paths_missing_for_git_mutation` | runtime に Allowed Paths binding がある状態へ戻す | `git diff --cached --name-only` / `git diff --cached --name-only` |
 | `commit_staged_changes_outside_allowed_paths` | staged diff を Allowed Paths subset に戻す | `rtk git commit -m "issue-1241 update"` / `git diff --cached --name-only` |
-| `push_refspec_requires_active_branch` | remote head 照合後、active branch と一致する refspec だけを使う | `rtk git <publish> origin HEAD:refs/heads/<active-branch>` / `git branch --show-current` |
+| `push_refspec_requires_active_branch` | `PUBLISH_LANE_DECISION_V1 status=allow_retry` の allowed command だけを使う | suggestion なし / `git ls-remote --refs --exit-code origin refs/heads/<active-branch>` |
+| `publish_guard_context_missing` / `publish_guard_context_invalid` | publish lane の decision inputs を live readback 証跡付きで揃える | suggestion なし / `git ls-remote --refs --exit-code origin refs/heads/<branch>` |
+| `allowed_paths_gate_not_ok` | Allowed Paths gate を `ok` にできる current-head 証跡を取得する | suggestion なし / `allowed_paths_review_gate.py status == ok` |
 | `issue_context_required` | issue 未解決の root / unrelated cwd では mutation しない | `git worktree list` / `git branch --show-current` |
 | `target_dir_outside_worktree` | active issue worktree 配下へ戻る | `git status --short` / `git branch --show-current` |
 | `no_matching_worktree` / `ambiguous_worktree` | worktree catalog を 1 件に特定する | `git worktree list` / `git branch --show-current` |

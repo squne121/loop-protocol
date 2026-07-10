@@ -204,8 +204,10 @@ uv run --locked python3 .claude/skills/open-pr/scripts/open_pr.py \
 
 `E_GH_FAILURE` が branch 未公開または remote head drift に起因する場合、存在しない step file を参照せず、本 `SKILL.md` と
 `scripts/open_pr.py` の wrapper 結果を正本にする。復旧前に `impl-review-loop` の Publish Failure Safety Lane を参照し、
-`expected_remote_head`、`current_remote_head`、`local_head`、`verified_head`、`allowed_paths_gate_status` を比較する。
-比較が崩れた場合は `PUBLISH_SAFETY_STOP_REPORT_V1` を残し、force update / reset へ進まない。
+`expected_remote_head`、`current_remote_head`、`local_head`、`verified_head`、`declared_publish_head`、
+`allowed_paths_gate_status`、`remote_readback_source`、`decision_inputs_complete` を比較する。
+open-pr は branch publish を自前で復旧せず、比較が崩れた場合は `PUBLISH_SAFETY_STOP_REPORT_V1` を残して
+impl-review-loop の publish failure lane に戻す。force update / reset へ進まない。
 
 ## Guardrails（ガードレール）
 
