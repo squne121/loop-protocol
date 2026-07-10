@@ -95,6 +95,10 @@ def build_hook_command_repair_hint(
         safe_action = "remote head の追加 commit を分離し、linked issue 専用 head に戻す"
         verification_command = verification_command or "git rev-list <expected_remote_head>..<current_remote_head>"
         stop_condition = "remote head に scope 外 commit がある場合は safety stop"
+    elif reason_code == "remote_fast_forward_by_same_scope":
+        safe_action = "remote fast-forward 差分の scope を確認し、linked issue 専用 head へ再同期する"
+        verification_command = verification_command or "git rev-list <expected_remote_head>..<current_remote_head>"
+        stop_condition = "remote head が expected head より進んでいる場合は safety stop"
     elif reason_code == "non_fast_forward_remote_rewrite":
         safe_action = "remote rewrite の有無を human decision route で確認する"
         verification_command = verification_command or "git merge-base --is-ancestor <expected> <current>"

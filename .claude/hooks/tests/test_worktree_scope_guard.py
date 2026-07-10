@@ -2625,7 +2625,7 @@ def test_publish_lane_push_allowed_when_remote_and_reviewed_heads_match(tmp_path
             "LOOP_PUBLISH_DECLARED_PUBLISH_HEAD": head,
             "LOOP_PUBLISH_VERIFIED_HEAD": head,
             "LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS": "ok",
-            "LOOP_PUBLISH_REMOTE_READBACK_SOURCE": "ls_remote",
+            "LOOP_PUBLISH_REMOTE_READBACK_SOURCE": "fetch_then_show_ref",
         },
     )
     assert r.returncode == 0, r.stderr
@@ -2646,7 +2646,7 @@ def test_publish_lane_push_denies_missing_strict_context(tmp_path):
     assert "decision_inputs_complete: false" in r.stderr
 
 
-def test_publish_lane_push_emits_safety_stop_report_for_mixed_remote_head(tmp_path):
+def test_publish_lane_push_emits_safety_stop_report_for_fast_forward_remote_head(tmp_path):
     repo = _make_repo_with_worktree(tmp_path, issue="942")
     expected_head = _git("rev-parse", "HEAD", cwd=repo["worktree"]).stdout.strip()
     main = repo["root"]
@@ -2677,7 +2677,7 @@ def test_publish_lane_push_emits_safety_stop_report_for_mixed_remote_head(tmp_pa
     )
     assert r.returncode == 2, r.stderr
     assert "PUBLISH_SAFETY_STOP_REPORT_V1:" in r.stderr
-    assert "remote_head_scope_contamination" in r.stderr
+    assert "remote_fast_forward_by_same_scope" in r.stderr
     assert 'pr_number: "1410"' in r.stderr
     assert "declared_publish_head" in r.stderr
     assert 'remote_readback_source: "fetch_then_show_ref"' in r.stderr

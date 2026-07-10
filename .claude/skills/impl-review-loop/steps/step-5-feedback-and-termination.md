@@ -153,7 +153,7 @@ PUBLISH_LANE_DECISION_V1:
   status: allow_retry | safety_stop
   publish_failure_reason:
     boundary_layer: worktree_scope_guard_denied
-    reason_code: remote_write_requires_approval | branch_mismatch | stale_remote_head | local_head_mismatch | remote_head_scope_contamination | non_fast_forward_remote_rewrite | allowed_paths_gate_not_ok | publish_guard_context_missing | publish_guard_context_invalid
+    reason_code: remote_write_requires_approval | branch_mismatch | stale_remote_head | local_head_mismatch | remote_fast_forward_by_same_scope | remote_head_scope_contamination | non_fast_forward_remote_rewrite | allowed_paths_gate_not_ok | publish_guard_context_missing | publish_guard_context_invalid
   remote_readback_source: ls_remote | github_branch_api | fetch_then_show_ref
   decision_inputs_complete: true | false
   allowed_command: null | "<bounded publish command>"
@@ -396,7 +396,7 @@ PUBLISH_LANE_DECISION_V1:
   status: allow_retry | safety_stop
   publish_failure_reason:
     boundary_layer: worktree_scope_guard_denied | git_remote_rejected | codex_permission_request_no_decision
-    reason_code: remote_write_requires_approval | hook_policy_denied | branch_mismatch | stale_remote_head | local_head_mismatch | remote_head_scope_contamination | non_fast_forward_remote_rewrite | allowed_paths_gate_not_ok | publish_guard_context_missing | publish_guard_context_invalid
+    reason_code: remote_write_requires_approval | hook_policy_denied | branch_mismatch | stale_remote_head | local_head_mismatch | remote_fast_forward_by_same_scope | remote_head_scope_contamination | non_fast_forward_remote_rewrite | allowed_paths_gate_not_ok | publish_guard_context_missing | publish_guard_context_invalid
   expected_remote_head: "<sha>"
   current_remote_head: "<sha>"
   local_head: "<sha>"

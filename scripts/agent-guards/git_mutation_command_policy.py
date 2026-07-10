@@ -92,6 +92,7 @@ def evaluate_publish_lane(
     allowed_paths_gate_status: str,
     remote_readback_source: str,
     decision_inputs_complete: bool,
+    remote_drift_reason: str | None = None,
     boundary_layer: str,
     issue_number: int | None = None,
     pr_number: str | None = None,
@@ -111,7 +112,7 @@ def evaluate_publish_lane(
         reason_code = "allowed_paths_gate_not_ok"
     elif expected_remote_head != current_remote_head:
         reason_code = (
-            "remote_head_scope_contamination"
+            remote_drift_reason or "remote_head_scope_contamination"
             if current_remote_head not in {expected_remote_head, local_head}
             else "stale_remote_head"
         )
@@ -238,6 +239,55 @@ def _remote_tracking_head(cwd: str, remote: str, branch: str) -> str | None:
         return None
     oid = result.stdout.strip()
     return oid or None
+
+
+def _ls_remote_head(cwd: str, remote: str, branch: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "--refs", "--exit-code", remote, f"refs/heads/{branch}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    first = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+    oid = first.split()[0] if first else ""
+    return oid.lower() if _SHA_RE.fullmatch(oid.lower()) else None
+
+
+def _is_ancestor(cwd: str, ancestor: str, descendant: str) -> bool | None:
+    if not (_SHA_RE.fullmatch(ancestor) and _SHA_RE.fullmatch(descendant)):
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    return None
+
+
+def _classify_remote_drift(cwd: str, expected_remote_head: str, current_remote_head: str) -> str:
+    ancestry = _is_ancestor(cwd, expected_remote_head, current_remote_head)
+    if ancestry is True:
+        return "remote_fast_forward_by_same_scope"
+    if ancestry is False:
+        return "non_fast_forward_remote_rewrite"
+    return "remote_head_scope_contamination"
 
 
 def _extract_git_argv(tokens: list[str]) -> list[str] | None:
@@ -608,18 +658,44 @@ def classify_rtk_git_mutation(
             decision_inputs_complete=False,
         )
     if publish_guard is not None:
+        current_remote_head = publish_guard.current_remote_head
+        if publish_guard.remote_readback_source == "ls_remote":
+            live_remote_head = _ls_remote_head(cwd, "origin", target_branch)
+            if not live_remote_head:
+                return _publish_safety_stop_result(
+                    reason_code="publish_guard_context_invalid",
+                    target_branch=target_branch,
+                    expected_remote_head=publish_guard.expected_remote_head,
+                    current_remote_head=current_remote_head,
+                    local_head=local_head,
+                    verified_head=publish_guard.verified_head,
+                    declared_publish_head=publish_guard.declared_publish_head,
+                    allowed_paths_gate_status=publish_guard.allowed_paths_gate_status,
+                    pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+                    remote_readback_source=publish_guard.remote_readback_source,
+                    decision_inputs_complete=False,
+                )
+            current_remote_head = live_remote_head
+        remote_drift_reason = None
+        if publish_guard.expected_remote_head != current_remote_head:
+            remote_drift_reason = _classify_remote_drift(
+                cwd,
+                publish_guard.expected_remote_head,
+                current_remote_head,
+            )
         decision = evaluate_publish_lane(
             remote="origin",
             active_branch=_current_branch(cwd) or "",
             target_branch=target_branch,
             expected_remote_head=publish_guard.expected_remote_head,
-            current_remote_head=publish_guard.current_remote_head,
+            current_remote_head=current_remote_head,
             local_head=local_head or "",
             verified_head=publish_guard.verified_head,
             declared_publish_head=publish_guard.declared_publish_head,
             allowed_paths_gate_status=publish_guard.allowed_paths_gate_status,
             remote_readback_source=publish_guard.remote_readback_source,
             decision_inputs_complete=publish_guard.decision_inputs_complete,
+            remote_drift_reason=remote_drift_reason,
             boundary_layer="worktree_scope_guard_denied",
             issue_number=int(os.environ.get("LOOP_ISSUE_NUMBER", "0") or "0"),
             pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
@@ -629,7 +705,7 @@ def classify_rtk_git_mutation(
                 reason_code=decision.publish_failure_reason["reason_code"],
                 target_branch=target_branch,
                 expected_remote_head=publish_guard.expected_remote_head,
-                current_remote_head=publish_guard.current_remote_head,
+                current_remote_head=current_remote_head,
                 local_head=local_head,
                 verified_head=publish_guard.verified_head,
                 declared_publish_head=publish_guard.declared_publish_head,
@@ -643,7 +719,7 @@ def classify_rtk_git_mutation(
         command_class=COMMAND_CLASS_RTK_GIT_PUSH,
         reason_code="rtk_git_push_allowed",
         expected_remote_head=publish_guard.expected_remote_head if publish_guard else None,
-        current_remote_head=publish_guard.current_remote_head,
+        current_remote_head=current_remote_head,
         local_head=local_head,
         verified_head=publish_guard.verified_head if publish_guard else None,
         declared_publish_head=publish_guard.declared_publish_head if publish_guard else None,

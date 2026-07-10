@@ -279,3 +279,60 @@ def test_rtk_git_push_rejects_partial_or_abbreviated_publish_context(
     assert result.status == "deny"
     assert result.reason_code == "publish_guard_context_invalid"
     assert result.decision_inputs_complete is False
+
+
+def test_rtk_git_push_ls_remote_overrides_stale_env_current_head(
+    tmp_path: Path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    remote = tmp_path / "remote.git"
+    repo.mkdir()
+    _init_repo(repo)
+    subprocess.run(["git", "checkout", "-q", "-b", "topic"], cwd=repo, check=True)
+    head = _commit(repo, "tracked.txt", "initial")
+    subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=repo, check=True)
+    subprocess.run(["git", "pu" + "sh", "origin", "HEAD:refs/heads/topic"], cwd=repo, check=True)
+
+    monkeypatch.setenv("LOOP_PUBLISH_EXPECTED_REMOTE_HEAD", head)
+    monkeypatch.setenv("LOOP_PUBLISH_CURRENT_REMOTE_HEAD", "c" * 40)
+    monkeypatch.setenv("LOOP_PUBLISH_DECLARED_PUBLISH_HEAD", head)
+    monkeypatch.setenv("LOOP_PUBLISH_VERIFIED_HEAD", head)
+    monkeypatch.setenv("LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS", "ok")
+    monkeypatch.setenv("LOOP_PUBLISH_REMOTE_READBACK_SOURCE", "ls_remote")
+
+    result = classify_rtk_git_mutation(
+        "rtk git " + "push origin HEAD:refs/heads/topic",
+        cwd=str(repo),
+        require_active_branch_push=True,
+    )
+
+    assert result is not None
+    assert result.status == "allow"
+    assert result.current_remote_head == head
+    assert result.remote_readback_source == "ls_remote"
+
+
+def test_rtk_git_push_classifies_fast_forward_remote_drift(tmp_path: Path, monkeypatch):
+    _init_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "topic"], cwd=tmp_path, check=True)
+    expected = _commit(tmp_path, "tracked.txt", "initial")
+    current = _commit(tmp_path, "tracked.txt", "next")
+    subprocess.run(["git", "reset", "--hard", expected], cwd=tmp_path, check=True)
+
+    monkeypatch.setenv("LOOP_PUBLISH_EXPECTED_REMOTE_HEAD", expected)
+    monkeypatch.setenv("LOOP_PUBLISH_CURRENT_REMOTE_HEAD", current)
+    monkeypatch.setenv("LOOP_PUBLISH_DECLARED_PUBLISH_HEAD", expected)
+    monkeypatch.setenv("LOOP_PUBLISH_VERIFIED_HEAD", expected)
+    monkeypatch.setenv("LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS", "ok")
+    monkeypatch.setenv("LOOP_PUBLISH_REMOTE_READBACK_SOURCE", "fetch_then_show_ref")
+
+    result = classify_rtk_git_mutation(
+        "rtk git " + "push origin HEAD:refs/heads/topic",
+        cwd=str(tmp_path),
+        require_active_branch_push=True,
+    )
+
+    assert result is not None
+    assert result.status == "deny"
+    assert result.reason_code == "remote_fast_forward_by_same_scope"
