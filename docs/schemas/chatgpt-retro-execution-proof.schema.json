@@ -76,6 +76,9 @@
         "validation_verdict": {
           "type": "string",
           "const": "pass"
+        },
+        "embedded_payload": {
+          "type": "object"
         }
       }
     },

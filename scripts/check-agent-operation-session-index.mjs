@@ -19,6 +19,7 @@
 //   node scripts/check-agent-operation-session-index.mjs <file-or-glob ...>
 //   pnpm run agent-operation-session-index:check
 
+import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { glob as fsGlob, stat } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
@@ -42,19 +43,33 @@ try {
 
 const SCHEMA_FILE = resolve(REPO_ROOT, 'docs/schemas/agent-operation-session-index.schema.json')
 
-// github_event_ref.kind <-> operation.kind closed mapping (semantic_checks bullet,
-// OWNER review indication 5). pr_review / pr_review_addressed are intentionally
-// absent from operation.kind's schema enum (out of scope until resolver support,
-// follow-up issue) so they cannot appear here either.
 const EVENT_KIND_MAPPING = {
   issue_comment: new Set(['github_comment']),
   issue_body_update: new Set(['github_issue']),
   issue_close: new Set(['github_issue']),
   pr_open: new Set(['github_pr']),
   pr_comment: new Set(['github_comment']),
+  pr_review_submitted: new Set(['github_pr']),
+  pr_review_comment_created: new Set(['github_comment']),
+  pr_review_thread_resolved: new Set(['github_pr']),
   commit_push: new Set(['workflow_run', 'github_pr']),
   ci_retry: new Set(['workflow_run']),
   merge: new Set(['github_pr']),
+}
+
+const PR_REVIEW_OPERATION_KIND_TO_SOURCE_KIND = {
+  pr_review_submitted: 'github_pull_request_review',
+  pr_review_comment_created: 'github_pull_request_review_comment',
+  pr_review_thread_resolved: 'github_pull_request_review_thread',
+}
+
+function hasDuplicateValues(values) {
+  const normalized = values.map((value) => String(value))
+  return new Set(normalized).size !== normalized.length
+}
+
+function isPrReviewOperationKind(kind) {
+  return Object.hasOwn(PR_REVIEW_OPERATION_KIND_TO_SOURCE_KIND, kind)
 }
 
 function createAjv() {
@@ -112,6 +127,8 @@ export function validateAgentOperationSessionIndexSemantics(index) {
   const target = index?.target
   const parentIssue = index?.parent_issue
   const publicArtifacts = index?.public_artifacts || {}
+  const operation = index?.operation || {}
+  const verification = index?.verification || {}
 
   if (target && typeof target.kind === 'string' && typeof target.number === 'number') {
     const expectedSegment = urlKindSegment(target.kind)
@@ -135,7 +152,9 @@ export function validateAgentOperationSessionIndexSemantics(index) {
         })
         continue
       }
-      if (actualSegment !== expectedSegment) {
+      const number = actualSegment === 'issues' ? issuesNumber : pullNumber
+      const parentIssueMatch = actualSegment === 'issues' && number === parentIssue
+      if (actualSegment !== expectedSegment && !parentIssueMatch) {
         errors.push({
           path,
           code: 'target.kind_mismatch',
@@ -143,7 +162,6 @@ export function validateAgentOperationSessionIndexSemantics(index) {
         })
         continue
       }
-      const number = actualSegment === 'issues' ? issuesNumber : pullNumber
       if (number !== target.number && number !== parentIssue) {
         errors.push({
           path,
@@ -154,8 +172,8 @@ export function validateAgentOperationSessionIndexSemantics(index) {
     }
   }
 
-  const operationKind = index?.operation?.kind
-  const eventKind = index?.operation?.github_event_ref?.kind
+  const operationKind = operation.kind
+  const eventKind = operation?.github_event_ref?.kind
   if (operationKind && eventKind) {
     const allowedEventKinds = EVENT_KIND_MAPPING[operationKind]
     if (!allowedEventKinds || !allowedEventKinds.has(eventKind)) {
@@ -175,6 +193,143 @@ export function validateAgentOperationSessionIndexSemantics(index) {
     })
   }
 
+  if (isPrReviewOperationKind(operationKind)) {
+    const expectedSourceKind = PR_REVIEW_OPERATION_KIND_TO_SOURCE_KIND[operationKind]
+    const source = operation.source
+    const resolver = verification.operation_source_resolver
+
+    if (target?.kind !== 'pull_request') {
+      errors.push({
+        path: 'target.kind',
+        code: 'target.kind_mismatch',
+        message: `${operationKind} requires target.kind "pull_request"`,
+      })
+    }
+
+    if (!source || source.kind !== expectedSourceKind) {
+      errors.push({
+        path: 'operation.source.kind',
+        code: 'source.kind_mismatch',
+        message: `operation.kind "${operationKind}" requires operation.source.kind "${expectedSourceKind}"`,
+      })
+    }
+
+    if (source?.pull_number !== target?.number) {
+      errors.push({
+        path: 'operation.source.pull_number',
+        code: 'source.target_mismatch',
+        message: `operation.source.pull_number (#${source?.pull_number}) must match target.number (#${target?.number})`,
+      })
+    }
+
+    if (!resolver || resolver.status !== 'resolved') {
+      errors.push({
+        path: 'verification.operation_source_resolver.status',
+        code: 'resolver.status_not_resolved',
+        message: 'verification.operation_source_resolver.status must be "resolved" for PR review operations',
+      })
+    }
+
+    const pagination = resolver?.pagination
+    if (pagination && Object.entries(pagination).some(([, complete]) => complete !== true)) {
+      errors.push({
+        path: 'verification.operation_source_resolver.pagination',
+        code: 'resolver.pagination_incomplete',
+        message: 'PR review surface pagination must be complete for reviews, review comments, review threads, and thread comments',
+      })
+    }
+
+    const sourceCatalog = resolver?.source_catalog
+    if (sourceCatalog) {
+      if (hasDuplicateValues(sourceCatalog.review_ids ?? [])) {
+        errors.push({
+          path: 'verification.operation_source_resolver.source_catalog.review_ids',
+          code: 'resolver.duplicate_source_id',
+          message: 'review_ids must be unique',
+        })
+      }
+      if (hasDuplicateValues(sourceCatalog.review_comment_ids ?? [])) {
+        errors.push({
+          path: 'verification.operation_source_resolver.source_catalog.review_comment_ids',
+          code: 'resolver.duplicate_source_id',
+          message: 'review_comment_ids must be unique',
+        })
+      }
+      if (hasDuplicateValues(sourceCatalog.review_thread_node_ids ?? [])) {
+        errors.push({
+          path: 'verification.operation_source_resolver.source_catalog.review_thread_node_ids',
+          code: 'resolver.duplicate_source_id',
+          message: 'review_thread_node_ids must be unique',
+        })
+      }
+    }
+
+    if (source?.kind === 'github_pull_request_review') {
+      if (source.state === 'PENDING') {
+        errors.push({
+          path: 'operation.source.state',
+          code: 'review.state_pending',
+          message: 'pr_review_submitted cannot reference a PENDING review',
+        })
+      }
+      if (source.commit_id !== resolver?.target_commit) {
+        errors.push({
+          path: 'operation.source.commit_id',
+          code: 'source.commit_mismatch',
+          message: 'operation.source.commit_id must match verification.operation_source_resolver.target_commit',
+        })
+      }
+      if (!sourceCatalog?.review_ids?.includes(source.review_id)) {
+        errors.push({
+          path: 'operation.source.review_id',
+          code: 'source.catalog_missing',
+          message: 'review_id must exist in verification.operation_source_resolver.source_catalog.review_ids',
+        })
+      }
+    }
+
+    if (source?.kind === 'github_pull_request_review_comment') {
+      if (source.commit_id !== resolver?.target_commit) {
+        errors.push({
+          path: 'operation.source.commit_id',
+          code: 'source.commit_mismatch',
+          message: 'operation.source.commit_id must match verification.operation_source_resolver.target_commit',
+        })
+      }
+      if (!sourceCatalog?.review_ids?.includes(source.review_id)) {
+        errors.push({
+          path: 'operation.source.review_id',
+          code: 'source.catalog_missing',
+          message: 'review_id must exist in verification.operation_source_resolver.source_catalog.review_ids',
+        })
+      }
+      if (!sourceCatalog?.review_comment_ids?.includes(source.comment_id)) {
+        errors.push({
+          path: 'operation.source.comment_id',
+          code: 'source.catalog_missing',
+          message: 'comment_id must exist in verification.operation_source_resolver.source_catalog.review_comment_ids',
+        })
+      }
+    }
+
+    if (source?.kind === 'github_pull_request_review_thread') {
+      if (source.is_resolved !== true || source.origin?.is_resolved !== true) {
+        errors.push({
+          path: 'operation.source.is_resolved',
+          code: 'review_thread.unresolved',
+          message: 'pr_review_thread_resolved must reference a resolved review thread',
+        })
+      }
+      if (!sourceCatalog?.review_thread_node_ids?.includes(source.thread_node_id)) {
+        errors.push({
+          path: 'operation.source.thread_node_id',
+          code: 'source.catalog_missing',
+          message: 'thread_node_id must exist in verification.operation_source_resolver.source_catalog.review_thread_node_ids',
+        })
+      }
+    }
+  }
+
   return { valid: errors.length === 0, errors }
 }
 
@@ -182,12 +337,35 @@ export function validateAgentOperationSessionIndex(payload) {
   const schemaResult = validateAgentOperationSessionIndexAgainstSchema(payload)
   const semanticResult = validateAgentOperationSessionIndexSemantics(payload)
   const scanResult = scanPublicSafety(payload)
+  const filteredScanErrors = scanResult.errors.filter((error) => {
+    if (error.code !== 'secret.token_like_hex40') {
+      return true
+    }
+    return ![
+      'operation.source.commit_id',
+      'verification.operation_source_resolver.target_commit',
+    ].includes(error.path)
+  })
   const errors = [
     ...schemaResult.errors,
     ...semanticResult.errors,
-    ...scanResult.errors,
+    ...filteredScanErrors,
   ]
   return { valid: errors.length === 0, errors }
+}
+
+function stableStringify(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => stableStringify(entry)).join(',')}]`
+  }
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+export function computeAgentOperationSessionIndexPayloadDigest(payload) {
+  return `sha256:${createHash('sha256').update(stableStringify(payload), 'utf-8').digest('hex')}`
 }
 
 function printUsage() {

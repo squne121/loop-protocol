@@ -1,0 +1,84 @@
+{
+  "schema": "agent_operation_session_index/v1",
+  "repo": "squne121/loop-protocol",
+  "parent_issue": 1153,
+  "target": {
+    "kind": "pull_request",
+    "number": 1411
+  },
+  "operation": {
+    "kind": "pr_review_submitted",
+    "github_event_ref": {
+      "kind": "github_pr",
+      "ref": "https://github.com/squne121/loop-protocol/pull/1411",
+      "digest": "sha256:7819347ab764d34f64f319f8164a43a670db3aaedf0f02e73051531c9c62f22d"
+    },
+    "source": {
+      "kind": "github_pull_request_review",
+      "review_id": 4671349811,
+      "node_id": "PRR_kwDOSfQcDc8AAAABFm8kMw",
+      "pull_number": 1411,
+      "state": "COMMENTED",
+      "commit_id": "5190a306c3795bd2762ca218dd173a663207cfad",
+      "submitted_at": "2026-07-10T12:27:19Z",
+      "html_url": "https://github.com/squne121/loop-protocol/pull/1411#pullrequestreview-4671349811",
+      "digest": "sha256:7819347ab764d34f64f319f8164a43a670db3aaedf0f02e73051531c9c62f22d"
+    },
+    "occurred_at": "2026-07-10T12:27:19Z"
+  },
+  "agent_run": {
+    "run_id": "run-1416-pr-review-001",
+    "agent_surface": "codex_cli",
+    "evidence_mode": "synthetic_route_proof",
+    "capability_verdict": "supported",
+    "raw_values_emitted": false
+  },
+  "public_artifacts": {
+    "run_report_comment_url": "https://github.com/squne121/loop-protocol/pull/1411#issuecomment-4935300001",
+    "run_report_payload_digest": "sha256:d1c9dcb2a5a5731bd1d00f35fb52f0e65f099eded93be7e0373315d45af7540e",
+    "retro_index_comment_url": "https://github.com/squne121/loop-protocol/issues/1153#issuecomment-4935300002",
+    "retro_index_payload_digest": "sha256:6a8f5f21a9e0735007d06726c3023408949ae924e5f2e8359c3d5956468e7485",
+    "retro_index_source_set_digest": "sha256:62c67b28f53662ef4765d33a50319a9fc18cfe3de7e4aed896fa4c314ccafd93",
+    "chatgpt_marker_comment_url": "https://github.com/squne121/loop-protocol/pull/1411#issuecomment-4935300003",
+    "chatgpt_marker_digest": "sha256:6d422b49d8d840de070b79ecb0933cae0cf1966059f1f722fdd66463fc108cd1"
+  },
+  "verification": {
+    "resolver_command": "pnpm chatgpt-retro-context:resolve-live",
+    "resolver_status": "resolved",
+    "checked_at": "2026-07-10T12:28:00Z",
+    "checker_version": "check-agent-operation-session-index.mjs@1416",
+    "public_safe": true,
+    "semantic_checks": [
+      "target.kind_url_alignment",
+      "public_artifacts.number_alignment",
+      "event_kind_mapping",
+      "raw_values_emitted_false",
+      "pr_review_source_kind_alignment",
+      "pr_review_surface_pagination_complete"
+    ],
+    "operation_source_resolver": {
+      "command": "pnpm chatgpt-retro-context:resolve-live",
+      "status": "resolved",
+      "checked_at": "2026-07-10T12:27:59Z",
+      "evidence_projection_digest": "sha256:9030dc57b8e7d563ad44a9052b8604fe4b18f4b43b7980a843c042d0501f4c9f",
+      "target_commit": "5190a306c3795bd2762ca218dd173a663207cfad",
+      "pagination": {
+        "reviews_complete": true,
+        "review_comments_complete": true,
+        "review_threads_complete": true,
+        "thread_comments_complete": true
+      },
+      "source_catalog": {
+        "review_ids": [
+          4671349811
+        ],
+        "review_comment_ids": [
+          3558855703
+        ],
+        "review_thread_node_ids": [
+          "PRRT_kwDOSfQcDc6P4Sca"
+        ]
+      }
+    }
+  }
+}

@@ -48,6 +48,10 @@ import {
   scanPublicSafety,
   validateChatgptRetrospectiveResultAgainstSchema,
 } from './lib/agent-run-report-validation.mjs'
+import {
+  computeAgentOperationSessionIndexPayloadDigest,
+  validateAgentOperationSessionIndex,
+} from './check-agent-operation-session-index.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 export const REPO_ROOT = resolve(__dirname, '..')
@@ -323,6 +327,18 @@ function collectRuntimeCaptureClaimTexts(retroResult) {
   return texts
 }
 
+function filterPublicSafetyErrors(errors) {
+  return errors.filter((error) => {
+    if (error.code !== 'secret.token_like_hex40') {
+      return true
+    }
+    return ![
+      'operation_index_ref.embedded_payload.operation.source.commit_id',
+      'operation_index_ref.embedded_payload.verification.operation_source_resolver.target_commit',
+    ].includes(error.path)
+  })
+}
+
 // ── markdown extraction (marker uniqueness + fence matching) ───────────────
 function extractMarkedJsonBlock(markdown, startMarker, endMarker) {
   const lines = markdown.split('\n')
@@ -580,7 +596,7 @@ export function validateChatgptRetroExecutionProof(proof, retroResult) {
     path: `retrospective_result_payload${error.path === 'root' ? '' : `.${error.path}`}`,
   })))
 
-  errors.push(...scanPublicSafety(proof).errors)
+  errors.push(...filterPublicSafetyErrors(scanPublicSafety(proof).errors))
   errors.push(...scanPublicSafety(retroResult).errors)
   errors.push(...scanChatgptRetroE2eProofForbiddenFields(proof).errors)
   errors.push(...scanChatgptRetroE2eProofForbiddenFields(retroResult).errors)
@@ -605,6 +621,36 @@ export function validateChatgptRetroExecutionProof(proof, retroResult) {
         code: 'digest.retrospective_result_mismatch',
         message: 'proof.retrospective_result.payload_digest does not match the recomputed digest of the referenced payload',
       })
+    }
+
+    if (proof.operation_index_ref?.embedded_payload) {
+      const operationIndexValidation = validateAgentOperationSessionIndex(proof.operation_index_ref.embedded_payload)
+      if (!operationIndexValidation.valid) {
+        for (const error of operationIndexValidation.errors) {
+          errors.push({
+            path: `operation_index_ref.embedded_payload${error.path === 'root' ? '' : `.${error.path}`}`,
+            code: 'operation_index.validation_failed',
+            message: error.message,
+          })
+        }
+      }
+
+      const recomputedOperationIndexDigest = computeAgentOperationSessionIndexPayloadDigest(proof.operation_index_ref.embedded_payload)
+      if (proof.operation_index_ref.payload_digest !== recomputedOperationIndexDigest) {
+        errors.push({
+          path: 'operation_index_ref.payload_digest',
+          code: 'operation_index.payload_digest_mismatch',
+          message: 'operation_index_ref.payload_digest does not match the embedded operation index payload digest',
+        })
+      }
+
+      if (proof.operation_index_ref.embedded_payload?.verification?.operation_source_resolver?.status !== 'resolved') {
+        errors.push({
+          path: 'operation_index_ref.embedded_payload.verification.operation_source_resolver.status',
+          code: 'operation_index.source_resolver_unresolved',
+          message: 'embedded operation index payload must carry verification.operation_source_resolver.status = "resolved"',
+        })
+      }
     }
 
     // target.mismatch

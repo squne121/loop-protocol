@@ -56,6 +56,7 @@ Stop Condition に到達する前に次フェーズへ進まない。
 - `chatgpt-retro-context:post` は `CHATGPT_RETRO_CONTEXT_V1` / `CHATGPT_RETRO_CONTEXT_DIGEST_V1` の 2-line marker contract に従って marker comment を create / noop / supersede する
 - `chatgpt-retro-context:resolve-fixture` は fixture JSON から marker 導線を検証する静的 resolver である
 - `chatgpt-retro-context:resolve-live` は issue / pull request target を issue comments endpoint として扱い、marker comment だけでなく参照先 run report / retro index comment まで live fetch して digest chain を再検証する live resolver である
+- pull request target では追加で PR review / review comment / review thread の public-safe projection を取得し、pagination 完全性・ID catalog・projection digest を返す
 - `chatgpt-retro-context:resolve-live` は `resolved | missing | blocked_duplicate | blocked_malformed | blocked_malformed_marker_syntax | blocked_invalid_reference_chain | blocked_page_budget_exhausted | blocked_stale_write` の structured result を返す
 - `chatgpt-retro-context:post` の blocked state は helper 内部では throw / nonzero exit を使うが、CLI surface では `error_code` を持つ machine-readable JSON を stdout に返す
 
@@ -79,6 +80,7 @@ Stop Condition に到達する前に次フェーズへ進まない。
 - outer digest は payload markdown 全体の sha256 である
 - inner `canonicalization.payload_digest` は JSON payload の canonical digest である
 - `resolve-live` は outer 2-line marker の ownership を確認した後、inner payload・run report comment・retro index comment・source-set digest を live 再検証する
+- pull request target の `resolved` は comment chain だけでなく review surface pagination も complete であることを含む
 
 ## Review Correction Loop / レビュー修正ループ
 
@@ -490,7 +492,8 @@ retro_e2e_proof_required:
 ```
 
 - #1153 を close する前に、少なくとも 1 件の Issue target と 1 件の PR target
-  （`operation.kind: pr_comment` 限定。`pr_review` / `pr_review_addressed` は resolver 対応後の follow-up）
+  （`operation.kind: pr_comment` に加え、`pr_review_submitted` / `pr_review_comment_created` /
+  `pr_review_thread_resolved` を public-safe projection として再検証できること）
   で live GitHub comment chain を作成し、`resolve-live status: resolved` と
   ChatGPT connector-only retrospective result を GitHub 上に残すこと（本 Issue の Runtime Verification
   Applicability は `deferred`。live 検証証跡は PR verification comment として任意に添付し、CI 必須条件にはしない）。

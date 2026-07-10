@@ -43,6 +43,12 @@ describe('chatgpt_retro_execution_proof/v1 checker: valid fixture (AC2, AC4, AC1
     expect(result.errors).toEqual([])
     expect(result.valid).toBe(true)
   })
+
+  it('GIVEN valid-pr-review-retro-proof.md WHEN validated THEN checker revalidates the embedded operation index payload', () => {
+    const result = validateFixture('valid-pr-review-retro-proof.md')
+    expect(result.errors).toEqual([])
+    expect(result.valid).toBe(true)
+  })
 })
 
 describe('chatgpt_retro_execution_proof/v1 checker: negative fixtures (AC4, AC7-AC9, fail-closed)', () => {
@@ -173,6 +179,25 @@ describe('chatgpt_retro_execution_proof/v1 checker: negative fixtures (AC4, AC7-
     const result = validateChatgptRetroE2eProofMarkdown(markdown)
     expect(result.valid).toBe(false)
     expect(result.errors.some((e: { code: string }) => e.code === 'digest.stale')).toBe(true)
+  })
+
+  it('GIVEN an embedded operation index payload whose digest does not match operation_index_ref.payload_digest THEN operation_index.payload_digest_mismatch is raised', () => {
+    const markdown = mutateMarkdown((proof) => {
+      proof.operation_index_ref.embedded_payload = {
+        schema: 'agent_operation_session_index/v1',
+        repo: 'squne121/loop-protocol',
+      }
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'operation_index.payload_digest_mismatch')).toBe(true)
+  })
+
+  it('GIVEN an embedded operation index payload whose source resolver status is not resolved THEN operation_index.source_resolver_unresolved is raised', () => {
+    const markdown = readFixture('valid-pr-review-retro-proof.md').replace('"status": "resolved"', '"status": "missing"')
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'operation_index.source_resolver_unresolved')).toBe(true)
   })
 
   it('GIVEN safety.local_absolute_path_present = true THEN schema const violation fails closed', () => {

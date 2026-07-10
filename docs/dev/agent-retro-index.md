@@ -103,7 +103,7 @@ post-run verifier が canonical gate である。
 | アーティファクト | 単位 | 責務 |
 |---|---|---|
 | `agent_retro_index` | 複数ラン横断 | friction パターン・フォローアップ Issue の集約 |
-| `agent_operation_session_index/v1` | 単一 Issue/PR operation | operation（issue_comment / pr_comment 等）と agent run / public artifact（run report・retro index・`CHATGPT_RETRO_CONTEXT_V1` marker）の対応関係を machine-readable に固定する |
+| `agent_operation_session_index/v1` | 単一 Issue/PR operation | operation（issue_comment / pr_comment / pr_review_submitted / pr_review_comment_created / pr_review_thread_resolved 等）と agent run / public artifact（run report・retro index・`CHATGPT_RETRO_CONTEXT_V1` marker・PR review surface projection）の対応関係を machine-readable に固定する |
 
 `agent_operation_session_index/v1` は `agent_retro_index` を置き換えず、
 `agent_retro_index` の `entries[].report_comment_url` が指す run report と
