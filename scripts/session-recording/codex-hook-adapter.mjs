@@ -18,6 +18,180 @@ const producerScript = configuredProducerScript.startsWith(repoRoot)
   ? configuredProducerScript
   : defaultProducerScript
 
+// Issue #1428: shell command structure analyzer (SHELL_COMMAND_ANALYSIS_V1).
+// Invoked out-of-process via execFile-style argv (no shell interpolation,
+// no shell: true) with the command passed as JSON over stdin (data channel,
+// not argv/shell-string), per In Scope 4 (analyzer invocation safety).
+//
+// CODEX_SHELL_COMMAND_ANALYZER (test-only override, PR #1441 High 3): lets
+// the test suite substitute a fake analyzer script to exercise the strict
+// SHELL_COMMAND_ANALYSIS_V1 response validation below (e.g. a regression
+// where the analyzer emits a malformed command fact) without needing to
+// break the real bounded-grammar analyzer. Same repoRoot-confinement
+// pattern as CODEX_SESSION_RECORDING_PRODUCER — an override outside the
+// repo is ignored and the production default is used instead.
+const defaultShellCommandAnalyzerScript = resolve(repoRoot, 'scripts', 'agent-guards', 'shell_command_analysis.py')
+const configuredShellCommandAnalyzerScript = process.env.CODEX_SHELL_COMMAND_ANALYZER
+  ? resolve(process.env.CODEX_SHELL_COMMAND_ANALYZER)
+  : defaultShellCommandAnalyzerScript
+const shellCommandAnalyzerScript = configuredShellCommandAnalyzerScript.startsWith(repoRoot)
+  ? configuredShellCommandAnalyzerScript
+  : defaultShellCommandAnalyzerScript
+const SHELL_COMMAND_ANALYSIS_SCHEMA = 'SHELL_COMMAND_ANALYSIS_V1'
+const SHELL_ANALYZER_TIMEOUT_MS = 5000
+const SHELL_ANALYZER_MAX_BUFFER = 1024 * 1024
+
+const PUSH_COMMAND_KINDS = new Set(['git_push', 'rtk_git_push'])
+
+// PR #1441 High 3: full SHELL_COMMAND_ANALYSIS_V1 command-fact validation —
+// every key/type/enum/source-span shape the analyzer contract promises,
+// mirrored from scripts/agent-guards/shell_command_analysis.py.
+const COMMAND_FACT_KEYS = new Set([
+  'command_kind',
+  'executable_literalness',
+  'subcommand_literalness',
+  'remote_class',
+  'refspec_class',
+  'dangerous_flags',
+  'execution_context',
+  'source_span',
+])
+const VALID_COMMAND_KINDS = new Set(['git_push', 'rtk_git_push'])
+const VALID_LITERALNESS = new Set(['literal', 'dynamic'])
+const VALID_REMOTE_CLASSES = new Set(['absent', 'origin', 'other_literal', 'dynamic'])
+const VALID_REFSPEC_CLASSES = new Set(['absent', 'head_to_literal_branch', 'other_literal', 'dynamic'])
+const VALID_DANGEROUS_FLAGS = new Set(['force', 'tags', 'all', 'mirror', 'delete'])
+const VALID_EXECUTION_CONTEXTS = new Set([
+  'top_level',
+  'list',
+  'pipeline',
+  'command_substitution',
+  'process_substitution',
+  'execution_carrier',
+])
+const VALID_ANALYZER_REASON_CODES = new Set([
+  'parsed',
+  'malformed_shell',
+  'unsupported_construct',
+  'dynamic_command_word',
+  'analysis_timeout',
+])
+
+function isValidSourceSpan(span) {
+  if (!span || typeof span !== 'object' || Array.isArray(span)) return false
+  if (Object.keys(span).length !== 2) return false
+  if (!Number.isInteger(span.start) || !Number.isInteger(span.end)) return false
+  if (span.start < 0 || span.end < span.start) return false
+  return true
+}
+
+function isValidCommandFact(fact) {
+  if (!fact || typeof fact !== 'object' || Array.isArray(fact)) return false
+  const keys = Object.keys(fact)
+  if (keys.length !== COMMAND_FACT_KEYS.size) return false
+  for (const key of keys) {
+    if (!COMMAND_FACT_KEYS.has(key)) return false
+  }
+  if (typeof fact.command_kind !== 'string' || !VALID_COMMAND_KINDS.has(fact.command_kind)) return false
+  if (typeof fact.executable_literalness !== 'string' || !VALID_LITERALNESS.has(fact.executable_literalness)) return false
+  if (typeof fact.subcommand_literalness !== 'string' || !VALID_LITERALNESS.has(fact.subcommand_literalness)) return false
+  if (typeof fact.remote_class !== 'string' || !VALID_REMOTE_CLASSES.has(fact.remote_class)) return false
+  if (typeof fact.refspec_class !== 'string' || !VALID_REFSPEC_CLASSES.has(fact.refspec_class)) return false
+  if (!Array.isArray(fact.dangerous_flags)) return false
+  for (const flag of fact.dangerous_flags) {
+    if (typeof flag !== 'string' || !VALID_DANGEROUS_FLAGS.has(flag)) return false
+  }
+  if (typeof fact.execution_context !== 'string' || !VALID_EXECUTION_CONTEXTS.has(fact.execution_context)) return false
+  if (!isValidSourceSpan(fact.source_span)) return false
+  return true
+}
+
+/**
+ * PR #1441 High 3: validate the FULL SHELL_COMMAND_ANALYSIS_V1 shape,
+ * including every command fact's keys/types/enums/source-span — not just
+ * the top-level object/schema-name/commands-is-array/status-enum checks
+ * this previously performed. A regression such as
+ * `{"commands": [{"command_kind": 123}]}` must be normalized to
+ * indeterminate/analysis_process_failed even when the top-level `status`
+ * field says `ok` — never treated as allow.
+ */
+function isStructurallyValidAnalysis(parsed) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false
+  if (parsed.schema !== SHELL_COMMAND_ANALYSIS_SCHEMA) return false
+  if (!Array.isArray(parsed.commands)) return false
+  if (parsed.status !== 'ok' && parsed.status !== 'indeterminate') return false
+  if (typeof parsed.reason_code !== 'string' || !VALID_ANALYZER_REASON_CODES.has(parsed.reason_code)) return false
+  for (const fact of parsed.commands) {
+    if (!isValidCommandFact(fact)) return false
+  }
+  return true
+}
+
+/**
+ * Map an analyzer-internal indeterminate reason_code to the machine-readable
+ * command_kind surfaced in the (still generic) remote_write_requires_approval
+ * deny reason, per Issue #1428 In Scope 8. External consumers that only know
+ * the pre-existing `remote_write_requires_approval` / `git_push` vocabulary
+ * keep working (reason_code stays remote_write_requires_approval); the
+ * command_kind field carries the finer-grained indeterminate classification.
+ */
+function mapIndeterminateReasonToCommandKind(analyzerReasonCode) {
+  switch (analyzerReasonCode) {
+    case 'dynamic_command_word':
+      return 'dynamic_command_word'
+    case 'unsupported_construct':
+      return 'unsupported_execution_carrier'
+    case 'analysis_timeout':
+      return 'shell_command_analysis_timeout'
+    case 'malformed_shell':
+      return 'shell_command_parse_indeterminate'
+    default:
+      return 'shell_command_analysis_failed'
+  }
+}
+
+/**
+ * Run the bounded shell-command structure analyzer as a subprocess and
+ * return its parsed SHELL_COMMAND_ANALYSIS_V1 result. Any failure mode
+ * (non-zero exit, timeout, malformed JSON, schema mismatch, missing/invalid
+ * commands array) is normalized to an indeterminate result with a
+ * shell_command_analysis_failed-family command_kind — never fail-open
+ * (Issue #1428 In Scope 1 / 2 / 8).
+ */
+function runShellCommandAnalyzer(command) {
+  let stdout
+  try {
+    stdout = execFileSync('python3', [shellCommandAnalyzerScript], {
+      input: JSON.stringify({ command }),
+      encoding: 'utf8',
+      timeout: SHELL_ANALYZER_TIMEOUT_MS,
+      maxBuffer: SHELL_ANALYZER_MAX_BUFFER,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+  } catch (err) {
+    const timedOut = err && (err.signal === 'SIGTERM' || err.killed === true)
+    return {
+      status: 'indeterminate',
+      commands: [],
+      reason_code: timedOut ? 'analysis_timeout' : 'analysis_process_failed',
+    }
+  }
+
+  let parsed
+  try {
+    parsed = JSON.parse(stdout)
+  } catch {
+    return { status: 'indeterminate', commands: [], reason_code: 'analysis_process_failed' }
+  }
+
+  // PR #1441 High 3: full schema validation — an `ok` status with a
+  // malformed/incomplete command fact must still fail closed, never allow.
+  if (!isStructurallyValidAnalysis(parsed)) {
+    return { status: 'indeterminate', commands: [], reason_code: 'analysis_process_failed' }
+  }
+  return parsed
+}
+
 function parseArgs(argv) {
   const args = { event: null }
   for (let index = 2; index < argv.length; index += 1) {
@@ -80,10 +254,6 @@ async function readJsonFromStdin() {
   return JSON.parse(text)
 }
 
-function getCommand(payload) {
-  return String(payload?.tool_input?.command ?? payload?.tool_input?.description ?? '')
-}
-
 function sanitizeStopReason(eventName) {
   return `${eventName}: Codex session recording failed; see private local log.`
 }
@@ -122,10 +292,36 @@ function classifySecretBoundary(command) {
   return null
 }
 
-/** AC4: remote write commands - git push variants */
+/**
+ * AC4 / Issue #1428: remote write commands - git push / rtk git push.
+ *
+ * Classification is delegated to the SHELL_COMMAND_ANALYSIS_V1 command
+ * structure analyzer (scripts/agent-guards/shell_command_analysis.py)
+ * instead of a substring/regex match against the raw command string
+ * (Issue #1428 AC7). Non-executable occurrences of "git push" (quoted
+ * argument data, search keywords, heredoc data with a quoted delimiter,
+ * etc.) are never classified as remote write. Commands that would actually
+ * execute `git push` / `git -C <path> push` / `rtk git push` — including
+ * via pipeline, list, command substitution, or a known execution carrier
+ * (bash -c / sh -c / eval / exec / env prefix / command wrapper) — are
+ * still classified as remote write (AC3-AC6). Anything the analyzer cannot
+ * statically resolve (dynamic command word, unsupported execution carrier,
+ * parse failure, analyzer process failure) is fail-closed to remote write
+ * as well (AC8) — never fail-open.
+ */
 function classifyRemoteWrite(command) {
-  if (/\bgit(?:\s+-C\s+\S+)?\s+push\b/.test(command)) {
-    return { reason_code: 'remote_write_requires_approval', command_kind: 'git_push' }
+  const analysis = runShellCommandAnalyzer(command)
+
+  if (analysis.status === 'indeterminate') {
+    return {
+      reason_code: 'remote_write_requires_approval',
+      command_kind: mapIndeterminateReasonToCommandKind(analysis.reason_code),
+    }
+  }
+
+  const pushCommand = analysis.commands.find((entry) => PUSH_COMMAND_KINDS.has(entry?.command_kind))
+  if (pushCommand) {
+    return { reason_code: 'remote_write_requires_approval', command_kind: pushCommand.command_kind }
   }
   return null
 }
@@ -202,13 +398,14 @@ function redactCommandPreview(command) {
  *   'public_checkpoint'             — public_checkpoint_enabled flag
  *   'unknown_visibility_mapping'    — unknown_visibility_mapping flag
  *   'secrets_mode'                  — secrets_mode != 'none'
+ *   'malformed_payload'             — Bash tool_input.command missing/non-string
  *   'forbidden_path'                — forbidden path access
  *   'secret_boundary_violation'     — secret-revealing command
  *   'remote_write_requires_approval'— remote write (git push etc.)
  */
 function evaluateGuard(payload, eventName) {
-  const rawCommand = getCommand(payload)
-
+  // Kill-switch flags apply regardless of tool/event shape (Stop /
+  // SubagentStop payloads carry these too, with no tool_input at all).
   if (payload?.public_checkpoint_enabled === true) {
     return {
       action: 'deny',
@@ -233,6 +430,31 @@ function evaluateGuard(payload, eventName) {
       message: `${eventName}: secrets_mode must remain none`,
     }
   }
+
+  // PR #1441 Blocker 5: command-based classification (forbidden_path /
+  // secret_boundary / remote_write) is ONLY evaluated inside the fixed
+  // analyzer boundary: event ∈ {PreToolUse, PermissionRequest} AND
+  // tool_name === 'Bash' AND typeof tool_input.command === 'string'. A
+  // non-Bash tool call (or a non-PreToolUse/PermissionRequest event) never
+  // reaches command-text classification at all — there is no `description`
+  // fallback.
+  if (eventName !== 'PreToolUse' && eventName !== 'PermissionRequest') {
+    return null
+  }
+  if (payload?.tool_name !== 'Bash') {
+    return null
+  }
+  if (typeof payload?.tool_input?.command !== 'string') {
+    return {
+      action: 'deny',
+      reason_code: 'malformed_payload',
+      command_kind: 'malformed_payload',
+      message: `${eventName}: malformed_payload blocked (Bash tool_input.command missing or not a string)`,
+    }
+  }
+
+  const rawCommand = payload.tool_input.command
+
   if (payload?.forbidden_path_touched === true || matchesForbiddenPath(rawCommand)) {
     return {
       action: 'deny',

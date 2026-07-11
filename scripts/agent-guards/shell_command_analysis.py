@@ -1,0 +1,1508 @@
+#!/usr/bin/env python3
+"""Bounded shell-command structure analyzer (Issue #1428).
+
+Extracts the set of *simple commands* that would actually execute when a
+shell (POSIX/bash-family) evaluates a command string, distinguishing them
+from quoted argument data, search keywords, and other non-executable text.
+
+This module is intentionally a *bounded grammar* hand-written analyzer, not a
+full shell parser. It recognizes:
+
+  * top-level control operators: ``;`` ``&&`` ``||`` ``&`` ``|`` and newline
+  * bash reserved words / compound-command keywords (``if``/``then``/
+    ``else``/``elif``/``fi``/``while``/``until``/``do``/``done``/``for``/
+    ``case``/``esac``/``time``/``!``/``{``/``}``) as leading no-op prefixes
+    to a simple command
+  * command substitution: ``$( ... )`` and backtick `` `...` ``, including
+    when nested inside ``${...}`` / ``$((...))``
+  * process substitution: ``<(...)`` and ``>(...)`` — recursed into as a
+    full nested command list
+  * arithmetic expansion (``$((...))``)  and parameter expansion
+    (``${...}``) markers — used to decide word literalness AND recursed into
+    for any nested ``$(...)``/backtick command substitution they contain
+  * heredocs (``<<DELIM`` / ``<<-DELIM``) and here-strings (``<<<WORD``),
+    with bash-accurate unquoted-heredoc-body semantics (quote characters in
+    an unquoted heredoc body are literal data, not quoting)
+  * a bounded set of known *execution carriers*: ``bash -c`` / ``sh -c`` /
+    ``bash -s`` / ``sh -s`` / bare ``bash`` / bare ``sh`` (stdin script),
+    ``eval``, ``exec``, ``source`` / ``.``, ``find ... -exec/-execdir/-ok``
+    (recursed into up to its terminating ``;``/``+``), ``timeout``/``nice``/
+    ``nohup`` (their own leading options — and, for ``timeout``, its
+    required DURATION argument — are skipped and the wrapped command is
+    recursed into), leading ``env VAR=val...`` assignment prefixes, bare
+    leading ``VAR=val`` assignment prefixes, and the ``command`` wrapper.
+  * basename-normalized command-word recognition (``/usr/bin/git`` and
+    ``git`` are both recognized as ``git``) and generalized fd-numbered
+    redirection operators (``2>``, ``3>&1``, ``2>/dev/null``, ...)
+
+Anything outside this bounded grammar (unclosed quotes, malformed
+substitutions, unknown/unsupported execution carriers such as plain
+``xargs`` or ``sudo`` (an authorization boundary), a ``find -exec`` clause
+whose terminator could not be statically resolved, or dynamic command words
+that could resolve to ``git``/``rtk``/``bash``/``sh``) is classified
+``indeterminate`` and must be treated as fail-closed by callers — never
+fail-open. A dynamic (non-literal) EXECUTABLE word is *always* indeterminate
+— never fail-open based on a heuristic scan for a later literal ``push``
+token, since that heuristic misses the case where both the executable and
+the subcommand are dynamic.
+
+The analyzer never executes any part of the input and never returns raw
+argument text (only the bounded enum classifications defined by
+``SHELL_COMMAND_ANALYSIS_V1``), so it can safely run on secret-boundary
+protected input without leaking argv into structured output (Issue #1428
+In Scope 2 / secret boundary continuity).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass, field
+
+SCHEMA = "SHELL_COMMAND_ANALYSIS_V1"
+
+STATUS_OK = "ok"
+STATUS_INDETERMINATE = "indeterminate"
+
+REASON_PARSED = "parsed"
+REASON_MALFORMED_SHELL = "malformed_shell"
+REASON_UNSUPPORTED_CONSTRUCT = "unsupported_construct"
+REASON_DYNAMIC_COMMAND_WORD = "dynamic_command_word"
+REASON_ANALYSIS_TIMEOUT = "analysis_timeout"
+
+COMMAND_KIND_GIT_PUSH = "git_push"
+COMMAND_KIND_RTK_GIT_PUSH = "rtk_git_push"
+
+LITERAL = "literal"
+DYNAMIC = "dynamic"
+
+CTX_TOP_LEVEL = "top_level"
+CTX_LIST = "list"
+CTX_PIPELINE = "pipeline"
+CTX_COMMAND_SUBSTITUTION = "command_substitution"
+CTX_PROCESS_SUBSTITUTION = "process_substitution"
+CTX_EXECUTION_CARRIER = "execution_carrier"
+
+DANGEROUS_FORCE = "force"
+DANGEROUS_TAGS = "tags"
+DANGEROUS_ALL = "all"
+DANGEROUS_MIRROR = "mirror"
+DANGEROUS_DELETE = "delete"
+
+_MAX_INPUT_LEN = 20000
+_MAX_DEPTH = 12
+
+# Known git global options that take a value and appear before the
+# subcommand. Unrecognized leading `-`-prefixed tokens before a subcommand
+# is identified are treated as unsupported (fail-closed).
+_GIT_GLOBAL_OPTS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--config-env", "--namespace"}
+
+# Known execution carriers that this analyzer recursively parses.
+_SHELL_CARRIER_NAMES = {"bash", "sh"}
+
+# Known but *unresolvable inline* carriers: their real script content is not
+# present in the command string itself (external file / stdin), so any
+# occurrence is indeterminate rather than recursed into.
+_UNRESOLVABLE_CARRIER_REASON = REASON_DYNAMIC_COMMAND_WORD
+
+# Execution carriers that are recognized but explicitly NOT supported for
+# recursive analysis (Issue #1428 In Scope 1 / 8 / PR #1441 High 2)  —
+# `sudo` is an authorization boundary and stays indeterminate. `find` is
+# only a carrier when it has an -exec/-execdir/-ok option (handled
+# separately in _analyze_simple_command); a plain `find . -type f` is not
+# an execution carrier at all. `timeout`/`nice`/`nohup` are option-skipping
+# wrappers (handled separately) rather than unconditionally indeterminate.
+_UNSUPPORTED_CARRIERS = {"sudo"}
+
+# find(1) options that make it an execution carrier (Issue #1428 In Scope 1;
+# PR #1441 High 2). Anything else is a plain read-only find invocation.
+_FIND_EXEC_OPTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
+
+# Carriers that skip a bounded set of their own leading options/arguments and
+# then recursively analyze the remaining command (PR #1441 High 2).
+_OPTION_SKIPPING_CARRIERS = {"timeout", "nice", "nohup"}
+
+# Bash reserved words / compound-command keywords that may legitimately
+# precede a simple command at a position this bounded grammar treats as a
+# top-level chunk (Issue #1428 In Scope 1; PR #1441 Blocker 2). Stripping
+# these (and the brace-grouping tokens `{` / `}`) as a leading no-op prefix
+# lets the analyzer recurse into the *actual* command that follows instead
+# of silently treating the reserved word itself as the (non-matching)
+# executable and giving up.
+_BASH_RESERVED_PREFIX_WORDS = {
+    "if",
+    "then",
+    "else",
+    "elif",
+    "fi",
+    "while",
+    "until",
+    "do",
+    "done",
+    "for",
+    "case",
+    "esac",
+    "time",
+    "!",
+    "{",
+    "}",
+}
+
+# Redirection-operator word classification (PR #1441 Blocker 2): supports an
+# optional leading file-descriptor number and duplication targets (`>&N`,
+# `<&N`), not just the small hardcoded set the analyzer previously matched.
+_REDIR_SELF_CONTAINED_DUP_RE = re.compile(r"^\d*(?:>&\d+|<&\d+|>&-|<&-)$")
+_REDIR_BARE_OP_RE = re.compile(r"^(?:\d*(?:>>|<<|>&|<&|>|<)|&>>|&>)$")
+_REDIR_COMBINED_RE = re.compile(r"^(?:\d*(?:>>|<<|>&|<&|>|<)|&>>|&>)(?!\()")
+
+
+def _exe_basename(value: str) -> str:
+    """Normalize a literal executable word to its basename for command-word
+    recognition (PR #1441 Blocker 2): `/usr/bin/git` and `git` must both be
+    recognized as `git`, `/bin/bash` and `bash` must both be recognized as
+    `bash`, etc. Uses os.path.basename so `.` / `..` / trailing-slash edge
+    cases fall back to the raw value unchanged (never raises)."""
+    try:
+        return os.path.basename(value)
+    except Exception:
+        return value
+
+
+def _classify_redirection_word(bare: str) -> str:
+    """Classify a tokenized WORD's raw text as a redirection construct
+    (PR #1441 Blocker 2 — generalizes the previous hardcoded operator list to
+    also recognize arbitrary leading file-descriptor numbers, e.g. `2>`,
+    `3>&1`, `2>/dev/null`).
+
+    Returns one of:
+      'self_contained'    — the word is the whole redirection (operator with
+                             an attached fd-duplication target, or the
+                             here-string `<<<` operator token) — drop the
+                             word, no following word is consumed as a target.
+      'bare_needs_target'  — a pure operator with no attached target — drop
+                             this word AND the following word (the target).
+      'combined'           — operator with a non-fd-duplication target
+                             attached directly (no space), e.g. `>out.txt` /
+                             `2>/dev/null` — drop the whole word.
+      'none'               — not a redirection word at all (ordinary argv).
+    """
+    if bare == "<<<":
+        return "self_contained"
+    if _REDIR_SELF_CONTAINED_DUP_RE.fullmatch(bare):
+        return "self_contained"
+    if _REDIR_BARE_OP_RE.fullmatch(bare):
+        return "bare_needs_target"
+    if _REDIR_COMBINED_RE.match(bare):
+        return "combined"
+    return "none"
+
+_PUSH_DANGEROUS_FLAG_MAP = {
+    "--force": DANGEROUS_FORCE,
+    "--force-with-lease": DANGEROUS_FORCE,
+    "-f": DANGEROUS_FORCE,
+    "--tags": DANGEROUS_TAGS,
+    "--all": DANGEROUS_ALL,
+    "--mirror": DANGEROUS_MIRROR,
+    "--delete": DANGEROUS_DELETE,
+    "-d": DANGEROUS_DELETE,
+}
+
+
+@dataclass(frozen=True)
+class SourceSpan:
+    start: int
+    end: int
+
+    def to_dict(self) -> dict:
+        return {"start": self.start, "end": self.end}
+
+
+@dataclass(frozen=True)
+class CommandFact:
+    command_kind: str
+    executable_literalness: str
+    subcommand_literalness: str
+    remote_class: str
+    refspec_class: str
+    dangerous_flags: tuple
+    execution_context: str
+    source_span: SourceSpan
+
+    def to_dict(self) -> dict:
+        return {
+            "command_kind": self.command_kind,
+            "executable_literalness": self.executable_literalness,
+            "subcommand_literalness": self.subcommand_literalness,
+            "remote_class": self.remote_class,
+            "refspec_class": self.refspec_class,
+            "dangerous_flags": list(self.dangerous_flags),
+            "execution_context": self.execution_context,
+            "source_span": self.source_span.to_dict(),
+        }
+
+
+@dataclass
+class _Word:
+    text: str
+    start: int
+    end: int
+    literal: bool
+    value: str | None  # unquoted literal value, only meaningful if literal
+
+
+@dataclass
+class _AnalysisState:
+    commands: list = field(default_factory=list)
+    indeterminate: bool = False
+    reason_code: str = REASON_PARSED
+
+    def mark_indeterminate(self, reason_code: str) -> None:
+        self.indeterminate = True
+        # First indeterminate reason wins unless already set to a more
+        # specific one; keep it simple and deterministic (first wins).
+        if self.reason_code == REASON_PARSED:
+            self.reason_code = reason_code
+
+
+def _is_ident_start(ch: str) -> bool:
+    return ch.isalpha() or ch == "_"
+
+
+def _is_ident_char(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
+def _find_matching(text: str, open_idx: int, open_ch: str, close_ch: str) -> int | None:
+    """Return index of the matching close_ch for open_ch at open_idx, scanning
+    forward while respecting nested quotes and nested (open_ch, close_ch)
+    pairs of the SAME kind. Returns None if unbalanced."""
+    depth = 1
+    i = open_idx + 1
+    quote: str | None = None
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if quote is not None:
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _find_matching_backtick(text: str, open_idx: int) -> int | None:
+    i = open_idx + 1
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "`":
+            return i
+        i += 1
+    return None
+
+
+def _find_dollar_paren_extent(
+    text: str, dollar_idx: int
+) -> tuple[int, int, bool, tuple[int, int] | None] | None:
+    """text[dollar_idx] == '$' and text[dollar_idx+1] == '('.
+    Returns (start, end_inclusive_of_close, is_arithmetic, arith_body_span)
+    or None if unbalanced. arith_body_span is (body_start, body_end) — the
+    span of the arithmetic expression's own text (exclusive of the `$((` /
+    `))` delimiters) — when is_arithmetic is True, so callers can recurse
+    into it for embedded `$(...)` / backtick command substitutions
+    (PR #1441 Blocker 1); it is None when is_arithmetic is False."""
+    n = len(text)
+    if dollar_idx + 1 >= n or text[dollar_idx + 1] != "(":
+        return None
+    is_arith = dollar_idx + 2 < n and text[dollar_idx + 2] == "("
+    if is_arith:
+        # $(( ... )) — find matching double-close.
+        depth = 1
+        i = dollar_idx + 3
+        body_start = dollar_idx + 3
+        while i < n:
+            ch = text[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    body_end = i
+                    if i + 1 < n and text[i + 1] == ")":
+                        return (dollar_idx, i + 1, True, (body_start, body_end))
+                    return (dollar_idx, i, True, (body_start, body_end))
+            i += 1
+        return None
+    close = _find_matching(text, dollar_idx + 1, "(", ")")
+    if close is None:
+        return None
+    return (dollar_idx, close, False, None)
+
+
+def _find_matching_brace(text: str, open_idx: int) -> int | None:
+    return _find_matching(text, open_idx, "{", "}")
+
+
+def _scan_word_dynamism(text: str, start: int, end: int) -> tuple[bool, list[tuple[int, int, str]]]:
+    """Scan text[start:end] (a single shell WORD's raw source, which may
+    include quote characters) and determine:
+      - is_dynamic: True if any expansion construct is present outside of
+        single-quoted regions
+      - substitutions: list of (abs_start, abs_end, execution_context) spans
+        of $(...) / backtick / process-substitution content, including any
+        such spans nested inside `${...}` or `$((...))` (PR #1441
+        Blocker 1), to recurse into, in absolute offsets into the ORIGINAL
+        command string.
+
+    Single-quoted regions suppress all expansion (bash semantics).
+    """
+    is_dynamic = False
+    subs: list[tuple[int, int, str]] = []
+    i = start
+    quote: str | None = None
+    n = end
+    while i < n:
+        ch = text[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+                i += 1
+                continue
+            if ch == "$" or ch == "`":
+                pass  # fall through to expansion handling below
+            else:
+                i += 1
+                continue
+        if quote is None:
+            if ch == "'":
+                quote = "'"
+                i += 1
+                continue
+            if ch == '"':
+                quote = '"'
+                i += 1
+                continue
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+
+        if ch == "`":
+            close = _find_matching_backtick(text, i)
+            is_dynamic = True
+            if close is None:
+                raise _ParseError(REASON_MALFORMED_SHELL)
+            subs.append((i + 1, close, CTX_COMMAND_SUBSTITUTION))
+            i = close + 1
+            continue
+
+        if ch == "$" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt == "(":
+                extent = _find_dollar_paren_extent(text, i)
+                is_dynamic = True
+                if extent is None:
+                    raise _ParseError(REASON_MALFORMED_SHELL)
+                d_start, d_end, is_arith, arith_body = extent
+                if not is_arith:
+                    subs.append((d_start + 2, d_end, CTX_COMMAND_SUBSTITUTION))
+                else:
+                    # PR #1441 Blocker 1: arithmetic expansion cannot itself
+                    # execute a new top-level command, but a $(...) / `...`
+                    # command substitution NESTED inside the arithmetic
+                    # expression still executes normally — recurse into it.
+                    body_start, body_end = arith_body
+                    subs.extend(_collect_substitutions_in_range(text, body_start, body_end))
+                i = d_end + 1
+                continue
+            if nxt == "{":
+                close = _find_matching_brace(text, i + 1)
+                is_dynamic = True
+                if close is None:
+                    raise _ParseError(REASON_MALFORMED_SHELL)
+                # PR #1441 Blocker 1: the parameter-expansion WORD (e.g.
+                # `${x:-$(cmd)}`) may itself contain a nested command
+                # substitution — recurse into it.
+                subs.extend(_collect_substitutions_in_range(text, i + 2, close))
+                i = close + 1
+                continue
+            if _is_ident_start(nxt) or nxt.isdigit() or nxt in ("@", "*", "#", "?", "-", "$", "!"):
+                is_dynamic = True
+                i += 1
+                if _is_ident_start(nxt):
+                    i += 1
+                    while i < n and _is_ident_char(text[i]):
+                        i += 1
+                else:
+                    i += 1
+                continue
+
+        if ch in ("<", ">") and i + 1 < n and text[i + 1] == "(":
+            # PR #1441 Blocker 1: process substitution `<(...)` / `>(...)`
+            # contains a full command list to recurse into (In Scope 1).
+            close = _find_matching(text, i + 1, "(", ")")
+            is_dynamic = True
+            if close is None:
+                raise _ParseError(REASON_MALFORMED_SHELL)
+            subs.append((i + 2, close, CTX_PROCESS_SUBSTITUTION))
+            i = close + 1
+            continue
+
+        i += 1
+    if quote is not None:
+        raise _ParseError(REASON_MALFORMED_SHELL)
+    return is_dynamic, subs
+
+
+class _ParseError(Exception):
+    def __init__(self, reason_code: str) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+
+
+def _unquote_literal(text: str) -> str:
+    """Given a word's raw source text that _scan_word_dynamism already
+    determined is fully literal (no unescaped expansion), strip quoting to
+    obtain its literal value. Assumes well-formed input (already validated
+    by _scan_word_dynamism)."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    quote: str | None = None
+    while i < n:
+        ch = text[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            else:
+                out.append(ch)
+            i += 1
+            continue
+        if quote == '"':
+            if ch == "\\" and i + 1 < n and text[i + 1] in ('"', "\\", "$", "`"):
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "'":
+            quote = "'"
+            i += 1
+            continue
+        if ch == '"':
+            quote = '"'
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(text[i + 1])
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _tokenize_chunk_words(text: str, chunk_start: int, chunk_end: int) -> list[_Word]:
+    """Split a top-level 'simple command' chunk (already isolated from
+    top-level control operators) into shell WORDs, respecting quoting.
+    Redirection operators and their targets/delimiters are excluded by the
+    caller (via redir span removal) before this is invoked on the residual
+    argv text; heredoc bodies are handled separately by the caller."""
+    words: list[_Word] = []
+    i = chunk_start
+    n = chunk_end
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == "#" and (i == chunk_start or text[i - 1].isspace()):
+            # PR #1441 High 1: a `#` at a word-start position (preceded by
+            # whitespace or the start of the chunk) begins a shell comment —
+            # everything to the end of the line is ignored (never scanned
+            # for $(...) / backtick substitutions).
+            nl = text.find("\n", i, n)
+            i = n if nl == -1 else nl
+            continue
+        word_start = i
+        quote: str | None = None
+        while i < n:
+            c = text[i]
+            if quote == "'":
+                if c == "'":
+                    quote = None
+                i += 1
+                continue
+            if quote == '"':
+                if c == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if c == '"':
+                    quote = None
+                i += 1
+                continue
+            if c.isspace():
+                break
+            if c == "'":
+                quote = "'"
+                i += 1
+                continue
+            if c == '"':
+                quote = '"'
+                i += 1
+                continue
+            if c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if c == "`":
+                close = _find_matching_backtick(text, i)
+                if close is None:
+                    raise _ParseError(REASON_MALFORMED_SHELL)
+                i = close + 1
+                continue
+            if c == "$" and i + 1 < n and text[i + 1] == "(":
+                extent = _find_dollar_paren_extent(text, i)
+                if extent is None:
+                    raise _ParseError(REASON_MALFORMED_SHELL)
+                i = extent[1] + 1
+                continue
+            if c == "$" and i + 1 < n and text[i + 1] == "{":
+                close = _find_matching_brace(text, i + 1)
+                if close is None:
+                    raise _ParseError(REASON_MALFORMED_SHELL)
+                i = close + 1
+                continue
+            if c in ("<", ">") and i + 1 < n and text[i + 1] == "(":
+                # PR #1441 Blocker 1/2: process substitution `<(...)` /
+                # `>(...)` must stay a single WORD even though its content
+                # may contain whitespace (e.g. `cat <(git push origin main)`)
+                # — without this, the tokenizer would incorrectly split on
+                # the internal spaces.
+                close = _find_matching(text, i + 1, "(", ")")
+                if close is None:
+                    raise _ParseError(REASON_MALFORMED_SHELL)
+                i = close + 1
+                continue
+            i += 1
+        if quote is not None:
+            raise _ParseError(REASON_MALFORMED_SHELL)
+        word_end = i
+        is_dynamic, _subs = _scan_word_dynamism(text, word_start, word_end)
+        value = None if is_dynamic else _unquote_literal(text[word_start:word_end])
+        words.append(
+            _Word(
+                text=text[word_start:word_end],
+                start=word_start,
+                end=word_end,
+                literal=not is_dynamic,
+                value=value,
+            )
+        )
+    return words
+
+
+def _collect_substitutions_in_range(text: str, start: int, end: int) -> list[tuple[int, int, str]]:
+    """Scan text[start:end] for $(...) / backtick / process-substitution
+    spans anywhere (used for heredoc bodies / here-string words /
+    redirection targets / nested `${...}` and `$((...))` bodies — PR #1441
+    Blocker 1), returning (inner_start, inner_end, context) triples. Recurses
+    into `${...}` and `$((...))` bodies so nested command substitutions
+    (e.g. `${x:-$(cmd)}`, `$(( $(cmd) ))`) are not missed."""
+    results: list[tuple[int, int, str]] = []
+    i = start
+    n = end
+    quote: str | None = None
+    while i < n:
+        ch = text[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+                i += 1
+                continue
+        if quote is None and ch == "'":
+            quote = "'"
+            i += 1
+            continue
+        if quote is None and ch == '"':
+            quote = '"'
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n and quote != "'":
+            i += 2
+            continue
+        if ch == "`":
+            close = _find_matching_backtick(text, i)
+            if close is None:
+                raise _ParseError(REASON_MALFORMED_SHELL)
+            results.append((i + 1, close, CTX_COMMAND_SUBSTITUTION))
+            i = close + 1
+            continue
+        if ch == "$" and i + 1 < n and text[i + 1] == "(":
+            extent = _find_dollar_paren_extent(text, i)
+            if extent is None:
+                raise _ParseError(REASON_MALFORMED_SHELL)
+            d_start, d_end, is_arith, arith_body = extent
+            if not is_arith:
+                results.append((d_start + 2, d_end, CTX_COMMAND_SUBSTITUTION))
+            else:
+                body_start, body_end = arith_body
+                results.extend(_collect_substitutions_in_range(text, body_start, body_end))
+            i = d_end + 1
+            continue
+        if ch == "$" and i + 1 < n and text[i + 1] == "{":
+            close = _find_matching_brace(text, i + 1)
+            if close is None:
+                raise _ParseError(REASON_MALFORMED_SHELL)
+            results.extend(_collect_substitutions_in_range(text, i + 2, close))
+            i = close + 1
+            continue
+        if ch in ("<", ">") and i + 1 < n and text[i + 1] == "(":
+            close = _find_matching(text, i + 1, "(", ")")
+            if close is None:
+                raise _ParseError(REASON_MALFORMED_SHELL)
+            results.append((i + 2, close, CTX_PROCESS_SUBSTITUTION))
+            i = close + 1
+            continue
+        i += 1
+    return results
+
+
+def _collect_substitutions_in_heredoc_body(text: str, start: int, end: int) -> list[tuple[int, int, str]]:
+    """Scan an UNQUOTED heredoc body (text[start:end]) for $(...) / backtick
+    command-substitution spans, per real bash heredoc semantics (PR #1441
+    Blocker 3): inside an unquoted heredoc body, quote characters (`'`, `"`)
+    are ordinary literal DATA and do NOT suppress `$`/backtick expansion —
+    only a backslash immediately before `$`, backtick, another backslash, or
+    a newline is special (it escapes/suppresses that one character). This is
+    intentionally a separate scanner from `_collect_substitutions_in_range`
+    (which implements normal shell-word quoting semantics and would
+    incorrectly treat a bare `'` inside a heredoc body as opening a quoted
+    region)."""
+    results: list[tuple[int, int, str]] = []
+    i = start
+    n = end
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n and text[i + 1] in ("$", "`", "\\", "\n"):
+            i += 2
+            continue
+        if ch == "`":
+            close = _find_matching_backtick(text, i)
+            if close is None:
+                raise _ParseError(REASON_MALFORMED_SHELL)
+            results.append((i + 1, close, CTX_COMMAND_SUBSTITUTION))
+            i = close + 1
+            continue
+        if ch == "$" and i + 1 < n and text[i + 1] == "(":
+            extent = _find_dollar_paren_extent(text, i)
+            if extent is None:
+                raise _ParseError(REASON_MALFORMED_SHELL)
+            d_start, d_end, is_arith, arith_body = extent
+            if not is_arith:
+                results.append((d_start + 2, d_end, CTX_COMMAND_SUBSTITUTION))
+            else:
+                body_start, body_end = arith_body
+                results.extend(_collect_substitutions_in_range(text, body_start, body_end))
+            i = d_end + 1
+            continue
+        if ch == "$" and i + 1 < n and text[i + 1] == "{":
+            close = _find_matching_brace(text, i + 1)
+            if close is None:
+                raise _ParseError(REASON_MALFORMED_SHELL)
+            results.extend(_collect_substitutions_in_range(text, i + 2, close))
+            i = close + 1
+            continue
+        i += 1
+    return results
+
+
+def _split_top_level_chunks(text: str) -> list[tuple[int, int, str]]:
+    """Split the full command text into top-level chunks separated by
+    control operators (;, &&, ||, &, |, newline), respecting quoting,
+    nested $()/``/${}/process-substitution, and heredoc bodies.
+
+    Returns list of (chunk_start, chunk_end, preceding_operator) where
+    preceding_operator is one of: None (first chunk), ';', '&&', '||',
+    '&', '|', '\\n'.
+    """
+    chunks: list[tuple[int, int, str]] = []
+    n = len(text)
+    i = 0
+    chunk_start = 0
+    preceding_op: str | None = None
+    quote: str | None = None
+    while i < n:
+        ch = text[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+            i += 1
+            continue
+        if ch == "'":
+            quote = "'"
+            i += 1
+            continue
+        if ch == '"':
+            quote = '"'
+            i += 1
+            continue
+        if ch == "#" and (i == 0 or text[i - 1].isspace()):
+            # PR #1441 High 1: shell comment (word-start `#`, unquoted) —
+            # everything to end of line is inert; do not interpret `;` /
+            # `&&` / `$(...)` / etc. within it as real shell syntax.
+            nl = text.find("\n", i)
+            i = n if nl == -1 else nl
+            continue
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "`":
+            close = _find_matching_backtick(text, i)
+            if close is None:
+                raise _ParseError(REASON_MALFORMED_SHELL)
+            i = close + 1
+            continue
+        if ch == "$" and i + 1 < n and text[i + 1] == "(":
+            extent = _find_dollar_paren_extent(text, i)
+            if extent is None:
+                raise _ParseError(REASON_MALFORMED_SHELL)
+            i = extent[1] + 1
+            continue
+        if ch == "$" and i + 1 < n and text[i + 1] == "{":
+            close = _find_matching_brace(text, i + 1)
+            if close is None:
+                raise _ParseError(REASON_MALFORMED_SHELL)
+            i = close + 1
+            continue
+        if ch in ("<", ">") and i + 1 < n and text[i + 1] == "(":
+            # process substitution <( ... ) / >( ... ) — top-level-scan skip
+            # only. Recursion into its content happens once, at the WORD
+            # level (_scan_word_dynamism / _tokenize_chunk_words), to avoid
+            # double-recursing into the same span (PR #1441 Blocker 1).
+            close = _find_matching(text, i + 1, "(", ")")
+            if close is None:
+                raise _ParseError(REASON_MALFORMED_SHELL)
+            i = close + 1
+            continue
+        if ch in ("<", ">") and i + 1 < n and text[i + 1] == "&":
+            # PR #1441 Blocker 2: fd-duplication redirection (`>&1`, `<&-`,
+            # etc.) — the `&` here is part of the redirection operator, NOT
+            # the background/async control operator. Skip past it (plus any
+            # trailing fd digits / `-`) so the generic `&` handling below
+            # never misinterprets it as `cmd &`.
+            j = i + 2
+            while j < n and text[j].isdigit():
+                j += 1
+            if j < n and text[j] == "-":
+                j += 1
+            i = j
+            continue
+        if ch == "<" and i + 1 < n and text[i + 1] == "<":
+            # heredoc / here-string: << / <<- / <<<
+            heredoc_op_start = i
+            j = i + 2
+            dash = False
+            if j < n and text[j] == "-":
+                dash = True
+                j += 1
+            if j < n and text[j] == "<":
+                # here-string <<<WORD — treat WORD as an ordinary word
+                # (scanned normally by chunk word tokenization later); just
+                # skip past the operator here.
+                i = j + 1
+                continue
+            # classic heredoc: consume optional whitespace, then delimiter
+            while j < n and text[j] in " \t":
+                j += 1
+            delim_start = j
+            quoted_delim = False
+            if j < n and text[j] in ("'", '"'):
+                qc = text[j]
+                quoted_delim = True
+                j += 1
+                while j < n and text[j] != qc:
+                    j += 1
+                if j >= n:
+                    raise _ParseError(REASON_MALFORMED_SHELL)
+                delim_text = text[delim_start + 1 : j]
+                j += 1
+            else:
+                while j < n and (text[j].isalnum() or text[j] in "_-"):
+                    j += 1
+                delim_text = text[delim_start:j]
+            if not delim_text:
+                raise _ParseError(REASON_UNSUPPORTED_CONSTRUCT)
+            # Find the next newline to locate the body start.
+            nl = text.find("\n", j)
+            if nl == -1:
+                # No body present in this fragment (e.g. truncated input) —
+                # treat as unsupported/indeterminate rather than guessing.
+                raise _ParseError(REASON_UNSUPPORTED_CONSTRUCT)
+            body_start = nl + 1
+            scan = body_start
+            body_end = None
+            while scan <= n:
+                line_end = text.find("\n", scan)
+                if line_end == -1:
+                    line_end = n
+                line = text[scan:line_end]
+                candidate = line.lstrip("\t") if dash else line
+                if candidate == delim_text:
+                    body_end = scan
+                    delim_line_end = line_end
+                    break
+                if line_end >= n:
+                    break
+                scan = line_end + 1
+            if body_end is None:
+                raise _ParseError(REASON_UNSUPPORTED_CONSTRUCT)
+            consumed_end = min(delim_line_end + 1, n)
+            _HEREDOC_REGISTRY.append((heredoc_op_start, consumed_end, body_start, body_end, quoted_delim))
+            # PR #1441 Blocker 3: force a chunk boundary immediately after the
+            # heredoc's consumed region (operator + delimiter + body +
+            # closing delimiter line). Without this, any command that
+            # follows on the next physical line (with no `;`/`&&`/newline-as
+            # -operator directly after the closing delimiter, since the
+            # heredoc body itself already consumed that newline) would be
+            # silently merged into the SAME chunk as whatever preceded the
+            # heredoc — e.g. `cat <<'EOF'\nbody\nEOF\ngit push origin main\n`
+            # would otherwise tokenize as a single `cat ... git push origin
+            # main` argv list (exe=`cat`, never classified as git push).
+            chunks.append((chunk_start, consumed_end, preceding_op or ""))
+            preceding_op = ";"
+            chunk_start = consumed_end
+            i = consumed_end
+            continue
+        if ch == "&" and i + 1 < n and text[i + 1] == ">":
+            # PR #1441 Blocker 2: `&>` / `&>>` combined stdout+stderr
+            # redirection — the `&` here is part of the redirection
+            # operator, NOT the background/async control operator.
+            j = i + 2
+            if j < n and text[j] == ">":
+                j += 1
+            i = j
+            continue
+        if ch == "&" and i + 1 < n and text[i + 1] == "&":
+            chunks.append((chunk_start, i, preceding_op or ""))
+            preceding_op = "&&"
+            i += 2
+            chunk_start = i
+            continue
+        if ch == "|" and i + 1 < n and text[i + 1] == "|":
+            chunks.append((chunk_start, i, preceding_op or ""))
+            preceding_op = "||"
+            i += 2
+            chunk_start = i
+            continue
+        if ch == "|":
+            chunks.append((chunk_start, i, preceding_op or ""))
+            preceding_op = "|"
+            i += 1
+            chunk_start = i
+            continue
+        if ch == ";":
+            chunks.append((chunk_start, i, preceding_op or ""))
+            preceding_op = ";"
+            i += 1
+            chunk_start = i
+            continue
+        if ch == "&":
+            chunks.append((chunk_start, i, preceding_op or ""))
+            preceding_op = "&"
+            i += 1
+            chunk_start = i
+            continue
+        if ch == "\n":
+            chunks.append((chunk_start, i, preceding_op or ""))
+            preceding_op = ";"
+            i += 1
+            chunk_start = i
+            continue
+        if ch in ("(", ")"):
+            # Bounded grammar does not support subshell grouping semantics
+            # beyond opaque skip; treat unmatched/parenthesized grouping as
+            # unsupported to stay fail-closed rather than guessing.
+            raise _ParseError(REASON_UNSUPPORTED_CONSTRUCT)
+        i += 1
+    if quote is not None:
+        raise _ParseError(REASON_MALFORMED_SHELL)
+    chunks.append((chunk_start, n, preceding_op or ""))
+    return [c for c in chunks if text[c[0] : c[1]].strip() != ""]
+
+
+# Module-level scratch registry used during a single _split_top_level_chunks
+# call to communicate heredoc spans back to the caller. Reset per call.
+# Entries: (consumed_start, consumed_end, body_start, body_end, quoted_delim)
+_HEREDOC_REGISTRY: list[tuple[int, int, int, int, bool]] = []
+
+
+def _classify_push_words(words: list[_Word]) -> tuple[str, int] | None:
+    """Given the argv words of a simple command, determine if it is a
+    git-push / rtk-git-push candidate. Returns (command_kind, subcommand_idx)
+    where subcommand_idx is the index of the "push" token in words, or None
+    if this command is not a push candidate at all (e.g. different git
+    subcommand, unrelated executable)."""
+    if not words:
+        return None
+    idx = 0
+    # Strip `command` wrapper (basename-normalized — PR #1441 Blocker 2A).
+    if words[idx].literal and _exe_basename(words[idx].value) == "command":
+        idx += 1
+        while idx < len(words) and words[idx].literal and words[idx].value in ("-p", "-v", "-V"):
+            idx += 1
+    if idx >= len(words):
+        return None
+    exe = words[idx]
+    rtk_prefix = False
+    if exe.literal and _exe_basename(exe.value) == "rtk":
+        rtk_prefix = True
+        idx += 1
+        if idx >= len(words):
+            return None
+        exe = words[idx]
+    if not exe.literal:
+        # PR #1441 Blocker 4: a dynamic (non-literal) executable word is
+        # ALWAYS indeterminate — never fail-open based on a heuristic scan
+        # for a later literal "push" token (that heuristic missed the case
+        # where BOTH the executable AND the subcommand are dynamic, e.g.
+        # `"$cmd" "$sub" origin main`). There is no bounded-grammar way to
+        # prove a dynamic word cannot resolve to `git`/`rtk`/`bash`/`sh` at
+        # analysis time, so this always fail-closes to indeterminate.
+        return ("__dynamic__", idx)
+    if _exe_basename(exe.value) != "git":
+        return None
+    idx += 1
+    # Skip known global options (with values) between `git` and subcommand.
+    while idx < len(words):
+        tok = words[idx]
+        if not tok.literal:
+            return ("__dynamic_subcommand__", idx)
+        if tok.value in _GIT_GLOBAL_OPTS_WITH_VALUE:
+            idx += 1  # option token
+            if idx < len(words):
+                idx += 1  # its value
+            continue
+        if (
+            tok.value.startswith("--")
+            and "=" in tok.value
+            and tok.value.split("=", 1)[0] in _GIT_GLOBAL_OPTS_WITH_VALUE
+        ):
+            idx += 1
+            continue
+        if tok.value.startswith("-") and tok.value not in _GIT_GLOBAL_OPTS_WITH_VALUE:
+            # Unknown leading option before subcommand is determined.
+            return ("__unsupported__", idx)
+        break
+    if idx >= len(words):
+        return None
+    subcommand = words[idx]
+    if not subcommand.literal:
+        return ("__dynamic_subcommand__", idx)
+    if subcommand.value != "push":
+        return None
+    return (COMMAND_KIND_RTK_GIT_PUSH if rtk_prefix else COMMAND_KIND_GIT_PUSH, idx)
+
+
+def _dangerous_flags_for(words: list[_Word], push_idx: int) -> tuple:
+    flags = []
+    for w in words[push_idx + 1 :]:
+        if w.literal and w.value in _PUSH_DANGEROUS_FLAG_MAP:
+            mapped = _PUSH_DANGEROUS_FLAG_MAP[w.value]
+            if mapped not in flags:
+                flags.append(mapped)
+    return tuple(flags)
+
+
+def _positional_args_after(words: list[_Word], push_idx: int) -> list[_Word]:
+    positional = []
+    for w in words[push_idx + 1 :]:
+        if w.literal and w.value.startswith("-"):
+            continue
+        positional.append(w)
+    return positional
+
+
+def _remote_and_refspec_class(words: list[_Word], push_idx: int) -> tuple[str, str]:
+    positional = _positional_args_after(words, push_idx)
+    if not positional:
+        return "absent", "absent"
+    remote_w = positional[0]
+    if not remote_w.literal:
+        remote_class = "dynamic"
+    elif remote_w.value == "origin":
+        remote_class = "origin"
+    else:
+        remote_class = "other_literal"
+    if len(positional) < 2:
+        return remote_class, "absent"
+    refspec_w = positional[1]
+    if not refspec_w.literal:
+        refspec_class = "dynamic"
+    elif refspec_w.value.startswith("HEAD:refs/heads/") and len(refspec_w.value) > len("HEAD:refs/heads/"):
+        refspec_class = "head_to_literal_branch"
+    else:
+        refspec_class = "other_literal"
+    return remote_class, refspec_class
+
+
+def _strip_env_and_assignment_prefix(words: list[_Word]) -> list[_Word]:
+    idx = 0
+    if idx < len(words) and words[idx].literal and _exe_basename(words[idx].value) == "env":
+        idx += 1
+        while idx < len(words) and words[idx].literal and _looks_like_assignment(words[idx].value):
+            idx += 1
+        return words[idx:]
+    while idx < len(words) and words[idx].literal and _looks_like_assignment(words[idx].value):
+        idx += 1
+    return words[idx:]
+
+
+def _looks_like_assignment(value: str) -> bool:
+    eq = value.find("=")
+    if eq <= 0:
+        return False
+    name = value[:eq]
+    if not _is_ident_start(name[0]):
+        return False
+    return all(_is_ident_char(c) for c in name[1:])
+
+
+def _analyze_simple_command(
+    words: list[_Word],
+    execution_context: str,
+    span: SourceSpan,
+    state: _AnalysisState,
+    depth: int,
+) -> None:
+    # PR #1441 Blocker 2B: strip leading bash reserved words / compound
+    # -command keywords (if/then/.../time/!/{/}) so the analyzer recurses
+    # into the ACTUAL command that follows instead of treating the reserved
+    # word itself as a (non-matching) executable and silently giving up —
+    # e.g. `if true; then git push origin main; fi` previously never
+    # examined `git push` at all because "then" != "git".
+    words = list(words)
+    while words and words[0].literal and words[0].value in _BASH_RESERVED_PREFIX_WORDS:
+        words = words[1:]
+    if not words:
+        return
+
+    stripped = _strip_env_and_assignment_prefix(words)
+    if not stripped:
+        return
+    exe = stripped[0]
+    exe_base = _exe_basename(exe.value) if exe.literal else None
+    if exe.literal and exe_base in _UNSUPPORTED_CARRIERS:
+        # Blocker 2A/High 2: sudo is an authorization boundary — remains
+        # indeterminate regardless of path prefix (basename-normalized).
+        state.mark_indeterminate(REASON_UNSUPPORTED_CONSTRUCT)
+        return
+    if exe.literal and exe_base == "find":
+        _handle_find_carrier(stripped, execution_context, span, state, depth)
+        return
+    if exe.literal and exe_base == "xargs":
+        # xargs' argv is supplied via stdin, not inline in the command
+        # string — its target program cannot be statically resolved from
+        # this fragment alone (Issue #1428 In Scope 1/8).
+        state.mark_indeterminate(REASON_UNSUPPORTED_CONSTRUCT)
+        return
+    if exe.literal and exe_base in _OPTION_SKIPPING_CARRIERS:
+        _handle_option_skipping_carrier(stripped, execution_context, span, state, depth)
+        return
+    if exe.literal and exe_base in _SHELL_CARRIER_NAMES:
+        _handle_shell_carrier(stripped, execution_context, span, state, depth)
+        return
+    if exe.literal and exe_base == "eval":
+        _handle_eval_or_exec(stripped, span, state, depth, is_exec=False)
+        return
+    if exe.literal and exe_base == "exec":
+        _handle_eval_or_exec(stripped, span, state, depth, is_exec=True)
+        return
+    if exe.literal and exe_base in (".", "source"):
+        state.mark_indeterminate(_UNRESOLVABLE_CARRIER_REASON)
+        return
+
+    classification = _classify_push_words(stripped)
+    if classification is None:
+        return
+    kind, marker_idx = classification
+    if kind in ("__dynamic__", "__dynamic_subcommand__"):
+        state.mark_indeterminate(REASON_DYNAMIC_COMMAND_WORD)
+        return
+    if kind == "__unsupported__":
+        state.mark_indeterminate(REASON_UNSUPPORTED_CONSTRUCT)
+        return
+
+    remote_class, refspec_class = _remote_and_refspec_class(stripped, marker_idx)
+    fact = CommandFact(
+        command_kind=kind,
+        executable_literalness=LITERAL,
+        subcommand_literalness=LITERAL,
+        remote_class=remote_class,
+        refspec_class=refspec_class,
+        dangerous_flags=_dangerous_flags_for(stripped, marker_idx),
+        execution_context=execution_context,
+        source_span=span,
+    )
+    state.commands.append(fact)
+
+
+_DURATION_RE = re.compile(r"^[0-9]+(\.[0-9]+)?[smhd]?$")
+_NICE_VALUE_OPTS = {"-n", "--adjustment"}
+_TIMEOUT_VALUE_OPTS = {"-s", "--signal", "-k", "--kill-after"}
+
+
+def _handle_find_carrier(
+    words: list[_Word],
+    execution_context: str,
+    span: SourceSpan,
+    state: _AnalysisState,
+    depth: int,
+) -> None:
+    """PR #1441 High 2: `find` is only an execution carrier when it has an
+    `-exec` / `-execdir` / `-ok` / `-okdir` option; otherwise it is a plain
+    read-only invocation (`find . -type f`) and must not be flagged at all.
+    When present, recurse into the argv between the option and its
+    terminating literal `;` / `+` (Issue #1428 In Scope 1)."""
+    rest = words[1:]
+    exec_positions = [i for i, w in enumerate(rest) if w.literal and w.value in _FIND_EXEC_OPTIONS]
+    if not exec_positions:
+        return
+    for pos in exec_positions:
+        i = pos + 1
+        argv: list[_Word] = []
+        terminated = False
+        while i < len(rest):
+            w = rest[i]
+            if w.literal and w.value in (";", "+"):
+                terminated = True
+                break
+            if not w.literal:
+                state.mark_indeterminate(REASON_DYNAMIC_COMMAND_WORD)
+                return
+            argv.append(w)
+            i += 1
+        if not terminated or not argv:
+            # The terminator was not found inline (e.g. an unescaped `;`
+            # that the shell itself already consumed as a top-level command
+            # separator, so the real find invocation would fail with a
+            # missing-argument error at runtime) — cannot statically resolve
+            # what -exec would have run; fail-closed.
+            state.mark_indeterminate(REASON_UNSUPPORTED_CONSTRUCT)
+            continue
+        _analyze_simple_command(argv, CTX_EXECUTION_CARRIER, span, state, depth + 1)
+
+
+def _handle_option_skipping_carrier(
+    words: list[_Word],
+    execution_context: str,
+    span: SourceSpan,
+    state: _AnalysisState,
+    depth: int,
+) -> None:
+    """PR #1441 High 2: `timeout` / `nice` / `nohup` are option-skipping
+    wrappers, not unconditionally-indeterminate carriers — skip their own
+    leading options (and, for `timeout`, its required DURATION positional
+    argument) and recurse into the wrapped command so genuine `git push`
+    usage is still detected while harmless usage (`timeout 1 sleep 2`,
+    `nice echo ok`) is not falsely flagged."""
+    carrier = _exe_basename(words[0].value)
+    rest = words[1:]
+    value_opts = {"timeout": _TIMEOUT_VALUE_OPTS, "nice": _NICE_VALUE_OPTS}.get(carrier, set())
+    idx = 0
+    while idx < len(rest):
+        tok = rest[idx]
+        if not tok.literal:
+            state.mark_indeterminate(REASON_DYNAMIC_COMMAND_WORD)
+            return
+        if tok.value.startswith("-") and tok.value != "-":
+            idx += 1
+            if tok.value in value_opts:
+                idx += 1
+            continue
+        break
+    if carrier == "timeout":
+        if idx >= len(rest):
+            state.mark_indeterminate(REASON_UNSUPPORTED_CONSTRUCT)
+            return
+        duration_tok = rest[idx]
+        if not duration_tok.literal or not _DURATION_RE.fullmatch(duration_tok.value):
+            # Not a statically-recognizable DURATION — cannot safely assume
+            # the wrapped command never runs (real `timeout` would reject
+            # this at runtime, but this analyzer does not model that);
+            # fail-closed rather than guess.
+            state.mark_indeterminate(REASON_UNSUPPORTED_CONSTRUCT)
+            return
+        idx += 1
+    if idx >= len(rest):
+        return
+    _analyze_simple_command(rest[idx:], CTX_EXECUTION_CARRIER, span, state, depth + 1)
+
+
+def _handle_shell_carrier(
+    words: list[_Word],
+    execution_context: str,
+    span: SourceSpan,
+    state: _AnalysisState,
+    depth: int,
+) -> None:
+    # words[0] is literal "bash" or "sh".
+    rest = words[1:]
+    flag = rest[0].value if rest and rest[0].literal else None
+    if flag == "-c" and len(rest) >= 2:
+        script_word = rest[1]
+        if not script_word.literal:
+            state.mark_indeterminate(REASON_DYNAMIC_COMMAND_WORD)
+            return
+        _recurse(script_word.value, 0, CTX_EXECUTION_CARRIER, state, depth + 1)
+        return
+    # bare `bash` / `sh`, or `-s`, or anything else reading a script from
+    # stdin or an unresolved external source — content not inline.
+    state.mark_indeterminate(_UNRESOLVABLE_CARRIER_REASON)
+
+
+def _handle_eval_or_exec(
+    words: list[_Word],
+    span: SourceSpan,
+    state: _AnalysisState,
+    depth: int,
+    *,
+    is_exec: bool,
+) -> None:
+    rest = words[1:]
+    if not rest:
+        return
+    if not all(w.literal for w in rest):
+        state.mark_indeterminate(REASON_DYNAMIC_COMMAND_WORD)
+        return
+    if is_exec:
+        # exec replaces the process with the given argv directly (not a
+        # re-parsed script string) — analyze it as a simple command in
+        # place.
+        _analyze_simple_command(rest, CTX_EXECUTION_CARRIER, span, state, depth + 1)
+        return
+    joined = " ".join(w.value for w in rest)
+    _recurse(joined, 0, CTX_EXECUTION_CARRIER, state, depth + 1)
+
+
+def _word_in_any_span(w: _Word, spans: list[tuple[int, int]]) -> bool:
+    return any(cs <= w.start and w.end <= ce for cs, ce in spans)
+
+
+def _recurse(text: str, base_offset: int, execution_context: str, state: _AnalysisState, depth: int) -> None:
+    if depth > _MAX_DEPTH or len(text) > _MAX_INPUT_LEN:
+        state.mark_indeterminate(REASON_ANALYSIS_TIMEOUT)
+        return
+    global _HEREDOC_REGISTRY
+    saved_heredoc_registry = _HEREDOC_REGISTRY
+    _HEREDOC_REGISTRY = []
+    try:
+        chunks = _split_top_level_chunks(text)
+        heredocs = _HEREDOC_REGISTRY
+    except _ParseError as exc:
+        state.mark_indeterminate(exc.reason_code)
+        return
+    finally:
+        _HEREDOC_REGISTRY = saved_heredoc_registry
+
+    consumed_spans = [(cs, ce) for cs, ce, _bs, _be, _q in heredocs]
+
+    for _cs, _ce, body_start, body_end, quoted_delim in heredocs:
+        if quoted_delim:
+            continue
+        # PR #1441 Blocker 3: unquoted heredoc bodies use bash heredoc
+        # semantics, not normal shell-word quoting semantics — a bare `'` or
+        # `"` in the body is literal data and must NOT suppress `$(...)` /
+        # backtick detection.
+        try:
+            subs = _collect_substitutions_in_heredoc_body(text, body_start, body_end)
+        except _ParseError as exc:
+            state.mark_indeterminate(exc.reason_code)
+            continue
+        for inner_start, inner_end, ctx in subs:
+            _recurse(text[inner_start:inner_end], base_offset + inner_start, ctx, state, depth + 1)
+
+    # PR #1441 Blocker 1: process substitution `<(...)` / `>(...)` is
+    # recursed into once, at the WORD level (_scan_word_dynamism, invoked
+    # below via the per-word substitution scan), not here — recursing here
+    # too would double-count the same span (both the top-level scan in
+    # _split_top_level_chunks and the per-word scan would otherwise fire on
+    # the identical `<(...)` occurrence).
+
+    is_single_chunk = len(chunks) == 1 and execution_context in (CTX_TOP_LEVEL,)
+    for chunk_start, chunk_end, preceding_op in chunks:
+        chunk_ctx = execution_context
+        if execution_context == CTX_TOP_LEVEL:
+            if is_single_chunk:
+                chunk_ctx = CTX_TOP_LEVEL
+            elif preceding_op == "|":
+                chunk_ctx = CTX_PIPELINE
+            else:
+                chunk_ctx = CTX_LIST
+        elif execution_context == CTX_LIST and preceding_op == "|":
+            chunk_ctx = CTX_PIPELINE
+
+        try:
+            words = _tokenize_chunk_words(text, chunk_start, chunk_end)
+        except _ParseError as exc:
+            state.mark_indeterminate(exc.reason_code)
+            continue
+
+        # Drop any word that falls entirely inside a heredoc's consumed
+        # region (operator + delimiter + body + closing delimiter line) —
+        # that text is data (or already handled via the dedicated heredoc
+        # substitution scan above), not argv.
+        words = [w for w in words if not _word_in_any_span(w, consumed_spans)]
+
+        # Redirection handling: drop redirection operator/target words from
+        # argv (PR #1441 Blocker 2 — generalized beyond the previous
+        # hardcoded fd list to any `\d*(>>|<<|>&|<&|>|<)` / `&>` / `&>>`
+        # form, including fd-duplication targets like `3>&1`). Also scan
+        # every word (argv AND redirection targets) for embedded command
+        # substitutions / process substitutions.
+        argv_words: list[_Word] = []
+        skip_next = False
+        for w in words:
+            if skip_next:
+                skip_next = False
+                continue
+            bare = w.text
+            redir_kind = _classify_redirection_word(bare)
+            if redir_kind == "self_contained":
+                continue
+            if redir_kind == "bare_needs_target":
+                skip_next = True
+                continue
+            if redir_kind == "combined":
+                continue
+            argv_words.append(w)
+
+        for w in words:
+            try:
+                _is_dyn, subs = _scan_word_dynamism(text, w.start, w.end)
+            except _ParseError as exc:
+                state.mark_indeterminate(exc.reason_code)
+                continue
+            for inner_start, inner_end, sub_ctx in subs:
+                _recurse(
+                    text[inner_start:inner_end],
+                    base_offset + inner_start,
+                    sub_ctx,
+                    state,
+                    depth + 1,
+                )
+
+        if not argv_words:
+            continue
+        span = SourceSpan(base_offset + argv_words[0].start, base_offset + argv_words[-1].end)
+        _analyze_simple_command(argv_words, chunk_ctx, span, state, depth)
+
+
+def analyze_shell_command(command: str) -> dict:
+    """Analyze a shell command string and return a
+    SHELL_COMMAND_ANALYSIS_V1-shaped dict."""
+    if command is None:
+        return {"schema": SCHEMA, "status": STATUS_INDETERMINATE, "commands": [], "reason_code": REASON_MALFORMED_SHELL}
+    if len(command) > _MAX_INPUT_LEN:
+        return {
+            "schema": SCHEMA,
+            "status": STATUS_INDETERMINATE,
+            "commands": [],
+            "reason_code": REASON_ANALYSIS_TIMEOUT,
+        }
+    state = _AnalysisState()
+    try:
+        _recurse(command, 0, CTX_TOP_LEVEL, state, 0)
+    except RecursionError:
+        state.mark_indeterminate(REASON_ANALYSIS_TIMEOUT)
+    except Exception:
+        state.mark_indeterminate(REASON_MALFORMED_SHELL)
+
+    status = STATUS_INDETERMINATE if state.indeterminate else STATUS_OK
+    reason_code = state.reason_code if state.indeterminate else REASON_PARSED
+    return {
+        "schema": SCHEMA,
+        "status": status,
+        "commands": [c.to_dict() for c in state.commands],
+        "reason_code": reason_code,
+    }
+
+
+def main(argv: list[str]) -> int:
+    """CLI entrypoint: reads a JSON payload `{"command": "..."}` from stdin
+    and writes a SHELL_COMMAND_ANALYSIS_V1 JSON document to stdout.
+
+    Used by the Node.js adapter via execFileSync (Issue #1428 In Scope 4) —
+    argv-based invocation, no shell interpolation."""
+    del argv
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw)
+        command = payload.get("command")
+        if not isinstance(command, str):
+            raise ValueError("command must be a string")
+    except Exception:
+        result = {
+            "schema": SCHEMA,
+            "status": STATUS_INDETERMINATE,
+            "commands": [],
+            "reason_code": REASON_MALFORMED_SHELL,
+        }
+        sys.stdout.write(json.dumps(result))
+        return 0
+    result = analyze_shell_command(command)
+    sys.stdout.write(json.dumps(result))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
