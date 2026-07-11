@@ -3040,7 +3040,11 @@ def main() -> int:
                 "stop_condition_triggered": True,
                 "errors": [invalid_reason],
             }
-            emit_json(current_head_blocked_result(args, current_evidence, invalid_reason), args.evidence_mode, current_evidence)
+            emit_json(
+                current_head_blocked_result(args, current_evidence, invalid_reason),
+                args.evidence_mode,
+                current_evidence,
+            )
             return 1
         current_evidence = collect_current_head_evidence(args.cwd, args.reviewed_head_sha)
         if not current_evidence["certified"]:
