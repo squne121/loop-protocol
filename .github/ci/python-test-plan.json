@@ -32,8 +32,6 @@
     "scripts/tests/test_milestone_rollup.py",
     "scripts/tests/test_pr_body_validator.py",
     "scripts/tests/test_e501_migration_guard.py",
-    "scripts/trust-root/tests/test_manifest_schema.py",
-    "scripts/trust-root/tests/test_trusted_hook_launcher.py",
     "tests/context_mode/",
     "tests/test_summarize_agent_transcript.py",
     "tests/agent_ops/"
@@ -74,7 +72,6 @@
     "dedicated_lanes_excluded": "tests/codex/test_local_main_branch_guard.py runs in its own codex execpolicy step (needs the pinned codex CLI context) and is intentionally NOT in targets to avoid double execution. tests/codex/test_execpolicy_matrix.py is included here so python-test and ci_test_selection/v1 both treat the pure-Python execpolicy contract coverage as part of the shared python lane, while the dedicated Codex CLI step keeps only the runtime guard test isolated. The Node-backed lane (pnpm test / e2e) and the hook-discovery collect-only guard remain separate steps; this plan only governs the unified python pytest suite.",
     "ignore_deselect_contract": "ignore/deselect preserve the hook-discovery contract: test_secret_boundary_contract.py is ignored (tracked by #412) and the two non-hermetic generate_session_manifest wrapper tests are deselected.",
     "node_test_lane": "test_session_manifest_debounce.mjs (AC4 virtual-clock tests) runs in the dedicated node-backed-hook-tests CI lane via `node --test` (Issue #1141 AC6). It is NOT in the pytest targets.",
-    "edit_issue_tests_directory_coverage": "Issue #1303: individual file targets test_guard_issue_body.py / test_issue_contract_hygiene_autofix.py were replaced by the directory target .claude/skills/edit-issue/tests/ so newly added tests in that directory (e.g. test_edit_issue_txn.py from PR #1301 / Issue #1287) are covered by the python-test lane and the ci_test_selection/v1 artifact without requiring a plan edit per new test file.",
-    "trust_root_tests_registration": "Issue #1454: scripts/trust-root/tests/test_manifest_schema.py and scripts/trust-root/tests/test_trusted_hook_launcher.py were registered here as individual file targets (following the same explicit-file pattern as scripts/tests/test_milestone_rollup.py etc.) so the python-test job and the ci_test_selection/v1 artifact cover the new external trust root test suite. This edit is outside Issue #1454's original Allowed Paths and was applied as a required Scope Delta per pr-review-judge REQUEST_CHANGES feedback (precedent: #1163/#1164/#1165/#1166)."
+    "edit_issue_tests_directory_coverage": "Issue #1303: individual file targets test_guard_issue_body.py / test_issue_contract_hygiene_autofix.py were replaced by the directory target .claude/skills/edit-issue/tests/ so newly added tests in that directory (e.g. test_edit_issue_txn.py from PR #1301 / Issue #1287) are covered by the python-test lane and the ci_test_selection/v1 artifact without requiring a plan edit per new test file."
   }
 }

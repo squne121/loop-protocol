@@ -706,56 +706,6 @@ SESSION_MANIFEST_LEGACY_SCAN_V1:
 
 ---
 
-## 12. publish lane authorization trust root（公開レーン認可の外部信頼起点）— bootstrap・rotation・managed hook registration 手順（Issue #1454）
+## 12. publish lane authorization trust root（historical note）
 
-Issue #1454（Phase A）は、publish lane authorization code の信頼起点となる external trust root（`scripts/trust-root/` — `trusted_hook_launcher.py` / `manifest_schema.py` / `install_trust_root.sh`）を確立する。この trust root は candidate repository の外側、agent が書込み不能な絶対パス（既定値 `/opt/loop-protocol/trust-root` のような root-owned anchor）に配置される。本節はその bootstrap・manifest rotation・managed hook registration の手順（担当者・順序・failure/rollback）を正本として記述する。
-
-### 責任者・ロール（TRUST_ROOT_OPERATIONS_V1）
-
-```yaml
-TRUST_ROOT_OPERATIONS_V1:
-  bootstrap_executor: privileged_operator
-  manifest_update_authority: privileged_operator
-  rollback_policy: explicit_operator_approval
-  activation_order:
-    - merge_trusted_code
-    - install_trusted_runtime
-    - install_manifest
-    - register_managed_hook
-    - enable_publish_lane
-```
-
-- `bootstrap_executor: privileged_operator` — 初回インストール（`install_trust_root.sh` の初回実行、trust root ディレクトリの作成・所有権設定）は agent ではなく privileged operator が手動で行う。agent は `install_trust_root.sh` を実行しない（Issue #1454 の Stop Condition）。
-- `manifest_update_authority: privileged_operator` — manifest rotation（新しい `trusted_commit_oid` / component digest への切替）も privileged operator のみが行う。installer は「trust root owner と同一 euid での実行」を拒否する（`runtime_euid_must_differ_from_owner`）ため、trust root の所有アカウント自身による無審査ローテーションもできない。
-- `rollback_policy: explicit_operator_approval` — manifest rotation・managed hook 登録のいずれも、問題発生時のロールバックは privileged operator の明示承認を経てから行う。自動ロールバックは実装しない（fail-closed のまま停止する方が安全なため）。
-- `activation_order` — 本番切替は以下の順序を厳守する。逆順・スキップは行わない。
-  1. `merge_trusted_code`: `trusted_hook_launcher.py` / `manifest_schema.py` / `install_trust_root.sh` を含む本 Issue の PR を `main` にマージする
-  2. `install_trusted_runtime`: privileged operator が trust root ディレクトリ（root-owned anchor）を作成し、`install_trust_root.sh` を実行してランチャーのソース一式を配置する
-  3. `install_manifest`: privileged operator が信頼するコミット OID から `AUTHORIZATION_TCB_MANIFEST_V1` manifest を生成し、`releases/<generation>-<digest>/` 配下へ配置、`active.json` を原子的に activation する
-  4. `register_managed_hook`: `/etc/codex/requirements.toml` に `[features] hooks = true` を固定し、managed `PreToolUse` hook として trusted launcher を登録する（admin-enforced 領域。agent はこの登録ファイルを編集できない）
-  5. `enable_publish_lane`: 上記すべてが揃った状態で publish lane の実運用切替を有効化する。`.codex/hooks.json`（project-local、candidate-controlled）を本 launcher へ実際に向ける本番切替そのものは Issue #1450（Phase B）の対象であり、本 Issue の Scope 外
-
-### fail-closed 状態（未 bootstrap 時）
-
-manifest と trusted directory が privileged operator によって install されるまで、`trusted_hook_launcher.py` は generic allow を返さず `authorization_trust_root_missing` で fail-closed に deny する（Issue #1454 AC11）。
-
-### managed hook の独立性
-
-managed `PreToolUse` 登録は `allow_managed_hooks_only` のような project-local 設定を必須にしない。project-local `.codex/hooks.json` が削除・空化・別 command に変更された状態でも、managed launcher は独立して deny を維持する契約である（Issue #1454 AC13、`scripts/trust-root/tests/test_trusted_hook_launcher.py::test_managed_registration_survives_local_hook_removal`）。
-
-### 固定 managed hook command と実際の wire format 契約（Issue #1454 fix_delta 対応）
-
-`install_trust_root.sh` は `trusted_hook_launcher.py` / `manifest_schema.py` を trust root の**トップレベル固定パス**（`<trust_root_dir>/trusted_hook_launcher.py` / `<trust_root_dir>/manifest_schema.py`）へ実際にコピーする。manifest rotation のたびに再生成される `releases/<generation>-<digest>/` 配下の provenance コピーとは別に、このトップレベルコピーを tmp+fsync+rename で原子的に置き換えることで、managed hook 登録の固定コマンドは rotation を跨いで変化しない:
-
-```
-/usr/bin/python3 -I <trust_root_dir>/trusted_hook_launcher.py --evidence-file <path>
-```
-
-launcher の stdin は実際の Codex / Claude Code `PreToolUse` hook payload（`tool_name` / `tool_use_id` / `tool_input.command` / `cwd`）をそのまま受理する（独自 flat payload 形式は使わない）。`--evidence-file` は trusted verifier が生成する別ファイル（`PUBLISH_EVIDENCE_V1`）であり、`tool_use_id` / `cwd` / `command` の SHA-256 で hook payload と bind される。allow 決定は `hookSpecificOutput.permissionDecision: "allow"` 配下に `updatedInput.command` を**文字列**（`shlex.join()` 相当）で返し、deny 決定は `permissionDecision: "deny"` + stderr + exit code 2 を返す（本ドキュメント冒頭の `PreToolUse` exit code contract と整合する）。
-
-### 本節が対象としない事項
-
-- `.codex/hooks.json` を trusted launcher へ実際に向ける本番切替そのもの（Issue #1450 Phase B）
-- candidate 側 `codex-hook-adapter.mjs` / `git_mutation_command_policy.py` の TCB digest 照合ロジック実装そのもの（同上）
-- trusted verifier が `--evidence-file` を admin-managed 固定コマンドへどう受け渡すかの具体的配線（Issue #1450 Phase B の対象。本 Issue はファイルパスによる受け渡し契約のみを固定する）
-- Codex `hooks.managed_dir`（admin-enforced 領域）への完全移行（将来 follow-up）
+Issue #1454（Phase A, PR #1457 MERGED）で `scripts/trust-root` 一式（`trusted_hook_launcher.py` / `manifest_schema.py` / `install_trust_root.sh`）が external trust root として導入されたが、これを `.codex/hooks.json` へ実際に配線する Issue #1450（Phase B）と、追加ハードニングを扱う Issue #1468 がいずれも個人開発の脅威モデルに対して過剰と判断され not planned でクローズされた。配線先を失った `scripts/trust-root` は不使用コードとなったため、Issue #1469 でコード一式・CI 登録・本節の bootstrap/rotation/managed hook registration 手順を削除した。現行の publish lane 保護は Issue #1408（PR #1442 MERGED、Issue branch 限定 push 許可・force/tag/delete/mirror 拒否）と main branch protection（Issue #360）のみで構成される。
