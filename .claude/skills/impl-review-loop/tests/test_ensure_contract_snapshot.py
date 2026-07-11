@@ -477,8 +477,16 @@ class TestFreshGoSnapshots:
         parser_mod.find_latest_go.return_value = legacy_go
 
         with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
-            with patch.object(_ecs_mod, "fetch_issue_snapshot", return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None)):
-                with patch.object(_ecs_mod, "run_contract_review_once", return_value=(_make_review_result("go"), None)) as review:
+            with patch.object(
+                _ecs_mod,
+                "fetch_issue_snapshot",
+                return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None),
+            ):
+                with patch.object(
+                    _ecs_mod,
+                    "run_contract_review_once",
+                    return_value=(_make_review_result("go"), None),
+                ) as review:
                     result = ensure_contract_snapshot(
                         issue_number=_ISSUE_NUMBER, repo=_REPO, mode="auto", do_post=False
                     )
