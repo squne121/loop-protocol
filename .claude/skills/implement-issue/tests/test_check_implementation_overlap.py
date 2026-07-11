@@ -1,0 +1,564 @@
+"""AC5-AC8: `check_implementation_overlap.py` の implementation 専用 overlap
+preflight adapter を subprocess 経由で検証する（#1452、PR #1455 レビュー修正版）。
+
+すべて `--dry-run --current-file --candidates-file` の offline 経路を使い、
+live GitHub Issue への参照ではなく `tests/fixtures/overlap/` の固定 fixture
+（body_sha256 付き）で決定論的に検証する。
+
+exit code 契約（Major 2）: 分類に成功した場合は route を問わず exit 0。
+`runtime_error` のみ非 0（exit 1）。route の正本は常に JSON 出力の
+`route` フィールドである。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Dict, Tuple
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
+HELPER = (
+    REPO_ROOT
+    / ".claude"
+    / "skills"
+    / "implement-issue"
+    / "scripts"
+    / "check_implementation_overlap.py"
+)
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "overlap"
+
+ROUTES = {
+    "proceed",
+    "proceed_with_collision_evidence",
+    "wait_for_predecessor",
+    "human_review_required",
+    "duplicate",
+    "runtime_error",
+}
+
+EXIT_OK = 0
+EXIT_RUNTIME_ERROR = 1
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _run_cli(
+    issue_number: int,
+    current_file: Path,
+    candidates_file: Path,
+    *extra: str,
+) -> Tuple[int, Dict[str, Any]]:
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "--issue-number",
+            str(issue_number),
+            "--dry-run",
+            "--current-file",
+            str(current_file),
+            "--candidates-file",
+            str(candidates_file),
+            *extra,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(proc.stdout)
+    return proc.returncode, payload
+
+
+def _number(fixture_name: str) -> int:
+    return json.loads((FIXTURES_DIR / fixture_name).read_text(encoding="utf-8"))["number"]
+
+
+def test_helper_and_fixtures_exist() -> None:
+    assert HELPER.is_file(), f"missing helper: {HELPER}"
+    assert FIXTURES_DIR.is_dir(), f"missing fixtures dir: {FIXTURES_DIR}"
+    for name in (
+        "current_1451_analog.json",
+        "candidates_path_only_false_positive.json",
+        "candidates_self_only.json",
+        "current_with_open_dependency.json",
+        "candidates_duplicate.json",
+        "current_with_closed_dependency.json",
+        "candidates_closed_predecessor.json",
+        "candidates_pathset_disjoint_contract.json",
+        "current_edit_target.json",
+        "candidates_paraphrase_shared_edit_target.json",
+        "current_with_native_blocked_by.json",
+        "current_with_native_blocked_by_closed.json",
+        "current_schema_collision.json",
+        "candidates_partial_paths_shared_schema.json",
+        "candidates_missing_body.json",
+        "candidates_missing_number.json",
+        "candidates_missing_allowed_paths.json",
+    ):
+        assert (FIXTURES_DIR / name).is_file(), f"missing fixture: {name}"
+
+
+def _assert_fixture_body_sha256(fixture_path: Path) -> None:
+    """全 fixture の body_sha256 が実体の body と一致することを検証する
+    （AC5: live Issue 参照ではなく body_sha256 付き固定 fixture であることの保証）。
+    """
+    data = json.loads(fixture_path.read_text(encoding="utf-8"))
+    records = data if isinstance(data, list) else [data]
+    for record in records:
+        if "body_sha256" not in record:
+            continue  # Major 5 の欠損フィールドテスト用 fixture は意図的に省略
+        expected = f"sha256:{_sha256(record['body'])}"
+        assert record["body_sha256"] == expected, (
+            f"{fixture_path.name} (#{record.get('number')}) body_sha256 mismatch: "
+            f"fixture is stale relative to its own body"
+        )
+
+
+def test_path_only_false_positive_fixture_body_sha256_is_pinned() -> None:
+    _assert_fixture_body_sha256(FIXTURES_DIR / "current_1451_analog.json")
+    _assert_fixture_body_sha256(FIXTURES_DIR / "candidates_path_only_false_positive.json")
+
+
+def test_path_only_false_positive_fixture_routes_to_proceed_with_collision_evidence() -> None:
+    """AC5: #1451 対 #1449/#1450 相当のケース（同じ Allowed Paths、disjoint な Outcome）は
+    `human_review_required` に誤停止せず `proceed_with_collision_evidence` に route する。
+    """
+    current_file = FIXTURES_DIR / "current_1451_analog.json"
+    candidates_file = FIXTURES_DIR / "candidates_path_only_false_positive.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+
+    exit_code, payload = _run_cli(current_number, current_file, candidates_file)
+
+    assert payload["schema"] == "IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1"
+    assert payload["route"] == "proceed_with_collision_evidence", payload
+    assert exit_code == EXIT_OK
+
+    # #9451（current 自身）は自己除外されているため candidates に現れない
+    candidate_numbers = {c["issue_number"] for c in payload["candidates"]}
+    assert current_number not in candidate_numbers
+
+
+def test_self_exclusion_removes_current_issue_from_candidates() -> None:
+    """AC6: `--issue-number` は必須であり、対象 Issue 自身は候補から除外される。
+    candidates_self_only.json は current と同一 Issue 番号のみを含む候補集合であり、
+    自己除外後は候補が 0 件になるため `proceed`（C0）に route する。
+    """
+    current_file = FIXTURES_DIR / "current_1451_analog.json"
+    self_only_file = FIXTURES_DIR / "candidates_self_only.json"
+    self_only_candidates = json.loads(self_only_file.read_text(encoding="utf-8"))
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    assert self_only_candidates[0]["number"] == current_number, (
+        "fixture precondition: candidates_self_only.json must reference the same "
+        "issue number as current_1451_analog.json to exercise self-exclusion"
+    )
+
+    exit_code, payload = _run_cli(current_number, current_file, self_only_file)
+
+    assert payload["candidates"] == []
+    assert payload["route"] == "proceed"
+    assert exit_code == EXIT_OK
+
+
+def test_missing_issue_number_argument_is_rejected() -> None:
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "--dry-run",
+            "--current-file",
+            str(FIXTURES_DIR / "current_1451_analog.json"),
+            "--candidates-file",
+            str(FIXTURES_DIR / "candidates_self_only.json"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "--issue-number" in proc.stderr or "required" in proc.stderr.lower()
+
+
+def test_given_exact_same_allowed_paths_but_disjoint_contract_then_route_is_not_duplicate() -> None:
+    """Blocker 3: Allowed Paths が同一集合というだけで duplicate と即断しない。
+    candidates_pathset_disjoint_contract.json は current_1451_analog.json と
+    同一の Allowed Paths を持つが Outcome/In Scope/goal_ref が disjoint であり、
+    readback で確認できないため `proceed_with_collision_evidence`（C1 相当）に
+    route する（`duplicate` ではない）。
+    """
+    current_file = FIXTURES_DIR / "current_1451_analog.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    exit_code, payload = _run_cli(
+        current_number, current_file, FIXTURES_DIR / "candidates_pathset_disjoint_contract.json"
+    )
+    assert payload["route"] == "proceed_with_collision_evidence", payload
+    assert exit_code == EXIT_OK
+    for cand in payload["candidates"]:
+        assert cand["policy_class"] != "duplicate", payload
+
+
+def test_given_confirmed_duplicate_body_then_route_is_duplicate() -> None:
+    """candidates_duplicate.json は current_1451_analog.json とほぼ同一の
+    Outcome/In Scope を持つため、readback 確認を経て `duplicate` に route する。
+    """
+    current_file = FIXTURES_DIR / "current_1451_analog.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    exit_code, payload = _run_cli(
+        current_number, current_file, FIXTURES_DIR / "candidates_duplicate.json"
+    )
+    assert payload["route"] == "duplicate", payload
+    assert exit_code == EXIT_OK
+
+
+def test_given_paraphrased_outcome_with_shared_edit_target_then_not_auto_proceeded() -> None:
+    """Blocker 1: 自然言語類似度（Outcome の token Jaccard）だけを唯一の根拠に
+    しない。candidates_paraphrase_shared_edit_target.json は current との
+    Outcome token overlap が低い（言い換え）が、In Scope の edit target
+    （`docs/dev/agent-runtime-ops.md`）を共有しており、構造シグナルが
+    collision を検出するため `proceed`/`proceed_with_collision_evidence`
+    へ自動で route してはならない。
+    """
+    current_file = FIXTURES_DIR / "current_edit_target.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    exit_code, payload = _run_cli(
+        current_number,
+        current_file,
+        FIXTURES_DIR / "candidates_paraphrase_shared_edit_target.json",
+    )
+    assert payload["route"] not in {"proceed", "proceed_with_collision_evidence"}, payload
+    assert exit_code == EXIT_OK
+    cand = payload["candidates"][0]
+    assert cand["text_similarity"] < 0.5, "fixture precondition: text similarity must be low (paraphrase)"
+    assert cand["structural_signals"]["shared_edit_targets"], (
+        "shared edit target must be detected structurally, independent of low text similarity"
+    )
+
+
+def test_given_partial_path_overlap_with_shared_output_schema_then_human_review_required() -> None:
+    """構造シグナル（shared output schema 名）による collision 検出。
+    Allowed Paths は部分重複のみ（同一集合ではない）だが、両 Issue の Outcome/
+    In Scope が同じ output schema 名（`FOO_BAR_RESULT_V2`）を参照しており、
+    `human_review_required` に route する。
+    """
+    current_file = FIXTURES_DIR / "current_schema_collision.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    exit_code, payload = _run_cli(
+        current_number,
+        current_file,
+        FIXTURES_DIR / "candidates_partial_paths_shared_schema.json",
+    )
+    assert payload["route"] == "human_review_required", payload
+    assert exit_code == EXIT_OK
+    cand = payload["candidates"][0]
+    assert "FOO_BAR_RESULT_V2" in cand["structural_signals"]["shared_output_schema"]
+
+
+def test_given_blocked_by_open_predecessor_then_route_is_wait_for_predecessor() -> None:
+    """`blocked_by` (legacy `Depends on #N`) を参照し、predecessor が OPEN の
+    ままである場合は `wait_for_predecessor`（C2b）に route する。
+    """
+    current_file = FIXTURES_DIR / "current_with_open_dependency.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    exit_code, payload = _run_cli(
+        current_number, current_file, FIXTURES_DIR / "candidates_path_only_false_positive.json"
+    )
+    assert payload["route"] == "wait_for_predecessor", payload
+    assert exit_code == EXIT_OK
+    assert payload["dependency_resolution"]["blocking_predecessor"]["issue_number"] == 9449
+
+
+def test_given_blocked_by_closed_predecessor_then_route_is_not_blocked() -> None:
+    """`blocked_by` の predecessor が CLOSED の場合は C2a として扱われ、
+    readback で disjoint と確認できれば `proceed_with_collision_evidence` に
+    route する（`wait_for_predecessor` ではない）。
+    """
+    current_file = FIXTURES_DIR / "current_with_closed_dependency.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    exit_code, payload = _run_cli(
+        current_number, current_file, FIXTURES_DIR / "candidates_closed_predecessor.json"
+    )
+    assert payload["route"] == "proceed_with_collision_evidence", payload
+    assert exit_code == EXIT_OK
+    assert payload["dependency_resolution"]["closed_predecessors"] == [9449]
+    assert payload["candidates"][0]["policy_class"] == "C2a"
+
+
+def test_given_native_github_dependency_blocked_by_open_then_route_is_wait_for_predecessor() -> None:
+    """GitHub native dependency（`blockedBy` フィールド）を legacy `Depends on #N`
+    が無くても解決し、predecessor が OPEN なら C2b に route する。
+    """
+    current_file = FIXTURES_DIR / "current_with_native_blocked_by.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    exit_code, payload = _run_cli(
+        current_number, current_file, FIXTURES_DIR / "candidates_path_only_false_positive.json"
+    )
+    assert payload["route"] == "wait_for_predecessor", payload
+    assert exit_code == EXIT_OK
+
+
+def test_given_native_github_dependency_blocked_by_closed_then_route_is_c2a() -> None:
+    """GitHub native dependency の predecessor が CLOSED の場合は C2a として
+    readback に回す。
+    """
+    current_file = FIXTURES_DIR / "current_with_native_blocked_by_closed.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    exit_code, payload = _run_cli(
+        current_number, current_file, FIXTURES_DIR / "candidates_closed_predecessor.json"
+    )
+    assert payload["route"] == "proceed_with_collision_evidence", payload
+    assert exit_code == EXIT_OK
+    assert payload["candidates"][0]["policy_class"] == "C2a"
+
+
+def test_given_candidate_missing_body_then_route_is_human_review_required() -> None:
+    """Major 5: number/body/updatedAt/Allowed Paths のいずれかが欠けた candidate は
+    false positive として黙って除外されず `human_review_required` に倒す。
+    """
+    current_file = FIXTURES_DIR / "current_1451_analog.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    exit_code, payload = _run_cli(
+        current_number, current_file, FIXTURES_DIR / "candidates_missing_body.json"
+    )
+    assert payload["route"] == "human_review_required", payload
+    assert exit_code == EXIT_OK
+    assert "missing_body" in payload["validation_errors"]["9454"]
+
+
+def test_given_candidate_missing_number_then_route_is_human_review_required() -> None:
+    current_file = FIXTURES_DIR / "current_1451_analog.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    exit_code, payload = _run_cli(
+        current_number, current_file, FIXTURES_DIR / "candidates_missing_number.json"
+    )
+    assert payload["route"] == "human_review_required", payload
+    assert exit_code == EXIT_OK
+    assert "missing_or_invalid_number" in payload["validation_errors"]["-1"]
+
+
+def test_given_candidate_missing_allowed_paths_then_route_is_human_review_required() -> None:
+    current_file = FIXTURES_DIR / "current_1451_analog.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    exit_code, payload = _run_cli(
+        current_number, current_file, FIXTURES_DIR / "candidates_missing_allowed_paths.json"
+    )
+    assert payload["route"] == "human_review_required", payload
+    assert exit_code == EXIT_OK
+    assert "missing_allowed_paths" in payload["validation_errors"]["9456"]
+
+
+def test_saturation_boundary_limit_minus_one_limit_and_limit_plus_one() -> None:
+    """収集上限の limit-1 / limit / limit+1 境界（saturation 検出）。
+    `candidates_path_only_false_positive.json` は自己除外前 3 件（#9449/#9450/
+    #9451）、自己除外後 2 件（#9449/#9450）。
+    """
+    current_file = FIXTURES_DIR / "current_1451_analog.json"
+    candidates_file = FIXTURES_DIR / "candidates_path_only_false_positive.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    raw_count = len(json.loads(candidates_file.read_text(encoding="utf-8")))
+
+    # limit-1: saturated=true（取得件数が limit を上回る）
+    _, payload = _run_cli(current_number, current_file, candidates_file, "--limit", str(raw_count - 1))
+    assert payload["source"]["saturated"] is True, payload
+    assert payload["route"] == "human_review_required", payload  # 全件性を証明できない -> fail-closed
+
+    # limit == raw_count: saturated=true（>= 境界）
+    _, payload = _run_cli(current_number, current_file, candidates_file, "--limit", str(raw_count))
+    assert payload["source"]["saturated"] is True, payload
+
+    # limit+1: saturated=false
+    _, payload = _run_cli(current_number, current_file, candidates_file, "--limit", str(raw_count + 1))
+    assert payload["source"]["saturated"] is False, payload
+    assert payload["route"] == "proceed_with_collision_evidence", payload
+
+
+def test_exit_code_contract_covers_all_known_routes_including_wait_and_human_review() -> None:
+    """AC7 改訂: すべての closed route（`wait_for_predecessor` /
+    `human_review_required` を含む）で分類成功時は exit 0 を返す（Major 2）。
+    """
+    current_file = FIXTURES_DIR / "current_1451_analog.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+
+    # proceed (C0): no candidates at all
+    empty_file = current_file.parent / "_empty_candidates.json"
+    empty_file.write_text("[]", encoding="utf-8")
+    try:
+        exit_code, payload = _run_cli(current_number, current_file, empty_file)
+        assert payload["route"] == "proceed"
+        assert exit_code == EXIT_OK
+    finally:
+        empty_file.unlink(missing_ok=True)
+
+    # proceed_with_collision_evidence
+    exit_code, payload = _run_cli(
+        current_number, current_file, FIXTURES_DIR / "candidates_path_only_false_positive.json"
+    )
+    assert payload["route"] == "proceed_with_collision_evidence"
+    assert exit_code == EXIT_OK
+
+    # duplicate
+    exit_code, payload = _run_cli(
+        current_number, current_file, FIXTURES_DIR / "candidates_duplicate.json"
+    )
+    assert payload["route"] == "duplicate"
+    assert exit_code == EXIT_OK
+
+    # wait_for_predecessor (C2b)
+    dep_current = FIXTURES_DIR / "current_with_open_dependency.json"
+    dep_number = json.loads(dep_current.read_text(encoding="utf-8"))["number"]
+    exit_code, payload = _run_cli(
+        dep_number, dep_current, FIXTURES_DIR / "candidates_path_only_false_positive.json"
+    )
+    assert payload["route"] == "wait_for_predecessor"
+    assert exit_code == EXIT_OK
+
+    # human_review_required
+    exit_code, payload = _run_cli(
+        current_number, current_file, FIXTURES_DIR / "candidates_missing_body.json"
+    )
+    assert payload["route"] == "human_review_required"
+    assert exit_code == EXIT_OK
+
+    # runtime_error: invalid JSON candidates file
+    bad_file = current_file.parent / "_bad_candidates.json"
+    bad_file.write_text("{not valid json", encoding="utf-8")
+    try:
+        exit_code, payload = _run_cli(current_number, current_file, bad_file)
+        assert payload["route"] == "runtime_error"
+        assert exit_code == EXIT_RUNTIME_ERROR
+    finally:
+        bad_file.unlink(missing_ok=True)
+
+
+def test_unknown_route_value_never_escapes_closed_set() -> None:
+    """AC7: route は必ず ROUTES の closed set に含まれる。"""
+    current_file = FIXTURES_DIR / "current_1451_analog.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    _, payload = _run_cli(
+        current_number,
+        current_file,
+        FIXTURES_DIR / "candidates_self_only.json",
+    )
+    assert payload["route"] in ROUTES
+
+
+def test_continue_routes_survive_bash_set_dash_e() -> None:
+    """Major 2: `set -e` 環境でも継続 route（`proceed_with_collision_evidence` /
+    `wait_for_predecessor` / `human_review_required` / `duplicate`）が exit 0 で
+    正しく次のコマンドへ進むことを、実際の bash `set -e` 経由で検証する。
+    """
+    current_file = FIXTURES_DIR / "current_1451_analog.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    candidates_file = FIXTURES_DIR / "candidates_path_only_false_positive.json"
+
+    script = (
+        "set -e\n"
+        f"{sys.executable} {HELPER} --issue-number {current_number} --dry-run "
+        f"--current-file {current_file} --candidates-file {candidates_file} > /dev/null\n"
+        "echo CONTINUED_AFTER_SET_E\n"
+    )
+    proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert "CONTINUED_AFTER_SET_E" in proc.stdout
+
+
+def test_evidence_schema_contains_implement_scope_collision_preflight_v1_fields() -> None:
+    """AC8: `IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1` evidence の必須フィールドを検証する
+    （Major 3/4 の per-candidate policy_class/reasons、decision_inputs_sha256 を含む）。
+    """
+    current_file = FIXTURES_DIR / "current_1451_analog.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+
+    _, payload = _run_cli(
+        current_number,
+        current_file,
+        FIXTURES_DIR / "candidates_path_only_false_positive.json",
+    )
+
+    assert payload["schema"] == "IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1"
+
+    current_issue = payload["current_issue"]
+    assert current_issue["number"] == current_number
+    assert "updated_at" in current_issue
+    assert current_issue["body_sha256"].startswith("sha256:")
+    assert isinstance(current_issue["allowed_paths"], list)
+
+    source = payload["source"]
+    assert isinstance(source["complete"], bool)
+    assert isinstance(source["saturated"], bool)
+    assert "collected_at" in source
+
+    assert isinstance(payload["candidates"], list)
+    for cand in payload["candidates"]:
+        assert "issue_number" in cand
+        assert "updated_at" in cand
+        assert "overlapping_paths" in cand
+        assert "heading_overlap" in cand
+        assert "change_kind_equal" in cand
+        assert "machine_readable_keys_intersection" in cand
+        assert "policy_class" in cand
+        assert "reasons" in cand and isinstance(cand["reasons"], list)
+        assert "non_conflict_reason" in cand
+
+    assert "dependency_resolution" in payload
+    assert "validation_errors" in payload
+    assert payload["route"] in ROUTES
+    assert payload["decision_inputs_sha256"].startswith("sha256:")
+    assert payload["evidence_sha256"].startswith("sha256:")
+
+
+def test_decision_inputs_sha256_is_time_independent() -> None:
+    """Major 4 ケース 1: 同じ入力で collected_at のみ異なる 2 回の実行間で
+    `decision_inputs_sha256` は同じ値になる（`evidence_sha256` は時刻を含むため
+    異なりうる）。
+    """
+    current_file = FIXTURES_DIR / "current_1451_analog.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    candidates_file = FIXTURES_DIR / "candidates_path_only_false_positive.json"
+
+    _, payload_a = _run_cli(current_number, current_file, candidates_file)
+    _, payload_b = _run_cli(current_number, current_file, candidates_file)
+
+    assert payload_a["decision_inputs_sha256"] == payload_b["decision_inputs_sha256"]
+
+
+def test_decision_inputs_sha256_changes_when_candidate_body_drifts() -> None:
+    """Major 4 ケース 2: candidate body を 1 文字変更すると digest が変わる。"""
+    current_file = FIXTURES_DIR / "current_1451_analog.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    candidates_file = FIXTURES_DIR / "candidates_path_only_false_positive.json"
+
+    _, payload_before = _run_cli(current_number, current_file, candidates_file)
+
+    original = json.loads(candidates_file.read_text(encoding="utf-8"))
+    drifted = json.loads(json.dumps(original))
+    drifted[0]["body"] = drifted[0]["body"] + " "  # 1 文字分の drift
+    drifted_file = candidates_file.parent / "_drifted_candidates.json"
+    drifted_file.write_text(json.dumps(drifted, ensure_ascii=False), encoding="utf-8")
+    try:
+        _, payload_after = _run_cli(current_number, current_file, drifted_file)
+    finally:
+        drifted_file.unlink(missing_ok=True)
+
+    assert payload_before["decision_inputs_sha256"] != payload_after["decision_inputs_sha256"]
+
+
+def test_decision_inputs_sha256_is_order_independent_after_canonical_sort() -> None:
+    """Major 4 ケース 3: candidate の列挙順序を変えても canonical sort 後は
+    同じ digest になる。"""
+    current_file = FIXTURES_DIR / "current_1451_analog.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    candidates_file = FIXTURES_DIR / "candidates_path_only_false_positive.json"
+
+    original = json.loads(candidates_file.read_text(encoding="utf-8"))
+    reordered = list(reversed(original))
+    reordered_file = candidates_file.parent / "_reordered_candidates.json"
+    reordered_file.write_text(json.dumps(reordered, ensure_ascii=False), encoding="utf-8")
+    try:
+        _, payload_original = _run_cli(current_number, current_file, candidates_file)
+        _, payload_reordered = _run_cli(current_number, current_file, reordered_file)
+    finally:
+        reordered_file.unlink(missing_ok=True)
+
+    assert payload_original["decision_inputs_sha256"] == payload_reordered["decision_inputs_sha256"]

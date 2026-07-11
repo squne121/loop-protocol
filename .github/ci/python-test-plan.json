@@ -10,7 +10,7 @@
     ".claude/skills/edit-issue/tests/",
     ".claude/skills/create-issue/tests/",
     ".claude/skills/create-issue/scripts/tests/",
-    ".claude/skills/ssot-discovery/tests/test_match_ssot_registry.py",
+    ".claude/skills/ssot-discovery/tests/",
     ".claude/hooks/tests/",
     ".claude/skills/issue-contract-review/scripts/tests/",
     ".claude/skills/issue-contract-review/tests/",

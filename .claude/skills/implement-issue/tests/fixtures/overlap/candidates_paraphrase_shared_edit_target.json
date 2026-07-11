@@ -1,0 +1,15 @@
+[
+  {
+    "number": 9453,
+    "title": "実装: ランタイム運用ドキュメントの表現を整える",
+    "body": "## Machine-Readable Contract\n\n```yaml\ncontract_schema_version: v1\nissue_kind: implementation\nparent_issue: \"none\"\ngoal_ref: \"ランタイム運用ドキュメントの表現を整える\"\nchange_kind: docs\n```\n\n## Outcome\n\nエージェント実行基盤の解説資料が読みやすく整理され、用語の揺れが\n解消されている状態。\n\n## In Scope\n\n- `docs/dev/agent-runtime-ops.md` の文体統一と誤字修正\n\n## Out of Scope\n\n- model allocation の内容変更\n\n## Delivery Rule\n\n- 1 Issue = 1 PR\n- Draft PR を既定とする\n\n## Allowed Paths\n\n- docs/dev/agent-runtime-ops.md\n",
+    "labels": [
+      {
+        "name": "phase/implementation"
+      }
+    ],
+    "updatedAt": "2026-07-11T09:30:00Z",
+    "url": "https://github.com/squne121/loop-protocol/issues/9453",
+    "body_sha256": "sha256:377ecde82cc72215076e4cbf7c0a949894122c0f3ea2bbe35671a3211087b31b"
+  }
+]

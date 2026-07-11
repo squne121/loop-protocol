@@ -1,0 +1,8 @@
+{
+  "number": 9452,
+  "title": "実装: agent-runtime-ops の model routing 表を更新する",
+  "body": "## Machine-Readable Contract\n\n```yaml\ncontract_schema_version: v1\nissue_kind: implementation\nparent_issue: \"none\"\ngoal_ref: \"agent-runtime-ops の model routing 表を更新する\"\nchange_kind: docs\n```\n\n## Outcome\n\n`docs/dev/agent-runtime-ops.md` の role-based model allocation 表が\nGPT-5.6 の launch 証跡と同期している状態。\n\n## In Scope\n\n- `docs/dev/agent-runtime-ops.md` の model routing 表の更新\n\n## Out of Scope\n\n- publish lane authorization\n\n## Delivery Rule\n\n- 1 Issue = 1 PR\n- Draft PR を既定とする\n\n## Allowed Paths\n\n- docs/dev/agent-runtime-ops.md\n",
+  "updatedAt": "2026-07-11T09:00:00Z",
+  "url": "https://github.com/squne121/loop-protocol/issues/9452",
+  "body_sha256": "sha256:86d92030e3c56755eac87d9ee28a8ca6527c8a6152e8dadec7d03aa0cb8dcd09"
+}

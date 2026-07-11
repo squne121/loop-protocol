@@ -1,0 +1,15 @@
+[
+  {
+    "number": 9456,
+    "title": "実装: Allowed Paths なし Issue",
+    "body": "## Outcome\n\nダミー outcome\n\n## In Scope\n\n- dummy\n",
+    "labels": [
+      {
+        "name": "phase/implementation"
+      }
+    ],
+    "updatedAt": "2026-07-11T09:00:00Z",
+    "url": "https://github.com/squne121/loop-protocol/issues/9456",
+    "body_sha256": "sha256:318906625dedeb3c89e487f7c98011d3170ee1133f9403d845ed479d53f625fb"
+  }
+]
