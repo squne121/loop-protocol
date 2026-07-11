@@ -26,7 +26,7 @@ _VC_SYNTAX_DIR = _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "
 if str(_VC_SYNTAX_DIR) not in sys.path:
     sys.path.insert(0, str(_VC_SYNTAX_DIR))
 
-from vc_contract_syntax import (
+from vc_contract_syntax import (  # noqa: E402
     VALID_PRE_FLIGHT_SCOPE_VALUES,
     parse_ac_marker_line,
     parse_preflight_scope_marker_line,
@@ -158,8 +158,9 @@ def safety_fields(evidence_mode: str, evidence: Optional[Dict[str, Any]] = None)
 
 
 def emit_json(result: Dict[str, Any], evidence_mode: str, evidence: Optional[Dict[str, Any]] = None) -> None:
-    """Emit a JSON envelope with the stable safety-field contract."""
-    result.update(safety_fields(evidence_mode, evidence))
+    """Emit the legacy envelope, extended only for current-head evidence."""
+    if evidence_mode == "current-head":
+        result.update(safety_fields(evidence_mode, evidence))
     print(json.dumps(result, indent=2))
 
 
