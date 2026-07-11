@@ -303,10 +303,13 @@ def test_live_smoke_read_only_native_dependency_fetch() -> None:
     """
     auth_check = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, timeout=30)
     if auth_check.returncode != 0:
-        pytest.exit(
+        # pytest.exit() は xdist worker process ごと落とし controller 側で
+        # "INTERNALERROR: assert not crashitem" を引き起こす
+        # (CI run 29172464382, job 86595777094 で確認済み)。
+        # xdist worker 内では pytest.skip() を使う。
+        pytest.skip(
             "SKIP: gh auth status unavailable; AC11 live smoke test skipped "
-            "(fixture-based AC7 coverage still applies)",
-            returncode=77,
+            "(fixture-based AC7 coverage still applies)"
         )
 
     result = fetch_all_native_dependencies(REPO, 1462)
