@@ -47,8 +47,9 @@ DEFAULT_TIMEOUT_SECONDS = 90
 def collect_current_head_evidence(cwd: str, reviewed_head_sha: str) -> Dict[str, Any]:
     """Observe and certify one clean worktree against a reviewed commit object.
 
-    This deliberately uses Git's revision parser instead of a fixed-width SHA
-    regexp so repositories using a non-SHA-1 object format remain supported.
+    The caller must provide the full immutable object ID. Git resolution is
+    still used to prove that the object exists and is a commit, but aliases,
+    symbolic refs, and abbreviated IDs are never canonicalized into acceptance.
     """
     base = {
         "head_sha": None,
@@ -84,6 +85,13 @@ def collect_current_head_evidence(cwd: str, reviewed_head_sha: str) -> Dict[str,
     if error:
         base["head_sha"] = observed
         base["errors"].append(f"reviewed_head_not_commit:{error}")
+        return base
+    if (
+        reviewed_head_sha != canonical_reviewed
+        or re.fullmatch(r"[0-9a-f]+", reviewed_head_sha) is None
+    ):
+        base["head_sha"] = observed
+        base["errors"].append("reviewed_head_sha_not_full_oid")
         return base
     status, error = git_text("status", "--porcelain=v1", "-z", "--untracked-files=all")
     if error:
@@ -130,6 +138,11 @@ def finalize_current_head_evidence(cwd: str, evidence: Dict[str, Any]) -> Dict[s
     evidence["certified"] = not evidence["errors"]
     evidence["stop_condition_triggered"] = not evidence["certified"]
     return evidence
+
+
+def exit_code_for_status(status: str) -> int:
+    """Map the final emitted status to a fail-closed process exit code."""
+    return {"pass": 0, "blocked": 1, "human_judgment": 3}.get(status, 2)
 
 
 def safety_fields(evidence_mode: str, evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -3679,14 +3692,7 @@ def main() -> int:
 
     # C2: Exit code contract
     # status: pass → 0, blocked → 1, human_judgment → 3
-    if status == "pass":
-        return 0
-    elif status == "blocked":
-        return 1
-    elif status == "human_judgment":
-        return 3
-    else:
-        return 0  # default fallback
+    return exit_code_for_status(output["status"])
 
 
 if __name__ == "__main__":
