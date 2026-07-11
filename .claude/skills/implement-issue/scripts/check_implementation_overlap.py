@@ -441,9 +441,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--issue-number", required=True, type=int, help="対象 Issue 番号（自己除外に使用）")
     p.add_argument("--repo", help="owner/name（オンライン取得時に必須）")
     p.add_argument("--limit", type=int, default=DEFAULT_CANDIDATE_LIMIT, help="候補取得上限")
-    p.add_argument("--dry-run", action="store_true", help="GitHub へアクセスしない（--current-file / --candidates-file 必須）")
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="GitHub へアクセスしない（--current-file / --candidates-file 必須）",
+    )
     p.add_argument("--current-file", help="offline 用: 対象 Issue の JSON（number,title,body,updatedAt）")
-    p.add_argument("--candidates-file", help="offline 用: 候補 Issue raw JSON 配列（number,title,body,labels,updatedAt,url）")
+    p.add_argument(
+        "--candidates-file",
+        help="offline 用: 候補 Issue raw JSON 配列（number,title,body,labels,updatedAt,url）",
+    )
     return p
 
 
