@@ -501,3 +501,45 @@ def test_env_prefix_benign_command_allowed():
     if "hookSpecificOutput" in response:
         assert response["hookSpecificOutput"].get("permissionDecision") != "deny", \
             f"Expected allow but got deny: {response}"
+
+
+# ---------------------------------------------------------------------------
+# AC12 (#1420 fix_delta 3): default manifest root fallback when
+# CODEX_HOOK_MANIFEST_ROOT is unset
+# ---------------------------------------------------------------------------
+
+def test_manifest_written_to_default_root_when_env_unset():
+    """GIVEN CODEX_HOOK_MANIFEST_ROOT is unset WHEN Stop fires THEN the manifest
+    is written to the production default path
+    <repoRoot>/tmp/session-manifests/codex/stop/ (AC12, #1420 fix_delta 3).
+
+    This test intentionally does NOT use tmp_path / CODEX_HOOK_MANIFEST_ROOT
+    override (it is the only test in this module that writes to the shared
+    repo-relative default path), so it identifies and removes only the exact
+    file it created rather than rmtree-ing the shared directory (which would
+    race other concurrent runs)."""
+    payload = json.loads((FIXTURES / "positive_fixture.json").read_text())
+    default_manifest_dir = REPO_ROOT / "tmp" / "session-manifests" / "codex" / "stop"
+    before_files = set(default_manifest_dir.glob("*.json")) if default_manifest_dir.exists() else set()
+
+    env = os.environ.copy()
+    env.pop("CODEX_HOOK_MANIFEST_ROOT", None)
+    result = run_adapter("Stop", payload, env=env)
+    assert json.loads(result.stdout) == {"continue": True}
+
+    after_files = set(default_manifest_dir.glob("*.json"))
+    new_files = after_files - before_files
+    assert len(new_files) == 1, f"expected exactly one new manifest file, got {new_files}"
+    new_file = new_files.pop()
+
+    try:
+        validation = subprocess.run(
+            ["node", str(MANIFEST_VALIDATOR), str(default_manifest_dir)],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert validation.returncode == 0, validation.stderr
+    finally:
+        new_file.unlink()
