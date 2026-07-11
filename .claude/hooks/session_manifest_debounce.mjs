@@ -37,6 +37,52 @@ const PRODUCER_ARGS = process.env.SESSION_MANIFEST_DEBOUNCE_PRODUCER_ARGS_JSON
   ? JSON.parse(process.env.SESSION_MANIFEST_DEBOUNCE_PRODUCER_ARGS_JSON)
   : [join(REPO_ROOT, '.claude', 'hooks', 'generate_session_manifest_from_hook.mjs')]
 
+// ─── Legacy state detection (Issue #1430) ─────────────────────────────────
+// PR #1426 hard-cutover intentionally does not migrate or clean up
+// pre-existing runtime state under the old (pre-#1426) layout
+// artifacts/session-manifest-debounce/{events,worker.lock}. This best-effort,
+// non-fail-close diagnostic surfaces detection of legacy residue via a fixed
+// single-line stderr schema so operators/tooling can observe it without the
+// hook failing closed. Detection is anchored to REPO_ROOT (which already
+// resolves CLAUDE_PROJECT_DIR) and is intentionally independent of any
+// current-layout override such as SESSION_MANIFEST_DEBOUNCE_DIR -- legacy
+// paths never change identity when the current runtime base is redirected
+// (e.g. by tests).
+const LEGACY_DEBOUNCE_STATE_DIR = join(REPO_ROOT, 'artifacts', 'session-manifest-debounce')
+const LEGACY_EVENTS_DIR = join(LEGACY_DEBOUNCE_STATE_DIR, 'events')
+const LEGACY_WORKER_LOCK = join(LEGACY_DEBOUNCE_STATE_DIR, 'worker.lock')
+
+function toRepoRelative(pathname) {
+  return relative(REPO_ROOT, pathname).replace(/\\/g, '/')
+}
+
+function emitLegacyStateDiagnostic(legacyKind, paths) {
+  // Field order (status, legacy_kind, paths, detected_at) is fixed by the
+  // Issue #1430 contract and intentionally places legacy_kind before paths
+  // so that a coordinator-side truncation to the first N characters of the
+  // line still preserves the legacy_kind value even if paths is long.
+  const diagnostic = {
+    status: 'legacy_state_detected',
+    legacy_kind: legacyKind,
+    paths,
+    detected_at: new Date().toISOString(),
+  }
+  process.stderr.write(`SESSION_MANIFEST_LEGACY_STATE_V1=${JSON.stringify(diagnostic)}\n`)
+}
+
+function detectAndEmitLegacyDebounceState() {
+  try {
+    if (existsSync(LEGACY_EVENTS_DIR)) {
+      emitLegacyStateDiagnostic('debounce_events_dir', [toRepoRelative(LEGACY_EVENTS_DIR)])
+    }
+    if (existsSync(LEGACY_WORKER_LOCK)) {
+      emitLegacyStateDiagnostic('debounce_worker_lock', [toRepoRelative(LEGACY_WORKER_LOCK)])
+    }
+  } catch {
+    // Detection must never fail-close the hook; swallow any fs error.
+  }
+}
+
 function readStdin() {
   return new Promise((resolvePromise) => {
     let data = ''
@@ -485,6 +531,11 @@ async function flushWithLockHandling() {
 }
 
 async function main() {
+  // Issue #1430: startup legacy-state detection runs unconditionally, before
+  // any argv/mode dispatch, so it fires for direct invocation, --worker, and
+  // --flush alike. Detection is read-only (existsSync) and never blocks.
+  detectAndEmitLegacyDebounceState()
+
   if (process.argv[2] === '--worker') {
     try {
       refreshLock(WORKER_LOCK, { role: 'worker', owner_pid: process.pid })

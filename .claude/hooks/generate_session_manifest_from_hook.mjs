@@ -71,6 +71,70 @@ const LOCKS_DIR = join(ARTIFACTS_BASE_DIR, 'locks')
 const TMP_DIR = join(ARTIFACTS_BASE_DIR, 'tmp')
 const REPOSITORY = 'squne121/loop-protocol'
 
+// ─── Legacy state detection (Issue #1430) ─────────────────────────────────
+// PR #1426 hard-cutover intentionally does not migrate or clean up
+// pre-existing runtime state written directly under the repo-root
+// artifacts/ directory by the pre-#1426 producer layout:
+//   artifacts/.lock-<32hex>                         (stable-key lock file)
+//   artifacts/.tmp-<uuid>[.failed]                  (atomic-write temp file)
+//   artifacts/private-agent-session-manifest-*.json (root-level manifest)
+// This best-effort, non-fail-close diagnostic surfaces detection of that
+// residue via a fixed single-line stderr schema. Detection is anchored to
+// REPO_ROOT (which already resolves CLAUDE_PROJECT_DIR) and only inspects
+// the immediate children of artifacts/ (non-recursive) so the current-layout
+// subtree artifacts/session-manifest-runtime/ (a directory, never matching
+// the file-name grammars below) is never misclassified as legacy residue.
+const LEGACY_ARTIFACTS_ROOT_DIR = join(REPO_ROOT, 'artifacts')
+// Matches the exact filename grammar produced by the pre-#1426 producer:
+// stable key = sha256(...).slice(0, 32) (lowercase hex), and
+// randomUUID() = standard 8-4-4-4-12 lowercase-hex UUID.
+const LEGACY_LOCK_RE = /^\.lock-[0-9a-f]{32}$/
+const LEGACY_TMP_RE = /^\.tmp-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(\.failed)?$/
+const LEGACY_ROOT_MANIFEST_RE = /^private-agent-session-manifest-[a-z]+-\d+-[0-9a-f]{32}\.json$/
+
+function toRepoRelative(pathname) {
+  return relative(REPO_ROOT, pathname).replace(/\\/g, '/')
+}
+
+function emitLegacyStateDiagnostic(legacyKind, paths) {
+  // Field order (status, legacy_kind, paths, detected_at) is fixed by the
+  // Issue #1430 contract and intentionally places legacy_kind before paths
+  // so that a coordinator-side truncation to the first N characters of the
+  // line still preserves the legacy_kind value even if paths is long.
+  const diagnostic = {
+    status: 'legacy_state_detected',
+    legacy_kind: legacyKind,
+    paths,
+    detected_at: new Date().toISOString(),
+  }
+  process.stderr.write(`SESSION_MANIFEST_LEGACY_STATE_V1=${JSON.stringify(diagnostic)}\n`)
+}
+
+function detectAndEmitLegacyProducerState() {
+  try {
+    if (!existsSync(LEGACY_ARTIFACTS_ROOT_DIR)) return
+    const entries = readdirSync(LEGACY_ARTIFACTS_ROOT_DIR)
+
+    const lockTmpMatches = entries.filter((name) => LEGACY_LOCK_RE.test(name) || LEGACY_TMP_RE.test(name))
+    if (lockTmpMatches.length > 0) {
+      emitLegacyStateDiagnostic(
+        'producer_lock_tmp',
+        lockTmpMatches.map((name) => toRepoRelative(join(LEGACY_ARTIFACTS_ROOT_DIR, name))),
+      )
+    }
+
+    const manifestMatches = entries.filter((name) => LEGACY_ROOT_MANIFEST_RE.test(name))
+    if (manifestMatches.length > 0) {
+      emitLegacyStateDiagnostic(
+        'producer_root_manifest',
+        manifestMatches.map((name) => toRepoRelative(join(LEGACY_ARTIFACTS_ROOT_DIR, name))),
+      )
+    }
+  } catch {
+    // Detection must never fail-close the hook; swallow any fs error.
+  }
+}
+
 // Event-type to phase mapping
 const EVENT_PHASE_MAP = {
   Stop: { mainLoop: 'impl', ledgerPhase: 'post_commit_verification' },
@@ -398,6 +462,11 @@ export function buildProducerArgs({
 let _activeLockPath = null
 
 async function main() {
+  // Issue #1430: startup legacy-state detection runs unconditionally, before
+  // stdin/lock/producer processing. Detection is read-only (existsSync /
+  // readdirSync) and never blocks.
+  detectAndEmitLegacyProducerState()
+
   // Read hook context from stdin
   const hookCtx = await readStdin()
 
