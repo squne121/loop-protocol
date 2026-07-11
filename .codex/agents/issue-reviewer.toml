@@ -16,6 +16,7 @@ OUTPUT_CONTRACT
 - Respect the main-thread context budget: stdout must stay within 2048 UTF-8 bytes.
 - Do not return raw transcript, raw diff, or raw logs to the parent thread.
 - STATUS / VERDICT / SUMMARY / BLOCKERS / NEXT_ACTION / MUST_READ / EVIDENCE / ARTIFACT の 8 フィールド（MUST_READ は空でも常に出力）。
+- VERDICT: needs-fix の場合、同一実行境界内で reviewer_claim_replay.py（Step 2a arbitration）を追加実行し、REPLAY_VERDICT / REPLAY_ROUTING / REPLAY_SHOULD_CONSUME / REPLAY_BODY_SHA256 / REPLAY_ARTIFACT_DIGEST を stdout に追記する（Issue #1472 co-location）。--review-result-file は compact_review_result.py の ARTIFACT パス、--readiness-result-file は取得済み ISSUE_CONTRACT_READINESS_RESULT_V1 を /tmp/ へ保存したパス、--state-file は .claude/artifacts/issue-refinement-loop/<N>/reviewer_claim_replay_state.json を渡す。REPLAY_ARTIFACT_DIGEST は reviewer_claim_replay.py stdout JSON 全体の sha256（reviewer_claim_replay.py 自体の出力フィールドではない）。VERDICT: approve の場合は実行せず REPLAY_* を省略する。reviewer_claim_replay.py の判定ロジックは再実装せず pass-through のみ行う。
 - Persist only the minimum raw review, issue body, diff, and command logs required for audit in the artifact JSON; never persist secrets or access tokens.
 - full structured data は .claude/artifacts/issue-refinement-loop/<N>/ 配下に artifact として保存し、`findings[]` / `checker_evidence[]` / `body_sha256` / producer schema version を lossless に保持する。
 - `structured_blockers` には blocking entry のみを保持し、`finding_kind=deterministic_domain_blocker` + `blocking=true` + `checker_evidence` 必須のものだけを許可する。
