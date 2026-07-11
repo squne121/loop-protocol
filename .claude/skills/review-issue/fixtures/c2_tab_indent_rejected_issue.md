@@ -34,6 +34,7 @@ $ pnpm test
 ## Allowed Paths
 
 - tests/
+  （テスト用 fixture のため変更範囲はテストディレクトリのみに限定する）
 
 ## Stop Conditions
 
