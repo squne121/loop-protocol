@@ -20,13 +20,23 @@ AC coverage:
   AC6  the emitted diagnostic line survives session_manifest_coordinator.sh's
        sanitize_stderr() transform (path redaction + first-line 220-char
        truncation) with legacy_kind still recoverable.
+  AC8  the diagnostic line is ordered AFTER an existing
+       SESSION_MANIFEST_DEBOUNCE_RESULT_V1 result line, so a coordinator-side
+       "first line only" truncation never hides the result line.
+  AC10 producer failure during a debounce flush does not delete the queued
+       event files (they remain pending for a later retry).
+  AC13 the same residue does not re-trigger the diagnostic on a second,
+       later invocation (duplicate-suppression marker).
 """
 
 import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(
     subprocess.run(
@@ -40,6 +50,7 @@ REPO_ROOT = Path(
 DEBOUNCE_PATH = REPO_ROOT / ".claude" / "hooks" / "session_manifest_debounce.mjs"
 
 LEGACY_DIAGNOSTIC_PREFIX = "SESSION_MANIFEST_LEGACY_STATE_V1="
+RESULT_PREFIX = "SESSION_MANIFEST_DEBOUNCE_RESULT_V1="
 
 
 def make_env(project_root: Path) -> dict[str, str]:
@@ -190,3 +201,155 @@ def test_legacy_state_survives_coordinator_truncation(tmp_path: Path):
     assert "debounce_events_dir" in transformed, (
         f"legacy_kind not recoverable after coordinator-style truncation: {transformed!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# AC8: legacy diagnostic ordered after an existing result line
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_diagnostic_does_not_shadow_existing_result_line(tmp_path: Path):
+    """
+    When --flush emits an existing SESSION_MANIFEST_DEBOUNCE_RESULT_V1 result
+    line (from a successful producer call) AND legacy-layout residue is
+    present, the legacy diagnostic must be ordered strictly AFTER the result
+    line. A coordinator that only keeps the first non-empty stderr line as
+    its `detail=` field must therefore still see the RESULT_V1 line, not the
+    legacy diagnostic (PR #1440 review P1-1).
+    """
+    legacy_events_dir = tmp_path / "artifacts" / "session-manifest-debounce" / "events"
+    legacy_events_dir.mkdir(parents=True)
+
+    runtime_dir = tmp_path / "current-runtime"
+    events_dir = runtime_dir / "events"
+    events_dir.mkdir(parents=True)
+    (events_dir / "1-pending.json").write_text(
+        json.dumps(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "ac8-test",
+                "session_manifest_delta": [
+                    {"mutation_type": "write", "relative_paths": ["docs/dev/x.md"]}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    producer = tmp_path / "producer.sh"
+    producer.write_text("#!/usr/bin/env bash\ncat >/dev/null\nexit 0\n", encoding="utf-8")
+    producer.chmod(0o755)
+
+    env = make_env(tmp_path)
+    env["SESSION_MANIFEST_DEBOUNCE_PRODUCER_CMD"] = str(producer)
+    env["SESSION_MANIFEST_DEBOUNCE_PRODUCER_ARGS_JSON"] = "[]"
+    env["SESSION_MANIFEST_DEBOUNCE_FLUSH_WAIT_MS"] = "3000"
+
+    result = subprocess.run(
+        ["node", str(DEBOUNCE_PATH), "--flush"],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, f"--flush failed: {result.stderr}"
+
+    lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
+    result_indices = [i for i, line in enumerate(lines) if line.startswith(RESULT_PREFIX)]
+    legacy_indices = [i for i, line in enumerate(lines) if line.startswith(LEGACY_DIAGNOSTIC_PREFIX)]
+
+    assert result_indices, f"expected an existing result line, got: {lines}"
+    assert legacy_indices, f"expected a legacy diagnostic line, got: {lines}"
+    assert max(result_indices) < min(legacy_indices), (
+        f"legacy diagnostic must not precede the existing result line (AC8): {lines}"
+    )
+
+    # Coordinator-style: sanitize_stderr keeps only the FIRST non-empty line
+    # as the `detail=` field -- it must be the existing result line.
+    first_line = lines[0]
+    assert first_line.startswith(RESULT_PREFIX), (
+        f"first stderr line must be the existing result line, not the legacy "
+        f"diagnostic (AC8 violated): {first_line!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC10: producer failure does not delete queued events
+# ---------------------------------------------------------------------------
+
+
+def test_queued_event_not_deleted_on_producer_failure(tmp_path: Path):
+    producer = tmp_path / "producer.sh"
+    producer.write_text("#!/usr/bin/env bash\ncat >/dev/null\nexit 1\n", encoding="utf-8")
+    producer.chmod(0o755)
+
+    env = make_env(tmp_path)
+    env["SESSION_MANIFEST_DEBOUNCE_PRODUCER_CMD"] = str(producer)
+    env["SESSION_MANIFEST_DEBOUNCE_PRODUCER_ARGS_JSON"] = "[]"
+    env["SESSION_MANIFEST_DEBOUNCE_FLUSH_WAIT_MS"] = "3000"
+
+    runtime_dir = tmp_path / "current-runtime"
+    events_dir = runtime_dir / "events"
+    events_dir.mkdir(parents=True)
+    now_ms = int(time.time() * 1000)
+    event_file = events_dir / f"{now_ms}-pending.json"
+    event_file.write_text(
+        json.dumps(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "ac10-test",
+                "session_manifest_delta": [
+                    {"mutation_type": "write", "relative_paths": ["docs/dev/y.md"]}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["node", str(DEBOUNCE_PATH), "--flush"],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, f"--flush unexpectedly fail-closed: {result.stderr}"
+
+    remaining = sorted(events_dir.glob("*.json"))
+    assert remaining, (
+        f"queued event was deleted despite producer failure -- AC10 violated: {result.stderr}"
+    )
+    assert event_file in remaining
+
+
+# ---------------------------------------------------------------------------
+# AC13: duplicate-residue diagnostic suppressed on repeat invocation
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_residue_diagnostic_suppressed_on_repeat_invocation(tmp_path: Path):
+    legacy_events_dir = tmp_path / "artifacts" / "session-manifest-debounce" / "events"
+    legacy_events_dir.mkdir(parents=True)
+
+    first = run_front_gate_readonly(tmp_path)
+    assert first.returncode == 0
+    first_diagnostics = extract_legacy_diagnostics(first.stderr)
+    matching_first = [d for d in first_diagnostics if d.get("legacy_kind") == "debounce_events_dir"]
+    assert matching_first, f"expected diagnostic on first invocation: {first.stderr}"
+
+    second = run_front_gate_readonly(tmp_path)
+    assert second.returncode == 0
+    second_diagnostics = extract_legacy_diagnostics(second.stderr)
+    matching_second = [d for d in second_diagnostics if d.get("legacy_kind") == "debounce_events_dir"]
+    assert not matching_second, (
+        f"expected suppressed diagnostic on repeat invocation with unchanged "
+        f"residue (AC13 violated), got: {matching_second}"
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /* global process */
 
-import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, openSync, closeSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { existsSync, lstatSync, mkdirSync, openSync, closeSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn, spawnSync } from 'node:child_process'
@@ -52,31 +52,179 @@ const LEGACY_DEBOUNCE_STATE_DIR = join(REPO_ROOT, 'artifacts', 'session-manifest
 const LEGACY_EVENTS_DIR = join(LEGACY_DEBOUNCE_STATE_DIR, 'events')
 const LEGACY_WORKER_LOCK = join(LEGACY_DEBOUNCE_STATE_DIR, 'worker.lock')
 
+// Issue #1430 AC14: the front gate also scans for pre-#1426 *producer*-layout
+// legacy residue (normally detected by generate_session_manifest_from_hook.mjs)
+// so that it is observed on the SYNCHRONOUS front-gate stderr, independent of
+// the detached (`stdio: 'ignore'`) --worker child that would otherwise
+// swallow it (PR #1440 review P1-2). Regex grammar mirrors
+// generate_session_manifest_from_hook.mjs (AC11: strict RFC4122 v4 UUID,
+// known hook-name grammar for root manifests).
+const LEGACY_ARTIFACTS_ROOT_DIR = join(REPO_ROOT, 'artifacts')
+const LEGACY_LOCK_RE = /^\.lock-[0-9a-f]{32}$/
+const LEGACY_TMP_RE = /^\.tmp-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(\.failed)?$/
+const LEGACY_ROOT_MANIFEST_RE = /^private-agent-session-manifest-(stop|subagentstop|posttooluse)-\d+-[0-9a-f]{32}\.json$/
+
+// Issue #1430 AC9: bound the number of paths embedded in a single diagnostic
+// line so it never approaches spawnSync's default 1 MiB maxBuffer.
+const LEGACY_PATHS_BOUND = 20
+
+// Issue #1430 AC13: duplicate-residue suppression markers live under the
+// current-layout runtime subtree (never the legacy paths themselves).
+const LEGACY_MARKER_DIR = join(STATE_DIR, 'legacy-state-markers')
+
+// Issue #1430 AC8: legacy diagnostics are buffered and flushed to stderr
+// only after all other stderr writes for this invocation, so that
+// coordinator-side "first line only" truncation never hides an existing
+// SESSION_MANIFEST_DEBOUNCE_RESULT_V1 (or similar) result line.
+const _pendingLegacyDiagnosticLines = []
+
 function toRepoRelative(pathname) {
   return relative(REPO_ROOT, pathname).replace(/\\/g, '/')
 }
 
-function emitLegacyStateDiagnostic(legacyKind, paths) {
+function legacyMarkerPath(legacyKind, paths) {
+  const material = `${legacyKind}:${[...paths].sort().join(',')}`
+  const digest = createHash('sha256').update(material).digest('hex').slice(0, 32)
+  return join(LEGACY_MARKER_DIR, `${legacyKind}-${digest}.marker`)
+}
+
+function shouldSuppressDuplicateLegacyDiagnostic(legacyKind, paths) {
+  try {
+    const markerPath = legacyMarkerPath(legacyKind, paths)
+    if (existsSync(markerPath)) return true
+    mkdirSync(LEGACY_MARKER_DIR, { recursive: true })
+    writeFileSync(markerPath, JSON.stringify({ legacy_kind: legacyKind, marked_at: new Date().toISOString() }), 'utf8')
+    return false
+  } catch {
+    // Marker bookkeeping must never fail-close or suppress a genuine
+    // diagnostic; on any error, fail open (do not suppress).
+    return false
+  }
+}
+
+function buildLegacyDiagnosticPayload(legacyKind, allPaths) {
+  const totalCount = allPaths.length
+  const truncated = totalCount > LEGACY_PATHS_BOUND
+  const paths = truncated ? allPaths.slice(0, LEGACY_PATHS_BOUND) : allPaths
   // Field order (status, legacy_kind, paths, detected_at) is fixed by the
   // Issue #1430 contract and intentionally places legacy_kind before paths
   // so that a coordinator-side truncation to the first N characters of the
   // line still preserves the legacy_kind value even if paths is long.
-  const diagnostic = {
+  return {
     status: 'legacy_state_detected',
     legacy_kind: legacyKind,
     paths,
     detected_at: new Date().toISOString(),
+    total_count: totalCount,
+    truncated,
   }
-  process.stderr.write(`SESSION_MANIFEST_LEGACY_STATE_V1=${JSON.stringify(diagnostic)}\n`)
+}
+
+function queueLegacyDiagnostic(legacyKind, rawPaths) {
+  try {
+    if (shouldSuppressDuplicateLegacyDiagnostic(legacyKind, rawPaths)) return
+    const payload = buildLegacyDiagnosticPayload(legacyKind, rawPaths)
+    _pendingLegacyDiagnosticLines.push(`SESSION_MANIFEST_LEGACY_STATE_V1=${JSON.stringify(payload)}\n`)
+  } catch {
+    // Detection must never fail-close the hook; swallow any fs error.
+  }
+}
+
+function queueLegacyScanFailure(legacyKind, path, error) {
+  try {
+    const payload = {
+      status: 'scan_failed',
+      legacy_kind: legacyKind,
+      path,
+      reason: (error && error.code) || 'unknown_error',
+      detected_at: new Date().toISOString(),
+    }
+    _pendingLegacyDiagnosticLines.push(`SESSION_MANIFEST_LEGACY_SCAN_V1=${JSON.stringify(payload)}\n`)
+  } catch {
+    // Detection must never fail-close the hook; swallow any fs error.
+  }
+}
+
+function flushPendingLegacyDiagnostics() {
+  for (const line of _pendingLegacyDiagnosticLines) {
+    process.stderr.write(line)
+  }
+  _pendingLegacyDiagnosticLines.length = 0
+}
+
+// Issue #1430 AC12: distinguish file type without following symlinks
+// (lstatSync) so a directory or symlink masquerading under a legacy path
+// name is never misclassified as legacy residue, and fs access errors
+// (e.g. EACCES) are reported as scan_failed rather than silently treated
+// as "absent".
+function scanLegacyPath(pathname, expectedType) {
+  let stat
+  try {
+    stat = lstatSync(pathname, { throwIfNoEntry: false })
+  } catch (error) {
+    return { kind: 'scan_failed', error }
+  }
+  if (stat === undefined) return { kind: 'absent' }
+  if (expectedType === 'directory' && stat.isDirectory()) return { kind: 'present' }
+  if (expectedType === 'file' && stat.isFile()) return { kind: 'present' }
+  return { kind: 'absent' }
 }
 
 function detectAndEmitLegacyDebounceState() {
   try {
-    if (existsSync(LEGACY_EVENTS_DIR)) {
-      emitLegacyStateDiagnostic('debounce_events_dir', [toRepoRelative(LEGACY_EVENTS_DIR)])
+    const eventsScan = scanLegacyPath(LEGACY_EVENTS_DIR, 'directory')
+    if (eventsScan.kind === 'present') {
+      queueLegacyDiagnostic('debounce_events_dir', [toRepoRelative(LEGACY_EVENTS_DIR)])
+    } else if (eventsScan.kind === 'scan_failed') {
+      queueLegacyScanFailure('debounce_events_dir', toRepoRelative(LEGACY_EVENTS_DIR), eventsScan.error)
     }
-    if (existsSync(LEGACY_WORKER_LOCK)) {
-      emitLegacyStateDiagnostic('debounce_worker_lock', [toRepoRelative(LEGACY_WORKER_LOCK)])
+
+    const lockScan = scanLegacyPath(LEGACY_WORKER_LOCK, 'file')
+    if (lockScan.kind === 'present') {
+      queueLegacyDiagnostic('debounce_worker_lock', [toRepoRelative(LEGACY_WORKER_LOCK)])
+    } else if (lockScan.kind === 'scan_failed') {
+      queueLegacyScanFailure('debounce_worker_lock', toRepoRelative(LEGACY_WORKER_LOCK), lockScan.error)
+    }
+  } catch {
+    // Detection must never fail-close the hook; swallow any fs error.
+  }
+}
+
+// Issue #1430 AC14: the front gate independently scans for producer-layout
+// legacy residue (normally the responsibility of
+// generate_session_manifest_from_hook.mjs) so it is observable on the
+// synchronous front-gate invocation's own stderr even when the detached
+// --worker child (which may eventually spawn the producer) has
+// `stdio: 'ignore'` in production.
+function detectAndEmitLegacyProducerState() {
+  let dirents
+  try {
+    if (!existsSync(LEGACY_ARTIFACTS_ROOT_DIR)) return
+    dirents = readdirSync(LEGACY_ARTIFACTS_ROOT_DIR, { withFileTypes: true })
+  } catch (error) {
+    queueLegacyScanFailure('producer_lock_tmp', toRepoRelative(LEGACY_ARTIFACTS_ROOT_DIR), error)
+    return
+  }
+
+  try {
+    const lockTmpMatches = dirents
+      .filter((entry) => entry.isFile() && (LEGACY_LOCK_RE.test(entry.name) || LEGACY_TMP_RE.test(entry.name)))
+      .map((entry) => entry.name)
+    if (lockTmpMatches.length > 0) {
+      queueLegacyDiagnostic(
+        'producer_lock_tmp',
+        lockTmpMatches.map((name) => toRepoRelative(join(LEGACY_ARTIFACTS_ROOT_DIR, name))),
+      )
+    }
+
+    const manifestMatches = dirents
+      .filter((entry) => entry.isFile() && LEGACY_ROOT_MANIFEST_RE.test(entry.name))
+      .map((entry) => entry.name)
+    if (manifestMatches.length > 0) {
+      queueLegacyDiagnostic(
+        'producer_root_manifest',
+        manifestMatches.map((name) => toRepoRelative(join(LEGACY_ARTIFACTS_ROOT_DIR, name))),
+      )
     }
   } catch {
     // Detection must never fail-close the hook; swallow any fs error.
@@ -375,16 +523,17 @@ function runProducer(payload) {
   }
   const timedOut = result.error?.code === 'ETIMEDOUT' || result.signal === 'SIGKILL'
   const reasonCode = timedOut ? 'producer_timeout' : result.status === 0 ? null : 'producer_failed'
+  const ok = result.status === 0 && !timedOut
   process.stderr.write(
     `SESSION_MANIFEST_DEBOUNCE_RESULT_V1=${JSON.stringify({
-      status: result.status === 0 && !timedOut ? 'ok' : 'warn',
+      status: ok ? 'ok' : 'warn',
       producer_status: result.status ?? 0,
       reason_code: reasonCode,
       stderr_lines: lines.length,
       timed_out: timedOut,
     })}\n`,
   )
-  return { ...result, timedOut, reasonCode }
+  return { ...result, timedOut, reasonCode, ok }
 }
 
 /**
@@ -403,8 +552,12 @@ function runProducer(payload) {
  *   Returns pending events as {timestamp} objects for quiet-window check.
  * @param {() => Array<object>} deps.readEvents
  *   Returns full event payloads for delta aggregation.
- * @param {(payload: object) => void} deps.runProducer
- *   Invokes the producer with the aggregated payload.
+ * @param {(payload: object) => (object|void)} deps.runProducer
+ *   Invokes the producer with the aggregated payload. May optionally return
+ *   an object with an `ok` boolean (Issue #1430 AC10); when `ok === false`
+ *   the queued events are NOT removed so they are retried on a later flush.
+ *   Returning nothing (undefined) preserves the pre-#1430 behavior of always
+ *   removing events after the producer call.
  * @param {() => void} deps.removeEvents
  *   Removes (clears) all pending events after a successful producer call.
  * @param {number} deps.windowMs
@@ -445,7 +598,7 @@ export async function runFlushLoopCore(
       }
     }
     const latest = payloads[payloads.length - 1]
-    callProducer({
+    const producerResult = callProducer({
       hook_event_name: 'PostToolUse',
       tool_name: 'DebounceBatch',
       session_id: latest?.session_id ?? null,
@@ -454,6 +607,12 @@ export async function runFlushLoopCore(
       debounce_event_count: payloads.length,
       debounce_flush_reason: force ? 'forced_flush' : 'debounced',
     })
+    // Issue #1430 AC10: on an explicit producer failure, do not remove the
+    // queued event files -- they remain pending so a later flush attempt can
+    // retry them instead of silently losing telemetry.
+    if (producerResult && producerResult.ok === false) {
+      break
+    }
     removeEvents()
     if (force) continue
   }
@@ -477,7 +636,7 @@ async function flushLoop(opts = {}) {
       listEventFiles().map((file) => JSON.parse(readFileSync(file, 'utf8'))),
     runProducer: (payload) => {
       refreshLock(WORKER_LOCK);
-      runProducer(payload);
+      return runProducer(payload);
     },
     removeEvents: () => {
       for (const file of listEventFiles()) {
@@ -531,54 +690,62 @@ async function flushWithLockHandling() {
 }
 
 async function main() {
-  // Issue #1430: startup legacy-state detection runs unconditionally, before
-  // any argv/mode dispatch, so it fires for direct invocation, --worker, and
-  // --flush alike. Detection is read-only (existsSync) and never blocks.
-  detectAndEmitLegacyDebounceState()
+  try {
+    // Issue #1430: startup legacy-state detection runs unconditionally, before
+    // any argv/mode dispatch, so it fires for direct invocation, --worker, and
+    // --flush alike. Detection is read-only (lstatSync/readdirSync) and never
+    // blocks. Diagnostics are only *queued* here (AC8); they are written to
+    // stderr by the `finally` block below, after any other stderr output this
+    // invocation produces.
+    detectAndEmitLegacyDebounceState()
+    detectAndEmitLegacyProducerState()
 
-  if (process.argv[2] === '--worker') {
-    try {
-      refreshLock(WORKER_LOCK, { role: 'worker', owner_pid: process.pid })
-      await flushLoop({ force: false })
-    } finally {
-      release(WORKER_LOCK)
+    if (process.argv[2] === '--worker') {
+      try {
+        refreshLock(WORKER_LOCK, { role: 'worker', owner_pid: process.pid })
+        await flushLoop({ force: false })
+      } finally {
+        release(WORKER_LOCK)
+      }
+      return
     }
-    return
-  }
 
-  if (process.argv[2] === '--flush') {
-    process.exitCode = await flushWithLockHandling()
-    return
-  }
-
-  const hookCtx = await readStdin()
-  if (!hookCtx || (hookCtx.hook_event_name ?? hookCtx.type) !== 'PostToolUse') return
-  const result = queueEvent(hookCtx)
-  if (!result.queued) return
-  if (tryAcquire(WORKER_LOCK, 'worker')) {
-    try {
-      const child = spawn(process.execPath, [SCRIPT_PATH, '--worker'], {
-        detached: true,
-        stdio: 'ignore',
-        env: process.env,
-      })
-      writeLockMetadata(
-        WORKER_LOCK,
-        buildLockMetadata('worker', {
-          owner_pid: child.pid,
-        }),
-      )
-      child.unref()
-    } catch (error) {
-      release(WORKER_LOCK)
-      process.stderr.write(
-        `SESSION_MANIFEST_DEBOUNCE_RESULT_V1=${JSON.stringify({
-          status: 'warn',
-          reason_code: 'spawn_failed',
-          detail: sanitizeForStderr(error.message),
-        })}\n`,
-      )
+    if (process.argv[2] === '--flush') {
+      process.exitCode = await flushWithLockHandling()
+      return
     }
+
+    const hookCtx = await readStdin()
+    if (!hookCtx || (hookCtx.hook_event_name ?? hookCtx.type) !== 'PostToolUse') return
+    const result = queueEvent(hookCtx)
+    if (!result.queued) return
+    if (tryAcquire(WORKER_LOCK, 'worker')) {
+      try {
+        const child = spawn(process.execPath, [SCRIPT_PATH, '--worker'], {
+          detached: true,
+          stdio: 'ignore',
+          env: process.env,
+        })
+        writeLockMetadata(
+          WORKER_LOCK,
+          buildLockMetadata('worker', {
+            owner_pid: child.pid,
+          }),
+        )
+        child.unref()
+      } catch (error) {
+        release(WORKER_LOCK)
+        process.stderr.write(
+          `SESSION_MANIFEST_DEBOUNCE_RESULT_V1=${JSON.stringify({
+            status: 'warn',
+            reason_code: 'spawn_failed',
+            detail: sanitizeForStderr(error.message),
+          })}\n`,
+        )
+      }
+    }
+  } finally {
+    flushPendingLegacyDiagnostics()
   }
 }
 
