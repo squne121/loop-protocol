@@ -452,6 +452,55 @@ describe('chatgpt retro context marker helper', () => {
         }
         return []
       },
+      listPullRequestReviewsPage: async () => ({
+        items: [
+          {
+            id: 4671349811,
+            node_id: 'PRR_kwDOSfQcDc8AAAABFm8kMw',
+            state: 'COMMENTED',
+            commit_id: '5190a306c3795bd2762ca218dd173a663207cfad',
+            submitted_at: '2026-07-10T12:27:19Z',
+            html_url: 'https://github.com/squne121/loop-protocol/pull/1224#pullrequestreview-4671349811',
+          },
+        ],
+        hasNextPage: false,
+      }),
+      listPullRequestReviewCommentsPage: async () => ({
+        items: [
+          {
+            id: 3558855703,
+            node_id: 'PRRC_kwDOSfQcDc7UH9QX',
+            pull_request_review_id: 4671349811,
+            path: 'docs/dev/agent-retro-index.md',
+            line: 100,
+            commit_id: '5190a306c3795bd2762ca218dd173a663207cfad',
+            created_at: '2026-07-10T12:27:19Z',
+            updated_at: '2026-07-10T12:27:19Z',
+            html_url: 'https://github.com/squne121/loop-protocol/pull/1224#discussion_r3558855703',
+          },
+        ],
+        hasNextPage: false,
+      }),
+      listPullRequestReviewThreadsPage: async () => ({
+        items: [
+          {
+            id: 'PRRT_kwDOSfQcDc6P4Sca',
+            isResolved: true,
+            isOutdated: false,
+            path: 'docs/dev/agent-retro-index.md',
+            line: 100,
+            subjectType: 'LINE',
+            comments: {
+              totalCount: 1,
+              pageInfo: {
+                hasNextPage: false,
+              },
+            },
+          },
+        ],
+        hasNextPage: false,
+        endCursor: null,
+      }),
     }
 
     await expect(resolveChatgptRetroContextLive(client, {
@@ -473,6 +522,12 @@ describe('chatgpt retro context marker helper', () => {
       matched_comment_count: 1,
       evidence_ref_count: 1,
       source_manifest_count: 3,
+      pr_review_surface: {
+        status: 'resolved',
+        review_count: 1,
+        review_comment_count: 1,
+        resolved_thread_count: 1,
+      },
     })
   })
 
@@ -496,6 +551,80 @@ describe('chatgpt retro context marker helper', () => {
       status: 'blocked_malformed_marker_syntax',
       marker_comment: {
         id: 7,
+      },
+    })
+  })
+
+  it('GIVEN the context chain is malformed but the PR review surface resolves WHEN resolving live THEN top-level status stays blocked_malformed_marker_syntax', async () => {
+    const client = {
+      listIssueComments: async () => [
+        {
+          id: 7,
+          html_url: 'https://github.com/squne121/loop-protocol/pull/1224#issuecomment-7',
+          body: '<!-- CHATGPT_RETRO_CONTEXT_V1 repo=squne121/loop-protocol target=pull_request:1224 parent_issue=1153 trailing -->',
+        },
+      ],
+      listPullRequestReviewsPage: async () => ({
+        items: [
+          {
+            id: 4671349811,
+            node_id: 'PRR_kwDOSfQcDc8AAAABFm8kMw',
+            state: 'COMMENTED',
+            commit_id: '5190a306c3795bd2762ca218dd173a663207cfad',
+            submitted_at: '2026-07-10T12:27:19Z',
+            html_url: 'https://github.com/squne121/loop-protocol/pull/1224#pullrequestreview-4671349811',
+          },
+        ],
+        hasNextPage: false,
+      }),
+      listPullRequestReviewCommentsPage: async () => ({
+        items: [
+          {
+            id: 3558855703,
+            node_id: 'PRRC_kwDOSfQcDc7UH9QX',
+            pull_request_review_id: 4671349811,
+            path: 'docs/dev/agent-retro-index.md',
+            line: 100,
+            commit_id: '5190a306c3795bd2762ca218dd173a663207cfad',
+            created_at: '2026-07-10T12:27:19Z',
+            updated_at: '2026-07-10T12:27:19Z',
+            html_url: 'https://github.com/squne121/loop-protocol/pull/1224#discussion_r3558855703',
+          },
+        ],
+        hasNextPage: false,
+      }),
+      listPullRequestReviewThreadsPage: async () => ({
+        items: [
+          {
+            id: 'PRRT_kwDOSfQcDc6P4Sca',
+            isResolved: true,
+            isOutdated: false,
+            path: 'docs/dev/agent-retro-index.md',
+            line: 100,
+            subjectType: 'LINE',
+            comments: {
+              totalCount: 1,
+              pageInfo: {
+                hasNextPage: false,
+              },
+            },
+          },
+        ],
+        hasNextPage: false,
+        endCursor: null,
+      }),
+    }
+
+    await expect(resolveChatgptRetroContextLive(client, {
+      repo: 'squne121/loop-protocol',
+      targetType: 'pull_request',
+      targetNumber: 1224,
+      parentIssue: 1153,
+    })).resolves.toMatchObject({
+      status: 'blocked_malformed_marker_syntax',
+      comment_chain_status: 'blocked_malformed_marker_syntax',
+      pr_review_surface: {
+        status: 'resolved',
       },
     })
   })

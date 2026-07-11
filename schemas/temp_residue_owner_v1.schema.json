@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.local/schemas/temp_residue_owner_v1.schema.json",
+  "title": "Temp Residue Owner V1",
+  "description": "Schema for temp_residue_owner/v1 ownership marker files placed inside a repo-approved temporary root (tmp/, .claude/tmp/) session subdirectory. A valid marker is advisory only: it is used by temp_residue_classifier.py to distinguish an agent-owned session subdirectory from unowned residue, so the classifier can suggest recommendation=eligible_for_delete instead of report_only. A valid marker is NEVER deletion authorization by itself — a separate deletion executor (out of scope for this schema) must re-verify ownership, Git state, and path containment immediately before any destructive operation. This document implements the accidental-isolation threat model only: it protects against unintentional cross-agent deletion within the same OS user, not against an adversarial process on the same host.",
+  "type": "object",
+  "required": [
+    "schema",
+    "marker_id",
+    "repository",
+    "session_id",
+    "target_relpath",
+    "created_at",
+    "expires_at",
+    "nonce",
+    "producer"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "temp_residue_owner/v1"
+    },
+    "marker_id": {
+      "type": "string",
+      "pattern": "^tro-[0-9a-fA-F-]{8,}$"
+    },
+    "repository": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^/]+/[^/]+$"
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "target_relpath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(tmp|\\.claude/tmp)/[^/]+$"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "nonce": {
+      "type": "string",
+      "minLength": 8
+    },
+    "producer": {
+      "type": "object",
+      "required": ["kind", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["self_claim", "trusted_materializer"]
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

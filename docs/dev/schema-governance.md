@@ -45,8 +45,61 @@ related_issue: "#135"
 | `pr_body_schema/schema_consumer_inventory/v1` | `.github/pull_request_template.md`, `.claude/skills/open-pr/SKILL.md` | PR author / open-pr skill | pr-review-judge, open-pr procedure, future open_pr.py (#170) | `rg -n "Schema Consumer Inventory\|Consumer 更新状況\|Compatibility Decision" .` |
 | `agent_session_manifest/v1` | `docs/schemas/agent-session-manifest.md` | Claude Code hook-based ledger, human/AI GitHub Issue or PR comment | pr-review-judge, impl-review-loop, pilot smoke test issue, future aggregation script | `rg -n "agent_session_manifest/v1\|agent_session_manifest:v1\|agent-session-manifest" .` |
 | `PR_REVIEW_GATE_RESULT_V1` | `.claude/skills/pr-review-judge/references/pr-review-gate-result-schema.yml` | check_pr_review_gates.py | pr-review-judge, impl-review-loop | `rg -n "PR_REVIEW_GATE_RESULT_V1\|schema_version.*RESULT" .` |
+| `temp_residue_classification/v1` | `schemas/temp_residue_classification_v1.schema.json` | `scripts/agent-ops/temp_residue_classifier.py` | post-merge-cleanup（`classify-git-state.py`）、将来の実削除 executor（out of scope） | `rg -n "temp_residue_classification/v1\|temp_residue_classifier" .` |
+| `temp_residue_owner/v1` | `schemas/temp_residue_owner_v1.schema.json` | agent session（`self_claim`）または `trusted_materializer` | `scripts/agent-ops/temp_residue_classifier.py`（marker 評価） | `rg -n "temp_residue_owner/v1\|temp_residue_marker" .` |
 | `TERMINATION_REPORT_RENDER_RESULT_V1` | `.claude/skills/issue-refinement-loop/scripts/render_termination_report.py` | render_termination_report.py | publish_termination_report.py, issue-refinement-loop Step 5 | `rg -n "TERMINATION_REPORT_RENDER_RESULT_V1" .claude/skills/issue-refinement-loop/` |
 | `delegation_audit_v1` | `.claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py`（`--audit-log` / `DELEGATION_AUDIT_LOG_PATH` で明示有効化する監査ログ JSONL） | run_gemini_headless.py（`run_delegation()` トップレベル呼び出し） | `.claude/skills/gemini-cli-headless-delegation/tests/test_delegation_audit_schema.py`（本 PR で追加した唯一の consumer。既存 `delegation_result/v1` の consumer とはファイルレベルで分離） | `rg -n "delegation_audit_v1\|DELEGATION_AUDIT_LOG_PATH\|_build_delegation_audit_record" .claude/skills/gemini-cli-headless-delegation` |
+
+## temp_residue_classification/v1 と temp_residue_owner/v1 詳細登録
+
+```yaml
+schema_id: temp_residue_classification/v1
+definition: schemas/temp_residue_classification_v1.schema.json
+related_issue: "#1417"
+producer:
+  - scripts/agent-ops/temp_residue_classifier.py
+consumer:
+  - .claude/skills/post-merge-cleanup/scripts/classify-git-state.py（temp_residue_classification field）
+  - .claude/skills/post-merge-cleanup/SKILL.md
+compatibility:
+  breaking_changes:
+    - remove_required_field
+    - rename_field
+    - narrow_type
+    - change_recommendation_semantics（report_only / eligible_for_delete の意味変更）
+detection_patterns:
+  - 'temp_residue_classification/v1'
+  - 'temp_residue_classifier'
+validation_commands:
+  - "uv run --locked pytest tests/agent_ops/test_temp_residue_classifier.py -q"
+  - "uv run --locked pytest schemas/tests/test_catalog.py -q"
+notes:
+  - "classifier は read-only。os.unlink / os.rmdir / shutil.rmtree / mutation subprocess を呼ばない。"
+  - "recommendation: eligible_for_delete は advisory であり deletion authorization ではない。"
+
+schema_id: temp_residue_owner/v1
+definition: schemas/temp_residue_owner_v1.schema.json
+related_issue: "#1417"
+producer:
+  - agent session (self_claim, デフォルト)
+  - trusted_materializer（将来の実削除 executor 設計時に導入予定。out of scope）
+consumer:
+  - scripts/agent-ops/temp_residue_classifier.py（marker evaluate）
+compatibility:
+  breaking_changes:
+    - remove_required_field
+    - rename_field
+    - narrow_type
+    - change_trust_model（accidental isolation → authorization への切替）
+detection_patterns:
+  - 'temp_residue_owner/v1'
+  - 'temp_residue_marker'
+validation_commands:
+  - "uv run --locked pytest tests/agent_ops/test_temp_residue_classifier.py -q -k owner_marker_schema"
+notes:
+  - "本 schema は accidental isolation model のみを実装する。marker は deletion authority ではない。"
+  - "duplicate JSON key・NaN/Infinity・oversized・symlink・group/other writable marker は invalid として扱う。"
+```
 
 ## TERMINATION_REPORT_RENDER_RESULT_V1 詳細登録
 

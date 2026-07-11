@@ -17,6 +17,7 @@ import hashlib
 import json
 import re
 import sys
+from dataclasses import dataclass
 from typing import Any
 
 SCHEMA_VERSION = "scope_signal_delta/v1"
@@ -41,9 +42,62 @@ SUBJECTIVE_KEYWORDS = (
 )
 
 PATH_TOKEN_RE = re.compile(r"`(?P<path>[^`\n]+)`|(?P<bare>(?:\.claude|docs|src|scripts|tests|\.github)/[^\s|`]+)")
+HEADING_RE = re.compile(r"^[ ]{0,3}##[ \t]+(?P<title>.+?)[ \t#]*$")
 
 INPUT_REQUIRED_FIELDS = ("before_body", "current_body", "after_body", "source_refs")
 INPUT_SOURCE_REF_KEYS = ("before", "current", "after")
+
+
+@dataclass(frozen=True)
+class SourceLine:
+    number: int
+    text: str
+
+
+def _leading_space_count(line: str) -> int:
+    count = 0
+    for ch in line:
+        if ch == " ":
+            count += 1
+        else:
+            break
+    return count
+
+
+def _parse_fence_opener(line: str) -> tuple[str, int] | None:
+    if _leading_space_count(line) > 3:
+        return None
+    content = line.lstrip(" ")
+    if not content or content[0] not in ("`", "~"):
+        return None
+    fence_char = content[0]
+    run_len = 0
+    for ch in content:
+        if ch == fence_char:
+            run_len += 1
+        else:
+            break
+    if run_len < 3:
+        return None
+    return fence_char, run_len
+
+
+def _is_fence_closer(line: str, fence_char: str, fence_len: int) -> bool:
+    if _leading_space_count(line) > 3:
+        return False
+    content = line.lstrip(" ").rstrip()
+    if not content or any(ch != fence_char for ch in content):
+        return False
+    return len(content) >= fence_len
+
+
+def _parse_heading(line: str) -> str | None:
+    if _leading_space_count(line) > 3:
+        return None
+    match = HEADING_RE.match(line.rstrip())
+    if not match:
+        return None
+    return match.group("title").strip()
 
 
 def _sha256(text: str) -> str:
@@ -60,7 +114,7 @@ def _canonical_json(value: Any) -> str:
     )
 
 
-def _extract_sections(text: str) -> dict[str, str]:
+def extract_sections(text: str, *, semantic_only: bool = False) -> dict[str, str]:
     sections: dict[str, str] = {}
     current_section: str | None = None
     current_content: list[str] = []
@@ -69,36 +123,31 @@ def _extract_sections(text: str) -> dict[str, str]:
     fence_len = 0
 
     for line in text.splitlines():
-        stripped = line.strip()
         if not in_fence:
-            if stripped.startswith("```") or stripped.startswith("~~~"):
-                fence_char = stripped[0]
-                fence_len = 0
-                for ch in stripped:
-                    if ch == fence_char:
-                        fence_len += 1
-                    else:
-                        break
+            opener = _parse_fence_opener(line)
+            if opener is not None:
+                fence_char, fence_len = opener
                 in_fence = True
-                if current_section is not None:
+                if current_section is not None and not semantic_only:
                     current_content.append(line)
                 continue
         else:
-            if stripped and all(ch == fence_char for ch in stripped) and len(stripped) >= fence_len:
+            if _is_fence_closer(line, fence_char, fence_len):
                 in_fence = False
                 fence_char = ""
                 fence_len = 0
-                if current_section is not None:
+                if current_section is not None and not semantic_only:
                     current_content.append(line)
                 continue
-            if current_section is not None:
+            if current_section is not None and not semantic_only:
                 current_content.append(line)
             continue
 
-        if line.startswith("## "):
+        heading = _parse_heading(line)
+        if heading is not None:
             if current_section is not None:
                 sections[current_section] = "\n".join(current_content).strip()
-            current_section = line[3:].strip()
+            current_section = heading
             current_content = []
         elif current_section is not None:
             current_content.append(line)
@@ -109,28 +158,79 @@ def _extract_sections(text: str) -> dict[str, str]:
     return sections
 
 
+def _extract_sections(text: str) -> dict[str, str]:
+    return extract_sections(text)
+
+
 def _find_section_line_offset(text: str, section_name: str) -> int:
     in_fence = False
     fence_char = ""
     fence_len = 0
     for index, line in enumerate(text.splitlines(), start=1):
-        stripped = line.strip()
         if not in_fence:
-            if stripped.startswith("```") or stripped.startswith("~~~"):
-                fence_char = stripped[0]
-                fence_len = len(stripped) - len(stripped.lstrip(fence_char))
+            opener = _parse_fence_opener(line)
+            if opener is not None:
+                fence_char, fence_len = opener
                 in_fence = True
                 continue
         else:
-            if stripped and all(ch == fence_char for ch in stripped) and len(stripped) >= fence_len:
+            if _is_fence_closer(line, fence_char, fence_len):
                 in_fence = False
                 fence_char = ""
                 fence_len = 0
             continue
 
-        if line.startswith("## ") and line[3:].strip() == section_name:
+        heading = _parse_heading(line)
+        if heading == section_name:
             return index + 1
     return 1
+
+
+def iter_section_lines(
+    text: str,
+    section_name: str,
+    *,
+    semantic_only: bool = False,
+) -> list[SourceLine]:
+    lines: list[SourceLine] = []
+    current_section: str | None = None
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+
+    for index, line in enumerate(text.splitlines(), start=1):
+        if not in_fence:
+            opener = _parse_fence_opener(line)
+            if opener is not None:
+                fence_char, fence_len = opener
+                in_fence = True
+                if current_section == section_name and not semantic_only:
+                    lines.append(SourceLine(index, line))
+                continue
+        else:
+            if _is_fence_closer(line, fence_char, fence_len):
+                in_fence = False
+                fence_char = ""
+                fence_len = 0
+                if current_section == section_name and not semantic_only:
+                    lines.append(SourceLine(index, line))
+                continue
+            if current_section == section_name and not semantic_only:
+                lines.append(SourceLine(index, line))
+            continue
+
+        heading = _parse_heading(line)
+        if heading is not None:
+            current_section = heading
+            continue
+        if current_section == section_name:
+            lines.append(SourceLine(index, line))
+
+    return lines
+
+
+def _iter_section_lines(text: str, section_name: str) -> list[SourceLine]:
+    return iter_section_lines(text, section_name)
 
 
 def _normalize_path(path: str) -> str:
@@ -140,29 +240,10 @@ def _normalize_path(path: str) -> str:
 
 
 def _extract_path_items(text: str, section_name: str) -> list[dict[str, Any]]:
-    sections = _extract_sections(text)
-    section_text = sections.get(section_name, "")
-    section_start = _find_section_line_offset(text, section_name)
     items: list[dict[str, Any]] = []
-    in_fence = False
-    fence_char = ""
-    fence_len = 0
 
-    for local_line, raw_line in enumerate(section_text.splitlines(), start=0):
-        stripped = raw_line.strip()
-        if not in_fence:
-            if stripped.startswith("```") or stripped.startswith("~~~"):
-                fence_char = stripped[0]
-                fence_len = len(stripped) - len(stripped.lstrip(fence_char))
-                in_fence = True
-                continue
-        else:
-            if stripped and all(ch == fence_char for ch in stripped) and len(stripped) >= fence_len:
-                in_fence = False
-                fence_char = ""
-                fence_len = 0
-            continue
-
+    for source_line in iter_section_lines(text, section_name, semantic_only=True):
+        raw_line = source_line.text
         for match in PATH_TOKEN_RE.finditer(raw_line):
             candidate = match.group("path") or match.group("bare") or ""
             normalized = _normalize_path(candidate)
@@ -171,8 +252,8 @@ def _extract_path_items(text: str, section_name: str) -> list[dict[str, Any]]:
             items.append(
                 {
                     "value": normalized,
-                    "start_line": section_start + local_line,
-                    "end_line": section_start + local_line,
+                    "start_line": source_line.number,
+                    "end_line": source_line.number,
                     "text_sha256": _sha256(raw_line),
                 }
             )
@@ -180,29 +261,11 @@ def _extract_path_items(text: str, section_name: str) -> list[dict[str, Any]]:
 
 
 def _extract_in_scope_layers(text: str) -> list[dict[str, Any]]:
-    sections = _extract_sections(text)
-    section_text = sections.get("In Scope", "")
-    section_start = _find_section_line_offset(text, "In Scope")
     items: list[dict[str, Any]] = []
-    in_fence = False
-    fence_char = ""
-    fence_len = 0
     prefixes = (".claude/", "docs/", "src/", "scripts/", "tests/", ".github/")
 
-    for local_line, raw_line in enumerate(section_text.splitlines(), start=0):
-        stripped = raw_line.strip()
-        if not in_fence:
-            if stripped.startswith("```") or stripped.startswith("~~~"):
-                fence_char = stripped[0]
-                fence_len = len(stripped) - len(stripped.lstrip(fence_char))
-                in_fence = True
-                continue
-        else:
-            if stripped and all(ch == fence_char for ch in stripped) and len(stripped) >= fence_len:
-                in_fence = False
-                fence_char = ""
-                fence_len = 0
-            continue
+    for source_line in iter_section_lines(text, "In Scope", semantic_only=True):
+        raw_line = source_line.text
 
         # Note: a single path token (e.g. a backtick-quoted or bare path) may
         # contain more than one of the known prefixes as an embedded
@@ -225,8 +288,8 @@ def _extract_in_scope_layers(text: str) -> list[dict[str, Any]]:
                 items.append(
                     {
                         "value": prefix.rstrip("/"),
-                        "start_line": section_start + local_line,
-                        "end_line": section_start + local_line,
+                        "start_line": source_line.number,
+                        "end_line": source_line.number,
                         "text_sha256": _sha256(raw_line),
                     }
                 )
@@ -234,19 +297,17 @@ def _extract_in_scope_layers(text: str) -> list[dict[str, Any]]:
 
 
 def _extract_ac_items(text: str) -> list[dict[str, Any]]:
-    sections = _extract_sections(text)
-    section_text = sections.get("Acceptance Criteria", "")
-    section_start = _find_section_line_offset(text, "Acceptance Criteria")
     items: list[dict[str, Any]] = []
-    for local_line, raw_line in enumerate(section_text.splitlines(), start=0):
+    for source_line in iter_section_lines(text, "Acceptance Criteria", semantic_only=True):
+        raw_line = source_line.text
         stripped = raw_line.lstrip()
         if stripped.startswith("- [ ]") or stripped.startswith("- [x]"):
             normalized = re.sub(r"\s+", " ", stripped).strip()
             items.append(
                 {
                     "value": normalized,
-                    "start_line": section_start + local_line,
-                    "end_line": section_start + local_line,
+                    "start_line": source_line.number,
+                    "end_line": source_line.number,
                     "text_sha256": _sha256(raw_line),
                     "is_low_verifiability": any(keyword in raw_line for keyword in SUBJECTIVE_KEYWORDS),
                 }
@@ -276,6 +337,7 @@ def _triggering_lines(
         {
             "body_version": body_version,
             "source_ref": source_ref,
+            "coordinate_space": "body_absolute_1_based",
             "start_line": item["start_line"],
             "end_line": item["end_line"],
             "text_sha256": item["text_sha256"],

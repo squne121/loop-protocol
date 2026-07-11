@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.local/schemas/temp_residue_classification_v1.schema.json",
+  "title": "Temp Residue Classification V1",
+  "description": "Schema for temp_residue_classification/v1, the read-only output of scripts/agent-ops/temp_residue_classifier.py. The classifier never mutates the filesystem (no unlink/rmdir/rmtree). recommendation=eligible_for_delete is advisory only and is NOT deletion authorization; a separate deletion executor (out of scope) must re-verify everything immediately before any destructive operation.",
+  "type": "object",
+  "required": [
+    "schema",
+    "scan_status",
+    "generated_at",
+    "project_root",
+    "entries",
+    "errors"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "temp_residue_classification/v1"
+    },
+    "scan_status": {
+      "type": "string",
+      "enum": ["ok", "partial", "error"]
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "project_root": {
+      "type": "object",
+      "required": ["source", "validated"],
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": ["claude_project_dir", "git_toplevel", "script_location"]
+        },
+        "validated": {
+          "type": "boolean"
+        }
+      }
+    },
+    "entries": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Entry" }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["reason_code", "message"],
+        "additionalProperties": false,
+        "properties": {
+          "reason_code": { "type": "string", "minLength": 1 },
+          "message": { "type": "string" },
+          "path": { "type": ["string", "null"] }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "Entry": {
+      "type": "object",
+      "required": [
+        "path",
+        "folder_class",
+        "entry_type",
+        "tracked_state",
+        "ignored_state",
+        "ownership_marker",
+        "recommendation",
+        "primary_reason_code",
+        "reason_codes",
+        "observation"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "repo-relative POSIX path; never an absolute local path."
+        },
+        "folder_class": {
+          "type": "string",
+          "enum": [
+            "repo_approved_temporary_workspace",
+            "root_temporary_alias",
+            "managed_worktree_root"
+          ]
+        },
+        "entry_type": {
+          "type": "string",
+          "enum": ["directory", "regular_file", "symlink", "special", "unknown"]
+        },
+        "tracked_state": {
+          "type": "string",
+          "enum": ["none", "some", "all", "unknown"]
+        },
+        "ignored_state": {
+          "type": "string",
+          "enum": ["none", "some", "all", "unknown"]
+        },
+        "ownership_marker": {
+          "type": "object",
+          "required": ["state", "schema", "session_match", "target_match", "expired"],
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "type": "string",
+              "enum": [
+                "absent",
+                "valid",
+                "malformed",
+                "mismatch",
+                "untrusted",
+                "unreadable"
+              ]
+            },
+            "schema": {
+              "type": ["string", "null"],
+              "enum": ["temp_residue_owner/v1", null]
+            },
+            "session_match": { "type": ["boolean", "null"] },
+            "target_match": { "type": ["boolean", "null"] },
+            "expired": { "type": ["boolean", "null"] }
+          }
+        },
+        "recommendation": {
+          "type": "string",
+          "enum": ["report_only", "eligible_for_delete"]
+        },
+        "primary_reason_code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason_codes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1
+        },
+        "observation": {
+          "type": "object",
+          "required": ["device", "inode", "mtime_ns"],
+          "additionalProperties": false,
+          "properties": {
+            "device": { "type": ["integer", "null"] },
+            "inode": { "type": ["integer", "null"] },
+            "mtime_ns": { "type": ["integer", "null"] }
+          }
+        }
+      }
+    }
+  }
+}

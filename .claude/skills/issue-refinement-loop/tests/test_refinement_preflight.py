@@ -77,6 +77,30 @@ def make_minimal_fixture(
     }
 
 
+def seed_previous_snapshot(
+    repo_root: Path,
+    *,
+    issue_number: int,
+    repo: str,
+    body: str,
+    fetched_at: str = "2025-12-31T00:00:00+00:00",
+) -> None:
+    snapshot = {
+        "schema_version": "raw_issue_snapshot/v1",
+        "fetched_at": fetched_at,
+        "issue_number": issue_number,
+        "repo": repo,
+        "issue": {
+            "number": issue_number,
+            "title": "Test Issue",
+            "body": body,
+            "labels": [],
+        },
+        "comments": [],
+    }
+    wrapper._materialize_immutable_snapshot(repo_root, issue_number, snapshot)
+
+
 VALID_ISSUE_BODY = """\
 ## Machine-Readable Contract
 
@@ -231,6 +255,12 @@ class TestAC1BasicFixtureOutput:
         fixture_path.write_text(
             json.dumps(make_minimal_fixture(body=VALID_ISSUE_BODY)),
             encoding="utf-8",
+        )
+        seed_previous_snapshot(
+            tmp_path,
+            issue_number=200,
+            repo="testowner/testrepo",
+            body=VALID_ISSUE_BODY,
         )
 
         with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
@@ -1622,6 +1652,12 @@ class TestB4PlannerInputArtifact:
         fixture_data["now"] = "2026-01-01T00:00:00+00:00"
         fixture_path = tmp_path / "fixture.json"
         fixture_path.write_text(json.dumps(fixture_data), encoding="utf-8")
+        seed_previous_snapshot(
+            tmp_path,
+            issue_number=1002,
+            repo="testowner/testrepo",
+            body=VALID_ISSUE_BODY,
+        )
 
         hashes_list = []
         for _ in range(2):
@@ -2052,6 +2088,12 @@ class TestNonBlockerDArgparseValidation:
             json.dumps(make_minimal_fixture(body=VALID_ISSUE_BODY, issue_number=42)),
             encoding="utf-8",
         )
+        seed_previous_snapshot(
+            tmp_path,
+            issue_number=42,
+            repo="owner/repo",
+            body=VALID_ISSUE_BODY,
+        )
 
         # Should not raise SystemExit for invalid args (may raise for other reasons)
         import io
@@ -2069,7 +2111,8 @@ class TestNonBlockerDArgparseValidation:
                 "--fixture", str(fixture_path),
             ])
 
-        # Should exit with pass or warn (0 or 1), not blocked (2) due to invalid args
+        # With valid args and an available previous snapshot, the wrapper should
+        # proceed to a non-blocking outcome instead of stopping on missing delta input.
         assert exc_info.value.code in (
             wrapper.EXIT_PASS, wrapper.EXIT_WARN
         ), f"Valid args should exit with 0 or 1, got {exc_info.value.code}"

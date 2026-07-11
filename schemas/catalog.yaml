@@ -801,3 +801,106 @@ entries:
     last_verified:
       commit: "dc4f88fea6094269cc715cdd7959d31f2a670ee6"
       command_id: "validate_pr_review_gates"
+
+
+  - schema_id: "temp_residue_classification/v1"
+    format: json_schema
+    source_kind: repo_path
+    definition_paths:
+      - "schemas/temp_residue_classification_v1.schema.json"
+      - "scripts/agent-ops/temp_residue_classifier.py"
+    producer:
+      owner: "temp_residue_classifier.py"
+      paths:
+        - "scripts/agent-ops/temp_residue_classifier.py"
+    consumers:
+      - id: "post-merge-cleanup"
+        paths:
+          - ".claude/skills/post-merge-cleanup/scripts/classify-git-state.py"
+          - ".claude/skills/post-merge-cleanup/SKILL.md"
+      - id: "repository-folder-policy"
+        paths:
+          - "docs/dev/repository-folder-policy.md"
+    detection_patterns:
+      - id: "temp-residue-classification-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "temp_residue_classification/v1|temp_residue_classifier"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "lint_catalog_yaml"
+        runner: pytest
+        target: "schemas/tests/test_catalog.py"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+        - change_recommendation_semantics
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive:
+          - "tests/agent_ops/test_temp_residue_classifier.py"
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "2198d01374caedd3ad86a42e9dbb45ea285d4bb3"
+      command_id: "lint_catalog_yaml"
+
+  - schema_id: "temp_residue_owner/v1"
+    format: json_schema
+    source_kind: repo_path
+    definition_paths:
+      - "schemas/temp_residue_owner_v1.schema.json"
+      - "scripts/agent-ops/temp_residue_marker.py"
+    producer:
+      owner: "agent session (self_claim / trusted_materializer)"
+      paths:
+        - "scripts/agent-ops/temp_residue_marker.py"
+    consumers:
+      - id: "temp-residue-classifier"
+        paths:
+          - "scripts/agent-ops/temp_residue_classifier.py"
+    detection_patterns:
+      - id: "temp-residue-owner-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "temp_residue_owner/v1|temp_residue_marker"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "lint_catalog_yaml"
+        runner: pytest
+        target: "schemas/tests/test_catalog.py"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+        - change_trust_model
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive:
+          - "tests/agent_ops/test_temp_residue_classifier.py"
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "2198d01374caedd3ad86a42e9dbb45ea285d4bb3"
+      command_id: "lint_catalog_yaml"
