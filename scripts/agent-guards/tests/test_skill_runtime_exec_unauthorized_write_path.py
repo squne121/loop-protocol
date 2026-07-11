@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import json
-import importlib.util
 import os
-import py_compile
 import subprocess
 import sys
 import threading
