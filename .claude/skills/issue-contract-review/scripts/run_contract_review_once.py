@@ -268,6 +268,7 @@ def run_once(
             "readiness": None,
             "blockers": None,
             "product_spec": None,
+            "product_spec_check": None,
             "vc_preflight": None,
         },
         "idempotency_check": {
@@ -424,6 +425,11 @@ def run_once(
         )
         result["status"] = "runtime_error"
         return result
+
+    # Preserve the validated evaluator payload for consumers that need to
+    # distinguish a legacy scalar summary from a schema-valid Product Spec
+    # decision bound to this review run.
+    result["checks"]["product_spec_check"] = product_spec_json
 
     if ps_applicability == "applicable":
         if ps_decision == "fail":

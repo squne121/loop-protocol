@@ -69,6 +69,11 @@ _ICR_SCRIPTS_DIR = (
 _RUN_CONTRACT_REVIEW_ONCE_PY = _ICR_SCRIPTS_DIR / "run_contract_review_once.py"
 _CONTRACT_REVIEW_RESULT_PARSER_PY = _ICR_SCRIPTS_DIR / "contract_review_result_parser.py"
 
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from evaluate_product_spec_gate import evaluate_product_spec_payload  # noqa: E402
+
 _DEFAULT_REPO = "squne121/loop-protocol"
 _DEFAULT_TIMEOUT = 30
 _VC_TIMEOUT = 180
@@ -163,8 +168,22 @@ def has_vc_preflight_classifications(go_result: object) -> bool:
 
 def is_go_current(go_result: object, expected_body_sha256: str) -> bool:
     """Return whether a go snapshot is fresh and complete for loop consumption."""
-    return is_go_fresh(go_result, expected_body_sha256) and has_vc_preflight_classifications(
-        go_result
+    if not is_go_fresh(go_result, expected_body_sha256):
+        return False
+    if not has_vc_preflight_classifications(go_result):
+        return False
+    inner = go_result.get("inner") if isinstance(go_result, dict) else None
+    checks = inner.get("checks") if isinstance(inner, dict) else None
+    product_spec_check = checks.get("product_spec_check") if isinstance(checks, dict) else None
+    if not isinstance(product_spec_check, dict):
+        return False
+    if product_spec_check.get("body_sha256") != expected_body_sha256:
+        return False
+    return (
+        evaluate_product_spec_payload(
+            product_spec_check,
+            body_sha256=expected_body_sha256,
+        ).get("routing_action") == "continue"
     )
 
 
@@ -715,7 +734,13 @@ def _build_contract_review_comment(
     checks = review_result.get("checks", {}) or {}
     readiness_check = checks.get("readiness", "go") or "go"
     blockers_check = checks.get("blockers", "pass") or "pass"
-    product_spec_check = checks.get("product_spec", "pass") or "pass"
+    product_spec_summary = checks.get("product_spec", "pass") or "pass"
+    product_spec_check = checks.get("product_spec_check")
+    if not isinstance(product_spec_check, dict):
+        product_spec_check = {}
+    product_spec_check_json = json.dumps(
+        product_spec_check, ensure_ascii=False, separators=(",", ":")
+    )
     vc_preflight_check = checks.get("vc_preflight", "pass") or "pass"
     vc_preflight_classifications = review_result.get(
         "vc_preflight_classifications", []
@@ -740,7 +765,8 @@ CONTRACT_REVIEW_RESULT_V1:
   checks:
     readiness: {readiness_check}
     blockers: {blockers_check}
-    product_spec: {product_spec_check}
+    product_spec: {product_spec_summary}
+    product_spec_check: {product_spec_check_json}
     vc_preflight:
       decision: {vc_preflight_check}
       classifications: {classifications_json}

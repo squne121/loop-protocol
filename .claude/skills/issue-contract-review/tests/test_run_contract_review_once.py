@@ -139,6 +139,9 @@ class TestAllChecksCalledB1:
         assert result["checks"]["readiness"] == "go"
         assert result["checks"]["blockers"] == "pass"
         assert result["checks"]["product_spec"] == "pass"
+        assert result["checks"]["product_spec_check"] == _make_product_spec_json(
+            "pass", "applicable"
+        )
         assert result["checks"]["vc_preflight"] == "pass"
 
     def test_blockers_blocked_stops_pipeline(self, monkeypatch):

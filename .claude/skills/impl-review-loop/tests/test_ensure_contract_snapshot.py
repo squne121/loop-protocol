@@ -139,7 +139,22 @@ def _mock_parser_mod(
 def _fresh_inner(body_sha256: str) -> dict:
     return {
         "body_sha256": body_sha256,
-        "checks": {"vc_preflight": {"classifications": []}},
+        "checks": {
+            "product_spec_check": {
+                "schema": "product_spec_check/v1",
+                "applicability": "applicable",
+                "decision": "pass",
+                "triggers": {},
+                "conditions": {},
+                "blocked_reasons": [],
+                "body_sha256": body_sha256,
+                "source_provenance": {
+                    "source_type": "github_issue_body",
+                    "body_file": None,
+                },
+            },
+            "vc_preflight": {"classifications": []},
+        },
     }
 
 
@@ -148,6 +163,9 @@ def _make_review_result(status: str) -> dict:
         "readiness": "go" if status == "go" else "needs_fix",
         "blockers": "pass" if status == "go" else None,
         "product_spec": "pass" if status == "go" else None,
+        "product_spec_check": _fresh_inner(_SAMPLE_BODY_SHA256)["checks"][
+            "product_spec_check"
+        ] if status == "go" else None,
         "vc_preflight": "pass" if status == "go" else None,
     }
     return {
@@ -525,6 +543,32 @@ class TestFreshGoSnapshots:
         assert result["status"] == "dry_run_would_post"
         review.assert_called_once()
 
+    def test_current_body_legacy_go_without_product_spec_payload_materializes_dry_run(self):
+        legacy_go = {
+            "comment_id": 1001,
+            "html_url": _GO_COMMENT["html_url"],
+            "created_at": _GO_COMMENT["created_at"],
+            "status": "go",
+            "inner": {
+                "body_sha256": _SAMPLE_BODY_SHA256,
+                "checks": {"vc_preflight": {"classifications": []}},
+            },
+        }
+        parser_mod = _mock_parser_mod(comments=[_GO_COMMENT])
+        parser_mod.parse_contract_review_results.return_value = [legacy_go]
+        parser_mod.find_latest_go.return_value = legacy_go
+        parser_mod.find_latest_result.return_value = legacy_go
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(_ecs_mod, "fetch_issue_snapshot", return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None)):
+                with patch.object(_ecs_mod, "run_contract_review_once", return_value=(_make_review_result("go"), None)) as review:
+                    result = ensure_contract_snapshot(
+                        issue_number=_ISSUE_NUMBER, repo=_REPO, mode="auto", do_post=False
+                    )
+
+        assert result["status"] == "dry_run_would_post"
+        review.assert_called_once()
+
     def test_parser_result_with_canonical_body_sha256_is_consumed(self):
         parser_mod = _ecs_mod._import_parser_module()
         results = parser_mod.parse_contract_review_results([_GO_COMMENT], _ISSUE_URL)
@@ -558,6 +602,7 @@ class TestContractReviewComment:
         assert go_result["inner"]["checks"]["vc_preflight"]["classifications"] == [
             {"ac": "AC1", "decision": "pass"}
         ]
+        assert go_result["inner"]["checks"]["product_spec_check"]["schema"] == "product_spec_check/v1"
 
 
 # ---------------------------------------------------------------------------
