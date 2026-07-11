@@ -145,6 +145,29 @@ def is_go_fresh(go_result: object, expected_body_sha256: str) -> bool:
     )
 
 
+def has_vc_preflight_classifications(go_result: object) -> bool:
+    """Return whether a go snapshot carries baseline VC classifications."""
+    if not isinstance(go_result, dict):
+        return False
+    inner = go_result.get("inner")
+    if not isinstance(inner, dict):
+        return False
+    checks = inner.get("checks")
+    if not isinstance(checks, dict):
+        return False
+    vc_preflight = checks.get("vc_preflight")
+    return isinstance(vc_preflight, dict) and isinstance(
+        vc_preflight.get("classifications"), list
+    )
+
+
+def is_go_current(go_result: object, expected_body_sha256: str) -> bool:
+    """Return whether a go snapshot is fresh and complete for loop consumption."""
+    return is_go_fresh(go_result, expected_body_sha256) and has_vc_preflight_classifications(
+        go_result
+    )
+
+
 def fetch_issue_snapshot(
     issue_number: int,
     repo: str,
@@ -476,7 +499,7 @@ def ensure_contract_snapshot(
             result["contract_snapshot_url"] = latest["html_url"]
             return result
 
-        if not is_go_fresh(go_result, body_sha256):
+        if not is_go_current(go_result, body_sha256):
             break
 
         body_confirm, updated_confirm, confirm_err = fetch_issue_snapshot(issue_number, repo)
@@ -607,7 +630,7 @@ def ensure_contract_snapshot(
 
     # Also check if a go comment appeared in the interim
     go_post = parser_mod.find_latest_go(results_post)
-    if is_go_fresh(go_post, body_sha256_post):
+    if is_go_current(go_post, body_sha256_post):
         body_dedupe, _updated_dedupe, dedupe_err = fetch_issue_snapshot(
             issue_number, repo
         )
@@ -694,6 +717,14 @@ def _build_contract_review_comment(
     blockers_check = checks.get("blockers", "pass") or "pass"
     product_spec_check = checks.get("product_spec", "pass") or "pass"
     vc_preflight_check = checks.get("vc_preflight", "pass") or "pass"
+    vc_preflight_classifications = review_result.get(
+        "vc_preflight_classifications", []
+    )
+    if not isinstance(vc_preflight_classifications, list):
+        vc_preflight_classifications = []
+    classifications_json = json.dumps(
+        vc_preflight_classifications, ensure_ascii=False, separators=(",", ":")
+    )
 
     return f"""{idempotency_marker}
 
@@ -710,7 +741,9 @@ CONTRACT_REVIEW_RESULT_V1:
     readiness: {readiness_check}
     blockers: {blockers_check}
     product_spec: {product_spec_check}
-    vc_preflight: {vc_preflight_check}
+    vc_preflight:
+      decision: {vc_preflight_check}
+      classifications: {classifications_json}
   source: ensure_contract_snapshot_auto
 ```
 """

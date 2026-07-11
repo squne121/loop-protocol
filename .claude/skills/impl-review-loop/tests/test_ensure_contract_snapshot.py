@@ -41,6 +41,7 @@ find_idempotency_marker = _ecs_mod.find_idempotency_marker
 sha256_of = _ecs_mod.sha256_of
 compute_comments_digest = _ecs_mod.compute_comments_digest
 is_go_fresh = _ecs_mod.is_go_fresh
+is_go_current = _ecs_mod.is_go_current
 
 # Use post_status constants (B4)
 POST_STATUS_POSTED = _ecs_mod.POST_STATUS_POSTED
@@ -126,13 +127,20 @@ def _mock_parser_mod(
             "html_url": go_comment["html_url"],
             "created_at": go_comment["created_at"],
             "status": "go",
-            "inner": {"body_sha256": _SAMPLE_BODY_SHA256},
+            "inner": _fresh_inner(_SAMPLE_BODY_SHA256),
         })
 
     mod.parse_contract_review_results.return_value = results
     mod.find_latest_go.return_value = results[0] if results and results[0]["status"] == "go" else None
     mod.find_latest_result.return_value = latest or (results[0] if results else None)
     return mod
+
+
+def _fresh_inner(body_sha256: str) -> dict:
+    return {
+        "body_sha256": body_sha256,
+        "checks": {"vc_preflight": {"classifications": []}},
+    }
 
 
 def _make_review_result(status: str) -> dict:
@@ -147,6 +155,7 @@ def _make_review_result(status: str) -> dict:
         "status": status,
         "readiness_status": "go" if status == "go" else "needs_fix",
         "checks": checks,
+        "vc_preflight_classifications": [{"ac": "AC1", "decision": "pass"}],
         "errors": [],
     }
 
@@ -347,7 +356,7 @@ class TestFreshGoSnapshots:
             "html_url": "https://example.test/fresh",
             "created_at": "2026-06-13T09:00:00Z",
             "status": "go",
-            "inner": {"body_sha256": _SAMPLE_BODY_SHA256},
+            "inner": _fresh_inner(_SAMPLE_BODY_SHA256),
         }
         parser_mod = _mock_parser_mod(comments=[])
         parser_mod.parse_contract_review_results.side_effect = [[], [fresh_go]]
@@ -372,7 +381,7 @@ class TestFreshGoSnapshots:
             "html_url": "https://example.test/fresh",
             "created_at": "2026-06-13T09:00:00Z",
             "status": "go",
-            "inner": {"body_sha256": _SAMPLE_BODY_SHA256},
+            "inner": _fresh_inner(_SAMPLE_BODY_SHA256),
         }
         parser_mod = _mock_parser_mod(comments=[])
         parser_mod.parse_contract_review_results.side_effect = [[], [fresh_go]]
@@ -405,7 +414,7 @@ class TestFreshGoSnapshots:
             "html_url": _GO_COMMENT["html_url"],
             "created_at": _GO_COMMENT["created_at"],
             "status": "go",
-            "inner": {"body_sha256": _SAMPLE_BODY_SHA256},
+            "inner": _fresh_inner(_SAMPLE_BODY_SHA256),
         }
         parser_mod = _mock_parser_mod(comments=[_GO_COMMENT])
         parser_mod.parse_contract_review_results.return_value = [fresh_go]
@@ -432,7 +441,7 @@ class TestFreshGoSnapshots:
             "html_url": _GO_COMMENT["html_url"],
             "created_at": _GO_COMMENT["created_at"],
             "status": "go",
-            "inner": {"body_sha256": _SAMPLE_BODY_SHA256},
+            "inner": _fresh_inner(_SAMPLE_BODY_SHA256),
         }
         parser_mod = _mock_parser_mod(comments=[_GO_COMMENT])
         parser_mod.parse_contract_review_results.return_value = [fresh_go]
@@ -477,6 +486,37 @@ class TestFreshGoSnapshots:
         assert result["status"] == "dry_run_would_post"
         review.assert_called_once()
 
+    def test_fresh_go_without_classifications_materializes_dry_run(self):
+        incomplete_go = {
+            "comment_id": 1001,
+            "html_url": _GO_COMMENT["html_url"],
+            "created_at": _GO_COMMENT["created_at"],
+            "status": "go",
+            "inner": {"body_sha256": _SAMPLE_BODY_SHA256},
+        }
+        parser_mod = _mock_parser_mod(comments=[_GO_COMMENT])
+        parser_mod.parse_contract_review_results.return_value = [incomplete_go]
+        parser_mod.find_latest_result.return_value = incomplete_go
+        parser_mod.find_latest_go.return_value = incomplete_go
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(
+                _ecs_mod,
+                "fetch_issue_snapshot",
+                return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None),
+            ):
+                with patch.object(
+                    _ecs_mod,
+                    "run_contract_review_once",
+                    return_value=(_make_review_result("go"), None),
+                ) as review:
+                    result = ensure_contract_snapshot(
+                        issue_number=_ISSUE_NUMBER, repo=_REPO, mode="auto", do_post=False
+                    )
+
+        assert result["status"] == "dry_run_would_post"
+        review.assert_called_once()
+
     def test_parser_result_with_canonical_body_sha256_is_consumed(self):
         parser_mod = _ecs_mod._import_parser_module()
         results = parser_mod.parse_contract_review_results([_GO_COMMENT], _ISSUE_URL)
@@ -484,6 +524,32 @@ class TestFreshGoSnapshots:
 
         assert go_result is not None
         assert is_go_fresh(go_result, _SAMPLE_BODY_SHA256)
+        assert not is_go_current(go_result, _SAMPLE_BODY_SHA256)
+
+
+class TestContractReviewComment:
+    """Materialized snapshots retain VC baseline classifications for consumers."""
+
+    def test_comment_serializes_vc_preflight_classifications(self):
+        body = _ecs_mod._build_contract_review_comment(
+            issue_number=_ISSUE_NUMBER,
+            repo=_REPO,
+            review_result=_make_review_result("go"),
+            idempotency_marker="<!-- marker -->",
+            body_sha256=_SAMPLE_BODY_SHA256,
+        )
+        parser_mod = _ecs_mod._import_parser_module()
+        results = parser_mod.parse_contract_review_results(
+            [{"id": 1, "html_url": "https://example.test/1", "created_at": "now", "body": body}],
+            _ISSUE_URL,
+        )
+        go_result = parser_mod.find_latest_go(results)
+
+        assert go_result is not None
+        assert is_go_current(go_result, _SAMPLE_BODY_SHA256)
+        assert go_result["inner"]["checks"]["vc_preflight"]["classifications"] == [
+            {"ac": "AC1", "decision": "pass"}
+        ]
 
 
 # ---------------------------------------------------------------------------
