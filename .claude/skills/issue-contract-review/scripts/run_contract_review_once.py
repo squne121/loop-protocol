@@ -152,13 +152,31 @@ def _run_shell_script(
 # ---------------------------------------------------------------------------
 
 
+def _is_current_go_snapshot(go_result: object, expected_body_sha256: str) -> bool:
+    """Use the loop consumer's currentness predicate for producer dedupe."""
+    import importlib.util
+
+    ensure_path = (
+        _SCRIPTS_DIR.parent.parent / "impl-review-loop" / "scripts"
+        / "ensure_contract_snapshot.py"
+    )
+    spec = importlib.util.spec_from_file_location("ensure_contract_snapshot", ensure_path)
+    if spec is None or spec.loader is None:
+        return False
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return bool(module.is_go_current(go_result, expected_body_sha256))
+
+
 def check_existing_go_comment(
     issue_number: int,
     repo: str,
-) -> tuple[Optional[str], Optional[str]]:
+) -> tuple[Optional[dict], Optional[str]]:
     """
-    Check if a valid CONTRACT_REVIEW_RESULT_V1 status: go comment already exists.
-    Returns (html_url_or_None, error_code_or_None).
+    Return a current, complete go snapshot or None.
+
+    Dedupe is only safe when the existing comment satisfies the same
+    currentness predicate consumed by impl-review-loop.
     """
     try:
         from contract_review_result_parser import (
@@ -203,8 +221,29 @@ def check_existing_go_comment(
         return None, None
 
     go = find_latest_go(results)
-    if go:
-        return go["html_url"], None
+    if go is None:
+        return None, None
+
+    try:
+        issue = subprocess.run(
+            ["gh", "issue", "view", str(issue_number), "--repo", repo, "--json", "body"],
+            capture_output=True,
+            text=True,
+            timeout=_DEFAULT_TIMEOUT,
+        )
+        if issue.returncode != 0:
+            return None, "issue_body_fetch_error"
+        current_body = json.loads(issue.stdout).get("body", "")
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+        return None, "issue_body_fetch_error"
+
+    import hashlib
+
+    current_body_sha256 = "sha256:" + hashlib.sha256(
+        current_body.encode("utf-8")
+    ).hexdigest()
+    if _is_current_go_snapshot(go, current_body_sha256):
+        return go, None
     return None, None
 
 
@@ -281,17 +320,20 @@ def run_once(
 
     # Step 1: idempotency check — if existing go exists, return early
     if not skip_idempotency_check:
-        existing_url, id_err = check_existing_go_comment(issue_number, repo)
+        existing_go, id_err = check_existing_go_comment(issue_number, repo)
+        existing_url = existing_go.get("html_url") if existing_go else None
         result["idempotency_check"]["existing_go_url"] = existing_url
         if id_err:
             result["errors"].append(f"idempotency_check_error: {id_err}")
             # non-fatal: continue
-        elif existing_url:
+        elif existing_go:
             # Already has a valid go comment — return deduped
             result["status"] = "go"
             result["source"] = "existing_go_comment"
             result["go_comment_url"] = existing_url
             result["idempotency_check"]["deduped"] = True
+            checks = existing_go.get("inner", {}).get("checks", {})
+            result["checks"]["product_spec_check"] = checks.get("product_spec_check")
             return result
 
     # Step 2: contract_readiness_check.py (static check)

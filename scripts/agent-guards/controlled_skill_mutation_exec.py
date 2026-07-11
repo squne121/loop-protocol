@@ -1232,6 +1232,60 @@ def _readback_by_marker_literal(marker_literal: str, issue_number: int, repo: st
         return {"error": f"readback_exception:{exc}"}
 
 
+def _readback_contract_snapshot(
+    marker_literal: str,
+    issue_number: int,
+    repo: str,
+    gh_bin: str,
+    expected_url: str,
+    expected_body_sha256: str,
+) -> dict:
+    """Verify the posted snapshot against remote comment state, not child stdout."""
+    try:
+        out = subprocess.run(
+            [
+                gh_bin, "api", "--paginate",
+                f"repos/{repo}/issues/{issue_number}/comments?per_page=100",
+                "--jq", ".[] | {id, html_url, created_at, updated_at, body}",
+            ],
+            capture_output=True, text=True, timeout=20, shell=False,
+        )
+        if out.returncode != 0:
+            return {"error": f"remote_readback_failed_rc_{out.returncode}"}
+        comments = [json.loads(line) for line in out.stdout.splitlines() if line.strip()]
+        matches = [c for c in comments if marker_literal in c.get("body", "")]
+        if len(matches) != 1:
+            return {"error": f"expected_contract_marker_match_count_{len(matches)}"}
+        comment = matches[0]
+        if comment.get("html_url") != expected_url:
+            return {"error": "remote_contract_snapshot_url_mismatch"}
+
+        import importlib.util
+
+        parser_path = PROJECT_ROOT / ".claude/skills/issue-contract-review/scripts/contract_review_result_parser.py"
+        parser_spec = importlib.util.spec_from_file_location("contract_review_result_parser", parser_path)
+        ensure_path = PROJECT_ROOT / _ENSURE_CONTRACT_SNAPSHOT_REL
+        ensure_spec = importlib.util.spec_from_file_location("ensure_contract_snapshot", ensure_path)
+        if not parser_spec or not parser_spec.loader or not ensure_spec or not ensure_spec.loader:
+            return {"error": "contract_snapshot_readback_import_error"}
+        parser_mod = importlib.util.module_from_spec(parser_spec)
+        parser_spec.loader.exec_module(parser_mod)
+        ensure_mod = importlib.util.module_from_spec(ensure_spec)
+        ensure_spec.loader.exec_module(ensure_mod)
+        issue_url = f"https://github.com/{repo}/issues/{issue_number}"
+        results = parser_mod.parse_contract_review_results([comment], issue_url)
+        snapshot = parser_mod.find_latest_go(results)
+        if snapshot is None or not ensure_mod.is_go_current(snapshot, expected_body_sha256):
+            return {"error": "remote_contract_snapshot_not_current"}
+        return {
+            "comment_id": comment.get("id", ""),
+            "comment_url": comment.get("html_url", ""),
+            "remote_postcondition_verified": True,
+        }
+    except Exception as exc:
+        return {"error": f"remote_contract_snapshot_readback_exception:{exc}"}
+
+
 def _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok) -> int:
     # -- Blocker 4: input schema binding (repo / target_issue_body_sha256 /
     # expected_latest_contract_review_status / expected_contract_marker /
@@ -1314,6 +1368,17 @@ def _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok) -> int:
             status="failed",
         )
 
+    readback = _readback_contract_snapshot(
+        input_data["expected_contract_marker"],
+        args.issue_number,
+        args.repo,
+        gh_bin,
+        pub_result["contract_snapshot_url"],
+        input_data["target_issue_body_sha256"],
+    )
+    if "error" in readback:
+        return _fail(readback["error"], status="failed")
+
     # -- AC14 / Blocker 6: postcondition -- no changes outside this command's
     # own write root (artifacts/{issue}/issue-metadata/contract_snapshot.publish/).
     changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
@@ -1325,9 +1390,10 @@ def _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok) -> int:
         )
 
     return _ok({
-        "contract_snapshot_url": pub_result["contract_snapshot_url"],
+        "contract_snapshot_url": readback["comment_url"],
         "post_status": pub_result.get("post_status"),
-        "idempotency_marker_written": True,
+        "remote_postcondition_verified": True,
+        "idempotency_marker_written": False,
     })
 
 

@@ -777,14 +777,18 @@ class TestContractSnapshotPublish:
                     with patch.object(_exec, "_fetch_issue_body_and_updated_at",
                                        return_value=("current issue body", "2026-01-01T00:00:00Z", "")):
                         with patch("subprocess.run", return_value=fake_proc):
-                            with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
-                                rc = _exec.main([
-                                    "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
-                                    "--issue-number", "1284",
-                                    "--input-file", rel,
-                                    "--repo", TRUSTED_REPO,
-                                    "--json",
-                                ])
+                            with patch.object(_exec, "_readback_contract_snapshot", return_value={
+                                "comment_url": pub_result["contract_snapshot_url"],
+                                "remote_postcondition_verified": True,
+                            }):
+                                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
+                                    rc = _exec.main([
+                                        "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
+                                        "--issue-number", "1284",
+                                        "--input-file", rel,
+                                        "--repo", TRUSTED_REPO,
+                                        "--json",
+                                    ])
         assert rc == 0
 
     def test_ac8_contract_snapshot_publisher_authority_fixed(self):
@@ -814,13 +818,17 @@ class TestContractSnapshotPublish:
                     with patch.object(_exec, "_fetch_issue_body_and_updated_at",
                                        return_value=("current issue body", "2026-01-01T00:00:00Z", "")):
                         with patch("subprocess.run", side_effect=_fake_run):
-                            with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
-                                rc = _exec.main([
-                                    "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
-                                    "--issue-number", "1284",
-                                    "--input-file", rel,
-                                    "--repo", TRUSTED_REPO,
-                                ])
+                            with patch.object(_exec, "_readback_contract_snapshot", return_value={
+                                "comment_url": pub_result["contract_snapshot_url"],
+                                "remote_postcondition_verified": True,
+                            }):
+                                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
+                                    rc = _exec.main([
+                                        "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
+                                        "--issue-number", "1284",
+                                        "--input-file", rel,
+                                        "--repo", TRUSTED_REPO,
+                                    ])
         assert rc == 0
         assert isinstance(captured["cmd"], list)
         assert captured["kwargs"].get("shell") is False
@@ -853,6 +861,28 @@ class TestContractSnapshotPublish:
                                 "--input-file", rel,
                                 "--repo", TRUSTED_REPO,
                             ])
+        assert rc == 1
+
+    def test_contract_snapshot_publish_remote_marker_missing_not_success(self, tmp_project, monkeypatch):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        rel = _write_input(
+            tmp_project, 1284, COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH, "in.json",
+            _contract_snapshot_input(1284),
+        )
+        pub_result = {"status": "ok", "contract_snapshot_url": "https://ex", "post_status": "posted"}
+        fake_proc = type("P", (), {"stdout": json.dumps(pub_result), "stderr": "", "returncode": 0})()
+        with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
+            with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
+                with patch.object(_exec, "_check_contract_snapshot_module_realpaths", return_value=[]):
+                    with patch.object(_exec, "_fetch_issue_body_and_updated_at", return_value=("current issue body", "now", "")):
+                        with patch("subprocess.run", return_value=fake_proc):
+                            with patch.object(_exec, "_readback_contract_snapshot", return_value={"error": "expected_contract_marker_match_count_0"}):
+                                rc = _exec.main([
+                                    "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
+                                    "--issue-number", "1284", "--input-file", rel,
+                                    "--repo", TRUSTED_REPO,
+                                ])
         assert rc == 1
 
     def test_contract_snapshot_publish_missing_required_field_rc2(self, tmp_project, monkeypatch):
