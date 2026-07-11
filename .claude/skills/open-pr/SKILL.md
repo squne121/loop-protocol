@@ -149,7 +149,7 @@ EXISTING_PR=$(gh pr list --head <branch> --state open --json number,url --jq '.[
 - 既存 PR あり → 重複作成せず、既存 PR URL を返す（必要なら本文 update を提案）
 - 既存 PR なし → 次のステップへ
 
-### 4.5. Overlap Preflight Hard Gate（`gh pr create` 直前の drift / unsafe route 検出、Issue #1458）
+### 4.5. Overlap Preflight Hard Gate（`gh pr create` 直前のオンライン再検証による drift（乖離）/ unsafe route（危険経路）検出、Issue #1458）
 
 `open_pr.py` は既存 PR 検出・dry-run 処理より後、`gh pr create` 呼び出し直前に、`overlap_preflight` が `required: true` の場合、または linked issue が `phase/implementation` ラベルを持つ場合（呼び出し元が `overlap_preflight` を未指定または `required: false` としていても、AC2 の bypass-via-omission 対策により省略されない）、以下を実行する:
 
@@ -424,7 +424,7 @@ VALIDATOR_RULE_IDS=<rule_ids>  # validator fail 時
 - `.claude/skills/impl-review-loop/SKILL.md` — オーケストレーター（差し戻し時の再呼び出し含む）
 - `.github/pull_request_template.md` — テンプレート正本（あれば）
 - `docs/dev/schema-governance.md` — schema 定義・Initial Known Schemas・Consumer Inventory 義務の SSOT
-- `scripts/open_pr.py` — PR 작성手順を実装する Python wrapper
+- `scripts/open_pr.py` — PR 作成手順を実装する Python wrapper
 - `scripts/update_pr.py` — PR body 更新 wrapper with validator pre-write hook
 - `docs/dev/agent-run-report.md` — PR open 後のレポート posting handoff 規約
 - `.claude/skills/implement-issue/scripts/check_implementation_overlap.py` — overlap preflight gate（Issue #1458）がオンライン subprocess 再実行する producer script（open-pr の Allowed Paths 外、変更しない）

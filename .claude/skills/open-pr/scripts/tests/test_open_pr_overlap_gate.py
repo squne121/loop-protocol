@@ -611,7 +611,9 @@ def test_subprocess_nonzero_exit_auth_failure_blocks(monkeypatch: pytest.MonkeyP
     stored = build_stored_evidence(decision_inputs_sha256="sha256:" + "b" * 64, current_issue_number=1458)
     evidence_path = write_evidence_file(stored)
 
-    error_body = json.dumps({"schema": open_pr.OVERLAP_PREFLIGHT_SCHEMA, "route": "runtime_error", "error": "gh auth failure"})
+    error_body = json.dumps(
+        {"schema": open_pr.OVERLAP_PREFLIGHT_SCHEMA, "route": "runtime_error", "error": "gh auth failure"}
+    )
     monkeypatch.setattr(
         open_pr.subprocess,
         "run",
