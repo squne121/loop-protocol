@@ -366,6 +366,39 @@ class TestFreshGoSnapshots:
         assert result["post_status"] == POST_STATUS_DEDUPED
         post.assert_not_called()
 
+    def test_updated_at_only_change_with_fresh_go_dedupes(self):
+        fresh_go = {
+            "comment_id": 1002,
+            "html_url": "https://example.test/fresh",
+            "created_at": "2026-06-13T09:00:00Z",
+            "status": "go",
+            "inner": {"body_sha256": _SAMPLE_BODY_SHA256},
+        }
+        parser_mod = _mock_parser_mod(comments=[])
+        parser_mod.parse_contract_review_results.side_effect = [[], [fresh_go]]
+        parser_mod.find_latest_result.side_effect = [None, fresh_go]
+        parser_mod.find_latest_go.side_effect = [None, fresh_go]
+        snapshots = [
+            (_SAMPLE_BODY, "one", None),
+            (_SAMPLE_BODY, "two", None),
+            (_SAMPLE_BODY, "two", None),
+        ]
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(_ecs_mod, "fetch_issue_snapshot", side_effect=snapshots):
+                with patch.object(
+                    _ecs_mod, "run_contract_review_once", return_value=(_make_review_result("go"), None)
+                ):
+                    with patch.object(_ecs_mod, "post_comment") as post:
+                        result = ensure_contract_snapshot(
+                            issue_number=_ISSUE_NUMBER, repo=_REPO, mode="auto", do_post=True
+                        )
+
+        assert result["status"] == "ok"
+        assert result["source"] == "existing_go"
+        assert result["post_status"] == POST_STATUS_DEDUPED
+        post.assert_not_called()
+
     def test_existing_go_snapshot_change_retries_then_conflicts(self):
         fresh_go = {
             "comment_id": 1001,
@@ -392,6 +425,57 @@ class TestFreshGoSnapshots:
                 )
 
         assert result["status"] == "stale_or_conflicting_snapshot"
+
+    def test_existing_go_updated_at_change_retries_then_succeeds(self):
+        fresh_go = {
+            "comment_id": 1001,
+            "html_url": _GO_COMMENT["html_url"],
+            "created_at": _GO_COMMENT["created_at"],
+            "status": "go",
+            "inner": {"body_sha256": _SAMPLE_BODY_SHA256},
+        }
+        parser_mod = _mock_parser_mod(comments=[_GO_COMMENT])
+        parser_mod.parse_contract_review_results.return_value = [fresh_go]
+        parser_mod.find_latest_result.return_value = fresh_go
+        parser_mod.find_latest_go.return_value = fresh_go
+        snapshots = [
+            (_SAMPLE_BODY, "one", None),
+            (_SAMPLE_BODY, "two", None),
+            (_SAMPLE_BODY, "two", None),
+            (_SAMPLE_BODY, "two", None),
+        ]
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(_ecs_mod, "fetch_issue_snapshot", side_effect=snapshots):
+                result = ensure_contract_snapshot(
+                    issue_number=_ISSUE_NUMBER, repo=_REPO, mode="check-only"
+                )
+
+        assert result["status"] == "ok"
+        assert result["source"] == "existing_go"
+
+    def test_hashless_go_auto_materializes_dry_run(self):
+        legacy_go = {
+            "comment_id": 1001,
+            "html_url": _GO_COMMENT["html_url"],
+            "created_at": _GO_COMMENT["created_at"],
+            "status": "go",
+            "inner": {},
+        }
+        parser_mod = _mock_parser_mod(comments=[_GO_COMMENT])
+        parser_mod.parse_contract_review_results.return_value = [legacy_go]
+        parser_mod.find_latest_result.return_value = legacy_go
+        parser_mod.find_latest_go.return_value = legacy_go
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(_ecs_mod, "fetch_issue_snapshot", return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None)):
+                with patch.object(_ecs_mod, "run_contract_review_once", return_value=(_make_review_result("go"), None)) as review:
+                    result = ensure_contract_snapshot(
+                        issue_number=_ISSUE_NUMBER, repo=_REPO, mode="auto", do_post=False
+                    )
+
+        assert result["status"] == "dry_run_would_post"
+        review.assert_called_once()
 
     def test_parser_result_with_canonical_body_sha256_is_consumed(self):
         parser_mod = _ecs_mod._import_parser_module()
@@ -596,9 +680,9 @@ class TestStaleBodyDetection:
 class TestIdempotencyMarker:
     """AC10: GitHub comment 投稿は idempotency marker により重複投稿されない。"""
 
-    def test_idempotency_marker_found_skips_post(self, monkeypatch):
+    def test_marker_only_comment_does_not_authorize_existing_go(self, monkeypatch):
         """
-        If idempotency marker already exists in comments, skip posting.
+        A marker without a parser-valid fresh go result is not snapshot authority.
         """
         # Build a comment that has the idempotency marker
         idempotency_marker = _ecs_mod._IDEMPOTENCY_MARKER_TEMPLATE.format(
@@ -643,10 +727,9 @@ class TestIdempotencyMarker:
                             do_post=True,
                         )
 
-        # Should be deduped — no additional post
-        assert len(posted) == 0, "must not post when idempotency marker exists"
-        assert result["post_status"] == POST_STATUS_DEDUPED  # B4: post_status
-        assert result["idempotency_marker_found"] is True
+        assert len(posted) == 1, "marker-only comment must not suppress materialization"
+        assert result["post_status"] == POST_STATUS_POSTED  # B4: post_status
+        assert result["idempotency_marker_found"] is False
         assert result["status"] == "ok"
         # B3: status: ok implies contract_snapshot_url is not None
         assert result["contract_snapshot_url"] is not None

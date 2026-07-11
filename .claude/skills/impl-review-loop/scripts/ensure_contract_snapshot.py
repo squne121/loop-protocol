@@ -564,16 +564,6 @@ def ensure_contract_snapshot(
         body_sha256=body_sha256,
     )
 
-    # Check idempotency marker in existing comments
-    existing_marker_url = find_idempotency_marker(comments, issue_number, body_sha256)
-    if existing_marker_url:
-        result["status"] = "ok"
-        result["source"] = "existing_go"
-        result["contract_snapshot_url"] = existing_marker_url
-        result["post_status"] = POST_STATUS_DEDUPED
-        result["idempotency_marker_found"] = True
-        return result
-
     # Atomicity check (B2): re-fetch body, updatedAt, and comments before posting
     body_post, updated_at_post, snapshot_post_err = fetch_issue_snapshot(issue_number, repo)
     if snapshot_post_err:
@@ -602,14 +592,8 @@ def ensure_contract_snapshot(
         )
         return result
 
-    if updated_at_post and updated_at and updated_at_post != updated_at:
-        result["status"] = "stale_or_conflicting_snapshot"
-        result["errors"].append(
-            f"updated_at_mismatch: initial={updated_at} post={updated_at_post}"
-        )
-        return result
-
-    # Also check if a blocked comment appeared in the interim (B2)
+    # Parse comments before treating an updatedAt change as conflicting: adding a
+    # fresh go comment can legitimately advance Issue.updatedAt.
     results_post = parser_mod.parse_contract_review_results(
         comments_post, expected_issue_url=issue_url
     )
@@ -624,10 +608,28 @@ def ensure_contract_snapshot(
     # Also check if a go comment appeared in the interim
     go_post = parser_mod.find_latest_go(results_post)
     if is_go_fresh(go_post, body_sha256_post):
+        body_dedupe, _updated_dedupe, dedupe_err = fetch_issue_snapshot(
+            issue_number, repo
+        )
+        if dedupe_err:
+            result["errors"].append(f"body_dedupe_refetch_error: {dedupe_err}")
+            result["status"] = "runtime_error"
+            return result
+        if sha256_of(body_dedupe or "") != body_sha256_post:
+            result["status"] = "stale_or_conflicting_snapshot"
+            result["errors"].append("body_changed_during_fresh_go_dedupe")
+            return result
         result["status"] = "ok"
         result["source"] = "existing_go"
         result["contract_snapshot_url"] = go_post["html_url"]
         result["post_status"] = POST_STATUS_DEDUPED
+        return result
+
+    if updated_at_post and updated_at and updated_at_post != updated_at:
+        result["status"] = "stale_or_conflicting_snapshot"
+        result["errors"].append(
+            f"updated_at_mismatch: initial={updated_at} post={updated_at_post}"
+        )
         return result
 
     # Build comment to post (B6: include checks summary)
