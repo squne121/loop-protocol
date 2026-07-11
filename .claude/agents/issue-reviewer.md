@@ -31,16 +31,16 @@ skills:
 
   Note: `--mode execute` は `compound_command_disallowed`（静的検出）と `unexpected_pass`（VC 実行結果）の両方を検出する。`shell=True` は導入しない（既存の `shell=False` 前提を維持）。入力は `--body-file` のみを使い、`--issue` / gh / network / external auth に依存しない。
 
-## Result & Consume Contract (SubAgent-owned)
+## 結果と消費契約 (Result & Consume Contract, SubAgent-owned)
 
 本 SubAgent が返す `REVIEW_ISSUE_RESULT_V1` は、以下の消費契約を SSOT とする。orchestrator は判定を再評価せず、機械的に routing する。
 
-### Verdict Consumption
+### 判定結果の消費 (Verdict Consumption)
 
 - `verdict: approve`: Issue 本文が contract を満たしている。
 - `verdict: needs-fix`: Issue 本文に修正が必要な箇所（C1〜C12 fail）がある。
 
-### Escape Hatch: needs_second_pass
+### 逃げ道: needs_second_pass の扱い
 
 - orchestrator 側で `iteration >= max_iterations` に達したが `verdict: needs-fix` の場合、本結果の `blocking_issues` を保持したまま `termination_reason: needs_second_pass` で停止する。
 
@@ -80,7 +80,7 @@ uv run python3 .claude/skills/issue-refinement-loop/scripts/compact_review_resul
 
 `update_applied` は常に `false`。本 SubAgent は Issue 本文を変更しない。
 
-### needs-fix 時の Step 2a Replay Arbitration co-location（Issue #1472）
+### needs-fix 判定時の同一境界内 Replay Arbitration 実行（Issue #1472 co-location 方針）
 
 `VERDICT: needs-fix` の場合、本 SubAgent は同一実行境界内（同一 SubAgent 実行、同一 isolation worktree）で `reviewer_claim_replay.py`（Step 2a arbitration）を追加実行し、`REVIEWER_CLAIM_REPLAY_V1` 相当のフィールドを stdout に追記する。これにより、orchestrator は子 worktree の raw `compact_review_result_v1` artifact パスを直接 open/read する必要がなくなる（isolation worktree 環境では orchestrator から子 worktree の artifact パスは解決できないため。詳細は Issue #1465 runtime evidence 参照）。
 
