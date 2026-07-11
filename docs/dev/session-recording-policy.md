@@ -65,7 +65,7 @@ Codex CLI は同一 event に matching する複数の command hooks を **concu
 - **#360（destination guard policy）**: remote write の許可 policy 自体の見直しは #360 が担当する。本 #783 は deny reason の分類整理のみ。`remote_write_requires_approval` を自動許可に変更する設計は #360 スコープ。
 - **#639（PR body mutation enforcement）**: PR body の mutation 強制実装は #639 が担当する。本 #783 は hook output shape の整形のみ。
 
-### command structure classification と #1408 publish lane authorization の責務分離（#1428）
+### command structure classification（コマンド構造分類）と #1408 publish lane authorization（公開レーン認可）の責務分離（#1428）
 
 `codex-hook-adapter.mjs` の `classifyRemoteWrite(command)` は、raw command 文字列全体への
 正規表現 substring match ではなく、`scripts/agent-guards/shell_command_analysis.py`
