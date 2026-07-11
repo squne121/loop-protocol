@@ -492,7 +492,7 @@ def test_rtk_git_push_classifies_fast_forward_remote_drift(tmp_path: Path, monke
     _init_repo(repo)
     subprocess.run(["git", "checkout", "-q", "-b", "topic"], cwd=repo, check=True)
     expected = _commit(repo, "tracked.txt", "initial")
-    current = _commit(repo, "tracked.txt", "next")
+    _current = _commit(repo, "tracked.txt", "next")
     subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
     subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=repo, check=True)
     # Remote is fast-forwarded to `current` while the local checkout is
