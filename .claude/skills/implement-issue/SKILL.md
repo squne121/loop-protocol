@@ -35,18 +35,49 @@ gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json title,body,labels,comments
 
 consumer ready contract（title `実装:` または `implement:`、routing label `phase/implementation`、`state/needs-human` 不在、dependency all closed、最新 `CONTRACT_REVIEW_RESULT_V1 status: go`）が揃っているかも確認する。legacy state label の有無だけを理由に停止してはならない。不一致なら停止して人間判断を仰ぐ。
 
-### 2. 複数 Issue 同時着手時の Allowed Paths 重複チェック
+### 2. Contract-aware overlap preflight（`check_implementation_overlap.py`）
 
-本 Issue の Allowed Paths と、現在 OPEN の他 implementation Issue の Allowed Paths が重複する場合、マージコンフリクトのリスクがあるため統合 PR を提案する。
+本 Issue の Allowed Paths が他の OPEN implementation Issue と literal 一致するだけでは、実装開始を停止しない（#1452）。Allowed Paths の一致は「マージコンフリクトの可能性」を示すに過ぎず、Outcome / In Scope が意味的に disjoint な candidate（C1/C2a）は証跡を残した上で実装を継続できる。一方、意味的に重複する candidate（C2b/C3/duplicate）や、readback が不完全な candidate は fail-closed で人間判断へ停止する。
+
+`.claude/skills/create-issue/scripts/check_issue_overlap.py` の pure classifier（`classify_overlap` / `IssueScope` / `SourceStatus` / path normalization）を正本として再利用し、implementation 専用の候補収集レイヤー `.claude/skills/implement-issue/scripts/check_implementation_overlap.py` を実行する:
 
 ```bash
-# 同じファイルを Allowed Paths に持つ open Issue を検索
-for path in $(awk '/^## Allowed Paths$/{flag=1;next} /^## /{flag=0} flag && /^- /' issue_body.md | sed 's/^- //'); do
-  gh issue list --search "\"$path\" is:open" --state open --json number,title --jq '.[] | select(.number != '"$ISSUE_NUMBER"')'
-done
+uv run python3 .claude/skills/implement-issue/scripts/check_implementation_overlap.py \
+  --issue-number "$ISSUE_NUMBER" \
+  --repo "$REPO" \
+  > /tmp/overlap_preflight_${ISSUE_NUMBER}.json
+OVERLAP_EXIT=$?
 ```
 
-重複あり → 統合 PR への切替を人間に提案して停止。重複なし → 次へ。
+このスクリプトは:
+- `--issue-number` を必須にし、対象 Issue 自身を候補から自己除外する。
+- `phase/implementation` ラベルが付いた OPEN Issue を `gh issue list` で列挙する（`number,title,body,labels,updatedAt,url`）。
+- 全候補の本文から Allowed Paths をローカルで抽出する。
+- 明示的な取得上限（`--limit`、既定 100）と saturation 検出を持ち、全件性を証明できない場合は fail-closed にする。
+- 収集した候補 JSON を `check_issue_overlap.py` の pure classifier に渡し、候補ごとに `## Outcome` / `## In Scope` を readback して意味的重複を判定する（Outcome token overlap ≥ 0.5 は heading_overlap とみなす）。
+- `IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1` evidence（`current_issue` / `source` / `candidates` / `route` / `evidence_sha256`）を標準出力に JSON で返す。
+
+#### route / exit code 契約（closed set）
+
+| route | exit | 意味 | 本 Section の対応 |
+|---|---|---|---|
+| `proceed` | 0 | C0（重複候補なし） | 実装を継続する |
+| `proceed_with_collision_evidence` | 1 | 証明済み C1/C2a（全候補 readback 完了かつ Outcome が disjoint） | evidence を Issue コメントまたは worktree artifact に記録してから継続する |
+| `wait_for_predecessor` | 2 | C2b（open predecessor への依存が検出された） | 人間判断へ停止（predecessor 完了待ち） |
+| `human_review_required` | 3 | C3 / ambiguous / readback 不完全 / source degraded（saturated 等） | 人間判断へ停止 |
+| `duplicate` | 4 | 起票統合が必要な重複 | 人間判断へ停止（統合 PR を人間に提案） |
+| `runtime_error` | 5 | JSON parse 失敗 / schema 違反 / GitHub 取得失敗 | 人間判断へ停止（fail-closed） |
+
+unknown な verdict / policy_class（`check_issue_overlap.py` の契約違反の兆候）は `runtime_error` に倒される。
+
+- **継続 route（AC2）**: `proceed` と `proceed_with_collision_evidence` は実装を継続する。`proceed_with_collision_evidence` の場合、`IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1` evidence 全体を Issue コメントまたは worktree artifact に記録してから Step 3 へ進む。`open-pr` は同じ evidence digest（`evidence_sha256`）を PR 本文へ転記する。
+- **fail-closed route（AC3）**: `wait_for_predecessor` / `human_review_required` / `duplicate` / `runtime_error` はいずれも実装を開始せず、人間判断へ停止する。route と evidence（またはエラー内容）を人間へ提示する。
+- **candidate readback 前提（AC4）**: `check_implementation_overlap.py` は候補の `## Outcome` / `## In Scope` の readback が完了し、かつ意味的に disjoint であることを確認できて初めて `proceed_with_collision_evidence` を返す。readback が不完全な候補が一件でもある場合、または Outcome が意味的に重複する候補が一件でもある場合は `human_review_required` に倒す。**candidate contract の Outcome / In Scope / Out of Scope / Delivery Rule を readback する前に統合 PR を提案してはならない。**
+- **自己除外（AC6）**: `--issue-number` は必須であり、対象 Issue 自身は候補収集レイヤーによって自動的に自己除外される。自己除外を怠ると同一タイトル・同一 Allowed Paths によって `duplicate` と誤判定される。
+
+Step 7（push & PR 起票）の直前に、`route` が `proceed_with_collision_evidence` だった場合は candidate の `updated_at` / `body_sha256` drift（stale evidence）を再確認する。drift を検出した場合は本 Section を再実行する。
+
+`check_issue_overlap.py` 本体の scoring / schema ロジックの変更は本 Section の対象外（#1452 の Out of Scope）。また、本 preflight の continue 判定は OPEN Issue 間の意味的適合性のみを示し、active worktree / dirty path / 進行中 PR との同時編集安全性は証明しない（別 gate、#966 の責務）。
 
 ### 3. Worktree / Branch 作成
 
@@ -236,6 +267,8 @@ IMPLEMENT_RESULT_V1:
 - `.claude/skills/open-pr/SKILL.md` — PR 起票手順（C-4 で整備予定）
 - `.claude/skills/post-merge-cleanup/SKILL.md` — PR マージ後の cleanup
 - `.claude/skills/ssot-discovery/SKILL.md` — 実装着手前の SSOT 探索
+- `.claude/skills/create-issue/scripts/check_issue_overlap.py` — 本 skill Step 2 が再利用する pure overlap classifier の正本
+- `.claude/skills/implement-issue/scripts/check_implementation_overlap.py` — 本 skill Step 2 が実行する implementation 専用 overlap preflight adapter
 - `.claude/agents/implementation-worker.md` — 本 skill を使う SubAgent
 - `.claude/agents/test-runner.md` — Verification Commands を実行する SubAgent
 - ルート `CLAUDE.md` + per-directory `CLAUDE.md` — 不変条件の正本
