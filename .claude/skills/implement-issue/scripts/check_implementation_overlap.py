@@ -151,6 +151,25 @@ def _canonical_json(payload: Any) -> str:
     return json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
 
 
+def _canonicalize_repo(repo: Optional[str]) -> str:
+    """`--repo owner/name` を canonical value（小文字正規化）へ変換する（AC2/AC5）。
+
+    ネットワークアクセスを避けるため、固定の正規化規則（owner/name の小文字化）
+    を採用する（Notes for Reviewer 参照）。`owner/name` 形式でない、または
+    いずれかの segment が空の場合は fail-closed で `OverlapRuntimeError` を
+    投げる。
+    """
+    raw = (repo or "").strip()
+    if "/" not in raw:
+        raise OverlapRuntimeError(f"invalid --repo value (expected owner/name): {repo!r}")
+    owner, _, name = raw.partition("/")
+    owner = owner.strip()
+    name = name.strip()
+    if not owner or not name or "/" in name:
+        raise OverlapRuntimeError(f"invalid --repo value (expected owner/name): {repo!r}")
+    return f"{owner.lower()}/{name.lower()}"
+
+
 def _extract_section(body: str, heading: str) -> str:
     if not body:
         return ""
@@ -263,11 +282,17 @@ def _parse_contract_dependency_lists(body: str) -> Dict[str, Tuple[str, ...]]:
     return result
 
 
-def _extract_native_dependency_numbers(raw: Dict[str, Any], key: str) -> Tuple[str, ...]:
+def _extract_native_dependency_numbers(
+    raw: Dict[str, Any], key: str, *, current_repo: Optional[str] = None
+) -> Tuple[str, ...]:
     """GitHub native issue dependency（`blockedBy` / `blocking`）を解析する。
 
-    `gh issue view --json` が返す形（`[{"number": N, ...}, ...]`）と、
-    fixture の簡易形（`[N, ...]`）の両方を許容する。
+    typed record（`{"repository": "...", "number": N, "state": "..."}`、REST
+    issue-dependencies endpoint 由来、Blocker 4/5）と、legacy fixture の簡易形
+    （`[N, ...]` / `[{"number": N}, ...]`、repository 情報なし）の両方を許容
+    する。typed record が `repository` を持ち、かつ `current_repo` が指定され
+    ている場合は同一 repository 制約を検証し、不一致は除外する（cross-repo
+    dependency は既存の number-based resolver に接続しない）。
     """
     val = raw.get(key)
     if not isinstance(val, list):
@@ -275,6 +300,10 @@ def _extract_native_dependency_numbers(raw: Dict[str, Any], key: str) -> Tuple[s
     out: List[str] = []
     for item in val:
         if isinstance(item, dict) and "number" in item:
+            repo_field = item.get("repository")
+            if repo_field is not None and current_repo is not None:
+                if str(repo_field).lower() != current_repo.lower():
+                    continue
             digits = _ref_digits(item["number"])
         elif isinstance(item, (int, str)):
             digits = _ref_digits(item)
@@ -285,13 +314,16 @@ def _extract_native_dependency_numbers(raw: Dict[str, Any], key: str) -> Tuple[s
     return tuple(out)
 
 
-def _merge_dependency_refs(body: str, raw: Dict[str, Any], key: str) -> Tuple[str, ...]:
+def _merge_dependency_refs(
+    body: str, raw: Dict[str, Any], key: str, *, current_repo: Optional[str] = None
+) -> Tuple[str, ...]:
     """legacy `Depends on #N` + contract YAML + native dependency を統合する。
 
     `key == "blocked_by"` の場合のみ、Machine-Readable Contract の
     `blocked_by:` に加えて legacy `Depends on #N` 記法と GitHub native
     `blockedBy` を統合する。それ以外の key（`depends_on` / `supersedes`）は
-    contract の YAML 値のみを正本とする。
+    contract の YAML 値のみを正本とする。`current_repo` は native dependency
+    typed record の同一 repository 制約検証に使う（Blocker 4/5）。
     """
     contract = _parse_contract_dependency_lists(body)
     seen: set = set()
@@ -306,7 +338,9 @@ def _merge_dependency_refs(body: str, raw: Dict[str, Any], key: str) -> Tuple[st
             if digits not in seen:
                 seen.add(digits)
                 merged.append(digits)
-        for digits in _extract_native_dependency_numbers(raw, "blockedBy"):
+        for digits in _extract_native_dependency_numbers(
+            raw, "blockedBy", current_repo=current_repo
+        ):
             if digits not in seen:
                 seen.add(digits)
                 merged.append(digits)
@@ -498,7 +532,101 @@ def fetch_predecessor_issue(repo: str, number: int) -> Optional[Dict[str, Any]]:
     return data
 
 
-def _issue_scope_from_raw(raw: Dict[str, Any]) -> IssueScope:
+_NATIVE_DEPENDENCY_DIRECTIONS: Dict[str, str] = {
+    "blocked_by": "blocked_by",
+    "blocking": "blocking",
+}
+_NATIVE_DEPENDENCY_PAGE_SIZE = 100
+_NATIVE_DEPENDENCY_MAX_PAGES = 1000  # safety cap; fail-closed if exceeded
+
+
+def _normalize_native_dependency_record(item: Any, *, direction: str) -> Dict[str, Any]:
+    """REST issue-dependencies endpoint の 1 レコードを
+    `{repository, number, state}` typed record へ正規化する。number /
+    repository / state のいずれかが欠けている、または型が不正な場合は
+    「依存なし」として黙って握りつぶさず fail-closed（`OverlapRuntimeError`）
+    にする（Outcome 要件）。
+    """
+    if not isinstance(item, dict):
+        raise OverlapRuntimeError(
+            f"native dependency ({direction}) record is not an object: {item!r}"
+        )
+    number = item.get("number")
+    state = item.get("state")
+    repo_obj = item.get("repository")
+    if isinstance(repo_obj, dict):
+        repository = repo_obj.get("full_name")
+    elif isinstance(repo_obj, str):
+        repository = repo_obj
+    else:
+        repository = None
+    if not isinstance(number, int) or not repository or not state:
+        raise OverlapRuntimeError(
+            f"native dependency ({direction}) record missing number/repository/state: {item!r}"
+        )
+    return {
+        "repository": _canonicalize_repo(str(repository)),
+        "number": number,
+        "state": str(state).upper(),
+    }
+
+
+def _fetch_native_dependency_page(
+    repo: str, issue_number: int, direction: str, page: int
+) -> List[Any]:
+    endpoint = f"repos/{repo}/issues/{issue_number}/dependencies/{direction}"
+    data = _run_gh_json(
+        [
+            "gh", "api", endpoint,
+            "-X", "GET",
+            "-f", f"per_page={_NATIVE_DEPENDENCY_PAGE_SIZE}",
+            "-f", f"page={page}",
+        ]
+    )
+    if not isinstance(data, list):
+        raise OverlapRuntimeError(
+            f"native dependency endpoint returned non-array: {endpoint} page={page}"
+        )
+    return data
+
+
+def fetch_native_dependencies(
+    repo: str, issue_number: int, direction: str
+) -> Tuple[Dict[str, Any], ...]:
+    """GitHub native issue dependency（既定: REST issue-dependencies endpoint）を
+    全ページ取得する（Blocker 5、pagination boundary の完全性証明）。
+
+    `direction` は `"blocked_by"` または `"blocking"`。API 失敗・ページ欠落・
+    レスポンス形状不正は「依存なし」として扱わず fail-closed で例外を投げる。
+    """
+    if direction not in _NATIVE_DEPENDENCY_DIRECTIONS:
+        raise OverlapRuntimeError(f"unknown native dependency direction: {direction}")
+    records: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        raw_page = _fetch_native_dependency_page(repo, issue_number, direction, page)
+        records.extend(
+            _normalize_native_dependency_record(item, direction=direction) for item in raw_page
+        )
+        if len(raw_page) < _NATIVE_DEPENDENCY_PAGE_SIZE:
+            break
+        page += 1
+        if page > _NATIVE_DEPENDENCY_MAX_PAGES:
+            raise OverlapRuntimeError(
+                f"native dependency pagination exceeded safety cap for {direction}"
+            )
+    return tuple(records)
+
+
+def fetch_all_native_dependencies(repo: str, issue_number: int) -> Dict[str, Tuple[Dict[str, Any], ...]]:
+    """`blockedBy` / `blocking` の両方向を取得する。混同せず別々のキーで返す。"""
+    return {
+        "blockedBy": fetch_native_dependencies(repo, issue_number, "blocked_by"),
+        "blocking": fetch_native_dependencies(repo, issue_number, "blocking"),
+    }
+
+
+def _issue_scope_from_raw(raw: Dict[str, Any], *, current_repo: Optional[str] = None) -> IssueScope:
     body = str(raw.get("body") or "")
     return IssueScope(
         title=str(raw.get("title", "")),
@@ -509,7 +637,7 @@ def _issue_scope_from_raw(raw: Dict[str, Any]) -> IssueScope:
             (lbl.get("name", "") if isinstance(lbl, dict) else str(lbl))
             for lbl in (raw.get("labels", []) or [])
         ),
-        depends_on=_merge_dependency_refs(body, raw, "blocked_by"),
+        depends_on=_merge_dependency_refs(body, raw, "blocked_by", current_repo=current_repo),
         parent_refs=_extract_parent_ref(body),
         # B1 fix (Blocker 2): state は raw の実際の値を使う。offline fixture は
         # "state" を明示できる（既定 "OPEN" は後方互換）。online 経路は
@@ -676,6 +804,7 @@ def _resolve_dependency(
 
 def build_evidence(
     *,
+    repository: str,
     current_number: int,
     current_body: str,
     current_updated_at: Optional[str],
@@ -696,6 +825,7 @@ def build_evidence(
 
     decision_payload: Dict[str, Any] = {
         "schema": SCHEMA,
+        "repository": repository,
         "current_issue": {
             "number": current_number,
             "body_sha256": f"sha256:{_sha256(current_body)}",
@@ -714,6 +844,7 @@ def build_evidence(
 
     body: Dict[str, Any] = {
         "schema": SCHEMA,
+        "repository": repository,
         "current_issue": {
             "number": current_number,
             "updated_at": current_updated_at,
@@ -748,6 +879,7 @@ def _classify(
     candidates_raw: List[Dict[str, Any]],
     saturated: bool,
     repo: Optional[str],
+    repository: str,
 ) -> Tuple[str, Dict[str, Any]]:
     current_body = str(current_raw.get("body") or "")
     current_paths = extract_allowed_paths(current_body)
@@ -768,7 +900,7 @@ def _classify(
     scope_pool: Dict[str, IssueScope] = {}
     candidate_scopes: List[IssueScope] = []
     for raw in candidates_raw:
-        scope = _issue_scope_from_raw(raw)
+        scope = _issue_scope_from_raw(raw, current_repo=repository)
         candidate_scopes.append(scope)
         if scope.number is not None:
             key = str(scope.number)
@@ -783,7 +915,9 @@ def _classify(
         number=args.issue_number,
         allowed_paths=tuple(current_paths),
         body=current_body,
-        depends_on=_merge_dependency_refs(current_body, current_raw, "blocked_by"),
+        depends_on=_merge_dependency_refs(
+            current_body, current_raw, "blocked_by", current_repo=repository
+        ),
         parent_refs=_extract_parent_ref(current_body),
     )
 
@@ -992,9 +1126,14 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
     collected_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     try:
+        # --- Blocker 4: online / dry-run 両方の呼び出し経路で --repo を必須化
+        #     する（AC1）。欠落時は runtime_error に倒す（evidence を出力しない）。
         if args.dry_run:
             if not args.current_file or not args.candidates_file:
                 raise OverlapRuntimeError("--dry-run には --current-file と --candidates-file が必須")
+            if not args.repo:
+                raise OverlapRuntimeError("--repo is required for dry-run")
+            canonical_repo = _canonicalize_repo(args.repo)
             current_raw = _load_json_file(args.current_file)
             candidates_raw = _load_json_file(args.candidates_file)
             saturated = len(candidates_raw) >= args.limit
@@ -1002,9 +1141,18 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         else:
             if not args.repo:
                 raise OverlapRuntimeError("--repo is required for online fetch")
+            canonical_repo = _canonicalize_repo(args.repo)
             current_raw = fetch_current_issue(args.repo, args.issue_number)
             candidates_raw, saturated = fetch_implementation_candidates(args.repo, args.limit)
             repo = args.repo
+
+            # --- Blocker 5: native issue dependency（blockedBy/blocking）を
+            #     REST issue-dependencies endpoint で取得し、current issue の
+            #     raw dict に typed record として付与する（gh issue view/list
+            #     --json には存在しないフィールド名を使わない、AC6）。
+            native_deps = fetch_all_native_dependencies(canonical_repo, args.issue_number)
+            current_raw["blockedBy"] = [dict(rec) for rec in native_deps["blockedBy"]]
+            current_raw["blocking"] = [dict(rec) for rec in native_deps["blocking"]]
 
         if not isinstance(current_raw, dict) or "body" not in current_raw:
             raise OverlapRuntimeError("current issue JSON missing required 'body' field")
@@ -1020,7 +1168,9 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         #     存在しない場合、オンライン経路では個別 readback する。
         if not args.dry_run and repo:
             current_body_preview = str(current_raw.get("body") or "")
-            refs = _merge_dependency_refs(current_body_preview, current_raw, "blocked_by")
+            refs = _merge_dependency_refs(
+                current_body_preview, current_raw, "blocked_by", current_repo=canonical_repo
+            )
             known_numbers = {str(c.get("number")) for c in candidates_raw}
             for ref in refs:
                 if ref in known_numbers:
@@ -1036,11 +1186,13 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             candidates_raw=candidates_raw,
             saturated=saturated,
             repo=repo,
+            repository=canonical_repo,
         )
         if route not in ROUTES:
             route = ROUTE_RUNTIME_ERROR
 
         evidence = build_evidence(
+            repository=canonical_repo,
             current_number=args.issue_number,
             current_body=ctx["current_body"],
             current_updated_at=current_raw.get("updatedAt"),
