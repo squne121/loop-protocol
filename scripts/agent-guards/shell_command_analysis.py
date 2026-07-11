@@ -464,7 +464,15 @@ def _tokenize_chunk_words(text: str, chunk_start: int, chunk_end: int) -> list[_
         word_end = i
         is_dynamic, _subs = _scan_word_dynamism(text, word_start, word_end)
         value = None if is_dynamic else _unquote_literal(text[word_start:word_end])
-        words.append(_Word(text=text[word_start:word_end], start=word_start, end=word_end, literal=not is_dynamic, value=value))
+        words.append(
+            _Word(
+                text=text[word_start:word_end],
+                start=word_start,
+                end=word_end,
+                literal=not is_dynamic,
+                value=value,
+            )
+        )
     return words
 
 
@@ -750,7 +758,11 @@ def _classify_push_words(words: list[_Word]) -> tuple[str, int] | None:
             if idx < len(words):
                 idx += 1  # its value
             continue
-        if tok.value.startswith("--") and "=" in tok.value and tok.value.split("=", 1)[0] in _GIT_GLOBAL_OPTS_WITH_VALUE:
+        if (
+            tok.value.startswith("--")
+            and "=" in tok.value
+            and tok.value.split("=", 1)[0] in _GIT_GLOBAL_OPTS_WITH_VALUE
+        ):
             idx += 1
             continue
         if tok.value.startswith("-") and tok.value not in _GIT_GLOBAL_OPTS_WITH_VALUE:
@@ -1014,7 +1026,13 @@ def _recurse(text: str, base_offset: int, execution_context: str, state: _Analys
                 state.mark_indeterminate(exc.reason_code)
                 continue
             for inner_start, inner_end in subs:
-                _recurse(text[inner_start:inner_end], base_offset + inner_start, CTX_COMMAND_SUBSTITUTION, state, depth + 1)
+                _recurse(
+                    text[inner_start:inner_end],
+                    base_offset + inner_start,
+                    CTX_COMMAND_SUBSTITUTION,
+                    state,
+                    depth + 1,
+                )
 
         if not argv_words:
             continue
@@ -1028,7 +1046,12 @@ def analyze_shell_command(command: str) -> dict:
     if command is None:
         return {"schema": SCHEMA, "status": STATUS_INDETERMINATE, "commands": [], "reason_code": REASON_MALFORMED_SHELL}
     if len(command) > _MAX_INPUT_LEN:
-        return {"schema": SCHEMA, "status": STATUS_INDETERMINATE, "commands": [], "reason_code": REASON_ANALYSIS_TIMEOUT}
+        return {
+            "schema": SCHEMA,
+            "status": STATUS_INDETERMINATE,
+            "commands": [],
+            "reason_code": REASON_ANALYSIS_TIMEOUT,
+        }
     state = _AnalysisState()
     try:
         _recurse(command, 0, CTX_TOP_LEVEL, state, 0)
