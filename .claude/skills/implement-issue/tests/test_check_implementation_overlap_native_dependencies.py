@@ -182,7 +182,7 @@ def test_given_100_items_when_default_page_size_100_then_pagination_boundary_sin
 # ------------------------------------------------------------
 
 
-def test_given_blocked_by_open_predecessor_when_direction_and_repository_resolved_then_wait_for_predecessor_signal() -> None:
+def test_given_blocked_by_open_predecessor_when_direction_repo_resolved_then_wait_for_signal() -> None:
     """`blockedBy` の OPEN predecessor は current の停止理由になる。"""
     raw = {"blockedBy": [_typed_record(number=9449, state="OPEN")], "blocking": []}
     refs = _merge_dependency_refs("", raw, "blocked_by", current_repo=REPO)
