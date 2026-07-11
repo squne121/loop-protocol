@@ -138,6 +138,11 @@ def _common_monkeypatches(monkeypatch: pytest.MonkeyPatch, linked_issue: int = 1
         },
     )
     monkeypatch.setattr(open_pr, "find_existing_pr", lambda repo, branch: None)
+    # Default: fresh label re-fetch succeeds with no labels (no phase/implementation
+    # forcing). Individual tests override this to simulate forcing / fetch failure.
+    monkeypatch.setattr(
+        open_pr, "fetch_current_linked_issue_labels", lambda repo, issue: ([], None)
+    )
 
 
 def _run_main(
@@ -248,6 +253,57 @@ def test_drift_detected_blocks(monkeypatch: pytest.MonkeyPatch):
 
 
 # ---------------------------------------------------------------------------
+# 2b. P2-1 provenance chain: stored.decision_inputs_sha256 must be connected
+#     to expected_decision_inputs_sha256 BEFORE any fresh comparison. Without
+#     this, a stored artifact from a DIFFERENT preflight collection chain
+#     (decision_inputs_sha256=D1) could pass if the caller's expected value
+#     (D2) happens to match the fresh online re-run's result (also D2) even
+#     though stored and fresh never shared the same collection chain.
+# ---------------------------------------------------------------------------
+
+
+def test_decision_inputs_provenance_chain_blocks_on_stored_expected_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    d1 = "sha256:" + "d1" * 32
+    d2 = "sha256:" + "d2" * 32
+    # stored artifact belongs to a collection chain with decision_inputs_sha256=D1
+    stored = build_stored_evidence(decision_inputs_sha256=d1, current_issue_number=1458)
+    evidence_path = write_evidence_file(stored)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError(
+            "subprocess should not run before the stored/expected "
+            "decision_inputs_sha256 provenance check"
+        )
+
+    monkeypatch.setattr(open_pr.subprocess, "run", fail_if_called)
+
+    try:
+        rc, lines, create_called = _run_main(
+            monkeypatch,
+            1458,
+            [
+                "--overlap-preflight-required",
+                "--overlap-preflight-evidence-file", str(evidence_path),
+                "--overlap-preflight-expected-evidence-sha256", stored["evidence_sha256"],
+                # caller-supplied expected value is D2 (a DIFFERENT collection chain
+                # from the stored artifact's D1), even though a fresh online re-run
+                # would also report D2 (simulated by fail_if_called never running).
+                "--overlap-preflight-expected-decision-inputs-sha256", d2,
+            ],
+        )
+        assert rc == 2
+        assert create_called is False
+        assert any(
+            line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines
+        ), lines
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # 3. evidence file missing blocks
 # ---------------------------------------------------------------------------
 
@@ -286,7 +342,9 @@ def test_phase_implementation_forced_blocks_without_overlap_preflight_args(
 ):
     _common_monkeypatches(monkeypatch, linked_issue=1458)
     monkeypatch.setattr(
-        open_pr, "get_linked_issue_labels", lambda repo, issue: ["phase/implementation"]
+        open_pr,
+        "fetch_current_linked_issue_labels",
+        lambda repo, issue: (["phase/implementation"], None),
     )
 
     def fail_if_called(*args, **kwargs):
@@ -305,10 +363,13 @@ def test_phase_implementation_forced_blocks_without_overlap_preflight_args(
 def test_no_forcing_without_label_and_without_required_flag_skips_gate(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Regression parity: no label, no --overlap-preflight-required -> gate inactive,
-    existing (pre-#1458) behavior is preserved."""
+    """Regression parity: fresh fetch succeeds with an empty label list, no
+    --overlap-preflight-required -> gate inactive, existing (pre-#1458)
+    behavior is preserved."""
     _common_monkeypatches(monkeypatch, linked_issue=1458)
-    monkeypatch.setattr(open_pr, "get_linked_issue_labels", lambda repo, issue: None)
+    monkeypatch.setattr(
+        open_pr, "fetch_current_linked_issue_labels", lambda repo, issue: ([], None)
+    )
 
     def fail_if_called(*args, **kwargs):
         raise AssertionError("overlap preflight subprocess should not run when gate is inactive")
@@ -318,6 +379,62 @@ def test_no_forcing_without_label_and_without_required_flag_skips_gate(
     rc, lines, create_called = _run_main(monkeypatch, 1458, [])
     assert rc == 0, lines
     assert create_called is True
+
+
+def test_labels_fetch_failure_fails_closed_blocks_pr_creation(monkeypatch: pytest.MonkeyPatch):
+    """P1-1: if the fresh labels re-fetch fails (auth error / bad JSON / type
+    mismatch / etc.), it must be treated as fail-closed (gate forced active),
+    never as 'no label' (fail-open)."""
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    monkeypatch.setattr(
+        open_pr,
+        "fetch_current_linked_issue_labels",
+        lambda repo, issue: (None, "gh issue view 失敗: simulated auth error"),
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("subprocess should not run when evidence is missing")
+
+    monkeypatch.setattr(open_pr.subprocess, "run", fail_if_called)
+
+    rc, lines, create_called = _run_main(monkeypatch, 1458, [])
+    assert rc == 2
+    assert create_called is False
+    assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING}" for line in lines), lines
+    assert any(line == "OVERLAP_PREFLIGHT_FORCED_BY_LABEL=true" for line in lines), lines
+    assert any(
+        line.startswith("OVERLAP_PREFLIGHT_LABELS_FETCH_ERROR=") for line in lines
+    ), lines
+
+
+def test_toctou_label_added_after_initial_fetch_still_forces_gate(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """P1-1 (TOCTOU): the gate-activation decision must always use a fresh
+    re-fetch taken immediately before the decision, never an earlier cached
+    value. This simulates a label added to the linked issue *after* any
+    earlier (unrelated) issue lookup but *before* PR creation: the fresh
+    re-fetch must observe it and force the gate."""
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    # get_linked_issue_state (an unrelated, earlier lookup) reports no
+    # knowledge of labels at all; only the fresh re-fetch right before the
+    # gate decision sees the label that was added in the mutation window.
+    monkeypatch.setattr(
+        open_pr,
+        "fetch_current_linked_issue_labels",
+        lambda repo, issue: (["phase/implementation"], None),
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("subprocess should not run when evidence is missing")
+
+    monkeypatch.setattr(open_pr.subprocess, "run", fail_if_called)
+
+    rc, lines, create_called = _run_main(monkeypatch, 1458, [])
+    assert rc == 2
+    assert create_called is False
+    assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING}" for line in lines), lines
+    assert any(line == "OVERLAP_PREFLIGHT_FORCED_BY_LABEL=true" for line in lines), lines
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +790,9 @@ def test_gate_runs_after_existing_pr_check_and_before_create_pr(monkeypatch: pyt
         return None
 
     monkeypatch.setattr(open_pr, "find_existing_pr", fake_find_existing_pr)
+    monkeypatch.setattr(
+        open_pr, "fetch_current_linked_issue_labels", lambda repo, issue: ([], None)
+    )
 
     stored = build_stored_evidence(decision_inputs_sha256="sha256:" + "b" * 64, current_issue_number=1458)
     evidence_path = write_evidence_file(stored)
@@ -712,7 +832,9 @@ def test_dry_run_skips_overlap_gate_entirely(monkeypatch: pytest.MonkeyPatch):
     """dry-run returns before the gate; the gate subprocess must never run."""
     _common_monkeypatches(monkeypatch, linked_issue=1458)
     monkeypatch.setattr(
-        open_pr, "get_linked_issue_labels", lambda repo, issue: ["phase/implementation"]
+        open_pr,
+        "fetch_current_linked_issue_labels",
+        lambda repo, issue: (["phase/implementation"], None),
     )
 
     def fail_if_called(*args, **kwargs):

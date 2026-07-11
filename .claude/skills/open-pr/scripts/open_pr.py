@@ -52,12 +52,18 @@ _CHECK_IMPLEMENTATION_OVERLAP_SCRIPT = (
     / "implement-issue" / "scripts" / "check_implementation_overlap.py"
 )
 
-# get_linked_issue_state() が取得した labels をキャッシュする（AC2）。
-# get_linked_issue_state がテストで monkeypatch されている場合はキャッシュが
-# 埋まらず get_linked_issue_labels() は None（unknown）を返す。呼び出し側は
-# unknown を「forced ではない」として扱う（best-effort mitigation。#1458
-# Dependency 節に明記された残存ギャップ）。
-_LINKED_ISSUE_LABELS_CACHE: dict[tuple[str, int], list[str]] = {}
+# P1-1 (PR #1467 review fix): 旧実装は get_linked_issue_state() が処理前半で
+# 一度だけ取得した labels をキャッシュし、`gh pr create` 直前の
+# forced_by_label 判定でそのキャッシュを再利用していた。これは
+# 「起動時点で label なし → gate 起動判定は stale cache を読む → 処理中に
+# 別プロセスが phase/implementation を付与 → gate が起動しないまま
+# gh pr create が呼ばれる」という TOCTOU を許した。さらに labels 取得不能
+# （None）を「forced ではない」として fail-open していた。
+#
+# 修正: gate 起動要否 (forced_by_label) の判定はこのキャッシュを一切使わず、
+# `gh pr create` 直前で毎回オンライン再取得する（fetch_current_linked_issue_labels）。
+# 取得失敗・型不正・JSON不正はすべて「ラベルなし」ではなく fail-closed
+# （gate を必ず有効化する）として扱う。
 
 
 def _classify_validator_errors(errors: list[object]) -> str:
@@ -172,28 +178,48 @@ def resolve_branch() -> str:
 def get_linked_issue_state(repo: str, issue_number: int) -> str | None:
     try:
         result = run_gh(
-            "issue", "view", str(issue_number), "--repo", repo, "--json", "state,labels"
+            "issue", "view", str(issue_number), "--repo", repo, "--json", "state"
         )
         data = json.loads(result.stdout)
     except (subprocess.SubprocessError, json.JSONDecodeError):
         return None
-    labels = data.get("labels") or []
-    label_names = [
-        (lbl.get("name") if isinstance(lbl, dict) else str(lbl)) for lbl in labels
-    ]
-    _LINKED_ISSUE_LABELS_CACHE[(repo, issue_number)] = label_names
+    if not isinstance(data, dict):
+        return None
     return data.get("state")
 
 
-def get_linked_issue_labels(repo: str, issue_number: int) -> list[str] | None:
-    """linked issue の label 一覧を返す（AC2: bypass-via-omission 対策）。
+def fetch_current_linked_issue_labels(
+    repo: str, issue_number: int
+) -> tuple[list[str] | None, str | None]:
+    """gate 起動要否 (forced_by_label) の判定 **直前** に labels をオンライン
+    再取得する（P1-1: TOCTOU 対策。PR #1467 review fix）。
 
-    `get_linked_issue_state()` が実行された際に同一の `gh issue view` 呼び出し
-    から labels もキャッシュされる。`get_linked_issue_state` がテストで
-    monkeypatch されている場合はキャッシュが埋まらず None（unknown）を返す。
-    呼び出し側は None を「forced ではない」として扱う。
+    `get_linked_issue_state()` の初回取得結果（または他のどのキャッシュ）も
+    この security decision には使わない。呼び出しごとに fresh に取得する。
+
+    Returns (label_names, error_detail)。取得に成功した場合は
+    `(list[str], None)`（label が無ければ空 list）。認証失敗・JSON不正・
+    型不正など取得に失敗した場合は `(None, <detail>)` を返す。呼び出し側は
+    これを「ラベルなし」ではなく fail-closed（gate を強制的に有効化する）
+    として扱わなければならない。
     """
-    return _LINKED_ISSUE_LABELS_CACHE.get((repo, issue_number))
+    try:
+        result = run_gh("issue", "view", str(issue_number), "--repo", repo, "--json", "labels")
+    except subprocess.SubprocessError as exc:
+        return None, f"gh issue view 失敗: {exc}"
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        return None, f"gh issue view の JSON parse に失敗: {exc}"
+    if not isinstance(data, dict):
+        return None, "gh issue view の出力が object ではありません"
+    labels = data.get("labels")
+    if not isinstance(labels, list):
+        return None, "labels フィールドが list ではありません"
+    label_names = [
+        (lbl.get("name") if isinstance(lbl, dict) else str(lbl)) for lbl in labels
+    ]
+    return label_names, None
 
 
 def find_existing_pr(repo: str, branch: str) -> dict | None:
@@ -602,6 +628,25 @@ def run_overlap_preflight_gate(
             None,
         )
 
+    # P2-1 (PR #1467 review fix): stored evidence の decision_inputs_sha256 を
+    # 呼び出し元が指定した expected_decision_inputs_sha256 と接続する
+    # provenance チェックを、オンライン再実行の **前** に行う。これを省くと
+    # 「evidence_sha256 は正しいが decision_inputs_sha256 が別の preflight
+    # collection chain のものである stored artifact」と「expected_decision_
+    # inputs_sha256 = fresh 側の値」という組み合わせが、stored/fresh の
+    # 独立検証だけでは検出できず通過してしまう（stored の provenance が
+    # fresh のそれと結び付けられていない）。
+    stored_decision_inputs_sha256 = stored.get("decision_inputs_sha256")
+    if stored_decision_inputs_sha256 != expected_decision_inputs_sha256:
+        return (
+            False,
+            E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID,
+            f"decision_inputs_sha256 不一致 (stored vs expected): "
+            f"stored={stored_decision_inputs_sha256} "
+            f"expected={expected_decision_inputs_sha256}",
+            None,
+        )
+
     cmd = [
         sys.executable,
         str(_CHECK_IMPLEMENTATION_OVERLAP_SCRIPT),
@@ -771,8 +816,16 @@ def main(argv: list[str] | None = None) -> int:
 
         # --- Overlap preflight hard gate (Issue #1458) ---
         # gh pr create 直前・既存 PR 検出/dry-run 処理より後に実行する。
-        labels = get_linked_issue_labels(repo, args.linked_issue)
-        forced_by_label = bool(labels) and FORCE_OVERLAP_PREFLIGHT_LABEL in labels
+        # P1-1 (PR #1467 review fix): forced_by_label の判定はここでオンライン
+        # 再取得した fresh labels のみを使う（stale cache は使わない）。取得
+        # 失敗は fail-closed（gate を必ず有効化する）として扱う。
+        fresh_labels, labels_fetch_error = fetch_current_linked_issue_labels(
+            repo, args.linked_issue
+        )
+        if labels_fetch_error is not None:
+            forced_by_label = True
+        else:
+            forced_by_label = FORCE_OVERLAP_PREFLIGHT_LABEL in (fresh_labels or [])
         overlap_gate_active = bool(args.overlap_preflight_required) or forced_by_label
         if overlap_gate_active:
             gate_ok, gate_error_code, gate_detail, _fresh_evidence = run_overlap_preflight_gate(
@@ -783,6 +836,8 @@ def main(argv: list[str] | None = None) -> int:
                 expected_decision_inputs_sha256=args.overlap_preflight_expected_decision_inputs_sha256,
             )
             emit_kv("OVERLAP_PREFLIGHT_FORCED_BY_LABEL", str(forced_by_label).lower())
+            if labels_fetch_error is not None:
+                emit_kv("OVERLAP_PREFLIGHT_LABELS_FETCH_ERROR", labels_fetch_error)
             if not gate_ok:
                 emit_error(gate_error_code or E_OVERLAP_PREFLIGHT_SOURCE_FAILURE, gate_detail)
                 return 2

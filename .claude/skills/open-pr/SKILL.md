@@ -154,15 +154,25 @@ EXISTING_PR=$(gh pr list --head <branch> --state open --json number,url --jq '.[
 `open_pr.py` は既存 PR 検出・dry-run 処理より後、`gh pr create` 呼び出し直前に、`overlap_preflight` が `required: true` の場合、または linked issue が `phase/implementation` ラベルを持つ場合（呼び出し元が `overlap_preflight` を未指定または `required: false` としていても、AC2 の bypass-via-omission 対策により省略されない）、以下を実行する:
 
 1. `evidence_file` の再読込と `expected_evidence_sha256`（stored evidence の embedded `evidence_sha256` との一致確認、evidence 自体の integrity 検証）
-2. `check_implementation_overlap.py`（`.claude/skills/implement-issue/scripts/check_implementation_overlap.py`。producer は変更せず subprocess として再実行するのみ）を同一 `--repo` / `--issue-number` でオンライン再実行し、fresh evidence を取得
-3. fresh evidence の `decision_inputs_sha256` と `expected_decision_inputs_sha256` の一致確認（collection 時点からの drift 検出）
-4. fresh evidence の `route`（`proceed` / `proceed_with_collision_evidence` のみ安全）・`source.complete`（`true` 必須）・`source.saturated`（`false` 必須）・`validation_errors`（空必須）・`dependency_resolution.unresolved_refs`（空配列必須）・`dependency_resolution.blocking_predecessor`（`null` 必須）・`current_issue.number`（`linked_issue` と一致必須）の安全性 predicate 検証
+2. stored evidence の `decision_inputs_sha256` と、呼び出し元が指定した `expected_decision_inputs_sha256` との一致確認（PR #1467 review fix, P2-1: stored artifact がどの preflight collection chain に属するかを確定する provenance チェック。ここで不一致なら `E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID` で停止し、オンライン再実行は行わない）
+3. `check_implementation_overlap.py`（`.claude/skills/implement-issue/scripts/check_implementation_overlap.py`。producer は変更せず subprocess として再実行するのみ）を同一 `--repo` / `--issue-number` でオンライン再実行し、fresh evidence を取得
+4. fresh evidence の `decision_inputs_sha256` と `expected_decision_inputs_sha256` の一致確認（collection 時点からの drift 検出。上記 2 で stored と expected の同一性が既に確認されているため、fresh がここで一致すれば stored・fresh 双方が同一 collection chain に属することが保証される）
+5. fresh evidence の `route`（`proceed` / `proceed_with_collision_evidence` のみ安全）・`source.complete`（`true` 必須）・`source.saturated`（`false` 必須）・`validation_errors`（空必須）・`dependency_resolution.unresolved_refs`（空配列必須）・`dependency_resolution.blocking_predecessor`（`null` 必須）・`current_issue.number`（`linked_issue` と一致必須）の安全性 predicate 検証
 
 いずれかが不成立の場合、`gh pr create` を呼ばず fail-closed で停止する（下記 Error Codes 参照）。オンライン再実行に使う `--repo` は `gh pr create --repo` にもそのまま渡される同一変数であり、これが AC8 の cross-repo binding mitigation の根拠（evidence 自体への `repository` フィールド追加は #1462 の scope。残存する cross-repo binding gap は本 gate では完全には閉じない）。
+
+`overlap_gate_active`（gate 起動要否, `forced_by_label` 判定）は `gh pr create` 呼び出し直前に毎回オンラインで linked issue の labels を再取得して決定する（PR #1467 review fix, P1-1）。処理前半で取得した labels のキャッシュはこの security decision には使わない（TOCTOU 対策）。labels 再取得が失敗した場合（認証エラー・JSON 不正・型不正等）は「ラベルなし」として扱わず fail-closed（gate を必ず有効化する）。
 
 注記: 本機構は「TOCTOU を完全に排除する」ものではない。GitHub の PR 作成 API には issue body の SHA に紐づく precondition / If-Match 機構が存在しないため、これは **mutation 直前の bounded freshness gate**（race window を狭める設計）であり、atomic な保証ではない。
 
 `dry_run: true` の場合、本 gate は実行されない（`gh pr create` 自体を呼ばないため）。
+
+#### 既知の限界（暫定的 mitigation であることの明記, PR #1467 review fix）
+
+- 本 gate は現時点では **native GitHub issue dependency（`blockedBy` / `blocking`）を含まない暫定的 mitigation** である。`check_implementation_overlap.py` は producer 側（`implement-issue` skill、Allowed Paths 外）であり、本 Issue（PR #1467 の fix delta）のスコープでは変更できない。
+- `dependency_resolution.unresolved_refs == []` や `blocking_predecessor == null` は「依存が存在しないことの証明」ではない。これらは producer が観測できた範囲（Issue 本文 / コメントに書かれた `Depends on` 等のテキスト参照）内で依存が見つからなかったことの確認に留まり、GitHub の native issue dependency グラフ（`blockedBy` / `blocking`）を反映していない。
+- native dependency の取得と、`repository` フィールドの schema migration は #1462（未マージ）の scope。#1462 がマージされるまでは、producer が観測していない native dependency が残存ギャップとして存在し続ける。
+- `repository` フィールド追加を additive migration（V1 のまま拡張）にするか schema V2 bump にするかは、本 Issue のスコープでは決定しない。#1462 側で明示的に決定すること。
 
 ### 5. PR 作成
 
