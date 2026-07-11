@@ -2280,23 +2280,21 @@ def _git_worktree_status(file_path: Path, repo_root: Path) -> str:
 def build_py_compile_proof(script_path: Path, repo_root: Path) -> dict:
     """Generate PY_COMPILE_PROOF_V1 artifact for a Python script.
 
-    Runs ``python3 -m py_compile`` and records the full execution context
-    so that the caller can prove which interpreter / commit / file blob was
-    checked, not just whether compilation succeeded.
+    Compiles the source in-process without materializing a bytecode cache.
+    ``python -m py_compile`` is intentionally not used here: it writes a
+    ``__pycache__`` entry next to the source even when descendant imports have
+    ``PYTHONDONTWRITEBYTECODE`` enabled.  The privileged executor must retain
+    source-tree write attribution, so provenance generation cannot create an
+    otherwise unauthorized cache file.
     """
     script_realpath = str(script_path.resolve())
-    command = [sys.executable, "-m", "py_compile", script_realpath]
+    command = ["in_process", "compile", script_realpath]
 
     try:
-        proc = subprocess.run(
-            command,
-            shell=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        py_compile_status = "pass" if proc.returncode == 0 else "fail"
-        stderr_text = proc.stderr or ""
+        source = script_path.read_text(encoding="utf-8")
+        compile(source, script_realpath, "exec")
+        py_compile_status = "pass"
+        stderr_text = ""
     except Exception as exc:
         py_compile_status = "fail"
         stderr_text = str(exc)
