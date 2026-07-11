@@ -17,14 +17,14 @@ FIXTURES = REPO_ROOT / "tests" / "fixtures" / "codex"
 VALID_MANIFEST = REPO_ROOT / "tests" / "fixtures" / "agent-session-manifest" / "valid-basic.json"
 
 
-def run_adapter(event: str, payload, expect_exit: int = 0, env=None):
+def run_adapter(event: str, payload, expect_exit: int = 0, env=None, cwd=None):
     data = payload if isinstance(payload, str) else json.dumps(payload)
     result = subprocess.run(
         ["node", str(ADAPTER), "--event", event],
         input=data,
         text=True,
         capture_output=True,
-        cwd=REPO_ROOT,
+        cwd=cwd if cwd is not None else REPO_ROOT,
         check=False,
         env=env,
     )
@@ -543,3 +543,155 @@ def test_manifest_written_to_default_root_when_env_unset():
         assert validation.returncode == 0, validation.stderr
     finally:
         new_file.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Issue #1408 AC1/AC2/AC3/AC5: publish lane approval bridge for
+# `rtk git push origin HEAD:refs/heads/<active-branch>` — positive lane and
+# negative lane fixtures through the real PreToolUse entrypoint.
+# ---------------------------------------------------------------------------
+
+def _init_publish_lane_repo(repo: Path, branch: str) -> str:
+    """Create a throwaway git repo checked out on `branch` with one commit and
+    return its HEAD sha (used as the matching local/declared/verified head)."""
+    subprocess.run(["git", "init", "-q", "-b", branch], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("x")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    return head
+
+
+def _publish_lane_env(head: str) -> dict:
+    env = os.environ.copy()
+    env["LOOP_PUBLISH_EXPECTED_REMOTE_HEAD"] = head
+    env["LOOP_PUBLISH_CURRENT_REMOTE_HEAD"] = head
+    env["LOOP_PUBLISH_DECLARED_PUBLISH_HEAD"] = head
+    env["LOOP_PUBLISH_VERIFIED_HEAD"] = head
+    env["LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS"] = "ok"
+    env["LOOP_PUBLISH_REMOTE_READBACK_SOURCE"] = "fetch_then_show_ref"
+    return env
+
+
+def test_pre_tool_use_rtk_git_push_allowed_with_validated_publish_lane(tmp_path: Path):
+    """AC1: rtk git push origin HEAD:refs/heads/<active-branch> with matching publish
+    lane evidence is NOT denied by the generic remote_write_requires_approval guard."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    branch = "worktree-issue-1408-publish-lane"
+    head = _init_publish_lane_repo(repo, branch)
+    env = _publish_lane_env(head)
+
+    command = f"rtk git push origin HEAD:refs/heads/{branch}"
+    result = run_adapter("PreToolUse", {"tool_input": {"command": command}}, env=env, cwd=repo)
+    # Allowed: adapter emits no deny (null guard result => stdout stays empty).
+    assert result.stdout == "", result.stdout
+
+
+def test_pre_tool_use_rtk_git_push_denied_without_publish_lane_context(tmp_path: Path):
+    """AC3: rtk git push with no publish lane env vars at all is denied with a
+    PUBLISH_SAFETY_STOP_REPORT_V1-shaped reason (boundary_layer / reason_code /
+    head comparison values / required decisions), not the generic remote_write deny."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    branch = "worktree-issue-1408-publish-lane"
+    _init_publish_lane_repo(repo, branch)
+    env = os.environ.copy()
+    for key in (
+        "LOOP_PUBLISH_EXPECTED_REMOTE_HEAD",
+        "LOOP_PUBLISH_CURRENT_REMOTE_HEAD",
+        "LOOP_PUBLISH_DECLARED_PUBLISH_HEAD",
+        "LOOP_PUBLISH_VERIFIED_HEAD",
+        "LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS",
+        "LOOP_PUBLISH_REMOTE_READBACK_SOURCE",
+    ):
+        env.pop(key, None)
+
+    command = f"rtk git push origin HEAD:refs/heads/{branch}"
+    result = run_adapter("PreToolUse", {"tool_input": {"command": command}}, env=env, cwd=repo)
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "publish_lane_safety_stop" in reason
+    assert "boundary_layer=codex_hook_adapter_pretooluse" in reason
+    assert "reason_code=publish_guard_context_missing" in reason
+    assert "required_decisions=" in reason
+
+
+def test_pre_tool_use_rtk_git_push_head_mismatch_denied(tmp_path: Path):
+    """AC3: expected/current/local/verified/declared head mismatch denies with the
+    structured publish_lane_safety_stop reason (local_head_mismatch here)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    branch = "worktree-issue-1408-publish-lane"
+    head = _init_publish_lane_repo(repo, branch)
+    env = _publish_lane_env(head)
+    env["LOOP_PUBLISH_DECLARED_PUBLISH_HEAD"] = "c" * 40
+
+    command = f"rtk git push origin HEAD:refs/heads/{branch}"
+    result = run_adapter("PreToolUse", {"tool_input": {"command": command}}, env=env, cwd=repo)
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "publish_lane_safety_stop" in reason
+    assert "reason_code=local_head_mismatch" in reason
+    assert f"declared_publish_head={'c' * 40}" in reason
+
+
+def test_pre_tool_use_rtk_git_push_allowed_paths_gate_not_ok_denied(tmp_path: Path):
+    """AC3: LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS != ok denies with the structured
+    publish_lane_safety_stop reason (allowed_paths_gate_not_ok)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    branch = "worktree-issue-1408-publish-lane"
+    head = _init_publish_lane_repo(repo, branch)
+    env = _publish_lane_env(head)
+    env["LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS"] = "indeterminate"
+
+    command = f"rtk git push origin HEAD:refs/heads/{branch}"
+    result = run_adapter("PreToolUse", {"tool_input": {"command": command}}, env=env, cwd=repo)
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "publish_lane_safety_stop" in reason
+    assert "reason_code=allowed_paths_gate_not_ok" in reason
+
+
+def test_pre_tool_use_rtk_git_push_force_flag_denied_even_with_lane_evidence(tmp_path: Path):
+    """AC4: force push is denied even when publish lane evidence is otherwise valid."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    branch = "worktree-issue-1408-publish-lane"
+    head = _init_publish_lane_repo(repo, branch)
+    env = _publish_lane_env(head)
+
+    command = f"rtk git push --force origin HEAD:refs/heads/{branch}"
+    result = run_adapter("PreToolUse", {"tool_input": {"command": command}}, env=env, cwd=repo)
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "publish_lane_safety_stop" in reason
+    assert "reason_code=push_refspec_requires_active_branch" in reason
+
+
+def test_pre_tool_use_raw_git_push_still_denied_generic_reason(tmp_path: Path):
+    """AC2: a raw (non-rtk) git push is unaffected by the publish lane bridge and
+    keeps the generic remote_write_requires_approval deny — even with a fully
+    valid publish lane env present (the shape check gates the bridge, not env vars)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    branch = "worktree-issue-1408-publish-lane"
+    head = _init_publish_lane_repo(repo, branch)
+    env = _publish_lane_env(head)
+
+    command = f"git push origin HEAD:refs/heads/{branch}"
+    result = run_adapter("PreToolUse", {"tool_input": {"command": command}}, env=env, cwd=repo)
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "remote_write_requires_approval" in reason
+    assert "publish_lane_safety_stop" not in reason

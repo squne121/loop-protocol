@@ -45,6 +45,7 @@ class GitMutationPolicyResult:
     remote_readback_source: str | None = None
     decision_inputs_complete: bool | None = None
     required_decisions: tuple[str, ...] = ()
+    boundary_layer: str | None = None
 
 
 @dataclass(frozen=True)
@@ -471,6 +472,7 @@ def _publish_safety_stop_result(
     pr_number: str | None,
     remote_readback_source: str | None,
     decision_inputs_complete: bool,
+    boundary_layer: str,
 ) -> GitMutationPolicyResult:
     return GitMutationPolicyResult(
         status="deny",
@@ -495,6 +497,7 @@ def _publish_safety_stop_result(
             "PR branch を linked issue 専用 head へ戻す",
             "混入 commit を別 PR / 別 branch へ退避する",
         ),
+        boundary_layer=boundary_layer,
     )
 
 
@@ -503,8 +506,15 @@ def classify_rtk_git_mutation(
     *,
     cwd: str,
     require_active_branch_push: bool,
+    boundary_layer: str = "worktree_scope_guard_denied",
 ) -> GitMutationPolicyResult | None:
-    """Return a bounded policy result for recognized `rtk git` commands."""
+    """Return a bounded policy result for recognized `rtk git` commands.
+
+    `boundary_layer` identifies the PreToolUse-layer caller for
+    `PUBLISH_SAFETY_STOP_REPORT_V1`-shaped deny reasons (Issue #1408). It
+    defaults to the historical `worktree_scope_guard_denied` value used by
+    `.claude/hooks/worktree_scope_guard.py` so existing callers are unaffected.
+    """
     tokens = _tokenize(command)
     if not tokens:
         return None
@@ -656,6 +666,7 @@ def classify_rtk_git_mutation(
             pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
             remote_readback_source=os.environ.get("LOOP_PUBLISH_REMOTE_READBACK_SOURCE", "").strip().lower(),
             decision_inputs_complete=False,
+            boundary_layer=boundary_layer,
         )
     if publish_guard is not None:
         current_remote_head = publish_guard.current_remote_head
@@ -674,6 +685,7 @@ def classify_rtk_git_mutation(
                     pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
                     remote_readback_source=publish_guard.remote_readback_source,
                     decision_inputs_complete=False,
+                    boundary_layer=boundary_layer,
                 )
             current_remote_head = live_remote_head
         remote_drift_reason = None
@@ -696,7 +708,7 @@ def classify_rtk_git_mutation(
             remote_readback_source=publish_guard.remote_readback_source,
             decision_inputs_complete=publish_guard.decision_inputs_complete,
             remote_drift_reason=remote_drift_reason,
-            boundary_layer="worktree_scope_guard_denied",
+            boundary_layer=boundary_layer,
             issue_number=int(os.environ.get("LOOP_ISSUE_NUMBER", "0") or "0"),
             pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
         )
@@ -713,6 +725,7 @@ def classify_rtk_git_mutation(
                 pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
                 remote_readback_source=publish_guard.remote_readback_source,
                 decision_inputs_complete=publish_guard.decision_inputs_complete,
+                boundary_layer=boundary_layer,
             )
     return GitMutationPolicyResult(
         status="allow",
@@ -728,4 +741,79 @@ def classify_rtk_git_mutation(
         pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
         remote_readback_source=publish_guard.remote_readback_source,
         decision_inputs_complete=publish_guard.decision_inputs_complete,
+        boundary_layer=boundary_layer,
     )
+
+
+def _result_to_json(result: GitMutationPolicyResult | None) -> dict:
+    """Serialize a `classify_rtk_git_mutation` result for the `--json` CLI mode
+    (Issue #1408: consumed by `scripts/session-recording/codex-hook-adapter.mjs`
+    so the PreToolUse publish-lane decision is not re-implemented in JS)."""
+    if result is None:
+        return {"status": "no_match"}
+    return {
+        "status": result.status,
+        "command_class": result.command_class,
+        "reason_code": result.reason_code,
+        "suggested_command": result.suggested_command,
+        "verification_command": result.verification_command,
+        "expected_remote_head": result.expected_remote_head,
+        "current_remote_head": result.current_remote_head,
+        "local_head": result.local_head,
+        "verified_head": result.verified_head,
+        "declared_publish_head": result.declared_publish_head,
+        "allowed_paths_gate_status": result.allowed_paths_gate_status,
+        "target_branch": result.target_branch,
+        "pr_number": result.pr_number,
+        "remote_readback_source": result.remote_readback_source,
+        "decision_inputs_complete": result.decision_inputs_complete,
+        "required_decisions": list(result.required_decisions),
+        "boundary_layer": result.boundary_layer,
+    }
+
+
+def _build_cli_parser():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Classify a single command via classify_rtk_git_mutation and print the "
+            "result as JSON. Non-`rtk git` commands and unrecognized shapes print "
+            '{"status": "no_match"}. This CLI wrapper is the single reuse surface for '
+            "non-Python callers (Issue #1408) — it does not re-implement policy logic."
+        )
+    )
+    parser.add_argument("--command", required=True, help="the shell command string to classify")
+    parser.add_argument("--cwd", required=True, help="working directory the command would run in")
+    parser.add_argument(
+        "--boundary-layer",
+        default="worktree_scope_guard_denied",
+        help="caller identifier embedded in safety-stop deny results (default: worktree_scope_guard_denied)",
+    )
+    parser.add_argument(
+        "--no-require-active-branch-push",
+        action="store_true",
+        help="disable the require_active_branch_push check (default: enabled)",
+    )
+    return parser
+
+
+def _main(argv: list[str] | None = None) -> int:
+    import json as json_module
+    import sys
+
+    args = _build_cli_parser().parse_args(argv if argv is not None else sys.argv[1:])
+    result = classify_rtk_git_mutation(
+        args.command,
+        cwd=args.cwd,
+        require_active_branch_push=not args.no_require_active_branch_push,
+        boundary_layer=args.boundary_layer,
+    )
+    print(json_module.dumps(_result_to_json(result)))
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    raise SystemExit(_main(sys.argv[1:]))

@@ -65,6 +65,12 @@ Codex CLI は同一 event に matching する複数の command hooks を **concu
 - **#360（destination guard policy）**: remote write の許可 policy 自体の見直しは #360 が担当する。本 #783 は deny reason の分類整理のみ。`remote_write_requires_approval` を自動許可に変更する設計は #360 スコープ。
 - **#639（PR body mutation enforcement）**: PR body の mutation 強制実装は #639 が担当する。本 #783 は hook output shape の整形のみ。
 
+### publish lane approval bridge（#1408・#360 との責務差分）
+
+- **#360（destination guard policy）**: main/master への push destination そのものを拒否する汎用 guard。判定対象は push 先ブランチであり、証跡の有無に関わらず適用される。本境界は #1408 実装後も変更しない。
+- **publish lane approval bridge（#1408）**: `codex-hook-adapter.mjs` の PreToolUse remote write 判定に限定して追加された、狭い bypass 経路。`rtk git push origin HEAD:refs/heads/<active-branch>` かつ `scripts/agent-guards/git_mutation_command_policy.py` の bounded policy（expected/current/local/verified/declared head 比較、`LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS`）が `status: allow` を返した場合のみ、generic `remote_write_requires_approval` deny を経由せず通過する。安全判定ロジック自体は `git_mutation_command_policy.py` の再利用であり、hook adapter 側に別実装の安全判定は追加していない。
+- force/tag/all/delete/mirror push、直接 `git push`、`git -C <dir> push`、wrapper bypass は publish lane approval bridge の対象外であり、引き続き deny される（#360 の destination guard および既存 deny reason taxonomy がそのまま適用される）。
+
 ---
 
 ## codex exec live smoke（diagnostic-only、#783 追加・診断限定）
