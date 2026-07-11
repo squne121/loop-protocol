@@ -875,9 +875,17 @@ class TestContractSnapshotPublish:
         with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
             with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
                 with patch.object(_exec, "_check_contract_snapshot_module_realpaths", return_value=[]):
-                    with patch.object(_exec, "_fetch_issue_body_and_updated_at", return_value=("current issue body", "now", "")):
+                    with patch.object(
+                        _exec,
+                        "_fetch_issue_body_and_updated_at",
+                        return_value=("current issue body", "now", ""),
+                    ):
                         with patch("subprocess.run", return_value=fake_proc):
-                            with patch.object(_exec, "_readback_contract_snapshot", return_value={"error": "expected_contract_marker_match_count_0"}):
+                            with patch.object(
+                                _exec,
+                                "_readback_contract_snapshot",
+                                return_value={"error": "expected_contract_marker_match_count_0"},
+                            ):
                                 rc = _exec.main([
                                     "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
                                     "--issue-number", "1284", "--input-file", rel,
