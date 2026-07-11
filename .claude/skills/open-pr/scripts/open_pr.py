@@ -28,6 +28,37 @@ E_GH_FAILURE = "E_GH_FAILURE"
 E_SCHEMA_CONSUMER_INVENTORY_MISSING = "E_SCHEMA_CONSUMER_INVENTORY_MISSING"
 E_PR_BODY_JAPANESE_VALIDATION_FAILED = "E_PR_BODY_JAPANESE_VALIDATION_FAILED"
 
+# --- Overlap preflight hard gate (Issue #1458) ---
+E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING = "E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING"
+E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID = "E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID"
+E_OVERLAP_PREFLIGHT_DRIFT = "E_OVERLAP_PREFLIGHT_DRIFT"
+E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE = "E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE"
+E_OVERLAP_PREFLIGHT_SOURCE_FAILURE = "E_OVERLAP_PREFLIGHT_SOURCE_FAILURE"
+
+# `check_implementation_overlap.py`（implement-issue 専用の overlap preflight
+# adapter）の evidence schema。本ファイルは producer を変更せず subprocess として
+# 再実行するのみ（#1458 の Out of Scope）。
+OVERLAP_PREFLIGHT_SCHEMA = "IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1"
+OVERLAP_PREFLIGHT_SAFE_ROUTES = frozenset({"proceed", "proceed_with_collision_evidence"})
+
+# linked issue がこのラベルを持つ場合、`overlap_preflight` が未指定または
+# `required: false` でも gate を省略しない（AC2, bypass-via-omission 対策）。
+FORCE_OVERLAP_PREFLIGHT_LABEL = "phase/implementation"
+
+# `.claude/skills/implement-issue/scripts/check_implementation_overlap.py`
+# （open-pr の Allowed Paths 外、変更しない。subprocess として再実行するのみ）。
+_CHECK_IMPLEMENTATION_OVERLAP_SCRIPT = (
+    Path(__file__).resolve().parent.parent.parent
+    / "implement-issue" / "scripts" / "check_implementation_overlap.py"
+)
+
+# get_linked_issue_state() が取得した labels をキャッシュする（AC2）。
+# get_linked_issue_state がテストで monkeypatch されている場合はキャッシュが
+# 埋まらず get_linked_issue_labels() は None（unknown）を返す。呼び出し側は
+# unknown を「forced ではない」として扱う（best-effort mitigation。#1458
+# Dependency 節に明記された残存ギャップ）。
+_LINKED_ISSUE_LABELS_CACHE: dict[tuple[str, int], list[str]] = {}
+
 
 def _classify_validator_errors(errors: list[object]) -> str:
     """Classify validator errors list into an error code.
@@ -64,6 +95,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs="*",
         default=None,
         help="変更ファイルパスのリスト。未指定時は git diff から決定論的に解決する。",
+    )
+    p.add_argument(
+        "--overlap-preflight-required",
+        action="store_true",
+        help=(
+            "overlap_preflight evidence 検証を必須化する（phase/implementation "
+            "ラベル付き linked issue は未指定でも自動的に必須化される。AC2）"
+        ),
+    )
+    p.add_argument(
+        "--overlap-preflight-evidence-file",
+        type=Path,
+        default=None,
+        help="check_implementation_overlap.py が出力した evidence JSON のパス",
+    )
+    p.add_argument(
+        "--overlap-preflight-expected-evidence-sha256",
+        default=None,
+        help="stored evidence file の embedded evidence_sha256 と照合する期待値（sha256:...）",
+    )
+    p.add_argument(
+        "--overlap-preflight-expected-decision-inputs-sha256",
+        default=None,
+        help="オンライン再実行の fresh decision_inputs_sha256 と照合する期待値（sha256:...）",
     )
     return p.parse_args(argv)
 
@@ -116,10 +171,29 @@ def resolve_branch() -> str:
 
 def get_linked_issue_state(repo: str, issue_number: int) -> str | None:
     try:
-        result = run_gh("issue", "view", str(issue_number), "--repo", repo, "--json", "state")
-        return json.loads(result.stdout).get("state")
+        result = run_gh(
+            "issue", "view", str(issue_number), "--repo", repo, "--json", "state,labels"
+        )
+        data = json.loads(result.stdout)
     except (subprocess.SubprocessError, json.JSONDecodeError):
         return None
+    labels = data.get("labels") or []
+    label_names = [
+        (lbl.get("name") if isinstance(lbl, dict) else str(lbl)) for lbl in labels
+    ]
+    _LINKED_ISSUE_LABELS_CACHE[(repo, issue_number)] = label_names
+    return data.get("state")
+
+
+def get_linked_issue_labels(repo: str, issue_number: int) -> list[str] | None:
+    """linked issue の label 一覧を返す（AC2: bypass-via-omission 対策）。
+
+    `get_linked_issue_state()` が実行された際に同一の `gh issue view` 呼び出し
+    から labels もキャッシュされる。`get_linked_issue_state` がテストで
+    monkeypatch されている場合はキャッシュが埋まらず None（unknown）を返す。
+    呼び出し側は None を「forced ではない」として扱う。
+    """
+    return _LINKED_ISSUE_LABELS_CACHE.get((repo, issue_number))
 
 
 def find_existing_pr(repo: str, branch: str) -> dict | None:
@@ -431,6 +505,156 @@ def _run_japanese_content_validator(
     finally:
         Path(body_file.name).unlink(missing_ok=True)
 
+def _overlap_preflight_evidence_sha256(payload: dict) -> str:
+    """producer（`check_implementation_overlap.py`）と同一の canonicalization
+    契約（`json.dumps(payload, sort_keys=True, ensure_ascii=True,
+    separators=(",", ":"))` を経て sha256 hex 化し `sha256:` を前置）で
+    embedded `evidence_sha256` を再計算する。"""
+    body = {k: v for k, v in payload.items() if k != "evidence_sha256"}
+    canonical = json.dumps(body, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
+def _load_overlap_preflight_evidence(
+    evidence_file: Path | None,
+) -> tuple[dict | None, str | None]:
+    """stored evidence file を読み込み検証する。
+
+    Returns (stored_evidence, error_code)。error_code は成功時 None。
+    ファイル欠落は E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING、parse 失敗・
+    スキーマ不一致は E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID（AC5/AC7）。
+    """
+    if evidence_file is None or not evidence_file.exists():
+        return None, E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING
+    try:
+        raw = evidence_file.read_text(encoding="utf-8")
+        stored = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID
+    if not isinstance(stored, dict) or stored.get("schema") != OVERLAP_PREFLIGHT_SCHEMA:
+        return None, E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID
+    if "evidence_sha256" not in stored or "decision_inputs_sha256" not in stored:
+        return None, E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID
+    return stored, None
+
+
+def _overlap_preflight_safety_reason(fresh: dict, linked_issue: int) -> str | None:
+    """AC4 の安全性 predicate を検証する。violation があれば理由文字列、
+    なければ None を返す。"""
+    if not isinstance(fresh, dict) or fresh.get("schema") != OVERLAP_PREFLIGHT_SCHEMA:
+        return "schema_mismatch"
+    if fresh.get("route") not in OVERLAP_PREFLIGHT_SAFE_ROUTES:
+        return f"unsafe_route:{fresh.get('route')!r}"
+    source = fresh.get("source")
+    if not isinstance(source, dict) or source.get("complete") is not True:
+        return "source_incomplete"
+    if not isinstance(source, dict) or source.get("saturated") is not False:
+        return "source_saturated"
+    if fresh.get("validation_errors") != {}:
+        return "validation_errors_present"
+    dependency_resolution = fresh.get("dependency_resolution")
+    if not isinstance(dependency_resolution, dict) or dependency_resolution.get("unresolved_refs") != []:
+        return "unresolved_refs_present"
+    if not isinstance(dependency_resolution, dict) or dependency_resolution.get("blocking_predecessor") is not None:
+        return "blocking_predecessor_present"
+    current_issue = fresh.get("current_issue")
+    if not isinstance(current_issue, dict) or current_issue.get("number") != linked_issue:
+        return "current_issue_number_mismatch"
+    return None
+
+
+def run_overlap_preflight_gate(
+    *,
+    repo: str,
+    linked_issue: int,
+    evidence_file: Path | None,
+    expected_evidence_sha256: str | None,
+    expected_decision_inputs_sha256: str | None,
+) -> tuple[bool, str | None, str, dict | None]:
+    """`gh pr create` 呼び出し直前の overlap preflight hard gate（Issue #1458）。
+
+    `repo` は本関数呼び出し元（`main()`）が `gh pr create --repo` にもそのまま
+    渡す同一変数であり、これが AC8 の cross-repo binding mitigation の根拠
+    （オンライン再実行と PR 作成に使う `--repo` の一致は単一のソースオブ
+    トゥルースとして構造的に保証される。evidence 自体への `repository`
+    フィールド追加は #1462 の scope）。
+
+    Returns (ok, error_code, detail, fresh_evidence)。ok=True の場合
+    error_code は None、detail は空文字列。
+    """
+    stored, load_error = _load_overlap_preflight_evidence(evidence_file)
+    if load_error is not None:
+        detail = (
+            f"evidence_file が存在しないか読み込めません: {evidence_file}"
+            if load_error == E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING
+            else f"evidence_file の parse/schema が不正です: {evidence_file}"
+        )
+        return False, load_error, detail, None
+
+    recomputed = _overlap_preflight_evidence_sha256(stored)
+    stored_sha = stored.get("evidence_sha256")
+    if recomputed != stored_sha or stored_sha != expected_evidence_sha256:
+        return (
+            False,
+            E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID,
+            f"evidence_sha256 不一致: stored={stored_sha} recomputed={recomputed} "
+            f"expected={expected_evidence_sha256}",
+            None,
+        )
+
+    cmd = [
+        sys.executable,
+        str(_CHECK_IMPLEMENTATION_OVERLAP_SCRIPT),
+        "--issue-number",
+        str(linked_issue),
+        "--repo",
+        repo,
+    ]
+    try:
+        cp = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=90)
+    except subprocess.TimeoutExpired as exc:
+        return False, E_OVERLAP_PREFLIGHT_SOURCE_FAILURE, f"subprocess timeout: {exc}", None
+    except OSError as exc:
+        return False, E_OVERLAP_PREFLIGHT_SOURCE_FAILURE, f"subprocess spawn error: {exc}", None
+
+    if cp.returncode != 0:
+        return (
+            False,
+            E_OVERLAP_PREFLIGHT_SOURCE_FAILURE,
+            f"check_implementation_overlap.py exit {cp.returncode}: "
+            f"{(cp.stderr or cp.stdout or '').strip()[:500]}",
+            None,
+        )
+
+    try:
+        fresh = json.loads(cp.stdout)
+    except json.JSONDecodeError:
+        return (
+            False,
+            E_OVERLAP_PREFLIGHT_SOURCE_FAILURE,
+            f"non-JSON output: {(cp.stdout or '').strip()[:500]}",
+            None,
+        )
+    if not isinstance(fresh, dict):
+        return False, E_OVERLAP_PREFLIGHT_SOURCE_FAILURE, "non-object JSON output", None
+
+    fresh_decision_inputs = fresh.get("decision_inputs_sha256")
+    if expected_decision_inputs_sha256 is None or fresh_decision_inputs != expected_decision_inputs_sha256:
+        return (
+            False,
+            E_OVERLAP_PREFLIGHT_DRIFT,
+            f"decision_inputs_sha256 drift: expected={expected_decision_inputs_sha256} "
+            f"fresh={fresh_decision_inputs}",
+            fresh,
+        )
+
+    unsafe_reason = _overlap_preflight_safety_reason(fresh, linked_issue)
+    if unsafe_reason is not None:
+        return False, E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE, unsafe_reason, fresh
+
+    return True, None, "", fresh
+
+
 def create_pr(repo: str, title: str, body_file: Path, branch: str, draft: bool) -> str:
     args = [
         "pr",
@@ -544,6 +768,24 @@ def main(argv: list[str] | None = None) -> int:
             emit_kv("LINK_KIND", link_kind)
             emit_kv("DRAFT", str(draft).lower())
             return 0
+
+        # --- Overlap preflight hard gate (Issue #1458) ---
+        # gh pr create 直前・既存 PR 検出/dry-run 処理より後に実行する。
+        labels = get_linked_issue_labels(repo, args.linked_issue)
+        forced_by_label = bool(labels) and FORCE_OVERLAP_PREFLIGHT_LABEL in labels
+        overlap_gate_active = bool(args.overlap_preflight_required) or forced_by_label
+        if overlap_gate_active:
+            gate_ok, gate_error_code, gate_detail, _fresh_evidence = run_overlap_preflight_gate(
+                repo=repo,
+                linked_issue=args.linked_issue,
+                evidence_file=args.overlap_preflight_evidence_file,
+                expected_evidence_sha256=args.overlap_preflight_expected_evidence_sha256,
+                expected_decision_inputs_sha256=args.overlap_preflight_expected_decision_inputs_sha256,
+            )
+            emit_kv("OVERLAP_PREFLIGHT_FORCED_BY_LABEL", str(forced_by_label).lower())
+            if not gate_ok:
+                emit_error(gate_error_code or E_OVERLAP_PREFLIGHT_SOURCE_FAILURE, gate_detail)
+                return 2
 
         try:
             pr_url = create_pr(repo, args.pr_title, final_body_path, branch, draft)
