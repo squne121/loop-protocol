@@ -41,6 +41,7 @@ def _payload_item(
         else [{"kind": "pytest_nodeid", "key": "tests/test_alpha.py::test_ok"}],
         "exit_code": exit_code,
         "category": category,
+        "classification": "expected_fail",
         "decision": "blocked",
         "raw_command": raw_command,
         "raw_stdout": "pytest output",
@@ -51,6 +52,7 @@ def _payload_item(
 def _snapshot_payload(items: list[dict[str, object]]) -> dict:
     return {
         "schema": "CONTRACT_REVIEW_RESULT_V1",
+        "status": "go",
         "body_sha256": "sha256:" + "b" * 64,
         "checks": {
             "vc_preflight": {
@@ -68,6 +70,13 @@ def _current_payload(
 ) -> dict:
     payload = {
         "schema": "baseline_vc_preflight/v1",
+        "generated_at": "2026-07-11T10:00:00Z",
+        "status": "pass",
+        "errors": [],
+        "fallback_detected": False,
+        "human_review_required": False,
+        "stop_condition_triggered": False,
+        "source": {"body_sha256": "sha256:" + "b" * 64},
         "results": items,
     }
     if head_sha is not None:
@@ -119,7 +128,7 @@ def test_no_diff_same_baseline_failure_is_pre_existing_nonblocking():
 def test_ac3_failure_key_evidence_missing_becomes_indeterminate_blocking():
     baseline = _snapshot_payload([_payload_item("AC1", command_hash="sha256:" + "a" * 64)])
     current = _current_payload(
-        [_payload_item("AC1", command_hash="sha256:" + "b" * 64, failure_keys=[])],
+        [_payload_item("AC1", command_hash="sha256:" + "a" * 64, failure_keys=[])],
         head_sha="head1",
         reviewed_head_sha="head1",
     )
@@ -150,7 +159,7 @@ def test_diff_related_failure_is_regression_blocking():
         [
             _payload_item(
                 "AC1",
-                command_hash="sha256:" + "b" * 64,
+                command_hash="sha256:" + "a" * 64,
                 failure_keys=[{"kind": "pytest_nodeid", "key": "src/main.py::test_regression"}],
             )
         ],
@@ -176,7 +185,7 @@ def test_allowed_paths_glob_matcher_v2_relevance_is_regression_blocking():
         [
             _payload_item(
                 "AC1",
-                command_hash="sha256:" + "b" * 64,
+                command_hash="sha256:" + "a" * 64,
                 failure_keys=[
                     {
                         "kind": "pytest_nodeid",
@@ -204,7 +213,7 @@ def test_allowed_paths_glob_matcher_v2_relevance_is_regression_blocking():
 def test_pytest_exit_5_is_not_regression_fail():
     baseline = _snapshot_payload([_payload_item("AC1")])
     current = _current_payload(
-        [_payload_item("AC1", command_hash="sha256:" + "b" * 64, exit_code=5, category="vc_no_tests_collected")],
+            [_payload_item("AC1", command_hash="sha256:" + "a" * 64, exit_code=5, category="vc_no_tests_collected")],
         head_sha="head1",
         reviewed_head_sha="head1",
     )
@@ -240,6 +249,103 @@ def test_current_head_mismatch_is_indeterminate_blocking():
     assert result["source_integrity"]["evidence_fresh"] is False
 
 
+def test_mixed_expected_baseline_results_with_certified_current_pass_are_nonblocking():
+    items = [
+        _payload_item(
+            f"AC{index}",
+            command_hash="sha256:" + f"{index:x}" * 64,
+            failure_keys=[],
+            exit_code=4 if index not in {6, 7} else 0,
+        )
+        for index in range(1, 9)
+    ]
+    for item in items:
+        item["classification"] = "expected_pass" if item["ac"] in {"AC6", "AC7"} else "expected_fail"
+    current_items = [
+        {
+            **item,
+            "exit_code": 0,
+            "failure_keys": [],
+        }
+        for item in items
+    ]
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_snapshot_payload(items),
+        current_vc_result=_current_payload(current_items, head_sha="head1", reviewed_head_sha="head1"),
+        diff_summary={"changed_paths": [".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"], "head_sha": "head1"},
+        allowed_paths=[".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+    )
+    assert result["overall_status"] == "pass"
+    assert result["blocking"] is False
+    assert {entry["reason_code"] for entry in result["per_ac"]} == {
+        "expected_fail_resolved_on_current_head",
+        "expected_pass_still_passes",
+    }
+
+
+def test_current_pass_requires_complete_certified_envelope_and_allowed_paths():
+    baseline_item = _payload_item("AC1", failure_keys=[], exit_code=4)
+    baseline_item["classification"] = "expected_fail"
+    current_item = _payload_item("AC1", failure_keys=[], exit_code=0)
+    current = _current_payload([current_item], head_sha="head1", reviewed_head_sha="head1")
+    current["errors"] = ["producer_error"]
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_snapshot_payload([baseline_item]),
+        current_vc_result=current,
+        diff_summary={"changed_paths": ["src/outside.py"], "head_sha": "head1"},
+        allowed_paths=[".claude/skills/**"],
+    )
+    assert result["blocking"] is True
+    assert result["per_ac"][0]["reason_code"] == "uncertified_current_pass"
+
+
+def test_mapping_and_invalid_paths_fail_closed_for_current_pass():
+    baseline_item = _payload_item("AC1", failure_keys=[], exit_code=4)
+    baseline_item["classification"] = "expected_fail"
+    current_item = _payload_item("AC1", failure_keys=[], exit_code=0)
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_snapshot_payload([baseline_item]),
+        current_vc_result=_current_payload([current_item], head_sha="head1", reviewed_head_sha="head1"),
+        diff_summary={"changed_paths": [{"path": ".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py", "previous_path": "../outside.py"}], "head_sha": "head1"},
+        allowed_paths=[".claude/skills/**"],
+    )
+    assert result["blocking"] is True
+    assert result["per_ac"][0]["reason_code"] == "uncertified_current_pass"
+
+    current_item["ac"] = "AC2"
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_snapshot_payload([baseline_item]),
+        current_vc_result=_current_payload([current_item], head_sha="head1", reviewed_head_sha="head1"),
+        diff_summary={"changed_paths": [], "head_sha": "head1"},
+        allowed_paths=[".claude/skills/**"],
+    )
+    assert result["errors"] == ["baseline_current_mapping_mismatch"]
+
+
+def test_bool_exit_code_and_pass_with_failure_keys_fail_closed():
+    baseline_item = _payload_item("AC1", failure_keys=[], exit_code=4)
+    baseline_item["classification"] = "expected_fail"
+    invalid = _payload_item("AC1", failure_keys=[], exit_code=False)
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_snapshot_payload([baseline_item]),
+        current_vc_result=_current_payload([invalid], head_sha="head1", reviewed_head_sha="head1"),
+        diff_summary={"changed_paths": [], "head_sha": "head1"},
+        allowed_paths=[".claude/skills/**"],
+    )
+    assert result["blocking"] is True
+    assert result["errors"] == ["current[0]:invalid_exit_code"]
+
+    invalid["exit_code"] = 0
+    invalid["failure_keys"] = [{"kind": "pytest_nodeid", "key": "tests/test_alpha.py::test_ok"}]
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_snapshot_payload([baseline_item]),
+        current_vc_result=_current_payload([invalid], head_sha="head1", reviewed_head_sha="head1"),
+        diff_summary={"changed_paths": [], "head_sha": "head1"},
+        allowed_paths=[".claude/skills/**"],
+    )
+    assert result["per_ac"][0]["reason_code"] == "pass_with_failure_keys"
+
+
 def test_new_unrelated_failure_with_diff_is_not_out_of_scope():
     baseline = _snapshot_payload(
         [
@@ -254,7 +360,7 @@ def test_new_unrelated_failure_with_diff_is_not_out_of_scope():
         [
             _payload_item(
                 "AC1",
-                command_hash="sha256:" + "b" * 64,
+                command_hash="sha256:" + "a" * 64,
                 failure_keys=[{"kind": "pytest_nodeid", "key": "docs/readme.md::test_readme"}],
             )
         ],
@@ -284,7 +390,7 @@ def test_failure_key_kind_process_exit_cannot_prove_out_of_scope():
         [
             _payload_item(
                 "AC1",
-                command_hash="sha256:" + "b" * 64,
+                command_hash="sha256:" + "a" * 64,
                 failure_keys=[{"kind": "process_exit", "key": "process_exit:1"}],
             )
         ],
@@ -434,7 +540,7 @@ def test_compact_stdout_remains_valid_json_when_truncated_budget_is_small(tmp_pa
         [
             _payload_item(
                 "AC1",
-                command_hash="sha256:" + "b" * 64,
+                command_hash="sha256:" + "a" * 64,
                 failure_keys=[{"kind": "pytest_nodeid", "key": "src/main.py::test_regression"}],
             )
         ],

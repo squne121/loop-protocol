@@ -168,7 +168,7 @@ def _normalize_item(item: Any) -> tuple[dict[str, Any] | None, list[str]]:
         return None, ["missing_or_invalid_command_hash"]
 
     exit_code = item.get("exit_code")
-    if exit_code is not None and not isinstance(exit_code, int):
+    if isinstance(exit_code, bool) or (exit_code is not None and not isinstance(exit_code, int)):
         return None, ["invalid_exit_code"]
 
     category = item.get("category")
@@ -183,6 +183,7 @@ def _normalize_item(item: Any) -> tuple[dict[str, Any] | None, list[str]]:
         "category": category,
         "failure_keys": failure_keys,
         "failure_keys_present": failure_keys_present,
+        "classification": item.get("classification"),
     }
     if command_hash_note is not None:
         normalized["command_hash_note"] = command_hash_note
@@ -214,10 +215,11 @@ def _extract_changed_paths(diff_summary: Any) -> tuple[list[str], bool, list[str
         for item in raw_paths:
             if isinstance(item, str):
                 values.append(item)
-            elif isinstance(item, dict) and isinstance(item.get("path"), str):
-                values.append(item.get("path"))
-            elif isinstance(item, dict) and isinstance(item.get("file"), str):
-                values.append(item.get("file"))
+            elif isinstance(item, dict):
+                for key in ("path", "file", "previous_path", "previous_filename", "old_path"):
+                    value = item.get(key)
+                    if isinstance(value, str):
+                        values.append(value)
         return values, bool(values), []
 
     return [], False, ["missing_changed_paths"]
@@ -273,6 +275,57 @@ def _normalize_allowed_paths(allowed_paths: list[str]) -> tuple[list[str], str |
 
 def _normalize_scope_paths(paths: list[str]) -> list[str]:
     return [_normalize_path(path) for path in paths if isinstance(path, str) and path.strip()]
+
+
+def _all_changed_paths_allowed(changed_paths: list[str], allowed_paths: list[str]) -> bool:
+    matcher, error = _get_allowed_paths_matcher()
+    if matcher is None or error is not None:
+        return False
+    for path in changed_paths:
+        normalized_path = matcher.normalize_path(path)
+        if normalized_path is None or not any(
+            matcher.matches_pattern(normalized_path, pattern) for pattern in allowed_paths
+        ):
+            return False
+    return True
+
+
+def _is_nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _current_pass_envelope_is_certified(
+    contract_snapshot: Any,
+    current_vc_result: Any,
+    diff_summary: Any,
+    changed_paths: list[str],
+    allowed_paths: list[str],
+) -> bool:
+    if not isinstance(contract_snapshot, dict) or not isinstance(current_vc_result, dict):
+        return False
+    if not isinstance(diff_summary, dict):
+        return False
+    contract_sha = contract_snapshot.get("body_sha256")
+    source = current_vc_result.get("source")
+    if not isinstance(source, dict):
+        return False
+    current_head = current_vc_result.get("head_sha")
+    reviewed_head = current_vc_result.get("reviewed_head_sha")
+    diff_head = diff_summary.get("head_sha")
+    return (
+        contract_snapshot.get("status") == "go"
+        and _is_nonempty_string(contract_sha)
+        and _is_nonempty_string(current_vc_result.get("generated_at"))
+        and current_vc_result.get("status") == "pass"
+        and current_vc_result.get("errors") == []
+        and current_vc_result.get("fallback_detected") is False
+        and current_vc_result.get("human_review_required") is False
+        and current_vc_result.get("stop_condition_triggered") is False
+        and _is_nonempty_string(current_head)
+        and current_head == reviewed_head == diff_head
+        and source.get("body_sha256") == contract_sha
+        and _all_changed_paths_allowed(changed_paths, allowed_paths)
+    )
 
 
 def _is_related_to_scope(
@@ -585,6 +638,7 @@ def adjudicate_vc_result(
 
     baseline_signatures: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
     baseline_failure_index: set[tuple[str, str]] = set()
+    baseline_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     for idx, item in enumerate(baseline_items):
         norm, errs = _normalize_item(item)
         if norm is None:
@@ -596,6 +650,20 @@ def adjudicate_vc_result(
                 evidence_refs=evidence_refs,
                 errors=[f"baseline[{idx}]:{err}" for err in errs],
             )
+        mapping_key = (norm["ac"], norm["command_hash"])
+        if mapping_key in baseline_by_key:
+            return _result(
+                overall_status="indeterminate", per_ac=[], rerun_required=True,
+                source_integrity=source_integrity, evidence_refs=evidence_refs,
+                errors=[f"duplicate_baseline_ac_command_hash:{norm['ac']}"],
+            )
+        if norm["classification"] not in {"expected_fail", "expected_pass"}:
+            return _result(
+                overall_status="indeterminate", per_ac=[], rerun_required=True,
+                source_integrity=source_integrity, evidence_refs=evidence_refs,
+                errors=[f"unsupported_baseline_classification:{norm['ac']}"],
+            )
+        baseline_by_key[mapping_key] = norm
         baseline_signatures.add(
             (
                 norm["command_hash"],
@@ -604,7 +672,8 @@ def adjudicate_vc_result(
         )
         baseline_failure_index.update((entry["kind"], entry["key"]) for entry in norm["failure_keys"])
 
-    per_ac: list[dict[str, Any]] = []
+    normalized_current: list[dict[str, Any]] = []
+    current_keys: set[tuple[str, str]] = set()
     for idx, item in enumerate(current_items):
         norm, errs = _normalize_item(item)
         if norm is None:
@@ -617,7 +686,63 @@ def adjudicate_vc_result(
                 errors=[f"current[{idx}]:{err}" for err in errs],
             )
 
-        status, blocking, rerun_required, reason_code, summary = _classify_item(
+        mapping_key = (norm["ac"], norm["command_hash"])
+        if mapping_key in current_keys:
+            return _result(
+                overall_status="indeterminate", per_ac=[], rerun_required=True,
+                source_integrity=source_integrity, evidence_refs=evidence_refs,
+                errors=[f"duplicate_current_ac_command_hash:{norm['ac']}"],
+            )
+        current_keys.add(mapping_key)
+        normalized_current.append(norm)
+
+    if not normalized_current:
+        return _result(
+            overall_status="indeterminate", per_ac=[], rerun_required=True,
+            source_integrity=source_integrity, evidence_refs=evidence_refs,
+            errors=["empty_current_results_without_pass_signal"],
+        )
+
+    if current_keys != set(baseline_by_key):
+        return _result(
+            overall_status="indeterminate", per_ac=[], rerun_required=True,
+            source_integrity=source_integrity, evidence_refs=evidence_refs,
+            errors=["baseline_current_mapping_mismatch"],
+        )
+
+    current_pass_certified = _current_pass_envelope_is_certified(
+        contract_snapshot,
+        current_vc_result,
+        diff_summary,
+        changed_paths,
+        normalized_allowed,
+    )
+    per_ac: list[dict[str, Any]] = []
+    for norm in normalized_current:
+        baseline_item = baseline_by_key[(norm["ac"], norm["command_hash"])]
+        if norm["exit_code"] == 0:
+            if norm["failure_keys_present"]:
+                status, blocking, rerun_required, reason_code, summary = (
+                    "indeterminate", True, True, "pass_with_failure_keys",
+                    "Current PASS must not contain failure keys",
+                )
+            elif not current_pass_certified:
+                status, blocking, rerun_required, reason_code, summary = (
+                    "indeterminate", True, True, "uncertified_current_pass",
+                    "Current PASS lacks complete producer-certified source integrity",
+                )
+            elif baseline_item["classification"] == "expected_fail":
+                status, blocking, rerun_required, reason_code, summary = (
+                    "pass", False, False, "expected_fail_resolved_on_current_head",
+                    "Expected baseline failure resolved by certified current-head PASS",
+                )
+            else:
+                status, blocking, rerun_required, reason_code, summary = (
+                    "pass", False, False, "expected_pass_still_passes",
+                    "Expected baseline PASS remains a certified current-head PASS",
+                )
+        else:
+            status, blocking, rerun_required, reason_code, summary = _classify_item(
             item=norm,
             baseline_signatures=baseline_signatures,
             baseline_failure_index=baseline_failure_index,
@@ -637,8 +762,6 @@ def adjudicate_vc_result(
         if "command_hash_note" in norm:
             entry["command_hash_note"] = norm["command_hash_note"]
         per_ac.append(entry)
-        if rerun_required:
-            continue
 
     if not per_ac:
         return _result(
