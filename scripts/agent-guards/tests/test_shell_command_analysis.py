@@ -470,13 +470,15 @@ def test_analyzer_does_not_change_git_mutation_command_policy_api():
     """GIVEN scripts/agent-guards/git_mutation_command_policy.py WHEN
     imported alongside this analyzer THEN classify_rtk_git_mutation keeps
     its existing signature (external API unchanged, Issue #1428 In Scope
-    5 / Out of Scope)."""
+    5 / Out of Scope). Issue #1408 iteration2 intentionally added the
+    `boundary_layer` parameter for human-review-driven boundary tagging;
+    this contract test tracks that as the current expected signature."""
     sys.path.insert(0, os.path.join(HERE, ".."))
     import git_mutation_command_policy as gmcp
     import inspect
 
     sig = inspect.signature(gmcp.classify_rtk_git_mutation)
-    assert list(sig.parameters) == ["command", "cwd", "require_active_branch_push"]
+    assert list(sig.parameters) == ["command", "cwd", "require_active_branch_push", "boundary_layer"]
 
 
 def test_analyzer_and_git_mutation_policy_agree_on_rtk_git_push_recognition():
