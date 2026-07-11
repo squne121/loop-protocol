@@ -1,0 +1,14 @@
+[
+  {
+    "number": 9454,
+    "title": "実装: 何かの機能",
+    "body": "",
+    "labels": [
+      {
+        "name": "phase/implementation"
+      }
+    ],
+    "updatedAt": "2026-07-11T09:00:00Z",
+    "url": "https://github.com/squne121/loop-protocol/issues/9454"
+  }
+]

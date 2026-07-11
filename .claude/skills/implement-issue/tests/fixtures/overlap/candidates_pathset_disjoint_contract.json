@@ -1,0 +1,15 @@
+[
+  {
+    "number": 9998,
+    "title": "実装: CI pipeline の flaky test retry policy を安定化する",
+    "body": "## Machine-Readable Contract\n\n```yaml\ncontract_schema_version: v1\nissue_kind: implementation\nparent_issue: \"none\"\ngoal_ref: \"CI pipeline の flaky test retry policy を安定化する\"\nchange_kind: ci\n```\n\n## Outcome\n\nCI pipeline の flaky test retry policy が、再現性のある exponential\nbackoff と明示的な retry budget を持つ状態。docs/dev/agent-runtime-ops.md\nに CI retry policy の運用ガイドを追記する。\n\n## In Scope\n\n- CI retry budget の exponential backoff 実装\n- docs/dev/agent-runtime-ops.md への CI retry policy 運用ガイド追記\n\n## Out of Scope\n\n- Codex custom-agent の model allocation\n- publish lane authorization の trust root\n\n## Delivery Rule\n\n- 1 Issue = 1 PR\n- Draft PR を既定とする\n\n## Allowed Paths\n\n- docs/dev/agent-runtime-ops.md\n- docs/dev/codex-model-routing.md\n",
+    "labels": [
+      {
+        "name": "phase/implementation"
+      }
+    ],
+    "updatedAt": "2026-07-11T08:00:00Z",
+    "url": "https://github.com/squne121/loop-protocol/issues/9998",
+    "body_sha256": "sha256:044fdde8a14a7c3a79820b34a4197e6f2233f52b1d918ef68d70bf2d99c92391"
+  }
+]

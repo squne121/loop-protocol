@@ -1,0 +1,13 @@
+[
+  {
+    "title": "実装: 番号なし Issue",
+    "body": "## Outcome\n\nダミー\n\n## In Scope\n\n- dummy\n\n## Allowed Paths\n\n- docs/dev/agent-runtime-ops.md\n",
+    "labels": [
+      {
+        "name": "phase/implementation"
+      }
+    ],
+    "updatedAt": "2026-07-11T09:00:00Z",
+    "url": "https://github.com/squne121/loop-protocol/issues/9455"
+  }
+]
