@@ -40,6 +40,7 @@ classify_post_http_error = _ecs_mod.classify_post_http_error
 find_idempotency_marker = _ecs_mod.find_idempotency_marker
 sha256_of = _ecs_mod.sha256_of
 compute_comments_digest = _ecs_mod.compute_comments_digest
+is_go_fresh = _ecs_mod.is_go_fresh
 
 # Use post_status constants (B4)
 POST_STATUS_POSTED = _ecs_mod.POST_STATUS_POSTED
@@ -85,6 +86,7 @@ CONTRACT_REVIEW_RESULT_V1:
   generated_at: "2026-06-13T08:00:00Z"
   generated_by: issue-contract-review
   issue_url: {_ISSUE_URL}
+  body_sha256: "{_SAMPLE_BODY_SHA256}"
 ```
 """,
 }
@@ -124,6 +126,7 @@ def _mock_parser_mod(
             "html_url": go_comment["html_url"],
             "created_at": go_comment["created_at"],
             "status": "go",
+            "inner": {"body_sha256": _SAMPLE_BODY_SHA256},
         })
 
     mod.parse_contract_review_results.return_value = results
@@ -156,7 +159,7 @@ def _make_review_result(status: str) -> dict:
 class TestCheckOnlyMode:
     """check-only mode tests."""
 
-    def test_existing_go_returns_ok(self, monkeypatch):
+    def test_existing_go_matches_current_body_returns_ok(self, monkeypatch):
         """Existing go comment → status: ok, source: existing_go."""
         parser_mod = _mock_parser_mod(
             comments=[_GO_COMMENT],
@@ -224,6 +227,155 @@ class TestCheckOnlyMode:
 
         assert result["status"] == "blocked_needs_refinement"
         assert result["source"] == "latest_blocked"
+
+
+class TestFreshGoSnapshots:
+    """#1445: existing go is usable only for the current canonical body hash."""
+
+    @pytest.mark.parametrize(
+        "body_sha256",
+        [
+            None,
+            "",
+            1,
+            "sha256:" + "A" * 64,
+            "sha256:" + "a" * 63,
+            " sha256:" + "a" * 64,
+            sha256_of("different body"),
+        ],
+    )
+    def test_invalid_or_stale_go_never_returns_existing_go(self, body_sha256):
+        stale_go = {
+            "comment_id": 1001,
+            "html_url": _GO_COMMENT["html_url"],
+            "created_at": _GO_COMMENT["created_at"],
+            "status": "go",
+            "inner": {"body_sha256": body_sha256},
+        }
+        parser_mod = _mock_parser_mod(comments=[_GO_COMMENT])
+        parser_mod.parse_contract_review_results.return_value = [stale_go]
+        parser_mod.find_latest_go.return_value = stale_go
+        parser_mod.find_latest_result.return_value = stale_go
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(
+                _ecs_mod,
+                "fetch_issue_snapshot",
+                return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None),
+            ):
+                result = ensure_contract_snapshot(
+                    issue_number=_ISSUE_NUMBER, repo=_REPO, mode="check-only"
+                )
+
+        assert result["status"] == "human_judgment"
+        assert result["source"] == "readiness_blocked"
+
+    def test_stale_go_auto_without_post_materializes_dry_run(self):
+        stale_go = {
+            "comment_id": 1001,
+            "html_url": _GO_COMMENT["html_url"],
+            "created_at": _GO_COMMENT["created_at"],
+            "status": "go",
+            "inner": {"body_sha256": sha256_of("different body")},
+        }
+        parser_mod = _mock_parser_mod(comments=[_GO_COMMENT])
+        parser_mod.parse_contract_review_results.return_value = [stale_go]
+        parser_mod.find_latest_go.return_value = stale_go
+        parser_mod.find_latest_result.return_value = stale_go
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(_ecs_mod, "fetch_issue_snapshot", return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None)):
+                with patch.object(_ecs_mod, "run_contract_review_once", return_value=(_make_review_result("go"), None)) as review:
+                    result = ensure_contract_snapshot(
+                        issue_number=_ISSUE_NUMBER, repo=_REPO, mode="auto", do_post=False
+                    )
+
+        assert result["status"] == "dry_run_would_post"
+        review.assert_called_once()
+
+    def test_stale_go_at_post_check_does_not_dedupe(self):
+        stale_go = {
+            "comment_id": 1001,
+            "html_url": _GO_COMMENT["html_url"],
+            "created_at": _GO_COMMENT["created_at"],
+            "status": "go",
+            "inner": {"body_sha256": sha256_of("different body")},
+        }
+        parser_mod = _mock_parser_mod(comments=[])
+        parser_mod.parse_contract_review_results.side_effect = [[], [stale_go]]
+        parser_mod.find_latest_result.side_effect = [None, None]
+        parser_mod.find_latest_go.side_effect = [None, stale_go]
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(_ecs_mod, "fetch_issue_snapshot", return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None)):
+                with patch.object(_ecs_mod, "run_contract_review_once", return_value=(_make_review_result("go"), None)):
+                    with patch.object(_ecs_mod, "post_comment", return_value=("https://example.test/comment", POST_STATUS_POSTED, 201)) as post:
+                        result = ensure_contract_snapshot(
+                            issue_number=_ISSUE_NUMBER, repo=_REPO, mode="auto", do_post=True
+                        )
+
+        assert result["source"] == "materialized_go"
+        post.assert_called_once()
+
+    def test_fresh_go_at_post_check_dedupes(self):
+        fresh_go = {
+            "comment_id": 1002,
+            "html_url": "https://example.test/fresh",
+            "created_at": "2026-06-13T09:00:00Z",
+            "status": "go",
+            "inner": {"body_sha256": _SAMPLE_BODY_SHA256},
+        }
+        parser_mod = _mock_parser_mod(comments=[])
+        parser_mod.parse_contract_review_results.side_effect = [[], [fresh_go]]
+        parser_mod.find_latest_result.side_effect = [None, fresh_go]
+        parser_mod.find_latest_go.side_effect = [None, fresh_go]
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(_ecs_mod, "fetch_issue_snapshot", return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None)):
+                with patch.object(_ecs_mod, "run_contract_review_once", return_value=(_make_review_result("go"), None)):
+                    with patch.object(_ecs_mod, "post_comment") as post:
+                        result = ensure_contract_snapshot(
+                            issue_number=_ISSUE_NUMBER, repo=_REPO, mode="auto", do_post=True
+                        )
+
+        assert result["source"] == "existing_go"
+        assert result["post_status"] == POST_STATUS_DEDUPED
+        post.assert_not_called()
+
+    def test_existing_go_snapshot_change_retries_then_conflicts(self):
+        fresh_go = {
+            "comment_id": 1001,
+            "html_url": _GO_COMMENT["html_url"],
+            "created_at": _GO_COMMENT["created_at"],
+            "status": "go",
+            "inner": {"body_sha256": _SAMPLE_BODY_SHA256},
+        }
+        parser_mod = _mock_parser_mod(comments=[_GO_COMMENT])
+        parser_mod.parse_contract_review_results.return_value = [fresh_go]
+        parser_mod.find_latest_result.return_value = fresh_go
+        parser_mod.find_latest_go.return_value = fresh_go
+        snapshots = [
+            (_SAMPLE_BODY, "one", None),
+            (_SAMPLE_BODY + " changed", "two", None),
+            (_SAMPLE_BODY, "three", None),
+            (_SAMPLE_BODY + " changed again", "four", None),
+        ]
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(_ecs_mod, "fetch_issue_snapshot", side_effect=snapshots):
+                result = ensure_contract_snapshot(
+                    issue_number=_ISSUE_NUMBER, repo=_REPO, mode="check-only"
+                )
+
+        assert result["status"] == "stale_or_conflicting_snapshot"
+
+    def test_parser_result_with_canonical_body_sha256_is_consumed(self):
+        parser_mod = _ecs_mod._import_parser_module()
+        results = parser_mod.parse_contract_review_results([_GO_COMMENT], _ISSUE_URL)
+        go_result = parser_mod.find_latest_go(results)
+
+        assert go_result is not None
+        assert is_go_fresh(go_result, _SAMPLE_BODY_SHA256)
 
 
 # ---------------------------------------------------------------------------

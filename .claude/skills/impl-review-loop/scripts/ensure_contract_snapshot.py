@@ -53,6 +53,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -124,6 +125,24 @@ def _import_parser_module():
 
 def sha256_of(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+_CANONICAL_BODY_SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+
+
+def is_go_fresh(go_result: object, expected_body_sha256: str) -> bool:
+    """Return whether a parsed go result is canonical and bound to this body."""
+    if not isinstance(go_result, dict):
+        return False
+    inner = go_result.get("inner")
+    if not isinstance(inner, dict):
+        return False
+    body_sha256 = inner.get("body_sha256")
+    return (
+        isinstance(body_sha256, str)
+        and _CANONICAL_BODY_SHA256_RE.fullmatch(body_sha256) is not None
+        and body_sha256 == expected_body_sha256
+    )
 
 
 def fetch_issue_snapshot(
@@ -415,26 +434,6 @@ def ensure_contract_snapshot(
         result["status"] = "runtime_error"
         return result
 
-    # Step 1: Fetch body, updatedAt, and comments atomically (initial snapshot) — B2
-    body, updated_at, snapshot_err = fetch_issue_snapshot(issue_number, repo)
-    if snapshot_err:
-        result["errors"].append(f"body_fetch_error: {snapshot_err}")
-        result["status"] = "runtime_error"
-        return result
-
-    body_sha256 = sha256_of(body or "")
-    result["body_sha256_at_check"] = body_sha256
-    result["issue_updated_at_at_check"] = updated_at  # B2
-
-    comments, comments_err = parser_mod.fetch_issue_comments(issue_number, repo)
-    if comments_err:
-        result["errors"].append(f"comments_fetch_error: {comments_err}")
-        result["status"] = "runtime_error"
-        return result
-
-    comments_digest = compute_comments_digest(comments)
-    result["comments_digest_at_check"] = comments_digest
-
     # Build issue URL for validation
     owner_repo = repo.split("/")
     if len(owner_repo) == 2:
@@ -442,24 +441,58 @@ def ensure_contract_snapshot(
     else:
         issue_url = None
 
-    # Step 2: Parse existing CONTRACT_REVIEW_RESULT_V1 comments
-    results = parser_mod.parse_contract_review_results(comments, expected_issue_url=issue_url)
-    latest = parser_mod.find_latest_result(results)
-    go_result = parser_mod.find_latest_go(results)
+    # Step 1/2: read a candidate snapshot.  A fresh existing go needs one
+    # bounded recheck, otherwise a body edit between the two API calls could
+    # make an old comment look current.
+    for attempt in range(2):
+        body, updated_at, snapshot_err = fetch_issue_snapshot(issue_number, repo)
+        if snapshot_err:
+            result["errors"].append(f"body_fetch_error: {snapshot_err}")
+            result["status"] = "runtime_error"
+            return result
 
-    # If latest result is blocked, return blocked regardless of mode
-    if latest and latest["status"] == "blocked":
-        result["status"] = "blocked_needs_refinement"
-        result["source"] = "latest_blocked"
-        result["contract_snapshot_url"] = latest["html_url"]
-        return result
+        body_sha256 = sha256_of(body or "")
+        result["body_sha256_at_check"] = body_sha256
+        result["issue_updated_at_at_check"] = updated_at
 
-    # If go result exists, return ok (idempotent)
-    if go_result:
-        result["status"] = "ok"
-        result["source"] = "existing_go"
-        result["contract_snapshot_url"] = go_result["html_url"]
-        return result
+        comments, comments_err = parser_mod.fetch_issue_comments(issue_number, repo)
+        if comments_err:
+            result["errors"].append(f"comments_fetch_error: {comments_err}")
+            result["status"] = "runtime_error"
+            return result
+        comments_digest = compute_comments_digest(comments)
+        result["comments_digest_at_check"] = comments_digest
+
+        results = parser_mod.parse_contract_review_results(
+            comments, expected_issue_url=issue_url
+        )
+        latest = parser_mod.find_latest_result(results)
+        go_result = parser_mod.find_latest_go(results)
+
+        # latest blocked retains precedence over existing-go adoption.
+        if latest and latest["status"] == "blocked":
+            result["status"] = "blocked_needs_refinement"
+            result["source"] = "latest_blocked"
+            result["contract_snapshot_url"] = latest["html_url"]
+            return result
+
+        if not is_go_fresh(go_result, body_sha256):
+            break
+
+        body_confirm, updated_confirm, confirm_err = fetch_issue_snapshot(issue_number, repo)
+        if confirm_err:
+            result["errors"].append(f"body_refetch_error: {confirm_err}")
+            result["status"] = "runtime_error"
+            return result
+        if body_confirm == body and updated_confirm == updated_at:
+            result["status"] = "ok"
+            result["source"] = "existing_go"
+            result["contract_snapshot_url"] = go_result["html_url"]
+            return result
+        if attempt == 1:
+            result["status"] = "stale_or_conflicting_snapshot"
+            result["errors"].append("issue_changed_during_existing_go_recheck")
+            return result
 
     # No existing go result
     if mode == "check-only":
@@ -590,7 +623,7 @@ def ensure_contract_snapshot(
 
     # Also check if a go comment appeared in the interim
     go_post = parser_mod.find_latest_go(results_post)
-    if go_post:
+    if is_go_fresh(go_post, body_sha256_post):
         result["status"] = "ok"
         result["source"] = "existing_go"
         result["contract_snapshot_url"] = go_post["html_url"]
