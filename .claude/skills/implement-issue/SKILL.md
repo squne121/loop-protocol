@@ -42,7 +42,7 @@ consumer ready contract（title `実装:` または `implement:`、routing label
 `.claude/skills/create-issue/scripts/check_issue_overlap.py` の pure classifier（`classify_overlap` / `IssueScope` / `SourceStatus` / path normalization）を正本として再利用し、implementation 専用の候補収集レイヤー `.claude/skills/implement-issue/scripts/check_implementation_overlap.py` を実行する:
 
 ```bash
-uv run python3 .claude/skills/implement-issue/scripts/check_implementation_overlap.py \
+uv run --locked python3 .claude/skills/implement-issue/scripts/check_implementation_overlap.py \
   --issue-number "$ISSUE_NUMBER" \
   --repo "$REPO" \
   > /tmp/overlap_preflight_${ISSUE_NUMBER}.json
