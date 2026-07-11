@@ -71,6 +71,161 @@ const LOCKS_DIR = join(ARTIFACTS_BASE_DIR, 'locks')
 const TMP_DIR = join(ARTIFACTS_BASE_DIR, 'tmp')
 const REPOSITORY = 'squne121/loop-protocol'
 
+// ─── Legacy state detection (Issue #1430) ─────────────────────────────────
+// PR #1426 hard-cutover intentionally does not migrate or clean up
+// pre-existing runtime state written directly under the repo-root
+// artifacts/ directory by the pre-#1426 producer layout:
+//   artifacts/.lock-<32hex>                         (stable-key lock file)
+//   artifacts/.tmp-<uuid>[.failed]                  (atomic-write temp file)
+//   artifacts/private-agent-session-manifest-*.json (root-level manifest)
+// This best-effort, non-fail-close diagnostic surfaces detection of that
+// residue via a fixed single-line stderr schema. Detection is anchored to
+// REPO_ROOT (which already resolves CLAUDE_PROJECT_DIR) and only inspects
+// the immediate children of artifacts/ (non-recursive) so the current-layout
+// subtree artifacts/session-manifest-runtime/ (a directory, never matching
+// the file-name grammars below) is never misclassified as legacy residue.
+const LEGACY_ARTIFACTS_ROOT_DIR = join(REPO_ROOT, 'artifacts')
+// Matches the exact filename grammar produced by the pre-#1426 producer:
+// stable key = sha256(...).slice(0, 32) (lowercase hex), and
+// randomUUID() = standard RFC4122 v4 UUID (version nibble `4`, variant
+// nibble `8|9|a|b` -- Issue #1430 AC11 strict grammar).
+const LEGACY_LOCK_RE = /^\.lock-[0-9a-f]{32}$/
+const LEGACY_TMP_RE = /^\.tmp-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(\.failed)?$/
+// Issue #1430 AC11: the hook-name segment is limited to the known set of
+// hook event names this producer is ever invoked for (rather than any
+// lowercase-letters run), narrowing accidental over-match.
+const LEGACY_ROOT_MANIFEST_RE = /^private-agent-session-manifest-(stop|subagentstop|posttooluse)-\d+-[0-9a-f]{32}\.json$/
+
+// Issue #1430 AC9: bound the number of paths embedded in a single diagnostic
+// line so it never approaches spawnSync's default 1 MiB maxBuffer on the
+// (debounce) caller side.
+const LEGACY_PATHS_BOUND = 20
+
+// Issue #1430 AC13: duplicate-residue suppression markers live under the
+// current-layout runtime subtree (never the legacy paths themselves).
+const LEGACY_MARKER_DIR = join(ARTIFACTS_BASE_DIR, 'legacy-state-markers')
+
+// Issue #1430 AC8: legacy diagnostics are buffered and flushed to stderr
+// only after all other stderr writes for this invocation, so that
+// coordinator-side "first line only" truncation never hides an existing
+// result/info/warn line emitted by the rest of this script.
+const _pendingLegacyDiagnosticLines = []
+
+function toRepoRelative(pathname) {
+  return relative(REPO_ROOT, pathname).replace(/\\/g, '/')
+}
+
+function legacyMarkerPath(legacyKind, paths) {
+  const material = `${legacyKind}:${[...paths].sort().join(',')}`
+  const digest = createHash('sha256').update(material).digest('hex').slice(0, 32)
+  return join(LEGACY_MARKER_DIR, `${legacyKind}-${digest}.marker`)
+}
+
+function shouldSuppressDuplicateLegacyDiagnostic(legacyKind, paths) {
+  try {
+    const markerPath = legacyMarkerPath(legacyKind, paths)
+    if (existsSync(markerPath)) return true
+    mkdirSync(LEGACY_MARKER_DIR, { recursive: true })
+    writeFileSync(markerPath, JSON.stringify({ legacy_kind: legacyKind, marked_at: new Date().toISOString() }), 'utf8')
+    return false
+  } catch {
+    // Marker bookkeeping must never fail-close or suppress a genuine
+    // diagnostic; on any error, fail open (do not suppress).
+    return false
+  }
+}
+
+function buildLegacyDiagnosticPayload(legacyKind, allPaths) {
+  const totalCount = allPaths.length
+  const truncated = totalCount > LEGACY_PATHS_BOUND
+  const paths = truncated ? allPaths.slice(0, LEGACY_PATHS_BOUND) : allPaths
+  // Field order (status, legacy_kind, paths, detected_at) is fixed by the
+  // Issue #1430 contract and intentionally places legacy_kind before paths
+  // so that a coordinator-side truncation to the first N characters of the
+  // line still preserves the legacy_kind value even if paths is long.
+  return {
+    status: 'legacy_state_detected',
+    legacy_kind: legacyKind,
+    paths,
+    detected_at: new Date().toISOString(),
+    total_count: totalCount,
+    truncated,
+  }
+}
+
+function queueLegacyDiagnostic(legacyKind, rawPaths) {
+  try {
+    if (shouldSuppressDuplicateLegacyDiagnostic(legacyKind, rawPaths)) return
+    const payload = buildLegacyDiagnosticPayload(legacyKind, rawPaths)
+    _pendingLegacyDiagnosticLines.push(`SESSION_MANIFEST_LEGACY_STATE_V1=${JSON.stringify(payload)}\n`)
+  } catch {
+    // Detection must never fail-close the hook; swallow any fs error.
+  }
+}
+
+function queueLegacyScanFailure(legacyKind, path, error) {
+  try {
+    const payload = {
+      status: 'scan_failed',
+      legacy_kind: legacyKind,
+      path,
+      reason: (error && error.code) || 'unknown_error',
+      detected_at: new Date().toISOString(),
+    }
+    _pendingLegacyDiagnosticLines.push(`SESSION_MANIFEST_LEGACY_SCAN_V1=${JSON.stringify(payload)}\n`)
+  } catch {
+    // Detection must never fail-close the hook; swallow any fs error.
+  }
+}
+
+function flushPendingLegacyDiagnostics() {
+  for (const line of _pendingLegacyDiagnosticLines) {
+    process.stderr.write(line)
+  }
+  _pendingLegacyDiagnosticLines.length = 0
+}
+
+// Issue #1430 AC12: readdirSync(..., {withFileTypes: true}) reflects each
+// entry's own dirent type (never following symlinks), so a directory or
+// symlink that happens to share a legacy filename is correctly excluded via
+// `entry.isFile()` without any extra lstat call. A readdirSync failure
+// (e.g. EACCES) is reported as a distinct scan_failed diagnostic rather than
+// silently treated the same as "no legacy state present".
+function detectAndEmitLegacyProducerState() {
+  let dirents
+  try {
+    if (!existsSync(LEGACY_ARTIFACTS_ROOT_DIR)) return
+    dirents = readdirSync(LEGACY_ARTIFACTS_ROOT_DIR, { withFileTypes: true })
+  } catch (error) {
+    queueLegacyScanFailure('producer_lock_tmp', toRepoRelative(LEGACY_ARTIFACTS_ROOT_DIR), error)
+    return
+  }
+
+  try {
+    const lockTmpMatches = dirents
+      .filter((entry) => entry.isFile() && (LEGACY_LOCK_RE.test(entry.name) || LEGACY_TMP_RE.test(entry.name)))
+      .map((entry) => entry.name)
+    if (lockTmpMatches.length > 0) {
+      queueLegacyDiagnostic(
+        'producer_lock_tmp',
+        lockTmpMatches.map((name) => toRepoRelative(join(LEGACY_ARTIFACTS_ROOT_DIR, name))),
+      )
+    }
+
+    const manifestMatches = dirents
+      .filter((entry) => entry.isFile() && LEGACY_ROOT_MANIFEST_RE.test(entry.name))
+      .map((entry) => entry.name)
+    if (manifestMatches.length > 0) {
+      queueLegacyDiagnostic(
+        'producer_root_manifest',
+        manifestMatches.map((name) => toRepoRelative(join(LEGACY_ARTIFACTS_ROOT_DIR, name))),
+      )
+    }
+  } catch {
+    // Detection must never fail-close the hook; swallow any fs error.
+  }
+}
+
 // Event-type to phase mapping
 const EVENT_PHASE_MAP = {
   Stop: { mainLoop: 'impl', ledgerPhase: 'post_commit_verification' },
@@ -398,184 +553,198 @@ export function buildProducerArgs({
 let _activeLockPath = null
 
 async function main() {
-  // Read hook context from stdin
-  const hookCtx = await readStdin()
-
-  if (!hookCtx) {
-    process.stderr.write('[generate_session_manifest_from_hook] warn: no stdin context\n')
-  }
-
-  // Extract fields from hook stdin
-  const hookEventName = hookCtx?.hook_event_name ?? hookCtx?.type ?? 'Stop'
-  // session_id: may not be present in all hook payloads; use cwd-derived fallback
-  const sessionId = hookCtx?.session_id ?? null
-  // PostToolUse specific fields
-  const toolName = hookCtx?.tool_name ?? hookCtx?.tool ?? null
-  // tool_use_id: read for potential future use; not currently passed to producer CLI
-  // (producer does not have a --tool-use-id argument; encoded in phase-instance-id instead)
-  const _toolUseId = hookCtx?.tool_use_id ?? null
-  void _toolUseId // explicitly unused — suppress lint warning
-  // SubagentStop specific fields
-  const agentId = hookCtx?.agent_id ?? hookCtx?.subagent_id ?? null
-
-  // Map event to phase info
-  const phaseInfo = EVENT_PHASE_MAP[hookEventName] ?? EVENT_PHASE_MAP['Stop']
-
-  // Compute payload digest for throttle (same payload → same digest → skip)
-  const payloadDigest = computePayloadDigest(hookCtx)
-
-  // Build stable duplicate key — hash of all key material (no truncation of payloadDigest)
-  const stableKeySegment = buildStableKey(hookEventName, sessionId, toolName, phaseInfo.ledgerPhase, payloadDigest, null)
-
-  // Ensure artifacts dir exists before attempting lock
-  ensureArtifactsDir()
-
-  // Acquire exclusive lock for this stable key to prevent parallel duplicate generation (B3)
-  const lockPath = join(LOCKS_DIR, `.lock-${stableKeySegment}`)
-  _activeLockPath = lockPath
-  const lockAcquired = tryAcquireLock(lockPath)
-  if (!lockAcquired) {
-    process.stderr.write(
-      `[generate_session_manifest_from_hook] info: lock held by another process — skipping (key=${stableKeySegment}, event=${hookEventName})\n`,
-    )
-    process.exit(0)
-  }
-
-  // Double-check for duplicate after acquiring the lock (lock-then-check pattern)
-  if (hasDuplicateArtifact(stableKeySegment)) {
-    releaseLock(lockPath)
-    process.stderr.write(
-      `[generate_session_manifest_from_hook] info: duplicate skip (key=${stableKeySegment}, event=${hookEventName})\n`,
-    )
-    process.exit(0)
-  }
-
-  // Resolve issue identity: payload → branch → cwd → issue-0 sentinel
-  // B1: use hookCtx.cwd (the active worktree cwd from hook stdin) rather than
-  // process.cwd() / REPO_ROOT so that worktrees are identified correctly.
-  const hookCwd = typeof hookCtx?.cwd === 'string' ? hookCtx.cwd : null
-  const gitCwd = hookCwd ?? REPO_ROOT
-
-  let currentBranchName = null
   try {
-    currentBranchName =
-      execFileSync('git', ['branch', '--show-current'], {
-        encoding: 'utf8',
-        cwd: gitCwd,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      }).trim() || null
-  } catch {
-    // git unavailable or not a repo — fall through to cwd extraction
-  }
-  const resolvedIssueNumber = resolveIssueNumber(hookCtx, {
-    branchName: currentBranchName,
-    cwdPath: hookCwd ?? process.cwd(),
-  })
+    // Issue #1430: startup legacy-state detection runs unconditionally, before
+    // stdin/lock/producer processing. Detection is read-only (existsSync /
+    // readdirSync) and never blocks. Diagnostics are only *queued* here
+    // (AC8); they are written to stderr by the `finally` block below, after
+    // any other stderr output this invocation produces.
+    detectAndEmitLegacyProducerState()
 
-  // Build sequence ID: must be 3-digit zero-padded number (producer validates /^[0-9]{3}$/)
-  // Use last 3 digits of epoch seconds to get a stable-ish 3-digit number
-  const seqNum = String(Math.floor(Date.now() / 1000) % 1000).padStart(3, '0')
-  const issuePrefix = resolvedIssueNumber !== null ? `issue-${resolvedIssueNumber}` : 'issue-0'
-  const phaseInstanceId = `${issuePrefix}:${phaseInfo.mainLoop}:${seqNum}`
+    // Read hook context from stdin
+    const hookCtx = await readStdin()
 
-  // Artifact filename: timestamp-based with stable key segment (no content hash — avoids circular ref)
-  const timestamp = Date.now()
-  const eventNameLower = hookEventName.toLowerCase()
-  const baseFilename = `private-agent-session-manifest-${eventNameLower}-${timestamp}-${stableKeySegment}.json`
-
-  // Evidence source ref uses relative path (no absolute paths in public output)
-  const evidenceSourceRef = `artifacts/session-manifest-runtime/manifests/${baseFilename}`
-
-  // Build actor name enriched with available context
-  // Limit to reasonable length to avoid producer validation issues
-  let actorName = 'claude-code-hook'
-  if (agentId) {
-    actorName = `claude-code-subagent-${agentId.slice(0, 8)}`
-  } else if (toolName) {
-    // Truncate tool name to avoid excessively long actor names
-    const safeToolName = toolName.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 32)
-    actorName = `claude-code-hook-${safeToolName}`
-  }
-
-  // Build producer CLI arguments via exported helper (testable separately)
-  const producerArgs = buildProducerArgs({
-    producerScript: PRODUCER_SCRIPT,
-    repository: REPOSITORY,
-    phaseInfo,
-    phaseInstanceId,
-    actorType: 'ai_agent',
-    actorName,
-    evidenceSourceKind: 'artifact',
-    evidenceSourceRef,
-    evidenceVisibility: 'private_artifact',
-    sessionId,
-    resolvedIssueNumber,
-  })
-
-  let manifestJson
-  try {
-    // Invoke producer and capture stdout (manifest JSON)
-    // stdout is captured but NOT forwarded to our process stdout
-    manifestJson = execFileSync(process.execPath, producerArgs, {
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    })
-  } catch (err) {
-    // Best-effort: producer failure does NOT block the session
-    process.stderr.write(
-      `[generate_session_manifest_from_hook] warn: producer failed (best-effort, continuing): ${sanitizeForStderr(err.message)}\n`,
-    )
-    releaseLock(lockPath)
-    process.exit(0)
-  }
-
-  // Compute content hash for storage as metadata (not used in filename)
-  const contentHash = sha256(manifestJson)
-
-  // Atomic write: write to temp file, then rename to final filename
-  const finalPath = join(MANIFESTS_DIR, baseFilename)
-  const tmpPath = join(TMP_DIR, `.tmp-${randomUUID()}`)
-
-  try {
-    writeFileSync(tmpPath, manifestJson, { encoding: 'utf8', flag: 'wx' })
-    renameSync(tmpPath, finalPath)
-    process.stderr.write(
-      `[generate_session_manifest_from_hook] info: artifact written (event=${hookEventName}, sha256=${contentHash.slice(0, 16)})\n`,
-    )
-  } catch (err) {
-    // Best-effort: artifact write failure does NOT block the session
-    process.stderr.write(
-      `[generate_session_manifest_from_hook] warn: artifact write failed (best-effort, continuing): ${sanitizeForStderr(err.message)}\n`,
-    )
-    // Attempt cleanup of temp file (ignore errors)
-    try {
-      renameSync(tmpPath, `${tmpPath}.failed`)
-    } catch {
-      // ignore cleanup error
+    if (!hookCtx) {
+      process.stderr.write('[generate_session_manifest_from_hook] warn: no stdin context\n')
     }
+
+    // Extract fields from hook stdin
+    const hookEventName = hookCtx?.hook_event_name ?? hookCtx?.type ?? 'Stop'
+    // session_id: may not be present in all hook payloads; use cwd-derived fallback
+    const sessionId = hookCtx?.session_id ?? null
+    // PostToolUse specific fields
+    const toolName = hookCtx?.tool_name ?? hookCtx?.tool ?? null
+    // tool_use_id: read for potential future use; not currently passed to producer CLI
+    // (producer does not have a --tool-use-id argument; encoded in phase-instance-id instead)
+    const _toolUseId = hookCtx?.tool_use_id ?? null
+    void _toolUseId // explicitly unused — suppress lint warning
+    // SubagentStop specific fields
+    const agentId = hookCtx?.agent_id ?? hookCtx?.subagent_id ?? null
+
+    // Map event to phase info
+    const phaseInfo = EVENT_PHASE_MAP[hookEventName] ?? EVENT_PHASE_MAP['Stop']
+
+    // Compute payload digest for throttle (same payload → same digest → skip)
+    const payloadDigest = computePayloadDigest(hookCtx)
+
+    // Build stable duplicate key — hash of all key material (no truncation of payloadDigest)
+    const stableKeySegment = buildStableKey(hookEventName, sessionId, toolName, phaseInfo.ledgerPhase, payloadDigest, null)
+
+    // Ensure artifacts dir exists before attempting lock
+    ensureArtifactsDir()
+
+    // Acquire exclusive lock for this stable key to prevent parallel duplicate generation (B3)
+    const lockPath = join(LOCKS_DIR, `.lock-${stableKeySegment}`)
+    _activeLockPath = lockPath
+    const lockAcquired = tryAcquireLock(lockPath)
+    if (!lockAcquired) {
+      process.stderr.write(
+        `[generate_session_manifest_from_hook] info: lock held by another process — skipping (key=${stableKeySegment}, event=${hookEventName})\n`,
+      )
+      return
+    }
+
+    // Double-check for duplicate after acquiring the lock (lock-then-check pattern)
+    if (hasDuplicateArtifact(stableKeySegment)) {
+      releaseLock(lockPath)
+      process.stderr.write(
+        `[generate_session_manifest_from_hook] info: duplicate skip (key=${stableKeySegment}, event=${hookEventName})\n`,
+      )
+      return
+    }
+
+    // Resolve issue identity: payload → branch → cwd → issue-0 sentinel
+    // B1: use hookCtx.cwd (the active worktree cwd from hook stdin) rather than
+    // process.cwd() / REPO_ROOT so that worktrees are identified correctly.
+    const hookCwd = typeof hookCtx?.cwd === 'string' ? hookCtx.cwd : null
+    const gitCwd = hookCwd ?? REPO_ROOT
+
+    let currentBranchName = null
+    try {
+      currentBranchName =
+        execFileSync('git', ['branch', '--show-current'], {
+          encoding: 'utf8',
+          cwd: gitCwd,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        }).trim() || null
+    } catch {
+      // git unavailable or not a repo — fall through to cwd extraction
+    }
+    const resolvedIssueNumber = resolveIssueNumber(hookCtx, {
+      branchName: currentBranchName,
+      cwdPath: hookCwd ?? process.cwd(),
+    })
+
+    // Build sequence ID: must be 3-digit zero-padded number (producer validates /^[0-9]{3}$/)
+    // Use last 3 digits of epoch seconds to get a stable-ish 3-digit number
+    const seqNum = String(Math.floor(Date.now() / 1000) % 1000).padStart(3, '0')
+    const issuePrefix = resolvedIssueNumber !== null ? `issue-${resolvedIssueNumber}` : 'issue-0'
+    const phaseInstanceId = `${issuePrefix}:${phaseInfo.mainLoop}:${seqNum}`
+
+    // Artifact filename: timestamp-based with stable key segment (no content hash — avoids circular ref)
+    const timestamp = Date.now()
+    const eventNameLower = hookEventName.toLowerCase()
+    const baseFilename = `private-agent-session-manifest-${eventNameLower}-${timestamp}-${stableKeySegment}.json`
+
+    // Evidence source ref uses relative path (no absolute paths in public output)
+    const evidenceSourceRef = `artifacts/session-manifest-runtime/manifests/${baseFilename}`
+
+    // Build actor name enriched with available context
+    // Limit to reasonable length to avoid producer validation issues
+    let actorName = 'claude-code-hook'
+    if (agentId) {
+      actorName = `claude-code-subagent-${agentId.slice(0, 8)}`
+    } else if (toolName) {
+      // Truncate tool name to avoid excessively long actor names
+      const safeToolName = toolName.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 32)
+      actorName = `claude-code-hook-${safeToolName}`
+    }
+
+    // Build producer CLI arguments via exported helper (testable separately)
+    const producerArgs = buildProducerArgs({
+      producerScript: PRODUCER_SCRIPT,
+      repository: REPOSITORY,
+      phaseInfo,
+      phaseInstanceId,
+      actorType: 'ai_agent',
+      actorName,
+      evidenceSourceKind: 'artifact',
+      evidenceSourceRef,
+      evidenceVisibility: 'private_artifact',
+      sessionId,
+      resolvedIssueNumber,
+    })
+
+    let manifestJson
+    try {
+      // Invoke producer and capture stdout (manifest JSON)
+      // stdout is captured but NOT forwarded to our process stdout
+      manifestJson = execFileSync(process.execPath, producerArgs, {
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+    } catch (err) {
+      // Best-effort: producer failure does NOT block the session
+      process.stderr.write(
+        `[generate_session_manifest_from_hook] warn: producer failed (best-effort, continuing): ${sanitizeForStderr(err.message)}\n`,
+      )
+      releaseLock(lockPath)
+      return
+    }
+
+    // Compute content hash for storage as metadata (not used in filename)
+    const contentHash = sha256(manifestJson)
+
+    // Atomic write: write to temp file, then rename to final filename
+    const finalPath = join(MANIFESTS_DIR, baseFilename)
+    const tmpPath = join(TMP_DIR, `.tmp-${randomUUID()}`)
+
+    try {
+      writeFileSync(tmpPath, manifestJson, { encoding: 'utf8', flag: 'wx' })
+      renameSync(tmpPath, finalPath)
+      process.stderr.write(
+        `[generate_session_manifest_from_hook] info: artifact written (event=${hookEventName}, sha256=${contentHash.slice(0, 16)})\n`,
+      )
+    } catch (err) {
+      // Best-effort: artifact write failure does NOT block the session
+      process.stderr.write(
+        `[generate_session_manifest_from_hook] warn: artifact write failed (best-effort, continuing): ${sanitizeForStderr(err.message)}\n`,
+      )
+      // Attempt cleanup of temp file (ignore errors)
+      try {
+        renameSync(tmpPath, `${tmpPath}.failed`)
+      } catch {
+        // ignore cleanup error
+      }
+      releaseLock(lockPath)
+      return
+    }
+
+    // Release lock after successful artifact write
     releaseLock(lockPath)
-    process.exit(0)
+
+    // stdout remains empty (no manifest content on stdout)
+  } finally {
+    flushPendingLegacyDiagnostics()
   }
-
-  // Release lock after successful artifact write
-  releaseLock(lockPath)
-
-  // stdout remains empty (no manifest content on stdout)
-  process.exit(0)
 }
 
 // Run main() only when executed directly (not imported for unit testing)
 if (fileURLToPath(import.meta.url) === process.argv[1]) {
-  main().catch((err) => {
-    // Best-effort: uncaught error does NOT block the session
-    process.stderr.write(
-      `[generate_session_manifest_from_hook] warn: fatal (best-effort, continuing): ${sanitizeForStderr(err.message)}\n`,
-    )
-    // Release any lock we may be holding
-    if (_activeLockPath) {
-      releaseLock(_activeLockPath)
-      _activeLockPath = null
-    }
-    process.exit(0)
-  })
+  main()
+    .then(() => {
+      process.exit(0)
+    })
+    .catch((err) => {
+      // Best-effort: uncaught error does NOT block the session
+      process.stderr.write(
+        `[generate_session_manifest_from_hook] warn: fatal (best-effort, continuing): ${sanitizeForStderr(err.message)}\n`,
+      )
+      // Release any lock we may be holding
+      if (_activeLockPath) {
+        releaseLock(_activeLockPath)
+        _activeLockPath = null
+      }
+      process.exit(0)
+    })
 }
