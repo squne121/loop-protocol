@@ -46,7 +46,12 @@ uv run --locked python3 .claude/skills/implement-issue/scripts/check_implementat
   --issue-number "$ISSUE_NUMBER" \
   --repo "$REPO" \
   > /tmp/overlap_preflight_${ISSUE_NUMBER}.json
-OVERLAP_EXIT=$?
+```
+
+**呼び出し側は `$?`（exit code）を continue/stop の分岐条件に使ってはならない**。分類に成功した場合はどの route でも exit 0 を返す（Major 2、下記参照）。route の正本は常に出力 JSON の `route` フィールドである:
+
+```bash
+ROUTE=$(uv run python3 -c "import json,sys; print(json.load(sys.stdin)['route'])" < /tmp/overlap_preflight_${ISSUE_NUMBER}.json)
 ```
 
 このスクリプトは:
@@ -54,28 +59,44 @@ OVERLAP_EXIT=$?
 - `phase/implementation` ラベルが付いた OPEN Issue を `gh issue list` で列挙する（`number,title,body,labels,updatedAt,url`）。
 - 全候補の本文から Allowed Paths をローカルで抽出する。
 - 明示的な取得上限（`--limit`、既定 100）と saturation 検出を持ち、全件性を証明できない場合は fail-closed にする。
-- 収集した候補 JSON を `check_issue_overlap.py` の pure classifier に渡し、候補ごとに `## Outcome` / `## In Scope` を readback して意味的重複を判定する（Outcome token overlap ≥ 0.5 は heading_overlap とみなす）。
-- `IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1` evidence（`current_issue` / `source` / `candidates` / `route` / `evidence_sha256`）を標準出力に JSON で返す。
+- Machine-Readable Contract の `blocked_by` / `depends_on` / `supersedes`（YAML list、inline/block 両表記）、legacy `Depends on #N` 記法、GitHub native dependency（`blockedBy` / `blocking`）を統合的に解析する。current が参照する predecessor が OPEN candidate 一覧に含まれない場合、オンライン経路では個別に readback して実 state（OPEN/CLOSED）を確認する。predecessor の実 state に基づき C2a（closed、直列化可能）と C2b（open、待機）を分岐する。
+- 収集した候補 JSON を `check_issue_overlap.py` の pure classifier に渡した上で、候補ごとに `## Outcome` / `## In Scope` を readback し、**構造的シグナル**（AC ID・output schema 名・Machine-Readable Contract の key/value・In Scope 内 edit target（inline-code パス）・goal_ref・supersedes/superseded-by）を主軸に意味的重複を判定する。自然言語類似度（Outcome の token Jaccard）は補助 signal に留め、`proceed_with_collision_evidence` を許可する唯一の根拠にはしない。
+- `Allowed Paths` が同一集合であることは duplicate の十分条件にしない。`same_path_set` に基づく duplicate 候補は readback + 構造シグナルによる確認を経て初めて `duplicate` route を確定し、確認できない場合は C1 と同様に扱う。
+- 全 candidate（number/body/updatedAt/Allowed Paths/dependency contract の schema）を検証し、一件でも欠ければ `human_review_required` に倒す（false positive での黙殺を防ぐ）。
+- `IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1` evidence（`current_issue` / `source` / `candidates`（candidate ごとの `policy_class` / `reasons` / `structural_signals`）/ `dependency_resolution` / `validation_errors` / `route` / `decision_inputs_sha256` / `evidence_sha256`）を標準出力に JSON で返す。
 
-#### route / exit code 契約（クローズドセット）
+#### route / exit code 契約（クローズドセット、Major 2 改訂）
 
-| route | exit | 意味 | 本 Section の対応 |
-|---|---|---|---|
-| `proceed` | 0 | C0（重複候補なし） | 実装を継続する |
-| `proceed_with_collision_evidence` | 1 | 証明済み C1/C2a（全候補 readback 完了かつ Outcome が disjoint） | evidence を Issue コメントまたは worktree artifact に記録してから継続する |
-| `wait_for_predecessor` | 2 | C2b（open predecessor への依存が検出された） | 人間判断へ停止（predecessor 完了待ち） |
-| `human_review_required` | 3 | C3 / ambiguous / readback 不完全 / source degraded（saturated 等） | 人間判断へ停止 |
-| `duplicate` | 4 | 起票統合が必要な重複 | 人間判断へ停止（統合 PR を人間に提案） |
-| `runtime_error` | 5 | JSON parse 失敗 / schema 違反 / GitHub 取得失敗 | 人間判断へ停止（fail-closed） |
+| route | 意味 | 本 Section の対応 |
+|---|---|---|
+| `proceed` | C0（重複候補なし） | 実装を継続する |
+| `proceed_with_collision_evidence` | 証明済み C1/C2a（全候補 readback 完了かつ構造的に disjoint） | evidence を Issue コメントまたは worktree artifact に記録してから継続する |
+| `wait_for_predecessor` | C2b（open predecessor への依存が検出された） | 人間判断へ停止（predecessor 完了待ち） |
+| `human_review_required` | C3 / ambiguous / readback 不完全 / candidate schema 不備 / dependency 未解決 / source degraded（saturated 等） | 人間判断へ停止 |
+| `duplicate` | readback で確認済みの重複 | 人間判断へ停止（統合 PR を人間に提案） |
+| `runtime_error` | JSON parse 失敗 / schema 違反 / GitHub 取得失敗 | 人間判断へ停止（fail-closed） |
 
-unknown な verdict / policy_class（`check_issue_overlap.py` の契約違反の兆候）は `runtime_error` に倒される。
+**exit code**: 分類処理が成功した場合（`route` が上記 closed set のいずれかに決定できた場合）は **route を問わずすべて exit 0** を返す。GitHub 取得失敗 / JSON・schema 破損時のみ `runtime_error` として exit 1 を返す。`set -e` を使うシェルでも継続 route（`proceed_with_collision_evidence` / `wait_for_predecessor` / `human_review_required` / `duplicate`）で意図せず停止しない。unknown な verdict / policy_class（`check_issue_overlap.py` の契約違反の兆候）は `runtime_error` に倒される。
 
 - **継続 route（AC2）**: `proceed` と `proceed_with_collision_evidence` は実装を継続する。`proceed_with_collision_evidence` の場合、`IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1` evidence 全体を Issue コメントまたは worktree artifact に記録してから Step 3 へ進む。`open-pr` は同じ evidence digest（`evidence_sha256`）を PR 本文へ転記する。
 - **fail-closed route（AC3）**: `wait_for_predecessor` / `human_review_required` / `duplicate` / `runtime_error` はいずれも実装を開始せず、人間判断へ停止する。route と evidence（またはエラー内容）を人間へ提示する。
-- **candidate readback 前提（AC4）**: `check_implementation_overlap.py` は候補の `## Outcome` / `## In Scope` の readback が完了し、かつ意味的に disjoint であることを確認できて初めて `proceed_with_collision_evidence` を返す。readback が不完全な候補が一件でもある場合、または Outcome が意味的に重複する候補が一件でもある場合は `human_review_required` に倒す。**candidate contract の Outcome / In Scope / Out of Scope / Delivery Rule を readback する前に統合 PR を提案してはならない。**
+- **candidate readback 前提（AC4）**: `check_implementation_overlap.py` は候補の `## Outcome` / `## In Scope` の readback が完了し、かつ構造的シグナルと自然言語類似度の双方から disjoint であることを確認できて初めて `proceed_with_collision_evidence` を返す。readback が不完全な候補が一件でもある場合、または構造的シグナルもしくは Outcome の意味的重複が検出された候補が一件でもある場合は `human_review_required` に倒す。**candidate contract の Outcome / In Scope / Out of Scope / Delivery Rule を readback する前に統合 PR を提案してはならない。** `Allowed Paths` の同一集合一致（`same_path_set`）だけでは duplicate と確定しない。
 - **自己除外（AC6）**: `--issue-number` は必須であり、対象 Issue 自身は候補収集レイヤーによって自動的に自己除外される。自己除外を怠ると同一タイトル・同一 Allowed Paths によって `duplicate` と誤判定される。
 
-Step 7（push & PR 起票）の直前に、`route` が `proceed_with_collision_evidence` だった場合は candidate の `updated_at` / `body_sha256` drift（stale evidence）を再確認する。drift を検出した場合は本 Section を再実行する。
+#### PR 作成直前の deterministic drift gate（Major 1）
+
+Step 7（push & PR 起票）の直前に、`route` が `proceed_with_collision_evidence` または `wait_for_predecessor` 解除直後だった場合は、`check_implementation_overlap.py` を **再実行**して stale evidence（`updated_at` / `body_sha256` drift）を確認する:
+
+```bash
+uv run --locked python3 .claude/skills/implement-issue/scripts/check_implementation_overlap.py \
+  --issue-number "$ISSUE_NUMBER" \
+  --repo "$REPO" \
+  > /tmp/overlap_preflight_${ISSUE_NUMBER}_recheck.json
+```
+
+再実行後の `evidence_sha256`（または各 candidate の `body_sha256` / `updated_at`）が Step 2 実行時の値と異なる場合は drift と判定し、**本 Section を再実行してから Step 3 以降をやり直す**。drift が解消しない、または新たに `wait_for_predecessor` / `human_review_required` / `duplicate` に route が変わった場合は、Step 7 へ進まず（`git push` / `gh pr create` を呼ばず）人間判断へ停止する。これは deterministic gate であり、自然言語での「再確認する」という指示に留めない。
+
+open-pr 側の validator が `overlap_preflight` evidence を強制検証する変更（`open-pr/scripts/update_pr.py` 等）は、本 Issue（#1452 / PR #1455）の Allowed Paths 外（follow-up 要）。現時点では本 SKILL.md の deterministic drift gate（上記）と、Step 7 で `gh pr create` を直接呼ばないこと（`open-pr` に委譲）が唯一の強制ポイントである。
 
 `check_issue_overlap.py` 本体の scoring / schema ロジックの変更は本 Section の対象外（#1452 の Out of Scope）。また、本 preflight の continue 判定は OPEN Issue 間の意味的適合性のみを示し、active worktree / dirty path / 進行中 PR との同時編集安全性は証明しない（別 gate、#966 の責務）。
 
@@ -200,8 +221,15 @@ push 完了後、以下を `open-pr` skill に渡して起票させる:
 - `contract_snapshot_url`: 受け取った contract-snapshot comment URL
 - `verification_summary`: ステップ 5 で記録した PASS / FAIL サマリ
 - `allowed_paths_compliance`: true / false
+- `overlap_preflight`（Step 2 の route が `proceed_with_collision_evidence` だった場合のみ必須。それ以外は省略可）:
+  ```yaml
+  overlap_preflight:
+    required: true
+    evidence_file: /tmp/overlap_preflight_<ISSUE_NUMBER>_recheck.json  # Major 1 drift gate 再実行後のファイル
+    expected_digest: sha256:<evidence_sha256>
+  ```
 
-PR 本文テンプレ・publish ゲート・idempotency チェック・`Closes`/`Refs` の使い分けは `open-pr` 側の責務。本 skill では `gh pr create` を直接呼ばない。
+PR 本文テンプレ・publish ゲート・idempotency チェック・`Closes`/`Refs` の使い分けは `open-pr` 側の責務。本 skill では `gh pr create` を直接呼ばない。`overlap_preflight` を open-pr 側が強制検証する validator 配線は #1452 / PR #1455 の Allowed Paths 外であり follow-up とする（PR 作成直前の deterministic drift gate の項を参照）。
 
 ### 8. Issue コメントへの結果報告
 

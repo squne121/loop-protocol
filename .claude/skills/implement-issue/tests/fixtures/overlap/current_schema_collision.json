@@ -1,0 +1,8 @@
+{
+  "number": 9460,
+  "title": "実装: upgrade queue の resource ledger を FOO_BAR_RESULT_V2 で統一する",
+  "body": "## Machine-Readable Contract\n\n```yaml\ncontract_schema_version: v1\nissue_kind: implementation\nparent_issue: \"none\"\ngoal_ref: \"upgrade queue の resource ledger を FOO_BAR_RESULT_V2 で統一する\"\nchange_kind: feature\n```\n\n## Outcome\n\nupgrade queue の resource ledger 出力が `FOO_BAR_RESULT_V2` schema に\n統一されている状態。src/upgrade/ledger.ts と docs/dev/agent-runtime-ops.md\nを更新する。\n\n## In Scope\n\n- src/upgrade/ledger.ts の出力 schema を FOO_BAR_RESULT_V2 化\n- docs/dev/agent-runtime-ops.md への schema 説明追記\n\n## Out of Scope\n\n- queue の consumer 側実装\n\n## Delivery Rule\n\n- 1 Issue = 1 PR\n- Draft PR を既定とする\n\n## Allowed Paths\n\n- docs/dev/agent-runtime-ops.md\n- src/upgrade/ledger.ts\n",
+  "updatedAt": "2026-07-11T10:00:00Z",
+  "url": "https://github.com/squne121/loop-protocol/issues/9460",
+  "body_sha256": "sha256:4407de0a60e28cf24ef1bac063f3a15db7d6170df47fd85eded1b32f718b310c"
+}

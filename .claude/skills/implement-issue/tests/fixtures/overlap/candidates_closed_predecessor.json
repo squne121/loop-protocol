@@ -1,0 +1,16 @@
+[
+  {
+    "number": 9449,
+    "title": "実装: publish lane の authorization code の信頼起点となる external trust root を確立する",
+    "body": "## Machine-Readable Contract\n\n```yaml\ncontract_schema_version: v1\nissue_kind: implementation\nparent_issue: \"none\"\ngoal_ref: \"publish lane の authorization code の信頼起点となる external trust root を確立する\"\nchange_kind: security\n```\n\n## Outcome\n\npublish lane の authorization code（policy/adapter）が、trusted hook\nlauncher・manifest・bootstrap/rotation 手順を含む external trust root に\n基づいて検証される状態。docs/dev/agent-runtime-ops.md に trust root の\n配置と検証手順を追記する。\n\n## In Scope\n\n- trusted hook launcher の bootstrap / rotation 手順\n- docs/dev/agent-runtime-ops.md への trust root セクション追記\n\n## Out of Scope\n\n- Codex custom-agent の model allocation\n- role-based model routing 証跡\n\n## Delivery Rule\n\n- 1 Issue = 1 PR\n- Draft PR を既定とする\n\n## Allowed Paths\n\n- docs/dev/agent-runtime-ops.md\n- docs/dev/publish-lane-trust-root.md\n",
+    "labels": [
+      {
+        "name": "phase/implementation"
+      }
+    ],
+    "updatedAt": "2026-07-11T07:39:31Z",
+    "url": "https://github.com/squne121/loop-protocol/issues/9449",
+    "state": "CLOSED",
+    "body_sha256": "sha256:90de034df4aa97020caf3c89a59eddfa945ddbc46daeea37d659fb6f8c25289b"
+  }
+]
