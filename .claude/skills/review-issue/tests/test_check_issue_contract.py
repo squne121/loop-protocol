@@ -340,6 +340,242 @@ class TestC2Fail:
         )
 
 
+class TestC2StopConditionsBulletMarkers:
+    """GIVEN Stop Conditions sections using non-hyphen bullet markers
+    WHEN checker runs THEN C2 counts top-level bullets consistently for all
+    allowed markers (-, *, +), via iter_top_level_stop_condition_items
+    (Issue #1431)."""
+
+    def test_c2_stop_conditions_asterisk_bullet(self):
+        """GIVEN c2_asterisk_pass_issue.md (6 asterisk bullets) WHEN checker runs
+        THEN C2_stop_conditions_6 is pass."""
+        output = run_checker("c2_asterisk_pass_issue.md")
+        assert output["deterministic_checks"]["C2_stop_conditions_6"] == "pass", (
+            f"Expected C2 to pass, got {output['deterministic_checks']['C2_stop_conditions_6']}"
+        )
+
+    def test_c2_stop_conditions_plus_bullet(self):
+        """GIVEN c2_plus_pass_issue.md (6 plus bullets) WHEN checker runs
+        THEN C2_stop_conditions_6 is pass."""
+        output = run_checker("c2_plus_pass_issue.md")
+        assert output["deterministic_checks"]["C2_stop_conditions_6"] == "pass", (
+            f"Expected C2 to pass, got {output['deterministic_checks']['C2_stop_conditions_6']}"
+        )
+
+    def test_c2_stop_conditions_insufficient(self):
+        """GIVEN c2_asterisk_insufficient_issue.md (3 asterisk bullets, <6) WHEN checker
+        runs THEN C2_stop_conditions_6 is fail."""
+        output = run_checker("c2_asterisk_insufficient_issue.md")
+        assert output["deterministic_checks"]["C2_stop_conditions_6"] == "fail", (
+            f"Expected C2 to fail, got {output['deterministic_checks']['C2_stop_conditions_6']}"
+        )
+
+
+class TestC2StopConditionsTopLevelTokenizer:
+    """GIVEN Stop Conditions sections exercising the dedicated top-level
+    tokenizer (iter_top_level_stop_condition_items, Issue #1431 review
+    remediation) WHEN checker runs THEN C2 counts only genuine top-level
+    items, excluding fence content / nested bullets / thematic breaks /
+    empty items / tab-indented lines."""
+
+    @pytest.mark.parametrize(
+        "fixture_name",
+        [
+            "c2_hyphen_pass_issue.md",
+            "c2_asterisk_pass_issue.md",
+            "c2_plus_pass_issue.md",
+        ],
+    )
+    def test_marker_matrix_6_items_pass(self, fixture_name):
+        """GIVEN 6 top-level items using -, *, or + markers WHEN checker runs
+        THEN C2_stop_conditions_6 is pass."""
+        output = run_checker(fixture_name)
+        assert output["deterministic_checks"]["C2_stop_conditions_6"] == "pass", (
+            f"{fixture_name}: expected C2 to pass, "
+            f"got {output['deterministic_checks']['C2_stop_conditions_6']}"
+        )
+
+    @pytest.mark.parametrize(
+        "fixture_name",
+        [
+            "c2_hyphen_insufficient_issue.md",
+            "c2_asterisk_insufficient_5_issue.md",
+            "c2_plus_insufficient_issue.md",
+        ],
+    )
+    def test_marker_matrix_5_items_fail(self, fixture_name):
+        """GIVEN 5 top-level items using -, *, or + markers WHEN checker runs
+        THEN C2_stop_conditions_6 is fail, verdict is needs-fix, and
+        blocking_issues references Stop Conditions."""
+        output = run_checker(fixture_name)
+        assert output["deterministic_checks"]["C2_stop_conditions_6"] == "fail", (
+            f"{fixture_name}: expected C2 to fail, "
+            f"got {output['deterministic_checks']['C2_stop_conditions_6']}"
+        )
+        assert output["verdict"] == "needs-fix", (
+            f"{fixture_name}: expected verdict needs-fix, got {output['verdict']}"
+        )
+        assert any("Stop Conditions" in msg for msg in output["blocking_issues"]), (
+            f"{fixture_name}: expected a Stop Conditions message in blocking_issues, "
+            f"got {output['blocking_issues']}"
+        )
+
+    def test_fenced_bullet_like_lines_not_counted(self):
+        """GIVEN 5 real top-level items plus a code fence containing
+        bullet-like lines WHEN checker runs THEN the fenced lines are NOT
+        counted (count stays 5, C2 fails) and blocking_issues references
+        Stop Conditions."""
+        output = run_checker("c2_fence_bullet_excluded_issue.md")
+        assert output["deterministic_checks"]["C2_stop_conditions_6"] == "fail", (
+            "Expected C2 to fail (fenced bullet-like lines must not be "
+            f"counted), got {output['deterministic_checks']['C2_stop_conditions_6']}"
+        )
+        assert output["verdict"] == "needs-fix", (
+            f"Expected verdict needs-fix, got {output['verdict']}"
+        )
+        assert any("Stop Conditions" in msg for msg in output["blocking_issues"]), (
+            f"Expected a Stop Conditions message in blocking_issues, got {output['blocking_issues']}"
+        )
+
+    def test_nested_bullet_not_counted_as_top_level(self):
+        """GIVEN 5 top-level items and 1 nested (indented) sub-item WHEN
+        checker runs THEN the nested item is NOT counted as top-level
+        (count stays 5, C2 fails) and blocking_issues references Stop
+        Conditions."""
+        output = run_checker("c2_nested_bullet_excluded_issue.md")
+        assert output["deterministic_checks"]["C2_stop_conditions_6"] == "fail", (
+            "Expected C2 to fail (nested bullet must not be counted as "
+            f"top-level), got {output['deterministic_checks']['C2_stop_conditions_6']}"
+        )
+        assert output["verdict"] == "needs-fix", (
+            f"Expected verdict needs-fix, got {output['verdict']}"
+        )
+        assert any("Stop Conditions" in msg for msg in output["blocking_issues"]), (
+            f"Expected a Stop Conditions message in blocking_issues, got {output['blocking_issues']}"
+        )
+
+    def test_thematic_break_not_counted(self):
+        """GIVEN 5 top-level items and a GFM thematic break line ("* * *")
+        WHEN checker runs THEN the thematic break is NOT counted as a
+        bullet (count stays 5, C2 fails) and blocking_issues references
+        Stop Conditions."""
+        output = run_checker("c2_thematic_break_excluded_issue.md")
+        assert output["deterministic_checks"]["C2_stop_conditions_6"] == "fail", (
+            "Expected C2 to fail (thematic break must not be counted), "
+            f"got {output['deterministic_checks']['C2_stop_conditions_6']}"
+        )
+        assert output["verdict"] == "needs-fix", (
+            f"Expected verdict needs-fix, got {output['verdict']}"
+        )
+        assert any("Stop Conditions" in msg for msg in output["blocking_issues"]), (
+            f"Expected a Stop Conditions message in blocking_issues, got {output['blocking_issues']}"
+        )
+
+    def test_whitespace_only_item_not_counted(self):
+        """GIVEN 5 real top-level items and 1 item whose content is
+        whitespace-only WHEN checker runs THEN the empty item is NOT
+        counted (count stays 5, C2 fails) and blocking_issues references
+        Stop Conditions."""
+        output = run_checker("c2_empty_item_excluded_issue.md")
+        assert output["deterministic_checks"]["C2_stop_conditions_6"] == "fail", (
+            "Expected C2 to fail (whitespace-only item must not be "
+            f"counted), got {output['deterministic_checks']['C2_stop_conditions_6']}"
+        )
+        assert output["verdict"] == "needs-fix", (
+            f"Expected verdict needs-fix, got {output['verdict']}"
+        )
+        assert any("Stop Conditions" in msg for msg in output["blocking_issues"]), (
+            f"Expected a Stop Conditions message in blocking_issues, got {output['blocking_issues']}"
+        )
+
+    def test_tab_indented_item_rejected(self):
+        """GIVEN 5 real top-level items and 1 tab-indented bullet-like line
+        WHEN checker runs THEN the tab-indented line is REJECTED (not
+        counted at all — tabs are not accepted as marker indentation),
+        count stays 5, C2 fails, and blocking_issues references Stop
+        Conditions."""
+        output = run_checker("c2_tab_indent_rejected_issue.md")
+        assert output["deterministic_checks"]["C2_stop_conditions_6"] == "fail", (
+            "Expected C2 to fail (tab-indented line must be rejected, not "
+            f"counted), got {output['deterministic_checks']['C2_stop_conditions_6']}"
+        )
+        assert output["verdict"] == "needs-fix", (
+            f"Expected verdict needs-fix, got {output['verdict']}"
+        )
+        assert any("Stop Conditions" in msg for msg in output["blocking_issues"]), (
+            f"Expected a Stop Conditions message in blocking_issues, got {output['blocking_issues']}"
+        )
+
+
+class TestIterTopLevelStopConditionItemsUnit:
+    """GIVEN small in-memory Stop Conditions section strings WHEN
+    iter_top_level_stop_condition_items() runs THEN it yields exactly the
+    top-level items (unit-level coverage complementing the fixture-based
+    C2 tests above, Issue #1431)."""
+
+    def test_simple_hyphen_list(self):
+        section = "- a\n- b\n- c\n"
+        assert list(checker.iter_top_level_stop_condition_items(section)) == [
+            "a",
+            "b",
+            "c",
+        ]
+
+    def test_fence_content_excluded(self):
+        section = "- a\n- b\n```\n- fake1\n- fake2\n```\n- c\n"
+        assert list(checker.iter_top_level_stop_condition_items(section)) == [
+            "a",
+            "b",
+            "c",
+        ]
+
+    def test_nested_item_excluded(self):
+        section = "- a\n- b\n  - nested\n- c\n"
+        assert list(checker.iter_top_level_stop_condition_items(section)) == [
+            "a",
+            "b",
+            "c",
+        ]
+
+    def test_thematic_break_excluded(self):
+        section = "- a\n- b\n- c\n* * *\n"
+        assert list(checker.iter_top_level_stop_condition_items(section)) == [
+            "a",
+            "b",
+            "c",
+        ]
+
+    def test_thematic_break_dash_variant_excluded(self):
+        section = "- a\n- b\n- c\n- - -\n"
+        assert list(checker.iter_top_level_stop_condition_items(section)) == [
+            "a",
+            "b",
+            "c",
+        ]
+
+    def test_empty_item_excluded(self):
+        section = "- a\n- b\n-  \n- c\n"
+        assert list(checker.iter_top_level_stop_condition_items(section)) == [
+            "a",
+            "b",
+            "c",
+        ]
+
+    def test_tab_after_marker_rejected(self):
+        section = "- a\n-\tb\n- c\n"
+        assert list(checker.iter_top_level_stop_condition_items(section)) == [
+            "a",
+            "c",
+        ]
+
+    def test_tab_before_marker_rejected(self):
+        section = "- a\n\t- b\n- c\n"
+        assert list(checker.iter_top_level_stop_condition_items(section)) == [
+            "a",
+            "c",
+        ]
+
+
 class TestC3Fail:
     """GIVEN a fixture with non-checkbox AC WHEN checker runs THEN C3 fails."""
 
