@@ -882,6 +882,17 @@ def test_ac8_japanese_pass_allows_gh_pr_create(monkeypatch: pytest.MonkeyPatch):
             },
         )
         monkeypatch.setattr(open_pr, "find_existing_pr", lambda repo, branch: None)
+        # P1-1 (PR #1467 review fix): overlap gate 起動判定用の label 再取得を
+        # モックし、labels なし（phase/implementation 無し）を明示する。実
+        # gh 呼び出しに fail-closed した場合、overlap gate が強制起動され
+        # evidence 未提供で rc=2 になるため、この AC8 テストの意図
+        # （Japanese check pass 時に gh pr create がブロックされない）を
+        # 検証するには label 取得を空 list でモックする必要がある。
+        monkeypatch.setattr(
+            open_pr,
+            "fetch_current_linked_issue_labels",
+            lambda repo, issue_number: ([], None),
+        )
 
         def fake_create_pr(repo, title, body_file, branch, draft):
             create_called["value"] = True
