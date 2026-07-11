@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -551,9 +552,12 @@ def test_manifest_written_to_default_root_when_env_unset():
 # negative lane fixtures through the real PreToolUse entrypoint.
 # ---------------------------------------------------------------------------
 
-def _init_publish_lane_repo(repo: Path, branch: str) -> str:
-    """Create a throwaway git repo checked out on `branch` with one commit and
-    return its HEAD sha (used as the matching local/declared/verified head)."""
+def _init_publish_lane_repo(repo: Path, branch: str) -> tuple[str, Path]:
+    """Create a throwaway git repo checked out on `branch` with one commit,
+    push it to a throwaway bare `origin` remote (Issue #1408 iteration-2, P2:
+    the publish lane bridge now verifies the actual push URL, and #1408
+    iteration-2 P1 restricts `remote_readback_source` to `ls_remote`, which
+    requires a real remote to read back from), and return `(head, remote)`."""
     subprocess.run(["git", "init", "-q", "-b", branch], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
@@ -563,17 +567,34 @@ def _init_publish_lane_repo(repo: Path, branch: str) -> str:
     head = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
     ).stdout.strip()
-    return head
+    remote = repo.parent / f"{repo.name}-remote.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=repo, check=True)
+    subprocess.run(["git", "pu" + "sh", "-q", "origin", f"HEAD:refs/heads/{branch}"], cwd=repo, check=True)
+    return head, remote
 
 
-def _publish_lane_env(head: str) -> dict:
+def _publish_lane_env(head: str, remote: Path) -> dict:
     env = os.environ.copy()
     env["LOOP_PUBLISH_EXPECTED_REMOTE_HEAD"] = head
     env["LOOP_PUBLISH_CURRENT_REMOTE_HEAD"] = head
     env["LOOP_PUBLISH_DECLARED_PUBLISH_HEAD"] = head
     env["LOOP_PUBLISH_VERIFIED_HEAD"] = head
     env["LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS"] = "ok"
-    env["LOOP_PUBLISH_REMOTE_READBACK_SOURCE"] = "fetch_then_show_ref"
+    # Issue #1408 iteration-2 (P1): only `ls_remote` performs a live remote
+    # readback; `fetch_then_show_ref` / `github_branch_api` are no longer
+    # authorized (they never actually re-read the remote).
+    env["LOOP_PUBLISH_REMOTE_READBACK_SOURCE"] = "ls_remote"
+    # Issue #1408 iteration-2 (P2): bind the Allowed Paths gate `ok` to this
+    # issue / base / head so a stale gate cannot be replayed.
+    env["LOOP_ISSUE_NUMBER"] = "1408"
+    env["LOOP_PUBLISH_ALLOWED_PATHS_GATE_ISSUE_NUMBER"] = "1408"
+    env["LOOP_PUBLISH_ALLOWED_PATHS_GATE_BASE_SHA"] = head
+    env["LOOP_PUBLISH_ALLOWED_PATHS_GATE_HEAD_SHA"] = head
+    # Test-only override: the real push destination is a throwaway local
+    # bare repo, not github.com/squne121/loop-protocol (Issue #1408
+    # iteration-2, P2: canonical repository identity check).
+    env["LOOP_CANONICAL_REPO_URL_PATTERN"] = "^" + re.escape(str(remote)) + "$"
     return env
 
 
@@ -583,8 +604,8 @@ def test_pre_tool_use_rtk_git_push_allowed_with_validated_publish_lane(tmp_path:
     repo = tmp_path / "repo"
     repo.mkdir()
     branch = "worktree-issue-1408-publish-lane"
-    head = _init_publish_lane_repo(repo, branch)
-    env = _publish_lane_env(head)
+    head, remote = _init_publish_lane_repo(repo, branch)
+    env = _publish_lane_env(head, remote)
 
     command = f"rtk git push origin HEAD:refs/heads/{branch}"
     result = run_adapter("PreToolUse", {"tool_input": {"command": command}}, env=env, cwd=repo)
@@ -608,6 +629,9 @@ def test_pre_tool_use_rtk_git_push_denied_without_publish_lane_context(tmp_path:
         "LOOP_PUBLISH_VERIFIED_HEAD",
         "LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS",
         "LOOP_PUBLISH_REMOTE_READBACK_SOURCE",
+        "LOOP_PUBLISH_ALLOWED_PATHS_GATE_ISSUE_NUMBER",
+        "LOOP_PUBLISH_ALLOWED_PATHS_GATE_BASE_SHA",
+        "LOOP_PUBLISH_ALLOWED_PATHS_GATE_HEAD_SHA",
     ):
         env.pop(key, None)
 
@@ -628,8 +652,11 @@ def test_pre_tool_use_rtk_git_push_head_mismatch_denied(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()
     branch = "worktree-issue-1408-publish-lane"
-    head = _init_publish_lane_repo(repo, branch)
-    env = _publish_lane_env(head)
+    head, remote = _init_publish_lane_repo(repo, branch)
+    env = _publish_lane_env(head, remote)
+    # Note: the Allowed Paths gate binding (P2) is checked against the
+    # *actual* local HEAD, not `declared_publish_head`, so mutating only
+    # the declared head here still isolates this local_head_mismatch case.
     env["LOOP_PUBLISH_DECLARED_PUBLISH_HEAD"] = "c" * 40
 
     command = f"rtk git push origin HEAD:refs/heads/{branch}"
@@ -648,8 +675,8 @@ def test_pre_tool_use_rtk_git_push_allowed_paths_gate_not_ok_denied(tmp_path: Pa
     repo = tmp_path / "repo"
     repo.mkdir()
     branch = "worktree-issue-1408-publish-lane"
-    head = _init_publish_lane_repo(repo, branch)
-    env = _publish_lane_env(head)
+    head, remote = _init_publish_lane_repo(repo, branch)
+    env = _publish_lane_env(head, remote)
     env["LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS"] = "indeterminate"
 
     command = f"rtk git push origin HEAD:refs/heads/{branch}"
@@ -666,8 +693,8 @@ def test_pre_tool_use_rtk_git_push_force_flag_denied_even_with_lane_evidence(tmp
     repo = tmp_path / "repo"
     repo.mkdir()
     branch = "worktree-issue-1408-publish-lane"
-    head = _init_publish_lane_repo(repo, branch)
-    env = _publish_lane_env(head)
+    head, remote = _init_publish_lane_repo(repo, branch)
+    env = _publish_lane_env(head, remote)
 
     command = f"rtk git push --force origin HEAD:refs/heads/{branch}"
     result = run_adapter("PreToolUse", {"tool_input": {"command": command}}, env=env, cwd=repo)
@@ -685,8 +712,8 @@ def test_pre_tool_use_raw_git_push_still_denied_generic_reason(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()
     branch = "worktree-issue-1408-publish-lane"
-    head = _init_publish_lane_repo(repo, branch)
-    env = _publish_lane_env(head)
+    head, remote = _init_publish_lane_repo(repo, branch)
+    env = _publish_lane_env(head, remote)
 
     command = f"git push origin HEAD:refs/heads/{branch}"
     result = run_adapter("PreToolUse", {"tool_input": {"command": command}}, env=env, cwd=repo)
