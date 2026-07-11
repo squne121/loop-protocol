@@ -155,14 +155,14 @@ def test_stdout_silent_for_stop_positive_fixture(tmp_path: Path):
     ],
 )
 def test_pre_tool_use_guard_blocks_bypass_variants(command: str):
-    result = run_adapter("PreToolUse", {"tool_input": {"command": command}})
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 def test_pre_tool_use_guard_blocks_git_push():
     result = run_adapter("PreToolUse", {
-        "tool_input": {"command": "git push origin main"}
+        "tool_name": "Bash", "tool_input": {"command": "git push origin main"}
     })
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
@@ -170,7 +170,7 @@ def test_pre_tool_use_guard_blocks_git_push():
 
 def test_pre_tool_use_guard_blocks_forbidden_paths():
     result = run_adapter("PreToolUse", {
-        "tool_input": {"command": "cat .env"}
+        "tool_name": "Bash", "tool_input": {"command": "cat .env"}
     })
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
@@ -178,7 +178,7 @@ def test_pre_tool_use_guard_blocks_forbidden_paths():
 
 def test_permission_request_uses_event_specific_deny_shape():
     result = run_adapter("PermissionRequest", {
-        "tool_input": {"command": "printenv"}
+        "tool_name": "Bash", "tool_input": {"command": "printenv"}
     })
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["hookEventName"] == "PermissionRequest"
@@ -189,7 +189,7 @@ def test_pre_tool_use_readonly_pipeline_keeps_stdout_empty_and_writes_no_manifes
     """GIVEN readonly pipeline WHEN PreToolUse fires THEN stdout empty and no manifest directory is created."""
     env = manifest_root_env(tmp_path)
     result = run_adapter("PreToolUse", {
-        "tool_input": {"command": 'rg -n "TODO" README.md | head -n 20'}
+        "tool_name": "Bash", "tool_input": {"command": 'rg -n "TODO" README.md | head -n 20'}
     }, env=env)
     assert result.stdout == ""  # stdout empty
     manifest_root = Path(env["CODEX_HOOK_MANIFEST_ROOT"])
@@ -201,7 +201,7 @@ def test_permission_request_readonly_pipeline_keeps_stdout_empty_and_writes_no_m
     """GIVEN readonly pipeline WHEN PermissionRequest fires THEN stdout empty and no manifest directory is created."""
     env = manifest_root_env(tmp_path)
     result = run_adapter("PermissionRequest", {
-        "tool_input": {"command": "git status --short | head -n 20"}
+        "tool_name": "Bash", "tool_input": {"command": "git status --short | head -n 20"}
     }, env=env)
     assert result.stdout == ""  # stdout empty
     manifest_root = Path(env["CODEX_HOOK_MANIFEST_ROOT"])
@@ -266,7 +266,7 @@ def test_post_run_verifier_blocks_forbidden_paths(tmp_path: Path):
 
 def test_pre_tool_use_secret_boundary_gh_secret():
     """GIVEN a gh secret command WHEN PreToolUse fires THEN reason_code=secret_boundary_violation command_kind=gh_secret"""
-    result = run_adapter("PreToolUse", {"tool_input": {"command": "gh secret list"}})
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "gh secret list"}})
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
@@ -277,7 +277,7 @@ def test_pre_tool_use_secret_boundary_gh_secret():
 def test_pre_tool_use_secret_boundary_gh_api_secrets():
     """GIVEN a gh api .../secrets command WHEN PreToolUse fires THEN reason_code=secret_boundary_violation command_kind=gh_api_actions_secrets"""
     result = run_adapter("PreToolUse", {
-        "tool_input": {"command": "gh api repos/squne121/loop-protocol/actions/secrets"}
+        "tool_name": "Bash", "tool_input": {"command": "gh api repos/squne121/loop-protocol/actions/secrets"}
     })
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
@@ -288,7 +288,7 @@ def test_pre_tool_use_secret_boundary_gh_api_secrets():
 
 def test_pre_tool_use_secret_boundary_printenv():
     """GIVEN printenv command WHEN PreToolUse fires THEN reason_code=secret_boundary_violation command_kind=printenv"""
-    result = run_adapter("PreToolUse", {"tool_input": {"command": "printenv"}})
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "printenv"}})
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
@@ -302,7 +302,7 @@ def test_pre_tool_use_secret_boundary_printenv():
 
 def test_pre_tool_use_remote_write_git_push():
     """GIVEN git push command WHEN PreToolUse fires THEN reason_code=remote_write_requires_approval command_kind=git_push"""
-    result = run_adapter("PreToolUse", {"tool_input": {"command": "git push origin main"}})
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "git push origin main"}})
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
@@ -312,7 +312,9 @@ def test_pre_tool_use_remote_write_git_push():
 
 def test_pre_tool_use_remote_write_git_push_dash_c():
     """GIVEN git -C <dir> push command WHEN PreToolUse fires THEN reason_code=remote_write_requires_approval"""
-    result = run_adapter("PreToolUse", {"tool_input": {"command": "git -C /some/path push origin main"}})
+    result = run_adapter(
+        "PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "git -C /some/path push origin main"}}
+    )
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
@@ -322,7 +324,7 @@ def test_pre_tool_use_remote_write_git_push_dash_c():
 
 def test_pre_tool_use_remote_write_reason_not_secret():
     """GIVEN git push WHEN PreToolUse fires THEN reason does NOT contain secret_boundary_violation"""
-    result = run_adapter("PreToolUse", {"tool_input": {"command": "git push origin main"}})
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "git push origin main"}})
     response = json.loads(result.stdout)
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
     assert "secret_boundary_violation" not in reason
@@ -335,7 +337,7 @@ def test_pre_tool_use_remote_write_reason_not_secret():
 
 def test_supported_output_shape():
     """GIVEN a denied PreToolUse event WHEN adapter emits deny JSON THEN only supported fields are present"""
-    result = run_adapter("PreToolUse", {"tool_input": {"command": "git push origin main"}})
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "git push origin main"}})
     response = json.loads(result.stdout)
     # Root-level must NOT contain Codex control fields that would interfere with PreToolUse
     root_unsupported = {"decision", "continue", "stopReason", "suppressOutput"}
@@ -355,7 +357,7 @@ def test_supported_output_shape():
 
 def test_permission_request_supported_output_shape():
     """GIVEN a denied PermissionRequest event WHEN adapter emits deny JSON THEN event-specific shape is used"""
-    result = run_adapter("PermissionRequest", {"tool_input": {"command": "printenv"}})
+    result = run_adapter("PermissionRequest", {"tool_name": "Bash", "tool_input": {"command": "printenv"}})
     response = json.loads(result.stdout)
     hook_output = response["hookSpecificOutput"]
     assert hook_output["hookEventName"] == "PermissionRequest"
@@ -373,7 +375,7 @@ def test_mixed_priority_secret_before_remote_write():
     """GIVEN a command that matches both secret AND remote write patterns WHEN guard fires THEN secret_boundary_violation takes priority"""
     # Hypothetical combined command: push that also dumps secrets (secret wins)
     result = run_adapter("PreToolUse", {
-        "tool_input": {"command": "gh secret list && git push origin main"}
+        "tool_name": "Bash", "tool_input": {"command": "gh secret list && git push origin main"}
     })
     response = json.loads(result.stdout)
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
@@ -383,7 +385,9 @@ def test_mixed_priority_secret_before_remote_write():
 
 def test_env_wrapper_not_secret():
     """GIVEN env FOO=bar <cmd> prefix WHEN PreToolUse fires THEN it is NOT treated as a secret dump"""
-    result = run_adapter("PreToolUse", {"tool_input": {"command": "env PAGER=cat gh issue view 1"}})
+    result = run_adapter(
+        "PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "env PAGER=cat gh issue view 1"}}
+    )
     # env FOO=bar prefix should be stripped and gh issue view 1 is allowed (read-only)
     # If stdout is empty, the command passed through (no deny output = allowed behavior)
     if not result.stdout.strip():
@@ -402,7 +406,7 @@ def test_blocked_command_preview_redacted():
     # Note: we use a command that is actually blocked by the guard.
     # For redaction verification we rely on the redactCommandPreview unit behavior via gh secret.
     result = run_adapter("PreToolUse", {
-        "tool_input": {"command": "gh secret list --token sk-abc123xyz456"}
+        "tool_name": "Bash", "tool_input": {"command": "gh secret list --token sk-abc123xyz456"}
     })
     response = json.loads(result.stdout)
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
@@ -411,7 +415,8 @@ def test_blocked_command_preview_redacted():
 
     # Test 2: ghp_ token in gh api secrets command
     result = run_adapter("PreToolUse", {
-        "tool_input": {"command": "gh api /repos/owner/repo/actions/secrets --header Authorization:ghp_abc123xyz456"}
+        "tool_name": "Bash",
+        "tool_input": {"command": "gh api /repos/owner/repo/actions/secrets --header Authorization:ghp_abc123xyz456"},
     })
     response = json.loads(result.stdout)
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
@@ -420,7 +425,7 @@ def test_blocked_command_preview_redacted():
 
     # Test 3: MY_SECRET variable in printenv command (printenv → secret_boundary_violation)
     result = run_adapter("PreToolUse", {
-        "tool_input": {"command": "MY_SECRET=hunter2 printenv"}
+        "tool_name": "Bash", "tool_input": {"command": "MY_SECRET=hunter2 printenv"}
     })
     response = json.loads(result.stdout)
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
@@ -429,7 +434,7 @@ def test_blocked_command_preview_redacted():
 
     # Test 4: long command is truncated
     long_cmd = "git push origin main " + ("x" * 100)
-    result = run_adapter("PreToolUse", {"tool_input": {"command": long_cmd}})
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": long_cmd}})
     response = json.loads(result.stdout)
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
     assert "blocked_command_preview" in reason
@@ -444,7 +449,7 @@ def test_env_prefix_does_not_bypass_secret():
     """GIVEN env VAR=val <secret-command> WHEN PreToolUse fires THEN secret classification still applies"""
     # env PAGER=cat gh secret list → must deny: secret_boundary_violation
     result = run_adapter("PreToolUse", {
-        "tool_input": {"command": "env PAGER=cat gh secret list"}
+        "tool_name": "Bash", "tool_input": {"command": "env PAGER=cat gh secret list"}
     })
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
@@ -453,7 +458,7 @@ def test_env_prefix_does_not_bypass_secret():
 
     # env FOO=bar printenv → must deny: secret_boundary_violation (printenv dumps env)
     result = run_adapter("PreToolUse", {
-        "tool_input": {"command": "env FOO=bar printenv"}
+        "tool_name": "Bash", "tool_input": {"command": "env FOO=bar printenv"}
     })
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
@@ -464,7 +469,7 @@ def test_env_prefix_does_not_bypass_secret():
 def test_env_prefix_remote_write_not_bypassed():
     """GIVEN env VAR=val git push WHEN PreToolUse fires THEN remote_write_requires_approval applies"""
     result = run_adapter("PreToolUse", {
-        "tool_input": {"command": "env FOO=bar git push origin main"}
+        "tool_name": "Bash", "tool_input": {"command": "env FOO=bar git push origin main"}
     })
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
@@ -475,7 +480,7 @@ def test_env_prefix_remote_write_not_bypassed():
 def test_bare_env_is_env_dump():
     """GIVEN bare 'env' command WHEN PreToolUse fires THEN env_dump deny is emitted"""
     # bare "env"
-    result = run_adapter("PreToolUse", {"tool_input": {"command": "env"}})
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "env"}})
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
@@ -483,7 +488,7 @@ def test_bare_env_is_env_dump():
     assert "env_dump" in reason
 
     # "env -0" (null-delimited dump)
-    result = run_adapter("PreToolUse", {"tool_input": {"command": "env -0"}})
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "env -0"}})
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
@@ -493,7 +498,9 @@ def test_bare_env_is_env_dump():
 
 def test_env_prefix_benign_command_allowed():
     """GIVEN env PAGER=cat gh issue view 1 WHEN PreToolUse fires THEN command is allowed (null = no deny)"""
-    result = run_adapter("PreToolUse", {"tool_input": {"command": "env PAGER=cat gh issue view 1"}})
+    result = run_adapter(
+        "PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "env PAGER=cat gh issue view 1"}}
+    )
     # No deny should be emitted — stdout is empty or no deny in output
     if not result.stdout.strip():
         return  # empty stdout = allowed
@@ -564,7 +571,7 @@ def test_pre_tool_use_keyword_false_positive_match_ssot_not_blocked():
         '.claude/skills/ssot-discovery/scripts/match-ssot.sh '
         '--keywords "issue-refinement remote_write git push"'
     )
-    result = run_adapter("PreToolUse", {"tool_input": {"command": command}})
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})
     assert result.stdout == ""
 
 
@@ -592,7 +599,7 @@ def test_pre_tool_use_data_only_git_push_text_not_blocked(command: str):
     non-executable text (search keyword, quoted argument, description,
     quoted-delimiter heredoc body) WHEN PreToolUse fires THEN it is NOT
     classified as remote_write_requires_approval."""
-    result = run_adapter("PreToolUse", {"tool_input": {"command": command}})
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})
     assert result.stdout == ""
 
 
@@ -611,7 +618,7 @@ def test_pre_tool_use_remote_write_top_level_blocked(command: str):
     """AC3: GIVEN a top-level `git push` / `git -C <path> push` command
     WHEN PreToolUse fires THEN it is denied with
     remote_write_requires_approval / command_kind=git_push."""
-    result = run_adapter("PreToolUse", {"tool_input": {"command": command}})
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
@@ -636,7 +643,7 @@ def test_pre_tool_use_remote_write_compound_blocked(command: str):
     """AC4: GIVEN `git push` executed inside a `&&` / `;` / `||` list or a
     `|` pipeline WHEN PreToolUse fires THEN it is still denied with
     remote_write_requires_approval / command_kind=git_push."""
-    result = run_adapter("PreToolUse", {"tool_input": {"command": command}})
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
@@ -666,7 +673,7 @@ def test_pre_tool_use_remote_write_substitution_blocked(command: str):
     """AC5: GIVEN `git push` executed via `$()` / backtick / `bash -c` /
     `sh -c` / unquoted heredoc / here-string WHEN PreToolUse fires THEN it
     is denied with remote_write_requires_approval / command_kind=git_push."""
-    result = run_adapter("PreToolUse", {"tool_input": {"command": command}})
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
@@ -692,7 +699,7 @@ def test_pre_tool_use_remote_write_wrapper_not_bypassed(command: str):
     the real `git push` invocation is still denied with
     remote_write_requires_approval / command_kind=git_push (the wrapper
     does not bypass detection)."""
-    result = run_adapter("PreToolUse", {"tool_input": {"command": command}})
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
@@ -706,7 +713,7 @@ def test_pre_tool_use_remote_write_rtk_git_push_blocked():
     remote_write_requires_approval / command_kind=rtk_git_push (detection
     only — #1408 owns the final publish-lane authorization decision)."""
     result = run_adapter("PreToolUse", {
-        "tool_input": {"command": "rtk git push origin HEAD:refs/heads/feature-x"}
+        "tool_name": "Bash", "tool_input": {"command": "rtk git push origin HEAD:refs/heads/feature-x"}
     })
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
@@ -737,8 +744,263 @@ def test_pre_tool_use_indeterminate_commands_fail_closed(command: str):
     carrier) WHEN PreToolUse fires THEN it is still denied (fail-closed,
     never fail-open) under the remote_write_requires_approval reason,
     carrying a machine-readable indeterminate command_kind."""
-    result = run_adapter("PreToolUse", {"tool_input": {"command": command}})
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
     assert "remote_write_requires_approval" in reason
+
+
+# ---------------------------------------------------------------------------
+# PR #1441 Blocker 5: fixed event/tool boundary for the command-structure
+# analyzer — event ∈ {PreToolUse, PermissionRequest} AND tool_name == "Bash"
+# AND typeof tool_input.command == "string". Non-Bash tool calls must NEVER
+# reach command-based classification, and there is no `description`
+# fallback.
+# ---------------------------------------------------------------------------
+
+
+def test_pre_tool_use_non_bash_tool_with_dangerous_description_not_blocked():
+    """GIVEN a non-Bash tool call (e.g. Edit) whose `description` field
+    happens to contain `git push origin main` WHEN PreToolUse fires THEN it
+    is NOT blocked — there is no `description` fallback into remote-write
+    classification for non-Bash tools (PR #1441 Blocker 5)."""
+    result = run_adapter(
+        "PreToolUse",
+        {"tool_name": "Edit", "tool_input": {"description": "git push origin main", "file_path": "foo.txt"}},
+    )
+    assert result.stdout == ""
+
+
+def test_permission_request_non_bash_tool_with_dangerous_description_not_blocked():
+    """GIVEN a non-Bash tool call on PermissionRequest with a dangerous
+    `description` WHEN PermissionRequest fires THEN it is NOT blocked
+    (PR #1441 Blocker 5)."""
+    result = run_adapter(
+        "PermissionRequest",
+        {"tool_name": "Write", "tool_input": {"description": "printenv", "file_path": "foo.txt"}},
+    )
+    assert result.stdout == ""
+
+
+def test_pre_tool_use_bash_tool_non_string_command_malformed_payload():
+    """GIVEN a Bash tool call whose tool_input.command is missing/non-string
+    WHEN PreToolUse fires THEN it is denied with reason_code=malformed_payload
+    (fail-closed — PR #1441 Blocker 5)."""
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": 12345}})
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "malformed_payload" in reason
+
+
+def test_pre_tool_use_bash_tool_missing_command_malformed_payload():
+    """GIVEN a Bash tool call with no `command` key at all WHEN PreToolUse
+    fires THEN it is denied with reason_code=malformed_payload
+    (PR #1441 Blocker 5)."""
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {}})
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "malformed_payload" in reason
+
+
+def test_permission_request_bash_tool_non_string_command_malformed_payload():
+    """GIVEN a Bash tool call on PermissionRequest with a non-string command
+    WHEN PermissionRequest fires THEN it is denied with
+    reason_code=malformed_payload (PR #1441 Blocker 5)."""
+    result = run_adapter("PermissionRequest", {"tool_name": "Bash", "tool_input": {"command": None}})
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+    assert "malformed_payload" in response["hookSpecificOutput"]["decision"]["message"]
+
+
+def test_kill_switch_public_checkpoint_still_applies_without_bash_tool_name():
+    """GIVEN a Stop-event kill-switch payload (public_checkpoint_enabled)
+    with no tool_input/tool_name at all WHEN Stop fires THEN it is still
+    denied — the event/tool boundary added in PR #1441 Blocker 5 only gates
+    COMMAND-based classification, not the pre-existing kill-switch flags."""
+    payload = json.loads((FIXTURES / "public_checkpoint_enabled.json").read_text())
+    result = run_adapter("Stop", payload)
+    response = json.loads(result.stdout)
+    assert response["continue"] is False
+    assert "public checkpoint" in response["stopReason"]
+
+
+# ---------------------------------------------------------------------------
+# PR #1441 REQUEST_CHANGES regression fixtures — Blocker 1 (process
+# substitution / arithmetic expansion / parameter expansion recursion),
+# Blocker 2 (basename normalization / reserved words / fd-numbered
+# redirection), Blocker 3 (heredoc semantics), Blocker 4 (dynamic command
+# word fail-closed), High 1 (shell comments). Exercised through the real
+# hook entrypoint (node subprocess), per reviewer request.
+# ---------------------------------------------------------------------------
+
+DENY_REGRESSION_CASES = [
+    ("regression_process_substitution", "cat <(git push origin main)"),
+    ("regression_arithmetic_expansion_nested_substitution", 'echo "$(( $(git push origin main) ))"'),
+    (
+        "regression_parameter_expansion_nested_substitution",
+        'unset x; echo "${x:-$(git push origin main)}"',
+    ),
+    ("regression_basename_normalized_absolute_path", "/usr/bin/git push origin main"),
+    ("regression_basename_normalized_absolute_path_bash", "/bin/bash -c 'git push origin main'"),
+    ("regression_if_then_fi_reserved_word", "if true; then git push origin main; fi"),
+    ("regression_fd_numbered_redirection", "2>/dev/null git push origin main"),
+    ("regression_fd_duplication_redirection", "3>&1 git push origin main"),
+    (
+        "regression_unquoted_heredoc_body_quote_not_suppressing",
+        "cat <<EOF\n'$(git push origin main)'\nEOF\n",
+    ),
+    (
+        "regression_quoted_heredoc_followed_by_new_command",
+        "cat <<'EOF'\nharmless\nEOF\ngit push origin main\n",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "command", [c for _id, c in DENY_REGRESSION_CASES], ids=[i for i, _c in DENY_REGRESSION_CASES]
+)
+def test_pre_tool_use_pr1441_regression_fixtures_denied(command: str):
+    """GIVEN one of the PR #1441 REQUEST_CHANGES regression fixtures WHEN
+    PreToolUse fires THEN it is denied under remote_write_requires_approval
+    / command_kind=git_push (previously fail-open — Blockers 1/2/3)."""
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "remote_write_requires_approval" in reason
+    assert "command_kind=git_push" in reason
+
+
+def test_pre_tool_use_pr1441_double_dynamic_command_and_subcommand_fail_closed():
+    """GIVEN `cmd=git; sub=push; "$cmd" "$sub" origin main` (BOTH the
+    executable AND the subcommand are dynamic) WHEN PreToolUse fires THEN it
+    is still denied (fail-closed, PR #1441 Blocker 4 — the previous
+    heuristic missed this exact double-dynamic case)."""
+    command = 'cmd=git; sub=push; "$cmd" "$sub" origin main'
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "remote_write_requires_approval" in reason
+
+
+def test_pre_tool_use_pr1441_shell_comment_command_substitution_not_blocked():
+    """GIVEN `echo ok # $(git push origin main)` (the `$(...)` appears only
+    inside a shell comment) WHEN PreToolUse fires THEN it is NOT blocked
+    (PR #1441 High 1 — comments are inert)."""
+    result = run_adapter(
+        "PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "echo ok # $(git push origin main)"}}
+    )
+    assert result.stdout == ""
+
+
+# ---------------------------------------------------------------------------
+# PR #1441 High 2: find (without -exec) / timeout / nice are NOT
+# unconditionally indeterminate.
+# ---------------------------------------------------------------------------
+
+DATA_ONLY_CARRIER_PRETOOLUSE_CASES = [
+    ("data_only_find_without_exec", "find . -type f"),
+    ("data_only_timeout_harmless", "timeout 1 sleep 2"),
+    ("data_only_nice_harmless", "nice echo ok"),
+]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [c for _id, c in DATA_ONLY_CARRIER_PRETOOLUSE_CASES],
+    ids=[i for i, _c in DATA_ONLY_CARRIER_PRETOOLUSE_CASES],
+)
+def test_pre_tool_use_harmless_carrier_prefixed_commands_not_blocked(command: str):
+    """GIVEN a harmless command wrapped by `find` (without -exec) /
+    `timeout` / `nice` WHEN PreToolUse fires THEN it is NOT blocked
+    (PR #1441 High 2)."""
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}})
+    assert result.stdout == ""
+
+
+def test_pre_tool_use_sudo_dash_n_still_fails_closed():
+    """GIVEN `sudo -n true` (a harmless read-only command wrapped in sudo)
+    WHEN PreToolUse fires THEN it is still denied (fail-closed) — sudo
+    remains a conservative authorization-boundary carrier
+    (PR #1441 High 2 reviewer-accepted trade-off)."""
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "sudo -n true"}})
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# ---------------------------------------------------------------------------
+# PR #1441 High 3: consumer-side (Node adapter) strict SHELL_COMMAND_ANALYSIS_V1
+# validation — a malformed command fact must normalize to
+# indeterminate/analysis_process_failed even when the analyzer's top-level
+# `status` says `ok`.
+# ---------------------------------------------------------------------------
+
+
+def test_pre_tool_use_malformed_analyzer_command_fact_fails_closed():
+    """GIVEN a (fake, test-only) shell command analyzer that returns
+    `status: ok` with a structurally malformed command fact
+    (`{"command_kind": 123}` — wrong type, missing required keys) WHEN
+    PreToolUse fires for an otherwise-harmless command THEN the adapter
+    still denies it under remote_write_requires_approval (never treats a
+    malformed `ok` response as allow — PR #1441 High 3).
+
+    The fake analyzer is written under `<repoRoot>/tmp/` (the repo-approved
+    local temp workspace, gitignored) rather than pytest's `tmp_path`
+    fixture, because CODEX_SHELL_COMMAND_ANALYZER is intentionally confined
+    to paths under repoRoot (same pattern as CODEX_SESSION_RECORDING_PRODUCER)
+    — an override outside the repo is silently ignored."""
+    repo_tmp_dir = REPO_ROOT / "tmp"
+    repo_tmp_dir.mkdir(exist_ok=True)
+    fake_analyzer = repo_tmp_dir / f"pr1441_fake_shell_command_analysis_{os.getpid()}.py"
+    fake_analyzer.write_text(
+        "import sys, json\n"
+        "sys.stdin.read()\n"
+        'sys.stdout.write(json.dumps({"schema": "SHELL_COMMAND_ANALYSIS_V1", "status": "ok", '
+        '"commands": [{"command_kind": 123}], "reason_code": "parsed"}))\n'
+    )
+    try:
+        env = os.environ.copy()
+        env["CODEX_SHELL_COMMAND_ANALYZER"] = str(fake_analyzer)
+        result = run_adapter(
+            "PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "echo harmless"}}, env=env
+        )
+        response = json.loads(result.stdout)
+        assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+        reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "remote_write_requires_approval" in reason
+    finally:
+        fake_analyzer.unlink()
+
+
+def test_pre_tool_use_analyzer_override_outside_repo_root_ignored(tmp_path: Path):
+    """GIVEN CODEX_SHELL_COMMAND_ANALYZER pointed OUTSIDE the repo root WHEN
+    PreToolUse fires THEN the override is ignored and the production
+    analyzer is used instead (same repoRoot-confinement pattern as
+    CODEX_SESSION_RECORDING_PRODUCER — PR #1441 High 3 testability guard
+    rail)."""
+    outside_dir = Path("/tmp") / f"pr1441-outside-{os.getpid()}"
+    outside_dir.mkdir(exist_ok=True)
+    fake_analyzer = outside_dir / "fake_shell_command_analysis.py"
+    fake_analyzer.write_text(
+        "import sys, json\n"
+        "sys.stdin.read()\n"
+        'sys.stdout.write(json.dumps({"schema": "SHELL_COMMAND_ANALYSIS_V1", "status": "ok", '
+        '"commands": [], "reason_code": "parsed"}))\n'
+    )
+    env = os.environ.copy()
+    env["CODEX_SHELL_COMMAND_ANALYZER"] = str(fake_analyzer)
+    try:
+        result = run_adapter(
+            "PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "git push origin main"}}, env=env
+        )
+        response = json.loads(result.stdout)
+        assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+        reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "command_kind=git_push" in reason
+    finally:
+        fake_analyzer.unlink()
+        outside_dir.rmdir()

@@ -141,6 +141,100 @@ def test_executed_commands_classified_as_push(command: str, expected_context: st
     assert push_commands[0]["command_kind"] == COMMAND_KIND_GIT_PUSH
 
 
+# ---------------------------------------------------------------------------
+# PR #1441 REQUEST_CHANGES regression fixtures — Blocker 1 (process
+# substitution / arithmetic expansion / parameter expansion recursion),
+# Blocker 2 (basename normalization / reserved words / fd-numbered
+# redirection), Blocker 3 (heredoc semantics), Blocker 4 (dynamic command
+# word fail-closed), High 1 (shell comments).
+# ---------------------------------------------------------------------------
+
+EXECUTED_PR1441_CASES = [
+    ("executed_process_substitution_arg_push", "cat <(git push origin main)", "process_substitution"),
+    (
+        "executed_process_substitution_multi_arg_push",
+        "diff <(git push origin main) /dev/null",
+        "process_substitution",
+    ),
+    (
+        "executed_arithmetic_expansion_nested_substitution_push",
+        'echo "$(( $(git push origin main) ))"',
+        "command_substitution",
+    ),
+    (
+        "executed_parameter_expansion_nested_substitution_push",
+        'unset x; echo "${x:-$(git push origin main)}"',
+        "command_substitution",
+    ),
+    ("executed_basename_normalized_absolute_path_push", "/usr/bin/git push origin main", "top_level"),
+    (
+        "executed_basename_normalized_absolute_path_bash_dash_c",
+        "/bin/bash -c 'git push origin main'",
+        "execution_carrier",
+    ),
+    ("executed_if_then_fi_reserved_word_push", "if true; then git push origin main; fi", "list"),
+    ("executed_fd_numbered_redirection_push", "2>/dev/null git push origin main", "top_level"),
+    ("executed_fd_duplication_redirection_push", "3>&1 git push origin main", "top_level"),
+    (
+        "executed_quoted_heredoc_followed_by_new_command_push",
+        "cat <<'EOF'\nharmless\nEOF\ngit push origin main\n",
+        "list",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "command,expected_context",
+    [(c, ctx) for _id, c, ctx in EXECUTED_PR1441_CASES],
+    ids=[i for i, _c, _ctx in EXECUTED_PR1441_CASES],
+)
+def test_pr1441_executed_regression_fixtures_classified_as_push(command: str, expected_context: str):
+    """GIVEN one of the PR #1441 REQUEST_CHANGES regression fixtures (process
+    substitution / arithmetic-expansion-nested / parameter-expansion-nested
+    substitution, basename-normalized absolute paths, bash reserved-word
+    prefixes, fd-numbered redirection, and heredoc-terminated new commands)
+    WHEN analyzed THEN a git_push command fact IS reported."""
+    result = analyze_shell_command(command)
+    push_commands = _push_commands(result)
+    assert push_commands, f"expected a git_push fact for: {command!r}, got {result}"
+    assert push_commands[0]["execution_context"] == expected_context
+    assert push_commands[0]["command_kind"] == COMMAND_KIND_GIT_PUSH
+
+
+def test_pr1441_unquoted_heredoc_body_quote_does_not_suppress_substitution():
+    """GIVEN an unquoted heredoc body containing a single-quoted-looking
+    `$(...)` (`'$(git push origin main)'`) WHEN analyzed THEN the push IS
+    detected — unquoted heredoc bodies use bash heredoc semantics, where
+    quote characters are literal data and do NOT suppress `$(...)`
+    expansion (PR #1441 Blocker 3)."""
+    command = "cat <<EOF\n'$(git push origin main)'\nEOF\n"
+    result = analyze_shell_command(command)
+    push_commands = _push_commands(result)
+    assert push_commands, f"expected a git_push fact for: {command!r}, got {result}"
+
+
+def test_pr1441_dynamic_executable_and_subcommand_both_dynamic_indeterminate():
+    """GIVEN `cmd=git; sub=push; "$cmd" "$sub" origin main` (BOTH the
+    executable AND the subcommand are dynamic) WHEN analyzed THEN status is
+    indeterminate with dynamic_command_word — the previous heuristic
+    (`_classify_push_words` only flagged a dynamic executable indeterminate
+    if a LATER literal "push" token existed) missed this exact
+    double-dynamic case (PR #1441 Blocker 4)."""
+    command = 'cmd=git; sub=push; "$cmd" "$sub" origin main'
+    result = analyze_shell_command(command)
+    assert result["status"] == STATUS_INDETERMINATE
+    assert result["reason_code"] == "dynamic_command_word"
+
+
+def test_pr1441_shell_comment_command_substitution_not_executed():
+    """GIVEN `echo ok # $(git push origin main)` (the `$(...)` appears only
+    inside a shell comment) WHEN analyzed THEN no git_push command is
+    reported (PR #1441 High 1 — comments are inert, never scanned for
+    substitutions)."""
+    result = analyze_shell_command("echo ok # $(git push origin main)")
+    assert _push_commands(result) == []
+
+
 def test_executed_rtk_git_push():
     """GIVEN `rtk git push ...` WHEN analyzed THEN command_kind is
     rtk_git_push (distinct from plain git_push)."""
@@ -230,13 +324,108 @@ def test_indeterminate_unsupported_execution_carrier_xargs():
     assert result["reason_code"] == "unsupported_construct"
 
 
-@pytest.mark.parametrize("carrier", ["sudo", "timeout", "nice", "nohup"])
-def test_indeterminate_unsupported_execution_carrier_misc(carrier: str):
-    """GIVEN an unsupported execution carrier prefix WHEN analyzed THEN
-    status is indeterminate with unsupported_construct."""
-    result = analyze_shell_command(f"{carrier} git push origin main")
+def test_indeterminate_sudo_authorization_boundary():
+    """GIVEN a `sudo`-prefixed command WHEN analyzed THEN status is
+    indeterminate with unsupported_construct (sudo is an authorization
+    boundary and always stays indeterminate — PR #1441 High 2)."""
+    result = analyze_shell_command("sudo git push origin main")
     assert result["status"] == STATUS_INDETERMINATE
     assert result["reason_code"] == "unsupported_construct"
+
+
+def test_indeterminate_timeout_missing_or_invalid_duration():
+    """GIVEN `timeout git push origin main` (missing the required DURATION
+    positional argument — `git` is not a valid duration) WHEN analyzed THEN
+    status is indeterminate with unsupported_construct (PR #1441 High 2:
+    cannot statically prove the wrapped command never runs)."""
+    result = analyze_shell_command("timeout git push origin main")
+    assert result["status"] == STATUS_INDETERMINATE
+    assert result["reason_code"] == "unsupported_construct"
+
+
+# ---------------------------------------------------------------------------
+# PR #1441 High 2: find (without -exec) / timeout / nice / nohup / sudo -n
+# are NOT unconditionally indeterminate — only carriers that actually wrap
+# a command are recursed into (or, for sudo, remain conservatively
+# indeterminate as an authorization boundary).
+# ---------------------------------------------------------------------------
+
+DATA_ONLY_CARRIER_CASES = [
+    ("data_only_find_without_exec", "find . -type f"),
+    ("data_only_timeout_harmless", "timeout 1 sleep 2"),
+    ("data_only_nice_harmless", "nice echo ok"),
+    ("data_only_nice_with_level_harmless", "nice -n 10 echo ok"),
+]
+
+
+@pytest.mark.parametrize(
+    "command", [c for _id, c in DATA_ONLY_CARRIER_CASES], ids=[i for i, _c in DATA_ONLY_CARRIER_CASES]
+)
+def test_data_only_carrier_prefixed_commands_not_flagged(command: str):
+    """GIVEN a harmless (non-git-push) command wrapped by `find` (without
+    -exec) / `timeout` / `nice` WHEN analyzed THEN status is `ok` and no
+    push command is reported (PR #1441 High 2 — these must not be
+    unconditionally indeterminate)."""
+    result = analyze_shell_command(command)
+    assert result["status"] == STATUS_OK
+    assert _push_commands(result) == []
+
+
+def test_indeterminate_sudo_n_true_stays_indeterminate():
+    """GIVEN `sudo -n true` (a harmless read-only command wrapped in sudo)
+    WHEN analyzed THEN status is still indeterminate — sudo is explicitly
+    allowed to remain a conservative authorization-boundary carrier
+    (PR #1441 High 2 reviewer-accepted trade-off)."""
+    result = analyze_shell_command("sudo -n true")
+    assert result["status"] == STATUS_INDETERMINATE
+
+
+EXECUTED_OPTION_SKIPPING_CARRIER_CASES = [
+    ("executed_timeout_wrapped_push", "timeout 5 git push origin main"),
+    ("executed_nice_wrapped_push", "nice git push origin main"),
+    ("executed_nice_with_level_wrapped_push", "nice -n 10 git push origin main"),
+    ("executed_nohup_wrapped_push", "nohup git push origin main"),
+]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [c for _id, c in EXECUTED_OPTION_SKIPPING_CARRIER_CASES],
+    ids=[i for i, _c in EXECUTED_OPTION_SKIPPING_CARRIER_CASES],
+)
+def test_executed_option_skipping_carrier_wrapped_push_detected(command: str):
+    """GIVEN `git push` wrapped by `timeout DURATION` / `nice [-n N]` /
+    `nohup` WHEN analyzed THEN it is still classified as git_push
+    (PR #1441 High 2 — these carriers must recurse into the wrapped command,
+    not blanket-fail-closed)."""
+    result = analyze_shell_command(command)
+    push_commands = _push_commands(result)
+    assert push_commands, f"expected a git_push fact for: {command!r}, got {result}"
+    assert push_commands[0]["command_kind"] == COMMAND_KIND_GIT_PUSH
+
+
+def test_indeterminate_find_exec_git_push_terminator_not_inline():
+    """GIVEN `find . -maxdepth 0 -exec git push origin main ;` (the
+    unescaped trailing `;` is consumed by the shell as a top-level command
+    separator, so find's own -exec terminator is never actually supplied
+    inline) WHEN analyzed THEN status is indeterminate with
+    unsupported_construct — unchanged from Issue #1428's original fixture,
+    still fail-closed (PR #1441 High 2 keeps this exact case)."""
+    result = analyze_shell_command("find . -maxdepth 0 -exec git push origin main ;")
+    assert result["status"] == STATUS_INDETERMINATE
+    assert result["reason_code"] == "unsupported_construct"
+
+
+def test_executed_find_exec_escaped_terminator_push_detected():
+    """GIVEN a PROPERLY escaped find -exec terminator
+    (`find . -exec git push origin main \\;`) WHEN analyzed THEN it IS
+    recursed into and classified as git_push (Issue #1428 In Scope 1;
+    PR #1441 High 2 — find is only a carrier with -exec/-execdir/-ok, and
+    when present with a resolvable terminator it must not fail-open)."""
+    result = analyze_shell_command(r"find . -exec git push origin main \;")
+    push_commands = _push_commands(result)
+    assert push_commands, f"expected a git_push fact, got {result}"
+    assert push_commands[0]["command_kind"] == COMMAND_KIND_GIT_PUSH
 
 
 def test_indeterminate_unresolved_source_carrier():
