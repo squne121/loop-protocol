@@ -26,21 +26,21 @@ SSOT_DISCOVERY_RESULT_V1:
   # this unknown field and continue to consume matched_documents.
   section_limited_matches:
     - path: "docs/dev/workflow.md"
-      source_commit: "<40-char git commit SHA>"
-      blob_sha: "<git blob SHA>"
-      content_sha256: "sha256:<hex>"
+      source_commit: "<40-char git commit SHA>" # string, non-null
+      blob_sha: "<git blob SHA>" # string, non-null; blob at source_commit:path
+      content_sha256: "sha256:<hex>" # string, non-null; section bytes from that blob
       heading: "Scope Collision Preflight（スコープ衝突の事前確認）"
       heading_level: 3
-      start_line: 1                       # one-indexed, inclusive
-      end_line_exclusive: 20              # one-indexed, exclusive
-      permalink: "https://github.com/owner/repo/blob/<commit>/docs/dev/workflow.md#L1-L19"
+      start_line: 1                       # int, one-indexed, inclusive
+      end_line_exclusive: 20              # int, one-indexed, exclusive
+      permalink: "https://github.com/owner/repo/blob/<commit>/docs/dev/workflow.md#L1-L19" # string or null when repo provenance is unavailable
       selector_version: "ssot-section-selector/v1"
       selection_reason_code: "heading_keyword_match"
       char_count: 100
       char_budget: 4000
   section_selection_outcomes:
     - path: "docs/dev/workflow.md"
-      reason_code: "selected | section_not_found | section_budget_exceeded | document_not_found"
+      reason_code: "selected | section_not_found | section_budget_exceeded | document_not_found | source_blob_unavailable"
   unmatched_keywords: ["..."]              # マッチしなかったキーワード（SSOT 未整備の示唆）
   unmatched_paths: ["src/data/foo.ts"]    # マッチしなかった target_paths
   notes: []                                # 補足
@@ -80,3 +80,4 @@ SSOT_DISCOVERY_RESULT_V1:
 - `section_limited_matches` と `section_selection_outcomes` は v1 の optional field である。旧 consumer は未知 field を無視し、既存の `matched_documents` 契約を継続利用する。
 - consumer inventory: `ssot-discovery` を呼び出す Skill / orchestrator は、この optional field を消費する場合にのみ `selector_version` と reason code を確認する。未対応 consumer の migration は不要であり、互換性は unknown field ignore により維持される。
 - 文書がマッチしても section が選べない場合、全体 status は既存の keyword/path match 規則を維持し、`section_selection_outcomes` の reason code を consumer が fail-closed routing に用いる。全文 fallback は禁止する。
+- `source_blob_unavailable` は `HEAD:<path>` を取得または解決できなかったことを表す。selector は作業ツリーへ暗黙fallbackせず、commit-pinned provenance を持つ match を返さない。

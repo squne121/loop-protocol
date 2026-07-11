@@ -17,9 +17,23 @@ SELECTOR_VERSION = "ssot-section-selector/v1"
 DEFAULT_SECTION_CHAR_BUDGET = 4_000
 
 
-def _is_fence(line: str) -> bool:
-    """Return whether a line opens or closes a supported fenced code block."""
-    return bool(re.match(r"^ {0,3}(`{3,}|~{3,})", line))
+def _fence_opener(line: str) -> tuple[str, int] | None:
+    """Return the marker and length for a fenced-code opener, if present."""
+    match = re.match(r"^ {0,3}([`~])\1{2,}", line)
+    if not match:
+        return None
+    marker = match.group(1)
+    return marker, len(match.group(0).lstrip())
+
+
+def _is_fence_closer(line: str, marker: str, length: int) -> bool:
+    """Return whether a line closes the exact fenced-code block in progress."""
+    return bool(re.match(rf"^ {{0,3}}{re.escape(marker)}{{{length},}}[ \t]*$", line))
+
+
+def _atx_heading_text(text: str) -> str:
+    """Remove an ATX closing sequence only when Markdown requires whitespace."""
+    return re.sub(r"[ \t]+#+[ \t]*$", "", text).strip()
 
 
 def parse_markdown_sections(text: str) -> list[dict]:
@@ -30,24 +44,38 @@ def parse_markdown_sections(text: str) -> list[dict]:
     """
     lines = text.splitlines(keepends=True)
     headings = []
-    in_fence = False
+    fence: tuple[str, int] | None = None
     index = 0
     while index < len(lines):
         line = lines[index]
-        if _is_fence(line):
-            in_fence = not in_fence
+        if fence:
+            if _is_fence_closer(line.rstrip("\r\n"), *fence):
+                fence = None
             index += 1
             continue
-        if not in_fence:
-            atx = re.match(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$", line.rstrip("\r\n"))
+        opener = _fence_opener(line)
+        if opener:
+            fence = opener
+            index += 1
+            continue
+        if not fence:
+            atx = re.match(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*$", line.rstrip("\r\n"))
             if atx:
-                headings.append({"heading": atx.group(2).strip(), "heading_level": len(atx.group(1)), "start_line": index + 1})
+                headings.append({
+                    "heading": _atx_heading_text(atx.group(2)),
+                    "heading_level": len(atx.group(1)),
+                    "start_line": index + 1,
+                })
                 index += 1
                 continue
             if index + 1 < len(lines):
                 setext = re.match(r"^ {0,3}(=+|-+)[ \t]*$", lines[index + 1].rstrip("\r\n"))
                 if setext and line.strip():
-                    headings.append({"heading": line.strip(), "heading_level": 1 if setext.group(1)[0] == "=" else 2, "start_line": index + 1})
+                    headings.append({
+                        "heading": line.strip(),
+                        "heading_level": 1 if setext.group(1)[0] == "=" else 2,
+                        "start_line": index + 1,
+                    })
                     index += 2
                     continue
         index += 1
@@ -66,6 +94,14 @@ def _git_value(repo_root: Path, args: list[str]) -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def _git_show(repo_root: Path, object_name: str) -> str | None:
+    """Return a Git object's exact text without normalizing its line endings."""
+    result = subprocess.run(
+        ["git", "show", object_name], cwd=repo_root, capture_output=True, text=True
+    )
+    return result.stdout if result.returncode == 0 else None
+
+
 def _github_repo_slug(repo_root: Path) -> str | None:
     remote = _git_value(repo_root, ["remote", "get-url", "origin"])
     if not remote:
@@ -74,7 +110,9 @@ def _github_repo_slug(repo_root: Path) -> str | None:
     return match.group(1) if match else None
 
 
-def select_section_matches(repo_root: Path, matched: list[dict], keywords: list[str], char_budget: int) -> tuple[list[dict], list[dict]]:
+def select_section_matches(
+    repo_root: Path, matched: list[dict], keywords: list[str], char_budget: int
+) -> tuple[list[dict], list[dict]]:
     """Return bounded evidence for headings that directly match an input keyword."""
     source_commit = _git_value(repo_root, ["rev-parse", "HEAD"])
     repo_slug = _github_repo_slug(repo_root)
@@ -82,27 +120,42 @@ def select_section_matches(repo_root: Path, matched: list[dict], keywords: list[
     normalized_keywords = [keyword.casefold() for keyword in keywords if keyword.strip()]
     for document in matched:
         path = document["path"]
-        file_path = repo_root / path
-        if not file_path.exists():
-            outcomes.append({"path": path, "reason_code": "document_not_found"})
+        text = _git_show(repo_root, f"HEAD:{path}")
+        blob_sha = _git_value(repo_root, ["rev-parse", f"HEAD:{path}"])
+        if text is None or blob_sha is None:
+            outcomes.append({"path": path, "reason_code": "source_blob_unavailable"})
             continue
-        text = file_path.read_text(encoding="utf-8", errors="ignore")
         headings = parse_markdown_sections(text)
-        selected = [section for section in headings if any(keyword in section["heading"].casefold() for keyword in normalized_keywords)]
+        selected = [
+            section
+            for section in headings
+            if any(
+                keyword in section["heading"].casefold()
+                for keyword in normalized_keywords
+            )
+        ]
         if not selected:
             outcomes.append({"path": path, "reason_code": "section_not_found"})
             continue
-        blob_sha = _git_value(repo_root, ["rev-parse", f"HEAD:{path}"])
         lines = text.splitlines(keepends=True)
         for section in selected:
             content = "".join(lines[section["start_line"] - 1:section["end_line_exclusive"] - 1])
             char_count = len(content)
             if char_count > char_budget:
-                outcomes.append({"path": path, "heading": section["heading"], "reason_code": "section_budget_exceeded", "char_count": char_count, "char_budget": char_budget})
+                outcomes.append({
+                    "path": path,
+                    "heading": section["heading"],
+                    "reason_code": "section_budget_exceeded",
+                    "char_count": char_count,
+                    "char_budget": char_budget,
+                })
                 continue
             permalink = None
             if repo_slug and source_commit:
-                permalink = f"https://github.com/{repo_slug}/blob/{source_commit}/{path}#L{section['start_line']}-L{section['end_line_exclusive'] - 1}"
+                permalink = (
+                    f"https://github.com/{repo_slug}/blob/{source_commit}/{path}"
+                    f"#L{section['start_line']}-L{section['end_line_exclusive'] - 1}"
+                )
             matches.append({
                 "path": path,
                 "source_commit": source_commit,
@@ -383,7 +436,12 @@ def main():
     parser = argparse.ArgumentParser(description="SSOT discovery matcher")
     parser.add_argument("--keywords", default="", help="Comma-separated keywords")
     parser.add_argument("--paths", default="", help="Comma-separated target paths")
-    parser.add_argument("--section-char-budget", type=int, default=DEFAULT_SECTION_CHAR_BUDGET, help="Maximum characters per selected section")
+    parser.add_argument(
+        "--section-char-budget",
+        type=int,
+        default=DEFAULT_SECTION_CHAR_BUDGET,
+        help="Maximum characters per selected section",
+    )
     args = parser.parse_args()
 
     if args.section_char_budget <= 0:

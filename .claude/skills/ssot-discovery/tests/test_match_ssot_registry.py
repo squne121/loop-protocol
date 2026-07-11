@@ -20,7 +20,7 @@ MATCH_PY = SCRIPTS_DIR / "match_ssot.py"
 
 # Add scripts dir to sys.path so we can import parse_registry directly
 sys.path.insert(0, str(SCRIPTS_DIR))
-from match_ssot import parse_registry, get_repo_root
+from match_ssot import parse_registry, get_repo_root  # noqa: E402
 
 
 @pytest.fixture(scope="session")
