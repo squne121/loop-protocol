@@ -705,3 +705,46 @@ SESSION_MANIFEST_LEGACY_SCAN_V1:
 `session_manifest_debounce.mjs` の flush loop は、producer 呼び出しが失敗（非 0 exit または timeout）した場合、対象の queued event ファイルを削除しない。次回の flush 試行で再試行される。
 
 ---
+
+## 12. publish lane authorization trust root（公開レーン認可の外部信頼起点）— bootstrap・rotation・managed hook registration 手順（Issue #1454）
+
+Issue #1454（Phase A）は、publish lane authorization code の信頼起点となる external trust root（`scripts/trust-root/` — `trusted_hook_launcher.py` / `manifest_schema.py` / `install_trust_root.sh`）を確立する。この trust root は candidate repository の外側、agent が書込み不能な絶対パス（既定値 `/opt/loop-protocol/trust-root` のような root-owned anchor）に配置される。本節はその bootstrap・manifest rotation・managed hook registration の手順（担当者・順序・failure/rollback）を正本として記述する。
+
+### 責任者・ロール（TRUST_ROOT_OPERATIONS_V1）
+
+```yaml
+TRUST_ROOT_OPERATIONS_V1:
+  bootstrap_executor: privileged_operator
+  manifest_update_authority: privileged_operator
+  rollback_policy: explicit_operator_approval
+  activation_order:
+    - merge_trusted_code
+    - install_trusted_runtime
+    - install_manifest
+    - register_managed_hook
+    - enable_publish_lane
+```
+
+- `bootstrap_executor: privileged_operator` — 初回インストール（`install_trust_root.sh` の初回実行、trust root ディレクトリの作成・所有権設定）は agent ではなく privileged operator が手動で行う。agent は `install_trust_root.sh` を実行しない（Issue #1454 の Stop Condition）。
+- `manifest_update_authority: privileged_operator` — manifest rotation（新しい `trusted_commit_oid` / component digest への切替）も privileged operator のみが行う。installer は「trust root owner と同一 euid での実行」を拒否する（`runtime_euid_must_differ_from_owner`）ため、trust root の所有アカウント自身による無審査ローテーションもできない。
+- `rollback_policy: explicit_operator_approval` — manifest rotation・managed hook 登録のいずれも、問題発生時のロールバックは privileged operator の明示承認を経てから行う。自動ロールバックは実装しない（fail-closed のまま停止する方が安全なため）。
+- `activation_order` — 本番切替は以下の順序を厳守する。逆順・スキップは行わない。
+  1. `merge_trusted_code`: `trusted_hook_launcher.py` / `manifest_schema.py` / `install_trust_root.sh` を含む本 Issue の PR を `main` にマージする
+  2. `install_trusted_runtime`: privileged operator が trust root ディレクトリ（root-owned anchor）を作成し、`install_trust_root.sh` を実行してランチャーのソース一式を配置する
+  3. `install_manifest`: privileged operator が信頼するコミット OID から `AUTHORIZATION_TCB_MANIFEST_V1` manifest を生成し、`releases/<generation>-<digest>/` 配下へ配置、`active.json` を原子的に activation する
+  4. `register_managed_hook`: `/etc/codex/requirements.toml` に `[features] hooks = true` を固定し、managed `PreToolUse` hook として trusted launcher を登録する（admin-enforced 領域。agent はこの登録ファイルを編集できない）
+  5. `enable_publish_lane`: 上記すべてが揃った状態で publish lane の実運用切替を有効化する。`.codex/hooks.json`（project-local、candidate-controlled）を本 launcher へ実際に向ける本番切替そのものは Issue #1450（Phase B）の対象であり、本 Issue の Scope 外
+
+### fail-closed 状態（未 bootstrap 時）
+
+manifest と trusted directory が privileged operator によって install されるまで、`trusted_hook_launcher.py` は generic allow を返さず `authorization_trust_root_missing` で fail-closed に deny する（Issue #1454 AC11）。
+
+### managed hook の独立性
+
+managed `PreToolUse` 登録は `allow_managed_hooks_only` のような project-local 設定を必須にしない。project-local `.codex/hooks.json` が削除・空化・別 command に変更された状態でも、managed launcher は独立して deny を維持する契約である（Issue #1454 AC13、`scripts/trust-root/tests/test_trusted_hook_launcher.py::test_managed_registration_survives_local_hook_removal`）。
+
+### 本節が対象としない事項
+
+- `.codex/hooks.json` を trusted launcher へ実際に向ける本番切替そのもの（Issue #1450 Phase B）
+- candidate 側 `codex-hook-adapter.mjs` / `git_mutation_command_policy.py` の TCB digest 照合ロジック実装そのもの（同上）
+- Codex `hooks.managed_dir`（admin-enforced 領域）への完全移行（将来 follow-up）
