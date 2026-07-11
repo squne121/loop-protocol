@@ -132,6 +132,7 @@ def test_output_contract_fields():
         "status", "generated_at", "generated_by",
         "inputs", "matched_documents", "unmatched_keywords",
         "unmatched_paths", "notes", "warnings", "errors",
+        "section_limited_matches", "section_selection_outcomes",
     ]
     for field in required_fields:
         assert field in r, f"Missing required field '{field}' in SSOT_DISCOVERY_RESULT_V1"

@@ -4,12 +4,122 @@ SSOT discovery matcher.
 Reads docs/dev/ssot-registry.md and returns SSOT_DISCOVERY_RESULT_V1 YAML.
 """
 import argparse
+import hashlib
 import re
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 import yaml
+
+
+SELECTOR_VERSION = "ssot-section-selector/v1"
+DEFAULT_SECTION_CHAR_BUDGET = 4_000
+
+
+def _is_fence(line: str) -> bool:
+    """Return whether a line opens or closes a supported fenced code block."""
+    return bool(re.match(r"^ {0,3}(`{3,}|~{3,})", line))
+
+
+def parse_markdown_sections(text: str) -> list[dict]:
+    """Parse ATX and Setext headings, excluding headings inside fenced code.
+
+    The returned end_line_exclusive is one-indexed and points at the next
+    heading of the same or higher level, or one past the final document line.
+    """
+    lines = text.splitlines(keepends=True)
+    headings = []
+    in_fence = False
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if _is_fence(line):
+            in_fence = not in_fence
+            index += 1
+            continue
+        if not in_fence:
+            atx = re.match(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$", line.rstrip("\r\n"))
+            if atx:
+                headings.append({"heading": atx.group(2).strip(), "heading_level": len(atx.group(1)), "start_line": index + 1})
+                index += 1
+                continue
+            if index + 1 < len(lines):
+                setext = re.match(r"^ {0,3}(=+|-+)[ \t]*$", lines[index + 1].rstrip("\r\n"))
+                if setext and line.strip():
+                    headings.append({"heading": line.strip(), "heading_level": 1 if setext.group(1)[0] == "=" else 2, "start_line": index + 1})
+                    index += 2
+                    continue
+        index += 1
+
+    for position, section in enumerate(headings):
+        section["end_line_exclusive"] = len(lines) + 1
+        for following in headings[position + 1:]:
+            if following["heading_level"] <= section["heading_level"]:
+                section["end_line_exclusive"] = following["start_line"]
+                break
+    return headings
+
+
+def _git_value(repo_root: Path, args: list[str]) -> str | None:
+    result = subprocess.run(["git", *args], cwd=repo_root, capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _github_repo_slug(repo_root: Path) -> str | None:
+    remote = _git_value(repo_root, ["remote", "get-url", "origin"])
+    if not remote:
+        return None
+    match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", remote)
+    return match.group(1) if match else None
+
+
+def select_section_matches(repo_root: Path, matched: list[dict], keywords: list[str], char_budget: int) -> tuple[list[dict], list[dict]]:
+    """Return bounded evidence for headings that directly match an input keyword."""
+    source_commit = _git_value(repo_root, ["rev-parse", "HEAD"])
+    repo_slug = _github_repo_slug(repo_root)
+    matches, outcomes = [], []
+    normalized_keywords = [keyword.casefold() for keyword in keywords if keyword.strip()]
+    for document in matched:
+        path = document["path"]
+        file_path = repo_root / path
+        if not file_path.exists():
+            outcomes.append({"path": path, "reason_code": "document_not_found"})
+            continue
+        text = file_path.read_text(encoding="utf-8", errors="ignore")
+        headings = parse_markdown_sections(text)
+        selected = [section for section in headings if any(keyword in section["heading"].casefold() for keyword in normalized_keywords)]
+        if not selected:
+            outcomes.append({"path": path, "reason_code": "section_not_found"})
+            continue
+        blob_sha = _git_value(repo_root, ["rev-parse", f"HEAD:{path}"])
+        lines = text.splitlines(keepends=True)
+        for section in selected:
+            content = "".join(lines[section["start_line"] - 1:section["end_line_exclusive"] - 1])
+            char_count = len(content)
+            if char_count > char_budget:
+                outcomes.append({"path": path, "heading": section["heading"], "reason_code": "section_budget_exceeded", "char_count": char_count, "char_budget": char_budget})
+                continue
+            permalink = None
+            if repo_slug and source_commit:
+                permalink = f"https://github.com/{repo_slug}/blob/{source_commit}/{path}#L{section['start_line']}-L{section['end_line_exclusive'] - 1}"
+            matches.append({
+                "path": path,
+                "source_commit": source_commit,
+                "blob_sha": blob_sha,
+                "content_sha256": f"sha256:{hashlib.sha256(content.encode('utf-8')).hexdigest()}",
+                "heading": section["heading"],
+                "heading_level": section["heading_level"],
+                "start_line": section["start_line"],
+                "end_line_exclusive": section["end_line_exclusive"],
+                "permalink": permalink,
+                "selector_version": SELECTOR_VERSION,
+                "selection_reason_code": "heading_keyword_match",
+                "char_count": char_count,
+                "char_budget": char_budget,
+            })
+            outcomes.append({"path": path, "heading": section["heading"], "reason_code": "selected"})
+    return matches, outcomes
 
 
 def get_repo_root() -> Path:
@@ -224,6 +334,8 @@ def emit_result(
     unmatched_paths,
     errors=None,
     warnings=None,
+    section_limited_matches=None,
+    section_selection_outcomes=None,
 ):
     errors = errors or []
     warnings = warnings or []
@@ -253,6 +365,10 @@ def emit_result(
                 }
                 for d in matched
             ],
+            # Optional v1 extension. Consumers that do not recognize this key
+            # continue to use matched_documents unchanged.
+            "section_limited_matches": section_limited_matches or [],
+            "section_selection_outcomes": section_selection_outcomes or [],
             "unmatched_keywords": unmatched_keywords,
             "unmatched_paths": unmatched_paths,
             "notes": ["SSOT registry: docs/dev/ssot-registry.md"],
@@ -267,7 +383,11 @@ def main():
     parser = argparse.ArgumentParser(description="SSOT discovery matcher")
     parser.add_argument("--keywords", default="", help="Comma-separated keywords")
     parser.add_argument("--paths", default="", help="Comma-separated target paths")
+    parser.add_argument("--section-char-budget", type=int, default=DEFAULT_SECTION_CHAR_BUDGET, help="Maximum characters per selected section")
     args = parser.parse_args()
+
+    if args.section_char_budget <= 0:
+        parser.error("--section-char-budget must be greater than zero")
 
     keywords = [k.strip() for k in args.keywords.split(",") if k.strip()] if args.keywords else []
     paths = [p.strip() for p in args.paths.split(",") if p.strip()] if args.paths else []
@@ -305,7 +425,15 @@ def main():
 
     matched = merge_results(kw_matched, path_matched)
 
-    print(emit_result(keywords, paths, matched, unmatched_keywords, unmatched_paths, warnings=parse_warnings), end="")
+    section_limited_matches, section_selection_outcomes = select_section_matches(
+        repo_root, matched, keywords, args.section_char_budget
+    )
+    print(emit_result(
+        keywords, paths, matched, unmatched_keywords, unmatched_paths,
+        warnings=parse_warnings,
+        section_limited_matches=section_limited_matches,
+        section_selection_outcomes=section_selection_outcomes,
+    ), end="")
 
 
 if __name__ == "__main__":
