@@ -2,7 +2,6 @@
 
 import json
 import os
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -16,7 +15,6 @@ HOOKS_VALIDATOR = REPO_ROOT / "scripts" / "session-recording" / "validate-codex-
 MANIFEST_VALIDATOR = REPO_ROOT / "scripts" / "validate-agent-session-manifest.mjs"
 FIXTURES = REPO_ROOT / "tests" / "fixtures" / "codex"
 VALID_MANIFEST = REPO_ROOT / "tests" / "fixtures" / "agent-session-manifest" / "valid-basic.json"
-MANIFEST_ROOT = REPO_ROOT / "tmp" / "session-manifests" / "codex"
 
 
 def run_adapter(event: str, payload, expect_exit: int = 0, env=None):
@@ -34,8 +32,14 @@ def run_adapter(event: str, payload, expect_exit: int = 0, env=None):
     return result
 
 
-def setup_function():
-    shutil.rmtree(MANIFEST_ROOT, ignore_errors=True)
+def manifest_root_env(tmp_path: Path) -> dict:
+    """Build a subprocess env with CODEX_HOOK_MANIFEST_ROOT pointed at a
+    pytest tmp_path-derived directory unique to the calling test. This keeps
+    each test's manifest writes isolated from other tests running concurrently
+    under pytest-xdist (AC3)."""
+    env = os.environ.copy()
+    env["CODEX_HOOK_MANIFEST_ROOT"] = str(tmp_path / "session-manifests" / "codex")
+    return env
 
 
 def test_hook_config_positive_fixture():
@@ -49,11 +53,12 @@ def test_hook_config_positive_fixture():
     assert result.returncode == 0, result.stderr
 
 
-def test_positive_fixture_writes_private_manifest_and_returns_continue_true():
+def test_positive_fixture_writes_private_manifest_and_returns_continue_true(tmp_path: Path):
     payload = json.loads((FIXTURES / "positive_fixture.json").read_text())
-    result = run_adapter("Stop", payload)
+    env = manifest_root_env(tmp_path)
+    result = run_adapter("Stop", payload, env=env)
     assert json.loads(result.stdout) == {"continue": True}
-    manifest_dir = MANIFEST_ROOT / "stop"
+    manifest_dir = Path(env["CODEX_HOOK_MANIFEST_ROOT"]) / "stop"
     files = sorted(manifest_dir.glob("*.json"))
     assert len(files) == 1
 
@@ -97,12 +102,13 @@ def test_manifest_validator_rejects_root_directory_without_any_json(tmp_path: Pa
     assert validation.returncode == 1
 
 
-def test_zz_positive_fixture_leaves_manifest_directory_for_followup_validation():
+def test_zz_positive_fixture_leaves_manifest_directory_for_followup_validation(tmp_path: Path):
     payload = json.loads((FIXTURES / "positive_fixture.json").read_text())
-    result = run_adapter("Stop", payload)
+    env = manifest_root_env(tmp_path)
+    result = run_adapter("Stop", payload, env=env)
     assert json.loads(result.stdout) == {"continue": True}
 
-    manifest_dir = MANIFEST_ROOT / "stop"
+    manifest_dir = Path(env["CODEX_HOOK_MANIFEST_ROOT"]) / "stop"
     files = sorted(manifest_dir.glob("*.json"))
     assert len(files) == 1
 
@@ -130,9 +136,10 @@ def test_malformed_stop_payload_fail_closed():
     assert "session recording skipped" in result.stderr
 
 
-def test_stdout_silent_for_stop_positive_fixture():
+def test_stdout_silent_for_stop_positive_fixture(tmp_path: Path):
     payload = json.loads((FIXTURES / "positive_fixture.json").read_text())
-    result = run_adapter("Stop", payload)
+    env = manifest_root_env(tmp_path)
+    result = run_adapter("Stop", payload, env=env)
     assert "manifest_id" not in result.stdout
     assert "/home/" not in result.stdout
     assert result.stderr == ""
@@ -178,24 +185,28 @@ def test_permission_request_uses_event_specific_deny_shape():
     assert response["hookSpecificOutput"]["decision"]["behavior"] == "deny"
 
 
-def test_pre_tool_use_readonly_pipeline_keeps_stdout_empty_and_writes_no_manifest():
+def test_pre_tool_use_readonly_pipeline_keeps_stdout_empty_and_writes_no_manifest(tmp_path: Path):
     """GIVEN readonly pipeline WHEN PreToolUse fires THEN stdout empty and no manifest directory is created."""
+    env = manifest_root_env(tmp_path)
     result = run_adapter("PreToolUse", {
         "tool_input": {"command": 'rg -n "TODO" README.md | head -n 20'}
-    })
+    }, env=env)
     assert result.stdout == ""  # stdout empty
-    assert not (MANIFEST_ROOT / "pretooluse").exists()
-    assert not (MANIFEST_ROOT / "permissionrequest").exists()
+    manifest_root = Path(env["CODEX_HOOK_MANIFEST_ROOT"])
+    assert not (manifest_root / "pretooluse").exists()
+    assert not (manifest_root / "permissionrequest").exists()
 
 
-def test_permission_request_readonly_pipeline_keeps_stdout_empty_and_writes_no_manifest():
+def test_permission_request_readonly_pipeline_keeps_stdout_empty_and_writes_no_manifest(tmp_path: Path):
     """GIVEN readonly pipeline WHEN PermissionRequest fires THEN stdout empty and no manifest directory is created."""
+    env = manifest_root_env(tmp_path)
     result = run_adapter("PermissionRequest", {
         "tool_input": {"command": "git status --short | head -n 20"}
-    })
+    }, env=env)
     assert result.stdout == ""  # stdout empty
-    assert not (MANIFEST_ROOT / "pretooluse").exists()
-    assert not (MANIFEST_ROOT / "permissionrequest").exists()
+    manifest_root = Path(env["CODEX_HOOK_MANIFEST_ROOT"])
+    assert not (manifest_root / "pretooluse").exists()
+    assert not (manifest_root / "permissionrequest").exists()
 
 
 def test_hook_validator_rejects_duplicate_stop_composite_handler(tmp_path: Path):
@@ -221,7 +232,7 @@ def test_stop_event_scrubs_producer_failure_stderr(tmp_path: Path):
         'process.stderr.write("cwd=/home/leak/project secret=sk-test-123\\n"); process.exit(1);\n'
     )
     payload = json.loads((FIXTURES / "positive_fixture.json").read_text())
-    env = os.environ.copy()
+    env = manifest_root_env(tmp_path)
     env["CODEX_SESSION_RECORDING_PRODUCER"] = str(producer)
 
     result = subprocess.run(
@@ -238,11 +249,12 @@ def test_stop_event_scrubs_producer_failure_stderr(tmp_path: Path):
     assert str(producer) not in result.stderr
 
 
-def test_post_run_verifier_blocks_forbidden_paths():
+def test_post_run_verifier_blocks_forbidden_paths(tmp_path: Path):
+    env = manifest_root_env(tmp_path)
     result = run_adapter("Stop", {
         "secrets_mode": "none",
         "touched_paths": ["assets/test.png"]
-    })
+    }, env=env)
     response = json.loads(result.stdout)
     assert response["continue"] is False
     assert "forbidden_path" in response["stopReason"]
@@ -489,3 +501,45 @@ def test_env_prefix_benign_command_allowed():
     if "hookSpecificOutput" in response:
         assert response["hookSpecificOutput"].get("permissionDecision") != "deny", \
             f"Expected allow but got deny: {response}"
+
+
+# ---------------------------------------------------------------------------
+# AC12 (#1420 fix_delta 3): default manifest root fallback when
+# CODEX_HOOK_MANIFEST_ROOT is unset
+# ---------------------------------------------------------------------------
+
+def test_manifest_written_to_default_root_when_env_unset():
+    """GIVEN CODEX_HOOK_MANIFEST_ROOT is unset WHEN Stop fires THEN the manifest
+    is written to the production default path
+    <repoRoot>/tmp/session-manifests/codex/stop/ (AC12, #1420 fix_delta 3).
+
+    This test intentionally does NOT use tmp_path / CODEX_HOOK_MANIFEST_ROOT
+    override (it is the only test in this module that writes to the shared
+    repo-relative default path), so it identifies and removes only the exact
+    file it created rather than rmtree-ing the shared directory (which would
+    race other concurrent runs)."""
+    payload = json.loads((FIXTURES / "positive_fixture.json").read_text())
+    default_manifest_dir = REPO_ROOT / "tmp" / "session-manifests" / "codex" / "stop"
+    before_files = set(default_manifest_dir.glob("*.json")) if default_manifest_dir.exists() else set()
+
+    env = os.environ.copy()
+    env.pop("CODEX_HOOK_MANIFEST_ROOT", None)
+    result = run_adapter("Stop", payload, env=env)
+    assert json.loads(result.stdout) == {"continue": True}
+
+    after_files = set(default_manifest_dir.glob("*.json"))
+    new_files = after_files - before_files
+    assert len(new_files) == 1, f"expected exactly one new manifest file, got {new_files}"
+    new_file = new_files.pop()
+
+    try:
+        validation = subprocess.run(
+            ["node", str(MANIFEST_VALIDATOR), str(default_manifest_dir)],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert validation.returncode == 0, validation.stderr
+    finally:
+        new_file.unlink()

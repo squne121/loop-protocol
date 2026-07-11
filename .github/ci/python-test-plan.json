@@ -57,6 +57,12 @@
         "paths": [
           "tests/codex/test_local_main_branch_guard.py"
         ]
+      },
+      {
+        "provider_job": "node-backed-hook-tests",
+        "paths": [
+          "tests/session_recording/codex/test_hook_adapter.py"
+        ]
       }
     ]
   },

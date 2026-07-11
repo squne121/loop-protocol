@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { buildCodexManifestFileName, writeCodexSessionManifest } from './write-codex-session-manifest.mjs'
+import { buildCodexManifestFileName, resolveManifestWriteTarget, writeCodexSessionManifest } from './write-codex-session-manifest.mjs'
 import { scanObjectForSyntheticCanary, scanTextForSyntheticCanary } from './codex-metadata-scan.mjs'
 import { verifyCodexPostRun } from './codex-postrun-verifier.mjs'
 
@@ -328,7 +328,22 @@ function produceManifest(eventName, payload, evidenceSourceRef) {
 function runManifestFlow(eventName, payload) {
   const metadataFindings = scanObjectForSyntheticCanary(payload)
   const fileName = buildCodexManifestFileName()
-  const evidenceSourceRef = `tmp/session-manifests/codex/${eventName.toLowerCase()}/${fileName}`
+
+  // AC2: when CODEX_HOOK_MANIFEST_ROOT is set, honor it as the manifest write-target
+  // override (used by the test suite to isolate per-test manifest directories under
+  // pytest-xdist parallel execution). Unset/empty falls back to the production default.
+  const manifestRootOverride = process.env.CODEX_HOOK_MANIFEST_ROOT || undefined
+
+  // Issue #1420 fix_delta AC10: resolve the real write target BEFORE producing the
+  // manifest so evidence_ref reflects the actual write location (including any
+  // manifestRoot override) instead of a fixed string that can diverge from it.
+  const manifestWriteResult = resolveManifestWriteTarget({
+    repoRoot,
+    eventName,
+    manifestRoot: manifestRootOverride,
+    fileName,
+  })
+  const evidenceSourceRef = manifestWriteResult.relativePath
   const manifest = produceManifest(eventName, payload, evidenceSourceRef)
   const stdoutFindings = scanTextForSyntheticCanary(JSON.stringify(manifest))
   const stderrFindings = []
@@ -342,6 +357,7 @@ function runManifestFlow(eventName, payload) {
     repoRoot,
     eventName,
     fileName,
+    manifestRoot: manifestRootOverride,
   })
 
   const verification = verifyCodexPostRun(payload, { repoRoot })

@@ -1238,6 +1238,36 @@ jobs:
           printf '{"step_id":"pytest_node_backed_hook_tests","phase_id":"pytest_node_backed_hooks","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
+      - name: pytest_session_recording_codex_hook_adapter (timed)
+        # Issue #1420 fix_delta 2: dedicated node-backed-hook-tests lane for
+        # tests/session_recording/codex/test_hook_adapter.py. This job already
+        # runs pnpm install, so the Node child-process dependency
+        # (codex-hook-adapter.mjs / ajv / ajv-formats) is available here.
+        # Independent of the fixed 2-nodeid disjointness/exact-match invariant
+        # check below (do not touch that block).
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest -q tests/session_recording/codex/test_hook_adapter.py -p no:xdist
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_session_recording_codex_hook_adapter","phase_id":"pytest_session_recording_codex_hook_adapter","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
+      - name: pytest_session_recording_codex_hook_adapter_xdist (timed)
+        # Issue #1420 fix_delta 3 AC11: run the same suite under pytest-xdist
+        # parallel execution (-n 4 --dist load) to regression-test the manifest
+        # write-path race fix under real worker parallelism. The `-p no:xdist`
+        # step above is left untouched (both lanes execute).
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest -q tests/session_recording/codex/test_hook_adapter.py -n 4 --dist load
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_session_recording_codex_hook_adapter_xdist","phase_id":"pytest_session_recording_codex_hook_adapter_xdist","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
       - name: node --test session_manifest_debounce (AC4/AC6, Node 22) (timed)
         # Issue #1141 AC6: virtual-clock unit tests for flushLoop DI core.
         # Node 22 is guaranteed by the setup-node-pnpm composite action (default
@@ -1258,6 +1288,7 @@ jobs:
           uv run --locked pytest --collect-only -q \
             .claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable \
             .claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths \
+            tests/session_recording/codex/test_hook_adapter.py \
             > ci_test_selection_artifacts/node_backed_hook_tests_collect_only.txt
           uv run --locked pytest --collect-only -q \
             .claude/hooks/tests/ \
@@ -1287,6 +1318,7 @@ jobs:
               pytest_args=[
                   ".claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable",
                   ".claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths",
+                  "tests/session_recording/codex/test_hook_adapter.py",
               ],
               plan=".github/ci/python-test-plan.json",
               pr_head_sha="${{ github.event.pull_request.head.sha || github.sha }}",
@@ -1302,10 +1334,20 @@ jobs:
           if exit_code != 0:
               sys.exit(exit_code)
 
+          # Fixed 2-nodeid sublane (Node child-process hook wrapper tests, #1064).
+          # This invariant is unchanged and independent of the collect-only
+          # extension below (Issue #1420 fix_delta AC8).
           node_backed_nodeids = [
               ".claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable",
               ".claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths",
           ]
+          # #1420 fix_delta AC8: the session_recording sublane is now ALSO
+          # collected in this same collect-only pass so the G1
+          # uncovered_changed_test_files gate observes real execution evidence
+          # for tests/session_recording/codex/test_hook_adapter.py instead of
+          # relying solely on the python-test-plan.json declared
+          # secondary_coverage entry.
+          session_recording_prefix = "tests/session_recording/codex/test_hook_adapter.py"
           artifact_dir = pathlib.Path("ci_test_selection_artifacts")
           python_lines = [
               line.strip()
@@ -1317,9 +1359,15 @@ jobs:
               for line in (artifact_dir / "node_backed_hook_tests_collect_only.txt").read_text().splitlines()
               if line.strip() and "::" in line
           ]
+          session_recording_nodeids = sorted(
+              line for line in node_lines if line.startswith(session_recording_prefix)
+          )
+          fixed_hook_wrapper_nodeids = sorted(
+              line for line in node_lines if not line.startswith(session_recording_prefix)
+          )
 
           python_absent = sorted(nodeid for nodeid in node_backed_nodeids if nodeid not in python_lines)
-          node_exact_match = sorted(node_lines) == sorted(node_backed_nodeids)
+          node_exact_match = fixed_hook_wrapper_nodeids == sorted(node_backed_nodeids)
           overlap = sorted(set(python_lines) & set(node_lines))
           summary = {
               "schema": "ci_test_selection_summary_v1",
@@ -1332,9 +1380,11 @@ jobs:
               "node_backed_hook_tests": {
                   "collect_only_path": "ci_test_selection_artifacts/node_backed_hook_tests_collect_only.txt",
                   "exact_nodeid_count": len(node_lines),
-                  "exactly_expected_two": len(node_lines) == 2,
+                  "exactly_expected_two": len(fixed_hook_wrapper_nodeids) == 2,
                   "matches_expected_nodeids": node_exact_match,
                   "collected_nodeids": node_lines,
+                  "session_recording_nodeids_count": len(session_recording_nodeids),
+                  "session_recording_nodeids_present": len(session_recording_nodeids) > 0,
               },
               "union_disjointness": {
                   "disjoint": not overlap,
@@ -1348,9 +1398,11 @@ jobs:
           if not summary["python_test"]["node_backed_nodeids_absent"]:
               raise SystemExit("Node-backed nodeids still present in python-test collect-only output")
           if not summary["node_backed_hook_tests"]["exactly_expected_two"]:
-              raise SystemExit("node-backed-hook-tests collect-only output did not contain exactly 2 nodeids")
+              raise SystemExit("node-backed-hook-tests collect-only output did not contain exactly 2 fixed nodeids")
           if not summary["node_backed_hook_tests"]["matches_expected_nodeids"]:
-              raise SystemExit("node-backed-hook-tests collect-only output did not match expected nodeids")
+              raise SystemExit("node-backed-hook-tests collect-only output did not match expected fixed nodeids")
+          if not summary["node_backed_hook_tests"]["session_recording_nodeids_present"]:
+              raise SystemExit("node-backed-hook-tests collect-only output did not include tests/session_recording/codex/test_hook_adapter.py nodeids")
           if not summary["union_disjointness"]["disjoint"]:
               raise SystemExit("python-test and node-backed-hook-tests collect-only outputs overlapped")
           PY
