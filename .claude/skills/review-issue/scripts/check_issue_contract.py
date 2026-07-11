@@ -41,7 +41,7 @@ import tempfile
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +533,107 @@ PATH_TOKEN_RE = re.compile(
 )
 
 # Bullet pattern: matches "- ", "* ", "+ " and indented variants (up to 3 spaces) (Blocker 2 fix)
+# NOTE: This is the shared scope-tokenization bullet pattern (Issue #396 / PR #430),
+# used by _bullet_tokens() below. It is intentionally general (any indent 0-3, any
+# whitespace after marker) because it only needs to find candidate bullet lines for
+# token extraction. C2 Stop Conditions counting has stricter, independent semantics
+# (fence exclusion / top-level-only / thematic-break exclusion) and MUST NOT reuse
+# this pattern directly — see iter_top_level_stop_condition_items() (Issue #1431).
 BULLET_RE = re.compile(r"^\s{0,3}[-*+]\s+(.+)$")
+
+# ---------------------------------------------------------------------------
+# C2 Stop Conditions dedicated tokenizer (Issue #1431 review remediation).
+# ---------------------------------------------------------------------------
+# GFM thematic break: 0-3 leading spaces, then 3+ repetitions of the same
+# marker char (*, -, _) optionally interleaved with spaces/tabs, and nothing
+# else on the line. These lines superficially resemble a bullet marker line
+# (e.g. "* * *", "- - -") but are NOT list items and must not be counted.
+_THEMATIC_BREAK_RE = re.compile(
+    r"^ {0,3}(?:\*[ \t]*){3,}$"
+    r"|^ {0,3}(?:-[ \t]*){3,}$"
+    r"|^ {0,3}(?:_[ \t]*){3,}$"
+)
+
+# Stop-Conditions bullet line: allowed markers are '-', '*', '+' only.
+# Group 1: leading indentation, ASCII space characters ONLY (a leading tab
+#   before the marker means the whole line fails to match this pattern —
+#   tab-indented lines are rejected outright, never counted as top-level or
+#   nested).
+# Group 2: the marker character.
+# Group 3: one or more literal ASCII space (0x20) characters after the
+#   marker. A tab immediately after the marker does NOT satisfy this group,
+#   so such a line does not match (rejected, not silently accepted). This
+#   avoids relying on Python's `\s` Unicode whitespace semantics.
+# Group 4: the remaining line content (may be empty/whitespace-only; that is
+#   checked separately so empty items are excluded).
+_STOP_CONDITION_BULLET_LINE_RE = re.compile(r"^( *)([-*+])( +)(.*)$")
+
+
+def iter_top_level_stop_condition_items(section: str) -> Iterator[str]:
+    """Yield the stripped content of each top-level Stop Conditions bullet item.
+
+    C2-dedicated tokenizer (Issue #1431 review remediation): counting Stop
+    Conditions items has different semantics than the shared scope
+    tokenization BULLET_RE (see the comment above BULLET_RE), so this
+    function is deliberately independent and fixes the following behaviors:
+
+      - Code fence content (``` ... ```) is excluded entirely, using the
+        same iter_markdown_blocks() SSOT as extract_section().
+      - Only TOP-LEVEL items are yielded. A bullet line's leading space
+        count must be less than or equal to the leading space count of the
+        first recognized bullet line encountered in the section; deeper
+        bullet lines are treated as nested children of the preceding item
+        and are excluded (previously, any bullet indented 0-3 spaces was
+        counted as top-level regardless of nesting).
+      - GFM thematic break lines ("* * *", "- - -", "___", etc.) are
+        excluded even though they superficially match the marker pattern.
+      - Items whose content is empty or whitespace-only are excluded.
+      - Allowed markers are '-', '*', '+' only; the marker must be followed
+        by one or more ASCII space characters (tabs after the marker, or a
+        leading tab before the marker, are rejected — not counted at all).
+    """
+    lines = section.splitlines(keepends=True)
+
+    # fence 内行の除外（extract_section と同じ SSOT: iter_markdown_blocks）
+    fence_line_indices: set[int] = set()
+    current_line_idx = 0
+    for block_text, block_kind in _iter_markdown_blocks(section):
+        block_lines = block_text.splitlines(keepends=True)
+        if block_kind == _BLOCK_KIND_CODE_FENCE:
+            for k in range(len(block_lines)):
+                fence_line_indices.add(current_line_idx + k)
+        current_line_idx += len(block_lines)
+
+    top_level_indent: "int | None" = None
+
+    for idx, raw_line in enumerate(lines):
+        if idx in fence_line_indices:
+            continue
+
+        line = raw_line.rstrip("\n")
+
+        if _THEMATIC_BREAK_RE.match(line):
+            continue
+
+        m = _STOP_CONDITION_BULLET_LINE_RE.match(line)
+        if not m:
+            continue
+
+        content = m.group(4).strip()
+        if not content:
+            continue
+
+        indent = len(m.group(1))
+        if top_level_indent is None:
+            top_level_indent = indent
+
+        if indent > top_level_indent:
+            # Deeper-indented bullet: nested child of the preceding item.
+            continue
+
+        # Sibling at (or shallower than) the established top-level indent.
+        top_level_indent = indent
+        yield content
 
 SIGNIFICANT_TOKEN_RE = re.compile(r"[A-Za-z0-9_]{4,}")
 
@@ -854,7 +954,7 @@ def check_c2_stop_conditions(body: str, issue_kind: str) -> tuple[str, list[str]
     if not section:
         return CheckResult.FAIL, ["## Stop Conditions セクションが存在しない"]
 
-    bullet_count = sum(1 for line in section.splitlines() if BULLET_RE.match(line))
+    bullet_count = sum(1 for _ in iter_top_level_stop_condition_items(section))
     if bullet_count < 6:
         return CheckResult.FAIL, [f"Stop Conditions の項目数が {bullet_count} 件（6 件以上必要）"]
     return CheckResult.PASS, []
