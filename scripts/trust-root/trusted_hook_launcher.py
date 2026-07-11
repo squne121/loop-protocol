@@ -10,12 +10,46 @@ proceed, based ONLY on:
 
   1. an external trust manifest (``AUTHORIZATION_TCB_MANIFEST_V1``, see
      ``manifest_schema.py``) that is installed by a privileged operator and
-     is NOT writable by the candidate-repository agent, and
+     is NOT writable by the candidate-repository agent,
   2. the exact tree/blob bytes of the commit (``local_oid``) that is about to
      be pushed, read via a trusted ``git`` invocation with a restricted,
      allowlisted environment — NEVER via ``lstat``/``open`` on the candidate
      working tree, and NEVER via any remote-tracking ref (``origin/main`` et
-     al.) that lives inside the candidate repository.
+     al.) that lives inside the candidate repository, and
+  3. trusted publish evidence (nonce/expiry/ref/repository identity/command
+     binding) that is cross-checked against the real Codex/Claude Code
+     ``PreToolUse`` hook payload for this exact tool call.
+
+Wire format (Issue #1454 fix_delta, OWNER adversarial review):
+
+  - stdin carries the REAL ``PreToolUse`` hook payload:
+    ``{"tool_name": "Bash", "tool_use_id": "...", "tool_input": {"command": "..."},
+    "cwd": "..."}`` (Codex / Claude Code hook contract — see
+    https://developers.openai.com/codex/hooks/). ``tool_name`` MUST be
+    ``"Bash"``; any other value is fail-closed.
+  - ``--evidence-file`` carries a SEPARATE, trusted-verifier-produced
+    ``PUBLISH_EVIDENCE_V1`` JSON document (never inherited environment
+    variables). It is bound to the hook payload via ``tool_use_id``, ``cwd``,
+    and a SHA-256 of the literal ``tool_input.command`` string, so a
+    mismatched/replayed/foreign evidence file can never authorize a
+    different command than the one actually intercepted.
+  - Allow output uses the real hook output contract:
+    ``{"hookSpecificOutput": {"hookEventName": "PreToolUse",
+    "permissionDecision": "allow", "updatedInput": {"command": "<str>"}}}``
+    with ``updatedInput.command`` as a single shell-quoted STRING (built via
+    ``shlex.join``), never an argv list. Exit code 0.
+  - Deny output uses ``permissionDecision: "deny"`` on stdout AND a
+    structured message on stderr, exit code 2 (matching the Claude Code /
+    Codex ``PreToolUse`` block contract documented in
+    ``docs/dev/hook-boundaries.md``).
+
+Note on production evidence delivery (Issue #1450, Phase B scope): the exact
+mechanism by which a trusted verifier process produces and hands off the
+``--evidence-file`` path to the ONE fixed, admin-managed hook command is
+finalized in Issue #1450 (candidate integrity binding / production cutover).
+This module's contract only requires that whatever mechanism is used
+delivers a file path (not inherited env, not candidate-writable content);
+the CLI flag is the stable, testable interface for that contract.
 
 Threat model addressed (see Issue #1454 contract for full detail):
 
@@ -40,6 +74,20 @@ Threat model addressed (see Issue #1454 contract for full detail):
     treated as ambiguous and denied (``candidate_tree_ambiguous``), since an
     agent could otherwise race a ``git commit --amend`` between this check
     and the actual push (TOCTOU).
+  - The push target ref is restricted to ``refs/heads/<branch>`` (never
+    tags/notes/arbitrary refs) and explicitly excludes conventional
+    protected branch names (``main``/``master``/``trunk``) — this publish
+    lane authorizes issue/feature branch pushes, not direct pushes to the
+    default branch.
+  - The evidence nonce is single-use (tracked via an atomic marker file
+    under the trust root) and time-bounded (``expiry``), so a captured
+    evidence file cannot be replayed indefinitely or reused for an
+    unrelated later push.
+  - The runtime process's uid MUST differ from the trust root owner's uid
+    (mirroring the installer's ``runtime_euid_must_differ_from_owner``
+    separation of duties) — if the invoking process already has write
+    access to the trust root, the boundary this module exists to enforce
+    is illusory.
 
 This module intentionally does NOT wire itself into ``.codex/hooks.json``
 (project-local, candidate-controlled) — that production cutover is Issue
@@ -52,10 +100,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shlex
 import stat
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -79,6 +130,32 @@ _GIT_BINARY_CANDIDATES: tuple[str, ...] = ("/usr/bin/git", "/usr/local/bin/git",
 # working tree state).
 DEFAULT_TRUST_ROOT_DIR = Path("/opt/loop-protocol/trust-root")
 
+# Production trust root path allowlist. The launcher's default (no
+# ``--trust-root-dir`` override) is always exactly this tuple; test harnesses
+# exercise the allowlist function directly with an explicit, test-scoped
+# tuple (see test_production_path_allowlist*) rather than relying on the
+# production default, so the mechanism itself is verified without needing a
+# real ``/opt`` mount in CI.
+PRODUCTION_TRUST_ROOT_ALLOWLIST: tuple[Path, ...] = (DEFAULT_TRUST_ROOT_DIR,)
+
+# Test-only escape hatch for the runtime/owner uid separation check (see
+# check_runtime_identity_separation). Production NEVER sets this. It exists
+# solely because a single-user sandbox/CI runner cannot otherwise exercise
+# the ALLOW path of a check whose entire purpose is "the invoking uid must
+# differ from the trust root owner uid" without genuine multi-account
+# privilege separation (Issue #1454 skip_conditions).
+_TEST_ALLOW_SAME_UID_ENV = "LOOP_TRUST_ROOT_TEST_ALLOW_SAME_UID"
+
+# Test-only escape hatch for the repository-identity check (see
+# check_repository_identity). Production NEVER sets this. It exists solely
+# so end-to-end push-mechanics tests (real bare local remote, no network
+# access to github.com in this sandbox) can exercise the ACTUAL push/lease
+# behavior without a false obstacle from a local-path remote.origin.url not
+# matching a github.com slug. The repository-identity check itself has its
+# own DEDICATED, unconditional test
+# (test_repository_identity_mismatch_denied) that never sets this bypass.
+_TEST_SKIP_REPOSITORY_IDENTITY_ENV = "LOOP_TRUST_ROOT_TEST_SKIP_REPOSITORY_IDENTITY"
+
 # ─── Reason codes (fail-closed; see Issue #1454 contract) ────────────────────
 
 REASON_TRUST_ROOT_MISSING = "authorization_trust_root_missing"
@@ -91,6 +168,17 @@ REASON_RUNTIME_UNTRUSTED = "authorization_runtime_untrusted"
 REASON_CANDIDATE_TREE_AMBIGUOUS = "candidate_tree_ambiguous"
 REASON_CANDIDATE_COMMIT_COMPONENT_MISMATCH = "candidate_commit_component_mismatch"
 
+# Added by the Issue #1454 fix_delta (OWNER adversarial review,
+# https://github.com/squne121/loop-protocol/pull/1457#issuecomment-4945279761):
+# these extend (never replace) the fixed 9-code set above.
+REASON_HOOK_PAYLOAD_INVALID = "authorization_hook_payload_invalid"
+REASON_EVIDENCE_INVALID = "authorization_evidence_invalid"
+REASON_EVIDENCE_BINDING_MISMATCH = "authorization_evidence_binding_mismatch"
+REASON_EVIDENCE_EXPIRED = "authorization_evidence_expired"
+REASON_NONCE_REPLAYED = "authorization_nonce_replayed"
+REASON_REF_UNTRUSTED = "authorization_ref_untrusted"
+REASON_REPOSITORY_IDENTITY_MISMATCH = "authorization_repository_identity_mismatch"
+
 _ALL_REASON_CODES = frozenset(
     {
         REASON_TRUST_ROOT_MISSING,
@@ -102,20 +190,44 @@ _ALL_REASON_CODES = frozenset(
         REASON_RUNTIME_UNTRUSTED,
         REASON_CANDIDATE_TREE_AMBIGUOUS,
         REASON_CANDIDATE_COMMIT_COMPONENT_MISMATCH,
+        REASON_HOOK_PAYLOAD_INVALID,
+        REASON_EVIDENCE_INVALID,
+        REASON_EVIDENCE_BINDING_MISMATCH,
+        REASON_EVIDENCE_EXPIRED,
+        REASON_NONCE_REPLAYED,
+        REASON_REF_UNTRUSTED,
+        REASON_REPOSITORY_IDENTITY_MISMATCH,
     }
 )
+
+# Refs this publish lane may target: issue/feature branches only. Direct
+# pushes to conventional default/protected branch names are explicitly
+# denied — this lane exists to authorize a candidate agent's own
+# issue/feature branch push, never a rewrite of the shared default branch.
+_ALLOWED_REF_RE = re.compile(r"^refs/heads/[A-Za-z0-9._/-]+$")
+_PROTECTED_BRANCH_NAMES = frozenset({"main", "master", "trunk"})
+_ALL_ZERO_OID = "0" * 40
 
 
 # ─── Data types ───────────────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
-class PublishEvidence:
-    """Publish evidence supplied by the trusted verifier (never inherited env).
+class HookPayload:
+    """The REAL Codex / Claude Code PreToolUse hook payload for this call."""
 
-    Production contract: this is delivered to the launcher as versioned
-    JSON (stdin or an explicit FD), never read back from process environment
-    variables — see Issue #1454 In Scope bullet on publish evidence.
+    tool_name: str
+    tool_use_id: str
+    command: str
+    cwd: str
+
+
+@dataclass(frozen=True)
+class PublishEvidence:
+    """Publish evidence supplied by a trusted verifier (never inherited env,
+    never candidate-writable content). Bound to the hook payload via
+    ``tool_use_id`` / ``candidate_repo_dir`` (== hook ``cwd``) /
+    ``command_sha256`` (== sha256 of the hook payload's literal command).
     """
 
     session_id: str
@@ -128,6 +240,7 @@ class PublishEvidence:
     nonce: str
     expiry: str
     candidate_repo_dir: str
+    command_sha256: str
 
 
 @dataclass(frozen=True)
@@ -178,18 +291,28 @@ def _mode_is_owner_only(path: Path, *, allow_sticky_shared: bool = False) -> boo
     return False
 
 
+def _ancestor_is_symlink(path: Path) -> bool:
+    try:
+        return path.is_symlink()
+    except OSError:
+        return True  # fail-closed: unknown state treated as untrusted
+
+
 def validate_trust_root_permissions(trust_root_dir: Path) -> AuthorizationDecision | None:
     """Validate owner-only write permissions on ``trust_root_dir`` itself and
     walk its ancestor chain, tolerating conventional sticky shared-temp
-    ancestors (e.g. ``/tmp``) above it.
+    ancestors (e.g. ``/tmp``) above it. Also rejects any ancestor (including
+    ``trust_root_dir`` itself) that is a symlink.
 
-    Returns a deny decision if any component is missing or writable by a
-    non-owner (without the sticky-bit exception), else ``None`` (meaning:
-    permission check passed).
+    Returns a deny decision if any component is missing, is a symlink, or is
+    writable by a non-owner (without the sticky-bit exception), else
+    ``None`` (meaning: permission check passed).
     """
     if not trust_root_dir.is_absolute():
         return deny(REASON_RUNTIME_UNTRUSTED, detail="trust root path must be absolute")
 
+    if _ancestor_is_symlink(trust_root_dir):
+        return deny(REASON_RUNTIME_UNTRUSTED, detail=f"trust root path is a symlink: {trust_root_dir}")
     if not trust_root_dir.exists():
         return deny(REASON_TRUST_ROOT_MISSING, detail=f"trust root path missing: {trust_root_dir}")
     if not _mode_is_owner_only(trust_root_dir, allow_sticky_shared=False):
@@ -203,6 +326,8 @@ def validate_trust_root_permissions(trust_root_dir: Path) -> AuthorizationDecisi
     while True:
         if not current.exists():
             return deny(REASON_TRUST_ROOT_MISSING, detail=f"trust root ancestor missing: {current}")
+        if _ancestor_is_symlink(current):
+            return deny(REASON_RUNTIME_UNTRUSTED, detail=f"trust root ancestor is a symlink: {current}")
         if not _mode_is_owner_only(current, allow_sticky_shared=True):
             return deny(
                 REASON_RUNTIME_UNTRUSTED,
@@ -213,6 +338,46 @@ def validate_trust_root_permissions(trust_root_dir: Path) -> AuthorizationDecisi
         if parent == current or checked >= 8:
             break
         current = parent
+    return None
+
+
+def validate_trust_root_path_allowlist(
+    trust_root_dir: Path,
+    allowlist: tuple[Path, ...] = PRODUCTION_TRUST_ROOT_ALLOWLIST,
+) -> bool:
+    """Return True iff ``trust_root_dir`` (resolved) matches one of the fixed
+    production allowlist entries. Test harnesses call this directly with an
+    explicit test-scoped ``allowlist`` tuple to exercise the mechanism
+    without requiring a real ``/opt`` mount.
+    """
+    resolved = os.path.realpath(str(trust_root_dir))
+    for candidate in allowlist:
+        candidate_str = str(candidate)
+        if os.path.realpath(candidate_str) == resolved or candidate_str == str(trust_root_dir):
+            return True
+    return False
+
+
+def check_runtime_identity_separation(trust_root_dir: Path) -> AuthorizationDecision | None:
+    """The runtime (agent/hook) process uid MUST differ from the trust root
+    owner uid — otherwise whoever is invoking this launcher already has
+    write access to the trust root and the boundary is illusory.
+
+    Test-only bypass: set ``LOOP_TRUST_ROOT_TEST_ALLOW_SAME_UID=1`` in the
+    process environment. Production NEVER sets this (Issue #1454
+    skip_conditions: genuine multi-account privilege separation is not
+    available in this sandbox/CI runner; the DENY path of this check is
+    exercised directly and unconditionally).
+    """
+    try:
+        owner_uid = trust_root_dir.stat().st_uid
+    except OSError:
+        return deny(REASON_TRUST_ROOT_MISSING, detail=f"cannot stat trust root for uid check: {trust_root_dir}")
+    if os.getuid() == owner_uid and os.environ.get(_TEST_ALLOW_SAME_UID_ENV) != "1":
+        return deny(
+            REASON_RUNTIME_UNTRUSTED,
+            detail="runtime uid equals trust root owner uid; no privilege separation",
+        )
     return None
 
 
@@ -358,6 +523,181 @@ def _read_workdir_bytes(candidate_repo_dir: str, path: str) -> bytes | None:
         return None
 
 
+def get_remote_origin_url(ctx: GitContext) -> str | None:
+    result = _run_git(ctx, "config", "--get", "remote.origin.url")
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+_OWNER_REPO_RE = re.compile(r"github\.com[:/]+([^/]+)/([^/.]+?)(?:\.git)?/?$")
+
+
+def extract_owner_repo_slug(remote_url: str) -> str | None:
+    match = _OWNER_REPO_RE.search(remote_url)
+    if not match:
+        return None
+    return f"{match.group(1)}/{match.group(2)}"
+
+
+def check_repository_identity(ctx: GitContext, manifest_repository: str) -> bool:
+    """Verify the candidate repository's own ``remote.origin.url`` (read via
+    a TRUSTED, restricted-env git invocation — never a candidate-writable
+    config file parsed by hand) resolves to the same owner/repo slug the
+    manifest was issued for.
+    """
+    remote_url = get_remote_origin_url(ctx)
+    if remote_url is None:
+        return False
+    slug = extract_owner_repo_slug(remote_url)
+    return slug is not None and slug == manifest_repository
+
+
+# ─── Ref validation (Issue #1454 fix_delta) ──────────────────────────────────
+
+
+def validate_target_ref(ref: str) -> bool:
+    """Only ``refs/heads/<branch>`` is an allowed publish-lane push target.
+    Tags, notes, arbitrary refs, and conventional protected branch names
+    (main/master/trunk) are explicitly denied — this lane authorizes an
+    issue/feature branch push, never a rewrite of the shared default branch.
+    """
+    if not _ALLOWED_REF_RE.match(ref):
+        return False
+    branch = ref[len("refs/heads/") :]
+    if branch in _PROTECTED_BRANCH_NAMES:
+        return False
+    return True
+
+
+# ─── Evidence binding / nonce / expiry (Issue #1454 fix_delta) ──────────────
+
+
+def parse_hook_payload(raw: dict) -> HookPayload | None:
+    """Parse the REAL Codex / Claude Code PreToolUse hook stdin payload.
+
+    Expected shape: {"tool_name": "Bash", "tool_use_id": "...",
+    "tool_input": {"command": "..."}, "cwd": "..."}. Returns None on any
+    structural deviation (fail-closed — caller denies with
+    authorization_hook_payload_invalid).
+    """
+    if not isinstance(raw, dict):
+        return None
+    tool_name = raw.get("tool_name")
+    tool_use_id = raw.get("tool_use_id")
+    tool_input = raw.get("tool_input")
+    cwd = raw.get("cwd")
+    if not isinstance(tool_name, str) or not tool_name:
+        return None
+    if not isinstance(tool_use_id, str) or not tool_use_id:
+        return None
+    if not isinstance(tool_input, dict):
+        return None
+    command = tool_input.get("command")
+    if not isinstance(command, str) or not command:
+        return None
+    if not isinstance(cwd, str) or not cwd:
+        return None
+    return HookPayload(tool_name=tool_name, tool_use_id=tool_use_id, command=command, cwd=cwd)
+
+
+_EVIDENCE_REQUIRED_STR_FIELDS = (
+    "session_id",
+    "turn_id",
+    "tool_use_id",
+    "local_oid",
+    "remote_oid",
+    "ref",
+    "nonce",
+    "expiry",
+    "candidate_repo_dir",
+    "command_sha256",
+)
+
+
+def parse_evidence(raw: dict) -> PublishEvidence | None:
+    if not isinstance(raw, dict):
+        return None
+    for field in _EVIDENCE_REQUIRED_STR_FIELDS:
+        if not isinstance(raw.get(field), str) or not raw.get(field):
+            return None
+    issue_number = raw.get("issue_number")
+    if isinstance(issue_number, bool) or not isinstance(issue_number, int):
+        return None
+    command_sha256 = raw["command_sha256"]
+    if len(command_sha256) != 64 or not all(c in "0123456789abcdef" for c in command_sha256.lower()):
+        return None
+    return PublishEvidence(
+        session_id=raw["session_id"],
+        turn_id=raw["turn_id"],
+        tool_use_id=raw["tool_use_id"],
+        local_oid=raw["local_oid"],
+        remote_oid=raw["remote_oid"],
+        ref=raw["ref"],
+        issue_number=issue_number,
+        nonce=raw["nonce"],
+        expiry=raw["expiry"],
+        candidate_repo_dir=raw["candidate_repo_dir"],
+        command_sha256=command_sha256.lower(),
+    )
+
+
+def validate_evidence_binding(payload: HookPayload, evidence: PublishEvidence) -> AuthorizationDecision | None:
+    """Cross-check the hook payload against the trusted evidence bundle so a
+    mismatched/foreign evidence file can never authorize a DIFFERENT tool
+    call than the one actually intercepted.
+    """
+    if payload.tool_name != "Bash":
+        return deny(REASON_HOOK_PAYLOAD_INVALID, detail=f"unsupported tool_name: {payload.tool_name!r}")
+    if payload.tool_use_id != evidence.tool_use_id:
+        return deny(REASON_EVIDENCE_BINDING_MISMATCH, detail="tool_use_id mismatch between hook payload and evidence")
+    if os.path.realpath(payload.cwd) != os.path.realpath(evidence.candidate_repo_dir):
+        return deny(REASON_EVIDENCE_BINDING_MISMATCH, detail="cwd mismatch between hook payload and evidence")
+    actual_command_sha256 = hashlib.sha256(payload.command.encode("utf-8")).hexdigest()
+    if actual_command_sha256 != evidence.command_sha256:
+        return deny(
+            REASON_EVIDENCE_BINDING_MISMATCH,
+            detail="tool_input.command does not match evidence.command_sha256",
+        )
+    return None
+
+
+def check_evidence_expiry(evidence: PublishEvidence, now: datetime | None = None) -> AuthorizationDecision | None:
+    current = now or datetime.now(timezone.utc)
+    try:
+        expiry_str = evidence.expiry.replace("Z", "+00:00")
+        expiry_dt = datetime.fromisoformat(expiry_str)
+    except ValueError:
+        return deny(REASON_EVIDENCE_INVALID, detail=f"unparseable expiry: {evidence.expiry!r}")
+    if expiry_dt.tzinfo is None:
+        expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+    if current > expiry_dt:
+        return deny(REASON_EVIDENCE_EXPIRED, detail=f"evidence expired at {evidence.expiry}")
+    return None
+
+
+def check_and_consume_nonce(trust_root_dir: Path, nonce: str) -> AuthorizationDecision | None:
+    """Single-use nonce enforcement via an atomic marker file under the
+    trust root's ``nonces/`` subdirectory (``O_CREAT|O_EXCL`` — a second
+    attempt to create the same marker fails, detecting replay).
+    """
+    nonces_dir = trust_root_dir / "nonces"
+    try:
+        nonces_dir.mkdir(mode=0o700, exist_ok=True)
+    except OSError as exc:
+        return deny(REASON_RUNTIME_UNTRUSTED, detail=f"cannot prepare nonce store: {exc}")
+    marker_name = hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+    marker_path = nonces_dir / marker_name
+    try:
+        fd = os.open(str(marker_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+    except FileExistsError:
+        return deny(REASON_NONCE_REPLAYED, detail="nonce has already been consumed")
+    except OSError as exc:
+        return deny(REASON_RUNTIME_UNTRUSTED, detail=f"cannot write nonce marker: {exc}")
+    return None
+
+
 # ─── Trust root / manifest loading ──────────────────────────────────────────
 
 
@@ -421,10 +761,26 @@ def load_active_manifest(trust_root_dir: Path) -> ManifestLoadResult:
 
 
 def evaluate_publish_authorization(
+    payload: HookPayload,
     evidence: PublishEvidence,
     trust_root_dir: Path,
     dedicated_home: str,
 ) -> AuthorizationDecision:
+    identity_error = check_runtime_identity_separation(trust_root_dir)
+    if identity_error is not None:
+        return identity_error
+
+    binding_error = validate_evidence_binding(payload, evidence)
+    if binding_error is not None:
+        return binding_error
+
+    expiry_error = check_evidence_expiry(evidence)
+    if expiry_error is not None:
+        return expiry_error
+
+    if not validate_target_ref(evidence.ref):
+        return deny(REASON_REF_UNTRUSTED, detail=f"ref not authorized for this publish lane: {evidence.ref!r}")
+
     manifest, load_error = load_active_manifest(trust_root_dir)
     if load_error is not None:
         return load_error
@@ -433,6 +789,14 @@ def evaluate_publish_authorization(
     ctx = build_git_context(evidence.candidate_repo_dir, dedicated_home)
     if ctx is None:
         return deny(REASON_RUNTIME_UNTRUSTED, detail="no trusted absolute git binary found")
+
+    if os.environ.get(_TEST_SKIP_REPOSITORY_IDENTITY_ENV) != "1" and not check_repository_identity(
+        ctx, manifest.repository
+    ):
+        return deny(
+            REASON_REPOSITORY_IDENTITY_MISMATCH,
+            detail=f"remote.origin.url does not match manifest.repository={manifest.repository!r}",
+        )
 
     trusted_local_oid = resolve_trusted_commit(ctx, evidence.local_oid)
     if trusted_local_oid is None:
@@ -477,6 +841,13 @@ def evaluate_publish_authorization(
             detail=f"uncommitted changes on critical path(s): {ambiguous_paths}",
         )
 
+    # Nonce consumption is the LAST gate before allow: every earlier deny
+    # path leaves the nonce unconsumed so a legitimate retry (e.g. after
+    # transient git failure) is not permanently burned by a denied attempt.
+    nonce_error = check_and_consume_nonce(trust_root_dir, evidence.nonce)
+    if nonce_error is not None:
+        return nonce_error
+
     updated_command = (
         ctx.git_binary,
         "push",
@@ -496,34 +867,23 @@ def evaluate_publish_authorization(
 # ─── CLI entrypoint ───────────────────────────────────────────────────────────
 
 
-def _evidence_from_payload(payload: dict) -> PublishEvidence:
-    return PublishEvidence(
-        session_id=str(payload.get("session_id", "")),
-        turn_id=str(payload.get("turn_id", "")),
-        tool_use_id=str(payload.get("tool_use_id", "")),
-        local_oid=str(payload.get("local_oid", "")),
-        remote_oid=str(payload.get("remote_oid", "")),
-        ref=str(payload.get("ref", "")),
-        issue_number=int(payload.get("issue_number", 0) or 0),
-        nonce=str(payload.get("nonce", "")),
-        expiry=str(payload.get("expiry", "")),
-        candidate_repo_dir=str(payload.get("candidate_repo_dir", "")),
-    )
-
-
 def _decision_to_json(decision: AuthorizationDecision) -> dict:
-    out: dict = {
-        "schema": "TRUSTED_HOOK_LAUNCHER_DECISION_V1",
-        "decision": decision.decision,
-        "reason_code": decision.reason_code,
+    """Render the decision using the REAL Codex / Claude Code PreToolUse
+    hookSpecificOutput contract (see docs/dev/hook-boundaries.md and
+    https://developers.openai.com/codex/hooks/), never a bespoke schema.
+    """
+    hook_specific: dict = {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow" if decision.decision == "allow" else "deny",
     }
-    if decision.detail is not None:
-        out["detail"] = decision.detail
+    if decision.reason_code is not None:
+        reason_text = decision.reason_code
+        if decision.detail:
+            reason_text = f"{decision.reason_code}: {decision.detail}"
+        hook_specific["permissionDecisionReason"] = reason_text
     if decision.decision == "allow" and decision.updated_command is not None:
-        out["updatedInput"] = {"command": list(decision.updated_command)}
-        out["generation"] = decision.generation
-        out["trusted_commit_oid"] = decision.trusted_commit_oid
-    return out
+        hook_specific["updatedInput"] = {"command": shlex.join(decision.updated_command)}
+    return {"hookSpecificOutput": hook_specific}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -540,22 +900,51 @@ def main(argv: list[str] | None = None) -> int:
             "launcher WITHOUT this flag, always using the fixed default."
         ),
     )
-    parser.add_argument("--evidence-file", default=None, help="Path to a JSON evidence file. Defaults to stdin.")
+    parser.add_argument(
+        "--evidence-file",
+        required=True,
+        help="Path to a trusted-verifier-produced PUBLISH_EVIDENCE_V1 JSON file.",
+    )
     args = parser.parse_args(argv)
 
-    if args.evidence_file:
-        payload = json.loads(Path(args.evidence_file).read_text(encoding="utf-8"))
-    else:
-        payload = json.loads(sys.stdin.read())
+    try:
+        hook_raw = json.loads(sys.stdin.read())
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        decision = deny(REASON_HOOK_PAYLOAD_INVALID, detail=f"stdin is not valid JSON: {exc}")
+        return _emit(decision)
 
-    evidence = _evidence_from_payload(payload)
+    payload = parse_hook_payload(hook_raw)
+    if payload is None:
+        decision = deny(REASON_HOOK_PAYLOAD_INVALID, detail="hook payload missing required fields")
+        return _emit(decision)
+
+    try:
+        evidence_raw = json.loads(Path(args.evidence_file).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        decision = deny(REASON_EVIDENCE_INVALID, detail=f"evidence file unreadable: {exc}")
+        return _emit(decision)
+
+    evidence = parse_evidence(evidence_raw)
+    if evidence is None:
+        decision = deny(REASON_EVIDENCE_INVALID, detail="evidence file missing required fields")
+        return _emit(decision)
+
     trust_root_dir = Path(args.trust_root_dir) if args.trust_root_dir else DEFAULT_TRUST_ROOT_DIR
 
     with tempfile.TemporaryDirectory(prefix="trusted-hook-launcher-home-") as dedicated_home:
-        decision = evaluate_publish_authorization(evidence, trust_root_dir, dedicated_home)
+        decision = evaluate_publish_authorization(payload, evidence, trust_root_dir, dedicated_home)
 
-    print(json.dumps(_decision_to_json(decision)))
-    return 0 if decision.decision == "allow" else 1
+    return _emit(decision)
+
+
+def _emit(decision: AuthorizationDecision) -> int:
+    payload = _decision_to_json(decision)
+    print(json.dumps(payload))
+    if decision.decision != "allow":
+        reason = payload["hookSpecificOutput"].get("permissionDecisionReason", decision.reason_code)
+        print(f"[trusted_hook_launcher] deny: {reason}", file=sys.stderr)
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
