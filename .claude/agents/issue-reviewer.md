@@ -31,16 +31,16 @@ skills:
 
   Note: `--mode execute` は `compound_command_disallowed`（静的検出）と `unexpected_pass`（VC 実行結果）の両方を検出する。`shell=True` は導入しない（既存の `shell=False` 前提を維持）。入力は `--body-file` のみを使い、`--issue` / gh / network / external auth に依存しない。
 
-## Result & Consume Contract (SubAgent-owned)
+## 結果と消費契約 (Result & Consume Contract, SubAgent-owned)
 
 本 SubAgent が返す `REVIEW_ISSUE_RESULT_V1` は、以下の消費契約を SSOT とする。orchestrator は判定を再評価せず、機械的に routing する。
 
-### Verdict Consumption
+### 判定結果の消費 (Verdict Consumption)
 
 - `verdict: approve`: Issue 本文が contract を満たしている。
 - `verdict: needs-fix`: Issue 本文に修正が必要な箇所（C1〜C12 fail）がある。
 
-### Escape Hatch: needs_second_pass
+### 逃げ道: needs_second_pass の扱い
 
 - orchestrator 側で `iteration >= max_iterations` に達したが `verdict: needs-fix` の場合、本結果の `blocking_issues` を保持したまま `termination_reason: needs_second_pass` で停止する。
 
@@ -79,6 +79,37 @@ uv run python3 .claude/skills/issue-refinement-loop/scripts/compact_review_resul
 ```
 
 `update_applied` は常に `false`。本 SubAgent は Issue 本文を変更しない。
+
+### needs-fix 判定時の同一境界内 Replay Arbitration 実行（Issue #1472 co-location 方針）
+
+`VERDICT: needs-fix` の場合、本 SubAgent は同一実行境界内（同一 SubAgent 実行、同一 isolation worktree）で `reviewer_claim_replay.py`（Step 2a arbitration）を追加実行し、`REVIEWER_CLAIM_REPLAY_V1` 相当のフィールドを stdout に追記する。これにより、orchestrator は子 worktree の raw `compact_review_result_v1` artifact パスを直接 open/read する必要がなくなる（isolation worktree 環境では orchestrator から子 worktree の artifact パスは解決できないため。詳細は Issue #1465 runtime evidence 参照）。
+
+```bash
+uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/reviewer_claim_replay.py \
+  --review-result-file <直前に生成した compact_review_result_v1 の ARTIFACT パス> \
+  --readiness-result-file <既に取得済みの ISSUE_CONTRACT_READINESS_RESULT_V1 を /tmp/ へ保存したパス> \
+  --state-file .claude/artifacts/issue-refinement-loop/<N>/reviewer_claim_replay_state.json
+```
+
+- `--review-result-file` には、直前の `compact_review_result.py` 実行で得た `ARTIFACT: compact_review_result_v1=<path>` のパスをそのまま渡す。
+- `--readiness-result-file` には、本 SubAgent が「contract readiness consumer」ステップで既に取得済みの `ISSUE_CONTRACT_READINESS_RESULT_V1` を `/tmp/` へ書き出したものを渡す（追加の gh / network 呼び出しを行わない。既存取得結果の再利用のみ）。
+- `--state-file` は Issue 番号 `<N>` で名前空間化された既存パスをそのまま使う（`--vc-syntax-result-file` / `--vc-preflight-result-file` は入手済みの場合のみ渡す。省略可）。
+
+`reviewer_claim_replay.py` の判定ロジック（`analyze()` の taxonomy / routing）は本 SubAgent から再実装・上書きしない。stdout JSON をそのまま以下の compact フィールドへ pass-through する:
+
+```text
+REPLAY_VERDICT: <reviewer_claim_replay.py stdout の verdict>
+REPLAY_ROUTING: <routing>
+REPLAY_SHOULD_CONSUME: <should_consume_iteration>
+REPLAY_BODY_SHA256: <body_sha256>
+REPLAY_ARTIFACT_DIGEST: <reviewer_claim_replay.py stdout JSON 全体の sha256>
+```
+
+`REPLAY_ARTIFACT_DIGEST` は `reviewer_claim_replay.py` の stdout に含まれるフィールドではなく、本 SubAgent が pass-through 前に stdout JSON 全体へ `sha256sum` を適用して算出する tamper-evidence 用の digest である。orchestrator はこの digest を artifact の再取得なしで整合性確認に使える。
+
+`VERDICT: approve` の場合は `reviewer_claim_replay.py` を実行せず、`REPLAY_*` フィールドは stdout に含めない。
+
+`REPLAY_*` フィールドも `ISSUE_REVIEW_RESULT_COMPACT_V1` stdout と同一の 2048 UTF-8 byte budget の内側に収める（OUTPUT_BUDGET_V1 参照）。
 
 ### 内部処理用 REVIEW_ISSUE_RESULT_V1（artifact のみ）
 
@@ -129,6 +160,7 @@ REVIEW_ISSUE_RESULT_V1:
 
 `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
 `ISSUE_REVIEW_RESULT_COMPACT_V1` の全フィールド（STATUS / VERDICT / SUMMARY / BLOCKERS / NEXT_ACTION / EVIDENCE / ARTIFACT）は必ず欠落なく含める（routing 必須フィールド）。
+`VERDICT: needs-fix` の場合は `REPLAY_VERDICT` / `REPLAY_ROUTING` / `REPLAY_SHOULD_CONSUME` / `REPLAY_BODY_SHA256` / `REPLAY_ARTIFACT_DIGEST` も欠落なく含める（Step 2a routing 必須フィールド）。
 stdout は 2048 UTF-8 bytes 以内とする。raw diff / raw log / ANSI escape sequence を stdout に返してはならない。
 
 ## script-first 化について（コスト削減）
@@ -139,7 +171,7 @@ stdout は 2048 UTF-8 bytes 以内とする。raw diff / raw log / ANSI escape s
 
 ## 制約（ORCHESTRATOR_IO_BOUNDARY_V1 準拠）
 
-- 最終応答は `ISSUE_REVIEW_RESULT_COMPACT_V1` stdout のみ（`compact_review_result.py` 経由）
+- 最終応答は `ISSUE_REVIEW_RESULT_COMPACT_V1` stdout のみ（`compact_review_result.py` 経由）。`VERDICT: needs-fix` の場合は同一 stdout に `reviewer_claim_replay.py` の `REPLAY_*` フィールドを追記する
 - `STATUS` / `VERDICT` / `NEXT_ACTION` / `ARTIFACT` を必ず含める（orchestrator の routing 判断に使われるため）
 - raw review body / raw diff / raw issue body / raw log を main context に返してはならない
 - full structured data は artifact JSON に保存し、main context には `ARTIFACT:` パスのみ返す
