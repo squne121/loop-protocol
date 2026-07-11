@@ -340,6 +340,35 @@ class TestC2Fail:
         )
 
 
+class TestC2StopConditionsBulletMarkers:
+    """GIVEN Stop Conditions sections using non-hyphen bullet markers
+    WHEN checker runs THEN C2 counts bullets consistently with BULLET_RE (Issue #1431)."""
+
+    def test_c2_stop_conditions_asterisk_bullet(self):
+        """GIVEN c2_asterisk_pass_issue.md (6 asterisk bullets) WHEN checker runs
+        THEN C2_stop_conditions_6 is pass."""
+        output = run_checker("c2_asterisk_pass_issue.md")
+        assert output["deterministic_checks"]["C2_stop_conditions_6"] == "pass", (
+            f"Expected C2 to pass, got {output['deterministic_checks']['C2_stop_conditions_6']}"
+        )
+
+    def test_c2_stop_conditions_plus_bullet(self):
+        """GIVEN c2_plus_pass_issue.md (6 plus bullets) WHEN checker runs
+        THEN C2_stop_conditions_6 is pass."""
+        output = run_checker("c2_plus_pass_issue.md")
+        assert output["deterministic_checks"]["C2_stop_conditions_6"] == "pass", (
+            f"Expected C2 to pass, got {output['deterministic_checks']['C2_stop_conditions_6']}"
+        )
+
+    def test_c2_stop_conditions_insufficient(self):
+        """GIVEN c2_asterisk_insufficient_issue.md (3 asterisk bullets, <6) WHEN checker
+        runs THEN C2_stop_conditions_6 is fail."""
+        output = run_checker("c2_asterisk_insufficient_issue.md")
+        assert output["deterministic_checks"]["C2_stop_conditions_6"] == "fail", (
+            f"Expected C2 to fail, got {output['deterministic_checks']['C2_stop_conditions_6']}"
+        )
+
+
 class TestC3Fail:
     """GIVEN a fixture with non-checkbox AC WHEN checker runs THEN C3 fails."""
 

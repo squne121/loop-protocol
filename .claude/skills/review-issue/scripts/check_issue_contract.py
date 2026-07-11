@@ -854,7 +854,7 @@ def check_c2_stop_conditions(body: str, issue_kind: str) -> tuple[str, list[str]
     if not section:
         return CheckResult.FAIL, ["## Stop Conditions セクションが存在しない"]
 
-    bullet_count = len(re.findall(r"^- ", section, re.MULTILINE))
+    bullet_count = sum(1 for line in section.splitlines() if BULLET_RE.match(line))
     if bullet_count < 6:
         return CheckResult.FAIL, [f"Stop Conditions の項目数が {bullet_count} 件（6 件以上必要）"]
     return CheckResult.PASS, []
