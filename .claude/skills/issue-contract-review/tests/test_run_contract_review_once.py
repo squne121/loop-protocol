@@ -141,6 +141,29 @@ class TestAllChecksCalledB1:
         assert result["checks"]["product_spec"] == "pass"
         assert result["checks"]["vc_preflight"] == "pass"
 
+    def test_current_head_arguments_are_forwarded_to_producer(self):
+        """GIVEN current-head caller inputs WHEN review runs THEN producer receives them unchanged."""
+        run_script_results, shell_results = _make_all_pass_side_effects()
+        captured = []
+
+        def run_script(*args, **kwargs):
+            captured.append(args[0])
+            return run_script_results.pop(0)
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=run_script):
+            with patch.object(_rcr_mod, "_run_shell_script", return_value=shell_results[0]):
+                result = run_once(
+                    _ISSUE_NUMBER, _REPO, skip_idempotency_check=True,
+                    evidence_mode="current-head", cwd="/tmp/pr-worktree", reviewed_head_sha="abc123",
+                )
+
+        producer_command = captured[-1]
+        assert result["status"] == "go"
+        assert producer_command[-8:] == [
+            "--cwd", "/tmp/pr-worktree", "--evidence-mode", "current-head",
+            "--reviewed-head-sha", "abc123", "--format", "json",
+        ]
+
     def test_blockers_blocked_stops_pipeline(self, monkeypatch):
         """If check_blockers.sh returns exit 1 (open blockers), status: blocked."""
         readiness_json = _make_readiness_json("go")

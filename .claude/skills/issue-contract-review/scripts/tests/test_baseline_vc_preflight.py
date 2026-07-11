@@ -9,6 +9,54 @@ import sys
 from pathlib import Path
 import tempfile
 
+
+def test_current_head_evidence_certifies_clean_temporary_repository():
+    """GIVEN clean temporary Git repo WHEN current-head evidence is observed THEN it is certified."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import collect_current_head_evidence
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        repo = Path(temp_dir)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+        (repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+        head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+        evidence = collect_current_head_evidence(str(repo), head)
+
+    assert evidence["certified"] is True
+    assert evidence["head_sha"] == head
+    assert evidence["reviewed_head_sha"] == head
+    assert evidence["clean_before"] is True
+
+
+def test_current_head_evidence_rejects_dirty_temporary_repository():
+    """GIVEN dirty temporary Git repo WHEN current-head evidence is observed THEN it is blocked."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import collect_current_head_evidence
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        repo = Path(temp_dir)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+        (repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+        head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        (repo / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+
+        evidence = collect_current_head_evidence(str(repo), head)
+
+    assert evidence["certified"] is False
+    assert evidence["clean_before"] is False
+    assert evidence["stop_condition_triggered"] is True
+
 try:
     import pytest
     HAS_PYTEST = True

@@ -240,6 +240,9 @@ def run_once(
     repo: str,
     mode: str = "static",
     skip_idempotency_check: bool = False,
+    evidence_mode: str = "baseline",
+    cwd: str | None = None,
+    reviewed_head_sha: str | None = None,
 ) -> dict[str, Any]:
     """
     Run issue-contract-review checks once for the given issue.
@@ -264,6 +267,7 @@ def run_once(
         "readiness_errors": [],
         "vc_preflight_status": None,
         "vc_preflight_classifications": [],
+        "vc_evidence": {"mode": evidence_mode},
         "checks": {
             "readiness": None,
             "blockers": None,
@@ -446,8 +450,7 @@ def run_once(
         result["checks"]["product_spec"] = "pass"
 
     # Step 5: baseline_vc_preflight.py (run in all modes)
-    vc_result_json, vc_rc, vc_err = _run_script(
-        [
+    vc_command = [
             sys.executable,
             str(_BASELINE_VC_PREFLIGHT_PY),
             "--issue",
@@ -456,7 +459,22 @@ def run_once(
             repo,
             "--timeout-seconds",
             str(_VC_PREFLIGHT_PER_COMMAND_TIMEOUT),
-        ],
+    ]
+    if evidence_mode == "current-head":
+        if not cwd or not reviewed_head_sha:
+            result["status"] = "blocked"
+            result["source"] = "vc_preflight"
+            result["checks"]["vc_preflight"] = "blocked"
+            result["errors"].append("current_head_requires_cwd_and_reviewed_head_sha")
+            return result
+        vc_command.extend([
+            "--cwd", cwd,
+            "--evidence-mode", "current-head",
+            "--reviewed-head-sha", reviewed_head_sha,
+            "--format", "json",
+        ])
+    vc_result_json, vc_rc, vc_err = _run_script(
+        vc_command,
         timeout=_VC_PREFLIGHT_TIMEOUT,
     )
 
@@ -473,6 +491,12 @@ def run_once(
     vc_status = vc_result_json.get("status", "")
     result["vc_preflight_status"] = vc_status
     result["vc_preflight_classifications"] = vc_result_json.get("results", [])
+    result["vc_evidence"] = {
+        "mode": vc_result_json.get("evidence_mode", evidence_mode),
+        "head_sha": vc_result_json.get("head_sha"),
+        "reviewed_head_sha": vc_result_json.get("reviewed_head_sha"),
+        "stop_condition_triggered": vc_result_json.get("stop_condition_triggered"),
+    }
 
     if vc_status == "human_judgment":
         result["checks"]["vc_preflight"] = "human_judgment"
@@ -516,6 +540,9 @@ def main() -> int:
         required=True,
         help="GitHub Issue number",
     )
+    parser.add_argument("--evidence-mode", choices=["baseline", "current-head"], default="baseline")
+    parser.add_argument("--cwd", default=None)
+    parser.add_argument("--reviewed-head-sha", default=None)
     parser.add_argument(
         "--repo",
         default="squne121/loop-protocol",
@@ -541,6 +568,9 @@ def main() -> int:
         repo=args.repo,
         mode=args.mode,
         skip_idempotency_check=args.skip_idempotency_check,
+        evidence_mode=args.evidence_mode,
+        cwd=args.cwd,
+        reviewed_head_sha=args.reviewed_head_sha,
     )
 
     print(json.dumps(result))

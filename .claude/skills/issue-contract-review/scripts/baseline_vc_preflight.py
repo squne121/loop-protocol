@@ -44,6 +44,145 @@ from vc_contract_syntax import (
 DEFAULT_TIMEOUT_SECONDS = 90
 
 
+def collect_current_head_evidence(cwd: str, reviewed_head_sha: str) -> Dict[str, Any]:
+    """Observe and certify one clean worktree against a reviewed commit object.
+
+    This deliberately uses Git's revision parser instead of a fixed-width SHA
+    regexp so repositories using a non-SHA-1 object format remain supported.
+    """
+    base = {
+        "head_sha": None,
+        "reviewed_head_sha": reviewed_head_sha or None,
+        "clean_before": False,
+        "clean_after": None,
+        "head_after_sha": None,
+        "certified": False,
+        "fallback_detected": False,
+        "human_review_required": False,
+        "stop_condition_triggered": True,
+        "errors": [],
+    }
+    if not reviewed_head_sha or isinstance(reviewed_head_sha, bool):
+        base["errors"].append("reviewed_head_sha_missing_or_invalid")
+        return base
+
+    def git_text(*arguments: str) -> Tuple[Optional[str], Optional[str]]:
+        result = subprocess.run(
+            ["git", "-C", cwd, *arguments], capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            return None, result.stderr.strip() or "git_command_failed"
+        return result.stdout.strip(), None
+
+    observed, error = git_text("rev-parse", "--verify", "--end-of-options", "HEAD^{commit}")
+    if error:
+        base["errors"].append(f"head_observation_failed:{error}")
+        return base
+    canonical_reviewed, error = git_text(
+        "rev-parse", "--verify", "--end-of-options", f"{reviewed_head_sha}^{{commit}}"
+    )
+    if error:
+        base["head_sha"] = observed
+        base["errors"].append(f"reviewed_head_not_commit:{error}")
+        return base
+    status, error = git_text("status", "--porcelain=v1", "-z", "--untracked-files=all")
+    if error:
+        base["head_sha"] = observed
+        base["reviewed_head_sha"] = canonical_reviewed
+        base["errors"].append(f"cleanliness_observation_failed:{error}")
+        return base
+
+    base["head_sha"] = observed
+    base["reviewed_head_sha"] = canonical_reviewed
+    base["clean_before"] = status == ""
+    if observed != canonical_reviewed:
+        base["errors"].append("reviewed_head_sha_mismatch")
+    if status != "":
+        base["errors"].append("worktree_not_clean_before_execution")
+    if not base["errors"]:
+        base["certified"] = True
+        base["stop_condition_triggered"] = False
+    return base
+
+
+def finalize_current_head_evidence(cwd: str, evidence: Dict[str, Any]) -> Dict[str, Any]:
+    """Verify that a certified worktree did not drift during VC execution."""
+    if not evidence.get("certified"):
+        return evidence
+    result = subprocess.run(
+        ["git", "-C", cwd, "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
+        capture_output=True,
+        text=True,
+    )
+    status = subprocess.run(
+        ["git", "-C", cwd, "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+    )
+    head_after = result.stdout.strip() if result.returncode == 0 else None
+    clean_after = status.returncode == 0 and status.stdout == ""
+    evidence["head_after_sha"] = head_after
+    evidence["clean_after"] = clean_after
+    if head_after != evidence.get("head_sha"):
+        evidence["errors"].append("head_drift_during_execution")
+    if not clean_after:
+        evidence["errors"].append("worktree_not_clean_after_execution")
+    evidence["certified"] = not evidence["errors"]
+    evidence["stop_condition_triggered"] = not evidence["certified"]
+    return evidence
+
+
+def safety_fields(evidence_mode: str, evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Return stable bool safety fields for every JSON envelope."""
+    if evidence_mode != "current-head":
+        return {
+            "evidence_mode": "baseline",
+            "head_sha": None,
+            "reviewed_head_sha": None,
+            "fallback_detected": False,
+            "human_review_required": False,
+            "stop_condition_triggered": False,
+        }
+    evidence = evidence or {}
+    return {
+        "evidence_mode": "current-head",
+        "head_sha": evidence.get("head_sha"),
+        "reviewed_head_sha": evidence.get("reviewed_head_sha"),
+        "head_after_sha": evidence.get("head_after_sha"),
+        "clean_before": bool(evidence.get("clean_before")),
+        "clean_after": evidence.get("clean_after"),
+        "fallback_detected": bool(evidence.get("fallback_detected", False)),
+        "human_review_required": bool(evidence.get("human_review_required", False)),
+        "stop_condition_triggered": bool(evidence.get("stop_condition_triggered", True)),
+    }
+
+
+def emit_json(result: Dict[str, Any], evidence_mode: str, evidence: Optional[Dict[str, Any]] = None) -> None:
+    """Emit a JSON envelope with the stable safety-field contract."""
+    result.update(safety_fields(evidence_mode, evidence))
+    print(json.dumps(result, indent=2))
+
+
+def current_head_blocked_result(args: argparse.Namespace, evidence: Dict[str, Any], message: str) -> Dict[str, Any]:
+    return {
+        "schema": "baseline_vc_preflight/v1",
+        "issue": args.issue or 0,
+        "repo": args.repo,
+        "generated_at": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+        "source": {"kind": "current_head_validation", "body_sha256": ""},
+        "status": "blocked",
+        "summary": {
+            "expected_fail": 0,
+            "unexpected_pass": 0,
+            "blocked": 1,
+            "human_judgment": 0,
+            "extraction_errors": 0,
+        },
+        "results": [],
+        "errors": [message, *evidence.get("errors", [])],
+    }
+
+
 def get_issue_body(issue_number: int, repo: str) -> Tuple[Optional[str], Optional[str]]:
     """
     GitHub API から Issue body を取得
@@ -2835,7 +2974,18 @@ def main() -> int:
     parser.add_argument("--issue", type=int, help="GitHub Issue number")
     parser.add_argument("--repo", default="squne121/loop-protocol", help="GitHub repo (owner/name)")
     parser.add_argument("--body-file", help="Path to Issue body file (for testing)")
-    parser.add_argument("--cwd", default=".", help="Working directory for command execution")
+    parser.add_argument("--cwd", default=None, help="Working directory for command execution")
+    parser.add_argument(
+        "--evidence-mode",
+        choices=["baseline", "current-head"],
+        default="baseline",
+        help="Evidence contract: backward-compatible baseline or producer-certified current-head",
+    )
+    parser.add_argument(
+        "--reviewed-head-sha",
+        default=None,
+        help="Immutable commit selected by the caller; required in current-head mode",
+    )
     parser.add_argument(
         "--timeout-seconds",
         type=int,
@@ -2868,6 +3018,38 @@ def main() -> int:
     )
 
     args = parser.parse_args()
+    cwd_supplied = args.cwd is not None
+    args.cwd = args.cwd or "."
+    current_evidence: Optional[Dict[str, Any]] = None
+
+    if args.evidence_mode == "current-head":
+        invalid_reason = None
+        if not cwd_supplied:
+            invalid_reason = "current-head requires --cwd"
+        elif not args.reviewed_head_sha or isinstance(args.reviewed_head_sha, bool):
+            invalid_reason = "current-head requires --reviewed-head-sha"
+        elif args.format != "json":
+            invalid_reason = "current-head requires --format json"
+        elif args.static_only:
+            invalid_reason = "current-head cannot be combined with --static-only"
+        if invalid_reason:
+            current_evidence = {
+                "reviewed_head_sha": args.reviewed_head_sha,
+                "fallback_detected": False,
+                "human_review_required": False,
+                "stop_condition_triggered": True,
+                "errors": [invalid_reason],
+            }
+            emit_json(current_head_blocked_result(args, current_evidence, invalid_reason), args.evidence_mode, current_evidence)
+            return 1
+        current_evidence = collect_current_head_evidence(args.cwd, args.reviewed_head_sha)
+        if not current_evidence["certified"]:
+            emit_json(
+                current_head_blocked_result(args, current_evidence, "current-head certification failed"),
+                args.evidence_mode,
+                current_evidence,
+            )
+            return 1
 
     # Issue body を取得 (C2: error code と一緒に返す)
     body = None
@@ -2907,7 +3089,7 @@ def main() -> int:
                 }
             ],
         }
-        print(json.dumps(result, indent=2))
+        emit_json(result, args.evidence_mode, current_evidence)
         # C2: exit code 2 for retrieval/parse errors
         return 2 if error_code else 2
 
@@ -2942,7 +3124,7 @@ def main() -> int:
                 }
             ],
         }
-        print(json.dumps(result, indent=2))
+        emit_json(result, args.evidence_mode, current_evidence)
         # C2: exit code 2 for extraction errors
         return 2
 
@@ -2990,7 +3172,7 @@ def main() -> int:
             "results": static_results,
             "errors": [],
         }
-        print(json.dumps(result, indent=2))
+        emit_json(result, args.evidence_mode, current_evidence)
         return 0 if static_status == "ok" else 1
 
     # AC2: parse Allowed Paths from Issue body for containment-based broad path detection
@@ -3048,7 +3230,7 @@ def main() -> int:
             "results": [],
             "errors": [no_cmd_error],
         }
-        print(json.dumps(result, indent=2))
+        emit_json(result, args.evidence_mode, current_evidence)
         # C2: exit code 2 for extraction errors
         return 2
 
@@ -3456,6 +3638,12 @@ def main() -> int:
         "errors": [],
     }
 
+    if current_evidence is not None:
+        current_evidence = finalize_current_head_evidence(args.cwd, current_evidence)
+        if not current_evidence["certified"]:
+            output["status"] = "blocked"
+            output["errors"].extend(current_evidence["errors"])
+
     # B8: Output format selection
     if args.format == "contract-review-fragment":
         # C1: lazy import yaml - only when needed for fragment output
@@ -3476,13 +3664,13 @@ def main() -> int:
                 "results": results,
                 "errors": ["PyYAML is required for contract-review-fragment format; install pyyaml"],
             }
-            print(json.dumps(error_result, indent=2))
+            emit_json(error_result, args.evidence_mode, current_evidence)
             # C2: exit code 2 for missing dependency
             return 2
         fragment = generate_contract_review_fragment(status, results)
         print(yaml.dump(fragment, default_flow_style=False))
     else:
-        print(json.dumps(output, indent=2))
+        emit_json(output, args.evidence_mode, current_evidence)
 
     # C2: Exit code contract
     # status: pass → 0, blocked → 1, human_judgment → 3

@@ -368,6 +368,9 @@ def run_contract_review_once(
     repo: str,
     mode: str = "static",
     skip_idempotency_check: bool = True,
+    evidence_mode: str = "baseline",
+    cwd: Optional[str] = None,
+    reviewed_head_sha: Optional[str] = None,
 ) -> tuple[Optional[dict], Optional[str]]:
     """
     Run run_contract_review_once.py as subprocess.
@@ -385,6 +388,14 @@ def run_contract_review_once(
     ]
     if skip_idempotency_check:
         cmd.append("--skip-idempotency-check")
+    if evidence_mode == "current-head":
+        if not cwd or not reviewed_head_sha:
+            return None, "current_head_requires_cwd_and_reviewed_head_sha"
+        cmd.extend([
+            "--evidence-mode", "current-head",
+            "--cwd", cwd,
+            "--reviewed-head-sha", reviewed_head_sha,
+        ])
 
     try:
         result = subprocess.run(
@@ -418,6 +429,9 @@ def ensure_contract_snapshot(
     mode: str = "check-only",
     do_post: bool = False,
     artifact_dir: Optional[str] = None,
+    evidence_mode: str = "baseline",
+    cwd: Optional[str] = None,
+    reviewed_head_sha: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Main logic for ensure_contract_snapshot.
@@ -447,6 +461,7 @@ def ensure_contract_snapshot(
         "idempotency_marker_found": False,
         "errors": [],
         "contract_review_once_result": None,
+        "vc_evidence": {"mode": evidence_mode},
     }
 
     # Load parser module
@@ -532,9 +547,14 @@ def ensure_contract_snapshot(
         repo=repo,
         mode="static",
         skip_idempotency_check=True,
+        evidence_mode=evidence_mode,
+        cwd=cwd,
+        reviewed_head_sha=reviewed_head_sha,
     )
 
     result["contract_review_once_result"] = review_result
+    if review_result:
+        result["vc_evidence"] = review_result.get("vc_evidence", result["vc_evidence"])
 
     if review_err:
         result["errors"].append(f"run_contract_review_once_error: {review_err}")
@@ -769,6 +789,9 @@ def main() -> int:
         required=True,
         help="GitHub Issue number",
     )
+    parser.add_argument("--evidence-mode", choices=["baseline", "current-head"], default="baseline")
+    parser.add_argument("--cwd", default=None)
+    parser.add_argument("--reviewed-head-sha", default=None)
     parser.add_argument(
         "--repo",
         default=_DEFAULT_REPO,
@@ -816,6 +839,9 @@ def main() -> int:
         mode=args.mode,
         do_post=args.post,
         artifact_dir=args.artifact_dir,
+        evidence_mode=args.evidence_mode,
+        cwd=args.cwd,
+        reviewed_head_sha=args.reviewed_head_sha,
     )
 
     # Save artifact if requested
