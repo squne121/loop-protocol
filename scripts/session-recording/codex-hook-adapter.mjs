@@ -18,6 +18,86 @@ const producerScript = configuredProducerScript.startsWith(repoRoot)
   ? configuredProducerScript
   : defaultProducerScript
 
+// Issue #1428: shell command structure analyzer (SHELL_COMMAND_ANALYSIS_V1).
+// Invoked out-of-process via execFile-style argv (no shell interpolation,
+// no shell: true) with the command passed as JSON over stdin (data channel,
+// not argv/shell-string), per In Scope 4 (analyzer invocation safety).
+const shellCommandAnalyzerScript = resolve(repoRoot, 'scripts', 'agent-guards', 'shell_command_analysis.py')
+const SHELL_COMMAND_ANALYSIS_SCHEMA = 'SHELL_COMMAND_ANALYSIS_V1'
+const SHELL_ANALYZER_TIMEOUT_MS = 5000
+const SHELL_ANALYZER_MAX_BUFFER = 1024 * 1024
+
+const PUSH_COMMAND_KINDS = new Set(['git_push', 'rtk_git_push'])
+
+/**
+ * Map an analyzer-internal indeterminate reason_code to the machine-readable
+ * command_kind surfaced in the (still generic) remote_write_requires_approval
+ * deny reason, per Issue #1428 In Scope 8. External consumers that only know
+ * the pre-existing `remote_write_requires_approval` / `git_push` vocabulary
+ * keep working (reason_code stays remote_write_requires_approval); the
+ * command_kind field carries the finer-grained indeterminate classification.
+ */
+function mapIndeterminateReasonToCommandKind(analyzerReasonCode) {
+  switch (analyzerReasonCode) {
+    case 'dynamic_command_word':
+      return 'dynamic_command_word'
+    case 'unsupported_construct':
+      return 'unsupported_execution_carrier'
+    case 'analysis_timeout':
+      return 'shell_command_analysis_timeout'
+    case 'malformed_shell':
+      return 'shell_command_parse_indeterminate'
+    default:
+      return 'shell_command_analysis_failed'
+  }
+}
+
+/**
+ * Run the bounded shell-command structure analyzer as a subprocess and
+ * return its parsed SHELL_COMMAND_ANALYSIS_V1 result. Any failure mode
+ * (non-zero exit, timeout, malformed JSON, schema mismatch, missing/invalid
+ * commands array) is normalized to an indeterminate result with a
+ * shell_command_analysis_failed-family command_kind — never fail-open
+ * (Issue #1428 In Scope 1 / 2 / 8).
+ */
+function runShellCommandAnalyzer(command) {
+  let stdout
+  try {
+    stdout = execFileSync('python3', [shellCommandAnalyzerScript], {
+      input: JSON.stringify({ command }),
+      encoding: 'utf8',
+      timeout: SHELL_ANALYZER_TIMEOUT_MS,
+      maxBuffer: SHELL_ANALYZER_MAX_BUFFER,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+  } catch (err) {
+    const timedOut = err && (err.signal === 'SIGTERM' || err.killed === true)
+    return {
+      status: 'indeterminate',
+      commands: [],
+      reason_code: timedOut ? 'analysis_timeout' : 'analysis_process_failed',
+    }
+  }
+
+  let parsed
+  try {
+    parsed = JSON.parse(stdout)
+  } catch {
+    return { status: 'indeterminate', commands: [], reason_code: 'analysis_process_failed' }
+  }
+
+  if (!parsed || typeof parsed !== 'object' || parsed.schema !== SHELL_COMMAND_ANALYSIS_SCHEMA) {
+    return { status: 'indeterminate', commands: [], reason_code: 'analysis_process_failed' }
+  }
+  if (!Array.isArray(parsed.commands)) {
+    return { status: 'indeterminate', commands: [], reason_code: 'analysis_process_failed' }
+  }
+  if (parsed.status !== 'ok' && parsed.status !== 'indeterminate') {
+    return { status: 'indeterminate', commands: [], reason_code: 'analysis_process_failed' }
+  }
+  return parsed
+}
+
 function parseArgs(argv) {
   const args = { event: null }
   for (let index = 2; index < argv.length; index += 1) {
@@ -122,10 +202,36 @@ function classifySecretBoundary(command) {
   return null
 }
 
-/** AC4: remote write commands - git push variants */
+/**
+ * AC4 / Issue #1428: remote write commands - git push / rtk git push.
+ *
+ * Classification is delegated to the SHELL_COMMAND_ANALYSIS_V1 command
+ * structure analyzer (scripts/agent-guards/shell_command_analysis.py)
+ * instead of a substring/regex match against the raw command string
+ * (Issue #1428 AC7). Non-executable occurrences of "git push" (quoted
+ * argument data, search keywords, heredoc data with a quoted delimiter,
+ * etc.) are never classified as remote write. Commands that would actually
+ * execute `git push` / `git -C <path> push` / `rtk git push` — including
+ * via pipeline, list, command substitution, or a known execution carrier
+ * (bash -c / sh -c / eval / exec / env prefix / command wrapper) — are
+ * still classified as remote write (AC3-AC6). Anything the analyzer cannot
+ * statically resolve (dynamic command word, unsupported execution carrier,
+ * parse failure, analyzer process failure) is fail-closed to remote write
+ * as well (AC8) — never fail-open.
+ */
 function classifyRemoteWrite(command) {
-  if (/\bgit(?:\s+-C\s+\S+)?\s+push\b/.test(command)) {
-    return { reason_code: 'remote_write_requires_approval', command_kind: 'git_push' }
+  const analysis = runShellCommandAnalyzer(command)
+
+  if (analysis.status === 'indeterminate') {
+    return {
+      reason_code: 'remote_write_requires_approval',
+      command_kind: mapIndeterminateReasonToCommandKind(analysis.reason_code),
+    }
+  }
+
+  const pushCommand = analysis.commands.find((entry) => PUSH_COMMAND_KINDS.has(entry?.command_kind))
+  if (pushCommand) {
+    return { reason_code: 'remote_write_requires_approval', command_kind: pushCommand.command_kind }
   }
   return null
 }

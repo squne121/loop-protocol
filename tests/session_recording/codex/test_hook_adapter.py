@@ -543,3 +543,202 @@ def test_manifest_written_to_default_root_when_env_unset():
         assert validation.returncode == 0, validation.stderr
     finally:
         new_file.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Issue #1428: command-structure-based remote write classification.
+#
+# Fixture naming convention (AC12): each parametrized test id is prefixed
+# with the expected classification bucket (`data_only` / `executed` /
+# `indeterminate`) so the expected outcome is discoverable from the fixture
+# name alone.
+# ---------------------------------------------------------------------------
+
+
+def test_pre_tool_use_keyword_false_positive_match_ssot_not_blocked():
+    """AC1: GIVEN the actually-observed match-ssot.sh --keywords "... git
+    push ..." command (Issue #1428 Background) WHEN PreToolUse fires THEN it
+    is NOT blocked as remote_write_requires_approval / command_kind=git_push
+    (the executable is match-ssot.sh; "git push" is quoted argument data)."""
+    command = (
+        '.claude/skills/ssot-discovery/scripts/match-ssot.sh '
+        '--keywords "issue-refinement remote_write git push"'
+    )
+    result = run_adapter("PreToolUse", {"tool_input": {"command": command}})
+    assert result.stdout == ""
+
+
+DATA_ONLY_PRETOOLUSE_CASES = [
+    ("data_only_rg_search", 'rg -n "git push" docs/ .claude/'),
+    ("data_only_grep_search", "grep -R 'git push origin main' docs/"),
+    ("data_only_printf_literal", "printf '%s\\n' 'git push origin main'"),
+    ("data_only_python_option_value", 'python3 tool.py --message "git push origin main"'),
+    ("data_only_git_log_grep", 'git log --grep="git push"'),
+    (
+        "data_only_quoted_keyword_description",
+        "some-command --keyword='git push' --description=\"do not execute git push\"",
+    ),
+    ("data_only_quoted_heredoc_delimiter", "cat <<'EOF'\ngit push origin main\nEOF\n"),
+]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [c for _id, c in DATA_ONLY_PRETOOLUSE_CASES],
+    ids=[i for i, _c in DATA_ONLY_PRETOOLUSE_CASES],
+)
+def test_pre_tool_use_data_only_git_push_text_not_blocked(command: str):
+    """AC1/AC2: GIVEN a command where 'git push' appears only as
+    non-executable text (search keyword, quoted argument, description,
+    quoted-delimiter heredoc body) WHEN PreToolUse fires THEN it is NOT
+    classified as remote_write_requires_approval."""
+    result = run_adapter("PreToolUse", {"tool_input": {"command": command}})
+    assert result.stdout == ""
+
+
+REMOTE_WRITE_TOP_LEVEL_CASES = [
+    ("remote_write_top_level_plain", "git push origin main"),
+    ("remote_write_top_level_dash_c", "git -C /some/path push origin main"),
+]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [c for _id, c in REMOTE_WRITE_TOP_LEVEL_CASES],
+    ids=[i for i, _c in REMOTE_WRITE_TOP_LEVEL_CASES],
+)
+def test_pre_tool_use_remote_write_top_level_blocked(command: str):
+    """AC3: GIVEN a top-level `git push` / `git -C <path> push` command
+    WHEN PreToolUse fires THEN it is denied with
+    remote_write_requires_approval / command_kind=git_push."""
+    result = run_adapter("PreToolUse", {"tool_input": {"command": command}})
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "remote_write_requires_approval" in reason
+    assert "command_kind=git_push" in reason
+
+
+REMOTE_WRITE_COMPOUND_CASES = [
+    ("remote_write_compound_and_list", "echo ok && git push origin main"),
+    ("remote_write_compound_semicolon_list", "echo ok; git push origin main"),
+    ("remote_write_compound_or_list", "false || git push origin main"),
+    ("remote_write_compound_pipeline", "git status | git push origin main"),
+]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [c for _id, c in REMOTE_WRITE_COMPOUND_CASES],
+    ids=[i for i, _c in REMOTE_WRITE_COMPOUND_CASES],
+)
+def test_pre_tool_use_remote_write_compound_blocked(command: str):
+    """AC4: GIVEN `git push` executed inside a `&&` / `;` / `||` list or a
+    `|` pipeline WHEN PreToolUse fires THEN it is still denied with
+    remote_write_requires_approval / command_kind=git_push."""
+    result = run_adapter("PreToolUse", {"tool_input": {"command": command}})
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "remote_write_requires_approval" in reason
+    assert "command_kind=git_push" in reason
+
+
+REMOTE_WRITE_SUBSTITUTION_CASES = [
+    ("remote_write_substitution_dollar_paren", 'echo "$(git push origin main)"'),
+    ("remote_write_substitution_backtick", "echo `git push origin main`"),
+    ("remote_write_substitution_bash_dash_c", "bash -c 'git push origin main'"),
+    ("remote_write_substitution_sh_dash_c", 'sh -c "git push origin main"'),
+    (
+        "remote_write_substitution_unquoted_heredoc",
+        "cat <<EOF\n$(git push origin main)\nEOF\n",
+    ),
+    ("remote_write_substitution_here_string", 'cat <<< "$(git push origin main)"'),
+]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [c for _id, c in REMOTE_WRITE_SUBSTITUTION_CASES],
+    ids=[i for i, _c in REMOTE_WRITE_SUBSTITUTION_CASES],
+)
+def test_pre_tool_use_remote_write_substitution_blocked(command: str):
+    """AC5: GIVEN `git push` executed via `$()` / backtick / `bash -c` /
+    `sh -c` / unquoted heredoc / here-string WHEN PreToolUse fires THEN it
+    is denied with remote_write_requires_approval / command_kind=git_push."""
+    result = run_adapter("PreToolUse", {"tool_input": {"command": command}})
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "remote_write_requires_approval" in reason
+    assert "command_kind=git_push" in reason
+
+
+REMOTE_WRITE_WRAPPER_CASES = [
+    ("remote_write_wrapper_env_prefix", "env FOO=bar git push origin main"),
+    ("remote_write_wrapper_bare_assignment_prefix", "FOO=bar git push origin main"),
+    ("remote_write_wrapper_command_builtin", "command git push origin main"),
+]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [c for _id, c in REMOTE_WRITE_WRAPPER_CASES],
+    ids=[i for i, _c in REMOTE_WRITE_WRAPPER_CASES],
+)
+def test_pre_tool_use_remote_write_wrapper_not_bypassed(command: str):
+    """AC6: GIVEN `env VAR=value ...` / a bare leading `VAR=value` prefix /
+    the `command` wrapper in front of `git push` WHEN PreToolUse fires THEN
+    the real `git push` invocation is still denied with
+    remote_write_requires_approval / command_kind=git_push (the wrapper
+    does not bypass detection)."""
+    result = run_adapter("PreToolUse", {"tool_input": {"command": command}})
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "remote_write_requires_approval" in reason
+    assert "command_kind=git_push" in reason
+
+
+def test_pre_tool_use_remote_write_rtk_git_push_blocked():
+    """AC3/#1408 boundary: GIVEN `rtk git push origin HEAD:refs/heads/<b>`
+    WHEN PreToolUse fires THEN it is denied with
+    remote_write_requires_approval / command_kind=rtk_git_push (detection
+    only — #1408 owns the final publish-lane authorization decision)."""
+    result = run_adapter("PreToolUse", {
+        "tool_input": {"command": "rtk git push origin HEAD:refs/heads/feature-x"}
+    })
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "remote_write_requires_approval" in reason
+    assert "command_kind=rtk_git_push" in reason
+
+
+INDETERMINATE_PRETOOLUSE_CASES = [
+    ("indeterminate_dynamic_executable_word", '"$command" push origin main'),
+    ("indeterminate_dynamic_subcommand_word", "git p$(printf ush) origin main"),
+    (
+        "indeterminate_unsupported_execution_carrier_find_exec",
+        "find . -maxdepth 0 -exec git push origin main ;",
+    ),
+    ("indeterminate_unsupported_execution_carrier_xargs", "xargs git push < push-args.txt"),
+]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [c for _id, c in INDETERMINATE_PRETOOLUSE_CASES],
+    ids=[i for i, _c in INDETERMINATE_PRETOOLUSE_CASES],
+)
+def test_pre_tool_use_indeterminate_commands_fail_closed(command: str):
+    """AC8: GIVEN a command whose remote-write classification the analyzer
+    cannot statically resolve (dynamic command word / unsupported execution
+    carrier) WHEN PreToolUse fires THEN it is still denied (fail-closed,
+    never fail-open) under the remote_write_requires_approval reason,
+    carrying a machine-readable indeterminate command_kind."""
+    result = run_adapter("PreToolUse", {"tool_input": {"command": command}})
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "remote_write_requires_approval" in reason
