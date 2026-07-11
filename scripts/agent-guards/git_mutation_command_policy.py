@@ -18,13 +18,27 @@ from pathlib import Path
 
 ALLOWED_RTK_GIT_SUBCOMMANDS = frozenset({"add", "commit", "push"})
 DENIED_PUSH_FLAGS = frozenset({"--force", "-f", "--tags", "--all", "--mirror", "--delete"})
-ALLOWED_REMOTE_READBACK_SOURCES = frozenset({"ls_remote", "github_branch_api", "fetch_then_show_ref"})
+# Issue #1408 iteration-2 adversarial review (P1): `github_branch_api` /
+# `fetch_then_show_ref` never actually re-read the remote — they were
+# self-reported labels that trusted `LOOP_PUBLISH_CURRENT_REMOTE_HEAD`
+# verbatim. Only `ls_remote` performs a live `git ls-remote` readback, so it
+# is the sole authorized source until a verified implementation for the
+# other sources exists (tracked separately, not in this PR's scope).
+ALLOWED_REMOTE_READBACK_SOURCES = frozenset({"ls_remote"})
 COMMAND_CLASS_RTK_GIT_ADD = "rtk_git_add"
 COMMAND_CLASS_RTK_GIT_COMMIT = "rtk_git_commit"
 COMMAND_CLASS_RTK_GIT_PUSH = "rtk_git_push"
 COMMAND_CLASS_RTK_GIT_UNKNOWN = "rtk_git_unknown"
 ALLOWED_ALLOWED_PATHS_GATE_STATUSES = frozenset({"ok", "fail_closed", "indeterminate"})
+# Issue #1408 iteration-2 (P2): canonical push destination identity. New
+# branch initial publish (remote ref absent) is explicitly out of scope for
+# this bridge — see Issue #1449.
+CANONICAL_REPO_IDENTITY_DEFAULT = "squne121/loop-protocol"
+# Issue #1408 iteration-2 (P2): policy-level default branch destination
+# guard, independent of #360's hook-level destination guard.
+DEFAULT_BRANCH_NAMES = frozenset({"main", "master", "trunk"})
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_CANONICAL_REPO_URL_TEMPLATE = r"^(?:https://github\.com/|git@github\.com:){identity}(?:\.git)?/?$"
 
 
 @dataclass(frozen=True)
@@ -45,6 +59,7 @@ class GitMutationPolicyResult:
     remote_readback_source: str | None = None
     decision_inputs_complete: bool | None = None
     required_decisions: tuple[str, ...] = ()
+    boundary_layer: str | None = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +71,9 @@ class PublishGuardContext:
     allowed_paths_gate_status: str
     remote_readback_source: str
     decision_inputs_complete: bool
+    allowed_paths_gate_issue_number: str
+    allowed_paths_gate_base_sha: str
+    allowed_paths_gate_head_sha: str
 
 
 @dataclass(frozen=True)
@@ -241,7 +259,17 @@ def _remote_tracking_head(cwd: str, remote: str, branch: str) -> str | None:
     return oid or None
 
 
-def _ls_remote_head(cwd: str, remote: str, branch: str) -> str | None:
+def _ls_remote_head(cwd: str, remote: str, branch: str) -> tuple[str | None, bool]:
+    """Return `(oid, remote_absent)`.
+
+    `remote_absent=True` only when `git ls-remote --exit-code` confirms the
+    ref does not exist on the remote (returncode 2). Any other non-zero
+    returncode (network error, auth failure, etc.) is treated as an
+    indeterminate readback failure, not an absence signal (Issue #1408
+    iteration-2, P1: new-branch initial publish is out of scope — #1449 —
+    so an absent remote ref must be denied explicitly, not folded into the
+    generic `publish_guard_context_invalid` catch-all).
+    """
     try:
         result = subprocess.run(
             ["git", "ls-remote", "--refs", "--exit-code", remote, f"refs/heads/{branch}"],
@@ -252,12 +280,89 @@ def _ls_remote_head(cwd: str, remote: str, branch: str) -> str | None:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
+        return None, False
+    if result.returncode == 2:
+        return None, True
+    if result.returncode != 0:
+        return None, False
+    first = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+    oid = first.split()[0] if first else ""
+    if _SHA_RE.fullmatch(oid.lower()):
+        return oid.lower(), False
+    return None, False
+
+
+def _canonical_repo_identity() -> str:
+    return os.environ.get("LOOP_CANONICAL_REPO_IDENTITY", "").strip() or CANONICAL_REPO_IDENTITY_DEFAULT
+
+
+def _canonical_repo_url_pattern() -> re.Pattern[str]:
+    override = os.environ.get("LOOP_CANONICAL_REPO_URL_PATTERN", "").strip()
+    if override:
+        return re.compile(override)
+    identity = re.escape(_canonical_repo_identity())
+    return re.compile(_CANONICAL_REPO_URL_TEMPLATE.format(identity=identity))
+
+
+def _origin_push_urls(cwd: str) -> list[str] | None:
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "--push", "--all", "origin"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0:
         return None
-    first = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
-    oid = first.split()[0] if first else ""
-    return oid.lower() if _SHA_RE.fullmatch(oid.lower()) else None
+    urls = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return urls or None
+
+
+def _origin_push_urls_match_canonical_repo(cwd: str) -> bool:
+    """Verify every configured `origin` push URL resolves to the canonical
+    repository identity (Issue #1408 iteration-2, P2). Guards against
+    remote reconfiguration / `insteadOf` redirection pointing the push at a
+    different repository while the `origin` name and branch/head checks
+    still pass."""
+    urls = _origin_push_urls(cwd)
+    if not urls:
+        return False
+    pattern = _canonical_repo_url_pattern()
+    return all(pattern.match(url) for url in urls)
+
+
+def _resolve_default_branch_names(cwd: str) -> frozenset[str]:
+    """Return the set of branch names treated as protected default branches
+    for the push-target destination guard (Issue #1408 iteration-2, P2).
+    Independent of #360's hook-level destination guard — this is a
+    policy-internal regression backstop."""
+    names = set(DEFAULT_BRANCH_NAMES)
+    try:
+        result = subprocess.run(
+            ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        result = None
+    if result is not None and result.returncode == 0:
+        ref = result.stdout.strip()
+        prefix = "refs/remotes/origin/"
+        if ref.startswith(prefix):
+            resolved = ref[len(prefix) :]
+            if resolved:
+                names.add(resolved)
+    env_default = os.environ.get("LOOP_DEFAULT_BRANCH", "").strip()
+    if env_default:
+        names.add(env_default)
+    return frozenset(names)
 
 
 def _is_ancestor(cwd: str, ancestor: str, descendant: str) -> bool | None:
@@ -303,6 +408,12 @@ def _load_publish_guard_context() -> tuple[PublishGuardContext | None, str | Non
     verified_head = os.environ.get("LOOP_PUBLISH_VERIFIED_HEAD", "").strip().lower()
     allowed_paths_gate_status = os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS", "").strip().lower()
     remote_readback_source = os.environ.get("LOOP_PUBLISH_REMOTE_READBACK_SOURCE", "").strip().lower()
+    # Issue #1408 iteration-2 (P2): bind the Allowed Paths gate `status: ok`
+    # to the issue / base / head it was evaluated against, so a stale `ok`
+    # from a prior head or a different issue cannot be replayed.
+    allowed_paths_gate_issue_number = os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_ISSUE_NUMBER", "").strip()
+    allowed_paths_gate_base_sha = os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_BASE_SHA", "").strip().lower()
+    allowed_paths_gate_head_sha = os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_HEAD_SHA", "").strip().lower()
     fields = (
         expected_remote_head,
         current_remote_head,
@@ -310,6 +421,9 @@ def _load_publish_guard_context() -> tuple[PublishGuardContext | None, str | Non
         verified_head,
         allowed_paths_gate_status,
         remote_readback_source,
+        allowed_paths_gate_issue_number,
+        allowed_paths_gate_base_sha,
+        allowed_paths_gate_head_sha,
     )
     if not any(fields):
         return None, "publish_guard_context_missing"
@@ -320,12 +434,21 @@ def _load_publish_guard_context() -> tuple[PublishGuardContext | None, str | Non
         and _SHA_RE.fullmatch(current_remote_head or "")
         and _SHA_RE.fullmatch(declared_publish_head or "")
         and _SHA_RE.fullmatch(verified_head or "")
+        and _SHA_RE.fullmatch(allowed_paths_gate_base_sha or "")
+        and _SHA_RE.fullmatch(allowed_paths_gate_head_sha or "")
     ):
+        return None, "publish_guard_context_invalid"
+    if not allowed_paths_gate_issue_number.isdigit():
         return None, "publish_guard_context_invalid"
     if allowed_paths_gate_status not in ALLOWED_ALLOWED_PATHS_GATE_STATUSES:
         return None, "publish_guard_context_invalid"
     if remote_readback_source not in ALLOWED_REMOTE_READBACK_SOURCES:
         return None, "publish_guard_context_invalid"
+    # Note: the issue/base/head binding check (Issue #1408 iteration-2, P2)
+    # is performed in `classify_rtk_git_mutation` against the actual local
+    # HEAD (`_current_head`), not here — binding to the *real* HEAD (rather
+    # than the self-declared `declared_publish_head` / `verified_head`
+    # claims) keeps this check independent of `local_head_mismatch`.
     return PublishGuardContext(
         expected_remote_head=expected_remote_head,
         current_remote_head=current_remote_head,
@@ -334,6 +457,9 @@ def _load_publish_guard_context() -> tuple[PublishGuardContext | None, str | Non
         allowed_paths_gate_status=allowed_paths_gate_status,
         remote_readback_source=remote_readback_source,
         decision_inputs_complete=True,
+        allowed_paths_gate_issue_number=allowed_paths_gate_issue_number,
+        allowed_paths_gate_base_sha=allowed_paths_gate_base_sha,
+        allowed_paths_gate_head_sha=allowed_paths_gate_head_sha,
     ), None
 
 
@@ -471,6 +597,7 @@ def _publish_safety_stop_result(
     pr_number: str | None,
     remote_readback_source: str | None,
     decision_inputs_complete: bool,
+    boundary_layer: str,
 ) -> GitMutationPolicyResult:
     return GitMutationPolicyResult(
         status="deny",
@@ -495,6 +622,7 @@ def _publish_safety_stop_result(
             "PR branch を linked issue 専用 head へ戻す",
             "混入 commit を別 PR / 別 branch へ退避する",
         ),
+        boundary_layer=boundary_layer,
     )
 
 
@@ -503,8 +631,15 @@ def classify_rtk_git_mutation(
     *,
     cwd: str,
     require_active_branch_push: bool,
+    boundary_layer: str = "worktree_scope_guard_denied",
 ) -> GitMutationPolicyResult | None:
-    """Return a bounded policy result for recognized `rtk git` commands."""
+    """Return a bounded policy result for recognized `rtk git` commands.
+
+    `boundary_layer` identifies the PreToolUse-layer caller for
+    `PUBLISH_SAFETY_STOP_REPORT_V1`-shaped deny reasons (Issue #1408). It
+    defaults to the historical `worktree_scope_guard_denied` value used by
+    `.claude/hooks/worktree_scope_guard.py` so existing callers are unaffected.
+    """
     tokens = _tokenize(command)
     if not tokens:
         return None
@@ -628,6 +763,17 @@ def classify_rtk_git_mutation(
             suggested_command="rtk git push origin HEAD:refs/heads/<active-branch>",
             verification_command="git branch --show-current",
         )
+    # Issue #1408 iteration-2 (P2): policy-internal destination guard,
+    # independent of #360's hook-level default-branch destination guard.
+    if target_branch in _resolve_default_branch_names(cwd):
+        return GitMutationPolicyResult(
+            status="deny",
+            command_class=COMMAND_CLASS_RTK_GIT_PUSH,
+            reason_code="push_target_is_default_branch",
+            suggested_command="rtk git push origin HEAD:refs/heads/<active-branch>",
+            verification_command="git branch --show-current",
+            target_branch=target_branch,
+        )
     if require_active_branch_push:
         current = _current_branch(cwd)
         if not current or current != target_branch:
@@ -656,11 +802,55 @@ def classify_rtk_git_mutation(
             pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
             remote_readback_source=os.environ.get("LOOP_PUBLISH_REMOTE_READBACK_SOURCE", "").strip().lower(),
             decision_inputs_complete=False,
+            boundary_layer=boundary_layer,
         )
     if publish_guard is not None:
+        # Issue #1408 iteration-2 (P2): bind the Allowed Paths gate `ok` to
+        # this issue and to the *actual* local HEAD (not the self-declared
+        # `declared_publish_head` / `verified_head` claims), so a stale gate
+        # from a prior head or a different issue cannot be replayed.
+        loop_issue_number = os.environ.get("LOOP_ISSUE_NUMBER", "").strip()
+        if (
+            publish_guard.allowed_paths_gate_issue_number != loop_issue_number
+            or publish_guard.allowed_paths_gate_base_sha != publish_guard.expected_remote_head
+            or publish_guard.allowed_paths_gate_head_sha != (local_head or "")
+        ):
+            return _publish_safety_stop_result(
+                reason_code="allowed_paths_gate_binding_mismatch",
+                target_branch=target_branch,
+                expected_remote_head=publish_guard.expected_remote_head,
+                current_remote_head=publish_guard.current_remote_head,
+                local_head=local_head,
+                verified_head=publish_guard.verified_head,
+                declared_publish_head=publish_guard.declared_publish_head,
+                allowed_paths_gate_status=publish_guard.allowed_paths_gate_status,
+                pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+                remote_readback_source=publish_guard.remote_readback_source,
+                decision_inputs_complete=publish_guard.decision_inputs_complete,
+                boundary_layer=boundary_layer,
+            )
         current_remote_head = publish_guard.current_remote_head
         if publish_guard.remote_readback_source == "ls_remote":
-            live_remote_head = _ls_remote_head(cwd, "origin", target_branch)
+            live_remote_head, remote_absent = _ls_remote_head(cwd, "origin", target_branch)
+            if remote_absent:
+                # Issue #1408 iteration-2 (P1): new-branch initial publish
+                # (remote ref does not exist yet) is out of scope for this
+                # bridge — see #1449. Deny explicitly rather than folding
+                # into the generic publish_guard_context_invalid path.
+                return _publish_safety_stop_result(
+                    reason_code="remote_branch_absent_not_supported",
+                    target_branch=target_branch,
+                    expected_remote_head=publish_guard.expected_remote_head,
+                    current_remote_head=current_remote_head,
+                    local_head=local_head,
+                    verified_head=publish_guard.verified_head,
+                    declared_publish_head=publish_guard.declared_publish_head,
+                    allowed_paths_gate_status=publish_guard.allowed_paths_gate_status,
+                    pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+                    remote_readback_source=publish_guard.remote_readback_source,
+                    decision_inputs_complete=False,
+                    boundary_layer=boundary_layer,
+                )
             if not live_remote_head:
                 return _publish_safety_stop_result(
                     reason_code="publish_guard_context_invalid",
@@ -674,6 +864,7 @@ def classify_rtk_git_mutation(
                     pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
                     remote_readback_source=publish_guard.remote_readback_source,
                     decision_inputs_complete=False,
+                    boundary_layer=boundary_layer,
                 )
             current_remote_head = live_remote_head
         remote_drift_reason = None
@@ -696,7 +887,7 @@ def classify_rtk_git_mutation(
             remote_readback_source=publish_guard.remote_readback_source,
             decision_inputs_complete=publish_guard.decision_inputs_complete,
             remote_drift_reason=remote_drift_reason,
-            boundary_layer="worktree_scope_guard_denied",
+            boundary_layer=boundary_layer,
             issue_number=int(os.environ.get("LOOP_ISSUE_NUMBER", "0") or "0"),
             pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
         )
@@ -713,6 +904,26 @@ def classify_rtk_git_mutation(
                 pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
                 remote_readback_source=publish_guard.remote_readback_source,
                 decision_inputs_complete=publish_guard.decision_inputs_complete,
+                boundary_layer=boundary_layer,
+            )
+        # Issue #1408 iteration-2 (P2): verify the actual push destination
+        # (not just the `origin` remote *name*) resolves to the canonical
+        # repository before allowing the push. Guards against remote
+        # reconfiguration / `insteadOf` redirection to a different repo.
+        if not _origin_push_urls_match_canonical_repo(cwd):
+            return _publish_safety_stop_result(
+                reason_code="origin_remote_identity_mismatch",
+                target_branch=target_branch,
+                expected_remote_head=publish_guard.expected_remote_head,
+                current_remote_head=current_remote_head,
+                local_head=local_head,
+                verified_head=publish_guard.verified_head,
+                declared_publish_head=publish_guard.declared_publish_head,
+                allowed_paths_gate_status=publish_guard.allowed_paths_gate_status,
+                pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+                remote_readback_source=publish_guard.remote_readback_source,
+                decision_inputs_complete=publish_guard.decision_inputs_complete,
+                boundary_layer=boundary_layer,
             )
     return GitMutationPolicyResult(
         status="allow",
@@ -728,4 +939,79 @@ def classify_rtk_git_mutation(
         pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
         remote_readback_source=publish_guard.remote_readback_source,
         decision_inputs_complete=publish_guard.decision_inputs_complete,
+        boundary_layer=boundary_layer,
     )
+
+
+def _result_to_json(result: GitMutationPolicyResult | None) -> dict:
+    """Serialize a `classify_rtk_git_mutation` result for the `--json` CLI mode
+    (Issue #1408: consumed by `scripts/session-recording/codex-hook-adapter.mjs`
+    so the PreToolUse publish-lane decision is not re-implemented in JS)."""
+    if result is None:
+        return {"status": "no_match"}
+    return {
+        "status": result.status,
+        "command_class": result.command_class,
+        "reason_code": result.reason_code,
+        "suggested_command": result.suggested_command,
+        "verification_command": result.verification_command,
+        "expected_remote_head": result.expected_remote_head,
+        "current_remote_head": result.current_remote_head,
+        "local_head": result.local_head,
+        "verified_head": result.verified_head,
+        "declared_publish_head": result.declared_publish_head,
+        "allowed_paths_gate_status": result.allowed_paths_gate_status,
+        "target_branch": result.target_branch,
+        "pr_number": result.pr_number,
+        "remote_readback_source": result.remote_readback_source,
+        "decision_inputs_complete": result.decision_inputs_complete,
+        "required_decisions": list(result.required_decisions),
+        "boundary_layer": result.boundary_layer,
+    }
+
+
+def _build_cli_parser():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Classify a single command via classify_rtk_git_mutation and print the "
+            "result as JSON. Non-`rtk git` commands and unrecognized shapes print "
+            '{"status": "no_match"}. This CLI wrapper is the single reuse surface for '
+            "non-Python callers (Issue #1408) — it does not re-implement policy logic."
+        )
+    )
+    parser.add_argument("--command", required=True, help="the shell command string to classify")
+    parser.add_argument("--cwd", required=True, help="working directory the command would run in")
+    parser.add_argument(
+        "--boundary-layer",
+        default="worktree_scope_guard_denied",
+        help="caller identifier embedded in safety-stop deny results (default: worktree_scope_guard_denied)",
+    )
+    parser.add_argument(
+        "--no-require-active-branch-push",
+        action="store_true",
+        help="disable the require_active_branch_push check (default: enabled)",
+    )
+    return parser
+
+
+def _main(argv: list[str] | None = None) -> int:
+    import json as json_module
+    import sys
+
+    args = _build_cli_parser().parse_args(argv if argv is not None else sys.argv[1:])
+    result = classify_rtk_git_mutation(
+        args.command,
+        cwd=args.cwd,
+        require_active_branch_push=not args.no_require_active_branch_push,
+        boundary_layer=args.boundary_layer,
+    )
+    print(json_module.dumps(_result_to_json(result)))
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    raise SystemExit(_main(sys.argv[1:]))

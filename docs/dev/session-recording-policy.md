@@ -65,6 +65,41 @@ Codex CLI は同一 event に matching する複数の command hooks を **concu
 - **#360（destination guard policy）**: remote write の許可 policy 自体の見直しは #360 が担当する。本 #783 は deny reason の分類整理のみ。`remote_write_requires_approval` を自動許可に変更する設計は #360 スコープ。
 - **#639（PR body mutation enforcement）**: PR body の mutation 強制実装は #639 が担当する。本 #783 は hook output shape の整形のみ。
 
+### publish lane approval bridge（#1408・#360 との責務差分）
+
+- **#360（destination guard policy）**: main/master への push destination そのものを拒否する汎用 guard。判定対象は push 先ブランチであり、証跡の有無に関わらず適用される。本境界は #1408 実装後も変更しない。
+- **publish lane approval bridge（#1408）**: `codex-hook-adapter.mjs` の PreToolUse remote write 判定に限定して追加された、狭い bypass 経路。`rtk git push origin HEAD:refs/heads/<active-branch>` かつ `scripts/agent-guards/git_mutation_command_policy.py` の bounded policy（expected/current/local/verified/declared head 比較、`LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS`）が `status: allow` を返した場合のみ、generic `remote_write_requires_approval` deny を経由せず通過する。安全判定ロジック自体は `git_mutation_command_policy.py` の再利用であり、hook adapter 側に別実装の安全判定は追加していない。
+- force/tag/all/delete/mirror push、直接 `git push`、`git -C <dir> push`、wrapper bypass は publish lane approval bridge の対象外であり、引き続き deny される（#360 の destination guard および既存 deny reason taxonomy がそのまま適用される）。
+- **スコープ縮小（#1408 アドバーサリアルレビュー iteration 2 反映）**: 本 bridge は **既存 remote branch の更新（fast-forward push）のみ**を対象とする。remote 上にブランチが存在しない新規 branch の初回 publish は本 PR のスコープ外であり、別 Issue #1449 に切り出した。`git_mutation_command_policy.py` は remote ref 不在を `_ls_remote_head` の `git ls-remote --exit-code` 非ゼロ終了（returncode 2）から明示的に判別し、`remote_branch_absent_not_supported` として deny する。
+- **`remote_readback_source` は `ls_remote` のみを認可**する。`github_branch_api` / `fetch_then_show_ref` は実際に remote を再読込みせず環境変数値をそのまま信用する自己申告ラベルだったため、`publish_guard_context_invalid` として deny する。
+- push 実行前に `git remote get-url --push --all origin` 相当で push URL を取得し、canonical repository identity（`squne121/loop-protocol`）と一致することを検証する。不一致（別 repository への push URL、`insteadOf` 等での向け替えを含む）は `origin_remote_identity_mismatch` として deny する。
+- policy 自身（`classify_rtk_git_mutation`）が push 先ブランチ（解決済み `origin/HEAD`、`LOOP_DEFAULT_BRANCH` を含む default branch 名 `main` / `master` / `trunk`）である場合に `push_target_is_default_branch` で deny する回帰も追加した（#360 の destination guard に独立して重ねる防御）。
+- Allowed Paths gate の `status: ok` は issue_number（`LOOP_ISSUE_NUMBER`）/ base_sha（`expected_remote_head`）/ head_sha（`local_head` と一致する `declared_publish_head` / `verified_head`）に bind する。`LOOP_PUBLISH_ALLOWED_PATHS_GATE_ISSUE_NUMBER` / `LOOP_PUBLISH_ALLOWED_PATHS_GATE_BASE_SHA` / `LOOP_PUBLISH_ALLOWED_PATHS_GATE_HEAD_SHA` が実際の issue / expected remote head / local head と一致しない場合は `allowed_paths_gate_binding_mismatch` として deny し、過去の head や別 issue で得た `ok` の再利用を防ぐ。
+
+### command structure classification（コマンド構造分類）と #1408 publish lane authorization（公開レーン認可）の責務分離（#1428）
+
+`codex-hook-adapter.mjs` の `classifyRemoteWrite(command)` は、raw command 文字列全体への
+正規表現 substring match ではなく、`scripts/agent-guards/shell_command_analysis.py`
+（`SHELL_COMMAND_ANALYSIS_V1`）が返す **command structure classification** を基準に
+`git push` / `rtk git push` を判定する（#1428）。
+
+- **本 responsibility（command structure classification, #1428）**: シェル上で実際に実行される
+  simple command を、quoted argument・検索キーワード・heredoc data 等の非実行データと区別し、
+  `command_kind`（`git_push` / `rtk_git_push`）・`execution_context`（`top_level` /
+  `list` / `pipeline` / `command_substitution` / `execution_carrier` 等）を機械可読な enum
+  として返す。静的に literal と確定できない command word / subcommand（dynamic executable、
+  `find -exec` / `xargs` 等の未対応 execution carrier を含む）は `status: indeterminate` として
+  fail-closed に扱い、remote write classifier は allow に倒さない。
+- **#1408 の responsibility（publish lane authorization）**: `rtk git push` と判定された command
+  について、実際に push を許可するかどうかの最終判断（`scripts/agent-guards/git_mutation_command_policy.py`
+  の `classify_rtk_git_mutation` / publish guard context 検証）は `#1408` が担当する。本 #1428 は
+  publish lane の allow / deny 条件そのものを変更しない。
+- `git_mutation_command_policy.py` の外部 API（`classify_rtk_git_mutation` シグネチャ）は #1428 の
+  スコープでは変更しない。同 module は raw command 文字列を独自に `shlex.split` で再 tokenize し
+  続けるが、両 module は互いに独立した trust boundary 内で raw command の再解析を行うのみであり、
+  #1428 の analyzer 出力を #1408 の policy へ直接受け渡す配線変更は本 Issue のスコープ外
+  （split-brain regression は `scripts/agent-guards/tests/test_shell_command_analysis.py` で固定）。
+
 ---
 
 ## codex exec live smoke（diagnostic-only、#783 追加・診断限定）
