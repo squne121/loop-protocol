@@ -15,6 +15,7 @@ with a PreToolUse-shaped stdin payload.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import importlib.util as _ilu
@@ -2608,8 +2609,15 @@ def _add_guard_paths(mod, guard_py):
 
 def test_publish_lane_push_allowed_when_remote_and_reviewed_heads_match(tmp_path):
     repo = _make_repo_with_worktree(tmp_path, issue="942")
-    _git("update-ref", "refs/remotes/origin/issue-942-x", "HEAD", cwd=repo["worktree"])
+    # Issue #1408 iteration-2: remote_readback_source is restricted to
+    # `ls_remote`, which performs a live `git ls-remote` against `origin`
+    # instead of trusting a self-declared `refs/remotes/origin/*` ref. Point
+    # `origin` at a real local bare repo so the live readback succeeds.
+    remote_bare = tmp_path / "origin.git"
+    _git("init", "--bare", "-q", str(remote_bare), cwd=tmp_path)
+    _git("remote", "set-url", "origin", str(remote_bare), cwd=repo["worktree"])
     head = _git("rev-parse", "HEAD", cwd=repo["worktree"]).stdout.strip()
+    _git("push", "-q", "origin", "HEAD:refs/heads/issue-942-x", cwd=repo["worktree"])
     payload = {
         "tool_name": "Bash",
         "tool_input": {"command": "rtk git " + "push origin HEAD:refs/heads/issue-942-x"},
@@ -2625,7 +2633,11 @@ def test_publish_lane_push_allowed_when_remote_and_reviewed_heads_match(tmp_path
             "LOOP_PUBLISH_DECLARED_PUBLISH_HEAD": head,
             "LOOP_PUBLISH_VERIFIED_HEAD": head,
             "LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS": "ok",
-            "LOOP_PUBLISH_REMOTE_READBACK_SOURCE": "fetch_then_show_ref",
+            "LOOP_PUBLISH_REMOTE_READBACK_SOURCE": "ls_remote",
+            "LOOP_PUBLISH_ALLOWED_PATHS_GATE_ISSUE_NUMBER": "942",
+            "LOOP_PUBLISH_ALLOWED_PATHS_GATE_BASE_SHA": head,
+            "LOOP_PUBLISH_ALLOWED_PATHS_GATE_HEAD_SHA": head,
+            "LOOP_CANONICAL_REPO_URL_PATTERN": "^" + re.escape(str(remote_bare)) + "$",
         },
     )
     assert r.returncode == 0, r.stderr
@@ -2648,14 +2660,24 @@ def test_publish_lane_push_denies_missing_strict_context(tmp_path):
 
 def test_publish_lane_push_emits_safety_stop_report_for_fast_forward_remote_head(tmp_path):
     repo = _make_repo_with_worktree(tmp_path, issue="942")
+    # Issue #1408 iteration-2: remote_readback_source is restricted to
+    # `ls_remote`, which performs a live `git ls-remote` against `origin`
+    # instead of trusting a self-declared `refs/remotes/origin/*` ref. Point
+    # `origin` at a real local bare repo so the live readback observes the
+    # fast-forwarded remote_head pushed below (simulating another agent
+    # publishing to the same scope ahead of this push attempt).
+    remote_bare = tmp_path / "origin.git"
+    _git("init", "--bare", "-q", str(remote_bare), cwd=tmp_path)
+    _git("remote", "set-url", "origin", str(remote_bare), cwd=repo["worktree"])
     expected_head = _git("rev-parse", "HEAD", cwd=repo["worktree"]).stdout.strip()
+    _git("push", "-q", "origin", "HEAD:refs/heads/issue-942-x", cwd=repo["worktree"])
     main = repo["root"]
     (main / "README.md").write_text("next\n")
     _git("add", "README.md", cwd=main)
     _git("commit", "-q", "-m", "next", cwd=main)
     remote_head = _git("rev-parse", "HEAD", cwd=main).stdout.strip()
+    _git("push", "-q", "origin", "HEAD:refs/heads/issue-942-x", cwd=main)
     _git("reset", "--hard", expected_head, cwd=repo["worktree"])
-    _git("update-ref", "refs/remotes/origin/issue-942-x", remote_head, cwd=repo["worktree"])
     payload = {
         "tool_name": "Bash",
         "tool_input": {"command": "rtk git " + "push origin HEAD:refs/heads/issue-942-x"},
@@ -2671,8 +2693,12 @@ def test_publish_lane_push_emits_safety_stop_report_for_fast_forward_remote_head
             "LOOP_PUBLISH_DECLARED_PUBLISH_HEAD": expected_head,
             "LOOP_PUBLISH_VERIFIED_HEAD": expected_head,
             "LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS": "ok",
-            "LOOP_PUBLISH_REMOTE_READBACK_SOURCE": "fetch_then_show_ref",
+            "LOOP_PUBLISH_REMOTE_READBACK_SOURCE": "ls_remote",
+            "LOOP_PUBLISH_ALLOWED_PATHS_GATE_ISSUE_NUMBER": "942",
+            "LOOP_PUBLISH_ALLOWED_PATHS_GATE_BASE_SHA": expected_head,
+            "LOOP_PUBLISH_ALLOWED_PATHS_GATE_HEAD_SHA": expected_head,
             "LOOP_PR_NUMBER": "1410",
+            "LOOP_CANONICAL_REPO_URL_PATTERN": "^" + re.escape(str(remote_bare)) + "$",
         },
     )
     assert r.returncode == 2, r.stderr
@@ -2680,7 +2706,7 @@ def test_publish_lane_push_emits_safety_stop_report_for_fast_forward_remote_head
     assert "remote_fast_forward_by_same_scope" in r.stderr
     assert 'pr_number: "1410"' in r.stderr
     assert "declared_publish_head" in r.stderr
-    assert 'remote_readback_source: "fetch_then_show_ref"' in r.stderr
+    assert 'remote_readback_source: "ls_remote"' in r.stderr
     assert "decision_inputs_complete: true" in r.stderr
     assert expected_head in r.stderr
     assert remote_head in r.stderr

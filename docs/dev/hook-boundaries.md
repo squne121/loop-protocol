@@ -705,3 +705,7 @@ SESSION_MANIFEST_LEGACY_SCAN_V1:
 `session_manifest_debounce.mjs` の flush loop は、producer 呼び出しが失敗（非 0 exit または timeout）した場合、対象の queued event ファイルを削除しない。次回の flush 試行で再試行される。
 
 ---
+
+## 12. publish lane authorization trust root（historical note）
+
+Issue #1454（Phase A, PR #1457 MERGED）で `scripts/trust-root` 一式（`trusted_hook_launcher.py` / `manifest_schema.py` / `install_trust_root.sh`）が external trust root として導入されたが、これを `.codex/hooks.json` へ実際に配線する Issue #1450（Phase B）と、追加ハードニングを扱う Issue #1468 がいずれも個人開発の脅威モデルに対して過剰と判断され not planned でクローズされた。配線先を失った `scripts/trust-root` は不使用コードとなったため、Issue #1469 でコード一式・CI 登録・本節の bootstrap/rotation/managed hook registration 手順を削除した。現行の publish lane 保護は Issue #1408（PR #1442 MERGED、Issue branch 限定 push 許可・force/tag/delete/mirror 拒否）と main branch protection（Issue #360）のみで構成される。

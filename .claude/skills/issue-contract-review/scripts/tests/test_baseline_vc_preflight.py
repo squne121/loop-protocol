@@ -9,6 +9,150 @@ import sys
 from pathlib import Path
 import tempfile
 
+
+def test_current_head_evidence_certifies_clean_temporary_repository():
+    """GIVEN clean temporary Git repo WHEN current-head evidence is observed THEN it is certified."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import collect_current_head_evidence
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        repo = Path(temp_dir)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+        (repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+        head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+        evidence = collect_current_head_evidence(str(repo), head)
+
+    assert evidence["certified"] is True
+    assert evidence["head_sha"] == head
+    assert evidence["reviewed_head_sha"] == head
+    assert evidence["clean_before"] is True
+
+
+def test_current_head_evidence_rejects_dirty_temporary_repository():
+    """GIVEN dirty temporary Git repo WHEN current-head evidence is observed THEN it is blocked."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import collect_current_head_evidence
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        repo = Path(temp_dir)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+        (repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+        head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        (repo / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+
+        evidence = collect_current_head_evidence(str(repo), head)
+
+    assert evidence["certified"] is False
+    assert evidence["clean_before"] is False
+    assert evidence["stop_condition_triggered"] is True
+
+
+def test_current_head_evidence_rejects_abbreviated_oid_and_symbolic_ref():
+    """GIVEN non-full revision inputs WHEN evidence is observed THEN certification fails closed."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import collect_current_head_evidence
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        repo = Path(temp_dir)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+        (repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+        head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+        abbreviated = collect_current_head_evidence(str(repo), head[:12])
+        symbolic = collect_current_head_evidence(str(repo), "HEAD")
+
+    assert abbreviated["certified"] is False
+    assert "reviewed_head_sha_not_full_oid" in abbreviated["errors"]
+    assert symbolic["certified"] is False
+    assert "reviewed_head_sha_not_full_oid" in symbolic["errors"]
+
+
+def test_finalize_dirty_after_execution_blocks_and_maps_to_nonzero_exit():
+    """GIVEN certified before evidence WHEN worktree becomes dirty THEN final status exits non-zero."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import (
+        collect_current_head_evidence,
+        exit_code_for_status,
+        finalize_current_head_evidence,
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        repo = Path(temp_dir)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+        (repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+        head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        evidence = collect_current_head_evidence(str(repo), head)
+        (repo / "tracked.txt").write_text("dirty after\n", encoding="utf-8")
+
+        finalized = finalize_current_head_evidence(str(repo), evidence)
+        final_status = "pass" if finalized["certified"] else "blocked"
+
+    assert finalized["clean_before"] is True
+    assert finalized["clean_after"] is False
+    assert finalized["certified"] is False
+    assert exit_code_for_status(final_status) == 1
+
+
+def test_current_head_retrieval_failure_finalizes_blocked_safety_fields():
+    """GIVEN retrieval failure WHEN current-head CLI emits JSON THEN stop condition is true."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        repo = Path(temp_dir)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+        (repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+        head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(script_path),
+                "--body-file",
+                str(repo / "missing-issue.md"),
+                "--cwd",
+                str(repo),
+                "--evidence-mode",
+                "current-head",
+                "--reviewed-head-sha",
+                head,
+                "--format",
+                "json",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    payload = json.loads(completed.stdout)
+    assert completed.returncode != 0
+    assert payload["status"] == "blocked"
+    assert payload["stop_condition_triggered"] is True
+    assert payload["human_review_required"] is False
+
 try:
     import pytest
     HAS_PYTEST = True

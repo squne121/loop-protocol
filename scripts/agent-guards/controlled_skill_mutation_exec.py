@@ -96,6 +96,9 @@ _ENSURE_CONTRACT_SNAPSHOT_REL = (
 _RUN_CONTRACT_REVIEW_ONCE_REL = (
     ".claude/skills/issue-contract-review/scripts/run_contract_review_once.py"
 )
+_EVALUATE_PRODUCT_SPEC_GATE_REL = (
+    ".claude/skills/impl-review-loop/scripts/evaluate_product_spec_gate.py"
+)
 _CONTRACT_REVIEW_RESULT_PARSER_REL = (
     ".claude/skills/issue-contract-review/scripts/contract_review_result_parser.py"
 )
@@ -203,21 +206,33 @@ def _check_contract_snapshot_module_realpaths(project_root: Path) -> list[str]:
     publisher module chain. Missing modules are treated as errors (missing=deny),
     mirroring _check_module_realpaths() for the legacy termination_report.publish
     command.
+
+    Issue #1459 review Blocker (evaluator_missing_from_module_trust_chain):
+    evaluate_product_spec_gate.py is imported by ensure_contract_snapshot.py at
+    module load time, so it is part of the trusted publisher module chain and
+    must be realpath-checked here too -- otherwise a repo-external symlink
+    shadowing that evaluator would run unchecked before the publisher even
+    starts. Path ancestry is decided with Path.is_relative_to() against the
+    resolved project root rather than a raw str.startswith() prefix check,
+    which would also treat a sibling directory such as
+    "/repo-evil/..." as "under" "/repo" purely by string-prefix coincidence.
     """
     errors = []
+    resolved_project_root = project_root.resolve()
     for rel in (
         _ENSURE_CONTRACT_SNAPSHOT_REL,
         _RUN_CONTRACT_REVIEW_ONCE_REL,
+        _EVALUATE_PRODUCT_SPEC_GATE_REL,
         _CONTRACT_REVIEW_RESULT_PARSER_REL,
     ):
         canonical = (project_root / rel).resolve()
         if not canonical.exists():
             errors.append(f"module_missing: {rel} not found at {canonical}")
             continue
-        if not str(canonical).startswith(str(project_root)):
+        if not canonical.is_relative_to(resolved_project_root):
             errors.append(
                 f"module_shadowing: {rel} resolved to {canonical}, "
-                f"expected under {project_root}"
+                f"expected under {resolved_project_root}"
             )
     return errors
 
@@ -1232,6 +1247,144 @@ def _readback_by_marker_literal(marker_literal: str, issue_number: int, repo: st
         return {"error": f"readback_exception:{exc}"}
 
 
+_ISSUECOMMENT_ID_RE = _re.compile(r"#issuecomment-(\d+)$")
+
+
+def _extract_comment_id_from_url(url: str) -> str | None:
+    """Extract the numeric comment id from a GitHub `#issuecomment-<id>` URL."""
+    if not url:
+        return None
+    m = _ISSUECOMMENT_ID_RE.search(url)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _fetch_single_comment_by_id(comment_id: str, repo: str, gh_bin: str) -> dict:
+    """Fetch exactly one comment by id (not a marker search across all comments)."""
+    try:
+        out = subprocess.run(
+            [
+                gh_bin, "api", f"repos/{repo}/issues/comments/{comment_id}",
+                "--jq", "{id, html_url, created_at, updated_at, body}",
+            ],
+            capture_output=True, text=True, timeout=15, shell=False,
+        )
+        if out.returncode != 0:
+            return {"error": f"comment_fetch_failed_rc_{out.returncode}"}
+        return {"comment": json.loads(out.stdout)}
+    except Exception as exc:
+        return {"error": f"comment_fetch_exception:{exc}"}
+
+
+def _readback_contract_snapshot(
+    marker_literal: str,
+    issue_number: int,
+    repo: str,
+    gh_bin: str,
+    expected_url: str,
+    expected_body_sha256: str,
+) -> dict:
+    """Verify the posted snapshot against remote comment state, not child stdout.
+
+    Issue #1459 review Blocker (legacy_refresh_duplicate_marker_deadlock): the
+    idempotency marker is derived from (issue, body_sha256, schema) only, so a
+    stale legacy go comment can share the exact same marker text as the fresh
+    comment the publisher just posted. Searching all comments for a *unique*
+    marker match therefore deadlocks permanently once both comments coexist.
+    This function instead selects the single comment the publisher itself
+    reported posting (by the comment id parsed from expected_url / html_url)
+    and verifies marker/YAML/is_go_current against that one comment only.
+    Global marker uniqueness across the whole comment list is not required.
+    """
+    try:
+        comment_id = _extract_comment_id_from_url(expected_url)
+        if not comment_id:
+            return {"error": "contract_snapshot_url_missing_comment_id"}
+
+        fetched = _fetch_single_comment_by_id(comment_id, repo, gh_bin)
+        if "error" in fetched:
+            return {"error": fetched["error"]}
+        comment = fetched["comment"]
+        if comment.get("html_url") != expected_url:
+            return {"error": "remote_contract_snapshot_url_mismatch"}
+        body = comment.get("body", "") or ""
+        if marker_literal not in body:
+            return {"error": "expected_contract_marker_not_embedded_in_selected_comment"}
+
+        import importlib.util
+
+        parser_path = PROJECT_ROOT / ".claude/skills/issue-contract-review/scripts/contract_review_result_parser.py"
+        parser_spec = importlib.util.spec_from_file_location("contract_review_result_parser", parser_path)
+        ensure_path = PROJECT_ROOT / _ENSURE_CONTRACT_SNAPSHOT_REL
+        ensure_spec = importlib.util.spec_from_file_location("ensure_contract_snapshot", ensure_path)
+        if not parser_spec or not parser_spec.loader or not ensure_spec or not ensure_spec.loader:
+            return {"error": "contract_snapshot_readback_import_error"}
+        parser_mod = importlib.util.module_from_spec(parser_spec)
+        parser_spec.loader.exec_module(parser_mod)
+        ensure_mod = importlib.util.module_from_spec(ensure_spec)
+        ensure_spec.loader.exec_module(ensure_mod)
+        issue_url = f"https://github.com/{repo}/issues/{issue_number}"
+        results = parser_mod.parse_contract_review_results([comment], issue_url)
+        snapshot = parser_mod.find_latest_go(results)
+        if snapshot is None or not ensure_mod.is_go_current(snapshot, expected_body_sha256):
+            return {"error": "remote_contract_snapshot_not_current"}
+
+        # -- Issue #1459 review Blocker (post_publish_live_body_not_revalidated) --
+        # The checks above only prove the *posted comment* is bound to
+        # expected_body_sha256. They do not prove the *live* Issue body still
+        # matches that hash at readback time -- a concurrent body edit between
+        # the pre-publish check and this readback must not be reported as
+        # success. Re-fetch the live body and require it to match the input
+        # hash, the outer (comment-bound) hash, and the nested product-spec
+        # hash carried inside the just-verified snapshot -- all three must
+        # agree, not just the outer one.
+        live_body, _live_updated_at, live_body_err = _fetch_issue_body_and_updated_at(
+            issue_number, repo, gh_bin
+        )
+        if live_body_err:
+            return {
+                "error": f"failed_after_mutation:live_body_refetch_error:{live_body_err}",
+                "comment_id": comment.get("id", ""),
+                "comment_url": comment.get("html_url", ""),
+            }
+        live_body_sha256 = "sha256:" + hashlib.sha256(
+            (live_body or "").encode("utf-8")
+        ).hexdigest()
+        inner = snapshot.get("inner") if isinstance(snapshot, dict) else None
+        checks = inner.get("checks") if isinstance(inner, dict) else None
+        product_spec_check = (
+            checks.get("product_spec_check") if isinstance(checks, dict) else None
+        )
+        nested_product_spec_sha256 = (
+            product_spec_check.get("body_sha256")
+            if isinstance(product_spec_check, dict)
+            else None
+        )
+        hashes_to_check = {
+            "expected_body_sha256": expected_body_sha256,
+            "live_body_sha256": live_body_sha256,
+            "nested_product_spec_body_sha256": nested_product_spec_sha256,
+        }
+        if len(set(hashes_to_check.values())) != 1:
+            return {
+                "error": (
+                    "failed_after_mutation:live_body_hash_mismatch:"
+                    f"{json.dumps(hashes_to_check, sort_keys=True)}"
+                ),
+                "comment_id": comment.get("id", ""),
+                "comment_url": comment.get("html_url", ""),
+            }
+
+        return {
+            "comment_id": comment.get("id", ""),
+            "comment_url": comment.get("html_url", ""),
+            "remote_postcondition_verified": True,
+        }
+    except Exception as exc:
+        return {"error": f"remote_contract_snapshot_readback_exception:{exc}"}
+
+
 def _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok) -> int:
     # -- Blocker 4: input schema binding (repo / target_issue_body_sha256 /
     # expected_latest_contract_review_status / expected_contract_marker /
@@ -1314,6 +1467,26 @@ def _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok) -> int:
             status="failed",
         )
 
+    readback = _readback_contract_snapshot(
+        input_data["expected_contract_marker"],
+        args.issue_number,
+        args.repo,
+        gh_bin,
+        pub_result["contract_snapshot_url"],
+        input_data["target_issue_body_sha256"],
+    )
+    if "error" in readback:
+        # The publisher's POST already happened (a remote side effect exists).
+        # Preserve the posted URL/comment id as evidence even on failure so the
+        # caller can locate and reconcile the mutation instead of only seeing
+        # an opaque error string.
+        evidence = [readback["error"]]
+        if readback.get("comment_url"):
+            evidence.append(f"posted_comment_url: {readback['comment_url']}")
+        if readback.get("comment_id"):
+            evidence.append(f"posted_comment_id: {readback['comment_id']}")
+        return _fail(readback["error"], evidence, status="failed")
+
     # -- AC14 / Blocker 6: postcondition -- no changes outside this command's
     # own write root (artifacts/{issue}/issue-metadata/contract_snapshot.publish/).
     changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
@@ -1325,9 +1498,10 @@ def _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok) -> int:
         )
 
     return _ok({
-        "contract_snapshot_url": pub_result["contract_snapshot_url"],
+        "contract_snapshot_url": readback["comment_url"],
         "post_status": pub_result.get("post_status"),
-        "idempotency_marker_written": True,
+        "remote_postcondition_verified": True,
+        "idempotency_marker_written": False,
     })
 
 

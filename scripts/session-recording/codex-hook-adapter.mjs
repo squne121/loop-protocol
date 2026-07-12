@@ -10,6 +10,12 @@ import { verifyCodexPostRun } from './codex-postrun-verifier.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const repoRoot = resolve(__dirname, '..', '..')
+// Issue #1408: single reuse surface for the publish-lane bounded policy. The
+// safety decision itself (expected/current/local/verified/declared head
+// comparison, allowed_paths_gate_status, force/tag/all/delete/mirror deny)
+// lives in scripts/agent-guards/git_mutation_command_policy.py and MUST NOT be
+// re-implemented here — see In Scope in Issue #1408.
+const gitMutationPolicyScript = resolve(repoRoot, 'scripts', 'agent-guards', 'git_mutation_command_policy.py')
 const defaultProducerScript = resolve(repoRoot, 'scripts', 'generate-session-manifest.mjs')
 const configuredProducerScript = process.env.CODEX_SESSION_RECORDING_PRODUCER
   ? resolve(process.env.CODEX_SESSION_RECORDING_PRODUCER)
@@ -254,6 +260,17 @@ async function readJsonFromStdin() {
   return JSON.parse(text)
 }
 
+function getCommand(payload) {
+  return String(payload?.tool_input?.command ?? payload?.tool_input?.description ?? '')
+}
+
+/** Issue #1408: cwd used for the publish-lane bounded policy classification.
+ *  Falls back to the hook process's own cwd (which Codex sets to the tool
+ *  invocation's working directory) when the payload does not carry one. */
+function getCwd(payload) {
+  return String(payload?.cwd ?? process.cwd())
+}
+
 function sanitizeStopReason(eventName) {
   return `${eventName}: Codex session recording failed; see private local log.`
 }
@@ -324,6 +341,44 @@ function classifyRemoteWrite(command) {
     return { reason_code: 'remote_write_requires_approval', command_kind: pushCommand.command_kind }
   }
   return null
+}
+
+/** Issue #1408 AC1/AC3/AC4: does `command` look like an `rtk git push` invocation
+ *  (as opposed to a raw `git push` / `git -C <dir> push` / wrapper-bypass variant)?
+ *  This is a narrow shape check only — it decides whether the publish-lane bounded
+ *  policy CLI should be consulted at all; the policy itself owns every safety
+ *  decision (force/tag/all/delete/mirror deny, head mismatch, allowed_paths gate). */
+function looksLikeRtkGitPush(command) {
+  return /^\s*rtk\s+git\s+push\b/.test(command)
+}
+
+/** Issue #1408 AC1/AC3: delegate the publish-lane safety decision for an
+ *  `rtk git push origin HEAD:refs/heads/<active-branch>` command to the shared
+ *  bounded policy in scripts/agent-guards/git_mutation_command_policy.py
+ *  (single source of truth — see Issue #1402 / #1408 In Scope). Returns the
+ *  parsed policy JSON, or null when the policy CLI is unavailable or the
+ *  command does not match a recognized `rtk git` shape (fail-closed: callers
+ *  keep the generic remote_write_requires_approval deny in that case). */
+function classifyRtkGitPushPublishLane(command, cwd) {
+  try {
+    const stdout = execFileSync('python3', [
+      gitMutationPolicyScript,
+      '--command', command,
+      '--cwd', cwd,
+      '--boundary-layer', 'codex_hook_adapter_pretooluse',
+    ], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 10_000,
+    })
+    const parsed = JSON.parse(stdout)
+    if (parsed && typeof parsed === 'object' && parsed.status && parsed.status !== 'no_match') {
+      return parsed
+    }
+    return null
+  } catch {
+    return null
+  }
 }
 
 /** AC2: read-only investigation commands that must NOT be blocked.
@@ -492,6 +547,73 @@ function evaluateGuard(payload, eventName) {
   // AC4: remote write - no_decision on PermissionRequest, deny on PreToolUse
   const remoteWriteDenial = classifyRemoteWrite(command)
   if (remoteWriteDenial) {
+    // Issue #1408 AC1/AC3/AC4: `rtk git push origin HEAD:refs/heads/<active-branch>`
+    // with validated publish lane evidence bypasses the generic deny below. The
+    // bounded decision is delegated to git_mutation_command_policy.py (single
+    // source of truth) rather than re-implemented here. Raw `git push`,
+    // `git -C <dir> push`, and wrapper-bypass variants never reach this branch
+    // (looksLikeRtkGitPush returns false) and keep the existing deny (AC2).
+    if (looksLikeRtkGitPush(command)) {
+      const publishLane = classifyRtkGitPushPublishLane(command, getCwd(payload))
+      if (publishLane && publishLane.status === 'allow') {
+        // AC1: validated publish lane evidence — no denial, command passes through.
+        return null
+      }
+      // Issue #1449 (PR #1479 OWNER review, P1 Blocker 1): the
+      // initial_branch_create lane NEVER returns `allow` — the real
+      // probe -> push -> readback transaction already ran synchronously
+      // inside `classify_rtk_git_mutation` (via
+      // `execute_initial_branch_create_transaction`), so the raw shell
+      // command that triggered this hook is always denied afterward (it
+      // would otherwise attempt a redundant/racy second push against the
+      // same empty-expect lease). `reason_code` distinguishes an actual
+      // completed-and-verified publish from a genuine safety stop.
+      if (publishLane && publishLane.command_class === 'rtk_git_initial_branch_create') {
+        const preview = redactCommandPreview(rawCommand)
+        const remoteStateDetail = publishLane.remote_state_detail ?? {}
+        return {
+          action: 'deny',
+          reason_code: 'initial_branch_create_transaction_result',
+          command_kind: publishLane.command_class,
+          message: `${eventName}: initial_branch_create_transaction_result `
+            + `[transaction_status=${publishLane.reason_code}] `
+            + `[remote_state=${remoteStateDetail.kind ?? publishLane.remote_state}] `
+            + `[remote_oid=${remoteStateDetail.oid ?? 'null'}] `
+            + `[error_category=${remoteStateDetail.error_category ?? 'null'}] `
+            + `[local_head=${publishLane.local_head}] `
+            + `blocked_command_preview="${preview}" `
+            + '(the trusted transaction already executed the probe/push/readback — '
+            + 'do not retry the raw command; inspect transaction_status above)',
+        }
+      }
+      if (publishLane && publishLane.status === 'deny') {
+        // AC3: PUBLISH_SAFETY_STOP_REPORT_V1-shaped reason — boundary_layer /
+        // reason_code / head comparison values / required decisions.
+        const preview = redactCommandPreview(rawCommand)
+        const requiredDecisions = Array.isArray(publishLane.required_decisions)
+          ? publishLane.required_decisions.join('; ')
+          : ''
+        return {
+          action: 'deny',
+          reason_code: 'publish_lane_safety_stop',
+          command_kind: publishLane.command_class ?? 'rtk_git_push',
+          message: `${eventName}: publish_lane_safety_stop `
+            + `[boundary_layer=${publishLane.boundary_layer}] `
+            + `[reason_code=${publishLane.reason_code}] `
+            + `[expected_remote_head=${publishLane.expected_remote_head}] `
+            + `[current_remote_head=${publishLane.current_remote_head}] `
+            + `[local_head=${publishLane.local_head}] `
+            + `[verified_head=${publishLane.verified_head}] `
+            + `[declared_publish_head=${publishLane.declared_publish_head}] `
+            + `[allowed_paths_gate_status=${publishLane.allowed_paths_gate_status}] `
+            + `[required_decisions=${requiredDecisions}] `
+            + `blocked_command_preview="${preview}"`,
+        }
+      }
+      // publishLane === null: policy CLI unavailable, or a recognized-but-not-yet-
+      // classified edge case. Fail-closed to the generic deny below (never allow
+      // on ambiguous classification).
+    }
     const preview = redactCommandPreview(rawCommand)
     return {
       action: 'no_decision',

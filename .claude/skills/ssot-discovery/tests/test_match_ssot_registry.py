@@ -20,7 +20,7 @@ MATCH_PY = SCRIPTS_DIR / "match_ssot.py"
 
 # Add scripts dir to sys.path so we can import parse_registry directly
 sys.path.insert(0, str(SCRIPTS_DIR))
-from match_ssot import parse_registry, get_repo_root
+from match_ssot import parse_registry, get_repo_root  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -132,6 +132,7 @@ def test_output_contract_fields():
         "status", "generated_at", "generated_by",
         "inputs", "matched_documents", "unmatched_keywords",
         "unmatched_paths", "notes", "warnings", "errors",
+        "section_limited_matches", "section_selection_outcomes",
     ]
     for field in required_fields:
         assert field in r, f"Missing required field '{field}' in SSOT_DISCOVERY_RESULT_V1"

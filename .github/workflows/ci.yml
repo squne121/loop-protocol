@@ -1254,6 +1254,22 @@ jobs:
           printf '{"step_id":"pytest_session_recording_codex_hook_adapter","phase_id":"pytest_session_recording_codex_hook_adapter","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
+      - name: pytest_session_recording_codex_initial_branch_create_lane (timed)
+        # Issue #1449 fix_delta (PR #1479 review): dedicated node-backed-hook-tests
+        # lane for tests/session_recording/codex/test_initial_branch_create_lane.py,
+        # which exercises the real codex-hook-adapter.mjs node subprocess (same
+        # harness pattern as test_hook_adapter.py above) and was previously an
+        # uncovered changed test file (neither python-test targets nor this job's
+        # dedicated_lanes referenced it).
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest -q tests/session_recording/codex/test_initial_branch_create_lane.py -p no:xdist
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_session_recording_codex_initial_branch_create_lane","phase_id":"pytest_session_recording_codex_initial_branch_create_lane","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
       - name: pytest_session_recording_codex_hook_adapter_xdist (timed)
         # Issue #1420 fix_delta 3 AC11: run the same suite under pytest-xdist
         # parallel execution (-n 4 --dist load) to regression-test the manifest
@@ -1289,6 +1305,7 @@ jobs:
             .claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable \
             .claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths \
             tests/session_recording/codex/test_hook_adapter.py \
+            tests/session_recording/codex/test_initial_branch_create_lane.py \
             > ci_test_selection_artifacts/node_backed_hook_tests_collect_only.txt
           uv run --locked pytest --collect-only -q \
             .claude/hooks/tests/ \
@@ -1319,6 +1336,7 @@ jobs:
                   ".claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable",
                   ".claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths",
                   "tests/session_recording/codex/test_hook_adapter.py",
+                  "tests/session_recording/codex/test_initial_branch_create_lane.py",
               ],
               plan=".github/ci/python-test-plan.json",
               pr_head_sha="${{ github.event.pull_request.head.sha || github.sha }}",
@@ -1347,7 +1365,15 @@ jobs:
           # for tests/session_recording/codex/test_hook_adapter.py instead of
           # relying solely on the python-test-plan.json declared
           # secondary_coverage entry.
-          session_recording_prefix = "tests/session_recording/codex/test_hook_adapter.py"
+          # #1449 fix_delta (PR #1479 review): tests/session_recording/codex/
+          # test_initial_branch_create_lane.py joins the same sublane (same
+          # directory, same real codex-hook-adapter.mjs node subprocess
+          # harness) so it is also treated as session_recording, not as a
+          # "fixed hook wrapper" nodeid.
+          session_recording_prefixes = (
+              "tests/session_recording/codex/test_hook_adapter.py",
+              "tests/session_recording/codex/test_initial_branch_create_lane.py",
+          )
           artifact_dir = pathlib.Path("ci_test_selection_artifacts")
           python_lines = [
               line.strip()
@@ -1360,10 +1386,10 @@ jobs:
               if line.strip() and "::" in line
           ]
           session_recording_nodeids = sorted(
-              line for line in node_lines if line.startswith(session_recording_prefix)
+              line for line in node_lines if line.startswith(session_recording_prefixes)
           )
           fixed_hook_wrapper_nodeids = sorted(
-              line for line in node_lines if not line.startswith(session_recording_prefix)
+              line for line in node_lines if not line.startswith(session_recording_prefixes)
           )
 
           python_absent = sorted(nodeid for nodeid in node_backed_nodeids if nodeid not in python_lines)
