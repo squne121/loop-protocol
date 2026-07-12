@@ -449,7 +449,9 @@ def make_subprocess_runner(script_path: Path, python_executable: str | None = No
         except (OSError, json.JSONDecodeError) as exc:
             return _synthetic_failure_result(request, "child_output_unreadable", str(exc))
         if not isinstance(data, dict):
-            return _synthetic_failure_result(request, "child_output_unreadable", "output file did not contain an object")
+            return _synthetic_failure_result(
+                request, "child_output_unreadable", "output file did not contain an object"
+            )
         return data
 
     return _runner
@@ -631,7 +633,11 @@ def run_fanout(
                     "reasons": ["overall_timeout_pending_cancelled"],
                 }
                 _journal(
-                    {"event": "subtask_cancelled_before_start", "subtask_id": subtask_id, "parent_run_id": parent_run_id}
+                    {
+                        "event": "subtask_cancelled_before_start",
+                        "subtask_id": subtask_id,
+                        "parent_run_id": parent_run_id,
+                    }
                 )
                 return
             _journal({"event": "subtask_started", "subtask_id": subtask_id, "parent_run_id": parent_run_id})
