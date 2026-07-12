@@ -24,12 +24,33 @@ jobs:
           persist-credentials: true
           fetch-depth: 0
       - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6
-        with:
-          version: 11
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: 22
           cache: pnpm
+      - name: Assert resolved pnpm version matches packageManager
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016 # single-quoted: this is a JS template
+          # literal for `node -e`, not a shell expansion.
+          expected_pnpm_version="$(
+            node -e '
+              const value = require("./package.json").packageManager;
+              const match = /^pnpm@(\d+\.\d+\.\d+)$/.exec(value ?? "");
+              if (!match) {
+                console.error(`invalid packageManager: ${value}`);
+                process.exit(1);
+              }
+              process.stdout.write(match[1]);
+            '
+          )"
+          actual_pnpm_version="$(pnpm --version)"
+          if [ "$actual_pnpm_version" != "$expected_pnpm_version" ]; then
+            echo "ERROR: resolved pnpm version ($actual_pnpm_version) does not match expected packageManager pin ($expected_pnpm_version)" >&2
+            exit 1
+          fi
+          echo "OK: resolved pnpm version matches expected $expected_pnpm_version"
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm lint
@@ -185,12 +206,33 @@ jobs:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha }}
       - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6
-        with:
-          version: 11
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: 22
           cache: pnpm
+      - name: Assert resolved pnpm version matches packageManager
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016 # single-quoted: this is a JS template
+          # literal for `node -e`, not a shell expansion.
+          expected_pnpm_version="$(
+            node -e '
+              const value = require("./package.json").packageManager;
+              const match = /^pnpm@(\d+\.\d+\.\d+)$/.exec(value ?? "");
+              if (!match) {
+                console.error(`invalid packageManager: ${value}`);
+                process.exit(1);
+              }
+              process.stdout.write(match[1]);
+            '
+          )"
+          actual_pnpm_version="$(pnpm --version)"
+          if [ "$actual_pnpm_version" != "$expected_pnpm_version" ]; then
+            echo "ERROR: resolved pnpm version ($actual_pnpm_version) does not match expected packageManager pin ($expected_pnpm_version)" >&2
+            exit 1
+          fi
+          echo "OK: resolved pnpm version matches expected $expected_pnpm_version"
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm lint
