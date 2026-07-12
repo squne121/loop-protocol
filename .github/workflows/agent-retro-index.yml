@@ -26,11 +26,22 @@ on:
       - package.json
       - pnpm-lock.yaml
       - .github/workflows/agent-retro-index.yml
+  # Read-only bootstrap smoke trigger only (Issue #1476 P1-3). The write jobs
+  # (build-index / upsert-parent-comment) below are explicitly gated to skip
+  # pull_request; only bootstrap-smoke runs here, so a PR touching this
+  # file's pnpm bootstrap is actually exercised by CI instead of relying on
+  # static tests alone.
+  pull_request:
+    paths:
+      - package.json
+      - pnpm-lock.yaml
+      - .github/workflows/agent-retro-index.yml
 
 permissions: {}
 
 jobs:
   build-index:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -42,8 +53,6 @@ jobs:
       - uses: actions/checkout@v5
 
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
 
       - uses: actions/setup-node@v5
         with:
@@ -91,7 +100,7 @@ jobs:
   upsert-parent-comment:
     runs-on: ubuntu-latest
     needs: build-index
-    if: github.event_name == 'push' || needs.build-index.outputs.dry_run == 'false'
+    if: github.event_name != 'pull_request' && (github.event_name == 'push' || needs.build-index.outputs.dry_run == 'false')
     permissions:
       contents: read
       issues: write
@@ -100,8 +109,6 @@ jobs:
       - uses: actions/checkout@v5
 
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
 
       - uses: actions/setup-node@v5
         with:
@@ -133,3 +140,48 @@ jobs:
             --source-set-json-in artifacts/agent-retro-index-source-set.json \
             --summary-json-in artifacts/agent-retro-index-summary.json \
             --summary-json-out artifacts/agent-retro-index-live-summary.json
+
+  # Read-only bootstrap-only smoke job (Issue #1476 P1-3). build-index /
+  # upsert-parent-comment above never run on pull_request (see the
+  # per-job `if:` gates), so this workflow was previously never exercised by
+  # this PR's own CI. This job does nothing but checkout + pnpm bootstrap +
+  # assert the resolved pnpm version matches package.json#packageManager --
+  # no build-index side effects, no write permissions.
+  bootstrap-smoke:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Assert resolved pnpm version matches packageManager
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016 # single-quoted: this is a JS template
+          # literal for `node -e`, not a shell expansion.
+          expected_pnpm_version="$(
+            node -e '
+              const value = require("./package.json").packageManager;
+              const match = /^pnpm@(\d+\.\d+\.\d+)$/.exec(value ?? "");
+              if (!match) {
+                console.error(`invalid packageManager: ${value}`);
+                process.exit(1);
+              }
+              process.stdout.write(match[1]);
+            '
+          )"
+          actual_pnpm_version="$(pnpm --version)"
+          if [ "$actual_pnpm_version" != "$expected_pnpm_version" ]; then
+            echo "ERROR: resolved pnpm version ($actual_pnpm_version) does not match expected packageManager pin ($expected_pnpm_version)" >&2
+            exit 1
+          fi
+          echo "OK: resolved pnpm version matches expected $expected_pnpm_version"
