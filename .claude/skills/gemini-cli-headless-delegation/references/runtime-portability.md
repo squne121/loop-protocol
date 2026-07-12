@@ -507,6 +507,30 @@ export DELEGATION_AUDIT_REQUIRED=1
 | `auth_diagnostics_metadata` | AGY の認証系 `failure_class`（`agy_auth_required` / `agy_permission_denied`）から導出（Issue #1267 territory） | 認証起因の失敗率監視 |
 | `parent_run_id` / `subtask_id` / `attempt_id` | Issue #1273（fan-out）向けの予約フィールド。request に指定があれば伝播、無ければ出力されない | 将来の並列実行 orchestrator が subtask を親 run に紐付けるための予約領域 |
 
+## Fan-Out Orchestrator: 並行実行が portability に与える影響 / Fan-Out concurrency portability notes
+
+（Issue #1273）`fan_out_orchestrator.py` は各 subtask を独立した subprocess worker として実行する
+（thread pool ではなく OS process 単位。理由: `gemini` / `agy` provider の CLI 実行そのものが
+subprocess ベースであり、overall timeout 到達時にプロセスグループ単位で確実に終了させる必要があるため）。
+
+- **プロセス生成コスト**: subtask 1 件につき Python インタプリタの起動コストが発生する（数十〜数百 ms
+  オーダー）。`max_subtasks` / `max_workers` を大きくしすぎると、単純な逐次実行より起動オーバーヘッドが
+  支配的になり得る。深い調査を伴わない軽量 subtask を大量 fan-out する用途には不向き。
+- **プロセスグループ終了 (process group termination)**: `overall_timeout_sec` 到達時の子プロセス終了は
+  `start_new_session=True`（POSIX: 新しい session/process group を子プロセスに割り当てる）と
+  `os.killpg()`（SIGTERM → grace period 後 SIGKILL）に依存する。この機構は POSIX（Linux / WSL2 / macOS）
+  前提であり、Windows ネイティブでは `os.killpg` / `os.getpgid` が利用できない（`NotImplementedError`
+  相当）。Windows ネイティブからの fan-out 実行は Out of Scope（下記参照）。
+- **OS 差異**: WSL2 上の Linux プロセスモデルでの検証を前提とする。macOS でも POSIX process group
+  機構自体は利用できるが、本 skill の対応環境（Supported Environments 参照）に含まれないため未検証。
+- **リソース上限**: `max_workers` / provider 別・profile 別 semaphore は同時に起動する OS プロセス数を
+  直接制限する。WSL2 環境のメモリ・ファイルディスクリプタ上限を踏まえ、既定値（`max_workers=4`）から
+  大きく外れる設定を行う場合は実行環境のリソース余裕を事前に確認すること。
+- **NDJSON journal の並行書き込み**: parent プロセス内の単一 writer が `os.O_APPEND` + 単一 `write()`
+  syscall で 1 record = 1 write を行う。この atomicity は POSIX の正規ファイルへの `O_APPEND` 書き込みに
+  依存しており、NFS 等の一部ネットワークファイルシステムでは atomicity 保証が弱まる可能性がある
+  （本 skill の実行 artifact はローカルディスク前提であり、NFS 等での動作は未検証）。
+
 ## Out of Scope / 対象外
 
 - CodexCLI 向け実行手順（Followup Issue 扱い）
