@@ -13,7 +13,7 @@ Codex local runtime 運用の主文書。
 
 `tests/fixtures/codex-agent-config/expected-runtime-contract.json` が custom agent のモデル、reasoning effort、permission 宣言の唯一の declaration proof である。TOML と静的 validator はこの契約への一致を検査するが、宣言値を provider-side dispatch の観測値として扱わない。
 
-証明は三層に分ける。declaration proof は contract/TOML の静的一致、dispatch proof は trusted hook が記録した observed model と session/turn/agent/run の相関、availability proof は同一 evidence run の direct smoke と明示custom-agent launchである。ledger は secret を保存せず、hook trust、freshness、repo head、agent definition hash を検証できない場合は PASS にせず `HUMAN_ACTION_REQUIRED` または `BLOCKED` とする。
+証明は三層に分ける。declaration proof は contract/TOML の静的一致、dispatch proof はイベントが存在する場合に trusted hook が記録する observed model と session/turn/agent/run の相関、availability proof は同一 evidence run の全distinct Terra/Luna model/effort direct smokeである。Issue #1451 のruntime完了条件はavailability proofに限定し、custom-agent dispatchやfresh ledger生成を要求しない。ledger境界はstatic validator/fixtureで維持する。ledger は secret を保存せず、hook trust、freshness、repo headを検証できない場合は PASS にせず `HUMAN_ACTION_REQUIRED` または `BLOCKED` とする。
 
 allocation を戻す必要がある場合は、contract、全対象TOML、hook/evidence validator、fixture を同一コミットで原子的に戻す。片面だけのrollbackや、過去runのledger再利用は許可しない。
 
