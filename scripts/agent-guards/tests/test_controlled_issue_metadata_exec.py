@@ -1001,6 +1001,349 @@ class TestContractSnapshotPublish:
 
 
 # =============================================================================
+# Issue #1459 review Blockers: legacy_refresh_duplicate_marker_deadlock /
+# post_publish_live_body_not_revalidated / evaluator_missing_from_module_trust_chain
+# =============================================================================
+
+# Minimal but functionally real (not string-stub) replacements for
+# ensure_contract_snapshot.py / contract_review_result_parser.py, used only by
+# the tests below that exercise _readback_contract_snapshot's actual
+# importlib-loaded module chain end to end. Full-fidelity coverage of
+# is_go_current / parse_contract_review_results lives in
+# test_ensure_contract_snapshot.py and contract_review_result_parser's own
+# tests; this stub only needs to preserve the invariant these tests assert on
+# (fresh comment id selection + live-body triple-hash agreement).
+_ENSURE_MOD_FUNCTIONAL_STUB = """
+def is_go_current(go_result, expected_body_sha256):
+    if not isinstance(go_result, dict):
+        return False
+    inner = go_result.get("inner")
+    if not isinstance(inner, dict):
+        return False
+    if inner.get("body_sha256") != expected_body_sha256:
+        return False
+    checks = inner.get("checks") or {}
+    product_spec_check = checks.get("product_spec_check") or {}
+    return product_spec_check.get("body_sha256") == expected_body_sha256
+"""
+
+_PARSER_MOD_FUNCTIONAL_STUB = """
+import json
+import re
+
+_INNER_RE = re.compile(r"<!--TEST_INNER:(.*?)-->", re.S)
+
+
+def parse_contract_review_results(comments, expected_issue_url=None):
+    results = []
+    for c in comments:
+        body = c.get("body", "") or ""
+        m = _INNER_RE.search(body)
+        if not m:
+            continue
+        inner = json.loads(m.group(1))
+        results.append({
+            "comment_id": c.get("id"),
+            "html_url": c.get("html_url"),
+            "status": "go",
+            "created_at": c.get("created_at"),
+            "inner": inner,
+        })
+    return results
+
+
+def find_latest_result(results):
+    return results[-1] if results else None
+
+
+def find_latest_go(results):
+    go = [r for r in results if r.get("status") == "go"]
+    return go[-1] if go else None
+
+
+def fetch_issue_comments(issue_number, repo):
+    return [], None
+"""
+
+
+@pytest.fixture()
+def tmp_project_functional(tmp_path):
+    """Like tmp_project, but ensure_contract_snapshot.py / contract_review_result_parser.py
+    are functionally real (not "# stub\\n") so _readback_contract_snapshot's
+    importlib-loaded module chain actually runs end to end."""
+    executor_dir = tmp_path / "scripts" / "agent-guards"
+    executor_dir.mkdir(parents=True)
+    irl_dir = tmp_path / ".claude" / "skills" / "impl-review-loop" / "scripts"
+    irl_dir.mkdir(parents=True)
+    (irl_dir / "ensure_contract_snapshot.py").write_text(_ENSURE_MOD_FUNCTIONAL_STUB)
+    icr_dir = tmp_path / ".claude" / "skills" / "issue-contract-review" / "scripts"
+    icr_dir.mkdir(parents=True)
+    (icr_dir / "contract_review_result_parser.py").write_text(_PARSER_MOD_FUNCTIONAL_STUB)
+
+    subprocess.run(["git", "init", str(tmp_path)], capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "origin",
+         f"https://github.com/{TRUSTED_REPO}.git"],
+        capture_output=True,
+    )
+    return tmp_path
+
+
+class TestReadbackContractSnapshotDuplicateMarker:
+    """Blocker: legacy_refresh_duplicate_marker_deadlock. A legacy go comment
+    can carry the exact same idempotency marker as the fresh comment just
+    posted (the marker is derived from issue + body_sha256 + schema only, not
+    from a per-post nonce). Readback must select the exact comment the
+    publisher reported posting (by comment id parsed from its URL) and must
+    never search the full comment list for a *uniquely* matching marker."""
+
+    def test_selects_fresh_comment_by_id_ignoring_legacy_duplicate_marker(
+        self, tmp_project_functional, monkeypatch
+    ):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project_functional)
+        body_text = "current issue body"
+        body_sha256 = _sha(body_text)
+        marker = (
+            f"<!-- loop-protocol:contract-snapshot issue=1284 "
+            f"body_sha256={body_sha256} schema=CONTRACT_REVIEW_RESULT_V1 -->"
+        )
+        inner = {
+            "body_sha256": body_sha256,
+            "checks": {"product_spec_check": {"body_sha256": body_sha256}},
+        }
+        fresh_url = "https://github.com/o/r/issues/1284#issuecomment-999"
+        fresh_body = f"{marker}\n\n<!--TEST_INNER:{json.dumps(inner)}-->"
+
+        calls = []
+
+        def _fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            # A legacy comment (e.g. id 111) carrying the identical marker text
+            # exists on GitHub but this function must never issue a
+            # list-all-comments call that would have to disambiguate between
+            # them -- it must go straight to the id parsed from expected_url.
+            assert cmd[0] == "/bin/gh" and cmd[1] == "api"
+            assert cmd[2] == "repos/squne121/loop-protocol/issues/comments/999", cmd
+            payload = {
+                "id": 999,
+                "html_url": fresh_url,
+                "created_at": "2026-01-02T00:00:00Z",
+                "updated_at": "2026-01-02T00:00:00Z",
+                "body": fresh_body,
+            }
+            return type("P", (), {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""})()
+
+        with patch("subprocess.run", side_effect=_fake_run):
+            with patch.object(
+                _exec, "_fetch_issue_body_and_updated_at",
+                return_value=(body_text, "now", ""),
+            ):
+                readback = _exec._readback_contract_snapshot(
+                    marker, 1284, TRUSTED_REPO, "/bin/gh", fresh_url, body_sha256,
+                )
+
+        assert readback.get("remote_postcondition_verified") is True
+        assert readback["comment_id"] == 999
+        assert readback["comment_url"] == fresh_url
+        assert len(calls) == 1
+
+
+class TestReadbackContractSnapshotLiveBodyRevalidation:
+    """Blocker: post_publish_live_body_not_revalidated. The comment-level
+    checks alone only prove the *posted comment* is bound to
+    expected_body_sha256; they do not prove the live Issue body still matches
+    that hash at readback time. A concurrent body edit between the pre-publish
+    check and this readback must not be reported as success even though the
+    POST already happened (mutation occurred, postcondition failed)."""
+
+    def _fresh_comment(self, body_sha256: str, comment_id: int = 999):
+        marker = (
+            f"<!-- loop-protocol:contract-snapshot issue=1284 "
+            f"body_sha256={body_sha256} schema=CONTRACT_REVIEW_RESULT_V1 -->"
+        )
+        inner = {
+            "body_sha256": body_sha256,
+            "checks": {"product_spec_check": {"body_sha256": body_sha256}},
+        }
+        url = f"https://github.com/o/r/issues/1284#issuecomment-{comment_id}"
+        body = f"{marker}\n\n<!--TEST_INNER:{json.dumps(inner)}-->"
+        return marker, url, body
+
+    def test_live_body_changed_after_post_is_not_success(
+        self, tmp_project_functional, monkeypatch
+    ):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project_functional)
+        body_sha256 = _sha("body at pre-publish check time")
+        marker, fresh_url, fresh_body = self._fresh_comment(body_sha256)
+
+        def _fake_run(cmd, **kwargs):
+            payload = {
+                "id": 999, "html_url": fresh_url,
+                "created_at": "t", "updated_at": "t", "body": fresh_body,
+            }
+            return type("P", (), {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""})()
+
+        with patch("subprocess.run", side_effect=_fake_run):
+            with patch.object(
+                _exec, "_fetch_issue_body_and_updated_at",
+                # A different (concurrently edited) live body at readback time.
+                return_value=("body changed by a concurrent editor", "later", ""),
+            ):
+                readback = _exec._readback_contract_snapshot(
+                    marker, 1284, TRUSTED_REPO, "/bin/gh", fresh_url, body_sha256,
+                )
+
+        assert "error" in readback
+        assert readback["error"].startswith("failed_after_mutation:")
+        # The POST already happened (remote side effect exists); evidence must
+        # be preserved so the caller can reconcile the mutation, not lose it.
+        assert readback["comment_id"] == 999
+        assert readback["comment_url"] == fresh_url
+
+    def test_contract_snapshot_publish_end_to_end_fails_closed_and_preserves_evidence(
+        self, tmp_project_functional, monkeypatch
+    ):
+        """End-to-end through _run_contract_snapshot_publish: a live body
+        change discovered only at readback time must surface as rc == 1
+        (failed), never rc == 0, with the posted comment URL retained in the
+        error evidence for human reconciliation."""
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project_functional)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        body_text = "current issue body"
+        body_sha256 = _sha(body_text)
+        marker, fresh_url, fresh_body = self._fresh_comment(body_sha256)
+        rel = _write_input(
+            tmp_project_functional, 1284, COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH, "in.json",
+            _contract_snapshot_input(
+                1284,
+                target_issue_body_sha256=body_sha256,
+                expected_contract_marker=marker,
+            ),
+        )
+        pub_result = {"status": "ok", "contract_snapshot_url": fresh_url, "post_status": "posted"}
+        fake_publisher_proc = type(
+            "P", (), {"stdout": json.dumps(pub_result), "stderr": "", "returncode": 0}
+        )()
+
+        call_log = []
+
+        def _fake_run(cmd, **kwargs):
+            call_log.append(cmd)
+            if _exec._ENSURE_CONTRACT_SNAPSHOT_REL in " ".join(str(c) for c in cmd):
+                return fake_publisher_proc
+            payload = {
+                "id": 999, "html_url": fresh_url,
+                "created_at": "t", "updated_at": "t", "body": fresh_body,
+            }
+            return type("P", (), {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""})()
+
+        fetch_calls = {"n": 0}
+
+        def _fake_fetch_body(*_args, **_kwargs):
+            fetch_calls["n"] += 1
+            if fetch_calls["n"] == 1:
+                # Pre-publish precondition check: body unchanged.
+                return body_text, "t0", ""
+            # Post-publish readback: a concurrent editor changed the body.
+            return "body changed by a concurrent editor", "t1", ""
+
+        with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
+            with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
+                with patch.object(_exec, "_check_contract_snapshot_module_realpaths", return_value=[]):
+                    with patch.object(_exec, "_fetch_issue_body_and_updated_at", side_effect=_fake_fetch_body):
+                        with patch("subprocess.run", side_effect=_fake_run):
+                            rc = _exec.main([
+                                "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
+                                "--issue-number", "1284",
+                                "--input-file", rel,
+                                "--repo", TRUSTED_REPO,
+                                "--json",
+                            ])
+        assert rc == 1
+
+
+class TestModuleRealpathsEvaluatorTrustChain:
+    """Blocker: evaluator_missing_from_module_trust_chain.
+    ensure_contract_snapshot.py imports evaluate_product_spec_gate.py at
+    module load time, so it must be part of the realpath-checked publisher
+    module chain -- and path ancestry must be decided by Path.is_relative_to()
+    against the resolved project root, not a raw str.startswith() prefix
+    check (which also treats a sibling directory like "<root>-evil" as
+    "under" "<root>" purely by string-prefix coincidence)."""
+
+    def test_evaluator_included_in_trust_chain(self):
+        assert _exec._EVALUATE_PRODUCT_SPEC_GATE_REL == (
+            ".claude/skills/impl-review-loop/scripts/evaluate_product_spec_gate.py"
+        )
+
+    def test_repo_external_symlink_evaluator_detected_and_denied(self, tmp_path):
+        project_root = tmp_path / "repo"
+        (project_root / ".claude/skills/impl-review-loop/scripts").mkdir(parents=True)
+        (project_root / ".claude/skills/issue-contract-review/scripts").mkdir(parents=True)
+        (project_root / _exec._ENSURE_CONTRACT_SNAPSHOT_REL).write_text("# stub\n")
+        (project_root / _exec._RUN_CONTRACT_REVIEW_ONCE_REL).write_text("# stub\n")
+        (project_root / _exec._CONTRACT_REVIEW_RESULT_PARSER_REL).write_text("# stub\n")
+
+        # Sibling directory whose name path-prefix-collides with project_root
+        # (e.g. ".../repo-evil" starts with the literal string ".../repo").
+        # A raw str.startswith() ancestry check would incorrectly treat this
+        # as "under" project_root; Path.is_relative_to() must not.
+        evil_root = tmp_path / (project_root.name + "-evil")
+        evil_root.mkdir()
+        real_evaluator = evil_root / "evaluate_product_spec_gate.py"
+        real_evaluator.write_text("# attacker-controlled\n")
+        symlinked_evaluator = project_root / _exec._EVALUATE_PRODUCT_SPEC_GATE_REL
+        symlinked_evaluator.symlink_to(real_evaluator)
+
+        errors = _exec._check_contract_snapshot_module_realpaths(project_root)
+        assert any(
+            "module_shadowing" in e and "evaluate_product_spec_gate.py" in e for e in errors
+        )
+
+    def test_missing_evaluator_denied(self, tmp_path):
+        project_root = tmp_path / "repo"
+        (project_root / ".claude/skills/impl-review-loop/scripts").mkdir(parents=True)
+        (project_root / ".claude/skills/issue-contract-review/scripts").mkdir(parents=True)
+        (project_root / _exec._ENSURE_CONTRACT_SNAPSHOT_REL).write_text("# stub\n")
+        (project_root / _exec._RUN_CONTRACT_REVIEW_ONCE_REL).write_text("# stub\n")
+        (project_root / _exec._CONTRACT_REVIEW_RESULT_PARSER_REL).write_text("# stub\n")
+        # evaluate_product_spec_gate.py intentionally absent -- missing=deny.
+        errors = _exec._check_contract_snapshot_module_realpaths(project_root)
+        assert any(
+            "module_missing" in e and "evaluate_product_spec_gate.py" in e for e in errors
+        )
+
+    def test_publisher_not_launched_when_evaluator_realpath_check_fails(
+        self, tmp_project, monkeypatch
+    ):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1284")
+        rel = _write_input(
+            tmp_project, 1284, COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH, "in.json",
+            _contract_snapshot_input(1284),
+        )
+        with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
+            with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
+                with patch.object(
+                    _exec, "_check_contract_snapshot_module_realpaths",
+                    return_value=[
+                        "module_shadowing: evaluate_product_spec_gate.py resolved outside project_root"
+                    ],
+                ):
+                    with patch("subprocess.run") as run_mock:
+                        rc = _exec.main([
+                            "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
+                            "--issue-number", "1284",
+                            "--input-file", rel,
+                            "--repo", TRUSTED_REPO,
+                        ])
+        # _fail(..., status="error") default -> rc == 2 (mirrors
+        # test_contract_snapshot_publish_realpath_mismatch_denied).
+        assert rc == 2
+        run_mock.assert_not_called()
+
+
+# =============================================================================
 # Blocker 5: contract_snapshot.publish env sanitizer (unit-level)
 # =============================================================================
 
