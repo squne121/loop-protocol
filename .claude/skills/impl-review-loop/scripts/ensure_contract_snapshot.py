@@ -368,6 +368,9 @@ def run_contract_review_once(
     repo: str,
     mode: str = "static",
     skip_idempotency_check: bool = True,
+    evidence_mode: str = "baseline",
+    cwd: Optional[str] = None,
+    reviewed_head_sha: Optional[str] = None,
 ) -> tuple[Optional[dict], Optional[str]]:
     """
     Run run_contract_review_once.py as subprocess.
@@ -385,6 +388,14 @@ def run_contract_review_once(
     ]
     if skip_idempotency_check:
         cmd.append("--skip-idempotency-check")
+    if evidence_mode == "current-head":
+        if not cwd or not reviewed_head_sha:
+            return None, "current_head_requires_cwd_and_reviewed_head_sha"
+        cmd.extend([
+            "--evidence-mode", "current-head",
+            "--cwd", cwd,
+            "--reviewed-head-sha", reviewed_head_sha,
+        ])
 
     try:
         result = subprocess.run(
@@ -418,6 +429,9 @@ def ensure_contract_snapshot(
     mode: str = "check-only",
     do_post: bool = False,
     artifact_dir: Optional[str] = None,
+    evidence_mode: str = "baseline",
+    cwd: Optional[str] = None,
+    reviewed_head_sha: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Main logic for ensure_contract_snapshot.
@@ -447,6 +461,8 @@ def ensure_contract_snapshot(
         "idempotency_marker_found": False,
         "errors": [],
         "contract_review_once_result": None,
+        "vc_evidence": {"mode": evidence_mode},
+        "current_vc_result": None,
     }
 
     # Load parser module
@@ -508,17 +524,24 @@ def ensure_contract_snapshot(
             result["status"] = "runtime_error"
             return result
         if body_confirm == body and updated_confirm == updated_at:
-            result["status"] = "ok"
+            if evidence_mode != "current-head":
+                result["status"] = "ok"
+                result["source"] = "existing_go"
+                result["contract_snapshot_url"] = go_result["html_url"]
+                return result
+            # Snapshot reuse and current-head evidence production are independent:
+            # preserve the fresh snapshot, then continue to run the producer.
             result["source"] = "existing_go"
             result["contract_snapshot_url"] = go_result["html_url"]
-            return result
+            break
         if attempt == 1:
             result["status"] = "stale_or_conflicting_snapshot"
             result["errors"].append("issue_changed_during_existing_go_recheck")
             return result
 
-    # No existing go result
-    if mode == "check-only":
+    # No existing go result.  A current-head caller must still produce fresh
+    # evidence when a snapshot was found above, even in check-only mode.
+    if mode == "check-only" and result["contract_snapshot_url"] is None:
         result["status"] = "human_judgment"
         result["source"] = "readiness_blocked"
         result["errors"].append(
@@ -532,9 +555,17 @@ def ensure_contract_snapshot(
         repo=repo,
         mode="static",
         skip_idempotency_check=True,
+        evidence_mode=evidence_mode,
+        cwd=cwd,
+        reviewed_head_sha=reviewed_head_sha,
     )
 
     result["contract_review_once_result"] = review_result
+    if review_result:
+        result["vc_evidence"] = review_result.get("vc_evidence", result["vc_evidence"])
+        result["current_vc_result"] = review_result.get(
+            "current_vc_result", result["current_vc_result"]
+        )
 
     if review_err:
         result["errors"].append(f"run_contract_review_once_error: {review_err}")
@@ -569,6 +600,11 @@ def ensure_contract_snapshot(
     if review_status != "go":
         result["status"] = "runtime_error"
         result["errors"].append(f"unexpected_review_status: {review_status}")
+        return result
+
+    if result["contract_snapshot_url"] is not None:
+        result["status"] = "ok"
+        result["source"] = "existing_go"
         return result
 
     # review_status == go
@@ -769,6 +805,9 @@ def main() -> int:
         required=True,
         help="GitHub Issue number",
     )
+    parser.add_argument("--evidence-mode", choices=["baseline", "current-head"], default="baseline")
+    parser.add_argument("--cwd", default=None)
+    parser.add_argument("--reviewed-head-sha", default=None)
     parser.add_argument(
         "--repo",
         default=_DEFAULT_REPO,
@@ -816,6 +855,9 @@ def main() -> int:
         mode=args.mode,
         do_post=args.post,
         artifact_dir=args.artifact_dir,
+        evidence_mode=args.evidence_mode,
+        cwd=args.cwd,
+        reviewed_head_sha=args.reviewed_head_sha,
     )
 
     # Save artifact if requested
