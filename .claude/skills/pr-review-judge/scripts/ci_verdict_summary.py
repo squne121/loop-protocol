@@ -61,6 +61,8 @@ EXIT_GH_ERROR = 40
 HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES: frozenset[tuple[str, str]] = frozenset({
     ("deploy-pages", "deploy-main"),
     ("deploy-pages", "cleanup-pr"),
+    ("agent-retro-index", "build-index"),
+    ("agent-retro-index", "upsert-parent-comment"),
     ("Check Japanese Content", "Issue Body Japanese Check (retrospective)"),
     ("Check Japanese Content", "Issue Comment Japanese Check (retrospective)"),
     ("Check Japanese Content", "PR Review Japanese Check (retrospective)"),
