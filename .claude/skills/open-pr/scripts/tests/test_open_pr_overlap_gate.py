@@ -1180,7 +1180,11 @@ CONTRACT_REVIEW_RESULT_V1:
   body_sha256: \"{sha}\"
 ```
 """
-    payload = {"body": body, "url": "https://github.com/squne121/loop-protocol/issues/1477", "comments": [{"body": snapshot}]}
+    payload = {
+        "body": body,
+        "url": "https://github.com/squne121/loop-protocol/issues/1477",
+        "comments": [{"body": snapshot}],
+    }
     monkeypatch.setattr(
         open_pr,
         "run_gh",
@@ -1224,7 +1228,11 @@ CONTRACT_REVIEW_RESULT_V1:
   body_sha256: \"{sha}\"
 ```
 """
-    payload = {"body": body, "url": "https://github.com/squne121/loop-protocol/issues/1477", "comments": [{"body": snapshot}]}
+    payload = {
+        "body": body,
+        "url": "https://github.com/squne121/loop-protocol/issues/1477",
+        "comments": [{"body": snapshot}],
+    }
     monkeypatch.setattr(
         open_pr,
         "run_gh",
