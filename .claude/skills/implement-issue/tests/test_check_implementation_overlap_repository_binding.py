@@ -222,3 +222,91 @@ def test_given_invalid_repo_format_when_run_then_runtime_error() -> None:
 
     assert exit_code == 1, payload
     assert payload["route"] == "runtime_error"
+
+
+# ------------------------------------------------------------
+# Major 2 (PR #1474 レビュー): online 経路の repository canonicalization は
+# GitHub API の `full_name`（rename/transfer 後の redirect を追跡）を正本に
+# し、dry-run 経路は引き続きネットワークアクセスを避けた固定正規化規則
+# （小文字化）へ fallback する。
+# ------------------------------------------------------------
+
+
+def test_given_dry_run_when_canonicalized_then_no_network_access_used_and_lowercase_applied() -> None:
+    """dry-run 経路は `_canonicalize_repo(..., online=False)` を使い、
+    GitHub API へアクセスせず静的な小文字化のみで canonicalize する。
+    """
+    import importlib.util
+    import sys as _sys
+
+    script_path = HELPER
+    spec = importlib.util.spec_from_file_location(
+        "check_implementation_overlap_repo_binding_major2", script_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    _sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    calls: list = []
+
+    def _forbidden_fetch(repo: str):  # pragma: no cover - defensive
+        calls.append(repo)
+        raise AssertionError("dry-run canonicalization must not call GitHub API")
+
+    module._fetch_repository_full_name = _forbidden_fetch  # type: ignore[assignment]
+
+    result = module._canonicalize_repo("SQUNE121/LOOP-PROTOCOL", online=False)
+
+    assert result == "squne121/loop-protocol"
+    assert calls == []
+
+
+def test_given_online_when_api_returns_renamed_full_name_then_canonical_repository_uses_it(monkeypatch) -> None:
+    """online 経路（Major 2）: `GET /repos/{owner}/{repo}` が rename 後の
+    現在の `full_name` を返す場合、evidence の `repository` field はその
+    canonical value を使う（旧 alias の小文字化ではなく）。
+    """
+    import importlib.util
+    import sys as _sys
+
+    script_path = HELPER
+    spec = importlib.util.spec_from_file_location(
+        "check_implementation_overlap_repo_binding_major2_online", script_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    _sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    monkeypatch.setattr(
+        module, "_fetch_repository_full_name", lambda repo: "squne121/loop-protocol-renamed"
+    )
+
+    result = module._canonicalize_repo("squne121/old-alias", online=True)
+
+    assert result == "squne121/loop-protocol-renamed"
+
+
+def test_given_online_when_api_fetch_fails_then_falls_back_to_static_canonicalization(monkeypatch) -> None:
+    """online 経路で `GET /repos/{owner}/{repo}` が失敗（None）した場合は
+    固定の正規化規則（小文字化）へ fallback し、fail-closed にはしない
+    （既存 online 経路の後方互換維持）。
+    """
+    import importlib.util
+    import sys as _sys
+
+    script_path = HELPER
+    spec = importlib.util.spec_from_file_location(
+        "check_implementation_overlap_repo_binding_major2_fallback", script_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    _sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    monkeypatch.setattr(module, "_fetch_repository_full_name", lambda repo: None)
+
+    result = module._canonicalize_repo("SQUNE121/LOOP-PROTOCOL", online=True)
+
+    assert result == "squne121/loop-protocol"
