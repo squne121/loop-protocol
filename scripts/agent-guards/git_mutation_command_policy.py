@@ -1004,7 +1004,11 @@ def _load_initial_branch_create_guard_context() -> tuple[InitialBranchCreateGuar
         return None, "publish_guard_context_missing"
     if not all(fields):
         return None, "publish_guard_context_invalid"
-    if not (_SHA_RE.fullmatch(declared_publish_head) and _SHA_RE.fullmatch(verified_head) and _SHA_RE.fullmatch(allowed_paths_gate_head_sha)):
+    if not (
+        _SHA_RE.fullmatch(declared_publish_head)
+        and _SHA_RE.fullmatch(verified_head)
+        and _SHA_RE.fullmatch(allowed_paths_gate_head_sha)
+    ):
         return None, "publish_guard_context_invalid"
     if not allowed_paths_gate_issue_number.isdigit():
         return None, "publish_guard_context_invalid"
