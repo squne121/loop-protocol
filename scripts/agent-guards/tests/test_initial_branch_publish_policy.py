@@ -62,7 +62,13 @@ def _make_repo_with_remote(tmp_path: Path, branch: str) -> tuple[Path, Path, str
     return repo, remote, head
 
 
-def _set_strict_publish_env(monkeypatch: pytest.MonkeyPatch, *, head: str, remote: Path, issue_number: str = "1449") -> None:
+def _set_strict_publish_env(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    head: str,
+    remote: Path,
+    issue_number: str = "1449",
+) -> None:
     monkeypatch.setenv("LOOP_PUBLISH_EXPECTED_REMOTE_HEAD", head)
     monkeypatch.setenv("LOOP_PUBLISH_CURRENT_REMOTE_HEAD", head)
     monkeypatch.setenv("LOOP_PUBLISH_DECLARED_PUBLISH_HEAD", head)

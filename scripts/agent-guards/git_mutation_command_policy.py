@@ -367,7 +367,9 @@ def build_initial_branch_create_argv(remote: str, target_branch: str) -> list[st
     ]
 
 
-def validate_initial_branch_create_argv(args: list[str], target_branch: str, remote: str = "origin") -> tuple[bool, str]:
+def validate_initial_branch_create_argv(
+    args: list[str], target_branch: str, remote: str = "origin"
+) -> tuple[bool, str]:
     """Return `(is_valid, reason_code)` for a candidate initial_branch_create
     lane push argv (Issue #1449 AC9). `args` is the tail of a `git push`
     argv (i.e. excludes the leading `git push` tokens themselves).
