@@ -28,6 +28,12 @@ ALLOWED_REMOTE_READBACK_SOURCES = frozenset({"ls_remote"})
 COMMAND_CLASS_RTK_GIT_ADD = "rtk_git_add"
 COMMAND_CLASS_RTK_GIT_COMMIT = "rtk_git_commit"
 COMMAND_CLASS_RTK_GIT_PUSH = "rtk_git_push"
+# Issue #1449: the initial_branch_create lane is a separate decision path from
+# the existing_branch_update lane (COMMAND_CLASS_RTK_GIT_PUSH above) — new
+# branch initial publish (remote ref absent) uses a fully-qualified
+# empty-expect `--force-with-lease` compare-and-create primitive instead of
+# the plain `HEAD:refs/heads/<branch>` refspec the existing lane expects.
+COMMAND_CLASS_RTK_GIT_INITIAL_BRANCH_CREATE = "rtk_git_initial_branch_create"
 COMMAND_CLASS_RTK_GIT_UNKNOWN = "rtk_git_unknown"
 ALLOWED_ALLOWED_PATHS_GATE_STATUSES = frozenset({"ok", "fail_closed", "indeterminate"})
 # Issue #1408 iteration-2 (P2): canonical push destination identity. New
@@ -39,6 +45,16 @@ CANONICAL_REPO_IDENTITY_DEFAULT = "squne121/loop-protocol"
 DEFAULT_BRANCH_NAMES = frozenset({"main", "master", "trunk"})
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _CANONICAL_REPO_URL_TEMPLATE = r"^(?:https://github\.com/|git@github\.com:){identity}(?:\.git)?/?$"
+
+# Issue #1449: remote branch state — the exclusive 3-state classification
+# used by the initial_branch_create lane. `present`/`absent` are derived ONLY
+# from a live `git ls-remote --refs --exit-code` performed in the same
+# execution cycle; any other non-zero/timeout/malformed-output outcome is
+# `probe_error` (never folded into `absent`) and must fail-closed.
+REMOTE_STATE_PRESENT = "present"
+REMOTE_STATE_ABSENT = "absent"
+REMOTE_STATE_PROBE_ERROR = "probe_error"
+REMOTE_BRANCH_STATES = frozenset({REMOTE_STATE_PRESENT, REMOTE_STATE_ABSENT, REMOTE_STATE_PROBE_ERROR})
 
 
 @dataclass(frozen=True)
@@ -60,6 +76,7 @@ class GitMutationPolicyResult:
     decision_inputs_complete: bool | None = None
     required_decisions: tuple[str, ...] = ()
     boundary_layer: str | None = None
+    remote_state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -290,6 +307,153 @@ def _ls_remote_head(cwd: str, remote: str, branch: str) -> tuple[str | None, boo
     if _SHA_RE.fullmatch(oid.lower()):
         return oid.lower(), False
     return None, False
+
+
+def classify_remote_branch_state(cwd: str, remote: str, branch: str, timeout: int = 10) -> tuple[str, str | None]:
+    """Return `(state, oid)` for `branch` on `remote`, classified into the
+    exclusive 3-state vocabulary (Issue #1449 AC1):
+
+      - `present`: the ref exists on the remote; `oid` is its live SHA.
+      - `absent`: `git ls-remote --refs --exit-code` confirmed (returncode 2)
+        the ref does not exist on the remote.
+      - `probe_error`: timeout, auth failure, network failure, malformed
+        output, or any other non-{0,2} returncode — never folded into
+        `absent`, always fail-closed at the call site.
+
+    `state`/`oid` are derived ONLY from a live `git ls-remote` performed in
+    this call (same execution cycle) — never from a cached/self-reported
+    value."""
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "--refs", "--exit-code", remote, f"refs/heads/{branch}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return REMOTE_STATE_PROBE_ERROR, None
+    if result.returncode == 2:
+        return REMOTE_STATE_ABSENT, None
+    if result.returncode != 0:
+        return REMOTE_STATE_PROBE_ERROR, None
+    first = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+    oid = first.split()[0] if first else ""
+    if _SHA_RE.fullmatch(oid.lower()):
+        return REMOTE_STATE_PRESENT, oid.lower()
+    # Non-empty, non-SHA-shaped stdout on returncode 0 is malformed output —
+    # fail-closed, not `present` and not `absent`.
+    return REMOTE_STATE_PROBE_ERROR, None
+
+
+def build_initial_branch_create_argv(remote: str, target_branch: str) -> list[str]:
+    """Return the fully-qualified empty-expect `--force-with-lease` argv for
+    the initial_branch_create lane (Issue #1449 AC2):
+
+      git push --force-with-lease=refs/heads/<branch>: origin HEAD:refs/heads/<branch>
+
+    A single-token `--force-with-lease=refs/heads/<branch>:` with nothing
+    after the trailing colon is the git-native "the ref MUST NOT already
+    exist" empty-expect form — this is the sole primitive this lane executes.
+    Returned as an argv list (never a shell string) so callers execute it via
+    `subprocess.run(argv, shell=False)`, never shell-string concatenation."""
+    return [
+        "git",
+        "push",
+        f"--force-with-lease=refs/heads/{target_branch}:",
+        remote,
+        f"HEAD:refs/heads/{target_branch}",
+    ]
+
+
+def validate_initial_branch_create_argv(args: list[str], target_branch: str, remote: str = "origin") -> tuple[bool, str]:
+    """Return `(is_valid, reason_code)` for a candidate initial_branch_create
+    lane push argv (Issue #1449 AC9). `args` is the tail of a `git push`
+    argv (i.e. excludes the leading `git push` tokens themselves).
+
+    Validates the EXACT fully-qualified empty-expect lease shape produced by
+    `build_initial_branch_create_argv` — any deviation (bare `--force` / `-f`,
+    `+refspec`, an argument-less `--force-with-lease`, a lease with only
+    `<refname>` (no trailing colon), a non-empty expected value, a lease ref
+    that differs from the push target branch, multiple lease flags, multiple
+    refspecs, `--tags`/`--all`/`--mirror`/`--delete`, a branch-deletion
+    refspec, or a default-branch target) is rejected — never falls back to a
+    looser match."""
+    if target_branch in DEFAULT_BRANCH_NAMES:
+        return False, "push_target_is_default_branch"
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", target_branch):
+        return False, "invalid_target_branch"
+    expected = build_initial_branch_create_argv(remote, target_branch)[2:]
+    if args == expected:
+        return True, "initial_branch_create_argv_valid"
+    return False, "initial_branch_create_argv_invalid"
+
+
+def execute_initial_branch_create_push(
+    cwd: str, remote: str, target_branch: str, timeout: int = 30
+) -> subprocess.CompletedProcess:
+    """Execute the initial_branch_create lease push. Always invoked with an
+    argv list (never a shell string) and `shell=False` (the `subprocess.run`
+    default) — Issue #1449 AC2/AC12: the remote-write execution must never be
+    assembled via shell-string concatenation."""
+    argv = build_initial_branch_create_argv(remote, target_branch)
+    return subprocess.run(
+        argv,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def verify_initial_branch_create_readback(
+    cwd: str, remote: str, target_branch: str, local_head: str, timeout: int = 10
+) -> tuple[bool, str, str | None]:
+    """Post-push readback (Issue #1449 AC7/AC8): re-read the same remote ref
+    via a fresh live `git ls-remote` and confirm it now matches `local_head`.
+    Returns `(matched, reason_code, remote_oid)`. Any non-`present` state, or
+    a `present` state whose oid differs from `local_head`, is a structured
+    safety stop (`matched=False`) — never treated as success."""
+    state, oid = classify_remote_branch_state(cwd, remote, target_branch, timeout=timeout)
+    if state == REMOTE_STATE_PROBE_ERROR:
+        return False, "readback_failed_after_push", None
+    if state == REMOTE_STATE_ABSENT:
+        return False, "readback_failed_after_push", None
+    if oid != local_head:
+        return False, "readback_mismatch_local_head", oid
+    return True, "readback_matches_local_head", oid
+
+
+def evaluate_initial_branch_create_lane(
+    *,
+    remote_state: str,
+    local_head: str,
+    declared_publish_head: str,
+    verified_head: str,
+    allowed_paths_gate_status: str,
+    decision_inputs_complete: bool,
+    remote_readback_source: str,
+) -> tuple[str, str]:
+    """Pure decision core for the initial_branch_create lane (Issue #1449
+    AC1/AC5/AC6): returns `(status, reason_code)` where `status` is one of
+    `allow` / `route_existing_update` / `deny`. Does not perform any I/O —
+    `remote_state` must already be the result of a live
+    `classify_remote_branch_state` call in the same execution cycle."""
+    if not decision_inputs_complete or remote_readback_source not in ALLOWED_REMOTE_READBACK_SOURCES:
+        return "deny", "publish_guard_context_invalid"
+    if allowed_paths_gate_status != "ok":
+        return "deny", "allowed_paths_gate_not_ok"
+    if local_head != declared_publish_head or local_head != verified_head:
+        return "deny", "local_head_mismatch"
+    if remote_state == REMOTE_STATE_PROBE_ERROR:
+        return "deny", "probe_error_fail_closed"
+    if remote_state == REMOTE_STATE_PRESENT:
+        return "route_existing_update", "remote_branch_present_route_existing_update"
+    if remote_state == REMOTE_STATE_ABSENT:
+        return "allow", "initial_branch_create_allowed"
+    return "deny", "unknown_remote_state"  # pragma: no cover - defensive fail-closed
 
 
 def _canonical_repo_identity() -> str:
@@ -598,10 +762,12 @@ def _publish_safety_stop_result(
     remote_readback_source: str | None,
     decision_inputs_complete: bool,
     boundary_layer: str,
+    command_class: str = COMMAND_CLASS_RTK_GIT_PUSH,
+    remote_state: str | None = None,
 ) -> GitMutationPolicyResult:
     return GitMutationPolicyResult(
         status="deny",
-        command_class=COMMAND_CLASS_RTK_GIT_PUSH,
+        command_class=command_class,
         reason_code=reason_code,
         suggested_command=None,
         verification_command=(
@@ -623,6 +789,205 @@ def _publish_safety_stop_result(
             "混入 commit を別 PR / 別 branch へ退避する",
         ),
         boundary_layer=boundary_layer,
+        remote_state=remote_state,
+    )
+
+
+def _classify_initial_branch_create_push(
+    args: list[str],
+    *,
+    cwd: str,
+    require_active_branch_push: bool,
+    boundary_layer: str,
+) -> GitMutationPolicyResult:
+    """Classify an `rtk git push --force-with-lease=refs/heads/<b>: origin
+    HEAD:refs/heads/<b>` initial_branch_create lane candidate (Issue #1449).
+
+    This is a SEPARATE decision path from the existing_branch_update lane
+    (`git_argv` shape `push origin HEAD:refs/heads/<b>` with exactly 2 args)
+    handled further below in `classify_rtk_git_mutation`. It is only reached
+    when the push argv has 3 tokens whose first token starts with
+    `--force-with-lease=` (see call site)."""
+    lease_flag, remote, refspec = args[0], args[1], args[2]
+    del lease_flag  # validated via validate_initial_branch_create_argv below
+    if remote != "origin" or not refspec.startswith("HEAD:refs/heads/"):
+        return GitMutationPolicyResult(
+            status="deny",
+            command_class=COMMAND_CLASS_RTK_GIT_INITIAL_BRANCH_CREATE,
+            reason_code="push_refspec_requires_active_branch",
+            suggested_command="rtk git push origin HEAD:refs/heads/<active-branch>",
+            verification_command="git branch --show-current",
+        )
+    target_branch = refspec.removeprefix("HEAD:refs/heads/")
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", target_branch):
+        return GitMutationPolicyResult(
+            status="deny",
+            command_class=COMMAND_CLASS_RTK_GIT_INITIAL_BRANCH_CREATE,
+            reason_code="push_refspec_requires_active_branch",
+            suggested_command="rtk git push origin HEAD:refs/heads/<active-branch>",
+            verification_command="git branch --show-current",
+        )
+    if target_branch in _resolve_default_branch_names(cwd):
+        return GitMutationPolicyResult(
+            status="deny",
+            command_class=COMMAND_CLASS_RTK_GIT_INITIAL_BRANCH_CREATE,
+            reason_code="push_target_is_default_branch",
+            suggested_command="rtk git push origin HEAD:refs/heads/<active-branch>",
+            verification_command="git branch --show-current",
+            target_branch=target_branch,
+        )
+    if require_active_branch_push:
+        current = _current_branch(cwd)
+        if not current or current != target_branch:
+            return GitMutationPolicyResult(
+                status="deny",
+                command_class=COMMAND_CLASS_RTK_GIT_INITIAL_BRANCH_CREATE,
+                reason_code="push_refspec_requires_active_branch",
+                suggested_command="rtk git push origin HEAD:refs/heads/<active-branch>",
+                verification_command="git branch --show-current",
+            )
+    is_valid_argv, argv_reason = validate_initial_branch_create_argv(args, target_branch)
+    if not is_valid_argv:
+        return GitMutationPolicyResult(
+            status="deny",
+            command_class=COMMAND_CLASS_RTK_GIT_INITIAL_BRANCH_CREATE,
+            reason_code=argv_reason,
+            suggested_command="rtk git push origin HEAD:refs/heads/<active-branch>",
+            verification_command="git branch --show-current",
+            target_branch=target_branch,
+        )
+    publish_guard, publish_guard_error = _load_publish_guard_context()
+    local_head = _current_head(cwd)
+    if publish_guard is None:
+        return _publish_safety_stop_result(
+            reason_code=publish_guard_error or "publish_guard_context_missing",
+            target_branch=target_branch,
+            expected_remote_head=os.environ.get("LOOP_PUBLISH_EXPECTED_REMOTE_HEAD", "").strip().lower(),
+            current_remote_head=os.environ.get("LOOP_PUBLISH_CURRENT_REMOTE_HEAD", "").strip().lower(),
+            local_head=local_head,
+            verified_head=os.environ.get("LOOP_PUBLISH_VERIFIED_HEAD", "").strip().lower(),
+            declared_publish_head=os.environ.get("LOOP_PUBLISH_DECLARED_PUBLISH_HEAD", "").strip().lower(),
+            allowed_paths_gate_status=(
+                os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS", "").strip().lower()
+                or "indeterminate"
+            ),
+            pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+            remote_readback_source=os.environ.get("LOOP_PUBLISH_REMOTE_READBACK_SOURCE", "").strip().lower(),
+            decision_inputs_complete=False,
+            boundary_layer=boundary_layer,
+            command_class=COMMAND_CLASS_RTK_GIT_INITIAL_BRANCH_CREATE,
+        )
+    loop_issue_number = os.environ.get("LOOP_ISSUE_NUMBER", "").strip()
+    if (
+        publish_guard.allowed_paths_gate_issue_number != loop_issue_number
+        or publish_guard.allowed_paths_gate_head_sha != (local_head or "")
+    ):
+        return _publish_safety_stop_result(
+            reason_code="allowed_paths_gate_binding_mismatch",
+            target_branch=target_branch,
+            expected_remote_head=publish_guard.expected_remote_head,
+            current_remote_head=publish_guard.current_remote_head,
+            local_head=local_head,
+            verified_head=publish_guard.verified_head,
+            declared_publish_head=publish_guard.declared_publish_head,
+            allowed_paths_gate_status=publish_guard.allowed_paths_gate_status,
+            pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+            remote_readback_source=publish_guard.remote_readback_source,
+            decision_inputs_complete=publish_guard.decision_inputs_complete,
+            boundary_layer=boundary_layer,
+            command_class=COMMAND_CLASS_RTK_GIT_INITIAL_BRANCH_CREATE,
+        )
+    if publish_guard.allowed_paths_gate_status != "ok":
+        return _publish_safety_stop_result(
+            reason_code="allowed_paths_gate_not_ok",
+            target_branch=target_branch,
+            expected_remote_head=publish_guard.expected_remote_head,
+            current_remote_head=publish_guard.current_remote_head,
+            local_head=local_head,
+            verified_head=publish_guard.verified_head,
+            declared_publish_head=publish_guard.declared_publish_head,
+            allowed_paths_gate_status=publish_guard.allowed_paths_gate_status,
+            pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+            remote_readback_source=publish_guard.remote_readback_source,
+            decision_inputs_complete=publish_guard.decision_inputs_complete,
+            boundary_layer=boundary_layer,
+            command_class=COMMAND_CLASS_RTK_GIT_INITIAL_BRANCH_CREATE,
+        )
+    if local_head != publish_guard.declared_publish_head or local_head != publish_guard.verified_head:
+        return _publish_safety_stop_result(
+            reason_code="local_head_mismatch",
+            target_branch=target_branch,
+            expected_remote_head=publish_guard.expected_remote_head,
+            current_remote_head=publish_guard.current_remote_head,
+            local_head=local_head,
+            verified_head=publish_guard.verified_head,
+            declared_publish_head=publish_guard.declared_publish_head,
+            allowed_paths_gate_status=publish_guard.allowed_paths_gate_status,
+            pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+            remote_readback_source=publish_guard.remote_readback_source,
+            decision_inputs_complete=publish_guard.decision_inputs_complete,
+            boundary_layer=boundary_layer,
+            command_class=COMMAND_CLASS_RTK_GIT_INITIAL_BRANCH_CREATE,
+        )
+    if not _origin_push_urls_match_canonical_repo(cwd):
+        return _publish_safety_stop_result(
+            reason_code="origin_remote_identity_mismatch",
+            target_branch=target_branch,
+            expected_remote_head=publish_guard.expected_remote_head,
+            current_remote_head=publish_guard.current_remote_head,
+            local_head=local_head,
+            verified_head=publish_guard.verified_head,
+            declared_publish_head=publish_guard.declared_publish_head,
+            allowed_paths_gate_status=publish_guard.allowed_paths_gate_status,
+            pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+            remote_readback_source=publish_guard.remote_readback_source,
+            decision_inputs_complete=publish_guard.decision_inputs_complete,
+            boundary_layer=boundary_layer,
+            command_class=COMMAND_CLASS_RTK_GIT_INITIAL_BRANCH_CREATE,
+        )
+    remote_state, remote_oid = classify_remote_branch_state(cwd, "origin", target_branch)
+    lane_status, lane_reason = evaluate_initial_branch_create_lane(
+        remote_state=remote_state,
+        local_head=local_head or "",
+        declared_publish_head=publish_guard.declared_publish_head,
+        verified_head=publish_guard.verified_head,
+        allowed_paths_gate_status=publish_guard.allowed_paths_gate_status,
+        decision_inputs_complete=publish_guard.decision_inputs_complete,
+        remote_readback_source=publish_guard.remote_readback_source,
+    )
+    if lane_status != "allow":
+        return _publish_safety_stop_result(
+            reason_code=lane_reason,
+            target_branch=target_branch,
+            expected_remote_head=publish_guard.expected_remote_head,
+            current_remote_head=remote_oid,
+            local_head=local_head,
+            verified_head=publish_guard.verified_head,
+            declared_publish_head=publish_guard.declared_publish_head,
+            allowed_paths_gate_status=publish_guard.allowed_paths_gate_status,
+            pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+            remote_readback_source=publish_guard.remote_readback_source,
+            decision_inputs_complete=publish_guard.decision_inputs_complete,
+            boundary_layer=boundary_layer,
+            command_class=COMMAND_CLASS_RTK_GIT_INITIAL_BRANCH_CREATE,
+            remote_state=remote_state,
+        )
+    return GitMutationPolicyResult(
+        status="allow",
+        command_class=COMMAND_CLASS_RTK_GIT_INITIAL_BRANCH_CREATE,
+        reason_code="initial_branch_create_allowed",
+        expected_remote_head=publish_guard.expected_remote_head,
+        current_remote_head=remote_oid,
+        local_head=local_head,
+        verified_head=publish_guard.verified_head,
+        declared_publish_head=publish_guard.declared_publish_head,
+        allowed_paths_gate_status=publish_guard.allowed_paths_gate_status,
+        target_branch=target_branch,
+        pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+        remote_readback_source=publish_guard.remote_readback_source,
+        decision_inputs_complete=publish_guard.decision_inputs_complete,
+        boundary_layer=boundary_layer,
+        remote_state=remote_state,
     )
 
 
@@ -737,6 +1102,20 @@ def classify_rtk_git_mutation(
             suggested_command="rtk git push origin HEAD:refs/heads/<active-branch>",
             verification_command="git branch --show-current",
         )
+
+    # Issue #1449: initial_branch_create lane candidate — a SEPARATE decision
+    # path from the existing_branch_update lane below. Only entered when the
+    # push argv is exactly 3 tokens whose first token starts with
+    # `--force-with-lease=` (the existing_branch_update lane never has more
+    # than 2 args: `origin HEAD:refs/heads/<branch>`).
+    if len(args) == 3 and args[0].startswith("--force-with-lease="):
+        return _classify_initial_branch_create_push(
+            args,
+            cwd=cwd,
+            require_active_branch_push=require_active_branch_push,
+            boundary_layer=boundary_layer,
+        )
+
     if len(args) != 2 or args[0] != "origin":
         return GitMutationPolicyResult(
             status="deny",
@@ -834,9 +1213,12 @@ def classify_rtk_git_mutation(
             live_remote_head, remote_absent = _ls_remote_head(cwd, "origin", target_branch)
             if remote_absent:
                 # Issue #1408 iteration-2 (P1): new-branch initial publish
-                # (remote ref does not exist yet) is out of scope for this
-                # bridge — see #1449. Deny explicitly rather than folding
-                # into the generic publish_guard_context_invalid path.
+                # (remote ref does not exist yet) via the existing_branch_update
+                # lane's plain `HEAD:refs/heads/<branch>` refspec remains out
+                # of scope for THIS lane — see Issue #1449, which adds a
+                # SEPARATE initial_branch_create lane (handled above via the
+                # `--force-with-lease=` argv shape) rather than changing this
+                # lane's behavior.
                 return _publish_safety_stop_result(
                     reason_code="remote_branch_absent_not_supported",
                     target_branch=target_branch,
@@ -967,6 +1349,7 @@ def _result_to_json(result: GitMutationPolicyResult | None) -> dict:
         "decision_inputs_complete": result.decision_inputs_complete,
         "required_decisions": list(result.required_decisions),
         "boundary_layer": result.boundary_layer,
+        "remote_state": result.remote_state,
     }
 
 
