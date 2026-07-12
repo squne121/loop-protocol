@@ -24,7 +24,7 @@
       "evidence_source": "event_derived",
       "event_fingerprint": "evt-impl-001",
       "runtime": {
-        "model": "gpt-5.4-mini",
+        "model": "gpt-5.6-luna",
         "reasoning_effort": "medium",
         "default_permissions": "loop-protocol-rtk"
       }

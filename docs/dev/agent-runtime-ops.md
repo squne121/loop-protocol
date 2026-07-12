@@ -9,6 +9,14 @@ Codex local runtime 運用の主文書。
 - repo の正本は引き続き `CLAUDE.md`、`docs/dev/workflow.md`、`docs/product/requirements.md` などの SSOT 群にある
 - Codex 向けの project-local guidance は `AGENTS.md` に集約し、この文書はその runtime 前提と復旧手順を補足する
 
+## Agent model allocation declaration proof
+
+`tests/fixtures/codex-agent-config/expected-runtime-contract.json` が custom agent のモデル、reasoning effort、permission 宣言の唯一の declaration proof である。TOML と静的 validator はこの契約への一致を検査するが、宣言値を provider-side dispatch の観測値として扱わない。
+
+証明は三層に分ける。declaration proof は contract/TOML の静的一致、dispatch proof は trusted hook が記録した observed model と session/turn/agent/run の相関、availability proof は同一 evidence run の direct smoke と明示custom-agent launchである。ledger は secret を保存せず、hook trust、freshness、repo head、agent definition hash を検証できない場合は PASS にせず `HUMAN_ACTION_REQUIRED` または `BLOCKED` とする。
+
+allocation を戻す必要がある場合は、contract、全対象TOML、hook/evidence validator、fixture を同一コミットで原子的に戻す。片面だけのrollbackや、過去runのledger再利用は許可しない。
+
 ## Network-Only Auto Allow
 
 この節は **network boundary の差分例** であり、permission profile 全体を列挙する complete profile ではない。

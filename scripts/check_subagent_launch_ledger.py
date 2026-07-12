@@ -103,7 +103,7 @@ def validate_common_schema(payload: dict, *, fixture_mode: bool) -> list[str]:
     return errors
 
 
-def validate_runtime_and_launches(payload: dict, expectations: dict) -> tuple[list[str], list[str]]:
+def validate_runtime_and_launches(payload: dict, expectations: dict, *, require_observed: bool = False) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     codes: list[str] = []
     runtime_map = canonical_runtime_map(expectations)
@@ -114,14 +114,19 @@ def validate_runtime_and_launches(payload: dict, expectations: dict) -> tuple[li
         codes.append("subagent_launch_evidence_missing")
 
     for launch in launches:
-        required_launch_keys = {
+        legacy_launch_keys = {
             "agent_name",
             "event_type",
             "evidence_source",
             "event_fingerprint",
             "runtime",
         }
-        if set(launch.keys()) != required_launch_keys:
+        observed_launch_keys = {
+            "agent_name", "event_type", "evidence_source", "event_fingerprint",
+            "declared_runtime", "observed_dispatch", "correlation",
+        }
+        launch_keys = set(launch.keys())
+        if launch_keys != legacy_launch_keys and launch_keys != observed_launch_keys:
             errors.append(f"launch has unknown/missing fields: {sorted(launch.keys())}")
             codes.append("launch_schema_violation")
             continue
@@ -141,11 +146,37 @@ def validate_runtime_and_launches(payload: dict, expectations: dict) -> tuple[li
             errors.append("launch event_fingerprint must be a non-empty string")
             codes.append("launch_schema_violation")
 
-        runtime = launch["runtime"]
+        runtime = launch.get("declared_runtime", launch.get("runtime"))
+        if launch_keys == observed_launch_keys:
+            observed = launch["observed_dispatch"]
+            correlation = launch["correlation"]
+            required_observed = {"model", "session_id", "turn_id", "agent_id", "observed_at"}
+            if set(observed.keys()) != required_observed or any(
+                not isinstance(observed.get(key), str) or not observed[key].strip()
+                for key in required_observed
+            ):
+                errors.append("observed_dispatch must contain an observed model and correlation identifiers")
+                codes.append("dispatch_evidence_missing")
+            required_correlation = {"evidence_run_id", "repo_head_sha", "worktree_dirty"}
+            if set(correlation.keys()) != required_correlation or any(
+                not isinstance(correlation.get(key), str) or not correlation[key].strip()
+                for key in ("evidence_run_id", "repo_head_sha")
+            ) or not isinstance(correlation.get("worktree_dirty"), bool):
+                errors.append("correlation must contain evidence_run_id, repo_head_sha, and worktree_dirty")
+                codes.append("stale_or_replayed_evidence")
+            if observed.get("model") != runtime.get("model"):
+                errors.append("observed dispatch model differs from declared runtime")
+                codes.append("runtime_contract_mismatch")
+        elif require_observed:
+            errors.append("declared-only launch is not runtime evidence")
+            codes.append("dispatch_evidence_missing")
         if set(runtime.keys()) != {"model", "reasoning_effort", "default_permissions"}:
-            errors.append(f"runtime has unknown/missing fields: {sorted(runtime.keys())}")
-            codes.append("launch_schema_violation")
-            continue
+            if set(runtime.keys()) == {"model", "reasoning_effort", "default_permissions", "agent_definition_sha256"}:
+                runtime = {key: runtime[key] for key in ("model", "reasoning_effort", "default_permissions")}
+            else:
+                errors.append(f"runtime has unknown/missing fields: {sorted(runtime.keys())}")
+                codes.append("launch_schema_violation")
+                continue
         expected_runtime = runtime_map[agent_name]
         if runtime != expected_runtime:
             errors.append(
@@ -252,7 +283,7 @@ def run_audit_mode(ledger_path: Path, expectations: dict) -> dict:
         errors.append(
             f"audit-mode forbids fixture-only fields: {unexpected_fixture_fields}"
         )
-    launch_errors, launch_codes = validate_runtime_and_launches(payload, expectations)
+    launch_errors, launch_codes = validate_runtime_and_launches(payload, expectations, require_observed=True)
     action_errors, action_codes = validate_root_thread_actions(payload)
     errors.extend(launch_errors)
     errors.extend(action_errors)
@@ -286,8 +317,12 @@ def main() -> int:
     else:
         result = run_audit_mode(args.ledger, expectations)
 
+    try:
+        ledger_ref = str(args.ledger.resolve().relative_to(REPO_ROOT))
+    except ValueError:
+        ledger_ref = str(args.ledger.resolve())
     output = {
-        "ledger": str(args.ledger.resolve().relative_to(REPO_ROOT)) if args.ledger.exists() else str(args.ledger),
+        "ledger": ledger_ref if args.ledger.exists() else str(args.ledger),
         "status": result["status"],
         "error_codes": result["error_codes"],
         "errors": result["errors"],
