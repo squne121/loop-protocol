@@ -25,6 +25,11 @@ _SCHEMA_VERSION = 1
 _DEFAULT_ARTIFACT_DIR = _REPO_ROOT / "artifacts" / "impl-review-loop"
 _TRIAGE_SCHEMA = "CONTRACT_BLOCKER_TRIAGE_V1"
 _TRIAGE_PATH = _SCRIPT_DIR / "triage_contract_blockers.py"
+# #1475: shared GitHub provenance trust policy (single source of truth).
+_CRP_PATH = (
+    _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts"
+    / "contract_review_result_parser.py"
+)
 _FENCED_YAML_RE = re.compile(r"```ya?ml[ \t]*\n(.*?)```", re.DOTALL)
 _CONTRACT_REVIEW_MARKER = "CONTRACT_REVIEW_RESULT_V1"
 
@@ -160,6 +165,12 @@ def _extract_yaml_blocks(body: str) -> list[str]:
     return [match.group(1) for match in _FENCED_YAML_RE.finditer(body)]
 
 
+def _is_trusted_snapshot_author(author: Any, author_association: Any) -> bool:
+    """#1475: delegate to the shared trust policy (single source of truth)."""
+    module = _load_module(_CRP_PATH, "contract_review_result_parser_for_intake_capsule")
+    return bool(module.is_trusted_snapshot_author(author, author_association))
+
+
 def _is_valid_contract_review_result(block: dict[str, Any], expected_issue_url: str) -> bool:
     inner = block.get(_CONTRACT_REVIEW_MARKER)
     if not isinstance(inner, dict):
@@ -232,7 +243,8 @@ def _collect_issue_comments(
         "--paginate",
         f"repos/{repo}/issues/{issue_number}/comments?per_page=100",
         "--jq",
-        ".[] | {id, html_url, created_at, updated_at, body}",
+        ".[] | {id, html_url, created_at, updated_at, body, "
+        "author: .user.login, author_association}",
     ]
     rc, stdout, stderr = _run_command(argv)
     _record_command(command_log, "issue_comments", argv, rc, stdout, stderr)
@@ -280,6 +292,8 @@ def _parse_contract_results(
             parsed = _parse_simple_yaml_block(raw_block)
             if _is_valid_contract_review_result(parsed, expected_issue_url):
                 inner = parsed[_CONTRACT_REVIEW_MARKER]
+                author = comment.get("author")
+                author_association = comment.get("author_association")
                 valid_blocks.append(
                     {
                         "comment_id": comment.get("id"),
@@ -288,6 +302,11 @@ def _parse_contract_results(
                         "updated_at": comment.get("updated_at", ""),
                         "status": inner.get("status"),
                         "inner": inner,
+                        "author": author,
+                        "author_association": author_association,
+                        "is_trusted_author": _is_trusted_snapshot_author(
+                            author, author_association
+                        ),
                     }
                 )
             else:
@@ -316,7 +335,12 @@ def _find_latest_result(results: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 def _find_latest_go(results: list[dict[str, Any]]) -> dict[str, Any] | None:
-    go_results = [item for item in results if item.get("status") == "go"]
+    # #1475: only a trusted-author go result is authoritative.
+    go_results = [
+        item
+        for item in results
+        if item.get("status") == "go" and item.get("is_trusted_author")
+    ]
     return _find_latest_result(go_results)
 
 

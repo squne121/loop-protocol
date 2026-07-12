@@ -13,6 +13,7 @@ Exit codes:
   30  invalid_input — argument エラー
   40  runtime_error — subprocess / network エラー
   50  stale_or_conflicting_snapshot — atomicity 検証で body_sha256 or updatedAt mismatch
+  60  controlled_publisher_binding_failed — #1475: 投稿直後の comment ID readback binding 不一致・欠落
 
 stdout: CONTRACT_SNAPSHOT_ENSURE_RESULT_V1 compact JSON のみ
 stderr: diagnostic messages のみ
@@ -378,6 +379,76 @@ def _extract_http_status(stderr: str) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
+# Controlled publisher comment ID binding (#1475, AC3)
+# ---------------------------------------------------------------------------
+
+_COMMENT_ID_FROM_URL_RE = re.compile(r"#issuecomment-(\d+)$")
+
+
+def extract_comment_id_from_url(url: Optional[str]) -> Optional[int]:
+    """Extract the numeric comment id from a GitHub issue comment html_url."""
+    if not url:
+        return None
+    m = _COMMENT_ID_FROM_URL_RE.search(url)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def verify_controlled_publisher_comment_id_binding(
+    issue_number: int,
+    repo: str,
+    expected_comment_id: Optional[int],
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> tuple[bool, Optional[str]]:
+    """
+    Confirm that the just-posted comment id is retrievable via the single
+    comment GitHub REST endpoint (repos/{repo}/issues/comments/{id}) and that
+    it is bound to this issue.
+
+    Fail-closed: a missing id, fetch error, invalid payload, id mismatch, or
+    issue mismatch all return (False, <reason_code>).
+    """
+    if not expected_comment_id:
+        return False, "missing_comment_id"
+    try:
+        result = subprocess.run(
+            [
+                "gh", "api",
+                f"repos/{repo}/issues/comments/{expected_comment_id}",
+                "--jq", "{id, issue_url}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "binding_readback_timeout"
+    except Exception:
+        return False, "binding_readback_error"
+
+    if result.returncode != 0:
+        return False, "binding_readback_error"
+
+    try:
+        payload = json.loads(result.stdout.strip())
+    except json.JSONDecodeError:
+        return False, "binding_readback_invalid_json"
+    if not isinstance(payload, dict):
+        return False, "binding_readback_invalid_json"
+
+    if payload.get("id") != expected_comment_id:
+        return False, "binding_id_mismatch"
+
+    issue_url = str(payload.get("issue_url") or "")
+    expected_suffix = f"/repos/{repo}/issues/{issue_number}"
+    if not issue_url.endswith(expected_suffix):
+        return False, "binding_issue_mismatch"
+
+    return True, None
+
+
+# ---------------------------------------------------------------------------
 # run_contract_review_once wrapper
 # ---------------------------------------------------------------------------
 
@@ -525,7 +596,7 @@ def ensure_contract_snapshot(
             comments, expected_issue_url=issue_url
         )
         latest = parser_mod.find_latest_result(results)
-        go_result = parser_mod.find_latest_go(results)
+        go_result = parser_mod.find_latest_go(results, trusted_only=True)
 
         # latest blocked retains precedence over existing-go adoption.
         if latest and latest["status"] == "blocked":
@@ -534,6 +605,8 @@ def ensure_contract_snapshot(
             result["contract_snapshot_url"] = latest["html_url"]
             return result
 
+        # #1475: parser_mod.find_latest_go(..., trusted_only=True) above already
+        # excludes untrusted-author results; is_go_current only re-checks freshness.
         if not is_go_current(go_result, body_sha256):
             break
 
@@ -684,7 +757,7 @@ def ensure_contract_snapshot(
         return result
 
     # Also check if a go comment appeared in the interim
-    go_post = parser_mod.find_latest_go(results_post)
+    go_post = parser_mod.find_latest_go(results_post, trusted_only=True)
     if is_go_current(go_post, body_sha256_post):
         body_dedupe, _updated_dedupe, dedupe_err = fetch_issue_snapshot(
             issue_number, repo
@@ -725,6 +798,20 @@ def ensure_contract_snapshot(
     result["http_status"] = http_status
 
     if post_code == POST_STATUS_POSTED:
+        # #1475 AC3: verify the controlled publisher's comment id is bound to
+        # this issue via an independent readback before treating the freshly
+        # materialized snapshot as authoritative. Fail-closed on mismatch.
+        expected_comment_id = extract_comment_id_from_url(url)
+        bound_ok, binding_err = verify_controlled_publisher_comment_id_binding(
+            issue_number, repo, expected_comment_id
+        )
+        if not bound_ok:
+            result["status"] = "controlled_publisher_binding_failed"
+            result["contract_snapshot_url"] = None
+            result["errors"].append(
+                f"controlled_publisher_binding_failed: {binding_err}"
+            )
+            return result
         # B3: status: ok only when contract_snapshot_url is non-null
         result["status"] = "ok"
         result["source"] = "materialized_go"
@@ -907,6 +994,8 @@ def main() -> int:
         return 20
     elif status == "stale_or_conflicting_snapshot":
         return 50
+    elif status == "controlled_publisher_binding_failed":
+        return 60
     else:  # runtime_error or unknown
         return 40
 

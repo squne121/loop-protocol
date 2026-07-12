@@ -221,7 +221,8 @@ def check_existing_go_comment(
     if latest and latest["status"] == "blocked":
         return None, None
 
-    go = find_latest_go(results)
+    # #1475: only a trusted-author go snapshot is authoritative for dedupe.
+    go = find_latest_go(results, trusted_only=True)
     if go is None:
         return None, None
 

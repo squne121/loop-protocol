@@ -39,7 +39,8 @@ def fetch_issue_comments(
                 "--paginate",
                 f"repos/{repo}/issues/{issue_number}/comments?per_page=100",
                 "--jq",
-                '.[] | {id, html_url, created_at, updated_at, body}',
+                '.[] | {id, html_url, created_at, updated_at, body, '
+                'author: .user.login, author_association}',
             ],
             capture_output=True,
             text=True,
@@ -156,6 +157,35 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Trust policy (GitHub provenance, #1475)
+# ---------------------------------------------------------------------------
+
+# Trusted GitHub author_association values. NONE/CONTRIBUTOR/FIRST_TIME_CONTRIBUTOR
+# are excluded so that arbitrary outside commenters cannot post an authoritative
+# snapshot.
+TRUSTED_AUTHOR_ASSOCIATIONS: frozenset[str] = frozenset(
+    {"OWNER", "MEMBER", "COLLABORATOR"}
+)
+
+
+def is_trusted_snapshot_author(
+    author: Optional[str],
+    author_association: Optional[str],
+) -> bool:
+    """
+    Decide whether a GitHub comment author/author_association pair is allowed
+    to publish an authoritative CONTRACT_REVIEW_RESULT_V1 snapshot.
+
+    Fail-closed: a missing/empty author or author_association is untrusted.
+    A snapshot is trusted iff author is present AND author_association is one
+    of TRUSTED_AUTHOR_ASSOCIATIONS (repo OWNER, MEMBER, or COLLABORATOR).
+    """
+    if not author or not author_association:
+        return False
+    return author_association in TRUSTED_AUTHOR_ASSOCIATIONS
+
+
+# ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 
@@ -243,6 +273,8 @@ def parse_contract_review_results(
                 inner = parsed[_CONTRACT_REVIEW_MARKER]
                 if not isinstance(inner, dict):
                     continue
+                author = comment.get("author")
+                author_association = comment.get("author_association")
                 results.append(
                     {
                         "comment_id": comment.get("id"),
@@ -251,6 +283,11 @@ def parse_contract_review_results(
                         "block": parsed,
                         "inner": inner,
                         "status": inner.get("status", ""),
+                        "author": author,
+                        "author_association": author_association,
+                        "is_trusted_author": is_trusted_snapshot_author(
+                            author, author_association
+                        ),
                     }
                 )
                 # Only take first valid block per comment
@@ -261,13 +298,21 @@ def parse_contract_review_results(
 
 def find_latest_go(
     results: list[dict],
+    *,
+    trusted_only: bool = False,
 ) -> Optional[dict]:
     """
     Return the latest (by created_at desc, comment_id desc) valid
     CONTRACT_REVIEW_RESULT_V1 with status: go.
     Returns None if no go result found.
+
+    trusted_only (#1475): when True, results whose is_trusted_author is not
+    True are excluded from candidacy. A schema-valid but untrusted
+    `status: go` is never returned as authoritative when trusted_only=True.
     """
     go_results = [r for r in results if r["status"] == "go"]
+    if trusted_only:
+        go_results = [r for r in go_results if r.get("is_trusted_author")]
     if not go_results:
         return None
     # Sort by created_at desc, then comment_id desc
