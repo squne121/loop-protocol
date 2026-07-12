@@ -159,6 +159,15 @@ EXISTING_PR=$(gh pr list --head <branch> --state open --json number,url --jq '.[
 4. fresh evidence の `source.limit` が正の整数かつ stored `source.limit` と一致すること、さらに fresh evidence の `decision_inputs_sha256` と `expected_decision_inputs_sha256` が一致することを確認する（collection 時点からの drift 検出。上記 2 で stored と expected の同一性が既に確認されているため、fresh がここで一致すれば stored・fresh 双方が同一 collection chain に属することが保証される）
 5. fresh evidence の `route`（`proceed` / `proceed_with_collision_evidence` のみ安全）・`source.complete`（`true` 必須）・`source.saturated`（`false` 必須）・`validation_errors`（空必須）・`dependency_resolution.unresolved_refs`（空配列必須）・`dependency_resolution.blocking_predecessor`（`null` 必須）・`current_issue.number`（`linked_issue` と一致必須）の安全性 predicate 検証
 
+Issue #1477 の限定例として、fresh evidence の `human_review_required` が #519・#520・#1429 の `readback_incomplete` **だけ**に起因するときは、次の全条件を満たす `overlap_readback_waiver` を live Issue body と同一 SHA の `CONTRACT_REVIEW_RESULT_V1 status: go` snapshot から検証してから、その3件だけを safe route 判定から除外できる。
+
+- `issue_numbers: [519, 520, 1429]`
+- `reason: human_approved_readback_ignore`
+- `expires_on: "2026-07-13"`（当日を含む）
+- `approved_by: user_session`
+
+対象外 Issue、他の incomplete candidate、`readback_incomplete` 以外の reason、期限切れ、live body / snapshot SHA 不一致、または waiver のキー・値不一致はすべて fail-closed とする。この例外は `source`、`validation_errors`、依存解決、current issue binding の既存 predicate を緩めず、任意 waiver を受け付ける一般機構ではない。
+
 いずれかが不成立の場合、`gh pr create` を呼ばず fail-closed で停止する（下記 Error Codes 参照）。オンライン再実行に使う `--repo` は `gh pr create --repo` にもそのまま渡される同一変数であり、これが AC8 の cross-repo binding mitigation の根拠（evidence 自体への `repository` フィールド追加は #1462 の scope。残存する cross-repo binding gap は本 gate では完全には閉じない）。
 
 `overlap_gate_active`（gate 起動要否, `forced_by_label` 判定）は `gh pr create` 呼び出し直前に毎回オンラインで linked issue の labels を再取得して決定する（PR #1467 review fix, P1-1）。処理前半で取得した labels のキャッシュはこの security decision には使わない（TOCTOU 対策）。labels 再取得が失敗した場合（認証エラー・JSON 不正・型不正等）は「ラベルなし」として扱わず fail-closed（gate を必ず有効化する）。

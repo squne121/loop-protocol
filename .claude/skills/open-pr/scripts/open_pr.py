@@ -20,6 +20,9 @@ import sys
 import tempfile
 from pathlib import Path
 import re
+from datetime import date
+
+import yaml
 
 E_APPROVAL_MISSING = "E_APPROVAL_MISSING"
 E_PR_BODY_VALIDATION_FAILED = "E_PR_BODY_VALIDATION_FAILED"
@@ -40,6 +43,12 @@ E_OVERLAP_PREFLIGHT_SOURCE_FAILURE = "E_OVERLAP_PREFLIGHT_SOURCE_FAILURE"
 # 再実行するのみ（#1458 の Out of Scope）。
 OVERLAP_PREFLIGHT_SCHEMA = "IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1"
 OVERLAP_PREFLIGHT_SAFE_ROUTES = frozenset({"proceed", "proceed_with_collision_evidence"})
+
+# #1477 の contract にだけ許容された、期限付きで固定された readback waiver。
+# 任意の Issue / 理由を consumer が受け入れる一般機構にはしない。
+OVERLAP_READBACK_WAIVER_ISSUE_NUMBERS = frozenset({519, 520, 1429})
+OVERLAP_READBACK_WAIVER_REASON = "human_approved_readback_ignore"
+OVERLAP_READBACK_WAIVER_APPROVED_BY = "user_session"
 
 # linked issue がこのラベルを持つ場合、`overlap_preflight` が未指定または
 # `required: false` でも gate を省略しない（AC2, bypass-via-omission 対策）。
@@ -575,6 +584,119 @@ def _positive_overlap_source_limit(evidence: dict) -> int | None:
     return limit
 
 
+def _extract_fenced_yaml(text: str, required_marker: str) -> list[dict]:
+    """required_marker を含む fenced YAML object だけを返す。"""
+    blocks = re.findall(r"```yaml\s*\n(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+    parsed: list[dict] = []
+    for block in blocks:
+        if required_marker not in block:
+            continue
+        try:
+            payload = yaml.safe_load(block)
+        except yaml.YAMLError:
+            continue
+        if isinstance(payload, dict):
+            parsed.append(payload)
+    return parsed
+
+
+def _load_verified_overlap_readback_waiver(
+    repo: str,
+    linked_issue: int,
+    *,
+    today: date | None = None,
+) -> tuple[dict | None, str | None]:
+    """live body と ``status: go`` snapshot が同一 SHA の waiver だけを返す。
+
+    Issue 本文だけ、または古い contract snapshot だけでは waiver を有効化しない。
+    戻り値の error detail は gate 側で fail-closed の監査情報に使う。
+    """
+    try:
+        result = run_gh(
+            "issue",
+            "view",
+            str(linked_issue),
+            "--repo",
+            repo,
+            "--json",
+            "body,comments,url",
+        )
+        issue = json.loads(result.stdout)
+    except (subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        return None, f"contract snapshot の取得に失敗: {exc}"
+    if not isinstance(issue, dict):
+        return None, "contract snapshot の Issue payload が object ではありません"
+    body = issue.get("body")
+    comments = issue.get("comments")
+    url = issue.get("url")
+    if not isinstance(body, str) or not isinstance(comments, list) or not isinstance(url, str):
+        return None, "contract snapshot の Issue payload に body/comments/url がありません"
+
+    body_sha256 = f"sha256:{hashlib.sha256(body.encode('utf-8')).hexdigest()}"
+    contract_blocks = _extract_fenced_yaml(body, "overlap_readback_waiver")
+    waiver = next(
+        (block.get("overlap_readback_waiver") for block in contract_blocks
+         if isinstance(block.get("overlap_readback_waiver"), dict)),
+        None,
+    )
+    if not isinstance(waiver, dict):
+        return None, "live contract に overlap_readback_waiver がありません"
+
+    expected_waiver = {
+        "issue_numbers": [519, 520, 1429],
+        "reason": OVERLAP_READBACK_WAIVER_REASON,
+        "expires_on": "2026-07-13",
+        "approved_by": OVERLAP_READBACK_WAIVER_APPROVED_BY,
+    }
+    if waiver != expected_waiver:
+        return None, "overlap_readback_waiver が固定 contract と完全一致しません"
+    if (today or date.today()) > date.fromisoformat(expected_waiver["expires_on"]):
+        return None, "overlap_readback_waiver の期限が切れています"
+
+    for comment in comments:
+        if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
+            continue
+        for snapshot in _extract_fenced_yaml(comment["body"], "CONTRACT_REVIEW_RESULT_V1"):
+            result_payload = snapshot.get("CONTRACT_REVIEW_RESULT_V1")
+            if not isinstance(result_payload, dict):
+                continue
+            if (
+                result_payload.get("status") == "go"
+                and result_payload.get("generated_by") == "issue-contract-review"
+                and result_payload.get("issue_url") == url
+                and result_payload.get("body_sha256") == body_sha256
+            ):
+                return waiver, None
+    return None, "live body SHA と一致する status: go contract snapshot がありません"
+
+
+def _has_only_fixed_readback_incomplete_blockers(fresh: dict) -> bool:
+    """固定3件の readback_incomplete だけが route を妨げる場合に限り True。"""
+    if fresh.get("route") != "human_review_required":
+        return False
+    candidates = fresh.get("candidates")
+    if not isinstance(candidates, list):
+        return False
+    incomplete = [
+        candidate for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("readback_complete") is False
+    ]
+    if len(incomplete) != len(OVERLAP_READBACK_WAIVER_ISSUE_NUMBERS):
+        return False
+    numbers = {candidate.get("issue_number") for candidate in incomplete}
+    if numbers != OVERLAP_READBACK_WAIVER_ISSUE_NUMBERS:
+        return False
+    for candidate in incomplete:
+        reasons = candidate.get("reasons")
+        if (
+            not isinstance(reasons, list)
+            or not reasons
+            or not all(isinstance(reason, str) and reason.startswith("readback_incomplete") for reason in reasons)
+        ):
+            return False
+    return True
+
+
 def _overlap_preflight_safety_reason(fresh: dict, linked_issue: int) -> str | None:
     """AC4 の安全性 predicate を検証する。violation があれば理由文字列、
     なければ None を返す。"""
@@ -736,6 +858,27 @@ def run_overlap_preflight_gate(
 
     unsafe_reason = _overlap_preflight_safety_reason(fresh, linked_issue)
     if unsafe_reason is not None:
+        # #1477: route が human_review_required になった原因が、integrity を
+        # 確認できる期限付き contract waiver の固定3件だけであるときに限り、
+        # その3 candidate を既存の safe-route 判定から除外する。他の source /
+        # dependency / validation failure はこの clone 後にも必ず判定される。
+        if _has_only_fixed_readback_incomplete_blockers(fresh):
+            waiver, waiver_error = _load_verified_overlap_readback_waiver(repo, linked_issue)
+            if waiver_error is not None:
+                return (
+                    False,
+                    E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID,
+                    f"overlap_readback_waiver が検証できません: {waiver_error}",
+                    fresh,
+                )
+            effective_fresh = dict(fresh)
+            if waiver is not None:
+                effective_fresh["route"] = "proceed_with_collision_evidence"
+                remaining_unsafe_reason = _overlap_preflight_safety_reason(
+                    effective_fresh, linked_issue
+                )
+                if remaining_unsafe_reason is None:
+                    return True, None, "", effective_fresh
         return False, E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE, unsafe_reason, fresh
 
     return True, None, "", fresh
