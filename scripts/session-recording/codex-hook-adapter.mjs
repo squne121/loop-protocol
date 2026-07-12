@@ -559,6 +559,33 @@ function evaluateGuard(payload, eventName) {
         // AC1: validated publish lane evidence — no denial, command passes through.
         return null
       }
+      // Issue #1449 (PR #1479 OWNER review, P1 Blocker 1): the
+      // initial_branch_create lane NEVER returns `allow` — the real
+      // probe -> push -> readback transaction already ran synchronously
+      // inside `classify_rtk_git_mutation` (via
+      // `execute_initial_branch_create_transaction`), so the raw shell
+      // command that triggered this hook is always denied afterward (it
+      // would otherwise attempt a redundant/racy second push against the
+      // same empty-expect lease). `reason_code` distinguishes an actual
+      // completed-and-verified publish from a genuine safety stop.
+      if (publishLane && publishLane.command_class === 'rtk_git_initial_branch_create') {
+        const preview = redactCommandPreview(rawCommand)
+        const remoteStateDetail = publishLane.remote_state_detail ?? {}
+        return {
+          action: 'deny',
+          reason_code: 'initial_branch_create_transaction_result',
+          command_kind: publishLane.command_class,
+          message: `${eventName}: initial_branch_create_transaction_result `
+            + `[transaction_status=${publishLane.reason_code}] `
+            + `[remote_state=${remoteStateDetail.kind ?? publishLane.remote_state}] `
+            + `[remote_oid=${remoteStateDetail.oid ?? 'null'}] `
+            + `[error_category=${remoteStateDetail.error_category ?? 'null'}] `
+            + `[local_head=${publishLane.local_head}] `
+            + `blocked_command_preview="${preview}" `
+            + '(the trusted transaction already executed the probe/push/readback — '
+            + 'do not retry the raw command; inspect transaction_status above)',
+        }
+      }
       if (publishLane && publishLane.status === 'deny') {
         // AC3: PUBLISH_SAFETY_STOP_REPORT_V1-shaped reason — boundary_layer /
         // reason_code / head comparison values / required decisions.

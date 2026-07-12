@@ -82,12 +82,17 @@ def _publish_lane_env(head: str, remote: Path, issue_number: str = "1449") -> di
 
 
 def test_initial_branch_create_pretooluse_lane(tmp_path: Path):
-    """AC11: positive lane (remote branch absent — initial create allowed)
-    and negative lane (remote branch already present — empty-expect lease
-    rejected) through the real PreToolUse entrypoint."""
+    """AC11 (Issue #1449 PR #1479 OWNER review, required test #10): a TRUE
+    end-to-end test through the real PreToolUse entrypoint that verifies the
+    remote branch state, not merely the absence of a deny. The
+    initial_branch_create lane now ALWAYS denies the raw shell command
+    (Blocker 1 fix — the actual push already ran inside the trusted
+    transaction), so the positive-lane assertion is: the remote branch was
+    actually created and matches the verified local head, confirmed via an
+    independent `git ls-remote` — not via `stdout == ""`."""
     branch = "worktree-issue-1449-initial-branch-create-lane"
 
-    # ---- Positive lane: remote branch absent -> allowed (no deny emitted) ----
+    # ---- Positive lane: remote branch absent -> transaction creates it ----
     positive_repo = tmp_path / "positive-repo"
     positive_repo.mkdir()
     head, remote = _init_repo_with_bare_remote(positive_repo, branch)
@@ -100,7 +105,22 @@ def test_initial_branch_create_pretooluse_lane(tmp_path: Path):
         env=env,
         cwd=positive_repo,
     )
-    assert result.stdout == "", result.stdout
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "initial_branch_create_transaction_result" in reason
+    assert "transaction_status=created_and_verified" in reason
+
+    # Independent verification: re-read the remote ref directly (not via the
+    # policy module) and confirm it now matches the verified local head.
+    verify = subprocess.run(
+        ["git", "ls-remote", "--refs", "--exit-code", str(remote), f"refs/heads/{branch}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    remote_oid = verify.stdout.strip().split()[0]
+    assert remote_oid == head
 
     # ---- Negative lane: remote branch already present -> denied ----
     negative_repo = tmp_path / "negative-repo"
@@ -115,8 +135,48 @@ def test_initial_branch_create_pretooluse_lane(tmp_path: Path):
         env=neg_env,
         cwd=negative_repo,
     )
-    response = json.loads(neg_result.stdout)
+    neg_response = json.loads(neg_result.stdout)
+    assert neg_response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    neg_reason = neg_response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "initial_branch_create_transaction_result" in neg_reason
+    assert "transaction_status=remote_branch_present_route_existing_update" in neg_reason
+
+
+def test_initial_branch_create_pretooluse_lane_head_race_denies(tmp_path: Path):
+    """Required test #3 (Issue #1449 PR #1479 OWNER review): if HEAD is
+    changed after the guard-context verification but before the trusted
+    transaction's push, the transaction must deny — it must never publish
+    an unverified commit."""
+    branch = "worktree-issue-1449-initial-branch-create-lane"
+    repo = tmp_path / "race-repo"
+    repo.mkdir()
+    head, remote = _init_repo_with_bare_remote(repo, branch)
+    env = _publish_lane_env(head, remote)
+    # Simulate a concurrent process moving HEAD to a different commit AFTER
+    # the publish-guard context was computed (env still declares `head`).
+    _commit(repo, "moved.txt", "moved-after-verification")
+
+    command = f"rtk git push --force-with-lease=refs/heads/{branch}: origin HEAD:refs/heads/{branch}"
+    result = run_adapter(
+        "PreToolUse",
+        {"tool_name": "Bash", "tool_input": {"command": command}},
+        env=env,
+        cwd=repo,
+    )
+    response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
-    assert "publish_lane_safety_stop" in reason
-    assert "reason_code=remote_branch_present_route_existing_update" in reason
+    # The Allowed Paths gate head-binding check (bound to the real live HEAD)
+    # catches the drift before the local_head_mismatch check is even reached
+    # — either reason is an acceptable deny for this race, but the important
+    # invariant (checked below) is that the remote stays untouched.
+    assert "allowed_paths_gate_binding_mismatch" in reason or "local_head_mismatch" in reason
+
+    # The remote must remain untouched — no unverified commit was published.
+    verify = subprocess.run(
+        ["git", "ls-remote", "--refs", "--exit-code", str(remote), f"refs/heads/{branch}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert verify.returncode == 2

@@ -18,6 +18,13 @@ if str(_GUARDS_DIR) not in sys.path:
     sys.path.insert(0, str(_GUARDS_DIR))
 
 from git_mutation_command_policy import (
+    INITIAL_BRANCH_CREATE_STATUS_CREATED_VERIFIED,
+    INITIAL_BRANCH_CREATE_STATUS_DENIED,
+    INITIAL_BRANCH_CREATE_STATUS_READBACK_MISMATCH,
+    INITIAL_BRANCH_CREATE_STATUS_TRANSPORT_ERROR_ABSENT,
+    INITIAL_BRANCH_CREATE_STATUS_TRANSPORT_ERROR_CREATED,
+    PROBE_ERROR_CATEGORY_TIMEOUT,
+    PROBE_ERROR_CATEGORY_TRANSPORT_ERROR,
     REMOTE_STATE_ABSENT,
     REMOTE_STATE_PRESENT,
     REMOTE_STATE_PROBE_ERROR,
@@ -26,6 +33,9 @@ from git_mutation_command_policy import (
     classify_rtk_git_mutation,
     evaluate_initial_branch_create_lane,
     execute_initial_branch_create_push,
+    execute_initial_branch_create_transaction,
+    resolve_single_push_url,
+    validate_branch_name_via_git,
     validate_initial_branch_create_argv,
     verify_initial_branch_create_readback,
 )
@@ -91,7 +101,7 @@ def test_remote_state_classification_absent_when_ref_missing(tmp_path: Path):
     """GIVEN a bare remote with no matching ref WHEN classify_remote_branch_state
     runs THEN it returns (absent, None)."""
     repo, remote, _head = _make_repo_with_remote(tmp_path, "topic")
-    state, oid = classify_remote_branch_state(str(repo), "origin", "topic")
+    state, oid, _category = classify_remote_branch_state(str(repo), "origin", "topic")
     assert state == REMOTE_STATE_ABSENT
     assert oid is None
 
@@ -101,7 +111,7 @@ def test_remote_state_classification_present_when_ref_exists(tmp_path: Path):
     runs THEN it returns (present, <live-sha>)."""
     repo, remote, head = _make_repo_with_remote(tmp_path, "topic")
     subprocess.run(["git", "pu" + "sh", "-q", "origin", "HEAD:refs/heads/topic"], cwd=repo, check=True)
-    state, oid = classify_remote_branch_state(str(repo), "origin", "topic")
+    state, oid, _category = classify_remote_branch_state(str(repo), "origin", "topic")
     assert state == REMOTE_STATE_PRESENT
     assert oid == head
 
@@ -115,7 +125,7 @@ def test_remote_state_classification_probe_error_on_nonexistent_remote(tmp_path:
     _commit(repo, "tracked.txt", "initial")
     missing_remote = tmp_path / "does-not-exist.git"
     subprocess.run(["git", "remote", "add", "origin", str(missing_remote)], cwd=repo, check=True)
-    state, oid = classify_remote_branch_state(str(repo), "origin", "topic")
+    state, oid, _category = classify_remote_branch_state(str(repo), "origin", "topic")
     assert state == REMOTE_STATE_PROBE_ERROR
     assert oid is None
 
@@ -129,7 +139,7 @@ def test_remote_state_classification_probe_error_on_timeout(tmp_path: Path, monk
         raise subprocess.TimeoutExpired(cmd="git ls-remote", timeout=10)
 
     monkeypatch.setattr(subprocess, "run", _raise_timeout)
-    state, oid = classify_remote_branch_state(str(repo), "origin", "topic")
+    state, oid, _category = classify_remote_branch_state(str(repo), "origin", "topic")
     assert state == REMOTE_STATE_PROBE_ERROR
     assert oid is None
 
@@ -188,7 +198,7 @@ def test_bare_remote_initial_create_succeeds(tmp_path: Path):
     result = execute_initial_branch_create_push(str(repo), "origin", "topic")
     assert result.returncode == 0, result.stderr
 
-    state, oid = classify_remote_branch_state(str(repo), "origin", "topic")
+    state, oid, _category = classify_remote_branch_state(str(repo), "origin", "topic")
     assert state == REMOTE_STATE_PRESENT
     assert oid == head
 
@@ -206,7 +216,7 @@ def test_race_lease_rejects_conflicting_ref(tmp_path: Path):
     repo, remote, head = _make_repo_with_remote(tmp_path, "topic")
 
     # Probe confirms absent.
-    state, _oid = classify_remote_branch_state(str(repo), "origin", "topic")
+    state, _oid, _category = classify_remote_branch_state(str(repo), "origin", "topic")
     assert state == REMOTE_STATE_ABSENT
 
     # Simulate a competing process creating the ref between probe and push.
@@ -221,7 +231,7 @@ def test_race_lease_rejects_conflicting_ref(tmp_path: Path):
     assert result.returncode != 0
 
     # The competitor's ref must remain untouched (not overwritten by our push).
-    state_after, oid_after = classify_remote_branch_state(str(repo), "origin", "topic")
+    state_after, oid_after, _category_after = classify_remote_branch_state(str(repo), "origin", "topic")
     assert state_after == REMOTE_STATE_PRESENT
     assert oid_after == competitor_head
     assert oid_after != head
@@ -437,3 +447,302 @@ def test_denied_default_branch_target_still_denied():
 # duplicated here; scripts/agent-guards/tests/test_git_mutation_command_policy.py
 # already exercises test_publish_lane_allows_only_matching_remote_branch_and_heads.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# PR #1479 OWNER review (P1 Blocker 1): production executor actually creates
+# the remote branch, end-to-end, through execute_initial_branch_create_transaction.
+# (Required test #1 / #2)
+# ---------------------------------------------------------------------------
+
+
+def test_transaction_creates_remote_branch_and_readback_matches_verified_sha(tmp_path: Path):
+    """GIVEN a bare remote with no matching ref WHEN
+    execute_initial_branch_create_transaction runs THEN the remote branch is
+    actually created AND the post-transaction readback confirms it matches
+    the verified SHA (not just that a push subprocess returned 0)."""
+    repo, remote, head = _make_repo_with_remote(tmp_path, "topic")
+    result = execute_initial_branch_create_transaction(str(repo), "topic", head)
+    assert result.status == INITIAL_BRANCH_CREATE_STATUS_CREATED_VERIFIED
+    assert result.remote_oid == head
+
+    # Independent verification, bypassing the policy module entirely.
+    verify = subprocess.run(
+        ["git", "ls-remote", "--refs", "--exit-code", str(remote), "refs/heads/topic"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert verify.stdout.strip().split()[0] == head
+
+
+# ---------------------------------------------------------------------------
+# PR #1479 OWNER review (P1 Blocker 3): HEAD moved after verification but
+# before push must never publish the unverified commit. (Required test #3)
+# ---------------------------------------------------------------------------
+
+
+def test_transaction_denies_when_head_changes_after_verification(tmp_path: Path):
+    """GIVEN local HEAD moves to a different commit after `expected_head` was
+    captured (verification time) but before the transaction's push WHEN
+    execute_initial_branch_create_transaction runs THEN it denies
+    (`head_changed_before_push`) and the remote remains untouched — the
+    unverified commit is never published."""
+    repo, remote, verified_head = _make_repo_with_remote(tmp_path, "topic")
+    moved_head = _commit(repo, "moved.txt", "moved-after-verification")
+    assert moved_head != verified_head
+
+    result = execute_initial_branch_create_transaction(str(repo), "topic", verified_head)
+    assert result.status == INITIAL_BRANCH_CREATE_STATUS_DENIED
+    assert result.reason_code == "head_changed_before_push"
+
+    verify = subprocess.run(
+        ["git", "ls-remote", "--refs", "--exit-code", str(remote), "refs/heads/topic"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert verify.returncode == 2  # remote ref still absent
+
+
+def test_verified_sha_embedded_in_refspec_source_not_head_token():
+    """GIVEN a verified SHA WHEN build_initial_branch_create_argv runs with
+    verified_sha THEN the refspec source is the verified SHA itself, never
+    the literal `HEAD` token (Blocker 3: HEAD is resolved at push-execution
+    time and can drift from what was verified)."""
+    sha = "a" * 40
+    argv = build_initial_branch_create_argv("origin", "topic", verified_sha=sha)
+    assert argv[-1] == f"{sha}:refs/heads/topic"
+    assert "HEAD" not in argv[-1]
+
+
+# ---------------------------------------------------------------------------
+# PR #1479 OWNER review (P1 Blocker 2): probe/push/readback must all target
+# the SAME resolved push URL — fail-closed on ambiguous or missing push URL
+# configuration. (Required test #4 / #5)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_single_push_url_fails_closed_when_url_and_pushurl_differ(tmp_path: Path):
+    """GIVEN `origin` has a plain `url` different from its `pushurl` WHEN
+    resolve_single_push_url runs THEN it resolves to the configured pushurl
+    (the actual push destination) — never the plain fetch `url`."""
+    repo, remote, _head = _make_repo_with_remote(tmp_path, "topic")
+    other_remote = tmp_path / "other-remote.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(other_remote)], check=True)
+    subprocess.run(["git", "remote", "set-url", "--push", "origin", str(other_remote)], cwd=repo, check=True)
+
+    url, reason = resolve_single_push_url(str(repo), "origin")
+    assert reason == "push_url_resolved"
+    assert url == str(other_remote)
+    assert url != str(remote)
+
+
+def test_resolve_single_push_url_fails_closed_on_multiple_push_urls(tmp_path: Path):
+    """GIVEN `origin` has multiple configured push URLs WHEN
+    resolve_single_push_url runs THEN it fails closed (`None`,
+    push_url_ambiguous_multiple_configured) rather than picking one
+    arbitrarily or pushing to all of them while probing/reading back only
+    one."""
+    repo, remote, _head = _make_repo_with_remote(tmp_path, "topic")
+    second_remote = tmp_path / "second-remote.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(second_remote)], check=True)
+    subprocess.run(["git", "remote", "set-url", "--add", "--push", "origin", str(remote)], cwd=repo, check=True)
+    subprocess.run(["git", "remote", "set-url", "--add", "--push", "origin", str(second_remote)], cwd=repo, check=True)
+
+    url, reason = resolve_single_push_url(str(repo), "origin")
+    assert url is None
+    assert reason == "push_url_ambiguous_multiple_configured"
+
+
+def test_transaction_denies_on_multiple_push_urls(tmp_path: Path):
+    """GIVEN origin has multiple configured push URLs WHEN
+    execute_initial_branch_create_transaction runs THEN it denies before
+    attempting any push."""
+    repo, remote, head = _make_repo_with_remote(tmp_path, "topic")
+    second_remote = tmp_path / "second-remote.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(second_remote)], check=True)
+    subprocess.run(["git", "remote", "set-url", "--add", "--push", "origin", str(remote)], cwd=repo, check=True)
+    subprocess.run(["git", "remote", "set-url", "--add", "--push", "origin", str(second_remote)], cwd=repo, check=True)
+
+    result = execute_initial_branch_create_transaction(str(repo), "topic", head)
+    assert result.status == INITIAL_BRANCH_CREATE_STATUS_DENIED
+    assert result.reason_code == "push_url_ambiguous_multiple_configured"
+
+
+# ---------------------------------------------------------------------------
+# PR #1479 OWNER review (P1 High): timeout / transport-error handling always
+# performs a readback and never silently treats "no readback" as success.
+# (Required test #6 / #7)
+# ---------------------------------------------------------------------------
+
+
+def test_transaction_readback_after_push_timeout_reports_created_when_matched(tmp_path: Path, monkeypatch):
+    """GIVEN the push subprocess itself times out but the remote WAS updated
+    (simulated: patch subprocess.run to raise TimeoutExpired for the push
+    call only, then let the real push happen first) WHEN
+    execute_initial_branch_create_transaction runs THEN it still performs a
+    readback and reports `transport_error_but_created_and_verified` rather
+    than silently succeeding or silently failing."""
+    repo, remote, head = _make_repo_with_remote(tmp_path, "topic")
+    real_run = subprocess.run
+    call_state = {"push_calls": 0}
+
+    def _fake_run(argv, **kwargs):
+        if isinstance(argv, list) and len(argv) >= 2 and argv[0] == "git" and argv[1] == "push":
+            call_state["push_calls"] += 1
+            # Perform the real push (so the remote really is updated) then
+            # report it to the caller as a timeout — simulating a push that
+            # succeeded on the wire but whose confirmation never arrived.
+            real_run(argv, **{**kwargs, "timeout": kwargs.get("timeout", 30)})
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout", 30))
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    result = execute_initial_branch_create_transaction(str(repo), "topic", head)
+    assert result.status == INITIAL_BRANCH_CREATE_STATUS_TRANSPORT_ERROR_CREATED
+    assert result.push_error_category == PROBE_ERROR_CATEGORY_TIMEOUT
+    assert call_state["push_calls"] == 1
+
+
+def test_transaction_readback_after_push_transport_error_remote_still_absent(tmp_path: Path, monkeypatch):
+    """GIVEN the push subprocess raises OSError (transport failure) and the
+    remote was NOT actually updated WHEN
+    execute_initial_branch_create_transaction runs THEN it reports
+    `transport_error_remote_absent` (readback confirms absence) rather than
+    assuming success."""
+    repo, _remote, head = _make_repo_with_remote(tmp_path, "topic")
+    real_run = subprocess.run
+
+    def _fake_run(argv, **kwargs):
+        if isinstance(argv, list) and len(argv) >= 2 and argv[0] == "git" and argv[1] == "push":
+            raise OSError("simulated transport failure")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    result = execute_initial_branch_create_transaction(str(repo), "topic", head)
+    assert result.status == INITIAL_BRANCH_CREATE_STATUS_TRANSPORT_ERROR_ABSENT
+    assert result.push_error_category == PROBE_ERROR_CATEGORY_TRANSPORT_ERROR
+
+
+def test_transaction_readback_mismatch_is_structured_deny(tmp_path: Path, monkeypatch):
+    """GIVEN a push that returns success (returncode 0) but the post-push
+    readback shows a DIFFERENT oid than the verified head (simulated
+    competitor overwrite between our push and our readback) WHEN
+    execute_initial_branch_create_transaction runs THEN it reports
+    `readback_mismatch` as a structured deny (Required test #7) — never
+    treated as success just because the push subprocess itself returned 0."""
+    repo, remote, head = _make_repo_with_remote(tmp_path, "topic")
+    real_run = subprocess.run
+
+    def _fake_run(argv, **kwargs):
+        if isinstance(argv, list) and len(argv) >= 2 and argv[0] == "git" and argv[1] == "push":
+            # Push our verified head successfully...
+            result = real_run(argv, **kwargs)
+            # ...then simulate a competitor immediately overwriting the ref
+            # before our readback runs (still returns the ORIGINAL push's
+            # completed_process to the caller as if it succeeded normally).
+            competitor = tmp_path / "competitor"
+            subprocess.run(["git", "clone", "-q", str(remote), str(competitor)], check=True)
+            _init_repo(competitor, "topic")
+            _commit(competitor, "competitor.txt", "competitor-overwrite")
+            real_run(
+                ["git", "push", "--force", "origin", "HEAD:refs/heads/topic"],
+                cwd=str(competitor),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            return result
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    result = execute_initial_branch_create_transaction(str(repo), "topic", head)
+    assert result.status == INITIAL_BRANCH_CREATE_STATUS_READBACK_MISMATCH
+    assert result.remote_oid != head
+
+
+# ---------------------------------------------------------------------------
+# PR #1479 OWNER review (P2): branch-name validation delegates to Git's own
+# grammar (`git check-ref-format --branch`), not a looser hand-rolled regex.
+# (Required test #8)
+# ---------------------------------------------------------------------------
+
+
+INVALID_GIT_BRANCH_NAMES = [
+    ".foo",
+    "foo.lock",
+    "foo..bar",
+    "foo//bar",
+    "foo/",
+    "-foo",
+]
+
+
+@pytest.mark.parametrize("branch", INVALID_GIT_BRANCH_NAMES)
+def test_validate_branch_name_via_git_rejects_invalid_names(tmp_path: Path, branch: str):
+    """GIVEN a branch name that Git itself rejects (but the old
+    `[A-Za-z0-9._/-]+` regex would have accepted) WHEN
+    validate_branch_name_via_git runs THEN it is denied."""
+    repo, _remote, _head = _make_repo_with_remote(tmp_path, "topic")
+    is_valid, reason = validate_branch_name_via_git(str(repo), branch)
+    assert is_valid is False
+    assert reason == "invalid_target_branch"
+
+
+def test_validate_branch_name_via_git_accepts_valid_name(tmp_path: Path):
+    """GIVEN a well-formed branch name WHEN validate_branch_name_via_git runs
+    THEN it is accepted."""
+    repo, _remote, _head = _make_repo_with_remote(tmp_path, "topic")
+    is_valid, reason = validate_branch_name_via_git(str(repo), "worktree-issue-1449-lane")
+    assert is_valid is True
+    assert reason == "valid_target_branch"
+
+
+@pytest.mark.parametrize("branch", INVALID_GIT_BRANCH_NAMES)
+def test_transaction_denies_invalid_branch_names_via_full_classify(tmp_path: Path, monkeypatch, branch: str):
+    """GIVEN an invalid Git branch name embedded in the initial_branch_create
+    push shape WHEN classify_rtk_git_mutation runs THEN it is denied via the
+    real Git ref-name grammar check, not silently accepted by the looser
+    regex."""
+    repo, remote, head = _make_repo_with_remote(tmp_path, "topic")
+    _set_strict_publish_env(monkeypatch, head=head, remote=remote)
+    command = f"rtk git push --force-with-lease=refs/heads/{branch}: origin HEAD:refs/heads/{branch}"
+    result = classify_rtk_git_mutation(command, cwd=str(repo), require_active_branch_push=False)
+    assert result is not None
+    assert result.status == "deny"
+
+
+# ---------------------------------------------------------------------------
+# PR #1479 OWNER review (P1 Blocker 1, required test #9): a raw, direct
+# `rtk git push` cannot bypass the trusted transaction executor — the SAME
+# classify_rtk_git_mutation call path always routes through
+# execute_initial_branch_create_transaction for this argv shape, so there is
+# no separate "allow, then the caller pushes on its own" code path to skip.
+# ---------------------------------------------------------------------------
+
+
+def test_direct_rtk_git_push_cannot_bypass_transaction_executor(tmp_path: Path, monkeypatch):
+    """GIVEN a direct `rtk git push --force-with-lease=...` command WHEN
+    classify_rtk_git_mutation classifies it THEN the result is NEVER
+    `status == "allow"` for this lane — the transaction already ran inside
+    classify itself, so there is no residual "allow" path a caller's raw
+    shell command could exploit to push independently."""
+    repo, remote, head = _make_repo_with_remote(tmp_path, "topic")
+    _set_strict_publish_env(monkeypatch, head=head, remote=remote)
+    command = "rtk git push --force-with-lease=refs/heads/topic: origin HEAD:refs/heads/topic"
+    result = classify_rtk_git_mutation(command, cwd=str(repo), require_active_branch_push=False)
+    assert result is not None
+    assert result.status == "deny"
+    assert result.reason_code == INITIAL_BRANCH_CREATE_STATUS_CREATED_VERIFIED
+
+    # And the remote branch really was created by the transaction, not by
+    # any subsequent (never-executed) raw shell command.
+    verify = subprocess.run(
+        ["git", "ls-remote", "--refs", "--exit-code", str(remote), "refs/heads/topic"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert verify.stdout.strip().split()[0] == head
