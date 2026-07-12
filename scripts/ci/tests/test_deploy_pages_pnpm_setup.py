@@ -606,5 +606,130 @@ def test_version_assertion_script_exits_nonzero_on_range_package_manager(job_nam
     )
 
 
+
+# ---------------------------------------------------------------------------
+# P1-3: agent-retro-index.yml read-only bootstrap smoke job (Issue #1476)
+#
+# agent-retro-index.yml's write jobs (build-index / upsert-parent-comment)
+# only trigger on workflow_dispatch and push-to-main, so a PR touching this
+# file's pnpm bootstrap was never actually exercised by CI. These tests
+# assert (a) the write jobs are excluded from pull_request, (b) a dedicated
+# read-only bootstrap-smoke job runs on pull_request instead, and (c) its
+# version-assertion step is bootstrap-equivalent to deploy-pages.yml's --
+# same runtime-derivation-from-packageManager pattern, no error suppression.
+# ---------------------------------------------------------------------------
+
+AGENT_RETRO_INDEX_WORKFLOW_RELPATH = Path(".github") / "workflows" / "agent-retro-index.yml"
+AGENT_RETRO_INDEX_WRITE_JOBS = ("build-index", "upsert-parent-comment")
+AGENT_RETRO_INDEX_SMOKE_JOB = "bootstrap-smoke"
+
+
+def _load_agent_retro_index_workflow(root: Path = REPO_ROOT) -> dict[str, Any]:
+    path = root / AGENT_RETRO_INDEX_WORKFLOW_RELPATH
+    with path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def test_agent_retro_index_has_pull_request_trigger():
+    """P1-3: agent-retro-index.yml must declare a pull_request trigger so its
+    bootstrap-smoke job is actually exercised by PR-scoped CI."""
+    workflow = _load_agent_retro_index_workflow()
+    # PyYAML (YAML 1.1) parses the bare `on:` key as the boolean `True`, not
+    # the string "on" -- guard against both to avoid a false negative.
+    triggers = workflow.get("on")
+    if triggers is None:
+        triggers = workflow.get(True) or {}
+    assert "pull_request" in triggers, (
+        "agent-retro-index.yml must declare a pull_request trigger "
+        "(Issue #1476 P1-3 bootstrap smoke)"
+    )
+
+
+@pytest.mark.parametrize("job_name", AGENT_RETRO_INDEX_WRITE_JOBS)
+def test_agent_retro_index_write_jobs_are_excluded_from_pull_request(job_name: str):
+    """P1-3: build-index / upsert-parent-comment must never run on pull_request
+    (only the read-only bootstrap-smoke job may run there)."""
+    workflow = _load_agent_retro_index_workflow()
+    job = workflow["jobs"][job_name]
+    condition = str(job.get("if", ""))
+    assert "pull_request" in condition, (
+        f"{job_name}: must explicitly exclude github.event_name == 'pull_request' "
+        f"via an `if:` guard, got if={condition!r}"
+    )
+
+
+def test_agent_retro_index_has_read_only_bootstrap_smoke_job():
+    """P1-3: a dedicated bootstrap-smoke job must exist, run only on
+    pull_request, and declare no write permissions."""
+    workflow = _load_agent_retro_index_workflow()
+    jobs = workflow.get("jobs") or {}
+    assert AGENT_RETRO_INDEX_SMOKE_JOB in jobs, (
+        f"agent-retro-index.yml must declare a {AGENT_RETRO_INDEX_SMOKE_JOB!r} job "
+        "(Issue #1476 P1-3)"
+    )
+    job = jobs[AGENT_RETRO_INDEX_SMOKE_JOB]
+    condition = str(job.get("if", ""))
+    assert "pull_request" in condition, (
+        f"{AGENT_RETRO_INDEX_SMOKE_JOB}: must be gated to pull_request only, "
+        f"got if={condition!r}"
+    )
+    permissions = job.get("permissions") or {}
+    assert permissions.get("issues") != "write", (
+        f"{AGENT_RETRO_INDEX_SMOKE_JOB}: must not declare issues: write "
+        "(read-only smoke job)"
+    )
+    assert permissions.get("pull-requests") != "write", (
+        f"{AGENT_RETRO_INDEX_SMOKE_JOB}: must not declare pull-requests: write "
+        "(read-only smoke job)"
+    )
+    steps = job.get("steps") or []
+    assert any(_uses_action_setup(s) for s in steps), (
+        f"{AGENT_RETRO_INDEX_SMOKE_JOB}: must include a pnpm/action-setup step"
+    )
+
+
+def test_agent_retro_index_smoke_job_version_assertion_is_bootstrap_equivalent():
+    """P1-3: static bootstrap-equivalence -- the smoke job's version-assertion
+    step must derive the expected pnpm version from package.json#packageManager
+    at runtime (same pattern as deploy-pages.yml), never hardcode the literal
+    version, and must not suppress errors."""
+    workflow = _load_agent_retro_index_workflow()
+    steps = workflow["jobs"][AGENT_RETRO_INDEX_SMOKE_JOB]["steps"]
+    version_assert_step = next(
+        (s for s in steps if "pnpm --version" in str(s.get("run", ""))), None
+    )
+    assert version_assert_step is not None, (
+        f"{AGENT_RETRO_INDEX_SMOKE_JOB}: missing a `pnpm --version` assertion step"
+    )
+    run = str(version_assert_step.get("run", ""))
+    assert 'require("./package.json").packageManager' in run, (
+        f"{AGENT_RETRO_INDEX_SMOKE_JOB}: version assertion must derive the "
+        f"expected version from package.json#packageManager at runtime, got: {run!r}"
+    )
+    assert EXPECTED_PNPM_VERSION not in run, (
+        f"{AGENT_RETRO_INDEX_SMOKE_JOB}: version assertion must NOT hardcode the "
+        f"literal pnpm version {EXPECTED_PNPM_VERSION!r}"
+    )
+    assert '"$actual_pnpm_version" != "$expected_pnpm_version"' in run, (
+        f"{AGENT_RETRO_INDEX_SMOKE_JOB}: version assertion must compare the "
+        f"runtime-derived expected version against the actually-resolved "
+        f"`pnpm --version`, got: {run!r}"
+    )
+    assert not _step_has_error_suppression(version_assert_step), (
+        f"{AGENT_RETRO_INDEX_SMOKE_JOB}: version assertion step must not "
+        "suppress errors"
+    )
+
+    # Bootstrap-equivalence: compare against deploy-pages.yml's assertion body
+    # (both derive from the same runtime packageManager parse/compare shape).
+    deploy_pages_step = _extract_version_assert_step("deploy-main")
+    deploy_pages_run = str(deploy_pages_step.get("run", "")).strip()
+    assert run.strip() == deploy_pages_run, (
+        f"{AGENT_RETRO_INDEX_SMOKE_JOB}: version-assertion run body must be "
+        "identical to deploy-pages.yml's deploy-main assertion body "
+        "(bootstrap-equivalence, Issue #1476 P1-3)"
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
