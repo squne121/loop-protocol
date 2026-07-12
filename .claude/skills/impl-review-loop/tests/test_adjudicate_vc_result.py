@@ -272,7 +272,10 @@ def test_mixed_expected_baseline_results_with_certified_current_pass_are_nonbloc
     result = mod.adjudicate_vc_result(
         contract_snapshot=_snapshot_payload(items),
         current_vc_result=_current_payload(current_items, head_sha="head1", reviewed_head_sha="head1"),
-        diff_summary={"changed_paths": [".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"], "head_sha": "head1"},
+        diff_summary={
+            "changed_paths": [".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+            "head_sha": "head1",
+        },
         allowed_paths=[".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
     )
     assert result["overall_status"] == "pass"
@@ -306,7 +309,15 @@ def test_mapping_and_invalid_paths_fail_closed_for_current_pass():
     result = mod.adjudicate_vc_result(
         contract_snapshot=_snapshot_payload([baseline_item]),
         current_vc_result=_current_payload([current_item], head_sha="head1", reviewed_head_sha="head1"),
-        diff_summary={"changed_paths": [{"path": ".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py", "previous_path": "../outside.py"}], "head_sha": "head1"},
+        diff_summary={
+            "changed_paths": [
+                {
+                    "path": ".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py",
+                    "previous_path": "../outside.py",
+                }
+            ],
+            "head_sha": "head1",
+        },
         allowed_paths=[".claude/skills/**"],
     )
     assert result["blocking"] is True
