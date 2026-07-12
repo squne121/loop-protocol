@@ -1121,6 +1121,44 @@ def test_overlap_readback_waiver_rejects_non_target_or_non_readback_blocker(monk
         evidence_path.unlink(missing_ok=True)
 
 
+def test_overlap_readback_waiver_rejects_another_complete_candidate_blocker(monkeypatch):
+    """readback 完了済みでも C3 なら waiver 単独の原因とは扱わない。"""
+    stored = build_stored_evidence(
+        decision_inputs_sha256="sha256:" + "b" * 64,
+        current_issue_number=1477,
+    )
+    evidence_path = write_evidence_file(stored)
+    fresh = fresh_evidence_from_stored(stored)
+    fresh["route"] = "human_review_required"
+    fresh["candidates"] = [
+        *[_readback_incomplete_candidate(number) for number in (519, 520, 1429)],
+        {"issue_number": 777, "readback_complete": True, "policy_class": "C3", "reasons": ["collision"]},
+    ]
+    monkeypatch.setattr(
+        open_pr.subprocess,
+        "run",
+        lambda cmd, **kwargs: FakeCompletedProcess(0, json.dumps(fresh), ""),
+    )
+    monkeypatch.setattr(
+        open_pr,
+        "_load_verified_overlap_readback_waiver",
+        lambda repo, linked_issue: (_fixed_overlap_readback_waiver(), None),
+    )
+
+    try:
+        ok, error, _, _ = open_pr.run_overlap_preflight_gate(
+            repo="squne121/loop-protocol",
+            linked_issue=1477,
+            evidence_file=evidence_path,
+            expected_evidence_sha256=stored["evidence_sha256"],
+            expected_decision_inputs_sha256=stored["decision_inputs_sha256"],
+        )
+        assert ok is False
+        assert error == open_pr.E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
 def test_overlap_readback_waiver_requires_live_body_snapshot_integrity(monkeypatch):
     """live body SHA と一致する go snapshot がない waiver は fail-closed。"""
     body = """## Machine-Readable Contract

@@ -694,6 +694,13 @@ def _has_only_fixed_readback_incomplete_blockers(fresh: dict) -> bool:
             or not all(isinstance(reason, str) and reason.startswith("readback_incomplete") for reason in reasons)
         ):
             return False
+    # readback が完了した candidate 側に C2b/C3/unknown が残っていれば、
+    # human_review_required の原因をこの waiver だけとは証明できない。
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or candidate.get("readback_complete") is False:
+            continue
+        if candidate.get("policy_class") not in {"C1", "C2a"}:
+            return False
     return True
 
 
