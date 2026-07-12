@@ -420,7 +420,7 @@ def test_given_native_dependency_page_fetch_when_gh_api_invoked_then_version_hea
 # ------------------------------------------------------------
 
 
-def test_given_candidate_raw_with_native_blocked_by_typed_record_when_scope_built_then_successor_relation_visible() -> None:
+def test_given_candidate_native_blocked_by_when_scope_built_then_successor_relation_visible() -> None:
     """candidate が current に native dependency で blocked by されている
     場合（successor 関係）、candidate の raw dict に `blockedBy` typed record
     が付与されていれば `_issue_scope_from_raw` が `depends_on` に current の
