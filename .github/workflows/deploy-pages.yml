@@ -32,7 +32,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected_pnpm_version="11.7.0"
+          expected_pnpm_version="$(
+            node -e '
+              const value = require("./package.json").packageManager;
+              const match = /^pnpm@(\d+\.\d+\.\d+)$/.exec(value ?? "");
+              if (!match) {
+                console.error(`invalid packageManager: ${value}`);
+                process.exit(1);
+              }
+              process.stdout.write(match[1]);
+            '
+          )"
           actual_pnpm_version="$(pnpm --version)"
           if [ "$actual_pnpm_version" != "$expected_pnpm_version" ]; then
             echo "ERROR: resolved pnpm version ($actual_pnpm_version) does not match expected packageManager pin ($expected_pnpm_version)" >&2
@@ -202,7 +212,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected_pnpm_version="11.7.0"
+          expected_pnpm_version="$(
+            node -e '
+              const value = require("./package.json").packageManager;
+              const match = /^pnpm@(\d+\.\d+\.\d+)$/.exec(value ?? "");
+              if (!match) {
+                console.error(`invalid packageManager: ${value}`);
+                process.exit(1);
+              }
+              process.stdout.write(match[1]);
+            '
+          )"
           actual_pnpm_version="$(pnpm --version)"
           if [ "$actual_pnpm_version" != "$expected_pnpm_version" ]; then
             echo "ERROR: resolved pnpm version ($actual_pnpm_version) does not match expected packageManager pin ($expected_pnpm_version)" >&2
