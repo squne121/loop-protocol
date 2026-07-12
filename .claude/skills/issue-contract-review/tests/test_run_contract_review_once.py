@@ -161,6 +161,9 @@ class TestAllChecksCalledB1:
         assert result["checks"]["readiness"] == "go"
         assert result["checks"]["blockers"] == "pass"
         assert result["checks"]["product_spec"] == "pass"
+        assert result["checks"]["product_spec_check"] == _make_product_spec_json(
+            "pass", "applicable"
+        )
         assert result["checks"]["vc_preflight"] == "pass"
 
     def test_current_head_arguments_are_forwarded_to_producer(self):
@@ -451,12 +454,17 @@ class TestIdempotencyCheck:
     def test_existing_go_deduped(self, monkeypatch):
         """If existing go comment found → return early with deduped."""
         existing_url = f"{_ISSUE_URL}#issuecomment-1001"
+        existing_go = {
+            "html_url": existing_url,
+            "inner": {"checks": {"product_spec_check": _make_product_spec_json("pass")}},
+        }
 
-        with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(existing_url, None)):
+        with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(existing_go, None)):
             result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=False)
 
         assert result["status"] == "go"
         assert result["source"] == "existing_go_comment"
+        assert result["checks"]["product_spec_check"]["schema"] == "product_spec_check/v1"
         assert result["go_comment_url"] == existing_url
         assert result["idempotency_check"]["deduped"] is True
 
