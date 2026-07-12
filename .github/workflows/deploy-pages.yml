@@ -32,6 +32,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # shellcheck disable=SC2016 # single-quoted: this is a JS template
+          # literal for `node -e`, not a shell expansion.
           expected_pnpm_version="$(
             node -e '
               const value = require("./package.json").packageManager;
@@ -212,6 +214,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # shellcheck disable=SC2016 # single-quoted: this is a JS template
+          # literal for `node -e`, not a shell expansion.
           expected_pnpm_version="$(
             node -e '
               const value = require("./package.json").packageManager;
