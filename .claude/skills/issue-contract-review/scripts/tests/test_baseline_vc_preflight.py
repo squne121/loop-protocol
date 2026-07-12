@@ -113,6 +113,46 @@ def test_finalize_dirty_after_execution_blocks_and_maps_to_nonzero_exit():
     assert finalized["certified"] is False
     assert exit_code_for_status(final_status) == 1
 
+
+def test_current_head_retrieval_failure_finalizes_blocked_safety_fields():
+    """GIVEN retrieval failure WHEN current-head CLI emits JSON THEN stop condition is true."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        repo = Path(temp_dir)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+        (repo / "tracked.txt").write_text("clean\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+        head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(script_path),
+                "--body-file",
+                str(repo / "missing-issue.md"),
+                "--cwd",
+                str(repo),
+                "--evidence-mode",
+                "current-head",
+                "--reviewed-head-sha",
+                head,
+                "--format",
+                "json",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    payload = json.loads(completed.stdout)
+    assert completed.returncode != 0
+    assert payload["status"] == "blocked"
+    assert payload["stop_condition_triggered"] is True
+    assert payload["human_review_required"] is False
+
 try:
     import pytest
     HAS_PYTEST = True

@@ -462,6 +462,7 @@ def ensure_contract_snapshot(
         "errors": [],
         "contract_review_once_result": None,
         "vc_evidence": {"mode": evidence_mode},
+        "current_vc_result": None,
     }
 
     # Load parser module
@@ -523,17 +524,24 @@ def ensure_contract_snapshot(
             result["status"] = "runtime_error"
             return result
         if body_confirm == body and updated_confirm == updated_at:
-            result["status"] = "ok"
+            if evidence_mode != "current-head":
+                result["status"] = "ok"
+                result["source"] = "existing_go"
+                result["contract_snapshot_url"] = go_result["html_url"]
+                return result
+            # Snapshot reuse and current-head evidence production are independent:
+            # preserve the fresh snapshot, then continue to run the producer.
             result["source"] = "existing_go"
             result["contract_snapshot_url"] = go_result["html_url"]
-            return result
+            break
         if attempt == 1:
             result["status"] = "stale_or_conflicting_snapshot"
             result["errors"].append("issue_changed_during_existing_go_recheck")
             return result
 
-    # No existing go result
-    if mode == "check-only":
+    # No existing go result.  A current-head caller must still produce fresh
+    # evidence when a snapshot was found above, even in check-only mode.
+    if mode == "check-only" and result["contract_snapshot_url"] is None:
         result["status"] = "human_judgment"
         result["source"] = "readiness_blocked"
         result["errors"].append(
@@ -555,6 +563,9 @@ def ensure_contract_snapshot(
     result["contract_review_once_result"] = review_result
     if review_result:
         result["vc_evidence"] = review_result.get("vc_evidence", result["vc_evidence"])
+        result["current_vc_result"] = review_result.get(
+            "current_vc_result", result["current_vc_result"]
+        )
 
     if review_err:
         result["errors"].append(f"run_contract_review_once_error: {review_err}")
@@ -589,6 +600,11 @@ def ensure_contract_snapshot(
     if review_status != "go":
         result["status"] = "runtime_error"
         result["errors"].append(f"unexpected_review_status: {review_status}")
+        return result
+
+    if result["contract_snapshot_url"] is not None:
+        result["status"] = "ok"
+        result["source"] = "existing_go"
         return result
 
     # review_status == go

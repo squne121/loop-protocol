@@ -140,6 +140,24 @@ def finalize_current_head_evidence(cwd: str, evidence: Dict[str, Any]) -> Dict[s
     return evidence
 
 
+def finalize_current_head_output(result: Dict[str, Any], evidence: Dict[str, Any]) -> None:
+    """Make final status and safety flags consistent on every current-head exit path."""
+    status = result.get("status")
+    if status == "human_judgment":
+        evidence["human_review_required"] = True
+        evidence["stop_condition_triggered"] = True
+        evidence["certified"] = False
+    elif status == "blocked":
+        evidence["stop_condition_triggered"] = True
+        evidence["certified"] = False
+    elif status == "pass" and not evidence.get("certified"):
+        result["status"] = "blocked"
+        evidence["stop_condition_triggered"] = True
+    elif status == "pass":
+        evidence["human_review_required"] = False
+        evidence["stop_condition_triggered"] = False
+
+
 def exit_code_for_status(status: str) -> int:
     """Map the final emitted status to a fail-closed process exit code."""
     return {"pass": 0, "blocked": 1, "human_judgment": 3}.get(status, 2)
@@ -173,7 +191,9 @@ def safety_fields(evidence_mode: str, evidence: Optional[Dict[str, Any]] = None)
 def emit_json(result: Dict[str, Any], evidence_mode: str, evidence: Optional[Dict[str, Any]] = None) -> None:
     """Emit the legacy envelope, extended only for current-head evidence."""
     if evidence_mode == "current-head":
-        result.update(safety_fields(evidence_mode, evidence))
+        finalized_evidence = evidence or {}
+        finalize_current_head_output(result, finalized_evidence)
+        result.update(safety_fields(evidence_mode, finalized_evidence))
     print(json.dumps(result, indent=2))
 
 

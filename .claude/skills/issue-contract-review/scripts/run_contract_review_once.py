@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -222,6 +223,49 @@ HTTP_ERROR_CLASSIFICATIONS: dict[int, str] = {
 }
 
 
+_FULL_COMMIT_OID_RE = re.compile(r"^[0-9a-f]{40,64}$")
+
+
+def validate_current_head_envelope(payload: Any, returncode: int) -> list[str]:
+    """Return fail-closed validation errors for a producer current-head envelope."""
+    if returncode != 0:
+        return [f"producer_nonzero_exit:{returncode}"]
+    if not isinstance(payload, dict):
+        return ["producer_payload_not_object"]
+
+    errors: list[str] = []
+    required_scalars = {
+        "schema": "baseline_vc_preflight/v1",
+        "evidence_mode": "current-head",
+        "status": "pass",
+    }
+    for key, expected in required_scalars.items():
+        if payload.get(key) != expected:
+            errors.append(f"invalid_{key}")
+    if not isinstance(payload.get("generated_at"), str) or not payload["generated_at"]:
+        errors.append("missing_generated_at")
+    if payload.get("errors") != []:
+        errors.append("errors_not_empty")
+    if not isinstance(payload.get("results"), list):
+        errors.append("missing_results")
+    source = payload.get("source")
+    if not isinstance(source, dict) or not isinstance(source.get("body_sha256"), str) or not source["body_sha256"]:
+        errors.append("missing_source_body_sha256")
+    for key in ("fallback_detected", "human_review_required", "stop_condition_triggered"):
+        if payload.get(key) is not False:
+            errors.append(f"unsafe_{key}")
+    for key in ("clean_before", "clean_after"):
+        if payload.get(key) is not True:
+            errors.append(f"unclean_{key}")
+    head_values = [payload.get(key) for key in ("head_sha", "reviewed_head_sha", "head_after_sha")]
+    if (
+        not all(isinstance(value, str) and _FULL_COMMIT_OID_RE.fullmatch(value) for value in head_values)
+        or len(set(head_values)) != 1
+    ):
+        errors.append("head_sha_mismatch_or_invalid")
+    return errors
+
+
 def classify_http_error(status_code: int) -> str:
     """
     Classify HTTP error code for contract review API calls.
@@ -268,6 +312,7 @@ def run_once(
         "vc_preflight_status": None,
         "vc_preflight_classifications": [],
         "vc_evidence": {"mode": evidence_mode},
+        "current_vc_result": None,
         "checks": {
             "readiness": None,
             "blockers": None,
@@ -491,12 +536,20 @@ def run_once(
     vc_status = vc_result_json.get("status", "")
     result["vc_preflight_status"] = vc_status
     result["vc_preflight_classifications"] = vc_result_json.get("results", [])
-    result["vc_evidence"] = {
-        "mode": vc_result_json.get("evidence_mode", evidence_mode),
-        "head_sha": vc_result_json.get("head_sha"),
-        "reviewed_head_sha": vc_result_json.get("reviewed_head_sha"),
-        "stop_condition_triggered": vc_result_json.get("stop_condition_triggered"),
-    }
+    result["current_vc_result"] = vc_result_json
+    result["vc_evidence"] = vc_result_json
+
+    if evidence_mode == "current-head":
+        envelope_errors = validate_current_head_envelope(vc_result_json, vc_rc)
+        if envelope_errors:
+            result["checks"]["vc_preflight"] = "blocked"
+            result["status"] = "blocked"
+            result["source"] = "vc_preflight"
+            result["errors"].extend(
+                f"uncertified_current_head_vc_evidence:{error}"
+                for error in envelope_errors
+            )
+            return result
 
     if vc_status == "human_judgment":
         result["checks"]["vc_preflight"] = "human_judgment"
