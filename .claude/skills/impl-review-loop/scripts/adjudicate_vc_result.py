@@ -212,14 +212,28 @@ def _extract_changed_paths(diff_summary: Any) -> tuple[list[str], bool, list[str
 
     if isinstance(raw_paths, list):
         values: list[str] = []
+        unrecognized_records: list[str] = []
         for item in raw_paths:
             if isinstance(item, str):
                 values.append(item)
             elif isinstance(item, dict):
-                for key in ("path", "file", "previous_path", "previous_filename", "old_path"):
+                matched = False
+                for key in (
+                    "path",
+                    "file",
+                    "filename",
+                    "previous_path",
+                    "previous_filename",
+                    "old_path",
+                ):
                     value = item.get(key)
                     if isinstance(value, str):
                         values.append(value)
+                        matched = True
+                if not matched and item:
+                    unrecognized_records.append("unrecognized_changed_path_record")
+        if unrecognized_records:
+            return values, bool(values), unrecognized_records
         return values, bool(values), []
 
     return [], False, ["missing_changed_paths"]
@@ -299,6 +313,7 @@ def _current_pass_envelope_is_certified(
     current_vc_result: Any,
     diff_summary: Any,
     changed_paths: list[str],
+    changed_paths_present: bool,
     allowed_paths: list[str],
 ) -> bool:
     if not isinstance(contract_snapshot, dict) or not isinstance(current_vc_result, dict):
@@ -324,6 +339,7 @@ def _current_pass_envelope_is_certified(
         and _is_nonempty_string(current_head)
         and current_head == reviewed_head == diff_head
         and source.get("body_sha256") == contract_sha
+        and changed_paths_present is True
         and _all_changed_paths_allowed(changed_paths, allowed_paths)
     )
 
@@ -715,6 +731,7 @@ def adjudicate_vc_result(
         current_vc_result,
         diff_summary,
         changed_paths,
+        changed_paths_present,
         normalized_allowed,
     )
     per_ac: list[dict[str, Any]] = []

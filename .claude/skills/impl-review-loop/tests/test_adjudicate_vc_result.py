@@ -654,3 +654,81 @@ def test_allowed_paths_matcher_import_failure_returns_machine_json(monkeypatch):
     assert result["overall_status"] == "indeterminate"
     assert result["blocking"] is True
     assert any(error.startswith("allowed_paths_matcher_import_failed:") for error in result["errors"])
+
+
+def test_github_standard_filename_key_outside_allowed_paths_blocks_current_pass():
+    baseline_item = _payload_item("AC1", failure_keys=[], exit_code=4)
+    baseline_item["classification"] = "expected_fail"
+    current_item = _payload_item("AC1", failure_keys=[], exit_code=0)
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_snapshot_payload([baseline_item]),
+        current_vc_result=_current_payload([current_item], head_sha="head1", reviewed_head_sha="head1"),
+        diff_summary={
+            "changed_paths": [{"filename": "src/outside.ts", "status": "modified"}],
+            "head_sha": "head1",
+        },
+        allowed_paths=[".claude/skills/**"],
+    )
+
+    assert result["overall_status"] != "pass"
+    assert result["blocking"] is True
+    assert result["per_ac"][0]["reason_code"] == "uncertified_current_pass"
+
+
+def test_empty_changed_paths_does_not_vacuously_certify_current_pass():
+    baseline_item = _payload_item("AC1", failure_keys=[], exit_code=4)
+    baseline_item["classification"] = "expected_fail"
+    current_item = _payload_item("AC1", failure_keys=[], exit_code=0)
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_snapshot_payload([baseline_item]),
+        current_vc_result=_current_payload([current_item], head_sha="head1", reviewed_head_sha="head1"),
+        diff_summary={"changed_paths": [], "head_sha": "head1"},
+        allowed_paths=[".claude/skills/**"],
+    )
+
+    assert result["overall_status"] != "pass"
+    assert result["blocking"] is True
+    assert result["per_ac"][0]["reason_code"] == "uncertified_current_pass"
+
+
+def test_github_standard_filename_key_inside_allowed_paths_still_certifies_current_pass():
+    baseline_item = _payload_item("AC1", failure_keys=[], exit_code=4)
+    baseline_item["classification"] = "expected_fail"
+    current_item = _payload_item("AC1", failure_keys=[], exit_code=0)
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_snapshot_payload([baseline_item]),
+        current_vc_result=_current_payload([current_item], head_sha="head1", reviewed_head_sha="head1"),
+        diff_summary={
+            "changed_paths": [
+                {
+                    "filename": ".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py",
+                    "status": "modified",
+                }
+            ],
+            "head_sha": "head1",
+        },
+        allowed_paths=[".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+    )
+
+    assert result["overall_status"] == "pass"
+    assert result["blocking"] is False
+    assert result["per_ac"][0]["reason_code"] == "expected_fail_resolved_on_current_head"
+
+
+def test_unrecognized_changed_path_record_is_fail_closed_indeterminate():
+    baseline = _snapshot_payload([_payload_item("AC1")])
+    current = _current_payload([_payload_item("AC1")], head_sha="head1", reviewed_head_sha="head1")
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary={
+            "changed_paths": [{"status": "modified", "sha": "abc123"}],
+            "head_sha": "head1",
+        },
+        allowed_paths=[".claude/skills/**"],
+    )
+
+    assert result["overall_status"] == "indeterminate"
+    assert result["blocking"] is True
+    assert "unrecognized_changed_path_record" in result["errors"]
