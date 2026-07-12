@@ -80,6 +80,28 @@ def _make_vc_preflight_json(status: str) -> dict:
     }
 
 
+def _make_current_head_vc_preflight_json(status: str = "pass") -> dict:
+    """Return a producer-certified current-head envelope for caller tests."""
+    head = "a" * 40
+    return {
+        "schema": "baseline_vc_preflight/v1",
+        "generated_at": "2026-07-12T00:00:00Z",
+        "status": status,
+        "errors": [],
+        "source": {"kind": "body_file", "body_sha256": "sha256:" + "b" * 64},
+        "results": [],
+        "evidence_mode": "current-head",
+        "head_sha": head,
+        "reviewed_head_sha": head,
+        "head_after_sha": head,
+        "clean_before": True,
+        "clean_after": True,
+        "fallback_detected": False,
+        "human_review_required": False,
+        "stop_condition_triggered": False,
+    }
+
+
 def _make_subprocess_result(stdout: str, returncode: int = 0) -> MagicMock:
     result = MagicMock()
     result.stdout = stdout
@@ -143,6 +165,57 @@ class TestAllChecksCalledB1:
             "pass", "applicable"
         )
         assert result["checks"]["vc_preflight"] == "pass"
+
+    def test_current_head_arguments_are_forwarded_to_producer(self):
+        """GIVEN certified current-head input WHEN review runs THEN it preserves the full envelope."""
+        run_script_results, shell_results = _make_all_pass_side_effects()
+        run_script_results[-1] = (_make_current_head_vc_preflight_json(), 0, None)
+        captured = []
+
+        def run_script(*args, **kwargs):
+            captured.append(args[0])
+            return run_script_results.pop(0)
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=run_script):
+            with patch.object(_rcr_mod, "_run_shell_script", return_value=shell_results[0]):
+                result = run_once(
+                    _ISSUE_NUMBER, _REPO, skip_idempotency_check=True,
+                    evidence_mode="current-head", cwd="/tmp/pr-worktree", reviewed_head_sha="a" * 40,
+                )
+
+        producer_command = captured[-1]
+        assert result["status"] == "go"
+        assert producer_command[-8:] == [
+            "--cwd", "/tmp/pr-worktree", "--evidence-mode", "current-head",
+            "--reviewed-head-sha", "a" * 40, "--format", "json",
+        ]
+        assert result["current_vc_result"] == _make_current_head_vc_preflight_json()
+        assert result["vc_evidence"]["schema"] == "baseline_vc_preflight/v1"
+        assert result["vc_evidence"]["source"]["body_sha256"].startswith("sha256:")
+
+    def test_current_head_rejects_malformed_pass_envelope(self):
+        """GIVEN malformed current-head PASS WHEN review runs THEN caller blocks it."""
+        run_script_results, shell_results = _make_all_pass_side_effects()
+        malformed = _make_current_head_vc_preflight_json()
+        malformed["schema"] = "wrong/v1"
+        malformed.pop("results")
+        run_script_results[-1] = (malformed, 0, None)
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=run_script_results):
+            with patch.object(_rcr_mod, "_run_shell_script", return_value=shell_results[0]):
+                result = run_once(
+                    _ISSUE_NUMBER,
+                    _REPO,
+                    skip_idempotency_check=True,
+                    evidence_mode="current-head",
+                    cwd="/tmp/pr-worktree",
+                    reviewed_head_sha="a" * 40,
+                )
+
+        assert result["status"] == "blocked"
+        assert result["checks"]["vc_preflight"] == "blocked"
+        assert result["current_vc_result"] == malformed
+        assert any(error.startswith("uncertified_current_head_vc_evidence:") for error in result["errors"])
 
     def test_blockers_blocked_stops_pipeline(self, monkeypatch):
         """If check_blockers.sh returns exit 1 (open blockers), status: blocked."""

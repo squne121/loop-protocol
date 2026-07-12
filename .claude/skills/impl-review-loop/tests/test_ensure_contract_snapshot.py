@@ -259,6 +259,83 @@ class TestCheckOnlyMode:
 class TestFreshGoSnapshots:
     """#1445: existing go is usable only for the current canonical body hash."""
 
+    def test_current_head_runs_producer_even_when_existing_go_is_fresh(self):
+        """GIVEN fresh GO WHEN current-head is requested THEN producer evidence is refreshed."""
+        parser_mod = _mock_parser_mod(
+            comments=[_GO_COMMENT],
+            go_comment=_GO_COMMENT,
+            latest={
+                "comment_id": 1001,
+                "html_url": _GO_COMMENT["html_url"],
+                "status": "go",
+                "created_at": _GO_COMMENT["created_at"],
+            },
+        )
+        full_envelope = {
+            "schema": "baseline_vc_preflight/v1",
+            "status": "pass",
+            "generated_at": "2026-07-12T00:00:00Z",
+            "errors": [],
+            "source": {"body_sha256": "sha256:" + "c" * 64},
+            "results": [],
+            "evidence_mode": "current-head",
+            "head_sha": "a" * 40,
+            "reviewed_head_sha": "a" * 40,
+            "head_after_sha": "a" * 40,
+            "clean_before": True,
+            "clean_after": True,
+            "fallback_detected": False,
+            "human_review_required": False,
+            "stop_condition_triggered": False,
+        }
+        review_result = _make_review_result("go")
+        review_result["vc_evidence"] = full_envelope
+        review_result["current_vc_result"] = full_envelope
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(
+                _ecs_mod,
+                "fetch_issue_snapshot",
+                return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None),
+            ):
+                with patch.object(
+                    _ecs_mod,
+                    "run_contract_review_once",
+                    return_value=(review_result, None),
+                ) as run_once:
+                    result = ensure_contract_snapshot(
+                        issue_number=_ISSUE_NUMBER,
+                        repo=_REPO,
+                        mode="auto",
+                        evidence_mode="current-head",
+                        cwd="/tmp/pr-worktree",
+                        reviewed_head_sha="a" * 40,
+                    )
+
+        assert run_once.call_count == 1
+        assert result["status"] == "ok"
+        assert result["source"] == "existing_go"
+        assert result["contract_snapshot_url"] == _GO_COMMENT["html_url"]
+        assert result["vc_evidence"] == full_envelope
+        assert result["current_vc_result"] == full_envelope
+
+        adjudicator_path = _SCRIPTS_DIR / "adjudicate_vc_result.py"
+        spec = importlib.util.spec_from_file_location("adjudicate_vc_result_e2e", adjudicator_path)
+        assert spec is not None and spec.loader is not None
+        adjudicator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(adjudicator)  # type: ignore[union-attr]
+        adjudication = adjudicator.adjudicate_vc_result(
+            contract_snapshot={
+                "schema": "CONTRACT_REVIEW_RESULT_V1",
+                "checks": {"vc_preflight": {"classifications": []}},
+            },
+            current_vc_result=result["current_vc_result"],
+            diff_summary={"changed_paths": [], "head_sha": "a" * 40},
+            allowed_paths=[".claude/skills/**"],
+        )
+        assert adjudication["source_integrity"]["current_vc_result_present"] is True
+        assert adjudication["source_integrity"]["current_vc_result_head_sha"] == "a" * 40
+
     @pytest.mark.parametrize(
         "body_sha256",
         [

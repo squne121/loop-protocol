@@ -47,12 +47,17 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+DEFAULT_REPO = "squne121/loop-protocol"
+
+
 def _run_cli(
     issue_number: int,
     current_file: Path,
     candidates_file: Path,
     *extra: str,
 ) -> Tuple[int, Dict[str, Any]]:
+    # AC1/AC10 (#1462): dry-run も --repo が必須になったため、既存テストヘルパー
+    # に既定の --repo を追加する（後方互換維持のための Scope Delta 内変更）。
     proc = subprocess.run(
         [
             sys.executable,
@@ -64,6 +69,8 @@ def _run_cli(
             str(current_file),
             "--candidates-file",
             str(candidates_file),
+            "--repo",
+            DEFAULT_REPO,
             *extra,
         ],
         capture_output=True,
@@ -455,7 +462,8 @@ def test_continue_routes_survive_bash_set_dash_e() -> None:
     script = (
         "set -e\n"
         f"{sys.executable} {HELPER} --issue-number {current_number} --dry-run "
-        f"--current-file {current_file} --candidates-file {candidates_file} > /dev/null\n"
+        f"--current-file {current_file} --candidates-file {candidates_file} "
+        f"--repo {DEFAULT_REPO} > /dev/null\n"
         "echo CONTINUED_AFTER_SET_E\n"
     )
     proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True)

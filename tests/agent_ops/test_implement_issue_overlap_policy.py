@@ -43,7 +43,12 @@ def _skill_text() -> str:
     return SKILL_PATH.read_text(encoding="utf-8")
 
 
+DEFAULT_REPO = "squne121/loop-protocol"
+
+
 def _run_cli(issue_number: int, current_file: Path, candidates_file: Path):
+    # AC1/AC10 (#1462): dry-run も --repo が必須になったため、既存テストヘルパー
+    # に既定の --repo を追加する（後方互換維持のための Scope Delta 内変更）。
     proc = subprocess.run(
         [
             sys.executable,
@@ -55,6 +60,8 @@ def _run_cli(issue_number: int, current_file: Path, candidates_file: Path):
             str(current_file),
             "--candidates-file",
             str(candidates_file),
+            "--repo",
+            DEFAULT_REPO,
         ],
         capture_output=True,
         text=True,
