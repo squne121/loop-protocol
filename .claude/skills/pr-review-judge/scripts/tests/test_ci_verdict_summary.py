@@ -1041,6 +1041,11 @@ class TestHeadShaNullSkippedExclude:
             "Check Japanese Content",
             "PR Review Japanese Check (retrospective)",
         ) in HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES
+        assert ("agent-retro-index", "build-index") in HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES
+        assert (
+            "agent-retro-index",
+            "upsert-parent-comment",
+        ) in HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES
 
     def test_head_sha_null_skipped_deploy_main_is_excluded(self):
         """AC1: deploy-main の head_sha=None かつ conclusion=skipped は excluded"""
@@ -1061,6 +1066,30 @@ class TestHeadShaNullSkippedExclude:
             "conclusion": "skipped",
             "name": "cleanup-pr",
             "workflow": "deploy-pages",
+            "bucket": "skipping",
+            "status": "completed",
+        }
+        assert determine_check_verdict(entry, HEAD_SHA) == "excluded"
+
+    def test_head_sha_null_skipped_agent_retro_index_build_index_is_excluded(self):
+        """AC11: agent-retro-index の build-index の head_sha=None かつ conclusion=skipped は excluded"""
+        entry = {
+            "head_sha": None,
+            "conclusion": "skipped",
+            "name": "build-index",
+            "workflow": "agent-retro-index",
+            "bucket": "skipping",
+            "status": "completed",
+        }
+        assert determine_check_verdict(entry, HEAD_SHA) == "excluded"
+
+    def test_head_sha_null_skipped_agent_retro_index_upsert_parent_comment_is_excluded(self):
+        """AC11: agent-retro-index の upsert-parent-comment の head_sha=None かつ conclusion=skipped は excluded"""
+        entry = {
+            "head_sha": None,
+            "conclusion": "skipped",
+            "name": "upsert-parent-comment",
+            "workflow": "agent-retro-index",
             "bucket": "skipping",
             "status": "completed",
         }
