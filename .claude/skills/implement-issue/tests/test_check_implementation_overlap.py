@@ -344,15 +344,52 @@ def test_given_candidate_missing_number_then_route_is_human_review_required() ->
     assert "missing_or_invalid_number" in payload["validation_errors"]["-1"]
 
 
-def test_given_candidate_missing_allowed_paths_then_route_is_human_review_required() -> None:
+def test_given_candidate_missing_allowed_paths_then_excludes_it_from_classifier_and_returns_proceed() -> None:
     current_file = FIXTURES_DIR / "current_1451_analog.json"
     current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
     exit_code, payload = _run_cli(
         current_number, current_file, FIXTURES_DIR / "candidates_missing_allowed_paths.json"
     )
-    assert payload["route"] == "human_review_required", payload
+    assert payload["route"] == "proceed", payload
     assert exit_code == EXIT_OK
-    assert "missing_allowed_paths" in payload["validation_errors"]["9456"]
+    assert "9456" not in payload["validation_errors"]
+    assert payload["candidates"] == []
+    assert payload["ignored_candidates"] == [
+        {
+            "issue_number": 9456,
+            "reason": "ignored_missing_allowed_paths",
+        }
+    ]
+
+
+def test_given_missing_allowed_paths_and_comparable_candidate_then_preserves_comparable_collision_route() -> None:
+    current_file = FIXTURES_DIR / "current_1451_analog.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    missing_path_candidates = json.loads(
+        (FIXTURES_DIR / "candidates_missing_allowed_paths.json").read_text(encoding="utf-8")
+    )
+    comparable_candidates = json.loads(
+        (FIXTURES_DIR / "candidates_path_only_false_positive.json").read_text(encoding="utf-8")
+    )
+    combined_file = current_file.parent / "_missing_allowed_paths_with_comparable.json"
+    combined_file.write_text(
+        json.dumps(missing_path_candidates + comparable_candidates, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    try:
+        exit_code, payload = _run_cli(current_number, current_file, combined_file)
+    finally:
+        combined_file.unlink(missing_ok=True)
+
+    assert exit_code == EXIT_OK
+    assert payload["route"] == "proceed_with_collision_evidence", payload
+    assert {candidate["issue_number"] for candidate in payload["candidates"]} == {9449, 9450}
+    assert payload["ignored_candidates"] == [
+        {
+            "issue_number": 9456,
+            "reason": "ignored_missing_allowed_paths",
+        }
+    ]
 
 
 def test_saturation_boundary_limit_minus_one_limit_and_limit_plus_one() -> None:
@@ -510,6 +547,7 @@ def test_evidence_schema_contains_implement_scope_collision_preflight_v1_fields(
         assert "non_conflict_reason" in cand
 
     assert "dependency_resolution" in payload
+    assert isinstance(payload["ignored_candidates"], list)
     assert "validation_errors" in payload
     assert payload["route"] in ROUTES
     assert payload["decision_inputs_sha256"].startswith("sha256:")

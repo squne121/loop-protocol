@@ -884,6 +884,7 @@ def build_evidence(
     source_saturated: bool,
     collected_at: str,
     candidates_evidence: List[Dict[str, Any]],
+    ignored_candidates: List[Dict[str, Any]],
     dependency_resolution: Dict[str, Any],
     validation_errors: Dict[int, List[str]],
     route: str,
@@ -893,6 +894,7 @@ def build_evidence(
         candidates_evidence,
         key=lambda c: (c["issue_number"] is None, c["issue_number"] or 0),
     )
+    ordered_ignored = sorted(ignored_candidates, key=lambda c: c["issue_number"])
 
     decision_payload: Dict[str, Any] = {
         "schema": SCHEMA,
@@ -907,6 +909,7 @@ def build_evidence(
             "saturated": source_saturated,
         },
         "candidates": ordered,
+        "ignored_candidates": ordered_ignored,
         "dependency_resolution": dependency_resolution,
         "validation_errors": {str(k): v for k, v in sorted(validation_errors.items())},
         "route": route,
@@ -928,6 +931,7 @@ def build_evidence(
             "collected_at": collected_at,
         },
         "candidates": ordered,
+        "ignored_candidates": ordered_ignored,
         "dependency_resolution": dependency_resolution,
         "validation_errors": {str(k): v for k, v in sorted(validation_errors.items())},
         "route": route,
@@ -957,13 +961,29 @@ def _classify(
     current_contract = _contract_schema_keys(current_body)
 
     # --- 全 candidate の schema validation（Major 5） ---
+    # Allowed Paths 未記載だけの legacy candidate は、collision classifier の
+    # 比較対象にはできない。その候補は validation error にせず、evidence に
+    # provenance を残して classifier 入力から除外する。number/body/updatedAt/
+    # dependency contract など他の schema error が併存する場合は従来どおり
+    # fail-closed とする。
     validation_errors: Dict[int, List[str]] = {}
+    ignored_candidates: List[Dict[str, Any]] = []
+    comparable_raw: List[Dict[str, Any]] = []
     for raw in candidates_raw:
         number = raw.get("number")
         errors = _validate_candidate_schema(raw)
+        if errors == ["missing_allowed_paths"] and isinstance(number, int):
+            ignored_candidates.append(
+                {
+                    "issue_number": number,
+                    "reason": "ignored_missing_allowed_paths",
+                }
+            )
+            continue
         if errors:
             key = number if isinstance(number, int) else -1
             validation_errors[key] = errors
+        comparable_raw.append(raw)
 
     candidate_bodies: Dict[str, str] = {}
     candidate_updated_at: Dict[str, Optional[str]] = {}
@@ -972,7 +992,6 @@ def _classify(
     candidate_scopes: List[IssueScope] = []
     for raw in candidates_raw:
         scope = _issue_scope_from_raw(raw, current_repo=repository)
-        candidate_scopes.append(scope)
         if scope.number is not None:
             key = str(scope.number)
             body_text = str(raw.get("body") or "")
@@ -980,6 +999,8 @@ def _classify(
             candidate_updated_at[key] = raw.get("updatedAt")
             candidate_contracts[key] = _contract_schema_keys(body_text)
             scope_pool[key] = scope
+    for raw in comparable_raw:
+        candidate_scopes.append(_issue_scope_from_raw(raw, current_repo=repository))
 
     current = IssueScope(
         title=str(current_raw.get("title", "")),
@@ -1114,6 +1135,7 @@ def _classify(
             "source_complete": source_complete,
             "saturated": saturated,
             "candidates_evidence": candidates_evidence,
+            "ignored_candidates": ignored_candidates,
             "dependency_resolution": dependency_resolution,
             "validation_errors": validation_errors,
         }
@@ -1156,6 +1178,7 @@ def _classify(
         "source_complete": source_complete,
         "saturated": saturated,
         "candidates_evidence": candidates_evidence,
+        "ignored_candidates": ignored_candidates,
         "dependency_resolution": dependency_resolution,
         "validation_errors": validation_errors,
     }
@@ -1323,6 +1346,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             source_saturated=ctx["saturated"],
             collected_at=collected_at,
             candidates_evidence=ctx["candidates_evidence"],
+            ignored_candidates=ctx["ignored_candidates"],
             dependency_resolution=ctx["dependency_resolution"],
             validation_errors=ctx["validation_errors"],
             route=route,

@@ -57,13 +57,13 @@ ROUTE=$(uv run python3 -c "import json,sys; print(json.load(sys.stdin)['route'])
 このスクリプトは:
 - `--issue-number` を必須にし、対象 Issue 自身を候補から自己除外する。
 - `phase/implementation` ラベルが付いた OPEN Issue を `gh issue list` で列挙する（`number,title,body,labels,updatedAt,url`）。
-- 全候補の本文から Allowed Paths をローカルで抽出する。
+- 全候補の本文から Allowed Paths をローカルで抽出する。`Allowed Paths` 未記載だけが schema error である候補は `ignored_missing_allowed_paths` として evidence に残し、collision classifier の candidate pool には渡さない。number / body / updatedAt / dependency contract の error を併発する候補は従来どおり fail-closed とする。
 - 明示的な取得上限（`--limit`、既定 100）と saturation 検出を持ち、全件性を証明できない場合は fail-closed にする。
 - Machine-Readable Contract の `blocked_by` / `depends_on` / `supersedes`（YAML list、inline/block 両表記）、legacy `Depends on #N` 記法、GitHub native dependency（`blockedBy` / `blocking`）を統合的に解析する。current が参照する predecessor が OPEN candidate 一覧に含まれない場合、オンライン経路では個別に readback して実 state（OPEN/CLOSED）を確認する。predecessor の実 state に基づき C2a（closed、直列化可能）と C2b（open、待機）を分岐する。
-- 収集した候補 JSON を `check_issue_overlap.py` の pure classifier に渡した上で、候補ごとに `## Outcome` / `## In Scope` を readback し、**構造的シグナル**（AC ID・output schema 名・Machine-Readable Contract の key/value・In Scope 内 edit target（inline-code パス）・goal_ref・supersedes/superseded-by）を主軸に意味的重複を判定する。自然言語類似度（Outcome の token Jaccard）は補助 signal に留め、`proceed_with_collision_evidence` を許可する唯一の根拠にはしない。
+- 収集した comparable candidate JSON だけを `check_issue_overlap.py` の pure collision classifier に渡した上で、候補ごとに `## Outcome` / `## In Scope` を readback し、**構造的シグナル**（AC ID・output schema 名・Machine-Readable Contract の key/value・In Scope 内 edit target（inline-code パス）・goal_ref・supersedes/superseded-by）を主軸に意味的重複を判定する。自然言語類似度（Outcome の token Jaccard）は補助 signal に留め、`proceed_with_collision_evidence` を許可する唯一の根拠にはしない。
 - `Allowed Paths` が同一集合であることは duplicate の十分条件にしない。`same_path_set` に基づく duplicate 候補は readback + 構造シグナルによる確認を経て初めて `duplicate` route を確定し、確認できない場合は C1 と同様に扱う。
-- 全 candidate（number/body/updatedAt/Allowed Paths/dependency contract の schema）を検証し、一件でも欠ければ `human_review_required` に倒す（false positive での黙殺を防ぐ）。
-- `IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1` evidence（`current_issue` / `source` / `candidates`（candidate ごとの `policy_class` / `reasons` / `structural_signals`）/ `dependency_resolution` / `validation_errors` / `route` / `decision_inputs_sha256` / `evidence_sha256`）を標準出力に JSON で返す。
+- 全 candidate の number / body / updatedAt / dependency contract schema を検証し、一件でも欠ければ `human_review_required` に倒す（false positive での黙殺を防ぐ）。Allowed Paths 未記載だけは非比較対象として除外するため validation error に含めない。
+- `IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1` evidence（`current_issue` / `source` / `candidates`（candidate ごとの `policy_class` / `reasons` / `structural_signals`）/ `ignored_candidates`（`issue_number` と `reason: ignored_missing_allowed_paths`）/ `dependency_resolution` / `validation_errors` / `route` / `decision_inputs_sha256` / `evidence_sha256`）を標準出力に JSON で返す。
 
 #### route / exit code 契約（クローズドセット、Major 2 改訂）
 
