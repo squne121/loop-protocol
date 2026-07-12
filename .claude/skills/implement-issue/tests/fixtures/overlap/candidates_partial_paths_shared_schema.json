@@ -1,0 +1,15 @@
+[
+  {
+    "number": 9461,
+    "title": "実装: resource ledger consumer の再試行制御を追加する",
+    "body": "## Machine-Readable Contract\n\n```yaml\ncontract_schema_version: v1\nissue_kind: implementation\nparent_issue: \"none\"\ngoal_ref: \"resource ledger consumer の再試行制御を追加する\"\nchange_kind: feature\n```\n\n## Outcome\n\nresource ledger consumer が `FOO_BAR_RESULT_V2` を読み取り、再試行制御\nを行う状態。src/upgrade/consumer.ts と docs/dev/agent-runtime-ops.md を\n更新する。\n\n## In Scope\n\n- src/upgrade/consumer.ts への再試行制御追加\n- docs/dev/agent-runtime-ops.md への consumer 挙動追記\n\n## Out of Scope\n\n- ledger 側の出力 schema 変更\n\n## Delivery Rule\n\n- 1 Issue = 1 PR\n- Draft PR を既定とする\n\n## Allowed Paths\n\n- docs/dev/agent-runtime-ops.md\n- src/upgrade/consumer.ts\n",
+    "labels": [
+      {
+        "name": "phase/implementation"
+      }
+    ],
+    "updatedAt": "2026-07-11T10:30:00Z",
+    "url": "https://github.com/squne121/loop-protocol/issues/9461",
+    "body_sha256": "sha256:911f32585f3f0bca60fd807a61087cc6dc669de0e6d13f6f1a0eb10771e8b453"
+  }
+]

@@ -1,0 +1,11 @@
+{
+  "number": 9451,
+  "title": "実装: Codex custom agents の GPT-5.6 role-based model allocation を静的契約・launch証跡まで同期する",
+  "body": "## Machine-Readable Contract\n\n```yaml\ncontract_schema_version: v1\nissue_kind: implementation\nparent_issue: \"none\"\ngoal_ref: \"Codex custom agents の GPT-5.6 role-based model allocation を静的契約・launch証跡まで同期する\"\nchange_kind: docs\n```\n\n## Outcome\n\nCodex custom-agent runtime の role-based model allocation が、静的契約\n（agent 定義ファイル）と実際の launch 証跡の両方で GPT-5.6 に同期している\n状態。docs/dev/agent-runtime-ops.md に model routing 表を追記する。\n\n## In Scope\n\n- docs/dev/agent-runtime-ops.md への role-based model allocation 表の追記\n- Codex custom-agent launch 証跡と静的契約の突合スクリプト\n\n## Out of Scope\n\n- publish lane authorization の trust root\n- hash pinning による candidate worktree 分離\n\n## Delivery Rule\n\n- 1 Issue = 1 PR\n- Draft PR を既定とする\n\n## Allowed Paths\n\n- docs/dev/agent-runtime-ops.md\n- docs/dev/codex-model-routing.md\n",
+  "updatedAt": "2026-07-11T06:58:09Z",
+  "url": "https://github.com/squne121/loop-protocol/issues/9451",
+  "blockedBy": [
+    9449
+  ],
+  "body_sha256": "sha256:89d704bca89d35bdb57880d86752b2045b89f2de5c453db13d7efbcbc2e3c368"
+}

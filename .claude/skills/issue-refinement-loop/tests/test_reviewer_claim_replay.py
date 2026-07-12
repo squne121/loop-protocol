@@ -1289,3 +1289,187 @@ def test_broad_search_path_unbounded_vc_preflight_requires_matching_source_body_
     assert result["verdict_detail_v1"] == "input_or_runtime_error"
     assert result["should_consume_iteration"] is False
     assert result["reason_code"] == "vc_preflight_body_sha_mismatch"
+
+
+# ---------------------------------------------------------------------------
+# Issue #1472 (session / issue-number binding negative tests): the SubAgent
+# co-location design (issue-reviewer.md now runs `reviewer_claim_replay.py`
+# in the same execution boundary that produced `compact_review_result_v1`)
+# removes the need for an orchestrator to open a raw artifact path from a
+# different SubAgent's isolation worktree. These tests confirm the existing
+# `body_sha256` binding contract (the only cross-artifact binding the
+# script performs; #1465 In Scope explicitly excludes changing the
+# judgment logic) still fails closed under tamper / symlink / cross-session
+# / cross-issue-number / oversize / stale-artifact conditions -- i.e. the
+# gap identified in #1465 (no prior CLI-level regression coverage for these
+# attack shapes) is closed without touching `analyze()`'s taxonomy or
+# routing rules.
+# ---------------------------------------------------------------------------
+
+
+def _run_cli(
+    tmp_path: Path,
+    review_path: Path,
+    readiness_path: Path,
+    state_path: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    args = [
+        sys.executable,
+        str(SCRIPT_PATH),
+        "--review-result-file",
+        str(review_path),
+        "--readiness-result-file",
+        str(readiness_path),
+    ]
+    if state_path is not None:
+        args.extend(["--state-file", str(state_path)])
+    return subprocess.run(args, capture_output=True, text=True, timeout=15)
+
+
+def test_tampered_review_result_file_after_generation_fails_closed(tmp_path: Path):
+    """GIVEN a review-result-file tampered post-generation (body hash
+    rewritten to a value the paired readiness artifact never saw) WHEN the
+    CLI is invoked THEN it fails closed with a wrong_body_hash mismatch
+    (`reason_code: body_sha_mismatch`), not a silent pass-through."""
+    review_path = tmp_path / "review.json"
+    readiness_path = tmp_path / "readiness.json"
+    review_path.write_text(json.dumps(COMPACT_C4), encoding="utf-8")
+    readiness_path.write_text(json.dumps(READINESS_CLEAN), encoding="utf-8")
+
+    # Simulate tamper: overwrite the review artifact after it was produced,
+    # with a wrong_body_hash that no longer matches the readiness artifact.
+    tampered = {**COMPACT_C4, "body_sha256": "sha256:wrong_body_hash-tampered"}
+    review_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+    proc = _run_cli(tmp_path, review_path, readiness_path)
+    assert proc.returncode == 0
+    payload = json.loads(proc.stdout)
+    assert payload["verdict"] == "input_or_runtime_error"
+    assert payload["reason_code"] == "body_sha_mismatch"
+    assert payload["routing"] == "human_judgment_required"
+
+
+def test_symlinked_review_result_file_does_not_bypass_body_hash_binding(tmp_path: Path):
+    """GIVEN --review-result-file is a symlink pointing at a file whose
+    content carries a wrong_body_hash (mismatched vs. the readiness
+    artifact) WHEN the CLI is invoked THEN the mismatch is still detected
+    -- a symlink indirection does not bypass the body-hash binding check."""
+    real_target = tmp_path / "real_review.json"
+    tampered = {**COMPACT_C4, "body_sha256": "sha256:wrong_body_hash-via-symlink"}
+    real_target.write_text(json.dumps(tampered), encoding="utf-8")
+
+    symlink_path = tmp_path / "review_symlink.json"
+    symlink_path.symlink_to(real_target)
+
+    readiness_path = tmp_path / "readiness.json"
+    readiness_path.write_text(json.dumps(READINESS_CLEAN), encoding="utf-8")
+
+    proc = _run_cli(tmp_path, symlink_path, readiness_path)
+    assert proc.returncode == 0
+    payload = json.loads(proc.stdout)
+    assert payload["verdict"] == "input_or_runtime_error"
+    assert payload["reason_code"] == "body_sha_mismatch"
+
+
+def test_wrong_session_state_file_does_not_leak_across_issue_numbers(tmp_path: Path):
+    """GIVEN two separate `--state-file` paths namespaced by distinct issue
+    numbers (matching the `.claude/artifacts/issue-refinement-loop/<N>/...`
+    convention) WHEN each issue's replay is run twice with an unbacked
+    blocker THEN the `consecutive_unbacked_count` in one issue's state file
+    is never incremented by the other issue's runs (no cross-session
+    leakage through a shared/guessed state path)."""
+    review_path = tmp_path / "review.json"
+    readiness_path = tmp_path / "readiness.json"
+    review_path.write_text(json.dumps(COMPACT_C4), encoding="utf-8")
+    readiness_path.write_text(json.dumps(READINESS_CLEAN), encoding="utf-8")
+
+    issue_1021_state = tmp_path / "1021" / "reviewer_claim_replay_state.json"
+    issue_9999_state = tmp_path / "9999" / "reviewer_claim_replay_state.json"
+
+    # Issue #1021 "session": run once.
+    proc_1021 = _run_cli(tmp_path, review_path, readiness_path, issue_1021_state)
+    assert proc_1021.returncode == 0
+
+    # A different issue's "session" (#9999) has never run before; its state
+    # file must not already reflect issue #1021's consecutive count.
+    assert not issue_9999_state.exists()
+    proc_9999 = _run_cli(tmp_path, review_path, readiness_path, issue_9999_state)
+    assert proc_9999.returncode == 0
+    assert json.loads(proc_9999.stdout)["verdict"] == "reviewer_claim_unbacked_by_deterministic_checker"
+    assert json.loads(issue_9999_state.read_text(encoding="utf-8"))["consecutive_unbacked_count"] == 1
+    # Issue #1021's own state file is unaffected by #9999's run.
+    assert json.loads(issue_1021_state.read_text(encoding="utf-8"))["consecutive_unbacked_count"] == 1
+
+
+def test_wrong_issue_number_pairing_fails_closed_via_body_hash(tmp_path: Path):
+    """GIVEN a review-result-file produced for one issue's body paired with
+    a readiness-result-file produced for a different issue's body (distinct
+    `body_sha256`) WHEN the CLI is invoked THEN the mismatch fails closed
+    instead of being silently arbitrated as if the pairing were correct."""
+    review_for_issue_1021 = {
+        **COMPACT_C4,
+        "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+        "body_sha256": "sha256:issue-1021-body",
+    }
+    readiness_for_issue_9999 = {
+        "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+        "body_sha256": "sha256:issue-9999-body",
+        "errors": [],
+    }
+    review_path = tmp_path / "review.json"
+    readiness_path = tmp_path / "readiness.json"
+    review_path.write_text(json.dumps(review_for_issue_1021), encoding="utf-8")
+    readiness_path.write_text(json.dumps(readiness_for_issue_9999), encoding="utf-8")
+
+    proc = _run_cli(tmp_path, review_path, readiness_path)
+    assert proc.returncode == 0
+    payload = json.loads(proc.stdout)
+    assert payload["verdict"] == "input_or_runtime_error"
+    assert payload["reason_code"] == "body_sha_mismatch"
+    assert payload["issue_url"] == "https://github.com/squne121/loop-protocol/issues/1021"
+
+
+def test_oversize_review_result_file_keeps_stdout_within_output_budget(tmp_path: Path):
+    """GIVEN a review-result-file with a very large number of blocker
+    entries (oversize input, well beyond a normal review payload) WHEN the
+    CLI is invoked THEN it still terminates deterministically and the
+    stdout OUTPUT_BUDGET_V1 (<=2048 UTF-8 bytes) is respected via the
+    existing trim path -- oversize input does not crash the process or
+    silently balloon stdout."""
+    many_blockers = [{"code": "C4", "message": "missing $ prefix " * 20} for _ in range(500)]
+    oversize_review = {**COMPACT_C4, "blocking_issues": many_blockers}
+    review_path = tmp_path / "review.json"
+    readiness_path = tmp_path / "readiness.json"
+    review_path.write_text(json.dumps(oversize_review), encoding="utf-8")
+    readiness_path.write_text(json.dumps(READINESS_CLEAN), encoding="utf-8")
+
+    proc = _run_cli(tmp_path, review_path, readiness_path)
+    assert proc.returncode == 0
+    assert len(proc.stdout.encode("utf-8")) <= 2048
+
+
+def test_stale_artifact_replayed_against_fresh_state_is_detected(tmp_path: Path):
+    """GIVEN a stale (previously-consumed) review/readiness artifact pair is
+    replayed a second time against its own prior state file WHEN the CLI is
+    invoked THEN the repeated unbacked claim against the same body hash is
+    escalated (`reviewer_false_positive_suspected` / `human_escalation`)
+    rather than being treated as a fresh first-time claim -- a stale
+    artifact cannot be replayed to keep resetting the consecutive-unbacked
+    counter."""
+    review_path = tmp_path / "review.json"
+    readiness_path = tmp_path / "readiness.json"
+    state_path = tmp_path / "state.json"
+    review_path.write_text(json.dumps(COMPACT_C4), encoding="utf-8")
+    readiness_path.write_text(json.dumps(READINESS_CLEAN), encoding="utf-8")
+
+    first = _run_cli(tmp_path, review_path, readiness_path, state_path)
+    assert first.returncode == 0
+    assert json.loads(first.stdout)["verdict"] == "reviewer_claim_unbacked_by_deterministic_checker"
+
+    # Replay the same stale artifact pair again against the state file it
+    # already advanced.
+    second = _run_cli(tmp_path, review_path, readiness_path, state_path)
+    assert second.returncode == 0
+    payload = json.loads(second.stdout)
+    assert payload["verdict"] == "reviewer_false_positive_suspected"
+    assert payload["routing"] == "human_escalation"
