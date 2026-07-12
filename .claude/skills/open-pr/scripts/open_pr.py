@@ -564,6 +564,17 @@ def _load_overlap_preflight_evidence(
     return stored, None
 
 
+def _positive_overlap_source_limit(evidence: dict) -> int | None:
+    """evidence の ``source.limit`` を再検証用の正の整数として読む。"""
+    source = evidence.get("source")
+    if not isinstance(source, dict):
+        return None
+    limit = source.get("limit")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        return None
+    return limit
+
+
 def _overlap_preflight_safety_reason(fresh: dict, linked_issue: int) -> str | None:
     """AC4 の安全性 predicate を検証する。violation があれば理由文字列、
     なければ None を返す。"""
@@ -647,6 +658,18 @@ def run_overlap_preflight_gate(
             None,
         )
 
+    # stored evidence の embedded hash と decision-input provenance を確認した
+    # 後にだけ、収集境界を固定する candidate limit を利用する。呼び出し元が
+    # 任意値で上書きできないよう、唯一の入力はこの verified evidence とする。
+    stored_limit = _positive_overlap_source_limit(stored)
+    if stored_limit is None:
+        return (
+            False,
+            E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID,
+            "stored source.limit が正の整数ではありません",
+            None,
+        )
+
     cmd = [
         sys.executable,
         str(_CHECK_IMPLEMENTATION_OVERLAP_SCRIPT),
@@ -654,6 +677,8 @@ def run_overlap_preflight_gate(
         str(linked_issue),
         "--repo",
         repo,
+        "--limit",
+        str(stored_limit),
     ]
     try:
         cp = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=90)
@@ -682,6 +707,22 @@ def run_overlap_preflight_gate(
         )
     if not isinstance(fresh, dict):
         return False, E_OVERLAP_PREFLIGHT_SOURCE_FAILURE, "non-object JSON output", None
+
+    fresh_limit = _positive_overlap_source_limit(fresh)
+    if fresh_limit is None:
+        return (
+            False,
+            E_OVERLAP_PREFLIGHT_DRIFT,
+            "fresh source.limit が正の整数ではありません",
+            fresh,
+        )
+    if fresh_limit != stored_limit:
+        return (
+            False,
+            E_OVERLAP_PREFLIGHT_DRIFT,
+            f"source.limit drift: stored={stored_limit} fresh={fresh_limit}",
+            fresh,
+        )
 
     fresh_decision_inputs = fresh.get("decision_inputs_sha256")
     if expected_decision_inputs_sha256 is None or fresh_decision_inputs != expected_decision_inputs_sha256:

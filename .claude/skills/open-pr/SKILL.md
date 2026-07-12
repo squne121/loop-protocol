@@ -155,8 +155,8 @@ EXISTING_PR=$(gh pr list --head <branch> --state open --json number,url --jq '.[
 
 1. `evidence_file` の再読込と `expected_evidence_sha256`（stored evidence の embedded `evidence_sha256` との一致確認、evidence 自体の integrity 検証）
 2. stored evidence の `decision_inputs_sha256` と、呼び出し元が指定した `expected_decision_inputs_sha256` との一致確認（PR #1467 review fix, P2-1: stored artifact がどの preflight collection chain に属するかを確定する provenance チェック。ここで不一致なら `E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID` で停止し、オンライン再実行は行わない）
-3. `check_implementation_overlap.py`（`.claude/skills/implement-issue/scripts/check_implementation_overlap.py`。producer は変更せず subprocess として再実行するのみ）を同一 `--repo` / `--issue-number` でオンライン再実行し、fresh evidence を取得
-4. fresh evidence の `decision_inputs_sha256` と `expected_decision_inputs_sha256` の一致確認（collection 時点からの drift 検出。上記 2 で stored と expected の同一性が既に確認されているため、fresh がここで一致すれば stored・fresh 双方が同一 collection chain に属することが保証される）
+3. integrity 確認済み stored evidence の `source.limit` を正の整数として検証し、その値以外の caller input は使わず、`check_implementation_overlap.py`（`.claude/skills/implement-issue/scripts/check_implementation_overlap.py`。producer は変更せず subprocess として再実行するのみ）へ同一 `--repo` / `--issue-number` / `--limit <stored source.limit>` でオンライン再実行する
+4. fresh evidence の `source.limit` が正の整数かつ stored `source.limit` と一致すること、さらに fresh evidence の `decision_inputs_sha256` と `expected_decision_inputs_sha256` が一致することを確認する（collection 時点からの drift 検出。上記 2 で stored と expected の同一性が既に確認されているため、fresh がここで一致すれば stored・fresh 双方が同一 collection chain に属することが保証される）
 5. fresh evidence の `route`（`proceed` / `proceed_with_collision_evidence` のみ安全）・`source.complete`（`true` 必須）・`source.saturated`（`false` 必須）・`validation_errors`（空必須）・`dependency_resolution.unresolved_refs`（空配列必須）・`dependency_resolution.blocking_predecessor`（`null` 必須）・`current_issue.number`（`linked_issue` と一致必須）の安全性 predicate 検証
 
 いずれかが不成立の場合、`gh pr create` を呼ばず fail-closed で停止する（下記 Error Codes 参照）。オンライン再実行に使う `--repo` は `gh pr create --repo` にもそのまま渡される同一変数であり、これが AC8 の cross-repo binding mitigation の根拠（evidence 自体への `repository` フィールド追加は #1462 の scope。残存する cross-repo binding gap は本 gate では完全には閉じない）。
@@ -245,8 +245,8 @@ uv run --locked python3 .claude/skills/open-pr/scripts/open_pr.py \
 | `E_LINKED_ISSUE_STATE_UNKNOWN` | linked issue の state 取得失敗 | gh 認証 / linked_issue 番号を確認 |
 | `E_GH_FAILURE` | `gh pr create` 失敗 | stderr の詳細を確認、リポジトリ権限 / ブランチ存在 / リモート push 済みを確認 |
 | `E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING` | `overlap_preflight` gate が有効（`required: true` または `phase/implementation` ラベルによる強制）だが `evidence_file` が存在しない・読み込めない | `check_implementation_overlap.py` を再実行して evidence file を再生成し、正しいパスを渡す |
-| `E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID` | stored evidence の parse 失敗・スキーマ不一致・embedded `evidence_sha256` と `expected_evidence_sha256` の不一致 | evidence file が破損していないか、`expected_evidence_sha256` が正しい stored 値か確認し、必要なら再収集する |
-| `E_OVERLAP_PREFLIGHT_DRIFT` | オンライン再実行の fresh `decision_inputs_sha256` が `expected_decision_inputs_sha256` と不一致（collection 時点からの drift） | `implement-issue/SKILL.md` の overlap preflight（Step 2）を再実行し、新しい evidence で再度 `open_pr.py` を呼び出す |
+| `E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID` | stored evidence の parse 失敗・スキーマ不一致・embedded `evidence_sha256` と `expected_evidence_sha256` の不一致、または stored `source.limit` の欠落・非整数・0以下 | evidence file が破損していないか、`expected_evidence_sha256` と stored `source.limit` が正しいか確認し、必要なら再収集する |
+| `E_OVERLAP_PREFLIGHT_DRIFT` | オンライン再実行の fresh `decision_inputs_sha256` が `expected_decision_inputs_sha256` と不一致、または fresh `source.limit` の欠落・非整数・0以下・stored 値との不一致 | `implement-issue/SKILL.md` の overlap preflight（Step 2）を再実行し、新しい evidence で再度 `open_pr.py` を呼び出す |
 | `E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE` | fresh evidence の `route` / `source.complete` / `source.saturated` / `validation_errors` / `dependency_resolution.unresolved_refs` / `dependency_resolution.blocking_predecessor` / `current_issue.number` のいずれかが不安全 | `route` と関連フィールドを確認し、`wait_for_predecessor` / `human_review_required` / `duplicate` 等の場合は人間判断へ停止する |
 | `E_OVERLAP_PREFLIGHT_SOURCE_FAILURE` | `check_implementation_overlap.py` のオンライン再実行が subprocess timeout / 非ゼロ終了 / 非 JSON 出力 / 認証失敗のいずれかを起こした | gh 認証・ネットワーク・スクリプトの実行環境を確認し、再実行する |
 

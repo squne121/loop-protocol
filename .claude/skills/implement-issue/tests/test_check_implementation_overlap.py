@@ -344,7 +344,7 @@ def test_given_candidate_missing_number_then_route_is_human_review_required() ->
     assert "missing_or_invalid_number" in payload["validation_errors"]["-1"]
 
 
-def test_given_candidate_missing_allowed_paths_then_excludes_it_from_classifier_and_returns_proceed() -> None:
+def test_given_ignored_missing_allowed_paths_candidate_then_excludes_it_from_classifier_and_returns_proceed() -> None:
     current_file = FIXTURES_DIR / "current_1451_analog.json"
     current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
     exit_code, payload = _run_cli(
@@ -532,6 +532,8 @@ def test_evidence_schema_contains_implement_scope_collision_preflight_v1_fields(
     source = payload["source"]
     assert isinstance(source["complete"], bool)
     assert isinstance(source["saturated"], bool)
+    assert isinstance(source["limit"], int)
+    assert source["limit"] == 100
     assert "collected_at" in source
 
     assert isinstance(payload["candidates"], list)

@@ -882,6 +882,7 @@ def build_evidence(
     current_paths: Sequence[str],
     source_complete: bool,
     source_saturated: bool,
+    source_limit: int,
     collected_at: str,
     candidates_evidence: List[Dict[str, Any]],
     ignored_candidates: List[Dict[str, Any]],
@@ -907,6 +908,7 @@ def build_evidence(
         "source": {
             "complete": source_complete,
             "saturated": source_saturated,
+            "limit": source_limit,
         },
         "candidates": ordered,
         "ignored_candidates": ordered_ignored,
@@ -928,6 +930,7 @@ def build_evidence(
         "source": {
             "complete": source_complete,
             "saturated": source_saturated,
+            "limit": source_limit,
             "collected_at": collected_at,
         },
         "candidates": ordered,
@@ -1344,6 +1347,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             current_paths=ctx["current_paths"],
             source_complete=ctx["source_complete"],
             source_saturated=ctx["saturated"],
+            source_limit=args.limit,
             collected_at=collected_at,
             candidates_evidence=ctx["candidates_evidence"],
             ignored_candidates=ctx["ignored_candidates"],

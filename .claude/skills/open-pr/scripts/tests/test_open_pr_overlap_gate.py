@@ -65,6 +65,7 @@ def build_stored_evidence(
     current_issue_number: int = 1458,
     source_complete: bool = True,
     source_saturated: bool = False,
+    source_limit: object = 500,
     validation_errors: dict | None = None,
     unresolved_refs: list | None = None,
     blocking_predecessor: object | None = None,
@@ -75,7 +76,12 @@ def build_stored_evidence(
     body = {
         "schema": open_pr.OVERLAP_PREFLIGHT_SCHEMA,
         "current_issue": {"number": current_issue_number, "allowed_paths": []},
-        "source": {"complete": source_complete, "saturated": source_saturated, "collected_at": "2026-07-11T00:00:00Z"},
+        "source": {
+            "complete": source_complete,
+            "saturated": source_saturated,
+            "limit": source_limit,
+            "collected_at": "2026-07-11T00:00:00Z",
+        },
         "candidates": [],
         "dependency_resolution": {
             "blocked_by_refs": [],
@@ -212,6 +218,117 @@ def test_fresh_evidence_no_drift_continues_to_create_pr(monkeypatch: pytest.Monk
         assert rc == 0, lines
         assert create_called is True
         assert not any(line.startswith("ERROR=") for line in lines)
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+def test_stored_limit_is_forwarded_to_online_preflight(monkeypatch: pytest.MonkeyPatch):
+    """GIVEN verified stored limit WHEN rechecking THEN the same --limit is used."""
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    stored = build_stored_evidence(
+        decision_inputs_sha256="sha256:" + "b" * 64,
+        current_issue_number=1458,
+        source_limit=500,
+    )
+    evidence_path = write_evidence_file(stored)
+    observed_cmds: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        observed_cmds.append(cmd)
+        return FakeCompletedProcess(0, json.dumps(fresh_evidence_from_stored(stored)), "")
+
+    monkeypatch.setattr(open_pr.subprocess, "run", fake_run)
+
+    try:
+        rc, lines, create_called = _run_main(
+            monkeypatch,
+            1458,
+            [
+                "--overlap-preflight-required",
+                "--overlap-preflight-evidence-file", str(evidence_path),
+                "--overlap-preflight-expected-evidence-sha256", stored["evidence_sha256"],
+                "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
+            ],
+        )
+        assert rc == 0, lines
+        assert create_called is True
+        command = observed_cmds[0]
+        limit_index = command.index("--limit")
+        assert command[limit_index + 1] == "500"
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("source_limit", [None, "500", True, 0, -1])
+def test_invalid_stored_limit_blocks_before_online_recheck(
+    monkeypatch: pytest.MonkeyPatch, source_limit: object
+):
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    stored = build_stored_evidence(
+        decision_inputs_sha256="sha256:" + "b" * 64,
+        current_issue_number=1458,
+        source_limit=source_limit,
+    )
+    evidence_path = write_evidence_file(stored)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("invalid stored limit must block before online recheck")
+
+    monkeypatch.setattr(open_pr.subprocess, "run", fail_if_called)
+
+    try:
+        rc, lines, create_called = _run_main(
+            monkeypatch,
+            1458,
+            [
+                "--overlap-preflight-required",
+                "--overlap-preflight-evidence-file", str(evidence_path),
+                "--overlap-preflight-expected-evidence-sha256", stored["evidence_sha256"],
+                "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
+            ],
+        )
+        assert rc == 2
+        assert create_called is False
+        assert any(
+            line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines
+        ), lines
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("fresh_limit", [None, "500", True, 0, -1, 499])
+def test_invalid_or_mismatched_fresh_limit_blocks_pr_creation(
+    monkeypatch: pytest.MonkeyPatch, fresh_limit: object
+):
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    stored = build_stored_evidence(
+        decision_inputs_sha256="sha256:" + "b" * 64,
+        current_issue_number=1458,
+        source_limit=500,
+    )
+    evidence_path = write_evidence_file(stored)
+    fresh = fresh_evidence_from_stored(stored)
+    fresh["source"]["limit"] = fresh_limit
+    monkeypatch.setattr(
+        open_pr.subprocess,
+        "run",
+        lambda cmd, **kwargs: FakeCompletedProcess(0, json.dumps(fresh), ""),
+    )
+
+    try:
+        rc, lines, create_called = _run_main(
+            monkeypatch,
+            1458,
+            [
+                "--overlap-preflight-required",
+                "--overlap-preflight-evidence-file", str(evidence_path),
+                "--overlap-preflight-expected-evidence-sha256", stored["evidence_sha256"],
+                "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
+            ],
+        )
+        assert rc == 2
+        assert create_called is False
+        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_DRIFT}" for line in lines), lines
     finally:
         evidence_path.unlink(missing_ok=True)
 
