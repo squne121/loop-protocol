@@ -54,7 +54,28 @@ def _issue_view_json(
     )
 
 
-def _comment_ndjson(body: str, *, comment_id: int = 1, created_at: str = "2026-06-19T00:01:00Z") -> str:
+# #1475: this test module exercises routing / triage / normalization logic,
+# not the trust policy itself (that is covered end-to-end in
+# test_contract_snapshot_author_binding.py). Default every fixture comment
+# to the sole allowlisted TRUSTED_CONTRACT_PUBLISHERS identity so existing
+# routing assertions are unaffected by the fix_delta P1 item 1/2 trust gate;
+# tests that specifically need an untrusted comment pass author=... overrides.
+_TRUSTED_AUTHOR_LOGIN = "squne121"
+_TRUSTED_AUTHOR_ID = 63350259
+_TRUSTED_AUTHOR_TYPE = "User"
+_TRUSTED_AUTHOR_ASSOCIATION = "OWNER"
+
+
+def _comment_ndjson(
+    body: str,
+    *,
+    comment_id: int = 1,
+    created_at: str = "2026-06-19T00:01:00Z",
+    author: str | None = _TRUSTED_AUTHOR_LOGIN,
+    author_id: int | None = _TRUSTED_AUTHOR_ID,
+    author_type: str | None = _TRUSTED_AUTHOR_TYPE,
+    author_association: str | None = _TRUSTED_AUTHOR_ASSOCIATION,
+) -> str:
     return json.dumps(
         {
             "id": comment_id,
@@ -62,6 +83,10 @@ def _comment_ndjson(body: str, *, comment_id: int = 1, created_at: str = "2026-0
             "created_at": created_at,
             "updated_at": created_at,
             "body": body,
+            "author": author,
+            "author_id": author_id,
+            "author_type": author_type,
+            "author_association": author_association,
         }
     )
 
