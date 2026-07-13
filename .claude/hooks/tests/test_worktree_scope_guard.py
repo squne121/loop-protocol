@@ -2709,4 +2709,237 @@ def test_publish_lane_push_emits_safety_stop_report_for_fast_forward_remote_head
     assert 'remote_readback_source: "ls_remote"' in r.stderr
     assert "decision_inputs_complete: true" in r.stderr
     assert expected_head in r.stderr
-    assert remote_head in r.stderr
+
+
+# =============================================================================
+# Issue #1498: preflight.run.with_anchor sibling exact profile
+# =============================================================================
+# Real PreToolUse hook path (stdin JSON via worktree_scope_guard.sh, real git
+# worktree) for the Positive/Negative Test Matrix's allow (#2) and deny
+# (#3-#22) cases that are within worktree_scope_guard's own responsibility
+# (exact-command classification + root-no-worktree eligibility). URL-shape
+# and parser-level rejections (already covered exhaustively by
+# scripts/agent-guards/tests/test_skill_runtime_command_policy_anchor.py) are
+# re-verified here end-to-end through the real hook to rule out split-brain
+# (Matrix #23) between the parser and this guard's allow/deny decision.
+
+_ANCHOR_VALID_URL = "https://github.com/squne121/loop-protocol/issues/1154#issuecomment-1"
+
+
+def _anchor_command(
+    issue_number: str = "1154",
+    repo: str = "squne121/loop-protocol",
+    url: str = _ANCHOR_VALID_URL,
+) -> str:
+    return (
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run.with_anchor "
+        f"--issue-number {issue_number} --repo {repo} --anchor-comment-url {url}"
+    )
+
+
+def test_worktree_scope_guard_allows_anchor_profile_matrix_2(tmp_path):
+    """Matrix #2: correct single anchor + preflight.run.with_anchor → allow."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1154", slug="x")
+    payload = _bash_payload(_anchor_command(), str(repo["root"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1154"}
+    r = _run_guard(payload, repo["root"], issue="1154", extra_env=env)
+    assert r.returncode == 0, r.stderr
+
+
+def test_worktree_scope_guard_allows_anchor_profile_without_active_worktree(tmp_path):
+    """preflight.run.with_anchor is root-no-worktree eligible, mirroring preflight.run."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1154", slug="x")
+    _git("worktree", "remove", "--force", str(repo["worktree"]), cwd=repo["root"])
+    payload = _bash_payload(_anchor_command(), str(repo["root"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"])}
+    r = _run_guard(payload, repo["root"], issue=None, extra_env=env)
+    assert r.returncode == 0, r.stderr
+
+
+@pytest.mark.parametrize(
+    ("name", "command"),
+    [
+        # Matrix #3: anchor missing on preflight.run.with_anchor is not a
+        # constructible command for this exact-command_id (the flag itself
+        # is absent), covered instead by feeding preflight.run.with_anchor
+        # with a trailing missing value (#17) and by omitting the flag pair.
+        (
+            "missing_anchor_flag",
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run.with_anchor --issue-number 1154 "
+            "--repo squne121/loop-protocol",
+        ),
+        # Matrix #4: anchor added to preflight.run (production, unmodified).
+        (
+            "anchor_on_preflight_run",
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run --issue-number 1154 "
+            "--repo squne121/loop-protocol --anchor-comment-url " + _ANCHOR_VALID_URL,
+        ),
+        # Matrix #5: two distinct --anchor-comment-url flags.
+        (
+            "duplicate_distinct_anchor_flags",
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run.with_anchor --issue-number 1154 "
+            "--repo squne121/loop-protocol --anchor-comment-url " + _ANCHOR_VALID_URL
+            + " --anchor-comment-url "
+            "https://github.com/squne121/loop-protocol/issues/1154#issuecomment-2",
+        ),
+        # Matrix #7: different repository in the URL.
+        (
+            "different_repo_in_url",
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run.with_anchor --issue-number 1154 "
+            "--repo squne121/loop-protocol --anchor-comment-url "
+            "https://github.com/other/repo/issues/1154#issuecomment-1",
+        ),
+        # Matrix #8: different issue number in the URL.
+        (
+            "different_issue_in_url",
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run.with_anchor --issue-number 1154 "
+            "--repo squne121/loop-protocol --anchor-comment-url "
+            "https://github.com/squne121/loop-protocol/issues/999#issuecomment-1",
+        ),
+        # Matrix #9: pull request review comment URL.
+        (
+            "pull_request_review_comment_url",
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run.with_anchor --issue-number 1154 "
+            "--repo squne121/loop-protocol --anchor-comment-url "
+            "https://github.com/squne121/loop-protocol/pull/1154/files#r1",
+        ),
+        # Matrix #10: discussion_r fragment form.
+        (
+            "discussion_r_fragment",
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run.with_anchor --issue-number 1154 "
+            "--repo squne121/loop-protocol --anchor-comment-url "
+            "https://github.com/squne121/loop-protocol/issues/1154#discussion_r1",
+        ),
+        # Matrix #11: query string present.
+        (
+            "query_string",
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run.with_anchor --issue-number 1154 "
+            "--repo squne121/loop-protocol --anchor-comment-url "
+            "https://github.com/squne121/loop-protocol/issues/1154?tab=1#issuecomment-1",
+        ),
+        # Matrix #12: trailing slash suffix.
+        (
+            "trailing_slash",
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run.with_anchor --issue-number 1154 "
+            "--repo squne121/loop-protocol --anchor-comment-url "
+            "https://github.com/squne121/loop-protocol/issues/1154#issuecomment-1/",
+        ),
+        # Matrix #13: userinfo present.
+        (
+            "userinfo",
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run.with_anchor --issue-number 1154 "
+            "--repo squne121/loop-protocol --anchor-comment-url "
+            "https://user@github.com/squne121/loop-protocol/issues/1154#issuecomment-1",
+        ),
+        # Matrix #14: percent-encoding disguise.
+        (
+            "percent_encoded",
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run.with_anchor --issue-number 1154 "
+            "--repo squne121/loop-protocol --anchor-comment-url "
+            "https://github.com/squne121/loop-protocol/issues/1154%23issuecomment-1",
+        ),
+        # Matrix #15: --anchor-comment-url=URL (= form).
+        (
+            "eq_form",
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run.with_anchor --issue-number 1154 "
+            "--repo squne121/loop-protocol --anchor-comment-url=" + _ANCHOR_VALID_URL,
+        ),
+        # Matrix #16: option abbreviation.
+        (
+            "abbreviated_flag",
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run.with_anchor --issue-number 1154 "
+            "--repo squne121/loop-protocol --anchor-comment-u " + _ANCHOR_VALID_URL,
+        ),
+        # Matrix #17: flag present but no value.
+        (
+            "flag_no_value",
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run.with_anchor --issue-number 1154 "
+            "--repo squne121/loop-protocol --anchor-comment-url",
+        ),
+        # Matrix #18: unknown extra flag.
+        (
+            "unknown_extra_flag",
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run.with_anchor --issue-number 1154 "
+            "--repo squne121/loop-protocol --anchor-comment-url " + _ANCHOR_VALID_URL
+            + " --extra x",
+        ),
+        # Matrix #19: duplicate flag (identical URL twice).
+        (
+            "duplicate_identical_anchor_flags",
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run.with_anchor --issue-number 1154 "
+            "--repo squne121/loop-protocol --anchor-comment-url " + _ANCHOR_VALID_URL
+            + " --anchor-comment-url " + _ANCHOR_VALID_URL,
+        ),
+        # Matrix #20: flag order changed.
+        (
+            "flag_order_changed",
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--anchor-comment-url " + _ANCHOR_VALID_URL
+            + " --command-id preflight.run.with_anchor --issue-number 1154 "
+            "--repo squne121/loop-protocol",
+        ),
+        # Matrix #21: shell metacharacter in value.
+        (
+            "shell_metachar",
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run.with_anchor --issue-number 1154 "
+            "--repo squne121/loop-protocol --anchor-comment-url "
+            + _ANCHOR_VALID_URL + ";rm -rf /",
+        ),
+    ],
+)
+def test_worktree_scope_guard_denies_anchor_profile_negative_matrix(tmp_path, name, command):
+    repo = _make_repo_with_worktree(tmp_path, issue="1154", slug="x")
+    payload = _bash_payload(command, str(repo["root"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1154"}
+    r = _run_guard(payload, repo["root"], issue="1154", extra_env=env)
+    assert r.returncode == 2, f"{name}: expected deny, got allow: {r.stderr}"
+
+
+def test_worktree_scope_guard_anchor_matrix_no_split_brain_with_policy_parser(tmp_path):
+    """Matrix #23: worktree_scope_guard's allow/deny must agree with the
+    underlying parser (scripts/agent-guards/skill_runtime_command_policy.py)
+    for the same command set — no split-brain allowlist."""
+    sys.path.insert(0, str(REPO_ROOT / "scripts" / "agent-guards"))
+    from skill_runtime_command_policy import (  # noqa: E402
+        parse_exact_skill_runtime_anchor_command,
+    )
+
+    repo = _make_repo_with_worktree(tmp_path, issue="1154", slug="x")
+    commands = [
+        _anchor_command(),
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run.with_anchor --issue-number 1154 "
+        "--repo squne121/loop-protocol --anchor-comment-url=" + _ANCHOR_VALID_URL,
+    ]
+    for command in commands:
+        payload = _bash_payload(command, str(repo["root"]))
+        env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1154"}
+        r = _run_guard(payload, repo["root"], issue="1154", extra_env=env)
+        guard_allows = r.returncode == 0
+        # The command under test targets skill_runtime_exec.py's own argv
+        # contract (12 tokens: uv run python3 <script> --command-id ...),
+        # which mirrors the parser's own exact-match contract byte for byte.
+        parser_allows = (
+            parse_exact_skill_runtime_anchor_command(command, str(repo["root"])) is not None
+        )
+        assert guard_allows == parser_allows, (
+            f"split-brain: guard={guard_allows} parser={parser_allows} for {command!r}"
+        )

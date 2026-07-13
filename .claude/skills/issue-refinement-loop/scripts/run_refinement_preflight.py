@@ -2542,7 +2542,8 @@ def write_provenance_artifact(
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Deterministic preflight wrapper for issue-refinement-loop."
+        description="Deterministic preflight wrapper for issue-refinement-loop.",
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--issue-number", type=int, required=True, help="GitHub Issue number (positive int)."
@@ -2555,7 +2556,13 @@ def main(argv: list[str] | None = None) -> None:
         dest="anchor_comment_urls",
         action="append",
         default=[],
-        help="Anchor comment URL to validate (can be specified multiple times).",
+        help=(
+            "Anchor comment URL to validate. The CLI flag is repeatable, but only "
+            "0 or 1 distinct URL is actually supported: passing 2+ distinct "
+            "anchor-comment URLs is rejected as ANCHOR_COMMENT_MULTIPLE_UNSUPPORTED "
+            "(repeating the identical URL is deduplicated to 1 and is not an "
+            "error)."
+        ),
     )
     parser.add_argument(
         "--fixture",
