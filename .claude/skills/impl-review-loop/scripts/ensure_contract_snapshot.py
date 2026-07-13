@@ -13,6 +13,7 @@ Exit codes:
   30  invalid_input — argument エラー
   40  runtime_error — subprocess / network エラー
   50  stale_or_conflicting_snapshot — atomicity 検証で body_sha256 or updatedAt mismatch
+  60  controlled_publisher_binding_failed — #1475: 投稿直後の comment ID readback binding 不一致・欠落
 
 stdout: CONTRACT_SNAPSHOT_ENSURE_RESULT_V1 compact JSON のみ
 stderr: diagnostic messages のみ
@@ -43,6 +44,31 @@ dry-run / no-post → status: dry_run_would_post (not ok).
 
 Comment posting: gh api REST (B5) for precise HTTP status classification.
 V1 comment includes checks summary (B6).
+
+Security scope (#1475 fix_delta P1 item 3 -- explicit, deliberately narrowed
+claim rather than an unimplemented receipt schema):
+  "Authoritative" means: authored by a GitHub account present in
+  contract_review_result_parser.TRUSTED_CONTRACT_PUBLISHERS (an exact
+  user.id + user.login + user.type + author_association match), which today
+  is the repo OWNER account only. It does NOT mean "identical to the exact
+  bytes this specific ensure_contract_snapshot.py process instance posted
+  moments ago" for every code path:
+    - The publish-time path (POST_STATUS_POSTED) DOES verify the freshly
+      posted comment id, issue binding, publisher identity, and comment
+      body hash via an independent direct-GET readback
+      (verify_controlled_publisher_comment_id_binding).
+    - The existing-snapshot-reuse path (source: existing_go, status: ok
+      without a POST in this run) does NOT re-run that binding check. It is
+      protected instead by the strict identity-tuple allowlist applied to
+      every comment considered a candidate (only the allowlisted account
+      can ever produce an authoritative go/blocked entry) plus the
+      body_sha256 / vc_preflight / product_spec_check freshness checks in
+      is_go_current(). It does not protect against the allowlisted account's
+      own comment being edited after posting to a body that still hashes to
+      a value is_go_current() would accept as current -- that residual risk
+      is intentionally out of scope for this Issue and tracked as a
+      follow-up (CONTRACT_SNAPSHOT_PUBLISH_RECEIPT_V1, option 1 in the
+      Issue #1475 fix_delta) rather than claimed as solved here.
 """
 
 from __future__ import annotations
@@ -378,6 +404,124 @@ def _extract_http_status(stderr: str) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
+# Controlled publisher comment ID binding (#1475, AC3)
+# ---------------------------------------------------------------------------
+
+_COMMENT_ID_FROM_URL_RE = re.compile(r"#issuecomment-(\d+)$")
+
+
+def extract_comment_id_from_url(url: Optional[str]) -> Optional[int]:
+    """Extract the numeric comment id from a GitHub issue comment html_url."""
+    if not url:
+        return None
+    m = _COMMENT_ID_FROM_URL_RE.search(url)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def verify_controlled_publisher_comment_id_binding(
+    issue_number: int,
+    repo: str,
+    expected_comment_id: Optional[int],
+    expected_body_sha256: Optional[str] = None,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> tuple[bool, Optional[str]]:
+    """
+    Confirm that the just-posted comment id is retrievable via the single
+    comment GitHub REST endpoint (repos/{repo}/issues/comments/{id}) and that
+    it is bound to this issue, this trusted publisher identity, and (when
+    provided) the exact comment body that was intended to be published.
+
+    Fail-closed (#1475 fix_delta P1 item 3): a missing/invalid id, fetch
+    error, invalid payload, id mismatch, issue mismatch, untrusted publisher
+    identity, or body hash mismatch all return (False, <reason_code>).
+
+    This function only re-validates the state of the comment id at the
+    moment it is called (publish-time direct GET). It does NOT by itself
+    protect a later `existing_go` snapshot-reuse decision made in a
+    different process run days/weeks later -- that decision is instead
+    protected by requiring a strict identity-tuple match
+    (contract_review_result_parser.is_trusted_snapshot_author) on every
+    comment considered as an authoritative candidate, not by re-running this
+    binding check at reuse-time. See the ensure_contract_snapshot docstring
+    and the PR's Safety Claim Matrix for the explicit scope of this
+    guarantee ("authored by an allowlisted GitHub account", not "byte-for-
+    byte identical to what this specific process instance posted").
+    """
+    if (
+        expected_comment_id is None
+        or isinstance(expected_comment_id, bool)
+        or not isinstance(expected_comment_id, int)
+        or expected_comment_id <= 0
+    ):
+        return False, "missing_comment_id"
+    try:
+        result = subprocess.run(
+            [
+                "gh", "api",
+                f"repos/{repo}/issues/comments/{expected_comment_id}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "binding_readback_timeout"
+    except Exception:
+        return False, "binding_readback_error"
+
+    if result.returncode != 0:
+        return False, "binding_readback_error"
+
+    try:
+        payload = json.loads(result.stdout.strip())
+    except json.JSONDecodeError:
+        return False, "binding_readback_invalid_json"
+    if not isinstance(payload, dict):
+        return False, "binding_readback_invalid_json"
+
+    if payload.get("id") != expected_comment_id:
+        return False, "binding_id_mismatch"
+
+    issue_url = str(payload.get("issue_url") or "")
+    expected_suffix = f"/repos/{repo}/issues/{issue_number}"
+    if not issue_url.endswith(expected_suffix):
+        return False, "binding_issue_mismatch"
+
+    html_url = str(payload.get("html_url") or "")
+    if not html_url or extract_comment_id_from_url(html_url) != expected_comment_id:
+        return False, "binding_html_url_mismatch"
+
+    user = payload.get("user") if isinstance(payload.get("user"), dict) else {}
+    author_login = user.get("login")
+    author_id = user.get("id")
+    author_type = user.get("type")
+    author_association = payload.get("author_association")
+
+    try:
+        parser_mod = _import_parser_module()
+    except Exception:
+        return False, "binding_parser_import_error"
+
+    if not parser_mod.is_trusted_snapshot_author(
+        author_login,
+        author_association,
+        author_id=author_id,
+        author_type=author_type,
+    ):
+        return False, "binding_publisher_untrusted"
+
+    if expected_body_sha256:
+        body = str(payload.get("body") or "")
+        actual_body_sha256 = sha256_of(body)
+        if actual_body_sha256 != expected_body_sha256:
+            return False, "binding_body_hash_mismatch"
+
+    return True, None
+
+
+# ---------------------------------------------------------------------------
 # run_contract_review_once wrapper
 # ---------------------------------------------------------------------------
 
@@ -524,16 +668,22 @@ def ensure_contract_snapshot(
         results = parser_mod.parse_contract_review_results(
             comments, expected_issue_url=issue_url
         )
-        latest = parser_mod.find_latest_result(results)
-        go_result = parser_mod.find_latest_go(results)
+        # #1475 (fix_delta P1 item 1): trust filtering must be applied BEFORE
+        # go/blocked precedence is decided, not only when selecting a go
+        # candidate. Otherwise an untrusted comment posted after a trusted
+        # go can still pre-empt it via the "latest blocked wins" branch below.
+        latest = parser_mod.find_latest_result(results, trusted_only=True)
+        go_result = parser_mod.find_latest_go(results, trusted_only=True)
 
-        # latest blocked retains precedence over existing-go adoption.
+        # latest (trusted) blocked retains precedence over existing-go adoption.
         if latest and latest["status"] == "blocked":
             result["status"] = "blocked_needs_refinement"
             result["source"] = "latest_blocked"
             result["contract_snapshot_url"] = latest["html_url"]
             return result
 
+        # #1475: parser_mod.find_latest_go(..., trusted_only=True) above already
+        # excludes untrusted-author results; is_go_current only re-checks freshness.
         if not is_go_current(go_result, body_sha256):
             break
 
@@ -675,7 +825,9 @@ def ensure_contract_snapshot(
     results_post = parser_mod.parse_contract_review_results(
         comments_post, expected_issue_url=issue_url
     )
-    latest_post = parser_mod.find_latest_result(results_post)
+    # #1475 (fix_delta P1 item 1): trust filtering before precedence, same as
+    # the pre-post check above.
+    latest_post = parser_mod.find_latest_result(results_post, trusted_only=True)
     if latest_post and latest_post["status"] == "blocked":
         result["status"] = "stale_or_conflicting_snapshot"
         result["errors"].append(
@@ -684,7 +836,7 @@ def ensure_contract_snapshot(
         return result
 
     # Also check if a go comment appeared in the interim
-    go_post = parser_mod.find_latest_go(results_post)
+    go_post = parser_mod.find_latest_go(results_post, trusted_only=True)
     if is_go_current(go_post, body_sha256_post):
         body_dedupe, _updated_dedupe, dedupe_err = fetch_issue_snapshot(
             issue_number, repo
@@ -725,6 +877,25 @@ def ensure_contract_snapshot(
     result["http_status"] = http_status
 
     if post_code == POST_STATUS_POSTED:
+        # #1475 fix_delta P1 item 3: verify the controlled publisher's
+        # comment id is bound to this issue, this trusted publisher
+        # identity, AND the exact comment body just posted, via an
+        # independent direct-GET readback -- before treating the freshly
+        # materialized snapshot as authoritative. Fail-closed on mismatch.
+        expected_comment_id = extract_comment_id_from_url(url)
+        bound_ok, binding_err = verify_controlled_publisher_comment_id_binding(
+            issue_number,
+            repo,
+            expected_comment_id,
+            expected_body_sha256=sha256_of(comment_body),
+        )
+        if not bound_ok:
+            result["status"] = "controlled_publisher_binding_failed"
+            result["contract_snapshot_url"] = None
+            result["errors"].append(
+                f"controlled_publisher_binding_failed: {binding_err}"
+            )
+            return result
         # B3: status: ok only when contract_snapshot_url is non-null
         result["status"] = "ok"
         result["source"] = "materialized_go"
@@ -907,6 +1078,8 @@ def main() -> int:
         return 20
     elif status == "stale_or_conflicting_snapshot":
         return 50
+    elif status == "controlled_publisher_binding_failed":
+        return 60
     else:  # runtime_error or unknown
         return 40
 

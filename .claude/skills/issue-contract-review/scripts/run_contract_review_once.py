@@ -215,13 +215,17 @@ def check_existing_go_comment(
         return None, err
 
     results = parse_contract_review_results(comments, expected_issue_url=issue_url)
-    latest = find_latest_result(results)
+    # #1475 (fix_delta P1 item 1): trust filtering must be applied BEFORE
+    # go/blocked precedence is decided. An untrusted comment posted after a
+    # trusted go must never pre-empt that go, regardless of its status.
+    latest = find_latest_result(results, trusted_only=True)
 
-    # If the latest result is blocked, do not return an existing go
+    # If the latest (trusted) result is blocked, do not return an existing go
     if latest and latest["status"] == "blocked":
         return None, None
 
-    go = find_latest_go(results)
+    # #1475: only a trusted-author go snapshot is authoritative for dedupe.
+    go = find_latest_go(results, trusted_only=True)
     if go is None:
         return None, None
 

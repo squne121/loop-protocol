@@ -25,6 +25,11 @@ _SCHEMA_VERSION = 1
 _DEFAULT_ARTIFACT_DIR = _REPO_ROOT / "artifacts" / "impl-review-loop"
 _TRIAGE_SCHEMA = "CONTRACT_BLOCKER_TRIAGE_V1"
 _TRIAGE_PATH = _SCRIPT_DIR / "triage_contract_blockers.py"
+# #1475: shared GitHub provenance trust policy (single source of truth).
+_CRP_PATH = (
+    _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts"
+    / "contract_review_result_parser.py"
+)
 _FENCED_YAML_RE = re.compile(r"```ya?ml[ \t]*\n(.*?)```", re.DOTALL)
 _CONTRACT_REVIEW_MARKER = "CONTRACT_REVIEW_RESULT_V1"
 
@@ -160,6 +165,24 @@ def _extract_yaml_blocks(body: str) -> list[str]:
     return [match.group(1) for match in _FENCED_YAML_RE.finditer(body)]
 
 
+def _is_trusted_snapshot_author(
+    author: Any,
+    author_association: Any,
+    author_id: Any = None,
+    author_type: Any = None,
+) -> bool:
+    """#1475: delegate to the shared trust policy (single source of truth)."""
+    module = _load_module(_CRP_PATH, "contract_review_result_parser_for_intake_capsule")
+    return bool(
+        module.is_trusted_snapshot_author(
+            author,
+            author_association,
+            author_id=author_id,
+            author_type=author_type,
+        )
+    )
+
+
 def _is_valid_contract_review_result(block: dict[str, Any], expected_issue_url: str) -> bool:
     inner = block.get(_CONTRACT_REVIEW_MARKER)
     if not isinstance(inner, dict):
@@ -232,7 +255,9 @@ def _collect_issue_comments(
         "--paginate",
         f"repos/{repo}/issues/{issue_number}/comments?per_page=100",
         "--jq",
-        ".[] | {id, html_url, created_at, updated_at, body}",
+        ".[] | {id, html_url, created_at, updated_at, body, "
+        "author: .user.login, author_id: .user.id, "
+        "author_type: .user.type, author_association}",
     ]
     rc, stdout, stderr = _run_command(argv)
     _record_command(command_log, "issue_comments", argv, rc, stdout, stderr)
@@ -280,6 +305,10 @@ def _parse_contract_results(
             parsed = _parse_simple_yaml_block(raw_block)
             if _is_valid_contract_review_result(parsed, expected_issue_url):
                 inner = parsed[_CONTRACT_REVIEW_MARKER]
+                author = comment.get("author")
+                author_association = comment.get("author_association")
+                author_id = comment.get("author_id")
+                author_type = comment.get("author_type")
                 valid_blocks.append(
                     {
                         "comment_id": comment.get("id"),
@@ -288,6 +317,16 @@ def _parse_contract_results(
                         "updated_at": comment.get("updated_at", ""),
                         "status": inner.get("status"),
                         "inner": inner,
+                        "author": author,
+                        "author_association": author_association,
+                        "author_id": author_id,
+                        "author_type": author_type,
+                        "is_trusted_author": _is_trusted_snapshot_author(
+                            author,
+                            author_association,
+                            author_id=author_id,
+                            author_type=author_type,
+                        ),
                     }
                 )
             else:
@@ -305,18 +344,38 @@ def _parse_contract_results(
     }
 
 
-def _find_latest_result(results: list[dict[str, Any]]) -> dict[str, Any] | None:
-    if not results:
+def _find_latest_result(
+    results: list[dict[str, Any]],
+    *,
+    trusted_only: bool = False,
+) -> dict[str, Any] | None:
+    """#1475 fix_delta P1 item 1: trusted_only=True filters to authoritative
+    (trusted-author) candidates BEFORE selecting the latest entry, so an
+    untrusted comment can never pre-empt a trusted go/blocked snapshot.
+    Every caller that decides go/blocked precedence must pass
+    trusted_only=True.
+    """
+    candidates = (
+        [item for item in results if item.get("is_trusted_author") is True]
+        if trusted_only
+        else results
+    )
+    if not candidates:
         return None
     return sorted(
-        results,
+        candidates,
         key=lambda item: (str(item.get("created_at") or ""), int(item.get("comment_id") or 0)),
         reverse=True,
     )[0]
 
 
 def _find_latest_go(results: list[dict[str, Any]]) -> dict[str, Any] | None:
-    go_results = [item for item in results if item.get("status") == "go"]
+    # #1475: only a trusted-author go result is authoritative.
+    go_results = [
+        item
+        for item in results
+        if item.get("status") == "go" and item.get("is_trusted_author")
+    ]
     return _find_latest_result(go_results)
 
 
@@ -378,9 +437,30 @@ def _normalize_contract_snapshot_live(
     parsed_results, parser_counts = _parse_contract_results(comments, issue_url)
     parse_warning_counts.update(parser_counts)
 
-    latest = _find_latest_result(parsed_results)
+    # #1475 fix_delta P1 item 1: trust filtering before precedence -- an
+    # untrusted comment must never pre-empt a trusted go via the
+    # "latest blocked wins" branch below.
+    latest = _find_latest_result(parsed_results, trusted_only=True)
     latest_go = _find_latest_go(parsed_results)
     evidence_complete = not any(parse_warning_counts.values())
+
+    # #1475 fix_delta P2 item 4: incomplete comment evidence (malformed
+    # NDJSON lines, ambiguous duplicate contract blocks, invalid contract
+    # blocks) must never be silently treated as "no conflicting evidence" --
+    # a "go" adoption based on a partial comment fetch is fail-open. When
+    # evidence is incomplete, do not report normalized_status: "go" even if
+    # a trusted go candidate was found in the partial data; route to
+    # missing_go so the caller re-fetches / escalates instead of proceeding.
+    if not evidence_complete and latest_go and not (latest and latest.get("status") == "blocked"):
+        return {
+            "normalized_status": "missing_go",
+            "upstream_schema": _CONTRACT_REVIEW_MARKER,
+            "upstream_status": "go",
+            "source": "incomplete_evidence",
+            "contract_snapshot_url": latest_go.get("html_url"),
+            "top_blocked_categories": [],
+            "contract_blocker_triage": {"schema": _TRIAGE_SCHEMA, "status": "not_run"},
+        }, evidence_complete
 
     if latest and latest.get("status") == "blocked":
         return {

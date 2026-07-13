@@ -64,6 +64,24 @@ POST_RESULT_AMBIGUOUS = POST_STATUS_AMBIGUOUS
 POST_RESULT_NOT_REQUESTED = POST_STATUS_NOT_REQUESTED
 
 # ---------------------------------------------------------------------------
+# #1475: default the controlled-publisher comment id binding check to success
+# for all tests in this file. AC5 regression scenarios in this file predate
+# the binding check and do not exercise real `gh api` subprocess calls; tests
+# that specifically exercise the binding check live in
+# test_contract_snapshot_author_binding.py and override this fixture locally.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _default_trusted_comment_id_binding(monkeypatch):
+    monkeypatch.setattr(
+        _ecs_mod,
+        "verify_controlled_publisher_comment_id_binding",
+        lambda *args, **kwargs: (True, None),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Helpers for mocking
 # ---------------------------------------------------------------------------
 
