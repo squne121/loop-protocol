@@ -33,6 +33,7 @@ from ci_verdict_summary import (
     compute_overall_status,
     determine_check_verdict,
     extract_run_id_from_link,
+    fetch_checks,
     find_failed_job_id,
     main,
     next_action_for,
@@ -46,6 +47,34 @@ HEAD_SHA = "abc1234567890abcdef1234567890abcdef123456"
 STALE_SHA = "deadbeef1234567890abcdef1234567890abcdef"
 EXPECTED_SHA = HEAD_SHA
 
+# GitHub GraphQL statusCheckRollup の実 API 応答形を縮小保存した golden fixture。
+STATUS_CHECK_ROLLUP_GOLDEN = {
+    "data": {"repository": {"pullRequest": {"commits": {"nodes": [{"commit": {
+        "oid": HEAD_SHA,
+        "statusCheckRollup": {"contexts": {"pageInfo": {"hasNextPage": False}, "nodes": [
+            {
+                "__typename": "CheckRun", "databaseId": 86953783527,
+                "name": "PR Body Japanese Check", "status": "COMPLETED",
+                "conclusion": "SUCCESS", "startedAt": "2026-07-13T22:44:01Z",
+                "completedAt": "2026-07-13T22:44:08Z",
+                "detailsUrl": "https://github.com/squne121/loop-protocol/actions/runs/29290822289/job/86953783527",
+                "checkSuite": {"commit": {"oid": HEAD_SHA}, "workflowRun": {
+                    "event": "pull_request", "workflow": {"name": "Check Japanese Content"},
+                }},
+            },
+            {
+                "__typename": "CheckRun", "databaseId": 86955636256,
+                "name": "PR Body Japanese Check", "status": "COMPLETED",
+                "conclusion": "SKIPPED", "startedAt": "2026-07-13T22:55:08Z",
+                "completedAt": "2026-07-13T22:55:08Z",
+                "detailsUrl": "https://github.com/squne121/loop-protocol/actions/runs/29291421456/job/86955636256",
+                "checkSuite": {"commit": {"oid": HEAD_SHA}, "workflowRun": {
+                    "event": "pull_request_review", "workflow": {"name": "Check Japanese Content"},
+                }},
+            },
+        ]}},
+    }}]}}}}}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -53,6 +82,59 @@ EXPECTED_SHA = HEAD_SHA
 
 def load_fixture(name: str) -> Any:
     return json.loads((FIXTURE_DIR / name).read_text())
+
+
+def status_check_rollup_response(
+    checks: list[dict],
+    *,
+    head_sha: str,
+    runs: Optional[dict[int, dict]] = None,
+    default_run: Optional[dict] = None,
+) -> dict:
+    """GraphQL statusCheckRollup の実 API 形を返す test fixture adapter。"""
+    nodes = []
+    for index, check in enumerate(checks, start=1):
+        direct_run_id = check.get("runId") or extract_run_id_from_link(check.get("link") or "")
+        run_id = int(direct_run_id or index)
+        run = (runs or {}).get(run_id, default_run or {}) if direct_run_id else {}
+        conclusion = run.get("conclusion") or (check.get("state") or "").lower()
+        status = run.get("status") or ("completed" if check.get("bucket") != "pending" else "in_progress")
+        run_head = run.get("headSha", head_sha)
+        nodes.append({
+            "__typename": "CheckRun",
+            "databaseId": run_id,
+            "name": check.get("name"),
+            "status": status.upper(),
+            "conclusion": conclusion.upper(),
+            "startedAt": check.get("startedAt"),
+            "completedAt": check.get("completedAt"),
+            "detailsUrl": check.get("link"),
+            "checkSuite": {
+                "commit": {"oid": run_head},
+                "workflowRun": {
+                    "event": check.get("event"),
+                    "workflow": {"name": check.get("workflow")},
+                },
+            },
+        })
+    return {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "commits": {
+                        "nodes": [{
+                            "commit": {
+                                "oid": head_sha,
+                                "statusCheckRollup": {
+                                    "contexts": {"pageInfo": {"hasNextPage": False}, "nodes": nodes},
+                                },
+                            },
+                        }],
+                    },
+                },
+            },
+        },
+    }
 
 
 def make_mock_run_gh(
@@ -64,7 +146,7 @@ def make_mock_run_gh(
 ):
     """
     run_gh をモックする。
-    呼び出し順: pr view → pr checks → (run view)*
+    呼び出し順: pr view → GraphQL statusCheckRollup
     """
     call_count = 0
     checks_list = checks if checks is not None else []
@@ -75,10 +157,13 @@ def make_mock_run_gh(
 
         if "pr" in args and "view" in args and "headRefOid" in args:
             return True, {"headRefOid": head_sha}, json.dumps({"headRefOid": head_sha})
-        if "pr" in args and "checks" in args:
+        if "api" in args and "graphql" in args:
             if not checks_ok:
                 return False, None, checks_err_msg
-            return True, checks_list, json.dumps(checks_list)
+            payload = status_check_rollup_response(
+                checks_list, head_sha=head_sha, default_run=run_data,
+            )
+            return True, payload, json.dumps(payload)
         if "run" in args and "view" in args and "--log" not in args:
             if run_data is not None:
                 return True, run_data, json.dumps(run_data)
@@ -95,11 +180,9 @@ def run_summary_with_details(checks: list[dict], runs: dict[int, dict], check_na
     def _run_gh(args: list[str]):
         if "pr" in args and "view" in args and "headRefOid" in args:
             return True, {"headRefOid": HEAD_SHA}, "{}"
-        if "pr" in args and "checks" in args:
-            return True, checks, json.dumps(checks)
-        if "run" in args and "view" in args and "--log" not in args:
-            run_id = int(next(arg for arg in args if arg.isdigit()))
-            return True, runs[run_id], json.dumps(runs[run_id])
+        if "api" in args and "graphql" in args:
+            payload = status_check_rollup_response(checks, head_sha=HEAD_SHA, runs=runs)
+            return True, payload, json.dumps(payload)
         return False, None, "unexpected gh call"
 
     argv = [
@@ -478,8 +561,8 @@ class TestLogExcerpt:
                 "workflow": "CI",
                 "link": "https://github.com/owner/repo/actions/runs/9999",
                 "event": "push",
-                "startedAt": None,
-                "completedAt": None,
+                "startedAt": "2026-07-14T00:00:00Z",
+                "completedAt": "2026-07-14T00:00:01Z",
             }
         ]
         run_data = {
@@ -569,8 +652,8 @@ class TestLogExcerpt:
                 "workflow": "CI",
                 "link": "https://github.com/owner/repo/actions/runs/9999",
                 "event": "push",
-                "startedAt": None,
-                "completedAt": None,
+                "startedAt": "2026-07-14T00:00:00Z",
+                "completedAt": "2026-07-14T00:00:01Z",
             }
         ]
         run_data = {
@@ -585,10 +668,11 @@ class TestLogExcerpt:
         def mock_fn_log_fail(args: list[str]):
             if "pr" in args and "view" in args and "headRefOid" in args:
                 return True, {"headRefOid": HEAD_SHA}, json.dumps({"headRefOid": HEAD_SHA})
-            if "pr" in args and "checks" in args:
-                return True, checks_data, json.dumps(checks_data)
-            if "run" in args and "view" in args and "--log" not in args:
-                return True, run_data, json.dumps(run_data)
+            if "api" in args and "graphql" in args:
+                payload = status_check_rollup_response(
+                    checks_data, head_sha=HEAD_SHA, default_run=run_data,
+                )
+                return True, payload, json.dumps(payload)
             if "run" in args and "view" in args and "--log" in args:
                 return False, None, "403 permission denied"
             return False, None, "unexpected"
@@ -755,7 +839,7 @@ class TestGhError:
         def mock_fn(args):
             if "pr" in args and "view" in args and "headRefOid" in args:
                 return True, {"headRefOid": HEAD_SHA}, json.dumps({"headRefOid": HEAD_SHA})
-            if "pr" in args and "checks" in args:
+            if "api" in args and "graphql" in args:
                 return False, None, "Error: authentication required (401)"
             return False, None, "unexpected"
 
@@ -820,7 +904,7 @@ class TestGhError:
         def mock_fn(args):
             if "pr" in args and "view" in args and "headRefOid" in args:
                 return True, {"headRefOid": HEAD_SHA}, json.dumps({"headRefOid": HEAD_SHA})
-            if "pr" in args and "checks" in args:
+            if "api" in args and "graphql" in args:
                 return False, None, "permission denied (403)"
             return False, None, "unexpected"
 
@@ -861,8 +945,8 @@ class TestPassCheckHeadShaVerification:
                 "workflow": "CI",
                 "link": "https://github.com/owner/repo/actions/runs/1001",
                 "event": "push",
-                "startedAt": None,
-                "completedAt": None,
+                "startedAt": "2026-07-14T00:00:00Z",
+                "completedAt": "2026-07-14T00:00:01Z",
             }
         ]
         run_data = {
@@ -901,8 +985,8 @@ class TestPassCheckHeadShaVerification:
                 "workflow": "CI",
                 "link": "https://github.com/owner/repo/actions/runs/1001",
                 "event": "push",
-                "startedAt": None,
-                "completedAt": None,
+                "startedAt": "2026-07-14T00:00:00Z",
+                "completedAt": "2026-07-14T00:00:01Z",
             }
         ]
         run_data = {
@@ -1033,7 +1117,7 @@ class TestClassifyGhError:
     def test_fetch_checks_uses_classify_gh_error(self):
         """B6: fetch_checks が共通分類を使うことを確認"""
         def mock_fn(args):
-            if "pr" in args and "checks" in args:
+            if "api" in args and "graphql" in args:
                 return False, None, "403 permission denied"
             return False, None, "unexpected"
 
@@ -1300,8 +1384,8 @@ class TestHeadShaNullSkippedExclude:
                 "workflow": "CI",
                 "link": "https://github.com/owner/repo/actions/runs/1001",
                 "event": "push",
-                "startedAt": None,
-                "completedAt": None,
+                "startedAt": "2026-07-14T00:00:00Z",
+                "completedAt": "2026-07-14T00:00:01Z",
             },
         ]
         run_data = {
@@ -1336,6 +1420,17 @@ class TestHeadShaNullSkippedExclude:
 
 class TestReviewShadowAndRerunCanonicalization:
     """GIVEN provenance-complete checks WHEN summarized THEN only proven shadows exclude."""
+
+    def test_status_check_rollup_golden_fixture_has_direct_run_identity(self):
+        """GIVEN actual GraphQL form WHEN fetched THEN it retains ID/event/head/timestamps."""
+        with patch("ci_verdict_summary.run_gh", return_value=(True, STATUS_CHECK_ROLLUP_GOLDEN, "{}")):
+            checks, error = fetch_checks(1505, "squne121/loop-protocol")
+        assert error is None
+        assert checks is not None
+        assert checks[0]["runId"] == 86953783527
+        assert checks[0]["event"] == "pull_request"
+        assert checks[0]["headSha"] == HEAD_SHA
+        assert checks[0]["completedAt"] == "2026-07-13T22:44:08Z"
 
     def _peer_and_shadow(self, event: str = "pull_request_review") -> tuple[list[dict], dict[int, dict]]:
         checks = [
@@ -1373,6 +1468,7 @@ class TestReviewShadowAndRerunCanonicalization:
         checks, runs = self._peer_and_shadow()
         checks[1]["state"] = state
         checks[1]["event"] = event
+        runs[102]["conclusion"] = state.lower()
         _, out = run_summary_with_details(checks, runs)
         assert out["status"] == "failed"
         assert out["excluded_checks"] == []
@@ -1400,6 +1496,100 @@ class TestReviewShadowAndRerunCanonicalization:
         assert out["status"] == "all_pass"
         assert len(out["checks"]) == 2
         assert out["excluded_count"] == 1
+
+    def test_current_success_and_newer_stale_failure_are_not_canonicalized_together(self):
+        checks = [
+            provenance_check(100, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:01Z"),
+            provenance_check(101, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:02Z"),
+        ]
+        _, out = run_summary_with_details(
+            checks,
+            {100: completed_run("success"), 101: completed_run("failure", STALE_SHA)},
+        )
+        assert out["status"] == "stale_head_sha"
+        assert len(out["checks"]) == 2
+
+    def test_current_failure_and_newer_stale_success_preserve_current_failure(self):
+        checks = [
+            provenance_check(100, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:01Z"),
+            provenance_check(101, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:02Z"),
+        ]
+        _, out = run_summary_with_details(
+            checks,
+            {100: completed_run("failure"), 101: completed_run("success", STALE_SHA)},
+        )
+        assert out["status"] == "stale_head_sha"
+        assert out["failed_checks"] == ["PR Body Japanese Check"]
+
+    def test_missing_head_sha_is_not_deduplicated_or_accepted_as_success(self):
+        checks = [
+            provenance_check(100, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:01Z"),
+            provenance_check(101, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:02Z"),
+        ]
+        _, out = run_summary_with_details(
+            checks,
+            {100: completed_run("failure"), 101: completed_run("success", None)},
+        )
+        assert out["status"] == "pending_or_queued"
+        assert len(out["checks"]) == 2
+
+    def test_same_head_old_failure_new_success_is_canonicalized(self):
+        checks = [
+            provenance_check(100, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:01Z"),
+            provenance_check(101, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:02Z"),
+        ]
+        exit_code, out = run_summary_with_details(
+            checks,
+            {100: completed_run("failure"), 101: completed_run("success")},
+        )
+        assert exit_code == EXIT_ALL_PASS
+        assert out["status"] == "all_pass"
+        assert len(out["checks"]) == 1
+
+    @pytest.mark.parametrize("field,value", [("workflow", "wrong workflow"), ("name", "wrong name")])
+    def test_wrong_review_shadow_tuple_is_not_excluded(self, field: str, value: str):
+        checks, runs = self._peer_and_shadow()
+        checks[1][field] = value
+        _, out = run_summary_with_details(checks, runs)
+        assert out["status"] == "failed"
+        assert out["excluded_checks"] == []
+
+    @pytest.mark.parametrize("incomplete_run", [101, 102])
+    def test_shadow_or_peer_incomplete_direct_detail_is_fail_closed(self, incomplete_run: int):
+        checks, runs = self._peer_and_shadow()
+        runs[incomplete_run]["headSha"] = None
+        _, out = run_summary_with_details(checks, runs)
+        assert out["status"] == "pending_or_queued"
+        assert out["excluded_checks"] == []
+
+    @pytest.mark.parametrize(
+        "order",
+        [(100, 101, 102), (102, 100, 101), (101, 102, 100), (102, 101, 100)],
+    )
+    def test_failure_success_shadow_three_element_order_is_stable(self, order: tuple[int, int, int]):
+        checks = {
+            100: provenance_check(100, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:01Z"),
+            101: provenance_check(101, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:02Z"),
+            102: provenance_check(102, bucket="skipping", state="SKIPPED", event="pull_request_review", completed_at="2026-07-14T00:00:03Z"),
+        }
+        _, out = run_summary_with_details(
+            [checks[run_id] for run_id in order],
+            {100: completed_run("failure"), 101: completed_run("success"), 102: completed_run("skipped")},
+        )
+        assert out["status"] == "all_pass"
+        assert out["excluded_checks"] == ["PR Body Japanese Check"]
+
+    def test_same_timestamp_different_run_ids_is_not_deduplicated(self):
+        checks = [
+            provenance_check(100, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:01Z"),
+            provenance_check(101, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:01Z"),
+        ]
+        _, out = run_summary_with_details(
+            checks,
+            {100: completed_run("failure"), 101: completed_run("success")},
+        )
+        assert out["status"] == "failed"
+        assert len(out["checks"]) == 2
 
     def test_ambiguous_rerun_timestamp_is_not_deduped_to_success(self):
         checks = [
