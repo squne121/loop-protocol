@@ -2479,6 +2479,7 @@ def classify_result(
     runner_env_delta: Optional[Dict[str, str]] = None,
     allowed_paths: Optional[List[str]] = None,
     static_policy_passed: bool = True,
+    evidence_mode: str = "baseline",
 ) -> Tuple[str, str, str, Optional[str], str]:
     """
     VC 実行結果を分類。
@@ -2497,6 +2498,12 @@ def classify_result(
             returned None (not statically blocked) for this command. Defaults
             to True for backward compatibility with existing call sites that
             only invoke classify_result() after a static_result is None.
+        evidence_mode: "baseline" (default, backward compatible) or
+            "current-head" (Issue #1488). In current-head mode, a
+            non-regression-gate VC (rg / test -f / test -s etc.) that passed
+            static policy and exited 0 is classified as a certified current
+            PASS (expected_pass / go) instead of unexpected_pass / blocked.
+            baseline evidence-mode semantics are unchanged (AC1).
 
     戻り値: (classification, category, decision, fix_hint, scope_class)
       classification: expected_fail | unexpected_pass | blocked | human_judgment | expected_pass | skipped
@@ -2504,7 +2511,8 @@ def classify_result(
                 env_missing_dep | file_not_found_unrunnable | timeout |
                 compound_command_disallowed | unsupported_shell_syntax |
                 unsafe_command | command_not_allowed | unknown | regression_gate |
-                new_file_missing_expected | existing_file_missing_node_id_noncanonical
+                new_file_missing_expected | existing_file_missing_node_id_noncanonical |
+                expected_pass_resolved_on_current_head
       decision: go | blocked | human_judgment
       fix_hint: nullable hint
       scope_class: baseline_fail_expected | regression_gate | pr_review_only | runtime_only
@@ -2612,8 +2620,20 @@ def classify_result(
     if "timeout" in stderr.lower():
         return "blocked", "timeout", "blocked", "Command exceeded timeout", "baseline_fail_expected"
 
-    # exit_code = 0 で回帰ゲート以外 → unexpected_pass / blocked
+    # exit_code = 0 で回帰ゲート以外
+    # Issue #1488: current-head evidence-mode では、静的 policy を通過して
+    # 実行された非 regression-gate VC（rg / test -f / test -s 等）の exit 0 は
+    # certified current PASS（expected_pass / go）として扱う。baseline
+    # evidence-mode の意味論（unexpected_pass / blocked）は変更しない（AC1）。
     if exit_code == 0:
+        if evidence_mode == "current-head" and static_policy_passed:
+            return (
+                "expected_pass",
+                "expected_pass_resolved_on_current_head",
+                "go",
+                None,
+                "baseline_fail_expected",
+            )
         return "unexpected_pass", "unexpected_pass", "blocked", "Command unexpectedly passed", "baseline_fail_expected"
 
     # shlex.split failed
@@ -3495,6 +3515,7 @@ def main() -> int:
                         runner_env_delta=runner_env_delta,
                         allowed_paths=allowed_paths_from_body,
                         static_policy_passed=True,
+                        evidence_mode=args.evidence_mode,
                     )
 
                     # Issue #889: Apply baseline-expect annotation post-execution re-mapping
