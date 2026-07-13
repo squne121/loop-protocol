@@ -58,6 +58,7 @@ from skill_runtime_command_policy import (  # noqa: E402
     command_allows_root_no_worktree,
     current_branch,
     looks_like_skill_runtime_executor_command,
+    parse_exact_skill_runtime_anchor_command,
     parse_exact_skill_runtime_command,
     resolve_active_issue,
     resolve_default_branch,
@@ -1985,6 +1986,8 @@ def _decide_bash(
 
     if _is_skill_runtime_executor_command(command, cwd, _pr):
         _allow()
+    if _is_skill_runtime_anchor_executor_command(command, cwd, _pr):
+        _allow()
     if looks_like_skill_runtime_executor_command(command):
         _block(_rel(resolution.expected, project_root=_pr) if resolution.expected else "<skill-runtime-denied>", cwd)
 
@@ -2330,6 +2333,29 @@ def _is_skill_runtime_executor_command(
 ) -> bool:
     """True iff command is the exact privileged skill runtime executor class."""
     parsed = parse_exact_skill_runtime_command(command, project_root)
+    if parsed is None:
+        return False
+    if os.path.realpath(cwd) != os.path.realpath(project_root):
+        return False
+    default_branch = resolve_default_branch(project_root, None)
+    if current_branch(project_root, None) != default_branch:
+        return False
+    if resolve_repo_slug(project_root, None) != parsed.repo:
+        return False
+    if command_allows_root_no_worktree(parsed):
+        return True
+    active_issue, entry = resolve_active_issue(project_root, cwd, deadline)
+    if active_issue != parsed.issue_number or entry is None:
+        return False
+    return True
+
+
+def _is_skill_runtime_anchor_executor_command(
+    command: str, cwd: str, project_root: str, deadline: "object | None" = None
+) -> bool:
+    """True iff command is the exact `preflight.run.with_anchor` privileged
+    skill runtime executor class (Issue #1498)."""
+    parsed = parse_exact_skill_runtime_anchor_command(command, project_root)
     if parsed is None:
         return False
     if os.path.realpath(cwd) != os.path.realpath(project_root):
@@ -2745,6 +2771,8 @@ def build_decision(payload: dict) -> dict:
 
     if _is_skill_runtime_executor_command(command, cwd, project_root):
         return _v2("skill_runtime_executor", cwd_class, "allow", "skill_runtime_executor_allowed")
+    if _is_skill_runtime_anchor_executor_command(command, cwd, project_root):
+        return _v2("skill_runtime_executor", cwd_class, "allow", "skill_runtime_executor_anchor_allowed")
     if looks_like_skill_runtime_executor_command(command):
         return _v2("skill_runtime_executor", cwd_class, "deny", "skill_runtime_executor_denied")
 
