@@ -1045,6 +1045,67 @@ def _readback_incomplete_candidate(number: int) -> dict:
     }
 
 
+def _waiver_live_body() -> str:
+    return """## Machine-Readable Contract
+
+```yaml
+overlap_readback_waiver:
+  issue_numbers: [519, 520, 1429]
+  reason: human_approved_readback_ignore
+  expires_on: \"2026-07-13\"
+  approved_by: user_session
+```
+"""
+
+
+def _snapshot_comment(
+    body_sha256: str,
+    *,
+    status: str = "go",
+    comment_id: int = 1,
+    created_at: str = "2026-07-13T00:00:00Z",
+    trusted: bool = True,
+) -> dict:
+    author_id = 63350259 if trusted else 999999
+    author = "squne121" if trusted else "outside"
+    return {
+        "id": comment_id,
+        "html_url": f"https://github.com/squne121/loop-protocol/issues/1477#issuecomment-{comment_id}",
+        "created_at": created_at,
+        "updated_at": created_at,
+        "author": author,
+        "author_id": author_id,
+        "author_type": "User",
+        "author_association": "OWNER",
+        "body": f"""```yaml
+CONTRACT_REVIEW_RESULT_V1:
+  status: {status}
+  generated_at: \"{created_at}\"
+  generated_by: issue-contract-review
+  issue_url: https://github.com/squne121/loop-protocol/issues/1477
+  body_sha256: \"{body_sha256}\"
+```
+""",
+    }
+
+
+def _patch_live_waiver_readback(monkeypatch, body: str, comments: list[dict], error: str | None = None) -> None:
+    payload = {
+        "body": body,
+        "url": "https://github.com/squne121/loop-protocol/issues/1477",
+    }
+    monkeypatch.setattr(
+        open_pr,
+        "run_gh",
+        lambda *args, **kwargs: FakeCompletedProcess(0, json.dumps(payload), ""),
+    )
+    monkeypatch.setattr(
+        open_pr.contract_review_parser,
+        "fetch_issue_comments",
+        lambda issue, repo: (comments, error),
+    )
+
+
 def test_overlap_readback_waiver_allows_only_the_fixed_incomplete_candidates(monkeypatch):
     """GIVEN verified fixed waiver WHEN only its three targets are incomplete
     THEN the effective safety predicate can proceed."""
@@ -1161,35 +1222,9 @@ def test_overlap_readback_waiver_rejects_another_complete_candidate_blocker(monk
 
 def test_overlap_readback_waiver_requires_live_body_snapshot_integrity(monkeypatch):
     """live body SHA と一致する go snapshot がない waiver は fail-closed。"""
-    body = """## Machine-Readable Contract
-
-```yaml
-overlap_readback_waiver:
-  issue_numbers: [519, 520, 1429]
-  reason: human_approved_readback_ignore
-  expires_on: \"2026-07-13\"
-  approved_by: user_session
-```
-"""
+    body = _waiver_live_body()
     sha = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
-    snapshot = f"""```yaml
-CONTRACT_REVIEW_RESULT_V1:
-  status: go
-  generated_by: issue-contract-review
-  issue_url: https://github.com/squne121/loop-protocol/issues/1477
-  body_sha256: \"{sha}\"
-```
-"""
-    payload = {
-        "body": body,
-        "url": "https://github.com/squne121/loop-protocol/issues/1477",
-        "comments": [{"body": snapshot}],
-    }
-    monkeypatch.setattr(
-        open_pr,
-        "run_gh",
-        lambda *args, **kwargs: FakeCompletedProcess(0, json.dumps(payload), ""),
-    )
+    _patch_live_waiver_readback(monkeypatch, body, [_snapshot_comment(sha)])
 
     waiver, error = open_pr._load_verified_overlap_readback_waiver(
         "squne121/loop-protocol", 1477
@@ -1197,11 +1232,8 @@ CONTRACT_REVIEW_RESULT_V1:
     assert error is None
     assert waiver == _fixed_overlap_readback_waiver()
 
-    payload["comments"][0]["body"] = payload["comments"][0]["body"].replace(sha, "sha256:" + "0" * 64)
-    monkeypatch.setattr(
-        open_pr,
-        "run_gh",
-        lambda *args, **kwargs: FakeCompletedProcess(0, json.dumps(payload), ""),
+    _patch_live_waiver_readback(
+        monkeypatch, body, [_snapshot_comment("sha256:" + "0" * 64)]
     )
     waiver, error = open_pr._load_verified_overlap_readback_waiver(
         "squne121/loop-protocol", 1477
@@ -1211,36 +1243,111 @@ CONTRACT_REVIEW_RESULT_V1:
 
 
 def test_overlap_readback_waiver_rejects_expired_or_changed_contract(monkeypatch):
-    body = """```yaml
-overlap_readback_waiver:
-  issue_numbers: [519, 520, 1429]
-  reason: human_approved_readback_ignore
-  expires_on: \"2026-07-13\"
-  approved_by: user_session
-```
-"""
+    body = _waiver_live_body()
     sha = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
-    snapshot = f"""```yaml
-CONTRACT_REVIEW_RESULT_V1:
-  status: go
-  generated_by: issue-contract-review
-  issue_url: https://github.com/squne121/loop-protocol/issues/1477
-  body_sha256: \"{sha}\"
-```
-"""
-    payload = {
-        "body": body,
-        "url": "https://github.com/squne121/loop-protocol/issues/1477",
-        "comments": [{"body": snapshot}],
-    }
-    monkeypatch.setattr(
-        open_pr,
-        "run_gh",
-        lambda *args, **kwargs: FakeCompletedProcess(0, json.dumps(payload), ""),
-    )
+    _patch_live_waiver_readback(monkeypatch, body, [_snapshot_comment(sha)])
 
     waiver, error = open_pr._load_verified_overlap_readback_waiver(
         "squne121/loop-protocol", 1477, today=open_pr.date(2026, 7, 14)
     )
     assert waiver is None
     assert "期限" in error
+
+
+@pytest.mark.parametrize(
+    ("comments", "expected_valid"),
+    [
+        (
+            [
+                _snapshot_comment("BODY", status="go", comment_id=10),
+                _snapshot_comment("BODY", status="blocked", comment_id=11),
+            ],
+            False,
+        ),
+        (
+            [
+                _snapshot_comment("BODY", status="go", comment_id=20, trusted=False),
+                _snapshot_comment("BODY", status="blocked", comment_id=21),
+            ],
+            False,
+        ),
+        (
+            [
+                _snapshot_comment("BODY", status="blocked", comment_id=30),
+                _snapshot_comment("BODY", status="go", comment_id=31),
+            ],
+            True,
+        ),
+    ],
+)
+def test_overlap_readback_waiver_uses_latest_trusted_snapshot_precedence(
+    monkeypatch, comments, expected_valid
+):
+    body = _waiver_live_body()
+    sha = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+    for comment in comments:
+        comment["body"] = comment["body"].replace("BODY", sha)
+    _patch_live_waiver_readback(monkeypatch, body, comments)
+
+    waiver, error = open_pr._load_verified_overlap_readback_waiver(
+        "squne121/loop-protocol", 1477
+    )
+
+    assert (waiver is not None) is expected_valid
+    assert (error is None) is expected_valid
+
+
+def test_overlap_readback_waiver_uses_comment_id_to_break_same_timestamp_tie(monkeypatch):
+    body = _waiver_live_body()
+    sha = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+    same_time = "2026-07-13T00:00:00Z"
+    comments = [
+        _snapshot_comment(sha, status="blocked", comment_id=50, created_at=same_time),
+        _snapshot_comment(sha, status="go", comment_id=51, created_at=same_time),
+    ]
+    _patch_live_waiver_readback(monkeypatch, body, comments)
+
+    waiver, error = open_pr._load_verified_overlap_readback_waiver(
+        "squne121/loop-protocol", 1477
+    )
+
+    assert error is None
+    assert waiver == _fixed_overlap_readback_waiver()
+
+
+def test_overlap_readback_waiver_requires_complete_paginated_comment_readback(monkeypatch):
+    body = _waiver_live_body()
+    sha = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+    comments = [{"id": index, "body": "unrelated"} for index in range(1, 101)]
+    comments.append(_snapshot_comment(sha, comment_id=101))
+    _patch_live_waiver_readback(monkeypatch, body, comments)
+
+    waiver, error = open_pr._load_verified_overlap_readback_waiver(
+        "squne121/loop-protocol", 1477
+    )
+
+    assert error is None
+    assert waiver == _fixed_overlap_readback_waiver()
+
+    _patch_live_waiver_readback(monkeypatch, body, [], error="comments_fetch_incomplete")
+    waiver, error = open_pr._load_verified_overlap_readback_waiver(
+        "squne121/loop-protocol", 1477
+    )
+    assert waiver is None
+    assert "不完全" in error
+
+
+def test_overlap_readback_waiver_is_bound_to_1477_in_the_canonical_repository(monkeypatch):
+    monkeypatch.setattr(open_pr, "run_gh", lambda *args, **kwargs: pytest.fail("must not read"))
+
+    waiver, error = open_pr._load_verified_overlap_readback_waiver(
+        "other/repository", 1477
+    )
+    assert waiver is None
+    assert "固定 binding" in error
+
+    waiver, error = open_pr._load_verified_overlap_readback_waiver(
+        "squne121/loop-protocol", 9999
+    )
+    assert waiver is None
+    assert "固定 binding" in error

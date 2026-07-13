@@ -24,6 +24,14 @@ from datetime import date
 
 import yaml
 
+_ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR = (
+    Path(__file__).resolve().parent.parent.parent / "issue-contract-review" / "scripts"
+)
+if str(_ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR))
+
+import contract_review_result_parser as contract_review_parser
+
 E_APPROVAL_MISSING = "E_APPROVAL_MISSING"
 E_PR_BODY_VALIDATION_FAILED = "E_PR_BODY_VALIDATION_FAILED"
 E_LINKED_ISSUE_STATE_UNKNOWN = "E_LINKED_ISSUE_STATE_UNKNOWN"
@@ -49,6 +57,8 @@ OVERLAP_PREFLIGHT_SAFE_ROUTES = frozenset({"proceed", "proceed_with_collision_ev
 OVERLAP_READBACK_WAIVER_ISSUE_NUMBERS = frozenset({519, 520, 1429})
 OVERLAP_READBACK_WAIVER_REASON = "human_approved_readback_ignore"
 OVERLAP_READBACK_WAIVER_APPROVED_BY = "user_session"
+OVERLAP_READBACK_WAIVER_REPOSITORY = "squne121/loop-protocol"
+OVERLAP_READBACK_WAIVER_LINKED_ISSUE = 1477
 
 # linked issue がこのラベルを持つ場合、`overlap_preflight` が未指定または
 # `required: false` でも gate を省略しない（AC2, bypass-via-omission 対策）。
@@ -584,20 +594,23 @@ def _positive_overlap_source_limit(evidence: dict) -> int | None:
     return limit
 
 
-def _extract_fenced_yaml(text: str, required_marker: str) -> list[dict]:
-    """required_marker を含む fenced YAML object だけを返す。"""
+def _extract_waiver_from_live_contract(text: str) -> dict | None:
+    """live Issue body の waiver 設定だけを読む。
+
+    CONTRACT_REVIEW_RESULT_V1 の comment 走査は共有 parser の責務であり、ここで
+    独自に解釈しない。"""
     blocks = re.findall(r"```yaml\s*\n(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
-    parsed: list[dict] = []
     for block in blocks:
-        if required_marker not in block:
+        if "overlap_readback_waiver" not in block:
             continue
         try:
             payload = yaml.safe_load(block)
         except yaml.YAMLError:
             continue
-        if isinstance(payload, dict):
-            parsed.append(payload)
-    return parsed
+        waiver = payload.get("overlap_readback_waiver") if isinstance(payload, dict) else None
+        if isinstance(waiver, dict):
+            return waiver
+    return None
 
 
 def _load_verified_overlap_readback_waiver(
@@ -606,11 +619,17 @@ def _load_verified_overlap_readback_waiver(
     *,
     today: date | None = None,
 ) -> tuple[dict | None, str | None]:
-    """live body と ``status: go`` snapshot が同一 SHA の waiver だけを返す。
+    """live body と最新の trusted ``status: go`` snapshot が同一 SHA の waiver を返す。
 
     Issue 本文だけ、または古い contract snapshot だけでは waiver を有効化しない。
     戻り値の error detail は gate 側で fail-closed の監査情報に使う。
     """
+    if (
+        repo.strip().lower() != OVERLAP_READBACK_WAIVER_REPOSITORY
+        or linked_issue != OVERLAP_READBACK_WAIVER_LINKED_ISSUE
+    ):
+        return None, "overlap_readback_waiver の対象 repository / linked issue が固定 binding と一致しません"
+
     try:
         result = run_gh(
             "issue",
@@ -619,7 +638,7 @@ def _load_verified_overlap_readback_waiver(
             "--repo",
             repo,
             "--json",
-            "body,comments,url",
+            "body,url",
         )
         issue = json.loads(result.stdout)
     except (subprocess.SubprocessError, json.JSONDecodeError) as exc:
@@ -627,18 +646,16 @@ def _load_verified_overlap_readback_waiver(
     if not isinstance(issue, dict):
         return None, "contract snapshot の Issue payload が object ではありません"
     body = issue.get("body")
-    comments = issue.get("comments")
     url = issue.get("url")
-    if not isinstance(body, str) or not isinstance(comments, list) or not isinstance(url, str):
-        return None, "contract snapshot の Issue payload に body/comments/url がありません"
+    expected_url = (
+        f"https://github.com/{OVERLAP_READBACK_WAIVER_REPOSITORY}/issues/"
+        f"{OVERLAP_READBACK_WAIVER_LINKED_ISSUE}"
+    )
+    if not isinstance(body, str) or url != expected_url:
+        return None, "contract snapshot の Issue payload が固定 waiver target と一致しません"
 
     body_sha256 = f"sha256:{hashlib.sha256(body.encode('utf-8')).hexdigest()}"
-    contract_blocks = _extract_fenced_yaml(body, "overlap_readback_waiver")
-    waiver = next(
-        (block.get("overlap_readback_waiver") for block in contract_blocks
-         if isinstance(block.get("overlap_readback_waiver"), dict)),
-        None,
-    )
+    waiver = _extract_waiver_from_live_contract(body)
     if not isinstance(waiver, dict):
         return None, "live contract に overlap_readback_waiver がありません"
 
@@ -653,21 +670,23 @@ def _load_verified_overlap_readback_waiver(
     if (today or date.today()) > date.fromisoformat(expected_waiver["expires_on"]):
         return None, "overlap_readback_waiver の期限が切れています"
 
-    for comment in comments:
-        if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
-            continue
-        for snapshot in _extract_fenced_yaml(comment["body"], "CONTRACT_REVIEW_RESULT_V1"):
-            result_payload = snapshot.get("CONTRACT_REVIEW_RESULT_V1")
-            if not isinstance(result_payload, dict):
-                continue
-            if (
-                result_payload.get("status") == "go"
-                and result_payload.get("generated_by") == "issue-contract-review"
-                and result_payload.get("issue_url") == url
-                and result_payload.get("body_sha256") == body_sha256
-            ):
-                return waiver, None
-    return None, "live body SHA と一致する status: go contract snapshot がありません"
+    comments, comments_error = contract_review_parser.fetch_issue_comments(linked_issue, repo)
+    if comments_error is not None:
+        return None, f"contract snapshot comment readback が不完全です: {comments_error}"
+    latest = contract_review_parser.find_latest_result(
+        contract_review_parser.parse_contract_review_results(
+            comments, expected_issue_url=expected_url
+        ),
+        trusted_only=True,
+    )
+    if latest is None:
+        return None, "trusted contract snapshot がありません"
+    if latest.get("status") != "go":
+        return None, "最新 trusted contract snapshot が status: go ではありません"
+    inner = latest.get("inner")
+    if not isinstance(inner, dict) or inner.get("body_sha256") != body_sha256:
+        return None, "最新 trusted status: go contract snapshot の body SHA が live body と一致しません"
+    return waiver, None
 
 
 def _has_only_fixed_readback_incomplete_blockers(fresh: dict) -> bool:
