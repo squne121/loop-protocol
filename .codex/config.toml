@@ -12,7 +12,7 @@ max_depth = 1
 
 [permissions.loop-protocol-rtk.filesystem]
 ":minimal" = "read"
-"~/.codex/packages/standalone" = "read"
+"~/.codex/packages/standalone/releases" = "read"
 
 [permissions.loop-protocol-rtk.filesystem.":workspace_roots"]
 "." = "write"
@@ -31,7 +31,7 @@ enabled = true
 
 [permissions.loop-protocol-readonly.filesystem]
 ":minimal" = "read"
-"~/.codex/packages/standalone" = "read"
+"~/.codex/packages/standalone/releases" = "read"
 
 [permissions.loop-protocol-readonly.filesystem.":workspace_roots"]
 "." = "read"
@@ -48,7 +48,7 @@ enabled = true
 
 [permissions.loop-protocol-bootstrap.filesystem]
 ":minimal" = "read"
-"~/.codex/packages/standalone" = "read"
+"~/.codex/packages/standalone/releases" = "read"
 
 [permissions.loop-protocol-bootstrap.filesystem.":workspace_roots"]
 "." = "write"
