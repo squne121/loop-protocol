@@ -5,6 +5,7 @@ baseline_vc_preflight.py.
 """
 
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -150,3 +151,110 @@ def test_ac3_result_item_exposes_both_command_hash_and_execution_key_hash(tmp_pa
     assert result["command_hash"].startswith("sha256:")
     assert result["execution_key_hash"].startswith("sha256:")
     assert result["command_hash"] != result["execution_key_hash"]
+
+
+# ---------------------------------------------------------------------------
+# P0-1 (PR #1508 review): state-epoch barrier tests.
+# ---------------------------------------------------------------------------
+
+
+def _reset_state_probe_fixture(fixture_dir: Path, probe_path: Path) -> None:
+    if fixture_dir.exists():
+        shutil.rmtree(fixture_dir)
+    fixture_dir.mkdir()
+    probe_path.write_text("x = 1\n", encoding="utf-8")
+
+
+_STATE_EPOCH_BODY = """## Verification Commands
+
+```bash
+# AC1
+$ test -d fixture/__pycache__
+# AC2
+$ python3 -m py_compile fixture/state_probe.py
+# AC3
+$ test -d fixture/__pycache__
+```
+"""
+
+
+def test_p0_1_state_epoch_barrier_prevents_stale_dedup_replay(tmp_path, monkeypatch, capsys):
+    """P0-1: `test -d fixture/__pycache__` executed BEFORE and AFTER a
+    stateful `python3 -m py_compile fixture/state_probe.py` barrier must be
+    re-executed fresh each time (fixing AC3 against the real post-barrier
+    state), not dedup-replayed against AC1's stale pre-barrier snapshot.
+    Holds identically at --max-workers 1 and 2."""
+    fixture_dir = tmp_path / "fixture"
+    probe = fixture_dir / "state_probe.py"
+    body_file = tmp_path / "issue_body.md"
+    body_file.write_text(_STATE_EPOCH_BODY, encoding="utf-8")
+
+    results_by_workers = {}
+    for max_workers in ("1", "2"):
+        _reset_state_probe_fixture(fixture_dir, probe)
+        _, data = _run_main(
+            monkeypatch,
+            capsys,
+            [
+                "--body-file", str(body_file), "--issue", "999", "--cwd", str(tmp_path),
+                "--max-workers", max_workers,
+            ],
+        )
+        results_by_workers[max_workers] = data["results"]
+
+    for max_workers, results in results_by_workers.items():
+        assert len(results) == 3, max_workers
+        ac1, ac2, ac3 = results
+        # AC1: __pycache__ does not exist yet -> `test -d` fails (exit 1)
+        assert ac1["exit_code"] == 1, max_workers
+        # AC2: py_compile succeeds and creates __pycache__ as a side effect.
+        assert ac2["exit_code"] == 0, max_workers
+        # AC3: __pycache__ now exists -> `test -d` succeeds (exit 0). If AC3
+        # had been (incorrectly) dedup-replayed against AC1's pre-barrier
+        # snapshot, this would still read exit_code == 1.
+        assert ac3["exit_code"] == 0, max_workers
+        # AC1 and AC3 share identical raw command text ...
+        assert ac1["raw_command"] == ac3["raw_command"]
+        # ... but MUST NOT share an execution_key_hash (different state
+        # epoch) and AC3 must not be flagged as a dedup replay of AC1.
+        assert ac1["execution_key_hash"] != ac3["execution_key_hash"], max_workers
+        assert ac3["runner"] != "dedup_replay", max_workers
+        assert "dedup" not in ac3 or ac3.get("dedup") is None, max_workers
+
+    # Same fixed-point exit codes at both --max-workers 1 and 2.
+    assert [r["exit_code"] for r in results_by_workers["1"]] == [
+        r["exit_code"] for r in results_by_workers["2"]
+    ]
+
+
+def test_p0_1_execution_key_hash_changes_with_state_epoch():
+    """compute_execution_key_hash() must produce a distinct hash for the
+    same argv/cwd/env/timeout when state_epoch differs (P0-1)."""
+    argv = ["test", "-d", "fixture/__pycache__"]
+    epoch_0 = vcp.compute_execution_key_hash(argv, "/tmp/repo", {}, 90, state_epoch=0)
+    epoch_0_again = vcp.compute_execution_key_hash(argv, "/tmp/repo", {}, 90, state_epoch=0)
+    epoch_1 = vcp.compute_execution_key_hash(argv, "/tmp/repo", {}, 90, state_epoch=1)
+
+    assert epoch_0 == epoch_0_again
+    assert epoch_0 != epoch_1
+
+
+# ---------------------------------------------------------------------------
+# P2-2 (PR #1508 review): dedup provenance identifies the exact source AC.
+# ---------------------------------------------------------------------------
+
+
+def test_p2_2_dedup_provenance_identifies_source_result_index_ac_and_line(tmp_path, monkeypatch, capsys):
+    body_file = _write_body(tmp_path, _DEDUP_BODY)
+
+    _, data = _run_main(
+        monkeypatch,
+        capsys,
+        ["--body-file", str(body_file), "--issue", "999", "--cwd", str(_REPO_ROOT)],
+    )
+
+    source, replay = data["results"][0], data["results"][1]
+    assert replay["dedup"]["source_result_index"] == 0
+    assert replay["dedup"]["source_ac"] == source["ac"] == "AC1"
+    assert replay["dedup"]["source_line"] == source["line"]
+    assert replay["dedup"]["source_line"] != replay["line"]

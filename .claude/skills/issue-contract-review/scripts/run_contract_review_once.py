@@ -84,9 +84,12 @@ _DEFAULT_TIMEOUT = 30
 
 # Issue #1338 AC9: named constant for the --max-workers value explicitly
 # passed to baseline_vc_preflight.py. Bounded parallel execution there is
-# restricted to a dedicated safe read-only predicate (rg/grep/egrep/fgrep,
-# exact test -f|-d|-s PATH); pnpm/uv run pytest/pytest/gh/git/
-# github_metadata_assert always stay serial regardless of this value.
+# restricted to a dedicated safe read-only predicate (`rg` with a fully
+# validated bounded path operand, or exact test -f|-d|-s PATH); pnpm/uv run
+# pytest/pytest/gh/git/github_metadata_assert always stay serial regardless
+# of this value. grep/egrep/fgrep are intentionally EXCLUDED from the
+# parallel-eligible predicate (PR #1508 review P0-2): the prior basename-only
+# classification allowed them into the pool with no path/stdin validation.
 _VC_PREFLIGHT_MAX_WORKERS = 2
 
 _IDEMPOTENCY_MARKER_PREFIX = "<!-- loop-protocol:contract-review-once"
