@@ -30,6 +30,19 @@ def fetch_issue_comments(
     """
     Fetch all issue comments via gh CLI with pagination.
     Returns (comments_list, error_code_or_None).
+
+    #1475 (fix_delta P1 item 2): the jq projection now also requests
+    user.id / user.type so the trusted-publisher check can bind to the full
+    GitHub identity tuple (id, login, type, association), not login/
+    association alone.
+
+    #1475 (fix_delta P2 item 4): fail-closed NDJSON handling. A single
+    malformed line makes the whole fetch untrustworthy for authoritative
+    go/blocked precedence -- a truncated/corrupted stream could silently
+    drop the newest trusted comment and make a stale one look authoritative.
+    Any json.JSONDecodeError on a non-empty line aborts the fetch with
+    comments_fetch_incomplete instead of silently continuing with a partial
+    comment list.
     """
     try:
         result = subprocess.run(
@@ -39,7 +52,9 @@ def fetch_issue_comments(
                 "--paginate",
                 f"repos/{repo}/issues/{issue_number}/comments?per_page=100",
                 "--jq",
-                '.[] | {id, html_url, created_at, updated_at, body}',
+                '.[] | {id, html_url, created_at, updated_at, body, '
+                'author: .user.login, author_id: .user.id, '
+                'author_type: .user.type, author_association}',
             ],
             capture_output=True,
             text=True,
@@ -56,11 +71,14 @@ def fetch_issue_comments(
         comments: list[dict] = []
         for line in result.stdout.splitlines():
             line = line.strip()
-            if line:
-                try:
-                    comments.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
+            if not line:
+                continue
+            try:
+                comments.append(json.loads(line))
+            except json.JSONDecodeError:
+                # Fail-closed (#1475 P2 item 4): a partially-decoded comment
+                # stream must never be treated as a complete evidence set.
+                return [], "comments_fetch_incomplete"
         return comments, None
     except subprocess.TimeoutExpired:
         return [], "gh_timeout"
@@ -156,6 +174,79 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Trust policy (GitHub provenance, #1475)
+# ---------------------------------------------------------------------------
+
+# Trusted GitHub author_association values. NONE/CONTRIBUTOR/FIRST_TIME_CONTRIBUTOR
+# are excluded so that arbitrary outside commenters cannot post an authoritative
+# snapshot. Retained for callers that only need the (weaker) association-only
+# check as a display/audit signal; it is no longer sufficient on its own to
+# authorize a snapshot -- see TRUSTED_CONTRACT_PUBLISHERS below (#1475).
+TRUSTED_AUTHOR_ASSOCIATIONS: frozenset[str] = frozenset(
+    {"OWNER", "MEMBER", "COLLABORATOR"}
+)
+
+# #1475 (fix_delta P1 item 2): static allowlist of controlled contract-snapshot
+# publishers, keyed by the immutable GitHub user.id. author_association alone
+# authorizes any current repo COLLABORATOR/MEMBER, which is too broad for an
+# authoritative security-relevant snapshot. Authorization now requires the
+# full (user.id, user.login, user.type, author_association) tuple to match a
+# single allowlisted entry exactly. login is used for audit display and
+# rename-drift detection only -- it is never sufficient by itself, and
+# association is never sufficient by itself either.
+TRUSTED_CONTRACT_PUBLISHERS: dict[int, dict[str, Any]] = {
+    63350259: {
+        "expected_login": "squne121",
+        "expected_type": "User",
+        "allowed_associations": frozenset({"OWNER"}),
+    },
+}
+
+
+def is_trusted_snapshot_author(
+    author: Optional[str],
+    author_association: Optional[str],
+    *,
+    author_id: Optional[int] = None,
+    author_type: Optional[str] = None,
+) -> bool:
+    """
+    Decide whether a GitHub comment's full identity tuple is allowed to
+    publish an authoritative CONTRACT_REVIEW_RESULT_V1 snapshot.
+
+    Fail-closed (#1475 P1 item 2): identity authorization requires an exact
+    match against TRUSTED_CONTRACT_PUBLISHERS, keyed by author_id (GitHub
+    user.id, immutable). author_association alone is never sufficient --
+    it no longer authorizes arbitrary repo COLLABORATOR/MEMBER accounts.
+
+    Validation order:
+      1. author_id must be present, a non-bool int, and > 0.
+      2. author_id must be a key in TRUSTED_CONTRACT_PUBLISHERS.
+      3. author (login) must equal the allowlisted expected_login.
+      4. author_type must equal the allowlisted expected_type.
+      5. author_association must be one of the allowlisted associations.
+    All five conditions must hold; any missing/mismatched field is untrusted.
+    """
+    if author_id is None or isinstance(author_id, bool) or not isinstance(author_id, int):
+        return False
+    if author_id <= 0:
+        return False
+
+    entry = TRUSTED_CONTRACT_PUBLISHERS.get(author_id)
+    if entry is None:
+        return False
+
+    if not author or author != entry["expected_login"]:
+        return False
+    if not author_type or author_type != entry["expected_type"]:
+        return False
+    if not author_association or author_association not in entry["allowed_associations"]:
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 
@@ -243,6 +334,10 @@ def parse_contract_review_results(
                 inner = parsed[_CONTRACT_REVIEW_MARKER]
                 if not isinstance(inner, dict):
                     continue
+                author = comment.get("author")
+                author_association = comment.get("author_association")
+                author_id = comment.get("author_id")
+                author_type = comment.get("author_type")
                 results.append(
                     {
                         "comment_id": comment.get("id"),
@@ -251,6 +346,16 @@ def parse_contract_review_results(
                         "block": parsed,
                         "inner": inner,
                         "status": inner.get("status", ""),
+                        "author": author,
+                        "author_association": author_association,
+                        "author_id": author_id,
+                        "author_type": author_type,
+                        "is_trusted_author": is_trusted_snapshot_author(
+                            author,
+                            author_association,
+                            author_id=author_id,
+                            author_type=author_type,
+                        ),
                     }
                 )
                 # Only take first valid block per comment
@@ -259,15 +364,39 @@ def parse_contract_review_results(
     return results
 
 
+def filter_authoritative_results(results: list[dict]) -> list[dict]:
+    """
+    Return only the subset of parsed results whose author identity passes
+    is_trusted_snapshot_author (#1475 P1 item 1).
+
+    This is the single shared authoritative-candidate set: it MUST be applied
+    to go/blocked precedence decisions BEFORE choosing the "latest" result,
+    not only when selecting a go candidate. Applying trust filtering only to
+    find_latest_go (and leaving find_latest_result unfiltered) allows an
+    untrusted `status: blocked` comment posted after a trusted `status: go`
+    to incorrectly take precedence and halt the workflow (the exact bug this
+    function closes).
+    """
+    return [r for r in results if r.get("is_trusted_author") is True]
+
+
 def find_latest_go(
     results: list[dict],
+    *,
+    trusted_only: bool = False,
 ) -> Optional[dict]:
     """
     Return the latest (by created_at desc, comment_id desc) valid
     CONTRACT_REVIEW_RESULT_V1 with status: go.
     Returns None if no go result found.
+
+    trusted_only (#1475): when True, results whose is_trusted_author is not
+    True are excluded from candidacy. A schema-valid but untrusted
+    `status: go` is never returned as authoritative when trusted_only=True.
     """
     go_results = [r for r in results if r["status"] == "go"]
+    if trusted_only:
+        go_results = filter_authoritative_results(go_results)
     if not go_results:
         return None
     # Sort by created_at desc, then comment_id desc
@@ -277,15 +406,25 @@ def find_latest_go(
 
 def find_latest_result(
     results: list[dict],
+    *,
+    trusted_only: bool = False,
 ) -> Optional[dict]:
     """
     Return the latest (by created_at desc, comment_id desc) valid
     CONTRACT_REVIEW_RESULT_V1 regardless of status.
+
+    trusted_only (#1475 P1 item 1): when True, only authoritative
+    (trusted-author) results are considered before selecting the latest
+    entry. Every consumer that uses find_latest_result to decide go/blocked
+    precedence MUST pass trusted_only=True, or an untrusted outsider comment
+    can silently pre-empt a trusted go/blocked snapshot regardless of which
+    status it carries.
     """
-    if not results:
+    candidates = filter_authoritative_results(results) if trusted_only else results
+    if not candidates:
         return None
     sorted_results = sorted(
-        results,
+        candidates,
         key=lambda r: (r.get("created_at", ""), r.get("comment_id", 0)),
         reverse=True,
     )

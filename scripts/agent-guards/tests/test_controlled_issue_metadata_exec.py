@@ -1048,16 +1048,26 @@ def parse_contract_review_results(comments, expected_issue_url=None):
             "status": "go",
             "created_at": c.get("created_at"),
             "inner": inner,
+            # #1475: this functional stub only exercises the readback/marker
+            # flow (not trust-filtering itself, which is covered by the real
+            # contract_review_result_parser.py unit tests), so every
+            # comment produced by this fixture is treated as authoritative.
+            "is_trusted_author": True,
         })
     return results
 
 
-def find_latest_result(results):
-    return results[-1] if results else None
+def find_latest_result(results, trusted_only=False):
+    candidates = (
+        [r for r in results if r.get("is_trusted_author")] if trusted_only else results
+    )
+    return candidates[-1] if candidates else None
 
 
-def find_latest_go(results):
+def find_latest_go(results, trusted_only=False):
     go = [r for r in results if r.get("status") == "go"]
+    if trusted_only:
+        go = [r for r in go if r.get("is_trusted_author")]
     return go[-1] if go else None
 
 
@@ -1087,6 +1097,91 @@ def tmp_project_functional(tmp_path):
         capture_output=True,
     )
     return tmp_path
+
+
+# #1475 fix_delta P1 item 3 / P2 item 5: a variant of the functional parser
+# stub where every parsed comment is untrusted (is_trusted_author: False),
+# to prove _readback_contract_snapshot's find_latest_go(results,
+# trusted_only=True) call actually rejects an untrusted-but-otherwise-valid
+# posted comment, rather than merely asserting the call shape.
+_PARSER_MOD_FUNCTIONAL_STUB_UNTRUSTED = _PARSER_MOD_FUNCTIONAL_STUB.replace(
+    '"is_trusted_author": True,\n', '"is_trusted_author": False,\n'
+).replace(
+    '"is_trusted_author": True', '"is_trusted_author": False'
+)
+
+
+@pytest.fixture()
+def tmp_project_functional_untrusted(tmp_path):
+    """Same as tmp_project_functional, but the parser stub reports every
+    comment as untrusted -- proving the trusted_only=True gate in
+    controlled_skill_mutation_exec.py's _readback_contract_snapshot is not a
+    no-op."""
+    executor_dir = tmp_path / "scripts" / "agent-guards"
+    executor_dir.mkdir(parents=True)
+    irl_dir = tmp_path / ".claude" / "skills" / "impl-review-loop" / "scripts"
+    irl_dir.mkdir(parents=True)
+    (irl_dir / "ensure_contract_snapshot.py").write_text(_ENSURE_MOD_FUNCTIONAL_STUB)
+    icr_dir = tmp_path / ".claude" / "skills" / "issue-contract-review" / "scripts"
+    icr_dir.mkdir(parents=True)
+    (icr_dir / "contract_review_result_parser.py").write_text(
+        _PARSER_MOD_FUNCTIONAL_STUB_UNTRUSTED
+    )
+
+    subprocess.run(["git", "init", str(tmp_path)], capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "origin",
+         f"https://github.com/{TRUSTED_REPO}.git"],
+        capture_output=True,
+    )
+    return tmp_path
+
+
+class TestReadbackContractSnapshotRejectsUntrustedPublisher:
+    """fix_delta P1 item 3: controlled_skill_mutation_exec.py is the actual
+    controlled mutation boundary; it must apply trusted_only=True the same
+    as every other consumer. This is a genuine end-to-end assertion (real
+    find_latest_go execution against an untrusted-marked result set), not a
+    mocked True/False return value standing in for the real check."""
+
+    def test_readback_rejects_otherwise_valid_untrusted_comment(
+        self, tmp_project_functional_untrusted, monkeypatch
+    ):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project_functional_untrusted)
+        body_text = "current issue body"
+        body_sha256 = _sha(body_text)
+        marker = (
+            f"<!-- loop-protocol:contract-snapshot issue=1284 "
+            f"body_sha256={body_sha256} schema=CONTRACT_REVIEW_RESULT_V1 -->"
+        )
+        inner = {
+            "body_sha256": body_sha256,
+            "checks": {"product_spec_check": {"body_sha256": body_sha256}},
+        }
+        fresh_url = "https://github.com/o/r/issues/1284#issuecomment-999"
+        fresh_body = f"{marker}\n\n<!--TEST_INNER:{json.dumps(inner)}-->"
+
+        def _fake_run(cmd, **kwargs):
+            payload = {
+                "id": 999,
+                "html_url": fresh_url,
+                "created_at": "t",
+                "updated_at": "t",
+                "body": fresh_body,
+            }
+            return type("P", (), {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""})()
+
+        with patch("subprocess.run", side_effect=_fake_run):
+            with patch.object(
+                _exec, "_fetch_issue_body_and_updated_at",
+                return_value=(body_text, "now", ""),
+            ):
+                readback = _exec._readback_contract_snapshot(
+                    marker, 1284, TRUSTED_REPO, "/bin/gh", fresh_url, body_sha256,
+                )
+
+        assert "error" in readback
+        assert readback["error"] == "remote_contract_snapshot_not_current"
 
 
 class TestReadbackContractSnapshotDuplicateMarker:

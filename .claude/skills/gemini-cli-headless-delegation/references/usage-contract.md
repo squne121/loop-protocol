@@ -1059,3 +1059,146 @@ Fallback Handoff Contract:
 ```
 
 Caller はこの失敗を見て「file evidence を取得できなかった」と判断し、Issue author に修正を依頼するか、別の evidence source を探す。
+
+## Fan-Out Orchestrator (delegation_fanout_request_v1 / delegation_fanout_result_v1) / 並列実行 fan-out 契約
+
+（Issue #1273）`fan_out_orchestrator.py` は既存の `delegation_request_v1` / `delegation_result/v1` を変更せず、
+複数の provider/profile へ**並列**に fan-out する薄いオーケストレーション層を追加する。planner mode
+（LLM によるタスク数・分割・provider 選択の動的決定）は v1 の対象外 -- 呼び出し側が `subtasks[]` を明示的に列挙する。
+
+### Request: delegation_fanout_request_v1（closed schema、リクエスト定義）
+
+```yaml
+delegation_fanout_request_v1:
+  schema: delegation_fanout_request_v1
+  subtasks:  # 必須。空リスト不可。各要素は既存 delegation_request_v1 をそのまま保持する。
+    - schema: delegation_request_v1
+      provider: gemini | agy  # provider: auto は fan-out child では禁止（下記参照）
+      tool_profile: no_tools | grounded_research | local_asset_research | proposal_only | github_research
+      objective: "..."
+      instructions: ["...", "..."]
+      output_sections: ["..."]
+      context_files: ["..."]
+      subtask_id: "<任意。省略時は subtask-<index> が自動採番される>"
+      # subtask_id は安全な charset のみ許可（英数字始まり、以降は英数字/_/./- のみ、
+      # 最大128文字、制御文字禁止。'..' や絶対パスは拒否される）。呼び出し側から見える
+      # 論理IDであり、ファイル名には決して使われない（orchestrator 内部生成の
+      # artifact_stem を使う。下記「subtask_id と artifact_stem の分離」参照）。
+      # subtasks[] 自体をここに書くことは禁止（再帰 fan-out 不可、planner mode 不可）
+  max_workers: 4          # 任意。既定 4。全体の同時実行数上限。
+  max_subtasks: 20        # 任意。既定 20。dedupe 後 unique subtask 数の上限。
+  max_total_attempts: 20  # 任意。既定 20。v1 は 1 subtask = 1 attempt（orchestrator 側リトライなし）。
+  overall_timeout_sec: 300  # 任意。既定 300。到達時に pending を cancel、実行中 child を terminate。
+  provider_concurrency: {gemini: 2, agy: 1}  # 任意。provider 別 semaphore 上限（既定は max_workers）。
+  profile_concurrency: {github_research: 1}  # 任意。profile 別 semaphore 上限（既定は max_workers）。
+```
+
+トップレベルキーは closed set（`schema` / `subtasks` / `max_workers` / `max_subtasks` /
+`max_total_attempts` / `overall_timeout_sec` / `provider_concurrency` / `profile_concurrency`）で、
+未知キーは fail-closed で拒否される。
+
+#### subtask_id と artifact_stem の分離（Issue #1273 iteration 3 Blocker 1）
+
+`subtask_id` は呼び出し側が指定する**論理**識別子であり、`results[].subtask_id` や
+`deduplicated_aliases` に現れる。安全な charset（`^[A-Za-z0-9][A-Za-z0-9_.-]*$`、最大128文字、
+制御文字禁止）にバリデーションされるが、**ファイル名や内部プロセスレジストリのキーには一切使われない**。
+orchestrator は dedupe 後の各 unique subtask に対して、`{index:04d}-{fingerprint[:16]}` 形式の
+`artifact_stem`（完全に orchestrator 生成、caller が制御不能）を別途割り当て、request/result ファイル名
+と child process registry key にはこちらのみを使う。これにより `subtask_id` に `"../../outside"` の
+ような値を与えても path traversal は構造的に不可能であり、重複 `subtask_id`（バリデーションで拒否済み）
+による request/result 競合や process registry 上書きも発生しない。
+
+### 実行前 exact dedupe
+
+provider 呼び出し前に、`provider` / `tool_profile` / `objective` / `instructions` / `output_sections` /
+`context_files` の**内容ハッシュ**（パスではなくファイル内容の SHA-256）/ `gh_commands` を canonical JSON 化した
+SHA-256 fingerprint で重複判定する。**semantic dedupe（意味的類似度による縮約）は v1 では行わない** -- 上記
+フィールドがすべて byte-for-byte 一致した場合のみ縮約される。縮約された subtask の元 `subtask_id` は
+`deduplicated_aliases`（`{kept_subtask_id: [alias_subtask_id, ...]}`）に保持され、消えない。
+
+### 実行制御
+
+`max_workers`（全体の同時実行数）、provider 別 semaphore、profile 別 semaphore、`max_total_attempts`
+（総 attempt 数上限）、`overall_timeout_sec`（全体タイムアウト）を組み合わせて適用する。上限超過分は
+provider を一切起動せず `failed`（`max_subtasks_exceeded` / `max_total_attempts_exceeded`）として扱う。
+
+### provider/profile 互換性 preflight（起動前検証）
+
+provider 起動前に、`SUPPORTED_PROVIDERS` / `AGY_SUPPORTED_PROFILES`
+（`run_gemini_headless.py` 正本）と `validate_request()` による完全な delegation_request_v1 検証を通し、
+非互換な組合せや無効なリクエストは provider を起動せず `failed`（`provider_profile_incompatible` /
+`validation_error`）として扱う。
+
+**`provider: auto` は fan-out child では禁止**（Issue #1273 iteration 3 Blocker 3）。`auto` は
+`run_delegation()` 内部で gemini → agy の順に再入し、その内部 fallback attempt は `max_total_attempts` にも provider 別 semaphore にも計上されない（child subprocess は 1 攻撃分の
+枠しか消費しないのに実際には 2 provider を呼び得る）。この二重計上/semaphore バイパスを閉じるため、
+v1 では `provider: auto` を preflight で一律拒否する。provider fallback が必要な場合は、呼び出し側が
+`gemini` / `agy` の subtask を明示的に個別 submit すること。
+
+### Child からの mutation は fail-closed で禁止（AC12）
+
+child subtask は以下をすべて拒否される（provider 起動前の preflight で reject、実行されない）:
+- `post_to_issue_url` の指定（GitHub write mutation）
+- `gh_commands` の read-only argv allowlist（`_validate_github_research_argv()`）に違反するエントリ
+  （github_research 以外の profile にも一律適用される -- delegation_request_v1 には他に構造化された
+  shell/file-mutation channel が存在しないため）
+- 再帰的な新規 fan-out 呼出し（`subtasks` キーを持つ、または `schema: delegation_fanout_request_v1` を宣言する）
+
+child は結果を parent へ返すのみで、ファイルへの直接書き込みは行わない（parent が single-writer）。
+
+### Result: delegation_fanout_result_v1（結果契約）
+
+```yaml
+delegation_fanout_result_v1:
+  schema: delegation_fanout_result_v1
+  status: success | partial_success | failed | cancelled
+  ok: true   # unique subtask が全件 succeeded の場合のみ true（status: success と等価）
+  parent_run_id: "<uuid4 hex>"
+  counts:
+    requested: 5   # 入力 subtasks[] の件数（dedupe 前）
+    unique: 3      # dedupe 後の件数
+    succeeded: 2
+    failed: 1
+    cancelled: 0
+  results:   # 入力順（＝ dedupe 後の subtask_id 順）で固定。dedupe/preflight/timeout で拒否された
+             # subtask も results[] に含まれる（fanout_status: failed | cancelled として）。
+    - subtask_id: "..."
+      original_ids: ["...", "..."]  # dedupe で縮約された元の subtask_id 群（自身を含む）
+      fanout_status: succeeded | failed | cancelled
+      result: <delegation_result/v1 または null>
+      reasons: []  # failed/cancelled のときのみ非空
+  failures: []   # results[] のうち fanout_status != succeeded の要素のサブセット
+  deduplicated_aliases: {}
+  run_dir: "<run 専用ディレクトリ（0700）>"
+  manifest_path: "<run_dir>/manifest.json"  # temporary file へ書いてから os.replace() された最終 manifest
+```
+
+`ok` は全 unique subtask が succeeded のときのみ true（`status: success` と等価）。1 件でも失敗/cancel が
+あれば `partial_success`（1 件以上 succeeded）または `failed`/`cancelled`（succeeded 0 件）に決定的に分類される。
+
+### Timeout / cancel 契約
+
+`overall_timeout_sec` 到達時、まだ開始していない subtask は provider を一切起動せず `cancelled` になる。
+実行中の child は（production の subprocess runner の場合）SIGTERM → grace period 後 SIGKILL を
+プロセスグループ単位で送る。timeout 後に遅れて返ってきた child の結果は**破棄**され、`cancelled` として
+扱われる（`overall_timeout_late_result_discarded`）。
+
+### CLI Usage（コマンドライン利用例）
+
+```bash
+uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/build_fanout_request.py \
+  --subtask-request request-a.json \
+  --subtask-request request-b.json \
+  --max-workers 4 \
+  --overall-timeout-sec 300 \
+  --provider-concurrency gemini=2 \
+  --provider-concurrency agy=1 \
+  --profile-concurrency github_research=1 \
+  --output fanout-request.json
+
+uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/fan_out_orchestrator.py \
+  --request-file fanout-request.json \
+  --output-file fanout-result.json \
+  --audit-log delegation_audit.jsonl
+```
+
