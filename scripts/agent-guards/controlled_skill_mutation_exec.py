@@ -1326,7 +1326,11 @@ def _readback_contract_snapshot(
         ensure_spec.loader.exec_module(ensure_mod)
         issue_url = f"https://github.com/{repo}/issues/{issue_number}"
         results = parser_mod.parse_contract_review_results([comment], issue_url)
-        snapshot = parser_mod.find_latest_go(results)
+        # #1475 fix_delta P1 item 3: this is the actual controlled mutation
+        # boundary. It must apply the same trusted_only=True gate as every
+        # other consumer -- an untrusted comment must never be treated as an
+        # authoritative snapshot readback here either.
+        snapshot = parser_mod.find_latest_go(results, trusted_only=True)
         if snapshot is None or not ensure_mod.is_go_current(snapshot, expected_body_sha256):
             return {"error": "remote_contract_snapshot_not_current"}
 
