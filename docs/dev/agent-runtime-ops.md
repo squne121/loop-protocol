@@ -3,13 +3,13 @@
 Codex local runtime 運用の主文書。
 この文書は Codex CLI の起動・sandbox・permission profile・rules・instruction surface を扱い、GitHub 操作ルールそのものは [github-ops.md](github-ops.md) を参照する。
 
-## Runtime Positioning
+## Runtime Positioning（実行時の位置付け）
 
 - Codex CLI は **optional runtime** であり、`Claude Code`、既存 `SSOT`、既存 `workflow` を置き換えない
 - repo の正本は引き続き `CLAUDE.md`、`docs/dev/workflow.md`、`docs/product/requirements.md` などの SSOT 群にある
 - Codex 向けの project-local guidance は `AGENTS.md` に集約し、この文書はその runtime 前提と復旧手順を補足する
 
-## Agent model allocation declaration proof
+## Agent model allocation declaration proof（エージェントモデル割当の宣言証明）
 
 `tests/fixtures/codex-agent-config/expected-runtime-contract.json` が custom agent のモデル、reasoning effort、permission 宣言の唯一の declaration proof である。TOML と静的 validator はこの契約への一致を検査するが、宣言値を provider-side dispatch の観測値として扱わない。
 
@@ -17,13 +17,13 @@ Codex local runtime 運用の主文書。
 
 allocation を戻す必要がある場合は、contract、全対象TOML、hook/evidence validator、fixture を同一コミットで原子的に戻す。片面だけのrollbackや、過去runのledger再利用は許可しない。
 
-## Network-Only Auto Allow
+## Network-Only Auto Allow（ネットワーク限定の自動許可）
 
 この節は **network boundary の差分例** であり、permission profile 全体を列挙する complete profile ではない。
 `uploads.github.com` は GitHub の release asset / upload 系 endpoint 向けで、issue / PR の投稿やコメントの主経路ではない。
 GitHub issue / PR の更新・コメントは引き続き [github-ops.md](github-ops.md) と `rtk gh` を使う。
 
-### Modern example
+### Modern example（現行設定例）
 
 ```toml
 approval_policy = "on-request"
@@ -44,7 +44,7 @@ enabled = true
 - `uploads.github.com` は release asset / upload 系の経路に限定して追加している
 - `loop-protocol-readonly` と `loop-protocol-bootstrap` には追加しない。どちらも upload / release asset の許可を必要としないため、read-only / bootstrap の境界を狭く保つ
 
-### Legacy compatibility note
+### Legacy compatibility note（旧設定との互換注記）
 
 ```toml
 # legacy runtime only
@@ -55,7 +55,7 @@ network_access = true
 - `network_access = true` は legacy runtime のみの表現で、modern `default_permissions` と混在させない
 - GitHub issue / PR updates and comments still use [github-ops.md](github-ops.md) and `rtk gh`
 
-## WSL2 / standalone install の self-binary ENOENT 復旧
+## WSL2 / standalone install の self-binary ENOENT 復旧（自己バイナリの復旧）
 
 ### 症状
 
@@ -117,7 +117,7 @@ codex sandbox linux -- pwd
 - Issue #350 で `~/.local/bin/codex` 経由の sandbox failure と `/usr/local/bin/codex` 優先での復旧を確認した
 - PR #345 / Issue #343 の deferred AC6 は、この workaround を前提に `loop-protocol-rtk` で再確認する流れに整理されている
 
-## Human Approval Load Reduction Policy
+## Human Approval Load Reduction Policy（人間承認負荷の削減方針）
 
 目標は、人間を **approval machine** にしないこと。
 routine 操作は bounded な profile / rules / wrapper に寄せ、境界外だけ明示承認に残す。
@@ -147,12 +147,12 @@ routine 操作は bounded な profile / rules / wrapper に寄せ、境界外だ
 - secret / environment の広い参照
 - sandbox bypass や runtime policy の再設計
 
-## Network-Only Auto Allow
+## Network-Only Auto Allow（ネットワーク限定の自動許可）
 
 この節は、Codex の repo-local 既定を「network だけを最小限 allow する」方向に寄せるための例を示す。
 GitHub posting path 自体の正本は `docs/dev/github-ops.md` で、Codex session では `rtk gh` を low-approval boundary として使う。
 
-### Modern profile example
+### Modern profile example（現行プロファイル例）
 
 ```toml
 approval_policy = "on-request"
@@ -171,7 +171,7 @@ enabled = true
 この modern 例では、`default_permissions` と `[permissions.*]` だけを使い、filesystem 境界は広げない。
 GitHub への issue / PR 更新やコメント投稿は、`docs/dev/github-ops.md` の body-file guidance に従って `rtk gh` へ寄せる。
 
-### Legacy compatibility note
+### Legacy compatibility note（旧設定との互換注記）
 
 ```toml
 # legacy runtime only
@@ -182,21 +182,21 @@ network_access = true
 `network_access = true` は legacy 互換の説明であり、modern の `default_permissions = "loop-protocol-rtk"` と同じスニペットに混ぜない。
 `sandbox_workspace_write` を使う場合でも、`danger-full-access` や `approval_policy = "never"` を既定にしない。
 
-### GitHub Posting Boundary
+### GitHub Posting Boundary（GitHub 投稿の境界）
 
 GitHub への issue / PR 更新、コメント投稿、draft PR 起票は `docs/dev/github-ops.md` を正本にし、`rtk gh` の low-approval boundary に寄せる。
 `gh` 直叩きや `rtk curl` のような arbitrary network 操作は、この節の対象外とする。
 
-## Official References
+## Official References（公式参照）
 
-- Codex permissions: https://developers.openai.com/codex/permissions
-- Codex rules: https://developers.openai.com/codex/rules
-- Codex AGENTS.md: https://developers.openai.com/codex/guides/agents-md
-- Codex sandboxing / approval policy: https://developers.openai.com/codex/concepts/sandboxing
+- Codex permissions（権限）: https://developers.openai.com/codex/permissions
+- Codex rules（ルール）: https://developers.openai.com/codex/rules
+- Codex AGENTS.md（指示ファイル）: https://developers.openai.com/codex/guides/agents-md
+- Codex sandboxing / approval policy（サンドボックスと承認方針）: https://developers.openai.com/codex/concepts/sandboxing
 
-## Permission / Rules / Instruction Surface
+## Permission / Rules / Instruction Surface（権限・ルール・指示面）
 
-### project-local boundary
+### project-local boundary（プロジェクトローカル境界）
 
 - `.codex/config.toml` の `default_permissions` が repo 既定 profile を選ぶ
 - `.codex/rules/default.rules` が command rules を持つ
@@ -288,7 +288,7 @@ docs/dev"
 `secret_boundary_violation`・`forbidden_path`・`public_checkpoint`・`secrets_mode` は
 `PermissionRequest` でも `deny` を維持する。
 
-## Cross References
+## Cross References（相互参照）
 
 - GitHub 操作の共通規約: [github-ops.md](github-ops.md)
 - 実装フローの正本: [workflow.md](workflow.md)
