@@ -181,3 +181,60 @@ class TestBaselineVcPreflightTimeoutArgvAC3:
         timeout_idx = vc_preflight_cmd.index("--timeout-seconds")
         timeout_value = vc_preflight_cmd[timeout_idx + 1]
         assert timeout_value == str(_rcr_mod._VC_PREFLIGHT_PER_COMMAND_TIMEOUT)
+
+
+
+# ---------------------------------------------------------------------------
+# Issue #1338 AC9: run_contract_review_once.py holds a named constant
+# _VC_PREFLIGHT_MAX_WORKERS and passes it, together with --timeout-seconds,
+# as explicit argv when invoking baseline_vc_preflight.py.
+# ---------------------------------------------------------------------------
+
+
+class TestVcPreflightMaxWorkersWiringAC9:
+    """AC9: _VC_PREFLIGHT_MAX_WORKERS named constant + explicit argv wiring."""
+
+    def test_named_constant_exists_with_expected_initial_value(self):
+        assert hasattr(_rcr_mod, "_VC_PREFLIGHT_MAX_WORKERS")
+        assert _rcr_mod._VC_PREFLIGHT_MAX_WORKERS == 2
+
+    def test_vc_preflight_invocation_passes_explicit_max_workers_and_timeout(self):
+        """The baseline_vc_preflight.py subprocess argv explicitly includes both
+        --timeout-seconds and --max-workers (sourced from the named constants),
+        not merely relying on the sub-script's own defaults."""
+        readiness_json = _make_readiness_json("go")
+        product_spec_json = _make_product_spec_json("pass")
+        vc_json = _make_vc_preflight_json("pass")
+
+        run_script_iter = iter(
+            [
+                (readiness_json, 0, None),
+                (product_spec_json, 0, None),
+                (vc_json, 0, None),
+            ]
+        )
+        captured_calls = []
+
+        def _fake_run_script(cmd, *args, **kwargs):
+            captured_calls.append(cmd)
+            return next(run_script_iter)
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=_fake_run_script):
+            with patch.object(_rcr_mod, "_run_shell_script", return_value=(0, "OK", "")):
+                with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, None)):
+                    result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+
+        assert result["status"] == "go"
+
+        # vc_preflight is the 3rd _run_script call (readiness, product_spec, vc_preflight)
+        vc_preflight_cmd = captured_calls[2]
+        assert str(_rcr_mod._BASELINE_VC_PREFLIGHT_PY) in vc_preflight_cmd
+
+        assert "--timeout-seconds" in vc_preflight_cmd
+        timeout_idx = vc_preflight_cmd.index("--timeout-seconds")
+        assert vc_preflight_cmd[timeout_idx + 1] == str(_rcr_mod._VC_PREFLIGHT_PER_COMMAND_TIMEOUT)
+
+        assert "--max-workers" in vc_preflight_cmd
+        max_workers_idx = vc_preflight_cmd.index("--max-workers")
+        assert vc_preflight_cmd[max_workers_idx + 1] == str(_rcr_mod._VC_PREFLIGHT_MAX_WORKERS)
+        assert vc_preflight_cmd[max_workers_idx + 1] == "2"

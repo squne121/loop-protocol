@@ -82,6 +82,13 @@ _VC_PREFLIGHT_TIMEOUT = (
 )
 _DEFAULT_TIMEOUT = 30
 
+# Issue #1338 AC9: named constant for the --max-workers value explicitly
+# passed to baseline_vc_preflight.py. Bounded parallel execution there is
+# restricted to a dedicated safe read-only predicate (rg/grep/egrep/fgrep,
+# exact test -f|-d|-s PATH); pnpm/uv run pytest/pytest/gh/git/
+# github_metadata_assert always stay serial regardless of this value.
+_VC_PREFLIGHT_MAX_WORKERS = 2
+
 _IDEMPOTENCY_MARKER_PREFIX = "<!-- loop-protocol:contract-review-once"
 
 
@@ -556,6 +563,8 @@ def run_once(
             repo,
             "--timeout-seconds",
             str(_VC_PREFLIGHT_PER_COMMAND_TIMEOUT),
+            "--max-workers",
+            str(_VC_PREFLIGHT_MAX_WORKERS),
     ]
     if evidence_mode == "current-head":
         if not cwd or not reviewed_head_sha:
