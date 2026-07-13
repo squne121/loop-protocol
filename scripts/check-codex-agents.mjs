@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import { execSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 // Derive repoRoot from script location so it is stable regardless of cwd.
@@ -18,6 +19,11 @@ const configPath = path.join(repoRoot, '.codex', 'config.toml');
 const hooksPath = path.join(repoRoot, '.codex', 'hooks.json');
 const rulesPath = path.join(repoRoot, '.codex', 'rules', 'default.rules');
 const ledgerPath = path.join(repoRoot, 'artifacts', 'codex', 'subagent-launch-ledger.json');
+const sourceRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const fixtureRuntimeContractPath = path.join(repoRoot, 'tests', 'fixtures', 'codex-agent-config', 'expected-runtime-contract.json');
+const runtimeContractPath = fs.existsSync(fixtureRuntimeContractPath)
+  ? fixtureRuntimeContractPath
+  : path.join(sourceRepoRoot, 'tests', 'fixtures', 'codex-agent-config', 'expected-runtime-contract.json');
 
 // CODEX_BIN env override for environments without codex on PATH
 const CODEX_BIN = process.env.CODEX_BIN ?? 'codex';
@@ -49,25 +55,36 @@ const allowedRuntimeStatuses = new Set([
 ]);
 
 const expectedProfiles = new Set(['loop-protocol-readonly', 'loop-protocol-rtk']);
-// Model mapping (ChatGPT account Codex CLI, v0.136.0+):
-//   gpt-5.4-mini medium      = Haiku equivalent  (light read-only / cleanup tasks)
-//   gpt-5.4-mini extra-high  = Sonnet equivalent (medium complexity tasks)
-//   gpt-5.4 medium           = Opus equivalent   (heavy implementation / review tasks)
-const reasoningMap = new Map([
-  ['codebase-investigator', { model: 'gpt-5.4-mini', effort: 'medium' }],
-  ['implementation-worker', { model: 'gpt-5.4', effort: 'medium' }],
-  ['issue-author', { model: 'gpt-5.4-mini', effort: 'xhigh' }],
-  ['issue-reviewer', { model: 'gpt-5.4-mini', effort: 'medium' }],
-  ['post-merge-cleanup-worker', { model: 'gpt-5.4-mini', effort: 'medium' }],
-  ['pr-reviewer-lite', { model: 'gpt-5.4-mini', effort: 'medium' }],
-  ['pr-reviewer', { model: 'gpt-5.4', effort: 'medium' }],
-  ['review-issue', { model: 'gpt-5.4', effort: 'medium' }],
-  ['spark-deep', { model: 'gpt-5.3-codex-spark', effort: 'high' }],
-  ['spark-skim', { model: 'gpt-5.3-codex-spark', effort: 'low' }],
-  ['spark-worker', { model: 'gpt-5.3-codex-spark', effort: 'medium' }],
-  ['test-runner', { model: 'gpt-5.4-mini', effort: 'medium' }],
-  ['web-researcher', { model: 'gpt-5.4-mini', effort: 'medium' }],
-]);
+function loadReasoningMap() {
+  const contract = JSON.parse(fs.readFileSync(runtimeContractPath, 'utf8'));
+  if (!contract || typeof contract !== 'object' || !contract.required_agents || typeof contract.required_agents !== 'object') {
+    throw new Error(`runtime contract is malformed: ${runtimeContractPath}`);
+  }
+  const entries = Object.entries(contract.required_agents);
+  if (entries.length !== 13) {
+    throw new Error(`runtime contract must declare exactly 13 agents: ${runtimeContractPath}`);
+  }
+  for (const [name, expected] of entries) {
+    for (const field of ['path', 'model', 'model_reasoning_effort', 'default_permissions']) {
+      if (typeof expected[field] !== 'string' || !expected[field]) {
+        throw new Error(`runtime contract ${name}.${field} must be a non-empty string`);
+      }
+    }
+    const isSpark = name.startsWith('spark-');
+    if (isSpark && expected.protected_lane !== true) {
+      throw new Error(`runtime contract ${name}.protected_lane must be true`);
+    }
+    if (!isSpark && Object.hasOwn(expected, 'protected_lane')) {
+      throw new Error(`runtime contract ${name}.protected_lane is reserved for Spark agents`);
+    }
+  }
+  return new Map(entries.map(([name, expected]) => [name, {
+    model: expected.model,
+    effort: expected.model_reasoning_effort,
+  }]));
+}
+
+const reasoningMap = loadReasoningMap();
 
 const readOnlyAgents = new Set([
   'codebase-investigator',
@@ -960,7 +977,22 @@ function appendLaunchEvidence(payload) {
       event_type: 'SubagentStart',
       evidence_source: 'event_derived',
       event_fingerprint: fingerprint,
-      runtime,
+      declared_runtime: {
+        ...runtime,
+        agent_definition_sha256: crypto.createHash('sha256').update(readText(path.join(agentsDir, `${agentType}.toml`))).digest('hex'),
+      },
+      observed_dispatch: {
+        model: payload.model ?? payload.active_model ?? null,
+        session_id: payload.session_id ?? null,
+        turn_id: payload.turn_id ?? null,
+        agent_id: payload.agent_id ?? null,
+        observed_at: new Date().toISOString(),
+      },
+      correlation: {
+        evidence_run_id: process.env.CODEX_AGENT_EVIDENCE_RUN_ID ?? null,
+        repo_head_sha: process.env.CODEX_AGENT_EVIDENCE_HEAD_SHA ?? null,
+        worktree_dirty: process.env.CODEX_AGENT_EVIDENCE_WORKTREE_DIRTY === 'true',
+      },
     });
   }
   saveLedger(ledger);

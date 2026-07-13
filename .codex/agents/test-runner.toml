@@ -1,7 +1,7 @@
 name = "test-runner"
 description = "Issue contract の Verification Commands を実行し、PASS / FAIL / SKIP を構造化報告する read-heavy custom agent。"
-model = "gpt-5.4-mini"
-model_reasoning_effort = "medium"
+model = "gpt-5.6-luna"
+model_reasoning_effort = "low"
 default_permissions = "loop-protocol-readonly"
 developer_instructions = """
 ROLE

@@ -22,8 +22,8 @@
       "evidence_source": "event_derived",
       "event_fingerprint": "evt-impl-001",
       "runtime": {
-        "model": "gpt-5.4",
-        "reasoning_effort": "medium",
+        "model": "gpt-5.6-terra",
+        "reasoning_effort": "high",
         "default_permissions": "loop-protocol-rtk"
       }
     },
@@ -33,8 +33,8 @@
       "evidence_source": "event_derived",
       "event_fingerprint": "evt-test-001",
       "runtime": {
-        "model": "gpt-5.4-mini",
-        "reasoning_effort": "medium",
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "low",
         "default_permissions": "loop-protocol-readonly"
       }
     },
@@ -44,8 +44,8 @@
       "evidence_source": "event_derived",
       "event_fingerprint": "evt-review-001",
       "runtime": {
-        "model": "gpt-5.4",
-        "reasoning_effort": "medium",
+        "model": "gpt-5.6-terra",
+        "reasoning_effort": "high",
         "default_permissions": "loop-protocol-readonly"
       }
     }
