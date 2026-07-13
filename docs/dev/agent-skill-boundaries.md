@@ -247,9 +247,17 @@ SKILL_RUNTIME_COMMAND_POLICY_V2:
       allowed_write_roots:
         - .claude/artifacts/issue-refinement-loop/{active_issue}/
       network_effect: github_read_only
+    preflight.run.with_anchor:
+      execution_class: exact_skill_runtime_anchor
+      required_cwd: canonical_main_root
+      required_branch: default_branch
+      allowed_write_roots:
+        - .claude/artifacts/issue-refinement-loop/{active_issue}/
+      network_effect: github_read_only
 ```
 
 - root checkout から許可される command class は `uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number <active> --repo squne121/loop-protocol` の exact form のみ
+- Issue #1498 で `preflight.run.with_anchor`（sibling exact profile）を追加した。`preflight.run` の argv / placeholders / execution_class / timeout は一切変更していない。`preflight.run.with_anchor` は末尾に `--anchor-comment-url <canonical GitHub issue comment URL>` を持つ 12-token exact form のみを受理し、URL は `https://github.com/<owner>/<repo>/issues/<N>#issuecomment-<M>` の canonical shape（percent-encoding・query・userinfo・port・非 GitHub host・`/pull/` パス・`discussion_r` fragment を拒否）に限定され、URL 内の owner/repo/issue 番号は CLI の `--repo` / `--issue-number` に context-binding される
 - `mutation: false`、`cwd_policy: repo_root`、registry 登録済みであること自体は認可根拠に使わない
 - `preflight.run` の root no-worktree profile では issue source は exact argv の `--issue-number` とし、active issue worktree と `LOOP_ISSUE_NUMBER` は不要
 - `preflight.run` 以外の privileged command は従来どおり active issue worktree が `git worktree list --porcelain -z` catalog で一意に解決できる entry のみを許可し、`.claude/worktrees/issue-<N>-*` の stale directory prefix match を認可根拠に使わない

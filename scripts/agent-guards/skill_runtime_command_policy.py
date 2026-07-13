@@ -37,6 +37,27 @@ _OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 SKILL_RUNTIME_EXECUTION_CLASS_FIXTURE = "exact_skill_runtime_fixture"
 
+# Issue #1498: sibling exact profile for anchor-comment-scoped preflight runs.
+# `preflight.run` itself (argv / placeholders / execution_class / timeout) is
+# entirely unmodified by this addition -- this is a new, independent
+# eligible_command_ids entry, not a generalization of the existing one.
+SKILL_RUNTIME_EXECUTION_CLASS_ANCHOR = "exact_skill_runtime_anchor"
+
+# Canonical GitHub issue comment URL shape used both for the registry
+# placeholder type (`.claude/skills/issue-refinement-loop/scripts/
+# command_registry.py`) and for this module's own context-binding check.
+# Character classes deliberately exclude "%" so any percent-encoded disguise
+# attempt (Issue #1498 Matrix #14) is rejected by construction -- no
+# separate decode-and-recheck step is required because the class itself
+# cannot match a "%" byte anywhere in owner/repo/issue/comment.
+_GH_ISSUE_COMMENT_URL_RE = re.compile(
+    r"^https://github\.com/"
+    r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})?)/"
+    r"(?P<repo>[A-Za-z0-9_.-]+)/"
+    r"issues/(?P<issue>[1-9][0-9]*)"
+    r"#issuecomment-(?P<comment>[1-9][0-9]*)$"
+)
+
 SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
     "schema": SKILL_RUNTIME_COMMAND_POLICY_SCHEMA,
     "eligible_command_ids": {
@@ -64,10 +85,24 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
             ],
             "network_effect": "local_only",
         },
+        # Issue #1498: sibling exact profile — anchor-comment-scoped preflight
+        # run through the same privileged executor. `preflight.run` above is
+        # entirely unmodified.
+        "preflight.run.with_anchor": {
+            "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_ANCHOR,
+            "required_cwd": "canonical_main_root",
+            "required_branch": "default_branch",
+            "allowed_write_roots": [
+                ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            ],
+            "network_effect": "github_read_only",
+        },
     },
 }
 
-ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS = frozenset({"preflight.run", "preflight.run.fixture"})
+ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS = frozenset(
+    {"preflight.run", "preflight.run.fixture", "preflight.run.with_anchor"}
+)
 _ROOT_NO_WORKTREE_POLICY_INVARIANTS: dict[str, dict[str, Any]] = {
     "preflight.run": {
         "execution_class": SKILL_RUNTIME_EXECUTION_CLASS,
@@ -87,6 +122,15 @@ _ROOT_NO_WORKTREE_POLICY_INVARIANTS: dict[str, dict[str, Any]] = {
             ".claude/artifacts/issue-refinement-loop/{active_issue}/",
         ],
     },
+    "preflight.run.with_anchor": {
+        "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_ANCHOR,
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "network_effect": "github_read_only",
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+        ],
+    },
 }
 
 
@@ -97,6 +141,7 @@ class ExactSkillRuntimeCommand:
     repo: str
     argv: tuple[str, ...]
     fixture: str = ""
+    anchor_comment_url: str = ""
 
 
 def command_allows_root_no_worktree(parsed: ExactSkillRuntimeCommand) -> bool:
@@ -255,7 +300,16 @@ def parse_exact_skill_runtime_command(command: str, project_root: str | None = N
         return None
     if repo != TRUSTED_REPO_SLUG:
         return None
-    if command_id not in SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"]:
+    policy = SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"].get(command_id)
+    if policy is None:
+        return None
+    # This parser's argv contract is exactly 10 tokens with no --fixture /
+    # --anchor-comment-url suffix. Only command ids whose policy execution
+    # class matches that plain shape may match here -- sibling profiles that
+    # require additional trailing tokens (preflight.run.fixture,
+    # preflight.run.with_anchor) have their own dedicated parsers and must
+    # never be reachable through this 10-token shape with a missing suffix.
+    if policy.get("execution_class") != SKILL_RUNTIME_EXECUTION_CLASS:
         return None
     return ExactSkillRuntimeCommand(
         command_id=command_id,
@@ -407,6 +461,106 @@ def is_exact_skill_runtime_fixture_executor_command(
     return True
 
 
+def parse_exact_skill_runtime_anchor_command(
+    command: str, project_root: str | None = None
+) -> ExactSkillRuntimeCommand | None:
+    """Exact-match parser for the `preflight.run.with_anchor` command class
+    (Issue #1498).
+
+    Mirrors `parse_exact_skill_runtime_command` token-for-token, with two
+    additional trailing tokens (`--anchor-comment-url <canonical-url>`) and
+    strict canonical-shape + context-binding rejection. Production
+    `preflight.run`'s 10-token exact match is entirely unmodified and
+    unaffected -- this is a separate, independent parser.
+    """
+    root = os.path.realpath(project_root or resolve_project_root())
+    if not command or _METACHAR_RE.search(command) or _LEADING_ENV_RE.match(command):
+        return None
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    if len(tokens) != 12:
+        return None
+    if tokens[:4] != ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL]:
+        return None
+    if os.path.islink(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
+        return None
+    expected_script = os.path.realpath(os.path.join(root, SKILL_RUNTIME_EXEC_REL))
+    if os.path.realpath(os.path.join(root, tokens[3])) != expected_script:
+        return None
+    expected_flags = ["--command-id", "--issue-number", "--repo", "--anchor-comment-url"]
+    expected_positions = [4, 6, 8, 10]
+    for flag, pos in zip(expected_flags, expected_positions):
+        if tokens[pos] != flag:
+            return None
+    if any(
+        tok.startswith("--command-id=")
+        or tok.startswith("--issue-number=")
+        or tok.startswith("--repo=")
+        or tok.startswith("--anchor-comment-url=")
+        for tok in tokens
+    ):
+        return None
+    command_id = tokens[5]
+    issue_number = tokens[7]
+    repo = tokens[9]
+    anchor_comment_url = tokens[11]
+    if command_id != "preflight.run.with_anchor":
+        return None
+    if not issue_number.isdigit() or int(issue_number) <= 0:
+        return None
+    if repo != TRUSTED_REPO_SLUG:
+        return None
+    if command_id not in SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"]:
+        return None
+    match = _GH_ISSUE_COMMENT_URL_RE.fullmatch(anchor_comment_url)
+    if match is None:
+        return None
+    # Context-binding: URL owner/repo and issue number must match the CLI
+    # --repo / --issue-number arguments exactly (Issue #1498 Matrix #22).
+    url_repo_slug = f"{match.group('owner')}/{match.group('repo')}"
+    if url_repo_slug != repo:
+        return None
+    if match.group("issue") != issue_number:
+        return None
+    return ExactSkillRuntimeCommand(
+        command_id=command_id,
+        issue_number=issue_number,
+        repo=repo,
+        argv=tuple(tokens),
+        anchor_comment_url=anchor_comment_url,
+    )
+
+
+def is_exact_skill_runtime_anchor_executor_command(
+    command: str, cwd: str, project_root: str, deadline: Deadline | None = None
+) -> bool:
+    """Same trusted-repo / default-branch / canonical-root / active-issue
+    safety boundary as `is_exact_skill_runtime_executor_command`, applied to
+    the `preflight.run.with_anchor` command class (Issue #1498)."""
+    parsed = parse_exact_skill_runtime_anchor_command(command, project_root)
+    if parsed is None:
+        return False
+    if os.path.realpath(cwd) != os.path.realpath(project_root):
+        return False
+    branch = current_branch(project_root, deadline)
+    default_branch = resolve_default_branch(project_root, deadline)
+    if not branch or branch != default_branch:
+        return False
+    repo_slug = resolve_repo_slug(project_root, deadline)
+    if repo_slug != parsed.repo:
+        return False
+    if command_allows_root_no_worktree(parsed):
+        return True
+    active_issue, entry = resolve_active_issue(project_root, cwd, deadline)
+    if active_issue != parsed.issue_number or entry is None:
+        return False
+    return True
+
+
 def looks_like_skill_runtime_executor_command(command: str) -> bool:
     return "skill_runtime_exec.py" in (command or "")
 
@@ -461,6 +615,18 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "--fixture",
         "{fixture}",
     ],
+    "preflight.run.with_anchor": [
+        "uv",
+        "run",
+        "python3",
+        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+        "--issue-number",
+        "{issue_number}",
+        "--repo",
+        "{repo}",
+        "--anchor-comment-url",
+        "{anchor_comment_url}",
+    ],
 }
 
 _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
@@ -472,6 +638,11 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
         "issue_number": {"type": "positive_int", "required": True},
         "repo": {"type": "owner_repo", "required": True},
         "fixture": {"type": "repo_relative_file", "required": True},
+    },
+    "preflight.run.with_anchor": {
+        "issue_number": {"type": "positive_int", "required": True},
+        "repo": {"type": "owner_repo", "required": True},
+        "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
     },
 }
 

@@ -1443,6 +1443,212 @@ class TestExactAllowlistClaude:
         assert resolve_repo_slug(str(tmp_git_repo)) == expected
 
 
+_ANCHOR_VALID_URL = "https://github.com/squne121/loop-protocol/issues/981#issuecomment-1"
+
+
+def _anchor_lmbg_command(
+    issue_number: str = "981",
+    repo: str = "squne121/loop-protocol",
+    url: str = _ANCHOR_VALID_URL,
+) -> str:
+    return (
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run.with_anchor "
+        f"--issue-number {issue_number} --repo {repo} --anchor-comment-url {url}"
+    )
+
+
+class TestExactAllowlistAnchorClaude:
+    """Issue #1498: `preflight.run.with_anchor` sibling exact profile (Claude flavor).
+
+    Covers AC5 (real hook: allow Matrix #2, deny Matrix #3-#22, no split-brain
+    with worktree_scope_guard) using local_main_branch_guard's own `evaluate()`.
+    """
+
+    def test_exact_allowlist_anchor_profile(self, tmp_linked_worktree: Path):
+        """Matrix #2: correct single anchor URL is allowed."""
+        repo_root = tmp_linked_worktree.parent.parent.parent
+        result = eval_in_local_root(
+            _anchor_lmbg_command(),
+            str(repo_root),
+            env_override={"LOOP_ISSUE_NUMBER": "981"},
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_SKILL_RUNTIME_EXECUTOR
+
+    def test_exact_allowlist_anchor_profile_without_issue_env_or_worktree(self, tmp_git_repo: Path):
+        """preflight.run.with_anchor is root-no-worktree eligible."""
+        result = eval_in_local_root(_anchor_lmbg_command(), str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_SKILL_RUNTIME_EXECUTOR
+
+    def test_anchor_on_preflight_run_is_denied(self, tmp_git_repo: Path):
+        """Matrix #4: preflight.run (production, unmodified) rejects an anchor flag."""
+        command = (
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run --issue-number 981 "
+            "--repo squne121/loop-protocol --anchor-comment-url " + _ANCHOR_VALID_URL
+        )
+        result = eval_in_local_root(command, str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    @pytest.mark.parametrize(
+        ("name", "command"),
+        [
+            (
+                "missing_anchor_flag",
+                "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+                "--command-id preflight.run.with_anchor --issue-number 981 "
+                "--repo squne121/loop-protocol",
+            ),
+            (
+                "duplicate_distinct_anchor_flags",
+                _anchor_lmbg_command()
+                + " --anchor-comment-url "
+                "https://github.com/squne121/loop-protocol/issues/981#issuecomment-2",
+            ),
+            (
+                "duplicate_identical_anchor_flags",
+                _anchor_lmbg_command() + " --anchor-comment-url " + _ANCHOR_VALID_URL,
+            ),
+            (
+                "different_repo_in_url",
+                "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+                "--command-id preflight.run.with_anchor --issue-number 981 "
+                "--repo squne121/loop-protocol --anchor-comment-url "
+                "https://github.com/other/repo/issues/981#issuecomment-1",
+            ),
+            (
+                "different_issue_in_url",
+                "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+                "--command-id preflight.run.with_anchor --issue-number 981 "
+                "--repo squne121/loop-protocol --anchor-comment-url "
+                "https://github.com/squne121/loop-protocol/issues/999#issuecomment-1",
+            ),
+            (
+                "pull_request_review_comment_url",
+                "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+                "--command-id preflight.run.with_anchor --issue-number 981 "
+                "--repo squne121/loop-protocol --anchor-comment-url "
+                "https://github.com/squne121/loop-protocol/pull/981/files#r1",
+            ),
+            (
+                "discussion_r_fragment",
+                "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+                "--command-id preflight.run.with_anchor --issue-number 981 "
+                "--repo squne121/loop-protocol --anchor-comment-url "
+                "https://github.com/squne121/loop-protocol/issues/981#discussion_r1",
+            ),
+            (
+                "query_string",
+                "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+                "--command-id preflight.run.with_anchor --issue-number 981 "
+                "--repo squne121/loop-protocol --anchor-comment-url "
+                "https://github.com/squne121/loop-protocol/issues/981?tab=1#issuecomment-1",
+            ),
+            (
+                "trailing_slash",
+                "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+                "--command-id preflight.run.with_anchor --issue-number 981 "
+                "--repo squne121/loop-protocol --anchor-comment-url "
+                "https://github.com/squne121/loop-protocol/issues/981#issuecomment-1/",
+            ),
+            (
+                "userinfo",
+                "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+                "--command-id preflight.run.with_anchor --issue-number 981 "
+                "--repo squne121/loop-protocol --anchor-comment-url "
+                "https://user@github.com/squne121/loop-protocol/issues/981#issuecomment-1",
+            ),
+            (
+                "percent_encoded",
+                "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+                "--command-id preflight.run.with_anchor --issue-number 981 "
+                "--repo squne121/loop-protocol --anchor-comment-url "
+                "https://github.com/squne121/loop-protocol/issues/981%23issuecomment-1",
+            ),
+            (
+                "eq_form",
+                "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+                "--command-id preflight.run.with_anchor --issue-number 981 "
+                "--repo squne121/loop-protocol --anchor-comment-url=" + _ANCHOR_VALID_URL,
+            ),
+            (
+                "abbreviated_flag",
+                "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+                "--command-id preflight.run.with_anchor --issue-number 981 "
+                "--repo squne121/loop-protocol --anchor-comment-u " + _ANCHOR_VALID_URL,
+            ),
+            (
+                "flag_no_value",
+                "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+                "--command-id preflight.run.with_anchor --issue-number 981 "
+                "--repo squne121/loop-protocol --anchor-comment-url",
+            ),
+            (
+                "unknown_extra_flag",
+                _anchor_lmbg_command() + " --extra x",
+            ),
+            (
+                "flag_order_changed",
+                "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+                "--anchor-comment-url " + _ANCHOR_VALID_URL
+                + " --command-id preflight.run.with_anchor --issue-number 981 "
+                "--repo squne121/loop-protocol",
+            ),
+            (
+                "shell_metachar",
+                "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+                "--command-id preflight.run.with_anchor --issue-number 981 "
+                "--repo squne121/loop-protocol --anchor-comment-url "
+                + _ANCHOR_VALID_URL + ";rm -rf /",
+            ),
+        ],
+    )
+    def test_anchor_profile_negative_matrix(self, tmp_git_repo: Path, name: str, command: str):
+        result = eval_in_local_root(command, str(tmp_git_repo))
+        assert result["status"] == "block", f"{name}: expected block, got {result}"
+
+    def test_anchor_profile_no_split_brain_with_worktree_scope_guard(self, tmp_git_repo: Path):
+        """Matrix #23: this guard's decision must agree with worktree_scope_guard's
+        decision for the same command (no split-brain)."""
+        import json as _json
+        import subprocess as _subprocess
+
+        wsg_sh = REPO_ROOT / ".claude" / "hooks" / "worktree_scope_guard.sh"
+        commands = [
+            _anchor_lmbg_command(),
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run.with_anchor --issue-number 981 "
+            "--repo squne121/loop-protocol",
+        ]
+        for command in commands:
+            lmbg_result = eval_in_local_root(
+                command, str(tmp_git_repo), env_override={"LOOP_ISSUE_NUMBER": "981"}
+            )
+            payload = {
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+                "cwd": str(tmp_git_repo),
+            }
+            env = dict(os.environ)
+            env["CLAUDE_PROJECT_DIR"] = str(tmp_git_repo)
+            env["LOOP_ISSUE_NUMBER"] = "981"
+            wsg_result = _subprocess.run(
+                ["bash", str(wsg_sh)],
+                input=_json.dumps(payload),
+                text=True,
+                capture_output=True,
+                env=env,
+            )
+            wsg_allows = wsg_result.returncode == 0
+            lmbg_allows = lmbg_result["status"] == "allow"
+            assert lmbg_allows == wsg_allows, (
+                f"split-brain: local_main_branch_guard={lmbg_allows} "
+                f"worktree_scope_guard={wsg_allows} for {command!r}"
+            )
+
+
 class TestPythonpathStaleAndTmpWrapperClaude:
     """AC14: PYTHONPATH stale regression / /tmp wrapper fail-closed (Claude flavor)."""
 
