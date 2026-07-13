@@ -1409,3 +1409,37 @@ class TestReviewShadowAndRerunCanonicalization:
         _, out = run_summary_with_details(checks, {100: completed_run("failure"), 101: completed_run("success")})
         assert out["status"] == "failed"
         assert out["failed_checks"] == ["PR Body Japanese Check"]
+
+    def test_run_detail_head_does_not_erase_retrospective_skip_provenance(self):
+        """GIVEN an allowlisted retrospective skip WHEN detail is completed THEN it stays excluded."""
+        checks = [
+            {
+                "name": "PR Body Japanese Check",
+                "bucket": "pass",
+                "state": "SUCCESS",
+                "workflow": "Check Japanese Content",
+                "link": "https://github.com/owner/repo/actions/runs/201",
+                "event": "pull_request",
+                "startedAt": "2026-07-14T00:00:01Z",
+                "completedAt": "2026-07-14T00:00:01Z",
+            },
+            {
+                "name": "PR Review Japanese Check (retrospective)",
+                "bucket": "skipping",
+                "state": "SKIPPED",
+                "workflow": "Check Japanese Content",
+                "link": "https://github.com/owner/repo/actions/runs/202",
+                "event": "pull_request_review",
+                "startedAt": "2026-07-14T00:00:02Z",
+                "completedAt": "2026-07-14T00:00:02Z",
+            },
+        ]
+        runs = {201: completed_run("success"), 202: completed_run("skipped")}
+        exit_code, out = run_summary_with_details(checks, runs)
+        assert exit_code == EXIT_ALL_PASS
+        assert out["excluded_checks"] == ["PR Review Japanese Check (retrospective)"]
+        retrospective = next(
+            entry for entry in out["checks"]
+            if entry["name"] == "PR Review Japanese Check (retrospective)"
+        )
+        assert retrospective["head_sha"] is None

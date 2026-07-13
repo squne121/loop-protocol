@@ -282,14 +282,19 @@ def classify_check(check: dict, pr_head_sha: str) -> dict:
     return entry
 
 
+def _entry_run_head_sha(entry: dict) -> Optional[str]:
+    """Return the run-detail SHA without replacing producer provenance."""
+    return entry.get("_run_head_sha") or entry.get("head_sha")
+
+
 def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
     """
     check entry から verdict bucket を決定する。
     returns: "all_pass" | "failed" | "pending_or_queued" | "stale_head_sha" | "excluded"
     """
     # stale: head SHA mismatch
-    head_sha = entry.get("head_sha")
-    if head_sha and head_sha != pr_head_sha:
+    run_head_sha = _entry_run_head_sha(entry)
+    if run_head_sha and run_head_sha != pr_head_sha:
         return "stale_head_sha"
 
     bucket = entry.get("bucket")
@@ -300,7 +305,7 @@ def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
 
     # Allowlist exclusion: head_sha=None + conclusion=skipped + (workflow, name) in rules
     # These are conditional/retrospective checks that do not run on PR commits.
-    if head_sha is None and conclusion == "skipped":
+    if entry.get("head_sha") is None and conclusion == "skipped":
         if (workflow, name) in HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES:
             return "excluded"
 
@@ -385,7 +390,7 @@ def is_review_skipped_shadow(entry: dict, entries: list[dict], pr_head_sha: str)
         (peer.get("workflow"), peer.get("name")) == REVIEW_SHADOW_TUPLE
         and peer.get("event") == "pull_request"
         and peer.get("conclusion") == "success"
-        and peer.get("head_sha") == pr_head_sha
+        and _entry_run_head_sha(peer) == pr_head_sha
         and peer.get("run_detail_complete")
         for peer in entries
     )
@@ -410,7 +415,7 @@ def public_check_entry(entry: dict) -> dict:
     return {
         key: value
         for key, value in entry.items()
-        if key not in {"event", "run_detail_complete"}
+        if key not in {"event", "run_detail_complete", "_run_head_sha"}
     }
 
 
@@ -594,10 +599,11 @@ def main() -> int:
                     entry["conclusion"] = None
                     entry["status"] = "unknown"
             else:
-                # Update head_sha from run
+                # Keep run-detail SHA internal.  Producer `head_sha=None` is
+                # required provenance for the existing retrospective allowlist.
                 run_head = run_data.get("headSha")
                 if run_head:
-                    entry["head_sha"] = run_head
+                    entry["_run_head_sha"] = run_head
                 # Update conclusion if available
                 run_conclusion = run_data.get("conclusion")
                 if run_conclusion and entry["conclusion"] is None:
@@ -630,7 +636,7 @@ def main() -> int:
             and any(
                 entry.get("event") == "pull_request"
                 and entry.get("conclusion") == "success"
-                and entry.get("head_sha") == expected_head_sha
+                and _entry_run_head_sha(entry) == expected_head_sha
                 for entry in check_entries
             )
         )
