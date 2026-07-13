@@ -25,7 +25,6 @@ from skill_runtime_command_policy import (  # noqa: E402
     SKILL_RUNTIME_EXEC_REL,
     TRUSTED_REPO_SLUG,
     is_exact_skill_runtime_anchor_executor_command,
-    is_exact_skill_runtime_executor_command,
     parse_exact_skill_runtime_anchor_command,
     parse_exact_skill_runtime_command,
 )
@@ -250,7 +249,7 @@ def test_parse_exact_anchor_command_rejects_negative_matrix():
         f"--issue-number 981 --repo {TRUSTED_REPO_SLUG}",  # matrix #3
         f"uv run python3 {SKILL_RUNTIME_EXEC_REL} --command-id preflight.run "
         f"--issue-number 981 --repo {TRUSTED_REPO_SLUG} --anchor-comment-url {_VALID_URL}",  # matrix #4
-        _cmd() + f" --anchor-comment-url https://github.com/squne121/loop-protocol/issues/981#issuecomment-2",  # #5
+        _cmd() + " --anchor-comment-url https://github.com/squne121/loop-protocol/issues/981#issuecomment-2",  # #5
         _cmd() + f" --anchor-comment-url {_VALID_URL}",  # #6
         f"uv run python3 {SKILL_RUNTIME_EXEC_REL} --command-id preflight.run.with_anchor "
         f"--issue-number 981 --repo {TRUSTED_REPO_SLUG} --anchor-comment-url={_VALID_URL}",  # #15
