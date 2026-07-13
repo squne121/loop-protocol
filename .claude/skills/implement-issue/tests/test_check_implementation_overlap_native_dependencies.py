@@ -245,13 +245,22 @@ def test_given_both_directions_present_when_direction_and_repository_resolved_th
     assert refs == ("9449",)
 
 
-def test_given_cross_repository_dependency_when_direction_and_repository_resolved_then_excluded() -> None:
-    """repository 不一致の native dependency は同一 repository 制約により
-    除外される（別 repo の issue number を誤って解決しない）。
+def test_given_cross_repository_dependency_when_direction_and_repository_resolved_then_unresolved_fail_closed() -> None:
+    """repository 不一致の OPEN native dependency は同一 repository の Issue
+    番号へ誤結合せず、namespaced ref のまま unresolved として fail-closed にする。
     """
     raw = {"blockedBy": [_typed_record(number=9449, state="OPEN", repository="other-owner/other-repo")]}
     refs = _merge_dependency_refs("", raw, "blocked_by", current_repo=REPO)
-    assert refs == ()
+    assert refs == ("other-owner/other-repo#9449",)
+
+    # 同一 repository に同じ番号が存在しても cross-repository predecessor と
+    # 誤結合しない。scope を比較できない OPEN predecessor は human review を
+    # 要する unresolved dependency として evidence 化される。
+    scope_pool = {"9449": IssueScope(title="local", number=9449, state="OPEN", allowed_paths=("a.py",))}
+    result = _resolve_dependency(1462, ("a.py",), refs, scope_pool)
+    assert result["blocking"] is None
+    assert result["closed_predecessors"] == []
+    assert result["unresolved_refs"] == ["other-owner/other-repo#9449"]
 
 
 def test_given_duplicate_dependency_entries_when_direction_and_repository_resolved_then_deduplicated() -> None:
