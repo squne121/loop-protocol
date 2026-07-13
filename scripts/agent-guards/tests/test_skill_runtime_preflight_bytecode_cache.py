@@ -72,16 +72,35 @@ def test_given_invalid_source_when_building_proof_then_failure_is_recorded_witho
     assert not Path(importlib.util.cache_from_source(str(planner))).exists()
 
 
-def test_given_runtime_guard_source_when_static_policy_checked_then_cache_is_not_excluded() -> None:
-    """GIVEN the privileged runtime executor
-    WHEN its race-tolerant roots are inspected
-    THEN neither source cache paths nor the skill scripts directory is ignored."""
-    exec_source = (
-        REPO_ROOT / "scripts" / "agent-guards" / "skill_runtime_exec.py"
-    ).read_text(encoding="utf-8")
-    assert "__pycache__" not in exec_source
-    assert "*.pyc" not in exec_source
-    assert "issue-refinement-loop/scripts" not in exec_source
+def test_given_race_tolerant_predicate_when_checked_then_bytecode_cache_paths_are_not_excluded() -> None:
+    """AC14 (behavioral -- replaces the prior static source-text grep): drive
+    the real `_is_race_tolerant_unattributable_path` predicate (and its
+    backing `_RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS` root list) with
+    representative candidate paths and assert its actual classification
+    output, instead of grepping `skill_runtime_exec.py` source text for
+    forbidden substrings (a static check that would pass even if the
+    predicate's *behavior* silently ignored bytecode caches through an
+    indirect / computed path)."""
+    for declared_root in real_exec._RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS:
+        assert real_exec._is_race_tolerant_unattributable_path(declared_root) is True
+        assert real_exec._is_race_tolerant_unattributable_path(f"{declared_root}/leaf.txt") is True
+
+    non_race_tolerant_candidates = [
+        "scripts/agent-guards/skill_runtime_exec.py",
+        "scripts/agent-guards/__pycache__/skill_runtime_exec.cpython-312.pyc",
+        (
+            ".claude/skills/issue-refinement-loop/scripts/__pycache__/"
+            "run_refinement_preflight.cpython-312.pyc"
+        ),
+        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+        ".claude/skills/issue-refinement-loop/scripts",
+        # Prefix-lookalikes must NOT be treated as inside a declared root
+        # (component-boundary match only, not a raw string prefix match).
+        ".claude/artifacts/issue-refinement-loop-not-a-real-child/leaf.txt",
+        "artifacts/session-manifest-runtime-not-a-real-child/leaf.txt",
+    ]
+    for candidate in non_race_tolerant_candidates:
+        assert real_exec._is_race_tolerant_unattributable_path(candidate) is False, candidate
 
 
 # ---------------------------------------------------------------------------
@@ -278,11 +297,14 @@ def _install_real_preflight_fixture(repo_root: Path, *, negative_writer: str | N
 
     `command_registry.py`'s canonical `preflight.run` argv template is
     exact-match validated by `skill_runtime_command_policy.validate_registry_entry`
-    (a deliberate security control on the real, unmodifiable registry) and
-    therefore cannot be extended with a `--fixture` flag without editing a
-    file outside this Issue's Allowed Paths. Instead of relaxing that gate,
-    these tests invoke `run_refinement_preflight.py` directly while reusing
-    the *real* `skill_runtime_exec` detection primitives
+    (a deliberate security control on the real, unmodifiable registry).
+    Issue #1439 Scope Delta 2 adds a *sibling*, test-only command-id
+    (`preflight.run.fixture`) that legitimately extends the registry with a
+    `--fixture` placeholder without touching `preflight.run` at all --
+    `test_ac10_*` / `test_ac11_*` below drive that command-id through the
+    real `skill_runtime_exec.main()` entry point end to end. This helper is
+    still used directly (bypassing the executor) by the AC2/AC3 tests below,
+    reusing the *real* `skill_runtime_exec` detection primitives
     (`_sanitize_env`, `_snapshot_repo_paths`, `_git_status_paths`,
     `_find_unauthorized_repo_changes`) imported unmodified from
     `scripts/agent-guards/skill_runtime_exec.py`, so the actual production
@@ -322,6 +344,10 @@ def _install_real_preflight_fixture(repo_root: Path, *, negative_writer: str | N
         _cache_path_test.parent.mkdir(parents=True, exist_ok=True)
         _cache_path_test.parent.rmdir()
         _cache_path_test.parent.symlink_to("../", target_is_directory=True)
+    elif _writer_test == "replace-parent-file":
+        _cache_path_test.parent.mkdir(parents=True, exist_ok=True)
+        _cache_path_test.parent.rmdir()
+        _cache_path_test.parent.write_bytes(b"not-a-directory")
     elif _writer_test == "modify-existing":
         _cache_path_test.parent.mkdir(parents=True, exist_ok=True)
         _cache_path_test.write_bytes(b"before")
@@ -570,14 +596,17 @@ def test_ac4_real_preflight_explicit_or_bytes_cache_write_fails_closed(
     assert "__pycache__" in unauthorized_path
 
 
-@pytest.mark.parametrize("writer", ["replace-parent", "modify-existing"])
+@pytest.mark.parametrize(
+    "writer", ["replace-parent", "replace-parent-file", "modify-existing"]
+)
 def test_ac5_real_preflight_cache_parent_replace_or_mutation_fails_closed(
     tmp_path: Path, writer: str
 ) -> None:
     """AC5: when the real production `run_refinement_preflight.py` process
-    replaces its cache parent directory with a symlink, or mutates an
-    existing cache file's content/size, the real `skill_runtime_exec`
-    detection primitives must flag it as `unauthorized_write_path`."""
+    replaces its cache parent directory with a symlink, replaces it with a
+    plain (non-directory) file, or mutates an existing cache file's
+    content/size, the real `skill_runtime_exec` detection primitives must
+    flag it as `unauthorized_write_path`."""
     repo = _make_repo(tmp_path)
     fixture_input_path = _install_real_preflight_fixture(repo, negative_writer=writer)
     issue_number = str(_FIXTURE_ISSUE_NUMBER)
@@ -611,3 +640,276 @@ def test_ac5_real_preflight_cache_parent_replace_or_mutation_fails_closed(
         str(repo), issue_number, before_snapshot, before_status
     )
     assert unauthorized_path is not None
+
+
+# ---------------------------------------------------------------------------
+# AC10-AC13: Issue #1439 Scope Delta 2 -- real executor chain via the
+# test-only `preflight.run.fixture` command-id (skill_runtime_exec.main()
+# driven end to end, not bypassed).
+# ---------------------------------------------------------------------------
+
+_EXECUTOR_SCRIPT = AGENT_GUARDS_DIR / "skill_runtime_exec.py"
+
+_ENTRY_GUARD = 'if __name__ == "__main__":\n    main()\n'
+
+
+def _splice_pid_proof_harness(path: Path, marker: str, issue_number: int) -> None:
+    """Append a thin test-only harness *after* the real script's own
+    `if __name__ == "__main__": main()` guard (never replacing or editing
+    any of the real logic) that records this process's own pid/ppid and
+    effective bytecode flags to a JSON proof file under the issue's allowed
+    artifact root, just before `main()` runs (Issue #1439 AC10)."""
+    source = path.read_text(encoding="utf-8")
+    assert source.endswith(_ENTRY_GUARD), (
+        f"entry-point guard shape changed for {path}; update this test harness splice point"
+    )
+    harness = f"""
+    import json as _json_test
+    import os as _os_test
+    import sys as _sys_test
+    from pathlib import Path as _Path_test
+
+    _root_test = _Path_test(__file__).resolve().parents[4]
+    _proof_dir_test = (
+        _root_test / ".claude" / "artifacts" / "issue-refinement-loop" / "{issue_number}"
+    )
+    _proof_dir_test.mkdir(parents=True, exist_ok=True)
+    (_proof_dir_test / "pid_proof_{marker}.json").write_text(
+        _json_test.dumps(
+            {{
+                "marker": {marker!r},
+                "pid": _os_test.getpid(),
+                "ppid": _os_test.getppid(),
+                "dont_write_bytecode_flag": bool(_sys_test.flags.dont_write_bytecode),
+                "dont_write_bytecode_attr": bool(_sys_test.dont_write_bytecode),
+                "pythondontwritebytecode_env": _os_test.environ.get("PYTHONDONTWRITEBYTECODE"),
+            }}
+        ),
+        encoding="utf-8",
+    )
+"""
+    spliced = source[: -len(_ENTRY_GUARD)] + ('if __name__ == "__main__":\n' + harness + "    main()\n")
+    path.write_text(spliced, encoding="utf-8")
+
+
+def _install_real_preflight_fixture_with_pid_proof(repo_root: Path) -> Path:
+    fixture_input_path = _install_real_preflight_fixture(repo_root)
+    dest_scripts = repo_root / ".claude" / "skills" / "issue-refinement-loop" / "scripts"
+    _splice_pid_proof_harness(
+        dest_scripts / "run_refinement_preflight.py", "preflight", _FIXTURE_ISSUE_NUMBER
+    )
+    _splice_pid_proof_harness(
+        dest_scripts / "plan_refinement_loop.py", "planner", _FIXTURE_ISSUE_NUMBER
+    )
+    return fixture_input_path
+
+
+def _run_real_executor(
+    repo: Path,
+    fixture_relpath: str,
+    *,
+    command_id: str = "preflight.run.fixture",
+) -> subprocess.CompletedProcess[str]:
+    """Spawn the real `skill_runtime_exec.py` executor as a real subprocess
+    (not a direct call to `run_refinement_preflight.py`), driving the whole
+    real executor -> real preflight -> real planner chain end to end."""
+    outer_env = {**os.environ, "CLAUDE_PROJECT_DIR": str(repo)}
+    return subprocess.run(
+        [
+            sys.executable,
+            str(_EXECUTOR_SCRIPT),
+            "--command-id",
+            command_id,
+            "--issue-number",
+            str(_FIXTURE_ISSUE_NUMBER),
+            "--repo",
+            _FIXTURE_REPO_SLUG,
+            "--fixture",
+            fixture_relpath,
+        ],
+        cwd=str(repo),
+        env=outer_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_ac10_real_executor_chain_drives_real_preflight_and_planner_with_pid_proof(
+    tmp_path: Path,
+) -> None:
+    """AC10: drive the real executor -> real preflight -> real planner
+    subprocess chain through the canonical executor
+    `skill_runtime_exec.py --command-id preflight.run.fixture --issue-number
+    <n> --repo <repo> --fixture <path>`, recording each process's own
+    pid/ppid/effective bytecode flags as JSON proof, and require an explicit
+    success exit code (not `blocked` / `environment_failure`)."""
+    repo = _make_repo(tmp_path)
+    _install_real_preflight_fixture_with_pid_proof(repo)
+
+    result = _run_real_executor(repo, "preflight_fixture_input.json")
+    assert result.returncode in (0, 1), (result.stdout, result.stderr)
+
+    artifact_dir = repo / ".claude" / "artifacts" / "issue-refinement-loop" / str(_FIXTURE_ISSUE_NUMBER)
+    preflight_proof = json.loads((artifact_dir / "pid_proof_preflight.json").read_text(encoding="utf-8"))
+    planner_proof = json.loads((artifact_dir / "pid_proof_planner.json").read_text(encoding="utf-8"))
+    proof = {"preflight": preflight_proof, "planner": planner_proof}
+
+    # Real, distinct process identities for every level of the chain.
+    assert isinstance(preflight_proof["pid"], int)
+    assert isinstance(planner_proof["pid"], int)
+    assert preflight_proof["pid"] != planner_proof["pid"], proof
+
+    # Parent-child relationship evidence: the planner is spawned by a plain
+    # `subprocess.run([sys.executable, PLANNER_SCRIPT], ...)` call inside the
+    # real preflight process (no shell/uv indirection at that level), so its
+    # os.getppid() must equal the real preflight process's own pid.
+    assert planner_proof["ppid"] == preflight_proof["pid"], proof
+
+    # Effective bytecode flags at every level of the real chain.
+    for level_name, level in proof.items():
+        assert level["pythondontwritebytecode_env"] == "1", (level_name, proof)
+        assert level["dont_write_bytecode_flag"] is True, (level_name, proof)
+        assert level["dont_write_bytecode_attr"] is True, (level_name, proof)
+
+    assert list(repo.rglob("*.pyc")) == []
+    assert [p for p in repo.rglob("__pycache__") if p.is_dir()] == []
+
+
+@pytest.mark.parametrize(
+    "writer",
+    ["bytes", "compile", "replace-parent", "replace-parent-file", "modify-existing"],
+)
+def test_ac11_real_executor_negative_write_fails_closed_with_reason_code(
+    tmp_path: Path, writer: str
+) -> None:
+    """AC11: drive the AC4/AC5 adversarial bytecode-cache writes through the
+    real executor (`preflight.run.fixture`), and assert the real executor's
+    own exit code (2) and stderr `reason_code=unauthorized_write_path`
+    directly -- not just the lower-level detection primitives called
+    in-process (as AC4/AC5 above do)."""
+    repo = _make_repo(tmp_path)
+    fixture_input_path = _install_real_preflight_fixture(repo, negative_writer=writer)
+
+    if writer == "modify-existing":
+        cache_path = Path(
+            importlib.util.cache_from_source(
+                str(
+                    repo
+                    / ".claude"
+                    / "skills"
+                    / "issue-refinement-loop"
+                    / "scripts"
+                    / "run_refinement_preflight.py"
+                )
+            )
+        )
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(b"seed")
+
+    result = _run_real_executor(repo, fixture_input_path.name)
+
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    assert "reason_code=unauthorized_write_path" in result.stderr, result.stderr
+    assert "__pycache__" in result.stderr, result.stderr
+
+
+def test_ac12_persisted_provenance_artifact_contains_full_v2_proof(tmp_path: Path) -> None:
+    """AC12: read back the actually-persisted
+    `refinement_preflight_provenance_v1.json` artifact and assert it
+    contains the full `PY_SYNTAX_COMPILE_PROOF_V2` proof (schema_version +
+    all required fields), not just the collapsed `py_compile_status`
+    summary."""
+    repo = _make_repo(tmp_path)
+    fixture_input_path = _install_real_preflight_fixture(repo)
+    env = real_exec._sanitize_env(str(repo))
+
+    result = _run_real_preflight_child(repo, fixture_input_path, env)
+    assert result.returncode in (0, 1), result.stderr
+
+    provenance_path = (
+        repo
+        / ".claude"
+        / "artifacts"
+        / "issue-refinement-loop"
+        / str(_FIXTURE_ISSUE_NUMBER)
+        / "refinement_preflight_provenance_v1.json"
+    )
+    assert provenance_path.exists()
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+
+    proof = provenance.get("python_syntax_compile_proof")
+    assert proof is not None, provenance
+
+    required_v2_fields = {
+        "schema_version",
+        "operation_kind",
+        "source_mode",
+        "flags",
+        "dont_inherit",
+        "optimize",
+        "cache_write_expected",
+        "py_compile_status",
+        "python_version",
+        "python_executable",
+        "git_head_sha",
+        "planner_script_path",
+        "planner_script_realpath",
+        "planner_script_blob_sha",
+        "cwd",
+        "stderr_sha256",
+        "stderr_excerpt",
+    }
+    assert required_v2_fields.issubset(proof.keys()), proof
+    assert proof["schema_version"] == "PY_SYNTAX_COMPILE_PROOF_V2"
+    assert proof["operation_kind"] == "in_process_compile"
+    assert proof["source_mode"] == "bytes"
+    assert proof["flags"] == 0
+    assert proof["dont_inherit"] is True
+    assert proof["optimize"] == -1
+    assert proof["cache_write_expected"] is False
+    assert proof["py_compile_status"] == "pass"
+
+
+def test_ac13_child_subprocess_timeout_applies_registry_timeout_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC13: `skill_runtime_exec.py`'s own `subprocess.run` of the
+    registry-declared child command must apply the registry's
+    `timeout_seconds` and convert a `subprocess.TimeoutExpired` into a
+    fail-closed reason code, instead of hanging indefinitely or silently
+    ignoring the timeout."""
+    repo = _make_repo(tmp_path)
+    _install_real_preflight_fixture(repo)
+
+    captured: dict[str, object] = {}
+    real_subprocess_run = subprocess.run
+
+    def _selective_raising_run(argv, **kwargs):
+        if isinstance(argv, list) and any(
+            isinstance(tok, str) and tok.endswith("run_refinement_preflight.py") for tok in argv
+        ):
+            captured["argv"] = argv
+            captured["timeout"] = kwargs.get("timeout")
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
+        return real_subprocess_run(argv, **kwargs)
+
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(repo))
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(real_exec.subprocess, "run", _selective_raising_run)
+
+    exit_code = real_exec.main(
+        [
+            "--command-id",
+            "preflight.run.fixture",
+            "--issue-number",
+            str(_FIXTURE_ISSUE_NUMBER),
+            "--repo",
+            _FIXTURE_REPO_SLUG,
+            "--fixture",
+            "preflight_fixture_input.json",
+        ]
+    )
+
+    assert exit_code == 2
+    assert captured.get("timeout") == 120, captured  # registry's declared timeout_seconds

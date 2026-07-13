@@ -2464,6 +2464,12 @@ def build_provenance(
         "python_version": sys.version,
         "cwd": str(Path.cwd()),
         "py_compile_status": py_compile_proof["py_compile_status"],
+        # Issue #1439 AC12: persist the full PY_SYNTAX_COMPILE_PROOF_V2 proof
+        # (schema_version + all required fields), not just the collapsed
+        # py_compile_status summary above, so a later reader of the
+        # refinement_preflight_provenance_v1.json artifact can verify the
+        # full V2 semantics without re-deriving them.
+        "python_syntax_compile_proof": py_compile_proof,
         "wrapper_exit_code": wrapper_exit_code,
         "wrapper_status": wrapper_status,
         "blockers": list(blockers),

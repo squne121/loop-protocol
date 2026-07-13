@@ -22,6 +22,7 @@ from skill_runtime_command_policy import (
     command_allows_root_no_worktree,
     current_branch,
     is_exact_skill_runtime_executor_command,
+    is_exact_skill_runtime_fixture_executor_command,
     load_registry_entry,
     resolve_active_issue,
     resolve_default_branch,
@@ -587,34 +588,75 @@ def _emit_unauthorized_write_failure(issue_number: int, unauthorized_path: str) 
     return 2
 
 
+def _emit_timeout_failure(issue_number: int, timeout_seconds: object) -> int:
+    print(
+        "SKILL_RUNTIME_FAIL: "
+        f"reason_code=child_process_timeout target_issue={issue_number} "
+        f"timeout_seconds={timeout_seconds} "
+        "recovery=investigate_child_process_hang_or_increase_registry_timeout",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Privileged exact skill runtime executor")
     parser.add_argument("--command-id", required=True)
     parser.add_argument("--issue-number", required=True, type=int)
     parser.add_argument("--repo", required=True)
+    parser.add_argument("--fixture", required=False, default=None)
     args = parser.parse_args(argv)
 
     project_root = resolve_project_root()
     stale_entries = _normalize_and_validate_runtime_env(project_root)
     if stale_entries:
         return _emit_stale_runtime_failure(args.issue_number, stale_entries)
-    command_text = " ".join(
-        [
-            "uv",
-            "run",
-            "python3",
-            SKILL_RUNTIME_EXEC_REL,
-            "--command-id",
-            args.command_id,
-            "--issue-number",
-            str(args.issue_number),
-            "--repo",
-            args.repo,
-        ]
-    )
-    if not is_exact_skill_runtime_executor_command(command_text, project_root, project_root):
-        print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
-        return 2
+
+    is_fixture_command = args.command_id == "preflight.run.fixture"
+    if is_fixture_command:
+        if not args.fixture:
+            print("skill_runtime_exec: --fixture required for preflight.run.fixture", file=sys.stderr)
+            return 2
+        command_text = " ".join(
+            [
+                "uv",
+                "run",
+                "python3",
+                SKILL_RUNTIME_EXEC_REL,
+                "--command-id",
+                args.command_id,
+                "--issue-number",
+                str(args.issue_number),
+                "--repo",
+                args.repo,
+                "--fixture",
+                args.fixture,
+            ]
+        )
+        if not is_exact_skill_runtime_fixture_executor_command(command_text, project_root, project_root):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
+    else:
+        if args.fixture:
+            print("skill_runtime_exec: --fixture is only allowed for preflight.run.fixture", file=sys.stderr)
+            return 2
+        command_text = " ".join(
+            [
+                "uv",
+                "run",
+                "python3",
+                SKILL_RUNTIME_EXEC_REL,
+                "--command-id",
+                args.command_id,
+                "--issue-number",
+                str(args.issue_number),
+                "--repo",
+                args.repo,
+            ]
+        )
+        if not is_exact_skill_runtime_executor_command(command_text, project_root, project_root):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
 
     _validate_runtime_context(project_root, args)
     before_snapshot = _snapshot_repo_paths(project_root, str(args.issue_number))
@@ -646,21 +688,26 @@ def main(argv: list[str] | None = None) -> int:
     render_command = getattr(module, "render_command", None)
     if not callable(render_command):
         raise RuntimeError("render_command_missing")
-    child_argv = render_command(
-        args.command_id,
-        {"issue_number": args.issue_number, "repo": args.repo},
-    )
+    render_params: dict[str, object] = {"issue_number": args.issue_number, "repo": args.repo}
+    if is_fixture_command:
+        render_params["fixture"] = args.fixture
+    child_argv = render_command(args.command_id, render_params)
     child_argv = _resolve_child_argv(child_argv)
 
-    result = subprocess.run(
-        child_argv,
-        cwd=project_root,
-        env=_sanitize_env(project_root),
-        capture_output=True,
-        text=True,
-        shell=False,
-        check=False,
-    )
+    timeout_seconds = entry.get("timeout_seconds")
+    try:
+        result = subprocess.run(
+            child_argv,
+            cwd=project_root,
+            env=_sanitize_env(project_root),
+            capture_output=True,
+            text=True,
+            shell=False,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return _emit_timeout_failure(args.issue_number, timeout_seconds)
 
     unauthorized_path = _find_unauthorized_repo_changes(
         project_root,

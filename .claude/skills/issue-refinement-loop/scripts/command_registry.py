@@ -129,6 +129,40 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "repo": {"type": "owner_repo", "required": True},
         },
     },
+    # Issue #1439 Scope Delta 2: test-only command-id driving the real
+    # executor -> real preflight -> real planner subprocess chain offline
+    # (via --fixture, which bypasses the `gh` CLI). Production `preflight.run`
+    # above is entirely unmodified -- this is a sibling entry, not a
+    # generalization of it. Same trusted repo slug / default branch /
+    # canonical root safety boundary applies (see
+    # skill_runtime_command_policy.py / skill_runtime_exec.py).
+    "preflight.run.fixture": {
+        "id": "preflight.run.fixture",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--fixture", "{fixture}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_skill_runtime_fixture",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        "network_effect": "local_only",
+        "stdin_contract": "none",
+        "stdout_contract": "refinement_preflight_result/v1",
+        "timeout_seconds": 120,
+        "mutation": False,
+        "test_only": True,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "fixture": {"type": "repo_relative_file", "required": True},
+        },
+    },
     "plan.run": {
         "id": "plan.run",
         "argv": [
