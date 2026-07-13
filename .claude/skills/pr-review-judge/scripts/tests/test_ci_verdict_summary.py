@@ -1339,7 +1339,10 @@ class TestReviewShadowAndRerunCanonicalization:
 
     def _peer_and_shadow(self, event: str = "pull_request_review") -> tuple[list[dict], dict[int, dict]]:
         checks = [
-            provenance_check(101, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:01Z"),
+            provenance_check(
+                101, bucket="pass", state="SUCCESS", event="pull_request",
+                completed_at="2026-07-14T00:00:01Z",
+            ),
             provenance_check(102, bucket="skipping", state="SKIPPED", event=event, completed_at="2026-07-14T00:00:02Z"),
         ]
         return checks, {101: completed_run("success"), 102: completed_run("skipped")}
@@ -1384,7 +1387,13 @@ class TestReviewShadowAndRerunCanonicalization:
 
     def test_true_rerun_uses_latest_same_event_without_removing_cross_event_shadow(self):
         checks, runs = self._peer_and_shadow()
-        checks.insert(0, provenance_check(100, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:00Z"))
+        checks.insert(
+            0,
+            provenance_check(
+                100, bucket="fail", state="FAILURE", event="pull_request",
+                completed_at="2026-07-14T00:00:00Z",
+            ),
+        )
         runs[100] = completed_run("failure")
         exit_code, out = run_summary_with_details(checks, runs, "PR Body Japanese Check")
         assert exit_code == EXIT_ALL_PASS
