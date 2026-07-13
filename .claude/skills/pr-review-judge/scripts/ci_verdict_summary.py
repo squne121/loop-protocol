@@ -335,8 +335,8 @@ def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
     returns: "all_pass" | "failed" | "pending_or_queued" | "stale_head_sha" | "excluded"
     """
     # stale: head SHA mismatch
-    head_sha = _entry_run_head_sha(entry)
-    if head_sha and head_sha != pr_head_sha:
+    run_head_sha = _entry_run_head_sha(entry)
+    if run_head_sha and run_head_sha != pr_head_sha:
         return "stale_head_sha"
 
     bucket = entry.get("bucket")
@@ -345,9 +345,11 @@ def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
     name = entry.get("name") or ""
     workflow = entry.get("workflow") or ""
 
-    # Allowlist exclusion: head_sha=None + conclusion=skipped + (workflow, name) in rules
-    # These are conditional/retrospective checks that do not run on PR commits.
-    if head_sha is None and conclusion == "skipped":
+    # Allowlist exclusion is bound to producer provenance, not the internal
+    # run-detail SHA used for duplicate current-head selection.  Retrospective
+    # checks report head_sha=None even when their run belongs to the PR head.
+    producer_head_sha = entry.get("head_sha")
+    if producer_head_sha is None and conclusion == "skipped":
         if (workflow, name) in HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES:
             return "excluded"
 

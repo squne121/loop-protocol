@@ -1024,6 +1024,70 @@ class TestCurrentHeadDuplicateSelection:
         assert out["status"] == "failed"
         assert out["failed_checks"] == ["PR Body Japanese Check"]
 
+    def test_main_path_excludes_retrospective_skipped_checks_without_masking_pr_body_success(self):
+        """Retrospective producer-null checks stay excluded after run-head selection."""
+        retrospective_names = [
+            "Issue Body Japanese Check (retrospective)",
+            "Issue Comment Japanese Check (retrospective)",
+            "PR Review Japanese Check (retrospective)",
+        ]
+        checks = [
+            {
+                "name": "PR Body Japanese Check", "bucket": "pass", "state": "SUCCESS",
+                "workflow": "Check Japanese Content", "event": "pull_request",
+                "link": "https://github.com/owner/repo/actions/runs/2001",
+                "startedAt": None, "completedAt": "2026-07-14T00:00:00Z",
+            },
+            {
+                "name": "PR Body Japanese Check", "bucket": "skipping", "state": "SKIPPED",
+                "workflow": "Check Japanese Content", "event": "pull_request_review",
+                "link": "https://github.com/owner/repo/actions/runs/2002",
+                "startedAt": None, "completedAt": "2026-07-14T00:01:00Z",
+            },
+        ]
+        runs = {
+            2001: self._run(2001, "success"),
+            2002: self._run(2002, "skipped"),
+        }
+        for offset, name in enumerate(retrospective_names, start=3):
+            run_id = 2000 + offset
+            checks.append({
+                "name": name, "bucket": "skipping", "state": "SKIPPED",
+                "workflow": "Check Japanese Content", "event": "pull_request_review",
+                "link": f"https://github.com/owner/repo/actions/runs/{run_id}",
+                "startedAt": None, "completedAt": "2026-07-14T00:02:00Z",
+            })
+            runs[run_id] = self._run(run_id, "skipped")
+
+        exit_code, out = self._run_summary(checks, runs)
+        assert exit_code == EXIT_ALL_PASS
+        assert out["status"] == "all_pass"
+        assert out["failed_checks"] == []
+        assert out["excluded_checks"] == retrospective_names
+
+    def test_producer_null_allowlist_stays_excluded_but_required_skipped_stays_failed(self):
+        """Internal current run SHA never replaces producer-null allowlist provenance."""
+        retrospective = {
+            "head_sha": None,
+            "_run_head_sha": HEAD_SHA,
+            "conclusion": "skipped",
+            "name": "Issue Body Japanese Check (retrospective)",
+            "workflow": "Check Japanese Content",
+            "bucket": "skipping",
+            "status": "completed",
+        }
+        required = {
+            "head_sha": None,
+            "_run_head_sha": HEAD_SHA,
+            "conclusion": "skipped",
+            "name": "PR Body Japanese Check",
+            "workflow": "Check Japanese Content",
+            "bucket": "skipping",
+            "status": "completed",
+        }
+        assert determine_check_verdict(retrospective, HEAD_SHA) == "excluded"
+        assert determine_check_verdict(required, HEAD_SHA) == "failed"
+
 
 # ---------------------------------------------------------------------------
 # B3: find_failed_job_id テスト
