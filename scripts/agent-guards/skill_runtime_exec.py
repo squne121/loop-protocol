@@ -21,6 +21,7 @@ from skill_runtime_command_policy import (
     ExactSkillRuntimeCommand,
     command_allows_root_no_worktree,
     current_branch,
+    is_exact_skill_runtime_anchor_executor_command,
     is_exact_skill_runtime_executor_command,
     is_exact_skill_runtime_fixture_executor_command,
     load_registry_entry,
@@ -600,11 +601,14 @@ def _emit_timeout_failure(issue_number: int, timeout_seconds: object) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Privileged exact skill runtime executor")
+    parser = argparse.ArgumentParser(
+        description="Privileged exact skill runtime executor", allow_abbrev=False
+    )
     parser.add_argument("--command-id", required=True)
     parser.add_argument("--issue-number", required=True, type=int)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--fixture", required=False, default=None)
+    parser.add_argument("--anchor-comment-url", required=False, default=None)
     args = parser.parse_args(argv)
 
     project_root = resolve_project_root()
@@ -613,9 +617,16 @@ def main(argv: list[str] | None = None) -> int:
         return _emit_stale_runtime_failure(args.issue_number, stale_entries)
 
     is_fixture_command = args.command_id == "preflight.run.fixture"
+    is_anchor_command = args.command_id == "preflight.run.with_anchor"
     if is_fixture_command:
         if not args.fixture:
             print("skill_runtime_exec: --fixture required for preflight.run.fixture", file=sys.stderr)
+            return 2
+        if args.anchor_comment_url:
+            print(
+                "skill_runtime_exec: --anchor-comment-url is not allowed for preflight.run.fixture",
+                file=sys.stderr,
+            )
             return 2
         command_text = " ".join(
             [
@@ -636,9 +647,48 @@ def main(argv: list[str] | None = None) -> int:
         if not is_exact_skill_runtime_fixture_executor_command(command_text, project_root, project_root):
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
+    elif is_anchor_command:
+        if args.fixture:
+            print(
+                "skill_runtime_exec: --fixture is not allowed for preflight.run.with_anchor",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.anchor_comment_url:
+            print(
+                "skill_runtime_exec: --anchor-comment-url required for preflight.run.with_anchor",
+                file=sys.stderr,
+            )
+            return 2
+        command_text = " ".join(
+            [
+                "uv",
+                "run",
+                "python3",
+                SKILL_RUNTIME_EXEC_REL,
+                "--command-id",
+                args.command_id,
+                "--issue-number",
+                str(args.issue_number),
+                "--repo",
+                args.repo,
+                "--anchor-comment-url",
+                args.anchor_comment_url,
+            ]
+        )
+        if not is_exact_skill_runtime_anchor_executor_command(command_text, project_root, project_root):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
     else:
         if args.fixture:
             print("skill_runtime_exec: --fixture is only allowed for preflight.run.fixture", file=sys.stderr)
+            return 2
+        if args.anchor_comment_url:
+            print(
+                "skill_runtime_exec: --anchor-comment-url is only allowed for "
+                "preflight.run.with_anchor",
+                file=sys.stderr,
+            )
             return 2
         command_text = " ".join(
             [
@@ -691,6 +741,8 @@ def main(argv: list[str] | None = None) -> int:
     render_params: dict[str, object] = {"issue_number": args.issue_number, "repo": args.repo}
     if is_fixture_command:
         render_params["fixture"] = args.fixture
+    if is_anchor_command:
+        render_params["anchor_comment_url"] = args.anchor_comment_url
     child_argv = render_command(args.command_id, render_params)
     child_argv = _resolve_child_argv(child_argv)
 

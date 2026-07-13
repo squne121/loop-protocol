@@ -861,6 +861,197 @@ class TestExactAllowlist:
         assert resolve_repo_slug(str(tmp_git_repo)) == expected
 
 
+_ANCHOR_VALID_URL = "https://github.com/squne121/loop-protocol/issues/981#issuecomment-1"
+
+
+def _anchor_command(
+    issue_number: str = "981",
+    repo: str = "squne121/loop-protocol",
+    url: str = _ANCHOR_VALID_URL,
+) -> str:
+    return (
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run.with_anchor "
+        f"--issue-number {issue_number} --repo {repo} --anchor-comment-url {url}"
+    )
+
+
+_ANCHOR_NEGATIVE_MATRIX: list[tuple[str, str]] = [
+    (
+        "missing_anchor_flag",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run.with_anchor --issue-number 981 "
+        "--repo squne121/loop-protocol",
+    ),
+    (
+        "anchor_on_preflight_run",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run --issue-number 981 "
+        "--repo squne121/loop-protocol --anchor-comment-url " + _ANCHOR_VALID_URL,
+    ),
+    (
+        "duplicate_distinct_anchor_flags",
+        _anchor_command()
+        + " --anchor-comment-url "
+        "https://github.com/squne121/loop-protocol/issues/981#issuecomment-2",
+    ),
+    (
+        "duplicate_identical_anchor_flags",
+        _anchor_command() + " --anchor-comment-url " + _ANCHOR_VALID_URL,
+    ),
+    (
+        "different_repo_in_url",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run.with_anchor --issue-number 981 "
+        "--repo squne121/loop-protocol --anchor-comment-url "
+        "https://github.com/other/repo/issues/981#issuecomment-1",
+    ),
+    (
+        "different_issue_in_url",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run.with_anchor --issue-number 981 "
+        "--repo squne121/loop-protocol --anchor-comment-url "
+        "https://github.com/squne121/loop-protocol/issues/999#issuecomment-1",
+    ),
+    (
+        "pull_request_review_comment_url",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run.with_anchor --issue-number 981 "
+        "--repo squne121/loop-protocol --anchor-comment-url "
+        "https://github.com/squne121/loop-protocol/pull/981/files#r1",
+    ),
+    (
+        "discussion_r_fragment",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run.with_anchor --issue-number 981 "
+        "--repo squne121/loop-protocol --anchor-comment-url "
+        "https://github.com/squne121/loop-protocol/issues/981#discussion_r1",
+    ),
+    (
+        "query_string",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run.with_anchor --issue-number 981 "
+        "--repo squne121/loop-protocol --anchor-comment-url "
+        "https://github.com/squne121/loop-protocol/issues/981?tab=1#issuecomment-1",
+    ),
+    (
+        "trailing_slash",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run.with_anchor --issue-number 981 "
+        "--repo squne121/loop-protocol --anchor-comment-url "
+        "https://github.com/squne121/loop-protocol/issues/981#issuecomment-1/",
+    ),
+    (
+        "userinfo",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run.with_anchor --issue-number 981 "
+        "--repo squne121/loop-protocol --anchor-comment-url "
+        "https://user@github.com/squne121/loop-protocol/issues/981#issuecomment-1",
+    ),
+    (
+        "percent_encoded",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run.with_anchor --issue-number 981 "
+        "--repo squne121/loop-protocol --anchor-comment-url "
+        "https://github.com/squne121/loop-protocol/issues/981%23issuecomment-1",
+    ),
+    (
+        "eq_form",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run.with_anchor --issue-number 981 "
+        "--repo squne121/loop-protocol --anchor-comment-url=" + _ANCHOR_VALID_URL,
+    ),
+    (
+        "abbreviated_flag",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run.with_anchor --issue-number 981 "
+        "--repo squne121/loop-protocol --anchor-comment-u " + _ANCHOR_VALID_URL,
+    ),
+    (
+        "flag_no_value",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run.with_anchor --issue-number 981 "
+        "--repo squne121/loop-protocol --anchor-comment-url",
+    ),
+    (
+        "unknown_extra_flag",
+        _anchor_command() + " --extra x",
+    ),
+    (
+        "flag_order_changed",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--anchor-comment-url " + _ANCHOR_VALID_URL
+        + " --command-id preflight.run.with_anchor --issue-number 981 "
+        "--repo squne121/loop-protocol",
+    ),
+    (
+        "shell_metachar",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run.with_anchor --issue-number 981 "
+        "--repo squne121/loop-protocol --anchor-comment-url "
+        + _ANCHOR_VALID_URL + ";rm -rf /",
+    ),
+]
+
+
+class TestAnchorProfileCodexParity:
+    """Issue #1498 AC6: Claude/Codex parity for `preflight.run.with_anchor`
+    (Positive/Negative Test Matrix #24)."""
+
+    def test_exact_allowlist_anchor_profile_codex(self, tmp_git_repo: Path):
+        """Matrix #2: correct single anchor URL is allowed (Codex flavor)."""
+        result = eval_codex(
+            _anchor_command(),
+            str(tmp_git_repo),
+            env_override={"LOOP_ISSUE_NUMBER": "981"},
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_SKILL_RUNTIME_EXECUTOR
+
+    @pytest.mark.parametrize(("name", "command"), _ANCHOR_NEGATIVE_MATRIX)
+    def test_anchor_profile_negative_matrix_codex(self, tmp_git_repo: Path, name: str, command: str):
+        result = eval_codex(command, str(tmp_git_repo))
+        assert result["status"] == "block", f"{name}: expected block, got {result}"
+
+    @pytest.mark.parametrize(
+        "command",
+        [_anchor_command()] + [c for _, c in _ANCHOR_NEGATIVE_MATRIX],
+    )
+    def test_claude_codex_parity_anchor_profile(self, tmp_git_repo: Path, command: str):
+        """Matrix #24: Claude allow/Codex deny parity mismatch must not exist."""
+        claude_result = eval_codex(
+            command,
+            str(tmp_git_repo),
+            env_override={"LOOP_ISSUE_NUMBER": "981"},
+        )
+        # eval_codex always sets hook_flavor via the `event`/flavor default in
+        # evaluate(); call evaluate() directly for the two flavors so the
+        # only variable between the two calls is hook_flavor itself.
+        import os as _os
+
+        old = _os.environ.get("CLAUDE_PROJECT_DIR", "")
+        old_issue = _os.environ.get("LOOP_ISSUE_NUMBER")
+        try:
+            _os.environ["CLAUDE_PROJECT_DIR"] = str(tmp_git_repo)
+            _os.environ["LOOP_ISSUE_NUMBER"] = "981"
+            claude_flavor_result = evaluate(command=command, cwd=str(tmp_git_repo), hook_flavor="claude")
+            codex_flavor_result = evaluate(command=command, cwd=str(tmp_git_repo), hook_flavor="codex")
+        finally:
+            if old:
+                _os.environ["CLAUDE_PROJECT_DIR"] = old
+            elif "CLAUDE_PROJECT_DIR" in _os.environ:
+                del _os.environ["CLAUDE_PROJECT_DIR"]
+            if old_issue is not None:
+                _os.environ["LOOP_ISSUE_NUMBER"] = old_issue
+            elif "LOOP_ISSUE_NUMBER" in _os.environ:
+                del _os.environ["LOOP_ISSUE_NUMBER"]
+        assert claude_flavor_result["status"] == codex_flavor_result["status"], (
+            f"parity mismatch for {command!r}: "
+            f"claude={claude_flavor_result['status']} codex={codex_flavor_result['status']}"
+        )
+        assert claude_result["status"] == claude_flavor_result["status"]
+
+
 class TestPythonpathStaleAndTmpWrapper:
     """AC14: PYTHONPATH stale regression / /tmp wrapper fail-closed."""
 

@@ -40,6 +40,7 @@ if str(_AGENT_GUARDS_DIR) not in sys.path:
 
 from skill_runtime_command_policy import (  # noqa: E402
     SKILL_RUNTIME_REASON_CODE,
+    is_exact_skill_runtime_anchor_executor_command,
     is_exact_skill_runtime_executor_command,
     looks_like_skill_runtime_executor_command,
 )
@@ -1876,6 +1877,22 @@ def evaluate(
             local_parser_stage="skill_runtime_exec",
             local_command_kind=COMMAND_KIND_UNKNOWN,
             local_rule_id="skill_runtime_executor",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
+        )
+    # Issue #1498: exact privileged skill runtime anchor command class
+    # (`preflight.run.with_anchor`). Must be checked before the
+    # `looks_like_skill_runtime_executor_command` block below, since that
+    # block matches ANY command mentioning `skill_runtime_exec.py`.
+    if project_root and is_exact_skill_runtime_anchor_executor_command(normalized_cmd, cwd, project_root):
+        return _emit(
+            status="allow",
+            reason_code=REASON_SKILL_RUNTIME_EXECUTOR,
+            target_branch=None,
+            target_branch_kind=None,
+            local_parser_stage="skill_runtime_exec_anchor",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="skill_runtime_executor_anchor",
             argv_tokens=argv_redacted,
             inner_tokens=inner_argv_redacted,
         )

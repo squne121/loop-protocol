@@ -6,6 +6,7 @@
       "Bash(pnpm test)",
       "Bash(pnpm build *)",
       "Bash(uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number * --repo squne121/loop-protocol)",
+      "Bash(uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run.with_anchor --issue-number * --repo squne121/loop-protocol --anchor-comment-url *)",
       "Bash(uv run --locked python3 .claude/skills/edit-issue/scripts/*.py *)",
       "Bash(uv run --locked python3 .claude/skills/post-merge-cleanup/scripts/*.py *)",
       "Bash(uv run --locked python3 .claude/skills/create-issue/scripts/*.py *)",
