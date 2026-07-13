@@ -118,6 +118,19 @@ uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/run_refinem
   [--anchor-comment-url <URL>]
 ```
 
+root checkout（canonical main root / default branch）から anchor comment を指定して preflight を実行する場合は、上記の直接 wrapper 呼び出しではなく、`preflight.run.with_anchor`（`preflight.run` の sibling exact profile、Issue #1498）を正規の privileged executor 経由で実行する。以下は exact command policy が要求する厳密な token 列（`--locked` を含まない）そのものであり、`uv run --locked` governance policy の対象ではない:
+
+<!-- policy-example --><!-- 以下は方針の例を示すコメントであり、実行対象のコマンド構文には影響しない -->
+```bash
+uv run python3 scripts/agent-guards/skill_runtime_exec.py \
+  --command-id preflight.run.with_anchor \
+  --issue-number <N> \
+  --repo <owner/repo> \
+  --anchor-comment-url <canonical GitHub issue comment URL>
+```
+
+`--anchor-comment-url` は `https://github.com/<owner>/<repo>/issues/<N>#issuecomment-<M>` の canonical shape のみを受け付け、`--issue-number` / `--repo` と URL 内の owner/repo/issue 番号が一致しない場合は拒否される（context-binding）。`preflight.run` 自体の argv / placeholders / execution_class はこの sibling profile の追加によって一切変更されない。
+
 wrapper の出力フィールドを確認する:
 
 **canonical stdout フィールド（機械可読）:**

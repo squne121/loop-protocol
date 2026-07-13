@@ -1,7 +1,7 @@
 name = "review-issue"
 description = "Issue の review と修正文案作成を担当する custom agent。承認がある場合のみ Issue body mutation に進む。"
-model = "gpt-5.4"
-model_reasoning_effort = "medium"
+model = "gpt-5.6-terra"
+model_reasoning_effort = "high"
 default_permissions = "loop-protocol-rtk"
 developer_instructions = """
 ROLE

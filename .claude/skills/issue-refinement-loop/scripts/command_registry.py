@@ -29,6 +29,7 @@ import re
 import shlex
 import sys
 from typing import Any
+from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
 # Registry schema version
@@ -161,6 +162,35 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "issue_number": {"type": "positive_int", "required": True},
             "repo": {"type": "owner_repo", "required": True},
             "fixture": {"type": "repo_relative_file", "required": True},
+        },
+    },
+    # Issue #1498: sibling exact profile — anchor-comment-scoped preflight
+    # run. `preflight.run` above is entirely unmodified by this addition;
+    # this is an independent registry entry, not a generalization of it.
+    "preflight.run.with_anchor": {
+        "id": "preflight.run.with_anchor",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--anchor-comment-url", "{anchor_comment_url}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_skill_runtime_anchor",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        "network_effect": "github_read_only",
+        "stdin_contract": "none",
+        "stdout_contract": "refinement_preflight_result/v1",
+        "timeout_seconds": 120,
+        "mutation": False,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
         },
     },
     "plan.run": {
@@ -324,6 +354,24 @@ _OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _HTTPS_URL_RE = re.compile(r"^https://")
 _VERDICT_VALUES: frozenset[str] = frozenset({"approve", "request_changes", "needs-fix"})
 
+# Issue #1498: canonical GitHub issue comment URL shape.
+#   https://github.com/{owner}/{repo}/issues/{digits}#issuecomment-{digits}
+# Character classes deliberately exclude "%" so any percent-encoded disguise
+# of the canonical shape (e.g. %2e%2e, encoded "#") is rejected by
+# construction -- the regex simply cannot match a "%" byte anywhere in
+# owner/repo/issue/comment, so no separate decode step is required to catch
+# it. Query strings, extra fragments/suffixes, trailing slashes, `/pull/`
+# paths, and `discussion_r...` fragments are all rejected because the
+# pattern is anchored end-to-end (fullmatch) with no room for extra
+# characters.
+_GH_ISSUE_COMMENT_URL_RE = re.compile(
+    r"^https://github\.com/"
+    r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})?)/"
+    r"(?P<repo>[A-Za-z0-9_.-]+)/"
+    r"issues/(?P<issue>[1-9][0-9]*)"
+    r"#issuecomment-(?P<comment>[1-9][0-9]*)$"
+)
+
 
 def _validate_placeholder_value(name: str, value: Any, spec: dict) -> None:
     """Validate a single placeholder value against its type spec.
@@ -394,6 +442,37 @@ def _validate_placeholder_value(name: str, value: Any, spec: dict) -> None:
             raise ValueError(
                 f"Placeholder '{name}': URL must start with https://, got {value!r}"
             )
+
+    elif ph_type == "github_issue_comment_url":
+        if not isinstance(value, str) or not value:
+            raise ValueError(
+                f"Placeholder '{name}': expected non-empty GitHub issue comment URL, got {value!r}"
+            )
+        if "%" in value:
+            raise ValueError(
+                f"Placeholder '{name}': percent-encoding not allowed in canonical "
+                f"GitHub issue comment URL, got {value!r}"
+            )
+        match = _GH_ISSUE_COMMENT_URL_RE.fullmatch(value)
+        if match is None:
+            raise ValueError(
+                f"Placeholder '{name}': must be a canonical "
+                f"https://github.com/<owner>/<repo>/issues/<N>#issuecomment-<M> URL, got {value!r}"
+            )
+        # Defense-in-depth cross-check with urlparse: the regex above already
+        # rejects userinfo/port/query by construction, but this makes the
+        # rejection explicit and independent of the regex implementation.
+        parsed = urlparse(value)
+        if parsed.scheme != "https":
+            raise ValueError(f"Placeholder '{name}': scheme must be https, got {value!r}")
+        if parsed.hostname != "github.com":
+            raise ValueError(f"Placeholder '{name}': host must be github.com, got {value!r}")
+        if parsed.username or parsed.password:
+            raise ValueError(f"Placeholder '{name}': userinfo not allowed, got {value!r}")
+        if parsed.port is not None:
+            raise ValueError(f"Placeholder '{name}': port not allowed, got {value!r}")
+        if parsed.query:
+            raise ValueError(f"Placeholder '{name}': query string not allowed, got {value!r}")
 
     elif ph_type == "verdict":
         if not isinstance(value, str) or value not in _VERDICT_VALUES:
