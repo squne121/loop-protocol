@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextvars
 import hashlib
 import json
 import os
@@ -4220,7 +4221,22 @@ def _run_delegation_core(
 # Only the outermost call -- depth == 1 -- emits a delegation_audit_v1
 # start/end pair; nested re-entrant calls see depth > 1 and skip audit
 # entirely, so each top-level invocation still produces exactly one pair.
-_AUDIT_REENTRANCY_DEPTH = 0
+#
+# Issue #1273 AC1: this is a contextvars.ContextVar rather than a plain
+# module-global int. A module-global int is shared mutable state across
+# every thread in the process -- concurrent fan-out worker threads calling
+# run_delegation() simultaneously would race on incrementing/decrementing
+# the same counter, corrupting the is_top_level_call determination (e.g. a
+# thread could see depth == 2 for what is actually its own top-level call
+# because a different thread incremented the shared counter first). A
+# ContextVar is thread-local (each thread gets its own copy on first
+# access within that thread, via the default) and is also correctly
+# propagated into asyncio tasks / concurrent.futures workers that copy the
+# context, so re-entrancy detection stays correct per logical call chain
+# regardless of how many other delegations run concurrently.
+_AUDIT_REENTRANCY_DEPTH_VAR: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "_AUDIT_REENTRANCY_DEPTH_VAR", default=0
+)
 
 
 def run_delegation(
@@ -4237,9 +4253,9 @@ def run_delegation(
     provider_auto_dispatch() re-enter this same function) are detected via a
     depth counter and do not each emit their own pair.
     """
-    global _AUDIT_REENTRANCY_DEPTH
-    _AUDIT_REENTRANCY_DEPTH += 1
-    is_top_level_call = _AUDIT_REENTRANCY_DEPTH == 1
+    depth = _AUDIT_REENTRANCY_DEPTH_VAR.get() + 1
+    _AUDIT_REENTRANCY_DEPTH_VAR.set(depth)
+    is_top_level_call = depth == 1
     audit_state: dict[str, Any] | None = None
     try:
         audit_state = _audit_begin(request) if is_top_level_call else None
@@ -4259,7 +4275,7 @@ def run_delegation(
             _audit_end(audit_state, request, unexpected_result)
         raise
     finally:
-        _AUDIT_REENTRANCY_DEPTH -= 1
+        _AUDIT_REENTRANCY_DEPTH_VAR.set(depth - 1)
 
 
 def _provider_auto_unsupported_profile_result(
