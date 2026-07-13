@@ -264,6 +264,9 @@ def classify_check(check: dict, pr_head_sha: str) -> dict:
     entry: dict[str, Any] = {
         "name": name,
         "workflow": workflow,
+        # event は cross-event shadow と同一 event の再実行を識別する内部 provenance。
+        # CI_VERDICT_SUMMARY_V1 の公開 checks schema には出力しない。
+        "event": check.get("event") or None,
         "state": state,
         "bucket": bucket,
         "status": status,
@@ -274,6 +277,7 @@ def classify_check(check: dict, pr_head_sha: str) -> dict:
         "details_url": link,
         "started_at": started_at,
         "completed_at": completed_at,
+        "run_detail_complete": False,
     }
     return entry
 
@@ -320,6 +324,94 @@ def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
 
     # null / unknown → treat as pending
     return "pending_or_queued"
+
+
+REVIEW_SHADOW_TUPLE = ("Check Japanese Content", "PR Body Japanese Check")
+REVIEW_SHADOW_EVENTS = frozenset({"pull_request_review", "pull_request_review_comment"})
+
+
+def _completed_timestamp(entry: dict) -> Optional[datetime]:
+    """completed_at、次に started_at を UTC timestamp として正規化する。"""
+    for field in ("completed_at", "started_at"):
+        raw = entry.get(field)
+        if not isinstance(raw, str) or not raw:
+            continue
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def canonicalize_true_reruns(entries: list[dict]) -> list[dict]:
+    """同一 (workflow, name, event) の完了済み再実行だけを最新 run に集約する。
+
+    event 不明、timestamp 不明/同値、または未完了 run が混在する場合は判断を
+    恣意化しないため、既存の fail-closed 分類を維持する。
+    """
+    groups: dict[tuple[str, str, str], list[dict]] = {}
+    for entry in entries:
+        workflow, name, event = entry.get("workflow"), entry.get("name"), entry.get("event")
+        if not all(isinstance(value, str) and value for value in (workflow, name, event)):
+            continue
+        groups.setdefault((workflow, name, event), []).append(entry)
+
+    superseded_ids: set[int] = set()
+    for group in groups.values():
+        if len(group) < 2 or any(entry.get("status") != "completed" for entry in group):
+            continue
+        dated = [(entry, _completed_timestamp(entry)) for entry in group]
+        if any(timestamp is None for _, timestamp in dated):
+            continue
+        timestamps = [timestamp for _, timestamp in dated]
+        if len(set(timestamps)) != len(timestamps):
+            continue
+        latest = max(dated, key=lambda item: item[1])[0]
+        superseded_ids.update(id(entry) for entry in group if entry is not latest)
+
+    return [entry for entry in entries if id(entry) not in superseded_ids]
+
+
+def is_review_skipped_shadow(entry: dict, entries: list[dict], pr_head_sha: str) -> bool:
+    """限定 review-event skipped shadow を current-head success peer により除外する。"""
+    if (entry.get("workflow"), entry.get("name")) != REVIEW_SHADOW_TUPLE:
+        return False
+    if entry.get("event") not in REVIEW_SHADOW_EVENTS:
+        return False
+    if entry.get("state") != "SKIPPED" or not entry.get("run_detail_complete"):
+        return False
+
+    return any(
+        (peer.get("workflow"), peer.get("name")) == REVIEW_SHADOW_TUPLE
+        and peer.get("event") == "pull_request"
+        and peer.get("conclusion") == "success"
+        and peer.get("head_sha") == pr_head_sha
+        and peer.get("run_detail_complete")
+        for peer in entries
+    )
+
+
+def precompute_verdicts(entries: list[dict], pr_head_sha: str) -> list[tuple[dict, str]]:
+    """detail 補完後の two-pass 集約。overall と各 bucket はこの結果だけを消費する。"""
+    canonical_entries = canonicalize_true_reruns(entries)
+    return [
+        (
+            entry,
+            "excluded"
+            if is_review_skipped_shadow(entry, canonical_entries, pr_head_sha)
+            else determine_check_verdict(entry, pr_head_sha),
+        )
+        for entry in canonical_entries
+    ]
+
+
+def public_check_entry(entry: dict) -> dict:
+    """V1 公開 schema へ内部 provenance を露出しない。"""
+    return {
+        key: value
+        for key, value in entry.items()
+        if key not in {"event", "run_detail_complete"}
+    }
 
 
 def compute_overall_status(verdicts: list[str]) -> str:
@@ -478,18 +570,11 @@ def main() -> int:
     if errors:
         verdicts.append("gh_error")
 
-    # B1: --check-name フィルタ: 0件 → gh_error、複数件 → gh_error
+    # B1: 0件は gh_error。複数件は event-aware canonicalization 後に判定する。
     if check_name_filter and raw_checks is not None:
         matched = [raw for raw in raw_checks if (raw.get("name") or "unknown") == check_name_filter]
         if len(matched) == 0:
             errors.append({"kind": "check_not_found", "detail": f"check-name not found: {check_name_filter}"})
-            verdicts.append("gh_error")
-            raw_checks = []
-        elif len(matched) > 1:
-            errors.append({(
-                "kind"
-            ): "ambiguous_check_name", "detail": f"check-name matched multiple checks: {check_name_filter}"})
-            verdicts.append("gh_error")
             raw_checks = []
         else:
             raw_checks = matched
@@ -497,18 +582,12 @@ def main() -> int:
     for raw in (raw_checks or []):
         entry = classify_check(raw, head_sha or expected_head_sha)
 
-        # 失敗・pending の場合、または expected_head_sha 指定時の pass check は run details を補完
+        # state/event/head provenance は全 run detail 補完後にのみ shadow 判定する。
         bucket = entry.get("bucket")
-        # B2: pass check で expected_head_sha が指定されている場合も補完して head SHA 確認
-        needs_details = (
-            bucket in ("fail", "pending", None)
-            or (bucket == "pass" and expected_head_sha is not None)
-        )
-        if needs_details and entry["run_id"] is not None:
+        if entry["run_id"] is not None:
             run_data, run_err = fetch_run_details(entry["run_id"], repo)
             if run_err:
                 errors.append(run_err)
-                verdicts.append("gh_error")
                 # B2: pass check で補完失敗 → all_pass の根拠にしない → pending_or_queued 扱い
                 if bucket == "pass":
                     entry["bucket"] = None
@@ -533,13 +612,37 @@ def main() -> int:
                 jobs = run_data.get("jobs") or []
                 if jobs:
                     entry["job_id"] = find_failed_job_id(jobs, entry["name"])
-
-        verdict = determine_check_verdict(entry, head_sha or expected_head_sha)
-        verdicts.append(verdict)
+                entry["run_detail_complete"] = True
 
         check_entries.append(entry)
 
+    # review shadow の success peer は、現在の実 head だけでなく caller が固定した
+    # expected head と一致して初めて有効とする。head drift 中に shadow を除外しない。
+    verdict_pairs = precompute_verdicts(check_entries, expected_head_sha)
+    check_entries = [entry for entry, _ in verdict_pairs]
+    verdict_by_entry_id = {id(entry): verdict for entry, verdict in verdict_pairs}
+
+    # cross-event の canonical success + 限定 shadow は正当な二重行として許可する。
+    if check_name_filter and len(check_entries) > 1:
+        allowed_shadow_pair = (
+            len(check_entries) == 2
+            and any(verdict == "excluded" for _, verdict in verdict_pairs)
+            and any(
+                entry.get("event") == "pull_request"
+                and entry.get("conclusion") == "success"
+                and entry.get("head_sha") == expected_head_sha
+                for entry in check_entries
+            )
+        )
+        if not allowed_shadow_pair:
+            errors.append({
+                "kind": "ambiguous_check_name",
+                "detail": f"check-name matched multiple canonical checks: {check_name_filter}",
+            })
+
         # log artifact: failed check のみ、--include-log-excerpt 指定時
+    for entry in check_entries:
+        verdict = verdict_by_entry_id[id(entry)]
         if include_log_excerpt and verdict == "failed" and entry.get("job_id"):
             log_text, log_err = fetch_job_log(entry["job_id"], repo)
             if log_err:
@@ -561,6 +664,10 @@ def main() -> int:
                 )
                 log_artifacts.append(artifact_entry)
 
+    if errors:
+        verdicts.append("gh_error")
+    verdicts.extend(verdict for _, verdict in verdict_pairs)
+
     # Overall status
     if not verdicts:
         # No checks found (check_name_filter が一致しない場合は B1 で gh_error 処理済み)
@@ -570,14 +677,10 @@ def main() -> int:
         overall_status = compute_overall_status(verdicts)
 
     # Build categorized lists
-    effective_sha = head_sha or expected_head_sha
-    failed_checks = [e["name"] for e in check_entries if determine_check_verdict(e, effective_sha) == "failed"]
-    pending_checks = [e["name"] for e in check_entries if determine_check_verdict(
-        e,
-        effective_sha
-    ) == "pending_or_queued"]
-    stale_checks = [e["name"] for e in check_entries if determine_check_verdict(e, effective_sha) == "stale_head_sha"]
-    excluded_checks = [e["name"] for e in check_entries if determine_check_verdict(e, effective_sha) == "excluded"]
+    failed_checks = [e["name"] for e in check_entries if verdict_by_entry_id[id(e)] == "failed"]
+    pending_checks = [e["name"] for e in check_entries if verdict_by_entry_id[id(e)] == "pending_or_queued"]
+    stale_checks = [e["name"] for e in check_entries if verdict_by_entry_id[id(e)] == "stale_head_sha"]
+    excluded_checks = [e["name"] for e in check_entries if verdict_by_entry_id[id(e)] == "excluded"]
 
     summary: dict[str, Any] = {
         "schema": "CI_VERDICT_SUMMARY_V1",
@@ -587,7 +690,7 @@ def main() -> int:
         "expected_head_sha": expected_head_sha,
         "head_sha": head_sha or "",
         "status": overall_status,
-        "checks": check_entries,
+        "checks": [public_check_entry(entry) for entry in check_entries],
         "failed_checks": failed_checks,
         "pending_checks": pending_checks,
         "stale_checks": stale_checks,

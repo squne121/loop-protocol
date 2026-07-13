@@ -90,6 +90,64 @@ def make_mock_run_gh(
     return _run_gh
 
 
+def run_summary_with_details(checks: list[dict], runs: dict[int, dict], check_name: Optional[str] = None):
+    """event/state provenance を含む integration fixture を main() 経由で集約する。"""
+    def _run_gh(args: list[str]):
+        if "pr" in args and "view" in args and "headRefOid" in args:
+            return True, {"headRefOid": HEAD_SHA}, "{}"
+        if "pr" in args and "checks" in args:
+            return True, checks, json.dumps(checks)
+        if "run" in args and "view" in args and "--log" not in args:
+            run_id = int(next(arg for arg in args if arg.isdigit()))
+            return True, runs[run_id], json.dumps(runs[run_id])
+        return False, None, "unexpected gh call"
+
+    argv = [
+        "ci_verdict_summary.py", "--pr", "1456", "--repo", "owner/repo",
+        "--expected-head-sha", HEAD_SHA,
+    ]
+    if check_name:
+        argv.extend(["--check-name", check_name])
+    import io
+    from contextlib import redirect_stdout
+    with patch("ci_verdict_summary.run_gh", side_effect=_run_gh), patch("sys.argv", argv):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            exit_code = main()
+    return exit_code, json.loads(buf.getvalue())
+
+
+def provenance_check(
+    run_id: int,
+    *,
+    bucket: str,
+    state: str,
+    event: Optional[str],
+    completed_at: str,
+) -> dict:
+    return {
+        "name": "PR Body Japanese Check",
+        "bucket": bucket,
+        "state": state,
+        "workflow": "Check Japanese Content",
+        "link": f"https://github.com/owner/repo/actions/runs/{run_id}",
+        "event": event,
+        "startedAt": completed_at,
+        "completedAt": completed_at,
+    }
+
+
+def completed_run(conclusion: str, head_sha: str = HEAD_SHA) -> dict:
+    return {
+        "headSha": head_sha,
+        "conclusion": conclusion,
+        "status": "completed",
+        "workflowName": "Check Japanese Content",
+        "jobs": [],
+        "databaseId": 1,
+    }
+
+
 # ---------------------------------------------------------------------------
 # AC: stale (head SHA mismatch)
 # ---------------------------------------------------------------------------
@@ -1270,3 +1328,75 @@ class TestHeadShaNullSkippedExclude:
         assert "excluded_count" in out
         assert "deploy-main" in out["excluded_checks"]
         assert out["excluded_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #1456: event-aware rerun canonicalization and review skipped shadows
+# ---------------------------------------------------------------------------
+
+class TestReviewShadowAndRerunCanonicalization:
+    """GIVEN provenance-complete checks WHEN summarized THEN only proven shadows exclude."""
+
+    def _peer_and_shadow(self, event: str = "pull_request_review") -> tuple[list[dict], dict[int, dict]]:
+        checks = [
+            provenance_check(101, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:01Z"),
+            provenance_check(102, bucket="skipping", state="SKIPPED", event=event, completed_at="2026-07-14T00:00:02Z"),
+        ]
+        return checks, {101: completed_run("success"), 102: completed_run("skipped")}
+
+    @pytest.mark.parametrize("event", ["pull_request_review", "pull_request_review_comment"])
+    def test_exact_review_skipped_shadow_is_excluded_only_with_current_head_success_peer(self, event: str):
+        checks, runs = self._peer_and_shadow(event)
+        exit_code, out = run_summary_with_details(checks, runs, "PR Body Japanese Check")
+        assert exit_code == EXIT_ALL_PASS
+        assert out["status"] == "all_pass"
+        assert out["excluded_checks"] == ["PR Body Japanese Check"]
+        assert all("event" not in entry for entry in out["checks"])
+
+    @pytest.mark.parametrize("peer_head", [None, STALE_SHA])
+    def test_missing_or_stale_peer_keeps_shadow_failed(self, peer_head: Optional[str]):
+        checks, runs = self._peer_and_shadow()
+        if peer_head is None:
+            checks = checks[1:]
+            runs = {102: runs[102]}
+        else:
+            runs[101] = completed_run("success", peer_head)
+        _, out = run_summary_with_details(checks, runs)
+        assert out["status"] in {"failed", "stale_head_sha"}
+        assert out["excluded_checks"] == []
+
+    @pytest.mark.parametrize("state,event", [("NEUTRAL", "pull_request_review"), ("SKIPPED", None)])
+    def test_neutral_or_missing_event_is_not_excluded(self, state: str, event: Optional[str]):
+        checks, runs = self._peer_and_shadow()
+        checks[1]["state"] = state
+        checks[1]["event"] = event
+        _, out = run_summary_with_details(checks, runs)
+        assert out["status"] == "failed"
+        assert out["excluded_checks"] == []
+
+    def test_reversed_input_has_same_verdict_and_buckets(self):
+        checks, runs = self._peer_and_shadow()
+        _, normal = run_summary_with_details(checks, runs)
+        _, reversed_out = run_summary_with_details(list(reversed(checks)), runs)
+        assert (normal["status"], normal["failed_checks"], normal["excluded_checks"]) == (
+            reversed_out["status"], reversed_out["failed_checks"], reversed_out["excluded_checks"]
+        )
+
+    def test_true_rerun_uses_latest_same_event_without_removing_cross_event_shadow(self):
+        checks, runs = self._peer_and_shadow()
+        checks.insert(0, provenance_check(100, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:00Z"))
+        runs[100] = completed_run("failure")
+        exit_code, out = run_summary_with_details(checks, runs, "PR Body Japanese Check")
+        assert exit_code == EXIT_ALL_PASS
+        assert out["status"] == "all_pass"
+        assert len(out["checks"]) == 2
+        assert out["excluded_count"] == 1
+
+    def test_ambiguous_rerun_timestamp_is_not_deduped_to_success(self):
+        checks = [
+            provenance_check(100, bucket="fail", state="FAILURE", event="pull_request", completed_at="not-a-timestamp"),
+            provenance_check(101, bucket="pass", state="SUCCESS", event="pull_request", completed_at="not-a-timestamp"),
+        ]
+        _, out = run_summary_with_details(checks, {100: completed_run("failure"), 101: completed_run("success")})
+        assert out["status"] == "failed"
+        assert out["failed_checks"] == ["PR Body Japanese Check"]
