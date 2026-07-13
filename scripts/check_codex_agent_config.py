@@ -148,6 +148,8 @@ def validate_codex_only_expectation(agent_name: str, expected: dict) -> list[str
         failures.append(f"{expected['path']}: codex_only parity must use runtime_followup_route 'none'")
     if expected.get("runtime_dependency_status") != "codex_native":
         failures.append(f"{expected['path']}: codex_only parity must use runtime_dependency_status 'codex_native'")
+    if expected.get("protected_lane") is not True:
+        failures.append(f"{expected['path']}: codex_only parity must set protected_lane true")
     if expected.get("repo_local_skill_surfaces", []) != []:
         failures.append(f"{expected['path']}: codex_only parity must not declare repo_local_skill_surfaces")
     return failures
