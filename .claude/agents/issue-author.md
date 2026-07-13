@@ -63,6 +63,12 @@ permissionMode: acceptEdits
 - `failed_after_mutation` → helper result に含まれる sha / artifact ref を source of truth にして follow-up 判断する
 - `human_judgment` → owner 判断を要求する
 
+## 出力契約（ISSUE_AUTHOR_RESULT_COMPACT_V1）
+
+- 最終結果は `ISSUE_AUTHOR_RESULT_COMPACT_V1` として返し、自由形式の長文を返さない
+- `STATUS / SUMMARY / BODY_HASH / COMMENT_URL / ARTIFACT / NEXT_ACTION` を出力し、`SUMMARY` は常に含める
+- compact output は 2048 UTF-8 bytes 以内とし、raw transcript、raw diff、raw log、secret、access token を含めない
+
 ## fail-closed terminal result の確認項目
 
 - helper 結果の `comment_publish.comment_id` / `comment_publish.comment_url` / `comment_publish.comment_body_sha256` を readback し、

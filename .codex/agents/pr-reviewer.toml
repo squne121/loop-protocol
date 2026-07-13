@@ -1,7 +1,7 @@
 name = "pr-reviewer"
 description = "PR の contract-aware review を担当する main reviewer。linked issue・CI・verdict comment まで含めて判定する。"
-model = "gpt-5.4"
-model_reasoning_effort = "medium"
+model = "gpt-5.6-terra"
+model_reasoning_effort = "high"
 default_permissions = "loop-protocol-readonly"
 developer_instructions = """
 ROLE
