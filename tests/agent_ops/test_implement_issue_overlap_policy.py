@@ -156,6 +156,15 @@ def test_given_continue_routes_when_described_then_proceed_and_evidence_route_co
     assert "Issue コメント" in content or "worktree artifact" in content
 
 
+def test_given_missing_allowed_paths_when_described_then_candidate_is_excluded_with_evidence() -> None:
+    """AC6: Allowed Paths 未記載候補は validation error ではなく、証跡を残して
+    collision classifier の入力から除外する契約を Section 2 に明記する。"""
+    content = _skill_text()
+    assert "Allowed Paths 未記載" in content
+    assert "ignored_missing_allowed_paths" in content
+    assert "collision classifier" in content
+
+
 def test_given_fail_closed_routes_when_described_then_ambiguous_and_duplicate_route_to_human() -> None:
     """AC3: `ambiguous_requires_human`（`human_review_required` /
     `wait_for_predecessor`）と `duplicate` が fail-closed で

@@ -8,6 +8,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -125,8 +127,10 @@ def render_command(command_id: str, values: dict[str, object]) -> list[str]:
         """from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
+import py_compile
 import time
 from pathlib import Path
 
@@ -143,6 +147,20 @@ def main() -> int:
         outside = Path(".cache")
         outside.mkdir(parents=True, exist_ok=True)
         (outside / "outside.txt").write_text("self-write")
+    cache_path = Path(importlib.util.cache_from_source(__file__))
+    if os.environ.get("SKILL_RUNTIME_TEST_PYC_WRITE") == "bytes":
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(b"not-a-valid-pyc")
+    if os.environ.get("SKILL_RUNTIME_TEST_PYC_WRITE") == "compile":
+        py_compile.compile(__file__, cfile=str(cache_path), doraise=True)
+    if os.environ.get("SKILL_RUNTIME_TEST_PYC_WRITE") == "replace-parent":
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.parent.rmdir()
+        cache_path.parent.symlink_to("../", target_is_directory=True)
+    if os.environ.get("SKILL_RUNTIME_TEST_PYC_WRITE") == "modify-existing":
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(b"before")
+        cache_path.write_bytes(b"after-with-different-size")
     if os.environ.get("SKILL_RUNTIME_TEST_SELF_WRITE_WORKTREES") == "ignored":
         # Issue #1343 AC5: a self-write into a volatile peer-session root
         # (.claude/worktrees/**) is a known, accepted limitation of the
@@ -259,6 +277,32 @@ def test_self_write_outside_allowed_roots_still_fails(tmp_path: Path) -> None:
     assert "reason_code=unauthorized_write_path" in result.stderr
     assert "unauthorized write path=.cache/" in result.stderr
     assert "target_issue=1228" in result.stderr
+
+
+@pytest.mark.parametrize("writer", ["bytes", "compile", "modify-existing"])
+def test_bytecode_shaped_self_write_outside_allowed_roots_fails(
+    tmp_path: Path, writer: str
+) -> None:
+    """GIVEN a child writes to its canonical importlib cache path
+    WHEN it uses bytes, py_compile, or modifies an existing cache
+    THEN the executor rejects the source-tree change rather than excluding pyc."""
+    repo = _make_repo(tmp_path)
+    _install_skill_runtime_exec_fixture(repo)
+    result = _run_executor(repo, {"SKILL_RUNTIME_TEST_PYC_WRITE": writer})
+    assert result.returncode == 2
+    assert "reason_code=unauthorized_write_path" in result.stderr
+    assert "__pycache__" in result.stderr
+
+
+def test_bytecode_cache_parent_symlink_replacement_fails_closed(tmp_path: Path) -> None:
+    """GIVEN a child replaces its cache parent with a symlink
+    WHEN the exact executor compares source-tree state
+    THEN it fails closed instead of treating the cache path as volatile."""
+    repo = _make_repo(tmp_path)
+    _install_skill_runtime_exec_fixture(repo)
+    result = _run_executor(repo, {"SKILL_RUNTIME_TEST_PYC_WRITE": "replace-parent"})
+    assert result.returncode == 2
+    assert "reason_code=unauthorized_write_path" in result.stderr
 
 
 def test_self_write_inside_allowed_roots_still_succeeds(tmp_path: Path) -> None:

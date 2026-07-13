@@ -2278,25 +2278,44 @@ def _git_worktree_status(file_path: Path, repo_root: Path) -> str:
 
 
 def build_py_compile_proof(script_path: Path, repo_root: Path) -> dict:
-    """Generate PY_COMPILE_PROOF_V1 artifact for a Python script.
+    """Generate PY_SYNTAX_COMPILE_PROOF_V2 artifact for a Python script.
 
-    Runs ``python3 -m py_compile`` and records the full execution context
-    so that the caller can prove which interpreter / commit / file blob was
-    checked, not just whether compilation succeeded.
+    Compiles the source in-process without materializing a bytecode cache.
+    ``python -m py_compile`` is intentionally not used here: it writes a
+    ``__pycache__`` entry next to the source even when descendant imports have
+    ``PYTHONDONTWRITEBYTECODE`` enabled.  The privileged executor must retain
+    source-tree write attribution, so provenance generation cannot create an
+    otherwise unauthorized cache file.
+
+    The source is read and compiled as raw ``bytes`` (not a decoded ``str``)
+    so that CPython's own PEP 263 encoding-declaration handling (UTF-8 BOM,
+    ``# -*- coding: ... -*-`` cookie, and BOM/cookie contradictions) applies
+    exactly as it would for a normally-imported module, instead of this
+    wrapper silently assuming UTF-8. ``dont_inherit=True`` and ``flags=0``
+    ensure this module's own ``from __future__ import annotations`` (and any
+    other wrapper-side future statement) is never inherited by the checked
+    script. There is no executable ``command`` for this proof: the operation
+    is in-process and is described by ``operation_kind`` instead.
     """
     script_realpath = str(script_path.resolve())
-    command = [sys.executable, "-m", "py_compile", script_realpath]
+    operation_kind = "in_process_compile"
+    source_mode = "bytes"
+    flags = 0
+    dont_inherit = True
+    optimize = -1
 
     try:
-        proc = subprocess.run(
-            command,
-            shell=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
+        source_bytes = script_path.read_bytes()
+        compile(
+            source_bytes,
+            script_realpath,
+            "exec",
+            flags=flags,
+            dont_inherit=dont_inherit,
+            optimize=optimize,
         )
-        py_compile_status = "pass" if proc.returncode == 0 else "fail"
-        stderr_text = proc.stderr or ""
+        py_compile_status = "pass"
+        stderr_text = ""
     except Exception as exc:
         py_compile_status = "fail"
         stderr_text = str(exc)
@@ -2304,8 +2323,13 @@ def build_py_compile_proof(script_path: Path, repo_root: Path) -> dict:
     stderr_excerpt = stderr_text[:500]
 
     return {
-        "schema_version": "PY_COMPILE_PROOF_V1",
-        "command": command,
+        "schema_version": "PY_SYNTAX_COMPILE_PROOF_V2",
+        "operation_kind": operation_kind,
+        "source_mode": source_mode,
+        "flags": flags,
+        "dont_inherit": dont_inherit,
+        "optimize": optimize,
+        "cache_write_expected": False,
         "py_compile_status": py_compile_status,
         "python_version": sys.version,
         "python_executable": sys.executable,
@@ -2440,6 +2464,12 @@ def build_provenance(
         "python_version": sys.version,
         "cwd": str(Path.cwd()),
         "py_compile_status": py_compile_proof["py_compile_status"],
+        # Issue #1439 AC12: persist the full PY_SYNTAX_COMPILE_PROOF_V2 proof
+        # (schema_version + all required fields), not just the collapsed
+        # py_compile_status summary above, so a later reader of the
+        # refinement_preflight_provenance_v1.json artifact can verify the
+        # full V2 semantics without re-deriving them.
+        "python_syntax_compile_proof": py_compile_proof,
         "wrapper_exit_code": wrapper_exit_code,
         "wrapper_status": wrapper_status,
         "blockers": list(blockers),

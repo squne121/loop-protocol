@@ -35,6 +35,8 @@ _LEADING_ENV_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)+")
 _PLACEHOLDER_RE = re.compile(r"^\{[A-Za-z0-9_]+\}$")
 _OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
+SKILL_RUNTIME_EXECUTION_CLASS_FIXTURE = "exact_skill_runtime_fixture"
+
 SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
     "schema": SKILL_RUNTIME_COMMAND_POLICY_SCHEMA,
     "eligible_command_ids": {
@@ -46,11 +48,26 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
                 ".claude/artifacts/issue-refinement-loop/{active_issue}/",
             ],
             "network_effect": "github_read_only",
-        }
+        },
+        # Issue #1439 Scope Delta 2: test-only command-id that drives the
+        # real executor -> real preflight -> real planner subprocess chain
+        # offline (via --fixture). Production `preflight.run` argv/timeout
+        # /placeholders are entirely unaffected -- this is a sibling entry,
+        # not a generalization of `preflight.run`. Same trusted repo slug /
+        # default branch / canonical root safety boundary applies.
+        "preflight.run.fixture": {
+            "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_FIXTURE,
+            "required_cwd": "canonical_main_root",
+            "required_branch": "default_branch",
+            "allowed_write_roots": [
+                ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            ],
+            "network_effect": "local_only",
+        },
     },
 }
 
-ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS = frozenset({"preflight.run"})
+ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS = frozenset({"preflight.run", "preflight.run.fixture"})
 _ROOT_NO_WORKTREE_POLICY_INVARIANTS: dict[str, dict[str, Any]] = {
     "preflight.run": {
         "execution_class": SKILL_RUNTIME_EXECUTION_CLASS,
@@ -60,7 +77,16 @@ _ROOT_NO_WORKTREE_POLICY_INVARIANTS: dict[str, dict[str, Any]] = {
         "allowed_write_roots": [
             ".claude/artifacts/issue-refinement-loop/{active_issue}/",
         ],
-    }
+    },
+    "preflight.run.fixture": {
+        "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_FIXTURE,
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "network_effect": "local_only",
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+        ],
+    },
 }
 
 
@@ -70,6 +96,7 @@ class ExactSkillRuntimeCommand:
     issue_number: str
     repo: str
     argv: tuple[str, ...]
+    fixture: str = ""
 
 
 def command_allows_root_no_worktree(parsed: ExactSkillRuntimeCommand) -> bool:
@@ -261,6 +288,125 @@ def is_exact_skill_runtime_executor_command(
     return True
 
 
+def _is_safe_repo_relative_fixture_path(fixture: str, root: str) -> bool:
+    """True iff `fixture` is a safe repo-relative path for `--fixture`.
+
+    Rejects absolute paths, `..` traversal, NUL/newline injection, a leading
+    `-` (flag-injection), and any realpath resolution that escapes `root`
+    (including via symlink components). Issue #1439 Scope Delta 2 Out of
+    Scope: `--fixture` must never accept an absolute path, path traversal,
+    or a symlink-mediated repo-external reference.
+    """
+    if not fixture or fixture.startswith("-"):
+        return False
+    if os.path.isabs(fixture):
+        return False
+    if "\x00" in fixture or "\n" in fixture or "\r" in fixture:
+        return False
+    parts = fixture.replace("\\", "/").split("/")
+    if ".." in parts or "" in parts[1:]:
+        return False
+    resolved = os.path.realpath(os.path.join(root, fixture))
+    try:
+        common = os.path.commonpath([root, resolved])
+    except ValueError:
+        return False
+    return common == root
+
+
+def parse_exact_skill_runtime_fixture_command(
+    command: str, project_root: str | None = None
+) -> ExactSkillRuntimeCommand | None:
+    """Exact-match parser for the test-only `preflight.run.fixture` command
+    class (Issue #1439 Scope Delta 2).
+
+    Mirrors `parse_exact_skill_runtime_command` token-for-token, with two
+    additional trailing tokens (`--fixture <repo-relative-path>`) and
+    fixture-path traversal/absolute-path/symlink-escape rejection. This is a
+    separate function -- production `preflight.run`'s 10-token exact match is
+    entirely unmodified and unaffected.
+    """
+    root = os.path.realpath(project_root or resolve_project_root())
+    if not command or _METACHAR_RE.search(command) or _LEADING_ENV_RE.match(command):
+        return None
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    if len(tokens) != 12:
+        return None
+    if tokens[:4] != ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL]:
+        return None
+    if os.path.islink(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
+        return None
+    expected_script = os.path.realpath(os.path.join(root, SKILL_RUNTIME_EXEC_REL))
+    if os.path.realpath(os.path.join(root, tokens[3])) != expected_script:
+        return None
+    expected_flags = ["--command-id", "--issue-number", "--repo", "--fixture"]
+    expected_positions = [4, 6, 8, 10]
+    for flag, pos in zip(expected_flags, expected_positions):
+        if tokens[pos] != flag:
+            return None
+    if any(
+        tok.startswith("--command-id=")
+        or tok.startswith("--issue-number=")
+        or tok.startswith("--repo=")
+        or tok.startswith("--fixture=")
+        for tok in tokens
+    ):
+        return None
+    command_id = tokens[5]
+    issue_number = tokens[7]
+    repo = tokens[9]
+    fixture = tokens[11]
+    if command_id != "preflight.run.fixture":
+        return None
+    if not issue_number.isdigit() or int(issue_number) <= 0:
+        return None
+    if repo != TRUSTED_REPO_SLUG:
+        return None
+    if command_id not in SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"]:
+        return None
+    if not _is_safe_repo_relative_fixture_path(fixture, root):
+        return None
+    return ExactSkillRuntimeCommand(
+        command_id=command_id,
+        issue_number=issue_number,
+        repo=repo,
+        argv=tuple(tokens),
+        fixture=fixture,
+    )
+
+
+def is_exact_skill_runtime_fixture_executor_command(
+    command: str, cwd: str, project_root: str, deadline: Deadline | None = None
+) -> bool:
+    """Same trusted-repo / default-branch / canonical-root / active-issue
+    safety boundary as `is_exact_skill_runtime_executor_command`, applied to
+    the test-only `preflight.run.fixture` command class (Issue #1439 Scope
+    Delta 2)."""
+    parsed = parse_exact_skill_runtime_fixture_command(command, project_root)
+    if parsed is None:
+        return False
+    if os.path.realpath(cwd) != os.path.realpath(project_root):
+        return False
+    branch = current_branch(project_root, deadline)
+    default_branch = resolve_default_branch(project_root, deadline)
+    if not branch or branch != default_branch:
+        return False
+    repo_slug = resolve_repo_slug(project_root, deadline)
+    if repo_slug != parsed.repo:
+        return False
+    if command_allows_root_no_worktree(parsed):
+        return True
+    active_issue, entry = resolve_active_issue(project_root, cwd, deadline)
+    if active_issue != parsed.issue_number or entry is None:
+        return False
+    return True
+
+
 def looks_like_skill_runtime_executor_command(command: str) -> bool:
     return "skill_runtime_exec.py" in (command or "")
 
@@ -287,6 +433,49 @@ def load_registry_entry(command_id: str, project_root: str | None = None) -> dic
     return dict(entry)
 
 
+# Per-command-id exact argv/placeholder contracts (Issue #1439 Scope Delta 2:
+# generalized from the single hard-coded `preflight.run` check so the new
+# test-only `preflight.run.fixture` command-id can be validated the same
+# exact-match way, without loosening `preflight.run`'s own check at all --
+# its entry below is byte-for-byte identical to the prior hard-coded literal).
+_EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
+    "preflight.run": [
+        "uv",
+        "run",
+        "python3",
+        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+        "--issue-number",
+        "{issue_number}",
+        "--repo",
+        "{repo}",
+    ],
+    "preflight.run.fixture": [
+        "uv",
+        "run",
+        "python3",
+        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+        "--issue-number",
+        "{issue_number}",
+        "--repo",
+        "{repo}",
+        "--fixture",
+        "{fixture}",
+    ],
+}
+
+_EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
+    "preflight.run": {
+        "issue_number": {"type": "positive_int", "required": True},
+        "repo": {"type": "owner_repo", "required": True},
+    },
+    "preflight.run.fixture": {
+        "issue_number": {"type": "positive_int", "required": True},
+        "repo": {"type": "owner_repo", "required": True},
+        "fixture": {"type": "repo_relative_file", "required": True},
+    },
+}
+
+
 def validate_registry_entry(command_id: str, entry: dict[str, Any], active_issue: str) -> None:
     policy = SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"].get(command_id)
     if policy is None:
@@ -305,22 +494,12 @@ def validate_registry_entry(command_id: str, entry: dict[str, Any], active_issue
     if entry.get("allowed_write_roots") != expected_write_roots:
         raise ValueError("allowed_write_roots_mismatch")
     argv = entry.get("argv")
-    if argv != [
-        "uv",
-        "run",
-        "python3",
-        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
-        "--issue-number",
-        "{issue_number}",
-        "--repo",
-        "{repo}",
-    ]:
+    expected_argv = _EXPECTED_ARGV_BY_COMMAND.get(command_id)
+    if expected_argv is None or argv != expected_argv:
         raise ValueError("argv_template_mismatch")
     placeholders = entry.get("placeholders")
-    if placeholders != {
-        "issue_number": {"type": "positive_int", "required": True},
-        "repo": {"type": "owner_repo", "required": True},
-    }:
+    expected_placeholders = _EXPECTED_PLACEHOLDERS_BY_COMMAND.get(command_id)
+    if expected_placeholders is None or placeholders != expected_placeholders:
         raise ValueError("placeholder_mismatch")
     declared_placeholders = set(placeholders)
     argv_placeholders = {
