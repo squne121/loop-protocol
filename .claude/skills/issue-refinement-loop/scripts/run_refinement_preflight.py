@@ -2278,7 +2278,7 @@ def _git_worktree_status(file_path: Path, repo_root: Path) -> str:
 
 
 def build_py_compile_proof(script_path: Path, repo_root: Path) -> dict:
-    """Generate PY_COMPILE_PROOF_V1 artifact for a Python script.
+    """Generate PY_SYNTAX_COMPILE_PROOF_V2 artifact for a Python script.
 
     Compiles the source in-process without materializing a bytecode cache.
     ``python -m py_compile`` is intentionally not used here: it writes a
@@ -2286,13 +2286,34 @@ def build_py_compile_proof(script_path: Path, repo_root: Path) -> dict:
     ``PYTHONDONTWRITEBYTECODE`` enabled.  The privileged executor must retain
     source-tree write attribution, so provenance generation cannot create an
     otherwise unauthorized cache file.
+
+    The source is read and compiled as raw ``bytes`` (not a decoded ``str``)
+    so that CPython's own PEP 263 encoding-declaration handling (UTF-8 BOM,
+    ``# -*- coding: ... -*-`` cookie, and BOM/cookie contradictions) applies
+    exactly as it would for a normally-imported module, instead of this
+    wrapper silently assuming UTF-8. ``dont_inherit=True`` and ``flags=0``
+    ensure this module's own ``from __future__ import annotations`` (and any
+    other wrapper-side future statement) is never inherited by the checked
+    script. There is no executable ``command`` for this proof: the operation
+    is in-process and is described by ``operation_kind`` instead.
     """
     script_realpath = str(script_path.resolve())
-    command = ["in_process", "compile", script_realpath]
+    operation_kind = "in_process_compile"
+    source_mode = "bytes"
+    flags = 0
+    dont_inherit = True
+    optimize = -1
 
     try:
-        source = script_path.read_text(encoding="utf-8")
-        compile(source, script_realpath, "exec")
+        source_bytes = script_path.read_bytes()
+        compile(
+            source_bytes,
+            script_realpath,
+            "exec",
+            flags=flags,
+            dont_inherit=dont_inherit,
+            optimize=optimize,
+        )
         py_compile_status = "pass"
         stderr_text = ""
     except Exception as exc:
@@ -2302,8 +2323,13 @@ def build_py_compile_proof(script_path: Path, repo_root: Path) -> dict:
     stderr_excerpt = stderr_text[:500]
 
     return {
-        "schema_version": "PY_COMPILE_PROOF_V1",
-        "command": command,
+        "schema_version": "PY_SYNTAX_COMPILE_PROOF_V2",
+        "operation_kind": operation_kind,
+        "source_mode": source_mode,
+        "flags": flags,
+        "dont_inherit": dont_inherit,
+        "optimize": optimize,
+        "cache_write_expected": False,
         "py_compile_status": py_compile_status,
         "python_version": sys.version,
         "python_executable": sys.executable,
