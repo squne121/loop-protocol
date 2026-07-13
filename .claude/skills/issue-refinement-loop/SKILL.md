@@ -120,7 +120,7 @@ uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/run_refinem
 
 root checkout（canonical main root / default branch）から anchor comment を指定して preflight を実行する場合は、上記の直接 wrapper 呼び出しではなく、`preflight.run.with_anchor`（`preflight.run` の sibling exact profile、Issue #1498）を正規の privileged executor 経由で実行する。以下は exact command policy が要求する厳密な token 列（`--locked` を含まない）そのものであり、`uv run --locked` governance policy の対象ではない:
 
-<!-- policy-example -->
+<!-- policy-example: 以下は方針の例を示す -->
 ```bash
 uv run python3 scripts/agent-guards/skill_runtime_exec.py \
   --command-id preflight.run.with_anchor \
