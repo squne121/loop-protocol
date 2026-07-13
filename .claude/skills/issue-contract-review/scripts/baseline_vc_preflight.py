@@ -2470,6 +2470,124 @@ def _rg_stderr_extract_missing_paths(stderr: str) -> List[str]:
     return seen
 
 
+# PR #1497 review (Blocker 1): only these commands have a path-operand
+# parser implemented for current-head PASS target-scope certification.
+# grep / egrep / fgrep / ack / ag / etc. are intentionally excluded until a
+# dedicated path parser exists for them (closed allowlist, fail-closed).
+_CURRENT_PASS_ELIGIBLE_TEST_FLAGS = frozenset(["-f", "-d", "-s"])
+
+
+def _certified_path_exists_as_file(resolved_cwd: Path, normalized: str) -> bool:
+    try:
+        return (resolved_cwd / normalized).is_file()
+    except OSError:
+        return False
+
+
+def certify_current_pass_command(
+    command: str,
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    cwd: Optional[str],
+    allowed_paths: Optional[List[str]],
+) -> Tuple[bool, Optional[str]]:
+    """PR #1497 review fix (Blocker 1 / Blocker 2): decide whether a
+    non-regression-gate command's exit_code == 0 in current-head
+    evidence-mode may be certified as a resolved current PASS.
+
+    This is a CLOSED allowlist, not a generic "exit 0 means done" check:
+
+    - Blocker 1 (unbound target scope): only `test -f|-d|-s <PATH>` and
+      `rg PATTERN <PATH...>` are eligible. Every path operand MUST normalize
+      to a strict repo-relative path (`_normalize_repo_relative_path_strict`)
+      contained within `allowed_paths`, and MUST exist as a regular file at
+      certification time. Absolute paths, `..`, backslashes, and repo-
+      external state (e.g. `/tmp/vc-sentinel`) are rejected outright.
+      `grep` / `egrep` / `fgrep` have no path-operand parser here and are
+      therefore never certified (they keep the pre-existing
+      unexpected_pass / blocked classification even in current-head mode).
+    - Blocker 2 (quiet partial success): `stderr` must be empty. `rg -q` /
+      `grep -q` can exit 0 (a match was found) while ALSO emitting a
+      missing-path / permission-denied error for a different operand on
+      stderr; requiring empty stderr rejects this "quiet partial success"
+      case even when an error-suppression flag would otherwise hide the
+      message from a text-pattern check. Filesystem existence is checked
+      independently of stderr content for defense in depth.
+
+    Returns (certified, reason). `reason` is a short machine string
+    describing the rejection when `certified` is False; `None` when
+    `certified` is True.
+    """
+    if exit_code != 0:
+        return False, "exit_code_not_zero"
+    if stderr:
+        return False, "nonempty_stderr"
+    if not allowed_paths:
+        return False, "no_allowed_paths"
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return False, "argv_parse_failed"
+    if not argv:
+        return False, "empty_argv"
+
+    resolved_cwd = Path(cwd) if cwd else Path(".")
+    base = Path(argv[0]).name
+
+    if base == "test":
+        if len(argv) != 3 or argv[1] not in _CURRENT_PASS_ELIGIBLE_TEST_FLAGS:
+            return False, "test_argv_not_exact_allowlisted_form"
+        target = argv[2]
+        normalized = _normalize_repo_relative_path_strict(target)
+        if normalized is None:
+            return False, "test_path_not_repo_relative"
+        if not _rg_path_operands_all_within_allowed_paths([target], allowed_paths):
+            return False, "test_path_outside_allowed_paths"
+        if not _certified_path_exists_as_file(resolved_cwd, normalized):
+            return False, "test_path_does_not_exist_at_certification_time"
+        return True, None
+
+    if base == "rg":
+        path_operands = _rg_extract_path_operands(argv)
+        if not path_operands:
+            return False, "rg_no_path_operands"
+        if not _rg_path_operands_all_within_allowed_paths(path_operands, allowed_paths):
+            return False, "rg_path_outside_allowed_paths"
+        for operand in path_operands:
+            normalized = _normalize_repo_relative_path_strict(operand)
+            if normalized is None:
+                return False, "rg_path_not_repo_relative"
+            if not _certified_path_exists_as_file(resolved_cwd, normalized):
+                return False, "rg_path_not_a_regular_file_or_missing"
+        return True, None
+
+    # grep / egrep / fgrep / any other command: closed allowlist -- never
+    # certified until a dedicated path-operand parser is implemented.
+    return False, "command_not_in_current_pass_allowlist"
+
+
+def _extract_certified_target_paths(command: str) -> List[str]:
+    """Best-effort re-extraction of the path operands certified by
+    `certify_current_pass_command()`, for inclusion in the producer result
+    item (PR #1497 review Blocker 1: "producer 結果に、検証済み target path
+    ... を含める"). Only called after certification already succeeded, so
+    this does not need to re-validate anything -- it mirrors the same
+    per-command extraction rules for observability."""
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return []
+    if not argv:
+        return []
+    base = Path(argv[0]).name
+    if base == "test" and len(argv) == 3:
+        return [argv[2]]
+    if base == "rg":
+        return _rg_extract_path_operands(argv)
+    return []
+
+
 def classify_result(
     exit_code: int,
     stdout: str,
@@ -2478,7 +2596,7 @@ def classify_result(
     cwd: Optional[str] = None,
     runner_env_delta: Optional[Dict[str, str]] = None,
     allowed_paths: Optional[List[str]] = None,
-    static_policy_passed: bool = True,
+    static_policy_passed: bool = False,
     evidence_mode: str = "baseline",
 ) -> Tuple[str, str, str, Optional[str], str]:
     """
@@ -2496,8 +2614,9 @@ def classify_result(
             category regardless of stderr content (AC9).
         static_policy_passed: whether classify_static_command() already ran and
             returned None (not statically blocked) for this command. Defaults
-            to True for backward compatibility with existing call sites that
-            only invoke classify_result() after a static_result is None.
+            to False (PR #1497 review Major 1: this is a safety-relevant flag
+            and must fail closed; callers MUST explicitly pass True after
+            confirming classify_static_command() returned None).
         evidence_mode: "baseline" (default, backward compatible) or
             "current-head" (Issue #1488). In current-head mode, a
             non-regression-gate VC (rg / test -f / test -s etc.) that passed
@@ -2625,15 +2744,33 @@ def classify_result(
     # 実行された非 regression-gate VC（rg / test -f / test -s 等）の exit 0 は
     # certified current PASS（expected_pass / go）として扱う。baseline
     # evidence-mode の意味論（unexpected_pass / blocked）は変更しない（AC1）。
+    #
+    # PR #1497 review (Blocker 1 / Blocker 2): a bare `exit_code == 0` is NOT
+    # sufficient evidence of "this AC was resolved by the reviewed commit".
+    # `certify_current_pass_command()` additionally requires: (a) the command
+    # is on a closed allowlist (`test -f|-d|-s <PATH>` / `rg PATTERN
+    # <PATH...>` only -- grep/egrep/fgrep are excluded until a path-operand
+    # parser exists for them), (b) every path operand is a strictly
+    # normalized repo-relative path contained within Allowed Paths (rejecting
+    # absolute paths / `..` / repo-external state such as /tmp sentinels),
+    # (c) every path operand is verified to exist as a regular file at
+    # certification time, and (d) stderr is empty (rejecting `rg -q`/`grep
+    # -q` "quiet partial success" where one operand matched while another
+    # produced a missing-path/permission error that would otherwise be
+    # silently absorbed by exit_code == 0 alone).
     if exit_code == 0:
         if evidence_mode == "current-head" and static_policy_passed:
-            return (
-                "expected_pass",
-                "expected_pass_resolved_on_current_head",
-                "go",
-                None,
-                "baseline_fail_expected",
+            certified, _reason = certify_current_pass_command(
+                command, exit_code, stdout, stderr, cwd, allowed_paths
             )
+            if certified:
+                return (
+                    "expected_pass",
+                    "expected_pass_resolved_on_current_head",
+                    "go",
+                    None,
+                    "baseline_fail_expected",
+                )
         return "unexpected_pass", "unexpected_pass", "blocked", "Command unexpectedly passed", "baseline_fail_expected"
 
     # shlex.split failed
@@ -2859,6 +2996,7 @@ def compute_confidence(category: str) -> str:
         "rg_option_mismatch",            # AC1: Issue #648
         "broad_search_path_unbounded",   # AC2: Issue #648
         "new_file_missing_expected",     # AC11: Issue #1328
+        "expected_pass_resolved_on_current_head",  # PR #1497 review Major 2: Issue #1488
     }
     medium_confidence = {"timeout", "unexpected_pass"}
 
@@ -2929,6 +3067,24 @@ def check_c13_vc_preflight_decision_consistency(classifications: List[Dict[str, 
                     failures.append(f"{prefix}: regression_gate + go requires classification expected_pass")
                 if item["decision"] == "blocked" and item["classification"] != "blocked":
                     failures.append(f"{prefix}: regression_gate + blocked requires classification blocked")
+
+        # PR #1497 review Major 2: expected_pass_resolved_on_current_head
+        # consistency (classification / decision / confidence must agree;
+        # an "unknown category" fallback to confidence: low would otherwise
+        # silently contradict a certified current PASS).
+        if item.get("category") == "expected_pass_resolved_on_current_head":
+            if item.get("classification") != "expected_pass":
+                failures.append(
+                    f"{prefix}: expected_pass_resolved_on_current_head requires classification expected_pass"
+                )
+            if item.get("decision") != "go":
+                failures.append(
+                    f"{prefix}: expected_pass_resolved_on_current_head requires decision go"
+                )
+            if "confidence" in item and item["confidence"] != "high":
+                failures.append(
+                    f"{prefix}: expected_pass_resolved_on_current_head requires confidence high"
+                )
 
         # Skipped routing metadata
         if "classification" in item and item["classification"] == "skipped":
@@ -3591,6 +3747,11 @@ def main() -> int:
             "runner_env_delta": runner_env_delta,
             "duration_ms": duration_ms,
             "fix_hint": fix_hint,
+            "certified_target_paths": (
+                _extract_certified_target_paths(command)
+                if category == "expected_pass_resolved_on_current_head"
+                else None
+            ),
             "annotations": {
                 "baseline_expect": (
                     # Expose raw invalid value (without __invalid__: prefix) in annotations

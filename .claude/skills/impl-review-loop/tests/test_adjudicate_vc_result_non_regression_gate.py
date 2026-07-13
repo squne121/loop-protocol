@@ -4,11 +4,14 @@ Issue #1488 AC5: boundary test proving the REAL producer
 VC (rg) feeds into `adjudicate_vc_result.py` and resolves a baseline
 `expected_fail` into `expected_fail_resolved_on_current_head`.
 
-This deliberately does NOT rely on a hand-written fixture for the
-`current_vc_result` payload (fixture-only false-green prevention, AC5):
-the current-head envelope is produced by actually invoking
-`baseline_vc_preflight.py` as a subprocess against a real temporary git
-repository.
+PR #1497 review (REQUEST_CHANGES) required a stronger E2E fixture that does
+NOT rely on a hand-written baseline snapshot / diff summary: (1) create a
+real baseline commit, (2) run the REAL baseline producer and save its actual
+snapshot, (3) create a second commit that changes an Allowed Path, (4) run
+the REAL current-head producer, (5) generate the diff summary from a REAL
+`git diff` between the two commits, (6) feed everything into the
+adjudicator, and (7) exercise negative cases: an out-of-scope (repo-external)
+path, a quiet partial error (delete + match), and HEAD drift.
 """
 
 from __future__ import annotations
@@ -56,34 +59,51 @@ def _init_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
 
 
-def _run_producer_current_head(
-    *, repo: Path, body_file: Path, reviewed_head_sha: str
+def _commit_all(repo: Path, message: str) -> str:
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", message], check=True)
+    return subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+    ).strip()
+
+
+def _run_producer(
+    *,
+    repo: Path,
+    body_file: Path,
+    evidence_mode: str | None = None,
+    reviewed_head_sha: str | None = None,
 ) -> dict:
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(PRODUCER_SCRIPT_PATH),
-            "--body-file",
-            str(body_file),
-            "--cwd",
-            str(repo),
-            "--evidence-mode",
-            "current-head",
-            "--reviewed-head-sha",
-            reviewed_head_sha,
-            "--format",
-            "json",
-            "--issue",
-            "1488",
-            "--repo",
-            "squne121/loop-protocol",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    argv = [
+        sys.executable,
+        str(PRODUCER_SCRIPT_PATH),
+        "--body-file",
+        str(body_file),
+        "--cwd",
+        str(repo),
+        "--format",
+        "json",
+        "--issue",
+        "1488",
+        "--repo",
+        "squne121/loop-protocol",
+    ]
+    if evidence_mode is not None:
+        argv += ["--evidence-mode", evidence_mode]
+    if reviewed_head_sha is not None:
+        argv += ["--reviewed-head-sha", reviewed_head_sha]
+    completed = subprocess.run(argv, capture_output=True, text=True, check=False)
     assert completed.stdout, f"producer emitted no stdout: {completed.stderr}"
     return json.loads(completed.stdout)
+
+
+def _git_diff_changed_paths(repo: Path, base_sha: str, head_sha: str) -> list[str]:
+    """Real `git diff --name-only` between two commits (not hand-typed)."""
+    output = subprocess.check_output(
+        ["git", "-C", str(repo), "diff", "--name-only", base_sha, head_sha],
+        text=True,
+    )
+    return [line for line in output.splitlines() if line.strip()]
 
 
 def test_real_producer_non_regression_gate_current_pass_resolves_baseline_expected_fail(
@@ -105,6 +125,8 @@ def test_real_producer_non_regression_gate_current_pass_resolves_baseline_expect
     ).strip()
 
     body = (
+        "## Allowed Paths\n"
+        "- tracked.txt\n\n"
         "## Verification Commands\n\n"
         "```bash\n"
         "# AC1\n"
@@ -116,8 +138,11 @@ def test_real_producer_non_regression_gate_current_pass_resolves_baseline_expect
     body_file = tmp_path / "issue-body.md"
     body_file.write_text(body, encoding="utf-8")
 
-    current_vc_result = _run_producer_current_head(
-        repo=repo, body_file=body_file, reviewed_head_sha=head
+    current_vc_result = _run_producer(
+        repo=repo,
+        body_file=body_file,
+        evidence_mode="current-head",
+        reviewed_head_sha=head,
     )
 
     # Sanity: the real producer must have certified this as a current PASS
@@ -132,6 +157,8 @@ def test_real_producer_non_regression_gate_current_pass_resolves_baseline_expect
     assert current_item["classification"] == "expected_pass"
     assert current_item["category"] == "expected_pass_resolved_on_current_head"
     assert current_item["exit_code"] == 0
+    assert current_item["confidence"] == "high"
+    assert current_item["certified_target_paths"] == ["tracked.txt"]
 
     contract_snapshot = {
         "schema": "CONTRACT_REVIEW_RESULT_V1",
@@ -189,6 +216,8 @@ def test_real_producer_non_regression_gate_test_f_current_pass_resolves_baseline
     ).strip()
 
     body = (
+        "## Allowed Paths\n"
+        "- implemented.txt\n\n"
         "## Verification Commands\n\n"
         "```bash\n"
         "# AC1\n"
@@ -198,8 +227,11 @@ def test_real_producer_non_regression_gate_test_f_current_pass_resolves_baseline
     body_file = tmp_path / "issue-body.md"
     body_file.write_text(body, encoding="utf-8")
 
-    current_vc_result = _run_producer_current_head(
-        repo=repo, body_file=body_file, reviewed_head_sha=head
+    current_vc_result = _run_producer(
+        repo=repo,
+        body_file=body_file,
+        evidence_mode="current-head",
+        reviewed_head_sha=head,
     )
 
     assert current_vc_result["status"] == "pass"
@@ -256,6 +288,8 @@ def test_real_producer_baseline_mode_non_regression_gate_pass_stays_uncertified(
     subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
 
     body = (
+        "## Allowed Paths\n"
+        "- tracked.txt\n\n"
         "## Verification Commands\n\n"
         "```bash\n"
         "# AC1\n"
@@ -265,24 +299,279 @@ def test_real_producer_baseline_mode_non_regression_gate_pass_stays_uncertified(
     body_file = tmp_path / "issue-body.md"
     body_file.write_text(body, encoding="utf-8")
 
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(PRODUCER_SCRIPT_PATH),
-            "--body-file",
-            str(body_file),
-            "--issue",
-            "1488",
-            "--repo",
-            "squne121/loop-protocol",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        cwd=str(repo),
-    )
-    current_vc_result = json.loads(completed.stdout)
+    current_vc_result = _run_producer(repo=repo, body_file=body_file)
 
     # AC1: baseline mode must NOT certify a non-regression-gate exit 0 VC.
     assert current_vc_result["status"] != "pass"
     assert current_vc_result["results"][0]["classification"] == "unexpected_pass"
+
+
+# ---------------------------------------------------------------------------
+# PR #1497 review: "テスト設計の修正方針" — full E2E fixture with real
+# baseline commit, real baseline producer snapshot, a second commit that
+# changes the Allowed Path, a real current-head producer run, and a real
+# `git diff`-derived diff_summary. Plus negative cases: external path, quiet
+# partial error (delete + match), and HEAD drift.
+# ---------------------------------------------------------------------------
+
+
+def test_e2e_real_baseline_and_current_head_producer_pipeline_resolves_via_git_diff(
+    tmp_path: Path,
+) -> None:
+    """(1) real baseline commit, (2) real baseline producer snapshot saved,
+    (3) a second commit changes tracked.txt (Allowed Path) so the VC now
+    matches, (4) real current-head producer run, (5) diff_summary generated
+    from a REAL `git diff` between the two commits, (6) fed into the
+    adjudicator THEN overall_status is pass via
+    expected_fail_resolved_on_current_head. Nothing here is a hand-written
+    snapshot/diff -- every producer output and diff is real."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+
+    body = (
+        "## Allowed Paths\n"
+        "- tracked.txt\n\n"
+        "## Verification Commands\n\n"
+        "```bash\n"
+        "# AC1\n"
+        "$ rg -q hello tracked.txt\n"
+        "```\n"
+    )
+    body_file = tmp_path / "issue-body.md"
+    body_file.write_text(body, encoding="utf-8")
+
+    # (1) baseline commit: tracked.txt exists but does not yet satisfy the VC.
+    (repo / "tracked.txt").write_text("placeholder\n", encoding="utf-8")
+    base_sha = _commit_all(repo, "baseline")
+
+    # (2) real baseline producer run + saved snapshot.
+    baseline_result = _run_producer(repo=repo, body_file=body_file)
+    assert baseline_result["results"][0]["classification"] == "expected_fail"
+    baseline_item = baseline_result["results"][0]
+
+    # (3) a second commit changes the Allowed Path so the VC now matches.
+    (repo / "tracked.txt").write_text("hello world\n", encoding="utf-8")
+    head_sha = _commit_all(repo, "implement AC1")
+
+    # (4) real current-head producer run.
+    current_vc_result = _run_producer(
+        repo=repo,
+        body_file=body_file,
+        evidence_mode="current-head",
+        reviewed_head_sha=head_sha,
+    )
+    assert current_vc_result["status"] == "pass"
+
+    # (5) diff_summary generated from a REAL git diff.
+    changed_paths = _git_diff_changed_paths(repo, base_sha, head_sha)
+    assert changed_paths == ["tracked.txt"]
+    diff_summary = {"changed_paths": changed_paths, "head_sha": head_sha}
+
+    contract_snapshot = {
+        "schema": "CONTRACT_REVIEW_RESULT_V1",
+        "status": "go",
+        "body_sha256": baseline_result["source"]["body_sha256"],
+        "checks": {"vc_preflight": {"classifications": [baseline_item]}},
+    }
+
+    # (6) fed into the adjudicator.
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=contract_snapshot,
+        current_vc_result=current_vc_result,
+        diff_summary=diff_summary,
+        allowed_paths=["tracked.txt"],
+    )
+
+    assert result["overall_status"] == "pass"
+    assert result["blocking"] is False
+    assert result["per_ac"][0]["reason_code"] == "expected_fail_resolved_on_current_head"
+
+
+def test_e2e_negative_repo_external_path_never_resolves_via_pipeline(tmp_path: Path) -> None:
+    """(7) negative case: a VC targeting a repo-EXTERNAL path (outside
+    Allowed Paths / the repo tree) must never resolve to a certified current
+    PASS through the full real pipeline, even if the external file exists."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+
+    sentinel = tmp_path / "vc-sentinel"
+
+    body = (
+        "## Allowed Paths\n"
+        "- src/feature.ts\n\n"
+        "## Verification Commands\n\n"
+        "```bash\n"
+        f"# AC1\n"
+        f"$ test -f {sentinel}\n"
+        "```\n"
+    )
+    body_file = tmp_path / "issue-body.md"
+    body_file.write_text(body, encoding="utf-8")
+
+    (repo / "src").mkdir()
+    (repo / "src" / "feature.ts").write_text("// placeholder\n", encoding="utf-8")
+    base_sha = _commit_all(repo, "baseline")
+
+    baseline_result = _run_producer(repo=repo, body_file=body_file)
+    assert baseline_result["results"][0]["classification"] == "expected_fail"
+
+    # "别プロセスが作成" -- the sentinel is created OUTSIDE the repo/commit
+    # entirely; the implementation commit itself does not touch it.
+    sentinel.write_text("external state\n", encoding="utf-8")
+    (repo / "src" / "feature.ts").write_text("// implemented\n", encoding="utf-8")
+    head_sha = _commit_all(repo, "implement AC1 (unrelated to sentinel)")
+
+    current_vc_result = _run_producer(
+        repo=repo,
+        body_file=body_file,
+        evidence_mode="current-head",
+        reviewed_head_sha=head_sha,
+    )
+    # The producer itself must refuse to certify: exit 0 on a repo-external
+    # path is never promoted (Blocker 1).
+    assert current_vc_result["status"] != "pass"
+    assert current_vc_result["results"][0]["classification"] == "unexpected_pass"
+
+    changed_paths = _git_diff_changed_paths(repo, base_sha, head_sha)
+    diff_summary = {"changed_paths": changed_paths, "head_sha": head_sha}
+    contract_snapshot = {
+        "schema": "CONTRACT_REVIEW_RESULT_V1",
+        "status": "go",
+        "body_sha256": baseline_result["source"]["body_sha256"],
+        "checks": {
+            "vc_preflight": {"classifications": [baseline_result["results"][0]]}
+        },
+    }
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=contract_snapshot,
+        current_vc_result=current_vc_result,
+        diff_summary=diff_summary,
+        allowed_paths=["src/feature.ts"],
+    )
+    assert result["overall_status"] != "pass"
+    assert result["blocking"] is True
+
+
+def test_e2e_negative_quiet_partial_error_delete_and_match_never_resolves(
+    tmp_path: Path,
+) -> None:
+    """(7) negative case: reproduces the reviewer's exact Blocker 2 scenario
+    through the full real pipeline -- baseline has two files without the
+    needle; the implementation commit deletes one and adds the needle to the
+    other, producing a quiet `rg -q` partial success (exit 0 + missing-path
+    stderr) that must never resolve to a certified current PASS."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+
+    body = (
+        "## Allowed Paths\n"
+        "- deleted.txt\n"
+        "- changed.txt\n\n"
+        "## Verification Commands\n\n"
+        "```bash\n"
+        "# AC1\n"
+        "$ rg -q needle deleted.txt changed.txt\n"
+        "```\n"
+    )
+    body_file = tmp_path / "issue-body.md"
+    body_file.write_text(body, encoding="utf-8")
+
+    (repo / "deleted.txt").write_text("placeholder\n", encoding="utf-8")
+    (repo / "changed.txt").write_text("placeholder\n", encoding="utf-8")
+    base_sha = _commit_all(repo, "baseline")
+
+    baseline_result = _run_producer(repo=repo, body_file=body_file)
+    assert baseline_result["results"][0]["classification"] == "expected_fail"
+
+    (repo / "deleted.txt").unlink()
+    (repo / "changed.txt").write_text("needle\n", encoding="utf-8")
+    head_sha = _commit_all(repo, "delete one file, add needle to the other")
+
+    current_vc_result = _run_producer(
+        repo=repo,
+        body_file=body_file,
+        evidence_mode="current-head",
+        reviewed_head_sha=head_sha,
+    )
+    # The producer itself must refuse to certify this quiet partial success.
+    assert current_vc_result["status"] != "pass"
+    current_item = current_vc_result["results"][0]
+    assert current_item["exit_code"] == 0
+    assert current_item["classification"] == "unexpected_pass"
+
+    changed_paths = _git_diff_changed_paths(repo, base_sha, head_sha)
+    diff_summary = {"changed_paths": changed_paths, "head_sha": head_sha}
+    contract_snapshot = {
+        "schema": "CONTRACT_REVIEW_RESULT_V1",
+        "status": "go",
+        "body_sha256": baseline_result["source"]["body_sha256"],
+        "checks": {
+            "vc_preflight": {"classifications": [baseline_result["results"][0]]}
+        },
+    }
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=contract_snapshot,
+        current_vc_result=current_vc_result,
+        diff_summary=diff_summary,
+        allowed_paths=["deleted.txt", "changed.txt"],
+    )
+    assert result["overall_status"] != "pass"
+    assert result["blocking"] is True
+
+
+def test_e2e_negative_head_drift_never_resolves_via_pipeline(tmp_path: Path) -> None:
+    """(7) negative case: HEAD drift between the certified current-head run
+    and the diff_summary's head_sha must fail closed (indeterminate),
+    through the full real pipeline."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+
+    body = (
+        "## Allowed Paths\n"
+        "- tracked.txt\n\n"
+        "## Verification Commands\n\n"
+        "```bash\n"
+        "# AC1\n"
+        "$ rg -q hello tracked.txt\n"
+        "```\n"
+    )
+    body_file = tmp_path / "issue-body.md"
+    body_file.write_text(body, encoding="utf-8")
+
+    (repo / "tracked.txt").write_text("placeholder\n", encoding="utf-8")
+    base_sha = _commit_all(repo, "baseline")
+    baseline_result = _run_producer(repo=repo, body_file=body_file)
+
+    (repo / "tracked.txt").write_text("hello world\n", encoding="utf-8")
+    head_sha = _commit_all(repo, "implement AC1")
+
+    current_vc_result = _run_producer(
+        repo=repo,
+        body_file=body_file,
+        evidence_mode="current-head",
+        reviewed_head_sha=head_sha,
+    )
+    assert current_vc_result["status"] == "pass"
+
+    # HEAD drift: diff_summary claims a DIFFERENT head_sha than the one the
+    # current-head producer actually certified.
+    drifted_diff_summary = {"changed_paths": ["tracked.txt"], "head_sha": base_sha}
+    contract_snapshot = {
+        "schema": "CONTRACT_REVIEW_RESULT_V1",
+        "status": "go",
+        "body_sha256": baseline_result["source"]["body_sha256"],
+        "checks": {
+            "vc_preflight": {"classifications": [baseline_result["results"][0]]}
+        },
+    }
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=contract_snapshot,
+        current_vc_result=current_vc_result,
+        diff_summary=drifted_diff_summary,
+        allowed_paths=["tracked.txt"],
+    )
+    assert result["overall_status"] != "pass"
+    assert result["blocking"] is True
