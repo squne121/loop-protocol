@@ -103,7 +103,12 @@ def validate_common_schema(payload: dict, *, fixture_mode: bool) -> list[str]:
     return errors
 
 
-def validate_runtime_and_launches(payload: dict, expectations: dict, *, require_observed: bool = False) -> tuple[list[str], list[str]]:
+def validate_runtime_and_launches(
+    payload: dict,
+    expectations: dict,
+    *,
+    require_observed: bool = False,
+) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     codes: list[str] = []
     runtime_map = canonical_runtime_map(expectations)

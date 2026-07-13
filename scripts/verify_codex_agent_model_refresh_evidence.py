@@ -107,7 +107,10 @@ def validate(evidence: dict, evidence_path: Path) -> tuple[int, dict]:
         if pair not in REQUIRED_SMOKES or pair in seen_smokes:
             return fail("direct_smoke_invalid", f"unexpected or duplicate direct smoke: {pair!r}")
         if smoke.get("status") != "pass" or smoke.get("fallback_used") is not False:
-            return fail("model_unavailable_or_unsupported_effort", f"direct smoke did not pass without fallback: {pair!r}")
+            return fail(
+                "model_unavailable_or_unsupported_effort",
+                f"direct smoke did not pass without fallback: {pair!r}",
+            )
         try:
             observed_at = parse_time(smoke.get("observed_at"), "direct_smoke.observed_at")
         except (ValueError, TypeError) as exc:
