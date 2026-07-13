@@ -51,12 +51,46 @@ def _write_failure(output: Path | None, failure_class: str, failure_reason: str)
         print(text)
 
 
+class ConcurrencyMapParseError(ValueError):
+    """Raised by _parse_concurrency_entries() on a malformed name=value pair."""
+
+
+def _parse_concurrency_entries(entries: list[str] | None) -> dict[str, int]:
+    """Parse repeatable ``name=value`` CLI entries (Issue #1273 iteration 3
+    Major 3: --provider-concurrency / --profile-concurrency) into a
+    ``{name: positive_int}`` map. Raises ConcurrencyMapParseError with a
+    human-readable message on any malformed entry (missing '=', empty name,
+    non-integer or non-positive value) -- validated again downstream by
+    ``validate_fanout_request`` regardless, but a precise CLI-level error is
+    friendlier than a generic schema validation failure.
+    """
+    result: dict[str, int] = {}
+    for entry in entries or []:
+        if "=" not in entry:
+            raise ConcurrencyMapParseError(f"malformed concurrency entry {entry!r}: expected 'name=value'")
+        name, _, raw_value = entry.partition("=")
+        if not name:
+            raise ConcurrencyMapParseError(f"malformed concurrency entry {entry!r}: empty name")
+        try:
+            value = int(raw_value)
+        except ValueError as exc:
+            raise ConcurrencyMapParseError(
+                f"malformed concurrency entry {entry!r}: value must be an integer"
+            ) from exc
+        if value < 1:
+            raise ConcurrencyMapParseError(f"malformed concurrency entry {entry!r}: value must be >= 1")
+        result[name] = value
+    return result
+
+
 def build_fanout_request(
     subtask_request_files: list[Path],
     max_workers: int | None,
     max_subtasks: int | None,
     max_total_attempts: int | None,
     overall_timeout_sec: float | None,
+    provider_concurrency: list[str] | None,
+    profile_concurrency: list[str] | None,
     output: Path | None,
 ) -> int:
     """Build and validate a delegation_fanout_request_v1.
@@ -88,6 +122,17 @@ def build_fanout_request(
         request["max_total_attempts"] = max_total_attempts
     if overall_timeout_sec is not None:
         request["overall_timeout_sec"] = overall_timeout_sec
+
+    try:
+        provider_concurrency_map = _parse_concurrency_entries(provider_concurrency)
+        profile_concurrency_map = _parse_concurrency_entries(profile_concurrency)
+    except ConcurrencyMapParseError as exc:
+        _write_failure(output, "validation_error", str(exc))
+        return 1
+    if provider_concurrency_map:
+        request["provider_concurrency"] = provider_concurrency_map
+    if profile_concurrency_map:
+        request["profile_concurrency"] = profile_concurrency_map
 
     try:
         validate_fanout_request = _load_validate_fanout_request()
@@ -122,6 +167,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-subtasks", type=int, default=None)
     parser.add_argument("--max-total-attempts", type=int, default=None)
     parser.add_argument("--overall-timeout-sec", type=float, default=None)
+    parser.add_argument(
+        "--provider-concurrency",
+        dest="provider_concurrency",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="Per-provider concurrency limit, e.g. --provider-concurrency gemini=2. Repeatable.",
+    )
+    parser.add_argument(
+        "--profile-concurrency",
+        dest="profile_concurrency",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="Per-profile concurrency limit, e.g. --profile-concurrency github_research=1. Repeatable.",
+    )
     parser.add_argument("--output", type=Path, default=None)
     return parser
 
@@ -134,6 +195,8 @@ def main(argv: list[str] | None = None) -> int:
         max_subtasks=args.max_subtasks,
         max_total_attempts=args.max_total_attempts,
         overall_timeout_sec=args.overall_timeout_sec,
+        provider_concurrency=args.provider_concurrency,
+        profile_concurrency=args.profile_concurrency,
         output=args.output,
     )
 

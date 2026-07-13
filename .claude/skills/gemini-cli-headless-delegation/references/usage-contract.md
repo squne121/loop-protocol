@@ -1073,13 +1073,17 @@ delegation_fanout_request_v1:
   schema: delegation_fanout_request_v1
   subtasks:  # 必須。空リスト不可。各要素は既存 delegation_request_v1 をそのまま保持する。
     - schema: delegation_request_v1
-      provider: gemini | agy | auto
+      provider: gemini | agy  # provider: auto は fan-out child では禁止（下記参照）
       tool_profile: no_tools | grounded_research | local_asset_research | proposal_only | github_research
       objective: "..."
       instructions: ["...", "..."]
       output_sections: ["..."]
       context_files: ["..."]
       subtask_id: "<任意。省略時は subtask-<index> が自動採番される>"
+      # subtask_id は安全な charset のみ許可（英数字始まり、以降は英数字/_/./- のみ、
+      # 最大128文字、制御文字禁止。'..' や絶対パスは拒否される）。呼び出し側から見える
+      # 論理IDであり、ファイル名には決して使われない（orchestrator 内部生成の
+      # artifact_stem を使う。下記「subtask_id と artifact_stem の分離」参照）。
       # subtasks[] 自体をここに書くことは禁止（再帰 fan-out 不可、planner mode 不可）
   max_workers: 4          # 任意。既定 4。全体の同時実行数上限。
   max_subtasks: 20        # 任意。既定 20。dedupe 後 unique subtask 数の上限。
@@ -1092,6 +1096,17 @@ delegation_fanout_request_v1:
 トップレベルキーは closed set（`schema` / `subtasks` / `max_workers` / `max_subtasks` /
 `max_total_attempts` / `overall_timeout_sec` / `provider_concurrency` / `profile_concurrency`）で、
 未知キーは fail-closed で拒否される。
+
+#### subtask_id と artifact_stem の分離（Issue #1273 iteration 3 Blocker 1）
+
+`subtask_id` は呼び出し側が指定する**論理**識別子であり、`results[].subtask_id` や
+`deduplicated_aliases` に現れる。安全な charset（`^[A-Za-z0-9][A-Za-z0-9_.-]*$`、最大128文字、
+制御文字禁止）にバリデーションされるが、**ファイル名や内部プロセスレジストリのキーには一切使われない**。
+orchestrator は dedupe 後の各 unique subtask に対して、`{index:04d}-{fingerprint[:16]}` 形式の
+`artifact_stem`（完全に orchestrator 生成、caller が制御不能）を別途割り当て、request/result ファイル名
+と child process registry key にはこちらのみを使う。これにより `subtask_id` に `"../../outside"` の
+ような値を与えても path traversal は構造的に不可能であり、重複 `subtask_id`（バリデーションで拒否済み）
+による request/result 競合や process registry 上書きも発生しない。
 
 ### 実行前 exact dedupe
 
@@ -1109,10 +1124,16 @@ provider を一切起動せず `failed`（`max_subtasks_exceeded` / `max_total_a
 
 ### provider/profile 互換性 preflight（起動前検証）
 
-provider 起動前に、`SUPPORTED_PROVIDERS` / `AGY_SUPPORTED_PROFILES` / `PROVIDER_AUTO_ELIGIBLE_PROFILES`
+provider 起動前に、`SUPPORTED_PROVIDERS` / `AGY_SUPPORTED_PROFILES`
 （`run_gemini_headless.py` 正本）と `validate_request()` による完全な delegation_request_v1 検証を通し、
 非互換な組合せや無効なリクエストは provider を起動せず `failed`（`provider_profile_incompatible` /
 `validation_error`）として扱う。
+
+**`provider: auto` は fan-out child では禁止**（Issue #1273 iteration 3 Blocker 3）。`auto` は
+`run_delegation()` 内部で gemini → agy の順に再入し、その内部 fallback attempt は `max_total_attempts` にも provider 別 semaphore にも計上されない（child subprocess は 1 攻撃分の
+枠しか消費しないのに実際には 2 provider を呼び得る）。この二重計上/semaphore バイパスを閉じるため、
+v1 では `provider: auto` を preflight で一律拒否する。provider fallback が必要な場合は、呼び出し側が
+`gemini` / `agy` の subtask を明示的に個別 submit すること。
 
 ### Child からの mutation は fail-closed で禁止（AC12）
 
@@ -1170,6 +1191,9 @@ uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/build_fanou
   --subtask-request request-b.json \
   --max-workers 4 \
   --overall-timeout-sec 300 \
+  --provider-concurrency gemini=2 \
+  --provider-concurrency agy=1 \
+  --profile-concurrency github_research=1 \
   --output fanout-request.json
 
 uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/fan_out_orchestrator.py \
