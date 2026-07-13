@@ -47,18 +47,29 @@ import run_refinement_preflight as wrapper  # noqa: E402
 
 
 def test_py_compile_proof_v1():
-    """PY_COMPILE_PROOF_V1 must record all required fields and compile clean."""
+    """PY_SYNTAX_COMPILE_PROOF_V2 must record all required fields and compile clean.
+
+    Issue #1439 Scope Delta: build_py_compile_proof() moved from
+    PY_COMPILE_PROOF_V1 to PY_SYNTAX_COMPILE_PROOF_V2 (in-process bytes
+    compile, no source-tree bytecode cache). This is the only test in this
+    file updated for that change (test name kept stable for VC continuity)."""
     planner_script = SCRIPTS_DIR / "plan_refinement_loop.py"
     assert planner_script.exists(), f"planner script not found: {planner_script}"
 
     proof = wrapper.build_py_compile_proof(planner_script, REPO_ROOT)
 
     # Schema version
-    assert proof["schema_version"] == "PY_COMPILE_PROOF_V1"
+    assert proof["schema_version"] == "PY_SYNTAX_COMPILE_PROOF_V2"
 
-    # Required fields present
+    # Required fields present (V2: no "command" — in-process operations are
+    # described by operation_kind, not an executable argv)
     required = [
-        "command",
+        "operation_kind",
+        "source_mode",
+        "flags",
+        "dont_inherit",
+        "optimize",
+        "cache_write_expected",
         "py_compile_status",
         "python_version",
         "python_executable",
@@ -72,9 +83,17 @@ def test_py_compile_proof_v1():
     ]
     for field in required:
         assert field in proof, f"missing field: {field}"
+    assert "command" not in proof, (
+        "V2 must not carry a pseudo executable command for an in-process operation"
+    )
 
-    # Type checks
-    assert isinstance(proof["command"], list), "command must be a list (argv)"
+    # Type / value checks for the V2 semantics
+    assert proof["operation_kind"] == "in_process_compile"
+    assert proof["source_mode"] == "bytes"
+    assert proof["flags"] == 0
+    assert proof["dont_inherit"] is True
+    assert proof["optimize"] == -1
+    assert proof["cache_write_expected"] is False
     assert proof["py_compile_status"] in ("pass", "fail")
     assert isinstance(proof["python_version"], str)
     assert isinstance(proof["python_executable"], str)
