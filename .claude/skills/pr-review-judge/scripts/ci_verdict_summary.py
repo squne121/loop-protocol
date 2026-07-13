@@ -278,13 +278,64 @@ def classify_check(check: dict, pr_head_sha: str) -> dict:
     return entry
 
 
+def _entry_run_head_sha(entry: dict) -> Optional[str]:
+    """Return the run-detail SHA used internally for verdict selection."""
+    return entry.get("_run_head_sha") or entry.get("head_sha")
+
+
+def _latest_entry(entries: list[dict]) -> dict:
+    """Choose the latest completed check, breaking equal timestamps by run ID."""
+    return max(
+        entries,
+        key=lambda entry: (
+            entry.get("completed_at") or "",
+            entry.get("run_id") if isinstance(entry.get("run_id"), int) else -1,
+        ),
+    )
+
+
+def select_current_head_check_entries(entries: list[dict], pr_head_sha: str) -> list[dict]:
+    """Select one current-head result for duplicate (workflow, name) checks.
+
+    Run-detail head SHAs are intentionally internal: ``entry.head_sha`` remains the
+    value emitted by the original check entry.  A current-head non-skipped result
+    supersedes same-workflow/name skipped or stale duplicates.  If current-head
+    candidates are skipped only, their newest result remains selected and therefore
+    fail-closed.  A single entry or a same-name entry in another workflow keeps the
+    legacy independent behavior.
+    """
+    grouped: dict[tuple[str, str], list[dict]] = {}
+    for entry in entries:
+        key = (entry.get("workflow") or "", entry.get("name") or "")
+        grouped.setdefault(key, []).append(entry)
+
+    selected: list[dict] = []
+    for group in grouped.values():
+        current_head = [
+            entry for entry in group if _entry_run_head_sha(entry) == pr_head_sha
+        ]
+        if not current_head:
+            selected.extend(group)
+            continue
+
+        non_skipped = [
+            entry for entry in current_head if entry.get("conclusion") != "skipped"
+        ]
+        if non_skipped:
+            selected.append(_latest_entry(non_skipped))
+        else:
+            selected.append(_latest_entry(current_head))
+
+    return selected
+
+
 def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
     """
     check entry から verdict bucket を決定する。
     returns: "all_pass" | "failed" | "pending_or_queued" | "stale_head_sha" | "excluded"
     """
     # stale: head SHA mismatch
-    head_sha = entry.get("head_sha")
+    head_sha = _entry_run_head_sha(entry)
     if head_sha and head_sha != pr_head_sha:
         return "stale_head_sha"
 
@@ -497,11 +548,12 @@ def main() -> int:
     for raw in (raw_checks or []):
         entry = classify_check(raw, head_sha or expected_head_sha)
 
-        # 失敗・pending の場合、または expected_head_sha 指定時の pass check は run details を補完
+        # skipped を含む run detail を内部選択用に補完する。entry.head_sha は
+        # producer payload のまま保持し、summary schema を暗黙に変更しない。
         bucket = entry.get("bucket")
         # B2: pass check で expected_head_sha が指定されている場合も補完して head SHA 確認
         needs_details = (
-            bucket in ("fail", "pending", None)
+            bucket in ("fail", "pending", "skipping", None)
             or (bucket == "pass" and expected_head_sha is not None)
         )
         if needs_details and entry["run_id"] is not None:
@@ -515,10 +567,10 @@ def main() -> int:
                     entry["conclusion"] = None
                     entry["status"] = "unknown"
             else:
-                # Update head_sha from run
+                # Keep the run-detail SHA internal for same-check current-head selection.
                 run_head = run_data.get("headSha")
                 if run_head:
-                    entry["head_sha"] = run_head
+                    entry["_run_head_sha"] = run_head
                 # Update conclusion if available
                 run_conclusion = run_data.get("conclusion")
                 if run_conclusion and entry["conclusion"] is None:
@@ -534,10 +586,16 @@ def main() -> int:
                 if jobs:
                     entry["job_id"] = find_failed_job_id(jobs, entry["name"])
 
+        check_entries.append(entry)
+
+    check_entries = select_current_head_check_entries(
+        check_entries,
+        head_sha or expected_head_sha,
+    )
+
+    for entry in check_entries:
         verdict = determine_check_verdict(entry, head_sha or expected_head_sha)
         verdicts.append(verdict)
-
-        check_entries.append(entry)
 
         # log artifact: failed check のみ、--include-log-excerpt 指定時
         if include_log_excerpt and verdict == "failed" and entry.get("job_id"):
@@ -587,7 +645,10 @@ def main() -> int:
         "expected_head_sha": expected_head_sha,
         "head_sha": head_sha or "",
         "status": overall_status,
-        "checks": check_entries,
+        "checks": [
+            {key: value for key, value in entry.items() if key != "_run_head_sha"}
+            for entry in check_entries
+        ],
         "failed_checks": failed_checks,
         "pending_checks": pending_checks,
         "stale_checks": stale_checks,

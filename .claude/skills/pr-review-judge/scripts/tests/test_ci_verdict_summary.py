@@ -61,6 +61,7 @@ def make_mock_run_gh(
     checks_ok: bool = True,
     checks_err_msg: str = "",
     run_data: Optional[dict] = None,
+    run_data_by_id: Optional[dict[int, dict]] = None,
 ):
     """
     run_gh をモックする。
@@ -80,6 +81,10 @@ def make_mock_run_gh(
                 return False, None, checks_err_msg
             return True, checks_list, json.dumps(checks_list)
         if "run" in args and "view" in args and "--log" not in args:
+            if run_data_by_id is not None:
+                run_id = int(args[2])
+                data = run_data_by_id.get(run_id, {})
+                return True, data, json.dumps(data)
             if run_data is not None:
                 return True, run_data, json.dumps(run_data)
             return True, {}, "{}"
@@ -870,6 +875,154 @@ class TestPassCheckHeadShaVerification:
         # head_sha in run is STALE_SHA != HEAD_SHA → stale_head_sha
         assert out["status"] == "stale_head_sha"
         assert exit_code == EXIT_STALE
+
+
+class TestCurrentHeadDuplicateSelection:
+    """AC8-AC11: same-workflow/name checks are selected from current-head runs."""
+
+    @staticmethod
+    def _run_summary(checks: list[dict], runs: dict[int, dict]):
+        mock_fn = make_mock_run_gh(
+            head_sha=HEAD_SHA,
+            checks=checks,
+            run_data_by_id=runs,
+        )
+        with patch("ci_verdict_summary.run_gh", side_effect=mock_fn):
+            with patch("sys.argv", [
+                "ci_verdict_summary.py", "--pr", "1403", "--repo", "owner/repo",
+                "--expected-head-sha", HEAD_SHA,
+            ]):
+                import io
+                from contextlib import redirect_stdout
+
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    exit_code = main()
+        return exit_code, json.loads(buf.getvalue())
+
+    @staticmethod
+    def _run(run_id: int, conclusion: str, workflow: str = "Check Japanese Content"):
+        return {
+            "headSha": HEAD_SHA,
+            "conclusion": conclusion,
+            "status": "completed",
+            "workflowName": workflow,
+            "jobs": [{"databaseId": run_id, "name": "PR Body Japanese Check", "conclusion": conclusion}],
+            "databaseId": run_id,
+        }
+
+    def test_success_supersedes_same_workflow_skipped_retrospective(self):
+        """AC8: pull_request success wins over pull_request_review skipped."""
+        checks = [
+            {
+                "name": "PR Body Japanese Check", "bucket": "pass", "state": "SUCCESS",
+                "workflow": "Check Japanese Content", "event": "pull_request",
+                "link": "https://github.com/owner/repo/actions/runs/1001",
+                "startedAt": None, "completedAt": "2026-07-14T00:00:00Z",
+            },
+            {
+                "name": "PR Body Japanese Check", "bucket": "skipping", "state": "SKIPPED",
+                "workflow": "Check Japanese Content", "event": "pull_request_review",
+                "link": "https://github.com/owner/repo/actions/runs/1002",
+                "startedAt": None, "completedAt": "2026-07-14T00:01:00Z",
+            },
+        ]
+        exit_code, out = self._run_summary(checks, {
+            1001: self._run(1001, "success"),
+            1002: self._run(1002, "skipped"),
+        })
+        assert exit_code == EXIT_ALL_PASS
+        assert out["status"] == "all_pass"
+        assert out["failed_checks"] == []
+        assert len(out["checks"]) == 1
+        assert out["checks"][0]["run_id"] == 1001
+        assert out["checks"][0]["head_sha"] is None
+
+    def test_latest_completed_non_skipped_entry_is_the_only_selected_result(self):
+        """AC9: completed_at descending selects only the latest non-skipped result."""
+        checks = [
+            {
+                "name": "python-test", "bucket": "pass", "state": "SUCCESS",
+                "workflow": "CI", "event": "pull_request",
+                "link": "https://github.com/owner/repo/actions/runs/1101",
+                "startedAt": None, "completedAt": "2026-07-14T00:00:00Z",
+            },
+            {
+                "name": "python-test", "bucket": "fail", "state": "FAILURE",
+                "workflow": "CI", "event": "pull_request",
+                "link": "https://github.com/owner/repo/actions/runs/1102",
+                "startedAt": None, "completedAt": "2026-07-14T00:01:00Z",
+            },
+        ]
+        exit_code, out = self._run_summary(checks, {
+            1101: self._run(1101, "success", "CI"),
+            1102: self._run(1102, "failure", "CI"),
+        })
+        assert exit_code == EXIT_FAILED
+        assert out["status"] == "failed"
+        assert out["failed_checks"] == ["python-test"]
+        assert [entry["run_id"] for entry in out["checks"]] == [1102]
+
+    def test_equal_completed_at_uses_descending_run_id_tiebreak(self):
+        """AC9: equal completed_at is resolved by descending run_id."""
+        checks = [
+            {
+                "name": "lint", "bucket": "fail", "state": "FAILURE",
+                "workflow": "CI", "event": "pull_request",
+                "link": "https://github.com/owner/repo/actions/runs/1201",
+                "startedAt": None, "completedAt": "2026-07-14T00:00:00Z",
+            },
+            {
+                "name": "lint", "bucket": "pass", "state": "SUCCESS",
+                "workflow": "CI", "event": "pull_request",
+                "link": "https://github.com/owner/repo/actions/runs/1202",
+                "startedAt": None, "completedAt": "2026-07-14T00:00:00Z",
+            },
+        ]
+        exit_code, out = self._run_summary(checks, {
+            1201: self._run(1201, "failure", "CI"),
+            1202: self._run(1202, "success", "CI"),
+        })
+        assert exit_code == EXIT_ALL_PASS
+        assert out["status"] == "all_pass"
+        assert [entry["run_id"] for entry in out["checks"]] == [1202]
+
+    def test_skipped_only_current_head_required_check_remains_failed(self):
+        """AC10: no non-skipped candidate keeps the latest skipped check fail-closed."""
+        checks = [{
+            "name": "PR Body Japanese Check", "bucket": "skipping", "state": "SKIPPED",
+            "workflow": "Check Japanese Content", "event": "pull_request_review",
+            "link": "https://github.com/owner/repo/actions/runs/1301",
+            "startedAt": None, "completedAt": "2026-07-14T00:00:00Z",
+        }]
+        exit_code, out = self._run_summary(checks, {1301: self._run(1301, "skipped")})
+        assert exit_code == EXIT_FAILED
+        assert out["status"] == "failed"
+        assert out["failed_checks"] == ["PR Body Japanese Check"]
+
+    def test_same_name_in_another_workflow_is_not_collapsed(self):
+        """AC11: grouping uses workflow and name, preserving cross-workflow failure."""
+        checks = [
+            {
+                "name": "PR Body Japanese Check", "bucket": "pass", "state": "SUCCESS",
+                "workflow": "Check Japanese Content", "event": "pull_request",
+                "link": "https://github.com/owner/repo/actions/runs/1401",
+                "startedAt": None, "completedAt": "2026-07-14T00:00:00Z",
+            },
+            {
+                "name": "PR Body Japanese Check", "bucket": "skipping", "state": "SKIPPED",
+                "workflow": "Other workflow", "event": "pull_request_review",
+                "link": "https://github.com/owner/repo/actions/runs/1402",
+                "startedAt": None, "completedAt": "2026-07-14T00:01:00Z",
+            },
+        ]
+        exit_code, out = self._run_summary(checks, {
+            1401: self._run(1401, "success"),
+            1402: self._run(1402, "skipped", "Other workflow"),
+        })
+        assert exit_code == EXIT_FAILED
+        assert out["status"] == "failed"
+        assert out["failed_checks"] == ["PR Body Japanese Check"]
 
 
 # ---------------------------------------------------------------------------
