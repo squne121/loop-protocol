@@ -19,6 +19,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[4]
 HELPER = (
     REPO_ROOT
@@ -344,15 +346,145 @@ def test_given_candidate_missing_number_then_route_is_human_review_required() ->
     assert "missing_or_invalid_number" in payload["validation_errors"]["-1"]
 
 
-def test_given_candidate_missing_allowed_paths_then_route_is_human_review_required() -> None:
+def test_given_ignored_missing_allowed_paths_candidate_then_excludes_it_from_classifier_and_returns_proceed() -> None:
     current_file = FIXTURES_DIR / "current_1451_analog.json"
     current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
     exit_code, payload = _run_cli(
         current_number, current_file, FIXTURES_DIR / "candidates_missing_allowed_paths.json"
     )
-    assert payload["route"] == "human_review_required", payload
+    assert payload["route"] == "proceed", payload
     assert exit_code == EXIT_OK
-    assert "missing_allowed_paths" in payload["validation_errors"]["9456"]
+    assert "9456" not in payload["validation_errors"]
+    assert payload["candidates"] == []
+    ignored = payload["ignored_candidates"]
+    assert len(ignored) == 1
+    assert ignored[0]["issue_number"] == 9456
+    assert ignored[0]["reason"] == "ignored_missing_allowed_paths"
+    assert ignored[0]["url"] == "https://github.com/squne121/loop-protocol/issues/9456"
+    assert ignored[0]["updated_at"] == "2026-07-11T09:00:00Z"
+    assert ignored[0]["body_sha256"].startswith("sha256:")
+    assert ignored[0]["decision_sha256"].startswith("sha256:")
+
+
+def test_given_missing_allowed_paths_and_comparable_candidate_then_preserves_comparable_collision_route() -> None:
+    current_file = FIXTURES_DIR / "current_1451_analog.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    missing_path_candidates = json.loads(
+        (FIXTURES_DIR / "candidates_missing_allowed_paths.json").read_text(encoding="utf-8")
+    )
+    comparable_candidates = json.loads(
+        (FIXTURES_DIR / "candidates_path_only_false_positive.json").read_text(encoding="utf-8")
+    )
+    combined_file = current_file.parent / "_missing_allowed_paths_with_comparable.json"
+    combined_file.write_text(
+        json.dumps(missing_path_candidates + comparable_candidates, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    try:
+        exit_code, payload = _run_cli(current_number, current_file, combined_file)
+    finally:
+        combined_file.unlink(missing_ok=True)
+
+    assert exit_code == EXIT_OK
+    assert payload["route"] == "proceed_with_collision_evidence", payload
+    assert {candidate["issue_number"] for candidate in payload["candidates"]} == {9449, 9450}
+    assert payload["ignored_candidates"][0]["issue_number"] == 9456
+    assert payload["ignored_candidates"][0]["decision_sha256"].startswith("sha256:")
+
+
+def _write_overlap_inputs(tmp_path: Path, current: dict, candidates: list[dict]) -> tuple[Path, Path]:
+    current_file = tmp_path / "current.json"
+    candidates_file = tmp_path / "candidates.json"
+    current_file.write_text(json.dumps(current, ensure_ascii=False), encoding="utf-8")
+    candidates_file.write_text(json.dumps(candidates, ensure_ascii=False), encoding="utf-8")
+    return current_file, candidates_file
+
+
+def _legacy_candidate(number: int, *, state: str = "OPEN") -> dict:
+    return {
+        "number": number,
+        "title": "legacy scope",
+        "body": "## Outcome\n\nlegacy\n\n## In Scope\n\n- legacy\n",
+        "labels": [{"name": "phase/implementation"}],
+        "updatedAt": "2026-07-13T00:00:00Z",
+        "url": f"https://github.com/squne121/loop-protocol/issues/{number}",
+        "state": state,
+    }
+
+
+@pytest.mark.parametrize(
+    "section_body",
+    [
+        "",
+        "# path is intentionally absent\n",
+        "-\n",
+    ],
+    ids=["empty", "comment_only", "malformed_entry"],
+)
+def test_allowed_paths_heading_empty_or_comment_only_is_fail_closed(
+    tmp_path: Path, section_body: str
+) -> None:
+    current = json.loads((FIXTURES_DIR / "current_1451_analog.json").read_text(encoding="utf-8"))
+    candidate = _legacy_candidate(9550)
+    candidate["body"] += f"\n## Allowed Paths\n\n{section_body}"
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [candidate])
+
+    exit_code, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    assert exit_code == EXIT_OK
+    assert payload["route"] == "human_review_required", payload
+    assert payload["validation_errors"]["9550"] == ["invalid_allowed_paths"]
+    assert payload["ignored_candidates"] == []
+
+
+def test_open_legacy_predecessor_without_scope_is_unresolved_fail_closed(tmp_path: Path) -> None:
+    current = json.loads((FIXTURES_DIR / "current_1451_analog.json").read_text(encoding="utf-8"))
+    current["body"] += "\nDepends on #9551\n"
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [_legacy_candidate(9551)])
+
+    exit_code, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    assert exit_code == EXIT_OK
+    assert payload["route"] == "human_review_required", payload
+    assert payload["dependency_resolution"]["unresolved_refs"] == ["9551"]
+
+
+def test_open_native_predecessor_without_scope_is_unresolved_fail_closed(tmp_path: Path) -> None:
+    current = json.loads((FIXTURES_DIR / "current_1451_analog.json").read_text(encoding="utf-8"))
+    current["blockedBy"] = [{"repository": DEFAULT_REPO, "number": 9552, "state": "OPEN"}]
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [_legacy_candidate(9552)])
+
+    exit_code, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    assert exit_code == EXIT_OK
+    assert payload["route"] == "human_review_required", payload
+    assert payload["dependency_resolution"]["unresolved_refs"] == ["9552"]
+
+
+def test_closed_predecessor_without_scope_is_not_an_open_scope_blocker(tmp_path: Path) -> None:
+    current = json.loads((FIXTURES_DIR / "current_1451_analog.json").read_text(encoding="utf-8"))
+    current["body"] += "\nDepends on #9553\n"
+    current_file, candidates_file = _write_overlap_inputs(
+        tmp_path, current, [_legacy_candidate(9553, state="CLOSED")]
+    )
+
+    exit_code, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    assert exit_code == EXIT_OK
+    assert payload["route"] == "proceed", payload
+    assert payload["dependency_resolution"]["unresolved_refs"] == []
+
+
+def test_cross_repository_native_predecessor_is_unresolved_fail_closed(tmp_path: Path) -> None:
+    current = json.loads((FIXTURES_DIR / "current_1451_analog.json").read_text(encoding="utf-8"))
+    current["blockedBy"] = [{"repository": "other/repository", "number": 9554, "state": "OPEN"}]
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [])
+
+    exit_code, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    assert exit_code == EXIT_OK
+    assert payload["route"] == "human_review_required", payload
+    assert payload["dependency_resolution"]["unresolved_refs"] == ["other/repository#9554"]
 
 
 def test_saturation_boundary_limit_minus_one_limit_and_limit_plus_one() -> None:
@@ -495,6 +627,8 @@ def test_evidence_schema_contains_implement_scope_collision_preflight_v1_fields(
     source = payload["source"]
     assert isinstance(source["complete"], bool)
     assert isinstance(source["saturated"], bool)
+    assert isinstance(source["limit"], int)
+    assert source["limit"] == 100
     assert "collected_at" in source
 
     assert isinstance(payload["candidates"], list)
@@ -510,6 +644,7 @@ def test_evidence_schema_contains_implement_scope_collision_preflight_v1_fields(
         assert "non_conflict_reason" in cand
 
     assert "dependency_resolution" in payload
+    assert isinstance(payload["ignored_candidates"], list)
     assert "validation_errors" in payload
     assert payload["route"] in ROUTES
     assert payload["decision_inputs_sha256"].startswith("sha256:")

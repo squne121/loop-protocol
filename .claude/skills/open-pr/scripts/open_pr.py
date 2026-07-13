@@ -20,6 +20,17 @@ import sys
 import tempfile
 from pathlib import Path
 import re
+from datetime import date
+
+import yaml
+
+_ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR = (
+    Path(__file__).resolve().parent.parent.parent / "issue-contract-review" / "scripts"
+)
+if str(_ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR))
+
+import contract_review_result_parser as contract_review_parser
 
 E_APPROVAL_MISSING = "E_APPROVAL_MISSING"
 E_PR_BODY_VALIDATION_FAILED = "E_PR_BODY_VALIDATION_FAILED"
@@ -40,6 +51,14 @@ E_OVERLAP_PREFLIGHT_SOURCE_FAILURE = "E_OVERLAP_PREFLIGHT_SOURCE_FAILURE"
 # 再実行するのみ（#1458 の Out of Scope）。
 OVERLAP_PREFLIGHT_SCHEMA = "IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1"
 OVERLAP_PREFLIGHT_SAFE_ROUTES = frozenset({"proceed", "proceed_with_collision_evidence"})
+
+# #1477 の contract にだけ許容された、期限付きで固定された readback waiver。
+# 任意の Issue / 理由を consumer が受け入れる一般機構にはしない。
+OVERLAP_READBACK_WAIVER_ISSUE_NUMBERS = frozenset({519, 520, 1429})
+OVERLAP_READBACK_WAIVER_REASON = "human_approved_readback_ignore"
+OVERLAP_READBACK_WAIVER_APPROVED_BY = "user_session"
+OVERLAP_READBACK_WAIVER_REPOSITORY = "squne121/loop-protocol"
+OVERLAP_READBACK_WAIVER_LINKED_ISSUE = 1477
 
 # linked issue がこのラベルを持つ場合、`overlap_preflight` が未指定または
 # `required: false` でも gate を省略しない（AC2, bypass-via-omission 対策）。
@@ -564,6 +583,146 @@ def _load_overlap_preflight_evidence(
     return stored, None
 
 
+def _positive_overlap_source_limit(evidence: dict) -> int | None:
+    """evidence の ``source.limit`` を再検証用の正の整数として読む。"""
+    source = evidence.get("source")
+    if not isinstance(source, dict):
+        return None
+    limit = source.get("limit")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        return None
+    return limit
+
+
+def _extract_waiver_from_live_contract(text: str) -> dict | None:
+    """live Issue body の waiver 設定だけを読む。
+
+    CONTRACT_REVIEW_RESULT_V1 の comment 走査は共有 parser の責務であり、ここで
+    独自に解釈しない。"""
+    blocks = re.findall(r"```yaml\s*\n(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+    for block in blocks:
+        if "overlap_readback_waiver" not in block:
+            continue
+        try:
+            payload = yaml.safe_load(block)
+        except yaml.YAMLError:
+            continue
+        waiver = payload.get("overlap_readback_waiver") if isinstance(payload, dict) else None
+        if isinstance(waiver, dict):
+            return waiver
+    return None
+
+
+def _load_verified_overlap_readback_waiver(
+    repo: str,
+    linked_issue: int,
+    *,
+    today: date | None = None,
+) -> tuple[dict | None, str | None]:
+    """live body と最新の trusted ``status: go`` snapshot が同一 SHA の waiver を返す。
+
+    Issue 本文だけ、または古い contract snapshot だけでは waiver を有効化しない。
+    戻り値の error detail は gate 側で fail-closed の監査情報に使う。
+    """
+    if (
+        repo.strip().lower() != OVERLAP_READBACK_WAIVER_REPOSITORY
+        or linked_issue != OVERLAP_READBACK_WAIVER_LINKED_ISSUE
+    ):
+        return None, "overlap_readback_waiver の対象 repository / linked issue が固定 binding と一致しません"
+
+    try:
+        result = run_gh(
+            "issue",
+            "view",
+            str(linked_issue),
+            "--repo",
+            repo,
+            "--json",
+            "body,url",
+        )
+        issue = json.loads(result.stdout)
+    except (subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        return None, f"contract snapshot の取得に失敗: {exc}"
+    if not isinstance(issue, dict):
+        return None, "contract snapshot の Issue payload が object ではありません"
+    body = issue.get("body")
+    url = issue.get("url")
+    expected_url = (
+        f"https://github.com/{OVERLAP_READBACK_WAIVER_REPOSITORY}/issues/"
+        f"{OVERLAP_READBACK_WAIVER_LINKED_ISSUE}"
+    )
+    if not isinstance(body, str) or url != expected_url:
+        return None, "contract snapshot の Issue payload が固定 waiver target と一致しません"
+
+    body_sha256 = f"sha256:{hashlib.sha256(body.encode('utf-8')).hexdigest()}"
+    waiver = _extract_waiver_from_live_contract(body)
+    if not isinstance(waiver, dict):
+        return None, "live contract に overlap_readback_waiver がありません"
+
+    expected_waiver = {
+        "issue_numbers": [519, 520, 1429],
+        "reason": OVERLAP_READBACK_WAIVER_REASON,
+        "expires_on": "2026-07-13",
+        "approved_by": OVERLAP_READBACK_WAIVER_APPROVED_BY,
+    }
+    if waiver != expected_waiver:
+        return None, "overlap_readback_waiver が固定 contract と完全一致しません"
+    if (today or date.today()) > date.fromisoformat(expected_waiver["expires_on"]):
+        return None, "overlap_readback_waiver の期限が切れています"
+
+    comments, comments_error = contract_review_parser.fetch_issue_comments(linked_issue, repo)
+    if comments_error is not None:
+        return None, f"contract snapshot comment readback が不完全です: {comments_error}"
+    latest = contract_review_parser.find_latest_result(
+        contract_review_parser.parse_contract_review_results(
+            comments, expected_issue_url=expected_url
+        ),
+        trusted_only=True,
+    )
+    if latest is None:
+        return None, "trusted contract snapshot がありません"
+    if latest.get("status") != "go":
+        return None, "最新 trusted contract snapshot が status: go ではありません"
+    inner = latest.get("inner")
+    if not isinstance(inner, dict) or inner.get("body_sha256") != body_sha256:
+        return None, "最新 trusted status: go contract snapshot の body SHA が live body と一致しません"
+    return waiver, None
+
+
+def _has_only_fixed_readback_incomplete_blockers(fresh: dict) -> bool:
+    """固定3件の readback_incomplete だけが route を妨げる場合に限り True。"""
+    if fresh.get("route") != "human_review_required":
+        return False
+    candidates = fresh.get("candidates")
+    if not isinstance(candidates, list):
+        return False
+    incomplete = [
+        candidate for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("readback_complete") is False
+    ]
+    if len(incomplete) != len(OVERLAP_READBACK_WAIVER_ISSUE_NUMBERS):
+        return False
+    numbers = {candidate.get("issue_number") for candidate in incomplete}
+    if numbers != OVERLAP_READBACK_WAIVER_ISSUE_NUMBERS:
+        return False
+    for candidate in incomplete:
+        reasons = candidate.get("reasons")
+        if (
+            not isinstance(reasons, list)
+            or not reasons
+            or not all(isinstance(reason, str) and reason.startswith("readback_incomplete") for reason in reasons)
+        ):
+            return False
+    # readback が完了した candidate 側に C2b/C3/unknown が残っていれば、
+    # human_review_required の原因をこの waiver だけとは証明できない。
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or candidate.get("readback_complete") is False:
+            continue
+        if candidate.get("policy_class") not in {"C1", "C2a"}:
+            return False
+    return True
+
+
 def _overlap_preflight_safety_reason(fresh: dict, linked_issue: int) -> str | None:
     """AC4 の安全性 predicate を検証する。violation があれば理由文字列、
     なければ None を返す。"""
@@ -647,6 +806,18 @@ def run_overlap_preflight_gate(
             None,
         )
 
+    # stored evidence の embedded hash と decision-input provenance を確認した
+    # 後にだけ、収集境界を固定する candidate limit を利用する。呼び出し元が
+    # 任意値で上書きできないよう、唯一の入力はこの verified evidence とする。
+    stored_limit = _positive_overlap_source_limit(stored)
+    if stored_limit is None:
+        return (
+            False,
+            E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID,
+            "stored source.limit が正の整数ではありません",
+            None,
+        )
+
     cmd = [
         sys.executable,
         str(_CHECK_IMPLEMENTATION_OVERLAP_SCRIPT),
@@ -654,6 +825,8 @@ def run_overlap_preflight_gate(
         str(linked_issue),
         "--repo",
         repo,
+        "--limit",
+        str(stored_limit),
     ]
     try:
         cp = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=90)
@@ -683,6 +856,22 @@ def run_overlap_preflight_gate(
     if not isinstance(fresh, dict):
         return False, E_OVERLAP_PREFLIGHT_SOURCE_FAILURE, "non-object JSON output", None
 
+    fresh_limit = _positive_overlap_source_limit(fresh)
+    if fresh_limit is None:
+        return (
+            False,
+            E_OVERLAP_PREFLIGHT_DRIFT,
+            "fresh source.limit が正の整数ではありません",
+            fresh,
+        )
+    if fresh_limit != stored_limit:
+        return (
+            False,
+            E_OVERLAP_PREFLIGHT_DRIFT,
+            f"source.limit drift: stored={stored_limit} fresh={fresh_limit}",
+            fresh,
+        )
+
     fresh_decision_inputs = fresh.get("decision_inputs_sha256")
     if expected_decision_inputs_sha256 is None or fresh_decision_inputs != expected_decision_inputs_sha256:
         return (
@@ -695,6 +884,27 @@ def run_overlap_preflight_gate(
 
     unsafe_reason = _overlap_preflight_safety_reason(fresh, linked_issue)
     if unsafe_reason is not None:
+        # #1477: route が human_review_required になった原因が、integrity を
+        # 確認できる期限付き contract waiver の固定3件だけであるときに限り、
+        # その3 candidate を既存の safe-route 判定から除外する。他の source /
+        # dependency / validation failure はこの clone 後にも必ず判定される。
+        if _has_only_fixed_readback_incomplete_blockers(fresh):
+            waiver, waiver_error = _load_verified_overlap_readback_waiver(repo, linked_issue)
+            if waiver_error is not None:
+                return (
+                    False,
+                    E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID,
+                    f"overlap_readback_waiver が検証できません: {waiver_error}",
+                    fresh,
+                )
+            effective_fresh = dict(fresh)
+            if waiver is not None:
+                effective_fresh["route"] = "proceed_with_collision_evidence"
+                remaining_unsafe_reason = _overlap_preflight_safety_reason(
+                    effective_fresh, linked_issue
+                )
+                if remaining_unsafe_reason is None:
+                    return True, None, "", effective_fresh
         return False, E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE, unsafe_reason, fresh
 
     return True, None, "", fresh

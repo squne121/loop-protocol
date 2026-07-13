@@ -137,6 +137,7 @@ _DEPENDS_ON_RE = re.compile(r"[Dd]epends\s+on\s+#(\d+)")
 _PARENT_ISSUE_RE = re.compile(r"^parent_issue:\s*\"?#?(\d+)\"?", re.MULTILINE)
 
 _DEPENDENCY_CONTRACT_KEYS = ("blocked_by", "depends_on", "supersedes")
+_ALLOWED_PATHS_HEADING_RE = re.compile(r"^##\s+Allowed Paths\s*$", re.MULTILINE)
 
 
 class OverlapRuntimeError(RuntimeError):
@@ -335,8 +336,9 @@ def _extract_native_dependency_numbers(
     issue-dependencies endpoint 由来、Blocker 4/5）と、legacy fixture の簡易形
     （`[N, ...]` / `[{"number": N}, ...]`、repository 情報なし）の両方を許容
     する。typed record が `repository` を持ち、かつ `current_repo` が指定され
-    ている場合は同一 repository 制約を検証し、不一致は除外する（cross-repo
-    dependency は既存の number-based resolver に接続しない）。
+    ている場合は同一 repository 制約を検証する。不一致は ``repo#number`` の
+    namespaced ref として残し、ローカル Issue 番号と誤結合せず unresolved
+    dependency として fail-closed にする。
     """
     val = raw.get(key)
     if not isinstance(val, list):
@@ -347,6 +349,9 @@ def _extract_native_dependency_numbers(
             repo_field = item.get("repository")
             if repo_field is not None and current_repo is not None:
                 if str(repo_field).lower() != current_repo.lower():
+                    digits = _ref_digits(item["number"])
+                    if digits:
+                        out.append(f"{str(repo_field).lower()}#{digits}")
                     continue
             digits = _ref_digits(item["number"])
         elif isinstance(item, (int, str)):
@@ -742,8 +747,15 @@ def _validate_candidate_schema(raw: Dict[str, Any]) -> List[str]:
     if not updated_at:
         errors.append("missing_updated_at")
     if body:
-        if not extract_allowed_paths(body):
+        # 見出しが存在しない legacy Issue だけを classifier 入力から除外できる。
+        # 見出しがあるのに空/コメントだけ/正規化不能なら、scope が不明なため
+        # fail-closed にする。
+        has_allowed_paths_heading = _ALLOWED_PATHS_HEADING_RE.search(body) is not None
+        paths = extract_allowed_paths(body)
+        if not has_allowed_paths_heading:
             errors.append("missing_allowed_paths")
+        elif not paths or any(path in {"-", "*", "+"} for path in paths):
+            errors.append("invalid_allowed_paths")
         # Machine-Readable Contract が存在する場合は壊れていないことだけ確認
         # （存在しない contract は許容 — legacy issue 互換）。
         try:
@@ -852,6 +864,9 @@ def _resolve_dependency(
             unresolved_refs.append(ref)
             continue
         cand_paths = scope.effective_allowed_paths()
+        if str(scope.state).upper() == "OPEN" and not cand_paths:
+            unresolved_refs.append(ref)
+            continue
         if not allowed_paths_overlap(current_paths, cand_paths):
             continue
         if str(scope.state).upper() == "OPEN":
@@ -882,8 +897,10 @@ def build_evidence(
     current_paths: Sequence[str],
     source_complete: bool,
     source_saturated: bool,
+    source_limit: int,
     collected_at: str,
     candidates_evidence: List[Dict[str, Any]],
+    ignored_candidates: List[Dict[str, Any]],
     dependency_resolution: Dict[str, Any],
     validation_errors: Dict[int, List[str]],
     route: str,
@@ -893,6 +910,7 @@ def build_evidence(
         candidates_evidence,
         key=lambda c: (c["issue_number"] is None, c["issue_number"] or 0),
     )
+    ordered_ignored = sorted(ignored_candidates, key=lambda c: c["issue_number"])
 
     decision_payload: Dict[str, Any] = {
         "schema": SCHEMA,
@@ -905,8 +923,10 @@ def build_evidence(
         "source": {
             "complete": source_complete,
             "saturated": source_saturated,
+            "limit": source_limit,
         },
         "candidates": ordered,
+        "ignored_candidates": ordered_ignored,
         "dependency_resolution": dependency_resolution,
         "validation_errors": {str(k): v for k, v in sorted(validation_errors.items())},
         "route": route,
@@ -925,9 +945,11 @@ def build_evidence(
         "source": {
             "complete": source_complete,
             "saturated": source_saturated,
+            "limit": source_limit,
             "collected_at": collected_at,
         },
         "candidates": ordered,
+        "ignored_candidates": ordered_ignored,
         "dependency_resolution": dependency_resolution,
         "validation_errors": {str(k): v for k, v in sorted(validation_errors.items())},
         "route": route,
@@ -957,13 +979,39 @@ def _classify(
     current_contract = _contract_schema_keys(current_body)
 
     # --- 全 candidate の schema validation（Major 5） ---
+    # Allowed Paths 未記載だけの legacy candidate は、collision classifier の
+    # 比較対象にはできない。その候補は validation error にせず、evidence に
+    # provenance を残して classifier 入力から除外する。number/body/updatedAt/
+    # dependency contract など他の schema error が併存する場合は従来どおり
+    # fail-closed とする。
     validation_errors: Dict[int, List[str]] = {}
+    ignored_candidates: List[Dict[str, Any]] = []
+    comparable_raw: List[Dict[str, Any]] = []
     for raw in candidates_raw:
         number = raw.get("number")
         errors = _validate_candidate_schema(raw)
+        if errors == ["missing_allowed_paths"] and isinstance(number, int):
+            body = raw.get("body")
+            audit_payload = {
+                "issue_number": number,
+                "reason": "ignored_missing_allowed_paths",
+                "url": raw.get("url") if isinstance(raw.get("url"), str) else None,
+                "updated_at": raw.get("updatedAt"),
+                "body_sha256": (
+                    f"sha256:{_sha256(body)}" if isinstance(body, str) and body else None
+                ),
+            }
+            ignored_candidates.append(
+                {
+                    **audit_payload,
+                    "decision_sha256": f"sha256:{_sha256(_canonical_json(audit_payload))}",
+                }
+            )
+            continue
         if errors:
             key = number if isinstance(number, int) else -1
             validation_errors[key] = errors
+        comparable_raw.append(raw)
 
     candidate_bodies: Dict[str, str] = {}
     candidate_updated_at: Dict[str, Optional[str]] = {}
@@ -972,7 +1020,6 @@ def _classify(
     candidate_scopes: List[IssueScope] = []
     for raw in candidates_raw:
         scope = _issue_scope_from_raw(raw, current_repo=repository)
-        candidate_scopes.append(scope)
         if scope.number is not None:
             key = str(scope.number)
             body_text = str(raw.get("body") or "")
@@ -980,6 +1027,8 @@ def _classify(
             candidate_updated_at[key] = raw.get("updatedAt")
             candidate_contracts[key] = _contract_schema_keys(body_text)
             scope_pool[key] = scope
+    for raw in comparable_raw:
+        candidate_scopes.append(_issue_scope_from_raw(raw, current_repo=repository))
 
     current = IssueScope(
         title=str(current_raw.get("title", "")),
@@ -1114,6 +1163,7 @@ def _classify(
             "source_complete": source_complete,
             "saturated": saturated,
             "candidates_evidence": candidates_evidence,
+            "ignored_candidates": ignored_candidates,
             "dependency_resolution": dependency_resolution,
             "validation_errors": validation_errors,
         }
@@ -1156,6 +1206,7 @@ def _classify(
         "source_complete": source_complete,
         "saturated": saturated,
         "candidates_evidence": candidates_evidence,
+        "ignored_candidates": ignored_candidates,
         "dependency_resolution": dependency_resolution,
         "validation_errors": validation_errors,
     }
@@ -1255,6 +1306,11 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             for ref in refs:
                 if ref in known_numbers:
                     continue
+                if not ref.isdigit():
+                    # cross-repo native dependency は number-only readback に
+                    # 接続できない。_resolve_dependency で unresolved として
+                    # evidence 化し、route を fail-closed にする。
+                    continue
                 fetched = fetch_predecessor_issue(repo, int(ref))
                 if fetched is not None:
                     candidates_raw.append(fetched)
@@ -1321,8 +1377,10 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             current_paths=ctx["current_paths"],
             source_complete=ctx["source_complete"],
             source_saturated=ctx["saturated"],
+            source_limit=args.limit,
             collected_at=collected_at,
             candidates_evidence=ctx["candidates_evidence"],
+            ignored_candidates=ctx["ignored_candidates"],
             dependency_resolution=ctx["dependency_resolution"],
             validation_errors=ctx["validation_errors"],
             route=route,
