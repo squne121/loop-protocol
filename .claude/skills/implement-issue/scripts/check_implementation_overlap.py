@@ -87,10 +87,15 @@ from check_issue_overlap import (  # noqa: E402
     SOURCE_OK,
     SOURCE_SATURATED,
     IssueScope,
+    PathScopeKind,
     SourceStatus,
     allowed_paths_overlap,
     classify_overlap,
+    classify_path_scope_kind,
+    extract_allowed_path_entries,
     extract_allowed_paths,
+    normalize_path,
+    paths_conflict,
 )
 
 SCHEMA = "IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1"
@@ -131,6 +136,7 @@ _TOKEN_RE = re.compile(r"[0-9A-Za-z]+|[぀-ヿ一-鿿]")
 _AC_ID_RE = re.compile(r"\bAC(\d+)\b")
 _SCHEMA_NAME_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_V\d+\b")
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_LOW_SPECIFICITY_PATHS = frozenset({"package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"})
 
 # workflow.md の "Depends on #N" line-anchored dependency 表記（legacy）
 _DEPENDS_ON_RE = re.compile(r"[Dd]epends\s+on\s+#(\d+)")
@@ -479,9 +485,10 @@ def _structural_collision_signals(
         or (cur_key and cur_key in cand_deps.get("supersedes", ()))
     )
 
+    # ordinal AC ID は無関係な implementation issue にも反復するため evidence
+    # 専用の weak signal とし、strong collision の根拠には使わない。
     has_signal = bool(
-        shared_ac
-        or shared_schema
+        shared_schema
         or shared_targets
         or shared_goal_ref
         or edit_intent_match
@@ -498,6 +505,36 @@ def _structural_collision_signals(
         "explicit_supersession": explicit_supersession,
         "has_structural_collision": has_signal and not explicit_supersession,
     }
+
+
+def _path_signal_reasons(current_body: str, cand_body: str) -> List[str]:
+    """raw path kind を用いて、weak path signal の説明コードを返す。"""
+    low_specificity_only = False
+    broad_prefix_only = False
+    for current_entry in extract_allowed_path_entries(current_body):
+        for candidate_entry in extract_allowed_path_entries(cand_body):
+            current_path = normalize_path(current_entry)
+            candidate_path = normalize_path(candidate_entry)
+            if not paths_conflict(current_path, candidate_path):
+                continue
+            current_kind = classify_path_scope_kind(current_entry)
+            candidate_kind = classify_path_scope_kind(candidate_entry)
+            if current_path == candidate_path and current_path in _LOW_SPECIFICITY_PATHS:
+                low_specificity_only = True
+            if (
+                current_path != candidate_path
+                and (
+                    current_kind in {PathScopeKind.DIRECTORY, PathScopeKind.RECURSIVE_GLOB}
+                    or candidate_kind in {PathScopeKind.DIRECTORY, PathScopeKind.RECURSIVE_GLOB}
+                )
+            ):
+                broad_prefix_only = True
+    reasons: List[str] = []
+    if low_specificity_only:
+        reasons.append("low_specificity_path_only")
+    if broad_prefix_only:
+        reasons.append("broad_prefix_only")
+    return reasons
 
 
 # ============================================================
@@ -540,23 +577,35 @@ def fetch_implementation_candidates(
 ) -> Tuple[List[Dict[str, Any]], bool]:
     """OPEN かつ ``phase/implementation`` ラベルを持つ Issue を列挙する。
 
-    Returns (candidates_raw, saturated)。``saturated`` は取得件数が limit に
-    到達し全件性を証明できないことを表す（fail-closed の入力）。
+    REST pagination を最後のページまで読むため、既定の ``--limit`` 到達を
+    saturation と誤認しない。``limit`` は evidence 互換のために受け取るが、
+    online source の全件性を切り詰める用途には使わない。
     """
     data = _run_gh_json(
         [
-            "gh", "issue", "list",
-            "--repo", repo,
-            "--label", "phase/implementation",
-            "--state", "open",
-            "--json", "number,title,body,labels,updatedAt,url",
-            "--limit", str(limit),
+            "gh", "api", "--paginate", "--slurp", "-X", "GET", f"repos/{repo}/issues",
+            "-f", "state=open",
+            "-f", "labels=phase/implementation",
+            "-f", "per_page=100",
         ]
     )
-    if not isinstance(data, list):
-        raise OverlapRuntimeError("gh issue list did not return a JSON array")
-    saturated = len(data) >= limit
-    return data, saturated
+    if not isinstance(data, list) or any(not isinstance(page, list) for page in data):
+        raise OverlapRuntimeError("gh api --paginate did not return JSON page arrays")
+    raw_items = [item for page in data for item in page]
+    if any(not isinstance(item, dict) for item in raw_items):
+        raise OverlapRuntimeError("gh api --paginate returned a non-object issue")
+    # REST `/issues` は pull request も返すため除外し、REST の snake_case を
+    # adapter の既存 raw schema（gh issue view/list 由来）へ正規化する。
+    candidates = [
+        {
+            **item,
+            "updatedAt": item.get("updated_at"),
+            "url": item.get("html_url", item.get("url", "")),
+        }
+        for item in raw_items
+        if "pull_request" not in item
+    ]
+    return candidates, False
 
 
 def fetch_predecessor_issue(repo: str, number: int) -> Optional[Dict[str, Any]]:
@@ -807,6 +856,8 @@ def _readback_candidate(
         cand_number, cand_body, cand_contract,
     )
     structural_collision = structural["has_structural_collision"]
+    weak_path_reasons = _path_signal_reasons(current_body, cand_body)
+    ordinal_only = bool(structural["shared_ac_ids"]) and not structural_collision
 
     collision = structural_collision or text_signal
     non_conflict_reason = None
@@ -829,6 +880,7 @@ def _readback_candidate(
         "heading_overlap": collision,
         "text_similarity": text_similarity,
         "structural_signals": structural,
+        "weak_signal_reasons": weak_path_reasons + (["ordinal_ac_id_only"] if ordinal_only else []),
         "non_conflict_reason": non_conflict_reason,
     }
 
@@ -1144,7 +1196,7 @@ def _classify(
                 ),
                 "structural_signals": structural,
                 "policy_class": policy_class,
-                "reasons": reasons,
+                "reasons": reasons + list(rb.get("weak_signal_reasons") or []),
                 "non_conflict_reason": rb["non_conflict_reason"],
             }
         )

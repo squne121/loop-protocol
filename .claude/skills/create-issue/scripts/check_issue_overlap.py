@@ -44,6 +44,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -133,15 +134,25 @@ _PAREN_ANNOTATION_RE = re.compile(r"\s*[（(][^）)]*[）)]\s*$")
 _MULTI_SLASH_RE = re.compile(r"/{2,}")
 
 
-def normalize_path(entry: str) -> str:
-    """Allowed Paths の 1 エントリを bare path に正規化する。
+class PathScopeKind(str, Enum):
+    """Allowed Paths の raw entry が表す範囲。
 
-    対応:
-    - bullet marker（- + *）と番号付きリスト（1. / 1)）の除去
-    - backtick 包み（`path`）と末尾の全角/半角括弧注釈の除去
-    - 先頭の ``./``、連続スラッシュの圧縮、末尾スラッシュの除去
-    - 末尾 glob ``/**`` / ``/*`` は basedir に畳む（prefix 比較で吸収するため）
+    末尾 slash / glob のように明示された記法だけを directory scope として
+    扱う。拡張子の有無から directory を推測しないため、README や Makefile
+    のような拡張子なしの exact file を broad path に誤分類しない。
     """
+
+    EXACT = "EXACT"
+    DIRECTORY = "DIRECTORY"
+    RECURSIVE_GLOB = "RECURSIVE_GLOB"
+    UNKNOWN = "UNKNOWN"
+
+
+_KNOWN_EXTENSIONLESS_FILES = frozenset({"README", "LICENSE", "Dockerfile", "Makefile"})
+
+
+def _clean_path_entry(entry: str) -> str:
+    """正規化前に path entry の Markdown 装飾だけを外す。"""
     s = entry.strip()
     s = _BULLET_RE.sub("", s).strip()
     m = _CODE_RE.match(s)
@@ -153,7 +164,34 @@ def normalize_path(entry: str) -> str:
     s = _PAREN_ANNOTATION_RE.sub("", s).strip()
     if s.startswith("./"):
         s = s[2:]
-    s = _MULTI_SLASH_RE.sub("/", s)
+    return _MULTI_SLASH_RE.sub("/", s)
+
+
+def classify_path_scope_kind(entry: str) -> PathScopeKind:
+    """raw Allowed Paths entry から、推測ではなく記法で path kind を判定する。"""
+    raw = _clean_path_entry(entry)
+    if not raw:
+        return PathScopeKind.UNKNOWN
+    if raw.endswith("/**") or raw.endswith("/*"):
+        return PathScopeKind.RECURSIVE_GLOB
+    if raw.endswith("/"):
+        return PathScopeKind.DIRECTORY
+    basename = raw.rsplit("/", 1)[-1]
+    if basename in _KNOWN_EXTENSIONLESS_FILES or "." in basename:
+        return PathScopeKind.EXACT
+    return PathScopeKind.UNKNOWN
+
+
+def normalize_path(entry: str) -> str:
+    """Allowed Paths の 1 エントリを bare path に正規化する。
+
+    対応:
+    - bullet marker（- + *）と番号付きリスト（1. / 1)）の除去
+    - backtick 包み（`path`）と末尾の全角/半角括弧注釈の除去
+    - 先頭の ``./``、連続スラッシュの圧縮、末尾スラッシュの除去
+    - 末尾 glob ``/**`` / ``/*`` は basedir に畳む（prefix 比較で吸収するため）
+    """
+    s = _clean_path_entry(entry)
     # 末尾 glob を basedir に畳む（tests/x/** -> tests/x, tests/x/* -> tests/x）
     while s.endswith("/**") or s.endswith("/*"):
         s = s.rsplit("/", 1)[0]
@@ -333,16 +371,31 @@ def extract_allowed_paths(body: str) -> List[str]:
     )
     if not match:
         return []
-    section = match.group(1)
     paths: List[str] = []
-    for line in section.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        path = normalize_path(stripped)
+    for entry in extract_allowed_path_entries(body):
+        path = normalize_path(entry)
         if path:
             paths.append(path)
     return paths
+
+
+def extract_allowed_path_entries(body: str) -> List[str]:
+    """Allowed Paths の装飾除去前 entry を返す（path kind 保存用）。"""
+    if not body:
+        return []
+    match = re.search(
+        r"^##\s+Allowed Paths\s*$(.+?)(?=^##|\Z)",
+        body,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not match:
+        return []
+    entries: List[str] = []
+    for line in match.group(1).splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and normalize_path(stripped):
+            entries.append(stripped)
+    return entries
 
 
 def _ref_key(ref: str) -> str:
