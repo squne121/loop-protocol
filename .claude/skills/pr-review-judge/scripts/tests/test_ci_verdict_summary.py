@@ -1499,8 +1499,12 @@ class TestReviewShadowAndRerunCanonicalization:
 
     def test_current_success_and_newer_stale_failure_are_not_canonicalized_together(self):
         checks = [
-            provenance_check(100, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:01Z"),
-            provenance_check(101, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:02Z"),
+            provenance_check(
+                100, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:01Z"
+            ),
+            provenance_check(
+                101, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:02Z"
+            ),
         ]
         _, out = run_summary_with_details(
             checks,
@@ -1511,8 +1515,12 @@ class TestReviewShadowAndRerunCanonicalization:
 
     def test_current_failure_and_newer_stale_success_preserve_current_failure(self):
         checks = [
-            provenance_check(100, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:01Z"),
-            provenance_check(101, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:02Z"),
+            provenance_check(
+                100, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:01Z"
+            ),
+            provenance_check(
+                101, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:02Z"
+            ),
         ]
         _, out = run_summary_with_details(
             checks,
@@ -1523,8 +1531,12 @@ class TestReviewShadowAndRerunCanonicalization:
 
     def test_missing_head_sha_is_not_deduplicated_or_accepted_as_success(self):
         checks = [
-            provenance_check(100, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:01Z"),
-            provenance_check(101, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:02Z"),
+            provenance_check(
+                100, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:01Z"
+            ),
+            provenance_check(
+                101, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:02Z"
+            ),
         ]
         _, out = run_summary_with_details(
             checks,
@@ -1535,8 +1547,12 @@ class TestReviewShadowAndRerunCanonicalization:
 
     def test_same_head_old_failure_new_success_is_canonicalized(self):
         checks = [
-            provenance_check(100, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:01Z"),
-            provenance_check(101, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:02Z"),
+            provenance_check(
+                100, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:01Z"
+            ),
+            provenance_check(
+                101, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:02Z"
+            ),
         ]
         exit_code, out = run_summary_with_details(
             checks,
@@ -1568,9 +1584,19 @@ class TestReviewShadowAndRerunCanonicalization:
     )
     def test_failure_success_shadow_three_element_order_is_stable(self, order: tuple[int, int, int]):
         checks = {
-            100: provenance_check(100, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:01Z"),
-            101: provenance_check(101, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:02Z"),
-            102: provenance_check(102, bucket="skipping", state="SKIPPED", event="pull_request_review", completed_at="2026-07-14T00:00:03Z"),
+            100: provenance_check(
+                100, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:01Z"
+            ),
+            101: provenance_check(
+                101, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:02Z"
+            ),
+            102: provenance_check(
+                102,
+                bucket="skipping",
+                state="SKIPPED",
+                event="pull_request_review",
+                completed_at="2026-07-14T00:00:03Z",
+            ),
         }
         _, out = run_summary_with_details(
             [checks[run_id] for run_id in order],
@@ -1581,8 +1607,12 @@ class TestReviewShadowAndRerunCanonicalization:
 
     def test_same_timestamp_different_run_ids_is_not_deduplicated(self):
         checks = [
-            provenance_check(100, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:01Z"),
-            provenance_check(101, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:01Z"),
+            provenance_check(
+                100, bucket="fail", state="FAILURE", event="pull_request", completed_at="2026-07-14T00:00:01Z"
+            ),
+            provenance_check(
+                101, bucket="pass", state="SUCCESS", event="pull_request", completed_at="2026-07-14T00:00:01Z"
+            ),
         ]
         _, out = run_summary_with_details(
             checks,
