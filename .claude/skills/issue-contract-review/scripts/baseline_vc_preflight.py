@@ -13,8 +13,10 @@ import os
 import json
 import re
 import shlex
+import stat
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -540,6 +542,155 @@ def compute_command_hash(command: str) -> str:
     return hashlib.sha256(command.encode("utf-8")).hexdigest()
 
 
+def compute_execution_key_hash(
+    argv: List[str],
+    cwd: str,
+    runner_env_delta: Dict[str, str],
+    timeout_seconds: int,
+    state_epoch: int = 0,
+) -> str:
+    """Issue #1338: dedup key covering normalized argv + cwd + runner_env_delta + timeout + state_epoch.
+
+    PR #1508 review (P0-1): the execution key MUST also cover a `state_epoch`
+    -- a monotonically increasing counter that advances every time a
+    "barrier" command (any command that is not a validated pure observation;
+    see _is_parallel_eligible_command) executes. Without this, two
+    textually-identical, side-effect-free observations (e.g.
+    `test -d fixture/__pycache__`) that bracket a stateful command (e.g.
+    `python3 -m py_compile fixture/state_probe.py`) would previously hash
+    identically and the second observation would be incorrectly replayed
+    from the first's stale pre-barrier snapshot instead of being re-executed
+    against the new on-disk state.
+
+    Distinct from compute_command_hash() (raw command string hash; existing
+    behavior/meaning unchanged). Two commands whose execution_key_hash matches
+    are guaranteed to run under identical conditions (same argv / cwd / env /
+    timeout / state_epoch), so the second invocation may safely replay the
+    first's execution outcome (exit_code/stdout/stderr/duration_ms/
+    runner_env_delta) instead of re-launching the subprocess. classify_result()
+    /decision are NEVER copied from the source; callers must recompute them
+    per-AC using each AC's own raw_command/annotations.
+    """
+    normalized_cwd = os.path.normpath(os.path.abspath(cwd))
+    normalized_env = sorted(runner_env_delta.items())
+    payload = json.dumps(
+        {
+            "argv": list(argv),
+            "cwd": normalized_cwd,
+            "env": normalized_env,
+            "timeout_seconds": timeout_seconds,
+            "state_epoch": state_epoch,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _rg_operand_is_safe_target(cwd: str, operand: str, allowed_paths: List[str]) -> bool:
+    """Issue #1338 P0-2 fix (PR #1508 review): a single `rg` PATH operand is
+    only a safe (bounded, non-racy) parallel/dedup target if it is a
+    repo-relative, existing, non-special filesystem entry that is either a
+    regular file (any repo-relative location) or a directory contained
+    within the Issue's `## Allowed Paths` (recursion is bounded to that
+    Allowed Path, never to the whole repo). FIFOs, sockets, and device
+    files are always rejected; `-` (stdin) is rejected by the caller before
+    reaching here.
+    """
+    if operand == "-":
+        return False
+    normalized = _normalize_repo_relative_path_strict(operand)
+    if normalized is None:
+        return False
+    try:
+        resolved_cwd = Path(cwd).resolve(strict=True)
+    except OSError:
+        return False
+    resolved_target = (resolved_cwd / normalized).resolve(strict=False)
+    try:
+        resolved_target.relative_to(resolved_cwd)
+    except ValueError:
+        return False  # escapes the repo root
+    try:
+        st = os.stat(resolved_target)
+    except OSError:
+        return False  # must already exist (unverifiable targets are not "pure")
+    mode = st.st_mode
+    if stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISBLK(mode) or stat.S_ISCHR(mode):
+        return False
+    if stat.S_ISREG(mode):
+        return True
+    if stat.S_ISDIR(mode):
+        return _rg_path_operands_all_within_allowed_paths([operand], allowed_paths or [])
+    return False
+
+
+def _validate_rg_parallel_command(command: str, cwd: str, allowed_paths: List[str]) -> bool:
+    """Issue #1338 P0-2 fix (PR #1508 review): full validation gate for an
+    `rg` command before it may be treated as a pure/dedup/parallel-eligible
+    observation.
+
+    Requires ALL of:
+      - >= 1 explicit PATH operand (a bare `rg PATTERN` with no path is
+        rejected: it would search the whole repo AND, with no path operand
+        and no piped input, `rg` reads from stdin -- subprocess.Popen
+        defaults to inheriting the parent's stdin, so concurrent `rg`
+        invocations with no explicit path are a stdin race).
+      - no `-` (explicit stdin) operand.
+      - every operand is a repo-relative, existing, non-special target,
+        validated by _rg_operand_is_safe_target() (rejects absolute paths,
+        `..` traversal, repo-external targets, FIFOs/devices/sockets, and
+        unbounded directory recursion outside `## Allowed Paths`).
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if not argv or Path(argv[0]).name != "rg":
+        return False
+    path_operands = _rg_extract_path_operands(argv)
+    if not path_operands:
+        return False
+    return all(_rg_operand_is_safe_target(cwd, op, allowed_paths) for op in path_operands)
+
+
+def _is_parallel_eligible_command(
+    command: str, cwd: str = ".", allowed_paths: Optional[List[str]] = None
+) -> bool:
+    """Issue #1338 AC5, narrowed by PR #1508 review (P0-1/P0-2): predicate
+    for bounded-parallel/dedup-safe PURE read-only VC observations.
+
+    Only two shapes are eligible:
+      - exact 'test -f|-d|-s PATH' (3 argv tokens)
+      - `rg` with a fully validated bounded path operand (see
+        _validate_rg_parallel_command)
+
+    `grep` / `egrep` / `fgrep` are INTENTIONALLY EXCLUDED (P0-2 fix): the
+    prior basename-only classification allowed them into the parallel/dedup
+    pool with no argument-count / path-operand / stdin validation at all,
+    and subprocess.Popen defaults to inheriting the parent's stdin, so
+    concurrent invocations without an explicit path operand could race on
+    shared stdin. They remain executable (still listed in _ALLOWED_COMMANDS
+    for serial preflight execution) but are never batched or dedup-replayed.
+
+    Everything else (pnpm, uv run pytest, pytest, gh, git,
+    github_metadata_assert, python3 -m py_compile, etc.) is treated as a
+    state barrier by the caller: never eligible for dedup or concurrent
+    execution (rate-limit / cache-contention / state-mutation concerns).
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+    basename = Path(argv[0]).name
+    if basename == "test" and len(argv) == 3 and argv[1] in ("-f", "-d", "-s"):
+        return True
+    if basename == "rg":
+        return _validate_rg_parallel_command(command, cwd, allowed_paths or [])
+    return False
+
+
 def detect_compound_command(command: str) -> bool:
     """
     コマンドが compound shell syntax を含むか検出
@@ -592,6 +743,12 @@ def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str,
             cwd=cwd,
             shell=False,
             env=run_env,
+            # Issue #1338 P0-2 fix (PR #1508 review): explicit stdin=DEVNULL.
+            # subprocess.run() otherwise defaults to inheriting the parent's
+            # stdin, which is a race hazard when multiple VC subprocesses
+            # (e.g. two `rg` invocations) may run concurrently under the
+            # bounded-parallel executor.
+            stdin=subprocess.DEVNULL,
         )
         duration_ms = int((datetime.now() - start).total_seconds() * 1000)
         return result.returncode, result.stdout, result.stderr, duration_ms, env_delta
@@ -3177,6 +3334,200 @@ def generate_contract_review_fragment(status: str, results: List[Dict[str, Any]]
     }
 
 
+def _build_result_item(
+    *,
+    ac_label,
+    line_no,
+    command,
+    exit_code,
+    classification,
+    category,
+    decision,
+    scope_class,
+    stdout,
+    stderr,
+    duration_ms,
+    fix_hint,
+    runner_env_delta,
+    preflight_scope,
+    baseline_expect,
+    vc_role,
+    annotation_line_no,
+    annotation_raw,
+    verification_owner,
+    deferred_reason,
+    runtime_verification_required,
+    strict_enabled,
+    max_head_lines,
+    execution_key_hash: Optional[str] = None,
+    is_dedup_replay: bool = False,
+    source_command_hash: Optional[str] = None,
+    source_execution_key_hash: Optional[str] = None,
+    source_result_index: Optional[int] = None,
+    source_ac: Optional[str] = None,
+    source_line: Optional[int] = None,
+    certified_target_paths: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Build one VC result entry.
+
+    Issue #1338: extracted from the main per-command loop so the immediate
+    (single-execution) code path and the deferred dedup/bounded-parallel
+    execution phase share byte-identical result-shaping logic. New in #1338:
+    `execution_key_hash` (dedup key, distinct from the pre-existing
+    `command_hash`) and, for dedup-replayed entries, a `dedup` object carrying
+    the source AC's command_hash/execution_key_hash. classification/decision
+    are always computed by the caller from THIS entry's own
+    command/annotations -- never copied from another AC's result.
+    """
+    stdout_head, stdout_truncated, stdout_orig_count = truncate_output(stdout, max_head_lines)
+    stderr_head, stderr_truncated, stderr_orig_count = truncate_output(stderr, max_head_lines)
+
+    runner_value = (
+        "skipped" if preflight_scope is not None
+        else ("dedup_replay" if is_dedup_replay else "exec")
+    )
+
+    result_item = {
+        "ac": ac_label or "AC_UNKNOWN",
+        "line": line_no,
+        "raw_command": command,
+        "command_hash": f"sha256:{compute_command_hash(command)}",
+        "execution_key_hash": (
+            f"sha256:{execution_key_hash}" if execution_key_hash is not None else None
+        ),
+        "runner": runner_value,
+        "exit_code": exit_code,
+        "classification": classification,
+        "category": category,
+        "decision": decision,
+        "scope_class": scope_class,
+        "confidence": compute_confidence(category),  # C4: category ベースで統一
+        "stdout_head": stdout_head,
+        "stdout_truncated": stdout_truncated,
+        "stdout_original_line_count": stdout_orig_count,
+        "stderr_head": stderr_head,
+        "stderr_truncated": stderr_truncated,
+        "stderr_original_line_count": stderr_orig_count,
+        "runner_env_delta": runner_env_delta,
+        "duration_ms": duration_ms,
+        "fix_hint": fix_hint,
+        "certified_target_paths": certified_target_paths,
+        "annotations": {
+            "baseline_expect": (
+                # Expose raw invalid value (without __invalid__: prefix) in annotations
+                baseline_expect[len("__invalid__:"):] if (
+                    preflight_scope is None
+                    and baseline_expect is not None
+                    and baseline_expect.startswith("__invalid__:")
+                ) else (baseline_expect if preflight_scope is None else None)
+            ),
+            "vc_role": vc_role if preflight_scope is None else None,
+            "missing_baseline_expect": (
+                preflight_scope is None
+                and baseline_expect is None
+                and classification == "unexpected_pass"
+            ),
+        },
+        "annotation_source": {
+            "line": annotation_line_no,
+            "raw": annotation_raw,
+        },
+        "strict": {
+            "enabled": strict_enabled,
+            "violation": category in [
+                "inline_baseline_expect_invalid_placement",
+                "missing_baseline_expect_for_new_allowed_path"
+            ],
+            "body_author_fixable": category in [
+                "inline_baseline_expect_invalid_placement",
+                "missing_baseline_expect_for_new_allowed_path"
+            ],
+            "needs_fix": category in [
+                "inline_baseline_expect_invalid_placement",
+                "missing_baseline_expect_for_new_allowed_path"
+            ],
+            "structured_feedback": {
+                "category": category,
+                "body_author_fixable": True,
+                "category_wide_remediation": True,
+            } if category in [(
+                "inline_baseline_expect_invalid_placement"
+            ), "missing_baseline_expect_for_new_allowed_path"] else None,
+        } if strict_enabled or category in [(
+            "inline_baseline_expect_invalid_placement"
+        ), "missing_baseline_expect_for_new_allowed_path"] else None,
+        # strict + repair coordination for inline_baseline_expect and missing_baseline_expect
+        "repair": {
+            "repairable": category in [
+                "inline_baseline_expect_invalid_placement",
+                "missing_baseline_expect_for_new_allowed_path"
+            ],
+            "kind": (
+                (
+                    "move_inline_baseline_expect_to_preceding_line"
+                ) if category == "inline_baseline_expect_invalid_placement"
+                else "insert_baseline_expect_fail" if category == "missing_baseline_expect_for_new_allowed_path"
+                else None
+            ),
+            "line_start": line_no,
+            "line_end": line_no,
+            "reason": (
+                (
+                    "baseline-expect annotation must be in contiguous preceding comment block"
+                ) if category == "inline_baseline_expect_invalid_placement"
+                else (
+                    "new Allowed Path file requires baseline-expect: fail annotation"
+                ) if category == "missing_baseline_expect_for_new_allowed_path"
+                else None
+            ),
+        } if category in [(
+            "inline_baseline_expect_invalid_placement"
+        ), "missing_baseline_expect_for_new_allowed_path"] else None,
+    }
+    # "strict" + "repair" payload for inline_baseline_expect and missing_baseline_expect errors
+    # AC5: Add routing metadata for skipped results
+    if verification_owner:
+        result_item["verification_owner"] = verification_owner
+        result_item["deferred_reason"] = deferred_reason
+        result_item["runtime_verification_required"] = runtime_verification_required
+
+    if is_dedup_replay:
+        # AC2/AC3: dedup replay carries provenance of the source execution,
+        # distinct from this AC's own command_hash/classification/decision.
+        # PR #1508 review (P2-2): source_result_index/source_ac/source_line
+        # let a consumer uniquely locate the exact source AC in `results`
+        # (command_hash/execution_key_hash alone cannot disambiguate when
+        # multiple ACs would legitimately share the same hash).
+        result_item["dedup"] = {
+            "source_command_hash": source_command_hash,
+            "source_execution_key_hash": (
+                f"sha256:{source_execution_key_hash}"
+                if source_execution_key_hash is not None else None
+            ),
+            "source_result_index": source_result_index,
+            "source_ac": source_ac,
+            "source_line": source_line,
+        }
+
+    return result_item
+
+
+def bounded_worker_count(value: str) -> int:
+    """argparse type for --max-workers (Issue #1338, PR #1508 review P2-1):
+    only accepts integers in the closed range [1, 8]. Values <= 0, non-
+    integer strings, and values > 8 are rejected at argument-parsing time
+    (fail-closed bound on VC-preflight concurrency width)."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"--max-workers must be an integer, got {value!r}")
+    if parsed < 1 or parsed > 8:
+        raise argparse.ArgumentTypeError(
+            f"--max-workers must be between 1 and 8 (inclusive), got {parsed}"
+        )
+    return parsed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Baseline VC Preflight: extract and classify VCs from Issue body"
@@ -3201,6 +3552,18 @@ def main() -> int:
         type=int,
         default=DEFAULT_TIMEOUT_SECONDS,
         help="Timeout per command",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=bounded_worker_count,
+        default=1,
+        help=(
+            "Issue #1338: bounded parallel execution width (1-8 inclusive) for safe "
+            "read-only VC predicates (rg with a validated bounded path operand, exact "
+            "test -f|-d|-s PATH). grep/egrep/fgrep are intentionally excluded (PR #1508 "
+            "review P0-2). Default 1 preserves fully serial execution and output "
+            "identical to pre-#1338 behavior."
+        ),
     )
     parser.add_argument("--max-head-lines", type=int, default=20, help="Max lines for stdout/stderr")
     # B8: contract-review-fragment format support
@@ -3449,7 +3812,10 @@ def main() -> int:
         return 2
 
     # 各コマンドを実行して分類
-    results = []
+    # Issue #1338: results is pre-sized so a contiguous parallel batch (below)
+    # can write finalized entries back at their original Issue-body command
+    # position, regardless of execution completion order (AC7).
+    results: List[Optional[Dict[str, Any]]] = [None] * len(commands)
     summary = {
         "expected_fail": 0,
         "unexpected_pass": 0,
@@ -3460,10 +3826,222 @@ def main() -> int:
         "extraction_errors": 0,
     }
 
-    for (
+    # ---------------------------------------------------------------------
+    # Issue #1338 (PR #1508 review P0-1/P0-2/P1-1 fixes)
+    #
+    # State-epoch-aware execution cache + contiguous pure-observation
+    # batching, executed INLINE (in Issue-body order) rather than deferred
+    # to a single end-of-loop phase. This fixes two review findings:
+    #
+    #   P0-1: execution_key_hash previously covered only argv/cwd/env/
+    #   timeout, so two textually-identical pure observations that bracket
+    #   a stateful command (e.g. `test -d X` .. `python3 -m py_compile Y` ..
+    #   `test -d X`) would incorrectly dedup-replay the second against the
+    #   first's stale pre-mutation snapshot. `_state_epoch` now advances
+    #   every time a non-pure ("barrier") command executes, and is folded
+    #   into compute_execution_key_hash(), so the two `test -d X` calls above
+    #   get DIFFERENT keys and are never conflated.
+    #
+    #   P1-1: the previous design deferred ALL "safe to run" commands
+    #   (including pnpm/pytest/git) to a single batch phase after the whole
+    #   Issue body had been parsed, which could reorder their actual
+    #   subprocess launches relative to commands executed immediately in
+    #   this same loop (e.g. github_metadata_assert, a live `gh api` call).
+    #   Executing inline, right here, preserves the exact Issue-body
+    #   execution order for every side-effecting/observing command.
+    #
+    # Only a CONTIGUOUS run of pure-observation commands (exact
+    # `test -f|-d|-s PATH`, or a fully validated `rg` -- see
+    # _is_parallel_eligible_command) is ever batched for concurrent
+    # execution (only when --max-workers > 1); a barrier command always
+    # flushes that batch first, so parallel batching never reorders a
+    # barrier relative to its neighbors.
+    # ---------------------------------------------------------------------
+    _state_epoch = [0]  # boxed int so nested closures can mutate it
+    _exec_cache: Dict[str, Dict[str, Any]] = {}
+    _cache_meta: Dict[str, Dict[str, Any]] = {}
+    _command_hash_by_key: Dict[str, str] = {}
+    _parallel_batch: List[Dict[str, Any]] = []
+    # Keys that have already been consumed by a FINALIZED (result-emitting)
+    # job. Distinct from `_exec_cache` (which may already hold an entry for
+    # a key purely because THIS SAME job's own subprocess just populated it
+    # -- e.g. inside a freshly-launched parallel batch); only a key that was
+    # already in `_dedup_seen_keys` at finalize-time is a true dedup replay.
+    _dedup_seen_keys: set = set()
+
+    def _run_and_cache_pure_job(job: Dict[str, Any]) -> None:
+        _key = job["_key"]
+        _exit_code, _stdout, _stderr, _duration_ms, _runner_env_delta = run_command(
+            job["command"], args.timeout_seconds, args.cwd
+        )
+        # P0-2: fail-closed quiet-success -- a pure observation VC that exits
+        # 0 but leaves non-empty stderr is not a trustworthy silent pass.
+        if _exit_code == 0 and _stderr.strip():
+            _exit_code = 1
+        _exec_cache[_key] = {
+            "exit_code": _exit_code,
+            "stdout": _stdout,
+            "stderr": _stderr,
+            "duration_ms": _duration_ms,
+            "runner_env_delta": _runner_env_delta,
+        }
+        _cache_meta[_key] = {"idx": job["idx"], "ac": job["ac_label"], "line": job["line_no"]}
+        _command_hash_by_key[_key] = f"sha256:{compute_command_hash(job['command'])}"
+
+    def _finalize_and_store_job(job: Dict[str, Any]) -> None:
+        _key = compute_execution_key_hash(
+            job["argv"], args.cwd, job["env_delta"], args.timeout_seconds,
+            state_epoch=_state_epoch[0],
+        )
+        _is_replay = job["is_pure"] and _key in _dedup_seen_keys
+        if _is_replay:
+            _outcome = _exec_cache[_key]
+        elif job["is_pure"]:
+            if _key not in _exec_cache:
+                _run_and_cache_pure_job({**job, "_key": _key})
+            _outcome = _exec_cache[_key]
+            _dedup_seen_keys.add(_key)
+        else:
+            _exit_code, _stdout, _stderr, _duration_ms, _runner_env_delta = run_command(
+                job["command"], args.timeout_seconds, args.cwd
+            )
+            _outcome = {
+                "exit_code": _exit_code,
+                "stdout": _stdout,
+                "stderr": _stderr,
+                "duration_ms": _duration_ms,
+                "runner_env_delta": _runner_env_delta,
+            }
+            # P0-1: this is a state barrier -- advance the epoch so later
+            # pure observations of identical argv/cwd/env never dedup
+            # against a stale pre-barrier snapshot.
+            _state_epoch[0] += 1
+
+        _classification, _category, _decision, _fix_hint, _scope_class = classify_result(
+            _outcome["exit_code"],
+            _outcome["stdout"],
+            _outcome["stderr"],
+            job["command"],
+            cwd=args.cwd,
+            runner_env_delta=_outcome["runner_env_delta"],
+            allowed_paths=allowed_paths_from_body,
+            static_policy_passed=True,
+            evidence_mode=args.evidence_mode,
+        )
+
+        _job_baseline_expect = job["baseline_expect"]
+        if _job_baseline_expect == "pass":
+            if _outcome["exit_code"] == 0 and _classification in ("unexpected_pass", "expected_pass"):
+                _classification = "expected_pass"
+                _category = "baseline_expect_pass"
+                _decision = "go"
+                _scope_class = "regression_gate"
+                _fix_hint = None
+            elif _outcome["exit_code"] is not None and _outcome["exit_code"] != 0:
+                if _category == "package_manager_no_tty_prompt":
+                    pass
+                else:
+                    _classification = "human_judgment"
+                    _category = "baseline_regression_failed"
+                    _decision = "human_judgment"
+                    _fix_hint = (
+                        "VC annotated baseline-expect: pass but exited non-0; "
+                        "the command that was passing at baseline is now failing. "
+                        "Investigate regression or update annotation."
+                    )
+        elif _job_baseline_expect == "fail":
+            pass
+        else:
+            if _classification == "unexpected_pass" and _decision == "blocked":
+                _existing_hint = _fix_hint or ""
+                _missing_hint = (
+                    " [missing_annotation] Consider adding "
+                    "# baseline-expect: pass on the preceding line "
+                    "if this VC is expected to pass at baseline "
+                    "(e.g., for a promotion/refactor Issue)."
+                )
+                _fix_hint = _existing_hint + _missing_hint
+
+        _source_meta = _cache_meta.get(_key) if _is_replay else None
+        _result_item = _build_result_item(
+            ac_label=job["ac_label"],
+            line_no=job["line_no"],
+            command=job["command"],
+            exit_code=_outcome["exit_code"],
+            classification=_classification,
+            category=_category,
+            decision=_decision,
+            scope_class=_scope_class,
+            stdout=_outcome["stdout"],
+            stderr=_outcome["stderr"],
+            duration_ms=_outcome["duration_ms"],
+            fix_hint=_fix_hint,
+            runner_env_delta=_outcome["runner_env_delta"],
+            preflight_scope=job["preflight_scope"],
+            baseline_expect=_job_baseline_expect,
+            vc_role=job["vc_role"],
+            annotation_line_no=job["annotation_line_no"],
+            annotation_raw=job["annotation_raw"],
+            verification_owner=None,
+            deferred_reason=None,
+            runtime_verification_required=None,
+            strict_enabled=args.strict,
+            max_head_lines=args.max_head_lines,
+            execution_key_hash=_key,
+            is_dedup_replay=_is_replay,
+            source_command_hash=(_command_hash_by_key.get(_key) if _is_replay else None),
+            source_execution_key_hash=(_key if _is_replay else None),
+            source_result_index=(_source_meta["idx"] if _source_meta else None),
+            source_ac=(_source_meta["ac"] if _source_meta else None),
+            source_line=(_source_meta["line"] if _source_meta else None),
+            certified_target_paths=(
+                _extract_certified_target_paths(job["command"])
+                if _category == "expected_pass_resolved_on_current_head"
+                else None
+            ),
+        )
+        results[job["idx"]] = _result_item
+        summary[_result_item["classification"]] += 1
+
+    def _flush_parallel_batch() -> None:
+        """Execute (and finalize) every job buffered in `_parallel_batch`,
+        preserving the AC5 contract: with --max-workers > 1, distinct
+        not-yet-cached execution keys in this contiguous batch are launched
+        concurrently through a single ThreadPoolExecutor; every job (cached,
+        deduped, or freshly launched) is then finalized in original order."""
+        if not _parallel_batch:
+            return
+        _batch = list(_parallel_batch)
+        _parallel_batch.clear()
+        if args.max_workers > 1:
+            _launch_order: List[str] = []
+            _launch_jobs: Dict[str, Dict[str, Any]] = {}
+            for _job in _batch:
+                _key = compute_execution_key_hash(
+                    _job["argv"], args.cwd, _job["env_delta"], args.timeout_seconds,
+                    state_epoch=_state_epoch[0],
+                )
+                if _key in _exec_cache or _key in _launch_jobs:
+                    continue
+                _job_with_key = dict(_job)
+                _job_with_key["_key"] = _key
+                _launch_jobs[_key] = _job_with_key
+                _launch_order.append(_key)
+            if _launch_jobs:
+                with ThreadPoolExecutor(max_workers=args.max_workers) as _executor:
+                    _future_to_key = {
+                        _executor.submit(_run_and_cache_pure_job, _launch_jobs[_key]): _key
+                        for _key in _launch_order
+                    }
+                    for _future in as_completed(_future_to_key):
+                        _future.result()
+        for _job in _batch:
+            _finalize_and_store_job(_job)
+
+    for _cmd_idx, (
         ac_label, command, line_no, preflight_scope, vc_regex_intent,
         baseline_expect, vc_role, annotation_line_no, annotation_raw,
-    ) in commands:
+    ) in enumerate(commands):
         runner_env_delta: Dict[str, str] = {}
         # AC5: Handle pr_review_only / runtime_only preflight-scope markers
         # NB2: Invalid marker values (typos) → human_judgment
@@ -3614,6 +4192,10 @@ def main() -> int:
                     # "No such file or directory"), dispatch the assertion to
                     # _check_github_metadata_assertion and classify by its exit code.
                     # subprocess is invoked there with a fixed read-only argv (gh api --method GET).
+                    # PR #1508 review (P1-1): flush any buffered pure-observation
+                    # parallel batch first, so this live `gh api` call keeps its
+                    # exact Issue-body relative order against the VCs around it.
+                    _flush_parallel_batch()
                     try:
                         _assert_argv = shlex.split(command, posix=True)
                     except ValueError:
@@ -3628,6 +4210,10 @@ def main() -> int:
                         _assertion_type, _field, _literal, _endpoint,
                         timeout_seconds=args.timeout_seconds,
                     )
+                    # P0-1: an external GitHub API observation is a state
+                    # barrier -- advance the epoch so later pure observations
+                    # are never dedup-replayed across it.
+                    _state_epoch[0] += 1
                     exit_code, stdout, stderr, duration_ms = assert_exit, "", "", 0
                     if assert_exit == 0:
                         # assertion holds (present for contains / absent for not_contains)
@@ -3657,182 +4243,99 @@ def main() -> int:
                             "pass/fail and is not treated as a baseline pass."
                         )
                 else:
-                    # Safe to run: execute the command
-                    exit_code, stdout, stderr, duration_ms, runner_env_delta = run_command(
-                        command, args.timeout_seconds, args.cwd
+                    # Issue #1338 (PR #1508 review P0-1/P1-1): execute inline,
+                    # in Issue-body order, through the state-epoch-aware
+                    # execution cache / contiguous parallel batch defined
+                    # above `for _cmd_idx, (...)`. classify_result() and the
+                    # baseline-expect re-map are always recomputed from THIS
+                    # AC's own command/annotations (never copied from another
+                    # AC's classification/decision) inside
+                    # _finalize_and_store_job().
+                    try:
+                        _this_argv = shlex.split(command)
+                    except ValueError:
+                        _this_argv = []
+                    _this_env_delta = _fixed_env_delta_for_argv(_this_argv)
+                    _this_is_pure = _is_parallel_eligible_command(
+                        command, args.cwd, allowed_paths_from_body
                     )
-
-                    classification, category, decision, fix_hint, scope_class = classify_result(
-                        exit_code,
-                        stdout,
-                        stderr,
-                        command,
-                        cwd=args.cwd,
-                        runner_env_delta=runner_env_delta,
-                        allowed_paths=allowed_paths_from_body,
-                        static_policy_passed=True,
-                        evidence_mode=args.evidence_mode,
-                    )
-
-                    # Issue #889: Apply baseline-expect annotation post-execution re-mapping
-                    if baseline_expect == "pass":
-                        if exit_code == 0 and classification in ("unexpected_pass", "expected_pass"):
-                            # expected: exit 0 at baseline → expected_pass / go
-                            classification = "expected_pass"
-                            category = "baseline_expect_pass"
-                            decision = "go"
-                            scope_class = "regression_gate"
-                            fix_hint = None
-                        elif exit_code is not None and exit_code != 0:
-                            if category == "package_manager_no_tty_prompt":
-                                # AC7: no-TTY is a tooling/env blocker — do not re-map to
-                                # baseline_regression_failed. The blocked/package_manager_no_tty_prompt
-                                # classification is authoritative regardless of baseline-expect: pass.
-                                pass
-                            else:
-                                # exit non-0 despite baseline-expect: pass → regression detected
-                                classification = "human_judgment"
-                                category = "baseline_regression_failed"
-                                decision = "human_judgment"
-                                fix_hint = (
-                                    "VC annotated baseline-expect: pass but exited non-0; "
-                                    "the command that was passing at baseline is now failing. "
-                                    "Investigate regression or update annotation."
-                                )
-                    elif baseline_expect == "fail":
-                        # baseline-expect: fail is the traditional expectation (backward compat)
-                        # unexpected_pass → needs_fix (existing behavior)
-                        # expected_fail → go (existing behavior)
-                        # No re-mapping needed; just preserve existing logic
-                        pass
-                    else:
-                        # annotation absent: add missing_annotation warning as fix_hint
-                        if classification == "unexpected_pass" and decision == "blocked":
-                            # Suggest adding baseline-expect annotation
-                            existing_hint = fix_hint or ""
-                            missing_hint = (
-                                " [missing_annotation] Consider adding "
-                                "# baseline-expect: pass on the preceding line "
-                                "if this VC is expected to pass at baseline "
-                                "(e.g., for a promotion/refactor Issue)."
-                            )
-                            fix_hint = existing_hint + missing_hint
+                    _job = {
+                        "idx": _cmd_idx,
+                        "ac_label": ac_label,
+                        "line_no": line_no,
+                        "command": command,
+                        "baseline_expect": baseline_expect,
+                        "vc_role": vc_role,
+                        "annotation_line_no": annotation_line_no,
+                        "annotation_raw": annotation_raw,
+                        "preflight_scope": preflight_scope,
+                        "argv": _this_argv,
+                        "env_delta": _this_env_delta,
+                        "is_pure": _this_is_pure,
+                    }
+                    if _this_is_pure and args.max_workers > 1:
+                        # AC5/P1-1: only buffer a CONTIGUOUS run of pure
+                        # observation VCs; any barrier command flushes this
+                        # batch (see the `else` branch just below) before it
+                        # executes, so relative order across a barrier is
+                        # never disturbed.
+                        _parallel_batch.append(_job)
+                        verification_owner = None
+                        deferred_reason = None
+                        runtime_verification_required = None
+                        continue
+                    _flush_parallel_batch()
+                    _finalize_and_store_job(_job)
+                    verification_owner = None
+                    deferred_reason = None
+                    runtime_verification_required = None
+                    continue
 
                 verification_owner = None
                 deferred_reason = None
                 runtime_verification_required = None
 
-        # C4: confidence を compute_confidence 経由で統一
-        stdout_head, stdout_truncated, stdout_orig_count = truncate_output(stdout, args.max_head_lines)
-        stderr_head, stderr_truncated, stderr_orig_count = truncate_output(stderr, args.max_head_lines)
-
-        result_item = {
-            "ac": ac_label or "AC_UNKNOWN",
-            "line": line_no,
-            "raw_command": command,
-            "command_hash": f"sha256:{compute_command_hash(command)}",
-            "runner": "exec" if preflight_scope is None else "skipped",
-            "exit_code": exit_code,
-            "classification": classification,
-            "category": category,
-            "decision": decision,
-            "scope_class": scope_class,
-            "confidence": compute_confidence(category),  # C4: category ベースで統一
-            "stdout_head": stdout_head,
-            "stdout_truncated": stdout_truncated,
-            "stdout_original_line_count": stdout_orig_count,
-            "stderr_head": stderr_head,
-            "stderr_truncated": stderr_truncated,
-            "stderr_original_line_count": stderr_orig_count,
-            "runner_env_delta": runner_env_delta,
-            "duration_ms": duration_ms,
-            "fix_hint": fix_hint,
-            "certified_target_paths": (
+        # Issue #1338: result-shaping is shared with the deferred (pending-job)
+        # finalization phase below via _build_result_item(), so both the
+        # immediate and dedup/parallel-execution code paths produce identical
+        # entry shapes.
+        result_item = _build_result_item(
+            ac_label=ac_label,
+            line_no=line_no,
+            command=command,
+            exit_code=exit_code,
+            classification=classification,
+            category=category,
+            decision=decision,
+            scope_class=scope_class,
+            stdout=stdout,
+            stderr=stderr,
+            duration_ms=duration_ms,
+            fix_hint=fix_hint,
+            runner_env_delta=runner_env_delta,
+            preflight_scope=preflight_scope,
+            baseline_expect=baseline_expect,
+            vc_role=vc_role,
+            annotation_line_no=annotation_line_no,
+            annotation_raw=annotation_raw,
+            verification_owner=verification_owner,
+            deferred_reason=deferred_reason,
+            runtime_verification_required=runtime_verification_required,
+            strict_enabled=args.strict,
+            max_head_lines=args.max_head_lines,
+            certified_target_paths=(
                 _extract_certified_target_paths(command)
                 if category == "expected_pass_resolved_on_current_head"
                 else None
             ),
-            "annotations": {
-                "baseline_expect": (
-                    # Expose raw invalid value (without __invalid__: prefix) in annotations
-                    baseline_expect[len("__invalid__:"):] if (
-                        preflight_scope is None
-                        and baseline_expect is not None
-                        and baseline_expect.startswith("__invalid__:")
-                    ) else (baseline_expect if preflight_scope is None else None)
-                ),
-                "vc_role": vc_role if preflight_scope is None else None,
-                "missing_baseline_expect": (
-                    preflight_scope is None
-                    and baseline_expect is None
-                    and classification == "unexpected_pass"
-                ),
-            },
-            "annotation_source": {
-                "line": annotation_line_no,
-                "raw": annotation_raw,
-            },
-            "strict": {
-                "enabled": args.strict,
-                "violation": category in [
-                    "inline_baseline_expect_invalid_placement",
-                    "missing_baseline_expect_for_new_allowed_path"
-                ],
-                "body_author_fixable": category in [
-                    "inline_baseline_expect_invalid_placement",
-                    "missing_baseline_expect_for_new_allowed_path"
-                ],
-                "needs_fix": category in [
-                    "inline_baseline_expect_invalid_placement",
-                    "missing_baseline_expect_for_new_allowed_path"
-                ],
-                "structured_feedback": {
-                    "category": category,
-                    "body_author_fixable": True,
-                    "category_wide_remediation": True,
-                } if category in [(
-                    "inline_baseline_expect_invalid_placement"
-                ), "missing_baseline_expect_for_new_allowed_path"] else None,
-            } if args.strict or category in [(
-                "inline_baseline_expect_invalid_placement"
-            ), "missing_baseline_expect_for_new_allowed_path"] else None,
-            # strict + repair coordination for inline_baseline_expect and missing_baseline_expect
-            "repair": {
-                "repairable": category in [
-                    "inline_baseline_expect_invalid_placement",
-                    "missing_baseline_expect_for_new_allowed_path"
-                ],
-                "kind": (
-                    (
-                        "move_inline_baseline_expect_to_preceding_line"
-                    ) if category == "inline_baseline_expect_invalid_placement"
-                    else "insert_baseline_expect_fail" if category == "missing_baseline_expect_for_new_allowed_path"
-                    else None
-                ),
-                "line_start": line_no,
-                "line_end": line_no,
-                "reason": (
-                    (
-                        "baseline-expect annotation must be in contiguous preceding comment block"
-                    ) if category == "inline_baseline_expect_invalid_placement"
-                    else (
-                        "new Allowed Path file requires baseline-expect: fail annotation"
-                    ) if category == "missing_baseline_expect_for_new_allowed_path"
-                    else None
-                ),
-            } if category in [(
-                "inline_baseline_expect_invalid_placement"
-            ), "missing_baseline_expect_for_new_allowed_path"] else None,
-        }
-        # "strict" + "repair" payload for inline_baseline_expect and missing_baseline_expect errors
-        # AC5: Add routing metadata for skipped results
-        if verification_owner:
-            result_item["verification_owner"] = verification_owner
-            result_item["deferred_reason"] = deferred_reason
-            result_item["runtime_verification_required"] = runtime_verification_required
+        )
+        results[_cmd_idx] = result_item
+        summary[result_item["classification"]] += 1
 
-        results.append(result_item)
-        summary[classification] += 1
+    # Issue #1338 (PR #1508 review P1-1): flush any pure-observation batch
+    # still buffered after the last Issue-body command (e.g. the body ends
+    # with a contiguous run of `rg`/`test` VCs with no trailing barrier).
+    _flush_parallel_batch()
 
     # B2: status 優先順位を blocked > human_judgment > pass にする
     status = "pass"
