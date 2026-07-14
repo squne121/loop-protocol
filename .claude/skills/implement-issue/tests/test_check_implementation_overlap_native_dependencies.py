@@ -524,6 +524,11 @@ _FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "overlap"
 def test_given_online_run_when_readback_candidate_exists_then_native_dependencies_fetched_for_it_only(
     monkeypatch, capsys
 ) -> None:
+    """online C1: current の `blocking` は後続 Issue であり、predecessor
+    ではない。`current_1451_analog` と path-only false-positive candidates を
+    使い、#9449 の candidate native fetch を含む二段階 readback 後も
+    `proceed_with_collision_evidence` を維持する。
+    """
     current_raw = json.loads((_FIXTURES_DIR / "current_1451_analog.json").read_text(encoding="utf-8"))
     candidates_raw = json.loads(
         (_FIXTURES_DIR / "candidates_path_only_false_positive.json").read_text(encoding="utf-8")
@@ -540,11 +545,23 @@ def test_given_online_run_when_readback_candidate_exists_then_native_dependencie
 
     def fake_fetch_all_native_dependencies(repo, issue_number):
         fetch_calls.append(issue_number)
+        if issue_number == 9451:
+            return {
+                "blockedBy": (),
+                "blocking": ({"repository": REPO, "number": 9600, "state": "OPEN"},),
+            }
         return {"blockedBy": (), "blocking": ()}
+
+    def fail_fetch_predecessor_issue(repo, issue_number):
+        pytest.fail(
+            "blocking-only native dependency must not fall through to predecessor readback: "
+            f"{repo}#{issue_number}"
+        )
 
     monkeypatch.setattr(module, "fetch_current_issue", fake_fetch_current_issue)
     monkeypatch.setattr(module, "fetch_implementation_candidates", fake_fetch_implementation_candidates)
     monkeypatch.setattr(module, "fetch_all_native_dependencies", fake_fetch_all_native_dependencies)
+    monkeypatch.setattr(module, "fetch_predecessor_issue", fail_fetch_predecessor_issue)
 
     exit_code = module.run(["--issue-number", "9451", "--repo", REPO])
     out = capsys.readouterr().out
@@ -552,14 +569,22 @@ def test_given_online_run_when_readback_candidate_exists_then_native_dependencie
 
     assert exit_code == 0, payload
     assert payload["route"] == "proceed_with_collision_evidence", payload
-    # current issue（9451）は必ず 1 回取得される。
+    # current issue（9451）は `blockedBy=[]` / `blocking=[#9600 OPEN]` として
+    # 取得されるが、後者は predecessor readback に流れてはならない。
     assert fetch_calls[0] == 9451
+    assert payload["dependency_resolution"]["blocked_by_refs"] == []
+    assert payload["dependency_resolution"]["blocking_predecessor"] is None
+    assert payload["dependency_resolution"]["native_blocking"] == [
+        {"repository": REPO, "number": 9600, "state": "OPEN"}
+    ]
     # readback 対象になった candidate（false positive fixture では 9449 は
     # 自己除外されず、Allowed Paths が重複するが Outcome/In Scope が disjoint
     # な候補として readback される）にも native dependency 取得が行われる。
     readback_numbers = {c["issue_number"] for c in payload["candidates"]}
     assert readback_numbers, "expected at least one readback candidate"
     assert readback_numbers.issubset(set(fetch_calls[1:]))
+    assert 9449 in readback_numbers
+    assert 9449 in fetch_calls[1:]
     assert "native_dependency_candidates_fetched" in payload["dependency_resolution"]
     assert set(payload["dependency_resolution"]["native_dependency_candidates_fetched"]) == readback_numbers
 
