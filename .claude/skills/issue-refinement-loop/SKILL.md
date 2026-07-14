@@ -250,6 +250,8 @@ hard stop 判定は `post_rewrite_check` / `decide_next_action` phase（`hard_st
 
 `VERDICT: needs-fix` の直後に、reviewer blocker が deterministic checker に裏付けられているかを確認する。この arbitration（`reviewer_claim_replay.py`）は `issue-reviewer` SubAgent の実行境界内（producer である `compact_review_result.py` と同一 SubAgent 実行、同一 isolation worktree）で co-locate 実行済みであり、orchestrator はその子 worktree の raw artifact パスを別途 open/read しない（Issue #1472）。これにより、unbacked reviewer blocker だけで semantic iteration を消費しない、という Step 2a の目的を isolation worktree 環境でも維持する。
 
+consecutive-unbacked state は isolation worktree（呼び出しごとに破棄される）ではなく orchestrator が所有する（`reviewer_claim_replay_state_store.py`、Issue #1515）。orchestrator は SubAgent 起動前に `--read` で `previous_state` を取得し prompt へ渡し、SubAgent stdout の `REPLAY_NEXT_STATE` を `--write` でそのまま永続化する。read→invoke→write の手順・identity binding・retention は `references/loop-state.md` の「REVIEWER_CLAIM_REPLAY_STATE_V2」セクションを参照する。
+
 orchestrator は `issue-reviewer` SubAgent stdout の compact な arbitration フィールドをそのまま consume する:
 
 ```text
@@ -257,21 +259,17 @@ REPLAY_VERDICT: deterministic_fail_confirmed | reviewer_claim_unbacked_by_determ
 REPLAY_ROUTING: proceed_to_rewrite | downgrade_to_non_blocking | human_escalation | human_judgment_required | fix_checker_artifact
 REPLAY_SHOULD_CONSUME: true | false
 REPLAY_BODY_SHA256: <sha256>
+REPLAY_NEXT_STATE: <next_state JSON — --write へそのまま渡す>
 REPLAY_ARTIFACT_DIGEST: <sha256 of reviewer_claim_replay.py stdout JSON>
 ```
 
-`issue-reviewer` SubAgent 側の実行契約（`--review-result-file` / `--readiness-result-file` / `--state-file` の入力契約、reviewer code ↔ deterministic checker ↔ readiness rule id の exact mapping、fail-closed 条件）は `.claude/agents/issue-reviewer.md` を SSOT とし、本ファイルに重複記載しない。
+`issue-reviewer` SubAgent 側の実行契約（`--review-result-file` / `--readiness-result-file` / `--previous-state-inline` の入力契約、reviewer code ↔ deterministic checker ↔ readiness rule id の exact mapping、fail-closed 条件）は `.claude/agents/issue-reviewer.md` を SSOT とし、本ファイルに重複記載しない。
 
 出力契約（`REPLAY_VERDICT` の consume ルーティング）:
 - `deterministic_fail_confirmed` → Step 4 rewrite に進む。`REPLAY_SHOULD_CONSUME: true`
 - `reviewer_claim_unbacked_by_deterministic_checker` → reviewer blocker を non-blocking downgrade し、semantic iteration を消費せず Step 2 reviewer に戻す
 - `reviewer_false_positive_suspected` → same `REPLAY_BODY_SHA256` + same blocker lane で 2 回連続 unbacked。`REPLAY_ROUTING: human_escalation` で停止する
 - `input_or_runtime_error` → `human_judgment_required` で停止する
-
-state persistence（`issue-reviewer` SubAgent 内で実行される `reviewer_claim_replay.py` が保持）:
-- state file（`.claude/artifacts/issue-refinement-loop/<issue_number>/reviewer_claim_replay_state.json`）は `body_sha256`、`reviewer_blocker_code`、`normalized_kind`、`consecutive_unbacked_count`、`last_review_artifact` を保持する
-- `body_sha256` が変わったら consecutive count を reset する
-- 同じ body / 同じ blocker lane でのみ consecutive count を increment する
 
 ### Step 4: 書き換え (Rewrite)
 
