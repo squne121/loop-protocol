@@ -3,7 +3,7 @@ test_validate_review_compact_output.py
 
 Pytest coverage for `validate_review_compact_output.py` (Issue #1507).
 
-GIVEN/WHEN/THEN style tests covering AC1-AC9, AC12, AC13 of Issue #1507:
+GIVEN/WHEN/THEN style tests covering AC1-AC9, AC12, AC13, AC15-AC21 of Issue #1507:
   - AC1/AC2/AC3: exact envelope shape acceptance / rejection
   - AC4: missing / duplicate / unknown / out-of-order field rejection
   - AC5: prose / code fence / blank line / ANSI / control char / byte budget
@@ -16,6 +16,11 @@ GIVEN/WHEN/THEN style tests covering AC1-AC9, AC12, AC13 of Issue #1507:
   - AC12: parity with real compact_review_result.py / reviewer_claim_replay.py
     output
   - AC13: subprocess E2E rejection of malformed input
+  - AC15/AC16: --issue-number active issue namespace binding (mismatch /
+    unknown / 0 / leading-zero rejection)
+  - AC17-AC20: MUST_READ / EVIDENCE / ARTIFACT filename / SUMMARY
+    producer-derived invariants
+  - AC21: mutation testing against real compact_review_result.py output
 """
 
 from __future__ import annotations
@@ -456,9 +461,15 @@ class TestArtifactLexicalValidation:
 
     def test_artifact_does_not_check_filesystem_existence(self, tmp_path):
         """GIVEN a syntactically valid but nonexistent ARTIFACT path WHEN
-        validated THEN validation succeeds (lexical-only, #1472 boundary)."""
+        validated THEN validation succeeds (lexical-only, #1472 boundary).
+
+        Uses a canonical-shape but never-generated timestamp
+        (20990101T000000Z) so the filename still matches the AC19
+        compact_review_result_YYYYMMDDTHHMMSSZ.json pattern while remaining
+        guaranteed absent from disk.
+        """
         text = _approve_envelope(
-            artifact_path=".claude/artifacts/issue-refinement-loop/999999/definitely_does_not_exist.json"
+            artifact_path=".claude/artifacts/issue-refinement-loop/999999/compact_review_result_20990101T000000Z.json"
         )
         result = validate_review_compact_output(text)
         assert result["validation_status"] == "valid"
@@ -555,7 +566,7 @@ class TestParityWithRealProducers:
             repo_root=tmp_path,
         )
         approve_text = "\n".join(stdout_lines)
-        approve_result = validate_review_compact_output(approve_text)
+        approve_result = validate_review_compact_output(approve_text, issue_number=1507)
         assert approve_result["validation_status"] == "valid", approve_result["violations"]
         assert approve_result["envelope_kind"] == "approve"
 
@@ -612,7 +623,7 @@ class TestParityWithRealProducers:
             f"REPLAY_ARTIFACT_DIGEST: {replay_artifact_digest}",
         ]
         needs_fix_text = "\n".join(stdout_lines_nf) + "\n" + "\n".join(replay_lines)
-        needs_fix_result = validate_review_compact_output(needs_fix_text)
+        needs_fix_result = validate_review_compact_output(needs_fix_text, issue_number=1507)
         assert needs_fix_result["validation_status"] == "valid", needs_fix_result["violations"]
         assert needs_fix_result["envelope_kind"] == "needs_fix"
         assert needs_fix_result["normalized_payload"]["REPLAY_VERDICT"] == "deterministic_fail_confirmed"
@@ -633,9 +644,9 @@ class TestParityWithRealProducers:
 
 
 class TestE2ESubprocess:
-    def _run(self, stdin_text: str) -> subprocess.CompletedProcess:
+    def _run(self, stdin_text: str, *, issue_number: int = 1507) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [sys.executable, str(VALIDATOR_PATH)],
+            [sys.executable, str(VALIDATOR_PATH), "--issue-number", str(issue_number)],
             input=stdin_text.encode("utf-8"),
             capture_output=True,
             timeout=30,
@@ -674,3 +685,200 @@ class TestE2ESubprocess:
         # Exactly one JSON object followed by a single trailing newline.
         assert stdout_text.endswith("\n")
         json.loads(stdout_text)  # must parse as a single JSON document
+
+    def test_e2e_subprocess_requires_issue_number(self):
+        """GIVEN validator invoked without --issue-number WHEN it runs THEN
+        argparse fails closed (exit code 2, no stdout JSON emitted)."""
+        proc = subprocess.run(
+            [sys.executable, str(VALIDATOR_PATH)],
+            input=_approve_envelope().encode("utf-8"),
+            capture_output=True,
+            timeout=30,
+        )
+        assert proc.returncode == 2
+        assert b"--issue-number" in proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# AC15/AC16: active issue namespace binding
+# ---------------------------------------------------------------------------
+
+
+class TestIssueNumberBinding:
+    def test_artifact_issue_number_mismatch_rejected(self):
+        """GIVEN an approve envelope whose ARTIFACT issue segment (1507)
+        does not match the bound --issue-number (9999) WHEN validated THEN
+        artifact_issue_number_mismatch."""
+        text = _approve_envelope()
+        result = validate_review_compact_output(text, issue_number=9999)
+        assert result["validation_status"] == "invalid"
+        codes = {v["code"] for v in result["violations"]}
+        assert "artifact_issue_number_mismatch" in codes
+
+    def test_artifact_issue_number_match_is_valid(self):
+        """GIVEN an approve envelope whose ARTIFACT issue segment matches
+        the bound --issue-number WHEN validated THEN valid."""
+        text = _approve_envelope()
+        result = validate_review_compact_output(text, issue_number=1507)
+        assert result["validation_status"] == "valid"
+
+    def test_artifact_unknown_namespace_rejected(self):
+        """GIVEN ARTIFACT issue segment 'unknown' WHEN validated THEN
+        artifact_issue_segment_unknown_rejected, regardless of --issue-number."""
+        text = _approve_envelope(
+            artifact_path=".claude/artifacts/issue-refinement-loop/unknown/compact_review_result_20260714T113303Z.json"
+        )
+        result = validate_review_compact_output(text, issue_number=1507)
+        assert result["validation_status"] == "invalid"
+        codes = {v["code"] for v in result["violations"]}
+        assert "artifact_issue_segment_unknown_rejected" in codes
+
+    @pytest.mark.parametrize("segment", ["0", "0001507"])
+    def test_artifact_zero_or_leading_zero_namespace_rejected(self, segment):
+        """GIVEN ARTIFACT issue segment '0' or a leading-zero segment WHEN
+        validated THEN artifact_issue_segment_zero_or_leading_zero_rejected,
+        regardless of --issue-number."""
+        text = _approve_envelope(
+            artifact_path=f".claude/artifacts/issue-refinement-loop/{segment}/compact_review_result_20260714T113303Z.json"
+        )
+        result = validate_review_compact_output(text, issue_number=1507)
+        assert result["validation_status"] == "invalid"
+        codes = {v["code"] for v in result["violations"]}
+        assert "artifact_issue_segment_zero_or_leading_zero_rejected" in codes
+
+
+# ---------------------------------------------------------------------------
+# AC17-AC20: producer-derived field invariants
+# ---------------------------------------------------------------------------
+
+
+class TestProducerDerivedInvariants:
+    def test_must_read_non_empty_rejected(self):
+        """GIVEN MUST_READ is non-empty WHEN validated THEN
+        must_read_non_empty_rejected."""
+        text = _approve_envelope(must_read="docs/dev/some-file.md")
+        result = validate_review_compact_output(text)
+        assert result["validation_status"] == "invalid"
+        codes = {v["code"] for v in result["violations"]}
+        assert "must_read_non_empty_rejected" in codes
+
+    def test_evidence_artifact_mismatch_rejected(self):
+        """GIVEN EVIDENCE does not match the ARTIFACT path (with the
+        compact_review_result_v1= prefix stripped) WHEN validated THEN
+        evidence_artifact_mismatch."""
+        artifact_path = ".claude/artifacts/issue-refinement-loop/1507/compact_review_result_20260714T113303Z.json"
+        lines = _approve_envelope(artifact_path=artifact_path).split("\n")
+        # Tamper EVIDENCE (index 6) only, leaving ARTIFACT (index 7) intact.
+        lines[6] = "EVIDENCE: .claude/artifacts/issue-refinement-loop/1507/compact_review_result_99999999T999999Z.json"
+        text = "\n".join(lines)
+        result = validate_review_compact_output(text, issue_number=1507)
+        assert result["validation_status"] == "invalid"
+        codes = {v["code"] for v in result["violations"]}
+        assert "evidence_artifact_mismatch" in codes
+
+    def test_artifact_filename_pattern_rejected(self):
+        """GIVEN the ARTIFACT filename does not match
+        compact_review_result_YYYYMMDDTHHMMSSZ.json WHEN validated THEN
+        artifact_filename_pattern_invalid."""
+        text = _approve_envelope(
+            artifact_path=".claude/artifacts/issue-refinement-loop/1507/some_other_file.json"
+        )
+        result = validate_review_compact_output(text, issue_number=1507)
+        assert result["validation_status"] == "invalid"
+        codes = {v["code"] for v in result["violations"]}
+        assert "artifact_filename_pattern_invalid" in codes
+
+    def test_summary_invariant_rejected(self):
+        """GIVEN SUMMARY does not match the expected invariant for its
+        envelope kind (approve: 'contract ready' exact; needs-fix:
+        'N blocker(s)(; first=<code>)?') WHEN validated THEN
+        summary_invariant_invalid."""
+        approve_text = _approve_envelope(summary="looks fine to me")
+        approve_result = validate_review_compact_output(approve_text)
+        assert approve_result["validation_status"] == "invalid"
+        approve_codes = {v["code"] for v in approve_result["violations"]}
+        assert "summary_invariant_invalid" in approve_codes
+
+        needs_fix_lines = _needs_fix_envelope().split("\n")
+        needs_fix_lines[2] = "SUMMARY: something is wrong"
+        needs_fix_text = "\n".join(needs_fix_lines)
+        needs_fix_result = validate_review_compact_output(needs_fix_text)
+        assert needs_fix_result["validation_status"] == "invalid"
+        needs_fix_codes = {v["code"] for v in needs_fix_result["violations"]}
+        assert "summary_invariant_invalid" in needs_fix_codes
+
+    def test_summary_invariant_needs_fix_first_code_suffix_is_valid(self):
+        """GIVEN needs-fix SUMMARY matches 'N blocker(s); first=<code>' WHEN
+        validated THEN no summary_invariant_invalid violation."""
+        lines = _needs_fix_envelope().split("\n")
+        lines[2] = "SUMMARY: 2 blocker(s); first=LP010"
+        text = "\n".join(lines)
+        result = validate_review_compact_output(text)
+        assert result["validation_status"] == "valid", result["violations"]
+
+
+# ---------------------------------------------------------------------------
+# AC21: mutation testing against real compact_review_result.py output
+# ---------------------------------------------------------------------------
+
+
+class TestProducerOutputMutationTesting:
+    def test_producer_output_mutation_testing(self, tmp_path, monkeypatch):
+        """GIVEN real compact_review_result.py approve/needs-fix stdout
+        WHEN validated THEN valid; WHEN MUST_READ / EVIDENCE / ARTIFACT
+        filename / ARTIFACT issue segment are each individually mutated
+        THEN each mutation independently causes validation_status invalid
+        (Issue #1507 AC21)."""
+        monkeypatch.chdir(tmp_path)
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        from compact_review_result import compact_review_result
+
+        approve_raw = json.loads((FIXTURES_DIR / "review_result_approve.json").read_text(encoding="utf-8"))
+        _compact, stdout_lines, _artifact_path, _content = compact_review_result(
+            approve_raw,
+            artifact_dir=Path(".claude/artifacts/issue-refinement-loop"),
+            issue_number=1507,
+            repo_root=tmp_path,
+        )
+        baseline_text = "\n".join(stdout_lines)
+        baseline_result = validate_review_compact_output(baseline_text, issue_number=1507)
+        assert baseline_result["validation_status"] == "valid", baseline_result["violations"]
+
+        field_index = {line.split(": ", 1)[0]: i for i, line in enumerate(stdout_lines)}
+
+        # Mutation 1: MUST_READ non-empty
+        mutated = list(stdout_lines)
+        mutated[field_index["MUST_READ"]] = "MUST_READ: docs/dev/some-file.md"
+        result = validate_review_compact_output("\n".join(mutated), issue_number=1507)
+        assert result["validation_status"] == "invalid"
+        assert "must_read_non_empty_rejected" in {v["code"] for v in result["violations"]}
+
+        # Mutation 2: EVIDENCE diverges from ARTIFACT
+        mutated = list(stdout_lines)
+        mutated[field_index["EVIDENCE"]] = (
+            "EVIDENCE: .claude/artifacts/issue-refinement-loop/1507/compact_review_result_99999999T999999Z.json"
+        )
+        result = validate_review_compact_output("\n".join(mutated), issue_number=1507)
+        assert result["validation_status"] == "invalid"
+        assert "evidence_artifact_mismatch" in {v["code"] for v in result["violations"]}
+
+        # Mutation 3: ARTIFACT filename no longer matches the canonical shape
+        mutated = list(stdout_lines)
+        artifact_line = mutated[field_index["ARTIFACT"]]
+        prefix, _, path = artifact_line.partition("=")
+        mutated_path = str(Path(path).parent / "not_a_compact_result.json")
+        mutated[field_index["ARTIFACT"]] = f"{prefix}={mutated_path}"
+        result = validate_review_compact_output("\n".join(mutated), issue_number=1507)
+        assert result["validation_status"] == "invalid"
+        assert "artifact_filename_pattern_invalid" in {v["code"] for v in result["violations"]}
+
+        # Mutation 4: ARTIFACT issue segment diverges from the bound --issue-number
+        mutated = list(stdout_lines)
+        artifact_line = mutated[field_index["ARTIFACT"]]
+        prefix, _, path = artifact_line.partition("=")
+        p = Path(path)
+        mutated_path = p.parent.parent / "1508" / p.name
+        mutated[field_index["ARTIFACT"]] = f"{prefix}={mutated_path}"
+        result = validate_review_compact_output("\n".join(mutated), issue_number=1507)
+        assert result["validation_status"] == "invalid"
+        assert "artifact_issue_number_mismatch" in {v["code"] for v in result["violations"]}

@@ -348,11 +348,18 @@ REGISTRY: dict[str, dict[str, Any]] = {
     # SubAgent stdout. Consumes the SubAgent exact final text via stdin
     # (no re-transcription); see validate_review_compact_output.py and
     # SKILL.md Step 2 / Step 2a.
+    #
+    # AC22 (P1-2 of the second owner review): argv is rendered with
+    # `uv run --locked --offline --no-sync python3 ...` so the rendered
+    # argv's actual execution semantics match this entry's own
+    # `mutation: False` / `network_effect: local_only` declarations exactly
+    # (no implicit lockfile sync / no implicit network access at run time).
     "review_compact.validate": {
         "id": "review_compact.validate",
         "argv": [
-            "uv", "run", "python3",
+            "uv", "run", "--locked", "--offline", "--no-sync", "python3",
             f"{_SKILL_PREFIX}/validate_review_compact_output.py",
+            "--issue-number", "{issue_number}",
         ],
         "shell": False,
         "cwd_policy": "repo_root",
@@ -361,7 +368,9 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "timeout_seconds": 30,
         "mutation": False,
         "network_effect": "local_only",
-        "placeholders": {},
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+        },
     },
 }
 

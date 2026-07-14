@@ -47,9 +47,25 @@ exact ordered-field-sequence check (a concatenation never matches any of the
 three canonical field sequences, even when the total line count happens to
 coincide with the needs-fix envelope's 13 lines).
 
+Issue #1507 P0-3 / P1-1 (AC15-AC20): active issue namespace binding and
+producer-derived field invariants.
+
+  - `--issue-number` (positive int, required on the CLI) binds the `ARTIFACT`
+    issue segment to the active issue. A mismatched, `unknown`, `0`, or
+    leading-zero segment is always rejected (AC15/AC16), independent of
+    whether `--issue-number` was supplied to `validate_review_compact_output`
+    directly (the pure function defaults `issue_number=None`, in which case
+    only the `unknown`/`0`/leading-zero checks apply).
+  - `MUST_READ` must always be empty (AC17); `EVIDENCE` must exactly equal
+    the `ARTIFACT` path with its `compact_review_result_v1=` prefix stripped
+    (AC18); the `ARTIFACT` filename (final path segment) for approve/
+    needs-fix envelopes must match `compact_review_result_YYYYMMDDTHHMMSSZ.json`
+    (AC19); `SUMMARY` must be exactly `contract ready` for approve, or match
+    `N blocker(s)(; first=<code>)?` for needs-fix (AC20).
+
 Usage:
-    <subagent stdout text> | uv run python3 validate_review_compact_output.py
-    uv run python3 validate_review_compact_output.py --input-file <path>
+    <subagent stdout text> | uv run python3 validate_review_compact_output.py --issue-number <N>
+    uv run python3 validate_review_compact_output.py --input-file <path> --issue-number <N>
 
 stdout: exactly one JSON object, schema `REVIEW_COMPACT_VALIDATION_RESULT_V1`.
 Human-oriented diagnostics (if any) go to stderr only; stdout is
@@ -168,8 +184,16 @@ _SHA256_PLAIN_RE = re.compile(r"^[0-9a-f]{64}$")
 # lexical validation ONLY -- it never opens, stats, or reads the referenced
 # file (Issue #1472 isolation worktree boundary; #1507 P0-2).
 _ARTIFACT_PATH_RE = re.compile(
-    r"^\.claude/artifacts/issue-refinement-loop/(?:[0-9]+|unknown)/[A-Za-z0-9_.-]+\.json$"
+    r"^\.claude/artifacts/issue-refinement-loop/(?P<segment>[0-9]+|unknown)/(?P<filename>[A-Za-z0-9_.-]+\.json)$"
 )
+
+# AC19: canonical compact_review_result artifact filename shape.
+_COMPACT_FILENAME_RE = re.compile(r"^compact_review_result_[0-9]{8}T[0-9]{6}Z\.json$")
+
+# AC20: needs-fix SUMMARY invariant shape.
+_SUMMARY_NEEDS_FIX_RE = re.compile(r"^[0-9]+ blocker\(s\)(; first=.{1,60})?$")
+
+_COMPACT_ARTIFACT_PREFIX = "compact_review_result_v1="
 
 
 def _violation(code: str, **extra: Any) -> dict[str, Any]:
@@ -314,7 +338,14 @@ def _diff_violations(ordered_keys: list[str]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def _artifact_value_violations(field: str, prefix: str, value: str) -> list[dict[str, Any]]:
+def _artifact_value_violations(
+    field: str,
+    prefix: str,
+    value: str,
+    *,
+    issue_number: int | None = None,
+    check_filename_pattern: bool = False,
+) -> list[dict[str, Any]]:
     violations: list[dict[str, Any]] = []
     if not value.startswith(prefix):
         violations.append(
@@ -328,12 +359,89 @@ def _artifact_value_violations(field: str, prefix: str, value: str) -> list[dict
     if ".." in path.split("/"):
         violations.append(_violation("artifact_parent_traversal_rejected", field=field, value=value))
         return violations
-    if not _ARTIFACT_PATH_RE.match(path):
+    match = _ARTIFACT_PATH_RE.match(path)
+    if not match:
         violations.append(_violation("artifact_path_invalid", field=field, value=value))
+        return violations
+
+    # AC15/AC16: active issue namespace binding (independent of each other).
+    segment = match.group("segment")
+    if segment == "unknown":
+        violations.append(
+            _violation("artifact_issue_segment_unknown_rejected", field=field, value=value)
+        )
+    elif segment == "0" or (len(segment) > 1 and segment[0] == "0"):
+        violations.append(
+            _violation(
+                "artifact_issue_segment_zero_or_leading_zero_rejected",
+                field=field,
+                value=value,
+                segment=segment,
+            )
+        )
+    elif issue_number is not None and int(segment) != int(issue_number):
+        violations.append(
+            _violation(
+                "artifact_issue_number_mismatch",
+                field=field,
+                value=value,
+                segment=segment,
+                expected_issue_number=issue_number,
+            )
+        )
+
+    # AC19: canonical compact_review_result filename shape (approve/needs-fix only).
+    if check_filename_pattern:
+        filename = match.group("filename")
+        if not _COMPACT_FILENAME_RE.match(filename):
+            violations.append(
+                _violation("artifact_filename_pattern_invalid", field=field, value=value, filename=filename)
+            )
+
     return violations
 
 
-def _validate_approve_values(fields: dict[str, str]) -> list[dict[str, Any]]:
+def _common_field_invariants(fields: dict[str, str], envelope_kind: str) -> list[dict[str, Any]]:
+    """AC17/AC18/AC20 producer-derived value invariants shared by the
+    approve and needs-fix envelopes (producer-failure envelope does not
+    carry these fields)."""
+    violations: list[dict[str, Any]] = []
+
+    must_read = fields.get("MUST_READ", "")
+    if must_read != "":
+        violations.append(_violation("must_read_non_empty_rejected", value=must_read))
+
+    artifact = fields.get("ARTIFACT", "")
+    evidence = fields.get("EVIDENCE", "")
+    if artifact.startswith(_COMPACT_ARTIFACT_PREFIX):
+        expected_evidence = artifact[len(_COMPACT_ARTIFACT_PREFIX) :]
+        if evidence != expected_evidence:
+            violations.append(
+                _violation(
+                    "evidence_artifact_mismatch",
+                    evidence=evidence,
+                    expected=expected_evidence,
+                )
+            )
+
+    summary = fields.get("SUMMARY", "")
+    if envelope_kind == "approve":
+        if summary != "contract ready":
+            violations.append(
+                _violation("summary_invariant_invalid", envelope="approve", value=summary)
+            )
+    elif envelope_kind == "needs_fix":
+        if not _SUMMARY_NEEDS_FIX_RE.match(summary):
+            violations.append(
+                _violation("summary_invariant_invalid", envelope="needs_fix", value=summary)
+            )
+
+    return violations
+
+
+def _validate_approve_values(
+    fields: dict[str, str], *, issue_number: int | None = None
+) -> list[dict[str, Any]]:
     violations: list[dict[str, Any]] = []
     status = fields.get("STATUS", "")
     verdict = fields.get("VERDICT", "")
@@ -353,11 +461,22 @@ def _validate_approve_values(fields: dict[str, str]) -> list[dict[str, Any]]:
         violations.append(_violation("blockers_invalid_format", value=blockers))
     elif blockers != "0":
         violations.append(_violation("approve_blockers_must_be_zero", value=blockers))
-    violations.extend(_artifact_value_violations("ARTIFACT", "compact_review_result_v1=", artifact))
+    violations.extend(
+        _artifact_value_violations(
+            "ARTIFACT",
+            _COMPACT_ARTIFACT_PREFIX,
+            artifact,
+            issue_number=issue_number,
+            check_filename_pattern=True,
+        )
+    )
+    violations.extend(_common_field_invariants(fields, "approve"))
     return violations
 
 
-def _validate_needs_fix_values(fields: dict[str, str]) -> list[dict[str, Any]]:
+def _validate_needs_fix_values(
+    fields: dict[str, str], *, issue_number: int | None = None
+) -> list[dict[str, Any]]:
     violations: list[dict[str, Any]] = []
     status = fields.get("STATUS", "")
     verdict = fields.get("VERDICT", "")
@@ -386,7 +505,16 @@ def _validate_needs_fix_values(fields: dict[str, str]) -> list[dict[str, Any]]:
         violations.append(_violation("blockers_invalid_format", value=blockers))
     elif blockers == "0":
         violations.append(_violation("needs_fix_blockers_must_be_nonzero", value=blockers))
-    violations.extend(_artifact_value_violations("ARTIFACT", "compact_review_result_v1=", artifact))
+    violations.extend(
+        _artifact_value_violations(
+            "ARTIFACT",
+            _COMPACT_ARTIFACT_PREFIX,
+            artifact,
+            issue_number=issue_number,
+            check_filename_pattern=True,
+        )
+    )
+    violations.extend(_common_field_invariants(fields, "needs_fix"))
 
     if replay_verdict not in VALID_REPLAY_VERDICTS:
         violations.append(_violation("replay_verdict_invalid_enum", value=replay_verdict))
@@ -413,7 +541,9 @@ def _validate_needs_fix_values(fields: dict[str, str]) -> list[dict[str, Any]]:
     return violations
 
 
-def _validate_producer_failure_values(fields: dict[str, str]) -> list[dict[str, Any]]:
+def _validate_producer_failure_values(
+    fields: dict[str, str], *, issue_number: int | None = None
+) -> list[dict[str, Any]]:
     violations: list[dict[str, Any]] = []
     status = fields.get("STATUS", "")
     next_action = fields.get("NEXT_ACTION", "")
@@ -431,7 +561,15 @@ def _validate_producer_failure_values(fields: dict[str, str]) -> list[dict[str, 
         )
     if not reason_code:
         violations.append(_violation("reason_code_empty"))
-    violations.extend(_artifact_value_violations("ARTIFACT", "producer_failure_v1=", artifact))
+    violations.extend(
+        _artifact_value_violations(
+            "ARTIFACT",
+            "producer_failure_v1=",
+            artifact,
+            issue_number=issue_number,
+            check_filename_pattern=False,
+        )
+    )
     if not _SHA256_PLAIN_RE.match(artifact_sha256):
         violations.append(_violation("artifact_sha256_invalid_format", value=artifact_sha256))
 
@@ -443,8 +581,16 @@ def _validate_producer_failure_values(fields: dict[str, str]) -> list[dict[str, 
 # ---------------------------------------------------------------------------
 
 
-def validate_review_compact_output(raw_text: str) -> dict[str, Any]:
+def validate_review_compact_output(
+    raw_text: str, *, issue_number: int | None = None
+) -> dict[str, Any]:
     """Validate `raw_text` against the three canonical envelope grammars.
+
+    `issue_number` (Issue #1507 AC15/AC16, optional for direct callers,
+    required on the CLI): binds the `ARTIFACT` issue segment to the active
+    issue. When omitted, the segment-shape invariants (not `unknown`, not
+    `0`/leading-zero) still apply; only the exact-match binding to a
+    specific issue number is skipped.
 
     Returns a dict with keys: validation_status, envelope_kind,
     normalized_payload, violations, next_action, artifact_path_policy.
@@ -499,11 +645,11 @@ def validate_review_compact_output(raw_text: str) -> dict[str, Any]:
         }
 
     if envelope_kind_exact == "approve":
-        value_violations = _validate_approve_values(fields)
+        value_violations = _validate_approve_values(fields, issue_number=issue_number)
     elif envelope_kind_exact == "needs_fix":
-        value_violations = _validate_needs_fix_values(fields)
+        value_violations = _validate_needs_fix_values(fields, issue_number=issue_number)
     else:
-        value_violations = _validate_producer_failure_values(fields)
+        value_violations = _validate_producer_failure_values(fields, issue_number=issue_number)
 
     violations.extend(value_violations)
 
@@ -551,7 +697,7 @@ def validate_review_compact_output(raw_text: str) -> dict[str, Any]:
     }
 
 
-def build_result(raw_bytes: bytes) -> tuple[dict[str, Any], int]:
+def build_result(raw_bytes: bytes, *, issue_number: int | None = None) -> tuple[dict[str, Any], int]:
     """Build the full REVIEW_COMPACT_VALIDATION_RESULT_V1 payload + exit code."""
     input_sha256 = hashlib.sha256(raw_bytes).hexdigest()
     input_byte_count = len(raw_bytes)
@@ -573,7 +719,7 @@ def build_result(raw_bytes: bytes) -> tuple[dict[str, Any], int]:
         }
         return payload, 2
 
-    inner = validate_review_compact_output(raw_text)
+    inner = validate_review_compact_output(raw_text, issue_number=issue_number)
     payload = {
         "schema": SCHEMA,
         "schema_version": SCHEMA_VERSION,
@@ -594,6 +740,16 @@ def build_result(raw_bytes: bytes) -> tuple[dict[str, Any], int]:
 # ---------------------------------------------------------------------------
 
 
+def _positive_int(value: str) -> int:
+    try:
+        int_value = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"--issue-number must be an integer, got {value!r}") from exc
+    if int_value <= 0:
+        raise argparse.ArgumentTypeError(f"--issue-number must be a positive integer, got {value!r}")
+    return int_value
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Validate issue-reviewer SubAgent compact output against "
@@ -603,6 +759,13 @@ def main(argv: list[str] | None = None) -> int:
         "--input-file",
         default=None,
         help="Path to the raw SubAgent stdout text (default: read from stdin).",
+    )
+    parser.add_argument(
+        "--issue-number",
+        type=_positive_int,
+        required=True,
+        help="Active issue number (positive integer). Binds ARTIFACT's issue "
+        "segment to this value (Issue #1507 AC15/AC16).",
     )
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
@@ -629,7 +792,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write("\n")
         return 2
 
-    payload, exit_code = build_result(raw_bytes)
+    payload, exit_code = build_result(raw_bytes, issue_number=args.issue_number)
     sys.stdout.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
     sys.stdout.write("\n")
     return exit_code
