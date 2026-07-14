@@ -23,8 +23,6 @@ import sys
 from pathlib import Path
 from unittest import mock
 
-import pytest
-
 SKILL_ROOT = Path(__file__).parent.parent
 SCRIPTS_DIR = SKILL_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))

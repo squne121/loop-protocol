@@ -195,7 +195,7 @@ Exit codes:
 これが現在の phase で `scope_signal_guard.triggered` が hard stop になるかどうかを決定する。
 
 
-## REVIEWER_CLAIM_REPLAY_STATE_V2（Step 2a consecutive-unbacked state, #1515）
+## REVIEWER_CLAIM_REPLAY_STATE_V2（Step 2a の連続 unbacked 判定用 state, #1515）
 
 **この state は `LOOP_STATE_V1`（`schemas/loop_state.schema.json`）とは独立した、session-scoped な別 state であり、`LOOP_STATE_V1` へ統合しない（#1504 の比較検討で不採用、#1515 Out of Scope）。**
 
