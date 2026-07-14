@@ -724,7 +724,7 @@ jobs:
               >> measurements.jsonl
             return $status
           }
-          run_timed test_e2e_preview_namespace playwright test
+          run_timed test_e2e_preview_namespace pnpm exec playwright test
       - name: Upload AC9 preview-namespace Playwright report
         id: upload-playwright-report-preview-namespace
         if: ${{ !cancelled() }}
