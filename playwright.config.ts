@@ -41,8 +41,16 @@ export default defineConfig({
   retries: process.env.CI ? 1 : 0,
   /* One worker for consistent simulation timing */
   workers: 1,
-  /* Reporter to use. */
-  reporter: [['html', { open: 'never' }], ['list']],
+  /* Reporter to use.
+   * Preview-namespace lane writes its HTML report to a distinct output
+   * folder (not the default `playwright-report/`) so its CI upload step
+   * cannot collide with `scripts/check-visual-artifact-pipeline.py`'s fixed
+   * id/name contract for the `playwright-report/` path (PR #1517 review
+   * fix). */
+  reporter: [
+    ['html', { open: 'never', outputFolder: PREVIEW_NAMESPACE_LANE ? 'playwright-report-preview-namespace' : 'playwright-report' }],
+    ['list'],
+  ],
   use: {
     /* Base URL — matches the preview server port */
     baseURL: 'http://127.0.0.1:4173',

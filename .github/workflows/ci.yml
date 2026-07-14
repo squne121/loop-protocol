@@ -731,7 +731,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: playwright-report-preview-namespace
-          path: playwright-report/
+          path: playwright-report-preview-namespace/
           if-no-files-found: warn
           retention-days: 30
       - name: Collect ci_runtime_baseline_v1 artifact
