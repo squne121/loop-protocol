@@ -14,7 +14,12 @@ HELPER = REPO_ROOT / ".claude/skills/implement-issue/scripts/check_implementatio
 DEFAULT_REPO = "squne121/loop-protocol"
 CREATE_ISSUE_SCRIPTS = REPO_ROOT / ".claude/skills/create-issue/scripts"
 sys.path.insert(0, str(CREATE_ISSUE_SCRIPTS))
-from check_issue_overlap import PathScopeKind, classify_path_scope_kind  # noqa: E402
+from check_issue_overlap import (  # noqa: E402
+    PathScopeKind,
+    SOURCE_OK,
+    classify_path_scope_kind,
+    gh_search_candidates,
+)
 
 
 def _sha(body: str) -> str:
@@ -116,3 +121,37 @@ def test_issue_1283_golden_fixture(tmp_path: Path) -> None:
     assert all(value.startswith("sha256:") for value in golden.values())
     payload = _run(tmp_path, current, candidate)
     assert payload["route"] != "human_review_required"
+
+
+def test_open_issue_source_uses_paginated_api_without_saturation(monkeypatch: object) -> None:
+    """GIVEN two REST pages exceeding the former default limit
+    WHEN the online source collects candidates
+    THEN gh api --paginate is used and source status remains complete.
+    """
+    pages = [
+        [{"number": number, "title": f"issue {number}", "body": "body", "labels": [],
+          "state": "open", "html_url": f"https://example.test/{number}"}
+         for number in range(1, 101)],
+        [{"number": 101, "title": "issue 101", "body": "body", "labels": [],
+          "state": "open", "html_url": "https://example.test/101"},
+         {"number": 102, "title": "pull request", "body": "body", "labels": [],
+          "state": "open", "pull_request": {}}],
+    ]
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(pages))
+
+    monkeypatch.setattr("check_issue_overlap.subprocess.run", fake_run)  # type: ignore[attr-defined]
+
+    candidates, status = gh_search_candidates(DEFAULT_REPO, ("overlap",))
+
+    assert calls == [[
+        "gh", "api", "--paginate", "--slurp",
+        "repos/squne121/loop-protocol/issues?state=open&per_page=100",
+    ]]
+    assert len(candidates) == 101
+    assert candidates[-1].number == 101
+    assert status.issue_search == SOURCE_OK
+    assert status.issue_readback == SOURCE_OK

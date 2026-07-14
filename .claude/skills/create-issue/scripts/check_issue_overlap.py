@@ -120,10 +120,6 @@ SOURCE_ABSENT = "absent"
 _TITLE_DUP_THRESHOLD = 0.8       # ほぼ同一タイトル
 _TITLE_RELATED_THRESHOLD = 0.5   # 関連していると見なす下限
 
-# full-text search の saturation 既定 limit
-_DEFAULT_SEARCH_LIMIT = 30
-
-
 # ============================================================
 # Allowed Paths の正規化と overlap 判定（#387 互換 contract を志向）
 # ============================================================
@@ -862,58 +858,66 @@ def classify_child_overlap(
 # ============================================================
 
 def gh_search_candidates(
-    repo: str, query_tokens: Sequence[str], limit: int = _DEFAULT_SEARCH_LIMIT
+    repo: str, query_tokens: Sequence[str]
 ) -> Tuple[List[IssueScope], SourceStatus]:
-    """full-text search で候補 Issue を取得し body を read-back する。
+    """OPEN Issue を全ページ取得し、body を含む候補を返す。
 
-    失敗 / partial / saturation を SourceStatus に正直に反映する
-    （fail-open して [] を返さない）。network 依存のため tests からは
-    monkeypatch / offline candidates で代替する。
+    GitHub search の ``--limit`` は上限到達時に完全性を証明できず、
+    saturation を発生させる。Issue 起票時の overlap preflight は
+    ``gh api --paginate --slurp`` で REST の全ページを取得するため、
+    通常の OPEN Issue 件数が従来の既定上限を超えても source を degraded に
+    しない。REST response に body と labels が含まれるので、個別 read-back は
+    不要である。
+
+    ``query_tokens`` は呼び出し契約との互換性のため受け取る。候補の絞り込みは
+    classifier が title / goal / Allowed Paths を合わせて決定するため、ここでは
+    行わず recall を落とさない。
     """
-    # in:title の決定的 query（sorted tokens）
-    query = " ".join(query_tokens)
     try:
         proc = subprocess.run(
             [
-                "gh", "search", "issues", query,
-                "--repo", repo, "--state", "open",
-                "--limit", str(limit), "--json", "number",
+                "gh", "api", "--paginate", "--slurp",
+                f"repos/{repo}/issues?state=open&per_page=100",
             ],
             check=True, capture_output=True, text=True,
         )
-        numbers = [item["number"] for item in json.loads(proc.stdout or "[]")]
-    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, TypeError):
+        pages = json.loads(proc.stdout or "[]")
+        if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+            raise TypeError("gh api --slurp response must be a list of pages")
+        issues = [issue for page in pages for issue in page]
+    except (subprocess.CalledProcessError, json.JSONDecodeError, TypeError):
         return [], SourceStatus(SOURCE_FAILED, SOURCE_OK, SOURCE_ABSENT)
 
-    search_status = SOURCE_SATURATED if len(numbers) >= limit else SOURCE_OK
-
     candidates: List[IssueScope] = []
-    readback_status = SOURCE_OK
-    for num in numbers:
-        try:
-            view = subprocess.run(
-                [
-                    "gh", "issue", "view", str(num), "--repo", repo,
-                    "--json", "number,title,body,labels,state,url",
-                ],
-                check=True, capture_output=True, text=True,
-            )
-            data = json.loads(view.stdout)
-        except (subprocess.CalledProcessError, json.JSONDecodeError):
-            readback_status = SOURCE_PARTIAL
+    for issue in issues:
+        # REST /issues は Pull Request も返す。Issue preflight の対象外にする。
+        if not isinstance(issue, dict) or "pull_request" in issue:
             continue
+        try:
+            labels = issue.get("labels", []) or []
+            if not isinstance(labels, list):
+                raise TypeError("issue labels must be a list")
+            label_names = tuple(
+                label.get("name", "") if isinstance(label, dict) else str(label)
+                for label in labels
+            )
+            number = issue["number"]
+            title = issue["title"]
+            body = issue.get("body")
+        except (KeyError, TypeError):
+            return [], SourceStatus(SOURCE_OK, SOURCE_PARTIAL, SOURCE_ABSENT)
         candidates.append(
             IssueScope(
-                title=data.get("title", ""),
-                number=data.get("number"),
-                url=data.get("url", ""),
-                body=data.get("body"),
-                labels=tuple(lbl.get("name", "") for lbl in data.get("labels", []) or []),
-                state=data.get("state", "OPEN"),
+                title=str(title),
+                number=int(number),
+                url=str(issue.get("html_url", issue.get("url", "")) or ""),
+                body=body if isinstance(body, str) else None,
+                labels=label_names,
+                state=str(issue.get("state", "OPEN") or "OPEN"),
                 search_hit=True,
             )
         )
-    return candidates, SourceStatus(search_status, readback_status, SOURCE_ABSENT)
+    return candidates, SourceStatus.ok()
 
 
 # ============================================================
