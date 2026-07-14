@@ -72,6 +72,29 @@ jobs:
             return $status
           }
           run_timed pnpm_typecheck pnpm typecheck
+      - name: Typecheck E2E (timed)
+        # Issue #1283 PR #1517 review fix (P1): pnpm typecheck:e2e was not run
+        # in CI, so tests/e2e/**/*.ts type errors (including the type-only
+        # import from src/main.ts) could silently drift undetected. New step
+        # only — the existing "Typecheck (timed)" step above is unchanged.
+        id: timed-typecheck-e2e
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed pnpm_typecheck_e2e pnpm typecheck:e2e
       - name: Collect ci_runtime_baseline_v1 artifact
         if: ${{ !cancelled() }}
         env:
@@ -630,6 +653,85 @@ jobs:
         with:
           name: test-results
           path: test-results/
+          if-no-files-found: warn
+          retention-days: 30
+      # AC9 dedicated preview-namespace lane (Issue #1283 PR #1517 review fix,
+      # P0 Blocker 1): tests/e2e/m4-preview-namespace.spec.ts is excluded from
+      # the standard e2e lane above (playwright.config.ts testIgnore) and only
+      # runs here, against a clean, production-like build (no VITE_E2E_MODE)
+      # with VITE_LOOP_STORAGE_NAMESPACE set — the same namespace-resolution
+      # path deploy-pages.yml's deploy-pr job uses for PR preview builds.
+      # New steps only — the existing steps above/below are unchanged.
+      - name: Resolve preview storage namespace (AC9 dedicated lane)
+        id: preview-namespace
+        run: |
+          set -euo pipefail
+          namespace="pr-${{ github.event.number || github.run_id }}"
+          case "$namespace" in
+            pr-[0-9]*) ;;
+            *) echo "Invalid preview storage namespace: $namespace" >&2; exit 1 ;;
+          esac
+          echo "namespace=$namespace" >> "$GITHUB_OUTPUT"
+          echo "expected_key=loop-protocol.preview.${namespace}.mvp.save" >> "$GITHUB_OUTPUT"
+      - name: Build for AC9 preview-namespace lane (timed)
+        # Clean dist + production-like build (no VITE_E2E_MODE) — see
+        # tests/e2e/m4-preview-namespace.spec.ts file header and
+        # playwright.config.ts LOOP_E2E_PREVIEW_NAMESPACE_LANE handling.
+        id: timed-build-preview-namespace
+        env:
+          VITE_LOOP_STORAGE_NAMESPACE: ${{ steps.preview-namespace.outputs.namespace }}
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed clean_dist_preview_namespace rm -rf dist
+          run_timed pnpm_build_preview_namespace pnpm build
+      - name: Run AC9 preview-namespace E2E lane (timed)
+        # LOOP_E2E_PREVIEW_NAMESPACE_LANE=true selects the dedicated
+        # playwright.config.ts testMatch (only this spec) and forces
+        # reuseExistingServer: false. LOOP_EXPECTED_STORAGE_KEY is required
+        # by the spec — it throws (hard FAIL, not a skip) if unset or equal
+        # to the production key.
+        id: timed-e2e-preview-namespace
+        env:
+          LOOP_E2E_PREVIEW_NAMESPACE_LANE: "true"
+          LOOP_EXPECTED_STORAGE_KEY: ${{ steps.preview-namespace.outputs.expected_key }}
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed test_e2e_preview_namespace pnpm exec playwright test
+      - name: Upload AC9 preview-namespace Playwright report
+        id: upload-playwright-report-preview-namespace
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: playwright-report-preview-namespace
+          path: playwright-report-preview-namespace/
           if-no-files-found: warn
           retention-days: 30
       - name: Collect ci_runtime_baseline_v1 artifact
