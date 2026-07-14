@@ -110,7 +110,10 @@ def _producer_failure_envelope(
     status: str = "failed",
     next_action: str = "human_judgment_required",
     reason_code: str = "schema_mismatch",
-    artifact_path: str = ".claude/artifacts/issue-refinement-loop/1501/producer_failure_schema_mismatch_20260713T215634Z.json",
+    artifact_path: str = (
+        ".claude/artifacts/issue-refinement-loop/1501/"
+        "producer_failure_schema_mismatch_20260713T215634Z.json"
+    ),
     artifact_sha256: str | None = None,
 ) -> str:
     artifact_sha256 = artifact_sha256 or _fake_sha256("producer-failure-artifact")
