@@ -344,6 +344,25 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "mutation": False,
         "placeholders": {},
     },
+    # Issue 1507: fail-closed grammar validator for the issue-reviewer
+    # SubAgent stdout. Consumes the SubAgent exact final text via stdin
+    # (no re-transcription); see validate_review_compact_output.py and
+    # SKILL.md Step 2 / Step 2a.
+    "review_compact.validate": {
+        "id": "review_compact.validate",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/validate_review_compact_output.py",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "stdin_contract": "issue_review_result_compact_v1/raw_text",
+        "stdout_contract": "review_compact_validation_result/v1",
+        "timeout_seconds": 30,
+        "mutation": False,
+        "network_effect": "local_only",
+        "placeholders": {},
+    },
 }
 
 # ---------------------------------------------------------------------------

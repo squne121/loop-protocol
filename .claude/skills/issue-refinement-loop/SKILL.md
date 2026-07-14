@@ -250,20 +250,23 @@ hard stop 判定は `post_rewrite_check` / `decide_next_action` phase（`hard_st
 
 `VERDICT: needs-fix` の直後に、reviewer blocker が deterministic checker に裏付けられているかを確認する。この arbitration（`reviewer_claim_replay.py`）は `issue-reviewer` SubAgent の実行境界内（producer である `compact_review_result.py` と同一 SubAgent 実行、同一 isolation worktree）で co-locate 実行済みであり、orchestrator はその子 worktree の raw artifact パスを別途 open/read しない（Issue #1472）。これにより、unbacked reviewer blocker だけで semantic iteration を消費しない、という Step 2a の目的を isolation worktree 環境でも維持する。
 
-orchestrator は `issue-reviewer` SubAgent stdout の compact な arbitration フィールドをそのまま consume する:
+orchestrator は `issue-reviewer` SubAgent stdout の compact な arbitration フィールドをそのまま consume する前に、Issue #1507 の `validate_review_compact_output.py`（`review_compact.validate`, command_registry.py 登録済み）へ SubAgent の最終応答テキストをそのまま（re-transcribe せず）渡し、`REVIEW_COMPACT_VALIDATION_RESULT_V1.validation_status != valid` の場合は routing を `human_judgment_required` に固定する（fail-closed）。validation が `valid` の場合のみ、以下の compact な arbitration フィールドを `normalized_payload` 経由で consume する:
 
 ```text
-REPLAY_VERDICT: deterministic_fail_confirmed | reviewer_claim_unbacked_by_deterministic_checker | reviewer_false_positive_suspected | input_or_runtime_error
-REPLAY_ROUTING: proceed_to_rewrite | downgrade_to_non_blocking | human_escalation | human_judgment_required | fix_checker_artifact
+REPLAY_VERDICT: deterministic_fail_confirmed | checker_artifact_inconsistency | reviewer_claim_unbacked_by_deterministic_checker | reviewer_false_positive_suspected | input_or_runtime_error
+REPLAY_ROUTING: proceed_to_rewrite | fix_checker_artifact | downgrade_to_non_blocking | human_escalation | human_judgment_required
 REPLAY_SHOULD_CONSUME: true | false
 REPLAY_BODY_SHA256: <sha256>
 REPLAY_ARTIFACT_DIGEST: <sha256 of reviewer_claim_replay.py stdout JSON>
 ```
 
+`REPLAY_VERDICT` は `reviewer_claim_replay.py` の `_LEGACY_VERDICT_MAP_V1` と同期した正しい5値 enum である（`deterministic_fail_confirmed` / `checker_artifact_inconsistency` / `reviewer_claim_unbacked_by_deterministic_checker` / `reviewer_false_positive_suspected` / `input_or_runtime_error`）。
+
 `issue-reviewer` SubAgent 側の実行契約（`--review-result-file` / `--readiness-result-file` / `--state-file` の入力契約、reviewer code ↔ deterministic checker ↔ readiness rule id の exact mapping、fail-closed 条件）は `.claude/agents/issue-reviewer.md` を SSOT とし、本ファイルに重複記載しない。
 
 出力契約（`REPLAY_VERDICT` の consume ルーティング）:
 - `deterministic_fail_confirmed` → Step 4 rewrite に進む。`REPLAY_SHOULD_CONSUME: true`
+- `checker_artifact_inconsistency` → `REPLAY_ROUTING: fix_checker_artifact` に従い、checker artifact 側の不整合を先に修正してから Step 2 reviewer に戻す。semantic iteration は消費しない
 - `reviewer_claim_unbacked_by_deterministic_checker` → reviewer blocker を non-blocking downgrade し、semantic iteration を消費せず Step 2 reviewer に戻す
 - `reviewer_false_positive_suspected` → same `REPLAY_BODY_SHA256` + same blocker lane で 2 回連続 unbacked。`REPLAY_ROUTING: human_escalation` で停止する
 - `input_or_runtime_error` → `human_judgment_required` で停止する
