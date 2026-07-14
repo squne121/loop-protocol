@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,13 @@ import jsonschema as _jsonschema
 
 SCHEMA = "REVIEWER_CLAIM_REPLAY_V1"
 STATE_SCHEMA = "REVIEWER_CLAIM_REPLAY_STATE_V1"
+# STATE_SCHEMA_V2 (Issue #1515): emitted by analyze() for the `next_state`
+# field whenever any identity kwarg (repository_full_name / issue_number /
+# refinement_session_id) is supplied by the caller. The orchestrator-owned
+# `reviewer_claim_replay_state_store.py` is the sole persistence layer for
+# V2 state -- this module itself never writes V2 state to disk when
+# `--previous-state-inline` is used (no file I/O at all in that mode).
+STATE_SCHEMA_V2 = "REVIEWER_CLAIM_REPLAY_STATE_V2"
 TAXONOMY_SCHEMA = "REVIEWER_CHECKER_TAXONOMY_V1"
 
 VALID_FINDING_KINDS = frozenset(
@@ -478,6 +486,11 @@ def _matching_findings(kind: str, findings: list[dict[str, Any]], body_sha256: s
     return matches
 
 
+def _utc_now_iso() -> str:
+    """UTC timestamp for REVIEWER_CLAIM_REPLAY_STATE_V2.updated_at_iteration_id."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _load_state(state_file: str | None) -> dict[str, Any]:
     if not state_file:
         return {}
@@ -485,7 +498,7 @@ def _load_state(state_file: str | None) -> dict[str, Any]:
     if not path.exists():
         return {}
     data = _strict_json_loads(path.read_text(encoding="utf-8"))
-    if data.get("schema") != STATE_SCHEMA:
+    if data.get("schema") not in (STATE_SCHEMA, STATE_SCHEMA_V2):
         raise ValueError(f"unexpected state schema: {data.get('schema')!r}")
     return data
 
@@ -603,6 +616,9 @@ def analyze(
     vc_syntax_result: dict[str, Any] | None,
     vc_preflight_result: dict[str, Any] | None,
     previous_state: dict[str, Any] | None = None,
+    repository_full_name: str | None = None,
+    issue_number: int | None = None,
+    refinement_session_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     previous_state = previous_state or {}
     issue_url = str(review_result.get("issue_url") or "")
@@ -772,6 +788,25 @@ def analyze(
         and primary["normalized_kind"] == previous_state.get("normalized_kind")
         and body_sha256 == previous_state.get("body_sha256")
     )
+    # Issue #1515 AC5: when the caller supplies identity kwargs
+    # (orchestrator-owned state), same_lane additionally requires
+    # repository_full_name / issue_number / refinement_session_id to
+    # match the previous state -- AND condition on top of the
+    # pre-existing reviewer_blocker_code / normalized_kind / body_sha256
+    # triple. Callers that omit all three identity kwargs (legacy
+    # --state-file path, existing tests) are unaffected -- same_lane
+    # falls back to the original three-field check.
+    identity_kwargs_supplied = (
+        repository_full_name is not None
+        or issue_number is not None
+        or refinement_session_id is not None
+    )
+    if identity_kwargs_supplied:
+        same_lane = same_lane and (
+            repository_full_name == previous_state.get("repository_full_name")
+            and issue_number == previous_state.get("issue_number")
+            and refinement_session_id == previous_state.get("refinement_session_id")
+        )
     prior_count = int(previous_state.get("consecutive_unbacked_count", 0))
 
     if rewrite_ready_blockers:
@@ -824,15 +859,33 @@ def analyze(
 
     verdict = _legacy_verdict(verdict_detail)
 
-    next_state = {
-        "schema": STATE_SCHEMA,
-        "issue_url": issue_url,
-        "body_sha256": body_sha256,
-        "reviewer_blocker_code": primary["reviewer_blocker_code"],
-        "normalized_kind": primary["normalized_kind"],
-        "consecutive_unbacked_count": next_count,
-        "last_review_artifact": str(review_result.get("_artifact_path") or ""),
-    }
+    if identity_kwargs_supplied:
+        # REVIEWER_CLAIM_REPLAY_STATE_V2 (Issue #1515): orchestrator-owned
+        # state persisted via reviewer_claim_replay_state_store.py, keyed
+        # by identity (repository_full_name/issue_number/refinement_session_id)
+        # in addition to the legacy body/blocker-lane fields.
+        next_state = {
+            "schema": STATE_SCHEMA_V2,
+            "repository_full_name": repository_full_name,
+            "issue_number": issue_number,
+            "refinement_session_id": refinement_session_id,
+            "body_sha256": body_sha256,
+            "reviewer_blocker_code": primary["reviewer_blocker_code"],
+            "normalized_kind": primary["normalized_kind"],
+            "consecutive_unbacked_count": next_count,
+            "last_review_artifact": str(review_result.get("_artifact_path") or ""),
+            "updated_at_iteration_id": _utc_now_iso(),
+        }
+    else:
+        next_state = {
+            "schema": STATE_SCHEMA,
+            "issue_url": issue_url,
+            "body_sha256": body_sha256,
+            "reviewer_blocker_code": primary["reviewer_blocker_code"],
+            "normalized_kind": primary["normalized_kind"],
+            "consecutive_unbacked_count": next_count,
+            "last_review_artifact": str(review_result.get("_artifact_path") or ""),
+        }
     return (
         {
             "schema": SCHEMA,
@@ -1000,6 +1053,19 @@ def main() -> int:
     parser.add_argument("--vc-preflight-result-file")
     parser.add_argument("--state-file")
     parser.add_argument(
+        "--previous-state-inline",
+        help=(
+            "REVIEWER_CLAIM_REPLAY_STATE_V2 JSON (or '{}' for first-time). "
+            "Mutually exclusive with --state-file. When used, no file I/O "
+            "(_load_state/_save_state) is performed -- the orchestrator-owned "
+            "reviewer_claim_replay_state_store.py is the sole persistence layer "
+            "(Issue #1515)."
+        ),
+    )
+    parser.add_argument("--repository-full-name")
+    parser.add_argument("--issue-number", type=int)
+    parser.add_argument("--refinement-session-id")
+    parser.add_argument(
         "--dump-taxonomy",
         action="store_true",
         help="Print REVIEWER_CHECKER_TAXONOMY_V1 as JSON and exit (no other args required)",
@@ -1009,6 +1075,21 @@ def main() -> int:
     if args.dump_taxonomy:
         print(_strict_json_dumps(dump_taxonomy()), flush=True)
         return 0
+
+    if args.previous_state_inline is not None and args.state_file:
+        print(
+            _strict_json_dumps(
+                {
+                    "schema": SCHEMA,
+                    "verdict": _legacy_verdict("input_or_runtime_error"),
+                    "verdict_detail_v1": "input_or_runtime_error",
+                    "routing": "human_judgment_required",
+                    "error": "--previous-state-inline and --state-file are mutually exclusive",
+                }
+            ),
+            flush=True,
+        )
+        return 1
 
     if not args.review_result_file or not args.readiness_result_file:
         print(
@@ -1040,15 +1121,30 @@ def main() -> int:
             if args.vc_preflight_result_file
             else None
         )
-        previous_state = _load_state(args.state_file)
+        if args.previous_state_inline is not None:
+            # AC6: --previous-state-inline never touches the filesystem for
+            # state -- no _load_state/_save_state call in this branch.
+            raw_inline = args.previous_state_inline.strip()
+            previous_state = _strict_json_loads(raw_inline) if raw_inline else {}
+            if not isinstance(previous_state, dict):
+                raise ValueError("--previous-state-inline must decode to a JSON object")
+            used_inline = True
+        else:
+            previous_state = _load_state(args.state_file)
+            used_inline = False
         result, next_state = analyze(
             review_result=review_result,
             readiness_result=readiness_result,
             vc_syntax_result=vc_syntax_result,
             vc_preflight_result=vc_preflight_result,
             previous_state=previous_state,
+            repository_full_name=args.repository_full_name,
+            issue_number=args.issue_number,
+            refinement_session_id=args.refinement_session_id,
         )
-        _save_state(args.state_file, next_state)
+        if not used_inline:
+            _save_state(args.state_file, next_state)
+        result["next_state"] = next_state
     except ValueError as exc:
         print(
             _strict_json_dumps(

@@ -162,23 +162,112 @@ def fetch_head_sha(pr_number: int, repo: str) -> tuple[Optional[str], Optional[d
     return head, None
 
 
+STATUS_CHECK_ROLLUP_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      commits(last: 1) {
+        nodes {
+          commit {
+            oid
+            statusCheckRollup {
+              contexts(first: 100) {
+                pageInfo { hasNextPage }
+                nodes {
+                  __typename
+                  ... on CheckRun {
+                    databaseId
+                    name
+                    status
+                    conclusion
+                    startedAt
+                    completedAt
+                    detailsUrl
+                    checkSuite {
+                      commit { oid }
+                      workflowRun { event workflow { name } }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def _conclusion_bucket(conclusion: Optional[str], status: Optional[str]) -> Optional[str]:
+    """GraphQL CheckRun conclusion/status を既存の内部 bucket に正規化する。"""
+    normalized_conclusion = (conclusion or "").lower()
+    normalized_status = (status or "").lower()
+    if normalized_status != "completed":
+        return "pending"
+    if normalized_conclusion == "success":
+        return "pass"
+    if normalized_conclusion == "cancelled":
+        return "cancel"
+    if normalized_conclusion == "skipped":
+        return "skipping"
+    if normalized_conclusion:
+        return "fail"
+    return None
+
+
 def fetch_checks(pr_number: int, repo: str) -> tuple[Optional[list], Optional[dict]]:
-    """gh pr checks を取得する。失敗時は (None, error_entry)。"""
+    """GraphQL statusCheckRollup から未集約の CheckRun provenance を一括取得する。"""
+    try:
+        owner, name = repo.split("/", 1)
+    except ValueError:
+        return None, {"kind": "json_parse_error", "detail": f"invalid repo: {repo}"}
+
     ok, data, raw = run_gh([
-        "pr", "checks", str(pr_number),
-        "--repo", repo,
-        "--json", "bucket,name,state,workflow,link,event,startedAt,completedAt",
+        "api", "graphql",
+        "-f", f"query={STATUS_CHECK_ROLLUP_QUERY}",
+        "-F", f"owner={owner}",
+        "-F", f"name={name}",
+        "-F", f"number={pr_number}",
     ])
-    if not ok:
-        # B6: 共通エラー分類を使用
-        kind = classify_gh_error(raw)
-        return None, {"kind": kind, "detail": raw[:512]}
-    if data is None:
-        # gh pr checks は JSON array ではなく table 形式を返す場合がある
-        return None, {"kind": "json_parse_error", "detail": f"gh pr checks output: {raw[:256]}"}
-    if not isinstance(data, list):
-        return None, {"kind": "json_parse_error", "detail": f"expected list, got {type(data).__name__}"}
-    return data, None
+    if not ok or data is None:
+        return None, {"kind": classify_gh_error(raw), "detail": raw[:512]}
+
+    try:
+        commits = data["data"]["repository"]["pullRequest"]["commits"]["nodes"]
+        commit = commits[-1]["commit"]
+        contexts = commit["statusCheckRollup"]["contexts"]
+        if contexts["pageInfo"]["hasNextPage"]:
+            raise ValueError("statusCheckRollup exceeds 100 contexts")
+        raw_runs = contexts["nodes"]
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        return None, {"kind": "json_parse_error", "detail": f"statusCheckRollup shape: {exc}"}
+
+    checks: list[dict] = []
+    for run in raw_runs:
+        if run.get("__typename") != "CheckRun":
+            continue
+        suite = run.get("checkSuite") or {}
+        workflow_run = suite.get("workflowRun") or {}
+        workflow = workflow_run.get("workflow") or {}
+        checks.append({
+            "name": run.get("name") or "unknown",
+            "bucket": _conclusion_bucket(run.get("conclusion"), run.get("status")),
+            "state": run.get("conclusion") or run.get("status"),
+            "workflow": workflow.get("name"),
+            "link": run.get("detailsUrl"),
+            "event": workflow_run.get("event"),
+            "startedAt": run.get("startedAt"),
+            "completedAt": run.get("completedAt"),
+            "runId": run.get("databaseId"),
+            "headSha": (suite.get("commit") or {}).get("oid"),
+            "run_detail_complete": all(
+                run.get(field) is not None
+                for field in ("databaseId", "status", "conclusion", "startedAt", "completedAt")
+            ) and bool((suite.get("commit") or {}).get("oid")),
+        })
+    return checks, None
 
 
 def fetch_run_details(run_id: int, repo: str) -> tuple[Optional[dict], Optional[dict]]:
@@ -236,8 +325,8 @@ def classify_check(check: dict, pr_head_sha: str) -> dict:
     started_at = check.get("startedAt") or None
     completed_at = check.get("completedAt") or None
 
-    # run_id は link から抽出
-    run_id = extract_run_id_from_link(link) if link else None
+    # GraphQL CheckRun databaseId を優先し、旧形式 fixture では link から補う。
+    run_id = check.get("runId") or (extract_run_id_from_link(link) if link else None)
 
     # bucket → conclusion / status mapping
     # gh pr checks の bucket: pass / fail / pending / skipping / cancel / null
@@ -264,6 +353,9 @@ def classify_check(check: dict, pr_head_sha: str) -> dict:
     entry: dict[str, Any] = {
         "name": name,
         "workflow": workflow,
+        # event は cross-event shadow と同一 event の再実行を識別する内部 provenance。
+        # CI_VERDICT_SUMMARY_V1 の公開 checks schema には出力しない。
+        "event": check.get("event") or None,
         "state": state,
         "bucket": bucket,
         "status": status,
@@ -274,8 +366,16 @@ def classify_check(check: dict, pr_head_sha: str) -> dict:
         "details_url": link,
         "started_at": started_at,
         "completed_at": completed_at,
+        "run_detail_complete": bool(check.get("run_detail_complete")),
     }
+    if check.get("headSha"):
+        entry["_run_head_sha"] = check["headSha"]
     return entry
+
+
+def _entry_run_head_sha(entry: dict) -> Optional[str]:
+    """Return the run-detail SHA without replacing producer provenance."""
+    return entry.get("_run_head_sha") or entry.get("head_sha")
 
 
 def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
@@ -284,8 +384,8 @@ def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
     returns: "all_pass" | "failed" | "pending_or_queued" | "stale_head_sha" | "excluded"
     """
     # stale: head SHA mismatch
-    head_sha = entry.get("head_sha")
-    if head_sha and head_sha != pr_head_sha:
+    run_head_sha = _entry_run_head_sha(entry)
+    if run_head_sha and run_head_sha != pr_head_sha:
         return "stale_head_sha"
 
     bucket = entry.get("bucket")
@@ -296,9 +396,14 @@ def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
 
     # Allowlist exclusion: head_sha=None + conclusion=skipped + (workflow, name) in rules
     # These are conditional/retrospective checks that do not run on PR commits.
-    if head_sha is None and conclusion == "skipped":
+    if entry.get("head_sha") is None and conclusion == "skipped":
         if (workflow, name) in HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES:
             return "excluded"
+
+    # Direct CheckRun provenance が不完全なら、成功として通過させない。
+    # canonicalization でも残し、CI 完了待ちとして fail-closed に扱う。
+    if entry.get("run_id") is not None and not entry.get("run_detail_complete"):
+        return "pending_or_queued"
 
     # pending
     if bucket == "pending" or status in PENDING_STATUSES:
@@ -320,6 +425,97 @@ def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
 
     # null / unknown → treat as pending
     return "pending_or_queued"
+
+
+REVIEW_SHADOW_TUPLE = ("Check Japanese Content", "PR Body Japanese Check")
+REVIEW_SHADOW_EVENTS = frozenset({"pull_request_review", "pull_request_review_comment"})
+
+
+def _completed_timestamp(entry: dict) -> Optional[datetime]:
+    """completed_at、次に started_at を UTC timestamp として正規化する。"""
+    for field in ("completed_at", "started_at"):
+        raw = entry.get(field)
+        if not isinstance(raw, str) or not raw:
+            continue
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def canonicalize_true_reruns(entries: list[dict]) -> list[dict]:
+    """同一 (workflow, name, event, head SHA) の完了済み再実行だけを集約する。
+
+    event 不明、timestamp 不明/同値、または未完了 run が混在する場合は判断を
+    恣意化しないため、既存の fail-closed 分類を維持する。
+    """
+    groups: dict[tuple[str, str, str, str], list[dict]] = {}
+    for entry in entries:
+        workflow, name, event = entry.get("workflow"), entry.get("name"), entry.get("event")
+        run_head_sha = _entry_run_head_sha(entry)
+        if not all(isinstance(value, str) and value for value in (workflow, name, event, run_head_sha)):
+            continue
+        if not entry.get("run_detail_complete"):
+            continue
+        groups.setdefault((workflow, name, event, run_head_sha), []).append(entry)
+
+    superseded_ids: set[int] = set()
+    for group in groups.values():
+        if len(group) < 2 or any(entry.get("status") != "completed" for entry in group):
+            continue
+        dated = [(entry, _completed_timestamp(entry)) for entry in group]
+        if any(timestamp is None for _, timestamp in dated):
+            continue
+        timestamps = [timestamp for _, timestamp in dated]
+        if len(set(timestamps)) != len(timestamps):
+            continue
+        latest = max(dated, key=lambda item: item[1])[0]
+        superseded_ids.update(id(entry) for entry in group if entry is not latest)
+
+    return [entry for entry in entries if id(entry) not in superseded_ids]
+
+
+def is_review_skipped_shadow(entry: dict, entries: list[dict], pr_head_sha: str) -> bool:
+    """限定 review-event skipped shadow を current-head success peer により除外する。"""
+    if (entry.get("workflow"), entry.get("name")) != REVIEW_SHADOW_TUPLE:
+        return False
+    if entry.get("event") not in REVIEW_SHADOW_EVENTS:
+        return False
+    if entry.get("state") != "SKIPPED" or not entry.get("run_detail_complete"):
+        return False
+
+    return any(
+        (peer.get("workflow"), peer.get("name")) == REVIEW_SHADOW_TUPLE
+        and peer.get("event") == "pull_request"
+        and peer.get("conclusion") == "success"
+        and _entry_run_head_sha(peer) == pr_head_sha
+        and peer.get("run_detail_complete")
+        for peer in entries
+    )
+
+
+def precompute_verdicts(entries: list[dict], pr_head_sha: str) -> list[tuple[dict, str]]:
+    """detail 補完後の two-pass 集約。overall と各 bucket はこの結果だけを消費する。"""
+    canonical_entries = canonicalize_true_reruns(entries)
+    return [
+        (
+            entry,
+            "excluded"
+            if is_review_skipped_shadow(entry, canonical_entries, pr_head_sha)
+            else determine_check_verdict(entry, pr_head_sha),
+        )
+        for entry in canonical_entries
+    ]
+
+
+def public_check_entry(entry: dict) -> dict:
+    """V1 公開 schema へ内部 provenance を露出しない。"""
+    return {
+        key: value
+        for key, value in entry.items()
+        if key not in {"event", "run_detail_complete", "_run_head_sha"}
+    }
 
 
 def compute_overall_status(verdicts: list[str]) -> str:
@@ -457,7 +653,7 @@ def main() -> int:
     if head_sha and head_sha != expected_head_sha:
         stale_from_head = True
 
-    # Step 2: gh pr checks
+    # Step 2: GraphQL statusCheckRollup（gh pr checks の CLI 集約を使わない）
     raw_checks, checks_err = [], None
     if head_sha is not None:
         raw_checks, checks_err = fetch_checks(pr_number, repo)
@@ -478,68 +674,51 @@ def main() -> int:
     if errors:
         verdicts.append("gh_error")
 
-    # B1: --check-name フィルタ: 0件 → gh_error、複数件 → gh_error
+    # B1: 0件は gh_error。複数件は event-aware canonicalization 後に判定する。
     if check_name_filter and raw_checks is not None:
         matched = [raw for raw in raw_checks if (raw.get("name") or "unknown") == check_name_filter]
         if len(matched) == 0:
             errors.append({"kind": "check_not_found", "detail": f"check-name not found: {check_name_filter}"})
-            verdicts.append("gh_error")
-            raw_checks = []
-        elif len(matched) > 1:
-            errors.append({(
-                "kind"
-            ): "ambiguous_check_name", "detail": f"check-name matched multiple checks: {check_name_filter}"})
-            verdicts.append("gh_error")
             raw_checks = []
         else:
             raw_checks = matched
 
     for raw in (raw_checks or []):
         entry = classify_check(raw, head_sha or expected_head_sha)
-
-        # 失敗・pending の場合、または expected_head_sha 指定時の pass check は run details を補完
-        bucket = entry.get("bucket")
-        # B2: pass check で expected_head_sha が指定されている場合も補完して head SHA 確認
-        needs_details = (
-            bucket in ("fail", "pending", None)
-            or (bucket == "pass" and expected_head_sha is not None)
-        )
-        if needs_details and entry["run_id"] is not None:
-            run_data, run_err = fetch_run_details(entry["run_id"], repo)
-            if run_err:
-                errors.append(run_err)
-                verdicts.append("gh_error")
-                # B2: pass check で補完失敗 → all_pass の根拠にしない → pending_or_queued 扱い
-                if bucket == "pass":
-                    entry["bucket"] = None
-                    entry["conclusion"] = None
-                    entry["status"] = "unknown"
-            else:
-                # Update head_sha from run
-                run_head = run_data.get("headSha")
-                if run_head:
-                    entry["head_sha"] = run_head
-                # Update conclusion if available
-                run_conclusion = run_data.get("conclusion")
-                if run_conclusion and entry["conclusion"] is None:
-                    entry["conclusion"] = run_conclusion
-                    mapped_bucket = CONCLUSION_BUCKET.get(run_conclusion)
-                    if mapped_bucket:
-                        entry["bucket"] = mapped_bucket
-                run_status = run_data.get("status")
-                if run_status and entry["status"] is None:
-                    entry["status"] = run_status
-                # B3: Extract job_id — 失敗 job を特定する（jobs[0] を盲目的に使わない）
-                jobs = run_data.get("jobs") or []
-                if jobs:
-                    entry["job_id"] = find_failed_job_id(jobs, entry["name"])
-
-        verdict = determine_check_verdict(entry, head_sha or expected_head_sha)
-        verdicts.append(verdict)
+        # GraphQL の CheckRun は check-run ID と status/conclusion/head SHA を同時取得する。
+        # head SHA 欠落・未完の detail は rerun 集約対象から外れ、後段で fail-closed に残る。
+        if entry.get("run_id") is not None:
+            entry["job_id"] = entry["run_id"]
 
         check_entries.append(entry)
 
+    # review shadow の success peer は、現在の実 head だけでなく caller が固定した
+    # expected head と一致して初めて有効とする。head drift 中に shadow を除外しない。
+    verdict_pairs = precompute_verdicts(check_entries, expected_head_sha)
+    check_entries = [entry for entry, _ in verdict_pairs]
+    verdict_by_entry_id = {id(entry): verdict for entry, verdict in verdict_pairs}
+
+    # cross-event の canonical success + 限定 shadow は正当な二重行として許可する。
+    if check_name_filter and len(check_entries) > 1:
+        allowed_shadow_pair = (
+            len(check_entries) == 2
+            and any(verdict == "excluded" for _, verdict in verdict_pairs)
+            and any(
+                entry.get("event") == "pull_request"
+                and entry.get("conclusion") == "success"
+                and _entry_run_head_sha(entry) == expected_head_sha
+                for entry in check_entries
+            )
+        )
+        if not allowed_shadow_pair:
+            errors.append({
+                "kind": "ambiguous_check_name",
+                "detail": f"check-name matched multiple canonical checks: {check_name_filter}",
+            })
+
         # log artifact: failed check のみ、--include-log-excerpt 指定時
+    for entry in check_entries:
+        verdict = verdict_by_entry_id[id(entry)]
         if include_log_excerpt and verdict == "failed" and entry.get("job_id"):
             log_text, log_err = fetch_job_log(entry["job_id"], repo)
             if log_err:
@@ -561,6 +740,10 @@ def main() -> int:
                 )
                 log_artifacts.append(artifact_entry)
 
+    if errors:
+        verdicts.append("gh_error")
+    verdicts.extend(verdict for _, verdict in verdict_pairs)
+
     # Overall status
     if not verdicts:
         # No checks found (check_name_filter が一致しない場合は B1 で gh_error 処理済み)
@@ -570,14 +753,10 @@ def main() -> int:
         overall_status = compute_overall_status(verdicts)
 
     # Build categorized lists
-    effective_sha = head_sha or expected_head_sha
-    failed_checks = [e["name"] for e in check_entries if determine_check_verdict(e, effective_sha) == "failed"]
-    pending_checks = [e["name"] for e in check_entries if determine_check_verdict(
-        e,
-        effective_sha
-    ) == "pending_or_queued"]
-    stale_checks = [e["name"] for e in check_entries if determine_check_verdict(e, effective_sha) == "stale_head_sha"]
-    excluded_checks = [e["name"] for e in check_entries if determine_check_verdict(e, effective_sha) == "excluded"]
+    failed_checks = [e["name"] for e in check_entries if verdict_by_entry_id[id(e)] == "failed"]
+    pending_checks = [e["name"] for e in check_entries if verdict_by_entry_id[id(e)] == "pending_or_queued"]
+    stale_checks = [e["name"] for e in check_entries if verdict_by_entry_id[id(e)] == "stale_head_sha"]
+    excluded_checks = [e["name"] for e in check_entries if verdict_by_entry_id[id(e)] == "excluded"]
 
     summary: dict[str, Any] = {
         "schema": "CI_VERDICT_SUMMARY_V1",
@@ -587,7 +766,7 @@ def main() -> int:
         "expected_head_sha": expected_head_sha,
         "head_sha": head_sha or "",
         "status": overall_status,
-        "checks": check_entries,
+        "checks": [public_check_entry(entry) for entry in check_entries],
         "failed_checks": failed_checks,
         "pending_checks": pending_checks,
         "stale_checks": stale_checks,

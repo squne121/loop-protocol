@@ -7,11 +7,9 @@ in baseline_vc_preflight.py.
 import argparse
 import json
 import os
-import subprocess
 import sys
 import threading
 import time
-import types
 from pathlib import Path
 
 import pytest
@@ -511,44 +509,15 @@ def test_p1_2_real_subprocess_timeout_does_not_corrupt_sibling_result(tmp_path, 
 # github_metadata_assert call that appeared earlier in the Issue body).
 # ---------------------------------------------------------------------------
 
-# Immediate parent of the commit that introduced VC dedup/bounded-parallel
-# execution (Issue #1338); this IS the pre-#1338 baseline implementation.
-_PRE_1338_BASELINE_REV = "e375b3a1^"
-
-
-def _load_legacy_baseline_module():
-    """Load the pre-#1338 baseline_vc_preflight.py as a standalone module,
-    with `__file__` pointed at the REAL script path so its own
-    `Path(__file__).resolve().parents[4]` (repo-root resolution) and
-    `sys.path` insertion for `vc_contract_syntax` still work correctly."""
-    rel_path = ".claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py"
-    result = subprocess.run(
-        ["git", "show", f"{_PRE_1338_BASELINE_REV}:{rel_path}"],
-        cwd=str(_REPO_ROOT),
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    module = types.ModuleType("baseline_vc_preflight_legacy_pre_1338")
-    module.__file__ = str(_REPO_ROOT / rel_path)
-    exec(compile(result.stdout, module.__file__, "exec"), module.__dict__)
-    return module
-
-
 def _semantic_results(results):
-    """Additive/volatile-field-stripped projection for legacy-vs-new
-    comparison: (ac, exit_code, classification, category, decision,
-    scope_class). duration_ms/generated_at and #1338-only fields
-    (execution_key_hash/runner/dedup/...) are intentionally excluded."""
+    """Serial contract projection without volatile/additive fields."""
     return [
         (r["ac"], r["exit_code"], r["classification"], r["category"], r["decision"], r["scope_class"])
         for r in results
     ]
 
 
-def test_p1_1_max_workers_one_semantically_equivalent_to_legacy_baseline(tmp_path, monkeypatch, capsys):
-    legacy = _load_legacy_baseline_module()
-
+def test_p1_1_max_workers_one_preserves_documented_serial_contract(tmp_path, monkeypatch, capsys):
     body = f"""## Verification Commands
 
 ```bash
@@ -565,14 +534,13 @@ $ rg -q nonexistent_pattern_1338_legacy_a {_TARGET_A}
 """
     body_file = _write_body(tmp_path, body)
 
-    monkeypatch.setattr(
-        sys, "argv",
-        ["baseline_vc_preflight.py", "--body-file", str(body_file), "--issue", "999", "--cwd", str(_REPO_ROOT)],
+    _, default_data = _run_main(
+        monkeypatch, capsys,
+        [
+            "--body-file", str(body_file), "--issue", "999", "--cwd", str(_REPO_ROOT),
+        ],
     )
-    legacy.main()
-    legacy_data = json.loads(capsys.readouterr().out)
-
-    _, new_data = _run_main(
+    _, explicit_data = _run_main(
         monkeypatch, capsys,
         [
             "--body-file", str(body_file), "--issue", "999", "--cwd", str(_REPO_ROOT),
@@ -580,8 +548,15 @@ $ rg -q nonexistent_pattern_1338_legacy_a {_TARGET_A}
         ],
     )
 
-    assert legacy_data["status"] == new_data["status"]
-    assert _semantic_results(legacy_data["results"]) == _semantic_results(new_data["results"])
+    expected = [
+        ("AC1", 1, "expected_fail", "expected_baseline_fail", "go", "baseline_fail_expected"),
+        ("AC2", 1, "expected_fail", "expected_baseline_fail", "go", "baseline_fail_expected"),
+        ("AC3", 0, "unexpected_pass", "unexpected_pass", "blocked", "baseline_fail_expected"),
+        ("AC4", 1, "human_judgment", "baseline_regression_failed", "human_judgment", "baseline_fail_expected"),
+    ]
+    assert default_data["status"] == explicit_data["status"] == "blocked"
+    assert _semantic_results(default_data["results"]) == expected
+    assert _semantic_results(explicit_data["results"]) == expected
 
 
 def test_p1_1_execution_order_matches_issue_body_order_across_immediate_and_deferred_paths(

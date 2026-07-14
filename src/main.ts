@@ -1013,8 +1013,31 @@ function stepSimulation(fixedDeltaMs: number): void {
   runSortieSimulationStep(state, commands, fixedDeltaMs)
 }
 
+/**
+ * E2E pre-bootstrap fixture (Issue #1283, read-only navigation-time config —
+ * not a live mutation API). When `window.__LOOP_E2E_BOOTSTRAP__.autoStart` is
+ * explicitly `false`, `maybeAutoStartRuntime()` becomes a no-op and the app
+ * remains at `title_menu`, letting an E2E scenario drive the normal
+ * player-facing Load Game / New Game / Launch sortie navigation instead of
+ * the legacy auto-start shortcut. This flag must be set via
+ * `page.addInitScript()` before navigation — it is read exactly once here,
+ * at module init, and is never re-read or mutated afterward.
+ */
+function isE2EAutoStartDisabled(): boolean {
+  const bootstrap = (
+    window as Window & { __LOOP_E2E_BOOTSTRAP__?: { autoStart?: boolean } }
+  ).__LOOP_E2E_BOOTSTRAP__
+  return bootstrap?.autoStart === false
+}
+
 function maybeAutoStartRuntime(): void {
   if (import.meta.env.VITE_E2E_MODE !== 'true') {
+    return
+  }
+
+  if (isE2EAutoStartDisabled()) {
+    // Issue #1283: bootstrap fixture requests no auto-start — stay at
+    // title_menu so the scenario can drive Load Game / New Game explicitly.
     return
   }
 
@@ -1067,11 +1090,22 @@ function reportStorageFailure(
 // E2E observability hook (AC12)
 // - ONLY active when VITE_E2E_MODE === 'true' (tree-shaken in production builds)
 // - Read-only: returns a shallow snapshot (spread copy), never exposes live state
+//   or a mutation method (Issue #1283, AC10 / Design Constraints: this hook is
+//   observation-only — `startSortie()` and any other state-mutating method
+//   MUST NOT be exposed here; navigation-time bootstrap control lives in
+//   `window.__LOOP_E2E_BOOTSTRAP__` / `isE2EAutoStartDisabled()` instead, and
+//   player-facing actions are driven through DOM buttons / canvas pointer
+//   input, never through this hook).
 // - Production build MUST NOT contain '__LOOP_E2E__'
 // ---------------------------------------------------------------------------
 
-/** Minimal snapshot type exposed to E2E tests. */
-interface LoopE2ESnapshot {
+/**
+ * Minimal snapshot type exposed to E2E tests. Exported so E2E spec files can
+ * type-only import it directly (Issue #1283 PR #1517 review fix) instead of
+ * maintaining a duplicated local copy that can silently drift from the real
+ * `__LOOP_E2E__.getState()` return shape.
+ */
+export interface LoopE2ESnapshot {
   tick: number
   elapsedMs: number
   loopPhase: 'title_menu' | 'load_menu' | 'preparation' | 'running' | 'result' | 'debrief_pending_reward' | 'debrief_reward_claimed'
@@ -1083,11 +1117,18 @@ interface LoopE2ESnapshot {
     hp: number
     maxHp: number
   }
+  /** Read-only progression snapshot (Issue #1283, AC1, AC3, AC5). */
+  progress: {
+    resources: number
+    weaponPower: number
+  }
   projectiles: Array<{
     id: number
     x: number
     y: number
     ageMs: number
+    /** Damage snapshot taken from state.progress.weaponPower at fire time (Issue #1283, AC6). */
+    damage: number
   }>
   input: {
     primaryPressed: boolean
@@ -1127,12 +1168,9 @@ if (import.meta.env.VITE_E2E_MODE === 'true') {
   ;(
     window as Window &
       typeof globalThis & {
-        __LOOP_E2E__: { getState: () => LoopE2ESnapshot; startSortie: () => void }
+        __LOOP_E2E__: { getState: () => LoopE2ESnapshot }
       }
   ).__LOOP_E2E__ = {
-    startSortie() {
-      startSortie(state, defaultSimulationConfig.fixedDeltaMs)
-    },
     /** Returns a shallow snapshot copy of the current game + input state. Read-only. */
     getState(): LoopE2ESnapshot {
       return {
@@ -1147,11 +1185,16 @@ if (import.meta.env.VITE_E2E_MODE === 'true') {
           hp: state.player.hp,
           maxHp: state.player.maxHp,
         },
+        progress: {
+          resources: state.progress.resources,
+          weaponPower: state.progress.weaponPower,
+        },
         projectiles: state.projectiles.map((p) => ({
           id: p.id,
           x: p.x,
           y: p.y,
           ageMs: p.ageMs,
+          damage: p.damage,
         })),
         input: {
           primaryPressed: inputState.primaryPressed,

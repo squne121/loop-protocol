@@ -659,6 +659,13 @@ def _load_verified_overlap_readback_waiver(
     if not isinstance(waiver, dict):
         return None, "live contract に overlap_readback_waiver がありません"
 
+    # 決定（Issue #1518）: expires_on は延長しない。この waiver は
+    # OVERLAP_READBACK_WAIVER_LINKED_ISSUE（Issue #1477、既に CLOSED）専用
+    # binding であり、#1477 が再度 linked_issue になることはないため、期限切れ
+    # 後もこの分岐に実際に到達することはない（上の repo/linked_issue 一致
+    # チェックが先に落ちる）。#519 / #520 / #1429 は本 Issue 時点でまだ OPEN
+    # だが、waiver 対象範囲・トリガー条件の変更は本 Issue の Stop Condition
+    # に該当するため、汎用化・再設計は行わない（別 Issue #1509 の scope）。
     expected_waiver = {
         "issue_numbers": [519, 520, 1429],
         "reason": OVERLAP_READBACK_WAIVER_REASON,
