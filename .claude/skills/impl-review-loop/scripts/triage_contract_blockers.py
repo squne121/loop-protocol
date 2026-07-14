@@ -21,6 +21,8 @@ _CANONICAL_PNPM_GATES: list[list[str]] = [
     ["pnpm", "lint"],
     ["pnpm", "test"],
     ["pnpm", "build"],
+    ["pnpm", "typecheck:e2e"],
+    ["pnpm", "lint:docs"],
 ]
 VALID_INPUT_SCHEMAS = {
     "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1",

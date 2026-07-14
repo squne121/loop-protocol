@@ -1519,6 +1519,8 @@ _ALLOWED_PNPM_SUBCOMMANDS: frozenset = frozenset([
     ("pnpm", "lint"),
     ("pnpm", "test"),
     ("pnpm", "build"),
+    ("pnpm", "typecheck:e2e"),
+    ("pnpm", "lint:docs"),
 ])
 
 _FIXED_ENV_DELTA_BY_COMMAND: Dict[Tuple[str, str], Dict[str, str]] = {
@@ -1526,6 +1528,8 @@ _FIXED_ENV_DELTA_BY_COMMAND: Dict[Tuple[str, str], Dict[str, str]] = {
     ("pnpm", "lint"): {"CI": "true"},
     ("pnpm", "test"): {"CI": "true"},
     ("pnpm", "build"): {"CI": "true"},
+    ("pnpm", "typecheck:e2e"): {"CI": "true"},
+    ("pnpm", "lint:docs"): {"CI": "true"},
 }
 
 _PNPM_NO_TTY_ERROR_PATTERNS: tuple[str, ...] = (
