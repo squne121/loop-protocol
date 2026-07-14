@@ -1448,6 +1448,116 @@ def test_oversize_review_result_file_keeps_stdout_within_output_budget(tmp_path:
     assert len(proc.stdout.encode("utf-8")) <= 2048
 
 
+# ---------------------------------------------------------------------------
+# Issue #1515 In Scope item 2: --previous-state-inline / identity args
+# (AC6: no _load_state/_save_state file I/O occurs when
+# --previous-state-inline is used).
+# ---------------------------------------------------------------------------
+
+
+def test_previous_state_inline_skips_file_io(monkeypatch, tmp_path: Path, capsys):
+    """GIVEN --previous-state-inline is used WHEN the CLI runs THEN
+    _load_state / _save_state are never invoked (no file I/O for state)."""
+    import reviewer_claim_replay as rcr
+
+    review_path = tmp_path / "review.json"
+    readiness_path = tmp_path / "readiness.json"
+    review_path.write_text(json.dumps(COMPACT_C4), encoding="utf-8")
+    readiness_path.write_text(json.dumps(READINESS_CLEAN), encoding="utf-8")
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("file I/O must not occur when --previous-state-inline is used")
+
+    monkeypatch.setattr(rcr, "_load_state", _boom)
+    monkeypatch.setattr(rcr, "_save_state", _boom)
+
+    argv = [
+        "reviewer_claim_replay.py",
+        "--review-result-file",
+        str(review_path),
+        "--readiness-result-file",
+        str(readiness_path),
+        "--previous-state-inline",
+        "{}",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    exit_code = rcr.main()
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert "next_state" in payload
+    assert payload["next_state"]["schema"] == "REVIEWER_CLAIM_REPLAY_STATE_V1"
+
+
+def test_previous_state_inline_reuses_prior_count_without_a_state_file(tmp_path: Path):
+    review_path = tmp_path / "review.json"
+    readiness_path = tmp_path / "readiness.json"
+    review_path.write_text(json.dumps(COMPACT_C4), encoding="utf-8")
+    readiness_path.write_text(json.dumps(READINESS_CLEAN), encoding="utf-8")
+
+    previous_inline = json.dumps(
+        {
+            "schema": "REVIEWER_CLAIM_REPLAY_STATE_V1",
+            "issue_url": COMPACT_C4["issue_url"],
+            "body_sha256": "sha256:body-a",
+            "reviewer_blocker_code": "C4",
+            "normalized_kind": "vc_command_format",
+            "consecutive_unbacked_count": 1,
+            "last_review_artifact": "/tmp/prior.json",
+        }
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--review-result-file",
+            str(review_path),
+            "--readiness-result-file",
+            str(readiness_path),
+            "--previous-state-inline",
+            previous_inline,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 0
+    payload = json.loads(proc.stdout)
+    assert payload["verdict"] == "reviewer_false_positive_suspected"
+    assert payload["next_state"]["consecutive_unbacked_count"] == 2
+    assert not (tmp_path / "reviewer_claim_replay_state.json").exists()
+
+
+def test_previous_state_inline_and_state_file_are_mutually_exclusive(tmp_path: Path):
+    review_path = tmp_path / "review.json"
+    readiness_path = tmp_path / "readiness.json"
+    state_path = tmp_path / "state.json"
+    review_path.write_text(json.dumps(COMPACT_C4), encoding="utf-8")
+    readiness_path.write_text(json.dumps(READINESS_CLEAN), encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--review-result-file",
+            str(review_path),
+            "--readiness-result-file",
+            str(readiness_path),
+            "--previous-state-inline",
+            "{}",
+            "--state-file",
+            str(state_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 1
+    payload = json.loads(proc.stdout)
+    assert payload["verdict"] == "input_or_runtime_error"
+    assert not state_path.exists()
+
+
 def test_stale_artifact_replayed_against_fresh_state_is_detected(tmp_path: Path):
     """GIVEN a stale (previously-consumed) review/readiness artifact pair is
     replayed a second time against its own prior state file WHEN the CLI is
