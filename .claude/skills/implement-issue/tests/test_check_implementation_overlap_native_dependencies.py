@@ -593,3 +593,43 @@ def test_given_online_run_when_no_readback_candidate_then_native_dependencies_fe
     assert payload["route"] == "proceed", payload
     assert fetch_calls == [9451]
     assert "native_dependency_candidates_fetched" not in payload["dependency_resolution"]
+
+
+def test_given_online_run_when_current_only_blocks_open_dependent_then_route_does_not_wait(
+    monkeypatch, capsys
+) -> None:
+    """`blocking` は current が止めている後続 Issue であり、current の
+    predecessor ではない。online 経路でも C2b / human review に混入させない。
+    """
+    current_raw = json.loads((_FIXTURES_DIR / "current_1451_analog.json").read_text(encoding="utf-8"))
+
+    def fake_fetch_current_issue(repo, issue_number):
+        assert repo == REPO
+        assert issue_number == 9451
+        return dict(current_raw)
+
+    def fake_fetch_implementation_candidates(repo, limit):
+        return [], False
+
+    def fake_fetch_all_native_dependencies(repo, issue_number):
+        assert repo == REPO
+        assert issue_number == 9451
+        return {
+            "blockedBy": (),
+            "blocking": ({"repository": REPO, "number": 9600, "state": "OPEN"},),
+        }
+
+    monkeypatch.setattr(module, "fetch_current_issue", fake_fetch_current_issue)
+    monkeypatch.setattr(module, "fetch_implementation_candidates", fake_fetch_implementation_candidates)
+    monkeypatch.setattr(module, "fetch_all_native_dependencies", fake_fetch_all_native_dependencies)
+
+    exit_code = module.run(["--issue-number", "9451", "--repo", REPO])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0, payload
+    assert payload["route"] == "proceed", payload
+    assert payload["dependency_resolution"]["blocked_by_refs"] == []
+    assert payload["dependency_resolution"]["blocking_predecessor"] is None
+    assert payload["dependency_resolution"]["native_blocking"] == [
+        {"repository": REPO, "number": 9600, "state": "OPEN"}
+    ]
