@@ -140,6 +140,38 @@ notes:
   - "stdout: machine JSON only; stderr: diagnostics only (no publishable body to stderr)"
 ```
 
+## agent_session_manifest/v1 詳細登録
+
+```yaml
+schema_id: agent_session_manifest/v1
+definition: docs/schemas/agent-session-manifest.md
+related_issue: "#243"
+producer:
+  - Claude Code hook-based ledger
+  - human/AI GitHub Issue or PR comment
+consumer:
+  - pr-review-judge
+  - impl-review-loop
+  - pilot smoke test issue
+  - future aggregation script
+detection_patterns:
+  - 'agent_session_manifest/v1'
+  - 'agent_session_manifest:v1'
+  - 'agent-session-manifest'
+schema_json: "docs/schemas/agent-session-manifest.schema.json"
+fixtures: "docs/schemas/examples/"
+test_file: "tests/agent-session-manifest.test.ts"
+validation_commands:
+  - "rg 'agent_session_manifest/v1' docs/schemas/agent-session-manifest.md"
+  - "rg '<!-- agent_session_manifest:v1 start -->' docs/schemas/agent-session-manifest.md"
+  - "test -f docs/schemas/agent-session-manifest.schema.json && echo 'schema json exists'"
+  - "pnpm test -- --reporter=verbose 2>&1 | grep agent-session-manifest"
+notes:
+  - "GitHub comment への raw transcript 禁止ポリシー: docs/schemas/agent-session-manifest.md#github-comment-への-raw-transcript-禁止ポリシー"
+  - "phase.main_loop と phase.ledger_phase の対応表: docs/schemas/agent-session-manifest.md#main-loop-phase-と-subagent-execution-ledger-phase-の対応表"
+  - "token_usage.availability: unavailable を 0 と偽装しないこと（docs/schemas/agent-session-manifest.md 参照）"
+```
+
 ## REVIEW_COMPACT_VALIDATION_RESULT_V1 詳細登録
 
 ```yaml
