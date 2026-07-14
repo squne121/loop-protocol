@@ -1227,7 +1227,7 @@ def test_overlap_readback_waiver_requires_live_body_snapshot_integrity(monkeypat
     _patch_live_waiver_readback(monkeypatch, body, [_snapshot_comment(sha)])
 
     waiver, error = open_pr._load_verified_overlap_readback_waiver(
-        "squne121/loop-protocol", 1477
+        "squne121/loop-protocol", 1477, today=open_pr.date(2026, 7, 13)
     )
     assert error is None
     assert waiver == _fixed_overlap_readback_waiver()
@@ -1236,7 +1236,7 @@ def test_overlap_readback_waiver_requires_live_body_snapshot_integrity(monkeypat
         monkeypatch, body, [_snapshot_comment("sha256:" + "0" * 64)]
     )
     waiver, error = open_pr._load_verified_overlap_readback_waiver(
-        "squne121/loop-protocol", 1477
+        "squne121/loop-protocol", 1477, today=open_pr.date(2026, 7, 13)
     )
     assert waiver is None
     assert error is not None
@@ -1290,7 +1290,7 @@ def test_overlap_readback_waiver_uses_latest_trusted_snapshot_precedence(
     _patch_live_waiver_readback(monkeypatch, body, comments)
 
     waiver, error = open_pr._load_verified_overlap_readback_waiver(
-        "squne121/loop-protocol", 1477
+        "squne121/loop-protocol", 1477, today=open_pr.date(2026, 7, 13)
     )
 
     assert (waiver is not None) is expected_valid
@@ -1308,7 +1308,7 @@ def test_overlap_readback_waiver_uses_comment_id_to_break_same_timestamp_tie(mon
     _patch_live_waiver_readback(monkeypatch, body, comments)
 
     waiver, error = open_pr._load_verified_overlap_readback_waiver(
-        "squne121/loop-protocol", 1477
+        "squne121/loop-protocol", 1477, today=open_pr.date(2026, 7, 13)
     )
 
     assert error is None
@@ -1323,7 +1323,7 @@ def test_overlap_readback_waiver_requires_complete_paginated_comment_readback(mo
     _patch_live_waiver_readback(monkeypatch, body, comments)
 
     waiver, error = open_pr._load_verified_overlap_readback_waiver(
-        "squne121/loop-protocol", 1477
+        "squne121/loop-protocol", 1477, today=open_pr.date(2026, 7, 13)
     )
 
     assert error is None
@@ -1331,7 +1331,7 @@ def test_overlap_readback_waiver_requires_complete_paginated_comment_readback(mo
 
     _patch_live_waiver_readback(monkeypatch, body, [], error="comments_fetch_incomplete")
     waiver, error = open_pr._load_verified_overlap_readback_waiver(
-        "squne121/loop-protocol", 1477
+        "squne121/loop-protocol", 1477, today=open_pr.date(2026, 7, 13)
     )
     assert waiver is None
     assert "不完全" in error

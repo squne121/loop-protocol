@@ -195,6 +195,49 @@ Exit codes:
 これが現在の phase で `scope_signal_guard.triggered` が hard stop になるかどうかを決定する。
 
 
+## REVIEWER_CLAIM_REPLAY_STATE_V2（Step 2a の連続 unbacked 判定用 state, #1515）
+
+**この state は `LOOP_STATE_V1`（`schemas/loop_state.schema.json`）とは独立した、session-scoped な別 state であり、`LOOP_STATE_V1` へ統合しない（#1504 の比較検討で不採用、#1515 Out of Scope）。**
+
+`issue-reviewer` SubAgent の Step 2a arbitration（`reviewer_claim_replay.py`）が使う consecutive-unbacked state は、呼び出しごとに破棄される isolation worktree ではなく `issue-refinement-loop` orchestrator が所有する。orchestrator は `reviewer_claim_replay_state_store.py`（`.claude/skills/issue-refinement-loop/scripts/`）を唯一の writer として使い、`issue-reviewer` SubAgent は state file への直接書き込みを一切行わない。
+
+### state_contract
+
+```yaml
+state_contract:
+  owner: orchestrator
+  scope: refinement_session
+  identity_key:
+    - repository_full_name
+    - issue_number
+    - refinement_session_id
+    - body_sha256
+    - normalized_kind
+    - reviewer_blocker_code
+  concurrency_policy: single_writer (lock file による検出。O_CREAT|O_EXCL、待機/リトライなし)
+  write_policy: atomic_replace (同一ディレクトリの一時ファイル + fsync + os.replace)
+  symlink_policy: reject（state path・一時ファイル path 双方）
+  corrupt_state_policy: fail_closed（`status: corrupt` を返し黙って fresh state 扱いしない）
+  retention_policy: delete_on_loop_termination
+```
+
+### read → invoke → write フロー
+
+1. **read**（`issue-reviewer` SubAgent 起動前）:
+   ```bash
+   uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/reviewer_claim_replay_state_store.py      --read --state-dir .claude/artifacts/issue-refinement-loop/<issue_number>      --repository-full-name <owner/repo> --issue-number <N> --refinement-session-id <session_id>
+   ```
+   `status: ok` の `state`（`reset_reason` があれば空オブジェクト）を SubAgent の prompt へ `previous_state` として渡す。`status: corrupt` は `human_judgment_required` へ倒す。
+2. **invoke**: `issue-reviewer` SubAgent が `reviewer_claim_replay.py --previous-state-inline '<previous_state>' --repository-full-name <owner/repo> --issue-number <N> --refinement-session-id <session_id>` を実行し、stdout の `REPLAY_NEXT_STATE` を返す（ファイル I/O なし）。
+3. **write**（SubAgent 応答受信後）:
+   ```bash
+   uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/reviewer_claim_replay_state_store.py      --write --state-dir .claude/artifacts/issue-refinement-loop/<issue_number>      --next-state-inline '<REPLAY_NEXT_STATE の JSON>'
+   ```
+
+`refinement_session_id` は orchestrator が loop 開始時（Step 0f 相当）に一度だけ生成し、loop 全体（複数 iteration）で使い回す。loop が終了（`approved` / `needs_second_pass` / `human_escalation` いずれか）したら、orchestrator は `.claude/artifacts/issue-refinement-loop/<issue_number>/reviewer_claim_replay_state.json` を削除する（retention_policy: delete_on_loop_termination）。
+
+identity（`repository_full_name`/`issue_number`/`refinement_session_id`/`body_sha256`）のいずれかが不一致の場合、state store は空 state（`reset_reason` 付き）を返す。これはエラーではなく、fresh session として consecutive count を 1 から数え直すための正常系である。
+
 ## scope_signal_guard_decision_v2（build_loop_state.py の envelope pass-through 拡張フィールド, #1090）
 
 `build_loop_state.py` は `plan['scope_signal_guard_decision_v2']`（#1090, opt-in。
