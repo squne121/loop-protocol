@@ -702,6 +702,38 @@ def run(req: dict, project_root: str | None = None, budget_seconds: float = 60.0
         return _result("error", str(e)[:160], verified, [])
     if perform_error is not None:
         # Blocker 6: keep the partial actions that DID run (e.g. worktree_remove).
+        #
+        # Issue #1403: after the normal executor removed the dedicated worktree,
+        # ``git branch -d`` can still reject a squash-merged branch by ancestry.
+        # Re-enter the existing branch-only verifier in this *same* invocation;
+        # it retains every destructive-path predicate before the executor uses
+        # its internal ``git branch -D`` subprocess. Do not expose a new agent
+        # command or broaden any hook/execpolicy allowlist.
+        if (
+            actions == [OP_WORKTREE_REMOVE]
+            and perform_error.startswith("branch_delete_failed:")
+        ):
+            try:
+                fallback_ok, fallback_reason, fallback_verified = (
+                    verify_branch_only_cleanup_authorization(req, root, deadline)
+                )
+            except GuardDeadlineExceeded as e:
+                return _result("error", str(e), verified, actions)
+            if not fallback_ok:
+                # The worktree removal already happened, so retain that partial
+                # action while surfacing the branch-only verifier's reason code.
+                return _result("error", fallback_reason, fallback_verified, actions)
+            try:
+                fallback_actions, fallback_error = _perform_branch_only(
+                    req["branch_name"], root, deadline
+                )
+            except (GuardDeadlineExceeded, OSError, subprocess.TimeoutExpired) as e:
+                return _result("error", str(e)[:160], fallback_verified, actions)
+            if fallback_error is not None:
+                return _result(
+                    "error", fallback_error, fallback_verified, actions + fallback_actions
+                )
+            return _result("ok", None, fallback_verified, actions + fallback_actions)
         return _result("error", perform_error, verified, actions)
     return _result("ok", None, verified, actions)
 
