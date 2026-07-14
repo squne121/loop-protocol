@@ -8,9 +8,31 @@ import { defineConfig, devices } from '@playwright/test'
  * - VITE_E2E_MODE=true enables the read-only window.__LOOP_E2E__ observability hook.
  * - trace: 'retain-on-failure' ensures trace files are saved on any first failure
  *   (AC6: first-run failures are captured without requiring retries).
+ *
+ * Preview-namespace dedicated lane (Issue #1283 / PR #1517 review fix, P0
+ * Blocker 1): `tests/e2e/m4-preview-namespace.spec.ts` asserts build-time
+ * `VITE_LOOP_STORAGE_NAMESPACE` isolation against a production-like build
+ * (no `VITE_E2E_MODE`). Running it in the same lane as the standard
+ * `VITE_E2E_MODE=true`-only E2E suite let it silently pass via a fallback
+ * that has since been removed from the spec itself — the spec now throws if
+ * required env is missing instead. To prevent it from ever running against
+ * the wrong build, it is EXCLUDED from the default test run here
+ * (`testIgnore`) and is ONLY included when `LOOP_E2E_PREVIEW_NAMESPACE_LANE`
+ * is `true` (`testMatch`), which also forces `reuseExistingServer: false` so
+ * a stale server from a different worktree/build/PR cannot be reused. See
+ * `pnpm run test:e2e:preview-namespace` in package.json.
  */
+
+const PREVIEW_NAMESPACE_LANE = process.env.LOOP_E2E_PREVIEW_NAMESPACE_LANE === 'true'
+const PREVIEW_NAMESPACE_SPEC = '**/m4-preview-namespace.spec.ts'
+
 export default defineConfig({
   testDir: './tests/e2e',
+  // Dedicated lane: ONLY the preview-namespace spec. Standard lane: every
+  // other spec, with the preview-namespace spec excluded (never both).
+  ...(PREVIEW_NAMESPACE_LANE
+    ? { testMatch: [PREVIEW_NAMESPACE_SPEC] }
+    : { testIgnore: [PREVIEW_NAMESPACE_SPEC] }),
   /* Run tests in files in parallel */
   fullyParallel: false,
   /* Fail the build on CI if you accidentally left test.only in the source code. */
@@ -44,12 +66,16 @@ export default defineConfig({
 
   /* Start the Vite preview server before running tests.
    * Uses preview (not dev) so the build is deterministic.
-   * VITE_E2E_MODE=true enables the read-only __LOOP_E2E__ hook. */
+   * Standard lane: VITE_E2E_MODE=true enables the read-only __LOOP_E2E__ hook.
+   * Preview-namespace lane: no VITE_E2E_MODE (production-like build/serve —
+   * see file header); reuseExistingServer is always false so a stale server
+   * from a different worktree/build/PR is never reused (P0 Blocker 1, item 5). */
   webServer: {
-    command:
-      'VITE_E2E_MODE=true pnpm exec vite preview --host 127.0.0.1 --port 4173 --strictPort',
+    command: PREVIEW_NAMESPACE_LANE
+      ? 'pnpm exec vite preview --host 127.0.0.1 --port 4173 --strictPort'
+      : 'VITE_E2E_MODE=true pnpm exec vite preview --host 127.0.0.1 --port 4173 --strictPort',
     url: 'http://127.0.0.1:4173',
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer: PREVIEW_NAMESPACE_LANE ? false : !process.env.CI,
     timeout: 120_000,
     stdout: 'pipe',
     stderr: 'pipe',

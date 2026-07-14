@@ -1,32 +1,62 @@
 /**
  * E2E: M4 preview-mode storage namespace (Issue #1283, AC9)
  *
- * Dedicated lane: unlike `m4-upgrade-loop.spec.ts` (which uses the runtime
- * `__LOOP_STORAGE_KEY__` override), this scenario relies on the build-time
- * `VITE_LOOP_STORAGE_NAMESPACE` resolution baked into a preview-mode build
- * (`resolveStorageKey()` only falls back to the preview namespace when no
- * runtime override is present — Design Constraints: "E2E runtime namespace
- * and preview build namespace are verified in separate scenarios").
+ * Dedicated lane ONLY: unlike `m4-upgrade-loop.spec.ts` (which uses the
+ * runtime `__LOOP_STORAGE_KEY__` override), this scenario relies on the
+ * build-time `VITE_LOOP_STORAGE_NAMESPACE` resolution baked into a
+ * production-like build (`resolveStorageKey()` only falls back to the
+ * preview namespace when no runtime override is present — Design
+ * Constraints: "E2E runtime namespace and preview build namespace are
+ * verified in separate scenarios").
  *
- * Intended invocation (see Issue #1283 Verification Commands):
+ * PR #1517 review fix (P0 Blocker 1): this spec previously fell back to
+ * asserting against the *production* key when `LOOP_EXPECTED_STORAGE_KEY`
+ * was unset, which let the standard `VITE_E2E_MODE=true`-only CI E2E job
+ * "pass" this test without ever exercising real namespace isolation. That
+ * fallback has been removed: `LOOP_EXPECTED_STORAGE_KEY` is now a REQUIRED
+ * environment variable, and this spec throws immediately (a hard FAIL, not
+ * a silent skip) if it is unset OR equals the production key. This spec is
+ * also excluded from the default `playwright.config.ts` test run
+ * (`testIgnore`) and only included when
+ * `LOOP_E2E_PREVIEW_NAMESPACE_LANE=true` selects the dedicated lane
+ * (`testMatch`) — see `playwright.config.ts` and the
+ * `test:e2e:preview-namespace` package.json script.
  *
- *   VITE_E2E_MODE=true VITE_LOOP_STORAGE_NAMESPACE=pr-1283 pnpm build
+ * Dedicated lane invocation (see `pnpm run test:e2e:preview-namespace`):
+ *
+ *   VITE_LOOP_STORAGE_NAMESPACE=pr-1283 \
  *   LOOP_EXPECTED_STORAGE_KEY=loop-protocol.preview.pr-1283.mvp.save \
- *     pnpm exec playwright test tests/e2e/m4-preview-namespace.spec.ts
+ *     pnpm run test:e2e:preview-namespace
  *
- * `LOOP_EXPECTED_STORAGE_KEY` is a Node-side (test-runner) environment
- * variable naming the key this run's build is expected to resolve to. When
- * unset (e.g. a plain `pnpm test:e2e` full run with no namespace build), it
- * defaults to the production key — i.e. the assertions degrade to "the
- * default (production) key round-trips a save", which remains a
- * non-vacuous check of the same save/read path without asserting anything
- * about namespace isolation in that lane.
+ * `pnpm run test:e2e:preview-namespace` removes any stale `dist/`, builds
+ * WITHOUT `VITE_E2E_MODE` (a production-like build — `VITE_LOOP_STORAGE_NAMESPACE`
+ * is still honored by Vite's `import.meta.env` replacement regardless of
+ * `VITE_E2E_MODE`), and runs Playwright with `LOOP_E2E_PREVIEW_NAMESPACE_LANE=true`,
+ * which also forces `reuseExistingServer: false` in `playwright.config.ts` so
+ * a stale server from a different worktree/build cannot be reused.
  */
 
 import { test, expect, type Page } from '@playwright/test'
 
 const PRODUCTION_KEY = 'loop-protocol.mvp.save'
-const EXPECTED_KEY = process.env.LOOP_EXPECTED_STORAGE_KEY ?? PRODUCTION_KEY
+
+const rawExpectedKey = process.env.LOOP_EXPECTED_STORAGE_KEY
+if (!rawExpectedKey || rawExpectedKey.trim() === '') {
+  throw new Error(
+    'LOOP_EXPECTED_STORAGE_KEY is required for tests/e2e/m4-preview-namespace.spec.ts ' +
+      '(dedicated preview-namespace lane only — see file header). Refusing to fall back ' +
+      'to the production key, which would silently mask a missing namespace build (AC9, ' +
+      'PR #1517 review fix).',
+  )
+}
+if (rawExpectedKey === PRODUCTION_KEY) {
+  throw new Error(
+    `LOOP_EXPECTED_STORAGE_KEY must not equal the production key (${PRODUCTION_KEY}) — ` +
+      'this spec exists to prove namespace ISOLATION from the production key, so asserting ' +
+      'against the production key itself would be a vacuous check (AC9, PR #1517 review fix).',
+  )
+}
+const EXPECTED_KEY: string = rawExpectedKey
 
 const PRODUCTION_SENTINEL = JSON.stringify({
   schemaVersion: 1,
@@ -49,18 +79,17 @@ async function readStorageKey(page: Page, key: string): Promise<StoredSnapshot |
 }
 
 test(
-  'M4 upgrade loop: AC9 GIVEN preview-mode build (or default build) WHEN New Game -> Save THEN only the resolved namespace key is written and the production sentinel is untouched',
+  'M4 upgrade loop: AC9 GIVEN a production-like build with VITE_LOOP_STORAGE_NAMESPACE WHEN New Game -> Save THEN only the resolved preview-namespace key is written and the production sentinel is untouched',
   async ({ page }) => {
     test.setTimeout(30_000)
 
     // Deliberately does NOT set __LOOP_STORAGE_KEY__ — this lane relies on the
-    // build-time VITE_LOOP_STORAGE_NAMESPACE resolution (or its absence).
+    // build-time VITE_LOOP_STORAGE_NAMESPACE resolution only. This build is
+    // production-like (no VITE_E2E_MODE), so __LOOP_E2E_BOOTSTRAP__ /
+    // __LOOP_E2E__ are not present in the bundle and are not referenced here.
     await page.addInitScript(
       (payload: { productionKey: string; productionSentinel: string }) => {
         window.localStorage.setItem(payload.productionKey, payload.productionSentinel)
-        ;(
-          window as Window & { __LOOP_E2E_BOOTSTRAP__?: { autoStart?: boolean } }
-        ).__LOOP_E2E_BOOTSTRAP__ = { autoStart: false }
       },
       { productionKey: PRODUCTION_KEY, productionSentinel: PRODUCTION_SENTINEL },
     )
@@ -91,30 +120,28 @@ test(
     ).not.toBeNull()
     expect(savedSnapshot!.schemaVersion, 'saved snapshot must be schemaVersion 1 (AC9)').toBe(1)
 
-    if (EXPECTED_KEY !== PRODUCTION_KEY) {
-      // Dedicated preview-namespace lane: production sentinel must be untouched,
-      // and the app must not have used the runtime override key (AC9, AC7).
-      const productionValue = await page.evaluate(
-        (key: string) => window.localStorage.getItem(key),
-        PRODUCTION_KEY,
-      )
-      expect(
-        productionValue,
-        'production key must remain byte-for-byte unchanged in the preview-namespace lane (AC9, AC7)',
-      ).toBe(PRODUCTION_SENTINEL)
+    // Production sentinel must be untouched (AC7, AC9): namespace isolation
+    // means the app never wrote to the production key in this build.
+    const productionValue = await page.evaluate(
+      (key: string) => window.localStorage.getItem(key),
+      PRODUCTION_KEY,
+    )
+    expect(
+      productionValue,
+      'production key must remain byte-for-byte unchanged in the preview-namespace lane (AC9, AC7)',
+    ).toBe(PRODUCTION_SENTINEL)
 
-      const allKeys = await page.evaluate(() => {
-        const keys: string[] = []
-        for (let i = 0; i < window.localStorage.length; i += 1) {
-          const k = window.localStorage.key(i)
-          if (k !== null) keys.push(k)
-        }
-        return keys.sort()
-      })
-      expect(
-        allKeys,
-        'only the production sentinel and the resolved preview-namespace key must exist (AC9)',
-      ).toEqual([PRODUCTION_KEY, EXPECTED_KEY].sort())
-    }
+    const allKeys = await page.evaluate(() => {
+      const keys: string[] = []
+      for (let i = 0; i < window.localStorage.length; i += 1) {
+        const k = window.localStorage.key(i)
+        if (k !== null) keys.push(k)
+      }
+      return keys.sort()
+    })
+    expect(
+      allKeys,
+      'only the production sentinel and the resolved preview-namespace key must exist (AC9)',
+    ).toEqual([PRODUCTION_KEY, EXPECTED_KEY].sort())
   },
 )

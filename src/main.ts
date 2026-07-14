@@ -1099,8 +1099,13 @@ function reportStorageFailure(
 // - Production build MUST NOT contain '__LOOP_E2E__'
 // ---------------------------------------------------------------------------
 
-/** Minimal snapshot type exposed to E2E tests. */
-interface LoopE2ESnapshot {
+/**
+ * Minimal snapshot type exposed to E2E tests. Exported so E2E spec files can
+ * type-only import it directly (Issue #1283 PR #1517 review fix) instead of
+ * maintaining a duplicated local copy that can silently drift from the real
+ * `__LOOP_E2E__.getState()` return shape.
+ */
+export interface LoopE2ESnapshot {
   tick: number
   elapsedMs: number
   loopPhase: 'title_menu' | 'load_menu' | 'preparation' | 'running' | 'result' | 'debrief_pending_reward' | 'debrief_reward_claimed'

@@ -35,34 +35,14 @@
  */
 
 import { test, expect, type Page } from '@playwright/test'
+// Type-only import from the single source of truth (Issue #1283 PR #1517
+// review fix): avoids a locally-duplicated snapshot type that can silently
+// drift from the real `__LOOP_E2E__.getState()` return shape.
+import type { LoopE2ESnapshot } from '../../src/main'
 
 // ---------------------------------------------------------------------------
 // Helper: read-only __LOOP_E2E__ observability hook
 // ---------------------------------------------------------------------------
-
-interface LoopE2ESnapshot {
-  tick: number
-  elapsedMs: number
-  loopPhase:
-    | 'title_menu'
-    | 'load_menu'
-    | 'preparation'
-    | 'running'
-    | 'result'
-    | 'debrief_pending_reward'
-    | 'debrief_reward_claimed'
-  progress: {
-    resources: number
-    weaponPower: number
-  }
-  projectiles: Array<{
-    id: number
-    x: number
-    y: number
-    ageMs: number
-    damage: number
-  }>
-}
 
 async function getGameState(page: Page): Promise<LoopE2ESnapshot> {
   return page.evaluate(() => {
@@ -76,8 +56,7 @@ async function getGameState(page: Page): Promise<LoopE2ESnapshot> {
         '__LOOP_E2E__ hook not found. Was the app built with VITE_E2E_MODE=true?',
       )
     }
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return hook.getState() as any
+    return hook.getState()
   })
 }
 
@@ -169,13 +148,46 @@ test(
     await page.goto('/')
 
     // AC10: __LOOP_E2E__ is read-only — getState() only, no mutation methods.
+    // Reflect.ownKeys() (rather than Object.keys()) also surfaces
+    // non-enumerable own properties, so a mutation method hidden via
+    // Object.defineProperty(..., { enumerable: false }) cannot slip past
+    // this check (PR #1517 review fix).
     const hookShape = await page.evaluate(() => {
-      const hook = (window as Window & { __LOOP_E2E__?: Record<string, unknown> }).__LOOP_E2E__
+      const hook = (window as Window & { __LOOP_E2E__?: object }).__LOOP_E2E__
       if (!hook) return null
-      return Object.keys(hook)
+      return Reflect.ownKeys(hook).map(String)
     })
     expect(hookShape, '__LOOP_E2E__ must exist (AC10)').not.toBeNull()
-    expect(hookShape, '__LOOP_E2E__ must expose only getState() (AC10)').toEqual(['getState'])
+    expect(
+      hookShape,
+      '__LOOP_E2E__ must expose only getState() via Reflect.ownKeys (AC10)',
+    ).toEqual(['getState'])
+
+    // AC10: getState() must return a fresh, isolated snapshot on every call —
+    // mutating a previously-returned snapshot must not leak into a later
+    // getState() call (proves it is not a live-state reference).
+    const snapshotIsolation = await page.evaluate(() => {
+      const hook = (
+        window as Window & { __LOOP_E2E__?: { getState: () => { projectiles: unknown[] } } }
+      ).__LOOP_E2E__!
+      const first = hook.getState()
+      const originalLength = first.projectiles.length
+      first.projectiles.push({ injected: true })
+      const second = hook.getState()
+      return {
+        originalLength,
+        mutatedFirstLength: first.projectiles.length,
+        secondLength: second.projectiles.length,
+      }
+    })
+    expect(
+      snapshotIsolation.mutatedFirstLength,
+      'sanity: the local mutation itself must have applied (AC10 test harness check)',
+    ).toBe(snapshotIsolation.originalLength + 1)
+    expect(
+      snapshotIsolation.secondLength,
+      'mutating a returned snapshot must not leak into subsequent getState() calls (AC10)',
+    ).toBe(snapshotIsolation.originalLength)
 
     // AC1 / bootstrap: autoStart disabled — app stays at title_menu, not auto-advanced.
     const initialState = await getGameState(page)
@@ -302,26 +314,37 @@ test(
     const centerX = box!.x + box!.width / 2
     const centerY = box!.y + box!.height / 2
 
+    // AC6 (PR #1517 review fix): identify the newly-fired projectile by ID
+    // diff against the pre-fire set, rather than assuming index 0 — the
+    // running phase may already contain projectiles from a prior frame, and
+    // indexing projectiles[0] would silently pass against a stale/unrelated
+    // entry instead of the projectile this fire actually created.
+    const beforeFire = await getGameState(page)
+    const existingProjectileIds = new Set(beforeFire.projectiles.map((p) => p.id))
+
+    let newProjectile: LoopE2ESnapshot['projectiles'][number] | null = null
     await page.mouse.move(centerX, centerY)
     await page.mouse.down({ button: 'left' })
+    try {
+      await expect
+        .poll(
+          async () => {
+            const current = await getGameState(page)
+            newProjectile = current.projectiles.find((p) => !existingProjectileIds.has(p.id)) ?? null
+            return newProjectile
+          },
+          { timeout: 3_000, intervals: [50] },
+        )
+        .not.toBeNull()
+    } finally {
+      await page.mouse.up({ button: 'left' })
+    }
 
-    await expect
-      .poll(
-        async () => {
-          const s = await getGameState(page)
-          return s.projectiles.length
-        },
-        { timeout: 3_000, intervals: [50] },
-      )
-      .toBeGreaterThan(0)
-
-    const stateWithProjectile = await getGameState(page)
-    await page.mouse.up()
-
+    expect(newProjectile, 'a newly-fired projectile must have appeared (AC6)').not.toBeNull()
     expect(
-      stateWithProjectile.projectiles[0]!.damage,
+      newProjectile!.damage,
       'newly fired projectile damage must equal the restored weaponPower (AC6)',
-    ).toBe(2)
+    ).toBe(beforeFire.progress.weaponPower)
 
     // AC7: production sentinel must still be unchanged at the end of the scenario.
     const productionFinal = await page.evaluate(
