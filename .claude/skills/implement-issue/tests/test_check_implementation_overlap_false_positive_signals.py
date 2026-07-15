@@ -13,6 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 HELPER = REPO_ROOT / ".claude/skills/implement-issue/scripts/check_implementation_overlap.py"
 DEFAULT_REPO = "squne121/loop-protocol"
 CREATE_ISSUE_SCRIPTS = REPO_ROOT / ".claude/skills/create-issue/scripts"
+IMPLEMENT_ISSUE_SCRIPTS = REPO_ROOT / ".claude/skills/implement-issue/scripts"
 sys.path.insert(0, str(CREATE_ISSUE_SCRIPTS))
 from check_issue_overlap import (  # noqa: E402
     PathScopeKind,
@@ -21,6 +22,9 @@ from check_issue_overlap import (  # noqa: E402
     gh_search_candidates,
     paths_conflict,
 )
+
+sys.path.insert(0, str(IMPLEMENT_ISSUE_SCRIPTS))
+import check_implementation_overlap  # noqa: E402
 
 
 def _sha(body: str) -> str:
@@ -240,6 +244,7 @@ def test_broad_prefix_weak(tmp_path: Path) -> None:
     )
     assert payload["route"] == "proceed_with_collision_evidence"
     assert "broad_prefix_only" in payload["candidates"][0]["reasons"]
+    assert payload["candidates"][0]["heading_overlap"] is False
     assert payload["candidates"][0]["structural_signals"]["has_structural_collision"] is False
 
 
@@ -263,6 +268,7 @@ def test_ordinal_ac_id_only(tmp_path: Path) -> None:
     )
     candidate = payload["candidates"][0]
     assert payload["route"] == "proceed_with_collision_evidence"
+    assert candidate["heading_overlap"] is False
     assert candidate["structural_signals"]["has_structural_collision"] is False
     assert "ordinal_ac_id_only" in candidate["reasons"]
 
@@ -359,3 +365,91 @@ def test_open_issue_source_uses_paginated_api_without_saturation(monkeypatch: ob
     assert candidates[-1].number == 101
     assert status.issue_search == SOURCE_OK
     assert status.issue_readback == SOURCE_OK
+
+
+# ---------------------------------------------------------------------------
+# PR #1530 review fix_delta (Blocker 1): fetch_implementation_candidates() is
+# a SEPARATE function from check_issue_overlap.gh_search_candidates() tested
+# above. It intentionally keeps the bounded `gh issue list --limit N` source
+# (Issue #1516 Out of Scope explicitly excludes changing this function; only
+# check_issue_overlap.py's create-issue source was required to fully
+# paginate, per AC13). This dedicated regression test closes the audit gap:
+# without it, test_open_issue_source_uses_paginated_api_without_saturation
+# above could be mistaken for coverage of THIS module's source.limit
+# contract, when it only covers the sibling create-issue module.
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_implementation_candidates_respects_requested_limit(monkeypatch: object) -> None:
+    """GIVEN a caller-specified --limit
+    WHEN fetch_implementation_candidates() issues its gh issue list call
+    THEN the exact --limit value is forwarded to gh (the collection boundary
+    check_implementation_overlap.py records as evidence `source.limit` is the
+    same bound gh is actually asked to respect — no silent divergence).
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: object) -> "subprocess.CompletedProcess[str]":
+        calls.append(command)
+        data = [{"number": n, "title": f"issue {n}", "body": "body"} for n in range(1, 6)]
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(data))
+
+    monkeypatch.setattr("check_implementation_overlap.subprocess.run", fake_run)  # type: ignore[attr-defined]
+
+    candidates, saturated = check_implementation_overlap.fetch_implementation_candidates(DEFAULT_REPO, 5)
+
+    assert calls == [
+        [
+            "gh",
+            "issue",
+            "list",
+            "--repo",
+            DEFAULT_REPO,
+            "--label",
+            "phase/implementation",
+            "--state",
+            "open",
+            "--json",
+            "number,title,body,labels,updatedAt,url",
+            "--limit",
+            "5",
+        ]
+    ]
+    assert len(candidates) == 5
+    # len(data) >= limit -> saturated True, matching the evidence contract
+    # that `source.limit` == the requested/enforced boundary.
+    assert saturated is True
+
+
+def test_fetch_implementation_candidates_not_saturated_below_limit(monkeypatch: object) -> None:
+    """GIVEN fewer results than --limit
+    WHEN fetch_implementation_candidates() runs
+    THEN saturated is False, proving the limit truly bounds (not just labels)
+    the collection — it is not silently ignored while `source.limit` is
+    recorded as if it were enforced.
+    """
+
+    def fake_run(command: list[str], **_kwargs: object) -> "subprocess.CompletedProcess[str]":
+        data = [{"number": n, "title": f"issue {n}", "body": "body"} for n in range(1, 4)]
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(data))
+
+    monkeypatch.setattr("check_implementation_overlap.subprocess.run", fake_run)  # type: ignore[attr-defined]
+
+    candidates, saturated = check_implementation_overlap.fetch_implementation_candidates(DEFAULT_REPO, 100)
+
+    assert len(candidates) == 3
+    assert saturated is False
+
+
+def test_issue_198_and_1326_do_not_force_human_review_via_package_json_alone(tmp_path: Path) -> None:
+    """Direct regression for PR #1530 review Blocker 2: current #198 and
+    #1326 bodies (In Scope both mention `package.json` as the only shared
+    edit target) must not force human_review_required purely from that
+    low-specificity shared path.
+    """
+    payload = _run(tmp_path, ISSUE_198_CANDIDATE, ISSUE_1326_CANDIDATE)
+    candidate = payload["candidates"][0]
+    assert payload["route"] == "proceed_with_collision_evidence"
+    assert candidate["heading_overlap"] is False
+    assert candidate["structural_signals"]["has_structural_collision"] is False
+    assert "low_specificity_path_only" in candidate["reasons"]
