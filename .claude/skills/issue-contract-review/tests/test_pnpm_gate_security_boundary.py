@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -13,7 +12,12 @@ import pytest
 
 SCRIPTS = Path(__file__).parent.parent / "scripts"
 BASELINE_PATH = SCRIPTS / "baseline_vc_preflight.py"
-TRIAGE_PATH = Path(__file__).parents[2] / "impl-review-loop" / "scripts" / "triage_contract_blockers.py"
+TRIAGE_PATH = (
+    Path(__file__).parents[2]
+    / "impl-review-loop"
+    / "scripts"
+    / "triage_contract_blockers.py"
+)
 
 sys.path.insert(0, str(SCRIPTS))
 import pnpm_gate_registry as registry  # noqa: E402
@@ -45,7 +49,14 @@ def _write_manifest(root: Path, scripts: dict[str, str] | None = None) -> None:
 def test_registry_is_the_only_pnpm_gate_authority():
     """GIVEN both consumers WHEN gates are queried THEN one descriptor set is used."""
     expected = {tuple(item.request_argv) for item in registry.iter_gate_descriptors()}
-    assert expected == {("pnpm", "typecheck"), ("pnpm", "lint"), ("pnpm", "test"), ("pnpm", "build"), ("pnpm", "typecheck:e2e"), ("pnpm", "lint:docs")}
+    assert expected == {
+        ("pnpm", "typecheck"),
+        ("pnpm", "lint"),
+        ("pnpm", "test"),
+        ("pnpm", "build"),
+        ("pnpm", "typecheck:e2e"),
+        ("pnpm", "lint:docs"),
+    }
     assert baseline._canonical_pnpm_gate(["pnpm", "lint:docs"]) == ("pnpm", "lint:docs")
     assert triage.registry.gate_for_request(["pnpm", "lint:docs"]) is not None
 
@@ -61,7 +72,9 @@ def test_registry_is_the_only_pnpm_gate_authority():
         ["pnpm", "lint:docs", "--if-present"],
     ],
 )
-def test_noncanonical_pnpm_requests_are_blocked_without_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str]):
+def test_noncanonical_pnpm_requests_are_blocked_without_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str]
+):
     """GIVEN a nonexact request WHEN preflight runs THEN no script subprocess launches."""
     _write_manifest(tmp_path)
     calls: list[list[str]] = []
@@ -85,7 +98,9 @@ def test_noncanonical_pnpm_requests_are_blocked_without_launch(tmp_path: Path, m
         {"prelint:docs": "node unexpected-hook.mjs"},
     ],
 )
-def test_manifest_hook_and_closure_drift_blocks_before_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scripts: dict[str, str | None]):
+def test_manifest_hook_and_closure_drift_blocks_before_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scripts: dict[str, str | None]
+):
     """GIVEN manifest drift WHEN a gate is prepared THEN launch is denied."""
     _write_manifest(tmp_path, scripts)  # type: ignore[arg-type]
     calls: list[list[str]] = []
@@ -96,7 +111,9 @@ def test_manifest_hook_and_closure_drift_blocks_before_launch(tmp_path: Path, mo
     assert calls == []
 
 
-def test_producer_evidence_round_trips_to_triage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_producer_evidence_round_trips_to_triage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     """GIVEN producer evidence WHEN triage consumes it THEN the registry gate is lossless."""
     _write_manifest(tmp_path)
     monkeypatch.setattr(registry, "resolve_trusted_pnpm", lambda _root: "/usr/bin/pnpm")
@@ -113,11 +130,27 @@ def test_producer_evidence_round_trips_to_triage(tmp_path: Path, monkeypatch: py
 
     monkeypatch.setattr(baseline.subprocess, "run", fake_run)
     result = baseline.run_command("pnpm typecheck:e2e", 1, str(tmp_path))
-    evidence = baseline._pnpm_gate_evidence_for_command("pnpm typecheck:e2e", str(tmp_path))
+    evidence = baseline._pnpm_gate_evidence_for_command(
+        "pnpm typecheck:e2e", str(tmp_path)
+    )
     assert captured[0]["argv"] == ["/usr/bin/pnpm", "run", "typecheck:e2e"]
     assert result[4] == {"CI": "true"}
     assert evidence["runner_env_delta"] == {"CI": "true"}
-    payload = {"schema": "baseline_vc_preflight/v1", "results": [{"ac": "AC4", "command_hash": "sha256:" + "a" * 64, "category": "package_manager_no_tty_prompt", "decision": "blocked", "raw_command": "pnpm typecheck:e2e", "runner_env_delta": {}, "pnpm_gate_evidence_required": True, "pnpm_gate_evidence": evidence}]}
+    payload = {
+        "schema": "baseline_vc_preflight/v1",
+        "results": [
+            {
+                "ac": "AC4",
+                "command_hash": "sha256:" + "a" * 64,
+                "category": "package_manager_no_tty_prompt",
+                "decision": "blocked",
+                "raw_command": "pnpm typecheck:e2e",
+                "runner_env_delta": {},
+                "pnpm_gate_evidence_required": True,
+                "pnpm_gate_evidence": evidence,
+            }
+        ],
+    }
     output = triage.triage_contract_blockers(payload)
     assert output["status"] == "ok"
     assert output["suggested_actions"][0]["argv"] == ["pnpm", "typecheck:e2e"]

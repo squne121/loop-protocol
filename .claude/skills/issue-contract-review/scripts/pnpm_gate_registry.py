@@ -33,8 +33,14 @@ _SCRIPTS = {
     "build": "tsc && vite build",
     "typecheck:e2e": "tsc -p tests/e2e/tsconfig.json --noEmit",
     "lint:docs": "pnpm run lint:md && pnpm run lint:prose && pnpm run validate:roadmap-refs",
-    "lint:md": "markdownlint-cli2 '**/*.md' '#node_modules/**' '#.claude/worktrees/**' '#dist/**' '#coverage/**' '#playwright-report/**' '#test-results/**'",
-    "lint:prose": "textlint --config .textlintrc 'docs/**/*.md' 'README.md' '.github/**/*.md' 'CLAUDE.md' 'AGENTS.md' 'SECURITY.md' '.claude/**/*.md'",
+    "lint:md": (
+        "markdownlint-cli2 '**/*.md' '#node_modules/**' '#.claude/worktrees/**' "
+        "'#dist/**' '#coverage/**' '#playwright-report/**' '#test-results/**'"
+    ),
+    "lint:prose": (
+        "textlint --config .textlintrc 'docs/**/*.md' 'README.md' '.github/**/*.md' "
+        "'CLAUDE.md' 'AGENTS.md' 'SECURITY.md' '.claude/**/*.md'"
+    ),
     "validate:roadmap-refs": "node scripts/validate-roadmap-refs.mjs",
 }
 
@@ -43,8 +49,18 @@ _GATES = (
     GateDescriptor("pnpm.lint.v1", ("pnpm", "lint"), "lint", ("lint",)),
     GateDescriptor("pnpm.test.v1", ("pnpm", "test"), "test", ("test",)),
     GateDescriptor("pnpm.build.v1", ("pnpm", "build"), "build", ("build",)),
-    GateDescriptor("pnpm.typecheck-e2e.v1", ("pnpm", "typecheck:e2e"), "typecheck:e2e", ("typecheck:e2e",)),
-    GateDescriptor("pnpm.lint-docs.v1", ("pnpm", "lint:docs"), "lint:docs", ("lint:docs", "lint:md", "lint:prose", "validate:roadmap-refs")),
+    GateDescriptor(
+        "pnpm.typecheck-e2e.v1",
+        ("pnpm", "typecheck:e2e"),
+        "typecheck:e2e",
+        ("typecheck:e2e",),
+    ),
+    GateDescriptor(
+        "pnpm.lint-docs.v1",
+        ("pnpm", "lint:docs"),
+        "lint:docs",
+        ("lint:docs", "lint:md", "lint:prose", "validate:roadmap-refs"),
+    ),
 )
 
 
@@ -110,7 +126,11 @@ def validate_manifest(gate: GateDescriptor, cwd: str) -> tuple[dict[str, Any] | 
     }
     if _digest(observed) != _digest(expected):
         return None, "manifest_integrity:digest_mismatch"
-    return {"manifest_path": str(manifest_path), "manifest_integrity_digest": _digest(expected), "validator_digest": expected["validator_digest"]}, None
+    return {
+        "manifest_path": str(manifest_path),
+        "manifest_integrity_digest": _digest(expected),
+        "validator_digest": expected["validator_digest"],
+    }, None
 
 
 def resolve_trusted_pnpm(repo_root: str) -> str | None:
@@ -129,7 +149,11 @@ def resolve_trusted_pnpm(repo_root: str) -> str | None:
         mode = resolved.stat().st_mode
     except OSError:
         return None
-    if not stat.S_ISREG(mode) or not os.access(resolved, os.X_OK) or mode & (stat.S_IWGRP | stat.S_IWOTH):
+    if (
+        not stat.S_ISREG(mode)
+        or not os.access(resolved, os.X_OK)
+        or mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
         return None
     return str(resolved)
 
@@ -160,7 +184,9 @@ def evidence_for_request(argv: list[str], cwd: str) -> tuple[dict[str, Any] | No
     return evidence, error
 
 
-def validate_evidence(evidence: Any, raw_argv: list[str], cwd: str) -> tuple[GateDescriptor | None, str | None]:
+def validate_evidence(
+    evidence: Any, raw_argv: list[str], cwd: str
+) -> tuple[GateDescriptor | None, str | None]:
     gate = gate_for_request(raw_argv)
     if gate is None:
         return None, "noncanonical_pnpm_gate"
@@ -169,7 +195,14 @@ def validate_evidence(evidence: Any, raw_argv: list[str], cwd: str) -> tuple[Gat
     _, expected, error = prepare_launch(raw_argv, cwd)
     if error or expected is None:
         return None, error or "pnpm_gate_evidence_invalid"
-    for key in ("gate_id", "exact_request_argv", "launch_argv", "runner_env_delta", "manifest_integrity_digest", "validator_digest"):
+    for key in (
+        "gate_id",
+        "exact_request_argv",
+        "launch_argv",
+        "runner_env_delta",
+        "manifest_integrity_digest",
+        "validator_digest",
+    ):
         if evidence.get(key) != expected.get(key):
             return None, f"pnpm_gate_evidence_mismatch:{key}"
     return gate, None
