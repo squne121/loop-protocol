@@ -432,8 +432,8 @@ $ pnpm typecheck
         os.unlink(fixture_file)
 
 
-def test_full_pipeline_no_tty_replay_in_tempdir(tmp_path):
-    """AC2: tempdir fixture with broken .modules.yaml + no-TTY pnpm replay keeps package_manager_no_tty_prompt."""
+def test_full_pipeline_missing_root_manifest_blocks_before_no_tty_launch(tmp_path):
+    """AC2: manifest 不在の tempdir では PATH 上 fake pnpm を起動しない。"""
     fixture_content = """## Verification Commands
 
 ```bash
@@ -506,9 +506,8 @@ virtualStoreDir: /unexpected/v3
         assert first["classification"] == "blocked", (
             f"Expected blocked classification, got {first}"
         )
-        assert first["category"] == "package_manager_no_tty_prompt", (
-            f"Expected package_manager_no_tty_prompt, got {first}"
-        )
+        assert first["category"] == "regression_gate", f"Expected regression_gate, got {first}"
+        assert "manifest_integrity:manifest_unreadable" in first["stderr_head"][0]
         assert first["scope_class"] == "regression_gate", (
             f"Expected scope_class regression_gate, got {first}"
         )
