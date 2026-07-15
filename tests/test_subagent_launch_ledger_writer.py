@@ -156,6 +156,27 @@ def test_malformed_and_replacement_failures_never_reset_or_publish_partial_json(
     assert not ledger.exists()
 
 
+def test_schema_invalid_ledger_missing_coverage_scope_fails_closed_without_replacement(tmp_path: Path):
+    writer = build_writer(tmp_path)
+    ledger_dir = tmp_path / "artifacts" / "codex"
+    ledger_dir.mkdir(parents=True)
+    ledger = ledger_dir / "subagent-launch-ledger.json"
+    original = json.dumps({
+        "ledger_schema": "SUBAGENT_LAUNCH_LEDGER_V1",
+        "generated_by": "codex_hook_pipeline",
+        "launches": [],
+        "root_thread_actions": [],
+    }).encode()
+    ledger.write_bytes(original)
+
+    result = invoke(writer, tmp_path, entry("spark-skim"))
+
+    assert result.returncode != 0
+    assert "ledger_parse_or_schema_invalid" in result.stderr
+    assert ledger.read_bytes() == original
+    assert not (ledger_dir / "subagent-launch-ledger.json.tmp").exists()
+
+
 def test_canonical_evidence_requires_launch_dispatch_and_correlation(tmp_path: Path):
     runtime = json.loads(
         (ROOT / "tests/fixtures/codex-agent-config/expected-runtime-contract.json").read_text(encoding="utf-8")

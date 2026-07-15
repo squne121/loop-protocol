@@ -1,8 +1,10 @@
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/openat2.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -52,15 +54,178 @@ static void acquire_lock(int parent) {
 
 static void release_lock(int parent) { if (unlinkat(parent, LOCK, 0) < 0) fail("ledger_lock_release_failed"); }
 
-static int balanced_json(const char *text) {
-  int depth = 0, quote = 0, escaped = 0;
-  for (const char *p = text; *p; p++) {
-    if (quote) { if (escaped) escaped = 0; else if (*p == '\\') escaped = 1; else if (*p == '"') quote = 0; continue; }
-    if (*p == '"') quote = 1;
-    else if (*p == '{' || *p == '[') depth++;
-    else if (*p == '}' || *p == ']') { if (--depth < 0) return 0; }
+static const char *skip_space_const(const char *p) { while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++; return p; }
+
+/* This is deliberately a small JSON parser, not a substring check.  The
+ * writer must never rewrite a ledger unless the persisted document has the
+ * canonical common schema accepted by check_subagent_launch_ledger.py. */
+static const char *skip_json_string(const char *p) {
+  if (*p++ != '"') return NULL;
+  for (; *p; p++) {
+    unsigned char c = (unsigned char)*p;
+    if (c < 0x20) return NULL;
+    if (c == '"') return p + 1;
+    if (c != '\\') continue;
+    c = (unsigned char)*++p;
+    if (!c || !strchr("\"\\/bfnrt", c)) {
+      if (c != 'u') return NULL;
+      for (int i = 0; i < 4; i++) {
+        c = (unsigned char)*++p;
+        if (!isxdigit(c)) return NULL;
+      }
+    }
   }
-  return depth == 0 && !quote && !escaped;
+  return NULL;
+}
+
+static const char *skip_json_value(const char *p);
+
+static const char *skip_json_compound(const char *p, char close) {
+  p = skip_space_const(p + 1);
+  if (*p == close) return p + 1;
+  for (;;) {
+    if (close == '}') {
+      p = skip_json_string(p);
+      if (!p) return NULL;
+      p = skip_space_const(p);
+      if (*p++ != ':') return NULL;
+    }
+    p = skip_json_value(skip_space_const(p));
+    if (!p) return NULL;
+    p = skip_space_const(p);
+    if (*p == close) return p + 1;
+    if (*p++ != ',') return NULL;
+    p = skip_space_const(p);
+  }
+}
+
+static const char *skip_json_value(const char *p) {
+  p = skip_space_const(p);
+  if (*p == '"') return skip_json_string(p);
+  if (*p == '{') return skip_json_compound(p, '}');
+  if (*p == '[') return skip_json_compound(p, ']');
+  if (!strncmp(p, "true", 4)) return p + 4;
+  if (!strncmp(p, "false", 5)) return p + 5;
+  if (!strncmp(p, "null", 4)) return p + 4;
+  const char *start = p;
+  if (*p == '-') p++;
+  if (*p == '0') p++;
+  else if (*p >= '1' && *p <= '9') while (*++p >= '0' && *p <= '9') {}
+  else return NULL;
+  if (*p == '.') { if (*++p < '0' || *p > '9') return NULL; while (*++p >= '0' && *p <= '9') {} }
+  if (*p == 'e' || *p == 'E') { p++; if (*p == '+' || *p == '-') p++; if (*p < '0' || *p > '9') return NULL; while (*++p >= '0' && *p <= '9') {} }
+  return p == start ? NULL : p;
+}
+
+static int json_string_equals(const char *start, const char *end, const char *expected) {
+  size_t length = strlen(expected);
+  return end - start == (ptrdiff_t)length + 2 && !memcmp(start + 1, expected, length);
+}
+
+static int json_value_is(const char *start, const char *end, const char *expected) {
+  return end - start == (ptrdiff_t)strlen(expected) && !memcmp(start, expected, strlen(expected));
+}
+
+static int json_string_contains(const char *start, const char *end, const char *needle) {
+  size_t length = strlen(needle);
+  if (end - start < (ptrdiff_t)length + 2) return 0;
+  for (const char *p = start + 1; p + length < end; p++) {
+    if (!memcmp(p, needle, length)) return 1;
+  }
+  return 0;
+}
+
+static int coverage_scope_valid(const char *start, const char *end) {
+  unsigned fields = 0;
+  const char *p = skip_space_const(start);
+  if (*p++ != '{') return 0;
+  p = skip_space_const(p);
+  while (*p != '}') {
+    const char *key = p, *key_end = skip_json_string(p);
+    if (!key_end) return 0;
+    p = skip_space_const(key_end);
+    if (*p++ != ':') return 0;
+    p = skip_space_const(p);
+    const char *value = p, *value_end = skip_json_value(p);
+    if (!value_end) return 0;
+    if (json_string_equals(key, key_end, "subagent_start_event_recorded")) {
+      if (fields & 1 || !json_value_is(value, value_end, "true")) return 0;
+      fields |= 1;
+    } else if (json_string_equals(key, key_end, "unsupported_paths_fail_closed")) {
+      if (fields & 2 || !json_value_is(value, value_end, "true")) return 0;
+      fields |= 2;
+    } else if (json_string_equals(key, key_end, "scope_note")) {
+      if (fields & 4 || *value != '"' || !json_string_contains(value, value_end, "supported PreToolUse paths")) return 0;
+      fields |= 4;
+    } else if (json_string_equals(key, key_end, "supported_pretooluse_paths")) {
+      unsigned supported = 0;
+      const char *item = skip_space_const(value);
+      if (*item++ != '[') return 0;
+      item = skip_space_const(item);
+      while (*item != ']') {
+        const char *item_end = skip_json_string(item);
+        if (!item_end) return 0;
+        if (json_string_equals(item, item_end, "Bash")) supported |= 1;
+        else if (json_string_equals(item, item_end, "apply_patch")) supported |= 2;
+        else if (json_string_equals(item, item_end, "Edit")) supported |= 4;
+        else if (json_string_equals(item, item_end, "Write")) supported |= 8;
+        else return 0;
+        item = skip_space_const(item_end);
+        if (*item == ']') break;
+        if (*item++ != ',') return 0;
+        item = skip_space_const(item);
+      }
+      if (fields & 8 || supported != 15 || item + 1 != value_end) return 0;
+      fields |= 8;
+    } else return 0;
+    p = skip_space_const(value_end);
+    if (*p == '}') break;
+    if (*p++ != ',') return 0;
+    p = skip_space_const(p);
+  }
+  return fields == 15 && p + 1 == end;
+}
+
+static int ledger_common_schema_valid(const char *text) {
+  unsigned fields = 0;
+  const char *p = skip_space_const(text);
+  if (*p++ != '{') return 0;
+  p = skip_space_const(p);
+  while (*p != '}') {
+    const char *key = p, *key_end = skip_json_string(p);
+    if (!key_end) return 0;
+    p = skip_space_const(key_end);
+    if (*p++ != ':') return 0;
+    p = skip_space_const(p);
+    const char *value = p, *value_end = skip_json_value(p);
+    if (!value_end) return 0;
+    if (json_string_equals(key, key_end, "ledger_schema")) {
+      if (fields & 1 || !json_string_equals(value, value_end, "SUBAGENT_LAUNCH_LEDGER_V1")) return 0;
+      fields |= 1;
+    } else if (json_string_equals(key, key_end, "generated_by")) {
+      if (fields & 2 || !json_string_equals(value, value_end, "codex_hook_pipeline")) return 0;
+      fields |= 2;
+    } else if (json_string_equals(key, key_end, "coverage_scope")) {
+      if (fields & 4 || !coverage_scope_valid(value, value_end)) return 0;
+      fields |= 4;
+    } else if (json_string_equals(key, key_end, "launches")) {
+      if (fields & 8 || *value != '[') return 0;
+      fields |= 8;
+    } else if (json_string_equals(key, key_end, "root_thread_actions")) {
+      if (fields & 16 || *value != '[') return 0;
+      fields |= 16;
+    } else if (json_string_equals(key, key_end, "codex_binary_status") ||
+               json_string_equals(key, key_end, "generated_at") ||
+               json_string_equals(key, key_end, "ledger_path") ||
+               json_string_equals(key, key_end, "tool_path_support")) {
+      /* Optional common-schema fields are type-checked by the canonical Python validator. */
+    } else return 0;
+    p = skip_space_const(value_end);
+    if (*p == '}') break;
+    if (*p++ != ',') return 0;
+    p = skip_space_const(p);
+  }
+  return fields == 31 && !*skip_space_const(p + 1);
 }
 
 static char *read_ledger(int parent) {
@@ -73,7 +238,7 @@ static char *read_ledger(int parent) {
   struct stat st; if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 2 || st.st_size > MAX_LEDGER) fail("ledger_target_unsafe");
   char *buf = calloc((size_t)st.st_size + 1, 1); if (!buf) fail("ledger_memory_failed");
   ssize_t got = read(fd, buf, (size_t)st.st_size); close(fd);
-  if (got != st.st_size || !balanced_json(buf) || !strstr(buf, "SUBAGENT_LAUNCH_LEDGER_V1") || !strstr(buf, "\"launches\"") || !strstr(buf, "\"root_thread_actions\"")) fail("ledger_parse_or_schema_invalid");
+  if (got != st.st_size || !ledger_common_schema_valid(buf)) fail("ledger_parse_or_schema_invalid");
   return buf;
 }
 
@@ -85,7 +250,8 @@ static char *array_end(char *start) {
 }
 
 static char *append_entry(char *ledger, const char *kind, const char *entry, const char *identity) {
-  if (!balanced_json(entry) || entry[0] != '{' || !identity || !*identity) fail("ledger_entry_invalid");
+  const char *entry_end = skip_json_value(entry);
+  if (!entry_end || *skip_space_const(entry_end) || entry[0] != '{' || !identity || !*identity) fail("ledger_entry_invalid");
   if (strstr(ledger, identity)) return ledger;
   char key[64]; snprintf(key, sizeof(key), "\"%s\"", kind);
   char *field = strstr(ledger, key); if (!field) fail("ledger_schema_invalid");
