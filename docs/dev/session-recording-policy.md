@@ -23,7 +23,7 @@ created: "2026-05-24"
 - `PreToolUse` / `PermissionRequest` は予防層であり security boundary ではない。canonical final gate は post-run verifier と private artifact validation に置く。
 - Codex hook command は `rtk pnpm exec node ...` を明示 dependency とし、runtime では `node` と repo script のみで deterministic に再実行できるようにする。
 
-### Codex SubagentStop の scope-rollup capture（#1527）
+### Codex SubagentStop における scope-rollup capture の記録（#1527）
 
 Codex の `SubagentStop` では、adapter は capture policy の適用と subprocess transport
 だけを担当し、canonical artifact の decision authority は既存
