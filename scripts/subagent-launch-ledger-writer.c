@@ -135,6 +135,226 @@ static int json_string_contains(const char *start, const char *end, const char *
   return 0;
 }
 
+static int json_string_nonempty(const char *start, const char *end) {
+  return *start == '"' && end - start > 2;
+}
+
+static int json_boolean(const char *start, const char *end) {
+  return json_value_is(start, end, "true") || json_value_is(start, end, "false");
+}
+
+static int declared_runtime_valid(const char *start, const char *end) {
+  unsigned fields = 0;
+  const char *p = skip_space_const(start);
+  if (*p++ != '{') return 0;
+  p = skip_space_const(p);
+  while (*p != '}') {
+    const char *key = p, *key_end = skip_json_string(p);
+    if (!key_end) return 0;
+    p = skip_space_const(key_end);
+    if (*p++ != ':') return 0;
+    p = skip_space_const(p);
+    const char *value = p, *value_end = skip_json_value(p);
+    if (!value_end || !json_string_nonempty(value, value_end)) return 0;
+    if (json_string_equals(key, key_end, "model")) {
+      if (fields & 1) return 0;
+      fields |= 1;
+    } else if (json_string_equals(key, key_end, "reasoning_effort")) {
+      if (fields & 2) return 0;
+      fields |= 2;
+    } else if (json_string_equals(key, key_end, "default_permissions")) {
+      if (fields & 4) return 0;
+      fields |= 4;
+    } else if (json_string_equals(key, key_end, "agent_definition_sha256")) {
+      if (fields & 8) return 0;
+      fields |= 8;
+    } else return 0;
+    p = skip_space_const(value_end);
+    if (*p == '}') break;
+    if (*p++ != ',') return 0;
+    p = skip_space_const(p);
+  }
+  return (fields == 7 || fields == 15) && p + 1 == end;
+}
+
+static int observed_dispatch_valid(const char *start, const char *end) {
+  unsigned fields = 0;
+  const char *p = skip_space_const(start);
+  if (*p++ != '{') return 0;
+  p = skip_space_const(p);
+  while (*p != '}') {
+    const char *key = p, *key_end = skip_json_string(p);
+    if (!key_end) return 0;
+    p = skip_space_const(key_end);
+    if (*p++ != ':') return 0;
+    p = skip_space_const(p);
+    const char *value = p, *value_end = skip_json_value(p);
+    if (!value_end || !json_string_nonempty(value, value_end)) return 0;
+    if (json_string_equals(key, key_end, "model")) {
+      if (fields & 1) return 0;
+      fields |= 1;
+    } else if (json_string_equals(key, key_end, "session_id")) {
+      if (fields & 2) return 0;
+      fields |= 2;
+    } else if (json_string_equals(key, key_end, "turn_id")) {
+      if (fields & 4) return 0;
+      fields |= 4;
+    } else if (json_string_equals(key, key_end, "agent_id")) {
+      if (fields & 8) return 0;
+      fields |= 8;
+    } else if (json_string_equals(key, key_end, "observed_at")) {
+      if (fields & 16) return 0;
+      fields |= 16;
+    } else return 0;
+    p = skip_space_const(value_end);
+    if (*p == '}') break;
+    if (*p++ != ',') return 0;
+    p = skip_space_const(p);
+  }
+  return fields == 31 && p + 1 == end;
+}
+
+static int correlation_valid(const char *start, const char *end) {
+  unsigned fields = 0;
+  const char *p = skip_space_const(start);
+  if (*p++ != '{') return 0;
+  p = skip_space_const(p);
+  while (*p != '}') {
+    const char *key = p, *key_end = skip_json_string(p);
+    if (!key_end) return 0;
+    p = skip_space_const(key_end);
+    if (*p++ != ':') return 0;
+    p = skip_space_const(p);
+    const char *value = p, *value_end = skip_json_value(p);
+    if (!value_end) return 0;
+    if (json_string_equals(key, key_end, "evidence_run_id") || json_string_equals(key, key_end, "repo_head_sha")) {
+      unsigned bit = json_string_equals(key, key_end, "evidence_run_id") ? 1 : 2;
+      if ((fields & bit) || !json_string_nonempty(value, value_end)) return 0;
+      fields |= bit;
+    } else if (json_string_equals(key, key_end, "worktree_dirty")) {
+      if ((fields & 4) || !json_boolean(value, value_end)) return 0;
+      fields |= 4;
+    } else return 0;
+    p = skip_space_const(value_end);
+    if (*p == '}') break;
+    if (*p++ != ',') return 0;
+    p = skip_space_const(p);
+  }
+  return fields == 7 && p + 1 == end;
+}
+
+static int launch_valid(const char *start, const char *end) {
+  unsigned fields = 0;
+  const char *p = skip_space_const(start);
+  if (*p++ != '{') return 0;
+  p = skip_space_const(p);
+  while (*p != '}') {
+    const char *key = p, *key_end = skip_json_string(p);
+    if (!key_end) return 0;
+    p = skip_space_const(key_end);
+    if (*p++ != ':') return 0;
+    p = skip_space_const(p);
+    const char *value = p, *value_end = skip_json_value(p);
+    if (!value_end) return 0;
+    if (json_string_equals(key, key_end, "agent_name")) {
+      if ((fields & 1) || !json_string_nonempty(value, value_end)) return 0;
+      fields |= 1;
+    } else if (json_string_equals(key, key_end, "event_type")) {
+      if ((fields & 2) || !json_string_equals(value, value_end, "SubagentStart")) return 0;
+      fields |= 2;
+    } else if (json_string_equals(key, key_end, "evidence_source")) {
+      if ((fields & 4) || !json_string_equals(value, value_end, "event_derived")) return 0;
+      fields |= 4;
+    } else if (json_string_equals(key, key_end, "event_fingerprint")) {
+      if ((fields & 8) || !json_string_nonempty(value, value_end)) return 0;
+      fields |= 8;
+    } else if (json_string_equals(key, key_end, "declared_runtime")) {
+      if ((fields & 16) || !declared_runtime_valid(value, value_end)) return 0;
+      fields |= 16;
+    } else if (json_string_equals(key, key_end, "observed_dispatch")) {
+      if ((fields & 32) || !observed_dispatch_valid(value, value_end)) return 0;
+      fields |= 32;
+    } else if (json_string_equals(key, key_end, "correlation")) {
+      if ((fields & 64) || !correlation_valid(value, value_end)) return 0;
+      fields |= 64;
+    } else return 0;
+    p = skip_space_const(value_end);
+    if (*p == '}') break;
+    if (*p++ != ',') return 0;
+    p = skip_space_const(p);
+  }
+  return fields == 127 && p + 1 == end;
+}
+
+static int launches_valid(const char *start, const char *end) {
+  int entries = 0;
+  const char *p = skip_space_const(start);
+  if (*p++ != '[') return 0;
+  p = skip_space_const(p);
+  while (*p != ']') {
+    const char *value = p, *value_end = skip_json_value(p);
+    if (!value_end || !launch_valid(value, value_end)) return 0;
+    entries++;
+    p = skip_space_const(value_end);
+    if (*p == ']') break;
+    if (*p++ != ',') return 0;
+    p = skip_space_const(p);
+  }
+  return entries && p + 1 == end;
+}
+
+static int root_thread_action_valid(const char *start, const char *end) {
+  unsigned fields = 0;
+  const char *p = skip_space_const(start);
+  if (*p++ != '{') return 0;
+  p = skip_space_const(p);
+  while (*p != '}') {
+    const char *key = p, *key_end = skip_json_string(p);
+    if (!key_end) return 0;
+    p = skip_space_const(key_end);
+    if (*p++ != ':') return 0;
+    p = skip_space_const(p);
+    const char *value = p, *value_end = skip_json_value(p);
+    if (!value_end) return 0;
+    if (json_string_equals(key, key_end, "kind")) {
+      if ((fields & 1) || !json_string_nonempty(value, value_end) ||
+          json_string_equals(value, value_end, "file_edit") || json_string_equals(value, value_end, "test_execution") ||
+          json_string_equals(value, value_end, "git_commit") || json_string_equals(value, value_end, "git_push") ||
+          json_string_equals(value, value_end, "review_judgment") || json_string_equals(value, value_end, "cleanup_git_mutation")) return 0;
+      fields |= 1;
+    } else if (json_string_equals(key, key_end, "command")) {
+      if ((fields & 2) || !json_string_nonempty(value, value_end)) return 0;
+      fields |= 2;
+    } else if (json_string_equals(key, key_end, "tool_name")) {
+      if ((fields & 4) || !(json_string_equals(value, value_end, "Bash") || json_string_equals(value, value_end, "apply_patch") || json_string_equals(value, value_end, "Edit") || json_string_equals(value, value_end, "Write"))) return 0;
+      fields |= 4;
+    } else if (json_string_equals(key, key_end, "coverage_source")) {
+      if ((fields & 8) || !json_string_equals(value, value_end, "supported_pretooluse_path")) return 0;
+      fields |= 8;
+    } else return 0;
+    p = skip_space_const(value_end);
+    if (*p == '}') break;
+    if (*p++ != ',') return 0;
+    p = skip_space_const(p);
+  }
+  return fields == 15 && p + 1 == end;
+}
+
+static int root_thread_actions_valid(const char *start, const char *end) {
+  const char *p = skip_space_const(start);
+  if (*p++ != '[') return 0;
+  p = skip_space_const(p);
+  while (*p != ']') {
+    const char *value = p, *value_end = skip_json_value(p);
+    if (!value_end || !root_thread_action_valid(value, value_end)) return 0;
+    p = skip_space_const(value_end);
+    if (*p == ']') break;
+    if (*p++ != ',') return 0;
+    p = skip_space_const(p);
+  }
+  return p + 1 == end;
+}
+
 static int coverage_scope_valid(const char *start, const char *end) {
   unsigned fields = 0;
   const char *p = skip_space_const(start);
@@ -209,10 +429,10 @@ static int ledger_common_schema_valid(const char *text) {
       if (fields & 4 || !coverage_scope_valid(value, value_end)) return 0;
       fields |= 4;
     } else if (json_string_equals(key, key_end, "launches")) {
-      if (fields & 8 || *value != '[') return 0;
+      if (fields & 8 || !launches_valid(value, value_end)) return 0;
       fields |= 8;
     } else if (json_string_equals(key, key_end, "root_thread_actions")) {
-      if (fields & 16 || *value != '[') return 0;
+      if (fields & 16 || !root_thread_actions_valid(value, value_end)) return 0;
       fields |= 16;
     } else if (json_string_equals(key, key_end, "codex_binary_status") ||
                json_string_equals(key, key_end, "generated_at") ||
