@@ -86,7 +86,8 @@ def _run(tmp_path: Path, current_body: str, candidate_body: str) -> dict[str, ob
 
 # GitHub readback on 2026-07-15.  These are deliberately literal test inputs:
 # the body digest assertions below must fail if the fixture drifts.
-ISSUE_1283_CURRENT = """## Machine-Readable Contract
+ISSUE_1283_CURRENT = (
+    """## Machine-Readable Contract
 
 ```yaml
 contract_schema_version: v1
@@ -98,7 +99,10 @@ change_kind: mixed
 
 ## Outcome
 
-Playwright E2E と必要最小限の observability hook が追加され、upgrade 購入後の `weaponPower` 永続化と next-sortie projectile damage 反映、および preview / E2E storage namespace 分離が証跡付きで再現できる状態。
+"""
+    "Playwright E2E と必要最小限の observability hook が追加され、upgrade 購入後の `weaponPower` 永続化と next-sortie "
+    "projectile damage 反映、および preview / E2E storage namespace 分離が証跡付きで再現できる状態。"
+    """
 
 ## In Scope
 
@@ -120,8 +124,10 @@ Playwright E2E と必要最小限の observability hook が追加され、upgrad
 - playwright.config.ts
 - package.json
 """
+)
 
-ISSUE_198_CANDIDATE = """## Machine-Readable Contract
+ISSUE_198_CANDIDATE = (
+    """## Machine-Readable Contract
 
 ```yaml
 contract_schema_version: v1
@@ -133,7 +139,10 @@ change_kind: code
 
 ## Outcome
 
-各 SSOT 文書に YAML Frontmatter が追加され、`generate-ssot-registry.sh` の実行により `docs/ssot-registry.generated.yml` が生成される状態。
+"""
+    "各 SSOT 文書に YAML Frontmatter が追加され、`generate-ssot-registry.sh` の実行により "
+    "`docs/ssot-registry.generated.yml` が生成される状態。"
+    """
 
 ## In Scope
 
@@ -149,6 +158,7 @@ change_kind: code
 - .claude/skills/ssot-discovery/scripts/generate-ssot-registry.sh
 - package.json
 """
+)
 
 ISSUE_1326_CANDIDATE = """## Machine-Readable Contract
 
