@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
-import { execFileSync } from 'node:child_process'
-import { dirname, resolve } from 'node:path'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { realpathSync } from 'node:fs'
+import { dirname, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { buildCodexManifestFileName, resolveManifestWriteTarget, writeCodexSessionManifest } from './write-codex-session-manifest.mjs'
@@ -23,6 +24,56 @@ const configuredProducerScript = process.env.CODEX_SESSION_RECORDING_PRODUCER
 const producerScript = configuredProducerScript.startsWith(repoRoot)
   ? configuredProducerScript
   : defaultProducerScript
+
+// Issue #1527: scope-rollup canonical capture remains owned by the existing
+// Python producer. The adapter owns only the narrow SubagentStop eligibility
+// decision and bounded subprocess transport; it must never parse markers,
+// choose artifact names, or write capture artifacts itself.
+const defaultScopeRollupCaptureScript = resolve(
+  repoRoot,
+  '.claude',
+  'hooks',
+  'capture_scope_rollup_final_response.py',
+)
+const scopeRollupCaptureFixtureRoot = resolve(
+  repoRoot,
+  'tests',
+  'fixtures',
+  'hooks',
+  'scope-rollup-capture',
+)
+const SCOPE_ROLLUP_CAPTURE_TIMEOUT_MS = 5000
+const SCOPE_ROLLUP_CAPTURE_ELIGIBILITY = Object.freeze({
+  event: 'SubagentStop',
+  secrets_mode: 'none',
+  public_checkpoint_enabled: false,
+  unknown_visibility_mapping: false,
+  guard_decision: 'allow_only',
+  stop_hook_active: false,
+  malformed_payload: 'skip',
+})
+
+function isDescendantPath(candidate, parent) {
+  const relativePath = relative(parent, candidate)
+  return relativePath !== '' && !relativePath.startsWith('..') && !relativePath.includes('..\\')
+}
+
+function resolveScopeRollupCaptureScript() {
+  const configured = process.env.CODEX_SCOPE_ROLLUP_CAPTURE_SCRIPT
+  if (!configured) return defaultScopeRollupCaptureScript
+
+  try {
+    const canonicalCandidate = realpathSync(resolve(configured))
+    const canonicalFixtureRoot = realpathSync(scopeRollupCaptureFixtureRoot)
+    return isDescendantPath(canonicalCandidate, canonicalFixtureRoot)
+      ? canonicalCandidate
+      : defaultScopeRollupCaptureScript
+  } catch {
+    return defaultScopeRollupCaptureScript
+  }
+}
+
+const scopeRollupCaptureScript = resolveScopeRollupCaptureScript()
 
 // Issue #1428: shell command structure analyzer (SHELL_COMMAND_ANALYSIS_V1).
 // Invoked out-of-process via execFile-style argv (no shell interpolation,
@@ -257,7 +308,14 @@ async function readJsonFromStdin() {
   if (!text.trim()) {
     throw new Error('empty stdin')
   }
-  return JSON.parse(text)
+  const payload = JSON.parse(text)
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('payload must be an object')
+  }
+  // Parse exactly once, while preserving the original bytes for the capture
+  // producer. JSON.stringify(payload) would not satisfy the producer-input
+  // provenance contract when caller whitespace or key order differs.
+  return { payload, rawPayload: text }
 }
 
 function getCommand(payload) {
@@ -711,11 +769,51 @@ function runManifestFlow(eventName, payload) {
   return { continue: true }
 }
 
+function shouldRunScopeRollupCapture(eventName, payload) {
+  if (eventName !== SCOPE_ROLLUP_CAPTURE_ELIGIBILITY.event) return false
+  if (payload.stop_hook_active === true) return false
+  // evaluateGuard() runs exactly once before this function. Re-checking its
+  // policy keys here would duplicate the guard decision authority.
+  return true
+}
+
+function runScopeRollupCapture(rawPayload) {
+  let result
+  try {
+    result = spawnSync('uv', ['run', '--locked', 'python3', scopeRollupCaptureScript], {
+      cwd: repoRoot,
+      input: rawPayload,
+      encoding: 'utf8',
+      timeout: SCOPE_ROLLUP_CAPTURE_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+  } catch {
+    process.stderr.write('[codex-hook-adapter] warn: scope-rollup capture skipped (capture_spawn_error)\n')
+    return
+  }
+
+  if (result.error) {
+    const reason = result.error.code === 'ETIMEDOUT'
+      ? 'capture_timeout'
+      : 'capture_spawn_error'
+    process.stderr.write(`[codex-hook-adapter] warn: scope-rollup capture skipped (${reason})\n`)
+    return
+  }
+  if (result.signal === 'SIGKILL') {
+    process.stderr.write('[codex-hook-adapter] warn: scope-rollup capture skipped (capture_timeout)\n')
+    return
+  }
+  if (result.status !== 0) {
+    process.stderr.write('[codex-hook-adapter] warn: scope-rollup capture skipped (capture_nonzero)\n')
+  }
+}
+
 async function main() {
   const { event } = parseArgs(process.argv)
-  let payload
+  let input
   try {
-    payload = await readJsonFromStdin()
+    input = await readJsonFromStdin()
   } catch {
     if (event === 'PreToolUse') {
       emitJson(denyPreToolUse(`Malformed ${event} payload blocked by hook.`))
@@ -731,6 +829,8 @@ async function main() {
     emitJson({ continue: true })
     return
   }
+
+  const { payload, rawPayload } = input
 
   const guardResult = evaluateGuard(payload, event)
   if (guardResult !== null) {
@@ -756,6 +856,11 @@ async function main() {
   }
 
   if (event === 'Stop' || event === 'SubagentStop') {
+    if (shouldRunScopeRollupCapture(event, payload)) {
+      // Capture transport is fail-open: semantic rejection, nonzero exit, and
+      // timeout never replace the existing manifest/decision flow.
+      runScopeRollupCapture(rawPayload)
+    }
     // AC3: session recording failure → best-effort telemetry, always continue:true
     let result
     try {
