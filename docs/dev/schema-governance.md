@@ -51,6 +51,7 @@ related_issue: "#135"
 | `delegation_audit_v1` | `.claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py`（`--audit-log` / `DELEGATION_AUDIT_LOG_PATH` で明示有効化する監査ログ JSONL） | run_gemini_headless.py（`run_delegation()` トップレベル呼び出し） | `.claude/skills/gemini-cli-headless-delegation/tests/test_delegation_audit_schema.py`（本 PR で追加した唯一の consumer。既存 `delegation_result/v1` の consumer とはファイルレベルで分離） | `rg -n "delegation_audit_v1\|DELEGATION_AUDIT_LOG_PATH\|_build_delegation_audit_record" .claude/skills/gemini-cli-headless-delegation` |
 | `delegation_fanout_request_v1` | `.claude/skills/gemini-cli-headless-delegation/scripts/fan_out_orchestrator.py`（closed schema; `subtasks[]` は既存 `delegation_request_v1` をそのまま保持し、planner mode は対象外） | `build_fanout_request.py` / 呼び出し元（実装/調査 orchestration の呼び出し側） | `fan_out_orchestrator.py`（`run_fanout()` / `validate_fanout_request()`） | `rg -n "delegation_fanout_request_v1" .claude/skills/gemini-cli-headless-delegation` |
 | `delegation_fanout_result_v1` | `.claude/skills/gemini-cli-headless-delegation/scripts/fan_out_orchestrator.py`（`status: success\|partial_success\|failed\|cancelled`、`counts`、`results[]`、`failures[]`、`deduplicated_aliases` を持つ決定的な merge 結果） | `fan_out_orchestrator.py`（`run_fanout()`） | 呼び出し元（実装/調査 orchestration の呼び出し側） | `rg -n "delegation_fanout_result_v1" .claude/skills/gemini-cli-headless-delegation` |
+| `REVIEW_COMPACT_VALIDATION_RESULT_V1` | `.claude/skills/issue-refinement-loop/scripts/validate_review_compact_output.py` | validate_review_compact_output.py（`review_compact.validate` 経由で orchestrator が呼び出す） | issue-refinement-loop（Step 2/2a routing gate）、build_refinement_phase_state.py（`--review-validation-result-path` 経由の review-phase 構造的ゲート、#1507 AC24） | `rg -n "REVIEW_COMPACT_VALIDATION_RESULT_V1\|validation_status\|review_compact.validate\|review-validation-result-path" .claude/skills/issue-refinement-loop` |
 
 ## temp_residue_classification/v1 と temp_residue_owner/v1 詳細登録
 
@@ -169,6 +170,41 @@ notes:
   - "GitHub comment への raw transcript 禁止ポリシー: docs/schemas/agent-session-manifest.md#github-comment-への-raw-transcript-禁止ポリシー"
   - "phase.main_loop と phase.ledger_phase の対応表: docs/schemas/agent-session-manifest.md#main-loop-phase-と-subagent-execution-ledger-phase-の対応表"
   - "token_usage.availability: unavailable を 0 と偽装しないこと（docs/schemas/agent-session-manifest.md 参照）"
+```
+
+## REVIEW_COMPACT_VALIDATION_RESULT_V1 詳細登録
+
+```yaml
+schema_id: REVIEW_COMPACT_VALIDATION_RESULT_V1
+definition: .claude/skills/issue-refinement-loop/scripts/validate_review_compact_output.py
+related_issue: "#1507"
+producer:
+  - validate_review_compact_output.py（`review_compact.validate` registry entry, command_registry.py）
+consumer:
+  - .claude/skills/issue-refinement-loop/SKILL.md（Step 2 / Step 2a: validator-first fail-closed routing）
+  - build_refinement_phase_state.py（`--review-validation-result-path`; review phase 構造的ゲート, AC24）
+compatibility:
+  breaking_changes:
+    - validation_status の意味変更（valid/invalid の判定条件変更）
+    - envelope_kind の値集合変更
+    - normalized_payload のキー削除・rename
+    - REPLAY_VERDICT 5値 enum の値変更（reviewer_claim_replay.py との同期崩れ）
+  non_breaking_changes:
+    - violations[] への新規 code 追加
+    - artifact_path_policy への新規フィールド追加
+detection_patterns:
+  - 'REVIEW_COMPACT_VALIDATION_RESULT_V1'
+  - 'validation_status'
+  - 'review_compact.validate'
+  - 'review-validation-result-path'
+validation_commands:
+  - "uv run --locked pytest .claude/skills/issue-refinement-loop/tests/test_validate_review_compact_output.py -q"
+  - "uv run --locked pytest .claude/skills/issue-refinement-loop/tests/test_review_compact_registry_entry.py -q"
+  - "uv run --locked pytest .claude/skills/issue-refinement-loop/tests/test_refinement_phase_gate_validation_seam.py -q"
+notes:
+  - "producer-failure envelope は構文解析可能だが validation_status は常に invalid（#1165 SSOT）。"
+  - "input_sha256 / normalized_payload は format-only 検証であり provenance 証明ではない。"
+  - "ARTIFACT の issue namespace 束縛（`--issue-number`）は active issue 以外への読み違いを防ぐが、実ファイル存在確認は行わない（#1472 isolation worktree 境界）。"
 ```
 
 ## #934 public-surface boundary cleanup note（公開境界クリーンアップ注記）

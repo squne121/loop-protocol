@@ -14,6 +14,7 @@ Usage:
     [--loop-state-path <path>] \\
     [--planner-result-path <path>] \\
     [--review-result-path <path>] \\
+    [--review-validation-result-path <path>] \\
     --output-path <path>
 
 Phases:
@@ -25,6 +26,16 @@ Phases:
   decide_next_action  When decide_next_loop_action.py is the intended router
   publish             During Step 5 publish / termination
   terminate           Loop is terminated
+
+Issue #1507 AC24 (structural enforcement of the SKILL.md Step 2
+validator-first mandate): when `--phase review` and
+`--source-kind issue_review_result_compact_v1`, `--review-validation-result-path`
+is REQUIRED and must point at a REVIEW_COMPACT_VALIDATION_RESULT_V1 JSON
+file whose `validation_status` is `valid`. Any other combination of phase /
+source_kind does not require this argument (Out of Scope: this gate applies
+only to the `review` phase, not `post_rewrite_check` / `decide_next_action`,
+which also accept `issue_review_result_compact_v1` per
+`_SOURCE_KIND_ALLOWED_PHASES`).
 
 Output:
   Writes ISSUE_REFINEMENT_PHASE_STATE_V1 JSON to --output-path.
@@ -75,6 +86,13 @@ _SOURCE_KIND_ALLOWED_PHASES: dict[str, list[str]] = {
 # phases that require loop_state_path or review_result_path
 _PHASES_REQUIRING_LOOP_STATE = ["post_rewrite_check", "decide_next_action"]
 _PHASES_REQUIRING_REVIEW_RESULT = ["review", "post_rewrite_check", "decide_next_action"]
+
+# Issue #1507 AC24: the review-phase validator-first gate applies ONLY to
+# this exact (phase, source_kind) pair, per the Issue's Out of Scope note
+# (the gate is not extended to post_rewrite_check / decide_next_action, nor
+# to any other phase).
+_REVIEW_VALIDATION_GATED_PHASE = "review"
+_REVIEW_VALIDATION_GATED_SOURCE_KIND = "issue_review_result_compact_v1"
 
 # Router name constants
 ROUTER_DECIDE_NEXT_LOOP_ACTION = "decide_next_loop_action.py"
@@ -217,6 +235,58 @@ def _validate_json_input(path: str | None, *, label: str) -> None:
         raise ValueError(f"{label} strict json validation error: {exc}") from exc
 
 
+def _validate_review_validation_gate(
+    phase: str,
+    source_kind: str,
+    review_validation_result_path: Optional[str],
+) -> None:
+    """Issue #1507 AC24: structural enforcement of the SKILL.md Step 2
+    validator-first mandate for the review phase.
+
+    Raises ValueError (fail-closed, no phase-state file written) when:
+      - the gate applies (phase == "review" and
+        source_kind == "issue_review_result_compact_v1") but
+        --review-validation-result-path was not supplied
+      - the referenced file does not exist / is not valid JSON
+      - the referenced file's validation_status is not "valid"
+    """
+    gate_applies = (
+        phase == _REVIEW_VALIDATION_GATED_PHASE
+        and source_kind == _REVIEW_VALIDATION_GATED_SOURCE_KIND
+    )
+    if not gate_applies:
+        return
+
+    if not review_validation_result_path:
+        raise ValueError(
+            "--review-validation-result-path is required when --phase review "
+            "and --source-kind issue_review_result_compact_v1 "
+            "(Issue #1507 AC24 structural validator-first gate)"
+        )
+
+    try:
+        validation_payload = _strict_json_loads(
+            Path(review_validation_result_path).read_text(encoding="utf-8")
+        )
+    except FileNotFoundError as exc:
+        raise ValueError(
+            f"review_validation_result_path not found: {review_validation_result_path}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"review_validation_result_path json decode error: {exc}"
+        ) from exc
+
+    validation_status = validation_payload.get("validation_status")
+    if validation_status != "valid":
+        raise ValueError(
+            "review_validation_result_path validation_status must be 'valid', "
+            f"got {validation_status!r} "
+            "(Issue #1507 AC24 fail-closed review-phase gate; "
+            "phase-state was NOT generated)"
+        )
+
+
 def build_phase_state(
     phase: str,
     source_kind: str,
@@ -224,12 +294,14 @@ def build_phase_state(
     loop_state_path: Optional[str] = None,
     planner_result_path: Optional[str] = None,
     review_result_path: Optional[str] = None,
+    review_validation_result_path: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Build ISSUE_REFINEMENT_PHASE_STATE_V1.
 
     Raises ValueError for invalid inputs (unknown phase, missing source_path,
-    source_kind/phase inconsistency, missing required paths).
+    source_kind/phase inconsistency, missing required paths, review-phase
+    validator-gate violations per AC24).
 
     NOTE: scope_signal_guard.hard_stop_eligible は現在 phase のみで決定される。
     signal_origin（existing_issue_body / rewrite_delta / review_delta）による
@@ -258,6 +330,12 @@ def build_phase_state(
             f"Allowed phases for this source_kind: {allowed_phases_for_kind}"
         )
 
+    # Issue #1507 AC24: review-phase validator-first structural gate.
+    # Raises ValueError (fail-closed) BEFORE the phase-state dict is built,
+    # so no output is ever written for a missing/invalid/non-valid
+    # validation result.
+    _validate_review_validation_gate(phase, source_kind, review_validation_result_path)
+
     return {
         "schema_version": "ISSUE_REFINEMENT_PHASE_STATE_V1",
         "phase": phase,
@@ -268,6 +346,7 @@ def build_phase_state(
         "loop_state_path": loop_state_path,
         "planner_result_path": planner_result_path,
         "review_result_path": review_result_path,
+        "review_validation_result_path": review_validation_result_path,
         "allowed_routers": list(rules["allowed_routers"]),
         "forbidden_routers": list(rules["forbidden_routers"]),
         "scope_signal_semantics": dict(rules["scope_signal_semantics"]),
@@ -311,6 +390,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Path to the ISSUE_REVIEW_RESULT_COMPACT_V1 artifact (optional).",
     )
     parser.add_argument(
+        "--review-validation-result-path",
+        default=None,
+        help="Path to the REVIEW_COMPACT_VALIDATION_RESULT_V1 JSON file. "
+        "Required (and must have validation_status: valid) when --phase review "
+        "and --source-kind issue_review_result_compact_v1 (Issue #1507 AC24).",
+    )
+    parser.add_argument(
         "--output-path",
         required=True,
         help="Path to write the ISSUE_REFINEMENT_PHASE_STATE_V1 JSON.",
@@ -329,6 +415,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             loop_state_path=args.loop_state_path,
             planner_result_path=args.planner_result_path,
             review_result_path=args.review_result_path,
+            review_validation_result_path=args.review_validation_result_path,
         )
     except ValueError as e:
         print("STATUS: error")

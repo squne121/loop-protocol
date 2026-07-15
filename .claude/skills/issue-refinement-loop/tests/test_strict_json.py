@@ -36,6 +36,12 @@ def test_build_refinement_phase_state_rejects_nan_on_write(tmp_path, monkeypatch
                 str(source_path),
                 "--review-result-path",
                 str(source_path),
+                # Issue #1507 AC24: review + issue_review_result_compact_v1 now
+                # requires --review-validation-result-path. build_phase_state
+                # itself is monkeypatched away above, so this argument only
+                # needs to satisfy argparse; its content is never consulted.
+                "--review-validation-result-path",
+                str(source_path),
                 "--output-path",
                 str(output_path),
             ]
@@ -46,7 +52,11 @@ def test_build_refinement_phase_state_cli_writes_strict_json(tmp_path):
     """GIVEN normal CLI usage WHEN output written THEN file contains parseable strict JSON."""
     source_path = tmp_path / "source.json"
     output_path = tmp_path / "phase_state.json"
+    validation_path = tmp_path / "validation.json"
     source_path.write_text("{}", encoding="utf-8")
+    validation_path.write_text(
+        json.dumps({"validation_status": "valid"}), encoding="utf-8"
+    )
 
     proc = subprocess.run(
         [
@@ -60,6 +70,10 @@ def test_build_refinement_phase_state_cli_writes_strict_json(tmp_path):
             str(source_path),
             "--review-result-path",
             str(source_path),
+            # Issue #1507 AC24: required for --phase review +
+            # --source-kind issue_review_result_compact_v1.
+            "--review-validation-result-path",
+            str(validation_path),
             "--output-path",
             str(output_path),
         ],
