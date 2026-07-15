@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WRITER_SOURCE = ROOT / "scripts" / "subagent-launch-ledger-writer.c"
 HOOK = ROOT / "scripts" / "check-codex-agents.mjs"
 VALIDATOR = ROOT / "scripts" / "check_subagent_launch_ledger.py"
+PYTHON_TEST_PLAN = ROOT / ".github" / "ci" / "python-test-plan.json"
 
 
 def build_writer(tmp_path: Path) -> Path:
@@ -192,3 +193,12 @@ def test_ssot_documents_native_writer_boundary():
     text = (ROOT / "docs/dev/agent-skill-boundaries.md").read_text(encoding="utf-8")
     assert "subagent-launch-ledger-writer.c" in text
     assert "hostile process" in text
+
+
+def test_ci_test_selection_plan_includes_writer_test_once():
+    plan = json.loads(PYTHON_TEST_PLAN.read_text(encoding="utf-8"))
+    targets = plan["targets"]
+    assert targets.count("tests/test_subagent_launch_ledger_writer.py") == 1
+    assert targets.index("tests/test_subagent_launch_ledger_writer.py") == (
+        targets.index("tests/test_subagent_launch_ledger.py") + 1
+    )
