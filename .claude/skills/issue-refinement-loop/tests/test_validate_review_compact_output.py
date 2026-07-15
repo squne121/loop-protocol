@@ -41,6 +41,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 from validate_review_compact_output import (  # noqa: E402
     build_result,
     validate_review_compact_output,
+    validate_review_compact_output_v2,
 )
 
 VALIDATOR_PATH = SCRIPTS_DIR / "validate_review_compact_output.py"
@@ -882,3 +883,104 @@ class TestProducerOutputMutationTesting:
         result = validate_review_compact_output("\n".join(mutated), issue_number=1507)
         assert result["validation_status"] == "invalid"
         assert "artifact_issue_number_mismatch" in {v["code"] for v in result["violations"]}
+
+
+# ---------------------------------------------------------------------------
+# Issue #1532 (V2): parent-owned replay binding envelope
+# ---------------------------------------------------------------------------
+
+
+def _v2_needs_fix_envelope(
+    *,
+    replay_next_state: str = '{"schema":"REVIEWER_CLAIM_REPLAY_STATE_V2"}',
+    replay_parent_binding_digest: str | None = None,
+    **kwargs,
+) -> str:
+    replay_parent_binding_digest = replay_parent_binding_digest or f"sha256:{_fake_sha256('parent-binding')}"
+    base = _needs_fix_envelope(**kwargs)
+    extra = [
+        f"REPLAY_NEXT_STATE: {replay_next_state}",
+        f"REPLAY_PARENT_BINDING_DIGEST: {replay_parent_binding_digest}",
+    ]
+    return base + "\n" + "\n".join(extra)
+
+
+class TestV2ParentBindingEnvelope:
+    """GIVEN an ISSUE_REVIEW_RESULT_COMPACT_V2 needs-fix envelope THEN the
+    V2 validator accepts the exact 15-line grammar and fails closed on any
+    tamper of the parent-owned fields (Issue #1532 AC4)."""
+
+    def test_valid_v2_envelope_is_accepted(self):
+        envelope = _v2_needs_fix_envelope()
+        result = validate_review_compact_output_v2(envelope, issue_number=1507)
+        assert result["validation_status"] == "valid"
+        assert result["envelope_kind"] == "needs_fix_v2"
+        assert "REPLAY_NEXT_STATE" in result["normalized_payload"]
+        assert "REPLAY_PARENT_BINDING_DIGEST" in result["normalized_payload"]
+
+    def test_v1_envelopes_are_unaffected_by_v2_validator(self):
+        """GIVEN a plain V1 approve envelope THEN validate_review_compact_output_v2
+        delegates to the V1 result unchanged (V2 is purely additive)."""
+        envelope = _approve_envelope()
+        v1_result = validate_review_compact_output(envelope, issue_number=1507)
+        v2_result = validate_review_compact_output_v2(envelope, issue_number=1507)
+        assert v2_result == v1_result
+
+    def test_tampered_parent_binding_digest_fails_closed(self):
+        envelope = _v2_needs_fix_envelope()
+        result = validate_review_compact_output_v2(
+            envelope,
+            issue_number=1507,
+            expected_parent_binding_digest=f"sha256:{_fake_sha256('a-different-value')}",
+        )
+        assert result["validation_status"] == "invalid"
+        assert result["next_action"] == "human_judgment_required"
+        assert "replay_parent_binding_digest_mismatch" in {v["code"] for v in result["violations"]}
+
+    def test_tampered_replay_next_state_fails_closed(self):
+        envelope = _v2_needs_fix_envelope()
+        result = validate_review_compact_output_v2(
+            envelope,
+            issue_number=1507,
+            expected_replay_next_state='{"schema":"different"}',
+        )
+        assert result["validation_status"] == "invalid"
+        assert "replay_next_state_mismatch" in {v["code"] for v in result["violations"]}
+
+    def test_malformed_replay_next_state_json_fails_closed(self):
+        envelope = _v2_needs_fix_envelope(replay_next_state="not-json{{")
+        result = validate_review_compact_output_v2(envelope, issue_number=1507)
+        assert result["validation_status"] == "invalid"
+        assert "replay_next_state_invalid_json" in {v["code"] for v in result["violations"]}
+
+    def test_malformed_parent_binding_digest_format_fails_closed(self):
+        envelope = _v2_needs_fix_envelope(replay_parent_binding_digest="not-a-digest")
+        result = validate_review_compact_output_v2(envelope, issue_number=1507)
+        assert result["validation_status"] == "invalid"
+        assert "replay_parent_binding_digest_invalid_format" in {v["code"] for v in result["violations"]}
+
+    def test_missing_v2_field_falls_back_to_unknown(self):
+        """Dropping REPLAY_PARENT_BINDING_DIGEST leaves a 14-line sequence
+        that matches neither the V1 13-line needs-fix template nor the V2
+        15-line template -- fail-closed to unknown/invalid, never silently
+        accepted as V1."""
+        envelope = _v2_needs_fix_envelope()
+        lines = envelope.split("\n")[:-1]  # drop REPLAY_PARENT_BINDING_DIGEST
+        result = validate_review_compact_output_v2("\n".join(lines), issue_number=1507)
+        assert result["validation_status"] == "invalid"
+        assert result["envelope_kind"] == "unknown"
+
+    def test_expected_values_matching_the_envelope_pass(self):
+        next_state = '{"schema":"REVIEWER_CLAIM_REPLAY_STATE_V2","consecutive_unbacked_count":0}'
+        digest = f"sha256:{_fake_sha256('exact-match')}"
+        envelope = _v2_needs_fix_envelope(
+            replay_next_state=next_state,
+            replay_parent_binding_digest=digest,
+        )
+        result = validate_review_compact_output_v2(
+            envelope,
+            issue_number=1507,
+            expected_replay_next_state=next_state,
+            expected_parent_binding_digest=digest,
+        )
+        assert result["validation_status"] == "valid"

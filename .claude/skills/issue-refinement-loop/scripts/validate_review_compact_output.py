@@ -697,6 +697,204 @@ def validate_review_compact_output(
     }
 
 
+# ---------------------------------------------------------------------------
+# V2: parent-owned replay binding (Issue #1532)
+# ---------------------------------------------------------------------------
+#
+# ISSUE_REVIEW_RESULT_COMPACT_V2 / REVIEW_COMPACT_VALIDATION_RESULT_V2.
+#
+# V2 is assembled by the ORCHESTRATOR (parent), not the child SubAgent: the
+# parent takes the child's already-V1-valid needs-fix envelope text
+# (REPLAY_VERDICT / REPLAY_ROUTING / REPLAY_SHOULD_CONSUME /
+# REPLAY_BODY_SHA256 / REPLAY_ARTIFACT_DIGEST remain the CHILD's bounded
+# claim / stdout digest -- meaning UNCHANGED from V1, Issue #1507 / #1519 --
+# AC1) and appends two parent-owned lines it computed itself via
+# `parent_replay_binding.py` (never trusting a raw child artifact or raw
+# `REPLAY_*` value as a parent replay INPUT -- AC2):
+#
+#   REPLAY_NEXT_STATE            canonical single-line JSON (`REPLAY_NEXT_STATE`
+#                                 state store persistence target -- previously
+#                                 outside the validated grammar entirely)
+#   REPLAY_PARENT_BINDING_DIGEST `sha256:<hex>` -- the parent's own
+#                                 `PARENT_REPLAY_BINDING_ARTIFACT_V1.binding_digest`,
+#                                 DISTINCT in meaning from `REPLAY_ARTIFACT_DIGEST`
+#
+# The approve envelope grammar is unchanged in V2 -- no replay fields are
+# ever produced for `verdict: approve`.
+
+NEEDS_FIX_FIELDS_V2: list[str] = NEEDS_FIX_FIELDS + [
+    "REPLAY_NEXT_STATE",
+    "REPLAY_PARENT_BINDING_DIGEST",
+]
+
+ALL_KNOWN_FIELDS_V2: frozenset[str] = ALL_KNOWN_FIELDS | frozenset(NEEDS_FIX_FIELDS_V2)
+
+
+def _reject_nonfinite_json_v2(token: str) -> None:
+    raise ValueError(f"Non-finite JSON constant rejected: {token}")
+
+
+def _parse_lines_v2(
+    lines: list[str],
+) -> tuple[list[str], dict[str, str], list[dict[str, Any]]]:
+    """Same grammar as `_parse_lines`, but the known-field set additionally
+    includes the two V2-only fields (`REPLAY_NEXT_STATE` /
+    `REPLAY_PARENT_BINDING_DIGEST`) so a genuine 15-line V2 envelope is not
+    rejected as `unknown_field`. V1 envelopes are entirely unaffected --
+    those two field names never appear in valid V1 input."""
+    ordered_keys: list[str] = []
+    field_values: dict[str, str] = {}
+    violations: list[dict[str, Any]] = []
+
+    for index, line in enumerate(lines):
+        if line == "":
+            violations.append(_violation("blank_line_detected", line_index=index))
+            continue
+        if "```" in line:
+            violations.append(_violation("code_fence_detected", line_index=index))
+            continue
+        match = _FIELD_LINE_RE.match(line)
+        if match is None:
+            if index == 0:
+                code = "prose_prefix"
+            elif index == len(lines) - 1:
+                code = "prose_suffix"
+            else:
+                code = "malformed_line"
+            violations.append(_violation(code, line_index=index, line=line))
+            continue
+        key = match.group("key")
+        value = match.group("value")
+        if key not in ALL_KNOWN_FIELDS_V2:
+            violations.append(_violation("unknown_field", field=key, line_index=index))
+            continue
+        if value != value.strip():
+            violations.append(_violation("value_whitespace_violation", field=key, value=value))
+        if key in field_values:
+            violations.append(_violation("duplicate_field", field=key, line_index=index))
+            continue
+        ordered_keys.append(key)
+        field_values[key] = value
+
+    return ordered_keys, field_values, violations
+
+
+def validate_review_compact_output_v2(
+    raw_text: str,
+    *,
+    issue_number: int | None = None,
+    expected_replay_next_state: str | None = None,
+    expected_parent_binding_digest: str | None = None,
+) -> dict[str, Any]:
+    """Validate an ISSUE_REVIEW_RESULT_COMPACT_V2 envelope.
+
+    Delegates to `validate_review_compact_output` (V1 grammar) first: any
+    exact V1 match (approve / needs_fix / producer_failure) is returned
+    UNCHANGED (V1 callers and V1-shaped input are entirely unaffected by
+    V2's existence). Only input that does NOT match any V1 template
+    (`envelope_kind == "unknown"`) is re-parsed against the 15-line V2
+    needs-fix grammar.
+
+    `expected_replay_next_state` / `expected_parent_binding_digest`, when
+    supplied, are the CALLER's own independently-computed values (from the
+    SAME `parent_replay_binding.py` invocation used to build the envelope)
+    -- never derived from the envelope text itself. A mismatch is tamper
+    evidence and fails closed to `human_judgment_required`, exactly like
+    every other violation in this module (AC4).
+    """
+    v1_result = validate_review_compact_output(raw_text, issue_number=issue_number)
+    if v1_result["envelope_kind"] != "unknown":
+        return v1_result
+
+    control_violations = _scan_control_chars(raw_text)
+    lines = _split_lines(raw_text)
+    ordered_keys, fields, structural_violations = _parse_lines_v2(lines)
+    violations: list[dict[str, Any]] = list(control_violations) + list(structural_violations)
+
+    has_malformed_line = any(
+        v["code"] in {"prose_prefix", "prose_suffix", "malformed_line", "unknown_field", "duplicate_field"}
+        for v in structural_violations
+    )
+
+    if has_malformed_line or ordered_keys != NEEDS_FIX_FIELDS_V2:
+        violations.append(_violation("v2_envelope_shape_invalid"))
+        return {
+            "validation_status": "invalid",
+            "envelope_kind": "unknown",
+            "normalized_payload": None,
+            "violations": violations,
+            "next_action": "human_judgment_required",
+            "artifact_path_policy": {"status": "not_applicable", "path": None},
+        }
+
+    value_violations = _validate_needs_fix_values(fields, issue_number=issue_number)
+
+    replay_next_state_raw = fields.get("REPLAY_NEXT_STATE", "")
+    try:
+        json.loads(replay_next_state_raw, parse_constant=_reject_nonfinite_json_v2)
+    except (ValueError, json.JSONDecodeError):
+        value_violations.append(
+            _violation("replay_next_state_invalid_json", value=replay_next_state_raw)
+        )
+
+    replay_parent_binding_digest = fields.get("REPLAY_PARENT_BINDING_DIGEST", "")
+    if not _SHA256_PREFIXED_RE.match(replay_parent_binding_digest):
+        value_violations.append(
+            _violation(
+                "replay_parent_binding_digest_invalid_format",
+                value=replay_parent_binding_digest,
+            )
+        )
+
+    if expected_replay_next_state is not None and replay_next_state_raw != expected_replay_next_state:
+        value_violations.append(
+            _violation(
+                "replay_next_state_mismatch",
+                value=replay_next_state_raw,
+                expected=expected_replay_next_state,
+            )
+        )
+    if (
+        expected_parent_binding_digest is not None
+        and replay_parent_binding_digest != expected_parent_binding_digest
+    ):
+        value_violations.append(
+            _violation(
+                "replay_parent_binding_digest_mismatch",
+                value=replay_parent_binding_digest,
+                expected=expected_parent_binding_digest,
+            )
+        )
+
+    violations.extend(value_violations)
+
+    artifact_value = fields.get("ARTIFACT")
+    artifact_policy_status = (
+        "invalid"
+        if any(v.get("field") == "ARTIFACT" for v in value_violations)
+        else "valid"
+    )
+
+    if violations:
+        return {
+            "validation_status": "invalid",
+            "envelope_kind": "needs_fix_v2",
+            "normalized_payload": None,
+            "violations": violations,
+            "next_action": "human_judgment_required",
+            "artifact_path_policy": {"status": artifact_policy_status, "path": artifact_value},
+        }
+
+    return {
+        "validation_status": "valid",
+        "envelope_kind": "needs_fix_v2",
+        "normalized_payload": dict(fields),
+        "violations": [],
+        "next_action": fields["NEXT_ACTION"],
+        "artifact_path_policy": {"status": "valid", "path": artifact_value},
+    }
+
+
 def build_result(raw_bytes: bytes, *, issue_number: int | None = None) -> tuple[dict[str, Any], int]:
     """Build the full REVIEW_COMPACT_VALIDATION_RESULT_V1 payload + exit code."""
     input_sha256 = hashlib.sha256(raw_bytes).hexdigest()

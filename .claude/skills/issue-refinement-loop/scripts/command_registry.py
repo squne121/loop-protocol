@@ -372,6 +372,43 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "issue_number": {"type": "positive_int", "required": True},
         },
     },
+    # Issue #1532: parent-owned replay binding V2. The orchestrator is the
+    # SOLE caller -- it supplies its own review/readiness/checker inventory
+    # files (never a child isolation worktree's raw artifact) and replays
+    # `reviewer_claim_replay.analyze()` in-process to derive
+    # PARENT_REPLAY_BINDING_ARTIFACT_V1 (REPLAY_NEXT_STATE + binding_digest,
+    # surfaced as REPLAY_PARENT_BINDING_DIGEST -- distinct from the child
+    # stdout REPLAY_ARTIFACT_DIGEST, #1507/#1519).
+    "parent_replay.bind": {
+        "id": "parent_replay.bind",
+        "argv": [
+            "uv", "run", "--locked", "--offline", "--no-sync", "python3",
+            f"{_SKILL_PREFIX}/parent_replay_binding.py",
+            "--review-result-file", "{review_result_file}",
+            "--readiness-result-file", "{readiness_result_file}",
+            "--previous-state-inline", "{previous_state_inline}",
+            "--repository-full-name", "{repo}",
+            "--issue-number", "{issue_number}",
+            "--refinement-session-id", "{refinement_session_id}",
+            "--iteration-id", "{iteration_id}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "stdin_contract": "none",
+        "stdout_contract": "parent_replay_binding_artifact/v1",
+        "timeout_seconds": 30,
+        "mutation": False,
+        "network_effect": "local_only",
+        "placeholders": {
+            "review_result_file": {"type": "repo_relative_file", "required": True},
+            "readiness_result_file": {"type": "repo_relative_file", "required": True},
+            "previous_state_inline": {"type": "string", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "issue_number": {"type": "positive_int", "required": True},
+            "refinement_session_id": {"type": "string", "required": True},
+            "iteration_id": {"type": "string", "required": True},
+        },
+    },
 }
 
 # ---------------------------------------------------------------------------

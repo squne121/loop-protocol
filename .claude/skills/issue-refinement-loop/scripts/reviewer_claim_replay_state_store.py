@@ -244,27 +244,143 @@ def write_state(*, state_dir: Path, next_state: dict[str, Any]) -> dict[str, Any
     return _result("write", "ok", state=next_state)
 
 
+def write_state_v2_from_validated_payload(
+    *, state_dir: Path, validation_result_v2: dict[str, Any]
+) -> dict[str, Any]:
+    """Issue #1532 AC5: the ONLY V2 write path.
+
+    `validation_result_v2` MUST be a REVIEW_COMPACT_VALIDATION_RESULT_V2-
+    shaped payload (as produced by
+    `validate_review_compact_output.validate_review_compact_output_v2`).
+    `REPLAY_NEXT_STATE` is persisted IF AND ONLY IF
+    `validation_result_v2["validation_status"] == "valid"` -- raw child
+    stdout, an invalid validation result, or a binding-digest mismatch
+    NEVER reach `write_state()`. This is the sole enforcement point that
+    prevents an unvalidated (or tampered) `REPLAY_NEXT_STATE` claim from
+    ever being persisted (Issue #1532 Remaining Parent Gap: previously
+    `REPLAY_NEXT_STATE` was outside the validated grammar entirely and
+    was written directly from raw child stdout)."""
+    if validation_result_v2.get("validation_status") != "valid":
+        return _result(
+            "write_v2",
+            "rejected",
+            error=(
+                "REPLAY_NEXT_STATE not persisted: validation_status is not "
+                f"'valid' ({validation_result_v2.get('validation_status')!r})"
+            ),
+        )
+
+    normalized_payload = validation_result_v2.get("normalized_payload")
+    if not isinstance(normalized_payload, dict) or "REPLAY_NEXT_STATE" not in normalized_payload:
+        return _result(
+            "write_v2",
+            "rejected",
+            error="normalized_payload missing REPLAY_NEXT_STATE",
+        )
+
+    try:
+        next_state = _strict_json_loads(normalized_payload["REPLAY_NEXT_STATE"])
+    except (ValueError, json.JSONDecodeError) as exc:
+        return _result(
+            "write_v2",
+            "rejected",
+            error=f"REPLAY_NEXT_STATE is not valid JSON: {exc}",
+        )
+    if not isinstance(next_state, dict):
+        return _result("write_v2", "rejected", error="REPLAY_NEXT_STATE must be a JSON object")
+
+    result = write_state(state_dir=state_dir, next_state=next_state)
+    result["operation"] = "write_v2"
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Orchestrator-owned atomic read/write for REVIEWER_CLAIM_REPLAY_STATE_V2"
     )
     parser.add_argument("--read", action="store_true")
     parser.add_argument("--write", action="store_true")
+    parser.add_argument(
+        "--write-v2",
+        action="store_true",
+        help=(
+            "Issue #1532: write REPLAY_NEXT_STATE only if the supplied "
+            "REVIEW_COMPACT_VALIDATION_RESULT_V2 (--validation-result-v2-inline) "
+            "has validation_status: valid."
+        ),
+    )
     parser.add_argument("--state-dir")
     parser.add_argument("--repository-full-name")
     parser.add_argument("--issue-number", type=int)
     parser.add_argument("--refinement-session-id")
     parser.add_argument("--next-state-inline")
+    parser.add_argument("--validation-result-v2-inline")
     args = parser.parse_args()
 
-    if args.read == args.write:
+    mode_count = sum([args.read, args.write, args.write_v2])
+    if mode_count != 1:
         print(
             _strict_json_dumps(
-                _result("unknown", "error", error="exactly one of --read or --write is required")
+                _result(
+                    "unknown",
+                    "error",
+                    error="exactly one of --read, --write, or --write-v2 is required",
+                )
             ),
             flush=True,
         )
         return 1
+
+    if args.write_v2:
+        if not args.state_dir:
+            print(
+                _strict_json_dumps(_result("write_v2", "error", error="--state-dir is required")),
+                flush=True,
+            )
+            return 1
+        if not args.validation_result_v2_inline:
+            print(
+                _strict_json_dumps(
+                    _result(
+                        "write_v2",
+                        "error",
+                        error="--validation-result-v2-inline is required",
+                    )
+                ),
+                flush=True,
+            )
+            return 1
+        try:
+            validation_result_v2 = _strict_json_loads(args.validation_result_v2_inline)
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(
+                _strict_json_dumps(
+                    _result(
+                        "write_v2",
+                        "error",
+                        error=f"invalid --validation-result-v2-inline JSON: {exc}",
+                    )
+                ),
+                flush=True,
+            )
+            return 1
+        if not isinstance(validation_result_v2, dict):
+            print(
+                _strict_json_dumps(
+                    _result(
+                        "write_v2",
+                        "error",
+                        error="--validation-result-v2-inline must be a JSON object",
+                    )
+                ),
+                flush=True,
+            )
+            return 1
+        result = write_state_v2_from_validated_payload(
+            state_dir=Path(args.state_dir), validation_result_v2=validation_result_v2
+        )
+        print(_strict_json_dumps(result), flush=True)
+        return 0 if result["status"] == "ok" else 1
 
     if not args.state_dir:
         print(

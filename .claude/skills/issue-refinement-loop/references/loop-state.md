@@ -238,6 +238,21 @@ state_contract:
 
 identity（`repository_full_name`/`issue_number`/`refinement_session_id`/`body_sha256`）のいずれかが不一致の場合、state store は空 state（`reset_reason` 付き）を返す。これはエラーではなく、fresh session として consecutive count を 1 から数え直すための正常系である。
 
+### read → invoke → write フロー V2（parent-owned replay binding, Issue #1532）
+
+上記 read→invoke→write フローの step 2/3（`REPLAY_NEXT_STATE` を child stdout からそのまま `--write` する）は、child self-claim を provenance と誤認しうる残余リスクである。V2 では invoke と write の間に以下を挿む:
+
+1. **parent replay**: orchestrator が `parent_replay_binding.py` に自ら取得・保存・readback した `review_result` / `readiness_result` / `vc_syntax_result` / `vc_preflight_result` / `previous_state` / identity を渡し、`PARENT_REPLAY_BINDING_ARTIFACT_V1`（`replay_next_state` + `binding_digest`）を得る。child の raw artifact ファイルは読まない。
+2. **V2 envelope 組み立て**: orchestrator が child の V1-valid needs-fix envelope に `REPLAY_NEXT_STATE`（canonical 1 行 JSON）と `REPLAY_PARENT_BINDING_DIGEST`（`binding_digest`）を追記する。
+3. **V2 validate**: `validate_review_compact_output_v2()` が `expected_replay_next_state` / `expected_parent_binding_digest`（step 1 の値）と envelope の値を exact 照合する。不一致は `human_judgment_required`。
+4. **write-v2**（`validation_status: valid` の場合のみ）:
+   ```bash
+   uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/reviewer_claim_replay_state_store.py \
+     --write-v2 --state-dir .claude/artifacts/issue-refinement-loop/<issue_number> \
+     --validation-result-v2-inline '<REVIEW_COMPACT_VALIDATION_RESULT_V2 の JSON>'
+   ```
+   `validation_status` が `valid` でない場合、または `normalized_payload.REPLAY_NEXT_STATE` が欠落・不正 JSON の場合、`write_state_v2_from_validated_payload()` は state file を一切更新せず `status: rejected` を返す。
+
 ## scope_signal_guard_decision_v2（build_loop_state.py の envelope pass-through 拡張フィールド, #1090）
 
 `build_loop_state.py` は `plan['scope_signal_guard_decision_v2']`（#1090, opt-in。

@@ -115,6 +115,8 @@ REPLAY_ARTIFACT_DIGEST: <reviewer_claim_replay.py stdout JSON 全体の sha256>
 
 `REPLAY_ARTIFACT_DIGEST` は `reviewer_claim_replay.py` の stdout に含まれるフィールドではなく、本 SubAgent が pass-through 前に stdout JSON 全体へ `sha256sum` を適用して算出する tamper-evidence 用の digest である。orchestrator はこの digest を artifact の再取得なしで整合性確認に使える。
 
+**Provenance boundary（Issue #1532）**: 上記 `REPLAY_*` 全フィールド（`REPLAY_NEXT_STATE` を含む）は、本 SubAgent が isolation worktree 内で自ら再計算した結果であり **bounded な reviewer claim** に過ぎない。orchestrator はこの claim を provenance の正本として直接信用してはならない。orchestrator（parent）は `parent_replay_binding.py` を使い、自ら取得・保存・readback した parent-owned inventory（child が渡した `review_result` を含む入力群）から独立に `reviewer_claim_replay.analyze()` を再実行し、`REPLAY_PARENT_BINDING_DIGEST`（`PARENT_REPLAY_BINDING_ARTIFACT_V1.binding_digest`）で束縛した `ISSUE_REVIEW_RESULT_COMPACT_V2` を自ら組み立てる。本 SubAgent 自身が `REPLAY_PARENT_BINDING_DIGEST` を計算・出力することはない（parent-only field）。
+
 `VERDICT: approve` の場合は `reviewer_claim_replay.py` を実行せず、`REPLAY_*` フィールドは stdout に含めない。
 
 `REPLAY_*` フィールドも `ISSUE_REVIEW_RESULT_COMPACT_V1` stdout と同一の 2048 UTF-8 byte budget の内側に収める（OUTPUT_BUDGET_V1 参照）。
