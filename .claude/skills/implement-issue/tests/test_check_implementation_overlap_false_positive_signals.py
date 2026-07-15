@@ -19,6 +19,7 @@ from check_issue_overlap import (  # noqa: E402
     SOURCE_OK,
     classify_path_scope_kind,
     gh_search_candidates,
+    paths_conflict,
 )
 
 
@@ -79,6 +80,106 @@ def _run(tmp_path: Path, current_body: str, candidate_body: str) -> dict[str, ob
     return json.loads(result.stdout)
 
 
+# GitHub readback on 2026-07-15.  These are deliberately literal test inputs:
+# the body digest assertions below must fail if the fixture drifts.
+ISSUE_1283_CURRENT = """## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+parent_issue: \"#1176\"
+goal_ref: \"M4 Upgrade Loop の runtime / E2E evidence を追加する\"
+change_kind: mixed
+```
+
+## Outcome
+
+Playwright E2E と必要最小限の observability hook が追加され、upgrade 購入後の `weaponPower` 永続化と next-sortie projectile damage 反映、および preview / E2E storage namespace 分離が証跡付きで再現できる状態。
+
+## In Scope
+
+- `tests/e2e/m4-upgrade-loop.spec.ts` の追加
+- `tests/e2e/m4-preview-namespace.spec.ts` の追加
+- `playwright.config.ts`
+- `package.json`
+- E2E typecheck
+
+## Acceptance Criteria
+
+- [ ] AC1: E2E 専用 key を seed できる
+- [ ] AC13: full `pnpm test:e2e` が PASS する
+
+## Allowed Paths
+
+- tests/e2e/m4-upgrade-loop.spec.ts
+- tests/e2e/m4-preview-namespace.spec.ts
+- playwright.config.ts
+- package.json
+"""
+
+ISSUE_198_CANDIDATE = """## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+parent_issue: \"#171\"
+goal_ref: \"SSOT registry を generated.yml に移行する\"
+change_kind: code
+```
+
+## Outcome
+
+各 SSOT 文書に YAML Frontmatter が追加され、`generate-ssot-registry.sh` の実行により `docs/ssot-registry.generated.yml` が生成される状態。
+
+## In Scope
+
+- `.claude/skills/ssot-discovery/scripts/generate-ssot-registry.sh`
+- `package.json` への `ssot:generate` / `ssot:check` npm script 追加
+
+## Acceptance Criteria
+
+- [ ] AC1: SSOT 文書に YAML Frontmatter が存在する
+
+## Allowed Paths
+
+- .claude/skills/ssot-discovery/scripts/generate-ssot-registry.sh
+- package.json
+"""
+
+ISSUE_1326_CANDIDATE = """## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+parent_issue: \"#1260\"
+goal_ref: \"cloud_pilot_success_contract_v1 を fail-closed に検証する\"
+change_kind: code
+```
+
+## Outcome
+
+cloud_pilot_success_contract_v1 checker・schema・negative fixture を実装し、pnpm test が全件 PASS する状態。
+
+## In Scope
+
+- `scripts/check-cloud-pilot-success-contract.mjs`
+- `package.json` に checker 実行用の script エントリを追加する
+
+## Acceptance Criteria
+
+- [ ] AC1: checker が存在する
+
+## Allowed Paths
+
+- scripts/check-cloud-pilot-success-contract.mjs
+- package.json
+"""
+
+ISSUE_1283_GOLDEN_SHA256 = "sha256:91161f3b8271a8830848e75c219ec0a400c6e038464ca41bf5503f2a4f3903ab"
+ISSUE_198_GOLDEN_SHA256 = "sha256:450a9523e45ab948a83f792729fb9e09014bd2bb36f5dfea1c4fbaefd9b2ce77"
+ISSUE_1326_GOLDEN_SHA256 = "sha256:4b5a1388e96731c3bc4ab354b34a919e364a7bcc27a895e2ed15eed2757c24da"
+
+
 def test_exact_file_kind(tmp_path: Path) -> None:
     assert [classify_path_scope_kind(name) for name in ("README", "LICENSE", "Dockerfile", "Makefile")] == [
         PathScopeKind.EXACT
@@ -91,21 +192,44 @@ def test_exact_file_kind(tmp_path: Path) -> None:
 def test_package_json_weak(tmp_path: Path) -> None:
     payload = _run(
         tmp_path,
-        _body(outcome="alpha", scope="alpha", allowed_paths=["package.json"]),
-        _body(outcome="beta", scope="beta", allowed_paths=["package.json"]),
+        ISSUE_198_CANDIDATE,
+        ISSUE_1326_CANDIDATE,
     )
+    candidate = payload["candidates"][0]
     assert payload["route"] == "proceed_with_collision_evidence"
-    assert "low_specificity_path_only" in payload["candidates"][0]["reasons"]
+    assert candidate["heading_overlap"] is False
+    assert candidate["structural_signals"]["has_structural_collision"] is False
+    assert candidate["reasons"] == ["readback_confirmed_disjoint", "low_specificity_path_only", "ordinal_ac_id_only"]
 
 
 def test_package_json_strong(tmp_path: Path) -> None:
     payload = _run(
         tmp_path,
-        _body(outcome="alpha", scope="same package script", allowed_paths=["package.json"], schema="BUILD_RESULT_V1"),
-        _body(outcome="beta", scope="same package script", allowed_paths=["package.json"], schema="BUILD_RESULT_V1"),
+        _body(outcome="alpha", scope="`package.json#scripts.foo`", allowed_paths=["package.json"]),
+        _body(outcome="beta", scope="`package.json#scripts.foo`", allowed_paths=["package.json"]),
     )
+    candidate = payload["candidates"][0]
     assert payload["route"] in {"human_review_required", "duplicate"}
-    assert payload["candidates"][0]["structural_signals"]["has_structural_collision"] is True
+    assert candidate["structural_signals"]["has_structural_collision"] is True
+    assert "independent_strong_signal_detected" in candidate["reasons"]
+
+
+def test_package_json_dependency_keys_are_compared_structurally(tmp_path: Path) -> None:
+    same = _run(
+        tmp_path,
+        _body(outcome="alpha", scope="`package.json#dependencies.react`", allowed_paths=["package.json"]),
+        _body(outcome="beta", scope="`package.json#dependencies.react`", allowed_paths=["package.json"]),
+    )
+    different = _run(
+        tmp_path,
+        _body(outcome="alpha", scope="`package.json#dependencies.react`", allowed_paths=["package.json"]),
+        _body(outcome="beta", scope="`package.json#dependencies.zod`", allowed_paths=["package.json"]),
+    )
+    assert same["route"] in {"human_review_required", "duplicate"}
+    assert (
+        "package.json#dependencies.react" in same["candidates"][0]["structural_signals"]["shared_specific_edit_targets"]
+    )
+    assert different["route"] == "proceed_with_collision_evidence"
 
 
 def test_broad_prefix_weak(tmp_path: Path) -> None:
@@ -116,6 +240,7 @@ def test_broad_prefix_weak(tmp_path: Path) -> None:
     )
     assert payload["route"] == "proceed_with_collision_evidence"
     assert "broad_prefix_only" in payload["candidates"][0]["reasons"]
+    assert payload["candidates"][0]["structural_signals"]["has_structural_collision"] is False
 
 
 def test_broad_prefix_strong(tmp_path: Path) -> None:
@@ -127,6 +252,7 @@ def test_broad_prefix_strong(tmp_path: Path) -> None:
         _body(outcome="beta", scope="same test target", allowed_paths=["tests/"], schema="TEST_RESULT_V1"),
     )
     assert payload["route"] == "human_review_required"
+    assert "independent_strong_signal_detected" in payload["candidates"][0]["reasons"]
 
 
 def test_ordinal_ac_id_only(tmp_path: Path) -> None:
@@ -152,18 +278,33 @@ def test_ac_id_with_output_schema(tmp_path: Path) -> None:
 
 
 def test_issue_1283_golden_fixture(tmp_path: Path) -> None:
-    """Issue #1283 observed shape: weak shared package path and AC ordinal are non-blocking."""
-    current = _body(
-        outcome="source pagination",
-        scope="collector",
-        allowed_paths=["package.json", "scripts/collector.py"],
-        ac="AC13",
+    """固定された #1283 / #198 / #1326 readback の exact evidence を検証する。"""
+    assert _sha(ISSUE_1283_CURRENT) == ISSUE_1283_GOLDEN_SHA256
+    assert _sha(ISSUE_198_CANDIDATE) == ISSUE_198_GOLDEN_SHA256
+    assert _sha(ISSUE_1326_CANDIDATE) == ISSUE_1326_GOLDEN_SHA256
+    payload = _run(tmp_path, ISSUE_1283_CURRENT, ISSUE_198_CANDIDATE)
+    candidate = payload["candidates"][0]
+    assert payload["route"] == "proceed_with_collision_evidence"
+    assert candidate["issue_number"] == 1284
+    assert candidate["heading_overlap"] is False
+    assert candidate["readback_complete"] is True
+    assert candidate["structural_signals"]["has_structural_collision"] is False
+    assert candidate["reasons"] == [
+        "readback_confirmed_disjoint",
+        "low_specificity_path_only",
+        "ordinal_ac_id_only",
+    ]
+
+
+def test_single_level_glob_does_not_overlap_nested_path(tmp_path: Path) -> None:
+    assert classify_path_scope_kind("tests/*") is PathScopeKind.UNKNOWN
+    assert not paths_conflict("tests/*", "tests/unit/deep/test_x.py")
+    payload = _run(
+        tmp_path,
+        _body(outcome="alpha", scope="alpha", allowed_paths=["tests/*"]),
+        _body(outcome="beta", scope="beta", allowed_paths=["tests/unit/deep/test_x.py"]),
     )
-    candidate = _body(outcome="unrelated package script", scope="unrelated", allowed_paths=["package.json"], ac="AC13")
-    golden = {"current_body_sha256": _sha(current), "candidate_body_sha256": _sha(candidate)}
-    assert all(value.startswith("sha256:") for value in golden.values())
-    payload = _run(tmp_path, current, candidate)
-    assert payload["route"] != "human_review_required"
+    assert payload["route"] == "proceed"
 
 
 def test_open_issue_source_uses_paginated_api_without_saturation(monkeypatch: object) -> None:

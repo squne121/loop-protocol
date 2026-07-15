@@ -61,9 +61,7 @@ OVERLAP_REQUIRES_COMMENT = "overlap_requires_comment"
 SAFE_NEW_ISSUE = "safe_new_issue"
 AMBIGUOUS_REQUIRES_HUMAN = "ambiguous_requires_human"
 
-VERDICTS: frozenset = frozenset(
-    {DUPLICATE, OVERLAP_REQUIRES_COMMENT, SAFE_NEW_ISSUE, AMBIGUOUS_REQUIRES_HUMAN}
-)
+VERDICTS: frozenset = frozenset({DUPLICATE, OVERLAP_REQUIRES_COMMENT, SAFE_NEW_ISSUE, AMBIGUOUS_REQUIRES_HUMAN})
 
 # ------------------------------------------------------------
 # reason_code enum
@@ -102,9 +100,7 @@ POLICY_TO_DECISION = {
 # matched_field enum
 # ------------------------------------------------------------
 
-MATCHED_FIELDS: frozenset = frozenset(
-    {"title", "goal_ref", "allowed_paths", "labels", "parent_refs"}
-)
+MATCHED_FIELDS: frozenset = frozenset({"title", "goal_ref", "allowed_paths", "labels", "parent_refs"})
 
 # ------------------------------------------------------------
 # source_status 値
@@ -117,8 +113,8 @@ SOURCE_SATURATED = "saturated"
 SOURCE_ABSENT = "absent"
 
 # title 類似のしきい値（Jaccard）
-_TITLE_DUP_THRESHOLD = 0.8       # ほぼ同一タイトル
-_TITLE_RELATED_THRESHOLD = 0.5   # 関連していると見なす下限
+_TITLE_DUP_THRESHOLD = 0.8  # ほぼ同一タイトル
+_TITLE_RELATED_THRESHOLD = 0.5  # 関連していると見なす下限
 
 # ============================================================
 # Allowed Paths の正規化と overlap 判定（#387 互換 contract を志向）
@@ -168,8 +164,13 @@ def classify_path_scope_kind(entry: str) -> PathScopeKind:
     raw = _clean_path_entry(entry)
     if not raw:
         return PathScopeKind.UNKNOWN
-    if raw.endswith("/**") or raw.endswith("/*"):
+    if raw.endswith("/**"):
         return PathScopeKind.RECURSIVE_GLOB
+    # ``/*`` は一階層だけに一致し、``/**`` のような再帰的な directory
+    # scope ではない。contract の closed enum に SINGLE_LEVEL_GLOB はないため、
+    # UNKNOWN として保持し paths_conflict() で一階層 semantics を適用する。
+    if raw.endswith("/*"):
+        return PathScopeKind.UNKNOWN
     if raw.endswith("/"):
         return PathScopeKind.DIRECTORY
     basename = raw.rsplit("/", 1)[-1]
@@ -219,10 +220,30 @@ def paths_conflict(a: str, b: str) -> bool:
     単なる文字列接頭辞（``tests/create`` と ``tests/create-issue``）は
     segment 境界が異なるため overlap としない。
     """
-    a = normalize_path(a)
-    b = normalize_path(b)
+    raw_a = _clean_path_entry(a)
+    raw_b = _clean_path_entry(b)
+    a = normalize_path(raw_a)
+    b = normalize_path(raw_b)
     if not a or not b:
         return False
+
+    def single_level_matches(pattern: str, other: str) -> bool:
+        base = normalize_path(pattern)
+        if not base or other == base or not other.startswith(f"{base}/"):
+            return False
+        return len(_segments(other)) == len(_segments(base)) + 1
+
+    # Git-style ``/*`` does not cross a slash.  Keep this before the generic
+    # prefix rule so ``tests/*`` and ``tests/unit/deep/test_x.py`` are not
+    # treated as overlapping scopes.
+    a_single = raw_a.endswith("/*") and not raw_a.endswith("/**")
+    b_single = raw_b.endswith("/*") and not raw_b.endswith("/**")
+    if a_single and b_single:
+        return a == b
+    if a_single:
+        return single_level_matches(raw_a, b)
+    if b_single:
+        return single_level_matches(raw_b, a)
     if a == b:
         return True
     sa, sb = _segments(a), _segments(b)
@@ -230,16 +251,16 @@ def paths_conflict(a: str, b: str) -> bool:
     return longer[: len(shorter)] == shorter
 
 
-def allowed_paths_overlap(
-    a_paths: Iterable[str], b_paths: Iterable[str]
-) -> Tuple[str, ...]:
+def allowed_paths_overlap(a_paths: Iterable[str], b_paths: Iterable[str]) -> Tuple[str, ...]:
     """両 Allowed Paths 集合の overlap を表す正規化パスを返す（昇順・重複なし）。"""
-    a_norm = normalize_paths(a_paths)
-    b_norm = normalize_paths(b_paths)
+    a_entries = tuple(a_paths)
+    b_entries = tuple(b_paths)
     hits = set()
-    for a in a_norm:
-        for b in b_norm:
-            if paths_conflict(a, b):
+    for a_raw in a_entries:
+        for b_raw in b_entries:
+            if paths_conflict(a_raw, b_raw):
+                a = normalize_path(a_raw)
+                b = normalize_path(b_raw)
                 hits.add(a if len(_segments(a)) >= len(_segments(b)) else b)
     return tuple(sorted(hits))
 
@@ -255,9 +276,7 @@ def same_path_set(a_paths: Iterable[str], b_paths: Iterable[str]) -> bool:
 # ============================================================
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-z]+|[぀-ヿ一-鿿]")
-_TITLE_PREFIX_RE = re.compile(
-    r"^\s*(実装|implement|impl|docs?|fix|chore|test)\s*[:：]\s*", re.IGNORECASE
-)
+_TITLE_PREFIX_RE = re.compile(r"^\s*(実装|implement|impl|docs?|fix|chore|test)\s*[:：]\s*", re.IGNORECASE)
 
 
 def _title_tokens(title: str) -> Tuple[str, ...]:
@@ -287,6 +306,7 @@ def _norm_goal(goal: str) -> str:
 # ============================================================
 # source_status / 入力モデル
 # ============================================================
+
 
 @dataclass(frozen=True)
 class SourceStatus:
@@ -324,13 +344,13 @@ class IssueScope:
     allowed_paths: Tuple[str, ...] = ()
     number: Optional[int] = None
     url: str = ""
-    goal: str = ""                       # goal_ref
+    goal: str = ""  # goal_ref
     labels: Tuple[str, ...] = ()
     parent_refs: Tuple[str, ...] = ()
-    depends_on: Tuple[str, ...] = ()     # `Depends on #N` / native dependency
+    depends_on: Tuple[str, ...] = ()  # `Depends on #N` / native dependency
     body: Optional[str] = None
     state: str = "OPEN"
-    search_hit: bool = False             # full-text search 由来 → read-back 必須
+    search_hit: bool = False  # full-text search 由来 → read-back 必須
 
     def effective_allowed_paths(self) -> Tuple[str, ...]:
         if self.allowed_paths:
@@ -405,10 +425,11 @@ def _ref_key(ref: str) -> str:
 # 判定結果モデル
 # ============================================================
 
+
 @dataclass(frozen=True)
 class DependencyRelation:
-    relation: str = "none"   # predecessor | successor | none | ambiguous
-    evidence: str = "none"   # native_dependency | line_anchored_depends_on | parent_work_ordering | none
+    relation: str = "none"  # predecessor | successor | none | ambiguous
+    evidence: str = "none"  # native_dependency | line_anchored_depends_on | parent_work_ordering | none
 
     def to_dict(self) -> dict:
         return {"relation": self.relation, "evidence": self.evidence}
@@ -459,9 +480,7 @@ class OverlapResult:
 
     @property
     def matched_issues(self) -> Tuple[int, ...]:
-        return tuple(
-            c.issue_number for c in self.candidates if c.issue_number is not None
-        )
+        return tuple(c.issue_number for c in self.candidates if c.issue_number is not None)
 
     @property
     def overlapping_paths(self) -> Tuple[str, ...]:
@@ -545,6 +564,7 @@ class ChildOverlapResult:
 # 判定ロジック（pure function）
 # ============================================================
 
+
 def _dependency_relation(current: IssueScope, cand: IssueScope) -> DependencyRelation:
     """current と candidate の dependency 関係を判定する。"""
     cur_dep = {_ref_key(r) for r in current.depends_on}
@@ -564,9 +584,7 @@ def _dependency_relation(current: IssueScope, cand: IssueScope) -> DependencyRel
     return DependencyRelation("none", "none")
 
 
-def _evaluate_candidate(
-    current: IssueScope, cand: IssueScope
-) -> Tuple[Optional[CandidateEvidence], List[str]]:
+def _evaluate_candidate(current: IssueScope, cand: IssueScope) -> Tuple[Optional[CandidateEvidence], List[str]]:
     """1 candidate を評価し evidence を返す。matched_fields を構築する。"""
     cur_paths = current.effective_allowed_paths()
     cand_paths = cand.effective_allowed_paths()
@@ -583,8 +601,7 @@ def _evaluate_candidate(
     cur_labels = {lbl.lower() for lbl in current.labels}
     cand_labels = {lbl.lower() for lbl in cand.labels}
     # routing 用 generic label を除いた意味的 label の共有のみ matched 扱い
-    generic = {"enhancement", "bug", "workflow", "phase/implementation",
-               "agent/implementer", "documentation", "docs"}
+    generic = {"enhancement", "bug", "workflow", "phase/implementation", "agent/implementer", "documentation", "docs"}
     shared_labels = (cur_labels & cand_labels) - generic
     if shared_labels:
         matched.append("labels")
@@ -592,10 +609,7 @@ def _evaluate_candidate(
     cur_parents = {_ref_key(r) for r in current.parent_refs}
     cand_key = _ref_key(cand.number) if cand.number is not None else None
     shared_parent = bool(cur_parents & {_ref_key(r) for r in cand.parent_refs})
-    parent_child = bool(
-        (cand_key and cand_key in cur_parents)
-        or (cur_parents and shared_parent)
-    )
+    parent_child = bool((cand_key and cand_key in cur_parents) or (cur_parents and shared_parent))
     if parent_child:
         matched.append("parent_refs")
 
@@ -641,8 +655,8 @@ def classify_overlap(
 
     duplicate: List[CandidateEvidence] = []
     parent_collision: List[CandidateEvidence] = []
-    dep_open: List[CandidateEvidence] = []     # predecessor open -> C2b
-    dep_closed: List[CandidateEvidence] = []   # predecessor closed -> C2a
+    dep_open: List[CandidateEvidence] = []  # predecessor open -> C2b
+    dep_closed: List[CandidateEvidence] = []  # predecessor closed -> C2a
     overlap_partial: List[CandidateEvidence] = []
     title_goal_disjoint: List[CandidateEvidence] = []
     excluded: List[int] = []
@@ -775,9 +789,7 @@ def classify_overlap(
     )
 
 
-def _build_comment_template(
-    cands: Sequence[CandidateEvidence], policy_class: str
-) -> str:
+def _build_comment_template(cands: Sequence[CandidateEvidence], policy_class: str) -> str:
     refs = ", ".join(f"#{c.issue_number}" for c in cands if c.issue_number is not None)
     paths: set = set()
     for c in cands:
@@ -823,9 +835,7 @@ def classify_child_overlap(
             if overlap:
                 if same_path_set(a_paths, b_paths):
                     has_identical = True
-                pairs.append(
-                    ChildOverlapPair(i, j, a.title, b.title, overlap)
-                )
+                pairs.append(ChildOverlapPair(i, j, a.title, b.title, overlap))
 
     if not pairs:
         return ChildOverlapResult(
@@ -844,10 +854,7 @@ def classify_child_overlap(
         overlapping_pairs=tuple(pairs),
         comment_template=(
             "Sibling child overlap: "
-            + "; ".join(
-                f"[{p.a_index}x{p.b_index}] {', '.join(p.overlapping_paths)}"
-                for p in pairs
-            )
+            + "; ".join(f"[{p.a_index}x{p.b_index}] {', '.join(p.overlapping_paths)}" for p in pairs)
         ),
         child_plan_status=child_plan_status,
     )
@@ -857,9 +864,8 @@ def classify_child_overlap(
 # GitHub adapter（CLI 層、非 dry-run 時のみ。fail-closed source_status を返す）
 # ============================================================
 
-def gh_search_candidates(
-    repo: str, query_tokens: Sequence[str]
-) -> Tuple[List[IssueScope], SourceStatus]:
+
+def gh_search_candidates(repo: str, query_tokens: Sequence[str]) -> Tuple[List[IssueScope], SourceStatus]:
     """OPEN Issue を全ページ取得し、body を含む候補を返す。
 
     GitHub search の ``--limit`` は上限到達時に完全性を証明できず、
@@ -876,10 +882,15 @@ def gh_search_candidates(
     try:
         proc = subprocess.run(
             [
-                "gh", "api", "--paginate", "--slurp",
+                "gh",
+                "api",
+                "--paginate",
+                "--slurp",
                 f"repos/{repo}/issues?state=open&per_page=100",
             ],
-            check=True, capture_output=True, text=True,
+            check=True,
+            capture_output=True,
+            text=True,
         )
         pages = json.loads(proc.stdout or "[]")
         if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
@@ -897,10 +908,7 @@ def gh_search_candidates(
             labels = issue.get("labels", []) or []
             if not isinstance(labels, list):
                 raise TypeError("issue labels must be a list")
-            label_names = tuple(
-                label.get("name", "") if isinstance(label, dict) else str(label)
-                for label in labels
-            )
+            label_names = tuple(label.get("name", "") if isinstance(label, dict) else str(label) for label in labels)
             number = issue["number"]
             title = issue["title"]
             body = issue.get("body")
@@ -923,6 +931,7 @@ def gh_search_candidates(
 # ============================================================
 # CLI
 # ============================================================
+
 
 def _read_paths_file(path: str) -> List[str]:
     out: List[str] = []
@@ -999,9 +1008,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
 
     # --- child overlap モード ---
     if args.children_file:
-        children, lookup_complete, ambiguous, child_status = _load_children(
-            args.children_file
-        )
+        children, lookup_complete, ambiguous, child_status = _load_children(args.children_file)
         child_result = classify_child_overlap(
             children,
             lookup_complete=lookup_complete,
