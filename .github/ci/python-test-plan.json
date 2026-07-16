@@ -31,6 +31,7 @@
     "tests/test_codex_agent_bridge_contract.py",
     "tests/test_codex_agent_model_refresh_evidence.py",
     "tests/test_subagent_launch_ledger.py",
+    "tests/test_subagent_launch_ledger_writer.py",
     "scripts/tests/test_milestone_rollup.py",
     "scripts/tests/test_pr_body_validator.py",
     "scripts/tests/test_e501_migration_guard.py",
