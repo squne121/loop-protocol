@@ -1,6 +1,6 @@
 ---
 name: pr-review-judge
-description: implementation child issue に紐づく PR をレビューし、linked issue の contract と PR diff / 証跡を照合して APPROVE / REQUEST_CHANGES を判定する。self-authored PR は `gh pr review --comment` のみを使う。
+description: implementation child issue に紐づく PR をレビューし、linked issue の contract と PR diff / 証跡を照合して APPROVE / REQUEST_CHANGES を判定する。verdict の GitHub 投稿は生の `gh pr review` を呼ばず、controlled review publisher（`pr_review.publish` command id、Issue #1536 Option C）へ委譲する。self-authored PR でも常に `event: COMMENT`。
 ---
 
 # PR Review Judge（PRレビュー判定）
@@ -14,7 +14,7 @@ description: implementation child issue に紐づく PR をレビューし、lin
 
 ### 0) Self-authored PR ガード
 
-`PR author == 実行アカウント` の場合、`gh pr review --comment` でのみ投稿。
+`PR author == 実行アカウント` の場合でも、投稿は常に controlled review publisher 経由・`event: COMMENT` 固定（`--approve` / `--request-changes` を意味する event は生成しない）。
 
 ### 1) Linked Issue を特定
 
@@ -113,8 +113,25 @@ merge_ready は impl-review-loop の終端条件。
 
 ### 6) verdict 投稿
 
-- `LOOP_VERDICT_V2` を `gh pr review --comment` 等で投稿
-- self-authored でも常に `--comment`
+pr-reviewer（本 SubAgent）は `Edit`/`Write`/`MultiEdit` を持たず、Bash 経由のファイル書き込みも禁止されている（`disallowedTools`）。そのため `PR_REVIEW_PUBLISH_REQUEST_V1` の JSON（`body_sha256` / `idempotency_key` / `producer_role` を含む）を自ら組み立てて `--input-file` に渡すことはできない（Issue #1539 fix_delta Blocker 1）。
+
+- pr-reviewer は verdict 本文（`LOOP_VERDICT_V2` フェンス YAML を含む Markdown）と `verdict` / `merge_ready` / `reviewed_head_sha` を構造化出力として **呼び出し元（impl-review-loop control-plane）に返すのみ**。JSON の組み立て・ハッシュ計算・`producer_role` の付与は行わない。
+- 呼び出し元（Write ツールを持つ trusted orchestrator）が、pr-reviewer の返した本文テキストをそのまま `artifacts/<PR番号>/issue-metadata/pr_review.publish/<name>.md` に書き込み（本文のみ。ハッシュや schema は含まない）、controlled review publisher を **render mode** で起動する。呼び出しコマンド例:
+
+```bash
+uv run --locked python3 scripts/agent-guards/controlled_skill_mutation_exec.py \
+  --command-id pr_review.publish --issue-number <PR番号> --repo <owner>/<repo> \
+  --render-body-file <本文テキストのパス> \
+  --verdict <APPROVE または REQUEST_CHANGES または COMMENT のいずれか> \
+  --reviewed-head-sha <SHA> --expected-head-sha <SHA> \
+  [--merge-ready] --json
+```
+
+- render mode の executor（trusted bridge）は `body_sha256` / `idempotency_key` を自前で再計算し、`producer_role: pr-reviewer` と `event: COMMENT` を自ら固定する（入力からは受け取らない）。本文中の `LOOP_VERDICT_V2.verdict` / `merge_ready` が CLI で宣言した値と一致しない場合は投稿前に fail-closed で拒否する。
+- publisher が `expected_head_sha` を GitHub REST API の `commit_id` へ拘束し、投稿前 stale 検出・投稿後 readback・idempotency marker 判定・投稿後の current-head 再検証（TOCTOU close-out）を行う（詳細: `scripts/agent-guards/controlled_skill_mutation_policy.py` / `_exec.py`）
+- self-authored でも常に `event: COMMENT`（`gh pr review --approve` / `--request-changes` は使わない）
+- 生の `gh pr review` を直接呼び出してはならない（root checkout からは `local_main_branch_guard.sh` が `gh_mutation_denied` として拒否する）
+- 従来の `--input-file`（事前構築済み JSON を渡す形）は dry-run/テスト用途として引き続き存在するが、本番の pr-reviewer 経路では使わない。
 
 ## Output Contract（出力契約）
 
