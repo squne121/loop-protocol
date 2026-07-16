@@ -295,6 +295,80 @@ class TestAC6VerdictRoundtripBodyHash:
         assert rc == 0
 
 
+class TestAC6TrailingNewlineBodyRegression:
+    """Issue #1539 fix_delta regression: _run_pr_review_publish() previously
+    called an open-ended `.rstrip("\n")` on the readback body before hashing,
+    which ate any trailing newline that was already part of raw_body itself
+    (near-universal for file-sourced bodies) and produced a permanent
+    postcondition_body_sha256_mismatch even though the review had already
+    posted successfully. None of the pre-existing AC6 fixtures used a
+    trailing-newline body, so this regression went undetected."""
+
+    def test_ac6_trailing_newline_body_roundtrip_succeeds(self, tmp_project, monkeypatch):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        body, body_sha256 = _body_and_hash(
+            "LOOP_VERDICT_V2: APPROVE\nblockers: []\n"
+        )
+        assert body.endswith("\n")
+        data = _pr_review_input(
+            body=body, body_sha256=body_sha256,
+            idempotency_key=f"{TRUSTED_REPO}:{PR_NUMBER}:{HEAD_SHA}:{body_sha256}",
+        )
+        rel = _write_input(tmp_project, "in.json", data)
+        marker = _exec._pr_review_marker_str(data["idempotency_key"])
+        p1, p2 = _base_patches()
+        with p1, p2:
+            with patch.object(_exec, "_find_pr_review_marker_matches", return_value=([], "")):
+                with patch.object(_exec, "_fetch_pr_head_sha", return_value=(HEAD_SHA, "")):
+                    with patch.object(_exec, "_post_pr_review", return_value=({"id": 8}, "")):
+                        with patch.object(_exec, "_readback_pr_review", return_value={
+                            "review": {"id": 8, "html_url": "https://ex/8",
+                                       "state": "COMMENTED", "commit_id": HEAD_SHA,
+                                       "body": f"{body}\n\n{marker}\n"}
+                        }):
+                            with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
+                                rc = _exec.main([
+                                    "--command-id", COMMAND_ID_PR_REVIEW_PUBLISH,
+                                    "--issue-number", str(PR_NUMBER),
+                                    "--input-file", rel,
+                                    "--repo", TRUSTED_REPO,
+                                    "--json",
+                                ])
+        assert rc == 0
+
+    def test_ac6_genuine_body_corruption_still_detected(self, tmp_project, monkeypatch):
+        """The fix must not become a no-op: an actually corrupted readback body
+        (diverging content, not just a trailing-newline normalization
+        difference) must still fail the postcondition check."""
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        body, body_sha256 = _body_and_hash("LOOP_VERDICT_V2: APPROVE\n")
+        data = _pr_review_input(
+            body=body, body_sha256=body_sha256,
+            idempotency_key=f"{TRUSTED_REPO}:{PR_NUMBER}:{HEAD_SHA}:{body_sha256}",
+        )
+        rel = _write_input(tmp_project, "in.json", data)
+        marker = _exec._pr_review_marker_str(data["idempotency_key"])
+        corrupted_body = "LOOP_VERDICT_V2: REQUEST_CHANGES\n"
+        p1, p2 = _base_patches()
+        with p1, p2:
+            with patch.object(_exec, "_find_pr_review_marker_matches", return_value=([], "")):
+                with patch.object(_exec, "_fetch_pr_head_sha", return_value=(HEAD_SHA, "")):
+                    with patch.object(_exec, "_post_pr_review", return_value=({"id": 9}, "")):
+                        with patch.object(_exec, "_readback_pr_review", return_value={
+                            "review": {"id": 9, "html_url": "https://ex/9",
+                                       "state": "COMMENTED", "commit_id": HEAD_SHA,
+                                       "body": f"{corrupted_body}\n\n{marker}\n"}
+                        }):
+                            rc = _exec.main([
+                                "--command-id", COMMAND_ID_PR_REVIEW_PUBLISH,
+                                "--issue-number", str(PR_NUMBER),
+                                "--input-file", rel,
+                                "--repo", TRUSTED_REPO,
+                                "--json",
+                            ])
+        assert rc == 1
+
+
 class TestAC7IdempotencyRetryNoDuplicate:
     def test_ac7_idempotency_retry_no_duplicate_conflict_fails_closed(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)

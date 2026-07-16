@@ -3,6 +3,7 @@
 Step 2 が `PASS` / `PARTIAL` で完了したら、`pr-reviewer` SubAgent に PR レビューを委譲する。Step 2 が `FAIL` の場合は本ステップをスキップして Step 5 に直行（REQUEST_CHANGES 確定）。
 
 Codex CLI: spawn the custom agent named pr-reviewer for this step; the root thread must not edit files, run tests, commit, push, or make the review judgment directly.
+（Codex CLI ではこのステップ用に pr-reviewer という名前のカスタムエージェントを spawn する。root thread はファイル編集・テスト実行・commit・push・レビュー判定のいずれも直接行ってはならない。）
 
 ## 委譲呼び出し
 
@@ -34,7 +35,7 @@ Step 4 では verdict 判定前に `wait_ci_checks.sh` を使って required che
   --timeout-seconds 1800
 ```
 
-### CI_WAIT_RESULT_V1 status routing
+### CI_WAIT_RESULT_V1 status routing（ステータス別ルーティング）
 
 | status | routing |
 |---|---|

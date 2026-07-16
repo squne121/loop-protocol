@@ -1524,7 +1524,27 @@ def _run_pr_review_publish(args, input_data, gh_bin, _fail, _ok) -> int:
     # AC6: strip the trailing marker before hashing so the round-tripped
     # UTF-8 body content (not the executor-appended marker) must hash to
     # the caller-declared body_sha256.
-    stripped_body = readback_body[: readback_body.rfind(marker_str)].rstrip("\n")
+    #
+    # Issue #1539 fix_delta: rendered_body is constructed above as exactly
+    # f"{raw_body}\n\n{marker_str}\n" -- the only bytes the executor adds
+    # between raw_body and the marker are the fixed 2-char separator "\n\n".
+    # The previous implementation called an open-ended `.rstrip("\n")` here,
+    # which also ate any trailing newline that was already part of raw_body
+    # itself (near-universal for file-sourced bodies). That silently produced
+    # a stripped_body shorter than raw_body, so its hash could never match
+    # the caller-declared body_sha256 (computed by _validate_pr_review_publish_
+    # fields() as hashlib.sha256(body.encode("utf-8")) on the verbatim raw_body,
+    # trailing newline included) -- postcondition_body_sha256_mismatch fired on
+    # essentially every real body even though the review had already posted.
+    # Fix: strip exactly the fixed separator the executor itself appended, not
+    # an open-ended rstrip, so the input-side and readback-side hashes apply
+    # the identical normalization rule (i.e. none) to raw_body.
+    marker_idx = readback_body.rfind(marker_str)
+    pre_marker = readback_body[:marker_idx]
+    if pre_marker.endswith("\n\n"):
+        stripped_body = pre_marker[: -len("\n\n")]
+    else:
+        stripped_body = pre_marker
     readback_body_sha256 = hashlib.sha256(stripped_body.encode("utf-8")).hexdigest()
     if readback_body_sha256 != body_sha256:
         return _fail(
