@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import json
+import re
 import stat
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -68,9 +70,53 @@ def _run_coordinator(payload: dict[str, object], capture_dir: Path) -> subproces
     producer_stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     producer_stub.chmod(0o755)
 
+    prepared_payload = dict(payload)
+    message = prepared_payload.get("last_assistant_message")
+    if (
+        prepared_payload.get("hook_event_name") == "SubagentStop"
+        and prepared_payload.get("agent_type") == "scope-rollup-runner"
+        and isinstance(message, str)
+    ):
+        marker_match = re.search(r"```ya?ml\s*\n(.*?)```", message, re.DOTALL)
+        try:
+            marker = yaml.safe_load(marker_match.group(1)) if marker_match else None
+        except yaml.YAMLError:
+            marker = None
+        result = marker.get("ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1") if isinstance(marker, dict) else None
+        if isinstance(result, dict) and isinstance(result.get("invocation_id"), str):
+            requested_at = result.get("requested_at")
+            if isinstance(requested_at, datetime):
+                requested_at = requested_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            eligibility_path = capture_dir / "source-bound-eligibility.json"
+            readiness_path = capture_dir / "source-bound-readiness.json"
+            eligibility_path.write_text(
+                json.dumps(
+                    {
+                        "invocation_id": result["invocation_id"],
+                        "requested_at": requested_at,
+                        "generated_at": "2026-06-15T12:00:02Z",
+                        "agent_transcript_path": prepared_payload.get("agent_transcript_path"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            readiness_path.write_text(
+                json.dumps(
+                    {
+                        "invocation_id": result["invocation_id"],
+                        "generated_at": "2026-06-15T12:00:03Z",
+                        "prepared": True,
+                        "state": "ready",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            prepared_payload["source_bound_eligibility_artifact_path"] = str(eligibility_path)
+            prepared_payload["source_bound_readiness_artifact_path"] = str(readiness_path)
+
     return subprocess.run(
         [str(COORDINATOR_PATH)],
-        input=json.dumps(payload),
+        input=json.dumps(prepared_payload),
         text=True,
         capture_output=True,
         check=False,

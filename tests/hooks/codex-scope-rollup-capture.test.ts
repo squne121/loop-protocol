@@ -276,7 +276,11 @@ describe('Codex SubagentStop scope-rollup capture adapter', () => {
     expect(ready.prepared).toBe(true)
     expect(ready.state).toBe('ready')
     expect(typeof ready.invocation_id).toBe('string')
-    expect(ready.invocation_id).toContain('inv-')
+    if (process.env.INVOCATION_ID) {
+      expect(ready.invocation_id).toBe(process.env.INVOCATION_ID)
+    } else {
+      expect(ready.invocation_id).toMatch(/^inv-/)
+    }
     expect((statSync(readinessPath).mode & 0o777)).toBe(0o600)
   })
 
