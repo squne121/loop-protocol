@@ -890,7 +890,7 @@ function writeLedgerEntry(kind, entry, identity) {
     '--kind', kind,
     '--entry', JSON.stringify(entry),
     '--identity', identity,
-  ], { encoding: 'utf8' });
+  ], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' });
   if (result.error || result.status !== 0) {
     throw new Error(String(result.stderr || '').trim() || 'ledger_writer_failed');
   }

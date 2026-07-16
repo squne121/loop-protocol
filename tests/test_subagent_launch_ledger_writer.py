@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -55,12 +56,30 @@ def entry(name: str) -> dict[str, object]:
     }
 
 
-def invoke(writer: Path, repo: Path, launch: dict[str, object]) -> subprocess.CompletedProcess[str]:
+def invoke(
+    writer: Path,
+    repo: Path,
+    payload: dict[str, object],
+    *,
+    kind: str = "launches",
+    identity: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    if identity is None:
+        identity = str(payload.get("event_fingerprint", "invalid-entry"))
     return subprocess.run(
-        [str(writer), "--repo", str(repo), "--kind", "launches", "--entry", json.dumps(launch), "--identity", launch["event_fingerprint"]],
+        [str(writer), "--repo", str(repo), "--kind", kind, "--entry", json.dumps(payload), "--identity", identity],
         text=True,
         capture_output=True,
     )
+
+
+def root_action(kind: str = "file_edit", command: str = "apply change") -> dict[str, object]:
+    return {
+        "kind": kind,
+        "command": command,
+        "tool_name": "Bash",
+        "coverage_source": "supported_pretooluse_path",
+    }
 
 
 def test_independent_trusted_processes_preserve_distinct_evidence(tmp_path: Path):
@@ -112,6 +131,13 @@ def test_hook_builds_writer_and_records_dispatch_evidence(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     ledger = json.loads((tmp_path / "artifacts/codex/subagent-launch-ledger.json").read_text())
     assert ledger["launches"][0]["observed_dispatch"]["agent_id"] == "agent"
+
+
+def test_hook_bounds_native_writer_execution_time():
+    source = HOOK.read_text(encoding="utf-8")
+    assert "spawnSync(ensureLedgerWriter()" in source
+    assert "timeout: 10_000" in source
+    assert "killSignal: 'SIGKILL'" in source
 
 
 def test_preexisting_substitution_and_nonregular_entries_fail_closed(tmp_path: Path):
@@ -202,6 +228,142 @@ def test_schema_invalid_launch_array_entry_fails_closed_without_replacement(tmp_
     assert "ledger_parse_or_schema_invalid" in result.stderr
     assert ledger.read_bytes() == original
     assert not (ledger_dir / "subagent-launch-ledger.json.tmp").exists()
+
+
+def test_root_actions_allow_empty_launches_then_transition_to_launch_evidence(tmp_path: Path):
+    writer = build_writer(tmp_path)
+    first = invoke(
+        writer,
+        tmp_path,
+        root_action("file_edit", "apply_patch scripts/check-codex-agents.mjs"),
+        kind="root_thread_actions",
+        identity="Bash\napply_patch scripts/check-codex-agents.mjs",
+    )
+    assert first.returncode == 0, first.stderr
+    ledger_path = tmp_path / "artifacts/codex/subagent-launch-ledger.json"
+    after_root = json.loads(ledger_path.read_text())
+    assert after_root["launches"] == []
+    assert after_root["root_thread_actions"][0]["kind"] == "file_edit"
+
+    second = invoke(writer, tmp_path, entry("spark-skim"))
+    assert second.returncode == 0, second.stderr
+    final = json.loads(ledger_path.read_text())
+    assert len(final["launches"]) == 1
+    assert len(final["root_thread_actions"]) == 1
+
+
+def test_writer_accepts_node_classifier_kinds_and_defers_policy_to_canonical_audit(tmp_path: Path):
+    writer = build_writer(tmp_path)
+    classifier_kinds = (
+        "test_execution",
+        "review_judgment",
+        "git_commit",
+        "git_push",
+        "cleanup_git_mutation",
+        "file_edit",
+    )
+    for index, kind in enumerate(classifier_kinds):
+        result = invoke(
+            writer,
+            tmp_path,
+            root_action(kind, f"command-{index}"),
+            kind="root_thread_actions",
+            identity=f"Bash\\ncommand-{index}",
+        )
+        assert result.returncode == 0, result.stderr
+
+    ledger_path = tmp_path / "artifacts/codex/subagent-launch-ledger.json"
+    payload = json.loads(ledger_path.read_text())
+    assert [action["kind"] for action in payload["root_thread_actions"]] == list(classifier_kinds)
+    audit = subprocess.run([sys.executable, str(VALIDATOR), "--audit-mode", str(ledger_path)], text=True, capture_output=True)
+    assert audit.returncode == 1
+    assert "root_thread_data_plane_execution_observed" in json.loads(audit.stdout)["error_codes"]
+
+
+def test_incoming_entry_schema_validation_and_post_append_validation_fail_closed(tmp_path: Path):
+    writer = build_writer(tmp_path)
+    invalid = invoke(writer, tmp_path, {}, identity="invalid")
+    assert invalid.returncode != 0
+    assert invalid.stderr.strip() == "ledger_entry_invalid"
+    ledger_path = tmp_path / "artifacts/codex/subagent-launch-ledger.json"
+    assert not ledger_path.exists()
+    assert not (ledger_path.parent / "subagent-launch-ledger.json.lock").exists()
+
+    valid = invoke(writer, tmp_path, entry("spark-skim"))
+    assert valid.returncode == 0, valid.stderr
+    before = ledger_path.read_bytes()
+    invalid_root = invoke(writer, tmp_path, {"kind": "file_edit"}, kind="root_thread_actions", identity="invalid-root")
+    assert invalid_root.returncode != 0
+    assert invalid_root.stderr.strip() == "ledger_entry_invalid"
+    assert ledger_path.read_bytes() == before
+    assert not (ledger_path.parent / "subagent-launch-ledger.json.lock").exists()
+
+
+def test_failure_releases_only_owned_lock_and_temp_with_exact_reason_codes(tmp_path: Path):
+    writer = build_writer(tmp_path)
+    ledger_dir = tmp_path / "artifacts/codex"
+    ledger_dir.mkdir(parents=True)
+    ledger = ledger_dir / "subagent-launch-ledger.json"
+    ledger.write_text("{}", encoding="utf-8")
+
+    malformed = invoke(writer, tmp_path, entry("spark-skim"))
+    assert malformed.returncode != 0
+    assert malformed.stderr.strip() == "ledger_parse_or_schema_invalid"
+    assert not (ledger_dir / "subagent-launch-ledger.json.lock").exists()
+    assert not (ledger_dir / "subagent-launch-ledger.json.tmp").exists()
+
+    ledger.unlink()
+    residue = ledger_dir / "subagent-launch-ledger.json.tmp"
+    residue.write_text("foreign-temp", encoding="utf-8")
+    external_temp = invoke(writer, tmp_path, entry("spark-skim"))
+    assert external_temp.returncode != 0
+    assert external_temp.stderr.strip() == "ledger_temp_preexisting"
+    assert residue.read_text(encoding="utf-8") == "foreign-temp"
+    assert not (ledger_dir / "subagent-launch-ledger.json.lock").exists()
+
+
+def test_fifo_and_socket_ledger_entries_fail_without_blocking(tmp_path: Path):
+    writer = build_writer(tmp_path)
+    for name, create in (("fifo", os.mkfifo), ("socket", None)):
+        case_root = tmp_path / name if create is not None else tmp_path.parent / "socket-case"
+        ledger_dir = case_root / "artifacts/codex"
+        ledger_dir.mkdir(parents=True)
+        target = ledger_dir / "subagent-launch-ledger.json"
+        if create is not None:
+            create(target)
+        else:
+            server = socket.socket(socket.AF_UNIX)
+            server.bind(str(target))
+        try:
+            result = invoke(writer, case_root, entry(f"spark-{name}"))
+        finally:
+            if create is None:
+                server.close()
+                target.unlink()
+        assert result.returncode != 0
+        assert result.stderr.strip() == "ledger_target_unsafe"
+        assert not (ledger_dir / "subagent-launch-ledger.json.lock").exists()
+
+
+def test_duplicate_detection_uses_exact_parsed_identity_fields(tmp_path: Path):
+    writer = build_writer(tmp_path)
+    assert invoke(writer, tmp_path, entry("prefix")).returncode == 0
+    suffix = entry("suffix")
+    suffix["event_fingerprint"] = "fingerprint"
+    prefix = entry("prefix")
+    prefix["event_fingerprint"] = "prefix-fingerprint"
+    clean_root = tmp_path / "exact-identity"
+    clean_root.mkdir()
+    assert invoke(writer, clean_root, prefix).returncode == 0
+    assert invoke(writer, clean_root, suffix).returncode == 0
+    ledger = json.loads((clean_root / "artifacts/codex/subagent-launch-ledger.json").read_text())
+    assert {item["event_fingerprint"] for item in ledger["launches"]} == {"prefix-fingerprint", "fingerprint"}
+
+    action = root_action(command="pnpm test")
+    assert invoke(writer, clean_root, action, kind="root_thread_actions", identity="first").returncode == 0
+    assert invoke(writer, clean_root, action, kind="root_thread_actions", identity="second").returncode == 0
+    final = json.loads((clean_root / "artifacts/codex/subagent-launch-ledger.json").read_text())
+    assert len(final["root_thread_actions"]) == 1
 
 
 def test_canonical_evidence_requires_launch_dispatch_and_correlation(tmp_path: Path):

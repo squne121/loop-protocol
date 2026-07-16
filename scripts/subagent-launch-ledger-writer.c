@@ -18,7 +18,27 @@
 #define TEMP "subagent-launch-ledger.json.tmp"
 #define MAX_LEDGER (1024 * 1024)
 
-static void fail(const char *reason) { fprintf(stderr, "%s\n", reason); exit(2); }
+static int cleanup_parent = -1;
+static int lock_owned = 0;
+static int temp_owned = 0;
+
+static void cleanup_owned_paths(void) {
+  if (cleanup_parent < 0) return;
+  if (temp_owned) {
+    (void)unlinkat(cleanup_parent, TEMP, 0);
+    temp_owned = 0;
+  }
+  if (lock_owned) {
+    (void)unlinkat(cleanup_parent, LOCK, 0);
+    lock_owned = 0;
+  }
+}
+
+static void fail(const char *reason) {
+  cleanup_owned_paths();
+  fprintf(stderr, "%s\n", reason);
+  exit(2);
+}
 
 static int open_directory_at(int parent, const char *name) {
   struct open_how how = {.flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW, .resolve = RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH};
@@ -42,7 +62,12 @@ static int open_parent(const char *repo) {
 static void acquire_lock(int parent) {
   for (int i = 0; i < 80; i++) {
     int fd = openat(parent, LOCK, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (fd >= 0) { close(fd); return; }
+    if (fd >= 0) {
+      close(fd);
+      cleanup_parent = parent;
+      lock_owned = 1;
+      return;
+    }
     if (errno != EEXIST) fail("ledger_lock_create_failed");
     struct stat st;
     if (fstatat(parent, LOCK, &st, AT_SYMLINK_NOFOLLOW) < 0) continue;
@@ -52,7 +77,11 @@ static void acquire_lock(int parent) {
   fail("ledger_lock_timeout");
 }
 
-static void release_lock(int parent) { if (unlinkat(parent, LOCK, 0) < 0) fail("ledger_lock_release_failed"); }
+static void release_lock(int parent) {
+  if (!lock_owned || cleanup_parent != parent) fail("ledger_lock_release_failed");
+  if (unlinkat(parent, LOCK, 0) < 0) fail("ledger_lock_release_failed");
+  lock_owned = 0;
+}
 
 static const char *skip_space_const(const char *p) { while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++; return p; }
 
@@ -287,20 +316,18 @@ static int launch_valid(const char *start, const char *end) {
 }
 
 static int launches_valid(const char *start, const char *end) {
-  int entries = 0;
   const char *p = skip_space_const(start);
   if (*p++ != '[') return 0;
   p = skip_space_const(p);
   while (*p != ']') {
     const char *value = p, *value_end = skip_json_value(p);
     if (!value_end || !launch_valid(value, value_end)) return 0;
-    entries++;
     p = skip_space_const(value_end);
     if (*p == ']') break;
     if (*p++ != ',') return 0;
     p = skip_space_const(p);
   }
-  return entries && p + 1 == end;
+  return p + 1 == end;
 }
 
 static int root_thread_action_valid(const char *start, const char *end) {
@@ -317,10 +344,9 @@ static int root_thread_action_valid(const char *start, const char *end) {
     const char *value = p, *value_end = skip_json_value(p);
     if (!value_end) return 0;
     if (json_string_equals(key, key_end, "kind")) {
-      if ((fields & 1) || !json_string_nonempty(value, value_end) ||
-          json_string_equals(value, value_end, "file_edit") || json_string_equals(value, value_end, "test_execution") ||
-          json_string_equals(value, value_end, "git_commit") || json_string_equals(value, value_end, "git_push") ||
-          json_string_equals(value, value_end, "review_judgment") || json_string_equals(value, value_end, "cleanup_git_mutation")) return 0;
+      /* The writer enforces the structural schema only.  Whether a root action
+       * is policy-permitted is decided by the canonical Python audit. */
+      if ((fields & 1) || !json_string_nonempty(value, value_end)) return 0;
       fields |= 1;
     } else if (json_string_equals(key, key_end, "command")) {
       if ((fields & 2) || !json_string_nonempty(value, value_end)) return 0;
@@ -449,16 +475,30 @@ static int ledger_common_schema_valid(const char *text) {
 }
 
 static char *read_ledger(int parent) {
-  int fd = openat(parent, LEDGER, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-  if (fd < 0 && errno == ENOENT) {
+  struct stat before;
+  if (fstatat(parent, LEDGER, &before, AT_SYMLINK_NOFOLLOW) < 0) {
+    if (errno != ENOENT) fail("ledger_target_unsafe");
     const char *empty = "{\"ledger_schema\":\"SUBAGENT_LAUNCH_LEDGER_V1\",\"generated_by\":\"codex_hook_pipeline\",\"generated_at\":\"writer-generated\",\"ledger_path\":\"artifacts/codex/subagent-launch-ledger.json\",\"codex_binary_status\":\"available\",\"coverage_scope\":{\"subagent_start_event_recorded\":true,\"supported_pretooluse_paths\":[\"Bash\",\"apply_patch\",\"Edit\",\"Write\"],\"unsupported_paths_fail_closed\":true,\"scope_note\":\"This ledger records event-derived SubagentStart launches and supported PreToolUse paths only.\"},\"launches\":[],\"root_thread_actions\":[]}";
     return strdup(empty);
   }
+  if (!S_ISREG(before.st_mode) || before.st_size < 2 || before.st_size > MAX_LEDGER) fail("ledger_target_unsafe");
+  int fd = openat(parent, LEDGER, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
   if (fd < 0) fail("ledger_target_unsafe");
-  struct stat st; if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 2 || st.st_size > MAX_LEDGER) fail("ledger_target_unsafe");
-  char *buf = calloc((size_t)st.st_size + 1, 1); if (!buf) fail("ledger_memory_failed");
-  ssize_t got = read(fd, buf, (size_t)st.st_size); close(fd);
-  if (got != st.st_size || !ledger_common_schema_valid(buf)) fail("ledger_parse_or_schema_invalid");
+  struct stat after;
+  if (fstat(fd, &after) < 0 || !S_ISREG(after.st_mode) || after.st_dev != before.st_dev || after.st_ino != before.st_ino ||
+      after.st_size < 2 || after.st_size > MAX_LEDGER) {
+    close(fd);
+    fail("ledger_target_unsafe");
+  }
+  char *buf = calloc((size_t)after.st_size + 1, 1); if (!buf) { close(fd); fail("ledger_memory_failed"); }
+  size_t offset = 0;
+  while (offset < (size_t)after.st_size) {
+    ssize_t got = read(fd, buf + offset, (size_t)after.st_size - offset);
+    if (got <= 0) { close(fd); free(buf); fail("ledger_read_failed"); }
+    offset += (size_t)got;
+  }
+  close(fd);
+  if (!ledger_common_schema_valid(buf)) { free(buf); fail("ledger_parse_or_schema_invalid"); }
   return buf;
 }
 
@@ -469,27 +509,82 @@ static char *array_end(char *start) {
   return NULL;
 }
 
+static int object_field_span(const char *object, const char *end, const char *expected,
+                             const char **value, const char **value_end) {
+  const char *p = skip_space_const(object);
+  if (*p++ != '{') return 0;
+  p = skip_space_const(p);
+  while (p < end && *p != '}') {
+    const char *key = p, *key_end = skip_json_string(p);
+    if (!key_end) return 0;
+    p = skip_space_const(key_end);
+    if (*p++ != ':') return 0;
+    p = skip_space_const(p);
+    const char *candidate = p, *candidate_end = skip_json_value(p);
+    if (!candidate_end) return 0;
+    if (json_string_equals(key, key_end, expected)) {
+      *value = candidate;
+      *value_end = candidate_end;
+      return 1;
+    }
+    p = skip_space_const(candidate_end);
+    if (*p == '}') break;
+    if (*p++ != ',') return 0;
+    p = skip_space_const(p);
+  }
+  return 0;
+}
+
+static int entry_duplicate(const char *array, const char *array_close, const char *kind,
+                           const char *entry, const char *entry_end) {
+  const char *wanted_one = NULL, *wanted_one_end = NULL, *wanted_two = NULL, *wanted_two_end = NULL;
+  const char *key_one = !strcmp(kind, "launches") ? "event_fingerprint" : "tool_name";
+  const char *key_two = !strcmp(kind, "launches") ? NULL : "command";
+  if (!object_field_span(entry, entry_end, key_one, &wanted_one, &wanted_one_end) ||
+      (key_two && !object_field_span(entry, entry_end, key_two, &wanted_two, &wanted_two_end))) fail("ledger_entry_invalid");
+  const char *p = skip_space_const(array + 1);
+  while (p < array_close && *p != ']') {
+    const char *existing = p, *existing_end = skip_json_value(p);
+    const char *existing_one = NULL, *existing_one_end = NULL, *existing_two = NULL, *existing_two_end = NULL;
+    if (!existing_end || !object_field_span(existing, existing_end, key_one, &existing_one, &existing_one_end)) fail("ledger_schema_invalid");
+    if (key_two && !object_field_span(existing, existing_end, key_two, &existing_two, &existing_two_end)) fail("ledger_schema_invalid");
+    if (wanted_one_end - wanted_one == existing_one_end - existing_one && !memcmp(wanted_one, existing_one, (size_t)(wanted_one_end - wanted_one)) &&
+        (!key_two || (wanted_two_end - wanted_two == existing_two_end - existing_two && !memcmp(wanted_two, existing_two, (size_t)(wanted_two_end - wanted_two))))) return 1;
+    p = skip_space_const(existing_end);
+    if (*p == ']') break;
+    if (*p++ != ',') fail("ledger_schema_invalid");
+    p = skip_space_const(p);
+  }
+  return 0;
+}
+
 static char *append_entry(char *ledger, const char *kind, const char *entry, const char *identity) {
   const char *entry_end = skip_json_value(entry);
-  if (!entry_end || *skip_space_const(entry_end) || entry[0] != '{' || !identity || !*identity) fail("ledger_entry_invalid");
-  if (strstr(ledger, identity)) return ledger;
+  if (!entry_end || *skip_space_const(entry_end) || entry[0] != '{' || !identity || !*identity ||
+      (!strcmp(kind, "launches") ? !launch_valid(entry, entry_end) : !root_thread_action_valid(entry, entry_end))) fail("ledger_entry_invalid");
   char key[64]; snprintf(key, sizeof(key), "\"%s\"", kind);
   char *field = strstr(ledger, key); if (!field) fail("ledger_schema_invalid");
   char *open = strchr(field + strlen(key), '['); if (!open) fail("ledger_schema_invalid");
   char *close = array_end(open); if (!close) fail("ledger_schema_invalid");
+  if (entry_duplicate(open, close, kind, entry, entry_end)) return ledger;
   char *content = skip_space(open + 1); size_t left = (size_t)(close - ledger); size_t entry_len = strlen(entry);
   char *out = malloc(strlen(ledger) + entry_len + 3); if (!out) fail("ledger_memory_failed");
   memcpy(out, ledger, left); size_t pos = left;
   if (content != close) out[pos++] = ',';
   memcpy(out + pos, entry, entry_len); pos += entry_len;
-  strcpy(out + pos, close); free(ledger); return out;
+  strcpy(out + pos, close);
+  if (!ledger_common_schema_valid(out)) { free(out); fail("ledger_append_schema_invalid"); }
+  free(ledger);
+  return out;
 }
 
 static void write_replace(int parent, const char *ledger) {
   struct stat residue; if (fstatat(parent, TEMP, &residue, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT) fail("ledger_temp_preexisting");
   int fd = openat(parent, TEMP, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600); if (fd < 0) fail("ledger_temp_create_failed");
-  size_t length = strlen(ledger); if (write(fd, ledger, length) != (ssize_t)length || fsync(fd) < 0) { close(fd); unlinkat(parent, TEMP, 0); fail("ledger_write_failed"); }
-  if (close(fd) < 0 || renameat(parent, TEMP, parent, LEDGER) < 0) { unlinkat(parent, TEMP, 0); fail("ledger_atomic_replace_failed"); }
+  temp_owned = 1;
+  size_t length = strlen(ledger); if (write(fd, ledger, length) != (ssize_t)length || fsync(fd) < 0) { close(fd); fail("ledger_write_failed"); }
+  if (close(fd) < 0 || renameat(parent, TEMP, parent, LEDGER) < 0) fail("ledger_atomic_replace_failed");
+  temp_owned = 0;
 }
 
 int main(int argc, char **argv) {
