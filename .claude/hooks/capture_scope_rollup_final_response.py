@@ -22,6 +22,22 @@ DEFAULT_CAPTURE_DIR = Path("/tmp")
 FENCED_YAML_RE = re.compile(r"```ya?ml[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 INVOCATION_ID_RE = re.compile(r"^\s*invocation_id:\s*['\"]?([A-Za-z0-9._:-]+)['\"]?\s*$", re.MULTILINE)
 STRICT_STATUS = {"ok", "failed", "runner_unavailable"}
+SOURCE_BOUND_ARTIFACT_KEYS = (
+    "source_bound_eligibility_artifact_path",
+    "source_bound_eligibility_artifact",
+    "source_bound_eligibility",
+    "scope_rollup_source_bound_eligibility_artifact_path",
+    "scope_rollup_source_bound_eligibility_artifact",
+    "scope_rollup_source_bound_eligibility",
+)
+SOURCE_BOUND_READINESS_KEYS = (
+    "source_bound_readiness_artifact_path",
+    "source_bound_readiness_artifact",
+    "source_bound_readiness",
+    "scope_rollup_source_bound_readiness_artifact_path",
+    "scope_rollup_source_bound_readiness_artifact",
+    "scope_rollup_source_bound_readiness",
+)
 
 
 class DuplicateKeyError(ValueError):
@@ -148,6 +164,203 @@ def _extract_invocation_id(last_assistant_message: str, marker_payload: dict[str
     if len(unique) == 1:
         return unique[0]
     return None
+
+
+def _payload_text_field(
+    payload: dict[str, Any],
+    keys: tuple[str, ...],
+    *,
+    artifact_name: str,
+) -> tuple[str | None, dict[str, Any] | None]:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                return text, None
+        if isinstance(value, dict):
+            return None, value
+    nested = payload.get("source_bound_artifacts")
+    if isinstance(nested, dict):
+        for key in keys:
+            value = nested.get(key)
+            if isinstance(value, str):
+                text = value.strip()
+                if text:
+                    return text, None
+            if isinstance(value, dict):
+                return None, value
+
+    nested = payload.get("source_bound")
+    if isinstance(nested, dict):
+        for key in keys:
+            value = nested.get(key)
+            if isinstance(value, str):
+                text = value.strip()
+                if text:
+                    return text, None
+            if isinstance(value, dict):
+                return None, value
+
+    artifacts = payload.get("artifacts")
+    if isinstance(artifacts, list):
+        for candidate in artifacts:
+            if not isinstance(candidate, dict):
+                continue
+            kind = str(candidate.get("kind", "")).lower()
+            artifact_kind = str(candidate.get("artifact_kind", "")).lower()
+            artifact_type = str(candidate.get("type", "")).lower()
+            if artifact_name not in kind and artifact_name not in artifact_kind and artifact_name not in artifact_type:
+                continue
+            path = candidate.get("path")
+            artifact_payload = candidate.get("artifact")
+            if artifact_payload is None:
+                artifact_payload = candidate.get("payload")
+            if isinstance(artifact_payload, dict):
+                return None, artifact_payload
+            if isinstance(path, str):
+                return path.strip(), None
+
+    return None, None
+
+
+def _load_json_or_yaml_text(text: str) -> Any | None:
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    try:
+        parsed = yaml.safe_load(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return None
+
+
+def _read_source_bound_artifact(value_path: str | None, value_payload: dict[str, Any] | None, *, artifact_type: str) -> tuple[dict[str, Any] | None, list[str]]:
+    if value_payload is not None:
+        if not isinstance(value_payload, dict):
+            return None, [f"source-bound {artifact_type} artifact is not an object"]
+        return value_payload, []
+
+    if not value_path:
+        return None, [f"source-bound {artifact_type} artifact path is missing"]
+
+    try:
+        file_path = Path(value_path)
+        raw = file_path.read_text(encoding="utf-8")
+    except Exception:
+        return None, [f"source-bound {artifact_type} artifact is unreadable"]
+
+    parsed = _load_json_or_yaml_text(raw)
+    if parsed is None:
+        return None, [f"source-bound {artifact_type} artifact is malformed"]
+    return parsed, []
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return _parse_iso8601(value)
+    except Exception:
+        return None
+
+
+def _is_ready_artifact_prepared(readiness_artifact: dict[str, Any]) -> bool:
+    prepared_value = readiness_artifact.get("prepared")
+    if prepared_value is True:
+        return True
+    if isinstance(prepared_value, str) and prepared_value.strip().lower() in {"true", "ready", "yes"}:
+        return True
+    ready_value = readiness_artifact.get("ready")
+    if ready_value is True:
+        return True
+    if isinstance(ready_value, str) and ready_value.strip().lower() in {"true", "ready", "yes"}:
+        return True
+    ready_state = readiness_artifact.get("state")
+    if isinstance(ready_state, str) and ready_state.strip().lower() in {"ready", "prepared"}:
+        return True
+    return False
+
+
+def _evaluate_source_bound_artifacts(payload: dict[str, Any], marker_payload: dict[str, Any] | None, marker_invocation_id: str | None, requested_dt: datetime, generated_dt: datetime) -> tuple[bool, list[str], str]:
+    eligibility_path, eligibility_payload = _payload_text_field(
+        payload,
+        SOURCE_BOUND_ARTIFACT_KEYS,
+        artifact_name="eligibility",
+    )
+    readiness_path, readiness_payload = _payload_text_field(
+        payload,
+        SOURCE_BOUND_READINESS_KEYS,
+        artifact_name="readiness",
+    )
+    if not (eligibility_path or eligibility_payload):
+        return False, ["source-bound eligibility artifact is missing"], "eligibility_missing"
+    if not (readiness_path or readiness_payload):
+        return False, ["source-bound readiness artifact is missing"], "readiness_missing"
+
+    eligibility_artifact, eligibility_notes = _read_source_bound_artifact(eligibility_path, eligibility_payload, artifact_type="eligibility")
+    if eligibility_artifact is None:
+        return False, eligibility_notes, "eligibility_invalid"
+
+    readiness_artifact, readiness_notes = _read_source_bound_artifact(readiness_path, readiness_payload, artifact_type="readiness")
+    if readiness_artifact is None:
+        return False, readiness_notes, "readiness_invalid"
+
+    if marker_payload is not None:
+        marker_invocation = marker_payload.get("invocation_id")
+        if isinstance(marker_invocation, str) and marker_invocation:
+            marker_invocation_id = marker_invocation
+
+    eligibility_invocation = eligibility_artifact.get("invocation_id")
+    readiness_invocation = readiness_artifact.get("invocation_id")
+    if marker_invocation_id is not None:
+        if not isinstance(eligibility_invocation, str) or eligibility_invocation != marker_invocation_id:
+            return False, ["eligibility artifact invocation_id mismatches marker invocation_id"], "source_binding_mismatch"
+        if not isinstance(readiness_invocation, str) or readiness_invocation != marker_invocation_id:
+            return False, ["readiness artifact invocation_id mismatches marker invocation_id"], "source_binding_mismatch"
+
+    if readiness_invocation is not None and isinstance(eligibility_invocation, str) and readiness_invocation != eligibility_invocation:
+        return False, ["source-bound eligibility/readiness invocation_id mismatch"], "source_binding_mismatch"
+
+    artifact_transcript = eligibility_artifact.get("agent_transcript_path") or eligibility_artifact.get("transcript_path")
+    payload_transcript = payload.get("agent_transcript_path")
+    if payload_transcript is not None and artifact_transcript is not None and artifact_transcript != payload_transcript:
+        return False, ["artifact transcript_path mismatches payload.agent_transcript_path"], "source_binding_mismatch"
+
+    if not _is_ready_artifact_prepared(readiness_artifact):
+        return False, ["source-bound readiness artifact is not prepared"], "readiness_unprepared"
+
+    eligibility_requested = _parse_timestamp(
+        eligibility_artifact.get("requested_at"),
+    )
+    eligibility_generated = _parse_timestamp(
+        eligibility_artifact.get("generated_at"),
+    )
+    if eligibility_requested is None or eligibility_generated is None:
+        return False, ["source-bound eligibility artifact has invalid requested_at/generated_at"], "eligibility_invalid"
+    if eligibility_requested >= eligibility_generated:
+        return False, ["source-bound eligibility artifact is stale"], "eligibility_stale"
+    if eligibility_generated <= requested_dt:
+        return False, ["source-bound eligibility artifact is stale"], "eligibility_stale"
+    if eligibility_generated <= generated_dt:
+        # guard against replay/copy-back where artifact generation is not
+        # forward-looking relative to the captured marker generation time.
+        return False, ["source-bound eligibility artifact is stale"], "eligibility_stale"
+
+    readiness_generated = _parse_timestamp(
+        readiness_artifact.get("generated_at"),
+    )
+    if readiness_generated is None:
+        return False, ["source-bound readiness artifact has invalid generated_at"], "readiness_invalid"
+    if readiness_generated < eligibility_generated:
+        return False, ["source-bound readiness artifact is stale"], "readiness_stale"
+
+    return True, [], "ok"
 
 
 def _resolve_capture_dir() -> Path:
@@ -377,6 +590,30 @@ def _decision_from_payload(payload: dict[str, Any]) -> CaptureDecision:
             capture_source="last_assistant_message",
             provenance=provenance,
             notes=["requested_at/generated_at could not be parsed"],
+        )
+
+    source_bound_ok, source_bound_notes, source_bound_status = _evaluate_source_bound_artifacts(
+        payload,
+        marker_payload,
+        invocation_id,
+        requested_dt,
+        generated_dt,
+    )
+    if not source_bound_ok:
+        return CaptureDecision(
+            capture_mode="subagent_stop_hook",
+            capture_status="parser_rejected",
+            parser_status=source_bound_status,
+            capture_routing_action="stop_human",
+            agent_type=TARGET_AGENT_TYPE,
+            invocation_id=invocation_id,
+            requested_at=requested_at,
+            generated_at=generated_at,
+            capture_path=None,
+            capture_sha256=None,
+            capture_source="last_assistant_message",
+            provenance=provenance,
+            notes=source_bound_notes,
         )
 
     if generated_dt <= requested_dt:

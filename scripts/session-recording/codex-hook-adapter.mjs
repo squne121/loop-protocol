@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { execFileSync, spawnSync } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { realpathSync } from 'node:fs'
 import { dirname, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -42,7 +42,32 @@ const scopeRollupCaptureFixtureRoot = resolve(
   'hooks',
   'scope-rollup-capture',
 )
-const SCOPE_ROLLUP_CAPTURE_TIMEOUT_MS = 5000
+const isScopeRollupCaptureTestTransport = process.env.NODE_ENV === 'test'
+const SCOPE_ROLLUP_CAPTURE_TIMEOUT_MS = 3500
+const SCOPE_ROLLUP_CAPTURE_ENV_ALLOWLIST = new Set([
+  'CI',
+  'HOME',
+  'LANG',
+  'LC_ALL',
+  'LC_COLLATE',
+  'LC_CTYPE',
+  'LC_MESSAGES',
+  'LC_MONETARY',
+  'LC_NUMERIC',
+  'LC_TIME',
+  'LOGNAME',
+  'PATH',
+  'PYTHONIOENCODING',
+  'PYTHONUNBUFFERED',
+  'SCOPE_ROLLUP_CAPTURE_DIR',
+  'TEMP',
+  'TMP',
+  'TMPDIR',
+  'USER',
+  'USERNAME',
+  'UV_CACHE_DIR',
+  'UV_DATA_DIR',
+])
 const SCOPE_ROLLUP_CAPTURE_ELIGIBILITY = Object.freeze({
   event: 'SubagentStop',
   secrets_mode: 'none',
@@ -59,6 +84,9 @@ function isDescendantPath(candidate, parent) {
 }
 
 function resolveScopeRollupCaptureScript() {
+  if (!isScopeRollupCaptureTestTransport) {
+    return defaultScopeRollupCaptureScript
+  }
   const configured = process.env.CODEX_SCOPE_ROLLUP_CAPTURE_SCRIPT
   if (!configured) return defaultScopeRollupCaptureScript
 
@@ -74,6 +102,17 @@ function resolveScopeRollupCaptureScript() {
 }
 
 const scopeRollupCaptureScript = resolveScopeRollupCaptureScript()
+
+function buildScopeRollupCaptureEnv() {
+  const env = {}
+  for (const key of SCOPE_ROLLUP_CAPTURE_ENV_ALLOWLIST) {
+    if (process.env[key] !== undefined) {
+      env[key] = process.env[key]
+    }
+  }
+  env.PYTHONUNBUFFERED = '1'
+  return env
+}
 
 // Issue #1428: shell command structure analyzer (SHELL_COMMAND_ANALYSIS_V1).
 // Invoked out-of-process via execFile-style argv (no shell interpolation,
@@ -778,35 +817,74 @@ function shouldRunScopeRollupCapture(eventName, payload) {
 }
 
 function runScopeRollupCapture(rawPayload) {
-  let result
-  try {
-    result = spawnSync('uv', ['run', '--locked', 'python3', scopeRollupCaptureScript], {
-      cwd: repoRoot,
-      input: rawPayload,
-      encoding: 'utf8',
-      timeout: SCOPE_ROLLUP_CAPTURE_TIMEOUT_MS,
-      killSignal: 'SIGKILL',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    })
-  } catch {
-    process.stderr.write('[codex-hook-adapter] warn: scope-rollup capture skipped (capture_spawn_error)\n')
-    return
-  }
+  return new Promise((resolveCapture) => {
+    let timeoutHandle
+    let timedOut = false
 
-  if (result.error) {
-    const reason = result.error.code === 'ETIMEDOUT'
-      ? 'capture_timeout'
-      : 'capture_spawn_error'
-    process.stderr.write(`[codex-hook-adapter] warn: scope-rollup capture skipped (${reason})\n`)
-    return
-  }
-  if (result.signal === 'SIGKILL') {
-    process.stderr.write('[codex-hook-adapter] warn: scope-rollup capture skipped (capture_timeout)\n')
-    return
-  }
-  if (result.status !== 0) {
-    process.stderr.write('[codex-hook-adapter] warn: scope-rollup capture skipped (capture_nonzero)\n')
-  }
+    const child = spawn('uv', ['run', '--locked', 'python3', scopeRollupCaptureScript], {
+      cwd: repoRoot,
+      env: buildScopeRollupCaptureEnv(),
+      stdio: ['pipe', 'ignore', 'ignore'],
+      detached: true,
+    })
+
+    const clearTimer = () => {
+      if (timeoutHandle) {
+        globalThis.clearTimeout(timeoutHandle)
+        timeoutHandle = undefined
+      }
+    }
+
+    const stopProcessGroup = () => {
+      if (!child.pid) return
+      try {
+        process.kill(-child.pid, 'SIGKILL')
+      } catch {
+        // process group may already be gone
+      }
+      try {
+        child.kill('SIGKILL')
+      } catch {
+        // already exited
+      }
+    }
+
+    const finish = (status) => {
+      clearTimer()
+      resolveCapture(status)
+    }
+
+    timeoutHandle = globalThis.setTimeout(() => {
+      timedOut = true
+      stopProcessGroup()
+      finish('capture_timeout')
+    }, SCOPE_ROLLUP_CAPTURE_TIMEOUT_MS)
+
+    child.on('error', () => {
+      if (timedOut) return
+      finish('capture_spawn_error')
+    })
+
+    child.on('close', (code, signal) => {
+      if (timedOut) return
+      if (signal === 'SIGKILL' || code === null) {
+        finish('capture_timeout')
+        return
+      }
+      if (code !== 0) {
+        finish('capture_nonzero')
+        return
+      }
+      finish('capture_ok')
+    })
+
+    child.stdin.write(rawPayload)
+    child.stdin.end()
+  }).then((status) => {
+    if (status !== 'capture_ok') {
+      process.stderr.write(`[codex-hook-adapter] warn: scope-rollup capture skipped (${status})\n`)
+    }
+  })
 }
 
 async function main() {
@@ -859,7 +937,7 @@ async function main() {
     if (shouldRunScopeRollupCapture(event, payload)) {
       // Capture transport is fail-open: semantic rejection, nonzero exit, and
       // timeout never replace the existing manifest/decision flow.
-      runScopeRollupCapture(rawPayload)
+      await runScopeRollupCapture(rawPayload)
     }
     // AC3: session recording failure → best-effort telemetry, always continue:true
     let result
