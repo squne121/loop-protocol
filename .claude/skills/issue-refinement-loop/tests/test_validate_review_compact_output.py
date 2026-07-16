@@ -543,10 +543,13 @@ class TestInjectionRejection:
 class TestParityWithRealProducers:
     def test_parity_with_real_producer_output(self, tmp_path, monkeypatch):
         """GIVEN real compact_review_result.py stdout for an approve fixture
-        WHEN validated THEN valid; GIVEN real reviewer_claim_replay.py
-        analyze() output for a deterministic_fail_confirmed scenario, used
-        to build a needs-fix envelope's REPLAY_* fields, WHEN validated
-        THEN valid.
+        WHEN validated THEN valid; GIVEN the REAL production chain -- real
+        `compact_review_result.py` needs-fix stdout (child, carrying only
+        REVIEWER_BLOCKER_CLAIM) parsed into a claim, replayed through the
+        real `parent_replay_binding.build_parent_replay_binding()` (parent),
+        assembled into a V2 envelope, and validated via the real
+        `validate_review_compact_output_v2` -- WHEN validated THEN valid
+        (Issue #1532 Blocker 3.1/3.4).
 
         `monkeypatch.chdir(tmp_path)` keeps the real producer's default
         (relative) artifact_dir relative in the resulting ARTIFACT/EVIDENCE
@@ -556,7 +559,6 @@ class TestParityWithRealProducers:
         monkeypatch.chdir(tmp_path)
         sys.path.insert(0, str(SCRIPTS_DIR))
         from compact_review_result import compact_review_result
-        from reviewer_claim_replay import analyze
 
         # -- approve parity --
         approve_raw = json.loads((FIXTURES_DIR / "review_result_approve.json").read_text(encoding="utf-8"))
@@ -571,15 +573,9 @@ class TestParityWithRealProducers:
         assert approve_result["validation_status"] == "valid", approve_result["violations"]
         assert approve_result["envelope_kind"] == "approve"
 
-        # -- needs-fix parity: real reviewer_claim_replay.py analyze() output --
-        body_sha = f"sha256:{_fake_sha256('parity-body')}"
-        review = {
-            "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
-            "issue_url": "https://github.com/squne121/loop-protocol/issues/1507",
-            "body_sha256": body_sha,
-            "blocking_issues": [{"code": "LP010", "message": "ac/vc mismatch"}],
-            "structured_blockers": [],
-        }
+        # -- needs-fix parity: REAL production chain --
+        body_bytes = b"parity-body-current-snapshot"
+        body_sha = f"sha256:{hashlib.sha256(body_bytes).hexdigest()}"
         readiness = {
             "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
             "body_sha256": body_sha,
@@ -593,41 +589,73 @@ class TestParityWithRealProducers:
                 }
             ],
         }
-        replay_result, _next_state = analyze(
-            review_result=review,
-            readiness_result=readiness,
-            vc_syntax_result=None,
-            vc_preflight_result=None,
-            previous_state={},
-        )
-        assert replay_result["verdict"] == "deterministic_fail_confirmed"
-        assert replay_result["routing"] == "proceed_to_rewrite"
-        assert replay_result["should_consume_iteration"] is True
 
+        # 1) CHILD step: the real compact_review_result.py producer builds
+        #    the needs-fix stdout, including the bounded REVIEWER_BLOCKER_CLAIM
+        #    field (no REPLAY_* fields -- those are retired for children).
         needs_fix_raw = json.loads((FIXTURES_DIR / "review_result_needs_fix.json").read_text(encoding="utf-8"))
-        needs_fix_raw = {**needs_fix_raw, "body_sha256": body_sha}
+        needs_fix_raw = {
+            **needs_fix_raw,
+            "body_sha256": body_sha,
+            "blocking_issues": [{"code": "LP010", "message": "ac/vc mismatch"}],
+        }
         _compact_nf, stdout_lines_nf, _artifact_path_nf, _content_nf = compact_review_result(
             needs_fix_raw,
             artifact_dir=Path(".claude/artifacts/issue-refinement-loop"),
             issue_number=1507,
             repo_root=tmp_path,
         )
-        replay_artifact_digest = (
-            f"sha256:{hashlib.sha256(json.dumps(replay_result, sort_keys=True).encode('utf-8')).hexdigest()}"
+        child_text = "\n".join(stdout_lines_nf)
+        claim_line = _compact_nf["REVIEWER_BLOCKER_CLAIM"]
+        reviewer_blocker_claim = json.loads(claim_line)
+
+        # 2) PARENT step: real parent_replay_binding.py replay over
+        #    parent-owned readiness_result + the (validated) child claim.
+        binding_artifact = _pb.build_parent_replay_binding(
+            reviewer_blocker_claim=reviewer_blocker_claim,
+            readiness_result=readiness,
+            vc_syntax_result=None,
+            vc_preflight_result=None,
+            previous_state=None,
+            current_body_bytes=body_bytes,
+            issue_url="https://github.com/squne121/loop-protocol/issues/1507",
+            repository_full_name="squne121/loop-protocol",
+            issue_number=1507,
+            refinement_session_id="session-parity",
+            iteration_id="iteration-parity",
         )
-        should_consume_literal = "true" if replay_result["should_consume_iteration"] else "false"
-        replay_lines = [
-            f"REPLAY_VERDICT: {replay_result['verdict']}",
-            f"REPLAY_ROUTING: {replay_result['routing']}",
-            f"REPLAY_SHOULD_CONSUME: {should_consume_literal}",
-            f"REPLAY_BODY_SHA256: {replay_result['body_sha256']}",
-            f"REPLAY_ARTIFACT_DIGEST: {replay_artifact_digest}",
-        ]
-        needs_fix_text = "\n".join(stdout_lines_nf) + "\n" + "\n".join(replay_lines)
-        needs_fix_result = validate_review_compact_output(needs_fix_text, issue_number=1507)
+        replay_result = binding_artifact["replay_result"]
+        assert replay_result["verdict"] == "deterministic_fail_confirmed"
+        assert replay_result["routing"] == "proceed_to_rewrite"
+        assert replay_result["should_consume_iteration"] is True
+
+        # 3) ASSEMBLER step: orchestrator appends its own parent-computed
+        #    fields to the child's real stdout text.
+        v2_text = child_text + "\n" + "\n".join(
+            [
+                f"PARENT_REPLAY_VERDICT: {replay_result['verdict']}",
+                f"PARENT_REPLAY_ROUTING: {replay_result['routing']}",
+                "PARENT_REPLAY_SHOULD_CONSUME: "
+                + ("true" if replay_result["should_consume_iteration"] else "false"),
+                f"PARENT_REPLAY_BODY_SHA256: {replay_result['body_sha256']}",
+                f"PARENT_REPLAY_NEXT_STATE: {_pb.canonical_replay_next_state_line(binding_artifact)}",
+                f"PARENT_REPLAY_BINDING_DIGEST: {binding_artifact['binding_digest']}",
+            ]
+        )
+
+        # 4) VALIDATOR step: real validate_review_compact_output_v2.
+        needs_fix_result = validate_review_compact_output_v2(
+            v2_text,
+            issue_number=1507,
+            binding_artifact=binding_artifact,
+            repository_full_name="squne121/loop-protocol",
+            refinement_session_id="session-parity",
+            iteration_id="iteration-parity",
+            current_body_sha256=body_sha,
+        )
         assert needs_fix_result["validation_status"] == "valid", needs_fix_result["violations"]
-        assert needs_fix_result["envelope_kind"] == "needs_fix"
-        assert needs_fix_result["normalized_payload"]["REPLAY_VERDICT"] == "deterministic_fail_confirmed"
+        assert needs_fix_result["envelope_kind"] == "needs_fix_v2"
+        assert needs_fix_result["normalized_payload"]["PARENT_REPLAY_VERDICT"] == "deterministic_fail_confirmed"
 
     def test_replay_verdict_enum_matches_reviewer_claim_replay_legacy_map(self):
         """GIVEN reviewer_claim_replay.py's own _LEGACY_VERDICT_MAP_V1 WHEN
@@ -886,101 +914,277 @@ class TestProducerOutputMutationTesting:
 
 
 # ---------------------------------------------------------------------------
-# Issue #1532 (V2): parent-owned replay binding envelope
+# Issue #1532 (V2): parent-local replay integrity binding envelope
 # ---------------------------------------------------------------------------
+
+import parent_replay_binding as _pb  # noqa: E402
+
+_V2_BODY_BYTES = b"issue body used for the V2 parity fixture"
+_V2_BODY_SHA256 = f"sha256:{hashlib.sha256(_V2_BODY_BYTES).hexdigest()}"
+_V2_IDENTITY = dict(
+    repository_full_name="squne121/loop-protocol",
+    issue_number=1507,
+    refinement_session_id="session-v2",
+    iteration_id="iteration-v2",
+)
+
+
+def _v2_claim(*, blockers=None) -> dict:
+    return {
+        "schema": "REVIEWER_BLOCKER_CLAIM_V1",
+        "body_sha256": _V2_BODY_SHA256,
+        "blockers": blockers
+        if blockers is not None
+        else [{"reviewer_blocker_code": "LP010", "message": "ac/vc mismatch", "line_start": 5, "line_end": 5}],
+    }
+
+
+def _v2_readiness() -> dict:
+    return {
+        "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+        "body_sha256": _V2_BODY_SHA256,
+        "errors": [
+            {
+                "rule_id": "LP010",
+                "source_check": "validate_issue_body",
+                "category": "body_lint",
+                "line_start": 5,
+                "line_end": 5,
+            }
+        ],
+    }
+
+
+def _v2_binding_artifact(**overrides) -> dict:
+    kwargs = dict(
+        reviewer_blocker_claim=_v2_claim(),
+        readiness_result=_v2_readiness(),
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state=None,
+        current_body_bytes=_V2_BODY_BYTES,
+        issue_url="https://github.com/squne121/loop-protocol/issues/1507",
+        **_V2_IDENTITY,
+    )
+    kwargs.update(overrides)
+    return _pb.build_parent_replay_binding(**kwargs)
 
 
 def _v2_needs_fix_envelope(
     *,
-    replay_next_state: str = '{"schema":"REVIEWER_CLAIM_REPLAY_STATE_V2"}',
-    replay_parent_binding_digest: str | None = None,
-    **kwargs,
-) -> str:
-    replay_parent_binding_digest = replay_parent_binding_digest or f"sha256:{_fake_sha256('parent-binding')}"
-    base = _needs_fix_envelope(**kwargs)
+    artifact_path: str = ".claude/artifacts/issue-refinement-loop/1507/compact_review_result_20260714T113304Z.json",
+    binding_artifact: dict | None = None,
+    reviewer_blocker_claim_line: str | None = None,
+    parent_replay_verdict: str | None = None,
+    parent_replay_routing: str | None = None,
+    parent_replay_should_consume: str | None = None,
+    parent_replay_body_sha256: str | None = None,
+    parent_replay_next_state: str | None = None,
+    parent_replay_binding_digest: str | None = None,
+) -> tuple[str, dict]:
+    binding_artifact = binding_artifact if binding_artifact is not None else _v2_binding_artifact()
+    replay_result = binding_artifact["replay_result"]
+    claim_line = reviewer_blocker_claim_line or _pb.canonical_json_bytes(
+        _pb.validate_reviewer_blocker_claim(_v2_claim())
+    ).decode("utf-8")
+    base = _approve_envelope(
+        verdict="needs-fix",
+        summary="1 blocker(s)",
+        blockers="1",
+        next_action="request_changes",
+        artifact_path=artifact_path,
+    )
     extra = [
-        f"REPLAY_NEXT_STATE: {replay_next_state}",
-        f"REPLAY_PARENT_BINDING_DIGEST: {replay_parent_binding_digest}",
+        f"REVIEWER_BLOCKER_CLAIM: {claim_line}",
+        f"PARENT_REPLAY_VERDICT: {parent_replay_verdict or replay_result['verdict']}",
+        f"PARENT_REPLAY_ROUTING: {parent_replay_routing or replay_result['routing']}",
+        "PARENT_REPLAY_SHOULD_CONSUME: "
+        + (
+            parent_replay_should_consume
+            if parent_replay_should_consume is not None
+            else ("true" if replay_result["should_consume_iteration"] else "false")
+        ),
+        f"PARENT_REPLAY_BODY_SHA256: {parent_replay_body_sha256 or replay_result['body_sha256']}",
+        "PARENT_REPLAY_NEXT_STATE: "
+        + (parent_replay_next_state or _pb.canonical_replay_next_state_line(binding_artifact)),
+        f"PARENT_REPLAY_BINDING_DIGEST: {parent_replay_binding_digest or binding_artifact['binding_digest']}",
     ]
-    return base + "\n" + "\n".join(extra)
+    return base + "\n" + "\n".join(extra), binding_artifact
+
+
+def _validate_v2(envelope: str, binding_artifact: dict, **overrides) -> dict:
+    kwargs = dict(
+        issue_number=_V2_IDENTITY["issue_number"],
+        binding_artifact=binding_artifact,
+        repository_full_name=_V2_IDENTITY["repository_full_name"],
+        refinement_session_id=_V2_IDENTITY["refinement_session_id"],
+        iteration_id=_V2_IDENTITY["iteration_id"],
+        current_body_sha256=_V2_BODY_SHA256,
+    )
+    kwargs.update(overrides)
+    return validate_review_compact_output_v2(envelope, **kwargs)
 
 
 class TestV2ParentBindingEnvelope:
     """GIVEN an ISSUE_REVIEW_RESULT_COMPACT_V2 needs-fix envelope THEN the
-    V2 validator accepts the exact 15-line grammar and fails closed on any
-    tamper of the parent-owned fields (Issue #1532 AC4)."""
+    V2 validator accepts the exact 15-line grammar (child's bounded claim +
+    parent-computed PARENT_REPLAY_* fields) ONLY against a REQUIRED,
+    independently-supplied binding artifact, and fails closed on any tamper
+    (Issue #1532 AC4/High-1)."""
 
     def test_valid_v2_envelope_is_accepted(self):
-        envelope = _v2_needs_fix_envelope()
-        result = validate_review_compact_output_v2(envelope, issue_number=1507)
-        assert result["validation_status"] == "valid"
+        envelope, binding_artifact = _v2_needs_fix_envelope()
+        result = _validate_v2(envelope, binding_artifact)
+        assert result["validation_status"] == "valid", result["violations"]
         assert result["envelope_kind"] == "needs_fix_v2"
-        assert "REPLAY_NEXT_STATE" in result["normalized_payload"]
-        assert "REPLAY_PARENT_BINDING_DIGEST" in result["normalized_payload"]
+        assert "PARENT_REPLAY_NEXT_STATE" in result["normalized_payload"]
+        assert "PARENT_REPLAY_BINDING_DIGEST" in result["normalized_payload"]
+        # The retired child self-report fields never appear in V2 output.
+        assert "REPLAY_VERDICT" not in result["normalized_payload"]
 
-    def test_v1_envelopes_are_unaffected_by_v2_validator(self):
+    def test_v1_approve_envelopes_are_unaffected_by_v2_validator(self):
         """GIVEN a plain V1 approve envelope THEN validate_review_compact_output_v2
-        delegates to the V1 result unchanged (V2 is purely additive)."""
+        delegates to the V1 result unchanged (V2 is purely additive for approve)."""
         envelope = _approve_envelope()
         v1_result = validate_review_compact_output(envelope, issue_number=1507)
-        v2_result = validate_review_compact_output_v2(envelope, issue_number=1507)
+        binding_artifact = _v2_binding_artifact()
+        v2_result = _validate_v2(envelope, binding_artifact)
         assert v2_result == v1_result
 
-    def test_tampered_parent_binding_digest_fails_closed(self):
-        envelope = _v2_needs_fix_envelope()
-        result = validate_review_compact_output_v2(
-            envelope,
-            issue_number=1507,
-            expected_parent_binding_digest=f"sha256:{_fake_sha256('a-different-value')}",
-        )
-        assert result["validation_status"] == "invalid"
-        assert result["next_action"] == "human_judgment_required"
-        assert "replay_parent_binding_digest_mismatch" in {v["code"] for v in result["violations"]}
-
-    def test_tampered_replay_next_state_fails_closed(self):
-        envelope = _v2_needs_fix_envelope()
-        result = validate_review_compact_output_v2(
-            envelope,
-            issue_number=1507,
-            expected_replay_next_state='{"schema":"different"}',
-        )
-        assert result["validation_status"] == "invalid"
-        assert "replay_next_state_mismatch" in {v["code"] for v in result["violations"]}
-
-    def test_malformed_replay_next_state_json_fails_closed(self):
-        envelope = _v2_needs_fix_envelope(replay_next_state="not-json{{")
-        result = validate_review_compact_output_v2(envelope, issue_number=1507)
-        assert result["validation_status"] == "invalid"
-        assert "replay_next_state_invalid_json" in {v["code"] for v in result["violations"]}
-
-    def test_malformed_parent_binding_digest_format_fails_closed(self):
-        envelope = _v2_needs_fix_envelope(replay_parent_binding_digest="not-a-digest")
-        result = validate_review_compact_output_v2(envelope, issue_number=1507)
-        assert result["validation_status"] == "invalid"
-        assert "replay_parent_binding_digest_invalid_format" in {v["code"] for v in result["violations"]}
-
-    def test_missing_v2_field_falls_back_to_unknown(self):
-        """Dropping REPLAY_PARENT_BINDING_DIGEST leaves a 14-line sequence
-        that matches neither the V1 13-line needs-fix template nor the V2
-        15-line template -- fail-closed to unknown/invalid, never silently
-        accepted as V1."""
-        envelope = _v2_needs_fix_envelope()
-        lines = envelope.split("\n")[:-1]  # drop REPLAY_PARENT_BINDING_DIGEST
-        result = validate_review_compact_output_v2("\n".join(lines), issue_number=1507)
+    def test_v1_needs_fix_envelope_is_never_valid_under_v2(self):
+        """Issue #1532 Blocker 2: the retired V1 13-line REPLAY_* child
+        self-report envelope must NOT be accepted by the V2 validator --
+        there is no producer that emits it anymore, and it must not
+        silently satisfy the V2 15-line grammar either."""
+        envelope = _needs_fix_envelope()
+        binding_artifact = _v2_binding_artifact()
+        result = _validate_v2(envelope, binding_artifact)
         assert result["validation_status"] == "invalid"
         assert result["envelope_kind"] == "unknown"
 
-    def test_expected_values_matching_the_envelope_pass(self):
-        next_state = '{"schema":"REVIEWER_CLAIM_REPLAY_STATE_V2","consecutive_unbacked_count":0}'
-        digest = f"sha256:{_fake_sha256('exact-match')}"
-        envelope = _v2_needs_fix_envelope(
-            replay_next_state=next_state,
-            replay_parent_binding_digest=digest,
+    def test_missing_expected_binding_artifact_is_a_type_error_at_call_site(self):
+        """High-1: there is no optional binding_artifact code path -- a
+        caller omitting it entirely fails to construct a valid call."""
+        envelope, _binding_artifact = _v2_needs_fix_envelope()
+        with pytest.raises(TypeError):
+            validate_review_compact_output_v2(  # type: ignore[call-arg]
+                envelope,
+                issue_number=1507,
+                repository_full_name=_V2_IDENTITY["repository_full_name"],
+                refinement_session_id=_V2_IDENTITY["refinement_session_id"],
+                iteration_id=_V2_IDENTITY["iteration_id"],
+                current_body_sha256=_V2_BODY_SHA256,
+            )
+
+    def test_binding_artifact_digest_tamper_fails_closed(self):
+        envelope, binding_artifact = _v2_needs_fix_envelope()
+        tampered_artifact = dict(binding_artifact)
+        tampered_artifact["binding_digest"] = f"sha256:{_fake_sha256('a-different-value')}"
+        result = _validate_v2(envelope, tampered_artifact)
+        assert result["validation_status"] == "invalid"
+        assert result["next_action"] == "human_judgment_required"
+        assert "binding_artifact_digest_self_inconsistent" in {v["code"] for v in result["violations"]}
+
+    def test_envelope_parent_replay_binding_digest_mismatch_fails_closed(self):
+        envelope, binding_artifact = _v2_needs_fix_envelope(
+            parent_replay_binding_digest=f"sha256:{_fake_sha256('forged')}"
         )
-        result = validate_review_compact_output_v2(
-            envelope,
-            issue_number=1507,
-            expected_replay_next_state=next_state,
-            expected_parent_binding_digest=digest,
+        result = _validate_v2(envelope, binding_artifact)
+        assert result["validation_status"] == "invalid"
+        assert "parent_replay_binding_digest_mismatch" in {v["code"] for v in result["violations"]}
+
+    def test_envelope_parent_replay_next_state_mismatch_fails_closed(self):
+        envelope, binding_artifact = _v2_needs_fix_envelope(
+            parent_replay_next_state='{"schema":"different"}'
         )
-        assert result["validation_status"] == "valid"
+        result = _validate_v2(envelope, binding_artifact)
+        assert result["validation_status"] == "invalid"
+        assert "parent_replay_next_state_mismatch" in {v["code"] for v in result["violations"]}
+
+    def test_malformed_parent_replay_next_state_json_fails_closed(self):
+        envelope, binding_artifact = _v2_needs_fix_envelope(parent_replay_next_state="not-json{{")
+        result = _validate_v2(envelope, binding_artifact)
+        assert result["validation_status"] == "invalid"
+        assert "parent_replay_next_state_invalid_json" in {v["code"] for v in result["violations"]}
+
+    def test_malformed_parent_replay_binding_digest_format_fails_closed(self):
+        envelope, binding_artifact = _v2_needs_fix_envelope(parent_replay_binding_digest="not-a-digest")
+        result = _validate_v2(envelope, binding_artifact)
+        assert result["validation_status"] == "invalid"
+        assert "parent_replay_binding_digest_invalid_format" in {v["code"] for v in result["violations"]}
+
+    def test_missing_v2_field_falls_back_to_unknown(self):
+        """Dropping PARENT_REPLAY_BINDING_DIGEST leaves a 14-line sequence
+        that matches neither the V1 13-line needs-fix template nor the V2
+        15-line template -- fail-closed to unknown/invalid, never silently
+        accepted as V1."""
+        envelope, binding_artifact = _v2_needs_fix_envelope()
+        lines = envelope.split("\n")[:-1]  # drop PARENT_REPLAY_BINDING_DIGEST
+        result = _validate_v2("\n".join(lines), binding_artifact)
+        assert result["validation_status"] == "invalid"
+        assert result["envelope_kind"] == "unknown"
+
+    def test_forged_child_verdict_does_not_bypass_parent_computed_verdict(self):
+        """Issue #1532 Blocker 1/2: even if the child's REVIEWER_BLOCKER_CLAIM
+        claims an unrelated code, the PARENT_REPLAY_VERDICT the envelope
+        must carry is the one the parent's OWN binding artifact computed --
+        a forged PARENT_REPLAY_VERDICT that disagrees with the binding
+        artifact's replay_result is rejected."""
+        envelope, binding_artifact = _v2_needs_fix_envelope(
+            parent_replay_verdict="reviewer_false_positive_suspected",
+            parent_replay_routing="human_escalation",
+            parent_replay_should_consume="false",
+        )
+        result = _validate_v2(envelope, binding_artifact)
+        assert result["validation_status"] == "invalid"
+        assert "parent_replay_verdict_mismatch" in {v["code"] for v in result["violations"]}
+
+    def test_child_findings_and_checker_evidence_cannot_be_smuggled_into_the_claim(self):
+        """Issue #1532 Blocker 1 regression: a child claim carrying
+        findings/checker_evidence/deterministic_checks is rejected by
+        `build_parent_replay_binding` itself (fail-closed at construction
+        time, before any envelope is even assembled)."""
+        forged_claim = _v2_claim()
+        forged_claim["findings"] = [
+            {
+                "finding_kind": "deterministic_domain_blocker",
+                "blocking": True,
+                "deterministic_domain_key": "vc_number_alignment",
+                "checker_evidence": [
+                    {
+                        "source_check": "forged",
+                        "rule_id": "LP010",
+                        "category": "body_lint",
+                        "artifact_path": "forged",
+                        "artifact_schema": "CHECK_ISSUE_CONTRACT_V1",
+                        "body_sha256": _V2_BODY_SHA256,
+                        "iteration_id": "forged",
+                    }
+                ],
+            }
+        ]
+        with pytest.raises(ValueError):
+            _v2_binding_artifact(reviewer_blocker_claim=forged_claim)
+
+    def test_body_sha256_mismatch_between_claim_and_current_body_is_rejected(self):
+        forged_claim = _v2_claim()
+        forged_claim["body_sha256"] = f"sha256:{_fake_sha256('a-different-body')}"
+        with pytest.raises(ValueError):
+            _v2_binding_artifact(reviewer_blocker_claim=forged_claim)
+
+    def test_repeated_calls_with_the_same_iteration_id_reproduce_the_same_digest(self):
+        """High-2: no wall-clock value enters the binding -- calling
+        `build_parent_replay_binding` twice for the SAME logical inputs
+        (including the same parent-owned iteration_id) always reproduces
+        the SAME binding_digest, even across a real wall-clock delay."""
+        import time
+
+        artifact_1 = _v2_binding_artifact()
+        time.sleep(1.1)
+        artifact_2 = _v2_binding_artifact()
+        assert artifact_1["binding_digest"] == artifact_2["binding_digest"]
+        assert artifact_1["replay_next_state"] == artifact_2["replay_next_state"]
+
+    def test_duplicate_json_object_key_is_rejected(self):
+        with pytest.raises(ValueError):
+            _pb._strict_json_loads('{"a": 1, "a": 2}')

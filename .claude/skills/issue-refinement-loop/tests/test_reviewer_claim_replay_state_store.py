@@ -377,18 +377,29 @@ def test_cli_requires_exactly_one_of_read_or_write(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Issue #1532 AC5: --write-v2 only persists REPLAY_NEXT_STATE from a
-# validated REVIEW_COMPACT_VALIDATION_RESULT_V2 payload.
+# Issue #1532 AC5/High-3: --write-v2 only persists PARENT_REPLAY_NEXT_STATE
+# from a STRICTLY validated REVIEW_COMPACT_VALIDATION_RESULT_V2 payload --
+# not merely a payload whose validation_status field says "valid" (High-3:
+# a caller-fabricated {"validation_status": "valid", ...} object is
+# rejected unless schema/schema_version/envelope_kind/violations/identity
+# also check out).
 # ---------------------------------------------------------------------------
+
+_VALID_BINDING_DIGEST = "sha256:" + ("a" * 64)
 
 
 def _valid_validation_result_v2(**overrides: object) -> dict[str, object]:
     payload = {
         "schema": "REVIEW_COMPACT_VALIDATION_RESULT_V2",
+        "schema_version": "2",
         "validation_status": "valid",
         "envelope_kind": "needs_fix_v2",
+        "violations": [],
         "normalized_payload": {
-            "REPLAY_NEXT_STATE": json.dumps(_valid_state(), separators=(",", ":"), sort_keys=True),
+            "PARENT_REPLAY_NEXT_STATE": json.dumps(
+                _valid_state(), separators=(",", ":"), sort_keys=True
+            ),
+            "PARENT_REPLAY_BINDING_DIGEST": _VALID_BINDING_DIGEST,
         },
     }
     payload.update(overrides)
@@ -396,15 +407,21 @@ def _valid_validation_result_v2(**overrides: object) -> dict[str, object]:
 
 
 class TestWriteV2ValidatedOnly:
-    """Issue #1532 AC5: state store persists REPLAY_NEXT_STATE if and only
-    if the caller-supplied REVIEW_COMPACT_VALIDATION_RESULT_V2 has
-    validation_status: valid. Raw stdout / invalid validation / binding
-    mismatch never reach the state file."""
+    """Issue #1532 AC5/High-3: state store persists PARENT_REPLAY_NEXT_STATE
+    if and only if the caller-supplied REVIEW_COMPACT_VALIDATION_RESULT_V2
+    is STRICTLY well-formed (schema / schema_version / envelope_kind /
+    empty violations / identity) -- not merely `validation_status: valid`.
+    Raw stdout / invalid validation / binding mismatch / caller-fabricated
+    partial payloads never reach the state file."""
 
     def test_write_v2_persists_when_validation_status_is_valid(self, tmp_path: Path):
         result = store.write_state_v2_from_validated_payload(
             state_dir=tmp_path,
             validation_result_v2=_valid_validation_result_v2(),
+            expected_repository_full_name=IDENTITY["repository_full_name"],
+            expected_issue_number=IDENTITY["issue_number"],
+            expected_refinement_session_id=IDENTITY["refinement_session_id"],
+            expected_parent_binding_digest=_VALID_BINDING_DIGEST,
         )
         assert result["status"] == "ok"
         assert result["operation"] == "write_v2"
@@ -425,7 +442,7 @@ class TestWriteV2ValidatedOnly:
         before_bytes = state_path.read_bytes()
 
         # A human_judgment_required / invalid validation result (e.g. the
-        # child's REPLAY_PARENT_BINDING_DIGEST failed to match the
+        # child's PARENT_REPLAY_BINDING_DIGEST failed to match the
         # orchestrator's independently-computed expected digest) must
         # never overwrite the prior state.
         tampered = _valid_validation_result_v2(
@@ -450,8 +467,50 @@ class TestWriteV2ValidatedOnly:
         result = store.write_state_v2_from_validated_payload(
             state_dir=tmp_path,
             validation_result_v2=_valid_validation_result_v2(
-                normalized_payload={"REPLAY_NEXT_STATE": "not-json{{"}
+                normalized_payload={
+                    "PARENT_REPLAY_NEXT_STATE": "not-json{{",
+                    "PARENT_REPLAY_BINDING_DIGEST": _VALID_BINDING_DIGEST,
+                }
             ),
+        )
+        assert result["status"] == "rejected"
+        assert not store._state_path(tmp_path).exists()
+
+    def test_write_v2_rejects_caller_fabricated_valid_status_missing_schema(
+        self, tmp_path: Path
+    ):
+        """High-3 regression: a bare {"validation_status": "valid", ...}
+        object assembled by a caller/attacker (not produced by
+        build_result_v2) must be rejected -- the schema/schema_version/
+        envelope_kind/violations checks are NOT optional."""
+        fabricated = {
+            "validation_status": "valid",
+            "normalized_payload": {
+                "PARENT_REPLAY_NEXT_STATE": json.dumps(_valid_state()),
+                "PARENT_REPLAY_BINDING_DIGEST": _VALID_BINDING_DIGEST,
+            },
+        }
+        result = store.write_state_v2_from_validated_payload(
+            state_dir=tmp_path, validation_result_v2=fabricated
+        )
+        assert result["status"] == "rejected"
+        assert not store._state_path(tmp_path).exists()
+
+    def test_write_v2_rejects_nonempty_violations_even_when_status_is_valid(
+        self, tmp_path: Path
+    ):
+        tampered = _valid_validation_result_v2(violations=[{"code": "some_violation"}])
+        result = store.write_state_v2_from_validated_payload(
+            state_dir=tmp_path, validation_result_v2=tampered
+        )
+        assert result["status"] == "rejected"
+        assert not store._state_path(tmp_path).exists()
+
+    def test_write_v2_rejects_expected_binding_digest_mismatch(self, tmp_path: Path):
+        result = store.write_state_v2_from_validated_payload(
+            state_dir=tmp_path,
+            validation_result_v2=_valid_validation_result_v2(),
+            expected_parent_binding_digest="sha256:" + ("f" * 64),
         )
         assert result["status"] == "rejected"
         assert not store._state_path(tmp_path).exists()
@@ -465,6 +524,8 @@ class TestWriteV2ValidatedOnly:
                 str(tmp_path),
                 "--validation-result-v2-inline",
                 json.dumps(validation_result_v2),
+                "--expected-parent-binding-digest",
+                _VALID_BINDING_DIGEST,
             ]
         )
         assert rc == 0
