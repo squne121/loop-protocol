@@ -225,12 +225,13 @@ related_issue: "#1532"
 producer:
   - parent_replay_binding.py（issue-refinement-loop orchestrator が唯一の呼び出し元。child isolation worktree からは呼ばれない）
 consumer:
-  - validate_review_compact_output.py（V2 validator の expected_replay_next_state / expected_parent_binding_digest 照合入力）
-  - reviewer_claim_replay_state_store.py（--write-v2 の REPLAY_NEXT_STATE 永続化ソース）
+  - validate_review_compact_output.py（`--v2` の `--binding-artifact-file` 経由。artifact から独立に再計算した expected_replay_next_state / expected_parent_binding_digest を envelope の `PARENT_REPLAY_NEXT_STATE` / `PARENT_REPLAY_BINDING_DIGEST` と exact 照合する）
+  - reviewer_claim_replay_state_store.py（`--write-v2 --expected-parent-binding-digest` の `PARENT_REPLAY_NEXT_STATE` 永続化ソース）
 trust_boundary:
   - "review_result / readiness_result / vc_syntax_result / vc_preflight_result / previous_state はすべて呼び出し元（orchestrator）が自ら取得・保存・readback した parent-owned inventory であり、child isolation worktree の raw artifact ファイルは一切読まない（#1472 isolation boundary の継承）。"
-  - "review_result は child SubAgent が返す bounded REVIEWER_BLOCKER_CLAIM_V1（reviewer の blocker 主張）を含み得るが、それ自体は reviewer_claim_replay.analyze() の入力の一部として扱われるだけであり、REPLAY_NEXT_STATE の算出主体は常に parent 側の analyze() 呼び出しである（child が直接 REPLAY_NEXT_STATE を計算・主張することはない）。"
-  - "binding_digest（REPLAY_PARENT_BINDING_DIGEST）は REPLAY_ARTIFACT_DIGEST（child stdout digest、#1507/#1519 で導入・意味不変）とは別 field であり、両者を混同・代替してはならない。"
+  - "review_result は child SubAgent（issue-reviewer）が返す bounded `REVIEWER_BLOCKER_CLAIM_V1`（`{schema, body_sha256, blockers: [...]}` のみ、reviewer の blocker 主張）を含み得るが、それ自体は `reviewer_claim_replay.analyze()` の入力の一部として扱われるだけであり、`PARENT_REPLAY_NEXT_STATE` の算出主体は常に parent 側の `analyze()` 呼び出しである（child が直接 `PARENT_REPLAY_*` フィールドを計算・主張することは一切ない — parent-only fields）。"
+  - "この binding は `REVIEWER_BLOCKER_CLAIM_V1` を返す child claim（needs-fix claim）に限定される。approve envelope には replay/binding フィールドを一切追加しない（V1 approve grammar は不変）。"
+  - "`binding_digest`（envelope 上は `PARENT_REPLAY_BINDING_DIGEST`）は `REPLAY_ARTIFACT_DIGEST`（child stdout digest、#1507/#1519 で導入・意味不変、V1 needs-fix envelope 専用フィールド）とは別 field であり、両者を混同・代替してはならない。"
 non_guarantees:
   - "同一 OS UID の child に対する暗号学的な producer identity 証明・署名・鍵管理は行わない（#1532 Out of Scope）。"
   - "外部 attestation service とのバインドは行わない。"
@@ -258,19 +259,19 @@ schema_id: ISSUE_REVIEW_RESULT_COMPACT_V2 / REVIEW_COMPACT_VALIDATION_RESULT_V2
 definition: .claude/skills/issue-refinement-loop/scripts/validate_review_compact_output.py
 related_issue: "#1532"
 producer:
-  - issue-refinement-loop orchestrator（child の V1-valid needs-fix envelope テキストに REPLAY_NEXT_STATE / REPLAY_PARENT_BINDING_DIGEST の2行を自ら追記する。child SubAgent は producer ではない）
+  - issue-refinement-loop orchestrator（child が返す `REVIEWER_BLOCKER_CLAIM_V1` needs-fix claim に、自ら計算した `PARENT_REPLAY_VERDICT` / `PARENT_REPLAY_ROUTING` / `PARENT_REPLAY_SHOULD_CONSUME` / `PARENT_REPLAY_BODY_SHA256` / `PARENT_REPLAY_NEXT_STATE` / `PARENT_REPLAY_BINDING_DIGEST` の6行を追記して15行の V2 envelope を組み立てる。child SubAgent はこれら `PARENT_REPLAY_*` フィールドの producer ではない）
 consumer:
-  - issue-refinement-loop（Step 2a V2 routing gate）
-  - reviewer_claim_replay_state_store.py（--write-v2）
+  - issue-refinement-loop（Step 2a V2 routing gate。routing は `PARENT_REPLAY_*` のみを参照し、`REVIEWER_BLOCKER_CLAIM` は audit-only で routing には使わない）
+  - reviewer_claim_replay_state_store.py（`--write-v2 --expected-parent-binding-digest`）
 compatibility:
   breaking_changes:
     - NEEDS_FIX_FIELDS_V2 のフィールド集合・順序変更
-    - REPLAY_ARTIFACT_DIGEST / REPLAY_PARENT_BINDING_DIGEST の意味の統合・置換
+    - REPLAY_ARTIFACT_DIGEST（V1 needs-fix envelope の child stdout digest）と PARENT_REPLAY_BINDING_DIGEST（V2 needs-fix envelope の parent 計算 digest）の意味の統合・置換
   non_breaking_changes:
-    - approve envelope grammar への影響（V2 では approve に replay field を追加しない、が非破壊的に維持される限り）
+    - approve envelope grammar への影響（V2 では approve に replay/binding field を追加しない、が非破壊的に維持される限り）
 detection_patterns:
   - 'REVIEW_COMPACT_VALIDATION_RESULT_V2'
-  - 'REPLAY_PARENT_BINDING_DIGEST'
+  - 'PARENT_REPLAY_BINDING_DIGEST'
   - 'NEEDS_FIX_FIELDS_V2'
   - 'validate_review_compact_output_v2'
 validation_commands:
