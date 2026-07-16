@@ -69,6 +69,12 @@ POST_RESULT_NOT_REQUESTED = POST_STATUS_NOT_REQUESTED
 # the binding check and do not exercise real `gh api` subprocess calls; tests
 # that specifically exercise the binding check live in
 # test_contract_snapshot_author_binding.py and override this fixture locally.
+#
+# #1537: also default the new two-phase fingerprint materialize steps
+# (base_ref/base_sha capture, PATCH) to success for the same reason -- these
+# pre-existing regression scenarios exercise the POST flow / precedence
+# rules, not the fingerprint mechanism itself. Tests that specifically
+# exercise fingerprint materialization override these locally.
 # ---------------------------------------------------------------------------
 
 
@@ -77,6 +83,16 @@ def _default_trusted_comment_id_binding(monkeypatch):
     monkeypatch.setattr(
         _ecs_mod,
         "verify_controlled_publisher_comment_id_binding",
+        lambda *args, **kwargs: (True, None),
+    )
+    monkeypatch.setattr(
+        _ecs_mod,
+        "capture_base_ref_and_sha",
+        lambda *args, **kwargs: ("main", "a" * 40),
+    )
+    monkeypatch.setattr(
+        _ecs_mod,
+        "patch_comment",
         lambda *args, **kwargs: (True, None),
     )
 
@@ -1367,3 +1383,327 @@ class TestAtomicityFields:
         assert "comments_digest_at_check" in result
         assert result["body_sha256_at_check"] == _SAMPLE_BODY_SHA256
         assert result["issue_updated_at_at_check"] == _SAMPLE_UPDATED_AT
+
+
+# ---------------------------------------------------------------------------
+# Source-bound contract fingerprint (Issue #1537)
+# ---------------------------------------------------------------------------
+
+extract_allowed_paths_from_body = _ecs_mod.extract_allowed_paths_from_body
+compute_expected_contract_fingerprint = _ecs_mod.compute_expected_contract_fingerprint
+capture_base_ref_and_sha = _ecs_mod.capture_base_ref_and_sha
+patch_comment = _ecs_mod.patch_comment
+
+_real_parser_mod_for_fp_tests = _ecs_mod._import_parser_module()
+parse_contract_review_results = _real_parser_mod_for_fp_tests.parse_contract_review_results
+find_latest_go = _real_parser_mod_for_fp_tests.find_latest_go
+is_fingerprint_ready_go = _real_parser_mod_for_fp_tests.is_fingerprint_ready_go
+
+_BODY_WITH_ALLOWED_PATHS = """## Outcome
+
+Something.
+
+## Allowed Paths
+
+- `.claude/skills/impl-review-loop/scripts/ensure_contract_snapshot.py`
+- `.claude/skills/impl-review-loop/tests/test_ensure_contract_snapshot.py`
+
+## Stop Conditions
+
+- N/A
+"""
+
+
+class TestExtractAllowedPathsFromBody:
+    def test_extracts_bullet_paths(self):
+        paths = extract_allowed_paths_from_body(_BODY_WITH_ALLOWED_PATHS)
+        assert paths == [
+            ".claude/skills/impl-review-loop/scripts/ensure_contract_snapshot.py",
+            ".claude/skills/impl-review-loop/tests/test_ensure_contract_snapshot.py",
+        ]
+
+    def test_missing_section_returns_empty(self):
+        assert extract_allowed_paths_from_body("## Outcome\n\nNo allowed paths here.\n") == []
+
+    def test_empty_body_returns_empty(self):
+        assert extract_allowed_paths_from_body("") == []
+
+
+class TestComputeExpectedContractFingerprint:
+    def test_returns_seven_keys(self):
+        fp = compute_expected_contract_fingerprint(
+            issue_number=_ISSUE_NUMBER,
+            contract_source_id="12345",
+            contract_body_sha256=_SAMPLE_BODY_SHA256,
+            allowed_paths=[".claude/skills/impl-review-loop/scripts/ensure_contract_snapshot.py"],
+            base_ref="main",
+            base_sha_at_snapshot="a" * 40,
+        )
+        assert set(fp.keys()) == {
+            "issue_number",
+            "contract_source_kind",
+            "contract_source_id",
+            "contract_body_sha256",
+            "allowed_paths_normalized_sha256",
+            "base_ref",
+            "base_sha_at_snapshot",
+        }
+        assert fp["issue_number"] == _ISSUE_NUMBER
+        assert fp["contract_source_kind"] == "issue_comment"
+        assert fp["contract_source_id"] == "12345"
+        assert fp["contract_body_sha256"] == _SAMPLE_BODY_SHA256
+        assert fp["base_ref"] == "main"
+        assert fp["base_sha_at_snapshot"] == "a" * 40
+
+    def test_allowed_paths_hash_matches_gate_recomputation(self):
+        """AC4: the gate must be able to recompute an identical
+        allowed_paths_normalized_sha256 from the same Allowed Paths list."""
+        import sys as _sys
+
+        gate_scripts_dir = (
+            Path(__file__).resolve().parents[4]
+            / ".claude"
+            / "skills"
+            / "pr-review-judge"
+            / "scripts"
+        )
+        if str(gate_scripts_dir) not in _sys.path:
+            _sys.path.insert(0, str(gate_scripts_dir))
+        from allowed_paths_review_gate import AllowedPathsGateEvaluator  # noqa: E402
+
+        allowed_paths = ["src/**", "docs/foo.md"]
+        fp = compute_expected_contract_fingerprint(
+            issue_number=_ISSUE_NUMBER,
+            contract_source_id="1",
+            contract_body_sha256=_SAMPLE_BODY_SHA256,
+            allowed_paths=allowed_paths,
+            base_ref="main",
+            base_sha_at_snapshot="a" * 40,
+        )
+        evaluator = AllowedPathsGateEvaluator(
+            pr_number=1,
+            base_ref="main",
+            base_sha_at_snapshot="a" * 40,
+            current_base_sha="x",
+            diff_base_sha="x",
+            head_sha="y",
+            reviewed_head_sha="y",
+            allowed_paths=allowed_paths,
+            contract_body_sha256=_SAMPLE_BODY_SHA256,
+            contract_source_kind="issue_comment",
+            contract_source_id="1",
+            expected_contract_fingerprint=None,
+            issue_number=_ISSUE_NUMBER,
+        )
+        assert fp["allowed_paths_normalized_sha256"] == evaluator.compute_allowed_paths_hash()
+
+    def test_no_sha256_prefix_on_allowed_paths_hash(self):
+        fp = compute_expected_contract_fingerprint(
+            issue_number=_ISSUE_NUMBER,
+            contract_source_id="1",
+            contract_body_sha256=_SAMPLE_BODY_SHA256,
+            allowed_paths=["src/**"],
+            base_ref="main",
+            base_sha_at_snapshot="a" * 40,
+        )
+        assert not fp["allowed_paths_normalized_sha256"].startswith("sha256:")
+
+
+class TestCaptureBaseRefAndSha:
+    def test_success_returns_both_values(self):
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["gh", "api"] and "default_branch" in cmd[-1]:
+                pass
+            result = MagicMock()
+            result.returncode = 0
+            if "--jq" in cmd and cmd[cmd.index("--jq") + 1] == ".default_branch":
+                result.stdout = "main\n"
+            else:
+                result.stdout = ("a" * 40) + "\n"
+            return result
+
+        with patch.object(_ecs_mod.subprocess, "run", side_effect=fake_run):
+            base_ref, base_sha = capture_base_ref_and_sha(_REPO)
+
+        assert base_ref == "main"
+        assert base_sha == "a" * 40
+
+    def test_default_branch_failure_returns_none_none(self):
+        def fake_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 1
+            result.stdout = ""
+            return result
+
+        with patch.object(_ecs_mod.subprocess, "run", side_effect=fake_run):
+            base_ref, base_sha = capture_base_ref_and_sha(_REPO)
+
+        assert base_ref is None
+        assert base_sha is None
+
+    def test_sha_failure_returns_base_ref_with_none_sha(self):
+        calls = {"i": 0}
+
+        def fake_run(cmd, **kwargs):
+            result = MagicMock()
+            calls["i"] += 1
+            if calls["i"] == 1:
+                result.returncode = 0
+                result.stdout = "main\n"
+            else:
+                result.returncode = 1
+                result.stdout = ""
+            return result
+
+        with patch.object(_ecs_mod.subprocess, "run", side_effect=fake_run):
+            base_ref, base_sha = capture_base_ref_and_sha(_REPO)
+
+        assert base_ref == "main"
+        assert base_sha is None
+
+
+class TestFingerprintMaterializeEndToEnd:
+    """Integration coverage for the two-phase POST+PATCH materialize flow
+    (Issue #1537 AC1/AC5): the final PATCHed comment body must embed a
+    fingerprint whose contract_source_id equals the real posted comment id.
+    """
+
+    def test_post_then_patch_embeds_fingerprint_bound_to_real_comment_id(self, monkeypatch):
+        parser_mod = _mock_parser_mod(comments=[], go_comment=None, latest=None)
+        parser_mod.parse_contract_review_results.return_value = []
+        parser_mod.find_latest_go.return_value = None
+        parser_mod.find_latest_result.return_value = None
+
+        review_result = _make_review_result("go")
+        real_comment_id = 555444
+        real_url = f"{_ISSUE_URL}#issuecomment-{real_comment_id}"
+
+        def fake_post(issue_number, repo, body, timeout=30):
+            return (real_url, POST_STATUS_POSTED, None)
+
+        patched_calls = []
+
+        def fake_patch(issue_number, repo, comment_id, body, timeout=30):
+            patched_calls.append((comment_id, body))
+            return (True, None)
+
+        monkeypatch.setattr(_ecs_mod, "capture_base_ref_and_sha", lambda *a, **kw: ("main", "d" * 40))
+        monkeypatch.setattr(_ecs_mod, "patch_comment", fake_patch)
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(_ecs_mod, "fetch_issue_snapshot", return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None)):
+                with patch.object(_ecs_mod, "run_contract_review_once", return_value=(review_result, None)):
+                    with patch.object(_ecs_mod, "post_comment", side_effect=fake_post):
+                        result = ensure_contract_snapshot(
+                            issue_number=_ISSUE_NUMBER,
+                            repo=_REPO,
+                            mode="auto",
+                            do_post=True,
+                        )
+
+        assert result["status"] == "ok"
+        assert result["source"] == "materialized_go"
+        assert len(patched_calls) == 1
+        patched_comment_id, patched_body = patched_calls[0]
+        assert patched_comment_id == real_comment_id
+
+        parsed = parse_contract_review_results(
+            [{"id": real_comment_id, "html_url": real_url, "created_at": "now", "body": patched_body}],
+            _ISSUE_URL,
+        )
+        go_entry = find_latest_go(parsed)
+        assert go_entry is not None
+        fp = go_entry["inner"]["expected_contract_fingerprint"]
+        assert fp["contract_source_id"] == str(real_comment_id)
+        assert fp["issue_number"] == _ISSUE_NUMBER
+        assert fp["base_ref"] == "main"
+        assert fp["base_sha_at_snapshot"] == "d" * 40
+        assert is_fingerprint_ready_go(go_entry["inner"], real_comment_id, _ISSUE_NUMBER) is True
+
+    def test_base_ref_capture_failure_blocks_materialization(self, monkeypatch):
+        parser_mod = _mock_parser_mod(comments=[], go_comment=None, latest=None)
+        parser_mod.parse_contract_review_results.return_value = []
+        parser_mod.find_latest_go.return_value = None
+        parser_mod.find_latest_result.return_value = None
+
+        review_result = _make_review_result("go")
+        monkeypatch.setattr(_ecs_mod, "capture_base_ref_and_sha", lambda *a, **kw: (None, None))
+
+        posted = []
+
+        def fake_post(issue_number, repo, body, timeout=30):
+            posted.append(body)
+            return (f"{_ISSUE_URL}#issuecomment-1", POST_STATUS_POSTED, None)
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(_ecs_mod, "fetch_issue_snapshot", return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None)):
+                with patch.object(_ecs_mod, "run_contract_review_once", return_value=(review_result, None)):
+                    with patch.object(_ecs_mod, "post_comment", side_effect=fake_post):
+                        result = ensure_contract_snapshot(
+                            issue_number=_ISSUE_NUMBER,
+                            repo=_REPO,
+                            mode="auto",
+                            do_post=True,
+                        )
+
+        assert result["status"] == "runtime_error"
+        assert not posted, "must not post a go when base_ref/base_sha capture fails"
+
+    def test_patch_failure_does_not_report_ok(self, monkeypatch):
+        parser_mod = _mock_parser_mod(comments=[], go_comment=None, latest=None)
+        parser_mod.parse_contract_review_results.return_value = []
+        parser_mod.find_latest_go.return_value = None
+        parser_mod.find_latest_result.return_value = None
+
+        review_result = _make_review_result("go")
+        monkeypatch.setattr(_ecs_mod, "capture_base_ref_and_sha", lambda *a, **kw: ("main", "e" * 40))
+        monkeypatch.setattr(_ecs_mod, "patch_comment", lambda *a, **kw: (False, "patch_error"))
+
+        def fake_post(issue_number, repo, body, timeout=30):
+            return (f"{_ISSUE_URL}#issuecomment-2", POST_STATUS_POSTED, None)
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(_ecs_mod, "fetch_issue_snapshot", return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None)):
+                with patch.object(_ecs_mod, "run_contract_review_once", return_value=(review_result, None)):
+                    with patch.object(_ecs_mod, "post_comment", side_effect=fake_post):
+                        result = ensure_contract_snapshot(
+                            issue_number=_ISSUE_NUMBER,
+                            repo=_REPO,
+                            mode="auto",
+                            do_post=True,
+                        )
+
+        assert result["status"] == "controlled_publisher_binding_failed"
+        assert result["contract_snapshot_url"] is None
+
+
+class TestExistingGoFingerprintReuseGate:
+    """Issue #1537: an existing go lacking a fingerprint must not be reused
+    as current -- it must fall through to (re-)materialization."""
+
+    def test_existing_go_without_fingerprint_is_not_reused_in_check_only(self):
+        parser_mod = _mock_parser_mod(
+            comments=[_GO_COMMENT],
+            go_comment=_GO_COMMENT,
+            latest={
+                "comment_id": 1001,
+                "html_url": _GO_COMMENT["html_url"],
+                "status": "go",
+                "created_at": "2026-06-13T08:00:00Z",
+            },
+        )
+        # _mock_parser_mod's _fresh_inner() has no expected_contract_fingerprint,
+        # so real is_fingerprint_ready_go() logic is exercised (not mocked here).
+        real_parser_mod = _ecs_mod._import_parser_module()
+        parser_mod.is_fingerprint_ready_go = real_parser_mod.is_fingerprint_ready_go
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(_ecs_mod, "fetch_issue_snapshot", return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None)):
+                result = ensure_contract_snapshot(
+                    issue_number=_ISSUE_NUMBER,
+                    repo=_REPO,
+                    mode="check-only",
+                )
+
+        assert result["status"] == "human_judgment"
+        assert result["source"] == "readiness_blocked"

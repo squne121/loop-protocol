@@ -176,6 +176,10 @@ def test_controlled_publisher_comment_id_binding_is_required():
     assert reason == "missing_comment_id"
 
     # Matching binding → status: ok with a non-null contract_snapshot_url.
+    # #1537: capture_base_ref_and_sha / patch_comment are the two-phase
+    # fingerprint materialize steps added after the binding verify this test
+    # exercises; default them to success since this test's concern is the
+    # binding check, not fingerprint materialization mechanics.
     with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
         with patch.object(
             _ecs_mod, "fetch_issue_snapshot",
@@ -190,12 +194,20 @@ def test_controlled_publisher_comment_id_binding_is_required():
                         "verify_controlled_publisher_comment_id_binding",
                         return_value=(True, None),
                     ):
-                        matched_result = _ecs_mod.ensure_contract_snapshot(
-                            issue_number=_ISSUE_NUMBER,
-                            repo=_REPO,
-                            mode="auto",
-                            do_post=True,
-                        )
+                        with patch.object(
+                            _ecs_mod,
+                            "capture_base_ref_and_sha",
+                            return_value=("main", "a" * 40),
+                        ):
+                            with patch.object(
+                                _ecs_mod, "patch_comment", return_value=(True, None)
+                            ):
+                                matched_result = _ecs_mod.ensure_contract_snapshot(
+                                    issue_number=_ISSUE_NUMBER,
+                                    repo=_REPO,
+                                    mode="auto",
+                                    do_post=True,
+                                )
 
     assert matched_result["status"] == "ok"
     assert matched_result["contract_snapshot_url"] is not None
@@ -525,6 +537,9 @@ class TestControlledPublisherCommentIdBinding:
         def fake_post(issue_number, repo, body, timeout=30):
             return (f"{_ISSUE_URL}#issuecomment-9999", _ecs_mod.POST_STATUS_POSTED, None)
 
+        # #1537: default the two-phase fingerprint materialize steps to
+        # success; this test's concern is the binding check, not fingerprint
+        # materialization mechanics.
         with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
             with patch.object(
                 _ecs_mod, "fetch_issue_snapshot",
@@ -539,12 +554,20 @@ class TestControlledPublisherCommentIdBinding:
                             "verify_controlled_publisher_comment_id_binding",
                             return_value=(True, None),
                         ):
-                            result = _ecs_mod.ensure_contract_snapshot(
-                                issue_number=_ISSUE_NUMBER,
-                                repo=_REPO,
-                                mode="auto",
-                                do_post=True,
-                            )
+                            with patch.object(
+                                _ecs_mod,
+                                "capture_base_ref_and_sha",
+                                return_value=("main", "a" * 40),
+                            ):
+                                with patch.object(
+                                    _ecs_mod, "patch_comment", return_value=(True, None)
+                                ):
+                                    result = _ecs_mod.ensure_contract_snapshot(
+                                        issue_number=_ISSUE_NUMBER,
+                                        repo=_REPO,
+                                        mode="auto",
+                                        do_post=True,
+                                    )
 
         assert result["status"] == "ok"
         assert result["contract_snapshot_url"] == f"{_ISSUE_URL}#issuecomment-9999"

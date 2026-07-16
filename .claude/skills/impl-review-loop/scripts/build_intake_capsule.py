@@ -183,6 +183,27 @@ def _is_trusted_snapshot_author(
     )
 
 
+def _is_fingerprint_ready(
+    inner: dict[str, Any],
+    comment_id: Any,
+    issue_number: int | None,
+) -> bool:
+    """#1537: delegate to the shared fingerprint-readiness policy (single
+    source of truth) -- same rule contract_review_result_parser.py and
+    ensure_contract_snapshot.py use for the same expected_contract_fingerprint
+    schema."""
+    module = _load_module(_CRP_PATH, "contract_review_result_parser_for_intake_capsule")
+    return bool(module.is_fingerprint_ready_go(inner, comment_id, issue_number))
+
+
+_ISSUE_NUMBER_FROM_URL_RE = re.compile(r"/issues/(\d+)\Z")
+
+
+def _issue_number_from_url(issue_url: str) -> int | None:
+    m = _ISSUE_NUMBER_FROM_URL_RE.search(issue_url or "")
+    return int(m.group(1)) if m else None
+
+
 def _is_valid_contract_review_result(block: dict[str, Any], expected_issue_url: str) -> bool:
     inner = block.get(_CONTRACT_REVIEW_MARKER)
     if not isinstance(inner, dict):
@@ -286,6 +307,7 @@ def _collect_issue_comments(
 def _parse_contract_results(
     comments: list[dict[str, Any]],
     expected_issue_url: str,
+    issue_number: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     results: list[dict[str, Any]] = []
     invalid_contract_blocks_count = 0
@@ -326,6 +348,11 @@ def _parse_contract_results(
                             author_association,
                             author_id=author_id,
                             author_type=author_type,
+                        ),
+                        "is_fingerprint_ready": _is_fingerprint_ready(
+                            inner,
+                            comment.get("id"),
+                            issue_number,
                         ),
                     }
                 )
@@ -370,7 +397,12 @@ def _find_latest_result(
 
 
 def _find_latest_go(results: list[dict[str, Any]]) -> dict[str, Any] | None:
-    # #1475: only a trusted-author go result is authoritative.
+    # #1475: only a trusted-author go result is authoritative. Note: this
+    # helper intentionally does NOT also require is_fingerprint_ready
+    # (#1537) -- fingerprint-readiness filtering for the loop-routing
+    # decision is applied by the sole caller, _normalize_contract_snapshot_live(),
+    # so other direct consumers of this general-purpose trust-precedence
+    # helper are unaffected.
     go_results = [
         item
         for item in results
@@ -434,7 +466,9 @@ def _normalize_contract_snapshot_live(
     comments: list[dict[str, Any]],
     parse_warning_counts: dict[str, int],
 ) -> tuple[dict[str, Any], bool]:
-    parsed_results, parser_counts = _parse_contract_results(comments, issue_url)
+    parsed_results, parser_counts = _parse_contract_results(
+        comments, issue_url, _issue_number_from_url(issue_url)
+    )
     parse_warning_counts.update(parser_counts)
 
     # #1475 fix_delta P1 item 1: trust filtering before precedence -- an
@@ -442,6 +476,13 @@ def _normalize_contract_snapshot_live(
     # "latest blocked wins" branch below.
     latest = _find_latest_result(parsed_results, trusted_only=True)
     latest_go = _find_latest_go(parsed_results)
+    # #1537: a trusted go lacking a well-formed source-bound
+    # expected_contract_fingerprint must never be routed as the
+    # loop-consumable latest go -- treat it as if no go were found so the
+    # caller re-materializes instead of adopting a fingerprint-incomplete
+    # snapshot.
+    if latest_go is not None and not latest_go.get("is_fingerprint_ready"):
+        latest_go = None
     evidence_complete = not any(parse_warning_counts.values())
 
     # #1475 fix_delta P2 item 4: incomplete comment evidence (malformed
