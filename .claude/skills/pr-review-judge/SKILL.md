@@ -119,7 +119,7 @@ pr-reviewer（本 SubAgent）は `Edit`/`Write`/`MultiEdit` を持たず、Bash 
 - 呼び出し元（Write ツールを持つ trusted orchestrator）が、pr-reviewer の返した本文テキストをそのまま `artifacts/<PR番号>/issue-metadata/pr_review.publish/<name>.md` に書き込み（本文のみ。ハッシュや schema は含まない）、controlled review publisher を **render mode** で起動する。呼び出しコマンド例:
 
 ```bash
-uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py \
+uv run --locked python3 scripts/agent-guards/controlled_skill_mutation_exec.py \
   --command-id pr_review.publish --issue-number <PR番号> --repo <owner>/<repo> \
   --render-body-file <本文テキストのパス> \
   --verdict <APPROVE または REQUEST_CHANGES または COMMENT のいずれか> \

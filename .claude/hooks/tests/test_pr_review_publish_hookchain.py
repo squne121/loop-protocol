@@ -42,7 +42,7 @@ PR_NUMBER = 1530
 INPUT_REL = f"artifacts/{PR_NUMBER}/issue-metadata/pr_review.publish/in.json"
 
 PR_REVIEW_PUBLISH_CMD = (
-    "uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py"
+    "uv run --locked python3 scripts/agent-guards/controlled_skill_mutation_exec.py"
     " --command-id pr_review.publish"
     f" --issue-number {PR_NUMBER}"
     f" --input-file {INPUT_REL}"
