@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { execFileSync, execSync, spawnSync } from 'node:child_process';
@@ -20,7 +21,16 @@ const hooksPath = path.join(repoRoot, '.codex', 'hooks.json');
 const rulesPath = path.join(repoRoot, '.codex', 'rules', 'default.rules');
 const ledgerPath = path.join(repoRoot, 'artifacts', 'codex', 'subagent-launch-ledger.json');
 const ledgerWriterSource = path.join(repoRoot, 'scripts', 'subagent-launch-ledger-writer.c');
-const ledgerWriterBinary = path.join(repoRoot, 'tmp', 'subagent-launch-ledger-writer');
+// Issue #1502: the compiled writer binary lives in a content-addressed cache
+// *outside* the repo snapshot (under the OS temp directory), never under a
+// repo-tracked-or-untracked path such as `tmp/`. This is deliberate: a
+// per-invocation repo-local build artifact (the pre-#1502 `tmp/subagent-
+// launch-ledger-writer*` scheme) made every cold/warm hook invocation look
+// like a self-write outside the executor's allowed_write_roots, which is
+// exactly the anchor-bound preflight false positive this Issue closes.
+// Repo-local `tmp/subagent-launch-ledger-writer*` must never be reintroduced
+// as a race-tolerant exception (Out of Scope / Stop Condition).
+const ledgerWriterCacheDir = path.join(os.tmpdir(), 'loop-protocol-subagent-ledger-writer-cache');
 const sourceRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const fixtureRuntimeContractPath = path.join(repoRoot, 'tests', 'fixtures', 'codex-agent-config', 'expected-runtime-contract.json');
 const runtimeContractPath = fs.existsSync(fixtureRuntimeContractPath)
@@ -868,17 +878,31 @@ function parseHookInput() {
 
 function ensureLedgerWriter() {
   try {
-    fs.mkdirSync(path.dirname(ledgerWriterBinary), { recursive: true, mode: 0o700 });
-    const directory = fs.lstatSync(path.dirname(ledgerWriterBinary));
-    if (directory.isSymbolicLink() || !directory.isDirectory()) throw new Error('unsafe_build_directory');
-    const candidate = `${ledgerWriterBinary}.${process.pid}.${crypto.randomBytes(8).toString('hex')}`;
+    const sourceBytes = fs.readFileSync(ledgerWriterSource);
+    const contentHash = crypto.createHash('sha256').update(sourceBytes).digest('hex');
+    fs.mkdirSync(ledgerWriterCacheDir, { recursive: true, mode: 0o700 });
+    const cacheDirStat = fs.lstatSync(ledgerWriterCacheDir);
+    if (cacheDirStat.isSymbolicLink() || !cacheDirStat.isDirectory()) throw new Error('unsafe_build_directory');
+    const cachedBinary = path.join(ledgerWriterCacheDir, `${contentHash}-ledger-writer`);
+    // Warm path: a peer session that already compiled this exact source
+    // content (by sha256) reuses the cached binary without rebuilding, so
+    // repeated hook invocations never touch the repo tree at all.
+    try {
+      const cachedStat = fs.lstatSync(cachedBinary);
+      if (!cachedStat.isSymbolicLink() && cachedStat.isFile() && (cachedStat.mode & 0o100) !== 0) {
+        return cachedBinary;
+      }
+    } catch {
+      // Not present yet -- fall through to cold build below.
+    }
+    const candidate = `${cachedBinary}.${process.pid}.${crypto.randomBytes(8).toString('hex')}`;
     try {
       execFileSync('cc', ['-std=c17', '-Wall', '-Wextra', '-Werror', '-O2', '-o', candidate, ledgerWriterSource], { stdio: 'pipe' });
-      fs.renameSync(candidate, ledgerWriterBinary);
+      fs.renameSync(candidate, cachedBinary);
     } finally {
       fs.rmSync(candidate, { force: true });
     }
-    return ledgerWriterBinary;
+    return cachedBinary;
   } catch {
     throw new Error('ledger_writer_build_failed');
   }

@@ -7,8 +7,10 @@ import argparse
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -73,6 +75,129 @@ def _is_race_tolerant_unattributable_path(rel_path: str) -> bool:
         if normalized == prefix or normalized.startswith(prefix + "/"):
             return True
     return False
+
+
+# =============================================================================
+# Typed SubAgent-launch-ledger transition policy (Issue #1502).
+#
+# `_RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS` above is a *directory root*
+# exclusion class: it never inspects the transition kind of anything under
+# those roots. The ledger final file cannot use that class (Out of Scope:
+# directory-wide exclusion of `artifacts/`, `artifacts/codex/`, or `tmp/` is
+# forbidden), so it gets its own narrow, exact-path, transition-typed policy:
+#
+# - stable exact peer file (`_LEDGER_STABLE_EXACT_REL`): the canonical ledger
+#   final file. Only `absent -> regular` and `regular -> regular` transitions
+#   are authorized; delete, symlink, directory, FIFO, socket, or device
+#   substitution fail closed on that exact path (AC2).
+# - transient protocol entries (`_LEDGER_TRANSIENT_EXACT_RELS`): the writer's
+#   `.lock` / `.tmp` sibling files. These may exist only for the bounded
+#   duration of a single native-writer invocation; the executor waits (bounded
+#   quiescence) for them to vanish and fails closed on any residue that
+#   outlives the timeout (AC3).
+#
+# Everything else under `artifacts/codex/` (siblings of the three exact
+# paths) remains subject to the ordinary repo-wide snapshot/status diff with
+# no special-casing, so unexpected sibling create/update/delete/rename still
+# fails closed (AC4).
+# =============================================================================
+
+_LEDGER_ARTIFACT_DIR_REL = "artifacts/codex"
+_LEDGER_STABLE_EXACT_REL = f"{_LEDGER_ARTIFACT_DIR_REL}/subagent-launch-ledger.json"
+_LEDGER_TRANSIENT_EXACT_RELS = (
+    f"{_LEDGER_STABLE_EXACT_REL}.lock",
+    f"{_LEDGER_STABLE_EXACT_REL}.tmp",
+)
+_LEDGER_TYPED_EXACT_RELS = (_LEDGER_STABLE_EXACT_REL, *_LEDGER_TRANSIENT_EXACT_RELS)
+
+# Ancestor directory *node* entries of the stable ledger path (e.g.
+# "artifacts", "artifacts/codex"). When the stable ledger transitions
+# `absent -> regular` for the first time in a fresh repo/worktree, its parent
+# directories are newly created too, and each appears in the repo-wide
+# snapshot as a brand-new directory-node entry (its own mtime/size), which
+# would otherwise be reported as an unrelated unauthorized change even though
+# the underlying ledger transition itself was already authorized above. This
+# is narrower than a directory-wide exclusion: only the ancestor directory's
+# own node entry is excluded, never any other path inside it, so an
+# unexpected sibling file created alongside the ledger is still detected via
+# its own (distinct) path entry (AC4).
+_LEDGER_STABLE_ANCESTOR_DIR_RELS = tuple(
+    str(parent).replace(os.sep, "/") for parent in Path(_LEDGER_STABLE_EXACT_REL).parents if str(parent) != "."
+)
+
+
+def _safe_ledger_ancestor_dir_rels(project_root: str) -> set[str]:
+    """Return the subset of `_LEDGER_STABLE_ANCESTOR_DIR_RELS` that are
+    currently real, non-symlink directories on disk. A parent-substitution
+    attack (e.g. `artifacts` replaced by a symlink or plain file instead of a
+    real directory) must never be silently excluded here -- only a genuine
+    directory-node side effect of the authorized ledger transition is."""
+    return {rel for rel in _LEDGER_STABLE_ANCESTOR_DIR_RELS if _is_real_nonsymlink_dir(project_root, rel)}
+
+# Bounded quiescence window: how long the executor waits, after the child
+# process exits, for the writer's own `.lock` / `.tmp` protocol entries to be
+# removed by the (already-exited-or-still-finishing) peer writer process
+# before treating any residue as stale (fail-closed, never auto-deleted).
+_LEDGER_TRANSIENT_QUIESCENCE_TIMEOUT_SECONDS = 2.0
+_LEDGER_TRANSIENT_QUIESCENCE_POLL_INTERVAL_SECONDS = 0.05
+
+
+def _path_kind(path: Path) -> str:
+    """Classify a filesystem path by its on-disk kind, never following the
+    final symlink component (uses lstat so a symlink is reported as
+    `"symlink"`, not as the kind of its target)."""
+    try:
+        st = path.lstat()
+    except OSError:
+        return "absent"
+    mode = st.st_mode
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISDIR(mode):
+        return "dir"
+    if stat.S_ISREG(mode):
+        return "regular"
+    if stat.S_ISFIFO(mode):
+        return "fifo"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISBLK(mode) or stat.S_ISCHR(mode):
+        return "device"
+    return "other"
+
+
+def _ledger_exact_kinds(project_root: str) -> dict[str, str]:
+    root = Path(project_root)
+    return {rel: _path_kind(root / rel) for rel in _LEDGER_TYPED_EXACT_RELS}
+
+
+def _is_allowed_stable_ledger_transition(before_kind: str, after_kind: str) -> bool:
+    """`absent -> regular` and `regular -> regular` are the only authorized
+    stable-exact-ledger transitions (AC2). Delete (`regular -> absent`) and
+    substitution into any non-regular kind (symlink / dir / fifo / socket /
+    device), from any before-kind, are rejected."""
+    if after_kind == "regular":
+        return True
+    if after_kind == "absent":
+        return before_kind == "absent"
+    return False
+
+
+def _wait_for_ledger_transient_quiescence(project_root: str) -> list[str]:
+    """Poll the writer's `.lock` / `.tmp` transient protocol entries until
+    they vanish or the bounded quiescence window elapses.
+
+    Returns the (possibly empty) list of transient relative paths still
+    present once the window elapses. Never deletes anything itself -- a
+    non-empty return means stale residue that the caller must fail closed on
+    (AC3)."""
+    root = Path(project_root)
+    deadline = time.monotonic() + _LEDGER_TRANSIENT_QUIESCENCE_TIMEOUT_SECONDS
+    while True:
+        remaining = [rel for rel in _LEDGER_TRANSIENT_EXACT_RELS if _path_kind(root / rel) != "absent"]
+        if not remaining or time.monotonic() >= deadline:
+            return remaining
+        time.sleep(_LEDGER_TRANSIENT_QUIESCENCE_POLL_INTERVAL_SECONDS)
 
 
 def _is_symlink_path(path: Path) -> bool:
@@ -439,7 +564,19 @@ def _find_unauthorized_repo_changes(
     issue_number: str,
     before_snapshot: dict[str, tuple[str, int, int]],
     before_status: set[str],
+    ledger_before_kinds: dict[str, str] | None = None,
 ) -> str | None:
+    # Issue #1502: the stable-exact ledger transition is checked first and
+    # independently of the generic snapshot/status diff below. If the
+    # transition is not one of the two authorized kinds, fail closed on that
+    # exact path immediately (AC2) rather than folding it into the generic
+    # diff (which would only report the deepest-path heuristic winner).
+    ledger_before_kinds = ledger_before_kinds or {}
+    stable_before_kind = ledger_before_kinds.get(_LEDGER_STABLE_EXACT_REL, "absent")
+    stable_after_kind = _path_kind(Path(project_root) / _LEDGER_STABLE_EXACT_REL)
+    if not _is_allowed_stable_ledger_transition(stable_before_kind, stable_after_kind):
+        return _LEDGER_STABLE_EXACT_REL
+
     after_snapshot = _snapshot_repo_paths(project_root, issue_number)
     after_status = _git_status_paths(project_root)
     new_raw_status_paths = after_status - before_status
@@ -449,11 +586,14 @@ def _find_unauthorized_repo_changes(
     # a race-tolerant subtree under an ignored parent is not misreported as
     # an unauthorized write to the collapsed parent itself.
     expanded_new_status_paths = _expand_new_status_paths(project_root, new_raw_status_paths)
+    safe_ledger_ancestor_dir_rels = _safe_ledger_ancestor_dir_rels(project_root)
     new_status_paths = {
         path
         for path in expanded_new_status_paths
         if not _is_under_allowed_artifact_root(project_root, issue_number, path)
         and not _is_race_tolerant_unattributable_path(path)
+        and path not in _LEDGER_TYPED_EXACT_RELS
+        and path.rstrip("/") not in safe_ledger_ancestor_dir_rels
     }
     if new_status_paths:
         return sorted(
@@ -468,14 +608,29 @@ def _find_unauthorized_repo_changes(
                 for path in before_snapshot.keys() & after_snapshot.keys()
                 if before_snapshot[path] != after_snapshot[path]
             )
-        return (
-            sorted(
-                changed,
+        # Issue #1502: the stable-exact ledger path is already authorized
+        # above (regular -> regular content changes are expected peer
+        # writes); the two transient `.lock` / `.tmp` paths are validated
+        # separately via bounded quiescence before this function runs; and a
+        # first-ever `absent -> regular` ledger transition also creates new
+        # ancestor directory-node entries (`artifacts`, `artifacts/codex`)
+        # that are a side effect of the already-authorized transition, not an
+        # independent change. Drop all of these from the generic diff so an
+        # authorized peer write is never reported as an unauthorized_write_path
+        # false positive.
+        filtered_changed = [
+            item
+            for item in changed
+            if item not in _LEDGER_TYPED_EXACT_RELS and item not in safe_ledger_ancestor_dir_rels
+        ]
+        if filtered_changed:
+            return sorted(
+                filtered_changed,
                 key=lambda item: (len(Path(item).parts), item),
             )[-1]
-            if changed
-            else "snapshot_drift"
-        )
+        if changed:
+            return None
+        return "snapshot_drift"
     return None
 
 
@@ -584,6 +739,17 @@ def _emit_unauthorized_write_failure(issue_number: int, unauthorized_path: str) 
         f"reason_code=unauthorized_write_path target_issue={issue_number} "
         f"unauthorized write path={unauthorized_path} "
         "recovery=do_not_write_outside_allowed_root",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _emit_ledger_transient_residue_failure(issue_number: int, stale_paths: list[str]) -> int:
+    print(
+        "SKILL_RUNTIME_FAIL: "
+        f"reason_code=ledger_transient_residue_timeout target_issue={issue_number} "
+        f"stale_path={','.join(sorted(stale_paths))} "
+        "recovery=investigate_concurrent_ledger_writer_lock_or_temp_not_released",
         file=sys.stderr,
     )
     return 2
@@ -711,6 +877,7 @@ def main(argv: list[str] | None = None) -> int:
     _validate_runtime_context(project_root, args)
     before_snapshot = _snapshot_repo_paths(project_root, str(args.issue_number))
     before_status = _git_status_paths(project_root)
+    ledger_before_kinds = _ledger_exact_kinds(project_root)
 
     entry = load_registry_entry(args.command_id, project_root)
     validate_registry_entry(args.command_id, entry, str(args.issue_number))
@@ -761,11 +928,21 @@ def main(argv: list[str] | None = None) -> int:
     except subprocess.TimeoutExpired:
         return _emit_timeout_failure(args.issue_number, timeout_seconds)
 
+    # Issue #1502 AC3: wait a bounded window for the writer's own `.lock` /
+    # `.tmp` transient protocol entries to vanish before evaluating the
+    # generic diff. This must run before `_find_unauthorized_repo_changes`
+    # takes its "after" snapshot, so quiescent peer writes never appear as
+    # residue in that snapshot.
+    stale_transient = _wait_for_ledger_transient_quiescence(project_root)
+    if stale_transient:
+        return _emit_ledger_transient_residue_failure(args.issue_number, stale_transient)
+
     unauthorized_path = _find_unauthorized_repo_changes(
         project_root,
         str(args.issue_number),
         before_snapshot,
         before_status,
+        ledger_before_kinds,
     )
     if unauthorized_path is not None:
         return _emit_unauthorized_write_failure(args.issue_number, unauthorized_path)

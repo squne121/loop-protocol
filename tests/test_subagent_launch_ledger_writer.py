@@ -201,6 +201,70 @@ def test_hook_bounds_native_writer_execution_time():
     assert "killSignal: 'SIGKILL'" in source
 
 
+def test_hook_builds_writer_outside_repo_tree_cold_and_warm(tmp_path: Path):
+    """GIVEN the hook is invoked cold (no cached writer binary for this
+    source content) and then warm (cached binary reused)
+    WHEN --hook-subagent-start builds/uses the native writer
+    THEN no repo-local `tmp/subagent-launch-ledger-writer*` build artifact is
+    ever created under REPO_ROOT_OVERRIDE, for either invocation
+    (Issue #1502 AC1: the build cache lives outside the repo snapshot)."""
+    import uuid
+
+    agent_dir = tmp_path / ".codex" / "agents"
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "spark-skim.toml").write_text(
+        "model = \"gpt-5.3-codex-spark\"\nmodel_reasoning_effort = \"medium\"\ndefault_permissions = \"loop-protocol-readonly\"\n",
+        encoding="utf-8",
+    )
+    writer_dir = tmp_path / "scripts"
+    writer_dir.mkdir()
+    # Append a unique nonce so this test's source content hash is guaranteed
+    # distinct from any other test's cached writer binary, forcing a
+    # genuinely cold build on the first of the two invocations below.
+    nonce = f"\n/* test-nonce: {uuid.uuid4().hex} */\n"
+    (writer_dir / WRITER_SOURCE.name).write_text(
+        WRITER_SOURCE.read_text(encoding="utf-8") + nonce, encoding="utf-8"
+    )
+
+    def _invoke(agent_id: str) -> subprocess.CompletedProcess[str]:
+        payload = {
+            "agent_type": "spark-skim",
+            "model": "gpt-5.3-codex-spark",
+            "session_id": "session",
+            "turn_id": "turn",
+            "agent_id": agent_id,
+        }
+        return subprocess.run(
+            ["node", str(HOOK), "--hook-subagent-start"],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            env={
+                **os.environ,
+                "REPO_ROOT_OVERRIDE": str(tmp_path),
+                "CODEX_AGENT_EVIDENCE_RUN_ID": "run",
+                "CODEX_AGENT_EVIDENCE_HEAD_SHA": "a" * 40,
+            },
+        )
+
+    cold = _invoke("cold-agent")
+    assert cold.returncode == 0, cold.stderr
+    repo_tmp_dir = tmp_path / "tmp"
+    if repo_tmp_dir.exists():
+        assert not any("subagent-launch-ledger-writer" in p.name for p in repo_tmp_dir.iterdir())
+
+    warm = _invoke("warm-agent")
+    assert warm.returncode == 0, warm.stderr
+    if repo_tmp_dir.exists():
+        assert not any("subagent-launch-ledger-writer" in p.name for p in repo_tmp_dir.iterdir())
+
+    ledger = json.loads((tmp_path / "artifacts/codex/subagent-launch-ledger.json").read_text())
+    assert [entry["observed_dispatch"]["agent_id"] for entry in ledger["launches"]] == [
+        "cold-agent",
+        "warm-agent",
+    ]
+
+
 def test_preexisting_substitution_and_nonregular_entries_fail_closed(tmp_path: Path):
     writer = build_writer(tmp_path)
     parent_link = tmp_path / "artifacts"
