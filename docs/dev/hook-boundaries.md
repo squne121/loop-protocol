@@ -714,6 +714,18 @@ SESSION_MANIFEST_LEGACY_SCAN_V1:
 
 Codex 側 `.codex/rules/default.rules` は `gh pr review` を引き続き明示的に forbidden とし（`gh` サブコマンド prefix rule）、かつ `controlled_skill_mutation_exec.py` 自体への allow エントリを持たないため、本変更は Claude-only のまま split-brain を生じない（確認のみ、rule 変更なし）。
 
+## 12b. pr_review.publish の追加ハードニング（Issue #1539 fix_delta）
+
+OWNER レビュー（PR #1539、squne121）で以下の構造的欠陥が指摘され、修正した:
+
+- **trusted bridge の欠如（Blocker 1）**: `pr-reviewer` SubAgent は `Edit`/`Write`/`MultiEdit` を持たず Bash 経由のファイル書き込みも禁止のため、当初の SKILL 文面が要求していた「`PR_REVIEW_PUBLISH_REQUEST_V1` を自ら組み立てて `--input-file` に渡す」経路は実際には SubAgent に実行不能だった。修正: `controlled_skill_mutation_exec.py` に render mode（`--render-body-file` / `--verdict` / `--reviewed-head-sha` / `--expected-head-sha` / `--merge-ready`）を追加。trusted orchestrator（Write ツールを持つ control-plane）が verdict 本文テキストのみを artifact パスへ書き込み、executor 自身が `body_sha256` / `idempotency_key` を再計算し `producer_role` / `event` を自ら固定する（入力からは受け取らない）。
+- **host/environment binding の欠如（Blocker 2）**: `_verify_git_remote_origin()` が owner/repo の正規表現抽出のみで host/scheme を無視していたため、`https://attacker.example/<owner>/<repo>.git` 等が trusted と誤認され得た。また `GH_HOST`/`GH_REPO`/`GH_CONFIG_DIR`/`GH_DEBUG`/`DEBUG` が sanitize されず、`gh` subprocess へ `env=` が渡っていなかった。修正: `urlsplit` による構造的 host/scheme/port/userinfo 検査（github.com の HTTPS/SSH canonical form のみ許可）と、全 `gh` subprocess への sanitized env（上記5キー除去）+ `--hostname github.com` 明示。
+- **idempotent retry が postcondition を迂回（Blocker 3）**: 既存 marker が1件見つかった retry 経路が `state`/`commit_id` のみ確認して即座に成功を返し、body hash・marker 一意性/位置・現在 PR head・author identity・tracked changes を再検証していなかった。修正: retry も fresh-post と同一の共通 postcondition validator（`_validate_pr_review_postcondition`）を通す。marker 検索も substring match から「末尾に厳密一致」判定に変更。
+- **TOCTOU（High 1）**: commit_id 拘束は「A に結び付ける」保証であって「POST 時点でも A が current head」の atomic precondition ではない。修正: POST/readback 後に current head を再取得し、移動していれば `published_but_stale` として fail-closed（review は残るが成功報告はしない）。
+- **producer provenance の自己申告（High 2）**: `producer_role` が入力 JSON の自己申告フィールドで、schema も exact-key ではなかった。修正: render mode では `producer_role`/`event` を executor が自ら固定（入力に存在しても無視ではなく、そもそも render mode の入力スキーマに含まれない）。`--input-file` 経路も exact-key schema + body size bound を追加。
+
+AC8（実 PreToolUse hook chain）テストは `secret_boundary_guard` / `local_main_branch_guard` / `worktree_scope_guard` / `guard-japanese-prose` / `rtk_boundary_shadow_guard` / `ci_test_performance_advisory` / `root_temporary_residue_advisory` の 7 hook すべてを `.claude/settings.json` 記載順に実行し、aggregate decision（deny/ask が無いこと）を検証する形に拡張した（`.claude/hooks/tests/hookchain_harness.py`）。
+
 ---
 
 ## 12. publish lane authorization trust root（歴史的経緯・historical note）

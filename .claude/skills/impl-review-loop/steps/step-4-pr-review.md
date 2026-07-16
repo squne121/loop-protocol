@@ -54,7 +54,7 @@ Step 4 では verdict 判定前に `wait_ci_checks.sh` を使って required che
 
 ## 期待する出力
 
-pr-reviewer は判定結果を `PR_REVIEW_PUBLISH_REQUEST_V1` として組み立て、controlled review publisher（`pr_review.publish` command id、Issue #1536 Option C）へ渡して投稿を委譲する。pr-reviewer 自身は生の `gh pr review` を呼ばない。publisher が投稿する verdict コメントには `LOOP_VERDICT_V2` fenced YAML を含める。
+pr-reviewer は判定結果（verdict 本文 + `verdict`/`merge_ready`/`reviewed_head_sha`）を呼び出し元（control-plane）へ返す。pr-reviewer は Write/Edit を持たず JSON を自ら組み立てられないため、実際の投稿は control-plane が本文を artifact パスへ書き込み、controlled review publisher を render mode （`--render-body-file` / `--verdict` / `--reviewed-head-sha` / `--expected-head-sha`、`pr_review.publish` command id、Issue #1536 Option C / Issue #1539 fix_delta Blocker 1）で起動して委譲する。pr-reviewer 自身は生の `gh pr review` を呼ばない。publisher が投稿する verdict コメントには `LOOP_VERDICT_V2` fenced YAML を含める。
 
 ```yaml
 LOOP_VERDICT_V2:

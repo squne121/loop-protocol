@@ -25,10 +25,14 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hookchain_harness  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 LOCAL_MAIN_GUARD_SH = REPO_ROOT / ".claude" / "hooks" / "local_main_branch_guard.sh"
@@ -118,3 +122,72 @@ class TestAC8ShadowAndEnforceAllow:
                 "transported via --input-file, never as a literal "
                 f"--body/-b/-F CLI flag; stderr={gjp_result.stderr}"
             )
+
+
+class TestAC8FullRealHookChainAggregate:
+    """Issue #1539 fix_delta Blocker 4: the real `.claude/settings.json`
+    PreToolUse registration wires (at minimum) 7 Bash-matching hooks --
+    secret_boundary_guard, local_main_branch_guard, worktree_scope_guard,
+    guard-japanese-prose, rtk_boundary_shadow_guard, ci_test_performance_advisory,
+    root_temporary_residue_advisory. The previous AC8 test hand-picked only 2
+    of the 7 and asserted each hook's raw exit code individually, never
+    running worktree_scope_guard.sh at all and never computing the AGGREGATE
+    deny/ask/defer decision a real Claude Code session would compute. This
+    class drives the full chain, in settings.json-declared order, via
+    hookchain_harness.run_pretool_hook_chain(), and asserts on the aggregate."""
+
+    def test_settings_json_registers_all_seven_expected_bash_hooks(self):
+        commands = hookchain_harness.load_pretool_hook_commands("Bash")
+        hook_names = {Path(c.split(" ")[0]).stem for c in commands}
+        expected = {
+            "secret_boundary_guard",
+            "local_main_branch_guard",
+            "worktree_scope_guard",
+            "guard-japanese-prose",
+            "rtk_boundary_shadow_guard",
+            "ci_test_performance_advisory",
+            "root_temporary_residue_advisory",
+        }
+        missing = expected - hook_names
+        assert not missing, f"settings.json PreToolUse|Bash chain is missing: {missing}"
+
+    def test_full_chain_aggregate_allow_for_pr_review_publish_command(self, tmp_git_repo):
+        payload = _pretool_payload(PR_REVIEW_PUBLISH_CMD, str(tmp_git_repo))
+        results = hookchain_harness.run_pretool_hook_chain(payload, tmp_git_repo)
+
+        executed_names = {r["hook_name"] for r in results}
+        assert "worktree_scope_guard" in executed_names, (
+            "worktree_scope_guard.sh must actually be invoked as part of the "
+            "chain, not skipped -- it is registered on the same Bash matcher."
+        )
+
+        aggregate = hookchain_harness.aggregate_decision(results)
+        assert aggregate == "allow", (
+            "Aggregate PreToolUse decision across the full real hook chain "
+            f"must be allow (explicit allow or no-decision), not deny/ask. "
+            f"Per-hook results: {results}"
+        )
+        # Every individual hook decision must also be allow -- an aggregate
+        # "allow" must not be hiding a masked deny from an earlier-short-
+        # circuited hook (the harness stops at the first block, so if the
+        # aggregate is allow, every hook that ran must itself have allowed).
+        for r in results:
+            assert r["decision"] == "allow", (
+                f"{r['hook_name']} returned {r['decision']} "
+                f"(exit={r['returncode']}); stderr={r['stderr']}"
+            )
+
+    def test_full_chain_aggregate_blocks_raw_gh_pr_review_mutation(self, tmp_git_repo):
+        """Negative control: proves the harness genuinely detects a real
+        block (not a fail-open false negative). A raw `gh pr review --approve`
+        issued directly from local root (bypassing the controlled executor
+        entirely) must be denied by local_main_branch_guard -- this is
+        exactly the unsafe pattern pr_review.publish exists to replace."""
+        raw_cmd = f"gh pr review {PR_NUMBER} --approve --body x"
+        payload = _pretool_payload(raw_cmd, str(tmp_git_repo))
+        results = hookchain_harness.run_pretool_hook_chain(payload, tmp_git_repo)
+        aggregate = hookchain_harness.aggregate_decision(results)
+        assert aggregate == "block", (
+            f"raw `gh pr review --approve` must be denied by the real hook "
+            f"chain; results={results}"
+        )
