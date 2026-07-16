@@ -102,7 +102,7 @@ def barrier_invoke_writer(
     results.put((kind, identity, result.returncode, result.stdout, result.stderr))
 
 
-def test_barrier_synchronised_independent_processes_preserve_launch_and_root_action_evidence(tmp_path: Path):
+def test_independent_trusted_processes_preserve_distinct_evidence(tmp_path: Path):
     writer = build_writer(tmp_path)
     # The writer itself is Linux-only; fork avoids pytest's non-package test
     # module import limitation while still creating independent OS processes.
