@@ -157,6 +157,20 @@ def _strict_json_dumps(payload: Any, *, indent: int | None = None) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=indent, allow_nan=False)
 
 
+def _strict_json_dumps_compact(payload: Any) -> str:
+    """Canonical single-line JSON (sorted keys, no whitespace, ASCII-only)
+    -- MUST match `parent_replay_binding.canonical_json_bytes()` byte for
+    byte, since the parent recomputes this digest independently over the
+    normalized claim object (Issue #1532)."""
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+
+
 def _validate_review_result_schema(raw_result: dict[str, Any]) -> None:
     _jsonschema.validate(instance=raw_result, schema=_load_review_result_schema())
 
@@ -394,6 +408,53 @@ def compact_review_result(
     if compact_data["EVIDENCE"]:
         stdout_lines.append(f"EVIDENCE: {compact_data['EVIDENCE']}")
     stdout_lines.append(f"ARTIFACT: {compact_data['ARTIFACT']}")
+
+    # Issue #1532 Blocker 1/3.1: needs-fix appends exactly ONE additional
+    # field -- the bounded, untrusted REVIEWER_BLOCKER_CLAIM_V1 claim. This
+    # SubAgent no longer co-locate-runs reviewer_claim_replay.py and no
+    # longer emits REPLAY_VERDICT/ROUTING/SHOULD_CONSUME/etc: those
+    # semantic (routing) fields are now EXCLUSIVELY parent-computed
+    # (PARENT_REPLAY_* -- see parent_replay_binding.py /
+    # validate_review_compact_output.py). The claim is built here (a
+    # deterministic script), not authored freeform by the SubAgent prompt,
+    # and carries only reviewer_blocker_code/message/line_start/line_end --
+    # no findings/checker_evidence/deterministic_checks can be smuggled in.
+    if verdict == "needs-fix":
+        body_sha256_raw = raw_result.get("body_sha256")
+        body_sha256 = (
+            body_sha256_raw if isinstance(body_sha256_raw, str) and body_sha256_raw else "sha256:" + ("0" * 64)
+        )
+        claim_blockers: list[dict[str, Any]] = []
+        for item in blocking_issues:
+            if isinstance(item, dict):
+                code = str(item.get("code") or item.get("reviewer_blocker_code") or "").strip()
+                if not code:
+                    continue
+                claim_blockers.append(
+                    {
+                        "reviewer_blocker_code": code,
+                        "message": item.get("message"),
+                        "line_start": item.get("line_start"),
+                        "line_end": item.get("line_end"),
+                    }
+                )
+            elif isinstance(item, str) and item.strip():
+                claim_blockers.append(
+                    {
+                        "reviewer_blocker_code": item.strip(),
+                        "message": None,
+                        "line_start": None,
+                        "line_end": None,
+                    }
+                )
+        reviewer_blocker_claim = {
+            "schema": "REVIEWER_BLOCKER_CLAIM_V1",
+            "body_sha256": body_sha256,
+            "blockers": claim_blockers,
+        }
+        claim_line = _strict_json_dumps_compact(reviewer_blocker_claim)
+        compact_data["REVIEWER_BLOCKER_CLAIM"] = claim_line
+        stdout_lines.append(f"REVIEWER_BLOCKER_CLAIM: {claim_line}")
 
     return compact_data, stdout_lines, artifact_path, artifact_content
 
