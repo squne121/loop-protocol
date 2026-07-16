@@ -41,7 +41,11 @@ PRODUCER_SCRIPT_PATH = (
     / "baseline_vc_preflight.py"
 )
 ADJUDICATOR_PATH = ".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"
-ADJUDICATOR_DIFF_SUMMARY = {"changed_paths": [ADJUDICATOR_PATH], "head_sha": "head-1"}
+ADJUDICATOR_DIFF_SUMMARY = {
+    "changed_paths": [ADJUDICATOR_PATH],
+    "head_sha": "head-1",
+    "pr_number": 1544,
+}
 
 _spec = importlib.util.spec_from_file_location(
     "adjudicate_vc_result_non_regression_gate", ADJUDICATE_SCRIPT_PATH
@@ -149,6 +153,7 @@ def _manual_contract_snapshot(items: list[dict]) -> dict:
 def _manual_current_payload(items: list[dict], *, head_sha: str, reviewed_head_sha: str) -> dict:
     return {
         "schema": "baseline_vc_preflight/v1",
+        "issue": 1488,
         "generated_at": "2026-07-11T10:00:00Z",
         "status": "pass",
         "errors": [],
@@ -159,6 +164,45 @@ def _manual_current_payload(items: list[dict], *, head_sha: str, reviewed_head_s
         "head_sha": head_sha,
         "reviewed_head_sha": reviewed_head_sha,
         "results": items,
+    }
+
+
+def _manual_test_verdict(
+    items: list[dict],
+    *,
+    head_sha: str,
+    reviewed_head_sha: str,
+    diff_head_sha: str,
+    issue_number: int = 1488,
+    pr_number: int = 1544,
+    contract_body_sha256: str = "sha256:" + "b" * 64,
+) -> dict:
+    return {
+        "schema": "TEST_VERDICT_MACHINE/v1",
+        "issue_number": issue_number,
+        "pr_number": pr_number,
+        "head_sha": head_sha,
+        "reviewed_head_sha": reviewed_head_sha,
+        "diff_head_sha": diff_head_sha,
+        "contract_body_sha256": contract_body_sha256,
+        "run_id": "run-1544-1",
+        "run_url": "https://example.invalid/runs/1544",
+        "result": "PASS",
+        "verification_commands_pass": len(items),
+        "verification_commands_fail": 0,
+        "verification_skipped_count": 0,
+        "runtime_ac_results": [
+            {
+                "ac": item["ac"],
+                "command_hash": item["command_hash"],
+                "exit_code": 0,
+                "status": "pass",
+                "fallback_detected": False,
+                "human_review_required": False,
+                "stop_condition_triggered": False,
+            }
+            for item in items
+        ],
     }
 
 
@@ -418,8 +462,17 @@ def test_real_producer_pr_review_only_current_head_envelope_is_adjudicated(
         diff_summary={
             "changed_paths": ["tracked.txt"],
             "head_sha": head,
+            "pr_number": 1544,
         },
         allowed_paths=["tracked.txt"],
+        test_verdict=_manual_test_verdict(
+            [current_item],
+            head_sha=head,
+            reviewed_head_sha=head,
+            diff_head_sha=head,
+            issue_number=current_vc_result["issue"],
+            contract_body_sha256=current_vc_result["source"]["body_sha256"],
+        ),
     )
 
     assert result["overall_status"] == "pass"
@@ -746,6 +799,12 @@ def test_non_regression_scope_pr_review_only_skip_item_is_excluded_from_regressi
         current_vc_result=current,
         diff_summary=ADJUDICATOR_DIFF_SUMMARY,
         allowed_paths=[ADJUDICATOR_PATH],
+        test_verdict=_manual_test_verdict(
+            baseline["checks"]["vc_preflight"]["classifications"],
+            head_sha="head-1",
+            reviewed_head_sha="head-1",
+            diff_head_sha="head-1",
+        ),
     )
 
     assert result["overall_status"] == "pass"
@@ -867,6 +926,12 @@ def test_current_head_runtime_evidence_is_required_for_pr_review_only_only_paylo
         current_vc_result=current,
         diff_summary=ADJUDICATOR_DIFF_SUMMARY,
         allowed_paths=[ADJUDICATOR_PATH],
+        test_verdict=_manual_test_verdict(
+            baseline["checks"]["vc_preflight"]["classifications"],
+            head_sha="head-1",
+            reviewed_head_sha="head-1",
+            diff_head_sha="head-1",
+        ),
     )
     assert certified["overall_status"] == "pass"
     assert certified["per_ac"] == []
@@ -881,7 +946,7 @@ def test_current_head_runtime_evidence_is_required_for_pr_review_only_only_paylo
 
     assert result["overall_status"] != "pass"
     assert result["blocking"] is True
-    assert result["errors"] == ["empty_current_results_without_pass_signal"]
+    assert result["errors"] == ["test_verdict_missing"]
 
 
 def test_pr_review_only_rejects_incomplete_evidence() -> None:
@@ -922,3 +987,136 @@ def test_pr_review_only_rejects_incomplete_evidence() -> None:
     assert result["overall_status"] != "pass"
     assert result["blocking"] is True
     assert result["errors"] == ["pr_review_only_current_authorization_mismatch:AC1"]
+
+
+def test_pr_review_only_requires_complete_coverage_rejects_missing_skip() -> None:
+    baseline_items = [
+        _manual_vc_result(
+            "AC1",
+            command_hash="sha256:" + "a" * 64,
+            classification="expected_fail",
+            decision="go",
+            scope_class=None,
+            exit_code=1,
+        ),
+        _manual_vc_result(
+            "AC2",
+            command_hash="sha256:" + "c" * 64,
+            classification="skipped",
+            decision="go",
+            scope_class="pr_review_only",
+            exit_code=None,
+        ),
+    ]
+    current = _manual_current_payload(
+        [
+            _manual_vc_result(
+                "AC1",
+                command_hash="sha256:" + "a" * 64,
+                classification="expected_pass",
+                decision="go",
+                scope_class=None,
+                exit_code=0,
+            )
+        ],
+        head_sha="head-1",
+        reviewed_head_sha="head-1",
+    )
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_manual_contract_snapshot(baseline_items),
+        current_vc_result=current,
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
+        test_verdict=_manual_test_verdict(
+            baseline_items,
+            head_sha="head-1",
+            reviewed_head_sha="head-1",
+            diff_head_sha="head-1",
+        ),
+    )
+
+    assert result["overall_status"] != "pass"
+    assert result["errors"] == ["pr_review_only_coverage_mismatch"]
+
+
+def test_pr_review_only_requires_complete_coverage_rejects_missing_regular_vc() -> None:
+    baseline_items = [
+        _manual_vc_result(
+            "AC1",
+            command_hash="sha256:" + "a" * 64,
+            classification="expected_fail",
+            decision="go",
+            scope_class=None,
+            exit_code=1,
+        ),
+        _manual_vc_result(
+            "AC2",
+            command_hash="sha256:" + "c" * 64,
+            classification="skipped",
+            decision="go",
+            scope_class="pr_review_only",
+            exit_code=None,
+        ),
+    ]
+    current = _manual_current_payload(
+        [baseline_items[1]],
+        head_sha="head-1",
+        reviewed_head_sha="head-1",
+    )
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_manual_contract_snapshot(baseline_items),
+        current_vc_result=current,
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
+        test_verdict=_manual_test_verdict(
+            baseline_items,
+            head_sha="head-1",
+            reviewed_head_sha="head-1",
+            diff_head_sha="head-1",
+        ),
+    )
+
+    assert result["overall_status"] != "pass"
+    assert result["errors"] == ["baseline_current_mapping_mismatch"]
+
+
+def test_pr_review_only_requires_test_verdict_binding() -> None:
+    items = [
+        _manual_vc_result(
+            "AC1",
+            command_hash="sha256:" + "a" * 64,
+            classification="skipped",
+            decision="go",
+            scope_class="pr_review_only",
+            exit_code=None,
+        )
+    ]
+    baseline = _manual_contract_snapshot(items)
+    current = _manual_current_payload(items, head_sha="head-1", reviewed_head_sha="head-1")
+
+    missing = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
+    )
+    assert missing["overall_status"] != "pass"
+    assert missing["errors"] == ["test_verdict_missing"]
+
+    mismatched = _manual_test_verdict(
+        items,
+        head_sha="wrong-head",
+        reviewed_head_sha="head-1",
+        diff_head_sha="head-1",
+    )
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
+        test_verdict=mismatched,
+    )
+    assert result["overall_status"] != "pass"
+    assert result["errors"] == ["test_verdict_head_sha_mismatch"]

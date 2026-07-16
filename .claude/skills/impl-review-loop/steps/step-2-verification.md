@@ -15,6 +15,8 @@ inputs:
   pr_number: <Step 1 で取得した PR 番号>
   ac_list: <linked issue の Acceptance Criteria 一覧>
   verification_commands: <linked issue の Verification Commands>
+  contract_body_sha256: <live Issue body SHA>
+  diff_head_sha: <diff summaryのhead_sha>
 ```
 
 SubAgent 側は `.claude/agents/test-runner.md` の手順を実行し、Verification Commands を実行して `TEST_VERDICT_MACHINE v1` マーカー付きコメントを PR に投稿する。
@@ -25,6 +27,15 @@ test-runner が PR コメントに投稿する `TEST_VERDICT` YAML:
 
 ```yaml
 TEST_VERDICT:
+  schema: TEST_VERDICT_MACHINE/v1
+  issue_number: <int>
+  pr_number: <int>
+  head_sha: "<PR current head_sha>"
+  reviewed_head_sha: "<reviewed head_sha>"
+  diff_head_sha: "<diff summary head_sha>"
+  contract_body_sha256: "sha256:<live Issue body SHA>"
+  run_id: "<run ID>"
+  run_url: "https://<run URL>"
   result: PASS | PARTIAL | FAIL
   mergeable: MERGEABLE | CONFLICTING | UNKNOWN
   merge_state_status: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
@@ -32,6 +43,8 @@ TEST_VERDICT:
   verification_commands_pass: <int>
   verification_commands_fail: <int>
 ```
+
+`pr_review_only` を baseline comparison から除外する adjudication では、`adjudicate_vc_result.py --test-verdict-file <TEST_VERDICT_MACHINE/v1 JSON>` にこの実行済み証跡を渡す。adjudicator は Issue/PR、current/reviewed/diff HEAD、contract body SHA、run ID/URL、全対象ACの command hash と PASS/exit 0/no fallback/no skip を検証し、欠落または不一致なら fail-closed とする。
 
 `TEST_VERDICT` は Step 2 の実行結果を示すみにし、`baseline_only` は**routing の正本ではない**。
 `baseline_only` は `adjudicate_vc_result.py` の evidence input としてのみ扱い、`VC_ADJUDICATION_RESULT_V1` の評価に渡す。
