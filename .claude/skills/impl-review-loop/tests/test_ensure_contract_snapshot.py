@@ -17,6 +17,7 @@ B2 atomicity: body_sha256 OR updatedAt 変化 → stale_or_conflicting_snapshot
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1707,3 +1708,777 @@ class TestExistingGoFingerprintReuseGate:
 
         assert result["status"] == "human_judgment"
         assert result["source"] == "readiness_blocked"
+
+# ---------------------------------------------------------------------------
+# Migrated from test_contract_snapshot_author_binding.py (Issue #1537 PR #1548
+# Blocker 2 remediation): that file was outside Issue #1537's Allowed Paths.
+# Its regression coverage (controlled-publisher comment-id binding, AC3/AC4
+# untrusted-author rejection across all snapshot consumers) is preserved here
+# verbatim, with module-level identifiers renamed (_AB_ / _ab_ prefix) to avoid
+# colliding with this file's own module globals (e.g. _ISSUE_NUMBER/_REPO).
+# This file's autouse _default_trusted_comment_id_binding fixture (above)
+# already defaults capture_base_ref_and_sha / verify_controlled_publisher_
+# comment_id_binding / patch_comment to success, matching the behavior the
+# migrated tests' local patch.object() overrides rely on.
+# ---------------------------------------------------------------------------
+
+# Captured before the autouse _default_trusted_comment_id_binding fixture
+# (defined above in this file) monkeypatches this attribute to always
+# succeed -- these migrated tests exercise the REAL implementation.
+_ab_real_verify_controlled_publisher_comment_id_binding = (
+    _ecs_mod.verify_controlled_publisher_comment_id_binding
+)
+
+_AB_HERE = Path(__file__).resolve().parent
+_AB_SCRIPTS_DIR = _AB_HERE.parent / "scripts"
+_AB_ICR_SCRIPTS_DIR = _AB_HERE.parents[1] / "issue-contract-review" / "scripts"
+
+
+def _ab_load(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
+
+
+_run_once_mod = _ab_load(
+    "run_contract_review_once_binding", _AB_ICR_SCRIPTS_DIR / "run_contract_review_once.py"
+)
+_parser_mod = _ab_load(
+    "contract_review_result_parser_binding",
+    _AB_ICR_SCRIPTS_DIR / "contract_review_result_parser.py",
+)
+_capsule_mod = _ab_load("build_intake_capsule_binding", _AB_SCRIPTS_DIR / "build_intake_capsule.py")
+
+_AB_ISSUE_NUMBER = 1475
+_AB_REPO = "squne121/loop-protocol"
+_AB_ISSUE_URL = f"https://github.com/{_AB_REPO}/issues/{_AB_ISSUE_NUMBER}"
+_AB_SAMPLE_BODY = "## Test body for #1475 binding tests"
+_AB_SAMPLE_BODY_SHA256 = _ecs_mod.sha256_of(_AB_SAMPLE_BODY)
+_AB_SAMPLE_UPDATED_AT = "2026-07-12T00:00:00Z"
+
+# #1475 fix_delta P1 item 2: the only entry in TRUSTED_CONTRACT_PUBLISHERS.
+_AB_TRUSTED_AUTHOR_ID = 63350259
+_AB_TRUSTED_LOGIN = "squne121"
+_AB_TRUSTED_TYPE = "User"
+_AB_TRUSTED_ASSOCIATION = "OWNER"
+
+
+def _ab_go_comment(
+    author,
+    author_association,
+    comment_id: int = 5001,
+    author_id=None,
+    author_type=None,
+) -> dict:
+    return {
+        "id": comment_id,
+        "html_url": f"{_AB_ISSUE_URL}#issuecomment-{comment_id}",
+        "created_at": "2026-07-12T00:00:00Z",
+        "updated_at": "2026-07-12T00:00:00Z",
+        "author": author,
+        "author_association": author_association,
+        "author_id": author_id,
+        "author_type": author_type,
+        "body": f"""
+```yaml
+CONTRACT_REVIEW_RESULT_V1:
+  status: go
+  generated_at: "2026-07-12T00:00:00Z"
+  generated_by: issue-contract-review
+  issue_url: {_AB_ISSUE_URL}
+  body_sha256: "{_AB_SAMPLE_BODY_SHA256}"
+```
+""",
+    }
+
+
+def _ab_trusted_go_comment(comment_id: int = 5001) -> dict:
+    """A go comment authored by the sole allowlisted TRUSTED_CONTRACT_PUBLISHERS entry."""
+    return _ab_go_comment(
+        author=_AB_TRUSTED_LOGIN,
+        author_association=_AB_TRUSTED_ASSOCIATION,
+        comment_id=comment_id,
+        author_id=_AB_TRUSTED_AUTHOR_ID,
+        author_type=_AB_TRUSTED_TYPE,
+    )
+
+
+def _ab_make_go_review_result() -> dict:
+    return {
+        "schema": "CONTRACT_REVIEW_ONCE_RESULT_V1",
+        "status": "go",
+        "readiness_status": "go",
+        "checks": {
+            "readiness": "go",
+            "blockers": "pass",
+            "product_spec": "pass",
+            "product_spec_check": {
+                "schema": "product_spec_check/v1",
+                "applicability": "not_applicable",
+                "decision": "pass",
+                "triggers": {},
+                "conditions": {},
+                "blocked_reasons": [],
+                "body_sha256": _AB_SAMPLE_BODY_SHA256,
+                "source_provenance": {"source_type": "github_issue_body", "body_file": None},
+            },
+            "vc_preflight": "pass",
+        },
+        "vc_preflight_classifications": [],
+        "errors": [],
+    }
+
+
+def _ab_mock_parser_mod_no_go() -> MagicMock:
+    mod = MagicMock()
+    mod.fetch_issue_comments.return_value = ([], None)
+    mod.parse_contract_review_results.return_value = []
+    mod.find_latest_go.return_value = None
+    mod.find_latest_result.return_value = None
+    return mod
+
+
+# ---------------------------------------------------------------------------
+# AC3: controlled publisher comment ID binding
+# ---------------------------------------------------------------------------
+
+
+def test_controlled_publisher_comment_id_binding_is_required():
+    """AC3: controlled publisher の expected comment ID と remote readback
+    comment ID が一致する場合だけ materialized snapshot を成功扱いし、
+    不一致・欠落を fail-closed にすることを確認する。"""
+    parser_mod = _ab_mock_parser_mod_no_go()
+    review_result = _ab_make_go_review_result()
+
+    def fake_post(issue_number, repo, body, timeout=30):
+        return (f"{_AB_ISSUE_URL}#issuecomment-9999", _ecs_mod.POST_STATUS_POSTED, None)
+
+    # Mismatched binding → fail-closed, no status: ok, no contract_snapshot_url.
+    # #1537: capture_base_ref_and_sha is a two-phase fingerprint materialize
+    # step invoked before the binding verify this test exercises; default it
+    # to success since this test's concern is the binding check, not
+    # fingerprint materialization mechanics (mirrors the "Matching binding"
+    # case below).
+    with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+        with patch.object(
+            _ecs_mod, "fetch_issue_snapshot",
+            return_value=(_AB_SAMPLE_BODY, _AB_SAMPLE_UPDATED_AT, None),
+        ):
+            with patch.object(
+                _ecs_mod, "run_contract_review_once", return_value=(review_result, None)
+            ):
+                with patch.object(_ecs_mod, "post_comment", side_effect=fake_post):
+                    with patch.object(
+                        _ecs_mod,
+                        "verify_controlled_publisher_comment_id_binding",
+                        return_value=(False, "binding_id_mismatch"),
+                    ):
+                        with patch.object(
+                            _ecs_mod,
+                            "capture_base_ref_and_sha",
+                            return_value=("main", "a" * 40),
+                        ):
+                            mismatched_result = _ecs_mod.ensure_contract_snapshot(
+                                issue_number=_AB_ISSUE_NUMBER,
+                                repo=_AB_REPO,
+                                mode="auto",
+                                do_post=True,
+                            )
+
+    assert mismatched_result["status"] == "controlled_publisher_binding_failed"
+    assert mismatched_result["contract_snapshot_url"] is None
+
+    # Missing expected_comment_id → fail-closed without any subprocess call.
+    bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+        _AB_ISSUE_NUMBER, _AB_REPO, None
+    )
+    assert bound_ok is False
+    assert reason == "missing_comment_id"
+
+    # Matching binding → status: ok with a non-null contract_snapshot_url.
+    # #1537: capture_base_ref_and_sha / patch_comment are the two-phase
+    # fingerprint materialize steps added after the binding verify this test
+    # exercises; default them to success since this test's concern is the
+    # binding check, not fingerprint materialization mechanics.
+    with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+        with patch.object(
+            _ecs_mod, "fetch_issue_snapshot",
+            return_value=(_AB_SAMPLE_BODY, _AB_SAMPLE_UPDATED_AT, None),
+        ):
+            with patch.object(
+                _ecs_mod, "run_contract_review_once", return_value=(review_result, None)
+            ):
+                with patch.object(_ecs_mod, "post_comment", side_effect=fake_post):
+                    with patch.object(
+                        _ecs_mod,
+                        "verify_controlled_publisher_comment_id_binding",
+                        return_value=(True, None),
+                    ):
+                        with patch.object(
+                            _ecs_mod,
+                            "capture_base_ref_and_sha",
+                            return_value=("main", "a" * 40),
+                        ):
+                            with patch.object(
+                                _ecs_mod, "patch_comment", return_value=(True, None)
+                            ):
+                                matched_result = _ecs_mod.ensure_contract_snapshot(
+                                    issue_number=_AB_ISSUE_NUMBER,
+                                    repo=_AB_REPO,
+                                    mode="auto",
+                                    do_post=True,
+                                )
+
+    assert matched_result["status"] == "ok"
+    assert matched_result["contract_snapshot_url"] is not None
+
+
+def test_all_snapshot_consumers_reject_untrusted_go():
+    """AC4: run_contract_review_once.py / ensure_contract_snapshot.py /
+    build_intake_capsule.py の各 snapshot 採用経路で、untrusted author が
+    投稿した完全な schema-valid `status: go` を採用しないことを確認する。"""
+    untrusted = _ab_go_comment(author="random-outsider", author_association="NONE")
+
+    # 1. contract_review_result_parser.py (shared parser, both consumers use it)
+    parsed = _parser_mod.parse_contract_review_results(
+        [untrusted], expected_issue_url=_AB_ISSUE_URL
+    )
+    assert parsed[0]["is_trusted_author"] is False
+    assert _parser_mod.find_latest_go(parsed, trusted_only=True) is None
+
+    # 2. run_contract_review_once.py: check_existing_go_comment dedupe source
+    def fake_run(cmd, **kwargs):
+        result = MagicMock()
+        if cmd[:2] == ["gh", "api"] and len(cmd) > 3 and "comments" in cmd[3]:
+            result.returncode = 0
+            result.stdout = json.dumps(untrusted) + "\n"
+            result.stderr = ""
+        else:
+            result.returncode = 1
+            result.stdout = ""
+            result.stderr = "not_needed_for_this_test"
+        return result
+
+    with patch("subprocess.run", side_effect=fake_run):
+        go, _err = _run_once_mod.check_existing_go_comment(_AB_ISSUE_NUMBER, _AB_REPO)
+    assert go is None
+
+    # 3. ensure_contract_snapshot.py: check-only mode existing-go adoption
+    parser_mod = MagicMock()
+    parser_mod.fetch_issue_comments.return_value = ([untrusted], None)
+    parser_mod.parse_contract_review_results.return_value = parsed
+    parser_mod.find_latest_result.return_value = parsed[0]
+    parser_mod.find_latest_go.side_effect = (
+        lambda results, trusted_only=False: (
+            None
+            if trusted_only
+            else next((r for r in results if r.get("status") == "go"), None)
+        )
+    )
+
+    with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+        with patch.object(
+            _ecs_mod, "fetch_issue_snapshot",
+            return_value=(_AB_SAMPLE_BODY, _AB_SAMPLE_UPDATED_AT, None),
+        ):
+            result = _ecs_mod.ensure_contract_snapshot(
+                issue_number=_AB_ISSUE_NUMBER, repo=_AB_REPO, mode="check-only"
+            )
+    assert result["status"] != "ok"
+
+    # 4. build_intake_capsule.py: live comment normalization path
+    capsule_results, _counts = _capsule_mod._parse_contract_results(
+        [untrusted], _AB_ISSUE_URL
+    )
+    assert capsule_results[0]["is_trusted_author"] is False
+    assert _capsule_mod._find_latest_go(capsule_results) is None
+
+
+class TestControlledPublisherCommentIdBinding:
+    def test_extract_comment_id_from_url(self):
+        assert _ecs_mod.extract_comment_id_from_url(f"{_AB_ISSUE_URL}#issuecomment-42") == 42
+        assert _ecs_mod.extract_comment_id_from_url("https://example.test/no-anchor") is None
+        assert _ecs_mod.extract_comment_id_from_url(None) is None
+        assert _ecs_mod.extract_comment_id_from_url("") is None
+
+    def test_binding_verification_missing_id_is_fail_closed(self):
+        bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+            _AB_ISSUE_NUMBER, _AB_REPO, None
+        )
+        assert bound_ok is False
+        assert reason == "missing_comment_id"
+
+    @staticmethod
+    def _full_payload(
+        comment_id=1234,
+        issue_number=_AB_ISSUE_NUMBER,
+        html_url=None,
+        author_id=_AB_TRUSTED_AUTHOR_ID,
+        author_login=_AB_TRUSTED_LOGIN,
+        author_type=_AB_TRUSTED_TYPE,
+        author_association=_AB_TRUSTED_ASSOCIATION,
+        body="unused-body",
+    ) -> dict:
+        return {
+            "id": comment_id,
+            "issue_url": f"https://api.github.com/repos/{_AB_REPO}/issues/{issue_number}",
+            "html_url": html_url or f"{_AB_ISSUE_URL}#issuecomment-{comment_id}",
+            "user": {"id": author_id, "login": author_login, "type": author_type},
+            "author_association": author_association,
+            "body": body,
+        }
+
+    def test_binding_verification_id_mismatch_is_fail_closed(self):
+        with patch("subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = json.dumps(self._full_payload(comment_id=999))
+            bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+                _AB_ISSUE_NUMBER, _AB_REPO, 1234
+            )
+        assert bound_ok is False
+        assert reason == "binding_id_mismatch"
+
+    def test_binding_verification_issue_mismatch_is_fail_closed(self):
+        with patch("subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = json.dumps(self._full_payload(issue_number=9999))
+            bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+                _AB_ISSUE_NUMBER, _AB_REPO, 1234
+            )
+        assert bound_ok is False
+        assert reason == "binding_issue_mismatch"
+
+    def test_binding_verification_readback_error_is_fail_closed(self):
+        with patch("subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 1
+            run_mock.return_value.stdout = ""
+            bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+                _AB_ISSUE_NUMBER, _AB_REPO, 1234
+            )
+        assert bound_ok is False
+        assert reason == "binding_readback_error"
+
+    def test_binding_verification_match_succeeds(self):
+        with patch("subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = json.dumps(self._full_payload())
+            bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+                _AB_ISSUE_NUMBER, _AB_REPO, 1234
+            )
+        assert bound_ok is True
+        assert reason is None
+
+    def test_binding_verification_html_url_mismatch_is_fail_closed(self):
+        """fix_delta P1 item 3: the direct-GET html_url must match the
+        comment id being verified, not just the numeric id field."""
+        with patch("subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = json.dumps(
+                self._full_payload(html_url=f"{_AB_ISSUE_URL}#issuecomment-9999999")
+            )
+            bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+                _AB_ISSUE_NUMBER, _AB_REPO, 1234
+            )
+        assert bound_ok is False
+        assert reason == "binding_html_url_mismatch"
+
+    def test_binding_verification_untrusted_collaborator_is_fail_closed(self):
+        """fix_delta P1 item 2/3: an unauthorized COLLABORATOR posting a
+        schema-valid, id/issue-matching comment must still be rejected."""
+        with patch("subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = json.dumps(
+                self._full_payload(
+                    author_id=987654,
+                    author_login="some-collaborator",
+                    author_type="User",
+                    author_association="COLLABORATOR",
+                )
+            )
+            bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+                _AB_ISSUE_NUMBER, _AB_REPO, 1234
+            )
+        assert bound_ok is False
+        assert reason == "binding_publisher_untrusted"
+
+    def test_binding_verification_untrusted_member_is_fail_closed(self):
+        with patch("subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = json.dumps(
+                self._full_payload(
+                    author_id=555555,
+                    author_login="some-member",
+                    author_type="User",
+                    author_association="MEMBER",
+                )
+            )
+            bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+                _AB_ISSUE_NUMBER, _AB_REPO, 1234
+            )
+        assert bound_ok is False
+        assert reason == "binding_publisher_untrusted"
+
+    def test_binding_verification_correct_login_wrong_id_is_fail_closed(self):
+        """The login string alone must never authorize -- only the id match does."""
+        with patch("subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = json.dumps(
+                self._full_payload(author_id=1, author_login=_AB_TRUSTED_LOGIN)
+            )
+            bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+                _AB_ISSUE_NUMBER, _AB_REPO, 1234
+            )
+        assert bound_ok is False
+        assert reason == "binding_publisher_untrusted"
+
+    def test_binding_verification_correct_id_wrong_login_is_fail_closed(self):
+        """A rename/spoofed-login on the correct id must never authorize."""
+        with patch("subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = json.dumps(
+                self._full_payload(author_id=_AB_TRUSTED_AUTHOR_ID, author_login="not-squne121")
+            )
+            bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+                _AB_ISSUE_NUMBER, _AB_REPO, 1234
+            )
+        assert bound_ok is False
+        assert reason == "binding_publisher_untrusted"
+
+    def test_binding_verification_type_mismatch_is_fail_closed(self):
+        """A Bot account impersonating the trusted id/login must be rejected."""
+        with patch("subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = json.dumps(
+                self._full_payload(author_type="Bot")
+            )
+            bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+                _AB_ISSUE_NUMBER, _AB_REPO, 1234
+            )
+        assert bound_ok is False
+        assert reason == "binding_publisher_untrusted"
+
+    def test_binding_verification_body_hash_mismatch_is_fail_closed(self):
+        with patch("subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = json.dumps(
+                self._full_payload(body="different-body-than-expected")
+            )
+            bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+                _AB_ISSUE_NUMBER,
+                _AB_REPO,
+                1234,
+                expected_body_sha256=_ecs_mod.sha256_of("expected-body"),
+            )
+        assert bound_ok is False
+        assert reason == "binding_body_hash_mismatch"
+
+    def test_binding_verification_body_hash_match_succeeds(self):
+        with patch("subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = json.dumps(
+                self._full_payload(body="expected-body")
+            )
+            bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+                _AB_ISSUE_NUMBER,
+                _AB_REPO,
+                1234,
+                expected_body_sha256=_ecs_mod.sha256_of("expected-body"),
+            )
+        assert bound_ok is True
+        assert reason is None
+
+    def test_binding_verification_comment_id_bool_is_fail_closed(self):
+        bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+            _AB_ISSUE_NUMBER, _AB_REPO, True
+        )
+        assert bound_ok is False
+        assert reason == "missing_comment_id"
+
+    def test_binding_verification_comment_id_string_is_fail_closed(self):
+        bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+            _AB_ISSUE_NUMBER, _AB_REPO, "1234"
+        )
+        assert bound_ok is False
+        assert reason == "missing_comment_id"
+
+    def test_binding_verification_comment_id_zero_is_fail_closed(self):
+        bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+            _AB_ISSUE_NUMBER, _AB_REPO, 0
+        )
+        assert bound_ok is False
+        assert reason == "missing_comment_id"
+
+    def test_binding_verification_comment_id_negative_is_fail_closed(self):
+        bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+            _AB_ISSUE_NUMBER, _AB_REPO, -1234
+        )
+        assert bound_ok is False
+        assert reason == "missing_comment_id"
+
+    def test_materialization_blocked_when_binding_fails(self):
+        """GIVEN a successful comment post WHEN the id-binding readback
+        mismatches THEN ensure_contract_snapshot fails closed and does not
+        report status: ok, even though post_comment itself succeeded."""
+        parser_mod = _ab_mock_parser_mod_no_go()
+        review_result = _ab_make_go_review_result()
+
+        def fake_post(issue_number, repo, body, timeout=30):
+            return (f"{_AB_ISSUE_URL}#issuecomment-9999", _ecs_mod.POST_STATUS_POSTED, None)
+
+        # #1537: capture_base_ref_and_sha is a two-phase fingerprint
+        # materialize step invoked before the binding verify this test
+        # exercises; default it to success since this test's concern is the
+        # binding check, not fingerprint materialization mechanics.
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(
+                _ecs_mod, "fetch_issue_snapshot",
+                return_value=(_AB_SAMPLE_BODY, _AB_SAMPLE_UPDATED_AT, None),
+            ):
+                with patch.object(
+                    _ecs_mod, "run_contract_review_once", return_value=(review_result, None)
+                ):
+                    with patch.object(_ecs_mod, "post_comment", side_effect=fake_post):
+                        with patch.object(
+                            _ecs_mod,
+                            "verify_controlled_publisher_comment_id_binding",
+                            return_value=(False, "binding_id_mismatch"),
+                        ):
+                            with patch.object(
+                                _ecs_mod,
+                                "capture_base_ref_and_sha",
+                                return_value=("main", "a" * 40),
+                            ):
+                                result = _ecs_mod.ensure_contract_snapshot(
+                                    issue_number=_AB_ISSUE_NUMBER,
+                                    repo=_AB_REPO,
+                                    mode="auto",
+                                    do_post=True,
+                                )
+
+        assert result["status"] == "controlled_publisher_binding_failed"
+        assert result["contract_snapshot_url"] is None
+        assert any("binding" in e for e in result["errors"])
+
+    def test_materialization_succeeds_when_binding_matches(self):
+        parser_mod = _ab_mock_parser_mod_no_go()
+        review_result = _ab_make_go_review_result()
+
+        def fake_post(issue_number, repo, body, timeout=30):
+            return (f"{_AB_ISSUE_URL}#issuecomment-9999", _ecs_mod.POST_STATUS_POSTED, None)
+
+        # #1537: default the two-phase fingerprint materialize steps to
+        # success; this test's concern is the binding check, not fingerprint
+        # materialization mechanics.
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(
+                _ecs_mod, "fetch_issue_snapshot",
+                return_value=(_AB_SAMPLE_BODY, _AB_SAMPLE_UPDATED_AT, None),
+            ):
+                with patch.object(
+                    _ecs_mod, "run_contract_review_once", return_value=(review_result, None)
+                ):
+                    with patch.object(_ecs_mod, "post_comment", side_effect=fake_post):
+                        with patch.object(
+                            _ecs_mod,
+                            "verify_controlled_publisher_comment_id_binding",
+                            return_value=(True, None),
+                        ):
+                            with patch.object(
+                                _ecs_mod,
+                                "capture_base_ref_and_sha",
+                                return_value=("main", "a" * 40),
+                            ):
+                                with patch.object(
+                                    _ecs_mod, "patch_comment", return_value=(True, None)
+                                ):
+                                    result = _ecs_mod.ensure_contract_snapshot(
+                                        issue_number=_AB_ISSUE_NUMBER,
+                                        repo=_AB_REPO,
+                                        mode="auto",
+                                        do_post=True,
+                                    )
+
+        assert result["status"] == "ok"
+        assert result["contract_snapshot_url"] == f"{_AB_ISSUE_URL}#issuecomment-9999"
+
+
+# ---------------------------------------------------------------------------
+# AC4: all snapshot consumers reject untrusted go
+# ---------------------------------------------------------------------------
+
+
+class TestAllSnapshotConsumersRejectUntrustedGo:
+    def test_contract_review_result_parser_marks_untrusted_go(self):
+        untrusted = _ab_go_comment(author="random-outsider", author_association="NONE")
+        results = _parser_mod.parse_contract_review_results(
+            [untrusted], expected_issue_url=_AB_ISSUE_URL
+        )
+        assert results[0]["is_trusted_author"] is False
+        assert _parser_mod.find_latest_go(results, trusted_only=True) is None
+        assert _parser_mod.find_latest_go(results, trusted_only=False) is not None
+
+    def test_run_contract_review_once_check_existing_go_rejects_untrusted(self):
+        """GIVEN an untrusted, schema-valid status:go comment WHEN
+        run_contract_review_once.check_existing_go_comment runs THEN the
+        untrusted snapshot is not adopted as an existing go (dedupe source)."""
+        untrusted = _ab_go_comment(author="random-outsider", author_association="NONE")
+
+        def fake_run(cmd, **kwargs):
+            result = MagicMock()
+            if cmd[:2] == ["gh", "api"] and len(cmd) > 3 and "comments" in cmd[3]:
+                result.returncode = 0
+                result.stdout = json.dumps(untrusted) + "\n"
+                result.stderr = ""
+            else:
+                result.returncode = 1
+                result.stdout = ""
+                result.stderr = "not_needed_for_this_test"
+            return result
+
+        with patch("subprocess.run", side_effect=fake_run):
+            go, err = _run_once_mod.check_existing_go_comment(_AB_ISSUE_NUMBER, _AB_REPO)
+
+        assert go is None
+
+    def test_run_contract_review_once_check_existing_go_accepts_trusted(self):
+        trusted = _ab_trusted_go_comment()
+
+        def fake_run(cmd, **kwargs):
+            result = MagicMock()
+            if cmd[:2] == ["gh", "api"] and len(cmd) > 3 and "comments" in cmd[3]:
+                result.returncode = 0
+                result.stdout = json.dumps(trusted) + "\n"
+                result.stderr = ""
+            elif cmd[:3] == ["gh", "issue", "view"]:
+                result.returncode = 0
+                result.stdout = json.dumps({"body": _AB_SAMPLE_BODY})
+                result.stderr = ""
+            else:
+                result.returncode = 1
+                result.stdout = ""
+                result.stderr = "not_needed_for_this_test"
+            return result
+
+        # is_go_current's fuller freshness contract (vc_preflight classifications,
+        # product_spec_check body binding) is exercised in
+        # test_ensure_contract_snapshot.py; here we isolate the trust filter by
+        # stubbing that unrelated freshness predicate to True.
+        with patch("subprocess.run", side_effect=fake_run):
+            with patch.object(_run_once_mod, "_is_current_go_snapshot", return_value=True):
+                go, err = _run_once_mod.check_existing_go_comment(_AB_ISSUE_NUMBER, _AB_REPO)
+
+        # Trusted + fresh body hash → adopted as an existing go.
+        assert go is not None
+        assert go["is_trusted_author"] is True
+
+    def test_build_intake_capsule_rejects_untrusted_go(self):
+        untrusted = _ab_go_comment(author="random-outsider", author_association="NONE")
+        results, _counts = _capsule_mod._parse_contract_results([untrusted], _AB_ISSUE_URL)
+        assert results[0]["is_trusted_author"] is False
+        assert _capsule_mod._find_latest_go(results) is None
+
+    def test_build_intake_capsule_accepts_trusted_go(self):
+        trusted = _ab_trusted_go_comment()
+        results, _counts = _capsule_mod._parse_contract_results([trusted], _AB_ISSUE_URL)
+        assert results[0]["is_trusted_author"] is True
+        latest_go = _capsule_mod._find_latest_go(results)
+        assert latest_go is not None
+        assert latest_go["html_url"] == trusted["html_url"]
+
+    def test_build_intake_capsule_rejects_unauthorized_collaborator_go(self):
+        """fix_delta P1 item 2: association alone (COLLABORATOR) must not
+        authorize an account outside TRUSTED_CONTRACT_PUBLISHERS."""
+        collaborator = _ab_go_comment(
+            author="some-collaborator",
+            author_association="COLLABORATOR",
+            author_id=999111,
+            author_type="User",
+        )
+        results, _counts = _capsule_mod._parse_contract_results([collaborator], _AB_ISSUE_URL)
+        assert results[0]["is_trusted_author"] is False
+        assert _capsule_mod._find_latest_go(results) is None
+
+    def test_untrusted_blocked_does_not_preempt_trusted_go_precedence(self):
+        """fix_delta P1 item 1 regression: a schema-valid untrusted `blocked`
+        posted AFTER a trusted `go` must not take latest-result precedence in
+        any of the three consumers."""
+        trusted_go = _ab_trusted_go_comment(comment_id=1)
+        trusted_go["created_at"] = "2026-07-12T00:00:00Z"
+        untrusted_blocked = {
+            "id": 2,
+            "html_url": f"{_AB_ISSUE_URL}#issuecomment-2",
+            "created_at": "2026-07-12T01:00:00Z",
+            "author": "outside-actor",
+            "author_association": "NONE",
+            "author_id": 42424242,
+            "author_type": "User",
+            "body": f"""
+```yaml
+CONTRACT_REVIEW_RESULT_V1:
+  status: blocked
+  generated_at: "2026-07-12T01:00:00Z"
+  generated_by: issue-contract-review
+  issue_url: {_AB_ISSUE_URL}
+```
+""",
+        }
+        comments = [trusted_go, untrusted_blocked]
+
+        # 1. shared parser: trusted_only precedence must select the trusted go.
+        parsed = _parser_mod.parse_contract_review_results(
+            comments, expected_issue_url=_AB_ISSUE_URL
+        )
+        latest_trusted = _parser_mod.find_latest_result(parsed, trusted_only=True)
+        assert latest_trusted is not None
+        assert latest_trusted["status"] == "go"
+
+        # 2. build_intake_capsule: same precedence contract.
+        capsule_results, _counts = _capsule_mod._parse_contract_results(
+            comments, _AB_ISSUE_URL
+        )
+        capsule_latest = _capsule_mod._find_latest_result(
+            capsule_results, trusted_only=True
+        )
+        assert capsule_latest is not None
+        assert capsule_latest["status"] == "go"
+
+    def test_untrusted_go_does_not_preempt_trusted_blocked_precedence(self):
+        """The mirror case: an untrusted `go` posted after a trusted
+        `blocked` must not be adopted as authoritative."""
+        trusted_blocked = {
+            "id": 1,
+            "html_url": f"{_AB_ISSUE_URL}#issuecomment-1",
+            "created_at": "2026-07-12T00:00:00Z",
+            "author": _AB_TRUSTED_LOGIN,
+            "author_association": _AB_TRUSTED_ASSOCIATION,
+            "author_id": _AB_TRUSTED_AUTHOR_ID,
+            "author_type": _AB_TRUSTED_TYPE,
+            "body": f"""
+```yaml
+CONTRACT_REVIEW_RESULT_V1:
+  status: blocked
+  generated_at: "2026-07-12T00:00:00Z"
+  generated_by: issue-contract-review
+  issue_url: {_AB_ISSUE_URL}
+```
+""",
+        }
+        untrusted_go = _ab_go_comment(
+            author="outside-actor",
+            author_association="NONE",
+            comment_id=2,
+            author_id=42424242,
+            author_type="User",
+        )
+        untrusted_go["created_at"] = "2026-07-12T01:00:00Z"
+        comments = [trusted_blocked, untrusted_go]
+
+        parsed = _parser_mod.parse_contract_review_results(
+            comments, expected_issue_url=_AB_ISSUE_URL
+        )
+        latest_trusted = _parser_mod.find_latest_result(parsed, trusted_only=True)
+        assert latest_trusted is not None
+        assert latest_trusted["status"] == "blocked"
+        assert _parser_mod.find_latest_go(parsed, trusted_only=True) is None
