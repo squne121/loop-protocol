@@ -706,6 +706,28 @@ SESSION_MANIFEST_LEGACY_SCAN_V1:
 
 ---
 
-## 12. publish lane authorization trust root（historical note）
+## 12a. pr_review.publish の位置づけ（Issue #1536）
+
+`scripts/agent-guards/controlled_skill_mutation_exec.py` の `CONTROLLED_SKILL_MUTATION_COMMAND_POLICY` に `pr_review.publish` command id を追加した（Option C: controlled review publisher）。`local_main_branch_guard.sh` / `worktree_scope_guard.sh` は既存の `REASON_CONTROLLED_SKILL_MUTATION_EXECUTOR` 判定（`is_controlled_skill_mutation_exec_command()`、`ALL_COMMAND_IDS` メンバーシップに基づく exact command class allow）をそのまま適用するため、この2フック自体の変更は不要だった（`termination_report.publish` / `issue_body.update` / `issue_comment.publish` / `contract_snapshot.publish` と同一の authorization lane）。
+
+`pr_review.publish` は `pr-reviewer` SubAgent（read-only、`gh pr review` / worktree bootstrap を一切行わない）の判定結果（`PR_REVIEW_PUBLISH_REQUEST_V1`）を受け取り、`event: COMMENT` 固定・`commit_id` 拘束・idempotency marker 付きで GitHub PR review を投稿する。生の `gh pr review` 呼び出しは `local_main_branch_guard.sh` で引き続き `gh_mutation_denied` として block される（本 Issue で変更しない）。
+
+Codex 側 `.codex/rules/default.rules` は `gh pr review` を引き続き明示的に forbidden とし（`gh` サブコマンド prefix rule）、かつ `controlled_skill_mutation_exec.py` 自体への allow エントリを持たないため、本変更は Claude-only のまま split-brain を生じない（確認のみ、rule 変更なし）。
+
+## 12b. pr_review.publish の追加ハードニング（Issue #1539 fix_delta）
+
+OWNER レビュー（PR #1539、squne121）で以下の構造的欠陥が指摘され、修正した:
+
+- **trusted bridge の欠如（Blocker 1）**: `pr-reviewer` SubAgent は `Edit`/`Write`/`MultiEdit` を持たず Bash 経由のファイル書き込みも禁止のため、当初の SKILL 文面が要求していた「`PR_REVIEW_PUBLISH_REQUEST_V1` を自ら組み立てて `--input-file` に渡す」経路は実際には SubAgent に実行不能だった。修正: `controlled_skill_mutation_exec.py` に render mode（`--render-body-file` / `--verdict` / `--reviewed-head-sha` / `--expected-head-sha` / `--merge-ready`）を追加。trusted orchestrator（Write ツールを持つ control-plane）が verdict 本文テキストのみを artifact パスへ書き込み、executor 自身が `body_sha256` / `idempotency_key` を再計算し `producer_role` / `event` を自ら固定する（入力からは受け取らない）。
+- **host/environment binding の欠如（Blocker 2）**: `_verify_git_remote_origin()` が owner/repo の正規表現抽出のみで host/scheme を無視していたため、`https://attacker.example/<owner>/<repo>.git` 等が trusted と誤認され得た。また `GH_HOST`/`GH_REPO`/`GH_CONFIG_DIR`/`GH_DEBUG`/`DEBUG` が sanitize されず、`gh` subprocess へ `env=` が渡っていなかった。修正: `urlsplit` による構造的 host/scheme/port/userinfo 検査（github.com の HTTPS/SSH canonical form のみ許可）と、全 `gh` subprocess への sanitized env（上記5キー除去）+ `--hostname github.com` 明示。
+- **idempotent retry が postcondition を迂回（Blocker 3）**: 既存 marker が1件見つかった retry 経路が `state`/`commit_id` のみ確認して即座に成功を返し、body hash・marker 一意性/位置・現在 PR head・author identity・tracked changes を再検証していなかった。修正: retry も fresh-post と同一の共通 postcondition validator（`_validate_pr_review_postcondition`）を通す。marker 検索も substring match から「末尾に厳密一致」判定に変更。
+- **TOCTOU（High 1）**: commit_id 拘束は「A に結び付ける」保証であって「POST 時点でも A が current head」の atomic precondition ではない。修正: POST/readback 後に current head を再取得し、移動していれば `published_but_stale` として fail-closed（review は残るが成功報告はしない）。
+- **producer provenance の自己申告（High 2）**: `producer_role` が入力 JSON の自己申告フィールドで、schema も exact-key ではなかった。修正: render mode では `producer_role`/`event` を executor が自ら固定（入力に存在しても無視ではなく、そもそも render mode の入力スキーマに含まれない）。`--input-file` 経路も exact-key schema + body size bound を追加。
+
+AC8（実 PreToolUse hook chain）テストは `secret_boundary_guard` / `local_main_branch_guard` / `worktree_scope_guard` / `guard-japanese-prose` / `rtk_boundary_shadow_guard` / `ci_test_performance_advisory` / `root_temporary_residue_advisory` の 7 hook すべてを `.claude/settings.json` 記載順に実行し、aggregate decision（deny/ask が無いこと）を検証する形に拡張した（`.claude/hooks/tests/hookchain_harness.py`）。
+
+---
+
+## 12. publish lane authorization trust root（歴史的経緯・historical note）
 
 Issue #1454（Phase A, PR #1457 MERGED）で `scripts/trust-root` 一式（`trusted_hook_launcher.py` / `manifest_schema.py` / `install_trust_root.sh`）が external trust root として導入されたが、これを `.codex/hooks.json` へ実際に配線する Issue #1450（Phase B）と、追加ハードニングを扱う Issue #1468 がいずれも個人開発の脅威モデルに対して過剰と判断され not planned でクローズされた。配線先を失った `scripts/trust-root` は不使用コードとなったため、Issue #1469 でコード一式・CI 登録・本節の bootstrap/rotation/managed hook registration 手順を削除した。現行の publish lane 保護は Issue #1408（PR #1442 MERGED、Issue branch 限定 push 許可・force/tag/delete/mirror 拒否）と main branch protection（Issue #360）のみで構成される。

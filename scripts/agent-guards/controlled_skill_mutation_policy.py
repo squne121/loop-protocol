@@ -32,6 +32,12 @@ COMMAND_ID_PUBLISH = "termination_report.publish"
 COMMAND_ID_ISSUE_BODY_UPDATE = "issue_body.update"
 COMMAND_ID_ISSUE_COMMENT_PUBLISH = "issue_comment.publish"
 COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH = "contract_snapshot.publish"
+# Issue #1536: controlled review publisher. `--issue-number` is reused as the
+# PR number for this command id (the executor's generic input-file/env
+# binding is issue-number-shaped; a PR number occupies the same GitHub
+# numbering space). The pr_review.publish field validator additionally
+# requires an explicit `pr_number` field and checks it matches.
+COMMAND_ID_PR_REVIEW_PUBLISH = "pr_review.publish"
 
 # Allowed write roots for all commands (relative to project root)
 ALLOWED_WRITE_ROOTS = ["artifacts/"]
@@ -47,6 +53,7 @@ INPUT_SCHEMA_BY_COMMAND: dict = {
     COMMAND_ID_ISSUE_BODY_UPDATE: "ISSUE_BODY_UPDATE_INPUT_V1",
     COMMAND_ID_ISSUE_COMMENT_PUBLISH: "ISSUE_COMMENT_PUBLISH_INPUT_V1",
     COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH: "CONTRACT_SNAPSHOT_PUBLISH_INPUT_V1",
+    COMMAND_ID_PR_REVIEW_PUBLISH: "PR_REVIEW_PUBLISH_REQUEST_V1",
 }
 
 ALL_COMMAND_IDS = frozenset(INPUT_SCHEMA_BY_COMMAND)
@@ -58,6 +65,9 @@ ALL_COMMAND_IDS = frozenset(INPUT_SCHEMA_BY_COMMAND)
 ENV_BINDING_MANDATORY_COMMAND_IDS = frozenset({COMMAND_ID_PUBLISH})
 
 # Environment variables that the executor sanitizes (removes from child env)
+# Issue #1539 fix_delta Blocker 2: GH_HOST / GH_REPO / GH_CONFIG_DIR / GH_DEBUG /
+# DEBUG are stripped so an inherited parent-process override cannot redirect
+# `gh` subprocess calls to a different host/config/repo or leak debug output.
 ENV_SANITIZE_KEYS = [
     "PUBLISH_ARTIFACT_DIR",
     "PYTHONPATH",
@@ -66,6 +76,11 @@ ENV_SANITIZE_KEYS = [
     "EDITOR",
     "VISUAL",
     "BROWSER",
+    "GH_HOST",
+    "GH_REPO",
+    "GH_CONFIG_DIR",
+    "GH_DEBUG",
+    "DEBUG",
 ]
 
 # ── CONTROLLED_SKILL_MUTATION_COMMAND_POLICY ──────────────────────────────────
@@ -201,6 +216,46 @@ CONTROLLED_SKILL_MUTATION_COMMAND_POLICY: dict = {
         },
         "env_sanitize": ENV_SANITIZE_KEYS,
     },
+    COMMAND_ID_PR_REVIEW_PUBLISH: {
+        "command_id": COMMAND_ID_PR_REVIEW_PUBLISH,
+        "description": (
+            "Publish a GitHub PR review (event: COMMENT, commit_id-bound, "
+            "idempotent) on behalf of the read-only pr-reviewer SubAgent "
+            "(controlled remote mutation, Issue #1536 Option C)"
+        ),
+        "executor_script": EXECUTOR_SCRIPT,
+        "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+        "input_namespace": (
+            f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{COMMAND_ID_PR_REVIEW_PUBLISH}/"
+        ),
+        "input_schema": INPUT_SCHEMA_BY_COMMAND[COMMAND_ID_PR_REVIEW_PUBLISH],
+        "github_mutation": {
+            "review_on_pull_request": True,
+            "review_event_fixed": "COMMENT",
+            "requires_repo": TRUSTED_REPO,
+            "requires_explicit_repo_flag": True,
+        },
+        "precondition": {
+            "expected_head_sha_must_match_remote_pr_head": True,
+        },
+        "postcondition": {
+            "no_tracked_source_changes": True,
+            "no_lockfile_changes": True,
+            "no_settings_changes": True,
+            "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+            "review_state_must_be_commented": True,
+            "review_commit_id_must_match_expected_head_sha": True,
+            "review_body_sha256_must_match_readback": True,
+        },
+        "idempotency": {
+            "marker_file_pattern": (
+                f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/"
+                f"{COMMAND_ID_PR_REVIEW_PUBLISH}/pr_review_publish.marker.json"
+            ),
+            "marker_field": "idempotency_key",
+        },
+        "env_sanitize": ENV_SANITIZE_KEYS,
+    },
 }
 
 # ── Executor argv spec ────────────────────────────────────────────────────────
@@ -214,16 +269,34 @@ _EXECUTOR_VALUE_FLAGS: frozenset[str] = frozenset({
     "--issue-number",
     "--input-file",
     "--repo",
+    # Issue #1539 fix_delta Blocker 1: pr_review.publish "render mode" flags.
+    # These let a trusted caller hand the executor the raw verdict fields and
+    # a body TEXT file (no self-declared hash/schema/producer_role) instead of
+    # a pre-built PR_REVIEW_PUBLISH_REQUEST_V1 JSON. The executor computes
+    # body_sha256 / idempotency_key / producer_role / event itself.
+    "--render-body-file",
+    "--verdict",
+    "--reviewed-head-sha",
+    "--expected-head-sha",
 })
 _EXECUTOR_BOOL_FLAGS: frozenset[str] = frozenset({
     "--json",
     "--dry-run",
+    "--merge-ready",
 })
+# Baseline flags required for every invocation. --input-file XOR --render-body-file
+# (plus its companion flags) is enforced separately in _validate_executor_argv
+# because it is a semantic OR, not a flat set-containment requirement.
 _EXECUTOR_REQUIRED_FLAGS: frozenset[str] = frozenset({
     "--command-id",
     "--issue-number",
-    "--input-file",
     "--repo",
+})
+_EXECUTOR_RENDER_MODE_REQUIRED_FLAGS: frozenset[str] = frozenset({
+    "--render-body-file",
+    "--verdict",
+    "--reviewed-head-sha",
+    "--expected-head-sha",
 })
 
 # Shell metacharacters that make a command unparseable / compound
@@ -273,8 +346,20 @@ def _validate_executor_argv(args: list[str]) -> bool:
         # Unknown flag
         return False
 
-    # All required flags must be present
-    return _EXECUTOR_REQUIRED_FLAGS.issubset(seen)
+    # All baseline required flags must be present
+    if not _EXECUTOR_REQUIRED_FLAGS.issubset(seen):
+        return False
+
+    # Exactly one of --input-file / --render-body-file (Issue #1539 Blocker 1).
+    has_input_file = "--input-file" in seen
+    has_render_mode = "--render-body-file" in seen
+    if has_input_file == has_render_mode:
+        # Neither present, or both present -- ambiguous / not allowed.
+        return False
+    if has_render_mode and not _EXECUTOR_RENDER_MODE_REQUIRED_FLAGS.issubset(seen):
+        return False
+
+    return True
 
 
 def is_controlled_skill_mutation_exec_command(cmd: str, project_root: str) -> bool:
