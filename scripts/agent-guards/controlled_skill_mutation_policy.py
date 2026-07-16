@@ -32,6 +32,12 @@ COMMAND_ID_PUBLISH = "termination_report.publish"
 COMMAND_ID_ISSUE_BODY_UPDATE = "issue_body.update"
 COMMAND_ID_ISSUE_COMMENT_PUBLISH = "issue_comment.publish"
 COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH = "contract_snapshot.publish"
+# Issue #1536: controlled review publisher. `--issue-number` is reused as the
+# PR number for this command id (the executor's generic input-file/env
+# binding is issue-number-shaped; a PR number occupies the same GitHub
+# numbering space). The pr_review.publish field validator additionally
+# requires an explicit `pr_number` field and checks it matches.
+COMMAND_ID_PR_REVIEW_PUBLISH = "pr_review.publish"
 
 # Allowed write roots for all commands (relative to project root)
 ALLOWED_WRITE_ROOTS = ["artifacts/"]
@@ -47,6 +53,7 @@ INPUT_SCHEMA_BY_COMMAND: dict = {
     COMMAND_ID_ISSUE_BODY_UPDATE: "ISSUE_BODY_UPDATE_INPUT_V1",
     COMMAND_ID_ISSUE_COMMENT_PUBLISH: "ISSUE_COMMENT_PUBLISH_INPUT_V1",
     COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH: "CONTRACT_SNAPSHOT_PUBLISH_INPUT_V1",
+    COMMAND_ID_PR_REVIEW_PUBLISH: "PR_REVIEW_PUBLISH_REQUEST_V1",
 }
 
 ALL_COMMAND_IDS = frozenset(INPUT_SCHEMA_BY_COMMAND)
@@ -198,6 +205,46 @@ CONTROLLED_SKILL_MUTATION_COMMAND_POLICY: dict = {
                 f"{COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH}/contract-snapshot-{{issue_number}}.json"
             ),
             "marker_field": "contract_snapshot_url",
+        },
+        "env_sanitize": ENV_SANITIZE_KEYS,
+    },
+    COMMAND_ID_PR_REVIEW_PUBLISH: {
+        "command_id": COMMAND_ID_PR_REVIEW_PUBLISH,
+        "description": (
+            "Publish a GitHub PR review (event: COMMENT, commit_id-bound, "
+            "idempotent) on behalf of the read-only pr-reviewer SubAgent "
+            "(controlled remote mutation, Issue #1536 Option C)"
+        ),
+        "executor_script": EXECUTOR_SCRIPT,
+        "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+        "input_namespace": (
+            f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{COMMAND_ID_PR_REVIEW_PUBLISH}/"
+        ),
+        "input_schema": INPUT_SCHEMA_BY_COMMAND[COMMAND_ID_PR_REVIEW_PUBLISH],
+        "github_mutation": {
+            "review_on_pull_request": True,
+            "review_event_fixed": "COMMENT",
+            "requires_repo": TRUSTED_REPO,
+            "requires_explicit_repo_flag": True,
+        },
+        "precondition": {
+            "expected_head_sha_must_match_remote_pr_head": True,
+        },
+        "postcondition": {
+            "no_tracked_source_changes": True,
+            "no_lockfile_changes": True,
+            "no_settings_changes": True,
+            "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+            "review_state_must_be_commented": True,
+            "review_commit_id_must_match_expected_head_sha": True,
+            "review_body_sha256_must_match_readback": True,
+        },
+        "idempotency": {
+            "marker_file_pattern": (
+                f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/"
+                f"{COMMAND_ID_PR_REVIEW_PUBLISH}/pr_review_publish.marker.json"
+            ),
+            "marker_field": "idempotency_key",
         },
         "env_sanitize": ENV_SANITIZE_KEYS,
     },

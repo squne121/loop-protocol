@@ -706,6 +706,16 @@ SESSION_MANIFEST_LEGACY_SCAN_V1:
 
 ---
 
+## 12a. pr_review.publish の位置づけ（Issue #1536）
+
+`scripts/agent-guards/controlled_skill_mutation_exec.py` の `CONTROLLED_SKILL_MUTATION_COMMAND_POLICY` に `pr_review.publish` command id を追加した（Option C: controlled review publisher）。`local_main_branch_guard.sh` / `worktree_scope_guard.sh` は既存の `REASON_CONTROLLED_SKILL_MUTATION_EXECUTOR` 判定（`is_controlled_skill_mutation_exec_command()`、`ALL_COMMAND_IDS` メンバーシップに基づく exact command class allow）をそのまま適用するため、この2フック自体の変更は不要だった（`termination_report.publish` / `issue_body.update` / `issue_comment.publish` / `contract_snapshot.publish` と同一の authorization lane）。
+
+`pr_review.publish` は `pr-reviewer` SubAgent（read-only、`gh pr review` / worktree bootstrap を一切行わない）の判定結果（`PR_REVIEW_PUBLISH_REQUEST_V1`）を受け取り、`event: COMMENT` 固定・`commit_id` 拘束・idempotency marker 付きで GitHub PR review を投稿する。生の `gh pr review` 呼び出しは `local_main_branch_guard.sh` で引き続き `gh_mutation_denied` として block される（本 Issue で変更しない）。
+
+Codex 側 `.codex/rules/default.rules` は `gh pr review` を引き続き明示的に forbidden とし（`gh` サブコマンド prefix rule）、かつ `controlled_skill_mutation_exec.py` 自体への allow エントリを持たないため、本変更は Claude-only のまま split-brain を生じない（確認のみ、rule 変更なし）。
+
+---
+
 ## 12. publish lane authorization trust root（historical note）
 
 Issue #1454（Phase A, PR #1457 MERGED）で `scripts/trust-root` 一式（`trusted_hook_launcher.py` / `manifest_schema.py` / `install_trust_root.sh`）が external trust root として導入されたが、これを `.codex/hooks.json` へ実際に配線する Issue #1450（Phase B）と、追加ハードニングを扱う Issue #1468 がいずれも個人開発の脅威モデルに対して過剰と判断され not planned でクローズされた。配線先を失った `scripts/trust-root` は不使用コードとなったため、Issue #1469 でコード一式・CI 登録・本節の bootstrap/rotation/managed hook registration 手順を削除した。現行の publish lane 保護は Issue #1408（PR #1442 MERGED、Issue branch 限定 push 許可・force/tag/delete/mirror 拒否）と main branch protection（Issue #360）のみで構成される。

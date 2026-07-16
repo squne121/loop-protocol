@@ -53,7 +53,7 @@ Step 4 では verdict 判定前に `wait_ci_checks.sh` を使って required che
 
 ## 期待する出力
 
-pr-reviewer が `gh pr review --comment` で投稿する verdict コメントには `LOOP_VERDICT_V2` fenced YAML を含める。
+pr-reviewer は判定結果を `PR_REVIEW_PUBLISH_REQUEST_V1` として組み立て、controlled review publisher（`pr_review.publish` command id、Issue #1536 Option C）へ渡して投稿を委譲する。pr-reviewer 自身は生の `gh pr review` を呼ばない。publisher が投稿する verdict コメントには `LOOP_VERDICT_V2` fenced YAML を含める。
 
 ```yaml
 LOOP_VERDICT_V2:

@@ -1,6 +1,6 @@
 ---
 name: pr-review-judge
-description: implementation child issue に紐づく PR をレビューし、linked issue の contract と PR diff / 証跡を照合して APPROVE / REQUEST_CHANGES を判定する。self-authored PR は `gh pr review --comment` のみを使う。
+description: implementation child issue に紐づく PR をレビューし、linked issue の contract と PR diff / 証跡を照合して APPROVE / REQUEST_CHANGES を判定する。verdict の GitHub 投稿は生の `gh pr review` を呼ばず、controlled review publisher（`pr_review.publish` command id、Issue #1536 Option C）へ委譲する。self-authored PR でも常に `event: COMMENT`。
 ---
 
 # PR Review Judge（PRレビュー判定）
@@ -14,7 +14,7 @@ description: implementation child issue に紐づく PR をレビューし、lin
 
 ### 0) Self-authored PR ガード
 
-`PR author == 実行アカウント` の場合、`gh pr review --comment` でのみ投稿。
+`PR author == 実行アカウント` の場合でも、投稿は常に controlled review publisher 経由・`event: COMMENT` 固定（`--approve` / `--request-changes` を意味する event は生成しない）。
 
 ### 1) Linked Issue を特定
 
@@ -113,8 +113,11 @@ merge_ready は impl-review-loop の終端条件。
 
 ### 6) verdict 投稿
 
-- `LOOP_VERDICT_V2` を `gh pr review --comment` 等で投稿
-- self-authored でも常に `--comment`
+- `LOOP_VERDICT_V2` を含む verdict 本文を組み立て、`body_sha256`（本文の SHA-256）と `idempotency_key`（`{repo}:{pr_number}:{expected_head_sha}:{body_sha256}`）を算出する
+- `PR_REVIEW_PUBLISH_REQUEST_V1`（`repo` / `pr_number` / `expected_head_sha` / `event: COMMENT` 固定 / `body` / `body_sha256` / `idempotency_key` / `producer_role: pr-reviewer`）を組み立て、controlled review publisher（`uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py --command-id pr_review.publish --issue-number <PR番号> --input-file <入力JSONパス> --repo <owner>/<repo> --json`）へ渡す
+- publisher が `expected_head_sha` を GitHub REST API の `commit_id` へ拘束し、投稿前 stale 検出・投稿後 readback・idempotency marker 判定を行う（詳細: `scripts/agent-guards/controlled_skill_mutation_policy.py` / `_exec.py`）
+- self-authored でも常に `event: COMMENT`（`gh pr review --approve` / `--request-changes` は使わない）
+- 生の `gh pr review` を直接呼び出してはならない（root checkout からは `local_main_branch_guard.sh` が `gh_mutation_denied` として拒否する）
 
 ## Output Contract（出力契約）
 

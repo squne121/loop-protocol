@@ -82,6 +82,7 @@ from controlled_skill_mutation_policy import (
     COMMAND_ID_ISSUE_BODY_UPDATE,
     COMMAND_ID_ISSUE_COMMENT_PUBLISH,
     COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
+    COMMAND_ID_PR_REVIEW_PUBLISH,
     ALL_COMMAND_IDS,
     INPUT_SCHEMA_BY_COMMAND,
     ENV_BINDING_MANDATORY_COMMAND_IDS,
@@ -458,6 +459,64 @@ def _validate_issue_comment_publish_fields(data: dict) -> str:
             return f"issue_comment_publish_field_invalid: {field!r}"
     if data["marker"] not in data["comment_body"]:
         return "issue_comment_publish_marker_not_embedded_in_body"
+    return ""
+
+
+_PR_HEAD_SHA_RE = _re.compile(r"^[0-9a-f]{40}$")
+
+
+def _validate_pr_review_publish_fields(data: dict, repo: str, issue_number: int) -> str:
+    """Issue #1536 AC1/AC2/AC5/AC6: PR_REVIEW_PUBLISH_REQUEST_V1 field validation.
+
+    All checks below run before any GitHub API call (AC2/AC3/AC5 require
+    fail-closed rejection with zero remote side effect for malformed input).
+    """
+    declared_repo = data.get("repo")
+    if declared_repo != repo:
+        return f"pr_review_publish_repo_mismatch: {declared_repo!r} != {repo!r}"
+
+    pr_number = data.get("pr_number")
+    if type(pr_number) is not int or pr_number <= 0:
+        return f"pr_review_publish_pr_number_invalid: {pr_number!r}"
+    if pr_number != issue_number:
+        return (
+            f"pr_review_publish_pr_number_mismatch: pr_number={pr_number} "
+            f"!= --issue-number={issue_number}"
+        )
+
+    expected_head_sha = data.get("expected_head_sha")
+    if not isinstance(expected_head_sha, str) or not _PR_HEAD_SHA_RE.match(expected_head_sha):
+        return f"pr_review_publish_expected_head_sha_invalid: {expected_head_sha!r}"
+
+    # AC2: event is fixed to COMMENT. Any alias (approve/-a/-r/APPROVE/
+    # REQUEST_CHANGES/lowercase "comment"/empty/missing) is rejected before
+    # any mutation -- the executor never negotiates event type with the API.
+    if data.get("event") != "COMMENT":
+        return f"pr_review_publish_event_not_comment: {data.get('event')!r}"
+
+    producer_role = data.get("producer_role")
+    if producer_role != "pr-reviewer":
+        return f"pr_review_publish_producer_role_invalid: {producer_role!r}"
+
+    body = data.get("body")
+    if not isinstance(body, str) or not body:
+        return "pr_review_publish_body_invalid"
+    body_sha256 = data.get("body_sha256")
+    computed_body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    if body_sha256 != computed_body_sha256:
+        return (
+            f"pr_review_publish_body_sha256_mismatch: computed={computed_body_sha256} "
+            f"declared={body_sha256!r}"
+        )
+
+    idempotency_key = data.get("idempotency_key")
+    expected_idempotency_key = f"{repo}:{pr_number}:{expected_head_sha}:{body_sha256}"
+    if idempotency_key != expected_idempotency_key:
+        return (
+            f"pr_review_publish_idempotency_key_mismatch: expected="
+            f"{expected_idempotency_key!r} declared={idempotency_key!r}"
+        )
+
     return ""
 
 
@@ -896,6 +955,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail, _ok)
     if args.command_id == COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH:
         return _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok)
+    if args.command_id == COMMAND_ID_PR_REVIEW_PUBLISH:
+        return _run_pr_review_publish(args, input_data, gh_bin, _fail, _ok)
 
     return _fail(f"unhandled_command_id: {args.command_id!r}")  # pragma: no cover — defensive
 
@@ -1245,6 +1306,253 @@ def _readback_by_marker_literal(marker_literal: str, issue_number: int, repo: st
         }
     except Exception as exc:
         return {"error": f"readback_exception:{exc}"}
+
+
+# -- Issue #1536: controlled PR review publisher (pr_review.publish) -----------
+
+PR_REVIEW_MARKER_PREFIX = "<!-- PR_REVIEW_PUBLISH_MARKER:"
+PR_REVIEW_MARKER_SUFFIX = " -->"
+
+
+def _pr_review_marker_str(idempotency_key: str) -> str:
+    marker_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:32]
+    return f"{PR_REVIEW_MARKER_PREFIX}{marker_hash}{PR_REVIEW_MARKER_SUFFIX}"
+
+
+def _fetch_pr_head_sha(pr_number: int, repo: str, gh_bin: str) -> tuple[str | None, str]:
+    """Fetch the current remote PR head commit SHA. Returns (sha, error)."""
+    try:
+        out = subprocess.run(
+            [gh_bin, "api", f"repos/{repo}/pulls/{pr_number}", "--jq", ".head.sha"],
+            capture_output=True, text=True, timeout=15, shell=False,
+        )
+        if out.returncode != 0:
+            return None, _classify_gh_error("gh_api_pr_head_fetch_failed", out.stderr or "")
+        sha = out.stdout.strip()
+        if not _PR_HEAD_SHA_RE.match(sha):
+            return None, f"gh_api_pr_head_unexpected_output: {sha!r}"
+        return sha, ""
+    except Exception as exc:
+        return None, f"gh_api_pr_head_fetch_exception: {exc}"
+
+
+def _find_pr_review_marker_matches(
+    marker_literal: str, pr_number: int, repo: str, gh_bin: str
+) -> tuple[list[dict], str]:
+    """List all remote reviews on the PR containing marker_literal. Returns
+    (matches, error). Mirrors _find_marker_matches() for issue_comment.publish
+    (Blocker 3 pattern): the caller must know remote marker count/identity
+    BEFORE deciding whether to POST, so a failed transaction never leaves a
+    remote side effect (AC7)."""
+    try:
+        out = subprocess.run(
+            [gh_bin, "api", f"repos/{repo}/pulls/{pr_number}/reviews",
+             "--paginate", "--jq", "."],
+            capture_output=True, text=True, timeout=15, shell=False,
+        )
+        if out.returncode != 0:
+            return [], _classify_gh_error("gh_api_pr_reviews_list_failed", out.stderr or "")
+        reviews: list[dict] = []
+        for line in out.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parsed = json.loads(line)
+            if isinstance(parsed, list):
+                reviews.extend(parsed)
+            else:
+                reviews.append(parsed)
+        matches = [r for r in reviews if marker_literal in (r.get("body") or "")]
+        return matches, ""
+    except Exception as exc:
+        return [], f"pr_review_marker_list_exception: {exc}"
+
+
+def _post_pr_review(
+    pr_number: int, repo: str, commit_id: str, event: str, body: str, gh_bin: str
+) -> tuple[dict | None, str]:
+    """POST a PR review via gh api with JSON stdin (--input -), never via
+    shell-interpolated -f/-F flags, so an arbitrary body (backticks, pipes,
+    `$(...)`, quotes) round-trips byte-for-byte (AC6)."""
+    payload = json.dumps({"commit_id": commit_id, "event": event, "body": body})
+    try:
+        out = subprocess.run(
+            [gh_bin, "api", "--method", "POST",
+             f"repos/{repo}/pulls/{pr_number}/reviews", "--input", "-"],
+            input=payload, capture_output=True, text=True, timeout=20, shell=False,
+        )
+        if out.returncode != 0:
+            return None, _classify_gh_error("gh_api_post_review_failed", out.stderr or "")
+        try:
+            return json.loads(out.stdout), ""
+        except Exception as exc:
+            return None, f"gh_api_post_review_response_parse_error: {exc}"
+    except Exception as exc:
+        return None, f"gh_api_post_review_exception: {exc}"
+
+
+def _readback_pr_review(review_id, pr_number: int, repo: str, gh_bin: str) -> dict:
+    """Fetch exactly one review by id (not a marker search) for postcondition
+    verification (AC4: state == COMMENTED, commit_id == expected_head_sha)."""
+    try:
+        out = subprocess.run(
+            [gh_bin, "api", f"repos/{repo}/pulls/{pr_number}/reviews/{review_id}"],
+            capture_output=True, text=True, timeout=15, shell=False,
+        )
+        if out.returncode != 0:
+            return {"error": _classify_gh_error("gh_api_pr_review_readback_failed", out.stderr or "")}
+        return {"review": json.loads(out.stdout)}
+    except Exception as exc:
+        return {"error": f"pr_review_readback_exception: {exc}"}
+
+
+def _run_pr_review_publish(args, input_data, gh_bin, _fail, _ok) -> int:
+    field_err = _validate_pr_review_publish_fields(input_data, args.repo, args.issue_number)
+    if field_err:
+        return _fail(field_err)
+
+    pr_number = input_data["pr_number"]
+    expected_head_sha = input_data["expected_head_sha"]
+    raw_body = input_data["body"]
+    body_sha256 = input_data["body_sha256"]
+    idempotency_key = input_data["idempotency_key"]
+    marker_str = _pr_review_marker_str(idempotency_key)
+    rendered_body = f"{raw_body}\n\n{marker_str}\n"
+
+    marker_path = _issue_metadata_marker_path(
+        PROJECT_ROOT, args.issue_number, args.command_id, "pr_review_publish.marker.json"
+    )
+    write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
+
+    if args.dry_run:
+        result = {"schema": RESULT_SCHEMA, "status": "dry_run_ok", "command_id": args.command_id,
+                   "issue_number": args.issue_number}
+        if args.output_json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    def _write_marker(review_id, review_url) -> None:
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps({
+            "schema": "PR_REVIEW_PUBLISH_MARKER_V1",
+            "pr_number": pr_number,
+            "repo": args.repo,
+            "idempotency_key": idempotency_key,
+            "expected_head_sha": expected_head_sha,
+            "review_id": review_id,
+            "review_url": review_url,
+            "published_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }, ensure_ascii=False, indent=2))
+
+    # -- AC7: pre-mutation idempotency precheck. Remote review list is the
+    # authority; a local marker file never substitutes for it. Runs BEFORE
+    # any POST so a failed/ambiguous transaction never leaves a remote
+    # side effect.
+    matches, list_err = _find_pr_review_marker_matches(marker_str, pr_number, args.repo, gh_bin)
+    if list_err:
+        return _fail(f"pr_review_marker_precheck_failed: {list_err}", status="failed")
+
+    if len(matches) > 1:
+        return _fail("pr_review_duplicate_marker_conflict_pre_mutation", status="failed")
+
+    if len(matches) == 1:
+        r = matches[0]
+        if r.get("state") != "COMMENTED" or r.get("commit_id") != expected_head_sha:
+            return _fail("pr_review_remote_marker_identity_conflict_pre_mutation", status="failed")
+        _write_marker(r.get("id"), r.get("html_url", ""))
+        return _ok({
+            "status_detail": "already_published",
+            "review_id": r.get("id"),
+            "review_url": r.get("html_url", ""),
+            "commit_id": r.get("commit_id"),
+            "idempotency_marker_written": True,
+        })
+
+    # -- AC3: stale-head precondition. GitHub review must never be created
+    # against a PR head that has moved since the reviewer inspected it.
+    current_head_sha, head_err = _fetch_pr_head_sha(pr_number, args.repo, gh_bin)
+    if head_err:
+        return _fail(head_err, status="failed")
+    if current_head_sha != expected_head_sha:
+        return _fail(
+            f"stale_review_request: current_head={current_head_sha} "
+            f"expected_head={expected_head_sha}",
+            status="failed",
+        )
+
+    # -- matches == 0 and head is fresh: proceed to post -----------------------
+    post_result, post_err = _post_pr_review(
+        pr_number, args.repo, expected_head_sha, "COMMENT", rendered_body, gh_bin
+    )
+    if post_err:
+        return _fail(post_err, status="failed")
+
+    review_id = post_result.get("id") if isinstance(post_result, dict) else None
+    if review_id is None:
+        return _fail("pr_review_post_response_missing_id", status="failed")
+
+    # -- AC4: readback -- POST response fields are not trusted on their own;
+    # a fresh GET readback by review id is the postcondition authority.
+    readback = _readback_pr_review(review_id, pr_number, args.repo, gh_bin)
+    if "error" in readback:
+        return _fail(
+            readback["error"],
+            [f"posted_review_id: {review_id}"],
+            status="failed",
+        )
+    review = readback["review"]
+    if review.get("state") != "COMMENTED":
+        return _fail(
+            f"postcondition_review_state_mismatch: {review.get('state')!r}",
+            [f"posted_review_id: {review_id}"],
+            status="failed",
+        )
+    if review.get("commit_id") != expected_head_sha:
+        return _fail(
+            f"postcondition_review_commit_id_mismatch: {review.get('commit_id')!r} "
+            f"!= {expected_head_sha!r}",
+            [f"posted_review_id: {review_id}"],
+            status="failed",
+        )
+    readback_body = review.get("body") or ""
+    if marker_str not in readback_body:
+        return _fail(
+            "postcondition_marker_not_embedded_in_readback",
+            [f"posted_review_id: {review_id}"],
+            status="failed",
+        )
+    # AC6: strip the trailing marker before hashing so the round-tripped
+    # UTF-8 body content (not the executor-appended marker) must hash to
+    # the caller-declared body_sha256.
+    stripped_body = readback_body[: readback_body.rfind(marker_str)].rstrip("\n")
+    readback_body_sha256 = hashlib.sha256(stripped_body.encode("utf-8")).hexdigest()
+    if readback_body_sha256 != body_sha256:
+        return _fail(
+            f"postcondition_body_sha256_mismatch: readback={readback_body_sha256} "
+            f"expected={body_sha256}",
+            [f"posted_review_id: {review_id}"],
+            status="failed",
+        )
+
+    # -- AC14 postcondition: no changes outside this command's own write root.
+    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+    if changed:
+        return _fail(
+            "postcondition_tracked_changes_detected",
+            [f"changed: {f}" for f in changed[:20]],
+            status="failed",
+        )
+
+    _write_marker(review.get("id"), review.get("html_url", ""))
+
+    return _ok({
+        "review_id": review.get("id"),
+        "review_url": review.get("html_url", ""),
+        "commit_id": review.get("commit_id"),
+        "state": review.get("state"),
+        "body_sha256": readback_body_sha256,
+        "idempotency_marker_written": True,
+    })
 
 
 _ISSUECOMMENT_ID_RE = _re.compile(r"#issuecomment-(\d+)$")
