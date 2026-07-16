@@ -184,10 +184,31 @@ def _normalize_item(item: Any) -> tuple[dict[str, Any] | None, list[str]]:
         "failure_keys": failure_keys,
         "failure_keys_present": failure_keys_present,
         "classification": item.get("classification"),
+        "decision": item.get("decision"),
+        "scope_class": item.get("scope_class"),
+        "runner": item.get("runner"),
+        "verification_owner": item.get("verification_owner"),
+        "deferred_reason": item.get("deferred_reason"),
+        "runtime_verification_required": item.get("runtime_verification_required"),
     }
     if command_hash_note is not None:
         normalized["command_hash_note"] = command_hash_note
     return normalized, []
+
+
+def _is_producer_authorized_pr_review_only_skip(item: dict[str, Any]) -> bool:
+    """Recognize only a complete PR-review-only skip produced by the VC producer."""
+    return (
+        item.get("runner") == "skipped"
+        and item.get("scope_class") == "pr_review_only"
+        and item.get("classification") == "skipped"
+        and item.get("decision") == "go"
+        and item.get("category") == "preflight_scope_pr_review_only"
+        and item.get("verification_owner") == "pr-review-judge"
+        and isinstance(item.get("deferred_reason"), str)
+        and bool(item["deferred_reason"])
+        and item.get("runtime_verification_required") is False
+    )
 
 
 def _load_path_list(raw: Any) -> tuple[list[str], list[str]]:
@@ -655,6 +676,8 @@ def adjudicate_vc_result(
     baseline_signatures: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
     baseline_failure_index: set[tuple[str, str]] = set()
     baseline_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    excluded_pr_review_only_keys: set[tuple[str, str]] = set()
+    seen_baseline_keys: set[tuple[str, str]] = set()
     for idx, item in enumerate(baseline_items):
         norm, errs = _normalize_item(item)
         if norm is None:
@@ -667,12 +690,16 @@ def adjudicate_vc_result(
                 errors=[f"baseline[{idx}]:{err}" for err in errs],
             )
         mapping_key = (norm["ac"], norm["command_hash"])
-        if mapping_key in baseline_by_key:
+        if mapping_key in seen_baseline_keys:
             return _result(
                 overall_status="indeterminate", per_ac=[], rerun_required=True,
                 source_integrity=source_integrity, evidence_refs=evidence_refs,
                 errors=[f"duplicate_baseline_ac_command_hash:{norm['ac']}"],
             )
+        seen_baseline_keys.add(mapping_key)
+        if _is_producer_authorized_pr_review_only_skip(norm):
+            excluded_pr_review_only_keys.add(mapping_key)
+            continue
         if norm["classification"] not in {"expected_fail", "expected_pass"}:
             return _result(
                 overall_status="indeterminate", per_ac=[], rerun_required=True,
@@ -690,6 +717,8 @@ def adjudicate_vc_result(
 
     normalized_current: list[dict[str, Any]] = []
     current_keys: set[tuple[str, str]] = set()
+    seen_current_keys: set[tuple[str, str]] = set()
+    excluded_current_count = 0
     for idx, item in enumerate(current_items):
         norm, errs = _normalize_item(item)
         if norm is None:
@@ -703,16 +732,40 @@ def adjudicate_vc_result(
             )
 
         mapping_key = (norm["ac"], norm["command_hash"])
-        if mapping_key in current_keys:
+        if mapping_key in seen_current_keys:
             return _result(
                 overall_status="indeterminate", per_ac=[], rerun_required=True,
                 source_integrity=source_integrity, evidence_refs=evidence_refs,
                 errors=[f"duplicate_current_ac_command_hash:{norm['ac']}"],
             )
+        seen_current_keys.add(mapping_key)
+        if mapping_key in excluded_pr_review_only_keys:
+            if not _is_producer_authorized_pr_review_only_skip(norm):
+                return _result(
+                    overall_status="indeterminate", per_ac=[], rerun_required=True,
+                    source_integrity=source_integrity, evidence_refs=evidence_refs,
+                    errors=[f"pr_review_only_current_authorization_mismatch:{norm['ac']}"],
+                )
+            excluded_current_count += 1
+            continue
         current_keys.add(mapping_key)
         normalized_current.append(norm)
 
+    current_pass_certified = _current_pass_envelope_is_certified(
+        contract_snapshot,
+        current_vc_result,
+        diff_summary,
+        changed_paths,
+        changed_paths_present,
+        normalized_allowed,
+    )
     if not normalized_current:
+        if excluded_current_count and current_pass_certified:
+            return _result(
+                overall_status="pass", per_ac=[], rerun_required=False,
+                source_integrity=source_integrity, evidence_refs=evidence_refs,
+                errors=[],
+            )
         return _result(
             overall_status="indeterminate", per_ac=[], rerun_required=True,
             source_integrity=source_integrity, evidence_refs=evidence_refs,
@@ -726,14 +779,6 @@ def adjudicate_vc_result(
             errors=["baseline_current_mapping_mismatch"],
         )
 
-    current_pass_certified = _current_pass_envelope_is_certified(
-        contract_snapshot,
-        current_vc_result,
-        diff_summary,
-        changed_paths,
-        changed_paths_present,
-        normalized_allowed,
-    )
     per_ac: list[dict[str, Any]] = []
     for norm in normalized_current:
         baseline_item = baseline_by_key[(norm["ac"], norm["command_hash"])]
