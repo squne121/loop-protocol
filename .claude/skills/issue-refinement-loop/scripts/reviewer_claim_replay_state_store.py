@@ -363,7 +363,10 @@ def write_state_v2_from_validated_payload(
     if not isinstance(next_state, dict):
         return _result("write_v2", "rejected", error="PARENT_REPLAY_NEXT_STATE must be a JSON object")
 
-    if expected_repository_full_name is not None and next_state.get("repository_full_name") != expected_repository_full_name:
+    if (
+        expected_repository_full_name is not None
+        and next_state.get("repository_full_name") != expected_repository_full_name
+    ):
         return _result("write_v2", "rejected", error="next_state repository_full_name identity mismatch")
     if expected_issue_number is not None and next_state.get("issue_number") != expected_issue_number:
         return _result("write_v2", "rejected", error="next_state issue_number identity mismatch")
