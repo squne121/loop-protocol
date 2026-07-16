@@ -24,8 +24,6 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
-
 SKILL_ROOT = Path(__file__).parent.parent
 SCRIPTS_DIR = SKILL_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))

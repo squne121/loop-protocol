@@ -238,7 +238,7 @@ state_contract:
 
 identity（`repository_full_name`/`issue_number`/`refinement_session_id`/`body_sha256`）のいずれかが不一致の場合、state store は空 state（`reset_reason` 付き）を返す。これはエラーではなく、fresh session として consecutive count を 1 から数え直すための正常系である。
 
-### read → invoke → write フロー V2（parent-owned replay binding, Issue #1532）
+### read → invoke → write フロー V2（parent-owned replay binding を追加, Issue #1532）
 
 上記 read→invoke→write フローの step 2/3（`REPLAY_NEXT_STATE` を child stdout からそのまま `--write` する）は、child self-claim を provenance と誤認しうる残余リスクである。V2 では invoke と write の間に以下を挿む:
 

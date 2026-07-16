@@ -12,8 +12,6 @@ import hashlib
 import sys
 from pathlib import Path
 
-import pytest
-
 SKILL_ROOT = Path(__file__).parent.parent
 SCRIPTS_DIR = SKILL_ROOT / "scripts"
 REPO_ROOT = SKILL_ROOT.parent.parent.parent
