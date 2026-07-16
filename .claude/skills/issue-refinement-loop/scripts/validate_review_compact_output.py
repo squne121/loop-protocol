@@ -89,6 +89,12 @@ from typing import Any
 SCHEMA = "REVIEW_COMPACT_VALIDATION_RESULT_V1"
 SCHEMA_VERSION = "1"
 
+# Issue #1532: REVIEW_COMPACT_VALIDATION_RESULT_V2 is a DISTINCT schema name
+# (not just a schema_version bump on V1) -- it always carries the required
+# PARENT_REPLAY_* binding-artifact-checked fields V1 never had.
+SCHEMA_V2 = "REVIEW_COMPACT_VALIDATION_RESULT_V2"
+SCHEMA_VERSION_V2 = "2"
+
 MAX_INPUT_BYTES = 2048
 
 # ---------------------------------------------------------------------------
@@ -474,20 +480,20 @@ def _validate_approve_values(
     return violations
 
 
-def _validate_needs_fix_values(
+def _validate_needs_fix_base_values(
     fields: dict[str, str], *, issue_number: int | None = None
 ) -> list[dict[str, Any]]:
+    """Common needs-fix invariants shared by the V1 grammar (REPLAY_* child
+    self-report, retired for producers but still a validatable pure
+    function) and the V2 grammar (REVIEWER_BLOCKER_CLAIM +
+    PARENT_REPLAY_*). Does NOT check any REPLAY_*/PARENT_REPLAY_* field --
+    callers append their own grammar-specific checks."""
     violations: list[dict[str, Any]] = []
     status = fields.get("STATUS", "")
     verdict = fields.get("VERDICT", "")
     next_action = fields.get("NEXT_ACTION", "")
     blockers = fields.get("BLOCKERS", "")
     artifact = fields.get("ARTIFACT", "")
-    replay_verdict = fields.get("REPLAY_VERDICT", "")
-    replay_routing = fields.get("REPLAY_ROUTING", "")
-    replay_should_consume = fields.get("REPLAY_SHOULD_CONSUME", "")
-    replay_body_sha256 = fields.get("REPLAY_BODY_SHA256", "")
-    replay_artifact_digest = fields.get("REPLAY_ARTIFACT_DIGEST", "")
 
     if status not in VALID_STATUSES:
         violations.append(_violation("status_value_invalid", value=status))
@@ -515,6 +521,22 @@ def _validate_needs_fix_values(
         )
     )
     violations.extend(_common_field_invariants(fields, "needs_fix"))
+    return violations
+
+
+def _validate_needs_fix_values(
+    fields: dict[str, str], *, issue_number: int | None = None
+) -> list[dict[str, Any]]:
+    """V1 grammar: base needs-fix invariants plus the retired child
+    self-report REPLAY_* fields (kept as a pure function for V1 producer-
+    parity tests; no production V1 producer emits this shape anymore --
+    Issue #1532 Blocker 2)."""
+    violations = _validate_needs_fix_base_values(fields, issue_number=issue_number)
+    replay_verdict = fields.get("REPLAY_VERDICT", "")
+    replay_routing = fields.get("REPLAY_ROUTING", "")
+    replay_should_consume = fields.get("REPLAY_SHOULD_CONSUME", "")
+    replay_body_sha256 = fields.get("REPLAY_BODY_SHA256", "")
+    replay_artifact_digest = fields.get("REPLAY_ARTIFACT_DIGEST", "")
 
     if replay_verdict not in VALID_REPLAY_VERDICTS:
         violations.append(_violation("replay_verdict_invalid_enum", value=replay_verdict))
@@ -697,6 +719,447 @@ def validate_review_compact_output(
     }
 
 
+# ---------------------------------------------------------------------------
+# V2: parent-local replay integrity binding (Issue #1532)
+# ---------------------------------------------------------------------------
+#
+# ISSUE_REVIEW_RESULT_COMPACT_V2 / REVIEW_COMPACT_VALIDATION_RESULT_V2.
+#
+# This module does NOT provide producer identity / supply-chain provenance
+# attestation for the child SubAgent (no signatures, no key management, no
+# same-OS-UID authentication -- see Issue #1532 Out of Scope). It provides
+# a parent-local replay integrity binding: the ONLY semantic (routing)
+# fields are computed by the PARENT and named `PARENT_REPLAY_*`.
+#
+# V2 needs-fix envelope (15 lines, exact), assembled by the orchestrator
+# (parent), NOT the child SubAgent:
+#
+#   The 8 approve fields, followed by:
+#     REVIEWER_BLOCKER_CLAIM     the CHILD's bounded, untrusted claim --
+#                                 canonical single-line JSON,
+#                                 REVIEWER_BLOCKER_CLAIM_V1 shape
+#                                 (`{schema, body_sha256, blockers: [...]}`
+#                                 only -- Issue #1532 Blocker 1). Audit-only;
+#                                 NEVER used for routing.
+#     PARENT_REPLAY_VERDICT      parent-computed (never child self-report)
+#     PARENT_REPLAY_ROUTING      parent-computed
+#     PARENT_REPLAY_SHOULD_CONSUME parent-computed
+#     PARENT_REPLAY_BODY_SHA256  parent-computed (the parent's OWN current
+#                                 body snapshot hash, not a child echo)
+#     PARENT_REPLAY_NEXT_STATE   canonical single-line JSON, the state-store
+#                                 persistence target
+#     PARENT_REPLAY_BINDING_DIGEST `sha256:<hex>` -- the parent's own
+#                                 `PARENT_REPLAY_BINDING_ARTIFACT_V1.binding_digest`
+#
+# Issue #1532 Blocker 2: the pre-#1532 V1 needs-fix grammar's
+# `REPLAY_VERDICT` / `REPLAY_ROUTING` / `REPLAY_SHOULD_CONSUME` child
+# self-report fields are RETIRED for the V2 producer path -- the
+# `issue-reviewer` SubAgent no longer co-locate-runs
+# `reviewer_claim_replay.py` and no longer emits those fields at all (see
+# `.claude/agents/issue-reviewer.md`). A consumer that only understands V1
+# and receives V2 (or vice versa) fails closed via `envelope_kind: unknown`
+# and never silently substitutes one grammar's fields for the other's.
+#
+# The approve envelope grammar is unchanged in V2 -- no replay/claim fields
+# are ever produced for `verdict: approve`.
+
+REVIEWER_BLOCKER_CLAIM_FIELD: str = "REVIEWER_BLOCKER_CLAIM"
+
+PARENT_REPLAY_FIELDS: list[str] = [
+    "PARENT_REPLAY_VERDICT",
+    "PARENT_REPLAY_ROUTING",
+    "PARENT_REPLAY_SHOULD_CONSUME",
+    "PARENT_REPLAY_BODY_SHA256",
+    "PARENT_REPLAY_NEXT_STATE",
+    "PARENT_REPLAY_BINDING_DIGEST",
+]
+
+NEEDS_FIX_FIELDS_V2: list[str] = APPROVE_FIELDS + [REVIEWER_BLOCKER_CLAIM_FIELD] + PARENT_REPLAY_FIELDS
+
+ALL_KNOWN_FIELDS_V2: frozenset[str] = ALL_KNOWN_FIELDS | frozenset(NEEDS_FIX_FIELDS_V2)
+
+# PARENT_REPLAY_VERDICT reuses the same 5-value enum / routing matrix as the
+# retired V1 REPLAY_VERDICT (SSOT: reviewer_claim_replay.py
+# _LEGACY_VERDICT_MAP_V1) -- only the field NAME and the fact that it is
+# always parent-computed changed, not the enum semantics.
+VALID_PARENT_REPLAY_VERDICTS = VALID_REPLAY_VERDICTS
+PARENT_REPLAY_MATRIX = REPLAY_MATRIX
+
+
+def _reject_nonfinite_json_v2(token: str) -> None:
+    raise ValueError(f"Non-finite JSON constant rejected: {token}")
+
+
+def _no_duplicate_keys_object_pairs_hook_v2(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: set[str] = set()
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate JSON object key rejected: {key!r}")
+        seen.add(key)
+        result[key] = value
+    return result
+
+
+def _strict_json_loads_v2(text: str) -> Any:
+    return json.loads(
+        text,
+        parse_constant=_reject_nonfinite_json_v2,
+        object_pairs_hook=_no_duplicate_keys_object_pairs_hook_v2,
+    )
+
+
+def _parse_lines_v2(
+    lines: list[str],
+) -> tuple[list[str], dict[str, str], list[dict[str, Any]]]:
+    """Same grammar as `_parse_lines`, but the known-field set additionally
+    includes the V2-only fields (`REVIEWER_BLOCKER_CLAIM` /
+    `PARENT_REPLAY_*`) so a genuine 15-line V2 envelope is not rejected as
+    `unknown_field`. V1 envelopes are entirely unaffected -- those field
+    names never appear in valid V1 input."""
+    ordered_keys: list[str] = []
+    field_values: dict[str, str] = {}
+    violations: list[dict[str, Any]] = []
+
+    for index, line in enumerate(lines):
+        if line == "":
+            violations.append(_violation("blank_line_detected", line_index=index))
+            continue
+        if "```" in line:
+            violations.append(_violation("code_fence_detected", line_index=index))
+            continue
+        match = _FIELD_LINE_RE.match(line)
+        if match is None:
+            if index == 0:
+                code = "prose_prefix"
+            elif index == len(lines) - 1:
+                code = "prose_suffix"
+            else:
+                code = "malformed_line"
+            violations.append(_violation(code, line_index=index, line=line))
+            continue
+        key = match.group("key")
+        value = match.group("value")
+        if key not in ALL_KNOWN_FIELDS_V2:
+            violations.append(_violation("unknown_field", field=key, line_index=index))
+            continue
+        if value != value.strip():
+            violations.append(_violation("value_whitespace_violation", field=key, value=value))
+        if key in field_values:
+            violations.append(_violation("duplicate_field", field=key, line_index=index))
+            continue
+        ordered_keys.append(key)
+        field_values[key] = value
+
+    return ordered_keys, field_values, violations
+
+
+def _validate_reviewer_blocker_claim_field(value: str) -> list[dict[str, Any]]:
+    """Lexical/shape validation (defense in depth) of the
+    `REVIEWER_BLOCKER_CLAIM` field value. This validator does NOT perform
+    the fail-closed trust-boundary schema check that rejects
+    findings/checker_evidence/deterministic_checks -- that is
+    `parent_replay_binding.validate_reviewer_blocker_claim()`'s job, run by
+    the ORCHESTRATOR before this claim is ever trusted as a replay input.
+    This function only confirms the envelope carries syntactically valid,
+    minimally-shaped JSON so a malformed claim fails closed here too."""
+    violations: list[dict[str, Any]] = []
+    try:
+        parsed = _strict_json_loads_v2(value)
+    except (ValueError, json.JSONDecodeError):
+        violations.append(_violation("reviewer_blocker_claim_invalid_json", value=value))
+        return violations
+    if not isinstance(parsed, dict):
+        violations.append(_violation("reviewer_blocker_claim_not_object", value=value))
+        return violations
+    allowed_top_keys = {"schema", "body_sha256", "blockers"}
+    if set(parsed.keys()) - allowed_top_keys:
+        violations.append(
+            _violation(
+                "reviewer_blocker_claim_disallowed_keys",
+                value=sorted(set(parsed.keys()) - allowed_top_keys),
+            )
+        )
+    if parsed.get("schema") != "REVIEWER_BLOCKER_CLAIM_V1":
+        violations.append(_violation("reviewer_blocker_claim_schema_invalid", value=parsed.get("schema")))
+    if not isinstance(parsed.get("blockers"), list):
+        violations.append(_violation("reviewer_blocker_claim_blockers_not_list"))
+    return violations
+
+
+def _validate_parent_replay_fields(fields: dict[str, str]) -> list[dict[str, Any]]:
+    violations: list[dict[str, Any]] = []
+    parent_replay_verdict = fields.get("PARENT_REPLAY_VERDICT", "")
+    parent_replay_routing = fields.get("PARENT_REPLAY_ROUTING", "")
+    parent_replay_should_consume = fields.get("PARENT_REPLAY_SHOULD_CONSUME", "")
+    parent_replay_body_sha256 = fields.get("PARENT_REPLAY_BODY_SHA256", "")
+    parent_replay_next_state = fields.get("PARENT_REPLAY_NEXT_STATE", "")
+    parent_replay_binding_digest = fields.get("PARENT_REPLAY_BINDING_DIGEST", "")
+
+    if parent_replay_verdict not in VALID_PARENT_REPLAY_VERDICTS:
+        violations.append(_violation("parent_replay_verdict_invalid_enum", value=parent_replay_verdict))
+    else:
+        expected_routing, expected_should_consume = PARENT_REPLAY_MATRIX[parent_replay_verdict]
+        if (
+            parent_replay_routing != expected_routing
+            or parent_replay_should_consume != expected_should_consume
+        ):
+            violations.append(
+                _violation(
+                    "parent_replay_verdict_routing_mismatch",
+                    parent_replay_verdict=parent_replay_verdict,
+                    expected_routing=expected_routing,
+                    expected_should_consume=expected_should_consume,
+                    actual_routing=parent_replay_routing,
+                    actual_should_consume=parent_replay_should_consume,
+                )
+            )
+    if parent_replay_should_consume not in VALID_REPLAY_SHOULD_CONSUME:
+        violations.append(
+            _violation("parent_replay_should_consume_invalid_literal", value=parent_replay_should_consume)
+        )
+    if not _SHA256_PREFIXED_RE.match(parent_replay_body_sha256):
+        violations.append(
+            _violation("parent_replay_body_sha256_invalid_format", value=parent_replay_body_sha256)
+        )
+    try:
+        _strict_json_loads_v2(parent_replay_next_state)
+    except (ValueError, json.JSONDecodeError):
+        violations.append(
+            _violation("parent_replay_next_state_invalid_json", value=parent_replay_next_state)
+        )
+    if not _SHA256_PREFIXED_RE.match(parent_replay_binding_digest):
+        violations.append(
+            _violation("parent_replay_binding_digest_invalid_format", value=parent_replay_binding_digest)
+        )
+    return violations
+
+
+def validate_review_compact_output_v2(
+    raw_text: str,
+    *,
+    issue_number: int,
+    binding_artifact: dict[str, Any],
+    repository_full_name: str,
+    refinement_session_id: str,
+    iteration_id: str,
+    current_body_sha256: str,
+) -> dict[str, Any]:
+    """Validate an ISSUE_REVIEW_RESULT_COMPACT_V2 needs-fix envelope against
+    a REQUIRED, independently-supplied `PARENT_REPLAY_BINDING_ARTIFACT_V1`
+    (High-1). This is the public V2 validator -- there is no "V2 validation
+    without a binding artifact" code path; every needs-fix envelope MUST be
+    checked against the exact binding artifact that produced its
+    parent-owned fields, or validation fails closed.
+
+    Delegates to `validate_review_compact_output` (V1 grammar) first: any
+    exact V1 match (approve / producer_failure) is returned UNCHANGED. A V1
+    needs-fix match (13-line, `REPLAY_*` child self-report grammar) is
+    NEVER returned as `valid` here -- Issue #1532 Blocker 2 retires that
+    grammar for the V2 producer path; the caller passing V1-shaped
+    needs-fix input to `validate_review_compact_output_v2` receives
+    `envelope_kind: unknown` / `human_judgment_required` because V1
+    needs-fix input never satisfies the 15-line V2 template with the field
+    names this function checks.
+
+    `binding_artifact`, `repository_full_name`, `refinement_session_id`,
+    `iteration_id`, `current_body_sha256` are the caller's own
+    independently-computed / independently-fetched values -- NEVER derived
+    from the envelope text itself. Any mismatch (schema violation, digest
+    tamper, identity mismatch, body mismatch, or `replay_result` /
+    `replay_next_state` mismatch) is tamper evidence and fails closed to
+    `human_judgment_required` (AC4).
+    """
+    v1_result = validate_review_compact_output(raw_text, issue_number=issue_number)
+    if v1_result["envelope_kind"] in ("approve", "producer_failure"):
+        return v1_result
+
+    violations: list[dict[str, Any]] = []
+
+    # High-1: binding artifact must itself be strictly schema-valid,
+    # digest-self-consistent, and bound to the exact identity/body the
+    # caller supplied -- BEFORE it is used as the source of expected
+    # values for the envelope check below.
+    try:
+        import parent_replay_binding as _binding  # local import: keep V1-only callers dependency-free
+
+        _binding.validate_binding_artifact(binding_artifact)
+        recomputed_digest = _binding.recompute_binding_digest(binding_artifact)
+        if recomputed_digest != binding_artifact.get("binding_digest"):
+            violations.append(
+                _violation(
+                    "binding_artifact_digest_self_inconsistent",
+                    recomputed=recomputed_digest,
+                    stored=binding_artifact.get("binding_digest"),
+                )
+            )
+        if binding_artifact.get("repository_full_name") != repository_full_name:
+            violations.append(_violation("binding_artifact_repository_mismatch"))
+        if binding_artifact.get("issue_number") != issue_number:
+            violations.append(_violation("binding_artifact_issue_number_mismatch"))
+        if binding_artifact.get("refinement_session_id") != refinement_session_id:
+            violations.append(_violation("binding_artifact_session_mismatch"))
+        if binding_artifact.get("iteration_id") != iteration_id:
+            violations.append(_violation("binding_artifact_iteration_mismatch"))
+        if binding_artifact.get("current_body_sha256") != current_body_sha256:
+            violations.append(_violation("binding_artifact_body_mismatch"))
+        expected_replay_next_state = _binding.canonical_replay_next_state_line(binding_artifact)
+        expected_parent_binding_digest = binding_artifact.get("binding_digest")
+        expected_replay_result = binding_artifact.get("replay_result", {})
+        expected_verdict = expected_replay_result.get("verdict")
+        expected_routing = expected_replay_result.get("routing")
+        expected_should_consume = expected_replay_result.get("should_consume_iteration")
+        expected_body_sha256 = expected_replay_result.get("body_sha256")
+        expected_claim_sha256 = binding_artifact.get("input_digests", {}).get(
+            "reviewer_blocker_claim_sha256"
+        )
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        violations.append(_violation("binding_artifact_invalid", detail=str(exc)))
+        return {
+            "validation_status": "invalid",
+            "envelope_kind": "unknown",
+            "normalized_payload": None,
+            "violations": violations,
+            "next_action": "human_judgment_required",
+            "artifact_path_policy": {"status": "not_applicable", "path": None},
+        }
+
+    control_violations = _scan_control_chars(raw_text)
+    lines = _split_lines(raw_text)
+    ordered_keys, fields, structural_violations = _parse_lines_v2(lines)
+    violations = list(violations) + list(control_violations) + list(structural_violations)
+
+    has_malformed_line = any(
+        v["code"] in {"prose_prefix", "prose_suffix", "malformed_line", "unknown_field", "duplicate_field"}
+        for v in structural_violations
+    )
+
+    if has_malformed_line or ordered_keys != NEEDS_FIX_FIELDS_V2:
+        violations.append(_violation("v2_envelope_shape_invalid"))
+        return {
+            "validation_status": "invalid",
+            "envelope_kind": "unknown",
+            "normalized_payload": None,
+            "violations": violations,
+            "next_action": "human_judgment_required",
+            "artifact_path_policy": {"status": "not_applicable", "path": None},
+        }
+
+    value_violations = _validate_needs_fix_base_values(fields, issue_number=issue_number)
+    value_violations.extend(
+        _validate_reviewer_blocker_claim_field(fields.get(REVIEWER_BLOCKER_CLAIM_FIELD, ""))
+    )
+    value_violations.extend(_validate_parent_replay_fields(fields))
+
+    reviewer_blocker_claim_raw = fields.get(REVIEWER_BLOCKER_CLAIM_FIELD, "")
+    if expected_claim_sha256 is not None:
+        # NOTE: expected_claim_sha256 is computed by the parent over the
+        # *canonical* JSON bytes of the validated claim object (see
+        # parent_replay_binding.build_parent_replay_binding), not over the
+        # raw envelope line text -- so this is compared via the JSON-parsed
+        # canonical form, not the raw string, when the field itself is
+        # valid JSON.
+        try:
+            import parent_replay_binding as _binding2
+
+            parsed_claim = _strict_json_loads_v2(reviewer_blocker_claim_raw)
+            normalized_claim = _binding2.validate_reviewer_blocker_claim(parsed_claim)
+            canonical_claim_digest = hashlib.sha256(
+                _binding2.canonical_json_bytes(normalized_claim)
+            ).hexdigest()
+            if canonical_claim_digest != expected_claim_sha256:
+                value_violations.append(
+                    _violation(
+                        "reviewer_blocker_claim_digest_mismatch",
+                        expected=expected_claim_sha256,
+                    )
+                )
+        except (ValueError, json.JSONDecodeError):
+            pass  # already reported as reviewer_blocker_claim_invalid_json above
+
+    parent_replay_verdict = fields.get("PARENT_REPLAY_VERDICT", "")
+    parent_replay_routing = fields.get("PARENT_REPLAY_ROUTING", "")
+    parent_replay_should_consume_raw = fields.get("PARENT_REPLAY_SHOULD_CONSUME", "")
+    parent_replay_body_sha256 = fields.get("PARENT_REPLAY_BODY_SHA256", "")
+    parent_replay_next_state_raw = fields.get("PARENT_REPLAY_NEXT_STATE", "")
+    parent_replay_binding_digest = fields.get("PARENT_REPLAY_BINDING_DIGEST", "")
+
+    if expected_verdict is not None and parent_replay_verdict != expected_verdict:
+        value_violations.append(
+            _violation("parent_replay_verdict_mismatch", value=parent_replay_verdict, expected=expected_verdict)
+        )
+    if expected_routing is not None and parent_replay_routing != expected_routing:
+        value_violations.append(
+            _violation("parent_replay_routing_mismatch", value=parent_replay_routing, expected=expected_routing)
+        )
+    expected_should_consume_literal = (
+        "true" if expected_should_consume else "false"
+    ) if expected_should_consume is not None else None
+    if (
+        expected_should_consume_literal is not None
+        and parent_replay_should_consume_raw != expected_should_consume_literal
+    ):
+        value_violations.append(
+            _violation(
+                "parent_replay_should_consume_mismatch",
+                value=parent_replay_should_consume_raw,
+                expected=expected_should_consume_literal,
+            )
+        )
+    if expected_body_sha256 is not None and parent_replay_body_sha256 != expected_body_sha256:
+        value_violations.append(
+            _violation(
+                "parent_replay_body_sha256_mismatch",
+                value=parent_replay_body_sha256,
+                expected=expected_body_sha256,
+            )
+        )
+    if parent_replay_next_state_raw != expected_replay_next_state:
+        value_violations.append(
+            _violation(
+                "parent_replay_next_state_mismatch",
+                value=parent_replay_next_state_raw,
+                expected=expected_replay_next_state,
+            )
+        )
+    if parent_replay_binding_digest != expected_parent_binding_digest:
+        value_violations.append(
+            _violation(
+                "parent_replay_binding_digest_mismatch",
+                value=parent_replay_binding_digest,
+                expected=expected_parent_binding_digest,
+            )
+        )
+
+    violations.extend(value_violations)
+
+    artifact_value = fields.get("ARTIFACT")
+    artifact_policy_status = (
+        "invalid"
+        if any(v.get("field") == "ARTIFACT" for v in value_violations)
+        else "valid"
+    )
+
+    if violations:
+        return {
+            "validation_status": "invalid",
+            "envelope_kind": "needs_fix_v2",
+            "normalized_payload": None,
+            "violations": violations,
+            "next_action": "human_judgment_required",
+            "artifact_path_policy": {"status": artifact_policy_status, "path": artifact_value},
+        }
+
+    return {
+        "validation_status": "valid",
+        "envelope_kind": "needs_fix_v2",
+        "normalized_payload": dict(fields),
+        "violations": [],
+        "next_action": fields["NEXT_ACTION"],
+        "artifact_path_policy": {"status": "valid", "path": artifact_value},
+    }
+
+
 def build_result(raw_bytes: bytes, *, issue_number: int | None = None) -> tuple[dict[str, Any], int]:
     """Build the full REVIEW_COMPACT_VALIDATION_RESULT_V1 payload + exit code."""
     input_sha256 = hashlib.sha256(raw_bytes).hexdigest()
@@ -735,6 +1198,60 @@ def build_result(raw_bytes: bytes, *, issue_number: int | None = None) -> tuple[
     return payload, exit_code
 
 
+def build_result_v2(
+    raw_bytes: bytes,
+    *,
+    issue_number: int,
+    binding_artifact: dict[str, Any],
+    repository_full_name: str,
+    refinement_session_id: str,
+    iteration_id: str,
+    current_body_sha256: str,
+) -> tuple[dict[str, Any], int]:
+    """Build the full REVIEW_COMPACT_VALIDATION_RESULT_V2 payload + exit
+    code (High-1: `binding_artifact` and full identity/body context are
+    REQUIRED -- there is no optional/skippable V2 validation path)."""
+    input_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    input_byte_count = len(raw_bytes)
+
+    try:
+        raw_text = raw_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        payload = {
+            "schema": SCHEMA_V2,
+            "schema_version": SCHEMA_VERSION_V2,
+            "validation_status": "invalid",
+            "envelope_kind": "runtime_error",
+            "input_sha256": f"sha256:{input_sha256}",
+            "input_byte_count": input_byte_count,
+            "normalized_payload": None,
+            "violations": [_violation("utf8_decode_error", detail=str(exc))],
+            "next_action": "human_judgment_required",
+            "artifact_path_policy": {"status": "not_applicable", "path": None},
+        }
+        return payload, 2
+
+    inner = validate_review_compact_output_v2(
+        raw_text,
+        issue_number=issue_number,
+        binding_artifact=binding_artifact,
+        repository_full_name=repository_full_name,
+        refinement_session_id=refinement_session_id,
+        iteration_id=iteration_id,
+        current_body_sha256=current_body_sha256,
+    )
+    payload = {
+        "schema": SCHEMA_V2,
+        "schema_version": SCHEMA_VERSION_V2,
+        "input_sha256": f"sha256:{input_sha256}",
+        "input_byte_count": input_byte_count,
+        **inner,
+    }
+
+    exit_code = 0 if payload["validation_status"] == "valid" else 1
+    return payload, exit_code
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -767,7 +1284,51 @@ def main(argv: list[str] | None = None) -> int:
         help="Active issue number (positive integer). Binds ARTIFACT's issue "
         "segment to this value (Issue #1507 AC15/AC16).",
     )
+    parser.add_argument(
+        "--v2",
+        action="store_true",
+        help=(
+            "Issue #1532: validate an ISSUE_REVIEW_RESULT_COMPACT_V2 envelope "
+            "against a required PARENT_REPLAY_BINDING_ARTIFACT_V1 (High-1). "
+            "Requires --binding-artifact-file, --repository-full-name, "
+            "--refinement-session-id, --iteration-id, --current-body-file."
+        ),
+    )
+    parser.add_argument("--binding-artifact-file", default=None)
+    parser.add_argument("--repository-full-name", default=None)
+    parser.add_argument("--refinement-session-id", default=None)
+    parser.add_argument("--iteration-id", default=None)
+    parser.add_argument("--current-body-file", default=None)
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+
+    if args.v2:
+        missing = [
+            name
+            for name, value in (
+                ("--binding-artifact-file", args.binding_artifact_file),
+                ("--repository-full-name", args.repository_full_name),
+                ("--refinement-session-id", args.refinement_session_id),
+                ("--iteration-id", args.iteration_id),
+                ("--current-body-file", args.current_body_file),
+            )
+            if not value
+        ]
+        if missing:
+            payload = {
+                "schema": SCHEMA_V2,
+                "schema_version": SCHEMA_VERSION_V2,
+                "validation_status": "invalid",
+                "envelope_kind": "runtime_error",
+                "input_sha256": None,
+                "input_byte_count": None,
+                "normalized_payload": None,
+                "violations": [_violation("missing_required_v2_args", missing=missing)],
+                "next_action": "human_judgment_required",
+                "artifact_path_policy": {"status": "not_applicable", "path": None},
+            }
+            sys.stdout.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
+            sys.stdout.write("\n")
+            return 2
 
     try:
         if args.input_file:
@@ -791,6 +1352,43 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
         sys.stdout.write("\n")
         return 2
+
+    if args.v2:
+        import parent_replay_binding as _binding_cli
+
+        try:
+            binding_artifact = _binding_cli._read_json_file_safely(args.binding_artifact_file)
+            current_body_bytes = _binding_cli.read_file_safely(args.current_body_file)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            payload = {
+                "schema": SCHEMA_V2,
+                "schema_version": SCHEMA_VERSION_V2,
+                "validation_status": "invalid",
+                "envelope_kind": "runtime_error",
+                "input_sha256": None,
+                "input_byte_count": None,
+                "normalized_payload": None,
+                "violations": [_violation("v2_input_read_error", detail=str(exc))],
+                "next_action": "human_judgment_required",
+                "artifact_path_policy": {"status": "not_applicable", "path": None},
+            }
+            sys.stdout.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
+            sys.stdout.write("\n")
+            return 2
+
+        current_body_sha256 = f"sha256:{hashlib.sha256(current_body_bytes).hexdigest()}"
+        payload, exit_code = build_result_v2(
+            raw_bytes,
+            issue_number=args.issue_number,
+            binding_artifact=binding_artifact,
+            repository_full_name=args.repository_full_name,
+            refinement_session_id=args.refinement_session_id,
+            iteration_id=args.iteration_id,
+            current_body_sha256=current_body_sha256,
+        )
+        sys.stdout.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
+        sys.stdout.write("\n")
+        return exit_code
 
     payload, exit_code = build_result(raw_bytes, issue_number=args.issue_number)
     sys.stdout.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))

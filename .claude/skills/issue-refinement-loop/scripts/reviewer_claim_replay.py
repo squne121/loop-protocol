@@ -619,6 +619,7 @@ def analyze(
     repository_full_name: str | None = None,
     issue_number: int | None = None,
     refinement_session_id: str | None = None,
+    iteration_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     previous_state = previous_state or {}
     issue_url = str(review_result.get("issue_url") or "")
@@ -864,6 +865,16 @@ def analyze(
         # state persisted via reviewer_claim_replay_state_store.py, keyed
         # by identity (repository_full_name/issue_number/refinement_session_id)
         # in addition to the legacy body/blocker-lane fields.
+        #
+        # Issue #1532 High-2: `updated_at_iteration_id` uses the caller-
+        # supplied `iteration_id` when provided (parent-owned, wall-clock
+        # free) so the SAME logical inputs always reproduce the SAME
+        # `next_state` -- and therefore the SAME
+        # `PARENT_REPLAY_BINDING_ARTIFACT_V1.binding_digest` -- regardless
+        # of when the replay runs. Falls back to the previous wall-clock
+        # behavior only when `iteration_id` is omitted (legacy callers /
+        # child single-process usage that never fed a parent-owned
+        # iteration id).
         next_state = {
             "schema": STATE_SCHEMA_V2,
             "repository_full_name": repository_full_name,
@@ -874,7 +885,7 @@ def analyze(
             "normalized_kind": primary["normalized_kind"],
             "consecutive_unbacked_count": next_count,
             "last_review_artifact": str(review_result.get("_artifact_path") or ""),
-            "updated_at_iteration_id": _utc_now_iso(),
+            "updated_at_iteration_id": iteration_id if iteration_id is not None else _utc_now_iso(),
         }
     else:
         next_state = {
@@ -1066,6 +1077,15 @@ def main() -> int:
     parser.add_argument("--issue-number", type=int)
     parser.add_argument("--refinement-session-id")
     parser.add_argument(
+        "--iteration-id",
+        help=(
+            "Parent-owned iteration id (Issue #1532 High-2). When supplied, "
+            "used verbatim as next_state.updated_at_iteration_id instead of "
+            "a wall-clock timestamp, so the SAME logical inputs reproduce "
+            "the SAME next_state regardless of when analyze() runs."
+        ),
+    )
+    parser.add_argument(
         "--dump-taxonomy",
         action="store_true",
         help="Print REVIEWER_CHECKER_TAXONOMY_V1 as JSON and exit (no other args required)",
@@ -1141,6 +1161,7 @@ def main() -> int:
             repository_full_name=args.repository_full_name,
             issue_number=args.issue_number,
             refinement_session_id=args.refinement_session_id,
+            iteration_id=args.iteration_id,
         )
         if not used_inline:
             _save_state(args.state_file, next_state)
