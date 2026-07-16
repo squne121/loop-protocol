@@ -40,6 +40,8 @@ PRODUCER_SCRIPT_PATH = (
     / "scripts"
     / "baseline_vc_preflight.py"
 )
+ADJUDICATOR_PATH = ".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"
+ADJUDICATOR_DIFF_SUMMARY = {"changed_paths": [ADJUDICATOR_PATH], "head_sha": "head-1"}
 
 _spec = importlib.util.spec_from_file_location(
     "adjudicate_vc_result_non_regression_gate", ADJUDICATE_SCRIPT_PATH
@@ -742,8 +744,8 @@ def test_non_regression_scope_pr_review_only_skip_item_is_excluded_from_regressi
     result = mod.adjudicate_vc_result(
         contract_snapshot=baseline,
         current_vc_result=current,
-        diff_summary={"changed_paths": [".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"], "head_sha": "head-1"},
-        allowed_paths=[".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
     )
 
     assert result["overall_status"] == "pass"
@@ -783,8 +785,8 @@ def test_non_regression_scope_pr_review_only_skip_missing_scope_is_not_excluded(
     result = mod.adjudicate_vc_result(
         contract_snapshot=baseline,
         current_vc_result=current,
-        diff_summary={"changed_paths": [".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"], "head_sha": "head-1"},
-        allowed_paths=[".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
     )
 
     assert result["overall_status"] != "pass"
@@ -823,8 +825,8 @@ def test_non_regression_scope_pr_review_only_skip_wrong_decision_is_not_excluded
     result = mod.adjudicate_vc_result(
         contract_snapshot=baseline,
         current_vc_result=current,
-        diff_summary={"changed_paths": [".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"], "head_sha": "head-1"},
-        allowed_paths=[".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
     )
 
     assert result["overall_status"] != "pass"
@@ -863,8 +865,8 @@ def test_current_head_runtime_evidence_is_required_for_pr_review_only_only_paylo
     certified = mod.adjudicate_vc_result(
         contract_snapshot=baseline,
         current_vc_result=current,
-        diff_summary={"changed_paths": [".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"], "head_sha": "head-1"},
-        allowed_paths=[".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
     )
     assert certified["overall_status"] == "pass"
     assert certified["per_ac"] == []
@@ -873,8 +875,8 @@ def test_current_head_runtime_evidence_is_required_for_pr_review_only_only_paylo
     result = mod.adjudicate_vc_result(
         contract_snapshot=baseline,
         current_vc_result=current,
-        diff_summary={"changed_paths": [".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"], "head_sha": "head-1"},
-        allowed_paths=[".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
     )
 
     assert result["overall_status"] != "pass"
@@ -913,8 +915,8 @@ def test_pr_review_only_rejects_incomplete_evidence() -> None:
     result = mod.adjudicate_vc_result(
         contract_snapshot=baseline,
         current_vc_result=current,
-        diff_summary={"changed_paths": [".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"], "head_sha": "head-1"},
-        allowed_paths=[".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
     )
 
     assert result["overall_status"] != "pass"
