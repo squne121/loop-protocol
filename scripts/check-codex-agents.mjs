@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
@@ -19,6 +19,8 @@ const configPath = path.join(repoRoot, '.codex', 'config.toml');
 const hooksPath = path.join(repoRoot, '.codex', 'hooks.json');
 const rulesPath = path.join(repoRoot, '.codex', 'rules', 'default.rules');
 const ledgerPath = path.join(repoRoot, 'artifacts', 'codex', 'subagent-launch-ledger.json');
+const ledgerWriterSource = path.join(repoRoot, 'scripts', 'subagent-launch-ledger-writer.c');
+const ledgerWriterBinary = path.join(repoRoot, 'tmp', 'subagent-launch-ledger-writer');
 const sourceRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const fixtureRuntimeContractPath = path.join(repoRoot, 'tests', 'fixtures', 'codex-agent-config', 'expected-runtime-contract.json');
 const runtimeContractPath = fs.existsSync(fixtureRuntimeContractPath)
@@ -864,53 +866,34 @@ function parseHookInput() {
   }
 }
 
-function ensureLedgerDirectory() {
-  fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
-}
-
-function defaultCoverageScope() {
-  return {
-    subagent_start_event_recorded: true,
-    supported_pretooluse_paths: supportedPreToolNames,
-    unsupported_paths_fail_closed: true,
-    scope_note: 'This ledger records event-derived SubagentStart launches and supported PreToolUse paths only.',
-  };
-}
-
-function loadLedger() {
-  if (!fs.existsSync(ledgerPath)) {
-    return {
-      ledger_schema: 'SUBAGENT_LAUNCH_LEDGER_V1',
-      generated_by: 'codex_hook_pipeline',
-      generated_at: new Date().toISOString(),
-      ledger_path: path.relative(repoRoot, ledgerPath),
-      codex_binary_status: 'available',
-      coverage_scope: defaultCoverageScope(),
-      launches: [],
-      root_thread_actions: [],
-    };
-  }
+function ensureLedgerWriter() {
   try {
-    return JSON.parse(readText(ledgerPath));
+    fs.mkdirSync(path.dirname(ledgerWriterBinary), { recursive: true, mode: 0o700 });
+    const directory = fs.lstatSync(path.dirname(ledgerWriterBinary));
+    if (directory.isSymbolicLink() || !directory.isDirectory()) throw new Error('unsafe_build_directory');
+    const candidate = `${ledgerWriterBinary}.${process.pid}.${crypto.randomBytes(8).toString('hex')}`;
+    try {
+      execFileSync('cc', ['-std=c17', '-Wall', '-Wextra', '-Werror', '-O2', '-o', candidate, ledgerWriterSource], { stdio: 'pipe' });
+      fs.renameSync(candidate, ledgerWriterBinary);
+    } finally {
+      fs.rmSync(candidate, { force: true });
+    }
+    return ledgerWriterBinary;
   } catch {
-    return {
-      ledger_schema: 'SUBAGENT_LAUNCH_LEDGER_V1',
-      generated_by: 'codex_hook_pipeline',
-      generated_at: new Date().toISOString(),
-      ledger_path: path.relative(repoRoot, ledgerPath),
-      codex_binary_status: 'available',
-      coverage_scope: defaultCoverageScope(),
-      launches: [],
-      root_thread_actions: [],
-    };
+    throw new Error('ledger_writer_build_failed');
   }
 }
 
-function saveLedger(ledger) {
-  ensureLedgerDirectory();
-  ledger.generated_at = new Date().toISOString();
-  ledger.ledger_path = path.relative(repoRoot, ledgerPath);
-  fs.writeFileSync(ledgerPath, `${JSON.stringify(ledger, null, 2)}\n`, 'utf8');
+function writeLedgerEntry(kind, entry, identity) {
+  const result = spawnSync(ensureLedgerWriter(), [
+    '--repo', repoRoot,
+    '--kind', kind,
+    '--entry', JSON.stringify(entry),
+    '--identity', identity,
+  ], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' });
+  if (result.error || result.status !== 0) {
+    throw new Error(String(result.stderr || '').trim() || 'ledger_writer_failed');
+  }
 }
 
 function getAgentRuntime(agentName) {
@@ -969,10 +952,7 @@ function appendLaunchEvidence(payload) {
     return;
   }
   const fingerprint = buildEventFingerprint(payload, `SubagentStart:${agentType}`);
-  const ledger = loadLedger();
-  const alreadyPresent = ledger.launches.some((launch) => launch.event_fingerprint === fingerprint);
-  if (!alreadyPresent) {
-    ledger.launches.push({
+  writeLedgerEntry('launches', {
       agent_name: agentType,
       event_type: 'SubagentStart',
       evidence_source: 'event_derived',
@@ -993,13 +973,10 @@ function appendLaunchEvidence(payload) {
         repo_head_sha: process.env.CODEX_AGENT_EVIDENCE_HEAD_SHA ?? null,
         worktree_dirty: process.env.CODEX_AGENT_EVIDENCE_WORKTREE_DIRTY === 'true',
       },
-    });
-  }
-  saveLedger(ledger);
+  }, fingerprint);
 }
 
 function appendPreToolEvidence(payload, toolName, command) {
-  const ledger = loadLedger();
   const observedCommand = command || payload?.tool_input?.file_path || payload?.tool_input?.command || '';
   const action = {
     kind: classifyRootThreadAction(toolName, command),
@@ -1007,13 +984,7 @@ function appendPreToolEvidence(payload, toolName, command) {
     tool_name: toolName,
     coverage_source: 'supported_pretooluse_path',
   };
-  const duplicate = ledger.root_thread_actions.some(
-    (entry) => entry.tool_name === action.tool_name && entry.command === action.command,
-  );
-  if (!duplicate) {
-    ledger.root_thread_actions.push(action);
-  }
-  saveLedger(ledger);
+  writeLedgerEntry('root_thread_actions', action, `${action.tool_name}\n${action.command}`);
 }
 
 function hookDeny(reason) {
