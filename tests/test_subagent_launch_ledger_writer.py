@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import shutil
 import socket
@@ -82,21 +83,81 @@ def root_action(kind: str = "file_edit", command: str = "apply change") -> dict[
     }
 
 
-def test_independent_trusted_processes_preserve_distinct_evidence(tmp_path: Path):
+def barrier_invoke_writer(
+    barrier: object,
+    results: object,
+    writer: str,
+    repo: str,
+    payload: str,
+    kind: str,
+    identity: str,
+) -> None:
+    """Start a native writer only after every independent process reaches the gate."""
+    barrier.wait(timeout=10)
+    result = subprocess.run(
+        [writer, "--repo", repo, "--kind", kind, "--entry", payload, "--identity", identity],
+        text=True,
+        capture_output=True,
+    )
+    results.put((kind, identity, result.returncode, result.stdout, result.stderr))
+
+
+def test_barrier_synchronised_independent_processes_preserve_launch_and_root_action_evidence(tmp_path: Path):
     writer = build_writer(tmp_path)
-    commands = [
-        [str(writer), "--repo", str(tmp_path), "--kind", "launches", "--entry", json.dumps(entry("spark-skim")), "--identity", "fingerprint-spark-skim"],
-        [str(writer), "--repo", str(tmp_path), "--kind", "launches", "--entry", json.dumps(entry("spark-deep")), "--identity", "fingerprint-spark-deep"],
+    # The writer itself is Linux-only; fork avoids pytest's non-package test
+    # module import limitation while still creating independent OS processes.
+    context = multiprocessing.get_context("fork")
+    barrier = context.Barrier(3)
+    results = context.Queue()
+    launch = entry("spark-skim")
+    launch["declared_runtime"]["reasoning_effort"] = "low"
+    action = root_action("bash_observed", "rtk git status --short")
+    workers = [
+        context.Process(
+            target=barrier_invoke_writer,
+            args=(
+                barrier,
+                results,
+                str(writer),
+                str(tmp_path),
+                json.dumps(launch),
+                "launches",
+                "fingerprint-spark-skim",
+            ),
+        ),
+        context.Process(
+            target=barrier_invoke_writer,
+            args=(
+                barrier,
+                results,
+                str(writer),
+                str(tmp_path),
+                json.dumps(action),
+                "root_thread_actions",
+                "Bash\\nrtk git status --short",
+            ),
+        ),
     ]
-    first = subprocess.Popen(commands[0], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    second = subprocess.Popen(commands[1], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert first.wait(timeout=10) == 0
-    assert second.wait(timeout=10) == 0
+    for worker in workers:
+        worker.start()
+    barrier.wait(timeout=10)
+    for worker in workers:
+        worker.join(timeout=10)
+        assert worker.exitcode == 0
+    outcomes = [results.get(timeout=2) for _ in workers]
+    assert all(returncode == 0 for _, _, returncode, _, _ in outcomes), outcomes
+
     ledger = json.loads((tmp_path / "artifacts/codex/subagent-launch-ledger.json").read_text())
-    assert {item["event_fingerprint"] for item in ledger["launches"]} == {
-        "fingerprint-spark-skim",
-        "fingerprint-spark-deep",
-    }
+    assert [item["event_fingerprint"] for item in ledger["launches"]] == ["fingerprint-spark-skim"]
+    assert ledger["root_thread_actions"] == [action]
+
+    audit = subprocess.run(
+        [sys.executable, str(VALIDATOR), "--audit-mode", str(tmp_path / "artifacts/codex/subagent-launch-ledger.json")],
+        text=True,
+        capture_output=True,
+    )
+    assert audit.returncode == 0, audit.stdout
+    assert json.loads(audit.stdout)["status"] == "pass"
 
 
 def test_hook_builds_writer_and_records_dispatch_evidence(tmp_path: Path):
