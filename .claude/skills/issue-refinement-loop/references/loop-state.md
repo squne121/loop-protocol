@@ -228,15 +228,29 @@ state_contract:
    uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/reviewer_claim_replay_state_store.py      --read --state-dir .claude/artifacts/issue-refinement-loop/<issue_number>      --repository-full-name <owner/repo> --issue-number <N> --refinement-session-id <session_id>
    ```
    `status: ok` の `state`（`reset_reason` があれば空オブジェクト）を SubAgent の prompt へ `previous_state` として渡す。`status: corrupt` は `human_judgment_required` へ倒す。
-2. **invoke**: `issue-reviewer` SubAgent が `reviewer_claim_replay.py --previous-state-inline '<previous_state>' --repository-full-name <owner/repo> --issue-number <N> --refinement-session-id <session_id>` を実行し、stdout の `REPLAY_NEXT_STATE` を返す（ファイル I/O なし）。
-3. **write**（SubAgent 応答受信後）:
-   ```bash
-   uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/reviewer_claim_replay_state_store.py      --write --state-dir .claude/artifacts/issue-refinement-loop/<issue_number>      --next-state-inline '<REPLAY_NEXT_STATE の JSON>'
-   ```
+2. **invoke**: `issue-reviewer` SubAgent は `reviewer_claim_replay.py` を実行せず、bounded な `REVIEWER_BLOCKER_CLAIM_V1` claim のみを stdout に返す（Issue #1532 以降。V1 の `--previous-state-inline` co-located 実行はこの経路では使われない — 直接 `analyze()` を呼ぶ pure function としての `--previous-state-inline` CLI 引数自体は後方互換のため残る）。
+3. **write は V2 経路（下記）のみ**: raw child claim から state を直接 `--write` する経路は Issue #1532 で廃止された。`--write`（`--write-v2` を使わない生の CLI）は legacy pure-function 用途のみに残る。
 
 `refinement_session_id` は orchestrator が loop 開始時（Step 0f 相当）に一度だけ生成し、loop 全体（複数 iteration）で使い回す。loop が終了（`approved` / `needs_second_pass` / `human_escalation` いずれか）したら、orchestrator は `.claude/artifacts/issue-refinement-loop/<issue_number>/reviewer_claim_replay_state.json` を削除する（retention_policy: delete_on_loop_termination）。
 
 identity（`repository_full_name`/`issue_number`/`refinement_session_id`/`body_sha256`）のいずれかが不一致の場合、state store は空 state（`reset_reason` 付き）を返す。これはエラーではなく、fresh session として consecutive count を 1 から数え直すための正常系である。
+
+### read → invoke → bind → validate → write-v2 フロー（親ローカル replay 整合性束縛, Issue #1532）
+
+Step 2a の唯一の state 永続化経路は V2 である。read の後、invoke と write の間に以下を挿む（これは producer identity・署名・鍵管理・supply-chain provenance の証明ではない — parent が自ら再計算した replay の整合性束縛にすぎない）:
+
+1. **parent replay**: orchestrator が `parent_replay_binding.py` に自ら取得・保存・readback した `readiness_result` / `vc_syntax_result` / `vc_preflight_result` / `previous_state` / 現在の Issue body raw bytes snapshot / identity と、strict schema 検証済みの child `REVIEWER_BLOCKER_CLAIM_V1` を渡し、`PARENT_REPLAY_BINDING_ARTIFACT_V1`（`replay_next_state` + `binding_digest`）を得る。child の raw artifact ファイルは読まない。`findings`/`checker_evidence`/`deterministic_checks` を含む claim は fail-closed に拒否される。
+2. **V2 envelope 組み立て**: orchestrator が child の claim envelope に `PARENT_REPLAY_VERDICT` / `PARENT_REPLAY_ROUTING` / `PARENT_REPLAY_SHOULD_CONSUME` / `PARENT_REPLAY_BODY_SHA256` / `PARENT_REPLAY_NEXT_STATE`（canonical 1 行 JSON）/ `PARENT_REPLAY_BINDING_DIGEST` の 6 行を追記する。
+3. **V2 validate**: `validate_review_compact_output.py --v2`（`--binding-artifact-file` に step 1 の artifact、`--repository-full-name` / `--refinement-session-id` / `--iteration-id` / `--current-body-file` すべて必須）が binding artifact の strict schema・digest 再計算・identity/body 照合と、envelope の全 `PARENT_REPLAY_*` フィールドを exact 照合する。不一致・binding artifact 不在は `human_judgment_required`。
+4. **write-v2**（`validation_status: valid` の場合のみ）:
+   ```bash
+   uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/reviewer_claim_replay_state_store.py \
+     --write-v2 --state-dir .claude/artifacts/issue-refinement-loop/<issue_number> \
+     --repository-full-name <owner/repo> --issue-number <N> --refinement-session-id <session_id> \
+     --validation-result-v2-inline '<REVIEW_COMPACT_VALIDATION_RESULT_V2 の JSON>' \
+     --expected-parent-binding-digest '<step 1 の binding_digest>'
+   ```
+   `write_state_v2_from_validated_payload()` は `schema == REVIEW_COMPACT_VALIDATION_RESULT_V2` / `schema_version == "2"` / `envelope_kind == needs_fix_v2` / `violations == []` / `validation_status: valid` / identity をすべて自ら再検証したうえでのみ `PARENT_REPLAY_NEXT_STATE` を永続化する。caller が組み立てた `{"validation_status": "valid", ...}` のみの偽装 payload は拒否される（state file を一切更新せず `status: rejected` を返す）。
 
 ## scope_signal_guard_decision_v2（build_loop_state.py の envelope pass-through 拡張フィールド, #1090）
 

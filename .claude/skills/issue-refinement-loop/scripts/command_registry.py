@@ -372,6 +372,116 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "issue_number": {"type": "positive_int", "required": True},
         },
     },
+    # Issue #1532: parent-local replay integrity binding. The orchestrator is
+    # the SOLE caller -- it supplies its own readiness/checker inventory
+    # files, its OWN current body snapshot file, and the child SubAgent's
+    # bounded REVIEWER_BLOCKER_CLAIM_V1 (never a raw child artifact or raw
+    # findings/checker_evidence), then replays
+    # `reviewer_claim_replay.analyze()` in-process to derive
+    # PARENT_REPLAY_BINDING_ARTIFACT_V1 (PARENT_REPLAY_NEXT_STATE +
+    # binding_digest, surfaced as PARENT_REPLAY_BINDING_DIGEST). This is a
+    # parent-local replay integrity binding, NOT a producer identity /
+    # supply-chain provenance attestation (no signatures, no key
+    # management, no same-OS-UID authentication).
+    "parent_replay.bind": {
+        "id": "parent_replay.bind",
+        "argv": [
+            "uv", "run", "--locked", "--offline", "--no-sync", "python3",
+            f"{_SKILL_PREFIX}/parent_replay_binding.py",
+            "--reviewer-blocker-claim-file", "{reviewer_blocker_claim_file}",
+            "--readiness-result-file", "{readiness_result_file}",
+            "--previous-state-inline", "{previous_state_inline}",
+            "--current-body-file", "{current_body_file}",
+            "--issue-url", "{issue_url}",
+            "--repository-full-name", "{repo}",
+            "--issue-number", "{issue_number}",
+            "--refinement-session-id", "{refinement_session_id}",
+            "--iteration-id", "{iteration_id}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "stdin_contract": "none",
+        "stdout_contract": "parent_replay_binding_artifact/v1",
+        "timeout_seconds": 30,
+        "mutation": False,
+        "network_effect": "local_only",
+        "placeholders": {
+            "reviewer_blocker_claim_file": {"type": "repo_relative_file", "required": True},
+            "readiness_result_file": {"type": "repo_relative_file", "required": True},
+            "previous_state_inline": {"type": "string", "required": True},
+            "current_body_file": {"type": "repo_relative_file", "required": True},
+            "issue_url": {"type": "url", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "issue_number": {"type": "positive_int", "required": True},
+            "refinement_session_id": {"type": "string", "required": True},
+            "iteration_id": {"type": "string", "required": True},
+        },
+    },
+    # Issue #1532 AC1/AC4/High-1: V2 validator sibling of
+    # `review_compact.validate` -- REQUIRES a binding artifact file and full
+    # parent-owned identity/body context. Never optional; there is no
+    # "V2 validation without a binding artifact" code path.
+    "review_compact.validate_v2": {
+        "id": "review_compact.validate_v2",
+        "argv": [
+            "uv", "run", "--locked", "--offline", "--no-sync", "python3",
+            f"{_SKILL_PREFIX}/validate_review_compact_output.py",
+            "--v2",
+            "--issue-number", "{issue_number}",
+            "--binding-artifact-file", "{binding_artifact_file}",
+            "--repository-full-name", "{repo}",
+            "--refinement-session-id", "{refinement_session_id}",
+            "--iteration-id", "{iteration_id}",
+            "--current-body-file", "{current_body_file}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "stdin_contract": "issue_review_result_compact_v2/raw_text",
+        "stdout_contract": "review_compact_validation_result/v2",
+        "timeout_seconds": 30,
+        "mutation": False,
+        "network_effect": "local_only",
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "binding_artifact_file": {"type": "repo_relative_file", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "refinement_session_id": {"type": "string", "required": True},
+            "iteration_id": {"type": "string", "required": True},
+            "current_body_file": {"type": "repo_relative_file", "required": True},
+        },
+    },
+    # Issue #1532 AC5/High-3: the sole V2 state-write path. Rejects
+    # caller-fabricated validation_status and cross-issue/session/digest
+    # substitution via the required `expected_*` identity args.
+    "state.write-v2": {
+        "id": "state.write-v2",
+        "argv": [
+            "uv", "run", "--locked", "--offline", "--no-sync", "python3",
+            f"{_SKILL_PREFIX}/reviewer_claim_replay_state_store.py",
+            "--write-v2",
+            "--state-dir", "{state_dir}",
+            "--repository-full-name", "{repo}",
+            "--issue-number", "{issue_number}",
+            "--refinement-session-id", "{refinement_session_id}",
+            "--validation-result-v2-inline", "{validation_result_v2_inline}",
+            "--expected-parent-binding-digest", "{expected_parent_binding_digest}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "stdin_contract": "none",
+        "stdout_contract": "reviewer_claim_replay_state_store_result/v1",
+        "timeout_seconds": 30,
+        "mutation": True,
+        "network_effect": "local_only",
+        "placeholders": {
+            "state_dir": {"type": "repo_relative_file", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "issue_number": {"type": "positive_int", "required": True},
+            "refinement_session_id": {"type": "string", "required": True},
+            "validation_result_v2_inline": {"type": "string", "required": True},
+            "expected_parent_binding_digest": {"type": "string", "required": True},
+        },
+    },
 }
 
 # ---------------------------------------------------------------------------
