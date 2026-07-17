@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -73,6 +76,314 @@ def _is_race_tolerant_unattributable_path(rel_path: str) -> bool:
         if normalized == prefix or normalized.startswith(prefix + "/"):
             return True
     return False
+
+
+# =============================================================================
+# Typed SubAgent-launch-ledger transition policy (Issue #1502).
+#
+# `_RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS` above is a *directory root*
+# exclusion class: it never inspects the transition kind of anything under
+# those roots. The ledger final file cannot use that class (Out of Scope:
+# directory-wide exclusion of `artifacts/`, `artifacts/codex/`, or `tmp/` is
+# forbidden), so it gets its own narrow, exact-path, transition-typed policy:
+#
+# - stable exact peer file (`_LEDGER_STABLE_EXACT_REL`): the canonical ledger
+#   final file. Only `absent -> regular` and `regular -> regular` transitions
+#   are authorized; delete, symlink, directory, FIFO, socket, or device
+#   substitution fail closed on that exact path (AC2).
+# - transient protocol entries (`_LEDGER_TRANSIENT_EXACT_RELS`): the writer's
+#   `.lock` / `.tmp` sibling files. These may exist only for the bounded
+#   duration of a single native-writer invocation; the executor waits (bounded
+#   quiescence) for them to vanish and fails closed on any residue that
+#   outlives the timeout (AC3).
+#
+# Everything else under `artifacts/codex/` (siblings of the three exact
+# paths) remains subject to the ordinary repo-wide snapshot/status diff with
+# no special-casing, so unexpected sibling create/update/delete/rename still
+# fails closed (AC4).
+# =============================================================================
+
+_LEDGER_ARTIFACT_DIR_REL = "artifacts/codex"
+_LEDGER_STABLE_EXACT_REL = f"{_LEDGER_ARTIFACT_DIR_REL}/subagent-launch-ledger.json"
+_LEDGER_TRANSIENT_EXACT_RELS = (
+    f"{_LEDGER_STABLE_EXACT_REL}.lock",
+    f"{_LEDGER_STABLE_EXACT_REL}.tmp",
+)
+_LEDGER_TYPED_EXACT_RELS = (_LEDGER_STABLE_EXACT_REL, *_LEDGER_TRANSIENT_EXACT_RELS)
+
+# Ancestor directory *node* entries of the stable ledger path (e.g.
+# "artifacts", "artifacts/codex"). When the stable ledger transitions
+# `absent -> regular` for the first time in a fresh repo/worktree, its parent
+# directories are newly created too, and each appears in the repo-wide
+# snapshot as a brand-new directory-node entry (its own mtime/size), which
+# would otherwise be reported as an unrelated unauthorized change even though
+# the underlying ledger transition itself was already authorized above. This
+# is narrower than a directory-wide exclusion: only the ancestor directory's
+# own node entry is excluded, never any other path inside it, so an
+# unexpected sibling file created alongside the ledger is still detected via
+# its own (distinct) path entry (AC4).
+_LEDGER_STABLE_ANCESTOR_DIR_RELS = tuple(
+    str(parent).replace(os.sep, "/") for parent in Path(_LEDGER_STABLE_EXACT_REL).parents if str(parent) != "."
+)
+
+
+# `_LEDGER_STABLE_ANCESTOR_DIR_RELS` is ordered deepest-first (from
+# `Path(...).parents`). Ancestor kind classification/exemption must instead
+# walk shallowest-first: a substituted shallow parent (e.g. `artifacts`
+# replaced by a symlink or file) can make a deeper rel (e.g.
+# `artifacts/codex`) *look* like a fresh, legitimate `absent -> dir`
+# transition purely because the substituted parent didn't previously resolve
+# to anything -- shallow-first propagation prevents that laundering.
+_LEDGER_STABLE_ANCESTOR_DIR_RELS_SHALLOW_TO_DEEP = tuple(reversed(_LEDGER_STABLE_ANCESTOR_DIR_RELS))
+
+# Sentinel before-kind for an ancestor rel whose own parent was already
+# confirmed non-traversable (a real file/fifo/socket/device node) before the
+# child ran: the path is filesystem-unreachable (any real subpath under a
+# non-directory, non-symlink leaf node raises `ENOTDIR`), so probing it
+# directly would raise rather than classify. This sentinel never matches an
+# authorized ancestor transition tuple, so it always fails closed.
+_LEDGER_ANCESTOR_KIND_UNREACHABLE = "unreachable"
+
+# Ancestor kinds that make every deeper path component unreachable via a
+# direct `lstat` (a real subpath cannot exist under a plain file, FIFO,
+# socket, or device node). `"absent"` and `"symlink"` are deliberately
+# excluded: the OS still traverses through a missing or symlinked
+# intermediate component without raising (a missing intermediate simply
+# yields `FileNotFoundError` -> `"absent"` for the deeper path too; a
+# symlinked intermediate is followed transparently unless it is the *final*
+# path component).
+_LEDGER_ANCESTOR_NON_TRAVERSABLE_KINDS = frozenset({"regular", "fifo", "socket", "device"})
+
+
+def _ledger_ancestor_kinds(project_root: str) -> dict[str, str]:
+    """Snapshot the on-disk kind of every stable-ledger ancestor directory
+    node *before* the child command runs (Issue #1502 REQUEST_CHANGES
+    Blocker 5). This is required so the ancestor exemption below can compare
+    a genuine before-kind (which may be `"symlink"` or `"regular"` in a
+    parent-substitution attack) instead of assuming `"absent"`.
+
+    Walks shallowest-first and stops probing once a shallower ancestor is
+    confirmed non-traversable, recording `_LEDGER_ANCESTOR_KIND_UNREACHABLE`
+    for every deeper rel instead of calling `_path_kind` on it (which would
+    otherwise raise `NotADirectoryError`/`ENOTDIR`, since Issue #1502
+    REQUEST_CHANGES Blocker 2 no longer folds arbitrary `OSError` into
+    `"absent"`)."""
+    root = Path(project_root)
+    kinds: dict[str, str] = {}
+    blocked = False
+    for rel in _LEDGER_STABLE_ANCESTOR_DIR_RELS_SHALLOW_TO_DEEP:
+        if blocked:
+            kinds[rel] = _LEDGER_ANCESTOR_KIND_UNREACHABLE
+            continue
+        kind = _path_kind(root / rel)
+        kinds[rel] = kind
+        if kind in _LEDGER_ANCESTOR_NON_TRAVERSABLE_KINDS:
+            blocked = True
+    return kinds
+
+
+def _is_allowed_ancestor_transition(before_kind: str, after_kind: str) -> bool:
+    """An ancestor directory-node side effect of an authorized stable-ledger
+    transition is limited to `absent -> dir` (first-ever creation) and
+    `dir -> dir` (already existed, unchanged kind). Any other before-kind
+    (`symlink`, `regular`, `fifo`, `socket`, `device`, or the
+    `"unreachable"` sentinel) transitioning into a real directory is parent
+    substitution and must fail closed -- it is never silently excluded from
+    the generic diff."""
+    return (before_kind, after_kind) in {("absent", "dir"), ("dir", "dir")}
+
+
+def _safe_ledger_ancestor_dir_rels(
+    project_root: str, ancestor_before_kinds: dict[str, str] | None = None
+) -> set[str]:
+    """Return the subset of `_LEDGER_STABLE_ANCESTOR_DIR_RELS` whose
+    before -> after kind transition is one of the two authorized ancestor
+    transitions (Issue #1502 REQUEST_CHANGES Blocker 5). Postcondition-only
+    inspection (checking only whether the *after* state is a real
+    non-symlink directory) is insufficient: a parent that was a symlink or
+    plain file *before* the child ran and got replaced by a real directory
+    *during* the child's run must never be silently excluded here -- only a
+    genuine directory-node side effect of the already-authorized ledger
+    transition is.
+
+    Walks shallowest-first and propagates unsafety downward: once any
+    ancestor in the chain fails its own transition check, every deeper rel
+    under it is excluded from the safe set too, even if that deeper rel's
+    own isolated before/after kinds would otherwise look like a legitimate
+    `absent -> dir` transition (which they can, spuriously, precisely
+    because the substituted shallow parent didn't previously resolve to
+    anything real)."""
+    ancestor_before_kinds = ancestor_before_kinds or {}
+    root = Path(project_root)
+    safe: set[str] = set()
+    chain_safe = True
+    for rel in _LEDGER_STABLE_ANCESTOR_DIR_RELS_SHALLOW_TO_DEEP:
+        if not chain_safe:
+            # PR #1552 REQUEST_CHANGES follow-up: once a shallower ancestor
+            # in the chain is already confirmed unsafe, do not probe any
+            # deeper rel's kind at all -- a shallower ancestor substituted by
+            # a plain file/fifo/socket/device makes every deeper path
+            # unreachable via a direct `lstat` (raises `ENOTDIR`), so calling
+            # `_path_kind` on it would only risk an uncaught crash for a
+            # result this loop already discards (mirrors the `blocked`
+            # skip-pattern in `_ledger_ancestor_kinds` above).
+            continue
+        before_kind = ancestor_before_kinds.get(rel, "absent")
+        after_kind = _path_kind_or_ancestor_absent(root / rel)
+        if _is_allowed_ancestor_transition(before_kind, after_kind):
+            safe.add(rel)
+        else:
+            chain_safe = False
+    return safe
+
+# Bounded quiescence window: how long the executor waits, after the child
+# process exits, for the writer's own `.lock` / `.tmp` protocol entries to be
+# removed by the (already-exited-or-still-finishing) peer writer process
+# before treating any residue as stale (fail-closed, never auto-deleted).
+_LEDGER_TRANSIENT_QUIESCENCE_TIMEOUT_SECONDS = 2.0
+_LEDGER_TRANSIENT_QUIESCENCE_POLL_INTERVAL_SECONDS = 0.05
+# Issue #1502 REQUEST_CHANGES (Blocker 6): after an apparently-clean
+# (fully-absent) poll, wait this long and re-poll before trusting the
+# observation. A single empty poll is not sufficient evidence of quiescence
+# -- a still-finishing peer writer could create/remove these entries again in
+# the gap between that poll and the caller's subsequent "after" snapshot
+# capture (TOCTOU). Bounded by the same overall deadline as the main loop.
+_LEDGER_TRANSIENT_QUIESCENCE_CONFIRM_INTERVAL_SECONDS = 0.1
+
+
+def _path_kind(path: Path) -> str:
+    """Classify a filesystem path by its on-disk kind, never following the
+    final symlink component (uses lstat so a symlink is reported as
+    `"symlink"`, not as the kind of its target).
+
+    Issue #1502 REQUEST_CHANGES (Blocker 2): only `FileNotFoundError` is
+    treated as `"absent"`. Any other `OSError` (e.g. `EACCES`, `EIO`,
+    `ENOTDIR` from a non-directory ancestor) must never be silently folded
+    into `"absent"` -- doing so would fail-open a transition check that
+    expects `"absent"` to mean "nothing is there", when the real condition is
+    "the on-disk state could not be determined". Such errors propagate to the
+    caller (and therefore to `main()`'s uncaught-exception fail-closed exit),
+    never masquerading as a benign missing path."""
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return "absent"
+    mode = st.st_mode
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISDIR(mode):
+        return "dir"
+    if stat.S_ISREG(mode):
+        return "regular"
+    if stat.S_ISFIFO(mode):
+        return "fifo"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISBLK(mode) or stat.S_ISCHR(mode):
+        return "device"
+    return "other"
+
+
+def _path_kind_or_ancestor_absent(path: Path) -> str:
+    """Classify like `_path_kind`, but additionally treat
+    `NotADirectoryError` (`ENOTDIR` -- some ancestor path component exists on
+    disk as a non-directory node) as `"absent"` instead of propagating it
+    uncaught.
+
+    PR #1552 REQUEST_CHANGES follow-up (post-Blocker-2 regression): unlike
+    genuinely ambiguous errors (`EACCES`, `EIO`, ...), which `_path_kind`
+    correctly refuses to fold into `"absent"` because their real on-disk
+    state is unknown, `ENOTDIR` is unambiguous proof that no real filesystem
+    node can exist at the deeper path -- a directory-nested file literally
+    cannot exist under a non-directory ancestor. Folding only this specific,
+    provable case into `"absent"` here never masks a genuine
+    parent-substitution attack: the independent, generic repo-wide diff in
+    `_find_unauthorized_repo_changes` (driven by `git status`, not by
+    `_path_kind`) still observes and fails closed on the substituted
+    ancestor itself (e.g. `artifacts` created as a plain file) on its own,
+    unconditionally. This helper exists only so that call sites which must
+    keep evaluating past a broken ancestor (transient-lock quiescence
+    polling, the stable-ledger transition check) route to that controlled
+    fail-close path instead of crashing with an uncaught traceback -- which
+    would silently *skip* the fail-close reporting entirely, the opposite of
+    Blocker 2's intent."""
+    try:
+        return _path_kind(path)
+    except NotADirectoryError:
+        return "absent"
+
+
+def _ledger_exact_kinds(project_root: str) -> dict[str, str]:
+    root = Path(project_root)
+    return {rel: _path_kind(root / rel) for rel in _LEDGER_TYPED_EXACT_RELS}
+
+
+def _is_allowed_stable_ledger_transition(before_kind: str, after_kind: str) -> bool:
+    """`absent -> regular` and `regular -> regular` are the only authorized
+    stable-exact-ledger transitions (AC2). Delete (`regular -> absent`) and
+    substitution into any non-regular kind (symlink / dir / fifo / socket /
+    device), from any before-kind, are rejected.
+
+    Issue #1502 REQUEST_CHANGES (Blocker 2): the previous implementation
+    returned True whenever `after_kind == "regular"` regardless of
+    `before_kind`, which silently authorized `symlink -> regular`,
+    `directory -> regular`, `fifo -> regular`, `socket -> regular`, and
+    `device -> regular` substitutions -- the exact opposite of the documented
+    contract. This is an explicit allow-tuple match instead."""
+    if before_kind == "absent" and after_kind == "absent":
+        return True
+    return (before_kind, after_kind) in {("absent", "regular"), ("regular", "regular")}
+
+
+def _wait_for_ledger_transient_quiescence(project_root: str) -> list[str]:
+    """Poll the writer's `.lock` / `.tmp` transient protocol entries until a
+    clean (fully-absent) observation is *confirmed* after a short quiet
+    interval, or the bounded quiescence window elapses.
+
+    Issue #1502 REQUEST_CHANGES (Blocker 6): a bare single-poll "empty now ->
+    return success immediately" check has a TOCTOU gap between that poll and
+    the caller's subsequent "after" snapshot capture -- a still-finishing
+    peer writer could re-create a `.lock` / `.tmp` entry in that gap and it
+    would never be observed. This loop treats an empty poll as tentative: it
+    re-polls after `_LEDGER_TRANSIENT_QUIESCENCE_CONFIRM_INTERVAL_SECONDS`
+    and only returns success (`[]`) once the same clean generation is
+    observed twice in a row. If the entries reappear during confirmation,
+    polling resumes against the overall deadline as normal.
+
+    Returns the (possibly empty) list of transient relative paths still
+    present once the window elapses. Never deletes anything itself -- a
+    non-empty return means stale residue that the caller must fail closed on
+    (AC3)."""
+    root = Path(project_root)
+    deadline = time.monotonic() + _LEDGER_TRANSIENT_QUIESCENCE_TIMEOUT_SECONDS
+
+    def _poll() -> list[str]:
+        return [
+            rel
+            for rel in _LEDGER_TRANSIENT_EXACT_RELS
+            if _path_kind_or_ancestor_absent(root / rel) != "absent"
+        ]
+
+    last = _poll()
+    while True:
+        now = time.monotonic()
+        if not last:
+            confirm_at = now + _LEDGER_TRANSIENT_QUIESCENCE_CONFIRM_INTERVAL_SECONDS
+            if confirm_at > deadline:
+                remaining_wait = max(0.0, deadline - now)
+                if remaining_wait:
+                    time.sleep(remaining_wait)
+                return _poll()
+            time.sleep(_LEDGER_TRANSIENT_QUIESCENCE_CONFIRM_INTERVAL_SECONDS)
+            confirmed = _poll()
+            if not confirmed:
+                return []
+            last = confirmed
+            continue
+        if now >= deadline:
+            return last
+        time.sleep(_LEDGER_TRANSIENT_QUIESCENCE_POLL_INTERVAL_SECONDS)
+        last = _poll()
 
 
 def _is_symlink_path(path: Path) -> bool:
@@ -434,12 +745,128 @@ def _resolve_child_argv(child_argv: Iterable[str]) -> list[str]:
     return resolved
 
 
+_LEDGER_IMMUTABLE_TOP_LEVEL_FIELDS = ("ledger_schema", "generated_by", "coverage_scope")
+
+
+def _read_bytes_or_none(path: Path) -> bytes | None:
+    """Read a file's raw bytes, returning None on any OSError (including
+    absent/unreadable) instead of raising -- callers treat None as "content
+    could not be established" and fail closed accordingly."""
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def _parse_ledger_bytes(data: bytes) -> dict | None:
+    """Parse raw bytes as a JSON object. Returns None on any parse failure or
+    if the top-level value is not an object."""
+    try:
+        parsed = json.loads(data)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _load_ledger_json(path: Path) -> dict | None:
+    """Read and parse a ledger JSON document. Returns None on any read/parse
+    failure or if the top-level value is not an object -- callers must treat
+    None as "not a valid ledger" and fail closed accordingly."""
+    raw = _read_bytes_or_none(path)
+    return _parse_ledger_bytes(raw) if raw is not None else None
+
+
+def _is_valid_ledger_schema(data: dict) -> bool:
+    """Minimal structural validation of a `SUBAGENT_LAUNCH_LEDGER_V1`
+    document sufficient to compare two revisions of the same ledger safely.
+    This is intentionally narrower than the full audit-mode validator in
+    `check_subagent_launch_ledger.py` -- it only needs to reject documents
+    where `launches` / `root_thread_actions` cannot be structurally compared
+    as append-only lists."""
+    return (
+        data.get("ledger_schema") == "SUBAGENT_LAUNCH_LEDGER_V1"
+        and isinstance(data.get("generated_by"), str)
+        and isinstance(data.get("coverage_scope"), dict)
+        and isinstance(data.get("launches"), list)
+        and isinstance(data.get("root_thread_actions"), list)
+    )
+
+
+def _is_authorized_ledger_content_transition(before: dict, after: dict) -> bool:
+    """Issue #1502 REQUEST_CHANGES (Blocker 3): a `regular -> regular`
+    stable-ledger transition is authorized only when:
+
+    - both the before and after content are valid `SUBAGENT_LAUNCH_LEDGER_V1`
+      documents (a malformed replacement, e.g. `"not-json-at-all"`, fails
+      closed);
+    - the immutable top-level fields (`ledger_schema`, `generated_by`,
+      `coverage_scope`) are byte-identical; and
+    - `launches` and `root_thread_actions` are each a strict append: every
+      existing before-entry is still present, unchanged, and in the same
+      order in the after-list (deleting, reordering, or mutating an existing
+      entry fails closed; only appending new valid entries is allowed).
+    """
+    if not _is_valid_ledger_schema(before) or not _is_valid_ledger_schema(after):
+        return False
+    for field in _LEDGER_IMMUTABLE_TOP_LEVEL_FIELDS:
+        if before.get(field) != after.get(field):
+            return False
+    for key in ("launches", "root_thread_actions"):
+        before_list = before[key]
+        after_list = after[key]
+        if len(after_list) < len(before_list):
+            return False
+        if after_list[: len(before_list)] != before_list:
+            return False
+    return True
+
+
 def _find_unauthorized_repo_changes(
     project_root: str,
     issue_number: str,
     before_snapshot: dict[str, tuple[str, int, int]],
     before_status: set[str],
+    ledger_before_kinds: dict[str, str] | None = None,
+    ledger_before_bytes: bytes | None = None,
+    ledger_ancestor_before_kinds: dict[str, str] | None = None,
 ) -> str | None:
+    # Issue #1502: the stable-exact ledger transition is checked first and
+    # independently of the generic snapshot/status diff below. If the
+    # transition is not one of the two authorized kinds, fail closed on that
+    # exact path immediately (AC2) rather than folding it into the generic
+    # diff (which would only report the deepest-path heuristic winner).
+    ledger_before_kinds = ledger_before_kinds or {}
+    stable_before_kind = ledger_before_kinds.get(_LEDGER_STABLE_EXACT_REL, "absent")
+    stable_ledger_path = Path(project_root) / _LEDGER_STABLE_EXACT_REL
+    stable_after_kind = _path_kind_or_ancestor_absent(stable_ledger_path)
+    if not _is_allowed_stable_ledger_transition(stable_before_kind, stable_after_kind):
+        return _LEDGER_STABLE_EXACT_REL
+
+    # Issue #1502 REQUEST_CHANGES (Blocker 3): `regular -> regular` is a
+    # *type*-authorized transition, but the type check alone says nothing
+    # about content -- a peer could replace a valid ledger with malformed
+    # content (e.g. `"not-json-at-all"`), or with a replacement that silently
+    # drops/mutates existing `launches` / `root_thread_actions` entries.
+    # Validate the content transition here, independently of the generic
+    # snapshot/status diff below (which only compares mtime/size, not
+    # content). Byte-identical before/after content (nothing actually
+    # changed) is always safe regardless of schema validity, so a
+    # pre-existing malformed-but-untouched ledger never blocks detection of
+    # an unrelated sibling change.
+    if stable_before_kind == "regular" and stable_after_kind == "regular":
+        after_bytes = _read_bytes_or_none(stable_ledger_path)
+        if after_bytes is None or ledger_before_bytes is None:
+            return _LEDGER_STABLE_EXACT_REL
+        if after_bytes != ledger_before_bytes:
+            before_content = _parse_ledger_bytes(ledger_before_bytes)
+            after_content = _parse_ledger_bytes(after_bytes)
+            if (
+                before_content is None
+                or after_content is None
+                or not _is_authorized_ledger_content_transition(before_content, after_content)
+            ):
+                return _LEDGER_STABLE_EXACT_REL
+
     after_snapshot = _snapshot_repo_paths(project_root, issue_number)
     after_status = _git_status_paths(project_root)
     new_raw_status_paths = after_status - before_status
@@ -449,11 +876,14 @@ def _find_unauthorized_repo_changes(
     # a race-tolerant subtree under an ignored parent is not misreported as
     # an unauthorized write to the collapsed parent itself.
     expanded_new_status_paths = _expand_new_status_paths(project_root, new_raw_status_paths)
+    safe_ledger_ancestor_dir_rels = _safe_ledger_ancestor_dir_rels(project_root, ledger_ancestor_before_kinds)
     new_status_paths = {
         path
         for path in expanded_new_status_paths
         if not _is_under_allowed_artifact_root(project_root, issue_number, path)
         and not _is_race_tolerant_unattributable_path(path)
+        and path not in _LEDGER_TYPED_EXACT_RELS
+        and path.rstrip("/") not in safe_ledger_ancestor_dir_rels
     }
     if new_status_paths:
         return sorted(
@@ -461,21 +891,47 @@ def _find_unauthorized_repo_changes(
             key=lambda item: (len(Path(item).parts), item),
         )[-1]
     if before_snapshot != after_snapshot:
-        changed = sorted(set(before_snapshot) ^ set(after_snapshot))
-        if not changed:
-            changed = sorted(
+        # Issue #1502 REQUEST_CHANGES (Blocker 4): the previous
+        # implementation computed the symmetric-difference (create/delete) set
+        # first and *skipped* the metadata-changed-for-existing-paths
+        # computation whenever that symmetric difference was non-empty. That
+        # meant a "ledger create" (or any other create/delete) happening in
+        # the same invocation as an existing sibling's *content* update (same
+        # path, different mtime/size) would silently drop the sibling update
+        # from the diff. Always compute the union of both: paths that
+        # appeared/disappeared, and paths that exist on both sides but whose
+        # snapshot value differs.
+        before_paths = set(before_snapshot)
+        after_paths = set(after_snapshot)
+        changed = sorted(
+            (before_paths ^ after_paths)
+            | {
                 path
-                for path in before_snapshot.keys() & after_snapshot.keys()
+                for path in before_paths & after_paths
                 if before_snapshot[path] != after_snapshot[path]
-            )
-        return (
-            sorted(
-                changed,
+            }
+        )
+        # Issue #1502: the stable-exact ledger path is already authorized
+        # above (regular -> regular content changes are expected peer
+        # writes); the two transient `.lock` / `.tmp` paths are validated
+        # separately via bounded quiescence before this function runs; and a
+        # first-ever `absent -> regular` ledger transition also creates new
+        # ancestor directory-node entries (`artifacts`, `artifacts/codex`)
+        # that are a side effect of the already-authorized transition, not an
+        # independent change. Drop all of these from the generic diff so an
+        # authorized peer write is never reported as an unauthorized_write_path
+        # false positive.
+        filtered_changed = [
+            item
+            for item in changed
+            if item not in _LEDGER_TYPED_EXACT_RELS and item not in safe_ledger_ancestor_dir_rels
+        ]
+        if filtered_changed:
+            return sorted(
+                filtered_changed,
                 key=lambda item: (len(Path(item).parts), item),
             )[-1]
-            if changed
-            else "snapshot_drift"
-        )
+        return None
     return None
 
 
@@ -584,6 +1040,17 @@ def _emit_unauthorized_write_failure(issue_number: int, unauthorized_path: str) 
         f"reason_code=unauthorized_write_path target_issue={issue_number} "
         f"unauthorized write path={unauthorized_path} "
         "recovery=do_not_write_outside_allowed_root",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _emit_ledger_transient_residue_failure(issue_number: int, stale_paths: list[str]) -> int:
+    print(
+        "SKILL_RUNTIME_FAIL: "
+        f"reason_code=ledger_transient_residue_timeout target_issue={issue_number} "
+        f"stale_path={','.join(sorted(stale_paths))} "
+        "recovery=investigate_concurrent_ledger_writer_lock_or_temp_not_released",
         file=sys.stderr,
     )
     return 2
@@ -711,6 +1178,13 @@ def main(argv: list[str] | None = None) -> int:
     _validate_runtime_context(project_root, args)
     before_snapshot = _snapshot_repo_paths(project_root, str(args.issue_number))
     before_status = _git_status_paths(project_root)
+    ledger_before_kinds = _ledger_exact_kinds(project_root)
+    ledger_ancestor_before_kinds = _ledger_ancestor_kinds(project_root)
+    ledger_before_bytes = (
+        _read_bytes_or_none(Path(project_root) / _LEDGER_STABLE_EXACT_REL)
+        if ledger_before_kinds.get(_LEDGER_STABLE_EXACT_REL) == "regular"
+        else None
+    )
 
     entry = load_registry_entry(args.command_id, project_root)
     validate_registry_entry(args.command_id, entry, str(args.issue_number))
@@ -761,11 +1235,23 @@ def main(argv: list[str] | None = None) -> int:
     except subprocess.TimeoutExpired:
         return _emit_timeout_failure(args.issue_number, timeout_seconds)
 
+    # Issue #1502 AC3: wait a bounded window for the writer's own `.lock` /
+    # `.tmp` transient protocol entries to vanish before evaluating the
+    # generic diff. This must run before `_find_unauthorized_repo_changes`
+    # takes its "after" snapshot, so quiescent peer writes never appear as
+    # residue in that snapshot.
+    stale_transient = _wait_for_ledger_transient_quiescence(project_root)
+    if stale_transient:
+        return _emit_ledger_transient_residue_failure(args.issue_number, stale_transient)
+
     unauthorized_path = _find_unauthorized_repo_changes(
         project_root,
         str(args.issue_number),
         before_snapshot,
         before_status,
+        ledger_before_kinds,
+        ledger_before_bytes,
+        ledger_ancestor_before_kinds,
     )
     if unauthorized_path is not None:
         return _emit_unauthorized_write_failure(args.issue_number, unauthorized_path)
