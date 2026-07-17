@@ -2075,7 +2075,16 @@ def _readback_contract_snapshot(
         # boundary. It must apply the same trusted_only=True gate as every
         # other consumer -- an untrusted comment must never be treated as an
         # authoritative snapshot readback here either.
-        snapshot = parser_mod.find_latest_go(results, trusted_only=True)
+        authoritative_go = getattr(parser_mod, "find_latest_authoritative_go", None)
+        if callable(authoritative_go):
+            snapshot = authoritative_go(results)
+        else:
+            try:
+                snapshot = parser_mod.find_latest_go(
+                    results, trusted_only=True, fingerprint_ready_only=True
+                )
+            except TypeError:  # legacy test-double only; production parser has the predicate
+                snapshot = parser_mod.find_latest_go(results, trusted_only=True)
         if snapshot is None or not ensure_mod.is_go_current(snapshot, expected_body_sha256):
             return {"error": "remote_contract_snapshot_not_current"}
 

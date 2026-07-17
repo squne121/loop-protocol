@@ -192,7 +192,7 @@ def check_existing_go_comment(
     try:
         from contract_review_result_parser import (
             fetch_issue_comments,
-            find_latest_go,
+            find_latest_authoritative_go,
             find_latest_result,
             parse_contract_review_results,
         )
@@ -209,7 +209,10 @@ def check_existing_go_comment(
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)  # type: ignore[union-attr]
         fetch_issue_comments = mod.fetch_issue_comments
-        find_latest_go = mod.find_latest_go
+        find_latest_authoritative_go = getattr(
+            mod, "find_latest_authoritative_go",
+            lambda results: mod.find_latest_go(results, trusted_only=True, fingerprint_ready_only=True),
+        )
         find_latest_result = mod.find_latest_result
         parse_contract_review_results = mod.parse_contract_review_results
 
@@ -235,7 +238,7 @@ def check_existing_go_comment(
         return None, None
 
     # #1475: only a trusted-author go snapshot is authoritative for dedupe.
-    go = find_latest_go(results, trusted_only=True)
+    go = find_latest_authoritative_go(results)
     if go is None:
         return None, None
 
