@@ -399,6 +399,8 @@ invocation_id: <INVOCATION_ID>
 
 runner は `ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1` marker を stdout に返す。
 
+**内部実装（Issue #1547）**: `scope-rollup-runner` は内部で `scope_rollup.run` exact executor（`uv run python3 scripts/agent-guards/run_scope_rollup_preflight.py --issue-number <issue_number> --repo <repo>`）を単一 transaction として呼び出す。GitHub read-only inventory 取得・pagination 完走判定・SHA256/count 計算・planner 呼び出し・result finalize はすべてこの exact executor 内で shell redirect なしに完結し、`local_main_branch_guard.py` はこの exact invocation のみを canonical root context で allow する（raw `gh ... > /tmp/...` は引き続き block）。この Step の外部契約（`ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1` marker schema・`invocation_id` 生成手順・Step 順序）自体は変更しない。
+
 ### ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 仕様
 
 runner が返す marker のスキーマ（ref-based 設計）:
@@ -423,7 +425,7 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
     pr_count: <int>
   result:
     plan_schema: "ISSUE_SCOPE_ROLLUP_PLAN_V2"
-    raw_plan_location: "/tmp/scope_rollup_<invocation_id>.json"
+    raw_plan_location: null  # Issue #1547 以降固定。executor-owned private invocation directory は全経路で cleanup され、永続 artifact は存在しない
     result_sha256: "<sha256>"
     verify_status: "verified|not_verified"
     suggested_actions_summary: "<1-3行の候補サマリ>"
@@ -433,7 +435,7 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
 
 `result_sha256` は `raw_plan_location` のファイルバイト列の sha256。
 
-`raw_plan_location` は runner の最終応答保存後に `main conversation` でのみ採用し、実体は `/tmp/scope_rollup_<invocation_id>.json` 等の形式を想定する。`runner` が別経路でファイルを保存する運用はしない。
+`raw_plan_location` は Issue #1547 以降 `null` 固定である。`scope_rollup.run` exact executor は executor-owned private invocation directory を success/failure/timeout の全経路で cleanup するため、`runner` が別経路でファイルを保存する運用はしない。
 
 ### main conversation の marker 検証
 

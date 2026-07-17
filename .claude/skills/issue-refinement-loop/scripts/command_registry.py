@@ -193,6 +193,38 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
         },
     },
+    # Issue #1547: scope_rollup.run exact command -- bound directly to
+    # scripts/agent-guards/run_scope_rollup_preflight.py (NOT the
+    # issue-refinement-loop skill_runtime_exec.py executor, which is
+    # hard-coded to run_refinement_preflight.py and is out of this Issue's
+    # Allowed Paths). This entry is a documentation/SSOT registration of the
+    # canonical argv shape; scope_rollup.run is dispatched directly by
+    # local_main_branch_guard.py / skill_runtime_command_policy.py, not via
+    # skill_runtime_exec.py's render_command() dispatch path.
+    "scope_rollup.run": {
+        "id": "scope_rollup.run",
+        "argv": [
+            "uv", "run", "python3",
+            "scripts/agent-guards/run_scope_rollup_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_scope_rollup_run",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "allowed_write_roots": [],
+        "network_effect": "github_read_only",
+        "stdin_contract": "none",
+        "stdout_contract": "scope_rollup_run_result/v1",
+        "timeout_seconds": 180,
+        "mutation": False,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+        },
+    },
     "plan.run": {
         "id": "plan.run",
         "argv": [
