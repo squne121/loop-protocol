@@ -42,7 +42,12 @@ _capsule_mod = _load("build_intake_capsule_binding", _SCRIPTS_DIR / "build_intak
 _ISSUE_NUMBER = 1475
 _REPO = "squne121/loop-protocol"
 _ISSUE_URL = f"https://github.com/{_REPO}/issues/{_ISSUE_NUMBER}"
-_SAMPLE_BODY = "## Test body for #1475 binding tests"
+_SAMPLE_BODY = """## Test body for #1475 binding tests
+
+## Allowed Paths
+
+- `.claude/skills/impl-review-loop/scripts/ensure_contract_snapshot.py`
+"""
 _SAMPLE_BODY_SHA256 = _ecs_mod.sha256_of(_SAMPLE_BODY)
 _SAMPLE_UPDATED_AT = "2026-07-12T00:00:00Z"
 
@@ -84,13 +89,29 @@ CONTRACT_REVIEW_RESULT_V1:
 
 def _trusted_go_comment(comment_id: int = 5001) -> dict:
     """A go comment authored by the sole allowlisted TRUSTED_CONTRACT_PUBLISHERS entry."""
-    return _go_comment(
+    comment = _go_comment(
         author=_TRUSTED_LOGIN,
         author_association=_TRUSTED_ASSOCIATION,
         comment_id=comment_id,
         author_id=_TRUSTED_AUTHOR_ID,
         author_type=_TRUSTED_TYPE,
     )
+    fingerprint = {
+        "issue_number": _ISSUE_NUMBER,
+        "contract_source_kind": "issue_comment",
+        "contract_source_id": str(comment_id),
+        "contract_body_sha256": _SAMPLE_BODY_SHA256,
+        "allowed_paths_normalized_sha256": "b" * 64,
+        "base_ref": "main",
+        "base_sha_at_snapshot": "a" * 40,
+    }
+    comment["body"] = comment["body"].replace(
+        "  body_sha256: \"" + _SAMPLE_BODY_SHA256 + "\"\n",
+        "  body_sha256: \"" + _SAMPLE_BODY_SHA256 + "\"\n"
+        "  expected_contract_fingerprint:\n"
+        + "".join(f"    {key}: {value!r}\n" for key, value in fingerprint.items()),
+    )
+    return comment
 
 
 def _make_go_review_result() -> dict:

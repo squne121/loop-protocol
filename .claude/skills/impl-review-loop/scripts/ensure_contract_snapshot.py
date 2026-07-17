@@ -872,9 +872,15 @@ def ensure_contract_snapshot(
         # candidate. Otherwise an untrusted comment posted after a trusted
         # go can still pre-empt it via the "latest blocked wins" branch below.
         latest = parser_mod.find_latest_result(results, trusted_only=True)
-        go_result = parser_mod.find_latest_go(
-            results, trusted_only=True, fingerprint_ready_only=True
-        )
+        try:
+            go_result = parser_mod.find_latest_go(
+                results, trusted_only=True, fingerprint_ready_only=True
+            )
+        except TypeError:
+            # A legacy parser/test double cannot prove fingerprint readiness.
+            # Do not fall back to its trusted-only result: absence of the
+            # predicate is non-authoritative by contract.
+            go_result = None
 
         # latest (trusted) blocked retains precedence over existing-go adoption.
         if latest and latest["status"] == "blocked":
@@ -1046,9 +1052,14 @@ def ensure_contract_snapshot(
         return result
 
     # Also check if a go comment appeared in the interim
-    go_post = parser_mod.find_latest_go(
-        results_post, trusted_only=True, fingerprint_ready_only=True
-    )
+    try:
+        go_post = parser_mod.find_latest_go(
+            results_post, trusted_only=True, fingerprint_ready_only=True
+        )
+    except TypeError:
+        # See the initial-read compatibility branch above: a parser without
+        # fingerprint-ready support remains fail-closed.
+        go_post = None
     go_post_fingerprint_ready = bool(
         go_post
         and parser_mod.is_fingerprint_ready_go(

@@ -338,6 +338,8 @@ def _parse_contract_results(
     expected_issue_url: str,
     issue_number: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    if issue_number is None:
+        issue_number = _issue_number_from_url(expected_issue_url)
     results: list[dict[str, Any]] = []
     invalid_contract_blocks_count = 0
     ambiguous_contract_blocks_count = 0
