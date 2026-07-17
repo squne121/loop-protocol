@@ -95,6 +95,18 @@ _ICR_SCRIPTS_DIR = (
 _RUN_CONTRACT_REVIEW_ONCE_PY = _ICR_SCRIPTS_DIR / "run_contract_review_once.py"
 _CONTRACT_REVIEW_RESULT_PARSER_PY = _ICR_SCRIPTS_DIR / "contract_review_result_parser.py"
 
+# #1537: single source of truth for Allowed Paths normalization / hashing,
+# shared with the reviewer's Allowed Paths gate so the fingerprint's
+# allowed_paths_normalized_sha256 is byte-for-byte reproducible by both sides.
+_PRJ_SCRIPTS_DIR = (
+    _REPO_ROOT / ".claude" / "skills" / "pr-review-judge" / "scripts"
+)
+_ALLOWED_PATHS_REVIEW_GATE_PY = _PRJ_SCRIPTS_DIR / "allowed_paths_review_gate.py"
+_BASELINE_VC_PREFLIGHT_PY = (
+    _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts"
+    / "baseline_vc_preflight.py"
+)
+
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
@@ -156,6 +168,193 @@ def _import_parser_module():
 
 def sha256_of(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Source-bound contract fingerprint (Issue #1537)
+# ---------------------------------------------------------------------------
+
+
+def _import_allowed_paths_gate_module():
+    """Import allowed_paths_review_gate from pr-review-judge scripts dir.
+
+    Single source of truth for Allowed Paths normalization/hash rules
+    (AllowedPathsMatcher, AllowedPathsGateEvaluator.compute_allowed_paths_hash)
+    so the fingerprint's allowed_paths_normalized_sha256 is computed
+    identically by producer (this module) and the reviewer's gate.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "allowed_paths_review_gate_for_ensure_contract_snapshot",
+        _ALLOWED_PATHS_REVIEW_GATE_PY,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("cannot load allowed_paths_review_gate")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    return mod
+
+
+def extract_allowed_paths_from_body(body: str) -> list[str]:
+    """Use the contract-review canonical Allowed Paths grammar."""
+    spec = importlib.util.spec_from_file_location(
+        "baseline_vc_preflight_allowed_paths", _BASELINE_VC_PREFLIGHT_PY
+    )
+    if spec is None or spec.loader is None:
+        raise ValueError("canonical_allowed_paths_extractor_unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    paths = module.extract_allowed_paths(body or "")
+    return paths if isinstance(paths, list) else []
+
+
+def _canonicalize_allowed_paths_strict(allowed_paths: list[str]) -> list[str]:
+    """Match the review gate's normalization or fail before any POST."""
+    gate_mod = _import_allowed_paths_gate_module()
+    canonicalized: list[str] = []
+    for pattern in allowed_paths:
+        normalized = gate_mod.AllowedPathsMatcher.normalize_allowed_pattern(pattern)
+        if normalized is None:
+            raise ValueError(f"invalid_allowed_path_pattern:{pattern}")
+        canonicalized.append(normalized)
+    if not canonicalized:
+        raise ValueError("allowed_paths_missing_or_empty")
+    return sorted(set(canonicalized))
+
+
+def compute_expected_contract_fingerprint(
+    *,
+    issue_number: int,
+    contract_source_id: str,
+    contract_body_sha256: str,
+    allowed_paths: list[str],
+    base_ref: str,
+    base_sha_at_snapshot: str,
+) -> dict[str, Any]:
+    """
+    Compute the 7-item expected_contract_fingerprint dict.
+
+    allowed_paths_normalized_sha256 reuses
+    AllowedPathsGateEvaluator.compute_allowed_paths_hash() verbatim (via the
+    shared AllowedPathsMatcher normalization) so it is byte-for-byte
+    reproducible by the reviewer's independent recomputation (AC4).
+    """
+    canonicalized = _canonicalize_allowed_paths_strict(allowed_paths)
+    normalized_json = json.dumps(
+        canonicalized, separators=(",", ":"), ensure_ascii=True
+    )
+    allowed_paths_hash = hashlib.sha256(normalized_json.encode()).hexdigest()
+    return {
+        "issue_number": issue_number,
+        "contract_source_kind": "issue_comment",
+        "contract_source_id": contract_source_id,
+        "contract_body_sha256": contract_body_sha256,
+        "allowed_paths_normalized_sha256": allowed_paths_hash,
+        "base_ref": base_ref,
+        "base_sha_at_snapshot": base_sha_at_snapshot,
+    }
+
+
+def capture_base_ref_and_sha(
+    repo: str, timeout: int = _DEFAULT_TIMEOUT
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Capture the repository default branch name and its current tip SHA via
+    the GitHub API, for binding a materialized snapshot's fingerprint to a
+    concrete (base_ref, base_sha_at_snapshot) pair (AC1).
+
+    Returns (base_ref, base_sha_at_snapshot); either may be None on failure
+    -- callers must treat (None, ...) or (..., None) as a capture failure and
+    must not materialize a go without both values.
+    """
+    try:
+        repo_result = subprocess.run(
+            ["gh", "api", f"repos/{repo}", "--jq", ".default_branch"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, Exception):
+        return None, None
+    if repo_result.returncode != 0:
+        return None, None
+    base_ref = repo_result.stdout.strip() or None
+    if not base_ref:
+        return None, None
+
+    try:
+        sha_result = subprocess.run(
+            ["gh", "api", f"repos/{repo}/commits/{base_ref}", "--jq", ".sha"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, Exception):
+        return base_ref, None
+    if sha_result.returncode != 0:
+        return base_ref, None
+    base_sha = sha_result.stdout.strip() or None
+    if not base_sha:
+        return base_ref, None
+
+    return base_ref, base_sha
+
+
+def patch_comment(
+    issue_number: int,
+    repo: str,
+    comment_id: int,
+    body: str,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> tuple[bool, Optional[str]]:
+    """
+    PATCH an already-posted comment's body via the GitHub REST API (AC1
+    step 2 of the two-phase materialize flow: POST provisional body, then
+    PATCH the same comment id with the final body once the real comment id
+    is known and can be embedded in expected_contract_fingerprint's
+    contract_source_id).
+
+    Returns (success, error_code_or_None).  The exact canonical UTF-8 JSON
+    payload is sent once, then the PATCH response and an independent GET are
+    both bound to that same body.  A transport timeout is reconciled by GET;
+    ambiguity remains fail-closed.
+    """
+    try:
+        payload = json.dumps({"body": body}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        result = subprocess.run(
+            [
+                "gh", "api", "--method", "PATCH",
+                f"repos/{repo}/issues/comments/{comment_id}", "--input", "-",
+            ],
+            input=payload,
+            capture_output=True,
+            timeout=timeout,
+        )
+        if result.returncode == 0:
+            try:
+                response = json.loads(result.stdout.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return False, "patch_response_invalid_json"
+            if not isinstance(response, dict) or response.get("id") != comment_id:
+                return False, "patch_response_id_mismatch"
+            if response.get("body") != body:
+                return False, "patch_response_body_mismatch"
+            ok, err = verify_controlled_publisher_comment_id_binding(
+                issue_number, repo, comment_id, expected_body_sha256=sha256_of(body), timeout=timeout
+            )
+            return (True, None) if ok else (False, f"patch_get_reconciliation_failed:{err}")
+
+        # The remote may have applied the update despite a transport error.
+        ok, _err = verify_controlled_publisher_comment_id_binding(
+            issue_number, repo, comment_id, expected_body_sha256=sha256_of(body), timeout=timeout
+        )
+        return (True, None) if ok else (False, "patch_transport_unreconciled")
+    except subprocess.TimeoutExpired:
+        ok, _err = verify_controlled_publisher_comment_id_binding(
+            issue_number, repo, comment_id, expected_body_sha256=sha256_of(body), timeout=timeout
+        )
+        return (True, None) if ok else (False, "patch_timeout_unreconciled")
+    except Exception:
+        return False, "patch_error"
 
 
 _CANONICAL_BODY_SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -673,7 +872,15 @@ def ensure_contract_snapshot(
         # candidate. Otherwise an untrusted comment posted after a trusted
         # go can still pre-empt it via the "latest blocked wins" branch below.
         latest = parser_mod.find_latest_result(results, trusted_only=True)
-        go_result = parser_mod.find_latest_go(results, trusted_only=True)
+        try:
+            go_result = parser_mod.find_latest_go(
+                results, trusted_only=True, fingerprint_ready_only=True
+            )
+        except TypeError:
+            # A legacy parser/test double cannot prove fingerprint readiness.
+            # Do not fall back to its trusted-only result: absence of the
+            # predicate is non-authoritative by contract.
+            go_result = None
 
         # latest (trusted) blocked retains precedence over existing-go adoption.
         if latest and latest["status"] == "blocked":
@@ -684,7 +891,16 @@ def ensure_contract_snapshot(
 
         # #1475: parser_mod.find_latest_go(..., trusted_only=True) above already
         # excludes untrusted-author results; is_go_current only re-checks freshness.
-        if not is_go_current(go_result, body_sha256):
+        # #1537: an existing go lacking a well-formed source-bound
+        # expected_contract_fingerprint must never be reused as current --
+        # fall through to (re-)materialization instead.
+        fingerprint_ready = bool(
+            go_result
+            and parser_mod.is_fingerprint_ready_go(
+                go_result.get("inner", {}), go_result.get("comment_id"), issue_number
+            )
+        )
+        if not is_go_current(go_result, body_sha256) or not fingerprint_ready:
             break
 
         body_confirm, updated_confirm, confirm_err = fetch_issue_snapshot(issue_number, repo)
@@ -836,8 +1052,21 @@ def ensure_contract_snapshot(
         return result
 
     # Also check if a go comment appeared in the interim
-    go_post = parser_mod.find_latest_go(results_post, trusted_only=True)
-    if is_go_current(go_post, body_sha256_post):
+    try:
+        go_post = parser_mod.find_latest_go(
+            results_post, trusted_only=True, fingerprint_ready_only=True
+        )
+    except TypeError:
+        # See the initial-read compatibility branch above: a parser without
+        # fingerprint-ready support remains fail-closed.
+        go_post = None
+    go_post_fingerprint_ready = bool(
+        go_post
+        and parser_mod.is_fingerprint_ready_go(
+            go_post.get("inner", {}), go_post.get("comment_id"), issue_number
+        )
+    )
+    if is_go_current(go_post, body_sha256_post) and go_post_fingerprint_ready:
         body_dedupe, _updated_dedupe, dedupe_err = fetch_issue_snapshot(
             issue_number, repo
         )
@@ -862,7 +1091,34 @@ def ensure_contract_snapshot(
         )
         return result
 
-    # Build comment to post (B6: include checks summary)
+    # #1537 AC1: capture the fingerprint's (base_ref, base_sha_at_snapshot)
+    # binding before materializing. If either cannot be captured, do not
+    # post a go at all -- fail closed rather than emit a fingerprint bound to
+    # an unknown/incomplete base.
+    base_ref, base_sha_at_snapshot = capture_base_ref_and_sha(repo)
+    if not base_ref or not base_sha_at_snapshot:
+        result["status"] = "runtime_error"
+        result["errors"].append(
+            "base_ref_or_base_sha_capture_failed: cannot materialize a "
+            "source-bound fingerprint without both values"
+        )
+        return result
+    try:
+        allowed_paths_at_post = extract_allowed_paths_from_body(body_post or "")
+        # Validate before POST; a malformed contract must not create even a
+        # provisional remote comment.
+        _canonicalize_allowed_paths_strict(allowed_paths_at_post)
+    except ValueError as exc:
+        result["status"] = "runtime_error"
+        result["errors"].append(f"allowed_paths_pre_post_validation_failed:{exc}")
+        return result
+
+    # Build comment to post (B6: include checks summary).
+    # #1537 AC1 (two-phase materialize, step 1): the provisional body omits
+    # expected_contract_fingerprint -- contract_source_id (the real GitHub
+    # comment id) cannot be known before POST. A comment lacking the
+    # fingerprint is never treated as fingerprint-ready by parsers/gates
+    # (fail-closed), so this window is safe even if read concurrently.
     comment_body = _build_contract_review_comment(
         issue_number=issue_number,
         repo=repo,
@@ -896,6 +1152,52 @@ def ensure_contract_snapshot(
                 f"controlled_publisher_binding_failed: {binding_err}"
             )
             return result
+
+        # #1537 AC1 (two-phase materialize, step 2): the real comment id is
+        # now confirmed via independent read-back. Compute the source-bound
+        # fingerprint using that confirmed id as contract_source_id, then
+        # PATCH the SAME comment with a final body embedding it, and
+        # re-verify via a second independent read-back before treating the
+        # snapshot as authoritative.
+        expected_contract_fingerprint = compute_expected_contract_fingerprint(
+            issue_number=issue_number,
+            contract_source_id=str(expected_comment_id),
+            contract_body_sha256=body_sha256,
+            allowed_paths=allowed_paths_at_post,
+            base_ref=base_ref,
+            base_sha_at_snapshot=base_sha_at_snapshot,
+        )
+        final_comment_body = _build_contract_review_comment(
+            issue_number=issue_number,
+            repo=repo,
+            review_result=review_result,
+            idempotency_marker=idempotency_marker,
+            body_sha256=body_sha256,
+            expected_contract_fingerprint=expected_contract_fingerprint,
+        )
+        patch_ok, patch_err = patch_comment(
+            issue_number, repo, expected_comment_id, final_comment_body
+        )
+        if not patch_ok:
+            result["status"] = "controlled_publisher_binding_failed"
+            result["contract_snapshot_url"] = None
+            result["errors"].append(f"fingerprint_patch_failed: {patch_err}")
+            return result
+
+        final_bound_ok, final_binding_err = verify_controlled_publisher_comment_id_binding(
+            issue_number,
+            repo,
+            expected_comment_id,
+            expected_body_sha256=sha256_of(final_comment_body),
+        )
+        if not final_bound_ok:
+            result["status"] = "controlled_publisher_binding_failed"
+            result["contract_snapshot_url"] = None
+            result["errors"].append(
+                f"fingerprint_patch_binding_failed: {final_binding_err}"
+            )
+            return result
+
         # B3: status: ok only when contract_snapshot_url is non-null
         result["status"] = "ok"
         result["source"] = "materialized_go"
@@ -924,10 +1226,17 @@ def _build_contract_review_comment(
     review_result: dict,
     idempotency_marker: str,
     body_sha256: str,
+    expected_contract_fingerprint: Optional[dict[str, Any]] = None,
 ) -> str:
     """
     Build the GitHub comment body for contract review posting.
     Includes checks summary (B6).
+
+    expected_contract_fingerprint (#1537): when provided, embeds the
+    source-bound 7-item fingerprint as a sibling key of CONTRACT_REVIEW_RESULT_V1.
+    Left as None for the step-1 provisional POST (the real comment id is not
+    known yet).  That POST is deliberately a pending-only schema, never a
+    syntactically valid CONTRACT_REVIEW_RESULT_V1.
     """
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     owner_repo = repo.split("/")
@@ -936,6 +1245,17 @@ def _build_contract_review_comment(
         if len(owner_repo) == 2
         else ""
     )
+
+    if expected_contract_fingerprint is None:
+        return f"""{idempotency_marker}
+
+```yaml
+CONTRACT_SNAPSHOT_MATERIALIZATION_PENDING_V1:
+  issue_number: {issue_number}
+  body_sha256: \"{body_sha256}\"
+  phase: awaiting_comment_id_binding
+```
+"""
 
     # B6: Build checks summary from review_result
     checks = review_result.get("checks", {}) or {}
@@ -958,6 +1278,11 @@ def _build_contract_review_comment(
         vc_preflight_classifications, ensure_ascii=False, separators=(",", ":")
     )
 
+    fingerprint_json = json.dumps(
+        expected_contract_fingerprint, ensure_ascii=False, separators=(",", ":")
+    )
+    fingerprint_yaml = f"\n  expected_contract_fingerprint: {fingerprint_json}"
+
     return f"""{idempotency_marker}
 
 ## Contract Review Result
@@ -977,7 +1302,7 @@ CONTRACT_REVIEW_RESULT_V1:
     vc_preflight:
       decision: {vc_preflight_check}
       classifications: {classifications_json}
-  source: ensure_contract_snapshot_auto
+  source: ensure_contract_snapshot_auto{fingerprint_yaml}
 ```
 """
 

@@ -247,6 +247,125 @@ def is_trusted_snapshot_author(
 
 
 # ---------------------------------------------------------------------------
+# Source-bound contract fingerprint (Issue #1537)
+# ---------------------------------------------------------------------------
+
+# The 7-item fingerprint schema. Must stay identical to
+# pr-review-judge/scripts/allowed_paths_review_gate.py ContractFingerprint --
+# both producer (ensure_contract_snapshot.py) and consumer (this parser, the
+# reviewer gate) must agree on the same key set for source-bound freshness
+# comparison to be meaningful.
+_FINGERPRINT_REQUIRED_KEYS = (
+    "issue_number",
+    "contract_source_kind",
+    "contract_source_id",
+    "contract_body_sha256",
+    "allowed_paths_normalized_sha256",
+    "base_ref",
+    "base_sha_at_snapshot",
+)
+
+# contract_body_sha256 follows the repo-wide `sha256:<64 hex>` convention used
+# by body_sha256 elsewhere in this schema (ensure_contract_snapshot.sha256_of).
+_PREFIXED_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+# allowed_paths_normalized_sha256 must byte-for-byte match
+# AllowedPathsGateEvaluator.compute_allowed_paths_hash(), which returns a bare
+# hex digest with NO "sha256:" prefix -- do not add one here.
+_BARE_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_FULL_COMMIT_OID_RE = re.compile(r"^[0-9a-f]{40,64}$")
+
+_ISSUE_NUMBER_FROM_URL_RE = re.compile(r"/issues/(\d+)\Z")
+
+
+def _issue_number_from_url(issue_url: Optional[str]) -> Optional[int]:
+    """Extract the trailing issue number from a GitHub issue URL."""
+    if not issue_url:
+        return None
+    m = _ISSUE_NUMBER_FROM_URL_RE.search(issue_url)
+    return int(m.group(1)) if m else None
+
+
+def is_fingerprint_ready_go(
+    inner: Any,
+    comment_id: Optional[int] = None,
+    issue_number: Optional[int] = None,
+) -> bool:
+    """
+    Return whether a parsed CONTRACT_REVIEW_RESULT_V1 `inner` block carries a
+    well-formed, source-bound `expected_contract_fingerprint` (Issue #1537).
+
+    Fail-closed: any missing key, wrong type, malformed hash, or mismatch
+    between the fingerprint's self-declared contract_source_id / issue_number
+    and the actual comment / issue this block was read from makes the result
+    NOT fingerprint-ready (False), regardless of `status`. `comment_id` /
+    `issue_number` are independent authorities (the real GitHub comment id
+    the block was parsed from, and the issue this parse run is scoped to) --
+    when supplied they are cross-checked against the fingerprint's own
+    self-reported values rather than trusted at face value.
+    """
+    if (
+        isinstance(comment_id, bool)
+        or not isinstance(comment_id, int)
+        or comment_id <= 0
+        or isinstance(issue_number, bool)
+        or not isinstance(issue_number, int)
+        or issue_number <= 0
+    ):
+        return False
+    if not isinstance(inner, dict):
+        return False
+    fingerprint = inner.get("expected_contract_fingerprint")
+    if not isinstance(fingerprint, dict):
+        return False
+    if set(fingerprint) != set(_FINGERPRINT_REQUIRED_KEYS):
+        return False
+
+    fp_issue_number = fingerprint.get("issue_number")
+    if isinstance(fp_issue_number, bool) or not isinstance(fp_issue_number, int):
+        return False
+    if fp_issue_number <= 0:
+        return False
+    if fp_issue_number != issue_number:
+        return False
+
+    if fingerprint.get("contract_source_kind") != "issue_comment":
+        return False
+
+    contract_source_id = fingerprint.get("contract_source_id")
+    if not isinstance(contract_source_id, str) or not contract_source_id.isdigit():
+        return False
+    if str(comment_id) != contract_source_id:
+        return False
+
+    contract_body_sha256 = fingerprint.get("contract_body_sha256")
+    if not isinstance(contract_body_sha256, str) or not _PREFIXED_SHA256_RE.fullmatch(
+        contract_body_sha256
+    ):
+        return False
+    if contract_body_sha256 != inner.get("body_sha256"):
+        return False
+
+    allowed_paths_hash = fingerprint.get("allowed_paths_normalized_sha256")
+    if not isinstance(allowed_paths_hash, str) or not _BARE_SHA256_RE.fullmatch(
+        allowed_paths_hash
+    ):
+        return False
+
+    base_ref = fingerprint.get("base_ref")
+    if not isinstance(base_ref, str) or not base_ref:
+        return False
+
+    base_sha_at_snapshot = fingerprint.get("base_sha_at_snapshot")
+    if not isinstance(base_sha_at_snapshot, str) or not _FULL_COMMIT_OID_RE.fullmatch(
+        base_sha_at_snapshot
+    ):
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 
@@ -356,6 +475,11 @@ def parse_contract_review_results(
                             author_id=author_id,
                             author_type=author_type,
                         ),
+                        "is_fingerprint_ready": is_fingerprint_ready_go(
+                            inner,
+                            comment.get("id"),
+                            _issue_number_from_url(expected_issue_url),
+                        ),
                     }
                 )
                 # Only take first valid block per comment
@@ -384,6 +508,7 @@ def find_latest_go(
     results: list[dict],
     *,
     trusted_only: bool = False,
+    fingerprint_ready_only: bool = False,
 ) -> Optional[dict]:
     """
     Return the latest (by created_at desc, comment_id desc) valid
@@ -393,15 +518,34 @@ def find_latest_go(
     trusted_only (#1475): when True, results whose is_trusted_author is not
     True are excluded from candidacy. A schema-valid but untrusted
     `status: go` is never returned as authoritative when trusted_only=True.
+
+    fingerprint_ready_only (#1537): when True, results whose
+    is_fingerprint_ready is not True are excluded from candidacy. A
+    schema-valid, trusted `status: go` that lacks a well-formed source-bound
+    expected_contract_fingerprint is never returned as loop-consumable when
+    fingerprint_ready_only=True -- callers must re-materialize instead.
     """
     go_results = [r for r in results if r["status"] == "go"]
     if trusted_only:
         go_results = filter_authoritative_results(go_results)
+    if fingerprint_ready_only:
+        go_results = [r for r in go_results if r.get("is_fingerprint_ready") is True]
     if not go_results:
         return None
     # Sort by created_at desc, then comment_id desc
     go_results.sort(key=lambda r: (r.get("created_at", ""), r.get("comment_id", 0)), reverse=True)
     return go_results[0]
+
+
+def find_latest_authoritative_go(results: list[dict]) -> Optional[dict]:
+    """Return the single loop-consumable GO candidate.
+
+    Trusted-but-provisional/orphan comments are intentionally excluded here.
+    All authoritative consumers must use this predicate.
+    """
+    return find_latest_go(
+        results, trusted_only=True, fingerprint_ready_only=True
+    )
 
 
 def find_latest_result(
