@@ -1804,34 +1804,66 @@ ledger 関連パスは以下の 4 分類のうち後半 2 分類として、exac
    （`skill_runtime_exec.py` の `_LEDGER_STABLE_EXACT_REL`）。owner は
    `scripts/subagent-launch-ledger-writer.c`。canonical であり、consumer（他 skill /
    validator）が読む唯一の正本。許可される状態遷移は `absent -> regular` と
-   `regular -> regular` のみ（`_is_allowed_stable_ledger_transition`）。delete
-   （`regular -> absent`）、symlink、directory、FIFO、socket、device への置換は、
-   before-kind に関わらずすべて fail-close する。
+   `regular -> regular` のみ（`_is_allowed_stable_ledger_transition`。厳密な allow-tuple
+   一致で判定し、`before_kind` を問わず `after_kind == "regular"` なら常に許可するような
+   実装は禁止 -- symlink/directory/FIFO/socket/device からの `-> regular` 置換は明示的に
+   拒否する）。delete（`regular -> absent`）、symlink、directory、FIFO、socket、device への
+   置換は、before-kind に関わらずすべて fail-close する。`regular -> regular` はさらに型
+   だけでなく内容も検証する（`_is_authorized_ledger_content_transition`）:
+   before/after 双方が有効な `SUBAGENT_LAUNCH_LEDGER_V1` ドキュメントであること、
+   `ledger_schema` / `generated_by` / `coverage_scope` が不変であること、`launches` /
+   `root_thread_actions` が既存エントリを一切削除・変更しない append-only であることを
+   要求する。malformed content への置換や既存エントリの削除・改変は、型としては
+   `regular -> regular` で authorized でも content 検証で fail-close する。
 3. **transient protocol entries**: `artifacts/codex/subagent-launch-ledger.json.lock` /
    `.tmp`（`_LEDGER_TRANSIENT_EXACT_RELS`）。owner は同じ native writer。writer 自身の
    単一呼び出しの間だけ存在する非 canonical な一時プロトコルエントリであり、consumer は
    これらを直接読まない。executor は子プロセス終了後、bounded quiescence window
    （既定 2 秒、50ms ポーリング。`_wait_for_ledger_transient_quiescence`）の間だけこれらの
-   消滅を待つ。window 内に消えれば無視し、window 経過後もなお残っていれば stale residue
-   として fail-close する（`reason_code=ledger_transient_residue_timeout`）。stale lock/temp
-   を executor が自動削除することはない。
-4. **build/runtime executable artifact**: 前節の content-addressed cache binary
-   （`os.tmpdir()/loop-protocol-subagent-ledger-writer-cache/<sha256>-ledger-writer`）。
-   repo snapshot 外にあるため、この分類は `skill_runtime_exec.py` の snapshot/status diff
-   に一切現れない（除外ロジックを必要としない）。
+   消滅を待つ。単発の空 poll だけでは quiescence とみなさず、短い confirm interval
+   （既定 0.1 秒）を空けて再度空であることを確認できた場合のみ成功とする
+   （TOCTOU: 単発 poll と呼び出し元の後続 snapshot 取得の間に late-arriving な
+   lock/tmp が現れるケースを取りこぼさないため）。window 内に確認できずに消えれば無視し、
+   window 経過後もなお残っていれば stale residue として fail-close する
+   （`reason_code=ledger_transient_residue_timeout`）。stale lock/temp を executor が
+   自動削除することはない。
+4. **build/runtime executable artifact**: `check-codex-agents.mjs` の
+   `ensureLedgerWriter()` が invocation ごとに `fs.mkdtempSync` で作る private work
+   directory 配下のコンパイル済みバイナリ。共有・content-addressed な warm cache は
+   廃止した（Issue #1502 REQUEST_CHANGES）: 予測可能なキャッシュパスに他プロセスが
+   先回りで実行ファイルを配置できる TOCTOU / cache poisoning を防ぐため、毎回
+   `os.tmpdir()` が repo 外の絶対パスであることを検証したうえで一意なディレクトリを
+   作成し、読み取り済みの `sourceBytes` をそのディレクトリ内の private source file へ
+   書き出してコンパイルし（`ledgerWriterSource` を pathname で再オープンしない）、
+   子プロセス終了後に private directory ごと削除する。repo snapshot 外にあるため、
+   この分類は `skill_runtime_exec.py` の snapshot/status diff に一切現れない
+   （除外ロジックを必要としない）。
 
 上記 3・4 に属さない `artifacts/codex/` 配下の他ファイル（sibling）は、この型付きポリシーの
 対象外であり、通常の repo-wide snapshot/status diff がそのまま適用される。したがって
 sibling の新規作成・更新・削除・rename は、既存の metadata/status model で観測可能な限り
 引き続き fail-close する（Out of Scope: `artifacts/codex/` の directory-wide exclusion は
-行わない）。
+行わない）。symmetric-difference（create/delete）の delta 集合と、既存 path の
+metadata-changed 集合は union で合成する。片方が非空でももう片方の計算をスキップしない
+（mixed delta: ledger の新規作成と既存 sibling の更新が同一 invocation で同時に起きても、
+sibling 側の更新差分を取りこぼさない）。
+
+ledger の ancestor directory node（`artifacts`、`artifacts/codex`）の exemption も
+postcondition だけでなく before-kind を snapshot して判定する。許可される ancestor 遷移は
+`absent -> dir` と `dir -> dir` のみで、shallow から順に判定し、chain 内のどこかで
+不許可な遷移が見つかった時点で、それより深い rel も safe set から除外する（parent が
+symlink や plain file から real directory へ置換された場合、その parent 配下の deeper rel
+単体の before/after だけを見ると `absent -> dir` に見えてしまうため、chain 全体の
+安全性が伝播しないと見逃す）。
 
 **stdlib snapshot mode の保証限界**: 本節の型付き遷移判定は「race-tolerant stdlib mode」
 （前述）の一部であり、mtime/size ベースの metadata 比較を用いる。cooperating/trusted な
 child process 自身による exact-ledger self-write（例えば正規 writer 以外のプロセスが
 同じ内容で ledger を書き戻す byte-preserving update）を完全には attribution できない
 （誰が書いたかを厳密に特定できない）。したがって、内容が変わらない `regular -> regular`
-の byte-preserving update を検出しないことは既知の制限として受容する。strict な
+の byte-preserving update を検出しないことは既知の制限として受容する（本文書の
+content-transition 検証はあくまで「内容が変化した場合」に適用され、無変更の
+byte-preserving update 自体を新たに検出可能にするものではない）。strict な
 process-level attribution（`strace` 等による OS-level trace）は本節の対象外であり、
 `#1363`（Linux-only optional strict trace attribution mode、OPEN）が handoff 先である。
 

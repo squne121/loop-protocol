@@ -21,16 +21,32 @@ const hooksPath = path.join(repoRoot, '.codex', 'hooks.json');
 const rulesPath = path.join(repoRoot, '.codex', 'rules', 'default.rules');
 const ledgerPath = path.join(repoRoot, 'artifacts', 'codex', 'subagent-launch-ledger.json');
 const ledgerWriterSource = path.join(repoRoot, 'scripts', 'subagent-launch-ledger-writer.c');
-// Issue #1502: the compiled writer binary lives in a content-addressed cache
-// *outside* the repo snapshot (under the OS temp directory), never under a
-// repo-tracked-or-untracked path such as `tmp/`. This is deliberate: a
-// per-invocation repo-local build artifact (the pre-#1502 `tmp/subagent-
-// launch-ledger-writer*` scheme) made every cold/warm hook invocation look
-// like a self-write outside the executor's allowed_write_roots, which is
-// exactly the anchor-bound preflight false positive this Issue closes.
+// Issue #1502: the compiled writer binary is built fresh, per invocation,
+// into a private `fs.mkdtempSync` directory *outside* the repo snapshot
+// (under the OS temp directory), never under a repo-tracked-or-untracked
+// path such as `tmp/`. This is deliberate: a per-invocation repo-local build
+// artifact (the pre-#1502 `tmp/subagent-launch-ledger-writer*` scheme) made
+// every cold/warm hook invocation look like a self-write outside the
+// executor's allowed_write_roots, which is exactly the anchor-bound
+// preflight false positive this Issue closes.
 // Repo-local `tmp/subagent-launch-ledger-writer*` must never be reintroduced
 // as a race-tolerant exception (Out of Scope / Stop Condition).
-const ledgerWriterCacheDir = path.join(os.tmpdir(), 'loop-protocol-subagent-ledger-writer-cache');
+//
+// Issue #1502 REQUEST_CHANGES (Blocker 1): a *shared*, content-addressed,
+// predictable-path warm cache (`<tmpdir>/loop-protocol-subagent-ledger-
+// writer-cache/<sha256>-ledger-writer`) was previously reused across
+// invocations after only checking "not a symlink, owner-executable" on the
+// cached file itself. Any co-uid process that could write into that shared
+// cache directory first could plant an executable there ahead of the real
+// compile (TOCTOU / cache poisoning), and `TMPDIR` was inherited unchanged
+// into the child environment, so `TMPDIR=<repo>/tmp` could silently move the
+// "outside the repo" cache back inside it. The shared warm cache is
+// abolished: every invocation validates that `os.tmpdir()` is genuinely
+// outside the repo, creates a brand-new unique directory via
+// `fs.mkdtempSync`, compiles a *private* copy of the exact `sourceBytes`
+// just read (never reopening `ledgerWriterSource` by pathname again), runs
+// that private binary, and deletes the whole private directory afterward.
+const ledgerWriterPrivateDirPrefix = 'loop-protocol-ledger-writer-';
 const sourceRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const fixtureRuntimeContractPath = path.join(repoRoot, 'tests', 'fixtures', 'codex-agent-config', 'expected-runtime-contract.json');
 const runtimeContractPath = fs.existsSync(fixtureRuntimeContractPath)
@@ -876,45 +892,115 @@ function parseHookInput() {
   }
 }
 
+// Issue #1502 REQUEST_CHANGES (Blocker 1): tracks the single private
+// work directory created by the in-flight `ensureLedgerWriter()` call (if
+// any) so `writeLedgerEntry` can delete it once the child process has
+// exited, regardless of success or failure. There is at most one pending
+// work directory at a time -- `writeLedgerEntry` is not re-entrant.
+let _pendingLedgerWriterWorkDir = null;
+
+function _cleanupPendingLedgerWriterWorkDir() {
+  if (_pendingLedgerWriterWorkDir) {
+    fs.rmSync(_pendingLedgerWriterWorkDir, { recursive: true, force: true });
+    _pendingLedgerWriterWorkDir = null;
+  }
+}
+
+// Issue #1502 REQUEST_CHANGES (Blocker 1): validate that the OS temp root
+// the private build directory will be created under is safe to trust,
+// *before* creating anything there. Three independent checks:
+//   1. an inherited `TMPDIR` env var must be an absolute path (a relative
+//      value would resolve against an unpredictable/attacker-influenced
+//      cwd);
+//   2. `os.tmpdir()` (which honors `TMPDIR`), fully symlink-resolved via
+//      `fs.realpathSync`, must not be the repo root or any path under it --
+//      this also transitively rejects "symlink indirection into the repo"
+//      because `realpathSync` resolves every symlink hop to its final
+//      target;
+//   3. the resolved temp root's own mode must not be world/group-writable
+//      without the sticky bit (mirrors the standard `/tmp`-safety
+//      precondition used by `mktemp`-family tooling: a world/group-writable
+//      directory without the sticky bit lets any other same-machine process
+//      rename/replace another user's -- or another same-uid session's --
+//      entries out from under it, regardless of who currently owns the
+//      directory node itself).
+function _assertLedgerWriterTmpRootSafe() {
+  const tmpdirEnv = process.env.TMPDIR;
+  if (tmpdirEnv !== undefined && tmpdirEnv !== '' && !path.isAbsolute(tmpdirEnv)) {
+    throw new Error('ledger_writer_tmpdir_env_relative');
+  }
+  const rawTmpRoot = os.tmpdir();
+  if (!path.isAbsolute(rawTmpRoot)) {
+    throw new Error('ledger_writer_tmp_root_not_absolute');
+  }
+  const tmpRootReal = fs.realpathSync(rawTmpRoot);
+  const repoRootReal = fs.realpathSync(repoRoot);
+  if (tmpRootReal === repoRootReal || tmpRootReal.startsWith(repoRootReal + path.sep)) {
+    throw new Error('ledger_writer_tmp_root_inside_repo');
+  }
+  const tmpRootStat = fs.statSync(tmpRootReal);
+  const worldOrGroupWritable = (tmpRootStat.mode & 0o022) !== 0;
+  const stickyBit = (tmpRootStat.mode & 0o1000) !== 0;
+  if (worldOrGroupWritable && !stickyBit) {
+    throw new Error('ledger_writer_tmp_root_insecure_mode');
+  }
+  return tmpRootReal;
+}
+
 function ensureLedgerWriter() {
+  const tmpRootReal = _assertLedgerWriterTmpRootSafe();
+  // Read the exact source bytes once; the private source file compiled
+  // below is written from these bytes directly, never by re-opening
+  // `ledgerWriterSource` by pathname a second time (Issue #1502
+  // REQUEST_CHANGES Blocker 1: reopening the same pathname after hashing it
+  // would be a TOCTOU gap if the source file changed in between).
+  const sourceBytes = fs.readFileSync(ledgerWriterSource);
+  // Invocation-unique, unpredictable-path private directory -- never a
+  // shared, content-addressed, predictable cache location.
+  const workDir = fs.mkdtempSync(path.join(tmpRootReal, ledgerWriterPrivateDirPrefix));
+  _pendingLedgerWriterWorkDir = workDir;
   try {
-    const sourceBytes = fs.readFileSync(ledgerWriterSource);
-    const contentHash = crypto.createHash('sha256').update(sourceBytes).digest('hex');
-    fs.mkdirSync(ledgerWriterCacheDir, { recursive: true, mode: 0o700 });
-    const cacheDirStat = fs.lstatSync(ledgerWriterCacheDir);
-    if (cacheDirStat.isSymbolicLink() || !cacheDirStat.isDirectory()) throw new Error('unsafe_build_directory');
-    const cachedBinary = path.join(ledgerWriterCacheDir, `${contentHash}-ledger-writer`);
-    // Warm path: a peer session that already compiled this exact source
-    // content (by sha256) reuses the cached binary without rebuilding, so
-    // repeated hook invocations never touch the repo tree at all.
+    const workDirReal = fs.realpathSync(workDir);
+    if (workDirReal !== workDir) throw new Error('ledger_writer_workdir_symlink_component');
+    const workDirStat = fs.lstatSync(workDir);
+    if (workDirStat.isSymbolicLink() || !workDirStat.isDirectory()) throw new Error('ledger_writer_workdir_unsafe');
+    if (typeof process.getuid === 'function' && workDirStat.uid !== process.getuid()) {
+      throw new Error('ledger_writer_workdir_owner_mismatch');
+    }
+    if ((workDirStat.mode & 0o077) !== 0) throw new Error('ledger_writer_workdir_mode_unsafe');
+
+    const privateSourcePath = path.join(workDir, 'subagent-launch-ledger-writer.c');
+    fs.writeFileSync(privateSourcePath, sourceBytes, { mode: 0o600 });
+    const binaryPath = path.join(workDir, 'ledger-writer');
     try {
-      const cachedStat = fs.lstatSync(cachedBinary);
-      if (!cachedStat.isSymbolicLink() && cachedStat.isFile() && (cachedStat.mode & 0o100) !== 0) {
-        return cachedBinary;
-      }
+      execFileSync('cc', ['-std=c17', '-Wall', '-Wextra', '-Werror', '-O2', '-o', binaryPath, privateSourcePath], { stdio: 'pipe' });
     } catch {
-      // Not present yet -- fall through to cold build below.
+      throw new Error('ledger_writer_build_failed');
     }
-    const candidate = `${cachedBinary}.${process.pid}.${crypto.randomBytes(8).toString('hex')}`;
-    try {
-      execFileSync('cc', ['-std=c17', '-Wall', '-Wextra', '-Werror', '-O2', '-o', candidate, ledgerWriterSource], { stdio: 'pipe' });
-      fs.renameSync(candidate, cachedBinary);
-    } finally {
-      fs.rmSync(candidate, { force: true });
-    }
-    return cachedBinary;
-  } catch {
-    throw new Error('ledger_writer_build_failed');
+    const binaryStat = fs.lstatSync(binaryPath);
+    if (binaryStat.isSymbolicLink() || !binaryStat.isFile()) throw new Error('ledger_writer_binary_unsafe');
+    return binaryPath;
+  } catch (error) {
+    _cleanupPendingLedgerWriterWorkDir();
+    throw error;
   }
 }
 
 function writeLedgerEntry(kind, entry, identity) {
-  const result = spawnSync(ensureLedgerWriter(), [
-    '--repo', repoRoot,
-    '--kind', kind,
-    '--entry', JSON.stringify(entry),
-    '--identity', identity,
-  ], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' });
+  let result;
+  try {
+    result = spawnSync(ensureLedgerWriter(), [
+      '--repo', repoRoot,
+      '--kind', kind,
+      '--entry', JSON.stringify(entry),
+      '--identity', identity,
+    ], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' });
+  } finally {
+    // Issue #1502 REQUEST_CHANGES (Blocker 1): the private binary (and its
+    // private source copy) is deleted once the child process has exited,
+    // regardless of outcome -- it never persists as a reusable cache entry.
+    _cleanupPendingLedgerWriterWorkDir();
+  }
   if (result.error || result.status !== 0) {
     throw new Error(String(result.stderr || '').trim() || 'ledger_writer_failed');
   }

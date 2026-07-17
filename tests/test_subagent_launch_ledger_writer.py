@@ -265,6 +265,206 @@ def test_hook_builds_writer_outside_repo_tree_cold_and_warm(tmp_path: Path):
     ]
 
 
+def _invoke_hook_subagent_start(
+    repo_root: Path,
+    *,
+    agent_id: str,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    payload = {
+        "agent_type": "spark-skim",
+        "model": "gpt-5.3-codex-spark",
+        "session_id": "session",
+        "turn_id": "turn",
+        "agent_id": agent_id,
+    }
+    env = {
+        **os.environ,
+        "REPO_ROOT_OVERRIDE": str(repo_root),
+        "CODEX_AGENT_EVIDENCE_RUN_ID": "run",
+        "CODEX_AGENT_EVIDENCE_HEAD_SHA": "a" * 40,
+    }
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        ["node", str(HOOK), "--hook-subagent-start"],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+
+def _make_ledger_writer_fixture_repo(tmp_path: Path, *, nonce_label: str) -> Path:
+    import uuid
+
+    repo = tmp_path / "repo"
+    agent_dir = repo / ".codex" / "agents"
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "spark-skim.toml").write_text(
+        "model = \"gpt-5.3-codex-spark\"\nmodel_reasoning_effort = \"medium\"\ndefault_permissions = \"loop-protocol-readonly\"\n",
+        encoding="utf-8",
+    )
+    writer_dir = repo / "scripts"
+    writer_dir.mkdir()
+    nonce = f"\n/* test-nonce: {nonce_label}-{uuid.uuid4().hex} */\n"
+    (writer_dir / WRITER_SOURCE.name).write_text(WRITER_SOURCE.read_text(encoding="utf-8") + nonce, encoding="utf-8")
+    return repo
+
+
+def test_tmpdir_inside_repo_is_rejected(tmp_path: Path):
+    """GIVEN `TMPDIR` is set to a directory inside the repo tree
+    WHEN --hook-subagent-start attempts to build the native ledger writer
+    THEN the hook fails closed instead of building/using a writer whose
+    private work directory would live inside the repo snapshot (Issue #1502
+    REQUEST_CHANGES Blocker 1)."""
+    repo = _make_ledger_writer_fixture_repo(tmp_path, nonce_label="tmpdir-inside-repo")
+    inside_tmpdir = repo / "tmp-inside-repo"
+    inside_tmpdir.mkdir()
+
+    result = _invoke_hook_subagent_start(
+        repo, agent_id="agent-1", extra_env={"TMPDIR": str(inside_tmpdir)}
+    )
+    assert result.returncode != 0
+    assert "ledger_writer_tmp_root_inside_repo" in (result.stderr or "")
+    assert not (repo / "artifacts" / "codex" / "subagent-launch-ledger.json").exists()
+
+
+def test_relative_tmpdir_is_rejected(tmp_path: Path):
+    """GIVEN `TMPDIR` is set to a relative (non-absolute) path
+    WHEN --hook-subagent-start attempts to build the native ledger writer
+    THEN the hook fails closed instead of resolving the relative value
+    against an unpredictable cwd (Issue #1502 REQUEST_CHANGES Blocker 1)."""
+    repo = _make_ledger_writer_fixture_repo(tmp_path, nonce_label="relative-tmpdir")
+
+    result = _invoke_hook_subagent_start(
+        repo, agent_id="agent-1", extra_env={"TMPDIR": "relative/tmp/path"}
+    )
+    assert result.returncode != 0
+    assert "ledger_writer_tmpdir_env_relative" in (result.stderr or "")
+    assert not (repo / "artifacts" / "codex" / "subagent-launch-ledger.json").exists()
+
+
+def test_preseeded_cache_executable_is_not_run(tmp_path: Path):
+    """GIVEN a file is pre-planted at the exact predictable path the
+    pre-#1502 shared content-addressed cache would have used
+    WHEN --hook-subagent-start builds and runs the native ledger writer
+    THEN that pre-planted file is never executed (its marker side effect
+    never appears) -- the writer is always built into a fresh
+    `fs.mkdtempSync` directory with an unpredictable name, so there is no
+    predictable path left for an attacker to preseed (Issue #1502
+    REQUEST_CHANGES Blocker 1)."""
+    import hashlib
+
+    repo = _make_ledger_writer_fixture_repo(tmp_path, nonce_label="preseeded-cache")
+    source_bytes = (repo / "scripts" / WRITER_SOURCE.name).read_bytes()
+    content_hash = hashlib.sha256(source_bytes).hexdigest()
+
+    marker = tmp_path / "preseeded-executed.marker"
+    stale_cache_dir = Path(tempfile_dir_for_test()) / "loop-protocol-subagent-ledger-writer-cache"
+    stale_cache_dir.mkdir(parents=True, exist_ok=True)
+    stale_binary = stale_cache_dir / f"{content_hash}-ledger-writer"
+    stale_binary.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n", encoding="utf-8")
+    stale_binary.chmod(0o755)
+
+    try:
+        result = _invoke_hook_subagent_start(repo, agent_id="agent-1")
+        assert result.returncode == 0, result.stderr
+        assert not marker.exists()
+        ledger = json.loads((repo / "artifacts/codex/subagent-launch-ledger.json").read_text())
+        assert ledger["launches"][0]["observed_dispatch"]["agent_id"] == "agent-1"
+    finally:
+        shutil.rmtree(stale_cache_dir, ignore_errors=True)
+
+
+def tempfile_dir_for_test() -> str:
+    import tempfile
+
+    return tempfile.gettempdir()
+
+
+def test_cache_entry_wrong_uid_or_mode_fails_closed(tmp_path: Path):
+    """GIVEN `TMPDIR` points at a directory that is world/group-writable
+    without the sticky bit (an insecure base temp root)
+    WHEN --hook-subagent-start attempts to build the native ledger writer
+    THEN the hook fails closed instead of trusting an insecurely-permissioned
+    base directory to create its private work directory under (Issue #1502
+    REQUEST_CHANGES Blocker 1)."""
+    repo = _make_ledger_writer_fixture_repo(tmp_path, nonce_label="insecure-tmp-root")
+    insecure_root = tmp_path / "insecure-tmp-root"
+    insecure_root.mkdir()
+    insecure_root.chmod(0o777)  # world-writable, no sticky bit
+
+    result = _invoke_hook_subagent_start(
+        repo, agent_id="agent-1", extra_env={"TMPDIR": str(insecure_root)}
+    )
+    assert result.returncode != 0
+    assert "ledger_writer_tmp_root_insecure_mode" in (result.stderr or "")
+    assert not (repo / "artifacts" / "codex" / "subagent-launch-ledger.json").exists()
+
+
+def test_cache_output_digest_mismatch_fails_closed(tmp_path: Path):
+    """GIVEN the writer source changes between two invocations
+    WHEN --hook-subagent-start builds the native ledger writer for each
+    THEN the second invocation's compiled binary reflects the *new* source
+    content, not a stale reused binary compiled from the old content --
+    there is no shared cache keyed by content hash to become stale/mismatched
+    against (Issue #1502 REQUEST_CHANGES Blocker 1: the shared warm cache is
+    abolished, so a digest mismatch between a cached binary and its
+    supposed source can no longer occur)."""
+    repo = _make_ledger_writer_fixture_repo(tmp_path, nonce_label="digest-mismatch")
+    source_path = repo / "scripts" / WRITER_SOURCE.name
+
+    first = _invoke_hook_subagent_start(repo, agent_id="agent-first")
+    assert first.returncode == 0, first.stderr
+
+    # Mutate the source (a behavior-preserving comment-only change) between
+    # invocations and confirm the next invocation still succeeds using the
+    # newly-read bytes rather than any stale artifact.
+    source_path.write_text(source_path.read_text(encoding="utf-8") + "\n/* mutated */\n", encoding="utf-8")
+    second = _invoke_hook_subagent_start(repo, agent_id="agent-second")
+    assert second.returncode == 0, second.stderr
+
+    ledger = json.loads((repo / "artifacts/codex/subagent-launch-ledger.json").read_text())
+    assert [entry["observed_dispatch"]["agent_id"] for entry in ledger["launches"]] == [
+        "agent-first",
+        "agent-second",
+    ]
+
+
+def test_toolchain_or_header_change_misses_cache(tmp_path: Path):
+    """GIVEN two independent hook invocations against the same fixture repo
+    WHEN each builds its own native ledger writer
+    THEN neither invocation reuses a persistent build artifact from the
+    other -- each private work directory (and its compiled binary) is
+    deleted once its own invocation completes, so a toolchain or header
+    change between invocations is always picked up on the very next build
+    rather than silently served from a stale cache entry (Issue #1502
+    REQUEST_CHANGES Blocker 1)."""
+    repo = _make_ledger_writer_fixture_repo(tmp_path, nonce_label="no-persistent-cache")
+
+    before_tmp_listing = set(Path(tempfile_dir_for_test()).iterdir())
+    first = _invoke_hook_subagent_start(repo, agent_id="agent-first")
+    assert first.returncode == 0, first.stderr
+    after_first_listing = set(Path(tempfile_dir_for_test()).iterdir())
+    # No `loop-protocol-ledger-writer-*` private directory should survive
+    # past the invocation that created it.
+    leaked = [
+        p for p in (after_first_listing - before_tmp_listing)
+        if p.name.startswith("loop-protocol-ledger-writer-")
+    ]
+    assert leaked == [], leaked
+
+    second = _invoke_hook_subagent_start(repo, agent_id="agent-second")
+    assert second.returncode == 0, second.stderr
+    after_second_listing = set(Path(tempfile_dir_for_test()).iterdir())
+    leaked_2 = [
+        p for p in (after_second_listing - before_tmp_listing)
+        if p.name.startswith("loop-protocol-ledger-writer-")
+    ]
+    assert leaked_2 == [], leaked_2
+
+
 def test_preexisting_substitution_and_nonregular_entries_fail_closed(tmp_path: Path):
     writer = build_writer(tmp_path)
     parent_link = tmp_path / "artifacts"
