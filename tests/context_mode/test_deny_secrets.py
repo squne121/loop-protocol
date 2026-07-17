@@ -395,11 +395,14 @@ class TestAC2SyntheticContextModeDir:
             f"deny_list={deny_list}"
         )
 
+        # #1551: Write と Edit の permission rule を統合したため、.env への
+        # 書き込み保護は Write(.env...) または Edit(.env...) のいずれかで
+        # カバーされていればよい（意味は「書き込みから保護されていること」で不変）。
         env_write_denied = any(
-            "Write(.env" in entry for entry in deny_list
+            ("Write(.env" in entry or "Edit(.env" in entry) for entry in deny_list
         )
         assert env_write_denied, (
-            f"settings.json に .env の Write deny が設定されていません。"
+            f"settings.json に .env の Write/Edit deny が設定されていません。"
             f"deny_list={deny_list}"
         )
 
