@@ -29,7 +29,10 @@ class GateDescriptor:
 _SCRIPTS = {
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "vitest run --exclude 'tests/e2e/**' --exclude '.claude/worktrees/**' --exclude '.claude/tmp/**' --exclude 'tmp/**'",
+    "test": (
+        "vitest run --exclude 'tests/e2e/**' --exclude '.claude/worktrees/**' "
+        "--exclude '.claude/tmp/**' --exclude 'tmp/**'"
+    ),
     "build": "tsc && vite build",
     "typecheck:e2e": "tsc -p tests/e2e/tsconfig.json --noEmit",
     "lint:docs": "pnpm run lint:md && pnpm run lint:prose && pnpm run validate:roadmap-refs",
