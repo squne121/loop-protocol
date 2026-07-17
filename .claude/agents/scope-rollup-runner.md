@@ -72,7 +72,7 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   script_blob_sha256: "<unknown>"
 ```
 
-### 3. `scope_rollup.run` exact executor 実行（Issue #1547）
+### 3. `scope_rollup.run` exact executor 実行（Issue #1547 対応の最終実装ステップ）
 
 GitHub read-only inventory 取得・pagination 完走判定・SHA256/count 計算・planner 呼び出し・result finalize を、shell redirect を一切使わず単一の Python transaction として実行する `scope_rollup.run` exact executor を呼び出す:
 
@@ -170,9 +170,9 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
 
 **`plan:` フィールドは含めない**。`raw_plan_location` は Issue #1547 以降 `null` 固定（executor が private invocation directory を全経路で cleanup するため永続 artifact が存在しない）。候補詳細が必要な場合でも raw JSON を main context へ展開しない。
 
-### 8.5. Final Response Capture Contract
+### 8.5. Final Response Capture Contract（最終応答のキャプチャ契約）
 
-`SubagentStop` hook 側の capture contract:
+`SubagentStop` hook 側で定義される capture contract（キャプチャ契約の詳細）は以下の通り:
 
 ```yaml
 SCOPE_ROLLUP_CAPTURE_RESULT_V1:

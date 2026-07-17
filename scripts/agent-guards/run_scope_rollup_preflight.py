@@ -361,7 +361,15 @@ def _validate_runtime_context(project_root: str, repo: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _run_planner(project_root: str, issues_path: Path, prs_path: Path, issue_number: int, repo: str, invocation_id: str, result_path: Path) -> None:
+def _run_planner(
+    project_root: str,
+    issues_path: Path,
+    prs_path: Path,
+    issue_number: int,
+    repo: str,
+    invocation_id: str,
+    result_path: Path,
+) -> None:
     if PLAN_SCRIPT.is_symlink() or not PLAN_SCRIPT.is_file():
         raise ScopeRollupPreflightError("planner_script_invalid")
     argv = [
