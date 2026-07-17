@@ -32,7 +32,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 _AGENT_GUARDS_DIR = Path(__file__).resolve().parent
 if str(_AGENT_GUARDS_DIR) not in sys.path:
@@ -947,8 +947,115 @@ def _is_skill_runtime_executor_command(cmd: str, cwd: str, project_root: str | N
     return is_exact_skill_runtime_executor_command(cmd, cwd, project_root)
 
 
-def _looks_like_direct_issue_refinement_runtime_command(cmd: str) -> bool:
-    return ".claude/skills/issue-refinement-loop/scripts/" in cmd and "skill_runtime_exec.py" not in cmd
+_ISSUE_REFINEMENT_LOOP_SCRIPTS_REL = os.path.join(".claude", "skills", "issue-refinement-loop", "scripts")
+
+
+def _extract_launcher_script_operand(tokens: Sequence[str], cwd: str) -> tuple[str | None, str]:
+    """Extract the script operand actually executed by a supported launcher
+    grammar (Issue #1543), returning ``(script_operand, effective_cwd)``.
+
+    Supported grammars only:
+      - ``<target-script>``                       (direct exec)
+      - ``python3 [opts] <script>``                (any ``pythonX[.Y]`` name)
+      - ``uv run [opts] [--] <script>``
+      - ``uv run [opts] [--] python3 [opts] <script>``
+
+    ``uv run --directory <dir> ...`` shifts the effective cwd used to resolve
+    a relative script operand, mirroring real `uv run` behaviour. Any other
+    launcher form this classifier does not understand -- notably
+    ``python -c`` / ``-m``, stdin execution, and unrecognized wrappers --
+    returns ``(None, cwd)`` so callers fall through to the existing
+    fail-closed classification for those forms (Issue #1543 In Scope).
+    """
+    toks = list(tokens)
+    if not toks:
+        return None, cwd
+
+    idx = 0
+    effective_cwd = cwd
+
+    if toks[0] == "uv" and len(toks) > 1 and toks[1] == "run":
+        idx = 2
+        while idx < len(toks) and toks[idx].startswith("-"):
+            tok = toks[idx]
+            if tok == "--":
+                idx += 1
+                break
+            if tok == "--directory":
+                if idx + 1 >= len(toks):
+                    return None, cwd
+                value = toks[idx + 1]
+                effective_cwd = value if os.path.isabs(value) else os.path.join(cwd, value)
+                idx += 2
+                continue
+            if tok.startswith("--directory="):
+                value = tok.split("=", 1)[1]
+                effective_cwd = value if os.path.isabs(value) else os.path.join(cwd, value)
+                idx += 1
+                continue
+            # Unknown uv-run option: skip as a boolean-style flag. This
+            # classifier only claims the four grammars documented above --
+            # any other launcher shape falls through to existing
+            # fail-closed handling further down `evaluate()` (e.g.
+            # `looks_like_skill_runtime_executor_command`,
+            # `is_tmp_wrapper_or_python_c_command`).
+            idx += 1
+        if idx >= len(toks):
+            return None, cwd
+
+    if idx < len(toks) and re.fullmatch(r"python[0-9.]*", os.path.basename(toks[idx])):
+        idx += 1
+        while idx < len(toks) and toks[idx].startswith("-"):
+            opt = toks[idx]
+            if opt in ("-c", "-m"):
+                # Unsupported wrapper form (Issue #1543 In Scope) -- defer to
+                # existing fail-closed classification.
+                return None, cwd
+            idx += 1
+        if idx >= len(toks):
+            return None, cwd
+        return toks[idx], effective_cwd
+
+    return toks[idx], effective_cwd
+
+
+def _looks_like_direct_issue_refinement_runtime_command(
+    tokens: Sequence[str] | None, cwd: str, project_root: str | None = None
+) -> bool:
+    """Argv-aware classifier (Issue #1543): True iff `tokens` actually launches
+    a script under `.claude/skills/issue-refinement-loop/scripts/` as its
+    execution target -- not merely mentions the path substring somewhere in
+    an unrelated argument value (e.g. an `--allowed-paths` JSON array).
+
+    Path identity is compared via realpath normalization so `./` relative
+    forms, absolute forms, and symlink-mediated indirection all resolve to
+    the same canonical script identity.
+    """
+    if not tokens:
+        return False
+    if project_root is None:
+        project_root = _resolve_project_root(cwd)
+    if not project_root:
+        return False
+
+    script_operand, effective_cwd = _extract_launcher_script_operand(tokens, cwd)
+    if not script_operand:
+        return False
+    # skill_runtime_exec.py invocations are governed by the exact allow/deny
+    # classifiers above this call site in evaluate(); this classifier never
+    # re-decides them (defensive redundancy -- unreachable in practice given
+    # call order, but kept for explicitness).
+    if os.path.basename(script_operand) == "skill_runtime_exec.py":
+        return False
+
+    candidate = script_operand if os.path.isabs(script_operand) else os.path.join(effective_cwd, script_operand)
+    resolved = os.path.realpath(candidate)
+    target_dir = os.path.realpath(os.path.join(project_root, _ISSUE_REFINEMENT_LOOP_SCRIPTS_REL))
+    try:
+        common = os.path.commonpath([target_dir, resolved])
+    except ValueError:
+        return False
+    return common == target_dir
 
 
 def is_github_remote_ops_command(cmd: str) -> bool:
@@ -1932,7 +2039,7 @@ def evaluate(
             argv_tokens=argv_redacted,
             inner_tokens=inner_argv_redacted,
         )
-    if _looks_like_direct_issue_refinement_runtime_command(normalized_cmd):
+    if _looks_like_direct_issue_refinement_runtime_command(normalized_tokens, cwd, project_root):
         return _emit(
             status="block",
             reason_code=REASON_UNPARSEABLE,

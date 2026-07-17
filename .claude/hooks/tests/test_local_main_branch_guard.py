@@ -2280,3 +2280,113 @@ class TestIssue1291IssueMetadataMutationClaude:
                         assert "controlled_skill_mutation_exec.py" in stripped, (
                             f"forbidden tmp body-file usage at {path}:{lineno}: {stripped}"
                         )
+
+
+class TestIssue1543ArgvAwareIssueRefinementClassifier:
+    """Issue #1543: _looks_like_direct_issue_refinement_runtime_command must be
+    argv-aware (execution-target based), not a naive substring match on the
+    full raw command string."""
+
+    def test_allowed_paths_review_gate_with_issue_refinement_path_in_json_allows(self, tmp_git_repo: Path):
+        """AC1: allowed_paths_review_gate.py invoked with an --allowed-paths
+        JSON array that merely contains an issue-refinement-loop path as a
+        string VALUE (not as the executed script) must ALLOW, and must not be
+        classified via the issue_refinement_direct rule."""
+        cmd = (
+            "uv run python3 .claude/skills/pr-review-judge/scripts/allowed_paths_review_gate.py "
+            "--allowed-paths '[\"scripts/agent-guards/local_main_branch_guard.py\", "
+            "\".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py\"]'"
+        )
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["rule_id"] != "issue_refinement_direct"
+
+    def test_issue_refinement_script_as_ordinary_argument_value_does_not_block(self, tmp_git_repo: Path):
+        """AC2: the exact issue-refinement-loop script path passed as a plain
+        argument VALUE to an unrelated program must not be misclassified as a
+        direct execution target."""
+        cmd = (
+            "uv run python3 scripts/agent-ops/git_worktree_probe.py "
+            "--reference .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py"
+        )
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["rule_id"] != "issue_refinement_direct"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py "
+            "--issue-number 985 --repo squne121/loop-protocol",
+            "uv run .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py "
+            "--issue-number 985 --repo squne121/loop-protocol",
+            "uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py "
+            "--issue-number 985 --repo squne121/loop-protocol",
+        ],
+    )
+    def test_direct_launcher_forms_still_blocked(self, tmp_git_repo: Path, cmd: str):
+        """AC3: python3 <script> / uv run <script> / uv run python3 <script>
+        direct execution forms of an issue-refinement-loop script must still
+        be blocked (non-regression of the existing block behaviour)."""
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["rule_id"] == "issue_refinement_direct"
+
+    def test_relative_dot_slash_form_still_blocks_same_script_identity(self, tmp_git_repo: Path):
+        """AC4: `./` relative notation must resolve to the same script
+        identity as the canonical direct-execution form and still block."""
+        cmd = (
+            "python3 ./.claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py "
+            "--issue-number 985 --repo squne121/loop-protocol"
+        )
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["rule_id"] == "issue_refinement_direct"
+
+    def test_absolute_path_form_still_blocks_same_script_identity(self, tmp_git_repo: Path):
+        """AC4: absolute-path notation must resolve to the same script
+        identity as the canonical direct-execution form and still block."""
+        abs_script = str(
+            tmp_git_repo / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "run_refinement_preflight.py"
+        )
+        cmd = f"python3 {abs_script} --issue-number 985 --repo squne121/loop-protocol"
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["rule_id"] == "issue_refinement_direct"
+
+    def test_python_isolated_flag_still_blocks_same_script_identity(self, tmp_git_repo: Path):
+        """AC4: `python3 -I <script>` alternate spelling must still resolve to
+        the same script identity and block."""
+        cmd = (
+            "python3 -I .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py "
+            "--issue-number 985 --repo squne121/loop-protocol"
+        )
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["rule_id"] == "issue_refinement_direct"
+
+    def test_uv_run_directory_flag_still_blocks_same_script_identity(self, tmp_git_repo: Path):
+        """AC4: `uv run --directory <dir> <script>` alternate spelling must
+        resolve to the same script identity and still block."""
+        cmd = (
+            f"uv run --directory {tmp_git_repo} "
+            ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py "
+            "--issue-number 985 --repo squne121/loop-protocol"
+        )
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["rule_id"] == "issue_refinement_direct"
+
+    def test_allowed_paths_json_with_whitespace_quotes_multiple_paths_allows(self, tmp_git_repo: Path):
+        """AC5: allowed-paths JSON argument with internal whitespace, quotes,
+        and multiple paths must not break token boundaries and must still
+        allow."""
+        cmd = (
+            "uv run python3 .claude/skills/pr-review-judge/scripts/allowed_paths_review_gate.py "
+            "--allowed-paths '[\n"
+            "  \"scripts/agent-guards/local_main_branch_guard.py\",\n"
+            "  \".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py\",\n"
+            "  \".claude/skills/issue-refinement-loop/scripts/build_loop_state.py\"\n]'"
+        )
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["rule_id"] != "issue_refinement_direct"

@@ -1825,3 +1825,48 @@ class TestProbeScriptsDeterministicChecker:
 
         cmd = "uv run python3 scripts/agent-ops/git_worktree_probe.py"
         assert is_deterministic_checker_command(cmd)
+
+
+class TestIssue1543CodexClaudeParity:
+    """Issue #1543 AC6: Claude hook wrapper invocation and Codex event fixture
+    invocation must produce the same allow/block verdict for the same input
+    command (argv-aware issue_refinement_direct classifier)."""
+
+    @pytest.mark.parametrize(
+        ("cmd", "expected_status"),
+        [
+            (
+                "uv run python3 .claude/skills/pr-review-judge/scripts/allowed_paths_review_gate.py "
+                "--allowed-paths '[\"scripts/agent-guards/local_main_branch_guard.py\", "
+                "\".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py\"]'",
+                "allow",
+            ),
+            (
+                "uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py "
+                "--issue-number 985 --repo squne121/loop-protocol",
+                "block",
+            ),
+        ],
+    )
+    def test_codex_and_claude_agree_on_issue_refinement_classifier_verdict(
+        self, tmp_git_repo: Path, cmd: str, expected_status: str
+    ):
+        codex_result = eval_codex(cmd, str(tmp_git_repo))
+        assert codex_result["status"] == expected_status
+
+        claude_hook_script = REPO_ROOT / ".claude" / "hooks" / "local_main_branch_guard.sh"
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": cmd},
+            "cwd": str(tmp_git_repo),
+        }
+        claude_proc = subprocess.run(
+            [str(claude_hook_script)],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            cwd=str(tmp_git_repo),
+        )
+        claude_status = "block" if claude_proc.returncode == 2 else "allow"
+        assert claude_status == expected_status
+        assert claude_status == codex_result["status"]
