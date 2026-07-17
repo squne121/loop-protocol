@@ -509,7 +509,11 @@ def main(argv: "list[str] | None" = None) -> int:
             current_body_bytes=current_body_bytes,
         )
     except EmitContractError as exc:
-        _write_diagnostic("contract_invalid", "child intermediate or binding artifact failed validation", violations=exc.violations)
+        _write_diagnostic(
+            "contract_invalid",
+            "child intermediate or binding artifact failed validation",
+            violations=exc.violations,
+        )
         return 1
     except EmitRuntimeError as exc:
         _write_diagnostic("runtime_error", str(exc))

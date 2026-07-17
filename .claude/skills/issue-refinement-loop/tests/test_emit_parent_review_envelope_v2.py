@@ -29,7 +29,6 @@ COMPACT_REVIEW_RESULT_SCRIPT = SCRIPTS_DIR / "compact_review_result.py"
 PARENT_REPLAY_BINDING_SCRIPT = SCRIPTS_DIR / "parent_replay_binding.py"
 
 import emit_parent_review_envelope_v2 as emit_mod  # noqa: E402
-import parent_replay_binding as pb  # noqa: E402
 import validate_review_compact_output as v1  # noqa: E402
 
 REPO = "squne121/loop-protocol"
@@ -153,8 +152,14 @@ def _build_valid_approve_intermediate() -> str:
             "BLOCKERS: 0",
             "NEXT_ACTION: proceed",
             "MUST_READ: ",
-            f"EVIDENCE: .claude/artifacts/issue-refinement-loop/{ISSUE_NUMBER}/compact_review_result_20260717T000000Z.json",
-            f"ARTIFACT: compact_review_result_v1=.claude/artifacts/issue-refinement-loop/{ISSUE_NUMBER}/compact_review_result_20260717T000000Z.json",
+            (
+                f"EVIDENCE: .claude/artifacts/issue-refinement-loop/{ISSUE_NUMBER}/"
+                f"compact_review_result_20260717T000000Z.json"
+            ),
+            (
+                f"ARTIFACT: compact_review_result_v1=.claude/artifacts/issue-refinement-loop/"
+                f"{ISSUE_NUMBER}/compact_review_result_20260717T000000Z.json"
+            ),
         ]
     ) + "\n"
 
@@ -169,8 +174,14 @@ def test_rejects_invalid_child_intermediate():
             "BLOCKERS: 1",
             "NEXT_ACTION: request_changes",
             "MUST_READ: ",
-            f"EVIDENCE: .claude/artifacts/issue-refinement-loop/{ISSUE_NUMBER}/compact_review_result_20260717T000000Z.json",
-            f"ARTIFACT: compact_review_result_v1=.claude/artifacts/issue-refinement-loop/{ISSUE_NUMBER}/compact_review_result_20260717T000000Z.json",
+            (
+                f"EVIDENCE: .claude/artifacts/issue-refinement-loop/{ISSUE_NUMBER}/"
+                f"compact_review_result_20260717T000000Z.json"
+            ),
+            (
+                f"ARTIFACT: compact_review_result_v1=.claude/artifacts/issue-refinement-loop/"
+                f"{ISSUE_NUMBER}/compact_review_result_20260717T000000Z.json"
+            ),
         ]
     ) + "\n"
     result = emit_mod.validate_child_intermediate(bad, issue_number=ISSUE_NUMBER)
