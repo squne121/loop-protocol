@@ -1792,3 +1792,151 @@ def test_cross_repo_same_issue_number_is_rejected(monkeypatch: pytest.MonkeyPatc
         assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
     finally:
         evidence_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Issue #1470 fix_delta (PR #1553 review): Medium 1 - canonical re-check of
+# labels / existing PR when target_repo differs from raw repo, and Medium 2 -
+# resolve_canonical_repository() catches OSError (e.g. FileNotFoundError when
+# `gh` is not installed) in addition to subprocess.SubprocessError.
+# ---------------------------------------------------------------------------
+
+
+def test_mixed_case_repo_rechecks_labels_and_existing_pr_with_canonical_target(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """GIVEN a mixed-case requested repo WHEN the gate resolves the canonical
+    target THEN labels and existing-PR idempotency are re-checked against the
+    canonical (not raw) repo value, and an existing PR found under the
+    canonical name short-circuits without calling create_pr (Medium 1)."""
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    monkeypatch.setattr(open_pr, "resolve_canonical_repository", _REAL_RESOLVE_CANONICAL_REPOSITORY)
+    monkeypatch.setattr(open_pr, "resolve_repo", lambda: "SQUNE121/LOOP-PROTOCOL")
+    monkeypatch.setattr(
+        open_pr,
+        "run_gh",
+        lambda *args, **kwargs: FakeCompletedProcess(
+            0, json.dumps({"full_name": "squne121/loop-protocol"}), ""
+        ),
+    )
+
+    observed_repos: list[str] = []
+
+    def fake_find_existing_pr(repo, branch):
+        observed_repos.append(repo)
+        if repo == "squne121/loop-protocol":
+            return {"url": "https://github.com/squne121/loop-protocol/pull/4242", "number": 4242}
+        return None
+
+    monkeypatch.setattr(open_pr, "find_existing_pr", fake_find_existing_pr)
+
+    label_calls: list[str] = []
+
+    def fake_fetch_labels(repo, issue):
+        label_calls.append(repo)
+        return ([], None)
+
+    monkeypatch.setattr(open_pr, "fetch_current_linked_issue_labels", fake_fetch_labels)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("create_pr should not run once canonical existing PR is found")
+
+    monkeypatch.setattr(open_pr, "create_pr", fail_if_called)
+
+    rc, lines, create_called = _run_main(
+        monkeypatch,
+        1458,
+        [
+            "--overlap-preflight-required",
+            "--overlap-preflight-evidence-file", "/nonexistent/should-not-be-read.json",
+            "--overlap-preflight-expected-evidence-sha256", "sha256:" + "a" * 64,
+            "--overlap-preflight-expected-decision-inputs-sha256", "sha256:" + "a" * 64,
+        ],
+    )
+    assert rc == 0, lines
+    assert create_called is False
+    assert any(line == "EXISTING=true" for line in lines), lines
+    assert any(line == "PR_NUMBER=4242" for line in lines), lines
+    # both the initial (raw-repo) and the canonical re-check label fetch
+    # observed the eventual canonical target at least once.
+    assert "squne121/loop-protocol" in label_calls, label_calls
+    assert "squne121/loop-protocol" in observed_repos, observed_repos
+
+
+def test_resolve_canonical_repository_catches_file_not_found_error(monkeypatch: pytest.MonkeyPatch):
+    """GIVEN `gh` is not installed (run_gh raises FileNotFoundError, a subclass
+    of OSError) WHEN resolve_canonical_repository() is called THEN it returns
+    None instead of propagating the exception (Medium 2)."""
+
+    def raise_file_not_found(*args, **kwargs):
+        raise FileNotFoundError("gh: command not found")
+
+    monkeypatch.setattr(open_pr, "run_gh", raise_file_not_found)
+
+    assert open_pr.resolve_canonical_repository("squne121/loop-protocol") is None
+
+
+def test_main_exits_2_with_source_failure_when_gh_missing(monkeypatch: pytest.MonkeyPatch):
+    """GIVEN `gh` is not installed WHEN the overlap gate is active THEN main()
+    exits 2 with E_OVERLAP_PREFLIGHT_SOURCE_FAILURE instead of raising
+    (Medium 2, end-to-end)."""
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+
+    def raise_file_not_found(*args, **kwargs):
+        raise FileNotFoundError("gh: command not found")
+
+    monkeypatch.setattr(open_pr, "resolve_canonical_repository", _REAL_RESOLVE_CANONICAL_REPOSITORY)
+    monkeypatch.setattr(open_pr, "run_gh", raise_file_not_found)
+
+    rc, lines, create_called = _run_main(
+        monkeypatch,
+        1458,
+        [
+            "--overlap-preflight-required",
+            "--overlap-preflight-evidence-file", "/nonexistent/should-not-be-read.json",
+            "--overlap-preflight-expected-evidence-sha256", "sha256:" + "a" * 64,
+            "--overlap-preflight-expected-decision-inputs-sha256", "sha256:" + "a" * 64,
+        ],
+    )
+    assert rc == 2, lines
+    assert create_called is False
+    assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_SOURCE_FAILURE}" for line in lines), lines
+
+
+
+# ---------------------------------------------------------------------------
+# Issue #1470 fix_delta (PR #1553 review): Blocker 1 - SKILL.md must not
+# claim the overlap gate ignores native GitHub issue dependency; it must
+# describe the actual blocked_by / blocking REST integration and the
+# genuinely remaining limitations.
+# ---------------------------------------------------------------------------
+
+_SKILL_MD_PATH = Path(__file__).parent.parent.parent / "SKILL.md"
+
+_SKILL_MD_STALE_PHRASES = (
+    "native dependency は producer に含まれていない",
+    "native GitHub issue dependency を含まない暫定的 mitigation",
+    "を含まない暫定的 mitigation",
+    "Issue 本文 / コメントに書かれた `Depends on` 等のテキスト参照）内で依存が見つからなかったこと",
+)
+
+
+def test_skill_md_does_not_claim_overlap_gate_excludes_native_dependency():
+    text = _SKILL_MD_PATH.read_text(encoding="utf-8")
+    for phrase in _SKILL_MD_STALE_PHRASES:
+        assert phrase not in text, f"stale phrase still present: {phrase!r}"
+
+
+def test_skill_md_describes_native_dependency_fetch_as_integrated():
+    text = _SKILL_MD_PATH.read_text(encoding="utf-8")
+    assert "blocked_by" in text
+    assert "blocking" in text
+    assert "REST" in text
+    assert "issue-dependencies" in text
+
+
+def test_skill_md_limits_remaining_gaps_to_1493_repo_id_and_freshness():
+    text = _SKILL_MD_PATH.read_text(encoding="utf-8")
+    assert "#1493" in text
+    assert "repository ID" in text
+    assert "bounded freshness" in text

@@ -30,7 +30,7 @@ _ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR = (
 if str(_ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR))
 
-import contract_review_result_parser as contract_review_parser
+import contract_review_result_parser as contract_review_parser  # noqa: E402
 
 E_APPROVAL_MISSING = "E_APPROVAL_MISSING"
 E_PR_BODY_VALIDATION_FAILED = "E_PR_BODY_VALIDATION_FAILED"
@@ -240,7 +240,7 @@ def resolve_canonical_repository(requested_repo: str) -> str | None:
             "-H",
             "X-GitHub-Api-Version: 2022-11-28",
         )
-    except subprocess.SubprocessError:
+    except (subprocess.SubprocessError, OSError):
         return None
     try:
         data = json.loads(result.stdout)
@@ -1158,6 +1158,33 @@ def main(argv: list[str] | None = None) -> int:
                     f"canonical repository を解決できませんでした: {repo}",
                 )
                 return 2
+
+            # Issue #1470 (Medium 1): canonical repo が raw repo と異なる場合
+            # （mixed-case / rename alias）、labels と既存 PR を canonical
+            # target で再確認する。以降のすべての repo-scoped 呼び出し
+            # （overlap preflight オンライン再実行・gh pr create）は同一の
+            # target_repo（canonical）を使うため、この再確認は label
+            # forcing 判定と idempotency チェックの canonical target 追従を
+            # 保証する追加の安全確認である（label 再取得失敗は fail-closed
+            # で forced 継続）。
+            if target_repo != repo:
+                canonical_labels, canonical_labels_error = fetch_current_linked_issue_labels(
+                    target_repo, args.linked_issue
+                )
+                if canonical_labels_error is not None:
+                    forced_by_label = True
+                elif FORCE_OVERLAP_PREFLIGHT_LABEL in (canonical_labels or []):
+                    forced_by_label = True
+                overlap_gate_active = bool(args.overlap_preflight_required) or forced_by_label
+
+                canonical_existing = find_existing_pr(target_repo, branch)
+                if canonical_existing:
+                    emit_kv("EXISTING", "true")
+                    emit_kv("PR_URL", canonical_existing["url"])
+                    emit_kv("PR_NUMBER", canonical_existing["number"])
+                    emit_kv("LINKED_ISSUE", args.linked_issue)
+                    emit_kv("LINK_KIND", link_kind)
+                    return 0
 
             gate_ok, gate_error_code, gate_detail, _fresh_evidence = run_overlap_preflight_gate(
                 repo=target_repo,
