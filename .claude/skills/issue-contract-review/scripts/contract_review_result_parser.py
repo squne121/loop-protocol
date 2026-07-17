@@ -273,6 +273,7 @@ _PREFIXED_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 # AllowedPathsGateEvaluator.compute_allowed_paths_hash(), which returns a bare
 # hex digest with NO "sha256:" prefix -- do not add one here.
 _BARE_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_FULL_COMMIT_OID_RE = re.compile(r"^[0-9a-f]{40,64}$")
 
 _ISSUE_NUMBER_FROM_URL_RE = re.compile(r"/issues/(\d+)\Z")
 
@@ -303,21 +304,29 @@ def is_fingerprint_ready_go(
     when supplied they are cross-checked against the fingerprint's own
     self-reported values rather than trusted at face value.
     """
+    if (
+        isinstance(comment_id, bool)
+        or not isinstance(comment_id, int)
+        or comment_id <= 0
+        or isinstance(issue_number, bool)
+        or not isinstance(issue_number, int)
+        or issue_number <= 0
+    ):
+        return False
     if not isinstance(inner, dict):
         return False
     fingerprint = inner.get("expected_contract_fingerprint")
     if not isinstance(fingerprint, dict):
         return False
-    for key in _FINGERPRINT_REQUIRED_KEYS:
-        if key not in fingerprint:
-            return False
+    if set(fingerprint) != set(_FINGERPRINT_REQUIRED_KEYS):
+        return False
 
     fp_issue_number = fingerprint.get("issue_number")
     if isinstance(fp_issue_number, bool) or not isinstance(fp_issue_number, int):
         return False
     if fp_issue_number <= 0:
         return False
-    if issue_number is not None and fp_issue_number != issue_number:
+    if fp_issue_number != issue_number:
         return False
 
     if fingerprint.get("contract_source_kind") != "issue_comment":
@@ -326,13 +335,15 @@ def is_fingerprint_ready_go(
     contract_source_id = fingerprint.get("contract_source_id")
     if not isinstance(contract_source_id, str) or not contract_source_id.isdigit():
         return False
-    if comment_id is not None and str(comment_id) != contract_source_id:
+    if str(comment_id) != contract_source_id:
         return False
 
     contract_body_sha256 = fingerprint.get("contract_body_sha256")
     if not isinstance(contract_body_sha256, str) or not _PREFIXED_SHA256_RE.fullmatch(
         contract_body_sha256
     ):
+        return False
+    if contract_body_sha256 != inner.get("body_sha256"):
         return False
 
     allowed_paths_hash = fingerprint.get("allowed_paths_normalized_sha256")
@@ -346,7 +357,9 @@ def is_fingerprint_ready_go(
         return False
 
     base_sha_at_snapshot = fingerprint.get("base_sha_at_snapshot")
-    if not isinstance(base_sha_at_snapshot, str) or not base_sha_at_snapshot:
+    if not isinstance(base_sha_at_snapshot, str) or not _FULL_COMMIT_OID_RE.fullmatch(
+        base_sha_at_snapshot
+    ):
         return False
 
     return True
@@ -522,6 +535,17 @@ def find_latest_go(
     # Sort by created_at desc, then comment_id desc
     go_results.sort(key=lambda r: (r.get("created_at", ""), r.get("comment_id", 0)), reverse=True)
     return go_results[0]
+
+
+def find_latest_authoritative_go(results: list[dict]) -> Optional[dict]:
+    """Return the single loop-consumable GO candidate.
+
+    Trusted-but-provisional/orphan comments are intentionally excluded here.
+    All authoritative consumers must use this predicate.
+    """
+    return find_latest_go(
+        results, trusted_only=True, fingerprint_ready_only=True
+    )
 
 
 def find_latest_result(

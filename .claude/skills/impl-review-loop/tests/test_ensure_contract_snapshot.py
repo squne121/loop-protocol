@@ -106,7 +106,7 @@ _ISSUE_NUMBER = 817
 _REPO = "squne121/loop-protocol"
 _ISSUE_URL = f"https://github.com/{_REPO}/issues/{_ISSUE_NUMBER}"
 
-_SAMPLE_BODY = "## Test Issue Body\nSome content here."
+_SAMPLE_BODY = "## Test Issue Body\nSome content here.\n\n## Allowed Paths\n- tracked.txt\n"
 _SAMPLE_BODY_SHA256 = sha256_of(_SAMPLE_BODY)
 _SAMPLE_UPDATED_AT = "2026-06-13T08:00:00Z"
 
@@ -167,6 +167,9 @@ def _mock_parser_mod(
 
     mod.parse_contract_review_results.return_value = results
     mod.find_latest_go.return_value = results[0] if results and results[0]["status"] == "go" else None
+    mod.find_latest_authoritative_go.return_value = (
+        results[0] if results and results[0]["status"] == "go" else None
+    )
     mod.find_latest_result.return_value = latest or (results[0] if results else None)
     return mod
 
@@ -703,12 +706,21 @@ class TestContractReviewComment:
     """Materialized snapshots retain VC baseline classifications for consumers."""
 
     def test_comment_serializes_vc_preflight_classifications(self):
+        fingerprint = _ecs_mod.compute_expected_contract_fingerprint(
+            issue_number=_ISSUE_NUMBER,
+            contract_source_id="1",
+            contract_body_sha256=_SAMPLE_BODY_SHA256,
+            allowed_paths=["tracked.txt"],
+            base_ref="main",
+            base_sha_at_snapshot="a" * 40,
+        )
         body = _ecs_mod._build_contract_review_comment(
             issue_number=_ISSUE_NUMBER,
             repo=_REPO,
             review_result=_make_review_result("go"),
             idempotency_marker="<!-- marker -->",
             body_sha256=_SAMPLE_BODY_SHA256,
+            expected_contract_fingerprint=fingerprint,
         )
         parser_mod = _ecs_mod._import_parser_module()
         results = parser_mod.parse_contract_review_results(
@@ -1754,7 +1766,7 @@ _capsule_mod = _ab_load("build_intake_capsule_binding", _AB_SCRIPTS_DIR / "build
 _AB_ISSUE_NUMBER = 1475
 _AB_REPO = "squne121/loop-protocol"
 _AB_ISSUE_URL = f"https://github.com/{_AB_REPO}/issues/{_AB_ISSUE_NUMBER}"
-_AB_SAMPLE_BODY = "## Test body for #1475 binding tests"
+_AB_SAMPLE_BODY = "## Test body for #1475 binding tests\n\n## Allowed Paths\n- tracked.txt\n"
 _AB_SAMPLE_BODY_SHA256 = _ecs_mod.sha256_of(_AB_SAMPLE_BODY)
 _AB_SAMPLE_UPDATED_AT = "2026-07-12T00:00:00Z"
 
@@ -1772,6 +1784,14 @@ def _ab_go_comment(
     author_id=None,
     author_type=None,
 ) -> dict:
+    fingerprint = _ecs_mod.compute_expected_contract_fingerprint(
+        issue_number=_AB_ISSUE_NUMBER,
+        contract_source_id=str(comment_id),
+        contract_body_sha256=_AB_SAMPLE_BODY_SHA256,
+        allowed_paths=["tracked.txt"],
+        base_ref="main",
+        base_sha_at_snapshot="a" * 40,
+    )
     return {
         "id": comment_id,
         "html_url": f"{_AB_ISSUE_URL}#issuecomment-{comment_id}",
@@ -1789,6 +1809,7 @@ CONTRACT_REVIEW_RESULT_V1:
   generated_by: issue-contract-review
   issue_url: {_AB_ISSUE_URL}
   body_sha256: "{_AB_SAMPLE_BODY_SHA256}"
+  expected_contract_fingerprint: {json.dumps(fingerprint)}
 ```
 """,
     }
@@ -1971,7 +1992,7 @@ def test_all_snapshot_consumers_reject_untrusted_go():
     parser_mod.parse_contract_review_results.return_value = parsed
     parser_mod.find_latest_result.return_value = parsed[0]
     parser_mod.find_latest_go.side_effect = (
-        lambda results, trusted_only=False: (
+        lambda results, trusted_only=False, **_kwargs: (
             None
             if trusted_only
             else next((r for r in results if r.get("status") == "go"), None)
@@ -2381,7 +2402,9 @@ class TestAllSnapshotConsumersRejectUntrustedGo:
 
     def test_build_intake_capsule_accepts_trusted_go(self):
         trusted = _ab_trusted_go_comment()
-        results, _counts = _capsule_mod._parse_contract_results([trusted], _AB_ISSUE_URL)
+        results, _counts = _capsule_mod._parse_contract_results(
+            [trusted], _AB_ISSUE_URL, _AB_ISSUE_NUMBER
+        )
         assert results[0]["is_trusted_author"] is True
         latest_go = _capsule_mod._find_latest_go(results)
         assert latest_go is not None

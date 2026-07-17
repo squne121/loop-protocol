@@ -102,6 +102,10 @@ _PRJ_SCRIPTS_DIR = (
     _REPO_ROOT / ".claude" / "skills" / "pr-review-judge" / "scripts"
 )
 _ALLOWED_PATHS_REVIEW_GATE_PY = _PRJ_SCRIPTS_DIR / "allowed_paths_review_gate.py"
+_BASELINE_VC_PREFLIGHT_PY = (
+    _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts"
+    / "baseline_vc_preflight.py"
+)
 
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
@@ -190,20 +194,31 @@ def _import_allowed_paths_gate_module():
     return mod
 
 
-_ALLOWED_PATHS_SECTION_RE = re.compile(
-    r"^##\s+Allowed Paths\s*$(.+?)(?=^##|\Z)", re.MULTILINE | re.DOTALL
-)
-_ALLOWED_PATHS_BULLET_RE = re.compile(r"^-\s*`([^`]+)`", re.MULTILINE)
-
-
 def extract_allowed_paths_from_body(body: str) -> list[str]:
-    """Extract the raw Allowed Paths bullet entries from an Issue body's
-    `## Allowed Paths` section (backtick-quoted path per bullet line)."""
-    match = _ALLOWED_PATHS_SECTION_RE.search(body or "")
-    if not match:
-        return []
-    section = match.group(1)
-    return [m.group(1) for m in _ALLOWED_PATHS_BULLET_RE.finditer(section)]
+    """Use the contract-review canonical Allowed Paths grammar."""
+    spec = importlib.util.spec_from_file_location(
+        "baseline_vc_preflight_allowed_paths", _BASELINE_VC_PREFLIGHT_PY
+    )
+    if spec is None or spec.loader is None:
+        raise ValueError("canonical_allowed_paths_extractor_unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    paths = module.extract_allowed_paths(body or "")
+    return paths if isinstance(paths, list) else []
+
+
+def _canonicalize_allowed_paths_strict(allowed_paths: list[str]) -> list[str]:
+    """Match the review gate's normalization or fail before any POST."""
+    gate_mod = _import_allowed_paths_gate_module()
+    canonicalized: list[str] = []
+    for pattern in allowed_paths:
+        normalized = gate_mod.AllowedPathsMatcher.normalize_allowed_pattern(pattern)
+        if normalized is None:
+            raise ValueError(f"invalid_allowed_path_pattern:{pattern}")
+        canonicalized.append(normalized)
+    if not canonicalized:
+        raise ValueError("allowed_paths_missing_or_empty")
+    return sorted(set(canonicalized))
 
 
 def compute_expected_contract_fingerprint(
@@ -223,15 +238,9 @@ def compute_expected_contract_fingerprint(
     shared AllowedPathsMatcher normalization) so it is byte-for-byte
     reproducible by the reviewer's independent recomputation (AC4).
     """
-    gate_mod = _import_allowed_paths_gate_module()
-    matcher = gate_mod.AllowedPathsMatcher
-    canonicalized: list[str] = []
-    for pattern in allowed_paths:
-        normalized = matcher.normalize_allowed_pattern(pattern)
-        if normalized is not None:
-            canonicalized.append(normalized)
+    canonicalized = _canonicalize_allowed_paths_strict(allowed_paths)
     normalized_json = json.dumps(
-        sorted(set(canonicalized)), separators=(",", ":"), ensure_ascii=True
+        canonicalized, separators=(",", ":"), ensure_ascii=True
     )
     allowed_paths_hash = hashlib.sha256(normalized_json.encode()).hexdigest()
     return {
@@ -304,43 +313,46 @@ def patch_comment(
     is known and can be embedded in expected_contract_fingerprint's
     contract_source_id).
 
-    Returns (success, error_code_or_None). No blind retry on error --
-    mirrors post_comment's fail-closed classification intent.
+    Returns (success, error_code_or_None).  The exact canonical UTF-8 JSON
+    payload is sent once, then the PATCH response and an independent GET are
+    both bound to that same body.  A transport timeout is reconciled by GET;
+    ambiguity remains fail-closed.
     """
-    del issue_number  # scoping context only; PATCH addresses by comment_id
-    import tempfile
-
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".md", delete=False, encoding="utf-8"
-        ) as tmp:
-            tmp.write(body)
-            tmp_path = tmp.name
-
-        try:
-            result = subprocess.run(
-                [
-                    "gh", "api",
-                    "--method", "PATCH",
-                    f"repos/{repo}/issues/comments/{comment_id}",
-                    "--field", f"body=@{tmp_path}",
-                    "--jq", ".id",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
+        payload = json.dumps({"body": body}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        result = subprocess.run(
+            [
+                "gh", "api", "--method", "PATCH",
+                f"repos/{repo}/issues/comments/{comment_id}", "--input", "-",
+            ],
+            input=payload,
+            capture_output=True,
+            timeout=timeout,
+        )
         if result.returncode == 0:
-            return True, None
-        return False, "patch_error"
+            try:
+                response = json.loads(result.stdout.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return False, "patch_response_invalid_json"
+            if not isinstance(response, dict) or response.get("id") != comment_id:
+                return False, "patch_response_id_mismatch"
+            if response.get("body") != body:
+                return False, "patch_response_body_mismatch"
+            ok, err = verify_controlled_publisher_comment_id_binding(
+                issue_number, repo, comment_id, expected_body_sha256=sha256_of(body), timeout=timeout
+            )
+            return (True, None) if ok else (False, f"patch_get_reconciliation_failed:{err}")
+
+        # The remote may have applied the update despite a transport error.
+        ok, _err = verify_controlled_publisher_comment_id_binding(
+            issue_number, repo, comment_id, expected_body_sha256=sha256_of(body), timeout=timeout
+        )
+        return (True, None) if ok else (False, "patch_transport_unreconciled")
     except subprocess.TimeoutExpired:
-        return False, "patch_timeout"
+        ok, _err = verify_controlled_publisher_comment_id_binding(
+            issue_number, repo, comment_id, expected_body_sha256=sha256_of(body), timeout=timeout
+        )
+        return (True, None) if ok else (False, "patch_timeout_unreconciled")
     except Exception:
         return False, "patch_error"
 
@@ -860,7 +872,9 @@ def ensure_contract_snapshot(
         # candidate. Otherwise an untrusted comment posted after a trusted
         # go can still pre-empt it via the "latest blocked wins" branch below.
         latest = parser_mod.find_latest_result(results, trusted_only=True)
-        go_result = parser_mod.find_latest_go(results, trusted_only=True)
+        go_result = parser_mod.find_latest_go(
+            results, trusted_only=True, fingerprint_ready_only=True
+        )
 
         # latest (trusted) blocked retains precedence over existing-go adoption.
         if latest and latest["status"] == "blocked":
@@ -1032,7 +1046,9 @@ def ensure_contract_snapshot(
         return result
 
     # Also check if a go comment appeared in the interim
-    go_post = parser_mod.find_latest_go(results_post, trusted_only=True)
+    go_post = parser_mod.find_latest_go(
+        results_post, trusted_only=True, fingerprint_ready_only=True
+    )
     go_post_fingerprint_ready = bool(
         go_post
         and parser_mod.is_fingerprint_ready_go(
@@ -1076,7 +1092,15 @@ def ensure_contract_snapshot(
             "source-bound fingerprint without both values"
         )
         return result
-    allowed_paths_at_post = extract_allowed_paths_from_body(body_post or "")
+    try:
+        allowed_paths_at_post = extract_allowed_paths_from_body(body_post or "")
+        # Validate before POST; a malformed contract must not create even a
+        # provisional remote comment.
+        _canonicalize_allowed_paths_strict(allowed_paths_at_post)
+    except ValueError as exc:
+        result["status"] = "runtime_error"
+        result["errors"].append(f"allowed_paths_pre_post_validation_failed:{exc}")
+        return result
 
     # Build comment to post (B6: include checks summary).
     # #1537 AC1 (two-phase materialize, step 1): the provisional body omits
@@ -1200,9 +1224,8 @@ def _build_contract_review_comment(
     expected_contract_fingerprint (#1537): when provided, embeds the
     source-bound 7-item fingerprint as a sibling key of CONTRACT_REVIEW_RESULT_V1.
     Left as None for the step-1 provisional POST (the real comment id is not
-    known yet), then supplied for the step-2 PATCH once the id is confirmed
-    via read-back -- see ensure_contract_snapshot()'s two-phase materialize
-    flow.
+    known yet).  That POST is deliberately a pending-only schema, never a
+    syntactically valid CONTRACT_REVIEW_RESULT_V1.
     """
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     owner_repo = repo.split("/")
@@ -1211,6 +1234,17 @@ def _build_contract_review_comment(
         if len(owner_repo) == 2
         else ""
     )
+
+    if expected_contract_fingerprint is None:
+        return f"""{idempotency_marker}
+
+```yaml
+CONTRACT_SNAPSHOT_MATERIALIZATION_PENDING_V1:
+  issue_number: {issue_number}
+  body_sha256: \"{body_sha256}\"
+  phase: awaiting_comment_id_binding
+```
+"""
 
     # B6: Build checks summary from review_result
     checks = review_result.get("checks", {}) or {}
@@ -1233,12 +1267,10 @@ def _build_contract_review_comment(
         vc_preflight_classifications, ensure_ascii=False, separators=(",", ":")
     )
 
-    fingerprint_yaml = ""
-    if expected_contract_fingerprint is not None:
-        fingerprint_json = json.dumps(
-            expected_contract_fingerprint, ensure_ascii=False, separators=(",", ":")
-        )
-        fingerprint_yaml = f"\n  expected_contract_fingerprint: {fingerprint_json}"
+    fingerprint_json = json.dumps(
+        expected_contract_fingerprint, ensure_ascii=False, separators=(",", ":")
+    )
+    fingerprint_yaml = f"\n  expected_contract_fingerprint: {fingerprint_json}"
 
     return f"""{idempotency_marker}
 

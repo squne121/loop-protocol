@@ -37,7 +37,7 @@ spec.loader.exec_module(mod)  # type: ignore[union-attr]
 def _issue_view_json(
     *,
     title: str = "実装: intake capsule テスト",
-    body: str = "## Machine-Readable Contract\n\nstatus: full-body",
+    body: str = "## Machine-Readable Contract\n\nstatus: full-body\n\n## Allowed Paths\n- tracked.txt\n",
     updated_at: str = "2026-06-19T00:00:00Z",
     labels: list[dict[str, str]] | None = None,
 ) -> str:
@@ -326,14 +326,16 @@ def test_malformed_ndjson_sets_parse_warning():
 # ---------------------------------------------------------------------------
 
 
-def _fingerprint_yaml_block(comment_id: int = 1) -> str:
+def _fingerprint_yaml_block(
+    comment_id: int = 1, body_sha256: str | None = None, paths_hash: str | None = None
+) -> str:
     return f"""
   expected_contract_fingerprint:
     issue_number: 958
     contract_source_kind: issue_comment
     contract_source_id: "{comment_id}"
-    contract_body_sha256: "sha256:{'a' * 64}"
-    allowed_paths_normalized_sha256: "{'b' * 64}"
+    contract_body_sha256: "{body_sha256 or 'sha256:' + 'a' * 64}"
+    allowed_paths_normalized_sha256: "{paths_hash or 'b' * 64}"
     base_ref: main
     base_sha_at_snapshot: "{'c' * 40}"
 """
@@ -341,7 +343,9 @@ def _fingerprint_yaml_block(comment_id: int = 1) -> str:
 
 def test_ac3_go_with_fingerprint_routes_to_proceed():
     comment_id = 42
-    default_body_sha256 = mod._sha256("## Machine-Readable Contract\n\nstatus: full-body")
+    issue_body = "## Machine-Readable Contract\n\nstatus: full-body\n\n## Allowed Paths\n- tracked.txt\n"
+    default_body_sha256 = mod._sha256(issue_body)
+    paths_hash = mod._live_allowed_paths_hash(issue_body)
     go_body = f"""
 ```yaml
 CONTRACT_REVIEW_RESULT_V1:
@@ -349,7 +353,7 @@ CONTRACT_REVIEW_RESULT_V1:
   generated_at: "2026-06-19T00:01:00Z"
   generated_by: issue-contract-review
   issue_url: https://github.com/squne121/loop-protocol/issues/958
-  body_sha256: "{default_body_sha256}"{_fingerprint_yaml_block(comment_id)}```
+  body_sha256: "{default_body_sha256}"{_fingerprint_yaml_block(comment_id, default_body_sha256, paths_hash)}```
 """
     run_cmd = _run_command_side_effect_factory(
         [

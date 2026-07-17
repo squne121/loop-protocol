@@ -332,7 +332,10 @@ class TestFingerprintReadiness:
     """Tests for is_fingerprint_ready_go (Issue #1537 AC2)."""
 
     def test_valid_fingerprint_is_ready(self):
-        inner = {"expected_contract_fingerprint": dict(_VALID_FINGERPRINT)}
+        inner = {
+            "body_sha256": _VALID_FINGERPRINT["contract_body_sha256"],
+            "expected_contract_fingerprint": dict(_VALID_FINGERPRINT),
+        }
         assert is_fingerprint_ready_go(inner, 1001, _ISSUE_NUMBER) is True
 
     def test_missing_fingerprint_key_is_not_ready(self):
@@ -398,9 +401,12 @@ class TestFingerprintReadiness:
         inner = {"expected_contract_fingerprint": fp}
         assert is_fingerprint_ready_go(inner, 1001, _ISSUE_NUMBER) is False
 
-    def test_no_comment_id_or_issue_number_provided_still_validates_schema(self):
-        inner = {"expected_contract_fingerprint": dict(_VALID_FINGERPRINT)}
-        assert is_fingerprint_ready_go(inner) is True
+    def test_missing_authoritative_comment_or_issue_context_is_not_ready(self):
+        inner = {
+            "body_sha256": _VALID_FINGERPRINT["contract_body_sha256"],
+            "expected_contract_fingerprint": dict(_VALID_FINGERPRINT),
+        }
+        assert is_fingerprint_ready_go(inner) is False
 
 
 class TestFindLatestGoFingerprintReadyOnly:

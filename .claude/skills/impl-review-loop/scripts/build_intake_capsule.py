@@ -30,6 +30,14 @@ _CRP_PATH = (
     _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts"
     / "contract_review_result_parser.py"
 )
+_BASELINE_PREFLIGHT_PATH = (
+    _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts"
+    / "baseline_vc_preflight.py"
+)
+_ALLOWED_PATHS_GATE_PATH = (
+    _REPO_ROOT / ".claude" / "skills" / "pr-review-judge" / "scripts"
+    / "allowed_paths_review_gate.py"
+)
 _FENCED_YAML_RE = re.compile(r"```ya?ml[ \t]*\n(.*?)```", re.DOTALL)
 _CONTRACT_REVIEW_MARKER = "CONTRACT_REVIEW_RESULT_V1"
 
@@ -196,6 +204,26 @@ def _is_fingerprint_ready(
     return bool(module.is_fingerprint_ready_go(inner, comment_id, issue_number))
 
 
+def _live_allowed_paths_hash(body: str) -> str | None:
+    """Compute the reviewer-compatible hash from the live Issue body."""
+    baseline = _load_module(_BASELINE_PREFLIGHT_PATH, "baseline_allowed_paths_for_intake")
+    gate = _load_module(_ALLOWED_PATHS_GATE_PATH, "allowed_paths_gate_for_intake")
+    paths = baseline.extract_allowed_paths(body)
+    if not isinstance(paths, list) or not paths:
+        return None
+    canonicalized: list[str] = []
+    for path in paths:
+        normalized = gate.AllowedPathsMatcher.normalize_allowed_pattern(path)
+        if normalized is None:
+            return None
+        canonicalized.append(normalized)
+    if not canonicalized:
+        return None
+    return hashlib.sha256(
+        json.dumps(sorted(set(canonicalized)), separators=(",", ":"), ensure_ascii=True).encode()
+    ).hexdigest()
+
+
 _ISSUE_NUMBER_FROM_URL_RE = re.compile(r"/issues/(\d+)\Z")
 
 
@@ -255,6 +283,7 @@ def _collect_issue_metadata(
         "title": title,
         "issue_url": f"https://github.com/{repo}/issues/{issue_number}",
         "body_sha256": _sha256(body),
+        "body": body,
         "updated_at": updated_at,
         "ready_tuple": {
             "title_prefix_ok": title_prefix_ok,
@@ -397,16 +426,13 @@ def _find_latest_result(
 
 
 def _find_latest_go(results: list[dict[str, Any]]) -> dict[str, Any] | None:
-    # #1475: only a trusted-author go result is authoritative. Note: this
-    # helper intentionally does NOT also require is_fingerprint_ready
-    # (#1537) -- fingerprint-readiness filtering for the loop-routing
-    # decision is applied by the sole caller, _normalize_contract_snapshot_live(),
-    # so other direct consumers of this general-purpose trust-precedence
-    # helper are unaffected.
+    # #1537: every consumer of an intake capsule requires a fully bound GO.
     go_results = [
         item
         for item in results
-        if item.get("status") == "go" and item.get("is_trusted_author")
+        if item.get("status") == "go"
+        and item.get("is_trusted_author") is True
+        and item.get("is_fingerprint_ready") is True
     ]
     return _find_latest_result(go_results)
 
@@ -461,6 +487,7 @@ def _normalize_contract_snapshot_from_ensure(
 
 def _normalize_contract_snapshot_live(
     issue_url: str,
+    issue_body: str,
     issue_body_sha256: str,
     issue_updated_at: str,
     comments: list[dict[str, Any]],
@@ -516,6 +543,22 @@ def _normalize_contract_snapshot_live(
 
     if latest_go:
         inner = latest_go.get("inner") or {}
+        fingerprint = inner.get("expected_contract_fingerprint")
+        live_paths_hash = _live_allowed_paths_hash(issue_body)
+        if (
+            not isinstance(fingerprint, dict)
+            or live_paths_hash is None
+            or fingerprint.get("allowed_paths_normalized_sha256") != live_paths_hash
+        ):
+            return {
+                "normalized_status": "missing_go",
+                "upstream_schema": _CONTRACT_REVIEW_MARKER,
+                "upstream_status": "go",
+                "source": "fingerprint_live_allowed_paths_mismatch",
+                "contract_snapshot_url": latest_go.get("html_url"),
+                "top_blocked_categories": [],
+                "contract_blocker_triage": {"schema": _TRIAGE_SCHEMA, "status": "not_run"},
+            }, evidence_complete
         body_sha256 = inner.get("body_sha256")
         generated_at = str(inner.get("generated_at") or "")
         if body_sha256 and body_sha256 != issue_body_sha256:
@@ -694,6 +737,7 @@ def build_intake_capsule(
         errors.extend(comment_errors)
         contract_snapshot, evidence_complete = _normalize_contract_snapshot_live(
             issue_meta["issue_url"],
+            issue_meta["body"],
             issue_meta["body_sha256"],
             issue_meta["updated_at"],
             comments,
