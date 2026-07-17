@@ -218,9 +218,19 @@ def _safe_ledger_ancestor_dir_rels(
     safe: set[str] = set()
     chain_safe = True
     for rel in _LEDGER_STABLE_ANCESTOR_DIR_RELS_SHALLOW_TO_DEEP:
+        if not chain_safe:
+            # PR #1552 REQUEST_CHANGES follow-up: once a shallower ancestor
+            # in the chain is already confirmed unsafe, do not probe any
+            # deeper rel's kind at all -- a shallower ancestor substituted by
+            # a plain file/fifo/socket/device makes every deeper path
+            # unreachable via a direct `lstat` (raises `ENOTDIR`), so calling
+            # `_path_kind` on it would only risk an uncaught crash for a
+            # result this loop already discards (mirrors the `blocked`
+            # skip-pattern in `_ledger_ancestor_kinds` above).
+            continue
         before_kind = ancestor_before_kinds.get(rel, "absent")
-        after_kind = _path_kind(root / rel)
-        if chain_safe and _is_allowed_ancestor_transition(before_kind, after_kind):
+        after_kind = _path_kind_or_ancestor_absent(root / rel)
+        if _is_allowed_ancestor_transition(before_kind, after_kind):
             safe.add(rel)
         else:
             chain_safe = False
@@ -274,6 +284,35 @@ def _path_kind(path: Path) -> str:
     return "other"
 
 
+def _path_kind_or_ancestor_absent(path: Path) -> str:
+    """Classify like `_path_kind`, but additionally treat
+    `NotADirectoryError` (`ENOTDIR` -- some ancestor path component exists on
+    disk as a non-directory node) as `"absent"` instead of propagating it
+    uncaught.
+
+    PR #1552 REQUEST_CHANGES follow-up (post-Blocker-2 regression): unlike
+    genuinely ambiguous errors (`EACCES`, `EIO`, ...), which `_path_kind`
+    correctly refuses to fold into `"absent"` because their real on-disk
+    state is unknown, `ENOTDIR` is unambiguous proof that no real filesystem
+    node can exist at the deeper path -- a directory-nested file literally
+    cannot exist under a non-directory ancestor. Folding only this specific,
+    provable case into `"absent"` here never masks a genuine
+    parent-substitution attack: the independent, generic repo-wide diff in
+    `_find_unauthorized_repo_changes` (driven by `git status`, not by
+    `_path_kind`) still observes and fails closed on the substituted
+    ancestor itself (e.g. `artifacts` created as a plain file) on its own,
+    unconditionally. This helper exists only so that call sites which must
+    keep evaluating past a broken ancestor (transient-lock quiescence
+    polling, the stable-ledger transition check) route to that controlled
+    fail-close path instead of crashing with an uncaught traceback -- which
+    would silently *skip* the fail-close reporting entirely, the opposite of
+    Blocker 2's intent."""
+    try:
+        return _path_kind(path)
+    except NotADirectoryError:
+        return "absent"
+
+
 def _ledger_exact_kinds(project_root: str) -> dict[str, str]:
     root = Path(project_root)
     return {rel: _path_kind(root / rel) for rel in _LEDGER_TYPED_EXACT_RELS}
@@ -319,7 +358,11 @@ def _wait_for_ledger_transient_quiescence(project_root: str) -> list[str]:
     deadline = time.monotonic() + _LEDGER_TRANSIENT_QUIESCENCE_TIMEOUT_SECONDS
 
     def _poll() -> list[str]:
-        return [rel for rel in _LEDGER_TRANSIENT_EXACT_RELS if _path_kind(root / rel) != "absent"]
+        return [
+            rel
+            for rel in _LEDGER_TRANSIENT_EXACT_RELS
+            if _path_kind_or_ancestor_absent(root / rel) != "absent"
+        ]
 
     last = _poll()
     while True:
@@ -795,7 +838,7 @@ def _find_unauthorized_repo_changes(
     ledger_before_kinds = ledger_before_kinds or {}
     stable_before_kind = ledger_before_kinds.get(_LEDGER_STABLE_EXACT_REL, "absent")
     stable_ledger_path = Path(project_root) / _LEDGER_STABLE_EXACT_REL
-    stable_after_kind = _path_kind(stable_ledger_path)
+    stable_after_kind = _path_kind_or_ancestor_absent(stable_ledger_path)
     if not _is_allowed_stable_ledger_transition(stable_before_kind, stable_after_kind):
         return _LEDGER_STABLE_EXACT_REL
 
