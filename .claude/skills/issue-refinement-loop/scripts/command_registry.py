@@ -450,6 +450,42 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "current_body_file": {"type": "repo_relative_file", "required": True},
         },
     },
+    # Issue #1541: deterministic production emitter that replaces the
+    # test-only `_assemble_v2_envelope()` f-string helper. Strictly
+    # validates the child intermediate (8-line approve / 9-line needs-fix)
+    # and, for needs-fix, derives the six `PARENT_REPLAY_*` fields ONLY from
+    # an already-validated `PARENT_REPLAY_BINDING_ARTIFACT_V1` -- never from
+    # anything the child claims about routing/digests. Sits between
+    # `parent_replay.bind` and `review_compact.validate_v2` in the command
+    # chain.
+    "review_compact.emit_v2": {
+        "id": "review_compact.emit_v2",
+        "argv": [
+            "uv", "run", "--locked", "--offline", "--no-sync", "python3",
+            f"{_SKILL_PREFIX}/emit_parent_review_envelope_v2.py",
+            "--issue-number", "{issue_number}",
+            "--binding-artifact-file", "{binding_artifact_file}",
+            "--repository-full-name", "{repo}",
+            "--refinement-session-id", "{refinement_session_id}",
+            "--iteration-id", "{iteration_id}",
+            "--current-body-file", "{current_body_file}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "stdin_contract": "issue_review_result_compact_v2/child_intermediate_text",
+        "stdout_contract": "issue_review_result_compact_v2/raw_text",
+        "timeout_seconds": 30,
+        "mutation": False,
+        "network_effect": "local_only",
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "binding_artifact_file": {"type": "repo_relative_file", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "refinement_session_id": {"type": "string", "required": True},
+            "iteration_id": {"type": "string", "required": True},
+            "current_body_file": {"type": "repo_relative_file", "required": True},
+        },
+    },
     # Issue #1532 AC5/High-3: the sole V2 state-write path. Rejects
     # caller-fabricated validation_status and cross-issue/session/digest
     # substitution via the required `expected_*` identity args.
