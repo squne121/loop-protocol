@@ -23,6 +23,7 @@ import pytest
 _SCRIPT = (
     pathlib.Path(__file__).parent.parent / "ci_verdict_summary_v2.py"
 )
+_WORKFLOW = pathlib.Path(__file__).parents[5] / ".github/workflows/ci.yml"
 
 
 def _load_module(path: pathlib.Path) -> types.ModuleType:
@@ -580,3 +581,74 @@ class TestB1B2NeedsResultSynthetic:
         entry = v2.build_check_entry(raw, "ci", EXPECTED_SHA)
         assert entry["blocking_merge_ready"] is True
         assert entry["failure_reason"] == "stale_head_sha"
+
+
+# ---------------------------------------------------------------------------
+# AC10/AC11: current PR head and uploaded payload binding
+# ---------------------------------------------------------------------------
+
+class TestAC10AC11UploadedArtifactBinding:
+    """The final uploaded payload must bind to an already-uploaded input artifact."""
+
+    def test_pr_head_is_recorded_when_explicitly_supplied(self, v2):
+        artifact = v2.generate_verdict(
+            expected_head_sha=EXPECTED_SHA,
+            pr_head_sha=EXPECTED_SHA,
+            repository="owner/repo",
+            workflow_run_id=123,
+            workflow_run_attempt=2,
+            event_name="pull_request",
+            raw_checks=[],
+        )
+        assert artifact["head_sha"] == EXPECTED_SHA
+
+    def test_pr_head_is_explicit_workflow_input_and_checked_out_ref(self):
+        workflow = _WORKFLOW.read_text()
+        assert "ref: ${{ github.event.pull_request.head.sha || github.sha }}" in workflow
+        assert "--pr-head-sha \"$PR_HEAD_SHA\"" in workflow
+        assert 'test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"' in workflow
+
+    def test_uploaded_artifact_payload_has_complete_non_self_reference(self, v2):
+        artifact = v2.generate_verdict(
+            expected_head_sha=EXPECTED_SHA,
+            pr_head_sha=EXPECTED_SHA,
+            repository="owner/repo",
+            workflow_run_id=123,
+            workflow_run_attempt=2,
+            event_name="pull_request",
+            raw_checks=[],
+            artifact_id="456",
+            artifact_url="https://example.test/artifacts/456",
+            artifact_digest="sha256:binding-digest",
+            artifact_name="ci-verdict-summary-v2-binding-123-2",
+            artifact_workflow_run_id=123,
+            artifact_workflow_run_attempt=2,
+        )
+        assert artifact["head_sha"] == EXPECTED_SHA
+        assert len(artifact["artifact_refs"]) == 1
+        ref = artifact["artifact_refs"][0]
+        assert ref["artifact_name"] == "ci-verdict-summary-v2-binding-123-2"
+        assert ref["artifact_digest"] == "sha256:binding-digest"
+        assert ref["workflow_run_id"] == 123
+        assert ref["workflow_run_attempt"] == 2
+
+    def test_uploaded_artifact_uses_preuploaded_binding_without_regeneration(self):
+        workflow = _WORKFLOW.read_text()
+        binding_upload = workflow.index("Upload ci_verdict_summary_v2 binding input")
+        verdict_generation = workflow.index("Generate ci_verdict_summary_v2 artifact")
+        verdict_upload = workflow.index("Upload ci-verdict-summary-v2 artifact")
+        summary = workflow.index("Output ci_verdict_summary_v2 Step Summary")
+        assert binding_upload < verdict_generation < verdict_upload < summary
+        assert "--artifact-name \"ci-verdict-summary-v2-binding-${{ github.run_id }}-${{ github.run_attempt }}\"" in workflow
+        assert "--summary-input ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json" in workflow
+
+    def test_summary_input_renders_existing_payload_without_regeneration(self, v2, tmp_path, monkeypatch):
+        payload = {"schema": "ci_verdict_summary_v2", "schema_version": 2,
+                   "overall_status": "stale_head_sha", "next_action": "refresh_head_sha",
+                   "expected_head_sha": EXPECTED_SHA, "head_sha": EXPECTED_SHA,
+                   "generated_at": "2026-01-01T00:00:00+00:00", "artifact_refs": [], "checks": []}
+        source = tmp_path / "payload.json"
+        source.write_text(json.dumps(payload))
+        summary = tmp_path / "summary.md"
+        assert v2.main(["--summary-input", str(source), "--summary-output", str(summary)]) == 0
+        assert "CI Verdict Summary V2" in summary.read_text()
