@@ -63,6 +63,17 @@ _RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS = (
     ".claude/artifacts/issue-refinement-loop",
     "artifacts/session-manifest-runtime",
 )
+# Issue #1563: `.guard_shadow_log.jsonl` (repo-root peer-append log written by
+# `.claude/hooks/shadow_log.py`, `.claude/hooks/guard-japanese-prose.sh`,
+# `.claude/hooks/rtk_boundary_shadow_guard.sh`, and `scripts/check-codex-agents.mjs`)
+# is deliberately NOT added to this tuple. This tuple is a *directory-root*
+# exclusion class: `_snapshot_repo_paths()` prunes everything under these
+# roots before even inspecting the transition kind, so adding an exact file
+# here would make a symlink/directory/FIFO/socket/device replacement of that
+# file invisible to this executor -- the exact opposite of the fail-close
+# guarantee this executor exists to provide. `.guard_shadow_log.jsonl` instead
+# gets its own narrow, exact-path, transition-typed policy (see
+# `_SHADOW_LOG_EXACT_REL` below), mirroring the `_LEDGER_*` typed policy.
 
 
 def _race_tolerant_unattributable_roots(project_root: str) -> list[Path]:
@@ -821,6 +832,123 @@ def _is_authorized_ledger_content_transition(before: dict, after: dict) -> bool:
     return True
 
 
+# =============================================================================
+# Typed shadow-log peer-append transition policy (Issue #1563).
+#
+# `.guard_shadow_log.jsonl` (repo root) is a peer file written by multiple
+# independent hook producers (`.claude/hooks/shadow_log.py`,
+# `.claude/hooks/guard-japanese-prose.sh`,
+# `.claude/hooks/rtk_boundary_shadow_guard.sh`) and by
+# `scripts/check-codex-agents.mjs`. It must NOT be added to
+# `_RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS` above -- that symbol is a
+# *directory-root* exclusion class that prunes the entire subtree before even
+# inspecting the transition kind, so adding an exact file to it would make a
+# symlink/directory/FIFO/socket/device replacement of that file invisible to
+# this executor -- the exact opposite of Issue #1563 AC2. Instead this file
+# gets its own narrow, exact-path, transition-typed policy, mirroring the
+# `_LEDGER_*` typed policy above (Issue #1502 / PR #1552 pattern):
+#
+# - kind transition (`_is_allowed_shadow_log_kind_transition`): only
+#   `absent -> absent`, `absent -> regular`, and `regular -> regular` are
+#   authorized. Delete (`regular -> absent`) and any substitution into or out
+#   of a non-regular kind (symlink / directory / FIFO / socket / device) fail
+#   closed, regardless of before-kind (AC2).
+# - content transition (`_is_authorized_shadow_log_content_transition`): a
+#   `regular -> regular` byte change is authorized only when the new content
+#   is a strict byte-level extension of the old content
+#   (`after.startswith(before)`) AND both the before and after content parse
+#   as well-formed JSONL (each complete line is a JSON object) AND every
+#   parsed before-record is still present, unchanged, and in the same order
+#   in the after-record list. Truncation, overwrite, malformed-JSONL
+#   replacement, and record deletion or reordering all fail closed (AC3).
+#
+# Unlike the ledger's stable-exact-peer-file policy, no ancestor directory
+# exemption is required here: `.guard_shadow_log.jsonl` lives directly at the
+# project root, so its own transition never creates a new ancestor
+# directory-node snapshot entry.
+#
+# stdlib snapshot mode provenance limitation (AC7): this policy runs on the
+# stdlib-only race-tolerant snapshot model (mtime/size plus one before/after
+# content read), so it cannot distinguish a regular guard_shadow_log.jsonl
+# append performed by this executor's own child command's asynchronous peer
+# hooks from an append made by a fully independent concurrent session/agent
+# -- both are authorized identically as long as the transition is
+# append-only; self-write and peer-write provenance are indistinguishable in
+# this mode. The AC2 guarantee is strictly postcondition-based ("if a
+# non-regular kind is observed at the end of the run, fail closed"), not a
+# TOCTOU-proof guarantee that the file was never replaced and replaced back
+# before the final observation (a stronger writer such as `openat2()` /
+# `O_NOFOLLOW` is explicitly out of scope for this executor-side check).
+# =============================================================================
+
+_SHADOW_LOG_EXACT_REL = ".guard_shadow_log.jsonl"
+
+
+def _shadow_log_kind(project_root: str) -> str:
+    return _path_kind_or_ancestor_absent(Path(project_root) / _SHADOW_LOG_EXACT_REL)
+
+
+def _is_allowed_shadow_log_kind_transition(before_kind: str, after_kind: str) -> bool:
+    """`absent -> absent`, `absent -> regular`, and `regular -> regular` are
+    the only authorized shadow-log kind transitions (AC2). Delete
+    (`regular -> absent`) and substitution into/out of any non-regular kind
+    (symlink / directory / FIFO / socket / device), from any before-kind, are
+    rejected -- this is an explicit allow-tuple match, not a
+    postcondition-only `after_kind == "regular"` check."""
+    if before_kind == "absent" and after_kind == "absent":
+        return True
+    return (before_kind, after_kind) in {("absent", "regular"), ("regular", "regular")}
+
+
+def _parse_shadow_log_jsonl(data: bytes) -> list[dict] | None:
+    """Parse JSONL content into a list of record objects. Returns None if the
+    content is not well-formed append-only JSONL: an incomplete final line
+    (no trailing newline for non-empty content), a non-UTF-8 byte sequence, a
+    line that fails to parse as JSON, or a line whose parsed value is not a
+    JSON object."""
+    if not data:
+        return []
+    if not data.endswith(b"\n"):
+        return None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    records: list[dict] = []
+    for line in text.split("\n")[:-1]:
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        records.append(obj)
+    return records
+
+
+def _is_authorized_shadow_log_content_transition(before: bytes, after: bytes) -> bool:
+    """A `regular -> regular` shadow-log content change is authorized only
+    when it is a strict append: `after` starts with the exact `before`
+    bytes, and every JSONL record present in `before` is still present,
+    unchanged, and in the same order in `after` (AC3). Truncation,
+    overwrite, malformed-JSONL replacement, and existing-record
+    deletion/reordering are all rejected, whether or not the byte length
+    changed."""
+    if before == after:
+        return True
+    if not after.startswith(before):
+        return False
+    before_records = _parse_shadow_log_jsonl(before)
+    after_records = _parse_shadow_log_jsonl(after)
+    if before_records is None or after_records is None:
+        return False
+    if len(after_records) < len(before_records):
+        return False
+    return after_records[: len(before_records)] == before_records
+
+
 def _find_unauthorized_repo_changes(
     project_root: str,
     issue_number: str,
@@ -829,6 +957,8 @@ def _find_unauthorized_repo_changes(
     ledger_before_kinds: dict[str, str] | None = None,
     ledger_before_bytes: bytes | None = None,
     ledger_ancestor_before_kinds: dict[str, str] | None = None,
+    shadow_log_before_kind: str | None = None,
+    shadow_log_before_bytes: bytes | None = None,
 ) -> str | None:
     # Issue #1502: the stable-exact ledger transition is checked first and
     # independently of the generic snapshot/status diff below. If the
@@ -867,6 +997,23 @@ def _find_unauthorized_repo_changes(
             ):
                 return _LEDGER_STABLE_EXACT_REL
 
+    # Issue #1563: the shadow-log exact-path typed transition is checked
+    # next, independently of the generic snapshot/status diff below,
+    # mirroring the ledger check above.
+    resolved_shadow_log_before_kind = shadow_log_before_kind or "absent"
+    shadow_log_path = Path(project_root) / _SHADOW_LOG_EXACT_REL
+    shadow_log_after_kind = _path_kind_or_ancestor_absent(shadow_log_path)
+    if not _is_allowed_shadow_log_kind_transition(resolved_shadow_log_before_kind, shadow_log_after_kind):
+        return _SHADOW_LOG_EXACT_REL
+    if resolved_shadow_log_before_kind == "regular" and shadow_log_after_kind == "regular":
+        shadow_log_after_bytes = _read_bytes_or_none(shadow_log_path)
+        if shadow_log_after_bytes is None or shadow_log_before_bytes is None:
+            return _SHADOW_LOG_EXACT_REL
+        if shadow_log_after_bytes != shadow_log_before_bytes and not _is_authorized_shadow_log_content_transition(
+            shadow_log_before_bytes, shadow_log_after_bytes
+        ):
+            return _SHADOW_LOG_EXACT_REL
+
     after_snapshot = _snapshot_repo_paths(project_root, issue_number)
     after_status = _git_status_paths(project_root)
     new_raw_status_paths = after_status - before_status
@@ -883,6 +1030,7 @@ def _find_unauthorized_repo_changes(
         if not _is_under_allowed_artifact_root(project_root, issue_number, path)
         and not _is_race_tolerant_unattributable_path(path)
         and path not in _LEDGER_TYPED_EXACT_RELS
+        and path != _SHADOW_LOG_EXACT_REL
         and path.rstrip("/") not in safe_ledger_ancestor_dir_rels
     }
     if new_status_paths:
@@ -924,7 +1072,9 @@ def _find_unauthorized_repo_changes(
         filtered_changed = [
             item
             for item in changed
-            if item not in _LEDGER_TYPED_EXACT_RELS and item not in safe_ledger_ancestor_dir_rels
+            if item not in _LEDGER_TYPED_EXACT_RELS
+            and item != _SHADOW_LOG_EXACT_REL
+            and item not in safe_ledger_ancestor_dir_rels
         ]
         if filtered_changed:
             return sorted(
@@ -1185,6 +1335,12 @@ def main(argv: list[str] | None = None) -> int:
         if ledger_before_kinds.get(_LEDGER_STABLE_EXACT_REL) == "regular"
         else None
     )
+    shadow_log_before_kind = _shadow_log_kind(project_root)
+    shadow_log_before_bytes = (
+        _read_bytes_or_none(Path(project_root) / _SHADOW_LOG_EXACT_REL)
+        if shadow_log_before_kind == "regular"
+        else None
+    )
 
     entry = load_registry_entry(args.command_id, project_root)
     validate_registry_entry(args.command_id, entry, str(args.issue_number))
@@ -1252,6 +1408,8 @@ def main(argv: list[str] | None = None) -> int:
         ledger_before_kinds,
         ledger_before_bytes,
         ledger_ancestor_before_kinds,
+        shadow_log_before_kind,
+        shadow_log_before_bytes,
     )
     if unauthorized_path is not None:
         return _emit_unauthorized_write_failure(args.issue_number, unauthorized_path)
