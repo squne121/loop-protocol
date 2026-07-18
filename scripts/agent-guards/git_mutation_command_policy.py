@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-ALLOWED_RTK_GIT_SUBCOMMANDS = frozenset({"add", "commit", "push"})
+ALLOWED_RTK_GIT_SUBCOMMANDS = frozenset({"add", "commit", "push", "merge"})
 DENIED_PUSH_FLAGS = frozenset({"--force", "-f", "--tags", "--all", "--mirror", "--delete"})
 # Issue #1408 iteration-2 adversarial review (P1): `github_branch_api` /
 # `fetch_then_show_ref` never actually re-read the remote — they were
@@ -35,6 +35,14 @@ COMMAND_CLASS_RTK_GIT_PUSH = "rtk_git_push"
 # the plain `HEAD:refs/heads/<branch>` refspec the existing lane expects.
 COMMAND_CLASS_RTK_GIT_INITIAL_BRANCH_CREATE = "rtk_git_initial_branch_create"
 COMMAND_CLASS_RTK_GIT_UNKNOWN = "rtk_git_unknown"
+# Issue #1589: verified fast-forward merge lane -- exact `rtk git merge
+# --ff-only <40-hex-sha>` command class. Mirrors the
+# execute_initial_branch_create_transaction pattern (Issue #1449): the
+# transaction performs verify -> live-remote-probe -> `git merge --ff-only`
+# -> postcondition-readback inside ONE trusted execution boundary, and
+# `classify_rtk_git_mutation` always returns "deny" for the raw command
+# afterward (the transaction outcome is carried in `reason_code`).
+COMMAND_CLASS_RTK_GIT_MERGE_FF_ONLY = "rtk_git_merge_ff_only"
 ALLOWED_ALLOWED_PATHS_GATE_STATUSES = frozenset({"ok", "fail_closed", "indeterminate"})
 # Issue #1408 iteration-2 (P2): canonical push destination identity. New
 # branch initial publish (remote ref absent) is explicitly out of scope for
@@ -44,6 +52,12 @@ CANONICAL_REPO_IDENTITY_DEFAULT = "squne121/loop-protocol"
 # guard, independent of #360's hook-level destination guard.
 DEFAULT_BRANCH_NAMES = frozenset({"main", "master", "trunk"})
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# Issue #1589: the verified-ff-merge lane restricts the active branch to the
+# canonical linked-issue-worktree naming shape (docs/dev/workflow.md#Worktree
+# 配置規約) so a drifted root checkout on a non-default, non-issue branch
+# cannot be treated as an eligible merge target -- independent of, and in
+# addition to, the DEFAULT_BRANCH_NAMES check below.
+_ISSUE_WORKTREE_BRANCH_RE = re.compile(r"^worktree-issue-\d+-[a-z0-9][a-z0-9-]{0,63}$")
 _CANONICAL_REPO_URL_TEMPLATE = r"^(?:https://github\.com/|git@github\.com:){identity}(?:\.git)?/?$"
 
 # Issue #1449: remote branch state — the exclusive 3-state classification
@@ -807,6 +821,325 @@ def execute_initial_branch_create_transaction(
     )
 
 
+# Issue #1589 (verified-ff-merge lane): exclusive outcome vocabulary for
+# `execute_verified_ff_merge_transaction` -- every merge attempt (success,
+# non-fast-forward rejection, postcondition violation, or a precondition
+# failure that means no merge was attempted at all) is classified into
+# exactly one of these, never silently treated as success.
+MERGE_STATUS_MERGED_AND_VERIFIED = "merged_and_verified"
+MERGE_STATUS_MERGE_REJECTED = "merge_rejected_non_fast_forward"
+MERGE_STATUS_POSTCONDITION_VIOLATION = "postcondition_violation"
+MERGE_STATUS_DENIED = "denied"
+
+
+@dataclass(frozen=True)
+class VerifiedFfMergeTransactionResult:
+    """Outcome of `execute_verified_ff_merge_transaction` (Issue #1589). `status`
+    is `MERGE_STATUS_DENIED` (no merge attempted -- a precondition failed
+    before `git merge` was ever invoked), `MERGE_STATUS_MERGE_REJECTED` (the
+    merge itself was attempted but git refused the fast-forward),
+    `MERGE_STATUS_POSTCONDITION_VIOLATION` (the merge returned success but the
+    post-merge state does not match the required invariants -- e.g. a
+    `post-merge` hook side effect), or `MERGE_STATUS_MERGED_AND_VERIFIED`
+    (the merge succeeded and every postcondition was confirmed)."""
+
+    status: str
+    reason_code: str
+    active_branch: str | None
+    verified_local_head: str | None
+    target_sha: str | None
+    live_remote_head: str | None
+    merge_returncode: int | None
+    post_head: str | None
+
+
+def _is_worktree_clean(cwd: str) -> bool | None:
+    """Return True iff the working tree, index, and submodules are clean
+    (Issue #1589 AC1/AC4). Returns None on probe failure (fail-closed at the
+    call site -- never folded into `False`, mirrors the `probe_error`
+    discrimination used elsewhere in this module)."""
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--ignore-submodules=none"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return not result.stdout.strip()
+
+
+_OPERATION_STATE_FILES = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG")
+
+
+def _git_common_dir(cwd: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    out = result.stdout.strip()
+    if not out:
+        return None
+    return out if os.path.isabs(out) else os.path.join(cwd, out)
+
+
+def _has_in_progress_operation(cwd: str) -> bool | None:
+    """Return True iff a git operation (merge/cherry-pick/revert/bisect/
+    rebase) is currently in progress in `cwd` (Issue #1589 AC1/AC4). Returns
+    None on probe failure (fail-closed at the call site)."""
+    git_dir = _git_common_dir(cwd)
+    if git_dir is None:
+        return None
+    for name in _OPERATION_STATE_FILES:
+        if os.path.exists(os.path.join(git_dir, name)):
+            return True
+    if os.path.isdir(os.path.join(git_dir, "rebase-merge")) or os.path.isdir(
+        os.path.join(git_dir, "rebase-apply")
+    ):
+        return True
+    return False
+
+
+def _is_local_commit_object(cwd: str, sha: str) -> bool:
+    if not _SHA_RE.fullmatch(sha or ""):
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "cat-file", "-t", sha],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "commit"
+
+
+def _merge_denied(
+    reason_code: str,
+    *,
+    active_branch: str | None = None,
+    verified_local_head: str | None = None,
+    target_sha: str | None = None,
+    live_remote_head: str | None = None,
+) -> VerifiedFfMergeTransactionResult:
+    return VerifiedFfMergeTransactionResult(
+        status=MERGE_STATUS_DENIED,
+        reason_code=reason_code,
+        active_branch=active_branch,
+        verified_local_head=verified_local_head,
+        target_sha=target_sha,
+        live_remote_head=live_remote_head,
+        merge_returncode=None,
+        post_head=None,
+    )
+
+
+def execute_verified_ff_merge_transaction(
+    cwd: str,
+    target_sha: str,
+    remote: str = "origin",
+    timeout: int = 30,
+) -> VerifiedFfMergeTransactionResult:
+    """Single trusted verify -> live-remote-probe -> `git merge --ff-only` ->
+    postcondition-readback boundary (Issue #1589), following the
+    `execute_initial_branch_create_transaction` pattern (Issue #1449 / PR
+    #1479): every precondition, the live remote probe, the merge itself, and
+    the postcondition verification happen inside ONE call, so the state that
+    was verified is the SAME state that gets mutated -- closing the TOCTOU
+    window a classify-then-allow-the-raw-command design would leave open.
+
+    Sequence (each step fails closed):
+      1. `target_sha` must be an exact lowercase 40-hex SHA.
+      2. Attached HEAD must be a non-default branch matching the canonical
+         issue-worktree naming shape (`worktree-issue-<N>-<slug>`).
+      3. Worktree/index/submodules must be clean; no git operation may be
+         in progress (`MERGE_HEAD` / `CHERRY_PICK_HEAD` / rebase state / etc).
+      4. `origin`'s configured push URL(s) must resolve to the canonical
+         repository identity.
+      5. Live `git ls-remote --refs --exit-code` for the active branch must
+         return exactly `target_sha` (absent / mismatch / probe error all
+         deny).
+      6. `target_sha` must be a local commit object, and local HEAD must be
+         an ancestor of it.
+      7. Branch/HEAD are re-confirmed unchanged immediately before the merge
+         (narrows, does not eliminate, the verify-to-merge race window).
+      8. `git merge --ff-only <target_sha>` is executed as an argv list with
+         `shell=False` (never shell-string concatenation).
+      9. Postconditions are checked unconditionally after the merge attempt:
+         active branch unchanged, `HEAD == target_sha`, worktree/index clean,
+         and no operation residue (a `post-merge` hook side effect that
+         leaves the tree dirty is NEVER treated as success).
+    """
+    if not _SHA_RE.fullmatch(target_sha or ""):
+        return _merge_denied("invalid_target_sha", target_sha=target_sha)
+
+    active_branch = _current_branch(cwd)
+    if not active_branch:
+        return _merge_denied("detached_head_not_supported", target_sha=target_sha)
+    if active_branch in _resolve_default_branch_names(cwd):
+        return _merge_denied(
+            "merge_target_is_default_branch", active_branch=active_branch, target_sha=target_sha
+        )
+    if not _ISSUE_WORKTREE_BRANCH_RE.fullmatch(active_branch):
+        return _merge_denied(
+            "active_branch_not_issue_worktree_branch", active_branch=active_branch, target_sha=target_sha
+        )
+
+    is_clean = _is_worktree_clean(cwd)
+    if is_clean is None:
+        return _merge_denied(
+            "worktree_status_probe_error", active_branch=active_branch, target_sha=target_sha
+        )
+    if not is_clean:
+        return _merge_denied("worktree_dirty", active_branch=active_branch, target_sha=target_sha)
+
+    has_op = _has_in_progress_operation(cwd)
+    if has_op is None:
+        return _merge_denied(
+            "operation_state_probe_error", active_branch=active_branch, target_sha=target_sha
+        )
+    if has_op:
+        return _merge_denied(
+            "in_progress_git_operation", active_branch=active_branch, target_sha=target_sha
+        )
+
+    if not _origin_push_urls_match_canonical_repo(cwd):
+        return _merge_denied(
+            "origin_remote_identity_mismatch", active_branch=active_branch, target_sha=target_sha
+        )
+
+    local_head = _current_head(cwd)
+    if not local_head:
+        return _merge_denied(
+            "local_head_unavailable", active_branch=active_branch, target_sha=target_sha
+        )
+
+    remote_state, remote_oid, _probe_error_category = classify_remote_branch_state(
+        cwd, remote, active_branch, timeout=timeout
+    )
+    if remote_state != REMOTE_STATE_PRESENT or remote_oid != target_sha:
+        if remote_state == REMOTE_STATE_PROBE_ERROR:
+            reason_code = "live_remote_probe_failed"
+        elif remote_state == REMOTE_STATE_ABSENT:
+            reason_code = "live_remote_branch_absent"
+        else:
+            reason_code = "live_remote_head_mismatch"
+        return _merge_denied(
+            reason_code,
+            active_branch=active_branch,
+            verified_local_head=local_head,
+            target_sha=target_sha,
+            live_remote_head=remote_oid,
+        )
+
+    if not _is_local_commit_object(cwd, target_sha):
+        return _merge_denied(
+            "target_not_local_commit_object",
+            active_branch=active_branch,
+            verified_local_head=local_head,
+            target_sha=target_sha,
+            live_remote_head=remote_oid,
+        )
+
+    if _is_ancestor(cwd, local_head, target_sha) is not True:
+        return _merge_denied(
+            "target_not_descendant_of_head",
+            active_branch=active_branch,
+            verified_local_head=local_head,
+            target_sha=target_sha,
+            live_remote_head=remote_oid,
+        )
+
+    # Re-confirm branch/HEAD have not moved since verification (narrows,
+    # does not eliminate, the verify-to-merge race window).
+    if _current_branch(cwd) != active_branch or _current_head(cwd) != local_head:
+        return _merge_denied(
+            "branch_or_head_changed_before_merge",
+            active_branch=active_branch,
+            verified_local_head=local_head,
+            target_sha=target_sha,
+            live_remote_head=remote_oid,
+        )
+
+    try:
+        proc = subprocess.run(
+            ["git", "merge", "--ff-only", target_sha],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return VerifiedFfMergeTransactionResult(
+            status=MERGE_STATUS_DENIED,
+            reason_code="merge_execution_transport_error",
+            active_branch=active_branch,
+            verified_local_head=local_head,
+            target_sha=target_sha,
+            live_remote_head=remote_oid,
+            merge_returncode=None,
+            post_head=_current_head(cwd),
+        )
+
+    post_branch = _current_branch(cwd)
+    post_head = _current_head(cwd)
+    post_clean = _is_worktree_clean(cwd)
+    post_has_op = _has_in_progress_operation(cwd)
+
+    if proc.returncode != 0:
+        return VerifiedFfMergeTransactionResult(
+            status=MERGE_STATUS_MERGE_REJECTED,
+            reason_code="merge_ff_only_rejected",
+            active_branch=active_branch,
+            verified_local_head=local_head,
+            target_sha=target_sha,
+            live_remote_head=remote_oid,
+            merge_returncode=proc.returncode,
+            post_head=post_head,
+        )
+
+    if post_branch != active_branch or post_head != target_sha or post_clean is not True or post_has_op is not False:
+        return VerifiedFfMergeTransactionResult(
+            status=MERGE_STATUS_POSTCONDITION_VIOLATION,
+            reason_code="postcondition_check_failed",
+            active_branch=active_branch,
+            verified_local_head=local_head,
+            target_sha=target_sha,
+            live_remote_head=remote_oid,
+            merge_returncode=proc.returncode,
+            post_head=post_head,
+        )
+
+    return VerifiedFfMergeTransactionResult(
+        status=MERGE_STATUS_MERGED_AND_VERIFIED,
+        reason_code="verified_ff_merge_completed",
+        active_branch=active_branch,
+        verified_local_head=local_head,
+        target_sha=target_sha,
+        live_remote_head=remote_oid,
+        merge_returncode=proc.returncode,
+        post_head=post_head,
+    )
+
+
 def _canonical_repo_identity() -> str:
     return os.environ.get("LOOP_CANONICAL_REPO_IDENTITY", "").strip() or CANONICAL_REPO_IDENTITY_DEFAULT
 
@@ -1425,6 +1758,40 @@ def _classify_initial_branch_create_push(
     )
 
 
+def _classify_rtk_git_merge(
+    args: list[str], *, cwd: str, boundary_layer: str
+) -> GitMutationPolicyResult:
+    """Classify an `rtk git merge` candidate (Issue #1589). Only the exact
+    2-token shape `--ff-only <40-hex-sha>` is recognized; every other shape
+    (short/non-hex SHA, reordered flags, extra options, `--no-ff`, a bare
+    branch name, etc.) is denied BEFORE `execute_verified_ff_merge_transaction`
+    is ever invoked -- no subprocess side effect occurs for a malformed
+    command. When the shape is exact, the transaction performs the actual
+    verify/probe/merge/readback and this function always returns "deny" (the
+    transaction outcome is carried in `reason_code`) so the caller's raw
+    `rtk git merge` command is never independently re-run afterward."""
+    if len(args) != 2 or args[0] != "--ff-only" or not _SHA_RE.fullmatch((args[1] or "").lower()):
+        return GitMutationPolicyResult(
+            status="deny",
+            command_class=COMMAND_CLASS_RTK_GIT_MERGE_FF_ONLY,
+            reason_code="merge_shape_requires_exact_ff_only_sha",
+            suggested_command="rtk git merge --ff-only <40-hex-target-sha>",
+            verification_command="git branch --show-current",
+        )
+    target_sha = args[1].lower()
+    transaction = execute_verified_ff_merge_transaction(cwd, target_sha, remote="origin", timeout=30)
+    return GitMutationPolicyResult(
+        status="deny",
+        command_class=COMMAND_CLASS_RTK_GIT_MERGE_FF_ONLY,
+        reason_code=transaction.reason_code,
+        target_branch=transaction.active_branch,
+        local_head=transaction.verified_local_head,
+        current_remote_head=transaction.live_remote_head,
+        boundary_layer=boundary_layer,
+        verification_command="git rev-parse HEAD",
+    )
+
+
 def classify_rtk_git_mutation(
     command: str,
     *,
@@ -1527,6 +1894,9 @@ def classify_rtk_git_mutation(
             command_class=COMMAND_CLASS_RTK_GIT_COMMIT,
             reason_code="rtk_git_commit_allowed",
         )
+
+    if subcommand == "merge":
+        return _classify_rtk_git_merge(args, cwd=cwd, boundary_layer=boundary_layer)
 
     if any(flag in args for flag in DENIED_PUSH_FLAGS):
         return GitMutationPolicyResult(

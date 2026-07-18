@@ -739,6 +739,39 @@ AC8（実 PreToolUse hook chain）テストは `secret_boundary_guard` / `local_
 - linked issue worktree context では、`is_local_root_context()` の context routing が classifier より先に評価されるため、`scope_rollup.run` classifier 自体には到達しない（`linked_issue_worktree_context` / `not_local_root` が先に allow を返す）
 - **既知の follow-up（本 fix_delta ではスコープ外）**: `skill_runtime_exec.py` を単一 registry SSOT として `scope_rollup.run` を統合すること（P1-5）。この executor は元々 `skill_runtime_exec.py` の Allowed Paths 外として独立レーンに設計されており（上記参照）、統合には `skill_runtime_exec.py`（直近で 500 行超の別 PR 変更が入ったばかり）への大規模な変更と Allowed Paths のさらなる拡張が必要になるため、本 PR のスコープには含めない。
 
+## 12d. verified fast-forward merge lane（検証済み fast-forward merge レーン, Issue #1589）
+
+`scripts/agent-guards/git_mutation_command_policy.py` の `classify_rtk_git_mutation` は、`ALLOWED_RTK_GIT_SUBCOMMANDS` に `merge` を追加し、exact `rtk git merge --ff-only <40-hex-target-sha>` を独立の command class（`COMMAND_CLASS_RTK_GIT_MERGE_FF_ONLY` = `rtk_git_merge_ff_only`）として認識する。linked issue worktree の active branch を live-verified remote head へ安全に fast-forward するための lane であり、`execute_initial_branch_create_transaction`（Issue #1449 / PR #1479）と同じ「単一 trusted execution boundary が verify・probe・実際の mutation・postcondition-readback を全て内包し、呼び出し元の raw command は常に deny として返す」設計パターンを踏襲する。
+
+### trusted transaction の内容
+
+`execute_verified_ff_merge_transaction(cwd, target_sha)` は、以下を **全て** 満たす場合のみ `git merge --ff-only <target_sha>`（argv list、`shell=False`）を実行する。いずれか一つでも欠ければ merge は一切実行されない（`git merge` 呼び出し前に fail-closed で deny）。
+
+1. `target_sha` が exact lowercase 40-hex SHA である。
+2. attached HEAD が非 detached であり、`DEFAULT_BRANCH_NAMES`（main/master/trunk + `origin/HEAD` 解決値 + `LOOP_DEFAULT_BRANCH`）に含まれない、かつ `_ISSUE_WORKTREE_BRANCH_RE`（`worktree-issue-<N>-<slug>` の canonical 命名形状、`docs/dev/workflow.md#Worktree 配置規約` 準拠）に一致する。
+3. `git status --porcelain=v1 --ignore-submodules=none` が空（tracked/untracked/submodule すべて clean）であり、`MERGE_HEAD` / `CHERRY_PICK_HEAD` / `REVERT_HEAD` / `BISECT_LOG` / `rebase-merge` / `rebase-apply` のいずれも存在しない(進行中の git operation なし)。
+4. `origin` の全 push URL が `LOOP_CANONICAL_REPO_URL_PATTERN`（既定は `squne121/loop-protocol` の GitHub canonical URL）に一致する。
+5. 対象 active branch に対する live `git ls-remote --refs --exit-code origin refs/heads/<active-branch>` の結果が `target_sha` と完全一致する（`absent` / `probe_error` / mismatch はいずれも deny — `classify_remote_branch_state` の 3-state 語彙をそのまま使用）。
+6. `target_sha` が local commit object であり（`git cat-file -t`）、local HEAD がその ancestor である（`git merge-base --is-ancestor`）。
+7. merge 実行の直前に branch/HEAD が変化していないことを再確認する（verify-to-merge race window を狭める。ゼロにはしない）。
+
+merge 実行後は、active branch 不変・`HEAD == target_sha`・`git status` clean・operation residue なしを無条件に確認する。`post-merge` hook が working tree を変更した場合（clean でなくなる）は `postcondition_violation` として **成功扱いにしない**。`git merge --ff-only` 自体が非ゼロ終了した場合は `merge_rejected_non_fast_forward` として区別する。
+
+### exact allow 条件
+
+`classify_rtk_git_mutation` は、上記 transaction の実行結果に関わらず（成功・拒否・precondition failure のいずれでも）常に `status: "deny"` を返す。transaction の outcome（`verified_ff_merge_completed` / `merge_ff_only_rejected` / `postcondition_check_failed` / 各種 precondition deny 理由）は `reason_code` にそのまま格納され、呼び出し元の raw `rtk git merge` コマンドが別途再実行されることはない。shape が exact 2-token `--ff-only <40-hex-sha>` でない場合（短縮/非hex SHA、flag 順序変更、追加 option、`--no-ff`、bare branch name 等）は transaction を呼び出す前に `merge_shape_requires_exact_ff_only_sha` で deny する。
+
+### Codex allow rule（Codex 許可ルール）
+
+`.codex/rules/default.rules` は exact `rtk git merge --ff-only` prefix のみを、既存の generic `rtk git merge`（`--ff-only` を伴わない形状は引き続き prompt）バケットより前に allow として追加する。Codex 側での不要な人間確認を避けるためであり、実際の安全性強制は引き続き `git_mutation_command_policy.py` の trusted transaction が担う。
+
+### deny 境界
+
+- root checkout（default branch）・非 issue-worktree 命名の branch・detached HEAD はいずれも `git merge` 呼び出し前に deny される（`local_main_branch_guard.py` / Codex 両 flavor で回帰確認済み）。
+- `git reset --hard` / `rtk git push --force ...` 等の既存 destructive command deny は本 lane 追加後も維持される。
+- raw `git merge`（`rtk` prefix なし）は本 policy の対象外（`classify_rtk_git_mutation` は `no_match` を返し、他レイヤーの一般的な mutating command 判定に委ねる）。
+- `.claude/worktrees/issue-1589-linked-issue-worktree-verified-fast-forw` の worktree_scope_guard 統合は、既存の `classify_rtk_git_mutation` 汎用ディスパッチ（resolved active Issue の clean linked worktree にのみ command class を通す既存経路）をそのまま利用し、本 Issue で `worktree_scope_guard.py` 自体の分岐追加は不要だった（既存 230 テスト回帰確認済み）。
+
 ---
 
 ---
