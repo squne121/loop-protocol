@@ -94,6 +94,17 @@ MAX_SAFE_READ_BYTES = 1_000_000
 
 _BLOCKER_CLAIM_ITEM_REQUIRED = ("reviewer_blocker_code", "message", "line_start", "line_end")
 
+# Issue #1541 PR #1557 OWNER REQUEST_CHANGES High-2: the 2048-byte envelope
+# cap bounds the SERIALIZED claim line, but does not by itself bound the
+# *shape* of the parsed claim object (e.g. a pathological input could try to
+# pack many short blocker entries, or a single very long code/message, into
+# that byte budget in aggregate before the outer envelope cap is measured).
+# These schema-level bounds are a defense-in-depth structural cap,
+# independent of and in addition to the byte budget.
+MAX_BLOCKER_CLAIM_ITEMS = 100
+MAX_REVIEWER_BLOCKER_CODE_LENGTH = 200
+MAX_BLOCKER_CLAIM_MESSAGE_LENGTH = 2000
+
 
 def _reject_nonfinite_json(token: str) -> None:
     raise ValueError(f"Non-finite JSON constant rejected: {token}")
@@ -130,6 +141,17 @@ def canonical_json_bytes(payload: Any) -> bytes:
     order or platform. `ensure_ascii=True` so non-ASCII property values
     never change the byte-for-byte outcome across platforms with different
     default encodings.
+
+    Issue #1541 PR #1557 OWNER REQUEST_CHANGES P2-2: this is a
+    project-local Python canonical JSON encoding (`json.dumps(...,
+    sort_keys=True, separators=(",", ":"), ensure_ascii=True)`) -- it is
+    NOT an implementation of RFC 8785 JSON Canonicalization Scheme (JCS).
+    In particular it does not perform JCS's Unicode NFC normalization,
+    JCS's specific number serialization (`ECMAScript`-compatible number
+    formatting), or interoperate with a non-Python JCS implementation.
+    Only THIS function's own byte output is ever compared byte-for-byte
+    elsewhere in this codebase (never against an external JCS producer),
+    so that is the only interoperability property this docstring claims.
     """
     return json.dumps(
         payload,
@@ -182,6 +204,13 @@ def validate_reviewer_blocker_claim(claim: Any) -> dict[str, Any]:
     blockers = claim.get("blockers")
     if not isinstance(blockers, list):
         raise ValueError("reviewer_blocker_claim.blockers must be a list")
+    # Issue #1541 High-2: structural cap on the number of blocker entries --
+    # independent of, and in addition to, the outer 2048-byte envelope cap.
+    if len(blockers) > MAX_BLOCKER_CLAIM_ITEMS:
+        raise ValueError(
+            f"reviewer_blocker_claim.blockers exceeds maxItems={MAX_BLOCKER_CLAIM_ITEMS}: "
+            f"got {len(blockers)}"
+        )
 
     normalized_blockers: list[dict[str, Any]] = []
     for index, item in enumerate(blockers):
@@ -201,9 +230,19 @@ def validate_reviewer_blocker_claim(claim: Any) -> dict[str, Any]:
         code = item.get("reviewer_blocker_code")
         if not isinstance(code, str) or not code.strip():
             raise ValueError(f"reviewer_blocker_claim.blockers[{index}].reviewer_blocker_code invalid")
+        if len(code) > MAX_REVIEWER_BLOCKER_CODE_LENGTH:
+            raise ValueError(
+                f"reviewer_blocker_claim.blockers[{index}].reviewer_blocker_code exceeds "
+                f"maxLength={MAX_REVIEWER_BLOCKER_CODE_LENGTH}: got {len(code)}"
+            )
         message = item.get("message")
         if message is not None and not isinstance(message, str):
             raise ValueError(f"reviewer_blocker_claim.blockers[{index}].message must be string or null")
+        if isinstance(message, str) and len(message) > MAX_BLOCKER_CLAIM_MESSAGE_LENGTH:
+            raise ValueError(
+                f"reviewer_blocker_claim.blockers[{index}].message exceeds "
+                f"maxLength={MAX_BLOCKER_CLAIM_MESSAGE_LENGTH}: got {len(message)}"
+            )
         for field_name in ("line_start", "line_end"):
             value = item.get(field_name)
             if value is not None and not isinstance(value, int):
@@ -235,7 +274,22 @@ def read_file_safely(path: str, *, max_bytes: int = MAX_SAFE_READ_BYTES) -> byte
     """Open `path` rejecting symlinks (O_NOFOLLOW), non-regular files, and
     oversized content. Raises `ValueError` (fail-closed) on any violation.
     Never uses `Path.read_text()` / `open()` (those follow symlinks and do
-    not bound the read size before touching the filesystem)."""
+    not bound the read size before touching the filesystem).
+
+    Guarantee scope (Issue #1541 PR #1557 OWNER REQUEST_CHANGES P2-1):
+    `O_NOFOLLOW` rejects a symlink ONLY at the final path component -- an
+    ancestor directory component that is itself a symlink is still
+    transparently followed by the OS before this open() call ever executes
+    (this function does not walk/verify each intermediate path segment).
+    This is a Linux-guaranteed `O_NOFOLLOW` semantic; `os.O_NOFOLLOW` is not
+    guaranteed to exist on every platform Python runs on (hence the
+    `hasattr(os, "O_NOFOLLOW")` guard below) -- on a platform where the flag
+    is unavailable, the final-component symlink check is silently skipped
+    rather than failing closed. Callers that need to reject symlinked
+    ancestor directories, or that need a hard guarantee on
+    non-`O_NOFOLLOW`-supporting platforms, must perform that check
+    separately (e.g. `Path.resolve()` containment comparison against a
+    trusted root) before calling this function."""
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -270,6 +324,19 @@ def _read_json_file_safely(path: str) -> Any:
 
 # ---------------------------------------------------------------------------
 # PARENT_REPLAY_BINDING_ARTIFACT_V1 strict schema (High-1)
+#
+# Issue #1541 PR #1557 OWNER REQUEST_CHANGES P2-3: this is a STRICT
+# TOP-LEVEL ENVELOPE schema. `additionalProperties: false` is enforced only
+# at the top level and at `input_digests` (one level deep) -- `replay_result`
+# and `replay_next_state` are each declared as bare `{"type": "object"}`,
+# i.e. their OWN internal shape is not independently schema-validated here.
+# Those two objects are instead cross-checked field-by-field, exact-match,
+# against `reviewer_claim_replay.analyze()`'s own return value by
+# `validate_review_compact_output_v2()` (see `_validate_parent_replay_fields()`
+# / the `expected_*` comparisons in that function) -- this schema's
+# responsibility ends at "the top-level envelope has exactly these keys,
+# with exactly these top-level types", not "every nested field of
+# `replay_result` / `replay_next_state` is itself schema-constrained".
 # ---------------------------------------------------------------------------
 
 PARENT_REPLAY_BINDING_ARTIFACT_V1_SCHEMA: dict[str, Any] = {
