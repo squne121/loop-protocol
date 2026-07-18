@@ -300,6 +300,9 @@ def generate_verdict(
     artifact_id: str | None = None,
     artifact_url: str | None = None,
     artifact_digest: str | None = None,
+    artifact_name: str | None = None,
+    artifact_workflow_run_id: int | None = None,
+    artifact_workflow_run_attempt: int | None = None,
 ) -> dict[str, Any]:
     """Build the ci_verdict_summary_v2 artifact dict.
 
@@ -318,10 +321,13 @@ def generate_verdict(
 
     # B4: populate artifact_refs from upload-artifact outputs
     artifact_refs: list[dict[str, Any]] = []
-    if artifact_id or artifact_url:
+    if artifact_id or artifact_url or artifact_name:
         ref: dict[str, Any] = {
             "artifact_id": artifact_id,
             "artifact_url": artifact_url,
+            "artifact_name": artifact_name,
+            "workflow_run_id": artifact_workflow_run_id,
+            "workflow_run_attempt": artifact_workflow_run_attempt,
         }
         if artifact_digest:
             ref["artifact_digest"] = artifact_digest
@@ -402,7 +408,7 @@ def render_step_summary(artifact: dict[str, Any]) -> str:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate ci_verdict_summary_v2 artifact")
-    p.add_argument("--expected-head-sha", required=True)
+    p.add_argument("--expected-head-sha", default=None)
     p.add_argument("--pr-head-sha", default=None)
     p.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", ""))
     p.add_argument("--workflow-run-id", type=int, default=0)
@@ -412,12 +418,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--needs-json", default=None, help="JSON string or @file with needs.*.result map")
     p.add_argument("--checks-json", default=None, help="Path to JSON file containing check run list")
     p.add_argument("--checks-stdin", action="store_true", help="Read check runs JSON from stdin")
-    p.add_argument("--output", required=True, help="Output path for ci_verdict_summary_v2.json")
+    p.add_argument("--output", default=None, help="Output path for ci_verdict_summary_v2.json")
+    p.add_argument("--summary-input", default=None, help="Existing artifact JSON to render without regenerating it")
     p.add_argument("--summary-output", default=None, help="Optional path to write step summary markdown")
     # B4: artifact upload metadata (from actions/upload-artifact outputs)
     p.add_argument("--artifact-id", default=None, help="artifact-id from upload-artifact output")
     p.add_argument("--artifact-url", default=None, help="artifact-url from upload-artifact output")
     p.add_argument("--artifact-digest", default=None, help="artifact-digest from upload-artifact output")
+    p.add_argument("--artifact-name", default=None, help="Name of the already-uploaded binding artifact")
+    p.add_argument("--artifact-workflow-run-id", type=int, default=None)
+    p.add_argument("--artifact-workflow-run-attempt", type=int, default=None)
     return p.parse_args(argv)
 
 
@@ -459,6 +469,27 @@ def needs_json_to_raw_checks(needs_map: dict[str, str]) -> list[dict[str, Any]]:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+
+    if args.summary_input:
+        with open(args.summary_input) as f:
+            artifact = json.load(f)
+        summary = render_step_summary(artifact)
+        if args.summary_output:
+            with open(args.summary_output, "w") as f:
+                f.write(summary)
+            print(f"Written summary: {args.summary_output}", file=sys.stderr)
+        elif os.environ.get("GITHUB_STEP_SUMMARY"):
+            with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                f.write(summary)
+            print("Written to GITHUB_STEP_SUMMARY", file=sys.stderr)
+        return 0
+
+    if not args.output:
+        print("ERROR: --output is required unless --summary-input is supplied", file=sys.stderr)
+        return 1
+    if not args.expected_head_sha:
+        print("ERROR: --expected-head-sha is required when generating an artifact", file=sys.stderr)
+        return 1
 
     raw_checks: list[dict[str, Any]]
 
@@ -510,6 +541,9 @@ def main(argv: list[str] | None = None) -> int:
         artifact_id=args.artifact_id,
         artifact_url=args.artifact_url,
         artifact_digest=args.artifact_digest,
+        artifact_name=args.artifact_name,
+        artifact_workflow_run_id=args.artifact_workflow_run_id,
+        artifact_workflow_run_attempt=args.artifact_workflow_run_attempt,
     )
 
     output_path = args.output

@@ -40,6 +40,12 @@ PRODUCER_SCRIPT_PATH = (
     / "scripts"
     / "baseline_vc_preflight.py"
 )
+ADJUDICATOR_PATH = ".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"
+ADJUDICATOR_DIFF_SUMMARY = {
+    "changed_paths": [ADJUDICATOR_PATH],
+    "head_sha": "head-1",
+    "pr_number": 1544,
+}
 
 _spec = importlib.util.spec_from_file_location(
     "adjudicate_vc_result_non_regression_gate", ADJUDICATE_SCRIPT_PATH
@@ -95,6 +101,131 @@ def _run_producer(
     completed = subprocess.run(argv, capture_output=True, text=True, check=False)
     assert completed.stdout, f"producer emitted no stdout: {completed.stderr}"
     return json.loads(completed.stdout)
+
+
+def _manual_vc_result(
+    ac: str,
+    *,
+    command_hash: str,
+    classification: str,
+    decision: str,
+    scope_class: str | None,
+    exit_code: int | None,
+) -> dict:
+    item = {
+        "ac": ac,
+        "command_hash": command_hash,
+        "classification": classification,
+        "decision": decision,
+        "category": "regression_gate",
+        "scope_class": scope_class,
+        "runner": "exec",
+        "exit_code": exit_code,
+        "failure_keys": [],
+        "raw_command": "pytest tests/test_alpha.py",
+    }
+    if scope_class == "pr_review_only":
+        item.update(
+            {
+                "category": "preflight_scope_pr_review_only",
+                "runner": "skipped",
+                "verification_owner": "pr-review-judge",
+                "deferred_reason": "VC marked pr_review_only; verification deferred to PR review",
+                "runtime_verification_required": False,
+            }
+        )
+    return item
+
+
+def _manual_contract_snapshot(items: list[dict]) -> dict:
+    return {
+        "schema": "CONTRACT_REVIEW_RESULT_V1",
+        "status": "go",
+        "body_sha256": "sha256:" + "b" * 64,
+        "checks": {
+            "vc_preflight": {
+                "classifications": items,
+            }
+        },
+    }
+
+
+def _manual_current_payload(items: list[dict], *, head_sha: str, reviewed_head_sha: str) -> dict:
+    return {
+        "schema": "baseline_vc_preflight/v1",
+        "issue": 1488,
+        "generated_at": "2026-07-11T10:00:00Z",
+        "status": "pass",
+        "errors": [],
+        "fallback_detected": False,
+        "human_review_required": False,
+        "stop_condition_triggered": False,
+        "source": {"body_sha256": "sha256:" + "b" * 64},
+        "head_sha": head_sha,
+        "reviewed_head_sha": reviewed_head_sha,
+        "results": items,
+    }
+
+
+def _manual_test_verdict(
+    items: list[dict],
+    *,
+    head_sha: str,
+    reviewed_head_sha: str,
+    diff_head_sha: str,
+    issue_number: int = 1488,
+    pr_number: int = 1544,
+    contract_body_sha256: str = "sha256:" + "b" * 64,
+) -> dict:
+    command_hashes = sorted(item["command_hash"] for item in items)
+    artifact_payload = {
+        "issue_number": issue_number,
+        "pr_number": pr_number,
+        "head_sha": head_sha,
+        "reviewed_head_sha": reviewed_head_sha,
+        "diff_head_sha": diff_head_sha,
+        "contract_body_sha256": contract_body_sha256,
+        "command_hashes": command_hashes,
+    }
+    return {
+        "schema": "TEST_VERDICT_MACHINE/v2",
+        "producer_kind": "test-runner",
+        "repository": "squne121/loop-protocol",
+        "issue_number": issue_number,
+        "pr_number": pr_number,
+        "head_sha": head_sha,
+        "reviewed_head_sha": reviewed_head_sha,
+        "diff_head_sha": diff_head_sha,
+        "contract_body_sha256": contract_body_sha256,
+        "run_id": "run-1544-1",
+        "run_url": "https://example.invalid/runs/1544",
+        "workflow_run_id": 1544,
+        "workflow_run_attempt": 1,
+        "check_run_id": 15440,
+        "artifact": {
+            "name": "test-verdict-machine",
+            "artifact_digest": "sha256:" + "a" * 64,
+            "url": "https://github.com/squne121/loop-protocol/actions/runs/1544/artifacts/1",
+        },
+        "artifact_payload": artifact_payload,
+        "artifact_payload_sha256": mod._sha256(mod._canonical_json(artifact_payload)),
+        "result": "PASS",
+        "verification_commands_pass": len(items),
+        "verification_commands_fail": 0,
+        "verification_skipped_count": 0,
+        "runtime_ac_results": [
+            {
+                "ac": item["ac"],
+                "command_hash": item["command_hash"],
+                "exit_code": 0,
+                "status": "pass",
+                "fallback_detected": False,
+                "human_review_required": False,
+                "stop_condition_triggered": False,
+            }
+            for item in items
+        ],
+    }
 
 
 def _git_diff_changed_paths(repo: Path, base_sha: str, head_sha: str) -> list[str]:
@@ -304,6 +435,143 @@ def test_real_producer_baseline_mode_non_regression_gate_pass_stays_uncertified(
     # AC1: baseline mode must NOT certify a non-regression-gate exit 0 VC.
     assert current_vc_result["status"] != "pass"
     assert current_vc_result["results"][0]["classification"] == "unexpected_pass"
+
+
+def test_real_producer_pr_review_only_current_head_envelope_is_adjudicated(
+    tmp_path: Path,
+) -> None:
+    """A real producer skip is excluded only after its routing evidence is complete."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "tracked.txt").write_text("fixture\n", encoding="utf-8")
+    head = _commit_all(repo, "initial")
+    body_file = tmp_path / "issue-1540-pr-review-only-body.md"
+    body_file.write_text(
+        "## Allowed Paths\n"
+        "- tracked.txt\n\n"
+        "## Verification Commands\n\n"
+        "```bash\n"
+        "# AC1\n"
+        "# preflight-scope: pr_review_only\n"
+        "$ rg -q fixture tracked.txt\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    current_vc_result = _run_producer(
+        repo=repo,
+        body_file=body_file,
+        evidence_mode="current-head",
+        reviewed_head_sha=head,
+    )
+
+    assert current_vc_result["status"] == "pass"
+    current_item = current_vc_result["results"][0]
+    assert current_item["scope_class"] == "pr_review_only"
+    assert current_item["classification"] == "skipped"
+    assert current_item["category"] == "preflight_scope_pr_review_only"
+    assert current_item["verification_owner"] == "pr-review-judge"
+    assert current_item["runtime_verification_required"] is False
+
+    contract_snapshot = {
+        "schema": "CONTRACT_REVIEW_RESULT_V1",
+        "status": "go",
+        "body_sha256": current_vc_result["source"]["body_sha256"],
+        "checks": {"vc_preflight": {"classifications": [current_item]}},
+    }
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=contract_snapshot,
+        current_vc_result=current_vc_result,
+        diff_summary={
+            "changed_paths": ["tracked.txt"],
+            "head_sha": head,
+            "pr_number": 1544,
+        },
+        allowed_paths=["tracked.txt"],
+        test_verdict=_manual_test_verdict(
+            [current_item],
+            head_sha=head,
+            reviewed_head_sha=head,
+            diff_head_sha=head,
+            issue_number=current_vc_result["issue"],
+            contract_body_sha256=current_vc_result["source"]["body_sha256"],
+        ),
+    )
+
+    assert result["overall_status"] == "pass"
+    assert result["per_ac"][0]["reason_code"] == "pr_review_only_runtime_evidence_pass"
+
+
+def test_test_verdict_v2_provenance_rejects_tampered_artifact_payload() -> None:
+    """GIVEN a producer-authorized skip WHEN artifact binding drifts THEN PASS is denied."""
+    item = _manual_vc_result(
+        "AC8",
+        command_hash="sha256:" + "8" * 64,
+        classification="skipped",
+        decision="go",
+        scope_class="pr_review_only",
+        exit_code=None,
+    )
+    snapshot = _manual_contract_snapshot([item])
+    current = _manual_current_payload([item], head_sha="head-8", reviewed_head_sha="head-8")
+    verdict = _manual_test_verdict(
+        [item], head_sha="head-8", reviewed_head_sha="head-8", diff_head_sha="head-8"
+    )
+    verdict["artifact_payload"]["head_sha"] = "stale-head"
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=snapshot,
+        current_vc_result=current,
+        diff_summary={"changed_paths": [ADJUDICATOR_PATH], "head_sha": "head-8", "pr_number": 1544},
+        allowed_paths=[ADJUDICATOR_PATH],
+        test_verdict=verdict,
+    )
+
+    assert result["overall_status"] == "indeterminate"
+    assert result["errors"] == ["test_verdict_artifact_digest_mismatch"]
+
+
+def test_test_verdict_v2_provenance_requires_github_artifact_digest() -> None:
+    """A payload self-hash cannot substitute for Actions artifact metadata."""
+    item = _manual_vc_result(
+        "AC8",
+        command_hash="sha256:" + "8" * 64,
+        classification="skipped",
+        decision="go",
+        scope_class="pr_review_only",
+        exit_code=None,
+    )
+    snapshot = _manual_contract_snapshot([item])
+    current = _manual_current_payload([item], head_sha="head-8", reviewed_head_sha="head-8")
+    verdict = _manual_test_verdict(
+        [item], head_sha="head-8", reviewed_head_sha="head-8", diff_head_sha="head-8"
+    )
+    verdict["artifact"].pop("artifact_digest")
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=snapshot,
+        current_vc_result=current,
+        diff_summary={"changed_paths": [ADJUDICATOR_PATH], "head_sha": "head-8", "pr_number": 1544},
+        allowed_paths=[ADJUDICATOR_PATH],
+        test_verdict=verdict,
+    )
+
+    assert result["overall_status"] == "indeterminate"
+    assert result["errors"] == ["test_verdict_artifact_digest_invalid"]
+
+
+def test_per_ac_coverage_rejects_empty_pass() -> None:
+    """GIVEN a direct result construction WHEN PASS has no AC coverage THEN it fails closed."""
+    result = mod._result(
+        overall_status="pass",
+        per_ac=[],
+        rerun_required=False,
+        source_integrity={},
+        evidence_refs=[],
+    )
+
+    assert result["overall_status"] == "indeterminate"
+    assert result["blocking"] is True
+    assert result["errors"] == ["pass_requires_per_ac_coverage"]
 
 
 # ---------------------------------------------------------------------------
@@ -575,3 +843,375 @@ def test_e2e_negative_head_drift_never_resolves_via_pipeline(tmp_path: Path) -> 
     )
     assert result["overall_status"] != "pass"
     assert result["blocking"] is True
+
+
+def test_non_regression_scope_pr_review_only_skip_item_is_excluded_from_regression_comparison() -> None:
+    baseline = _manual_contract_snapshot(
+        [
+            _manual_vc_result(
+                "AC1",
+                command_hash="sha256:" + "a" * 64,
+                classification="expected_fail",
+                decision="go",
+                scope_class=None,
+                exit_code=1,
+            ),
+            _manual_vc_result(
+                "AC2",
+                command_hash="sha256:" + "c" * 64,
+                classification="skipped",
+                decision="go",
+                scope_class="pr_review_only",
+                exit_code=1,
+            ),
+        ]
+    )
+    current = _manual_current_payload(
+        [
+            _manual_vc_result(
+                "AC1",
+                command_hash="sha256:" + "a" * 64,
+                classification="expected_pass",
+                decision="go",
+                scope_class=None,
+                exit_code=0,
+            ),
+            _manual_vc_result(
+                "AC2",
+                command_hash="sha256:" + "c" * 64,
+                classification="skipped",
+                decision="go",
+                scope_class="pr_review_only",
+                exit_code=1,
+            ),
+        ],
+        head_sha="head-1",
+        reviewed_head_sha="head-1",
+    )
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
+        test_verdict=_manual_test_verdict(
+            baseline["checks"]["vc_preflight"]["classifications"],
+            head_sha="head-1",
+            reviewed_head_sha="head-1",
+            diff_head_sha="head-1",
+        ),
+    )
+
+    assert result["overall_status"] == "pass"
+    assert len(result["per_ac"]) == 1
+    assert result["per_ac"][0]["ac"] == "AC1"
+    assert result["per_ac"][0]["reason_code"] == "expected_fail_resolved_on_current_head"
+
+
+def test_non_regression_scope_pr_review_only_skip_missing_scope_is_not_excluded() -> None:
+    baseline = _manual_contract_snapshot(
+        [
+            _manual_vc_result(
+                "AC1",
+                command_hash="sha256:" + "a" * 64,
+                classification="skipped",
+                decision="go",
+                scope_class="runtime_only",
+                exit_code=1,
+            ),
+        ]
+    )
+    current = _manual_current_payload(
+        [
+            _manual_vc_result(
+                "AC1",
+                command_hash="sha256:" + "a" * 64,
+                classification="expected_pass",
+                decision="go",
+                scope_class="runtime_only",
+                exit_code=0,
+            )
+        ],
+        head_sha="head-1",
+        reviewed_head_sha="head-1",
+    )
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
+    )
+
+    assert result["overall_status"] != "pass"
+    assert result["blocking"] is True
+    assert result["errors"] == ["unsupported_baseline_classification:AC1"]
+
+
+def test_non_regression_scope_pr_review_only_skip_wrong_decision_is_not_excluded() -> None:
+    baseline = _manual_contract_snapshot(
+        [
+            _manual_vc_result(
+                "AC1",
+                command_hash="sha256:" + "a" * 64,
+                classification="skipped",
+                decision="blocked",
+                scope_class="pr_review_only",
+                exit_code=1,
+            ),
+        ]
+    )
+    current = _manual_current_payload(
+        [
+            _manual_vc_result(
+                "AC1",
+                command_hash="sha256:" + "a" * 64,
+                classification="expected_pass",
+                decision="go",
+                scope_class="pr_review_only",
+                exit_code=0,
+            )
+        ],
+        head_sha="head-1",
+        reviewed_head_sha="head-1",
+    )
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
+    )
+
+    assert result["overall_status"] != "pass"
+    assert result["blocking"] is True
+    assert result["errors"] == ["unsupported_baseline_classification:AC1"]
+
+
+def test_current_head_runtime_evidence_is_required_for_pr_review_only_only_payload() -> None:
+    baseline = _manual_contract_snapshot(
+        [
+            _manual_vc_result(
+                "AC1",
+                command_hash="sha256:" + "a" * 64,
+                classification="skipped",
+                decision="go",
+                scope_class="pr_review_only",
+                exit_code=1,
+            ),
+        ]
+    )
+    current = _manual_current_payload(
+        [
+            _manual_vc_result(
+                "AC1",
+                command_hash="sha256:" + "a" * 64,
+                classification="skipped",
+                decision="go",
+                scope_class="pr_review_only",
+                exit_code=None,
+            )
+        ],
+        head_sha="head-1",
+        reviewed_head_sha="head-1",
+    )
+
+    certified = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
+        test_verdict=_manual_test_verdict(
+            baseline["checks"]["vc_preflight"]["classifications"],
+            head_sha="head-1",
+            reviewed_head_sha="head-1",
+            diff_head_sha="head-1",
+        ),
+    )
+    assert certified["overall_status"] == "pass"
+    assert certified["per_ac"][0]["reason_code"] == "pr_review_only_runtime_evidence_pass"
+
+    current["reviewed_head_sha"] = "head-0"
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
+    )
+
+    assert result["overall_status"] != "pass"
+    assert result["blocking"] is True
+    assert result["errors"] == ["test_verdict_missing"]
+
+
+def test_pr_review_only_rejects_incomplete_evidence() -> None:
+    baseline = _manual_contract_snapshot(
+        [
+            _manual_vc_result(
+                "AC1",
+                command_hash="sha256:" + "a" * 64,
+                classification="skipped",
+                decision="go",
+                scope_class="pr_review_only",
+                exit_code=None,
+            ),
+        ]
+    )
+    current = _manual_current_payload(
+        [
+            _manual_vc_result(
+                "AC1",
+                command_hash="sha256:" + "a" * 64,
+                classification="expected_pass",
+                decision="go",
+                scope_class="pr_review_only",
+                exit_code=0,
+            )
+        ],
+        head_sha="head-1",
+        reviewed_head_sha="head-1",
+    )
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
+    )
+
+    assert result["overall_status"] != "pass"
+    assert result["blocking"] is True
+    assert result["errors"] == ["pr_review_only_current_authorization_mismatch:AC1"]
+
+
+def test_pr_review_only_requires_complete_coverage_rejects_missing_skip() -> None:
+    baseline_items = [
+        _manual_vc_result(
+            "AC1",
+            command_hash="sha256:" + "a" * 64,
+            classification="expected_fail",
+            decision="go",
+            scope_class=None,
+            exit_code=1,
+        ),
+        _manual_vc_result(
+            "AC2",
+            command_hash="sha256:" + "c" * 64,
+            classification="skipped",
+            decision="go",
+            scope_class="pr_review_only",
+            exit_code=None,
+        ),
+    ]
+    current = _manual_current_payload(
+        [
+            _manual_vc_result(
+                "AC1",
+                command_hash="sha256:" + "a" * 64,
+                classification="expected_pass",
+                decision="go",
+                scope_class=None,
+                exit_code=0,
+            )
+        ],
+        head_sha="head-1",
+        reviewed_head_sha="head-1",
+    )
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_manual_contract_snapshot(baseline_items),
+        current_vc_result=current,
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
+        test_verdict=_manual_test_verdict(
+            baseline_items,
+            head_sha="head-1",
+            reviewed_head_sha="head-1",
+            diff_head_sha="head-1",
+        ),
+    )
+
+    assert result["overall_status"] != "pass"
+    assert result["errors"] == ["pr_review_only_coverage_mismatch"]
+
+
+def test_pr_review_only_requires_complete_coverage_rejects_missing_regular_vc() -> None:
+    baseline_items = [
+        _manual_vc_result(
+            "AC1",
+            command_hash="sha256:" + "a" * 64,
+            classification="expected_fail",
+            decision="go",
+            scope_class=None,
+            exit_code=1,
+        ),
+        _manual_vc_result(
+            "AC2",
+            command_hash="sha256:" + "c" * 64,
+            classification="skipped",
+            decision="go",
+            scope_class="pr_review_only",
+            exit_code=None,
+        ),
+    ]
+    current = _manual_current_payload(
+        [baseline_items[1]],
+        head_sha="head-1",
+        reviewed_head_sha="head-1",
+    )
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_manual_contract_snapshot(baseline_items),
+        current_vc_result=current,
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
+        test_verdict=_manual_test_verdict(
+            baseline_items,
+            head_sha="head-1",
+            reviewed_head_sha="head-1",
+            diff_head_sha="head-1",
+        ),
+    )
+
+    assert result["overall_status"] != "pass"
+    assert result["errors"] == ["baseline_current_mapping_mismatch"]
+
+
+def test_pr_review_only_requires_test_verdict_binding() -> None:
+    items = [
+        _manual_vc_result(
+            "AC1",
+            command_hash="sha256:" + "a" * 64,
+            classification="skipped",
+            decision="go",
+            scope_class="pr_review_only",
+            exit_code=None,
+        )
+    ]
+    baseline = _manual_contract_snapshot(items)
+    current = _manual_current_payload(items, head_sha="head-1", reviewed_head_sha="head-1")
+
+    missing = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
+    )
+    assert missing["overall_status"] != "pass"
+    assert missing["errors"] == ["test_verdict_missing"]
+
+    mismatched = _manual_test_verdict(
+        items,
+        head_sha="wrong-head",
+        reviewed_head_sha="head-1",
+        diff_head_sha="head-1",
+    )
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary=ADJUDICATOR_DIFF_SUMMARY,
+        allowed_paths=[ADJUDICATOR_PATH],
+        test_verdict=mismatched,
+    )
+    assert result["overall_status"] != "pass"
+    assert result["errors"] == ["test_verdict_head_sha_mismatch"]
