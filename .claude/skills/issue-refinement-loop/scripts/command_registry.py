@@ -208,6 +208,8 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "scripts/agent-guards/run_scope_rollup_preflight.py",
             "--issue-number", "{issue_number}",
             "--repo", "{repo}",
+            "--invocation-id", "{invocation_id}",
+            "--requested-at", "{requested_at}",
         ],
         "shell": False,
         "cwd_policy": "repo_root",
@@ -223,6 +225,8 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "placeholders": {
             "issue_number": {"type": "positive_int", "required": True},
             "repo": {"type": "owner_repo", "required": True},
+            "invocation_id": {"type": "string", "required": True},
+            "requested_at": {"type": "string", "required": True},
         },
     },
     "plan.run": {
