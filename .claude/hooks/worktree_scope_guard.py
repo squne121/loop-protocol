@@ -64,7 +64,12 @@ from skill_runtime_command_policy import (  # noqa: E402
     resolve_default_branch,
     resolve_repo_slug,
 )
-from git_mutation_command_policy import classify_rtk_git_mutation  # noqa: E402
+from git_mutation_command_policy import (  # noqa: E402
+    COMMAND_CLASS_RTK_GIT_MERGE_FF_ONLY,
+    GitMutationPolicyResult,
+    classify_rtk_git_mutation,
+    execute_verified_ff_merge_transaction,
+)
 from hook_repair_hints import render_hook_command_repair_hint, render_publish_safety_stop_report  # noqa: E402
 
 # Issue #1241 marker: HOOK_COMMAND_REPAIR_HINT_V1 is rendered via hook_repair_hints.py.
@@ -1973,6 +1978,83 @@ def _decide_write(
     _block(_rel(resolution.expected, project_root=resolve_project_root()), cwd)
 
 
+def _decide_rtk_git_merge(
+    bounded_rtk_git: "GitMutationPolicyResult",
+    cwd: str,
+    issue: str | None,
+    resolution: "WorktreeResolution",
+    project_root: str,
+) -> None:
+    """Issue #1609 fix_delta (P0 Blocker): authorize -- active Issue resolved,
+    exactly one matching worktree, cwd bound to that worktree, and the
+    worktree is LINKED (not the root/primary checkout) -- BEFORE calling
+    `execute_verified_ff_merge_transaction`. `classify_rtk_git_mutation`'s
+    merge lane is now a PURE shape classifier with no side effects, so this
+    ordering closes the P0 window where the previous design executed the
+    real `git merge --ff-only` as a side effect of classification, before any
+    of these authorization checks ever ran. This function always exits (via
+    `_block_with_reason`) -- it never returns and never lets the caller's raw
+    `rtk git merge` shell command run afterward (mirrors the
+    initial_branch_create push lane's classify-executes-then-always-deny
+    pattern, Issue #1449)."""
+    if bounded_rtk_git.status == "deny":
+        _block_with_reason(
+            _rel(resolution.expected, project_root=project_root) if resolution.expected else "<unresolved>",
+            cwd,
+            bounded_rtk_git.reason_code,
+            bounded_rtk_git.command_class,
+            bounded_rtk_git,
+        )
+    if not issue:
+        _block_with_reason("<issue-context-required>", cwd, "issue_context_required", bounded_rtk_git.command_class)
+    if not resolution.git_available:
+        _block_with_reason("<git-unavailable>", cwd, "no_matching_worktree", bounded_rtk_git.command_class)
+    if resolution.match_count == 0:
+        _block_with_reason("<no-matching-worktree>", cwd, "no_matching_worktree", bounded_rtk_git.command_class)
+    if resolution.expected is None:
+        _block_with_reason("<ambiguous>", cwd, "ambiguous_worktree", bounded_rtk_git.command_class)
+
+    expected_real = os.path.realpath(resolution.expected)
+    if os.path.realpath(project_root) == expected_real:
+        _block_with_reason(
+            _rel(resolution.expected, project_root=project_root),
+            cwd,
+            "expected_worktree_is_root_checkout",
+            bounded_rtk_git.command_class,
+        )
+    if os.path.realpath(cwd) != expected_real:
+        _block_with_reason(
+            _rel(resolution.expected, project_root=project_root),
+            cwd,
+            "cwd_not_expected_worktree",
+            bounded_rtk_git.command_class,
+        )
+
+    transaction = execute_verified_ff_merge_transaction(
+        cwd,
+        bounded_rtk_git.target_sha or "",
+        expected_worktree_realpath=resolution.expected,
+        active_issue_number=issue,
+        remote="origin",
+        timeout=30,
+    )
+    result = GitMutationPolicyResult(
+        status="deny",
+        command_class=bounded_rtk_git.command_class,
+        reason_code=transaction.reason_code,
+        target_branch=transaction.active_branch,
+        local_head=transaction.verified_local_head,
+        current_remote_head=transaction.live_remote_head,
+    )
+    _block_with_reason(
+        _rel(resolution.expected, project_root=project_root),
+        cwd,
+        transaction.reason_code,
+        bounded_rtk_git.command_class,
+        result,
+    )
+
+
 def _decide_bash(
     tool_input: dict, cwd: str, issue: str | None, resolution: "WorktreeResolution", deadline: "object | None" = None
 ) -> None:
@@ -2017,6 +2099,12 @@ def _decide_bash(
         require_active_branch_push=True,
     )
     if bounded_rtk_git is not None:
+        if bounded_rtk_git.command_class == COMMAND_CLASS_RTK_GIT_MERGE_FF_ONLY:
+            # Issue #1609 fix_delta (P0 Blocker): authorize BEFORE executing
+            # the merge transaction -- see _decide_rtk_git_merge. This call
+            # always exits (never returns, never falls through to the
+            # add/commit/push handling below).
+            _decide_rtk_git_merge(bounded_rtk_git, cwd, issue, resolution, _pr)
         if bounded_rtk_git.status == "deny":
             _block_with_reason(
                 _rel(resolution.expected, project_root=_pr) if resolution.expected else "<unresolved>",

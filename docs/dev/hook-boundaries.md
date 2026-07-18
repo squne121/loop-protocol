@@ -757,11 +757,11 @@ AC8（実 PreToolUse hook chain）テストは `secret_boundary_guard` / `local_
 
 merge 実行後は、active branch 不変・`HEAD == target_sha`・`git status` clean・operation residue なしを無条件に確認する。`post-merge` hook が working tree を変更した場合（clean でなくなる）は `postcondition_violation` として **成功扱いにしない**。`git merge --ff-only` 自体が非ゼロ終了した場合は `merge_rejected_non_fast_forward` として区別する。
 
-### exact allow 条件
+### exact allow 条件（旧設計。Issue #1609 fix_delta により下記のとおり変更済み）
 
 `classify_rtk_git_mutation` は、上記 transaction の実行結果に関わらず（成功・拒否・precondition failure のいずれでも）常に `status: "deny"` を返す。transaction の outcome（`verified_ff_merge_completed` / `merge_ff_only_rejected` / `postcondition_check_failed` / 各種 precondition deny 理由）は `reason_code` にそのまま格納され、呼び出し元の raw `rtk git merge` コマンドが別途再実行されることはない。shape が exact 2-token `--ff-only <40-hex-sha>` でない場合（短縮/非hex SHA、flag 順序変更、追加 option、`--no-ff`、bare branch name 等）は transaction を呼び出す前に `merge_shape_requires_exact_ff_only_sha` で deny する。
 
-### Codex allow rule（Codex 許可ルール）
+### Codex allow rule（Codex 許可ルール。旧設計。Issue #1609 fix_delta により下記のとおり変更済み）
 
 `.codex/rules/default.rules` は exact `rtk git merge --ff-only` prefix のみを、既存の generic `rtk git merge`（`--ff-only` を伴わない形状は引き続き prompt）バケットより前に allow として追加する。Codex 側での不要な人間確認を避けるためであり、実際の安全性強制は引き続き `git_mutation_command_policy.py` の trusted transaction が担う。
 
@@ -771,6 +771,21 @@ merge 実行後は、active branch 不変・`HEAD == target_sha`・`git status` 
 - `git reset --hard` / `rtk git push --force ...` 等の既存 destructive command deny は本 lane 追加後も維持される。
 - raw `git merge`（`rtk` prefix なし）は本 policy の対象外（`classify_rtk_git_mutation` は `no_match` を返し、他レイヤーの一般的な mutating command 判定に委ねる）。
 - `.claude/worktrees/issue-1589-linked-issue-worktree-verified-fast-forw` の worktree_scope_guard 統合は、既存の `classify_rtk_git_mutation` 汎用ディスパッチ（resolved active Issue の clean linked worktree にのみ command class を通す既存経路）をそのまま利用し、本 Issue で `worktree_scope_guard.py` 自体の分岐追加は不要だった（既存 230 テスト回帰確認済み）。
+
+
+
+### Issue #1609 fix_delta（P0 / P1 / P2 追加修正）
+
+OWNER の敵対的レビュー（PR #1609）により、上記の初回実装には authorization より先に merge が実行される P0 Blocker と、複数の P1 Blocker が指摘され、以下のとおり修正した。
+
+- P0 Blocker: `classify_rtk_git_mutation` の merge レーン（`_classify_rtk_git_merge`）は、副作用のない PURE shape classifier に戻した（exact shape なら `status: allow` を `target_sha` 付きで返すのみで、`execute_verified_ff_merge_transaction` は一切呼び出さない）。実際の transaction 実行は `.claude/hooks/worktree_scope_guard.py` の `_decide_rtk_git_merge` が、active Issue 解決済み・matching worktree が一意・`cwd == expected worktree`・当該 worktree が linked worktree（root checkout でない）の全てを認可した後にのみ行う。
+- P1 Blocker: `execute_verified_ff_merge_transaction` は `expected_worktree_realpath` / `active_issue_number` を必須キーワード引数として受け取り、cwd がその realpath と一致すること、当該 worktree が linked worktree であること（`git rev-parse --git-dir` が `--git-common-dir` と異なること）、branch 名に埋め込まれた Issue 番号が `active_issue_number` と一致することを、呼び出し元の申告を信用せず自ら再検証する。
+- P1 Blocker: operation residue（`MERGE_HEAD` / `CHERRY_PICK_HEAD` / `REVERT_HEAD` / `BISECT_LOG` / `rebase-merge` / `rebase-apply`）は `git rev-parse --git-path` で対象名ごとに per-worktree の GIT_DIR 配下を解決してから検査する（旧実装の `--git-common-dir` 解決は linked worktree では誤ったディレクトリを見ていた）。
+- P1 Blocker: canonical remote 検証は `git remote get-url origin`（push url でなく fetch url）を単一解決し、その同じ URL を `classify_remote_branch_state` の live probe にも使う。push url だけ canonical にして fetch url を別リポジトリに向ける迂回を防ぐ。
+- P1 Blocker: `git merge` 実行中の `OSError` / `TimeoutExpired` は無条件 deny に畳み込まず、`execution_not_started`（spawn 前の OSError）・`transport_error_but_merged_and_verified`・`transport_error_no_merge_observed`・`transport_error_state_ambiguous` の 4 状態に分類する。timeout 後も無条件で postcondition readback（branch/HEAD/clean/operation residue）を行ってから分類する。
+- P2: `_SHA_RE` 照合は小文字化前の raw 入力に対して行い、uppercase SHA は shape 不一致として deny する。
+- Codex allow rule: exact `rtk git merge --ff-only` prefix を allow にする design は、Codex execpolicy がマッチした全 rule のうち最も厳しい decision（forbidden 優先 prompt 優先 allow の順）を採用するため、既存の generic `rtk git merge` prompt rule にも一致してしまい exact shape が prompt のまま解決されるバグがあった。現在は専用 executor `scripts/agent-ops/verified_ff_merge_exec.py` の exact invocation shape（`uv run --locked --no-sync python3 scripts/agent-ops/verified_ff_merge_exec.py --target-sha SHA`）のみを allow とし、`rtk git merge`（`--ff-only` の有無を問わず）は引き続き prompt のままにしている。この executor は Codex 環境向けの独立した authorization（`LOOP_ISSUE_NUMBER` からの active Issue 解決・cwd の branch 形状照合）を行ってから `execute_verified_ff_merge_transaction` を呼び出す。
+
 
 ---
 

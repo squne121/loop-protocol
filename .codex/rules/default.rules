@@ -119,19 +119,25 @@ prefix_rule(
     ],
 )
 
-# Issue #1589: verified fast-forward merge lane. Only the exact
-# `--ff-only <40-hex-sha>` shape is allowlisted here -- the actual safety
-# enforcement (clean linked worktree, live-verified remote head, ancestry,
-# postcondition readback) happens inside the shared Python guard's single
-# trusted execution boundary (execute_verified_ff_merge_transaction), never
-# in this execpolicy layer. Generic `rtk git merge` (without `--ff-only`, or
-# any other shape) stays in the generic prompt bucket below.
+# Issue #1609 fix_delta (P1 Blocker): `rtk git merge --ff-only <sha>` itself
+# is intentionally NOT allowlisted here any more. A prefix_rule allowlisting
+# it would ALSO match the broader `["rtk", "git", [..., "merge", ...]]`
+# prompt rule below (execpolicy takes the most severe decision across every
+# matching rule -- forbidden > prompt > allow -- not "first rule wins"), so
+# the exact shape silently resolved to `prompt` regardless of this rule's
+# intent (verified via `codex execpolicy check`). Instead, the ONLY allowed,
+# non-prompting path for this lane is the dedicated executor script below --
+# it performs its OWN independent authorization (active Issue / matching
+# linked worktree / cwd binding) before calling
+# `execute_verified_ff_merge_transaction`, so a bare `rtk git merge` (with or
+# without `--ff-only`) staying in the generic prompt bucket is the correct,
+# safe default.
 prefix_rule(
-    pattern = ["rtk", "git", "merge", "--ff-only"],
+    pattern = ["uv", "run", "--locked", "--no-sync", "python3", "scripts/agent-ops/verified_ff_merge_exec.py", "--target-sha"],
     decision = "allow",
-    justification = "Verified fast-forward merge is allowed only when the runtime hooks validate live-verified remote head, ancestry, clean linked worktree, and postcondition readback inside a single trusted execution boundary.",
+    justification = "The verified-ff-merge executor performs its own independent authorization (active Issue / matching linked worktree / cwd binding) before calling execute_verified_ff_merge_transaction (clean linked worktree, live-verified remote head, ancestry, postcondition readback) inside a single trusted execution boundary. Malformed invocations (missing flags, extra options, shell wrappers) do not match this exact prefix and fall through to prompt.",
     match = [
-        "rtk git merge --ff-only 885087598eac7453544f08e468bc9b8ff6c29cf4",
+        "uv run --locked --no-sync python3 scripts/agent-ops/verified_ff_merge_exec.py --target-sha 885087598eac7453544f08e468bc9b8ff6c29cf4",
     ],
 )
 
