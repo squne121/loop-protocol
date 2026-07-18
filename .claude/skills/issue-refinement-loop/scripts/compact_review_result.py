@@ -32,6 +32,18 @@ from typing import Any
 
 import jsonschema as _jsonschema
 
+# Issue #1554 PR #1581 OWNER REQUEST_CHANGES Blocker 2: the producer must run
+# the SAME strict `REVIEWER_BLOCKER_CLAIM_V1` shape validation the consumer
+# (`parent_replay_binding.py`) runs, immediately after building the claim and
+# BEFORE any stdout is written. `parent_replay_binding.py` itself is not
+# modified -- only its `validate_reviewer_blocker_claim()` is imported and
+# reused (Out of Scope: duplicating that logic here).
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+import parent_replay_binding as _prb  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Schema constants (SSOT for ISSUE_REVIEW_RESULT_COMPACT_V1)
 # ---------------------------------------------------------------------------
@@ -462,12 +474,16 @@ def compact_review_result(
             for item in structured_blockers_list:
                 if not isinstance(item, dict):
                     continue
-                code = str(item.get("code") or "").strip()
-                if not code:
-                    continue
+                # Issue #1554 PR #1581 OWNER REQUEST_CHANGES Blocker 2: no
+                # implicit `str(...).strip()` conversion of `code` here --
+                # the raw value is passed through unchanged so strict
+                # validation (below) sees exactly what the checker produced
+                # and can fail closed on it (whitespace-only, over-length,
+                # wrong type), rather than this loop silently normalizing or
+                # skipping a bad entry.
                 claim_blockers.append(
                     {
-                        "reviewer_blocker_code": code,
+                        "reviewer_blocker_code": item.get("code"),
                         "message": item.get("message"),
                         "line_start": item.get("line_start"),
                         "line_end": item.get("line_end"),
@@ -476,12 +492,12 @@ def compact_review_result(
         else:
             for item in blocking_issues:
                 if isinstance(item, dict):
-                    code = str(item.get("code") or item.get("reviewer_blocker_code") or "").strip()
-                    if not code:
-                        continue
+                    code_raw = item.get("code")
+                    if code_raw is None:
+                        code_raw = item.get("reviewer_blocker_code")
                     claim_blockers.append(
                         {
-                            "reviewer_blocker_code": code,
+                            "reviewer_blocker_code": code_raw,
                             "message": item.get("message"),
                             "line_start": item.get("line_start"),
                             "line_end": item.get("line_end"),
@@ -501,6 +517,19 @@ def compact_review_result(
             "body_sha256": body_sha256,
             "blockers": claim_blockers,
         }
+        # Issue #1554 PR #1581 OWNER REQUEST_CHANGES Blocker 2: producer-side
+        # strict validation, reusing (never duplicating) the consumer's own
+        # `parent_replay_binding.validate_reviewer_blocker_claim()`. Any
+        # shape violation (empty/over-length code, non-int/non-null line
+        # fields, disallowed/missing keys, oversized blockers array) fails
+        # the WHOLE claim closed as a producer failure -- no per-entry
+        # silent skip, no implicit type coercion, no success envelope.
+        try:
+            _prb.validate_reviewer_blocker_claim(reviewer_blocker_claim)
+        except ValueError as exc:
+            raise ValueError(
+                f"REVIEWER_BLOCKER_CLAIM_V1 producer-side strict validation failed: {exc}"
+            ) from exc
         claim_line = _strict_json_dumps_compact(reviewer_blocker_claim)
         compact_data["REVIEWER_BLOCKER_CLAIM"] = claim_line
         stdout_lines.append(f"REVIEWER_BLOCKER_CLAIM: {claim_line}")

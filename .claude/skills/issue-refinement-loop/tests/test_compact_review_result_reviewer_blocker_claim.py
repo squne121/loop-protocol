@@ -35,6 +35,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import pytest
 from pathlib import Path
 from typing import Any
 
@@ -44,13 +45,14 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from compact_review_result import compact_review_result  # noqa: E402
 from parent_replay_binding import (  # noqa: E402
-    canonical_replay_next_state_line,
     validate_reviewer_blocker_claim,
 )
 
 COMPACT_SCRIPT = SCRIPTS_DIR / "compact_review_result.py"
 PARENT_REPLAY_SCRIPT = SCRIPTS_DIR / "parent_replay_binding.py"
 VALIDATE_V2_SCRIPT = SCRIPTS_DIR / "validate_review_compact_output.py"
+EMIT_V2_SCRIPT = SCRIPTS_DIR / "emit_parent_review_envelope_v2.py"
+STATE_STORE_SCRIPT = SCRIPTS_DIR / "reviewer_claim_replay_state_store.py"
 
 BODY_BYTES = b"issue-1554-fixture-body-c9"
 BODY_SHA256_HEX = hashlib.sha256(BODY_BYTES).hexdigest()
@@ -385,6 +387,106 @@ def _run_parent_replay_binding_cli(
     return json.loads(result.stdout)
 
 
+def _run_validate_intermediate_cli(
+    *, child_stdout_bytes: bytes, tmp_path: Path, issue_number: int = ISSUE_NUMBER
+) -> tuple[int, dict[str, Any]]:
+    """Issue #1554 PR #1581 OWNER REQUEST_CHANGES Blocker 1: the ONLY
+    sanctioned way to classify/extract fields from raw child stdout BYTES --
+    the independent `emit_parent_review_envelope_v2.py --validate-intermediate`
+    CLI (current SSOT, PR #1557). Never a manual `startswith()` /
+    `json.loads()` extraction."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(EMIT_V2_SCRIPT),
+            "--issue-number",
+            str(issue_number),
+            "--validate-intermediate",
+        ],
+        input=child_stdout_bytes,
+        capture_output=True,
+        cwd=str(tmp_path),
+    )
+    stdout_text = result.stdout.decode("utf-8")
+    return result.returncode, json.loads(stdout_text)
+
+
+def _run_emit_v2_cli(
+    *,
+    child_stdout_text: str,
+    binding_artifact: dict[str, Any],
+    tmp_path: Path,
+    refinement_session_id: str,
+    iteration_id: str,
+    issue_number: int = ISSUE_NUMBER,
+) -> tuple[int, bytes, str]:
+    """Issue #1554 PR #1581 OWNER REQUEST_CHANGES Blocker 1: the REAL
+    `emit_parent_review_envelope_v2.py` production CLI -- the sanctioned
+    replacement for manual `PARENT_REPLAY_*` f-string assembly."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    binding_file = tmp_path / "binding_artifact.json"
+    binding_file.write_text(json.dumps(binding_artifact), encoding="utf-8")
+    body_file = tmp_path / "current_body.txt"
+    body_file.write_bytes(BODY_BYTES)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(EMIT_V2_SCRIPT),
+            "--issue-number",
+            str(issue_number),
+            "--binding-artifact-file",
+            str(binding_file),
+            "--repository-full-name",
+            REPO_FULL_NAME,
+            "--refinement-session-id",
+            refinement_session_id,
+            "--iteration-id",
+            iteration_id,
+            "--current-body-file",
+            str(body_file),
+        ],
+        input=(child_stdout_text + "\n").encode("utf-8"),
+        capture_output=True,
+        cwd=str(tmp_path),
+    )
+    return result.returncode, result.stdout, result.stderr.decode("utf-8", errors="replace")
+
+
+def _run_state_write_v2_cli(
+    *, validation_result_v2: dict[str, Any], tmp_path: Path, refinement_session_id: str, issue_number: int = ISSUE_NUMBER
+) -> tuple[int, dict[str, Any]]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(exist_ok=True)
+    normalized_payload = validation_result_v2.get("normalized_payload") or {}
+    digest = normalized_payload.get("PARENT_REPLAY_BINDING_DIGEST", "sha256:" + ("0" * 64))
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(STATE_STORE_SCRIPT),
+            "--write-v2",
+            "--state-dir",
+            str(state_dir),
+            "--repository-full-name",
+            REPO_FULL_NAME,
+            "--issue-number",
+            str(issue_number),
+            "--refinement-session-id",
+            refinement_session_id,
+            "--validation-result-v2-inline",
+            json.dumps(validation_result_v2),
+            "--expected-parent-binding-digest",
+            digest,
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+    )
+    return result.returncode, json.loads(result.stdout)
+
+
 # ---------------------------------------------------------------------------
 # AC5: production chain confirms deterministic_fail_confirmed with
 # matching parent-owned evidence
@@ -462,21 +564,47 @@ def test_parent_replay_does_not_confirm_without_parent_owned_evidence(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# AC7: full production chain -- compact_review_result.py ->
-# parent_replay_binding.py -> validate_review_compact_output.py --v2
+# AC7: full production chain (current SSOT, PR #1557) -- compact_review_result.py
+# -> emit_parent_review_envelope_v2.py --validate-intermediate (canonical
+# claim extraction) -> parent_replay_binding.py -> emit_parent_review_envelope_v2.py
+# (V2 envelope generation) -> validate_review_compact_output.py --v2 ->
+# reviewer_claim_replay_state_store.py --write-v2
 # ---------------------------------------------------------------------------
 
 
 def test_production_chain_compact_to_parent_replay_to_v2_validation(tmp_path):
     """GIVEN a schema-valid producer result (blocking_issues prose,
-    structured_blockers full evidence shape) WHEN the REAL
-    compact_review_result.py CLI -> REAL parent_replay_binding.py CLI ->
-    REAL validate_review_compact_output.py --v2 CLI chain runs THEN
-    validation_status == valid."""
+    structured_blockers full evidence shape) WHEN the REAL production
+    command chain (compact_review_result.py -> emit_parent_review_envelope_v2.py
+    --validate-intermediate -> parent_replay_binding.py ->
+    emit_parent_review_envelope_v2.py -> validate_review_compact_output.py
+    --v2 -> reviewer_claim_replay_state_store.py --write-v2) runs entirely
+    via real CLI subprocesses THEN validation_status == valid. No manual
+    startswith()/json.loads() field extraction and no manual PARENT_REPLAY_*
+    f-string assembly are used anywhere in this test (Issue #1554 PR #1581
+    OWNER REQUEST_CHANGES Blocker 1)."""
     raw_result = _base_raw_result()
-    _rc, compact_stdout = _run_compact_review_result_cli(raw_result, tmp_path / "step1")
-    claim = _extract_claim_from_text(compact_stdout)
 
+    # 1) CHILD: real production CLI.
+    _rc, compact_stdout = _run_compact_review_result_cli(raw_result, tmp_path / "step1")
+    compact_stdout_bytes = compact_stdout.rstrip("\n").encode("utf-8") + b"\n"
+
+    # 2) INTERMEDIATE VALIDATION: real emit_parent_review_envelope_v2.py
+    # --validate-intermediate CLI -- the ONLY sanctioned way to extract the
+    # canonical claim from raw child stdout bytes (never a manual
+    # startswith()/json.loads() extraction).
+    intermediate_rc, intermediate_result = _run_validate_intermediate_cli(
+        child_stdout_bytes=compact_stdout_bytes, tmp_path=tmp_path / "step2"
+    )
+    assert intermediate_rc == 0, intermediate_result
+    assert intermediate_result["validation_status"] == "valid"
+    assert intermediate_result["envelope_kind"] == "needs_fix_intermediate"
+    canonical_claim_text = intermediate_result["canonical_reviewer_blocker_claim"]
+    assert canonical_claim_text is not None
+    claim = json.loads(canonical_claim_text)
+    assert claim["blockers"][0]["reviewer_blocker_code"] == "C9"
+
+    # 3) PARENT BINDING: real production CLI.
     readiness_result = {
         "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
         "body_sha256": BODY_SHA256,
@@ -495,38 +623,35 @@ def test_production_chain_compact_to_parent_replay_to_v2_validation(tmp_path):
     binding_artifact = _run_parent_replay_binding_cli(
         claim=claim,
         readiness_result=readiness_result,
-        tmp_path=tmp_path / "step2",
+        tmp_path=tmp_path / "step3",
         refinement_session_id=refinement_session_id,
         iteration_id=iteration_id,
     )
     assert binding_artifact["replay_result"]["verdict"] == "deterministic_fail_confirmed"
 
-    # The V2 envelope is orchestrator-assembled: the 9 canonical lines from
-    # compact_review_result.py's real stdout, plus the 6 PARENT_REPLAY_*
-    # fields derived from the parent's own binding artifact (never from the
-    # child's REPLAY self-report -- Issue #1532 Blocker 2).
-    compact_lines = compact_stdout.rstrip("\n").split("\n")
-    assert len(compact_lines) == 9  # 8 approve fields + REVIEWER_BLOCKER_CLAIM
+    # 4) EMITTER: real emit_parent_review_envelope_v2.py production CLI --
+    # NOT a manual PARENT_REPLAY_* f-string assembly.
+    emit_rc, envelope_bytes, emit_stderr = _run_emit_v2_cli(
+        child_stdout_text=compact_stdout.rstrip("\n"),
+        binding_artifact=binding_artifact,
+        tmp_path=tmp_path / "step4",
+        refinement_session_id=refinement_session_id,
+        iteration_id=iteration_id,
+    )
+    assert emit_rc == 0, emit_stderr
+    assert emit_stderr == ""
+    envelope_text = envelope_bytes.decode("utf-8")
+    assert envelope_text.count("\n") == 15
+    assert "PARENT_REPLAY_BINDING_DIGEST: " + binding_artifact["binding_digest"] in envelope_text
 
-    replay_result = binding_artifact["replay_result"]
-    should_consume_literal = "true" if replay_result["should_consume_iteration"] else "false"
-    parent_replay_lines = [
-        f"PARENT_REPLAY_VERDICT: {replay_result['verdict']}",
-        f"PARENT_REPLAY_ROUTING: {replay_result['routing']}",
-        f"PARENT_REPLAY_SHOULD_CONSUME: {should_consume_literal}",
-        f"PARENT_REPLAY_BODY_SHA256: {replay_result['body_sha256']}",
-        f"PARENT_REPLAY_NEXT_STATE: {canonical_replay_next_state_line(binding_artifact)}",
-        f"PARENT_REPLAY_BINDING_DIGEST: {binding_artifact['binding_digest']}",
-    ]
-    envelope_text = "\n".join(compact_lines + parent_replay_lines) + "\n"
-
-    step3_dir = tmp_path / "step3"
-    step3_dir.mkdir()
-    envelope_file = step3_dir / "envelope.txt"
-    envelope_file.write_bytes(envelope_text.encode("utf-8"))
-    binding_artifact_file = step3_dir / "binding_artifact.json"
+    # 5) VALIDATOR: real validate_review_compact_output.py --v2 CLI.
+    step5_dir = tmp_path / "step5"
+    step5_dir.mkdir()
+    envelope_file = step5_dir / "envelope.txt"
+    envelope_file.write_bytes(envelope_bytes)
+    binding_artifact_file = step5_dir / "binding_artifact.json"
     binding_artifact_file.write_text(json.dumps(binding_artifact), encoding="utf-8")
-    body_file = step3_dir / "current_body.txt"
+    body_file = step5_dir / "current_body.txt"
     body_file.write_bytes(BODY_BYTES)
 
     result = subprocess.run(
@@ -557,3 +682,104 @@ def test_production_chain_compact_to_parent_replay_to_v2_validation(tmp_path):
     assert payload["validation_status"] == "valid", payload
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     assert payload["envelope_kind"] == "needs_fix_v2"
+
+    # 6) STATE WRITE (optional per Issue #1554 In Scope "可能であれば"): real
+    # reviewer_claim_replay_state_store.py --write-v2 CLI.
+    write_rc, write_result = _run_state_write_v2_cli(
+        validation_result_v2=payload,
+        tmp_path=tmp_path / "step6",
+        refinement_session_id=refinement_session_id,
+    )
+    assert write_rc == 0, write_result
+    assert write_result["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# AC9: producer-side strict validation negative regression (Issue #1554
+# PR #1581 OWNER REQUEST_CHANGES Blocker 2) -- an invalid structured_blockers
+# entry must fail the WHOLE claim closed as a producer failure (ValueError),
+# never a silent per-entry skip or implicit type coercion, and no success
+# envelope (stdout_lines / compact_data) is ever produced.
+# ---------------------------------------------------------------------------
+
+
+def _structured_blocker(**overrides):
+    base = dict(STRUCTURED_C9)
+    base.update(overrides)
+    base["checker_evidence"] = [_checker_evidence()]
+    return base
+
+
+def test_producer_rejects_invalid_structured_blocker_fields(tmp_path):
+    """GIVEN structured_blockers containing (a) whitespace-only code, (b) an
+    over-length (201+ char) code, (c) a string top-level line_start, (d) a
+    string top-level line_end, or (e) a mix of valid and invalid entries,
+    WHEN compact_review_result() builds the claim THEN it raises (producer
+    failure) instead of silently skipping/coercing the bad entry, and never
+    returns a success envelope."""
+    artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
+
+    # (a) whitespace-only code
+    raw_a = _base_raw_result(structured_blockers=[_structured_blocker(code="   ")])
+    with pytest.raises(ValueError):
+        compact_review_result(raw_a, artifact_dir=artifact_dir, issue_number=ISSUE_NUMBER)
+
+    # (b) over-length code (201 chars, exceeds MAX_REVIEWER_BLOCKER_CODE_LENGTH=200)
+    raw_b = _base_raw_result(structured_blockers=[_structured_blocker(code="C" * 201)])
+    with pytest.raises(ValueError):
+        compact_review_result(raw_b, artifact_dir=artifact_dir, issue_number=ISSUE_NUMBER)
+
+    # (c) string top-level line_start
+    raw_c = _base_raw_result(
+        structured_blockers=[_structured_blocker(code="C9", line_start="not-an-int", line_end=None)]
+    )
+    with pytest.raises(ValueError):
+        compact_review_result(raw_c, artifact_dir=artifact_dir, issue_number=ISSUE_NUMBER)
+
+    # (d) string top-level line_end
+    raw_d = _base_raw_result(
+        structured_blockers=[_structured_blocker(code="C9", line_start=None, line_end="not-an-int")],
+    )
+    with pytest.raises(ValueError):
+        compact_review_result(raw_d, artifact_dir=artifact_dir, issue_number=ISSUE_NUMBER)
+
+    # (e) valid/invalid mixed multiple blockers -- the WHOLE claim fails,
+    # not just the bad entry (no silent partial success).
+    raw_e = _base_raw_result(
+        structured_blockers=[
+            _structured_blocker(code="C9"),
+            _structured_blocker(code="   ", message="whitespace-only sibling"),
+        ]
+    )
+    with pytest.raises(ValueError):
+        compact_review_result(raw_e, artifact_dir=artifact_dir, issue_number=ISSUE_NUMBER)
+
+
+def test_producer_rejects_invalid_structured_blocker_via_real_cli(tmp_path):
+    """GIVEN the same whitespace-only-code case as AC9(a), WHEN run through
+    the REAL compact_review_result.py CLI THEN it exits non-zero and prints
+    NO success envelope (no VERDICT/REVIEWER_BLOCKER_CLAIM line) -- the
+    producer failure envelope only."""
+    raw_result = _base_raw_result(structured_blockers=[_structured_blocker(code="   ")])
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    input_file = tmp_path / "raw_result.json"
+    input_file.write_text(json.dumps(raw_result), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(COMPACT_SCRIPT),
+            "--input-file",
+            str(input_file),
+            "--artifact-dir",
+            ".claude/artifacts/issue-refinement-loop",
+            "--issue-number",
+            str(ISSUE_NUMBER),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+    )
+    assert result.returncode == 2, result.stdout
+    assert "REVIEWER_BLOCKER_CLAIM:" not in result.stdout
+    assert "STATUS: failed" in result.stdout
