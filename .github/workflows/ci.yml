@@ -1810,7 +1810,10 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"
           mkdir -p ci_verdict_summary_v2_artifacts
-          uv run --locked python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
+          # This job installs the exact Python runtime above and the verdict
+          # producer uses only the standard library. Invoke that runner-owned
+          # interpreter directly: uv is intentionally not assumed available.
+          python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
             --expected-head-sha "$PR_HEAD_SHA" \
             --pr-head-sha "$PR_HEAD_SHA" \
             --repository "${{ github.repository }}" \
@@ -1838,5 +1841,5 @@ jobs:
         # Render the exact uploaded payload; never regenerate it after upload.
         if: ${{ !cancelled() }}
         run: |
-          uv run --locked python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
+          python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
             --summary-input ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json
