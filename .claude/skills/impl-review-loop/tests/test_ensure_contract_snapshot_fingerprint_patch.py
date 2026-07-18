@@ -253,12 +253,18 @@ def _make_review_result_for_live_test() -> dict:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.github_live
 class TestFingerprintActuallyPosted:
     """AC1 (decision: immediate). Only `run_contract_review_once` is
     mocked; `post_comment`, `patch_comment`,
     `verify_controlled_publisher_comment_id_binding`, and
     `capture_base_ref_and_sha` all execute their real `gh api` subprocess
-    calls against a real, disposable GitHub Issue."""
+    calls against a real, disposable GitHub Issue.
+
+    Marked ``github_live`` (Issue #1562 AC4): deselected from the default
+    ``pytest`` full-suite run via ``pyproject.toml``'s
+    ``addopts = "... -m 'not github_live'"``; run explicitly with
+    ``pytest -m github_live`` against an authenticated ``gh`` CLI."""
 
     def test_fingerprint_actually_posted(self) -> None:
         available, reason = _gh_write_access_available()
@@ -340,13 +346,18 @@ class TestFingerprintActuallyPosted:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.github_live
 class TestFingerprintPatchActuallyApplied:
     """AC3: locks the current (correct) `patch_comment()` behavior at the
     function level -- real POST of a provisional body, real PATCH to the
     final fingerprint-bearing body, and an independent re-GET confirming
     the PATCH was actually applied. This is a permanent regression guard
     against a future accidental removal/short-circuit of the PATCH step,
-    independent of whatever AC1 observes on the current HEAD."""
+    independent of whatever AC1 observes on the current HEAD.
+
+    Marked ``github_live`` (Issue #1562 AC4): see
+    ``TestFingerprintActuallyPosted`` docstring for the deselect/opt-in
+    mechanism."""
 
     def test_fingerprint_patch_actually_applied(self) -> None:
         available, reason = _gh_write_access_available()
