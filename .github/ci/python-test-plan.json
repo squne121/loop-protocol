@@ -67,7 +67,8 @@
         "provider_job": "node-backed-hook-tests",
         "paths": [
           "tests/session_recording/codex/test_hook_adapter.py",
-          "tests/session_recording/codex/test_initial_branch_create_lane.py"
+          "tests/session_recording/codex/test_initial_branch_create_lane.py",
+          "tests/session_recording/codex/test_external_manifest_publish.py"
         ]
       }
     ]

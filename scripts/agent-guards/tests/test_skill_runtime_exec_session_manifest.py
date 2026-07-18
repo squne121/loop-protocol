@@ -91,7 +91,6 @@ def test_repo_local_session_manifest_write_is_rejected(tmp_path: Path) -> None:
     target_dir = REPO_ROOT / "tmp" / "session-manifests" / "codex" / "stop"
     target_dir.mkdir(parents=True, exist_ok=True)
     dir_preexisted = True
-    created_ancestor: Path | None = None
     if not any(target_dir.parent.iterdir()) and not target_dir.exists():
         dir_preexisted = False
 
