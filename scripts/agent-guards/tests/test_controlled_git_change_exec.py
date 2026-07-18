@@ -504,6 +504,203 @@ def test_post_commit_audit_rolls_back_on_mismatch(tmp_path: Path, monkeypatch):
     assert "feat: a" not in _log(repo)
 
 
+# ─── env sanitization adversarial coverage (Issue #1611 PR #1620 Blocker 2,
+# Safety Claim Matrix follow-up) ─────────────────────────────────────────────
+
+_SANITIZED_GIT_ENV_VARS = (
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_COUNT",
+    "GIT_EXEC_PATH",
+    "GIT_CEILING_DIRECTORIES",
+)
+
+
+def _poison_git_env(monkeypatch, tmp_path: Path) -> None:
+    """Adversarially contaminate os.environ with every git-behavior-
+    redirection variable `_sanitized_git_env()` is documented to strip, so a
+    test that observes these leaking into a subprocess call's `env` kwarg
+    proves the specific call site does NOT go through `_sanitized_git_env()`.
+    """
+    poison_dir = str(tmp_path / "poison-git-dir")
+    for var in _SANITIZED_GIT_ENV_VARS:
+        if var == "GIT_CONFIG_COUNT":
+            monkeypatch.setenv(var, "1")
+        elif var == "GIT_EXEC_PATH":
+            monkeypatch.setenv(var, "/nonexistent/git-exec-path")
+        else:
+            monkeypatch.setenv(var, poison_dir)
+
+
+def _spy_on_subprocess_run(monkeypatch):
+    """Wrap the real `subprocess.run` so every call (from any module) is
+    still actually executed, but its full `(args, kwargs)` is recorded --
+    used to assert which `env` dict a given git subprocess invocation was
+    actually launched with."""
+    real_run = subprocess.run
+    calls: list = []
+
+    def _spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _spy)
+    return calls
+
+
+def _assert_no_leaked_git_env_vars(env: dict, argv: list) -> None:
+    leaked = [var for var in _SANITIZED_GIT_ENV_VARS if var in env]
+    assert not leaked, f"git env sanitization not applied for argv={argv!r}: leaked {leaked!r}"
+
+
+def test_env_sanitization_applied_to_stage_and_commit_calls(tmp_path: Path, monkeypatch):
+    """Adversarial coverage for `_run_git` / `_run_git_stdin`: even with
+    every documented git-behavior-redirection variable poisoned in
+    `os.environ`, the `add` (stage, via `_run_git_stdin`) and `commit` (via
+    `_run_git_stdin`) subprocess calls -- and every `_run_git` probe call
+    made along the way (`branch --show-current`, `rev-parse HEAD`,
+    `rev-parse --show-toplevel`, `rev-parse --git-common-dir`,
+    `diff-index`, etc.) -- must never receive the poisoned values."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "new_file.py").write_text("x = 1\n")
+    # Capture the expected HEAD (via an unsanitized, unpoisoned test-helper
+    # subprocess call) BEFORE poisoning os.environ -- the poisoning below
+    # simulates contamination of THIS process's environment (e.g. a leaked
+    # `git -C`/`--git-dir` invocation earlier in the same process tree),
+    # which is what `_sanitized_git_env()` must defend the executor's own
+    # subprocess calls against; it is not meant to also break the test's
+    # own unrelated setup helpers.
+    expected_head = _head(repo)
+
+    _poison_git_env(monkeypatch, tmp_path)
+    calls = _spy_on_subprocess_run(monkeypatch)
+
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+    result = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/new_file.py"],
+        commit_message="feat: add new file",
+        expected_head=expected_head,
+    )
+    assert result.status == "committed", result
+
+    git_calls = [
+        (args, kwargs) for (args, kwargs) in calls if args and args[0] and args[0][0] == "git"
+    ]
+    # At minimum the probe (_run_git), add (_run_git_stdin), and commit
+    # (_run_git_stdin) call sites must all have fired inside this one
+    # execute_controlled_change invocation.
+    argvs = [args[0] for (args, _kwargs) in git_calls]
+    assert any("add" in argv for argv in argvs), argvs
+    assert any("commit" in argv for argv in argvs), argvs
+    assert any("diff-index" in argv for argv in argvs), argvs
+    assert len(git_calls) >= 5, argvs
+
+    for args, kwargs in git_calls:
+        env = kwargs.get("env")
+        assert env is not None, args[0]
+        _assert_no_leaked_git_env_vars(env, args[0])
+
+
+def test_env_sanitization_applied_to_unstage_call(tmp_path: Path, monkeypatch):
+    """Adversarial coverage for the unstage path (`_unstage`, called on a
+    denied result e.g. `path_outside_allowed_paths`): the `git reset --quiet
+    -- <pathspecs>` call must not leak poisoned git env vars either."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    (repo / "outside.py").write_text("x = 1\n")
+    expected_head = _head(repo)
+
+    _poison_git_env(monkeypatch, tmp_path)
+    calls = _spy_on_subprocess_run(monkeypatch)
+
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+    result = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["outside.py"],
+        commit_message="feat: add outside file",
+        expected_head=expected_head,
+    )
+    assert result.status == "denied"
+    assert result.reason_code == "path_outside_allowed_paths"
+
+    reset_calls = [
+        (args, kwargs)
+        for (args, kwargs) in calls
+        if args and args[0] and args[0][0] == "git" and "reset" in args[0]
+    ]
+    assert reset_calls, [args[0] for (args, _kwargs) in calls]
+    for args, kwargs in reset_calls:
+        env = kwargs.get("env")
+        assert env is not None, args[0]
+        _assert_no_leaked_git_env_vars(env, args[0])
+
+
+def test_env_sanitization_applied_to_rollback_call(tmp_path: Path, monkeypatch):
+    """Adversarial coverage for the rollback path (`git reset --soft
+    HEAD~1`, fired on a post-commit audit violation): must not leak
+    poisoned git env vars either, even though this call site constructs its
+    own `subprocess.run(...)` invocation (not `_run_git`/`_run_git_stdin`)."""
+    import controlled_git_change_exec as module
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "a.py").write_text("x = 1\n")
+
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+    head_before = _head(repo)
+
+    def _fake_diff_tree_raw(cwd, commit_sha):
+        return True, b":100644 100644 " + b"0" * 40 + b" " + b"1" * 40 + b" A\0outside.py\0"
+
+    monkeypatch.setattr(module, "_diff_tree_raw", _fake_diff_tree_raw)
+
+    _poison_git_env(monkeypatch, tmp_path)
+    calls = _spy_on_subprocess_run(monkeypatch)
+
+    result = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/a.py"],
+        commit_message="feat: a",
+        expected_head=head_before,
+    )
+    assert result.status == "denied"
+    assert result.reason_code == "post_commit_audit_violation_rolled_back"
+    # Undo the adversarial poisoning before using the (unsanitized) test
+    # helper `_head()` again -- it is not itself a call site under test.
+    for var in _SANITIZED_GIT_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    assert _head(repo) == head_before
+
+    rollback_calls = [
+        (args, kwargs)
+        for (args, kwargs) in calls
+        if args and args[0] and args[0][0] == "git" and args[0][1:3] == ["reset", "--soft"]
+    ]
+    assert rollback_calls, [args[0] for (args, _kwargs) in calls]
+    for args, kwargs in rollback_calls:
+        env = kwargs.get("env")
+        assert env is not None, args[0]
+        _assert_no_leaked_git_env_vars(env, args[0])
+
+
 # ─── AC8 ──────────────────────────────────────────────────────────────────
 
 
