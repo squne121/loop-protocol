@@ -57,6 +57,27 @@ REVIEW_RESULT_SCHEMA_PATH = (
     Path(__file__).resolve().parent.parent.parent / "review-issue" / "schemas" / "review_issue_result_v1.json"
 )
 
+# Issue #1541 PR #1557 OWNER REQUEST_CHANGES High-1: the "wire bytes" contract
+# is the EXACT byte sequence that ends up on stdout -- one trailing LF after
+# the last of `stdout_lines`, not `"\n".join(stdout_lines)` alone. Every
+# producer/validator in the chain (this module, `emit_parent_review_envelope_v2.py`
+# `validate_child_intermediate()`, `validate_review_compact_output.py`) MUST
+# measure/compare this SAME byte sequence, or a producer can emit output it
+# believes is within budget while a downstream consumer measures one byte
+# more (the final LF) and rejects it as `byte_budget_exceeded` -- exactly the
+# boundary bug this constant/helper closes.
+
+
+def wire_bytes(stdout_lines: list[str]) -> bytes:
+    """The exact UTF-8 byte sequence written to stdout for `stdout_lines`:
+    each line followed by a single LF (matching `print(line, flush=True)`
+    called once per line), i.e. `"\\n".join(stdout_lines) + "\\n"`. This is
+    the SSOT byte-count contract shared by every producer/validator that
+    measures the 2048-byte budget (High-1)."""
+    if not stdout_lines:
+        return b""
+    return ("\n".join(stdout_lines) + "\n").encode("utf-8")
+
 
 def _default_artifact_dir() -> Path:
     """Return default artifact directory."""
@@ -230,7 +251,7 @@ def _emit_failure_envelope(
     """
     Emit canonical failure envelope to stdout and write failure artifact.
 
-    stdout format (always ≤ 2048 UTF-8 bytes):
+    stdout format (always <= 2048 UTF-8 wire bytes, see `wire_bytes()`):
       STATUS: failed
       NEXT_ACTION: <next_action>
       REASON_CODE: <reason_code>
@@ -256,12 +277,13 @@ def _emit_failure_envelope(
         f"ARTIFACT_SHA256: {artifact_sha256}",
     ]
 
-    # Enforce 2048-byte cap on the envelope itself; truncate artifact_ref if needed
-    envelope_text = "\n".join(lines)
-    if len(envelope_text.encode("utf-8")) > 2048:
+    # Issue #1541 High-1: enforce the 2048-byte cap on the EXACT wire bytes
+    # (lines joined by LF, plus the trailing LF the final `print()` call
+    # emits) -- not on the pre-trailing-LF join alone. Truncate artifact_ref
+    # if needed.
+    if len(wire_bytes(lines)) > 2048:
         short_ref = artifact_ref[:80] + "..." if len(artifact_ref) > 80 else artifact_ref
         lines[3] = f"ARTIFACT: {short_ref}"
-        envelope_text = "\n".join(lines)
 
     for line in lines:
         print(line, flush=True)
@@ -550,11 +572,20 @@ def main() -> int:
         )
         return 2
 
-    # B3: enforce 2048 UTF-8 bytes limit BEFORE writing success artifact
-    byte_count = len(output_text.encode("utf-8"))
+    # Issue #1541 High-1: enforce the 2048 UTF-8 byte limit on the EXACT wire
+    # bytes (`wire_bytes()` -- lines joined by LF, plus the trailing LF the
+    # final `print()` call below emits), BEFORE writing the success artifact.
+    # The previous implementation measured `"\n".join(stdout_lines)` alone
+    # (omitting that trailing LF), so a producer could self-measure exactly
+    # 2048 bytes while the actual stdout it printed was 2049 bytes -- a
+    # downstream consumer independently measuring the real wire bytes (e.g.
+    # `emit_parent_review_envelope_v2.validate_child_intermediate()`) would
+    # then reject output this producer believed was within budget.
+    wire = wire_bytes(stdout_lines)
+    byte_count = len(wire)
     if byte_count > 2048:
         # AC3: no success artifact written; save details to failure artifact only
-        output_sha256 = hashlib.sha256(output_text.encode("utf-8")).hexdigest()
+        output_sha256 = hashlib.sha256(wire).hexdigest()
         _emit_failure_envelope(
             reason_code="output_budget_violation",
             next_action="human_judgment_required",

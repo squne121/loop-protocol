@@ -10,9 +10,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.util
-import os
+import json
 import re
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -33,7 +32,7 @@ REQUIRED_FIELDS_BASE = {
     "generated_at",
     "script_blob_sha256",
 }
-REQUIRE_RESULT_FIELDS = {"raw_plan_location", "result_sha256"}
+REQUIRE_RESULT_FIELDS = {"raw_plan_location", "result_sha256", "payload"}
 
 FENCED_YAML_RE = re.compile(r"```ya?ml[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
@@ -143,45 +142,17 @@ def _load_capture_sidecar(path: Path) -> dict[str, Any] | None:
     return capture if isinstance(capture, dict) else None
 
 
-def _validate_tmp_raw_plan_path(
-    raw_plan_path: Path,
-    invocation_id: str,
-) -> tuple[bool, str]:
-    if not raw_plan_path.is_absolute():
-        return False, "raw_plan_location_invalid"
-
-    if any(part == ".." for part in raw_plan_path.parts):
-        return False, "raw_plan_location_invalid"
-
-    temp_root = Path(tempfile.gettempdir()).resolve()
-    raw_plan_path_text = str(raw_plan_path)
-    if not raw_plan_path_text.startswith(str(temp_root) + os.sep):
-        return False, "raw_plan_location_invalid"
-
-    if invocation_id not in raw_plan_path.name and invocation_id not in raw_plan_path_text:
-        return False, "raw_plan_location_invalid"
-
-    try:
-        if raw_plan_path.is_symlink():
-            return False, "raw_plan_location_invalid"
-        for parent in raw_plan_path.parents:
-            if parent.is_symlink():
-                return False, "raw_plan_location_invalid"
-    except OSError:
-        return False, "raw_plan_location_invalid"
-
-    try:
-        resolved_path = raw_plan_path.resolve()
-    except OSError:
-        return False, "raw_plan_location_invalid"
-
-    if not resolved_path.exists() or not resolved_path.is_file():
-        return False, "result_missing"
-
-    if not str(resolved_path).startswith(str(temp_root) + os.sep):
-        return False, "raw_plan_location_invalid"
-
-    return True, ""
+def _compute_payload_sha256(payload: dict[str, Any]) -> str:
+    """Same canonicalization as plan_issue_scope_rollup.py /
+    verify_scope_rollup_result.py: json.dumps(ensure_ascii=False,
+    sort_keys=True, separators=(",", ":")).encode("utf-8")."""
+    canonical_bytes = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical_bytes).hexdigest()
 
 
 def _validate_marker_payload(
@@ -249,18 +220,30 @@ def _validate_marker_payload(
     if result_block.get("verify_status") != "verified":
         return "rejected", "scope_rollup_marker_malformed", "verify_status_not_verified", False
 
-    raw_plan_path = Path(str(result_block.get("raw_plan_location", "")))
-    valid_path, path_reject_reason = _validate_tmp_raw_plan_path(
-        raw_plan_path=raw_plan_path,
-        invocation_id=str(expected_invocation_id),
-    )
-    if not valid_path:
-        if path_reject_reason == "":
-            return "rejected", "scope_rollup_marker_malformed", "raw_plan_location_invalid", False
-        return "rejected", "scope_rollup_marker_malformed", path_reject_reason, False
+    # Issue #1547 fix_delta (P0-1): raw_plan_location is fixed to null --
+    # the executor's private invocation directory is cleaned up on every
+    # exit path, so no persisted file location can ever exist. A non-null
+    # value now indicates a runner still speaking the old (broken) contract.
+    if result_block.get("raw_plan_location") is not None:
+        return "rejected", "scope_rollup_marker_malformed", "raw_plan_location_invalid", False
 
-    if _sha256_file(raw_plan_path) != str(result_block.get("result_sha256", "")):
+    payload = result_block.get("payload")
+    if not isinstance(payload, dict):
+        return "marker_malformed", "scope_rollup_marker_malformed", "marker_malformed", False
+
+    # result_sha256 means exactly one thing everywhere in this contract: the
+    # sha256 of the canonical JSON encoding of the plan payload (candidates +
+    # metadata, self_validation excluded) -- i.e. self_validation.payload_sha256
+    # as computed by plan_issue_scope_rollup.py. Recomputing it here from the
+    # embedded payload is a genuine cryptographic binding, not a
+    # self-report: a runner cannot fabricate verify_status: verified without
+    # also supplying a payload whose hash matches result_sha256.
+    if _compute_payload_sha256(payload) != str(result_block.get("result_sha256", "")):
         return "rejected", "scope_rollup_marker_malformed", "result_sha_mismatch", False
+
+    payload_schema_version = payload.get("schema_version")
+    if payload_schema_version != 2:
+        return "rejected", "scope_rollup_marker_malformed", "verify_status_not_verified", False
 
     capture_sidecar = _load_capture_sidecar(capture_sidecar_file)
     if capture_sidecar is None:
@@ -289,11 +272,23 @@ def _validate_marker_payload(
     if capture_sha != actual_capture_sha:
         return "rejected", "scope_rollup_marker_malformed", "capture_sha_mismatch", False
 
+    # Defense in depth: also run the shared in-memory verifier
+    # (verify_scope_rollup_result.verify_payload) against the embedded
+    # payload re-assembled with a self_validation block carrying the
+    # already-verified sha/schema fields, so schema_name/script_file_sha256
+    # (not covered by the result_sha256 check above) are cross-checked too.
     verifier = _load_issue_refinement_verifier()
     if verifier is None:
         return "rejected", "scope_rollup_marker_malformed", "verify_status_not_verified", False
 
-    _verify_output, verify_code = verifier.verify(str(raw_plan_path))
+    reconstructed = dict(payload)
+    reconstructed["self_validation"] = {
+        "schema_name": result_block.get("plan_schema_name") or result_block.get("plan_schema"),
+        "schema_version": payload_schema_version,
+        "payload_sha256": str(result_block.get("result_sha256", "")),
+        "script_file_sha256": expected_script_sha,
+    }
+    _verify_output, verify_code = verifier.verify_payload(reconstructed)
     if verify_code != 0:
         return "rejected", "scope_rollup_marker_malformed", "verify_status_not_verified", False
 

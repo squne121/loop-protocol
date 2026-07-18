@@ -28,6 +28,8 @@
     "tests/codex/test_execpolicy_matrix.py",
     "tests/codex/test_cleanup_exec_branch_only.py",
     "tests/codex/test_root_temporary_residue_advisory.py",
+    "tests/codex/test_scope_rollup_run_exact_executor.py",
+    "tests/codex/test_run_scope_rollup_preflight.py",
     "tests/test_codex_agent_bridge_contract.py",
     "tests/test_codex_agent_model_refresh_evidence.py",
     "tests/test_subagent_launch_ledger.py",

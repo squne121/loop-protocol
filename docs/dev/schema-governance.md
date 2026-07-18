@@ -54,7 +54,8 @@ related_issue: "#135"
 | `REVIEW_COMPACT_VALIDATION_RESULT_V1` | `.claude/skills/issue-refinement-loop/scripts/validate_review_compact_output.py` | validate_review_compact_output.py（`review_compact.validate` 経由で orchestrator が呼び出す） | issue-refinement-loop（Step 2/2a routing gate）、build_refinement_phase_state.py（`--review-validation-result-path` 経由の review-phase 構造的ゲート、#1507 AC24） | `rg -n "REVIEW_COMPACT_VALIDATION_RESULT_V1\|validation_status\|review_compact.validate\|review-validation-result-path" .claude/skills/issue-refinement-loop` |
 | `PARENT_REPLAY_BINDING_ARTIFACT_V1` | `.claude/skills/issue-refinement-loop/scripts/parent_replay_binding.py` | parent_replay_binding.py（issue-refinement-loop orchestrator が parent-owned inventory と child の bounded `REVIEWER_BLOCKER_CLAIM_V1` claim のみを渡して呼び出す） | validate_review_compact_output.py（`--v2` の required `--binding-artifact-file`。`expected_replay_next_state` / `expected_parent_binding_digest` の照合入力）、reviewer_claim_replay_state_store.py（`--write-v2` の `PARENT_REPLAY_NEXT_STATE` 永続化ソース） | `rg -n "PARENT_REPLAY_BINDING_ARTIFACT_V1\|binding_digest\|parent_replay_binding" .claude/skills/issue-refinement-loop` |
 | `REVIEWER_BLOCKER_CLAIM_V1` | `.claude/skills/issue-refinement-loop/scripts/compact_review_result.py`（`REVIEWER_BLOCKER_CLAIM` stdout field） | issue-reviewer SubAgent（`compact_review_result.py` 経由。`{schema, body_sha256, blockers: [...]}` のみ。`findings` / `checker_evidence` / `deterministic_checks` は禁止 — additionalProperties: false で fail-closed 拒否） | parent_replay_binding.py（`validate_reviewer_blocker_claim()` で shape 検証してから replay 入力にする。監査目的でのみ envelope に残る） | `rg -n "REVIEWER_BLOCKER_CLAIM_V1\|REVIEWER_BLOCKER_CLAIM" .claude/skills/issue-refinement-loop` |
-| `ISSUE_REVIEW_RESULT_COMPACT_V2` / `REVIEW_COMPACT_VALIDATION_RESULT_V2` | `.claude/skills/issue-refinement-loop/scripts/validate_review_compact_output.py`（`NEEDS_FIX_FIELDS_V2` / `validate_review_compact_output_v2` / `SCHEMA_V2`） | issue-refinement-loop orchestrator（child の bounded claim envelope に `PARENT_REPLAY_VERDICT` / `PARENT_REPLAY_ROUTING` / `PARENT_REPLAY_SHOULD_CONSUME` / `PARENT_REPLAY_BODY_SHA256` / `PARENT_REPLAY_NEXT_STATE` / `PARENT_REPLAY_BINDING_DIGEST` を自ら計算して追記し V2 envelope を組み立てる。子 SubAgent は routing フィールドの producer ではない — V1 の `REPLAY_VERDICT` 等 child 自己申告フィールドは V2 producer 契約から廃止された） | issue-refinement-loop（Step 2a V2 routing gate。routing は `PARENT_REPLAY_*` のみを参照する）、reviewer_claim_replay_state_store.py（`--write-v2`） | `rg -n "REVIEW_COMPACT_VALIDATION_RESULT_V2\|PARENT_REPLAY_BINDING_DIGEST\|NEEDS_FIX_FIELDS_V2" .claude/skills/issue-refinement-loop` |
+| `ISSUE_REVIEW_RESULT_COMPACT_V2` / `REVIEW_COMPACT_VALIDATION_RESULT_V2` | `.claude/skills/issue-refinement-loop/scripts/validate_review_compact_output.py`（`NEEDS_FIX_FIELDS_V2` / `validate_review_compact_output_v2` / `SCHEMA_V2`） | `emit_parent_review_envelope_v2.py`（issue-refinement-loop orchestrator が唯一の呼び出し元。strict 検証済みの child intermediate と `PARENT_REPLAY_BINDING_ARTIFACT_V1` から `PARENT_REPLAY_*` 6行を決定論的に導出し15行 envelope を組み立てる。Issue #1541 — 旧来の orchestrator 手動 f-string assembly は production 経路から廃止） | issue-refinement-loop（Step 2a V2 routing gate。routing は `PARENT_REPLAY_*` のみを参照する）、reviewer_claim_replay_state_store.py（`--write-v2`） | `rg -n "REVIEW_COMPACT_VALIDATION_RESULT_V2\|PARENT_REPLAY_BINDING_DIGEST\|NEEDS_FIX_FIELDS_V2" .claude/skills/issue-refinement-loop` |
+| `EMIT_PARENT_REVIEW_ENVELOPE_V2_FAILURE` | `.claude/skills/issue-refinement-loop/scripts/emit_parent_review_envelope_v2.py` | emit_parent_review_envelope_v2.py（`main()` の contract-invalid / runtime-error stderr diagnostic） | issue-refinement-loop orchestrator（Step 2a、emitter 非 0 exit 時の human-readable/machine-readable diagnostic） | `rg -n "EMIT_PARENT_REVIEW_ENVELOPE_V2_FAILURE" .claude/skills/issue-refinement-loop/scripts` |
 
 ### 信頼境界（Trust boundary、Issue #1532）
 
@@ -280,6 +281,36 @@ validation_commands:
 notes:
   - "V1 envelope（approve/needs_fix/producer_failure）は validate_review_compact_output_v2 経由でも完全に不変（V1 exact match は V1 結果をそのまま返す）。"
   - "expected_replay_next_state / expected_parent_binding_digest は呼び出し元が PARENT_REPLAY_BINDING_ARTIFACT_V1 から独立に計算した値であり、envelope テキスト自身から導出した値と比較することは決してない（自己参照検証の禁止）。"
+
+schema_id: EMIT_PARENT_REVIEW_ENVELOPE_V2 (child intermediate grammar + V2 emission)
+definition: .claude/skills/issue-refinement-loop/scripts/emit_parent_review_envelope_v2.py
+related_issue: "#1541"
+producer:
+  - emit_parent_review_envelope_v2.py（issue-refinement-loop orchestrator が command registry `review_compact.emit_v2` 経由で唯一呼び出す。旧来の orchestrator 手動 f-string assembly、テスト専用 `_assemble_v2_envelope()` は production 経路から廃止）
+consumer:
+  - issue-refinement-loop orchestrator（stdout の完全な15行 V2 envelope を `validate_review_compact_output.py --v2` へそのまま渡す）
+trust_boundary:
+  - "`validate_child_intermediate()` は child intermediate（8行 approve / 9行 needs-fix、`REVIEWER_BLOCKER_CLAIM` を含む）を V1/V2 final grammar とは別の grammar として strict 検証する。`PARENT_REPLAY_*` はこの grammar では unknown field として拒否される。"
+  - "`render_parent_review_envelope_v2()` は pure function（subprocess/I/O なし）。`PARENT_REPLAY_*` 6行は ALWAYS 呼び出し元が既に schema/digest 検証済みの `PARENT_REPLAY_BINDING_ARTIFACT_V1` からのみ導出され、child intermediate 自身の文字列や child が主張する値からは一切導出しない。"
+  - "`emit_parent_review_envelope_v2()` は binding artifact の digest 自己整合性・identity（repository/issue/session/iteration/body）・child claim の canonical digest 一致をすべて検証してから envelope を組み立てる。いずれかの不一致は contract-invalid（exit 1）として fail-closed する。"
+compatibility:
+  breaking_changes:
+    - child intermediate grammar（CHILD_APPROVE_FIELDS / CHILD_NEEDS_FIX_FIELDS）のフィールド集合・順序変更
+    - render_parent_review_envelope_v2() の byte layout 変更（LF/trailing LF/UTF-8/BOM なし の contract 変更）
+  non_breaking_changes:
+    - stderr diagnostic の追加フィールド
+detection_patterns:
+  - 'emit_parent_review_envelope_v2'
+  - 'render_parent_review_envelope_v2'
+  - 'validate_child_intermediate'
+  - 'review_compact.emit_v2'
+validation_commands:
+  - "uv run --locked pytest .claude/skills/issue-refinement-loop/tests/test_emit_parent_review_envelope_v2.py -q"
+  - "uv run --locked pytest .claude/skills/issue-refinement-loop/tests/test_production_v2_command_chain.py -q"
+  - "uv run --locked pytest .claude/skills/issue-refinement-loop/tests/test_review_compact_emit_v2_registry_contract.py -q"
+notes:
+  - "approve envelope（8行）は binding artifact / claim / replay / state write を一切起動しない（AC6）。"
+  - "失敗時（contract-invalid / runtime error）は stdout を常に空のまま保ち、部分 envelope を書かない（AC8）。"
 ```
 
 ## #934 public-surface boundary cleanup note（公開境界クリーンアップ注記）

@@ -193,6 +193,38 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
         },
     },
+    # Issue #1547: scope_rollup.run exact command -- bound directly to
+    # scripts/agent-guards/run_scope_rollup_preflight.py (NOT the
+    # issue-refinement-loop skill_runtime_exec.py executor, which is
+    # hard-coded to run_refinement_preflight.py and is out of this Issue's
+    # Allowed Paths). This entry is a documentation/SSOT registration of the
+    # canonical argv shape; scope_rollup.run is dispatched directly by
+    # local_main_branch_guard.py / skill_runtime_command_policy.py, not via
+    # skill_runtime_exec.py's render_command() dispatch path.
+    "scope_rollup.run": {
+        "id": "scope_rollup.run",
+        "argv": [
+            "uv", "run", "python3",
+            "scripts/agent-guards/run_scope_rollup_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_scope_rollup_run",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "allowed_write_roots": [],
+        "network_effect": "github_read_only",
+        "stdin_contract": "none",
+        "stdout_contract": "scope_rollup_run_result/v1",
+        "timeout_seconds": 180,
+        "mutation": False,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+        },
+    },
     "plan.run": {
         "id": "plan.run",
         "argv": [
@@ -448,6 +480,103 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "refinement_session_id": {"type": "string", "required": True},
             "iteration_id": {"type": "string", "required": True},
             "current_body_file": {"type": "repo_relative_file", "required": True},
+        },
+    },
+    # Issue #1541: deterministic production emitter that replaces the
+    # test-only `_assemble_v2_envelope()` f-string helper. Strictly
+    # validates the child intermediate (8-line approve / 9-line needs-fix)
+    # and, for needs-fix, derives the six `PARENT_REPLAY_*` fields ONLY from
+    # an already-validated `PARENT_REPLAY_BINDING_ARTIFACT_V1` -- never from
+    # anything the child claims about routing/digests. Sits between
+    # `parent_replay.bind` and `review_compact.validate_v2` in the command
+    # chain.
+    "review_compact.emit_v2": {
+        "id": "review_compact.emit_v2",
+        "argv": [
+            "uv", "run", "--locked", "--offline", "--no-sync", "python3",
+            f"{_SKILL_PREFIX}/emit_parent_review_envelope_v2.py",
+            "--issue-number", "{issue_number}",
+            "--binding-artifact-file", "{binding_artifact_file}",
+            "--repository-full-name", "{repo}",
+            "--refinement-session-id", "{refinement_session_id}",
+            "--iteration-id", "{iteration_id}",
+            "--current-body-file", "{current_body_file}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "stdin_contract": "issue_review_result_compact_v2/child_intermediate_text",
+        "stdout_contract": "issue_review_result_compact_v2/raw_text",
+        "timeout_seconds": 30,
+        "mutation": False,
+        "network_effect": "local_only",
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "binding_artifact_file": {"type": "repo_relative_file", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "refinement_session_id": {"type": "string", "required": True},
+            "iteration_id": {"type": "string", "required": True},
+            "current_body_file": {"type": "repo_relative_file", "required": True},
+        },
+    },
+    # Issue #1541 PR #1557 OWNER REQUEST_CHANGES Blocker 2: `review_compact.emit_v2`
+    # above is the NEEDS-FIX profile (binding artifact / repo identity /
+    # session / iteration / current body file are ALL required placeholders
+    # -- correct for needs-fix, but AC6 requires approve to touch NONE of
+    # those). This sibling entry is the APPROVE profile: its argv template
+    # structurally has NO binding/body/session/iteration placeholders at
+    # all, so an approve child input can never even be given a path to
+    # those files, let alone have them opened. `emit_parent_review_envelope_v2.py`
+    # itself also independently classifies the child intermediate BEFORE
+    # opening any binding/body file (see Blocker 2 fix in that module's
+    # `main()`), so this registry-level separation and that in-process
+    # ordering are two independent enforcement layers for the same
+    # guarantee.
+    "review_compact.emit_approve": {
+        "id": "review_compact.emit_approve",
+        "argv": [
+            "uv", "run", "--locked", "--offline", "--no-sync", "python3",
+            f"{_SKILL_PREFIX}/emit_parent_review_envelope_v2.py",
+            "--issue-number", "{issue_number}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "stdin_contract": "issue_review_result_compact_v2/child_intermediate_text",
+        "stdout_contract": "issue_review_result_compact_v2/raw_text",
+        "timeout_seconds": 30,
+        "mutation": False,
+        "network_effect": "local_only",
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+        },
+    },
+    # Issue #1541 PR #1557 OWNER REQUEST_CHANGES Blocker 1: independent
+    # `review_compact.validate_intermediate_v1` command. The production
+    # command chain MUST route raw child stdout BYTES through this command
+    # (never a hand-rolled `startswith("REVIEWER_BLOCKER_CLAIM: ")` /
+    # `json.loads()` extraction) before any parent binding/emit step --
+    # `emit_parent_review_envelope_v2.build_validate_intermediate_result()`
+    # returns `envelope_kind` / `input_sha256` / `input_byte_count` /
+    # `normalized_payload` / `canonical_reviewer_blocker_claim`. Only when
+    # `envelope_kind == "needs_fix_intermediate"` does the caller write
+    # `canonical_reviewer_blocker_claim` to a claim file and proceed to
+    # `parent_replay.bind`.
+    "review_compact.validate_intermediate_v1": {
+        "id": "review_compact.validate_intermediate_v1",
+        "argv": [
+            "uv", "run", "--locked", "--offline", "--no-sync", "python3",
+            f"{_SKILL_PREFIX}/emit_parent_review_envelope_v2.py",
+            "--issue-number", "{issue_number}",
+            "--validate-intermediate",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "stdin_contract": "issue_review_result_compact_v2/child_intermediate_text",
+        "stdout_contract": "review_compact_intermediate_validation_result/v1",
+        "timeout_seconds": 30,
+        "mutation": False,
+        "network_effect": "local_only",
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
         },
     },
     # Issue #1532 AC5/High-3: the sole V2 state-write path. Rejects
