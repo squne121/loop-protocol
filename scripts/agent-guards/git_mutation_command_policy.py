@@ -35,6 +35,11 @@ COMMAND_CLASS_RTK_GIT_PUSH = "rtk_git_push"
 # the plain `HEAD:refs/heads/<branch>` refspec the existing lane expects.
 COMMAND_CLASS_RTK_GIT_INITIAL_BRANCH_CREATE = "rtk_git_initial_branch_create"
 COMMAND_CLASS_RTK_GIT_UNKNOWN = "rtk_git_unknown"
+# Issue #1611 AC9: raw `git add`/`git commit` and `rtk git add`/`rtk git
+# commit` are always denied outside the controlled executor -- see
+# `classify_agent_lane_add_commit` below.
+COMMAND_CLASS_RAW_GIT_ADD = "raw_git_add"
+COMMAND_CLASS_RAW_GIT_COMMIT = "raw_git_commit"
 ALLOWED_ALLOWED_PATHS_GATE_STATUSES = frozenset({"ok", "fail_closed", "indeterminate"})
 # Issue #1408 iteration-2 (P2): canonical push destination identity. New
 # branch initial publish (remote ref absent) is explicitly out of scope for
@@ -1423,6 +1428,61 @@ def _classify_initial_branch_create_push(
         remote_state=transaction.remote_state,
         remote_state_error_category=transaction.push_error_category,
     )
+
+
+def classify_agent_lane_add_commit(command: str) -> GitMutationPolicyResult | None:
+    """Issue #1611 AC9: deny raw `git add`/`git commit` and `rtk git
+    add`/`rtk git commit` shell command shapes unconditionally for the
+    agent lane.
+
+    The ONLY authorized path for staging/committing agent-driven changes
+    is the controlled executor
+    (`scripts/agent-guards/controlled_git_change_exec.py`,
+    `execute_controlled_change`), which never goes through a `rtk git
+    ...` / `git ...` shell command string at all -- it invokes git
+    in-process via `subprocess.run` with a literal argv, inside a single
+    trusted stage -> classify -> audit -> commit -> re-audit boundary.
+    Any shell command string shaped like `git add` / `git commit` / `rtk
+    git add` / `rtk git commit` reaching this classifier is, by
+    definition, NOT the controlled executor -- so it is always denied,
+    independent of `CODEX_ALLOWED_PATHS` / staged-path contents (unlike
+    the legacy `classify_rtk_git_mutation` add/commit branches above,
+    which this function does not modify -- Issue #1611 AC13 keeps those
+    existing branches, and their existing regression tests, unchanged).
+    """
+    tokens = _tokenize(command)
+    if not tokens:
+        return None
+    if len(tokens) >= 3 and tokens[0] == "rtk" and tokens[1] == "git":
+        git_argv = tokens[1:]
+    elif len(tokens) >= 2 and tokens[0] == "git":
+        git_argv = tokens
+    else:
+        return None
+    if len(git_argv) < 2:
+        return None
+    subcommand = git_argv[1]
+    if subcommand == "add":
+        return GitMutationPolicyResult(
+            status="deny",
+            command_class=COMMAND_CLASS_RAW_GIT_ADD,
+            reason_code="git_add_requires_controlled_executor",
+            suggested_command=(
+                "uv run --locked python3 scripts/agent-guards/controlled_git_change_exec.py --help"
+            ),
+            verification_command="git diff --cached --name-status -M -z",
+        )
+    if subcommand == "commit":
+        return GitMutationPolicyResult(
+            status="deny",
+            command_class=COMMAND_CLASS_RAW_GIT_COMMIT,
+            reason_code="git_commit_requires_controlled_executor",
+            suggested_command=(
+                "uv run --locked python3 scripts/agent-guards/controlled_git_change_exec.py --help"
+            ),
+            verification_command="git log -1 --name-status",
+        )
+    return None
 
 
 def classify_rtk_git_mutation(
