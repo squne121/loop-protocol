@@ -53,6 +53,7 @@ from typing import Any, Dict, List, Tuple
 COLLECT_TIMEOUT_SECONDS = 120
 DIFF_TIMEOUT_SECONDS = 30
 RUNTIME_VERIFICATION_COLLECT_TIMEOUT_SECONDS = 60
+_PYTEST_MARKER_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # pytest's default test-file convention (python_files = test_*.py / *_test.py). A path is
 # a changed *test* file only if its basename matches this — not merely if "test" appears
@@ -159,9 +160,9 @@ def _get_runtime_verification_only_markers(args) -> Tuple[List[str], str | None]
         if not isinstance(markers, list):
             raise ValueError("plan.runtime_verification_only_markers must be a list")
         for marker in markers:
-            if not isinstance(marker, str) or not marker:
+            if not isinstance(marker, str) or not _PYTEST_MARKER_NAME_RE.fullmatch(marker):
                 raise ValueError(
-                    "plan.runtime_verification_only_markers entries must be non-empty strings"
+                    "plan.runtime_verification_only_markers entries must be valid pytest marker names"
                 )
         return list(markers), None
     except Exception as exc:
@@ -174,15 +175,18 @@ def check_runtime_verification_only_coverage(
     """Confirm ``changed_file`` is a runtime-verification-only exempt file (Issue #1562).
 
     Fail-closed: this NEVER trusts the marker declaration alone. It actually re-runs
-    ``pytest --collect-only`` scoped to exactly this file twice:
+    ``pytest --collect-only`` scoped to exactly this file three times:
       1. under the default marker filter (addopts) -- must collect ZERO nodeids
          (otherwise the file is genuinely collected by the default run and this
          function should not have been called for it in the first place, OR it is
          only partially marker-exempt, which is not a clean exemption).
-      2. under an explicit ``-m "<marker1> or <marker2>..."`` override -- must
-         collect AT LEAST ONE nodeid (proof the file's tests actually exist and are
-         reachable under the runtime-verification-only markers, not merely absent
-         from the plan target set for an unrelated reason).
+      2. with ``addopts`` disabled -- establishes the complete, unfiltered nodeid
+         set for the file.
+      3. with ``addopts`` disabled and an explicit
+         ``-m "<marker1> or <marker2>..."`` expression -- must collect exactly the
+         same nodeid set as (2). This proves every test in the changed file is
+         selected by a runtime-verification-only marker, rather than merely proving
+         that at least one marked test exists.
 
     Returns (is_exempt, evidence). evidence is always attached to the artifact for
     transparency (whether or not the file ends up exempted).
@@ -192,8 +196,11 @@ def check_runtime_verification_only_coverage(
         "markers": list(markers),
         "default_collect_nodeid_count": None,
         "default_collect_ok": None,
+        "unfiltered_collect_nodeid_count": None,
+        "unfiltered_collect_ok": None,
         "marker_collect_nodeid_count": None,
         "marker_collect_ok": None,
+        "all_nodeids_match_marker_nodeids": None,
         "exempt": False,
         "error": None,
     }
@@ -212,6 +219,7 @@ def check_runtime_verification_only_coverage(
         not default_status["timed_out"]
         and default_status["returncode"] in (0, 5)
     )
+    evidence["default_collect_ok"] = default_probe_ok
     if not default_probe_ok:
         evidence["error"] = (
             f"default collect-only probe failed: returncode={default_status['returncode']} "
@@ -225,9 +233,29 @@ def check_runtime_verification_only_coverage(
         )
         return False, evidence
 
+    clean_collection_args = ["-o", "addopts=", changed_file]
+    _, unfiltered_nodeids, unfiltered_status = get_pytest_collected_tests(
+        clean_collection_args,
+        timeout_seconds=RUNTIME_VERIFICATION_COLLECT_TIMEOUT_SECONDS,
+    )
+    evidence["unfiltered_collect_nodeid_count"] = unfiltered_status["nodeid_count"]
+    unfiltered_probe_ok = (
+        not unfiltered_status["timed_out"]
+        and unfiltered_status["returncode"] == 0
+        and unfiltered_status["nodeid_count"] > 0
+    )
+    evidence["unfiltered_collect_ok"] = unfiltered_probe_ok
+    if not unfiltered_probe_ok:
+        evidence["error"] = (
+            f"addopts-free collect-only probe failed: returncode={unfiltered_status['returncode']} "
+            f"timed_out={unfiltered_status['timed_out']} "
+            f"nodeid_count={unfiltered_status['nodeid_count']}"
+        )
+        return False, evidence
+
     marker_expr = " or ".join(markers)
     _, marker_nodeids, marker_status = get_pytest_collected_tests(
-        [changed_file, "-m", marker_expr],
+        ["-o", "addopts=", changed_file, "-m", marker_expr],
         timeout_seconds=RUNTIME_VERIFICATION_COLLECT_TIMEOUT_SECONDS,
     )
     evidence["marker_collect_nodeid_count"] = marker_status["nodeid_count"]
@@ -249,6 +277,15 @@ def check_runtime_verification_only_coverage(
         evidence["error"] = (
             "no tests collected under runtime_verification_only_markers either "
             "-- not a valid exemption"
+        )
+        return False, evidence
+
+    all_nodeids_match_marker_nodeids = set(unfiltered_nodeids) == set(marker_nodeids)
+    evidence["all_nodeids_match_marker_nodeids"] = all_nodeids_match_marker_nodeids
+    if not all_nodeids_match_marker_nodeids:
+        evidence["error"] = (
+            "addopts-free complete nodeid set does not match the "
+            "runtime-verification-only marker-selected nodeid set"
         )
         return False, evidence
 

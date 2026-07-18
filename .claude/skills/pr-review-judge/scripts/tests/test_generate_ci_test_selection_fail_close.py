@@ -343,10 +343,8 @@ def _fake_plan_module(plan: dict, scope=None):
     )
 
 
-def test_check_runtime_verification_only_coverage_confirms_real_double_probe(monkeypatch):
-    """The exemption must be backed by two REAL (mocked-subprocess-level) probes:
-    a default collect (expect 0 nodeids) and a marker-scoped collect (expect >=1).
-    """
+def test_check_runtime_verification_only_coverage_confirms_complete_marker_selection(monkeypatch):
+    """The exemption requires default deselection plus exact clean/marker nodeid parity."""
     calls: list[list[str]] = []
 
     def fake_get_pytest_collected_tests(pytest_args, timeout_seconds=None):
@@ -354,8 +352,15 @@ def test_check_runtime_verification_only_coverage_confirms_real_double_probe(mon
         if "-m" in pytest_args:
             return (
                 ["pkg/test_live.py"],
-                ["pkg/test_live.py::test_one"],
-                {"returncode": 0, "timed_out": False, "nodeid_count": 1,
+                ["pkg/test_live.py::test_one", "pkg/test_live.py::test_two"],
+                {"returncode": 0, "timed_out": False, "nodeid_count": 2,
+                 "error": None, "stderr_tail": "", "ok": True},
+            )
+        if "-o" in pytest_args:
+            return (
+                ["pkg/test_live.py"],
+                ["pkg/test_live.py::test_one", "pkg/test_live.py::test_two"],
+                {"returncode": 0, "timed_out": False, "nodeid_count": 2,
                  "error": None, "stderr_tail": "", "ok": True},
             )
         # default (no -m override): marker-only file collects zero under default addopts
@@ -374,11 +379,16 @@ def test_check_runtime_verification_only_coverage_confirms_real_double_probe(mon
     assert is_exempt is True
     assert evidence["exempt"] is True
     assert evidence["default_collect_nodeid_count"] == 0
-    assert evidence["marker_collect_nodeid_count"] == 1
-    # Both probes were actually invoked -- never a declaration-only shortcut.
-    assert len(calls) == 2
+    assert evidence["default_collect_ok"] is True
+    assert evidence["unfiltered_collect_nodeid_count"] == 2
+    assert evidence["unfiltered_collect_ok"] is True
+    assert evidence["marker_collect_nodeid_count"] == 2
+    assert evidence["marker_collect_ok"] is True
+    assert evidence["all_nodeids_match_marker_nodeids"] is True
+    assert len(calls) == 3
     assert calls[0] == ["pkg/test_live.py"]
-    assert calls[1] == ["pkg/test_live.py", "-m", "github_live"]
+    assert calls[1] == ["-o", "addopts=", "pkg/test_live.py"]
+    assert calls[2] == ["-o", "addopts=", "pkg/test_live.py", "-m", "github_live"]
 
 
 def test_check_runtime_verification_only_coverage_rejects_when_default_probe_collects(monkeypatch):
@@ -406,6 +416,19 @@ def test_check_runtime_verification_only_coverage_rejects_when_marker_probe_empt
     not a legitimate exemption (e.g. the file has no tests at all under this path)."""
 
     def fake_get_pytest_collected_tests(pytest_args, timeout_seconds=None):
+        if "-m" in pytest_args:
+            return (
+                [], [],
+                {"returncode": 5, "timed_out": False, "nodeid_count": 0,
+                 "error": None, "stderr_tail": "", "ok": False},
+            )
+        if "-o" in pytest_args:
+            return (
+                ["pkg/test_empty.py"],
+                ["pkg/test_empty.py::test_unmarked"],
+                {"returncode": 0, "timed_out": False, "nodeid_count": 1,
+                 "error": None, "stderr_tail": "", "ok": True},
+            )
         return (
             [],
             [],
@@ -419,6 +442,40 @@ def test_check_runtime_verification_only_coverage_rejects_when_marker_probe_empt
     )
     assert is_exempt is False
     assert "no tests collected under runtime_verification_only_markers" in evidence["error"]
+
+
+def test_check_runtime_verification_only_coverage_rejects_mixed_marker_file(monkeypatch):
+    """An unmarked test must keep a changed file uncovered (fail-closed)."""
+
+    def fake_get_pytest_collected_tests(pytest_args, timeout_seconds=None):
+        if "-m" in pytest_args:
+            return (
+                ["pkg/test_mixed.py"],
+                ["pkg/test_mixed.py::test_live"],
+                {"returncode": 0, "timed_out": False, "nodeid_count": 1,
+                 "error": None, "stderr_tail": "", "ok": True},
+            )
+        if "-o" in pytest_args:
+            return (
+                ["pkg/test_mixed.py"],
+                ["pkg/test_mixed.py::test_live", "pkg/test_mixed.py::test_default"],
+                {"returncode": 0, "timed_out": False, "nodeid_count": 2,
+                 "error": None, "stderr_tail": "", "ok": True},
+            )
+        return (
+            [], [],
+            {"returncode": 5, "timed_out": False, "nodeid_count": 0,
+             "error": None, "stderr_tail": "", "ok": False},
+        )
+
+    monkeypatch.setattr(gen, "get_pytest_collected_tests", fake_get_pytest_collected_tests)
+    is_exempt, evidence = gen.check_runtime_verification_only_coverage(
+        "pkg/test_mixed.py", ["github_live"]
+    )
+    assert is_exempt is False
+    assert evidence["default_collect_ok"] is True
+    assert evidence["all_nodeids_match_marker_nodeids"] is False
+    assert "complete nodeid set" in evidence["error"]
 
 
 def test_check_runtime_verification_only_coverage_no_markers_is_not_exempt():
@@ -436,7 +493,14 @@ def test_generate_artifact_exempts_runtime_verification_only_changed_test(monkey
     live_file = ".claude/skills/impl-review-loop/tests/test_ensure_contract_snapshot_fingerprint_patch.py"
 
     def fake_get_pytest_collected_tests(pytest_args, timeout_seconds=None):
-        if pytest_args == [live_file, "-m", "github_live"]:
+        if pytest_args == ["-o", "addopts=", live_file, "-m", "github_live"]:
+            return (
+                [live_file],
+                [f"{live_file}::TestA::test_one", f"{live_file}::TestB::test_two"],
+                {"returncode": 0, "timed_out": False, "nodeid_count": 2,
+                 "error": None, "stderr_tail": "", "ok": True},
+            )
+        if pytest_args == ["-o", "addopts=", live_file]:
             return (
                 [live_file],
                 [f"{live_file}::TestA::test_one", f"{live_file}::TestB::test_two"],
@@ -485,6 +549,8 @@ def test_generate_artifact_exempts_runtime_verification_only_changed_test(monkey
     assert data["runtime_verification_only_markers"] == ["github_live"]
     assert len(data["runtime_verification_only_evidence"]) == 1
     assert data["runtime_verification_only_evidence"][0]["exempt"] is True
+    assert data["runtime_verification_only_evidence"][0]["default_collect_ok"] is True
+    assert data["runtime_verification_only_evidence"][0]["all_nodeids_match_marker_nodeids"] is True
 
 
 def test_generate_artifact_still_fails_closed_for_genuinely_uncovered_file(monkeypatch, tmp_path):
@@ -496,13 +562,20 @@ def test_generate_artifact_still_fails_closed_for_genuinely_uncovered_file(monke
     uncovered_file = "pkg/test_really_uncovered.py"
 
     def fake_get_pytest_collected_tests(pytest_args, timeout_seconds=None):
-        if pytest_args == [uncovered_file, "-m", "github_live"]:
+        if pytest_args == ["-o", "addopts=", uncovered_file, "-m", "github_live"]:
             # marker probe ALSO collects nothing -> genuinely uncovered, not exempt
             return (
                 [],
                 [],
                 {"returncode": 5, "timed_out": False, "nodeid_count": 0,
                  "error": None, "stderr_tail": "", "ok": False},
+            )
+        if pytest_args == ["-o", "addopts=", uncovered_file]:
+            return (
+                [uncovered_file],
+                [f"{uncovered_file}::test_unmarked"],
+                {"returncode": 0, "timed_out": False, "nodeid_count": 1,
+                 "error": None, "stderr_tail": "", "ok": True},
             )
         if pytest_args == [uncovered_file]:
             return (
