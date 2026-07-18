@@ -943,6 +943,12 @@ jobs:
         # and Python script invocations; direct interpreters are allowed only via
         # the stdlib_only/bootstrap exceptions registry.
         run: uv run --locked python scripts/ci/check_python_invocation_policy.py --strict
+      - name: Check .claude/settings.json permissions (#1551)
+        # Fail-closed static scan: permissions.allow/ask/deny in .claude/settings.json
+        # must not contain scoped Write(path) rules (repository policy:
+        # claude_permission_edit_rule_canonicalization_v1). Scoped path mutation is
+        # expressed via Edit(path) instead.
+        run: uv run --locked python scripts/ci/check_claude_settings_permissions.py --settings .claude/settings.json
       - name: pytest python suite (parallel) (timed)
         # Plan-driven xdist parallel step (Issue #1064). Target set / --ignore / --deselect /
         # FIXED worker count / scheduler all come from the python-test-plan SSOT via the
