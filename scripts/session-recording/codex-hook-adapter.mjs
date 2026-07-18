@@ -673,18 +673,17 @@ function runManifestFlow(eventName, payload) {
   const metadataFindings = scanObjectForSyntheticCanary(payload)
   const fileName = buildCodexManifestFileName()
 
-  // AC2: when CODEX_HOOK_MANIFEST_ROOT is set, honor it as the manifest write-target
-  // override (used by the test suite to isolate per-test manifest directories under
-  // pytest-xdist parallel execution). Unset/empty falls back to the production default.
-  const manifestRootOverride = process.env.CODEX_HOOK_MANIFEST_ROOT || undefined
-
-  // Issue #1420 fix_delta AC10: resolve the real write target BEFORE producing the
-  // manifest so evidence_ref reflects the actual write location (including any
-  // manifestRoot override) instead of a fixed string that can diverge from it.
+  // Issue #1420 fix_delta AC10 / Issue #1546: resolve the real write target
+  // BEFORE producing the manifest so evidence_ref reflects the actual write
+  // location instead of a fixed string that can diverge from it. Issue
+  // #1546: the production default (no CODEX_HOOK_MANIFEST_ROOT override) is
+  // now the canonical external per-user state root -- never the repository
+  // tree. A CODEX_HOOK_MANIFEST_ROOT override (test isolation only) is
+  // still honored, and is validated fail-before-mutation by
+  // resolveCodexSessionManifestRoot (via resolveManifestWriteTarget).
   const manifestWriteResult = resolveManifestWriteTarget({
     repoRoot,
     eventName,
-    manifestRoot: manifestRootOverride,
     fileName,
   })
   const evidenceSourceRef = manifestWriteResult.relativePath
@@ -701,7 +700,6 @@ function runManifestFlow(eventName, payload) {
     repoRoot,
     eventName,
     fileName,
-    manifestRoot: manifestRootOverride,
   })
 
   const verification = verifyCodexPostRun(payload, { repoRoot })

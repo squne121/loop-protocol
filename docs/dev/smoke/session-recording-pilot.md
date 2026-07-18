@@ -20,7 +20,7 @@ status: in-progress
 ## Evidence Storage Boundary
 
 - `artifacts/session-recording-pilot/` は local-only / private artifact 用であり、raw transcript、local absolute path、API key、`.env`、agent-local settings を GitHub に投稿・commit・push してはならない。
-- Codex CLI adapter で追加される `tmp/session-manifests/codex/**` と `tmp/codex-pilot-metrics.json` も private/local artifact とし、runtime active hook / trust state の public evidence に流用しない。
+- Codex CLI adapter が生成する session manifest（Issue #1546 以降は canonical per-user state root `$XDG_STATE_HOME/loop-protocol/session-manifests/v1/<repo_key>/codex/**`、既定 `$HOME/.local/state` 配下。レガシー repo-local `tmp/session-manifests/codex/**` へは新規 write されない）と `tmp/codex-pilot-metrics.json` も private/local artifact とし、runtime active hook / trust state の public evidence に流用しない。
 - public GitHub comment に置けるのは `agent_session_manifest/v1` の metadata のみ（`source_kind: public_github_comment`）。
 - `entire/checkpoints/v1` または同等の checkpoint branch が public remote に存在しないことを Kill Switch 検証で確認する。
 - raw transcript は `public_github_comment` surface への出力禁止（#242 policy）。
