@@ -1750,6 +1750,9 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          # pull_request の既定 checkout は merge commit になるため、verdict の
+          # current-head contract には PR head を明示して checkout する。
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Set up Python
         uses: actions/setup-python@v5
         with:

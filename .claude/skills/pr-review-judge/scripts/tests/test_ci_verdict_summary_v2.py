@@ -632,15 +632,34 @@ class TestAC10AC11UploadedArtifactBinding:
         assert ref["workflow_run_id"] == 123
         assert ref["workflow_run_attempt"] == 2
 
-    def test_uploaded_artifact_uses_preuploaded_binding_without_regeneration(self):
+    def test_uploaded_artifact_uses_preuploaded_binding_without_regeneration(
+        self,
+    ):
         workflow = _WORKFLOW.read_text()
         binding_upload = workflow.index("Upload ci_verdict_summary_v2 binding input")
         verdict_generation = workflow.index("Generate ci_verdict_summary_v2 artifact")
         verdict_upload = workflow.index("Upload ci-verdict-summary-v2 artifact")
         summary = workflow.index("Output ci_verdict_summary_v2 Step Summary")
         assert binding_upload < verdict_generation < verdict_upload < summary
-        assert "--artifact-name \"ci-verdict-summary-v2-binding-${{ github.run_id }}-${{ github.run_attempt }}\"" in workflow
+        binding_artifact_name = (
+            "--artifact-name \"ci-verdict-summary-v2-binding-${{ github.run_id }}-"
+            "${{ github.run_attempt }}\""
+        )
+        assert binding_artifact_name in workflow
         assert "--summary-input ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json" in workflow
+
+    def test_ci_verdict_job_checks_out_pr_head_before_binding_generation(self):
+        workflow = _WORKFLOW.read_text()
+        verdict_job = workflow[workflow.index("  ci-verdict-summary:"):]
+
+        checkout = verdict_job.index("actions/checkout@")
+        binding_generation = verdict_job.index(
+            "Generate ci_verdict_summary_v2 binding input"
+        )
+        checkout_block = verdict_job[checkout:binding_generation]
+
+        assert "ref: ${{ github.event.pull_request.head.sha || github.sha }}" in checkout_block
+        assert 'test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"' in verdict_job
 
     def test_summary_input_renders_existing_payload_without_regeneration(self, v2, tmp_path, monkeypatch):
         payload = {"schema": "ci_verdict_summary_v2", "schema_version": 2,
