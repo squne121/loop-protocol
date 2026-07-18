@@ -40,7 +40,22 @@ PERMISSION_ARRAY_KEYS = ("allow", "ask", "deny")
 # Matches a scoped Write(...) rule, e.g. Write(assets/**), Write(.env)
 # Does NOT match bare "Write" and does NOT match hooks matcher strings such
 # as "Write|Edit" (no parenthesis specifier).
-_SCOPED_WRITE_RE = re.compile(r"^Write\(.*\)$")
+_SCOPED_WRITE_RE = re.compile(r"Write\(.+\)")
+
+# Issue #1551 AC2: these canonical Edit(...) deny entries must always be
+# present in permissions.deny. Their removal (accidental or otherwise) is a
+# regression of the Write -> Edit canonicalization policy.
+REQUIRED_CANONICAL_EDIT_DENIES = frozenset(
+    {
+        "Edit(assets/**)",
+        "Edit(LICENSES/**)",
+        "Edit(.env)",
+        "Edit(.env.*)",
+        "Edit(secrets/**)",
+        "Edit(**/.ssh/**)",
+        "Edit(**/.config/gh/**)",
+    }
+)
 
 
 class SettingsPermissionsError(Exception):
@@ -87,21 +102,43 @@ def find_scoped_write_violations(data: dict) -> list[str]:
     Only inspects permissions.allow / permissions.ask / permissions.deny.
     Raises SettingsPermissionsError for shape violations (fail-closed).
     """
-    permissions = data.get("permissions")
-    if permissions is None:
-        # No permissions block at all is a valid (if unusual) shape; nothing
+    if "permissions" not in data:
+        # No permissions key at all is a valid (if unusual) shape; nothing
         # to check.
         return []
+    permissions = data["permissions"]
     if not isinstance(permissions, dict):
+        # A present-but-null (or otherwise non-object) permissions value is a
+        # shape error, distinct from the key being entirely absent.
         raise SettingsPermissionsError("permissions must be an object")
 
     violations: list[str] = []
     for key in PERMISSION_ARRAY_KEYS:
         entries = _validate_array_shape(permissions, key, "permissions")
         for idx, entry in enumerate(entries):
-            if _SCOPED_WRITE_RE.match(entry):
+            if _SCOPED_WRITE_RE.fullmatch(entry):
                 violations.append(f"permissions.{key}[{idx}]")
     return violations
+
+
+def find_missing_canonical_edit_denies(data: dict) -> list[str]:
+    """Return the subset of REQUIRED_CANONICAL_EDIT_DENIES missing from
+    permissions.deny (Issue #1551 AC2 regression guard).
+
+    This is a lightweight, read-only helper intended for reuse from tests; it
+    does not raise on shape errors (callers that need fail-closed shape
+    validation should use find_scoped_write_violations() first).
+    """
+    if "permissions" not in data:
+        return sorted(REQUIRED_CANONICAL_EDIT_DENIES)
+    permissions = data["permissions"]
+    if not isinstance(permissions, dict):
+        return sorted(REQUIRED_CANONICAL_EDIT_DENIES)
+    deny = permissions.get("deny")
+    if not isinstance(deny, list):
+        return sorted(REQUIRED_CANONICAL_EDIT_DENIES)
+    deny_set = set(deny)
+    return sorted(REQUIRED_CANONICAL_EDIT_DENIES - deny_set)
 
 
 def run_validation(settings_path: Path) -> tuple[int, list[str]]:

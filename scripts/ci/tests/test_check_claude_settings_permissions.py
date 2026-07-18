@@ -10,6 +10,7 @@ Covers:
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import subprocess
@@ -21,6 +22,18 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _VALIDATOR_PATH = _REPO_ROOT / "scripts" / "ci" / "check_claude_settings_permissions.py"
 _REAL_SETTINGS_PATH = _REPO_ROOT / ".claude" / "settings.json"
+
+# Issue #1551 AC2: these canonical Edit(...) deny entries must always be
+# present in the repository's .claude/settings.json permissions.deny.
+REQUIRED_CANONICAL_EDIT_DENIES = {
+    "Edit(assets/**)",
+    "Edit(LICENSES/**)",
+    "Edit(.env)",
+    "Edit(.env.*)",
+    "Edit(secrets/**)",
+    "Edit(**/.ssh/**)",
+    "Edit(**/.config/gh/**)",
+}
 
 
 def _load_module():
@@ -57,6 +70,35 @@ def test_repository_settings_have_no_scoped_write_rule():
     exit_code, diagnostics = mod.run_validation(_REAL_SETTINGS_PATH)
     assert exit_code == 0, f"unexpected violations: {diagnostics}"
     assert diagnostics == []
+
+
+# --- AC2 regression guard: required canonical Edit(...) denies present ---
+
+
+def test_repository_settings_retain_required_canonical_edit_denies():
+    settings = json.loads(_REAL_SETTINGS_PATH.read_text(encoding="utf-8"))
+    deny = set(settings.get("permissions", {}).get("deny", []))
+    assert REQUIRED_CANONICAL_EDIT_DENIES <= deny, (
+        f"missing: {REQUIRED_CANONICAL_EDIT_DENIES - deny}"
+    )
+
+
+@pytest.mark.parametrize("removed_entry", sorted(REQUIRED_CANONICAL_EDIT_DENIES))
+def test_missing_canonical_edit_deny_is_detected(removed_entry):
+    settings = json.loads(_REAL_SETTINGS_PATH.read_text(encoding="utf-8"))
+    data = copy.deepcopy(settings)
+    deny_list = data["permissions"]["deny"]
+    assert removed_entry in deny_list
+    data["permissions"]["deny"] = [e for e in deny_list if e != removed_entry]
+
+    missing = mod.find_missing_canonical_edit_denies(data)
+    assert removed_entry in missing
+
+
+def test_find_missing_canonical_edit_denies_empty_when_all_present():
+    settings = json.loads(_REAL_SETTINGS_PATH.read_text(encoding="utf-8"))
+    missing = mod.find_missing_canonical_edit_denies(settings)
+    assert missing == []
 
 
 # --- AC4: bare Write accepted, hooks matcher ignored ---
@@ -196,6 +238,34 @@ def test_missing_permissions_block_is_valid(tmp_path):
     exit_code, diagnostics = mod.run_validation(path)
     assert exit_code == 0
     assert diagnostics == []
+
+
+# --- AC3: explicit null / non-dict permissions is a shape error, distinct
+# --- from the key being absent entirely ---
+
+
+def test_null_permissions_is_shape_error(tmp_path):
+    settings = {"permissions": None}
+    path = _write_settings(tmp_path, settings)
+    exit_code, diagnostics = mod.run_validation(path)
+    assert exit_code == 2
+    assert diagnostics
+
+
+def test_list_permissions_is_shape_error(tmp_path):
+    settings = {"permissions": []}
+    path = _write_settings(tmp_path, settings)
+    exit_code, diagnostics = mod.run_validation(path)
+    assert exit_code == 2
+    assert diagnostics
+
+
+def test_string_permissions_is_shape_error(tmp_path):
+    settings = {"permissions": "not-an-object"}
+    path = _write_settings(tmp_path, settings)
+    exit_code, diagnostics = mod.run_validation(path)
+    assert exit_code == 2
+    assert diagnostics
 
 
 def test_missing_settings_file_raises_shape_error(tmp_path):

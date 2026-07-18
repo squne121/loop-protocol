@@ -395,15 +395,19 @@ class TestAC2SyntheticContextModeDir:
             f"deny_list={deny_list}"
         )
 
-        # #1551: Write と Edit の permission rule を統合したため、.env への
-        # 書き込み保護は Write(.env...) または Edit(.env...) のいずれかで
-        # カバーされていればよい（意味は「書き込みから保護されていること」で不変）。
-        env_write_denied = any(
-            ("Write(.env" in entry or "Edit(.env" in entry) for entry in deny_list
-        )
+        # #1551: permissions.allow/ask/deny では scoped Write(...) を使用せず
+        # Edit(...) に正規化する policy（claude_permission_edit_rule_canonicalization_v1）
+        # のため、.env への書き込み保護は canonical Edit(.env) / Edit(.env.*) の
+        # 存在そのもので確認する。scoped Write(.env...) を有効な保護の証拠として
+        # 受理しない。
+        required_env_edit_denies = {"Edit(.env)", "Edit(.env.*)"}
+        env_write_denied = required_env_edit_denies <= set(deny_list)
         assert env_write_denied, (
-            f"settings.json に .env の Write/Edit deny が設定されていません。"
+            f"settings.json に .env の canonical Edit deny が設定されていません。"
             f"deny_list={deny_list}"
+        )
+        assert not any(entry.startswith("Write(.env") for entry in deny_list), (
+            "settings.json に非推奨の scoped Write(.env...) entry が残っています。"
         )
 
         allow_list = settings.get("permissions", {}).get("allow", [])
