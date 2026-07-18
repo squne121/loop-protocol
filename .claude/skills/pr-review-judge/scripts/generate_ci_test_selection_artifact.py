@@ -19,6 +19,23 @@ Fail-closed (Issue #1064 review):
   unprovided diff records ``diff_status`` and fails CI — it is never silently treated as
   "no changed tests" (the old fail-open false-green).
 - G1 requires BOTH ``collection_status.ok`` AND ``diff_status.ok``.
+
+Runtime-verification-only exemption (Issue #1562):
+- A changed test file that is not collected by the default pytest run may still be
+  legitimately exempt from ``uncovered_changed_test_files`` when ALL of its tests are
+  marked with one of ``plan.runtime_verification_only_markers`` (e.g. ``github_live``)
+  -- markers that are deselected from the default CI run (see pyproject.toml addopts)
+  because they require an execution environment (e.g. authenticated ``gh`` CLI write
+  access) that is structurally unavailable on the CI runner. This is verified by
+  actually re-running ``pytest --collect-only`` scoped to that single file, both under
+  the default marker filter (expected: 0 nodeids) and under an explicit
+  ``-m "<marker1> or <marker2>..."`` override (expected: >=1 nodeids) -- never by
+  filename/declaration alone (fail-closed). Files exempted this way are recorded in
+  ``runtime_verification_only_test_files`` and are NOT added to
+  ``uncovered_changed_test_files``. This is deliberately distinct from
+  ``secondary_coverage.dedicated_lanes``, which declares coverage by a different CI job
+  that actually executes the file -- no such job exists for runtime-verification-only
+  markers.
 """
 
 import argparse
@@ -35,6 +52,7 @@ from typing import Any, Dict, List, Tuple
 
 COLLECT_TIMEOUT_SECONDS = 120
 DIFF_TIMEOUT_SECONDS = 30
+RUNTIME_VERIFICATION_COLLECT_TIMEOUT_SECONDS = 60
 
 # pytest's default test-file convention (python_files = test_*.py / *_test.py). A path is
 # a changed *test* file only if its basename matches this — not merely if "test" appears
@@ -124,8 +142,123 @@ def _get_secondary_coverage(args) -> Tuple[Dict[str, set[str]], str | None]:
         return {}, str(exc)
 
 
+def _get_runtime_verification_only_markers(args) -> Tuple[List[str], str | None]:
+    """Load ``plan.runtime_verification_only_markers`` (Issue #1562).
+
+    Returns (markers, error). An empty/absent list is not an error (no exemption
+    mechanism configured); a malformed value is reported via the error slot and
+    treated as no markers (fail-closed: nothing gets exempted).
+    """
+    plan_arg = getattr(args, "plan", None)
+    if not plan_arg:
+        return [], None
+    try:
+        plan_module = _load_plan_module()
+        plan_obj = plan_module.load_plan(plan_arg)
+        markers = plan_obj.get("runtime_verification_only_markers", [])
+        if not isinstance(markers, list):
+            raise ValueError("plan.runtime_verification_only_markers must be a list")
+        for marker in markers:
+            if not isinstance(marker, str) or not marker:
+                raise ValueError(
+                    "plan.runtime_verification_only_markers entries must be non-empty strings"
+                )
+        return list(markers), None
+    except Exception as exc:
+        return [], str(exc)
+
+
+def check_runtime_verification_only_coverage(
+    changed_file: str, markers: List[str]
+) -> Tuple[bool, Dict[str, Any]]:
+    """Confirm ``changed_file`` is a runtime-verification-only exempt file (Issue #1562).
+
+    Fail-closed: this NEVER trusts the marker declaration alone. It actually re-runs
+    ``pytest --collect-only`` scoped to exactly this file twice:
+      1. under the default marker filter (addopts) -- must collect ZERO nodeids
+         (otherwise the file is genuinely collected by the default run and this
+         function should not have been called for it in the first place, OR it is
+         only partially marker-exempt, which is not a clean exemption).
+      2. under an explicit ``-m "<marker1> or <marker2>..."`` override -- must
+         collect AT LEAST ONE nodeid (proof the file's tests actually exist and are
+         reachable under the runtime-verification-only markers, not merely absent
+         from the plan target set for an unrelated reason).
+
+    Returns (is_exempt, evidence). evidence is always attached to the artifact for
+    transparency (whether or not the file ends up exempted).
+    """
+    evidence: Dict[str, Any] = {
+        "file": changed_file,
+        "markers": list(markers),
+        "default_collect_nodeid_count": None,
+        "default_collect_ok": None,
+        "marker_collect_nodeid_count": None,
+        "marker_collect_ok": None,
+        "exempt": False,
+        "error": None,
+    }
+    if not markers:
+        evidence["error"] = "no runtime_verification_only_markers configured in plan"
+        return False, evidence
+
+    _, _, default_status = get_pytest_collected_tests(
+        [changed_file], timeout_seconds=RUNTIME_VERIFICATION_COLLECT_TIMEOUT_SECONDS
+    )
+    evidence["default_collect_nodeid_count"] = default_status["nodeid_count"]
+    # A returncode of 5 ("no tests collected") with 0 nodeids is the EXPECTED
+    # shape here, not a collection failure -- only a non-5/non-0 returncode or a
+    # timeout is treated as an unreadable/broken probe (fail-closed).
+    default_probe_ok = (
+        not default_status["timed_out"]
+        and default_status["returncode"] in (0, 5)
+    )
+    if not default_probe_ok:
+        evidence["error"] = (
+            f"default collect-only probe failed: returncode={default_status['returncode']} "
+            f"timed_out={default_status['timed_out']}"
+        )
+        return False, evidence
+    if default_status["nodeid_count"] > 0:
+        evidence["error"] = (
+            "file is collected under the default marker filter; not a "
+            "runtime-verification-only candidate"
+        )
+        return False, evidence
+
+    marker_expr = " or ".join(markers)
+    _, marker_nodeids, marker_status = get_pytest_collected_tests(
+        [changed_file, "-m", marker_expr],
+        timeout_seconds=RUNTIME_VERIFICATION_COLLECT_TIMEOUT_SECONDS,
+    )
+    evidence["marker_collect_nodeid_count"] = marker_status["nodeid_count"]
+    # Same shape as the default probe above: returncode 5 ("no tests collected") is a
+    # valid probe outcome (zero matches), not a broken probe; only a non-5/non-0
+    # returncode or a timeout means the probe itself could not be trusted.
+    marker_probe_ok = (
+        not marker_status["timed_out"]
+        and marker_status["returncode"] in (0, 5)
+    )
+    evidence["marker_collect_ok"] = marker_probe_ok
+    if not marker_probe_ok:
+        evidence["error"] = (
+            f"marker collect-only probe failed: returncode={marker_status['returncode']} "
+            f"timed_out={marker_status['timed_out']}"
+        )
+        return False, evidence
+    if marker_status["nodeid_count"] == 0:
+        evidence["error"] = (
+            "no tests collected under runtime_verification_only_markers either "
+            "-- not a valid exemption"
+        )
+        return False, evidence
+
+    evidence["exempt"] = True
+    return True, evidence
+
+
 def get_pytest_collected_tests(
     pytest_args: List[str],
+    timeout_seconds: int = COLLECT_TIMEOUT_SECONDS,
 ) -> Tuple[List[str], List[str], Dict[str, Any]]:
     """Collect node IDs via the JSON-emitting plugin (no stdout parsing).
 
@@ -154,7 +287,7 @@ def get_pytest_collected_tests(
              "-p", "no:cacheprovider", "-p", "collect_nodeids_plugin"] + pytest_args,
             capture_output=True,
             text=True,
-            timeout=COLLECT_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
             env=env,
         )
         collection_status["returncode"] = result.returncode
@@ -291,10 +424,34 @@ def generate_artifact(args):
         and any(_is_covered_by_paths(f, paths) for paths in secondary_coverage_sources.values())
     )
 
+    # Issue #1562: candidates for the runtime-verification-only exemption are changed
+    # test files that are neither collected by the default run NOR covered by a
+    # dedicated secondary-coverage CI lane. Each candidate is independently re-probed
+    # (never trusted from a declaration alone) via check_runtime_verification_only_coverage.
+    runtime_verification_only_markers, runtime_verification_only_markers_error = (
+        _get_runtime_verification_only_markers(args)
+    )
+    runtime_verification_only_evidence: List[Dict[str, Any]] = []
+    runtime_verification_only_test_files: List[str] = []
+    if runtime_verification_only_markers:
+        for f in changed_test_files:
+            if f in collected_test_files:
+                continue
+            if any(_is_covered_by_paths(f, paths) for paths in secondary_coverage_sources.values()):
+                continue
+            is_exempt, evidence = check_runtime_verification_only_coverage(
+                f, runtime_verification_only_markers
+            )
+            runtime_verification_only_evidence.append(evidence)
+            if is_exempt:
+                runtime_verification_only_test_files.append(f)
+    runtime_verification_only_test_files = sorted(runtime_verification_only_test_files)
+
     uncovered = [
         f for f in changed_test_files
         if f not in collected_test_files
         and not any(_is_covered_by_paths(f, paths) for paths in secondary_coverage_sources.values())
+        and f not in runtime_verification_only_test_files
     ]
 
     artifact = {
@@ -318,6 +475,10 @@ def generate_artifact(args):
         "secondary_coverage_provider_job": secondary_coverage_provider_job,
         "cross_job_covered_test_files": cross_job_covered_test_files,
         "secondary_coverage_error": secondary_coverage_error,
+        "runtime_verification_only_markers": runtime_verification_only_markers,
+        "runtime_verification_only_test_files": runtime_verification_only_test_files,
+        "runtime_verification_only_evidence": runtime_verification_only_evidence,
+        "runtime_verification_only_markers_error": runtime_verification_only_markers_error,
         "ci_run_url": args.ci_run_url or "N/A",
     }
 
@@ -332,6 +493,8 @@ def generate_artifact(args):
     print(f"  Collected nodeids: {len(collected_nodeids)}")
     print(f"  Changed tests: {len(changed_test_files)}")
     print(f"  Uncovered tests: {len(uncovered)}")
+    if runtime_verification_only_test_files:
+        print(f"  Runtime-verification-only exempt tests: {len(runtime_verification_only_test_files)}")
     print(f"  collection_status.ok={collection_status['ok']} diff_status.ok={diff_status['ok']}")
 
     # Fail-closed: both collection AND change detection must succeed. A failed/empty
