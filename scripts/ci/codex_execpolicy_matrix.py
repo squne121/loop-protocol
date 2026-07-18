@@ -365,6 +365,25 @@ def execpolicy_case_definitions(fixture: FixtureRepo) -> list[dict[str, Any]]:
             "expected_guard_pair": "allow",
         },
         {
+            # execpolicy `prefix_rule` matching is strictly literal-prefix,
+            # position-anchored from argv[0] -- it has no wildcard, no
+            # substring/startswith matching, and no argv-length or "exact
+            # shape" modifier (see the comment block above the `bash`
+            # prefix_rule in `.codex/rules/default.rules`). Because the
+            # allow rule for the controlled executor can only anchor on the
+            # fixed `uv run --locked python3 <script>` prefix, it cannot,
+            # by construction, distinguish this well-formed-prefix-plus-
+            # trailing-unexpected-flag invocation from
+            # `controlled_executor_exact_invocation_allowed` above -- both
+            # share the same literal prefix, so execpolicy necessarily
+            # returns the same decision (`allow`) for both. This mirrors
+            # `controlled_executor_from_main_root_denied` /
+            # `controlled_executor_wrong_issue_worktree_denied` below, which
+            # already expect execpolicy=allow + guard_pair=deny for the same
+            # reason (execpolicy cannot inspect argv *values*, only
+            # `worktree_scope_guard.py`'s token-aware
+            # `parse_controlled_git_change_exec_command()` can, and it is
+            # the layer that actually rejects the unexpected extra flag).
             "label": "controlled_executor_extra_argv_denied",
             "argv": [
                 "uv",
@@ -384,7 +403,7 @@ def execpolicy_case_definitions(fixture: FixtureRepo) -> list[dict[str, Any]]:
                 "0" * 40,
                 "--unexpected-extra-flag",
             ],
-            "expected_execpolicy": ["forbidden", "prompt"],
+            "expected_execpolicy": ["allow"],
             "expected_guard_pair": "deny",
         },
         {
