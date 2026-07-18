@@ -868,7 +868,16 @@ def test_guard_shadow_log_real_multiprocess_barrier_synchronized_append(tmp_path
         procs.append(subprocess.Popen([node_bin, str(node_producer)]))
 
     executor_proc = subprocess.Popen(
-        [sys.executable, _skill_runtime_exec_rel(), "--command-id", "preflight.run", "--issue-number", "1228", "--repo", "squne121/loop-protocol"],
+        [
+            sys.executable,
+            _skill_runtime_exec_rel(),
+            "--command-id",
+            "preflight.run",
+            "--issue-number",
+            "1228",
+            "--repo",
+            "squne121/loop-protocol",
+        ],
         cwd=str(repo),
         env={
             **os.environ,
