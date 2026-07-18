@@ -706,7 +706,8 @@ def _ensure_pr_files_complete(gh_bin: str, repo: str, prs: list[dict[str, Any]])
         pr_number = item.get("number")
         if not isinstance(pr_number, int):
             raise ScopeRollupPreflightError("pr_files_pagination_incomplete", "missing pr number")
-        full_paths = _paginate_pr_files(gh_bin, repo, pr_number, [f.get("path", "") for f in files if isinstance(f, dict)])
+        pr_file_paths = [f.get("path", "") for f in files if isinstance(f, dict)]
+        full_paths = _paginate_pr_files(gh_bin, repo, pr_number, pr_file_paths)
         if len(full_paths) != changed_files:
             raise ScopeRollupPreflightError(
                 "pr_files_pagination_incomplete",
