@@ -447,9 +447,22 @@ def compact_review_result(
             body_sha256_raw if isinstance(body_sha256_raw, str) and body_sha256_raw else "sha256:" + ("0" * 64)
         )
         claim_blockers: list[dict[str, Any]] = []
-        for item in blocking_issues:
-            if isinstance(item, dict):
-                code = str(item.get("code") or item.get("reviewer_blocker_code") or "").strip()
+        # Issue #1554: prefer the deterministic checker's own
+        # `structured_blockers[].code` over the human-readable
+        # `blocking_issues` prose when `structured_blockers` is non-empty.
+        # This keeps `REVIEWER_BLOCKER_CLAIM_V1.blockers[].reviewer_blocker_code`
+        # aligned with the taxonomy the parent-local replay
+        # (`parent_replay_binding.py`) knows how to back with parent-owned
+        # evidence, instead of a `blocking_issues` prose string that never
+        # normalizes to a registered taxonomy entry_id. `blocking_issues`
+        # remains the fallback ONLY when `structured_blockers` is empty
+        # (schema requires the key but allows an empty array).
+        structured_blockers_list = raw_result.get("structured_blockers") or []
+        if structured_blockers_list:
+            for item in structured_blockers_list:
+                if not isinstance(item, dict):
+                    continue
+                code = str(item.get("code") or "").strip()
                 if not code:
                     continue
                 claim_blockers.append(
@@ -460,15 +473,29 @@ def compact_review_result(
                         "line_end": item.get("line_end"),
                     }
                 )
-            elif isinstance(item, str) and item.strip():
-                claim_blockers.append(
-                    {
-                        "reviewer_blocker_code": item.strip(),
-                        "message": None,
-                        "line_start": None,
-                        "line_end": None,
-                    }
-                )
+        else:
+            for item in blocking_issues:
+                if isinstance(item, dict):
+                    code = str(item.get("code") or item.get("reviewer_blocker_code") or "").strip()
+                    if not code:
+                        continue
+                    claim_blockers.append(
+                        {
+                            "reviewer_blocker_code": code,
+                            "message": item.get("message"),
+                            "line_start": item.get("line_start"),
+                            "line_end": item.get("line_end"),
+                        }
+                    )
+                elif isinstance(item, str) and item.strip():
+                    claim_blockers.append(
+                        {
+                            "reviewer_blocker_code": item.strip(),
+                            "message": None,
+                            "line_start": None,
+                            "line_end": None,
+                        }
+                    )
         reviewer_blocker_claim = {
             "schema": "REVIEWER_BLOCKER_CLAIM_V1",
             "body_sha256": body_sha256,
