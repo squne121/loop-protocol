@@ -895,7 +895,9 @@ def _build_cli_parser():
     )
     parser.add_argument("--cwd", required=True, help="worktree directory to operate in")
     parser.add_argument("--snapshot-json", required=True, help="path to a JSON file with the IssueScopeSnapshot fields")
-    parser.add_argument("--path", action="append", dest="paths", default=[], help="explicit pathspec to stage (repeatable)")
+    parser.add_argument(
+        "--path", action="append", dest="paths", default=[], help="explicit pathspec to stage (repeatable)"
+    )
     parser.add_argument("--message", default=None, help="commit message")
     parser.add_argument("--message-file", default=None, help="path to a file containing the commit message")
     parser.add_argument("--expected-head", required=True, help="expected local HEAD SHA (race guard, required)")
