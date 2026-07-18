@@ -142,6 +142,55 @@ class TestRenderCommandValidation:
 
 
 # ---------------------------------------------------------------------------
+# Issue #1579: scope_rollup.run invocation identity and request-time contract
+# ---------------------------------------------------------------------------
+
+class TestScopeRollupRunRegistryContract:
+    _PARAMS = {
+        "issue_number": 1579,
+        "repo": "squne121/loop-protocol",
+        "invocation_id": "scope-rollup-1579-20260718",
+        "requested_at": "2026-07-18T00:00:00Z",
+    }
+
+    def test_render_exact_argv(self):
+        """scope_rollup.run renders the canonical complete argv in order."""
+        assert reg.render_command("scope_rollup.run", self._PARAMS) == [
+            "uv", "run", "python3",
+            "scripts/agent-guards/run_scope_rollup_preflight.py",
+            "--issue-number", "1579",
+            "--repo", "squne121/loop-protocol",
+            "--invocation-id", "scope-rollup-1579-20260718",
+            "--requested-at", "2026-07-18T00:00:00Z",
+        ]
+
+    def test_missing_invocation_id_is_rejected(self):
+        """The identity field is mandatory and fails closed when absent."""
+        params = dict(self._PARAMS)
+        del params["invocation_id"]
+        with pytest.raises(ValueError, match="invocation_id.*missing"):
+            reg.render_command("scope_rollup.run", params)
+
+    def test_missing_requested_at_is_rejected(self):
+        """The request timestamp is mandatory and fails closed when absent."""
+        params = dict(self._PARAMS)
+        del params["requested_at"]
+        with pytest.raises(ValueError, match="requested_at.*missing"):
+            reg.render_command("scope_rollup.run", params)
+
+    def test_extra_parameter_is_rejected(self):
+        """scope_rollup.run does not silently accept an undefined parameter."""
+        params = {**self._PARAMS, "unexpected": "value"}
+        with pytest.raises(ValueError, match="Extra params"):
+            reg.render_command("scope_rollup.run", params)
+
+    def test_rendered_argv_has_no_unresolved_placeholder(self):
+        """A valid render cannot retain a registry placeholder token."""
+        argv = reg.render_command("scope_rollup.run", self._PARAMS)
+        assert not any(token.startswith("{") and token.endswith("}") for token in argv)
+
+
+# ---------------------------------------------------------------------------
 # AC5: _commands_from_plan() returns source: registry (not static_wrapper_template)
 # ---------------------------------------------------------------------------
 
