@@ -552,7 +552,9 @@ def test_intermediate_validation_rejects_valid_claim_line_out_of_order(tmp_path:
 
 
 def test_production_emit_v2_step_uses_registry_rendered_argv(tmp_path: Path):
-    artifact_base = REPO_ROOT / ".claude" / "artifacts" / "issue-refinement-loop" / ISSUE_NUMBER / "_test_high3_registry_argv"
+    artifact_base = (
+        REPO_ROOT / ".claude" / "artifacts" / "issue-refinement-loop" / ISSUE_NUMBER / "_test_high3_registry_argv"
+    )
     run_id = uuid.uuid4().hex
     run_dir = artifact_base / run_id
     run_dir.mkdir(parents=True)
