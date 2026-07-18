@@ -80,7 +80,13 @@ def append_jsonl(log_file: str, entry: Dict[str, Any]) -> None:
     if log_dir and not os.path.exists(log_dir):
         os.makedirs(log_dir, exist_ok=True)
 
-    line = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+    # Issue #1572 REQUEST_CHANGES Blocker 4: allow_nan=False so this producer
+    # can never emit NaN/Infinity/-Infinity tokens, which are accepted by
+    # Python's json module by default but are not valid JSON values -- the
+    # consumer-side executor's well-formed-JSONL check
+    # (scripts/agent-guards/skill_runtime_exec.py::_parse_shadow_log_jsonl)
+    # explicitly rejects them, so this producer must never generate them.
+    line = json.dumps(entry, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     with open(log_file, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
