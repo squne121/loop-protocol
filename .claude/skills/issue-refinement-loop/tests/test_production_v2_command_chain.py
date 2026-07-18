@@ -17,15 +17,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
 SKILL_ROOT = Path(__file__).parent.parent
 SCRIPTS_DIR = SKILL_ROOT / "scripts"
 FIXTURES_DIR = SKILL_ROOT / "fixtures"
+REPO_ROOT = SKILL_ROOT.parent.parent.parent
+sys.path.insert(0, str(SCRIPTS_DIR))
+
+import command_registry as cr  # noqa: E402
 
 COMPACT_REVIEW_RESULT_SCRIPT = SCRIPTS_DIR / "compact_review_result.py"
 PARENT_REPLAY_BINDING_SCRIPT = SCRIPTS_DIR / "parent_replay_binding.py"
@@ -75,7 +82,32 @@ def _readiness_lp001(body_sha256: str) -> dict:
     }
 
 
+def _run_validate_intermediate_v1(*, run_dir: Path, child_stdout_bytes: bytes) -> tuple[int, dict]:
+    """Issue #1541 PR #1557 OWNER REQUEST_CHANGES Blocker 1: the ONLY
+    sanctioned way to classify/extract fields from raw child stdout BYTES
+    -- the independent `review_compact.validate_intermediate_v1` command
+    (rendered via `command_registry.render_command()`, never a hand-rolled
+    argv list, so the SAME argv shape the real orchestrator would use is
+    exercised here too). Never a manual `startswith()` / `json.loads()`
+    extraction."""
+    argv = cr.render_command("review_compact.validate_intermediate_v1", {"issue_number": ISSUE_NUMBER})
+    proc = subprocess.run(
+        argv,
+        input=child_stdout_bytes,
+        capture_output=True,
+        cwd=str(REPO_ROOT),
+        timeout=15,
+    )
+    stdout_text = proc.stdout.decode("utf-8")
+    return proc.returncode, json.loads(stdout_text)
+
+
 def _run_child_compact_review_result(*, child_dir: Path, review_result: dict) -> tuple[str, dict]:
+    """Real child producer CLI, followed by real independent intermediate
+    validation (Blocker 1) -- returns (child_stdout_text, reviewer_blocker_claim)
+    where `reviewer_blocker_claim` is parsed from the validator's OWN
+    `canonical_reviewer_blocker_claim` output field, never extracted by this
+    test file's own `startswith()` / `json.loads()` on the raw child text."""
     input_file = child_dir / "raw_review_result.json"
     input_file.write_text(json.dumps(review_result), encoding="utf-8")
     proc = subprocess.run(
@@ -96,10 +128,16 @@ def _run_child_compact_review_result(*, child_dir: Path, review_result: dict) ->
     )
     assert proc.returncode == 0, proc.stderr
     stdout_text = proc.stdout.rstrip("\n")
-    claim_line = next(
-        line for line in stdout_text.split("\n") if line.startswith("REVIEWER_BLOCKER_CLAIM: ")
+
+    intermediate_rc, intermediate_result = _run_validate_intermediate_v1(
+        run_dir=child_dir, child_stdout_bytes=(stdout_text + "\n").encode("utf-8")
     )
-    claim = json.loads(claim_line[len("REVIEWER_BLOCKER_CLAIM: ") :])
+    assert intermediate_rc == 0, intermediate_result
+    assert intermediate_result["validation_status"] == "valid"
+    assert intermediate_result["envelope_kind"] == "needs_fix_intermediate"
+    canonical_claim_text = intermediate_result["canonical_reviewer_blocker_claim"]
+    assert canonical_claim_text is not None
+    claim = json.loads(canonical_claim_text)
     return stdout_text, claim
 
 
@@ -360,3 +398,217 @@ def test_production_v2_command_chain_tampered_binding_fails_before_state_write(t
     assert diagnostic["schema"] == "EMIT_PARENT_REVIEW_ENVELOPE_V2_FAILURE"
     assert diagnostic["reason_code"] == "contract_invalid"
     assert any(v["code"] == "binding_artifact_digest_self_inconsistent" for v in diagnostic["violations"])
+
+
+# ---------------------------------------------------------------------------
+# Issue #1541 PR #1557 OWNER REQUEST_CHANGES Blocker 1: negative
+# intermediate-validation cases. Each MUST be rejected by
+# `review_compact.validate_intermediate_v1` (`validation_status: invalid`,
+# `canonical_reviewer_blocker_claim: None`) -- and, since this test file's
+# own `_run_child_compact_review_result()` no longer extracts the claim by
+# hand, the caller structurally has nothing to feed
+# `_run_parent_replay_binding_process()` in this situation. The
+# `mock.patch` assertion below independently proves the parent binding
+# subprocess is never even attempted for these malformed inputs.
+# ---------------------------------------------------------------------------
+
+
+def _valid_needs_fix_intermediate_lines(tmp_path: Path) -> list[str]:
+    child_dir = tmp_path / "child_for_negative_case"
+    child_dir.mkdir()
+    current_body_bytes = b"body for a Blocker-1 negative intermediate case"
+    current_body_sha256 = f"sha256:{hashlib.sha256(current_body_bytes).hexdigest()}"
+    review_result = _review_result_needs_fix(current_body_sha256)
+    input_file = child_dir / "raw_review_result.json"
+    input_file.write_text(json.dumps(review_result), encoding="utf-8")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(COMPACT_REVIEW_RESULT_SCRIPT),
+            "--input-file",
+            str(input_file),
+            "--issue-number",
+            ISSUE_NUMBER,
+            "--repo-root",
+            str(child_dir),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(child_dir),
+        timeout=15,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.rstrip("\n").split("\n")
+
+
+def _orchestrate_claim_extraction_and_maybe_bind(
+    *, run_dir: Path, child_stdout_bytes: bytes, readiness_result: dict, current_body_bytes: bytes
+) -> "dict | None":
+    """Minimal orchestrator-shaped caller: validates the child intermediate
+    FIRST via the real `validate_intermediate_v1` CLI, and calls the real
+    parent-binding subprocess ONLY when that validation succeeded --
+    mirroring exactly the production ordering this Blocker fixes (child
+    stdout bytes -> intermediate validation -> parent binding). Returns the
+    binding artifact dict on success, or `None` when the intermediate was
+    rejected (in which case the binding subprocess is never invoked)."""
+    intermediate_rc, intermediate_result = _run_validate_intermediate_v1(
+        run_dir=run_dir, child_stdout_bytes=child_stdout_bytes
+    )
+    if intermediate_rc != 0 or intermediate_result["validation_status"] != "valid":
+        return None
+    claim = json.loads(intermediate_result["canonical_reviewer_blocker_claim"])
+    return _run_parent_replay_binding_process(
+        parent_dir=run_dir,
+        reviewer_blocker_claim=claim,
+        readiness_result=readiness_result,
+        current_body_bytes=current_body_bytes,
+    )
+
+
+def _assert_binding_subprocess_never_started(tmp_path: Path, malformed_text: str) -> dict:
+    """Validate `malformed_text` via the real `validate_intermediate_v1` CLI
+    (must be rejected), then independently prove no parent-binding
+    subprocess is ever launched for it: run the minimal orchestrator-shaped
+    caller above with `subprocess.run` patched to raise if it is EVER
+    invoked with `PARENT_REPLAY_BINDING_SCRIPT` in argv."""
+    run_dir = tmp_path / f"negative_case_{uuid.uuid4().hex}"
+    run_dir.mkdir()
+    current_body_bytes = b"body for a Blocker-1 negative intermediate case"
+    current_body_sha256 = f"sha256:{hashlib.sha256(current_body_bytes).hexdigest()}"
+    readiness_result = _readiness_lp001(current_body_sha256)
+
+    real_run = subprocess.run
+
+    def _guarded_run(argv, *args, **kwargs):
+        if isinstance(argv, list) and str(PARENT_REPLAY_BINDING_SCRIPT) in [str(a) for a in argv]:
+            raise AssertionError(
+                "parent_replay_binding.py subprocess must NEVER be started for a "
+                "validate_intermediate_v1-rejected child intermediate"
+            )
+        return real_run(argv, *args, **kwargs)
+
+    with mock.patch("subprocess.run", side_effect=_guarded_run):
+        result = _orchestrate_claim_extraction_and_maybe_bind(
+            run_dir=run_dir,
+            child_stdout_bytes=malformed_text.encode("utf-8"),
+            readiness_result=readiness_result,
+            current_body_bytes=current_body_bytes,
+        )
+
+    assert result is None
+    intermediate_rc, intermediate_result = _run_validate_intermediate_v1(
+        run_dir=run_dir, child_stdout_bytes=malformed_text.encode("utf-8")
+    )
+    assert intermediate_rc == 1, intermediate_result
+    assert intermediate_result["validation_status"] == "invalid"
+    assert intermediate_result["canonical_reviewer_blocker_claim"] is None
+    return intermediate_result
+
+
+def test_intermediate_validation_rejects_duplicate_field_mid_stream(tmp_path: Path):
+    """9-line intermediate with a duplicate STATUS field partway through."""
+    lines = _valid_needs_fix_intermediate_lines(tmp_path)
+    lines.insert(4, lines[0])  # duplicate STATUS somewhere in the middle
+    _assert_binding_subprocess_never_started(tmp_path, "\n".join(lines) + "\n")
+
+
+def test_intermediate_validation_rejects_prose_around_claim_line(tmp_path: Path):
+    """Prose injected both before and after an otherwise-valid 9-line
+    intermediate (the claim line itself is untouched/valid)."""
+    lines = _valid_needs_fix_intermediate_lines(tmp_path)
+    text = "Here is my review, please see below:\n" + "\n".join(lines) + "\nThanks for reading.\n"
+    _assert_binding_subprocess_never_started(tmp_path, text)
+
+
+def test_intermediate_validation_rejects_claim_line_recorded_twice(tmp_path: Path):
+    """The (valid) REVIEWER_BLOCKER_CLAIM line appears twice."""
+    lines = _valid_needs_fix_intermediate_lines(tmp_path)
+    claim_line = lines[-1]
+    assert claim_line.startswith("REVIEWER_BLOCKER_CLAIM: ")
+    lines.append(claim_line)
+    _assert_binding_subprocess_never_started(tmp_path, "\n".join(lines) + "\n")
+
+
+def test_intermediate_validation_rejects_valid_claim_line_out_of_order(tmp_path: Path):
+    """Every field is individually well-formed (including the claim line),
+    but the claim line is moved earlier than its canonical (last) position
+    -- out-of-order field sequence."""
+    lines = _valid_needs_fix_intermediate_lines(tmp_path)
+    claim_line = lines.pop()
+    lines.insert(1, claim_line)
+    _assert_binding_subprocess_never_started(tmp_path, "\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Issue #1541 PR #1557 OWNER REQUEST_CHANGES High-3: production E2E must
+# exercise the SAME argv `command_registry.render_command()` would hand the
+# real orchestrator -- not a hand-rolled `[sys.executable, str(SCRIPT), ...]`
+# list constructed independently by this test file. This covers the emit
+# step (the step central to Issue #1541's own scope); the registry
+# contract test (`test_review_compact_emit_v2_registry_contract.py`)
+# separately proves `render_command()` itself produces a safe,
+# fully-resolved argv for every other command in this chain.
+# ---------------------------------------------------------------------------
+
+
+def test_production_emit_v2_step_uses_registry_rendered_argv(tmp_path: Path):
+    artifact_base = REPO_ROOT / ".claude" / "artifacts" / "issue-refinement-loop" / ISSUE_NUMBER / "_test_high3_registry_argv"
+    run_id = uuid.uuid4().hex
+    run_dir = artifact_base / run_id
+    run_dir.mkdir(parents=True)
+    try:
+        child_dir = tmp_path / "child_isolation_worktree"
+        parent_dir = tmp_path / "parent_owned_inventory"
+        child_dir.mkdir()
+        parent_dir.mkdir()
+
+        current_body_bytes = b"the current live Issue #1541 body snapshot for the High-3 registry-argv case"
+        current_body_sha256 = f"sha256:{hashlib.sha256(current_body_bytes).hexdigest()}"
+        review_result = _review_result_needs_fix(current_body_sha256)
+        readiness_result = _readiness_lp001(current_body_sha256)
+
+        child_stdout_text, reviewer_blocker_claim = _run_child_compact_review_result(
+            child_dir=child_dir, review_result=review_result
+        )
+        binding_artifact = _run_parent_replay_binding_process(
+            parent_dir=parent_dir,
+            reviewer_blocker_claim=reviewer_blocker_claim,
+            readiness_result=readiness_result,
+            current_body_bytes=current_body_bytes,
+        )
+
+        binding_file = run_dir / "binding_artifact.json"
+        body_file = run_dir / "current_body.txt"
+        binding_file.write_text(json.dumps(binding_artifact), encoding="utf-8")
+        body_file.write_bytes(current_body_bytes)
+
+        # The argv this test actually executes comes from
+        # `command_registry.render_command()` -- the SAME function/entry
+        # (`review_compact.emit_v2`) the real orchestrator uses, not a
+        # bespoke argv list assembled independently by this test.
+        argv = cr.render_command(
+            "review_compact.emit_v2",
+            {
+                "issue_number": ISSUE_NUMBER,
+                "binding_artifact_file": str(binding_file.relative_to(REPO_ROOT)),
+                "repo": REPO,
+                "refinement_session_id": SESSION_ID,
+                "iteration_id": ITERATION_ID,
+                "current_body_file": str(body_file.relative_to(REPO_ROOT)),
+            },
+        )
+        assert argv[:6] == ["uv", "run", "--locked", "--offline", "--no-sync", "python3"]
+
+        proc = subprocess.run(
+            argv,
+            input=(child_stdout_text + "\n").encode("utf-8"),
+            capture_output=True,
+            cwd=str(REPO_ROOT),
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr.decode("utf-8", errors="replace")
+        envelope_text = proc.stdout.decode("utf-8")
+        assert envelope_text.count("\n") == 15
+        assert "PARENT_REPLAY_BINDING_DIGEST: " + binding_artifact["binding_digest"] in envelope_text
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)

@@ -289,6 +289,90 @@ def render_parent_review_envelope_v2(
 
 
 # ---------------------------------------------------------------------------
+# Issue #1541 PR #1557 OWNER REQUEST_CHANGES Blocker 1: independent
+# `review_compact.validate_intermediate_v1` command. Production E2E chains
+# MUST route child stdout bytes through this function (never a manual
+# `startswith("REVIEWER_BLOCKER_CLAIM: ")` / `json.loads()` extraction) so
+# the intermediate validation step is never bypassed before parent binding.
+# ---------------------------------------------------------------------------
+
+VALIDATE_INTERMEDIATE_SCHEMA = "REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1"
+VALIDATE_INTERMEDIATE_SCHEMA_VERSION = "1"
+
+
+def build_validate_intermediate_result(raw_bytes: bytes, *, issue_number: "int | None" = None) -> dict[str, Any]:
+    """Validate raw child stdout BYTES (never pre-decoded/pre-extracted text)
+    against the child-intermediate grammar and return a
+    `REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1` payload:
+
+        schema, schema_version, validation_status, envelope_kind,
+        input_sha256, input_byte_count, normalized_payload,
+        canonical_reviewer_blocker_claim, violations
+
+    `canonical_reviewer_blocker_claim` is populated ONLY when
+    `envelope_kind == "needs_fix_intermediate"` AND `validation_status ==
+    "valid"` -- it is the claim's canonical (sorted-key, no-whitespace)
+    JSON text, computed via `parent_replay_binding.validate_reviewer_blocker_claim()`
+    + `canonical_json_bytes()` (the SAME canonicalization the parent
+    independently recomputes when binding -- Issue #1532). It is `None` for
+    the approve shape or any invalid input; callers must NEVER derive a
+    claim file from anything other than this field.
+    """
+    input_sha256 = f"sha256:{hashlib.sha256(raw_bytes).hexdigest()}"
+    input_byte_count = len(raw_bytes)
+
+    try:
+        raw_text = raw_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        return {
+            "schema": VALIDATE_INTERMEDIATE_SCHEMA,
+            "schema_version": VALIDATE_INTERMEDIATE_SCHEMA_VERSION,
+            "validation_status": "invalid",
+            "envelope_kind": "unknown",
+            "input_sha256": input_sha256,
+            "input_byte_count": input_byte_count,
+            "normalized_payload": None,
+            "canonical_reviewer_blocker_claim": None,
+            "violations": [_violation("utf8_decode_error", detail=str(exc))],
+        }
+
+    child_result = validate_child_intermediate(raw_text, issue_number=issue_number)
+
+    canonical_claim: "str | None" = None
+    if (
+        child_result["validation_status"] == "valid"
+        and child_result["envelope_kind"] == "needs_fix_intermediate"
+    ):
+        claim_raw = child_result["normalized_payload"].get(_v1.REVIEWER_BLOCKER_CLAIM_FIELD, "")
+        try:
+            parsed_claim = _pb._strict_json_loads(claim_raw)
+            normalized_claim = _pb.validate_reviewer_blocker_claim(parsed_claim)
+            canonical_claim = _pb.canonical_json_bytes(normalized_claim).decode("utf-8")
+        except (ValueError, json.JSONDecodeError) as exc:
+            # The lexical `REVIEWER_BLOCKER_CLAIM` field check already
+            # confirmed syntactically valid minimal-shape JSON; a failure
+            # here means the trust-boundary schema check itself rejected
+            # it (fail-closed) -- surface as an additional violation
+            # rather than silently downgrading validation_status.
+            child_result = dict(child_result)
+            child_result["violations"] = list(child_result["violations"]) + [
+                _violation("reviewer_blocker_claim_canonicalization_failed", detail=str(exc))
+            ]
+
+    return {
+        "schema": VALIDATE_INTERMEDIATE_SCHEMA,
+        "schema_version": VALIDATE_INTERMEDIATE_SCHEMA_VERSION,
+        "validation_status": child_result["validation_status"],
+        "envelope_kind": child_result["envelope_kind"],
+        "input_sha256": input_sha256,
+        "input_byte_count": input_byte_count,
+        "normalized_payload": child_result["normalized_payload"],
+        "canonical_reviewer_blocker_claim": canonical_claim,
+        "violations": child_result["violations"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Orchestration (loads/validates binding artifact, cross-checks, renders)
 # ---------------------------------------------------------------------------
 
@@ -458,6 +542,18 @@ def main(argv: "list[str] | None" = None) -> int:
     )
     parser.add_argument("--input-file", default=None, help="Path to child stdout text (default: stdin)")
     parser.add_argument("--issue-number", type=_positive_int, required=True)
+    parser.add_argument(
+        "--validate-intermediate",
+        action="store_true",
+        help=(
+            "Issue #1541 PR #1557 OWNER REQUEST_CHANGES Blocker 1: independent "
+            "review_compact.validate_intermediate_v1 mode. Validates raw child "
+            "stdout bytes against the child-intermediate grammar ONLY -- never "
+            "opens --binding-artifact-file / --current-body-file (those flags "
+            "are rejected in this mode). Prints REVIEW_COMPACT_INTERMEDIATE_"
+            "VALIDATION_RESULT_V1 JSON to stdout; exit 0 (valid) / 1 (invalid)."
+        ),
+    )
     parser.add_argument("--binding-artifact-file", default=None)
     parser.add_argument("--repository-full-name", default=None)
     parser.add_argument("--refinement-session-id", default=None)
@@ -465,21 +561,73 @@ def main(argv: "list[str] | None" = None) -> int:
     parser.add_argument("--current-body-file", default=None)
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
+    if args.validate_intermediate:
+        disallowed = [
+            name
+            for name, value in (
+                ("--binding-artifact-file", args.binding_artifact_file),
+                ("--repository-full-name", args.repository_full_name),
+                ("--refinement-session-id", args.refinement_session_id),
+                ("--iteration-id", args.iteration_id),
+                ("--current-body-file", args.current_body_file),
+            )
+            if value is not None
+        ]
+        if disallowed:
+            _write_diagnostic(
+                "validate_intermediate_extra_args_rejected",
+                f"--validate-intermediate never opens binding/body files: {disallowed}",
+            )
+            return 2
+
+    # Issue #1541 PR #1557 OWNER REQUEST_CHANGES High-2: bound the read to
+    # MAX_INPUT_BYTES + 1 (one byte past the budget, so an over-budget input
+    # is still detectable/reportable) instead of reading an unbounded amount
+    # into memory before the byte-budget check runs.
     try:
         if args.input_file:
-            with open(args.input_file, "rb") as f:
-                raw_bytes = f.read()
+            raw_bytes = _pb.read_file_safely(args.input_file, max_bytes=MAX_INPUT_BYTES + 1)
         else:
-            raw_bytes = sys.stdin.buffer.read()
-    except OSError as exc:
+            raw_bytes = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+    except (OSError, ValueError) as exc:
         _write_diagnostic("input_read_error", str(exc))
         return 2
+
+    if args.validate_intermediate:
+        result = build_validate_intermediate_result(raw_bytes, issue_number=args.issue_number)
+        sys.stdout.write(json.dumps(result, ensure_ascii=True, separators=(",", ":")))
+        sys.stdout.write("\n")
+        return 0 if result["validation_status"] == "valid" else 1
 
     try:
         child_raw_text = raw_bytes.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
         _write_diagnostic("utf8_decode_error", str(exc))
         return 2
+
+    # Issue #1541 PR #1557 OWNER REQUEST_CHANGES Blocker 2: classify the
+    # bounded child intermediate FIRST, strictly, and only open
+    # --binding-artifact-file / --current-body-file when the classification
+    # is needs_fix_intermediate. An approve child input NEVER causes this
+    # process to open those files, even if the caller (e.g. a registry
+    # command profile that always supplies dummy/nonexistent paths) passed
+    # them -- see `review_compact.emit_v2` (needs-fix profile) vs
+    # `review_compact.emit_approve` (approve profile, which structurally
+    # never supplies these placeholders) in command_registry.py.
+    child_result = validate_child_intermediate(child_raw_text, issue_number=args.issue_number)
+    if child_result["validation_status"] != "valid":
+        _write_diagnostic(
+            "contract_invalid",
+            "child intermediate failed validation",
+            violations=child_result["violations"],
+        )
+        return 1
+
+    if child_result["envelope_kind"] == "approve":
+        envelope_bytes = render_parent_review_envelope_v2(child_result["normalized_payload"], None)
+        sys.stdout.buffer.write(envelope_bytes)
+        sys.stdout.buffer.flush()
+        return 0
 
     binding_artifact: "dict[str, Any] | None" = None
     current_body_bytes: "bytes | None" = None
