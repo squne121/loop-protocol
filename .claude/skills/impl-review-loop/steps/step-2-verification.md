@@ -19,7 +19,7 @@ inputs:
   diff_head_sha: <diff summaryのhead_sha>
 ```
 
-SubAgent 側は `.claude/agents/test-runner.md` の手順を実行し、Verification Commands を実行して `TEST_VERDICT_MACHINE v1` マーカー付きコメントを PR に投稿する。
+SubAgent 側は `.claude/agents/test-runner.md` の手順を実行し、Verification Commands を実行して `TEST_VERDICT_MACHINE v2` マーカー付きコメントを PR に投稿する。
 
 ## 受け取り結果の期待値
 
@@ -27,7 +27,9 @@ test-runner が PR コメントに投稿する `TEST_VERDICT` YAML:
 
 ```yaml
 TEST_VERDICT:
-  schema: TEST_VERDICT_MACHINE/v1
+  schema: TEST_VERDICT_MACHINE/v2
+  producer_kind: test-runner
+  repository: "<owner/repo>"
   issue_number: <int>
   pr_number: <int>
   head_sha: "<PR current head_sha>"
@@ -36,6 +38,21 @@ TEST_VERDICT:
   contract_body_sha256: "sha256:<live Issue body SHA>"
   run_id: "<run ID>"
   run_url: "https://<run URL>"
+  workflow_run_id: <GitHub Actions workflow run ID>
+  workflow_run_attempt: <workflow run attempt>
+  check_run_id: <GitHub check run ID>
+  artifact:
+    name: "<artifact name>"
+    sha256: "sha256:<artifact content SHA256>"
+    url: "https://github.com/<owner>/<repo>/actions/runs/<run>/artifacts/<id>"
+  artifact_payload:
+    issue_number: <int>
+    pr_number: <int>
+    head_sha: "<PR current head_sha>"
+    reviewed_head_sha: "<reviewed head_sha>"
+    diff_head_sha: "<diff summary head_sha>"
+    contract_body_sha256: "sha256:<live Issue body SHA>"
+    command_hashes: ["sha256:<command hash>"]
   result: PASS | PARTIAL | FAIL
   mergeable: MERGEABLE | CONFLICTING | UNKNOWN
   merge_state_status: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
@@ -44,7 +61,7 @@ TEST_VERDICT:
   verification_commands_fail: <int>
 ```
 
-`pr_review_only` を baseline comparison から除外する adjudication では、`adjudicate_vc_result.py --test-verdict-file <TEST_VERDICT_MACHINE/v1 JSON>` にこの実行済み証跡を渡す。adjudicator は Issue/PR、current/reviewed/diff HEAD、contract body SHA、run ID/URL、全対象ACの command hash と PASS/exit 0/no fallback/no skip を検証し、欠落または不一致なら fail-closed とする。
+`pr_review_only` を baseline comparison から除外する adjudication では、`adjudicate_vc_result.py --test-verdict-file <TEST_VERDICT_MACHINE/v2 JSON>` に GitHub API readback 済みの artifact とこの実行済み証跡を渡す。adjudicator は producer/repository、Issue/PR、current/reviewed/diff HEAD、contract body SHA、run ID/URL、workflow/check run、artifact digest と payload binding、全対象ACの command hash と PASS/exit 0/no fallback/no skip を検証し、欠落または不一致なら fail-closed とする。PASS は正規VCと `pr_review_only` 除外VCを含む非空の `per_ac` coverage を必須とする。
 
 `TEST_VERDICT` は Step 2 の実行結果を示すみにし、`baseline_only` は**routing の正本ではない**。
 `baseline_only` は `adjudicate_vc_result.py` の evidence input としてのみ扱い、`VC_ADJUDICATION_RESULT_V1` の評価に渡す。

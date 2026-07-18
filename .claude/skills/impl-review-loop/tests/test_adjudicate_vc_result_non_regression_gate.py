@@ -177,8 +177,20 @@ def _manual_test_verdict(
     pr_number: int = 1544,
     contract_body_sha256: str = "sha256:" + "b" * 64,
 ) -> dict:
+    command_hashes = sorted(item["command_hash"] for item in items)
+    artifact_payload = {
+        "issue_number": issue_number,
+        "pr_number": pr_number,
+        "head_sha": head_sha,
+        "reviewed_head_sha": reviewed_head_sha,
+        "diff_head_sha": diff_head_sha,
+        "contract_body_sha256": contract_body_sha256,
+        "command_hashes": command_hashes,
+    }
     return {
-        "schema": "TEST_VERDICT_MACHINE/v1",
+        "schema": "TEST_VERDICT_MACHINE/v2",
+        "producer_kind": "test-runner",
+        "repository": "squne121/loop-protocol",
         "issue_number": issue_number,
         "pr_number": pr_number,
         "head_sha": head_sha,
@@ -187,6 +199,15 @@ def _manual_test_verdict(
         "contract_body_sha256": contract_body_sha256,
         "run_id": "run-1544-1",
         "run_url": "https://example.invalid/runs/1544",
+        "workflow_run_id": 1544,
+        "workflow_run_attempt": 1,
+        "check_run_id": 15440,
+        "artifact": {
+            "name": "test-verdict-machine",
+            "sha256": mod._sha256(mod._canonical_json(artifact_payload)),
+            "url": "https://github.com/squne121/loop-protocol/actions/runs/1544/artifacts/1",
+        },
+        "artifact_payload": artifact_payload,
         "result": "PASS",
         "verification_commands_pass": len(items),
         "verification_commands_fail": 0,
@@ -476,7 +497,51 @@ def test_real_producer_pr_review_only_current_head_envelope_is_adjudicated(
     )
 
     assert result["overall_status"] == "pass"
-    assert result["per_ac"] == []
+    assert result["per_ac"][0]["reason_code"] == "pr_review_only_runtime_evidence_pass"
+
+
+def test_test_verdict_v2_provenance_rejects_tampered_artifact_payload() -> None:
+    """GIVEN a producer-authorized skip WHEN artifact binding drifts THEN PASS is denied."""
+    item = _manual_vc_result(
+        "AC8",
+        command_hash="sha256:" + "8" * 64,
+        classification="skipped",
+        decision="go",
+        scope_class="pr_review_only",
+        exit_code=None,
+    )
+    snapshot = _manual_contract_snapshot([item])
+    current = _manual_current_payload([item], head_sha="head-8", reviewed_head_sha="head-8")
+    verdict = _manual_test_verdict(
+        [item], head_sha="head-8", reviewed_head_sha="head-8", diff_head_sha="head-8"
+    )
+    verdict["artifact_payload"]["head_sha"] = "stale-head"
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=snapshot,
+        current_vc_result=current,
+        diff_summary={"changed_paths": [ADJUDICATOR_PATH], "head_sha": "head-8", "pr_number": 1544},
+        allowed_paths=[ADJUDICATOR_PATH],
+        test_verdict=verdict,
+    )
+
+    assert result["overall_status"] == "indeterminate"
+    assert result["errors"] == ["test_verdict_artifact_digest_mismatch"]
+
+
+def test_per_ac_coverage_rejects_empty_pass() -> None:
+    """GIVEN a direct result construction WHEN PASS has no AC coverage THEN it fails closed."""
+    result = mod._result(
+        overall_status="pass",
+        per_ac=[],
+        rerun_required=False,
+        source_integrity={},
+        evidence_refs=[],
+    )
+
+    assert result["overall_status"] == "indeterminate"
+    assert result["blocking"] is True
+    assert result["errors"] == ["pass_requires_per_ac_coverage"]
 
 
 # ---------------------------------------------------------------------------
@@ -934,7 +999,7 @@ def test_current_head_runtime_evidence_is_required_for_pr_review_only_only_paylo
         ),
     )
     assert certified["overall_status"] == "pass"
-    assert certified["per_ac"] == []
+    assert certified["per_ac"][0]["reason_code"] == "pr_review_only_runtime_evidence_pass"
 
     current["reviewed_head_sha"] = "head-0"
     result = mod.adjudicate_vc_result(
