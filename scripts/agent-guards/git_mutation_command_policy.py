@@ -1430,6 +1430,120 @@ def _classify_initial_branch_create_push(
     )
 
 
+# Issue #1611 AC14 (CI repair, worktree-issue-1611-v2 PR #1620): shared,
+# single-authority recognizer for the EXACT controlled_git_change_exec.py
+# invocation shape. Consumed by `.claude/hooks/worktree_scope_guard.py`
+# (and, by construction, safe for `local_main_branch_guard.py` to reuse) so
+# the PreToolUse guard chain does not fail-closed-deny the one authorized
+# staging/commit executor call shape purely because the process `cwd` (the
+# root checkout) differs from the `--cwd` flag value (the linked issue
+# worktree the executor is told to operate in) -- the executor itself does
+# its own worktree/branch/HEAD binding checks in-process (see
+# `controlled_git_change_exec.py.execute_controlled_change`); this
+# PreToolUse-layer recognizer only has to (a) prove the invocation is the
+# exact expected argv shape (no extra/unknown flags, no shell wrapper riding
+# along) and (b) hand the `--cwd` value back to the caller so it can be
+# containment-checked against the resolved active issue worktree.
+CONTROLLED_GIT_CHANGE_EXEC_SCRIPT = "scripts/agent-guards/controlled_git_change_exec.py"
+_CGCE_METACHAR_RE = re.compile(r"[;&|<>$`\n\r\0\\(){}*?\[\]!~]")
+_CGCE_SINGLE_VALUE_FLAGS = frozenset({"--cwd", "--snapshot-json", "--message", "--expected-head"})
+_CGCE_REPEATABLE_VALUE_FLAGS = frozenset({"--path"})
+_CGCE_REQUIRED_FLAGS = frozenset({"--cwd", "--snapshot-json", "--message", "--expected-head"})
+
+
+@dataclass(frozen=True)
+class ControlledGitChangeExecCommand:
+    """Parsed exact `controlled_git_change_exec.py` CLI invocation (AC14)."""
+
+    cwd: str
+    snapshot_json: str
+    paths: tuple[str, ...]
+    message: str
+    expected_head: str
+
+
+def parse_controlled_git_change_exec_command(
+    command: str, project_root: str
+) -> ControlledGitChangeExecCommand | None:
+    """Return the parsed argv iff `command` is an exact, unwrapped
+    `uv run --locked python3 scripts/agent-guards/controlled_git_change_exec.py
+    [FLAGS]` invocation, else None.
+
+    Rejects: shell metacharacters / wrappers (`bash -lc`, etc. -- the token
+    sequence must start literally with `uv run --locked python3`), any
+    positional argument, `--flag=value` forms, duplicate single-value flags,
+    unknown flags, missing required flags, and a script path that does not
+    resolve (relative to `project_root`) to the canonical executor. Does NOT
+    validate `--cwd` against the active issue worktree -- that containment
+    check is the caller's responsibility (the caller has the resolved
+    expected-worktree context this module does not).
+    """
+    if not command or not command.strip():
+        return None
+    if _CGCE_METACHAR_RE.search(command):
+        return None
+    toks = _tokenize(command)
+    if not toks or len(toks) < 5:
+        return None
+    if toks[:4] != ["uv", "run", "--locked", "python3"]:
+        return None
+
+    script_token = toks[4]
+    if not script_token or script_token.startswith("-") or script_token == "-c":
+        return None
+    if script_token.startswith("/tmp/"):
+        return None
+    script_real = (
+        os.path.realpath(script_token)
+        if os.path.isabs(script_token)
+        else os.path.realpath(os.path.join(project_root, script_token))
+    )
+    canonical_script = os.path.realpath(os.path.join(project_root, CONTROLLED_GIT_CHANGE_EXEC_SCRIPT))
+    if script_real != canonical_script:
+        return None
+
+    values: dict[str, list[str]] = {}
+    args = toks[5:]
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if not tok.startswith("--") or "=" in tok:
+            return None
+        if tok in _CGCE_SINGLE_VALUE_FLAGS:
+            if tok in values or i + 1 >= len(args):
+                return None
+            val = args[i + 1]
+            if val.startswith("--"):
+                return None
+            values[tok] = [val]
+            i += 2
+            continue
+        if tok in _CGCE_REPEATABLE_VALUE_FLAGS:
+            if i + 1 >= len(args):
+                return None
+            val = args[i + 1]
+            if val.startswith("--"):
+                return None
+            values.setdefault(tok, []).append(val)
+            i += 2
+            continue
+        return None  # unknown flag
+
+    if not _CGCE_REQUIRED_FLAGS.issubset(values):
+        return None
+    paths = tuple(values.get("--path", ()))
+    if not paths:
+        return None
+
+    return ControlledGitChangeExecCommand(
+        cwd=values["--cwd"][0],
+        snapshot_json=values["--snapshot-json"][0],
+        paths=paths,
+        message=values["--message"][0],
+        expected_head=values["--expected-head"][0],
+    )
+
+
 def classify_agent_lane_add_commit(command: str) -> GitMutationPolicyResult | None:
     """Issue #1611 AC9: deny raw `git add`/`git commit` and `rtk git
     add`/`rtk git commit` shell command shapes unconditionally for the
