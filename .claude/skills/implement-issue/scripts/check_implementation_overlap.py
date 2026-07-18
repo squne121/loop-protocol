@@ -146,6 +146,33 @@ _PARENT_ISSUE_RE = re.compile(r"^parent_issue:\s*\"?#?(\d+)\"?", re.MULTILINE)
 _DEPENDENCY_CONTRACT_KEYS = ("blocked_by", "depends_on", "supersedes")
 _ALLOWED_PATHS_HEADING_RE = re.compile(r"^##\s+Allowed Paths\s*$", re.MULTILINE)
 
+# #1613: human judgment is an additional, fail-closed input.  The checker does
+# not infer C1 from prose; it accepts only this fixed, self-identifying schema
+# and binds every claimed value to GitHub readback.
+HUMAN_C1_DECISION_SCHEMA = "HUMAN_C1_DECISION_V1"
+_HUMAN_C1_DECISION_FIELDS = frozenset(
+    {
+        "target_issue_url",
+        "candidate_issue_number",
+        "decision",
+        "comment_url",
+        "author_association",
+        "current_body_sha256",
+        "current_updated_at",
+        "candidate_body_sha256",
+        "candidate_updated_at",
+    }
+)
+_HUMAN_C1_DECISION_BLOCK_RE = re.compile(
+    rf"```yaml[ \t]*\n{HUMAN_C1_DECISION_SCHEMA}:[ \t]*\n(?P<fields>.*?)```",
+    re.DOTALL,
+)
+_HUMAN_C1_DECISION_FIELD_RE = re.compile(r"^  ([a-z][a-z0-9_]*):\s*(\S(?:.*\S)?)\s*$")
+_HUMAN_C1_COMMENT_URL_RE = re.compile(
+    r"^https://github\.com/(?P<owner>[^/#]+)/(?P<repo>[^/#]+)/issues/(?P<number>[1-9][0-9]*)"
+    r"#issuecomment-[1-9][0-9]*$"
+)
+
 
 class OverlapRuntimeError(RuntimeError):
     """GitHub 取得失敗 / JSON 解析失敗 / schema 違反を表す fail-closed error。"""
@@ -805,6 +832,53 @@ def fetch_all_native_dependencies(repo: str, issue_number: int) -> Dict[str, Tup
     }
 
 
+def fetch_issue_comments(repo: str, issue_number: int) -> List[Dict[str, Any]]:
+    """Read every Issue comment through the REST API for human-C1 validation.
+
+    `gh issue view --json comments` is a convenient display projection but does
+    not give this security-sensitive input a pagination-completeness contract.
+    Read REST pages explicitly, retain only fields consumed by the validator,
+    and fail closed if a page is not an array.
+    """
+    comments: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        data = _run_gh_json(
+            [
+                "gh",
+                "api",
+                f"repos/{repo}/issues/{issue_number}/comments",
+                "-X",
+                "GET",
+                "-H",
+                _GITHUB_API_ACCEPT_HEADER,
+                "-H",
+                f"X-GitHub-Api-Version: {_GITHUB_API_VERSION}",
+                "-f",
+                f"per_page={_NATIVE_DEPENDENCY_PAGE_SIZE}",
+                "-f",
+                f"page={page}",
+            ]
+        )
+        if not isinstance(data, list):
+            raise OverlapRuntimeError(f"issue comments endpoint returned non-array: page={page}")
+        for item in data:
+            if not isinstance(item, dict):
+                raise OverlapRuntimeError("issue comments endpoint contains non-object record")
+            comments.append(
+                {
+                    "body": item.get("body"),
+                    "url": item.get("html_url"),
+                    "authorAssociation": item.get("author_association"),
+                }
+            )
+        if len(data) < _NATIVE_DEPENDENCY_PAGE_SIZE:
+            return comments
+        page += 1
+        if page > _NATIVE_DEPENDENCY_MAX_PAGES:
+            raise OverlapRuntimeError("issue comments pagination exceeded safety cap")
+
+
 def _classifier_allowed_paths(entries: Sequence[str]) -> Tuple[str, ...]:
     """pure classifier に渡す path を one-level glob semantics へ写像する。
 
@@ -884,6 +958,157 @@ def _validate_candidate_schema(raw: Dict[str, Any]) -> List[str]:
         except Exception:  # pragma: no cover - defensive fail-closed
             errors.append("malformed_dependency_contract")
     return errors
+
+
+# ============================================================
+# human C1 decision comment（#1613: exact, candidate-scoped override input）
+# ============================================================
+
+
+def _unquote_comment_scalar(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _comment_author_association(raw: Dict[str, Any]) -> Optional[str]:
+    value = raw.get("authorAssociation", raw.get("author_association"))
+    return value.strip().upper() if isinstance(value, str) and value.strip() else None
+
+
+def _parse_human_c1_comment(raw: Dict[str, Any]) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+    """Parse exactly one fixed schema block from an Issue comment.
+
+    A comment without the schema is unrelated.  A comment which claims the
+    schema but cannot be parsed is a fail-closed rejected decision rather than
+    an ignored comment.
+    """
+    body = raw.get("body")
+    if not isinstance(body, str) or HUMAN_C1_DECISION_SCHEMA not in body:
+        return None, None
+    blocks = list(_HUMAN_C1_DECISION_BLOCK_RE.finditer(body))
+    if len(blocks) != 1:
+        return None, "schema_block_missing_or_duplicate"
+    fields: Dict[str, str] = {}
+    for line in blocks[0].group("fields").splitlines():
+        if not line.strip():
+            continue
+        match = _HUMAN_C1_DECISION_FIELD_RE.fullmatch(line)
+        if not match:
+            return None, "schema_field_syntax_invalid"
+        key, value = match.groups()
+        if key in fields:
+            return None, "schema_field_duplicate"
+        fields[key] = _unquote_comment_scalar(value)
+    if set(fields) != _HUMAN_C1_DECISION_FIELDS:
+        return None, "schema_fields_missing_or_unknown"
+    return fields, None
+
+
+def _decision_rejection(raw: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    url = raw.get("url") if isinstance(raw.get("url"), str) else None
+    return {"comment_url": url, "reason": reason}
+
+
+def _validate_human_c1_decisions(
+    *,
+    comments: Any,
+    repository: str,
+    current_number: int,
+    current_body: str,
+    current_updated_at: Optional[str],
+    candidates_evidence: List[Dict[str, Any]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Validate owner/collaborator records and attach only exact C1 decisions.
+
+    This does not alter duplicate/C2/source/validation routes.  It merely marks
+    a currently ambiguous C1 candidate as a human-confirmed non-conflict after
+    all comment claims are bound to the exact current readback.
+    """
+    result: Dict[str, List[Dict[str, Any]]] = {"accepted": [], "rejected": []}
+    if comments is None:
+        return result
+    if not isinstance(comments, list):
+        result["rejected"].append({"comment_url": None, "reason": "comments_schema_invalid"})
+        return result
+
+    expected_target_url = f"https://github.com/{repository}/issues/{current_number}"
+    candidate_by_number = {
+        item.get("issue_number"): item
+        for item in candidates_evidence
+        if isinstance(item.get("issue_number"), int)
+    }
+    seen_candidates: set[int] = set()
+
+    for raw in comments:
+        if not isinstance(raw, dict):
+            result["rejected"].append({"comment_url": None, "reason": "comment_record_invalid"})
+            continue
+        fields, parse_error = _parse_human_c1_comment(raw)
+        if fields is None:
+            if parse_error:
+                result["rejected"].append(_decision_rejection(raw, parse_error))
+            continue
+
+        comment_url = raw.get("url") if isinstance(raw.get("url"), str) else None
+        author_association = _comment_author_association(raw)
+        if comment_url is None or fields["comment_url"] != comment_url:
+            result["rejected"].append(_decision_rejection(raw, "comment_url_readback_mismatch"))
+            continue
+        url_match = _HUMAN_C1_COMMENT_URL_RE.fullmatch(comment_url)
+        if (
+            url_match is None
+            or _canonicalize_repo_static(f"{url_match.group('owner')}/{url_match.group('repo')}") != repository
+            or int(url_match.group("number")) != current_number
+        ):
+            result["rejected"].append(_decision_rejection(raw, "comment_url_not_target_issue"))
+            continue
+        if fields["target_issue_url"] != expected_target_url:
+            result["rejected"].append(_decision_rejection(raw, "target_issue_url_mismatch"))
+            continue
+        if author_association not in {"OWNER", "COLLABORATOR"} or fields["author_association"] != author_association:
+            result["rejected"].append(_decision_rejection(raw, "author_association_not_authorized_or_mismatch"))
+            continue
+        if fields["decision"] != "C1/non-conflict":
+            result["rejected"].append(_decision_rejection(raw, "decision_not_c1_non_conflict"))
+            continue
+        try:
+            candidate_number = int(fields["candidate_issue_number"])
+        except ValueError:
+            result["rejected"].append(_decision_rejection(raw, "candidate_number_invalid"))
+            continue
+        candidate = candidate_by_number.get(candidate_number)
+        if candidate is None or candidate.get("policy_class") != "C1":
+            result["rejected"].append(_decision_rejection(raw, "candidate_not_current_c1_overlap"))
+            continue
+        if candidate_number in seen_candidates:
+            result["rejected"].append(_decision_rejection(raw, "candidate_decision_duplicate"))
+            continue
+        if fields["current_body_sha256"] != f"sha256:{_sha256(current_body)}":
+            result["rejected"].append(_decision_rejection(raw, "current_body_sha256_mismatch"))
+            continue
+        if fields["current_updated_at"] != current_updated_at:
+            result["rejected"].append(_decision_rejection(raw, "current_updated_at_mismatch"))
+            continue
+        if fields["candidate_body_sha256"] != candidate.get("body_sha256"):
+            result["rejected"].append(_decision_rejection(raw, "candidate_body_sha256_mismatch"))
+            continue
+        if fields["candidate_updated_at"] != candidate.get("updated_at"):
+            result["rejected"].append(_decision_rejection(raw, "candidate_updated_at_mismatch"))
+            continue
+
+        verified = {
+            **fields,
+            "verified": True,
+        }
+        candidate["human_c1_decision"] = verified
+        result["accepted"].append(verified)
+        seen_candidates.add(candidate_number)
+
+    result["accepted"].sort(key=lambda item: (int(item["candidate_issue_number"]), item["comment_url"]))
+    result["rejected"].sort(key=lambda item: ((item.get("comment_url") or ""), item["reason"]))
+    return result
 
 
 # ============================================================
@@ -1042,6 +1267,7 @@ def build_evidence(
     ignored_candidates: List[Dict[str, Any]],
     dependency_resolution: Dict[str, Any],
     validation_errors: Dict[int, List[str]],
+    human_c1_decisions: Dict[str, List[Dict[str, Any]]],
     route: str,
 ) -> Dict[str, Any]:
     # 候補は issue_number で canonical sort（順序非依存性、Major 4）
@@ -1068,6 +1294,7 @@ def build_evidence(
         "ignored_candidates": ordered_ignored,
         "dependency_resolution": dependency_resolution,
         "validation_errors": {str(k): v for k, v in sorted(validation_errors.items())},
+        "human_c1_decisions": human_c1_decisions,
         "route": route,
     }
     decision_inputs_sha256 = f"sha256:{_sha256(_canonical_json(decision_payload))}"
@@ -1091,6 +1318,7 @@ def build_evidence(
         "ignored_candidates": ordered_ignored,
         "dependency_resolution": dependency_resolution,
         "validation_errors": {str(k): v for k, v in sorted(validation_errors.items())},
+        "human_c1_decisions": human_c1_decisions,
         "route": route,
         "decision_inputs_sha256": decision_inputs_sha256,
     }
@@ -1288,6 +1516,30 @@ def _classify(
         if origin == "classify" and result.verdict == DUPLICATE and rb["readback_complete"] and rb["heading_overlap"]:
             duplicate_confirmed = True
 
+    # #1613: a human C1 decision is valid only after candidate collection and
+    # readback have established the exact candidate set.  It may clear the
+    # incomplete/collision flags of that one C1 candidate, but never changes
+    # the classifier verdict, dependencies, source completeness, or validation
+    # errors.
+    human_c1_decisions = _validate_human_c1_decisions(
+        comments=current_raw.get("comments"),
+        repository=repository,
+        current_number=args.issue_number,
+        current_body=current_body,
+        current_updated_at=current_raw.get("updatedAt"),
+        candidates_evidence=candidates_evidence,
+    )
+    if human_c1_decisions["accepted"]:
+        accepted_numbers = {int(item["candidate_issue_number"]) for item in human_c1_decisions["accepted"]}
+        any_incomplete = any(
+            not item["readback_complete"] and item["issue_number"] not in accepted_numbers
+            for item in candidates_evidence
+        )
+        any_collision = any(
+            item["heading_overlap"] and item["issue_number"] not in accepted_numbers
+            for item in candidates_evidence
+        )
+
     # --- route 決定 ---
     route: str
     verdict = result.verdict
@@ -1302,6 +1554,7 @@ def _classify(
             "ignored_candidates": ignored_candidates,
             "dependency_resolution": dependency_resolution,
             "validation_errors": validation_errors,
+            "human_c1_decisions": {"accepted": [], "rejected": []},
         }
 
     if dep_res["blocking"] is not None:
@@ -1309,6 +1562,8 @@ def _classify(
     elif validation_errors:
         route = ROUTE_HUMAN_REVIEW_REQUIRED
     elif dep_res["unresolved_refs"]:
+        route = ROUTE_HUMAN_REVIEW_REQUIRED
+    elif human_c1_decisions["rejected"]:
         route = ROUTE_HUMAN_REVIEW_REQUIRED
     elif verdict == AMBIGUOUS_REQUIRES_HUMAN:
         route = ROUTE_HUMAN_REVIEW_REQUIRED
@@ -1345,6 +1600,7 @@ def _classify(
         "ignored_candidates": ignored_candidates,
         "dependency_resolution": dependency_resolution,
         "validation_errors": validation_errors,
+        "human_c1_decisions": human_c1_decisions,
     }
 
 
@@ -1419,6 +1675,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             native_deps = fetch_all_native_dependencies(canonical_repo, args.issue_number)
             current_raw["blockedBy"] = [dict(rec) for rec in native_deps["blockedBy"]]
             current_raw["blocking"] = [dict(rec) for rec in native_deps["blocking"]]
+            current_raw["comments"] = fetch_issue_comments(canonical_repo, args.issue_number)
 
         if not isinstance(current_raw, dict) or "body" not in current_raw:
             raise OverlapRuntimeError("current issue JSON missing required 'body' field")
@@ -1506,6 +1763,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             ignored_candidates=ctx["ignored_candidates"],
             dependency_resolution=ctx["dependency_resolution"],
             validation_errors=ctx["validation_errors"],
+            human_c1_decisions=ctx["human_c1_decisions"],
             route=route,
         )
         print(json.dumps(evidence, ensure_ascii=False, indent=2))
