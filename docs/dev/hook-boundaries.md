@@ -503,7 +503,12 @@ HOOK_COMMAND_REPAIR_HINT_V1:
   `classify_agent_lane_add_commit` は raw `git add`/`git commit`/`rtk git add`/`rtk git commit`
   シェルコマンド文字列を、そのコマンド自身が controlled executor でない限り常に deny する（既存の
   `classify_rtk_git_mutation` の add/commit 分岐は後方互換のため変更していない -- 実際の agent lane
-  はこの新しい deny-first 判定を優先する）。
+  はこの新しい deny-first 判定を優先する）。Codex 側の静的 rule
+  (`.codex/rules/default.rules`) も `rtk git add` / `rtk git commit -m` を `forbidden` に narrowing
+  し、controlled executor 本体の exact invocation prefix
+  (`uv run --locked python3 scripts/agent-guards/controlled_git_change_exec.py`) のみ `allow` にして
+  いる（AC14、`scripts/ci/codex_execpolicy_matrix.py` の `execpolicy_case_definitions()` に静的ケース
+  として記録）。
 
 ---
 

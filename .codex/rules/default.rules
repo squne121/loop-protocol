@@ -92,10 +92,18 @@ prefix_rule(
 )
 
 # rtk git mutation operations: only the bounded publish shapes are allowlisted here.
+# Issue #1611 (contract revision, AC9/AC14): `rtk git add` / `rtk git commit`
+# are narrowed to `forbidden` -- staging/commit is now exclusively the
+# controlled executor's job (`scripts/agent-guards/controlled_git_change_exec.py`,
+# invoked as `uv run --locked python3 scripts/agent-guards/controlled_git_change_exec.py
+# ...`), never a raw `git add`/`git commit` (or `rtk git add`/`rtk git commit`)
+# shell shape. `git_mutation_command_policy.classify_agent_lane_add_commit`
+# denies the same shapes at the PreToolUse guard layer (defense in depth --
+# this static rule and that runtime guard must both deny).
 prefix_rule(
     pattern = ["rtk", "git", "add"],
-    decision = "allow",
-    justification = "Issue-worktree publish path is allowed only when the runtime hooks validate exact bounded add pathspecs plus Allowed Paths.",
+    decision = "forbidden",
+    justification = "Issue #1611: staging is exclusively the controlled executor's job (scripts/agent-guards/controlled_git_change_exec.py); raw `rtk git add` is never allowed for the agent lane.",
     match = [
         "rtk git add docs/dev/hook-boundaries.md",
     ],
@@ -103,10 +111,26 @@ prefix_rule(
 
 prefix_rule(
     pattern = ["rtk", "git", "commit", "-m"],
-    decision = "allow",
-    justification = "Issue-worktree publish path is allowed only when the runtime hooks validate staged diff subset plus bounded commit message shape.",
+    decision = "forbidden",
+    justification = "Issue #1611: commit is exclusively the controlled executor's job (scripts/agent-guards/controlled_git_change_exec.py); raw `rtk git commit` is never allowed for the agent lane.",
     match = [
         "rtk git commit -m issue-1241-update",
+    ],
+)
+
+# --- controlled stage/commit executor (Issue #1611): the ONLY authorized ---
+# --- path for agent-driven git staging/commit. Runtime binding checks    ---
+# --- (repository/worktree/branch/HEAD, Allowed Paths, protected paths)   ---
+# --- happen inside the executor itself -- this static rule only allows   ---
+# --- the exact `uv run --locked python3` invocation prefix; extra argv,  ---
+# --- a `bash -lc` wrapper, or invocation from outside a linked issue     ---
+# --- worktree are all denied by the executor's own fail-closed checks.   ---
+prefix_rule(
+    pattern = ["uv", "run", "--locked", "python3", "scripts/agent-guards/controlled_git_change_exec.py"],
+    decision = "allow",
+    justification = "Issue #1611: the controlled stage/commit executor is the single authorized in-process path for agent-driven git add/commit; its own runtime checks (repository/worktree/branch/HEAD binding, Allowed Paths, protected paths, audit-then-rollback) are the actual enforcement, not this static allow.",
+    match = [
+        "uv run --locked python3 scripts/agent-guards/controlled_git_change_exec.py --cwd .claude/worktrees/issue-1611-x --snapshot-json .claude/tmp/issue-1611-scope-snapshot.json --path scripts/agent-guards/example.py --message \"feat: example\" --expected-head 0000000000000000000000000000000000000000",
     ],
 )
 

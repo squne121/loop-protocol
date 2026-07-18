@@ -7,11 +7,19 @@ _GUARDS_DIR = Path(__file__).resolve().parent.parent
 if str(_GUARDS_DIR) not in sys.path:
     sys.path.insert(0, str(_GUARDS_DIR))
 
+import hashlib  # noqa: E402
+
 from protected_paths_policy import (  # noqa: E402
+    POLICY_FILE,
+    POLICY_RULES,
+    POLICY_SCHEMA,
+    POLICY_SHA256,
     POLICY_VERSION,
     PROTECTED_PATH_PATTERNS,
+    compute_policy_sha256,
     filter_protected_paths,
     is_protected_path,
+    load_policy,
 )
 
 
@@ -63,3 +71,20 @@ def test_protected_paths_reject_invalid_input_fail_closed():
     assert is_protected_path("") is False
     assert is_protected_path("../secrets/token") is False
     assert is_protected_path("/secrets/token") is False
+
+
+def test_protected_paths_policy_is_json_ssot_content_hash_bound():
+    """Issue #1611 (contract revision, P1-2): `protected_paths_policy.v1.json`
+    is the single source of truth; `POLICY_SHA256` binds to its raw content
+    (never a hand-maintained version string), and the Python module derives
+    its rule set from the JSON, not a hardcoded list."""
+    assert POLICY_FILE.name == "protected_paths_policy.v1.json"
+    assert POLICY_FILE.exists()
+    on_disk = load_policy()
+    assert on_disk["schema"] == POLICY_SCHEMA == "PROTECTED_PATHS_POLICY_V1"
+    assert tuple(on_disk["rules"]) == POLICY_RULES
+    expected_sha = hashlib.sha256(POLICY_FILE.read_bytes()).hexdigest()
+    assert POLICY_SHA256 == expected_sha
+    assert compute_policy_sha256() == expected_sha
+    for rule in POLICY_RULES:
+        assert rule["kind"] in ("root_directory", "basename_glob")

@@ -1,0 +1,10 @@
+{
+  "schema": "PROTECTED_PATHS_POLICY_V1",
+  "rules": [
+    {"kind": "root_directory", "path": "assets"},
+    {"kind": "root_directory", "path": "LICENSES"},
+    {"kind": "basename_glob", "pattern": ".env"},
+    {"kind": "basename_glob", "pattern": ".env.*"},
+    {"kind": "root_directory", "path": "secrets"}
+  ]
+}

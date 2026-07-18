@@ -33,6 +33,16 @@ from typing import Any, Dict, List, Optional
 SOURCE_GIT_NAME_STATUS_Z = "git_diff_name_status_find_renames_z"
 SOURCE_PR_FILES_API = "github_pull_request_files_api_with_previous_filename"
 SOURCE_NAME_ONLY_INSUFFICIENT = "git_diff_current_merge_base_head_name_only"
+# Issue #1611 (contract revision, P0-2): the canonical authorization oracle
+# for controlled staging/commit is `git diff-index --raw --full-index -z -M`
+# (mode + OID aware, rename/submodule/type-change explicit), NOT the
+# name-status form above. `SOURCE_GIT_NAME_STATUS_Z` remains valid for
+# review-time (`allowed_paths_review_gate.py`) human-audit-assist use, but is
+# never the staging/commit authorization oracle.
+SOURCE_GIT_DIFF_INDEX_RAW_Z = "git_diff_index_raw_full_index_find_renames_z"
+
+# Submodule (gitlink) tree entry mode, per the git object model.
+GITLINK_MODE = "160000"
 
 PATH_ROLE_FILENAME = "filename"
 PATH_ROLE_PREVIOUS_FILENAME = "previous_filename"
@@ -72,9 +82,24 @@ class ChangedFileRecord:
     previous_path: Optional[str]
     source: str
     provenance_complete: bool
+    # Issue #1611 (contract revision, P0-2): mode/OID provenance from
+    # `git diff-index --raw --full-index -z -M`. `None` for records built
+    # from a source that does not carry mode/OID (e.g. the PR files API, or
+    # the legacy `--name-status` parser below) -- callers that need
+    # submodule-gitlink (mode 160000) classification MUST use a record
+    # whose `source == SOURCE_GIT_DIFF_INDEX_RAW_Z` (`old_mode`/`new_mode`
+    # populated), never infer it from `status` alone.
+    old_mode: Optional[str] = None
+    new_mode: Optional[str] = None
+    old_oid: Optional[str] = None
+    new_oid: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    @property
+    def is_submodule_gitlink_change(self) -> bool:
+        return self.old_mode == GITLINK_MODE or self.new_mode == GITLINK_MODE
 
 
 class AllowedPathsMatcher:
@@ -231,4 +256,107 @@ def parse_git_diff_name_status_z(raw: str, source: str) -> List[ChangedFileRecor
             )
         else:
             raise ValueError(f"unknown git diff --name-status status: {status_token!r}")
+    return records
+
+
+class UnsupportedPathEncodingError(ValueError):
+    """Raised when a NUL-delimited raw diff-index path token cannot be
+    decoded as UTF-8 (Issue #1611 contract revision, AC5). Callers MUST
+    treat this fail-closed -- never silently fall back to `errors="replace"`
+    / latin-1 / a best-effort decode."""
+
+
+def _decode_path_token(token: bytes) -> str:
+    try:
+        return token.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise UnsupportedPathEncodingError(f"path token is not valid UTF-8: {token!r}") from exc
+
+
+def parse_git_diff_index_raw_z(raw: bytes, source: str) -> List[ChangedFileRecord]:
+    """Parse `git diff-index --raw --full-index -z -M <tree-ish>` (bytes)
+    output into `ChangedFileRecord` list, with mode/OID provenance (Issue
+    #1611 contract revision, AC3/AC4/AC5).
+
+    This is the canonical, mode/OID-aware authorization oracle for
+    controlled staging/commit -- `--name-status` (above) remains available
+    for human-audit-assist use only.
+
+    Input MUST be `bytes` (not `str`) -- the caller must invoke the
+    subprocess with `text=False` so NUL-delimited path tokens are never
+    passed through a lossy/replacing text decode before this parser sees
+    them. Each record is:
+      ":<old_mode> <new_mode> <old_oid> <new_oid> <status>[score]\\0<path>\\0"
+    or, for rename/copy (`status` in `R`/`C`):
+      ":<old_mode> <new_mode> <old_oid> <new_oid> <status><score>\\0<old_path>\\0<new_path>\\0"
+
+    Raises `ValueError` (or the `UnsupportedPathEncodingError` subclass, for
+    a path token that is not valid UTF-8) on any malformed/unknown record --
+    fail-closed, never a filename-only or best-effort fallback.
+    """
+    if not isinstance(raw, (bytes, bytearray)):
+        raise TypeError("parse_git_diff_index_raw_z requires bytes input (text=False subprocess output)")
+    tokens = [tok for tok in bytes(raw).split(b"\0") if tok != b""]
+    records: List[ChangedFileRecord] = []
+    i = 0
+    while i < len(tokens):
+        meta_token = tokens[i]
+        i += 1
+        try:
+            meta_str = meta_token.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"malformed raw diff-index meta token (non-ascii): {meta_token!r}") from exc
+        if not meta_str.startswith(":"):
+            raise ValueError(f"malformed raw diff-index meta token: {meta_str!r}")
+        parts = meta_str[1:].split(" ")
+        if len(parts) != 5:
+            raise ValueError(f"malformed raw diff-index meta token: {meta_str!r}")
+        old_mode, new_mode, old_oid, new_oid, status_field = parts
+        if not status_field:
+            raise ValueError(f"malformed raw diff-index meta token: {meta_str!r}")
+        letter = status_field[0]
+        if letter in ("R", "C"):
+            if i + 1 >= len(tokens):
+                raise ValueError(f"malformed rename/copy raw record for status {status_field!r}: missing old/new path")
+            old_path = _decode_path_token(tokens[i])
+            new_path = _decode_path_token(tokens[i + 1])
+            i += 2
+            if not old_path or not new_path:
+                raise ValueError(f"malformed rename/copy raw record: empty path for status {status_field!r}")
+            status_name = "renamed" if letter == "R" else "copied"
+            records.append(
+                ChangedFileRecord(
+                    path=new_path,
+                    status=status_name,
+                    previous_path=old_path,
+                    source=source,
+                    provenance_complete=True,
+                    old_mode=old_mode,
+                    new_mode=new_mode,
+                    old_oid=old_oid,
+                    new_oid=new_oid,
+                )
+            )
+        elif letter in _GIT_STATUS_LETTER_MAP:
+            if i >= len(tokens):
+                raise ValueError(f"malformed raw record for status {status_field!r}: missing path")
+            path = _decode_path_token(tokens[i])
+            i += 1
+            if not path:
+                raise ValueError(f"malformed raw record: empty path for status {status_field!r}")
+            records.append(
+                ChangedFileRecord(
+                    path=path,
+                    status=_GIT_STATUS_LETTER_MAP[letter],
+                    previous_path=None,
+                    source=source,
+                    provenance_complete=True,
+                    old_mode=old_mode,
+                    new_mode=new_mode,
+                    old_oid=old_oid,
+                    new_oid=new_oid,
+                )
+            )
+        else:
+            raise ValueError(f"unknown git diff-index raw status: {status_field!r}")
     return records

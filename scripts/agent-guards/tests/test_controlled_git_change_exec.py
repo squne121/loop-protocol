@@ -12,18 +12,21 @@ if str(_GUARDS_DIR) not in sys.path:
 
 _REPO_ROOT = _GUARDS_DIR.parent.parent
 _PR_REVIEW_JUDGE_SCRIPTS_DIR = _REPO_ROOT / ".claude" / "skills" / "pr-review-judge" / "scripts"
+_CI_DIR = _REPO_ROOT / "scripts" / "ci"
 
 import protected_paths_policy  # noqa: E402
 from controlled_git_change_exec import (  # noqa: E402
     AUTHORITY_MIGRATION_VALIDATION,
+    AUTHORITY_NEW_DISABLED_FAIL_CLOSED,
     AUTHORITY_NEW_ONLY,
     AUTHORITY_OLD_ONLY,
-    AUTHORITY_ROLLBACK_TO_OLD,
     AUTHORITY_SOURCE_LEGACY_ENV,
     AUTHORITY_SOURCE_NONE,
     AUTHORITY_SOURCE_SNAPSHOT,
+    CONTRACT_SOURCE_ISSUE_BODY,
     build_issue_scope_snapshot,
     compute_allowed_paths_sha256,
+    compute_comments_digest_sha256,
     execute_controlled_change,
     resolve_authority,
 )
@@ -44,6 +47,12 @@ def _init_repo(repo: Path) -> str:
     return base_sha
 
 
+def _head(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
 def _build_snapshot(
     repo: Path,
     *,
@@ -52,17 +61,24 @@ def _build_snapshot(
     issue_body: str = "## Outcome\nsomething\n",
     base_sha: str = "a" * 40,
     target_branch: str = "topic",
-    authority_version: str = AUTHORITY_NEW_ONLY,
+    authority_mode: str = AUTHORITY_NEW_ONLY,
+    comment_bodies=("",),
 ):
     return build_issue_scope_snapshot(
+        repository_full_name="squne121/loop-protocol",
         issue_number=issue_number,
+        contract_source_kind=CONTRACT_SOURCE_ISSUE_BODY,
+        contract_source_id=f"issue-{issue_number}-body",
+        contract_source_body=issue_body,
         issue_body=issue_body,
+        issue_updated_at="2026-07-18T00:00:00Z",
+        comment_bodies=comment_bodies,
         allowed_paths=allowed_paths,
-        base_branch="main",
+        base_ref="main",
         base_sha=base_sha,
-        target_branch=target_branch,
+        branch_ref=f"refs/heads/{target_branch}",
         worktree_path=str(repo),
-        authority_version=authority_version,
+        authority_mode=authority_mode,
     )
 
 
@@ -87,33 +103,79 @@ def test_scope_snapshot_binds_required_fields(tmp_path: Path):
     body = "## Outcome\nsomething important\n"
     allowed_paths = ["scripts/agent-guards/**", "docs/dev/hook-boundaries.md"]
     snapshot = build_issue_scope_snapshot(
+        repository_full_name="squne121/loop-protocol",
         issue_number=1611,
+        contract_source_kind=CONTRACT_SOURCE_ISSUE_BODY,
+        contract_source_id="issue-1611-body",
+        contract_source_body=body,
         issue_body=body,
+        issue_updated_at="2026-07-18T00:00:00Z",
+        comment_bodies=["comment one"],
         allowed_paths=allowed_paths,
-        base_branch="main",
+        base_ref="main",
         base_sha="a" * 40,
-        target_branch="worktree-issue-1611-x",
+        branch_ref="refs/heads/worktree-issue-1611-x",
         worktree_path=str(repo),
     )
     assert snapshot.schema_version == "ISSUE_SCOPE_SNAPSHOT_V1"
+    assert snapshot.repository_full_name == "squne121/loop-protocol"
     assert snapshot.issue_number == 1611
-    assert snapshot.body_sha256 == hashlib.sha256(body.encode("utf-8")).hexdigest()
+    assert snapshot.contract_source_kind == CONTRACT_SOURCE_ISSUE_BODY
+    assert snapshot.contract_source_id == "issue-1611-body"
+    assert snapshot.contract_source_body_sha256 == hashlib.sha256(body.encode("utf-8")).hexdigest()
+    assert snapshot.issue_body_sha256 == hashlib.sha256(body.encode("utf-8")).hexdigest()
+    assert snapshot.issue_updated_at == "2026-07-18T00:00:00Z"
+    assert snapshot.comments_digest_sha256 == compute_comments_digest_sha256(["comment one"])
     assert snapshot.allowed_paths_normalized_sha256 == compute_allowed_paths_sha256(allowed_paths)
-    assert snapshot.base_branch == "main"
+    assert snapshot.base_ref == "main"
     assert snapshot.base_sha == "a" * 40
+    assert snapshot.branch_ref == "refs/heads/worktree-issue-1611-x"
     assert snapshot.worktree_realpath == os.path.realpath(str(repo))
-    assert snapshot.protected_paths_policy_version == protected_paths_policy.POLICY_VERSION
+    assert snapshot.protected_paths_policy_sha256 == protected_paths_policy.POLICY_SHA256
+    assert snapshot.authority_mode == AUTHORITY_NEW_ONLY
 
     snapshot_dict = snapshot.to_dict()
     for required_key in (
-        "body_sha256",
+        "repository_full_name",
+        "issue_number",
+        "contract_source_kind",
+        "contract_source_id",
+        "contract_source_body_sha256",
+        "issue_body_sha256",
+        "issue_updated_at",
+        "comments_digest_sha256",
         "allowed_paths_normalized_sha256",
-        "base_branch",
+        "base_ref",
         "base_sha",
+        "branch_ref",
         "worktree_realpath",
-        "protected_paths_policy_version",
+        "protected_paths_policy_sha256",
+        "authority_mode",
     ):
         assert required_key in snapshot_dict, required_key
+
+
+def test_scope_snapshot_requires_live_github_readback():
+    """AC1: missing issue_body/issue_updated_at (i.e. no live readback
+    evidence) fails closed."""
+    import pytest
+
+    with pytest.raises(ValueError, match="github_live_readback_required"):
+        build_issue_scope_snapshot(
+            repository_full_name="squne121/loop-protocol",
+            issue_number=1611,
+            contract_source_kind=CONTRACT_SOURCE_ISSUE_BODY,
+            contract_source_id="issue-1611-body",
+            contract_source_body="body",
+            issue_body="",
+            issue_updated_at="2026-07-18T00:00:00Z",
+            comment_bodies=[],
+            allowed_paths=["scripts/agent-guards/**"],
+            base_ref="main",
+            base_sha="a" * 40,
+            branch_ref="refs/heads/topic",
+            worktree_path="/tmp/does-not-matter",
+        )
 
 
 # ─── AC2 ──────────────────────────────────────────────────────────────────
@@ -133,6 +195,7 @@ def test_explicit_pathspec_stage_commit_allowed(tmp_path: Path):
         snapshot=snapshot,
         requested_pathspecs=["scripts/agent-guards/new_file.py"],
         commit_message="feat: add new file",
+        expected_head=_head(repo),
     )
     assert result.status == "committed"
     assert result.commit_sha is not None
@@ -152,6 +215,7 @@ def test_explicit_pathspec_outside_allowed_paths_denied(tmp_path: Path):
         snapshot=snapshot,
         requested_pathspecs=["outside.py"],
         commit_message="feat: add outside file",
+        expected_head=_head(repo),
     )
     assert result.status == "denied"
     assert result.reason_code == "path_outside_allowed_paths"
@@ -181,12 +245,15 @@ def test_rename_old_and_new_path_checked(tmp_path: Path):
         snapshot=snapshot,
         requested_pathspecs=["scripts/agent-guards/old_name.py", "scripts/agent-guards/new_name.py"],
         commit_message="refactor: rename old_name to new_name",
+        expected_head=_head(repo),
     )
     assert result.status == "committed"
     rename_records = [r for r in result.classified_records if r["git_status"] == "renamed"]
     assert len(rename_records) == 1
     assert rename_records[0]["previous_path"] == "scripts/agent-guards/old_name.py"
     assert rename_records[0]["path"] == "scripts/agent-guards/new_name.py"
+    assert rename_records[0]["old_oid"] is not None
+    assert rename_records[0]["new_oid"] is not None
 
 
 def test_rename_denied_when_old_path_outside_allowed_paths(tmp_path: Path):
@@ -211,6 +278,7 @@ def test_rename_denied_when_old_path_outside_allowed_paths(tmp_path: Path):
         snapshot=snapshot,
         requested_pathspecs=["outside/old_name.py", "scripts/agent-guards/new_name.py"],
         commit_message="refactor: move old_name into scope",
+        expected_head=_head(repo),
     )
     assert result.status == "denied"
     assert result.reason_code == "path_outside_allowed_paths"
@@ -251,16 +319,22 @@ def test_deletion_type_change_submodule_classified(tmp_path: Path):
             "scripts/agent-guards/to_typechange.py",
         ],
         commit_message="chore: delete and type-change files",
+        expected_head=_head(repo),
     )
     assert result.status == "committed"
     statuses = {r["path"]: r["git_status"] for r in result.classified_records}
     assert statuses["scripts/agent-guards/to_delete.py"] == "removed"
     assert statuses["scripts/agent-guards/to_typechange.py"] == "type_changed"
+    modes = {r["path"]: (r["old_mode"], r["new_mode"]) for r in result.classified_records}
+    assert modes["scripts/agent-guards/to_delete.py"][1] == "000000"
+    assert modes["scripts/agent-guards/to_typechange.py"][1] == "120000"  # symlink mode
 
     # Submodule (gitlink, mode 160000) classification -- exercised directly
-    # against a real staged gitlink entry, since constructing a full nested
-    # submodule checkout is unnecessary to exercise mode-160000 detection.
-    from controlled_git_change_exec import _detect_gitlink_paths
+    # against a real staged gitlink entry via the shared raw oracle, since
+    # constructing a full nested submodule checkout is unnecessary to
+    # exercise mode-160000 detection.
+    from changed_file_matcher import parse_git_diff_index_raw_z
+    from controlled_git_change_exec import _diff_index_raw
 
     fake_sha = "1" * 40
     subprocess.run(
@@ -268,8 +342,13 @@ def test_deletion_type_change_submodule_classified(tmp_path: Path):
         cwd=repo,
         check=True,
     )
-    gitlink_paths = _detect_gitlink_paths(str(repo))
-    assert "scripts/agent-guards/vendored" in gitlink_paths
+    ok, raw = _diff_index_raw(str(repo), _head(repo))
+    assert ok
+    records = parse_git_diff_index_raw_z(raw, source="test")
+    gitlink_records = [r for r in records if r.path == "scripts/agent-guards/vendored"]
+    assert len(gitlink_records) == 1
+    assert gitlink_records[0].is_submodule_gitlink_change is True
+    assert gitlink_records[0].new_mode == "160000"
     subprocess.run(["git", "reset", "--quiet"], cwd=repo, check=True)
 
 
@@ -291,9 +370,22 @@ def test_special_char_paths_nul_delimited(tmp_path: Path):
         snapshot=snapshot,
         requested_pathspecs=[f"scripts/agent-guards/{special_name}"],
         commit_message="feat: add file with unicode/space/quote name",
+        expected_head=_head(repo),
     )
     assert result.status == "committed"
     assert result.staged_paths == (f"scripts/agent-guards/{special_name}",)
+
+
+def test_special_char_path_undecodable_utf8_fails_closed():
+    from changed_file_matcher import UnsupportedPathEncodingError, parse_git_diff_index_raw_z
+
+    # A path token with an invalid UTF-8 byte sequence must be rejected,
+    # never silently replaced/best-effort decoded (AC5).
+    raw = b":100644 100644 " + b"0" * 40 + b" " + b"1" * 40 + b" A\x00\xff\xfe\x00"
+    import pytest
+
+    with pytest.raises(UnsupportedPathEncodingError):
+        parse_git_diff_index_raw_z(raw, source="test")
 
 
 # ─── AC6 ──────────────────────────────────────────────────────────────────
@@ -322,6 +414,7 @@ def test_pathspec_magic_and_directory_pathspec_rejected(tmp_path: Path):
             snapshot=snapshot,
             requested_pathspecs=[bad_pathspec],
             commit_message="chore: attempt broad staging",
+            expected_head=_head(repo),
         )
         assert result.status == "denied", bad_pathspec
         assert result.reason_code in (
@@ -335,7 +428,7 @@ def test_pathspec_magic_and_directory_pathspec_rejected(tmp_path: Path):
 # ─── AC7 ──────────────────────────────────────────────────────────────────
 
 
-def test_staged_requested_mismatch_denies(tmp_path: Path):
+def test_staged_requested_mismatch_denies_and_rolls_back(tmp_path: Path):
     from controlled_git_change_exec import _staged_matches_requested
 
     assert _staged_matches_requested({"a.py", "b.py"}, {"a.py", "b.py"}) is True
@@ -347,6 +440,10 @@ def test_staged_requested_mismatch_denies(tmp_path: Path):
     _init_repo(repo)
     guards = repo / "scripts" / "agent-guards"
     guards.mkdir(parents=True)
+
+    # Pre-existing unrelated staged content: this must NOT block our own
+    # narrow stage/commit (git commit --only tolerates it) -- but it must
+    # also never get swept into our commit.
     (guards / "already_staged.py").write_text("pre-existing\n")
     subprocess.run(["git", "add", "scripts/agent-guards/already_staged.py"], cwd=repo, check=True)
 
@@ -357,16 +454,60 @@ def test_staged_requested_mismatch_denies(tmp_path: Path):
         snapshot=snapshot,
         requested_pathspecs=["scripts/agent-guards/requested.py"],
         commit_message="feat: add requested file only",
+        expected_head=_head(repo),
+    )
+    assert result.status == "committed", result
+    assert result.staged_paths == ("scripts/agent-guards/requested.py",)
+    # commit --only must not have swept in the pre-existing staged file.
+    log_show = subprocess.run(
+        ["git", "show", "--name-only", "--format=", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.split()
+    assert log_show == ["scripts/agent-guards/requested.py"]
+    # the pre-existing staged file remains staged (untouched), not lost.
+    assert "already_staged.py" in _staged_name_only(repo)
+
+
+def test_post_commit_audit_rolls_back_on_mismatch(tmp_path: Path, monkeypatch):
+    """AC7: if the post-commit re-audit disagrees with what was requested,
+    the commit is rolled back via `git reset --soft HEAD~1` and denied --
+    a successful-looking commit must never be left behind."""
+    import controlled_git_change_exec as module
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "a.py").write_text("x = 1\n")
+
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+    head_before = _head(repo)
+
+    def _fake_diff_tree_raw(cwd, commit_sha):
+        # Simulate a post-commit audit that reports an out-of-scope path,
+        # regardless of what actually got committed.
+        return True, b":100644 100644 " + b"0" * 40 + b" " + b"1" * 40 + b" A\0outside.py\0"
+
+    monkeypatch.setattr(module, "_diff_tree_raw", _fake_diff_tree_raw)
+
+    result = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/a.py"],
+        commit_message="feat: a",
+        expected_head=head_before,
     )
     assert result.status == "denied"
-    assert result.reason_code in ("index_not_clean_before_stage", "staged_requested_mismatch")
-    assert "add requested file only" not in _log(repo)
+    assert result.reason_code == "post_commit_audit_violation_rolled_back"
+    assert _head(repo) == head_before
+    assert _staged_name_only(repo) == ""
+    assert "feat: a" not in _log(repo)
 
 
 # ─── AC8 ──────────────────────────────────────────────────────────────────
 
 
-def test_stale_snapshot_and_head_race_denies(tmp_path: Path):
+def test_stale_snapshot_comment_drift_and_head_race_denies(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()
     _init_repo(repo)
@@ -374,23 +515,36 @@ def test_stale_snapshot_and_head_race_denies(tmp_path: Path):
     guards.mkdir(parents=True)
     (guards / "a.py").write_text("x\n")
 
-    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"], comment_bodies=("first",))
 
     stale_body = execute_controlled_change(
         cwd=str(repo),
         snapshot=snapshot,
         requested_pathspecs=["scripts/agent-guards/a.py"],
         commit_message="feat: x",
-        current_body_sha256="0" * 64,
+        expected_head=_head(repo),
+        current_issue_body_sha256="0" * 64,
     )
     assert stale_body.status == "denied"
     assert stale_body.reason_code == "stale_snapshot_body_drift"
+
+    stale_comment = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/a.py"],
+        commit_message="feat: x",
+        expected_head=_head(repo),
+        current_comments_digest_sha256=compute_comments_digest_sha256(("first", "a new reply")),
+    )
+    assert stale_comment.status == "denied"
+    assert stale_comment.reason_code == "stale_snapshot_comment_drift"
 
     stale_allowed = execute_controlled_change(
         cwd=str(repo),
         snapshot=snapshot,
         requested_pathspecs=["scripts/agent-guards/a.py"],
         commit_message="feat: x",
+        expected_head=_head(repo),
         current_allowed_paths_sha256="0" * 64,
     )
     assert stale_allowed.status == "denied"
@@ -407,17 +561,37 @@ def test_stale_snapshot_and_head_race_denies(tmp_path: Path):
     assert race.reason_code == "head_race_detected"
     assert _staged_name_only(repo) == ""
 
-    current_head = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
-    ).stdout.strip()
     ok_result = execute_controlled_change(
         cwd=str(repo),
         snapshot=snapshot,
         requested_pathspecs=["scripts/agent-guards/a.py"],
         commit_message="feat: x",
-        expected_head=current_head,
+        expected_head=_head(repo),
     )
     assert ok_result.status == "committed"
+
+
+def test_detached_head_unborn_branch_and_in_progress_state_denied(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "a.py").write_text("x\n")
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+
+    head = _head(repo)
+    subprocess.run(["git", "checkout", "-q", head], cwd=repo, check=True)
+    detached = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/a.py"],
+        commit_message="feat: x",
+        expected_head=head,
+    )
+    assert detached.status == "denied"
+    assert detached.reason_code == "detached_head_rejected"
+    subprocess.run(["git", "checkout", "-q", "topic"], cwd=repo, check=True)
 
 
 # ─── AC9 ──────────────────────────────────────────────────────────────────
@@ -480,20 +654,51 @@ def test_legacy_env_and_new_snapshot_not_simultaneous_authority(tmp_path: Path):
         (AUTHORITY_MIGRATION_VALIDATION, None, snapshot, AUTHORITY_SOURCE_LEGACY_ENV),
         (AUTHORITY_NEW_ONLY, None, snapshot, AUTHORITY_SOURCE_SNAPSHOT),
         (AUTHORITY_NEW_ONLY, "legacy paths here", snapshot, AUTHORITY_SOURCE_SNAPSHOT),
-        (AUTHORITY_ROLLBACK_TO_OLD, "legacy paths here", snapshot, AUTHORITY_SOURCE_LEGACY_ENV),
+        (AUTHORITY_NEW_DISABLED_FAIL_CLOSED, "legacy paths here", snapshot, AUTHORITY_SOURCE_NONE),
+        (AUTHORITY_NEW_DISABLED_FAIL_CLOSED, None, None, AUTHORITY_SOURCE_NONE),
     ]
-    for authority_version, legacy_env, snap, expected_source in combos:
+    for authority_mode, legacy_env, snap, expected_source in combos:
         resolution = resolve_authority(
-            authority_version=authority_version,
+            authority_mode=authority_mode,
             legacy_allowed_paths_env=legacy_env,
             snapshot=snap,
         )
-        assert resolution.authoritative_source == expected_source, (authority_version, legacy_env)
-        assert resolution.authoritative_source in (AUTHORITY_SOURCE_LEGACY_ENV, AUTHORITY_SOURCE_SNAPSHOT)
+        assert resolution.authoritative_source == expected_source, (authority_mode, legacy_env)
+        assert resolution.authoritative_source in (
+            AUTHORITY_SOURCE_LEGACY_ENV,
+            AUTHORITY_SOURCE_SNAPSHOT,
+            AUTHORITY_SOURCE_NONE,
+        )
 
-    unknown = resolve_authority(authority_version="not_a_real_state", legacy_allowed_paths_env=None, snapshot=None)
+    unknown = resolve_authority(authority_mode="not_a_real_state", legacy_allowed_paths_env=None, snapshot=None)
     assert unknown.authoritative_source == AUTHORITY_SOURCE_NONE
-    assert unknown.reason_code == "unknown_authority_version"
+    assert unknown.reason_code == "unknown_authority_mode"
+
+
+def test_new_disabled_fail_closed_stops_add_commit_no_auto_fallback(tmp_path: Path):
+    """AC12: `new_disabled_fail_closed` stops add/commit outright through
+    `execute_controlled_change` itself -- never silently falls back to
+    treating the legacy env as authoritative and proceeding anyway."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "a.py").write_text("x\n")
+
+    snapshot = _build_snapshot(
+        repo, allowed_paths=["scripts/agent-guards/**"], authority_mode=AUTHORITY_NEW_DISABLED_FAIL_CLOSED
+    )
+    result = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/a.py"],
+        commit_message="feat: x",
+        expected_head=_head(repo),
+    )
+    assert result.status == "denied"
+    assert result.reason_code == "authority_new_disabled_fail_closed_add_commit_stopped"
+    assert _staged_name_only(repo) == ""
 
 
 # ─── AC13 ─────────────────────────────────────────────────────────────────
@@ -505,3 +710,61 @@ def test_new_modules_compile():
     for module_name in ("controlled_git_change_exec", "changed_file_matcher", "protected_paths_policy"):
         module = importlib.import_module(module_name)
         assert module is not None
+
+
+# ─── AC14 ─────────────────────────────────────────────────────────────────
+
+
+def test_codex_execpolicy_matrix_includes_git_mutation_cases():
+    """AC14: `execpolicy_case_definitions()` includes static cases for the
+    controlled-executor-only git add/commit narrowing (Issue #1611 contract
+    revision). This asserts the case DEFINITIONS exist with the expected
+    decision/guard-pair shape -- it does not invoke a real Codex binary."""
+    import sys as _sys
+    from dataclasses import dataclass
+    from pathlib import Path as _Path
+
+    if str(_CI_DIR) not in _sys.path:
+        _sys.path.insert(0, str(_CI_DIR))
+    import codex_execpolicy_matrix as matrix_module
+
+    @dataclass(frozen=True)
+    class _FakeFixture:
+        root: _Path
+        worktree: _Path
+        branch: str
+        issue_number: str
+
+    fixture = _FakeFixture(
+        root=_Path("/tmp/fake-repo"),
+        worktree=_Path("/tmp/fake-repo/.claude/worktrees/issue-1611-x"),
+        branch="worktree-issue-1611-x",
+        issue_number="1611",
+    )
+    cases = matrix_module.execpolicy_case_definitions(fixture)
+    labels = {case["label"]: case for case in cases}
+
+    for expected_deny_label in (
+        "git_add_denied_outside_controlled_executor",
+        "git_commit_denied_outside_controlled_executor",
+        "rtk_git_add_denied_outside_controlled_executor",
+        "rtk_git_commit_denied_outside_controlled_executor",
+    ):
+        assert expected_deny_label in labels, expected_deny_label
+        case = labels[expected_deny_label]
+        assert case["expected_guard_pair"] == "deny"
+        assert "forbidden" in case["expected_execpolicy"] or "prompt" in case["expected_execpolicy"]
+
+    exact_case = labels["controlled_executor_exact_invocation_allowed"]
+    assert exact_case["expected_guard_pair"] == "allow"
+    assert exact_case["expected_execpolicy"] == ["allow"]
+    assert "controlled_git_change_exec.py" in " ".join(exact_case["argv"])
+
+    for deny_label in (
+        "controlled_executor_extra_argv_denied",
+        "controlled_executor_via_bash_lc_denied",
+        "controlled_executor_from_main_root_denied",
+        "controlled_executor_wrong_issue_worktree_denied",
+    ):
+        assert deny_label in labels, deny_label
+        assert labels[deny_label]["expected_guard_pair"] == "deny"
