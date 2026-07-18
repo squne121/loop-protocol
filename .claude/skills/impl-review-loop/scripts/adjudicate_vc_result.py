@@ -394,16 +394,27 @@ def _test_verdict_binding_error(
         return "test_verdict_artifact_missing"
     if not _is_nonempty_string(artifact.get("name")):
         return "test_verdict_artifact_name_missing"
-    artifact_sha = artifact.get("sha256")
-    if not isinstance(artifact_sha, str) or not artifact_sha.startswith("sha256:") or not _is_hex_64(artifact_sha[7:]):
-        return "test_verdict_artifact_sha256_invalid"
+    artifact_digest = artifact.get("artifact_digest")
+    if (
+        not isinstance(artifact_digest, str)
+        or not artifact_digest.startswith("sha256:")
+        or not _is_hex_64(artifact_digest[7:])
+    ):
+        return "test_verdict_artifact_digest_invalid"
     artifact_url = artifact.get("url")
     if not isinstance(artifact_url, str) or not artifact_url.startswith("https://github.com/"):
         return "test_verdict_artifact_url_invalid"
     artifact_payload = test_verdict.get("artifact_payload")
     if not isinstance(artifact_payload, dict):
         return "test_verdict_artifact_payload_missing"
-    if _sha256(_canonical_json(artifact_payload)) != artifact_sha:
+    artifact_payload_sha256 = test_verdict.get("artifact_payload_sha256")
+    if (
+        not isinstance(artifact_payload_sha256, str)
+        or not artifact_payload_sha256.startswith("sha256:")
+        or not _is_hex_64(artifact_payload_sha256[7:])
+    ):
+        return "test_verdict_artifact_payload_sha256_invalid"
+    if _sha256(_canonical_json(artifact_payload)) != artifact_payload_sha256:
         return "test_verdict_artifact_digest_mismatch"
     for key, expected in required_bindings.items():
         if artifact_payload.get(key) != expected:

@@ -150,7 +150,7 @@ TEST_VERDICT:
   check_run_id: <GitHub check run ID>
   artifact:
     name: "<artifact name>"
-    sha256: "sha256:<artifact content SHA256>"
+    artifact_digest: "sha256:<GitHub Actions artifact API digest>"
     url: "https://github.com/<owner>/<repo>/actions/runs/<run>/artifacts/<id>"
   artifact_payload:
     issue_number: <Issue番号>
@@ -160,6 +160,7 @@ TEST_VERDICT:
     diff_head_sha: "<diff summaryのhead_sha>"
     contract_body_sha256: "sha256:<live Issue body SHA>"
     command_hashes: ["sha256:<command hash>"]
+  artifact_payload_sha256: "sha256:<canonical artifact_payload JSON SHA256>"
   result: PASS | PARTIAL | FAIL
   mergeable: MERGEABLE | CONFLICTING | UNKNOWN
   merge_state_status: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
@@ -190,7 +191,7 @@ TEST_VERDICT:
 
 **`runtime_ac_results`**: contract snapshot で動作検証 VC として指定されたコマンドの詳細結果。動作検証 VC が存在しない場合は空リスト `[]`。
 
-**identity / run binding**: `schema`、producer/repository、Issue/PR 番号、3種の HEAD、contract body SHA、run ID/URL、workflow/check run、artifact identity と artifact payload digest は省略不可。`pr_review_only` を含む adjudication では、GitHub API から workflow/check/artifact を readback して artifact を保存し、全対象 AC の `command_hash`、`status: pass`、`exit_code: 0`、`fallback_detected: false`、`human_review_required: false`、`stop_condition_triggered: false` を report する。skip routing record や任意 JSON の自己申告を実行済み証跡にしてはならない。
+**identity / run binding**: `schema`、producer/repository、Issue/PR 番号、3種の HEAD、contract body SHA、run ID/URL、workflow/check run、artifact identity、`artifact.artifact_digest`、`artifact_payload_sha256` は省略不可。`artifact.artifact_digest` には GitHub Actions artifact API が返す digest を `sha256:` 付きでそのまま記録し、ローカル download ZIP の hash や `artifact_payload_sha256` を代入してはならない。`pr_review_only` を含む adjudication では、GitHub API から workflow/check/artifact を readback して artifact を保存し、全対象 AC の `command_hash`、`status: pass`、`exit_code: 0`、`fallback_detected: false`、`human_review_required: false`、`stop_condition_triggered: false` を report する。skip routing record や任意 JSON の自己申告を実行済み証跡にしてはならない。
 
 ## 出力形式
 

@@ -204,10 +204,11 @@ def _manual_test_verdict(
         "check_run_id": 15440,
         "artifact": {
             "name": "test-verdict-machine",
-            "sha256": mod._sha256(mod._canonical_json(artifact_payload)),
+            "artifact_digest": "sha256:" + "a" * 64,
             "url": "https://github.com/squne121/loop-protocol/actions/runs/1544/artifacts/1",
         },
         "artifact_payload": artifact_payload,
+        "artifact_payload_sha256": mod._sha256(mod._canonical_json(artifact_payload)),
         "result": "PASS",
         "verification_commands_pass": len(items),
         "verification_commands_fail": 0,
@@ -527,6 +528,35 @@ def test_test_verdict_v2_provenance_rejects_tampered_artifact_payload() -> None:
 
     assert result["overall_status"] == "indeterminate"
     assert result["errors"] == ["test_verdict_artifact_digest_mismatch"]
+
+
+def test_test_verdict_v2_provenance_requires_github_artifact_digest() -> None:
+    """A payload self-hash cannot substitute for Actions artifact metadata."""
+    item = _manual_vc_result(
+        "AC8",
+        command_hash="sha256:" + "8" * 64,
+        classification="skipped",
+        decision="go",
+        scope_class="pr_review_only",
+        exit_code=None,
+    )
+    snapshot = _manual_contract_snapshot([item])
+    current = _manual_current_payload([item], head_sha="head-8", reviewed_head_sha="head-8")
+    verdict = _manual_test_verdict(
+        [item], head_sha="head-8", reviewed_head_sha="head-8", diff_head_sha="head-8"
+    )
+    verdict["artifact"].pop("artifact_digest")
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=snapshot,
+        current_vc_result=current,
+        diff_summary={"changed_paths": [ADJUDICATOR_PATH], "head_sha": "head-8", "pr_number": 1544},
+        allowed_paths=[ADJUDICATOR_PATH],
+        test_verdict=verdict,
+    )
+
+    assert result["overall_status"] == "indeterminate"
+    assert result["errors"] == ["test_verdict_artifact_digest_invalid"]
 
 
 def test_per_ac_coverage_rejects_empty_pass() -> None:
