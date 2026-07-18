@@ -31,6 +31,8 @@ import re
 import shlex
 import subprocess
 import sys
+from dataclasses import dataclass
+from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -950,73 +952,325 @@ def _is_skill_runtime_executor_command(cmd: str, cwd: str, project_root: str | N
 _ISSUE_REFINEMENT_LOOP_SCRIPTS_REL = os.path.join(".claude", "skills", "issue-refinement-loop", "scripts")
 
 
-def _extract_launcher_script_operand(tokens: Sequence[str], cwd: str) -> tuple[str | None, str]:
-    """Extract the script operand actually executed by a supported launcher
-    grammar (Issue #1543), returning ``(script_operand, effective_cwd)``.
+class LauncherParseKind(Enum):
+    """Issue #1543 (OWNER REQUEST_CHANGES): tri-state launcher-grammar parse
+    result.
 
-    Supported grammars only:
-      - ``<target-script>``                       (direct exec)
-      - ``python3 [opts] <script>``                (any ``pythonX[.Y]`` name)
-      - ``uv run [opts] [--] <script>``
+    TARGET      -- a script operand was identified; the caller MUST
+                   realpath-check it against the guarded directory.
+    NOT_TARGET  -- this classifier confidently determined the command is
+                   NOT one of the launcher grammars it claims (e.g.
+                   ``python -c`` / ``-m``, combined short options embedding
+                   ``c``/``m``) and defers to existing downstream
+                   fail-closed classifiers (e.g.
+                   ``is_tmp_wrapper_or_python_c_command``).
+    UNSUPPORTED -- the launcher grammar could not be safely parsed (unknown
+                   option, missing option value, unmodeled wrapper program,
+                   or dynamic shell-expansion syntax in the resolved
+                   operand). The caller MUST treat this as blocked
+                   (fail-closed) -- it must never fall through to a
+                   default-allow path.
+    """
+
+    TARGET = auto()
+    NOT_TARGET = auto()
+    UNSUPPORTED = auto()
+
+
+@dataclass(frozen=True)
+class LauncherParse:
+    """Result of parsing a launcher command's execution-target grammar."""
+
+    kind: LauncherParseKind
+    script_operand: str | None = None
+    effective_cwd: str | None = None
+    reason: str | None = None
+
+
+# ─── uv / python launcher arity tables (Issue #1543 Blockers 1-2) ─────────────
+# Options NOT present in these tables are treated as UNSUPPORTED (fail-closed)
+# rather than guessed as boolean flags -- this is the core arity fix.
+
+_UV_GLOBAL_VALUE_FLAGS = frozenset({
+    "--directory",
+    "--cache-dir",
+    "--config-file",
+    "--python-preference",
+    "--color",
+})
+_UV_GLOBAL_BOOL_FLAGS = frozenset({
+    "--no-cache",
+    "--offline",
+    "--refresh",
+    "--isolated",
+    "--no-config",
+    "--native-tls",
+    "--no-native-tls",
+    "--no-progress",
+    "-q",
+    "--quiet",
+    "-v",
+    "--verbose",
+})
+_UV_RUN_VALUE_FLAGS = frozenset({
+    "--directory",
+    "--python",
+    "-p",
+    "--project",
+    "--package",
+    "--extra",
+    "--group",
+    "--no-group",
+    "--with",
+    "--with-requirements",
+    "--with-editable",
+    "--index",
+    "--index-url",
+    "--extra-index-url",
+    "-f",
+    "--find-links",
+    "--env-file",
+    "--config-file",
+    "--python-preference",
+    "--cache-dir",
+    "--color",
+    "--index-strategy",
+    "--resolution",
+    "--prerelease",
+    "--exclude-newer",
+    "--link-mode",
+})
+_UV_RUN_BOOL_FLAGS = frozenset({
+    "--isolated",
+    "--no-project",
+    "--no-sync",
+    "--frozen",
+    "--locked",
+    "--all-extras",
+    "--no-dev",
+    "--dev",
+    "--exact",
+    "--no-config",
+    "--offline",
+    "--refresh",
+    "--no-cache",
+    "-v",
+    "--verbose",
+    "-q",
+    "--quiet",
+    "--native-tls",
+    "--no-native-tls",
+    "--no-editable",
+    "--all-packages",
+    "--compile-bytecode",
+})
+
+_PY_VALUE_FLAGS = frozenset({"-W", "-X", "--check-hash-based-pycs"})
+_PY_BOOL_FLAGS_EXACT = frozenset({
+    "-B", "-E", "-I", "-O", "-OO", "-S", "-s", "-t", "-tt",
+    "-u", "-v", "-x", "-b", "-bb", "-d", "-q", "-3",
+})
+# -c / -m launch an inline/module target this classifier does not model;
+# defer to the existing (extended) is_tmp_wrapper_or_python_c_command check.
+_PY_UNSUPPORTED_WRAPPER_FORMS = frozenset({"-c", "-m"})
+
+# Issue #1543 High 4: a script operand containing shell-expansion syntax
+# cannot be safely resolved via literal realpath comparison because this
+# guard does not evaluate shell expansion (variables/globs). Such operands
+# are always UNSUPPORTED (fail-closed) rather than compared.
+_SHELL_EXPANSION_CHARS_RE = re.compile(r"[$*?\[]")
+
+# Issue #1543 Blocker 3: wrapper programs this classifier does not model.
+# `exec`, `time`, `timeout`, and any `env` invocation (bare or
+# path-qualified, e.g. /usr/bin/env) shift the actually-executed command
+# into a following token this classifier does not walk. A path-qualified
+# `uv` (e.g. /usr/local/bin/uv) is likewise not recognized -- only the bare
+# `uv` token is modeled below.
+_UNMODELED_WRAPPER_HEADS = frozenset({"exec", "time", "timeout"})
+
+
+def _has_shell_expansion_syntax(token: str) -> bool:
+    """True if token contains shell-expansion syntax ($ / * / ? / [) that
+    this guard cannot safely evaluate (Issue #1543 High 4)."""
+    return bool(_SHELL_EXPANSION_CHARS_RE.search(token))
+
+
+def _parse_uv_run_options(
+    toks: Sequence[str], start_idx: int, cwd: str, effective_cwd: str
+) -> tuple[int, str, "LauncherParseKind"]:
+    """Parse ``uv run`` sub-options starting at ``start_idx`` (just after
+    ``run``). Returns ``(idx, effective_cwd, kind)`` where ``kind`` is
+    TARGET (positional found at ``idx``) or UNSUPPORTED (unknown or
+    missing-value option encountered, or no positional found)."""
+    idx = start_idx
+    while idx < len(toks):
+        tok = toks[idx]
+        if tok == "--":
+            idx += 1
+            if idx < len(toks):
+                return idx, effective_cwd, LauncherParseKind.TARGET
+            return idx, effective_cwd, LauncherParseKind.UNSUPPORTED
+        if not tok.startswith("-"):
+            return idx, effective_cwd, LauncherParseKind.TARGET
+        opt_key = tok.split("=", 1)[0]
+        has_inline_value = "=" in tok
+        if opt_key == "--directory":
+            if has_inline_value:
+                value = tok.split("=", 1)[1]
+                idx += 1
+            else:
+                if idx + 1 >= len(toks):
+                    return idx, effective_cwd, LauncherParseKind.UNSUPPORTED
+                value = toks[idx + 1]
+                idx += 2
+            effective_cwd = value if os.path.isabs(value) else os.path.join(cwd, value)
+            continue
+        if opt_key in _UV_RUN_VALUE_FLAGS:
+            if has_inline_value:
+                idx += 1
+            else:
+                if idx + 1 >= len(toks) or toks[idx + 1].startswith("--"):
+                    return idx, effective_cwd, LauncherParseKind.UNSUPPORTED
+                idx += 2
+            continue
+        if opt_key in _UV_RUN_BOOL_FLAGS:
+            idx += 1
+            continue
+        return idx, effective_cwd, LauncherParseKind.UNSUPPORTED
+    return idx, effective_cwd, LauncherParseKind.UNSUPPORTED
+
+
+def _parse_python_options(toks: Sequence[str], start_idx: int) -> tuple[int, "LauncherParseKind"]:
+    """Parse python-interpreter sub-options starting at ``start_idx`` (just
+    after the interpreter token). Returns ``(idx, kind)``."""
+    idx = start_idx
+    while idx < len(toks):
+        tok = toks[idx]
+        if tok == "--":
+            idx += 1
+            if idx < len(toks):
+                return idx, LauncherParseKind.TARGET
+            return idx, LauncherParseKind.UNSUPPORTED
+        if not tok.startswith("-"):
+            return idx, LauncherParseKind.TARGET
+        if tok in _PY_UNSUPPORTED_WRAPPER_FORMS:
+            return idx, LauncherParseKind.NOT_TARGET
+        opt_key = tok.split("=", 1)[0]
+        has_inline_value = "=" in tok
+        if opt_key in _PY_VALUE_FLAGS:
+            if has_inline_value:
+                idx += 1
+            else:
+                if idx + 1 >= len(toks):
+                    return idx, LauncherParseKind.UNSUPPORTED
+                idx += 2
+            continue
+        if opt_key in _PY_BOOL_FLAGS_EXACT:
+            idx += 1
+            continue
+        if not tok.startswith("--") and len(tok) > 2:
+            # Combined short-option form (e.g. -Ic). Exact doubled flags
+            # like -tt/-bb/-OO are matched above; anything else combined may
+            # embed -c/-m and is not modeled here -- defer (Issue #1543
+            # rule 5) rather than guess.
+            return idx, LauncherParseKind.NOT_TARGET
+        return idx, LauncherParseKind.UNSUPPORTED
+    return idx, LauncherParseKind.UNSUPPORTED
+
+
+def _extract_launcher_script_operand(tokens: Sequence[str], cwd: str) -> LauncherParse:
+    """Parse a launcher command's actually-executed script operand using an
+    argv-aware, arity-correct grammar (Issue #1543 OWNER REQUEST_CHANGES).
+
+    Supported grammars:
+      - ``<target-script>``                             (direct exec)
+      - ``python3 [opts] <script>``                      (any ``pythonX[.Y]`` name; arity-correct option table)
+      - ``uv run [opts] [--] <script>``                   (arity-correct uv-run option table)
       - ``uv run [opts] [--] python3 [opts] <script>``
+      - ``uv [global-opts] run [opts] [--] <script>``     (uv global options preceding ``run``)
 
-    ``uv run --directory <dir> ...`` shifts the effective cwd used to resolve
-    a relative script operand, mirroring real `uv run` behaviour. Any other
-    launcher form this classifier does not understand -- notably
-    ``python -c`` / ``-m``, stdin execution, and unrecognized wrappers --
-    returns ``(None, cwd)`` so callers fall through to the existing
-    fail-closed classification for those forms (Issue #1543 In Scope).
+    Any other launcher shape -- ``python -c`` / ``-m``, combined short
+    options such as ``-Ic``, unknown/missing-value options, dynamic
+    shell-expansion syntax (``$``, ``${``, ``*``, ``?``, ``[``) in the
+    resolved operand, or unmodeled wrapper programs such as ``exec`` /
+    ``env`` / ``time`` / ``timeout`` / path-qualified ``uv`` -- returns
+    ``NOT_TARGET`` (defer to existing downstream fail-closed classifiers) or
+    ``UNSUPPORTED`` (the caller MUST treat this as blocked; never allow an
+    unparseable launcher shape).
     """
     toks = list(tokens)
     if not toks:
-        return None, cwd
+        return LauncherParse(LauncherParseKind.NOT_TARGET, reason="empty_command")
+
+    effective_cwd = cwd
+    head = toks[0]
+    head_base = os.path.basename(head)
+
+    if head in _UNMODELED_WRAPPER_HEADS or head_base == "env":
+        return LauncherParse(LauncherParseKind.UNSUPPORTED, reason=f"unmodeled_wrapper:{head}")
+    if head != "uv" and head_base == "uv":
+        return LauncherParse(LauncherParseKind.UNSUPPORTED, reason="path_qualified_uv_unsupported")
 
     idx = 0
-    effective_cwd = cwd
-
-    if toks[0] == "uv" and len(toks) > 1 and toks[1] == "run":
-        idx = 2
-        while idx < len(toks) and toks[idx].startswith("-"):
-            tok = toks[idx]
-            if tok == "--":
-                idx += 1
+    if head == "uv":
+        if len(toks) < 2:
+            return LauncherParse(LauncherParseKind.UNSUPPORTED, reason="uv_missing_subcommand")
+        gidx = 1
+        while gidx < len(toks):
+            tok = toks[gidx]
+            if tok == "run":
                 break
-            if tok == "--directory":
-                if idx + 1 >= len(toks):
-                    return None, cwd
-                value = toks[idx + 1]
+            opt_key = tok.split("=", 1)[0]
+            has_inline_value = "=" in tok
+            if opt_key == "--directory":
+                if has_inline_value:
+                    value = tok.split("=", 1)[1]
+                    gidx += 1
+                else:
+                    if gidx + 1 >= len(toks):
+                        return LauncherParse(LauncherParseKind.UNSUPPORTED, reason="uv_directory_missing_value")
+                    value = toks[gidx + 1]
+                    gidx += 2
                 effective_cwd = value if os.path.isabs(value) else os.path.join(cwd, value)
-                idx += 2
                 continue
-            if tok.startswith("--directory="):
-                value = tok.split("=", 1)[1]
-                effective_cwd = value if os.path.isabs(value) else os.path.join(cwd, value)
-                idx += 1
+            if opt_key in _UV_GLOBAL_VALUE_FLAGS:
+                if has_inline_value:
+                    gidx += 1
+                else:
+                    if gidx + 1 >= len(toks) or toks[gidx + 1].startswith("--"):
+                        return LauncherParse(LauncherParseKind.UNSUPPORTED, reason="uv_global_option_missing_value")
+                    gidx += 2
                 continue
-            # Unknown uv-run option: skip as a boolean-style flag. This
-            # classifier only claims the four grammars documented above --
-            # any other launcher shape falls through to existing
-            # fail-closed handling further down `evaluate()` (e.g.
-            # `looks_like_skill_runtime_executor_command`,
-            # `is_tmp_wrapper_or_python_c_command`).
-            idx += 1
-        if idx >= len(toks):
-            return None, cwd
+            if opt_key in _UV_GLOBAL_BOOL_FLAGS:
+                gidx += 1
+                continue
+            if tok.startswith("-"):
+                return LauncherParse(LauncherParseKind.UNSUPPORTED, reason=f"uv_unknown_global_option:{tok}")
+            # Non-flag, non-`run` token: a different uv subcommand (sync,
+            # pip, tool, add, ...) this classifier does not model as a
+            # script launcher. Defer to existing classification.
+            return LauncherParse(LauncherParseKind.NOT_TARGET, reason=f"uv_non_run_subcommand:{tok}")
+        if gidx >= len(toks) or toks[gidx] != "run":
+            return LauncherParse(LauncherParseKind.UNSUPPORTED, reason="uv_run_not_found")
+        run_idx, effective_cwd, kind = _parse_uv_run_options(toks, gidx + 1, cwd, effective_cwd)
+        if kind is not LauncherParseKind.TARGET:
+            return LauncherParse(kind, reason="uv_run_option_parse_failed")
+        idx = run_idx
 
     if idx < len(toks) and re.fullmatch(r"python[0-9.]*", os.path.basename(toks[idx])):
-        idx += 1
-        while idx < len(toks) and toks[idx].startswith("-"):
-            opt = toks[idx]
-            if opt in ("-c", "-m"):
-                # Unsupported wrapper form (Issue #1543 In Scope) -- defer to
-                # existing fail-closed classification.
-                return None, cwd
-            idx += 1
-        if idx >= len(toks):
-            return None, cwd
-        return toks[idx], effective_cwd
+        py_idx, kind = _parse_python_options(toks, idx + 1)
+        if kind is not LauncherParseKind.TARGET:
+            return LauncherParse(kind, reason="python_option_parse_failed")
+        idx = py_idx
 
-    return toks[idx], effective_cwd
+    if idx >= len(toks):
+        return LauncherParse(LauncherParseKind.UNSUPPORTED, reason="missing_script_operand")
+
+    script_operand = toks[idx]
+    if _has_shell_expansion_syntax(script_operand):
+        return LauncherParse(LauncherParseKind.UNSUPPORTED, reason="shell_expansion_syntax_in_operand")
+
+    return LauncherParse(LauncherParseKind.TARGET, script_operand=script_operand, effective_cwd=effective_cwd)
 
 
 def _looks_like_direct_issue_refinement_runtime_command(
@@ -1025,7 +1279,11 @@ def _looks_like_direct_issue_refinement_runtime_command(
     """Argv-aware classifier (Issue #1543): True iff `tokens` actually launches
     a script under `.claude/skills/issue-refinement-loop/scripts/` as its
     execution target -- not merely mentions the path substring somewhere in
-    an unrelated argument value (e.g. an `--allowed-paths` JSON array).
+    an unrelated argument value (e.g. an `--allowed-paths` JSON array) -- OR
+    the launcher grammar could not be safely parsed (UNSUPPORTED), in which
+    case this classifier fails closed and blocks rather than falling through
+    to a default-allow path (OWNER REQUEST_CHANGES, Issue #1543 Blockers
+    1-4 / High 4).
 
     Path identity is compared via realpath normalization so `./` relative
     forms, absolute forms, and symlink-mediated indirection all resolve to
@@ -1038,7 +1296,21 @@ def _looks_like_direct_issue_refinement_runtime_command(
     if not project_root:
         return False
 
-    script_operand, effective_cwd = _extract_launcher_script_operand(tokens, cwd)
+    parsed = _extract_launcher_script_operand(tokens, cwd)
+
+    if parsed.kind is LauncherParseKind.UNSUPPORTED:
+        # Fail-closed: an unparseable launcher shape must never be treated
+        # as safe-to-allow. This rule blocks it directly rather than letting
+        # it fall through to a downstream default-allow path.
+        return True
+    if parsed.kind is LauncherParseKind.NOT_TARGET:
+        # Confidently not one of the grammars this classifier claims (e.g.
+        # python -c/-m, combined short options). Defer to downstream
+        # fail-closed classifiers (e.g. is_tmp_wrapper_or_python_c_command).
+        return False
+
+    script_operand = parsed.script_operand
+    effective_cwd = parsed.effective_cwd or cwd
     if not script_operand:
         return False
     # skill_runtime_exec.py invocations are governed by the exact allow/deny
@@ -1329,15 +1601,29 @@ def is_gh_mutation_command(cmd: str) -> bool:
     return True
 
 
+_PY_C_OR_M_TOKEN_RE = re.compile(r"^-[A-Za-z]*[cm][A-Za-z]*$")
+
+
 def is_tmp_wrapper_or_python_c_command(cmd: str) -> bool:
-    """Return True if command is /tmp wrapper or python -c (fail-closed, AC14)."""
+    """Return True if command is /tmp wrapper or python -c/-m (fail-closed,
+    AC14; extended by Issue #1543 rule 5 to also catch -m and combined short
+    options embedding c/m such as -Ic, which the launcher-grammar classifier
+    defers here via LauncherParseKind.NOT_TARGET)."""
     cmd = cmd.strip()
     tokens = tokenize_command(cmd)
     if not tokens:
         return False
-    # Block: python -c / python3 -c (inline code)
-    if tokens[0] in ("python", "python3") and "-c" in tokens[1:]:
-        return True
+    # Block: python[X.Y] -c / -m / combined short option embedding c or m
+    # (inline code / module execution), as a LEADING option only.
+    head_base = os.path.basename(tokens[0])
+    if re.fullmatch(r"python[0-9.]*", head_base):
+        for tok in tokens[1:]:
+            if tok == "--" or not tok.startswith("-"):
+                break
+            if tok in ("-c", "-m"):
+                return True
+            if not tok.startswith("--") and len(tok) > 1 and _PY_C_OR_M_TOKEN_RE.match(tok):
+                return True
     # Block: uv run python3 /tmp/*.py
     if len(tokens) >= 4 and tokens[:3] == ["uv", "run", "python3"] and tokens[3].startswith("/tmp/"):
         return True

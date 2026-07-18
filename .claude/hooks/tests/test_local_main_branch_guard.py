@@ -35,6 +35,7 @@ from local_main_branch_guard import (  # noqa: E402
     is_readonly_command,
     is_branch_safe_maintenance_command,
     is_compound_or_wrapped,
+    is_tmp_wrapper_or_python_c_command,
     _has_leading_env_assignment,
     _normalize_git_global_opts,
     _is_allowed_when_drifted,
@@ -2388,5 +2389,170 @@ class TestIssue1543ArgvAwareIssueRefinementClassifier:
             "  \".claude/skills/issue-refinement-loop/scripts/build_loop_state.py\"\n]'"
         )
         result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["rule_id"] != "issue_refinement_direct"
+
+
+class TestIssue1543OwnerRequestChangesLauncherGrammarArity:
+    """Issue #1543 OWNER REQUEST_CHANGES (PR #1558 review, reviewed_head_sha
+    0dea96cab7635e0b45eb4c959f6bbadced0670b5): the launcher grammar parser
+    must be arity-aware for uv/python options, must fail closed (never
+    allow) for unmodeled wrapper forms and shell-expansion syntax, and must
+    delegate python -c/-m/combined-short-option forms to the existing
+    is_tmp_wrapper_or_python_c_command fail-closed classifier rather than
+    guessing."""
+
+    ISSUE_REFINEMENT_SCRIPT = ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py"
+    ISSUE_REFINEMENT_ARGS = "--issue-number 985 --repo squne121/loop-protocol"
+
+    # ── Blocker 1: uv value-taking options must not be misread as the
+    #    execution target (false-negative), and must not swallow an
+    #    unrelated script as their own value (false-positive). ──────────────
+
+    def test_uv_run_python_long_flag_with_value_still_blocks(self, tmp_git_repo: Path):
+        """`uv run --python 3.13 <script>` must not misread '3.13' as the
+        script operand -- the real target script must still be blocked."""
+        cmd = f"uv run --python 3.13 {self.ISSUE_REFINEMENT_SCRIPT} {self.ISSUE_REFINEMENT_ARGS}"
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["rule_id"] == "issue_refinement_direct"
+
+    def test_uv_run_python_short_flag_with_value_still_blocks(self, tmp_git_repo: Path):
+        """`uv run -p 3.13 <script>` (short form) must still block."""
+        cmd = f"uv run -p 3.13 {self.ISSUE_REFINEMENT_SCRIPT} {self.ISSUE_REFINEMENT_ARGS}"
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["rule_id"] == "issue_refinement_direct"
+
+    def test_uv_run_project_flag_value_not_misread_as_unrelated_script(self, tmp_git_repo: Path):
+        """`uv run --project <dir> <unrelated-script>` must allow -- the
+        --project VALUE must not be misread as the executed script."""
+        cmd = f"uv run --project {tmp_git_repo} scripts/agent-ops/git_worktree_probe.py --json"
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["rule_id"] != "issue_refinement_direct"
+
+    def test_uv_global_directory_option_before_run_still_blocks(self, tmp_git_repo: Path):
+        """`uv --directory <dir> run <script>` (uv GLOBAL option form, before
+        the `run` subcommand) must still resolve and block the real
+        target."""
+        cmd = f"uv --directory {tmp_git_repo} run {self.ISSUE_REFINEMENT_SCRIPT} {self.ISSUE_REFINEMENT_ARGS}"
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["rule_id"] == "issue_refinement_direct"
+
+    # ── Blocker 2: python value-taking options must not be misread as the
+    #    script operand, and -m must properly fail closed. ─────────────────
+
+    def test_python_dash_w_value_flag_still_blocks(self, tmp_git_repo: Path):
+        """`python3 -W ignore <script>` must not misread 'ignore' as the
+        script operand."""
+        cmd = f"python3 -W ignore {self.ISSUE_REFINEMENT_SCRIPT} {self.ISSUE_REFINEMENT_ARGS}"
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["rule_id"] == "issue_refinement_direct"
+
+    def test_python_dash_x_value_flag_still_blocks(self, tmp_git_repo: Path):
+        """`python3 -X dev <script>` must not misread 'dev' as the script
+        operand."""
+        cmd = f"python3 -X dev {self.ISSUE_REFINEMENT_SCRIPT} {self.ISSUE_REFINEMENT_ARGS}"
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["rule_id"] == "issue_refinement_direct"
+
+    def test_python_check_hash_based_pycs_value_flag_still_blocks(self, tmp_git_repo: Path):
+        """`python3 --check-hash-based-pycs always <script>` must not misread
+        'always' as the script operand."""
+        cmd = f"python3 --check-hash-based-pycs always {self.ISSUE_REFINEMENT_SCRIPT} {self.ISSUE_REFINEMENT_ARGS}"
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["rule_id"] == "issue_refinement_direct"
+
+    def test_python_dash_m_module_form_blocks_via_delegated_fail_closed(self, tmp_git_repo: Path):
+        """`python3 -m cProfile <script>` (module-execution form) must still
+        block, delegated to the existing (extended)
+        is_tmp_wrapper_or_python_c_command fail-closed classifier rather
+        than the issue_refinement_direct rule (Issue #1543 rule 5)."""
+        cmd = f"python3 -m cProfile {self.ISSUE_REFINEMENT_SCRIPT} {self.ISSUE_REFINEMENT_ARGS}"
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert is_tmp_wrapper_or_python_c_command(cmd) is True
+        assert result["rule_id"] != "issue_refinement_direct"
+
+    def test_python_combined_short_option_with_c_delegates_to_existing_fail_closed(self, tmp_git_repo: Path):
+        """`python3 -Ic '...'` (combined short option embedding -c) must be
+        delegated to the existing python -c fail-closed classification, not
+        claimed by issue_refinement_direct."""
+        cmd = "python3 -Ic 'import os'"
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert is_tmp_wrapper_or_python_c_command(cmd) is True
+        assert result["rule_id"] != "issue_refinement_direct"
+
+    # ── Blocker 3: unmodeled wrapper forms must fail closed, not silently
+    #    allow the target script through an unrecognized prefix. ───────────
+
+    def test_exec_wrapper_prefix_still_blocks(self, tmp_git_repo: Path):
+        """`exec python3 <script>` must fail closed (block), not silently
+        allow the target script through the unmodeled `exec` wrapper."""
+        cmd = f"exec python3 {self.ISSUE_REFINEMENT_SCRIPT} {self.ISSUE_REFINEMENT_ARGS}"
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_usr_bin_env_python_wrapper_still_blocks(self, tmp_git_repo: Path):
+        """`/usr/bin/env python3 <script>` must fail closed (block), not
+        silently allow the target script through the unmodeled
+        path-qualified `env` wrapper."""
+        cmd = f"/usr/bin/env python3 {self.ISSUE_REFINEMENT_SCRIPT} {self.ISSUE_REFINEMENT_ARGS}"
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_path_qualified_uv_still_blocks(self, tmp_git_repo: Path):
+        """A path-qualified `uv` (e.g. /usr/local/bin/uv) is not recognized
+        by the launcher grammar and must fail closed (block), not silently
+        allow the target script."""
+        cmd = f"/usr/local/bin/uv run {self.ISSUE_REFINEMENT_SCRIPT} {self.ISSUE_REFINEMENT_ARGS}"
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    # ── High 4: dynamic shell-expansion syntax in the resolved script
+    #    operand cannot be safely evaluated and must fail closed. ──────────
+
+    def test_dollar_variable_expansion_in_operand_still_blocks(self, tmp_git_repo: Path):
+        """`python3 "$PWD/<script>"` -- the guard does not evaluate shell
+        variable expansion, so the literal '$PWD/...' operand must fail
+        closed (block), never be silently allowed."""
+        cmd = f'python3 "$PWD/{self.ISSUE_REFINEMENT_SCRIPT}"'
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_glob_expansion_in_operand_still_blocks(self, tmp_git_repo: Path):
+        """`python3 .claude/skills/issue-refinement-*/scripts/<script>` --
+        the guard does not evaluate glob expansion, so the literal
+        wildcard-containing operand must fail closed (block)."""
+        cmd = (
+            "python3 .claude/skills/issue-refinement-*/scripts/run_refinement_preflight.py "
+            f"{self.ISSUE_REFINEMENT_ARGS}"
+        )
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    # ── Regression: existing supported grammars remain unaffected. ─────────
+
+    @pytest.mark.parametrize("hook_flavor", ["claude", "codex"])
+    def test_direct_target_still_blocks_across_flavors(self, tmp_git_repo: Path, hook_flavor: str):
+        """Non-regression: the plain `python3 <script>` direct-execution
+        form must still block under both Claude and Codex hook flavors."""
+        cmd = f"python3 {self.ISSUE_REFINEMENT_SCRIPT} {self.ISSUE_REFINEMENT_ARGS}"
+        result = eval_in_local_root(cmd, str(tmp_git_repo), hook_flavor=hook_flavor)
+        assert result["status"] == "block"
+        assert result["rule_id"] == "issue_refinement_direct"
+
+    @pytest.mark.parametrize("hook_flavor", ["claude", "codex"])
+    def test_unrelated_project_flag_value_still_allows_across_flavors(self, tmp_git_repo: Path, hook_flavor: str):
+        """Non-regression parity: `uv run --project <dir> <unrelated-script>`
+        must allow under both Claude and Codex hook flavors."""
+        cmd = f"uv run --project {tmp_git_repo} scripts/agent-ops/git_worktree_probe.py --json"
+        result = eval_in_local_root(cmd, str(tmp_git_repo), hook_flavor=hook_flavor)
         assert result["status"] == "allow"
         assert result["rule_id"] != "issue_refinement_direct"
