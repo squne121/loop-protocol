@@ -41,9 +41,12 @@ if str(_AGENT_GUARDS_DIR) not in sys.path:
     sys.path.insert(0, str(_AGENT_GUARDS_DIR))
 
 from skill_runtime_command_policy import (  # noqa: E402
+    SCOPE_ROLLUP_RUN_REASON_CODE,
     SKILL_RUNTIME_REASON_CODE,
     is_exact_skill_runtime_anchor_executor_command,
     is_exact_skill_runtime_executor_command,
+    is_scope_rollup_run_command,
+    looks_like_scope_rollup_run_command,
     looks_like_skill_runtime_executor_command,
 )
 from git_mutation_command_policy import (  # noqa: E402
@@ -78,6 +81,9 @@ REASON_GITHUB_REMOTE_OPS = "github_remote_ops_command"
 REASON_GH_MUTATION = "gh_mutation_denied"
 REASON_WORKTREE_BOOTSTRAP_EXECUTOR = "worktree_bootstrap_executor_command"
 REASON_SKILL_RUNTIME_EXECUTOR = SKILL_RUNTIME_REASON_CODE
+# Issue #1547: exact scope_rollup.run executor (run_scope_rollup_preflight.py,
+# NOT skill_runtime_exec.py -- see skill_runtime_command_policy.py).
+REASON_SCOPE_ROLLUP_RUN_EXECUTOR = SCOPE_ROLLUP_RUN_REASON_CODE
 # Issue #1137: exact cleanup commands (git worktree remove / git branch -d) are
 # arbitrated by worktree_scope_guard against the V3 one-shot contract. The local
 # root branch guard explicitly DEFERS authority to that guard so the two guards
@@ -2298,6 +2304,33 @@ def evaluate(
             local_parser_stage="skill_runtime_like_block",
             local_command_kind=COMMAND_KIND_UNKNOWN,
             local_rule_id="skill_runtime_guess",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
+        )
+    # Issue #1547: exact scope_rollup.run executor -- independent command
+    # class bound to run_scope_rollup_preflight.py (not skill_runtime_exec.py).
+    # Always runs at canonical root before any issue worktree is created.
+    if project_root and is_scope_rollup_run_command(normalized_cmd, cwd, project_root):
+        return _emit(
+            status="allow",
+            reason_code=REASON_SCOPE_ROLLUP_RUN_EXECUTOR,
+            target_branch=None,
+            target_branch_kind=None,
+            local_parser_stage="scope_rollup_run_exec",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="scope_rollup_run_executor",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
+        )
+    if looks_like_scope_rollup_run_command(normalized_cmd):
+        return _emit(
+            status="block",
+            reason_code=REASON_UNPARSEABLE,
+            target_branch=None,
+            target_branch_kind=None,
+            local_parser_stage="scope_rollup_run_like_block",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="scope_rollup_run_guess",
             argv_tokens=argv_redacted,
             inner_tokens=inner_argv_redacted,
         )
