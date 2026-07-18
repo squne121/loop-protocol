@@ -661,18 +661,21 @@ class TestAC10AC11UploadedArtifactBinding:
         assert "ref: ${{ github.event.pull_request.head.sha || github.sha }}" in checkout_block
         assert 'test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"' in verdict_job
 
-    def test_ci_verdict_job_uses_configured_python_without_uv(self):
+    def test_ci_verdict_job_uses_locked_uv_python_runner(self):
         workflow = _WORKFLOW.read_text()
         verdict_job = workflow[workflow.index("  ci-verdict-summary:"):]
 
-        setup_python = verdict_job.index("uses: actions/setup-python@v5")
+        setup_uv = verdict_job.index("uses: ./.github/actions/setup-python-uv")
         generator = verdict_job.index("Generate ci_verdict_summary_v2 artifact")
         summary = verdict_job.index("Output ci_verdict_summary_v2 Step Summary")
-        producer = "python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py"
+        producer = (
+            "uv run --locked python3 "
+            ".claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py"
+        )
 
-        assert setup_python < generator < summary
+        assert setup_uv < generator < summary
         assert verdict_job.count(producer) == 2
-        assert "uv run --locked python3" not in verdict_job
+        assert "\n          python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py" not in verdict_job
 
     def test_summary_input_renders_existing_payload_without_regeneration(self, v2, tmp_path, monkeypatch):
         payload = {"schema": "ci_verdict_summary_v2", "schema_version": 2,

@@ -1753,10 +1753,8 @@ jobs:
           # pull_request の既定 checkout は merge commit になるため、verdict の
           # current-head contract には PR head を明示して checkout する。
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - name: Set up locked Python runner
+        uses: ./.github/actions/setup-python-uv
       - name: Generate ci_verdict_summary_v2 binding input
         env:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -1810,10 +1808,7 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"
           mkdir -p ci_verdict_summary_v2_artifacts
-          # This job installs the exact Python runtime above and the verdict
-          # producer uses only the standard library. Invoke that runner-owned
-          # interpreter directly: uv is intentionally not assumed available.
-          python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
+          uv run --locked python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
             --expected-head-sha "$PR_HEAD_SHA" \
             --pr-head-sha "$PR_HEAD_SHA" \
             --repository "${{ github.repository }}" \
@@ -1841,5 +1836,5 @@ jobs:
         # Render the exact uploaded payload; never regenerate it after upload.
         if: ${{ !cancelled() }}
         run: |
-          python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
+          uv run --locked python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
             --summary-input ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json
