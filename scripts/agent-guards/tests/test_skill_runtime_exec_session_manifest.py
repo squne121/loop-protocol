@@ -67,6 +67,14 @@ def test_external_session_manifest_peer_write_does_not_stop_preflight(tmp_path: 
     env = os.environ.copy()
     env.pop("CODEX_HOOK_MANIFEST_ROOT", None)
     env["XDG_STATE_HOME"] = str(tmp_path / "state")
+    # Issue #1546 CI fix_delta (PR #1586): the python-test CI job runs this
+    # test without a pnpm install step, so scripts/generate-session-manifest.mjs
+    # --validate (which loads ajv/ajv-formats) is unavailable there for a
+    # reason unrelated to this AC. AC3 verifies that the external manifest
+    # write is invisible to the executor's repo-tree diff, not the
+    # producer's own JSON schema validation, so requesting --no-validate via
+    # this test-only override does not weaken what AC3 proves.
+    env["CODEX_SESSION_RECORDING_SKIP_VALIDATE"] = "1"
 
     result = _run_stop_hook(env)
     assert result.returncode == 0, result.stderr
