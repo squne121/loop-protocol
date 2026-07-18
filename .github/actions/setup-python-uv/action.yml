@@ -1,14 +1,11 @@
 name: Setup Python with uv
 description: |
   astral-sh/setup-uv を使って uv をセットアップする Composite Action。
-  checkout 後に呼び出す。uv バージョンの canonical source は
-  pyproject.toml の [tool.uv].required-version（Issue #1598 で決定）。
+  checkout 後に呼び出す。uv バージョン pin は #375 で管理。
   cache policy は setup-uv のデフォルト（enable-cache: auto）を採用。
   uv python install / uv sync は workflow 側 timed step に残す。
 
 runs:
   using: composite
   steps:
-    - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
-      with:
-        version: "0.11.23"
+    - uses: astral-sh/setup-uv@v8.1.0
