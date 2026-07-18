@@ -14,6 +14,7 @@ from typing import Any
 
 SCHEMA_NAME = "VC_ADJUDICATION_RESULT_V1"
 SCHEMA_VERSION = 1
+TEST_VERDICT_SCHEMA = "TEST_VERDICT_MACHINE/v2"
 PRIVATE_BUNDLE_SCHEMA = "VC_ADJUDICATION_PRIVATE_BUNDLE_V1"
 PRIVATE_ARTIFACT_REF = "vc-adjudication-private-bundle"
 STATUS_PRIORITY = {
@@ -359,7 +360,7 @@ def _test_verdict_binding_error(
         "diff_head_sha": expected_diff_head,
         "contract_body_sha256": expected_contract_sha,
     }
-    if test_verdict.get("schema") != "TEST_VERDICT_MACHINE/v1":
+    if test_verdict.get("schema") != TEST_VERDICT_SCHEMA:
         return "test_verdict_schema_mismatch"
     for key, expected in required_bindings.items():
         if expected is None or test_verdict.get(key) != expected:
@@ -375,6 +376,51 @@ def _test_verdict_binding_error(
         return "test_verdict_fail_count_nonzero"
     if test_verdict.get("verification_skipped_count") != 0:
         return "test_verdict_skip_count_nonzero"
+
+    # A v2 verdict is only usable when it identifies the producer and the
+    # GitHub Actions artifact that was read back.  The artifact payload is
+    # bound to the digest recorded by that readback, so a copied or partial
+    # summary cannot stand in for current-head execution evidence.
+    if test_verdict.get("producer_kind") != "test-runner":
+        return "test_verdict_producer_kind_mismatch"
+    if not _is_nonempty_string(test_verdict.get("repository")):
+        return "test_verdict_repository_missing"
+    for key in ("workflow_run_id", "workflow_run_attempt", "check_run_id"):
+        value = test_verdict.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return f"test_verdict_{key}_invalid"
+    artifact = test_verdict.get("artifact")
+    if not isinstance(artifact, dict):
+        return "test_verdict_artifact_missing"
+    if not _is_nonempty_string(artifact.get("name")):
+        return "test_verdict_artifact_name_missing"
+    artifact_digest = artifact.get("artifact_digest")
+    if (
+        not isinstance(artifact_digest, str)
+        or not artifact_digest.startswith("sha256:")
+        or not _is_hex_64(artifact_digest[7:])
+    ):
+        return "test_verdict_artifact_digest_invalid"
+    artifact_url = artifact.get("url")
+    if not isinstance(artifact_url, str) or not artifact_url.startswith("https://github.com/"):
+        return "test_verdict_artifact_url_invalid"
+    artifact_payload = test_verdict.get("artifact_payload")
+    if not isinstance(artifact_payload, dict):
+        return "test_verdict_artifact_payload_missing"
+    artifact_payload_sha256 = test_verdict.get("artifact_payload_sha256")
+    if (
+        not isinstance(artifact_payload_sha256, str)
+        or not artifact_payload_sha256.startswith("sha256:")
+        or not _is_hex_64(artifact_payload_sha256[7:])
+    ):
+        return "test_verdict_artifact_payload_sha256_invalid"
+    if _sha256(_canonical_json(artifact_payload)) != artifact_payload_sha256:
+        return "test_verdict_artifact_digest_mismatch"
+    for key, expected in required_bindings.items():
+        if artifact_payload.get(key) != expected:
+            return f"test_verdict_artifact_{key}_mismatch"
+    if artifact_payload.get("command_hashes") != sorted(command_hash for _, command_hash in expected_keys):
+        return "test_verdict_artifact_command_hashes_mismatch"
 
     raw_results = test_verdict.get("runtime_ac_results")
     if not isinstance(raw_results, list):
@@ -599,6 +645,11 @@ def _result(
     stdout_truncated: bool = False,
     omitted_fields: list[str] | None = None,
 ) -> dict[str, Any]:
+    result_errors = errors or []
+    if overall_status == "pass" and not per_ac:
+        overall_status = "indeterminate"
+        rerun_required = True
+        result_errors = [*result_errors, "pass_requires_per_ac_coverage"]
     return {
         "schema": SCHEMA_NAME,
         "schema_version": SCHEMA_VERSION,
@@ -612,7 +663,7 @@ def _result(
         "per_ac": per_ac,
         "evidence_refs": evidence_refs,
         "source_integrity": source_integrity,
-        "errors": errors or [],
+        "errors": result_errors,
         "artifact_ref": artifact_ref,
         "artifact_digest": artifact_digest,
         "stdout_truncated": stdout_truncated,
@@ -878,8 +929,20 @@ def adjudicate_vc_result(
                 errors=["baseline_current_mapping_mismatch"],
             )
         if excluded_current_count and current_pass_certified:
+            per_ac = [
+                {
+                    "ac": ac,
+                    "status": "pass",
+                    "blocking": False,
+                    "command_hash": command_hash,
+                    "failure_keys": [],
+                    "reason_code": "pr_review_only_runtime_evidence_pass",
+                    "summary": "Producer-authorized skip is covered by v2 runtime evidence",
+                }
+                for ac, command_hash in sorted(excluded_pr_review_only_keys)
+            ]
             return _result(
-                overall_status="pass", per_ac=[], rerun_required=False,
+                overall_status="pass", per_ac=per_ac, rerun_required=False,
                 source_integrity=source_integrity, evidence_refs=evidence_refs,
                 errors=[],
             )
