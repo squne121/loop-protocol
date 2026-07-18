@@ -739,7 +739,6 @@ def _human_c1_comment(
 
 
 def _collision_candidate(number: int = 9771) -> dict:
-    current = json.loads((FIXTURES_DIR / "current_1451_analog.json").read_text(encoding="utf-8"))
     return {
         "number": number,
         "title": "same schema collision",
@@ -820,11 +819,25 @@ def test_human_c1_decision_accepts_exact_owner_or_collaborator(
     "mutation",
     [
         lambda current, candidate, comment: comment.update({"authorAssociation": "MEMBER"}),
-        lambda current, candidate, comment: comment.update({"url": "https://github.com/squne121/loop-protocol/issues/9999#issuecomment-9000000001"}),
-        lambda current, candidate, comment: comment.update({"body": comment["body"].replace("C1/non-conflict", "C2a")}),
-        lambda current, candidate, comment: comment.update({"body": comment["body"].replace(str(candidate["number"]), "9998", 1)}),
-        lambda current, candidate, comment: comment.update({"body": comment["body"].replace("sha256:", "sha256:bad", 1)}),
-        lambda current, candidate, comment: comment.update({"body": comment["body"].replace(current["updatedAt"], "2020-01-01T00:00:00Z")}),
+        lambda current, candidate, comment: comment.update(
+            {"url": "https://github.com/squne121/loop-protocol/issues/9999#issuecomment-9000000001"}
+        ),
+        lambda current, candidate, comment: comment.update(
+            {"body": comment["body"].replace("C1/non-conflict", "C2a")}
+        ),
+        lambda current, candidate, comment: comment.update(
+            {"body": comment["body"].replace(str(candidate["number"]), "9998", 1)}
+        ),
+        lambda current, candidate, comment: comment.update(
+            {"body": comment["body"].replace("sha256:", "sha256:bad", 1)}
+        ),
+        lambda current, candidate, comment: comment.update(
+            {
+                "body": comment["body"].replace(
+                    current["updatedAt"], "2020-01-01T00:00:00Z"
+                )
+            }
+        ),
     ],
     ids=["author", "url", "decision", "candidate", "sha", "updated_at"],
 )
