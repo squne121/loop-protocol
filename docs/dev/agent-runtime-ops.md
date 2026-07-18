@@ -268,7 +268,7 @@ Codex write hook 層でのみ強制される）。`.claude/settings.json` の de
 を維持する必要がある。protected path は Issue の Allowed Paths に明示されていても常に deny される
 -- Allowed Paths は protected path へのアクセスを決して広げない。
 
-## Controlled Stage/Commit Executor（Issue #1611、契約改訂）
+## Controlled Stage/Commit Executor（統制済み stage/commit 実行機構、Issue #1611 の契約改訂で追加）
 
 `scripts/agent-guards/controlled_git_change_exec.py` は、agent 駆動の git staging/commit を単一
 transaction として所有する controlled executor である。`rtk git add` / `rtk git commit` / raw
@@ -331,7 +331,7 @@ fail-closed で `ValueError` になる）:
 commit hook（pre-commit/prepare-commit-msg/commit-msg）は `git commit --only` の通常の実行経路に
 従い、実行される（暗黙のスキップはしない）。
 
-### env sanitization（P1-1）
+### 環境変数の除去（env sanitization、P1-1）
 
 子プロセスへ渡す環境から `GIT_DIR` / `GIT_COMMON_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` /
 `GIT_OBJECT_DIRECTORY` / `GIT_ALTERNATE_OBJECT_DIRECTORIES` / `GIT_CONFIG_SYSTEM` /
