@@ -386,7 +386,8 @@ def _test_verdict_binding_error(
     if not _is_nonempty_string(test_verdict.get("repository")):
         return "test_verdict_repository_missing"
     for key in ("workflow_run_id", "workflow_run_attempt", "check_run_id"):
-        if isinstance(test_verdict.get(key), bool) or not isinstance(test_verdict.get(key), int) or test_verdict[key] <= 0:
+        value = test_verdict.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             return f"test_verdict_{key}_invalid"
     artifact = test_verdict.get("artifact")
     if not isinstance(artifact, dict):
