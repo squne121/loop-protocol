@@ -455,7 +455,11 @@ def _run_emit_v2_cli(
 
 
 def _run_state_write_v2_cli(
-    *, validation_result_v2: dict[str, Any], tmp_path: Path, refinement_session_id: str, issue_number: int = ISSUE_NUMBER
+    *,
+    validation_result_v2: dict[str, Any],
+    tmp_path: Path,
+    refinement_session_id: str,
+    issue_number: int = ISSUE_NUMBER,
 ) -> tuple[int, dict[str, Any]]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     state_dir = tmp_path / "state"
