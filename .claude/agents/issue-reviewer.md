@@ -84,7 +84,7 @@ uv run python3 .claude/skills/issue-refinement-loop/scripts/compact_review_resul
 
 `VERDICT: needs-fix` の場合、本 SubAgent は `reviewer_claim_replay.py` を実行しない。Step 2a の arbitration（taxonomy 判定・routing 決定）は完全に orchestrator（parent）の責務であり、本 SubAgent はその入力となる **bounded な reviewer claim** のみを返す。
 
-`compact_review_result.py` が needs-fix 判定時に stdout へ追記する `REVIEWER_BLOCKER_CLAIM` フィールドは、本 SubAgent が独自に組み立てるものではなく、決定論的スクリプト（`compact_review_result.py`）が `raw_result.blocking_issues` から機械的に構成する:
+`compact_review_result.py` が needs-fix 判定時に stdout へ追記する `REVIEWER_BLOCKER_CLAIM` フィールドは、本 SubAgent が独自に組み立てるものではなく、決定論的スクリプト（`compact_review_result.py`）が機械的に構成する（Issue #1554）: `raw_result.structured_blockers` が非空の場合は structured_blockers の code / message を優先して使用し（code フィールド・message フィールド）、`structured_blockers` が空配列の場合のみ `blocking_issues`（人間可読 prose）へフォールバックする。
 
 ```text
 REVIEWER_BLOCKER_CLAIM: {"schema":"REVIEWER_BLOCKER_CLAIM_V1","body_sha256":"sha256:<hex>","blockers":[{"reviewer_blocker_code":"<code>","message":"<msg>|null","line_start":<int>|null,"line_end":<int>|null}]}
