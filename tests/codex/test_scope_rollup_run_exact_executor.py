@@ -39,7 +39,8 @@ from skill_runtime_command_policy import SCOPE_ROLLUP_RUN_REASON_CODE  # noqa: E
 
 SCOPE_ROLLUP_RUN_CMD = (
     "uv run python3 scripts/agent-guards/run_scope_rollup_preflight.py "
-    "--issue-number 1547 --repo squne121/loop-protocol"
+    "--issue-number 1547 --repo squne121/loop-protocol "
+    "--invocation-id 20260713T100000Z_123 --requested-at 2026-07-13T10:00:00Z"
 )
 
 
@@ -166,6 +167,23 @@ UNSAFE_VARIANTS = [
     (
         "near_miss_script_path",
         "uv run python3 /tmp/run_scope_rollup_preflight.py --issue-number 1547 --repo squne121/loop-protocol",
+    ),
+    (
+        "missing_invocation_id_and_requested_at",
+        "uv run python3 scripts/agent-guards/run_scope_rollup_preflight.py "
+        "--issue-number 1547 --repo squne121/loop-protocol",
+    ),
+    (
+        "invocation_id_equals_form",
+        "uv run python3 scripts/agent-guards/run_scope_rollup_preflight.py "
+        "--issue-number 1547 --repo squne121/loop-protocol "
+        "--invocation-id=20260713T100000Z_123 --requested-at 2026-07-13T10:00:00Z",
+    ),
+    (
+        "requested_at_malformed",
+        "uv run python3 scripts/agent-guards/run_scope_rollup_preflight.py "
+        "--issue-number 1547 --repo squne121/loop-protocol "
+        "--invocation-id 20260713T100000Z_123 --requested-at not-a-timestamp",
     ),
 ]
 

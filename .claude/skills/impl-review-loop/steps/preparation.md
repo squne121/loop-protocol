@@ -395,11 +395,12 @@ REQUESTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 issue_number: <issue_number>
 repo: <REPO_FULL_NAME>
 invocation_id: <INVOCATION_ID>
+requested_at: <REQUESTED_AT>
 ```
 
 runner は `ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1` marker を stdout に返す。
 
-**内部実装（Issue #1547）**: `scope-rollup-runner` は内部で `scope_rollup.run` exact executor（`uv run python3 scripts/agent-guards/run_scope_rollup_preflight.py --issue-number <issue_number> --repo <repo>`）を単一 transaction として呼び出す。GitHub read-only inventory 取得・pagination 完走判定・SHA256/count 計算・planner 呼び出し・result finalize はすべてこの exact executor 内で shell redirect なしに完結し、`local_main_branch_guard.py` はこの exact invocation のみを canonical root context で allow する（raw `gh ... > /tmp/...` は引き続き block）。この Step の外部契約（`ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1` marker schema・`invocation_id` 生成手順・Step 順序）自体は変更しない。
+**内部実装（Issue #1547、PR #1560 fix_delta で producer/consumer 契約統一）**: `scope-rollup-runner` は内部で `scope_rollup.run` exact executor（`uv run python3 scripts/agent-guards/run_scope_rollup_preflight.py --issue-number <issue_number> --repo <repo> --invocation-id <INVOCATION_ID> --requested-at <REQUESTED_AT>`）を単一 transaction として呼び出す。`INVOCATION_ID` / `REQUESTED_AT` は本 Step で生成した値をそのまま渡し、executor 側で新しい UUID / timestamp を生成することはない（producer と consumer が同一値を参照する — PR #1560 P0-1 対応）。GitHub read-only inventory 取得・pagination 完走判定（server-side totalCount cross-check を含む）・SHA256/count 計算・planner 呼び出し・result finalize はすべてこの exact executor 内で shell redirect なしに完結し、`local_main_branch_guard.py` はこの exact invocation（12 トークン固定形状）のみを canonical root context で allow する（raw `gh ... > /tmp/...` は引き続き block）。この Step の外部契約（`ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1` marker schema・`invocation_id` 生成手順・Step 順序）自体は変更しない。
 
 ### ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 仕様
 
@@ -431,11 +432,12 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
     suggested_actions_summary: "<1-3行の候補サマリ>"
     candidate_count: <int>
     high_confidence_count: <int>
+    payload: {...}  # self_validation を除いた plan 全体（candidates を含む）。Issue #1547 fix_delta (P0-1)
 ```
 
-`result_sha256` は `raw_plan_location` のファイルバイト列の sha256。
+`result_sha256` は `result.payload`（self_validation を除いた plan 全体）の canonical JSON（`ensure_ascii=False, sort_keys=True, separators=(",", ":")`）の sha256。ファイルバイト列の sha256 ではない（PR #1560 fix_delta で producer/consumer の意味を統一）。
 
-`raw_plan_location` は Issue #1547 以降 `null` 固定である。`scope_rollup.run` exact executor は executor-owned private invocation directory を success/failure/timeout の全経路で cleanup するため、`runner` が別経路でファイルを保存する運用はしない。
+`raw_plan_location` は Issue #1547 以降 `null` 固定である。`scope_rollup.run` exact executor は executor-owned private invocation directory を success/failure/timeout の全経路で cleanup するため、`runner` が別経路でファイルを保存する運用はしない。候補詳細（`candidates[]`）は `result.payload` にそのまま埋め込まれ、ファイルを介さずに consumer（`parse_scope_rollup_run_result.py`）が独立して `result_sha256` を再計算・検証する。
 
 ### main conversation の marker 検証
 
@@ -461,7 +463,7 @@ uv run python3 .claude/skills/impl-review-loop/scripts/parse_scope_rollup_run_re
 - sidecar missing / `capture_mode != subagent_stop_hook` / `capture_status != captured` / `capture_sha256` mismatch / `capture_path` mismatch / `agent_type` mismatch / `invocation_id` mismatch / `capture_source != last_assistant_message` → `routing_action: stop_human`
 - `routing_action: stop_human` は `human_escalation` として扱う（`LOOP_STATE.termination_reason: human_escalation`）
 - `routing_action: deferred` は `LOOP_STATE.scope_rollup_decision.decision: deferred` を許容する（必要に応じて追加で `human_escalation`）
-- `raw_plan_location_allowed: true` の場合のみ `result.raw_plan_location` を読み取る
+- `raw_plan_location_allowed: true` は parser が `result.payload` の `result_sha256` 再計算・`verify_payload()` 検証まで通過したことを意味する（Issue #1547 以降 `raw_plan_location` 自体は常に `null` であり、ファイル読み取りは行われない）
 
 ### marker 検証・採用（ref-based フロー）
 
@@ -474,12 +476,12 @@ uv run python3 .claude/skills/impl-review-loop/scripts/parse_scope_rollup_run_re
 5. capture sidecar が存在し、`capture_mode == subagent_stop_hook`、`capture_status == captured`、`capture_source == last_assistant_message`
 6. sidecar の `agent_type` / `invocation_id` / `capture_path` / `capture_sha256` が期待値と一致する
 7. `script_blob_sha256` が現在の `plan_issue_scope_rollup.py` の sha と一致する
-8. `result.raw_plan_location` が存在し、`result.result_sha256` と一致し、`result.verify_status == verified`
-9. `verify_scope_rollup_result.py`（issue-refinement-loop 版）検証が pass
+8. `result.raw_plan_location` が `null` であり、`result.payload` の canonical JSON sha256 が `result.result_sha256` と一致し、`result.verify_status == verified`
+9. `verify_scope_rollup_result.py`（issue-refinement-loop 版）の `verify_payload()` 検証が pass（ファイルを介さない in-memory 検証）
 
 これらが全て通過した場合:
 - `result.suggested_actions_summary` を `LOOP_STATE.scope_rollup_plan.summary` に採用する
-- `result.raw_plan_location` は debug 専用とし、default では main context に展開しない
+- `result.payload.candidates` は debug 専用とし、default では main context に全件展開しない（`suggested_actions_summary` を要約として使う）
 - `ISSUE_SCOPE_ROLLUP_DECISION_V2` を記録して次ステップへ進む
 
 ### runner_unavailable / marker 違反の扱い

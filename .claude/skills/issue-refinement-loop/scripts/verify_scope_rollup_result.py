@@ -129,12 +129,6 @@ def verify(result_json_path: str) -> tuple[str, int]:
 
     Returns (output_text, exit_code).
     """
-    # Placeholder values for output (used on early exit)
-    actual_payload_sha256 = "N/A"
-    expected_payload_sha256 = "N/A"
-    actual_script_file_sha256 = "N/A"
-    expected_script_file_sha256 = "N/A"
-
     plan, error = _load_json_strict(result_json_path)
 
     if error is not None:
@@ -142,12 +136,55 @@ def verify(result_json_path: str) -> tuple[str, int]:
             status="invalid_input",
             summary=error,
             result_path=result_json_path,
-            actual_payload_sha256=actual_payload_sha256,
-            expected_payload_sha256=expected_payload_sha256,
-            actual_script_file_sha256=actual_script_file_sha256,
-            expected_script_file_sha256=expected_script_file_sha256,
+            actual_payload_sha256="N/A",
+            expected_payload_sha256="N/A",
+            actual_script_file_sha256="N/A",
+            expected_script_file_sha256="N/A",
         )
         return output, EXIT_INVALID_INPUT
+
+    return _verify_plan_dict(plan, result_json_path)
+
+
+def verify_payload(plan: dict[str, Any]) -> tuple[str, int]:
+    """In-memory equivalent of :func:`verify` for a plan dict that has never
+    been (and never needs to be) written to disk.
+
+    Issue #1547 fix_delta (P0-2): the ``scope_rollup.run`` executor now
+    invokes the planner and captures its stdout in-memory instead of writing
+    a ``plan_result.json`` file; this function lets it (and any other
+    caller, e.g. ``parse_scope_rollup_run_result.py``) run the exact same
+    schema/payload_sha256/script_file_sha256 checks against that in-memory
+    dict, with no filesystem involvement at all.
+
+    Returns (output_text, exit_code) with the same semantics as
+    :func:`verify` (``result_path`` in the output is rendered as
+    ``"<in-memory>"``).
+    """
+    if not isinstance(plan, dict):
+        output = _format_output(
+            status="invalid_input",
+            summary=f"Expected a dict, got {type(plan).__name__}",
+            result_path="<in-memory>",
+            actual_payload_sha256="N/A",
+            expected_payload_sha256="N/A",
+            actual_script_file_sha256="N/A",
+            expected_script_file_sha256="N/A",
+        )
+        return output, EXIT_INVALID_INPUT
+    return _verify_plan_dict(plan, "<in-memory>")
+
+
+def _verify_plan_dict(plan: dict[str, Any], result_path_label: str) -> tuple[str, int]:
+    """Shared core: verify self_validation/schema/payload_sha256 for an
+    already-parsed plan dict, regardless of whether it came from a file
+    (:func:`verify`) or from memory (:func:`verify_payload`)."""
+    # Placeholder values for output (used on early exit)
+    actual_payload_sha256 = "N/A"
+    expected_payload_sha256 = "N/A"
+    actual_script_file_sha256 = "N/A"
+    expected_script_file_sha256 = "N/A"
+    result_json_path = result_path_label
 
     # Extract self_validation block
     self_validation = plan.get("self_validation")
