@@ -30,7 +30,7 @@ _ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR = (
 if str(_ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR))
 
-import contract_review_result_parser as contract_review_parser
+import contract_review_result_parser as contract_review_parser  # noqa: E402
 
 E_APPROVAL_MISSING = "E_APPROVAL_MISSING"
 E_PR_BODY_VALIDATION_FAILED = "E_PR_BODY_VALIDATION_FAILED"
@@ -192,6 +192,63 @@ def resolve_branch() -> str:
     except subprocess.SubprocessError:
         return ""
     return result.stdout.strip()
+
+
+def _canonicalize_repo_static(repo: object) -> str | None:
+    """`owner/name` を小文字化した canonical 形へ静的に正規化する（Issue #1470）。
+
+    `.claude/skills/implement-issue/scripts/check_implementation_overlap.py`
+    の `_canonicalize_repo_static`（producer 側、Allowed Paths 外・変更しない）
+    と同じ正規化規則を consumer 側で独立に持つ小さな pure function。producer
+    が raise する代わりに、こちらは fail-closed で `None` を返す（呼び出し側が
+    分岐しやすいように）。owner/name 形式でない、またはいずれかの segment が
+    空の場合に `None` を返す。
+    """
+    if not isinstance(repo, str):
+        return None
+    raw = repo.strip()
+    if "/" not in raw:
+        return None
+    owner, _, name = raw.partition("/")
+    owner = owner.strip()
+    name = name.strip()
+    if not owner or not name or "/" in name:
+        return None
+    return f"{owner.lower()}/{name.lower()}"
+
+
+def resolve_canonical_repository(requested_repo: str) -> str | None:
+    """`requested_repo` を GitHub Repository API の canonical `full_name` の
+    小文字化形へ一度だけ解決する（Issue #1470）。
+
+    rename / transfer 後の alias もこの単一の API 呼び出しで現在の
+    `full_name` へ解決される。producer 側 `_canonicalize_repo(..., online=True)`
+    と異なり、consumer 側はオンライン解決に失敗した場合に静的正規化への
+    fallback を **行わない**（fresh evidence / gh pr create --repo に使う
+    PR mutation target の identity を、GitHub の現在の応答一本に束縛する
+    ため）。失敗時は `None` を返し、呼び出し元は停止する。
+    """
+    static = _canonicalize_repo_static(requested_repo)
+    if static is None:
+        return None
+    try:
+        result = run_gh(
+            "api",
+            f"repos/{static}",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "X-GitHub-Api-Version: 2022-11-28",
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _canonicalize_repo_static(data.get("full_name"))
 
 
 def get_linked_issue_state(repo: str, issue_number: int) -> str | None:
@@ -580,6 +637,12 @@ def _load_overlap_preflight_evidence(
         return None, E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID
     if "evidence_sha256" not in stored or "decision_inputs_sha256" not in stored:
         return None, E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID
+    # Issue #1470: repository は required field。欠落・型不正・legacy V1
+    # evidence（repository field 自体を持たない旧 schema、正しい legacy hash
+    # を持っていても）はここで一律拒否する。
+    repository = stored.get("repository")
+    if not isinstance(repository, str) or not repository:
+        return None, E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID
     return stored, None
 
 
@@ -794,6 +857,26 @@ def run_overlap_preflight_gate(
             None,
         )
 
+    # Issue #1470 (AC2/AC7): repository binding は他のどの検証よりも先に確認する。
+    # `repo`（呼び出し元 main() が resolve_canonical_repository() で一度だけ解決
+    # 済みの canonical full_name）を PR mutation target として、stored evidence の
+    # repository が canonical 形かつこの target と一致することを、オンライン
+    # 再実行（subprocess）より前に検証する。これにより、同じ Issue 番号を持つ
+    # 別リポジトリの evidence を誤って再利用しても gh pr create は一度も呼ばれない。
+    target_repo = repo
+    stored_repository = stored.get("repository")
+    if (
+        stored_repository != _canonicalize_repo_static(stored_repository)
+        or stored_repository != target_repo
+    ):
+        return (
+            False,
+            E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID,
+            f"stored repository が canonical target と一致しません: "
+            f"stored={stored_repository!r} target={target_repo!r}",
+            None,
+        )
+
     # P2-1 (PR #1467 review fix): stored evidence の decision_inputs_sha256 を
     # 呼び出し元が指定した expected_decision_inputs_sha256 と接続する
     # provenance チェックを、オンライン再実行の **前** に行う。これを省くと
@@ -831,7 +914,7 @@ def run_overlap_preflight_gate(
         "--issue-number",
         str(linked_issue),
         "--repo",
-        repo,
+        target_repo,
         "--limit",
         str(stored_limit),
     ]
@@ -862,6 +945,21 @@ def run_overlap_preflight_gate(
         )
     if not isinstance(fresh, dict):
         return False, E_OVERLAP_PREFLIGHT_SOURCE_FAILURE, "non-object JSON output", None
+
+    # Issue #1470 (AC3/AC5 ordering): fresh evidence の repository binding は
+    # 汎用の decision_inputs_sha256 drift 検査より **前** に確認する。repository
+    # 自体が decision hash の入力に含まれるため、repository を書き換えても
+    # 偶然 decision_inputs_sha256 が一致してしまう（あるいは caller が誤った
+    # expected 値を渡してしまう）可能性を、この明示的な検証で個別に防ぐ。
+    fresh_repository = fresh.get("repository")
+    if fresh_repository != target_repo:
+        return (
+            False,
+            E_OVERLAP_PREFLIGHT_DRIFT,
+            f"fresh repository が canonical target と一致しません: "
+            f"fresh={fresh_repository!r} target={target_repo!r}",
+            fresh,
+        )
 
     fresh_limit = _positive_overlap_source_limit(fresh)
     if fresh_limit is None:
@@ -1044,23 +1142,64 @@ def main(argv: list[str] | None = None) -> int:
         else:
             forced_by_label = FORCE_OVERLAP_PREFLIGHT_LABEL in (fresh_labels or [])
         overlap_gate_active = bool(args.overlap_preflight_required) or forced_by_label
+        pr_create_repo = repo
         if overlap_gate_active:
+            # Issue #1470 (AC1): PR mutation target を GitHub Repository API の
+            # canonical full_name (小文字化形) として一度だけ解決し、fresh
+            # preflight のオンライン再実行と gh pr create --repo の両方に同じ
+            # 値を使う。解決に失敗した場合は fallback せず停止する。
+            target_repo = resolve_canonical_repository(repo)
+            emit_kv("OVERLAP_PREFLIGHT_FORCED_BY_LABEL", str(forced_by_label).lower())
+            if labels_fetch_error is not None:
+                emit_kv("OVERLAP_PREFLIGHT_LABELS_FETCH_ERROR", labels_fetch_error)
+            if target_repo is None:
+                emit_error(
+                    E_OVERLAP_PREFLIGHT_SOURCE_FAILURE,
+                    f"canonical repository を解決できませんでした: {repo}",
+                )
+                return 2
+
+            # Issue #1470 (Medium 1): canonical repo が raw repo と異なる場合
+            # （mixed-case / rename alias）、labels と既存 PR を canonical
+            # target で再確認する。以降のすべての repo-scoped 呼び出し
+            # （overlap preflight オンライン再実行・gh pr create）は同一の
+            # target_repo（canonical）を使うため、この再確認は label
+            # forcing 判定と idempotency チェックの canonical target 追従を
+            # 保証する追加の安全確認である（label 再取得失敗は fail-closed
+            # で forced 継続）。
+            if target_repo != repo:
+                canonical_labels, canonical_labels_error = fetch_current_linked_issue_labels(
+                    target_repo, args.linked_issue
+                )
+                if canonical_labels_error is not None:
+                    forced_by_label = True
+                elif FORCE_OVERLAP_PREFLIGHT_LABEL in (canonical_labels or []):
+                    forced_by_label = True
+                overlap_gate_active = bool(args.overlap_preflight_required) or forced_by_label
+
+                canonical_existing = find_existing_pr(target_repo, branch)
+                if canonical_existing:
+                    emit_kv("EXISTING", "true")
+                    emit_kv("PR_URL", canonical_existing["url"])
+                    emit_kv("PR_NUMBER", canonical_existing["number"])
+                    emit_kv("LINKED_ISSUE", args.linked_issue)
+                    emit_kv("LINK_KIND", link_kind)
+                    return 0
+
             gate_ok, gate_error_code, gate_detail, _fresh_evidence = run_overlap_preflight_gate(
-                repo=repo,
+                repo=target_repo,
                 linked_issue=args.linked_issue,
                 evidence_file=args.overlap_preflight_evidence_file,
                 expected_evidence_sha256=args.overlap_preflight_expected_evidence_sha256,
                 expected_decision_inputs_sha256=args.overlap_preflight_expected_decision_inputs_sha256,
             )
-            emit_kv("OVERLAP_PREFLIGHT_FORCED_BY_LABEL", str(forced_by_label).lower())
-            if labels_fetch_error is not None:
-                emit_kv("OVERLAP_PREFLIGHT_LABELS_FETCH_ERROR", labels_fetch_error)
             if not gate_ok:
                 emit_error(gate_error_code or E_OVERLAP_PREFLIGHT_SOURCE_FAILURE, gate_detail)
                 return 2
+            pr_create_repo = target_repo
 
         try:
-            pr_url = create_pr(repo, args.pr_title, final_body_path, branch, draft)
+            pr_url = create_pr(pr_create_repo, args.pr_title, final_body_path, branch, draft)
         except subprocess.CalledProcessError as exc:
             emit_error(E_GH_FAILURE, f"gh pr create 失敗: exit {exc.returncode}")
             if exc.stderr:
