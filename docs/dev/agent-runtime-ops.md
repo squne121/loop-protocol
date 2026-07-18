@@ -288,8 +288,36 @@ docs/dev"
 `secret_boundary_violation`・`forbidden_path`・`public_checkpoint`・`secrets_mode` は
 `PermissionRequest` でも `deny` を維持する。
 
+## Issue Scope Snapshot と controlled stage/commit executor（Issue #1611）
+
+Claude/Codex 共通で使う、Issue contract から生成した scope snapshot と controlled stage/commit executor の設計を扱う。`CODEX_ALLOWED_PATHS_MODE` の env ベース入力（本文書の該当節）を repository guard の正規契約から置き換える最初の Implementation Issue（Child A）である。
+
+### 責務境界
+
+- `scripts/agent-guards/changed_file_matcher.py`: Allowed Paths matcher（`AllowedPathsMatcher`）、repo-relative path normalizer、rename-aware `ChangedFileRecord`、`parse_git_diff_name_status_z` の単一正本。staging（`controlled_git_change_exec.py`）・commit・PR review（`allowed_paths_review_gate.py`）が同じ grammar を import する。ローカルに再実装しない。
+- `scripts/agent-guards/protected_paths_policy.py`: `PROTECTED_PATHS_POLICY_V1`。`assets/`・`LICENSES/`・dotenv 系ファイル・`secrets/` 配下は、Issue Allowed Paths の記載に関わらず常に deny する。上表「保護 path（全モード共通・常に deny）」の Python 実装の正本であり、`.codex/config.toml` / `.claude/settings.json` はこの正本の validated mirror として保守する。
+- `scripts/agent-guards/controlled_git_change_exec.py`: Issue scope snapshot（`ISSUE_SCOPE_SNAPSHOT_V1`）の生成、literal pathspec での stage、rename/deletion/type-change/submodule 分類、staged 集合と requested 集合の一致検証、commit、post-commit re-audit を単一 transaction として実行する controlled executor。
+
+### ISSUE_SCOPE_SNAPSHOT_V1
+
+Issue contract の body_sha256、Allowed Paths 正規化 sha256、base branch/sha、worktree realpath、protected_paths_policy_version を bind する。`current_body_sha256` / `current_allowed_paths` を毎回フレッシュに再計算し snapshot と比較することで、Issue body/comment 更新後の stale snapshot を deny する（stale-snapshot drift 検出）。
+
+### 私有 index / compare-and-swap についての設計判断
+
+private `GIT_INDEX_FILE` + `git update-ref` の compare-and-swap primitive は「別プロセスが同じ index/HEAD を同時に動かす」レースを完全に排除できるが、この Issue のエージェントレーン脅威モデル（単一の controlled executor プロセスが単一 worktree から呼ばれ、同一 worktree 内の並行 writer を想定しない）に対しては過剰と判断した。代わりに、通常の index を使い、以下 3 点でレース窓を閉じる:
+
+1. `expected_head` を stage 直前・commit 直前の 2 回、live `git rev-parse HEAD` で再検証する。
+2. staged 集合は `git diff --cached --name-status -M -z` で index から再読み込みし、要求された集合と厳密一致することを commit 前に確認する（一致しなければ deny）。
+3. commit 後は committed diff を再読み込みし、staged 集合と一致しない場合は `git reset --mixed <prior_head>` でロールバックする。
+
+真の compare-and-swap（同一 worktree に対する複数 controlled executor の同時実行）が必要な場合は、本 Issue の Out of Scope として follow-up で扱う。残存レースはこの節に明記した設計上のトレードオフである。
+
+### raw / rtk `git add` / `git commit` の位置付け
+
+`scripts/agent-guards/controlled_git_change_exec.is_raw_or_rtk_git_add_or_commit_command()` は raw `git add`/`git commit` と `rtk git add`/`rtk git commit` の両方を検出する追加の fail-closed 分類器であり、hook レイヤーが `git_mutation_command_policy.classify_rtk_git_mutation`（Issue #1241 由来の既存 bounded lane、explicit pathspec の `rtk git add`/`rtk git commit` を許可し続ける）より先に参照することを想定している。既存 lane の allow 挙動そのものは本 Issue では変更しない（regression gate 維持のため）。hook 配線の変更自体は follow-up。
+
 ## Cross References（相互参照）
 
 - GitHub 操作の共通規約: [github-ops.md](github-ops.md)
 - 実装フローの正本: [workflow.md](workflow.md)
-- 既知の背景: Issue #350, Issue #343, PR #345
+- 既知の背景: Issue #350, Issue #343, PR #345, Issue #1611

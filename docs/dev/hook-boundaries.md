@@ -746,3 +746,14 @@ AC8（実 PreToolUse hook chain）テストは `secret_boundary_guard` / `local_
 ## 12. publish lane authorization trust root（歴史的経緯・historical note）
 
 Issue #1454（Phase A, PR #1457 MERGED）で `scripts/trust-root` 一式（`trusted_hook_launcher.py` / `manifest_schema.py` / `install_trust_root.sh`）が external trust root として導入されたが、これを `.codex/hooks.json` へ実際に配線する Issue #1450（Phase B）と、追加ハードニングを扱う Issue #1468 がいずれも個人開発の脅威モデルに対して過剰と判断され not planned でクローズされた。配線先を失った `scripts/trust-root` は不使用コードとなったため、Issue #1469 でコード一式・CI 登録・本節の bootstrap/rotation/managed hook registration 手順を削除した。現行の publish lane 保護は Issue #1408（PR #1442 MERGED、Issue branch 限定 push 許可・force/tag/delete/mirror 拒否）と main branch protection（Issue #360）のみで構成される。
+
+---
+
+## 13. controlled_git_change_exec.py の位置づけ（Issue #1611）
+
+`scripts/agent-guards/controlled_git_change_exec.py` は、この manifest が扱う `.claude/settings.json` PreToolUse hook トポロジには **新規 hook として登録しない**（`check_hook_boundaries.py` の対象外）。Issue scope snapshot（`ISSUE_SCOPE_SNAPSHOT_V1`）を入力に、literal pathspec での stage・rename-aware 検査・commit・post-commit re-audit を単一 transaction として行う、hook 外の controlled executor script である。
+
+- **共有 grammar**: `scripts/agent-guards/changed_file_matcher.py`（`AllowedPathsMatcher` / `ChangedFileRecord` / `parse_git_diff_name_status_z`）を staging・commit・`allowed_paths_review_gate.py`（PR review gate）が共通で import する。matcher の実装は 1 箇所のみに存在する。
+- **protected paths の単一正本**: `scripts/agent-guards/protected_paths_policy.py`（`PROTECTED_PATHS_POLICY_V1`）が `assets/` / `LICENSES/` / dotenv 系ファイル / `secrets/` 配下を Issue Allowed Paths に関わらず常に deny する。本節冒頭の「保護 path（全モード共通・常に deny）」表（`docs/dev/agent-runtime-ops.md` の CODEX_ALLOWED_PATHS_MODE 節）と同一集合を維持する validated mirror 関係にある。
+- **raw / rtk `git add` / `git commit` の追加検出**: `is_raw_or_rtk_git_add_or_commit_command()` は raw と `rtk` 両方の `git add`/`git commit` shape を検出する pure classifier。既存の `local_main_branch_guard` / `worktree_scope_guard` hook 配線・`git_mutation_command_policy.classify_rtk_git_mutation` の既存 allow 挙動（explicit pathspec の `rtk git add`/`rtk git commit`）は本 Issue では変更しない（regression gate 維持）。hook chain への実配線は follow-up。
+- **残存レース**: private `GIT_INDEX_FILE` + `git update-ref` compare-and-swap は導入せず、通常 index + 3 段の再検証（`expected_head` の stage 前後の再確認、staged 集合の index 再読み込みでの厳密一致、post-commit re-audit + rollback）で単一プロセス・単一 worktree の脅威モデルに対する race window を閉じる設計とした。詳細は `docs/dev/agent-runtime-ops.md`「Issue Scope Snapshot と controlled stage/commit executor」節を参照。
