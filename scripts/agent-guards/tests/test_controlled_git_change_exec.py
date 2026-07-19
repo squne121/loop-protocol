@@ -222,6 +222,52 @@ def test_explicit_pathspec_outside_allowed_paths_denied(tmp_path: Path):
     assert _staged_name_only(repo) == ""
 
 
+def test_branch_name_containing_slash_binding_not_truncated(tmp_path: Path):
+    """Issue #1629 fix_delta P2 (branch_name_slash_binding_mismatch):
+    `refs/heads/feature/foo` must bind to the real branch `feature/foo`,
+    not `foo` (the old `split('/')[-1]` behavior)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    subprocess.run(["git", "checkout", "-q", "-b", "feature/foo"], cwd=repo, check=True)
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "new_file.py").write_text("x = 1\n")
+
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"], target_branch="feature/foo")
+    result = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/new_file.py"],
+        commit_message="feat: add new file",
+        expected_head=_head(repo),
+    )
+    assert result.status == "committed"
+
+
+def test_branch_name_containing_slash_mismatch_still_denied(tmp_path: Path):
+    """The fix must not become permissive: a genuinely different branch
+    (`feature/bar` vs. the snapshot's `feature/foo`) must still be denied."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    subprocess.run(["git", "checkout", "-q", "-b", "feature/bar"], cwd=repo, check=True)
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "new_file.py").write_text("x = 1\n")
+
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"], target_branch="feature/foo")
+    result = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/new_file.py"],
+        commit_message="feat: add new file",
+        expected_head=_head(repo),
+    )
+    assert result.status == "denied"
+    assert result.reason_code == "branch_binding_mismatch"
+
+
 # ─── AC3 ──────────────────────────────────────────────────────────────────
 
 
@@ -965,3 +1011,123 @@ def test_codex_execpolicy_matrix_includes_git_mutation_cases():
     ):
         assert deny_label in labels, deny_label
         assert labels[deny_label]["expected_guard_pair"] == "deny"
+
+
+# ─── Issue #1629 fix_delta P0 (provenance_self_attestation) ────────────────
+
+
+def test_snapshot_json_flag_always_denied(tmp_path: Path):
+    """`--snapshot-json` is permanently disabled as an authority source
+    (Issue #1629 fix_delta P0): a hand-written, internally-consistent
+    snapshot/sidecar pair on disk must never authorize a commit through the
+    CLI entrypoint, regardless of what `_validate_materialized_snapshot_
+    provenance` would say about it in isolation."""
+    import controlled_git_change_exec as controlled_module
+    import io
+    import contextlib
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    snapshot_json = repo / "handwritten_snapshot.json"
+    snapshot_json.write_text("{}")
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = controlled_module._main(
+            [
+                "--cwd",
+                str(repo),
+                "--snapshot-json",
+                str(snapshot_json),
+                "--path",
+                "README.md",
+                "--message",
+                "feat: x",
+                "--expected-head",
+                _head(repo),
+            ]
+        )
+    assert rc == 1
+    assert "snapshot_json_file_trust_disabled_use_materialize_request" in buf.getvalue()
+
+
+def test_materialize_request_required_when_snapshot_json_absent(tmp_path: Path):
+    import controlled_git_change_exec as controlled_module
+    import io
+    import contextlib
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = controlled_module._main(
+            [
+                "--cwd",
+                str(repo),
+                "--path",
+                "README.md",
+                "--message",
+                "feat: x",
+                "--expected-head",
+                _head(repo),
+            ]
+        )
+    assert rc == 1
+    assert "materialize_request_required" in buf.getvalue()
+
+
+def test_materialize_request_drives_commit_via_live_snapshot(tmp_path: Path, monkeypatch):
+    """The sanctioned CLI path: `--materialize-request` recomputes the
+    snapshot live (mocked here) and that in-memory snapshot -- never a file
+    on disk -- authorizes the commit."""
+    import controlled_git_change_exec as controlled_module
+    import io
+    import contextlib
+    import json as json_module
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "new_file.py").write_text("x = 1\n")
+
+    live_snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+    monkeypatch.setattr(controlled_module, "build_snapshot_via_live_materializer", lambda **kwargs: live_snapshot)
+
+    request_json = repo / "materialize_request.json"
+    request_json.write_text(
+        json_module.dumps(
+            {
+                "issue_number": 1611,
+                "repo": "squne121/loop-protocol",
+                "contract_snapshot_url": "https://github.com/squne121/loop-protocol/issues/1611#issuecomment-1",
+                "base_ref": "main",
+                "branch_name": "topic",
+                "output": "artifacts/1611/issue-metadata/issue_scope_snapshot.materialize/issue_scope_snapshot.json",
+                "gh_bin": "/usr/bin/gh",
+            }
+        )
+    )
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = controlled_module._main(
+            [
+                "--cwd",
+                str(repo),
+                "--materialize-request",
+                str(request_json),
+                "--path",
+                "scripts/agent-guards/new_file.py",
+                "--message",
+                "feat: add new file",
+                "--expected-head",
+                _head(repo),
+            ]
+        )
+    assert rc == 0
+    assert '"status": "committed"' in buf.getvalue()
