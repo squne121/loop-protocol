@@ -300,6 +300,13 @@ def test_given_blocked_by_closed_predecessor_then_route_is_not_blocked() -> None
     assert exit_code == EXIT_OK
     assert payload["dependency_resolution"]["closed_predecessors"] == [9449]
     assert payload["candidates"][0]["policy_class"] == "C2a"
+    # #1621 P2 Major (PR #1637 レビュー): predecessor (dependency_c2a origin)
+    # の dependency_relation / provenance も保存される。current の
+    # Machine-Readable Contract の `blocked_by: ["#9449"]` が根拠。
+    assert payload["candidates"][0]["dependency_relation"] == "predecessor", payload
+    assert payload["candidates"][0]["dependency_provenance"] == [
+        {"source": "current_contract_blocked_by", "repository": DEFAULT_REPO, "issue_number": 9449}
+    ], payload
 
 
 def test_given_native_github_dependency_blocked_by_open_then_route_is_wait_for_predecessor() -> None:
@@ -1120,6 +1127,13 @@ def test_given_shared_parent_native_blocking_successor_then_route_is_c2a_not_par
     assert cand_evidence["issue_number"] == candidate_number
     assert cand_evidence["policy_class"] == "C2a", payload
     assert "successor_dependency_ordering" in cand_evidence["reasons"], payload
+    # #1621 P2 Major (PR #1637 レビュー): dependency_relation / provenance
+    # が candidate evidence に保存され、current の native blocking が根拠
+    # であることが監査可能。
+    assert cand_evidence["dependency_relation"] == "successor", payload
+    assert cand_evidence["dependency_provenance"] == [
+        {"source": "current_native_blocking", "repository": DEFAULT_REPO, "issue_number": current_number}
+    ], payload
 
 
 def test_given_mixed_normal_c1_and_successor_candidates_then_policy_class_distinguished_per_candidate(
@@ -1188,6 +1202,15 @@ def test_given_mixed_normal_c1_and_successor_candidates_then_policy_class_distin
     assert "successor_dependency_ordering" in by_number[successor_number]["reasons"], payload
     assert by_number[normal_number]["policy_class"] == "C1", payload
     assert "successor_dependency_ordering" not in by_number[normal_number]["reasons"], payload
+    # #1621 P2 Major (PR #1637 レビュー): dependency_relation は candidate
+    # ごとに区別され、normal C1 candidate は "none" のまま provenance も
+    # 空である。
+    assert by_number[successor_number]["dependency_relation"] == "successor", payload
+    assert by_number[successor_number]["dependency_provenance"] == [
+        {"source": "current_native_blocking", "repository": DEFAULT_REPO, "issue_number": current_number}
+    ], payload
+    assert by_number[normal_number]["dependency_relation"] == "none", payload
+    assert by_number[normal_number]["dependency_provenance"] == [], payload
 
 
 def test_given_human_c1_decision_targets_successor_c2a_candidate_when_c1_candidate_also_present_then_rejected(

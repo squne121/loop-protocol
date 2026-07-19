@@ -129,15 +129,19 @@ def test_adapter_current_blocking_only_without_candidate_blocked_by_produces_suc
     }
     assert "blockedBy" not in candidate_raw  # precondition
 
-    successor_numbers = impl_module._current_native_successor_numbers(current_raw, "squne121/loop-protocol")
-    assert 1612 in successor_numbers
+    successor_index = impl_module._current_native_successor_index(current_raw, "squne121/loop-protocol")
+    assert ("squne121/loop-protocol", 1612) in successor_index
 
     current_scope = cio.IssueScope(
         title=current_raw["title"],
         number=current_raw["number"],
         allowed_paths=("a.py",),
     )
-    extra_depends_on = (str(current_raw["number"]),) if candidate_raw["number"] in successor_numbers else ()
+    extra_depends_on = (
+        (str(current_raw["number"]),)
+        if ("squne121/loop-protocol", candidate_raw["number"]) in successor_index
+        else ()
+    )
     candidate_scope = impl_module._issue_scope_from_raw(
         candidate_raw, current_repo="squne121/loop-protocol", extra_depends_on=extra_depends_on
     )
