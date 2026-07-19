@@ -224,6 +224,37 @@ prefix_rule(
     ],
 )
 
+# Issue #1603: `rtk git merge --ff-only origin/<default-branch>` (default-
+# branch fast-forward sync lane) is, for the same execpolicy most-severe-
+# decision-wins reason documented above, intentionally NOT allowlisted here
+# either. The ONLY allowed, non-prompting path is the dedicated executor
+# script below -- it performs its OWN independent authorization before
+# calling execute_verified_default_branch_ff_merge_transaction (clean linked
+# worktree, live `git ls-remote --symref` default-branch identity, object-
+# only fetch, re-probe, ancestry, postcondition readback).
+#
+# Issue #1603 iteration-2 (OWNER adversarial review, P2-7): this is a
+# PREFIX rule -- Codex execpolicy has no exact-shape / no-trailing-token
+# primitive (see the `controlled_git_change_exec.py` rule note above for
+# the same limitation), so a duplicate `--candidate-branch` flag, a
+# `--flag=value` form, an extra positional, or a trailing token would still
+# match this rule's `allow` prefix at the execpolicy layer. The REAL
+# enforcement for those malformed shapes is the executor's OWN
+# `_validate_exact_invocation_argv` check (exact `["--candidate-branch",
+# <value>]`, two tokens, no duplicates, no trailing tokens), run BEFORE
+# argparse and BEFORE any authorization/transaction call -- mirroring how
+# `parse_controlled_git_change_exec_command()` (a real token-aware parser)
+# is the actual enforcement for that other prefix-only rule, not the
+# execpolicy prefix match itself.
+prefix_rule(
+    pattern = ["uv", "run", "--locked", "--no-sync", "python3", "scripts/agent-ops/verified_default_branch_ff_merge_exec.py", "--candidate-branch"],
+    decision = "allow",
+    justification = "PREFIX allow only -- execpolicy cannot inspect trailing tokens / duplicate flags / --flag=value forms by design (Rust execpolicy crate: literal-prefix matching only). The REAL enforcement is the executor's own _validate_exact_invocation_argv() (exact two-token argv) plus its independent authorization (worktree-catalog-bound active Issue / matching linked worktree / cwd binding via scripts/agent-ops/worktree_catalog.py) before calling execute_verified_default_branch_ff_merge_transaction (trusted sanitized Git context, live-verified default-branch identity via git ls-remote --symref, object-only fetch, re-probe, ancestry, per-worktree execution lock, postcondition readback) inside a single trusted execution boundary. Malformed invocations that violate the exact two-token shape are denied by the executor itself, not by this static rule.",
+    match = [
+        "uv run --locked --no-sync python3 scripts/agent-ops/verified_default_branch_ff_merge_exec.py --candidate-branch main",
+    ],
+)
+
 # Other rtk git mutation operations: require explicit human review (prompt)
 prefix_rule(
     pattern = ["rtk", "git", ["checkout", "switch", "worktree", "stash", "merge", "rebase", "cherry-pick", "reset", "restore", "rm", "mv", "clean", "apply", "am", "pull", "fetch", "remote", "tag", "config", "submodule"]],
