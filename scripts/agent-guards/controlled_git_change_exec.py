@@ -1099,7 +1099,14 @@ def _main(argv: Optional[List[str]] = None) -> int:
     # behavior fails loudly instead of degrading to a false "denied" for an
     # unrelated reason.
     if args.snapshot_json is not None:
-        print(json.dumps({"status": "denied", "reason_code": "snapshot_json_file_trust_disabled_use_materialize_request"}))
+        print(
+            json.dumps(
+                {
+                    "status": "denied",
+                    "reason_code": "snapshot_json_file_trust_disabled_use_materialize_request",
+                }
+            )
+        )
         return 1
 
     if args.materialize_request is None:

@@ -282,6 +282,7 @@ def _validate_contract_source(
     contract_snapshot_url: str,
     issue_body: str,
     base_ref: str,
+    base_sha: str,
     allowed_paths: list[str],
     project_root: Path,
     env: Dict[str, str],
@@ -290,7 +291,8 @@ def _validate_contract_source(
     issue comment, using the canonical parser's trusted-publisher +
     source-bound-fingerprint checks (Issue #1629 fix_delta P1:
     contract_source_substring_check). Cross-checks the fingerprint's
-    `base_ref` / `allowed_paths_normalized_sha256` against the live values
+    `base_ref` / `base_sha_at_snapshot` /
+    `allowed_paths_normalized_sha256` against the live values
     this materialize() call independently computed (P1:
     default_base_sha_local_not_live). Returns
     (contract_source_id, contract_source_body, comment_bodies_in_order)."""
@@ -322,6 +324,8 @@ def _validate_contract_source(
     fingerprint = inner.get("expected_contract_fingerprint") or {}
     if fingerprint.get("base_ref") != base_ref:
         raise ValueError("base_ref_fingerprint_mismatch")
+    if fingerprint.get("base_sha_at_snapshot") != base_sha:
+        raise ValueError("base_sha_fingerprint_mismatch")
     if fingerprint.get("allowed_paths_normalized_sha256") != compute_allowed_paths_sha256(allowed_paths):
         raise ValueError("allowed_paths_fingerprint_mismatch")
 
@@ -384,6 +388,7 @@ def materialize(
         contract_snapshot_url=contract_snapshot_url,
         issue_body=live_issue["body"],
         base_ref=base_ref,
+        base_sha=base_sha,
         allowed_paths=allowed_paths,
         project_root=root,
         env=sanitized_env,

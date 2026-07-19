@@ -49,6 +49,7 @@ def _go_comment_body(
     *,
     issue_body: str = _ISSUE_BODY,
     base_ref: str = "main",
+    base_sha: str = "a" * 40,
     allowed_paths_hash: str | None = None,
     fingerprint: bool = True,
 ) -> str:
@@ -70,7 +71,7 @@ def _go_comment_body(
             f'    contract_body_sha256: "{body_sha}"',
             f'    allowed_paths_normalized_sha256: "{allowed_paths_hash or _allowed_paths_hash()}"',
             f'    base_ref: "{base_ref}"',
-            f'    base_sha_at_snapshot: "{"a" * 40}"',
+            f'    base_sha_at_snapshot: "{base_sha}"',
         ]
     return "```yaml\n" + "\n".join(lines) + "\n```\n"
 
@@ -174,6 +175,18 @@ def test_materializer_rejects_contract_source_drift(tmp_path: Path, monkeypatch)
     assert not expected_output_path(tmp_path, 1629).exists()
 
 
+def test_materializer_rejects_readback_drift_binding_and_unsafe_output(tmp_path: Path, monkeypatch):
+    stale_body = "## Allowed Paths\n\n- scripts/agent-guards/other.py\n"
+    _patch_common(monkeypatch, tmp_path, comments=[_comment(_go_comment_body(issue_body=stale_body))])
+    with pytest.raises(ValueError, match="contract_source_drift"):
+        _materialize(tmp_path)
+    assert not expected_output_path(tmp_path, 1629).exists()
+
+    with pytest.raises(ValueError, match="artifact_path_binding_mismatch"):
+        _materialize(tmp_path, output="tmp/handwritten.json")
+    assert not expected_output_path(tmp_path, 1629).exists()
+
+
 def test_materializer_rejects_untrusted_author_go(tmp_path: Path, monkeypatch):
     _patch_common(monkeypatch, tmp_path, comments=[_comment(_go_comment_body(), trusted=False)])
     with pytest.raises(ValueError, match="contract_source_untrusted_author"):
@@ -202,6 +215,18 @@ def test_materializer_rejects_base_ref_fingerprint_mismatch(tmp_path: Path, monk
         _materialize(tmp_path)
 
 
+def test_materializer_rejects_base_sha_fingerprint_mismatch(tmp_path: Path, monkeypatch):
+    _patch_common(
+        monkeypatch,
+        tmp_path,
+        comments=[_comment(_go_comment_body(base_sha="a" * 40))],
+        base_sha="b" * 40,
+    )
+    with pytest.raises(ValueError, match="base_sha_fingerprint_mismatch"):
+        _materialize(tmp_path)
+    assert not expected_output_path(tmp_path, 1629).exists()
+
+
 def test_materializer_rejects_allowed_paths_fingerprint_mismatch(tmp_path: Path, monkeypatch):
     _patch_common(
         monkeypatch,
@@ -227,7 +252,12 @@ def test_materializer_uses_live_default_branch_sha_not_local_git(tmp_path: Path,
     in the produced snapshot must be whatever the (mocked) live GitHub API
     call returned, independent of any local git state."""
     live_sha = "b" * 40
-    _patch_common(monkeypatch, tmp_path, comments=[_comment(_go_comment_body())], base_sha=live_sha)
+    _patch_common(
+        monkeypatch,
+        tmp_path,
+        comments=[_comment(_go_comment_body(base_sha=live_sha))],
+        base_sha=live_sha,
+    )
     result = _materialize(tmp_path)
     assert result["base_sha"] == live_sha
     assert result["snapshot"]["base_sha"] == live_sha
@@ -243,7 +273,12 @@ def test_materializer_atomic_replace_on_re_materialize(tmp_path: Path, monkeypat
     snapshot_path = expected_output_path(tmp_path, 1629)
     first_bytes = snapshot_path.read_bytes()
 
-    _patch_common(monkeypatch, tmp_path, comments=[_comment(_go_comment_body())], base_sha="c" * 40)
+    _patch_common(
+        monkeypatch,
+        tmp_path,
+        comments=[_comment(_go_comment_body(base_sha="c" * 40))],
+        base_sha="c" * 40,
+    )
     second = _materialize(tmp_path)
     second_bytes = snapshot_path.read_bytes()
 
