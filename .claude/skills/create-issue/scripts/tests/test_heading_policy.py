@@ -739,6 +739,27 @@ class TestHeadingPolicyAppliedViaValidate:
         THEN: True（bilingual heading と認識）"""
         assert _is_heading_block("## 成果物 (Outcome)") is True
 
+    @pytest.mark.parametrize(
+        "heading",
+        ["Schema Change Applicability", "Schema Consumer Inventory"],
+    )
+    def test_lp052_exact_heading_is_non_prose_canonical(self, heading):
+        """GIVEN: LP052 exact English heading WHEN: Japanese prose validation
+        THEN: canonical headingとして除外され、翻訳を要求されない"""
+        entry = lookup_heading_policy(heading)
+        assert entry is not None
+        assert entry["prose_guard_kind"] == BLOCK_KIND_CANONICAL_HEADING
+        assert _is_heading_block(f"## {heading}") is True
+
+    def test_lp052_noncanonical_english_heading_remains_prose(self):
+        """GIVEN: LP052にない英語見出し WHEN: Japanese prose validation
+        THEN: prose validation対象のまま failする"""
+        text = "## Schema Change Applicability Details\n"
+        result = validate_text(text)
+        assert result.passed is False
+        assert lookup_heading_policy("Schema Change Applicability Details") is None
+        assert _is_heading_block("## Schema Change Applicability Details") is False
+
     def test_delta_heading_not_counted_as_prose_change(self):
         """GIVEN: canonical_heading のみが変更された delta WHEN: changed_prose_blocks
         THEN: prose delta は空（heading は prose 比率チェック対象外）"""

@@ -108,6 +108,9 @@ HEADING_POLICY: dict[str, dict] = {
         "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
         "contract_checker_kind": "Checks",
     },
+    # LP052 requires these exact English headings in PR bodies.  They are
+    # canonical metadata headings, not English prose, so the Japanese prose
+    # validator must keep them exempt without translating or renaming them.
     "Schema Change Applicability": {
         "canonical_en": "Schema Change Applicability",
         "canonical_ja": "スキーマ変更適用性",

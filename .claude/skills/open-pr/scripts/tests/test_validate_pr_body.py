@@ -13,7 +13,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+_CREATE_ISSUE_SCRIPTS = Path(__file__).parent.parent.parent.parent / "create-issue" / "scripts"
+sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS))
+
 from validate_pr_body import validate_pr_body
+from validate_japanese_content import validate_text
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "pr_body"
@@ -69,6 +73,42 @@ def test_not_schema_change_inventory_na():
     lp050_errors = [error for error in result.errors if error.rule_id == "LP050"]
     assert result.status == "pass"
     assert lp050_errors == []
+
+
+def test_lp052_exact_headings_pass_japanese_prose_validation():
+    body = """## Summary
+
+この変更の概要を日本語で説明します。
+
+## Checks
+
+- テストを実行しました。
+
+## Schema Change Applicability
+
+- decision: not_schema_change
+- reason: schema の形状を変更しないため
+
+## Schema Consumer Inventory
+
+N/A
+reason: schema を変更しないため inventory は不要
+
+## Safety Claim Matrix
+
+N/A
+reason: 安全性に影響しないため
+
+## Notes
+
+- Related issue: #1641
+- 関連する作業です。
+"""
+    body_result = validate_pr_body(body, load_paths("non_safety_paths.txt"), linked_issue=1641)
+    japanese_result = validate_text(body)
+
+    assert body_result.status == "pass"
+    assert japanese_result.passed is True
 
 
 def test_lp051_safety_matrix_required():

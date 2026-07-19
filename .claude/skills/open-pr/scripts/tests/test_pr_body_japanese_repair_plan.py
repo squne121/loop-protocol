@@ -275,6 +275,15 @@ contract_schema_version: v1
             assert not preview.startswith("## Outcome")
             assert not preview.startswith("## Machine-Readable Contract")
 
+    def test_lp052_exact_headings_are_protected_without_translation(self):
+        """LP052 heading は英語のまま保護され、日本語化修復の対象にならない。"""
+        body = _make_valid_body("日本語の説明です。")
+        plan = analyze_pr_body(body, threshold=0.1)
+
+        failed_previews = [item.get("text_preview") or "" for item in plan["failed_blocks"]]
+        assert not any("Schema Change Applicability" in preview for preview in failed_previews)
+        assert not any("Schema Consumer Inventory" in preview for preview in failed_previews)
+
     def test_bilingual_heading_protected(self):
         """日英混在見出しは保護される（任意の ATX 見出しは protected）"""
         block = {
