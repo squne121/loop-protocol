@@ -45,8 +45,21 @@ consumer ready contract（title `実装:` または `implement:`、routing label
 uv run --locked python3 .claude/skills/implement-issue/scripts/check_implementation_overlap.py \
   --issue-number "$ISSUE_NUMBER" \
   --repo "$REPO" \
+  --limit 2000 \
   > /tmp/overlap_preflight_${ISSUE_NUMBER}.json
 ```
+
+`--limit` は GraphQL cursor pagination の収集総数に対する **safety cap**
+であり（#1493）、ページサイズや取得件数の目標値ではない。全件性の証明は
+GitHub GraphQL の `pageInfo.hasNextPage` が `false` になった時点で確定する
+（`hasNextPage=false` に到達すれば、取得件数が page size（100）とちょうど
+一致していても `source.complete: true` / `source.saturated: false` になる
+— 固定件数への到達だけを理由に stop しない）。CLI 既定値は後方互換のため
+`100`（safety cap としては小さすぎる）のままなので、本手順では明示的に
+大きい値（`--limit 2000`）を指定する。呼び出し元が safety cap 自体を
+超える巨大な候補集合に遭遇した場合（`source.saturated: true` /
+`source.complete: false`）は、全件性を証明できないため人間判断へ停止する
+（fail-closed、cap を無制限にはしない）。
 
 **呼び出し側は `$?`（exit code）を continue/stop の分岐条件に使ってはならない**。分類に成功した場合はどの route でも exit 0 を返す（Major 2、下記参照）。route の正本は常に出力 JSON の `route` フィールドである:
 
@@ -83,6 +96,20 @@ ROUTE=$(uv run python3 -c "import json,sys; print(json.load(sys.stdin)['route'])
 - **candidate readback 前提（AC4）**: `check_implementation_overlap.py` は候補の `## Outcome` / `## In Scope` の readback が完了し、かつ構造的シグナルと自然言語類似度の双方から disjoint であることを確認できて初めて `proceed_with_collision_evidence` を返す。readback が不完全な候補が一件でもある場合、または構造的シグナルもしくは Outcome の意味的重複が検出された候補が一件でもある場合は `human_review_required` に倒す。**candidate contract の Outcome / In Scope / Out of Scope / Delivery Rule を readback する前に統合 PR を提案してはならない。** `Allowed Paths` の同一集合一致（`same_path_set`）だけでは duplicate と確定しない。
 - **自己除外（AC6）**: `--issue-number` は必須であり、対象 Issue 自身は候補収集レイヤーによって自動的に自己除外される。自己除外を怠ると同一タイトル・同一 Allowed Paths によって `duplicate` と誤判定される。
 
+#### 候補収集契約 collection contract（#1493、AC1/AC3）
+
+`check_implementation_overlap.py` の evidence `source` には、GraphQL cursor
+pagination の全件性を示す collection contract フィールドが additive で
+含まれる: `collection_mode`（`exhaustive_cursor_pagination` 固定）、
+`page_size`、`page_count`、`fetched_count`、`has_next_page`、`complete`、
+`saturated`、`limit`（safety cap）。`open-pr` 側の overlap preflight hard
+gate は、stored evidence と fresh（オンライン再実行）evidence の
+collection contract が完全一致することを検証し、いずれかにこれらの
+フィールドが欠けている場合（collection contract 未対応の legacy evidence）
+は再収集を要求して fail-closed に拒否する。呼び出し元は `--limit` や
+collection contract を上書きできない — 唯一の入力は integrity 確認済み
+stored evidence の `source.limit`（safety cap）である。
+
 #### PR 作成直前の deterministic drift gate（Major 1）
 
 Step 7（push & PR 起票）の直前に、`route` が `proceed_with_collision_evidence` または `wait_for_predecessor` 解除直後だった場合は、`check_implementation_overlap.py` を **再実行**して stale evidence（`updated_at` / `body_sha256` drift）を確認する:
@@ -91,6 +118,7 @@ Step 7（push & PR 起票）の直前に、`route` が `proceed_with_collision_e
 uv run --locked python3 .claude/skills/implement-issue/scripts/check_implementation_overlap.py \
   --issue-number "$ISSUE_NUMBER" \
   --repo "$REPO" \
+  --limit 2000 \
   > /tmp/overlap_preflight_${ISSUE_NUMBER}_recheck.json
 ```
 
