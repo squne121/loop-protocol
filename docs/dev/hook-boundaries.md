@@ -824,11 +824,11 @@ OWNER の敵対的レビュー（PR #1609）により、上記の初回実装に
 
 merge 実行後は、active branch 不変・`HEAD == live-oid`・`git status` clean・operation residue なしを無条件に確認する。`postcondition_violation` / `merge_rejected_non_fast_forward` / timeout 分類（`execution_not_started` / `transport_error_but_merged_and_verified` / `transport_error_no_merge_observed` / `transport_error_state_ambiguous`）は 12d 節の `execute_verified_ff_merge_transaction` と同じ語彙・分類方針を踏襲する。
 
-### classify_rtk_git_mutation の routing
+### classify_rtk_git_mutation の振り分け（routing）
 
 `classify_rtk_git_mutation` の `merge` 分岐は、shape が exact 2-token `--ff-only origin/<branch-name-shaped-token>` の場合のみ `_classify_rtk_git_merge_default_branch`（PURE shape classifier、副作用なし）へルーティングし、それ以外（40-hex SHA を含む既存の 12d 節の形状等）は従来どおり `_classify_rtk_git_merge` へルーティングする。トランザクションの実行認可は `.claude/hooks/worktree_scope_guard.py` の `_decide_rtk_git_merge_default_branch`（`_decide_rtk_git_merge` と同じ authorize-before-execute パターン）が、active Issue 解決済み・matching worktree が一意・`cwd == expected worktree`・当該 worktree が linked worktree であることを認可した後にのみ行う。
 
-### Codex allow rule
+### Codex allow rule（Codex 許可ルール）
 
 `.codex/rules/default.rules` は、専用 executor `scripts/agent-ops/verified_default_branch_ff_merge_exec.py` の exact invocation shape（`uv run --locked --no-sync python3 scripts/agent-ops/verified_default_branch_ff_merge_exec.py --candidate-branch NAME`）のみを allow とし、`rtk git merge --ff-only origin/<candidate>`（12d 節と同じ execpolicy most-severe-decision-wins の理由により）は引き続き既存の generic `rtk git merge` prompt rule に委ねる。この executor は `LOOP_ISSUE_NUMBER` からの active Issue 解決・cwd の branch 形状照合という独立した authorization を行ってから `execute_verified_default_branch_ff_merge_transaction` を呼び出す。
 
