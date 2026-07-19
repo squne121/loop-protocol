@@ -620,12 +620,16 @@ query($owner: String!, $name: String!) {
 _INVENTORY_CONNECTION_QUERY = """
 query($owner: String!, $name: String!, $after: String, $first: Int!, $fetchIssues: Boolean!, $fetchPRs: Boolean!) {
   repository(owner: $owner, name: $name) {
-    issues: issues(first: $first, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) @include(if: $fetchIssues) {
+    issues: issues(
+      first: $first, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}
+    ) @include(if: $fetchIssues) {
       totalCount
       pageInfo { hasNextPage endCursor }
       nodes { id number title body state stateReason url labels(first: 100) { nodes { name } } }
     }
-    pullRequests: pullRequests(first: $first, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) @include(if: $fetchPRs) {
+    pullRequests: pullRequests(
+      first: $first, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}
+    ) @include(if: $fetchPRs) {
       totalCount
       pageInfo { hasNextPage endCursor }
       nodes {
