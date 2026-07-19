@@ -775,7 +775,15 @@ def test_given_online_run_when_current_native_blocking_shared_parent_candidate_t
         return dict(current_raw)
 
     def fake_fetch_implementation_candidates(repo, limit):
-        return [dict(candidate_raw)], False
+        return [dict(candidate_raw)], {
+            "collection_mode": "exhaustive_cursor_pagination",
+            "page_size": 100,
+            "page_count": 1,
+            "fetched_count": 1,
+            "has_next_page": False,
+            "complete": True,
+            "saturated": False,
+        }
 
     def fake_fetch_all_native_dependencies(repo, issue_number):
         fetch_calls.append(issue_number)
