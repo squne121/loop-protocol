@@ -97,6 +97,13 @@ def build_stored_evidence(
             "saturated": source_saturated,
             "limit": source_limit,
             "collected_at": "2026-07-11T00:00:00Z",
+            # #1493 AC3: collection contract の必須 field（additive）。この
+            # fixture builder は cursor pagination 経路の evidence を模す。
+            "collection_mode": "exhaustive_cursor_pagination",
+            "page_size": 100,
+            "page_count": 1,
+            "fetched_count": 0,
+            "has_next_page": False,
         },
         "candidates": [],
         "dependency_resolution": {

@@ -657,6 +657,28 @@ def _positive_overlap_source_limit(evidence: dict) -> int | None:
     return limit
 
 
+# #1493 AC3: producer（check_implementation_overlap.py）が全件性を証明する
+# ために additive で積む collection contract の必須 field。stored evidence
+# にこれらが欠けている場合は legacy（cursor pagination 以前）の evidence で
+# あり、全件性を証明できないため再収集を要求する（fail-closed、caller
+# override は許可しない）。
+_OVERLAP_COLLECTION_CONTRACT_KEYS = (
+    "collection_mode",
+    "page_size",
+    "page_count",
+    "fetched_count",
+    "has_next_page",
+)
+
+
+def _overlap_collection_contract_missing_keys(evidence: dict) -> tuple[str, ...]:
+    """``source`` に collection contract の必須 field が欠けていればその key を返す。"""
+    source = evidence.get("source")
+    if not isinstance(source, dict):
+        return _OVERLAP_COLLECTION_CONTRACT_KEYS
+    return tuple(key for key in _OVERLAP_COLLECTION_CONTRACT_KEYS if key not in source)
+
+
 def _extract_waiver_from_live_contract(text: str) -> dict | None:
     """live Issue body の waiver 設定だけを読む。
 
@@ -908,6 +930,19 @@ def run_overlap_preflight_gate(
             None,
         )
 
+    # #1493 AC3: stored evidence が cursor pagination の collection contract
+    # を満たさない legacy evidence の場合、全件性を証明できないため再収集を
+    # 要求する（fail-closed）。
+    stored_missing_contract_keys = _overlap_collection_contract_missing_keys(stored)
+    if stored_missing_contract_keys:
+        return (
+            False,
+            E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID,
+            f"stored evidence に collection contract の必須 field がありません "
+            f"（再収集が必要です）: {sorted(stored_missing_contract_keys)}",
+            None,
+        )
+
     cmd = [
         sys.executable,
         str(_CHECK_IMPLEMENTATION_OVERLAP_SCRIPT),
@@ -974,6 +1009,44 @@ def run_overlap_preflight_gate(
             False,
             E_OVERLAP_PREFLIGHT_DRIFT,
             f"source.limit drift: stored={stored_limit} fresh={fresh_limit}",
+            fresh,
+        )
+
+    # #1493 AC3: fresh evidence（オンライン再実行）も同じ collection contract
+    # を満たすことを検証する。caller は contract / limit を上書きできない
+    # （唯一の入力は verified stored evidence の limit を再検証 CLI に渡す
+    # ことだけであり、それ自体は上の subprocess 呼び出しで既に行っている）。
+    fresh_missing_contract_keys = _overlap_collection_contract_missing_keys(fresh)
+    if fresh_missing_contract_keys:
+        return (
+            False,
+            E_OVERLAP_PREFLIGHT_DRIFT,
+            f"fresh evidence に collection contract の必須 field がありません: "
+            f"{sorted(fresh_missing_contract_keys)}",
+            fresh,
+        )
+    stored_source = stored.get("source") if isinstance(stored.get("source"), dict) else {}
+    fresh_source = fresh.get("source") if isinstance(fresh.get("source"), dict) else {}
+    for key in _OVERLAP_COLLECTION_CONTRACT_KEYS:
+        if key == "collection_mode":
+            # stored（前回のオンライン収集）と fresh（今回のオンライン再収集）
+            # は同じ producer 経路を通るため collection_mode は完全一致する
+            # ことを要求する。offline fixture 由来の evidence は上の必須
+            # field チェックで既に拒否されている。
+            if stored_source.get(key) != fresh_source.get(key):
+                return (
+                    False,
+                    E_OVERLAP_PREFLIGHT_DRIFT,
+                    f"collection contract drift ({key}): stored={stored_source.get(key)!r} "
+                    f"fresh={fresh_source.get(key)!r}",
+                    fresh,
+                )
+    if fresh_source.get("collection_mode") != "exhaustive_cursor_pagination":
+        return (
+            False,
+            E_OVERLAP_PREFLIGHT_DRIFT,
+            f"fresh evidence の collection_mode が exhaustive_cursor_pagination ではありません: "
+            f"{fresh_source.get('collection_mode')!r}",
             fresh,
         )
 
