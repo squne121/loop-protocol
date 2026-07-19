@@ -26,6 +26,7 @@ if str(_GUARDS_DIR) not in sys.path:
 from controlled_skill_mutation_policy import (
     ALLOWED_WRITE_ROOTS,
     COMMAND_ID_PUBLISH,
+    COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
     CONTROLLED_SKILL_MUTATION_COMMAND_POLICY,
     ENV_SANITIZE_KEYS,
     EXECUTOR_SCRIPT,
@@ -127,6 +128,7 @@ class TestRegistryScope:
             "issue_comment.publish",
             "contract_snapshot.publish",
             "pr_review.publish",
+            COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
         }
         actual_ids = set(CONTROLLED_SKILL_MUTATION_COMMAND_POLICY.keys())
         assert actual_ids == known_ids, (
