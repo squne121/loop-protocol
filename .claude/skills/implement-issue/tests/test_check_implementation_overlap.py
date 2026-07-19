@@ -13,6 +13,7 @@ exit code 契約（Major 2）: 分類に成功した場合は route を問わず
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import subprocess
 import sys
@@ -43,6 +44,13 @@ ROUTES = {
 
 EXIT_OK = 0
 EXIT_RUNTIME_ERROR = 1
+
+
+_SPEC = importlib.util.spec_from_file_location("overlap_checker", HELPER)
+assert _SPEC and _SPEC.loader
+checker_module = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = checker_module
+_SPEC.loader.exec_module(checker_module)
 
 
 def _sha256(text: str) -> str:
@@ -705,3 +713,320 @@ def test_decision_inputs_sha256_is_order_independent_after_canonical_sort() -> N
         reordered_file.unlink(missing_ok=True)
 
     assert payload_original["decision_inputs_sha256"] == payload_reordered["decision_inputs_sha256"]
+
+
+def _human_c1_comment(
+    *,
+    current: dict,
+    candidate: dict,
+    author_association: str = "OWNER",
+    decision: str = "C1/non-conflict",
+) -> dict:
+    """#1613 の固定 comment schema を作るテスト用 helper。"""
+    url = f"https://github.com/squne121/loop-protocol/issues/{current['number']}#issuecomment-9000000001"
+    body = "\n".join(
+        [
+            "```yaml",
+            "HUMAN_C1_DECISION_V1:",
+            f"  candidate_issue_number: {candidate['number']}",
+            f"  decision: {decision}",
+            f"  current_body_sha256: sha256:{_sha256(current['body'])}",
+            f"  candidate_body_sha256: sha256:{_sha256(candidate['body'])}",
+            "```",
+        ]
+    )
+    return {
+        "body": body,
+        "comment_id": 9000000001,
+        "comment_url": url,
+        "author_login": "squne121",
+        "author_association": author_association,
+        "created_at": "2026-07-18T12:02:00Z",
+        "updated_at": "2026-07-18T12:02:00Z",
+    }
+
+
+def _collision_candidate(number: int = 9771) -> dict:
+    return {
+        "number": number,
+        "title": "same schema collision",
+        "body": "\n".join(
+            [
+                "## Machine-Readable Contract",
+                "",
+                "```yaml",
+                "contract_schema_version: v1",
+                "issue_kind: implementation",
+                "parent_issue: \"none\"",
+                "goal_ref: \"different goal\"",
+                "change_kind: code",
+                "```",
+                "",
+                "## Outcome",
+                "",
+                "candidate has a structurally colliding result.",
+                "",
+                "## In Scope",
+                "",
+                "- `docs/dev/agent-runtime-ops.md`",
+                "",
+                "## Allowed Paths",
+                "",
+                "- `docs/dev/agent-runtime-ops.md`",
+                "",
+                "## Acceptance Criteria",
+                "",
+                "- [ ] AC1: candidate contract",
+                "",
+                "## Delivery Rule",
+                "",
+                "- 1 Issue = 1 PR",
+            ]
+        ),
+        "labels": [{"name": "phase/implementation"}],
+        "updatedAt": "2026-07-18T12:00:00Z",
+        "url": f"https://github.com/squne121/loop-protocol/issues/{number}",
+        "state": "OPEN",
+    }
+
+
+def _current_with_shared_target(tmp_path: Path) -> dict:
+    current = json.loads((FIXTURES_DIR / "current_1451_analog.json").read_text(encoding="utf-8"))
+    current["body"] = current["body"].replace(
+        "## Allowed Paths", "## In Scope\n\n- `shared/target.py`\n\n## Allowed Paths"
+    )
+    current["body"] = current["body"].replace(
+        "## Acceptance Criteria", "- `shared/target.py`\n\n## Acceptance Criteria"
+    )
+    current["updatedAt"] = "2026-07-18T12:01:00Z"
+    return current
+
+
+@pytest.mark.parametrize("author_association", ["OWNER", "COLLABORATOR"])
+def test_human_c1_decision_accepts_exact_owner_or_collaborator(
+    tmp_path: Path, author_association: str
+) -> None:
+    current = _current_with_shared_target(tmp_path)
+    candidate = _collision_candidate()
+    comment = _human_c1_comment(current=current, candidate=candidate, author_association=author_association)
+    current["comments"] = [comment]
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [candidate])
+
+    exit_code, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    assert exit_code == EXIT_OK
+    assert not payload["human_c1_decisions"]["rejected"], payload["human_c1_decisions"]
+    assert payload["route"] == "proceed_with_collision_evidence", payload
+    decision = payload["candidates"][0]["human_c1_decision"]
+    assert decision["verified"] is True
+    assert decision["author_association"] == author_association
+    assert decision["comment_url"] == comment["comment_url"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda current, candidate, comment: comment.update(
+            {"body": comment["body"].replace("C1/non-conflict", "C2a")}
+        ),
+        lambda current, candidate, comment: comment.update(
+            {"body": comment["body"].replace(str(candidate["number"]), "9998", 1)}
+        ),
+        lambda current, candidate, comment: comment.update(
+            {"body": comment["body"].replace("sha256:", "sha256:bad", 1)}
+        ),
+    ],
+    ids=["decision", "candidate", "sha"],
+)
+def test_human_c1_decision_rejects(tmp_path: Path, mutation: Any) -> None:
+    current = _current_with_shared_target(tmp_path)
+    candidate = _collision_candidate()
+    comment = _human_c1_comment(current=current, candidate=candidate)
+    mutation(current, candidate, comment)
+    current["comments"] = [comment]
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [candidate])
+
+    exit_code, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    assert exit_code == EXIT_OK
+    assert payload["route"] == "human_review_required", payload
+    assert payload["human_c1_decisions"]["rejected"]
+
+
+def test_human_c1_decision_does_not_override_duplicate_c2b_or_saturation(tmp_path: Path) -> None:
+    current = _current_with_shared_target(tmp_path)
+    candidate = _collision_candidate()
+    comment = _human_c1_comment(current=current, candidate=candidate)
+    current["comments"] = [comment]
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [candidate])
+
+    _, saturated = _run_cli(current["number"], current_file, candidates_file, "--limit", "1")
+    assert saturated["route"] == "human_review_required", saturated
+
+    duplicate_current = json.loads((FIXTURES_DIR / "current_1451_analog.json").read_text(encoding="utf-8"))
+    duplicate_candidate = json.loads(
+        (FIXTURES_DIR / "candidates_duplicate.json").read_text(encoding="utf-8")
+    )[0]
+    duplicate_current["comments"] = [_human_c1_comment(current=duplicate_current, candidate=duplicate_candidate)]
+    duplicate_current_file, duplicate_candidates_file = _write_overlap_inputs(
+        tmp_path, duplicate_current, [duplicate_candidate]
+    )
+    _, duplicate = _run_cli(duplicate_current["number"], duplicate_current_file, duplicate_candidates_file)
+    assert duplicate["route"] == "duplicate", duplicate
+    assert duplicate["human_c1_decisions"]["rejected"] == []
+    assert (
+        duplicate["human_c1_decisions"]["ignored_non_routing"][0]["reason"]
+        == "no_current_c1_candidate"
+    )
+
+    c2b_current = json.loads((FIXTURES_DIR / "current_with_open_dependency.json").read_text(encoding="utf-8"))
+    c2b_candidates = json.loads(
+        (FIXTURES_DIR / "candidates_path_only_false_positive.json").read_text(encoding="utf-8")
+    )
+    c2b_current["comments"] = [_human_c1_comment(current=c2b_current, candidate=c2b_candidates[0])]
+    c2b_current_file, c2b_candidates_file = _write_overlap_inputs(tmp_path, c2b_current, c2b_candidates)
+    _, c2b = _run_cli(c2b_current["number"], c2b_current_file, c2b_candidates_file)
+    assert c2b["route"] == "wait_for_predecessor", c2b
+
+
+def test_human_c1_decision_evidence_is_deterministic_and_sha_bound(tmp_path: Path) -> None:
+    current = _current_with_shared_target(tmp_path)
+    candidate = _collision_candidate()
+    comment = _human_c1_comment(current=current, candidate=candidate)
+    current["comments"] = [comment]
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [candidate])
+
+    _, first = _run_cli(current["number"], current_file, candidates_file)
+    _, second = _run_cli(current["number"], current_file, candidates_file)
+
+    assert first["decision_inputs_sha256"] == second["decision_inputs_sha256"]
+    assert first["human_c1_decisions"]["accepted"] == second["human_c1_decisions"]["accepted"]
+    accepted = first["human_c1_decisions"]["accepted"][0]
+    assert accepted["current_body_sha256"] == f"sha256:{_sha256(current['body'])}"
+    assert accepted["candidate_body_sha256"] == f"sha256:{_sha256(candidate['body'])}"
+
+
+def test_human_c1_decision_lifecycle_uses_rest_metadata_not_self_declared_url(tmp_path: Path) -> None:
+    current = _current_with_shared_target(tmp_path)
+    candidate = _collision_candidate()
+    comment = _human_c1_comment(current=current, candidate=candidate)
+    current["comments"] = [comment]
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [candidate])
+
+    _, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    accepted = payload["human_c1_decisions"]["accepted"][0]
+    assert "comment_url" not in comment["body"]
+    assert accepted["comment_id"] == comment["comment_id"]
+    assert accepted["comment_url"] == comment["comment_url"]
+    assert accepted["author_login"] == "squne121"
+
+
+def test_human_c1_decision_trust_ignores_untrusted_before_schema_parse(tmp_path: Path) -> None:
+    current = _current_with_shared_target(tmp_path)
+    candidate = _collision_candidate()
+    comment = _human_c1_comment(current=current, candidate=candidate, author_association="MEMBER")
+    comment["body"] = "HUMAN_C1_DECISION_V1\nnot even yaml"
+    current["comments"] = [comment]
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [candidate])
+
+    _, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    decisions = payload["human_c1_decisions"]
+    assert decisions["accepted"] == []
+    assert decisions["rejected"] == []
+    assert decisions["ignored_untrusted"][0]["reason"] == "untrusted_author_association"
+
+
+def test_human_c1_decision_trusted_malformed_is_non_routing_without_c1_candidate(
+    tmp_path: Path,
+) -> None:
+    current = _current_with_shared_target(tmp_path)
+    comment = _human_c1_comment(current=current, candidate=_collision_candidate())
+    comment["body"] = "HUMAN_C1_DECISION_V1\nnot even yaml"
+    current["comments"] = [comment]
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [])
+
+    _, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    decisions = payload["human_c1_decisions"]
+    assert payload["route"] == "proceed"
+    assert decisions["accepted"] == []
+    assert decisions["rejected"] == []
+    assert decisions["ignored_non_routing"][0]["reason"] == "no_current_c1_candidate"
+
+
+def test_human_c1_decision_untrusted_mimic_is_non_routing_without_c1_candidate(
+    tmp_path: Path,
+) -> None:
+    current = _current_with_shared_target(tmp_path)
+    comment = _human_c1_comment(
+        current=current,
+        candidate=_collision_candidate(),
+        author_association="MEMBER",
+    )
+    current["comments"] = [comment]
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [])
+
+    _, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    decisions = payload["human_c1_decisions"]
+    assert payload["route"] == "proceed"
+    assert decisions["accepted"] == []
+    assert decisions["rejected"] == []
+    assert decisions["ignored_untrusted"] == []
+    assert decisions["ignored_non_routing"][0]["reason"] == "no_current_c1_candidate"
+
+
+def test_human_c1_decision_trust_rejects_malformed_trusted_with_full_audit(tmp_path: Path) -> None:
+    current = _current_with_shared_target(tmp_path)
+    candidate = _collision_candidate()
+    comment = _human_c1_comment(current=current, candidate=candidate)
+    comment["body"] = "HUMAN_C1_DECISION_V1\nnot even yaml"
+    current["comments"] = [comment]
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [candidate])
+
+    _, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    rejected = payload["human_c1_decisions"]["rejected"][0]
+    assert payload["route"] == "human_review_required"
+    assert set(rejected) == {
+        "comment_id",
+        "comment_url",
+        "comment_body_sha256",
+        "comment_updated_at",
+        "author_login",
+        "author_association",
+        "parsed_candidate_issue_number",
+        "reason",
+    }
+
+
+def test_human_c1_decision_final_readback_detects_fingerprint_drift(tmp_path: Path) -> None:
+    current = _current_with_shared_target(tmp_path)
+    candidate = _collision_candidate()
+    comment = _human_c1_comment(current=current, candidate=candidate)
+    decisions = checker_module._validate_human_c1_decisions(
+        comments=[comment],
+        repository=DEFAULT_REPO,
+        current_number=current["number"],
+        current_body=current["body"],
+        candidates_evidence=[
+            {
+                "issue_number": candidate["number"],
+                "policy_class": "C1",
+                "body_sha256": f"sha256:{_sha256(candidate['body'])}",
+            }
+        ],
+    )
+
+    final_current = dict(current)
+    final_current["body"] += " drift"
+    assert checker_module._apply_final_readback_drift(
+        decisions=decisions,
+        final_current=final_current,
+        final_candidates={candidate["number"]: candidate},
+        final_comments=[comment],
+    )
+    assert decisions["accepted"][0]["final_readback_verified"] is False
+    assert decisions["rejected"][0]["reason"] == "final_readback_fingerprint_drift"

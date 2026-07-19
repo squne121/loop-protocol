@@ -571,6 +571,7 @@ def test_given_online_run_when_readback_candidate_exists_then_native_dependencie
         )
 
     monkeypatch.setattr(module, "fetch_current_issue", fake_fetch_current_issue)
+    monkeypatch.setattr(module, "fetch_issue_comments", lambda repo, issue_number: [])
     monkeypatch.setattr(module, "fetch_implementation_candidates", fake_fetch_implementation_candidates)
     monkeypatch.setattr(module, "fetch_all_native_dependencies", fake_fetch_all_native_dependencies)
     monkeypatch.setattr(module, "fetch_predecessor_issue", fail_fetch_predecessor_issue)
@@ -619,6 +620,7 @@ def test_given_online_run_when_no_readback_candidate_then_native_dependencies_fe
         return {"blockedBy": (), "blocking": ()}
 
     monkeypatch.setattr(module, "fetch_current_issue", fake_fetch_current_issue)
+    monkeypatch.setattr(module, "fetch_issue_comments", lambda repo, issue_number: [])
     monkeypatch.setattr(module, "fetch_implementation_candidates", fake_fetch_implementation_candidates)
     monkeypatch.setattr(module, "fetch_all_native_dependencies", fake_fetch_all_native_dependencies)
 
@@ -657,6 +659,7 @@ def test_given_online_run_when_current_only_blocks_open_dependent_then_route_doe
         }
 
     monkeypatch.setattr(module, "fetch_current_issue", fake_fetch_current_issue)
+    monkeypatch.setattr(module, "fetch_issue_comments", lambda repo, issue_number: [])
     monkeypatch.setattr(module, "fetch_implementation_candidates", fake_fetch_implementation_candidates)
     monkeypatch.setattr(module, "fetch_all_native_dependencies", fake_fetch_all_native_dependencies)
 
