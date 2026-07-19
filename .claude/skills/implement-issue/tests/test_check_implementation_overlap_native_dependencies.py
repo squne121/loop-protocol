@@ -673,3 +673,189 @@ def test_given_online_run_when_current_only_blocks_open_dependent_then_route_doe
     assert payload["dependency_resolution"]["native_blocking"] == [
         {"repository": REPO, "number": 9600, "state": "OPEN"}
     ]
+
+
+# ------------------------------------------------------------
+# #1621 AC1: successor index construction from current's own native
+# `blocking` (dead data until now), injected before the FIRST
+# classify_overlap() call -- no per-candidate API calls required.
+# ------------------------------------------------------------
+
+
+def test_current_native_successor_index_matches_same_repository_only() -> None:
+    """#1621 AC7 (PR #1637 レビュー P2 Conditional): index は
+    `(repository, issue_number)` タプルの frozenset として返る（number だけ
+    へ潰さない）。
+    """
+    current_raw = {
+        "blocking": [
+            _typed_record(number=2001, state="OPEN"),
+            _typed_record(number=2002, state="OPEN", repository="other-owner/other-repo"),
+            {"number": 2003, "state": "OPEN"},  # missing repository -> ignored
+            "not-a-dict",
+            {"number": True, "state": "OPEN", "repository": REPO},  # bool number -> ignored
+        ],
+    }
+    index = module._current_native_successor_index(current_raw, REPO)
+    assert index == frozenset({(REPO, 2001)})
+
+
+def test_current_native_successor_index_empty_when_blocking_missing_or_not_list() -> None:
+    assert module._current_native_successor_index({}, REPO) == frozenset()
+    assert module._current_native_successor_index({"blocking": "not-a-list"}, REPO) == frozenset()
+    assert module._current_native_successor_index({"blocking": None}, REPO) == frozenset()
+
+
+def test_current_native_successor_index_tuple_does_not_match_different_repository_same_number() -> None:
+    """#1621 AC7 (PR #1637 レビュー P2 Conditional): 返り値がタプルであることの
+    直接的な回帰確認。同一 issue number でも repository が異なれば
+    membership check は False になる（number だけの frozenset に潰していた
+    場合はこの区別ができない）。
+    """
+    current_raw = {"blocking": [_typed_record(number=5000, state="OPEN", repository=REPO)]}
+    index = module._current_native_successor_index(current_raw, REPO)
+    assert (REPO, 5000) in index
+    assert ("other-owner/other-repo", 5000) not in index
+
+
+def test_given_online_run_when_current_native_blocking_shared_parent_candidate_then_successor_c2a_without_extra_calls(
+    monkeypatch, capsys
+) -> None:
+    """#1621 AC1/AC3/AC4（PR #1637 レビュー P1 Blocker 修正版）: current の
+    native blocking のみから successor index を構築し、最初の
+    classify_overlap() 呼び出し前に candidate の depends_on へ current 番号を
+    注入する。candidate 自身は blockedBy を持たず、shared parent_refs だけを
+    持つ（旧実装では parent_child_collision により human_review_required に
+    停止していたケース）。fix 後は proceed_with_collision_evidence / C2a に
+    なる。
+
+    P1 Blocker: successor 関係が current の native blocking から確定済みの
+    candidate に対しては、第二段階の readback（`fetch_all_native_dependencies`
+    経由の候補側 blockedBy/blocking hydration）を一切実行しない
+    （「candidate 単位の追加 API 呼び出しゼロ」という Issue #1621 の中核
+    契約）。下位の dependency endpoint（`blocked_by`/`blocking` それぞれ）
+    単位で呼び出し回数を固定し、current 自身の blocked_by 1 回・blocking 1
+    回のみで、candidate 側は 0 回であることを検証する。
+    """
+    current_number = 9700
+    candidate_number = 9701
+
+    def _body(*, parent_issue: str, goal_ref: str, outcome: str) -> str:
+        return "\n".join(
+            [
+                "## Machine-Readable Contract",
+                "",
+                "```yaml",
+                "contract_schema_version: v1",
+                "issue_kind: implementation",
+                f'parent_issue: "{parent_issue}"',
+                f'goal_ref: "{goal_ref}"',
+                "change_kind: code",
+                "```",
+                "",
+                "## Outcome",
+                "",
+                outcome,
+                "",
+                "## In Scope",
+                "",
+                "- docs/dev/successor_shared.md",
+                "",
+                "## Allowed Paths",
+                "",
+                "- docs/dev/successor_shared.md",
+                "",
+            ]
+        )
+
+    current_raw = {
+        "number": current_number,
+        "title": "実装: current side",
+        "body": _body(
+            parent_issue="#9690", goal_ref="current goal alpha", outcome="current outcome about alpha beta gamma."
+        ),
+        "updatedAt": "2026-07-19T00:00:00Z",
+        "url": f"https://github.com/{REPO}/issues/{current_number}",
+    }
+    candidate_raw = {
+        "number": candidate_number,
+        "title": "実装: candidate side",
+        "body": _body(
+            parent_issue="#9690",
+            goal_ref="candidate goal beta",
+            outcome="candidate outcome about delta epsilon zeta.",
+        ),
+        "labels": [{"name": "phase/implementation"}],
+        "updatedAt": "2026-07-19T00:05:00Z",
+        "url": f"https://github.com/{REPO}/issues/{candidate_number}",
+        "state": "OPEN",
+        # 注意: blockedBy は意図的に存在しない（AC1/AC2 の検証対象）
+    }
+
+    fetch_native_dependency_calls: List[Any] = []
+
+    def fake_fetch_current_issue(repo, issue_number):
+        assert repo == REPO
+        return dict(current_raw)
+
+    def fake_fetch_implementation_candidates(repo, limit):
+        return [dict(candidate_raw)], {
+            "collection_mode": "exhaustive_cursor_pagination",
+            "page_size": 100,
+            "page_count": 1,
+            "fetched_count": 1,
+            "has_next_page": False,
+            "complete": True,
+            "saturated": False,
+        }
+
+    def fake_fetch_native_dependencies(repo, issue_number, direction):
+        # P1 Blocker: 下位の dependency endpoint（blocked_by / blocking）
+        # 単位で呼び出しを記録する。`fetch_all_native_dependencies` はこの
+        # 関数を経由するため、モックしない実物の `fetch_all_native_dependencies`
+        # がここへ到達する呼び出し回数を直接検証できる。
+        assert repo == REPO
+        fetch_native_dependency_calls.append((issue_number, direction))
+        if issue_number == current_number and direction == "blocking":
+            return ({"repository": REPO, "number": candidate_number, "state": "OPEN"},)
+        return ()
+
+    def fail_fetch_predecessor_issue(repo, issue_number):
+        pytest.fail(f"unexpected predecessor readback: {repo}#{issue_number}")
+
+    monkeypatch.setattr(module, "fetch_current_issue", fake_fetch_current_issue)
+    monkeypatch.setattr(module, "fetch_issue_comments", lambda repo, issue_number: [])
+    monkeypatch.setattr(module, "fetch_implementation_candidates", fake_fetch_implementation_candidates)
+    monkeypatch.setattr(module, "fetch_native_dependencies", fake_fetch_native_dependencies)
+    monkeypatch.setattr(module, "fetch_predecessor_issue", fail_fetch_predecessor_issue)
+
+    exit_code = module.run(["--issue-number", str(current_number), "--repo", REPO])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0, payload
+    assert payload["route"] == "proceed_with_collision_evidence", payload
+    assert len(payload["candidates"]) == 1
+    cand_evidence = payload["candidates"][0]
+    assert cand_evidence["issue_number"] == candidate_number
+    assert cand_evidence["policy_class"] == "C2a", payload
+    assert "successor_dependency_ordering" in cand_evidence["reasons"], payload
+
+    # P2 Major: candidate evidence に dependency_relation / dependency_provenance
+    # が保存され、current の native blocking から証明された successor で
+    # あることが監査可能になっている。
+    assert cand_evidence["dependency_relation"] == "successor", payload
+    assert cand_evidence["dependency_provenance"] == [
+        {"source": "current_native_blocking", "repository": REPO, "issue_number": current_number}
+    ], payload
+
+    # P1 Blocker: candidate 側への native dependency hydration（第二段階の
+    # readback）は一切発生しない。
+    assert "native_dependency_candidates_fetched" not in payload["dependency_resolution"], payload
+    assert fetch_native_dependency_calls.count((current_number, "blocked_by")) == 1
+    assert fetch_native_dependency_calls.count((current_number, "blocking")) == 1
+    assert fetch_native_dependency_calls.count((candidate_number, "blocked_by")) == 0
+    assert fetch_native_dependency_calls.count((candidate_number, "blocking")) == 0
+    assert fetch_native_dependency_calls == [
+        (current_number, "blocked_by"),
+        (current_number, "blocking"),
+    ], fetch_native_dependency_calls
