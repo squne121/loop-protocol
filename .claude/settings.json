@@ -9,6 +9,7 @@
       "Bash(uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run.with_anchor --issue-number * --repo squne121/loop-protocol --anchor-comment-url *)",
       "Bash(uv run --locked python3 .claude/skills/edit-issue/scripts/*.py *)",
       "Bash(uv run --locked python3 .claude/skills/post-merge-cleanup/scripts/*.py *)",
+      "Bash(uv run --locked python3 scripts/agent-ops/pr_review_marker_archive_exec.py *)",
       "Bash(uv run --locked python3 .claude/skills/create-issue/scripts/*.py *)",
       "Bash(uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py *)",
       "Bash(.claude/skills/create-issue/scripts/*.sh *)",

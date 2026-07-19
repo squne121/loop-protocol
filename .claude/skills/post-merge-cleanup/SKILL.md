@@ -232,6 +232,29 @@ gh pr list --search "linked:issue/<linked_issue> is:open" --json number,title,he
 
 候補を `superseded_prs` に列挙して返す（実行は main thread）。
 
+### 5a. merged PR の pr_review.publish marker を限定 archive する（Issue #1602）
+
+`merged_pr_number` が提供されている場合、当該 PR の
+`artifacts/<pr>/issue-metadata/pr_review.publish/pr_review_publish.marker.json`
+（`PR_REVIEW_PUBLISH_MARKER_V1`。存在しない場合は何もしない）を
+`pr_review_marker_archive_exec.py` に限定して引き渡す。この executor だけが、
+merged PR number と exact marker path を明示した呼び出しから、remote readback
+（merged-check endpoint + `review_id` primary key の exact review 一致）を経て
+marker を repo 外 archive root へ退避し、repo 側 marker を除去する権限を持つ
+（詳細契約: `docs/dev/agent-skill-boundaries.md` の
+「PR Review Marker Archive Lifecycle」セクション）。
+
+```bash
+uv run --locked python3 scripts/agent-ops/pr_review_marker_archive_exec.py \
+  --pr-number <merged_pr_number> --json
+```
+
+`archived` / `already_archived` は成功として扱い、追加のアクションを要求しない。
+`source_retained` / `indeterminate` / `refused` / `environment_blocked` は
+`unresolved_cleanup_items` に `PR_REVIEW_MARKER_ARCHIVE_RESULT_V1.status` /
+`reason_code` を記録する（SubAgent はこれらの状態を自動リトライ・強制削除しない）。
+本 executor は marker 以外の artifact family には一切適用しない。
+
 ### 6. Follow-up 候補の収集
 
 merged PR の本文 / コメントから以下を抽出:
@@ -240,7 +263,7 @@ merged PR の本文 / コメントから以下を抽出:
 
 候補を `follow_up_issue_requests` に `FOLLOW_UP_ISSUE_REQUEST_V1` 形式で列挙する（起票実行は main thread が `issue-author` SubAgent / `create-issue` 経由で実行）。
 
-#### 6a. Delivery-rollup Parent の残り child 検出（追加ステップ）
+### 6a. Delivery-rollup Parent の残り child 検出（追加ステップ）
 
 ステップ 4 で取得した parent issue が `parent_mode: delivery-rollup` の場合、`plan_child_materialization.py` を実行して残り child を検出し `follow_up_issue_requests` に追加する。
 
@@ -311,6 +334,18 @@ POST_MERGE_CLEANUP_REPORT_V1:
       origin_skill: post-merge-cleanup
       labels:
         - triage-required
+  pr_review_marker_archive:
+    schema: PR_REVIEW_MARKER_ARCHIVE_RESULT_V1
+    status: archived | already_archived | source_retained | indeterminate | refused | environment_blocked | n/a
+    reason_code: null
+    pr_number: <int>
+    source_relpath: "artifacts/<pr>/issue-metadata/pr_review.publish/pr_review_publish.marker.json"
+    marker_sha256: null
+    archive_locator: null
+    archive_durable: false
+    source_present_after: "unknown"
+    source_directory_synced: false
+    remote: {}
   stash_restored: true | false | n/a
   stash_entry_ref: "<stash@{N} or null>"
   warnings: []
