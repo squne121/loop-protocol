@@ -729,6 +729,8 @@ SESSION_MANIFEST_LEGACY_SCAN_V1:
 
 Codex 側 `.codex/rules/default.rules` は `gh pr review` を引き続き明示的に forbidden とし（`gh` サブコマンド prefix rule）、かつ `controlled_skill_mutation_exec.py` 自体への allow エントリを持たないため、本変更は Claude-only のまま split-brain を生じない（確認のみ、rule 変更なし）。
 
+**Issue #1633 更新（Codex/Claude parity 解消）**: 上記の「Codex 側は allow エントリを持たない」記述は Issue #1633 時点でもはや正確ではない。`.codex/rules/default.rules` に `uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py` の exact prefix allow エントリを追加し、`.claude/settings.json` の `Bash(uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py *)` と同じ 共有 authorization lane に Codex 側も明示的に乗るようにした（`codex execpolicy check` で `decision: allow` を確認済み）。ランタイム hook 層（`is_controlled_skill_mutation_exec_command()`）は元々 Claude/Codex 共通実装であり split-brain は生じていなかったが、静的 `codex execpolicy` layer には対応する allow ルールが欠けていたため、本 Issue でその欠落を埋めた。
+
 ## 12b. pr_review.publish の追加ハードニング（Issue #1539 fix_delta）
 
 OWNER レビュー（PR #1539、squne121）で以下の構造的欠陥が指摘され、修正した:
