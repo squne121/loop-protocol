@@ -11,9 +11,17 @@
 # linked-worktree-vs-root-checkout identity and per-worktree operation-state
 # resolution -- a plain repo root checkout would silently exercise the wrong
 # code path.
+#
+# Issue #1603 iteration-2 (OWNER adversarial review, permission/sandbox
+# boundary focus) additionally covers: trusted Git execution context
+# (sanitized env, replace-refs / grafts rejection), the object-only fetch's
+# side-effect boundary, non-zero-merge-exit state reclassification, the
+# per-worktree execution lock, live-probe OID strictness, and the Codex
+# executor's real worktree-catalog binding + exact argv validation.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -30,19 +38,28 @@ _HOOKS_DIR = _GUARDS_DIR.parent / "hooks"
 if str(_HOOKS_DIR) not in sys.path:
     sys.path.insert(0, str(_HOOKS_DIR))
 
+_AGENT_OPS_DIR = _GUARDS_DIR.parent / "agent-ops"
+if str(_AGENT_OPS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_OPS_DIR))
+
 from git_mutation_command_policy import (  # noqa: E402
     COMMAND_CLASS_RTK_GIT_MERGE_DEFAULT_BRANCH_FF_ONLY,
     DEFAULT_BRANCH_FF_STATUS_DENIED,
+    DEFAULT_BRANCH_FF_STATUS_EXECUTION_ERROR_STATE_AMBIGUOUS,
     DEFAULT_BRANCH_FF_STATUS_EXECUTION_NOT_STARTED,
     DEFAULT_BRANCH_FF_STATUS_MERGED_AND_VERIFIED,
     DEFAULT_BRANCH_FF_STATUS_TRANSPORT_ERROR_AMBIGUOUS,
     DEFAULT_BRANCH_FF_STATUS_TRANSPORT_ERROR_MERGED_VERIFIED,
     DEFAULT_BRANCH_FF_STATUS_TRANSPORT_ERROR_NO_MERGE,
+    DEFAULT_BRANCH_IDENTITY_PROBE_ERROR,
     classify_rtk_git_mutation,
     execute_verified_default_branch_ff_merge_transaction,
+    _establish_trusted_git_context,
+    _probe_default_branch_identity,
 )
 import git_mutation_command_policy as _policy_mod  # noqa: E402
 from local_main_branch_guard import evaluate  # noqa: E402
+import verified_default_branch_ff_merge_exec as _executor_mod  # noqa: E402
 
 ISSUE_NUMBER = "1603"
 ISSUE_BRANCH = "worktree-issue-1603-default-branch-ff"
@@ -76,25 +93,28 @@ def _set_canonical_env(monkeypatch, remote):
     monkeypatch.setenv("LOOP_CANONICAL_REPO_URL_PATTERN", "^" + re.escape(str(remote)) + chr(92) + chr(90))
 
 
-def _make_main_and_linked_worktree(tmp_path, monkeypatch, branch=ISSUE_BRANCH, advance_main=True):
+def _make_main_and_linked_worktree(
+    tmp_path, monkeypatch, branch=ISSUE_BRANCH, advance_main=True, default_branch="main"
+):
     """Build a bare `remote.git` whose HEAD symref is explicitly set to
-    `refs/heads/main`, an initial `main_repo` checkout that publishes
-    `refs/heads/main`, and a REAL linked worktree checked out onto an
-    issue-worktree-shaped branch that is behind `main`'s live head."""
+    `refs/heads/<default_branch>`, an initial `main_repo` checkout that
+    publishes `refs/heads/<default_branch>`, and a REAL linked worktree
+    checked out onto an issue-worktree-shaped branch that is behind the
+    default branch's live head."""
     main_repo = tmp_path / "main"
     remote = tmp_path / "remote.git"
     main_repo.mkdir()
-    _init_repo(main_repo, "main")
+    _init_repo(main_repo, default_branch)
     base_sha = _commit(main_repo, "tracked.txt", "base")
     subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
     _git("remote", "add", "origin", str(remote), cwd=main_repo)
-    _git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=main_repo)
+    _git("push", "-q", "origin", "HEAD:refs/heads/" + default_branch, cwd=main_repo)
     # A plain `git init --bare` repo does NOT auto-update its own HEAD symref
     # on push (that auto-set-HEAD-on-first-push behavior is GitHub-server-side
     # logic, not plain git). Set it explicitly so `git ls-remote --symref`
-    # against this bare repo reports `HEAD` as `ref: refs/heads/main` --
-    # exactly the live identity the transaction under test verifies.
-    _git("symbolic-ref", "HEAD", "refs/heads/main", cwd=remote)
+    # against this bare repo reports `HEAD` as `ref: refs/heads/<default_branch>`
+    # -- exactly the live identity the transaction under test verifies.
+    _git("symbolic-ref", "HEAD", "refs/heads/" + default_branch, cwd=remote)
 
     worktree = tmp_path / "worktree"
     _git("worktree", "add", "-q", "-b", branch, str(worktree), cwd=main_repo)
@@ -103,7 +123,7 @@ def _make_main_and_linked_worktree(tmp_path, monkeypatch, branch=ISSUE_BRANCH, a
     main_ahead_sha = base_sha
     if advance_main:
         main_ahead_sha = _commit(main_repo, "tracked.txt", "main-ahead")
-        _git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=main_repo)
+        _git("push", "-q", "origin", "HEAD:refs/heads/" + default_branch, cwd=main_repo)
 
     _set_canonical_env(monkeypatch, remote)
     return worktree, remote, base_sha, main_ahead_sha
@@ -130,6 +150,8 @@ def test_transaction_fetches_and_merges_live_default_branch_head(tmp_path, monke
     assert result.reason_code == "verified_default_branch_ff_merge_completed"
     assert result.live_default_branch_oid == main_ahead_sha
     assert result.post_head == main_ahead_sha
+    assert result.trusted_git_dir is not None
+    assert result.trusted_worktree_toplevel is not None
     assert _rev_parse(worktree, "HEAD") == main_ahead_sha
     status = subprocess.run(
         ["git", "status", "--porcelain=v1"], cwd=worktree, capture_output=True, text=True, check=True
@@ -194,8 +216,8 @@ def test_transaction_requires_clean_linked_issue_worktree_and_verified_ancestry(
 # routes on that precondition). These are the shapes that reach it and are
 # denied by its OWN candidate-shape validation (invalid ref grammar).
 _MALFORMED_DEFAULT_BRANCH_COMMANDS = [
-    "invalid_candidate_shape", "rtk git merge --ff-only origin/../main",
-    "invalid_candidate_slash", "rtk git merge --ff-only origin/feature/x",
+    "invalid_candidate_leading_dash", "rtk git merge --ff-only origin/-weird",
+    "invalid_candidate_dotdot", "rtk git merge --ff-only origin/../main",
     "invalid_candidate_empty", "rtk git merge --ff-only origin/",
 ]
 
@@ -213,6 +235,16 @@ def test_rejects_noncanonical_default_branch_sync_shapes_and_unverified_states(t
         assert result.command_class == COMMAND_CLASS_RTK_GIT_MERGE_DEFAULT_BRANCH_FF_ONLY, command
         assert result.reason_code == "default_branch_sync_shape_requires_exact_ff_only_origin_ref", command
         assert _rev_parse(worktree, "HEAD") == base_sha, command
+
+    # Issue #1603 iteration-2 P2-6: a hierarchical branch name (containing
+    # `/`) is now a VALID classifier shape -- Git's own ref-name grammar is
+    # the sole authority, not this pre-filter.
+    hierarchical_result = classify_rtk_git_mutation(
+        "rtk git merge --ff-only origin/release/2026", cwd=str(worktree), require_active_branch_push=True
+    )
+    assert hierarchical_result is not None
+    assert hierarchical_result.status == "allow"
+    assert hierarchical_result.target_branch == "release/2026"
 
     # Shapes that violate the routing precondition itself (no `origin/`
     # prefix, `--ff-only` not the first/only-other token, flag reordered,
@@ -265,7 +297,7 @@ def _patch_merge_subprocess(monkeypatch, handler):
     original_run = subprocess.run
 
     def fake_run(argv, *args, **kwargs):
-        if argv[:3] == ["git", "merge", "--ff-only"]:
+        if len(argv) >= 4 and argv[1:4] == ["--no-replace-objects", "merge", "--ff-only"]:
             return handler(argv, kwargs, original_run)
         return original_run(argv, *args, **kwargs)
 
@@ -343,6 +375,212 @@ def test_transaction_classifies_timeout_with_operation_residue_as_ambiguous(tmp_
     assert result.reason_code == "merge_execution_timeout_state_ambiguous"
 
 
+# Issue #1603 iteration-2 P1-4: a non-zero merge exit whose post-state
+# matches NEITHER the original local head NOR the live target (because
+# something else moved HEAD during the merge subprocess call) must be
+# classified as state-ambiguous, never silently folded into the ordinary
+# "rejected" bucket.
+def test_nonzero_merge_after_head_move_is_not_classified_as_rejection(tmp_path, monkeypatch):
+    worktree, _remote, base_sha, main_ahead_sha = _make_main_and_linked_worktree(tmp_path, monkeypatch)
+
+    def handler(argv, kwargs, original_run):
+        # Simulate a concurrent process moving HEAD to a THIRD, unrelated
+        # commit while the (faked) merge subprocess is "running".
+        subprocess.run(["git", "checkout", "-q", "-b", "_third_party"], cwd=worktree, check=True)
+        subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "third-party"], cwd=worktree, check=True)
+        subprocess.run(["git", "checkout", "-q", ISSUE_BRANCH], cwd=worktree, check=True)
+        subprocess.run(["git", "merge", "-q", "--ff-only", "_third_party"], cwd=worktree, check=True)
+        return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="fake nonzero exit")
+
+    _patch_merge_subprocess(monkeypatch, handler)
+    result = execute_verified_default_branch_ff_merge_transaction(
+        str(worktree), "main", expected_worktree_realpath=str(worktree), active_issue_number=ISSUE_NUMBER
+    )
+    assert result.status == DEFAULT_BRANCH_FF_STATUS_EXECUTION_ERROR_STATE_AMBIGUOUS
+    assert result.reason_code == "merge_execution_error_state_ambiguous"
+    assert result.merge_returncode == 1
+
+
+# Issue #1603 iteration-2 P1-2: an injected GIT_OBJECT_DIRECTORY /
+# GIT_ALTERNATE_OBJECT_DIRECTORIES / GIT_CONFIG_COUNT+GIT_CONFIG_KEY_0/
+# GIT_CONFIG_VALUE_0 must NOT redirect the trusted probe/fetch/ancestry/merge
+# steps -- the sanitized TrustedGitContext strips them before establishing
+# context, so the transaction still resolves the real repository/object
+# database and completes normally (proves the strip happens BEFORE any
+# trusted subprocess call, not merely that a bogus GIT_DIR causes an
+# unrelated early fail-closed denial).
+def test_transaction_rejects_injected_git_dir_work_tree_and_index(tmp_path, monkeypatch):
+    worktree, _remote, base_sha, main_ahead_sha = _make_main_and_linked_worktree(tmp_path, monkeypatch)
+    # NOTE: GIT_OBJECT_DIRECTORY (unlike GIT_ALTERNATE_OBJECT_DIRECTORIES)
+    # redirects the PRIMARY object store and breaks even ordinary `git
+    # status` ("fatal: bad object HEAD") regardless of sanitization -- it is
+    # still stripped by `_sanitized_trusted_git_env` (see
+    # `_TRUSTED_GIT_ENV_STRIP_EXACT`), but exercising it here would only
+    # prove an unrelated early precondition failure, not context isolation.
+    bogus_odb = tmp_path / "bogus-injected-odb"
+    bogus_odb.mkdir()
+    monkeypatch.setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", str(bogus_odb))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(bogus_odb))
+
+    result = execute_verified_default_branch_ff_merge_transaction(
+        str(worktree), "main", expected_worktree_realpath=str(worktree), active_issue_number=ISSUE_NUMBER
+    )
+    assert result.status == DEFAULT_BRANCH_FF_STATUS_MERGED_AND_VERIFIED
+    assert result.live_default_branch_oid == main_ahead_sha
+
+
+# Issue #1603 iteration-2 P1-2: a `refs/replace/*` entry present in the
+# worktree's repository is rejected fail-closed by trusted context
+# establishment -- never silently honored or silently ignored mid-merge.
+def test_transaction_ignores_replace_refs(tmp_path, monkeypatch):
+    worktree, _remote, base_sha, main_ahead_sha = _make_main_and_linked_worktree(tmp_path, monkeypatch)
+    # NOTE: mapping base_sha to ITSELF creates an infinite replace-depth
+    # cycle ("replace depth too high") -- use the (unfetched-locally) main
+    # remote-ahead sha as an unrelated, non-cyclic replacement target.
+    subprocess.run(
+        ["git", "update-ref", "refs/replace/" + base_sha, main_ahead_sha], cwd=worktree, check=True
+    )
+
+    result = execute_verified_default_branch_ff_merge_transaction(
+        str(worktree), "main", expected_worktree_realpath=str(worktree), active_issue_number=ISSUE_NUMBER
+    )
+    assert result.status == DEFAULT_BRANCH_FF_STATUS_DENIED
+    assert result.reason_code == "replace_refs_present"
+    assert _rev_parse(worktree, "HEAD") == base_sha
+
+
+# Issue #1603 iteration-2 P1-3: the object-only fetch must not write
+# FETCH_HEAD (and disables submodule recursion / auto maintenance /
+# commit-graph writes as part of the same argv).
+def test_fetch_does_not_write_fetch_head_or_recurse_submodules(tmp_path, monkeypatch):
+    worktree, _remote, base_sha, main_ahead_sha = _make_main_and_linked_worktree(tmp_path, monkeypatch)
+    fetch_head_path = Path(_git_path(worktree, "FETCH_HEAD"))
+    assert not fetch_head_path.exists()
+
+    result = execute_verified_default_branch_ff_merge_transaction(
+        str(worktree), "main", expected_worktree_realpath=str(worktree), active_issue_number=ISSUE_NUMBER
+    )
+    assert result.status == DEFAULT_BRANCH_FF_STATUS_MERGED_AND_VERIFIED
+    assert not fetch_head_path.exists()
+
+
+# Issue #1603 iteration-2 P1-High-5: a second, concurrent invocation of the
+# transaction for the SAME worktree is denied (lock contention) rather than
+# racing the branch/HEAD checks against an in-flight merge.
+def test_concurrent_executor_is_serialized_by_worktree_lock(tmp_path, monkeypatch):
+    worktree, _remote, base_sha, main_ahead_sha = _make_main_and_linked_worktree(tmp_path, monkeypatch)
+    monkeypatch.setenv("LOOP_DEFAULT_BRANCH_FF_LOCK_TIMEOUT_SECONDS", "0.3")
+
+    lock_path_proc = subprocess.run(
+        ["git", "rev-parse", "--git-path", "loop-default-branch-ff.lock"],
+        cwd=worktree, capture_output=True, text=True, check=True,
+    )
+    lock_path = lock_path_proc.stdout.strip()
+    if not os.path.isabs(lock_path):
+        lock_path = os.path.join(str(worktree), lock_path)
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+
+    import fcntl
+
+    held_fh = open(lock_path, "a+")
+    fcntl.flock(held_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        result = execute_verified_default_branch_ff_merge_transaction(
+            str(worktree), "main", expected_worktree_realpath=str(worktree), active_issue_number=ISSUE_NUMBER
+        )
+        assert result.status == DEFAULT_BRANCH_FF_STATUS_DENIED
+        assert result.reason_code == "worktree_execution_lock_contended"
+        # Held lock means no merge was attempted -- HEAD unchanged.
+        assert _rev_parse(worktree, "HEAD") == base_sha
+    finally:
+        fcntl.flock(held_fh.fileno(), fcntl.LOCK_UN)
+        held_fh.close()
+
+    # Once released, the transaction succeeds normally.
+    result2 = execute_verified_default_branch_ff_merge_transaction(
+        str(worktree), "main", expected_worktree_realpath=str(worktree), active_issue_number=ISSUE_NUMBER
+    )
+    assert result2.status == DEFAULT_BRANCH_FF_STATUS_MERGED_AND_VERIFIED
+
+
+def _patch_ls_remote_subprocess(monkeypatch, stdout_text, returncode=0):
+    original_run = subprocess.run
+
+    def fake_run(argv, *args, **kwargs):
+        if len(argv) >= 2 and argv[1] == "ls-remote":
+            return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout_text, stderr="")
+        return original_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(_policy_mod.subprocess, "run", fake_run)
+
+
+# Issue #1603 iteration-2 P2-8: two oid lines for the same ref name in
+# `ls-remote --symref` output is malformed -- never resolved by "last one
+# wins".
+def test_probe_rejects_duplicate_ref_lines(tmp_path, monkeypatch):
+    worktree, _remote, base_sha, _main_ahead_sha = _make_main_and_linked_worktree(tmp_path, monkeypatch)
+    ctx, ctx_reason = _establish_trusted_git_context(str(worktree))
+    assert ctx is not None, ctx_reason
+
+    sha_a = "a" * 40
+    sha_b = "b" * 40
+    stdout_text = (
+        "ref: refs/heads/main\tHEAD\n"
+        + sha_a + "\tHEAD\n"
+        + sha_a + "\trefs/heads/main\n"
+        + sha_b + "\trefs/heads/main\n"
+    )
+    _patch_ls_remote_subprocess(monkeypatch, stdout_text)
+    status, oid, err_cat = _probe_default_branch_identity(ctx, str(worktree), "https://example.invalid/x", "main")
+    assert status == DEFAULT_BRANCH_IDENTITY_PROBE_ERROR
+    assert oid is None
+
+
+# Issue #1603 iteration-2 P2-8: an uppercase OID in `ls-remote` output is
+# REJECTED, never silently lowercased and accepted.
+def test_probe_rejects_uppercase_oid(tmp_path, monkeypatch):
+    worktree, _remote, base_sha, _main_ahead_sha = _make_main_and_linked_worktree(tmp_path, monkeypatch)
+    ctx, ctx_reason = _establish_trusted_git_context(str(worktree))
+    assert ctx is not None, ctx_reason
+
+    sha_upper = "A" * 40
+    stdout_text = (
+        "ref: refs/heads/main\tHEAD\n"
+        + sha_upper + "\tHEAD\n"
+        + sha_upper + "\trefs/heads/main\n"
+    )
+    _patch_ls_remote_subprocess(monkeypatch, stdout_text)
+    status, oid, err_cat = _probe_default_branch_identity(ctx, str(worktree), "https://example.invalid/x", "main")
+    assert status == DEFAULT_BRANCH_IDENTITY_PROBE_ERROR
+    assert oid is None
+
+
+# Issue #1603 iteration-2 P2-6: a hierarchical default branch name (e.g.
+# `release/2026`) succeeds end-to-end through both the classifier and the
+# trusted transaction -- this lane is NOT `main`-only by contract.
+def test_valid_hierarchical_default_branch_or_main_only_contract(tmp_path, monkeypatch):
+    worktree, _remote, base_sha, main_ahead_sha = _make_main_and_linked_worktree(
+        tmp_path, monkeypatch, default_branch="release/2026"
+    )
+
+    command = "rtk git merge --ff-only origin/release/2026"
+    classify_result = classify_rtk_git_mutation(command, cwd=str(worktree), require_active_branch_push=True)
+    assert classify_result is not None
+    assert classify_result.status == "allow"
+    assert classify_result.target_branch == "release/2026"
+
+    result = execute_verified_default_branch_ff_merge_transaction(
+        str(worktree),
+        "release/2026",
+        expected_worktree_realpath=str(worktree),
+        active_issue_number=ISSUE_NUMBER,
+    )
+    assert result.status == DEFAULT_BRANCH_FF_STATUS_MERGED_AND_VERIFIED
+    assert result.live_default_branch_oid == main_ahead_sha
+
+
 # AC4: Claude worktree guard, shared local-main guard, and Codex execpolicy
 # routing parity -- local root/main checkout is denied by the shared guard
 # regardless of the new command class, and Codex allows only the dedicated
@@ -386,9 +624,7 @@ def _execpolicy_decision(argv_tail):
         timeout=15,
         check=True,
     )
-    import json as _json
-
-    return _json.loads(result.stdout).get("decision", "no_match")
+    return json.loads(result.stdout).get("decision", "no_match")
 
 
 @pytest.mark.skipif(_CODEX_BIN is None, reason="codex CLI not available in this environment")
@@ -408,3 +644,86 @@ def test_codex_execpolicy_allows_only_the_dedicated_executor_shape():
     ]
     for argv_tail in prompt_cases:
         assert _execpolicy_decision(argv_tail) != "allow", argv_tail
+
+
+# ---------------------------------------------------------------------------
+# Codex executor (verified_default_branch_ff_merge_exec.py) authorization
+# tests -- Issue #1603 iteration-2 P1-1 / P2-7.
+# ---------------------------------------------------------------------------
+
+
+def _make_bare_linked_worktree(tmp_path, branch, dir_basename):
+    """A minimal main repo + ONE linked worktree on `branch`, no remote
+    needed (these tests only exercise the executor's worktree-catalog
+    binding, which happens BEFORE any remote/transaction work). `select_
+    issue_worktrees` requires BOTH the branch short-name AND the worktree
+    directory BASENAME to match `(worktree-)?issue-<N>-*` -- `dir_basename`
+    must therefore itself start with `issue-<N>-`, not just `branch`."""
+    main_repo = tmp_path / "main"
+    main_repo.mkdir()
+    _init_repo(main_repo, "main")
+    _commit(main_repo, "tracked.txt", "base")
+    worktree = tmp_path / dir_basename
+    _git("worktree", "add", "-q", "-b", branch, str(worktree), cwd=main_repo)
+    return main_repo, worktree
+
+
+def test_codex_executor_denies_zero_matching_worktrees(tmp_path, monkeypatch):
+    # Branch/path both belong to issue 1 -- issue 999 (below) has zero matches.
+    _main_repo, worktree = _make_bare_linked_worktree(tmp_path, "worktree-issue-1-x", "issue-1-x")
+    monkeypatch.setenv("LOOP_ISSUE_NUMBER", "999")
+    result = _executor_mod.run("main", cwd=str(worktree))
+    assert result["status"] == "denied"
+    assert result["reason_code"] == "zero_matching_worktrees"
+
+
+def test_codex_executor_denies_multiple_matching_worktrees(tmp_path, monkeypatch):
+    main_repo = tmp_path / "main"
+    main_repo.mkdir()
+    _init_repo(main_repo, "main")
+    _commit(main_repo, "tracked.txt", "base")
+    worktree_a = tmp_path / "issue-1603-a"
+    worktree_b = tmp_path / "issue-1603-b"
+    _git("worktree", "add", "-q", "-b", "worktree-issue-1603-a", str(worktree_a), cwd=main_repo)
+    _git("worktree", "add", "-q", "-b", "worktree-issue-1603-b", str(worktree_b), cwd=main_repo)
+    monkeypatch.setenv("LOOP_ISSUE_NUMBER", ISSUE_NUMBER)
+    result = _executor_mod.run("main", cwd=str(worktree_a))
+    assert result["status"] == "denied"
+    assert result["reason_code"] == "multiple_matching_worktrees"
+
+
+def test_codex_executor_denies_noncanonical_worktree_path(tmp_path, monkeypatch):
+    main_repo, _worktree = _make_bare_linked_worktree(
+        tmp_path, "worktree-issue-1603-x", "issue-1603-x"
+    )
+    monkeypatch.setenv("LOOP_ISSUE_NUMBER", ISSUE_NUMBER)
+    # Run from the ROOT checkout (not the matched linked worktree) -- exactly
+    # one matching worktree exists in the catalog, but cwd does not resolve
+    # to it.
+    result = _executor_mod.run("main", cwd=str(main_repo))
+    assert result["status"] == "denied"
+    assert result["reason_code"] == "cwd_not_expected_worktree"
+
+
+def test_executor_rejects_duplicate_candidate_flag(capsys):
+    exit_code = _executor_mod.main(["--candidate-branch", "main", "--candidate-branch", "other"])
+    assert exit_code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "denied"
+    assert out["reason_code"] == "invalid_executor_invocation_shape"
+
+
+def test_executor_rejects_flag_equals_value_form(capsys):
+    exit_code = _executor_mod.main(["--candidate-branch=main"])
+    assert exit_code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "denied"
+    assert out["reason_code"] == "invalid_executor_invocation_shape"
+
+
+def test_executor_rejects_trailing_positional_token(capsys):
+    exit_code = _executor_mod.main(["--candidate-branch", "main", "extra"])
+    assert exit_code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "denied"
+    assert out["reason_code"] == "invalid_executor_invocation_shape"

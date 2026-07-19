@@ -1464,7 +1464,14 @@ def _classify_remote_drift(cwd: str, expected_remote_head: str, current_remote_h
 # mirroring the vocabulary Issue #1589 established for
 # `execute_verified_ff_merge_transaction` (successful merge, non-fast-forward
 # rejection, postcondition violation, denied-before-any-mutation, and the
-# three-plus-one timeout/transport outcomes).
+# three-plus-one timeout/transport outcomes). Issue #1603 OWNER adversarial
+# review (iteration 2, P1-4) additionally requires classifying a NON-ZERO
+# merge exit by re-reading live state BEFORE assuming rejection: a clean
+# state match with the TARGET oid is `execution_error_but_merged_and_verified`
+# (the merge actually succeeded despite a non-zero exit -- e.g. a noisy
+# post-merge hook), a clean state match with the ORIGINAL local head is the
+# ordinary --ff-only rejection case, and anything else is
+# `execution_error_state_ambiguous`.
 DEFAULT_BRANCH_FF_STATUS_MERGED_AND_VERIFIED = "merged_and_verified"
 DEFAULT_BRANCH_FF_STATUS_MERGE_REJECTED = "merge_rejected_non_fast_forward"
 DEFAULT_BRANCH_FF_STATUS_POSTCONDITION_VIOLATION = "postcondition_violation"
@@ -1473,6 +1480,10 @@ DEFAULT_BRANCH_FF_STATUS_EXECUTION_NOT_STARTED = "execution_not_started"
 DEFAULT_BRANCH_FF_STATUS_TRANSPORT_ERROR_MERGED_VERIFIED = "transport_error_but_merged_and_verified"
 DEFAULT_BRANCH_FF_STATUS_TRANSPORT_ERROR_NO_MERGE = "transport_error_no_merge_observed"
 DEFAULT_BRANCH_FF_STATUS_TRANSPORT_ERROR_AMBIGUOUS = "transport_error_state_ambiguous"
+# Issue #1603 iteration-2 P1-4: non-zero `git merge` exit outcomes, resolved
+# by re-reading live state rather than assumed.
+DEFAULT_BRANCH_FF_STATUS_EXECUTION_ERROR_MERGED_AND_VERIFIED = "execution_error_but_merged_and_verified"
+DEFAULT_BRANCH_FF_STATUS_EXECUTION_ERROR_STATE_AMBIGUOUS = "execution_error_state_ambiguous"
 
 # Live identity-probe outcome vocabulary for `_probe_default_branch_identity`
 # (Issue #1603 AC1): `confirmed` means the live `git ls-remote --symref`
@@ -1504,6 +1515,12 @@ class VerifiedDefaultBranchFfMergeTransactionResult:
     live_default_branch_oid: str | None
     merge_returncode: int | None
     post_head: str | None
+    # Issue #1603 iteration-2 P1-2: trusted Git execution context audit
+    # (populated once a TrustedGitContext is established; None if denied
+    # before that point).
+    trusted_git_dir: str | None = None
+    trusted_git_common_dir: str | None = None
+    trusted_worktree_toplevel: str | None = None
 
 
 def _default_branch_ff_denied(
@@ -1513,6 +1530,9 @@ def _default_branch_ff_denied(
     verified_local_head: str | None = None,
     candidate_default_branch: str | None = None,
     live_default_branch_oid: str | None = None,
+    trusted_git_dir: str | None = None,
+    trusted_git_common_dir: str | None = None,
+    trusted_worktree_toplevel: str | None = None,
 ) -> VerifiedDefaultBranchFfMergeTransactionResult:
     return VerifiedDefaultBranchFfMergeTransactionResult(
         status=DEFAULT_BRANCH_FF_STATUS_DENIED,
@@ -1523,41 +1543,256 @@ def _default_branch_ff_denied(
         live_default_branch_oid=live_default_branch_oid,
         merge_returncode=None,
         post_head=None,
+        trusted_git_dir=trusted_git_dir,
+        trusted_git_common_dir=trusted_git_common_dir,
+        trusted_worktree_toplevel=trusted_worktree_toplevel,
     )
 
 
-_DEFAULT_BRANCH_SYNC_CANDIDATE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+# Issue #1603 iteration-2 P2-6: OWNER review found the previous
+# `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` shape check rejected legitimate default
+# branch names containing `/` (e.g. `release/2026`) or longer than 64 chars.
+# This lane is a general `<default-branch>` sync (not `main`-only by
+# contract), so the shape check is now a permissive syntax-only pre-filter
+# (non-empty, no whitespace/control chars, no leading `-`, no `..`
+# component) -- `git check-ref-format --branch` (already invoked below via
+# `validate_branch_name_via_git`) remains the SOLE grammar authority.
+_DEFAULT_BRANCH_SYNC_CANDIDATE_RE = re.compile(r"^(?!-)(?!.*\.\.)[!-~]+\Z")
+
+# Issue #1603 iteration-2 P1-2: trusted Git execution context. All Git
+# subprocess calls made INSIDE the trusted transaction (probe / fetch /
+# ancestry / merge) run through this sanitized environment and a
+# once-resolved absolute `git` binary, so injected GIT_DIR / GIT_WORK_TREE /
+# GIT_INDEX_FILE / GIT_OBJECT_DIRECTORY / GIT_ALTERNATE_OBJECT_DIRECTORIES /
+# GIT_CONFIG_COUNT / GIT_CONFIG_KEY_* / GIT_CONFIG_VALUE_* environment
+# variables (or a PATH-shadowed `git`) cannot redirect the transaction to a
+# different repository, index, or object database than the one
+# independently re-resolved here.
+_TRUSTED_GIT_ENV_STRIP_EXACT = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG_COUNT",
+    }
+)
+_TRUSTED_GIT_ENV_STRIP_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+
+
+def _sanitized_trusted_git_env() -> dict:
+    env = dict(os.environ)
+    for key in list(env):
+        if key in _TRUSTED_GIT_ENV_STRIP_EXACT or key.startswith(_TRUSTED_GIT_ENV_STRIP_PREFIXES):
+            del env[key]
+    return env
+
+
+def _resolve_trusted_git_binary() -> str | None:
+    import shutil as _shutil
+
+    return _shutil.which("git")
+
+
+@dataclass(frozen=True)
+class TrustedGitContext:
+    """Issue #1603 iteration-2 P1-2: resolved once per transaction, reused
+    for every subsequent trusted Git subprocess call."""
+
+    git_bin: str
+    env: dict
+    worktree_toplevel: str
+    git_dir: str
+    git_common_dir: str
+
+
+def _establish_trusted_git_context(cwd: str, timeout: int = 10) -> tuple:
+    """Resolve the trusted `git` binary, a sanitized environment, and the
+    repository identity (`--show-toplevel` / `--git-dir` / `--git-common-dir`)
+    using ONLY that sanitized environment -- never trusting the parent
+    process's possibly-injected Git environment variables. Also rejects
+    `refs/replace/*` and legacy `info/grafts` commit-graph rewrites, which
+    could otherwise make the live-verified target OID resolve to different
+    object content than what was actually probed/fetched (Issue #1603
+    iteration-2 P1-2). Returns `(TrustedGitContext | None, reason_code | None)`."""
+    git_bin = _resolve_trusted_git_binary()
+    if not git_bin:
+        return None, "trusted_git_binary_unresolved"
+    env = _sanitized_trusted_git_env()
+
+    def _run(args: list[str]):
+        try:
+            return subprocess.run(
+                [git_bin, *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, check=False
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    toplevel_proc = _run(["rev-parse", "--show-toplevel"])
+    gitdir_proc = _run(["rev-parse", "--git-dir"])
+    common_proc = _run(["rev-parse", "--git-common-dir"])
+    if toplevel_proc is None or gitdir_proc is None or common_proc is None:
+        return None, "trusted_git_context_probe_error"
+    if toplevel_proc.returncode != 0 or gitdir_proc.returncode != 0 or common_proc.returncode != 0:
+        return None, "trusted_git_context_probe_error"
+
+    toplevel = toplevel_proc.stdout.strip()
+    gitdir_raw = gitdir_proc.stdout.strip()
+    common_raw = common_proc.stdout.strip()
+    if not toplevel or not gitdir_raw or not common_raw:
+        return None, "trusted_git_context_probe_error"
+    toplevel_real = os.path.realpath(toplevel)
+    gitdir_real = os.path.realpath(gitdir_raw if os.path.isabs(gitdir_raw) else os.path.join(cwd, gitdir_raw))
+    common_real = os.path.realpath(common_raw if os.path.isabs(common_raw) else os.path.join(cwd, common_raw))
+
+    replace_proc = _run(["for-each-ref", "refs/replace/"])
+    if replace_proc is None or replace_proc.returncode != 0:
+        return None, "trusted_git_context_probe_error"
+    if replace_proc.stdout.strip():
+        return None, "replace_refs_present"
+
+    grafts_path = os.path.join(gitdir_real, "info", "grafts")
+    if os.path.isfile(grafts_path):
+        try:
+            with open(grafts_path, encoding="utf-8", errors="ignore") as fh:
+                grafts_content = fh.read().strip()
+        except OSError:
+            return None, "trusted_git_context_probe_error"
+        if grafts_content:
+            return None, "legacy_grafts_present"
+
+    return (
+        TrustedGitContext(
+            git_bin=git_bin, env=env, worktree_toplevel=toplevel_real, git_dir=gitdir_real, git_common_dir=common_real
+        ),
+        None,
+    )
+
+
+def _run_trusted_git(ctx: "TrustedGitContext", args: list[str], cwd: str, timeout: int):
+    """Run a Git subprocess inside the trusted, sanitized context resolved by
+    `_establish_trusted_git_context`. Propagates `OSError` /
+    `subprocess.TimeoutExpired` to the caller for outcome classification."""
+    return subprocess.run(
+        [ctx.git_bin, *args], cwd=cwd, env=ctx.env, capture_output=True, text=True, timeout=timeout, check=False
+    )
+
+
+def _is_local_commit_object_trusted(ctx: "TrustedGitContext", cwd: str, sha: str, timeout: int) -> bool:
+    if not _SHA_RE.fullmatch(sha or ""):
+        return False
+    try:
+        result = _run_trusted_git(ctx, ["--no-replace-objects", "cat-file", "-t", sha], cwd, timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "commit"
+
+
+def _is_ancestor_trusted(ctx: "TrustedGitContext", cwd: str, ancestor: str, descendant: str, timeout: int):
+    if not (_SHA_RE.fullmatch(ancestor) and _SHA_RE.fullmatch(descendant)):
+        return None
+    try:
+        result = _run_trusted_git(
+            ctx, ["--no-replace-objects", "merge-base", "--is-ancestor", ancestor, descendant], cwd, timeout
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    return None
+
+
+def _resolve_worktree_execution_lock_path(ctx: "TrustedGitContext", cwd: str, timeout: int) -> str | None:
+    try:
+        result = _run_trusted_git(ctx, ["rev-parse", "--git-path", "loop-default-branch-ff.lock"], cwd, timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    out = result.stdout.strip()
+    if not out:
+        return None
+    return out if os.path.isabs(out) else os.path.join(cwd, out)
+
+
+class _WorktreeExecutionLock:
+    """Issue #1603 iteration-2 P1-High-5: an OS file lock (``fcntl.flock``,
+    exclusive, non-blocking with bounded retry) that serializes the ENTIRE
+    trusted transaction for a SINGLE linked worktree -- Git context binding,
+    both live probes, the fetch, ancestry, the merge itself, and
+    postcondition readback all happen while this lock is held. This is NOT
+    `git worktree lock` (that guards `prune`/`move`, not transaction mutual
+    exclusion) -- a concurrent invocation of this same transaction for the
+    same worktree is denied rather than racing the branch/HEAD checks
+    against the merge."""
+
+    def __init__(self, lock_path: str) -> None:
+        self._lock_path = lock_path
+        self._fh = None
+
+    def acquire(self, timeout: float = 20.0, poll_interval: float = 0.05) -> bool:
+        import fcntl
+        import time as _time
+
+        os.makedirs(os.path.dirname(self._lock_path), exist_ok=True)
+        fh = open(self._lock_path, "a+")
+        deadline = _time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._fh = fh
+                return True
+            except OSError:
+                if _time.monotonic() >= deadline:
+                    fh.close()
+                    return False
+                _time.sleep(poll_interval)
+
+    def release(self) -> None:
+        if self._fh is None:
+            return
+        import fcntl
+
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._fh.close()
+            self._fh = None
 
 
 def _probe_default_branch_identity(
-    cwd: str, fetch_url: str, candidate: str, timeout: int = 10
+    ctx: "TrustedGitContext", cwd: str, fetch_url: str, candidate: str, timeout: int = 10
 ) -> tuple[str, str | None, str | None]:
     """Live `git ls-remote --symref --exit-code <fetch_url> HEAD
-    refs/heads/<candidate>` identity probe (Issue #1603 AC1). Returns
-    `(status, oid, error_category)`:
+    refs/heads/<candidate>` identity probe (Issue #1603 AC1), executed inside
+    the trusted sanitized Git context. Returns `(status, oid, error_category)`:
 
       - `DEFAULT_BRANCH_IDENTITY_CONFIRMED`: the remote's `HEAD` is an exact
-        symref to `refs/heads/<candidate>`, and the OID reported for `HEAD`
-        equals the OID reported for `refs/heads/<candidate>` and is a unique
-        lowercase 40-hex SHA. `oid` carries that confirmed value.
+        symref to `refs/heads/<candidate>`, EXACTLY ONE oid line was reported
+        for `HEAD` and EXACTLY ONE for `refs/heads/<candidate>`, both are
+        already-lowercase 40-hex SHAs (uppercase input is rejected, never
+        silently normalized -- Issue #1603 iteration-2 P2-8), and the two
+        OIDs are equal.
       - `DEFAULT_BRANCH_IDENTITY_MISMATCH`: the probe itself succeeded but
         `<candidate>` is not what `HEAD` currently symrefs to (or the ref is
         absent) -- `candidate` is NOT the live default branch. `oid` is None.
       - `DEFAULT_BRANCH_IDENTITY_PROBE_ERROR`: timeout, transport failure,
-        unexpected returncode, or malformed/inconsistent output -- NEVER
-        folded into `mismatch`. `error_category` discriminates why.
+        unexpected returncode, duplicate oid lines for the same ref, or
+        malformed/inconsistent output -- NEVER folded into `mismatch`.
+        `error_category` discriminates why.
 
     Never trusts a locally cached `origin/HEAD` / `LOOP_DEFAULT_BRANCH`
     value -- this is always a live remote round-trip performed in the same
     execution cycle as the caller's other checks."""
     try:
-        result = subprocess.run(
-            ["git", "ls-remote", "--symref", "--exit-code", fetch_url, "HEAD", f"refs/heads/{candidate}"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
+        result = _run_trusted_git(
+            ctx,
+            ["ls-remote", "--symref", "--exit-code", fetch_url, "HEAD", f"refs/heads/{candidate}"],
+            cwd,
+            timeout,
         )
     except subprocess.TimeoutExpired:
         return DEFAULT_BRANCH_IDENTITY_PROBE_ERROR, None, PROBE_ERROR_CATEGORY_TIMEOUT
@@ -1569,7 +1804,7 @@ def _probe_default_branch_identity(
         return DEFAULT_BRANCH_IDENTITY_PROBE_ERROR, None, PROBE_ERROR_CATEGORY_UNEXPECTED_RETURNCODE
 
     symref_target: str | None = None
-    oid_by_ref: dict[str, str] = {}
+    oid_lines_by_ref: dict = {}
     for line in result.stdout.splitlines():
         line = line.strip()
         if not line:
@@ -1583,17 +1818,27 @@ def _probe_default_branch_identity(
         parts = line.split()
         if len(parts) != 2:
             return DEFAULT_BRANCH_IDENTITY_PROBE_ERROR, None, PROBE_ERROR_CATEGORY_MALFORMED_OUTPUT
-        oid_by_ref[parts[1]] = parts[0].lower()
+        oid_raw, ref_name = parts[0], parts[1]
+        # Issue #1603 iteration-2 P2-8: validate the RAW (non-lowercased)
+        # value -- uppercase input is REJECTED, never silently normalized
+        # (mirrors the existing `_classify_rtk_git_merge` raw-input
+        # discipline elsewhere in this module).
+        if not _SHA_RE.fullmatch(oid_raw):
+            return DEFAULT_BRANCH_IDENTITY_PROBE_ERROR, None, PROBE_ERROR_CATEGORY_MALFORMED_OUTPUT
+        oid_lines_by_ref.setdefault(ref_name, []).append(oid_raw)
 
     expected_ref = f"refs/heads/{candidate}"
     if symref_target != expected_ref:
         return DEFAULT_BRANCH_IDENTITY_MISMATCH, None, None
-    head_oid = oid_by_ref.get("HEAD")
-    candidate_oid = oid_by_ref.get(expected_ref)
-    if not head_oid or not candidate_oid:
+    head_entries = oid_lines_by_ref.get("HEAD", [])
+    candidate_entries = oid_lines_by_ref.get(expected_ref, [])
+    # Issue #1603 iteration-2 P2-8: require EXACTLY one oid line per ref --
+    # duplicate lines for the same ref are malformed output, not resolved by
+    # "last one wins".
+    if len(head_entries) != 1 or len(candidate_entries) != 1:
         return DEFAULT_BRANCH_IDENTITY_PROBE_ERROR, None, PROBE_ERROR_CATEGORY_MALFORMED_OUTPUT
-    if not (_SHA_RE.fullmatch(head_oid) and _SHA_RE.fullmatch(candidate_oid)):
-        return DEFAULT_BRANCH_IDENTITY_PROBE_ERROR, None, PROBE_ERROR_CATEGORY_MALFORMED_OUTPUT
+    head_oid = head_entries[0]
+    candidate_oid = candidate_entries[0]
     if head_oid != candidate_oid:
         return DEFAULT_BRANCH_IDENTITY_MISMATCH, None, None
     return DEFAULT_BRANCH_IDENTITY_CONFIRMED, head_oid, None
@@ -1615,42 +1860,58 @@ def execute_verified_default_branch_ff_merge_transaction(
     target is the CANONICAL default branch's live head (discovered via `git
     ls-remote --symref`), not a caller-supplied active-branch remote-head SHA.
 
+    Issue #1603 iteration-2 OWNER adversarial review additions:
+      - A per-worktree OS file lock (`_WorktreeExecutionLock`) is held for
+        the Git-context-bound body of the transaction (P1-High-5): a
+        concurrent invocation for the same worktree is denied rather than
+        racing.
+      - Every Git subprocess call for the live probes / fetch / ancestry /
+        merge runs inside a sanitized `TrustedGitContext` (P1-2): injected
+        GIT_* env vars cannot redirect the repository/index/object
+        database, and `refs/replace/*` / legacy `info/grafts` rewrites are
+        rejected fail-closed.
+      - The object-only fetch additionally disables submodule recursion,
+        FETCH_HEAD writes, auto maintenance, and commit-graph writes, and
+        classifies failures into `fetch_execution_not_started` /
+        `fetch_failed_object_not_observed` / `fetch_failed_object_observed` /
+        `fetch_state_ambiguous` instead of a single `denied` (P1-3). Object
+        database / pack file mutation from the fetch itself is unavoidable
+        and is NOT controlled by this transaction (see the PR's Safety
+        Claim Matrix `Not controlled` column).
+      - A non-zero `git merge --ff-only` exit no longer assumes rejection:
+        live state is re-read and classified first (P1-4).
+
     Sequence (each step fails closed):
       0. `cwd` must resolve to the SAME realpath as `expected_worktree_realpath`,
          and that path must be a LINKED worktree (never the primary/root
          checkout).
-      1. `candidate_default_branch` must pass Git's own ref-name grammar
-         (`git check-ref-format --branch`) and the shape regex.
+      1. `candidate_default_branch` must pass a permissive syntax pre-filter
+         and Git's own ref-name grammar (`git check-ref-format --branch`,
+         the sole grammar authority -- Issue #1603 iteration-2 P2-6).
       2. Attached HEAD must be a non-default branch matching the canonical
          issue-worktree naming shape (`worktree-issue-<N>-<slug>`), and the
          captured `<N>` must equal `active_issue_number`.
       3. Worktree/index/submodules must be clean; no git operation may be
          in progress.
       4. `origin`'s single resolved FETCH url must match the canonical
-         repository identity; the SAME url is used for both live identity
-         probes and the object-only fetch below.
-      5. Live identity probe #1 (`_probe_default_branch_identity`): `HEAD`
-         must symref to exactly `refs/heads/<candidate_default_branch>`,
-         confirming `<candidate_default_branch>` IS the live default branch
-         -- never trusts a locally cached `origin/HEAD` / `LOOP_DEFAULT_BRANCH`
-         value for this authorization.
-      6. An object-only, destination-less `git fetch <fetch_url> <live_oid>`
-         is performed -- this fetches ONLY the object graph reachable from
-         the probed OID into the local object database; it updates no local
-         branch ref (not even a remote-tracking ref).
-      7. Live identity probe #2 (re-run of step 5): the default branch
-         identity and OID must be UNCHANGED after the fetch -- any drift
-         denies before merge.
-      8. The fetched OID must be a local commit object, and local HEAD must
+         repository identity.
+      5. A per-worktree execution lock is acquired; a trusted, sanitized Git
+         context is established and audited (replace-refs / grafts
+         rejected).
+      6. Live identity probe #1: `HEAD` must symref to exactly
+         `refs/heads/<candidate_default_branch>` with a unique lowercase
+         40-hex OID.
+      7. An object-only, destination-less, side-effect-minimized `git fetch`
+         is performed.
+      8. Live identity probe #2 (re-run of step 6): unchanged after fetch.
+      9. The fetched OID must be a local commit object, and local HEAD must
          be an ancestor of it (fast-forward eligibility).
-      9. Branch/HEAD are re-confirmed unchanged immediately before the merge
-         (narrows, does not eliminate, the verify-to-merge race window).
-      10. `git merge --ff-only <oid>` is executed as an argv list with
-          `shell=False`.
-      11. Postconditions are checked unconditionally after the merge attempt,
-          including after a timeout/transport exception -- active branch
-          unchanged, `HEAD == oid`, worktree/index clean, no operation
-          residue.
+      10. Branch/HEAD are re-confirmed unchanged immediately before the
+          merge.
+      11. `git merge --ff-only <oid>` is executed.
+      12. Postconditions are checked unconditionally, including after a
+          non-zero exit / timeout / transport exception, by re-reading live
+          state rather than assuming an outcome.
     """
     if not expected_worktree_realpath:
         return _default_branch_ff_denied(
@@ -1669,6 +1930,17 @@ def execute_verified_default_branch_ff_merge_transaction(
     if not is_linked:
         return _default_branch_ff_denied(
             "expected_worktree_is_root_checkout", candidate_default_branch=candidate_default_branch
+        )
+
+    # Issue #1603 iteration-2 P1-2: establish the trusted, sanitized Git
+    # context and reject `refs/replace/*` / legacy grafts BEFORE any other
+    # Git read (branch/clean/operation-state checks below) can be silently
+    # influenced by a replace-ref's transparent object substitution or an
+    # injected GIT_* environment variable.
+    trusted_ctx, ctx_reason = _establish_trusted_git_context(cwd, timeout=timeout)
+    if trusted_ctx is None:
+        return _default_branch_ff_denied(
+            ctx_reason or "trusted_git_context_probe_error", candidate_default_branch=candidate_default_branch
         )
 
     if not _DEFAULT_BRANCH_SYNC_CANDIDATE_RE.fullmatch(candidate_default_branch or ""):
@@ -1742,96 +2014,139 @@ def execute_verified_default_branch_ff_merge_transaction(
             "local_head_unavailable", active_branch=active_branch, candidate_default_branch=candidate_default_branch
         )
 
-    identity_status, live_oid, _err_cat = _probe_default_branch_identity(
-        cwd, fetch_url, candidate_default_branch, timeout=timeout
-    )
-    if identity_status != DEFAULT_BRANCH_IDENTITY_CONFIRMED:
-        reason_code = (
-            "live_default_branch_probe_failed"
-            if identity_status == DEFAULT_BRANCH_IDENTITY_PROBE_ERROR
-            else "live_default_branch_identity_mismatch"
+    lock_path = _resolve_worktree_execution_lock_path(trusted_ctx, cwd, timeout)
+    if not lock_path:
+        return _default_branch_ff_denied(
+            "worktree_execution_lock_path_unresolved",
+            active_branch=active_branch,
+            verified_local_head=local_head,
+            candidate_default_branch=candidate_default_branch,
+            trusted_git_dir=trusted_ctx.git_dir,
+            trusted_git_common_dir=trusted_ctx.git_common_dir,
+            trusted_worktree_toplevel=trusted_ctx.worktree_toplevel,
         )
+    lock = _WorktreeExecutionLock(lock_path)
+    # Issue #1603 iteration-2 P1-High-5 test hook: bounded lock-acquire
+    # timeout is overridable via env for fast contention tests -- production
+    # default remains 20s.
+    _lock_timeout_raw = os.environ.get("LOOP_DEFAULT_BRANCH_FF_LOCK_TIMEOUT_SECONDS", "").strip()
+    try:
+        _lock_timeout = float(_lock_timeout_raw) if _lock_timeout_raw else 20.0
+    except ValueError:
+        _lock_timeout = 20.0
+    if not lock.acquire(timeout=_lock_timeout):
+        return _default_branch_ff_denied(
+            "worktree_execution_lock_contended",
+            active_branch=active_branch,
+            verified_local_head=local_head,
+            candidate_default_branch=candidate_default_branch,
+            trusted_git_dir=trusted_ctx.git_dir,
+            trusted_git_common_dir=trusted_ctx.git_common_dir,
+            trusted_worktree_toplevel=trusted_ctx.worktree_toplevel,
+        )
+    try:
+        return _execute_verified_default_branch_ff_merge_transaction_locked(
+            trusted_ctx,
+            cwd,
+            candidate_default_branch,
+            active_branch=active_branch,
+            local_head=local_head,
+            fetch_url=fetch_url,
+            timeout=timeout,
+        )
+    finally:
+        lock.release()
+
+
+def _execute_verified_default_branch_ff_merge_transaction_locked(
+    ctx: "TrustedGitContext",
+    cwd: str,
+    candidate_default_branch: str,
+    *,
+    active_branch: str,
+    local_head: str,
+    fetch_url: str,
+    timeout: int,
+) -> VerifiedDefaultBranchFfMergeTransactionResult:
+    """The lock-held, trusted-context-bound body of
+    `execute_verified_default_branch_ff_merge_transaction` (Issue #1603
+    iteration-2). All preconditions up to (and including) trusted context /
+    lock acquisition were already verified by the caller."""
+
+    def _denied(reason_code: str, *, live_oid: str | None = None) -> VerifiedDefaultBranchFfMergeTransactionResult:
         return _default_branch_ff_denied(
             reason_code,
             active_branch=active_branch,
             verified_local_head=local_head,
             candidate_default_branch=candidate_default_branch,
+            live_default_branch_oid=live_oid,
+            trusted_git_dir=ctx.git_dir,
+            trusted_git_common_dir=ctx.git_common_dir,
+            trusted_worktree_toplevel=ctx.worktree_toplevel,
         )
 
+    identity_status, live_oid, _err_cat = _probe_default_branch_identity(
+        ctx, cwd, fetch_url, candidate_default_branch, timeout=timeout
+    )
+    if identity_status != DEFAULT_BRANCH_IDENTITY_CONFIRMED:
+        return _denied(
+            "live_default_branch_probe_failed"
+            if identity_status == DEFAULT_BRANCH_IDENTITY_PROBE_ERROR
+            else "live_default_branch_identity_mismatch"
+        )
+
+    # Issue #1603 iteration-2 P1-3: object-only, side-effect-minimized fetch.
+    # Object database / pack file mutation from `git fetch` itself is
+    # unavoidable and NOT controlled by this transaction -- everything else
+    # (FETCH_HEAD, auto maintenance, submodule recursion, commit-graph
+    # writes) is explicitly disabled.
     try:
-        fetch_proc = subprocess.run(
-            ["git", "fetch", "--no-tags", fetch_url, live_oid],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
+        fetch_proc = _run_trusted_git(
+            ctx,
+            [
+                "--no-replace-objects",
+                "fetch",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--no-write-fetch-head",
+                "--no-auto-maintenance",
+                "--no-write-commit-graph",
+                fetch_url,
+                live_oid,
+            ],
+            cwd,
+            timeout,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return _default_branch_ff_denied(
-            "default_branch_object_fetch_failed",
-            active_branch=active_branch,
-            verified_local_head=local_head,
-            candidate_default_branch=candidate_default_branch,
-            live_default_branch_oid=live_oid,
-        )
+    except OSError:
+        return _denied("fetch_execution_not_started", live_oid=live_oid)
+    except subprocess.TimeoutExpired:
+        # Timeout: the fetch process's exit semantics cannot be trusted --
+        # always ambiguous, regardless of whether the object later appears.
+        return _denied("fetch_state_ambiguous", live_oid=live_oid)
     if fetch_proc.returncode != 0:
-        return _default_branch_ff_denied(
-            "default_branch_object_fetch_failed",
-            active_branch=active_branch,
-            verified_local_head=local_head,
-            candidate_default_branch=candidate_default_branch,
-            live_default_branch_oid=live_oid,
+        object_observed = _is_local_commit_object_trusted(ctx, cwd, live_oid, timeout)
+        return _denied(
+            "fetch_failed_object_observed" if object_observed else "fetch_failed_object_not_observed",
+            live_oid=live_oid,
         )
 
     reprobe_status, reprobe_oid, _reprobe_err_cat = _probe_default_branch_identity(
-        cwd, fetch_url, candidate_default_branch, timeout=timeout
+        ctx, cwd, fetch_url, candidate_default_branch, timeout=timeout
     )
     if reprobe_status != DEFAULT_BRANCH_IDENTITY_CONFIRMED or reprobe_oid != live_oid:
-        return _default_branch_ff_denied(
-            "live_default_branch_identity_changed_after_fetch",
-            active_branch=active_branch,
-            verified_local_head=local_head,
-            candidate_default_branch=candidate_default_branch,
-            live_default_branch_oid=live_oid,
-        )
+        return _denied("live_default_branch_identity_changed_after_fetch", live_oid=live_oid)
 
-    if not _is_local_commit_object(cwd, live_oid):
-        return _default_branch_ff_denied(
-            "fetched_object_not_local_commit",
-            active_branch=active_branch,
-            verified_local_head=local_head,
-            candidate_default_branch=candidate_default_branch,
-            live_default_branch_oid=live_oid,
-        )
+    if not _is_local_commit_object_trusted(ctx, cwd, live_oid, timeout):
+        return _denied("fetched_object_not_local_commit", live_oid=live_oid)
 
-    if _is_ancestor(cwd, local_head, live_oid) is not True:
-        return _default_branch_ff_denied(
-            "target_not_descendant_of_head",
-            active_branch=active_branch,
-            verified_local_head=local_head,
-            candidate_default_branch=candidate_default_branch,
-            live_default_branch_oid=live_oid,
-        )
+    if _is_ancestor_trusted(ctx, cwd, local_head, live_oid, timeout) is not True:
+        return _denied("target_not_descendant_of_head", live_oid=live_oid)
 
     if _current_branch(cwd) != active_branch or _current_head(cwd) != local_head:
-        return _default_branch_ff_denied(
-            "branch_or_head_changed_before_merge",
-            active_branch=active_branch,
-            verified_local_head=local_head,
-            candidate_default_branch=candidate_default_branch,
-            live_default_branch_oid=live_oid,
-        )
+        return _denied("branch_or_head_changed_before_merge", live_oid=live_oid)
 
     try:
-        proc = subprocess.run(
-            ["git", "merge", "--ff-only", live_oid],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        proc = _run_trusted_git(ctx, ["--no-replace-objects", "merge", "--ff-only", live_oid], cwd, timeout)
     except OSError:
         return VerifiedDefaultBranchFfMergeTransactionResult(
             status=DEFAULT_BRANCH_FF_STATUS_EXECUTION_NOT_STARTED,
@@ -1842,73 +2157,76 @@ def execute_verified_default_branch_ff_merge_transaction(
             live_default_branch_oid=live_oid,
             merge_returncode=None,
             post_head=None,
+            trusted_git_dir=ctx.git_dir,
+            trusted_git_common_dir=ctx.git_common_dir,
+            trusted_worktree_toplevel=ctx.worktree_toplevel,
         )
     except subprocess.TimeoutExpired:
         post_branch = _current_branch(cwd)
         post_head = _current_head(cwd)
         post_clean = _is_worktree_clean(cwd)
         post_has_op = _has_in_progress_operation(cwd)
-        if (
-            post_branch == active_branch
-            and post_head == live_oid
-            and post_clean is True
-            and post_has_op is False
-        ):
-            return VerifiedDefaultBranchFfMergeTransactionResult(
-                status=DEFAULT_BRANCH_FF_STATUS_TRANSPORT_ERROR_MERGED_VERIFIED,
-                reason_code="merge_execution_timeout_but_merged_and_verified",
-                active_branch=active_branch,
-                verified_local_head=local_head,
-                candidate_default_branch=candidate_default_branch,
-                live_default_branch_oid=live_oid,
-                merge_returncode=None,
-                post_head=post_head,
-            )
-        if (
-            post_branch == active_branch
-            and post_head == local_head
-            and post_clean is True
-            and post_has_op is False
-        ):
-            return VerifiedDefaultBranchFfMergeTransactionResult(
-                status=DEFAULT_BRANCH_FF_STATUS_TRANSPORT_ERROR_NO_MERGE,
-                reason_code="merge_execution_timeout_no_merge_observed",
-                active_branch=active_branch,
-                verified_local_head=local_head,
-                candidate_default_branch=candidate_default_branch,
-                live_default_branch_oid=live_oid,
-                merge_returncode=None,
-                post_head=post_head,
-            )
+        if post_branch == active_branch and post_head == live_oid and post_clean is True and post_has_op is False:
+            status = DEFAULT_BRANCH_FF_STATUS_TRANSPORT_ERROR_MERGED_VERIFIED
+            reason_code = "merge_execution_timeout_but_merged_and_verified"
+        elif post_branch == active_branch and post_head == local_head and post_clean is True and post_has_op is False:
+            status = DEFAULT_BRANCH_FF_STATUS_TRANSPORT_ERROR_NO_MERGE
+            reason_code = "merge_execution_timeout_no_merge_observed"
+        else:
+            status = DEFAULT_BRANCH_FF_STATUS_TRANSPORT_ERROR_AMBIGUOUS
+            reason_code = "merge_execution_timeout_state_ambiguous"
         return VerifiedDefaultBranchFfMergeTransactionResult(
-            status=DEFAULT_BRANCH_FF_STATUS_TRANSPORT_ERROR_AMBIGUOUS,
-            reason_code="merge_execution_timeout_state_ambiguous",
+            status=status,
+            reason_code=reason_code,
             active_branch=active_branch,
             verified_local_head=local_head,
             candidate_default_branch=candidate_default_branch,
             live_default_branch_oid=live_oid,
             merge_returncode=None,
             post_head=post_head,
+            trusted_git_dir=ctx.git_dir,
+            trusted_git_common_dir=ctx.git_common_dir,
+            trusted_worktree_toplevel=ctx.worktree_toplevel,
         )
 
     post_branch = _current_branch(cwd)
     post_head = _current_head(cwd)
     post_clean = _is_worktree_clean(cwd)
     post_has_op = _has_in_progress_operation(cwd)
+    post_state_matches_target = (
+        post_branch == active_branch and post_head == live_oid and post_clean is True and post_has_op is False
+    )
+    post_state_matches_original = (
+        post_branch == active_branch and post_head == local_head and post_clean is True and post_has_op is False
+    )
 
     if proc.returncode != 0:
+        # Issue #1603 iteration-2 P1-4: a non-zero exit no longer assumes
+        # rejection -- live state is read and classified FIRST.
+        if post_state_matches_target:
+            status = DEFAULT_BRANCH_FF_STATUS_EXECUTION_ERROR_MERGED_AND_VERIFIED
+            reason_code = "merge_execution_error_but_merged_and_verified"
+        elif post_state_matches_original:
+            status = DEFAULT_BRANCH_FF_STATUS_MERGE_REJECTED
+            reason_code = "merge_execution_error_no_merge_observed"
+        else:
+            status = DEFAULT_BRANCH_FF_STATUS_EXECUTION_ERROR_STATE_AMBIGUOUS
+            reason_code = "merge_execution_error_state_ambiguous"
         return VerifiedDefaultBranchFfMergeTransactionResult(
-            status=DEFAULT_BRANCH_FF_STATUS_MERGE_REJECTED,
-            reason_code="merge_ff_only_rejected",
+            status=status,
+            reason_code=reason_code,
             active_branch=active_branch,
             verified_local_head=local_head,
             candidate_default_branch=candidate_default_branch,
             live_default_branch_oid=live_oid,
             merge_returncode=proc.returncode,
             post_head=post_head,
+            trusted_git_dir=ctx.git_dir,
+            trusted_git_common_dir=ctx.git_common_dir,
+            trusted_worktree_toplevel=ctx.worktree_toplevel,
         )
 
-    if post_branch != active_branch or post_head != live_oid or post_clean is not True or post_has_op is not False:
+    if not post_state_matches_target:
         return VerifiedDefaultBranchFfMergeTransactionResult(
             status=DEFAULT_BRANCH_FF_STATUS_POSTCONDITION_VIOLATION,
             reason_code="postcondition_check_failed",
@@ -1918,6 +2236,9 @@ def execute_verified_default_branch_ff_merge_transaction(
             live_default_branch_oid=live_oid,
             merge_returncode=proc.returncode,
             post_head=post_head,
+            trusted_git_dir=ctx.git_dir,
+            trusted_git_common_dir=ctx.git_common_dir,
+            trusted_worktree_toplevel=ctx.worktree_toplevel,
         )
 
     return VerifiedDefaultBranchFfMergeTransactionResult(
@@ -1929,6 +2250,9 @@ def execute_verified_default_branch_ff_merge_transaction(
         live_default_branch_oid=live_oid,
         merge_returncode=proc.returncode,
         post_head=post_head,
+        trusted_git_dir=ctx.git_dir,
+        trusted_git_common_dir=ctx.git_common_dir,
+        trusted_worktree_toplevel=ctx.worktree_toplevel,
     )
 
 
@@ -2510,11 +2834,15 @@ def _classify_rtk_git_merge_default_branch(
     #1609 fix_delta). Only the exact 2-token shape `--ff-only
     origin/<branch-name-shaped-token>` is recognized; any other shape (short
     SHA, bare branch name without `origin/` prefix, reordered flags, extra
-    options, `--no-ff`, a target containing `/` inside the branch component,
-    etc.) is denied. Whether `<candidate>` IS actually the live default
-    branch is NOT decided here -- that is a live property only the trusted
-    transaction (`execute_verified_default_branch_ff_merge_transaction`) can
-    verify via `git ls-remote --symref`."""
+    options, `--no-ff`, etc.) is denied. `<branch-name-shaped-token>` is a
+    permissive syntax pre-filter (Issue #1603 iteration-2 P2-6) -- it MAY
+    contain `/` (e.g. `release/2026`); Git's own ref-name grammar (`git
+    check-ref-format --branch`) is the sole grammar authority, enforced by
+    the trusted transaction, not this classifier. Whether `<candidate>` IS
+    actually the live default branch is NOT decided here either -- that is
+    a live property only the trusted transaction
+    (`execute_verified_default_branch_ff_merge_transaction`) can verify via
+    `git ls-remote --symref`."""
     if len(args) != 2 or args[0] != "--ff-only":
         return GitMutationPolicyResult(
             status="deny",
