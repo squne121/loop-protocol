@@ -43,6 +43,7 @@ sha256_of = _ecs_mod.sha256_of
 compute_comments_digest = _ecs_mod.compute_comments_digest
 is_go_fresh = _ecs_mod.is_go_fresh
 is_go_current = _ecs_mod.is_go_current
+is_go_base_binding_current = _ecs_mod.is_go_base_binding_current
 
 # Use post_status constants (B4)
 POST_STATUS_POSTED = _ecs_mod.POST_STATUS_POSTED
@@ -162,7 +163,9 @@ def _mock_parser_mod(
             "html_url": go_comment["html_url"],
             "created_at": go_comment["created_at"],
             "status": "go",
-            "inner": _fresh_inner(_SAMPLE_BODY_SHA256),
+            "inner": _fresh_inner(
+                _SAMPLE_BODY_SHA256, fingerprint_comment_id=go_comment["id"]
+            ),
         })
 
     mod.parse_contract_review_results.return_value = results
@@ -174,8 +177,14 @@ def _mock_parser_mod(
     return mod
 
 
-def _fresh_inner(body_sha256: str) -> dict:
-    return {
+def _fresh_inner(
+    body_sha256: str,
+    *,
+    fingerprint_comment_id: int | None = 1001,
+    base_ref: str = "main",
+    base_sha: str = "a" * 40,
+) -> dict:
+    inner = {
         "body_sha256": body_sha256,
         "checks": {
             "product_spec_check": {
@@ -194,6 +203,17 @@ def _fresh_inner(body_sha256: str) -> dict:
             "vc_preflight": {"classifications": []},
         },
     }
+    if fingerprint_comment_id is not None:
+        inner["expected_contract_fingerprint"] = {
+            "issue_number": _ISSUE_NUMBER,
+            "contract_source_kind": "issue_comment",
+            "contract_source_id": str(fingerprint_comment_id),
+            "contract_body_sha256": body_sha256,
+            "allowed_paths_normalized_sha256": "b" * 64,
+            "base_ref": base_ref,
+            "base_sha_at_snapshot": base_sha,
+        }
+    return inner
 
 
 def _make_review_result(status: str) -> dict:
@@ -1705,8 +1725,11 @@ class TestExistingGoFingerprintReuseGate:
                 "created_at": "2026-06-13T08:00:00Z",
             },
         )
-        # _mock_parser_mod's _fresh_inner() has no expected_contract_fingerprint,
-        # so real is_fingerprint_ready_go() logic is exercised (not mocked here).
+        # Make this candidate legacy-like so real fingerprint-ready logic is
+        # exercised rather than the mock's default return value.
+        parser_mod.parse_contract_review_results.return_value[0]["inner"].pop(
+            "expected_contract_fingerprint"
+        )
         real_parser_mod = _ecs_mod._import_parser_module()
         parser_mod.is_fingerprint_ready_go = real_parser_mod.is_fingerprint_ready_go
 
@@ -1720,6 +1743,163 @@ class TestExistingGoFingerprintReuseGate:
 
         assert result["status"] == "human_judgment"
         assert result["source"] == "readiness_blocked"
+
+
+class TestExistingGoBaseBindingFreshness:
+    """#1635: reuse additionally requires the live GitHub base binding."""
+
+    def test_matching_live_base_reuses_existing_go_without_mutation(self):
+        parser_mod = _mock_parser_mod(
+            comments=[_GO_COMMENT], go_comment=_GO_COMMENT
+        )
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(
+                _ecs_mod,
+                "fetch_issue_snapshot",
+                return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None),
+            ):
+                with patch.object(
+                    _ecs_mod,
+                    "capture_base_ref_and_sha",
+                    return_value=("main", "a" * 40),
+                ) as capture:
+                    result = ensure_contract_snapshot(
+                        issue_number=_ISSUE_NUMBER,
+                        repo=_REPO,
+                        mode="check-only",
+                    )
+
+        assert result["status"] == "ok"
+        assert result["source"] == "existing_go"
+        assert capture.call_count == 1
+
+    def test_base_sha_drift_is_not_reused_in_check_only(self):
+        parser_mod = _mock_parser_mod(
+            comments=[_GO_COMMENT], go_comment=_GO_COMMENT
+        )
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(
+                _ecs_mod,
+                "fetch_issue_snapshot",
+                return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None),
+            ):
+                with patch.object(
+                    _ecs_mod,
+                    "capture_base_ref_and_sha",
+                    return_value=("main", "c" * 40),
+                ):
+                    result = ensure_contract_snapshot(
+                        issue_number=_ISSUE_NUMBER,
+                        repo=_REPO,
+                        mode="check-only",
+                    )
+
+        assert result["status"] == "human_judgment"
+        assert result["contract_snapshot_url"] is None
+        assert "existing_go_base_binding_drift" in result["errors"][0]
+
+    def test_base_ref_drift_is_not_reused_in_check_only(self):
+        parser_mod = _mock_parser_mod(
+            comments=[_GO_COMMENT], go_comment=_GO_COMMENT
+        )
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(
+                _ecs_mod,
+                "fetch_issue_snapshot",
+                return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None),
+            ):
+                with patch.object(
+                    _ecs_mod,
+                    "capture_base_ref_and_sha",
+                    return_value=("release", "a" * 40),
+                ):
+                    result = ensure_contract_snapshot(
+                        issue_number=_ISSUE_NUMBER,
+                        repo=_REPO,
+                        mode="check-only",
+                    )
+
+        assert result["status"] == "human_judgment"
+        assert result["contract_snapshot_url"] is None
+        assert "existing_go_base_binding_drift" in result["errors"][0]
+
+    def test_base_readback_failure_is_fail_closed_for_existing_go(self):
+        parser_mod = _mock_parser_mod(
+            comments=[_GO_COMMENT], go_comment=_GO_COMMENT
+        )
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(
+                _ecs_mod,
+                "fetch_issue_snapshot",
+                return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None),
+            ):
+                with patch.object(
+                    _ecs_mod,
+                    "capture_base_ref_and_sha",
+                    return_value=(None, None),
+                ):
+                    result = ensure_contract_snapshot(
+                        issue_number=_ISSUE_NUMBER,
+                        repo=_REPO,
+                        mode="check-only",
+                    )
+
+        assert result["status"] == "runtime_error"
+        assert result["contract_snapshot_url"] is None
+        assert "base_ref_or_base_sha_capture_failed" in result["errors"][0]
+
+    def test_auto_post_materializes_new_go_after_base_sha_drift(self):
+        parser_mod = _mock_parser_mod(
+            comments=[_GO_COMMENT], go_comment=_GO_COMMENT
+        )
+        review_result = _make_review_result("go")
+        posted_comment_id = 2002
+        posted_url = f"{_ISSUE_URL}#issuecomment-{posted_comment_id}"
+        patched_bodies = []
+
+        def fake_patch(_issue, _repo, comment_id, body, timeout=30):
+            assert comment_id == posted_comment_id
+            patched_bodies.append(body)
+            return True, None
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(
+                _ecs_mod,
+                "fetch_issue_snapshot",
+                return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None),
+            ):
+                with patch.object(
+                    _ecs_mod,
+                    "capture_base_ref_and_sha",
+                    return_value=("main", "d" * 40),
+                ):
+                    with patch.object(
+                        _ecs_mod,
+                        "run_contract_review_once",
+                        return_value=(review_result, None),
+                    ):
+                        with patch.object(
+                            _ecs_mod,
+                            "post_comment",
+                            return_value=(posted_url, POST_STATUS_POSTED, 201),
+                        ) as post:
+                            with patch.object(_ecs_mod, "patch_comment", side_effect=fake_patch):
+                                result = ensure_contract_snapshot(
+                                    issue_number=_ISSUE_NUMBER,
+                                    repo=_REPO,
+                                    mode="auto",
+                                    do_post=True,
+                                )
+
+        assert result["status"] == "ok"
+        assert result["source"] == "materialized_go"
+        post.assert_called_once()
+        assert '"base_sha_at_snapshot":"' + ("d" * 40) + '"' in patched_bodies[0]
+
 
 # ---------------------------------------------------------------------------
 # Migrated from test_contract_snapshot_author_binding.py (Issue #1537 PR #1548

@@ -412,6 +412,36 @@ def is_go_current(go_result: object, expected_body_sha256: str) -> bool:
     )
 
 
+def is_go_base_binding_current(
+    go_result: object,
+    live_base_ref: Optional[str],
+    live_base_sha: Optional[str],
+) -> bool:
+    """Return whether a fingerprint binds the go comment to the live base.
+
+    ``is_fingerprint_ready_go`` is the schema and source-identity authority.
+    This helper deliberately adds the time-sensitive comparison which that
+    parser cannot perform: the fingerprint's captured default branch and tip
+    must still equal a fresh GitHub API readback before a go comment is reused.
+    """
+    if not isinstance(live_base_ref, str) or not live_base_ref:
+        return False
+    if not isinstance(live_base_sha, str) or not live_base_sha:
+        return False
+    if not isinstance(go_result, dict):
+        return False
+    inner = go_result.get("inner")
+    if not isinstance(inner, dict):
+        return False
+    fingerprint = inner.get("expected_contract_fingerprint")
+    if not isinstance(fingerprint, dict):
+        return False
+    return (
+        fingerprint.get("base_ref") == live_base_ref
+        and fingerprint.get("base_sha_at_snapshot") == live_base_sha
+    )
+
+
 def fetch_issue_snapshot(
     issue_number: int,
     repo: str,
@@ -842,6 +872,9 @@ def ensure_contract_snapshot(
     else:
         issue_url = None
 
+    existing_go_result: Optional[dict[str, Any]] = None
+    existing_go_base_binding_drift = False
+
     # Step 1/2: read a candidate snapshot.  A fresh existing go needs one
     # bounded recheck, otherwise a body edit between the two API calls could
     # make an old comment look current.
@@ -903,6 +936,21 @@ def ensure_contract_snapshot(
         if not is_go_current(go_result, body_sha256) or not fingerprint_ready:
             break
 
+        # Fingerprint schema validity alone is insufficient: reuse must be
+        # bound to the current GitHub default branch and its current tip.
+        live_base_ref, live_base_sha = capture_base_ref_and_sha(repo)
+        if not live_base_ref or not live_base_sha:
+            result["errors"].append(
+                "base_ref_or_base_sha_capture_failed: cannot reuse an existing go"
+            )
+            result["status"] = "runtime_error"
+            return result
+        if not is_go_base_binding_current(
+            go_result, live_base_ref, live_base_sha
+        ):
+            existing_go_base_binding_drift = True
+            break
+
         body_confirm, updated_confirm, confirm_err = fetch_issue_snapshot(issue_number, repo)
         if confirm_err:
             result["errors"].append(f"body_refetch_error: {confirm_err}")
@@ -918,6 +966,7 @@ def ensure_contract_snapshot(
             # preserve the fresh snapshot, then continue to run the producer.
             result["source"] = "existing_go"
             result["contract_snapshot_url"] = go_result["html_url"]
+            existing_go_result = go_result
             break
         if attempt == 1:
             result["status"] = "stale_or_conflicting_snapshot"
@@ -929,9 +978,14 @@ def ensure_contract_snapshot(
     if mode == "check-only" and result["contract_snapshot_url"] is None:
         result["status"] = "human_judgment"
         result["source"] = "readiness_blocked"
-        result["errors"].append(
-            "no_existing_go_comment: run issue-contract-review to generate contract snapshot"
-        )
+        if existing_go_base_binding_drift:
+            result["errors"].append(
+                "existing_go_base_binding_drift: run issue-contract-review to generate a fresh snapshot"
+            )
+        else:
+            result["errors"].append(
+                "no_existing_go_comment: run issue-contract-review to generate contract snapshot"
+            )
         return result
 
     # auto or dry-run mode: run contract review once
@@ -988,8 +1042,31 @@ def ensure_contract_snapshot(
         return result
 
     if result["contract_snapshot_url"] is not None:
-        result["status"] = "ok"
-        result["source"] = "existing_go"
+        # current-head evidence production can take long enough for main to
+        # advance. Re-read the binding before returning an existing snapshot.
+        live_base_ref, live_base_sha = capture_base_ref_and_sha(repo)
+        if not live_base_ref or not live_base_sha:
+            result["status"] = "runtime_error"
+            result["errors"].append(
+                "base_ref_or_base_sha_capture_failed: cannot reuse an existing go"
+            )
+            return result
+        if existing_go_result is not None and is_go_base_binding_current(
+            existing_go_result, live_base_ref, live_base_sha
+        ):
+            result["status"] = "ok"
+            result["source"] = "existing_go"
+            return result
+        result["contract_snapshot_url"] = None
+        result["source"] = None
+        existing_go_base_binding_drift = True
+
+    if mode == "check-only":
+        result["status"] = "human_judgment"
+        result["source"] = "readiness_blocked"
+        result["errors"].append(
+            "existing_go_base_binding_drift: run issue-contract-review to generate a fresh snapshot"
+        )
         return result
 
     # review_status == go
@@ -1066,7 +1143,23 @@ def ensure_contract_snapshot(
             go_post.get("inner", {}), go_post.get("comment_id"), issue_number
         )
     )
-    if is_go_current(go_post, body_sha256_post) and go_post_fingerprint_ready:
+    # The same live base binding is required when a go appeared during the
+    # atomicity window. Do not dedupe to a stale candidate, and do not post a
+    # fingerprint if its live base cannot be read back.
+    base_ref, base_sha_at_snapshot = capture_base_ref_and_sha(repo)
+    if not base_ref or not base_sha_at_snapshot:
+        result["status"] = "runtime_error"
+        result["errors"].append(
+            "base_ref_or_base_sha_capture_failed: cannot materialize or reuse a source-bound fingerprint"
+        )
+        return result
+    if (
+        is_go_current(go_post, body_sha256_post)
+        and go_post_fingerprint_ready
+        and is_go_base_binding_current(
+            go_post, base_ref, base_sha_at_snapshot
+        )
+    ):
         body_dedupe, _updated_dedupe, dedupe_err = fetch_issue_snapshot(
             issue_number, repo
         )
@@ -1091,18 +1184,9 @@ def ensure_contract_snapshot(
         )
         return result
 
-    # #1537 AC1: capture the fingerprint's (base_ref, base_sha_at_snapshot)
-    # binding before materializing. If either cannot be captured, do not
-    # post a go at all -- fail closed rather than emit a fingerprint bound to
-    # an unknown/incomplete base.
-    base_ref, base_sha_at_snapshot = capture_base_ref_and_sha(repo)
-    if not base_ref or not base_sha_at_snapshot:
-        result["status"] = "runtime_error"
-        result["errors"].append(
-            "base_ref_or_base_sha_capture_failed: cannot materialize a "
-            "source-bound fingerprint without both values"
-        )
-        return result
+    # The immediately preceding capture also supplies the fresh fingerprint.
+    # Sharing it with the dedupe gate prevents accepting a drifted go and then
+    # posting against a different, unobserved base binding.
     try:
         allowed_paths_at_post = extract_allowed_paths_from_body(body_post or "")
         # Validate before POST; a malformed contract must not create even a
