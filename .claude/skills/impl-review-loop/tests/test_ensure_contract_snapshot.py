@@ -44,6 +44,9 @@ compute_comments_digest = _ecs_mod.compute_comments_digest
 is_go_fresh = _ecs_mod.is_go_fresh
 is_go_current = _ecs_mod.is_go_current
 is_go_base_binding_current = _ecs_mod.is_go_base_binding_current
+_real_verify_snapshot_authority_postcondition = (
+    _ecs_mod.verify_snapshot_authority_postcondition
+)
 
 # Use post_status constants (B4)
 POST_STATUS_POSTED = _ecs_mod.POST_STATUS_POSTED
@@ -95,6 +98,11 @@ def _default_trusted_comment_id_binding(monkeypatch):
     monkeypatch.setattr(
         _ecs_mod,
         "patch_comment",
+        lambda *args, **kwargs: (True, None),
+    )
+    monkeypatch.setattr(
+        _ecs_mod,
+        "verify_snapshot_authority_postcondition",
         lambda *args, **kwargs: (True, None),
     )
 
@@ -515,6 +523,8 @@ class TestFreshGoSnapshots:
         parser_mod.parse_contract_review_results.side_effect = [[], [fresh_go]]
         parser_mod.find_latest_result.side_effect = [None, fresh_go]
         parser_mod.find_latest_go.side_effect = [None, fresh_go]
+        fresh_comment = {**_GO_COMMENT, "id": 1002, "html_url": fresh_go["html_url"]}
+        parser_mod.fetch_issue_comments.side_effect = [([], None), ([fresh_comment], None)]
 
         with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
             with patch.object(_ecs_mod, "fetch_issue_snapshot", return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None)):
@@ -540,6 +550,8 @@ class TestFreshGoSnapshots:
         parser_mod.parse_contract_review_results.side_effect = [[], [fresh_go]]
         parser_mod.find_latest_result.side_effect = [None, fresh_go]
         parser_mod.find_latest_go.side_effect = [None, fresh_go]
+        fresh_comment = {**_GO_COMMENT, "id": 1002, "html_url": fresh_go["html_url"]}
+        parser_mod.fetch_issue_comments.side_effect = [([], None), ([fresh_comment], None)]
         snapshots = [
             (_SAMPLE_BODY, "one", None),
             (_SAMPLE_BODY, "two", None),
@@ -1545,14 +1557,20 @@ class TestComputeExpectedContractFingerprint:
 class TestCaptureBaseRefAndSha:
     def test_success_returns_both_values(self):
         def fake_run(cmd, **kwargs):
-            if cmd[:2] == ["gh", "api"] and "default_branch" in cmd[-1]:
-                pass
             result = MagicMock()
             result.returncode = 0
-            if "--jq" in cmd and cmd[cmd.index("--jq") + 1] == ".default_branch":
-                result.stdout = "main\n"
-            else:
-                result.stdout = ("a" * 40) + "\n"
+            result.stdout = json.dumps(
+                {
+                    "data": {
+                        "repository": {
+                            "defaultBranchRef": {
+                                "name": "main",
+                                "target": {"oid": "a" * 40},
+                            }
+                        }
+                    }
+                }
+            )
             return result
 
         with patch.object(_ecs_mod.subprocess, "run", side_effect=fake_run):
@@ -1560,6 +1578,29 @@ class TestCaptureBaseRefAndSha:
 
         assert base_ref == "main"
         assert base_sha == "a" * 40
+
+    def test_uses_one_graphql_readback_for_branch_and_tip(self):
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = json.dumps(
+            {
+                "data": {
+                    "repository": {
+                        "defaultBranchRef": {
+                            "name": "main",
+                            "target": {"oid": "b" * 40},
+                        }
+                    }
+                }
+            }
+        )
+        with patch.object(_ecs_mod.subprocess, "run", return_value=result) as run:
+            assert capture_base_ref_and_sha(_REPO) == ("main", "b" * 40)
+
+        run.assert_called_once()
+        cmd = run.call_args.args[0]
+        assert cmd[:3] == ["gh", "api", "graphql"]
+        assert "defaultBranchRef" in next(arg for arg in cmd if arg.startswith("query="))
 
     def test_default_branch_failure_returns_none_none(self):
         def fake_run(cmd, **kwargs):
@@ -1574,24 +1615,17 @@ class TestCaptureBaseRefAndSha:
         assert base_ref is None
         assert base_sha is None
 
-    def test_sha_failure_returns_base_ref_with_none_sha(self):
-        calls = {"i": 0}
+    def test_graphql_payload_without_tip_fails_closed(self):
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = json.dumps(
+            {"data": {"repository": {"defaultBranchRef": {"name": "main", "target": {}}}}}
+        )
 
-        def fake_run(cmd, **kwargs):
-            result = MagicMock()
-            calls["i"] += 1
-            if calls["i"] == 1:
-                result.returncode = 0
-                result.stdout = "main\n"
-            else:
-                result.returncode = 1
-                result.stdout = ""
-            return result
-
-        with patch.object(_ecs_mod.subprocess, "run", side_effect=fake_run):
+        with patch.object(_ecs_mod.subprocess, "run", return_value=result):
             base_ref, base_sha = capture_base_ref_and_sha(_REPO)
 
-        assert base_ref == "main"
+        assert base_ref is None
         assert base_sha is None
 
 
@@ -1899,6 +1933,165 @@ class TestExistingGoBaseBindingFreshness:
         assert result["source"] == "materialized_go"
         post.assert_called_once()
         assert '"base_sha_at_snapshot":"' + ("d" * 40) + '"' in patched_bodies[0]
+
+
+class TestFinalAuthorityPostcondition:
+    """P1: no path may expose an ``ok`` snapshot after authority drift."""
+
+    def test_existing_go_base_moves_during_final_readback_returns_stale(self):
+        parser_mod = _mock_parser_mod(comments=[_GO_COMMENT], go_comment=_GO_COMMENT)
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(
+                _ecs_mod,
+                "fetch_issue_snapshot",
+                return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None),
+            ):
+                with patch.object(
+                    _ecs_mod,
+                    "verify_snapshot_authority_postcondition",
+                    return_value=(False, "authority_base_binding_drift"),
+                ):
+                    result = ensure_contract_snapshot(
+                        issue_number=_ISSUE_NUMBER, repo=_REPO, mode="check-only"
+                    )
+
+        assert result["status"] == "stale_or_conflicting_snapshot"
+        assert result["contract_snapshot_url"] is None
+
+    def test_concurrent_go_dedupe_drift_returns_stale(self):
+        fresh_go = {
+            "comment_id": 1002,
+            "html_url": "https://example.test/fresh",
+            "created_at": "2026-06-13T09:00:00Z",
+            "status": "go",
+            "inner": _fresh_inner(_SAMPLE_BODY_SHA256, fingerprint_comment_id=1002),
+        }
+        parser_mod = _mock_parser_mod(comments=[])
+        parser_mod.parse_contract_review_results.side_effect = [[], [fresh_go]]
+        parser_mod.find_latest_result.side_effect = [None, fresh_go]
+        parser_mod.find_latest_go.side_effect = [None, fresh_go]
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(
+                _ecs_mod,
+                "fetch_issue_snapshot",
+                return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None),
+            ):
+                with patch.object(
+                    _ecs_mod,
+                    "run_contract_review_once",
+                    return_value=(_make_review_result("go"), None),
+                ):
+                    with patch.object(
+                        _ecs_mod,
+                        "verify_snapshot_authority_postcondition",
+                        return_value=(False, "authority_base_binding_drift"),
+                    ):
+                        result = ensure_contract_snapshot(
+                            issue_number=_ISSUE_NUMBER,
+                            repo=_REPO,
+                            mode="auto",
+                            do_post=True,
+                        )
+
+        assert result["status"] == "stale_or_conflicting_snapshot"
+        assert result["contract_snapshot_url"] is None
+
+    def test_materialized_comment_drift_after_patch_returns_stale(self):
+        parser_mod = _mock_parser_mod(comments=[])
+        parser_mod.parse_contract_review_results.return_value = []
+        parser_mod.find_latest_go.return_value = None
+        parser_mod.find_latest_result.return_value = None
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(
+                _ecs_mod,
+                "fetch_issue_snapshot",
+                return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None),
+            ):
+                with patch.object(
+                    _ecs_mod,
+                    "run_contract_review_once",
+                    return_value=(_make_review_result("go"), None),
+                ):
+                    with patch.object(
+                        _ecs_mod,
+                        "post_comment",
+                        return_value=(
+                            f"{_ISSUE_URL}#issuecomment-1003",
+                            POST_STATUS_POSTED,
+                            201,
+                        ),
+                    ):
+                        with patch.object(
+                            _ecs_mod,
+                            "verify_snapshot_authority_postcondition",
+                            return_value=(False, "authority_comment_fingerprint_mismatch"),
+                        ):
+                            result = ensure_contract_snapshot(
+                                issue_number=_ISSUE_NUMBER,
+                                repo=_REPO,
+                                mode="auto",
+                                do_post=True,
+                            )
+
+        assert result["status"] == "stale_or_conflicting_snapshot"
+        assert result["contract_snapshot_url"] is None
+
+
+class TestAuthorityPostconditionReadback:
+    def test_issue_updated_at_drift_is_rejected(self):
+        with patch.object(
+            _ecs_mod,
+            "fetch_issue_snapshot",
+            return_value=(_SAMPLE_BODY, "2026-06-13T09:00:00Z", None),
+        ):
+            ok, reason = _real_verify_snapshot_authority_postcondition(
+                issue_number=_ISSUE_NUMBER,
+                repo=_REPO,
+                expected_body_sha256=_SAMPLE_BODY_SHA256,
+                expected_updated_at=_SAMPLE_UPDATED_AT,
+                expected_comment_id=1001,
+                expected_comment_body_sha256=sha256_of(_GO_COMMENT["body"]),
+                expected_fingerprint=_fresh_inner(_SAMPLE_BODY_SHA256)[
+                    "expected_contract_fingerprint"
+                ],
+            )
+
+        assert ok is False
+        assert reason == "authority_issue_updated_at_mismatch"
+
+    def test_comment_body_drift_is_rejected_before_authority_return(self):
+        parser_mod = MagicMock()
+        parser_mod.fetch_issue_comments.return_value = (
+            [{**_GO_COMMENT, "body": "tampered"}],
+            None,
+        )
+        with patch.object(
+            _ecs_mod,
+            "fetch_issue_snapshot",
+            return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None),
+        ):
+            with patch.object(
+                _ecs_mod,
+                "capture_base_ref_and_sha",
+                return_value=("main", "a" * 40),
+            ):
+                with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+                    ok, reason = _real_verify_snapshot_authority_postcondition(
+                        issue_number=_ISSUE_NUMBER,
+                        repo=_REPO,
+                        expected_body_sha256=_SAMPLE_BODY_SHA256,
+                        expected_updated_at=_SAMPLE_UPDATED_AT,
+                        expected_comment_id=1001,
+                        expected_comment_body_sha256=sha256_of(_GO_COMMENT["body"]),
+                        expected_fingerprint=_fresh_inner(_SAMPLE_BODY_SHA256)[
+                            "expected_contract_fingerprint"
+                        ],
+                    )
+
+        assert ok is False
+        assert reason == "authority_comment_body_sha256_mismatch"
 
 
 # ---------------------------------------------------------------------------
