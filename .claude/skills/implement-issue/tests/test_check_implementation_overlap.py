@@ -871,6 +871,8 @@ def test_human_c1_stale_attempt_is_audit_only_after_later_exact_same_candidate_d
     stale = _human_c1_comment(current=current, candidate=candidate, comment_id=9000000001)
     current["body"] += "\n<!-- current body changed after stale decision -->\n"
     exact = _human_c1_comment(current=current, candidate=candidate, comment_id=9000000002)
+    stale["updated_at"] = "2026-07-18T12:01:00Z"
+    exact["updated_at"] = "2026-07-18T12:02:00Z"
     current["comments"] = [stale, exact]
     current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [candidate])
 
@@ -1092,6 +1094,7 @@ def test_human_c1_decision_final_readback_detects_fingerprint_drift(tmp_path: Pa
     final_current["body"] += " drift"
     assert checker_module._apply_final_readback_drift(
         decisions=decisions,
+        initial_comments=[comment],
         final_current=final_current,
         final_candidates={candidate["number"]: candidate},
         final_comments=[comment],
@@ -1343,3 +1346,162 @@ def test_given_human_c1_decision_targets_successor_c2a_candidate_when_c1_candida
     assert decisions["accepted"] == []
     rejected_reasons = {item["reason"] for item in decisions["rejected"]}
     assert "candidate_not_current_c1_overlap" in rejected_reasons, payload
+def _accepted_decisions(current: dict, candidate: dict, comments: list[dict]) -> dict:
+    return checker_module._validate_human_c1_decisions(
+        comments=comments,
+        repository=DEFAULT_REPO,
+        current_number=current["number"],
+        current_body=current["body"],
+        candidates_evidence=[
+            {
+                "issue_number": candidate["number"],
+                "policy_class": "C1",
+                "body_sha256": f"sha256:{_sha256(candidate['body'])}",
+            }
+        ],
+    )
+
+
+def test_human_c1_final_readback_new_trusted_malformed_comment_requires_human_review(
+    tmp_path: Path,
+) -> None:
+    current = _current_with_shared_target(tmp_path)
+    candidate = _collision_candidate()
+    accepted = _human_c1_comment(current=current, candidate=candidate)
+    initial_comments = [accepted]
+    decisions = _accepted_decisions(current, candidate, initial_comments)
+    malformed = _human_c1_comment(current=current, candidate=candidate, comment_id=9000000002)
+    malformed["body"] = "HUMAN_C1_DECISION_V1\nnot even yaml"
+
+    assert checker_module._apply_final_readback_drift(
+        decisions=decisions,
+        initial_comments=initial_comments,
+        final_current=current,
+        final_candidates={candidate["number"]: candidate},
+        final_comments=[accepted, malformed],
+    )
+    assert any(
+        item["reason"] == "final_readback_trusted_comment_set_drift"
+        for item in decisions["rejected"]
+    )
+
+
+def test_human_c1_final_readback_edited_ignored_non_routing_comment_requires_human_review(
+    tmp_path: Path,
+) -> None:
+    current = _current_with_shared_target(tmp_path)
+    candidate = _collision_candidate()
+    stale = _human_c1_comment(current=current, candidate=candidate, comment_id=9000000001)
+    current["body"] += "\n<!-- current body changed after stale decision -->\n"
+    accepted = _human_c1_comment(current=current, candidate=candidate, comment_id=9000000002)
+    stale["updated_at"] = "2026-07-18T12:01:00Z"
+    accepted["updated_at"] = "2026-07-18T12:02:00Z"
+    initial_comments = [stale, accepted]
+    decisions = _accepted_decisions(current, candidate, initial_comments)
+    assert decisions["ignored_non_routing"]
+    edited_stale = dict(stale)
+    edited_stale["body"] += "\n<!-- edited after initial readback -->"
+    edited_stale["updated_at"] = "2026-07-18T12:03:00Z"
+
+    assert checker_module._apply_final_readback_drift(
+        decisions=decisions,
+        initial_comments=initial_comments,
+        final_current=current,
+        final_candidates={candidate["number"]: candidate},
+        final_comments=[edited_stale, accepted],
+    )
+    assert any(
+        item["reason"] == "final_readback_trusted_comment_set_drift"
+        for item in decisions["rejected"]
+    )
+
+
+def test_human_c1_duplicate_candidate_lines_are_not_superseded_by_later_candidate_a(
+    tmp_path: Path,
+) -> None:
+    current = _current_with_shared_target(tmp_path)
+    candidate = _collision_candidate(9771)
+    malformed = _human_c1_comment(current=current, candidate=candidate, comment_id=9000000001)
+    malformed["body"] = malformed["body"].replace(
+        "  candidate_issue_number: 9771\n",
+        "  candidate_issue_number: 9771\n  candidate_issue_number: 9772\n",
+    )
+    malformed["updated_at"] = "2026-07-18T12:01:00Z"
+    accepted = _human_c1_comment(current=current, candidate=candidate, comment_id=9000000002)
+    accepted["updated_at"] = "2026-07-18T12:02:00Z"
+    current["comments"] = [malformed, accepted]
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [candidate])
+
+    _, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    rejection = payload["human_c1_decisions"]["rejected"][0]
+    assert payload["route"] == "human_review_required"
+    assert rejection["reason"] == "schema_field_duplicate"
+    assert rejection["parsed_candidate_issue_number"] is None
+
+
+def test_human_c1_outside_candidate_does_not_bind_malformed_block_to_candidate_a(
+    tmp_path: Path,
+) -> None:
+    current = _current_with_shared_target(tmp_path)
+    candidate_a = _collision_candidate(9771)
+    malformed = _human_c1_comment(current=current, candidate=candidate_a, comment_id=9000000001)
+    malformed["body"] = "\n".join(
+        [
+            "candidate_issue_number: 9771",
+            "```yaml",
+            "HUMAN_C1_DECISION_V1:",
+            "  candidate_issue_number: 9772",
+            "  decision: C1/non-conflict",
+            f"  current_body_sha256: sha256:{_sha256(current['body'])}",
+            f"  candidate_body_sha256: sha256:{_sha256(candidate_a['body'])}",
+            "  unexpected_field: fail-closed",
+            "```",
+        ]
+    )
+    malformed["updated_at"] = "2026-07-18T12:01:00Z"
+    accepted = _human_c1_comment(current=current, candidate=candidate_a, comment_id=9000000002)
+    accepted["updated_at"] = "2026-07-18T12:02:00Z"
+    current["comments"] = [malformed, accepted]
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [candidate_a])
+
+    _, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    rejection = payload["human_c1_decisions"]["rejected"][0]
+    assert payload["route"] == "human_review_required"
+    assert rejection["reason"] == "schema_fields_missing_or_unknown"
+    assert rejection["parsed_candidate_issue_number"] == 9772
+
+
+def test_human_c1_stale_comment_edited_after_acceptance_is_not_superseded(tmp_path: Path) -> None:
+    current = _current_with_shared_target(tmp_path)
+    candidate = _collision_candidate()
+    stale = _human_c1_comment(current=current, candidate=candidate, comment_id=9000000001)
+    current["body"] += "\n<!-- current body changed after stale decision -->\n"
+    accepted = _human_c1_comment(current=current, candidate=candidate, comment_id=9000000002)
+    stale["updated_at"] = "2026-07-18T12:03:00Z"
+    accepted["updated_at"] = "2026-07-18T12:02:00Z"
+    current["comments"] = [stale, accepted]
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [candidate])
+
+    _, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    assert payload["route"] == "human_review_required"
+    assert payload["human_c1_decisions"]["rejected"][0]["reason"] == "current_body_sha256_mismatch"
+
+
+def test_human_c1_non_supersedable_rejection_reason_remains_routing(tmp_path: Path) -> None:
+    current = _current_with_shared_target(tmp_path)
+    candidate = _collision_candidate()
+    rejected = _human_c1_comment(current=current, candidate=candidate, comment_id=9000000001)
+    rejected["body"] = rejected["body"].replace("C1/non-conflict", "C2a")
+    rejected["updated_at"] = "2026-07-18T12:01:00Z"
+    accepted = _human_c1_comment(current=current, candidate=candidate, comment_id=9000000002)
+    accepted["updated_at"] = "2026-07-18T12:02:00Z"
+    current["comments"] = [rejected, accepted]
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [candidate])
+
+    _, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    assert payload["route"] == "human_review_required"
+    assert payload["human_c1_decisions"]["rejected"][0]["reason"] == "decision_not_c1_non_conflict"
