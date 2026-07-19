@@ -1084,14 +1084,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command_id == COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH:
         return _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok)
     if args.command_id == COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE:
-        return _run_issue_scope_snapshot_materialize(args, input_data, _fail, _ok)
+        return _run_issue_scope_snapshot_materialize(args, input_data, gh_bin, _fail, _ok)
     if args.command_id == COMMAND_ID_PR_REVIEW_PUBLISH:
         return _run_pr_review_publish(args, input_data, gh_bin, _fail, _ok)
 
     return _fail(f"unhandled_command_id: {args.command_id!r}")  # pragma: no cover — defensive
 
 
-def _run_issue_scope_snapshot_materialize(args, input_data, _fail, _ok) -> int:
+def _run_issue_scope_snapshot_materialize(args, input_data, gh_bin, _fail, _ok) -> int:
     field_err = _validate_issue_scope_snapshot_materialize_fields(input_data, args.repo)
     if field_err:
         return _fail(field_err)
@@ -1111,6 +1111,12 @@ def _run_issue_scope_snapshot_materialize(args, input_data, _fail, _ok) -> int:
     try:
         from materialize_issue_scope_snapshot import materialize
 
+        # Issue #1629 fix_delta P1 (untrusted_gh_git_env): a resolved, trusted
+        # gh_bin and a sanitized subprocess env are threaded into the
+        # materializer explicitly, the same way every other controlled
+        # mutation command id in this executor does -- the materializer must
+        # never fall back to an ambient "gh"/"git" on PATH with an
+        # unsanitized environment.
         result = materialize(
             issue_number=args.issue_number,
             repo=args.repo,
@@ -1119,6 +1125,8 @@ def _run_issue_scope_snapshot_materialize(args, input_data, _fail, _ok) -> int:
             branch_name=input_data["branch_name"],
             worktree_path=input_data["worktree_path"],
             output=input_data["output_path"],
+            gh_bin=gh_bin,
+            env=_build_metadata_sanitized_env(),
             project_root=PROJECT_ROOT,
         )
     except Exception as exc:

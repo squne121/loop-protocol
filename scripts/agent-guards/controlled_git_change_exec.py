@@ -675,7 +675,16 @@ def execute_controlled_change(
         return _denied("unmerged_index_conflict")
 
     current_branch = _current_branch(cwd)
-    expected_branch = snapshot.branch_ref.split("/")[-1] if "/" in snapshot.branch_ref else snapshot.branch_ref
+    # Issue #1629 fix_delta P2 (branch_name_slash_binding_mismatch):
+    # `split("/")[-1]` truncates `refs/heads/feature/foo` to `foo`, which no
+    # longer equals the real branch name `feature/foo`. `removeprefix` only
+    # strips the fixed `refs/heads/` prefix and leaves any `/` inside the
+    # branch name itself intact.
+    expected_branch = (
+        snapshot.branch_ref.removeprefix("refs/heads/")
+        if snapshot.branch_ref.startswith("refs/heads/")
+        else snapshot.branch_ref
+    )
     if not current_branch or current_branch != expected_branch:
         return _denied("branch_binding_mismatch")
 
@@ -893,11 +902,16 @@ def _validate_input_file(path: Path) -> Optional[str]:
 def _validate_materialized_snapshot_provenance(
     snapshot_path: Path, snapshot_data: Dict[str, Any], cwd: str
 ) -> Optional[str]:
-    """Accept only the materializer-owned snapshot artifact and sidecar.
-
-    ``ISSUE_SCOPE_SNAPSHOT_V1`` deliberately remains unchanged.  Provenance
-    is consequently a fixed-location, hash-bound sidecar rather than a
-    self-declared extra key in the snapshot JSON.
+    """Audit-only consistency check between a materializer-written snapshot
+    artifact and its sidecar. Issue #1629 fix_delta P0
+    (provenance_self_attestation): this function is NEVER sufficient
+    authorization on its own -- both files are written by the SAME trust
+    domain (the materializer process), so a caller could always hand-write
+    a self-consistent pair. It is retained only as a unit-tested audit
+    helper; `_main()` does NOT call it to grant commit authority. The
+    authoritative path is `build_snapshot_via_live_materializer()`, which
+    recomputes the snapshot from a fresh live GitHub readback in the same
+    transaction as the commit it authorizes and never re-reads these files.
     """
     issue_number = snapshot_data.get("issue_number")
     repository = snapshot_data.get("repository_full_name")
@@ -940,56 +954,8 @@ def _validate_materialized_snapshot_provenance(
     return None
 
 
-def _build_cli_parser():
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Controlled stage/commit executor: the single authorized path for "
-        "agent-driven git staging and commits (Issue #1611)."
-    )
-    parser.add_argument("--cwd", required=True, help="worktree directory to operate in")
-    parser.add_argument("--snapshot-json", required=True, help="path to a JSON file with the IssueScopeSnapshot fields")
-    parser.add_argument(
-        "--path", action="append", dest="paths", default=[], help="explicit pathspec to stage (repeatable)"
-    )
-    parser.add_argument("--message", default=None, help="commit message")
-    parser.add_argument("--message-file", default=None, help="path to a file containing the commit message")
-    parser.add_argument("--expected-head", required=True, help="expected local HEAD SHA (race guard, required)")
-    return parser
-
-
-def _main(argv: Optional[List[str]] = None) -> int:
-    args = _build_cli_parser().parse_args(argv if argv is not None else sys.argv[1:])
-
-    snapshot_path = Path(args.snapshot_json)
-    snapshot_file_error = _validate_input_file(snapshot_path)
-    if snapshot_file_error is not None:
-        print(json.dumps({"status": "denied", "reason_code": snapshot_file_error}))
-        return 1
-
-    commit_message = args.message
-    if args.message_file:
-        message_path = Path(args.message_file)
-        message_file_error = _validate_input_file(message_path)
-        if message_file_error is not None:
-            print(json.dumps({"status": "denied", "reason_code": message_file_error}))
-            return 1
-        commit_message = message_path.read_text(encoding="utf-8")
-    if not commit_message:
-        print(json.dumps({"status": "denied", "reason_code": "commit_message_required"}))
-        return 1
-
-    try:
-        with open(snapshot_path, encoding="utf-8") as fh:
-            snapshot_data = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        print(json.dumps({"status": "denied", "reason_code": "snapshot_json_invalid"}))
-        return 1
-    provenance_error = _validate_materialized_snapshot_provenance(snapshot_path, snapshot_data, args.cwd)
-    if provenance_error is not None:
-        print(json.dumps({"status": "denied", "reason_code": provenance_error}))
-        return 1
-    snapshot = IssueScopeSnapshot(
+def _snapshot_from_dict(snapshot_data: Dict[str, Any]) -> IssueScopeSnapshot:
+    return IssueScopeSnapshot(
         schema_version=snapshot_data.get("schema_version", SCHEMA_VERSION),
         repository_full_name=snapshot_data["repository_full_name"],
         issue_number=snapshot_data["issue_number"],
@@ -1013,6 +979,154 @@ def _main(argv: Optional[List[str]] = None) -> int:
         authority_mode=snapshot_data["authority_mode"],
         generated_at=snapshot_data.get("generated_at", ""),
     )
+
+
+_MATERIALIZER_MODULE_REL = "scripts/agent-guards/materialize_issue_scope_snapshot.py"
+_MATERIALIZE_REQUEST_KEYS = frozenset(
+    {"issue_number", "repo", "contract_snapshot_url", "base_ref", "branch_name", "output", "gh_bin"}
+)
+
+
+def _load_materializer_module(project_root: str):
+    path = (Path(project_root) / _MATERIALIZER_MODULE_REL).resolve()
+    if not path.exists() or not path.is_relative_to(Path(project_root).resolve()):
+        raise ValueError("materializer_module_shadowing")
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("materialize_issue_scope_snapshot", path)
+    if spec is None or spec.loader is None:
+        raise ValueError("materializer_import_error")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def build_snapshot_via_live_materializer(
+    *,
+    cwd: str,
+    issue_number: int,
+    repo: str,
+    contract_snapshot_url: str,
+    base_ref: str,
+    branch_name: str,
+    output: str,
+    gh_bin: str,
+) -> IssueScopeSnapshot:
+    """Issue #1629 fix_delta P0 (provenance_self_attestation /
+    stale_artifact_reuse): the ONLY sanctioned way to obtain snapshot
+    authority for a commit. Calls the sanctioned materializer in-process, in
+    the SAME transaction as the stage/commit it will authorize, and builds
+    the `IssueScopeSnapshot` directly from the `snapshot` dict the
+    materializer returns in-memory -- never from the artifact/sidecar files
+    it also writes to disk (those remain audit trail only). Because the
+    snapshot is always freshly recomputed from a live GitHub readback, a
+    hand-written artifact/sidecar pair on disk -- however internally
+    consistent -- is never consulted and can never become authoritative, and
+    "staleness" of a previously written artifact is structurally impossible
+    to exploit (nothing is ever reused)."""
+    module = _load_materializer_module(cwd)
+    result = module.materialize(
+        issue_number=issue_number,
+        repo=repo,
+        contract_snapshot_url=contract_snapshot_url,
+        base_ref=base_ref,
+        branch_name=branch_name,
+        worktree_path=cwd,
+        output=output,
+        gh_bin=gh_bin,
+        project_root=Path(cwd),
+    )
+    snapshot_data = result.get("snapshot") if isinstance(result, dict) else None
+    if not isinstance(snapshot_data, dict):
+        raise ValueError("materializer_live_snapshot_missing")
+    return _snapshot_from_dict(snapshot_data)
+
+
+def _build_cli_parser():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Controlled stage/commit executor: the single authorized path for "
+        "agent-driven git staging and commits (Issue #1611)."
+    )
+    parser.add_argument("--cwd", required=True, help="worktree directory to operate in")
+    parser.add_argument(
+        "--snapshot-json",
+        default=None,
+        help=(
+            "[disabled -- Issue #1629 fix_delta P0] file-trust path for the IssueScopeSnapshot is "
+            "no longer authoritative; always denied. Use --materialize-request."
+        ),
+    )
+    parser.add_argument(
+        "--materialize-request",
+        default=None,
+        help=(
+            "path to a JSON file with {issue_number, repo, contract_snapshot_url, base_ref, "
+            "branch_name, output, gh_bin} -- the sanctioned materializer is invoked live, in this "
+            "transaction, to obtain snapshot authority (Issue #1629 fix_delta P0)"
+        ),
+    )
+    parser.add_argument(
+        "--path", action="append", dest="paths", default=[], help="explicit pathspec to stage (repeatable)"
+    )
+    parser.add_argument("--message", default=None, help="commit message")
+    parser.add_argument("--message-file", default=None, help="path to a file containing the commit message")
+    parser.add_argument("--expected-head", required=True, help="expected local HEAD SHA (race guard, required)")
+    return parser
+
+
+def _main(argv: Optional[List[str]] = None) -> int:
+    args = _build_cli_parser().parse_args(argv if argv is not None else sys.argv[1:])
+
+    commit_message = args.message
+    if args.message_file:
+        message_path = Path(args.message_file)
+        message_file_error = _validate_input_file(message_path)
+        if message_file_error is not None:
+            print(json.dumps({"status": "denied", "reason_code": message_file_error}))
+            return 1
+        commit_message = message_path.read_text(encoding="utf-8")
+    if not commit_message:
+        print(json.dumps({"status": "denied", "reason_code": "commit_message_required"}))
+        return 1
+
+    # Issue #1629 fix_delta P0: --snapshot-json is permanently disabled as an
+    # authority source -- both the snapshot artifact and its sidecar are
+    # written by the same trust domain, so file-trust alone can never rule
+    # out a hand-written, internally-consistent pair. Deny unconditionally,
+    # rather than silently ignoring the flag, so a caller relying on the old
+    # behavior fails loudly instead of degrading to a false "denied" for an
+    # unrelated reason.
+    if args.snapshot_json is not None:
+        print(json.dumps({"status": "denied", "reason_code": "snapshot_json_file_trust_disabled_use_materialize_request"}))
+        return 1
+
+    if args.materialize_request is None:
+        print(json.dumps({"status": "denied", "reason_code": "materialize_request_required"}))
+        return 1
+
+    request_path = Path(args.materialize_request)
+    request_file_error = _validate_input_file(request_path)
+    if request_file_error is not None:
+        print(json.dumps({"status": "denied", "reason_code": request_file_error}))
+        return 1
+    try:
+        with open(request_path, encoding="utf-8") as fh:
+            request_data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        print(json.dumps({"status": "denied", "reason_code": "materialize_request_json_invalid"}))
+        return 1
+    if not isinstance(request_data, dict) or set(request_data) != _MATERIALIZE_REQUEST_KEYS:
+        print(json.dumps({"status": "denied", "reason_code": "materialize_request_schema_invalid"}))
+        return 1
+
+    try:
+        snapshot = build_snapshot_via_live_materializer(cwd=args.cwd, **request_data)
+    except Exception as exc:  # noqa: BLE001 -- materializer raises ValueError/OSError/SubprocessError
+        print(json.dumps({"status": "denied", "reason_code": f"materialize_request_failed: {exc}"}))
+        return 1
+
     result = execute_controlled_change(
         cwd=args.cwd,
         snapshot=snapshot,

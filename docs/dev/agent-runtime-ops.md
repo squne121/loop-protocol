@@ -317,11 +317,46 @@ repository / Issue / worktree / branch / default-base / output root を固定す
 
 出力は `artifacts/<issue>/issue-metadata/issue_scope_snapshot.materialize/` の
 `issue_scope_snapshot.json` と hash-bound provenance sidecar の対である。
-`ISSUE_SCOPE_SNAPSHOT_V1` 自体の key set は互換維持のため変更しない。consumer は
-固定パス・regular non-link file・sidecar schema・artifact hash と snapshot binding を
-検証するため、任意の `--snapshot-json` や provenance のない手書き JSON は拒否する。
+`ISSUE_SCOPE_SNAPSHOT_V1` 自体の key set は互換維持のため変更しない。
 GitHub readback、contract source drift、base/worktree/branch binding、unsafe path のいずれかが
 不成立なら artifact を残さず fail-closed とする。
+
+**Issue #1629 fix_delta（provenance self-attestation の是正）**: snapshot
+artifact と provenance sidecar はどちらもこの materializer 自身が書く、同一信頼領域の
+出力である。したがって disk 上のこのペアが internally consistent であることは、
+それ自体では認可根拠にならない（呼び出し元が両ファイルを手書きで一致させることを
+妨げない）。`controlled_git_change_exec.py` はこの2ファイルを認可判定に一切使わない
+—— consumer 契約は次のとおり:
+
+- `controlled_git_change_exec.build_snapshot_via_live_materializer()` が、
+  stage/commit と **同一 transaction 内で** materializer を in-process 呼び出しし、
+  materializer が返す in-memory `snapshot` dict だけを `IssueScopeSnapshot` の
+  構築に使う。disk 上の artifact / sidecar は監査証跡としてのみ書かれ、二度と
+  読み返されない。
+- materializer は `gh_bin`（trusted PATH から解決した実行ファイル）と、
+  `GH_HOST` / `GH_REPO` / `GH_CONFIG_DIR` / `GIT_DIR` / `GIT_WORK_TREE` /
+  `GIT_INDEX_FILE` / `GIT_OBJECT_DIRECTORY` / `GIT_ALTERNATE_OBJECT_DIRECTORIES`
+  等を除去した sanitized env を明示的に受け取る（呼び出し元は
+  `controlled_skill_mutation_exec._build_metadata_sanitized_env()` を使う）。
+  ambient PATH の `gh` / 素の環境変数への fallback はない。
+- contract source（`CONTRACT_REVIEW_RESULT_V1 status: go` comment）の検証は、
+  substring 一致ではなく `.claude/skills/issue-contract-review/scripts/
+  contract_review_result_parser.py` の canonical parser を再利用する
+  （fenced YAML 構造解析・trusted publisher identity・
+  `is_fingerprint_ready_go` による source-bound fingerprint 検証）。
+  fingerprint の `base_ref` / `allowed_paths_normalized_sha256` は、この
+  materialize() 呼び出しが独立に計算した値と一致することも要求する。
+- default branch の名前と tip SHA は GitHub REST API
+  （`gh api repos/<repo>` / `gh api repos/<repo>/git/ref/heads/<branch>`）
+  から live に取得する。ローカルの `refs/heads/<base_ref>` は使わない。
+- artifact / sidecar の書き込みは一時ファイル + 同一ファイルシステム上の
+  `os.replace()` による atomic 置き換えであり、失敗時に torn/partial な
+  artifact を残さない。
+- `controlled_git_change_exec.py` の CLI は `--snapshot-json`（ファイル信頼
+  パス）を無条件 deny する。唯一の入力経路は `--materialize-request`
+  （`issue_number` / `repo` / `contract_snapshot_url` / `base_ref` /
+  `branch_name` / `output` / `gh_bin` を含む JSON）で、これが上記の
+  live in-process 呼び出しをトリガする。
 
 ### 実行ステップ（単一 transaction、「案B」: `git commit --only` + audit-then-rollback）
 
