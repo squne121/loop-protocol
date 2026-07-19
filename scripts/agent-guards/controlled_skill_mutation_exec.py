@@ -57,6 +57,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 
 # -- Path resolution -----------------------------------------------------------
 
@@ -82,6 +83,7 @@ from controlled_skill_mutation_policy import (
     COMMAND_ID_ISSUE_BODY_UPDATE,
     COMMAND_ID_ISSUE_COMMENT_PUBLISH,
     COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
+    COMMAND_ID_PR_REVIEW_PUBLISH,
     ALL_COMMAND_IDS,
     INPUT_SCHEMA_BY_COMMAND,
     ENV_BINDING_MANDATORY_COMMAND_IDS,
@@ -123,20 +125,74 @@ def _find_gh_bin() -> tuple[str | None, str]:
 # -- Git remote origin verification --------------------------------------------
 
 
-def _verify_git_remote_origin(project_root: Path, trusted_repo: str) -> str:
-    """Return empty string if origin matches trusted_repo, else error."""
+# Issue #1539 fix_delta Blocker 2: the only trusted remote host. Structural
+# scheme/host validation replaces the previous "grab the last owner/repo-shaped
+# path segment" regex, which ignored host/scheme entirely and would treat
+# `https://attacker.example/squne121/loop-protocol.git` as trusted.
+_TRUSTED_GITHUB_HOST = "github.com"
+_OWNER_REPO_RE = _re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def _normalize_owner_repo(path: str) -> str | None:
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    if not path or not _OWNER_REPO_RE.match(path):
+        return None
+    return path
+
+
+def _parse_trusted_github_remote(url: str) -> str | None:
+    """Return the normalized ``owner/repo`` iff url is a canonical HTTPS/SSH
+    github.com remote. Returns None for any other host, scheme, port, or
+    non-``git``/anonymous userinfo (evil host, file://, other-host SSH, etc.).
+    """
+    url = (url or "").strip()
+    if not url or "\x00" in url:
+        return None
+    if "://" in url:
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            return None
+        if parsed.scheme.lower() not in ("https", "ssh"):
+            return None
+        host = (parsed.hostname or "").lower()
+        if host != _TRUSTED_GITHUB_HOST:
+            return None
+        if parsed.port not in (None, 443, 22):
+            return None
+        if parsed.username not in (None, "git"):
+            return None
+        return _normalize_owner_repo(parsed.path)
+    # scp-like syntax: [user@]host:path (e.g. git@github.com:owner/repo.git)
+    m = _re.match(r"^(?:([A-Za-z0-9_.-]+)@)?([A-Za-z0-9_.-]+):(.+)$", url)
+    if not m:
+        return None
+    user, host, path = m.group(1), m.group(2), m.group(3)
+    if user not in (None, "git"):
+        return None
+    if host.lower() != _TRUSTED_GITHUB_HOST:
+        return None
+    return _normalize_owner_repo(path)
+
+
+def _verify_git_remote_origin(
+    project_root: Path, trusted_repo: str, env: dict[str, str] | None = None
+) -> str:
+    """Return empty string if origin is a canonical github.com/trusted_repo
+    HTTPS or SSH remote, else a descriptive error string."""
     try:
         out = subprocess.run(
             ["git", "-C", str(project_root), "remote", "get-url", "origin"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, env=env,
         )
         if out.returncode != 0:
             return f"git_remote_origin_failed: {out.stderr.strip()[:100]}"
         url = out.stdout.strip()
-        m = _re.search(r'[:/]([^/]+/[^/]+?)(?:\.git)?$', url)
-        if not m:
-            return f"git_remote_origin_not_parseable: {url!r}"
-        normalized = m.group(1)
+        normalized = _parse_trusted_github_remote(url)
+        if normalized is None:
+            return f"git_remote_origin_untrusted_host_or_scheme: {url!r}"
         if normalized != trusted_repo:
             return f"git_remote_origin_mismatch: {normalized!r} != {trusted_repo!r}"
         return ""
@@ -458,6 +514,81 @@ def _validate_issue_comment_publish_fields(data: dict) -> str:
             return f"issue_comment_publish_field_invalid: {field!r}"
     if data["marker"] not in data["comment_body"]:
         return "issue_comment_publish_marker_not_embedded_in_body"
+    return ""
+
+
+_PR_HEAD_SHA_RE = _re.compile(r"^[0-9a-f]{40}$")
+
+
+# Issue #1539 fix_delta High 2: exact-key schema -- an input JSON with any key
+# outside this set is rejected before any mutation. Applies to the
+# --input-file code path (the --render-body-file code path never accepts an
+# arbitrary dict at all -- see _render_pr_review_publish_request()).
+_PR_REVIEW_PUBLISH_ALLOWED_KEYS = frozenset({
+    "schema", "issue_number", "repo", "pr_number", "expected_head_sha",
+    "event", "producer_role", "body", "body_sha256", "idempotency_key",
+})
+_PR_REVIEW_BODY_MAX_BYTES = 60000
+
+
+def _validate_pr_review_publish_fields(data: dict, repo: str, issue_number: int) -> str:
+    """Issue #1536 AC1/AC2/AC5/AC6: PR_REVIEW_PUBLISH_REQUEST_V1 field validation.
+
+    All checks below run before any GitHub API call (AC2/AC3/AC5 require
+    fail-closed rejection with zero remote side effect for malformed input).
+    """
+    unknown_keys = set(data.keys()) - _PR_REVIEW_PUBLISH_ALLOWED_KEYS
+    if unknown_keys:
+        return f"pr_review_publish_unknown_fields: {sorted(unknown_keys)}"
+
+    declared_repo = data.get("repo")
+    if declared_repo != repo:
+        return f"pr_review_publish_repo_mismatch: {declared_repo!r} != {repo!r}"
+
+    pr_number = data.get("pr_number")
+    if type(pr_number) is not int or pr_number <= 0:
+        return f"pr_review_publish_pr_number_invalid: {pr_number!r}"
+    if pr_number != issue_number:
+        return (
+            f"pr_review_publish_pr_number_mismatch: pr_number={pr_number} "
+            f"!= --issue-number={issue_number}"
+        )
+
+    expected_head_sha = data.get("expected_head_sha")
+    if not isinstance(expected_head_sha, str) or not _PR_HEAD_SHA_RE.match(expected_head_sha):
+        return f"pr_review_publish_expected_head_sha_invalid: {expected_head_sha!r}"
+
+    # AC2: event is fixed to COMMENT. Any alias (approve/-a/-r/APPROVE/
+    # REQUEST_CHANGES/lowercase "comment"/empty/missing) is rejected before
+    # any mutation -- the executor never negotiates event type with the API.
+    if data.get("event") != "COMMENT":
+        return f"pr_review_publish_event_not_comment: {data.get('event')!r}"
+
+    producer_role = data.get("producer_role")
+    if producer_role != "pr-reviewer":
+        return f"pr_review_publish_producer_role_invalid: {producer_role!r}"
+
+    body = data.get("body")
+    if not isinstance(body, str) or not body:
+        return "pr_review_publish_body_invalid"
+    if len(body.encode("utf-8")) > _PR_REVIEW_BODY_MAX_BYTES:
+        return f"pr_review_publish_body_too_large: {len(body.encode('utf-8'))} bytes"
+    body_sha256 = data.get("body_sha256")
+    computed_body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    if body_sha256 != computed_body_sha256:
+        return (
+            f"pr_review_publish_body_sha256_mismatch: computed={computed_body_sha256} "
+            f"declared={body_sha256!r}"
+        )
+
+    idempotency_key = data.get("idempotency_key")
+    expected_idempotency_key = f"{repo}:{pr_number}:{expected_head_sha}:{body_sha256}"
+    if idempotency_key != expected_idempotency_key:
+        return (
+            f"pr_review_publish_idempotency_key_mismatch: expected="
+            f"{expected_idempotency_key!r} declared={idempotency_key!r}"
+        )
+
     return ""
 
 
@@ -809,11 +940,40 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--command-id", required=True, help="Command ID")
     parser.add_argument("--issue-number", type=int, required=True, help="GitHub issue number")
     parser.add_argument(
-        "--input-file", required=True, help="Relative path to input JSON file (artifact subtree)"
+        "--input-file", default=None,
+        help="Relative path to input JSON file (artifact subtree)",
     )
     parser.add_argument("--repo", required=True, help="GitHub repo slug (owner/repo)")
     parser.add_argument("--json", dest="output_json", action="store_true", help="JSON output")
     parser.add_argument("--dry-run", action="store_true", help="Validate but do not publish")
+    # Issue #1539 fix_delta Blocker 1: pr_review.publish "render mode". A
+    # trusted caller (NOT the pr-reviewer SubAgent, which has no Write/Edit
+    # tool and may not write files via Bash either) supplies the raw verdict
+    # body TEXT via --render-body-file plus the structured verdict metadata as
+    # CLI flags; the executor independently computes body_sha256 /
+    # idempotency_key and hardcodes producer_role="pr-reviewer" / event=
+    # "COMMENT" itself instead of trusting a pre-built, self-hashed JSON.
+    parser.add_argument(
+        "--render-body-file", default=None,
+        help="Relative path to a raw review body TEXT file (artifact subtree, "
+             "pr_review.publish render mode only)",
+    )
+    parser.add_argument(
+        "--verdict", default=None, choices=["APPROVE", "REQUEST_CHANGES", "COMMENT"],
+        help="Declared verdict (render mode only)",
+    )
+    parser.add_argument(
+        "--reviewed-head-sha", default=None,
+        help="Head SHA the reviewer actually inspected (render mode only)",
+    )
+    parser.add_argument(
+        "--expected-head-sha", default=None,
+        help="Head SHA the review must be commit_id-bound to (render mode only)",
+    )
+    parser.add_argument(
+        "--merge-ready", action="store_true",
+        help="Declared merge_ready flag (render mode only; requires --verdict APPROVE)",
+    )
     args = parser.parse_args(argv)
 
     def _fail(reason: str, errors: list[str] | None = None, status: str = "error") -> int:
@@ -868,19 +1028,35 @@ def main(argv: list[str] | None = None) -> int:
     if env_err:
         return _fail(env_err)
 
-    # -- input-file binding -------------------------------------------------------
-    canonical_input, input_err = _validate_and_resolve_input_file(
-        args.input_file, args.issue_number, PROJECT_ROOT, command_id=args.command_id
-    )
-    if input_err:
-        return _fail(input_err)
+    # -- Issue #1539 fix_delta Blocker 1: pr_review.publish render mode -------
+    # Mutually exclusive with --input-file. Only pr_review.publish supports it.
+    render_mode = args.render_body_file is not None
+    if render_mode and args.command_id != COMMAND_ID_PR_REVIEW_PUBLISH:
+        return _fail("render_mode_not_supported_for_command_id")
+    if render_mode and args.input_file is not None:
+        return _fail("render_mode_and_input_file_mutually_exclusive")
+    if not render_mode and args.input_file is None:
+        return _fail("missing_input_source: neither --input-file nor --render-body-file given")
 
-    # -- AC10: per-command-id input schema validation ----------------------------
-    input_data, json_err = _load_and_validate_input_json(
-        canonical_input, args.issue_number, args.command_id
-    )
-    if json_err:
-        return _fail(json_err)
+    if render_mode:
+        canonical_input = None
+        input_data, render_err = _render_pr_review_publish_request(args, PROJECT_ROOT)
+        if render_err:
+            return _fail(render_err)
+    else:
+        # -- input-file binding ---------------------------------------------------
+        canonical_input, input_err = _validate_and_resolve_input_file(
+            args.input_file, args.issue_number, PROJECT_ROOT, command_id=args.command_id
+        )
+        if input_err:
+            return _fail(input_err)
+
+        # -- AC10: per-command-id input schema validation ------------------------
+        input_data, json_err = _load_and_validate_input_json(
+            canonical_input, args.issue_number, args.command_id
+        )
+        if json_err:
+            return _fail(json_err)
 
     # -- AC16: module realpath inspection (legacy publisher path only) ----------
     if args.command_id == COMMAND_ID_PUBLISH:
@@ -896,6 +1072,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail, _ok)
     if args.command_id == COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH:
         return _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok)
+    if args.command_id == COMMAND_ID_PR_REVIEW_PUBLISH:
+        return _run_pr_review_publish(args, input_data, gh_bin, _fail, _ok)
 
     return _fail(f"unhandled_command_id: {args.command_id!r}")  # pragma: no cover — defensive
 
@@ -1247,6 +1425,573 @@ def _readback_by_marker_literal(marker_literal: str, issue_number: int, repo: st
         return {"error": f"readback_exception:{exc}"}
 
 
+# -- Issue #1536: controlled PR review publisher (pr_review.publish) -----------
+
+PR_REVIEW_MARKER_PREFIX = "<!-- PR_REVIEW_PUBLISH_MARKER:"
+PR_REVIEW_MARKER_SUFFIX = " -->"
+
+# Issue #1539 fix_delta Blocker 2: env vars that must never reach the `gh`
+# subprocess for pr_review.publish, beyond the generic ENV_SANITIZE_KEYS
+# (GH_HOST / GH_REPO / GH_CONFIG_DIR / GH_DEBUG / DEBUG can silently redirect
+# `gh` to a different host/config or leak debug output; an inherited parent
+# env is never trusted here).
+_PR_REVIEW_GH_ENV_STRIP_KEYS = frozenset(ENV_SANITIZE_KEYS) | frozenset({
+    "GH_HOST", "GH_REPO", "GH_CONFIG_DIR", "GH_DEBUG", "DEBUG",
+})
+
+
+def _build_pr_review_gh_env() -> dict[str, str]:
+    """Sanitized environment for every `gh` subprocess call made while
+    publishing a PR review. Built fresh (not memoized) so each call gets an
+    independent copy that later mutation cannot cross-contaminate."""
+    env = os.environ.copy()
+    for key in _PR_REVIEW_GH_ENV_STRIP_KEYS:
+        env.pop(key, None)
+    env["GH_PROMPT_DISABLED"] = "1"
+    env["GH_NO_UPDATE_NOTIFIER"] = "1"
+    return env
+
+
+def _pr_review_marker_str(idempotency_key: str) -> str:
+    marker_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:32]
+    return f"{PR_REVIEW_MARKER_PREFIX}{marker_hash}{PR_REVIEW_MARKER_SUFFIX}"
+
+
+def _marker_at_expected_position(body: str, marker_str: str) -> bool:
+    """True iff marker_str occurs exactly once in body AND that occurrence is
+    the trailing content (i.e. the publisher's own appended marker, not an
+    unrelated mid-body substring match -- Issue #1539 fix_delta Blocker 3)."""
+    if not body or body.count(marker_str) != 1:
+        return False
+    return body.rstrip("\n").endswith(marker_str)
+
+
+def _fetch_pr_head_sha(
+    pr_number: int, repo: str, gh_bin: str, env: dict[str, str] | None = None
+) -> tuple[str | None, str]:
+    """Fetch the current remote PR head commit SHA. Returns (sha, error)."""
+    try:
+        out = subprocess.run(
+            [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST,
+             f"repos/{repo}/pulls/{pr_number}", "--jq", ".head.sha"],
+            capture_output=True, text=True, timeout=15, shell=False, env=env,
+        )
+        if out.returncode != 0:
+            return None, _classify_gh_error("gh_api_pr_head_fetch_failed", out.stderr or "")
+        sha = out.stdout.strip()
+        if not _PR_HEAD_SHA_RE.match(sha):
+            return None, f"gh_api_pr_head_unexpected_output: {sha!r}"
+        return sha, ""
+    except Exception as exc:
+        return None, f"gh_api_pr_head_fetch_exception: {exc}"
+
+
+def _fetch_authenticated_login(
+    gh_bin: str, env: dict[str, str] | None = None
+) -> tuple[str | None, str]:
+    """Fetch the authenticated gh identity's login. Used as a postcondition
+    identity binding when re-verifying an idempotent-retry review (Issue #1539
+    fix_delta Blocker 3): the review author must be the SAME identity this
+    process is authenticated as, not an unrelated/spoofed account."""
+    try:
+        out = subprocess.run(
+            [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST, "user", "--jq", ".login"],
+            capture_output=True, text=True, timeout=15, shell=False, env=env,
+        )
+        if out.returncode != 0:
+            return None, _classify_gh_error("gh_api_authenticated_user_failed", out.stderr or "")
+        login = out.stdout.strip()
+        if not login:
+            return None, "gh_api_authenticated_user_empty"
+        return login, ""
+    except Exception as exc:
+        return None, f"gh_api_authenticated_user_exception: {exc}"
+
+
+def _find_pr_review_marker_matches(
+    marker_literal: str, pr_number: int, repo: str, gh_bin: str,
+    env: dict[str, str] | None = None,
+) -> tuple[list[dict], str]:
+    """List all remote reviews on the PR whose body embeds marker_literal AT
+    THE EXPECTED TRAILING POSITION (not merely as a substring anywhere in the
+    body -- Issue #1539 fix_delta Blocker 3). Mirrors _find_marker_matches()
+    for issue_comment.publish (Blocker 3 pattern): the caller must know remote
+    marker count/identity BEFORE deciding whether to POST, so a failed
+    transaction never leaves a remote side effect (AC7)."""
+    try:
+        out = subprocess.run(
+            [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST,
+             f"repos/{repo}/pulls/{pr_number}/reviews", "--paginate", "--jq", "."],
+            capture_output=True, text=True, timeout=15, shell=False, env=env,
+        )
+        if out.returncode != 0:
+            return [], _classify_gh_error("gh_api_pr_reviews_list_failed", out.stderr or "")
+        reviews: list[dict] = []
+        for line in out.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parsed = json.loads(line)
+            if isinstance(parsed, list):
+                reviews.extend(parsed)
+            else:
+                reviews.append(parsed)
+        matches = [
+            r for r in reviews
+            if _marker_at_expected_position(r.get("body") or "", marker_literal)
+        ]
+        return matches, ""
+    except Exception as exc:
+        return [], f"pr_review_marker_list_exception: {exc}"
+
+
+def _post_pr_review(
+    pr_number: int, repo: str, commit_id: str, event: str, body: str, gh_bin: str,
+    env: dict[str, str] | None = None,
+) -> tuple[dict | None, str]:
+    """POST a PR review via gh api with JSON stdin (--input -), never via
+    shell-interpolated -f/-F flags, so an arbitrary body (backticks, pipes,
+    `$(...)`, quotes) round-trips byte-for-byte (AC6)."""
+    payload = json.dumps({"commit_id": commit_id, "event": event, "body": body})
+    try:
+        out = subprocess.run(
+            [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST, "--method", "POST",
+             f"repos/{repo}/pulls/{pr_number}/reviews", "--input", "-"],
+            input=payload, capture_output=True, text=True, timeout=20, shell=False, env=env,
+        )
+        if out.returncode != 0:
+            return None, _classify_gh_error("gh_api_post_review_failed", out.stderr or "")
+        try:
+            return json.loads(out.stdout), ""
+        except Exception as exc:
+            return None, f"gh_api_post_review_response_parse_error: {exc}"
+    except Exception as exc:
+        return None, f"gh_api_post_review_exception: {exc}"
+
+
+def _readback_pr_review(
+    review_id, pr_number: int, repo: str, gh_bin: str, env: dict[str, str] | None = None
+) -> dict:
+    """Fetch exactly one review by id (not a marker search) for postcondition
+    verification (AC4: state == COMMENTED, commit_id == expected_head_sha)."""
+    try:
+        out = subprocess.run(
+            [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST,
+             f"repos/{repo}/pulls/{pr_number}/reviews/{review_id}"],
+            capture_output=True, text=True, timeout=15, shell=False, env=env,
+        )
+        if out.returncode != 0:
+            return {"error": _classify_gh_error("gh_api_pr_review_readback_failed", out.stderr or "")}
+        return {"review": json.loads(out.stdout)}
+    except Exception as exc:
+        return {"error": f"pr_review_readback_exception: {exc}"}
+
+
+def _validate_pr_review_postcondition(
+    review: dict,
+    expected_head_sha: str,
+    marker_str: str,
+    body_sha256: str,
+    authenticated_login: str | None,
+) -> tuple[bool, str, str]:
+    """Shared postcondition validator used by BOTH the fresh-post path and the
+    idempotent-retry path (Issue #1539 fix_delta Blocker 3): state ==
+    COMMENTED, commit_id == expected_head_sha, submitted_at present, marker at
+    the expected trailing position (not a mid-body substring), rendered body
+    hash matches, and (when an authenticated_login is supplied) the review
+    author identity matches. Returns (ok, error_reason, stripped_body_sha256).
+    """
+    if review.get("state") != "COMMENTED":
+        return False, f"postcondition_review_state_mismatch: {review.get('state')!r}", ""
+    if review.get("commit_id") != expected_head_sha:
+        return False, (
+            f"postcondition_review_commit_id_mismatch: {review.get('commit_id')!r} "
+            f"!= {expected_head_sha!r}"
+        ), ""
+    if not review.get("submitted_at"):
+        return False, "postcondition_review_submitted_at_missing", ""
+    body = review.get("body") or ""
+    if not _marker_at_expected_position(body, marker_str):
+        return False, "postcondition_marker_not_at_expected_position", ""
+    # AC6: strip the trailing marker before hashing so the round-tripped
+    # UTF-8 body content (not the executor-appended marker) must hash to
+    # the caller-declared body_sha256.
+    #
+    # Issue #1539 fix_delta: rendered_body is constructed as exactly
+    # f"{raw_body}\n\n{marker_str}\n" -- the only bytes the executor adds
+    # between raw_body and the marker are the fixed 2-char separator "\n\n".
+    # Strip exactly that fixed separator, not an open-ended rstrip, so the
+    # input-side and readback-side hashes apply the identical normalization
+    # rule (i.e. none) to raw_body.
+    marker_idx = body.rfind(marker_str)
+    pre_marker = body[:marker_idx]
+    if pre_marker.endswith("\n\n"):
+        stripped_body = pre_marker[: -len("\n\n")]
+    else:
+        stripped_body = pre_marker
+    stripped_body_sha256 = hashlib.sha256(stripped_body.encode("utf-8")).hexdigest()
+    if stripped_body_sha256 != body_sha256:
+        return False, (
+            f"postcondition_body_sha256_mismatch: readback={stripped_body_sha256} "
+            f"expected={body_sha256}"
+        ), ""
+    if authenticated_login is not None:
+        actual_login = (review.get("user") or {}).get("login")
+        if actual_login != authenticated_login:
+            return False, (
+                f"postcondition_review_author_identity_mismatch: {actual_login!r} "
+                f"!= {authenticated_login!r}"
+            ), ""
+    return True, "", stripped_body_sha256
+
+
+# -- Issue #1539 fix_delta Blocker 1: pr_review.publish render mode -----------
+# This is the "trusted bridge": a trusted caller (the impl-review-loop
+# control-plane, NOT the sandboxed pr-reviewer SubAgent) provides only a raw
+# body TEXT file plus structured verdict metadata as CLI flags. This function
+# independently computes body_sha256 / idempotency_key, hardcodes
+# producer_role="pr-reviewer" and event="COMMENT" (never read from any input),
+# and cross-checks the body's embedded LOOP_VERDICT_V2 fenced-YAML block
+# against the CLI-declared --verdict/--merge-ready so the two can never
+# silently diverge (High 2: no self-reported hash/schema/producer_role).
+
+_LOOP_VERDICT_V2_BLOCK_RE = _re.compile(
+    r"```ya?ml\s*\n\s*LOOP_VERDICT_V2\s*:\s*\n(?P<block>.*?)```", _re.DOTALL
+)
+_LOOP_VERDICT_V2_VERDICT_FIELD_RE = _re.compile(
+    r"^\s*verdict\s*:\s*([A-Za-z_]+)\s*$", _re.MULTILINE
+)
+_LOOP_VERDICT_V2_MERGE_READY_FIELD_RE = _re.compile(
+    r"^\s*merge_ready\s*:\s*(true|false)\s*$", _re.MULTILINE | _re.IGNORECASE
+)
+
+
+def _extract_loop_verdict_v2_fields(body: str) -> tuple[str | None, bool | None, str]:
+    """Extract (verdict, merge_ready, error) from a LOOP_VERDICT_V2 fenced YAML
+    block embedded in body. error is non-empty iff the block, or either
+    required field within it, could not be found."""
+    m = _LOOP_VERDICT_V2_BLOCK_RE.search(body)
+    if not m:
+        return None, None, "pr_review_render_body_missing_loop_verdict_v2_block"
+    block = m.group("block")
+    vm = _LOOP_VERDICT_V2_VERDICT_FIELD_RE.search(block)
+    if not vm:
+        return None, None, "pr_review_render_body_loop_verdict_v2_missing_verdict_field"
+    mm = _LOOP_VERDICT_V2_MERGE_READY_FIELD_RE.search(block)
+    if not mm:
+        return None, None, "pr_review_render_body_loop_verdict_v2_missing_merge_ready_field"
+    return vm.group(1), mm.group(1).lower() == "true", ""
+
+
+def _render_pr_review_publish_request(args, project_root: Path) -> tuple[dict | None, str]:
+    """Build a PR_REVIEW_PUBLISH_REQUEST_V1 dict from render-mode CLI flags,
+    without ever trusting a caller-declared hash, schema, producer_role, or
+    event. Returns (input_data, error)."""
+    if args.verdict is None:
+        return None, "pr_review_render_missing_verdict"
+    if args.reviewed_head_sha is None:
+        return None, "pr_review_render_missing_reviewed_head_sha"
+    if args.expected_head_sha is None:
+        return None, "pr_review_render_missing_expected_head_sha"
+
+    if not _PR_HEAD_SHA_RE.match(args.expected_head_sha):
+        return None, f"pr_review_render_expected_head_sha_invalid: {args.expected_head_sha!r}"
+    if not _PR_HEAD_SHA_RE.match(args.reviewed_head_sha):
+        return None, f"pr_review_render_reviewed_head_sha_invalid: {args.reviewed_head_sha!r}"
+    # High 2: reviewed_head_sha and expected_head_sha must be semantically
+    # consistent -- the reviewer's own inspection target must be the same
+    # commit the publish transaction will bind to.
+    if args.reviewed_head_sha != args.expected_head_sha:
+        return None, (
+            f"pr_review_render_reviewed_head_sha_mismatch: "
+            f"reviewed={args.reviewed_head_sha!r} expected={args.expected_head_sha!r}"
+        )
+
+    # High 2: merge_ready may only be declared true alongside verdict APPROVE.
+    if args.merge_ready and args.verdict != "APPROVE":
+        return None, (
+            f"pr_review_render_merge_ready_requires_approve: verdict={args.verdict!r}"
+        )
+
+    # -- render-body-file path safety: same lexical/symlink/hardlink/subtree
+    # containment checks as --input-file, scoped to the pr_review.publish
+    # artifact subtree.
+    canonical_body_file, path_err = _validate_and_resolve_input_file(
+        args.render_body_file, args.issue_number, project_root,
+        command_id=COMMAND_ID_PR_REVIEW_PUBLISH,
+    )
+    if path_err:
+        return None, f"pr_review_render_body_file_invalid: {path_err}"
+
+    try:
+        raw_bytes = canonical_body_file.read_bytes()
+    except Exception as exc:
+        return None, f"pr_review_render_body_read_error: {exc}"
+
+    if len(raw_bytes) > _PR_REVIEW_BODY_MAX_BYTES:
+        return None, f"pr_review_render_body_too_large: {len(raw_bytes)} bytes"
+    if not raw_bytes:
+        return None, "pr_review_render_body_empty"
+
+    try:
+        body = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return None, f"pr_review_render_body_not_utf8: {exc}"
+
+    # High 2: cross-check the body's own embedded LOOP_VERDICT_V2 block against
+    # the CLI-declared verdict/merge_ready so the rendered comment text and the
+    # structured metadata used to build the publish request can never diverge.
+    body_verdict, body_merge_ready, extract_err = _extract_loop_verdict_v2_fields(body)
+    if extract_err:
+        return None, extract_err
+    if body_verdict != args.verdict:
+        return None, (
+            f"pr_review_render_body_verdict_mismatch: body={body_verdict!r} "
+            f"declared={args.verdict!r}"
+        )
+    if body_merge_ready != bool(args.merge_ready):
+        return None, (
+            f"pr_review_render_body_merge_ready_mismatch: body={body_merge_ready!r} "
+            f"declared={bool(args.merge_ready)!r}"
+        )
+
+    body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    idempotency_key = f"{args.repo}:{args.issue_number}:{args.expected_head_sha}:{body_sha256}"
+
+    return {
+        "schema": "PR_REVIEW_PUBLISH_REQUEST_V1",
+        "issue_number": args.issue_number,
+        "repo": args.repo,
+        "pr_number": args.issue_number,
+        "expected_head_sha": args.expected_head_sha,
+        "event": "COMMENT",
+        "producer_role": "pr-reviewer",
+        "body": body,
+        "body_sha256": body_sha256,
+        "idempotency_key": idempotency_key,
+    }, ""
+
+
+def _run_pr_review_publish(args, input_data, gh_bin, _fail, _ok) -> int:
+    field_err = _validate_pr_review_publish_fields(input_data, args.repo, args.issue_number)
+    if field_err:
+        return _fail(field_err)
+
+    pr_number = input_data["pr_number"]
+    expected_head_sha = input_data["expected_head_sha"]
+    raw_body = input_data["body"]
+    body_sha256 = input_data["body_sha256"]
+    idempotency_key = input_data["idempotency_key"]
+    marker_str = _pr_review_marker_str(idempotency_key)
+    rendered_body = f"{raw_body}\n\n{marker_str}\n"
+
+    marker_path = _issue_metadata_marker_path(
+        PROJECT_ROOT, args.issue_number, args.command_id, "pr_review_publish.marker.json"
+    )
+    write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
+
+    if args.dry_run:
+        result = {"schema": RESULT_SCHEMA, "status": "dry_run_ok", "command_id": args.command_id,
+                   "issue_number": args.issue_number}
+        if args.output_json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    gh_env = _build_pr_review_gh_env()
+
+    def _write_marker(review_id, review_url) -> None:
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps({
+            "schema": "PR_REVIEW_PUBLISH_MARKER_V1",
+            "pr_number": pr_number,
+            "repo": args.repo,
+            "idempotency_key": idempotency_key,
+            "expected_head_sha": expected_head_sha,
+            "review_id": review_id,
+            "review_url": review_url,
+            "published_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }, ensure_ascii=False, indent=2))
+
+    # -- AC7: pre-mutation idempotency precheck. Remote review list is the
+    # authority; a local marker file never substitutes for it. Runs BEFORE
+    # any POST so a failed/ambiguous transaction never leaves a remote
+    # side effect. _find_pr_review_marker_matches() itself now only returns
+    # reviews where the marker is at the expected trailing position (Blocker 3).
+    matches, list_err = _find_pr_review_marker_matches(
+        marker_str, pr_number, args.repo, gh_bin, env=gh_env
+    )
+    if list_err:
+        return _fail(f"pr_review_marker_precheck_failed: {list_err}", status="failed")
+
+    if len(matches) > 1:
+        return _fail("pr_review_duplicate_marker_conflict_pre_mutation", status="failed")
+
+    if len(matches) == 1:
+        # -- Issue #1539 fix_delta Blocker 3: idempotent-retry hardening. The
+        # previous implementation trusted the LIST entry's state/commit_id and
+        # returned success immediately -- it never re-verified body hash,
+        # marker uniqueness/position, current PR head, author identity, or
+        # tracked-changes postcondition. Retry now runs the SAME postcondition
+        # validator as the fresh-post path against a FRESH single-review GET
+        # (not the list entry), plus a fresh current-head fetch and an
+        # authenticated-identity check.
+        candidate_id = matches[0].get("id")
+        fresh_readback = _readback_pr_review(candidate_id, pr_number, args.repo, gh_bin, env=gh_env)
+        if "error" in fresh_readback:
+            return _fail(
+                f"pr_review_retry_readback_failed: {fresh_readback['error']}",
+                [f"posted_review_id: {candidate_id}"],
+                status="failed",
+            )
+        review = fresh_readback["review"]
+
+        current_head_sha, head_err = _fetch_pr_head_sha(pr_number, args.repo, gh_bin, env=gh_env)
+        if head_err:
+            return _fail(
+                f"pr_review_retry_current_head_fetch_failed: {head_err}",
+                [f"posted_review_id: {candidate_id}"],
+                status="failed",
+            )
+
+        authenticated_login, login_err = _fetch_authenticated_login(gh_bin, env=gh_env)
+        if login_err:
+            return _fail(
+                f"pr_review_retry_authenticated_identity_fetch_failed: {login_err}",
+                [f"posted_review_id: {candidate_id}"],
+                status="failed",
+            )
+
+        ok, post_err, stripped_body_sha256 = _validate_pr_review_postcondition(
+            review, expected_head_sha, marker_str, body_sha256, authenticated_login
+        )
+        if not ok:
+            return _fail(
+                f"pr_review_remote_marker_identity_conflict_pre_mutation: {post_err}",
+                [f"posted_review_id: {candidate_id}"],
+                status="failed",
+            )
+
+        if current_head_sha != expected_head_sha:
+            # The review that already exists is valid for expected_head_sha,
+            # but the PR has moved on since -- do not report success for a
+            # verdict that is no longer current (High 1 TOCTOU symmetry).
+            _write_marker(review.get("id"), review.get("html_url", ""))
+            return _fail(
+                f"published_but_stale: current_head={current_head_sha} "
+                f"expected_head={expected_head_sha}",
+                [f"posted_review_id: {review.get('id')}"],
+                status="published_but_stale",
+            )
+
+        changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+        if changed:
+            return _fail(
+                "postcondition_tracked_changes_detected",
+                [f"changed: {f}" for f in changed[:20]],
+                status="failed",
+            )
+
+        _write_marker(review.get("id"), review.get("html_url", ""))
+        return _ok({
+            "status_detail": "already_published",
+            "review_id": review.get("id"),
+            "review_url": review.get("html_url", ""),
+            "commit_id": review.get("commit_id"),
+            "body_sha256": stripped_body_sha256,
+            "idempotency_marker_written": True,
+        })
+
+    # -- AC3: stale-head precondition. GitHub review must never be created
+    # against a PR head that has moved since the reviewer inspected it.
+    current_head_sha, head_err = _fetch_pr_head_sha(pr_number, args.repo, gh_bin, env=gh_env)
+    if head_err:
+        return _fail(head_err, status="failed")
+    if current_head_sha != expected_head_sha:
+        return _fail(
+            f"stale_review_request: current_head={current_head_sha} "
+            f"expected_head={expected_head_sha}",
+            status="failed",
+        )
+
+    # -- matches == 0 and head is fresh: proceed to post -----------------------
+    post_result, post_err = _post_pr_review(
+        pr_number, args.repo, expected_head_sha, "COMMENT", rendered_body, gh_bin, env=gh_env
+    )
+    if post_err:
+        return _fail(post_err, status="failed")
+
+    review_id = post_result.get("id") if isinstance(post_result, dict) else None
+    if review_id is None:
+        return _fail("pr_review_post_response_missing_id", status="failed")
+
+    # -- AC4: readback -- POST response fields are not trusted on their own;
+    # a fresh GET readback by review id is the postcondition authority.
+    readback = _readback_pr_review(review_id, pr_number, args.repo, gh_bin, env=gh_env)
+    if "error" in readback:
+        return _fail(
+            readback["error"],
+            [f"posted_review_id: {review_id}"],
+            status="failed",
+        )
+    review = readback["review"]
+
+    ok, post_check_err, readback_body_sha256 = _validate_pr_review_postcondition(
+        review, expected_head_sha, marker_str, body_sha256, None
+    )
+    if not ok:
+        return _fail(
+            post_check_err,
+            [f"posted_review_id: {review_id}"],
+            status="failed",
+        )
+
+    # -- AC14 postcondition: no changes outside this command's own write root.
+    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+    if changed:
+        return _fail(
+            "postcondition_tracked_changes_detected",
+            [f"changed: {f}" for f in changed[:20]],
+            status="failed",
+        )
+
+    # -- Issue #1539 fix_delta High 1: TOCTOU close-out. commit_id binding
+    # proves the review is ATTACHED to expected_head_sha; it is not an atomic
+    # guarantee that expected_head_sha was STILL current PR head at POST time.
+    # Re-fetch current head one more time after the review is durably posted
+    # and postcondition-verified; if it has moved, the review evidence is kept
+    # (a GitHub review cannot be un-posted) but success is NOT reported --
+    # callers must route to a fresh review against the new head.
+    post_publish_head_sha, post_head_err = _fetch_pr_head_sha(
+        pr_number, args.repo, gh_bin, env=gh_env
+    )
+    if post_head_err:
+        _write_marker(review.get("id"), review.get("html_url", ""))
+        return _fail(
+            f"published_but_unverified_current_head: {post_head_err}",
+            [f"posted_review_id: {review_id}"],
+            status="published_but_unverified",
+        )
+    if post_publish_head_sha != expected_head_sha:
+        _write_marker(review.get("id"), review.get("html_url", ""))
+        return _fail(
+            f"published_but_stale: current_head={post_publish_head_sha} "
+            f"expected_head={expected_head_sha}",
+            [f"posted_review_id: {review_id}"],
+            status="published_but_stale",
+        )
+
+    _write_marker(review.get("id"), review.get("html_url", ""))
+
+    return _ok({
+        "review_id": review.get("id"),
+        "review_url": review.get("html_url", ""),
+        "commit_id": review.get("commit_id"),
+        "state": review.get("state"),
+        "body_sha256": readback_body_sha256,
+        "idempotency_marker_written": True,
+    })
+
+
 _ISSUECOMMENT_ID_RE = _re.compile(r"#issuecomment-(\d+)$")
 
 
@@ -1330,7 +2075,16 @@ def _readback_contract_snapshot(
         # boundary. It must apply the same trusted_only=True gate as every
         # other consumer -- an untrusted comment must never be treated as an
         # authoritative snapshot readback here either.
-        snapshot = parser_mod.find_latest_go(results, trusted_only=True)
+        authoritative_go = getattr(parser_mod, "find_latest_authoritative_go", None)
+        if callable(authoritative_go):
+            snapshot = authoritative_go(results)
+        else:
+            try:
+                snapshot = parser_mod.find_latest_go(
+                    results, trusted_only=True, fingerprint_ready_only=True
+                )
+            except TypeError:  # legacy test-double only; production parser has the predicate
+                snapshot = parser_mod.find_latest_go(results, trusted_only=True)
         if snapshot is None or not ensure_mod.is_go_current(snapshot, expected_body_sha256):
             return {"error": "remote_contract_snapshot_not_current"}
 

@@ -943,6 +943,12 @@ jobs:
         # and Python script invocations; direct interpreters are allowed only via
         # the stdlib_only/bootstrap exceptions registry.
         run: uv run --locked python scripts/ci/check_python_invocation_policy.py --strict
+      - name: Check .claude/settings.json permissions (#1551)
+        # Fail-closed static scan: permissions.allow/ask/deny in .claude/settings.json
+        # must not contain scoped Write(path) rules (repository policy:
+        # claude_permission_edit_rule_canonicalization_v1). Scoped path mutation is
+        # expressed via Edit(path) instead.
+        run: uv run --locked python scripts/ci/check_claude_settings_permissions.py --settings .claude/settings.json
       - name: pytest python suite (parallel) (timed)
         # Plan-driven xdist parallel step (Issue #1064). Target set / --ignore / --deselect /
         # FIXED worker count / scheduler all come from the python-test-plan SSOT via the
@@ -1626,6 +1632,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install actionlint (timed)
         id: timed-actionlint-install
         run: |
@@ -1743,15 +1750,50 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@v5
+          # pull_request の既定 checkout は merge commit になるため、verdict の
+          # current-head contract には PR head を明示して checkout する。
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Set up locked Python runner
+        uses: ./.github/actions/setup-python-uv
+      - name: Generate ci_verdict_summary_v2 binding input
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"
+          mkdir -p ci_verdict_summary_v2_binding_artifacts
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          Path("ci_verdict_summary_v2_binding_artifacts/ci_verdict_summary_v2_binding.json").write_text(
+              json.dumps(
+                  {
+                      "repository": os.environ["GITHUB_REPOSITORY"],
+                      "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+                      "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+                      "event_name": os.environ["GITHUB_EVENT_NAME"],
+                      "head_sha": os.environ["PR_HEAD_SHA"],
+                  },
+                  indent=2,
+              )
+          )
+          PY
+      - name: Upload ci_verdict_summary_v2 binding input
+        id: upload-ci-verdict-summary-v2-binding
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
         with:
-          python-version: "3.11"
+          name: ci-verdict-summary-v2-binding-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci_verdict_summary_v2_binding_artifacts/
+          if-no-files-found: error
+          retention-days: 30
       - name: Generate ci_verdict_summary_v2 artifact
         # B1: inline Python verdict calculation removed — ci_verdict_summary_v2.py called directly.
         # B2: --expected-head-sha uses github.event.pull_request.head.sha (not GITHUB_SHA).
         #     needs.result does not carry real head SHA, so provenance=needs_result_synthetic is set.
         env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           NEEDS_JSON: >-
             {
               "typecheck": "${{ needs.typecheck.result }}",
@@ -1764,14 +1806,22 @@ jobs:
               "actionlint": "${{ needs.actionlint.result }}"
             }
         run: |
+          test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"
           mkdir -p ci_verdict_summary_v2_artifacts
-          python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
-            --expected-head-sha "${{ github.event.pull_request.head.sha || github.sha }}" \
+          uv run --locked python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
+            --expected-head-sha "$PR_HEAD_SHA" \
+            --pr-head-sha "$PR_HEAD_SHA" \
             --repository "${{ github.repository }}" \
             --workflow-run-id "${{ github.run_id }}" \
             --workflow-run-attempt "${{ github.run_attempt }}" \
             --event-name "${{ github.event_name }}" \
             --needs-json "${NEEDS_JSON}" \
+            --artifact-id "${{ steps.upload-ci-verdict-summary-v2-binding.outputs.artifact-id }}" \
+            --artifact-url "${{ steps.upload-ci-verdict-summary-v2-binding.outputs.artifact-url }}" \
+            --artifact-digest "${{ steps.upload-ci-verdict-summary-v2-binding.outputs.artifact-digest }}" \
+            --artifact-name "ci-verdict-summary-v2-binding-${{ github.run_id }}-${{ github.run_attempt }}" \
+            --artifact-workflow-run-id "${{ github.run_id }}" \
+            --artifact-workflow-run-attempt "${{ github.run_attempt }}" \
             --output ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json
       - name: Upload ci-verdict-summary-v2 artifact
         id: upload-ci-verdict-summary-v2
@@ -1783,17 +1833,8 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Output ci_verdict_summary_v2 Step Summary
-        # B4: artifact-id/url/digest passed to script so they appear in JSON and Step Summary.
+        # Render the exact uploaded payload; never regenerate it after upload.
         if: ${{ !cancelled() }}
         run: |
-          python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
-            --expected-head-sha "${{ github.event.pull_request.head.sha || github.sha }}" \
-            --repository "${{ github.repository }}" \
-            --workflow-run-id "${{ github.run_id }}" \
-            --workflow-run-attempt "${{ github.run_attempt }}" \
-            --event-name "${{ github.event_name }}" \
-            --needs-json "${NEEDS_JSON}" \
-            --output ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json \
-            --artifact-id "${{ steps.upload-ci-verdict-summary-v2.outputs.artifact-id }}" \
-            --artifact-url "${{ steps.upload-ci-verdict-summary-v2.outputs.artifact-url }}" \
-            --artifact-digest "${{ steps.upload-ci-verdict-summary-v2.outputs.artifact-digest }}"
+          uv run --locked python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
+            --summary-input ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json

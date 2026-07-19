@@ -14,6 +14,7 @@ from typing import Any
 
 SCHEMA_NAME = "VC_ADJUDICATION_RESULT_V1"
 SCHEMA_VERSION = 1
+TEST_VERDICT_SCHEMA = "TEST_VERDICT_MACHINE/v2"
 PRIVATE_BUNDLE_SCHEMA = "VC_ADJUDICATION_PRIVATE_BUNDLE_V1"
 PRIVATE_ARTIFACT_REF = "vc-adjudication-private-bundle"
 STATUS_PRIORITY = {
@@ -184,10 +185,31 @@ def _normalize_item(item: Any) -> tuple[dict[str, Any] | None, list[str]]:
         "failure_keys": failure_keys,
         "failure_keys_present": failure_keys_present,
         "classification": item.get("classification"),
+        "decision": item.get("decision"),
+        "scope_class": item.get("scope_class"),
+        "runner": item.get("runner"),
+        "verification_owner": item.get("verification_owner"),
+        "deferred_reason": item.get("deferred_reason"),
+        "runtime_verification_required": item.get("runtime_verification_required"),
     }
     if command_hash_note is not None:
         normalized["command_hash_note"] = command_hash_note
     return normalized, []
+
+
+def _is_producer_authorized_pr_review_only_skip(item: dict[str, Any]) -> bool:
+    """Recognize only a complete PR-review-only skip produced by the VC producer."""
+    return (
+        item.get("runner") == "skipped"
+        and item.get("scope_class") == "pr_review_only"
+        and item.get("classification") == "skipped"
+        and item.get("decision") == "go"
+        and item.get("category") == "preflight_scope_pr_review_only"
+        and item.get("verification_owner") == "pr-review-judge"
+        and isinstance(item.get("deferred_reason"), str)
+        and bool(item["deferred_reason"])
+        and item.get("runtime_verification_required") is False
+    )
 
 
 def _load_path_list(raw: Any) -> tuple[list[str], list[str]]:
@@ -306,6 +328,126 @@ def _all_changed_paths_allowed(changed_paths: list[str], allowed_paths: list[str
 
 def _is_nonempty_string(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _test_verdict_binding_error(
+    test_verdict: Any,
+    *,
+    contract_snapshot: Any,
+    current_vc_result: Any,
+    diff_summary: Any,
+    expected_keys: set[tuple[str, str]],
+) -> str | None:
+    """Return a fail-closed reason unless runtime execution evidence is bound."""
+    if not isinstance(test_verdict, dict):
+        return "test_verdict_missing"
+    if not isinstance(contract_snapshot, dict) or not isinstance(current_vc_result, dict):
+        return "test_verdict_binding_context_invalid"
+    if not isinstance(diff_summary, dict):
+        return "test_verdict_diff_context_invalid"
+
+    expected_issue = current_vc_result.get("issue")
+    expected_pr = diff_summary.get("pr_number")
+    expected_head = current_vc_result.get("head_sha")
+    expected_reviewed_head = current_vc_result.get("reviewed_head_sha")
+    expected_diff_head = diff_summary.get("head_sha")
+    expected_contract_sha = contract_snapshot.get("body_sha256")
+    required_bindings = {
+        "issue_number": expected_issue,
+        "pr_number": expected_pr,
+        "head_sha": expected_head,
+        "reviewed_head_sha": expected_reviewed_head,
+        "diff_head_sha": expected_diff_head,
+        "contract_body_sha256": expected_contract_sha,
+    }
+    if test_verdict.get("schema") != TEST_VERDICT_SCHEMA:
+        return "test_verdict_schema_mismatch"
+    for key, expected in required_bindings.items():
+        if expected is None or test_verdict.get(key) != expected:
+            return f"test_verdict_{key}_mismatch"
+    if not _is_nonempty_string(test_verdict.get("run_id")):
+        return "test_verdict_run_id_missing"
+    run_url = test_verdict.get("run_url")
+    if not isinstance(run_url, str) or not run_url.startswith("https://"):
+        return "test_verdict_run_url_invalid"
+    if test_verdict.get("result") != "PASS":
+        return "test_verdict_result_not_pass"
+    if test_verdict.get("verification_commands_fail") != 0:
+        return "test_verdict_fail_count_nonzero"
+    if test_verdict.get("verification_skipped_count") != 0:
+        return "test_verdict_skip_count_nonzero"
+
+    # A v2 verdict is only usable when it identifies the producer and the
+    # GitHub Actions artifact that was read back.  The artifact payload is
+    # bound to the digest recorded by that readback, so a copied or partial
+    # summary cannot stand in for current-head execution evidence.
+    if test_verdict.get("producer_kind") != "test-runner":
+        return "test_verdict_producer_kind_mismatch"
+    if not _is_nonempty_string(test_verdict.get("repository")):
+        return "test_verdict_repository_missing"
+    for key in ("workflow_run_id", "workflow_run_attempt", "check_run_id"):
+        value = test_verdict.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return f"test_verdict_{key}_invalid"
+    artifact = test_verdict.get("artifact")
+    if not isinstance(artifact, dict):
+        return "test_verdict_artifact_missing"
+    if not _is_nonempty_string(artifact.get("name")):
+        return "test_verdict_artifact_name_missing"
+    artifact_digest = artifact.get("artifact_digest")
+    if (
+        not isinstance(artifact_digest, str)
+        or not artifact_digest.startswith("sha256:")
+        or not _is_hex_64(artifact_digest[7:])
+    ):
+        return "test_verdict_artifact_digest_invalid"
+    artifact_url = artifact.get("url")
+    if not isinstance(artifact_url, str) or not artifact_url.startswith("https://github.com/"):
+        return "test_verdict_artifact_url_invalid"
+    artifact_payload = test_verdict.get("artifact_payload")
+    if not isinstance(artifact_payload, dict):
+        return "test_verdict_artifact_payload_missing"
+    artifact_payload_sha256 = test_verdict.get("artifact_payload_sha256")
+    if (
+        not isinstance(artifact_payload_sha256, str)
+        or not artifact_payload_sha256.startswith("sha256:")
+        or not _is_hex_64(artifact_payload_sha256[7:])
+    ):
+        return "test_verdict_artifact_payload_sha256_invalid"
+    if _sha256(_canonical_json(artifact_payload)) != artifact_payload_sha256:
+        return "test_verdict_artifact_digest_mismatch"
+    for key, expected in required_bindings.items():
+        if artifact_payload.get(key) != expected:
+            return f"test_verdict_artifact_{key}_mismatch"
+    if artifact_payload.get("command_hashes") != sorted(command_hash for _, command_hash in expected_keys):
+        return "test_verdict_artifact_command_hashes_mismatch"
+
+    raw_results = test_verdict.get("runtime_ac_results")
+    if not isinstance(raw_results, list):
+        return "test_verdict_runtime_ac_results_missing"
+    observed_keys: set[tuple[str, str]] = set()
+    for item in raw_results:
+        if not isinstance(item, dict):
+            return "test_verdict_runtime_ac_result_invalid"
+        ac = item.get("ac")
+        command_hash = item.get("command_hash")
+        if not isinstance(ac, str) or not isinstance(command_hash, str):
+            return "test_verdict_runtime_ac_identity_missing"
+        key = (ac, command_hash)
+        if key in observed_keys:
+            return f"test_verdict_runtime_ac_duplicate:{ac}"
+        observed_keys.add(key)
+        if (
+            item.get("status") != "pass"
+            or item.get("exit_code") != 0
+            or item.get("fallback_detected") is not False
+            or item.get("human_review_required") is not False
+            or item.get("stop_condition_triggered") is not False
+        ):
+            return f"test_verdict_runtime_ac_not_executed_pass:{ac}"
+    if observed_keys != expected_keys:
+        return "test_verdict_runtime_ac_coverage_mismatch"
+    return None
 
 
 def _current_pass_envelope_is_certified(
@@ -444,6 +586,7 @@ def _build_evidence_refs(
     current_vc_result: Any,
     diff_summary: dict[str, Any] | None,
     normalized_allowed: list[str] | None,
+    test_verdict: Any | None,
 ) -> list[dict[str, str]]:
     refs = [
         {
@@ -477,6 +620,15 @@ def _build_evidence_refs(
                 "validation_verdict": "pass",
             }
         )
+    if test_verdict is not None:
+        refs.append(
+            {
+                "kind": "test_verdict",
+                "ref": "inline:test_verdict",
+                "digest": _sha256(_canonical_json(test_verdict)),
+                "validation_verdict": "pass",
+            }
+        )
     return refs
 
 
@@ -493,6 +645,11 @@ def _result(
     stdout_truncated: bool = False,
     omitted_fields: list[str] | None = None,
 ) -> dict[str, Any]:
+    result_errors = errors or []
+    if overall_status == "pass" and not per_ac:
+        overall_status = "indeterminate"
+        rerun_required = True
+        result_errors = [*result_errors, "pass_requires_per_ac_coverage"]
     return {
         "schema": SCHEMA_NAME,
         "schema_version": SCHEMA_VERSION,
@@ -506,7 +663,7 @@ def _result(
         "per_ac": per_ac,
         "evidence_refs": evidence_refs,
         "source_integrity": source_integrity,
-        "errors": errors or [],
+        "errors": result_errors,
         "artifact_ref": artifact_ref,
         "artifact_digest": artifact_digest,
         "stdout_truncated": stdout_truncated,
@@ -614,6 +771,7 @@ def adjudicate_vc_result(
     current_vc_result: Any,
     diff_summary: dict[str, Any] | None,
     allowed_paths: list[str] | None,
+    test_verdict: Any | None = None,
 ) -> dict[str, Any]:
     baseline_items, baseline_errors, baseline_schema = _normalize_list_payload(contract_snapshot)
     current_items, current_errors, _ = _normalize_list_payload(current_vc_result)
@@ -640,6 +798,7 @@ def adjudicate_vc_result(
         current_vc_result,
         diff_summary,
         normalized_allowed,
+        test_verdict,
     )
 
     if extraction_errors:
@@ -655,6 +814,8 @@ def adjudicate_vc_result(
     baseline_signatures: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
     baseline_failure_index: set[tuple[str, str]] = set()
     baseline_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    excluded_pr_review_only_keys: set[tuple[str, str]] = set()
+    seen_baseline_keys: set[tuple[str, str]] = set()
     for idx, item in enumerate(baseline_items):
         norm, errs = _normalize_item(item)
         if norm is None:
@@ -667,12 +828,16 @@ def adjudicate_vc_result(
                 errors=[f"baseline[{idx}]:{err}" for err in errs],
             )
         mapping_key = (norm["ac"], norm["command_hash"])
-        if mapping_key in baseline_by_key:
+        if mapping_key in seen_baseline_keys:
             return _result(
                 overall_status="indeterminate", per_ac=[], rerun_required=True,
                 source_integrity=source_integrity, evidence_refs=evidence_refs,
                 errors=[f"duplicate_baseline_ac_command_hash:{norm['ac']}"],
             )
+        seen_baseline_keys.add(mapping_key)
+        if _is_producer_authorized_pr_review_only_skip(norm):
+            excluded_pr_review_only_keys.add(mapping_key)
+            continue
         if norm["classification"] not in {"expected_fail", "expected_pass"}:
             return _result(
                 overall_status="indeterminate", per_ac=[], rerun_required=True,
@@ -690,6 +855,9 @@ def adjudicate_vc_result(
 
     normalized_current: list[dict[str, Any]] = []
     current_keys: set[tuple[str, str]] = set()
+    seen_current_keys: set[tuple[str, str]] = set()
+    excluded_current_count = 0
+    excluded_current_keys: set[tuple[str, str]] = set()
     for idx, item in enumerate(current_items):
         norm, errs = _normalize_item(item)
         if norm is None:
@@ -703,16 +871,81 @@ def adjudicate_vc_result(
             )
 
         mapping_key = (norm["ac"], norm["command_hash"])
-        if mapping_key in current_keys:
+        if mapping_key in seen_current_keys:
             return _result(
                 overall_status="indeterminate", per_ac=[], rerun_required=True,
                 source_integrity=source_integrity, evidence_refs=evidence_refs,
                 errors=[f"duplicate_current_ac_command_hash:{norm['ac']}"],
             )
+        seen_current_keys.add(mapping_key)
+        if mapping_key in excluded_pr_review_only_keys:
+            if not _is_producer_authorized_pr_review_only_skip(norm):
+                return _result(
+                    overall_status="indeterminate", per_ac=[], rerun_required=True,
+                    source_integrity=source_integrity, evidence_refs=evidence_refs,
+                    errors=[f"pr_review_only_current_authorization_mismatch:{norm['ac']}"],
+                )
+            excluded_current_count += 1
+            excluded_current_keys.add(mapping_key)
+            continue
         current_keys.add(mapping_key)
         normalized_current.append(norm)
 
+    if excluded_current_keys != excluded_pr_review_only_keys:
+        return _result(
+            overall_status="indeterminate", per_ac=[], rerun_required=True,
+            source_integrity=source_integrity, evidence_refs=evidence_refs,
+            errors=["pr_review_only_coverage_mismatch"],
+        )
+
+    if excluded_pr_review_only_keys:
+        binding_error = _test_verdict_binding_error(
+            test_verdict,
+            contract_snapshot=contract_snapshot,
+            current_vc_result=current_vc_result,
+            diff_summary=diff_summary,
+            expected_keys=set(baseline_by_key) | excluded_pr_review_only_keys,
+        )
+        if binding_error is not None:
+            return _result(
+                overall_status="indeterminate", per_ac=[], rerun_required=True,
+                source_integrity=source_integrity, evidence_refs=evidence_refs,
+                errors=[binding_error],
+            )
+
+    current_pass_certified = _current_pass_envelope_is_certified(
+        contract_snapshot,
+        current_vc_result,
+        diff_summary,
+        changed_paths,
+        changed_paths_present,
+        normalized_allowed,
+    )
     if not normalized_current:
+        if excluded_current_count and current_keys != set(baseline_by_key):
+            return _result(
+                overall_status="indeterminate", per_ac=[], rerun_required=True,
+                source_integrity=source_integrity, evidence_refs=evidence_refs,
+                errors=["baseline_current_mapping_mismatch"],
+            )
+        if excluded_current_count and current_pass_certified:
+            per_ac = [
+                {
+                    "ac": ac,
+                    "status": "pass",
+                    "blocking": False,
+                    "command_hash": command_hash,
+                    "failure_keys": [],
+                    "reason_code": "pr_review_only_runtime_evidence_pass",
+                    "summary": "Producer-authorized skip is covered by v2 runtime evidence",
+                }
+                for ac, command_hash in sorted(excluded_pr_review_only_keys)
+            ]
+            return _result(
+                overall_status="pass", per_ac=per_ac, rerun_required=False,
+                source_integrity=source_integrity, evidence_refs=evidence_refs,
+                errors=[],
+            )
         return _result(
             overall_status="indeterminate", per_ac=[], rerun_required=True,
             source_integrity=source_integrity, evidence_refs=evidence_refs,
@@ -726,14 +959,6 @@ def adjudicate_vc_result(
             errors=["baseline_current_mapping_mismatch"],
         )
 
-    current_pass_certified = _current_pass_envelope_is_certified(
-        contract_snapshot,
-        current_vc_result,
-        diff_summary,
-        changed_paths,
-        changed_paths_present,
-        normalized_allowed,
-    )
     per_ac: list[dict[str, Any]] = []
     for norm in normalized_current:
         baseline_item = baseline_by_key[(norm["ac"], norm["command_hash"])]
@@ -863,6 +1088,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--current-vc-result-file", required=True)
     parser.add_argument("--diff-summary-file")
     parser.add_argument("--allowed-paths-file")
+    parser.add_argument("--test-verdict-file")
     parser.add_argument("--artifact-out")
     parser.add_argument("--max-stdout-bytes", type=int, default=4096)
     return parser.parse_args(argv)
@@ -887,17 +1113,22 @@ def main(argv: list[str] | None = None) -> int:
     diff_summary, diff_errors = _load_json_file(args.diff_summary_file) if args.diff_summary_file else (None, [])
     diff_errors = diff_errors or []
     allowed_paths, allowed_errors = _load_allowed_paths(args.allowed_paths_file)
+    test_verdict, test_verdict_errors = (
+        _load_json_file(args.test_verdict_file) if args.test_verdict_file else (None, [])
+    )
 
     result = adjudicate_vc_result(
         contract_snapshot=contract_snapshot,
         current_vc_result=current_vc_result,
         diff_summary=diff_summary,
         allowed_paths=allowed_paths,
+        test_verdict=test_verdict,
     )
     result["errors"].extend(contract_errors or [])
     result["errors"].extend(current_errors or [])
     result["errors"].extend(diff_errors or [])
     result["errors"].extend(allowed_errors or [])
+    result["errors"].extend(test_verdict_errors or [])
     if result["errors"]:
         result["overall_status"] = "indeterminate"
         result["blocking"] = True
@@ -911,11 +1142,13 @@ def main(argv: list[str] | None = None) -> int:
             "current_vc_result": current_vc_result,
             "diff_summary": diff_summary,
             "allowed_paths": allowed_paths,
+            "test_verdict": test_verdict,
             "artifact_inputs": {
                 "contract_snapshot_file": args.contract_snapshot_file,
                 "current_vc_result_file": args.current_vc_result_file,
                 "diff_summary_file": args.diff_summary_file,
                 "allowed_paths_file": args.allowed_paths_file,
+                "test_verdict_file": args.test_verdict_file,
             },
             "result": result,
         }

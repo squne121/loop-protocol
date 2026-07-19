@@ -7,20 +7,24 @@ import argparse
 import hashlib
 import json
 import sys
+from pathlib import Path
 from typing import Any
+
+
+_REGISTRY_DIR = Path(__file__).resolve().parents[2] / "issue-contract-review" / "scripts"
+if str(_REGISTRY_DIR) not in sys.path:
+    sys.path.insert(0, str(_REGISTRY_DIR))
+import pnpm_gate_registry as registry  # noqa: E402
 
 
 SCHEMA_NAME = "CONTRACT_BLOCKER_TRIAGE_V1"
 SCHEMA_VERSION = 1
 BASELINE_SCHEMA = "baseline_vc_preflight/v1"
 CI_TRUE_DELTA = {"CI": "true"}
-# Allowlist of canonical pnpm gates that may receive retry_with_runner_env_delta.
-# Any raw_command that resolves to a different argv is fail-closed (non_canonical_pnpm_gate).
+# The registry is the sole canonicalization authority.  This compatibility
+# view is intentionally derived from it for diagnostics only.
 _CANONICAL_PNPM_GATES: list[list[str]] = [
-    ["pnpm", "typecheck"],
-    ["pnpm", "lint"],
-    ["pnpm", "test"],
-    ["pnpm", "build"],
+    list(gate.request_argv) for gate in registry.iter_gate_descriptors()
 ]
 VALID_INPUT_SCHEMAS = {
     "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1",
@@ -252,25 +256,34 @@ def normalize_item(item: Any) -> tuple[dict[str, Any] | None, str | None]:
         body_author_fixable = False
         environment_retry_recommended = runner_env_delta != CI_TRUE_DELTA
         evidence_pattern = "pnpm_no_tty"
-        # Extract the actual failing gate argv from raw_command and validate against
-        # the canonical pnpm gate allowlist.  If raw_command is present but resolves
-        # to a non-canonical argv (e.g. "pnpm install", "pnpm lint --filter foo"),
-        # fail-closed rather than emitting a non-canonical retry suggestion.
-        # Only when raw_command is absent do we allow the legacy ["pnpm", "build"] fallback.
+        # A current producer marks its result as evidence-required.  That
+        # shape has no fallback: raw command text is not authorization.
+        # Marker-less historical fixtures retain their previous routing until
+        # they are regenerated, but still derive their canonical argv from the
+        # registry rather than a second allowlist.
         if isinstance(raw_command, str) and raw_command.strip():
             import shlex as _shlex
             try:
                 _argv = _shlex.split(raw_command.strip())
             except ValueError:
                 _argv = []
-            if _argv in _CANONICAL_PNPM_GATES:
-                _gate_argv: list[str] | None = _argv
+            if item.get("pnpm_gate_evidence_required") is True:
+                _gate, _evidence_error = registry.validate_evidence(
+                    item.get("pnpm_gate_evidence"), _argv, str(Path.cwd())
+                )
+                if _gate is None:
+                    return None, _evidence_error or "pnpm_gate_evidence_invalid"
             else:
-                # raw_command present but not a canonical gate — fail-closed
-                return None, "non_canonical_pnpm_gate"
+                _gate = registry.gate_for_request(_argv)
+                if _gate is None:
+                    return None, "non_canonical_pnpm_gate"
+            _gate_argv: list[str] = list(_gate.request_argv)
         else:
-            # raw_command absent — legacy fallback for backward compat
-            _gate_argv = None
+            if item.get("pnpm_gate_evidence_required") is True:
+                return None, "pnpm_gate_evidence_missing_or_invalid"
+            # Historical evidence did not carry argv. Preserve this routing
+            # only for marker-less payloads; current producers never use it.
+            _gate_argv = ["pnpm", "build"]
     else:
         normalized_subreason = "unsupported_blocker_category"
         triage_reason = "unclassified"

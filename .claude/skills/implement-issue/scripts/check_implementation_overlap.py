@@ -68,6 +68,7 @@ import json
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -87,10 +88,15 @@ from check_issue_overlap import (  # noqa: E402
     SOURCE_OK,
     SOURCE_SATURATED,
     IssueScope,
+    PathScopeKind,
     SourceStatus,
     allowed_paths_overlap,
     classify_overlap,
+    classify_path_scope_kind,
+    extract_allowed_path_entries,
     extract_allowed_paths,
+    normalize_path,
+    paths_conflict,
 )
 
 SCHEMA = "IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1"
@@ -131,6 +137,7 @@ _TOKEN_RE = re.compile(r"[0-9A-Za-z]+|[぀-ヿ一-鿿]")
 _AC_ID_RE = re.compile(r"\bAC(\d+)\b")
 _SCHEMA_NAME_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_V\d+\b")
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_LOW_SPECIFICITY_PATHS = frozenset({"package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"})
 
 # workflow.md の "Depends on #N" line-anchored dependency 表記（legacy）
 _DEPENDS_ON_RE = re.compile(r"[Dd]epends\s+on\s+#(\d+)")
@@ -183,9 +190,13 @@ def _fetch_repository_full_name(repo: str) -> Optional[str]:
     try:
         data = _run_gh_json(
             [
-                "gh", "api", f"repos/{repo}",
-                "-H", _GITHUB_API_ACCEPT_HEADER,
-                "-H", f"X-GitHub-Api-Version: {_GITHUB_API_VERSION}",
+                "gh",
+                "api",
+                f"repos/{repo}",
+                "-H",
+                _GITHUB_API_ACCEPT_HEADER,
+                "-H",
+                f"X-GitHub-Api-Version: {_GITHUB_API_VERSION}",
             ]
         )
     except OverlapRuntimeError:
@@ -303,7 +314,7 @@ def _parse_contract_dependency_lists(body: str) -> Dict[str, Tuple[str, ...]]:
             prefix = f"{key}:"
             if stripped.startswith(prefix):
                 matched_key = key
-                rest = stripped[len(prefix):].strip()
+                rest = stripped[len(prefix) :].strip()
                 break
         if matched_key is None:
             i += 1
@@ -387,9 +398,7 @@ def _merge_dependency_refs(
             if digits not in seen:
                 seen.add(digits)
                 merged.append(digits)
-        for digits in _extract_native_dependency_numbers(
-            raw, "blockedBy", current_repo=current_repo
-        ):
+        for digits in _extract_native_dependency_numbers(raw, "blockedBy", current_repo=current_repo):
             if digits not in seen:
                 seen.add(digits)
                 merged.append(digits)
@@ -424,13 +433,31 @@ def _extract_edit_targets(body: str) -> Tuple[str, ...]:
     return tuple(sorted(targets))
 
 
+def _is_low_specificity_edit_target(target: str) -> bool:
+    return target.split("#", 1)[0] in _LOW_SPECIFICITY_PATHS and "#" not in target
+
+
+@dataclass(frozen=True)
+class SignalDecision:
+    """closed rule matrix の判定結果。
+
+    weak reason と collision verdict を別々に導くと監査 evidence が矛盾する。
+    この値だけを _readback_candidate() の判定・reason に用いる。
+    """
+
+    weak_path_signals: Tuple[str, ...]
+    strong_path_signals: Tuple[str, ...]
+    independent_structural_signals: Tuple[str, ...]
+    text_signal: bool
+    has_collision: bool
+    reasons: Tuple[str, ...]
+
+
 # boilerplate Machine-Readable Contract キー。ほぼ全 Issue で値が一致するため
 # collision シグナルとしては使わない（false positive 防止）。参考情報として
 # `machine_readable_keys_intersection` には含めるが `has_structural_collision`
 # の根拠にはしない。
-_GENERIC_CONTRACT_KEYS = frozenset(
-    {"contract_schema_version", "issue_kind", "parent_issue", "change_kind"}
-)
+_GENERIC_CONTRACT_KEYS = frozenset({"contract_schema_version", "issue_kind", "parent_issue", "change_kind"})
 
 
 def _contract_key_value_intersection(a: Dict[str, str], b: Dict[str, str]) -> Tuple[str, ...]:
@@ -454,20 +481,19 @@ def _structural_collision_signals(
 ) -> Dict[str, Any]:
     """collision 判定の構造的シグナル（Blocker 1: 自然言語類似度を唯一根拠にしない）。"""
     shared_ac = tuple(sorted(set(_extract_ac_ids(current_body)) & set(_extract_ac_ids(cand_body))))
-    shared_schema = tuple(
-        sorted(set(_extract_schema_names(current_body)) & set(_extract_schema_names(cand_body)))
+    shared_schema = tuple(sorted(set(_extract_schema_names(current_body)) & set(_extract_schema_names(cand_body))))
+    shared_targets = tuple(sorted(set(_extract_edit_targets(current_body)) & set(_extract_edit_targets(cand_body))))
+    shared_low_specificity_targets = tuple(
+        target for target in shared_targets if _is_low_specificity_edit_target(target)
     )
-    shared_targets = tuple(
-        sorted(set(_extract_edit_targets(current_body)) & set(_extract_edit_targets(cand_body)))
-    )
+    shared_specific_targets = tuple(target for target in shared_targets if target not in shared_low_specificity_targets)
     mrc_intersection = _contract_key_value_intersection(current_contract, cand_contract)
     meaningful_mrc_intersection = _meaningful_contract_key_intersection(current_contract, cand_contract)
     shared_goal_ref = bool(
         current_contract.get("goal_ref") and current_contract.get("goal_ref") == cand_contract.get("goal_ref")
     )
     edit_intent_match = bool(
-        current_contract.get("edit_intent")
-        and current_contract.get("edit_intent") == cand_contract.get("edit_intent")
+        current_contract.get("edit_intent") and current_contract.get("edit_intent") == cand_contract.get("edit_intent")
     )
 
     cur_deps = _parse_contract_dependency_lists(current_body)
@@ -479,25 +505,93 @@ def _structural_collision_signals(
         or (cur_key and cur_key in cand_deps.get("supersedes", ()))
     )
 
+    # ordinal AC ID は無関係な implementation issue にも反復するため evidence
+    # 専用の weak signal とし、strong collision の根拠には使わない。
     has_signal = bool(
-        shared_ac
-        or shared_schema
-        or shared_targets
-        or shared_goal_ref
-        or edit_intent_match
-        or meaningful_mrc_intersection
+        shared_schema or shared_specific_targets or shared_goal_ref or edit_intent_match or meaningful_mrc_intersection
     )
 
     return {
         "shared_ac_ids": list(shared_ac),
         "shared_output_schema": list(shared_schema),
         "shared_edit_targets": list(shared_targets),
+        "shared_low_specificity_edit_targets": list(shared_low_specificity_targets),
+        "shared_specific_edit_targets": list(shared_specific_targets),
         "machine_readable_keys_intersection": list(mrc_intersection),
         "shared_goal_ref": shared_goal_ref,
         "edit_intent_match": edit_intent_match,
         "explicit_supersession": explicit_supersession,
         "has_structural_collision": has_signal and not explicit_supersession,
     }
+
+
+def _path_signal_reasons(current_body: str, cand_body: str) -> Tuple[str, ...]:
+    """raw path kind から closed matrix 用の weak path reason を返す。
+
+    ``*_only`` は overlap の一部に weak pair があるという意味ではなく、全ての
+    observed path overlap がその weak class に属する場合だけ出力する。
+    """
+    overlap_classes: List[str] = []
+    for current_entry in extract_allowed_path_entries(current_body):
+        for candidate_entry in extract_allowed_path_entries(cand_body):
+            current_path = normalize_path(current_entry)
+            candidate_path = normalize_path(candidate_entry)
+            if not paths_conflict(current_entry, candidate_entry):
+                continue
+            current_kind = classify_path_scope_kind(current_entry)
+            candidate_kind = classify_path_scope_kind(candidate_entry)
+            if current_path == candidate_path and current_path in _LOW_SPECIFICITY_PATHS:
+                overlap_classes.append("low_specificity")
+            elif current_path != candidate_path and (
+                current_kind in {PathScopeKind.DIRECTORY, PathScopeKind.RECURSIVE_GLOB}
+                or candidate_kind in {PathScopeKind.DIRECTORY, PathScopeKind.RECURSIVE_GLOB}
+            ):
+                overlap_classes.append("broad_prefix")
+            else:
+                overlap_classes.append("specific")
+    if overlap_classes and set(overlap_classes) == {"low_specificity"}:
+        return ("low_specificity_path_only",)
+    if overlap_classes and set(overlap_classes) == {"broad_prefix"}:
+        return ("broad_prefix_only",)
+    return ()
+
+
+def _signal_decision(
+    structural: Dict[str, Any], *, text_signal: bool, weak_path_reasons: Tuple[str, ...]
+) -> SignalDecision:
+    """weak / strong reason と collision を一つの closed rule matrix で確定する。"""
+    independent: List[str] = []
+    if structural.get("shared_output_schema"):
+        independent.append("shared_output_schema")
+    if structural.get("shared_specific_edit_targets"):
+        independent.append("shared_specific_edit_target")
+    if structural.get("shared_goal_ref"):
+        independent.append("shared_goal_ref")
+    if structural.get("edit_intent_match"):
+        independent.append("shared_edit_intent")
+    meaningful_keys = [
+        key for key in structural.get("machine_readable_keys_intersection", []) if key not in _GENERIC_CONTRACT_KEYS
+    ]
+    if meaningful_keys:
+        independent.append("shared_machine_readable_key")
+
+    explicit_supersession = bool(structural.get("explicit_supersession"))
+    has_collision = bool(independent or text_signal) and not explicit_supersession
+    reasons: List[str] = []
+    if has_collision and independent:
+        reasons.append("independent_strong_signal_detected")
+    elif not has_collision:
+        reasons.extend(weak_path_reasons)
+        if structural.get("shared_ac_ids"):
+            reasons.append("ordinal_ac_id_only")
+    return SignalDecision(
+        weak_path_signals=weak_path_reasons,
+        strong_path_signals=tuple(independent),
+        independent_structural_signals=tuple(independent),
+        text_signal=text_signal,
+        has_collision=has_collision,
+        reasons=tuple(reasons),
+    )
 
 
 # ============================================================
@@ -525,9 +619,14 @@ def _run_gh_json(args: Sequence[str]) -> Any:
 def fetch_current_issue(repo: str, issue_number: int) -> Dict[str, Any]:
     data = _run_gh_json(
         [
-            "gh", "issue", "view", str(issue_number),
-            "--repo", repo,
-            "--json", "number,title,body,labels,updatedAt,url",
+            "gh",
+            "issue",
+            "view",
+            str(issue_number),
+            "--repo",
+            repo,
+            "--json",
+            "number,title,body,labels,updatedAt,url",
         ]
     )
     if not isinstance(data, dict) or "body" not in data:
@@ -535,28 +634,33 @@ def fetch_current_issue(repo: str, issue_number: int) -> Dict[str, Any]:
     return data
 
 
-def fetch_implementation_candidates(
-    repo: str, limit: int
-) -> Tuple[List[Dict[str, Any]], bool]:
+def fetch_implementation_candidates(repo: str, limit: int) -> Tuple[List[Dict[str, Any]], bool]:
     """OPEN かつ ``phase/implementation`` ラベルを持つ Issue を列挙する。
 
-    Returns (candidates_raw, saturated)。``saturated`` は取得件数が limit に
-    到達し全件性を証明できないことを表す（fail-closed の入力）。
+    ``limit`` は stored/fresh evidence の収集境界であり、上限到達は
+    fail-closed に扱う。全ページ取得と collection metadata の producer /
+    consumer 契約は #1493 の責務であり、本 Issue では変更しない。
     """
     data = _run_gh_json(
         [
-            "gh", "issue", "list",
-            "--repo", repo,
-            "--label", "phase/implementation",
-            "--state", "open",
-            "--json", "number,title,body,labels,updatedAt,url",
-            "--limit", str(limit),
+            "gh",
+            "issue",
+            "list",
+            "--repo",
+            repo,
+            "--label",
+            "phase/implementation",
+            "--state",
+            "open",
+            "--json",
+            "number,title,body,labels,updatedAt,url",
+            "--limit",
+            str(limit),
         ]
     )
     if not isinstance(data, list):
         raise OverlapRuntimeError("gh issue list did not return a JSON array")
-    saturated = len(data) >= limit
-    return data, saturated
+    return data, len(data) >= limit
 
 
 def fetch_predecessor_issue(repo: str, number: int) -> Optional[Dict[str, Any]]:
@@ -569,9 +673,14 @@ def fetch_predecessor_issue(repo: str, number: int) -> Optional[Dict[str, Any]]:
     try:
         data = _run_gh_json(
             [
-                "gh", "issue", "view", str(number),
-                "--repo", repo,
-                "--json", "number,title,body,labels,updatedAt,url,state",
+                "gh",
+                "issue",
+                "view",
+                str(number),
+                "--repo",
+                repo,
+                "--json",
+                "number,title,body,labels,updatedAt,url,state",
             ]
         )
     except OverlapRuntimeError:
@@ -625,9 +734,7 @@ def _normalize_native_dependency_record(item: Any, *, direction: str) -> Dict[st
     （`OverlapRuntimeError`）にする（Outcome 要件）。
     """
     if not isinstance(item, dict):
-        raise OverlapRuntimeError(
-            f"native dependency ({direction}) record is not an object: {item!r}"
-        )
+        raise OverlapRuntimeError(f"native dependency ({direction}) record is not an object: {item!r}")
     number = item.get("number")
     state = item.get("state")
     repository = _repository_from_repository_url(item.get("repository_url"))
@@ -635,8 +742,7 @@ def _normalize_native_dependency_record(item: Any, *, direction: str) -> Dict[st
     state_valid = isinstance(state, str) and state.strip().lower() in _NATIVE_DEPENDENCY_VALID_STATES
     if not number_valid or not repository or not state_valid:
         raise OverlapRuntimeError(
-            f"native dependency ({direction}) record missing/invalid "
-            f"number/repository_url/state: {item!r}"
+            f"native dependency ({direction}) record missing/invalid number/repository_url/state: {item!r}"
         )
     return {
         "repository": _canonicalize_repo_static(repository),
@@ -645,30 +751,31 @@ def _normalize_native_dependency_record(item: Any, *, direction: str) -> Dict[st
     }
 
 
-def _fetch_native_dependency_page(
-    repo: str, issue_number: int, direction: str, page: int
-) -> List[Any]:
+def _fetch_native_dependency_page(repo: str, issue_number: int, direction: str, page: int) -> List[Any]:
     endpoint = f"repos/{repo}/issues/{issue_number}/dependencies/{direction}"
     data = _run_gh_json(
         [
-            "gh", "api", endpoint,
-            "-X", "GET",
-            "-H", _GITHUB_API_ACCEPT_HEADER,
-            "-H", f"X-GitHub-Api-Version: {_GITHUB_API_VERSION}",
-            "-f", f"per_page={_NATIVE_DEPENDENCY_PAGE_SIZE}",
-            "-f", f"page={page}",
+            "gh",
+            "api",
+            endpoint,
+            "-X",
+            "GET",
+            "-H",
+            _GITHUB_API_ACCEPT_HEADER,
+            "-H",
+            f"X-GitHub-Api-Version: {_GITHUB_API_VERSION}",
+            "-f",
+            f"per_page={_NATIVE_DEPENDENCY_PAGE_SIZE}",
+            "-f",
+            f"page={page}",
         ]
     )
     if not isinstance(data, list):
-        raise OverlapRuntimeError(
-            f"native dependency endpoint returned non-array: {endpoint} page={page}"
-        )
+        raise OverlapRuntimeError(f"native dependency endpoint returned non-array: {endpoint} page={page}")
     return data
 
 
-def fetch_native_dependencies(
-    repo: str, issue_number: int, direction: str
-) -> Tuple[Dict[str, Any], ...]:
+def fetch_native_dependencies(repo: str, issue_number: int, direction: str) -> Tuple[Dict[str, Any], ...]:
     """GitHub native issue dependency（既定: REST issue-dependencies endpoint）を
     全ページ取得する（Blocker 5、pagination boundary の完全性証明）。
 
@@ -681,16 +788,12 @@ def fetch_native_dependencies(
     page = 1
     while True:
         raw_page = _fetch_native_dependency_page(repo, issue_number, direction, page)
-        records.extend(
-            _normalize_native_dependency_record(item, direction=direction) for item in raw_page
-        )
+        records.extend(_normalize_native_dependency_record(item, direction=direction) for item in raw_page)
         if len(raw_page) < _NATIVE_DEPENDENCY_PAGE_SIZE:
             break
         page += 1
         if page > _NATIVE_DEPENDENCY_MAX_PAGES:
-            raise OverlapRuntimeError(
-                f"native dependency pagination exceeded safety cap for {direction}"
-            )
+            raise OverlapRuntimeError(f"native dependency pagination exceeded safety cap for {direction}")
     return tuple(records)
 
 
@@ -702,16 +805,33 @@ def fetch_all_native_dependencies(repo: str, issue_number: int) -> Dict[str, Tup
     }
 
 
+def _classifier_allowed_paths(entries: Sequence[str]) -> Tuple[str, ...]:
+    """pure classifier に渡す path を one-level glob semantics へ写像する。
+
+    IssueScope は normalized path だけを保持するため、``tests/*`` が通常の
+    directory prefix に畳まれるのを防ぐ。evidence には原文 path を保ち、ここは
+    classifier 内部用の決定論的 sentinel に限定する。
+    """
+    out: List[str] = []
+    for entry in entries:
+        raw = entry.strip()
+        if raw.endswith("/*") and not raw.endswith("/**"):
+            out.append(f"{normalize_path(raw)}/__single_level_glob__")
+        else:
+            out.append(raw)
+    return tuple(out)
+
+
 def _issue_scope_from_raw(raw: Dict[str, Any], *, current_repo: Optional[str] = None) -> IssueScope:
     body = str(raw.get("body") or "")
     return IssueScope(
         title=str(raw.get("title", "")),
         number=raw.get("number"),
         url=str(raw.get("url", "") or ""),
+        allowed_paths=_classifier_allowed_paths(extract_allowed_path_entries(body)),
         body=raw.get("body"),
         labels=tuple(
-            (lbl.get("name", "") if isinstance(lbl, dict) else str(lbl))
-            for lbl in (raw.get("labels", []) or [])
+            (lbl.get("name", "") if isinstance(lbl, dict) else str(lbl)) for lbl in (raw.get("labels", []) or [])
         ),
         depends_on=_merge_dependency_refs(body, raw, "blocked_by", current_repo=current_repo),
         parent_refs=_extract_parent_ref(body),
@@ -803,12 +923,31 @@ def _readback_candidate(
     text_signal = text_similarity >= _HEADING_OVERLAP_THRESHOLD
 
     structural = _structural_collision_signals(
-        current_number, current_body, current_contract,
-        cand_number, cand_body, cand_contract,
+        current_number,
+        current_body,
+        current_contract,
+        cand_number,
+        cand_body,
+        cand_contract,
     )
-    structural_collision = structural["has_structural_collision"]
-
-    collision = structural_collision or text_signal
+    weak_path_reasons = _path_signal_reasons(current_body, cand_body)
+    decision = _signal_decision(
+        structural,
+        text_signal=text_signal,
+        weak_path_reasons=weak_path_reasons,
+    )
+    collision = decision.has_collision
+    structural["has_structural_collision"] = bool(
+        decision.independent_structural_signals and not structural["explicit_supersession"]
+    )
+    structural["signal_decision"] = {
+        "weak_path_signals": list(decision.weak_path_signals),
+        "strong_path_signals": list(decision.strong_path_signals),
+        "independent_structural_signals": list(decision.independent_structural_signals),
+        "text_signal": decision.text_signal,
+        "has_collision": decision.has_collision,
+        "reasons": list(decision.reasons),
+    }
     non_conflict_reason = None
     if not collision:
         non_conflict_reason = (
@@ -819,8 +958,7 @@ def _readback_candidate(
         )
     elif structural["explicit_supersession"]:
         non_conflict_reason = (
-            "candidate は current との supersedes/superseded-by 関係が明示されており、"
-            "意図的な直列化と判定する。"
+            "candidate は current との supersedes/superseded-by 関係が明示されており、意図的な直列化と判定する。"
         )
         collision = False
 
@@ -829,6 +967,7 @@ def _readback_candidate(
         "heading_overlap": collision,
         "text_similarity": text_similarity,
         "structural_signals": structural,
+        "weak_signal_reasons": list(decision.reasons),
         "non_conflict_reason": non_conflict_reason,
     }
 
@@ -975,7 +1114,7 @@ def _classify(
     repository: str,
 ) -> Tuple[str, Dict[str, Any]]:
     current_body = str(current_raw.get("body") or "")
-    current_paths = extract_allowed_paths(current_body)
+    current_paths = extract_allowed_path_entries(current_body)
     current_contract = _contract_schema_keys(current_body)
 
     # --- 全 candidate の schema validation（Major 5） ---
@@ -997,9 +1136,7 @@ def _classify(
                 "reason": "ignored_missing_allowed_paths",
                 "url": raw.get("url") if isinstance(raw.get("url"), str) else None,
                 "updated_at": raw.get("updatedAt"),
-                "body_sha256": (
-                    f"sha256:{_sha256(body)}" if isinstance(body, str) and body else None
-                ),
+                "body_sha256": (f"sha256:{_sha256(body)}" if isinstance(body, str) and body else None),
             }
             ignored_candidates.append(
                 {
@@ -1033,18 +1170,14 @@ def _classify(
     current = IssueScope(
         title=str(current_raw.get("title", "")),
         number=args.issue_number,
-        allowed_paths=tuple(current_paths),
+        allowed_paths=_classifier_allowed_paths(current_paths),
         body=current_body,
-        depends_on=_merge_dependency_refs(
-            current_body, current_raw, "blocked_by", current_repo=repository
-        ),
+        depends_on=_merge_dependency_refs(current_body, current_raw, "blocked_by", current_repo=repository),
         parent_refs=_extract_parent_ref(current_body),
     )
 
     # --- dependency 解決（Blocker 2） ---
-    dep_res = _resolve_dependency(
-        args.issue_number, current_paths, current.depends_on, scope_pool
-    )
+    dep_res = _resolve_dependency(args.issue_number, current_paths, current.depends_on, scope_pool)
     # Major 1（PR #1474 レビュー）: 取得済みの typed record（`{repository,
     # number, state}`）を issue number へ潰す前に auditability 用として保持
     # する。`native_blocking`（current が後続を止めている側）はこれまで取得
@@ -1074,9 +1207,9 @@ def _classify(
     #   1. classify_overlap が OVERLAP_REQUIRES_COMMENT / DUPLICATE と判定した候補
     #   2. dependency 解決で見つかった CLOSED predecessor（C2a track、Blocker 2）
     readback_targets: Dict[int, str] = {}  # issue_number -> "classify" | "dependency_c2a"
-    verdict_candidates: List[Any] = list(result.candidates) if result.verdict in {
-        OVERLAP_REQUIRES_COMMENT, DUPLICATE
-    } else []
+    verdict_candidates: List[Any] = (
+        list(result.candidates) if result.verdict in {OVERLAP_REQUIRES_COMMENT, DUPLICATE} else []
+    )
     for cand in verdict_candidates:
         if cand.issue_number is not None:
             readback_targets[cand.issue_number] = "classify"
@@ -1098,8 +1231,12 @@ def _classify(
         cand_body = candidate_bodies.get(key, "")
         cand_contract = candidate_contracts.get(key, {})
         rb = _readback_candidate(
-            args.issue_number, current_body, current_contract,
-            num, cand_body, cand_contract,
+            args.issue_number,
+            current_body,
+            current_contract,
+            num,
+            cand_body,
+            cand_contract,
         )
         if not rb["readback_complete"]:
             any_incomplete = True
@@ -1107,8 +1244,9 @@ def _classify(
             any_collision = True
 
         policy_class = (
-            "C2a" if origin == "dependency_c2a" else
-            ("duplicate_candidate" if origin == "classify" and result.verdict == DUPLICATE else "C1")
+            "C2a"
+            if origin == "dependency_c2a"
+            else ("duplicate_candidate" if origin == "classify" and result.verdict == DUPLICATE else "C1")
         )
         reasons: List[str] = []
         if origin == "dependency_c2a":
@@ -1139,12 +1277,10 @@ def _classify(
                 "readback_complete": rb["readback_complete"],
                 "text_similarity": round(rb["text_similarity"], 4),
                 "change_kind_equal": change_kind_equal,
-                "machine_readable_keys_intersection": list(
-                    structural.get("machine_readable_keys_intersection", [])
-                ),
+                "machine_readable_keys_intersection": list(structural.get("machine_readable_keys_intersection", [])),
                 "structural_signals": structural,
                 "policy_class": policy_class,
-                "reasons": reasons,
+                "reasons": reasons + list(rb.get("weak_signal_reasons") or []),
                 "non_conflict_reason": rb["non_conflict_reason"],
             }
         )
@@ -1232,8 +1368,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="check_implementation_overlap.py",
         description=(
-            "implement-issue 専用の contract-aware overlap preflight "
-            "（check_issue_overlap.py の classifier を再利用）"
+            "implement-issue 専用の contract-aware overlap preflight （check_issue_overlap.py の classifier を再利用）"
         ),
     )
     p.add_argument("--issue-number", required=True, type=int, help="対象 Issue 番号（自己除外に使用）")
@@ -1291,17 +1426,13 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             raise OverlapRuntimeError("candidates JSON must be an array")
 
         # --- 自己除外（AC6） ---
-        candidates_raw = [
-            c for c in candidates_raw if int(c.get("number", -1)) != args.issue_number
-        ]
+        candidates_raw = [c for c in candidates_raw if int(c.get("number", -1)) != args.issue_number]
 
         # --- Blocker 2: current が参照する predecessor が候補プールに
         #     存在しない場合、オンライン経路では個別 readback する。
         if not args.dry_run and repo:
             current_body_preview = str(current_raw.get("body") or "")
-            refs = _merge_dependency_refs(
-                current_body_preview, current_raw, "blocked_by", current_repo=canonical_repo
-            )
+            refs = _merge_dependency_refs(current_body_preview, current_raw, "blocked_by", current_repo=canonical_repo)
             known_numbers = {str(c.get("number")) for c in candidates_raw}
             for ref in refs:
                 if ref in known_numbers:
@@ -1334,18 +1465,10 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         #     predecessor・successor 関係を classifier に渡す。
         if not args.dry_run and repo:
             readback_numbers = sorted(
-                {
-                    c["issue_number"]
-                    for c in ctx["candidates_evidence"]
-                    if isinstance(c.get("issue_number"), int)
-                }
+                {c["issue_number"] for c in ctx["candidates_evidence"] if isinstance(c.get("issue_number"), int)}
             )
             if readback_numbers:
-                raw_by_number = {
-                    c.get("number"): c
-                    for c in candidates_raw
-                    if isinstance(c.get("number"), int)
-                }
+                raw_by_number = {c.get("number"): c for c in candidates_raw if isinstance(c.get("number"), int)}
                 fetched_numbers: List[int] = []
                 for num in readback_numbers:
                     target_raw = raw_by_number.get(num)

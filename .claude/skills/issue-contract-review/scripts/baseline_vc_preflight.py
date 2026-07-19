@@ -36,6 +36,7 @@ from vc_contract_syntax import (  # noqa: E402
     extract_vc_role_annotation,
     parse_verification_commands_section,
 )
+import pnpm_gate_registry as pnpm_gate_registry  # noqa: E402
 
 
 # Issue #1333 AC1: per-command timeout の named constant。
@@ -727,7 +728,15 @@ def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str,
         # shlex.split に失敗した場合は compound command の可能性
         return -1, "", "shlex.split failed", 0, {}
 
-    env_delta = _fixed_env_delta_for_argv(argv)
+    pnpm_evidence = None
+    if pnpm_gate_registry.looks_like_pnpm(argv):
+        launch_argv, pnpm_evidence, gate_error = pnpm_gate_registry.prepare_launch(argv, cwd)
+        if gate_error or launch_argv is None:
+            return -1, "", gate_error or "pnpm_gate:launch_preparation_failed", 0, {}
+        argv = launch_argv
+        env_delta = dict(pnpm_evidence["runner_env_delta"])
+    else:
+        env_delta = _fixed_env_delta_for_argv(argv)
     run_env = None
     if env_delta:
         run_env = os.environ.copy()
@@ -758,6 +767,16 @@ def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str,
     except Exception as e:
         duration_ms = int((datetime.now() - start).total_seconds() * 1000)
         return -1, "", str(e), duration_ms, env_delta
+
+
+def _pnpm_gate_evidence_for_command(command: str, cwd: str) -> Optional[Dict[str, Any]]:
+    """Produce consumer-verifiable gate evidence without a fallback pathway."""
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    evidence, error = pnpm_gate_registry.evidence_for_request(argv, cwd)
+    return evidence if error is None else None
 
 
 def truncate_line_bytes(line: str, max_bytes: int) -> str:
@@ -1514,18 +1533,14 @@ _ALLOWED_GH_PREFIXES: tuple = (
 # B1: pnpm exact subcommand allowlist (tuple-based)
 # Only these exact (argv[0], argv[1]) tuples are allowed for pnpm.
 # pnpm exec, pnpm dlx, pnpm run, pnpm add, etc. are blocked.
-_ALLOWED_PNPM_SUBCOMMANDS: frozenset = frozenset([
-    ("pnpm", "typecheck"),
-    ("pnpm", "lint"),
-    ("pnpm", "test"),
-    ("pnpm", "build"),
-])
-
+# Compatibility names are derived from the shared registry; they are not
+# independent allowlists.
+_ALLOWED_PNPM_SUBCOMMANDS: frozenset = frozenset(
+    gate.request_argv for gate in pnpm_gate_registry.iter_gate_descriptors()
+)
 _FIXED_ENV_DELTA_BY_COMMAND: Dict[Tuple[str, str], Dict[str, str]] = {
-    ("pnpm", "typecheck"): {"CI": "true"},
-    ("pnpm", "lint"): {"CI": "true"},
-    ("pnpm", "test"): {"CI": "true"},
-    ("pnpm", "build"): {"CI": "true"},
+    gate.request_argv: dict(pnpm_gate_registry.RUNNER_ENV_DELTA)
+    for gate in pnpm_gate_registry.iter_gate_descriptors()
 }
 
 _PNPM_NO_TTY_ERROR_PATTERNS: tuple[str, ...] = (
@@ -1577,12 +1592,8 @@ _ALLOWED_COMMANDS: frozenset = frozenset([
 
 def _canonical_pnpm_gate(argv: List[str]) -> Optional[Tuple[str, str]]:
     """Return the canonical 2-token pnpm gate tuple, or None if not exact."""
-    if len(argv) != 2:
-        return None
-    key = (Path(argv[0]).name, argv[1].lower())
-    if key in _ALLOWED_PNPM_SUBCOMMANDS:
-        return key
-    return None
+    descriptor = pnpm_gate_registry.gate_for_request(argv)
+    return descriptor.request_argv if descriptor else None
 
 
 def _is_allowed_python3_invocation(argv: List[str]) -> bool:
@@ -1657,7 +1668,7 @@ def _fixed_env_delta_for_argv(argv: List[str]) -> Dict[str, str]:
     key = _canonical_pnpm_gate(argv)
     if key is None:
         return {}
-    return dict(_FIXED_ENV_DELTA_BY_COMMAND.get(key, {}))
+    return dict(pnpm_gate_registry.RUNNER_ENV_DELTA)
 
 
 def _is_package_manager_no_tty_prompt(command: str, stdout: str, stderr: str) -> bool:
@@ -3367,6 +3378,7 @@ def _build_result_item(
     source_ac: Optional[str] = None,
     source_line: Optional[int] = None,
     certified_target_paths: Optional[List[str]] = None,
+    cwd: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build one VC result entry.
 
@@ -3490,6 +3502,19 @@ def _build_result_item(
         result_item["verification_owner"] = verification_owner
         result_item["deferred_reason"] = deferred_reason
         result_item["runtime_verification_required"] = runtime_verification_required
+
+    try:
+        _result_argv = shlex.split(command)
+    except ValueError:
+        _result_argv = []
+    pnpm_gate_evidence = _pnpm_gate_evidence_for_command(command, cwd or ".")
+    if pnpm_gate_evidence is not None:
+        result_item["pnpm_gate_evidence_required"] = True
+        result_item["pnpm_gate_evidence"] = pnpm_gate_evidence
+    elif pnpm_gate_registry.gate_for_request(_result_argv) is not None:
+        # Consumers must fail closed if this producer-declared requirement is
+        # present but its companion evidence is missing or malformed.
+        result_item["pnpm_gate_evidence_required"] = True
 
     if is_dedup_replay:
         # AC2/AC3: dedup replay carries provenance of the source execution,
@@ -3999,6 +4024,7 @@ def main() -> int:
                 if _category == "expected_pass_resolved_on_current_head"
                 else None
             ),
+            cwd=args.cwd,
         )
         results[job["idx"]] = _result_item
         summary[_result_item["classification"]] += 1
@@ -4328,6 +4354,7 @@ def main() -> int:
                 if category == "expected_pass_resolved_on_current_head"
                 else None
             ),
+            cwd=args.cwd,
         )
         results[_cmd_idx] = result_item
         summary[result_item["classification"]] += 1

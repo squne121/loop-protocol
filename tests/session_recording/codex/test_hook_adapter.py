@@ -4,6 +4,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -512,45 +513,64 @@ def test_env_prefix_benign_command_allowed():
 
 
 # ---------------------------------------------------------------------------
-# AC12 (#1420 fix_delta 3): default manifest root fallback when
-# CODEX_HOOK_MANIFEST_ROOT is unset
+# AC12 (#1420 fix_delta 3), superseded by Issue #1546 (see
+# docs/dev/agent-skill-boundaries.md): default manifest root when
+# CODEX_HOOK_MANIFEST_ROOT is unset. #1546 migrated the production default
+# from a repository-tree path to the canonical external per-user state root
+# (XDG_STATE_HOME), so this test now asserts that migrated default instead
+# of the old repo-local path, and additionally asserts that the legacy
+# repo-local root receives no new write (#1420 AC12 back-compat contract is
+# explicitly retired, not silently dropped).
 # ---------------------------------------------------------------------------
 
 def test_manifest_written_to_default_root_when_env_unset():
     """GIVEN CODEX_HOOK_MANIFEST_ROOT is unset WHEN Stop fires THEN the manifest
-    is written to the production default path
-    <repoRoot>/tmp/session-manifests/codex/stop/ (AC12, #1420 fix_delta 3).
+    is written under the canonical external per-user state root resolved from
+    XDG_STATE_HOME (Issue #1546 AC1/AC2/AC9), not under the legacy repo-local
+    <repoRoot>/tmp/session-manifests/codex/stop/ path (#1420 AC12, superseded).
 
-    This test intentionally does NOT use tmp_path / CODEX_HOOK_MANIFEST_ROOT
-    override (it is the only test in this module that writes to the shared
-    repo-relative default path), so it identifies and removes only the exact
-    file it created rather than rmtree-ing the shared directory (which would
-    race other concurrent runs)."""
+    This test isolates the external per-user state root under a pytest
+    tmp_path-derived XDG_STATE_HOME override (the officially supported base
+    override for the production default-resolution code path — distinct from
+    the CODEX_HOOK_MANIFEST_ROOT raw-root override used by the rest of this
+    module), so it never touches the real developer $HOME/.local/state."""
     payload = json.loads((FIXTURES / "positive_fixture.json").read_text())
-    default_manifest_dir = REPO_ROOT / "tmp" / "session-manifests" / "codex" / "stop"
-    before_files = set(default_manifest_dir.glob("*.json")) if default_manifest_dir.exists() else set()
+    legacy_manifest_dir = REPO_ROOT / "tmp" / "session-manifests" / "codex" / "stop"
+    legacy_before_files = (
+        set(legacy_manifest_dir.glob("*.json")) if legacy_manifest_dir.exists() else set()
+    )
 
-    env = os.environ.copy()
-    env.pop("CODEX_HOOK_MANIFEST_ROOT", None)
-    result = run_adapter("Stop", payload, env=env)
-    assert json.loads(result.stdout) == {"continue": True}
+    with tempfile.TemporaryDirectory() as state_home:
+        env = os.environ.copy()
+        env.pop("CODEX_HOOK_MANIFEST_ROOT", None)
+        env["XDG_STATE_HOME"] = state_home
+        result = run_adapter("Stop", payload, env=env)
+        assert json.loads(result.stdout) == {"continue": True}
+        assert result.stderr == ""
 
-    after_files = set(default_manifest_dir.glob("*.json"))
-    new_files = after_files - before_files
-    assert len(new_files) == 1, f"expected exactly one new manifest file, got {new_files}"
-    new_file = new_files.pop()
+        external_manifest_dir = (
+            Path(state_home) / "loop-protocol" / "session-manifests" / "v1"
+        )
+        external_manifests = list(external_manifest_dir.glob("*/codex/stop/*.json"))
+        assert len(external_manifests) == 1, (
+            f"expected exactly one external manifest, got {external_manifests}"
+        )
+        new_file = external_manifests[0]
 
-    try:
         validation = subprocess.run(
-            ["node", str(MANIFEST_VALIDATOR), str(default_manifest_dir)],
+            ["node", str(MANIFEST_VALIDATOR), str(new_file.parent)],
             cwd=REPO_ROOT,
             text=True,
             capture_output=True,
             check=False,
         )
         assert validation.returncode == 0, validation.stderr
-    finally:
-        new_file.unlink()
+
+    # #1546 AC9: no new write to the legacy repo-local default root.
+    legacy_after_files = (
+        set(legacy_manifest_dir.glob("*.json")) if legacy_manifest_dir.exists() else set()
+    )
+    assert legacy_after_files - legacy_before_files == set()
 
 
 # ---------------------------------------------------------------------------

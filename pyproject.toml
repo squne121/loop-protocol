@@ -15,7 +15,10 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-addopts = "--import-mode=importlib"
+addopts = "--import-mode=importlib -m 'not github_live'"
+markers = [
+  "github_live: exercises real GitHub API write access via gh CLI against a disposable Issue (deselected by default addopts; opt in explicitly with -m github_live and an authenticated gh CLI).",
+]
 
 [tool.ruff]
 line-length = 120

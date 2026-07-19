@@ -490,6 +490,7 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 | `target_dir_outside_worktree` | active issue worktree 配下へ戻る | `git status --short` / `git branch --show-current` |
 | `no_matching_worktree` / `ambiguous_worktree` | worktree catalog を 1 件に特定する | `git worktree list` / `git branch --show-current` |
 | `rtk_unknown_inner` | wrapper を剥がさず direct な `rtk git add/commit/push` へ揃える | `rtk git add <allowed-path-file>` / `git branch --show-current` |
+| `git_add_requires_controlled_executor` / `git_commit_requires_controlled_executor` | raw `git add`/`git commit`/`rtk git add`/`rtk git commit` は agent lane では常に deny -- controlled executor 経由に切り替える（Issue #1611 AC9） | `uv run --locked python3 scripts/agent-guards/controlled_git_change_exec.py --help` / `git diff --cached --name-status -M -z` |
 
 ### 運用ガイド
 
@@ -497,6 +498,17 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 - `suggested_command` は authorization を付与しない。rules / hooks / post-run verifier が独立に reject できる。
 - `allowed_paths_missing_for_git_mutation` は fail-closed 理由であり、Issue contract の Allowed Paths binding が runtime に見えていない状態を示す。
 - branch publish failure では `boundary_layer` と `reason_code` を分離し、`expected_remote_head` / `current_remote_head` / `local_head` / `verified_head` の比較が崩れたら `PUBLISH_SAFETY_STOP_REPORT_V1` に倒す。
+- Issue #1611 以降、staging/commit の唯一の認可経路は `scripts/agent-guards/controlled_git_change_exec.py`
+  （`execute_controlled_change`）である。`git_mutation_command_policy.py` の
+  `classify_agent_lane_add_commit` は raw `git add`/`git commit`/`rtk git add`/`rtk git commit`
+  シェルコマンド文字列を、そのコマンド自身が controlled executor でない限り常に deny する（既存の
+  `classify_rtk_git_mutation` の add/commit 分岐は後方互換のため変更していない -- 実際の agent lane
+  はこの新しい deny-first 判定を優先する）。Codex 側の静的 rule
+  (`.codex/rules/default.rules`) も `rtk git add` / `rtk git commit -m` を `forbidden` に narrowing
+  し、controlled executor 本体の exact invocation prefix
+  (`uv run --locked python3 scripts/agent-guards/controlled_git_change_exec.py`) のみ `allow` にして
+  いる（AC14、`scripts/ci/codex_execpolicy_matrix.py` の `execpolicy_case_definitions()` に静的ケース
+  として記録）。
 
 ---
 
@@ -706,6 +718,43 @@ SESSION_MANIFEST_LEGACY_SCAN_V1:
 
 ---
 
-## 12. publish lane authorization trust root（historical note）
+## 12a. pr_review.publish の位置づけ（Issue #1536）
+
+`scripts/agent-guards/controlled_skill_mutation_exec.py` の `CONTROLLED_SKILL_MUTATION_COMMAND_POLICY` に `pr_review.publish` command id を追加した（Option C: controlled review publisher）。`local_main_branch_guard.sh` / `worktree_scope_guard.sh` は既存の `REASON_CONTROLLED_SKILL_MUTATION_EXECUTOR` 判定（`is_controlled_skill_mutation_exec_command()`、`ALL_COMMAND_IDS` メンバーシップに基づく exact command class allow）をそのまま適用するため、この2フック自体の変更は不要だった（`termination_report.publish` / `issue_body.update` / `issue_comment.publish` / `contract_snapshot.publish` と同一の authorization lane）。
+
+`pr_review.publish` は `pr-reviewer` SubAgent（read-only、`gh pr review` / worktree bootstrap を一切行わない）の判定結果（`PR_REVIEW_PUBLISH_REQUEST_V1`）を受け取り、`event: COMMENT` 固定・`commit_id` 拘束・idempotency marker 付きで GitHub PR review を投稿する。生の `gh pr review` 呼び出しは `local_main_branch_guard.sh` で引き続き `gh_mutation_denied` として block される（本 Issue で変更しない）。
+
+Codex 側 `.codex/rules/default.rules` は `gh pr review` を引き続き明示的に forbidden とし（`gh` サブコマンド prefix rule）、かつ `controlled_skill_mutation_exec.py` 自体への allow エントリを持たないため、本変更は Claude-only のまま split-brain を生じない（確認のみ、rule 変更なし）。
+
+## 12b. pr_review.publish の追加ハードニング（Issue #1539 fix_delta）
+
+OWNER レビュー（PR #1539、squne121）で以下の構造的欠陥が指摘され、修正した:
+
+- **trusted bridge の欠如（Blocker 1）**: `pr-reviewer` SubAgent は `Edit`/`Write`/`MultiEdit` を持たず Bash 経由のファイル書き込みも禁止のため、当初の SKILL 文面が要求していた「`PR_REVIEW_PUBLISH_REQUEST_V1` を自ら組み立てて `--input-file` に渡す」経路は実際には SubAgent に実行不能だった。修正: `controlled_skill_mutation_exec.py` に render mode（`--render-body-file` / `--verdict` / `--reviewed-head-sha` / `--expected-head-sha` / `--merge-ready`）を追加。trusted orchestrator（Write ツールを持つ control-plane）が verdict 本文テキストのみを artifact パスへ書き込み、executor 自身が `body_sha256` / `idempotency_key` を再計算し `producer_role` / `event` を自ら固定する（入力からは受け取らない）。
+- **host/environment binding の欠如（Blocker 2）**: `_verify_git_remote_origin()` が owner/repo の正規表現抽出のみで host/scheme を無視していたため、`https://attacker.example/<owner>/<repo>.git` 等が trusted と誤認され得た。また `GH_HOST`/`GH_REPO`/`GH_CONFIG_DIR`/`GH_DEBUG`/`DEBUG` が sanitize されず、`gh` subprocess へ `env=` が渡っていなかった。修正: `urlsplit` による構造的 host/scheme/port/userinfo 検査（github.com の HTTPS/SSH canonical form のみ許可）と、全 `gh` subprocess への sanitized env（上記5キー除去）+ `--hostname github.com` 明示。
+- **idempotent retry が postcondition を迂回（Blocker 3）**: 既存 marker が1件見つかった retry 経路が `state`/`commit_id` のみ確認して即座に成功を返し、body hash・marker 一意性/位置・現在 PR head・author identity・tracked changes を再検証していなかった。修正: retry も fresh-post と同一の共通 postcondition validator（`_validate_pr_review_postcondition`）を通す。marker 検索も substring match から「末尾に厳密一致」判定に変更。
+- **TOCTOU（High 1）**: commit_id 拘束は「A に結び付ける」保証であって「POST 時点でも A が current head」の atomic precondition ではない。修正: POST/readback 後に current head を再取得し、移動していれば `published_but_stale` として fail-closed（review は残るが成功報告はしない）。
+- **producer provenance の自己申告（High 2）**: `producer_role` が入力 JSON の自己申告フィールドで、schema も exact-key ではなかった。修正: render mode では `producer_role`/`event` を executor が自ら固定（入力に存在しても無視ではなく、そもそも render mode の入力スキーマに含まれない）。`--input-file` 経路も exact-key schema + body size bound を追加。
+
+AC8（実 PreToolUse hook chain）テストは `secret_boundary_guard` / `local_main_branch_guard` / `worktree_scope_guard` / `guard-japanese-prose` / `rtk_boundary_shadow_guard` / `ci_test_performance_advisory` / `root_temporary_residue_advisory` の 7 hook すべてを `.claude/settings.json` 記載順に実行し、aggregate decision（deny/ask が無いこと）を検証する形に拡張した（`.claude/hooks/tests/hookchain_harness.py`）。
+
+## 12c. scope_rollup.run の位置づけ（Issue #1547）
+
+`scope_rollup.run` は canonical root（worktree 作成前）context からのみ許可される、独立した exact command class である。`local_main_branch_guard.py` / `skill_runtime_command_policy.py` に登録されており、既存の `preflight.run`（`skill_runtime_exec.py` 経由）とは別レーン -- `skill_runtime_exec.py` は `run_refinement_preflight.py` 呼び出しに固定されているため、`scope_rollup.run` は代わりに新規 `scripts/agent-guards/run_scope_rollup_preflight.py` を直接 exact-match する。
+
+- **command**: `uv run python3 scripts/agent-guards/run_scope_rollup_preflight.py --issue-number <N> --repo <owner/repo> --invocation-id <id> --requested-at <ISO8601>`（12 token 完全一致。`--invocation-id` / `--requested-at` は PR #1560 fix_delta で追加 -- caller (scope-rollup-runner) が生成した値をそのまま渡し、executor は独自に UUID / timestamp を生成しない。`--flag=value` 形・追加 flag・wrapper・shell metacharacter はすべて `unparseable_branch_mutation` で fail-closed）
+- **destination**: caller は出力先を指定しない。GitHub 生入力（`issues.json` / `prs.json`）は executor-owned private invocation directory（`tempfile.mkdtemp()`, mode `0700`）内に `O_CREAT | O_EXCL | O_NOFOLLOW` + mode `0600` で `.part` ファイルを排他生成し、同一 directory 内 `os.link()` ベースの排他 finalize（`os.rename` は使わない -- 既存 destination を静かに置換しうるため）+ flush + `fsync` で確定する。planner の実行結果（`plan_result.json` 相当）はファイル化せず、bounded streaming で in-memory capture した stdout を直接 JSON parse し、verifier も in-process の `verify_payload()` で検証する（PR #1560 P0-2）。success / failure / timeout の全経路で private directory を `finally` で cleanup し、cleanup 失敗自体も `cleanup_failed` として transaction failure に変換する（P1-3）。`SCOPE_ROLLUP_RUN_RESULT_V1` JSON のみを stdout へ返す（永続 artifact は残さない）
+- **safety boundary**: canonical root cwd・default branch・trusted repo（`squne121/loop-protocol`）を実行前後で拘束。`gh` は固定 trusted search dirs（`/usr/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, `/bin`）から解決し、realpath・owner 権限・ancestor directory の world/group-writable 状態（sticky bit なし）まで検証する（PATH shadowing 対策、P1-1）。`GH_HOST` / `GH_REPO` / `GH_FORCE_TTY` / `GH_PAGER` / `PAGER` / `GH_CONFIG_DIR` / `GH_DEBUG` / `GH_PATH` / `GH_PROMPT_DISABLED` は sanitize（呼び出し元環境から継承しない）
+- raw `gh issue view / list` / `gh pr list` の shell redirect（`gh ... > /tmp/...`）は引き続き `local_main_branch_guard` の compound/metachar 判定で block される。`scope_rollup.run` の exact invocation だけが許可レーンであり、redirect の部分許可は導入していない
+- pagination は `--limit <MAX_ITEMS_PER_KIND + 1>` を要求し、実際の件数が上限を超えた場合は `truncated: true` として transaction 全体を fail-close する（`hasNextPage` を直接確認できないため、上限超過を「完走を証明できない」と同一視する設計）。加えて `gh api graphql` で server-side `totalCount` を独立取得し、フェッチ件数と突き合わせる（P1-2）。マニフェストの `page_count` は `ceil(item_count / 100)` の実測値を記録する
+- PR の `files` connection は `files(first: 100)` に固定されるため、`changedFiles` がフェッチ済み `files` 件数を上回る PR については `gh api graphql` でその PR の files connection のみを `hasNextPage` が false になるまで cursor pagination し、完走できなければ `pr_files_pagination_incomplete` として fail-close する（101 件目以降のファイルで overlap を見逃す false negative の防止、P0-3）
+- linked issue worktree context では、`is_local_root_context()` の context routing が classifier より先に評価されるため、`scope_rollup.run` classifier 自体には到達しない（`linked_issue_worktree_context` / `not_local_root` が先に allow を返す）
+- **既知の follow-up（本 fix_delta ではスコープ外）**: `skill_runtime_exec.py` を単一 registry SSOT として `scope_rollup.run` を統合すること（P1-5）。この executor は元々 `skill_runtime_exec.py` の Allowed Paths 外として独立レーンに設計されており（上記参照）、統合には `skill_runtime_exec.py`（直近で 500 行超の別 PR 変更が入ったばかり）への大規模な変更と Allowed Paths のさらなる拡張が必要になるため、本 PR のスコープには含めない。
+
+---
+
+---
+
+## 12. publish lane authorization trust root（歴史的経緯・historical note）
 
 Issue #1454（Phase A, PR #1457 MERGED）で `scripts/trust-root` 一式（`trusted_hook_launcher.py` / `manifest_schema.py` / `install_trust_root.sh`）が external trust root として導入されたが、これを `.codex/hooks.json` へ実際に配線する Issue #1450（Phase B）と、追加ハードニングを扱う Issue #1468 がいずれも個人開発の脅威モデルに対して過剰と判断され not planned でクローズされた。配線先を失った `scripts/trust-root` は不使用コードとなったため、Issue #1469 でコード一式・CI 登録・本節の bootstrap/rotation/managed hook registration 手順を削除した。現行の publish lane 保護は Issue #1408（PR #1442 MERGED、Issue branch 限定 push 許可・force/tag/delete/mirror 拒否）と main branch protection（Issue #360）のみで構成される。

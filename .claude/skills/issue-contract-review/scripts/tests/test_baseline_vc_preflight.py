@@ -1953,10 +1953,13 @@ def test_fixed_env_injects_ci_true_for_pnpm_build(monkeypatch):
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        module.pnpm_gate_registry, "resolve_trusted_pnpm", lambda _root: "/trusted/pnpm"
+    )
 
     exit_code, stdout, stderr, duration_ms, runner_env_delta = module.run_command("pnpm build", 30, ".")
 
-    assert captured["argv"] == ["pnpm", "build"]
+    assert captured["argv"] == ["/trusted/pnpm", "run", "build"]
     assert captured["shell"] is False
     assert captured["env"]["CI"] == "true"
     assert runner_env_delta == {"CI": "true"}
@@ -1977,6 +1980,9 @@ def test_fixed_env_applies_to_all_canonical_pnpm_gates(monkeypatch):
             return subprocess.CompletedProcess(argv, 0, "", "")
 
         monkeypatch.setattr(module.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            module.pnpm_gate_registry, "resolve_trusted_pnpm", lambda _root: "/trusted/pnpm"
+        )
 
         _, _, _, _, runner_env_delta = module.run_command(gate, 30, ".")
 
@@ -1988,8 +1994,8 @@ def test_fixed_env_applies_to_all_canonical_pnpm_gates(monkeypatch):
         )
 
 
-def test_fixed_env_does_not_apply_to_pnpm_build_with_extra_args(monkeypatch):
-    """AC2: pnpm build extra args は canonical gate ではなく CI 注入しない"""
+def test_pnpm_build_with_extra_args_is_blocked_without_launch(monkeypatch):
+    """AC2: extra args は canonical gate でなく、script subprocess を起動しない。"""
     script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
     sys.path.insert(0, str(script_path.parent))
     import baseline_vc_preflight as module
@@ -2003,10 +2009,13 @@ def test_fixed_env_does_not_apply_to_pnpm_build_with_extra_args(monkeypatch):
 
     monkeypatch.setattr(module.subprocess, "run", fake_run)
 
-    _, _, _, _, runner_env_delta = module.run_command("pnpm build --filter foo", 30, ".")
+    exit_code, _, stderr, _, runner_env_delta = module.run_command(
+        "pnpm build --filter foo", 30, "."
+    )
 
-    assert captured["argv"] == ["pnpm", "build", "--filter", "foo"]
-    assert captured["env"] is None
+    assert captured == {}
+    assert exit_code == -1
+    assert "noncanonical_request_argv" in stderr
     assert runner_env_delta == {}
 
 
@@ -2030,6 +2039,9 @@ def test_runner_env_delta_output_exposes_only_fixed_env(monkeypatch, tmp_path, c
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        module.pnpm_gate_registry, "resolve_trusted_pnpm", lambda _root: "/trusted/pnpm"
+    )
     monkeypatch.setattr(
         sys,
         "argv",

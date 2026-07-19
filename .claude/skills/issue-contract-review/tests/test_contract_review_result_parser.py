@@ -29,6 +29,7 @@ find_latest_result = _parser_mod.find_latest_result
 _extract_yaml_blocks = _parser_mod._extract_yaml_blocks
 _parse_simple_yaml_block = _parser_mod._parse_simple_yaml_block
 _is_valid_contract_review_result = _parser_mod._is_valid_contract_review_result
+is_fingerprint_ready_go = _parser_mod.is_fingerprint_ready_go
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -310,6 +311,145 @@ CONTRACT_REVIEW_RESULT_V1:
 # ---------------------------------------------------------------------------
 # find_latest_go / find_latest_result
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# is_fingerprint_ready_go / find_latest_go(fingerprint_ready_only=True) (#1537)
+# ---------------------------------------------------------------------------
+
+_VALID_FINGERPRINT = {
+    "issue_number": _ISSUE_NUMBER,
+    "contract_source_kind": "issue_comment",
+    "contract_source_id": "1001",
+    "contract_body_sha256": "sha256:" + "a" * 64,
+    "allowed_paths_normalized_sha256": "b" * 64,
+    "base_ref": "main",
+    "base_sha_at_snapshot": "c" * 40,
+}
+
+
+class TestFingerprintReadiness:
+    """Tests for is_fingerprint_ready_go (Issue #1537 AC2)."""
+
+    def test_valid_fingerprint_is_ready(self):
+        inner = {
+            "body_sha256": _VALID_FINGERPRINT["contract_body_sha256"],
+            "expected_contract_fingerprint": dict(_VALID_FINGERPRINT),
+        }
+        assert is_fingerprint_ready_go(inner, 1001, _ISSUE_NUMBER) is True
+
+    def test_missing_fingerprint_key_is_not_ready(self):
+        inner = {"status": "go"}
+        assert is_fingerprint_ready_go(inner, 1001, _ISSUE_NUMBER) is False
+
+    def test_fingerprint_not_a_dict_is_not_ready(self):
+        inner = {"expected_contract_fingerprint": "not-a-dict"}
+        assert is_fingerprint_ready_go(inner, 1001, _ISSUE_NUMBER) is False
+
+    def test_fingerprint_missing_required_key_is_not_ready(self):
+        fp = dict(_VALID_FINGERPRINT)
+        del fp["base_sha_at_snapshot"]
+        inner = {"expected_contract_fingerprint": fp}
+        assert is_fingerprint_ready_go(inner, 1001, _ISSUE_NUMBER) is False
+
+    def test_issue_number_bool_is_not_ready(self):
+        fp = dict(_VALID_FINGERPRINT)
+        fp["issue_number"] = True
+        inner = {"expected_contract_fingerprint": fp}
+        assert is_fingerprint_ready_go(inner, 1001, _ISSUE_NUMBER) is False
+
+    def test_issue_number_mismatch_is_not_ready(self):
+        inner = {"expected_contract_fingerprint": dict(_VALID_FINGERPRINT)}
+        assert is_fingerprint_ready_go(inner, 1001, 999) is False
+
+    def test_contract_source_kind_wrong_is_not_ready(self):
+        fp = dict(_VALID_FINGERPRINT)
+        fp["contract_source_kind"] = "pr_comment"
+        inner = {"expected_contract_fingerprint": fp}
+        assert is_fingerprint_ready_go(inner, 1001, _ISSUE_NUMBER) is False
+
+    def test_contract_source_id_mismatch_with_actual_comment_id_is_not_ready(self):
+        """The fingerprint's self-declared contract_source_id must equal the
+        id of the comment it was actually parsed from -- otherwise it is a
+        self-reference to a different (or nonexistent) comment."""
+        inner = {"expected_contract_fingerprint": dict(_VALID_FINGERPRINT)}
+        assert is_fingerprint_ready_go(inner, 9999, _ISSUE_NUMBER) is False
+
+    def test_contract_source_id_non_digit_string_is_not_ready(self):
+        fp = dict(_VALID_FINGERPRINT)
+        fp["contract_source_id"] = "not-a-number"
+        inner = {"expected_contract_fingerprint": fp}
+        assert is_fingerprint_ready_go(inner, 1001, _ISSUE_NUMBER) is False
+
+    def test_malformed_contract_body_sha256_is_not_ready(self):
+        fp = dict(_VALID_FINGERPRINT)
+        fp["contract_body_sha256"] = "not-a-hash"
+        inner = {"expected_contract_fingerprint": fp}
+        assert is_fingerprint_ready_go(inner, 1001, _ISSUE_NUMBER) is False
+
+    def test_allowed_paths_hash_with_sha256_prefix_is_not_ready(self):
+        """allowed_paths_normalized_sha256 must be a bare hex digest to match
+        AllowedPathsGateEvaluator.compute_allowed_paths_hash() exactly."""
+        fp = dict(_VALID_FINGERPRINT)
+        fp["allowed_paths_normalized_sha256"] = "sha256:" + "b" * 64
+        inner = {"expected_contract_fingerprint": fp}
+        assert is_fingerprint_ready_go(inner, 1001, _ISSUE_NUMBER) is False
+
+    def test_empty_base_ref_is_not_ready(self):
+        fp = dict(_VALID_FINGERPRINT)
+        fp["base_ref"] = ""
+        inner = {"expected_contract_fingerprint": fp}
+        assert is_fingerprint_ready_go(inner, 1001, _ISSUE_NUMBER) is False
+
+    def test_missing_authoritative_comment_or_issue_context_is_not_ready(self):
+        inner = {
+            "body_sha256": _VALID_FINGERPRINT["contract_body_sha256"],
+            "expected_contract_fingerprint": dict(_VALID_FINGERPRINT),
+        }
+        assert is_fingerprint_ready_go(inner) is False
+
+
+class TestFindLatestGoFingerprintReadyOnly:
+    """Tests for find_latest_go(fingerprint_ready_only=True) (#1537 AC2/AC3)."""
+
+    def test_excludes_go_without_fingerprint(self):
+        results = [
+            {
+                "status": "go",
+                "created_at": "2026-01-01",
+                "comment_id": 1,
+                "html_url": "url1",
+                "is_fingerprint_ready": False,
+            },
+        ]
+        assert find_latest_go(results, fingerprint_ready_only=True) is None
+
+    def test_includes_go_with_fingerprint(self):
+        results = [
+            {
+                "status": "go",
+                "created_at": "2026-01-01",
+                "comment_id": 1,
+                "html_url": "url1",
+                "is_fingerprint_ready": True,
+            },
+        ]
+        r = find_latest_go(results, fingerprint_ready_only=True)
+        assert r is not None
+        assert r["html_url"] == "url1"
+
+    def test_default_does_not_require_fingerprint(self):
+        """Backward compatibility: fingerprint_ready_only defaults to False."""
+        results = [
+            {
+                "status": "go",
+                "created_at": "2026-01-01",
+                "comment_id": 1,
+                "html_url": "url1",
+                "is_fingerprint_ready": False,
+            },
+        ]
+        assert find_latest_go(results) is not None
 
 
 class TestFindLatest:

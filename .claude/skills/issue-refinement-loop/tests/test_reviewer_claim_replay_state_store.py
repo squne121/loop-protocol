@@ -374,3 +374,186 @@ def test_cli_requires_exactly_one_of_read_or_write(tmp_path: Path):
     )
     assert rc == 1
     assert payload["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# Issue #1532 AC5/High-3: --write-v2 only persists PARENT_REPLAY_NEXT_STATE
+# from a STRICTLY validated REVIEW_COMPACT_VALIDATION_RESULT_V2 payload --
+# not merely a payload whose validation_status field says "valid" (High-3:
+# a caller-fabricated {"validation_status": "valid", ...} object is
+# rejected unless schema/schema_version/envelope_kind/violations/identity
+# also check out).
+# ---------------------------------------------------------------------------
+
+_VALID_BINDING_DIGEST = "sha256:" + ("a" * 64)
+
+
+def _valid_validation_result_v2(**overrides: object) -> dict[str, object]:
+    payload = {
+        "schema": "REVIEW_COMPACT_VALIDATION_RESULT_V2",
+        "schema_version": "2",
+        "validation_status": "valid",
+        "envelope_kind": "needs_fix_v2",
+        "violations": [],
+        "normalized_payload": {
+            "PARENT_REPLAY_NEXT_STATE": json.dumps(
+                _valid_state(), separators=(",", ":"), sort_keys=True
+            ),
+            "PARENT_REPLAY_BINDING_DIGEST": _VALID_BINDING_DIGEST,
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestWriteV2ValidatedOnly:
+    """Issue #1532 AC5/High-3: state store persists PARENT_REPLAY_NEXT_STATE
+    if and only if the caller-supplied REVIEW_COMPACT_VALIDATION_RESULT_V2
+    is STRICTLY well-formed (schema / schema_version / envelope_kind /
+    empty violations / identity) -- not merely `validation_status: valid`.
+    Raw stdout / invalid validation / binding mismatch / caller-fabricated
+    partial payloads never reach the state file."""
+
+    def test_write_v2_persists_when_validation_status_is_valid(self, tmp_path: Path):
+        result = store.write_state_v2_from_validated_payload(
+            state_dir=tmp_path,
+            validation_result_v2=_valid_validation_result_v2(),
+            expected_repository_full_name=IDENTITY["repository_full_name"],
+            expected_issue_number=IDENTITY["issue_number"],
+            expected_refinement_session_id=IDENTITY["refinement_session_id"],
+            expected_parent_binding_digest=_VALID_BINDING_DIGEST,
+        )
+        assert result["status"] == "ok"
+        assert result["operation"] == "write_v2"
+        assert result["state"]["consecutive_unbacked_count"] == 1
+
+        read_result = store.read_state(state_dir=tmp_path, **IDENTITY)
+        assert read_result["status"] == "ok"
+        assert read_result["state"]["consecutive_unbacked_count"] == 1
+
+    def test_write_v2_rejects_invalid_validation_status_without_touching_state_file(
+        self, tmp_path: Path
+    ):
+        # First establish a known-good baseline state.
+        store.write_state_v2_from_validated_payload(
+            state_dir=tmp_path, validation_result_v2=_valid_validation_result_v2()
+        )
+        state_path = store._state_path(tmp_path)
+        before_bytes = state_path.read_bytes()
+
+        # A human_judgment_required / invalid validation result (e.g. the
+        # child's PARENT_REPLAY_BINDING_DIGEST failed to match the
+        # orchestrator's independently-computed expected digest) must
+        # never overwrite the prior state.
+        tampered = _valid_validation_result_v2(
+            validation_status="invalid",
+            normalized_payload=None,
+        )
+        result = store.write_state_v2_from_validated_payload(
+            state_dir=tmp_path, validation_result_v2=tampered
+        )
+        assert result["status"] == "rejected"
+        assert state_path.read_bytes() == before_bytes
+
+    def test_write_v2_rejects_missing_replay_next_state_field(self, tmp_path: Path):
+        result = store.write_state_v2_from_validated_payload(
+            state_dir=tmp_path,
+            validation_result_v2=_valid_validation_result_v2(normalized_payload={}),
+        )
+        assert result["status"] == "rejected"
+        assert not store._state_path(tmp_path).exists()
+
+    def test_write_v2_rejects_malformed_replay_next_state_json(self, tmp_path: Path):
+        result = store.write_state_v2_from_validated_payload(
+            state_dir=tmp_path,
+            validation_result_v2=_valid_validation_result_v2(
+                normalized_payload={
+                    "PARENT_REPLAY_NEXT_STATE": "not-json{{",
+                    "PARENT_REPLAY_BINDING_DIGEST": _VALID_BINDING_DIGEST,
+                }
+            ),
+        )
+        assert result["status"] == "rejected"
+        assert not store._state_path(tmp_path).exists()
+
+    def test_write_v2_rejects_caller_fabricated_valid_status_missing_schema(
+        self, tmp_path: Path
+    ):
+        """High-3 regression: a bare {"validation_status": "valid", ...}
+        object assembled by a caller/attacker (not produced by
+        build_result_v2) must be rejected -- the schema/schema_version/
+        envelope_kind/violations checks are NOT optional."""
+        fabricated = {
+            "validation_status": "valid",
+            "normalized_payload": {
+                "PARENT_REPLAY_NEXT_STATE": json.dumps(_valid_state()),
+                "PARENT_REPLAY_BINDING_DIGEST": _VALID_BINDING_DIGEST,
+            },
+        }
+        result = store.write_state_v2_from_validated_payload(
+            state_dir=tmp_path, validation_result_v2=fabricated
+        )
+        assert result["status"] == "rejected"
+        assert not store._state_path(tmp_path).exists()
+
+    def test_write_v2_rejects_nonempty_violations_even_when_status_is_valid(
+        self, tmp_path: Path
+    ):
+        tampered = _valid_validation_result_v2(violations=[{"code": "some_violation"}])
+        result = store.write_state_v2_from_validated_payload(
+            state_dir=tmp_path, validation_result_v2=tampered
+        )
+        assert result["status"] == "rejected"
+        assert not store._state_path(tmp_path).exists()
+
+    def test_write_v2_rejects_expected_binding_digest_mismatch(self, tmp_path: Path):
+        result = store.write_state_v2_from_validated_payload(
+            state_dir=tmp_path,
+            validation_result_v2=_valid_validation_result_v2(),
+            expected_parent_binding_digest="sha256:" + ("f" * 64),
+        )
+        assert result["status"] == "rejected"
+        assert not store._state_path(tmp_path).exists()
+
+    def test_cli_write_v2_round_trip(self, tmp_path: Path):
+        validation_result_v2 = _valid_validation_result_v2()
+        rc, payload = _run_cli(
+            [
+                "--write-v2",
+                "--state-dir",
+                str(tmp_path),
+                "--validation-result-v2-inline",
+                json.dumps(validation_result_v2),
+                "--expected-parent-binding-digest",
+                _VALID_BINDING_DIGEST,
+            ]
+        )
+        assert rc == 0
+        assert payload["status"] == "ok"
+        assert payload["operation"] == "write_v2"
+
+    def test_cli_write_v2_rejects_invalid_validation_result(self, tmp_path: Path):
+        validation_result_v2 = _valid_validation_result_v2(validation_status="invalid")
+        rc, payload = _run_cli(
+            [
+                "--write-v2",
+                "--state-dir",
+                str(tmp_path),
+                "--validation-result-v2-inline",
+                json.dumps(validation_result_v2),
+            ]
+        )
+        assert rc == 1
+        assert payload["status"] == "rejected"
+
+    def test_cli_requires_exactly_one_of_read_write_or_write_v2(self, tmp_path: Path):
+        rc, payload = _run_cli(
+            [
+                "--write",
+                "--write-v2",
+                "--state-dir",
+                str(tmp_path),
+            ]
+        )
+        assert rc == 1
+        assert payload["status"] == "error"

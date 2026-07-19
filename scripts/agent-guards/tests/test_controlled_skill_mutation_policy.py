@@ -114,13 +114,16 @@ class TestRegistryScope:
     def test_only_known_command_ids(self):
         # Issue #1284 extends the shared registry with issue metadata mutation
         # command ids (issue_body.update / issue_comment.publish /
-        # contract_snapshot.publish). This scope-pin is updated deliberately as
-        # part of that Issue's explicit In Scope registry extension.
+        # contract_snapshot.publish). Issue #1536 adds pr_review.publish
+        # (Option C controlled review publisher). This scope-pin is updated
+        # deliberately as part of each Issue's explicit In Scope registry
+        # extension.
         known_ids = {
             COMMAND_ID_PUBLISH,
             "issue_body.update",
             "issue_comment.publish",
             "contract_snapshot.publish",
+            "pr_review.publish",
         }
         actual_ids = set(CONTROLLED_SKILL_MUTATION_COMMAND_POLICY.keys())
         assert actual_ids == known_ids, (

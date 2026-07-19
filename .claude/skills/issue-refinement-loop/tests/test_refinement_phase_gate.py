@@ -10,6 +10,16 @@ AC2: decide_next_loop_action.py は phase gate を schema validation より先�
 AC3: scope_signal_guard.triggered は phase-sensitive に扱う。
 AC5: 失敗パターン fixture（preflight pass → scope_signal_guard.triggered: true → 誤った
      human_escalation）を再発防止。
+
+Issue #1507 AC24 (Scope Delta): `make_phase_state()` now auto-provisions a
+valid REVIEW_COMPACT_VALIDATION_RESULT_V1 fixture file (validation_status:
+valid) and passes `--review-validation-result-path` whenever phase="review"
+and source_kind="issue_review_result_compact_v1", since
+build_refinement_phase_state.py now requires that argument for this exact
+(phase, source_kind) combination (structural validator-first gate). This
+keeps all pre-existing AC1-AC5/B2/B3/M1/M3 call sites in this file working
+unchanged; only the shared helper and the one raw (non-helper) subprocess
+call in test_validate_router_in_phase_parametrize needed updating.
 """
 
 import json
@@ -37,14 +47,40 @@ def load_loop_state_fixture() -> dict[str, Any]:
     return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
 
+def write_valid_review_validation_result() -> str:
+    """Write a minimal valid REVIEW_COMPACT_VALIDATION_RESULT_V1 fixture
+    (Issue #1507 AC24) and return its path."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False
+    ) as f:
+        json.dump(
+            {
+                "schema": "REVIEW_COMPACT_VALIDATION_RESULT_V1",
+                "schema_version": "1",
+                "validation_status": "valid",
+                "envelope_kind": "approve",
+            },
+            f,
+        )
+        return f.name
+
+
 def make_phase_state(
     phase: str,
     source_kind: str = "refinement_preflight_result_v1",
     source_path: str | None = None,
+    review_validation_result_path: str | None = None,
 ) -> dict[str, Any]:
     """Build a minimal ISSUE_REFINEMENT_PHASE_STATE_V1 via build_refinement_phase_state.py.
 
     source_path defaults to a temporary file created automatically (M1: source_path must exist).
+
+    Issue #1507 AC24: when phase="review" and
+    source_kind="issue_review_result_compact_v1", a valid
+    REVIEW_COMPACT_VALIDATION_RESULT_V1 fixture is auto-provisioned (unless
+    the caller explicitly supplies review_validation_result_path) so that
+    existing (phase, source_kind) call sites in this file keep passing
+    unchanged under the new structural validator-first gate.
     """
     # Create a real temp file for source_path (M1 requires source_path to exist)
     _source_file = None
@@ -56,20 +92,31 @@ def make_phase_state(
             source_path = sf.name
         _source_file = source_path
 
+    if (
+        phase == "review"
+        and source_kind == "issue_review_result_compact_v1"
+        and review_validation_result_path is None
+    ):
+        review_validation_result_path = write_valid_review_validation_result()
+
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False
     ) as out_f:
         out_path = out_f.name
 
+    argv = [
+        sys.executable,
+        str(BUILD_SCRIPT),
+        "--phase", phase,
+        "--source-kind", source_kind,
+        "--source-path", source_path,
+        "--output-path", out_path,
+    ]
+    if review_validation_result_path is not None:
+        argv += ["--review-validation-result-path", review_validation_result_path]
+
     result = subprocess.run(
-        [
-            sys.executable,
-            str(BUILD_SCRIPT),
-            "--phase", phase,
-            "--source-kind", source_kind,
-            "--source-path", source_path,
-            "--output-path", out_path,
-        ],
+        argv,
         capture_output=True,
         text=True,
     )
@@ -302,6 +349,7 @@ def test_build_phase_state_has_required_fields():
     required_fields = [
         "schema_version", "phase", "source_artifact",
         "loop_state_path", "planner_result_path", "review_result_path",
+        "review_validation_result_path",
         "allowed_routers", "forbidden_routers", "scope_signal_semantics",
     ]
     for field in required_fields:
@@ -624,6 +672,125 @@ def test_build_phase_state_source_kind_phase_mismatch_returns_error(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Issue #1507 AC24: review-phase validator-first structural gate
+# ---------------------------------------------------------------------------
+
+
+def test_build_phase_state_review_phase_requires_validation_result_path(tmp_path):
+    """AC24: --phase review + --source-kind issue_review_result_compact_v1
+    without --review-validation-result-path returns STATUS: error and
+    writes no phase-state file."""
+    source_file = tmp_path / "source.json"
+    source_file.write_text("{}", encoding="utf-8")
+    out_file = tmp_path / "out.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(BUILD_SCRIPT),
+            "--phase", "review",
+            "--source-kind", "issue_review_result_compact_v1",
+            "--source-path", str(source_file),
+            "--output-path", str(out_file),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1, (
+        f"Expected exit 1 when --review-validation-result-path is missing "
+        f"(AC24), got {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert not out_file.exists(), "phase-state file must NOT be written (AC24 fail-closed)"
+
+
+def test_build_phase_state_review_phase_rejects_invalid_validation_status(tmp_path):
+    """AC24: a review-validation-result file whose validation_status is not
+    'valid' also blocks phase-state generation."""
+    source_file = tmp_path / "source.json"
+    source_file.write_text("{}", encoding="utf-8")
+    validation_file = tmp_path / "validation.json"
+    validation_file.write_text(
+        json.dumps({"validation_status": "invalid"}), encoding="utf-8"
+    )
+    out_file = tmp_path / "out.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(BUILD_SCRIPT),
+            "--phase", "review",
+            "--source-kind", "issue_review_result_compact_v1",
+            "--source-path", str(source_file),
+            "--review-validation-result-path", str(validation_file),
+            "--output-path", str(out_file),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert not out_file.exists(), "phase-state file must NOT be written (AC24 fail-closed)"
+
+
+def test_build_phase_state_review_phase_with_valid_validation_result_succeeds(tmp_path):
+    """AC24: a valid REVIEW_COMPACT_VALIDATION_RESULT_V1 (validation_status:
+    valid) allows phase-state generation to proceed as before."""
+    source_file = tmp_path / "source.json"
+    source_file.write_text("{}", encoding="utf-8")
+    validation_file = tmp_path / "validation.json"
+    validation_file.write_text(
+        json.dumps({"validation_status": "valid"}), encoding="utf-8"
+    )
+    out_file = tmp_path / "out.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(BUILD_SCRIPT),
+            "--phase", "review",
+            "--source-kind", "issue_review_result_compact_v1",
+            "--source-path", str(source_file),
+            "--review-validation-result-path", str(validation_file),
+            "--output-path", str(out_file),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    assert out_file.exists()
+    data = json.loads(out_file.read_text(encoding="utf-8"))
+    assert data["review_validation_result_path"] == str(validation_file)
+
+
+def test_build_phase_state_post_rewrite_check_does_not_require_validation_result_path(tmp_path):
+    """AC24 Out of Scope: post_rewrite_check phase (also allowed for
+    issue_review_result_compact_v1 per _SOURCE_KIND_ALLOWED_PHASES) does NOT
+    require --review-validation-result-path -- the gate applies only to the
+    review phase."""
+    source_file = tmp_path / "source.json"
+    source_file.write_text("{}", encoding="utf-8")
+    out_file = tmp_path / "out.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(BUILD_SCRIPT),
+            "--phase", "post_rewrite_check",
+            "--source-kind", "issue_review_result_compact_v1",
+            "--source-path", str(source_file),
+            "--output-path", str(out_file),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    assert out_file.exists()
+
+
+# ---------------------------------------------------------------------------
 # M3: validate_refinement_phase_transition.py の phase table テスト (parametrize)
 # ---------------------------------------------------------------------------
 
@@ -675,15 +842,25 @@ def test_validate_router_in_phase_parametrize(phase, router, expected_allowed, t
 
     # Build phase state
     out_file = tmp_path / f"phase_state_{phase}.json"
+    build_argv = [
+        sys.executable,
+        str(BUILD_SCRIPT),
+        "--phase", phase,
+        "--source-kind", source_kind,
+        "--source-path", str(source_file),
+        "--output-path", str(out_file),
+    ]
+    # Issue #1507 AC24: review phase + issue_review_result_compact_v1 requires
+    # a valid REVIEW_COMPACT_VALIDATION_RESULT_V1 fixture.
+    if phase == "review" and source_kind == "issue_review_result_compact_v1":
+        validation_file = tmp_path / "review_validation.json"
+        validation_file.write_text(
+            json.dumps({"validation_status": "valid"}), encoding="utf-8"
+        )
+        build_argv += ["--review-validation-result-path", str(validation_file)]
+
     result_build = subprocess.run(
-        [
-            sys.executable,
-            str(BUILD_SCRIPT),
-            "--phase", phase,
-            "--source-kind", source_kind,
-            "--source-path", str(source_file),
-            "--output-path", str(out_file),
-        ],
+        build_argv,
         capture_output=True,
         text=True,
     )
