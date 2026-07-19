@@ -652,3 +652,63 @@ def test_generate_artifact_no_markers_configured_stays_fail_closed(monkeypatch, 
     assert data["uncovered_changed_test_files"] == [uncovered_file]
     assert data["runtime_verification_only_markers"] == []
     assert data["runtime_verification_only_test_files"] == []
+
+
+def test_generate_artifact_scope_rollup_graphql_pagination_is_covered(monkeypatch, tmp_path):
+    """Issue #1644: tests/codex/test_scope_rollup_graphql_pagination_v3.py must be
+    covered by the ci_test_selection/v1 artifact generator via the python-test-plan
+    SSOT registration -- fixes the same collection-proof pattern used for
+    test_pr_body_validator.py (AC5/AC7/AC8) so a changed test file that is present
+    in the plan is never spuriously reported as uncovered.
+
+    Assertions fixed here (Issue #1644 AC3):
+    - pytest_argv contains the target path exactly once (pytest_argv.count == 1)
+    - changed_test_files / collected_test_files contain only the target path
+    - uncovered_changed_test_files is empty
+    - artifact generation returns exit code 0
+    """
+    changed_file = "tests/codex/test_scope_rollup_graphql_pagination_v3.py"
+    seen: dict = {}
+
+    def fake_collect(argv):
+        seen["argv"] = list(argv)
+        assert seen["argv"].count(changed_file) == 1, (
+            f"generator must pass {changed_file!r} exactly once to collector; got {argv!r}"
+        )
+        nodeids = [
+            f"{changed_file}::test_pagination_follows_next_cursor",
+            f"{changed_file}::test_pagination_stops_at_limit",
+        ]
+        return (
+            [changed_file],
+            nodeids,
+            {
+                "returncode": 0,
+                "timed_out": False,
+                "error": None,
+                "nodeid_count": len(nodeids),
+                "stderr_tail": "",
+                "ok": True,
+            },
+        )
+
+    monkeypatch.setattr(gen, "get_pytest_collected_tests", fake_collect)
+    monkeypatch.setattr(gen, "get_changed_test_files", lambda b, h: (
+        [changed_file], [], {"base_sha": b, "head_sha": h, "ok": True}
+    ))
+    out = tmp_path / "artifact.json"
+    args = argparse.Namespace(
+        output=str(out), pytest_args=None, plan=None, pr_head_sha="h",
+        base_sha="b", head_sha="h", checked_out_sha=None, merge_sha="m",
+        workflow="ci", job="python-test", ci_run_url=None,
+    )
+    rc = gen.generate_artifact(args)
+    assert rc == 0
+    artifact = json.loads(out.read_text())
+    assert artifact["collection_status"]["ok"] is True
+    assert artifact["diff_status"]["ok"] is True
+    assert changed_file in artifact["changed_test_files"]
+    assert artifact["collected_test_files"] == [changed_file]
+    assert artifact["uncovered_changed_test_files"] == []
+    assert seen["argv"] == artifact["pytest_argv"]
+    assert seen["argv"].count(changed_file) == 1

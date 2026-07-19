@@ -33,6 +33,16 @@ REQUIRED_FIELDS_BASE = {
     "script_blob_sha256",
 }
 REQUIRE_RESULT_FIELDS = {"raw_plan_location", "result_sha256", "payload"}
+COMPLETENESS_FIELDS = {"page_count", "item_count", "total_count", "pagination_complete", "sha256"}
+BUDGET_FIELDS = {
+    "page_count",
+    "response_bytes",
+    "inventory_items",
+    "max_transaction_pages",
+    "max_response_bytes",
+    "max_inventory_items",
+    "deadline_seconds",
+}
 
 FENCED_YAML_RE = re.compile(r"```ya?ml[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
@@ -155,6 +165,31 @@ def _compute_payload_sha256(payload: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_bytes).hexdigest()
 
 
+def _has_valid_completeness_contract(inputs: Any) -> bool:
+    if not isinstance(inputs, dict) or inputs.get("query_schema_version") != 3:
+        return False
+    for key in ("issues_completeness", "pull_requests_completeness"):
+        block = inputs.get(key)
+        if not isinstance(block, dict) or not COMPLETENESS_FIELDS.issubset(block):
+            return False
+        if (
+            not isinstance(block["page_count"], int)
+            or block["page_count"] < 1
+            or not isinstance(block["item_count"], int)
+            or block["item_count"] < 0
+            or not isinstance(block["total_count"], int)
+            or block["total_count"] != block["item_count"]
+            or block["pagination_complete"] is not True
+            or not isinstance(block["sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", block["sha256"])
+        ):
+            return False
+    budget = inputs.get("transaction_budget")
+    if not isinstance(budget, dict) or not BUDGET_FIELDS.issubset(budget):
+        return False
+    return all(isinstance(budget[key], (int, float)) and not isinstance(budget[key], bool) for key in BUDGET_FIELDS)
+
+
 def _validate_marker_payload(
     marker_payload: dict[str, Any],
     assistant_output_file: Path,
@@ -209,6 +244,46 @@ def _validate_marker_payload(
 
     if status in {"failed", "runner_unavailable"}:
         return status, None, None, False
+
+    inputs = marker_payload.get("inputs")
+    if inputs is not None and not isinstance(inputs, dict):
+        return "rejected", "scope_rollup_marker_malformed", "inventory_completeness_contract_invalid", False
+
+    # PR #1643 review (P0-3): the completeness gate below used to trigger
+    # only when "query_schema_version" happened to still be present inside
+    # ``inputs`` -- a marker that stripped just that one key (while leaving
+    # the other v3 completeness/budget fields, or nothing at all) was
+    # silently accepted as a "legacy v2" marker even though it came from the
+    # *current* v3-speaking runner. That is exactly the silent-downgrade
+    # this contract must never permit.
+    #
+    # The current runner (``.claude/agents/scope-rollup-runner.md``) always
+    # stamps an explicit ``marker_schema_version: 3`` on every marker it
+    # emits. That field -- not "does inputs still happen to contain
+    # query_schema_version" -- is now the authoritative version
+    # discriminator:
+    #   marker_schema_version == 3  -> full v3 completeness contract is
+    #                                  mandatory, regardless of what
+    #                                  ``inputs`` does or does not contain.
+    #   marker_schema_version == 2  -> explicit legacy marker; no
+    #                                  completeness contract required.
+    #   marker_schema_version absent -> a genuine pre-#1593 legacy marker
+    #                                  (minted before this field existed).
+    #                                  Preserve the original permissive
+    #                                  behavior for these so historical/AC6
+    #                                  legacy-v2 acceptance is not broken.
+    #   any other value            -> unsupported/malformed.
+    marker_schema_version = marker_payload.get("marker_schema_version")
+    if marker_schema_version is not None:
+        if marker_schema_version == 3:
+            if not (isinstance(inputs, dict) and _has_valid_completeness_contract(inputs)):
+                return "rejected", "scope_rollup_marker_malformed", "inventory_completeness_contract_invalid", False
+        elif marker_schema_version == 2:
+            pass
+        else:
+            return "rejected", "scope_rollup_marker_malformed", "marker_schema_version_unsupported", False
+    elif isinstance(inputs, dict) and "query_schema_version" in inputs and not _has_valid_completeness_contract(inputs):
+        return "rejected", "scope_rollup_marker_malformed", "inventory_completeness_contract_invalid", False
 
     result_block = marker_payload.get("result")
     if not isinstance(result_block, dict):
