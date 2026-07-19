@@ -650,7 +650,13 @@ def fetch_current_issue(repo: str, issue_number: int) -> Dict[str, Any]:
 _ISSUES_PAGE_GRAPHQL_QUERY = """
 query($owner: String!, $name: String!, $pageSize: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) {
-    issues(states: OPEN, labels: ["phase/implementation"], first: $pageSize, after: $cursor, orderBy: {field: CREATED_AT, direction: ASC}) {
+    issues(
+      states: OPEN
+      labels: ["phase/implementation"]
+      first: $pageSize
+      after: $cursor
+      orderBy: {field: CREATED_AT, direction: ASC}
+    ) {
       nodes {
         number
         title

@@ -417,7 +417,16 @@ def test_fetch_implementation_candidates_respects_requested_limit(monkeypatch: o
 
     def fake_run(command: list[str], **_kwargs: object) -> "subprocess.CompletedProcess[str]":
         calls.append(command)
-        nodes = [{"number": n, "title": f"issue {n}", "body": "body", "updatedAt": "2026-01-01T00:00:00Z", "url": "u"} for n in range(1, 6)]
+        nodes = [
+            {
+                "number": n,
+                "title": f"issue {n}",
+                "body": "body",
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "url": "u",
+            }
+            for n in range(1, 6)
+        ]
         return subprocess.CompletedProcess(
             command, 0, stdout=_graphql_page_response(nodes, has_next_page=True, end_cursor="cursor-1")
         )
@@ -442,7 +451,16 @@ def test_fetch_implementation_candidates_not_saturated_below_limit(monkeypatch: 
     """
 
     def fake_run(command: list[str], **_kwargs: object) -> "subprocess.CompletedProcess[str]":
-        nodes = [{"number": n, "title": f"issue {n}", "body": "body", "updatedAt": "2026-01-01T00:00:00Z", "url": "u"} for n in range(1, 4)]
+        nodes = [
+            {
+                "number": n,
+                "title": f"issue {n}",
+                "body": "body",
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "url": "u",
+            }
+            for n in range(1, 4)
+        ]
         return subprocess.CompletedProcess(
             command, 0, stdout=_graphql_page_response(nodes, has_next_page=False, end_cursor=None)
         )
