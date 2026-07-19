@@ -1127,7 +1127,7 @@ def _run_issue_scope_snapshot_materialize(args, input_data, _fail, _ok) -> int:
     changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
     if changed:
         return _fail("postcondition_tracked_changes_detected", changed, status="failed")
-    return _ok(result)
+    return _ok({"materializer_result": result})
 
 
 def _run_termination_report_publish(args, canonical_input, gh_bin, _fail, _ok) -> int:
