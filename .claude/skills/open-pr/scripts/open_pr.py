@@ -793,6 +793,211 @@ def _has_only_fixed_readback_incomplete_blockers(fresh: dict) -> bool:
     return True
 
 
+def _is_readback_incomplete_only_blocker(fresh: dict) -> bool:
+    """generic 版の構造 predicate（Issue #1509）。incomplete candidate が
+    1件以上存在し、それらの reasons がすべて ``readback_incomplete`` prefix
+    を持ち、readback 完了済み candidate が C1/C2a だけである場合に True。
+    waiver の内容を一切参照しない（waiver ロード前の安全な pre-gate。
+    unrelated な human_review_required route で無駄な online 読み出しを
+    発生させない）。"""
+    if fresh.get("route") != "human_review_required":
+        return False
+    candidates = fresh.get("candidates")
+    if not isinstance(candidates, list):
+        return False
+    incomplete = [
+        candidate for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("readback_complete") is False
+    ]
+    if not incomplete:
+        return False
+    for candidate in incomplete:
+        reasons = candidate.get("reasons")
+        if (
+            not isinstance(reasons, list)
+            or not reasons
+            or not all(
+                isinstance(reason, str) and reason.startswith("readback_incomplete")
+                for reason in reasons
+            )
+        ):
+            return False
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or candidate.get("readback_complete") is False:
+            continue
+        if candidate.get("policy_class") not in {"C1", "C2a"}:
+            return False
+    return True
+
+
+def _validate_generic_overlap_readback_waiver_schema(waiver: object) -> str | None:
+    """generic waiver dict の必須フィールド・型を検証する（Issue #1509）。
+    エラーがあれば理由文字列、なければ None を返す。"""
+    if not isinstance(waiver, dict):
+        return "overlap_readback_waiver が object ではありません"
+    repository = waiver.get("repository")
+    if not isinstance(repository, str) or not repository:
+        return "overlap_readback_waiver.repository が不正です"
+    linked_issue = waiver.get("linked_issue")
+    if isinstance(linked_issue, bool) or not isinstance(linked_issue, int):
+        return "overlap_readback_waiver.linked_issue が不正です"
+    candidates = waiver.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        return "overlap_readback_waiver.candidates が空または不正です"
+    seen_numbers: set[int] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            return "overlap_readback_waiver.candidates の要素が object ではありません"
+        number = candidate.get("issue_number")
+        if isinstance(number, bool) or not isinstance(number, int):
+            return "overlap_readback_waiver.candidates[].issue_number が不正です"
+        if number in seen_numbers:
+            return f"overlap_readback_waiver.candidates に重複した issue_number があります: {number}"
+        seen_numbers.add(number)
+        updated_at = candidate.get("updated_at")
+        if not isinstance(updated_at, str) or not updated_at:
+            return "overlap_readback_waiver.candidates[].updated_at が不正です"
+        reason = candidate.get("reason")
+        if not isinstance(reason, str) or not reason.startswith("readback_incomplete"):
+            return "overlap_readback_waiver.candidates[].reason が readback_incomplete で始まっていません"
+    expires_on = waiver.get("expires_on")
+    if not isinstance(expires_on, str):
+        return "overlap_readback_waiver.expires_on が不正です"
+    try:
+        date.fromisoformat(expires_on)
+    except ValueError:
+        return "overlap_readback_waiver.expires_on の日付形式が不正です"
+    approved_by = waiver.get("approved_by")
+    if not isinstance(approved_by, str) or not approved_by:
+        return "overlap_readback_waiver.approved_by が不正です"
+    return None
+
+
+def _load_verified_generic_overlap_readback_waiver(
+    repo: str,
+    linked_issue: int,
+    *,
+    today: date | None = None,
+) -> tuple[dict | None, str | None]:
+    """live body と最新の trusted ``status: go`` snapshot が同一 SHA の generic
+    waiver を返す（Issue #1509）。waiver は linked_issue **自身**の live body
+    に自己宣言され、caller の repo / linked_issue と完全一致する場合にだけ
+    有効化される。#1477 固定 binding（``_load_verified_overlap_readback_waiver``）
+    とは独立した経路であり、既存の固定 binding の挙動には一切影響しない。
+    """
+    try:
+        result = run_gh(
+            "issue", "view", str(linked_issue), "--repo", repo, "--json", "body,url"
+        )
+        issue = json.loads(result.stdout)
+    except (subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        return None, f"contract snapshot の取得に失敗: {exc}"
+    if not isinstance(issue, dict):
+        return None, "contract snapshot の Issue payload が object ではありません"
+    body = issue.get("body")
+    url = issue.get("url")
+    expected_url = f"https://github.com/{repo}/issues/{linked_issue}"
+    if not isinstance(body, str) or url != expected_url:
+        return None, "contract snapshot の Issue payload が linked issue と一致しません"
+
+    body_sha256 = f"sha256:{hashlib.sha256(body.encode('utf-8')).hexdigest()}"
+    waiver = _extract_waiver_from_live_contract(body)
+    if not isinstance(waiver, dict):
+        return None, "live contract に overlap_readback_waiver がありません"
+
+    schema_error = _validate_generic_overlap_readback_waiver_schema(waiver)
+    if schema_error is not None:
+        return None, schema_error
+
+    waiver_repo = _canonicalize_repo_static(waiver.get("repository"))
+    if waiver_repo != _canonicalize_repo_static(repo) or waiver.get("linked_issue") != linked_issue:
+        return None, "overlap_readback_waiver の repository / linked_issue が呼び出し対象と一致しません"
+
+    if (today or date.today()) > date.fromisoformat(waiver["expires_on"]):
+        return None, "overlap_readback_waiver の期限が切れています"
+
+    comments, comments_error = contract_review_parser.fetch_issue_comments(linked_issue, repo)
+    if comments_error is not None:
+        return None, f"contract snapshot comment readback が不完全です: {comments_error}"
+    latest = contract_review_parser.find_latest_result(
+        contract_review_parser.parse_contract_review_results(
+            comments, expected_issue_url=expected_url
+        ),
+        trusted_only=True,
+    )
+    if latest is None:
+        return None, "trusted contract snapshot がありません"
+    if latest.get("status") != "go":
+        return None, "最新 trusted contract snapshot が status: go ではありません"
+    inner = latest.get("inner")
+    if not isinstance(inner, dict) or inner.get("body_sha256") != body_sha256:
+        return None, "最新 trusted status: go contract snapshot の body SHA が live body と一致しません"
+    return waiver, None
+
+
+def _incomplete_candidates_match_generic_waiver(fresh: dict, waiver: dict) -> bool:
+    """fresh evidence の incomplete candidate 集合が generic waiver の
+    candidates と完全一致し（issue_number / updated_at / reason)、readback
+    完了済み候補が C1/C2a だけである場合に限り True（Issue #1509）。"""
+    if fresh.get("route") != "human_review_required":
+        return False
+    candidates = fresh.get("candidates")
+    if not isinstance(candidates, list):
+        return False
+    incomplete = [
+        candidate for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("readback_complete") is False
+    ]
+    waiver_candidates = waiver.get("candidates")
+    if not isinstance(waiver_candidates, list) or not waiver_candidates:
+        return False
+    if len(incomplete) != len(waiver_candidates):
+        return False
+
+    waiver_by_number: dict[int, dict] = {}
+    for entry in waiver_candidates:
+        if not isinstance(entry, dict):
+            return False
+        number = entry.get("issue_number")
+        if isinstance(number, bool) or not isinstance(number, int):
+            return False
+        if number in waiver_by_number:
+            return False
+        waiver_by_number[number] = entry
+    if len(waiver_by_number) != len(waiver_candidates):
+        return False
+
+    incomplete_numbers = {candidate.get("issue_number") for candidate in incomplete}
+    if incomplete_numbers != set(waiver_by_number.keys()):
+        return False
+
+    for candidate in incomplete:
+        entry = waiver_by_number.get(candidate.get("issue_number"))
+        if entry is None:
+            return False
+        reasons = candidate.get("reasons")
+        if (
+            not isinstance(reasons, list)
+            or not reasons
+            or not all(
+                isinstance(reason, str) and reason.startswith("readback_incomplete")
+                for reason in reasons
+            )
+        ):
+            return False
+        if entry.get("reason") not in reasons:
+            return False
+        if candidate.get("updated_at") != entry.get("updated_at"):
+            return False
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or candidate.get("readback_complete") is False:
+            continue
+        if candidate.get("policy_class") not in {"C1", "C2a"}:
+            return False
+    return True
+
+
 def _overlap_preflight_safety_reason(fresh: dict, linked_issue: int) -> str | None:
     """AC4 の安全性 predicate を検証する。violation があれば理由文字列、
     なければ None を返す。"""
@@ -993,7 +1198,11 @@ def run_overlap_preflight_gate(
         # 確認できる期限付き contract waiver の固定3件だけであるときに限り、
         # その3 candidate を既存の safe-route 判定から除外する。他の source /
         # dependency / validation failure はこの clone 後にも必ず判定される。
-        if _has_only_fixed_readback_incomplete_blockers(fresh):
+        is_fixed_1477_target = (
+            repo.strip().lower() == OVERLAP_READBACK_WAIVER_REPOSITORY
+            and linked_issue == OVERLAP_READBACK_WAIVER_LINKED_ISSUE
+        )
+        if is_fixed_1477_target and _has_only_fixed_readback_incomplete_blockers(fresh):
             waiver, waiver_error = _load_verified_overlap_readback_waiver(repo, linked_issue)
             if waiver_error is not None:
                 return (
@@ -1004,6 +1213,31 @@ def run_overlap_preflight_gate(
                 )
             effective_fresh = dict(fresh)
             if waiver is not None:
+                effective_fresh["route"] = "proceed_with_collision_evidence"
+                remaining_unsafe_reason = _overlap_preflight_safety_reason(
+                    effective_fresh, linked_issue
+                )
+                if remaining_unsafe_reason is None:
+                    return True, None, "", effective_fresh
+        elif not is_fixed_1477_target and _is_readback_incomplete_only_blocker(fresh):
+            # Issue #1509: linked_issue 自身の live body に自己宣言された
+            # generic waiver（#1477 固定 binding とは完全に独立した経路。
+            # #1477 の (repo, linked_issue) だけは常に上の固定 binding 分岐
+            # のみを通り、この elif には一切到達しない -- 既存 regression
+            # gate（test_open_pr_overlap_gate.py、本 Issue の Allowed Paths
+            # 外）の挙動を寸分違わず維持するため）。
+            waiver, waiver_error = _load_verified_generic_overlap_readback_waiver(
+                repo, linked_issue
+            )
+            if waiver_error is not None:
+                return (
+                    False,
+                    E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID,
+                    f"overlap_readback_waiver が検証できません: {waiver_error}",
+                    fresh,
+                )
+            if waiver is not None and _incomplete_candidates_match_generic_waiver(fresh, waiver):
+                effective_fresh = dict(fresh)
                 effective_fresh["route"] = "proceed_with_collision_evidence"
                 remaining_unsafe_reason = _overlap_preflight_safety_reason(
                     effective_fresh, linked_issue
