@@ -41,6 +41,28 @@ from pathlib import Path
 from render_termination_report import InputValidationError, normalize_input
 
 # ---------------------------------------------------------------------------
+# Issue #1633: shared controlled-executor policy import (bounded request
+# schema + issue_comment.publish command id / namespace / input schema).
+# scripts/agent-guards is a sibling top-level directory, not a package --
+# resolved by absolute path from this file, independent of cwd.
+# ---------------------------------------------------------------------------
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
+_AGENT_GUARDS_DIR = _PROJECT_ROOT / "scripts" / "agent-guards"
+if str(_AGENT_GUARDS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_GUARDS_DIR))
+
+from controlled_skill_mutation_policy import (  # noqa: E402
+    COMMAND_ID_ISSUE_COMMENT_PUBLISH,
+    INPUT_SCHEMA_BY_COMMAND,
+    ISOLATION_ISSUE_COMMENT_REQUEST_SCHEMA,
+    ISSUE_METADATA_NAMESPACE_SEGMENT,
+    validate_isolation_issue_comment_request,
+)
+
+CONTROLLED_SKILL_MUTATION_EXEC_SCRIPT = _AGENT_GUARDS_DIR / "controlled_skill_mutation_exec.py"
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -210,38 +232,121 @@ def _validate_render_result(result: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Issue #1633: parent-owned materializer for the isolation worktree agent's
+# bounded Issue comment request.
+# ---------------------------------------------------------------------------
+
+def materialize_isolation_issue_comment_request(
+    *,
+    issue_number: int,
+    repo: str,
+    comment_body: str,
+    marker: str,
+    project_root: Path | None = None,
+) -> tuple[str | None, str]:
+    """
+    Materialize a bounded ISOLATION_ISSUE_COMMENT_REQUEST_V1 request into the
+    issue-scoped input namespace consumed by controlled_skill_mutation_exec.py
+    --command-id issue_comment.publish (Issue #1633 / Issue #1608).
+
+    The isolation worktree agent only ever produces the bounded fields
+    (issue_number / repo / comment_body / marker) captured as arguments here.
+    This function -- run on the canonical main root -- validates those
+    bounded fields via validate_isolation_issue_comment_request(), writes an
+    ISSUE_COMMENT_PUBLISH_INPUT_V1 JSON file under
+    artifacts/{issue_number}/issue-metadata/issue_comment.publish/, and
+    returns a project-root-relative POSIX path string so the caller can
+    invoke the exact controlled executor argv (the executor rejects absolute
+    --input-file paths).
+
+    Returns (relative_input_file_path, error). relative_input_file_path is
+    None on validation error.
+    """
+    root = project_root or _PROJECT_ROOT
+    request = {
+        "schema": ISOLATION_ISSUE_COMMENT_REQUEST_SCHEMA,
+        "issue_number": issue_number,
+        "repo": repo,
+        "comment_body": comment_body,
+        "marker": marker,
+    }
+    req_err = validate_isolation_issue_comment_request(request, issue_number, repo)
+    if req_err:
+        return None, req_err
+
+    namespace_dir = (
+        root / "artifacts" / str(issue_number)
+        / ISSUE_METADATA_NAMESPACE_SEGMENT / COMMAND_ID_ISSUE_COMMENT_PUBLISH
+    )
+    namespace_dir.mkdir(parents=True, exist_ok=True)
+
+    materialized = {
+        "schema": INPUT_SCHEMA_BY_COMMAND[COMMAND_ID_ISSUE_COMMENT_PUBLISH],
+        "issue_number": issue_number,
+        "comment_body": comment_body,
+        "marker": marker,
+    }
+    out_path = namespace_dir / "issue_comment_publish_input.json"
+    out_path.write_text(
+        json.dumps(materialized, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return out_path.resolve().relative_to(root.resolve()).as_posix(), ""
+
+
+# ---------------------------------------------------------------------------
 # GitHub comment posting (fail-closed: only called on publishable=true)
 # ---------------------------------------------------------------------------
 
 def _post_github_comment(*, issue_number: int, body: str, repo: str) -> int:
     """
-    Post body as a GitHub issue comment via gh CLI.
+    Post body as a GitHub issue comment via the issue_comment.publish
+    controlled mutation lane (Issue #1633).
 
-    Uses --body-file - with stdin input (no temp file, no NamedTemporaryFile).
-    Requires explicit --repo flag for canonical repository binding (AC10 of #1166).
-    Sets GH_PROMPT_DISABLED=1 and GH_NO_UPDATE_NOTIFIER=1 to avoid interactive prompts.
+    Builds a bounded ISOLATION_ISSUE_COMMENT_REQUEST_V1 request from body
+    (embedding CONTROLLED_EXEC_MARKER from env, or a deterministic
+    content-hash marker when unset, as the request's marker field -- P0-5),
+    materializes it via materialize_isolation_issue_comment_request(), and
+    launches controlled_skill_mutation_exec.py --command-id
+    issue_comment.publish with the exact argv it accepts (Issue #1166
+    AC4/AC17 shared authority -- raw `gh issue comment` is no longer called
+    directly from this module).
     Enforces a 30-second timeout; on timeout fails closed.
-    Injects CONTROLLED_EXEC_MARKER from env into comment body (P0-5).
 
-    Returns gh exit code (or -1 on timeout).
+    Returns the executor's exit code (0 on success, -1 on timeout, or the
+    executor's nonzero exit on failure).
     """
+    exec_marker = os.environ.get("CONTROLLED_EXEC_MARKER", "")
+    if exec_marker:
+        marker = f"<!-- CONTROLLED_EXEC_MARKER:{exec_marker} -->"
+    else:
+        content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()[:32]
+        marker = f"<!-- CONTROLLED_EXEC_MARKER:{content_hash} -->"
+    comment_body = body + f"\n{marker}"
+
+    materialized_rel_path, materialize_err = materialize_isolation_issue_comment_request(
+        issue_number=issue_number, repo=repo, comment_body=comment_body, marker=marker,
+    )
+    if materialize_err:
+        print(
+            f"[publish_termination_report] materialize_isolation_issue_comment_request "
+            f"failed: {materialize_err}",
+            file=sys.stderr,
+        )
+        return 1
+
+    cmd = [
+        sys.executable, str(CONTROLLED_SKILL_MUTATION_EXEC_SCRIPT),
+        "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
+        "--issue-number", str(issue_number),
+        "--input-file", materialized_rel_path,
+        "--repo", repo,
+    ]
     env = os.environ.copy()
     env["GH_PROMPT_DISABLED"] = "1"
     env.setdefault("GH_NO_UPDATE_NOTIFIER", "1")
-
-    # P0-5: inject exec marker for comment read-back
-    exec_marker = env.get("CONTROLLED_EXEC_MARKER", "")
-    if exec_marker:
-        body = body + f"\n<!-- CONTROLLED_EXEC_MARKER:{exec_marker} -->"
-
     try:
         proc = subprocess.run(
-            [
-                "gh", "issue", "comment", str(issue_number),
-                "--repo", repo,
-                "--body-file", "-",
-            ],
-            input=body,
+            cmd,
             capture_output=True,
             text=True,
             check=False,
@@ -251,15 +356,16 @@ def _post_github_comment(*, issue_number: int, body: str, repo: str) -> int:
         )
     except subprocess.TimeoutExpired:
         print(
-            "[publish_termination_report] gh issue comment timed out (30s) — fail-closed",
+            "[publish_termination_report] controlled_skill_mutation_exec issue_comment.publish "
+            "timed out (30s) — fail-closed",
             file=sys.stderr,
         )
         return -1
 
     if proc.returncode != 0:
         print(
-            f"[publish_termination_report] gh issue comment failed "
-            f"(exit {proc.returncode})",
+            f"[publish_termination_report] controlled_skill_mutation_exec "
+            f"issue_comment.publish failed (exit {proc.returncode}): {proc.stderr[:200]}",
             file=sys.stderr,
         )
     return proc.returncode

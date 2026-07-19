@@ -125,6 +125,28 @@ prefix_rule(
 # --- the exact `uv run --locked python3` invocation prefix; extra argv,  ---
 # --- a `bash -lc` wrapper, or invocation from outside a linked issue     ---
 # --- worktree are all denied by the executor's own fail-closed checks.   ---
+# --- controlled skill mutation executor (Issue #1166 / #1284 / #1536 / ---
+# --- #1633): the ONLY authorized path for controlled remote GitHub       ---
+# --- mutation (termination_report.publish / issue_body.update /         ---
+# --- issue_comment.publish / contract_snapshot.publish / pr_review.publish).
+# --- Same shared-authority lane as .claude/settings.json's Claude-side   ---
+# --- `Bash(uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py *)`
+# --- allow entry (docs/dev/hook-boundaries.md previously noted this      ---
+# --- Codex rule file had no matching entry -- Issue #1633 closes that    ---
+# --- Codex/Claude parity gap). Runtime binding checks (command_id        ---
+# --- whitelist, repo binding, input-file namespace, module realpath,     ---
+# --- env sanitization, idempotency, postcondition) all happen inside the ---
+# --- executor itself -- this static rule only allows the exact           ---
+# --- `uv run python3 <script>` invocation prefix.
+prefix_rule(
+    pattern = ["uv", "run", "python3", "scripts/agent-guards/controlled_skill_mutation_exec.py"],
+    decision = "allow",
+    justification = "Issue #1166/#1284/#1536/#1633: the controlled skill mutation executor is the single authorized in-process path for controlled remote GitHub mutation (issue comment/body publish, contract snapshot publish, PR review publish); its own runtime checks (command_id whitelist, repo/env binding, input-file namespace, module realpath, idempotency, postcondition) are the actual enforcement, not this static allow. Mirrors the existing Claude-side settings.json wildcard allow entry for the same executor.",
+    match = [
+        "uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py --command-id issue_comment.publish --issue-number 1633 --input-file artifacts/1633/issue-metadata/issue_comment.publish/issue_comment_publish_input.json --repo squne121/loop-protocol",
+    ],
+)
+
 prefix_rule(
     pattern = ["uv", "run", "--locked", "python3", "scripts/agent-guards/controlled_git_change_exec.py"],
     decision = "allow",

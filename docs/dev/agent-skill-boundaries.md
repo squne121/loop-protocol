@@ -1504,6 +1504,97 @@ exact command class allow は executor script identity + argv 形状のみを検
 `_classify_gh` により引き続き `mutating` に分類され、active issue + no-matching-worktree
 状態では block される。
 
+## isolation worktree agent の Issue comment request bridge（Issue #1633）
+
+（Issue #1633 — `publish_termination_report.py::_post_github_comment` が保持していた
+唯一の raw `gh issue comment` production 呼び出しを、既存の
+`issue_comment.publish` controlled mutation lane（Issue #1284）へ parent delegation
+で接続する拡張。#1608 research の第一候補案「controlled metadata executor を再利用する」
+を実装したもの。）
+
+### 背景
+
+isolation worktree agent は Bash 経由で `gh` を直接呼び出すことも、
+`controlled_skill_mutation_exec.py` を自ら起動することも許可されない（root からの
+git/gh mutation は hook で全面ブロックされ、worktree agent には Write/Edit ツールで
+`.claude/worktrees` 配下を編集する権限もない）。そのため isolation worktree agent は
+**bounded な Issue comment request** のみを生成し、canonical main root 上で動く
+parent orchestrator（`publish_termination_report.py`）がその request を検証・
+materialize し、既存の controlled executor lane を起動する。
+
+### ISOLATION_ISSUE_COMMENT_REQUEST_V1（bounded request schema）
+
+`scripts/agent-guards/controlled_skill_mutation_policy.py` に閉じたキー集合のみを
+許可するスキーマを定義する:
+
+```python
+ISOLATION_ISSUE_COMMENT_REQUEST_SCHEMA = "ISOLATION_ISSUE_COMMENT_REQUEST_V1"
+ISOLATION_ISSUE_COMMENT_REQUEST_ALLOWED_KEYS = frozenset({
+    "schema", "issue_number", "repo", "comment_body", "marker",
+})
+```
+
+`validate_isolation_issue_comment_request(data, issue_number, repo)` が
+closed-key チェック・schema 一致・issue_number/repo の呼び出し元宣言値との一致・
+`marker` が `comment_body` に埋め込まれていることを検証する。
+
+### materialize_isolation_issue_comment_request()（parent 側 materializer）
+
+`.claude/skills/issue-refinement-loop/scripts/publish_termination_report.py` に
+追加した関数。bounded request を受け取り、上記バリデータを通した上で
+`artifacts/{issue_number}/issue-metadata/issue_comment.publish/issue_comment_publish_input.json`
+へ `ISSUE_COMMENT_PUBLISH_INPUT_V1` 互換 JSON を書き込み、project-root-relative な
+POSIX パス文字列を返す（executor は絶対パスの `--input-file` を拒否するため）。
+
+### _post_github_comment の置き換え（AC3）
+
+旧実装は `subprocess.run(["gh", "issue", "comment", ...])` を直接呼んでいた。
+新実装は次の経路のみを使う:
+
+1. `CONTROLLED_EXEC_MARKER` 環境変数（未設定時は body の内容ハッシュ由来の
+   deterministic marker）を `comment_body` に埋め込む
+2. `materialize_isolation_issue_comment_request()` で入力ファイルを materialize
+3. 以下の exact argv で `controlled_skill_mutation_exec.py` を起動する
+
+```bash
+uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py \
+  --command-id issue_comment.publish \
+  --issue-number <int> \
+  --input-file artifacts/<issue_number>/issue-metadata/issue_comment.publish/issue_comment_publish_input.json \
+  --repo squne121/loop-protocol
+```
+
+raw `gh issue comment` は `publish_termination_report.py` からもう呼ばれない。
+`issue_comment.publish` command id 自体の readback/marker/idempotency 契約
+（AC4/AC14、marker precheck、postcondition）は Issue #1284 で確定済みのものを
+そのまま再利用し、本 Issue では新設していない。
+
+### Codex 側 allow エントリ（AC5）
+
+`.codex/rules/default.rules` に `uv run python3
+scripts/agent-guards/controlled_skill_mutation_exec.py` の exact prefix allow
+エントリを追加した。Claude 側 `.claude/settings.json` の同等 wildcard allow
+エントリと同じ共有 authorization lane に Codex 側も乗る
+（詳細は `docs/dev/hook-boundaries.md` の該当セクション参照）。
+
+### no-live-mutation integration test（AC4）
+
+`scripts/agent-guards/tests/test_isolation_issue_comment_publish_bridge.py` が
+fake `gh`（`controlled_skill_mutation_exec.py` の `_find_gh_bin` /
+`_verify_git_remote_origin` / `_post_gh_comment` / `_find_marker_matches` /
+`_readback_by_marker_literal` をすべて fake に置き換える）を用いて、実際の
+GitHub ネットワーク呼び出しが一切発生しないことを確認しつつ、positive
+（materialize → controlled executor → 投稿成功 → idempotent retry）と negative
+（絶対パス / `..` traversal / symlink / schema mismatch / wrong repo /
+wrong issue number / duplicate marker / marker-body identity conflict /
+marker not embedded）の両方を検証する。
+
+### OUTPUT_BUDGET_V1
+
+routing-critical フィールド: `ISOLATION_ISSUE_COMMENT_REQUEST_ALLOWED_KEYS` の
+キー集合、`materialize_isolation_issue_comment_request()` の戻り値 shape
+（`(relative_input_file_path, error)`）は必須。
+
 ## edit-issue 向け transaction helper の契約定義（Issue #1287）
 
 既存 Issue body/comment mutation の consumer contract は `edit_issue_txn.py` に集約する。

@@ -5,7 +5,9 @@ Integration tests for publish_termination_report.py (Issue #692).
 
 AC coverage:
   AC2: subprocess.run is used with shell=False to call renderer
-  AC3: publishable=true + non-empty body -> gh issue comment --body-file (not --body)
+  AC3: publishable=true + non-empty body -> issue_comment.publish controlled
+       executor invoked with --input-file (Issue #1633; raw `gh issue comment`
+       is no longer called directly)
   AC4: all fail-closed cases -> gh NOT called
   AC5: publishable=false / error cases -> artifact recorded (reason_code, renderer info)
   AC8: fake gh + fake renderer integration tests:
@@ -87,6 +89,37 @@ def _fake_renderer_proc(
     return m
 
 
+def _fake_exec_proc(returncode: int = 0, stderr: str = "") -> MagicMock:
+    """Build a fake CompletedProcess-like object for the
+    controlled_skill_mutation_exec.py subprocess.run mock (Issue #1633)."""
+    m = MagicMock()
+    m.returncode = returncode
+    m.stderr = stderr
+    m.stdout = ""
+    return m
+
+
+def _is_exec_call(cmd) -> bool:
+    """True iff cmd is a subprocess.run invocation of
+    controlled_skill_mutation_exec.py (Issue #1633 issue_comment.publish
+    bridge), as opposed to the renderer subprocess call."""
+    return (
+        isinstance(cmd, list)
+        and len(cmd) > 1
+        and str(cmd[1]).endswith("controlled_skill_mutation_exec.py")
+    )
+
+
+def _read_materialized_issue_comment_input(project_root: Path, issue_number: int) -> dict:
+    """Read back the ISSUE_COMMENT_PUBLISH_INPUT_V1 JSON that
+    materialize_isolation_issue_comment_request() wrote for issue_number."""
+    path = (
+        project_root / "artifacts" / str(issue_number)
+        / "issue-metadata" / "issue_comment.publish" / "issue_comment_publish_input.json"
+    )
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 # ---------------------------------------------------------------------------
 # AC2: subprocess.run with shell=False
 # ---------------------------------------------------------------------------
@@ -148,88 +181,86 @@ class TestSubprocessRunShellFalse:
 # ---------------------------------------------------------------------------
 
 class TestGhBodyFile:
-    """AC3: gh issue comment uses --body-file, never --body directly."""
+    """AC3 (Issue #1633): _post_github_comment materializes a bounded
+    ISOLATION_ISSUE_COMMENT_REQUEST_V1 request and launches
+    controlled_skill_mutation_exec.py --command-id issue_comment.publish
+    with --input-file; raw `gh issue comment --body-file` is never called
+    directly from this module any more."""
 
-    def test_gh_called_with_body_file(self, tmp_path):
+    def test_gh_called_with_body_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pub, "_PROJECT_ROOT", tmp_path)
         fake_proc = _fake_renderer_proc(_make_render_result(publishable=True, body="## Report"))
-        gh_calls: list[list] = []
-        gh_kwargs_list: list[dict] = []
+        exec_calls: list[list] = []
 
         def fake_run(cmd, **kwargs):
-            if isinstance(cmd, list) and cmd[0] == "gh":
-                gh_calls.append(cmd)
-                gh_kwargs_list.append(kwargs)
-                m = MagicMock()
-                m.returncode = 0
-                m.stderr = ""
-                m.stdout = ""
-                return m
+            if _is_exec_call(cmd):
+                exec_calls.append(cmd)
+                return _fake_exec_proc()
             return fake_proc
 
         with patch("subprocess.run", side_effect=fake_run):
             result = pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
 
         assert result == 0
-        assert len(gh_calls) == 1
-        gh_cmd = gh_calls[0]
-        assert "gh" == gh_cmd[0]
-        assert "issue" == gh_cmd[1]
-        assert "comment" == gh_cmd[2]
-        assert "--body-file" in gh_cmd
-        # Must use "--body-file -" (stdin), not a file path
-        assert gh_cmd[gh_cmd.index("--body-file") + 1] == "-"
-        # --body must NOT appear as a standalone flag
-        assert "--body" not in gh_cmd
+        assert len(exec_calls) == 1
+        exec_cmd = exec_calls[0]
+        assert exec_cmd[1].endswith("controlled_skill_mutation_exec.py")
+        assert "--command-id" in exec_cmd
+        assert exec_cmd[exec_cmd.index("--command-id") + 1] == "issue_comment.publish"
+        assert "--input-file" in exec_cmd
+        input_file_value = exec_cmd[exec_cmd.index("--input-file") + 1]
+        # Must be a project-root-relative path (the executor rejects absolute paths)
+        assert not input_file_value.startswith("/")
+        assert input_file_value.startswith("artifacts/42/issue-metadata/issue_comment.publish/")
 
-    def test_gh_body_file_receives_correct_content(self, tmp_path):
-        """Body is passed via stdin (input= kwarg), not a file path."""
+    def test_gh_body_file_receives_correct_content(self, tmp_path, monkeypatch):
+        """Body is materialized into the ISSUE_COMMENT_PUBLISH_INPUT_V1 JSON
+        file, not passed via stdin to a raw gh call."""
+        monkeypatch.setattr(pub, "_PROJECT_ROOT", tmp_path)
         expected_body = "## Refinement Loop: Approved\n\nApproved."
         fake_proc = _fake_renderer_proc(_make_render_result(body=expected_body))
-        received_stdin: list[str] = []
 
         def fake_run(cmd, **kwargs):
-            if isinstance(cmd, list) and cmd[0] == "gh":
-                # New implementation passes body via input= kwarg (stdin)
-                received_stdin.append(kwargs.get("input", ""))
-                m = MagicMock()
-                m.returncode = 0
-                m.stderr = ""
-                return m
+            if _is_exec_call(cmd):
+                return _fake_exec_proc()
             return fake_proc
 
         with patch("subprocess.run", side_effect=fake_run):
             pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
 
-        assert len(received_stdin) == 1
-        assert received_stdin[0] == expected_body
+        materialized = _read_materialized_issue_comment_input(tmp_path, 42)
+        assert materialized["comment_body"].startswith(expected_body)
+        assert materialized["schema"] == "ISSUE_COMMENT_PUBLISH_INPUT_V1"
+        assert materialized["issue_number"] == 42
 
-    def test_gh_has_prompt_disabled_env(self, tmp_path):
-        """gh call must have GH_PROMPT_DISABLED=1 in env."""
+    def test_gh_has_prompt_disabled_env(self, tmp_path, monkeypatch):
+        """The controlled_skill_mutation_exec.py invocation must have
+        GH_PROMPT_DISABLED=1 in env (inherited down to its own gh call)."""
+        monkeypatch.setattr(pub, "_PROJECT_ROOT", tmp_path)
         fake_proc = _fake_renderer_proc(_make_render_result(publishable=True, body="## Report"))
-        gh_envs: list[dict] = []
+        exec_envs: list[dict] = []
 
         def fake_run(cmd, **kwargs):
-            if isinstance(cmd, list) and cmd[0] == "gh":
-                gh_envs.append(kwargs.get("env", {}))
-                m = MagicMock()
-                m.returncode = 0
-                m.stderr = ""
-                return m
+            if _is_exec_call(cmd):
+                exec_envs.append(kwargs.get("env", {}))
+                return _fake_exec_proc()
             return fake_proc
 
         with patch("subprocess.run", side_effect=fake_run):
             pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
 
-        assert len(gh_envs) == 1
-        assert gh_envs[0].get("GH_PROMPT_DISABLED") == "1"
+        assert len(exec_envs) == 1
+        assert exec_envs[0].get("GH_PROMPT_DISABLED") == "1"
 
-    def test_gh_timeout_fail_closed(self, tmp_path):
-        """gh timeout (30s) must fail closed (return -1, record artifact)."""
+    def test_gh_timeout_fail_closed(self, tmp_path, monkeypatch):
+        """controlled_skill_mutation_exec.py timeout (30s) must fail closed
+        (return -1, record artifact)."""
+        monkeypatch.setattr(pub, "_PROJECT_ROOT", tmp_path)
         import subprocess as _subprocess
         fake_proc = _fake_renderer_proc(_make_render_result(publishable=True, body="## Report"))
 
         def fake_run(cmd, **kwargs):
-            if isinstance(cmd, list) and cmd[0] == "gh":
+            if _is_exec_call(cmd):
                 raise _subprocess.TimeoutExpired(cmd, 30)
             return fake_proc
 
@@ -447,27 +478,26 @@ class TestArtifactRecording:
 class TestIntegration:
     """AC8: Integration tests with fake gh and fake renderer."""
 
-    def test_publishable_true_normal_post(self):
-        """publishable=true -> comment posted successfully."""
+    def test_publishable_true_normal_post(self, tmp_path, monkeypatch):
+        """publishable=true -> comment posted successfully via the
+        issue_comment.publish controlled executor bridge (Issue #1633)."""
+        monkeypatch.setattr(pub, "_PROJECT_ROOT", tmp_path)
         body = "## Refinement Loop: Approved\n\nThe issue has been approved."
         fake_proc = _fake_renderer_proc(_make_render_result(publishable=True, body=body))
-        gh_calls: list = []
-        gh_proc = MagicMock()
-        gh_proc.returncode = 0
-        gh_proc.stderr = ""
+        exec_calls: list = []
 
         def fake_run(cmd, **kwargs):
-            if isinstance(cmd, list) and cmd[0] == "gh":
-                gh_calls.append(cmd)
-                return gh_proc
+            if _is_exec_call(cmd):
+                exec_calls.append(cmd)
+                return _fake_exec_proc()
             return fake_proc
 
         with patch("subprocess.run", side_effect=fake_run):
             exit_code = pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
 
         assert exit_code == 0
-        assert len(gh_calls) == 1
-        assert "--body-file" in gh_calls[0]
+        assert len(exec_calls) == 1
+        assert "--input-file" in exec_calls[0]
 
     def test_publishable_false_no_post(self):
         """publishable=false -> gh not called, exit 1."""
@@ -509,19 +539,17 @@ class TestIntegration:
         assert exit_code == 1
         assert len(gh_calls) == 0
 
-    def test_publish_preserves_explicit_termination_cause(self):
+    def test_publish_preserves_explicit_termination_cause(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pub, "_PROJECT_ROOT", tmp_path)
         renderer_inputs: list[dict[str, Any]] = []
         fake_proc = _fake_renderer_proc(_make_render_result())
-        gh_proc = MagicMock()
-        gh_proc.returncode = 0
-        gh_proc.stderr = ""
 
         def fake_run(cmd, **kwargs):
+            if _is_exec_call(cmd):
+                return _fake_exec_proc()
             if isinstance(cmd, list) and cmd[0] == sys.executable:
                 renderer_inputs.append(json.loads(kwargs["input"]))
                 return fake_proc
-            if isinstance(cmd, list) and cmd[0] == "gh":
-                return gh_proc
             raise AssertionError(f"unexpected command: {cmd}")
 
         with patch("subprocess.run", side_effect=fake_run):
@@ -541,19 +569,17 @@ class TestIntegration:
             "issue_number": 42,
         }]
 
-    def test_publish_normalizes_legacy_blocker_summary_alias(self):
+    def test_publish_normalizes_legacy_blocker_summary_alias(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pub, "_PROJECT_ROOT", tmp_path)
         renderer_inputs: list[dict[str, Any]] = []
         fake_proc = _fake_renderer_proc(_make_render_result())
-        gh_proc = MagicMock()
-        gh_proc.returncode = 0
-        gh_proc.stderr = ""
 
         def fake_run(cmd, **kwargs):
+            if _is_exec_call(cmd):
+                return _fake_exec_proc()
             if isinstance(cmd, list) and cmd[0] == sys.executable:
                 renderer_inputs.append(json.loads(kwargs["input"]))
                 return fake_proc
-            if isinstance(cmd, list) and cmd[0] == "gh":
-                return gh_proc
             raise AssertionError(f"unexpected command: {cmd}")
 
         with patch("subprocess.run", side_effect=fake_run):
@@ -590,11 +616,12 @@ class TestIntegration:
         assert exit_code == 1
         mock_run.assert_not_called()
 
-    def test_coexistence_with_loop_handoff_result_v1(self):
+    def test_coexistence_with_loop_handoff_result_v1(self, tmp_path, monkeypatch):
         """
         AC8: Coexistence test — LOOP_HANDOFF_RESULT_V1 and
         FOLLOW_UP_MATERIALIZATION_RESULT_V1 markers in body do not break publishing.
         """
+        monkeypatch.setattr(pub, "_PROJECT_ROOT", tmp_path)
         body_with_markers = textwrap.dedent("""\
             ## Refinement Loop: Approved
 
@@ -620,22 +647,22 @@ class TestIntegration:
         fake_proc = _fake_renderer_proc(
             _make_render_result(publishable=True, body=body_with_markers)
         )
-        gh_calls: list = []
-        gh_proc = MagicMock()
-        gh_proc.returncode = 0
+        exec_calls: list = []
 
         def fake_run(cmd, **kwargs):
-            if isinstance(cmd, list) and cmd[0] == "gh":
-                gh_calls.append(cmd)
-                return gh_proc
+            if _is_exec_call(cmd):
+                exec_calls.append(cmd)
+                return _fake_exec_proc()
             return fake_proc
 
         with patch("subprocess.run", side_effect=fake_run):
             exit_code = pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
 
         assert exit_code == 0
-        assert len(gh_calls) == 1
-        assert "--body-file" in gh_calls[0]
+        assert len(exec_calls) == 1
+        assert "--input-file" in exec_calls[0]
+        materialized = _read_materialized_issue_comment_input(tmp_path, 42)
+        assert "LOOP_HANDOFF_RESULT_V1" in materialized["comment_body"]
 
     def test_coexistence_publishable_false_with_markers(self):
         """
@@ -670,24 +697,23 @@ class TestIntegration:
         assert exit_code == 1
         assert len(gh_calls) == 0
 
-    def test_issue_number_passed_to_gh(self):
-        """gh issue comment receives the correct issue number."""
+    def test_issue_number_passed_to_gh(self, tmp_path, monkeypatch):
+        """The issue_comment.publish controlled executor invocation receives
+        the correct --issue-number."""
+        monkeypatch.setattr(pub, "_PROJECT_ROOT", tmp_path)
         fake_proc = _fake_renderer_proc(_make_render_result(publishable=True, body="## OK"))
-        gh_cmd_received: list = []
-        gh_proc = MagicMock()
-        gh_proc.returncode = 0
-        gh_proc.stderr = ""
+        exec_cmd_received: list = []
 
         def fake_run(cmd, **kwargs):
-            if isinstance(cmd, list) and cmd[0] == "gh":
-                gh_cmd_received.extend(cmd)
-                return gh_proc
+            if _is_exec_call(cmd):
+                exec_cmd_received.extend(cmd)
+                return _fake_exec_proc()
             return fake_proc
 
         with patch("subprocess.run", side_effect=fake_run):
             pub.publish(issue_number=777, input_data=_make_input(issue_number=777), repo="squne121/loop-protocol")
 
-        assert "777" in gh_cmd_received
+        assert "777" in exec_cmd_received
 
 
 # ---------------------------------------------------------------------------
@@ -813,43 +839,40 @@ class TestRealRendererE2E:
 # ---------------------------------------------------------------------------
 
 class TestRepoFlag:
-    """AC10: publish_termination_report.py passes --repo to gh issue comment (Issue #1166)."""
+    """AC10 (Issue #1166) / Issue #1633: --repo is passed through unchanged
+    to the issue_comment.publish controlled executor invocation."""
 
-    def test_gh_command_includes_repo_flag(self, tmp_path):
-        """AC10: gh issue comment must include --repo <owner/repo> explicitly."""
+    def test_gh_command_includes_repo_flag(self, tmp_path, monkeypatch):
+        """--repo <owner/repo> must be present on the executor invocation."""
+        monkeypatch.setattr(pub, "_PROJECT_ROOT", tmp_path)
         fake_proc = _fake_renderer_proc(_make_render_result(publishable=True, body="## Report"))
-        gh_calls: list[list] = []
+        exec_calls: list[list] = []
 
         def fake_run(cmd, **kwargs):
-            if isinstance(cmd, list) and cmd[0] == "gh":
-                gh_calls.append(cmd)
-                m = MagicMock()
-                m.returncode = 0
-                m.stderr = ""
-                return m
+            if _is_exec_call(cmd):
+                exec_calls.append(cmd)
+                return _fake_exec_proc()
             return fake_proc
 
         with patch("subprocess.run", side_effect=fake_run):
             pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
 
-        assert len(gh_calls) == 1
-        gh_cmd = gh_calls[0]
-        assert "--repo" in gh_cmd, "--repo flag must be present in gh issue comment call"
-        repo_idx = gh_cmd.index("--repo")
-        assert repo_idx + 1 < len(gh_cmd), "--repo must be followed by repo value"
-        assert gh_cmd[repo_idx + 1] == "squne121/loop-protocol"
+        assert len(exec_calls) == 1
+        exec_cmd = exec_calls[0]
+        assert "--repo" in exec_cmd, "--repo flag must be present on the executor invocation"
+        repo_idx = exec_cmd.index("--repo")
+        assert repo_idx + 1 < len(exec_cmd), "--repo must be followed by repo value"
+        assert exec_cmd[repo_idx + 1] == "squne121/loop-protocol"
 
-    def test_post_github_comment_passes_repo_to_gh(self, tmp_path):
-        """AC10: _post_github_comment must include --repo in the gh command."""
-        gh_calls: list[list] = []
+    def test_post_github_comment_passes_repo_to_gh(self, tmp_path, monkeypatch):
+        """_post_github_comment must include --repo on the executor invocation."""
+        monkeypatch.setattr(pub, "_PROJECT_ROOT", tmp_path)
+        exec_calls: list[list] = []
 
         def fake_run(cmd, **kwargs):
-            if isinstance(cmd, list) and cmd[0] == "gh":
-                gh_calls.append(cmd)
-                m = MagicMock()
-                m.returncode = 0
-                m.stderr = ""
-                return m
+            if _is_exec_call(cmd):
+                exec_calls.append(cmd)
+                return _fake_exec_proc()
             raise AssertionError(f"Unexpected: {cmd}")
 
         with patch("subprocess.run", side_effect=fake_run):
@@ -860,10 +883,10 @@ class TestRepoFlag:
             )
 
         assert rc == 0
-        assert len(gh_calls) == 1
-        assert "--repo" in gh_calls[0]
-        idx = gh_calls[0].index("--repo")
-        assert gh_calls[0][idx + 1] == "squne121/loop-protocol"
+        assert len(exec_calls) == 1
+        assert "--repo" in exec_calls[0]
+        idx = exec_calls[0].index("--repo")
+        assert exec_calls[0][idx + 1] == "squne121/loop-protocol"
 
 
 class TestTerminationReportDocsProse:
@@ -890,20 +913,18 @@ class TestTerminationReportDocsProse:
 # ---------------------------------------------------------------------------
 
 class TestExecMarkerInjection:
-    """P0-5: CONTROLLED_EXEC_MARKER env var is injected into comment body."""
+    """P0-5 / Issue #1633: CONTROLLED_EXEC_MARKER env var (or a deterministic
+    content-hash fallback) is embedded into the materialized comment_body as
+    the bounded request's marker field."""
 
     def test_marker_injected_into_body_when_env_set(self, tmp_path, monkeypatch):
         """When CONTROLLED_EXEC_MARKER is set, comment body includes marker."""
+        monkeypatch.setattr(pub, "_PROJECT_ROOT", tmp_path)
         fake_proc = _fake_renderer_proc(_make_render_result(publishable=True, body="## Report"))
-        received_bodies: list[str] = []
 
         def fake_run(cmd, **kwargs):
-            if isinstance(cmd, list) and cmd[0] == "gh":
-                received_bodies.append(kwargs.get("input", ""))
-                m = MagicMock()
-                m.returncode = 0
-                m.stderr = ""
-                return m
+            if _is_exec_call(cmd):
+                return _fake_exec_proc()
             return fake_proc
 
         monkeypatch.setenv("CONTROLLED_EXEC_MARKER", "abc123marker456")
@@ -912,22 +933,20 @@ class TestExecMarkerInjection:
             result = pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
 
         assert result == 0
-        assert len(received_bodies) == 1
-        body = received_bodies[0]
-        assert "<!-- CONTROLLED_EXEC_MARKER:abc123marker456 -->" in body
+        materialized = _read_materialized_issue_comment_input(tmp_path, 42)
+        assert "<!-- CONTROLLED_EXEC_MARKER:abc123marker456 -->" in materialized["comment_body"]
+        assert materialized["marker"] == "<!-- CONTROLLED_EXEC_MARKER:abc123marker456 -->"
 
     def test_no_marker_injected_when_env_not_set(self, tmp_path, monkeypatch):
-        """When CONTROLLED_EXEC_MARKER is not set, no marker in body."""
+        """When CONTROLLED_EXEC_MARKER is not set, a deterministic
+        content-hash marker is used instead (materializer still requires a
+        non-empty marker embedded in comment_body -- Issue #1633 AC1)."""
+        monkeypatch.setattr(pub, "_PROJECT_ROOT", tmp_path)
         fake_proc = _fake_renderer_proc(_make_render_result(publishable=True, body="## Report"))
-        received_bodies: list[str] = []
 
         def fake_run(cmd, **kwargs):
-            if isinstance(cmd, list) and cmd[0] == "gh":
-                received_bodies.append(kwargs.get("input", ""))
-                m = MagicMock()
-                m.returncode = 0
-                m.stderr = ""
-                return m
+            if _is_exec_call(cmd):
+                return _fake_exec_proc()
             return fake_proc
 
         monkeypatch.delenv("CONTROLLED_EXEC_MARKER", raising=False)
@@ -936,21 +955,18 @@ class TestExecMarkerInjection:
             result = pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
 
         assert result == 0
-        assert len(received_bodies) == 1
-        body = received_bodies[0]
-        assert "CONTROLLED_EXEC_MARKER" not in body
+        materialized = _read_materialized_issue_comment_input(tmp_path, 42)
+        assert "abc123marker456" not in materialized["comment_body"]
+        assert materialized["marker"] in materialized["comment_body"]
 
-    def test_post_github_comment_injects_marker(self, monkeypatch):
-        """_post_github_comment directly injects marker when env is set."""
-        received_bodies: list[str] = []
+    def test_post_github_comment_injects_marker(self, tmp_path, monkeypatch):
+        """_post_github_comment materializes the marker into comment_body when
+        CONTROLLED_EXEC_MARKER is set."""
+        monkeypatch.setattr(pub, "_PROJECT_ROOT", tmp_path)
 
         def fake_run(cmd, **kwargs):
-            if isinstance(cmd, list) and cmd[0] == "gh":
-                received_bodies.append(kwargs.get("input", ""))
-                m = MagicMock()
-                m.returncode = 0
-                m.stderr = ""
-                return m
+            if _is_exec_call(cmd):
+                return _fake_exec_proc()
             raise AssertionError(f"Unexpected: {cmd}")
 
         monkeypatch.setenv("CONTROLLED_EXEC_MARKER", "testmarker99")
@@ -963,22 +979,18 @@ class TestExecMarkerInjection:
             )
 
         assert rc == 0
-        assert len(received_bodies) == 1
-        assert "<!-- CONTROLLED_EXEC_MARKER:testmarker99 -->" in received_bodies[0]
-        assert "## Test Body" in received_bodies[0]
+        materialized = _read_materialized_issue_comment_input(tmp_path, 42)
+        assert "<!-- CONTROLLED_EXEC_MARKER:testmarker99 -->" in materialized["comment_body"]
+        assert "## Test Body" in materialized["comment_body"]
 
-    def test_marker_appended_after_body_content(self, monkeypatch):
+    def test_marker_appended_after_body_content(self, tmp_path, monkeypatch):
         """Marker is appended after original body, not prepended."""
+        monkeypatch.setattr(pub, "_PROJECT_ROOT", tmp_path)
         original_body = "## Original Content\n\nSome text."
-        received_bodies: list[str] = []
 
         def fake_run(cmd, **kwargs):
-            if isinstance(cmd, list) and cmd[0] == "gh":
-                received_bodies.append(kwargs.get("input", ""))
-                m = MagicMock()
-                m.returncode = 0
-                m.stderr = ""
-                return m
+            if _is_exec_call(cmd):
+                return _fake_exec_proc()
             raise AssertionError(f"Unexpected: {cmd}")
 
         monkeypatch.setenv("CONTROLLED_EXEC_MARKER", "markerXYZ")
@@ -990,8 +1002,8 @@ class TestExecMarkerInjection:
                 repo="squne121/loop-protocol",
             )
 
-        assert len(received_bodies) == 1
-        body = received_bodies[0]
+        materialized = _read_materialized_issue_comment_input(tmp_path, 42)
+        body = materialized["comment_body"]
         # Marker comes after original content
         marker_pos = body.find("<!-- CONTROLLED_EXEC_MARKER:")
         original_end_pos = body.find(original_body) + len(original_body)
@@ -1003,6 +1015,63 @@ class TestExecMarkerInjection:
 # ---------------------------------------------------------------------------
 # #1311: loop_handoff input wiring (AC3)
 # ---------------------------------------------------------------------------
+
+class TestMaterializeIsolationIssueCommentRequest:
+    """AC2 (Issue #1633): materialize_isolation_issue_comment_request() writes
+    a bounded ISOLATION_ISSUE_COMMENT_REQUEST_V1 request into
+    artifacts/{issue_number}/issue-metadata/issue_comment.publish/ as an
+    ISSUE_COMMENT_PUBLISH_INPUT_V1 file, after validating the bounded fields."""
+
+    def test_success_writes_expected_namespace_and_schema(self, tmp_path):
+        rel_path, err = pub.materialize_isolation_issue_comment_request(
+            issue_number=555,
+            repo="squne121/loop-protocol",
+            comment_body="hello <!-- m1 -->",
+            marker="<!-- m1 -->",
+            project_root=tmp_path,
+        )
+        assert err == ""
+        assert rel_path == "artifacts/555/issue-metadata/issue_comment.publish/issue_comment_publish_input.json"
+        written = json.loads((tmp_path / rel_path).read_text(encoding="utf-8"))
+        assert written["schema"] == "ISSUE_COMMENT_PUBLISH_INPUT_V1"
+        assert written["issue_number"] == 555
+        assert written["comment_body"] == "hello <!-- m1 -->"
+        assert written["marker"] == "<!-- m1 -->"
+
+    def test_rejects_marker_not_embedded_in_body(self, tmp_path):
+        rel_path, err = pub.materialize_isolation_issue_comment_request(
+            issue_number=555,
+            repo="squne121/loop-protocol",
+            comment_body="hello world",
+            marker="<!-- missing -->",
+            project_root=tmp_path,
+        )
+        assert rel_path is None
+        assert "marker_not_embedded_in_body" in err
+        assert not (tmp_path / "artifacts").exists()
+
+    def test_rejects_empty_marker(self, tmp_path):
+        rel_path, err = pub.materialize_isolation_issue_comment_request(
+            issue_number=555,
+            repo="squne121/loop-protocol",
+            comment_body="hello world",
+            marker="",
+            project_root=tmp_path,
+        )
+        assert rel_path is None
+        assert "marker" in err
+
+    def test_rejects_empty_comment_body(self, tmp_path):
+        rel_path, err = pub.materialize_isolation_issue_comment_request(
+            issue_number=555,
+            repo="squne121/loop-protocol",
+            comment_body="",
+            marker="",
+            project_root=tmp_path,
+        )
+        assert rel_path is None
+        assert err != ""
+
 
 class TestLoopHandoffWiring:
     """AC3: publish() forwards the loop_handoff field from input_data to the
