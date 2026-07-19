@@ -152,15 +152,10 @@ _ALLOWED_PATHS_HEADING_RE = re.compile(r"^##\s+Allowed Paths\s*$", re.MULTILINE)
 HUMAN_C1_DECISION_SCHEMA = "HUMAN_C1_DECISION_V1"
 _HUMAN_C1_DECISION_FIELDS = frozenset(
     {
-        "target_issue_url",
         "candidate_issue_number",
         "decision",
-        "comment_url",
-        "author_association",
         "current_body_sha256",
-        "current_updated_at",
         "candidate_body_sha256",
-        "candidate_updated_at",
     }
 )
 _HUMAN_C1_DECISION_BLOCK_RE = re.compile(
@@ -865,11 +860,16 @@ def fetch_issue_comments(repo: str, issue_number: int) -> List[Dict[str, Any]]:
         for item in data:
             if not isinstance(item, dict):
                 raise OverlapRuntimeError("issue comments endpoint contains non-object record")
+            user = item.get("user")
             comments.append(
                 {
                     "body": item.get("body"),
-                    "url": item.get("html_url"),
-                    "authorAssociation": item.get("author_association"),
+                    "comment_id": item.get("id"),
+                    "comment_url": item.get("html_url"),
+                    "author_login": user.get("login") if isinstance(user, dict) else None,
+                    "author_association": item.get("author_association"),
+                    "created_at": item.get("created_at"),
+                    "updated_at": item.get("updated_at"),
                 }
             )
         if len(data) < _NATIVE_DEPENDENCY_PAGE_SIZE:
@@ -977,6 +977,29 @@ def _comment_author_association(raw: Dict[str, Any]) -> Optional[str]:
     return value.strip().upper() if isinstance(value, str) and value.strip() else None
 
 
+def _comment_metadata(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize REST-owned comment fields for every audit entry.
+
+    Decision payloads never self-assert these values.  Offline fixtures use
+    the same normalized shape, while the online producer populates it solely
+    from GitHub REST readback.
+    """
+    body = raw.get("body")
+    url = raw.get("comment_url", raw.get("url"))
+    comment_id = raw.get("comment_id", raw.get("id"))
+    author_login = raw.get("author_login")
+    if author_login is None and isinstance(raw.get("user"), dict):
+        author_login = raw["user"].get("login")
+    return {
+        "comment_id": comment_id if isinstance(comment_id, int) else None,
+        "comment_url": url if isinstance(url, str) else None,
+        "comment_body_sha256": f"sha256:{_sha256(body)}" if isinstance(body, str) else None,
+        "comment_updated_at": raw.get("updated_at") if isinstance(raw.get("updated_at"), str) else None,
+        "author_login": author_login if isinstance(author_login, str) else None,
+        "author_association": _comment_author_association(raw),
+    }
+
+
 def _parse_human_c1_comment(raw: Dict[str, Any]) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
     """Parse exactly one fixed schema block from an Issue comment.
 
@@ -1006,9 +1029,15 @@ def _parse_human_c1_comment(raw: Dict[str, Any]) -> Tuple[Optional[Dict[str, str
     return fields, None
 
 
-def _decision_rejection(raw: Dict[str, Any], reason: str) -> Dict[str, Any]:
-    url = raw.get("url") if isinstance(raw.get("url"), str) else None
-    return {"comment_url": url, "reason": reason}
+def _decision_rejection(
+    raw: Dict[str, Any], reason: str, parsed_candidate_issue_number: Optional[int] = None
+) -> Dict[str, Any]:
+    """Produce the complete, hash-bound rejection evidence required by AC5."""
+    return {
+        **_comment_metadata(raw),
+        "parsed_candidate_issue_number": parsed_candidate_issue_number,
+        "reason": reason,
+    }
 
 
 def _validate_human_c1_decisions(
@@ -1017,7 +1046,6 @@ def _validate_human_c1_decisions(
     repository: str,
     current_number: int,
     current_body: str,
-    current_updated_at: Optional[str],
     candidates_evidence: List[Dict[str, Any]],
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Validate owner/collaborator records and attach only exact C1 decisions.
@@ -1026,14 +1054,12 @@ def _validate_human_c1_decisions(
     a currently ambiguous C1 candidate as a human-confirmed non-conflict after
     all comment claims are bound to the exact current readback.
     """
-    result: Dict[str, List[Dict[str, Any]]] = {"accepted": [], "rejected": []}
+    result: Dict[str, List[Dict[str, Any]]] = {"accepted": [], "rejected": [], "ignored_untrusted": []}
     if comments is None:
         return result
     if not isinstance(comments, list):
-        result["rejected"].append({"comment_url": None, "reason": "comments_schema_invalid"})
+        result["rejected"].append(_decision_rejection({}, "comments_schema_invalid"))
         return result
-
-    expected_target_url = f"https://github.com/{repository}/issues/{current_number}"
     candidate_by_number = {
         item.get("issue_number"): item
         for item in candidates_evidence
@@ -1043,32 +1069,20 @@ def _validate_human_c1_decisions(
 
     for raw in comments:
         if not isinstance(raw, dict):
-            result["rejected"].append({"comment_url": None, "reason": "comment_record_invalid"})
+            result["rejected"].append(_decision_rejection({}, "comment_record_invalid"))
+            continue
+        author_association = _comment_author_association(raw)
+        # Trust is established before parsing schema-like attacker content.
+        if author_association not in {"OWNER", "COLLABORATOR"}:
+            if isinstance(raw.get("body"), str) and HUMAN_C1_DECISION_SCHEMA in raw["body"]:
+                result["ignored_untrusted"].append(
+                    _decision_rejection(raw, "untrusted_author_association")
+                )
             continue
         fields, parse_error = _parse_human_c1_comment(raw)
         if fields is None:
             if parse_error:
                 result["rejected"].append(_decision_rejection(raw, parse_error))
-            continue
-
-        comment_url = raw.get("url") if isinstance(raw.get("url"), str) else None
-        author_association = _comment_author_association(raw)
-        if comment_url is None or fields["comment_url"] != comment_url:
-            result["rejected"].append(_decision_rejection(raw, "comment_url_readback_mismatch"))
-            continue
-        url_match = _HUMAN_C1_COMMENT_URL_RE.fullmatch(comment_url)
-        if (
-            url_match is None
-            or _canonicalize_repo_static(f"{url_match.group('owner')}/{url_match.group('repo')}") != repository
-            or int(url_match.group("number")) != current_number
-        ):
-            result["rejected"].append(_decision_rejection(raw, "comment_url_not_target_issue"))
-            continue
-        if fields["target_issue_url"] != expected_target_url:
-            result["rejected"].append(_decision_rejection(raw, "target_issue_url_mismatch"))
-            continue
-        if author_association not in {"OWNER", "COLLABORATOR"} or fields["author_association"] != author_association:
-            result["rejected"].append(_decision_rejection(raw, "author_association_not_authorized_or_mismatch"))
             continue
         if fields["decision"] != "C1/non-conflict":
             result["rejected"].append(_decision_rejection(raw, "decision_not_c1_non_conflict"))
@@ -1088,27 +1102,79 @@ def _validate_human_c1_decisions(
         if fields["current_body_sha256"] != f"sha256:{_sha256(current_body)}":
             result["rejected"].append(_decision_rejection(raw, "current_body_sha256_mismatch"))
             continue
-        if fields["current_updated_at"] != current_updated_at:
-            result["rejected"].append(_decision_rejection(raw, "current_updated_at_mismatch"))
-            continue
         if fields["candidate_body_sha256"] != candidate.get("body_sha256"):
             result["rejected"].append(_decision_rejection(raw, "candidate_body_sha256_mismatch"))
-            continue
-        if fields["candidate_updated_at"] != candidate.get("updated_at"):
-            result["rejected"].append(_decision_rejection(raw, "candidate_updated_at_mismatch"))
             continue
 
         verified = {
             **fields,
+            **_comment_metadata(raw),
             "verified": True,
         }
         candidate["human_c1_decision"] = verified
         result["accepted"].append(verified)
         seen_candidates.add(candidate_number)
 
-    result["accepted"].sort(key=lambda item: (int(item["candidate_issue_number"]), item["comment_url"]))
+    result["accepted"].sort(key=lambda item: (int(item["candidate_issue_number"]), item["comment_url"] or ""))
     result["rejected"].sort(key=lambda item: ((item.get("comment_url") or ""), item["reason"]))
+    result["ignored_untrusted"].sort(key=lambda item: ((item.get("comment_url") or ""), item["reason"]))
     return result
+
+
+def _apply_final_readback_drift(
+    *,
+    decisions: Dict[str, List[Dict[str, Any]]],
+    final_current: Dict[str, Any],
+    final_candidates: Dict[int, Dict[str, Any]],
+    final_comments: List[Dict[str, Any]],
+) -> bool:
+    """Compare accepted records with a final REST readback.
+
+    This is a bounded freshness check, not an atomic guarantee.  Any missing
+    final object or change to the four contract inputs forces human review.
+    """
+    comments_by_id = {
+        raw.get("comment_id", raw.get("id")): raw
+        for raw in final_comments
+        if isinstance(raw, dict) and isinstance(raw.get("comment_id", raw.get("id")), int)
+    }
+    drifted = False
+    for accepted in decisions["accepted"]:
+        candidate_number = int(accepted["candidate_issue_number"])
+        candidate = final_candidates.get(candidate_number)
+        comment = comments_by_id.get(accepted.get("comment_id"))
+        final_meta = _comment_metadata(comment) if isinstance(comment, dict) else _comment_metadata({})
+        final_current_hash = (
+            f"sha256:{_sha256(final_current.get('body'))}"
+            if isinstance(final_current.get("body"), str)
+            else None
+        )
+        final_candidate_hash = (
+            f"sha256:{_sha256(candidate.get('body'))}"
+            if isinstance(candidate, dict) and isinstance(candidate.get("body"), str)
+            else None
+        )
+        unchanged = (
+            final_current_hash == accepted.get("current_body_sha256")
+            and final_candidate_hash == accepted.get("candidate_body_sha256")
+            and final_meta["comment_body_sha256"] == accepted.get("comment_body_sha256")
+            and final_meta["comment_updated_at"] == accepted.get("comment_updated_at")
+            and final_meta["author_login"] == accepted.get("author_login")
+        )
+        if unchanged:
+            accepted["final_readback_verified"] = True
+            continue
+        drifted = True
+        accepted["final_readback_verified"] = False
+        decisions["rejected"].append(
+            {
+                **_comment_metadata(comment if isinstance(comment, dict) else accepted),
+                "parsed_candidate_issue_number": candidate_number,
+                "reason": "final_readback_fingerprint_drift",
+            }
+        )
+    decisions["rejected"].sort(key=lambda item: ((item.get("comment_url") or ""), item["reason"]))
+    return drifted
 
 
 # ============================================================
@@ -1526,7 +1592,6 @@ def _classify(
         repository=repository,
         current_number=args.issue_number,
         current_body=current_body,
-        current_updated_at=current_raw.get("updatedAt"),
         candidates_evidence=candidates_evidence,
     )
     if human_c1_decisions["accepted"]:
@@ -1745,6 +1810,27 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                         repository=canonical_repo,
                     )
                     ctx["dependency_resolution"]["native_dependency_candidates_fetched"] = fetched_numbers
+
+        # #1613 review fix: auxiliary dependency reads may have taken time.
+        # Re-read every accepted decision input immediately before evidence
+        # generation.  This narrows the race window but deliberately does not
+        # claim atomicity after this final readback.
+        if not args.dry_run and repo and ctx["human_c1_decisions"]["accepted"]:
+            final_current = fetch_current_issue(repo, args.issue_number)
+            final_comments = fetch_issue_comments(canonical_repo, args.issue_number)
+            final_candidates: Dict[int, Dict[str, Any]] = {}
+            for accepted in ctx["human_c1_decisions"]["accepted"]:
+                number = int(accepted["candidate_issue_number"])
+                fetched = fetch_predecessor_issue(repo, number)
+                if isinstance(fetched, dict):
+                    final_candidates[number] = fetched
+            if _apply_final_readback_drift(
+                decisions=ctx["human_c1_decisions"],
+                final_current=final_current,
+                final_candidates=final_candidates,
+                final_comments=final_comments,
+            ):
+                route = ROUTE_HUMAN_REVIEW_REQUIRED
 
         if route not in ROUTES:
             route = ROUTE_RUNTIME_ERROR
