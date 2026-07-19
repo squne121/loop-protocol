@@ -693,7 +693,11 @@ def _overlap_collection_contract_shape_error(source: dict) -> str | None:
     文字列、なければ None を返す（PR #1626 review fix_delta P2 Blocker）。
     """
     page_size = source.get("page_size")
-    if isinstance(page_size, bool) or not isinstance(page_size, int) or not (1 <= page_size <= _OVERLAP_PAGE_SIZE_UPPER_BOUND):
+    if (
+        isinstance(page_size, bool)
+        or not isinstance(page_size, int)
+        or not (1 <= page_size <= _OVERLAP_PAGE_SIZE_UPPER_BOUND)
+    ):
         return f"page_size が 1..{_OVERLAP_PAGE_SIZE_UPPER_BOUND} の範囲の整数ではありません: {page_size!r}"
     page_count = source.get("page_count")
     if isinstance(page_count, bool) or not isinstance(page_count, int) or page_count < 1:
