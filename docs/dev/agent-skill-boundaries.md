@@ -1970,3 +1970,65 @@ Codex の Stop / SubagentStop hook（`scripts/session-recording/codex-hook-adapt
 - consumer は `.claude/skills/post-merge-cleanup/scripts/classify-git-state.py`（`--format json` の `temp_residue_classification` field）と `.claude/skills/post-merge-cleanup/SKILL.md`。
 - ownership marker（`temp_residue_owner/v1`、`scripts/agent-ops/temp_residue_marker.py`）は accidental isolation model のみを実装し、authorization model ではない（session id の真正性は保証しない）。
 - denied alias（`.tmp/` `.temp/` `.tmp-*/`）配下は valid marker があっても常に `report_only`。approved roots（`tmp/` `.claude/tmp/`）配下の owned session directory のみ `eligible_for_delete` になり得る。詳細は `docs/dev/repository-folder-policy.md` の Root Class / Marker Effect Matrix を参照。
+## PR Review Marker Archive Lifecycle（`PR_REVIEW_PUBLISH_MARKER_V1` / `PR_REVIEW_MARKER_ARCHIVE_RESULT_V1`）
+
+（Issue #1602 — merge 済み PR の `pr_review.publish` local marker が後続 preflight を
+`unauthorized_write_path` で不必要に停止させないための、限定 archive lifecycle の責務境界。）
+
+### 責務境界
+
+- `controlled_skill_mutation_exec.py` の `pr_review.publish` が書く
+  `artifacts/<pr>/issue-metadata/pr_review.publish/pr_review_publish.marker.json`
+  （schema `PR_REVIEW_PUBLISH_MARKER_V1`）は **local cache/audit** に過ぎない。
+  mutation の成功可否は常に remote GitHub review readback が authority であり、
+  marker 単体を成功の根拠にしてはならない（既存方針。変更なし）。
+- `scripts/agent-ops/pr_review_marker_archive_exec.py` は、この local marker を
+  repo 外 archive root（`XDG_STATE_HOME` authority、既定 `$HOME/.local/state`）へ
+  **限定的に** 退避してから repo 側 marker を除去する、唯一の executor である。
+  - remote が対象 PR を `MERGED` と判定し（merged-check endpoint、`204`=merged /
+    `404`=unmerged）、かつ marker の `review_id` を primary key として取得した exact
+    review が id/URL/PR URL/state/commit/idempotency-derived body marker のすべてで
+    一致する場合に限り、marker を archive してから除去する。
+  - 除去は `SOURCE_VALIDATED -> ARCHIVE_PREPARED -> ARCHIVE_DURABLE -> SOURCE_REMOVED
+    -> SOURCE_REMOVAL_DURABLE -> COMMITTED` の state machine に従い、`archived` /
+    `already_archived` / `source_retained` / `indeterminate` / `refused` /
+    `environment_blocked` のいずれかを返す（`PR_REVIEW_MARKER_ARCHIVE_RESULT_V1`）。
+    unlink 前の失敗は marker を必ず保持し、unlink 後に postcondition を確認できない
+    場合は `indeterminate` を返して「保持した」とは主張しない。
+- `post-merge-cleanup`（`.claude/skills/post-merge-cleanup/SKILL.md`）は、この
+  executor を **merged PR number と exact marker path を明示して** 呼び出す唯一の
+  consumer であり、`POST_MERGE_CLEANUP_REPORT_V1` に `pr_review_marker_archive`
+  （schema `PR_REVIEW_MARKER_ARCHIVE_RESULT_V1`）result block を追加する。
+- 本 executor は `pr_review.publish` の request/response semantics や idempotency
+  contract を変更しない。`skill_runtime_exec.py` / preflight の generic artifact
+  allowlist・ignore rule も拡張しない（`artifacts/**` を widen する経路として使わない）。
+  任意 path・glob・schema 不明・symlink/hardlink/non-regular file・open や
+  closed-unmerged な PR・remote readback 不一致の marker は無条件で対象外とする。
+
+### PR_REVIEW_MARKER_ARCHIVE_RESULT_V1（要約）
+
+```yaml
+PR_REVIEW_MARKER_ARCHIVE_RESULT_V1:
+  schema: PR_REVIEW_MARKER_ARCHIVE_RESULT_V1
+  status: archived | already_archived | source_retained | indeterminate | refused | environment_blocked
+  reason_code: <bounded enum> | null
+  pr_number: <int>
+  source_relpath: "artifacts/<pr>/issue-metadata/pr_review.publish/pr_review_publish.marker.json"
+  marker_sha256: "sha256:..." | null
+  archive_locator: "<repo>/<pr>/<marker-sha256>.archive.json" | null
+  archive_durable: true | false
+  source_present_after: "true" | "false" | "unknown"
+  source_directory_synced: true | false
+  remote:
+    merged: true | false
+    review_id: <int> | null
+    state: <string> | null
+    commit_id: <string> | null
+  errors: []
+```
+
+routing-critical フィールドは `status` / `reason_code` / `pr_number` /
+`source_relpath` / `archive_durable` / `source_present_after` であり、
+`post-merge-cleanup` は `status` に応じて `unresolved_cleanup_items` へ記録するか
+（`source_retained` / `indeterminate` / `refused` / `environment_blocked`）、
+何もしない（`archived` / `already_archived`）かを判定する。

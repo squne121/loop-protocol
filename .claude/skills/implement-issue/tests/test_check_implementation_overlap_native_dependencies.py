@@ -520,6 +520,18 @@ def test_live_smoke_read_only_native_dependency_fetch() -> None:
 
 _FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "overlap"
 
+def _fake_source_metadata(count: int, *, saturated: bool = False) -> dict:
+    return {
+        "collection_mode": "exhaustive_cursor_pagination",
+        "page_size": 100,
+        "page_count": 1,
+        "fetched_count": count,
+        "has_next_page": saturated,
+        "complete": not saturated,
+        "saturated": saturated,
+    }
+
+
 
 def test_given_online_run_when_readback_candidate_exists_then_native_dependencies_fetched_for_it_only(
     monkeypatch, capsys
@@ -541,7 +553,7 @@ def test_given_online_run_when_readback_candidate_exists_then_native_dependencie
         return dict(current_raw)
 
     def fake_fetch_implementation_candidates(repo, limit):
-        return list(candidates_raw), False
+        return list(candidates_raw), _fake_source_metadata(len(candidates_raw))
 
     def fake_fetch_all_native_dependencies(repo, issue_number):
         fetch_calls.append(issue_number)
@@ -601,7 +613,7 @@ def test_given_online_run_when_no_readback_candidate_then_native_dependencies_fe
         return dict(current_raw)
 
     def fake_fetch_implementation_candidates(repo, limit):
-        return [], False
+        return [], _fake_source_metadata(0)
 
     def fake_fetch_all_native_dependencies(repo, issue_number):
         fetch_calls.append(issue_number)
@@ -636,7 +648,7 @@ def test_given_online_run_when_current_only_blocks_open_dependent_then_route_doe
         return dict(current_raw)
 
     def fake_fetch_implementation_candidates(repo, limit):
-        return [], False
+        return [], _fake_source_metadata(0)
 
     def fake_fetch_all_native_dependencies(repo, issue_number):
         assert repo == REPO
