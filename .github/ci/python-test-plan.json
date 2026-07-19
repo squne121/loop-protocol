@@ -24,6 +24,7 @@
     "schemas/tests/",
     "scripts/ci/tests/",
     "scripts/agent-guards/tests/",
+    "scripts/agent-ops/tests/",
     "tests/codex/test_codex_hook_surface_guard.py",
     "tests/codex/test_execpolicy_matrix.py",
     "tests/codex/test_cleanup_exec_branch_only.py",
