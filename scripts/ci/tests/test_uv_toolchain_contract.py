@@ -40,6 +40,17 @@ SETUP_UV_PREFIX = "astral-sh/setup-uv@"
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _VERSION_OPERATOR_RE = re.compile(r"^[=><!~]+")
 
+# Exact PEP 440 pin: "==X.Y.Z" (three-part version only). Anything else
+# (range specifiers, compatible-release "~=", multiple specifiers joined by
+# ",", or a malformed value) must fail closed rather than silently stripping
+# the leading operator (Issue #1598 fix_delta AC10).
+_EXACT_VERSION_PIN_RE = re.compile(r"^==(?P<version>[0-9]+\.[0-9]+\.[0-9]+)$")
+
+# Allowlist of full commit SHAs approved for astral-sh/setup-uv consumers.
+# Kept in sync with the grep target used by Issue #1598 AC2's Verification
+# Command; every setup-uv consumer's pinned SHA must be a member of this set.
+_APPROVED_SETUP_UV_SHAS = frozenset({"08807647e7069bb48b6ef5acd8ec9567f424441b"})
+
 
 def _read_required_version_raw() -> str | None:
     """Return the raw `[tool.uv].required-version` value, or None if absent."""
@@ -59,14 +70,25 @@ def _read_required_version_raw() -> str | None:
 
 
 def _required_version_number() -> str:
-    """Return the numeric version (operator prefix stripped), asserting presence."""
+    """Return the numeric version, asserting an exact PEP 440 ``==X.Y.Z`` pin.
+
+    Fail-closed (AC10): a range specifier (``>=``), compatible-release
+    (``~=``), multiple comma-joined specifiers, or any other non-exact form
+    is rejected rather than silently accepted by stripping the leading
+    operator characters.
+    """
     raw = _read_required_version_raw()
     assert raw, (
         "pyproject.toml [tool.uv].required-version is missing or empty; "
         "it is the canonical source for the repository uv version pin "
         "(Issue #1598)."
     )
-    return _VERSION_OPERATOR_RE.sub("", raw)
+    match = _EXACT_VERSION_PIN_RE.fullmatch(raw)
+    assert match, (
+        f"pyproject.toml [tool.uv].required-version={raw!r} is not an exact "
+        "PEP 440 pin of the form '==X.Y.Z' (Issue #1598 AC10 fail-closed guard)."
+    )
+    return match.group("version")
 
 
 @pytest.fixture(autouse=True)
@@ -82,12 +104,18 @@ def _require_canonical_uv_version_present() -> None:
 
 
 def _iter_setup_uv_consumer_files() -> list[Path]:
-    """Enumerate every action/workflow YAML file that could reference setup-uv."""
+    """Enumerate every action/workflow YAML file that could reference setup-uv.
+
+    ``.github/actions`` is scanned recursively (``rglob``) so composite
+    actions nested under subdirectories (e.g.
+    ``.github/actions/toolchains/python/action.yml``) are also discovered,
+    matching this module's docstring (``.github/actions/**``).
+    """
     files: list[Path] = []
     actions_dir = REPO_ROOT / ".github" / "actions"
     if actions_dir.is_dir():
-        files.extend(sorted(actions_dir.glob("*/action.yml")))
-        files.extend(sorted(actions_dir.glob("*/action.yaml")))
+        files.extend(sorted(actions_dir.rglob("action.yml")))
+        files.extend(sorted(actions_dir.rglob("action.yaml")))
     workflows_dir = REPO_ROOT / ".github" / "workflows"
     if workflows_dir.is_dir():
         files.extend(sorted(workflows_dir.glob("*.yml")))
@@ -148,7 +176,10 @@ def test_repo_has_at_least_the_two_known_setup_uv_consumers() -> None:
 
 
 def test_all_setup_uv_consumers_use_approved_full_sha() -> None:
-    """AC5: every astral-sh/setup-uv consumer must pin a full commit SHA."""
+    """AC5/AC2: every astral-sh/setup-uv consumer must pin a full commit SHA
+    that is also a member of the approved SHA allowlist
+    (``_APPROVED_SETUP_UV_SHAS``). A well-formed-but-unapproved 40-hex SHA
+    must fail this test just as a mutable tag reference does."""
     consumers = _collect_setup_uv_consumers()
     assert consumers, "no astral-sh/setup-uv consumers found in repository"
 
@@ -156,14 +187,56 @@ def test_all_setup_uv_consumers_use_approved_full_sha() -> None:
     for path, step in consumers:
         uses = step["uses"]
         ref = uses[len(SETUP_UV_PREFIX) :]
+        rel = path.relative_to(REPO_ROOT)
         if not _FULL_SHA_RE.fullmatch(ref):
-            rel = path.relative_to(REPO_ROOT)
             failures.append(
                 f"{rel}: astral-sh/setup-uv is pinned to {ref!r}, which is not a "
                 "full 40-character commit SHA (mutable tag/branch references are "
                 "not allowed)"
             )
+            continue
+        if ref not in _APPROVED_SETUP_UV_SHAS:
+            failures.append(
+                f"{rel}: astral-sh/setup-uv is pinned to full SHA {ref!r}, which "
+                f"is not in the approved SHA allowlist ({sorted(_APPROVED_SETUP_UV_SHAS)!r})"
+            )
     assert not failures, "\n".join(failures)
+
+
+def test_nested_action_directory_mutable_tag_ref_is_detected(tmp_path) -> None:
+    """AC2b regression: a composite action nested under a subdirectory of
+    ``.github/actions`` (e.g. ``.github/actions/toolchains/python/action.yml``)
+    must still be discovered by the recursive scan, and a mutable tag
+    reference in it must still be flagged as non-full-SHA."""
+    nested_action_dir = tmp_path / ".github" / "actions" / "toolchains" / "python"
+    nested_action_dir.mkdir(parents=True)
+    nested_action_path = nested_action_dir / "action.yml"
+    nested_action_path.write_text(
+        "name: nested\n"
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - uses: astral-sh/setup-uv@v8.1.0\n"
+        "      with:\n"
+        "        version: \"0.11.29\"\n",
+        encoding="utf-8",
+    )
+
+    actions_dir = tmp_path / ".github" / "actions"
+    discovered = sorted(actions_dir.rglob("action.yml"))
+    assert nested_action_path in discovered, (
+        "recursive rglob('action.yml') must discover nested composite actions "
+        f"under subdirectories of .github/actions; discovered={discovered!r}"
+    )
+
+    steps = _iter_setup_uv_steps(nested_action_path)
+    assert len(steps) == 1, f"expected exactly one setup-uv step; found {steps!r}"
+    uses = steps[0]["uses"]
+    ref = uses[len(SETUP_UV_PREFIX) :]
+    assert not _FULL_SHA_RE.fullmatch(ref), (
+        f"nested action's mutable tag ref {ref!r} must NOT match the full-SHA "
+        "pattern (it must be flagged as non-compliant)"
+    )
 
 
 def test_setup_uv_consumer_explicit_version_matches_required_version() -> None:
@@ -239,3 +312,49 @@ def test_required_version_present_in_pyproject_toml() -> None:
     # comparison operator prefix (e.g. "==") is stripped.
     numeric = _VERSION_OPERATOR_RE.sub("", raw)
     assert numeric, f"required-version {raw!r} did not resolve to a version number"
+
+
+def test_repo_required_version_is_exact_version_pin() -> None:
+    """AC10: the repository's actual pyproject.toml [tool.uv].required-version
+    must be an exact PEP 440 pin ('==X.Y.Z'), enforced via
+    ``_required_version_number``'s fail-closed fullmatch."""
+    version = _required_version_number()
+    assert _EXACT_VERSION_PIN_RE.fullmatch(f"=={version}")
+
+
+@pytest.mark.parametrize(
+    "raw_value",
+    [
+        ">=0.11.29",
+        "~=0.11.29",
+        "==0.11.29,>=0.11.0",
+        "==0.11",
+        "==0.11.29.1",
+        "0.11.29",
+        "== 0.11.29",
+        "",
+        "not-a-version",
+    ],
+)
+def test_exact_version_pin_rejects_non_exact_specifiers(raw_value: str) -> None:
+    """AC10 negative case: range specifiers, compatible-release, multiple
+    comma-joined specifiers, malformed values, and bare version strings
+    (missing the '==' operator) must all be rejected by the exact-pin
+    regex rather than silently coerced into a usable version number."""
+    assert _EXACT_VERSION_PIN_RE.fullmatch(raw_value) is None
+
+
+@pytest.mark.parametrize(
+    "raw_value,expected",
+    [
+        ("==0.11.29", "0.11.29"),
+        ("==1.0.0", "1.0.0"),
+        ("==10.20.30", "10.20.30"),
+    ],
+)
+def test_exact_version_pin_accepts_well_formed_pins(raw_value: str, expected: str) -> None:
+    """AC10 positive case: well-formed '==X.Y.Z' pins are accepted and the
+    three-part numeric version is extracted correctly."""
+    match = _EXACT_VERSION_PIN_RE.fullmatch(raw_value)
+    assert match is not None
+    assert match.group("version") == expected

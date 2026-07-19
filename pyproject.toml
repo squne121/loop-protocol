@@ -18,7 +18,7 @@ dev = [
 # uv version canonical source (Issue #1598). GitHub Actions astral-sh/setup-uv
 # consumers with an explicit "version:" must match this value; verified by
 # scripts/ci/tests/test_uv_toolchain_contract.py.
-required-version = "==0.11.23"
+required-version = "==0.11.29"
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib -m 'not github_live'"
