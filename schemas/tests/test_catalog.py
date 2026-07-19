@@ -50,7 +50,7 @@ REPO_ROOT = Path(__file__).parents[2]
 CATALOG_YAML = REPO_ROOT / "schemas" / "catalog.yaml"
 CATALOG_SCHEMA_JSON = REPO_ROOT / "schemas" / "catalog.schema.json"
 
-EXPECTED_ENTRY_COUNT = 18
+EXPECTED_ENTRY_COUNT = 20
 
 AMBIGUOUS_PATTERNS = re.compile(
     r"推定|TBD|TODO|不明|unknown",
@@ -443,6 +443,8 @@ EXPECTED_SCHEMA_IDS = {
     "PR_REVIEW_GATE_RESULT_V1",
     "temp_residue_classification/v1",
     "temp_residue_owner/v1",
+    "TEST_VERDICT_EXECUTION_RECORD_V1",
+    "TEST_VERDICT_PRODUCER_RECEIPT_V1",
 }
 
 

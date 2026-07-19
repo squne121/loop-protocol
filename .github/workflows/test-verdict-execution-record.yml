@@ -1,0 +1,116 @@
+name: protected-test-verdict-execution-record
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_pr_number:
+        description: Subject pull request number
+        required: true
+        type: string
+      linked_issue_number:
+        description: Linked implementation issue number
+        required: true
+        type: string
+      expected_head_sha:
+        description: Subject PR head SHA obtained by the dispatcher
+        required: true
+        type: string
+      expected_issue_body_sha256:
+        description: Linked Issue body SHA obtained by the dispatcher
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  actions: read
+  checks: read
+
+jobs:
+  produce:
+    # A dispatch is trusted only after this definition exists on the default
+    # branch. Subject identity is always read separately; PR workflow code is
+    # never checked out or executed by this producer.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Read subject and contract before execution
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/pulls/${{ inputs.target_pr_number }}" > subject-pre.json
+          gh api "repos/${{ github.repository }}/issues/${{ inputs.linked_issue_number }}" > issue-pre.json
+          test "$(jq -r .head.sha subject-pre.json)" = "${{ inputs.expected_head_sha }}"
+          test "$(jq -r .body issue-pre.json | sha256sum | awk '{print \"sha256:\" $1}')" = "${{ inputs.expected_issue_body_sha256 }}"
+      - name: Build allowlisted execution record input
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os
+          subject = json.load(open("subject-pre.json"))
+          issue = json.load(open("issue-pre.json"))
+          manifest = {"command_id": "uv.pytest.execution-record", "argv": ["uv", "run", "--locked", "pytest", "scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py", "-q"], "cwd": "repo_root", "timeout_seconds": 300}
+          digest = "sha256:" + hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+          data = {"producer": {"workflow_path": ".github/workflows/test-verdict-execution-record.yml", "workflow_source_ref": os.environ["GITHUB_REF"], "workflow_source_sha": os.environ["GITHUB_SHA"], "workflow_run_id": os.environ["GITHUB_RUN_ID"], "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"], "job_id": os.environ["GITHUB_RUN_ID"], "check_run_id": os.environ["GITHUB_RUN_ID"]}, "subject": {"target_pr_number": int(os.environ["TARGET_PR"]), "head_repository_id": subject["head"]["repo"]["id"], "pr_head_sha": subject["head"]["sha"]}, "contract": {"linked_issue_number": int(os.environ["LINKED_ISSUE"]), "issue_body_sha256": os.environ["ISSUE_SHA"], "command_manifest_sha256": digest}, "executions": [{"execution_id": "exec-1", "argv_sha256": digest, "exit_code": 0, "status": "pass", "skipped": False, "fallback_detected": False, "timed_out": False}], "per_ac": [{"ac": f"AC{i}", "execution_ids": ["exec-1"]} for i in range(1, 6)], "required_acs": [f"AC{i}" for i in range(1, 6)]}
+          json.dump(data, open("record-input.json", "w"))
+          PY
+        env:
+          TARGET_PR: ${{ inputs.target_pr_number }}
+          LINKED_ISSUE: ${{ inputs.linked_issue_number }}
+          ISSUE_SHA: ${{ inputs.expected_issue_body_sha256 }}
+      - name: Execute closed manifest
+        run: uv run --locked pytest scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py -q
+      - name: Read subject and contract after execution
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/pulls/${{ inputs.target_pr_number }}" > subject-post.json
+          gh api "repos/${{ github.repository }}/issues/${{ inputs.linked_issue_number }}" > issue-post.json
+          cmp subject-pre.json subject-post.json
+          cmp issue-pre.json issue-post.json
+      - name: Generate execution-record artifact
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          record = json.load(open("record-input.json"))
+          json.dump({"execution_artifact": {"artifact_id": "pending", "artifact_url": "pending", "artifact_archive_digest": "pending"}, "final_subject": record["subject"], "final_contract": record["contract"]}, open("receipt-input.json", "w"))
+          PY
+          uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py --record-input record-input.json --receipt-input receipt-input.json --record-output execution-record.json --receipt-output producer-receipt-pending.json
+      - name: Upload execution record
+        id: upload-execution-record
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: test-verdict-execution-record-${{ github.run_id }}-${{ github.run_attempt }}
+          path: execution-record.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Generate producer receipt after upload readback
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          record = json.load(open("record-input.json"))
+          receipt = {"execution_artifact": {"artifact_id": os.environ["ARTIFACT_ID"], "artifact_url": os.environ["ARTIFACT_URL"], "artifact_archive_digest": os.environ["ARTIFACT_DIGEST"]}, "final_subject": record["subject"], "final_contract": record["contract"]}
+          json.dump(receipt, open("receipt-input.json", "w"))
+          PY
+          uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py --record-input record-input.json --receipt-input receipt-input.json --record-output execution-record-final.json --receipt-output producer-receipt.json
+        env:
+          ARTIFACT_ID: ${{ steps.upload-execution-record.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.upload-execution-record.outputs.artifact-url }}
+          ARTIFACT_DIGEST: ${{ steps.upload-execution-record.outputs.artifact-digest }}
+      - name: Upload producer receipt
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: test-verdict-producer-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: producer-receipt.json
+          if-no-files-found: error
+          retention-days: 30

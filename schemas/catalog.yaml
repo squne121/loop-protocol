@@ -856,6 +856,95 @@ entries:
       commit: "2198d01374caedd3ad86a42e9dbb45ea285d4bb3"
       command_id: "lint_catalog_yaml"
 
+  - schema_id: "TEST_VERDICT_EXECUTION_RECORD_V1"
+    format: json_schema
+    source_kind: repo_path
+    definition_paths:
+      - "schemas/test-verdict-execution-record.schema.json"
+      - "scripts/agent-ops/test_verdict_execution_record_producer.py"
+    producer:
+      owner: "protected-github-actions-workflow"
+      paths:
+        - ".github/workflows/test-verdict-execution-record.yml"
+        - "scripts/agent-ops/test_verdict_execution_record_producer.py"
+    consumers:
+      - id: "test-verdict-publisher"
+        paths:
+          - "scripts/agent-ops/test_verdict_comment_publisher.py"
+    detection_patterns:
+      - id: "execution-record-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "TEST_VERDICT_EXECUTION_RECORD_V1|test_verdict_execution_record"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "test_execution_record_producer"
+        runner: pytest
+        target: "scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes: [remove_required_field, rename_field, narrow_type]
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: ["scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py"]
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1a487a7e0a315a4283de916c222f7a0bacdd222b"
+      command_id: "test_execution_record_producer"
+
+  - schema_id: "TEST_VERDICT_PRODUCER_RECEIPT_V1"
+    format: json_schema
+    source_kind: repo_path
+    definition_paths:
+      - "schemas/test-verdict-producer-receipt.schema.json"
+      - "scripts/agent-ops/test_verdict_execution_record_producer.py"
+    producer:
+      owner: "protected-github-actions-workflow"
+      paths:
+        - ".github/workflows/test-verdict-execution-record.yml"
+    consumers:
+      - id: "test-verdict-publisher"
+        paths:
+          - "scripts/agent-ops/test_verdict_comment_publisher.py"
+    detection_patterns:
+      - id: "producer-receipt-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "TEST_VERDICT_PRODUCER_RECEIPT_V1|producer-receipt"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "test_execution_record_producer"
+        runner: pytest
+        target: "scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes: [remove_required_field, rename_field, narrow_type]
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: ["scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py"]
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1a487a7e0a315a4283de916c222f7a0bacdd222b"
+      command_id: "test_execution_record_producer"
+
   - schema_id: "temp_residue_owner/v1"
     format: json_schema
     source_kind: repo_path

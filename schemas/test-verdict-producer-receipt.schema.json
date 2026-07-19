@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TEST_VERDICT_PRODUCER_RECEIPT_V1",
+  "type": "object",
+  "required": ["schema", "schema_version", "execution_payload_sha256", "execution_artifact", "producer", "subject", "contract", "pass_eligible"],
+  "properties": {
+    "schema": {"const": "TEST_VERDICT_PRODUCER_RECEIPT_V1"}, "schema_version": {"const": 1},
+    "execution_payload_sha256": {"pattern": "^sha256:[0-9a-f]{64}$"},
+    "execution_artifact": {"type": "object", "required": ["artifact_id", "artifact_url", "artifact_archive_digest"]},
+    "pass_eligible": {"type": "boolean"}
+  }
+}

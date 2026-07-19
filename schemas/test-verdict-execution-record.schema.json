@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TEST_VERDICT_EXECUTION_RECORD_V1",
+  "type": "object",
+  "required": ["schema", "schema_version", "producer", "subject", "contract", "executions", "per_ac", "payload_sha256", "pass_eligible"],
+  "properties": {
+    "schema": {"const": "TEST_VERDICT_EXECUTION_RECORD_V1"},
+    "schema_version": {"const": 1},
+    "producer": {"type": "object", "required": ["workflow_path", "workflow_source_sha", "workflow_run_id", "job_id", "check_run_id"]},
+    "subject": {"type": "object", "required": ["target_pr_number", "head_repository_id", "pr_head_sha"]},
+    "contract": {"type": "object", "required": ["linked_issue_number", "issue_body_sha256", "command_manifest_sha256"]},
+    "executions": {"type": "array"}, "per_ac": {"type": "array"},
+    "payload_sha256": {"pattern": "^sha256:[0-9a-f]{64}$"}, "pass_eligible": {"type": "boolean"}
+  }
+}
