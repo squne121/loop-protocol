@@ -1912,6 +1912,51 @@ byte-preserving update 自体を新たに検出可能にするものではない
 process-level attribution（`strace` 等による OS-level trace）は本節の対象外であり、
 `#1363`（Linux-only optional strict trace attribution mode、OPEN）が handoff 先である。
 
+### Codex session manifest の canonical 出力先の外部化（Issue #1546）
+
+Codex の Stop / SubagentStop hook（`scripts/session-recording/codex-hook-adapter.mjs`）が
+生成する session manifest の canonical な出力先は、`CODEX_HOOK_MANIFEST_ROOT`（テスト分離
+専用の override。本番では未設定）が未設定のとき、repository tree 内の `tmp/session-manifests/codex/**`
+ではなく、Linux/WSL の canonical per-user state root（`XDG_STATE_HOME`、既定
+`$HOME/.local/state`）配下へ移行した（`scripts/session-recording/resolve-codex-session-manifest-root.mjs`
+の `resolveCodexSessionManifestRoot()`）。相対 path の `XDG_STATE_HOME` は無視され、既定値
+（`$HOME/.local/state`）にフォールバックする。実際の write root は
+`<XDG_STATE_HOME>/loop-protocol/session-manifests/v1/<repo_key>/codex/<event>/` であり、
+`repo_key` は canonical repository URL と `realpath(repoRoot)` から導出した sha256 の先頭 32 hex
+文字である（raw な local path や home directory を含まない）。
+
+- **executor には session-manifest 固有の allowlist / typed transition policy を追加しない**
+  （前述の「型付き ledger 遷移ポリシー」とは異なる設計判断）。write root が repository tree の
+  外側にあるため、`skill_runtime_exec.py` の repo-wide snapshot/status diff（本節の対象）には
+  そもそも現れない。したがって、独立 peer process による正規の external manifest write は
+  `unauthorized_write_path` の false positive を起こさず、専用の除外ロジックも不要である。
+- **repo-local write は引き続き fail-close する**。独立 peer が誤って（または悪意を持って）
+  `tmp/session-manifests/**` へ書き込んだ場合は、既存の generic postcondition（この節の
+  「repo-wide snapshot は自プロセス副作用とみなさない」以外の通常経路）がそのまま適用され、
+  ordinary な unauthorized write として検出する。`_RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS`
+  にも `_LEDGER_*` 型付き分類にも session-manifest 用のエントリは追加していない。
+- **publish protocol**: writer（`scripts/session-recording/write-codex-session-manifest.mjs`）は
+  create-once・no-overwrite プロトコルを実装する。一意な一時ファイル名で
+  `openSync(..., 'wx', 0o600)` により exclusive create し、`fsync` 後、`linkSync()`（destination
+  が既に存在すれば `EEXIST` で失敗し、`renameSync()` と異なり既存 final を上書きしない）で
+  publish し、最後に一時ファイル名を unlink する。ディレクトリは `0700`、ファイルは `0600` を
+  明示指定する。
+- **evidence locator**: `manifest.evidence[].source_ref` と
+  `manifest.secret_policy.runtime_boundary.evidence_ref` は、canonical な
+  state-root-relative path（`resolveCodexSessionManifestEvidenceRef()`）で一致し、raw な
+  home/repo absolute path や `..` を含まない。
+- **脅威モデル**: `same_uid_malicious_peer: not_controlled`（native dirfd writer による
+  `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` / `renameat2(RENAME_NOREPLACE)` 相当の
+  ハードニングは本 Issue では未採用。前述の SubAgent launch ledger writer とは異なり、
+  cooperative same-UID 前提の pure Node 実装のままである）。
+- **#1420 の supersede**: `tests/session_recording/codex/test_hook_adapter.py` の
+  `test_manifest_written_to_default_root_when_env_unset`（旧 #1420 fix_delta AC12:
+  「env 未設定時は repo-local `tmp/session-manifests/codex/stop/` に書く」という
+  back-compat 契約）は、本 Issue（#1546）が supersede した。同テストは env 未設定時の
+  production default が canonical external per-user state root であることを検証するよう
+  更新され、レガシー repo-local root への新規 write が発生しないことも合わせて確認する。
+  レガシー root に残る既存 artifact は自動削除しない（新規 write の停止のみ）。
+
 
 
 `scripts/agent-ops/temp_residue_classifier.py` は root temporary residue（`tmp/`, `.claude/tmp/`,
