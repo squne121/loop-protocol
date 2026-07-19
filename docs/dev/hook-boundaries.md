@@ -803,6 +803,43 @@ OWNER の敵対的レビュー（PR #1609）により、上記の初回実装に
 
 ---
 
+## 12e. default-branch fast-forward sync lane（既定ブランチ fast-forward 同期レーン, Issue #1603）
+
+`scripts/agent-guards/git_mutation_command_policy.py` の `classify_rtk_git_mutation` は、12d 節の `COMMAND_CLASS_RTK_GIT_MERGE_FF_ONLY`（Issue #1589）とは別の command class `COMMAND_CLASS_RTK_GIT_MERGE_DEFAULT_BRANCH_FF_ONLY`（`rtk_git_merge_default_branch_ff_only`）として、exact `rtk git merge --ff-only origin/<candidate>` を認識する。target identity が異なる: #1589 は active branch 自身の live remote head（呼び出し元が渡す 40-hex SHA）を検証するのに対し、本レーンは canonical default branch の LIVE identity を `git ls-remote --symref` で検証し、object-only fetch してから merge する。同一の trusted execution boundary パターン（verify・probe・実際の mutation・postcondition-readback を全て内包し、呼び出し元の raw command は常に deny として返す）を踏襲する。
+
+### trusted transaction の内容
+
+`execute_verified_default_branch_ff_merge_transaction(cwd, candidate_default_branch)` は、以下を **全て** 満たす場合のみ `git merge --ff-only <live-oid>`（argv list、`shell=False`）を実行する。いずれか一つでも欠ければ merge は一切実行されない。
+
+1. `cwd` が `expected_worktree_realpath` と同一 realpath であり、LINKED worktree（root checkout でない）である。
+2. `candidate_default_branch` が `git check-ref-format --branch` と形状 regex の両方を満たす。
+3. attached HEAD が `DEFAULT_BRANCH_NAMES` に含まれない、かつ `_ISSUE_WORKTREE_BRANCH_RE`（`worktree-issue-<N>-<slug>`）に一致し、`<N>` が `active_issue_number` と一致する。
+4. worktree/index/submodule が clean であり、進行中の git operation がない。
+5. `origin` の解決済み FETCH url が canonical repository identity に一致する（同じ url を以下の probe / fetch に使う）。
+6. live 識別 probe #1: `git ls-remote --symref --exit-code <fetch-url> HEAD refs/heads/<candidate>` を実行し、`HEAD` が exact `ref: refs/heads/<candidate>` を返し、`HEAD` と `refs/heads/<candidate>` の OID が一致する一意な小文字 40-hex SHA であることを確認する（`origin/HEAD` のローカルキャッシュや `LOOP_DEFAULT_BRANCH` は認可根拠にしない）。
+7. object-only, destination-less な `git fetch <fetch-url> <live-oid>` を実行する（ローカル ref は一切更新しない）。
+8. live 識別 probe #2（#6 の再実行）で default branch identity と OID が fetch 前後で不変であることを確認する。
+9. fetch した OID が local commit object であり、local HEAD がその ancestor である。
+10. merge 実行の直前に branch/HEAD が変化していないことを再確認する。
+
+merge 実行後は、active branch 不変・`HEAD == live-oid`・`git status` clean・operation residue なしを無条件に確認する。`postcondition_violation` / `merge_rejected_non_fast_forward` / timeout 分類（`execution_not_started` / `transport_error_but_merged_and_verified` / `transport_error_no_merge_observed` / `transport_error_state_ambiguous`）は 12d 節の `execute_verified_ff_merge_transaction` と同じ語彙・分類方針を踏襲する。
+
+### classify_rtk_git_mutation の routing
+
+`classify_rtk_git_mutation` の `merge` 分岐は、shape が exact 2-token `--ff-only origin/<branch-name-shaped-token>` の場合のみ `_classify_rtk_git_merge_default_branch`（PURE shape classifier、副作用なし）へルーティングし、それ以外（40-hex SHA を含む既存の 12d 節の形状等）は従来どおり `_classify_rtk_git_merge` へルーティングする。トランザクションの実行認可は `.claude/hooks/worktree_scope_guard.py` の `_decide_rtk_git_merge_default_branch`（`_decide_rtk_git_merge` と同じ authorize-before-execute パターン）が、active Issue 解決済み・matching worktree が一意・`cwd == expected worktree`・当該 worktree が linked worktree であることを認可した後にのみ行う。
+
+### Codex allow rule
+
+`.codex/rules/default.rules` は、専用 executor `scripts/agent-ops/verified_default_branch_ff_merge_exec.py` の exact invocation shape（`uv run --locked --no-sync python3 scripts/agent-ops/verified_default_branch_ff_merge_exec.py --candidate-branch NAME`）のみを allow とし、`rtk git merge --ff-only origin/<candidate>`（12d 節と同じ execpolicy most-severe-decision-wins の理由により）は引き続き既存の generic `rtk git merge` prompt rule に委ねる。この executor は `LOOP_ISSUE_NUMBER` からの active Issue 解決・cwd の branch 形状照合という独立した authorization を行ってから `execute_verified_default_branch_ff_merge_transaction` を呼び出す。
+
+### deny 境界
+
+- root checkout（default branch）・非 issue-worktree 命名の branch・detached HEAD はいずれも `git merge` 呼び出し前に deny される。
+- default branch 以外の ref、short SHA、`--flag=value`、flag 順序変更、追加 option、wrapper、raw git、dirty state、live/fetch mismatch、non-fast-forward、probe/fetch error、検証後の branch/HEAD change はいずれも merge 前に fail-closed で拒否される。
+- 人間による一時回避は、人間が clean state と live remote SHA を確認した上で linked worktree から通常の `git merge --ff-only origin/main` を行うことに限定される。guard/hook の無効化、force push、reset、stash、root checkout 操作は回避策に含めない。
+- raw `git merge`（`rtk` prefix なし）は本 policy の対象外（`classify_rtk_git_mutation` は `no_match` を返す）。
+- Issue #1589 の active branch remote-head lane（12d 節）とは独立した command class・独立したトランザクションであり、一方の contract を他方の contract で置換しない（#1603 の Scope Collision Preflight で確認済み）。
+
 ## 12. publish lane authorization trust root（歴史的経緯・historical note）
 
 Issue #1454（Phase A, PR #1457 MERGED）で `scripts/trust-root` 一式（`trusted_hook_launcher.py` / `manifest_schema.py` / `install_trust_root.sh`）が external trust root として導入されたが、これを `.codex/hooks.json` へ実際に配線する Issue #1450（Phase B）と、追加ハードニングを扱う Issue #1468 がいずれも個人開発の脅威モデルに対して過剰と判断され not planned でクローズされた。配線先を失った `scripts/trust-root` は不使用コードとなったため、Issue #1469 でコード一式・CI 登録・本節の bootstrap/rotation/managed hook registration 手順を削除した。現行の publish lane 保護は Issue #1408（PR #1442 MERGED、Issue branch 限定 push 許可・force/tag/delete/mirror 拒否）と main branch protection（Issue #360）のみで構成される。

@@ -66,9 +66,11 @@ from skill_runtime_command_policy import (  # noqa: E402
 )
 from git_mutation_command_policy import (  # noqa: E402
     COMMAND_CLASS_RTK_GIT_MERGE_FF_ONLY,
+    COMMAND_CLASS_RTK_GIT_MERGE_DEFAULT_BRANCH_FF_ONLY,
     GitMutationPolicyResult,
     classify_rtk_git_mutation,
     execute_verified_ff_merge_transaction,
+    execute_verified_default_branch_ff_merge_transaction,
     parse_controlled_git_change_exec_command,
 )
 from hook_repair_hints import render_hook_command_repair_hint, render_publish_safety_stop_report  # noqa: E402
@@ -2056,6 +2058,79 @@ def _decide_rtk_git_merge(
     )
 
 
+def _decide_rtk_git_merge_default_branch(
+    bounded_rtk_git: "GitMutationPolicyResult",
+    cwd: str,
+    issue: str | None,
+    resolution: "WorktreeResolution",
+    project_root: str,
+) -> None:
+    """Issue #1603: sibling authorization gate to `_decide_rtk_git_merge`
+    (Issue #1589 / #1609 fix_delta), for the default-branch fast-forward
+    sync lane. Authorizes -- active Issue resolved, exactly one matching
+    worktree, cwd bound to that worktree, and the worktree is LINKED (not
+    the root/primary checkout) -- BEFORE calling
+    `execute_verified_default_branch_ff_merge_transaction`. This function
+    always exits (via `_block_with_reason`) -- it never returns and never
+    lets the caller's raw `rtk git merge` shell command run afterward."""
+    if bounded_rtk_git.status == "deny":
+        _block_with_reason(
+            _rel(resolution.expected, project_root=project_root) if resolution.expected else "<unresolved>",
+            cwd,
+            bounded_rtk_git.reason_code,
+            bounded_rtk_git.command_class,
+            bounded_rtk_git,
+        )
+    if not issue:
+        _block_with_reason("<issue-context-required>", cwd, "issue_context_required", bounded_rtk_git.command_class)
+    if not resolution.git_available:
+        _block_with_reason("<git-unavailable>", cwd, "no_matching_worktree", bounded_rtk_git.command_class)
+    if resolution.match_count == 0:
+        _block_with_reason("<no-matching-worktree>", cwd, "no_matching_worktree", bounded_rtk_git.command_class)
+    if resolution.expected is None:
+        _block_with_reason("<ambiguous>", cwd, "ambiguous_worktree", bounded_rtk_git.command_class)
+
+    expected_real = os.path.realpath(resolution.expected)
+    if os.path.realpath(project_root) == expected_real:
+        _block_with_reason(
+            _rel(resolution.expected, project_root=project_root),
+            cwd,
+            "expected_worktree_is_root_checkout",
+            bounded_rtk_git.command_class,
+        )
+    if os.path.realpath(cwd) != expected_real:
+        _block_with_reason(
+            _rel(resolution.expected, project_root=project_root),
+            cwd,
+            "cwd_not_expected_worktree",
+            bounded_rtk_git.command_class,
+        )
+
+    transaction = execute_verified_default_branch_ff_merge_transaction(
+        cwd,
+        bounded_rtk_git.target_branch or "",
+        expected_worktree_realpath=resolution.expected,
+        active_issue_number=issue,
+        remote="origin",
+        timeout=30,
+    )
+    result = GitMutationPolicyResult(
+        status="deny",
+        command_class=bounded_rtk_git.command_class,
+        reason_code=transaction.reason_code,
+        target_branch=transaction.active_branch,
+        local_head=transaction.verified_local_head,
+        current_remote_head=transaction.live_default_branch_oid,
+    )
+    _block_with_reason(
+        _rel(resolution.expected, project_root=project_root),
+        cwd,
+        transaction.reason_code,
+        bounded_rtk_git.command_class,
+        result,
+    )
+
+
 def _decide_bash(
     tool_input: dict, cwd: str, issue: str | None, resolution: "WorktreeResolution", deadline: "object | None" = None
 ) -> None:
@@ -2118,6 +2193,11 @@ def _decide_bash(
         require_active_branch_push=True,
     )
     if bounded_rtk_git is not None:
+        if bounded_rtk_git.command_class == COMMAND_CLASS_RTK_GIT_MERGE_DEFAULT_BRANCH_FF_ONLY:
+            # Issue #1603: default-branch sync lane authorization -- distinct
+            # command class from the active-branch remote-head lane below,
+            # routed through its own trusted transaction. Always exits.
+            _decide_rtk_git_merge_default_branch(bounded_rtk_git, cwd, issue, resolution, _pr)
         if bounded_rtk_git.command_class == COMMAND_CLASS_RTK_GIT_MERGE_FF_ONLY:
             # Issue #1609 fix_delta (P0 Blocker): authorize BEFORE executing
             # the merge transaction -- see _decide_rtk_git_merge. This call

@@ -202,6 +202,23 @@ prefix_rule(
     ],
 )
 
+# Issue #1603: `rtk git merge --ff-only origin/<default-branch>` (default-
+# branch fast-forward sync lane) is, for the same execpolicy most-severe-
+# decision-wins reason documented above, intentionally NOT allowlisted here
+# either. The ONLY allowed, non-prompting path is the dedicated executor
+# script below -- it performs its OWN independent authorization before
+# calling execute_verified_default_branch_ff_merge_transaction (clean linked
+# worktree, live `git ls-remote --symref` default-branch identity, object-
+# only fetch, re-probe, ancestry, postcondition readback).
+prefix_rule(
+    pattern = ["uv", "run", "--locked", "--no-sync", "python3", "scripts/agent-ops/verified_default_branch_ff_merge_exec.py", "--candidate-branch"],
+    decision = "allow",
+    justification = "The verified-default-branch-ff-merge executor performs its own independent authorization (active Issue / matching linked worktree / cwd binding) before calling execute_verified_default_branch_ff_merge_transaction (clean linked worktree, live-verified default-branch identity via git ls-remote --symref, object-only fetch, re-probe, ancestry, postcondition readback) inside a single trusted execution boundary. Malformed invocations (missing flags, extra options, shell wrappers) do not match this exact prefix and fall through to prompt.",
+    match = [
+        "uv run --locked --no-sync python3 scripts/agent-ops/verified_default_branch_ff_merge_exec.py --candidate-branch main",
+    ],
+)
+
 # Other rtk git mutation operations: require explicit human review (prompt)
 prefix_rule(
     pattern = ["rtk", "git", ["checkout", "switch", "worktree", "stash", "merge", "rebase", "cherry-pick", "reset", "restore", "rm", "mv", "clean", "apply", "am", "pull", "fetch", "remote", "tag", "config", "submodule"]],
