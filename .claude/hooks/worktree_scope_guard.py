@@ -69,6 +69,7 @@ from git_mutation_command_policy import (  # noqa: E402
     GitMutationPolicyResult,
     classify_rtk_git_mutation,
     execute_verified_ff_merge_transaction,
+    parse_controlled_git_change_exec_command,
 )
 from hook_repair_hints import render_hook_command_repair_hint, render_publish_safety_stop_report  # noqa: E402
 
@@ -2093,6 +2094,24 @@ def _decide_bash(
     if issue and _is_direct_publish_termination_command(command, _pr):
         _block(_rel(resolution.expected, project_root=_pr) if resolution.expected else "<publish-denied>", cwd)
 
+    # Issue #1611 AC14 (CI repair): the controlled git change executor's
+    # exact invocation is the sole authorized staging/commit path (see
+    # `git_mutation_command_policy.classify_agent_lane_add_commit`, which
+    # denies raw `git add`/`git commit`/`rtk git add`/`rtk git commit`
+    # unconditionally). Its `--cwd` flag, not the PreToolUse `cwd`, is the
+    # operative target -- the caller normally runs it from the root
+    # checkout with `--cwd <linked-issue-worktree>` (mirroring the `uv run
+    # --directory <worktree> git ...` pattern used elsewhere in this repo)
+    # rather than `cd`-ing into the worktree first. Allow only when the
+    # `--cwd` value resolves inside the active issue's resolved worktree;
+    # any other target (main root, a different issue's worktree, an
+    # unresolved/ambiguous worktree) is denied with `worktree_binding_mismatch`.
+    parsed_cgce = parse_controlled_git_change_exec_command(command, _pr)
+    if parsed_cgce is not None:
+        if resolution.expected and is_inside(resolution.expected, parsed_cgce.cwd, cwd):
+            _allow()
+        _block_worktree_binding_mismatch(cwd)
+
     bounded_rtk_git = classify_rtk_git_mutation(
         command=command,
         cwd=cwd,
@@ -2778,6 +2797,23 @@ def _decide_cleanup_bash(command: str, cwd: str, contract: dict | None) -> tuple
         return "allow", "cleanup_branch_delete_ok"
 
     return "deny", "not_a_cleanup_command"
+
+
+def _block_worktree_binding_mismatch(actual_cwd: str) -> None:
+    """Emit a bounded block message for the controlled_git_change_exec.py
+    executor's `--cwd` flag not resolving inside the active issue worktree
+    (Issue #1611 AC14). Uses the same `reason: <code>` bounded-line format
+    `_block_cleanup` below uses, so tooling that greps a stderr line
+    starting with ``reason: `` (e.g. `scripts/ci/codex_execpolicy_matrix.py`)
+    can extract it uniformly across both denial classes.
+    """
+    lines = [
+        "[worktree_scope_guard] blocked: mutation outside active issue worktree",
+        "reason: worktree_binding_mismatch",
+        f"actual_cwd: {actual_cwd or '<unknown>'}",
+    ]
+    sys.stderr.write("\n".join(lines) + "\n")
+    sys.exit(2)
 
 
 def _block_cleanup(reason: str) -> None:
