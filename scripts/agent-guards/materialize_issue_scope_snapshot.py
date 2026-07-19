@@ -202,7 +202,9 @@ def _validate_worktree_binding(project_root: Path, worktree_path: str, branch_na
     return resolved
 
 
-def _load_live_issue(gh_bin: str, issue_number: int, repo: str, project_root: Path, env: Dict[str, str]) -> dict[str, Any]:
+def _load_live_issue(
+    gh_bin: str, issue_number: int, repo: str, project_root: Path, env: Dict[str, str]
+) -> dict[str, Any]:
     raw = _run(
         [gh_bin, "issue", "view", str(issue_number), "--repo", repo, "--json", "body,updatedAt"],
         project_root,
