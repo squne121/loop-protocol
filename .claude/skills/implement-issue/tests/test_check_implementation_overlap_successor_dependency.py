@@ -83,3 +83,68 @@ def test_reverse_direction_current_depends_on_candidate_is_still_predecessor_c2b
     assert result.candidates[0].dependency_relation.relation == "predecessor"
     assert result.verdict == cio.AMBIGUOUS_REQUIRES_HUMAN
     assert result.policy_class == "C2b"
+
+
+# ------------------------------------------------------------
+# #1621 AC2: adapter-level (check_implementation_overlap.py) consumer
+# integration -- candidate raw WITHOUT blockedBy, current native blocking
+# alone must be enough for check_issue_overlap._dependency_relation() to
+# return "successor" (no dependency on the second-stage candidate native
+# dependency readback).
+# ------------------------------------------------------------
+
+import importlib.util as _importlib_util  # noqa: E402
+
+_IMPL_SCRIPT_PATH = (
+    REPO_ROOT / ".claude" / "skills" / "implement-issue" / "scripts" / "check_implementation_overlap.py"
+)
+_impl_spec = _importlib_util.spec_from_file_location(
+    "check_implementation_overlap_successor_dep_adapter", _IMPL_SCRIPT_PATH
+)
+assert _impl_spec is not None and _impl_spec.loader is not None
+impl_module = _importlib_util.module_from_spec(_impl_spec)
+sys.modules[_impl_spec.name] = impl_module
+_impl_spec.loader.exec_module(impl_module)
+
+
+def test_adapter_current_blocking_only_without_candidate_blocked_by_produces_successor_relation() -> None:
+    """#1621 AC2: candidate raw に blockedBy が存在しない状態でも、current の
+    native blocking だけから check_issue_overlap._dependency_relation() が
+    successor を返す（第二段階の candidate native dependency 読み戻しに
+    依存しない）。#1611(current)/#1612(candidate) 相当の adapter 層向け
+    同型 fixture。
+    """
+    current_raw = {
+        "number": 1611,
+        "title": "実装: #1611 側の変更",
+        "body": "## Allowed Paths\n\n- a.py\n",
+        "blocking": [{"repository": "squne121/loop-protocol", "number": 1612, "state": "OPEN"}],
+    }
+    candidate_raw = {
+        "number": 1612,
+        "title": "実装: #1612 側の変更",
+        "body": "## Allowed Paths\n\n- a.py\n",
+        "state": "OPEN",
+        # 注意: blockedBy は意図的に存在しない（AC2 の検証対象）
+    }
+    assert "blockedBy" not in candidate_raw  # precondition
+
+    successor_index = impl_module._current_native_successor_index(current_raw, "squne121/loop-protocol")
+    assert ("squne121/loop-protocol", 1612) in successor_index
+
+    current_scope = cio.IssueScope(
+        title=current_raw["title"],
+        number=current_raw["number"],
+        allowed_paths=("a.py",),
+    )
+    extra_depends_on = (
+        (str(current_raw["number"]),)
+        if ("squne121/loop-protocol", candidate_raw["number"]) in successor_index
+        else ()
+    )
+    candidate_scope = impl_module._issue_scope_from_raw(
+        candidate_raw, current_repo="squne121/loop-protocol", extra_depends_on=extra_depends_on
+    )
+
+    relation = cio._dependency_relation(current_scope, candidate_scope)
+    assert relation.relation == "successor"
