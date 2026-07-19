@@ -629,19 +629,20 @@ def test_unsafe_route_blocks_even_with_hash_match(monkeypatch: pytest.MonkeyPatc
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "source_complete,source_saturated",
-    [(False, False), (True, True)],
-)
-def test_source_degraded_blocks(
-    monkeypatch: pytest.MonkeyPatch, source_complete: bool, source_saturated: bool
-):
+def test_source_incomplete_not_saturated_blocks_as_unsafe_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GIVEN stored/fresh evidence が complete=false / saturated=false
+    （internally-consistent な degraded source: 全件性を未証明のまま停止した
+    ケース）
+    WHEN overlap preflight gate を実行する
+    THEN online 再実行後の safety predicate（`_overlap_preflight_safety_reason`）
+    が E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE で拒否する。
+    """
     _common_monkeypatches(monkeypatch, linked_issue=1458)
     stored = build_stored_evidence(
         decision_inputs_sha256="sha256:" + "b" * 64,
         current_issue_number=1458,
-        source_complete=source_complete,
-        source_saturated=source_saturated,
+        source_complete=False,
+        source_saturated=False,
     )
     evidence_path = write_evidence_file(stored)
     fresh = fresh_evidence_from_stored(stored)
@@ -666,6 +667,56 @@ def test_source_degraded_blocks(
         assert rc == 2
         assert create_called is False
         assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE}" for line in lines), lines
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+def test_source_complete_and_saturated_both_true_is_self_contradictory_and_blocks_early(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GIVEN stored evidence が complete=true かつ saturated=true（producer
+    契約上あり得ない自己矛盾な組み合わせ — complete=true は常に
+    saturated=false を伴う）
+    WHEN overlap preflight gate を実行する
+    THEN PR #1626 review fix_delta の collection contract shape validator
+    （`_overlap_collection_contract_shape_error`）が online 再実行より前に
+    E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID で拒否し、online subprocess を
+    一度も呼ばない。
+    """
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    stored = build_stored_evidence(
+        decision_inputs_sha256="sha256:" + "b" * 64,
+        current_issue_number=1458,
+        source_complete=True,
+        source_saturated=True,
+    )
+    evidence_path = write_evidence_file(stored)
+
+    called = {"count": 0}
+
+    def fail_if_called(cmd, **kwargs):
+        called["count"] += 1
+        raise AssertionError("self-contradictory complete/saturated must block before online recheck")
+
+    monkeypatch.setattr(open_pr.subprocess, "run", fail_if_called)
+
+    try:
+        rc, lines, create_called = _run_main(
+            monkeypatch,
+            1458,
+            [
+                "--overlap-preflight-required",
+                "--overlap-preflight-evidence-file", str(evidence_path),
+                "--overlap-preflight-expected-evidence-sha256", stored["evidence_sha256"],
+                "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
+            ],
+        )
+        assert rc == 2
+        assert create_called is False
+        assert any(
+            line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines
+        ), lines
+        assert called["count"] == 0
     finally:
         evidence_path.unlink(missing_ok=True)
 

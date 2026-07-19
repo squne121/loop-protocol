@@ -701,6 +701,10 @@ def _fetch_implementation_candidates_page(
 ) -> Dict[str, Any]:
     """GraphQL で ``phase/implementation`` OPEN Issue を 1 ページ分取得する
     （#1493）。``cursor`` が None の場合は先頭ページを取得する。
+
+    PR #1626 review fix_delta: トップレベル GraphQL ``errors`` が非空の場合は
+    不正・部分的な応答として fail-closed にする（``errors`` があっても
+    ``data`` に partial な結果が入りうるため、黙って使わない）。
     """
     args = [
         "gh",
@@ -720,6 +724,9 @@ def _fetch_implementation_candidates_page(
     data = _run_gh_json(args)
     if not isinstance(data, dict):
         raise OverlapRuntimeError("gh api graphql did not return a JSON object")
+    top_errors = data.get("errors")
+    if isinstance(top_errors, list) and top_errors:
+        raise OverlapRuntimeError(f"GraphQL response contained top-level errors: {top_errors!r}")
     top_data = data.get("data")
     repository = top_data.get("repository") if isinstance(top_data, dict) else None
     if not isinstance(repository, dict):
@@ -730,9 +737,27 @@ def _fetch_implementation_candidates_page(
     return issues
 
 
+_REQUIRED_GRAPHQL_NODE_KEYS = ("number", "title", "body", "updatedAt", "url")
+
+
+def _validate_graphql_node(node: Any, *, page_count: int) -> Dict[str, Any]:
+    """1 GraphQL issue node を最小 schema validate する（PR #1626 review
+    fix_delta）。object でない、または必須 key を欠く node は黙って通さず
+    fail-closed にする。
+    """
+    if not isinstance(node, dict):
+        raise OverlapRuntimeError(f"malformed GraphQL issue node (page={page_count}): {node!r}")
+    missing = [key for key in _REQUIRED_GRAPHQL_NODE_KEYS if key not in node]
+    if missing:
+        raise OverlapRuntimeError(
+            f"GraphQL issue node missing required key(s) {missing!r} (page={page_count}): {node!r}"
+        )
+    return node
+
+
 def fetch_implementation_candidates(repo: str, limit: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """OPEN かつ ``phase/implementation`` ラベルを持つ Issue を、GraphQL cursor
-    pagination で全件収集する（#1493、AC1/AC2）。
+    pagination で全件収集する（#1493、AC1/AC2、PR #1626 review fix_delta）。
 
     固定件数への到達ではなく ``pageInfo.hasNextPage`` によって全件性を
     証明する。``limit`` は収集総数の safety cap（後方互換のため CLI 既定値は
@@ -741,6 +766,16 @@ def fetch_implementation_candidates(repo: str, limit: int) -> Tuple[List[Dict[st
     例外を投げず、``complete: False`` / ``saturated: True`` を返す（AC2、
     呼び出し側の route 判定へ委譲する）。
 
+    PR #1626 review fix_delta（P1 Blocker）: 各ページのリクエストサイズを
+    ``remaining = limit - len(candidates)`` に基づき
+    ``page_size = min(GRAPHQL_PAGE_SIZE, remaining)`` へ制限し、``--limit``
+    を超過したまま ``complete=True`` を返さないようにする。API が要求した
+    page_size より多い node を返した場合は runtime error として fail-closed
+    にする。``hasNextPage`` は厳密に bool 型のみ許容し、欠落・null・非 bool
+    は拒否する。``hasNextPage=true`` の場合は ``endCursor`` が非空文字列で
+    あることを要求し、直前の cursor と同一の場合も無限ループ防止のため
+    fail-closed にする。
+
     Returns: ``(candidates, source_metadata)``。``source_metadata`` は
     ``collection_mode`` / ``page_size`` / ``page_count`` / ``fetched_count`` /
     ``has_next_page`` / ``complete`` / ``saturated`` を持つ。
@@ -748,6 +783,8 @@ def fetch_implementation_candidates(repo: str, limit: int) -> Tuple[List[Dict[st
     owner, _, name = repo.partition("/")
     if not owner or not name:
         raise OverlapRuntimeError(f"invalid --repo value for GraphQL pagination: {repo!r}")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        raise OverlapRuntimeError(f"--limit must be a positive integer: {limit!r}")
 
     candidates: List[Dict[str, Any]] = []
     cursor: Optional[str] = None
@@ -758,19 +795,54 @@ def fetch_implementation_candidates(repo: str, limit: int) -> Tuple[List[Dict[st
 
     while True:
         page_count += 1
-        issues_page = _fetch_implementation_candidates_page(owner, name, GRAPHQL_PAGE_SIZE, cursor)
+        remaining = limit - len(candidates)
+        if remaining <= 0:
+            # 前ページまでで既に safety cap に到達している。
+            complete = False
+            saturated = True
+            break
+        page_size = min(GRAPHQL_PAGE_SIZE, remaining)
+        issues_page = _fetch_implementation_candidates_page(owner, name, page_size, cursor)
         nodes = issues_page.get("nodes")
         page_info = issues_page.get("pageInfo")
         if not isinstance(nodes, list) or not isinstance(page_info, dict):
             raise OverlapRuntimeError(f"malformed GraphQL issues page (page={page_count}): {issues_page!r}")
-        candidates.extend(nodes)
-        has_next_page = bool(page_info.get("hasNextPage"))
-        cursor = page_info.get("endCursor")
-        if has_next_page and not cursor:
-            # AC2: cursor/pageInfo 不整合は全件性を証明できないため fail-closed。
+        if len(nodes) > page_size:
+            # AC2: API が要求数より多く返した場合は全件性を証明できないため
+            # fail-closed にする（黙って切り詰めない）。
             raise OverlapRuntimeError(
-                f"GraphQL pageInfo inconsistency: hasNextPage=true but endCursor missing (page={page_count})"
+                f"GraphQL returned more nodes ({len(nodes)}) than requested page_size ({page_size}) "
+                f"(page={page_count})"
             )
+        validated_nodes = [_validate_graphql_node(node, page_count=page_count) for node in nodes]
+
+        raw_has_next_page = page_info.get("hasNextPage")
+        if not isinstance(raw_has_next_page, bool):
+            # AC2: hasNextPage 欠落/null/非 bool は安全に拒否する
+            # （厳密な bool 型のみ許容、bool のサブクラスは Python に無いため
+            # isinstance で十分厳密）。
+            raise OverlapRuntimeError(
+                f"GraphQL pageInfo.hasNextPage must be a strict boolean (page={page_count}): {page_info!r}"
+            )
+        has_next_page = raw_has_next_page
+
+        raw_cursor = page_info.get("endCursor")
+        if has_next_page:
+            if not isinstance(raw_cursor, str) or not raw_cursor:
+                # AC2: cursor/pageInfo 不整合は全件性を証明できないため fail-closed。
+                raise OverlapRuntimeError(
+                    f"GraphQL pageInfo inconsistency: hasNextPage=true but endCursor missing/empty "
+                    f"(page={page_count})"
+                )
+            if raw_cursor == cursor:
+                raise OverlapRuntimeError(
+                    f"GraphQL pageInfo returned unchanged endCursor while hasNextPage=true "
+                    f"(page={page_count}); would loop indefinitely"
+                )
+            cursor = raw_cursor
+
+        candidates.extend(validated_nodes)
+
         if not has_next_page:
             complete = True
             saturated = False
@@ -1832,6 +1904,19 @@ def _load_json_file(path: str) -> Any:
         raise OverlapRuntimeError(f"invalid JSON in file: {path}: {exc}") from exc
 
 
+def _positive_int(value: str) -> int:
+    """``--limit`` 用の argparse type: 0 以下・非整数を fail-closed で拒否する
+    （PR #1626 review fix_delta P2 Blocker）。
+    """
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"invalid positive int value: {value!r}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"--limit must be a positive integer (got {parsed})")
+    return parsed
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="check_implementation_overlap.py",
@@ -1841,7 +1926,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--issue-number", required=True, type=int, help="対象 Issue 番号（自己除外に使用）")
     p.add_argument("--repo", help="owner/name（オンライン取得時に必須）")
-    p.add_argument("--limit", type=int, default=DEFAULT_CANDIDATE_LIMIT, help="候補取得上限")
+    p.add_argument("--limit", type=_positive_int, default=DEFAULT_CANDIDATE_LIMIT, help="候補取得上限（正の整数）")
     p.add_argument(
         "--dry-run",
         action="store_true",

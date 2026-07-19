@@ -679,6 +679,48 @@ def _overlap_collection_contract_missing_keys(evidence: dict) -> tuple[str, ...]
     return tuple(key for key in _OVERLAP_COLLECTION_CONTRACT_KEYS if key not in source)
 
 
+# PR #1626 review fix_delta（P2 Blocker）: `_overlap_collection_contract_missing_keys`
+# は必須 field の *有無* しか見ておらず、`collection_mode` 以外の field は
+# stored/fresh 間でも比較されない。改ざんされた `page_size` / `fetched_count`
+# 等の自己矛盾 evidence（例: `fetched_count` が `page_count * page_size` を
+# 超過）を素通りさせないため、1 件の evidence 単体で内部整合性を検証する
+# strict validator を追加する。stored/fresh 双方に適用する。
+_OVERLAP_PAGE_SIZE_UPPER_BOUND = 100
+
+
+def _overlap_collection_contract_shape_error(source: dict) -> str | None:
+    """collection contract の内部整合性を検証する。violation があれば理由
+    文字列、なければ None を返す（PR #1626 review fix_delta P2 Blocker）。
+    """
+    page_size = source.get("page_size")
+    if isinstance(page_size, bool) or not isinstance(page_size, int) or not (1 <= page_size <= _OVERLAP_PAGE_SIZE_UPPER_BOUND):
+        return f"page_size が 1..{_OVERLAP_PAGE_SIZE_UPPER_BOUND} の範囲の整数ではありません: {page_size!r}"
+    page_count = source.get("page_count")
+    if isinstance(page_count, bool) or not isinstance(page_count, int) or page_count < 1:
+        return f"page_count が正の整数ではありません: {page_count!r}"
+    fetched_count = source.get("fetched_count")
+    if isinstance(fetched_count, bool) or not isinstance(fetched_count, int) or fetched_count < 0:
+        return f"fetched_count が非負整数ではありません: {fetched_count!r}"
+    if fetched_count > page_count * page_size:
+        return (
+            f"fetched_count が page_count*page_size を超過しており候補集合と整合しません: "
+            f"fetched_count={fetched_count} page_count={page_count} page_size={page_size}"
+        )
+    has_next_page = source.get("has_next_page")
+    if not isinstance(has_next_page, bool):
+        return f"has_next_page が bool ではありません: {has_next_page!r}"
+    complete = source.get("complete")
+    saturated = source.get("saturated")
+    if complete is True and (has_next_page is not False or saturated is not False):
+        return (
+            f"complete=true なのに has_next_page/saturated が矛盾しています: "
+            f"has_next_page={has_next_page!r} saturated={saturated!r}"
+        )
+    if saturated is True and complete is not False:
+        return f"saturated=true なのに complete=false ではありません: complete={complete!r}"
+    return None
+
+
 def _extract_waiver_from_live_contract(text: str) -> dict | None:
     """live Issue body の waiver 設定だけを読む。
 
@@ -943,6 +985,18 @@ def run_overlap_preflight_gate(
             None,
         )
 
+    # PR #1626 review fix_delta（P2 Blocker）: 必須 field が揃っていても
+    # 改ざんされた自己矛盾 evidence（page_size/fetched_count 等）を通さない。
+    stored_source_for_shape = stored.get("source") if isinstance(stored.get("source"), dict) else {}
+    stored_shape_error = _overlap_collection_contract_shape_error(stored_source_for_shape)
+    if stored_shape_error is not None:
+        return (
+            False,
+            E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID,
+            f"stored evidence の collection contract が自己矛盾しています: {stored_shape_error}",
+            None,
+        )
+
     cmd = [
         sys.executable,
         str(_CHECK_IMPLEMENTATION_OVERLAP_SCRIPT),
@@ -1023,6 +1077,18 @@ def run_overlap_preflight_gate(
             E_OVERLAP_PREFLIGHT_DRIFT,
             f"fresh evidence に collection contract の必須 field がありません: "
             f"{sorted(fresh_missing_contract_keys)}",
+            fresh,
+        )
+
+    # PR #1626 review fix_delta（P2 Blocker）: fresh evidence（オンライン
+    # 再実行の生出力）についても自己矛盾 shape を検証する。
+    fresh_source_for_shape = fresh.get("source") if isinstance(fresh.get("source"), dict) else {}
+    fresh_shape_error = _overlap_collection_contract_shape_error(fresh_source_for_shape)
+    if fresh_shape_error is not None:
+        return (
+            False,
+            E_OVERLAP_PREFLIGHT_DRIFT,
+            f"fresh evidence の collection contract が自己矛盾しています: {fresh_shape_error}",
             fresh,
         )
     stored_source = stored.get("source") if isinstance(stored.get("source"), dict) else {}

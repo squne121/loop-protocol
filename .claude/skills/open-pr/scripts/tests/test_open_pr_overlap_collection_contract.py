@@ -205,3 +205,123 @@ def test_matching_collection_contract_passes(monkeypatch: pytest.MonkeyPatch) ->
 
     assert ok is True, (error_code, detail)
     assert error_code is None
+
+
+def test_stored_evidence_with_fetched_count_exceeding_page_bound_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR #1626 review fix_delta（P2 Blocker）: GIVEN 改ざんされた stored
+    evidence（`fetched_count` が `page_count * page_size` を超過する自己
+    矛盾値）
+    WHEN overlap preflight gate を実行する
+    THEN E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID で online 再実行前に拒否する。
+    """
+    stored = _build_evidence(
+        source_extra={"page_size": 100, "page_count": 1, "fetched_count": 999}
+    )
+    body = {k: v for k, v in stored.items() if k != "evidence_sha256"}
+    stored["evidence_sha256"] = f"sha256:{_sha256(_canonical_json(body))}"
+
+    called = {"count": 0}
+
+    def fail_if_called(cmd, **kwargs):
+        called["count"] += 1
+        raise AssertionError("self-contradictory stored evidence must block before online recheck")
+
+    monkeypatch.setattr(open_pr.subprocess, "run", fail_if_called)
+    evidence_path = _write_evidence(stored)
+    try:
+        ok, error_code, detail, fresh = open_pr.run_overlap_preflight_gate(
+            repo="squne121/loop-protocol",
+            linked_issue=1493,
+            evidence_file=evidence_path,
+            expected_evidence_sha256=stored["evidence_sha256"],
+            expected_decision_inputs_sha256=stored["decision_inputs_sha256"],
+        )
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+    assert ok is False
+    assert error_code == open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID
+    assert "自己矛盾" in detail
+    assert called["count"] == 0
+
+
+def test_stored_evidence_with_out_of_range_page_size_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PR #1626 review fix_delta（P2 Blocker）: `page_size` が 1..100 の
+    範囲外（改ざん）の stored evidence は拒否する。
+    """
+    stored = _build_evidence(source_extra={"page_size": 500})
+    body = {k: v for k, v in stored.items() if k != "evidence_sha256"}
+    stored["evidence_sha256"] = f"sha256:{_sha256(_canonical_json(body))}"
+
+    def fail_if_called(cmd, **kwargs):
+        raise AssertionError("out-of-range page_size must block before online recheck")
+
+    monkeypatch.setattr(open_pr.subprocess, "run", fail_if_called)
+    evidence_path = _write_evidence(stored)
+    try:
+        ok, error_code, detail, fresh = open_pr.run_overlap_preflight_gate(
+            repo="squne121/loop-protocol",
+            linked_issue=1493,
+            evidence_file=evidence_path,
+            expected_evidence_sha256=stored["evidence_sha256"],
+            expected_decision_inputs_sha256=stored["decision_inputs_sha256"],
+        )
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+    assert ok is False
+    assert error_code == open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID
+    assert "page_size" in detail
+
+
+def test_stored_evidence_with_complete_true_but_has_next_page_true_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR #1626 review fix_delta（P2 Blocker）: `complete=true` なのに
+    `has_next_page=true` の矛盾した stored evidence は拒否する。
+    """
+    stored = _build_evidence(source_extra={"has_next_page": True})
+    body = {k: v for k, v in stored.items() if k != "evidence_sha256"}
+    stored["evidence_sha256"] = f"sha256:{_sha256(_canonical_json(body))}"
+
+    def fail_if_called(cmd, **kwargs):
+        raise AssertionError("complete/has_next_page contradiction must block before online recheck")
+
+    monkeypatch.setattr(open_pr.subprocess, "run", fail_if_called)
+    evidence_path = _write_evidence(stored)
+    try:
+        ok, error_code, detail, fresh = open_pr.run_overlap_preflight_gate(
+            repo="squne121/loop-protocol",
+            linked_issue=1493,
+            evidence_file=evidence_path,
+            expected_evidence_sha256=stored["evidence_sha256"],
+            expected_decision_inputs_sha256=stored["decision_inputs_sha256"],
+        )
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+    assert ok is False
+    assert error_code == open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID
+    assert "矛盾" in detail
+
+
+def test_fresh_evidence_with_fetched_count_exceeding_page_bound_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR #1626 review fix_delta（P2 Blocker）: GIVEN 有効な stored evidence
+    だが online 再実行が自己矛盾する fresh evidence（改ざんされた
+    `fetched_count`）を返す
+    WHEN overlap preflight gate を実行する
+    THEN E_OVERLAP_PREFLIGHT_DRIFT で拒否する。
+    """
+    stored = _build_evidence()
+    fresh = json.loads(json.dumps(stored))
+    fresh["source"]["fetched_count"] = 999
+
+    ok, error_code, detail, fresh_out = _run_gate(monkeypatch, stored=stored, fresh=fresh)
+
+    assert ok is False
+    assert error_code == open_pr.E_OVERLAP_PREFLIGHT_DRIFT
+    assert "自己矛盾" in detail
