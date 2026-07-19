@@ -390,65 +390,88 @@ def test_open_issue_source_uses_paginated_api_without_saturation(monkeypatch: ob
 # ---------------------------------------------------------------------------
 
 
+def _graphql_page_response(nodes: "list[dict]", *, has_next_page: bool, end_cursor: "str | None") -> str:
+    return json.dumps(
+        {
+            "data": {
+                "repository": {
+                    "issues": {
+                        "nodes": nodes,
+                        "pageInfo": {"hasNextPage": has_next_page, "endCursor": end_cursor},
+                    }
+                }
+            }
+        }
+    )
+
+
 def test_fetch_implementation_candidates_respects_requested_limit(monkeypatch: object) -> None:
-    """GIVEN a caller-specified --limit
-    WHEN fetch_implementation_candidates() issues its gh issue list call
-    THEN the exact --limit value is forwarded to gh (the collection boundary
-    check_implementation_overlap.py records as evidence `source.limit` is the
-    same bound gh is actually asked to respect — no silent divergence).
+    """GIVEN a caller-specified --limit (safety cap) smaller than the total
+    result count
+    WHEN fetch_implementation_candidates() paginates via GraphQL
+    THEN pagination stops at the safety cap and reports saturated=True /
+    complete=False (#1493: cursor pagination replaces the single `gh issue
+    list --limit` call this test previously asserted against).
     """
     calls: list[list[str]] = []
 
     def fake_run(command: list[str], **_kwargs: object) -> "subprocess.CompletedProcess[str]":
         calls.append(command)
-        data = [{"number": n, "title": f"issue {n}", "body": "body"} for n in range(1, 6)]
-        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(data))
+        nodes = [
+            {
+                "number": n,
+                "title": f"issue {n}",
+                "body": "body",
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "url": "u",
+            }
+            for n in range(1, 6)
+        ]
+        return subprocess.CompletedProcess(
+            command, 0, stdout=_graphql_page_response(nodes, has_next_page=True, end_cursor="cursor-1")
+        )
 
     monkeypatch.setattr("check_implementation_overlap.subprocess.run", fake_run)  # type: ignore[attr-defined]
 
-    candidates, saturated = check_implementation_overlap.fetch_implementation_candidates(DEFAULT_REPO, 5)
+    candidates, source_metadata = check_implementation_overlap.fetch_implementation_candidates(DEFAULT_REPO, 5)
 
-    assert calls == [
-        [
-            "gh",
-            "issue",
-            "list",
-            "--repo",
-            DEFAULT_REPO,
-            "--label",
-            "phase/implementation",
-            "--state",
-            "open",
-            "--json",
-            "number,title,body,labels,updatedAt,url",
-            "--limit",
-            "5",
-        ]
-    ]
+    assert calls, "expected at least one gh api graphql call"
+    assert calls[0][:3] == ["gh", "api", "graphql"]
     assert len(candidates) == 5
-    # len(data) >= limit -> saturated True, matching the evidence contract
-    # that `source.limit` == the requested/enforced boundary.
-    assert saturated is True
+    assert source_metadata["saturated"] is True
+    assert source_metadata["complete"] is False
+    assert source_metadata["collection_mode"] == "exhaustive_cursor_pagination"
 
 
 def test_fetch_implementation_candidates_not_saturated_below_limit(monkeypatch: object) -> None:
-    """GIVEN fewer results than --limit
+    """GIVEN fewer results than --limit (safety cap) and hasNextPage=false
     WHEN fetch_implementation_candidates() runs
-    THEN saturated is False, proving the limit truly bounds (not just labels)
-    the collection — it is not silently ignored while `source.limit` is
-    recorded as if it were enforced.
+    THEN saturated is False and complete is True (#1493: completeness is
+    proven by GraphQL pageInfo.hasNextPage, not by comparing count to limit).
     """
 
     def fake_run(command: list[str], **_kwargs: object) -> "subprocess.CompletedProcess[str]":
-        data = [{"number": n, "title": f"issue {n}", "body": "body"} for n in range(1, 4)]
-        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(data))
+        nodes = [
+            {
+                "number": n,
+                "title": f"issue {n}",
+                "body": "body",
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "url": "u",
+            }
+            for n in range(1, 4)
+        ]
+        return subprocess.CompletedProcess(
+            command, 0, stdout=_graphql_page_response(nodes, has_next_page=False, end_cursor=None)
+        )
 
     monkeypatch.setattr("check_implementation_overlap.subprocess.run", fake_run)  # type: ignore[attr-defined]
 
-    candidates, saturated = check_implementation_overlap.fetch_implementation_candidates(DEFAULT_REPO, 100)
+    candidates, source_metadata = check_implementation_overlap.fetch_implementation_candidates(DEFAULT_REPO, 100)
 
     assert len(candidates) == 3
-    assert saturated is False
+    assert source_metadata["saturated"] is False
+    assert source_metadata["complete"] is True
 
 
 def test_issue_198_and_1326_do_not_force_human_review_via_package_json_alone(tmp_path: Path) -> None:
