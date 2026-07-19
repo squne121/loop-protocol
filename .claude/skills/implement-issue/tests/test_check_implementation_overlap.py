@@ -721,9 +721,10 @@ def _human_c1_comment(
     candidate: dict,
     author_association: str = "OWNER",
     decision: str = "C1/non-conflict",
+    comment_id: int = 9000000001,
 ) -> dict:
     """#1613 の固定 comment schema を作るテスト用 helper。"""
-    url = f"https://github.com/squne121/loop-protocol/issues/{current['number']}#issuecomment-9000000001"
+    url = f"https://github.com/squne121/loop-protocol/issues/{current['number']}#issuecomment-{comment_id}"
     body = "\n".join(
         [
             "```yaml",
@@ -737,7 +738,7 @@ def _human_c1_comment(
     )
     return {
         "body": body,
-        "comment_id": 9000000001,
+        "comment_id": comment_id,
         "comment_url": url,
         "author_login": "squne121",
         "author_association": author_association,
@@ -851,6 +852,66 @@ def test_human_c1_decision_rejects(tmp_path: Path, mutation: Any) -> None:
     assert exit_code == EXIT_OK
     assert payload["route"] == "human_review_required", payload
     assert payload["human_c1_decisions"]["rejected"]
+
+
+def test_human_c1_stale_attempt_is_audit_only_after_later_exact_same_candidate_decision(
+    tmp_path: Path,
+) -> None:
+    """AC1: 同一 candidate の古い hash mismatch は、後続の exact decision が
+    あれば audit evidence に残すだけで route を恒久停止させない。"""
+    current = _current_with_shared_target(tmp_path)
+    candidate = _collision_candidate()
+    stale = _human_c1_comment(current=current, candidate=candidate, comment_id=9000000001)
+    current["body"] += "\n<!-- current body changed after stale decision -->\n"
+    exact = _human_c1_comment(current=current, candidate=candidate, comment_id=9000000002)
+    current["comments"] = [stale, exact]
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [candidate])
+
+    exit_code, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    assert exit_code == EXIT_OK
+    assert payload["route"] == "proceed_with_collision_evidence", payload
+    decisions = payload["human_c1_decisions"]
+    assert decisions["rejected"] == []
+    assert [item["reason"] for item in decisions["ignored_non_routing"]] == [
+        "current_body_sha256_mismatch"
+    ]
+    assert decisions["ignored_non_routing"][0]["parsed_candidate_issue_number"] == candidate["number"]
+    assert decisions["accepted"][0]["comment_id"] == exact["comment_id"]
+
+
+def test_human_c1_accepted_other_candidate_does_not_clear_unresolved_candidate(tmp_path: Path) -> None:
+    """AC2: candidate A の accepted decision は candidate B の collision を
+    解消しないため、route は fail-closed のままである。"""
+    current = _current_with_shared_target(tmp_path)
+    accepted_candidate = _collision_candidate(9771)
+    unresolved_candidate = _collision_candidate(9772)
+    unresolved_candidate["body"] = unresolved_candidate["body"].replace(
+        "## Outcome\n\ncandidate has a structurally colliding result.\n\n", ""
+    )
+    current["comments"] = [
+        _human_c1_comment(current=current, candidate=accepted_candidate, comment_id=9000000001)
+    ]
+    current_file, candidates_file = _write_overlap_inputs(
+        tmp_path, current, [accepted_candidate, unresolved_candidate]
+    )
+
+    exit_code, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    assert exit_code == EXIT_OK
+    assert payload["route"] == "human_review_required", payload
+    assert payload["human_c1_decisions"]["rejected"] == []
+    accepted_evidence = next(
+        item for item in payload["candidates"] if item["issue_number"] == accepted_candidate["number"]
+    )
+    unresolved_evidence = next(
+        item for item in payload["candidates"] if item["issue_number"] == unresolved_candidate["number"]
+    )
+    assert accepted_evidence["human_c1_decision"]["candidate_issue_number"] == str(
+        accepted_candidate["number"]
+    )
+    assert unresolved_evidence["readback_complete"] is False
+    assert "human_c1_decision" not in unresolved_evidence
 
 
 def test_human_c1_decision_does_not_override_duplicate_c2b_or_saturation(tmp_path: Path) -> None:

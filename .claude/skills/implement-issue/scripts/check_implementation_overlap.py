@@ -176,6 +176,10 @@ _HUMAN_C1_DECISION_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 _HUMAN_C1_DECISION_FIELD_RE = re.compile(r"^  ([a-z][a-z0-9_]*):\s*(\S(?:.*\S)?)\s*$")
+_HUMAN_C1_CANDIDATE_LINE_RE = re.compile(
+    r"^\s*candidate_issue_number:\s*[\"']?(?P<number>[1-9][0-9]*)[\"']?\s*$",
+    re.MULTILINE,
+)
 _HUMAN_C1_COMMENT_URL_RE = re.compile(
     r"^https://github\.com/(?P<owner>[^/#]+)/(?P<repo>[^/#]+)/issues/(?P<number>[1-9][0-9]*)"
     r"#issuecomment-[1-9][0-9]*$"
@@ -1217,11 +1221,34 @@ def _decision_rejection(
     raw: Dict[str, Any], reason: str, parsed_candidate_issue_number: Optional[int] = None
 ) -> Dict[str, Any]:
     """Produce the complete, hash-bound rejection evidence required by AC5."""
-    return {
+    if parsed_candidate_issue_number is None:
+        parsed_candidate_issue_number = _claimed_human_c1_candidate_number(raw)
+    rejection = {
         **_comment_metadata(raw),
         "parsed_candidate_issue_number": parsed_candidate_issue_number,
         "reason": reason,
     }
+    # This is internal ordering metadata only.  It is removed before evidence
+    # serialization, after a later exact decision has had the opportunity to
+    # supersede an earlier stale attempt for the same candidate.
+    comment_order = raw.get("_human_c1_comment_order")
+    if isinstance(comment_order, int):
+        rejection["_human_c1_comment_order"] = comment_order
+    return rejection
+
+
+def _claimed_human_c1_candidate_number(raw: Dict[str, Any]) -> Optional[int]:
+    """Best-effort candidate binding for malformed schema-like audit records.
+
+    A malformed record remains fail-closed when its candidate cannot be
+    determined.  When its candidate line is intact, a later exact decision for
+    that *same* candidate may supersede it without erasing the audit record.
+    """
+    body = raw.get("body")
+    if not isinstance(body, str):
+        return None
+    match = _HUMAN_C1_CANDIDATE_LINE_RE.search(body)
+    return int(match.group("number")) if match else None
 
 
 def _validate_human_c1_decisions(
@@ -1270,7 +1297,12 @@ def _validate_human_c1_decisions(
         return result
     seen_candidates: set[int] = set()
 
-    for raw in comments:
+    for comment_order, original_raw in enumerate(comments):
+        raw = (
+            {**original_raw, "_human_c1_comment_order": comment_order}
+            if isinstance(original_raw, dict)
+            else original_raw
+        )
         if not isinstance(raw, dict):
             result["rejected"].append(_decision_rejection({}, "comment_record_invalid"))
             continue
@@ -1313,10 +1345,35 @@ def _validate_human_c1_decisions(
             **fields,
             **_comment_metadata(raw),
             "verified": True,
+            "_human_c1_comment_order": comment_order,
         }
         candidate["human_c1_decision"] = verified
         result["accepted"].append(verified)
         seen_candidates.add(candidate_number)
+
+    # A current exact decision supersedes only earlier rejected attempts for
+    # the same C1 candidate.  Later malformed/duplicate attempts, records
+    # without a trustworthy candidate binding, and every other candidate stay
+    # fail-closed.  This preserves both auditability and candidate-scoped
+    # routing isolation.
+    accepted_order_by_candidate = {
+        int(item["candidate_issue_number"]): item["_human_c1_comment_order"]
+        for item in result["accepted"]
+    }
+    routing_rejections: List[Dict[str, Any]] = []
+    for rejection in result["rejected"]:
+        candidate_number = rejection.get("parsed_candidate_issue_number")
+        rejection_order = rejection.get("_human_c1_comment_order")
+        accepted_order = accepted_order_by_candidate.get(candidate_number)
+        if isinstance(rejection_order, int) and isinstance(accepted_order, int) and rejection_order < accepted_order:
+            result["ignored_non_routing"].append(rejection)
+        else:
+            routing_rejections.append(rejection)
+    result["rejected"] = routing_rejections
+
+    for records in result.values():
+        for record in records:
+            record.pop("_human_c1_comment_order", None)
 
     result["accepted"].sort(key=lambda item: (int(item["candidate_issue_number"]), item["comment_url"] or ""))
     result["rejected"].sort(key=lambda item: ((item.get("comment_url") or ""), item["reason"]))
