@@ -224,12 +224,17 @@ def test_controlled_publisher_comment_id_binding_is_required():
                                 "verify_controlled_publisher_comment_id_binding",
                                 return_value=(True, None),
                             ):
-                                matched_result = _ecs_mod.ensure_contract_snapshot(
-                                    issue_number=_ISSUE_NUMBER,
-                                    repo=_REPO,
-                                    mode="auto",
-                                    do_post=True,
-                                )
+                                with patch.object(
+                                    _ecs_mod,
+                                    "verify_snapshot_authority_postcondition",
+                                    return_value=(True, None),
+                                ):
+                                    matched_result = _ecs_mod.ensure_contract_snapshot(
+                                        issue_number=_ISSUE_NUMBER,
+                                        repo=_REPO,
+                                        mode="auto",
+                                        do_post=True,
+                                    )
 
     assert matched_result["status"] == "ok"
     assert matched_result["contract_snapshot_url"] is not None
@@ -586,12 +591,17 @@ class TestControlledPublisherCommentIdBinding:
                                     "verify_controlled_publisher_comment_id_binding",
                                     return_value=(True, None),
                                 ):
-                                    result = _ecs_mod.ensure_contract_snapshot(
-                                        issue_number=_ISSUE_NUMBER,
-                                        repo=_REPO,
-                                        mode="auto",
-                                        do_post=True,
-                                    )
+                                    with patch.object(
+                                        _ecs_mod,
+                                        "verify_snapshot_authority_postcondition",
+                                        return_value=(True, None),
+                                    ):
+                                        result = _ecs_mod.ensure_contract_snapshot(
+                                            issue_number=_ISSUE_NUMBER,
+                                            repo=_REPO,
+                                            mode="auto",
+                                            do_post=True,
+                                        )
 
         assert result["status"] == "ok"
         assert result["contract_snapshot_url"] == f"{_ISSUE_URL}#issuecomment-9999"
