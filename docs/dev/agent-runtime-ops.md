@@ -234,20 +234,28 @@ codex execpolicy check --pretty --rules .codex/rules/default.rules -- rtk gh iss
 - `instruction surface` として `AGENTS.md` / `CLAUDE.md` が読み込まれているか
 - `codex status` 上で意図しない `sandbox_mode` や CLI override が残っていないか
 
-## CODEX_ALLOWED_PATHS_MODE
+## Codex 編集ガードの filesystem 境界（Native Permission Profile + Protected Paths Policy）
 
-`scripts/check-codex-agents.mjs` の write guard は `CODEX_ALLOWED_PATHS_MODE` 環境変数でモードを制御する。
+Issue #1612 により、`scripts/check-codex-agents.mjs` の write guard から旧 env 駆動モード
+システム（モード選択用 env 変数 1 個・宣言的 allow-list 用 env 変数 1 個・既定モードへの
+legacy boolean alias 1 個の計 3 個）は完全に除去された。編集時（apply_patch / Edit / Write）の
+filesystem 境界は、現在は次の 2 つの独立した仕組みだけで構成される。いずれも env 変数を
+authority として読み取らない。
 
-### モード一覧
+1. **Native permission profile**（`.codex/config.toml` の
+   `[permissions.<profile>.filesystem]`）: プロセス/サンドボックスレベルでの read/write を制御する。
+2. **Protected paths policy の validated mirror**（`isProtectedPath()`、下記）: Issue の
+   Allowed Paths に何が書かれていても、常に deny する保護領域を強制する。
 
-| モード | 説明 | 既定 |
-|---|---|---|
-| `workspace` | repo workspace 内の通常編集を allow。保護 path は常に deny。`CODEX_ALLOWED_PATHS` が設定されている場合は intersect（narrowing）で絞り込む。 | **既定（未設定時）** |
-| `strict` | `CODEX_ALLOWED_PATHS` の明示宣言が必須。未宣言時は全書き込みを deny（fail-closed）。 | — |
-| `shadow` | workspace と同じ allow ロジック + would-block イベントを `.guard_shadow_log.jsonl`（repo root, git 管理外）に記録。 | — |
-| `unknown`（上記以外） | fail-closed（全書き込みを deny）。 | — |
+Issue 単位で宣言された Allowed Paths そのものは、この編集時ガードでは**narrowing しない**
+（Issue #1612 で意図的に廃止）。Allowed Paths の正本判定は PR review 時の独立した
+`git diff` ベースの `allowed_paths_review_gate`（canonical）が担い、git staging/commit 自体は
+`scripts/agent-guards/controlled_git_change_exec.py`（Issue #1611）が担う。旧モード用の env
+変数を設定しても、この編集時ガードの判定には一切影響しない
+（`scripts/agent-guards/tests/test_codex_legacy_env_ignored.py`、AC7 の negative test で
+継続的に検証する）。
 
-### 保護 path（全モード共通・常に deny）
+### 保護 path（常に deny）
 
 - `assets/`
 - `LICENSES/`
@@ -365,31 +373,32 @@ authority にならないことを保証する純粋な決定コアである。`
 されず、常にどちらか一方だけが enforcement を担う（Issue #1611 AC12）。契約改訂前の
 `rollback_to_old` という状態名・自動 fallback を示唆する表現は廃止された。
 
-### 設定方法
+### Rollback（障害時の安全側フォールバック、Issue #1612 AC9）
 
-```bash
-# workspace モードを既定にする（Codex セッション起動時に設定）
-export CODEX_ALLOWED_PATHS_MODE=workspace
+`isProtectedPath()` は `scripts/agent-guards/protected_paths_policy.v1.json` を毎プロセス起動時に
+一度読み込み（`loadProtectedPathsPolicy()`）、スキーマ不一致・空 `rules`・JSON parse 失敗を
+`throw` で fail-closed に扱う。この例外は catch されないため、PreToolUse hook（`--hook-pretool`）
+のプロセス自体が非ゼロ終了する。Codex の hook runner は hook プロセスの異常終了を
+「deny 決定を返せなかった hook」として扱うため、結果的に該当 apply_patch/Edit/Write は
+実行されない（silent allow にはならない）。
 
-# shadow モード（観測用）
-export CODEX_ALLOWED_PATHS_MODE=shadow
+障害発生時（例: JSON SSOT が壊れた・permission profile 定義自体が壊れた）の復旧手順:
 
-# strict モード（明示 path のみ allow）
-export CODEX_ALLOWED_PATHS_MODE=strict
-export CODEX_ALLOWED_PATHS="scripts
-docs/dev"
-```
-
-### 推奨構成
-
-- **CI / 自動化**: `strict` モード（`CODEX_ALLOWED_PATHS` を Issue contract から設定する）
-- **インタラクティブ開発**: `workspace` モード
-- **新規 guard ルール検証**: `shadow` モード（`.guard_shadow_log.jsonl` を確認）
-
-### CODEX_LEGACY_ALLOW_WRITES との関係
-
-`CODEX_LEGACY_ALLOW_WRITES=1` は後方互換のために残すが、内部的に `workspace` モードと同等に統合される。
-新規設定では `CODEX_ALLOWED_PATHS_MODE=workspace` を明示的に使うことを推奨する。
+1. `git diff HEAD -- scripts/agent-guards/protected_paths_policy.v1.json .codex/config.toml`
+   で直近の変更を確認する。
+2. `git checkout HEAD -- scripts/agent-guards/protected_paths_policy.v1.json` （または
+   `.codex/config.toml`）で直前の既知良好状態へ戻す。この 2 ファイルはどちらも Issue #1612 の
+   設計では env override を持たないため、**env 変数による緊急バイパスは存在しない**
+   （旧モード env システム時代のような「モードを切り替えて回避する」手段は意図的に
+   廃止された— fail-closed を維持するための設計判断）。
+3. `node scripts/check-codex-agents.mjs --self-test` で `PROTECTED_PATHS_POLICY_V1 JSON SSOT
+   mirrors` セクションと `protected-path enforcement` セクションが全 PASS することを確認してから
+   Codex セッションを再開する。
+4. 復旧後も編集を続行できない場合は、native permission profile 側（`.codex/config.toml` の
+   `default_permissions` を `loop-protocol-readonly` に切り替える）で Codex agent を読み取り専用に
+   固定し、人間判断を待つ。これは旧 strict モード相当の「宣言なしは
+   全 deny」という以前の fail-closed 挙動と同じ安全側（deny-heavy）の状態を、env 変数ではなく
+   `.codex/config.toml` の恒久設定として再現する。
 
 ### PermissionRequest の remote_write 緩和
 
