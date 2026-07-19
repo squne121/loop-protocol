@@ -180,6 +180,28 @@ prefix_rule(
     ],
 )
 
+# Issue #1609 fix_delta (P1 Blocker): `rtk git merge --ff-only <sha>` itself
+# is intentionally NOT allowlisted here any more. A prefix_rule allowlisting
+# it would ALSO match the broader `["rtk", "git", [..., "merge", ...]]`
+# prompt rule below (execpolicy takes the most severe decision across every
+# matching rule -- forbidden > prompt > allow -- not "first rule wins"), so
+# the exact shape silently resolved to `prompt` regardless of this rule's
+# intent (verified via `codex execpolicy check`). Instead, the ONLY allowed,
+# non-prompting path for this lane is the dedicated executor script below --
+# it performs its OWN independent authorization (active Issue / matching
+# linked worktree / cwd binding) before calling
+# `execute_verified_ff_merge_transaction`, so a bare `rtk git merge` (with or
+# without `--ff-only`) staying in the generic prompt bucket is the correct,
+# safe default.
+prefix_rule(
+    pattern = ["uv", "run", "--locked", "--no-sync", "python3", "scripts/agent-ops/verified_ff_merge_exec.py", "--target-sha"],
+    decision = "allow",
+    justification = "The verified-ff-merge executor performs its own independent authorization (active Issue / matching linked worktree / cwd binding) before calling execute_verified_ff_merge_transaction (clean linked worktree, live-verified remote head, ancestry, postcondition readback) inside a single trusted execution boundary. Malformed invocations (missing flags, extra options, shell wrappers) do not match this exact prefix and fall through to prompt.",
+    match = [
+        "uv run --locked --no-sync python3 scripts/agent-ops/verified_ff_merge_exec.py --target-sha 885087598eac7453544f08e468bc9b8ff6c29cf4",
+    ],
+)
+
 # Other rtk git mutation operations: require explicit human review (prompt)
 prefix_rule(
     pattern = ["rtk", "git", ["checkout", "switch", "worktree", "stash", "merge", "rebase", "cherry-pick", "reset", "restore", "rm", "mv", "clean", "apply", "am", "pull", "fetch", "remote", "tag", "config", "submodule"]],

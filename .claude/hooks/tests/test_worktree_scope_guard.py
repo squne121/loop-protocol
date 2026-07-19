@@ -2943,3 +2943,41 @@ def test_worktree_scope_guard_anchor_matrix_no_split_brain_with_policy_parser(tm
         assert guard_allows == parser_allows, (
             f"split-brain: guard={guard_allows} parser={parser_allows} for {command!r}"
         )
+
+
+# Issue 1609 fix_delta P0 Blocker regression: the merge lane authorization
+# (active Issue resolved, matching worktree count, cwd binding) must run
+# BEFORE any merge transaction executes -- every unauthorized shape below
+# must leave HEAD completely untouched.
+def test_merge_ff_only_authorizes_before_transaction(tmp_path):
+    repo = _make_repo_with_worktree(tmp_path, issue="1609", slug="mergeauth", extra_worktrees=[("1609", "other")])
+    worktree = repo["worktrees"]["1609"]
+    _git("checkout", "-q", "-b", "worktree-issue-1609-mergeauth", cwd=worktree)
+    head_before = _git("rev-parse", "HEAD", cwd=worktree).stdout.strip()
+    fake_sha = "a" * 40
+    command = "rtk git merge --ff-only " + fake_sha
+    payload = _bash_payload(command, str(worktree))
+
+    # (a) no active Issue context at all.
+    r = _run_guard(payload, repo["root"], issue=None)
+    assert r.returncode != 0
+    assert _git("rev-parse", "HEAD", cwd=worktree).stdout.strip() == head_before
+
+    # (b) active Issue set but zero / ambiguous matching worktree for that
+    # number -- "1609" now resolves to TWO worktrees (mergeauth + other).
+    r = _run_guard(payload, repo["root"], issue="1609")
+    assert r.returncode != 0
+    assert _git("rev-parse", "HEAD", cwd=worktree).stdout.strip() == head_before
+
+    # (c) active Issue set to a number with zero matching worktree.
+    r = _run_guard(payload, repo["root"], issue="424242")
+    assert r.returncode != 0
+    assert _git("rev-parse", "HEAD", cwd=worktree).stdout.strip() == head_before
+
+    # (d) cwd outside the expected worktree (the repo root itself).
+    root_head_before = _git("rev-parse", "HEAD", cwd=repo["root"]).stdout.strip()
+    payload_root = _bash_payload(command, str(repo["root"]))
+    r = _run_guard(payload_root, repo["root"], issue="1609")
+    assert r.returncode != 0
+    assert _git("rev-parse", "HEAD", cwd=repo["root"]).stdout.strip() == root_head_before
+    assert _git("rev-parse", "HEAD", cwd=worktree).stdout.strip() == head_before
