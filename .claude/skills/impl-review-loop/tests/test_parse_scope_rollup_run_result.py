@@ -381,7 +381,20 @@ def test_rejected_when_capture_sidecar_is_missing(tmp_path):
 
 def test_ok_when_capture_sidecar_file_matches_assistant_output(tmp_path):
     script_sha = _load_script_sha(PLAN_SCRIPT)
-    marker = _render_marker(script_sha=script_sha)
+    # Legacy v2 runner markers carried the original inputs block but did not
+    # declare query_schema_version or the v3 completeness fields.
+    marker = _render_marker(
+        script_sha=script_sha,
+        overrides={
+            "inputs": {
+                "current_issue_sha256": "deadbeef",
+                "issues_all_sha256": "deadbeef",
+                "prs_all_sha256": "deadbeef",
+                "issue_count": 0,
+                "pr_count": 0,
+            }
+        },
+    )
     with NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
         tmp.write(marker)
         output_path = Path(tmp.name)
@@ -479,6 +492,174 @@ def test_rejected_when_capture_sha_mismatches(tmp_path):
         parsed = yaml.safe_load(result.stdout)["SCOPE_ROLLUP_MARKER_PARSE_RESULT_V1"]
         assert parsed["status"] == "rejected"
         assert parsed["reject_reason"] == "capture_sha_mismatch"
+    finally:
+        output_path.unlink(missing_ok=True)
+        sidecar_path.unlink(missing_ok=True)
+
+
+def _full_v3_completeness_block(item_count: int = 2) -> Dict[str, Any]:
+    return {
+        "page_count": 1,
+        "item_count": item_count,
+        "total_count": item_count,
+        "pagination_complete": True,
+        "sha256": "a" * 64,
+    }
+
+
+def _full_v3_budget_block() -> Dict[str, Any]:
+    return {
+        "page_count": 3,
+        "response_bytes": 1234,
+        "inventory_items": 2,
+        "max_transaction_pages": 200,
+        "max_response_bytes": 32_000_000,
+        "max_inventory_items": 10_000,
+        "deadline_seconds": 120.0,
+    }
+
+
+def test_rejected_when_marker_schema_version_3_has_no_inputs_block(tmp_path):
+    """PR #1643 review (P0-3): the CURRENT runner always stamps
+    marker_schema_version: 3. A marker declaring that discriminator must
+    never be accepted as a "legacy v2" marker merely because `inputs` was
+    stripped entirely -- that is exactly the silent-downgrade this contract
+    must close."""
+    script_sha = _load_script_sha(PLAN_SCRIPT)
+    marker = _render_marker(
+        script_sha=script_sha,
+        overrides={"marker_schema_version": 3},
+    )
+    result = _run_parser(
+        marker,
+        expected_script_sha=script_sha,
+        requested_at="2026-06-13T10:00:00+00:00",
+    )
+    assert result["status"] == "rejected"
+    assert result["reject_reason"] == "inventory_completeness_contract_invalid"
+
+
+def test_rejected_when_marker_schema_version_3_strips_only_query_schema_version(tmp_path):
+    """A marker_schema_version: 3 marker that keeps every OTHER v3
+    completeness/budget field but deletes just `query_schema_version` from
+    `inputs` must still be rejected -- this is the exact gap the old
+    `"query_schema_version" in inputs` gate left open."""
+    script_sha = _load_script_sha(PLAN_SCRIPT)
+    marker = _render_marker(
+        script_sha=script_sha,
+        overrides={
+            "marker_schema_version": 3,
+            "inputs": {
+                "current_issue_sha256": "deadbeef",
+                "issues_all_sha256": "deadbeef",
+                "prs_all_sha256": "deadbeef",
+                "issue_count": 2,
+                "pr_count": 0,
+                # "query_schema_version": 3,  -- deliberately stripped
+                "issues_completeness": _full_v3_completeness_block(2),
+                "pull_requests_completeness": _full_v3_completeness_block(0),
+                "transaction_budget": _full_v3_budget_block(),
+            },
+        },
+    )
+    result = _run_parser(
+        marker,
+        expected_script_sha=script_sha,
+        requested_at="2026-06-13T10:00:00+00:00",
+    )
+    assert result["status"] == "rejected"
+    assert result["reject_reason"] == "inventory_completeness_contract_invalid"
+
+
+def test_rejected_when_marker_schema_version_unsupported(tmp_path):
+    script_sha = _load_script_sha(PLAN_SCRIPT)
+    marker = _render_marker(
+        script_sha=script_sha,
+        overrides={"marker_schema_version": 99},
+    )
+    result = _run_parser(
+        marker,
+        expected_script_sha=script_sha,
+        requested_at="2026-06-13T10:00:00+00:00",
+    )
+    assert result["status"] == "rejected"
+    assert result["reject_reason"] == "marker_schema_version_unsupported"
+
+
+def test_ok_when_marker_schema_version_3_has_full_completeness_contract(tmp_path):
+    """Positive counterpart: a marker_schema_version: 3 marker WITH the full
+    completeness/budget contract present is accepted."""
+    script_sha = _load_script_sha(PLAN_SCRIPT)
+    marker = _render_marker(
+        script_sha=script_sha,
+        overrides={
+            "marker_schema_version": 3,
+            "inputs": {
+                "current_issue_sha256": "deadbeef",
+                "issues_all_sha256": "deadbeef",
+                "prs_all_sha256": "deadbeef",
+                "issue_count": 2,
+                "pr_count": 0,
+                "query_schema_version": 3,
+                "issues_completeness": _full_v3_completeness_block(2),
+                "pull_requests_completeness": _full_v3_completeness_block(0),
+                "transaction_budget": _full_v3_budget_block(),
+            },
+        },
+    )
+    with NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
+        tmp.write(marker)
+        output_path = Path(tmp.name)
+    sidecar_path = output_path.with_suffix(".capture.yaml")
+    sidecar_path.write_text(_render_capture_sidecar(output_path), encoding="utf-8")
+    try:
+        result = _run_parser_cli(
+            output_path,
+            sidecar_path,
+            expected_script_sha=script_sha,
+            requested_at="2026-06-13T10:00:00+00:00",
+        )
+        assert result.returncode == 0, result.stderr
+        parsed = yaml.safe_load(result.stdout)["SCOPE_ROLLUP_MARKER_PARSE_RESULT_V1"]
+        assert parsed["status"] == "ok"
+    finally:
+        output_path.unlink(missing_ok=True)
+        sidecar_path.unlink(missing_ok=True)
+
+
+def test_ok_when_marker_schema_version_2_explicit_legacy_without_completeness(tmp_path):
+    """An explicit marker_schema_version: 2 marker is accepted without the
+    v3 completeness contract (explicit legacy discriminator, distinct from
+    the absent-field legacy path)."""
+    script_sha = _load_script_sha(PLAN_SCRIPT)
+    marker = _render_marker(
+        script_sha=script_sha,
+        overrides={
+            "marker_schema_version": 2,
+            "inputs": {
+                "current_issue_sha256": "deadbeef",
+                "issues_all_sha256": "deadbeef",
+                "prs_all_sha256": "deadbeef",
+                "issue_count": 0,
+                "pr_count": 0,
+            },
+        },
+    )
+    with NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
+        tmp.write(marker)
+        output_path = Path(tmp.name)
+    sidecar_path = output_path.with_suffix(".capture.yaml")
+    sidecar_path.write_text(_render_capture_sidecar(output_path), encoding="utf-8")
+    try:
+        result = _run_parser_cli(
+            output_path,
+            sidecar_path,
+            expected_script_sha=script_sha,
+            requested_at="2026-06-13T10:00:00+00:00",
+        )
+        assert result.returncode == 0, result.stderr
+        parsed = yaml.safe_load(result.stdout)["SCOPE_ROLLUP_MARKER_PARSE_RESULT_V1"]
+        assert parsed["status"] == "ok"
     finally:
         output_path.unlink(missing_ok=True)
         sidecar_path.unlink(missing_ok=True)
