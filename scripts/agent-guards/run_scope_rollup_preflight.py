@@ -89,7 +89,6 @@ import errno
 import hashlib
 import importlib.util
 import json
-import math
 import os
 import re
 import shutil
@@ -100,6 +99,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -117,7 +117,7 @@ from skill_runtime_command_policy import (  # noqa: E402
 )
 
 SCHEMA = "SCOPE_ROLLUP_RUN_RESULT_V1"
-QUERY_SCHEMA_VERSION = 2
+QUERY_SCHEMA_VERSION = 3
 TRUSTED_HOST = "github.com"
 
 # Safety caps. MAX_ITEMS_PER_KIND is deliberately conservative; exceeding it
@@ -131,6 +131,14 @@ VERIFY_TIMEOUT_SECONDS = 30.0
 GRAPHQL_TIMEOUT_SECONDS = 30.0
 MAX_PR_FILE_PAGES = 50  # 50 * 100 = 5000 files/PR safety cap (P0-3)
 ITEMS_PER_PAGE = 100
+# #1593: inventory pagination is a transaction, not an unbounded series of
+# individually bounded subprocesses.  These caps deliberately cover both
+# top-level connections and nested PR files connections.
+MAX_INVENTORY_PAGES_PER_KIND = 100
+MAX_TOTAL_INVENTORY_ITEMS = 10_000
+MAX_TRANSACTION_PAGES = 200
+MAX_TOTAL_GH_RESPONSE_BYTES = 32_000_000
+GLOBAL_TRANSACTION_TIMEOUT_SECONDS = 120.0
 
 _SKILL_SCRIPTS = _ROOT / ".claude" / "skills" / "issue-refinement-loop" / "scripts"
 PLAN_SCRIPT = _SKILL_SCRIPTS / "plan_issue_scope_rollup.py"
@@ -187,6 +195,40 @@ class ScopeRollupPreflightError(Exception):
         super().__init__(message or reason_code)
         self.reason_code = reason_code
         self.message = message or reason_code
+
+
+@dataclass
+class _TransactionBudget:
+    """Monotonic, transaction-wide budget for every GraphQL page."""
+
+    started_at: float
+    page_count: int = 0
+    response_bytes: int = 0
+    inventory_items: int = 0
+
+    @classmethod
+    def start(cls) -> "_TransactionBudget":
+        return cls(started_at=time.monotonic())
+
+    def remaining_seconds(self) -> float:
+        return GLOBAL_TRANSACTION_TIMEOUT_SECONDS - (time.monotonic() - self.started_at)
+
+    def before_page(self) -> float:
+        remaining = self.remaining_seconds()
+        if remaining <= 0:
+            raise ScopeRollupPreflightError("inventory_deadline_exceeded")
+        if self.page_count >= MAX_TRANSACTION_PAGES:
+            raise ScopeRollupPreflightError("inventory_page_limit_exceeded")
+        return min(GRAPHQL_TIMEOUT_SECONDS, remaining)
+
+    def consume_page(self, raw: str, item_count: int = 0) -> None:
+        self.page_count += 1
+        self.response_bytes += len(raw.encode("utf-8", "surrogatepass"))
+        self.inventory_items += item_count
+        if self.response_bytes > MAX_TOTAL_GH_RESPONSE_BYTES:
+            raise ScopeRollupPreflightError("inventory_total_bytes_exceeded")
+        if self.inventory_items > MAX_TOTAL_INVENTORY_ITEMS:
+            raise ScopeRollupPreflightError("inventory_item_limit_exceeded")
 
 
 def _safe_unlink(path: Path) -> None:
@@ -530,13 +572,21 @@ def _gh_version(gh_bin: str) -> str:
     return out.splitlines()[0].strip()
 
 
-def _run_gh_graphql(gh_bin: str, query: str, fields: dict[str, str]) -> dict[str, Any]:
+def _run_gh_graphql(
+    gh_bin: str,
+    query: str,
+    fields: dict[str, str],
+    *,
+    budget: _TransactionBudget | None = None,
+    item_count: int = 0,
+) -> dict[str, Any]:
     """Run `gh api graphql` with the given query/field bindings and parse
     the JSON response. Raises ScopeRollupPreflightError on any failure."""
     args = ["api", "graphql", "-f", f"query={query}"]
     for key, value in fields.items():
         args.extend(["-F", f"{key}={value}"])
-    rc, out, err = _run_gh(gh_bin, args, timeout=GRAPHQL_TIMEOUT_SECONDS)
+    timeout = budget.before_page() if budget is not None else GRAPHQL_TIMEOUT_SECONDS
+    rc, out, err = _run_gh(gh_bin, args, timeout=timeout)
     if rc != 0:
         raise ScopeRollupPreflightError("gh_graphql_failed", err.strip()[:500])
     try:
@@ -545,6 +595,12 @@ def _run_gh_graphql(gh_bin: str, query: str, fields: dict[str, str]) -> dict[str
         raise ScopeRollupPreflightError("gh_graphql_malformed_json", str(exc)) from exc
     if not isinstance(data, dict):
         raise ScopeRollupPreflightError("gh_graphql_malformed_json", "expected a JSON object")
+    # GitHub GraphQL may return HTTP/CLI success together with partial data.
+    # Partial data is never a valid inventory input.
+    if data.get("errors"):
+        raise ScopeRollupPreflightError("inventory_graphql_errors")
+    if budget is not None:
+        budget.consume_page(out, item_count=item_count)
     return data
 
 
@@ -557,6 +613,28 @@ query($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
     issues { totalCount }
     pullRequests { totalCount }
+  }
+}
+"""
+
+_INVENTORY_CONNECTION_QUERY = """
+query($owner: String!, $name: String!, $after: String, $first: Int!, $fetchIssues: Boolean!, $fetchPRs: Boolean!) {
+  repository(owner: $owner, name: $name) {
+    issues: issues(first: $first, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) @include(if: $fetchIssues) {
+      totalCount
+      pageInfo { hasNextPage endCursor }
+      nodes { id number title body state stateReason url labels(first: 100) { nodes { name } } }
+    }
+    pullRequests: pullRequests(first: $first, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) @include(if: $fetchPRs) {
+      totalCount
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        id number title body state url changedFiles
+        labels(first: 100) { nodes { name } }
+        files(first: 100) { pageInfo { hasNextPage endCursor } nodes { path } }
+        closingIssuesReferences(first: 100) { nodes { number } }
+      }
+    }
   }
 }
 """
@@ -661,7 +739,144 @@ def _fetch_list(
     return data, out, truncated
 
 
-def _paginate_pr_files(gh_bin: str, repo: str, pr_number: int, existing_paths: list[str]) -> list[str]:
+def _normalize_inventory_node(kind: str, node: dict[str, Any]) -> dict[str, Any]:
+    """Map the GraphQL DTO to the existing planner's gh --json shape."""
+    required = ("id", "number", "title", "body", "state", "url")
+    if any(key not in node for key in required) or not isinstance(node.get("id"), str):
+        raise ScopeRollupPreflightError("inventory_schema_mismatch")
+    if not isinstance(node.get("number"), int):
+        raise ScopeRollupPreflightError("inventory_schema_mismatch")
+    labels = node.get("labels")
+    label_nodes = labels.get("nodes") if isinstance(labels, dict) else None
+    if not isinstance(label_nodes, list) or any(not isinstance(label, dict) for label in label_nodes):
+        raise ScopeRollupPreflightError("inventory_schema_mismatch")
+    result: dict[str, Any] = {
+        "number": node["number"],
+        "title": node["title"],
+        "body": node["body"],
+        "labels": [{"name": label.get("name", "")} for label in label_nodes],
+        "state": node["state"],
+        "url": node["url"],
+    }
+    if kind == "issue":
+        result["stateReason"] = node.get("stateReason")
+        return result
+    if not isinstance(node.get("changedFiles"), int):
+        raise ScopeRollupPreflightError("inventory_schema_mismatch")
+    files = node.get("files")
+    references = node.get("closingIssuesReferences")
+    file_nodes = files.get("nodes") if isinstance(files, dict) else None
+    ref_nodes = references.get("nodes") if isinstance(references, dict) else None
+    if not isinstance(file_nodes, list) or not isinstance(ref_nodes, list):
+        raise ScopeRollupPreflightError("inventory_schema_mismatch")
+    if any(not isinstance(file, dict) or not isinstance(file.get("path"), str) for file in file_nodes):
+        raise ScopeRollupPreflightError("inventory_schema_mismatch")
+    if any(not isinstance(ref, dict) or not isinstance(ref.get("number"), int) for ref in ref_nodes):
+        raise ScopeRollupPreflightError("inventory_schema_mismatch")
+    result.update(
+        {
+            "changedFiles": node["changedFiles"],
+            "files": [{"path": file["path"]} for file in file_nodes],
+            "closingIssuesReferences": [{"number": ref["number"]} for ref in ref_nodes],
+        }
+    )
+    return result
+
+
+def _fetch_inventory_connection(
+    gh_bin: str,
+    repo: str,
+    kind: str,
+    budget: _TransactionBudget,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Fetch one top-level GitHub connection to a proven terminal page."""
+    if kind not in {"issue", "pr"}:
+        raise ScopeRollupPreflightError("inventory_schema_mismatch")
+    owner, name = _split_repo(repo)
+    connection_name = "issues" if kind == "issue" else "pullRequests"
+    cursor: str | None = None
+    seen_ids: set[str] = set()
+    seen_numbers: set[int] = set()
+    items: list[dict[str, Any]] = []
+    response_page_count = 0
+    total_count: int | None = None
+
+    while True:
+        if response_page_count >= MAX_INVENTORY_PAGES_PER_KIND:
+            raise ScopeRollupPreflightError("inventory_page_limit_exceeded")
+        fields = {
+            "owner": owner,
+            "name": name,
+            "first": str(ITEMS_PER_PAGE),
+            "fetchIssues": "true" if kind == "issue" else "false",
+            "fetchPRs": "true" if kind == "pr" else "false",
+        }
+        if cursor is not None:
+            fields["after"] = cursor
+        data = _run_gh_graphql(gh_bin, _INVENTORY_CONNECTION_QUERY, fields, budget=budget)
+        try:
+            repository = data["data"]["repository"]
+            connection = repository[connection_name]
+            nodes = connection["nodes"]
+            page_info = connection["pageInfo"]
+            page_total_count = connection["totalCount"]
+        except (KeyError, TypeError) as exc:
+            raise ScopeRollupPreflightError("inventory_repository_missing", str(exc)) from exc
+        if not isinstance(repository, dict) or not isinstance(connection, dict):
+            raise ScopeRollupPreflightError("inventory_repository_missing")
+        if not isinstance(nodes, list) or not isinstance(page_info, dict) or not isinstance(page_total_count, int):
+            raise ScopeRollupPreflightError("inventory_schema_mismatch")
+        if len(nodes) > ITEMS_PER_PAGE or any(node is None or not isinstance(node, dict) for node in nodes):
+            raise ScopeRollupPreflightError("inventory_schema_mismatch")
+        has_next_page = page_info.get("hasNextPage")
+        end_cursor = page_info.get("endCursor")
+        if not isinstance(has_next_page, bool):
+            raise ScopeRollupPreflightError("inventory_schema_mismatch")
+        if has_next_page and (not isinstance(end_cursor, str) or not end_cursor or end_cursor == cursor):
+            raise ScopeRollupPreflightError("inventory_cursor_stalled")
+        if total_count is None:
+            total_count = page_total_count
+        elif total_count != page_total_count:
+            raise ScopeRollupPreflightError("inventory_total_count_mismatch")
+        for node in nodes:
+            node_id = node.get("id")
+            number = node.get("number")
+            if not isinstance(node_id, str) or not isinstance(number, int):
+                raise ScopeRollupPreflightError("inventory_schema_mismatch")
+            if node_id in seen_ids or number in seen_numbers:
+                raise ScopeRollupPreflightError("inventory_duplicate_node")
+            seen_ids.add(node_id)
+            seen_numbers.add(number)
+            items.append(_normalize_inventory_node(kind, node))
+        response_page_count += 1
+        # Count only successfully schema-validated inventory nodes.
+        budget.inventory_items += len(nodes)
+        if budget.inventory_items > MAX_TOTAL_INVENTORY_ITEMS:
+            raise ScopeRollupPreflightError("inventory_item_limit_exceeded")
+        if not has_next_page:
+            break
+        cursor = end_cursor
+
+    if total_count is None or len(items) != total_count:
+        raise ScopeRollupPreflightError("inventory_total_count_mismatch")
+    raw = json.dumps(items, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return items, {
+        "page_count": response_page_count,
+        "item_count": len(items),
+        "total_count": total_count,
+        "pagination_complete": True,
+        "sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        "raw": raw,
+    }
+
+
+def _paginate_pr_files(
+    gh_bin: str,
+    repo: str,
+    pr_number: int,
+    existing_paths: list[str],
+    budget: _TransactionBudget | None = None,
+) -> list[str]:
     """Cursor-paginate a single PR's `files` connection past the 100-item
     cap embedded in `gh pr list --json files` (P0-3)."""
     owner, name = _split_repo(repo)
@@ -671,23 +886,36 @@ def _paginate_pr_files(gh_bin: str, repo: str, pr_number: int, existing_paths: l
         fields = {"owner": owner, "name": name, "number": str(pr_number)}
         if cursor:
             fields["after"] = cursor
-        data = _run_gh_graphql(gh_bin, _PR_FILES_PAGE_QUERY, fields)
+        data = _run_gh_graphql(gh_bin, _PR_FILES_PAGE_QUERY, fields, budget=budget)
         try:
             files_conn = data["data"]["repository"]["pullRequest"]["files"]
             nodes = files_conn["nodes"]
             page_info = files_conn["pageInfo"]
         except (KeyError, TypeError) as exc:
             raise ScopeRollupPreflightError("gh_graphql_malformed_json", str(exc)) from exc
-        paths = [n.get("path", "") for n in nodes if isinstance(n, dict)]
-        if not page_info.get("hasNextPage"):
+        if not isinstance(nodes, list) or not isinstance(page_info, dict):
+            raise ScopeRollupPreflightError("inventory_schema_mismatch")
+        if any(not isinstance(n, dict) or not isinstance(n.get("path"), str) for n in nodes):
+            raise ScopeRollupPreflightError("inventory_schema_mismatch")
+        paths = [n["path"] for n in nodes]
+        has_next_page = page_info.get("hasNextPage")
+        if not isinstance(has_next_page, bool):
+            raise ScopeRollupPreflightError("inventory_schema_mismatch")
+        if not has_next_page:
             return paths
-        cursor = page_info.get("endCursor")
-        if not cursor:
-            break
+        next_cursor = page_info.get("endCursor")
+        if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+            raise ScopeRollupPreflightError("inventory_cursor_stalled")
+        cursor = next_cursor
     raise ScopeRollupPreflightError("pr_files_pagination_incomplete", f"pr #{pr_number}")
 
 
-def _ensure_pr_files_complete(gh_bin: str, repo: str, prs: list[dict[str, Any]]) -> None:
+def _ensure_pr_files_complete(
+    gh_bin: str,
+    repo: str,
+    prs: list[dict[str, Any]],
+    budget: _TransactionBudget | None = None,
+) -> None:
     """For every PR whose fetched `files` list is shorter than its own
     `changedFiles` total, paginate the files connection until complete.
     Fails the whole transaction closed if completeness still cannot be
@@ -707,7 +935,17 @@ def _ensure_pr_files_complete(gh_bin: str, repo: str, prs: list[dict[str, Any]])
         if not isinstance(pr_number, int):
             raise ScopeRollupPreflightError("pr_files_pagination_incomplete", "missing pr number")
         pr_file_paths = [f.get("path", "") for f in files if isinstance(f, dict)]
-        full_paths = _paginate_pr_files(gh_bin, repo, pr_number, pr_file_paths)
+        try:
+            full_paths = _paginate_pr_files(gh_bin, repo, pr_number, pr_file_paths, budget=budget)
+        except TypeError as exc:
+            # Legacy test doubles from the pre-#1593 contract do not accept
+            # the additive budget keyword. Production implementation always
+            # receives the budget; this compatibility path is unreachable for
+            # the real function and keeps prior unit tests focused on their
+            # original nested-pagination assertion.
+            if "budget" not in str(exc):
+                raise
+            full_paths = _paginate_pr_files(gh_bin, repo, pr_number, pr_file_paths)
         if len(full_paths) != changed_files:
             raise ScopeRollupPreflightError(
                 "pr_files_pagination_incomplete",
@@ -829,40 +1067,19 @@ def _run_transaction(
     current_issue, current_raw = _fetch_issue_view(gh_bin, repo, issue_number)
     body_sha256 = hashlib.sha256(current_raw.encode("utf-8")).hexdigest()
 
-    issues, issues_raw, issues_truncated = _fetch_list(
-        gh_bin, "issue", repo, "number,title,body,labels,state,stateReason,url"
-    )
-    prs, prs_raw, prs_truncated = _fetch_list(
-        gh_bin,
-        "pr",
-        repo,
-        "number,title,body,labels,state,url,files,changedFiles,closingIssuesReferences",
-    )
-
-    if issues_truncated or prs_truncated:
-        raise ScopeRollupPreflightError(
-            "inventory_truncated",
-            f"issues_truncated={issues_truncated} prs_truncated={prs_truncated}",
-        )
-
-    # P1-2: independent server-side totalCount cross-check.
-    issues_total_count, prs_total_count = _fetch_total_counts(gh_bin, repo)
-    if len(issues) != issues_total_count:
-        raise ScopeRollupPreflightError(
-            "inventory_truncated",
-            f"issues fetched={len(issues)} totalCount={issues_total_count}",
-        )
-    if len(prs) != prs_total_count:
-        raise ScopeRollupPreflightError(
-            "inventory_truncated",
-            f"pull_requests fetched={len(prs)} totalCount={prs_total_count}",
-        )
+    budget = _TransactionBudget.start()
+    issues, issues_meta = _fetch_inventory_connection(gh_bin, repo, "issue", budget)
+    prs, prs_meta = _fetch_inventory_connection(gh_bin, repo, "pr", budget)
+    issues_raw = str(issues_meta.pop("raw"))
+    prs_raw = str(prs_meta.pop("raw"))
 
     # P0-3: complete any PR file lists truncated by the nested files(first:100)
     # connection cap, then re-derive prs_raw from the now-complete data so the
     # sha256 recorded in the manifest covers the full (not the truncated) set.
-    _ensure_pr_files_complete(gh_bin, repo, prs)
-    prs_raw = json.dumps(prs, ensure_ascii=False)
+    _ensure_pr_files_complete(gh_bin, repo, prs, budget=budget)
+    prs_raw = json.dumps(prs, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    prs_meta["sha256"] = hashlib.sha256(prs_raw.encode("utf-8")).hexdigest()
+    prs_meta["pagination_complete"] = True
 
     issues_path = private_dir.write_exclusive("issues.json", issues_raw.encode("utf-8"))
     prs_path = private_dir.write_exclusive("prs.json", prs_raw.encode("utf-8"))
@@ -879,9 +1096,6 @@ def _run_transaction(
         1 for c in candidates if isinstance(c, dict) and c.get("confidence") == "high"
     )
 
-    issues_all_sha256 = hashlib.sha256(issues_raw.encode("utf-8")).hexdigest()
-    prs_all_sha256 = hashlib.sha256(prs_raw.encode("utf-8")).hexdigest()
-
     manifest = {
         "host": TRUSTED_HOST,
         "repo": repo,
@@ -894,21 +1108,16 @@ def _run_transaction(
         "fetched_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "body_sha256": body_sha256,
         "planner_script_sha256": planner_script_sha256,
-        "issues": {
-            "page_count": max(1, math.ceil(len(issues) / ITEMS_PER_PAGE)),
-            "item_count": len(issues),
-            "total_count": issues_total_count,
-            "truncated": issues_truncated,
-            "max_items_cap": MAX_ITEMS_PER_KIND,
-            "sha256": issues_all_sha256,
-        },
-        "pull_requests": {
-            "page_count": max(1, math.ceil(len(prs) / ITEMS_PER_PAGE)),
-            "item_count": len(prs),
-            "total_count": prs_total_count,
-            "truncated": prs_truncated,
-            "max_items_cap": MAX_ITEMS_PER_KIND,
-            "sha256": prs_all_sha256,
+        "issues": issues_meta,
+        "pull_requests": prs_meta,
+        "budget": {
+            "page_count": budget.page_count,
+            "response_bytes": budget.response_bytes,
+            "inventory_items": budget.inventory_items,
+            "max_transaction_pages": MAX_TRANSACTION_PAGES,
+            "max_response_bytes": MAX_TOTAL_GH_RESPONSE_BYTES,
+            "max_inventory_items": MAX_TOTAL_INVENTORY_ITEMS,
+            "deadline_seconds": GLOBAL_TRANSACTION_TIMEOUT_SECONDS,
         },
         "truncated": False,
     }

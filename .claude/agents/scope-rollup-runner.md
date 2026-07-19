@@ -103,12 +103,13 @@ SCOPE_ROLLUP_RUN_RESULT_V1:
     requested_at: "<呼び出し元が渡した requested_at そのまま>"
     gh_realpath: "<trusted gh binary realpath>"
     gh_version: "<gh --version 出力先頭行>"
-    query_schema_version: 2
+    query_schema_version: 3
     fetched_at: "<ISO8601>"
     body_sha256: "<current issue view raw stdout の sha256>"
     planner_script_sha256: "<plan_issue_scope_rollup.py の sha256>"
-    issues: {page_count: <int>, item_count: <int>, total_count: <int>, truncated: false, max_items_cap: 500, sha256: "<sha256>"}
-    pull_requests: {page_count: <int>, item_count: <int>, total_count: <int>, truncated: false, max_items_cap: 500, sha256: "<sha256>"}
+    issues: {page_count: <実測 GraphQL page 数>, item_count: <int>, total_count: <int>, pagination_complete: true, sha256: "<canonical DTO sha256>"}
+    pull_requests: {page_count: <実測 GraphQL page 数>, item_count: <int>, total_count: <int>, pagination_complete: true, sha256: "<canonical DTO sha256>"}
+    budget: {page_count: <Issue/PR/nested files の合算>, response_bytes: <int>, inventory_items: <int>, max_transaction_pages: <int>, max_response_bytes: <int>, max_inventory_items: <int>, deadline_seconds: <number>}
     truncated: false
   current_issue: {number: <int>, title: "<str>", state: "<str>", url: "<str>"}
   plan:
@@ -165,6 +166,10 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
     prs_all_sha256: "<SCOPE_ROLLUP_RUN_RESULT_V1.manifest.pull_requests.sha256>"
     issue_count: <SCOPE_ROLLUP_RUN_RESULT_V1.manifest.issues.item_count>
     pr_count: <SCOPE_ROLLUP_RUN_RESULT_V1.manifest.pull_requests.item_count>
+    query_schema_version: 3
+    issues_completeness: <SCOPE_ROLLUP_RUN_RESULT_V1.manifest.issues をそのまま埋め込む>
+    pull_requests_completeness: <SCOPE_ROLLUP_RUN_RESULT_V1.manifest.pull_requests をそのまま埋め込む>
+    transaction_budget: <SCOPE_ROLLUP_RUN_RESULT_V1.manifest.budget をそのまま埋め込む>
   result:
     plan_schema: "ISSUE_SCOPE_ROLLUP_PLAN_V2"  # 後方互換 alias（ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 既存キー）
     plan_schema_name: "<SCOPE_ROLLUP_RUN_RESULT_V1.plan.plan_schema_name>"
@@ -179,6 +184,8 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
 ```
 
 **`invocation_id` / `requested_at` は入力値をそのまま echo する**（executor が独自生成した値ではなく、常に caller 生成値と一致する）。`raw_plan_location` は Issue #1547 以降 `null` 固定（executor が private invocation directory を全経路で cleanup するため永続 artifact が存在しない）。代わりに `result.payload` に `SCOPE_ROLLUP_RUN_RESULT_V1.plan.payload`（candidates を含む plan 全体、self_validation を除く）をそのまま埋め込み、consumer 側（`parse_scope_rollup_run_result.py`）が独立に `result_sha256` を再計算・検証できるようにする。`OUTPUT_BUDGET_V1` は routing-critical な機械可読フィールドの削減を禁止しており、`payload` は marker 採用判定に必須の machine-readable フィールドであるため削らない。
+
+`inputs.query_schema_version == 3`、各 completeness block の `total_count` / 実測 `page_count` / `pagination_complete: true` / `sha256`、および `transaction_budget` は marker の必須 producer/consumer 契約である。欠落・型不正・未完了状態は consumer が fail-close で reject する。GraphQL response の top-level `errors`、malformed connection、null / duplicate node、cursor 不進行、totalCount mismatch、transaction-wide pagination budget / deadline / response-byte cap は executor error とし、raw CLI list への fallback は行わない。
 
 ### 8.5. Final Response Capture Contract（最終応答のキャプチャ契約）
 

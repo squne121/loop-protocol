@@ -33,6 +33,16 @@ REQUIRED_FIELDS_BASE = {
     "script_blob_sha256",
 }
 REQUIRE_RESULT_FIELDS = {"raw_plan_location", "result_sha256", "payload"}
+COMPLETENESS_FIELDS = {"page_count", "item_count", "total_count", "pagination_complete", "sha256"}
+BUDGET_FIELDS = {
+    "page_count",
+    "response_bytes",
+    "inventory_items",
+    "max_transaction_pages",
+    "max_response_bytes",
+    "max_inventory_items",
+    "deadline_seconds",
+}
 
 FENCED_YAML_RE = re.compile(r"```ya?ml[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
@@ -155,6 +165,31 @@ def _compute_payload_sha256(payload: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_bytes).hexdigest()
 
 
+def _has_valid_completeness_contract(inputs: Any) -> bool:
+    if not isinstance(inputs, dict) or inputs.get("query_schema_version") != 3:
+        return False
+    for key in ("issues_completeness", "pull_requests_completeness"):
+        block = inputs.get(key)
+        if not isinstance(block, dict) or not COMPLETENESS_FIELDS.issubset(block):
+            return False
+        if (
+            not isinstance(block["page_count"], int)
+            or block["page_count"] < 1
+            or not isinstance(block["item_count"], int)
+            or block["item_count"] < 0
+            or not isinstance(block["total_count"], int)
+            or block["total_count"] != block["item_count"]
+            or block["pagination_complete"] is not True
+            or not isinstance(block["sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", block["sha256"])
+        ):
+            return False
+    budget = inputs.get("transaction_budget")
+    if not isinstance(budget, dict) or not BUDGET_FIELDS.issubset(budget):
+        return False
+    return all(isinstance(budget[key], (int, float)) and not isinstance(budget[key], bool) for key in BUDGET_FIELDS)
+
+
 def _validate_marker_payload(
     marker_payload: dict[str, Any],
     assistant_output_file: Path,
@@ -209,6 +244,9 @@ def _validate_marker_payload(
 
     if status in {"failed", "runner_unavailable"}:
         return status, None, None, False
+
+    if not _has_valid_completeness_contract(marker_payload.get("inputs")):
+        return "rejected", "scope_rollup_marker_malformed", "inventory_completeness_contract_invalid", False
 
     result_block = marker_payload.get("result")
     if not isinstance(result_block, dict):
