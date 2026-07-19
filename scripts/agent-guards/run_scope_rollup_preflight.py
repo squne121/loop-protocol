@@ -878,13 +878,34 @@ def _paginate_pr_files(
     gh_bin: str,
     repo: str,
     pr_number: int,
-    existing_paths: list[str],
+    changed_files: int,
     budget: _TransactionBudget | None = None,
 ) -> list[str]:
     """Cursor-paginate a single PR's `files` connection past the 100-item
-    cap embedded in `gh pr list --json files` (P0-3)."""
+    cap embedded in the top-level inventory query's ``files(first: 100)``
+    connection (P0-3).
+
+    PR #1643 review (P0-1): this always re-fetches the connection from
+    scratch (``cursor=None``) rather than resuming from the top-level
+    inventory query's first page. The top-level query's own ``endCursor``
+    for this *nested* ``files`` connection is never retained anywhere in the
+    DTO (only the top-level issues/pullRequests connection cursor is
+    tracked), so reusing the caller's already-fetched ``files`` list as a
+    pagination seed would silently corrupt the result the moment page 2 is
+    fetched: every page was being *assigned* into ``paths`` (not
+    accumulated), so only the last page's items ever survived, and any item
+    already present in the caller's seed list was permanently lost. Fully
+    re-deriving the connection here is the simplest correct fix and keeps
+    duplicate-detection and the terminal completeness check anchored to
+    values this function itself observed.
+
+    Rejects duplicate paths (``inventory_duplicate_node``) and fails closed
+    if the terminal page's total item count does not match the PR's own
+    ``changedFiles`` total (``pr_files_pagination_incomplete``).
+    """
     owner, name = _split_repo(repo)
-    paths = list(existing_paths)
+    seen_paths: set[str] = set()
+    paths: list[str] = []
     cursor: str | None = None
     for _page in range(MAX_PR_FILE_PAGES):
         fields = {"owner": owner, "name": name, "number": str(pr_number)}
@@ -901,11 +922,25 @@ def _paginate_pr_files(
             raise ScopeRollupPreflightError("inventory_schema_mismatch")
         if any(not isinstance(n, dict) or not isinstance(n.get("path"), str) for n in nodes):
             raise ScopeRollupPreflightError("inventory_schema_mismatch")
-        paths = [n["path"] for n in nodes]
+        for node in nodes:
+            path = node["path"]
+            if path in seen_paths:
+                raise ScopeRollupPreflightError("inventory_duplicate_node", f"pr #{pr_number}: {path}")
+            seen_paths.add(path)
+            paths.append(path)
+        if budget is not None:
+            budget.inventory_items += len(nodes)
+            if budget.inventory_items > MAX_TOTAL_INVENTORY_ITEMS:
+                raise ScopeRollupPreflightError("inventory_item_limit_exceeded")
         has_next_page = page_info.get("hasNextPage")
         if not isinstance(has_next_page, bool):
             raise ScopeRollupPreflightError("inventory_schema_mismatch")
         if not has_next_page:
+            if len(paths) != changed_files:
+                raise ScopeRollupPreflightError(
+                    "pr_files_pagination_incomplete",
+                    f"pr #{pr_number}: fetched {len(paths)} != changedFiles {changed_files}",
+                )
             return paths
         next_cursor = page_info.get("endCursor")
         if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
@@ -919,11 +954,19 @@ def _ensure_pr_files_complete(
     repo: str,
     prs: list[dict[str, Any]],
     budget: _TransactionBudget | None = None,
-) -> None:
+) -> dict[str, Any]:
     """For every PR whose fetched `files` list is shorter than its own
     `changedFiles` total, paginate the files connection until complete.
     Fails the whole transaction closed if completeness still cannot be
-    proven afterwards (P0-3)."""
+    proven afterwards (P0-3).
+
+    Returns a ``pr_files_completeness`` manifest block (P1-1) recording, for
+    every PR that required nested pagination: the number of pages fetched,
+    the final item count, and the sha256 of the canonical (sorted) file path
+    list -- independent, per-PR completeness evidence rather than only the
+    aggregate ``prs`` sha256 recorded elsewhere in the manifest.
+    """
+    per_pr: dict[str, Any] = {}
     for item in prs:
         if not isinstance(item, dict):
             continue
@@ -938,24 +981,24 @@ def _ensure_pr_files_complete(
         pr_number = item.get("number")
         if not isinstance(pr_number, int):
             raise ScopeRollupPreflightError("pr_files_pagination_incomplete", "missing pr number")
-        pr_file_paths = [f.get("path", "") for f in files if isinstance(f, dict)]
-        try:
-            full_paths = _paginate_pr_files(gh_bin, repo, pr_number, pr_file_paths, budget=budget)
-        except TypeError as exc:
-            # Legacy test doubles from the pre-#1593 contract do not accept
-            # the additive budget keyword. Production implementation always
-            # receives the budget; this compatibility path is unreachable for
-            # the real function and keeps prior unit tests focused on their
-            # original nested-pagination assertion.
-            if "budget" not in str(exc):
-                raise
-            full_paths = _paginate_pr_files(gh_bin, repo, pr_number, pr_file_paths)
-        if len(full_paths) != changed_files:
-            raise ScopeRollupPreflightError(
-                "pr_files_pagination_incomplete",
-                f"pr #{pr_number}: fetched {len(full_paths)} != changedFiles {changed_files}",
-            )
+        pages_before = budget.page_count if budget is not None else 0
+        full_paths = _paginate_pr_files(gh_bin, repo, pr_number, changed_files, budget=budget)
+        pages_after = budget.page_count if budget is not None else 0
         item["files"] = [{"path": p} for p in full_paths]
+        raw = json.dumps(sorted(full_paths), ensure_ascii=False, separators=(",", ":"))
+        per_pr[str(pr_number)] = {
+            "changed_files": changed_files,
+            "item_count": len(full_paths),
+            "page_count": pages_after - pages_before,
+            "sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        }
+    return {
+        "pr_count_checked": len(per_pr),
+        "page_count": sum(v["page_count"] for v in per_pr.values()),
+        "item_count": sum(v["item_count"] for v in per_pr.values()),
+        "pagination_complete": True,
+        "per_pr": per_pr,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1080,7 +1123,7 @@ def _run_transaction(
     # P0-3: complete any PR file lists truncated by the nested files(first:100)
     # connection cap, then re-derive prs_raw from the now-complete data so the
     # sha256 recorded in the manifest covers the full (not the truncated) set.
-    _ensure_pr_files_complete(gh_bin, repo, prs, budget=budget)
+    pr_files_completeness = _ensure_pr_files_complete(gh_bin, repo, prs, budget=budget)
     prs_raw = json.dumps(prs, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     prs_meta["sha256"] = hashlib.sha256(prs_raw.encode("utf-8")).hexdigest()
     prs_meta["pagination_complete"] = True
@@ -1114,6 +1157,7 @@ def _run_transaction(
         "planner_script_sha256": planner_script_sha256,
         "issues": issues_meta,
         "pull_requests": prs_meta,
+        "pr_files_completeness": pr_files_completeness,
         "budget": {
             "page_count": budget.page_count,
             "response_bytes": budget.response_bytes,

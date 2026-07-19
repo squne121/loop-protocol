@@ -152,6 +152,16 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
 ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   status: ok
   schema_version: 1
+  marker_schema_version: 3  # Issue #1593 fix_delta (PR #1643 review P0-3): explicit, mandatory version
+                             # discriminator this runner always stamps. A marker carrying
+                             # marker_schema_version: 3 REQUIRES the full inputs.query_schema_version /
+                             # *_completeness / transaction_budget contract below -- consumers
+                             # (parse_scope_rollup_run_result.py) reject any marker_schema_version: 3
+                             # marker whose completeness contract is missing or invalid, even if
+                             # `inputs` itself was stripped entirely. This closes the silent-downgrade
+                             # gap where deleting only `inputs.query_schema_version` (while this
+                             # runner's OTHER v3 fields remained) used to be misclassified as a
+                             # pre-#1593 legacy v2 marker.
   repo: "<repo>"
   current_issue: <issue_number>
   invocation_id: "<入力で受け取った invocation_id そのまま（= SCOPE_ROLLUP_RUN_RESULT_V1.manifest.invocation_id と一致するはず）>"
@@ -185,7 +195,7 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
 
 **`invocation_id` / `requested_at` は入力値をそのまま echo する**（executor が独自生成した値ではなく、常に caller 生成値と一致する）。`raw_plan_location` は Issue #1547 以降 `null` 固定（executor が private invocation directory を全経路で cleanup するため永続 artifact が存在しない）。代わりに `result.payload` に `SCOPE_ROLLUP_RUN_RESULT_V1.plan.payload`（candidates を含む plan 全体、self_validation を除く）をそのまま埋め込み、consumer 側（`parse_scope_rollup_run_result.py`）が独立に `result_sha256` を再計算・検証できるようにする。`OUTPUT_BUDGET_V1` は routing-critical な機械可読フィールドの削減を禁止しており、`payload` は marker 採用判定に必須の machine-readable フィールドであるため削らない。
 
-`inputs.query_schema_version == 3`、各 completeness block の `total_count` / 実測 `page_count` / `pagination_complete: true` / `sha256`、および `transaction_budget` は marker の必須 producer/consumer 契約である。欠落・型不正・未完了状態は consumer が fail-close で reject する。GraphQL response の top-level `errors`、malformed connection、null / duplicate node、cursor 不進行、totalCount mismatch、transaction-wide pagination budget / deadline / response-byte cap は executor error とし、raw CLI list への fallback は行わない。
+`marker_schema_version: 3`（明示的なバージョン discriminator。consumer は `inputs` の内容に関わらず、この値が 3 のマーカーには以下の完全性契約を必須として要求する）、`inputs.query_schema_version == 3`、各 completeness block の `total_count` / 実測 `page_count` / `pagination_complete: true` / `sha256`、および `transaction_budget` は marker の必須 producer/consumer 契約である。欠落・型不正・未完了状態は consumer が fail-close で reject する（`inputs` ブロック自体の削除も同様に reject 対象）。GraphQL response の top-level `errors`、malformed connection、null / duplicate node、cursor 不進行、totalCount mismatch、transaction-wide pagination budget / deadline / response-byte cap は executor error とし、raw CLI list への fallback は行わない。
 
 ### 8.5. Final Response Capture Contract（最終応答のキャプチャ契約）
 

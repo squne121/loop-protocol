@@ -246,14 +246,43 @@ def _validate_marker_payload(
         return status, None, None, False
 
     inputs = marker_payload.get("inputs")
-    # The runner marker predates the v3 inventory manifest.  A marker without
-    # the additive inputs block is therefore a legacy v2 marker and remains
-    # parseable.  Once a producer declares query_schema_version 3, however,
-    # every v3 completeness and transaction-budget field is mandatory; it must
-    # never silently downgrade to the legacy path.
     if inputs is not None and not isinstance(inputs, dict):
         return "rejected", "scope_rollup_marker_malformed", "inventory_completeness_contract_invalid", False
-    if isinstance(inputs, dict) and "query_schema_version" in inputs and not _has_valid_completeness_contract(inputs):
+
+    # PR #1643 review (P0-3): the completeness gate below used to trigger
+    # only when "query_schema_version" happened to still be present inside
+    # ``inputs`` -- a marker that stripped just that one key (while leaving
+    # the other v3 completeness/budget fields, or nothing at all) was
+    # silently accepted as a "legacy v2" marker even though it came from the
+    # *current* v3-speaking runner. That is exactly the silent-downgrade
+    # this contract must never permit.
+    #
+    # The current runner (``.claude/agents/scope-rollup-runner.md``) always
+    # stamps an explicit ``marker_schema_version: 3`` on every marker it
+    # emits. That field -- not "does inputs still happen to contain
+    # query_schema_version" -- is now the authoritative version
+    # discriminator:
+    #   marker_schema_version == 3  -> full v3 completeness contract is
+    #                                  mandatory, regardless of what
+    #                                  ``inputs`` does or does not contain.
+    #   marker_schema_version == 2  -> explicit legacy marker; no
+    #                                  completeness contract required.
+    #   marker_schema_version absent -> a genuine pre-#1593 legacy marker
+    #                                  (minted before this field existed).
+    #                                  Preserve the original permissive
+    #                                  behavior for these so historical/AC6
+    #                                  legacy-v2 acceptance is not broken.
+    #   any other value            -> unsupported/malformed.
+    marker_schema_version = marker_payload.get("marker_schema_version")
+    if marker_schema_version is not None:
+        if marker_schema_version == 3:
+            if not (isinstance(inputs, dict) and _has_valid_completeness_contract(inputs)):
+                return "rejected", "scope_rollup_marker_malformed", "inventory_completeness_contract_invalid", False
+        elif marker_schema_version == 2:
+            pass
+        else:
+            return "rejected", "scope_rollup_marker_malformed", "marker_schema_version_unsupported", False
+    elif isinstance(inputs, dict) and "query_schema_version" in inputs and not _has_valid_completeness_contract(inputs):
         return "rejected", "scope_rollup_marker_malformed", "inventory_completeness_contract_invalid", False
 
     result_block = marker_payload.get("result")
