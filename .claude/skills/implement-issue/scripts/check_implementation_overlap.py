@@ -1054,7 +1054,12 @@ def _validate_human_c1_decisions(
     a currently ambiguous C1 candidate as a human-confirmed non-conflict after
     all comment claims are bound to the exact current readback.
     """
-    result: Dict[str, List[Dict[str, Any]]] = {"accepted": [], "rejected": [], "ignored_untrusted": []}
+    result: Dict[str, List[Dict[str, Any]]] = {
+        "accepted": [],
+        "rejected": [],
+        "ignored_untrusted": [],
+        "ignored_non_routing": [],
+    }
     if comments is None:
         return result
     if not isinstance(comments, list):
@@ -1065,6 +1070,20 @@ def _validate_human_c1_decisions(
         for item in candidates_evidence
         if isinstance(item.get("issue_number"), int)
     }
+    # A decision is an override input only for an already-established C1
+    # candidate.  Without that target, even a trusted malformed comment must
+    # not manufacture a human-review route; retain schema-like records only
+    # as non-routing audit evidence.
+    if not any(item.get("policy_class") == "C1" for item in candidates_evidence):
+        for raw in comments:
+            if isinstance(raw, dict) and isinstance(raw.get("body"), str) and HUMAN_C1_DECISION_SCHEMA in raw["body"]:
+                result["ignored_non_routing"].append(
+                    _decision_rejection(raw, "no_current_c1_candidate")
+                )
+        result["ignored_non_routing"].sort(
+            key=lambda item: ((item.get("comment_url") or ""), item["reason"])
+        )
+        return result
     seen_candidates: set[int] = set()
 
     for raw in comments:

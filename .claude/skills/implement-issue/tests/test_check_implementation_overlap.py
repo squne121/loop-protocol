@@ -872,7 +872,12 @@ def test_human_c1_decision_does_not_override_duplicate_c2b_or_saturation(tmp_pat
         tmp_path, duplicate_current, [duplicate_candidate]
     )
     _, duplicate = _run_cli(duplicate_current["number"], duplicate_current_file, duplicate_candidates_file)
-    assert duplicate["route"] == "human_review_required", duplicate
+    assert duplicate["route"] == "duplicate", duplicate
+    assert duplicate["human_c1_decisions"]["rejected"] == []
+    assert (
+        duplicate["human_c1_decisions"]["ignored_non_routing"][0]["reason"]
+        == "no_current_c1_candidate"
+    )
 
     c2b_current = json.loads((FIXTURES_DIR / "current_with_open_dependency.json").read_text(encoding="utf-8"))
     c2b_candidates = json.loads(
@@ -931,6 +936,46 @@ def test_human_c1_decision_trust_ignores_untrusted_before_schema_parse(tmp_path:
     assert decisions["accepted"] == []
     assert decisions["rejected"] == []
     assert decisions["ignored_untrusted"][0]["reason"] == "untrusted_author_association"
+
+
+def test_human_c1_decision_trusted_malformed_is_non_routing_without_c1_candidate(
+    tmp_path: Path,
+) -> None:
+    current = _current_with_shared_target(tmp_path)
+    comment = _human_c1_comment(current=current, candidate=_collision_candidate())
+    comment["body"] = "HUMAN_C1_DECISION_V1\nnot even yaml"
+    current["comments"] = [comment]
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [])
+
+    _, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    decisions = payload["human_c1_decisions"]
+    assert payload["route"] == "proceed"
+    assert decisions["accepted"] == []
+    assert decisions["rejected"] == []
+    assert decisions["ignored_non_routing"][0]["reason"] == "no_current_c1_candidate"
+
+
+def test_human_c1_decision_untrusted_mimic_is_non_routing_without_c1_candidate(
+    tmp_path: Path,
+) -> None:
+    current = _current_with_shared_target(tmp_path)
+    comment = _human_c1_comment(
+        current=current,
+        candidate=_collision_candidate(),
+        author_association="MEMBER",
+    )
+    current["comments"] = [comment]
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [])
+
+    _, payload = _run_cli(current["number"], current_file, candidates_file)
+
+    decisions = payload["human_c1_decisions"]
+    assert payload["route"] == "proceed"
+    assert decisions["accepted"] == []
+    assert decisions["rejected"] == []
+    assert decisions["ignored_untrusted"] == []
+    assert decisions["ignored_non_routing"][0]["reason"] == "no_current_c1_candidate"
 
 
 def test_human_c1_decision_trust_rejects_malformed_trusted_with_full_audit(tmp_path: Path) -> None:
