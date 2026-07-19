@@ -47,6 +47,14 @@ if str(_PUB_SCRIPTS_DIR) not in sys.path:
 import publish_termination_report as _pub
 
 
+def _build_request(issue_number, repo, comment_body, marker):
+    """Build an ISOLATION_ISSUE_COMMENT_REQUEST_V1 via the production
+    producer (Issue #1639 fix_delta P1-1: producer/consumer separation)."""
+    return _pub.build_isolation_issue_comment_request(
+        issue_number=issue_number, repo=repo, comment_body=comment_body, marker=marker,
+    )
+
+
 @pytest.fixture()
 def tmp_project(tmp_path):
     """Fake project structure so controlled_skill_mutation_exec's own
@@ -77,11 +85,15 @@ class TestPositivePublishFlow:
 
     def test_full_bridge_success_path(self, tmp_project, monkeypatch):
         monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1633")
+        request = _build_request(
+            1633, TRUSTED_REPO,
+            "Loop terminated. <!-- CONTROLLED_EXEC_MARKER:abc123 -->",
+            "<!-- CONTROLLED_EXEC_MARKER:abc123 -->",
+        )
         rel_path, err = _pub.materialize_isolation_issue_comment_request(
-            issue_number=1633,
-            repo=TRUSTED_REPO,
-            comment_body="Loop terminated. <!-- CONTROLLED_EXEC_MARKER:abc123 -->",
-            marker="<!-- CONTROLLED_EXEC_MARKER:abc123 -->",
+            request=request,
+            expected_issue_number=1633,
+            expected_repo=TRUSTED_REPO,
             project_root=tmp_project,
         )
         assert err == ""
@@ -125,11 +137,13 @@ class TestPositivePublishFlow:
         call _post_gh_comment again (idempotent no-op)."""
         monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1633")
         comment_body = "Loop terminated. <!-- CONTROLLED_EXEC_MARKER:abc123 -->"
+        request = _build_request(
+            1633, TRUSTED_REPO, comment_body, "<!-- CONTROLLED_EXEC_MARKER:abc123 -->",
+        )
         rel_path, err = _pub.materialize_isolation_issue_comment_request(
-            issue_number=1633,
-            repo=TRUSTED_REPO,
-            comment_body=comment_body,
-            marker="<!-- CONTROLLED_EXEC_MARKER:abc123 -->",
+            request=request,
+            expected_issue_number=1633,
+            expected_repo=TRUSTED_REPO,
             project_root=tmp_project,
         )
         assert err == ""
@@ -161,9 +175,11 @@ class TestNegativeFixtures:
     def test_absolute_path_denied(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
         monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1633")
+        request = _build_request(1633, TRUSTED_REPO, "hi <!-- m -->", "<!-- m -->")
         rel_path, err = _pub.materialize_isolation_issue_comment_request(
-            issue_number=1633, repo=TRUSTED_REPO,
-            comment_body="hi <!-- m -->", marker="<!-- m -->",
+            request=request,
+            expected_issue_number=1633,
+            expected_repo=TRUSTED_REPO,
             project_root=tmp_project,
         )
         assert err == ""
@@ -183,9 +199,11 @@ class TestNegativeFixtures:
     def test_dotdot_traversal_denied(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
         monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1633")
+        request = _build_request(1633, TRUSTED_REPO, "hi <!-- m -->", "<!-- m -->")
         rel_path, err = _pub.materialize_isolation_issue_comment_request(
-            issue_number=1633, repo=TRUSTED_REPO,
-            comment_body="hi <!-- m -->", marker="<!-- m -->",
+            request=request,
+            expected_issue_number=1633,
+            expected_repo=TRUSTED_REPO,
             project_root=tmp_project,
         )
         assert err == ""
@@ -208,9 +226,11 @@ class TestNegativeFixtures:
     def test_symlink_input_file_denied(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
         monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1633")
+        request = _build_request(1633, TRUSTED_REPO, "hi <!-- m -->", "<!-- m -->")
         rel_path, err = _pub.materialize_isolation_issue_comment_request(
-            issue_number=1633, repo=TRUSTED_REPO,
-            comment_body="hi <!-- m -->", marker="<!-- m -->",
+            request=request,
+            expected_issue_number=1633,
+            expected_repo=TRUSTED_REPO,
             project_root=tmp_project,
         )
         assert err == ""
@@ -265,9 +285,11 @@ class TestNegativeFixtures:
         input file."""
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
         monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1633")
+        request = _build_request(1633, TRUSTED_REPO, "hi <!-- m -->", "<!-- m -->")
         rel_path, err = _pub.materialize_isolation_issue_comment_request(
-            issue_number=1633, repo=TRUSTED_REPO,
-            comment_body="hi <!-- m -->", marker="<!-- m -->",
+            request=request,
+            expected_issue_number=1633,
+            expected_repo=TRUSTED_REPO,
             project_root=tmp_project,
         )
         assert err == ""
@@ -284,9 +306,11 @@ class TestNegativeFixtures:
     def test_wrong_issue_number_denied_before_materialize(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
         monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1633")
+        request = _build_request(1633, TRUSTED_REPO, "hi <!-- m -->", "<!-- m -->")
         rel_path, err = _pub.materialize_isolation_issue_comment_request(
-            issue_number=1633, repo=TRUSTED_REPO,
-            comment_body="hi <!-- m -->", marker="<!-- m -->",
+            request=request,
+            expected_issue_number=1633,
+            expected_repo=TRUSTED_REPO,
             project_root=tmp_project,
         )
         assert err == ""
@@ -305,9 +329,11 @@ class TestNegativeFixtures:
     def test_duplicate_marker_denied_before_post(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
         monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1633")
+        request = _build_request(1633, TRUSTED_REPO, "hi <!-- m -->", "<!-- m -->")
         rel_path, err = _pub.materialize_isolation_issue_comment_request(
-            issue_number=1633, repo=TRUSTED_REPO,
-            comment_body="hi <!-- m -->", marker="<!-- m -->",
+            request=request,
+            expected_issue_number=1633,
+            expected_repo=TRUSTED_REPO,
             project_root=tmp_project,
         )
         assert err == ""
@@ -330,9 +356,11 @@ class TestNegativeFixtures:
     def test_marker_body_identity_conflict_denied(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
         monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1633")
+        request = _build_request(1633, TRUSTED_REPO, "hi <!-- m -->", "<!-- m -->")
         rel_path, err = _pub.materialize_isolation_issue_comment_request(
-            issue_number=1633, repo=TRUSTED_REPO,
-            comment_body="hi <!-- m -->", marker="<!-- m -->",
+            request=request,
+            expected_issue_number=1633,
+            expected_repo=TRUSTED_REPO,
             project_root=tmp_project,
         )
         assert err == ""
@@ -353,9 +381,11 @@ class TestNegativeFixtures:
     def test_marker_not_embedded_denied_before_materialize(self, tmp_project):
         """The bounded request validator rejects a marker that is not a
         substring of comment_body before any file is materialized."""
+        request = _build_request(1633, TRUSTED_REPO, "hi, no marker here", "<!-- missing -->")
         rel_path, err = _pub.materialize_isolation_issue_comment_request(
-            issue_number=1633, repo=TRUSTED_REPO,
-            comment_body="hi, no marker here", marker="<!-- missing -->",
+            request=request,
+            expected_issue_number=1633,
+            expected_repo=TRUSTED_REPO,
             project_root=tmp_project,
         )
         assert rel_path is None

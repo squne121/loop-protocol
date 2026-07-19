@@ -1538,22 +1538,87 @@ ISOLATION_ISSUE_COMMENT_REQUEST_ALLOWED_KEYS = frozenset({
 closed-key チェック・schema 一致・issue_number/repo の呼び出し元宣言値との一致・
 `marker` が `comment_body` に埋め込まれていることを検証する。
 
-### materialize_isolation_issue_comment_request()（親 root 側の書き込み関数）
+### build_isolation_issue_comment_request() / materialize_isolation_issue_comment_request()（親 root 側の producer/consumer 分離、Issue #1639 fix_delta P1-1）
 
-`.claude/skills/issue-refinement-loop/scripts/publish_termination_report.py` に
-追加した関数。bounded request を受け取り、上記バリデータを通した上で
-`artifacts/{issue_number}/issue-metadata/issue_comment.publish/issue_comment_publish_input.json`
-へ `ISSUE_COMMENT_PUBLISH_INPUT_V1` 互換 JSON を書き込み、project-root-relative な
-POSIX パス文字列を返す（executor は絶対パスの `--input-file` を拒否するため）。
+`.claude/skills/issue-refinement-loop/scripts/publish_termination_report.py` の
+2 関数に分離している。
+
+- `build_isolation_issue_comment_request(*, issue_number, repo, comment_body, marker)`
+  — producer。実運用では isolation worktree agent が生成する bounded request
+  と同じ形の dict を組み立てるだけの、閉じたキー集合の生成専用関数。
+- `materialize_isolation_issue_comment_request(*, request, expected_issue_number, expected_repo, project_root=None)`
+  — consumer。`request`（すでに構築済みの外部境界オブジェクト）を
+  `validate_isolation_issue_comment_request(request, expected_issue_number, expected_repo)`
+  で検証し、通過した場合のみ
+  `artifacts/{issue_number}/issue-metadata/issue_comment.publish/issue_comment_publish_input.json`
+  へ `ISSUE_COMMENT_PUBLISH_INPUT_V1` 互換 JSON を書き込み、project-root-relative な
+  POSIX パス文字列を返す（executor は絶対パスの `--input-file` を拒否するため）。
+
+以前は `materialize_isolation_issue_comment_request()` が `issue_number` /
+`repo` / `comment_body` / `marker` の bare keyword 引数を受け取り、関数内部で
+`request = {...}` を再構築してから自分自身を検証していたため、unknown field /
+schema mismatch / repo mismatch / issue mismatch を検出する validator の
+主要チェックがコード上恒真（呼び出し元が渡した値をそのまま dict化するだけ）
+になっていた。producer/consumer を別関数に分離したことで、`request` は
+実際に外部（テストでは production の `build_isolation_issue_comment_request()`
+経由）から来た境界オブジェクトとして検証される。
+
+### materialize_isolation_issue_comment_request() の symlink/TOCTOU 安全性（Issue #1639 fix_delta P0）
+
+書き込み先 `artifacts/{issue_number}/issue-metadata/issue_comment.publish/issue_comment_publish_input.json`
+は predictable なパスであり、`canonical main root` 権限で動くこの関数が
+plain `Path.write_text()` で直接書き込むと、事前に仕込まれた symlink
+（namespace の祖先ディレクトリいずれか、または出力ファイル自体）を
+無検証に追従してしまい、任意ファイルの上書き（CWE-59/CWE-61）や
+check-then-write の TOCTOU（CWE-363）が成立し得る。
+
+対策として `_write_json_atomic_symlink_safe()` / `_resolve_namespace_component_nofollow()`
+が以下を行う:
+
+1. `project_root` からの各 namespace path component（`artifacts` /
+   `{issue_number}` / `issue-metadata` / `issue_comment.publish`）を
+   dir_fd 相対の `os.mkdir` / `os.stat(..., follow_symlinks=False)` /
+   `os.open(..., O_DIRECTORY | O_NOFOLLOW)` で一段ずつ辿る。`mkdir` は
+   既存 dirent（symlink を含む）があれば追従せず `EEXIST` になるため
+   race-free であり、直後の lstat + O_NOFOLLOW open が「本物の
+   ディレクトリ」以外をすべて拒否する。
+2. 出力ファイルは新規の一時ファイルへ `O_CREAT | O_EXCL | O_NOFOLLOW`
+   （dir_fd 相対）で書き込み、`flush` + `os.fsync` の後、
+   `os.rename(tmp, filename, src_dir_fd=..., dst_dir_fd=...)` で
+   atomic に置換する。POSIX `rename()` は宛先が symlink であっても
+   追従せず、そのディレクトリエントリ自体を置き換えるため、
+   pre-check と rename の間の race window に symlink が仕込まれても
+   任意ファイルへの書き込みには繋がらない（実質的な TOCTOU 対策は
+   この rename 自体であり、事前の lstat チェックは fail-closed な
+   分類・監査レイヤー）。
+3. 出力の pre-existing dirent が symlink / directory / FIFO・device 等の
+   非通常ファイル / hardlink（`st_nlink != 1`）のいずれかであれば、
+   書き込みを一切行わず fail-closed で reject する（既存の正当な
+   dirent を意図せず置換しない、というこのレーンのポリシー）。
+
+テストは `.claude/skills/issue-refinement-loop/tests/test_publish_termination_report.py::TestMaterializerSymlinkSafety`
+に、出力 symlink（target 内容不変を確認）/ namespace directory 自体が
+symlink / 中間 directory が symlink / 出力が hardlink / 出力が
+directory / 出力が FIFO / concurrent replacement 相当 / 失敗時に既存の
+正当な入力ファイルを破壊しない、の各ケースを追加している。
 
 ### _post_github_comment の置き換え（AC3）
 
 旧実装は `subprocess.run(["gh", "issue", "comment", ...])` を直接呼んでいた。
 新実装は次の経路のみを使う:
 
-1. `CONTROLLED_EXEC_MARKER` 環境変数（未設定時は body の内容ハッシュ由来の
-   deterministic marker）を `comment_body` に埋め込む
-2. `materialize_isolation_issue_comment_request()` で入力ファイルを materialize
+1. `CONTROLLED_EXEC_MARKER` 環境変数（未設定時は Issue #1639 fix_delta P1-2
+   で強化した deterministic marker。`repo` + `issue_number` + `body` を
+   NUL区切りで連結したものの sha256 先頭32文字を使う。body のみのハッシュ
+   だと同一 body が異なる repo/issue へ投稿された場合に marker が衝突し得た
+   ため、repo と issue_number をハッシュ対象へ含めている。この制約を変更
+   する場合は本節と
+   `test_publish_termination_report.py::TestExecMarkerInjection` の
+   `test_fallback_marker_differs_across_issue_numbers_for_same_body` /
+   `test_fallback_marker_differs_across_repos_for_same_body_and_issue` を
+   同時に更新すること）を `comment_body` に埋め込む
+2. `build_isolation_issue_comment_request()` で bounded request を構築し、
+   `materialize_isolation_issue_comment_request()` で入力ファイルを materialize
 3. 以下の exact argv で `controlled_skill_mutation_exec.py` を起動する
 
 ```bash
@@ -1593,7 +1658,9 @@ marker not embedded）の両方を検証する。
 
 routing-critical フィールド: `ISOLATION_ISSUE_COMMENT_REQUEST_ALLOWED_KEYS` の
 キー集合、`materialize_isolation_issue_comment_request()` の戻り値 shape
-（`(relative_input_file_path, error)`）は必須。
+（`(relative_input_file_path, error)`）は必須。producer/consumer 分離後の
+シグネチャ（`request` / `expected_issue_number` / `expected_repo` キーワード
+引数）も routing-critical。
 
 ## edit-issue 向け transaction helper の契約定義（Issue #1287）
 
