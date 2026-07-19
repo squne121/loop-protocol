@@ -896,8 +896,24 @@ def _classifier_allowed_paths(entries: Sequence[str]) -> Tuple[str, ...]:
     return tuple(out)
 
 
-def _issue_scope_from_raw(raw: Dict[str, Any], *, current_repo: Optional[str] = None) -> IssueScope:
+def _issue_scope_from_raw(
+    raw: Dict[str, Any],
+    *,
+    current_repo: Optional[str] = None,
+    extra_depends_on: Tuple[str, ...] = (),
+) -> IssueScope:
+    """raw candidate/current JSON から ``IssueScope`` を組み立てる。
+
+    ``extra_depends_on``（#1621 AC1）: current の既取得 native ``blocking``
+    から構築した successor index により、candidate 自身の raw データには
+    現れない ``depends_on`` 入力を追加注入するための slot。candidate 自身の
+    ``blocked_by`` 由来の値と衝突しないよう重複排除した上で末尾に追加する。
+    """
     body = str(raw.get("body") or "")
+    depends_on = _merge_dependency_refs(body, raw, "blocked_by", current_repo=current_repo)
+    if extra_depends_on:
+        seen = set(depends_on)
+        depends_on = depends_on + tuple(ref for ref in extra_depends_on if ref not in seen)
     return IssueScope(
         title=str(raw.get("title", "")),
         number=raw.get("number"),
@@ -907,7 +923,7 @@ def _issue_scope_from_raw(raw: Dict[str, Any], *, current_repo: Optional[str] = 
         labels=tuple(
             (lbl.get("name", "") if isinstance(lbl, dict) else str(lbl)) for lbl in (raw.get("labels", []) or [])
         ),
-        depends_on=_merge_dependency_refs(body, raw, "blocked_by", current_repo=current_repo),
+        depends_on=depends_on,
         parent_refs=_extract_parent_ref(body),
         # B1 fix (Blocker 2): state は raw の実際の値を使う。offline fixture は
         # "state" を明示できる（既定 "OPEN" は後方互換）。online 経路は
@@ -1287,6 +1303,33 @@ def _readback_candidate(
 # ============================================================
 
 
+# #1621 AC1/AC7: current の既取得 native `blocking`（current が後続 Issue を
+# 止めている側。従来は evidence の `native_blocking` に保存されるだけの dead
+# data だった）から、同一 repository の successor candidate の issue number
+# 集合を構築する。`(repository, issue_number)` タプルで比較し、repository が
+# 一致しない typed record は cross-repository の同一番号との誤結合を避ける
+# ため index に含めない（AC7）。candidate 側への追加 API 呼び出しは発生し
+# ない（current の raw データのみを参照する、AC1）。
+def _current_native_successor_numbers(current_raw: Dict[str, Any], current_repo: str) -> frozenset:
+    blocking = current_raw.get("blocking")
+    if not isinstance(blocking, list):
+        return frozenset()
+    numbers: set = set()
+    for item in blocking:
+        if not isinstance(item, dict):
+            continue
+        number = item.get("number")
+        repository = item.get("repository")
+        if type(number) is not int or number <= 0:
+            continue
+        if not isinstance(repository, str) or not repository.strip():
+            continue
+        if _canonicalize_repo_static(repository) != current_repo:
+            continue
+        numbers.add(number)
+    return frozenset(numbers)
+
+
 def _resolve_dependency(
     current_number: int,
     current_paths: Sequence[str],
@@ -1477,8 +1520,20 @@ def _classify(
             candidate_updated_at[key] = raw.get("updatedAt")
             candidate_contracts[key] = _contract_schema_keys(body_text)
             scope_pool[key] = scope
+    # #1621 AC1: current の native blocking から構築した successor index を
+    # 参照し、最初の classify_overlap() 呼び出し前に同一 repository の
+    # candidate の depends_on へ current issue number を注入する。
+    current_native_successor_numbers = _current_native_successor_numbers(current_raw, repository)
     for raw in comparable_raw:
-        candidate_scopes.append(_issue_scope_from_raw(raw, current_repo=repository))
+        cand_number = raw.get("number")
+        extra_depends_on: Tuple[str, ...] = (
+            (str(args.issue_number),)
+            if isinstance(cand_number, int) and cand_number in current_native_successor_numbers
+            else ()
+        )
+        candidate_scopes.append(
+            _issue_scope_from_raw(raw, current_repo=repository, extra_depends_on=extra_depends_on)
+        )
 
     current = IssueScope(
         title=str(current_raw.get("title", "")),
@@ -1539,6 +1594,15 @@ def _classify(
         c.issue_number: c.overlapping_paths for c in result.candidates if c.issue_number is not None
     }
 
+    # #1621 AC4/AC5: classify_overlap() が candidate 単位で返す
+    # CandidateEvidence.dependency_relation を、origin == "classify" の候補
+    # について policy_class/reasons の根拠として参照する。`result.candidates`
+    # は verdict に対応する precedence bucket のみを保持するため、
+    # readback_targets の "classify" origin と対応付ける。
+    classify_candidates_by_number: Dict[int, Any] = {
+        c.issue_number: c for c in verdict_candidates if c.issue_number is not None
+    }
+
     for num, origin in readback_targets.items():
         key = str(num)
         cand_body = candidate_bodies.get(key, "")
@@ -1556,14 +1620,30 @@ def _classify(
         elif rb["heading_overlap"]:
             any_collision = True
 
-        policy_class = (
-            "C2a"
-            if origin == "dependency_c2a"
-            else ("duplicate_candidate" if origin == "classify" and result.verdict == DUPLICATE else "C1")
-        )
+        classify_dependency_relation = "none"
+        if origin == "classify":
+            classify_candidate = classify_candidates_by_number.get(num)
+            if classify_candidate is not None:
+                classify_dependency_relation = classify_candidate.dependency_relation.relation
+
+        if origin == "dependency_c2a":
+            policy_class = "C2a"
+        elif origin == "classify" and result.verdict == DUPLICATE:
+            policy_class = "duplicate_candidate"
+        elif origin == "classify" and classify_dependency_relation == "successor":
+            # pure classifier が successor（candidate が current に依存して
+            # おり current を止めていない）と判定した candidate は、origin/
+            # 集約 verdict のみからの一律 C1 化をやめ、C2a として evidence
+            # 化する（PR #1615 の human C1 override が successor candidate
+            # を解除できないようにするための区別）。
+            policy_class = "C2a"
+        else:
+            policy_class = "C1"
         reasons: List[str] = []
         if origin == "dependency_c2a":
             reasons.append("closed_predecessor_via_blocked_by")
+        if origin == "classify" and classify_dependency_relation == "successor":
+            reasons.append("successor_dependency_ordering")
         if rb["readback_complete"]:
             if rb["heading_overlap"]:
                 reasons.append("structural_or_textual_collision_detected")

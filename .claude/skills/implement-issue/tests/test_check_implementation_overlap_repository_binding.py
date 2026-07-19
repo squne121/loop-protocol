@@ -310,3 +310,52 @@ def test_given_online_when_api_fetch_fails_then_falls_back_to_static_canonicaliz
     result = module._canonicalize_repo("SQUNE121/LOOP-PROTOCOL", online=True)
 
     assert result == "squne121/loop-protocol"
+
+
+# ------------------------------------------------------------
+# #1621 AC7: successor index compares (repository, issue_number) tuples --
+# cross-repository issue numbers must not be treated as local successors.
+# ------------------------------------------------------------
+
+
+def test_given_cross_repository_native_blocking_same_number_then_successor_not_injected() -> None:
+    """AC7: current の native blocking の repository が異なる場合、同一 issue
+    number を持つ別 repository の候補と誤って successor 結合しない。
+    """
+    import importlib.util
+    import sys as _sys
+
+    spec = importlib.util.spec_from_file_location(
+        "check_implementation_overlap_repo_binding_ac7", HELPER
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    _sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    current_raw = {
+        "blocking": [{"repository": "other-owner/other-repo", "number": 9730, "state": "OPEN"}],
+    }
+    numbers = module._current_native_successor_numbers(current_raw, DEFAULT_REPO)
+    assert numbers == frozenset()
+    assert 9730 not in numbers
+
+
+def test_given_same_repository_native_blocking_then_successor_injected() -> None:
+    """AC7 の対照ケース: repository が current と一致する場合は index に含まれる。"""
+    import importlib.util
+    import sys as _sys
+
+    spec = importlib.util.spec_from_file_location(
+        "check_implementation_overlap_repo_binding_ac7_positive", HELPER
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    _sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    current_raw = {
+        "blocking": [{"repository": DEFAULT_REPO, "number": 9731, "state": "OPEN"}],
+    }
+    numbers = module._current_native_successor_numbers(current_raw, DEFAULT_REPO)
+    assert numbers == frozenset({9731})
