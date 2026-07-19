@@ -1080,8 +1080,24 @@ def _classifier_allowed_paths(entries: Sequence[str]) -> Tuple[str, ...]:
     return tuple(out)
 
 
-def _issue_scope_from_raw(raw: Dict[str, Any], *, current_repo: Optional[str] = None) -> IssueScope:
+def _issue_scope_from_raw(
+    raw: Dict[str, Any],
+    *,
+    current_repo: Optional[str] = None,
+    extra_depends_on: Tuple[str, ...] = (),
+) -> IssueScope:
+    """raw candidate/current JSON から ``IssueScope`` を組み立てる。
+
+    ``extra_depends_on``（#1621 AC1）: current の既取得 native ``blocking``
+    から構築した successor index により、candidate 自身の raw データには
+    現れない ``depends_on`` 入力を追加注入するための slot。candidate 自身の
+    ``blocked_by`` 由来の値と衝突しないよう重複排除した上で末尾に追加する。
+    """
     body = str(raw.get("body") or "")
+    depends_on = _merge_dependency_refs(body, raw, "blocked_by", current_repo=current_repo)
+    if extra_depends_on:
+        seen = set(depends_on)
+        depends_on = depends_on + tuple(ref for ref in extra_depends_on if ref not in seen)
     return IssueScope(
         title=str(raw.get("title", "")),
         number=raw.get("number"),
@@ -1091,7 +1107,7 @@ def _issue_scope_from_raw(raw: Dict[str, Any], *, current_repo: Optional[str] = 
         labels=tuple(
             (lbl.get("name", "") if isinstance(lbl, dict) else str(lbl)) for lbl in (raw.get("labels", []) or [])
         ),
-        depends_on=_merge_dependency_refs(body, raw, "blocked_by", current_repo=current_repo),
+        depends_on=depends_on,
         parent_refs=_extract_parent_ref(body),
         # B1 fix (Blocker 2): state は raw の実際の値を使う。offline fixture は
         # "state" を明示できる（既定 "OPEN" は後方互換）。online 経路は
@@ -1471,6 +1487,138 @@ def _readback_candidate(
 # ============================================================
 
 
+# #1621 AC1/AC7: current の既取得 native `blocking`（current が後続 Issue を
+# 止めている側。従来は evidence の `native_blocking` に保存されるだけの dead
+# data だったが、本 Issue で evidence（`native_blocking`）と successor index
+# の双方に使う）から `(repository, issue_number)` タプルの successor index を
+# 構築する。PR #1637 レビュー修正（AC7 Conditional）: repository でフィルタ
+# した後に number だけの frozenset へ潰すと、呼び出し側が repository
+# binding を再確認しないまま injection してしまう型上のリスクがあるため、
+# 契約どおり tuple のまま返す。cross-repository の typed record は index に
+# 含めない。candidate 側への追加 API 呼び出しは発生しない（current の raw
+# データのみを参照する、AC1）。
+def _current_native_successor_index(current_raw: Dict[str, Any], current_repo: str) -> frozenset:
+    blocking = current_raw.get("blocking")
+    if not isinstance(blocking, list):
+        return frozenset()
+    index: set = set()
+    for item in blocking:
+        if not isinstance(item, dict):
+            continue
+        number = item.get("number")
+        repository = item.get("repository")
+        if type(number) is not int or number <= 0:
+            continue
+        if not isinstance(repository, str) or not repository.strip():
+            continue
+        canonical = _canonicalize_repo_static(repository)
+        if canonical != current_repo:
+            continue
+        index.add((canonical, number))
+    return frozenset(index)
+
+
+def _successor_dependency_provenance(
+    *,
+    current_number: int,
+    current_repo: str,
+    cand_number: int,
+    cand_raw: Dict[str, Any],
+    current_native_successor_index: frozenset,
+) -> List[Dict[str, Any]]:
+    """successor 関係を証明した入力の出所を列挙する（PR #1637 レビュー P2 Major）。
+
+    「current の native blocking から注入された successor」と「candidate 自身の
+    blockedBy / Machine-Readable Contract / legacy `Depends on #N` から得た
+    successor」を監査時に区別できるようにする。複数の入力が同時に成立する
+    場合はすべて列挙する（単一の "唯一の根拠" を偽装しない）。
+    """
+    provenance: List[Dict[str, Any]] = []
+    if (current_repo, cand_number) in current_native_successor_index:
+        provenance.append(
+            {"source": "current_native_blocking", "repository": current_repo, "issue_number": current_number}
+        )
+    cand_body = str(cand_raw.get("body") or "")
+    contract = _parse_contract_dependency_lists(cand_body)
+    contract_blocked_by_digits = {_ref_digits(ref) for ref in contract.get("blocked_by", ())}
+    if str(current_number) in contract_blocked_by_digits:
+        provenance.append(
+            {"source": "candidate_contract_blocked_by", "repository": current_repo, "issue_number": current_number}
+        )
+    if str(current_number) in _extract_depends_on(cand_body):
+        provenance.append(
+            {
+                "source": "candidate_legacy_depends_on_text",
+                "repository": current_repo,
+                "issue_number": current_number,
+            }
+        )
+    cand_native_blocked_by = cand_raw.get("blockedBy")
+    if isinstance(cand_native_blocked_by, list):
+        for item in cand_native_blocked_by:
+            if not isinstance(item, dict):
+                continue
+            number = item.get("number")
+            repo_field = item.get("repository")
+            if (
+                type(number) is int
+                and number == current_number
+                and isinstance(repo_field, str)
+                and _canonicalize_repo_static(repo_field) == current_repo
+            ):
+                provenance.append(
+                    {
+                        "source": "candidate_native_blocked_by",
+                        "repository": current_repo,
+                        "issue_number": current_number,
+                    }
+                )
+                break
+    return provenance
+
+
+def _predecessor_dependency_provenance(
+    *,
+    current_number: int,
+    current_repo: str,
+    cand_number: int,
+    current_raw: Dict[str, Any],
+    current_body: str,
+) -> List[Dict[str, Any]]:
+    """closed predecessor（C2a, `origin == "dependency_c2a"`）の predecessor
+    関係を証明した入力の出所を列挙する（PR #1637 レビュー P2 Major）。
+    """
+    provenance: List[Dict[str, Any]] = []
+    contract = _parse_contract_dependency_lists(current_body)
+    contract_blocked_by_digits = {_ref_digits(ref) for ref in contract.get("blocked_by", ())}
+    if str(cand_number) in contract_blocked_by_digits:
+        provenance.append(
+            {"source": "current_contract_blocked_by", "repository": current_repo, "issue_number": cand_number}
+        )
+    if str(cand_number) in _extract_depends_on(current_body):
+        provenance.append(
+            {"source": "current_legacy_depends_on_text", "repository": current_repo, "issue_number": cand_number}
+        )
+    native_blocked_by = current_raw.get("blockedBy")
+    if isinstance(native_blocked_by, list):
+        for item in native_blocked_by:
+            if not isinstance(item, dict):
+                continue
+            number = item.get("number")
+            repo_field = item.get("repository")
+            if (
+                type(number) is int
+                and number == cand_number
+                and isinstance(repo_field, str)
+                and _canonicalize_repo_static(repo_field) == current_repo
+            ):
+                provenance.append(
+                    {"source": "current_native_blocked_by", "repository": current_repo, "issue_number": cand_number}
+                )
+                break
+    return provenance
+
+
 def _resolve_dependency(
     current_number: int,
     current_paths: Sequence[str],
@@ -1666,6 +1814,7 @@ def _classify(
     candidate_bodies: Dict[str, str] = {}
     candidate_updated_at: Dict[str, Optional[str]] = {}
     candidate_contracts: Dict[str, Dict[str, str]] = {}
+    candidate_raw_by_number: Dict[str, Dict[str, Any]] = {}
     scope_pool: Dict[str, IssueScope] = {}
     candidate_scopes: List[IssueScope] = []
     for raw in candidates_raw:
@@ -1676,9 +1825,23 @@ def _classify(
             candidate_bodies[key] = body_text
             candidate_updated_at[key] = raw.get("updatedAt")
             candidate_contracts[key] = _contract_schema_keys(body_text)
+            candidate_raw_by_number[key] = raw
             scope_pool[key] = scope
+    # #1621 AC1/AC7: current の native blocking から構築した (repository,
+    # issue_number) successor index を参照し、最初の classify_overlap()
+    # 呼び出し前に同一 repository の candidate の depends_on へ current
+    # issue number を注入する。
+    current_native_successor_index = _current_native_successor_index(current_raw, repository)
     for raw in comparable_raw:
-        candidate_scopes.append(_issue_scope_from_raw(raw, current_repo=repository))
+        cand_number = raw.get("number")
+        extra_depends_on: Tuple[str, ...] = (
+            (str(args.issue_number),)
+            if isinstance(cand_number, int) and (repository, cand_number) in current_native_successor_index
+            else ()
+        )
+        candidate_scopes.append(
+            _issue_scope_from_raw(raw, current_repo=repository, extra_depends_on=extra_depends_on)
+        )
 
     current = IssueScope(
         title=str(current_raw.get("title", "")),
@@ -1691,11 +1854,16 @@ def _classify(
 
     # --- dependency 解決（Blocker 2） ---
     dep_res = _resolve_dependency(args.issue_number, current_paths, current.depends_on, scope_pool)
-    # Major 1（PR #1474 レビュー）: 取得済みの typed record（`{repository,
-    # number, state}`）を issue number へ潰す前に auditability 用として保持
-    # する。`native_blocking`（current が後続を止めている側）はこれまで取得
-    # されるが判定に一切使われず捨てられていた（dead data）ため、evidence に
-    # 残して可視化する（判定ロジックへの新規組み込みは Out of Scope）。
+    # Major 1（PR #1474 レビュー）/ #1621（PR #1637 レビュー P3 Minor 更新）:
+    # 取得済みの typed record（`{repository, number, state}`）を issue number
+    # へ潰す前に auditability 用として保持する。`native_blocking`（current が
+    # 後続を止めている側）は、evidence への可視化に加えて successor index
+    # （`_current_native_successor_index`）の入力としても使う（#1621 で
+    # dead data 状態を解消済み）。candidate scope への注入は
+    # `current_native_blocking` provenance を明示して行い（
+    # `_successor_dependency_provenance`）、candidate raw の `blockedBy` を
+    # 取得したかのように偽装しない（candidate の `blockedBy` フィールド自体
+    # は変更しない）。
     native_blocked_by_raw = current_raw.get("blockedBy")
     native_blocking_raw = current_raw.get("blocking")
     dependency_resolution = {
@@ -1739,6 +1907,15 @@ def _classify(
         c.issue_number: c.overlapping_paths for c in result.candidates if c.issue_number is not None
     }
 
+    # #1621 AC4/AC5: classify_overlap() が candidate 単位で返す
+    # CandidateEvidence.dependency_relation を、origin == "classify" の候補
+    # について policy_class/reasons の根拠として参照する。`result.candidates`
+    # は verdict に対応する precedence bucket のみを保持するため、
+    # readback_targets の "classify" origin と対応付ける。
+    classify_candidates_by_number: Dict[int, Any] = {
+        c.issue_number: c for c in verdict_candidates if c.issue_number is not None
+    }
+
     for num, origin in readback_targets.items():
         key = str(num)
         cand_body = candidate_bodies.get(key, "")
@@ -1756,14 +1933,58 @@ def _classify(
         elif rb["heading_overlap"]:
             any_collision = True
 
-        policy_class = (
-            "C2a"
-            if origin == "dependency_c2a"
-            else ("duplicate_candidate" if origin == "classify" and result.verdict == DUPLICATE else "C1")
-        )
+        classify_dependency_relation = "none"
+        if origin == "classify":
+            classify_candidate = classify_candidates_by_number.get(num)
+            if classify_candidate is not None:
+                classify_dependency_relation = classify_candidate.dependency_relation.relation
+
+        if origin == "dependency_c2a":
+            policy_class = "C2a"
+        elif origin == "classify" and result.verdict == DUPLICATE:
+            policy_class = "duplicate_candidate"
+        elif origin == "classify" and classify_dependency_relation == "successor":
+            # pure classifier が successor（candidate が current に依存して
+            # おり current を止めていない）と判定した candidate は、origin/
+            # 集約 verdict のみからの一律 C1 化をやめ、C2a として evidence
+            # 化する（PR #1615 の human C1 override が successor candidate
+            # を解除できないようにするための区別）。
+            policy_class = "C2a"
+        else:
+            policy_class = "C1"
         reasons: List[str] = []
         if origin == "dependency_c2a":
             reasons.append("closed_predecessor_via_blocked_by")
+        if origin == "classify" and classify_dependency_relation == "successor":
+            reasons.append("successor_dependency_ordering")
+
+        # #1621 P2 Major（PR #1637 レビュー）: candidate evidence に
+        # dependency_relation とその provenance（どの入力から証明したか）を
+        # 保存する。「current の native blocking から注入された successor」
+        # と「candidate 自身の blockedBy 等から得た successor」を監査時に
+        # 区別できるようにする。両方が同時に成り立つ場合は provenance に
+        # 複数エントリを列挙する。
+        dependency_relation = "none"
+        dependency_provenance: List[Dict[str, Any]] = []
+        if origin == "dependency_c2a":
+            dependency_relation = "predecessor"
+            dependency_provenance = _predecessor_dependency_provenance(
+                current_number=args.issue_number,
+                current_repo=repository,
+                cand_number=num,
+                current_raw=current_raw,
+                current_body=current_body,
+            )
+        elif origin == "classify" and classify_dependency_relation == "successor":
+            dependency_relation = "successor"
+            dependency_provenance = _successor_dependency_provenance(
+                current_number=args.issue_number,
+                current_repo=repository,
+                cand_number=num,
+                cand_raw=candidate_raw_by_number.get(key, {}),
+                current_native_successor_index=current_native_successor_index,
+            )
+
         if rb["readback_complete"]:
             if rb["heading_overlap"]:
                 reasons.append("structural_or_textual_collision_detected")
@@ -1795,6 +2016,8 @@ def _classify(
                 "policy_class": policy_class,
                 "reasons": reasons + list(rb.get("weak_signal_reasons") or []),
                 "non_conflict_reason": rb["non_conflict_reason"],
+                "dependency_relation": dependency_relation,
+                "dependency_provenance": dependency_provenance,
             }
         )
 
@@ -2032,9 +2255,22 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                 {c["issue_number"] for c in ctx["candidates_evidence"] if isinstance(c.get("issue_number"), int)}
             )
             if readback_numbers:
+                # #1621 P1 Blocker（PR #1637 レビュー）: current の native
+                # blocking から既に successor 関係が確定している candidate は、
+                # 本文/構造 evidence が GraphQL candidate pool に既に含まれて
+                # おり、successor であることの証明に candidate 側の
+                # blockedBy/blocking API 呼び出しを必要としない。この集合を
+                # hydration 対象から除外し、「candidate 単位の追加 API 呼び
+                # 出しゼロ」という Issue #1621 の中核契約を第二段階でも維持
+                # する（successor candidate が N 件でも追加 REST リクエスト
+                # を発生させない）。
+                current_native_successor_index = _current_native_successor_index(current_raw, canonical_repo)
+                hydration_targets = [
+                    num for num in readback_numbers if (canonical_repo, num) not in current_native_successor_index
+                ]
                 raw_by_number = {c.get("number"): c for c in candidates_raw if isinstance(c.get("number"), int)}
                 fetched_numbers: List[int] = []
-                for num in readback_numbers:
+                for num in hydration_targets:
                     target_raw = raw_by_number.get(num)
                     if target_raw is None:
                         continue
