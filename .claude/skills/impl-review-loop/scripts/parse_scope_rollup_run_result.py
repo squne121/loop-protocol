@@ -245,7 +245,15 @@ def _validate_marker_payload(
     if status in {"failed", "runner_unavailable"}:
         return status, None, None, False
 
-    if not _has_valid_completeness_contract(marker_payload.get("inputs")):
+    inputs = marker_payload.get("inputs")
+    # The runner marker predates the v3 inventory manifest.  A marker without
+    # the additive inputs block is therefore a legacy v2 marker and remains
+    # parseable.  Once a producer declares query_schema_version 3, however,
+    # every v3 completeness and transaction-budget field is mandatory; it must
+    # never silently downgrade to the legacy path.
+    if inputs is not None and not isinstance(inputs, dict):
+        return "rejected", "scope_rollup_marker_malformed", "inventory_completeness_contract_invalid", False
+    if isinstance(inputs, dict) and "query_schema_version" in inputs and not _has_valid_completeness_contract(inputs):
         return "rejected", "scope_rollup_marker_malformed", "inventory_completeness_contract_invalid", False
 
     result_block = marker_payload.get("result")

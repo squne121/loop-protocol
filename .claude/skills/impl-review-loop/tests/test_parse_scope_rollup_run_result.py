@@ -381,7 +381,20 @@ def test_rejected_when_capture_sidecar_is_missing(tmp_path):
 
 def test_ok_when_capture_sidecar_file_matches_assistant_output(tmp_path):
     script_sha = _load_script_sha(PLAN_SCRIPT)
-    marker = _render_marker(script_sha=script_sha)
+    # Legacy v2 runner markers carried the original inputs block but did not
+    # declare query_schema_version or the v3 completeness fields.
+    marker = _render_marker(
+        script_sha=script_sha,
+        overrides={
+            "inputs": {
+                "current_issue_sha256": "deadbeef",
+                "issues_all_sha256": "deadbeef",
+                "prs_all_sha256": "deadbeef",
+                "issue_count": 0,
+                "pr_count": 0,
+            }
+        },
+    )
     with NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
         tmp.write(marker)
         output_path = Path(tmp.name)

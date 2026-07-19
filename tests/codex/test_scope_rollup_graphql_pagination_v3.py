@@ -154,7 +154,7 @@ def test_global_budget_counts_inventory_and_nested_pr_file_pages(monkeypatch):
 
 
 def test_marker_parser_rejects_manifest_missing_completeness_contract(tmp_path):
-    """GIVEN a v2-like marker WHEN v3 completeness fields are absent THEN parser rejects it."""
+    """GIVEN a v3 marker WHEN completeness fields are absent THEN parser rejects it."""
     output = tmp_path / "assistant.md"
     output.write_text("x", encoding="utf-8")
     sidecar = tmp_path / "sidecar.yml"
@@ -167,7 +167,7 @@ def test_marker_parser_rejects_manifest_missing_completeness_contract(tmp_path):
         "requested_at": "2026-07-19T10:00:00Z",
         "generated_at": "2026-07-19T10:00:01Z",
         "script_blob_sha256": "a" * 64,
-        "inputs": {"query_schema_version": 2},
+        "inputs": {"query_schema_version": 3},
     }
     status, _cause, reason, _allowed = parser._validate_marker_payload(
         marker, output, sidecar, "squne121/loop-protocol", 1593, "v3", "a" * 64, "2026-07-19T10:00:00Z"
