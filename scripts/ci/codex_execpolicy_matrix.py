@@ -313,6 +313,155 @@ def execpolicy_case_definitions(fixture: FixtureRepo) -> list[dict[str, Any]]:
             "expected_execpolicy": ["forbidden"],
             "expected_guard_pair": "deny",
         },
+        # ─── Issue #1611 (contract revision, AC9/AC14): raw git add/commit
+        # and `rtk git add/commit` are narrowed to controlled-executor-only
+        # -- `.codex/rules/default.rules` denies these shapes statically,
+        # and `git_mutation_command_policy.classify_agent_lane_add_commit`
+        # denies them at the PreToolUse guard layer too (defense in depth).
+        {
+            "label": "git_add_denied_outside_controlled_executor",
+            "argv": ["git", "add", "tracked.txt"],
+            "expected_execpolicy": ["forbidden"],
+            "expected_guard_pair": "deny",
+        },
+        {
+            "label": "git_commit_denied_outside_controlled_executor",
+            "argv": ["git", "commit", "-m", "msg"],
+            "expected_execpolicy": ["forbidden"],
+            "expected_guard_pair": "deny",
+        },
+        {
+            "label": "rtk_git_add_denied_outside_controlled_executor",
+            "argv": ["rtk", "git", "add", "tracked.txt"],
+            "expected_execpolicy": ["forbidden", "prompt"],
+            "expected_guard_pair": "deny",
+        },
+        {
+            "label": "rtk_git_commit_denied_outside_controlled_executor",
+            "argv": ["rtk", "git", "commit", "-m", "msg"],
+            "expected_execpolicy": ["forbidden", "prompt"],
+            "expected_guard_pair": "deny",
+        },
+        {
+            "label": "controlled_executor_exact_invocation_allowed",
+            "argv": [
+                "uv",
+                "run",
+                "--locked",
+                "python3",
+                "scripts/agent-guards/controlled_git_change_exec.py",
+                "--cwd",
+                worktree,
+                "--snapshot-json",
+                f"{worktree}/.claude/tmp/issue-{fixture.issue_number}-scope-snapshot.json",
+                "--path",
+                "scripts/agent-guards/example.py",
+                "--message",
+                f"feat: issue-{fixture.issue_number} example change",
+                "--expected-head",
+                "0" * 40,
+            ],
+            "expected_execpolicy": ["allow"],
+            "expected_guard_pair": "allow",
+        },
+        {
+            # execpolicy `prefix_rule` matching is strictly literal-prefix,
+            # position-anchored from argv[0] -- it has no wildcard, no
+            # substring/startswith matching, and no argv-length or "exact
+            # shape" modifier (see the comment block above the `bash`
+            # prefix_rule in `.codex/rules/default.rules`). Because the
+            # allow rule for the controlled executor can only anchor on the
+            # fixed `uv run --locked python3 <script>` prefix, it cannot,
+            # by construction, distinguish this well-formed-prefix-plus-
+            # trailing-unexpected-flag invocation from
+            # `controlled_executor_exact_invocation_allowed` above -- both
+            # share the same literal prefix, so execpolicy necessarily
+            # returns the same decision (`allow`) for both. This mirrors
+            # `controlled_executor_from_main_root_denied` /
+            # `controlled_executor_wrong_issue_worktree_denied` below, which
+            # already expect execpolicy=allow + guard_pair=deny for the same
+            # reason (execpolicy cannot inspect argv *values*, only
+            # `worktree_scope_guard.py`'s token-aware
+            # `parse_controlled_git_change_exec_command()` can, and it is
+            # the layer that actually rejects the unexpected extra flag).
+            "label": "controlled_executor_extra_argv_denied",
+            "argv": [
+                "uv",
+                "run",
+                "--locked",
+                "python3",
+                "scripts/agent-guards/controlled_git_change_exec.py",
+                "--cwd",
+                worktree,
+                "--snapshot-json",
+                f"{worktree}/.claude/tmp/issue-{fixture.issue_number}-scope-snapshot.json",
+                "--path",
+                "scripts/agent-guards/example.py",
+                "--message",
+                "feat: example",
+                "--expected-head",
+                "0" * 40,
+                "--unexpected-extra-flag",
+            ],
+            "expected_execpolicy": ["allow"],
+            "expected_guard_pair": "deny",
+        },
+        {
+            "label": "controlled_executor_via_bash_lc_denied",
+            "argv": [
+                "bash",
+                "-lc",
+                f"uv run --locked python3 scripts/agent-guards/controlled_git_change_exec.py --cwd {worktree}",
+            ],
+            "expected_execpolicy": ["forbidden", "prompt"],
+            "expected_guard_pair": "deny",
+        },
+        {
+            "label": "controlled_executor_from_main_root_denied",
+            "argv": [
+                "uv",
+                "run",
+                "--locked",
+                "python3",
+                "scripts/agent-guards/controlled_git_change_exec.py",
+                "--cwd",
+                str(fixture.root),
+                "--snapshot-json",
+                f"{worktree}/.claude/tmp/issue-{fixture.issue_number}-scope-snapshot.json",
+                "--path",
+                "scripts/agent-guards/example.py",
+                "--message",
+                "feat: example",
+                "--expected-head",
+                "0" * 40,
+            ],
+            "expected_execpolicy": ["allow"],
+            "expected_guard_pair": "deny",
+            "expected_guard_reason": "worktree_binding_mismatch",
+        },
+        {
+            "label": "controlled_executor_wrong_issue_worktree_denied",
+            "argv": [
+                "uv",
+                "run",
+                "--locked",
+                "python3",
+                "scripts/agent-guards/controlled_git_change_exec.py",
+                "--cwd",
+                str(fixture.root / ".claude" / "worktrees" / "issue-9999-other"),
+                "--snapshot-json",
+                f"{worktree}/.claude/tmp/issue-{fixture.issue_number}-scope-snapshot.json",
+                "--path",
+                "scripts/agent-guards/example.py",
+                "--message",
+                "feat: example",
+                "--expected-head",
+                "0" * 40,
+            ],
+            "expected_execpolicy": ["allow"],
+            "expected_guard_pair": "deny",
+            "expected_guard_reason": "worktree_binding_mismatch",
+        },
     ]
 
 

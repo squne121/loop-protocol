@@ -20,6 +20,11 @@ const configPath = path.join(repoRoot, '.codex', 'config.toml');
 const hooksPath = path.join(repoRoot, '.codex', 'hooks.json');
 const rulesPath = path.join(repoRoot, '.codex', 'rules', 'default.rules');
 const ledgerPath = path.join(repoRoot, 'artifacts', 'codex', 'subagent-launch-ledger.json');
+// Issue #1611 (contract revision, P1-2): PROTECTED_PATHS_POLICY_V1 JSON SSOT.
+// `isProtectedPath()` below reads THIS file directly (not a hand-mirrored
+// hardcoded list), so this Node consumer can never silently drift from the
+// Python consumer (`scripts/agent-guards/protected_paths_policy.py`).
+const protectedPathsPolicyPath = path.join(repoRoot, 'scripts', 'agent-guards', 'protected_paths_policy.v1.json');
 const ledgerWriterSource = path.join(repoRoot, 'scripts', 'subagent-launch-ledger-writer.c');
 // Issue #1502: the compiled writer binary is built fresh, per invocation,
 // into a private `fs.mkdtempSync` directory *outside* the repo snapshot
@@ -1230,24 +1235,44 @@ function isPathAllowed(filePath, allowedPaths) {
   });
 }
 
+let _protectedPathsPolicyCache = null;
+
+/**
+ * Load PROTECTED_PATHS_POLICY_V1 directly from the JSON SSOT (Issue #1611
+ * contract revision, P1-2). Cached per-process (the file does not change
+ * within a single hook invocation); throws (fail-closed, never silently
+ * falls back to a hardcoded list) if the file is missing/malformed.
+ */
+function loadProtectedPathsPolicy() {
+  if (_protectedPathsPolicyCache) return _protectedPathsPolicyCache;
+  const raw = fs.readFileSync(protectedPathsPolicyPath, 'utf8');
+  const data = JSON.parse(raw);
+  if (data.schema !== 'PROTECTED_PATHS_POLICY_V1' || !Array.isArray(data.rules) || data.rules.length === 0) {
+    throw new Error(`invalid protected paths policy at ${protectedPathsPolicyPath}`);
+  }
+  _protectedPathsPolicyCache = data;
+  return data;
+}
+
 /** Returns true if filePath is a protected path (always denied in any mode). */
 function isProtectedPath(filePath) {
   const candidate = resolveInsideRepo(filePath);
   if (!candidate) return true; // null path (traversal/NUL) → deny
-  const assetsDir = path.resolve(repoRoot, 'assets');
-  const licensesDir = path.resolve(repoRoot, 'LICENSES');
-  // .env* files anywhere in the repo
+  const policy = loadProtectedPathsPolicy();
   const basename = path.basename(filePath);
-  const isEnvFile = /^\.env(\.|$)/.test(basename) || basename === '.env';
-  // secrets/** directory
-  const secretsDir = path.resolve(repoRoot, 'secrets');
-  const isInSecrets = candidate === secretsDir || candidate.startsWith(secretsDir + path.sep);
-  return (
-    candidate === assetsDir || candidate.startsWith(assetsDir + path.sep) ||
-    candidate === licensesDir || candidate.startsWith(licensesDir + path.sep) ||
-    isEnvFile ||
-    isInSecrets
-  );
+  for (const rule of policy.rules) {
+    if (rule.kind === 'root_directory') {
+      const dir = path.resolve(repoRoot, rule.path);
+      if (candidate === dir || candidate.startsWith(dir + path.sep)) return true;
+    } else if (rule.kind === 'basename_glob') {
+      if (rule.pattern.endsWith('*') && !rule.pattern.slice(0, -1).includes('*')) {
+        if (basename.startsWith(rule.pattern.slice(0, -1))) return true;
+      } else if (basename === rule.pattern) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 /** Legacy alias: same as isProtectedPath for backward compat. */
@@ -1442,6 +1467,40 @@ function runSelfTest() {
     }
     fs.unlinkSync(tmpPath);
     selfAssert(threw, 'TOML parser: detects duplicate key');
+  }
+
+  process.stdout.write('\n=== self-test: PROTECTED_PATHS_POLICY_V1 JSON SSOT mirrors ===\n');
+  // Issue #1611 (contract revision, P1-2): every `root_directory` rule in the
+  // JSON SSOT must appear as a read-only `.codex/config.toml` workspace_root
+  // (the validated-mirror invariant this permission profile can represent).
+  {
+    const policy = loadProtectedPathsPolicy();
+    const rootDirRules = policy.rules.filter((r) => r.kind === 'root_directory').map((r) => r.path);
+    selfAssert(rootDirRules.length > 0, 'protected_paths_policy.v1.json: has at least one root_directory rule');
+    // The bundled TOML parser here is a minimal subset (it does not parse
+    // quoted map keys like `"assets" = "read"` into nested objects), so the
+    // mirror check is done against the raw file text within each profile's
+    // `:workspace_roots` table, not the parsed object.
+    const configText = fs.readFileSync(configPath, 'utf8');
+    for (const profileName of ['loop-protocol-rtk', 'loop-protocol-readonly', 'loop-protocol-bootstrap']) {
+      const tableHeader = `[permissions.${profileName}.filesystem.":workspace_roots"]`;
+      const headerIdx = configText.indexOf(tableHeader);
+      selfAssert(headerIdx !== -1, `config.toml: has table ${tableHeader}`);
+      const nextHeaderIdx = configText.indexOf('\n[', headerIdx + tableHeader.length);
+      const tableBody = configText.slice(headerIdx, nextHeaderIdx === -1 ? undefined : nextHeaderIdx);
+      for (const dir of rootDirRules) {
+        selfAssert(
+          new RegExp(`"${dir}"\\s*=\\s*"read"`).test(tableBody),
+          `config.toml [permissions.${profileName}]: workspace_roots."${dir}" mirrors protected_paths_policy.v1.json (read-only)`,
+        );
+      }
+    }
+    // isProtectedPath() must agree with the JSON SSOT for every rule kind.
+    selfAssert(isProtectedPath('assets/sprite.png') === true, 'isProtectedPath: assets/** matches JSON root_directory rule');
+    selfAssert(isProtectedPath('secrets/token') === true, 'isProtectedPath: secrets/** matches JSON root_directory rule');
+    selfAssert(isProtectedPath('.env') === true, 'isProtectedPath: .env matches JSON basename_glob rule');
+    selfAssert(isProtectedPath('.env.production') === true, 'isProtectedPath: .env.* matches JSON basename_glob rule');
+    selfAssert(isProtectedPath('src/main.ts') === false, 'isProtectedPath: unrelated path is not protected');
   }
 
   process.stdout.write('\n=== self-test: Allowed Paths enforcement (Edit/Write) ===\n');

@@ -490,6 +490,7 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 | `target_dir_outside_worktree` | active issue worktree 配下へ戻る | `git status --short` / `git branch --show-current` |
 | `no_matching_worktree` / `ambiguous_worktree` | worktree catalog を 1 件に特定する | `git worktree list` / `git branch --show-current` |
 | `rtk_unknown_inner` | wrapper を剥がさず direct な `rtk git add/commit/push` へ揃える | `rtk git add <allowed-path-file>` / `git branch --show-current` |
+| `git_add_requires_controlled_executor` / `git_commit_requires_controlled_executor` | raw `git add`/`git commit`/`rtk git add`/`rtk git commit` は agent lane では常に deny -- controlled executor 経由に切り替える（Issue #1611 AC9） | `uv run --locked python3 scripts/agent-guards/controlled_git_change_exec.py --help` / `git diff --cached --name-status -M -z` |
 
 ### 運用ガイド
 
@@ -497,6 +498,17 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 - `suggested_command` は authorization を付与しない。rules / hooks / post-run verifier が独立に reject できる。
 - `allowed_paths_missing_for_git_mutation` は fail-closed 理由であり、Issue contract の Allowed Paths binding が runtime に見えていない状態を示す。
 - branch publish failure では `boundary_layer` と `reason_code` を分離し、`expected_remote_head` / `current_remote_head` / `local_head` / `verified_head` の比較が崩れたら `PUBLISH_SAFETY_STOP_REPORT_V1` に倒す。
+- Issue #1611 以降、staging/commit の唯一の認可経路は `scripts/agent-guards/controlled_git_change_exec.py`
+  （`execute_controlled_change`）である。`git_mutation_command_policy.py` の
+  `classify_agent_lane_add_commit` は raw `git add`/`git commit`/`rtk git add`/`rtk git commit`
+  シェルコマンド文字列を、そのコマンド自身が controlled executor でない限り常に deny する（既存の
+  `classify_rtk_git_mutation` の add/commit 分岐は後方互換のため変更していない -- 実際の agent lane
+  はこの新しい deny-first 判定を優先する）。Codex 側の静的 rule
+  (`.codex/rules/default.rules`) も `rtk git add` / `rtk git commit -m` を `forbidden` に narrowing
+  し、controlled executor 本体の exact invocation prefix
+  (`uv run --locked python3 scripts/agent-guards/controlled_git_change_exec.py`) のみ `allow` にして
+  いる（AC14、`scripts/ci/codex_execpolicy_matrix.py` の `execpolicy_case_definitions()` に静的ケース
+  として記録）。
 
 ---
 

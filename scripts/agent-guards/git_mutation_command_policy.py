@@ -35,6 +35,11 @@ COMMAND_CLASS_RTK_GIT_PUSH = "rtk_git_push"
 # the plain `HEAD:refs/heads/<branch>` refspec the existing lane expects.
 COMMAND_CLASS_RTK_GIT_INITIAL_BRANCH_CREATE = "rtk_git_initial_branch_create"
 COMMAND_CLASS_RTK_GIT_UNKNOWN = "rtk_git_unknown"
+# Issue #1611 AC9: raw `git add`/`git commit` and `rtk git add`/`rtk git
+# commit` are always denied outside the controlled executor -- see
+# `classify_agent_lane_add_commit` below.
+COMMAND_CLASS_RAW_GIT_ADD = "raw_git_add"
+COMMAND_CLASS_RAW_GIT_COMMIT = "raw_git_commit"
 ALLOWED_ALLOWED_PATHS_GATE_STATUSES = frozenset({"ok", "fail_closed", "indeterminate"})
 # Issue #1408 iteration-2 (P2): canonical push destination identity. New
 # branch initial publish (remote ref absent) is explicitly out of scope for
@@ -1423,6 +1428,175 @@ def _classify_initial_branch_create_push(
         remote_state=transaction.remote_state,
         remote_state_error_category=transaction.push_error_category,
     )
+
+
+# Issue #1611 AC14 (CI repair, worktree-issue-1611-v2 PR #1620): shared,
+# single-authority recognizer for the EXACT controlled_git_change_exec.py
+# invocation shape. Consumed by `.claude/hooks/worktree_scope_guard.py`
+# (and, by construction, safe for `local_main_branch_guard.py` to reuse) so
+# the PreToolUse guard chain does not fail-closed-deny the one authorized
+# staging/commit executor call shape purely because the process `cwd` (the
+# root checkout) differs from the `--cwd` flag value (the linked issue
+# worktree the executor is told to operate in) -- the executor itself does
+# its own worktree/branch/HEAD binding checks in-process (see
+# `controlled_git_change_exec.py.execute_controlled_change`); this
+# PreToolUse-layer recognizer only has to (a) prove the invocation is the
+# exact expected argv shape (no extra/unknown flags, no shell wrapper riding
+# along) and (b) hand the `--cwd` value back to the caller so it can be
+# containment-checked against the resolved active issue worktree.
+CONTROLLED_GIT_CHANGE_EXEC_SCRIPT = "scripts/agent-guards/controlled_git_change_exec.py"
+_CGCE_METACHAR_RE = re.compile(r"[;&|<>$`\n\r\0\\(){}*?\[\]!~]")
+_CGCE_SINGLE_VALUE_FLAGS = frozenset({"--cwd", "--snapshot-json", "--message", "--expected-head"})
+_CGCE_REPEATABLE_VALUE_FLAGS = frozenset({"--path"})
+_CGCE_REQUIRED_FLAGS = frozenset({"--cwd", "--snapshot-json", "--message", "--expected-head"})
+
+
+@dataclass(frozen=True)
+class ControlledGitChangeExecCommand:
+    """Parsed exact `controlled_git_change_exec.py` CLI invocation (AC14)."""
+
+    cwd: str
+    snapshot_json: str
+    paths: tuple[str, ...]
+    message: str
+    expected_head: str
+
+
+def parse_controlled_git_change_exec_command(
+    command: str, project_root: str
+) -> ControlledGitChangeExecCommand | None:
+    """Return the parsed argv iff `command` is an exact, unwrapped
+    `uv run --locked python3 scripts/agent-guards/controlled_git_change_exec.py
+    [FLAGS]` invocation, else None.
+
+    Rejects: shell metacharacters / wrappers (`bash -lc`, etc. -- the token
+    sequence must start literally with `uv run --locked python3`), any
+    positional argument, `--flag=value` forms, duplicate single-value flags,
+    unknown flags, missing required flags, and a script path that does not
+    resolve (relative to `project_root`) to the canonical executor. Does NOT
+    validate `--cwd` against the active issue worktree -- that containment
+    check is the caller's responsibility (the caller has the resolved
+    expected-worktree context this module does not).
+    """
+    if not command or not command.strip():
+        return None
+    if _CGCE_METACHAR_RE.search(command):
+        return None
+    toks = _tokenize(command)
+    if not toks or len(toks) < 5:
+        return None
+    if toks[:4] != ["uv", "run", "--locked", "python3"]:
+        return None
+
+    script_token = toks[4]
+    if not script_token or script_token.startswith("-") or script_token == "-c":
+        return None
+    if script_token.startswith("/tmp/"):
+        return None
+    script_real = (
+        os.path.realpath(script_token)
+        if os.path.isabs(script_token)
+        else os.path.realpath(os.path.join(project_root, script_token))
+    )
+    canonical_script = os.path.realpath(os.path.join(project_root, CONTROLLED_GIT_CHANGE_EXEC_SCRIPT))
+    if script_real != canonical_script:
+        return None
+
+    values: dict[str, list[str]] = {}
+    args = toks[5:]
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if not tok.startswith("--") or "=" in tok:
+            return None
+        if tok in _CGCE_SINGLE_VALUE_FLAGS:
+            if tok in values or i + 1 >= len(args):
+                return None
+            val = args[i + 1]
+            if val.startswith("--"):
+                return None
+            values[tok] = [val]
+            i += 2
+            continue
+        if tok in _CGCE_REPEATABLE_VALUE_FLAGS:
+            if i + 1 >= len(args):
+                return None
+            val = args[i + 1]
+            if val.startswith("--"):
+                return None
+            values.setdefault(tok, []).append(val)
+            i += 2
+            continue
+        return None  # unknown flag
+
+    if not _CGCE_REQUIRED_FLAGS.issubset(values):
+        return None
+    paths = tuple(values.get("--path", ()))
+    if not paths:
+        return None
+
+    return ControlledGitChangeExecCommand(
+        cwd=values["--cwd"][0],
+        snapshot_json=values["--snapshot-json"][0],
+        paths=paths,
+        message=values["--message"][0],
+        expected_head=values["--expected-head"][0],
+    )
+
+
+def classify_agent_lane_add_commit(command: str) -> GitMutationPolicyResult | None:
+    """Issue #1611 AC9: deny raw `git add`/`git commit` and `rtk git
+    add`/`rtk git commit` shell command shapes unconditionally for the
+    agent lane.
+
+    The ONLY authorized path for staging/committing agent-driven changes
+    is the controlled executor
+    (`scripts/agent-guards/controlled_git_change_exec.py`,
+    `execute_controlled_change`), which never goes through a `rtk git
+    ...` / `git ...` shell command string at all -- it invokes git
+    in-process via `subprocess.run` with a literal argv, inside a single
+    trusted stage -> classify -> audit -> commit -> re-audit boundary.
+    Any shell command string shaped like `git add` / `git commit` / `rtk
+    git add` / `rtk git commit` reaching this classifier is, by
+    definition, NOT the controlled executor -- so it is always denied,
+    independent of `CODEX_ALLOWED_PATHS` / staged-path contents (unlike
+    the legacy `classify_rtk_git_mutation` add/commit branches above,
+    which this function does not modify -- Issue #1611 AC13 keeps those
+    existing branches, and their existing regression tests, unchanged).
+    """
+    tokens = _tokenize(command)
+    if not tokens:
+        return None
+    if len(tokens) >= 3 and tokens[0] == "rtk" and tokens[1] == "git":
+        git_argv = tokens[1:]
+    elif len(tokens) >= 2 and tokens[0] == "git":
+        git_argv = tokens
+    else:
+        return None
+    if len(git_argv) < 2:
+        return None
+    subcommand = git_argv[1]
+    if subcommand == "add":
+        return GitMutationPolicyResult(
+            status="deny",
+            command_class=COMMAND_CLASS_RAW_GIT_ADD,
+            reason_code="git_add_requires_controlled_executor",
+            suggested_command=(
+                "uv run --locked python3 scripts/agent-guards/controlled_git_change_exec.py --help"
+            ),
+            verification_command="git diff --cached --name-status -M -z",
+        )
+    if subcommand == "commit":
+        return GitMutationPolicyResult(
+            status="deny",
+            command_class=COMMAND_CLASS_RAW_GIT_COMMIT,
+            reason_code="git_commit_requires_controlled_executor",
+            suggested_command=(
+                "uv run --locked python3 scripts/agent-guards/controlled_git_change_exec.py --help"
+            ),
+            verification_command="git log -1 --name-status",
+        )
+    return None
 
 
 def classify_rtk_git_mutation(
