@@ -307,7 +307,7 @@ fail-closed で `ValueError` になる）:
 - `protected_paths_policy_schema` / `protected_paths_policy_sha256`（JSON の生content の sha256）
 - `authority_mode`（下記の状態遷移）
 
-### Live GitHub-bound materializer
+### Live GitHub-bound materializer（live GitHub Issue から snapshot を実体化する materializer）
 
 `scripts/agent-guards/materialize_issue_scope_snapshot.py` は、live Issue
 readback と `CONTRACT_REVIEW_RESULT_V1 status: go` の comment URL を再読込して

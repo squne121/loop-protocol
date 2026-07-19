@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import stat
 import subprocess
 import sys
@@ -26,7 +25,6 @@ if str(_HERE) not in sys.path:
 
 from controlled_git_change_exec import (  # noqa: E402
     CONTRACT_SOURCE_ISSUE_COMMENT,
-    IssueScopeSnapshot,
     build_issue_scope_snapshot,
 )
 
@@ -283,7 +281,15 @@ def main(argv: list[str] | None = None) -> int:
             output=args.output,
         )
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        print(json.dumps({"schema": "ISSUE_SCOPE_SNAPSHOT_MATERIALIZE_RESULT_V1", "status": "denied", "reason_code": str(exc)}))
+        print(
+            json.dumps(
+                {
+                    "schema": "ISSUE_SCOPE_SNAPSHOT_MATERIALIZE_RESULT_V1",
+                    "status": "denied",
+                    "reason_code": str(exc),
+                }
+            )
+        )
         return 1
     print(json.dumps(result, ensure_ascii=False))
     return 0

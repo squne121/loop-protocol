@@ -25,7 +25,12 @@ def _live_issue(issue_body: str, source_body: str) -> dict:
     return {
         "body": issue_body,
         "updatedAt": "2026-07-19T04:22:25Z",
-        "comments": [{"url": "https://github.com/squne121/loop-protocol/issues/1629#issuecomment-5014250179", "body": source_body}],
+        "comments": [
+            {
+                "url": "https://github.com/squne121/loop-protocol/issues/1629#issuecomment-5014250179",
+                "body": source_body,
+            }
+        ],
     }
 
 
@@ -37,7 +42,10 @@ def test_materializer_binds_live_github_contract_and_worktree(tmp_path: Path, mo
         "materialize_issue_scope_snapshot._validate_worktree_binding", lambda root, path, branch: root
     )
     monkeypatch.setattr("materialize_issue_scope_snapshot._default_branch_sha", lambda root, ref: "a" * 40)
-    monkeypatch.setattr("materialize_issue_scope_snapshot._load_live_issue", lambda *args: _live_issue(issue_body, source_body))
+    monkeypatch.setattr(
+        "materialize_issue_scope_snapshot._load_live_issue",
+        lambda *args: _live_issue(issue_body, source_body),
+    )
 
     result = materialize(
         issue_number=1629,
@@ -67,7 +75,10 @@ def test_materializer_rejects_readback_drift_binding_and_unsafe_output(tmp_path:
     stale_body = "## Allowed Paths\n\n- scripts/agent-guards/example.py\n"
     monkeypatch.setattr(
         "materialize_issue_scope_snapshot._load_live_issue",
-        lambda *args: _live_issue(stale_body, "CONTRACT_REVIEW_RESULT_V1:\n  status: go\n  body_sha256: \"sha256:stale\"\n"),
+        lambda *args: _live_issue(
+            stale_body,
+            "CONTRACT_REVIEW_RESULT_V1:\n  status: go\n  body_sha256: \"sha256:stale\"\n",
+        ),
     )
     import pytest
 
