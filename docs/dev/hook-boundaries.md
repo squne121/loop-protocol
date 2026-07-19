@@ -118,6 +118,9 @@ hook_boundaries_manifest_v1:
       /tmp wrapper / python -c は unparseable_branch_mutation で fail-closed。
       deterministic_checker_command は DETERMINISTIC_CHECKER_ALLOWLIST の exact-path のみ許可。
       probe scripts (git_ref_probe.py / git_worktree_probe.py) は DETERMINISTIC_CHECKER_ALLOWLIST に登録済み（Issue #1197）。
+      `issue_scope_snapshot.materialize` は controlled_skill_mutation_exec の exact command id
+      としてのみ許可する。live GitHub-bound scope snapshot artifact の producer であり、
+      任意の Python/heredoc または raw git commit を代替経路として許可しない。
       local root default branch 保護（branch drift 防止）は維持しつつ、Issue #1241 以降は shared policy で
       bounded な `rtk git add/commit/push` と `HOOK_COMMAND_REPAIR_HINT_V1` を扱う。
 
