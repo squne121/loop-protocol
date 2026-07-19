@@ -1504,7 +1504,7 @@ exact command class allow は executor script identity + argv 形状のみを検
 `_classify_gh` により引き続き `mutating` に分類され、active issue + no-matching-worktree
 状態では block される。
 
-## isolation worktree agent の Issue comment request bridge（Issue #1633）
+## isolation worktree agent の Issue コメント投稿ブリッジ機構（Issue #1633）
 
 （Issue #1633 — `publish_termination_report.py::_post_github_comment` が保持していた
 唯一の raw `gh issue comment` production 呼び出しを、既存の
@@ -1522,7 +1522,7 @@ git/gh mutation は hook で全面ブロックされ、worktree agent には Wri
 parent orchestrator（`publish_termination_report.py`）がその request を検証・
 materialize し、既存の controlled executor lane を起動する。
 
-### ISOLATION_ISSUE_COMMENT_REQUEST_V1（bounded request schema）
+### ISOLATION_ISSUE_COMMENT_REQUEST_V1（境界付きリクエストスキーマ）
 
 `scripts/agent-guards/controlled_skill_mutation_policy.py` に閉じたキー集合のみを
 許可するスキーマを定義する:
@@ -1538,7 +1538,7 @@ ISOLATION_ISSUE_COMMENT_REQUEST_ALLOWED_KEYS = frozenset({
 closed-key チェック・schema 一致・issue_number/repo の呼び出し元宣言値との一致・
 `marker` が `comment_body` に埋め込まれていることを検証する。
 
-### materialize_isolation_issue_comment_request()（parent 側 materializer）
+### materialize_isolation_issue_comment_request()（親 root 側の書き込み関数）
 
 `.claude/skills/issue-refinement-loop/scripts/publish_termination_report.py` に
 追加した関数。bounded request を受け取り、上記バリデータを通した上で
@@ -1577,7 +1577,7 @@ scripts/agent-guards/controlled_skill_mutation_exec.py` の exact prefix allow
 エントリと同じ共有 authorization lane に Codex 側も乗る
 （詳細は `docs/dev/hook-boundaries.md` の該当セクション参照）。
 
-### no-live-mutation integration test（AC4）
+### no-live-mutation 統合テスト（AC4）
 
 `scripts/agent-guards/tests/test_isolation_issue_comment_publish_bridge.py` が
 fake `gh`（`controlled_skill_mutation_exec.py` の `_find_gh_bin` /
