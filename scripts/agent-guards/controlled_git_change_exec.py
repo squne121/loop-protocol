@@ -864,6 +864,10 @@ def execute_controlled_change(
 # ─── CLI entrypoint ───────────────────────────────────────────────────────────
 
 _MAX_INPUT_FILE_BYTES = 1_000_000
+_MATERIALIZER_COMMAND_ID = "issue_scope_snapshot.materialize"
+_MATERIALIZER_OUTPUT_NAME = "issue_scope_snapshot.json"
+_MATERIALIZER_PROVENANCE_NAME = "issue_scope_snapshot.provenance.json"
+_MATERIALIZER_PROVENANCE_SCHEMA = "ISSUE_SCOPE_SNAPSHOT_MATERIALIZER_PROVENANCE_V1"
 
 
 def _validate_input_file(path: Path) -> Optional[str]:
@@ -883,6 +887,56 @@ def _validate_input_file(path: Path) -> Optional[str]:
             return "input_file_oversized"
     except OSError:
         return "input_file_stat_failed"
+    return None
+
+
+def _validate_materialized_snapshot_provenance(
+    snapshot_path: Path, snapshot_data: Dict[str, Any], cwd: str
+) -> Optional[str]:
+    """Accept only the materializer-owned snapshot artifact and sidecar.
+
+    ``ISSUE_SCOPE_SNAPSHOT_V1`` deliberately remains unchanged.  Provenance
+    is consequently a fixed-location, hash-bound sidecar rather than a
+    self-declared extra key in the snapshot JSON.
+    """
+    issue_number = snapshot_data.get("issue_number")
+    repository = snapshot_data.get("repository_full_name")
+    if type(issue_number) is not int or issue_number <= 0 or not isinstance(repository, str):
+        return "snapshot_identity_invalid"
+    repo_root = _git_toplevel(cwd)
+    if repo_root is None:
+        return "repository_binding_unavailable"
+    artifact_root = Path(repo_root) / "artifacts" / str(issue_number) / "issue-metadata" / _MATERIALIZER_COMMAND_ID
+    expected_snapshot = artifact_root / _MATERIALIZER_OUTPUT_NAME
+    expected_provenance = artifact_root / _MATERIALIZER_PROVENANCE_NAME
+    if snapshot_path.resolve(strict=False) != expected_snapshot.resolve(strict=False):
+        return "snapshot_not_materializer_owned"
+    provenance_error = _validate_input_file(expected_provenance)
+    if provenance_error is not None:
+        return f"materializer_provenance_{provenance_error}"
+    try:
+        provenance = json.loads(expected_provenance.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "materializer_provenance_invalid_json"
+    if not isinstance(provenance, dict):
+        return "materializer_provenance_not_object"
+    snapshot_sha256 = "sha256:" + hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+    required = {
+        "schema": _MATERIALIZER_PROVENANCE_SCHEMA,
+        "producer": "scripts/agent-guards/materialize_issue_scope_snapshot.py",
+        "command_id": _MATERIALIZER_COMMAND_ID,
+        "repository_full_name": repository,
+        "issue_number": issue_number,
+        "artifact_path": str(expected_snapshot.relative_to(repo_root)),
+        "artifact_sha256": snapshot_sha256,
+        "worktree_realpath": snapshot_data.get("worktree_realpath"),
+        "branch_ref": snapshot_data.get("branch_ref"),
+        "base_ref": snapshot_data.get("base_ref"),
+        "base_sha": snapshot_data.get("base_sha"),
+    }
+    for key, expected in required.items():
+        if provenance.get(key) != expected:
+            return f"materializer_provenance_{key}_mismatch"
     return None
 
 
@@ -925,8 +979,16 @@ def _main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps({"status": "denied", "reason_code": "commit_message_required"}))
         return 1
 
-    with open(snapshot_path, encoding="utf-8") as fh:
-        snapshot_data = json.load(fh)
+    try:
+        with open(snapshot_path, encoding="utf-8") as fh:
+            snapshot_data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        print(json.dumps({"status": "denied", "reason_code": "snapshot_json_invalid"}))
+        return 1
+    provenance_error = _validate_materialized_snapshot_provenance(snapshot_path, snapshot_data, args.cwd)
+    if provenance_error is not None:
+        print(json.dumps({"status": "denied", "reason_code": provenance_error}))
+        return 1
     snapshot = IssueScopeSnapshot(
         schema_version=snapshot_data.get("schema_version", SCHEMA_VERSION),
         repository_full_name=snapshot_data["repository_full_name"],

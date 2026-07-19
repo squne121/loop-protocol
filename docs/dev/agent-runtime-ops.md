@@ -307,6 +307,22 @@ fail-closed で `ValueError` になる）:
 - `protected_paths_policy_schema` / `protected_paths_policy_sha256`（JSON の生content の sha256）
 - `authority_mode`（下記の状態遷移）
 
+### Live GitHub-bound materializer
+
+`scripts/agent-guards/materialize_issue_scope_snapshot.py` は、live Issue
+readback と `CONTRACT_REVIEW_RESULT_V1 status: go` の comment URL を再読込して
+snapshot を生成する唯一の producer である。呼出しは
+`issue_scope_snapshot.materialize` command id を通し、入力 request の
+repository / Issue / worktree / branch / default-base / output root を固定する。
+
+出力は `artifacts/<issue>/issue-metadata/issue_scope_snapshot.materialize/` の
+`issue_scope_snapshot.json` と hash-bound provenance sidecar の対である。
+`ISSUE_SCOPE_SNAPSHOT_V1` 自体の key set は互換維持のため変更しない。consumer は
+固定パス・regular non-link file・sidecar schema・artifact hash と snapshot binding を
+検証するため、任意の `--snapshot-json` や provenance のない手書き JSON は拒否する。
+GitHub readback、contract source drift、base/worktree/branch binding、unsafe path のいずれかが
+不成立なら artifact を残さず fail-closed とする。
+
 ### 実行ステップ（単一 transaction、「案B」: `git commit --only` + audit-then-rollback）
 
 1. 認可 gate: `authority_mode == new_disabled_fail_closed` なら即座に deny（add/commit 停止）。

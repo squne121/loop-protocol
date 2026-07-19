@@ -84,6 +84,7 @@ from controlled_skill_mutation_policy import (
     COMMAND_ID_ISSUE_COMMENT_PUBLISH,
     COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
     COMMAND_ID_PR_REVIEW_PUBLISH,
+    COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
     ALL_COMMAND_IDS,
     INPUT_SCHEMA_BY_COMMAND,
     ENV_BINDING_MANDATORY_COMMAND_IDS,
@@ -104,6 +105,7 @@ _EVALUATE_PRODUCT_SPEC_GATE_REL = (
 _CONTRACT_REVIEW_RESULT_PARSER_REL = (
     ".claude/skills/issue-contract-review/scripts/contract_review_result_parser.py"
 )
+_ISSUE_SCOPE_SNAPSHOT_MATERIALIZER_REL = "scripts/agent-guards/materialize_issue_scope_snapshot.py"
 
 # -- Result schema -------------------------------------------------------------
 
@@ -614,6 +616,15 @@ def _validate_contract_snapshot_publish_fields(data: dict, repo: str) -> str:
     return ""
 
 
+def _validate_issue_scope_snapshot_materialize_fields(data: dict, repo: str) -> str:
+    if data.get("repo") != repo:
+        return "issue_scope_snapshot_materialize_repo_mismatch"
+    for field in ("contract_snapshot_url", "base_ref", "branch_name", "worktree_path", "output_path"):
+        if not isinstance(data.get(field), str) or not data[field]:
+            return f"issue_scope_snapshot_materialize_field_invalid: {field!r}"
+    return ""
+
+
 # -- Issue #1284: env binding (AC15) --------------------------------------------
 
 
@@ -1072,10 +1083,51 @@ def main(argv: list[str] | None = None) -> int:
         return _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail, _ok)
     if args.command_id == COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH:
         return _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok)
+    if args.command_id == COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE:
+        return _run_issue_scope_snapshot_materialize(args, input_data, _fail, _ok)
     if args.command_id == COMMAND_ID_PR_REVIEW_PUBLISH:
         return _run_pr_review_publish(args, input_data, gh_bin, _fail, _ok)
 
     return _fail(f"unhandled_command_id: {args.command_id!r}")  # pragma: no cover — defensive
+
+
+def _run_issue_scope_snapshot_materialize(args, input_data, _fail, _ok) -> int:
+    field_err = _validate_issue_scope_snapshot_materialize_fields(input_data, args.repo)
+    if field_err:
+        return _fail(field_err)
+    if input_data["worktree_path"] != str(PROJECT_ROOT.resolve()):
+        return _fail("issue_scope_snapshot_materialize_worktree_binding_mismatch")
+    expected_output = (
+        f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/"
+        f"{args.command_id}/issue_scope_snapshot.json"
+    )
+    if input_data["output_path"] != expected_output:
+        return _fail("issue_scope_snapshot_materialize_output_binding_mismatch")
+    materializer_path = (PROJECT_ROOT / _ISSUE_SCOPE_SNAPSHOT_MATERIALIZER_REL).resolve()
+    if not materializer_path.exists() or not materializer_path.is_relative_to(PROJECT_ROOT.resolve()):
+        return _fail("issue_scope_snapshot_materializer_module_shadowing")
+    if args.dry_run:
+        return _ok({"status_detail": "dry_run_ok"})
+    try:
+        from materialize_issue_scope_snapshot import materialize
+
+        result = materialize(
+            issue_number=args.issue_number,
+            repo=args.repo,
+            contract_snapshot_url=input_data["contract_snapshot_url"],
+            base_ref=input_data["base_ref"],
+            branch_name=input_data["branch_name"],
+            worktree_path=input_data["worktree_path"],
+            output=input_data["output_path"],
+            project_root=PROJECT_ROOT,
+        )
+    except Exception as exc:
+        return _fail(f"issue_scope_snapshot_materialize_failed: {exc}", status="failed")
+    write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
+    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+    if changed:
+        return _fail("postcondition_tracked_changes_detected", changed, status="failed")
+    return _ok(result)
 
 
 def _run_termination_report_publish(args, canonical_input, gh_bin, _fail, _ok) -> int:
