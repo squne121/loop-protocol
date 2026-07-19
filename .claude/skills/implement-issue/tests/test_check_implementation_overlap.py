@@ -300,6 +300,13 @@ def test_given_blocked_by_closed_predecessor_then_route_is_not_blocked() -> None
     assert exit_code == EXIT_OK
     assert payload["dependency_resolution"]["closed_predecessors"] == [9449]
     assert payload["candidates"][0]["policy_class"] == "C2a"
+    # #1621 P2 Major (PR #1637 レビュー): predecessor (dependency_c2a origin)
+    # の dependency_relation / provenance も保存される。current の
+    # Machine-Readable Contract の `blocked_by: ["#9449"]` が根拠。
+    assert payload["candidates"][0]["dependency_relation"] == "predecessor", payload
+    assert payload["candidates"][0]["dependency_provenance"] == [
+        {"source": "current_contract_blocked_by", "repository": DEFAULT_REPO, "issue_number": 9449}
+    ], payload
 
 
 def test_given_native_github_dependency_blocked_by_open_then_route_is_wait_for_predecessor() -> None:
@@ -1091,3 +1098,248 @@ def test_human_c1_decision_final_readback_detects_fingerprint_drift(tmp_path: Pa
     )
     assert decisions["accepted"][0]["final_readback_verified"] is False
     assert decisions["rejected"][0]["reason"] == "final_readback_fingerprint_drift"
+
+
+# ------------------------------------------------------------
+# #1621 AC3/AC4/AC5/AC10: successor index injection (adapter, --dry-run
+# path) fixes the adapter's blanket origin/verdict -> policy_class mapping
+# so a successor candidate is evidenced as C2a (not C1), distinguished
+# per-candidate from a normal C1 candidate in the same overlap_partial set,
+# and PR #1615's human C1 decision override cannot clear it.
+# ------------------------------------------------------------
+
+
+def _body_with_paths(*, parent_issue: str, goal_ref: str, outcome: str, paths: list[str]) -> str:
+    path_lines = "\n".join(f"- {p}" for p in paths)
+    return "\n".join(
+        [
+            "## Machine-Readable Contract",
+            "",
+            "```yaml",
+            "contract_schema_version: v1",
+            "issue_kind: implementation",
+            f'parent_issue: "{parent_issue}"',
+            f'goal_ref: "{goal_ref}"',
+            "change_kind: code",
+            "```",
+            "",
+            "## Outcome",
+            "",
+            outcome,
+            "",
+            "## In Scope",
+            "",
+            path_lines,
+            "",
+            "## Allowed Paths",
+            "",
+            path_lines,
+            "",
+        ]
+    )
+
+
+def test_given_shared_parent_native_blocking_successor_then_route_is_c2a_not_parent_collision(tmp_path: Path) -> None:
+    """#1621 AC3/AC4: shared parent_refs を持つ candidate は旧実装では第一段階で
+    parent_child_collision(AMBIGUOUS_REQUIRES_HUMAN) になり human_review_required
+    に停止していた。current の native blocking から構築した successor index が
+    最初の classify_overlap() 呼び出し前に candidate の depends_on へ current
+    番号を注入することで、successor_dependency_ordering(C2a) と判定され
+    proceed_with_collision_evidence に route する。
+    """
+    current_number = 9710
+    candidate_number = 9711
+    current = {
+        "number": current_number,
+        "title": "実装: current side",
+        "body": _body_with_paths(
+            parent_issue="#9690",
+            goal_ref="current goal alpha",
+            outcome="current outcome about alpha beta gamma.",
+            paths=["docs/dev/successor_shared_dry_run.md"],
+        ),
+        "updatedAt": "2026-07-19T00:00:00Z",
+        "url": f"https://github.com/{DEFAULT_REPO}/issues/{current_number}",
+        "blocking": [{"repository": DEFAULT_REPO, "number": candidate_number, "state": "OPEN"}],
+    }
+    candidate = {
+        "number": candidate_number,
+        "title": "実装: candidate side",
+        "body": _body_with_paths(
+            parent_issue="#9690",
+            goal_ref="candidate goal beta",
+            outcome="candidate outcome about delta epsilon zeta.",
+            paths=["docs/dev/successor_shared_dry_run.md"],
+        ),
+        "labels": [{"name": "phase/implementation"}],
+        "updatedAt": "2026-07-19T00:05:00Z",
+        "url": f"https://github.com/{DEFAULT_REPO}/issues/{candidate_number}",
+        "state": "OPEN",
+        # 注意: blockedBy は意図的に存在しない
+    }
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [candidate])
+
+    exit_code, payload = _run_cli(current_number, current_file, candidates_file)
+
+    assert exit_code == EXIT_OK
+    assert payload["route"] == "proceed_with_collision_evidence", payload
+    assert len(payload["candidates"]) == 1
+    cand_evidence = payload["candidates"][0]
+    assert cand_evidence["issue_number"] == candidate_number
+    assert cand_evidence["policy_class"] == "C2a", payload
+    assert "successor_dependency_ordering" in cand_evidence["reasons"], payload
+    # #1621 P2 Major (PR #1637 レビュー): dependency_relation / provenance
+    # が candidate evidence に保存され、current の native blocking が根拠
+    # であることが監査可能。
+    assert cand_evidence["dependency_relation"] == "successor", payload
+    assert cand_evidence["dependency_provenance"] == [
+        {"source": "current_native_blocking", "repository": DEFAULT_REPO, "issue_number": current_number}
+    ], payload
+
+
+def test_given_mixed_normal_c1_and_successor_candidates_then_policy_class_distinguished_per_candidate(
+    tmp_path: Path,
+) -> None:
+    """#1621 AC5: 同一 overlap_partial 集合に通常 C1 candidate（successor でも
+    predecessor でもない）と successor candidate が混在する場合、
+    candidates_evidence 内で両者の policy_class が candidate ごとに区別される。
+    """
+    current_number = 9720
+    successor_number = 9721
+    normal_number = 9722
+    shared_path = "docs/dev/mixed_c1_c2a.md"
+    current = {
+        "number": current_number,
+        "title": "実装: current mixed side",
+        "body": _body_with_paths(
+            parent_issue="none",
+            goal_ref="current goal mixed",
+            outcome="current outcome about alpha beta gamma delta.",
+            paths=[shared_path, "docs/dev/mixed_current_only.md"],
+        ),
+        "updatedAt": "2026-07-19T00:00:00Z",
+        "url": f"https://github.com/{DEFAULT_REPO}/issues/{current_number}",
+        "blocking": [{"repository": DEFAULT_REPO, "number": successor_number, "state": "OPEN"}],
+    }
+    successor_candidate = {
+        "number": successor_number,
+        "title": "実装: successor candidate",
+        "body": _body_with_paths(
+            parent_issue="none",
+            goal_ref="successor goal",
+            outcome="successor outcome about epsilon zeta eta theta.",
+            paths=[shared_path],
+        ),
+        "labels": [{"name": "phase/implementation"}],
+        "updatedAt": "2026-07-19T00:05:00Z",
+        "url": f"https://github.com/{DEFAULT_REPO}/issues/{successor_number}",
+        "state": "OPEN",
+    }
+    normal_candidate = {
+        "number": normal_number,
+        "title": "実装: normal C1 candidate",
+        "body": _body_with_paths(
+            parent_issue="none",
+            goal_ref="normal goal",
+            outcome="normal outcome about iota kappa lambda mu.",
+            paths=[shared_path],
+        ),
+        "labels": [{"name": "phase/implementation"}],
+        "updatedAt": "2026-07-19T00:06:00Z",
+        "url": f"https://github.com/{DEFAULT_REPO}/issues/{normal_number}",
+        "state": "OPEN",
+    }
+    current_file, candidates_file = _write_overlap_inputs(
+        tmp_path, current, [successor_candidate, normal_candidate]
+    )
+
+    exit_code, payload = _run_cli(current_number, current_file, candidates_file)
+
+    assert exit_code == EXIT_OK
+    assert payload["route"] == "proceed_with_collision_evidence", payload
+    by_number = {c["issue_number"]: c for c in payload["candidates"]}
+    assert set(by_number) == {successor_number, normal_number}
+    assert by_number[successor_number]["policy_class"] == "C2a", payload
+    assert "successor_dependency_ordering" in by_number[successor_number]["reasons"], payload
+    assert by_number[normal_number]["policy_class"] == "C1", payload
+    assert "successor_dependency_ordering" not in by_number[normal_number]["reasons"], payload
+    # #1621 P2 Major (PR #1637 レビュー): dependency_relation は candidate
+    # ごとに区別され、normal C1 candidate は "none" のまま provenance も
+    # 空である。
+    assert by_number[successor_number]["dependency_relation"] == "successor", payload
+    assert by_number[successor_number]["dependency_provenance"] == [
+        {"source": "current_native_blocking", "repository": DEFAULT_REPO, "issue_number": current_number}
+    ], payload
+    assert by_number[normal_number]["dependency_relation"] == "none", payload
+    assert by_number[normal_number]["dependency_provenance"] == [], payload
+
+
+def test_given_human_c1_decision_targets_successor_c2a_candidate_when_c1_candidate_also_present_then_rejected(
+    tmp_path: Path,
+) -> None:
+    """#1621 AC10: 同一 evidence 集合に通常 C1 candidate と successor C2a
+    candidate が混在する場合でも、human C1 decision override は C2a
+    candidate を解除できない（policy_class == "C1" のみを対象とする既存
+    validator が candidate_not_current_c1_overlap で拒否する）。
+    """
+    current_number = 9750
+    successor_number = 9751
+    normal_number = 9752
+    shared_path = "docs/dev/ac10_mixed.md"
+    current = {
+        "number": current_number,
+        "title": "実装: current AC10 mixed side",
+        "body": _body_with_paths(
+            parent_issue="none",
+            goal_ref="current goal ac10 mixed",
+            outcome="current outcome about alpha beta gamma ac10 mixed.",
+            paths=[shared_path, "docs/dev/ac10_current_only.md"],
+        ),
+        "updatedAt": "2026-07-19T00:00:00Z",
+        "url": f"https://github.com/{DEFAULT_REPO}/issues/{current_number}",
+        "blocking": [{"repository": DEFAULT_REPO, "number": successor_number, "state": "OPEN"}],
+    }
+    successor_candidate = {
+        "number": successor_number,
+        "title": "実装: successor AC10 candidate",
+        "body": _body_with_paths(
+            parent_issue="none",
+            goal_ref="successor goal ac10",
+            outcome="successor outcome about epsilon zeta eta theta ac10.",
+            paths=[shared_path],
+        ),
+        "labels": [{"name": "phase/implementation"}],
+        "updatedAt": "2026-07-19T00:05:00Z",
+        "url": f"https://github.com/{DEFAULT_REPO}/issues/{successor_number}",
+        "state": "OPEN",
+    }
+    normal_candidate = {
+        "number": normal_number,
+        "title": "実装: normal AC10 candidate",
+        "body": _body_with_paths(
+            parent_issue="none",
+            goal_ref="normal goal ac10",
+            outcome="normal outcome about iota kappa lambda mu ac10.",
+            paths=[shared_path],
+        ),
+        "labels": [{"name": "phase/implementation"}],
+        "updatedAt": "2026-07-19T00:06:00Z",
+        "url": f"https://github.com/{DEFAULT_REPO}/issues/{normal_number}",
+        "state": "OPEN",
+    }
+    comment = _human_c1_comment(current=current, candidate=successor_candidate)
+    current["comments"] = [comment]
+    current_file, candidates_file = _write_overlap_inputs(
+        tmp_path, current, [successor_candidate, normal_candidate]
+    )
+
+    exit_code, payload = _run_cli(current_number, current_file, candidates_file)
+
+    assert exit_code == EXIT_OK
+    by_number = {c["issue_number"]: c for c in payload["candidates"]}
+    assert by_number[successor_number]["policy_class"] == "C2a", payload
+    assert by_number[normal_number]["policy_class"] == "C1", payload
+    decisions = payload["human_c1_decisions"]
+    assert decisions["accepted"] == []
+    rejected_reasons = {item["reason"] for item in decisions["rejected"]}
+    assert "candidate_not_current_c1_overlap" in rejected_reasons, payload
