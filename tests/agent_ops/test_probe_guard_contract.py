@@ -77,7 +77,7 @@ class TestWorktreeScopeGuardArgSpecs:
         """Import worktree_scope_guard for inspection."""
         import importlib.util
 
-        guard_py = REPO_ROOT / ".claude" / "hooks" / "worktree_scope_guard.py"
+        guard_py = REPO_ROOT / "scripts" / "agent-guards" / "worktree_scope_guard.py"
         spec = importlib.util.spec_from_file_location("worktree_scope_guard", str(guard_py))
         mod = importlib.util.module_from_spec(spec)
         # Set up sys.path for guard dependencies

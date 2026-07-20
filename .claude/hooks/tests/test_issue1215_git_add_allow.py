@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Issue #1215: Allow coverage for explicit git add pathspecs in scope guard."""
 
-from test_worktree_scope_guard import _bash_payload, _make_repo_with_worktree, _run_guard
+from worktree_scope_guard_testkit import _bash_payload, _make_repo_with_worktree, _run_guard
 
 
 def test_issue1215_git_add_allow_explicit_file(tmp_path):

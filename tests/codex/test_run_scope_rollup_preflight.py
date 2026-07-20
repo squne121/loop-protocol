@@ -2,9 +2,20 @@
 tests/codex/test_run_scope_rollup_preflight.py
 
 Issue #1547 AC4/AC5/AC6/AC7/AC8 + PR #1560 OWNER fix_delta (P0-1/P0-2/P0-3/
-P1-1/P1-2/P1-3) tests. `gh` and the planner/verifier subprocess calls are
-stubbed via monkeypatched module-level functions so the tests are hermetic
-and do not require network access or a real `gh` binary.
+P1-1/P1-2/P1-3) + Issue #1593 (PR #1643 review, P0-1/P0-2/P0-3/P1-1/P1-3)
+tests. `gh` and the planner/verifier subprocess calls are stubbed via
+monkeypatched module-level functions so the tests are hermetic and do not
+require network access or a real `gh` binary.
+
+PR #1643 review (P0-2): the inventory fetch path now speaks
+`gh api graphql` exclusively (`_run_gh_graphql`) for both the top-level
+issues/pullRequests connections and the nested per-PR `files` connection;
+`gh issue list` / `gh pr list` are no longer used anywhere in
+`_run_transaction`. The fake dispatchers below were updated from the old
+`gh issue list` / `gh pr list` JSON-array shape to GraphQL connection node
+shapes (`{"data": {"repository": {...}}}`) so these regressions exercise
+the real, current transport instead of asserting against a superseded
+contract.
 """
 
 from __future__ import annotations
@@ -41,40 +52,95 @@ ISSUE_JSON = json.dumps(
 )
 
 
-def _issues_list(n: int) -> str:
-    return json.dumps(
-        [
-            {
-                "number": i,
-                "title": f"issue {i}",
-                "body": "",
-                "labels": [],
-                "state": "OPEN",
-                "stateReason": None,
-                "url": f"https://github.com/squne121/loop-protocol/issues/{i}",
-            }
-            for i in range(1, n + 1)
-        ]
-    )
+def _issue_node(number: int) -> dict:
+    return {
+        "id": f"issue-{number}",
+        "number": number,
+        "title": f"issue {number}",
+        "body": "",
+        "state": "OPEN",
+        "stateReason": None,
+        "url": f"https://github.com/squne121/loop-protocol/issues/{number}",
+        "labels": {"nodes": []},
+    }
 
 
-def _prs_list(n: int, files_per_pr: int = 0, changed_files: int | None = None) -> str:
-    return json.dumps(
-        [
-            {
-                "number": i,
-                "title": f"pr {i}",
-                "body": "",
-                "labels": [],
-                "state": "OPEN",
-                "url": f"https://github.com/squne121/loop-protocol/pull/{i}",
-                "files": [{"path": f"f{j}.py"} for j in range(files_per_pr)],
-                "changedFiles": changed_files if changed_files is not None else files_per_pr,
-                "closingIssuesReferences": [],
+def _issue_nodes(count: int, start: int = 1) -> list[dict]:
+    return [_issue_node(n) for n in range(start, start + count)]
+
+
+def _pr_node(number: int, *, files_per_pr: int = 0, changed_files: int | None = None) -> dict:
+    return {
+        "id": f"pr-{number}",
+        "number": number,
+        "title": f"pr {number}",
+        "body": "",
+        "state": "OPEN",
+        "url": f"https://github.com/squne121/loop-protocol/pull/{number}",
+        "labels": {"nodes": []},
+        "changedFiles": changed_files if changed_files is not None else files_per_pr,
+        "files": {"nodes": [{"path": f"f{j}.py"} for j in range(files_per_pr)]},
+        "closingIssuesReferences": {"nodes": []},
+    }
+
+
+def _pr_nodes(count: int, start: int = 1, files_per_pr: int = 0, changed_files: int | None = None) -> list[dict]:
+    return [_pr_node(n, files_per_pr=files_per_pr, changed_files=changed_files) for n in range(start, start + count)]
+
+
+def _standard_graphql_fake(num_issues: int = 2, num_prs: int = 1, pr_files_pages: dict | None = None):
+    """Fake `_run_gh_graphql` covering both the top-level inventory
+    connection query and the nested per-PR `files` connection query,
+    dispatched on the fields shape exactly like the real GraphQL variable
+    bindings the production code sends (`fetchIssues`/`fetchPRs` for the
+    inventory connection, `number` for the PR files page query)."""
+    issues = _issue_nodes(num_issues)
+    prs = _pr_nodes(num_prs)
+    pr_files_pages = pr_files_pages or {}
+
+    def fake(gh_bin, query, fields, *, budget=None, item_count=0):
+        if budget is not None:
+            budget.before_page()
+            budget.consume_page(query)
+        if "number" in fields:
+            pr_number = int(fields["number"])
+            all_paths = pr_files_pages.get(pr_number, [])
+            start = int(fields.get("after") or 0)
+            page = all_paths[start : start + rsrp.ITEMS_PER_PAGE]
+            end = start + len(page)
+            has_next = end < len(all_paths)
+            return {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "files": {
+                                "nodes": [{"path": p} for p in page],
+                                "pageInfo": {
+                                    "hasNextPage": has_next,
+                                    "endCursor": str(end) if has_next else None,
+                                },
+                            }
+                        }
+                    }
+                }
             }
-            for i in range(1, n + 1)
-        ]
-    )
+        if fields.get("fetchIssues") == "true":
+            nodes, key = issues, "issues"
+        else:
+            nodes, key = prs, "pullRequests"
+        return {
+            "data": {
+                "repository": {
+                    key: {
+                        "totalCount": len(nodes),
+                        "nodes": nodes,
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
+                }
+            }
+        }
+
+    return fake
 
 
 INVOCATION_ID = "20260713T100000Z_999"
@@ -86,9 +152,12 @@ def _patch_runtime_context(monkeypatch):
     monkeypatch.setattr(rsrp, "_validate_runtime_context", lambda project_root, repo: None)
     monkeypatch.setattr(rsrp, "_resolve_trusted_gh_binary", lambda project_root: "/usr/bin/gh")
     monkeypatch.setattr(rsrp, "_gh_version", lambda gh_bin: "gh version 2.99.0 (test)")
-    # Default: server-side totalCount matches the default (2 issues, 1 PR)
-    # fixtures used by most tests below (P1-2 cross-check).
-    monkeypatch.setattr(rsrp, "_fetch_total_counts", lambda gh_bin, repo: (2, 1))
+
+
+def _fake_run_gh_issue_view(gh_bin, args, timeout=rsrp.GH_TIMEOUT_SECONDS):
+    if args[:2] == ["issue", "view"]:
+        return 0, ISSUE_JSON, ""
+    raise AssertionError(f"unexpected gh args: {args}")
 
 
 def _fake_run_planner_ok(project_root, issues_path, prs_path, issue_number, repo, invocation_id):
@@ -116,51 +185,46 @@ def _fake_run_verifier_ok(plan_data):
     return None
 
 
-# --- AC4: pagination truncation fails closed ---------------------------------
+# --- AC4: pagination completeness fails closed --------------------------------
 
 
-def test_pagination_truncation_fails_closed(tmp_path, monkeypatch):
-    monkeypatch.setattr(rsrp, "MAX_ITEMS_PER_KIND", 3)
+def test_inventory_total_count_mismatch_after_terminal_page_fails_closed(tmp_path, monkeypatch):
+    """If a connection's terminal (hasNextPage: false) page's item count
+    does not match that same connection's own totalCount, pagination
+    completeness cannot be proven and the whole transaction fails closed."""
 
-    def fake_run_gh(gh_bin, args, timeout=rsrp.GH_TIMEOUT_SECONDS):
-        if args[:2] == ["issue", "view"]:
-            return 0, ISSUE_JSON, ""
-        if args[:2] == ["issue", "list"]:
-            return 0, _issues_list(5), ""  # exceeds MAX_ITEMS_PER_KIND(3) + 1 request bound
-        if args[:2] == ["pr", "list"]:
-            return 0, _prs_list(1), ""
-        raise AssertionError(f"unexpected gh args: {args}")
+    def fake_graphql(gh_bin, query, fields, *, budget=None, item_count=0):
+        if budget is not None:
+            budget.before_page()
+            budget.consume_page(query)
+        if fields.get("fetchIssues") == "true":
+            # Server reports 5 issues exist but the (terminal) page only
+            # returns 3 nodes.
+            return {
+                "data": {
+                    "repository": {
+                        "issues": {
+                            "totalCount": 5,
+                            "nodes": _issue_nodes(3),
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            }
+        return {
+            "data": {
+                "repository": {
+                    "pullRequests": {
+                        "totalCount": 0,
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
+                }
+            }
+        }
 
-    monkeypatch.setattr(rsrp, "_run_gh", fake_run_gh)
-
-    private_dir = rsrp._PrivateInvocationDir()
-    try:
-        with pytest.raises(rsrp.ScopeRollupPreflightError) as excinfo:
-            rsrp._run_transaction(
-                str(tmp_path), 1547, "squne121/loop-protocol", private_dir, INVOCATION_ID, REQUESTED_AT
-            )
-        assert excinfo.value.reason_code == "inventory_truncated"
-    finally:
-        private_dir.cleanup()
-
-
-def test_total_count_mismatch_fails_closed(tmp_path, monkeypatch):
-    """P1-2: even when the bounded `--limit N+1` sentinel does not catch a
-    truncation, an independent server-side totalCount mismatch still fails
-    the transaction closed."""
-
-    def fake_run_gh(gh_bin, args, timeout=rsrp.GH_TIMEOUT_SECONDS):
-        if args[:2] == ["issue", "view"]:
-            return 0, ISSUE_JSON, ""
-        if args[:2] == ["issue", "list"]:
-            return 0, _issues_list(2), ""
-        if args[:2] == ["pr", "list"]:
-            return 0, _prs_list(1), ""
-        raise AssertionError(f"unexpected gh args: {args}")
-
-    monkeypatch.setattr(rsrp, "_run_gh", fake_run_gh)
-    # Server reports 3 issues exist even though only 2 were fetched.
-    monkeypatch.setattr(rsrp, "_fetch_total_counts", lambda gh_bin, repo: (3, 1))
+    monkeypatch.setattr(rsrp, "_run_gh", _fake_run_gh_issue_view)
+    monkeypatch.setattr(rsrp, "_run_gh_graphql", fake_graphql)
 
     private_dir = rsrp._PrivateInvocationDir()
     try:
@@ -168,37 +232,109 @@ def test_total_count_mismatch_fails_closed(tmp_path, monkeypatch):
             rsrp._run_transaction(
                 str(tmp_path), 1547, "squne121/loop-protocol", private_dir, INVOCATION_ID, REQUESTED_AT
             )
-        assert excinfo.value.reason_code == "inventory_truncated"
+        assert excinfo.value.reason_code == "inventory_total_count_mismatch"
     finally:
         private_dir.cleanup()
 
 
-# --- P0-3: PR files(first:100) pagination -------------------------------------
+def test_inventory_total_count_drifts_between_pages_fails_closed(tmp_path, monkeypatch):
+    """An independent per-page totalCount cross-check fails closed if the
+    server-reported total drifts between pages of the SAME connection
+    (data changed mid-pagination -- cannot be proven complete)."""
+    call_count = {"issues": 0}
+
+    def fake_graphql(gh_bin, query, fields, *, budget=None, item_count=0):
+        if budget is not None:
+            budget.before_page()
+            budget.consume_page(query)
+        if fields.get("fetchIssues") == "true":
+            call_count["issues"] += 1
+            if call_count["issues"] == 1:
+                return {
+                    "data": {
+                        "repository": {
+                            "issues": {
+                                "totalCount": 150,
+                                "nodes": _issue_nodes(100, start=1),
+                                "pageInfo": {"hasNextPage": True, "endCursor": "cursor1"},
+                            }
+                        }
+                    }
+                }
+            return {
+                "data": {
+                    "repository": {
+                        "issues": {
+                            "totalCount": 151,  # drifted from page 1's 150
+                            "nodes": _issue_nodes(50, start=101),
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            }
+        return {
+            "data": {
+                "repository": {
+                    "pullRequests": {
+                        "totalCount": 0,
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
+                }
+            }
+        }
+
+    monkeypatch.setattr(rsrp, "_run_gh", _fake_run_gh_issue_view)
+    monkeypatch.setattr(rsrp, "_run_gh_graphql", fake_graphql)
+
+    private_dir = rsrp._PrivateInvocationDir()
+    try:
+        with pytest.raises(rsrp.ScopeRollupPreflightError) as excinfo:
+            rsrp._run_transaction(
+                str(tmp_path), 1547, "squne121/loop-protocol", private_dir, INVOCATION_ID, REQUESTED_AT
+            )
+        assert excinfo.value.reason_code == "inventory_total_count_mismatch"
+    finally:
+        private_dir.cleanup()
+
+
+# --- P0-1/P0-3: PR files(first:100) nested-connection pagination -------------
 
 
 def test_pr_files_pagination_completes_past_100(tmp_path, monkeypatch):
     """A PR reporting changedFiles > len(files) (the nested files(first:100)
     connection cap) must be paginated to completeness via graphql before the
-    transaction proceeds."""
+    transaction proceeds. Exercises the REAL `_paginate_pr_files` (not a
+    monkeypatched stand-in) across a 100 + 1 page boundary."""
+    pr_files_pages = {1: [f"f{j}.py" for j in range(101)]}
+    fake_graphql = _standard_graphql_fake(
+        num_issues=2,
+        num_prs=0,
+        pr_files_pages=pr_files_pages,
+    )
+    # num_prs=0 above only builds the issues fixture; supply the PR node with
+    # its own changedFiles/files seed directly instead.
+    prs = _pr_nodes(1, files_per_pr=100, changed_files=101)
 
-    def fake_run_gh(gh_bin, args, timeout=rsrp.GH_TIMEOUT_SECONDS):
-        if args[:2] == ["issue", "view"]:
-            return 0, ISSUE_JSON, ""
-        if args[:2] == ["issue", "list"]:
-            return 0, _issues_list(2), ""
-        if args[:2] == ["pr", "list"]:
-            return 0, _prs_list(1, files_per_pr=100, changed_files=101), ""
-        raise AssertionError(f"unexpected gh args: {args}")
+    def fake_run_gh_graphql(gh_bin, query, fields, *, budget=None, item_count=0, _base=fake_graphql):
+        if "number" in fields or fields.get("fetchIssues") == "true":
+            return _base(gh_bin, query, fields, budget=budget, item_count=item_count)
+        return {
+            "data": {
+                "repository": {
+                    "pullRequests": {
+                        "totalCount": len(prs),
+                        "nodes": prs,
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
+                }
+            }
+        }
 
-    monkeypatch.setattr(rsrp, "_run_gh", fake_run_gh)
+    monkeypatch.setattr(rsrp, "_run_gh", _fake_run_gh_issue_view)
+    monkeypatch.setattr(rsrp, "_run_gh_graphql", fake_run_gh_graphql)
     monkeypatch.setattr(rsrp, "_run_planner", _fake_run_planner_ok)
     monkeypatch.setattr(rsrp, "_run_verifier", _fake_run_verifier_ok)
-
-    def fake_paginate(gh_bin, repo, pr_number, existing_paths):
-        assert pr_number == 1
-        return [f"f{j}.py" for j in range(101)]
-
-    monkeypatch.setattr(rsrp, "_paginate_pr_files", fake_paginate)
 
     private_dir = rsrp._PrivateInvocationDir()
     try:
@@ -208,26 +344,65 @@ def test_pr_files_pagination_completes_past_100(tmp_path, monkeypatch):
     finally:
         private_dir.cleanup()
     assert result["status"] == "ok"
+    pr_files_completeness = result["manifest"]["pr_files_completeness"]
+    assert pr_files_completeness["pr_count_checked"] == 1
+    assert pr_files_completeness["item_count"] == 101
+    assert pr_files_completeness["per_pr"]["1"]["item_count"] == 101
+    assert pr_files_completeness["per_pr"]["1"]["page_count"] == 2
 
 
 def test_pr_files_pagination_incomplete_fails_closed(tmp_path, monkeypatch):
-    def fake_run_gh(gh_bin, args, timeout=rsrp.GH_TIMEOUT_SECONDS):
-        if args[:2] == ["issue", "view"]:
-            return 0, ISSUE_JSON, ""
-        if args[:2] == ["issue", "list"]:
-            return 0, _issues_list(2), ""
-        if args[:2] == ["pr", "list"]:
-            return 0, _prs_list(1, files_per_pr=100, changed_files=150), ""
-        raise AssertionError(f"unexpected gh args: {args}")
+    """A PR whose nested `files` connection terminates (hasNextPage: false)
+    before its own changedFiles total is reached must fail the whole
+    transaction closed (GitHub-side data drift, or an implementation bug in
+    the pagination loop -- either way, completeness cannot be proven)."""
+    pr_files_pages = {1: [f"f{j}.py" for j in range(120)]}  # terminates short of changedFiles=150
+    prs = _pr_nodes(1, files_per_pr=100, changed_files=150)
 
-    monkeypatch.setattr(rsrp, "_run_gh", fake_run_gh)
+    def fake_run_gh_graphql(gh_bin, query, fields, *, budget=None, item_count=0):
+        if budget is not None:
+            budget.before_page()
+            budget.consume_page(query)
+        if "number" in fields:
+            pr_number = int(fields["number"])
+            all_paths = pr_files_pages.get(pr_number, [])
+            start = int(fields.get("after") or 0)
+            page = all_paths[start : start + rsrp.ITEMS_PER_PAGE]
+            end = start + len(page)
+            has_next = end < len(all_paths)
+            return {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "files": {
+                                "nodes": [{"path": p} for p in page],
+                                "pageInfo": {
+                                    "hasNextPage": has_next,
+                                    "endCursor": str(end) if has_next else None,
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+        if fields.get("fetchIssues") == "true":
+            nodes, key = _issue_nodes(2), "issues"
+        else:
+            nodes, key = prs, "pullRequests"
+        return {
+            "data": {
+                "repository": {
+                    key: {
+                        "totalCount": len(nodes),
+                        "nodes": nodes,
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
+                }
+            }
+        }
 
-    def fake_paginate_short(gh_bin, repo, pr_number, existing_paths):
-        # Simulate a pagination that "completes" (hasNextPage: false) but
-        # never actually reaches changedFiles -- e.g. GitHub-side data drift.
-        return [f"f{j}.py" for j in range(120)]
-
-    monkeypatch.setattr(rsrp, "_paginate_pr_files", fake_paginate_short)
+    monkeypatch.setattr(rsrp, "_run_gh", _fake_run_gh_issue_view)
+    monkeypatch.setattr(rsrp, "_run_gh_graphql", fake_run_gh_graphql)
 
     private_dir = rsrp._PrivateInvocationDir()
     try:
@@ -238,6 +413,80 @@ def test_pr_files_pagination_incomplete_fails_closed(tmp_path, monkeypatch):
         assert excinfo.value.reason_code == "pr_files_pagination_incomplete"
     finally:
         private_dir.cleanup()
+
+
+def test_paginate_pr_files_rejects_duplicate_paths(monkeypatch):
+    """P0-1: duplicate paths returned across pages of the same PR files
+    connection must fail closed rather than silently deduplicating."""
+
+    def fake_graphql(gh_bin, query, fields, *, budget=None, item_count=0):
+        after = fields.get("after")
+        if after is None:
+            return {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "files": {
+                                "nodes": [{"path": "a.py"}],
+                                "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
+                            }
+                        }
+                    }
+                }
+            }
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "files": {
+                            # "a.py" repeated -- must never happen for a
+                            # well-formed cursor-paginated connection.
+                            "nodes": [{"path": "a.py"}],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            }
+        }
+
+    monkeypatch.setattr(rsrp, "_run_gh_graphql", fake_graphql)
+    with pytest.raises(rsrp.ScopeRollupPreflightError) as excinfo:
+        rsrp._paginate_pr_files("gh", "squne121/loop-protocol", 1, 2)
+    assert excinfo.value.reason_code == "inventory_duplicate_node"
+
+
+def test_paginate_pr_files_full_201_across_three_pages(monkeypatch):
+    """PR #1643 review (P0-1): a direct test -- not mocking
+    `_paginate_pr_files` itself -- proving the REAL implementation
+    accumulates every page (100 + 100 + 1) rather than overwriting `paths`
+    with only the last page fetched."""
+    all_paths = [f"f{j}.py" for j in range(201)]
+
+    def fake_graphql(gh_bin, query, fields, *, budget=None, item_count=0):
+        start = int(fields.get("after") or 0)
+        page = all_paths[start : start + rsrp.ITEMS_PER_PAGE]
+        end = start + len(page)
+        has_next = end < len(all_paths)
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "files": {
+                            "nodes": [{"path": p} for p in page],
+                            "pageInfo": {
+                                "hasNextPage": has_next,
+                                "endCursor": str(end) if has_next else None,
+                            },
+                        }
+                    }
+                }
+            }
+        }
+
+    monkeypatch.setattr(rsrp, "_run_gh_graphql", fake_graphql)
+    result = rsrp._paginate_pr_files("gh", "squne121/loop-protocol", 1, 201)
+    assert result == all_paths
+    assert len(result) == 201
 
 
 # --- AC5: private artifact exclusive/atomic write -----------------------------
@@ -293,16 +542,8 @@ def test_cleanup_failure_is_not_swallowed(tmp_path, monkeypatch):
 
 
 def test_main_surfaces_cleanup_failure_as_transaction_error(tmp_path, monkeypatch):
-    def fake_run_gh(gh_bin, args, timeout=rsrp.GH_TIMEOUT_SECONDS):
-        if args[:2] == ["issue", "view"]:
-            return 0, ISSUE_JSON, ""
-        if args[:2] == ["issue", "list"]:
-            return 0, _issues_list(2), ""
-        if args[:2] == ["pr", "list"]:
-            return 0, _prs_list(1), ""
-        raise AssertionError(f"unexpected gh args: {args}")
-
-    monkeypatch.setattr(rsrp, "_run_gh", fake_run_gh)
+    monkeypatch.setattr(rsrp, "_run_gh", _fake_run_gh_issue_view)
+    monkeypatch.setattr(rsrp, "_run_gh_graphql", _standard_graphql_fake())
     monkeypatch.setattr(rsrp, "_run_planner", _fake_run_planner_ok)
     monkeypatch.setattr(rsrp, "_run_verifier", _fake_run_verifier_ok)
 
@@ -344,16 +585,8 @@ def test_cleanup_across_all_exit_paths(tmp_path, monkeypatch):
 
     monkeypatch.setattr(rsrp._PrivateInvocationDir, "__init__", tracking_init)
 
-    def fake_run_gh_success(gh_bin, args, timeout=rsrp.GH_TIMEOUT_SECONDS):
-        if args[:2] == ["issue", "view"]:
-            return 0, ISSUE_JSON, ""
-        if args[:2] == ["issue", "list"]:
-            return 0, _issues_list(2), ""
-        if args[:2] == ["pr", "list"]:
-            return 0, _prs_list(1), ""
-        raise AssertionError(f"unexpected gh args: {args}")
-
-    monkeypatch.setattr(rsrp, "_run_gh", fake_run_gh_success)
+    monkeypatch.setattr(rsrp, "_run_gh", _fake_run_gh_issue_view)
+    monkeypatch.setattr(rsrp, "_run_gh_graphql", _standard_graphql_fake())
     monkeypatch.setattr(rsrp, "_run_planner", _fake_run_planner_ok)
     monkeypatch.setattr(rsrp, "_run_verifier", _fake_run_verifier_ok)
 
@@ -393,7 +626,7 @@ def test_cleanup_across_all_exit_paths(tmp_path, monkeypatch):
     def fake_run_gh_malformed(gh_bin, args, timeout=rsrp.GH_TIMEOUT_SECONDS):
         if args[:2] == ["issue", "view"]:
             return 0, "not json", ""
-        return 0, "[]", ""
+        raise AssertionError(f"unexpected gh args: {args}")
 
     monkeypatch.setattr(rsrp, "_run_gh", fake_run_gh_malformed)
     exit_code = rsrp.main(argv)
@@ -418,16 +651,8 @@ def test_cleanup_across_all_exit_paths(tmp_path, monkeypatch):
 
 
 def test_manifest_fields_recorded(tmp_path, monkeypatch):
-    def fake_run_gh(gh_bin, args, timeout=rsrp.GH_TIMEOUT_SECONDS):
-        if args[:2] == ["issue", "view"]:
-            return 0, ISSUE_JSON, ""
-        if args[:2] == ["issue", "list"]:
-            return 0, _issues_list(2), ""
-        if args[:2] == ["pr", "list"]:
-            return 0, _prs_list(1), ""
-        raise AssertionError(f"unexpected gh args: {args}")
-
-    monkeypatch.setattr(rsrp, "_run_gh", fake_run_gh)
+    monkeypatch.setattr(rsrp, "_run_gh", _fake_run_gh_issue_view)
+    monkeypatch.setattr(rsrp, "_run_gh_graphql", _standard_graphql_fake())
     monkeypatch.setattr(rsrp, "_run_planner", _fake_run_planner_ok)
     monkeypatch.setattr(rsrp, "_run_verifier", _fake_run_verifier_ok)
 
@@ -455,16 +680,21 @@ def test_manifest_fields_recorded(tmp_path, monkeypatch):
         "planner_script_sha256",
         "issues",
         "pull_requests",
+        "pr_files_completeness",
         "truncated",
     ):
         assert field in manifest, f"missing manifest field: {field}"
     assert manifest["host"] == "github.com"
     assert manifest["truncated"] is False
-    assert manifest["issues"]["truncated"] is False
     assert manifest["issues"]["item_count"] == 2
     assert manifest["issues"]["total_count"] == 2
     assert manifest["issues"]["page_count"] == 1
     assert manifest["pull_requests"]["item_count"] == 1
+    # P1-1: independent per-PR nested-pagination completeness evidence. No
+    # PR here required nested files() pagination (changedFiles == 0), so
+    # the block is present but empty.
+    assert manifest["pr_files_completeness"]["pr_count_checked"] == 0
+    assert manifest["pr_files_completeness"]["pagination_complete"] is True
     # P0-1: invocation_id/requested_at are echoed verbatim from the caller,
     # never minted fresh by the executor.
     assert manifest["invocation_id"] == INVOCATION_ID
@@ -477,16 +707,8 @@ def test_manifest_fields_recorded(tmp_path, monkeypatch):
 
 
 def test_stdout_stderr_separation(tmp_path, monkeypatch, capsys):
-    def fake_run_gh(gh_bin, args, timeout=rsrp.GH_TIMEOUT_SECONDS):
-        if args[:2] == ["issue", "view"]:
-            return 0, ISSUE_JSON, ""
-        if args[:2] == ["issue", "list"]:
-            return 0, _issues_list(2), ""
-        if args[:2] == ["pr", "list"]:
-            return 0, _prs_list(1), ""
-        raise AssertionError(f"unexpected gh args: {args}")
-
-    monkeypatch.setattr(rsrp, "_run_gh", fake_run_gh)
+    monkeypatch.setattr(rsrp, "_run_gh", _fake_run_gh_issue_view)
+    monkeypatch.setattr(rsrp, "_run_gh_graphql", _standard_graphql_fake())
 
     def _planner_with_stderr_warning(project_root, issues_path, prs_path, issue_number, repo, invocation_id):
         # A real planner subprocess would emit a stderr warning on an
@@ -614,17 +836,16 @@ def test_executor_subprocess_end_to_end_ok(tmp_path, monkeypatch):
                     "url": "https://github.com/squne121/loop-protocol/issues/1547",
                 }))
                 sys.exit(0)
-            if args[:2] == ["issue", "list"]:
-                print(json.dumps([]))
-                sys.exit(0)
-            if args[:2] == ["pr", "list"]:
-                print(json.dumps([]))
-                sys.exit(0)
             if args[:2] == ["api", "graphql"]:
+                empty_connection = {
+                    "totalCount": 0,
+                    "nodes": [],
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                }
                 print(json.dumps({
                     "data": {"repository": {
-                        "issues": {"totalCount": 0},
-                        "pullRequests": {"totalCount": 0},
+                        "issues": empty_connection,
+                        "pullRequests": empty_connection,
                     }}
                 }))
                 sys.exit(0)

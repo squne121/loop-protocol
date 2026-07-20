@@ -9,7 +9,7 @@ Covers original wide-pathspec forms (AC baseline) plus Fix 1/2 regression:
 
 import pytest
 
-from test_worktree_scope_guard import _bash_payload, _make_repo_with_worktree, _run_guard
+from worktree_scope_guard_testkit import _bash_payload, _make_repo_with_worktree, _run_guard
 
 
 def test_issue1215_no_git_add_exception_wide_pathspecs(tmp_path):
