@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import hookchain_harness  # noqa: E402
@@ -40,6 +41,10 @@ class TestDenyClassification:
         stdout = json.dumps({"decision": "block"})
         assert hookchain_harness.classify_decision(2, stdout) == "deny"
 
+    def test_exit_2_overrides_structured_allow_and_ask(self):
+        assert hookchain_harness.classify_decision(2, _structured("allow")) == "deny"
+        assert hookchain_harness.classify_decision(2, _structured("ask")) == "deny"
+
     def test_exit_0_is_not_deny(self):
         assert hookchain_harness.classify_decision(0, "") != "deny"
 
@@ -62,9 +67,6 @@ class TestAskClassification:
 
 
 class TestAllowClassification:
-    def test_exit_0_no_stdout_is_allow(self):
-        assert hookchain_harness.classify_decision(0, "") == "allow"
-
     def test_structured_permission_decision_allow(self):
         assert hookchain_harness.classify_decision(0, _structured("allow")) == "allow"
 
@@ -88,11 +90,8 @@ class TestNoDecisionClassification:
         )
         assert hookchain_harness.classify_decision(0, stdout) == "no_decision"
 
-    def test_exit_0_no_json_is_not_no_decision(self):
-        # Plain silent exit 0 (no structured output at all) is "allow", not
-        # "no_decision" -- the distinction matters for AC3's assertion that
-        # every hook in a real allow chain reports "allow".
-        assert hookchain_harness.classify_decision(0, "") == "allow"
+    def test_silent_exit_0_is_no_decision(self):
+        assert hookchain_harness.classify_decision(0, "") == "no_decision"
 
 
 class TestHookErrorClassification:
@@ -102,6 +101,10 @@ class TestHookErrorClassification:
     def test_exit_1_is_not_ask_regression(self):
         """AC1: exit 1 must be classified as hook_error, not ask."""
         assert hookchain_harness.classify_decision(1, "not json") == "hook_error"
+
+    def test_nonzero_stdout_is_ignored(self):
+        assert hookchain_harness.classify_decision(1, _structured("deny")) == "hook_error"
+        assert hookchain_harness.classify_decision(1, _structured("ask")) == "hook_error"
 
     def test_exit_other_nonzero_non_2_is_hook_error(self):
         assert hookchain_harness.classify_decision(127, "") == "hook_error"
@@ -119,7 +122,7 @@ def test_decision_vocabulary_distinguishes_hook_error_from_ask():
     assert hookchain_harness.classify_decision(1, "") == "hook_error"
     assert hookchain_harness.classify_decision(1, "some stderr-only output") == "hook_error"
     assert hookchain_harness.classify_decision(0, _structured("ask")) == "ask"
-    assert hookchain_harness.classify_decision(1, _structured("ask")) == "ask"
+    assert hookchain_harness.classify_decision(1, _structured("ask")) == "hook_error"
 
 
 class TestAggregateDecision:
@@ -139,10 +142,46 @@ class TestAggregateDecision:
         results = [{"decision": "allow"}, {"decision": "allow"}]
         assert hookchain_harness.aggregate_decision(results) == "allow"
 
-    def test_aggregate_defer_and_no_decision_and_hook_error_are_non_blocking(self):
+    def test_legacy_aggregate_maps_defer_conservatively_to_ask(self):
         results = [
             {"decision": "no_decision"},
             {"decision": "defer"},
             {"decision": "hook_error"},
         ]
-        assert hookchain_harness.aggregate_decision(results) == "allow"
+        assert hookchain_harness.aggregate_decision(results) == "ask"
+
+
+class TestLosslessAggregatePermissionDecision:
+    def test_defer_precedes_ask_and_allow(self):
+        results = [{"decision": "allow"}, {"decision": "defer"}, {"decision": "ask"}]
+        assert hookchain_harness.aggregate_permission_decision(results) == "defer"
+
+    def test_deny_precedes_defer_and_ask(self):
+        results = [{"decision": "deny"}, {"decision": "defer"}, {"decision": "ask"}]
+        assert hookchain_harness.aggregate_permission_decision(results) == "deny"
+
+    def test_no_decision_is_preserved(self):
+        assert hookchain_harness.aggregate_permission_decision([{"decision": "no_decision"}]) == "no_decision"
+
+
+def test_chain_collects_all_matching_hooks_after_deny(monkeypatch, tmp_path):
+    """A deny contributes to the aggregate but does not short-circuit sibling hooks."""
+    commands = ["first-hook", "second-hook"]
+    seen: list[str] = []
+
+    monkeypatch.setattr(hookchain_harness, "load_pretool_hook_commands", lambda _: commands)
+    monkeypatch.setattr(hookchain_harness, "_resolve_command", lambda command: [command])
+
+    def fake_run(argv, **_kwargs):
+        seen.append(argv[0])
+        return SimpleNamespace(
+            returncode=2 if argv[0] == "first-hook" else 0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(hookchain_harness.subprocess, "run", fake_run)
+    results = hookchain_harness.run_pretool_hook_chain({}, tmp_path)
+
+    assert seen == commands
+    assert [result["decision"] for result in results] == ["deny", "no_decision"]

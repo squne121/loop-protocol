@@ -14,9 +14,9 @@ Per-hook decisions are classified into one of six values:
 
   "deny"        -- explicit block. Either a structured
                    ``hookSpecificOutput.permissionDecision: "deny"`` (or the
-                   deprecated top-level ``decision: "block"``), or exit code 2
-                   with no structured decision present (this repo's hooks
-                   currently signal deny via bare exit code 2).
+                   deprecated top-level ``decision: "block"``), or exit code 2.
+                   Exit code 2 takes precedence over all stdout, matching the
+                   Claude Code PreToolUse contract.
   "defer"       -- structured ``hookSpecificOutput.permissionDecision: "defer"``.
                    No hook currently registered in settings.json emits this,
                    but the vocabulary supports it for forward compatibility.
@@ -25,21 +25,14 @@ Per-hook decisions are classified into one of six values:
                    equivalent value). Distinct from "hook_error" below --
                    exit code 1 alone is NOT "ask".
   "allow"       -- structured permissionDecision "allow" (or deprecated
-                   ``decision: "approve"``), OR plain exit code 0 with no
-                   structured hookSpecificOutput at all (this repo's
-                   fail-open hooks that produce no stdout on the happy path).
-  "no_decision" -- exit code 0 AND a ``hookSpecificOutput`` envelope IS
-                   present in stdout, but it carries no ``permissionDecision``
-                   key (e.g. an advisory-only envelope such as
-                   ``CI_TEST_PERFORMANCE_ADVISORY_V1``'s
-                   ``additionalContext``-only payload). The hook expressed no
-                   explicit allow/deny opinion.
-  "hook_error"  -- exit code 1 (or any other non-zero, non-2 code) with no
-                   structured permissionDecision recovered from stdout. Per
-                   the Claude Code PreToolUse hook contract, exit 1 is a
-                   NON-BLOCKING execution error (stderr surfaced to the user,
-                   tool execution continues) and must not be conflated with
-                   the interactive "ask" decision.
+                   ``decision: "approve"``) returned with exit code 0.
+  "no_decision" -- exit code 0 with no structured permission decision. This
+                   includes silent hooks and advisory-only envelopes; the hook
+                   expressed no explicit allow/deny opinion.
+  "hook_error"  -- any non-zero exit other than 2. Per the Claude Code
+                   PreToolUse hook contract, this is a NON-BLOCKING execution
+                   error (stderr surfaced to the user, tool execution
+                   continues) and must not be conflated with "ask".
 
 Claude Code PreToolUse hook exit code contract used by every hook in this
 repo (see each hook's own header comment): 0 = allow / no-decision,
@@ -143,6 +136,14 @@ def _has_hook_specific_output(stdout: str) -> bool:
 def classify_decision(returncode: int, stdout: str) -> str:
     """Classify a single hook's raw (returncode, stdout) into one of the six
     decision vocabulary values documented in this module's docstring."""
+    # Claude Code only processes structured hook output after a successful
+    # exit. Exit 2 always blocks, and every other non-zero exit is a
+    # non-blocking hook execution error, regardless of stale/malformed stdout.
+    if returncode == 2:
+        return "deny"
+    if returncode != 0:
+        return "hook_error"
+
     structured = _extract_structured_decision(stdout)
     if structured is not None:
         if structured in DECISION_VALUES:
@@ -151,16 +152,7 @@ def classify_decision(returncode: int, stdout: str) -> str:
         # than silently allowing.
         return "ask"
 
-    if returncode == 0:
-        if _has_hook_specific_output(stdout):
-            return "no_decision"
-        return "allow"
-    if returncode == 2:
-        return "deny"
-    # exit code 1, or any other non-zero/non-2 code: per the Claude Code
-    # PreToolUse contract this is a NON-BLOCKING hook execution error, not an
-    # interactive "ask" decision (Issue #1636 AC1).
-    return "hook_error"
+    return "no_decision"
 
 
 def run_pretool_hook_chain(
@@ -178,9 +170,9 @@ def run_pretool_hook_chain(
        "decision": "deny"|"defer"|"ask"|"allow"|"no_decision"|"hook_error",
        "stdout": str, "stderr": str}
 
-    Execution stops early (does not run subsequent hooks) once a "deny"
-    decision is observed -- this mirrors real Claude Code PreToolUse
-    semantics, where the first blocking hook short-circuits the chain.
+    All matching hooks are run and collected even when one returns "deny".
+    The harness is intentionally sequential, but this result collection
+    mirrors Claude Code's aggregate semantics without modelling its scheduler.
     """
     commands = load_pretool_hook_commands(tool_name)
     env = dict(os.environ)
@@ -206,19 +198,38 @@ def run_pretool_hook_chain(
             "stdout": proc.stdout,
             "stderr": proc.stderr,
         })
-        if decision == "deny":
-            break
     return results
 
 
+def aggregate_permission_decision(results: list[dict[str, Any]]) -> str:
+    """Return the lossless Claude Code PreToolUse aggregate decision.
+
+    Permission decisions use precedence ``deny > defer > ask > allow``. If
+    no hook made a permission decision, preserve ``no_decision``; if all hooks
+    failed non-blockingly, preserve ``hook_error`` instead of claiming allow.
+    """
+    decisions = {r["decision"] for r in results}
+    for decision in ("deny", "defer", "ask", "allow"):
+        if decision in decisions:
+            return decision
+    if "no_decision" in decisions:
+        return "no_decision"
+    if "hook_error" in decisions:
+        return "hook_error"
+    return "no_decision"
+
+
 def aggregate_decision(results: list[dict[str, Any]]) -> str:
-    """Aggregate per-hook decisions the way Claude Code itself does: any
-    "deny" wins outright (reported as "block" for backward compatibility
-    with pre-existing callers of this harness); else any "ask" wins; else
-    "allow" (this also covers "defer" / "no_decision" / "hook_error", all of
-    which are non-blocking per the Claude Code PreToolUse contract)."""
-    if any(r["decision"] == "deny" for r in results):
+    """Return the legacy three-value aggregate for existing callers.
+
+    New callers that need Claude Code semantics must use
+    :func:`aggregate_permission_decision`. The legacy facade keeps ``block`` /
+    ``ask`` / ``allow`` output stable; ``defer`` maps conservatively to
+    ``ask`` rather than being treated as allow.
+    """
+    decision = aggregate_permission_decision(results)
+    if decision == "deny":
         return "block"
-    if any(r["decision"] == "ask" for r in results):
+    if decision in {"defer", "ask"}:
         return "ask"
     return "allow"
