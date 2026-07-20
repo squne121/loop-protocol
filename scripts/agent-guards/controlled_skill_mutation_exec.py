@@ -777,19 +777,33 @@ def _classify_gh_error(prefix: str, stderr: str) -> str:
 def _fetch_issue_body_and_updated_at(
     issue_number: int, repo: str, gh_bin: str
 ) -> tuple[str | None, str | None, str]:
-    """Fetch (body, updatedAt, error) via gh api (argv-list, shell=False)."""
+    """Fetch live Issue state from the trusted GitHub host only.
+
+    ``contract_snapshot.publish`` uses this helper for both its stale-write
+    precondition and its post-publish live-body revalidation.  Those reads are
+    part of the authoritative success boundary, so they must not inherit a
+    caller-controlled GH_HOST/GH_REPO/GH_CONFIG_DIR setting.
+    """
     try:
         out = subprocess.run(
-            [gh_bin, "issue", "view", str(issue_number), "--repo", repo,
-             "--json", "body,updatedAt"],
+            [
+                gh_bin,
+                "api",
+                "--hostname",
+                _TRUSTED_GITHUB_HOST,
+                f"repos/{repo}/issues/{issue_number}",
+                "--jq",
+                "{body, updatedAt: .updated_at}",
+            ],
             capture_output=True, text=True, timeout=15, shell=False,
+            env=_build_metadata_sanitized_env(),
         )
         if out.returncode != 0:
-            return None, None, f"gh_issue_view_failed_rc_{out.returncode}"
+            return None, None, f"gh_issue_fetch_failed_rc_{out.returncode}"
         data = json.loads(out.stdout)
         return data.get("body", ""), data.get("updatedAt", ""), ""
     except Exception as exc:
-        return None, None, f"gh_issue_view_exception: {exc}"
+        return None, None, f"gh_issue_fetch_exception: {exc}"
 
 
 def _patch_issue_body(
@@ -2053,6 +2067,11 @@ def _run_pr_review_publish(args, input_data, gh_bin, _fail, _ok) -> int:
 
 
 _ISSUECOMMENT_ID_RE = _re.compile(r"#issuecomment-(\d+)$")
+_CANONICAL_SINGLE_COMMENT_PROJECTION = (
+    "{id, html_url, created_at, updated_at, body, "
+    "author: .user.login, author_id: .user.id, "
+    "author_type: .user.type, author_association}"
+)
 
 
 def _extract_comment_id_from_url(url: str) -> str | None:
@@ -2070,10 +2089,16 @@ def _fetch_single_comment_by_id(comment_id: str, repo: str, gh_bin: str) -> dict
     try:
         out = subprocess.run(
             [
-                gh_bin, "api", f"repos/{repo}/issues/comments/{comment_id}",
-                "--jq", "{id, html_url, created_at, updated_at, body}",
+                gh_bin,
+                "api",
+                "--hostname",
+                _TRUSTED_GITHUB_HOST,
+                f"repos/{repo}/issues/comments/{comment_id}",
+                "--jq",
+                _CANONICAL_SINGLE_COMMENT_PROJECTION,
             ],
             capture_output=True, text=True, timeout=15, shell=False,
+            env=_build_metadata_sanitized_env(),
         )
         if out.returncode != 0:
             return {"error": f"comment_fetch_failed_rc_{out.returncode}"}
