@@ -23,25 +23,68 @@ created: "2026-05-24"
 - `PreToolUse` / `PermissionRequest` は予防層であり security boundary ではない。canonical final gate は post-run verifier と private artifact validation に置く。
 - Codex hook command は `rtk pnpm exec node ...` を明示 dependency とし、runtime では `node` と repo script のみで deterministic に再実行できるようにする。
 
-### Codex SubagentStop における scope-rollup capture の記録（#1527）
+### Codex SubagentStop における scope-rollup capture の記録（#1527、Scope Delta (2)）
 
 Codex の `SubagentStop` では、adapter は capture policy の適用と subprocess transport
 だけを担当し、canonical artifact の decision authority は既存
 `.claude/hooks/capture_scope_rollup_final_response.py` とする。adapter は marker parse、
 invocation ID、capture path、sidecar schema、duplicate/stale/SHA256 判定を再実装しない。
 
+#### eligibility / readiness の authority（固定 private location のみ）
+
+source-bound eligibility / readiness の受理経路は、`.claude/scripts/check_session_recording_runtime_safety.py`
+（eligibility）と `scripts/session-recording/bootstrap-source-bound-readiness.mjs`（readiness）が
+書き込む固定 private location（既定: `.claude/tmp/session-recording/scope-rollup-{eligibility,readiness}.json`、
+mode `0600`）**のみ**である。hook payload 内の inline object、任意ファイルパス、`artifacts[]` 配列内
+fuzzy-match、`source_bound` / `source_bound_artifacts` キーは、eligibility/readiness の情報源として
+一切受理しない（#1527 の初回実装がこの経路を受理していたことが敵対的レビューで確認された不備であり、
+Scope Delta (2) で是正した）。
+
+adapter（Node のみ）は producer を起動する前に、両方の固定 location を検証する。missing / invalid /
+stale の場合は producer を一切起動せず、固定 reason code で即時 skip する（cold environment での
+`uv`/Python 起動そのものを防ぐ）。producer（Python）は、adapter からの `SCOPE_ROLLUP_REQUIRE_SOURCE_BOUND_ELIGIBILITY=1`
+env（Codex adapter の trusted process spawn でのみ設定され、hook payload からは設定できない）を受けたときのみ、
+同じ固定 location を独立に再検証する（defense in depth）。この env が未設定の Claude
+`session_manifest_coordinator.sh` の raw-payload 経路は、#1527 以前と同一の無加工 capture を継続する
+（回帰なし）。
+
+eligibility artifact の binding 検証: repo root realpath、policy digest（`docs/dev/session-recording-policy.md`
+の sha256）、secret-policy digest（`docs/dev/secret-policy.md` の sha256）、`public_checkpoint_present: false`、
+`secrets_mode: none`、`safety_verdict: allow`、mode `0600`、owner、no-symlink、`additionalProperties: false`
+（未知キー・欠落キーは両方 fail-closed）。timestamp lifecycle は事前生成を正とする方向で判定する:
+`eligibility.generated_at <= hook_received_at`、`eligibility.generated_at <= marker.generated_at`、
+`hook_received_at < eligibility.expires_at`、`readiness.generated_at <= hook_received_at`。marker より後に
+生成された artifact、または `expires_at` を過ぎた artifact は stale として拒否する。
+
+readiness artifact の binding 検証: repo root realpath、`producer_digest`（capture producer 自身の sha256、
+コード変更後の stale readiness を防ぐ）、`prepared: true`、`interpreter_realpath` の存在。hot path は
+`readiness.interpreter_realpath` を直接 spawn し、`uv run --locked`（暗黙 sync の可能性がある）は使わない。
+
+sidecar provenance には、検証した eligibility/readiness artifact の digest（`sha256:...`）と検証結果
+reason code を記録する（`provenance.eligibility_artifact_digest` / `provenance.eligibility_verification_reason_code`
+/ `provenance.readiness_artifact_digest` / `provenance.readiness_verification_reason_code`）。
+
 | 条件 | capture | hook result |
 |---|---|---|
-| `SubagentStop`、guard allow、`stop_hook_active: false` | producer を起動 | 既存 manifest flow を継続 |
+| `SubagentStop`、guard allow、`stop_hook_active: false`、固定 location の eligibility/readiness が valid | producer を起動 | 既存 manifest flow を継続 |
+| 固定 location の eligibility/readiness が missing/invalid/stale | producer を起動しない（固定 skip reason） | 既存 manifest flow を継続 |
 | `secrets_mode != none`、`public_checkpoint_enabled`、`unknown_visibility_mapping`、guard deny | skip | guard の既存 decision を維持 |
 | `stop_hook_active: true` または malformed payload | skip | existing fail-open output を維持 |
-| non-target agent | producer を起動 | canonical `.txt` は作らず diagnostic sidecar のみ |
+| non-target agent（eligibility/readiness は valid） | producer を起動 | canonical `.txt` は作らず diagnostic sidecar のみ |
 
-- production invocation は `uv run --locked python3 .claude/hooks/capture_scope_rollup_final_response.py`、`cwd: repoRoot`、stdin は受信した JSON payload の原文とする。
-- child は 5,000 ms で `SIGKILL` し、spawn/nonzero/timeout は fixed reason code の bounded diagnostic のみを残す。child stdout/stderr、absolute path、final response、marker 本文、例外 message を adapter stdout/stderr に出してはならない。
+- production invocation は、readiness artifact が指す fixed interpreter を直接 spawn し（`uv run` は使わない）、
+  `cwd: repoRoot`、stdin は受信した JSON payload の原文とする。
+- timeout（3,500 ms）後は process group に `SIGKILL` を送り、bounded grace（500 ms）で `close` を待ってから
+  `kill(-pgid, 0)` 等で process group の liveness 不在を確認する。spawn/nonzero/timeout は fixed reason code
+  の bounded diagnostic のみを残す。child stdout/stderr、absolute path、final response、marker 本文、
+  例外 message を adapter stdout/stderr に出してはならない。
 - `CODEX_SCOPE_ROLLUP_CAPTURE_SCRIPT` は test-only であり、canonicalize 後に `tests/fixtures/hooks/scope-rollup-capture/` 配下の fixture だけを受理する。production は既定 producer 以外を使わない。
 - canonical `.txt` の唯一の producer は上記 Python script である。PyYAML unavailable 時の `hook_unavailable` sidecar fallback は Claude coordinator の例外であり、Codex adapter に production fallback を追加しない。
-- runtime dependency は Node.js、`uv`、Python 3.12+、lockfile で固定された PyYAML である。scope-rollup pre-provision として、cold/warm 環境では hook 実行前に `uv run --locked python3 -c "import yaml"` を成功させる。dependency failure は adapter では fail-open、scope-rollup provenance consumer では fail-closed とする。
+- production readiness は `pnpm bootstrap`（`scripts/session-recording/bootstrap-source-bound-readiness.mjs`）が、
+  対応 Python の locked sync、PyYAML import smoke、producer の `py_compile` smoke を実際に完了してから
+  readiness artifact を atomic 生成する。いずれかに失敗した場合は nonzero exit とし、虚偽の `prepared: true`
+  を書かない。hot path（`package.json` の `session-recording:capture-hot-path-check`）は `uv run --no-sync`
+  を用い、environment sync や Python download を行わない。
 - adapter subprocess test は adapter path verified の証跡だけであり、`.codex/hooks.json` の runtime-active/trust または live Codex smoke の成功を示さない。
 
 ---

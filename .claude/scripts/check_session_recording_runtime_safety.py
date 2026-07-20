@@ -42,9 +42,10 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1285,6 +1286,303 @@ def run_all_checks(repo_root: Path) -> int:
     return EXIT_PASS
 
 
+# ---------------------------------------------------------------------------
+# Scope-rollup capture eligibility artifact authority (Issue #1527 Scope
+# Delta (2), AC12/AC13). This is the ONLY authority that may produce the
+# fixed private eligibility artifact consumed by the Codex adapter
+# (scripts/session-recording/codex-hook-adapter.mjs) and the capture
+# producer (.claude/hooks/capture_scope_rollup_final_response.py). Neither
+# consumer accepts hook-payload-supplied inline objects, arbitrary paths, or
+# `artifacts[]` fuzzy-match values as an eligibility source any more — see
+# SOURCE_BOUND_ARTIFACT_KEYS removal in the capture producer.
+# ---------------------------------------------------------------------------
+
+SCOPE_ROLLUP_ELIGIBILITY_SCHEMA = "SESSION_RECORDING_SCOPE_ROLLUP_ELIGIBILITY_V1"
+SCOPE_ROLLUP_ELIGIBILITY_ARTIFACT_VERSION = 1
+SCOPE_ROLLUP_ELIGIBILITY_TTL_SECONDS_DEFAULT = 1800
+SCOPE_ROLLUP_ELIGIBILITY_MAX_BYTES = 8192
+SCOPE_ROLLUP_ELIGIBILITY_KEYS = frozenset(
+    {
+        "schema",
+        "artifact_version",
+        "repo_root_realpath",
+        "head_sha",
+        "policy_digest",
+        "secret_policy_digest",
+        "public_checkpoint_present",
+        "visibility",
+        "secrets_mode",
+        "generated_at",
+        "expires_at",
+        "safety_verdict",
+    }
+)
+
+
+def scope_rollup_eligibility_artifact_path(repo_root: Path) -> Path:
+    """Fixed private location for the scope-rollup eligibility artifact.
+
+    The default path is deterministic (derived from repo root) and is never
+    taken from a hook payload. The env override exists solely for test
+    isolation (same pattern as SCOPE_ROLLUP_CAPTURE_DIR) — it is set by our
+    own trusted test harness, never by an external hook caller.
+    """
+    override = os.environ.get("SCOPE_ROLLUP_ELIGIBILITY_ARTIFACT_PATH")
+    if override:
+        return Path(override)
+    return repo_root / ".claude" / "tmp" / "session-recording" / "scope-rollup-eligibility.json"
+
+
+def _scope_rollup_policy_digest(repo_root: Path) -> str | None:
+    policy_path = repo_root / "docs" / "dev" / "session-recording-policy.md"
+    try:
+        content = policy_path.read_bytes()
+    except OSError:
+        return None
+    return f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+
+def _scope_rollup_head_sha(repo_root: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha or None
+
+
+def _scope_rollup_visibility(repo_root: Path) -> str:
+    try:
+        merged, err = _load_merged_entire_settings(repo_root)
+    except Exception:
+        return "unknown"
+    if err is not None:
+        return "unknown"
+    try:
+        return _get_gh_visibility(repo_root)
+    except Exception:
+        return "unknown"
+
+
+def _scope_rollup_public_checkpoint_present(repo_root: Path) -> bool:
+    try:
+        _code, exit_code = check_public_checkpoint_branch(repo_root)
+    except Exception:
+        return True  # fail-closed: treat unverifiable state as present
+    if exit_code == EXIT_PASS:
+        return False
+    # FAIL and FAIL_CLOSED both mean "cannot certify absence" -> present=True
+    return True
+
+
+def _parse_iso8601_utc(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def emit_scope_rollup_eligibility_artifact(
+    repo_root: Path,
+    *,
+    ttl_seconds: int = SCOPE_ROLLUP_ELIGIBILITY_TTL_SECONDS_DEFAULT,
+    now: datetime | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Generate the fixed private scope-rollup eligibility artifact.
+
+    Runs the existing fail-closed safety checks in this module (secrets_mode,
+    public checkpoint branch, checkpoint visibility, etc.) and binds the
+    result to repo root / HEAD / policy digests, generation time, and a
+    bounded expiry. Returns (exit_code, artifact_dict). The artifact is
+    written with mode 0600 via an atomic rename regardless of verdict so
+    that a `deny` verdict is still fail-closed-observable rather than
+    silently absent.
+    """
+    now = now or datetime.now(timezone.utc)
+
+    # NOTE: scope-rollup capture writes the exact final-response text to a
+    # LOCAL private file (never pushed anywhere) — it is a categorically
+    # different operation from the session-recording-tool checkpoint push
+    # that run_all_checks() as a whole is designed to gate (public remote /
+    # push-sessions / hook-based auto-push). Reusing run_all_checks()
+    # wholesale here would deny eligibility for this exact repository
+    # (a legitimate public open-source GitHub remote) even though local
+    # capture is safe. The two safety-relevant conditions for LOCAL capture
+    # eligibility are: secrets_mode must be 'none' (no active
+    # secrets-exposure mode elsewhere in the session), and no dangerous
+    # session-recording checkpoint branch must be present. `visibility` is
+    # recorded for binding/anti-replay purposes only — it is not itself a
+    # gate condition (a public origin remote does not make local-only
+    # capture unsafe).
+    secrets_mode = (os.environ.get("SRRS_SECRETS_MODE") or SECRET_MODE_NONE).strip() or SECRET_MODE_NONE
+    public_checkpoint_present = _scope_rollup_public_checkpoint_present(repo_root)
+    visibility = _scope_rollup_visibility(repo_root)
+    policy_digest = _scope_rollup_policy_digest(repo_root)
+    secret_policy_digest, _secret_policy_err = _read_secret_policy_digest(repo_root)
+    head_sha = _scope_rollup_head_sha(repo_root)
+
+    safety_verdict = "allow" if (
+        secrets_mode == SECRET_MODE_NONE
+        and public_checkpoint_present is False
+        and policy_digest is not None
+        and secret_policy_digest is not None
+    ) else "deny"
+
+    artifact: dict[str, Any] = {
+        "schema": SCOPE_ROLLUP_ELIGIBILITY_SCHEMA,
+        "artifact_version": SCOPE_ROLLUP_ELIGIBILITY_ARTIFACT_VERSION,
+        "repo_root_realpath": str(repo_root.resolve()),
+        "head_sha": head_sha,
+        "policy_digest": policy_digest,
+        "secret_policy_digest": secret_policy_digest,
+        "public_checkpoint_present": public_checkpoint_present,
+        "visibility": visibility,
+        "secrets_mode": secrets_mode,
+        "generated_at": now.isoformat().replace("+00:00", "Z"),
+        "expires_at": (now + timedelta(seconds=ttl_seconds)).isoformat().replace("+00:00", "Z"),
+        "safety_verdict": safety_verdict,
+    }
+
+    path = scope_rollup_eligibility_artifact_path(repo_root)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    rendered = (json.dumps(artifact, sort_keys=True, indent=2) + "\n").encode("utf-8")
+
+    tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(tmp_path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as handle:
+            handle.write(rendered)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(fd)
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, path)
+
+    return (EXIT_PASS if safety_verdict == "allow" else EXIT_FAIL), artifact
+
+
+def load_and_verify_scope_rollup_eligibility_artifact(
+    repo_root: Path,
+    *,
+    hook_received_at: datetime,
+    marker_generated_at: datetime | None = None,
+) -> tuple[dict[str, Any] | None, str, str | None]:
+    """Load and independently verify the fixed-location eligibility artifact.
+
+    Returns (artifact_or_None, reason_code, digest_or_None). reason_code is
+    "ok" only when every binding/timestamp check passes; otherwise it is a
+    stable machine-readable rejection code and artifact is None. This is
+    used by the capture producer (Python) as a second, independent
+    verification pass (defense in depth) on top of the Node-only adapter
+    gate — never as a substitute for it.
+    """
+    path = scope_rollup_eligibility_artifact_path(repo_root)
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None, "eligibility_missing", None
+
+    if stat.S_ISLNK(st.st_mode):
+        return None, "eligibility_invalid_symlink", None
+    if not stat.S_ISREG(st.st_mode):
+        return None, "eligibility_invalid_not_regular_file", None
+    if stat.S_IMODE(st.st_mode) != 0o600:
+        return None, "eligibility_invalid_mode", None
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        return None, "eligibility_invalid_owner", None
+    if st.st_size > SCOPE_ROLLUP_ELIGIBILITY_MAX_BYTES:
+        return None, "eligibility_invalid_size", None
+
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None, "eligibility_unreadable", None
+    digest = f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+    try:
+        artifact = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, "eligibility_invalid_json", digest
+    if not isinstance(artifact, dict):
+        return None, "eligibility_invalid_json", digest
+
+    extra_keys = set(artifact.keys()) - SCOPE_ROLLUP_ELIGIBILITY_KEYS
+    if extra_keys:
+        return None, "eligibility_invalid_additional_properties", digest
+    missing_keys = SCOPE_ROLLUP_ELIGIBILITY_KEYS - set(artifact.keys())
+    if missing_keys:
+        return None, "eligibility_invalid_missing_fields", digest
+
+    if artifact.get("schema") != SCOPE_ROLLUP_ELIGIBILITY_SCHEMA:
+        return None, "eligibility_invalid_schema", digest
+
+    expected_repo_root = str(repo_root.resolve())
+    if artifact.get("repo_root_realpath") != expected_repo_root:
+        return None, "eligibility_binding_repo_mismatch", digest
+
+    policy_digest = _scope_rollup_policy_digest(repo_root)
+    if policy_digest is None or artifact.get("policy_digest") != policy_digest:
+        return None, "eligibility_binding_policy_digest_mismatch", digest
+
+    secret_policy_digest, _err = _read_secret_policy_digest(repo_root)
+    if secret_policy_digest is None or artifact.get("secret_policy_digest") != secret_policy_digest:
+        return None, "eligibility_binding_secret_policy_digest_mismatch", digest
+
+    if artifact.get("public_checkpoint_present") is not False:
+        return None, "eligibility_binding_public_checkpoint_present", digest
+    # `visibility` is bound/recorded for anti-replay provenance only — see
+    # emit_scope_rollup_eligibility_artifact() docstring; it is not itself a
+    # safety gate for local-only capture.
+    if artifact.get("secrets_mode") != SECRET_MODE_NONE:
+        return None, "eligibility_binding_secrets_mode_unsafe", digest
+    if artifact.get("safety_verdict") != "allow":
+        return None, "eligibility_binding_safety_verdict_denied", digest
+
+    generated_at = _parse_iso8601_utc(artifact.get("generated_at"))
+    expires_at = _parse_iso8601_utc(artifact.get("expires_at"))
+    if generated_at is None or expires_at is None:
+        return None, "eligibility_invalid_timestamp", digest
+
+    # AC14: pre-generation lifecycle — the artifact must already exist
+    # (generated_at <= hook_received_at) and must not have expired
+    # (hook_received_at < expires_at). A future-dated generated_at is
+    # rejected as stale/invalid rather than trusted.
+    if generated_at > hook_received_at:
+        return None, "eligibility_stale_future_generated_at", digest
+    if hook_received_at >= expires_at:
+        return None, "eligibility_stale_expired", digest
+    if marker_generated_at is not None and generated_at > marker_generated_at:
+        return None, "eligibility_stale_generated_after_marker", digest
+
+    head_sha = artifact.get("head_sha")
+    current_head = _scope_rollup_head_sha(repo_root)
+    if head_sha is not None and current_head is not None and head_sha != current_head:
+        return None, "eligibility_binding_head_sha_mismatch", digest
+
+    return artifact, "ok", digest
+
+
 def _capability_public_safety(surfaces: list) -> dict[str, Any]:
     """Aggregate the public_safety admission contract over all surfaces' signals."""
     raw = prompt = tool_io = abspath = cred = False
@@ -1642,10 +1940,28 @@ def main() -> int:
         help="Path to the agent observation capability matrix doc; validates its "
              "machine-readable surface blocks against the closed schema and exits.",
     )
+    parser.add_argument(
+        "--emit-scope-rollup-eligibility", action="store_true", default=False,
+        help="Generate the fixed private scope-rollup capture eligibility artifact "
+             "(Issue #1527 Scope Delta (2), AC12/AC13) and exit.",
+    )
+    parser.add_argument(
+        "--scope-rollup-eligibility-ttl-seconds", type=int,
+        default=SCOPE_ROLLUP_ELIGIBILITY_TTL_SECONDS_DEFAULT,
+        help="TTL (seconds) for --emit-scope-rollup-eligibility.",
+    )
     args = parser.parse_args()
 
     execution_profile = args.execution_profile
     # Note: --test-mode just confirms fixture profile (already default)
+
+    if args.emit_scope_rollup_eligibility:
+        repo_root = get_repo_root(args.repo_root)
+        exit_code, artifact = emit_scope_rollup_eligibility_artifact(
+            repo_root, ttl_seconds=args.scope_rollup_eligibility_ttl_seconds,
+        )
+        print(json.dumps(artifact, indent=2), flush=True)
+        return exit_code
 
     # #1221 P0-3: capability doc schema cross-check (self-contained mode)
     if args.validate_capability_doc:
