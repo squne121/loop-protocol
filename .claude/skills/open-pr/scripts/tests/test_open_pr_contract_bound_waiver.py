@@ -166,11 +166,12 @@ def test_contract_bound_waiver_allows_exact_stale_candidate_only(monkeypatch):
     sha = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
     _patch_live_waiver_readback(monkeypatch, 1503, body, [_snapshot_comment(sha, 1503)])
 
-    loaded, error = open_pr._load_verified_generic_overlap_readback_waiver(
+    loaded, error, live_body_sha256 = open_pr._load_verified_generic_overlap_readback_waiver(
         "squne121/loop-protocol", 1503, today=open_pr.date(2026, 6, 15)
     )
     assert error is None
     assert loaded == waiver
+    assert live_body_sha256 == sha
 
     fresh = {
         "route": "human_review_required",
@@ -187,12 +188,23 @@ def test_contract_bound_waiver_allows_exact_stale_candidate_only(monkeypatch):
     monkeypatch.setattr(
         open_pr,
         "_load_verified_generic_overlap_readback_waiver",
-        lambda repo, linked_issue: (waiver, None),
+        lambda repo, linked_issue: (waiver, None, sha),
     )
     stored = fresh | {
         "schema": open_pr.OVERLAP_PREFLIGHT_SCHEMA,
-        "current_issue": {"number": 1503},
-        "source": {"complete": True, "saturated": False, "limit": 100},
+        # P1-binding-gap: current_issue.body_sha256 must equal the live body
+        # SHA the (monkeypatched) waiver loader "verified" against.
+        "current_issue": {"number": 1503, "body_sha256": sha},
+        "source": {
+            "complete": True,
+            "saturated": False,
+            "limit": 100,
+            "collection_mode": "exhaustive_cursor_pagination",
+            "page_size": 50,
+            "page_count": 1,
+            "fetched_count": 1,
+            "has_next_page": False,
+        },
         "validation_errors": {},
         "dependency_resolution": {"unresolved_refs": [], "blocking_predecessor": None},
         "decision_inputs_sha256": "sha256:" + "a" * 64,
@@ -235,6 +247,8 @@ def test_contract_bound_waiver_allows_exact_stale_candidate_only(monkeypatch):
 
 def test_contract_bound_waiver_rejects_candidate_timestamp_or_reason_drift(monkeypatch):
     waiver = _generic_waiver(linked_issue=1503)
+    body = _waiver_live_body(waiver)
+    sha = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
 
     # updated_at drift: fresh candidate's updated_at no longer matches the
     # waiver-declared value.
@@ -297,12 +311,21 @@ def test_contract_bound_waiver_rejects_candidate_timestamp_or_reason_drift(monke
     monkeypatch.setattr(
         open_pr,
         "_load_verified_generic_overlap_readback_waiver",
-        lambda repo, linked_issue: (waiver, None),
+        lambda repo, linked_issue: (waiver, None, sha),
     )
     stored = drifted_updated_at | {
         "schema": open_pr.OVERLAP_PREFLIGHT_SCHEMA,
-        "current_issue": {"number": 1503},
-        "source": {"complete": True, "saturated": False, "limit": 100},
+        "current_issue": {"number": 1503, "body_sha256": sha},
+        "source": {
+            "complete": True,
+            "saturated": False,
+            "limit": 100,
+            "collection_mode": "exhaustive_cursor_pagination",
+            "page_size": 50,
+            "page_count": 1,
+            "fetched_count": 1,
+            "has_next_page": False,
+        },
         "validation_errors": {},
         "dependency_resolution": {"unresolved_refs": [], "blocking_predecessor": None},
         "decision_inputs_sha256": "sha256:" + "b" * 64,
@@ -355,7 +378,7 @@ def test_contract_bound_waiver_rejects_invalid_live_contract_or_snapshot(monkeyp
     _patch_live_waiver_readback(
         monkeypatch, 1503, mismatched_body, [_snapshot_comment(mismatched_sha, 1503)]
     )
-    loaded, error = open_pr._load_verified_generic_overlap_readback_waiver(
+    loaded, error, _live_body_sha256 = open_pr._load_verified_generic_overlap_readback_waiver(
         "squne121/loop-protocol", 1503, today=open_pr.date(2026, 6, 15)
     )
     assert loaded is None
@@ -369,7 +392,7 @@ def test_contract_bound_waiver_rejects_invalid_live_contract_or_snapshot(monkeyp
     _patch_live_waiver_readback(
         monkeypatch, 1503, mismatched_issue_body, [_snapshot_comment(mismatched_issue_sha, 1503)]
     )
-    loaded, error = open_pr._load_verified_generic_overlap_readback_waiver(
+    loaded, error, _live_body_sha256 = open_pr._load_verified_generic_overlap_readback_waiver(
         "squne121/loop-protocol", 1503, today=open_pr.date(2026, 6, 15)
     )
     assert loaded is None
@@ -377,7 +400,7 @@ def test_contract_bound_waiver_rejects_invalid_live_contract_or_snapshot(monkeyp
 
     # expired waiver.
     _patch_live_waiver_readback(monkeypatch, 1503, body, [_snapshot_comment(sha, 1503)])
-    loaded, error = open_pr._load_verified_generic_overlap_readback_waiver(
+    loaded, error, _live_body_sha256 = open_pr._load_verified_generic_overlap_readback_waiver(
         "squne121/loop-protocol", 1503, today=open_pr.date(2027, 1, 1)
     )
     assert loaded is None
@@ -388,7 +411,7 @@ def test_contract_bound_waiver_rejects_invalid_live_contract_or_snapshot(monkeyp
     _patch_live_waiver_readback(
         monkeypatch, 1503, "## Outcome\n\nno waiver here\n", [_snapshot_comment("sha256:" + "0" * 64, 1503)]
     )
-    loaded, error = open_pr._load_verified_generic_overlap_readback_waiver(
+    loaded, error, _live_body_sha256 = open_pr._load_verified_generic_overlap_readback_waiver(
         "squne121/loop-protocol", 1503, today=open_pr.date(2026, 6, 15)
     )
     assert loaded is None
@@ -399,7 +422,7 @@ def test_contract_bound_waiver_rejects_invalid_live_contract_or_snapshot(monkeyp
     _patch_live_waiver_readback(
         monkeypatch, 1503, body, [_snapshot_comment("sha256:" + "0" * 64, 1503)]
     )
-    loaded, error = open_pr._load_verified_generic_overlap_readback_waiver(
+    loaded, error, _live_body_sha256 = open_pr._load_verified_generic_overlap_readback_waiver(
         "squne121/loop-protocol", 1503, today=open_pr.date(2026, 6, 15)
     )
     assert loaded is None
@@ -412,7 +435,7 @@ def test_contract_bound_waiver_rejects_invalid_live_contract_or_snapshot(monkeyp
         body,
         [_snapshot_comment(sha, 1503, status="blocked")],
     )
-    loaded, error = open_pr._load_verified_generic_overlap_readback_waiver(
+    loaded, error, _live_body_sha256 = open_pr._load_verified_generic_overlap_readback_waiver(
         "squne121/loop-protocol", 1503, today=open_pr.date(2026, 6, 15)
     )
     assert loaded is None
@@ -420,7 +443,7 @@ def test_contract_bound_waiver_rejects_invalid_live_contract_or_snapshot(monkeyp
 
     # comment readback itself incomplete (paginated fetch failure).
     _patch_live_waiver_readback(monkeypatch, 1503, body, [], error="comments_fetch_incomplete")
-    loaded, error = open_pr._load_verified_generic_overlap_readback_waiver(
+    loaded, error, _live_body_sha256 = open_pr._load_verified_generic_overlap_readback_waiver(
         "squne121/loop-protocol", 1503, today=open_pr.date(2026, 6, 15)
     )
     assert loaded is None
@@ -430,7 +453,7 @@ def test_contract_bound_waiver_rejects_invalid_live_contract_or_snapshot(monkeyp
     # rejections above are specific to the injected defects, not a broken
     # happy path).
     _patch_live_waiver_readback(monkeypatch, 1503, body, [_snapshot_comment(sha, 1503)])
-    loaded, error = open_pr._load_verified_generic_overlap_readback_waiver(
+    loaded, error, _live_body_sha256 = open_pr._load_verified_generic_overlap_readback_waiver(
         "squne121/loop-protocol", 1503, today=open_pr.date(2026, 6, 15)
     )
     assert error is None
@@ -517,7 +540,16 @@ def test_generic_waiver_path_does_not_activate_for_the_fixed_1477_binding(monkey
     stored = fresh | {
         "schema": open_pr.OVERLAP_PREFLIGHT_SCHEMA,
         "current_issue": {"number": 1477},
-        "source": {"complete": True, "saturated": False, "limit": 100},
+        "source": {
+            "complete": True,
+            "saturated": False,
+            "limit": 100,
+            "collection_mode": "exhaustive_cursor_pagination",
+            "page_size": 50,
+            "page_count": 1,
+            "fetched_count": 1,
+            "has_next_page": False,
+        },
         "validation_errors": {},
         "dependency_resolution": {"unresolved_refs": [], "blocking_predecessor": None},
         "decision_inputs_sha256": "sha256:" + "c" * 64,
@@ -554,3 +586,184 @@ def test_generic_waiver_path_does_not_activate_for_the_fixed_1477_binding(monkey
         assert err_code == open_pr.E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE
     finally:
         evidence_path.unlink(missing_ok=True)
+
+
+
+# ---------------------------------------------------------------------------
+# PR #1627 review fix_delta (P1-binding-gap): the generic waiver loader's
+# live_body_sha256 must be connected to the fresh evidence's own
+# current_issue.body_sha256 -- otherwise a waiver verified against a live
+# body read *after* the fresh (route-producing) readback could be applied
+# even though the fresh readback actually saw a different body.
+# ---------------------------------------------------------------------------
+
+
+def _build_stored_evidence(
+    *,
+    linked_issue: int,
+    candidates: list[dict],
+    current_issue: dict,
+    decision_inputs_byte: bytes,
+) -> dict:
+    stored = {
+        "route": "human_review_required",
+        "candidates": candidates,
+        "schema": open_pr.OVERLAP_PREFLIGHT_SCHEMA,
+        "current_issue": current_issue,
+        "source": {
+            "complete": True,
+            "saturated": False,
+            "limit": 100,
+            "collection_mode": "exhaustive_cursor_pagination",
+            "page_size": 50,
+            "page_count": 1,
+            "fetched_count": 1,
+            "has_next_page": False,
+        },
+        "validation_errors": {},
+        "dependency_resolution": {"unresolved_refs": [], "blocking_predecessor": None},
+        "decision_inputs_sha256": "sha256:" + decision_inputs_byte.hex()[:64].ljust(64, "0"),
+        "repository": "squne121/loop-protocol",
+    }
+    canonical = json.dumps(
+        {k: v for k, v in stored.items() if k != "evidence_sha256"},
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    stored["evidence_sha256"] = f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+    return stored
+
+
+def _run_binding_gap_case(monkeypatch, tmp_name: str, *, current_issue_body_sha256):
+    """Shared harness for the P1-binding-gap cases: live body/snapshot always
+    describe waiver-body "A" (matching candidates), but the fresh evidence's
+    ``current_issue.body_sha256`` is injected by the caller so each case can
+    independently control whether it matches the live body actually read
+    back by the (real, non-monkeypatched) generic waiver loader."""
+    waiver = _generic_waiver(linked_issue=1503)
+    body_a = _waiver_live_body(waiver)
+    sha_a = "sha256:" + hashlib.sha256(body_a.encode("utf-8")).hexdigest()
+    _patch_live_waiver_readback(monkeypatch, 1503, body_a, [_snapshot_comment(sha_a, 1503)])
+
+    candidates = [
+        _readback_incomplete_candidate(
+            521, "2026-06-01T00:00:00Z", "readback_incomplete_missing_outcome_or_in_scope"
+        ),
+    ]
+    current_issue = {"number": 1503}
+    if current_issue_body_sha256 is not _UNSET:
+        current_issue["body_sha256"] = current_issue_body_sha256
+    stored = _build_stored_evidence(
+        linked_issue=1503,
+        candidates=candidates,
+        current_issue=current_issue,
+        decision_inputs_byte=tmp_name.encode("utf-8"),
+    )
+    evidence_path = Path(str(Path(__file__).parent / f"_tmp_{tmp_name}_evidence.json"))
+    evidence_path.write_text(json.dumps(stored), encoding="utf-8")
+    monkeypatch.setattr(
+        open_pr.subprocess,
+        "run",
+        lambda cmd, **kwargs: FakeCompletedProcess(0, json.dumps(stored), ""),
+    )
+    try:
+        return open_pr.run_overlap_preflight_gate(
+            repo="squne121/loop-protocol",
+            linked_issue=1503,
+            evidence_file=evidence_path,
+            expected_evidence_sha256=stored["evidence_sha256"],
+            expected_decision_inputs_sha256=stored["decision_inputs_sha256"],
+        ), sha_a
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+_UNSET = object()
+
+
+def test_binding_gap_rejects_when_fresh_body_sha_does_not_match_live_body_read_by_waiver_loader(
+    monkeypatch,
+):
+    """fresh 本文A（producer が readback した時点の body_sha256）が、waiver
+    検証時に読み戻した live 本文（この harness では実際には本文Aだが、fresh
+    側は本文Bを読んだと主張する）と一致しない場合、waiver は適用されず
+    fail-closed になる。"""
+    other_body_sha256 = "sha256:" + hashlib.sha256(b"body-B-unrelated-content").hexdigest()
+    (ok, error, detail, _effective), _sha_a = _run_binding_gap_case(
+        monkeypatch, "gap_mismatch", current_issue_body_sha256=other_body_sha256
+    )
+    assert ok is False
+    assert error == open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID
+    assert "body_sha256" in detail
+
+
+def test_binding_gap_allows_when_fresh_body_sha_matches_live_body_read_by_waiver_loader(
+    monkeypatch,
+):
+    """fresh 本文A / live 本文A+snapshot A が一致する（binding gap がない）
+    control case: waiver は正しく適用され proceed する。"""
+    # `current_issue_body_sha256` は、live 本文を読み戻す前に決まる値が要る
+    # ため、ここでは harness を2段で呼ぶ代わりに waiver-body の SHA を先に
+    # 計算してから harness へ渡す。
+    waiver = _generic_waiver(linked_issue=1503)
+    expected_sha = "sha256:" + hashlib.sha256(_waiver_live_body(waiver).encode("utf-8")).hexdigest()
+    (ok, error, detail, effective), sha_a = _run_binding_gap_case(
+        monkeypatch, "gap_match", current_issue_body_sha256=expected_sha
+    )
+    assert sha_a == expected_sha
+    assert ok is True, (error, detail)
+    assert effective is not None
+    assert effective["route"] == "proceed_with_collision_evidence"
+
+
+def test_binding_gap_rejects_missing_current_issue_body_sha256(monkeypatch):
+    """current_issue.body_sha256 が欠落している fresh evidence は、waiver 検証
+    済みの live body SHA と接続できないため fail-closed で拒否する。"""
+    (ok, error, detail, _effective), _sha_a = _run_binding_gap_case(
+        monkeypatch, "gap_missing", current_issue_body_sha256=_UNSET
+    )
+    assert ok is False
+    assert error == open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID
+    assert "body_sha256" in detail
+
+
+def test_binding_gap_rejects_malformed_current_issue_body_sha256(monkeypatch):
+    """current_issue.body_sha256 が sha256:<64 hex> 形式でない場合も
+    fail-closed で拒否する（型は正しいが形式不正）。"""
+    (ok, error, detail, _effective), _sha_a = _run_binding_gap_case(
+        monkeypatch, "gap_malformed", current_issue_body_sha256="not-a-sha256-value"
+    )
+    assert ok is False
+    assert error == open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID
+    assert "body_sha256" in detail
+
+
+# ---------------------------------------------------------------------------
+# PR #1627 review fix_delta (P2-reason-partial-match): the waiver only ever
+# permits the single ``reason`` it declares per candidate. Fresh candidates
+# whose ``reasons`` list contains the permitted reason *plus* an additional,
+# unwaived reason must still be rejected (subset/superset is not equality).
+# ---------------------------------------------------------------------------
+
+
+def test_incomplete_candidates_match_generic_waiver_rejects_extra_reason_added_to_permitted_candidate():
+    waiver = _generic_waiver(linked_issue=1503)
+    fresh_with_extra_reason = {
+        "route": "human_review_required",
+        "candidates": [
+            {
+                "issue_number": 521,
+                "updated_at": "2026-06-01T00:00:00Z",
+                "readback_complete": False,
+                "reasons": [
+                    "readback_incomplete_missing_outcome_or_in_scope",
+                    "readback_incomplete_another_unwaived_reason",
+                ],
+            },
+        ],
+    }
+    assert (
+        open_pr._incomplete_candidates_match_generic_waiver(fresh_with_extra_reason, waiver)
+        is False
+    )
