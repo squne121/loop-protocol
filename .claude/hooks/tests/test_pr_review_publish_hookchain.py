@@ -161,18 +161,22 @@ class TestAC8FullRealHookChainAggregate:
             "chain, not skipped -- it is registered on the same Bash matcher."
         )
 
+        permission_aggregate = hookchain_harness.aggregate_permission_decision(results)
+        assert permission_aggregate == "no_decision", (
+            "Silent successful hooks must remain no_decision rather than being "
+            f"misreported as explicit allow. Per-hook results: {results}"
+        )
         aggregate = hookchain_harness.aggregate_decision(results)
         assert aggregate == "allow", (
             "Aggregate PreToolUse decision across the full real hook chain "
-            f"must be allow (explicit allow or no-decision), not deny/ask. "
+            f"must be allow when no hook blocks, defers, or asks. "
             f"Per-hook results: {results}"
         )
-        # Every individual hook decision must also be allow -- an aggregate
-        # "allow" must not be hiding a masked deny from an earlier-short-
-        # circuited hook (the harness stops at the first block, so if the
-        # aggregate is allow, every hook that ran must itself have allowed).
+        # A silent successful hook is no_decision, not an explicit allow. The
+        # canonical command remains safe only when no hook denies, defers,
+        # asks, or errors.
         for r in results:
-            assert r["decision"] == "allow", (
+            assert r["decision"] not in {"deny", "defer", "ask", "hook_error"}, (
                 f"{r['hook_name']} returned {r['decision']} "
                 f"(exit={r['returncode']}); stderr={r['stderr']}"
             )
