@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 _THIS_FILE = Path(__file__).resolve()
-REPO_ROOT = _THIS_FILE.parent.parent.parent.parent  # worktree root
+REPO_ROOT = _THIS_FILE.parent.parent.parent  # worktree root
 GUARD_SH = REPO_ROOT / ".claude" / "hooks" / "worktree_scope_guard.sh"
 
 
