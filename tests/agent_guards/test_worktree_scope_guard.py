@@ -25,9 +25,9 @@ import pytest
 
 # Anchor on __file__ for worktree isolation.
 _THIS_FILE = Path(__file__).resolve()
-REPO_ROOT = _THIS_FILE.parent.parent.parent.parent  # worktree root
+REPO_ROOT = _THIS_FILE.parent.parent.parent  # worktree root
 GUARD_SH = REPO_ROOT / ".claude" / "hooks" / "worktree_scope_guard.sh"
-GUARD_PY = REPO_ROOT / ".claude" / "hooks" / "worktree_scope_guard.py"
+GUARD_PY = REPO_ROOT / "scripts" / "agent-guards" / "worktree_scope_guard.py"
 SETTINGS_JSON = REPO_ROOT / ".claude" / "settings.json"
 
 
