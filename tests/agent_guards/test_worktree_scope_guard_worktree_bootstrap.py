@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 GUARD_SH = REPO_ROOT / ".claude" / "hooks" / "worktree_scope_guard.sh"
 
 

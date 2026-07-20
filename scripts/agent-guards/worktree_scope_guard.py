@@ -806,18 +806,18 @@ def resolve_project_root() -> str:
     Precedence:
       1. CLAUDE_PROJECT_DIR
       2. settings_json_parent_resolution — walk up from this file
-         (<root>/.claude/hooks/worktree_scope_guard.py) so the `.claude` parent
-         is the project root. Anchored on __file__, never on
-         `git rev-parse --show-toplevel`.
+         (<root>/scripts/agent-guards/worktree_scope_guard.py) so the parent
+         of `scripts/agent-guards` is the project root. Anchored on
+         __file__, never on `git rev-parse --show-toplevel`.
     """
     env_root = os.environ.get("CLAUDE_PROJECT_DIR")
     if env_root:
         return os.path.realpath(env_root)
-    # __file__ = <root>/.claude/hooks/worktree_scope_guard.py
+    # __file__ = <root>/scripts/agent-guards/worktree_scope_guard.py
     here = os.path.realpath(__file__)
-    hooks_dir = os.path.dirname(here)
-    claude_dir = os.path.dirname(hooks_dir)
-    root = os.path.dirname(claude_dir)
+    agent_guards_dir = os.path.dirname(here)
+    scripts_dir = os.path.dirname(agent_guards_dir)
+    root = os.path.dirname(scripts_dir)
     return os.path.realpath(root)
 
 

@@ -1671,7 +1671,7 @@ from local_main_branch_guard import (  # noqa: E402
     is_cleanup_class_command,
 )
 
-_GUARD_PY = REPO_ROOT / ".claude" / "hooks" / "worktree_scope_guard.py"
+_GUARD_PY = REPO_ROOT / "scripts" / "agent-guards" / "worktree_scope_guard.py"
 
 
 def _load_cleanup_core():
