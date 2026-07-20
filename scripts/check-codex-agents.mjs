@@ -454,7 +454,7 @@ const expectedPreToolUseEntries = new Map([
         statusMessage: 'Checking local root branch policy',
       },
       {
-        command: 'python3 "$(git rev-parse --show-toplevel)/.claude/hooks/worktree_scope_guard.py"',
+        command: 'python3 "$(git rev-parse --show-toplevel)/scripts/agent-guards/worktree_scope_guard.py"',
         timeout: 20,
         statusMessage: 'Checking worktree cleanup scope policy (shared core)',
       },
@@ -483,6 +483,11 @@ const expectedPreToolUseEntries = new Map([
   [
     '^(apply_patch|Edit|Write)$',
     [
+      {
+        command: 'python3 "$(git rev-parse --show-toplevel)/scripts/agent-guards/codex_apply_patch_adapter.py"',
+        timeout: 20,
+        statusMessage: 'Checking worktree containment for apply_patch/Edit/Write (shared core)',
+      },
       {
         command: `${checkCodexAgentsBase} --hook-pretool`,
         timeout: 30,

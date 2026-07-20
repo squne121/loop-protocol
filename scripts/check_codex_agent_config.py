@@ -34,7 +34,7 @@ EXPECTED_PRETOOL_HOOKS = {
         },
         {
             "type": "command",
-            "command": 'python3 "$(git rev-parse --show-toplevel)/.claude/hooks/worktree_scope_guard.py"',
+            "command": 'python3 "$(git rev-parse --show-toplevel)/scripts/agent-guards/worktree_scope_guard.py"',
             "timeout": 20,
             "statusMessage": "Checking worktree cleanup scope policy (shared core)",
         },
@@ -64,6 +64,12 @@ EXPECTED_PRETOOL_HOOKS = {
         },
     ],
     "^(apply_patch|Edit|Write)$": [
+        {
+            "type": "command",
+            "command": 'python3 "$(git rev-parse --show-toplevel)/scripts/agent-guards/codex_apply_patch_adapter.py"',
+            "timeout": 20,
+            "statusMessage": "Checking worktree containment for apply_patch/Edit/Write (shared core)",
+        },
         {
             "type": "command",
             "command": f"{CHECK_CODEX_AGENTS_BASE} --hook-pretool",

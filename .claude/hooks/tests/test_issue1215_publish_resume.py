@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Issue #1215: publish-resume related scope-guard coverage."""
 
-from test_worktree_scope_guard import _bash_payload, _make_repo_with_worktree, _run_guard
+from worktree_scope_guard_testkit import _bash_payload, _make_repo_with_worktree, _run_guard
 
 
 def test_issue1215_publish_resume_direct_publish_command_blocked(tmp_path):

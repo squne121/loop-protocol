@@ -38,6 +38,72 @@ COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH = "contract_snapshot.publish"
 # numbering space). The pr_review.publish field validator additionally
 # requires an explicit `pr_number` field and checks it matches.
 COMMAND_ID_PR_REVIEW_PUBLISH = "pr_review.publish"
+COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE = "issue_scope_snapshot.materialize"
+
+# Issue #1633: bounded request schema an isolation worktree agent is allowed
+# to produce for an Issue comment. The isolation worktree agent never invokes
+# `gh` or the controlled executor itself -- it only ever hands back this
+# closed-key dict to the canonical main root parent orchestrator (the
+# materializer in publish_termination_report.py), which validates it,
+# materializes an ISSUE_COMMENT_PUBLISH_INPUT_V1 file from it, and launches
+# controlled_skill_mutation_exec.py --command-id issue_comment.publish.
+ISOLATION_ISSUE_COMMENT_REQUEST_SCHEMA = "ISOLATION_ISSUE_COMMENT_REQUEST_V1"
+
+ISOLATION_ISSUE_COMMENT_REQUEST_ALLOWED_KEYS = frozenset({
+    "schema", "issue_number", "repo", "comment_body", "marker",
+})
+
+
+def validate_isolation_issue_comment_request(
+    data: object, issue_number: int, repo: str
+) -> str:
+    """Validate a bounded ISOLATION_ISSUE_COMMENT_REQUEST_V1 dict (Issue #1633).
+
+    Returns "" on success, else a descriptive error string. Enforces a
+    closed key set (no keys outside ISOLATION_ISSUE_COMMENT_REQUEST_ALLOWED_KEYS),
+    an exact schema match, an issue_number/repo cross-check against the
+    caller-declared values, non-empty comment_body/marker strings, and that
+    marker is embedded in comment_body. This is the parent-owned bounds check
+    on the request an isolation worktree agent is allowed to produce -- it
+    runs before any file is written into the issue-scoped input namespace.
+    """
+    if not isinstance(data, dict):
+        return "isolation_issue_comment_request_not_object"
+
+    unknown_keys = set(data.keys()) - ISOLATION_ISSUE_COMMENT_REQUEST_ALLOWED_KEYS
+    if unknown_keys:
+        return f"isolation_issue_comment_request_unknown_fields: {sorted(unknown_keys)}"
+
+    if data.get("schema") != ISOLATION_ISSUE_COMMENT_REQUEST_SCHEMA:
+        return (
+            "isolation_issue_comment_request_schema_mismatch: "
+            f"{data.get('schema')!r}"
+        )
+
+    req_issue_number = data.get("issue_number")
+    if type(req_issue_number) is not int or req_issue_number != issue_number:
+        return (
+            "isolation_issue_comment_request_issue_number_mismatch: "
+            f"{req_issue_number!r} != {issue_number!r}"
+        )
+
+    req_repo = data.get("repo")
+    if req_repo != repo:
+        return f"isolation_issue_comment_request_repo_mismatch: {req_repo!r} != {repo!r}"
+
+    comment_body = data.get("comment_body")
+    if not isinstance(comment_body, str) or not comment_body:
+        return "isolation_issue_comment_request_comment_body_invalid"
+
+    marker = data.get("marker")
+    if not isinstance(marker, str) or not marker:
+        return "isolation_issue_comment_request_marker_invalid"
+
+    if marker not in comment_body:
+        return "isolation_issue_comment_request_marker_not_embedded_in_body"
+
+    return ""
+
 
 # Allowed write roots for all commands (relative to project root)
 ALLOWED_WRITE_ROOTS = ["artifacts/"]
@@ -54,6 +120,7 @@ INPUT_SCHEMA_BY_COMMAND: dict = {
     COMMAND_ID_ISSUE_COMMENT_PUBLISH: "ISSUE_COMMENT_PUBLISH_INPUT_V1",
     COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH: "CONTRACT_SNAPSHOT_PUBLISH_INPUT_V1",
     COMMAND_ID_PR_REVIEW_PUBLISH: "PR_REVIEW_PUBLISH_REQUEST_V1",
+    COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE: "ISSUE_SCOPE_SNAPSHOT_MATERIALIZE_INPUT_V1",
 }
 
 ALL_COMMAND_IDS = frozenset(INPUT_SCHEMA_BY_COMMAND)
@@ -253,6 +320,25 @@ CONTROLLED_SKILL_MUTATION_COMMAND_POLICY: dict = {
                 f"{COMMAND_ID_PR_REVIEW_PUBLISH}/pr_review_publish.marker.json"
             ),
             "marker_field": "idempotency_key",
+        },
+        "env_sanitize": ENV_SANITIZE_KEYS,
+    },
+    COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE: {
+        "command_id": COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
+        "description": "Materialize a live GitHub-bound ISSUE_SCOPE_SNAPSHOT_V1 artifact",
+        "executor_script": EXECUTOR_SCRIPT,
+        "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+        "input_namespace": (
+            f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/"
+            f"{COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE}/"
+        ),
+        "input_schema": INPUT_SCHEMA_BY_COMMAND[COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE],
+        "materializer_script": "scripts/agent-guards/materialize_issue_scope_snapshot.py",
+        "github_mutation": {"read_issue": True, "requires_repo": TRUSTED_REPO},
+        "postcondition": {
+            "no_tracked_source_changes": True,
+            "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+            "materializer_provenance_required": True,
         },
         "env_sanitize": ENV_SANITIZE_KEYS,
     },

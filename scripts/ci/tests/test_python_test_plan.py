@@ -327,6 +327,16 @@ def test_cli_fails_closed_on_bad_plan(tmp_path):
     assert proc.returncode == 2
 
 
+def test_real_plan_includes_scope_rollup_graphql_pagination_v3_exactly_once():
+    """Issue #1644: tests/codex/test_scope_rollup_graphql_pagination_v3.py must be
+    registered in the python-test-plan SSOT exactly once (exact-one registration),
+    both in the raw targets list and in the derived scope argv."""
+    plan = mod.load_plan(_PLAN_PATH)
+    path = "tests/codex/test_scope_rollup_graphql_pagination_v3.py"
+    assert plan["targets"].count(path) == 1
+    assert mod.scope_argv(plan).count(path) == 1
+
+
 def test_real_plan_includes_pr_body_validator_exactly_once():
     plan = mod.load_plan(_PLAN_PATH)
     path = "scripts/tests/test_pr_body_validator.py"
