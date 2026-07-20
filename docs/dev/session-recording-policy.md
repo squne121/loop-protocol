@@ -30,7 +30,7 @@ Codex の `SubagentStop` では、adapter は capture policy の適用と subpro
 `.claude/hooks/capture_scope_rollup_final_response.py` とする。adapter は marker parse、
 invocation ID、capture path、sidecar schema、duplicate/stale/SHA256 判定を再実装しない。
 
-#### eligibility / readiness の authority（固定 private location のみ）
+#### eligibility / readiness の判定根拠は固定 private location のみとする
 
 source-bound eligibility / readiness の受理経路は、`.claude/scripts/check_session_recording_runtime_safety.py`
 （eligibility）と `scripts/session-recording/bootstrap-source-bound-readiness.mjs`（readiness）が
