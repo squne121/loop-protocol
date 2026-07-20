@@ -1225,13 +1225,13 @@ class TestReadbackContractSnapshotDuplicateMarker:
                 "github.com",
                 "repos/squne121/loop-protocol/issues/comments/999",
             ], cmd
-            payload = {
-                "id": 999,
-                "html_url": fresh_url,
-                "created_at": "2026-01-02T00:00:00Z",
-                "updated_at": "2026-01-02T00:00:00Z",
-                "body": fresh_body,
-            }
+            payload = _single_comment_payload(
+                id=999,
+                html_url=fresh_url,
+                created_at="2026-01-02T00:00:00Z",
+                updated_at="2026-01-02T00:00:00Z",
+                body=fresh_body,
+            )
             return type("P", (), {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""})()
 
         with patch("subprocess.run", side_effect=_fake_run):
@@ -1327,40 +1327,62 @@ class TestReadbackContractSnapshotLiveBodyRevalidation:
         )()
 
         call_log = []
+        issue_readback_calls = []
 
         def _fake_run(cmd, **kwargs):
             call_log.append(cmd)
             if _exec._ENSURE_CONTRACT_SNAPSHOT_REL in " ".join(str(c) for c in cmd):
                 return fake_publisher_proc
-            payload = {
-                "id": 999, "html_url": fresh_url,
-                "created_at": "t", "updated_at": "t", "body": fresh_body,
-            }
+            if cmd[1:5] == ["api", "--hostname", "github.com", f"repos/{TRUSTED_REPO}/issues/1284"]:
+                issue_readback_calls.append((cmd, kwargs))
+                payload = {
+                    "body": (
+                        body_text
+                        if len(issue_readback_calls) == 1
+                        else "body changed by a concurrent editor"
+                    ),
+                    "updatedAt": f"t{len(issue_readback_calls) - 1}",
+                }
+                return type(
+                    "P", (), {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
+                )()
+            payload = _single_comment_payload(
+                id=999,
+                html_url=fresh_url,
+                created_at="t",
+                updated_at="t",
+                body=fresh_body,
+            )
             return type("P", (), {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""})()
 
-        fetch_calls = {"n": 0}
-
-        def _fake_fetch_body(*_args, **_kwargs):
-            fetch_calls["n"] += 1
-            if fetch_calls["n"] == 1:
-                # Pre-publish precondition check: body unchanged.
-                return body_text, "t0", ""
-            # Post-publish readback: a concurrent editor changed the body.
-            return "body changed by a concurrent editor", "t1", ""
-
+        monkeypatch.setenv("GH_HOST", "attacker.example")
+        monkeypatch.setenv("GH_REPO", "other/repo")
+        monkeypatch.setenv("GH_CONFIG_DIR", "/tmp/evil")
         with patch.object(_exec, "_find_gh_bin", return_value=("/bin/gh", "")):
             with patch.object(_exec, "_verify_git_remote_origin", return_value=""):
                 with patch.object(_exec, "_check_contract_snapshot_module_realpaths", return_value=[]):
-                    with patch.object(_exec, "_fetch_issue_body_and_updated_at", side_effect=_fake_fetch_body):
-                        with patch("subprocess.run", side_effect=_fake_run):
-                            rc = _exec.main([
-                                "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
-                                "--issue-number", "1284",
-                                "--input-file", rel,
-                                "--repo", TRUSTED_REPO,
-                                "--json",
-                            ])
+                    with patch("subprocess.run", side_effect=_fake_run):
+                        rc = _exec.main([
+                            "--command-id", COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
+                            "--issue-number", "1284",
+                            "--input-file", rel,
+                            "--repo", TRUSTED_REPO,
+                            "--json",
+                        ])
         assert rc == 1
+        assert len(issue_readback_calls) == 2
+        for cmd, kwargs in issue_readback_calls:
+            assert cmd == [
+                "/bin/gh",
+                "api",
+                "--hostname",
+                "github.com",
+                f"repos/{TRUSTED_REPO}/issues/1284",
+                "--jq",
+                "{body, updatedAt: .updated_at}",
+            ]
+            for key in ("GH_HOST", "GH_REPO", "GH_CONFIG_DIR"):
+                assert key not in kwargs["env"]
 
 
 class TestModuleRealpathsEvaluatorTrustChain:
@@ -1627,7 +1649,46 @@ class TestSingleCommentCanonicalReadback:
         ) is False
 
     def test_single_comment_readback_binds_hostname_and_sanitized_env(self):
-        self.test_single_comment_canonical_projection()
+        hostile_env = {
+            "GH_HOST": "attacker.example",
+            "GH_REPO": "other/repo",
+            "GH_CONFIG_DIR": "/tmp/evil",
+        }
+        calls = []
+
+        def _fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return type(
+                "P",
+                (),
+                {
+                    "returncode": 0,
+                    "stdout": json.dumps({"body": "current body", "updatedAt": "now"}),
+                    "stderr": "",
+                },
+            )()
+
+        with patch.dict(os.environ, hostile_env, clear=False):
+            with patch("subprocess.run", side_effect=_fake_run):
+                body, updated_at, error = _exec._fetch_issue_body_and_updated_at(
+                    1649, TRUSTED_REPO, "/bin/gh"
+                )
+
+        assert (body, updated_at, error) == ("current body", "now", "")
+        assert calls[0][0] == [
+            "/bin/gh",
+            "api",
+            "--hostname",
+            "github.com",
+            f"repos/{TRUSTED_REPO}/issues/1649",
+            "--jq",
+            "{body, updatedAt: .updated_at}",
+        ]
+        child_env = calls[0][1]["env"]
+        for key in hostile_env:
+            assert key not in child_env
+        assert child_env["GH_PROMPT_DISABLED"] == "1"
+        assert child_env["GH_NO_UPDATE_NOTIFIER"] == "1"
 
     def test_single_comment_identity_fixture_preserves_existing_safeguards(
         self, tmp_project_functional, monkeypatch
@@ -1643,15 +1704,46 @@ class TestSingleCommentCanonicalReadback:
             "body_sha256": body_sha256,
             "checks": {"product_spec_check": {"body_sha256": body_sha256}},
         }
-        body = f"{marker}\\n\\n<!--TEST_INNER:{json.dumps(inner)}-->"
+        issue_url = "https://github.com/squne121/loop-protocol/issues/1649"
+        snapshot_body = "\n".join(
+            [
+                "```yaml",
+                "CONTRACT_REVIEW_RESULT_V1:",
+                "  status: go",
+                "  generated_by: issue-contract-review",
+                f'  issue_url: "{issue_url}"',
+                '  generated_at: "2026-07-20T00:00:00Z"',
+                f'  body_sha256: "{body_sha256}"',
+                "  expected_contract_fingerprint:",
+                "    issue_number: 1649",
+                "    contract_source_kind: issue_comment",
+                f'    contract_source_id: "{_SINGLE_COMMENT_ID}"',
+                f'    contract_body_sha256: "{body_sha256}"',
+                "    allowed_paths_normalized_sha256: " + "a" * 64,
+                '    base_ref: "main"',
+                "    base_sha_at_snapshot: " + "b" * 40,
+                "```",
+            ]
+        )
+        body = f"{marker}\n\n{snapshot_body}\n\n<!--TEST_INNER:{json.dumps(inner)}-->"
+        comment = _single_comment_payload(body=body)
+        parser = _load_single_comment_production_parser()
+        results = parser.parse_contract_review_results([comment], issue_url)
+        assert len(results) == 1
+        assert results[0]["is_trusted_author"] is True
+        assert results[0]["is_fingerprint_ready"] is True
+        assert parser.find_latest_authoritative_go(results) == results[0]
 
-        def _fake_run(_cmd, **_kwargs):
+        calls = []
+
+        def _fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
             return type(
                 "P",
                 (),
                 {
                     "returncode": 0,
-                    "stdout": json.dumps(_single_comment_payload(body=body)),
+                    "stdout": json.dumps(comment),
                     "stderr": "",
                 },
             )()
@@ -1671,6 +1763,12 @@ class TestSingleCommentCanonicalReadback:
 
         assert result["remote_postcondition_verified"] is True
         assert result["comment_id"] == _SINGLE_COMMENT_ID
+        assert len(calls) == 1
+        assert calls[0][0][4] == f"repos/{TRUSTED_REPO}/issues/comments/{_SINGLE_COMMENT_ID}"
+        assert not any(
+            cmd[4] == f"repos/{TRUSTED_REPO}/issues/1649/comments"
+            for cmd, _kwargs in calls
+        )
 
     @pytest.mark.github_live
     def test_single_comment_read_only_github_smoke(self):
@@ -1688,6 +1786,15 @@ class TestSingleCommentCanonicalReadback:
             "author", "author_id", "author_type", "author_association",
         }
         assert isinstance(comment["author_id"], int) and not isinstance(comment["author_id"], bool)
+        assert comment["id"] == _SINGLE_COMMENT_ID
+        assert comment["html_url"] == _SINGLE_COMMENT_URL
+        parser = _load_single_comment_production_parser()
+        issue_url = "https://github.com/squne121/loop-protocol/issues/1649"
+        results = parser.parse_contract_review_results([comment], issue_url)
+        assert len(results) == 1
+        assert results[0]["is_trusted_author"] is True
+        assert results[0]["is_fingerprint_ready"] is True
+        assert parser.find_latest_authoritative_go(results) == results[0]
         artifact_dir = Path(os.environ.get("RUNTIME_VERIFICATION_ARTIFACT_DIR", "artifacts"))
         artifact_dir.mkdir(parents=True, exist_ok=True)
         artifact = artifact_dir / (
@@ -1702,6 +1809,14 @@ class TestSingleCommentCanonicalReadback:
                     "command": "pytest -m github_live -k single_comment_read_only_github_smoke",
                     "hostname": "github.com",
                     "canonical_key_set": sorted(comment),
+                    "comment_id_matches_expected": comment["id"] == _SINGLE_COMMENT_ID,
+                    "comment_url_matches_expected": comment["html_url"] == _SINGLE_COMMENT_URL,
+                    "identity_tuple_verified": results[0]["is_trusted_author"] is True,
+                    "production_parser_accepted": len(results) == 1,
+                    "fingerprint_ready": results[0]["is_fingerprint_ready"] is True,
+                    "authoritative_go_selected": (
+                        parser.find_latest_authoritative_go(results) == results[0]
+                    ),
                     "exit_code": 0,
                     "verdict": "PASS",
                 },

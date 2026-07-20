@@ -777,19 +777,33 @@ def _classify_gh_error(prefix: str, stderr: str) -> str:
 def _fetch_issue_body_and_updated_at(
     issue_number: int, repo: str, gh_bin: str
 ) -> tuple[str | None, str | None, str]:
-    """Fetch (body, updatedAt, error) via gh api (argv-list, shell=False)."""
+    """Fetch live Issue state from the trusted GitHub host only.
+
+    ``contract_snapshot.publish`` uses this helper for both its stale-write
+    precondition and its post-publish live-body revalidation.  Those reads are
+    part of the authoritative success boundary, so they must not inherit a
+    caller-controlled GH_HOST/GH_REPO/GH_CONFIG_DIR setting.
+    """
     try:
         out = subprocess.run(
-            [gh_bin, "issue", "view", str(issue_number), "--repo", repo,
-             "--json", "body,updatedAt"],
+            [
+                gh_bin,
+                "api",
+                "--hostname",
+                _TRUSTED_GITHUB_HOST,
+                f"repos/{repo}/issues/{issue_number}",
+                "--jq",
+                "{body, updatedAt: .updated_at}",
+            ],
             capture_output=True, text=True, timeout=15, shell=False,
+            env=_build_metadata_sanitized_env(),
         )
         if out.returncode != 0:
-            return None, None, f"gh_issue_view_failed_rc_{out.returncode}"
+            return None, None, f"gh_issue_fetch_failed_rc_{out.returncode}"
         data = json.loads(out.stdout)
         return data.get("body", ""), data.get("updatedAt", ""), ""
     except Exception as exc:
-        return None, None, f"gh_issue_view_exception: {exc}"
+        return None, None, f"gh_issue_fetch_exception: {exc}"
 
 
 def _patch_issue_body(
