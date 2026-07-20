@@ -484,6 +484,11 @@ const expectedPreToolUseEntries = new Map([
     '^(apply_patch|Edit|Write)$',
     [
       {
+        command: 'python3 "$(git rev-parse --show-toplevel)/scripts/agent-guards/codex_apply_patch_adapter.py"',
+        timeout: 20,
+        statusMessage: 'Checking worktree containment for apply_patch/Edit/Write (shared core)',
+      },
+      {
         command: `${checkCodexAgentsBase} --hook-pretool`,
         timeout: 30,
         statusMessage: 'Checking LOOP_PROTOCOL patch guardrail',

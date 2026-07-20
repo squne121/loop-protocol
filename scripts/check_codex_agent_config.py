@@ -66,6 +66,12 @@ EXPECTED_PRETOOL_HOOKS = {
     "^(apply_patch|Edit|Write)$": [
         {
             "type": "command",
+            "command": 'python3 "$(git rev-parse --show-toplevel)/scripts/agent-guards/codex_apply_patch_adapter.py"',
+            "timeout": 20,
+            "statusMessage": "Checking worktree containment for apply_patch/Edit/Write (shared core)",
+        },
+        {
+            "type": "command",
             "command": f"{CHECK_CODEX_AGENTS_BASE} --hook-pretool",
             "timeout": 30,
             "statusMessage": "Checking LOOP_PROTOCOL patch guardrail",
