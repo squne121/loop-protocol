@@ -176,6 +176,10 @@ _HUMAN_C1_DECISION_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 _HUMAN_C1_DECISION_FIELD_RE = re.compile(r"^  ([a-z][a-z0-9_]*):\s*(\S(?:.*\S)?)\s*$")
+# An earlier rejected decision is supersedable only when it is the explicitly
+# supported stale-body retry.  Parser errors, different decisions, candidate
+# drift, and any future rejection reason stay routing inputs by default.
+_SUPERSEDABLE_HUMAN_C1_REJECTION_REASONS = frozenset({"current_body_sha256_mismatch"})
 _HUMAN_C1_COMMENT_URL_RE = re.compile(
     r"^https://github\.com/(?P<owner>[^/#]+)/(?P<repo>[^/#]+)/issues/(?P<number>[1-9][0-9]*)"
     r"#issuecomment-[1-9][0-9]*$"
@@ -1233,11 +1237,97 @@ def _decision_rejection(
     raw: Dict[str, Any], reason: str, parsed_candidate_issue_number: Optional[int] = None
 ) -> Dict[str, Any]:
     """Produce the complete, hash-bound rejection evidence required by AC5."""
-    return {
+    if parsed_candidate_issue_number is None:
+        parsed_candidate_issue_number = _claimed_human_c1_candidate_number(raw)
+    rejection = {
         **_comment_metadata(raw),
         "parsed_candidate_issue_number": parsed_candidate_issue_number,
         "reason": reason,
     }
+    # This is internal ordering metadata only.  It is removed before evidence
+    # serialization, after a later exact decision has had the opportunity to
+    # supersede an earlier stale attempt for the same candidate.
+    comment_order = raw.get("_human_c1_comment_order")
+    if isinstance(comment_order, int):
+        rejection["_human_c1_comment_order"] = comment_order
+    return rejection
+
+
+def _claimed_human_c1_candidate_number(raw: Dict[str, Any]) -> Optional[int]:
+    """Recover a candidate only from one unambiguous fenced schema block.
+
+    This is deliberately narrower than normal schema parsing because it is
+    used to decide whether a *rejected* record can ever stop routing.  Text
+    outside the fenced block and duplicate/malformed candidate lines must not
+    bind a rejection to a candidate that a later decision could supersede.
+    """
+    body = raw.get("body")
+    if not isinstance(body, str):
+        return None
+    blocks = list(_HUMAN_C1_DECISION_BLOCK_RE.finditer(body))
+    if len(blocks) != 1:
+        return None
+    candidate_numbers: List[int] = []
+    for line in blocks[0].group("fields").splitlines():
+        match = _HUMAN_C1_DECISION_FIELD_RE.fullmatch(line)
+        if not match:
+            continue
+        key, value = match.groups()
+        if key != "candidate_issue_number":
+            continue
+        number = _unquote_comment_scalar(value)
+        if re.fullmatch(r"[1-9][0-9]*", number):
+            candidate_numbers.append(int(number))
+    return candidate_numbers[0] if len(candidate_numbers) == 1 else None
+
+
+def _trusted_schema_like_comment_fingerprint(comments: Any) -> Optional[Tuple[Tuple[Any, ...], ...]]:
+    """Return the complete trusted schema-like comment set for drift checks.
+
+    The C1 decision is a routing input.  Therefore additions, deletions, or
+    edits of *any* trusted schema-like record must be visible between the
+    initial classification and final readback, including rejected and
+    non-routing audit records.  An invalid comments container is represented
+    by ``None`` so it cannot compare equal to a normal empty collection.
+    """
+    if not isinstance(comments, list):
+        return None
+    records: List[Tuple[Any, ...]] = []
+    for raw in comments:
+        if not isinstance(raw, dict):
+            continue
+        body = raw.get("body")
+        if (
+            _comment_author_association(raw) not in {"OWNER", "COLLABORATOR"}
+            or not isinstance(body, str)
+            or HUMAN_C1_DECISION_SCHEMA not in body
+        ):
+            continue
+        metadata = _comment_metadata(raw)
+        records.append(
+            (
+                metadata["comment_id"],
+                metadata["comment_body_sha256"],
+                metadata["comment_updated_at"],
+                metadata["author_login"],
+                metadata["author_association"],
+            )
+        )
+    return tuple(sorted(records, key=lambda item: tuple("" if value is None else str(value) for value in item)))
+
+
+def _is_strictly_earlier_updated_at(rejection_updated_at: Any, accepted_updated_at: Any) -> bool:
+    """Return true only for two valid, timezone-aware, strictly ordered times."""
+    if not isinstance(rejection_updated_at, str) or not isinstance(accepted_updated_at, str):
+        return False
+    try:
+        rejected_at = datetime.fromisoformat(rejection_updated_at.replace("Z", "+00:00"))
+        accepted_at = datetime.fromisoformat(accepted_updated_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if rejected_at.tzinfo is None or accepted_at.tzinfo is None:
+        return False
+    return rejected_at < accepted_at
 
 
 def _validate_human_c1_decisions(
@@ -1286,7 +1376,12 @@ def _validate_human_c1_decisions(
         return result
     seen_candidates: set[int] = set()
 
-    for raw in comments:
+    for comment_order, original_raw in enumerate(comments):
+        raw = (
+            {**original_raw, "_human_c1_comment_order": comment_order}
+            if isinstance(original_raw, dict)
+            else original_raw
+        )
         if not isinstance(raw, dict):
             result["rejected"].append(_decision_rejection({}, "comment_record_invalid"))
             continue
@@ -1329,10 +1424,42 @@ def _validate_human_c1_decisions(
             **fields,
             **_comment_metadata(raw),
             "verified": True,
+            "_human_c1_comment_order": comment_order,
         }
         candidate["human_c1_decision"] = verified
         result["accepted"].append(verified)
         seen_candidates.add(candidate_number)
+
+    # A current exact decision supersedes only an earlier, explicitly stale
+    # body-hash mismatch for the same C1 candidate.  Ordering is bound to
+    # REST ``updated_at`` rather than comment ID/order: an old comment edited
+    # after approval must remain a routing rejection.
+    accepted_by_candidate = {
+        int(item["candidate_issue_number"]): item for item in result["accepted"]
+    }
+    routing_rejections: List[Dict[str, Any]] = []
+    for rejection in result["rejected"]:
+        candidate_number = rejection.get("parsed_candidate_issue_number")
+        rejection_order = rejection.get("_human_c1_comment_order")
+        accepted = accepted_by_candidate.get(candidate_number)
+        accepted_order = accepted.get("_human_c1_comment_order") if accepted else None
+        if (
+            rejection.get("reason") in _SUPERSEDABLE_HUMAN_C1_REJECTION_REASONS
+            and isinstance(rejection_order, int)
+            and isinstance(accepted_order, int)
+            and rejection_order < accepted_order
+            and _is_strictly_earlier_updated_at(
+                rejection.get("comment_updated_at"), accepted.get("comment_updated_at")
+            )
+        ):
+            result["ignored_non_routing"].append(rejection)
+        else:
+            routing_rejections.append(rejection)
+    result["rejected"] = routing_rejections
+
+    for records in result.values():
+        for record in records:
+            record.pop("_human_c1_comment_order", None)
 
     result["accepted"].sort(key=lambda item: (int(item["candidate_issue_number"]), item["comment_url"] or ""))
     result["rejected"].sort(key=lambda item: ((item.get("comment_url") or ""), item["reason"]))
@@ -1343,6 +1470,7 @@ def _validate_human_c1_decisions(
 def _apply_final_readback_drift(
     *,
     decisions: Dict[str, List[Dict[str, Any]]],
+    initial_comments: Any,
     final_current: Dict[str, Any],
     final_candidates: Dict[int, Dict[str, Any]],
     final_comments: List[Dict[str, Any]],
@@ -1358,6 +1486,16 @@ def _apply_final_readback_drift(
         if isinstance(raw, dict) and isinstance(raw.get("comment_id", raw.get("id")), int)
     }
     drifted = False
+    if _trusted_schema_like_comment_fingerprint(initial_comments) != _trusted_schema_like_comment_fingerprint(
+        final_comments
+    ):
+        # Do not try to infer whether the changed record is still harmless:
+        # the initial routing decision was made from a different trusted
+        # schema-like input set.  The caller must re-run the whole preflight.
+        decisions["rejected"].append(
+            _decision_rejection({}, "final_readback_trusted_comment_set_drift")
+        )
+        drifted = True
     for accepted in decisions["accepted"]:
         candidate_number = int(accepted["candidate_issue_number"])
         candidate = final_candidates.get(candidate_number)
@@ -2304,6 +2442,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                     final_candidates[number] = fetched
             if _apply_final_readback_drift(
                 decisions=ctx["human_c1_decisions"],
+                initial_comments=current_raw.get("comments"),
                 final_current=final_current,
                 final_candidates=final_candidates,
                 final_comments=final_comments,
