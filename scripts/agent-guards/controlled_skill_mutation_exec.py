@@ -2053,6 +2053,11 @@ def _run_pr_review_publish(args, input_data, gh_bin, _fail, _ok) -> int:
 
 
 _ISSUECOMMENT_ID_RE = _re.compile(r"#issuecomment-(\d+)$")
+_CANONICAL_SINGLE_COMMENT_PROJECTION = (
+    "{id, html_url, created_at, updated_at, body, "
+    "author: .user.login, author_id: .user.id, "
+    "author_type: .user.type, author_association}"
+)
 
 
 def _extract_comment_id_from_url(url: str) -> str | None:
@@ -2070,10 +2075,16 @@ def _fetch_single_comment_by_id(comment_id: str, repo: str, gh_bin: str) -> dict
     try:
         out = subprocess.run(
             [
-                gh_bin, "api", f"repos/{repo}/issues/comments/{comment_id}",
-                "--jq", "{id, html_url, created_at, updated_at, body}",
+                gh_bin,
+                "api",
+                "--hostname",
+                _TRUSTED_GITHUB_HOST,
+                f"repos/{repo}/issues/comments/{comment_id}",
+                "--jq",
+                _CANONICAL_SINGLE_COMMENT_PROJECTION,
             ],
             capture_output=True, text=True, timeout=15, shell=False,
+            env=_build_metadata_sanitized_env(),
         )
         if out.returncode != 0:
             return {"error": f"comment_fetch_failed_rc_{out.returncode}"}
