@@ -3,7 +3,7 @@
 
 from pathlib import Path
 
-from test_worktree_scope_guard import _bash_payload, _make_repo_with_worktree, _run_guard
+from worktree_scope_guard_testkit import _bash_payload, _make_repo_with_worktree, _run_guard
 
 
 def test_issue1241_rtk_git_add_inside_worktree_allowed(tmp_path: Path):

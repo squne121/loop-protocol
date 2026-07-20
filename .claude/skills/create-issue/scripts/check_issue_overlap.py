@@ -78,6 +78,7 @@ REASON_CODES: frozenset = frozenset(
         "readback_partial",
         "malformed_candidate_contract",
         "no_overlap",
+        "successor_dependency_ordering",
     }
 )
 
@@ -658,6 +659,7 @@ def classify_overlap(
     dep_open: List[CandidateEvidence] = []  # predecessor open -> C2b
     dep_closed: List[CandidateEvidence] = []  # predecessor closed -> C2a
     overlap_partial: List[CandidateEvidence] = []
+    overlap_partial_successor_dependency = False  # successor + shared parent -> C2a (#1619)
     title_goal_disjoint: List[CandidateEvidence] = []
     excluded: List[int] = []
 
@@ -690,6 +692,14 @@ def classify_overlap(
                     dep_open.append(ev)
                 else:
                     dep_closed.append(ev)
+                continue
+            elif rel == "successor":
+                # candidate が current に依存している（current を止めていない）。
+                # shared parent_refs があっても無条件で parent_collision(C3) に
+                # 倒さず、安全な直列化順序として overlap_partial(C2a) へ倒す（#1619）。
+                overlap_partial.append(ev)
+                if has_parent:
+                    overlap_partial_successor_dependency = True
                 continue
             if has_parent:
                 parent_collision.append(ev)
@@ -753,15 +763,26 @@ def classify_overlap(
             excluded_false_positives=tuple(sorted(excluded)),
         )
     if overlap_partial:
+        if overlap_partial_successor_dependency:
+            partial_reason_code = "successor_dependency_ordering"
+            partial_policy_class = "C2a"
+            partial_reason = (
+                "candidate が current に対して successor dependency（明示依存）を"
+                "持つため、shared parent_refs があっても安全な直列化順序として扱う（C2a）"
+            )
+        else:
+            partial_reason_code = "allowed_paths_overlap"
+            partial_policy_class = "C1"
+            partial_reason = "既存 OPEN Issue と Allowed Paths が部分的に重複（C1 benign overlap）"
         return OverlapResult(
             verdict=OVERLAP_REQUIRES_COMMENT,
-            reason_code="allowed_paths_overlap",
-            policy_class="C1",
-            reason="既存 OPEN Issue と Allowed Paths が部分的に重複（C1 benign overlap）",
+            reason_code=partial_reason_code,
+            policy_class=partial_policy_class,
+            reason=partial_reason,
             source_status=source_status,
             target=current,
             candidates=tuple(overlap_partial),
-            comment_template=_build_comment_template(overlap_partial, "C1"),
+            comment_template=_build_comment_template(overlap_partial, partial_policy_class),
             excluded_false_positives=tuple(sorted(excluded)),
         )
     if title_goal_disjoint:

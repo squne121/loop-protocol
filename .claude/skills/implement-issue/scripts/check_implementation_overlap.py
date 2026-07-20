@@ -103,6 +103,19 @@ SCHEMA = "IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1"
 
 DEFAULT_CANDIDATE_LIMIT = 100
 
+# GraphQL cursor pagination（#1493）: 1 ページあたりの取得件数（固定）。
+# `--limit`（safety cap）はページサイズではなく、全ページを通した取得総数の
+# 上限として扱う。safety cap 自体は既定 100 だが、`--limit` を明示的に
+# 大きく指定した呼び出し（`implement-issue/SKILL.md` の初回 preflight 等）
+# では、pageInfo.hasNextPage が false になるまで複数ページを収集できる。
+GRAPHQL_PAGE_SIZE = 100
+
+# 呼び出し元が --limit に極端に大きい値を指定した場合でも無限ループしない
+# ための独立した safety cap（#1493 Major 1 のレビュー指摘、page 数ベース）。
+MAX_SAFETY_PAGES = 1000
+
+COLLECTION_MODE_EXHAUSTIVE_CURSOR_PAGINATION = "exhaustive_cursor_pagination"
+
 # ------------------------------------------------------------
 # route enum（closed set, AC7 の正本）
 # ------------------------------------------------------------
@@ -145,6 +158,32 @@ _PARENT_ISSUE_RE = re.compile(r"^parent_issue:\s*\"?#?(\d+)\"?", re.MULTILINE)
 
 _DEPENDENCY_CONTRACT_KEYS = ("blocked_by", "depends_on", "supersedes")
 _ALLOWED_PATHS_HEADING_RE = re.compile(r"^##\s+Allowed Paths\s*$", re.MULTILINE)
+
+# #1613: human judgment is an additional, fail-closed input.  The checker does
+# not infer C1 from prose; it accepts only this fixed, self-identifying schema
+# and binds every claimed value to GitHub readback.
+HUMAN_C1_DECISION_SCHEMA = "HUMAN_C1_DECISION_V1"
+_HUMAN_C1_DECISION_FIELDS = frozenset(
+    {
+        "candidate_issue_number",
+        "decision",
+        "current_body_sha256",
+        "candidate_body_sha256",
+    }
+)
+_HUMAN_C1_DECISION_BLOCK_RE = re.compile(
+    rf"```yaml[ \t]*\n{HUMAN_C1_DECISION_SCHEMA}:[ \t]*\n(?P<fields>.*?)```",
+    re.DOTALL,
+)
+_HUMAN_C1_DECISION_FIELD_RE = re.compile(r"^  ([a-z][a-z0-9_]*):\s*(\S(?:.*\S)?)\s*$")
+# An earlier rejected decision is supersedable only when it is the explicitly
+# supported stale-body retry.  Parser errors, different decisions, candidate
+# drift, and any future rejection reason stay routing inputs by default.
+_SUPERSEDABLE_HUMAN_C1_REJECTION_REASONS = frozenset({"current_body_sha256_mismatch"})
+_HUMAN_C1_COMMENT_URL_RE = re.compile(
+    r"^https://github\.com/(?P<owner>[^/#]+)/(?P<repo>[^/#]+)/issues/(?P<number>[1-9][0-9]*)"
+    r"#issuecomment-[1-9][0-9]*$"
+)
 
 
 class OverlapRuntimeError(RuntimeError):
@@ -634,33 +673,204 @@ def fetch_current_issue(repo: str, issue_number: int) -> Dict[str, Any]:
     return data
 
 
-def fetch_implementation_candidates(repo: str, limit: int) -> Tuple[List[Dict[str, Any]], bool]:
-    """OPEN かつ ``phase/implementation`` ラベルを持つ Issue を列挙する。
+_ISSUES_PAGE_GRAPHQL_QUERY = """
+query($owner: String!, $name: String!, $pageSize: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issues(
+      states: OPEN
+      labels: ["phase/implementation"]
+      first: $pageSize
+      after: $cursor
+      orderBy: {field: CREATED_AT, direction: ASC}
+    ) {
+      nodes {
+        number
+        title
+        body
+        updatedAt
+        url
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+}
+"""
 
-    ``limit`` は stored/fresh evidence の収集境界であり、上限到達は
-    fail-closed に扱う。全ページ取得と collection metadata の producer /
-    consumer 契約は #1493 の責務であり、本 Issue では変更しない。
+
+def _fetch_implementation_candidates_page(
+    owner: str, name: str, page_size: int, cursor: Optional[str]
+) -> Dict[str, Any]:
+    """GraphQL で ``phase/implementation`` OPEN Issue を 1 ページ分取得する
+    （#1493）。``cursor`` が None の場合は先頭ページを取得する。
+
+    PR #1626 review fix_delta: トップレベル GraphQL ``errors`` が非空の場合は
+    不正・部分的な応答として fail-closed にする（``errors`` があっても
+    ``data`` に partial な結果が入りうるため、黙って使わない）。
     """
-    data = _run_gh_json(
-        [
-            "gh",
-            "issue",
-            "list",
-            "--repo",
-            repo,
-            "--label",
-            "phase/implementation",
-            "--state",
-            "open",
-            "--json",
-            "number,title,body,labels,updatedAt,url",
-            "--limit",
-            str(limit),
-        ]
-    )
-    if not isinstance(data, list):
-        raise OverlapRuntimeError("gh issue list did not return a JSON array")
-    return data, len(data) >= limit
+    args = [
+        "gh",
+        "api",
+        "graphql",
+        "-f",
+        f"query={_ISSUES_PAGE_GRAPHQL_QUERY}",
+        "-F",
+        f"owner={owner}",
+        "-F",
+        f"name={name}",
+        "-F",
+        f"pageSize={page_size}",
+    ]
+    if cursor:
+        args.extend(["-F", f"cursor={cursor}"])
+    data = _run_gh_json(args)
+    if not isinstance(data, dict):
+        raise OverlapRuntimeError("gh api graphql did not return a JSON object")
+    top_errors = data.get("errors")
+    if isinstance(top_errors, list) and top_errors:
+        raise OverlapRuntimeError(f"GraphQL response contained top-level errors: {top_errors!r}")
+    top_data = data.get("data")
+    repository = top_data.get("repository") if isinstance(top_data, dict) else None
+    if not isinstance(repository, dict):
+        raise OverlapRuntimeError(f"GraphQL response missing repository field: {data!r}")
+    issues = repository.get("issues")
+    if not isinstance(issues, dict):
+        raise OverlapRuntimeError(f"GraphQL response missing issues field: {data!r}")
+    return issues
+
+
+_REQUIRED_GRAPHQL_NODE_KEYS = ("number", "title", "body", "updatedAt", "url")
+
+
+def _validate_graphql_node(node: Any, *, page_count: int) -> Dict[str, Any]:
+    """1 GraphQL issue node を最小 schema validate する（PR #1626 review
+    fix_delta）。object でない、または必須 key を欠く node は黙って通さず
+    fail-closed にする。
+    """
+    if not isinstance(node, dict):
+        raise OverlapRuntimeError(f"malformed GraphQL issue node (page={page_count}): {node!r}")
+    missing = [key for key in _REQUIRED_GRAPHQL_NODE_KEYS if key not in node]
+    if missing:
+        raise OverlapRuntimeError(
+            f"GraphQL issue node missing required key(s) {missing!r} (page={page_count}): {node!r}"
+        )
+    return node
+
+
+def fetch_implementation_candidates(repo: str, limit: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """OPEN かつ ``phase/implementation`` ラベルを持つ Issue を、GraphQL cursor
+    pagination で全件収集する（#1493、AC1/AC2、PR #1626 review fix_delta）。
+
+    固定件数への到達ではなく ``pageInfo.hasNextPage`` によって全件性を
+    証明する。``limit`` は収集総数の safety cap（後方互換のため CLI 既定値は
+    100 のまま）であり、途中ページの取得失敗・cursor/pageInfo 不整合は
+    ``OverlapRuntimeError`` で fail-closed にする（AC2）。safety cap 到達時は
+    例外を投げず、``complete: False`` / ``saturated: True`` を返す（AC2、
+    呼び出し側の route 判定へ委譲する）。
+
+    PR #1626 review fix_delta（P1 Blocker）: 各ページのリクエストサイズを
+    ``remaining = limit - len(candidates)`` に基づき
+    ``page_size = min(GRAPHQL_PAGE_SIZE, remaining)`` へ制限し、``--limit``
+    を超過したまま ``complete=True`` を返さないようにする。API が要求した
+    page_size より多い node を返した場合は runtime error として fail-closed
+    にする。``hasNextPage`` は厳密に bool 型のみ許容し、欠落・null・非 bool
+    は拒否する。``hasNextPage=true`` の場合は ``endCursor`` が非空文字列で
+    あることを要求し、直前の cursor と同一の場合も無限ループ防止のため
+    fail-closed にする。
+
+    Returns: ``(candidates, source_metadata)``。``source_metadata`` は
+    ``collection_mode`` / ``page_size`` / ``page_count`` / ``fetched_count`` /
+    ``has_next_page`` / ``complete`` / ``saturated`` を持つ。
+    """
+    owner, _, name = repo.partition("/")
+    if not owner or not name:
+        raise OverlapRuntimeError(f"invalid --repo value for GraphQL pagination: {repo!r}")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        raise OverlapRuntimeError(f"--limit must be a positive integer: {limit!r}")
+
+    candidates: List[Dict[str, Any]] = []
+    cursor: Optional[str] = None
+    page_count = 0
+    has_next_page = True
+    complete = False
+    saturated = False
+
+    while True:
+        page_count += 1
+        remaining = limit - len(candidates)
+        if remaining <= 0:
+            # 前ページまでで既に safety cap に到達している。
+            complete = False
+            saturated = True
+            break
+        page_size = min(GRAPHQL_PAGE_SIZE, remaining)
+        issues_page = _fetch_implementation_candidates_page(owner, name, page_size, cursor)
+        nodes = issues_page.get("nodes")
+        page_info = issues_page.get("pageInfo")
+        if not isinstance(nodes, list) or not isinstance(page_info, dict):
+            raise OverlapRuntimeError(f"malformed GraphQL issues page (page={page_count}): {issues_page!r}")
+        if len(nodes) > page_size:
+            # AC2: API が要求数より多く返した場合は全件性を証明できないため
+            # fail-closed にする（黙って切り詰めない）。
+            raise OverlapRuntimeError(
+                f"GraphQL returned more nodes ({len(nodes)}) than requested page_size ({page_size}) "
+                f"(page={page_count})"
+            )
+        validated_nodes = [_validate_graphql_node(node, page_count=page_count) for node in nodes]
+
+        raw_has_next_page = page_info.get("hasNextPage")
+        if not isinstance(raw_has_next_page, bool):
+            # AC2: hasNextPage 欠落/null/非 bool は安全に拒否する
+            # （厳密な bool 型のみ許容、bool のサブクラスは Python に無いため
+            # isinstance で十分厳密）。
+            raise OverlapRuntimeError(
+                f"GraphQL pageInfo.hasNextPage must be a strict boolean (page={page_count}): {page_info!r}"
+            )
+        has_next_page = raw_has_next_page
+
+        raw_cursor = page_info.get("endCursor")
+        if has_next_page:
+            if not isinstance(raw_cursor, str) or not raw_cursor:
+                # AC2: cursor/pageInfo 不整合は全件性を証明できないため fail-closed。
+                raise OverlapRuntimeError(
+                    f"GraphQL pageInfo inconsistency: hasNextPage=true but endCursor missing/empty "
+                    f"(page={page_count})"
+                )
+            if raw_cursor == cursor:
+                raise OverlapRuntimeError(
+                    f"GraphQL pageInfo returned unchanged endCursor while hasNextPage=true "
+                    f"(page={page_count}); would loop indefinitely"
+                )
+            cursor = raw_cursor
+
+        candidates.extend(validated_nodes)
+
+        if not has_next_page:
+            complete = True
+            saturated = False
+            break
+        if len(candidates) >= limit:
+            # AC2: safety cap 到達。全件性を証明できないため complete にしない。
+            complete = False
+            saturated = True
+            break
+        if page_count >= MAX_SAFETY_PAGES:
+            complete = False
+            saturated = True
+            break
+
+    source_metadata = {
+        "collection_mode": COLLECTION_MODE_EXHAUSTIVE_CURSOR_PAGINATION,
+        "page_size": GRAPHQL_PAGE_SIZE,
+        "page_count": page_count,
+        "fetched_count": len(candidates),
+        "has_next_page": has_next_page,
+        "complete": complete,
+        "saturated": saturated,
+    }
+    return candidates, source_metadata
 
 
 def fetch_predecessor_issue(repo: str, number: int) -> Optional[Dict[str, Any]]:
@@ -805,6 +1015,58 @@ def fetch_all_native_dependencies(repo: str, issue_number: int) -> Dict[str, Tup
     }
 
 
+def fetch_issue_comments(repo: str, issue_number: int) -> List[Dict[str, Any]]:
+    """Read every Issue comment through the REST API for human-C1 validation.
+
+    `gh issue view --json comments` is a convenient display projection but does
+    not give this security-sensitive input a pagination-completeness contract.
+    Read REST pages explicitly, retain only fields consumed by the validator,
+    and fail closed if a page is not an array.
+    """
+    comments: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        data = _run_gh_json(
+            [
+                "gh",
+                "api",
+                f"repos/{repo}/issues/{issue_number}/comments",
+                "-X",
+                "GET",
+                "-H",
+                _GITHUB_API_ACCEPT_HEADER,
+                "-H",
+                f"X-GitHub-Api-Version: {_GITHUB_API_VERSION}",
+                "-f",
+                f"per_page={_NATIVE_DEPENDENCY_PAGE_SIZE}",
+                "-f",
+                f"page={page}",
+            ]
+        )
+        if not isinstance(data, list):
+            raise OverlapRuntimeError(f"issue comments endpoint returned non-array: page={page}")
+        for item in data:
+            if not isinstance(item, dict):
+                raise OverlapRuntimeError("issue comments endpoint contains non-object record")
+            user = item.get("user")
+            comments.append(
+                {
+                    "body": item.get("body"),
+                    "comment_id": item.get("id"),
+                    "comment_url": item.get("html_url"),
+                    "author_login": user.get("login") if isinstance(user, dict) else None,
+                    "author_association": item.get("author_association"),
+                    "created_at": item.get("created_at"),
+                    "updated_at": item.get("updated_at"),
+                }
+            )
+        if len(data) < _NATIVE_DEPENDENCY_PAGE_SIZE:
+            return comments
+        page += 1
+        if page > _NATIVE_DEPENDENCY_MAX_PAGES:
+            raise OverlapRuntimeError("issue comments pagination exceeded safety cap")
+
+
 def _classifier_allowed_paths(entries: Sequence[str]) -> Tuple[str, ...]:
     """pure classifier に渡す path を one-level glob semantics へ写像する。
 
@@ -822,8 +1084,24 @@ def _classifier_allowed_paths(entries: Sequence[str]) -> Tuple[str, ...]:
     return tuple(out)
 
 
-def _issue_scope_from_raw(raw: Dict[str, Any], *, current_repo: Optional[str] = None) -> IssueScope:
+def _issue_scope_from_raw(
+    raw: Dict[str, Any],
+    *,
+    current_repo: Optional[str] = None,
+    extra_depends_on: Tuple[str, ...] = (),
+) -> IssueScope:
+    """raw candidate/current JSON から ``IssueScope`` を組み立てる。
+
+    ``extra_depends_on``（#1621 AC1）: current の既取得 native ``blocking``
+    から構築した successor index により、candidate 自身の raw データには
+    現れない ``depends_on`` 入力を追加注入するための slot。candidate 自身の
+    ``blocked_by`` 由来の値と衝突しないよう重複排除した上で末尾に追加する。
+    """
     body = str(raw.get("body") or "")
+    depends_on = _merge_dependency_refs(body, raw, "blocked_by", current_repo=current_repo)
+    if extra_depends_on:
+        seen = set(depends_on)
+        depends_on = depends_on + tuple(ref for ref in extra_depends_on if ref not in seen)
     return IssueScope(
         title=str(raw.get("title", "")),
         number=raw.get("number"),
@@ -833,7 +1111,7 @@ def _issue_scope_from_raw(raw: Dict[str, Any], *, current_repo: Optional[str] = 
         labels=tuple(
             (lbl.get("name", "") if isinstance(lbl, dict) else str(lbl)) for lbl in (raw.get("labels", []) or [])
         ),
-        depends_on=_merge_dependency_refs(body, raw, "blocked_by", current_repo=current_repo),
+        depends_on=depends_on,
         parent_refs=_extract_parent_ref(body),
         # B1 fix (Blocker 2): state は raw の実際の値を使う。offline fixture は
         # "state" を明示できる（既定 "OPEN" は後方互換）。online 経路は
@@ -884,6 +1162,376 @@ def _validate_candidate_schema(raw: Dict[str, Any]) -> List[str]:
         except Exception:  # pragma: no cover - defensive fail-closed
             errors.append("malformed_dependency_contract")
     return errors
+
+
+# ============================================================
+# human C1 decision comment（#1613: exact, candidate-scoped override input）
+# ============================================================
+
+
+def _unquote_comment_scalar(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _comment_author_association(raw: Dict[str, Any]) -> Optional[str]:
+    value = raw.get("authorAssociation", raw.get("author_association"))
+    return value.strip().upper() if isinstance(value, str) and value.strip() else None
+
+
+def _comment_metadata(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize REST-owned comment fields for every audit entry.
+
+    Decision payloads never self-assert these values.  Offline fixtures use
+    the same normalized shape, while the online producer populates it solely
+    from GitHub REST readback.
+    """
+    body = raw.get("body")
+    url = raw.get("comment_url", raw.get("url"))
+    comment_id = raw.get("comment_id", raw.get("id"))
+    author_login = raw.get("author_login")
+    if author_login is None and isinstance(raw.get("user"), dict):
+        author_login = raw["user"].get("login")
+    return {
+        "comment_id": comment_id if isinstance(comment_id, int) else None,
+        "comment_url": url if isinstance(url, str) else None,
+        "comment_body_sha256": f"sha256:{_sha256(body)}" if isinstance(body, str) else None,
+        "comment_updated_at": raw.get("updated_at") if isinstance(raw.get("updated_at"), str) else None,
+        "author_login": author_login if isinstance(author_login, str) else None,
+        "author_association": _comment_author_association(raw),
+    }
+
+
+def _parse_human_c1_comment(raw: Dict[str, Any]) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+    """Parse exactly one fixed schema block from an Issue comment.
+
+    A comment without the schema is unrelated.  A comment which claims the
+    schema but cannot be parsed is a fail-closed rejected decision rather than
+    an ignored comment.
+    """
+    body = raw.get("body")
+    if not isinstance(body, str) or HUMAN_C1_DECISION_SCHEMA not in body:
+        return None, None
+    blocks = list(_HUMAN_C1_DECISION_BLOCK_RE.finditer(body))
+    if len(blocks) != 1:
+        return None, "schema_block_missing_or_duplicate"
+    fields: Dict[str, str] = {}
+    for line in blocks[0].group("fields").splitlines():
+        if not line.strip():
+            continue
+        match = _HUMAN_C1_DECISION_FIELD_RE.fullmatch(line)
+        if not match:
+            return None, "schema_field_syntax_invalid"
+        key, value = match.groups()
+        if key in fields:
+            return None, "schema_field_duplicate"
+        fields[key] = _unquote_comment_scalar(value)
+    if set(fields) != _HUMAN_C1_DECISION_FIELDS:
+        return None, "schema_fields_missing_or_unknown"
+    return fields, None
+
+
+def _decision_rejection(
+    raw: Dict[str, Any], reason: str, parsed_candidate_issue_number: Optional[int] = None
+) -> Dict[str, Any]:
+    """Produce the complete, hash-bound rejection evidence required by AC5."""
+    if parsed_candidate_issue_number is None:
+        parsed_candidate_issue_number = _claimed_human_c1_candidate_number(raw)
+    rejection = {
+        **_comment_metadata(raw),
+        "parsed_candidate_issue_number": parsed_candidate_issue_number,
+        "reason": reason,
+    }
+    # This is internal ordering metadata only.  It is removed before evidence
+    # serialization, after a later exact decision has had the opportunity to
+    # supersede an earlier stale attempt for the same candidate.
+    comment_order = raw.get("_human_c1_comment_order")
+    if isinstance(comment_order, int):
+        rejection["_human_c1_comment_order"] = comment_order
+    return rejection
+
+
+def _claimed_human_c1_candidate_number(raw: Dict[str, Any]) -> Optional[int]:
+    """Recover a candidate only from one unambiguous fenced schema block.
+
+    This is deliberately narrower than normal schema parsing because it is
+    used to decide whether a *rejected* record can ever stop routing.  Text
+    outside the fenced block and duplicate/malformed candidate lines must not
+    bind a rejection to a candidate that a later decision could supersede.
+    """
+    body = raw.get("body")
+    if not isinstance(body, str):
+        return None
+    blocks = list(_HUMAN_C1_DECISION_BLOCK_RE.finditer(body))
+    if len(blocks) != 1:
+        return None
+    candidate_numbers: List[int] = []
+    for line in blocks[0].group("fields").splitlines():
+        match = _HUMAN_C1_DECISION_FIELD_RE.fullmatch(line)
+        if not match:
+            continue
+        key, value = match.groups()
+        if key != "candidate_issue_number":
+            continue
+        number = _unquote_comment_scalar(value)
+        if re.fullmatch(r"[1-9][0-9]*", number):
+            candidate_numbers.append(int(number))
+    return candidate_numbers[0] if len(candidate_numbers) == 1 else None
+
+
+def _trusted_schema_like_comment_fingerprint(comments: Any) -> Optional[Tuple[Tuple[Any, ...], ...]]:
+    """Return the complete trusted schema-like comment set for drift checks.
+
+    The C1 decision is a routing input.  Therefore additions, deletions, or
+    edits of *any* trusted schema-like record must be visible between the
+    initial classification and final readback, including rejected and
+    non-routing audit records.  An invalid comments container is represented
+    by ``None`` so it cannot compare equal to a normal empty collection.
+    """
+    if not isinstance(comments, list):
+        return None
+    records: List[Tuple[Any, ...]] = []
+    for raw in comments:
+        if not isinstance(raw, dict):
+            continue
+        body = raw.get("body")
+        if (
+            _comment_author_association(raw) not in {"OWNER", "COLLABORATOR"}
+            or not isinstance(body, str)
+            or HUMAN_C1_DECISION_SCHEMA not in body
+        ):
+            continue
+        metadata = _comment_metadata(raw)
+        records.append(
+            (
+                metadata["comment_id"],
+                metadata["comment_body_sha256"],
+                metadata["comment_updated_at"],
+                metadata["author_login"],
+                metadata["author_association"],
+            )
+        )
+    return tuple(sorted(records, key=lambda item: tuple("" if value is None else str(value) for value in item)))
+
+
+def _is_strictly_earlier_updated_at(rejection_updated_at: Any, accepted_updated_at: Any) -> bool:
+    """Return true only for two valid, timezone-aware, strictly ordered times."""
+    if not isinstance(rejection_updated_at, str) or not isinstance(accepted_updated_at, str):
+        return False
+    try:
+        rejected_at = datetime.fromisoformat(rejection_updated_at.replace("Z", "+00:00"))
+        accepted_at = datetime.fromisoformat(accepted_updated_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if rejected_at.tzinfo is None or accepted_at.tzinfo is None:
+        return False
+    return rejected_at < accepted_at
+
+
+def _validate_human_c1_decisions(
+    *,
+    comments: Any,
+    repository: str,
+    current_number: int,
+    current_body: str,
+    candidates_evidence: List[Dict[str, Any]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Validate owner/collaborator records and attach only exact C1 decisions.
+
+    This does not alter duplicate/C2/source/validation routes.  It merely marks
+    a currently ambiguous C1 candidate as a human-confirmed non-conflict after
+    all comment claims are bound to the exact current readback.
+    """
+    result: Dict[str, List[Dict[str, Any]]] = {
+        "accepted": [],
+        "rejected": [],
+        "ignored_untrusted": [],
+        "ignored_non_routing": [],
+    }
+    if comments is None:
+        return result
+    if not isinstance(comments, list):
+        result["rejected"].append(_decision_rejection({}, "comments_schema_invalid"))
+        return result
+    candidate_by_number = {
+        item.get("issue_number"): item
+        for item in candidates_evidence
+        if isinstance(item.get("issue_number"), int)
+    }
+    # A decision is an override input only for an already-established C1
+    # candidate.  Without that target, even a trusted malformed comment must
+    # not manufacture a human-review route; retain schema-like records only
+    # as non-routing audit evidence.
+    if not any(item.get("policy_class") == "C1" for item in candidates_evidence):
+        for raw in comments:
+            if isinstance(raw, dict) and isinstance(raw.get("body"), str) and HUMAN_C1_DECISION_SCHEMA in raw["body"]:
+                result["ignored_non_routing"].append(
+                    _decision_rejection(raw, "no_current_c1_candidate")
+                )
+        result["ignored_non_routing"].sort(
+            key=lambda item: ((item.get("comment_url") or ""), item["reason"])
+        )
+        return result
+    seen_candidates: set[int] = set()
+
+    for comment_order, original_raw in enumerate(comments):
+        raw = (
+            {**original_raw, "_human_c1_comment_order": comment_order}
+            if isinstance(original_raw, dict)
+            else original_raw
+        )
+        if not isinstance(raw, dict):
+            result["rejected"].append(_decision_rejection({}, "comment_record_invalid"))
+            continue
+        author_association = _comment_author_association(raw)
+        # Trust is established before parsing schema-like attacker content.
+        if author_association not in {"OWNER", "COLLABORATOR"}:
+            if isinstance(raw.get("body"), str) and HUMAN_C1_DECISION_SCHEMA in raw["body"]:
+                result["ignored_untrusted"].append(
+                    _decision_rejection(raw, "untrusted_author_association")
+                )
+            continue
+        fields, parse_error = _parse_human_c1_comment(raw)
+        if fields is None:
+            if parse_error:
+                result["rejected"].append(_decision_rejection(raw, parse_error))
+            continue
+        if fields["decision"] != "C1/non-conflict":
+            result["rejected"].append(_decision_rejection(raw, "decision_not_c1_non_conflict"))
+            continue
+        try:
+            candidate_number = int(fields["candidate_issue_number"])
+        except ValueError:
+            result["rejected"].append(_decision_rejection(raw, "candidate_number_invalid"))
+            continue
+        candidate = candidate_by_number.get(candidate_number)
+        if candidate is None or candidate.get("policy_class") != "C1":
+            result["rejected"].append(_decision_rejection(raw, "candidate_not_current_c1_overlap"))
+            continue
+        if candidate_number in seen_candidates:
+            result["rejected"].append(_decision_rejection(raw, "candidate_decision_duplicate"))
+            continue
+        if fields["current_body_sha256"] != f"sha256:{_sha256(current_body)}":
+            result["rejected"].append(_decision_rejection(raw, "current_body_sha256_mismatch"))
+            continue
+        if fields["candidate_body_sha256"] != candidate.get("body_sha256"):
+            result["rejected"].append(_decision_rejection(raw, "candidate_body_sha256_mismatch"))
+            continue
+
+        verified = {
+            **fields,
+            **_comment_metadata(raw),
+            "verified": True,
+            "_human_c1_comment_order": comment_order,
+        }
+        candidate["human_c1_decision"] = verified
+        result["accepted"].append(verified)
+        seen_candidates.add(candidate_number)
+
+    # A current exact decision supersedes only an earlier, explicitly stale
+    # body-hash mismatch for the same C1 candidate.  Ordering is bound to
+    # REST ``updated_at`` rather than comment ID/order: an old comment edited
+    # after approval must remain a routing rejection.
+    accepted_by_candidate = {
+        int(item["candidate_issue_number"]): item for item in result["accepted"]
+    }
+    routing_rejections: List[Dict[str, Any]] = []
+    for rejection in result["rejected"]:
+        candidate_number = rejection.get("parsed_candidate_issue_number")
+        rejection_order = rejection.get("_human_c1_comment_order")
+        accepted = accepted_by_candidate.get(candidate_number)
+        accepted_order = accepted.get("_human_c1_comment_order") if accepted else None
+        if (
+            rejection.get("reason") in _SUPERSEDABLE_HUMAN_C1_REJECTION_REASONS
+            and isinstance(rejection_order, int)
+            and isinstance(accepted_order, int)
+            and rejection_order < accepted_order
+            and _is_strictly_earlier_updated_at(
+                rejection.get("comment_updated_at"), accepted.get("comment_updated_at")
+            )
+        ):
+            result["ignored_non_routing"].append(rejection)
+        else:
+            routing_rejections.append(rejection)
+    result["rejected"] = routing_rejections
+
+    for records in result.values():
+        for record in records:
+            record.pop("_human_c1_comment_order", None)
+
+    result["accepted"].sort(key=lambda item: (int(item["candidate_issue_number"]), item["comment_url"] or ""))
+    result["rejected"].sort(key=lambda item: ((item.get("comment_url") or ""), item["reason"]))
+    result["ignored_untrusted"].sort(key=lambda item: ((item.get("comment_url") or ""), item["reason"]))
+    return result
+
+
+def _apply_final_readback_drift(
+    *,
+    decisions: Dict[str, List[Dict[str, Any]]],
+    initial_comments: Any,
+    final_current: Dict[str, Any],
+    final_candidates: Dict[int, Dict[str, Any]],
+    final_comments: List[Dict[str, Any]],
+) -> bool:
+    """Compare accepted records with a final REST readback.
+
+    This is a bounded freshness check, not an atomic guarantee.  Any missing
+    final object or change to the four contract inputs forces human review.
+    """
+    comments_by_id = {
+        raw.get("comment_id", raw.get("id")): raw
+        for raw in final_comments
+        if isinstance(raw, dict) and isinstance(raw.get("comment_id", raw.get("id")), int)
+    }
+    drifted = False
+    if _trusted_schema_like_comment_fingerprint(initial_comments) != _trusted_schema_like_comment_fingerprint(
+        final_comments
+    ):
+        # Do not try to infer whether the changed record is still harmless:
+        # the initial routing decision was made from a different trusted
+        # schema-like input set.  The caller must re-run the whole preflight.
+        decisions["rejected"].append(
+            _decision_rejection({}, "final_readback_trusted_comment_set_drift")
+        )
+        drifted = True
+    for accepted in decisions["accepted"]:
+        candidate_number = int(accepted["candidate_issue_number"])
+        candidate = final_candidates.get(candidate_number)
+        comment = comments_by_id.get(accepted.get("comment_id"))
+        final_meta = _comment_metadata(comment) if isinstance(comment, dict) else _comment_metadata({})
+        final_current_hash = (
+            f"sha256:{_sha256(final_current.get('body'))}"
+            if isinstance(final_current.get("body"), str)
+            else None
+        )
+        final_candidate_hash = (
+            f"sha256:{_sha256(candidate.get('body'))}"
+            if isinstance(candidate, dict) and isinstance(candidate.get("body"), str)
+            else None
+        )
+        unchanged = (
+            final_current_hash == accepted.get("current_body_sha256")
+            and final_candidate_hash == accepted.get("candidate_body_sha256")
+            and final_meta["comment_body_sha256"] == accepted.get("comment_body_sha256")
+            and final_meta["comment_updated_at"] == accepted.get("comment_updated_at")
+            and final_meta["author_login"] == accepted.get("author_login")
+        )
+        if unchanged:
+            accepted["final_readback_verified"] = True
+            continue
+        drifted = True
+        accepted["final_readback_verified"] = False
+        decisions["rejected"].append(
+            {
+                **_comment_metadata(comment if isinstance(comment, dict) else accepted),
+                "parsed_candidate_issue_number": candidate_number,
+                "reason": "final_readback_fingerprint_drift",
+            }
+        )
+    decisions["rejected"].sort(key=lambda item: ((item.get("comment_url") or ""), item["reason"]))
+    return drifted
 
 
 # ============================================================
@@ -977,6 +1625,138 @@ def _readback_candidate(
 # ============================================================
 
 
+# #1621 AC1/AC7: current の既取得 native `blocking`（current が後続 Issue を
+# 止めている側。従来は evidence の `native_blocking` に保存されるだけの dead
+# data だったが、本 Issue で evidence（`native_blocking`）と successor index
+# の双方に使う）から `(repository, issue_number)` タプルの successor index を
+# 構築する。PR #1637 レビュー修正（AC7 Conditional）: repository でフィルタ
+# した後に number だけの frozenset へ潰すと、呼び出し側が repository
+# binding を再確認しないまま injection してしまう型上のリスクがあるため、
+# 契約どおり tuple のまま返す。cross-repository の typed record は index に
+# 含めない。candidate 側への追加 API 呼び出しは発生しない（current の raw
+# データのみを参照する、AC1）。
+def _current_native_successor_index(current_raw: Dict[str, Any], current_repo: str) -> frozenset:
+    blocking = current_raw.get("blocking")
+    if not isinstance(blocking, list):
+        return frozenset()
+    index: set = set()
+    for item in blocking:
+        if not isinstance(item, dict):
+            continue
+        number = item.get("number")
+        repository = item.get("repository")
+        if type(number) is not int or number <= 0:
+            continue
+        if not isinstance(repository, str) or not repository.strip():
+            continue
+        canonical = _canonicalize_repo_static(repository)
+        if canonical != current_repo:
+            continue
+        index.add((canonical, number))
+    return frozenset(index)
+
+
+def _successor_dependency_provenance(
+    *,
+    current_number: int,
+    current_repo: str,
+    cand_number: int,
+    cand_raw: Dict[str, Any],
+    current_native_successor_index: frozenset,
+) -> List[Dict[str, Any]]:
+    """successor 関係を証明した入力の出所を列挙する（PR #1637 レビュー P2 Major）。
+
+    「current の native blocking から注入された successor」と「candidate 自身の
+    blockedBy / Machine-Readable Contract / legacy `Depends on #N` から得た
+    successor」を監査時に区別できるようにする。複数の入力が同時に成立する
+    場合はすべて列挙する（単一の "唯一の根拠" を偽装しない）。
+    """
+    provenance: List[Dict[str, Any]] = []
+    if (current_repo, cand_number) in current_native_successor_index:
+        provenance.append(
+            {"source": "current_native_blocking", "repository": current_repo, "issue_number": current_number}
+        )
+    cand_body = str(cand_raw.get("body") or "")
+    contract = _parse_contract_dependency_lists(cand_body)
+    contract_blocked_by_digits = {_ref_digits(ref) for ref in contract.get("blocked_by", ())}
+    if str(current_number) in contract_blocked_by_digits:
+        provenance.append(
+            {"source": "candidate_contract_blocked_by", "repository": current_repo, "issue_number": current_number}
+        )
+    if str(current_number) in _extract_depends_on(cand_body):
+        provenance.append(
+            {
+                "source": "candidate_legacy_depends_on_text",
+                "repository": current_repo,
+                "issue_number": current_number,
+            }
+        )
+    cand_native_blocked_by = cand_raw.get("blockedBy")
+    if isinstance(cand_native_blocked_by, list):
+        for item in cand_native_blocked_by:
+            if not isinstance(item, dict):
+                continue
+            number = item.get("number")
+            repo_field = item.get("repository")
+            if (
+                type(number) is int
+                and number == current_number
+                and isinstance(repo_field, str)
+                and _canonicalize_repo_static(repo_field) == current_repo
+            ):
+                provenance.append(
+                    {
+                        "source": "candidate_native_blocked_by",
+                        "repository": current_repo,
+                        "issue_number": current_number,
+                    }
+                )
+                break
+    return provenance
+
+
+def _predecessor_dependency_provenance(
+    *,
+    current_number: int,
+    current_repo: str,
+    cand_number: int,
+    current_raw: Dict[str, Any],
+    current_body: str,
+) -> List[Dict[str, Any]]:
+    """closed predecessor（C2a, `origin == "dependency_c2a"`）の predecessor
+    関係を証明した入力の出所を列挙する（PR #1637 レビュー P2 Major）。
+    """
+    provenance: List[Dict[str, Any]] = []
+    contract = _parse_contract_dependency_lists(current_body)
+    contract_blocked_by_digits = {_ref_digits(ref) for ref in contract.get("blocked_by", ())}
+    if str(cand_number) in contract_blocked_by_digits:
+        provenance.append(
+            {"source": "current_contract_blocked_by", "repository": current_repo, "issue_number": cand_number}
+        )
+    if str(cand_number) in _extract_depends_on(current_body):
+        provenance.append(
+            {"source": "current_legacy_depends_on_text", "repository": current_repo, "issue_number": cand_number}
+        )
+    native_blocked_by = current_raw.get("blockedBy")
+    if isinstance(native_blocked_by, list):
+        for item in native_blocked_by:
+            if not isinstance(item, dict):
+                continue
+            number = item.get("number")
+            repo_field = item.get("repository")
+            if (
+                type(number) is int
+                and number == cand_number
+                and isinstance(repo_field, str)
+                and _canonicalize_repo_static(repo_field) == current_repo
+            ):
+                provenance.append(
+                    {"source": "current_native_blocked_by", "repository": current_repo, "issue_number": cand_number}
+                )
+                break
+    return provenance
+
+
 def _resolve_dependency(
     current_number: int,
     current_paths: Sequence[str],
@@ -1042,7 +1822,9 @@ def build_evidence(
     ignored_candidates: List[Dict[str, Any]],
     dependency_resolution: Dict[str, Any],
     validation_errors: Dict[int, List[str]],
+    human_c1_decisions: Dict[str, List[Dict[str, Any]]],
     route: str,
+    source_collection_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     # 候補は issue_number で canonical sort（順序非依存性、Major 4）
     ordered = sorted(
@@ -1050,6 +1832,27 @@ def build_evidence(
         key=lambda c: (c["issue_number"] is None, c["issue_number"] or 0),
     )
     ordered_ignored = sorted(ignored_candidates, key=lambda c: c["issue_number"])
+
+    # #1493 AC1: collection contract（additive）。オンライン経路は
+    # GraphQL cursor pagination の実測値、offline/dry-run 経路は legacy
+    # 単発取得と等価な metadata を積む。decision_inputs_sha256 に含めることで
+    # stored/fresh 間の collection contract drift を open_pr.py 側の既存
+    # decision_inputs_sha256 照合が自動的に検出する。
+    collection_metadata = dict(source_collection_metadata or {})
+    source_common: Dict[str, Any] = {
+        "complete": source_complete,
+        "saturated": source_saturated,
+        "limit": source_limit,
+    }
+    for key in (
+        "collection_mode",
+        "page_size",
+        "page_count",
+        "fetched_count",
+        "has_next_page",
+    ):
+        if key in collection_metadata:
+            source_common[key] = collection_metadata[key]
 
     decision_payload: Dict[str, Any] = {
         "schema": SCHEMA,
@@ -1059,18 +1862,18 @@ def build_evidence(
             "body_sha256": f"sha256:{_sha256(current_body)}",
             "allowed_paths": sorted(current_paths),
         },
-        "source": {
-            "complete": source_complete,
-            "saturated": source_saturated,
-            "limit": source_limit,
-        },
+        "source": dict(source_common),
         "candidates": ordered,
         "ignored_candidates": ordered_ignored,
         "dependency_resolution": dependency_resolution,
         "validation_errors": {str(k): v for k, v in sorted(validation_errors.items())},
+        "human_c1_decisions": human_c1_decisions,
         "route": route,
     }
     decision_inputs_sha256 = f"sha256:{_sha256(_canonical_json(decision_payload))}"
+
+    body_source = dict(source_common)
+    body_source["collected_at"] = collected_at
 
     body: Dict[str, Any] = {
         "schema": SCHEMA,
@@ -1081,16 +1884,12 @@ def build_evidence(
             "body_sha256": f"sha256:{_sha256(current_body)}",
             "allowed_paths": list(current_paths),
         },
-        "source": {
-            "complete": source_complete,
-            "saturated": source_saturated,
-            "limit": source_limit,
-            "collected_at": collected_at,
-        },
+        "source": body_source,
         "candidates": ordered,
         "ignored_candidates": ordered_ignored,
         "dependency_resolution": dependency_resolution,
         "validation_errors": {str(k): v for k, v in sorted(validation_errors.items())},
+        "human_c1_decisions": human_c1_decisions,
         "route": route,
         "decision_inputs_sha256": decision_inputs_sha256,
     }
@@ -1153,6 +1952,7 @@ def _classify(
     candidate_bodies: Dict[str, str] = {}
     candidate_updated_at: Dict[str, Optional[str]] = {}
     candidate_contracts: Dict[str, Dict[str, str]] = {}
+    candidate_raw_by_number: Dict[str, Dict[str, Any]] = {}
     scope_pool: Dict[str, IssueScope] = {}
     candidate_scopes: List[IssueScope] = []
     for raw in candidates_raw:
@@ -1163,9 +1963,23 @@ def _classify(
             candidate_bodies[key] = body_text
             candidate_updated_at[key] = raw.get("updatedAt")
             candidate_contracts[key] = _contract_schema_keys(body_text)
+            candidate_raw_by_number[key] = raw
             scope_pool[key] = scope
+    # #1621 AC1/AC7: current の native blocking から構築した (repository,
+    # issue_number) successor index を参照し、最初の classify_overlap()
+    # 呼び出し前に同一 repository の candidate の depends_on へ current
+    # issue number を注入する。
+    current_native_successor_index = _current_native_successor_index(current_raw, repository)
     for raw in comparable_raw:
-        candidate_scopes.append(_issue_scope_from_raw(raw, current_repo=repository))
+        cand_number = raw.get("number")
+        extra_depends_on: Tuple[str, ...] = (
+            (str(args.issue_number),)
+            if isinstance(cand_number, int) and (repository, cand_number) in current_native_successor_index
+            else ()
+        )
+        candidate_scopes.append(
+            _issue_scope_from_raw(raw, current_repo=repository, extra_depends_on=extra_depends_on)
+        )
 
     current = IssueScope(
         title=str(current_raw.get("title", "")),
@@ -1178,11 +1992,16 @@ def _classify(
 
     # --- dependency 解決（Blocker 2） ---
     dep_res = _resolve_dependency(args.issue_number, current_paths, current.depends_on, scope_pool)
-    # Major 1（PR #1474 レビュー）: 取得済みの typed record（`{repository,
-    # number, state}`）を issue number へ潰す前に auditability 用として保持
-    # する。`native_blocking`（current が後続を止めている側）はこれまで取得
-    # されるが判定に一切使われず捨てられていた（dead data）ため、evidence に
-    # 残して可視化する（判定ロジックへの新規組み込みは Out of Scope）。
+    # Major 1（PR #1474 レビュー）/ #1621（PR #1637 レビュー P3 Minor 更新）:
+    # 取得済みの typed record（`{repository, number, state}`）を issue number
+    # へ潰す前に auditability 用として保持する。`native_blocking`（current が
+    # 後続を止めている側）は、evidence への可視化に加えて successor index
+    # （`_current_native_successor_index`）の入力としても使う（#1621 で
+    # dead data 状態を解消済み）。candidate scope への注入は
+    # `current_native_blocking` provenance を明示して行い（
+    # `_successor_dependency_provenance`）、candidate raw の `blockedBy` を
+    # 取得したかのように偽装しない（candidate の `blockedBy` フィールド自体
+    # は変更しない）。
     native_blocked_by_raw = current_raw.get("blockedBy")
     native_blocking_raw = current_raw.get("blocking")
     dependency_resolution = {
@@ -1226,6 +2045,15 @@ def _classify(
         c.issue_number: c.overlapping_paths for c in result.candidates if c.issue_number is not None
     }
 
+    # #1621 AC4/AC5: classify_overlap() が candidate 単位で返す
+    # CandidateEvidence.dependency_relation を、origin == "classify" の候補
+    # について policy_class/reasons の根拠として参照する。`result.candidates`
+    # は verdict に対応する precedence bucket のみを保持するため、
+    # readback_targets の "classify" origin と対応付ける。
+    classify_candidates_by_number: Dict[int, Any] = {
+        c.issue_number: c for c in verdict_candidates if c.issue_number is not None
+    }
+
     for num, origin in readback_targets.items():
         key = str(num)
         cand_body = candidate_bodies.get(key, "")
@@ -1243,14 +2071,58 @@ def _classify(
         elif rb["heading_overlap"]:
             any_collision = True
 
-        policy_class = (
-            "C2a"
-            if origin == "dependency_c2a"
-            else ("duplicate_candidate" if origin == "classify" and result.verdict == DUPLICATE else "C1")
-        )
+        classify_dependency_relation = "none"
+        if origin == "classify":
+            classify_candidate = classify_candidates_by_number.get(num)
+            if classify_candidate is not None:
+                classify_dependency_relation = classify_candidate.dependency_relation.relation
+
+        if origin == "dependency_c2a":
+            policy_class = "C2a"
+        elif origin == "classify" and result.verdict == DUPLICATE:
+            policy_class = "duplicate_candidate"
+        elif origin == "classify" and classify_dependency_relation == "successor":
+            # pure classifier が successor（candidate が current に依存して
+            # おり current を止めていない）と判定した candidate は、origin/
+            # 集約 verdict のみからの一律 C1 化をやめ、C2a として evidence
+            # 化する（PR #1615 の human C1 override が successor candidate
+            # を解除できないようにするための区別）。
+            policy_class = "C2a"
+        else:
+            policy_class = "C1"
         reasons: List[str] = []
         if origin == "dependency_c2a":
             reasons.append("closed_predecessor_via_blocked_by")
+        if origin == "classify" and classify_dependency_relation == "successor":
+            reasons.append("successor_dependency_ordering")
+
+        # #1621 P2 Major（PR #1637 レビュー）: candidate evidence に
+        # dependency_relation とその provenance（どの入力から証明したか）を
+        # 保存する。「current の native blocking から注入された successor」
+        # と「candidate 自身の blockedBy 等から得た successor」を監査時に
+        # 区別できるようにする。両方が同時に成り立つ場合は provenance に
+        # 複数エントリを列挙する。
+        dependency_relation = "none"
+        dependency_provenance: List[Dict[str, Any]] = []
+        if origin == "dependency_c2a":
+            dependency_relation = "predecessor"
+            dependency_provenance = _predecessor_dependency_provenance(
+                current_number=args.issue_number,
+                current_repo=repository,
+                cand_number=num,
+                current_raw=current_raw,
+                current_body=current_body,
+            )
+        elif origin == "classify" and classify_dependency_relation == "successor":
+            dependency_relation = "successor"
+            dependency_provenance = _successor_dependency_provenance(
+                current_number=args.issue_number,
+                current_repo=repository,
+                cand_number=num,
+                cand_raw=candidate_raw_by_number.get(key, {}),
+                current_native_successor_index=current_native_successor_index,
+            )
+
         if rb["readback_complete"]:
             if rb["heading_overlap"]:
                 reasons.append("structural_or_textual_collision_detected")
@@ -1282,11 +2154,36 @@ def _classify(
                 "policy_class": policy_class,
                 "reasons": reasons + list(rb.get("weak_signal_reasons") or []),
                 "non_conflict_reason": rb["non_conflict_reason"],
+                "dependency_relation": dependency_relation,
+                "dependency_provenance": dependency_provenance,
             }
         )
 
         if origin == "classify" and result.verdict == DUPLICATE and rb["readback_complete"] and rb["heading_overlap"]:
             duplicate_confirmed = True
+
+    # #1613: a human C1 decision is valid only after candidate collection and
+    # readback have established the exact candidate set.  It may clear the
+    # incomplete/collision flags of that one C1 candidate, but never changes
+    # the classifier verdict, dependencies, source completeness, or validation
+    # errors.
+    human_c1_decisions = _validate_human_c1_decisions(
+        comments=current_raw.get("comments"),
+        repository=repository,
+        current_number=args.issue_number,
+        current_body=current_body,
+        candidates_evidence=candidates_evidence,
+    )
+    if human_c1_decisions["accepted"]:
+        accepted_numbers = {int(item["candidate_issue_number"]) for item in human_c1_decisions["accepted"]}
+        any_incomplete = any(
+            not item["readback_complete"] and item["issue_number"] not in accepted_numbers
+            for item in candidates_evidence
+        )
+        any_collision = any(
+            item["heading_overlap"] and item["issue_number"] not in accepted_numbers
+            for item in candidates_evidence
+        )
 
     # --- route 決定 ---
     route: str
@@ -1302,6 +2199,7 @@ def _classify(
             "ignored_candidates": ignored_candidates,
             "dependency_resolution": dependency_resolution,
             "validation_errors": validation_errors,
+            "human_c1_decisions": {"accepted": [], "rejected": []},
         }
 
     if dep_res["blocking"] is not None:
@@ -1309,6 +2207,8 @@ def _classify(
     elif validation_errors:
         route = ROUTE_HUMAN_REVIEW_REQUIRED
     elif dep_res["unresolved_refs"]:
+        route = ROUTE_HUMAN_REVIEW_REQUIRED
+    elif human_c1_decisions["rejected"]:
         route = ROUTE_HUMAN_REVIEW_REQUIRED
     elif verdict == AMBIGUOUS_REQUIRES_HUMAN:
         route = ROUTE_HUMAN_REVIEW_REQUIRED
@@ -1345,6 +2245,7 @@ def _classify(
         "ignored_candidates": ignored_candidates,
         "dependency_resolution": dependency_resolution,
         "validation_errors": validation_errors,
+        "human_c1_decisions": human_c1_decisions,
     }
 
 
@@ -1364,6 +2265,19 @@ def _load_json_file(path: str) -> Any:
         raise OverlapRuntimeError(f"invalid JSON in file: {path}: {exc}") from exc
 
 
+def _positive_int(value: str) -> int:
+    """``--limit`` 用の argparse type: 0 以下・非整数を fail-closed で拒否する
+    （PR #1626 review fix_delta P2 Blocker）。
+    """
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"invalid positive int value: {value!r}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"--limit must be a positive integer (got {parsed})")
+    return parsed
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="check_implementation_overlap.py",
@@ -1373,7 +2287,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--issue-number", required=True, type=int, help="対象 Issue 番号（自己除外に使用）")
     p.add_argument("--repo", help="owner/name（オンライン取得時に必須）")
-    p.add_argument("--limit", type=int, default=DEFAULT_CANDIDATE_LIMIT, help="候補取得上限")
+    p.add_argument("--limit", type=_positive_int, default=DEFAULT_CANDIDATE_LIMIT, help="候補取得上限（正の整数）")
     p.add_argument(
         "--dry-run",
         action="store_true",
@@ -1403,13 +2317,23 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             current_raw = _load_json_file(args.current_file)
             candidates_raw = _load_json_file(args.candidates_file)
             saturated = len(candidates_raw) >= args.limit
+            # offline/dry-run 経路は単発取得のため、pagination metadata も
+            # legacy 相当の単一ページ値として additive に積む（#1493）。
+            source_collection_metadata: Dict[str, Any] = {
+                "collection_mode": "offline_fixture_single_batch",
+                "page_size": len(candidates_raw),
+                "page_count": 1,
+                "fetched_count": len(candidates_raw),
+                "has_next_page": saturated,
+            }
             repo = args.repo
         else:
             if not args.repo:
                 raise OverlapRuntimeError("--repo is required for online fetch")
             canonical_repo = _canonicalize_repo(args.repo, online=True)
             current_raw = fetch_current_issue(args.repo, args.issue_number)
-            candidates_raw, saturated = fetch_implementation_candidates(args.repo, args.limit)
+            candidates_raw, source_collection_metadata = fetch_implementation_candidates(args.repo, args.limit)
+            saturated = bool(source_collection_metadata["saturated"])
             repo = args.repo
 
             # --- Blocker 5: native issue dependency（blockedBy/blocking）を
@@ -1419,6 +2343,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             native_deps = fetch_all_native_dependencies(canonical_repo, args.issue_number)
             current_raw["blockedBy"] = [dict(rec) for rec in native_deps["blockedBy"]]
             current_raw["blocking"] = [dict(rec) for rec in native_deps["blocking"]]
+            current_raw["comments"] = fetch_issue_comments(canonical_repo, args.issue_number)
 
         if not isinstance(current_raw, dict) or "body" not in current_raw:
             raise OverlapRuntimeError("current issue JSON missing required 'body' field")
@@ -1468,9 +2393,22 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                 {c["issue_number"] for c in ctx["candidates_evidence"] if isinstance(c.get("issue_number"), int)}
             )
             if readback_numbers:
+                # #1621 P1 Blocker（PR #1637 レビュー）: current の native
+                # blocking から既に successor 関係が確定している candidate は、
+                # 本文/構造 evidence が GraphQL candidate pool に既に含まれて
+                # おり、successor であることの証明に candidate 側の
+                # blockedBy/blocking API 呼び出しを必要としない。この集合を
+                # hydration 対象から除外し、「candidate 単位の追加 API 呼び
+                # 出しゼロ」という Issue #1621 の中核契約を第二段階でも維持
+                # する（successor candidate が N 件でも追加 REST リクエスト
+                # を発生させない）。
+                current_native_successor_index = _current_native_successor_index(current_raw, canonical_repo)
+                hydration_targets = [
+                    num for num in readback_numbers if (canonical_repo, num) not in current_native_successor_index
+                ]
                 raw_by_number = {c.get("number"): c for c in candidates_raw if isinstance(c.get("number"), int)}
                 fetched_numbers: List[int] = []
-                for num in readback_numbers:
+                for num in hydration_targets:
                     target_raw = raw_by_number.get(num)
                     if target_raw is None:
                         continue
@@ -1489,6 +2427,28 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                     )
                     ctx["dependency_resolution"]["native_dependency_candidates_fetched"] = fetched_numbers
 
+        # #1613 review fix: auxiliary dependency reads may have taken time.
+        # Re-read every accepted decision input immediately before evidence
+        # generation.  This narrows the race window but deliberately does not
+        # claim atomicity after this final readback.
+        if not args.dry_run and repo and ctx["human_c1_decisions"]["accepted"]:
+            final_current = fetch_current_issue(repo, args.issue_number)
+            final_comments = fetch_issue_comments(canonical_repo, args.issue_number)
+            final_candidates: Dict[int, Dict[str, Any]] = {}
+            for accepted in ctx["human_c1_decisions"]["accepted"]:
+                number = int(accepted["candidate_issue_number"])
+                fetched = fetch_predecessor_issue(repo, number)
+                if isinstance(fetched, dict):
+                    final_candidates[number] = fetched
+            if _apply_final_readback_drift(
+                decisions=ctx["human_c1_decisions"],
+                initial_comments=current_raw.get("comments"),
+                final_current=final_current,
+                final_candidates=final_candidates,
+                final_comments=final_comments,
+            ):
+                route = ROUTE_HUMAN_REVIEW_REQUIRED
+
         if route not in ROUTES:
             route = ROUTE_RUNTIME_ERROR
 
@@ -1506,7 +2466,9 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             ignored_candidates=ctx["ignored_candidates"],
             dependency_resolution=ctx["dependency_resolution"],
             validation_errors=ctx["validation_errors"],
+            human_c1_decisions=ctx["human_c1_decisions"],
             route=route,
+            source_collection_metadata=source_collection_metadata,
         )
         print(json.dumps(evidence, ensure_ascii=False, indent=2))
         return EXIT_RUNTIME_ERROR if route == ROUTE_RUNTIME_ERROR else EXIT_OK

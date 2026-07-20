@@ -565,6 +565,147 @@ def looks_like_skill_runtime_executor_command(command: str) -> bool:
     return "skill_runtime_exec.py" in (command or "")
 
 
+# ─── scope_rollup.run exact executor (Issue #1547) ────────────────────────────────
+# Independent exact-match command class bound directly to
+# run_scope_rollup_preflight.py (NOT skill_runtime_exec.py, which is out of
+# this Issue's Allowed Paths and hard-coded to the issue-refinement-loop
+# preflight script). scope_rollup.run always executes at canonical root
+# BEFORE any issue worktree is created (impl-review-loop preparation runs it
+# pre-worktree), so it is unconditionally root-no-worktree eligible -- there
+# is no active-issue-worktree check for this command class.
+SCOPE_ROLLUP_RUN_COMMAND_ID = "scope_rollup.run"
+SCOPE_ROLLUP_RUN_EXECUTION_CLASS = "exact_scope_rollup_run"
+SCOPE_ROLLUP_RUN_REASON_CODE = "scope_rollup_run_executor_command"
+SCOPE_ROLLUP_RUN_SCRIPT_REL = "scripts/agent-guards/run_scope_rollup_preflight.py"
+
+SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"][SCOPE_ROLLUP_RUN_COMMAND_ID] = {
+    "execution_class": SCOPE_ROLLUP_RUN_EXECUTION_CLASS,
+    "required_cwd": "canonical_main_root",
+    "required_branch": "default_branch",
+    "allowed_write_roots": [],
+    "network_effect": "github_read_only",
+}
+
+ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS = ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS | frozenset(
+    {SCOPE_ROLLUP_RUN_COMMAND_ID}
+)
+_ROOT_NO_WORKTREE_POLICY_INVARIANTS[SCOPE_ROLLUP_RUN_COMMAND_ID] = {
+    "execution_class": SCOPE_ROLLUP_RUN_EXECUTION_CLASS,
+    "required_cwd": "canonical_main_root",
+    "required_branch": "default_branch",
+    "network_effect": "github_read_only",
+    "allowed_write_roots": [],
+}
+
+
+@dataclass(frozen=True)
+class ScopeRollupRunCommand:
+    command_id: str
+    issue_number: str
+    repo: str
+    invocation_id: str
+    requested_at: str
+    argv: tuple[str, ...]
+
+
+# Issue #1547 fix_delta (P0-1): the executor now requires the caller-generated
+# invocation_id / requested_at so the producer (run_scope_rollup_preflight.py)
+# and the consumer (parse_scope_rollup_run_result.py) agree on a single
+# invocation_id / requested_at value instead of each minting their own. The
+# exact-match classifier below validates the *shape* of these two tokens
+# (safe charset only -- no literal value pinning is possible since both are
+# generated per-invocation).
+_INVOCATION_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_REQUESTED_AT_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def parse_scope_rollup_run_command(
+    command: str, project_root: str | None = None
+) -> ScopeRollupRunCommand | None:
+    """Exact-match parser for `uv run python3
+    scripts/agent-guards/run_scope_rollup_preflight.py --issue-number <N>
+    --repo <owner/repo> --invocation-id <id> --requested-at <ISO8601>`
+    (12 tokens, no wrapper, no `--flag=value` form).
+    """
+    root = os.path.realpath(project_root or resolve_project_root())
+    if not command or _METACHAR_RE.search(command) or _LEADING_ENV_RE.match(command):
+        return None
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not tokens or len(tokens) != 12:
+        return None
+    if tokens[:3] != ["uv", "run", "python3"]:
+        return None
+    if tokens[3] != SCOPE_ROLLUP_RUN_SCRIPT_REL:
+        return None
+    if os.path.islink(os.path.join(root, SCOPE_ROLLUP_RUN_SCRIPT_REL)):
+        return None
+    expected_script = os.path.realpath(os.path.join(root, SCOPE_ROLLUP_RUN_SCRIPT_REL))
+    if os.path.realpath(os.path.join(root, tokens[3])) != expected_script:
+        return None
+    if tokens[4] != "--issue-number" or tokens[6] != "--repo":
+        return None
+    if tokens[8] != "--invocation-id" or tokens[10] != "--requested-at":
+        return None
+    if any(
+        tok.startswith("--issue-number=")
+        or tok.startswith("--repo=")
+        or tok.startswith("--invocation-id=")
+        or tok.startswith("--requested-at=")
+        for tok in tokens
+    ):
+        return None
+    issue_number = tokens[5]
+    repo = tokens[7]
+    invocation_id = tokens[9]
+    requested_at = tokens[11]
+    if not issue_number.isdigit() or int(issue_number) <= 0:
+        return None
+    if repo != TRUSTED_REPO_SLUG:
+        return None
+    if not _INVOCATION_ID_RE.match(invocation_id):
+        return None
+    if not _REQUESTED_AT_RE.match(requested_at):
+        return None
+    return ScopeRollupRunCommand(
+        command_id=SCOPE_ROLLUP_RUN_COMMAND_ID,
+        issue_number=issue_number,
+        repo=repo,
+        invocation_id=invocation_id,
+        requested_at=requested_at,
+        argv=tuple(tokens),
+    )
+
+
+def is_scope_rollup_run_command(
+    command: str, cwd: str, project_root: str, deadline: Deadline | None = None
+) -> bool:
+    """canonical root + default branch + trusted repo binding only. No
+    active-issue-worktree requirement -- scope_rollup.run always runs before
+    any issue worktree exists (Issue #1547 P0-1)."""
+    parsed = parse_scope_rollup_run_command(command, project_root)
+    if parsed is None:
+        return False
+    if os.path.realpath(cwd) != os.path.realpath(project_root):
+        return False
+    branch = current_branch(project_root, deadline)
+    default_branch = resolve_default_branch(project_root, deadline)
+    if not branch or branch != default_branch:
+        return False
+    repo_slug = resolve_repo_slug(project_root, deadline)
+    if repo_slug != parsed.repo:
+        return False
+    return True
+
+
+def looks_like_scope_rollup_run_command(command: str) -> bool:
+    return "run_scope_rollup_preflight.py" in (command or "")
+
+
 def load_registry_entry(command_id: str, project_root: str | None = None) -> dict[str, Any]:
     root = os.path.realpath(project_root or resolve_project_root())
     registry_path = os.path.realpath(os.path.join(root, REGISTRY_REL))

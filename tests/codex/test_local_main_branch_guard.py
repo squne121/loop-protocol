@@ -238,6 +238,77 @@ class TestAC8CodexParity:
         result = eval_codex("gh pr checkout 988", str(tmp_git_repo))
         assert result["status"] == "block"
 
+
+class TestIssue1543OwnerRequestChangesLauncherGrammarArityCodex:
+    """Issue #1543 OWNER REQUEST_CHANGES: Codex-wrapper-path parity for the
+    argv-aware, arity-correct launcher grammar classifier (see the Claude
+    counterpart in .claude/hooks/tests/test_local_main_branch_guard.py::
+    TestIssue1543OwnerRequestChangesLauncherGrammarArity for the full
+    Blocker 1-3 / High 4 rationale)."""
+
+    ISSUE_REFINEMENT_SCRIPT = ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py"
+    ISSUE_REFINEMENT_ARGS = "--issue-number 985 --repo squne121/loop-protocol"
+
+    def test_codex_uv_run_python_value_flag_still_blocks(self, tmp_git_repo: Path):
+        """Codex PreToolUse: `uv run --python 3.13 <script>` must not
+        misread '3.13' as the script operand."""
+        cmd = f"uv run --python 3.13 {self.ISSUE_REFINEMENT_SCRIPT} {self.ISSUE_REFINEMENT_ARGS}"
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_codex_uv_run_project_flag_value_not_misread_as_unrelated_script(self, tmp_git_repo: Path):
+        """Codex PreToolUse: `uv run --project <dir> <unrelated-script>`
+        must allow."""
+        cmd = f"uv run --project {tmp_git_repo} scripts/agent-ops/git_worktree_probe.py --json"
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "allow"
+
+    def test_codex_uv_global_directory_option_before_run_still_blocks(self, tmp_git_repo: Path):
+        """Codex PreToolUse: `uv --directory <dir> run <script>` (global
+        option form) must still block the real target."""
+        cmd = f"uv --directory {tmp_git_repo} run {self.ISSUE_REFINEMENT_SCRIPT} {self.ISSUE_REFINEMENT_ARGS}"
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_codex_python_dash_m_module_form_blocks(self, tmp_git_repo: Path):
+        """Codex PreToolUse: `python3 -m cProfile <script>` must still
+        block (delegated fail-closed classification)."""
+        cmd = f"python3 -m cProfile {self.ISSUE_REFINEMENT_SCRIPT} {self.ISSUE_REFINEMENT_ARGS}"
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_codex_exec_wrapper_prefix_still_blocks(self, tmp_git_repo: Path):
+        """Codex PreToolUse: `exec python3 <script>` must fail closed
+        (block), not silently allow through the unmodeled exec wrapper."""
+        cmd = f"exec python3 {self.ISSUE_REFINEMENT_SCRIPT} {self.ISSUE_REFINEMENT_ARGS}"
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_codex_usr_bin_env_python_wrapper_still_blocks(self, tmp_git_repo: Path):
+        """Codex PreToolUse: `/usr/bin/env python3 <script>` must fail
+        closed (block)."""
+        cmd = f"/usr/bin/env python3 {self.ISSUE_REFINEMENT_SCRIPT} {self.ISSUE_REFINEMENT_ARGS}"
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_codex_dollar_variable_expansion_in_operand_still_blocks(self, tmp_git_repo: Path):
+        """Codex PreToolUse: `python3 "$PWD/<script>"` must fail closed
+        (block); shell variable expansion is not evaluated by this guard."""
+        cmd = f'python3 "$PWD/{self.ISSUE_REFINEMENT_SCRIPT}"'
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_codex_glob_expansion_in_operand_still_blocks(self, tmp_git_repo: Path):
+        """Codex PreToolUse: `python3 .claude/skills/issue-refinement-*/
+        scripts/<script>` must fail closed (block); glob expansion is not
+        evaluated by this guard."""
+        cmd = (
+            "python3 .claude/skills/issue-refinement-*/scripts/run_refinement_preflight.py "
+            f"{self.ISSUE_REFINEMENT_ARGS}"
+        )
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+
     def test_permission_request_git_switch_issue_is_denied(self, tmp_git_repo: Path):
         """Codex PermissionRequest: git switch issue-* is denied (same logic)."""
         # PermissionRequest uses same evaluate() logic
@@ -1600,7 +1671,7 @@ from local_main_branch_guard import (  # noqa: E402
     is_cleanup_class_command,
 )
 
-_GUARD_PY = REPO_ROOT / ".claude" / "hooks" / "worktree_scope_guard.py"
+_GUARD_PY = REPO_ROOT / "scripts" / "agent-guards" / "worktree_scope_guard.py"
 
 
 def _load_cleanup_core():
@@ -1825,3 +1896,48 @@ class TestProbeScriptsDeterministicChecker:
 
         cmd = "uv run python3 scripts/agent-ops/git_worktree_probe.py"
         assert is_deterministic_checker_command(cmd)
+
+
+class TestIssue1543CodexClaudeParity:
+    """Issue #1543 AC6: Claude hook wrapper invocation and Codex event fixture
+    invocation must produce the same allow/block verdict for the same input
+    command (argv-aware issue_refinement_direct classifier)."""
+
+    @pytest.mark.parametrize(
+        ("cmd", "expected_status"),
+        [
+            (
+                "uv run python3 .claude/skills/pr-review-judge/scripts/allowed_paths_review_gate.py "
+                "--allowed-paths '[\"scripts/agent-guards/local_main_branch_guard.py\", "
+                "\".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py\"]'",
+                "allow",
+            ),
+            (
+                "uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py "
+                "--issue-number 985 --repo squne121/loop-protocol",
+                "block",
+            ),
+        ],
+    )
+    def test_codex_and_claude_agree_on_issue_refinement_classifier_verdict(
+        self, tmp_git_repo: Path, cmd: str, expected_status: str
+    ):
+        codex_result = eval_codex(cmd, str(tmp_git_repo))
+        assert codex_result["status"] == expected_status
+
+        claude_hook_script = REPO_ROOT / ".claude" / "hooks" / "local_main_branch_guard.sh"
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": cmd},
+            "cwd": str(tmp_git_repo),
+        }
+        claude_proc = subprocess.run(
+            [str(claude_hook_script)],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            cwd=str(tmp_git_repo),
+        )
+        claude_status = "block" if claude_proc.returncode == 2 else "allow"
+        assert claude_status == expected_status
+        assert claude_status == codex_result["status"]

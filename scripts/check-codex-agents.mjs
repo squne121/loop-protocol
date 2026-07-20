@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { execFileSync, execSync, spawnSync } from 'node:child_process';
@@ -19,8 +20,38 @@ const configPath = path.join(repoRoot, '.codex', 'config.toml');
 const hooksPath = path.join(repoRoot, '.codex', 'hooks.json');
 const rulesPath = path.join(repoRoot, '.codex', 'rules', 'default.rules');
 const ledgerPath = path.join(repoRoot, 'artifacts', 'codex', 'subagent-launch-ledger.json');
+// Issue #1611 (contract revision, P1-2): PROTECTED_PATHS_POLICY_V1 JSON SSOT.
+// `isProtectedPath()` below reads THIS file directly (not a hand-mirrored
+// hardcoded list), so this Node consumer can never silently drift from the
+// Python consumer (`scripts/agent-guards/protected_paths_policy.py`).
+const protectedPathsPolicyPath = path.join(repoRoot, 'scripts', 'agent-guards', 'protected_paths_policy.v1.json');
 const ledgerWriterSource = path.join(repoRoot, 'scripts', 'subagent-launch-ledger-writer.c');
-const ledgerWriterBinary = path.join(repoRoot, 'tmp', 'subagent-launch-ledger-writer');
+// Issue #1502: the compiled writer binary is built fresh, per invocation,
+// into a private `fs.mkdtempSync` directory *outside* the repo snapshot
+// (under the OS temp directory), never under a repo-tracked-or-untracked
+// path such as `tmp/`. This is deliberate: a per-invocation repo-local build
+// artifact (the pre-#1502 `tmp/subagent-launch-ledger-writer*` scheme) made
+// every cold/warm hook invocation look like a self-write outside the
+// executor's allowed_write_roots, which is exactly the anchor-bound
+// preflight false positive this Issue closes.
+// Repo-local `tmp/subagent-launch-ledger-writer*` must never be reintroduced
+// as a race-tolerant exception (Out of Scope / Stop Condition).
+//
+// Issue #1502 REQUEST_CHANGES (Blocker 1): a *shared*, content-addressed,
+// predictable-path warm cache (`<tmpdir>/loop-protocol-subagent-ledger-
+// writer-cache/<sha256>-ledger-writer`) was previously reused across
+// invocations after only checking "not a symlink, owner-executable" on the
+// cached file itself. Any co-uid process that could write into that shared
+// cache directory first could plant an executable there ahead of the real
+// compile (TOCTOU / cache poisoning), and `TMPDIR` was inherited unchanged
+// into the child environment, so `TMPDIR=<repo>/tmp` could silently move the
+// "outside the repo" cache back inside it. The shared warm cache is
+// abolished: every invocation validates that `os.tmpdir()` is genuinely
+// outside the repo, creates a brand-new unique directory via
+// `fs.mkdtempSync`, compiles a *private* copy of the exact `sourceBytes`
+// just read (never reopening `ledgerWriterSource` by pathname again), runs
+// that private binary, and deletes the whole private directory afterward.
+const ledgerWriterPrivateDirPrefix = 'loop-protocol-ledger-writer-';
 const sourceRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const fixtureRuntimeContractPath = path.join(repoRoot, 'tests', 'fixtures', 'codex-agent-config', 'expected-runtime-contract.json');
 const runtimeContractPath = fs.existsSync(fixtureRuntimeContractPath)
@@ -31,7 +62,6 @@ const runtimeContractPath = fs.existsSync(fixtureRuntimeContractPath)
 const CODEX_BIN = process.env.CODEX_BIN ?? 'codex';
 
 // Shadow log path (repo root, git-untracked)
-const shadowLogPath = path.join(repoRoot, '.guard_shadow_log.jsonl');
 
 const requiredAgentNames = [
   'codebase-investigator',
@@ -424,7 +454,7 @@ const expectedPreToolUseEntries = new Map([
         statusMessage: 'Checking local root branch policy',
       },
       {
-        command: 'python3 "$(git rev-parse --show-toplevel)/.claude/hooks/worktree_scope_guard.py"',
+        command: 'python3 "$(git rev-parse --show-toplevel)/scripts/agent-guards/worktree_scope_guard.py"',
         timeout: 20,
         statusMessage: 'Checking worktree cleanup scope policy (shared core)',
       },
@@ -453,6 +483,11 @@ const expectedPreToolUseEntries = new Map([
   [
     '^(apply_patch|Edit|Write)$',
     [
+      {
+        command: 'python3 "$(git rev-parse --show-toplevel)/scripts/agent-guards/codex_apply_patch_adapter.py"',
+        timeout: 20,
+        statusMessage: 'Checking worktree containment for apply_patch/Edit/Write (shared core)',
+      },
       {
         command: `${checkCodexAgentsBase} --hook-pretool`,
         timeout: 30,
@@ -866,31 +901,115 @@ function parseHookInput() {
   }
 }
 
+// Issue #1502 REQUEST_CHANGES (Blocker 1): tracks the single private
+// work directory created by the in-flight `ensureLedgerWriter()` call (if
+// any) so `writeLedgerEntry` can delete it once the child process has
+// exited, regardless of success or failure. There is at most one pending
+// work directory at a time -- `writeLedgerEntry` is not re-entrant.
+let _pendingLedgerWriterWorkDir = null;
+
+function _cleanupPendingLedgerWriterWorkDir() {
+  if (_pendingLedgerWriterWorkDir) {
+    fs.rmSync(_pendingLedgerWriterWorkDir, { recursive: true, force: true });
+    _pendingLedgerWriterWorkDir = null;
+  }
+}
+
+// Issue #1502 REQUEST_CHANGES (Blocker 1): validate that the OS temp root
+// the private build directory will be created under is safe to trust,
+// *before* creating anything there. Three independent checks:
+//   1. an inherited `TMPDIR` env var must be an absolute path (a relative
+//      value would resolve against an unpredictable/attacker-influenced
+//      cwd);
+//   2. `os.tmpdir()` (which honors `TMPDIR`), fully symlink-resolved via
+//      `fs.realpathSync`, must not be the repo root or any path under it --
+//      this also transitively rejects "symlink indirection into the repo"
+//      because `realpathSync` resolves every symlink hop to its final
+//      target;
+//   3. the resolved temp root's own mode must not be world/group-writable
+//      without the sticky bit (mirrors the standard `/tmp`-safety
+//      precondition used by `mktemp`-family tooling: a world/group-writable
+//      directory without the sticky bit lets any other same-machine process
+//      rename/replace another user's -- or another same-uid session's --
+//      entries out from under it, regardless of who currently owns the
+//      directory node itself).
+function _assertLedgerWriterTmpRootSafe() {
+  const tmpdirEnv = process.env.TMPDIR;
+  if (tmpdirEnv !== undefined && tmpdirEnv !== '' && !path.isAbsolute(tmpdirEnv)) {
+    throw new Error('ledger_writer_tmpdir_env_relative');
+  }
+  const rawTmpRoot = os.tmpdir();
+  if (!path.isAbsolute(rawTmpRoot)) {
+    throw new Error('ledger_writer_tmp_root_not_absolute');
+  }
+  const tmpRootReal = fs.realpathSync(rawTmpRoot);
+  const repoRootReal = fs.realpathSync(repoRoot);
+  if (tmpRootReal === repoRootReal || tmpRootReal.startsWith(repoRootReal + path.sep)) {
+    throw new Error('ledger_writer_tmp_root_inside_repo');
+  }
+  const tmpRootStat = fs.statSync(tmpRootReal);
+  const worldOrGroupWritable = (tmpRootStat.mode & 0o022) !== 0;
+  const stickyBit = (tmpRootStat.mode & 0o1000) !== 0;
+  if (worldOrGroupWritable && !stickyBit) {
+    throw new Error('ledger_writer_tmp_root_insecure_mode');
+  }
+  return tmpRootReal;
+}
+
 function ensureLedgerWriter() {
+  const tmpRootReal = _assertLedgerWriterTmpRootSafe();
+  // Read the exact source bytes once; the private source file compiled
+  // below is written from these bytes directly, never by re-opening
+  // `ledgerWriterSource` by pathname a second time (Issue #1502
+  // REQUEST_CHANGES Blocker 1: reopening the same pathname after hashing it
+  // would be a TOCTOU gap if the source file changed in between).
+  const sourceBytes = fs.readFileSync(ledgerWriterSource);
+  // Invocation-unique, unpredictable-path private directory -- never a
+  // shared, content-addressed, predictable cache location.
+  const workDir = fs.mkdtempSync(path.join(tmpRootReal, ledgerWriterPrivateDirPrefix));
+  _pendingLedgerWriterWorkDir = workDir;
   try {
-    fs.mkdirSync(path.dirname(ledgerWriterBinary), { recursive: true, mode: 0o700 });
-    const directory = fs.lstatSync(path.dirname(ledgerWriterBinary));
-    if (directory.isSymbolicLink() || !directory.isDirectory()) throw new Error('unsafe_build_directory');
-    const candidate = `${ledgerWriterBinary}.${process.pid}.${crypto.randomBytes(8).toString('hex')}`;
-    try {
-      execFileSync('cc', ['-std=c17', '-Wall', '-Wextra', '-Werror', '-O2', '-o', candidate, ledgerWriterSource], { stdio: 'pipe' });
-      fs.renameSync(candidate, ledgerWriterBinary);
-    } finally {
-      fs.rmSync(candidate, { force: true });
+    const workDirReal = fs.realpathSync(workDir);
+    if (workDirReal !== workDir) throw new Error('ledger_writer_workdir_symlink_component');
+    const workDirStat = fs.lstatSync(workDir);
+    if (workDirStat.isSymbolicLink() || !workDirStat.isDirectory()) throw new Error('ledger_writer_workdir_unsafe');
+    if (typeof process.getuid === 'function' && workDirStat.uid !== process.getuid()) {
+      throw new Error('ledger_writer_workdir_owner_mismatch');
     }
-    return ledgerWriterBinary;
-  } catch {
-    throw new Error('ledger_writer_build_failed');
+    if ((workDirStat.mode & 0o077) !== 0) throw new Error('ledger_writer_workdir_mode_unsafe');
+
+    const privateSourcePath = path.join(workDir, 'subagent-launch-ledger-writer.c');
+    fs.writeFileSync(privateSourcePath, sourceBytes, { mode: 0o600 });
+    const binaryPath = path.join(workDir, 'ledger-writer');
+    try {
+      execFileSync('cc', ['-std=c17', '-Wall', '-Wextra', '-Werror', '-O2', '-o', binaryPath, privateSourcePath], { stdio: 'pipe' });
+    } catch {
+      throw new Error('ledger_writer_build_failed');
+    }
+    const binaryStat = fs.lstatSync(binaryPath);
+    if (binaryStat.isSymbolicLink() || !binaryStat.isFile()) throw new Error('ledger_writer_binary_unsafe');
+    return binaryPath;
+  } catch (error) {
+    _cleanupPendingLedgerWriterWorkDir();
+    throw error;
   }
 }
 
 function writeLedgerEntry(kind, entry, identity) {
-  const result = spawnSync(ensureLedgerWriter(), [
-    '--repo', repoRoot,
-    '--kind', kind,
-    '--entry', JSON.stringify(entry),
-    '--identity', identity,
-  ], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' });
+  let result;
+  try {
+    result = spawnSync(ensureLedgerWriter(), [
+      '--repo', repoRoot,
+      '--kind', kind,
+      '--entry', JSON.stringify(entry),
+      '--identity', identity,
+    ], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' });
+  } finally {
+    // Issue #1502 REQUEST_CHANGES (Blocker 1): the private binary (and its
+    // private source copy) is deleted once the child process has exited,
+    // regardless of outcome -- it never persists as a reusable cache entry.
+    _cleanupPendingLedgerWriterWorkDir();
+  }
   if (result.error || result.status !== 0) {
     throw new Error(String(result.stderr || '').trim() || 'ledger_writer_failed');
   }
@@ -1058,50 +1177,42 @@ function denyForBash(command) {
 }
 
 // ---------------------------------------------------------------------------
-// Allowed Paths enforcement
-// CODEX_ALLOWED_PATHS_MODE controls the write-guard behavior:
-//   workspace — (default when not set) repo workspace edits are allowed; protected paths are
-//               always denied. CODEX_ALLOWED_PATHS, if set, narrows (intersects) rather than widens.
-//               CODEX_LEGACY_ALLOW_WRITES=1 maps to workspace mode (backward compat).
-//   strict    — CODEX_ALLOWED_PATHS must be declared; writes outside it are denied (fail-closed).
-//               If CODEX_ALLOWED_PATHS is not set in strict mode: deny all writes.
-//   shadow    — same allow logic as workspace but logs would-block events to
-//               .guard_shadow_log.jsonl for observability.
-//   unknown   — fail-closed (all writes denied). Unknown mode is never silently trusted.
+// Protected-path enforcement (Issue #1612)
 //
-// Protected paths (always denied regardless of mode):
-//   assets/  LICENSES/  .env*  secrets/**
+// The legacy env-driven Allowed Paths mode system (three env vars: one
+// selecting a workspace/strict/shadow/unknown mode, one declaring a
+// newline-separated allow-list, one legacy boolean alias for the default
+// mode) has been fully removed from this file (Issue #1612 AC1-3): none of
+// those env vars are read anywhere below, and setting them in an environment
+// has no effect on the decisions below (Issue #1612 AC7, verified out of
+// process by scripts/agent-guards/tests/test_codex_legacy_env_ignored.py).
+// The editing-time filesystem boundary is now owned by two independent,
+// non-overlapping mechanisms instead of an env-driven mode enum:
+//   1. Native Codex permission profiles (`.codex/config.toml`
+//      `[permissions.<profile>.filesystem]`), which govern general
+//      read/write access at the process/sandbox level.
+//   2. isProtectedPath() below, a validated mirror of the shared
+//      PROTECTED_PATHS_POLICY_V1 JSON SSOT
+//      (`scripts/agent-guards/protected_paths_policy.v1.json`, Issue #1611),
+//      which always denies apply_patch/Edit/Write to assets/**, LICENSES/**,
+//      .env*, secrets/** regardless of what an Issue's declared Allowed
+//      Paths say.
+//
+// Per-Issue declared Allowed Paths are intentionally NOT narrowed by this
+// hook: that enforcement now lives exclusively with the independent,
+// `git diff`-derived allowed_paths_review_gate at PR review time (canonical)
+// and, for git staging/commit itself, with the controlled stage/commit
+// executor (`scripts/agent-guards/controlled_git_change_exec.py`, Issue
+// #1611). Rollback: if `protected_paths_policy.v1.json` or this mirror is
+// ever found to be broken/unreadable, `loadProtectedPathsPolicy()` throws
+// and the hook process exits non-zero, which Codex's PreToolUse hook runner
+// treats as a hook execution failure -- see
+// "Rollback（障害時の安全側フォールバック）" in
+// docs/dev/agent-runtime-ops.md for the documented recovery procedure.
 //
 // KNOWN LIMITATION: path canonicalization uses path.resolve without realpath,
 // so symlinks that escape the repo root are not caught (WSL2 compatibility).
 // ---------------------------------------------------------------------------
-
-/** Parse CODEX_ALLOWED_PATHS_MODE; returns 'strict' | 'workspace' | 'shadow' | 'unknown' */
-function parseAllowedPathsMode() {
-  const legacyMode = process.env.CODEX_LEGACY_ALLOW_WRITES === '1';
-  if (legacyMode) {
-    return 'workspace'; // backward compat: legacy allow = workspace mode
-  }
-  const raw = (process.env.CODEX_ALLOWED_PATHS_MODE ?? '').trim().toLowerCase();
-  if (raw === '' || raw === 'workspace') {
-    return 'workspace'; // default when not set: workspace mode (allow repo workspace edits)
-  }
-  if (raw === 'strict') {
-    return 'strict';
-  }
-  if (raw === 'workspace') return 'workspace';
-  if (raw === 'shadow') return 'shadow';
-  return 'unknown'; // unknown mode → fail-closed
-}
-
-function parseAllowedPaths() {
-  const raw = process.env.CODEX_ALLOWED_PATHS;
-  if (!raw || !raw.trim()) {
-    return null; // not set
-  }
-  // Accept newline-separated paths (colon is avoided: conflicts with Windows drive letters)
-  return raw.split(/\n+/).map((p) => p.trim()).filter(Boolean);
-}
 
 function resolveInsideRepo(inputPath) {
   if (!inputPath || inputPath.includes('\0')) return null;
@@ -1111,33 +1222,44 @@ function resolveInsideRepo(inputPath) {
   return resolved;
 }
 
-function isPathAllowed(filePath, allowedPaths) {
-  const candidate = resolveInsideRepo(filePath);
-  if (!candidate) return false;
-  return allowedPaths.some((allowed) => {
-    const resolvedAllowed = resolveInsideRepo(allowed);
-    return resolvedAllowed && (candidate === resolvedAllowed || candidate.startsWith(resolvedAllowed + path.sep));
-  });
+let _protectedPathsPolicyCache = null;
+
+/**
+ * Load PROTECTED_PATHS_POLICY_V1 directly from the JSON SSOT (Issue #1611
+ * contract revision, P1-2). Cached per-process (the file does not change
+ * within a single hook invocation); throws (fail-closed, never silently
+ * falls back to a hardcoded list) if the file is missing/malformed.
+ */
+function loadProtectedPathsPolicy() {
+  if (_protectedPathsPolicyCache) return _protectedPathsPolicyCache;
+  const raw = fs.readFileSync(protectedPathsPolicyPath, 'utf8');
+  const data = JSON.parse(raw);
+  if (data.schema !== 'PROTECTED_PATHS_POLICY_V1' || !Array.isArray(data.rules) || data.rules.length === 0) {
+    throw new Error(`invalid protected paths policy at ${protectedPathsPolicyPath}`);
+  }
+  _protectedPathsPolicyCache = data;
+  return data;
 }
 
-/** Returns true if filePath is a protected path (always denied in any mode). */
+/** Returns true if filePath is a protected path (always denied). */
 function isProtectedPath(filePath) {
   const candidate = resolveInsideRepo(filePath);
   if (!candidate) return true; // null path (traversal/NUL) → deny
-  const assetsDir = path.resolve(repoRoot, 'assets');
-  const licensesDir = path.resolve(repoRoot, 'LICENSES');
-  // .env* files anywhere in the repo
+  const policy = loadProtectedPathsPolicy();
   const basename = path.basename(filePath);
-  const isEnvFile = /^\.env(\.|$)/.test(basename) || basename === '.env';
-  // secrets/** directory
-  const secretsDir = path.resolve(repoRoot, 'secrets');
-  const isInSecrets = candidate === secretsDir || candidate.startsWith(secretsDir + path.sep);
-  return (
-    candidate === assetsDir || candidate.startsWith(assetsDir + path.sep) ||
-    candidate === licensesDir || candidate.startsWith(licensesDir + path.sep) ||
-    isEnvFile ||
-    isInSecrets
-  );
+  for (const rule of policy.rules) {
+    if (rule.kind === 'root_directory') {
+      const dir = path.resolve(repoRoot, rule.path);
+      if (candidate === dir || candidate.startsWith(dir + path.sep)) return true;
+    } else if (rule.kind === 'basename_glob') {
+      if (rule.pattern.endsWith('*') && !rule.pattern.slice(0, -1).includes('*')) {
+        if (basename.startsWith(rule.pattern.slice(0, -1))) return true;
+      } else if (basename === rule.pattern) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 /** Legacy alias: same as isProtectedPath for backward compat. */
@@ -1145,63 +1267,18 @@ function isProtectedLegacy(filePath) {
   return isProtectedPath(filePath);
 }
 
-function appendShadowLog(entry) {
-  try {
-    fs.appendFileSync(shadowLogPath, JSON.stringify({ ...entry, ts: new Date().toISOString() }) + '\n', 'utf8');
-  } catch {
-    // shadow log write failure is non-fatal; log to stderr only
-    process.stderr.write('[guard-shadow] warn: failed to write to .guard_shadow_log.jsonl\n');
-  }
-}
-
 function extractPatchTouchedPaths(command) {
   return [...command.matchAll(/\*\*\* (?:Add|Delete|Update) File: (.+)$/gm)].map((match) => match[1].trim());
 }
 
-function denyForWriteTool(toolName, toolInput, allowedPaths, _modeOverride) {
-  const mode = _modeOverride ?? parseAllowedPathsMode();
-
-  // Unknown mode: fail-closed
-  if (mode === 'unknown') {
-    return 'codex_allowed_paths_mode_unknown: CODEX_ALLOWED_PATHS_MODE is not recognized. Fail-closed. Use strict, workspace, or shadow.';
-  }
-
+function denyForWriteTool(toolName, toolInput) {
   // apply_patch: extract touched paths from patch content
   if (toolName === 'apply_patch') {
     const command = normalizeCommand(toolInput?.command);
     const touchedPaths = extractPatchTouchedPaths(command);
-
-    if (mode === 'strict') {
-      if (allowedPaths === null) {
-        // strict + no CODEX_ALLOWED_PATHS: deny any write
-        if (touchedPaths.length > 0) {
-          return 'allowed_paths_missing: CODEX_ALLOWED_PATHS is not set. Declare allowed paths per Issue contract or set CODEX_ALLOWED_PATHS_MODE=workspace.';
-        }
-      } else {
-        for (const filePath of touchedPaths) {
-          if (!isPathAllowed(filePath, allowedPaths)) {
-            return `allowed_paths_violation: "${filePath}" is outside the declared Allowed Paths set. (CODEX_ALLOWED_PATHS enforcement)`;
-          }
-        }
-      }
-    } else {
-      // workspace or shadow: allow repo workspace edits; protected paths always denied
-      for (const filePath of touchedPaths) {
-        if (isProtectedPath(filePath)) {
-          const reason = 'protected_path_violation: path is in a protected area (assets/, LICENSES/, .env*, secrets/**).';
-          if (mode === 'shadow') {
-            appendShadowLog({ event: 'would_block', tool: toolName, path: filePath, reason });
-          }
-          return reason;
-        }
-        // workspace/shadow: if CODEX_ALLOWED_PATHS is set, narrow (intersect)
-        if (allowedPaths !== null && !isPathAllowed(filePath, allowedPaths)) {
-          const reason = `allowed_paths_violation: "${filePath}" is outside the declared Allowed Paths set. (CODEX_ALLOWED_PATHS enforcement)`;
-          if (mode === 'shadow') {
-            appendShadowLog({ event: 'would_block', tool: toolName, path: filePath, reason });
-          }
-          return reason;
-        }
+    for (const filePath of touchedPaths) {
+      if (isProtectedPath(filePath)) {
+        return 'protected_path_violation: path is in a protected area (assets/, LICENSES/, .env*, secrets/**).';
       }
     }
     return null;
@@ -1213,32 +1290,8 @@ function denyForWriteTool(toolName, toolInput, allowedPaths, _modeOverride) {
     if (!filePath) {
       return null; // no path to check
     }
-
-    if (mode === 'strict') {
-      if (allowedPaths === null) {
-        // strict + no CODEX_ALLOWED_PATHS: deny all writes
-        return 'allowed_paths_missing: CODEX_ALLOWED_PATHS is not set. Declare allowed paths per Issue contract or set CODEX_ALLOWED_PATHS_MODE=workspace.';
-      }
-      if (!isPathAllowed(filePath, allowedPaths)) {
-        return `allowed_paths_violation: "${filePath}" is outside the declared Allowed Paths set. (CODEX_ALLOWED_PATHS enforcement)`;
-      }
-    } else {
-      // workspace or shadow: allow repo workspace edits; protected paths always denied
-      if (isProtectedPath(filePath)) {
-        const reason = 'protected_path_violation: path is in a protected area (assets/, LICENSES/, .env*, secrets/**).';
-        if (mode === 'shadow') {
-          appendShadowLog({ event: 'would_block', tool: toolName, path: filePath, reason });
-        }
-        return reason;
-      }
-      // workspace/shadow: if CODEX_ALLOWED_PATHS is set, narrow (intersect)
-      if (allowedPaths !== null && !isPathAllowed(filePath, allowedPaths)) {
-        const reason = `allowed_paths_violation: "${filePath}" is outside the declared Allowed Paths set. (CODEX_ALLOWED_PATHS enforcement)`;
-        if (mode === 'shadow') {
-          appendShadowLog({ event: 'would_block', tool: toolName, path: filePath, reason });
-        }
-        return reason;
-      }
+    if (isProtectedPath(filePath)) {
+      return 'protected_path_violation: path is in a protected area (assets/, LICENSES/, .env*, secrets/**).';
     }
     return null;
   }
@@ -1251,7 +1304,6 @@ function runPreToolHook() {
   const toolName = payload.tool_name;
   const toolInput = payload?.tool_input ?? {};
   const command = normalizeCommand(toolInput?.command);
-  const allowedPaths = parseAllowedPaths();
   let reason = null;
 
   if (supportedPreToolNames.includes(toolName)) {
@@ -1261,7 +1313,7 @@ function runPreToolHook() {
   if (toolName === 'Bash') {
     reason = denyForBash(command);
   } else if (toolName === 'apply_patch' || toolName === 'Edit' || toolName === 'Write') {
-    reason = denyForWriteTool(toolName, toolInput, allowedPaths);
+    reason = denyForWriteTool(toolName, toolInput);
   }
 
   if (reason) {
@@ -1334,242 +1386,132 @@ function runSelfTest() {
     selfAssert(threw, 'TOML parser: detects duplicate key');
   }
 
-  process.stdout.write('\n=== self-test: Allowed Paths enforcement (Edit/Write) ===\n');
-
-  // Test: CODEX_ALLOWED_PATHS_MODE not set — default is workspace: normal path is allowed
+  process.stdout.write('\n=== self-test: PROTECTED_PATHS_POLICY_V1 JSON SSOT mirrors ===\n');
+  // Issue #1611 (contract revision, P1-2): every `root_directory` rule in the
+  // JSON SSOT must appear as a read-only `.codex/config.toml` workspace_root
+  // (the validated-mirror invariant this permission profile can represent).
   {
-    delete process.env.CODEX_ALLOWED_PATHS;
-    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
-    delete process.env.CODEX_ALLOWED_PATHS_MODE;
-    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null);
-    selfAssert(result === null, 'Workspace default: src/main.ts edit is allowed when CODEX_ALLOWED_PATHS_MODE not set (Issue #874 goal: workspace default)');
+    const policy = loadProtectedPathsPolicy();
+    const rootDirRules = policy.rules.filter((r) => r.kind === 'root_directory').map((r) => r.path);
+    selfAssert(rootDirRules.length > 0, 'protected_paths_policy.v1.json: has at least one root_directory rule');
+    // The bundled TOML parser here is a minimal subset (it does not parse
+    // quoted map keys like `"assets" = "read"` into nested objects), so the
+    // mirror check is done against the raw file text within each profile's
+    // `:workspace_roots` table, not the parsed object.
+    const configText = fs.readFileSync(configPath, 'utf8');
+    for (const profileName of ['loop-protocol-rtk', 'loop-protocol-readonly', 'loop-protocol-bootstrap']) {
+      const tableHeader = `[permissions.${profileName}.filesystem.":workspace_roots"]`;
+      const headerIdx = configText.indexOf(tableHeader);
+      selfAssert(headerIdx !== -1, `config.toml: has table ${tableHeader}`);
+      const nextHeaderIdx = configText.indexOf('\n[', headerIdx + tableHeader.length);
+      const tableBody = configText.slice(headerIdx, nextHeaderIdx === -1 ? undefined : nextHeaderIdx);
+      for (const dir of rootDirRules) {
+        selfAssert(
+          new RegExp(`"${dir}"\\s*=\\s*"read"`).test(tableBody),
+          `config.toml [permissions.${profileName}]: workspace_roots."${dir}" mirrors protected_paths_policy.v1.json (read-only)`,
+        );
+      }
+    }
+    // isProtectedPath() must agree with the JSON SSOT for every rule kind.
+    selfAssert(isProtectedPath('assets/sprite.png') === true, 'isProtectedPath: assets/** matches JSON root_directory rule');
+    selfAssert(isProtectedPath('secrets/token') === true, 'isProtectedPath: secrets/** matches JSON root_directory rule');
+    selfAssert(isProtectedPath('.env') === true, 'isProtectedPath: .env matches JSON basename_glob rule');
+    selfAssert(isProtectedPath('.env.production') === true, 'isProtectedPath: .env.* matches JSON basename_glob rule');
+    selfAssert(isProtectedPath('src/main.ts') === false, 'isProtectedPath: unrelated path is not protected');
   }
 
-  // Test: CODEX_ALLOWED_PATHS_MODE=strict — fail-closed: any write is denied
+  process.stdout.write('\n=== self-test: protected-path enforcement (Edit/Write) ===\n');
+
+  // Test: normal path is allowed (no protected-path match)
   {
-    delete process.env.CODEX_ALLOWED_PATHS;
-    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
-    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null, 'strict');
-    selfAssert(result !== null, 'Strict mode: src/main.ts edit is denied when CODEX_ALLOWED_PATHS not set');
+    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' });
+    selfAssert(result === null, 'Normal path: src/main.ts edit is allowed');
   }
 
-  // Test: CODEX_ALLOWED_PATHS not set, CODEX_LEGACY_ALLOW_WRITES=1 — assets/ is denied
+  // Test: assets/ is denied
   {
-    delete process.env.CODEX_ALLOWED_PATHS;
-    process.env.CODEX_LEGACY_ALLOW_WRITES = '1';
-    const result = denyForWriteTool('Edit', { file_path: 'assets/sprite.png' }, null);
-    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
-    selfAssert(result !== null, 'Legacy opt-in: assets/ edit is denied');
+    const result = denyForWriteTool('Edit', { file_path: 'assets/sprite.png' });
+    selfAssert(result !== null, 'Protected path: assets/ edit is denied');
   }
 
-  // Test: CODEX_ALLOWED_PATHS not set, CODEX_LEGACY_ALLOW_WRITES=1 — normal path is allowed
+  // Test: LICENSES/ is denied
   {
-    delete process.env.CODEX_ALLOWED_PATHS;
-    process.env.CODEX_LEGACY_ALLOW_WRITES = '1';
-    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null);
-    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
-    selfAssert(result === null, 'Legacy opt-in: src/main.ts edit is allowed');
+    const result = denyForWriteTool('Edit', { file_path: 'LICENSES/MIT.txt' });
+    selfAssert(result !== null, 'Protected path: LICENSES/ edit is denied');
   }
 
-  // Test: CODEX_ALLOWED_PATHS set — path inside set is allowed
+  // Test: .env is denied
   {
-    const allowed = ['.codex/agents', 'scripts'];
-    const result = denyForWriteTool('Write', { file_path: '.codex/agents/foo.toml' }, allowed);
-    selfAssert(result === null, 'Strict mode: .codex/agents/foo.toml is allowed');
+    const result = denyForWriteTool('Write', { file_path: '.env' });
+    selfAssert(result !== null, 'Protected path: .env write is denied');
   }
 
-  // Test: CODEX_ALLOWED_PATHS set — path outside set is denied
+  // Test: .env.local is denied
   {
-    const allowed = ['.codex/agents', 'scripts'];
-    const result = denyForWriteTool('Write', { file_path: 'src/main.ts' }, allowed);
-    selfAssert(result !== null, 'Strict mode: src/main.ts is denied (outside Allowed Paths)');
+    const result = denyForWriteTool('Write', { file_path: '.env.local' });
+    selfAssert(result !== null, 'Protected path: .env.local write is denied');
   }
 
-  // Test: assets/ is denied even with unrelated Allowed Paths set
+  // Test: secrets/ is denied
   {
-    const allowed = ['.codex/agents'];
-    const result = denyForWriteTool('Edit', { file_path: 'assets/sprite.png' }, allowed);
-    selfAssert(result !== null, 'Strict mode: assets/sprite.png is denied');
+    const result = denyForWriteTool('Write', { file_path: 'secrets/api-key.txt' });
+    selfAssert(result !== null, 'Protected path: secrets/ write is denied');
   }
 
-  // Test: path traversal escape — denied in strict mode
+  // Test: path traversal that resolves inside a protected root is still denied
   {
-    const allowed = ['scripts'];
-    const result = denyForWriteTool('Write', { file_path: 'scripts/../src/main.ts' }, allowed);
-    selfAssert(result !== null, 'Strict mode: path traversal escape scripts/../src/main.ts is denied');
+    const result = denyForWriteTool('Write', { file_path: 'scripts/../secrets/token' });
+    selfAssert(result !== null, 'Protected path: traversal resolving into secrets/ is denied');
   }
 
-  // Test: path traversal escape — denied in strict mode (no CODEX_ALLOWED_PATHS)
+  // Test: path traversal that resolves outside the repo root is denied fail-closed
   {
-    delete process.env.CODEX_ALLOWED_PATHS;
-    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
-    const result = denyForWriteTool('Write', { file_path: 'scripts/../src/main.ts' }, null, 'strict');
-    selfAssert(result !== null, 'Strict mode: path traversal escape is denied');
+    const result = denyForWriteTool('Write', { file_path: '../outside-repo/file.ts' });
+    selfAssert(result !== null, 'Fail-closed: traversal escaping repo root is denied');
   }
 
-  // Test: NUL byte in path — denied
+  // Test: path traversal that stays inside the repo and lands on a normal path is allowed
+  // (Allowed Paths narrowing is no longer this hook's responsibility -- see
+  // allowed_paths_review_gate for the canonical, git-diff-derived enforcement.)
   {
-    const allowed = ['scripts'];
-    const result = denyForWriteTool('Write', { file_path: 'scripts/foo\0bar.mjs' }, allowed);
-    selfAssert(result !== null, 'Strict mode: NUL byte in path is denied');
+    const result = denyForWriteTool('Write', { file_path: 'scripts/../src/main.ts' });
+    selfAssert(result === null, 'Normal path: traversal resolving to a non-protected in-repo path is allowed');
   }
 
-  process.stdout.write('\n=== self-test: Allowed Paths enforcement (apply_patch) ===\n');
-
-  // Test: apply_patch with assets path — fail-closed default deny
+  // Test: NUL byte in path — denied fail-closed
   {
-    delete process.env.CODEX_ALLOWED_PATHS;
-    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
+    const result = denyForWriteTool('Write', { file_path: 'scripts/foo\0bar.mjs' });
+    selfAssert(result !== null, 'Fail-closed: NUL byte in path is denied');
+  }
+
+  process.stdout.write('\n=== self-test: protected-path enforcement (apply_patch) ===\n');
+
+  // Test: apply_patch touching assets/ is denied
+  {
     const patchCmd = '*** Update File: assets/sprite.png\n--- a\n+++ b\n';
-    const result = denyForWriteTool('apply_patch', { command: patchCmd }, null);
-    selfAssert(result !== null, 'Fail-closed default: apply_patch to assets/ is denied');
+    const result = denyForWriteTool('apply_patch', { command: patchCmd });
+    selfAssert(result !== null, 'Protected path: apply_patch to assets/ is denied');
   }
 
-  // Test: apply_patch with assets path — legacy opt-in deny
+  // Test: apply_patch touching secrets/ is denied
   {
-    process.env.CODEX_LEGACY_ALLOW_WRITES = '1';
-    const patchCmd = '*** Update File: assets/sprite.png\n--- a\n+++ b\n';
-    const result = denyForWriteTool('apply_patch', { command: patchCmd }, null);
-    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
-    selfAssert(result !== null, 'Legacy opt-in: apply_patch to assets/ is denied');
+    const patchCmd = '*** Update File: secrets/api-key.txt\n--- a\n+++ b\n';
+    const result = denyForWriteTool('apply_patch', { command: patchCmd });
+    selfAssert(result !== null, 'Protected path: apply_patch to secrets/ is denied');
   }
 
-  // Test: apply_patch with allowed path — strict mode allow
+  // Test: apply_patch touching a normal path is allowed
   {
     const patchCmd = '*** Update File: scripts/check-codex-agents.mjs\n--- a\n+++ b\n';
-    const result = denyForWriteTool('apply_patch', { command: patchCmd }, ['scripts']);
-    selfAssert(result === null, 'Strict mode: apply_patch to scripts/ is allowed');
+    const result = denyForWriteTool('apply_patch', { command: patchCmd });
+    selfAssert(result === null, 'Normal path: apply_patch to scripts/ is allowed');
   }
 
-  // Test: apply_patch with disallowed path — strict mode deny
+  // Test: apply_patch path traversal resolving into a protected root is denied
   {
-    const patchCmd = '*** Update File: src/main.ts\n--- a\n+++ b\n';
-    const result = denyForWriteTool('apply_patch', { command: patchCmd }, ['.codex/agents', 'scripts']);
-    selfAssert(result !== null, 'Strict mode: apply_patch to src/main.ts is denied');
-  }
-
-  // Test: apply_patch path traversal — strict mode deny
-  {
-    const patchCmd = '*** Update File: scripts/../src/main.ts\n--- a\n+++ b\n';
-    const result = denyForWriteTool('apply_patch', { command: patchCmd }, ['scripts']);
-    selfAssert(result !== null, 'Strict mode: apply_patch path traversal is denied');
-  }
-
-  process.stdout.write('\n=== self-test: CODEX_ALLOWED_PATHS_MODE workspace ===\n');
-
-  // workspace mode: normal path is allowed (no CODEX_ALLOWED_PATHS)
-  {
-    delete process.env.CODEX_ALLOWED_PATHS;
-    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
-    delete process.env.CODEX_ALLOWED_PATHS_MODE;
-    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null, 'workspace');
-    selfAssert(result === null, 'Workspace mode: src/main.ts edit is allowed (normal workspace path)');
-  }
-
-  // workspace mode: assets/ is denied
-  {
-    delete process.env.CODEX_ALLOWED_PATHS;
-    const result = denyForWriteTool('Edit', { file_path: 'assets/sprite.png' }, null, 'workspace');
-    selfAssert(result !== null, 'Workspace mode: assets/ edit is denied (protected path)');
-  }
-
-  // workspace mode: .env is denied
-  {
-    delete process.env.CODEX_ALLOWED_PATHS;
-    const result = denyForWriteTool('Write', { file_path: '.env' }, null, 'workspace');
-    selfAssert(result !== null, 'Workspace mode: .env write is denied (protected path)');
-  }
-
-  // workspace mode: .env.local is denied
-  {
-    delete process.env.CODEX_ALLOWED_PATHS;
-    const result = denyForWriteTool('Write', { file_path: '.env.local' }, null, 'workspace');
-    selfAssert(result !== null, 'Workspace mode: .env.local write is denied (protected path)');
-  }
-
-  // workspace mode: secrets/ is denied
-  {
-    delete process.env.CODEX_ALLOWED_PATHS;
-    const result = denyForWriteTool('Write', { file_path: 'secrets/api-key.txt' }, null, 'workspace');
-    selfAssert(result !== null, 'Workspace mode: secrets/ write is denied (protected path)');
-  }
-
-  // workspace mode + CODEX_ALLOWED_PATHS set: intersection — narrowing applies
-  {
-    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, ['scripts'], 'workspace');
-    selfAssert(result !== null, 'Workspace mode + CODEX_ALLOWED_PATHS set: src/main.ts denied (not in allowed set)');
-  }
-
-  // workspace mode + CODEX_ALLOWED_PATHS set: path in set is allowed
-  {
-    const result = denyForWriteTool('Edit', { file_path: 'scripts/check-codex-agents.mjs' }, ['scripts'], 'workspace');
-    selfAssert(result === null, 'Workspace mode + CODEX_ALLOWED_PATHS set: scripts/ is allowed');
-  }
-
-  // CODEX_LEGACY_ALLOW_WRITES=1 maps to workspace mode
-  {
-    delete process.env.CODEX_ALLOWED_PATHS;
-    process.env.CODEX_LEGACY_ALLOW_WRITES = '1';
-    delete process.env.CODEX_ALLOWED_PATHS_MODE;
-    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null);
-    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
-    selfAssert(result === null, 'Legacy mode (CODEX_LEGACY_ALLOW_WRITES=1): maps to workspace — src/main.ts is allowed');
-  }
-
-  process.stdout.write('\n=== self-test: CODEX_ALLOWED_PATHS_MODE shadow ===\n');
-
-  // shadow mode: normal path is allowed (no CODEX_ALLOWED_PATHS)
-  {
-    delete process.env.CODEX_ALLOWED_PATHS;
-    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null, 'shadow');
-    selfAssert(result === null, 'Shadow mode: src/main.ts edit is allowed (normal workspace path)');
-  }
-
-  // shadow mode: assets/ is denied
-  {
-    const result = denyForWriteTool('Edit', { file_path: 'assets/sprite.png' }, null, 'shadow');
-    selfAssert(result !== null, 'Shadow mode: assets/ edit is denied (protected path)');
-  }
-
-  // shadow mode: .env is denied
-  {
-    const result = denyForWriteTool('Write', { file_path: '.env' }, null, 'shadow');
-    selfAssert(result !== null, 'Shadow mode: .env write is denied (protected path)');
-  }
-
-  // shadow mode: secrets/ is denied
-  {
-    const result = denyForWriteTool('Write', { file_path: 'secrets/api-key.txt' }, null, 'shadow');
-    selfAssert(result !== null, 'Shadow mode: secrets/ write is denied (protected path)');
-  }
-
-  process.stdout.write('\n=== self-test: CODEX_ALLOWED_PATHS_MODE strict ===\n');
-
-  // strict mode + no CODEX_ALLOWED_PATHS: deny all writes
-  {
-    delete process.env.CODEX_ALLOWED_PATHS;
-    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
-    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null, 'strict');
-    selfAssert(result !== null && result.includes('allowed_paths_missing'), 'Strict mode: src/main.ts denied with allowed_paths_missing when no CODEX_ALLOWED_PATHS');
-  }
-
-  // strict mode + CODEX_ALLOWED_PATHS set: path in set is allowed
-  {
-    const result = denyForWriteTool('Edit', { file_path: 'scripts/check-codex-agents.mjs' }, ['scripts'], 'strict');
-    selfAssert(result === null, 'Strict mode + CODEX_ALLOWED_PATHS: scripts/ is allowed');
-  }
-
-  // strict mode + CODEX_ALLOWED_PATHS set: path outside set is denied
-  {
-    const result = denyForWriteTool('Write', { file_path: 'src/main.ts' }, ['scripts'], 'strict');
-    selfAssert(result !== null && result.includes('allowed_paths_violation'), 'Strict mode + CODEX_ALLOWED_PATHS: src/main.ts denied (outside set)');
-  }
-
-  // unknown mode: fail-closed
-  {
-    delete process.env.CODEX_ALLOWED_PATHS;
-    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null, 'unknown');
-    selfAssert(result !== null && result.includes('codex_allowed_paths_mode_unknown'), 'Unknown mode: fail-closed with codex_allowed_paths_mode_unknown reason');
+    const patchCmd = '*** Update File: scripts/../.env\n--- a\n+++ b\n';
+    const result = denyForWriteTool('apply_patch', { command: patchCmd });
+    selfAssert(result !== null, 'Protected path: apply_patch traversal resolving into .env is denied');
   }
 
   process.stdout.write('\n=== self-test: Bash hook ===\n');
@@ -1716,29 +1658,6 @@ function runSelfTest() {
     selfAssert(result !== null, 'Bash hook (JSON payload): gh pr merge from payload is denied');
   }
 
-  // Test: Edit allowed by workspace default when CODEX_ALLOWED_PATHS not set
-  {
-    delete process.env.CODEX_ALLOWED_PATHS;
-    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
-    delete process.env.CODEX_ALLOWED_PATHS_MODE;
-    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null);
-    selfAssert(result === null, 'Write tool: workspace default allows src/main.ts when no CODEX_ALLOWED_PATHS (workspace is default mode)');
-  }
-
-  // Test: Edit denied with allowed_paths_missing when CODEX_ALLOWED_PATHS_MODE=strict and no CODEX_ALLOWED_PATHS
-  {
-    delete process.env.CODEX_ALLOWED_PATHS;
-    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
-    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null, 'strict');
-    selfAssert(result !== null && result.includes('allowed_paths_missing'), 'Write tool (strict): denied with allowed_paths_missing when no CODEX_ALLOWED_PATHS');
-  }
-
-  // Test: Write denied with allowed_paths_violation when path is outside Allowed Paths
-  {
-    const allowed = ['scripts'];
-    const result = denyForWriteTool('Write', { file_path: 'src/main.ts' }, allowed);
-    selfAssert(result !== null && result.includes('allowed_paths_violation'), 'Write tool: denied with allowed_paths_violation when path outside allowed set');
-  }
 
   process.stdout.write('\n');
   if (selfTestFailures.length > 0) {
@@ -1763,6 +1682,31 @@ function main() {
   }
   if (arg === '--self-test') {
     runSelfTest();
+    return;
+  }
+  if (arg === '--check-protected-path') {
+    // Issue #1612 AC4: a stable, scriptable entry point so an out-of-process
+    // parity test (scripts/agent-guards/tests/test_protected_paths_policy_node_parity.py)
+    // can compare this Node mirror's isProtectedPath() decision against the
+    // Python loader (scripts/agent-guards/protected_paths_policy.py) for the
+    // exact same input, without duplicating either implementation's logic.
+    const candidate = process.argv[3] ?? '';
+    process.stdout.write(isProtectedPath(candidate) ? 'true\n' : 'false\n');
+    return;
+  }
+  if (arg === '--check-write-tool') {
+    // Issue #1612 AC7: a stable, scriptable entry point so an out-of-process
+    // negative test (scripts/agent-guards/tests/test_codex_legacy_env_ignored.py)
+    // can drive denyForWriteTool() directly -- with legacy env vars set in
+    // the child process environment -- without also
+    // triggering the unrelated SubagentStart launch-ledger evidence path
+    // (appendPreToolEvidence()) that --hook-pretool always runs first.
+    // Usage: --check-write-tool <toolName> <filePathOrPatchCommand>
+    const toolName = process.argv[3] ?? '';
+    const pathOrCommand = process.argv[4] ?? '';
+    const toolInput = toolName === 'apply_patch' ? { command: pathOrCommand } : { file_path: pathOrCommand };
+    const reason = denyForWriteTool(toolName, toolInput);
+    process.stdout.write(reason ? `deny: ${reason}\n` : 'allow\n');
     return;
   }
 

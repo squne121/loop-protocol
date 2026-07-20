@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 
+REPO_ROOT = Path(__file__).parents[4]
 SCRIPTS = Path(__file__).parent.parent / "scripts"
 BASELINE_PATH = SCRIPTS / "baseline_vc_preflight.py"
 TRIAGE_PATH = (
@@ -158,3 +159,18 @@ def test_producer_evidence_round_trips_to_triage(
     rejected = triage.triage_contract_blockers(payload)
     assert rejected["status"] == "incomplete_evidence"
     assert rejected["suggested_actions"] == []
+
+
+def test_repository_manifest_test_script_matches_registry() -> None:
+    """GIVEN the real repo package.json WHEN compared to the registry THEN the test script matches exactly.
+
+    (Major 1, PR #1559 review). Regression tests above only compare
+    package.json against a synthetic manifest built from
+    registry.expected_scripts() itself, which cannot detect drift between
+    the real repository package.json and the registry. Production
+    validate_manifest() performs a byte-for-byte comparison against the
+    real package.json and fail-closes on manifest_integrity:closure_drift:test,
+    so this test reads the actual repository package.json to close that gap.
+    """
+    manifest = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
+    assert manifest["scripts"]["test"] == registry.expected_scripts()["test"]

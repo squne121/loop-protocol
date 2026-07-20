@@ -118,6 +118,9 @@ hook_boundaries_manifest_v1:
       /tmp wrapper / python -c は unparseable_branch_mutation で fail-closed。
       deterministic_checker_command は DETERMINISTIC_CHECKER_ALLOWLIST の exact-path のみ許可。
       probe scripts (git_ref_probe.py / git_worktree_probe.py) は DETERMINISTIC_CHECKER_ALLOWLIST に登録済み（Issue #1197）。
+      `issue_scope_snapshot.materialize` は controlled_skill_mutation_exec の exact command id
+      としてのみ許可する。live GitHub-bound scope snapshot artifact の producer であり、
+      任意の Python/heredoc または raw git commit を代替経路として許可しない。
       local root default branch 保護（branch drift 防止）は維持しつつ、Issue #1241 以降は shared policy で
       bounded な `rtk git add/commit/push` と `HOOK_COMMAND_REPAIR_HINT_V1` を扱う。
 
@@ -490,6 +493,7 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 | `target_dir_outside_worktree` | active issue worktree 配下へ戻る | `git status --short` / `git branch --show-current` |
 | `no_matching_worktree` / `ambiguous_worktree` | worktree catalog を 1 件に特定する | `git worktree list` / `git branch --show-current` |
 | `rtk_unknown_inner` | wrapper を剥がさず direct な `rtk git add/commit/push` へ揃える | `rtk git add <allowed-path-file>` / `git branch --show-current` |
+| `git_add_requires_controlled_executor` / `git_commit_requires_controlled_executor` | raw `git add`/`git commit`/`rtk git add`/`rtk git commit` は agent lane では常に deny -- controlled executor 経由に切り替える（Issue #1611 AC9） | `uv run --locked python3 scripts/agent-guards/controlled_git_change_exec.py --help` / `git diff --cached --name-status -M -z` |
 
 ### 運用ガイド
 
@@ -497,6 +501,17 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 - `suggested_command` は authorization を付与しない。rules / hooks / post-run verifier が独立に reject できる。
 - `allowed_paths_missing_for_git_mutation` は fail-closed 理由であり、Issue contract の Allowed Paths binding が runtime に見えていない状態を示す。
 - branch publish failure では `boundary_layer` と `reason_code` を分離し、`expected_remote_head` / `current_remote_head` / `local_head` / `verified_head` の比較が崩れたら `PUBLISH_SAFETY_STOP_REPORT_V1` に倒す。
+- Issue #1611 以降、staging/commit の唯一の認可経路は `scripts/agent-guards/controlled_git_change_exec.py`
+  （`execute_controlled_change`）である。`git_mutation_command_policy.py` の
+  `classify_agent_lane_add_commit` は raw `git add`/`git commit`/`rtk git add`/`rtk git commit`
+  シェルコマンド文字列を、そのコマンド自身が controlled executor でない限り常に deny する（既存の
+  `classify_rtk_git_mutation` の add/commit 分岐は後方互換のため変更していない -- 実際の agent lane
+  はこの新しい deny-first 判定を優先する）。Codex 側の静的 rule
+  (`.codex/rules/default.rules`) も `rtk git add` / `rtk git commit -m` を `forbidden` に narrowing
+  し、controlled executor 本体の exact invocation prefix
+  (`uv run --locked python3 scripts/agent-guards/controlled_git_change_exec.py`) のみ `allow` にして
+  いる（AC14、`scripts/ci/codex_execpolicy_matrix.py` の `execpolicy_case_definitions()` に静的ケース
+  として記録）。
 
 ---
 
@@ -706,6 +721,148 @@ SESSION_MANIFEST_LEGACY_SCAN_V1:
 
 ---
 
-## 12. publish lane authorization trust root（historical note）
+## 12a. pr_review.publish の位置づけ（Issue #1536）
+
+`scripts/agent-guards/controlled_skill_mutation_exec.py` の `CONTROLLED_SKILL_MUTATION_COMMAND_POLICY` に `pr_review.publish` command id を追加した（Option C: controlled review publisher）。`local_main_branch_guard.sh` / `worktree_scope_guard.sh` は既存の `REASON_CONTROLLED_SKILL_MUTATION_EXECUTOR` 判定（`is_controlled_skill_mutation_exec_command()`、`ALL_COMMAND_IDS` メンバーシップに基づく exact command class allow）をそのまま適用するため、この2フック自体の変更は不要だった（`termination_report.publish` / `issue_body.update` / `issue_comment.publish` / `contract_snapshot.publish` と同一の authorization lane）。
+
+`pr_review.publish` は `pr-reviewer` SubAgent（read-only、`gh pr review` / worktree bootstrap を一切行わない）の判定結果（`PR_REVIEW_PUBLISH_REQUEST_V1`）を受け取り、`event: COMMENT` 固定・`commit_id` 拘束・idempotency marker 付きで GitHub PR review を投稿する。生の `gh pr review` 呼び出しは `local_main_branch_guard.sh` で引き続き `gh_mutation_denied` として block される（本 Issue で変更しない）。
+
+Codex 側 `.codex/rules/default.rules` は `gh pr review` を引き続き明示的に forbidden とし（`gh` サブコマンド prefix rule）、かつ `controlled_skill_mutation_exec.py` 自体への allow エントリを持たないため、本変更は Claude-only のまま split-brain を生じない（確認のみ、rule 変更なし）。
+
+**Issue #1633 更新（Codex/Claude parity 解消）**: 上記の「Codex 側は allow エントリを持たない」記述は Issue #1633 時点でもはや正確ではない。`.codex/rules/default.rules` に `uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py` の exact prefix allow エントリを追加し、`.claude/settings.json` の `Bash(uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py *)` と同じ 共有 authorization lane に Codex 側も明示的に乗るようにした（`codex execpolicy check` で `decision: allow` を確認済み）。ランタイム hook 層（`is_controlled_skill_mutation_exec_command()`）は元々 Claude/Codex 共通実装であり split-brain は生じていなかったが、静的 `codex execpolicy` layer には対応する allow ルールが欠けていたため、本 Issue でその欠落を埋めた。
+
+## 12b. pr_review.publish の追加ハードニング（Issue #1539 fix_delta）
+
+OWNER レビュー（PR #1539、squne121）で以下の構造的欠陥が指摘され、修正した:
+
+- **trusted bridge の欠如（Blocker 1）**: `pr-reviewer` SubAgent は `Edit`/`Write`/`MultiEdit` を持たず Bash 経由のファイル書き込みも禁止のため、当初の SKILL 文面が要求していた「`PR_REVIEW_PUBLISH_REQUEST_V1` を自ら組み立てて `--input-file` に渡す」経路は実際には SubAgent に実行不能だった。修正: `controlled_skill_mutation_exec.py` に render mode（`--render-body-file` / `--verdict` / `--reviewed-head-sha` / `--expected-head-sha` / `--merge-ready`）を追加。trusted orchestrator（Write ツールを持つ control-plane）が verdict 本文テキストのみを artifact パスへ書き込み、executor 自身が `body_sha256` / `idempotency_key` を再計算し `producer_role` / `event` を自ら固定する（入力からは受け取らない）。
+- **host/environment binding の欠如（Blocker 2）**: `_verify_git_remote_origin()` が owner/repo の正規表現抽出のみで host/scheme を無視していたため、`https://attacker.example/<owner>/<repo>.git` 等が trusted と誤認され得た。また `GH_HOST`/`GH_REPO`/`GH_CONFIG_DIR`/`GH_DEBUG`/`DEBUG` が sanitize されず、`gh` subprocess へ `env=` が渡っていなかった。修正: `urlsplit` による構造的 host/scheme/port/userinfo 検査（github.com の HTTPS/SSH canonical form のみ許可）と、全 `gh` subprocess への sanitized env（上記5キー除去）+ `--hostname github.com` 明示。
+- **idempotent retry が postcondition を迂回（Blocker 3）**: 既存 marker が1件見つかった retry 経路が `state`/`commit_id` のみ確認して即座に成功を返し、body hash・marker 一意性/位置・現在 PR head・author identity・tracked changes を再検証していなかった。修正: retry も fresh-post と同一の共通 postcondition validator（`_validate_pr_review_postcondition`）を通す。marker 検索も substring match から「末尾に厳密一致」判定に変更。
+- **TOCTOU（High 1）**: commit_id 拘束は「A に結び付ける」保証であって「POST 時点でも A が current head」の atomic precondition ではない。修正: POST/readback 後に current head を再取得し、移動していれば `published_but_stale` として fail-closed（review は残るが成功報告はしない）。
+- **producer provenance の自己申告（High 2）**: `producer_role` が入力 JSON の自己申告フィールドで、schema も exact-key ではなかった。修正: render mode では `producer_role`/`event` を executor が自ら固定（入力に存在しても無視ではなく、そもそも render mode の入力スキーマに含まれない）。`--input-file` 経路も exact-key schema + body size bound を追加。
+
+AC8（実 PreToolUse hook chain）テストは `secret_boundary_guard` / `local_main_branch_guard` / `worktree_scope_guard` / `guard-japanese-prose` / `rtk_boundary_shadow_guard` / `ci_test_performance_advisory` / `root_temporary_residue_advisory` の 7 hook すべてを `.claude/settings.json` 記載順に実行し、aggregate decision（deny/ask が無いこと）を検証する形に拡張した（`.claude/hooks/tests/hookchain_harness.py`）。
+
+## 12c. scope_rollup.run の位置づけ（Issue #1547）
+
+`scope_rollup.run` は canonical root（worktree 作成前）context からのみ許可される、独立した exact command class である。`local_main_branch_guard.py` / `skill_runtime_command_policy.py` に登録されており、既存の `preflight.run`（`skill_runtime_exec.py` 経由）とは別レーン -- `skill_runtime_exec.py` は `run_refinement_preflight.py` 呼び出しに固定されているため、`scope_rollup.run` は代わりに新規 `scripts/agent-guards/run_scope_rollup_preflight.py` を直接 exact-match する。
+
+- **command**: `uv run python3 scripts/agent-guards/run_scope_rollup_preflight.py --issue-number <N> --repo <owner/repo> --invocation-id <id> --requested-at <ISO8601>`（12 token 完全一致。`--invocation-id` / `--requested-at` は PR #1560 fix_delta で追加 -- caller (scope-rollup-runner) が生成した値をそのまま渡し、executor は独自に UUID / timestamp を生成しない。`--flag=value` 形・追加 flag・wrapper・shell metacharacter はすべて `unparseable_branch_mutation` で fail-closed）
+- **destination**: caller は出力先を指定しない。GitHub 生入力（`issues.json` / `prs.json`）は executor-owned private invocation directory（`tempfile.mkdtemp()`, mode `0700`）内に `O_CREAT | O_EXCL | O_NOFOLLOW` + mode `0600` で `.part` ファイルを排他生成し、同一 directory 内 `os.link()` ベースの排他 finalize（`os.rename` は使わない -- 既存 destination を静かに置換しうるため）+ flush + `fsync` で確定する。planner の実行結果（`plan_result.json` 相当）はファイル化せず、bounded streaming で in-memory capture した stdout を直接 JSON parse し、verifier も in-process の `verify_payload()` で検証する（PR #1560 P0-2）。success / failure / timeout の全経路で private directory を `finally` で cleanup し、cleanup 失敗自体も `cleanup_failed` として transaction failure に変換する（P1-3）。`SCOPE_ROLLUP_RUN_RESULT_V1` JSON のみを stdout へ返す（永続 artifact は残さない）
+- **safety boundary**: canonical root cwd・default branch・trusted repo（`squne121/loop-protocol`）を実行前後で拘束。`gh` は固定 trusted search dirs（`/usr/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, `/bin`）から解決し、realpath・owner 権限・ancestor directory の world/group-writable 状態（sticky bit なし）まで検証する（PATH shadowing 対策、P1-1）。`GH_HOST` / `GH_REPO` / `GH_FORCE_TTY` / `GH_PAGER` / `PAGER` / `GH_CONFIG_DIR` / `GH_DEBUG` / `GH_PATH` / `GH_PROMPT_DISABLED` は sanitize（呼び出し元環境から継承しない）
+- raw `gh issue view / list` / `gh pr list` の shell redirect（`gh ... > /tmp/...`）は引き続き `local_main_branch_guard` の compound/metachar 判定で block される。`scope_rollup.run` の exact invocation だけが許可レーンであり、redirect の部分許可は導入していない
+- pagination は Issue / Pull Request の各 connection を GraphQL cursor で取得し、各 page の top-level `errors` 不在、`nodes` の schema・node ID / number の一意性、`hasNextPage` の bool、次 page の non-empty / progress する cursor、terminal `hasNextPage: false`、server `totalCount == unique item_count` を満たした場合だけ planner へ渡す。partial response、malformed connection、null / duplicate node、cursor stalled、count mismatch は stable reason code で transaction 全体を fail-close する。manifest `query_schema_version: 3` の `page_count` は算出値ではなく成功応答として実際に処理した page 数であり、`pagination_complete: true`、`total_count`、canonical normalized DTO の sha256 とともに marker/parser の必須 producer/consumer contract である。scope-rollup-runner marker は 明示的な `marker_schema_version: 3` を常に stamp し、parser (`parse_scope_rollup_run_result.py`) は `marker_schema_version == 3` を宣言するマーカーに対して `inputs` の内容に関わらず完全性契約を 必須とする（PR #1643 review: `inputs.query_schema_version` の有無だけを legacy 判定に使うと、その 1 キーだけを削除した v3 producer 由来のマーカーを legacy v2 と誤認して受理してしまう silent downgrade を許してしまうため）。`marker_schema_version` フィールド自体が存在しない pre-#1593 の legacy v2 マーカーは、Issue #1593 AC6 の要求通り引き続き受理される
+- transaction-wide pagination budget は Issue page、Pull Request page、nested PR files page を合算し、monotonic deadline、最大 page 数、最大 response byte 数、最大 inventory item 数を共通で enforce する。いずれかの budget 超過時は partial inventory を planner に渡さず fail-close する。PR files connection の個別 `MAX_PR_FILE_PAGES` はこの共通 budget を置き換えない
+- PR の `files` connection は `files(first: 100)` に固定されるため、`changedFiles` がフェッチ済み `files` 件数を上回る PR については `gh api graphql` でその PR の files connection のみを `hasNextPage` が false になるまで cursor pagination し、完走できなければ `pr_files_pagination_incomplete` として fail-close する（101 件目以降のファイルで overlap を見逃す false negative の防止、P0-3）
+- linked issue worktree context では、`is_local_root_context()` の context routing が classifier より先に評価されるため、`scope_rollup.run` classifier 自体には到達しない（`linked_issue_worktree_context` / `not_local_root` が先に allow を返す）
+- **既知の follow-up（本 fix_delta ではスコープ外）**: `skill_runtime_exec.py` を単一 registry SSOT として `scope_rollup.run` を統合すること（P1-5）。この executor は元々 `skill_runtime_exec.py` の Allowed Paths 外として独立レーンに設計されており（上記参照）、統合には `skill_runtime_exec.py`（直近で 500 行超の別 PR 変更が入ったばかり）への大規模な変更と Allowed Paths のさらなる拡張が必要になるため、本 PR のスコープには含めない。
+
+## 12d. verified fast-forward merge lane（検証済み fast-forward merge レーン, Issue #1589）
+
+`scripts/agent-guards/git_mutation_command_policy.py` の `classify_rtk_git_mutation` は、`ALLOWED_RTK_GIT_SUBCOMMANDS` に `merge` を追加し、exact `rtk git merge --ff-only <40-hex-target-sha>` を独立の command class（`COMMAND_CLASS_RTK_GIT_MERGE_FF_ONLY` = `rtk_git_merge_ff_only`）として認識する。linked issue worktree の active branch を live-verified remote head へ安全に fast-forward するための lane であり、`execute_initial_branch_create_transaction`（Issue #1449 / PR #1479）と同じ「単一 trusted execution boundary が verify・probe・実際の mutation・postcondition-readback を全て内包し、呼び出し元の raw command は常に deny として返す」設計パターンを踏襲する。
+
+### trusted transaction の内容
+
+`execute_verified_ff_merge_transaction(cwd, target_sha)` は、以下を **全て** 満たす場合のみ `git merge --ff-only <target_sha>`（argv list、`shell=False`）を実行する。いずれか一つでも欠ければ merge は一切実行されない（`git merge` 呼び出し前に fail-closed で deny）。
+
+1. `target_sha` が exact lowercase 40-hex SHA である。
+2. attached HEAD が非 detached であり、`DEFAULT_BRANCH_NAMES`（main/master/trunk + `origin/HEAD` 解決値 + `LOOP_DEFAULT_BRANCH`）に含まれない、かつ `_ISSUE_WORKTREE_BRANCH_RE`（`worktree-issue-<N>-<slug>` の canonical 命名形状、`docs/dev/workflow.md#Worktree 配置規約` 準拠）に一致する。
+3. `git status --porcelain=v1 --ignore-submodules=none` が空（tracked/untracked/submodule すべて clean）であり、`MERGE_HEAD` / `CHERRY_PICK_HEAD` / `REVERT_HEAD` / `BISECT_LOG` / `rebase-merge` / `rebase-apply` のいずれも存在しない(進行中の git operation なし)。
+4. `origin` の全 push URL が `LOOP_CANONICAL_REPO_URL_PATTERN`（既定は `squne121/loop-protocol` の GitHub canonical URL）に一致する。
+5. 対象 active branch に対する live `git ls-remote --refs --exit-code origin refs/heads/<active-branch>` の結果が `target_sha` と完全一致する（`absent` / `probe_error` / mismatch はいずれも deny — `classify_remote_branch_state` の 3-state 語彙をそのまま使用）。
+6. `target_sha` が local commit object であり（`git cat-file -t`）、local HEAD がその ancestor である（`git merge-base --is-ancestor`）。
+7. merge 実行の直前に branch/HEAD が変化していないことを再確認する（verify-to-merge race window を狭める。ゼロにはしない）。
+
+merge 実行後は、active branch 不変・`HEAD == target_sha`・`git status` clean・operation residue なしを無条件に確認する。`post-merge` hook が working tree を変更した場合（clean でなくなる）は `postcondition_violation` として **成功扱いにしない**。`git merge --ff-only` 自体が非ゼロ終了した場合は `merge_rejected_non_fast_forward` として区別する。
+
+### exact allow 条件（旧設計。Issue #1609 fix_delta により下記のとおり変更済み）
+
+`classify_rtk_git_mutation` は、上記 transaction の実行結果に関わらず（成功・拒否・precondition failure のいずれでも）常に `status: "deny"` を返す。transaction の outcome（`verified_ff_merge_completed` / `merge_ff_only_rejected` / `postcondition_check_failed` / 各種 precondition deny 理由）は `reason_code` にそのまま格納され、呼び出し元の raw `rtk git merge` コマンドが別途再実行されることはない。shape が exact 2-token `--ff-only <40-hex-sha>` でない場合（短縮/非hex SHA、flag 順序変更、追加 option、`--no-ff`、bare branch name 等）は transaction を呼び出す前に `merge_shape_requires_exact_ff_only_sha` で deny する。
+
+### Codex allow rule（Codex 許可ルール。旧設計。Issue #1609 fix_delta により下記のとおり変更済み）
+
+`.codex/rules/default.rules` は exact `rtk git merge --ff-only` prefix のみを、既存の generic `rtk git merge`（`--ff-only` を伴わない形状は引き続き prompt）バケットより前に allow として追加する。Codex 側での不要な人間確認を避けるためであり、実際の安全性強制は引き続き `git_mutation_command_policy.py` の trusted transaction が担う。
+
+### deny 境界
+
+- root checkout（default branch）・非 issue-worktree 命名の branch・detached HEAD はいずれも `git merge` 呼び出し前に deny される（`local_main_branch_guard.py` / Codex 両 flavor で回帰確認済み）。
+- `git reset --hard` / `rtk git push --force ...` 等の既存 destructive command deny は本 lane 追加後も維持される。
+- raw `git merge`（`rtk` prefix なし）は本 policy の対象外（`classify_rtk_git_mutation` は `no_match` を返し、他レイヤーの一般的な mutating command 判定に委ねる）。
+- `.claude/worktrees/issue-1589-linked-issue-worktree-verified-fast-forw` の worktree_scope_guard 統合は、既存の `classify_rtk_git_mutation` 汎用ディスパッチ（resolved active Issue の clean linked worktree にのみ command class を通す既存経路）をそのまま利用し、本 Issue で `worktree_scope_guard.py` 自体の分岐追加は不要だった（既存 230 テスト回帰確認済み）。
+
+
+
+### Issue #1609 fix_delta（P0 / P1 / P2 追加修正）
+
+OWNER の敵対的レビュー（PR #1609）により、上記の初回実装には authorization より先に merge が実行される P0 Blocker と、複数の P1 Blocker が指摘され、以下のとおり修正した。
+
+- P0 Blocker: `classify_rtk_git_mutation` の merge レーン（`_classify_rtk_git_merge`）は、副作用のない PURE shape classifier に戻した（exact shape なら `status: allow` を `target_sha` 付きで返すのみで、`execute_verified_ff_merge_transaction` は一切呼び出さない）。実際の transaction 実行は `.claude/hooks/worktree_scope_guard.py` の `_decide_rtk_git_merge` が、active Issue 解決済み・matching worktree が一意・`cwd == expected worktree`・当該 worktree が linked worktree（root checkout でない）の全てを認可した後にのみ行う。
+- P1 Blocker: `execute_verified_ff_merge_transaction` は `expected_worktree_realpath` / `active_issue_number` を必須キーワード引数として受け取り、cwd がその realpath と一致すること、当該 worktree が linked worktree であること（`git rev-parse --git-dir` が `--git-common-dir` と異なること）、branch 名に埋め込まれた Issue 番号が `active_issue_number` と一致することを、呼び出し元の申告を信用せず自ら再検証する。
+- P1 Blocker: operation residue（`MERGE_HEAD` / `CHERRY_PICK_HEAD` / `REVERT_HEAD` / `BISECT_LOG` / `rebase-merge` / `rebase-apply`）は `git rev-parse --git-path` で対象名ごとに per-worktree の GIT_DIR 配下を解決してから検査する（旧実装の `--git-common-dir` 解決は linked worktree では誤ったディレクトリを見ていた）。
+- P1 Blocker: canonical remote 検証は `git remote get-url origin`（push url でなく fetch url）を単一解決し、その同じ URL を `classify_remote_branch_state` の live probe にも使う。push url だけ canonical にして fetch url を別リポジトリに向ける迂回を防ぐ。
+- P1 Blocker: `git merge` 実行中の `OSError` / `TimeoutExpired` は無条件 deny に畳み込まず、`execution_not_started`（spawn 前の OSError）・`transport_error_but_merged_and_verified`・`transport_error_no_merge_observed`・`transport_error_state_ambiguous` の 4 状態に分類する。timeout 後も無条件で postcondition readback（branch/HEAD/clean/operation residue）を行ってから分類する。
+- P2: `_SHA_RE` 照合は小文字化前の raw 入力に対して行い、uppercase SHA は shape 不一致として deny する。
+- Codex allow rule: exact `rtk git merge --ff-only` prefix を allow にする design は、Codex execpolicy がマッチした全 rule のうち最も厳しい decision（forbidden 優先 prompt 優先 allow の順）を採用するため、既存の generic `rtk git merge` prompt rule にも一致してしまい exact shape が prompt のまま解決されるバグがあった。現在は専用 executor `scripts/agent-ops/verified_ff_merge_exec.py` の exact invocation shape（`uv run --locked --no-sync python3 scripts/agent-ops/verified_ff_merge_exec.py --target-sha SHA`）のみを allow とし、`rtk git merge`（`--ff-only` の有無を問わず）は引き続き prompt のままにしている。この executor は Codex 環境向けの独立した authorization（`LOOP_ISSUE_NUMBER` からの active Issue 解決・cwd の branch 形状照合）を行ってから `execute_verified_ff_merge_transaction` を呼び出す。
+
+
+---
+
+---
+
+## 12e. default-branch fast-forward sync lane（既定ブランチ fast-forward 同期レーン, Issue #1603）
+
+`scripts/agent-guards/git_mutation_command_policy.py` の `classify_rtk_git_mutation` は、12d 節の `COMMAND_CLASS_RTK_GIT_MERGE_FF_ONLY`（Issue #1589）とは別の command class `COMMAND_CLASS_RTK_GIT_MERGE_DEFAULT_BRANCH_FF_ONLY`（`rtk_git_merge_default_branch_ff_only`）として、exact `rtk git merge --ff-only origin/<candidate>` を認識する。target identity が異なる: #1589 は active branch 自身の live remote head（呼び出し元が渡す 40-hex SHA）を検証するのに対し、本レーンは canonical default branch の LIVE identity を `git ls-remote --symref` で検証し、object-only fetch してから merge する。同一の trusted execution boundary パターン（verify・probe・実際の mutation・postcondition-readback を全て内包し、呼び出し元の raw command は常に deny として返す）を踏襲する。
+
+### trusted transaction の内容
+
+`execute_verified_default_branch_ff_merge_transaction(cwd, candidate_default_branch)` は、以下を **全て** 満たす場合のみ `git merge --ff-only <live-oid>`（argv list、`shell=False`）を実行する。いずれか一つでも欠ければ merge は一切実行されない。
+
+1. `cwd` が `expected_worktree_realpath` と同一 realpath であり、LINKED worktree（root checkout でない）である。
+2. `candidate_default_branch` が `git check-ref-format --branch` と形状 regex の両方を満たす。
+3. attached HEAD が `DEFAULT_BRANCH_NAMES` に含まれない、かつ `_ISSUE_WORKTREE_BRANCH_RE`（`worktree-issue-<N>-<slug>`）に一致し、`<N>` が `active_issue_number` と一致する。
+4. worktree/index/submodule が clean であり、進行中の git operation がない。
+5. `origin` の解決済み FETCH url が canonical repository identity に一致する（同じ url を以下の probe / fetch に使う）。
+6. live 識別 probe #1: `git ls-remote --symref --exit-code <fetch-url> HEAD refs/heads/<candidate>` を実行し、`HEAD` が exact `ref: refs/heads/<candidate>` を返し、`HEAD` と `refs/heads/<candidate>` の OID が一致する一意な小文字 40-hex SHA であることを確認する（`origin/HEAD` のローカルキャッシュや `LOOP_DEFAULT_BRANCH` は認可根拠にしない）。
+7. object-only, destination-less な `git fetch <fetch-url> <live-oid>` を実行する（ローカル ref は一切更新しない）。
+8. live 識別 probe #2（#6 の再実行）で default branch identity と OID が fetch 前後で不変であることを確認する。
+9. fetch した OID が local commit object であり、local HEAD がその ancestor である。
+10. merge 実行の直前に branch/HEAD が変化していないことを再確認する。
+
+merge 実行後は、active branch 不変・`HEAD == live-oid`・`git status` clean・operation residue なしを無条件に確認する。`postcondition_violation` / `merge_rejected_non_fast_forward` / timeout 分類（`execution_not_started` / `transport_error_but_merged_and_verified` / `transport_error_no_merge_observed` / `transport_error_state_ambiguous`）は 12d 節の `execute_verified_ff_merge_transaction` と同じ語彙・分類方針を踏襲する。
+
+### classify_rtk_git_mutation の振り分け（routing）
+
+`classify_rtk_git_mutation` の `merge` 分岐は、shape が exact 2-token `--ff-only origin/<branch-name-shaped-token>` の場合のみ `_classify_rtk_git_merge_default_branch`（PURE shape classifier、副作用なし）へルーティングし、それ以外（40-hex SHA を含む既存の 12d 節の形状等）は従来どおり `_classify_rtk_git_merge` へルーティングする。トランザクションの実行認可は `.claude/hooks/worktree_scope_guard.py` の `_decide_rtk_git_merge_default_branch`（`_decide_rtk_git_merge` と同じ authorize-before-execute パターン）が、active Issue 解決済み・matching worktree が一意・`cwd == expected worktree`・当該 worktree が linked worktree であることを認可した後にのみ行う。
+
+### Codex allow rule（Codex 許可ルール）
+
+`.codex/rules/default.rules` は、専用 executor `scripts/agent-ops/verified_default_branch_ff_merge_exec.py` の exact invocation shape（`uv run --locked --no-sync python3 scripts/agent-ops/verified_default_branch_ff_merge_exec.py --candidate-branch NAME`）のみを allow とし、`rtk git merge --ff-only origin/<candidate>`（12d 節と同じ execpolicy most-severe-decision-wins の理由により）は引き続き既存の generic `rtk git merge` prompt rule に委ねる。この executor は `LOOP_ISSUE_NUMBER` からの active Issue 解決・cwd の branch 形状照合という独立した authorization を行ってから `execute_verified_default_branch_ff_merge_transaction` を呼び出す。
+
+### deny 境界
+
+- root checkout（default branch）・非 issue-worktree 命名の branch・detached HEAD はいずれも `git merge` 呼び出し前に deny される。
+- default branch 以外の ref、short SHA、`--flag=value`、flag 順序変更、追加 option、wrapper、raw git、dirty state、live/fetch mismatch、non-fast-forward、probe/fetch error、検証後の branch/HEAD change はいずれも merge 前に fail-closed で拒否される。
+- 人間による一時回避は、人間が clean state と live remote SHA を確認した上で linked worktree から通常の `git merge --ff-only origin/main` を行うことに限定される。guard/hook の無効化、force push、reset、stash、root checkout 操作は回避策に含めない。
+- raw `git merge`（`rtk` prefix なし）は本 policy の対象外（`classify_rtk_git_mutation` は `no_match` を返す）。
+- Issue #1589 の active branch remote-head lane（12d 節）とは独立した command class・独立したトランザクションであり、一方の contract を他方の contract で置換しない（#1603 の Scope Collision Preflight で確認済み）。
+
+### Issue #1603 iteration-2 追加修正（OWNER 敵対的レビュー、permission/sandbox boundary 観点）
+
+OWNER の敵対的レビュー（PR #1634 iteration 2）により、初回実装には以下の permission/sandbox boundary 上の指摘があり、以下のとおり修正した。
+
+- **P1-1（Codex executor の cwd binding）**: `verified_default_branch_ff_merge_exec.py` は、`cwd` を自明に `expected_worktree_realpath` として渡す恒真条件ではなく、リポジトリ共有 SSOT `scripts/agent-ops/worktree_catalog.py` の `select_issue_worktrees()` を使って、`git worktree list --porcelain -z` の実 catalog から対象 Issue に一致する linked worktree が一件だけであること・その realpath が `cwd` と一致することを検証する。0 件（`zero_matching_worktrees`）・複数件（`multiple_matching_worktrees`）・root checkout（`expected_worktree_is_root_checkout`）・cwd 不一致（`cwd_not_expected_worktree`）はそれぞれ別 reason code で拒否する。
+- **P1-2（trusted Git execution context）**: `_establish_trusted_git_context()` が、`GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` / `GIT_OBJECT_DIRECTORY` / `GIT_ALTERNATE_OBJECT_DIRECTORIES` / `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*` を取り除いた sanitized 環境と、一度だけ解決した絶対パスの `git` バイナリを使い、`--show-toplevel` / `--git-dir` / `--git-common-dir` を再解決する。`refs/replace/*` が存在する場合、または legacy `info/grafts` ファイルが非空の場合は fail-closed で deny する（`replace_refs_present` / `legacy_grafts_present`）。この trusted context の確立は、branch/clean/operation-state チェックより **前** に行う（replace-ref はそれらの読み取り結果を透過的に書き換えうるため）。live probe（`git ls-remote`）・fetch・ancestry（`git merge-base --is-ancestor`）・local-commit-object 確認（`git cat-file -t`）・merge 実行は、全てこの trusted context 経由で実行され、`--no-replace-objects` を付与する。
+- **P1-3（object-only fetch の副作用境界）**: fetch は `git --no-replace-objects fetch --no-tags --no-recurse-submodules --no-write-fetch-head --no-auto-maintenance --no-write-commit-graph <fetch-url> <live-oid>` に変更し、FETCH_HEAD 書き込み・submodule recursion・auto maintenance・commit-graph 書き込みを明示的に無効化する。fetch の失敗/timeout は `fetch_execution_not_started`（spawn 前の OSError）・`fetch_failed_object_not_observed` / `fetch_failed_object_observed`（clean non-zero exit、fetch 対象 object のローカル存在有無で区別）・`fetch_state_ambiguous`（timeout、exit 意味論を信用できないため常に ambiguous 扱い）に分類する。object database / pack file への書き込みそのものは fetch の不可避な副作用であり、本 transaction が制御する範囲外である（PR の Safety Claim Matrix `Not controlled` 列に明記）。
+- **P1-4（非零 merge exit の postcondition 分類）**: `git merge --ff-only` が非零終了した場合、無条件に `merge_rejected_non_fast_forward` とせず、実際の branch/HEAD/clean/operation state を読み直してから分類する。読み直した状態が live target OID と一致すれば `execution_error_but_merged_and_verified`（merge は実際には成功していた）、元の local head のまま unchanged であれば通常の reject（`merge_execution_error_no_merge_observed`）、どちらにも一致しなければ `execution_error_state_ambiguous`（merge 中に別プロセスが branch/HEAD を動かした可能性等）に分類する。
+- **P1-High-5（per-worktree execution lock）**: `_WorktreeExecutionLock`（`fcntl.flock`、exclusive・non-blocking・bounded retry）が、trusted context 確立から postcondition readback までの transaction 全区間を、`git rev-parse --git-path loop-default-branch-ff.lock` で解決した worktree 専用 lock file 上で保持する。同一 worktree に対する同時実行は `worktree_execution_lock_contended` で拒否される（`git worktree lock` は prune/move 用であり transaction mutex ではないため別の仕組みとして実装した）。
+- **P2-6（正当な hierarchical default branch 名の許可）**: 候補 branch 名の shape チェックは `^(?!-)(?!.*\.\.)[!-~]+$`（非空・空白/制御文字なし・先頭 `-` 不可・`..` を含まない）という permissive な pre-filter に変更し、`release/2026` のような `/` を含む正当な branch や 64 文字超の branch を拒否しない。文法上の唯一の authority は引き続き `git check-ref-format --branch`（trusted transaction 内で実行）であり、classifier 側のこの pre-filter は shape の粗い事前チェックに過ぎない。
+- **P2-7（Codex prefix rule の限界と executor 側 exact 検証）**: `.codex/rules/default.rules` の `verified_default_branch_ff_merge_exec.py` allow rule は PREFIX rule であり、Codex execpolicy には exact-shape / no-trailing-token の primitive がないため、duplicate `--candidate-branch` flag・`--flag=value` form・追加 positional・trailing token も prefix 一致自体は成立しうる。実際の enforcement は executor 自身の `_validate_exact_invocation_argv()`（exact `["--candidate-branch", <value>]` の 2-token 検証、argparse 実行前に行う）であり、rule の justification もこの分担を明記するよう修正した。
+- **P2-8（live probe の OID 厳密性）**: `_probe_default_branch_identity()` は、`ls-remote --symref` の各行の OID を lowercase に正規化する前に、raw 値のまま `_SHA_RE`（lowercase 40-hex のみ）で検証する（uppercase は REJECT、silent normalize しない）。また `HEAD` / `refs/heads/<candidate>` それぞれについて OID 行が厳密に一件であることを要求し、同一 ref に対する複数行（重複行）は `malformed_output` として fail-closed にする。
+
+### 実行環境ガード（本節の対象外）
+
+`worktree_scope_guard.py`（Claude Code hook）は、既存の `resolve_expected_worktree()`（`scripts/agent-ops/worktree_catalog.py` SSOT を使用）で active Issue worktree を authorize してから `execute_verified_default_branch_ff_merge_transaction` を呼び出しており、本節の P1-1 は Codex executor 独自の authorization 経路（Claude hook を経由しない）にのみ適用される修正である。
+
+## 12. publish lane authorization trust root（歴史的経緯・historical note）
 
 Issue #1454（Phase A, PR #1457 MERGED）で `scripts/trust-root` 一式（`trusted_hook_launcher.py` / `manifest_schema.py` / `install_trust_root.sh`）が external trust root として導入されたが、これを `.codex/hooks.json` へ実際に配線する Issue #1450（Phase B）と、追加ハードニングを扱う Issue #1468 がいずれも個人開発の脅威モデルに対して過剰と判断され not planned でクローズされた。配線先を失った `scripts/trust-root` は不使用コードとなったため、Issue #1469 でコード一式・CI 登録・本節の bootstrap/rotation/managed hook registration 手順を削除した。現行の publish lane 保護は Issue #1408（PR #1442 MERGED、Issue branch 限定 push 許可・force/tag/delete/mirror 拒否）と main branch protection（Issue #360）のみで構成される。

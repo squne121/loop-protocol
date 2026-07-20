@@ -10,9 +10,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.util
-import os
+import json
 import re
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -33,7 +32,17 @@ REQUIRED_FIELDS_BASE = {
     "generated_at",
     "script_blob_sha256",
 }
-REQUIRE_RESULT_FIELDS = {"raw_plan_location", "result_sha256"}
+REQUIRE_RESULT_FIELDS = {"raw_plan_location", "result_sha256", "payload"}
+COMPLETENESS_FIELDS = {"page_count", "item_count", "total_count", "pagination_complete", "sha256"}
+BUDGET_FIELDS = {
+    "page_count",
+    "response_bytes",
+    "inventory_items",
+    "max_transaction_pages",
+    "max_response_bytes",
+    "max_inventory_items",
+    "deadline_seconds",
+}
 
 FENCED_YAML_RE = re.compile(r"```ya?ml[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
@@ -143,45 +152,42 @@ def _load_capture_sidecar(path: Path) -> dict[str, Any] | None:
     return capture if isinstance(capture, dict) else None
 
 
-def _validate_tmp_raw_plan_path(
-    raw_plan_path: Path,
-    invocation_id: str,
-) -> tuple[bool, str]:
-    if not raw_plan_path.is_absolute():
-        return False, "raw_plan_location_invalid"
+def _compute_payload_sha256(payload: dict[str, Any]) -> str:
+    """Same canonicalization as plan_issue_scope_rollup.py /
+    verify_scope_rollup_result.py: json.dumps(ensure_ascii=False,
+    sort_keys=True, separators=(",", ":")).encode("utf-8")."""
+    canonical_bytes = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical_bytes).hexdigest()
 
-    if any(part == ".." for part in raw_plan_path.parts):
-        return False, "raw_plan_location_invalid"
 
-    temp_root = Path(tempfile.gettempdir()).resolve()
-    raw_plan_path_text = str(raw_plan_path)
-    if not raw_plan_path_text.startswith(str(temp_root) + os.sep):
-        return False, "raw_plan_location_invalid"
-
-    if invocation_id not in raw_plan_path.name and invocation_id not in raw_plan_path_text:
-        return False, "raw_plan_location_invalid"
-
-    try:
-        if raw_plan_path.is_symlink():
-            return False, "raw_plan_location_invalid"
-        for parent in raw_plan_path.parents:
-            if parent.is_symlink():
-                return False, "raw_plan_location_invalid"
-    except OSError:
-        return False, "raw_plan_location_invalid"
-
-    try:
-        resolved_path = raw_plan_path.resolve()
-    except OSError:
-        return False, "raw_plan_location_invalid"
-
-    if not resolved_path.exists() or not resolved_path.is_file():
-        return False, "result_missing"
-
-    if not str(resolved_path).startswith(str(temp_root) + os.sep):
-        return False, "raw_plan_location_invalid"
-
-    return True, ""
+def _has_valid_completeness_contract(inputs: Any) -> bool:
+    if not isinstance(inputs, dict) or inputs.get("query_schema_version") != 3:
+        return False
+    for key in ("issues_completeness", "pull_requests_completeness"):
+        block = inputs.get(key)
+        if not isinstance(block, dict) or not COMPLETENESS_FIELDS.issubset(block):
+            return False
+        if (
+            not isinstance(block["page_count"], int)
+            or block["page_count"] < 1
+            or not isinstance(block["item_count"], int)
+            or block["item_count"] < 0
+            or not isinstance(block["total_count"], int)
+            or block["total_count"] != block["item_count"]
+            or block["pagination_complete"] is not True
+            or not isinstance(block["sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", block["sha256"])
+        ):
+            return False
+    budget = inputs.get("transaction_budget")
+    if not isinstance(budget, dict) or not BUDGET_FIELDS.issubset(budget):
+        return False
+    return all(isinstance(budget[key], (int, float)) and not isinstance(budget[key], bool) for key in BUDGET_FIELDS)
 
 
 def _validate_marker_payload(
@@ -239,6 +245,46 @@ def _validate_marker_payload(
     if status in {"failed", "runner_unavailable"}:
         return status, None, None, False
 
+    inputs = marker_payload.get("inputs")
+    if inputs is not None and not isinstance(inputs, dict):
+        return "rejected", "scope_rollup_marker_malformed", "inventory_completeness_contract_invalid", False
+
+    # PR #1643 review (P0-3): the completeness gate below used to trigger
+    # only when "query_schema_version" happened to still be present inside
+    # ``inputs`` -- a marker that stripped just that one key (while leaving
+    # the other v3 completeness/budget fields, or nothing at all) was
+    # silently accepted as a "legacy v2" marker even though it came from the
+    # *current* v3-speaking runner. That is exactly the silent-downgrade
+    # this contract must never permit.
+    #
+    # The current runner (``.claude/agents/scope-rollup-runner.md``) always
+    # stamps an explicit ``marker_schema_version: 3`` on every marker it
+    # emits. That field -- not "does inputs still happen to contain
+    # query_schema_version" -- is now the authoritative version
+    # discriminator:
+    #   marker_schema_version == 3  -> full v3 completeness contract is
+    #                                  mandatory, regardless of what
+    #                                  ``inputs`` does or does not contain.
+    #   marker_schema_version == 2  -> explicit legacy marker; no
+    #                                  completeness contract required.
+    #   marker_schema_version absent -> a genuine pre-#1593 legacy marker
+    #                                  (minted before this field existed).
+    #                                  Preserve the original permissive
+    #                                  behavior for these so historical/AC6
+    #                                  legacy-v2 acceptance is not broken.
+    #   any other value            -> unsupported/malformed.
+    marker_schema_version = marker_payload.get("marker_schema_version")
+    if marker_schema_version is not None:
+        if marker_schema_version == 3:
+            if not (isinstance(inputs, dict) and _has_valid_completeness_contract(inputs)):
+                return "rejected", "scope_rollup_marker_malformed", "inventory_completeness_contract_invalid", False
+        elif marker_schema_version == 2:
+            pass
+        else:
+            return "rejected", "scope_rollup_marker_malformed", "marker_schema_version_unsupported", False
+    elif isinstance(inputs, dict) and "query_schema_version" in inputs and not _has_valid_completeness_contract(inputs):
+        return "rejected", "scope_rollup_marker_malformed", "inventory_completeness_contract_invalid", False
+
     result_block = marker_payload.get("result")
     if not isinstance(result_block, dict):
         return "marker_malformed", "scope_rollup_marker_malformed", "marker_malformed", False
@@ -249,18 +295,30 @@ def _validate_marker_payload(
     if result_block.get("verify_status") != "verified":
         return "rejected", "scope_rollup_marker_malformed", "verify_status_not_verified", False
 
-    raw_plan_path = Path(str(result_block.get("raw_plan_location", "")))
-    valid_path, path_reject_reason = _validate_tmp_raw_plan_path(
-        raw_plan_path=raw_plan_path,
-        invocation_id=str(expected_invocation_id),
-    )
-    if not valid_path:
-        if path_reject_reason == "":
-            return "rejected", "scope_rollup_marker_malformed", "raw_plan_location_invalid", False
-        return "rejected", "scope_rollup_marker_malformed", path_reject_reason, False
+    # Issue #1547 fix_delta (P0-1): raw_plan_location is fixed to null --
+    # the executor's private invocation directory is cleaned up on every
+    # exit path, so no persisted file location can ever exist. A non-null
+    # value now indicates a runner still speaking the old (broken) contract.
+    if result_block.get("raw_plan_location") is not None:
+        return "rejected", "scope_rollup_marker_malformed", "raw_plan_location_invalid", False
 
-    if _sha256_file(raw_plan_path) != str(result_block.get("result_sha256", "")):
+    payload = result_block.get("payload")
+    if not isinstance(payload, dict):
+        return "marker_malformed", "scope_rollup_marker_malformed", "marker_malformed", False
+
+    # result_sha256 means exactly one thing everywhere in this contract: the
+    # sha256 of the canonical JSON encoding of the plan payload (candidates +
+    # metadata, self_validation excluded) -- i.e. self_validation.payload_sha256
+    # as computed by plan_issue_scope_rollup.py. Recomputing it here from the
+    # embedded payload is a genuine cryptographic binding, not a
+    # self-report: a runner cannot fabricate verify_status: verified without
+    # also supplying a payload whose hash matches result_sha256.
+    if _compute_payload_sha256(payload) != str(result_block.get("result_sha256", "")):
         return "rejected", "scope_rollup_marker_malformed", "result_sha_mismatch", False
+
+    payload_schema_version = payload.get("schema_version")
+    if payload_schema_version != 2:
+        return "rejected", "scope_rollup_marker_malformed", "verify_status_not_verified", False
 
     capture_sidecar = _load_capture_sidecar(capture_sidecar_file)
     if capture_sidecar is None:
@@ -289,11 +347,23 @@ def _validate_marker_payload(
     if capture_sha != actual_capture_sha:
         return "rejected", "scope_rollup_marker_malformed", "capture_sha_mismatch", False
 
+    # Defense in depth: also run the shared in-memory verifier
+    # (verify_scope_rollup_result.verify_payload) against the embedded
+    # payload re-assembled with a self_validation block carrying the
+    # already-verified sha/schema fields, so schema_name/script_file_sha256
+    # (not covered by the result_sha256 check above) are cross-checked too.
     verifier = _load_issue_refinement_verifier()
     if verifier is None:
         return "rejected", "scope_rollup_marker_malformed", "verify_status_not_verified", False
 
-    _verify_output, verify_code = verifier.verify(str(raw_plan_path))
+    reconstructed = dict(payload)
+    reconstructed["self_validation"] = {
+        "schema_name": result_block.get("plan_schema_name") or result_block.get("plan_schema"),
+        "schema_version": payload_schema_version,
+        "payload_sha256": str(result_block.get("result_sha256", "")),
+        "script_file_sha256": expected_script_sha,
+    }
+    _verify_output, verify_code = verifier.verify_payload(reconstructed)
     if verify_code != 0:
         return "rejected", "scope_rollup_marker_malformed", "verify_status_not_verified", False
 

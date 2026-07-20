@@ -152,12 +152,28 @@ def test_parallel_exclude_overlapping_ignore_raises(tmp_path):
 
 
 def test_real_plan_serial_lane_has_debounce():
-    """After #1141, debounce test is deterministic; parallel_exclude is empty."""
+    """After #1141, debounce test is deterministic and stays in the parallel lane.
+
+    Issue 1546 AC3 added
+    scripts/agent-guards/tests/test_skill_runtime_exec_session_manifest.py to
+    parallel_exclude to remove a real xdist race: its repo-tree snapshot window can
+    be polluted by a concurrent worker running test_summarize_agent_transcript.py.
+    That is the only entry expected in the real plan; the debounce test itself must
+    NOT be excluded.
+    """
     plan = mod.load_plan(_PLAN_PATH)
     lane = mod.serial_lane_argv(plan)
-    assert lane == []
+    assert lane == [
+        "-n",
+        "0",
+        "scripts/agent-guards/tests/test_skill_runtime_exec_session_manifest.py",
+        "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py",
+        "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable",
+        "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths",
+    ]
     par = mod.run_argv(plan, mode="parallel")
     assert not any(a.startswith("--ignore=") and "session_manifest_debounce" in a for a in par)
+    assert "--ignore=scripts/agent-guards/tests/test_skill_runtime_exec_session_manifest.py" in par
 
 
 def test_real_plan_uses_fixed_worker_count():
@@ -309,6 +325,16 @@ def test_cli_fails_closed_on_bad_plan(tmp_path):
     bad.write_text("{}", encoding="utf-8")
     proc = _run_cli("--plan", str(bad), "--emit", "scope-argv")
     assert proc.returncode == 2
+
+
+def test_real_plan_includes_scope_rollup_graphql_pagination_v3_exactly_once():
+    """Issue #1644: tests/codex/test_scope_rollup_graphql_pagination_v3.py must be
+    registered in the python-test-plan SSOT exactly once (exact-one registration),
+    both in the raw targets list and in the derived scope argv."""
+    plan = mod.load_plan(_PLAN_PATH)
+    path = "tests/codex/test_scope_rollup_graphql_pagination_v3.py"
+    assert plan["targets"].count(path) == 1
+    assert mod.scope_argv(plan).count(path) == 1
 
 
 def test_real_plan_includes_pr_body_validator_exactly_once():

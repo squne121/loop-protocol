@@ -1,6 +1,7 @@
 ---
 id: session-recording-tool
 status: experimental
+summary_ja: "AI Agent session 記録ツールの pilot 導入手順書（人間向け安全な手順書 SSOT 文書）"
 related_issue: "#245"
 related_issues:
   - "#136"
@@ -16,15 +17,15 @@ created: "2026-05-24"
 導入作業のうち権限・secret・外部契約が必要な部分を明確に分離し、
 AI が実行できる準備作業と人間が判断しなければならない操作を区別する。
 
-## Codex CLI Hook Trust 補足
+## Codex CLI Hook Trust（信頼設定）補足
 
 - Codex repo-local hook の canonical config key は `[features].hooks`。旧 `codex_hooks` alias が残っていても、それを唯一の正本として説明しない。
 - `.codex/hooks.json` を validator が pass しても、runtime active hook state と trust state は別途 `/hooks` 等で確認する必要がある。
 - trusted project でない `.codex/` layer の hook は load されない。pilot で `--dangerously-bypass-hook-trust` を既定運用に組み込まない。
-- Codex session-recording manifest は `tmp/session-manifests/codex/**` の private/local artifact に閉じ、public comment や public checkpoint branch に転載しない。
+- Codex session-recording manifest は private/local artifact に閉じ、public comment や public checkpoint branch に転載しない。出力先は Issue #1546 で repository tree 内の `tmp/session-manifests/codex/**` から、canonical な per-user state root（`XDG_STATE_HOME`、既定 `$HOME/.local/state` 配下の `loop-protocol/session-manifests/v1/<repo_key>/codex/**`）へ移行した。レガシー repo-local root には新規 write されないが、既存 artifact の自動削除は行わない（手動 cleanup 対象）。
 - hook は diagnostic / prevention layer であり security boundary ではない。public-safe 判定の正本は post-run validator と posting guard に置く。
 
-## Current public surface boundary
+## Current public surface boundary（現在の公開範囲境界）
 
 - current live public posting では `agent_session_manifest/v1` の manifest 本文を Issue / PR comment に出さない。公開コメントでは `artifact_digest`、`artifact_url`、`schema_ref`、`validation_verdict` などの opaque ref のみ許可する。
 - `agent_run_report/v1` / `agent_retro_index/v1` は #935 schema/redaction validator と #937 exact marker upsert guard が merge されるまで dry-run 専用とし、conditional public comment としての live public posting は禁止する。#936 の lifecycle scripts もこの依存列に含まれる。
@@ -280,7 +281,7 @@ export MANIFEST_SKIP_PUSH=true
 pre-push-manifest --dry-run --no-push
 ```
 
-### 3.2 Private Checkpoint / Local-Only 設定
+### 3.2 Private Checkpoint / Local-Only 設定（非公開チェックポイント・ローカル限定の設定）
 
 記録データを private 環境に限定する。
 
@@ -319,7 +320,7 @@ test -f .gitignore && grep -q "^artifacts/" .gitignore
 # または手動追加が必要な場合は「手順4」参照
 ```
 
-### 3.3 Manual Review Required
+### 3.3 Manual Review Required（人間による手動レビュー必須）
 
 記録データの **公開・採用・push を人間が最終判断** する。
 
@@ -441,7 +442,7 @@ Session 記録ツールが security incident / secret leak を引き起こした
    # 出力: PRIVATE であること（public なら設定変更が必要）
    ```
 
-4. **Checkpoint branch 削除**
+4. **Checkpoint branch 削除**（チェックポイントブランチの削除手順）
    ```bash
    git branch -r | grep "entire/checkpoints"  # remote branch 確認
    git push origin --delete entire/checkpoints/v1 2>/dev/null || true
@@ -509,7 +510,7 @@ rm -f .claude/hooks/post-commit-manifest
 rm -f .claude/hooks/pre-push-manifest
 ```
 
-### Step 2: Checkpoint Branch 削除
+### Step 2: Checkpoint Branch 削除（手順2: チェックポイントブランチを削除する）
 
 ```bash
 # Remote branch を削除
@@ -524,7 +525,7 @@ git branch -r | grep -i checkpoint
 # 出力が空であること
 ```
 
-### Step 3: Hook / Manifest Script 削除
+### Step 3: Hook / Manifest Script 削除（手順3: Hook・Manifest スクリプトを削除する）
 
 ```bash
 # Hook ディレクトリをクリーンアップ
@@ -628,7 +629,7 @@ git commit -m "chore: session recording tool pilot 撤退 — hook 削除・mani
 
 ---
 
-## 7. Authoritative Producer 分類
+## 7. Authoritative Producer 分類（正当な生成者の分類）
 
 Session manifest が信頼できる出所（authoritative source）であるかどうかを判定するフレームワーク。
 
@@ -848,4 +849,4 @@ Public repo での pilot は full transcript 経路でリスクが高い。Priva
 
 **Last Updated**: 2026-05-24  
 **Status**: experimental (pilot 導入 SSOT)  
-**Maintained By**: Implementation team
+**Maintained By**: Implementation team（実装チームが本書を保守する）

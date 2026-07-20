@@ -310,3 +310,94 @@ def test_given_online_when_api_fetch_fails_then_falls_back_to_static_canonicaliz
     result = module._canonicalize_repo("SQUNE121/LOOP-PROTOCOL", online=True)
 
     assert result == "squne121/loop-protocol"
+
+
+# ------------------------------------------------------------
+# #1621 AC7: successor index compares (repository, issue_number) tuples --
+# cross-repository issue numbers must not be treated as local successors.
+# ------------------------------------------------------------
+
+
+def test_given_cross_repository_native_blocking_same_number_then_successor_not_injected() -> None:
+    """AC7: current の native blocking の repository が異なる場合、同一 issue
+    number を持つ別 repository の候補と誤って successor 結合しない。
+    """
+    import importlib.util
+    import sys as _sys
+
+    spec = importlib.util.spec_from_file_location(
+        "check_implementation_overlap_repo_binding_ac7", HELPER
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    _sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    current_raw = {
+        "blocking": [{"repository": "other-owner/other-repo", "number": 9730, "state": "OPEN"}],
+    }
+    index = module._current_native_successor_index(current_raw, DEFAULT_REPO)
+    assert index == frozenset()
+    assert (DEFAULT_REPO, 9730) not in index
+    assert ("other-owner/other-repo", 9730) not in index
+
+
+def test_given_same_repository_native_blocking_then_successor_injected() -> None:
+    """AC7 の対照ケース: repository が current と一致する場合は index に含まれる。"""
+    import importlib.util
+    import sys as _sys
+
+    spec = importlib.util.spec_from_file_location(
+        "check_implementation_overlap_repo_binding_ac7_positive", HELPER
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    _sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    current_raw = {
+        "blocking": [{"repository": DEFAULT_REPO, "number": 9731, "state": "OPEN"}],
+    }
+    index = module._current_native_successor_index(current_raw, DEFAULT_REPO)
+    assert index == frozenset({(DEFAULT_REPO, 9731)})
+
+
+def test_given_candidate_identity_repository_differs_from_current_then_offline_injection_is_repository_bound() -> None:
+    """#1621 AC7（PR #1637 レビュー P2 Conditional）: `--dry-run` オフライン
+    経路で、current の `--repo`（= current の repository identity）と異なる
+    repository に実際は属する candidate が、たまたま successor index と同じ
+    issue number を持っていても、injection の判定は
+    `(repository, issue_number)` タプルの完全一致で行われ、number だけの
+    一致では成立しないことを、`_current_native_successor_index()` の返り値を
+    直接 offline fixture 相当のシナリオで検証する（number-only frozenset に
+    潰していた旧実装はこの区別ができなかった）。
+    """
+    import importlib.util
+    import sys as _sys
+
+    spec = importlib.util.spec_from_file_location(
+        "check_implementation_overlap_repo_binding_ac7_candidate_identity", HELPER
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    _sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    # current（--repo で指定された repository）の native blocking に、同じ
+    # repository の #9732 が successor として記録されている。
+    current_raw = {
+        "blocking": [{"repository": DEFAULT_REPO, "number": 9732, "state": "OPEN"}],
+    }
+    index = module._current_native_successor_index(current_raw, DEFAULT_REPO)
+
+    # 「candidate identity（別 repository）」が異なる場合の誤結合防止:
+    # candidate 自身が別 repository（"someone-else/other-repo"）に属する
+    # ことが分かっている場合、同じ #9732 という番号だけでは injection 対象
+    # と判定してはならない。tuple membership はこれを正しく拒否する。
+    other_repo_candidate_identity = ("someone-else/other-repo", 9732)
+    assert other_repo_candidate_identity not in index
+
+    # 対して、current と同一 repository に属する candidate identity は
+    # injection 対象になる。
+    same_repo_candidate_identity = (DEFAULT_REPO, 9732)
+    assert same_repo_candidate_identity in index

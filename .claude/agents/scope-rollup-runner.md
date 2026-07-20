@@ -31,6 +31,7 @@ GitHub への書き込み / repo への書き込みは一切行わない。read-
 - `issue_number`（必須）: 対象 Issue 番号
 - `repo`（必須）: `owner/repo` 形式（例: `squne121/loop-protocol`）
 - `invocation_id`（必須）: 呼び出し元が生成した UUID または ISO8601+乱数（重複排除用）
+- `requested_at`（必須、Issue #1547 fix_delta）: 呼び出し元が生成した ISO8601 タイムスタンプ。`scope_rollup.run` exact executor にそのまま渡し、executor 側で新規生成しない（producer/consumer 契約統一。PR #1560 P0-1 対応）。
 
 ## 実行手順
 
@@ -72,77 +73,62 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   script_blob_sha256: "<unknown>"
 ```
 
-### 3. データ取得
+### 3. `scope_rollup.run` exact executor 実行（Issue #1547 対応の最終実装ステップ）
 
-以下のコマンドで一時ファイルにデータを保存する（`/tmp/` への書き込みのみ許可）:
-
-```bash
-# current_issue を取得
-gh issue view <issue_number> \
-  --repo <repo> \
-  --json number,title,body,labels,state,stateReason,url \
-  > /tmp/scope_rollup_current_issue_<invocation_id>.json
-
-# issues 全件を取得（--limit 1000 でデフォルト 30 件制限を回避）
-gh issue list \
-  --repo <repo> \
-  --state all \
-  --limit 1000 \
-  --json number,title,body,labels,state,stateReason,url \
-  > /tmp/scope_rollup_issues_all_<invocation_id>.json
-
-# PR 全件を取得
-gh pr list \
-  --repo <repo> \
-  --state all \
-  --limit 1000 \
-  --json number,title,body,labels,state,url,files,closingIssuesReferences \
-  > /tmp/scope_rollup_prs_all_<invocation_id>.json
-```
-
-`gh` コマンドが permission denied または network error で失敗した場合は即停止し、以下を返す:
-
-```yaml
-ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
-  status: runner_unavailable
-  schema_version: 1
-  repo: "<repo>"
-  current_issue: <issue_number>
-  error: "gh コマンド実行失敗（permission denied または network error）"
-  invocation_id: "<invocation_id>"
-  requested_at: "<ISO8601>"
-  generated_at: "<ISO8601>"
-  script_blob_sha256: "<SCRIPT_SHA or unknown>"
-```
-
-### 4. SHA256 計算
+GitHub read-only inventory 取得・pagination 完走判定・SHA256/count 計算・planner 呼び出し・result finalize を、shell redirect を一切使わず単一の Python transaction として実行する `scope_rollup.run` exact executor を呼び出す:
 
 ```bash
-# git head sha
-GIT_HEAD_SHA=$(git rev-parse HEAD)
-
-# inputs sha256（uv run python3 経由で計算 — 外部コマンド非依存）
-CURRENT_SHA=$(uv run python3 -c "import hashlib, sys; d=open(sys.argv[1],'rb').read(); print(hashlib.sha256(d).hexdigest())" /tmp/scope_rollup_current_issue_<invocation_id>.json)
-ISSUES_SHA=$(uv run python3 -c "import hashlib, sys; d=open(sys.argv[1],'rb').read(); print(hashlib.sha256(d).hexdigest())" /tmp/scope_rollup_issues_all_<invocation_id>.json)
-PRS_SHA=$(uv run python3 -c "import hashlib, sys; d=open(sys.argv[1],'rb').read(); print(hashlib.sha256(d).hexdigest())" /tmp/scope_rollup_prs_all_<invocation_id>.json)
-
-ISSUE_COUNT=$(uv run python3 -c "import json,sys; print(len(json.load(sys.stdin)))" < /tmp/scope_rollup_issues_all_<invocation_id>.json)
-PR_COUNT=$(uv run python3 -c "import json,sys; print(len(json.load(sys.stdin)))" < /tmp/scope_rollup_prs_all_<invocation_id>.json)
-```
-
-### 5. plan_issue_scope_rollup.py 実行
-
-```bash
-uv run python3 .claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rollup.py \
-  --issues-json /tmp/scope_rollup_issues_all_<invocation_id>.json \
-  --prs-json /tmp/scope_rollup_prs_all_<invocation_id>.json \
-  --current-issue <issue_number> \
+uv run python3 scripts/agent-guards/run_scope_rollup_preflight.py \
+  --issue-number <issue_number> \
   --repo <repo> \
   --invocation-id <invocation_id> \
-  > /tmp/scope_rollup_result_<invocation_id>.json 2>&1
+  --requested-at <requested_at>
 ```
 
-スクリプトが exit code 非 0 かつ 非 2 で失敗した場合（exit 2 は `partial` = current_issue 未発見の正常終了であり処理継続）:
+`<invocation_id>` / `<requested_at>` は入力で受け取った値をそのまま渡す（executor は独自に UUID / timestamp を生成しない。Issue #1547 fix_delta P0-1）。
+
+このコマンドは `local_main_branch_guard.py` / `skill_runtime_command_policy.py` に登録された exact command class（`scope_rollup.run`、12 トークン固定形状）としてのみ canonical root context で許可される。旧設計の `gh issue view/list` / `gh pr list` の raw shell redirect（`> /tmp/scope_rollup_*.json`）、`python -c` による SHA256 計算、`plan_issue_scope_rollup.py` の `> result.json 2>&1` は一切使用しない。
+
+実行結果は `SCOPE_ROLLUP_RUN_RESULT_V1` JSON として stdout に返る:
+
+```yaml
+SCOPE_ROLLUP_RUN_RESULT_V1:
+  status: ok | error
+  reason_code: null | "<code>"
+  manifest:
+    host: "github.com"
+    repo: "<repo>"
+    issue_number: <int>
+    invocation_id: "<呼び出し元が渡した invocation_id そのまま>"
+    requested_at: "<呼び出し元が渡した requested_at そのまま>"
+    gh_realpath: "<trusted gh binary realpath>"
+    gh_version: "<gh --version 出力先頭行>"
+    query_schema_version: 3
+    fetched_at: "<ISO8601>"
+    body_sha256: "<current issue view raw stdout の sha256>"
+    planner_script_sha256: "<plan_issue_scope_rollup.py の sha256>"
+    issues: {page_count: <実測 GraphQL page 数>, item_count: <int>, total_count: <int>, pagination_complete: true, sha256: "<canonical DTO sha256>"}
+    pull_requests: {page_count: <実測 GraphQL page 数>, item_count: <int>, total_count: <int>, pagination_complete: true, sha256: "<canonical DTO sha256>"}
+    budget: {page_count: <Issue/PR/nested files の合算>, response_bytes: <int>, inventory_items: <int>, max_transaction_pages: <int>, max_response_bytes: <int>, max_inventory_items: <int>, deadline_seconds: <number>}
+    truncated: false
+  current_issue: {number: <int>, title: "<str>", state: "<str>", url: "<str>"}
+  plan:
+    plan_schema_name: "ISSUE_SCOPE_ROLLUP_PLAN_V2"
+    plan_schema_version: 2
+    payload_sha256: "<self_validation.payload_sha256>"
+    verify_status: "verified"
+    candidate_count: <int>
+    high_confidence_count: <int>
+    completeness: "full | partial"
+    payload: { schema_version: 2, repo: "<repo>", generated_at: "<ISO8601>", source: "plan_issue_scope_rollup", body_sha256: "<sha256>", input: {...}, candidates: [...] }
+  errors: []
+```
+
+`plan.payload` は `self_validation` を除いた plan 全体（`candidates[]` を含む）をそのまま格納する。`plan.payload_sha256` は `plan.payload` の canonical JSON（`ensure_ascii=False, sort_keys=True, separators=(",", ":")`）の sha256 と一致する（Issue #1547 fix_delta P0-1: 候補詳細が executor 境界で消失しないようにするための変更）。
+
+executor はこの transaction 内で `plan_issue_scope_rollup.py`（planner）の stdout を bounded streaming で in-memory capture し、`verify_scope_rollup_result.py`（verifier）の `verify_payload()` を in-process で呼び出す（ファイルを介さない。Issue #1547 fix_delta P0-2）。`truncated: true`・`gh` nonzero・malformed JSON・timeout・verify 非 verified・PR files pagination 不完全（P0-3）・private directory cleanup 失敗（P1-3）のいずれかが発生した場合は `status: error` を返す（silent fallback 禁止）。
+
+`SCOPE_ROLLUP_RUN_RESULT_V1.status != ok` の場合は即停止し、以下を返す:
 
 ```yaml
 ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
@@ -150,39 +136,11 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   schema_version: 1
   repo: "<repo>"
   current_issue: <issue_number>
-  error: "plan_issue_scope_rollup.py 実行失敗（exit code 非 0 かつ 非 2）"
+  error: "scope_rollup.run executor が status: error を返した（reason_code: <reason_code>）"
   invocation_id: "<invocation_id>"
   requested_at: "<ISO8601>"
   generated_at: "<ISO8601>"
-  script_blob_sha256: "<SCRIPT_SHA>"
-```
-
-### 6. verify_scope_rollup_result.py による結果検証
-
-```bash
-uv run python3 .claude/skills/issue-refinement-loop/scripts/verify_scope_rollup_result.py \
-  --result-json /tmp/scope_rollup_result_<invocation_id>.json
-```
-
-`verify_scope_rollup_result.py` が exit 0（STATUS: verified）以外を返した場合は即停止し、以下を返す:
-
-```yaml
-ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
-  status: runner_unavailable
-  schema_version: 1
-  repo: "<repo>"
-  current_issue: <issue_number>
-  error: "verify_scope_rollup_result.py が verified 以外を返した"
-  invocation_id: "<invocation_id>"
-  requested_at: "<ISO8601>"
-  generated_at: "<ISO8601>"
-  script_blob_sha256: "<SCRIPT_SHA>"
-```
-
-### 7. result sha256 計算
-
-```bash
-RESULT_SHA=$(uv run python3 -c "import hashlib, sys; d=open(sys.argv[1],'rb').read(); print(hashlib.sha256(d).hexdigest())" /tmp/scope_rollup_result_<invocation_id>.json)
+  script_blob_sha256: "<manifest.planner_script_sha256 or unknown>"
 ```
 
 ### 8. ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 marker を stdout に出力
@@ -194,37 +152,54 @@ RESULT_SHA=$(uv run python3 -c "import hashlib, sys; d=open(sys.argv[1],'rb').re
 ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   status: ok
   schema_version: 1
+  marker_schema_version: 3  # Issue #1593 fix_delta (PR #1643 review P0-3): explicit, mandatory version
+                             # discriminator this runner always stamps. A marker carrying
+                             # marker_schema_version: 3 REQUIRES the full inputs.query_schema_version /
+                             # *_completeness / transaction_budget contract below -- consumers
+                             # (parse_scope_rollup_run_result.py) reject any marker_schema_version: 3
+                             # marker whose completeness contract is missing or invalid, even if
+                             # `inputs` itself was stripped entirely. This closes the silent-downgrade
+                             # gap where deleting only `inputs.query_schema_version` (while this
+                             # runner's OTHER v3 fields remained) used to be misclassified as a
+                             # pre-#1593 legacy v2 marker.
   repo: "<repo>"
   current_issue: <issue_number>
-  invocation_id: "<invocation_id>"
-  requested_at: "<ISO8601（呼び出し元が提供した場合）またはスクリプト実行直前の現在時刻>"
-  generated_at: "<ISO8601（スクリプト実行完了時刻）>"
+  invocation_id: "<入力で受け取った invocation_id そのまま（= SCOPE_ROLLUP_RUN_RESULT_V1.manifest.invocation_id と一致するはず）>"
+  requested_at: "<入力で受け取った requested_at そのまま（= SCOPE_ROLLUP_RUN_RESULT_V1.manifest.requested_at と一致するはず）>"
+  generated_at: "<SCOPE_ROLLUP_RUN_RESULT_V1.manifest.fetched_at>"
   git_head_sha: "<GIT_HEAD_SHA>"
-  script_path: ".claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rollup.py"
-  script_blob_sha256: "<SCRIPT_SHA>"  # 後方互換 alias（ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 既存キー）
+  script_path: "scripts/agent-guards/run_scope_rollup_preflight.py"
+  script_blob_sha256: "<SCOPE_ROLLUP_RUN_RESULT_V1.manifest.planner_script_sha256>"  # 後方互換 alias（ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 既存キー）
   inputs:
-    current_issue_sha256: "<CURRENT_SHA>"
-    issues_all_sha256: "<ISSUES_SHA>"
-    prs_all_sha256: "<PRS_SHA>"
-    issue_count: <ISSUE_COUNT>
-    pr_count: <PR_COUNT>
+    current_issue_sha256: "<SCOPE_ROLLUP_RUN_RESULT_V1.manifest.body_sha256>"
+    issues_all_sha256: "<SCOPE_ROLLUP_RUN_RESULT_V1.manifest.issues.sha256>"
+    prs_all_sha256: "<SCOPE_ROLLUP_RUN_RESULT_V1.manifest.pull_requests.sha256>"
+    issue_count: <SCOPE_ROLLUP_RUN_RESULT_V1.manifest.issues.item_count>
+    pr_count: <SCOPE_ROLLUP_RUN_RESULT_V1.manifest.pull_requests.item_count>
+    query_schema_version: 3
+    issues_completeness: <SCOPE_ROLLUP_RUN_RESULT_V1.manifest.issues をそのまま埋め込む>
+    pull_requests_completeness: <SCOPE_ROLLUP_RUN_RESULT_V1.manifest.pull_requests をそのまま埋め込む>
+    transaction_budget: <SCOPE_ROLLUP_RUN_RESULT_V1.manifest.budget をそのまま埋め込む>
   result:
     plan_schema: "ISSUE_SCOPE_ROLLUP_PLAN_V2"  # 後方互換 alias（ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 既存キー）
-    plan_schema_name: "ISSUE_SCOPE_ROLLUP_PLAN_V2"
-    plan_schema_version: 2
-    raw_plan_location: "/tmp/scope_rollup_result_<invocation_id>.json"
-    result_sha256: "<ファイルバイト列の sha256>"
-    verify_status: "verified"
-    suggested_actions_summary: "<1-3行の候補サマリ>"
-    candidate_count: <候補数>
-    high_confidence_count: <confidence:high の候補数>
+    plan_schema_name: "<SCOPE_ROLLUP_RUN_RESULT_V1.plan.plan_schema_name>"
+    plan_schema_version: <SCOPE_ROLLUP_RUN_RESULT_V1.plan.plan_schema_version>
+    raw_plan_location: null  # Issue #1547: private invocation directory は全経路で cleanup されるため、永続 artifact パスは存在しない
+    result_sha256: "<SCOPE_ROLLUP_RUN_RESULT_V1.plan.payload_sha256>"
+    verify_status: "<SCOPE_ROLLUP_RUN_RESULT_V1.plan.verify_status>"
+    suggested_actions_summary: "<1-3行の候補サマリ（candidates から runner が要約）>"
+    candidate_count: <SCOPE_ROLLUP_RUN_RESULT_V1.plan.candidate_count>
+    high_confidence_count: <SCOPE_ROLLUP_RUN_RESULT_V1.plan.high_confidence_count>
+    payload: <SCOPE_ROLLUP_RUN_RESULT_V1.plan.payload をそのまま埋め込む>  # Issue #1547 fix_delta (P0-1)
 ```
 
-**`plan:` フィールドは含めない**。raw plan JSON は `raw_plan_location` のファイルとして保持し、marker には inline 埋め込みしない。これにより main context への raw output 流入を防ぐ。
+**`invocation_id` / `requested_at` は入力値をそのまま echo する**（executor が独自生成した値ではなく、常に caller 生成値と一致する）。`raw_plan_location` は Issue #1547 以降 `null` 固定（executor が private invocation directory を全経路で cleanup するため永続 artifact が存在しない）。代わりに `result.payload` に `SCOPE_ROLLUP_RUN_RESULT_V1.plan.payload`（candidates を含む plan 全体、self_validation を除く）をそのまま埋め込み、consumer 側（`parse_scope_rollup_run_result.py`）が独立に `result_sha256` を再計算・検証できるようにする。`OUTPUT_BUDGET_V1` は routing-critical な機械可読フィールドの削減を禁止しており、`payload` は marker 採用判定に必須の machine-readable フィールドであるため削らない。
 
-### 8.5. Final Response Capture Contract
+`marker_schema_version: 3`（明示的なバージョン discriminator。consumer は `inputs` の内容に関わらず、この値が 3 のマーカーには以下の完全性契約を必須として要求する）、`inputs.query_schema_version == 3`、各 completeness block の `total_count` / 実測 `page_count` / `pagination_complete: true` / `sha256`、および `transaction_budget` は marker の必須 producer/consumer 契約である。欠落・型不正・未完了状態は consumer が fail-close で reject する（`inputs` ブロック自体の削除も同様に reject 対象）。GraphQL response の top-level `errors`、malformed connection、null / duplicate node、cursor 不進行、totalCount mismatch、transaction-wide pagination budget / deadline / response-byte cap は executor error とし、raw CLI list への fallback は行わない。
 
-`SubagentStop` hook 側の capture contract:
+### 8.5. Final Response Capture Contract（最終応答のキャプチャ契約）
+
+`SubagentStop` hook 側で定義される capture contract（キャプチャ契約の詳細）は以下の通り:
 
 ```yaml
 SCOPE_ROLLUP_CAPTURE_RESULT_V1:
@@ -253,7 +228,7 @@ SCOPE_ROLLUP_CAPTURE_RESULT_V1:
 - PR の作成・マージ・クローズ・編集（`gh pr` の書き込み系サブコマンド）
 - GitHub API への書き込みリクエスト（POST / PATCH / PUT / DELETE メソッドの `gh api` 呼び出し）
 - リポジトリへの履歴書き込み・ブランチ変更（`git` の書き込み系サブコマンド）
-- `/tmp/` 以外へのファイル書き込み（パイプ経由でのリポジトリパスへの出力を含む）
+- `scope_rollup.run` exact executor（`scripts/agent-guards/run_scope_rollup_preflight.py`）が使用する executor-owned private invocation directory 以外へのファイル書き込み（パイプ経由でのリポジトリパスへの出力を含む）。Issue #1547 以降、`/tmp/` への直接書き込みは行わない
 
 禁止操作を実行しようとした場合は即停止し、`status: runner_unavailable` を返す。
 
@@ -261,9 +236,8 @@ SCOPE_ROLLUP_CAPTURE_RESULT_V1:
 
 以下のいずれかに該当する場合は `status: runner_unavailable` を返す（silent fallback 禁止）:
 
-- 必要なスクリプト（`plan_issue_scope_rollup.py`）が見つからない
-- `gh` コマンドが permission denied または network error で失敗した
-- `plan_issue_scope_rollup.py` が exit code 非 0 で失敗した
+- 必要なスクリプト（`scripts/agent-guards/run_scope_rollup_preflight.py` / `plan_issue_scope_rollup.py`）が見つからない
+- `scope_rollup.run` exact executor が `status: error` を返した（`gh` permission denied / network error / pagination truncated / verify 失敗 / timeout を含む）
 - 禁止操作が要求された場合
 
 `runner_unavailable` を受け取った main conversation は silent fallback（raw output 展開）を行わず、停止または人間エスカレーションを選択する。

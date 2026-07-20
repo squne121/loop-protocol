@@ -12,6 +12,7 @@
     ".claude/skills/create-issue/scripts/tests/",
     ".claude/skills/ssot-discovery/tests/",
     ".claude/hooks/tests/",
+    "tests/agent_guards/",
     ".claude/skills/issue-contract-review/scripts/tests/",
     ".claude/skills/issue-contract-review/tests/",
     ".claude/skills/pr-review-judge/scripts/tests/",
@@ -24,10 +25,14 @@
     "schemas/tests/",
     "scripts/ci/tests/",
     "scripts/agent-guards/tests/",
+    "scripts/agent-ops/tests/",
     "tests/codex/test_codex_hook_surface_guard.py",
     "tests/codex/test_execpolicy_matrix.py",
     "tests/codex/test_cleanup_exec_branch_only.py",
     "tests/codex/test_root_temporary_residue_advisory.py",
+    "tests/codex/test_scope_rollup_run_exact_executor.py",
+    "tests/codex/test_run_scope_rollup_preflight.py",
+    "tests/codex/test_scope_rollup_graphql_pagination_v3.py",
     "tests/test_codex_agent_bridge_contract.py",
     "tests/test_codex_agent_model_refresh_evidence.py",
     "tests/test_subagent_launch_ledger.py",
@@ -50,7 +55,9 @@
     "workers": 4,
     "dist": "loadscope"
   },
-  "parallel_exclude": [],
+  "parallel_exclude": [
+    "scripts/agent-guards/tests/test_skill_runtime_exec_session_manifest.py"
+  ],
   "secondary_coverage": {
     "plan_targets_provider_job": "python-test",
     "dedicated_lanes": [
@@ -65,17 +72,22 @@
         "provider_job": "node-backed-hook-tests",
         "paths": [
           "tests/session_recording/codex/test_hook_adapter.py",
-          "tests/session_recording/codex/test_initial_branch_create_lane.py"
+          "tests/session_recording/codex/test_initial_branch_create_lane.py",
+          "tests/session_recording/codex/test_external_manifest_publish.py"
         ]
       }
     ]
   },
+  "runtime_verification_only_markers": [
+    "github_live"
+  ],
   "notes": {
-    "parallel_exclude_rationale": "test_session_manifest_debounce.py was previously quarantined here because it drove a real debounce front-gate with an 80ms window; under xdist CPU saturation the window expired between burst invocations and the coalescing assertion flaked (Issue #1064). It has been rewritten to be wall-clock-independent (Issue #1141): the worker is suppressed via a live lock owned by os.getpid(), events are queued synchronously, and flush is triggered via --flush (blocking call). No time.sleep() or wall-clock assertions remain. The test is now safe to run in the parallel lane.",
+    "parallel_exclude_rationale": "test_session_manifest_debounce.py was previously quarantined here because it drove a real debounce front-gate with an 80ms window; under xdist CPU saturation the window expired between burst invocations and the coalescing assertion flaked (Issue #1064). It has been rewritten to be wall-clock-independent (Issue #1141): the worker is suppressed via a live lock owned by os.getpid(), events are queued synchronously, and flush is triggered via --flush (blocking call). No time.sleep() or wall-clock assertions remain. The test is now safe to run in the parallel lane. test_skill_runtime_exec_session_manifest.py::test_external_session_manifest_peer_write_does_not_stop_preflight (Issue 1546 AC3) was added to parallel_exclude because its before/after repo-tree snapshot diff can be polluted, under xdist, by tests/test_summarize_agent_transcript.py writing real (non-tmp_path) files under tmp/agent-session-hotspots/ concurrently in another worker. Running the file at -n 0 in the serial lane removes the race without changing the skill_runtime_exec.py module (Out of Scope for Issue 1546).",
     "schemas_tests_inclusion": "schemas/tests/ is included exactly once here; it was previously missing from the generator pytest_args, causing the executed target set and the ci_test_selection artifact to drift (Issue #1064).",
     "dedicated_lanes_excluded": "tests/codex/test_local_main_branch_guard.py runs in its own codex execpolicy step (needs the pinned codex CLI context) and is intentionally NOT in targets to avoid double execution. tests/codex/test_execpolicy_matrix.py is included here so python-test and ci_test_selection/v1 both treat the pure-Python execpolicy contract coverage as part of the shared python lane, while the dedicated Codex CLI step keeps only the runtime guard test isolated. The Node-backed lane (pnpm test / e2e) and the hook-discovery collect-only guard remain separate steps; this plan only governs the unified python pytest suite.",
     "ignore_deselect_contract": "ignore/deselect preserve the hook-discovery contract: test_secret_boundary_contract.py is ignored (tracked by #412) and the two non-hermetic generate_session_manifest wrapper tests are deselected.",
     "node_test_lane": "test_session_manifest_debounce.mjs (AC4 virtual-clock tests) runs in the dedicated node-backed-hook-tests CI lane via `node --test` (Issue #1141 AC6). It is NOT in the pytest targets.",
-    "edit_issue_tests_directory_coverage": "Issue #1303: individual file targets test_guard_issue_body.py / test_issue_contract_hygiene_autofix.py were replaced by the directory target .claude/skills/edit-issue/tests/ so newly added tests in that directory (e.g. test_edit_issue_txn.py from PR #1301 / Issue #1287) are covered by the python-test lane and the ci_test_selection/v1 artifact without requiring a plan edit per new test file."
+    "edit_issue_tests_directory_coverage": "Issue #1303: individual file targets test_guard_issue_body.py / test_issue_contract_hygiene_autofix.py were replaced by the directory target .claude/skills/edit-issue/tests/ so newly added tests in that directory (e.g. test_edit_issue_txn.py from PR #1301 / Issue #1287) are covered by the python-test lane and the ci_test_selection/v1 artifact without requiring a plan edit per new test file.",
+    "runtime_verification_only_markers_rationale": "Issue #1562: pytest markers listed here are deselected from the default `python-test` pytest run (via pyproject.toml addopts, e.g. `github_live`) because they exercise real external services (e.g. `gh` write access to GitHub) that are structurally unavailable in the CI runner's authentication context. generate_ci_test_selection_artifact.py treats a changed test file whose tests are collected ONLY under one of these markers (verified by an actual `pytest --collect-only` re-run scoped to that file, both with and without the marker override) as covered by runtime verification rather than as a G1 `uncovered_changed_test_files` failure. This is deliberately distinct from `secondary_coverage.dedicated_lanes`, which declares coverage by a DIFFERENT CI job that actually executes the file; no such CI job exists for `github_live` tests, so registering them under dedicated_lanes would misrepresent a real CI job as covering tests it never runs."
   }
 }

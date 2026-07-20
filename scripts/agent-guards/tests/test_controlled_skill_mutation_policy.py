@@ -26,12 +26,16 @@ if str(_GUARDS_DIR) not in sys.path:
 from controlled_skill_mutation_policy import (
     ALLOWED_WRITE_ROOTS,
     COMMAND_ID_PUBLISH,
+    COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
     CONTROLLED_SKILL_MUTATION_COMMAND_POLICY,
     ENV_SANITIZE_KEYS,
     EXECUTOR_SCRIPT,
+    ISOLATION_ISSUE_COMMENT_REQUEST_ALLOWED_KEYS,
+    ISOLATION_ISSUE_COMMENT_REQUEST_SCHEMA,
     TRUSTED_REPO,
     _validate_executor_argv,
     is_controlled_skill_mutation_exec_command,
+    validate_isolation_issue_comment_request,
 )
 
 
@@ -114,13 +118,17 @@ class TestRegistryScope:
     def test_only_known_command_ids(self):
         # Issue #1284 extends the shared registry with issue metadata mutation
         # command ids (issue_body.update / issue_comment.publish /
-        # contract_snapshot.publish). This scope-pin is updated deliberately as
-        # part of that Issue's explicit In Scope registry extension.
+        # contract_snapshot.publish). Issue #1536 adds pr_review.publish
+        # (Option C controlled review publisher). This scope-pin is updated
+        # deliberately as part of each Issue's explicit In Scope registry
+        # extension.
         known_ids = {
             COMMAND_ID_PUBLISH,
             "issue_body.update",
             "issue_comment.publish",
             "contract_snapshot.publish",
+            "pr_review.publish",
+            COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
         }
         actual_ids = set(CONTROLLED_SKILL_MUTATION_COMMAND_POLICY.keys())
         assert actual_ids == known_ids, (
@@ -340,3 +348,84 @@ class TestSingleSourceOfTruth:
         # Remove --repo and its value
         args_without_repo = base[:-2]
         assert _validate_executor_argv(args_without_repo) is False
+
+
+# =============================================================================
+# AC1 (Issue #1633): ISOLATION_ISSUE_COMMENT_REQUEST_V1 bounded schema
+# =============================================================================
+
+class TestIsolationIssueCommentRequestSchema:
+    """AC1: closed-key bounded request schema for isolation worktree agent
+    Issue comment requests, and its validator."""
+
+    def test_schema_constant_value(self):
+        assert ISOLATION_ISSUE_COMMENT_REQUEST_SCHEMA == "ISOLATION_ISSUE_COMMENT_REQUEST_V1"
+
+    def test_allowed_keys_are_closed(self):
+        assert ISOLATION_ISSUE_COMMENT_REQUEST_ALLOWED_KEYS == frozenset(
+            {"schema", "issue_number", "repo", "comment_body", "marker"}
+        )
+
+    def _valid_request(self, issue_number=42, repo="squne121/loop-protocol"):
+        return {
+            "schema": ISOLATION_ISSUE_COMMENT_REQUEST_SCHEMA,
+            "issue_number": issue_number,
+            "repo": repo,
+            "comment_body": "hello <!-- m -->",
+            "marker": "<!-- m -->",
+        }
+
+    def test_valid_request_passes(self):
+        req = self._valid_request()
+        err = validate_isolation_issue_comment_request(req, 42, "squne121/loop-protocol")
+        assert err == ""
+
+    def test_not_a_dict_rejected(self):
+        err = validate_isolation_issue_comment_request(["not", "a", "dict"], 42, "squne121/loop-protocol")
+        assert "not_object" in err
+
+    def test_unknown_key_rejected(self):
+        req = self._valid_request()
+        req["extra_field"] = "unexpected"
+        err = validate_isolation_issue_comment_request(req, 42, "squne121/loop-protocol")
+        assert "unknown_fields" in err
+
+    def test_schema_mismatch_rejected(self):
+        req = self._valid_request()
+        req["schema"] = "WRONG_SCHEMA_V1"
+        err = validate_isolation_issue_comment_request(req, 42, "squne121/loop-protocol")
+        assert "schema_mismatch" in err
+
+    def test_issue_number_mismatch_rejected(self):
+        req = self._valid_request(issue_number=42)
+        err = validate_isolation_issue_comment_request(req, 99, "squne121/loop-protocol")
+        assert "issue_number_mismatch" in err
+
+    def test_issue_number_wrong_type_rejected(self):
+        req = self._valid_request()
+        req["issue_number"] = "42"
+        err = validate_isolation_issue_comment_request(req, 42, "squne121/loop-protocol")
+        assert "issue_number_mismatch" in err
+
+    def test_repo_mismatch_rejected(self):
+        req = self._valid_request(repo="attacker/evil-repo")
+        err = validate_isolation_issue_comment_request(req, 42, "squne121/loop-protocol")
+        assert "repo_mismatch" in err
+
+    def test_empty_comment_body_rejected(self):
+        req = self._valid_request()
+        req["comment_body"] = ""
+        err = validate_isolation_issue_comment_request(req, 42, "squne121/loop-protocol")
+        assert "comment_body_invalid" in err
+
+    def test_empty_marker_rejected(self):
+        req = self._valid_request()
+        req["marker"] = ""
+        err = validate_isolation_issue_comment_request(req, 42, "squne121/loop-protocol")
+        assert "marker_invalid" in err
+
+    def test_marker_not_embedded_in_body_rejected(self):
+        req = self._valid_request()
+        req["comment_body"] = "hello, no marker here"
+        err = validate_isolation_issue_comment_request(req, 42, "squne121/loop-protocol")
+        assert "marker_not_embedded_in_body" in err

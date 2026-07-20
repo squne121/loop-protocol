@@ -34,6 +34,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import open_pr
 
+# Issue #1470: captured at collection time (before any monkeypatching), so
+# tests that need the REAL resolve_canonical_repository() behavior (mixed
+# case / rename alias resolution) can restore it after _common_monkeypatches
+# installs its default identity mock.
+_REAL_RESOLVE_CANONICAL_REPOSITORY = open_pr.resolve_canonical_repository
+
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "pr_body"
 
@@ -69,10 +75,20 @@ def build_stored_evidence(
     validation_errors: dict | None = None,
     unresolved_refs: list | None = None,
     blocking_predecessor: object | None = None,
+    repository: str = "squne121/loop-protocol",
+    include_repository: bool = True,
 ) -> dict:
     """Build a stored evidence dict with a correctly-computed embedded
     evidence_sha256 (mirrors check_implementation_overlap.py's build_evidence
-    canonicalization contract)."""
+    canonicalization contract).
+
+    Issue #1470: ``repository`` is included by default (matching the
+    canonicalized repo used across these tests). ``include_repository=False``
+    builds a legacy V1-shaped evidence dict (no ``repository`` key at all)
+    with a *correctly computed* embedded hash for that legacy shape, so tests
+    can verify that the required-field validation (not hash mismatch) is what
+    rejects it.
+    """
     body = {
         "schema": open_pr.OVERLAP_PREFLIGHT_SCHEMA,
         "current_issue": {"number": current_issue_number, "allowed_paths": []},
@@ -81,6 +97,13 @@ def build_stored_evidence(
             "saturated": source_saturated,
             "limit": source_limit,
             "collected_at": "2026-07-11T00:00:00Z",
+            # #1493 AC3: collection contract の必須 field（additive）。この
+            # fixture builder は cursor pagination 経路の evidence を模す。
+            "collection_mode": "exhaustive_cursor_pagination",
+            "page_size": 100,
+            "page_count": 1,
+            "fetched_count": 0,
+            "has_next_page": False,
         },
         "candidates": [],
         "dependency_resolution": {
@@ -93,6 +116,8 @@ def build_stored_evidence(
         "route": route,
         "decision_inputs_sha256": decision_inputs_sha256,
     }
+    if include_repository:
+        body["repository"] = repository
     canonical = _canonical_json(body)
     body["evidence_sha256"] = f"sha256:{_sha256(canonical)}"
     return body
@@ -149,6 +174,12 @@ def _common_monkeypatches(monkeypatch: pytest.MonkeyPatch, linked_issue: int = 1
     monkeypatch.setattr(
         open_pr, "fetch_current_linked_issue_labels", lambda repo, issue: ([], None)
     )
+    # Issue #1470: default identity canonicalization (no real GitHub API call).
+    # resolve_repo() above already returns a lowercase canonical value, so the
+    # identity mapping keeps pre-#1470 test expectations unchanged. Tests that
+    # specifically exercise canonicalization (mixed-case / rename alias)
+    # restore _REAL_RESOLVE_CANONICAL_REPOSITORY or override this explicitly.
+    monkeypatch.setattr(open_pr, "resolve_canonical_repository", lambda repo: repo)
 
 
 def _run_main(
@@ -598,19 +629,20 @@ def test_unsafe_route_blocks_even_with_hash_match(monkeypatch: pytest.MonkeyPatc
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "source_complete,source_saturated",
-    [(False, False), (True, True)],
-)
-def test_source_degraded_blocks(
-    monkeypatch: pytest.MonkeyPatch, source_complete: bool, source_saturated: bool
-):
+def test_source_incomplete_not_saturated_blocks_as_unsafe_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GIVEN stored/fresh evidence が complete=false / saturated=false
+    （internally-consistent な degraded source: 全件性を未証明のまま停止した
+    ケース）
+    WHEN overlap preflight gate を実行する
+    THEN online 再実行後の safety predicate（`_overlap_preflight_safety_reason`）
+    が E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE で拒否する。
+    """
     _common_monkeypatches(monkeypatch, linked_issue=1458)
     stored = build_stored_evidence(
         decision_inputs_sha256="sha256:" + "b" * 64,
         current_issue_number=1458,
-        source_complete=source_complete,
-        source_saturated=source_saturated,
+        source_complete=False,
+        source_saturated=False,
     )
     evidence_path = write_evidence_file(stored)
     fresh = fresh_evidence_from_stored(stored)
@@ -635,6 +667,56 @@ def test_source_degraded_blocks(
         assert rc == 2
         assert create_called is False
         assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE}" for line in lines), lines
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+def test_source_complete_and_saturated_both_true_is_self_contradictory_and_blocks_early(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GIVEN stored evidence が complete=true かつ saturated=true（producer
+    契約上あり得ない自己矛盾な組み合わせ — complete=true は常に
+    saturated=false を伴う）
+    WHEN overlap preflight gate を実行する
+    THEN PR #1626 review fix_delta の collection contract shape validator
+    （`_overlap_collection_contract_shape_error`）が online 再実行より前に
+    E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID で拒否し、online subprocess を
+    一度も呼ばない。
+    """
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    stored = build_stored_evidence(
+        decision_inputs_sha256="sha256:" + "b" * 64,
+        current_issue_number=1458,
+        source_complete=True,
+        source_saturated=True,
+    )
+    evidence_path = write_evidence_file(stored)
+
+    called = {"count": 0}
+
+    def fail_if_called(cmd, **kwargs):
+        called["count"] += 1
+        raise AssertionError("self-contradictory complete/saturated must block before online recheck")
+
+    monkeypatch.setattr(open_pr.subprocess, "run", fail_if_called)
+
+    try:
+        rc, lines, create_called = _run_main(
+            monkeypatch,
+            1458,
+            [
+                "--overlap-preflight-required",
+                "--overlap-preflight-evidence-file", str(evidence_path),
+                "--overlap-preflight-expected-evidence-sha256", stored["evidence_sha256"],
+                "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
+            ],
+        )
+        assert rc == 2
+        assert create_called is False
+        assert any(
+            line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines
+        ), lines
+        assert called["count"] == 0
     finally:
         evidence_path.unlink(missing_ok=True)
 
@@ -910,6 +992,7 @@ def test_gate_runs_after_existing_pr_check_and_before_create_pr(monkeypatch: pyt
     monkeypatch.setattr(
         open_pr, "fetch_current_linked_issue_labels", lambda repo, issue: ([], None)
     )
+    monkeypatch.setattr(open_pr, "resolve_canonical_repository", lambda repo: repo)
 
     stored = build_stored_evidence(decision_inputs_sha256="sha256:" + "b" * 64, current_issue_number=1458)
     evidence_path = write_evidence_file(stored)
@@ -1351,3 +1434,567 @@ def test_overlap_readback_waiver_is_bound_to_1477_in_the_canonical_repository(mo
     )
     assert waiver is None
     assert "固定 binding" in error
+
+
+# ---------------------------------------------------------------------------
+# 13. Issue #1470 — repository binding (canonical full_name enforcement)
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_repo_is_shared_by_preflight_and_pr_create(monkeypatch: pytest.MonkeyPatch):
+    """GIVEN a requested repo that resolves to a canonical full_name WHEN the
+    overlap gate runs THEN the online recheck subprocess --repo and gh pr
+    create --repo both receive the SAME resolved canonical value (AC1)."""
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    monkeypatch.setattr(open_pr, "resolve_repo", lambda: "SQUNE121/LOOP-PROTOCOL")
+    monkeypatch.setattr(
+        open_pr, "resolve_canonical_repository", lambda repo: "squne121/loop-protocol"
+    )
+    stored = build_stored_evidence(
+        decision_inputs_sha256="sha256:" + "b" * 64,
+        current_issue_number=1458,
+        repository="squne121/loop-protocol",
+    )
+    evidence_path = write_evidence_file(stored)
+    fresh = fresh_evidence_from_stored(stored)
+
+    observed_cmds: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        observed_cmds.append(cmd)
+        return FakeCompletedProcess(0, json.dumps(fresh), "")
+
+    monkeypatch.setattr(open_pr.subprocess, "run", fake_run)
+
+    observed_create_pr_repo = {"repo": None}
+
+    def fake_create_pr(repo, title, body_file, branch, draft):
+        observed_create_pr_repo["repo"] = repo
+        return "https://github.com/squne121/loop-protocol/pull/9999"
+
+    monkeypatch.setattr(open_pr, "create_pr", fake_create_pr)
+
+    try:
+        rc, lines, _ = _run_main(
+            monkeypatch,
+            1458,
+            [
+                "--overlap-preflight-required",
+                "--overlap-preflight-evidence-file", str(evidence_path),
+                "--overlap-preflight-expected-evidence-sha256", stored["evidence_sha256"],
+                "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
+            ],
+            patch_create_pr=False,
+        )
+        assert rc == 0, lines
+        repo_flag_index = observed_cmds[0].index("--repo")
+        overlap_check_repo = observed_cmds[0][repo_flag_index + 1]
+        assert overlap_check_repo == "squne121/loop-protocol"
+        assert observed_create_pr_repo["repo"] == "squne121/loop-protocol"
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+def test_stored_repository_missing_blocks_before_online_recheck(monkeypatch: pytest.MonkeyPatch):
+    """GIVEN legacy V1 stored evidence (no repository key, correctly-computed
+    legacy hash) WHEN the gate runs THEN it is rejected before the online
+    recheck subprocess (AC2/AC5)."""
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    stored = build_stored_evidence(
+        decision_inputs_sha256="sha256:" + "b" * 64,
+        current_issue_number=1458,
+        include_repository=False,
+    )
+    evidence_path = write_evidence_file(stored)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("subprocess should not run when stored repository is missing")
+
+    monkeypatch.setattr(open_pr.subprocess, "run", fail_if_called)
+
+    try:
+        rc, lines, create_called = _run_main(
+            monkeypatch,
+            1458,
+            [
+                "--overlap-preflight-required",
+                "--overlap-preflight-evidence-file", str(evidence_path),
+                "--overlap-preflight-expected-evidence-sha256", stored["evidence_sha256"],
+                "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
+            ],
+        )
+        assert rc == 2
+        assert create_called is False
+        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+def test_stored_repository_invalid_type_blocks_before_online_recheck(monkeypatch: pytest.MonkeyPatch):
+    """GIVEN stored evidence whose repository field is a non-string type
+    WHEN the gate runs THEN it is rejected before the online recheck
+    subprocess (AC2)."""
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    stored = build_stored_evidence(
+        decision_inputs_sha256="sha256:" + "b" * 64,
+        current_issue_number=1458,
+    )
+    stored["repository"] = 12345
+    body_for_hash = {k: v for k, v in stored.items() if k != "evidence_sha256"}
+    stored["evidence_sha256"] = f"sha256:{_sha256(_canonical_json(body_for_hash))}"
+    evidence_path = write_evidence_file(stored)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("subprocess should not run when stored repository type is invalid")
+
+    monkeypatch.setattr(open_pr.subprocess, "run", fail_if_called)
+
+    try:
+        rc, lines, create_called = _run_main(
+            monkeypatch,
+            1458,
+            [
+                "--overlap-preflight-required",
+                "--overlap-preflight-evidence-file", str(evidence_path),
+                "--overlap-preflight-expected-evidence-sha256", stored["evidence_sha256"],
+                "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
+            ],
+        )
+        assert rc == 2
+        assert create_called is False
+        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+def test_stored_repository_mismatch_blocks_before_online_recheck(monkeypatch: pytest.MonkeyPatch):
+    """GIVEN stored evidence whose repository field does not match the
+    canonical target WHEN the gate runs THEN it is rejected before the online
+    recheck subprocess (AC2)."""
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    stored = build_stored_evidence(
+        decision_inputs_sha256="sha256:" + "b" * 64,
+        current_issue_number=1458,
+        repository="someone-else/other-repo",
+    )
+    evidence_path = write_evidence_file(stored)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("subprocess should not run when stored repository mismatches target")
+
+    monkeypatch.setattr(open_pr.subprocess, "run", fail_if_called)
+
+    try:
+        rc, lines, create_called = _run_main(
+            monkeypatch,
+            1458,
+            [
+                "--overlap-preflight-required",
+                "--overlap-preflight-evidence-file", str(evidence_path),
+                "--overlap-preflight-expected-evidence-sha256", stored["evidence_sha256"],
+                "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
+            ],
+        )
+        assert rc == 2
+        assert create_called is False
+        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+def test_fresh_repository_missing_blocks_before_pr_creation(monkeypatch: pytest.MonkeyPatch):
+    """GIVEN fresh (online re-run) evidence with no repository field WHEN the
+    gate runs THEN it is rejected before gh pr create (AC3)."""
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    stored = build_stored_evidence(decision_inputs_sha256="sha256:" + "b" * 64, current_issue_number=1458)
+    evidence_path = write_evidence_file(stored)
+    fresh = fresh_evidence_from_stored(stored)
+    del fresh["repository"]
+
+    monkeypatch.setattr(
+        open_pr.subprocess,
+        "run",
+        lambda cmd, **kwargs: FakeCompletedProcess(0, json.dumps(fresh), ""),
+    )
+
+    try:
+        rc, lines, create_called = _run_main(
+            monkeypatch,
+            1458,
+            [
+                "--overlap-preflight-required",
+                "--overlap-preflight-evidence-file", str(evidence_path),
+                "--overlap-preflight-expected-evidence-sha256", stored["evidence_sha256"],
+                "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
+            ],
+        )
+        assert rc == 2
+        assert create_called is False
+        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_DRIFT}" for line in lines), lines
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+def test_fresh_repository_mismatch_blocks_before_pr_creation(monkeypatch: pytest.MonkeyPatch):
+    """GIVEN fresh (online re-run) evidence whose repository field does not
+    match the canonical target WHEN the gate runs THEN it is rejected before
+    gh pr create (AC3)."""
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    stored = build_stored_evidence(decision_inputs_sha256="sha256:" + "b" * 64, current_issue_number=1458)
+    evidence_path = write_evidence_file(stored)
+    fresh = fresh_evidence_from_stored(stored, repository="attacker/other-repo")
+
+    monkeypatch.setattr(
+        open_pr.subprocess,
+        "run",
+        lambda cmd, **kwargs: FakeCompletedProcess(0, json.dumps(fresh), ""),
+    )
+
+    try:
+        rc, lines, create_called = _run_main(
+            monkeypatch,
+            1458,
+            [
+                "--overlap-preflight-required",
+                "--overlap-preflight-evidence-file", str(evidence_path),
+                "--overlap-preflight-expected-evidence-sha256", stored["evidence_sha256"],
+                "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
+            ],
+        )
+        assert rc == 2
+        assert create_called is False
+        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_DRIFT}" for line in lines), lines
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+def test_mixed_case_requested_repo_uses_canonical_repository(monkeypatch: pytest.MonkeyPatch):
+    """GIVEN a requested repo with mixed-case owner/name segments WHEN
+    resolved THEN the canonical lowercase full_name is used for both the
+    online recheck and gh pr create (AC4)."""
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    monkeypatch.setattr(open_pr, "resolve_canonical_repository", _REAL_RESOLVE_CANONICAL_REPOSITORY)
+    monkeypatch.setattr(open_pr, "resolve_repo", lambda: "SQUNE121/LOOP-PROTOCOL")
+    monkeypatch.setattr(
+        open_pr,
+        "run_gh",
+        lambda *args, **kwargs: FakeCompletedProcess(
+            0, json.dumps({"full_name": "squne121/loop-protocol"}), ""
+        ),
+    )
+    stored = build_stored_evidence(
+        decision_inputs_sha256="sha256:" + "b" * 64,
+        current_issue_number=1458,
+        repository="squne121/loop-protocol",
+    )
+    evidence_path = write_evidence_file(stored)
+    fresh = fresh_evidence_from_stored(stored)
+
+    monkeypatch.setattr(
+        open_pr.subprocess,
+        "run",
+        lambda cmd, **kwargs: FakeCompletedProcess(0, json.dumps(fresh), ""),
+    )
+
+    observed_create_pr_repo = {"repo": None}
+
+    def fake_create_pr(repo, title, body_file, branch, draft):
+        observed_create_pr_repo["repo"] = repo
+        return "https://github.com/squne121/loop-protocol/pull/9999"
+
+    monkeypatch.setattr(open_pr, "create_pr", fake_create_pr)
+
+    try:
+        rc, lines, _ = _run_main(
+            monkeypatch,
+            1458,
+            [
+                "--overlap-preflight-required",
+                "--overlap-preflight-evidence-file", str(evidence_path),
+                "--overlap-preflight-expected-evidence-sha256", stored["evidence_sha256"],
+                "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
+            ],
+            patch_create_pr=False,
+        )
+        assert rc == 0, lines
+        assert observed_create_pr_repo["repo"] == "squne121/loop-protocol"
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+def test_renamed_repository_alias_uses_resolved_full_name(monkeypatch: pytest.MonkeyPatch):
+    """GIVEN a requested repo that is a stale post-rename/transfer alias WHEN
+    resolved THEN the GitHub API's current full_name is used as the canonical
+    target, and stored evidence built under the NEW name is accepted (AC4)."""
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    monkeypatch.setattr(open_pr, "resolve_canonical_repository", _REAL_RESOLVE_CANONICAL_REPOSITORY)
+    monkeypatch.setattr(open_pr, "resolve_repo", lambda: "squne121/old-repo-name")
+    monkeypatch.setattr(
+        open_pr,
+        "run_gh",
+        lambda *args, **kwargs: FakeCompletedProcess(
+            0, json.dumps({"full_name": "squne121/new-repo-name"}), ""
+        ),
+    )
+    stored = build_stored_evidence(
+        decision_inputs_sha256="sha256:" + "b" * 64,
+        current_issue_number=1458,
+        repository="squne121/new-repo-name",
+    )
+    evidence_path = write_evidence_file(stored)
+    fresh = fresh_evidence_from_stored(stored)
+
+    monkeypatch.setattr(
+        open_pr.subprocess,
+        "run",
+        lambda cmd, **kwargs: FakeCompletedProcess(0, json.dumps(fresh), ""),
+    )
+
+    observed_create_pr_repo = {"repo": None}
+
+    def fake_create_pr(repo, title, body_file, branch, draft):
+        observed_create_pr_repo["repo"] = repo
+        return "https://github.com/squne121/new-repo-name/pull/9999"
+
+    monkeypatch.setattr(open_pr, "create_pr", fake_create_pr)
+
+    try:
+        rc, lines, _ = _run_main(
+            monkeypatch,
+            1458,
+            [
+                "--overlap-preflight-required",
+                "--overlap-preflight-evidence-file", str(evidence_path),
+                "--overlap-preflight-expected-evidence-sha256", stored["evidence_sha256"],
+                "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
+            ],
+            patch_create_pr=False,
+        )
+        assert rc == 0, lines
+        assert observed_create_pr_repo["repo"] == "squne121/new-repo-name"
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+def test_repository_binding_precedes_generic_decision_hash_drift(monkeypatch: pytest.MonkeyPatch):
+    """GIVEN fresh evidence whose repository field mismatches the canonical
+    target, but whose decision_inputs_sha256 is UNCHANGED from stored's (i.e.
+    the generic hash-drift check alone would pass) WHEN the gate runs THEN
+    the explicit repository binding check still rejects it, and the error
+    detail attributes the block to the repository mismatch (not the decision
+    hash) (AC5 ordering)."""
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    stored = build_stored_evidence(decision_inputs_sha256="sha256:" + "b" * 64, current_issue_number=1458)
+    evidence_path = write_evidence_file(stored)
+    fresh = fresh_evidence_from_stored(stored, repository="attacker/other-repo")
+
+    monkeypatch.setattr(
+        open_pr.subprocess,
+        "run",
+        lambda cmd, **kwargs: FakeCompletedProcess(0, json.dumps(fresh), ""),
+    )
+
+    try:
+        rc, lines, create_called = _run_main(
+            monkeypatch,
+            1458,
+            [
+                "--overlap-preflight-required",
+                "--overlap-preflight-evidence-file", str(evidence_path),
+                "--overlap-preflight-expected-evidence-sha256", stored["evidence_sha256"],
+                "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
+            ],
+        )
+        assert rc == 2
+        assert create_called is False
+        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_DRIFT}" for line in lines), lines
+        detail_line = next(line for line in lines if line.startswith("ERROR_DETAIL="))
+        assert "repository" in detail_line
+        assert "decision_inputs_sha256 drift" not in detail_line
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+def test_cross_repo_same_issue_number_is_rejected(monkeypatch: pytest.MonkeyPatch):
+    """GIVEN repository A's stored evidence WHEN reused for the same-numbered
+    issue while the PR mutation target resolves to repository B THEN the gate
+    rejects it and gh pr create is never invoked (AC7)."""
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    monkeypatch.setattr(open_pr, "resolve_repo", lambda: "owner-b/repo-b")
+    monkeypatch.setattr(open_pr, "resolve_canonical_repository", lambda repo: repo)
+    stored = build_stored_evidence(
+        decision_inputs_sha256="sha256:" + "b" * 64,
+        current_issue_number=1458,
+        repository="owner-a/repo-a",
+    )
+    evidence_path = write_evidence_file(stored)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("subprocess should not run for cross-repo evidence reuse")
+
+    monkeypatch.setattr(open_pr.subprocess, "run", fail_if_called)
+
+    try:
+        rc, lines, create_called = _run_main(
+            monkeypatch,
+            1458,
+            [
+                "--overlap-preflight-required",
+                "--overlap-preflight-evidence-file", str(evidence_path),
+                "--overlap-preflight-expected-evidence-sha256", stored["evidence_sha256"],
+                "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
+            ],
+        )
+        assert rc == 2
+        assert create_called is False
+        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Issue #1470 fix_delta (PR #1553 review): Medium 1 - canonical re-check of
+# labels / existing PR when target_repo differs from raw repo, and Medium 2 -
+# resolve_canonical_repository() catches OSError (e.g. FileNotFoundError when
+# `gh` is not installed) in addition to subprocess.SubprocessError.
+# ---------------------------------------------------------------------------
+
+
+def test_mixed_case_repo_rechecks_labels_and_existing_pr_with_canonical_target(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """GIVEN a mixed-case requested repo WHEN the gate resolves the canonical
+    target THEN labels and existing-PR idempotency are re-checked against the
+    canonical (not raw) repo value, and an existing PR found under the
+    canonical name short-circuits without calling create_pr (Medium 1)."""
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+    monkeypatch.setattr(open_pr, "resolve_canonical_repository", _REAL_RESOLVE_CANONICAL_REPOSITORY)
+    monkeypatch.setattr(open_pr, "resolve_repo", lambda: "SQUNE121/LOOP-PROTOCOL")
+    monkeypatch.setattr(
+        open_pr,
+        "run_gh",
+        lambda *args, **kwargs: FakeCompletedProcess(
+            0, json.dumps({"full_name": "squne121/loop-protocol"}), ""
+        ),
+    )
+
+    observed_repos: list[str] = []
+
+    def fake_find_existing_pr(repo, branch):
+        observed_repos.append(repo)
+        if repo == "squne121/loop-protocol":
+            return {"url": "https://github.com/squne121/loop-protocol/pull/4242", "number": 4242}
+        return None
+
+    monkeypatch.setattr(open_pr, "find_existing_pr", fake_find_existing_pr)
+
+    label_calls: list[str] = []
+
+    def fake_fetch_labels(repo, issue):
+        label_calls.append(repo)
+        return ([], None)
+
+    monkeypatch.setattr(open_pr, "fetch_current_linked_issue_labels", fake_fetch_labels)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("create_pr should not run once canonical existing PR is found")
+
+    monkeypatch.setattr(open_pr, "create_pr", fail_if_called)
+
+    rc, lines, create_called = _run_main(
+        monkeypatch,
+        1458,
+        [
+            "--overlap-preflight-required",
+            "--overlap-preflight-evidence-file", "/nonexistent/should-not-be-read.json",
+            "--overlap-preflight-expected-evidence-sha256", "sha256:" + "a" * 64,
+            "--overlap-preflight-expected-decision-inputs-sha256", "sha256:" + "a" * 64,
+        ],
+    )
+    assert rc == 0, lines
+    assert create_called is False
+    assert any(line == "EXISTING=true" for line in lines), lines
+    assert any(line == "PR_NUMBER=4242" for line in lines), lines
+    # both the initial (raw-repo) and the canonical re-check label fetch
+    # observed the eventual canonical target at least once.
+    assert "squne121/loop-protocol" in label_calls, label_calls
+    assert "squne121/loop-protocol" in observed_repos, observed_repos
+
+
+def test_resolve_canonical_repository_catches_file_not_found_error(monkeypatch: pytest.MonkeyPatch):
+    """GIVEN `gh` is not installed (run_gh raises FileNotFoundError, a subclass
+    of OSError) WHEN resolve_canonical_repository() is called THEN it returns
+    None instead of propagating the exception (Medium 2)."""
+
+    def raise_file_not_found(*args, **kwargs):
+        raise FileNotFoundError("gh: command not found")
+
+    monkeypatch.setattr(open_pr, "run_gh", raise_file_not_found)
+
+    assert open_pr.resolve_canonical_repository("squne121/loop-protocol") is None
+
+
+def test_main_exits_2_with_source_failure_when_gh_missing(monkeypatch: pytest.MonkeyPatch):
+    """GIVEN `gh` is not installed WHEN the overlap gate is active THEN main()
+    exits 2 with E_OVERLAP_PREFLIGHT_SOURCE_FAILURE instead of raising
+    (Medium 2, end-to-end)."""
+    _common_monkeypatches(monkeypatch, linked_issue=1458)
+
+    def raise_file_not_found(*args, **kwargs):
+        raise FileNotFoundError("gh: command not found")
+
+    monkeypatch.setattr(open_pr, "resolve_canonical_repository", _REAL_RESOLVE_CANONICAL_REPOSITORY)
+    monkeypatch.setattr(open_pr, "run_gh", raise_file_not_found)
+
+    rc, lines, create_called = _run_main(
+        monkeypatch,
+        1458,
+        [
+            "--overlap-preflight-required",
+            "--overlap-preflight-evidence-file", "/nonexistent/should-not-be-read.json",
+            "--overlap-preflight-expected-evidence-sha256", "sha256:" + "a" * 64,
+            "--overlap-preflight-expected-decision-inputs-sha256", "sha256:" + "a" * 64,
+        ],
+    )
+    assert rc == 2, lines
+    assert create_called is False
+    assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_SOURCE_FAILURE}" for line in lines), lines
+
+
+
+# ---------------------------------------------------------------------------
+# Issue #1470 fix_delta (PR #1553 review): Blocker 1 - SKILL.md must not
+# claim the overlap gate ignores native GitHub issue dependency; it must
+# describe the actual blocked_by / blocking REST integration and the
+# genuinely remaining limitations.
+# ---------------------------------------------------------------------------
+
+_SKILL_MD_PATH = Path(__file__).parent.parent.parent / "SKILL.md"
+
+_SKILL_MD_STALE_PHRASES = (
+    "native dependency は producer に含まれていない",
+    "native GitHub issue dependency を含まない暫定的 mitigation",
+    "を含まない暫定的 mitigation",
+    "Issue 本文 / コメントに書かれた `Depends on` 等のテキスト参照）内で依存が見つからなかったこと",
+)
+
+
+def test_skill_md_does_not_claim_overlap_gate_excludes_native_dependency():
+    text = _SKILL_MD_PATH.read_text(encoding="utf-8")
+    for phrase in _SKILL_MD_STALE_PHRASES:
+        assert phrase not in text, f"stale phrase still present: {phrase!r}"
+
+
+def test_skill_md_describes_native_dependency_fetch_as_integrated():
+    text = _SKILL_MD_PATH.read_text(encoding="utf-8")
+    assert "blocked_by" in text
+    assert "blocking" in text
+    assert "REST" in text
+    assert "issue-dependencies" in text
+
+
+def test_skill_md_limits_remaining_gaps_to_1493_repo_id_and_freshness():
+    text = _SKILL_MD_PATH.read_text(encoding="utf-8")
+    assert "#1493" in text
+    assert "repository ID" in text
+    assert "bounded freshness" in text

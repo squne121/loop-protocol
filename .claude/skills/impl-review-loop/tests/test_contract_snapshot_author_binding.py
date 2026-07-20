@@ -42,7 +42,12 @@ _capsule_mod = _load("build_intake_capsule_binding", _SCRIPTS_DIR / "build_intak
 _ISSUE_NUMBER = 1475
 _REPO = "squne121/loop-protocol"
 _ISSUE_URL = f"https://github.com/{_REPO}/issues/{_ISSUE_NUMBER}"
-_SAMPLE_BODY = "## Test body for #1475 binding tests"
+_SAMPLE_BODY = """## Test body for #1475 binding tests
+
+## Allowed Paths
+
+- `.claude/skills/impl-review-loop/scripts/ensure_contract_snapshot.py`
+"""
 _SAMPLE_BODY_SHA256 = _ecs_mod.sha256_of(_SAMPLE_BODY)
 _SAMPLE_UPDATED_AT = "2026-07-12T00:00:00Z"
 
@@ -84,13 +89,29 @@ CONTRACT_REVIEW_RESULT_V1:
 
 def _trusted_go_comment(comment_id: int = 5001) -> dict:
     """A go comment authored by the sole allowlisted TRUSTED_CONTRACT_PUBLISHERS entry."""
-    return _go_comment(
+    comment = _go_comment(
         author=_TRUSTED_LOGIN,
         author_association=_TRUSTED_ASSOCIATION,
         comment_id=comment_id,
         author_id=_TRUSTED_AUTHOR_ID,
         author_type=_TRUSTED_TYPE,
     )
+    fingerprint = {
+        "issue_number": _ISSUE_NUMBER,
+        "contract_source_kind": "issue_comment",
+        "contract_source_id": str(comment_id),
+        "contract_body_sha256": _SAMPLE_BODY_SHA256,
+        "allowed_paths_normalized_sha256": "b" * 64,
+        "base_ref": "main",
+        "base_sha_at_snapshot": "a" * 40,
+    }
+    comment["body"] = comment["body"].replace(
+        "  body_sha256: \"" + _SAMPLE_BODY_SHA256 + "\"\n",
+        "  body_sha256: \"" + _SAMPLE_BODY_SHA256 + "\"\n"
+        "  expected_contract_fingerprint:\n"
+        + "".join(f"    {key}: {value!r}\n" for key, value in fingerprint.items()),
+    )
+    return comment
 
 
 def _make_go_review_result() -> dict:
@@ -155,15 +176,20 @@ def test_controlled_publisher_comment_id_binding_is_required():
                 with patch.object(_ecs_mod, "post_comment", side_effect=fake_post):
                     with patch.object(
                         _ecs_mod,
-                        "verify_controlled_publisher_comment_id_binding",
-                        return_value=(False, "binding_id_mismatch"),
+                        "capture_base_ref_and_sha",
+                        return_value=("main", "a" * 40),
                     ):
-                        mismatched_result = _ecs_mod.ensure_contract_snapshot(
-                            issue_number=_ISSUE_NUMBER,
-                            repo=_REPO,
-                            mode="auto",
-                            do_post=True,
-                        )
+                        with patch.object(
+                            _ecs_mod,
+                            "verify_controlled_publisher_comment_id_binding",
+                            return_value=(False, "binding_id_mismatch"),
+                        ):
+                            mismatched_result = _ecs_mod.ensure_contract_snapshot(
+                                issue_number=_ISSUE_NUMBER,
+                                repo=_REPO,
+                                mode="auto",
+                                do_post=True,
+                            )
 
     assert mismatched_result["status"] == "controlled_publisher_binding_failed"
     assert mismatched_result["contract_snapshot_url"] is None
@@ -187,15 +213,28 @@ def test_controlled_publisher_comment_id_binding_is_required():
                 with patch.object(_ecs_mod, "post_comment", side_effect=fake_post):
                     with patch.object(
                         _ecs_mod,
-                        "verify_controlled_publisher_comment_id_binding",
-                        return_value=(True, None),
+                        "capture_base_ref_and_sha",
+                        return_value=("main", "a" * 40),
                     ):
-                        matched_result = _ecs_mod.ensure_contract_snapshot(
-                            issue_number=_ISSUE_NUMBER,
-                            repo=_REPO,
-                            mode="auto",
-                            do_post=True,
-                        )
+                        with patch.object(
+                            _ecs_mod, "patch_comment", return_value=(True, None)
+                        ):
+                            with patch.object(
+                                _ecs_mod,
+                                "verify_controlled_publisher_comment_id_binding",
+                                return_value=(True, None),
+                            ):
+                                with patch.object(
+                                    _ecs_mod,
+                                    "verify_snapshot_authority_postcondition",
+                                    return_value=(True, None),
+                                ):
+                                    matched_result = _ecs_mod.ensure_contract_snapshot(
+                                        issue_number=_ISSUE_NUMBER,
+                                        repo=_REPO,
+                                        mode="auto",
+                                        do_post=True,
+                                    )
 
     assert matched_result["status"] == "ok"
     assert matched_result["contract_snapshot_url"] is not None
@@ -504,15 +543,20 @@ class TestControlledPublisherCommentIdBinding:
                     with patch.object(_ecs_mod, "post_comment", side_effect=fake_post):
                         with patch.object(
                             _ecs_mod,
-                            "verify_controlled_publisher_comment_id_binding",
-                            return_value=(False, "binding_id_mismatch"),
+                            "capture_base_ref_and_sha",
+                            return_value=("main", "a" * 40),
                         ):
-                            result = _ecs_mod.ensure_contract_snapshot(
-                                issue_number=_ISSUE_NUMBER,
-                                repo=_REPO,
-                                mode="auto",
-                                do_post=True,
-                            )
+                            with patch.object(
+                                _ecs_mod,
+                                "verify_controlled_publisher_comment_id_binding",
+                                return_value=(False, "binding_id_mismatch"),
+                            ):
+                                result = _ecs_mod.ensure_contract_snapshot(
+                                    issue_number=_ISSUE_NUMBER,
+                                    repo=_REPO,
+                                    mode="auto",
+                                    do_post=True,
+                                )
 
         assert result["status"] == "controlled_publisher_binding_failed"
         assert result["contract_snapshot_url"] is None
@@ -536,15 +580,28 @@ class TestControlledPublisherCommentIdBinding:
                     with patch.object(_ecs_mod, "post_comment", side_effect=fake_post):
                         with patch.object(
                             _ecs_mod,
-                            "verify_controlled_publisher_comment_id_binding",
-                            return_value=(True, None),
+                            "capture_base_ref_and_sha",
+                            return_value=("main", "a" * 40),
                         ):
-                            result = _ecs_mod.ensure_contract_snapshot(
-                                issue_number=_ISSUE_NUMBER,
-                                repo=_REPO,
-                                mode="auto",
-                                do_post=True,
-                            )
+                            with patch.object(
+                                _ecs_mod, "patch_comment", return_value=(True, None)
+                            ):
+                                with patch.object(
+                                    _ecs_mod,
+                                    "verify_controlled_publisher_comment_id_binding",
+                                    return_value=(True, None),
+                                ):
+                                    with patch.object(
+                                        _ecs_mod,
+                                        "verify_snapshot_authority_postcondition",
+                                        return_value=(True, None),
+                                    ):
+                                        result = _ecs_mod.ensure_contract_snapshot(
+                                            issue_number=_ISSUE_NUMBER,
+                                            repo=_REPO,
+                                            mode="auto",
+                                            do_post=True,
+                                        )
 
         assert result["status"] == "ok"
         assert result["contract_snapshot_url"] == f"{_ISSUE_URL}#issuecomment-9999"

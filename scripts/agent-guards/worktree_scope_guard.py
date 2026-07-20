@@ -64,7 +64,15 @@ from skill_runtime_command_policy import (  # noqa: E402
     resolve_default_branch,
     resolve_repo_slug,
 )
-from git_mutation_command_policy import classify_rtk_git_mutation  # noqa: E402
+from git_mutation_command_policy import (  # noqa: E402
+    COMMAND_CLASS_RTK_GIT_MERGE_FF_ONLY,
+    COMMAND_CLASS_RTK_GIT_MERGE_DEFAULT_BRANCH_FF_ONLY,
+    GitMutationPolicyResult,
+    classify_rtk_git_mutation,
+    execute_verified_ff_merge_transaction,
+    execute_verified_default_branch_ff_merge_transaction,
+    parse_controlled_git_change_exec_command,
+)
 from hook_repair_hints import render_hook_command_repair_hint, render_publish_safety_stop_report  # noqa: E402
 
 # Issue #1241 marker: HOOK_COMMAND_REPAIR_HINT_V1 is rendered via hook_repair_hints.py.
@@ -798,18 +806,18 @@ def resolve_project_root() -> str:
     Precedence:
       1. CLAUDE_PROJECT_DIR
       2. settings_json_parent_resolution — walk up from this file
-         (<root>/.claude/hooks/worktree_scope_guard.py) so the `.claude` parent
-         is the project root. Anchored on __file__, never on
-         `git rev-parse --show-toplevel`.
+         (<root>/scripts/agent-guards/worktree_scope_guard.py) so the parent
+         of `scripts/agent-guards` is the project root. Anchored on
+         __file__, never on `git rev-parse --show-toplevel`.
     """
     env_root = os.environ.get("CLAUDE_PROJECT_DIR")
     if env_root:
         return os.path.realpath(env_root)
-    # __file__ = <root>/.claude/hooks/worktree_scope_guard.py
+    # __file__ = <root>/scripts/agent-guards/worktree_scope_guard.py
     here = os.path.realpath(__file__)
-    hooks_dir = os.path.dirname(here)
-    claude_dir = os.path.dirname(hooks_dir)
-    root = os.path.dirname(claude_dir)
+    agent_guards_dir = os.path.dirname(here)
+    scripts_dir = os.path.dirname(agent_guards_dir)
+    root = os.path.dirname(scripts_dir)
     return os.path.realpath(root)
 
 
@@ -1973,6 +1981,156 @@ def _decide_write(
     _block(_rel(resolution.expected, project_root=resolve_project_root()), cwd)
 
 
+def _decide_rtk_git_merge(
+    bounded_rtk_git: "GitMutationPolicyResult",
+    cwd: str,
+    issue: str | None,
+    resolution: "WorktreeResolution",
+    project_root: str,
+) -> None:
+    """Issue #1609 fix_delta (P0 Blocker): authorize -- active Issue resolved,
+    exactly one matching worktree, cwd bound to that worktree, and the
+    worktree is LINKED (not the root/primary checkout) -- BEFORE calling
+    `execute_verified_ff_merge_transaction`. `classify_rtk_git_mutation`'s
+    merge lane is now a PURE shape classifier with no side effects, so this
+    ordering closes the P0 window where the previous design executed the
+    real `git merge --ff-only` as a side effect of classification, before any
+    of these authorization checks ever ran. This function always exits (via
+    `_block_with_reason`) -- it never returns and never lets the caller's raw
+    `rtk git merge` shell command run afterward (mirrors the
+    initial_branch_create push lane's classify-executes-then-always-deny
+    pattern, Issue #1449)."""
+    if bounded_rtk_git.status == "deny":
+        _block_with_reason(
+            _rel(resolution.expected, project_root=project_root) if resolution.expected else "<unresolved>",
+            cwd,
+            bounded_rtk_git.reason_code,
+            bounded_rtk_git.command_class,
+            bounded_rtk_git,
+        )
+    if not issue:
+        _block_with_reason("<issue-context-required>", cwd, "issue_context_required", bounded_rtk_git.command_class)
+    if not resolution.git_available:
+        _block_with_reason("<git-unavailable>", cwd, "no_matching_worktree", bounded_rtk_git.command_class)
+    if resolution.match_count == 0:
+        _block_with_reason("<no-matching-worktree>", cwd, "no_matching_worktree", bounded_rtk_git.command_class)
+    if resolution.expected is None:
+        _block_with_reason("<ambiguous>", cwd, "ambiguous_worktree", bounded_rtk_git.command_class)
+
+    expected_real = os.path.realpath(resolution.expected)
+    if os.path.realpath(project_root) == expected_real:
+        _block_with_reason(
+            _rel(resolution.expected, project_root=project_root),
+            cwd,
+            "expected_worktree_is_root_checkout",
+            bounded_rtk_git.command_class,
+        )
+    if os.path.realpath(cwd) != expected_real:
+        _block_with_reason(
+            _rel(resolution.expected, project_root=project_root),
+            cwd,
+            "cwd_not_expected_worktree",
+            bounded_rtk_git.command_class,
+        )
+
+    transaction = execute_verified_ff_merge_transaction(
+        cwd,
+        bounded_rtk_git.target_sha or "",
+        expected_worktree_realpath=resolution.expected,
+        active_issue_number=issue,
+        remote="origin",
+        timeout=30,
+    )
+    result = GitMutationPolicyResult(
+        status="deny",
+        command_class=bounded_rtk_git.command_class,
+        reason_code=transaction.reason_code,
+        target_branch=transaction.active_branch,
+        local_head=transaction.verified_local_head,
+        current_remote_head=transaction.live_remote_head,
+    )
+    _block_with_reason(
+        _rel(resolution.expected, project_root=project_root),
+        cwd,
+        transaction.reason_code,
+        bounded_rtk_git.command_class,
+        result,
+    )
+
+
+def _decide_rtk_git_merge_default_branch(
+    bounded_rtk_git: "GitMutationPolicyResult",
+    cwd: str,
+    issue: str | None,
+    resolution: "WorktreeResolution",
+    project_root: str,
+) -> None:
+    """Issue #1603: sibling authorization gate to `_decide_rtk_git_merge`
+    (Issue #1589 / #1609 fix_delta), for the default-branch fast-forward
+    sync lane. Authorizes -- active Issue resolved, exactly one matching
+    worktree, cwd bound to that worktree, and the worktree is LINKED (not
+    the root/primary checkout) -- BEFORE calling
+    `execute_verified_default_branch_ff_merge_transaction`. This function
+    always exits (via `_block_with_reason`) -- it never returns and never
+    lets the caller's raw `rtk git merge` shell command run afterward."""
+    if bounded_rtk_git.status == "deny":
+        _block_with_reason(
+            _rel(resolution.expected, project_root=project_root) if resolution.expected else "<unresolved>",
+            cwd,
+            bounded_rtk_git.reason_code,
+            bounded_rtk_git.command_class,
+            bounded_rtk_git,
+        )
+    if not issue:
+        _block_with_reason("<issue-context-required>", cwd, "issue_context_required", bounded_rtk_git.command_class)
+    if not resolution.git_available:
+        _block_with_reason("<git-unavailable>", cwd, "no_matching_worktree", bounded_rtk_git.command_class)
+    if resolution.match_count == 0:
+        _block_with_reason("<no-matching-worktree>", cwd, "no_matching_worktree", bounded_rtk_git.command_class)
+    if resolution.expected is None:
+        _block_with_reason("<ambiguous>", cwd, "ambiguous_worktree", bounded_rtk_git.command_class)
+
+    expected_real = os.path.realpath(resolution.expected)
+    if os.path.realpath(project_root) == expected_real:
+        _block_with_reason(
+            _rel(resolution.expected, project_root=project_root),
+            cwd,
+            "expected_worktree_is_root_checkout",
+            bounded_rtk_git.command_class,
+        )
+    if os.path.realpath(cwd) != expected_real:
+        _block_with_reason(
+            _rel(resolution.expected, project_root=project_root),
+            cwd,
+            "cwd_not_expected_worktree",
+            bounded_rtk_git.command_class,
+        )
+
+    transaction = execute_verified_default_branch_ff_merge_transaction(
+        cwd,
+        bounded_rtk_git.target_branch or "",
+        expected_worktree_realpath=resolution.expected,
+        active_issue_number=issue,
+        remote="origin",
+        timeout=30,
+    )
+    result = GitMutationPolicyResult(
+        status="deny",
+        command_class=bounded_rtk_git.command_class,
+        reason_code=transaction.reason_code,
+        target_branch=transaction.active_branch,
+        local_head=transaction.verified_local_head,
+        current_remote_head=transaction.live_default_branch_oid,
+    )
+    _block_with_reason(
+        _rel(resolution.expected, project_root=project_root),
+        cwd,
+        transaction.reason_code,
+        bounded_rtk_git.command_class,
+        result,
+    )
+
+
 def _decide_bash(
     tool_input: dict, cwd: str, issue: str | None, resolution: "WorktreeResolution", deadline: "object | None" = None
 ) -> None:
@@ -2011,12 +2169,41 @@ def _decide_bash(
     if issue and _is_direct_publish_termination_command(command, _pr):
         _block(_rel(resolution.expected, project_root=_pr) if resolution.expected else "<publish-denied>", cwd)
 
+    # Issue #1611 AC14 (CI repair): the controlled git change executor's
+    # exact invocation is the sole authorized staging/commit path (see
+    # `git_mutation_command_policy.classify_agent_lane_add_commit`, which
+    # denies raw `git add`/`git commit`/`rtk git add`/`rtk git commit`
+    # unconditionally). Its `--cwd` flag, not the PreToolUse `cwd`, is the
+    # operative target -- the caller normally runs it from the root
+    # checkout with `--cwd <linked-issue-worktree>` (mirroring the `uv run
+    # --directory <worktree> git ...` pattern used elsewhere in this repo)
+    # rather than `cd`-ing into the worktree first. Allow only when the
+    # `--cwd` value resolves inside the active issue's resolved worktree;
+    # any other target (main root, a different issue's worktree, an
+    # unresolved/ambiguous worktree) is denied with `worktree_binding_mismatch`.
+    parsed_cgce = parse_controlled_git_change_exec_command(command, _pr)
+    if parsed_cgce is not None:
+        if resolution.expected and is_inside(resolution.expected, parsed_cgce.cwd, cwd):
+            _allow()
+        _block_worktree_binding_mismatch(cwd)
+
     bounded_rtk_git = classify_rtk_git_mutation(
         command=command,
         cwd=cwd,
         require_active_branch_push=True,
     )
     if bounded_rtk_git is not None:
+        if bounded_rtk_git.command_class == COMMAND_CLASS_RTK_GIT_MERGE_DEFAULT_BRANCH_FF_ONLY:
+            # Issue #1603: default-branch sync lane authorization -- distinct
+            # command class from the active-branch remote-head lane below,
+            # routed through its own trusted transaction. Always exits.
+            _decide_rtk_git_merge_default_branch(bounded_rtk_git, cwd, issue, resolution, _pr)
+        if bounded_rtk_git.command_class == COMMAND_CLASS_RTK_GIT_MERGE_FF_ONLY:
+            # Issue #1609 fix_delta (P0 Blocker): authorize BEFORE executing
+            # the merge transaction -- see _decide_rtk_git_merge. This call
+            # always exits (never returns, never falls through to the
+            # add/commit/push handling below).
+            _decide_rtk_git_merge(bounded_rtk_git, cwd, issue, resolution, _pr)
         if bounded_rtk_git.status == "deny":
             _block_with_reason(
                 _rel(resolution.expected, project_root=_pr) if resolution.expected else "<unresolved>",
@@ -2690,6 +2877,23 @@ def _decide_cleanup_bash(command: str, cwd: str, contract: dict | None) -> tuple
         return "allow", "cleanup_branch_delete_ok"
 
     return "deny", "not_a_cleanup_command"
+
+
+def _block_worktree_binding_mismatch(actual_cwd: str) -> None:
+    """Emit a bounded block message for the controlled_git_change_exec.py
+    executor's `--cwd` flag not resolving inside the active issue worktree
+    (Issue #1611 AC14). Uses the same `reason: <code>` bounded-line format
+    `_block_cleanup` below uses, so tooling that greps a stderr line
+    starting with ``reason: `` (e.g. `scripts/ci/codex_execpolicy_matrix.py`)
+    can extract it uniformly across both denial classes.
+    """
+    lines = [
+        "[worktree_scope_guard] blocked: mutation outside active issue worktree",
+        "reason: worktree_binding_mismatch",
+        f"actual_cwd: {actual_cwd or '<unknown>'}",
+    ]
+    sys.stderr.write("\n".join(lines) + "\n")
+    sys.exit(2)
 
 
 def _block_cleanup(reason: str) -> None:

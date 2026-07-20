@@ -32,6 +32,18 @@ from typing import Any
 
 import jsonschema as _jsonschema
 
+# Issue #1554 PR #1581 OWNER REQUEST_CHANGES Blocker 2: the producer must run
+# the SAME strict `REVIEWER_BLOCKER_CLAIM_V1` shape validation the consumer
+# (`parent_replay_binding.py`) runs, immediately after building the claim and
+# BEFORE any stdout is written. `parent_replay_binding.py` itself is not
+# modified -- only its `validate_reviewer_blocker_claim()` is imported and
+# reused (Out of Scope: duplicating that logic here).
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+import parent_replay_binding as _prb  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Schema constants (SSOT for ISSUE_REVIEW_RESULT_COMPACT_V1)
 # ---------------------------------------------------------------------------
@@ -56,6 +68,27 @@ VALID_NEXT_ACTIONS = {"proceed", "request_changes", "human_judgment_required"}
 REVIEW_RESULT_SCHEMA_PATH = (
     Path(__file__).resolve().parent.parent.parent / "review-issue" / "schemas" / "review_issue_result_v1.json"
 )
+
+# Issue #1541 PR #1557 OWNER REQUEST_CHANGES High-1: the "wire bytes" contract
+# is the EXACT byte sequence that ends up on stdout -- one trailing LF after
+# the last of `stdout_lines`, not `"\n".join(stdout_lines)` alone. Every
+# producer/validator in the chain (this module, `emit_parent_review_envelope_v2.py`
+# `validate_child_intermediate()`, `validate_review_compact_output.py`) MUST
+# measure/compare this SAME byte sequence, or a producer can emit output it
+# believes is within budget while a downstream consumer measures one byte
+# more (the final LF) and rejects it as `byte_budget_exceeded` -- exactly the
+# boundary bug this constant/helper closes.
+
+
+def wire_bytes(stdout_lines: list[str]) -> bytes:
+    """The exact UTF-8 byte sequence written to stdout for `stdout_lines`:
+    each line followed by a single LF (matching `print(line, flush=True)`
+    called once per line), i.e. `"\\n".join(stdout_lines) + "\\n"`. This is
+    the SSOT byte-count contract shared by every producer/validator that
+    measures the 2048-byte budget (High-1)."""
+    if not stdout_lines:
+        return b""
+    return ("\n".join(stdout_lines) + "\n").encode("utf-8")
 
 
 def _default_artifact_dir() -> Path:
@@ -230,7 +263,7 @@ def _emit_failure_envelope(
     """
     Emit canonical failure envelope to stdout and write failure artifact.
 
-    stdout format (always ≤ 2048 UTF-8 bytes):
+    stdout format (always <= 2048 UTF-8 wire bytes, see `wire_bytes()`):
       STATUS: failed
       NEXT_ACTION: <next_action>
       REASON_CODE: <reason_code>
@@ -256,12 +289,13 @@ def _emit_failure_envelope(
         f"ARTIFACT_SHA256: {artifact_sha256}",
     ]
 
-    # Enforce 2048-byte cap on the envelope itself; truncate artifact_ref if needed
-    envelope_text = "\n".join(lines)
-    if len(envelope_text.encode("utf-8")) > 2048:
+    # Issue #1541 High-1: enforce the 2048-byte cap on the EXACT wire bytes
+    # (lines joined by LF, plus the trailing LF the final `print()` call
+    # emits) -- not on the pre-trailing-LF join alone. Truncate artifact_ref
+    # if needed.
+    if len(wire_bytes(lines)) > 2048:
         short_ref = artifact_ref[:80] + "..." if len(artifact_ref) > 80 else artifact_ref
         lines[3] = f"ARTIFACT: {short_ref}"
-        envelope_text = "\n".join(lines)
 
     for line in lines:
         print(line, flush=True)
@@ -425,33 +459,77 @@ def compact_review_result(
             body_sha256_raw if isinstance(body_sha256_raw, str) and body_sha256_raw else "sha256:" + ("0" * 64)
         )
         claim_blockers: list[dict[str, Any]] = []
-        for item in blocking_issues:
-            if isinstance(item, dict):
-                code = str(item.get("code") or item.get("reviewer_blocker_code") or "").strip()
-                if not code:
+        # Issue #1554: prefer the deterministic checker's own
+        # `structured_blockers[].code` over the human-readable
+        # `blocking_issues` prose when `structured_blockers` is non-empty.
+        # This keeps `REVIEWER_BLOCKER_CLAIM_V1.blockers[].reviewer_blocker_code`
+        # aligned with the taxonomy the parent-local replay
+        # (`parent_replay_binding.py`) knows how to back with parent-owned
+        # evidence, instead of a `blocking_issues` prose string that never
+        # normalizes to a registered taxonomy entry_id. `blocking_issues`
+        # remains the fallback ONLY when `structured_blockers` is empty
+        # (schema requires the key but allows an empty array).
+        structured_blockers_list = raw_result.get("structured_blockers") or []
+        if structured_blockers_list:
+            for item in structured_blockers_list:
+                if not isinstance(item, dict):
                     continue
+                # Issue #1554 PR #1581 OWNER REQUEST_CHANGES Blocker 2: no
+                # implicit `str(...).strip()` conversion of `code` here --
+                # the raw value is passed through unchanged so strict
+                # validation (below) sees exactly what the checker produced
+                # and can fail closed on it (whitespace-only, over-length,
+                # wrong type), rather than this loop silently normalizing or
+                # skipping a bad entry.
                 claim_blockers.append(
                     {
-                        "reviewer_blocker_code": code,
+                        "reviewer_blocker_code": item.get("code"),
                         "message": item.get("message"),
                         "line_start": item.get("line_start"),
                         "line_end": item.get("line_end"),
                     }
                 )
-            elif isinstance(item, str) and item.strip():
-                claim_blockers.append(
-                    {
-                        "reviewer_blocker_code": item.strip(),
-                        "message": None,
-                        "line_start": None,
-                        "line_end": None,
-                    }
-                )
+        else:
+            for item in blocking_issues:
+                if isinstance(item, dict):
+                    code_raw = item.get("code")
+                    if code_raw is None:
+                        code_raw = item.get("reviewer_blocker_code")
+                    claim_blockers.append(
+                        {
+                            "reviewer_blocker_code": code_raw,
+                            "message": item.get("message"),
+                            "line_start": item.get("line_start"),
+                            "line_end": item.get("line_end"),
+                        }
+                    )
+                elif isinstance(item, str) and item.strip():
+                    claim_blockers.append(
+                        {
+                            "reviewer_blocker_code": item.strip(),
+                            "message": None,
+                            "line_start": None,
+                            "line_end": None,
+                        }
+                    )
         reviewer_blocker_claim = {
             "schema": "REVIEWER_BLOCKER_CLAIM_V1",
             "body_sha256": body_sha256,
             "blockers": claim_blockers,
         }
+        # Issue #1554 PR #1581 OWNER REQUEST_CHANGES Blocker 2: producer-side
+        # strict validation, reusing (never duplicating) the consumer's own
+        # `parent_replay_binding.validate_reviewer_blocker_claim()`. Any
+        # shape violation (empty/over-length code, non-int/non-null line
+        # fields, disallowed/missing keys, oversized blockers array) fails
+        # the WHOLE claim closed as a producer failure -- no per-entry
+        # silent skip, no implicit type coercion, no success envelope.
+        try:
+            _prb.validate_reviewer_blocker_claim(reviewer_blocker_claim)
+        except ValueError as exc:
+            raise ValueError(
+                f"REVIEWER_BLOCKER_CLAIM_V1 producer-side strict validation failed: {exc}"
+            ) from exc
         claim_line = _strict_json_dumps_compact(reviewer_blocker_claim)
         compact_data["REVIEWER_BLOCKER_CLAIM"] = claim_line
         stdout_lines.append(f"REVIEWER_BLOCKER_CLAIM: {claim_line}")
@@ -550,11 +628,20 @@ def main() -> int:
         )
         return 2
 
-    # B3: enforce 2048 UTF-8 bytes limit BEFORE writing success artifact
-    byte_count = len(output_text.encode("utf-8"))
+    # Issue #1541 High-1: enforce the 2048 UTF-8 byte limit on the EXACT wire
+    # bytes (`wire_bytes()` -- lines joined by LF, plus the trailing LF the
+    # final `print()` call below emits), BEFORE writing the success artifact.
+    # The previous implementation measured `"\n".join(stdout_lines)` alone
+    # (omitting that trailing LF), so a producer could self-measure exactly
+    # 2048 bytes while the actual stdout it printed was 2049 bytes -- a
+    # downstream consumer independently measuring the real wire bytes (e.g.
+    # `emit_parent_review_envelope_v2.validate_child_intermediate()`) would
+    # then reject output this producer believed was within budget.
+    wire = wire_bytes(stdout_lines)
+    byte_count = len(wire)
     if byte_count > 2048:
         # AC3: no success artifact written; save details to failure artifact only
-        output_sha256 = hashlib.sha256(output_text.encode("utf-8")).hexdigest()
+        output_sha256 = hashlib.sha256(wire).hexdigest()
         _emit_failure_envelope(
             reason_code="output_budget_violation",
             next_action="human_judgment_required",

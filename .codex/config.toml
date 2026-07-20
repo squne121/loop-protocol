@@ -6,6 +6,18 @@ default_permissions = "loop-protocol-rtk"
 # Known limitation: this is a fail-closed local guardrail, not a security boundary.
 # Project-local config is not evidence of profile routing; runtime evidence must
 # come from spawned custom-agent events and validated launch-ledger inputs.
+#
+# Issue #1611 (contract revision, P1-2): the `assets`/`LICENSES`/`secrets`
+# read-only workspace_roots below are a PARTIAL validated mirror of the
+# `root_directory` rules in `scripts/agent-guards/protected_paths_policy.v1.json`
+# (PROTECTED_PATHS_POLICY_V1, the JSON SSOT). This permission profile grammar
+# has no per-basename-glob primitive, so the `.env`/`.env.*` `basename_glob`
+# rules from that JSON are NOT representable here -- dotenv protection is
+# enforced at the git-staging/commit layer (`controlled_git_change_exec.py`)
+# and the Codex apply_patch/Edit/Write hook (`scripts/check-codex-agents.mjs`
+# `isProtectedPath()`, which reads the JSON SSOT directly), not via this
+# workspace_roots table. If the JSON's `root_directory` rule set changes,
+# update this table to match.
 
 [agents]
 max_depth = 1
@@ -18,6 +30,7 @@ max_depth = 1
 "." = "write"
 "assets" = "read"
 "LICENSES" = "read"
+"secrets" = "read"
 
 [permissions.loop-protocol-rtk.network]
 enabled = true
@@ -37,6 +50,7 @@ enabled = true
 "." = "read"
 "assets" = "read"
 "LICENSES" = "read"
+"secrets" = "read"
 
 [permissions.loop-protocol-readonly.network]
 enabled = true
@@ -54,6 +68,7 @@ enabled = true
 "." = "write"
 "assets" = "read"
 "LICENSES" = "read"
+"secrets" = "read"
 
 [permissions.loop-protocol-bootstrap.network]
 enabled = true

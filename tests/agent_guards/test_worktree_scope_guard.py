@@ -4,8 +4,14 @@
 Covers AC1..AC15 of WORKTREE_SCOPE_RESOLUTION_V1 / MUTATING_BASH_CLASSIFIER_V1.
 
 Path anchoring: this test resolves the guard via __file__ (worktree-local), NOT via
-`git rev-parse --show-toplevel`, because worktree isolation makes the latter return
-the main repo root. (Mirrors test_secret_boundary_contract.py.)
+`git rev-parse --show-toplevel`. Inside a linked git worktree, `git rev-parse
+--show-toplevel` returns THAT worktree's own toplevel -- NOT the main repository
+root (an earlier revision of this docstring incorrectly claimed the opposite; see
+`test_git_rev_parse_show_toplevel_returns_linked_worktree_root` below for a
+regression test of this exact distinction). Relying on `--show-toplevel` here
+would silently anchor the test at whichever worktree happens to be the cwd
+instead of the fixed worktree-local `scripts/agent-guards/worktree_scope_guard.py`.
+(Mirrors test_secret_boundary_contract.py.)
 
 Test harness: each test builds an isolated temporary git repo + a real
 `issue-<n>-<slug>` worktree, points CLAUDE_PROJECT_DIR at the repo root and
@@ -23,87 +29,52 @@ from pathlib import Path
 
 import pytest
 
-# Anchor on __file__ for worktree isolation.
-_THIS_FILE = Path(__file__).resolve()
-REPO_ROOT = _THIS_FILE.parent.parent.parent.parent  # worktree root
-GUARD_SH = REPO_ROOT / ".claude" / "hooks" / "worktree_scope_guard.sh"
-GUARD_PY = REPO_ROOT / ".claude" / "hooks" / "worktree_scope_guard.py"
-SETTINGS_JSON = REPO_ROOT / ".claude" / "settings.json"
-
+from worktree_scope_guard_testkit import (
+    GUARD_PY,
+    GUARD_SH,
+    REPO_ROOT,
+    SETTINGS_JSON,
+    _bash_payload,
+    _git,
+    _make_repo_with_worktree,
+    _run_guard,
+    _write_text,
+)
 
 # =============================================================================
 # Harness
+#
+# Issue #1657 AC8: the shared harness helpers (_git, _make_repo_with_worktree,
+# _run_guard, _write_text, _bash_payload, REPO_ROOT/GUARD_SH/GUARD_PY/
+# SETTINGS_JSON) live in worktree_scope_guard_testkit.py (imported above) and
+# are NOT redefined here. Sibling test modules import them from the same
+# testkit module explicitly instead of doing a bare `from
+# test_worktree_scope_guard import ...` test-to-test import.
 # =============================================================================
 
 
-def _git(*args, cwd):
-    return subprocess.run(
-        ["git", *args],
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        check=True,
-        env={
-            **os.environ,
-            "GIT_AUTHOR_NAME": "t",
-            "GIT_AUTHOR_EMAIL": "t@t",
-            "GIT_COMMITTER_NAME": "t",
-            "GIT_COMMITTER_EMAIL": "t@t",
-        },
-    )
+def test_git_rev_parse_show_toplevel_returns_linked_worktree_root(tmp_path: Path) -> None:
+    """AC7 (Issue #1657): `git rev-parse --show-toplevel`, executed with cwd
+    inside a LINKED git worktree, returns THAT worktree's own toplevel path --
+    it does NOT return the main repository root. This is the corrected claim;
+    an earlier revision of this module's docstring asserted the opposite,
+    which is why `worktree_scope_guard.py` deliberately anchors project_root
+    resolution on `__file__` / `CLAUDE_PROJECT_DIR` instead of
+    `git rev-parse --show-toplevel` (see the module docstring above)."""
+    repo = _make_repo_with_worktree(tmp_path, issue="942", slug="x")
+    main_root = repo["root"]
+    worktree = repo["worktree"]
 
+    main_toplevel = _git("rev-parse", "--show-toplevel", cwd=main_root).stdout.strip()
+    worktree_toplevel = _git("rev-parse", "--show-toplevel", cwd=worktree).stdout.strip()
 
-def _make_repo_with_worktree(tmp_path: Path, issue: str = "942", slug: str = "x", extra_worktrees=None) -> dict:
-    """Create a git repo + a real issue worktree. Returns dict with paths."""
-    main = tmp_path / "repo"
-    main.mkdir()
-    _git("init", "-q", "-b", "main", cwd=main)
-    _git("remote", "add", "origin", "https://github.com/squne121/loop-protocol.git", cwd=main)
-    (main / ".gitignore").write_text(".cache/\n__pycache__/\ntmp/\n")
-    (main / "README.md").write_text("seed\n")
-    _git("add", "README.md", ".gitignore", cwd=main)
-    _git("commit", "-q", "-m", "seed", cwd=main)
-
-    worktrees = {}
-    wt_path = main / ".claude" / "worktrees" / f"issue-{issue}-{slug}"
-    wt_path.parent.mkdir(parents=True, exist_ok=True)
-    branch = f"issue-{issue}-{slug}"
-    _git("branch", branch, cwd=main)
-    _git("worktree", "add", "-q", str(wt_path), branch, cwd=main)
-    worktrees[issue] = wt_path
-
-    for extra in extra_worktrees or []:
-        ei, es = extra
-        ewt = main / ".claude" / "worktrees" / f"issue-{ei}-{es}"
-        eb = f"issue-{ei}-{es}"
-        _git("branch", eb, cwd=main)
-        _git("worktree", "add", "-q", str(ewt), eb, cwd=main)
-        worktrees[ei] = ewt
-
-    return {"root": main, "worktree": wt_path, "worktrees": worktrees}
-
-
-def _run_guard(payload: dict, project_root: Path, issue: str | None = None, extra_env: dict | None = None):
-    env = dict(os.environ)
-    env["CLAUDE_PROJECT_DIR"] = str(project_root)
-    if issue is not None:
-        env["LOOP_ISSUE_NUMBER"] = str(issue)
-    else:
-        env.pop("LOOP_ISSUE_NUMBER", None)
-    if extra_env:
-        env.update(extra_env)
-    return subprocess.run(
-        ["bash", str(GUARD_SH)],
-        input=json.dumps(payload),
-        text=True,
-        capture_output=True,
-        env=env,
-    )
-
-
-def _write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
+    assert os.path.realpath(main_toplevel) == os.path.realpath(str(main_root))
+    assert os.path.realpath(worktree_toplevel) == os.path.realpath(str(worktree))
+    # The key regression assertion: the worktree's own show-toplevel result is
+    # NOT the main repo root -- contradicting the earlier incorrect docstring
+    # claim that worktree isolation makes --show-toplevel "return the main
+    # repo root".
+    assert os.path.realpath(worktree_toplevel) != os.path.realpath(str(main_root))
 
 
 def _install_skill_runtime_exec_fixture(repo_root: Path, catalog_mode: str = "active") -> None:
@@ -1677,10 +1648,6 @@ if str(_AGENT_OPS) not in _sys.path:
 import cleanup_contract_v3 as _cc3  # noqa: E402
 
 
-def _bash_payload(command: str, cwd: str) -> dict:
-    return {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": cwd}
-
-
 def _write_v3(
     root, wt_real, branch, operation, *, expired=False, bad_hash=False, bad_op=False, corrupt=False, nonce="0" * 32
 ):
@@ -2943,3 +2910,41 @@ def test_worktree_scope_guard_anchor_matrix_no_split_brain_with_policy_parser(tm
         assert guard_allows == parser_allows, (
             f"split-brain: guard={guard_allows} parser={parser_allows} for {command!r}"
         )
+
+
+# Issue 1609 fix_delta P0 Blocker regression: the merge lane authorization
+# (active Issue resolved, matching worktree count, cwd binding) must run
+# BEFORE any merge transaction executes -- every unauthorized shape below
+# must leave HEAD completely untouched.
+def test_merge_ff_only_authorizes_before_transaction(tmp_path):
+    repo = _make_repo_with_worktree(tmp_path, issue="1609", slug="mergeauth", extra_worktrees=[("1609", "other")])
+    worktree = repo["worktrees"]["1609"]
+    _git("checkout", "-q", "-b", "worktree-issue-1609-mergeauth", cwd=worktree)
+    head_before = _git("rev-parse", "HEAD", cwd=worktree).stdout.strip()
+    fake_sha = "a" * 40
+    command = "rtk git merge --ff-only " + fake_sha
+    payload = _bash_payload(command, str(worktree))
+
+    # (a) no active Issue context at all.
+    r = _run_guard(payload, repo["root"], issue=None)
+    assert r.returncode != 0
+    assert _git("rev-parse", "HEAD", cwd=worktree).stdout.strip() == head_before
+
+    # (b) active Issue set but zero / ambiguous matching worktree for that
+    # number -- "1609" now resolves to TWO worktrees (mergeauth + other).
+    r = _run_guard(payload, repo["root"], issue="1609")
+    assert r.returncode != 0
+    assert _git("rev-parse", "HEAD", cwd=worktree).stdout.strip() == head_before
+
+    # (c) active Issue set to a number with zero matching worktree.
+    r = _run_guard(payload, repo["root"], issue="424242")
+    assert r.returncode != 0
+    assert _git("rev-parse", "HEAD", cwd=worktree).stdout.strip() == head_before
+
+    # (d) cwd outside the expected worktree (the repo root itself).
+    root_head_before = _git("rev-parse", "HEAD", cwd=repo["root"]).stdout.strip()
+    payload_root = _bash_payload(command, str(repo["root"]))
+    r = _run_guard(payload_root, repo["root"], issue="1609")
+    assert r.returncode != 0
+    assert _git("rev-parse", "HEAD", cwd=repo["root"]).stdout.strip() == root_head_before
+    assert _git("rev-parse", "HEAD", cwd=worktree).stdout.strip() == head_before
