@@ -664,3 +664,389 @@ class TestPostconditionExtended:
         # No violation should reference artifacts/1166/
         for v in violations:
             assert "artifacts/1166/" not in v, f"Unexpected violation: {v}"
+
+
+# =============================================================================
+# Issue #1632: issue_dependency.remove
+# =============================================================================
+
+ISSUE_DEPENDENCY_REMOVE_COMMAND_ID = "issue_dependency.remove"
+ISSUE_DEPENDENCY_REMOVE_SCHEMA = "ISSUE_DEPENDENCY_REMOVE_INPUT_V1"
+
+
+def _dep_remove_input_dir(tmp_project, issue_number=1523):
+    d = (
+        tmp_project / "artifacts" / str(issue_number) / "issue-metadata"
+        / ISSUE_DEPENDENCY_REMOVE_COMMAND_ID
+    )
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _dep_remove_write_input(tmp_project, issue_number=1523, **overrides):
+    d = _dep_remove_input_dir(tmp_project, issue_number)
+    payload = {
+        "schema": ISSUE_DEPENDENCY_REMOVE_SCHEMA,
+        "issue_number": issue_number,
+        "repo": TRUSTED_REPO,
+        "target_blocker_number": 1403,
+        "expected_blocked_issue_node_id": "ISSUE_NODE_BLOCKED",
+        "expected_blocker_node_id": "ISSUE_NODE_BLOCKER",
+        "expected_blocked_by_numbers": [1403],
+        "expected_pre_mutation_snapshot_sha256": "sha256:" + "0" * 64,
+        "idempotency_key": f"{TRUSTED_REPO}:{issue_number}:1403:v1",
+    }
+    payload.update(overrides)
+    f = d / "input.json"
+    f.write_text(json.dumps(payload))
+    return f"artifacts/{issue_number}/issue-metadata/{ISSUE_DEPENDENCY_REMOVE_COMMAND_ID}/input.json"
+
+
+def _dep_remove_main_args(tmp_project, input_rel_path, issue_number=1523):
+    return [
+        "--command-id", ISSUE_DEPENDENCY_REMOVE_COMMAND_ID,
+        "--issue-number", str(issue_number),
+        "--input-file", input_rel_path,
+        "--repo", TRUSTED_REPO,
+    ]
+
+
+def _blocked_by_page(blocked_id, blocked_number, nodes, has_next=False, end_cursor=None,
+                      state="OPEN"):
+    return {
+        "repository": {
+            "issue": {
+                "id": blocked_id,
+                "number": blocked_number,
+                "state": state,
+                "blockedBy": {
+                    "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor},
+                    "nodes": nodes,
+                },
+            }
+        }
+    }
+
+
+def _node(node_id, number, state="CLOSED"):
+    return {
+        "id": node_id, "number": number, "state": state,
+        "repository": {"nameWithOwner": TRUSTED_REPO},
+    }
+
+
+class TestIssueDependencyRemoveAllPageReadback:
+    """AC2: exhaustive all-page readback; cursor/schema drift is rejected."""
+
+    def test_issue_dependency_remove_reads_all_pages_and_rejects_cursor_or_schema_drift(
+        self, tmp_project, monkeypatch
+    ):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        _dep_remove_write_input(
+            tmp_project,
+            expected_blocked_by_numbers=[1400, 1403],
+            expected_pre_mutation_snapshot_sha256="sha256:" + "0" * 64,
+        )
+
+        page1 = _blocked_by_page(
+            "ISSUE_NODE_BLOCKED", 1523, [_node("N1400", 1400)],
+            has_next=True, end_cursor="CURSOR1",
+        )
+        page2 = _blocked_by_page(
+            "ISSUE_NODE_BLOCKED", 1523, [_node("N1403", 1403)],
+            has_next=False,
+        )
+
+        with patch.object(_exec, "_graphql_call", side_effect=[
+            (page1, ""), (page2, ""),
+        ]):
+            result, err = _exec._fetch_blocked_by_all_pages(
+                1523, TRUSTED_REPO, "gh", {}
+            )
+        assert err == ""
+        assert result["page_count"] == 2
+        assert sorted(n["number"] for n in result["nodes"]) == [1400, 1403]
+
+        # Cursor/schema drift: hasNextPage True but endCursor missing/None.
+        bad_page = _blocked_by_page(
+            "ISSUE_NODE_BLOCKED", 1523, [_node("N1400", 1400)],
+            has_next=True, end_cursor=None,
+        )
+        with patch.object(_exec, "_graphql_call", return_value=(bad_page, "")):
+            result2, err2 = _exec._fetch_blocked_by_all_pages(1523, TRUSTED_REPO, "gh", {})
+        assert result2 is None
+        assert "cursor" in err2
+
+        # Duplicate node across pages is rejected.
+        dup_page1 = _blocked_by_page(
+            "ISSUE_NODE_BLOCKED", 1523, [_node("N1403", 1403)],
+            has_next=True, end_cursor="CURSOR1",
+        )
+        dup_page2 = _blocked_by_page(
+            "ISSUE_NODE_BLOCKED", 1523, [_node("N1403", 1403)],
+            has_next=False,
+        )
+        with patch.object(_exec, "_graphql_call", side_effect=[
+            (dup_page1, ""), (dup_page2, ""),
+        ]):
+            result3, err3 = _exec._fetch_blocked_by_all_pages(1523, TRUSTED_REPO, "gh", {})
+        assert result3 is None
+        assert "duplicate" in err3
+
+
+class TestIssueDependencyRemoveCredentialActor:
+    """AC3: trusted credential actor readback gates the mutation."""
+
+    def test_issue_dependency_remove_rejects_untrusted_or_unreadable_credential_actor(
+        self, tmp_project, monkeypatch
+    ):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        input_rel = _dep_remove_write_input(tmp_project)
+
+        # Unreadable actor (login fetch fails) -- fail closed, no GraphQL call.
+        with patch.object(_exec, "_fetch_authenticated_login",
+                           return_value=(None, "gh_api_authenticated_user_empty")):
+            with patch.object(_exec, "_graphql_call") as mock_gql:
+                rc = _exec.main(_dep_remove_main_args(tmp_project, input_rel))
+        assert rc == 1
+        mock_gql.assert_not_called()
+
+        # Authorized-but-insufficient permission -- fail closed, no GraphQL call.
+        with patch.object(_exec, "_fetch_authenticated_login", return_value=("bot", "")):
+            with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
+                               return_value=("bot", "read", "")):
+                with patch.object(_exec, "_graphql_call") as mock_gql2:
+                    rc2 = _exec.main(_dep_remove_main_args(tmp_project, input_rel))
+        assert rc2 == 1
+        mock_gql2.assert_not_called()
+
+
+class TestIssueDependencyRemoveClosedStatusNoRetry:
+    """AC4: closed result status set; transport/GraphQL failure is never
+    automatically retried within one invocation."""
+
+    def test_issue_dependency_remove_records_closed_status_and_never_retries_mutation(
+        self, tmp_project, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        input_rel = _dep_remove_write_input(tmp_project)
+
+        pre_page = _blocked_by_page(
+            "ISSUE_NODE_BLOCKED", 1523, [_node("ISSUE_NODE_BLOCKER", 1403)],
+        )
+        pre_hash = _exec._compute_blocked_by_snapshot_sha256(
+            "ISSUE_NODE_BLOCKED", 1523, [{"id": "ISSUE_NODE_BLOCKER", "number": 1403, "state": "CLOSED"}]
+        )
+        input_rel = _dep_remove_write_input(
+            tmp_project, expected_pre_mutation_snapshot_sha256=pre_hash
+        )
+
+        call_count = {"mutation": 0}
+
+        def fake_graphql(gh_bin, env, query, variables):
+            if "removeBlockedBy" in query:
+                call_count["mutation"] += 1
+                return None, "gh_api_graphql_failed: transport error"
+            return pre_page, ""
+
+        with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
+                           return_value=("bot", "write", "")):
+            with patch.object(_exec, "_graphql_call", side_effect=fake_graphql):
+                rc = _exec.main(_dep_remove_main_args(tmp_project, input_rel) + ["--json"])
+        assert rc == 1
+        assert call_count["mutation"] == 1  # never retried automatically
+        out = json.loads(capsys.readouterr().out)
+        assert out["status"] == "transport_or_schema_error"
+
+    def test_issue_dependency_remove_success_reports_removed_status(
+        self, tmp_project, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        pre_nodes = [{"id": "ISSUE_NODE_BLOCKER", "number": 1403, "state": "CLOSED"}]
+        pre_hash = _exec._compute_blocked_by_snapshot_sha256("ISSUE_NODE_BLOCKED", 1523, pre_nodes)
+        input_rel = _dep_remove_write_input(
+            tmp_project, expected_pre_mutation_snapshot_sha256=pre_hash
+        )
+        pre_page = _blocked_by_page(
+            "ISSUE_NODE_BLOCKED", 1523, [_node("ISSUE_NODE_BLOCKER", 1403)],
+        )
+        post_page = _blocked_by_page("ISSUE_NODE_BLOCKED", 1523, [])
+
+        mutation_response = {
+            "removeBlockedBy": {"issue": {"id": "ISSUE_NODE_BLOCKED", "number": 1523}}
+        }
+        responses = iter([pre_page, mutation_response, post_page])
+
+        def fake_graphql(gh_bin, env, query, variables):
+            return next(responses), ""
+
+        with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
+                           return_value=("bot", "admin", "")):
+            with patch.object(_exec, "_graphql_call", side_effect=fake_graphql):
+                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
+                    rc = _exec.main(_dep_remove_main_args(tmp_project, input_rel) + ["--json"])
+        assert rc == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["status"] == "removed"
+        assert out["idempotency_marker_written"] is True
+
+
+class TestIssueDependencyRemovePostconditionAndIdempotency:
+    """AC5: all-page post-mutation readback + idempotency marker."""
+
+    def test_issue_dependency_remove_requires_all_page_post_snapshot_and_idempotency_marker(
+        self, tmp_project, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        pre_nodes = [{"id": "ISSUE_NODE_BLOCKER", "number": 1403, "state": "CLOSED"}]
+        pre_hash = _exec._compute_blocked_by_snapshot_sha256("ISSUE_NODE_BLOCKED", 1523, pre_nodes)
+        input_rel = _dep_remove_write_input(
+            tmp_project, expected_pre_mutation_snapshot_sha256=pre_hash
+        )
+        pre_page = _blocked_by_page(
+            "ISSUE_NODE_BLOCKED", 1523, [_node("ISSUE_NODE_BLOCKER", 1403)],
+        )
+        # Postcondition failure: target relationship still present after mutation.
+        post_page_still_present = _blocked_by_page(
+            "ISSUE_NODE_BLOCKED", 1523, [_node("ISSUE_NODE_BLOCKER", 1403)],
+        )
+        responses = iter([
+            pre_page,
+            {"removeBlockedBy": {"issue": {"id": "ISSUE_NODE_BLOCKED", "number": 1523}}},
+            post_page_still_present,
+        ])
+
+        def fake_graphql(gh_bin, env, query, variables):
+            return next(responses), ""
+
+        with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
+                           return_value=("bot", "write", "")):
+            with patch.object(_exec, "_graphql_call", side_effect=fake_graphql):
+                rc = _exec.main(_dep_remove_main_args(tmp_project, input_rel) + ["--json"])
+        assert rc == 1
+        out = json.loads(capsys.readouterr().out)
+        assert out["status"] == "postcondition_rejected"
+
+        # Idempotency: marker present + fresh readback confirms already absent.
+        marker_path = _exec._issue_metadata_marker_path(
+            tmp_project, 1523, ISSUE_DEPENDENCY_REMOVE_COMMAND_ID,
+            "issue_dependency_remove.marker.json",
+        )
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps({
+            "schema": "ISSUE_DEPENDENCY_REMOVE_MARKER_V1",
+            "idempotency_key": f"{TRUSTED_REPO}:1523:1403:v1",
+        }))
+        already_absent_page = _blocked_by_page("ISSUE_NODE_BLOCKED", 1523, [])
+        with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
+                           return_value=("bot", "write", "")):
+            with patch.object(_exec, "_graphql_call", return_value=(already_absent_page, "")) as mock_gql:
+                rc2 = _exec.main(_dep_remove_main_args(tmp_project, input_rel) + ["--json"])
+        assert rc2 == 0
+        out2 = json.loads(capsys.readouterr().out)
+        assert out2["status"] == "already_completed"
+        # Only the pre-mutation readback call was made -- no mutation attempted.
+        assert mock_gql.call_count == 1
+
+
+class TestIssueDependencyRemoveFailurePathsFailClosed:
+    """AC6: dedicated failure-path fail-closed matrix, no real network mutation."""
+
+    def test_issue_dependency_remove_failure_paths_fail_closed_without_network_mutation(
+        self, tmp_project, monkeypatch
+    ):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+
+        def _assert_blocked(overrides, expect_rc=2):
+            input_rel = _dep_remove_write_input(tmp_project, **overrides)
+            with patch.object(_exec, "_graphql_call") as mock_gql:
+                rc = _exec.main(_dep_remove_main_args(tmp_project, input_rel))
+            assert rc == expect_rc, f"overrides={overrides} rc={rc}"
+            mock_gql.assert_not_called()
+
+        # unknown key
+        _assert_blocked({"unexpected_field": "x"})
+        # bool number
+        _assert_blocked({"target_blocker_number": True})
+        # duplicate set
+        _assert_blocked({"expected_blocked_by_numbers": [1403, 1403]})
+        # unsorted set
+        _assert_blocked({"expected_blocked_by_numbers": [1403, 100]})
+        # oversize set
+        oversize = list(range(1, _exec.ISSUE_DEPENDENCY_REMOVE_MAX_BLOCKED_BY_NUMBERS + 2))
+        _assert_blocked({"expected_blocked_by_numbers": oversize, "target_blocker_number": oversize[0]})
+        # null issue_number
+        _assert_blocked({"issue_number": None})
+        # wrong repo
+        _assert_blocked({"repo": "attacker/evil-repo"})
+
+        # -- GraphQL errors / cursor failure / schema drift during precondition
+        # readback -- fail closed before any mutation call.
+        input_rel = _dep_remove_write_input(tmp_project)
+        with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
+                           return_value=("bot", "write", "")):
+            with patch.object(_exec, "_graphql_call",
+                               return_value=(None, "gh_api_graphql_errors: boom")) as mock_gql:
+                rc = _exec.main(_dep_remove_main_args(tmp_project, input_rel))
+        assert rc == 1
+        mock_gql.assert_called_once()
+
+        # -- Hash / actor / node-id / state mismatch: precondition_rejected,
+        # no mutation call.
+        wrong_state_page = _blocked_by_page(
+            "ISSUE_NODE_BLOCKED", 1523, [_node("ISSUE_NODE_BLOCKER", 1403, state="OPEN")],
+        )
+        with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
+                           return_value=("bot", "write", "")):
+            with patch.object(_exec, "_graphql_call", return_value=(wrong_state_page, "")):
+                rc2 = _exec.main(_dep_remove_main_args(tmp_project, input_rel) + ["--json"])
+        assert rc2 == 1
+
+        # -- Pre/post TOCTOU: mutation succeeds but a concurrent change means
+        # the non-target set differs post-mutation -- postcondition_rejected.
+        pre_nodes = [{"id": "ISSUE_NODE_BLOCKER", "number": 1403, "state": "CLOSED"}]
+        pre_hash = _exec._compute_blocked_by_snapshot_sha256("ISSUE_NODE_BLOCKED", 1523, pre_nodes)
+        input_rel2 = _dep_remove_write_input(
+            tmp_project, expected_pre_mutation_snapshot_sha256=pre_hash
+        )
+        pre_page = _blocked_by_page(
+            "ISSUE_NODE_BLOCKED", 1523, [_node("ISSUE_NODE_BLOCKER", 1403)],
+        )
+        toctou_post_page = _blocked_by_page(
+            "ISSUE_NODE_BLOCKED", 1523, [_node("N_NEW", 9999)],
+        )
+        responses = iter([
+            pre_page,
+            {"removeBlockedBy": {"issue": {"id": "ISSUE_NODE_BLOCKED", "number": 1523}}},
+            toctou_post_page,
+        ])
+
+        def fake_graphql(gh_bin, env, query, variables):
+            return next(responses), ""
+
+        with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
+                           return_value=("bot", "write", "")):
+            with patch.object(_exec, "_graphql_call", side_effect=fake_graphql):
+                rc3 = _exec.main(_dep_remove_main_args(tmp_project, input_rel2) + ["--json"])
+        assert rc3 == 1
+
+        # -- Second mutation attempt within one invocation is never issued:
+        # verified structurally by the no-retry test above
+        # (call_count["mutation"] == 1). Here we additionally assert that a
+        # mutation transport error does not trigger any subsequent GraphQL
+        # call at all (fully fail-closed, zero further network activity).
+        call_log = []
+
+        def fake_graphql_single_call(gh_bin, env, query, variables):
+            call_log.append(query)
+            if "removeBlockedBy" in query:
+                return None, "gh_api_graphql_errors: boom"
+            return pre_page, ""
+
+        with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
+                           return_value=("bot", "write", "")):
+            with patch.object(_exec, "_graphql_call", side_effect=fake_graphql_single_call):
+                rc4 = _exec.main(_dep_remove_main_args(tmp_project, input_rel2) + ["--json"])
+        assert rc4 == 1
+        assert sum(1 for q in call_log if "removeBlockedBy" in q) == 1
+

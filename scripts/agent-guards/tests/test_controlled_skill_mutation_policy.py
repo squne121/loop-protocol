@@ -26,16 +26,21 @@ if str(_GUARDS_DIR) not in sys.path:
 from controlled_skill_mutation_policy import (
     ALLOWED_WRITE_ROOTS,
     COMMAND_ID_PUBLISH,
+    COMMAND_ID_ISSUE_DEPENDENCY_REMOVE,
     COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
     CONTROLLED_SKILL_MUTATION_COMMAND_POLICY,
     ENV_SANITIZE_KEYS,
     EXECUTOR_SCRIPT,
     ISOLATION_ISSUE_COMMENT_REQUEST_ALLOWED_KEYS,
     ISOLATION_ISSUE_COMMENT_REQUEST_SCHEMA,
+    ISSUE_DEPENDENCY_REMOVE_INPUT_ALLOWED_KEYS,
+    ISSUE_DEPENDENCY_REMOVE_INPUT_SCHEMA,
+    ISSUE_DEPENDENCY_REMOVE_MAX_BLOCKED_BY_NUMBERS,
     TRUSTED_REPO,
     _validate_executor_argv,
     is_controlled_skill_mutation_exec_command,
     validate_isolation_issue_comment_request,
+    validate_issue_dependency_remove_input,
 )
 
 
@@ -129,6 +134,7 @@ class TestRegistryScope:
             "contract_snapshot.publish",
             "pr_review.publish",
             COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
+            COMMAND_ID_ISSUE_DEPENDENCY_REMOVE,
         }
         actual_ids = set(CONTROLLED_SKILL_MUTATION_COMMAND_POLICY.keys())
         assert actual_ids == known_ids, (
@@ -429,3 +435,208 @@ class TestIsolationIssueCommentRequestSchema:
         req["comment_body"] = "hello, no marker here"
         err = validate_isolation_issue_comment_request(req, 42, "squne121/loop-protocol")
         assert "marker_not_embedded_in_body" in err
+
+
+
+# =============================================================================
+# AC1 (Issue #1632): issue_dependency.remove command id / schema registration
+# =============================================================================
+
+class TestIssueDependencyRemoveRegistration:
+    """AC1: issue_dependency.remove and ISSUE_DEPENDENCY_REMOVE_INPUT_V1 are
+    registered one-to-one, and existing command ids are unaffected
+    (read-only compatibility gate)."""
+
+    def test_command_id_value(self):
+        assert COMMAND_ID_ISSUE_DEPENDENCY_REMOVE == "issue_dependency.remove"
+
+    def test_registry_has_entry(self):
+        assert COMMAND_ID_ISSUE_DEPENDENCY_REMOVE in CONTROLLED_SKILL_MUTATION_COMMAND_POLICY
+
+    def test_entry_input_schema_is_one_to_one(self):
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_DEPENDENCY_REMOVE]
+        assert entry["input_schema"] == ISSUE_DEPENDENCY_REMOVE_INPUT_SCHEMA
+        assert ISSUE_DEPENDENCY_REMOVE_INPUT_SCHEMA == "ISSUE_DEPENDENCY_REMOVE_INPUT_V1"
+
+    def test_entry_has_required_keys(self):
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_DEPENDENCY_REMOVE]
+        required_keys = {
+            "command_id",
+            "executor_script",
+            "allowed_write_roots",
+            "github_mutation",
+            "precondition",
+            "postcondition",
+            "idempotency",
+            "env_sanitize",
+        }
+        assert required_keys.issubset(set(entry.keys())), (
+            f"Missing keys: {required_keys - set(entry.keys())}"
+        )
+
+    def test_entry_github_mutation_graphql_only(self):
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_DEPENDENCY_REMOVE]
+        gm = entry["github_mutation"]
+        assert gm["remove_blocked_by"] is True
+        assert gm["graphql_only"] is True
+        assert gm["requires_repo"] == TRUSTED_REPO
+        assert gm["fixed_host"] == "github.com"
+
+    def test_entry_postcondition_bounds(self):
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_DEPENDENCY_REMOVE]
+        pc = entry["postcondition"]
+        assert pc["target_relationship_removed"] is True
+        assert pc["non_target_relationship_set_unchanged"] is True
+        assert pc["post_snapshot_hash_and_marker_must_match"] is True
+
+    def test_read_only_compatibility_gate_publish_entry_unchanged(self):
+        """Adding issue_dependency.remove must not perturb the pre-existing
+        termination_report.publish schema/dispatch/postcondition contract."""
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_PUBLISH]
+        assert entry["executor_script"] == EXECUTOR_SCRIPT
+        assert entry["idempotency"]["marker_field"] == "comment_id"
+        assert entry["postcondition"]["no_tracked_source_changes"] is True
+
+    def test_read_only_compatibility_gate_issue_scope_snapshot_unchanged(self):
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[
+            COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE
+        ]
+        assert entry["materializer_script"] == (
+            "scripts/agent-guards/materialize_issue_scope_snapshot.py"
+        )
+
+
+# =============================================================================
+# AC1 (Issue #1632): ISSUE_DEPENDENCY_REMOVE_INPUT_V1 closed-schema validator
+# =============================================================================
+
+class TestIssueDependencyRemoveInputValidator:
+    """AC1: closed key set, unknown key / null / bool-as-int / duplicate /
+    unsorted / size-cap / hash / trusted-repo rejection before mutation."""
+
+    def _valid_request(self, issue_number=1523, repo="squne121/loop-protocol"):
+        return {
+            "schema": ISSUE_DEPENDENCY_REMOVE_INPUT_SCHEMA,
+            "issue_number": issue_number,
+            "repo": repo,
+            "target_blocker_number": 1403,
+            "expected_blocked_issue_node_id": "ISSUE_NODE_A",
+            "expected_blocker_node_id": "ISSUE_NODE_B",
+            "expected_blocked_by_numbers": [1403],
+            "expected_pre_mutation_snapshot_sha256": "sha256:" + "a" * 64,
+            "idempotency_key": "squne121/loop-protocol:1523:1403:abc",
+        }
+
+    def test_schema_constant_value(self):
+        assert ISSUE_DEPENDENCY_REMOVE_INPUT_SCHEMA == "ISSUE_DEPENDENCY_REMOVE_INPUT_V1"
+
+    def test_allowed_keys_are_closed(self):
+        assert ISSUE_DEPENDENCY_REMOVE_INPUT_ALLOWED_KEYS == frozenset({
+            "schema", "issue_number", "repo", "target_blocker_number",
+            "expected_blocked_issue_node_id", "expected_blocker_node_id",
+            "expected_blocked_by_numbers", "expected_pre_mutation_snapshot_sha256",
+            "idempotency_key",
+        })
+
+    def test_valid_request_passes(self):
+        req = self._valid_request()
+        err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
+        assert err == ""
+
+    def test_not_a_dict_rejected(self):
+        err = validate_issue_dependency_remove_input(
+            ["not", "a", "dict"], 1523, "squne121/loop-protocol"
+        )
+        assert "not_object" in err
+
+    def test_unknown_key_rejected(self):
+        req = self._valid_request()
+        req["extra_field"] = "unexpected"
+        err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
+        assert "unknown_fields" in err
+
+    def test_schema_mismatch_rejected(self):
+        req = self._valid_request()
+        req["schema"] = "WRONG_SCHEMA_V1"
+        err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
+        assert "schema_mismatch" in err
+
+    def test_issue_number_null_rejected(self):
+        req = self._valid_request()
+        req["issue_number"] = None
+        err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
+        assert "issue_number_mismatch" in err
+
+    def test_issue_number_bool_rejected(self):
+        req = self._valid_request()
+        req["issue_number"] = True
+        err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
+        assert "issue_number_mismatch" in err
+
+    def test_repo_untrusted_rejected(self):
+        req = self._valid_request(repo="attacker/evil-repo")
+        err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
+        assert "repo_mismatch" in err
+
+    def test_target_blocker_number_bool_rejected(self):
+        req = self._valid_request()
+        req["target_blocker_number"] = True
+        err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
+        assert "target_blocker_number_invalid" in err
+
+    def test_target_blocker_equals_issue_number_rejected(self):
+        req = self._valid_request()
+        req["target_blocker_number"] = req["issue_number"]
+        err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
+        assert "target_blocker_equals_issue_number" in err
+
+    def test_empty_node_id_rejected(self):
+        req = self._valid_request()
+        req["expected_blocked_issue_node_id"] = ""
+        err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
+        assert "field_invalid" in err
+
+    def test_duplicate_blocked_by_numbers_rejected(self):
+        req = self._valid_request()
+        req["expected_blocked_by_numbers"] = [1403, 1403]
+        err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
+        assert "duplicate" in err
+
+    def test_unsorted_blocked_by_numbers_rejected(self):
+        req = self._valid_request()
+        req["expected_blocked_by_numbers"] = [1403, 100]
+        err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
+        assert "not_sorted" in err
+
+    def test_oversize_blocked_by_numbers_rejected(self):
+        req = self._valid_request()
+        oversize = list(range(1, ISSUE_DEPENDENCY_REMOVE_MAX_BLOCKED_BY_NUMBERS + 2))
+        req["expected_blocked_by_numbers"] = oversize
+        req["target_blocker_number"] = oversize[0]
+        err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
+        assert "size_cap_exceeded" in err
+
+    def test_bool_in_blocked_by_numbers_rejected(self):
+        req = self._valid_request()
+        req["expected_blocked_by_numbers"] = [True]
+        req["target_blocker_number"] = 1403
+        err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
+        assert "not_all_positive_ints" in err
+
+    def test_target_blocker_not_in_expected_set_rejected(self):
+        req = self._valid_request()
+        req["expected_blocked_by_numbers"] = [1500]
+        err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
+        assert "target_blocker_not_in_expected_set" in err
+
+    def test_hash_missing_prefix_rejected(self):
+        req = self._valid_request()
+        req["expected_pre_mutation_snapshot_sha256"] = "not-a-hash"
+        err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
+        assert "snapshot_sha256_invalid" in err
+
+    def test_empty_idempotency_key_rejected(self):
+        req = self._valid_request()
+        req["idempotency_key"] = ""
+        err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
+        assert "idempotency_key_invalid" in err

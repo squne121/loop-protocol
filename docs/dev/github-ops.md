@@ -217,6 +217,23 @@ AI エージェントが着手可否を判定する際の blocker 確認順序:
 
 native dependency が示す依存関係と、本文の `Depends on #N` 記述が矛盾または不一致（例: native では依存なし、本文では `Depends on #N` が open を指している）の場合は、**自動判断せず human escalation とする**。不一致を Issue コメントに記録し、人間による確認・修正を依頼する。
 
+### closed になった stale native dependency の解除（`issue_dependency.remove`、Issue #1632）
+
+closed になった blocker への GitHub native `blockedBy` relationship が本文の依存記述を持たないまま残存すると、
+implementation overlap preflight が `human_review_required` に倒れ続ける（例: #1523 と closed #1403）。
+このケースは `CONTROLLED_SKILL_MUTATION_COMMAND_POLICY` の `issue_dependency.remove` command id で解除する
+（詳細は `docs/dev/agent-skill-boundaries.md#issue_dependencyremove--github-native-blockedby-解除-controlled-executorissue-1632`
+を参照）。
+
+- 対象は **closed blocker への native `blockedBy` 一件のみ**。open blocker、期待する `blockedBy` 集合が
+  一致しない候補、複数 dependency の一括解除は対象外（out of scope）。
+- 固定 host（`github.com`）・固定 GraphQL query/mutation・全ページ pre/post readback・
+  node-ID/number/state/set binding・trusted actor 権限確認をすべて満たした場合のみ一回だけ
+  `removeBlockedBy` を実行する。network/GraphQL error や postcondition mismatch は自動再試行しない。
+- native dependency と本文の `Depends on #N` が不一致な場合の human escalation 境界（上記節）は
+  この executor によって変更されない。`issue_dependency.remove` は closed-blocker-only の一件解除の
+  みを扱い、本文記述の自動修復は行わない。
+
 ## scripts 集約による permission 削減パターン
 
 オーケストレーション skill（edit-issue / post-merge-cleanup / create-issue）の inline bash は `.py` / `.sh` script に集約し、`subprocess.run([...])` 配列形式 + 外部入力 allowlist validation を必須とする。Bash allowlist は scripts entrypoint パターン（`Bash(uv run python3 .claude/skills/<name>/scripts/*.py *)`）に絞ることで permission prompt を 1 ループあたり 1 回に削減する。

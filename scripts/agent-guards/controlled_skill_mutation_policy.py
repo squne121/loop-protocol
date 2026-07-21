@@ -40,6 +40,16 @@ COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH = "contract_snapshot.publish"
 COMMAND_ID_PR_REVIEW_PUBLISH = "pr_review.publish"
 COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE = "issue_scope_snapshot.materialize"
 
+# Issue #1632: closed-blocker-only GitHub native `blockedBy` relationship
+# removal via a fixed GraphQL removeBlockedBy mutation, gated by an
+# all-page pre/post readback + node-ID/number/state/set binding.
+COMMAND_ID_ISSUE_DEPENDENCY_REMOVE = "issue_dependency.remove"
+
+# Issue #1632: hard safety cap on the size of the `blockedBy` set the
+# executor will ever readback/compare. Not a page-size knob -- pagination
+# itself is fixed at page size 50 (see controlled_skill_mutation_exec.py).
+ISSUE_DEPENDENCY_REMOVE_MAX_BLOCKED_BY_NUMBERS = 500
+
 # Issue #1633: bounded request schema an isolation worktree agent is allowed
 # to produce for an Issue comment. The isolation worktree agent never invokes
 # `gh` or the controlled executor itself -- it only ever hands back this
@@ -105,6 +115,111 @@ def validate_isolation_issue_comment_request(
     return ""
 
 
+# Issue #1632: ISSUE_DEPENDENCY_REMOVE_INPUT_V1 -- closed-key bounded input
+# schema for the issue_dependency.remove command id.
+ISSUE_DEPENDENCY_REMOVE_INPUT_SCHEMA = "ISSUE_DEPENDENCY_REMOVE_INPUT_V1"
+
+ISSUE_DEPENDENCY_REMOVE_INPUT_ALLOWED_KEYS = frozenset({
+    "schema",
+    "issue_number",
+    "repo",
+    "target_blocker_number",
+    "expected_blocked_issue_node_id",
+    "expected_blocker_node_id",
+    "expected_blocked_by_numbers",
+    "expected_pre_mutation_snapshot_sha256",
+    "idempotency_key",
+})
+
+
+def _is_strict_positive_int(value: object) -> bool:
+    """True iff value is a Python int (not bool) and > 0."""
+    return type(value) is int and value > 0
+
+
+def validate_issue_dependency_remove_input(
+    data: object, issue_number: int, repo: str
+) -> str:
+    """Validate a bounded ISSUE_DEPENDENCY_REMOVE_INPUT_V1 dict (Issue #1632).
+
+    Returns "" on success, else a descriptive error string. Enforces a closed
+    key set, exact schema match, issue_number/repo cross-check against the
+    caller-declared values, a positive target_blocker_number distinct from
+    issue_number, non-empty node-id/hash/idempotency-key strings, and a
+    sorted, deduplicated, size-capped expected_blocked_by_numbers set that
+    contains target_blocker_number. This runs entirely before any GraphQL
+    read or mutation -- it is a pure, side-effect-free bounds check on the
+    caller-declared expectation, not a readback.
+    """
+    if not isinstance(data, dict):
+        return "issue_dependency_remove_input_not_object"
+
+    unknown_keys = set(data.keys()) - ISSUE_DEPENDENCY_REMOVE_INPUT_ALLOWED_KEYS
+    if unknown_keys:
+        return f"issue_dependency_remove_input_unknown_fields: {sorted(unknown_keys)}"
+
+    if data.get("schema") != ISSUE_DEPENDENCY_REMOVE_INPUT_SCHEMA:
+        return (
+            "issue_dependency_remove_input_schema_mismatch: "
+            f"{data.get('schema')!r}"
+        )
+
+    req_issue_number = data.get("issue_number")
+    if not _is_strict_positive_int(req_issue_number) or req_issue_number != issue_number:
+        return (
+            "issue_dependency_remove_input_issue_number_mismatch: "
+            f"{req_issue_number!r} != {issue_number!r}"
+        )
+
+    req_repo = data.get("repo")
+    if req_repo != repo:
+        return f"issue_dependency_remove_input_repo_mismatch: {req_repo!r} != {repo!r}"
+
+    target_blocker_number = data.get("target_blocker_number")
+    if not _is_strict_positive_int(target_blocker_number):
+        return (
+            "issue_dependency_remove_input_target_blocker_number_invalid: "
+            f"{target_blocker_number!r}"
+        )
+    if target_blocker_number == issue_number:
+        return "issue_dependency_remove_input_target_blocker_equals_issue_number"
+
+    for field in ("expected_blocked_issue_node_id", "expected_blocker_node_id"):
+        val = data.get(field)
+        if not isinstance(val, str) or not val:
+            return f"issue_dependency_remove_input_field_invalid: {field!r}"
+
+    expected_numbers = data.get("expected_blocked_by_numbers")
+    if not isinstance(expected_numbers, list) or not expected_numbers:
+        return "issue_dependency_remove_input_expected_blocked_by_numbers_invalid"
+    if len(expected_numbers) > ISSUE_DEPENDENCY_REMOVE_MAX_BLOCKED_BY_NUMBERS:
+        return (
+            "issue_dependency_remove_input_expected_blocked_by_numbers_size_cap_exceeded: "
+            f"{len(expected_numbers)}"
+        )
+    if not all(_is_strict_positive_int(n) for n in expected_numbers):
+        return "issue_dependency_remove_input_expected_blocked_by_numbers_not_all_positive_ints"
+    if len(set(expected_numbers)) != len(expected_numbers):
+        return "issue_dependency_remove_input_expected_blocked_by_numbers_duplicate"
+    if expected_numbers != sorted(expected_numbers):
+        return "issue_dependency_remove_input_expected_blocked_by_numbers_not_sorted"
+    if target_blocker_number not in expected_numbers:
+        return (
+            "issue_dependency_remove_input_target_blocker_not_in_expected_set: "
+            f"{target_blocker_number!r}"
+        )
+
+    snapshot_sha256 = data.get("expected_pre_mutation_snapshot_sha256")
+    if not isinstance(snapshot_sha256, str) or not snapshot_sha256.startswith("sha256:"):
+        return "issue_dependency_remove_input_expected_pre_mutation_snapshot_sha256_invalid"
+
+    idempotency_key = data.get("idempotency_key")
+    if not isinstance(idempotency_key, str) or not idempotency_key:
+        return "issue_dependency_remove_input_idempotency_key_invalid"
+
+    return ""
+
+
 # Allowed write roots for all commands (relative to project root)
 ALLOWED_WRITE_ROOTS = ["artifacts/"]
 
@@ -121,6 +236,7 @@ INPUT_SCHEMA_BY_COMMAND: dict = {
     COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH: "CONTRACT_SNAPSHOT_PUBLISH_INPUT_V1",
     COMMAND_ID_PR_REVIEW_PUBLISH: "PR_REVIEW_PUBLISH_REQUEST_V1",
     COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE: "ISSUE_SCOPE_SNAPSHOT_MATERIALIZE_INPUT_V1",
+    COMMAND_ID_ISSUE_DEPENDENCY_REMOVE: ISSUE_DEPENDENCY_REMOVE_INPUT_SCHEMA,
 }
 
 ALL_COMMAND_IDS = frozenset(INPUT_SCHEMA_BY_COMMAND)
@@ -339,6 +455,52 @@ CONTROLLED_SKILL_MUTATION_COMMAND_POLICY: dict = {
             "no_tracked_source_changes": True,
             "allowed_write_roots": ALLOWED_WRITE_ROOTS,
             "materializer_provenance_required": True,
+        },
+        "env_sanitize": ENV_SANITIZE_KEYS,
+    },
+    COMMAND_ID_ISSUE_DEPENDENCY_REMOVE: {
+        "command_id": COMMAND_ID_ISSUE_DEPENDENCY_REMOVE,
+        "description": (
+            "Remove a stale closed-blocker GitHub native blockedBy relationship "
+            "via a single fixed GraphQL removeBlockedBy mutation, gated by an "
+            "all-page pre/post readback and node-ID/number/state/set binding "
+            "(Issue #1632)"
+        ),
+        "executor_script": EXECUTOR_SCRIPT,
+        "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+        "input_namespace": (
+            f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/"
+            f"{COMMAND_ID_ISSUE_DEPENDENCY_REMOVE}/"
+        ),
+        "input_schema": INPUT_SCHEMA_BY_COMMAND[COMMAND_ID_ISSUE_DEPENDENCY_REMOVE],
+        "github_mutation": {
+            "remove_blocked_by": True,
+            "requires_repo": TRUSTED_REPO,
+            "requires_explicit_repo_flag": True,
+            "graphql_only": True,
+            "fixed_host": "github.com",
+        },
+        "precondition": {
+            "target_blocker_must_be_closed": True,
+            "expected_blocked_by_set_must_match_all_page_readback": True,
+            "pre_mutation_snapshot_sha256_must_match_readback": True,
+            "credential_actor_must_be_trusted_and_authorized": True,
+        },
+        "postcondition": {
+            "no_tracked_source_changes": True,
+            "no_lockfile_changes": True,
+            "no_settings_changes": True,
+            "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+            "target_relationship_removed": True,
+            "non_target_relationship_set_unchanged": True,
+            "post_snapshot_hash_and_marker_must_match": True,
+        },
+        "idempotency": {
+            "marker_file_pattern": (
+                f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/"
+                f"{COMMAND_ID_ISSUE_DEPENDENCY_REMOVE}/issue_dependency_remove.marker.json"
+            ),
+            "marker_field": "idempotency_key",
         },
         "env_sanitize": ENV_SANITIZE_KEYS,
     },
