@@ -1745,15 +1745,41 @@ GraphQL/transport error は自動再試行しない
 （`_graphql_call` は 1 回の呼び出しにつき 1 回の subprocess 実行のみ）。
 結果は `removed | precondition_rejected | transport_or_schema_error |
 postcondition_rejected | already_completed` の closed status のいずれかを
-`status` フィールドで返す。
+`status` フィールドで返す（PR #1667 レビュー fix_delta で、mutation 成功後の
+write-root 外変更検出も `postcondition_rejected` に統一し、未定義の
+`failed` 値を使わないようにした）。
+
+mutation 呼び出しの GraphQL variables は公式スキーマの
+`RemoveBlockedByInput`（`issueId: ID!`, `blockingIssueId: ID!`,
+`clientMutationId: String`）と一対一である。応答
+（`RemoveBlockedByPayload`）は `issue { id number }` /
+`blockingIssue { id number }` / `clientMutationId` を返却し、
+`_validate_remove_blocked_by_mutation_response()` が期待値との完全一致を
+確認してから postcondition readback へ進む。missing/malformed な応答形状は
+`transport_or_schema_error`、値の不一致（別 issue/blocker を書き換えた場合等）
+は `postcondition_rejected` として区別する。
+
+mutation の直前には `mutation_attempted` の attempt marker を書き込み、
+mutation 呼び出しより前にも write-root 外の tracked changes が存在しないかを
+確認する（precondition）。これにより、mutation とその readback の間で
+プロセスが異常終了しても、mutation が試行されたという監査証跡が残る。
+
+`gh` subprocess 環境からは `GH_TOKEN` / `GITHUB_TOKEN` も除去する
+(`ENV_SANITIZE_KEYS`)。親プロセス環境の ambient token が trusted actor の
+identity を差し替えることを防ぐ。
 
 ### 再実行時の冪等性（AC5）
 
 `artifacts/{issue_number}/issue-metadata/issue_dependency.remove/issue_dependency_remove.marker.json`
-に `idempotency_key` を記録する。再実行時はマーカーの `idempotency_key` 一致に
-加えて、必ずフレッシュな全ページ readback で target relationship の不在を
-確認できた場合のみ `already_completed` を返す（marker 単独では
-`already_completed` を確定しない）。
+に `idempotency_key` を含む closed schema
+（`ISSUE_DEPENDENCY_REMOVE_MARKER_V1`: schema/issue_number/repo/
+target_blocker_number/blocked_issue_id/blocked_issue_number/blocker_node_id/
+idempotency_key/actor_login/status_detail が全て一致すること）を記録する。
+再実行時はこの全フィールド一致に加えて、必ずフレッシュな全ページ readback で
+target relationship の不在を確認できた場合のみ `already_completed` を返す
+（marker 単独では、また `idempotency_key` のみの部分一致でも
+`already_completed` を確定しない -- 部分一致かつ target 不在の場合は
+`postcondition_rejected` として人間判断に回す）。
 
 ### 失敗経路の専用テスト（AC6）
 

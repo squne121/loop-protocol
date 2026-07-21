@@ -106,6 +106,14 @@ class TestPolicySchema:
                     "GH_EDITOR", "EDITOR", "VISUAL", "BROWSER"}
         assert required.issubset(set(ENV_SANITIZE_KEYS))
 
+    def test_env_sanitize_keys_contains_gh_token_and_github_token(self):
+        """Issue #1667 review fix_delta P1: an ambient GH_TOKEN/GITHUB_TOKEN
+        must never reach a controlled mutation subprocess -- it could let a
+        trusted-actor identity be substituted by whatever credential happens
+        to be set in the parent process environment."""
+        required = {"GH_TOKEN", "GITHUB_TOKEN"}
+        assert required.issubset(set(ENV_SANITIZE_KEYS))
+
     def test_trusted_repo(self):
         assert TRUSTED_REPO == "squne121/loop-protocol"
 

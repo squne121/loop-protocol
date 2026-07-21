@@ -852,7 +852,8 @@ class TestIssueDependencyRemoveClosedStatusNoRetry:
         with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
                            return_value=("bot", "write", "")):
             with patch.object(_exec, "_graphql_call", side_effect=fake_graphql):
-                rc = _exec.main(_dep_remove_main_args(tmp_project, input_rel) + ["--json"])
+                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
+                    rc = _exec.main(_dep_remove_main_args(tmp_project, input_rel) + ["--json"])
         assert rc == 1
         assert call_count["mutation"] == 1  # never retried automatically
         out = json.loads(capsys.readouterr().out)
@@ -873,7 +874,11 @@ class TestIssueDependencyRemoveClosedStatusNoRetry:
         post_page = _blocked_by_page("ISSUE_NODE_BLOCKED", 1523, [])
 
         mutation_response = {
-            "removeBlockedBy": {"issue": {"id": "ISSUE_NODE_BLOCKED", "number": 1523}}
+            "removeBlockedBy": {
+                "issue": {"id": "ISSUE_NODE_BLOCKED", "number": 1523},
+                "blockingIssue": {"id": "ISSUE_NODE_BLOCKER", "number": 1403},
+                "clientMutationId": f"{TRUSTED_REPO}:1523:1403:v1",
+            }
         }
         responses = iter([pre_page, mutation_response, post_page])
 
@@ -912,7 +917,13 @@ class TestIssueDependencyRemovePostconditionAndIdempotency:
         )
         responses = iter([
             pre_page,
-            {"removeBlockedBy": {"issue": {"id": "ISSUE_NODE_BLOCKED", "number": 1523}}},
+            {
+                "removeBlockedBy": {
+                    "issue": {"id": "ISSUE_NODE_BLOCKED", "number": 1523},
+                    "blockingIssue": {"id": "ISSUE_NODE_BLOCKER", "number": 1403},
+                    "clientMutationId": f"{TRUSTED_REPO}:1523:1403:v1",
+                }
+            },
             post_page_still_present,
         ])
 
@@ -922,12 +933,14 @@ class TestIssueDependencyRemovePostconditionAndIdempotency:
         with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
                            return_value=("bot", "write", "")):
             with patch.object(_exec, "_graphql_call", side_effect=fake_graphql):
-                rc = _exec.main(_dep_remove_main_args(tmp_project, input_rel) + ["--json"])
+                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
+                    rc = _exec.main(_dep_remove_main_args(tmp_project, input_rel) + ["--json"])
         assert rc == 1
         out = json.loads(capsys.readouterr().out)
         assert out["status"] == "postcondition_rejected"
 
-        # Idempotency: marker present + fresh readback confirms already absent.
+        # Idempotency (Issue #1667 review fix_delta P2): a FULLY valid marker
+        # present + fresh readback confirms already absent -> already_completed.
         marker_path = _exec._issue_metadata_marker_path(
             tmp_project, 1523, ISSUE_DEPENDENCY_REMOVE_COMMAND_ID,
             "issue_dependency_remove.marker.json",
@@ -935,7 +948,16 @@ class TestIssueDependencyRemovePostconditionAndIdempotency:
         marker_path.parent.mkdir(parents=True, exist_ok=True)
         marker_path.write_text(json.dumps({
             "schema": "ISSUE_DEPENDENCY_REMOVE_MARKER_V1",
+            "issue_number": 1523,
+            "repo": TRUSTED_REPO,
+            "target_blocker_number": 1403,
+            "blocked_issue_id": "ISSUE_NODE_BLOCKED",
+            "blocked_issue_number": 1523,
+            "blocker_node_id": "ISSUE_NODE_BLOCKER",
             "idempotency_key": f"{TRUSTED_REPO}:1523:1403:v1",
+            "actor_login": "bot",
+            "actor_permission": "write",
+            "status_detail": "removed",
         }))
         already_absent_page = _blocked_by_page("ISSUE_NODE_BLOCKED", 1523, [])
         with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
@@ -947,6 +969,26 @@ class TestIssueDependencyRemovePostconditionAndIdempotency:
         assert out2["status"] == "already_completed"
         # Only the pre-mutation readback call was made -- no mutation attempted.
         assert mock_gql.call_count == 1
+
+        # Issue #1667 review fix_delta P2: an INCOMPLETE marker (missing the
+        # closed-schema fields, e.g. only idempotency_key) is never trusted
+        # as already_completed, even though the target is remotely absent --
+        # this is routed to human judgment (postcondition_rejected) instead.
+        marker_path.write_text(json.dumps({
+            "schema": "ISSUE_DEPENDENCY_REMOVE_MARKER_V1",
+            "idempotency_key": f"{TRUSTED_REPO}:1523:1403:v1",
+        }))
+        with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
+                           return_value=("bot", "write", "")):
+            with patch.object(_exec, "_graphql_call", return_value=(already_absent_page, "")) as mock_gql3:
+                rc3 = _exec.main(_dep_remove_main_args(tmp_project, input_rel) + ["--json"])
+        assert rc3 == 1
+        out3 = json.loads(capsys.readouterr().out)
+        assert out3["status"] == "postcondition_rejected"
+        assert "already_completed_marker_invalid" in out3["reason"]
+        # Still no mutation attempted -- the ambiguity is resolved without a
+        # network write.
+        assert mock_gql3.call_count == 1
 
 
 class TestIssueDependencyRemoveFailurePathsFailClosed:
@@ -1017,7 +1059,13 @@ class TestIssueDependencyRemoveFailurePathsFailClosed:
         )
         responses = iter([
             pre_page,
-            {"removeBlockedBy": {"issue": {"id": "ISSUE_NODE_BLOCKED", "number": 1523}}},
+            {
+                "removeBlockedBy": {
+                    "issue": {"id": "ISSUE_NODE_BLOCKED", "number": 1523},
+                    "blockingIssue": {"id": "ISSUE_NODE_BLOCKER", "number": 1403},
+                    "clientMutationId": f"{TRUSTED_REPO}:1523:1403:v1",
+                }
+            },
             toctou_post_page,
         ])
 
@@ -1027,7 +1075,8 @@ class TestIssueDependencyRemoveFailurePathsFailClosed:
         with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
                            return_value=("bot", "write", "")):
             with patch.object(_exec, "_graphql_call", side_effect=fake_graphql):
-                rc3 = _exec.main(_dep_remove_main_args(tmp_project, input_rel2) + ["--json"])
+                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
+                    rc3 = _exec.main(_dep_remove_main_args(tmp_project, input_rel2) + ["--json"])
         assert rc3 == 1
 
         # -- Second mutation attempt within one invocation is never issued:
@@ -1046,7 +1095,469 @@ class TestIssueDependencyRemoveFailurePathsFailClosed:
         with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
                            return_value=("bot", "write", "")):
             with patch.object(_exec, "_graphql_call", side_effect=fake_graphql_single_call):
-                rc4 = _exec.main(_dep_remove_main_args(tmp_project, input_rel2) + ["--json"])
+                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
+                    rc4 = _exec.main(_dep_remove_main_args(tmp_project, input_rel2) + ["--json"])
         assert rc4 == 1
         assert sum(1 for q in call_log if "removeBlockedBy" in q) == 1
 
+
+# =============================================================================
+# Issue #1667 review fix_delta P0: GraphQL field-name exactness
+# =============================================================================
+
+
+class TestIssueDependencyRemoveMutationFieldNames:
+    """P0: the GitHub GraphQL schema names the RemoveBlockedByInput field
+    `blockingIssueId` -- NOT `blockedByIssueId` (that name never existed on
+    the input type). This is a read-only, static string check on the fixed
+    mutation document; no network call is made."""
+
+    def test_mutation_uses_blocking_issue_id_not_blocked_by_issue_id(self):
+        mutation = _exec._ISSUE_DEPENDENCY_REMOVE_MUTATION
+        assert "blockingIssueId" in mutation
+        assert "blockedByIssueId" not in mutation
+
+    def test_mutation_declares_client_mutation_id_variable(self):
+        mutation = _exec._ISSUE_DEPENDENCY_REMOVE_MUTATION
+        assert "$clientMutationId: String" in mutation
+        assert "clientMutationId: $clientMutationId" in mutation
+
+    def test_mutation_response_selects_blocking_issue_and_client_mutation_id(self):
+        mutation = _exec._ISSUE_DEPENDENCY_REMOVE_MUTATION
+        assert "blockingIssue { id number }" in mutation
+        assert "clientMutationId" in mutation.split("removeBlockedBy", 1)[1]
+
+    def test_mutation_call_site_variables_use_official_field_name(self, tmp_project, monkeypatch):
+        """Static/behavioral check: the actual _graphql_call invocation for
+        the mutation is made with the exact variable keys
+        {issueId, blockingIssueId, clientMutationId} -- never
+        blockedByIssueId."""
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        pre_nodes = [{"id": "ISSUE_NODE_BLOCKER", "number": 1403, "state": "CLOSED"}]
+        pre_hash = _exec._compute_blocked_by_snapshot_sha256("ISSUE_NODE_BLOCKED", 1523, pre_nodes)
+        input_rel = _dep_remove_write_input(
+            tmp_project, expected_pre_mutation_snapshot_sha256=pre_hash
+        )
+        pre_page = _blocked_by_page(
+            "ISSUE_NODE_BLOCKED", 1523, [_node("ISSUE_NODE_BLOCKER", 1403)],
+        )
+        captured_variables = {}
+
+        def fake_graphql(gh_bin, env, query, variables):
+            if "removeBlockedBy" in query:
+                captured_variables.update(variables)
+                return None, "gh_api_graphql_errors: stop_before_mutation_succeeds"
+            return pre_page, ""
+
+        with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
+                           return_value=("bot", "write", "")):
+            with patch.object(_exec, "_graphql_call", side_effect=fake_graphql):
+                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
+                    _exec.main(_dep_remove_main_args(tmp_project, input_rel))
+        assert set(captured_variables.keys()) == {"issueId", "blockingIssueId", "clientMutationId"}
+        assert "blockedByIssueId" not in captured_variables
+
+
+# =============================================================================
+# Issue #1667 review fix_delta P0: RemoveBlockedByInput schema compatibility
+# (read-only, static -- no network mutation)
+# =============================================================================
+
+
+class TestRemoveBlockedByInputSchemaCompatibility:
+    """P0: static compatibility check against the official GitHub GraphQL
+    schema's RemoveBlockedByInput type:
+
+        input RemoveBlockedByInput {
+          blockingIssueId: ID!
+          clientMutationId: String
+          issueId: ID!
+        }
+
+    This test never makes a network call -- it only inspects the fixed
+    mutation document string this executor sends.
+    """
+
+    _OFFICIAL_INPUT_FIELDS = frozenset({"issueId", "blockingIssueId", "clientMutationId"})
+
+    def test_mutation_input_object_fields_match_official_schema(self):
+        mutation = _exec._ISSUE_DEPENDENCY_REMOVE_MUTATION
+        # Extract the input object body between "input: {" and the matching "}"
+        start = mutation.index("input: {") + len("input: {")
+        end = mutation.index("}", start)
+        input_body = mutation[start:end]
+        # Field names appear as "<name>: $<name>" pairs.
+        declared_fields = {
+            part.split(":", 1)[0].strip()
+            for part in input_body.split(",")
+            if part.strip()
+        }
+        assert declared_fields == self._OFFICIAL_INPUT_FIELDS
+
+    def test_mutation_variable_declarations_match_official_schema(self):
+        mutation = _exec._ISSUE_DEPENDENCY_REMOVE_MUTATION
+        header = mutation.split(")", 1)[0]
+        # Variable declarations look like "$name: Type"
+        declared_vars = {
+            piece.split(":", 1)[0].strip().lstrip("$")
+            for piece in header.split("(", 1)[1].split(",")
+            if piece.strip()
+        }
+        assert declared_vars == self._OFFICIAL_INPUT_FIELDS
+
+    def test_issue_id_and_blocking_issue_id_are_non_null_id_type(self):
+        mutation = _exec._ISSUE_DEPENDENCY_REMOVE_MUTATION
+        assert "$issueId: ID!" in mutation
+        assert "$blockingIssueId: ID!" in mutation
+
+    def test_client_mutation_id_is_nullable_string_type(self):
+        mutation = _exec._ISSUE_DEPENDENCY_REMOVE_MUTATION
+        assert "$clientMutationId: String" in mutation
+        assert "$clientMutationId: String!" not in mutation
+
+
+# =============================================================================
+# Issue #1667 review fix_delta P1: removeBlockedBy response validation
+# =============================================================================
+
+
+class TestValidateRemoveBlockedByMutationResponse:
+    """P1: the mutation response (RemoveBlockedByPayload) must be validated
+    before the executor trusts that the mutation succeeded against the
+    intended target."""
+
+    _KW = dict(
+        expected_blocked_issue_node_id="ISSUE_NODE_BLOCKED",
+        expected_blocked_issue_number=1523,
+        expected_blocker_node_id="ISSUE_NODE_BLOCKER",
+        expected_blocker_number=1403,
+        expected_client_mutation_id="squne121/loop-protocol:1523:1403:v1",
+    )
+
+    def _valid_response(self):
+        return {
+            "removeBlockedBy": {
+                "issue": {"id": "ISSUE_NODE_BLOCKED", "number": 1523},
+                "blockingIssue": {"id": "ISSUE_NODE_BLOCKER", "number": 1403},
+                "clientMutationId": "squne121/loop-protocol:1523:1403:v1",
+            }
+        }
+
+    def test_valid_response_passes(self):
+        err, is_schema_error = _exec._validate_remove_blocked_by_mutation_response(
+            self._valid_response(), **self._KW
+        )
+        assert err == ""
+        assert is_schema_error is False
+
+    def test_not_a_dict_is_schema_error(self):
+        err, is_schema_error = _exec._validate_remove_blocked_by_mutation_response(
+            None, **self._KW
+        )
+        assert err != ""
+        assert is_schema_error is True
+
+    def test_missing_remove_blocked_by_key_is_schema_error(self):
+        err, is_schema_error = _exec._validate_remove_blocked_by_mutation_response(
+            {}, **self._KW
+        )
+        assert "missing_remove_blocked_by_payload" in err
+        assert is_schema_error is True
+
+    def test_missing_blocking_issue_is_schema_error(self):
+        resp = self._valid_response()
+        del resp["removeBlockedBy"]["blockingIssue"]
+        err, is_schema_error = _exec._validate_remove_blocked_by_mutation_response(
+            resp, **self._KW
+        )
+        assert "missing_blocking_issue" in err
+        assert is_schema_error is True
+
+    def test_missing_issue_is_schema_error(self):
+        resp = self._valid_response()
+        del resp["removeBlockedBy"]["issue"]
+        err, is_schema_error = _exec._validate_remove_blocked_by_mutation_response(
+            resp, **self._KW
+        )
+        assert "missing_issue" in err
+        assert is_schema_error is True
+
+    def test_issue_id_mismatch_is_postcondition_error(self):
+        resp = self._valid_response()
+        resp["removeBlockedBy"]["issue"]["id"] = "WRONG_ISSUE_ID"
+        err, is_schema_error = _exec._validate_remove_blocked_by_mutation_response(
+            resp, **self._KW
+        )
+        assert "issue_identity_mismatch" in err
+        assert is_schema_error is False
+
+    def test_issue_number_mismatch_is_postcondition_error(self):
+        resp = self._valid_response()
+        resp["removeBlockedBy"]["issue"]["number"] = 9999
+        err, is_schema_error = _exec._validate_remove_blocked_by_mutation_response(
+            resp, **self._KW
+        )
+        assert "issue_identity_mismatch" in err
+        assert is_schema_error is False
+
+    def test_blocking_issue_id_mismatch_is_postcondition_error(self):
+        resp = self._valid_response()
+        resp["removeBlockedBy"]["blockingIssue"]["id"] = "WRONG_BLOCKER_ID"
+        err, is_schema_error = _exec._validate_remove_blocked_by_mutation_response(
+            resp, **self._KW
+        )
+        assert "blocking_issue_identity_mismatch" in err
+        assert is_schema_error is False
+
+    def test_blocking_issue_number_mismatch_is_postcondition_error(self):
+        resp = self._valid_response()
+        resp["removeBlockedBy"]["blockingIssue"]["number"] = 9999
+        err, is_schema_error = _exec._validate_remove_blocked_by_mutation_response(
+            resp, **self._KW
+        )
+        assert "blocking_issue_identity_mismatch" in err
+        assert is_schema_error is False
+
+    def test_missing_client_mutation_id_key_is_schema_error(self):
+        resp = self._valid_response()
+        del resp["removeBlockedBy"]["clientMutationId"]
+        err, is_schema_error = _exec._validate_remove_blocked_by_mutation_response(
+            resp, **self._KW
+        )
+        assert "missing_client_mutation_id" in err
+        assert is_schema_error is True
+
+    def test_client_mutation_id_mismatch_is_postcondition_error(self):
+        resp = self._valid_response()
+        resp["removeBlockedBy"]["clientMutationId"] = "wrong-key"
+        err, is_schema_error = _exec._validate_remove_blocked_by_mutation_response(
+            resp, **self._KW
+        )
+        assert "client_mutation_id_mismatch" in err
+        assert is_schema_error is False
+
+    def test_non_string_issue_id_is_schema_error(self):
+        resp = self._valid_response()
+        resp["removeBlockedBy"]["issue"]["id"] = 12345
+        err, is_schema_error = _exec._validate_remove_blocked_by_mutation_response(
+            resp, **self._KW
+        )
+        assert "issue_id_invalid" in err
+        assert is_schema_error is True
+
+    def test_non_int_issue_number_is_schema_error(self):
+        resp = self._valid_response()
+        resp["removeBlockedBy"]["issue"]["number"] = "1523"
+        err, is_schema_error = _exec._validate_remove_blocked_by_mutation_response(
+            resp, **self._KW
+        )
+        assert "issue_number_invalid" in err
+        assert is_schema_error is True
+
+
+# =============================================================================
+# Issue #1667 review fix_delta P1: pre-mutation tracked-changes precondition
+# =============================================================================
+
+
+class TestIssueDependencyRemovePreMutationTrackedChanges:
+    """P1: tracked/staged/untracked changes outside this command's write root
+    must be checked BEFORE the remote mutation is attempted, not only after."""
+
+    def test_pre_existing_tracked_changes_block_mutation_before_network_call(
+        self, tmp_project, monkeypatch
+    ):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        pre_nodes = [{"id": "ISSUE_NODE_BLOCKER", "number": 1403, "state": "CLOSED"}]
+        pre_hash = _exec._compute_blocked_by_snapshot_sha256("ISSUE_NODE_BLOCKED", 1523, pre_nodes)
+        input_rel = _dep_remove_write_input(
+            tmp_project, expected_pre_mutation_snapshot_sha256=pre_hash
+        )
+        pre_page = _blocked_by_page(
+            "ISSUE_NODE_BLOCKED", 1523, [_node("ISSUE_NODE_BLOCKER", 1403)],
+        )
+
+        with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
+                           return_value=("bot", "write", "")):
+            with patch.object(_exec, "_graphql_call", return_value=(pre_page, "")):
+                with patch.object(_exec, "_check_no_tracked_changes",
+                                   return_value=["M :src/unexpected.ts"]):
+                    with patch.object(_exec, "_graphql_call") as mock_gql_after_patch:
+                        mock_gql_after_patch.return_value = (pre_page, "")
+                        rc = _exec.main(_dep_remove_main_args(tmp_project, input_rel) + ["--json"])
+        assert rc == 1
+        # No removeBlockedBy mutation call was ever made -- the precondition
+        # failed before the single mutation attempt.
+        for call in mock_gql_after_patch.call_args_list:
+            assert "removeBlockedBy" not in call.args[2]
+
+
+# =============================================================================
+# Issue #1667 review fix_delta P1: attempt marker + audit trail on failure
+# =============================================================================
+
+
+class TestIssueDependencyRemoveAttemptMarker:
+    """P1: an attempt marker is written BEFORE the remote mutation call, and
+    updated on every post-mutation failure path -- an audit trail must exist
+    even if the process fails between the mutation and its readback."""
+
+    def test_marker_written_before_mutation_records_mutation_attempted(
+        self, tmp_project, monkeypatch
+    ):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        pre_nodes = [{"id": "ISSUE_NODE_BLOCKER", "number": 1403, "state": "CLOSED"}]
+        pre_hash = _exec._compute_blocked_by_snapshot_sha256("ISSUE_NODE_BLOCKED", 1523, pre_nodes)
+        input_rel = _dep_remove_write_input(
+            tmp_project, expected_pre_mutation_snapshot_sha256=pre_hash
+        )
+        pre_page = _blocked_by_page(
+            "ISSUE_NODE_BLOCKED", 1523, [_node("ISSUE_NODE_BLOCKER", 1403)],
+        )
+        marker_path = _exec._issue_metadata_marker_path(
+            tmp_project, 1523, ISSUE_DEPENDENCY_REMOVE_COMMAND_ID,
+            "issue_dependency_remove.marker.json",
+        )
+        seen_marker_status_before_mutation = {}
+
+        def fake_graphql(gh_bin, env, query, variables):
+            if "removeBlockedBy" in query:
+                # By this point the attempt marker must already be on disk.
+                assert marker_path.exists()
+                seen_marker_status_before_mutation["status"] = json.loads(
+                    marker_path.read_text()
+                )["status_detail"]
+                return None, "gh_api_graphql_errors: simulated_transport_error"
+            return pre_page, ""
+
+        with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
+                           return_value=("bot", "write", "")):
+            with patch.object(_exec, "_graphql_call", side_effect=fake_graphql):
+                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
+                    rc = _exec.main(_dep_remove_main_args(tmp_project, input_rel) + ["--json"])
+        assert rc == 1
+        assert seen_marker_status_before_mutation["status"] == "mutation_attempted"
+        # After the failed mutation, the marker is updated to reflect the
+        # terminal outcome -- never left stuck at "mutation_attempted".
+        final_marker = json.loads(marker_path.read_text())
+        assert final_marker["status_detail"] == "transport_or_schema_error"
+
+    def test_marker_records_actor_permission_and_blocker_identity_on_success(
+        self, tmp_project, monkeypatch
+    ):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        pre_nodes = [{"id": "ISSUE_NODE_BLOCKER", "number": 1403, "state": "CLOSED"}]
+        pre_hash = _exec._compute_blocked_by_snapshot_sha256("ISSUE_NODE_BLOCKED", 1523, pre_nodes)
+        input_rel = _dep_remove_write_input(
+            tmp_project, expected_pre_mutation_snapshot_sha256=pre_hash
+        )
+        pre_page = _blocked_by_page(
+            "ISSUE_NODE_BLOCKED", 1523, [_node("ISSUE_NODE_BLOCKER", 1403)],
+        )
+        post_page = _blocked_by_page("ISSUE_NODE_BLOCKED", 1523, [])
+        mutation_response = {
+            "removeBlockedBy": {
+                "issue": {"id": "ISSUE_NODE_BLOCKED", "number": 1523},
+                "blockingIssue": {"id": "ISSUE_NODE_BLOCKER", "number": 1403},
+                "clientMutationId": f"{TRUSTED_REPO}:1523:1403:v1",
+            }
+        }
+        responses = iter([pre_page, mutation_response, post_page])
+
+        def fake_graphql(gh_bin, env, query, variables):
+            return next(responses), ""
+
+        with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
+                           return_value=("bot", "admin", "")):
+            with patch.object(_exec, "_graphql_call", side_effect=fake_graphql):
+                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
+                    rc = _exec.main(_dep_remove_main_args(tmp_project, input_rel))
+        assert rc == 0
+        marker_path = _exec._issue_metadata_marker_path(
+            tmp_project, 1523, ISSUE_DEPENDENCY_REMOVE_COMMAND_ID,
+            "issue_dependency_remove.marker.json",
+        )
+        marker = json.loads(marker_path.read_text())
+        assert marker["status_detail"] == "removed"
+        assert marker["actor_permission"] == "admin"
+        assert marker["blocked_issue_id"] == "ISSUE_NODE_BLOCKED"
+        assert marker["blocker_node_id"] == "ISSUE_NODE_BLOCKER"
+
+
+# =============================================================================
+# Issue #1667 review fix_delta P1: GH_TOKEN/GITHUB_TOKEN sanitization
+# =============================================================================
+
+
+class TestIssueDependencyRemoveGhEnvSanitization:
+    """P1: an ambient GH_TOKEN/GITHUB_TOKEN must never reach the `gh`
+    subprocess for issue_dependency.remove -- it would let a trusted-actor
+    identity be silently substituted."""
+
+    def test_gh_token_and_github_token_are_stripped(self, monkeypatch):
+        monkeypatch.setenv("GH_TOKEN", "ghp_evil_token")
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_evil_token_2")
+        env = _exec._build_issue_dependency_remove_gh_env()
+        assert "GH_TOKEN" not in env
+        assert "GITHUB_TOKEN" not in env
+
+
+# =============================================================================
+# Issue #1667 review fix_delta P1: closed result-status set (no "failed")
+# =============================================================================
+
+
+class TestIssueDependencyRemoveClosedStatusSetNoFailedValue:
+    """P1: issue_dependency.remove's result `status` field must only ever be
+    one of {removed, precondition_rejected, transport_or_schema_error,
+    postcondition_rejected, already_completed} -- never the undefined
+    "failed" value."""
+
+    _CLOSED_STATUS_SET = frozenset({
+        "removed", "precondition_rejected", "transport_or_schema_error",
+        "postcondition_rejected", "already_completed",
+    })
+
+    def test_post_mutation_tracked_changes_status_is_postcondition_rejected(
+        self, tmp_project, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        pre_nodes = [{"id": "ISSUE_NODE_BLOCKER", "number": 1403, "state": "CLOSED"}]
+        pre_hash = _exec._compute_blocked_by_snapshot_sha256("ISSUE_NODE_BLOCKED", 1523, pre_nodes)
+        input_rel = _dep_remove_write_input(
+            tmp_project, expected_pre_mutation_snapshot_sha256=pre_hash
+        )
+        pre_page = _blocked_by_page(
+            "ISSUE_NODE_BLOCKED", 1523, [_node("ISSUE_NODE_BLOCKER", 1403)],
+        )
+        post_page = _blocked_by_page("ISSUE_NODE_BLOCKED", 1523, [])
+        mutation_response = {
+            "removeBlockedBy": {
+                "issue": {"id": "ISSUE_NODE_BLOCKED", "number": 1523},
+                "blockingIssue": {"id": "ISSUE_NODE_BLOCKER", "number": 1403},
+                "clientMutationId": f"{TRUSTED_REPO}:1523:1403:v1",
+            }
+        }
+        responses = iter([pre_page, mutation_response, post_page])
+
+        def fake_graphql(gh_bin, env, query, variables):
+            return next(responses), ""
+
+        # First call (pre-mutation precondition check) clean, second call
+        # (post-mutation postcondition check) reports an unrelated change.
+        tracked_changes_calls = iter([[], ["M :src/unexpected.ts"]])
+
+        def fake_tracked_changes(*args, **kwargs):
+            return next(tracked_changes_calls)
+
+        with patch.object(_exec, "_fetch_issue_dependency_remove_actor",
+                           return_value=("bot", "write", "")):
+            with patch.object(_exec, "_graphql_call", side_effect=fake_graphql):
+                with patch.object(_exec, "_check_no_tracked_changes",
+                                   side_effect=fake_tracked_changes):
+                    rc = _exec.main(_dep_remove_main_args(tmp_project, input_rel) + ["--json"])
+        assert rc == 1
+        out = json.loads(capsys.readouterr().out)
+        assert out["status"] == "postcondition_rejected"
+        assert out["status"] in self._CLOSED_STATUS_SET
+        assert out["status"] != "failed"

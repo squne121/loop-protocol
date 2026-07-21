@@ -2379,10 +2379,18 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
 }
 """
 
+# Issue #1667 review fix_delta P0: the official GitHub GraphQL schema names
+# the RemoveBlockedByInput field `blockingIssueId` (NOT `blockedByIssueId` --
+# that name never existed on the input type; see
+# docs.github.com/public/fpt/schema.docs.graphql). clientMutationId is threaded
+# through as the caller-declared idempotency_key so the response can be
+# cross-checked against the exact request that produced it (P1).
 _ISSUE_DEPENDENCY_REMOVE_MUTATION = """
-mutation($issueId: ID!, $blockedByIssueId: ID!) {
-  removeBlockedBy(input: {issueId: $issueId, blockedByIssueId: $blockedByIssueId}) {
+mutation($issueId: ID!, $blockingIssueId: ID!, $clientMutationId: String) {
+  removeBlockedBy(input: {issueId: $issueId, blockingIssueId: $blockingIssueId, clientMutationId: $clientMutationId}) {
     issue { id number }
+    blockingIssue { id number }
+    clientMutationId
   }
 }
 """
@@ -2603,6 +2611,114 @@ def _compute_blocked_by_snapshot_sha256(
     return "sha256:" + hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+# Issue #1667 review fix_delta P1: RemoveBlockedByPayload validator. The
+# executor must not treat a 200-with-`data` GraphQL response as success
+# without checking WHICH issue/blocker it actually mutated -- an id/number
+# mismatch here means the mutation executed against an unexpected target
+# (postcondition_rejected), while a missing/malformed shape means the
+# response cannot be trusted to mean anything at all
+# (transport_or_schema_error).
+def _validate_remove_blocked_by_mutation_response(
+    mutation_data: dict | None,
+    *,
+    expected_blocked_issue_node_id: str,
+    expected_blocked_issue_number: int,
+    expected_blocker_node_id: str,
+    expected_blocker_number: int,
+    expected_client_mutation_id: str,
+) -> tuple[str, bool]:
+    """Validate a removeBlockedBy GraphQL mutation response.
+
+    Returns (error, is_schema_error). error == "" means the response is fully
+    valid. is_schema_error=True means missing/malformed response shape
+    (caller classifies as transport_or_schema_error); is_schema_error=False
+    means a well-formed response whose values mismatch the caller-declared
+    expectation (caller classifies as postcondition_rejected).
+    """
+    if not isinstance(mutation_data, dict):
+        return "mutation_response_not_object", True
+    payload = mutation_data.get("removeBlockedBy")
+    if not isinstance(payload, dict):
+        return "mutation_response_missing_remove_blocked_by_payload", True
+
+    issue = payload.get("issue")
+    if not isinstance(issue, dict):
+        return "mutation_response_missing_issue", True
+    blocking_issue = payload.get("blockingIssue")
+    if not isinstance(blocking_issue, dict):
+        return "mutation_response_missing_blocking_issue", True
+
+    issue_id = issue.get("id")
+    issue_number = issue.get("number")
+    blocking_id = blocking_issue.get("id")
+    blocking_number = blocking_issue.get("number")
+    if not isinstance(issue_id, str) or not issue_id:
+        return "mutation_response_issue_id_invalid", True
+    if type(issue_number) is not int:
+        return "mutation_response_issue_number_invalid", True
+    if not isinstance(blocking_id, str) or not blocking_id:
+        return "mutation_response_blocking_issue_id_invalid", True
+    if type(blocking_number) is not int:
+        return "mutation_response_blocking_issue_number_invalid", True
+
+    if issue_id != expected_blocked_issue_node_id or issue_number != expected_blocked_issue_number:
+        return "mutation_response_issue_identity_mismatch", False
+    if blocking_id != expected_blocker_node_id or blocking_number != expected_blocker_number:
+        return "mutation_response_blocking_issue_identity_mismatch", False
+
+    if "clientMutationId" not in payload:
+        return "mutation_response_missing_client_mutation_id", True
+    if payload.get("clientMutationId") != expected_client_mutation_id:
+        return "mutation_response_client_mutation_id_mismatch", False
+
+    return "", False
+
+
+# Issue #1667 review fix_delta P2: closed-schema idempotency marker
+# validator. A stored marker is only ever trusted as evidence of a prior
+# successful removal when EVERY one of these fields matches the current
+# caller-declared context exactly -- a partial/loose match (e.g. only
+# idempotency_key) is never sufficient.
+_ISSUE_DEPENDENCY_REMOVE_MARKER_SCHEMA = "ISSUE_DEPENDENCY_REMOVE_MARKER_V1"
+
+
+def _validate_dependency_remove_marker(
+    marker: object,
+    *,
+    issue_number: int,
+    repo: str,
+    target_blocker_number: int,
+    expected_blocked_issue_node_id: str,
+    expected_blocker_node_id: str,
+    idempotency_key: str,
+) -> str:
+    """Return "" iff marker is a fully-matching ISSUE_DEPENDENCY_REMOVE_MARKER_V1
+    recording a completed removal for this exact context, else a descriptive
+    mismatch code."""
+    if not isinstance(marker, dict):
+        return "marker_not_object"
+    if marker.get("schema") != _ISSUE_DEPENDENCY_REMOVE_MARKER_SCHEMA:
+        return "marker_schema_mismatch"
+    if marker.get("issue_number") != issue_number:
+        return "marker_issue_number_mismatch"
+    if marker.get("repo") != repo:
+        return "marker_repo_mismatch"
+    if marker.get("target_blocker_number") != target_blocker_number:
+        return "marker_target_blocker_number_mismatch"
+    if marker.get("blocked_issue_id") != expected_blocked_issue_node_id:
+        return "marker_blocked_issue_id_mismatch"
+    if marker.get("blocker_node_id") != expected_blocker_node_id:
+        return "marker_blocker_node_id_mismatch"
+    if marker.get("idempotency_key") != idempotency_key:
+        return "marker_idempotency_key_mismatch"
+    actor_login = marker.get("actor_login")
+    if not isinstance(actor_login, str) or not actor_login:
+        return "marker_actor_login_missing"
+    if marker.get("status_detail") != "removed":
+        return "marker_status_detail_not_removed"
+    return ""
+
+
 def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
     field_err = validate_issue_dependency_remove_input(input_data, args.issue_number, args.repo)
     if field_err:
@@ -2641,20 +2757,41 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
             status="precondition_rejected",
         )
 
-    def _write_marker(status_detail: str, pre_hash: str, post_hash: str | None = None) -> None:
-        marker_path.parent.mkdir(parents=True, exist_ok=True)
-        marker_path.write_text(json.dumps({
-            "schema": "ISSUE_DEPENDENCY_REMOVE_MARKER_V1",
-            "issue_number": args.issue_number,
-            "repo": args.repo,
-            "target_blocker_number": target_blocker_number,
-            "idempotency_key": idempotency_key,
-            "actor_login": login,
-            "pre_mutation_snapshot_sha256": pre_hash,
-            "post_mutation_snapshot_sha256": post_hash,
-            "status_detail": status_detail,
-            "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        }, ensure_ascii=False, indent=2))
+    marker_write_errors: list[str] = []
+
+    def _write_marker(
+        status_detail: str,
+        pre_hash: str | None,
+        post_hash: str | None = None,
+        *,
+        blocked_issue_id: str | None = None,
+        blocked_issue_number: int | None = None,
+        blocker_node_id: str | None = None,
+    ) -> None:
+        # Issue #1667 review fix_delta P1: marker write failure is recorded
+        # explicitly (marker_write_errors) rather than silently swallowed --
+        # it is included in the result payload of whichever return path
+        # triggered this write.
+        try:
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            marker_path.write_text(json.dumps({
+                "schema": _ISSUE_DEPENDENCY_REMOVE_MARKER_SCHEMA,
+                "issue_number": args.issue_number,
+                "repo": args.repo,
+                "target_blocker_number": target_blocker_number,
+                "blocked_issue_id": blocked_issue_id or expected_blocked_issue_node_id,
+                "blocked_issue_number": blocked_issue_number or args.issue_number,
+                "blocker_node_id": blocker_node_id or expected_blocker_node_id,
+                "idempotency_key": idempotency_key,
+                "actor_login": login,
+                "actor_permission": permission,
+                "pre_mutation_snapshot_sha256": pre_hash,
+                "post_mutation_snapshot_sha256": post_hash,
+                "status_detail": status_detail,
+                "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            }, ensure_ascii=False, indent=2))
+        except Exception as exc:
+            marker_write_errors.append(f"marker_write_failed:{status_detail}:{exc}")
 
     existing_marker = None
     if marker_path.exists():
@@ -2674,24 +2811,42 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
 
     pre_numbers = sorted(n["number"] for n in pre_state["nodes"])
 
-    # -- Idempotency: a marker for this exact idempotency_key plus a FRESH
-    # remote readback showing the target relationship already absent is the
-    # only path to already_completed. This never substitutes a cached/local
-    # decision for the remote check above.
-    if (
-        existing_marker is not None
-        and existing_marker.get("idempotency_key") == idempotency_key
-        and target_blocker_number not in pre_numbers
-    ):
-        computed_pre_hash = _compute_blocked_by_snapshot_sha256(
-            pre_state["blocked_issue_id"], pre_state["blocked_issue_number"], pre_state["nodes"]
+    # -- Idempotency (Issue #1667 review fix_delta P2): a FULLY validated
+    # marker for this exact context plus a FRESH remote readback showing the
+    # target relationship already absent is the only path to
+    # already_completed. A marker that exists but fails closed-schema
+    # validation is never trusted; if the target relationship also happens
+    # to be absent, that ambiguous state is routed to human judgment
+    # (postcondition_rejected) rather than silently treated as
+    # already_completed.
+    if existing_marker is not None and target_blocker_number not in pre_numbers:
+        marker_validation_err = _validate_dependency_remove_marker(
+            existing_marker,
+            issue_number=args.issue_number,
+            repo=args.repo,
+            target_blocker_number=target_blocker_number,
+            expected_blocked_issue_node_id=expected_blocked_issue_node_id,
+            expected_blocker_node_id=expected_blocker_node_id,
+            idempotency_key=idempotency_key,
         )
-        return _ok({
-            "status": "already_completed",
-            "actor_login": login,
-            "pre_mutation_snapshot_sha256": computed_pre_hash,
-            "idempotency_marker_found": True,
-        })
+        if not marker_validation_err:
+            computed_pre_hash = _compute_blocked_by_snapshot_sha256(
+                pre_state["blocked_issue_id"], pre_state["blocked_issue_number"], pre_state["nodes"]
+            )
+            result = {
+                "status": "already_completed",
+                "actor_login": login,
+                "actor_permission": permission,
+                "pre_mutation_snapshot_sha256": computed_pre_hash,
+                "idempotency_marker_found": True,
+            }
+            if marker_write_errors:
+                result["marker_write_errors"] = list(marker_write_errors)
+            return _ok(result)
+        return _fail(
+            f"already_completed_marker_invalid: {marker_validation_err}",
+            status="postcondition_rejected",
+        )
 
     if pre_numbers != expected_numbers:
         return _fail(
@@ -2720,31 +2875,110 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
             status="precondition_rejected",
         )
 
+    # -- Precondition (Issue #1667 review fix_delta P1): confirm no unrelated
+    # tracked/staged/untracked changes exist BEFORE the remote mutation is
+    # attempted, not only after.
+    pre_mutation_changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+    if pre_mutation_changed:
+        return _fail(
+            "precondition_tracked_changes_detected",
+            [f"changed: {f}" for f in pre_mutation_changed[:20]],
+            status="precondition_rejected",
+        )
+
+    # -- Attempt marker (Issue #1667 review fix_delta P1): written BEFORE the
+    # remote mutation call so any post-mutation failure (including an
+    # interpreter crash) still leaves an audit trail proving the mutation
+    # was attempted.
+    _write_marker(
+        "mutation_attempted", computed_pre_hash,
+        blocked_issue_id=pre_state["blocked_issue_id"],
+        blocked_issue_number=pre_state["blocked_issue_number"],
+        blocker_node_id=expected_blocker_node_id,
+    )
+
     # -- AC4: single mutation attempt. No automatic retry on transport/GraphQL
     # error -- a failed call is recorded and reported, never retried here.
     _mutation_data, mutation_err = _graphql_call(
         gh_bin, gh_env, _ISSUE_DEPENDENCY_REMOVE_MUTATION,
-        {"issueId": expected_blocked_issue_node_id, "blockedByIssueId": expected_blocker_node_id},
+        {
+            "issueId": expected_blocked_issue_node_id,
+            "blockingIssueId": expected_blocker_node_id,
+            "clientMutationId": idempotency_key,
+        },
     )
     if mutation_err:
-        _write_marker("transport_or_schema_error", computed_pre_hash)
-        return _fail(mutation_err, status="transport_or_schema_error")
+        _write_marker(
+            "transport_or_schema_error", computed_pre_hash,
+            blocked_issue_id=pre_state["blocked_issue_id"],
+            blocked_issue_number=pre_state["blocked_issue_number"],
+            blocker_node_id=expected_blocker_node_id,
+        )
+        errors = [mutation_err] + marker_write_errors
+        return _fail(mutation_err, errors, status="transport_or_schema_error")
+
+    # -- Issue #1667 review fix_delta P1: validate the removeBlockedBy
+    # response shape/identity before trusting the mutation succeeded against
+    # the intended target.
+    response_err, response_is_schema_error = _validate_remove_blocked_by_mutation_response(
+        _mutation_data,
+        expected_blocked_issue_node_id=expected_blocked_issue_node_id,
+        expected_blocked_issue_number=pre_state["blocked_issue_number"],
+        expected_blocker_node_id=expected_blocker_node_id,
+        expected_blocker_number=target_blocker_number,
+        expected_client_mutation_id=idempotency_key,
+    )
+    if response_err:
+        response_status = (
+            "transport_or_schema_error" if response_is_schema_error else "postcondition_rejected"
+        )
+        _write_marker(
+            response_status, computed_pre_hash,
+            blocked_issue_id=pre_state["blocked_issue_id"],
+            blocked_issue_number=pre_state["blocked_issue_number"],
+            blocker_node_id=expected_blocker_node_id,
+        )
+        return _fail(response_err, status=response_status)
 
     # -- AC5: all-page post-mutation readback (TOCTOU close-out).
     post_state, post_err = _fetch_blocked_by_all_pages(args.issue_number, args.repo, gh_bin, gh_env)
     if post_err:
+        _write_marker(
+            "transport_or_schema_error", computed_pre_hash,
+            blocked_issue_id=pre_state["blocked_issue_id"],
+            blocked_issue_number=pre_state["blocked_issue_number"],
+            blocker_node_id=expected_blocker_node_id,
+        )
         return _fail(post_err, status="transport_or_schema_error")
 
     if post_state["blocked_issue_id"] != expected_blocked_issue_node_id:
+        _write_marker(
+            "postcondition_rejected", computed_pre_hash,
+            blocked_issue_id=pre_state["blocked_issue_id"],
+            blocked_issue_number=pre_state["blocked_issue_number"],
+            blocker_node_id=expected_blocker_node_id,
+        )
         return _fail("postcondition_blocked_issue_node_id_mismatch", status="postcondition_rejected")
 
     post_numbers = sorted(n["number"] for n in post_state["nodes"])
     expected_post_numbers = sorted(n for n in expected_numbers if n != target_blocker_number)
     if target_blocker_number in post_numbers:
+        _write_marker(
+            "postcondition_rejected", computed_pre_hash,
+            blocked_issue_id=pre_state["blocked_issue_id"],
+            blocked_issue_number=pre_state["blocked_issue_number"],
+            blocker_node_id=expected_blocker_node_id,
+        )
         return _fail(
             "postcondition_target_relationship_still_present", status="postcondition_rejected"
         )
     if post_numbers != expected_post_numbers:
+        _write_marker(
+            "postcondition_rejected", computed_pre_hash,
+            blocked_issue_id=pre_state["blocked_issue_id"],
+            blocked_issue_number=pre_state["blocked_issue_number"],
+            blocker_node_id=expected_blocker_node_id,
+        )
         return _fail(
             f"postcondition_non_target_set_changed: current={post_numbers} "
             f"expected={expected_post_numbers}",
@@ -2754,6 +2988,12 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
     pre_by_number = {n["number"]: n["id"] for n in pre_state["nodes"]}
     for n in post_state["nodes"]:
         if pre_by_number.get(n["number"]) != n["id"]:
+            _write_marker(
+                "postcondition_rejected", computed_pre_hash,
+                blocked_issue_id=pre_state["blocked_issue_id"],
+                blocked_issue_number=pre_state["blocked_issue_number"],
+                blocker_node_id=expected_blocker_node_id,
+            )
             return _fail(
                 "postcondition_non_target_node_id_drift", status="postcondition_rejected"
             )
@@ -2763,24 +3003,41 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
     )
 
     # -- AC14-equivalent postcondition: no changes outside this command's own
-    # write root.
+    # write root. Issue #1667 review fix_delta P1: classified as
+    # postcondition_rejected (not the undefined "failed" status) -- the
+    # closed result-status set for this command id never includes "failed".
     changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
     if changed:
+        _write_marker(
+            "postcondition_rejected", computed_pre_hash, computed_post_hash,
+            blocked_issue_id=pre_state["blocked_issue_id"],
+            blocked_issue_number=pre_state["blocked_issue_number"],
+            blocker_node_id=expected_blocker_node_id,
+        )
         return _fail(
             "postcondition_tracked_changes_detected",
             [f"changed: {f}" for f in changed[:20]],
-            status="failed",
+            status="postcondition_rejected",
         )
 
-    _write_marker("removed", computed_pre_hash, computed_post_hash)
+    _write_marker(
+        "removed", computed_pre_hash, computed_post_hash,
+        blocked_issue_id=pre_state["blocked_issue_id"],
+        blocked_issue_number=pre_state["blocked_issue_number"],
+        blocker_node_id=expected_blocker_node_id,
+    )
 
-    return _ok({
+    result = {
         "status": "removed",
         "actor_login": login,
+        "actor_permission": permission,
         "pre_mutation_snapshot_sha256": computed_pre_hash,
         "post_mutation_snapshot_sha256": computed_post_hash,
         "idempotency_marker_written": True,
-    })
+    }
+    if marker_write_errors:
+        result["marker_write_errors"] = list(marker_write_errors)
+    return _ok(result)
 
 
 if __name__ == "__main__":

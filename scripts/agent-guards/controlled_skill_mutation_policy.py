@@ -264,6 +264,14 @@ ENV_SANITIZE_KEYS = [
     "GH_CONFIG_DIR",
     "GH_DEBUG",
     "DEBUG",
+    # Issue #1667 review fix_delta P1: an ambient GH_TOKEN/GITHUB_TOKEN in the
+    # parent process environment could let a trusted-actor identity be
+    # substituted by whatever credential happens to be set (not necessarily
+    # the identity `gh auth status` reports for the stored config). Stripping
+    # both env vars forces every controlled mutation subprocess to use the
+    # already-authenticated `gh` credential store exclusively.
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
 ]
 
 # ── CONTROLLED_SKILL_MUTATION_COMMAND_POLICY ──────────────────────────────────
