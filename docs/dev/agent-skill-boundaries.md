@@ -1662,6 +1662,153 @@ routing-critical フィールド: `ISOLATION_ISSUE_COMMENT_REQUEST_ALLOWED_KEYS`
 シグネチャ（`request` / `expected_issue_number` / `expected_repo` キーワード
 引数）も routing-critical。
 
+## `issue_dependency.remove` による GitHub 由来の依存関係解除実行系統（Issue #1632）
+
+（Issue #1632 — closed になった stale GitHub native `blockedBy` relationship を、
+全ページ readback・exact node-ID binding・一回限りの GraphQL mutation で安全に
+解除する command id を `CONTROLLED_SKILL_MUTATION_COMMAND_POLICY` に追加する拡張。
+`#1523` が closed `#1403` への stale native `blockedBy` を保持し続け、implementation
+overlap preflight を `human_review_required` に倒していた事象への対処。）
+
+### GraphQL 選定理由
+
+REST では `blockedBy` connection の全ページ・node ID・state を単一固定 query で
+取得できない。GitHub GraphQL の `Issue.blockedBy(first, after)` はカーソル
+ページネーション付きで node ID・番号・state・所属 repository を同時に返し、
+`removeBlockedBy` mutation は blocked issue ID と blocking issue ID の 2 node ID
+だけを要求する。これにより pre/post readback・node-ID binding・page 全件性の
+証明を REST の複数エンドポイント合成より単純な単一契約に閉じられる。
+
+### 通信先・問い合わせ内容・応答検証の固定化
+
+- host は `github.com` に固定（`_TRUSTED_GITHUB_HOST`）。呼び出し元が host を
+  上書きすることはできない。
+- readback query・`removeBlockedBy` mutation の GraphQL document 文字列は
+  `controlled_skill_mutation_exec.py` に埋め込まれた定数
+  (`_ISSUE_DEPENDENCY_REMOVE_BLOCKED_BY_QUERY` /
+  `_ISSUE_DEPENDENCY_REMOVE_MUTATION`) のみを使用し、呼び出し元が query を
+  指定することはできない。
+- 実行は `gh api --hostname github.com graphql --input -` の argv-list
+  （shell=False）に固定し、query/variables は stdin JSON として渡す
+  （`_post_pr_review` と同じ「shell 展開に依存しない body 渡し」パターン）。
+- response validator (`_fetch_blocked_by_all_pages`) は `errors` キー、
+  `data`/`repository`/`issue`/`blockedBy`/`pageInfo`/`nodes` の欠落、
+  node の repository 不一致、node id/number の型不正、state が
+  `OPEN`/`CLOSED` 以外、ページ間の node id/number 重複、
+  `hasNextPage: true` なのに cursor が非進行・欠落、を fail-closed で拒否する。
+
+### ISSUE_DEPENDENCY_REMOVE_INPUT_V1（closed-key 入力スキーマ）
+
+```python
+ISSUE_DEPENDENCY_REMOVE_INPUT_SCHEMA = "ISSUE_DEPENDENCY_REMOVE_INPUT_V1"
+ISSUE_DEPENDENCY_REMOVE_INPUT_ALLOWED_KEYS = frozenset({
+    "schema", "issue_number", "repo", "target_blocker_number",
+    "expected_blocked_issue_node_id", "expected_blocker_node_id",
+    "expected_blocked_by_numbers", "expected_pre_mutation_snapshot_sha256",
+    "idempotency_key",
+})
+```
+
+`validate_issue_dependency_remove_input(data, issue_number, repo)` は
+unknown key、null、bool を整数として受理する値、`target_blocker_number` が
+`issue_number` と同一、`expected_blocked_by_numbers` の重複・未ソート・
+size cap（`ISSUE_DEPENDENCY_REMOVE_MAX_BLOCKED_BY_NUMBERS`）超過・
+`target_blocker_number` 非包含、`expected_pre_mutation_snapshot_sha256` の
+`sha256:` prefix 欠落、trusted repository 以外を mutation 前に拒否する。
+
+### closed-blocker-only・全ページ pre/post readback（AC2/AC5）
+
+mutation 前に `blockedBy` を cursor が null（`hasNextPage: false`）になるまで
+全ページ readback し、`expected_blocked_by_numbers`（ソート済み number 集合）
+との完全一致、`target_blocker_number` の node ID 一致、state が `CLOSED`
+であることを確認する。`blocked_issue_id` / `blocked_issue_number` を含む
+canonical hash（`_compute_blocked_by_snapshot_sha256`）が
+`expected_pre_mutation_snapshot_sha256` と一致した場合のみ mutation に進む。
+mutation 後も同じ全ページ readback を行い、target の不在・非 target の
+number/node-ID 集合の不変性を確認できない限り success にしない
+（TOCTOU を pre/post 両ハッシュの差分として artifact に残す）。
+
+### 実行者の認証情報と権限の確認（AC3）
+
+`_fetch_issue_dependency_remove_actor()` が `gh api user` で authenticated
+login を、`gh api repos/{repo}/collaborators/{login}/permission` で repo
+permission を readback する。login 取得不能は `transport_or_schema_error`、
+permission が `admin`/`write`/`maintain` のいずれでもない場合は
+`precondition_rejected` とし、いずれの場合も `removeBlockedBy` を呼ばない。
+artifact には login と permission のみを記録し、token 等の credential は
+一切記録しない。
+
+### 再試行しない設計と結果状態の閉じた集合（AC4/AC6）
+
+`removeBlockedBy` は precondition が全て一致した場合に一度だけ呼ぶ。
+GraphQL/transport error は自動再試行しない
+（`_graphql_call` は 1 回の呼び出しにつき 1 回の subprocess 実行のみ）。
+結果は `removed | precondition_rejected | transport_or_schema_error |
+postcondition_rejected | already_completed` の closed status のいずれかを
+`status` フィールドで返す（PR #1667 レビュー fix_delta で、mutation 成功後の
+write-root 外変更検出も `postcondition_rejected` に統一し、未定義の
+`failed` 値を使わないようにした）。
+
+mutation 呼び出しの GraphQL variables は公式スキーマの
+`RemoveBlockedByInput`（`issueId: ID!`, `blockingIssueId: ID!`,
+`clientMutationId: String`）と一対一である。応答
+（`RemoveBlockedByPayload`）は `issue { id number }` /
+`blockingIssue { id number }` / `clientMutationId` を返却し、
+`_validate_remove_blocked_by_mutation_response()` が期待値との完全一致を
+確認してから postcondition readback へ進む。missing/malformed な応答形状は
+`transport_or_schema_error`、値の不一致（別 issue/blocker を書き換えた場合等）
+は `postcondition_rejected` として区別する。
+
+mutation の直前には `mutation_attempted` の attempt marker を書き込み、
+mutation 呼び出しより前にも write-root 外の tracked changes が存在しないかを
+確認する（precondition）。これにより、mutation とその readback の間で
+プロセスが異常終了しても、mutation が試行されたという監査証跡が残る。
+
+`gh` subprocess 環境からは `GH_TOKEN` / `GITHUB_TOKEN` も除去する
+(`ENV_SANITIZE_KEYS`)。親プロセス環境の ambient token が trusted actor の
+identity を差し替えることを防ぐ。
+
+### 再実行時の冪等性（AC5）
+
+`artifacts/{issue_number}/issue-metadata/issue_dependency.remove/issue_dependency_remove.marker.json`
+に `idempotency_key` を含む closed schema
+（`ISSUE_DEPENDENCY_REMOVE_MARKER_V1`: schema/issue_number/repo/
+target_blocker_number/blocked_issue_id/blocked_issue_number/blocker_node_id/
+idempotency_key/actor_login/status_detail が全て一致すること）を記録する。
+再実行時はこの全フィールド一致に加えて、必ずフレッシュな全ページ readback で
+target relationship の不在を確認できた場合のみ `already_completed` を返す
+（marker 単独では、また `idempotency_key` のみの部分一致でも
+`already_completed` を確定しない -- 部分一致かつ target 不在の場合は
+`postcondition_rejected` として人間判断に回す）。
+
+### 失敗経路の専用テスト（AC6）
+
+`scripts/agent-guards/tests/test_controlled_skill_mutation_exec.py` に、
+unknown key・bool number・duplicate/unsorted/oversize set・null・wrong repo・
+hash/actor/node-ID/state mismatch・GraphQL errors・cursor failure・
+schema drift・pre/post TOCTOU・二回目 mutation attempt を fail-closed で
+検証する専用テストを追加している。すべて fake `_graphql_call` /
+`_fetch_issue_dependency_remove_actor` を用い、実 network mutation を
+一切行わない。
+
+### 既存 command id への非破壊性確認（AC1/AC7）
+
+`issue_dependency.remove` の追加は既存 command id
+（`termination_report.publish` / `issue_body.update` /
+`issue_comment.publish` / `contract_snapshot.publish` /
+`pr_review.publish` / `issue_scope_snapshot.materialize`）の
+schema・dispatch・exact argv・postcondition を一切変更しない。
+`scripts/agent-guards/tests/test_controlled_skill_mutation_policy.py::TestIssueDependencyRemoveRegistration`
+が既存 entry の read-only 不変性を確認する。
+
+### 本文 dependency 不一致時の human escalation（変わらない境界）
+
+`issue_dependency.remove` は closed blocker への stale native `blockedBy`
+の一件解除のみを扱う。Issue 本文の `Depends on #N` / Machine-Readable
+Contract の `blocked_by` と native `blockedBy` が不一致な場合の判断は
+引き続き `docs/dev/github-ops.md#native-dependency-と-depends-on-n-が不一致の場合`
+に従い human escalation とし、本 executor は自動で本文を書き換えない。
+
 ## edit-issue 向け transaction helper の契約定義（Issue #1287）
 
 既存 Issue body/comment mutation の consumer contract は `edit_issue_txn.py` に集約する。
