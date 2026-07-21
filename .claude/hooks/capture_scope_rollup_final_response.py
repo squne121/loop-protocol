@@ -16,12 +16,114 @@ from typing import Any
 
 import yaml
 
+# Issue #1527 Scope Delta (2): eligibility/readiness are validated exclusively
+# against the fixed private location authority in
+# .claude/scripts/check_session_recording_runtime_safety.py — never from
+# hook-payload-supplied inline objects, arbitrary paths, or artifacts[]
+# fuzzy-match values. Import it as a sibling module under .claude/scripts.
+_SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+import check_session_recording_runtime_safety as _srrs  # noqa: E402
+
 MARKER_NAME = "ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1"
 TARGET_AGENT_TYPE = "scope-rollup-runner"
 DEFAULT_CAPTURE_DIR = Path("/tmp")
 FENCED_YAML_RE = re.compile(r"```ya?ml[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 INVOCATION_ID_RE = re.compile(r"^\s*invocation_id:\s*['\"]?([A-Za-z0-9._:-]+)['\"]?\s*$", re.MULTILINE)
 STRICT_STATUS = {"ok", "failed", "runner_unavailable"}
+
+# Codex-only transport gate: only when the caller (the Codex adapter's
+# `uv run`/fixed-interpreter invocation) sets this env var does the producer
+# enforce fixed-location source-bound eligibility/readiness. The Claude
+# `session_manifest_coordinator.sh` path never sets it and therefore keeps
+# capturing raw payloads exactly as before #1527 (Scope Delta (2) AC16
+# regression guard). This flag can only be set by our own trusted process
+# spawn — never by hook-payload content.
+REQUIRE_SOURCE_BOUND_ENV = "SCOPE_ROLLUP_REQUIRE_SOURCE_BOUND_ELIGIBILITY"
+
+READINESS_SCHEMA = "SESSION_RECORDING_SCOPE_ROLLUP_READINESS_V1"
+READINESS_KEYS = frozenset(
+    {
+        "schema",
+        "artifact_version",
+        "repo_root_realpath",
+        "uv_lock_digest",
+        "python_version_digest",
+        "interpreter_realpath",
+        "interpreter_version",
+        "producer_digest",
+        "prepared",
+        "generated_at",
+    }
+)
+READINESS_MAX_BYTES = 8192
+
+
+def _readiness_artifact_path(repo_root: Path) -> Path:
+    override = os.environ.get("SCOPE_ROLLUP_READINESS_ARTIFACT_PATH")
+    if override:
+        return Path(override)
+    return repo_root / ".claude" / "tmp" / "session-recording" / "scope-rollup-readiness.json"
+
+
+def _load_and_verify_readiness_artifact(
+    repo_root: Path, *, hook_received_at: datetime,
+) -> tuple[dict[str, Any] | None, str, str | None]:
+    path = _readiness_artifact_path(repo_root)
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None, "readiness_missing", None
+    if stat.S_ISLNK(st.st_mode):
+        return None, "readiness_invalid_symlink", None
+    if not stat.S_ISREG(st.st_mode):
+        return None, "readiness_invalid_not_regular_file", None
+    if stat.S_IMODE(st.st_mode) != 0o600:
+        return None, "readiness_invalid_mode", None
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        return None, "readiness_invalid_owner", None
+    if st.st_size > READINESS_MAX_BYTES:
+        return None, "readiness_invalid_size", None
+
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None, "readiness_unreadable", None
+    digest = f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+    try:
+        artifact = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, "readiness_invalid_json", digest
+    if not isinstance(artifact, dict):
+        return None, "readiness_invalid_json", digest
+
+    extra_keys = set(artifact.keys()) - READINESS_KEYS
+    if extra_keys:
+        return None, "readiness_invalid_additional_properties", digest
+    missing_keys = READINESS_KEYS - set(artifact.keys())
+    if missing_keys:
+        return None, "readiness_invalid_missing_fields", digest
+
+    if artifact.get("schema") != READINESS_SCHEMA:
+        return None, "readiness_invalid_schema", digest
+    if artifact.get("repo_root_realpath") != str(repo_root.resolve()):
+        return None, "readiness_binding_repo_mismatch", digest
+    if artifact.get("prepared") is not True:
+        return None, "readiness_unprepared", digest
+
+    producer_digest = f"sha256:{hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}"
+    if artifact.get("producer_digest") != producer_digest:
+        return None, "readiness_binding_producer_digest_mismatch", digest
+
+    generated_at = _parse_timestamp(artifact.get("generated_at"))
+    if generated_at is None:
+        return None, "readiness_invalid_timestamp", digest
+    if generated_at > hook_received_at:
+        return None, "readiness_stale_future_generated_at", digest
+
+    return artifact, "ok", digest
 
 
 class DuplicateKeyError(ValueError):
@@ -150,6 +252,67 @@ def _extract_invocation_id(last_assistant_message: str, marker_payload: dict[str
     return None
 
 
+def _parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return _parse_iso8601(value)
+    except Exception:
+        return None
+
+
+def _evaluate_source_bound_artifacts(
+    repo_root: Path,
+    marker_payload: dict[str, Any] | None,
+    hook_received_at: datetime,
+) -> tuple[bool, list[str], str, dict[str, Any]]:
+    """Issue #1527 Scope Delta (2) AC12/AC13/AC14: the sole eligibility/
+    readiness source is the fixed private location authority in
+    check_session_recording_runtime_safety.py — never a hook-payload value.
+    Returns (ok, notes, reason_code, provenance).
+    """
+    # PyYAML resolves an unquoted ISO8601-looking scalar to a native
+    # datetime object (not a str) — normalize back to text before parsing,
+    # same as every other marker timestamp field in this module.
+    marker_generated_at = (
+        _parse_timestamp(_normalize_text(marker_payload.get("generated_at"))) if marker_payload else None
+    )
+
+    eligibility_artifact, eligibility_reason, eligibility_digest = (
+        _srrs.load_and_verify_scope_rollup_eligibility_artifact(
+            repo_root,
+            hook_received_at=hook_received_at,
+            marker_generated_at=marker_generated_at,
+        )
+    )
+    provenance: dict[str, Any] = {
+        "eligibility_artifact_digest": eligibility_digest,
+        "eligibility_verification_reason_code": eligibility_reason,
+        "readiness_artifact_digest": None,
+        "readiness_verification_reason_code": None,
+    }
+    if eligibility_artifact is None:
+        note = "source-bound eligibility artifact is missing" if eligibility_reason == "eligibility_missing" \
+            else f"source-bound eligibility artifact rejected: {eligibility_reason}"
+        # Pass the underlying reason code through verbatim (rather than
+        # collapsing distinct failure modes into a small bucket) so callers
+        # can distinguish e.g. binding mismatches from staleness (AC13/AC14).
+        return False, [note], eligibility_reason, provenance
+
+    readiness_artifact, readiness_reason, readiness_digest = _load_and_verify_readiness_artifact(
+        repo_root, hook_received_at=hook_received_at,
+    )
+    provenance["readiness_artifact_digest"] = readiness_digest
+    provenance["readiness_verification_reason_code"] = readiness_reason
+    if readiness_artifact is None:
+        note = "source-bound readiness artifact is missing" if readiness_reason == "readiness_missing" \
+            else ("source-bound readiness artifact is not prepared" if readiness_reason == "readiness_unprepared"
+                  else f"source-bound readiness artifact rejected: {readiness_reason}")
+        return False, [note], readiness_reason, provenance
+
+    return True, [], "ok", provenance
+
+
 def _resolve_capture_dir() -> Path:
     candidate = Path(os.environ.get("SCOPE_ROLLUP_CAPTURE_DIR", str(DEFAULT_CAPTURE_DIR)))
     return candidate.resolve()
@@ -246,6 +409,10 @@ def _decision_from_payload(payload: dict[str, Any]) -> CaptureDecision:
     provenance = {
         "hook_event_name": hook_event_name,
         "agent_transcript_path": transcript_path,
+        "eligibility_artifact_digest": None,
+        "eligibility_verification_reason_code": None,
+        "readiness_artifact_digest": None,
+        "readiness_verification_reason_code": None,
     }
 
     if hook_event_name != "SubagentStop":
@@ -378,6 +545,34 @@ def _decision_from_payload(payload: dict[str, Any]) -> CaptureDecision:
             provenance=provenance,
             notes=["requested_at/generated_at could not be parsed"],
         )
+
+    # Issue #1527 Scope Delta (2) AC16: the source-bound eligibility gate is
+    # enforced ONLY for callers that explicitly opt in (the Codex adapter,
+    # via its own trusted process spawn env — never a hook-payload value).
+    # The Claude session_manifest_coordinator.sh raw-payload path never sets
+    # this and therefore keeps capturing exactly as it did before #1527.
+    if os.environ.get(REQUIRE_SOURCE_BOUND_ENV) == "1":
+        repo_root = Path(os.environ.get("SCOPE_ROLLUP_REPO_ROOT", str(Path(__file__).resolve().parents[2])))
+        source_bound_ok, source_bound_notes, source_bound_status, source_bound_provenance = (
+            _evaluate_source_bound_artifacts(repo_root, marker_payload, datetime.now(timezone.utc))
+        )
+        provenance.update(source_bound_provenance)
+        if not source_bound_ok:
+            return CaptureDecision(
+                capture_mode="subagent_stop_hook",
+                capture_status="parser_rejected",
+                parser_status=source_bound_status,
+                capture_routing_action="stop_human",
+                agent_type=TARGET_AGENT_TYPE,
+                invocation_id=invocation_id,
+                requested_at=requested_at,
+                generated_at=generated_at,
+                capture_path=None,
+                capture_sha256=None,
+                capture_source="last_assistant_message",
+                provenance=provenance,
+                notes=source_bound_notes,
+            )
 
     if generated_dt <= requested_dt:
         return CaptureDecision(

@@ -20,7 +20,8 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { existsSync, readdirSync, readFileSync, mkdirSync, unlinkSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, mkdirSync, unlinkSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
@@ -378,13 +379,19 @@ describe('AC2-AC8: Codex composite hook direct Vitest assertions', () => {
   const compositeHook = resolve(repoRoot, '.codex', 'hooks', 'session-recording-composite.mjs')
 
   function runCompositeHook(event: string, stdinContent: string | object, overrideEnv: Record<string, string> = {}) {
-    const result = spawnSync(process.execPath, [compositeHook, '--event', event], {
-      input: typeof stdinContent === 'string' ? stdinContent : JSON.stringify(stdinContent),
-      encoding: 'utf8',
-      timeout: HOOK_SPAWN_TIMEOUT_MS,
-      cwd: repoRoot,
-      env: { ...process.env, ...overrideEnv },
-    })
+    const captureDirectory = mkdtempSync(resolve(tmpdir(), 'codex-hook-capture-fixture-'))
+    let result
+    try {
+      result = spawnSync(process.execPath, [compositeHook, '--event', event], {
+        input: typeof stdinContent === 'string' ? stdinContent : JSON.stringify(stdinContent),
+        encoding: 'utf8',
+        timeout: HOOK_SPAWN_TIMEOUT_MS,
+        cwd: repoRoot,
+        env: { ...process.env, SCOPE_ROLLUP_CAPTURE_DIR: captureDirectory, ...overrideEnv },
+      })
+    } finally {
+      rmSync(captureDirectory, { recursive: true, force: true })
+    }
     let parsedJson: unknown = null
     if (result.stdout && result.stdout.trim()) {
       try { parsedJson = JSON.parse(result.stdout.trim()) } catch { /* not JSON */ }

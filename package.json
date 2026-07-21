@@ -6,6 +6,8 @@
   "packageManager": "pnpm@11.7.0",
   "scripts": {
     "dev": "vite",
+    "bootstrap": "node scripts/session-recording/bootstrap-source-bound-readiness.mjs",
+    "session-recording:capture-hot-path-check": "uv run --no-sync --locked python3 -c \"import yaml; print('scope-rollup capture hot path: no-sync interpreter ready')\"",
     "test": "vitest run --exclude 'tests/e2e/**' --exclude '.claude/worktrees/**' --exclude '.claude/tmp/**' --exclude 'tmp/**'",
     "typecheck": "tsc --noEmit",
     "typecheck:e2e": "tsc -p tests/e2e/tsconfig.json --noEmit",

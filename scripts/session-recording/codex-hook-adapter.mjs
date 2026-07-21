@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
-import { execFileSync } from 'node:child_process'
-import { dirname, resolve } from 'node:path'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
+import { readFileSync, realpathSync, statSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { dirname, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { buildCodexManifestFileName, resolveManifestWriteTarget, writeCodexSessionManifest } from './write-codex-session-manifest.mjs'
@@ -23,6 +25,286 @@ const configuredProducerScript = process.env.CODEX_SESSION_RECORDING_PRODUCER
 const producerScript = configuredProducerScript.startsWith(repoRoot)
   ? configuredProducerScript
   : defaultProducerScript
+
+// Issue #1527: scope-rollup canonical capture remains owned by the existing
+// Python producer. The adapter owns only the narrow SubagentStop eligibility
+// decision and bounded subprocess transport; it must never parse markers,
+// choose artifact names, or write capture artifacts itself.
+const defaultScopeRollupCaptureScript = resolve(
+  repoRoot,
+  '.claude',
+  'hooks',
+  'capture_scope_rollup_final_response.py',
+)
+const scopeRollupCaptureFixtureRoot = resolve(
+  repoRoot,
+  'tests',
+  'fixtures',
+  'hooks',
+  'scope-rollup-capture',
+)
+const isScopeRollupCaptureTestTransport = process.env.NODE_ENV === 'test'
+const SCOPE_ROLLUP_CAPTURE_TIMEOUT_MS = 3500
+const SCOPE_ROLLUP_CAPTURE_ENV_ALLOWLIST = new Set([
+  'CI',
+  'HOME',
+  'LANG',
+  'LC_ALL',
+  'LC_COLLATE',
+  'LC_CTYPE',
+  'LC_MESSAGES',
+  'LC_MONETARY',
+  'LC_NUMERIC',
+  'LC_TIME',
+  'LOGNAME',
+  'PATH',
+  'PYTHONIOENCODING',
+  'PYTHONUNBUFFERED',
+  'SCOPE_ROLLUP_CAPTURE_DIR',
+  'SCOPE_ROLLUP_ELIGIBILITY_ARTIFACT_PATH',
+  'SCOPE_ROLLUP_READINESS_ARTIFACT_PATH',
+  'SCOPE_ROLLUP_REPO_ROOT',
+  'SCOPE_ROLLUP_REQUIRE_SOURCE_BOUND_ELIGIBILITY',
+  'TEMP',
+  'TMP',
+  'TMPDIR',
+  'USER',
+  'USERNAME',
+  'UV_CACHE_DIR',
+  'UV_DATA_DIR',
+])
+const SCOPE_ROLLUP_CAPTURE_ELIGIBILITY = Object.freeze({
+  event: 'SubagentStop',
+  secrets_mode: 'none',
+  public_checkpoint_enabled: false,
+  unknown_visibility_mapping: false,
+  guard_decision: 'allow_only',
+  stop_hook_active: false,
+  malformed_payload: 'skip',
+})
+
+// ---------------------------------------------------------------------------
+// Issue #1527 Scope Delta (2) AC1/AC3/AC12/AC13/AC14: fixed private location
+// eligibility/readiness gate. This is a NODE-ONLY check that runs BEFORE the
+// Python producer is ever spawned. It never reads eligibility/readiness from
+// the hook payload — only from the fixed private artifact locations written
+// by .claude/scripts/check_session_recording_runtime_safety.py (eligibility)
+// and scripts/session-recording/bootstrap-source-bound-readiness.mjs
+// (readiness). missing/invalid/stale artifacts short-circuit BEFORE any `uv`
+// / Python process is started (cold-environment sync is never triggered).
+// ---------------------------------------------------------------------------
+const SCOPE_ROLLUP_ELIGIBILITY_SCHEMA = 'SESSION_RECORDING_SCOPE_ROLLUP_ELIGIBILITY_V1'
+const SCOPE_ROLLUP_ELIGIBILITY_KEYS = new Set([
+  'schema', 'artifact_version', 'repo_root_realpath', 'head_sha',
+  'policy_digest', 'secret_policy_digest', 'public_checkpoint_present',
+  'visibility', 'secrets_mode', 'generated_at', 'expires_at', 'safety_verdict',
+])
+const SCOPE_ROLLUP_READINESS_SCHEMA = 'SESSION_RECORDING_SCOPE_ROLLUP_READINESS_V1'
+const SCOPE_ROLLUP_READINESS_KEYS = new Set([
+  'schema', 'artifact_version', 'repo_root_realpath', 'uv_lock_digest',
+  'python_version_digest', 'interpreter_realpath', 'interpreter_version',
+  'producer_digest', 'prepared', 'generated_at',
+])
+const SCOPE_ROLLUP_ARTIFACT_MAX_BYTES = 8192
+
+function scopeRollupEligibilityArtifactPath() {
+  return process.env.SCOPE_ROLLUP_ELIGIBILITY_ARTIFACT_PATH
+    ? resolve(process.env.SCOPE_ROLLUP_ELIGIBILITY_ARTIFACT_PATH)
+    : resolve(repoRoot, '.claude', 'tmp', 'session-recording', 'scope-rollup-eligibility.json')
+}
+
+function scopeRollupReadinessArtifactPath() {
+  return process.env.SCOPE_ROLLUP_READINESS_ARTIFACT_PATH
+    ? resolve(process.env.SCOPE_ROLLUP_READINESS_ARTIFACT_PATH)
+    : resolve(repoRoot, '.claude', 'tmp', 'session-recording', 'scope-rollup-readiness.json')
+}
+
+function sha256Hex(buffer) {
+  return `sha256:${createHash('sha256').update(buffer).digest('hex')}`
+}
+
+function hasAllowedKeysOnly(obj, allowedKeys) {
+  return Object.keys(obj).every((key) => allowedKeys.has(key)) && allowedKeys.size === Object.keys(obj).length
+}
+
+/** Load + verify a fixed-location JSON artifact (mode 0600, regular file,
+ *  no symlink, owner match, size-bounded, closed key set). Returns
+ *  { artifact, reasonCode, digest }. artifact is null unless reasonCode is
+ *  'ok'. This never trusts a path from the hook payload — `artifactPath`
+ *  is always one of the two fixed-location resolvers above. */
+function loadFixedLocationArtifact(artifactPath, schemaName, allowedKeys) {
+  let st
+  try {
+    st = statSync(artifactPath, { throwIfNoEntry: false, bigint: false })
+  } catch {
+    st = undefined
+  }
+  if (!st) return { artifact: null, reasonCode: 'missing', digest: null }
+  if (!st.isFile()) return { artifact: null, reasonCode: 'invalid_not_regular_file', digest: null }
+  if ((st.mode & 0o777) !== 0o600) return { artifact: null, reasonCode: 'invalid_mode', digest: null }
+  if (typeof process.getuid === 'function' && st.uid !== process.getuid()) {
+    return { artifact: null, reasonCode: 'invalid_owner', digest: null }
+  }
+  if (st.size > SCOPE_ROLLUP_ARTIFACT_MAX_BYTES) {
+    return { artifact: null, reasonCode: 'invalid_size', digest: null }
+  }
+
+  let raw
+  try {
+    raw = readFileSync(artifactPath)
+  } catch {
+    return { artifact: null, reasonCode: 'unreadable', digest: null }
+  }
+  const digest = sha256Hex(raw)
+
+  let parsed
+  try {
+    parsed = JSON.parse(raw.toString('utf8'))
+  } catch {
+    return { artifact: null, reasonCode: 'invalid_json', digest }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { artifact: null, reasonCode: 'invalid_json', digest }
+  }
+  if (!hasAllowedKeysOnly(parsed, allowedKeys)) {
+    return { artifact: null, reasonCode: 'invalid_additional_properties', digest }
+  }
+  if (parsed.schema !== schemaName) {
+    return { artifact: null, reasonCode: 'invalid_schema', digest }
+  }
+  return { artifact: parsed, reasonCode: 'ok', digest }
+}
+
+/** Node-only pre-spawn eligibility/readiness gate (AC1/AC3/AC12/AC13/AC14).
+ *  Returns { allowed: boolean, reasonCode: string, interpreterPath?: string }. */
+function evaluateScopeRollupSourceBoundGate() {
+  const hookReceivedAtMs = Date.now()
+  let realRepoRoot
+  try {
+    realRepoRoot = realpathSync(repoRoot)
+  } catch {
+    realRepoRoot = repoRoot
+  }
+
+  const { artifact: eligibility, reasonCode: eligibilityReason } = loadFixedLocationArtifact(
+    scopeRollupEligibilityArtifactPath(),
+    SCOPE_ROLLUP_ELIGIBILITY_SCHEMA,
+    SCOPE_ROLLUP_ELIGIBILITY_KEYS,
+  )
+  if (!eligibility) {
+    return { allowed: false, reasonCode: `eligibility_${eligibilityReason}` }
+  }
+  if (eligibility.repo_root_realpath !== realRepoRoot) {
+    return { allowed: false, reasonCode: 'eligibility_binding_repo_mismatch' }
+  }
+  if (eligibility.public_checkpoint_present !== false) {
+    return { allowed: false, reasonCode: 'eligibility_binding_public_checkpoint_present' }
+  }
+  // `visibility` is bound/recorded for anti-replay provenance only (a
+  // public origin remote does not make local-only capture unsafe) — see
+  // check_session_recording_runtime_safety.py::emit_scope_rollup_eligibility_artifact.
+  if (eligibility.secrets_mode !== 'none') {
+    return { allowed: false, reasonCode: 'eligibility_binding_secrets_mode_unsafe' }
+  }
+  if (eligibility.safety_verdict !== 'allow') {
+    return { allowed: false, reasonCode: 'eligibility_binding_safety_verdict_denied' }
+  }
+  const generatedAtMs = Date.parse(eligibility.generated_at)
+  const expiresAtMs = Date.parse(eligibility.expires_at)
+  if (Number.isNaN(generatedAtMs) || Number.isNaN(expiresAtMs)) {
+    return { allowed: false, reasonCode: 'eligibility_invalid_timestamp' }
+  }
+  // AC14: pre-generation lifecycle — the artifact must already exist and
+  // must not have expired at hook-received time.
+  if (generatedAtMs > hookReceivedAtMs) {
+    return { allowed: false, reasonCode: 'eligibility_stale_future_generated_at' }
+  }
+  if (hookReceivedAtMs >= expiresAtMs) {
+    return { allowed: false, reasonCode: 'eligibility_stale_expired' }
+  }
+
+  const { artifact: readiness, reasonCode: readinessReason } = loadFixedLocationArtifact(
+    scopeRollupReadinessArtifactPath(),
+    SCOPE_ROLLUP_READINESS_SCHEMA,
+    SCOPE_ROLLUP_READINESS_KEYS,
+  )
+  if (!readiness) {
+    return { allowed: false, reasonCode: `readiness_${readinessReason}` }
+  }
+  if (readiness.repo_root_realpath !== realRepoRoot) {
+    return { allowed: false, reasonCode: 'readiness_binding_repo_mismatch' }
+  }
+  if (readiness.prepared !== true) {
+    return { allowed: false, reasonCode: 'readiness_unprepared' }
+  }
+  let producerDigest
+  try {
+    producerDigest = sha256Hex(readFileSync(defaultScopeRollupCaptureScript))
+  } catch {
+    producerDigest = null
+  }
+  if (producerDigest !== null && readiness.producer_digest !== producerDigest) {
+    return { allowed: false, reasonCode: 'readiness_binding_producer_digest_mismatch' }
+  }
+  const readinessGeneratedAtMs = Date.parse(readiness.generated_at)
+  if (Number.isNaN(readinessGeneratedAtMs) || readinessGeneratedAtMs > hookReceivedAtMs) {
+    return { allowed: false, reasonCode: 'readiness_stale_future_generated_at' }
+  }
+  let interpreterPath = readiness.interpreter_realpath
+  try {
+    const st = statSync(interpreterPath)
+    if (!st.isFile()) interpreterPath = null
+  } catch {
+    interpreterPath = null
+  }
+  if (!interpreterPath) {
+    return { allowed: false, reasonCode: 'readiness_interpreter_unavailable' }
+  }
+
+  return { allowed: true, reasonCode: 'ok', interpreterPath }
+}
+
+function isDescendantPath(candidate, parent) {
+  const relativePath = relative(parent, candidate)
+  return relativePath !== '' && !relativePath.startsWith('..') && !relativePath.includes('..\\')
+}
+
+function resolveScopeRollupCaptureScript() {
+  if (!isScopeRollupCaptureTestTransport) {
+    return defaultScopeRollupCaptureScript
+  }
+  const configured = process.env.CODEX_SCOPE_ROLLUP_CAPTURE_SCRIPT
+  if (!configured) return defaultScopeRollupCaptureScript
+
+  try {
+    const canonicalCandidate = realpathSync(resolve(configured))
+    const canonicalFixtureRoot = realpathSync(scopeRollupCaptureFixtureRoot)
+    return isDescendantPath(canonicalCandidate, canonicalFixtureRoot)
+      ? canonicalCandidate
+      : defaultScopeRollupCaptureScript
+  } catch {
+    return defaultScopeRollupCaptureScript
+  }
+}
+
+const scopeRollupCaptureScript = resolveScopeRollupCaptureScript()
+
+function buildScopeRollupCaptureEnv() {
+  const env = {}
+  for (const key of SCOPE_ROLLUP_CAPTURE_ENV_ALLOWLIST) {
+    if (process.env[key] !== undefined) {
+      env[key] = process.env[key]
+    }
+  }
+  env.PYTHONUNBUFFERED = '1'
+  // Issue #1527 Scope Delta (2): the adapter itself asserts this flag on the
+  // producer's child environment after independently verifying the fixed
+  // private eligibility/readiness artifacts (Node-only gate, above). It is
+  // never forwarded verbatim from an upstream hook-payload value.
+  env.SCOPE_ROLLUP_REQUIRE_SOURCE_BOUND_ELIGIBILITY = '1'
+  env.SCOPE_ROLLUP_REPO_ROOT = repoRoot
+  return env
+}
 
 // Issue #1428: shell command structure analyzer (SHELL_COMMAND_ANALYSIS_V1).
 // Invoked out-of-process via execFile-style argv (no shell interpolation,
@@ -257,7 +539,14 @@ async function readJsonFromStdin() {
   if (!text.trim()) {
     throw new Error('empty stdin')
   }
-  return JSON.parse(text)
+  const payload = JSON.parse(text)
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('payload must be an object')
+  }
+  // Parse exactly once, while preserving the original bytes for the capture
+  // producer. JSON.stringify(payload) would not satisfy the producer-input
+  // provenance contract when caller whitespace or key order differs.
+  return { payload, rawPayload: text }
 }
 
 function getCommand(payload) {
@@ -723,11 +1012,138 @@ function runManifestFlow(eventName, payload) {
   return { continue: true }
 }
 
+function shouldRunScopeRollupCapture(eventName, payload) {
+  if (eventName !== SCOPE_ROLLUP_CAPTURE_ELIGIBILITY.event) return null
+  if (payload.stop_hook_active === true) return null
+  // evaluateGuard() runs exactly once before this function. Re-checking its
+  // policy keys here would duplicate the guard decision authority.
+  //
+  // Issue #1527 Scope Delta (2) AC1/AC3: the fixed private eligibility and
+  // readiness artifacts are the ONLY source consulted here, verified
+  // entirely in Node before any Python process is spawned. On
+  // missing/invalid/stale artifacts this returns { allowed: false } with a
+  // fixed reason code and the producer is never started (no `uv`/Python
+  // cold-start sync is triggered on a cold/ineligible environment).
+  return evaluateScopeRollupSourceBoundGate()
+}
+
+// Issue #1527 Scope Delta (2) AC18: after SIGKILL to the process group, wait
+// a short bounded grace period for `close`, then independently verify group
+// liveness via `kill(-pgid, 0)` (ESRCH => group is gone). This is a
+// best-effort POSIX liveness probe: signal delivery alone never proves
+// termination.
+const SCOPE_ROLLUP_CAPTURE_GRACE_MS = 500
+
+function isProcessGroupAlive(pgid) {
+  try {
+    process.kill(-pgid, 0)
+    return true
+  } catch (err) {
+    // ESRCH: no such process/group => confirmed gone.
+    // EPERM: exists but we lack permission => treat as still alive
+    // (fail toward "not yet confirmed terminated").
+    return err && err.code === 'EPERM'
+  }
+}
+
+function runScopeRollupCapture(rawPayload, interpreterPath) {
+  return new Promise((resolveCapture) => {
+    let timeoutHandle
+    let graceHandle
+    let timedOut = false
+    let closed = false
+
+    const child = spawn(interpreterPath, [scopeRollupCaptureScript], {
+      cwd: repoRoot,
+      env: buildScopeRollupCaptureEnv(),
+      stdio: ['pipe', 'ignore', 'ignore'],
+      detached: true,
+    })
+
+    const clearTimers = () => {
+      if (timeoutHandle) {
+        globalThis.clearTimeout(timeoutHandle)
+        timeoutHandle = undefined
+      }
+      if (graceHandle) {
+        globalThis.clearTimeout(graceHandle)
+        graceHandle = undefined
+      }
+    }
+
+    const stopProcessGroup = () => {
+      if (!child.pid) return
+      try {
+        process.kill(-child.pid, 'SIGKILL')
+      } catch {
+        // process group may already be gone
+      }
+      try {
+        child.kill('SIGKILL')
+      } catch {
+        // already exited
+      }
+    }
+
+    const finish = (status) => {
+      clearTimers()
+      resolveCapture(status)
+    }
+
+    timeoutHandle = globalThis.setTimeout(() => {
+      timedOut = true
+      const pgid = child.pid
+      stopProcessGroup()
+      // AC18: bounded grace wait for `close`, then confirm process-group
+      // liveness absence rather than resolving immediately on signal send.
+      graceHandle = globalThis.setTimeout(() => {
+        if (closed) return
+        if (pgid && isProcessGroupAlive(pgid)) {
+          process.stderr.write('[codex-hook-adapter] warn: scope-rollup capture process group still alive after grace period\n')
+        }
+        finish('capture_timeout')
+      }, SCOPE_ROLLUP_CAPTURE_GRACE_MS)
+    }, SCOPE_ROLLUP_CAPTURE_TIMEOUT_MS)
+
+    child.on('error', () => {
+      if (timedOut) return
+      finish('capture_spawn_error')
+    })
+
+    child.on('close', (code, signal) => {
+      closed = true
+      if (timedOut) {
+        // Close arrived during/after the grace wait — resolve immediately
+        // with the already-decided timeout outcome instead of waiting out
+        // the full grace budget.
+        finish('capture_timeout')
+        return
+      }
+      if (signal === 'SIGKILL' || code === null) {
+        finish('capture_timeout')
+        return
+      }
+      if (code !== 0) {
+        finish('capture_nonzero')
+        return
+      }
+      finish('capture_ok')
+    })
+
+    child.stdin.write(rawPayload)
+    child.stdin.end()
+  }).then((status) => {
+    if (status !== 'capture_ok') {
+      process.stderr.write(`[codex-hook-adapter] warn: scope-rollup capture skipped (${status})\n`)
+    }
+  })
+}
+
 async function main() {
   const { event } = parseArgs(process.argv)
-  let payload
+  let input
   try {
-    payload = await readJsonFromStdin()
+    input = await readJsonFromStdin()
   } catch {
     if (event === 'PreToolUse') {
       emitJson(denyPreToolUse(`Malformed ${event} payload blocked by hook.`))
@@ -743,6 +1159,8 @@ async function main() {
     emitJson({ continue: true })
     return
   }
+
+  const { payload, rawPayload } = input
 
   const guardResult = evaluateGuard(payload, event)
   if (guardResult !== null) {
@@ -768,6 +1186,19 @@ async function main() {
   }
 
   if (event === 'Stop' || event === 'SubagentStop') {
+    const scopeRollupGate = shouldRunScopeRollupCapture(event, payload)
+    if (scopeRollupGate !== null) {
+      if (scopeRollupGate.allowed) {
+        // Capture transport is fail-open: semantic rejection, nonzero exit,
+        // and timeout never replace the existing manifest/decision flow.
+        await runScopeRollupCapture(rawPayload, scopeRollupGate.interpreterPath)
+      } else {
+        // AC1/AC3: missing/invalid/stale fixed-location eligibility or
+        // readiness artifacts never start the producer — fixed reason code,
+        // no `uv`/Python cold-start sync, manifest flow continues below.
+        process.stderr.write(`[codex-hook-adapter] info: scope-rollup capture skipped (${scopeRollupGate.reasonCode})\n`)
+      }
+    }
     // AC3: session recording failure → best-effort telemetry, always continue:true
     let result
     try {

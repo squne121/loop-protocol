@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "SubagentStop",
+  "session_id": "codex-session-scope-rollup-001",
+  "agent_id": "subagent-scope-rollup-001",
+  "agent_type": "scope-rollup-runner",
+  "secrets_mode": "none",
+  "touched_paths": [],
+  "last_assistant_message": "scope rollup completed\n```yaml\nISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:\n  status: ok\n  invocation_id: scope-rollup-001\n  requested_at: '2026-07-15T12:00:00Z'\n  generated_at: '2026-07-15T12:00:01Z'\n```\n"
+}

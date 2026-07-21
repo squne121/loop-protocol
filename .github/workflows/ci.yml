@@ -294,6 +294,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-node-pnpm
+      - uses: ./.github/actions/setup-python-uv
       - name: Install dependencies (timed)
         id: timed-pnpm-install
         run: |
@@ -332,6 +333,10 @@ jobs:
             return $status
           }
           run_timed pnpm_manifest_check pnpm manifest:check
+      - name: Install Python runtime for scope-rollup capture
+        run: uv python install
+      - name: Sync locked Python development dependencies for scope-rollup capture
+        run: uv sync --locked --group dev
       - name: Test (timed)
         id: timed-test
         run: |
