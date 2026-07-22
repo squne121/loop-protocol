@@ -1191,6 +1191,27 @@ def test_allow_read_only_external_read_with_relative_inside_write(tmp_path):
     assert r.returncode == 0, r.stderr
 
 
+def test_given_verified_no_issue_when_claude_write_runs_then_deny_while_codex_compatibility_is_separate(tmp_path):
+    """Issue #1670 compatibility decision: Claude Write/Edit stay deny-on-no-
+    Issue, while Codex canonical apply_patch's established no-Issue allow is
+    covered by its dedicated adapter contract test."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1670", slug="policy")
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {"file_path": str(repo["root"] / "outside.txt")},
+        "cwd": str(repo["root"]),
+    }
+    result = _run_guard(payload, repo["root"], issue=None)
+    assert result.returncode == 2, result.stderr
+
+
+def test_given_empty_write_target_when_active_worktree_then_fail_closed(tmp_path):
+    repo = _make_repo_with_worktree(tmp_path, issue="1670", slug="policy")
+    payload = {"tool_name": "Write", "tool_input": {}, "cwd": str(repo["worktree"])}
+    result = _run_guard(payload, repo["root"], issue="1670")
+    assert result.returncode == 2, result.stderr
+
+
 # =============================================================================
 # Issue #1050: WORKTREE_SCOPE_DECISION_V2 / cleanup classification tests
 # =============================================================================
