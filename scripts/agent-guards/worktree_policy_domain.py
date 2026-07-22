@@ -37,7 +37,10 @@ def _require_mapping(value: object, label: str) -> Mapping[str, Any]:
 def _require_exact_keys(value: Mapping[str, Any], expected: frozenset[str], label: str) -> None:
     actual = frozenset(value)
     if actual != expected:
-        raise ContractValidationError(f"{label} keys must be closed; missing={sorted(expected - actual)!r} extra={sorted(actual - expected)!r}")
+        raise ContractValidationError(
+            f"{label} keys must be closed; missing={sorted(expected - actual)!r} "
+            f"extra={sorted(actual - expected)!r}"
+        )
 
 
 def _require_string(value: object, label: str, *, maximum: int = _MAX_PATH_LENGTH) -> str:
@@ -100,7 +103,19 @@ def validate_intent(value: object) -> dict[str, object]:
     intent = _require_mapping(value, "intent")
     _require_exact_keys(
         intent,
-        frozenset({"schema", "runtime", "runtime_version", "tool_identity", "canonical_identity", "mutation_kind", "target_paths", "path_flavor", "capture_digest"}),
+        frozenset(
+            {
+                "schema",
+                "runtime",
+                "runtime_version",
+                "tool_identity",
+                "canonical_identity",
+                "mutation_kind",
+                "target_paths",
+                "path_flavor",
+                "capture_digest",
+            }
+        ),
         "intent",
     )
     if intent["schema"] != INTENT_SCHEMA:
@@ -158,7 +173,11 @@ def make_binding(
 
 def validate_binding(value: object) -> dict[str, object]:
     binding = _require_mapping(value, "binding")
-    _require_exact_keys(binding, frozenset({"schema", "state", "expected_worktree", "path_flavor", "resolver_digest"}), "binding")
+    _require_exact_keys(
+        binding,
+        frozenset({"schema", "state", "expected_worktree", "path_flavor", "resolver_digest"}),
+        "binding",
+    )
     if binding["schema"] != BINDING_SCHEMA:
         raise ContractValidationError("unsupported binding schema")
     state = _require_string(binding["state"], "binding state", maximum=32)

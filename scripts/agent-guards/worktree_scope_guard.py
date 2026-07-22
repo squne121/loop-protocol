@@ -1984,7 +1984,11 @@ def _decide_write(
             tool_identity=tool_name,
             canonical_identity="Write",
             mutation_kind="write",
-            target_paths=[os.path.realpath(os.path.join(cwd, target)) if not os.path.isabs(target) else os.path.realpath(target)],
+            target_paths=[
+                os.path.realpath(os.path.join(cwd, target))
+                if not os.path.isabs(target)
+                else os.path.realpath(target)
+            ],
             path_flavor="posix",
             capture_digest=_CLAUDE_CAPTURE_DIGEST,
         )
