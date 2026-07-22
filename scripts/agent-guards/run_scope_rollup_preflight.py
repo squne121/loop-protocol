@@ -117,7 +117,10 @@ from skill_runtime_command_policy import (  # noqa: E402
 )
 
 SCHEMA = "SCOPE_ROLLUP_RUN_RESULT_V1"
-QUERY_SCHEMA_VERSION = 3
+# Schema v4 deliberately projects only the fields consumed by the planner.
+# ``labels`` and ``closingIssuesReferences`` are not fetched, normalized, or
+# included in the manifest hash because they are not planner inputs.
+QUERY_SCHEMA_VERSION = 4
 TRUSTED_HOST = "github.com"
 
 # Safety caps. MAX_ITEMS_PER_KIND is deliberately conservative; exceeding it
@@ -625,7 +628,7 @@ query($owner: String!, $name: String!, $after: String, $first: Int!, $fetchIssue
     ) @include(if: $fetchIssues) {
       totalCount
       pageInfo { hasNextPage endCursor }
-      nodes { id number title body state stateReason url labels(first: 100) { nodes { name } } }
+      nodes { id number title body state stateReason url }
     }
     pullRequests: pullRequests(
       first: $first, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}
@@ -634,9 +637,7 @@ query($owner: String!, $name: String!, $after: String, $first: Int!, $fetchIssue
       pageInfo { hasNextPage endCursor }
       nodes {
         id number title body state url changedFiles
-        labels(first: 100) { nodes { name } }
         files(first: 100) { pageInfo { hasNextPage endCursor } nodes { path } }
-        closingIssuesReferences(first: 100) { nodes { number } }
       }
     }
   }
@@ -750,38 +751,37 @@ def _normalize_inventory_node(kind: str, node: dict[str, Any]) -> dict[str, Any]
         raise ScopeRollupPreflightError("inventory_schema_mismatch")
     if not isinstance(node.get("number"), int):
         raise ScopeRollupPreflightError("inventory_schema_mismatch")
-    labels = node.get("labels")
-    label_nodes = labels.get("nodes") if isinstance(labels, dict) else None
-    if not isinstance(label_nodes, list) or any(not isinstance(label, dict) for label in label_nodes):
-        raise ScopeRollupPreflightError("inventory_schema_mismatch")
     result: dict[str, Any] = {
         "number": node["number"],
         "title": node["title"],
         "body": node["body"],
-        "labels": [{"name": label.get("name", "")} for label in label_nodes],
         "state": node["state"],
         "url": node["url"],
     }
     if kind == "issue":
-        result["stateReason"] = node.get("stateReason")
+        state_reason = node.get("stateReason")
+        if "stateReason" not in node or (state_reason is not None and not isinstance(state_reason, str)):
+            raise ScopeRollupPreflightError("inventory_schema_mismatch")
+        result["stateReason"] = state_reason
         return result
     if not isinstance(node.get("changedFiles"), int):
         raise ScopeRollupPreflightError("inventory_schema_mismatch")
     files = node.get("files")
-    references = node.get("closingIssuesReferences")
     file_nodes = files.get("nodes") if isinstance(files, dict) else None
-    ref_nodes = references.get("nodes") if isinstance(references, dict) else None
-    if not isinstance(file_nodes, list) or not isinstance(ref_nodes, list):
+    file_page_info = files.get("pageInfo") if isinstance(files, dict) else None
+    if not isinstance(file_nodes, list) or not isinstance(file_page_info, dict):
+        raise ScopeRollupPreflightError("inventory_schema_mismatch")
+    if not isinstance(file_page_info.get("hasNextPage"), bool):
+        raise ScopeRollupPreflightError("inventory_schema_mismatch")
+    file_end_cursor = file_page_info.get("endCursor")
+    if file_page_info["hasNextPage"] and (not isinstance(file_end_cursor, str) or not file_end_cursor):
         raise ScopeRollupPreflightError("inventory_schema_mismatch")
     if any(not isinstance(file, dict) or not isinstance(file.get("path"), str) for file in file_nodes):
-        raise ScopeRollupPreflightError("inventory_schema_mismatch")
-    if any(not isinstance(ref, dict) or not isinstance(ref.get("number"), int) for ref in ref_nodes):
         raise ScopeRollupPreflightError("inventory_schema_mismatch")
     result.update(
         {
             "changedFiles": node["changedFiles"],
             "files": [{"path": file["path"]} for file in file_nodes],
-            "closingIssuesReferences": [{"number": ref["number"]} for ref in ref_nodes],
         }
     )
     return result

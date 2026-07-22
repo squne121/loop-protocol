@@ -61,7 +61,6 @@ def _issue_node(number: int) -> dict:
         "state": "OPEN",
         "stateReason": None,
         "url": f"https://github.com/squne121/loop-protocol/issues/{number}",
-        "labels": {"nodes": []},
     }
 
 
@@ -77,10 +76,11 @@ def _pr_node(number: int, *, files_per_pr: int = 0, changed_files: int | None = 
         "body": "",
         "state": "OPEN",
         "url": f"https://github.com/squne121/loop-protocol/pull/{number}",
-        "labels": {"nodes": []},
         "changedFiles": changed_files if changed_files is not None else files_per_pr,
-        "files": {"nodes": [{"path": f"f{j}.py"} for j in range(files_per_pr)]},
-        "closingIssuesReferences": {"nodes": []},
+        "files": {
+            "nodes": [{"path": f"f{j}.py"} for j in range(files_per_pr)],
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+        },
     }
 
 
@@ -685,6 +685,7 @@ def test_manifest_fields_recorded(tmp_path, monkeypatch):
     ):
         assert field in manifest, f"missing manifest field: {field}"
     assert manifest["host"] == "github.com"
+    assert manifest["query_schema_version"] == 4
     assert manifest["truncated"] is False
     assert manifest["issues"]["item_count"] == 2
     assert manifest["issues"]["total_count"] == 2

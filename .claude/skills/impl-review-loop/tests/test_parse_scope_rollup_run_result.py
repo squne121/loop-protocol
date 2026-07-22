@@ -15,11 +15,13 @@ import hashlib
 import json
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Dict
 
 import yaml
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 PARSE_SCRIPT = (
@@ -519,6 +521,22 @@ def _full_v3_budget_block() -> Dict[str, Any]:
     }
 
 
+def _valid_v3_inputs(query_schema_version: int = 3) -> Dict[str, Any]:
+    issues = _full_v3_completeness_block(2)
+    pull_requests = _full_v3_completeness_block(0)
+    return {
+        "current_issue_sha256": "b" * 64,
+        "issues_all_sha256": issues["sha256"],
+        "prs_all_sha256": pull_requests["sha256"],
+        "issue_count": issues["item_count"],
+        "pr_count": pull_requests["item_count"],
+        "query_schema_version": query_schema_version,
+        "issues_completeness": issues,
+        "pull_requests_completeness": pull_requests,
+        "transaction_budget": _full_v3_budget_block(),
+    }
+
+
 def test_rejected_when_marker_schema_version_3_has_no_inputs_block(tmp_path):
     """PR #1643 review (P0-3): the CURRENT runner always stamps
     marker_schema_version: 3. A marker declaring that discriminator must
@@ -594,17 +612,7 @@ def test_ok_when_marker_schema_version_3_has_full_completeness_contract(tmp_path
         script_sha=script_sha,
         overrides={
             "marker_schema_version": 3,
-            "inputs": {
-                "current_issue_sha256": "deadbeef",
-                "issues_all_sha256": "deadbeef",
-                "prs_all_sha256": "deadbeef",
-                "issue_count": 2,
-                "pr_count": 0,
-                "query_schema_version": 3,
-                "issues_completeness": _full_v3_completeness_block(2),
-                "pull_requests_completeness": _full_v3_completeness_block(0),
-                "transaction_budget": _full_v3_budget_block(),
-            },
+            "inputs": _valid_v3_inputs(),
         },
     )
     with NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
@@ -625,6 +633,83 @@ def test_ok_when_marker_schema_version_3_has_full_completeness_contract(tmp_path
     finally:
         output_path.unlink(missing_ok=True)
         sidecar_path.unlink(missing_ok=True)
+
+
+def test_query_schema_v4(tmp_path):
+    """GIVEN a v4 inventory marker WHEN parser validates it THEN it is accepted."""
+    script_sha = _load_script_sha(PLAN_SCRIPT)
+    marker = _render_marker(
+        script_sha=script_sha,
+        overrides={
+            "marker_schema_version": 3,
+            "inputs": _valid_v3_inputs(query_schema_version=4),
+        },
+    )
+    with NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
+        tmp.write(marker)
+        output_path = Path(tmp.name)
+    sidecar_path = output_path.with_suffix(".capture.yaml")
+    sidecar_path.write_text(_render_capture_sidecar(output_path), encoding="utf-8")
+    try:
+        result = _run_parser_cli(
+            output_path,
+            sidecar_path,
+            expected_script_sha=script_sha,
+            requested_at="2026-06-13T10:00:00+00:00",
+        )
+        assert result.returncode == 0, result.stderr
+        parsed = yaml.safe_load(result.stdout)["SCOPE_ROLLUP_MARKER_PARSE_RESULT_V1"]
+        assert parsed["status"] == "ok"
+    finally:
+        output_path.unlink(missing_ok=True)
+        sidecar_path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_alias_hash",
+        "alias_hash_mismatch",
+        "alias_count_mismatch",
+        "query_schema_float",
+        "item_count_bool",
+        "negative_budget",
+        "budget_over_limit",
+        "deadline_not_positive",
+    ],
+)
+def test_marker_schema_v3_rejects_inconsistent_aliases_types_and_budgets(mutation):
+    """Schema-v4 markers must not weaken the v3 marker completeness contract."""
+    inputs = deepcopy(_valid_v3_inputs(query_schema_version=4))
+    if mutation == "missing_alias_hash":
+        del inputs["issues_all_sha256"]
+    elif mutation == "alias_hash_mismatch":
+        inputs["prs_all_sha256"] = "c" * 64
+    elif mutation == "alias_count_mismatch":
+        inputs["issue_count"] = 1
+    elif mutation == "query_schema_float":
+        inputs["query_schema_version"] = 4.0
+    elif mutation == "item_count_bool":
+        inputs["issues_completeness"]["item_count"] = True
+    elif mutation == "negative_budget":
+        inputs["transaction_budget"]["response_bytes"] = -1
+    elif mutation == "budget_over_limit":
+        inputs["transaction_budget"]["page_count"] = 201
+    elif mutation == "deadline_not_positive":
+        inputs["transaction_budget"]["deadline_seconds"] = 0
+    else:  # pragma: no cover - parametrize values above are exhaustive
+        raise AssertionError(mutation)
+
+    result = _run_parser(
+        _render_marker(
+            script_sha=_load_script_sha(PLAN_SCRIPT),
+            overrides={"marker_schema_version": 3, "inputs": inputs},
+        ),
+        expected_script_sha=_load_script_sha(PLAN_SCRIPT),
+        requested_at="2026-06-13T10:00:00+00:00",
+    )
+    assert result["status"] == "rejected"
+    assert result["reject_reason"] == "inventory_completeness_contract_invalid"
 
 
 def test_ok_when_marker_schema_version_2_explicit_legacy_without_completeness(tmp_path):

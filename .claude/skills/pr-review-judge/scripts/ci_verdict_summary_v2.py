@@ -44,6 +44,7 @@ CLASSIFICATION_MAP: dict[tuple[str, str], str] = {
     ("ci", "build"): "required",
     ("ci", "e2e"): "evidence",
     ("ci", "python-test"): "evidence",
+    ("ci", "node-backed-hook-tests"): "evidence",
     ("ci", "actionlint"): "required",
     # ci-verdict-summary aggregator (evidence producer)
     ("ci", "ci-verdict-summary"): "evidence",
@@ -64,6 +65,7 @@ REQUIRED_CHECKS: set[tuple[str, str]] = {
     ("ci", "build"),
     ("ci", "e2e"),
     ("ci", "python-test"),
+    ("ci", "node-backed-hook-tests"),
     ("ci", "actionlint"),
 }
 
@@ -123,6 +125,7 @@ def determine_check_verdict(
     conclusion = check.get("conclusion")
     head_sha = check.get("head_sha")
     head_sha_match = check.get("head_sha_match", False)
+    check_run_id = check.get("check_run_id")
 
     # excluded checks never block
     if classification == "excluded":
@@ -130,6 +133,14 @@ def determine_check_verdict(
 
     # B5: unknown classification is conservatively blocking
     if classification == "unknown":
+        return True, "gh_error"
+
+    # Required/evidence rows are only merge-ready evidence when their exact
+    # GitHub CheckRun is addressable.  A status/conclusion without an id
+    # cannot be rebound to the current PR head during artifact readback.
+    if classification in {"required", "evidence"} and (
+        not isinstance(check_run_id, int) or isinstance(check_run_id, bool) or check_run_id <= 0
+    ):
         return True, "gh_error"
 
     # pending / in-progress status → wait
@@ -196,7 +207,9 @@ def build_check_entry(
     expected_head_sha: str,
 ) -> dict[str, Any]:
     name = raw.get("name", "")
-    check_run_id = raw.get("databaseId") or raw.get("id")
+    # REST CheckRun API uses ``id``. The API adapter intentionally preserves
+    # it as ``check_run_id`` so the artifact retains current-head provenance.
+    check_run_id = raw.get("databaseId") or raw.get("id") or raw.get("check_run_id")
     status = raw.get("status")
     conclusion = raw.get("conclusion")
 
@@ -417,6 +430,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # B1: --needs-json accepts JSON dict of {job_name: result} from workflow needs context
     p.add_argument("--needs-json", default=None, help="JSON string or @file with needs.*.result map")
     p.add_argument("--checks-json", default=None, help="Path to JSON file containing check run list")
+    p.add_argument(
+        "--check-runs-api-json",
+        default=None,
+        help="GitHub REST commit check-runs response bound to --workflow-run-id",
+    )
     p.add_argument("--checks-stdin", action="store_true", help="Read check runs JSON from stdin")
     p.add_argument("--output", default=None, help="Output path for ci_verdict_summary_v2.json")
     p.add_argument("--summary-input", default=None, help="Existing artifact JSON to render without regenerating it")
@@ -467,6 +485,62 @@ def needs_json_to_raw_checks(needs_map: dict[str, str]) -> list[dict[str, Any]]:
     return raw_checks
 
 
+def check_runs_api_to_raw_checks(
+    payload: Any,
+    *,
+    workflow_run_id: int,
+    workflow: str = "ci",
+) -> list[dict[str, Any]]:
+    """Normalize only real GitHub Check Runs for this workflow run.
+
+    ``needs.<job>.result`` has no CheckRun id or head SHA and must never be
+    used to produce merge-ready evidence. The REST endpoint is commit-scoped;
+    each retained row is additionally bound to this Actions run via its URL.
+    """
+    check_runs = payload.get("check_runs") if isinstance(payload, dict) else payload
+    if not isinstance(check_runs, list):
+        raise ValueError("check_runs_api_payload_invalid")
+
+    expected_run_fragment = f"/actions/runs/{workflow_run_id}/"
+    raw_checks: list[dict[str, Any]] = []
+    for row in check_runs:
+        if not isinstance(row, dict):
+            raise ValueError("check_runs_api_payload_invalid")
+        details_url = row.get("details_url") or row.get("detailsUrl")
+        if not isinstance(details_url, str) or expected_run_fragment not in details_url:
+            continue
+        name = row.get("name")
+        head_sha = row.get("head_sha") or row.get("headSha")
+        check_run_id = row.get("id") or row.get("databaseId")
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(head_sha, str)
+            or not head_sha
+            or check_run_id is None
+        ):
+            raise ValueError("check_runs_api_row_invalid")
+        # This job creates its own CheckRun while generating the artifact;
+        # it is not an upstream input and would necessarily be in progress.
+        if name == "ci-verdict-summary":
+            continue
+        raw_checks.append(
+            {
+                "name": name,
+                "workflow": workflow,
+                "status": row.get("status"),
+                "conclusion": row.get("conclusion"),
+                "head_sha": head_sha,
+                "check_run_id": check_run_id,
+                "details_url": details_url,
+                "provenance": "github_check_run_api",
+            }
+        )
+    if not raw_checks:
+        raise ValueError("check_runs_api_no_current_workflow_evidence")
+    return raw_checks
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
@@ -508,6 +582,16 @@ def main(argv: list[str] | None = None) -> int:
             print("ERROR: --needs-json must be a JSON object {job_name: result}", file=sys.stderr)
             return 1
         raw_checks = needs_json_to_raw_checks(needs_map)
+    elif args.check_runs_api_json:
+        try:
+            with open(args.check_runs_api_json) as f:
+                raw_payload = json.load(f)
+            raw_checks = check_runs_api_to_raw_checks(
+                raw_payload, workflow_run_id=args.workflow_run_id
+            )
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            print(f"ERROR: Failed to load real CheckRun API evidence: {e}", file=sys.stderr)
+            return 1
     elif args.checks_stdin:
         raw_text = sys.stdin.read()
         try:
