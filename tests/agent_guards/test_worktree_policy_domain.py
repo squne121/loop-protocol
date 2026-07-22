@@ -16,18 +16,57 @@ import codex_apply_patch_adapter  # noqa: E402
 
 CLAUDE_DIGEST = "sha256:7a6792dfc33b57b2b347bee70db61e54ba37ce0b263b6e79cb1466a4a67df6e0"
 CODEX_DIGEST = "sha256:c9de2e1296733b5600d5ef9cc9c2b56d51aafae15bc51d63d295c3155f02263c"
+CLAUDE_OFFICIAL_2_1_218 = {
+    "Write": {
+        "sanitized": "sha256:819d65d60a8282dddeb25ab308852198cabd804312b8a3b293bc3029c2eafd73",
+        "raw": "sha256:161b8a8beb999269831c09c3e3050459e549e85221111c04c9687ce21d6367b8",
+    },
+    "Edit": {
+        "sanitized": "sha256:01f222e4e123868ab617899db8553ab23e0a5427c21776b299165f450a550e31",
+        "raw": "sha256:4e571d256fc56f5dc1cf4cc01554972c479cffdd46eb3dc8a7a71e16d9878e4c",
+    },
+    "Bash": {
+        "sanitized": "sha256:223140cf2b4ead326ef731333f49c6fbf5789a4bae586f4d67badc718c639779",
+        "raw": "sha256:bf330713ca708ad68674fffcfcc539e192e8c02f7d09966f163d3282a5e52929",
+    },
+}
 
 
-def _intent(runtime: str = "claude", identity: str = "Write", path: str = "/repo/wt/file.py") -> dict[str, object]:
+def _claude_capture_digest(version: str, identity: str, prefer: str = "sanitized") -> str:
+    if version == "2.1.218":
+        return CLAUDE_OFFICIAL_2_1_218[identity][prefer]
+    return CLAUDE_DIGEST
+
+
+def _intent(
+    runtime: str = "claude",
+    identity: str = "Write",
+    path: str = "/repo/wt/file.py",
+    runtime_version: str | None = None,
+    capture_digest: str | None = None,
+    canonical_identity: str | None = None,
+    mutation_kind: str | None = None,
+) -> dict[str, object]:
+    if runtime_version is None:
+        runtime_version = "2.1.216" if runtime == "claude" else "0.145.0"
+    if canonical_identity is None:
+        canonical_identity = "Write" if runtime == "claude" else "apply_patch"
+    if mutation_kind is None:
+        mutation_kind = "bash" if identity == "Bash" else ("write" if runtime == "claude" else "apply_patch")
+    if capture_digest is None:
+        if runtime == "claude":
+            capture_digest = _claude_capture_digest(runtime_version, identity)
+        else:
+            capture_digest = CODEX_DIGEST
     return domain.make_intent(
         runtime=runtime,
-        runtime_version="2.1.216" if runtime == "claude" else "0.145.0",
+        runtime_version=runtime_version,
         tool_identity=identity,
-        canonical_identity="Write" if runtime == "claude" else "apply_patch",
-        mutation_kind="write" if runtime == "claude" else "apply_patch",
+        canonical_identity=canonical_identity,
+        mutation_kind=mutation_kind,
         target_paths=[path],
         path_flavor="posix",
-        capture_digest=CLAUDE_DIGEST if runtime == "claude" else CODEX_DIGEST,
+        capture_digest=capture_digest,
     )
 
 
@@ -83,13 +122,54 @@ def test_given_malformed_or_vendor_shaped_intent_when_validated_then_reject(muta
         domain.validate_intent(value)
 
 
-def test_given_unsupported_version_or_identity_when_adapter_builds_intent_then_fail_closed() -> None:
+@pytest.mark.parametrize(
+    ("runtime", "version", "identity", "canonical", "kind", "digest"),
+    [
+        ("claude", "2.1.217", "Write", "Write", "write", CLAUDE_DIGEST),
+        ("claude", "2.1.217", "Bash", "Bash", "bash", CLAUDE_DIGEST),
+        ("codex", "0.999.0", "ApplyPatch", "apply_patch", "apply_patch", CODEX_DIGEST),
+    ],
+)
+def test_given_unsupported_version_or_identity_when_adapter_builds_intent_then_fail_closed(
+    runtime: str, version: str, identity: str, canonical: str, kind: str, digest: str
+) -> None:
     with pytest.raises(domain.ContractValidationError):
         domain.make_intent(
-            runtime="codex", runtime_version="0.999.0", tool_identity="ApplyPatch",
-            canonical_identity="apply_patch", mutation_kind="apply_patch", target_paths=["/repo/wt/a"],
-            path_flavor="posix", capture_digest=CODEX_DIGEST,
+            runtime=runtime, runtime_version=version, tool_identity=identity,
+            canonical_identity=canonical, mutation_kind=kind, target_paths=["/repo/wt/a"], path_flavor="posix", capture_digest=digest,
         )
+
+
+@pytest.mark.parametrize(
+    ("runtime", "version", "identity", "canonical", "kind", "digest"),
+    [
+        ("claude", "2.1.216", "Write", "Write", "write", CLAUDE_DIGEST),
+        ("claude", "2.1.216", "Edit", "Write", "write", CLAUDE_DIGEST),
+        ("claude", "2.1.216", "MultiEdit", "Write", "write", CLAUDE_DIGEST),
+        ("claude", "2.1.218", "Write", "Write", "write", CLAUDE_OFFICIAL_2_1_218["Write"]["sanitized"]),
+        ("claude", "2.1.218", "Edit", "Write", "write", CLAUDE_OFFICIAL_2_1_218["Edit"]["sanitized"]),
+        ("claude", "2.1.218", "Bash", "Bash", "bash", CLAUDE_OFFICIAL_2_1_218["Bash"]["sanitized"]),
+        ("codex", "0.145.0", "apply_patch", "apply_patch", "apply_patch", CODEX_DIGEST),
+    ],
+)
+def test_given_supported_runtime_profile_when_validated_then_allow_inside_worktree(
+    runtime: str, version: str, identity: str, canonical: str, kind: str, digest: str
+) -> None:
+    intent = domain.make_intent(
+        runtime=runtime,
+        runtime_version=version,
+        tool_identity=identity,
+        canonical_identity=canonical,
+        mutation_kind=kind,
+        target_paths=["/repo/wt/file.py"],
+        path_flavor="posix", capture_digest=digest,
+    )
+    decision = domain.policy_decide(intent, _binding())
+    assert decision == {
+        "schema": domain.DECISION_SCHEMA,
+        "decision": "allow",
+        "reason_code": "mutation_inside_worktree",
+    }
 
 
 def test_given_move_source_and_destination_when_one_escapes_then_deny() -> None:
