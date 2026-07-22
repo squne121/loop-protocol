@@ -153,6 +153,8 @@ def test_ambiguous_and_precondition_failures_do_not_retry_patch(tmp_project, mon
         rc, payload = run(tmp_project, data, monkeypatch, capsys)
     assert rc == 1
     assert payload["status"] == "failed"
+    assert payload["patch_attempted"] is True
+    assert payload["mutation_outcome"] == "unknown"
     patch_once.assert_called_once()
 
     stale = content_input(expected_previous_title="someone else")
@@ -163,7 +165,7 @@ def test_ambiguous_and_precondition_failures_do_not_retry_patch(tmp_project, mon
     patch_never.assert_not_called()
 
 
-@pytest.mark.parametrize("title", ["", "  ", "bad\nvalue", "bad\x00value"])
+@pytest.mark.parametrize("title", ["", "  ", "bad\nvalue", "bad\x00value", "bad\x7fvalue", "bad\x85value", "bad\x9fvalue"])
 def test_invalid_title_is_rejected_before_patch(tmp_project, monkeypatch, capsys, title):
     data = content_input(new_title=title)
     with patch.object(executor, "_patch_issue_content") as patch_never:
@@ -180,3 +182,92 @@ def test_unknown_key_is_rejected_before_patch(tmp_project, monkeypatch, capsys):
     assert rc == 2
     assert payload["reason"].startswith("issue_content_update_unknown_fields")
     patch_never.assert_not_called()
+
+
+def test_remote_desired_state_replays_without_or_with_corrupt_marker(tmp_project, monkeypatch, capsys):
+    data = content_input()
+    desired = {
+        "title": "new title", "body": "new body", "updatedAt": "2026-07-22T00:00:01Z",
+        "isPullRequest": False,
+    }
+    monkeypatch.setattr(executor, "_fetch_issue_content", lambda *_: (desired, ""))
+    monkeypatch.setattr(executor, "_check_no_tracked_changes", lambda *_: [])
+    marker = (
+        tmp_project / "artifacts" / "1660" / "issue-metadata" / COMMAND_ID_ISSUE_CONTENT_UPDATE
+        / "issue_content_update.marker.json"
+    )
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{broken", encoding="utf-8")
+    with patch.object(executor, "_patch_issue_content") as patch_never:
+        rc, payload = run(tmp_project, data, monkeypatch, capsys)
+    assert rc == 0
+    assert payload["status_detail"] == "already_applied"
+    assert payload["patch_attempted"] is False
+    assert json.loads(marker.read_text(encoding="utf-8"))["new_title"] == "new title"
+    patch_never.assert_not_called()
+
+
+def test_remote_desired_state_recovers_after_local_postcondition_failure(tmp_project, monkeypatch, capsys):
+    data = content_input()
+    desired = {
+        "title": "new title", "body": "new body", "updatedAt": "2026-07-22T00:00:01Z",
+        "isPullRequest": False,
+    }
+    monkeypatch.setattr(executor, "_fetch_issue_content", lambda *_: (desired, ""))
+    checks = iter([[" M tracked.py"], []])
+    monkeypatch.setattr(executor, "_check_no_tracked_changes", lambda *_: next(checks))
+    with patch.object(executor, "_patch_issue_content") as patch_never:
+        rc, failed = run(tmp_project, data, monkeypatch, capsys)
+        rc_retry, replay = run(tmp_project, data, monkeypatch, capsys)
+    assert rc == 1
+    assert failed["reason"] == "postcondition_tracked_changes_detected"
+    assert rc_retry == 0
+    assert replay["status_detail"] == "already_applied"
+    patch_never.assert_not_called()
+
+
+def test_successful_patch_replays_after_local_postcondition_failure(tmp_project, monkeypatch, capsys):
+    data = content_input()
+    old = {"title": "old title", "body": "old body", "updatedAt": "2026-07-22T00:00:00Z", "isPullRequest": False}
+    desired = {"title": "new title", "body": "new body", "updatedAt": "2026-07-22T00:00:01Z", "isPullRequest": False}
+    readbacks = iter([old, desired, desired])
+    monkeypatch.setattr(executor, "_fetch_issue_content", lambda *_: (next(readbacks), ""))
+    checks = iter([[" M tracked.py"], []])
+    monkeypatch.setattr(executor, "_check_no_tracked_changes", lambda *_: next(checks))
+    with patch.object(executor, "_patch_issue_content", return_value="") as patch_once:
+        rc, failed = run(tmp_project, data, monkeypatch, capsys)
+        retry_rc, replay = run(tmp_project, data, monkeypatch, capsys)
+    assert rc == 1
+    assert failed["mutation_outcome"] == "applied"
+    assert retry_rc == 0
+    assert replay["status_detail"] == "already_applied"
+    patch_once.assert_called_once()
+
+
+def test_pull_request_target_is_rejected_before_patch(tmp_project, monkeypatch, capsys):
+    data = content_input()
+    pull_request = {
+        "title": "old title", "body": "old body", "updatedAt": "2026-07-22T00:00:00Z",
+        "isPullRequest": True,
+    }
+    monkeypatch.setattr(executor, "_fetch_issue_content", lambda *_: (pull_request, ""))
+    with patch.object(executor, "_patch_issue_content") as patch_never:
+        rc, payload = run(tmp_project, data, monkeypatch, capsys)
+    assert rc == 2
+    assert payload["reason"] == "target_is_pull_request"
+    patch_never.assert_not_called()
+
+
+def test_empty_body_is_a_valid_canonical_content_value(tmp_project, monkeypatch, capsys):
+    data = content_input(new_body="", new_body_sha256=sha(""))
+    readbacks = iter([
+        {"title": "old title", "body": "old body", "updatedAt": "2026-07-22T00:00:00Z", "isPullRequest": False},
+        {"title": "new title", "body": "", "updatedAt": "2026-07-22T00:00:01Z", "isPullRequest": False},
+    ])
+    monkeypatch.setattr(executor, "_fetch_issue_content", lambda *_: (next(readbacks), ""))
+    monkeypatch.setattr(executor, "_check_no_tracked_changes", lambda *_: [])
+    with patch.object(executor, "_patch_issue_content", return_value="") as patch_once:
+        rc, payload = run(tmp_project, data, monkeypatch, capsys)
+    assert rc == 0
+    assert payload["new_body_sha256"] == sha("")
+    patch_once.assert_called_once()

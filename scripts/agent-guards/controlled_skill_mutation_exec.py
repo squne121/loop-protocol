@@ -56,6 +56,7 @@ import shutil
 import stat as _stat
 import subprocess
 import sys
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
@@ -535,11 +536,11 @@ def _validate_issue_content_update_fields(data: dict, repo: str, issue_number: i
         "expected_previous_updated_at", "new_title", "new_body",
         "new_body_sha256", "operation_reason", "idempotency_key",
     ):
-        if not isinstance(data.get(field), str) or not data[field]:
+        if not isinstance(data.get(field), str) or (field != "new_body" and not data[field]):
             return f"issue_content_update_field_invalid: {field!r}"
     for field in ("expected_previous_title", "new_title"):
         value = data[field]
-        if not value.strip() or "\x00" in value or any(ord(char) < 32 for char in value):
+        if not value.strip() or any(unicodedata.category(char) == "Cc" for char in value):
             return f"issue_content_update_title_invalid: {field!r}"
     computed = "sha256:" + hashlib.sha256(data["new_body"].encode("utf-8")).hexdigest()
     if computed != data["new_body_sha256"]:
@@ -821,7 +822,7 @@ def _fetch_issue_content(
             [
                 gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST,
                 f"repos/{repo}/issues/{issue_number}",
-                "--jq", "{title, body, updatedAt: .updated_at}",
+                "--jq", "{title, body, updatedAt: .updated_at, isPullRequest: has(\"pull_request\")}",
             ],
             capture_output=True, text=True, timeout=15, shell=False,
             env=_build_metadata_sanitized_env(),
@@ -831,10 +832,12 @@ def _fetch_issue_content(
         data = json.loads(out.stdout)
         if (
             not isinstance(data, dict)
-            or not isinstance(data.get("body"), str)
+            or not (isinstance(data.get("body"), str) or data.get("body") is None)
             or not isinstance(data.get("updatedAt"), str)
+            or not isinstance(data.get("isPullRequest"), bool)
         ):
             return None, "gh_issue_fetch_schema_invalid"
+        data["body"] = data["body"] or ""
         # Existing body-only consumers use the same fixed endpoint but do not
         # require a title fixture. ``issue_content.update`` enforces title
         # presence at its own pre/postcondition boundary.
@@ -1100,7 +1103,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    def _fail(reason: str, errors: list[str] | None = None, status: str = "error") -> int:
+    def _fail(
+        reason: str,
+        errors: list[str] | None = None,
+        status: str = "error",
+        extra: dict | None = None,
+    ) -> int:
         result = {
             "schema": RESULT_SCHEMA,
             "status": status,
@@ -1108,6 +1116,8 @@ def main(argv: list[str] | None = None) -> int:
             "reason": reason,
             "errors": errors or [reason],
         }
+        if extra:
+            result.update(extra)
         if args.output_json:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         else:
@@ -1471,31 +1481,77 @@ def _run_issue_content_update(args, input_data, gh_bin, _fail, _ok) -> int:
         PROJECT_ROOT, args.issue_number, args.command_id, "issue_content_update.marker.json"
     )
     write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
-    marker_data = None
-    if marker_path.exists():
-        try:
-            marker_data = json.loads(marker_path.read_text(encoding="utf-8"))
-        except Exception:
-            return _fail("issue_content_update_marker_corrupt")
-        if marker_data.get("issue_number") != args.issue_number or marker_data.get("repo") != args.repo:
-            return _fail("issue_content_update_marker_metadata_mismatch")
 
     before, err = _fetch_issue_content(args.issue_number, args.repo, gh_bin)
     if before is None:
         return _fail(err, status="failed")
+    if before.get("isPullRequest"):
+        return _fail("target_is_pull_request")
     if not isinstance(before.get("title"), str):
         return _fail("gh_issue_fetch_schema_invalid", status="failed")
     current_body_sha256 = "sha256:" + hashlib.sha256(before["body"].encode("utf-8")).hexdigest()
-    if (
-        marker_data is not None
-        and before["title"] == input_data["new_title"]
-        and current_body_sha256 == input_data["new_body_sha256"]
-    ):
+
+    def _write_marker_atomically(body_sha256: str) -> str:
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = marker_path.with_name(f".{marker_path.name}.{os.getpid()}.tmp")
+        try:
+            temporary.write_text(json.dumps({
+                "schema": "ISSUE_CONTENT_UPDATE_MARKER_V1",
+                "issue_number": args.issue_number,
+                "repo": args.repo,
+                "idempotency_key": input_data["idempotency_key"],
+                "new_title": input_data["new_title"],
+                "new_body_sha256": body_sha256,
+                "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, marker_path)
+            return ""
+        except Exception as exc:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+            return f"issue_content_update_marker_write_failed: {exc}"
+
+    def _finalize_remote_success(
+        *, status_detail: str, body_sha256: str, patch_attempted: bool
+    ) -> int:
+        changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+        if changed:
+            return _fail(
+                "postcondition_tracked_changes_detected",
+                status="failed",
+                extra={"patch_attempted": patch_attempted, "mutation_outcome": "applied"},
+            )
+        marker_error = _write_marker_atomically(body_sha256)
+        if marker_error:
+            return _fail(
+                marker_error,
+                status="failed",
+                extra={"patch_attempted": patch_attempted, "mutation_outcome": "applied"},
+            )
         return _ok({
-            "status_detail": "already_applied",
-            "idempotency_marker_found": True,
-            "new_body_sha256": current_body_sha256,
+            "status_detail": status_detail,
+            "mutation_outcome": "applied" if patch_attempted else status_detail,
+            "patch_attempted": patch_attempted,
+            "new_title": input_data["new_title"],
+            "new_body_sha256": body_sha256,
+            "idempotency_marker_written": True,
         })
+
+    # Remote state is authoritative. Local marker state is repairable audit
+    # cache only and never decides whether a PATCH is needed.
+    if before["title"] == input_data["new_title"] and current_body_sha256 == input_data["new_body_sha256"]:
+        expected_matches = (
+            before["title"] == input_data["expected_previous_title"]
+            and current_body_sha256 == input_data["expected_previous_body_sha256"]
+            and before["updatedAt"] == input_data["expected_previous_updated_at"]
+        )
+        return _finalize_remote_success(
+            status_detail="no_change" if expected_matches else "already_applied",
+            body_sha256=current_body_sha256,
+            patch_attempted=False,
+        )
     if before["title"] != input_data["expected_previous_title"]:
         return _fail("stale_precondition_title_mismatch", status="failed")
     if current_body_sha256 != input_data["expected_previous_body_sha256"]:
@@ -1512,38 +1568,30 @@ def _run_issue_content_update(args, input_data, gh_bin, _fail, _ok) -> int:
         if after_ambiguous is not None:
             body_sha = "sha256:" + hashlib.sha256(after_ambiguous["body"].encode("utf-8")).hexdigest()
             if after_ambiguous["title"] == input_data["new_title"] and body_sha == input_data["new_body_sha256"]:
-                return _ok({"status_detail": "already_applied", "new_body_sha256": body_sha})
-        return _fail(patch_err if not after_err else f"{patch_err}; readback={after_err}", status="failed")
+                return _finalize_remote_success(
+                    status_detail="already_applied", body_sha256=body_sha, patch_attempted=True
+                )
+        return _fail(
+            patch_err if not after_err else f"{patch_err}; readback={after_err}",
+            status="failed",
+            extra={"patch_attempted": True, "mutation_outcome": "unknown"},
+        )
 
     after, err = _fetch_issue_content(args.issue_number, args.repo, gh_bin)
     if after is None:
-        return _fail(err, status="failed")
+        return _fail(err, status="failed", extra={"patch_attempted": True, "mutation_outcome": "unknown"})
+    if after.get("isPullRequest"):
+        return _fail("target_is_pull_request", status="failed", extra={"patch_attempted": True, "mutation_outcome": "unknown"})
     if not isinstance(after.get("title"), str):
-        return _fail("gh_issue_fetch_schema_invalid", status="failed")
+        return _fail("gh_issue_fetch_schema_invalid", status="failed", extra={"patch_attempted": True, "mutation_outcome": "unknown"})
     actual_new_body_sha256 = "sha256:" + hashlib.sha256(after["body"].encode("utf-8")).hexdigest()
     if after["title"] != input_data["new_title"]:
-        return _fail("postcondition_new_title_mismatch", status="failed")
+        return _fail("postcondition_new_title_mismatch", status="failed", extra={"patch_attempted": True, "mutation_outcome": "unknown"})
     if actual_new_body_sha256 != input_data["new_body_sha256"]:
-        return _fail("postcondition_new_body_sha256_mismatch", status="failed")
-    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
-    if changed:
-        return _fail("postcondition_tracked_changes_detected", status="failed")
-
-    marker_path.parent.mkdir(parents=True, exist_ok=True)
-    marker_path.write_text(json.dumps({
-        "schema": "ISSUE_CONTENT_UPDATE_MARKER_V1",
-        "issue_number": args.issue_number,
-        "repo": args.repo,
-        "idempotency_key": input_data["idempotency_key"],
-        "new_title": input_data["new_title"],
-        "new_body_sha256": actual_new_body_sha256,
-        "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    }, ensure_ascii=False, indent=2))
-    return _ok({
-        "new_title": input_data["new_title"],
-        "new_body_sha256": actual_new_body_sha256,
-        "idempotency_marker_written": True,
-    })
+        return _fail("postcondition_new_body_sha256_mismatch", status="failed", extra={"patch_attempted": True, "mutation_outcome": "unknown"})
+    return _finalize_remote_success(
+        status_detail="applied", body_sha256=actual_new_body_sha256, patch_attempted=True
+    )
 
 
 def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail, _ok) -> int:

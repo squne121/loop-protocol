@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -143,8 +144,7 @@ def _validate_input_payload(data: dict[str, Any]) -> None:
             if (
                 not isinstance(proposed_title, str)
                 or not proposed_title.strip()
-                or "\x00" in proposed_title
-                or any(ord(char) < 32 for char in proposed_title)
+                or any(unicodedata.category(char) == "Cc" for char in proposed_title)
             ):
                 raise ValueError("title_update_proposed_title_invalid")
             if not isinstance(reason, str) or not reason.strip():
@@ -280,6 +280,11 @@ def _render_result(
     body_input_ref: str | None,
     comment_input_ref: str | None,
     errors: list[dict[str, str]],
+    previous_title: str | None = None,
+    requested_title: str | None = None,
+    remote_current_title: str | None = None,
+    patch_attempted: bool = False,
+    mutation_outcome: str = "not_attempted",
 ) -> dict[str, Any]:
     return {
         "schema": RESULT_SCHEMA,
@@ -295,6 +300,13 @@ def _render_result(
             "new_body_sha256": requested_new_body_sha256,
             "remote_current_body_sha256": remote_current_body_sha256,
             "artifact_ref": body_input_ref,
+        },
+        "content_update": {
+            "previous_title": previous_title,
+            "requested_title": requested_title,
+            "remote_current_title": remote_current_title,
+            "patch_attempted": patch_attempted,
+            "mutation_outcome": mutation_outcome,
         },
         "comment_publish": {
             "attempted": comment_attempted,
@@ -545,6 +557,7 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
         )
 
     new_body = _read_text_file(input_data["new_body_file"])
+    body_change_requested = new_body != current_body
     requested_new_sha = _sha256_text(new_body)
     state.requested_new_body_sha256 = requested_new_sha
     comment_mode = input_data.get("comment_mode", {"mode": "skip"})
@@ -628,81 +641,61 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
         candidate_path = Path(tmp_body.name)
 
     try:
-        guard_cp = _run_command([sys.executable, str(GUARD_SCRIPT), str(candidate_path), "--format", "json"])
-        if guard_cp.returncode != 0:
-            state.errors.append(_child_error(guard_cp, "guard_or_readiness_failed_before_mutation"))
-            return _render_result(
-                status="failed_no_mutation",
-                issue_number=state.issue_number,
-                repo=state.repo,
-                mutation_started=False,
-                body_attempted=False,
-                body_status="not_run",
-                comment_attempted=False,
-                comment_status="not_run",
-                previous_body_sha256=current_sha,
-                requested_new_body_sha256=requested_new_sha,
-                remote_current_body_sha256=current_sha,
-                body_input_ref=None,
-                comment_input_ref=None,
-                comment_id=None,
-                comment_url=None,
-                comment_body_sha256=None,
-                errors=state.errors,
+        if body_change_requested:
+            guard_cp = _run_command([sys.executable, str(GUARD_SCRIPT), str(candidate_path), "--format", "json"])
+            if guard_cp.returncode != 0:
+                state.errors.append(_child_error(guard_cp, "guard_or_readiness_failed_before_mutation"))
+                return _render_result(
+                    status="failed_no_mutation", issue_number=state.issue_number, repo=state.repo,
+                    mutation_started=False, body_attempted=False, body_status="not_run",
+                    comment_attempted=False, comment_status="not_run", previous_body_sha256=current_sha,
+                    requested_new_body_sha256=requested_new_sha, remote_current_body_sha256=current_sha,
+                    body_input_ref=None, comment_input_ref=None, comment_id=None, comment_url=None,
+                    comment_body_sha256=None, errors=state.errors,
+                )
+            hygiene_cp = _run_command(
+                [sys.executable, str(HYGIENE_SCRIPT), "--body-file", str(candidate_path), "--out-file", str(candidate_path)]
             )
-
-        hygiene_cp = _run_command(
-            [sys.executable, str(HYGIENE_SCRIPT), "--body-file", str(candidate_path), "--out-file", str(candidate_path)]
-        )
-        if hygiene_cp.returncode not in (0, 1, 2):
-            state.errors.append(_child_error(hygiene_cp, "issue_contract_hygiene_runtime_error"))
-            return _render_result(
-                status="failed_no_mutation",
-                issue_number=state.issue_number,
-                repo=state.repo,
-                mutation_started=False,
-                body_attempted=False,
-                body_status="not_run",
-                comment_attempted=False,
-                comment_status="not_run",
-                previous_body_sha256=current_sha,
-                requested_new_body_sha256=requested_new_sha,
-                remote_current_body_sha256=current_sha,
-                body_input_ref=None,
-                comment_input_ref=None,
-                comment_id=None,
-                comment_url=None,
-                comment_body_sha256=None,
-                errors=state.errors,
+            if hygiene_cp.returncode not in (0, 1, 2):
+                state.errors.append(_child_error(hygiene_cp, "issue_contract_hygiene_runtime_error"))
+                return _render_result(
+                    status="failed_no_mutation", issue_number=state.issue_number, repo=state.repo,
+                    mutation_started=False, body_attempted=False, body_status="not_run",
+                    comment_attempted=False, comment_status="not_run", previous_body_sha256=current_sha,
+                    requested_new_body_sha256=requested_new_sha, remote_current_body_sha256=current_sha,
+                    body_input_ref=None, comment_input_ref=None, comment_id=None, comment_url=None,
+                    comment_body_sha256=None, errors=state.errors,
+                )
+            mutated_candidate = candidate_path.read_text(encoding="utf-8")
+            readiness_cp = _run_command(
+                [sys.executable, str(READINESS_SCRIPT), "--body-file", str(candidate_path), "--mode", "static"]
             )
+            if readiness_cp.returncode != 0:
+                state.errors.append(_child_error(readiness_cp, "guard_or_readiness_failed_before_mutation"))
+                return _render_result(
+                    status="failed_no_mutation", issue_number=state.issue_number, repo=state.repo,
+                    mutation_started=False, body_attempted=False, body_status="not_run",
+                    comment_attempted=False, comment_status="not_run", previous_body_sha256=current_sha,
+                    requested_new_body_sha256=_sha256_text(mutated_candidate), remote_current_body_sha256=current_sha,
+                    body_input_ref=None, comment_input_ref=None, comment_id=None, comment_url=None,
+                    comment_body_sha256=None, errors=state.errors,
+                )
+        else:
+            # A title-only request must preserve even a noncanonical body exactly.
+            mutated_candidate = current_body
 
-        mutated_candidate = candidate_path.read_text(encoding="utf-8")
         requested_new_sha = _sha256_text(mutated_candidate)
         state.requested_new_body_sha256 = requested_new_sha
-
-        readiness_cp = _run_command(
-            [sys.executable, str(READINESS_SCRIPT), "--body-file", str(candidate_path), "--mode", "static"]
-        )
-        if readiness_cp.returncode != 0:
-            state.errors.append(_child_error(readiness_cp, "guard_or_readiness_failed_before_mutation"))
+        if requested_new_sha == current_sha and requested_title == current_title:
             return _render_result(
-                status="failed_no_mutation",
-                issue_number=state.issue_number,
-                repo=state.repo,
-                mutation_started=False,
-                body_attempted=False,
-                body_status="not_run",
-                comment_attempted=False,
-                comment_status="not_run",
-                previous_body_sha256=current_sha,
-                requested_new_body_sha256=requested_new_sha,
-                remote_current_body_sha256=current_sha,
-                body_input_ref=None,
-                comment_input_ref=None,
-                comment_id=None,
-                comment_url=None,
-                comment_body_sha256=None,
-                errors=state.errors,
+                status="no_change", issue_number=state.issue_number, repo=state.repo,
+                mutation_started=False, body_attempted=False, body_status="not_run",
+                comment_attempted=False, comment_status="not_run", previous_body_sha256=current_sha,
+                requested_new_body_sha256=requested_new_sha, remote_current_body_sha256=current_sha,
+                body_input_ref=None, comment_input_ref=None, comment_id=None, comment_url=None,
+                comment_body_sha256=None, errors=[], previous_title=current_title,
+                requested_title=requested_title, remote_current_title=current_title,
+                patch_attempted=False, mutation_outcome="no_change",
             )
 
         body_input = {
@@ -753,7 +746,7 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
                     errors=state.errors,
                 )
             return _render_result(
-                status="failed_no_mutation",
+                status="mutation_outcome_unknown",
                 issue_number=state.issue_number,
                 repo=state.repo,
                 mutation_started=False,
@@ -770,6 +763,11 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
                 comment_url=None,
                 comment_body_sha256=None,
                 errors=state.errors,
+                previous_title=current_title,
+                requested_title=requested_title,
+                remote_current_title=refreshed_title if isinstance(refreshed_title, str) else None,
+                patch_attempted=True,
+                mutation_outcome="unknown",
             )
 
         state.mutation_started = True
@@ -876,6 +874,11 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             comment_url=state.comment_url,
             comment_body_sha256=state.comment_body_sha256,
             errors=[],
+            previous_title=current_title,
+            requested_title=requested_title,
+            remote_current_title=final_title if isinstance(final_title, str) else None,
+            patch_attempted=True,
+            mutation_outcome="applied",
         )
     finally:
         try:

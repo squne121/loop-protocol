@@ -424,7 +424,9 @@ def test_child_timeout_maps_to_single_bounded_json(
     out = capsys.readouterr().out
     parsed = json.loads(out)
     assert rc == 1
-    assert parsed["status"] == "failed_no_mutation"
+    assert parsed["status"] == "mutation_outcome_unknown"
+    assert parsed["content_update"]["patch_attempted"] is True
+    assert parsed["content_update"]["mutation_outcome"] == "unknown"
     assert len(out.splitlines()) == 1
     assert len(parsed["errors"]) == 1
     assert len(parsed["errors"][0]["message"]) <= 240
