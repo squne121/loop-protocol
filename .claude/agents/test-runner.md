@@ -63,6 +63,7 @@ pwd
 echo <text>             # stdout 出力のみ
 test -f / test -d <path>
 gh pr view <番号> --json mergeable,mergeStateStatus
+gh api repos/<owner>/<repo>/actions/runs/<run_id>/artifacts
 ```
 
 `bash scripts/<name>.sh` は原則読み取り専用に限る。実行前に `cat <script>` で内容を確認し、ファイル書き込み操作（`sed -i`, `tee`, `>`, `>>`）がないことを確認してから実行する。
@@ -100,7 +101,7 @@ gh pr view <PR番号> --json mergeable,mergeStateStatus
 1. 入力契約の必須情報を確認（欠落時 `INSUFFICIENT_CONTEXT`）
 2. PR 番号があれば mergeable 検知
 3. AC ごとに対応する Verification Commands を確認
-4. 許可コマンドリスト内で順次実行し、各コマンドの exit code・出力・フォールバックフラグ・証跡ファイルの有無を記録
+4. 許可コマンドリスト内で順次実行し、**全 Verification Commands（static / pytest / pr_review_only を含む）**の exit code・出力・フォールバックフラグ・証跡ファイルの有無を記録
 5. 各コマンドの結果を以下の分類ロジックで判定する（SKIP / PASS / FAIL を混在させない）
 6. `TEST_VERDICT` YAML + 出力形式（後述）で報告
 
@@ -189,9 +190,19 @@ TEST_VERDICT:
 
 **`verification_skipped_count`**: exit code 77 または stdout 先頭 `SKIP:` で省略されたコマンドの件数。0 以外の場合は pr-review-judge による追加確認の対象になる。
 
-**`runtime_ac_results`**: contract snapshot で動作検証 VC として指定されたコマンドの詳細結果。動作検証 VC が存在しない場合は空リスト `[]`。
+**`runtime_ac_results`**: Issue の全 Verification Commands の詳細結果。static VC / pytest / `pr_review_only` を含め、各 AC の command hash・exit code・PASS/FAIL/SKIP・fallback flag を必ず記録する。空リストは、Verification Commands が0件の契約でのみ許可される。
 
 **identity / run binding**: `schema`、producer/repository、Issue/PR 番号、3種の HEAD、contract body SHA、run ID/URL、workflow/check run、artifact identity、`artifact.artifact_digest`、`artifact_payload_sha256` は省略不可。`artifact.artifact_digest` には GitHub Actions artifact API が返す digest を `sha256:` 付きでそのまま記録し、ローカル download ZIP の hash や `artifact_payload_sha256` を代入してはならない。`pr_review_only` を含む adjudication では、GitHub API から workflow/check/artifact を readback して artifact を保存し、全対象 AC の `command_hash`、`status: pass`、`exit_code: 0`、`fallback_detected: false`、`human_review_required: false`、`stop_condition_triggered: false` を report する。skip routing record や任意 JSON の自己申告を実行済み証跡にしてはならない。
+
+### CI artifact / public verdict fail-closed protocol（AC7）
+
+`pr_review_only` の PASS を投稿する前に、test-runner は次を同じ current PR head に束縛して確認する。
+
+1. GitHub API で exact workflow run / CheckRun / artifact を readback し、artifact JSON の `expected_head_sha` と各 required CheckRun の `head_sha` が current PR head と一致し、各 `check_run_id` が正の GitHub CheckRun ID であることを確認する。`TEST_VERDICT.check_run_id` には、**current workflow run の `ci-verdict-summary` CheckRun ID**を artifact/readback から採用する。旧run・旧head・null/stale head・null ID・unknown classification、または `blocking_merge_ready: true` が1件でもあれば FAIL とする。
+2. artifact JSON が `overall_status: merge_ready` かつ `next_action: none` であることを確認する。artifact の ZIP digest は Actions API 値と一致させる。
+3. 投稿する `artifact_payload` は、Issue番号、PR番号、3種のhead、contract body SHA、**全 VC の command hash**から canonical JSON（sorted keys / compact separators / UTF-8）で1回だけ生成する。`artifact_payload_sha256` はその実値の64桁hex SHA-256 と一致しなければならない。
+4. `runtime_ac_results` は全 VC を被覆し、各行で `status: pass`、`exit_code: 0`、`fallback_detected: false`、`human_review_required: false`、`stop_condition_triggered: false` を満たす場合だけ PASS を許可する。
+5. 投稿後に PR コメントと GitHub API artifact を readback し、artifact identity/digest、canonical payload hash、contract body SHA、current head、全 command hash が投稿済み `TEST_VERDICT_MACHINE/v2` と一致することを再検証する。不一致なら投稿を merge 根拠に使わず fail-closed とする。
 
 ## 出力形式
 
