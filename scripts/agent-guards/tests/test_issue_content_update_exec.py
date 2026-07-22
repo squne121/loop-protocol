@@ -109,6 +109,38 @@ def test_title_and_body_are_sent_in_one_patch(tmp_project, monkeypatch, capsys):
     patch_once.assert_called_once_with(1660, TRUSTED_REPO, "new title", "new body", "/bin/gh")
 
 
+@pytest.mark.parametrize("title", ["true", "false", "null", "123", "@literal-title"])
+@pytest.mark.parametrize(
+    ("update_kind", "body"),
+    [("title_only", "old body"), ("title_and_body", "new body")],
+)
+def test_json_patch_preserves_literal_string_titles(
+    monkeypatch, title, update_kind, body
+):
+    calls: list[list[str]] = []
+    payloads: list[dict] = []
+
+    def fake_run(args, **_kwargs):
+        calls.append(args)
+        input_path = Path(args[args.index("--input") + 1])
+        payloads.append(json.loads(input_path.read_text(encoding="utf-8")))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(executor.subprocess, "run", fake_run)
+    assert executor._patch_issue_content(1660, TRUSTED_REPO, title, body, "/bin/gh") == ""
+    assert len(calls) == 1
+    assert calls[0][:-1] == [
+        "/bin/gh", "api", "--hostname", "github.com", "--method", "PATCH",
+        f"repos/{TRUSTED_REPO}/issues/1660", "--input",
+    ]
+    assert "--field" not in calls[0]
+    assert payloads == [{"title": title, "body": body}]
+    if update_kind == "title_only":
+        assert payloads[0]["body"] == "old body"
+    else:
+        assert payloads[0]["body"] == "new body"
+
+
 def test_ambiguous_and_precondition_failures_do_not_retry_patch(tmp_project, monkeypatch, capsys):
     data = content_input()
     old_content = {

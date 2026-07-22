@@ -909,15 +909,17 @@ def _patch_issue_content(issue_number: int, repo: str, title: str, body: str, gh
     import tempfile
 
     try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as tmp:
-            tmp.write(body)
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, encoding="utf-8"
+        ) as tmp:
+            json.dump({"title": title, "body": body}, tmp, ensure_ascii=False)
             tmp_path = tmp.name
         try:
             out = subprocess.run(
                 [
                     gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST,
                     "--method", "PATCH", f"repos/{repo}/issues/{issue_number}",
-                    "--field", f"title={title}", "--field", f"body=@{tmp_path}",
+                    "--input", tmp_path,
                 ],
                 capture_output=True, text=True, timeout=15, shell=False,
                 env=_build_metadata_sanitized_env(),
