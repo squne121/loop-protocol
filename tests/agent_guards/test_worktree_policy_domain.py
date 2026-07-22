@@ -10,6 +10,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "agent-guards"))
 import worktree_policy_domain as domain  # noqa: E402
+import worktree_scope_guard  # noqa: E402
+import codex_apply_patch_adapter  # noqa: E402
 
 
 CLAUDE_DIGEST = "sha256:7a6792dfc33b57b2b347bee70db61e54ba37ce0b263b6e79cb1466a4a67df6e0"
@@ -108,3 +110,146 @@ def test_given_windows_paths_when_flavor_is_windows_then_component_boundary_is_p
         resolver_digest=domain.digest_for_resolver("bound", r"C:\\repo\\wt"),
     )
     assert domain.policy_decide(intent, binding)["decision"] == "allow"
+
+
+def test_given_equivalent_intents_from_claude_and_codex_with_shared_binding_parity() -> None:
+    expected_worktree = "/repo/wt"
+    binding = _binding("bound", expected_worktree)
+    for target in ["/repo/wt/file.py", "/repo/outside/file.py"]:
+        claude = domain.policy_decide(
+            _intent(runtime="claude", identity="Write", path=target),
+            binding,
+        )
+        codex = domain.policy_decide(
+            _intent(runtime="codex", identity="apply_patch", path=target),
+            binding,
+        )
+        assert claude == codex
+
+
+def test_given_adapters_generate_matching_bound_binding_and_parity_for_claude_vs_codex_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_worktree = "/repo/wt"
+    project_root = "/repo"
+    issue = "942"
+    resolution = worktree_scope_guard.WorktreeResolution(expected_worktree, 1, True)
+
+    recorded: dict[str, list[dict[str, object]]] = {"intent": [], "binding": []}
+
+    original_make_intent = domain.make_intent
+    original_make_binding = domain.make_binding
+
+    def capture_make_intent(**kwargs: object) -> dict[str, object]:
+        value = original_make_intent(**kwargs)  # type: ignore[arg-type]
+        recorded["intent"].append(value)  # type: ignore[arg-type]
+        return value
+
+    def capture_make_binding(**kwargs: object) -> dict[str, object]:
+        value = original_make_binding(**kwargs)  # type: ignore[arg-type]
+        recorded["binding"].append(value)  # type: ignore[arg-type]
+        return value
+
+    monkeypatch.setattr(domain, "make_intent", capture_make_intent)
+    monkeypatch.setattr(domain, "make_binding", capture_make_binding)
+    monkeypatch.setattr(worktree_scope_guard, "local_main_scratch_allow_v1", lambda *args, **kwargs: False)
+    monkeypatch.setattr(worktree_scope_guard, "resolve_project_root", lambda: project_root)
+    monkeypatch.setattr(worktree_scope_guard, "resolve_current_issue", lambda _cwd, _root: issue)
+    monkeypatch.setattr(worktree_scope_guard, "resolve_expected_worktree", lambda _issue, _root, _deadline=None: resolution)
+
+    with pytest.raises(SystemExit) as claude_exit:
+        worktree_scope_guard._decide_write(
+            {"file_path": "inside.py"},
+            f"{expected_worktree}/sub",
+            issue,
+            resolution,
+            "Write",
+            project_root=project_root,
+        )
+    assert claude_exit.value.code == 0
+
+    patch_body = "*** Begin Patch\n*** Add File: inside.py\n+print('ok')\n*** End Patch\n"
+    payload = {"tool_name": "apply_patch", "tool_input": {"command": patch_body}, "cwd": f"{expected_worktree}/sub"}
+    with pytest.raises(SystemExit) as codex_exit:
+        codex_apply_patch_adapter._decide_apply_patch(payload)
+    assert codex_exit.value.code == 0
+
+    assert len(recorded["intent"]) == 2
+    assert len(recorded["binding"]) == 2
+
+    claude_intent = domain.validate_intent(recorded["intent"][0])
+    codex_intent = domain.validate_intent(recorded["intent"][1])
+    claude_binding = domain.validate_binding(recorded["binding"][0])
+    codex_binding = domain.validate_binding(recorded["binding"][1])
+
+    assert claude_binding == codex_binding
+    assert claude_binding["state"] == "bound"
+    assert claude_binding["expected_worktree"] == expected_worktree
+
+    claude_decision = domain.policy_decide(claude_intent, claude_binding)
+    codex_decision = domain.policy_decide(codex_intent, codex_binding)
+    assert codex_decision["decision"] == claude_decision["decision"]
+    assert codex_decision["reason_code"] == claude_decision["reason_code"] == "mutation_inside_worktree"
+
+
+def test_given_adapters_generate_matching_deny_for_shared_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_worktree = "/repo/wt"
+    project_root = "/repo"
+    issue = "942"
+    resolution = worktree_scope_guard.WorktreeResolution(expected_worktree, 1, True)
+
+    recorded: dict[str, list[dict[str, object]]] = {"intent": [], "binding": []}
+
+    original_make_intent = domain.make_intent
+    original_make_binding = domain.make_binding
+
+    def capture_make_intent(**kwargs: object) -> dict[str, object]:
+        value = original_make_intent(**kwargs)  # type: ignore[arg-type]
+        recorded["intent"].append(value)  # type: ignore[arg-type]
+        return value
+
+    def capture_make_binding(**kwargs: object) -> dict[str, object]:
+        value = original_make_binding(**kwargs)  # type: ignore[arg-type]
+        recorded["binding"].append(value)  # type: ignore[arg-type]
+        return value
+
+    monkeypatch.setattr(domain, "make_intent", capture_make_intent)
+    monkeypatch.setattr(domain, "make_binding", capture_make_binding)
+    monkeypatch.setattr(worktree_scope_guard, "local_main_scratch_allow_v1", lambda *args, **kwargs: False)
+    monkeypatch.setattr(worktree_scope_guard, "resolve_project_root", lambda: project_root)
+    monkeypatch.setattr(worktree_scope_guard, "resolve_current_issue", lambda _cwd, _root: issue)
+    monkeypatch.setattr(worktree_scope_guard, "resolve_expected_worktree", lambda _issue, _root, _deadline=None: resolution)
+
+    with pytest.raises(SystemExit) as claude_exit:
+        worktree_scope_guard._decide_write(
+            {"file_path": "../../outside.py"},
+            f"{expected_worktree}/sub",
+            issue,
+            resolution,
+            "Write",
+            project_root=project_root,
+        )
+    assert claude_exit.value.code == 2
+
+    patch_body = "*** Begin Patch\n*** Add File: ../../outside.py\n+print('ok')\n*** End Patch\n"
+    payload = {"tool_name": "apply_patch", "tool_input": {"command": patch_body}, "cwd": f"{expected_worktree}/sub"}
+    with pytest.raises(SystemExit) as codex_exit:
+        codex_apply_patch_adapter._decide_apply_patch(payload)
+    assert codex_exit.value.code == 2
+
+    assert len(recorded["intent"]) == 2
+    assert len(recorded["binding"]) == 2
+
+    claude_intent = domain.validate_intent(recorded["intent"][0])
+    codex_intent = domain.validate_intent(recorded["intent"][1])
+    claude_binding = domain.validate_binding(recorded["binding"][0])
+    codex_binding = domain.validate_binding(recorded["binding"][1])
+
+    assert claude_binding == codex_binding
+
+    claude_decision = domain.policy_decide(claude_intent, claude_binding)
+    codex_decision = domain.policy_decide(codex_intent, codex_binding)
+    assert codex_decision["decision"] == claude_decision["decision"] == "deny"
+    assert codex_decision["reason_code"] == claude_decision["reason_code"] == "target_outside_worktree"
