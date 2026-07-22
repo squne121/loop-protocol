@@ -39,7 +39,6 @@ from local_main_branch_guard import (  # noqa: E402
     _has_leading_env_assignment,
     _normalize_git_global_opts,
     _is_allowed_when_drifted,
-    REASON_NOT_LOCAL_ROOT,
     REASON_LINKED_ISSUE_WORKTREE_CONTEXT,
     REASON_READONLY,
     REASON_BRANCH_SAFE_MAINTENANCE,
@@ -103,6 +102,10 @@ CONTROLLED_METADATA_COMMANDS = [
     (
         "issue_body.update",
         "artifacts/1291/issue-metadata/issue_body.update/input.json",
+    ),
+    (
+        "issue_content.update",
+        "artifacts/1291/issue-metadata/issue_content.update/input.json",
     ),
     (
         "issue_comment.publish",

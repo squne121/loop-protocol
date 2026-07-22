@@ -94,23 +94,40 @@ def test_no_raw_issue_mutation_or_shell_escape_in_production_path() -> None:
     ]
     for token in forbidden:
         assert token not in source
-    assert "issue_body.update" in source
+    assert "issue_content.update" in source
     assert "issue_comment.publish" in source
 
 
-def test_title_update_rejected_without_controlled_executor(repo_tmp: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    called = {"fetch": 0}
+def test_title_update_routes_through_content_executor(
+    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    readbacks = iter([
+        {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"},
+        {"title": "x", "body": "new issue body", "updatedAt": "2026-07-03T10:41:51Z"},
+    ])
+    calls: list[str] = []
 
     def _fetch(*_args: object, **_kwargs: object) -> tuple[dict | None, str]:
-        called["fetch"] += 1
-        return {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"}, ""
+        return next(readbacks), ""
+
+    def _run(args: list[str]) -> _CP:
+        if str(txn.GUARD_SCRIPT) in args:
+            return _CP(0, stdout='{"status":"pass"}')
+        if str(txn.HYGIENE_SCRIPT) in args or str(txn.READINESS_SCRIPT) in args:
+            return _CP(0)
+        pytest.fail(f"unexpected command: {args}")
+
+    def _invoke(command_id: str, *_args: object, **_kwargs: object) -> tuple[_CP, dict | None]:
+        calls.append(command_id)
+        return _CP(0), {"new_body_sha256": txn._sha256_text("new issue body")}
 
     monkeypatch.setattr(txn, "_fetch_issue", _fetch)
+    monkeypatch.setattr(txn, "_run_command", _run)
+    monkeypatch.setattr(txn, "_invoke_controlled_exec", _invoke)
     result = txn.run_transaction(_minimal_input(repo_tmp, title_required=True))
-    assert result["status"] == "failed_no_mutation"
-    assert result["mutation_started"] is False
-    assert result["errors"][0]["code"] == "title_update_requested_without_controlled_title_executor"
-    assert called["fetch"] == 0
+    assert result["status"] == "ok"
+    assert result["mutation_started"] is True
+    assert calls == ["issue_content.update"]
 
 
 @pytest.mark.parametrize(
@@ -229,8 +246,8 @@ def test_comment_publish_success_propagates_comment_id_url_body_sha(
         if str(txn.READINESS_SCRIPT) in args:
             return _CP(0)
         if str(txn.CONTROLLED_EXEC) in args:
-            if "issue_body.update" in args:
-                calls.append("issue_body.update")
+            if "issue_content.update" in args:
+                calls.append("issue_content.update")
                 return _CP(0, stdout='{"new_body_sha256":"sha256:new"}')
             if "issue_comment.publish" in args:
                 calls.append("issue_comment.publish")
@@ -252,7 +269,7 @@ def test_comment_publish_success_propagates_comment_id_url_body_sha(
 
     result = txn.run_transaction(payload)
     assert result["status"] == "ok"
-    assert calls == ["issue_body.update", "issue_comment.publish"]
+    assert calls == ["issue_content.update", "issue_comment.publish"]
     assert result["comment_publish"]["comment_id"] == "c-123"
     assert result["comment_publish"]["comment_url"] == "https://github.com/squne121/loop-protocol/issues/1287#issuecomment-123"
     assert result["comment_publish"]["comment_body_sha256"] == "sha256:comment"
@@ -361,7 +378,7 @@ def test_body_update_success_comment_or_readback_failure_maps_failed_after_mutat
         pytest.fail(f"unexpected command: {args}")
 
     def _invoke(command_id: str, *_args: object, **_kwargs: object) -> tuple[_CP, dict | None]:
-        if command_id == "issue_body.update":
+        if command_id == "issue_content.update":
             return _CP(0, stdout='{"new_body_sha256":"sha256:body"}'), {"new_body_sha256": "sha256:body"}
         if command_id == "issue_comment.publish":
             return _CP(1, stderr="child stderr with secret"), None
@@ -407,7 +424,9 @@ def test_child_timeout_maps_to_single_bounded_json(
     out = capsys.readouterr().out
     parsed = json.loads(out)
     assert rc == 1
-    assert parsed["status"] == "failed_no_mutation"
+    assert parsed["status"] == "mutation_outcome_unknown"
+    assert parsed["content_update"]["patch_attempted"] is True
+    assert parsed["content_update"]["mutation_outcome"] == "unknown"
     assert len(out.splitlines()) == 1
     assert len(parsed["errors"]) == 1
     assert len(parsed["errors"][0]["message"]) <= 240
