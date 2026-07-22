@@ -74,6 +74,10 @@ from git_mutation_command_policy import (  # noqa: E402
     parse_controlled_git_change_exec_command,
 )
 from hook_repair_hints import render_hook_command_repair_hint, render_publish_safety_stop_report  # noqa: E402
+import worktree_policy_domain as _policy_domain  # noqa: E402
+
+_CLAUDE_RUNTIME_VERSION = "2.1.216"
+_CLAUDE_CAPTURE_DIGEST = "sha256:7a6792dfc33b57b2b347bee70db61e54ba37ce0b263b6e79cb1466a4a67df6e0"
 
 # Issue #1241 marker: HOOK_COMMAND_REPAIR_HINT_V1 is rendered via hook_repair_hints.py.
 
@@ -1918,6 +1922,8 @@ def decide(payload: dict) -> None:
     # Malformed payload for a matched mutation tool → fail-closed.
     if not tool_name:
         _block("<unresolved>", cwd)
+    if not isinstance(tool_input, dict) or not isinstance(cwd, str) or not cwd:
+        _block("<unresolved>", os.getcwd())
     if tool_name not in MATCHED_TOOLS:
         # Not a tool we guard (defensive; matcher should already scope this).
         _allow()
@@ -1952,33 +1958,53 @@ def _decide_write(
 
     if project_root is None:
         project_root = resolve_project_root()
+    if not isinstance(target, str) or not target:
+        _block("<invalid-write-intent>", cwd)
 
-    # No active issue resolvable → write tools are not scoped to a worktree; allow.
+    # LOCAL_MAIN_SCRATCH_ALLOW_V1 is adapter-side authorization context; all
+    # ordinary write containment follows the normalized policy-domain contract.
+    if issue and resolution.expected and not is_inside(resolution.expected, target, cwd):
+        if local_main_scratch_allow_v1(target, cwd, project_root, tool_name):
+            _allow()
+
     if not issue:
+        binding_state, expected = "verified_unbound", None
+    elif not resolution.git_available:
+        binding_state, expected = "resolution_failed", None
+    elif resolution.match_count == 0:
+        binding_state, expected = "unknown", None
+    elif resolution.expected is None:
+        binding_state, expected = "ambiguous", None
+    else:
+        binding_state, expected = "bound", resolution.expected
+    try:
+        intent = _policy_domain.make_intent(
+            runtime="claude",
+            runtime_version=_CLAUDE_RUNTIME_VERSION,
+            tool_identity=tool_name,
+            canonical_identity="Write",
+            mutation_kind="write",
+            target_paths=[
+                os.path.realpath(os.path.join(cwd, target))
+                if not os.path.isabs(target)
+                else os.path.realpath(target)
+            ],
+            path_flavor="posix",
+            capture_digest=_CLAUDE_CAPTURE_DIGEST,
+        )
+        binding = _policy_domain.make_binding(
+            state=binding_state,
+            expected_worktree=expected,
+            path_flavor="posix",
+            resolver_digest=_policy_domain.digest_for_resolver(binding_state, expected),
+        )
+        decision = _policy_domain.policy_decide(intent, binding)
+    except _policy_domain.ContractValidationError:
+        _block("<invalid-write-intent>", cwd)
+        return
+    if decision["decision"] == "allow":
         _allow()
-
-    # An issue is resolved but git is unavailable → fail-closed for mutation.
-    if not resolution.git_available:
-        _block("<git-unavailable>", cwd)
-
-    # B1: active issue resolved but NO matching worktree → fail-closed block
-    # (symmetric with _decide_bash zero_matches_for_mutation:block).
-    if resolution.match_count == 0:
-        _block("<no-matching-worktree>", cwd)
-
-    # multiple matches (match_count > 1) → fail-closed block.
-    if resolution.expected is None:
-        _block("<ambiguous>", cwd)
-
-    if is_inside(resolution.expected, target, cwd):
-        _allow()
-
-    # Target is outside the expected worktree.
-    # LOCAL_MAIN_SCRATCH_ALLOW_V1: allow writes to safe scratch paths from local main.
-    if local_main_scratch_allow_v1(target, cwd, project_root, tool_name):
-        _allow()
-
-    _block(_rel(resolution.expected, project_root=resolve_project_root()), cwd)
+    _block(_rel(expected, project_root=resolve_project_root()) if expected else f"<{binding_state}>", cwd)
 
 
 def _decide_rtk_git_merge(

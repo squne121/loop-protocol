@@ -150,6 +150,20 @@ class TestApplyPatchWorktreeContainment:
         result = _run_codex_apply_patch_adapter(payload, repo["root"], issue=None)
         assert result.returncode == 0, result.stderr
 
+    def test_given_version_mismatch_when_canonical_apply_patch_then_fail_closed(self, tmp_path: Path) -> None:
+        repo = _make_repo_with_worktree(tmp_path, issue="942", slug="x")
+        payload = _apply_patch_payload(_add_file_patch("foo.py"), cwd=str(repo["worktree"]))
+        payload["runtime_version"] = "0.999.0"
+        result = _run_codex_apply_patch_adapter(payload, repo["root"], issue="942")
+        assert result.returncode == 2, result.stderr
+
+    def test_given_legacy_apply_patch_alias_when_adapter_runs_then_fail_closed(self, tmp_path: Path) -> None:
+        repo = _make_repo_with_worktree(tmp_path, issue="942", slug="x")
+        payload = _apply_patch_payload(_add_file_patch("foo.py"), cwd=str(repo["worktree"]))
+        payload["tool_name"] = "ApplyPatch"
+        result = _run_codex_apply_patch_adapter(payload, repo["root"], issue="942")
+        assert result.returncode == 2, result.stderr
+
 
 class TestEditWriteDelegation:
     """AC6: the same adapter script is wired to the `apply_patch|Edit|Write`
@@ -197,6 +211,26 @@ class TestMalformedPayload:
             capture_output=True,
             env=env,
         )
+        assert result.returncode == 2, result.stderr
+
+    def test_given_non_object_json_when_adapter_runs_then_fail_closed(self, tmp_path: Path) -> None:
+        import os
+        import subprocess
+
+        from worktree_scope_guard_testkit import CODEX_APPLY_PATCH_ADAPTER_PY
+
+        repo = _make_repo_with_worktree(tmp_path, issue="942", slug="x")
+        env = {**os.environ, "CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "942"}
+        result = subprocess.run(
+            ["python3", str(CODEX_APPLY_PATCH_ADAPTER_PY)], input="[]", text=True,
+            capture_output=True, env=env,
+        )
+        assert result.returncode == 2, result.stderr
+
+    def test_given_non_object_tool_input_when_adapter_runs_then_fail_closed(self, tmp_path: Path) -> None:
+        repo = _make_repo_with_worktree(tmp_path, issue="942", slug="x")
+        payload = {"tool_name": "apply_patch", "tool_input": [], "cwd": str(repo["worktree"])}
+        result = _run_codex_apply_patch_adapter(payload, repo["root"], issue="942")
         assert result.returncode == 2, result.stderr
 
 

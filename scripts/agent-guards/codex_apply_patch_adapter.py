@@ -43,6 +43,7 @@ Exit codes:
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 import re
 import sys
@@ -52,6 +53,10 @@ if _AGENT_GUARDS_DIR not in sys.path:
     sys.path.insert(0, _AGENT_GUARDS_DIR)
 
 import worktree_scope_guard as _wsg  # noqa: E402
+import worktree_policy_domain as _policy_domain  # noqa: E402
+
+_CODEX_VERSION = "0.145.0"
+_CODEX_CAPTURE_DIGEST = "sha256:c9de2e1296733b5600d5ef9cc9c2b56d51aafae15bc51d63d295c3155f02263c"
 
 # Codex apply_patch envelope headers. A `Move to:` header follows an
 # `Update File:` header when the patch renames a file; both the old
@@ -98,10 +103,15 @@ def _adapter_block(reason: str) -> None:
 def _decide_apply_patch(payload: dict) -> None:
     tool_input = payload.get("tool_input") or {}
     cwd = payload.get("cwd") or os.environ.get("PWD") or os.getcwd()
+    if not isinstance(tool_input, dict) or not isinstance(cwd, str) or not cwd:
+        _adapter_block("malformed apply_patch payload")
     command = tool_input.get("command")
 
     if not isinstance(command, str):
         _adapter_block("apply_patch tool_input.command is missing or not a string")
+    supplied_version = payload.get("runtime_version")
+    if supplied_version is not None and supplied_version != _CODEX_VERSION:
+        _adapter_block("unsupported Codex runtime version")
 
     try:
         targets = extract_target_paths(command)
@@ -114,31 +124,50 @@ def _decide_apply_patch(payload: dict) -> None:
     for target in targets:
         if "\x00" in target:
             _adapter_block(f"NUL byte in apply_patch target path: {target!r}")
-        if os.path.isabs(target):
+        if os.path.isabs(target) or ntpath.isabs(target):
             _adapter_block(f"absolute path not permitted in apply_patch target: {target}")
 
     project_root = _wsg.resolve_project_root()
     issue = _wsg.resolve_current_issue(cwd, project_root)
-
+    resolution = _wsg.resolve_expected_worktree(issue, project_root)
     if not issue:
-        # No active issue resolvable -> apply_patch is not scoped to a worktree.
-        _wsg._allow()
+        binding_state, expected = "verified_unbound", None
+    elif not resolution.git_available:
+        binding_state, expected = "resolution_failed", None
+    elif resolution.match_count == 0:
+        binding_state, expected = "unknown", None
+    elif resolution.expected is None:
+        binding_state, expected = "ambiguous", None
+    else:
+        binding_state, expected = "bound", resolution.expected
+
+    try:
+        # Layer 1-2: this adapter parses the vendor patch envelope and emits a
+        # normalized intent. Layer 3-5 below only receive domain contracts.
+        intent = _policy_domain.make_intent(
+            runtime="codex",
+            runtime_version=_CODEX_VERSION,
+            tool_identity="apply_patch",
+            canonical_identity="apply_patch",
+            mutation_kind="apply_patch",
+            target_paths=[os.path.realpath(os.path.join(cwd, target)) for target in targets],
+            path_flavor="posix",
+            capture_digest=_CODEX_CAPTURE_DIGEST,
+        )
+        binding = _policy_domain.make_binding(
+            state=binding_state,
+            expected_worktree=expected,
+            path_flavor="posix",
+            resolver_digest=_policy_domain.digest_for_resolver(binding_state, expected),
+        )
+        decision = _policy_domain.policy_decide(intent, binding)
+    except _policy_domain.ContractValidationError as exc:
+        _adapter_block(f"invalid normalized apply_patch contract: {exc}")
         return
 
-    resolution = _wsg.resolve_expected_worktree(issue, project_root)
-
-    if not resolution.git_available:
-        _wsg._block("<git-unavailable>", cwd)
-    if resolution.match_count == 0:
-        _wsg._block("<no-matching-worktree>", cwd)
-    if resolution.expected is None:
-        _wsg._block("<ambiguous>", cwd)
-
-    for target in targets:
-        if not _wsg.is_inside(resolution.expected, target, cwd):
-            _wsg._block(_wsg._rel(resolution.expected, project_root=project_root), cwd)
-
-    _wsg._allow()
+    if decision["decision"] == "allow":
+        _wsg._allow()
+    _wsg._block(_wsg._rel(expected, project_root=project_root) if expected else f"<{binding_state}>", cwd)
 
 
 def main() -> None:
@@ -149,10 +178,20 @@ def main() -> None:
         _adapter_block("malformed PreToolUse payload (JSON parse failure)")
         return
 
+    if not isinstance(payload, dict):
+        _adapter_block("malformed PreToolUse payload (object required)")
+        return
+
     tool_name = payload.get("tool_name")
 
     if tool_name == "apply_patch":
         _decide_apply_patch(payload)
+        return
+
+    # These names resemble the supported Codex identity but are not the
+    # version-validated canonical wire identity. Do not silently alias them.
+    if tool_name in {"ApplyPatch", "applyPatch"}:
+        _adapter_block("unsupported apply_patch tool identity")
         return
 
     # Edit / Write / anything else: delegate to the shared-core decision
