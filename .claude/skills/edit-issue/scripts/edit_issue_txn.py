@@ -137,6 +137,15 @@ def _validate_input_payload(data: dict[str, Any]) -> None:
         _require_closed_keys(title_update, TITLE_UPDATE_KEYS, "title_update")
         if not isinstance(title_update.get("required"), bool):
             raise ValueError("title_update_required_invalid")
+        if title_update["required"]:
+            proposed_title = title_update.get("proposed_title")
+            reason = title_update.get("reason")
+            if not isinstance(proposed_title, str) or not proposed_title.strip() or "\x00" in proposed_title or any(ord(char) < 32 for char in proposed_title):
+                raise ValueError("title_update_proposed_title_invalid")
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError("title_update_reason_invalid")
+        elif title_update.get("proposed_title") is not None or title_update.get("reason") is not None:
+            raise ValueError("title_update_not_required_fields_must_be_null")
 
     comment_mode = data.get("comment_mode", {"mode": "skip"})
     if not isinstance(comment_mode, dict):
@@ -413,33 +422,6 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
     _validate_input_payload(input_data)
     state = TxnState(issue_number=input_data["issue_number"], repo=input_data["repo"])
     title_update = input_data.get("title_update") or {"required": False}
-    if title_update.get("required"):
-        state.errors.append(
-            {
-                "code": "title_update_requested_without_controlled_title_executor",
-                "message": "v1 does not mutate title; no controlled title executor exists",
-            }
-        )
-        return _render_result(
-            status="failed_no_mutation",
-            issue_number=state.issue_number,
-            repo=state.repo,
-            mutation_started=False,
-            body_attempted=False,
-            body_status="not_run",
-            comment_attempted=False,
-            comment_status="not_run",
-            previous_body_sha256=None,
-            requested_new_body_sha256=None,
-            remote_current_body_sha256=None,
-            body_input_ref=None,
-            comment_input_ref=None,
-            comment_id=None,
-            comment_url=None,
-            comment_body_sha256=None,
-            errors=state.errors,
-        )
-
     readiness_result = input_data["readiness_forwarding_payload"]["readiness_result"]
     forwarded_status = readiness_result["status"]
     if forwarded_status in {"human_judgment", "input_or_runtime_error"}:
@@ -519,11 +501,14 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             errors=state.errors,
         )
 
+    current_title = issue_data.get("title", "")
     current_body = issue_data.get("body", "")
     current_updated_at = issue_data.get("updatedAt", "")
     current_sha = _sha256_text(current_body)
     state.previous_body_sha256 = current_sha
     state.remote_current_body_sha256 = current_sha
+    requested_title = title_update.get("proposed_title") if title_update.get("required") else current_title
+    operation_reason = title_update.get("reason") if title_update.get("required") else "issue_body_update"
     if (
         current_sha != input_data["expected_previous_body_sha256"]
         or current_updated_at != input_data["expected_previous_updated_at"]
@@ -558,7 +543,7 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
     requested_new_sha = _sha256_text(new_body)
     state.requested_new_body_sha256 = requested_new_sha
     comment_mode = input_data.get("comment_mode", {"mode": "skip"})
-    if requested_new_sha == current_sha and comment_mode.get("mode") == "publish":
+    if requested_new_sha == current_sha and requested_title == current_title and comment_mode.get("mode") == "publish":
         if not _run_comment_publish(state, comment_mode):
             return _render_result(
                 status="failed_after_mutation",
@@ -600,7 +585,7 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             errors=[],
         )
 
-    if requested_new_sha == current_sha and comment_mode.get("mode", "skip") == "skip":
+    if requested_new_sha == current_sha and requested_title == current_title and comment_mode.get("mode", "skip") == "skip":
         return _render_result(
             status="no_change",
             issue_number=state.issue_number,
@@ -712,26 +697,32 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             )
 
         body_input = {
-            "schema": "ISSUE_BODY_UPDATE_INPUT_V1",
+            "schema": "ISSUE_CONTENT_UPDATE_INPUT_V1",
             "issue_number": state.issue_number,
-            "previous_body_sha256": current_sha,
-            "previous_updated_at": current_updated_at,
+            "repo": state.repo,
+            "expected_previous_title": current_title,
+            "expected_previous_body_sha256": current_sha,
+            "expected_previous_updated_at": current_updated_at,
+            "new_title": requested_title,
             "new_body": mutated_candidate,
             "new_body_sha256": requested_new_sha,
+            "operation_reason": operation_reason,
+            "idempotency_key": f"{state.repo}:{state.issue_number}:{current_sha}:{requested_new_sha}:{requested_title}",
         }
-        state.body_input_ref = _write_issue_metadata_input(state.issue_number, "issue_body.update", body_input)
+        state.body_input_ref = _write_issue_metadata_input(state.issue_number, "issue_content.update", body_input)
         state.body_attempted = True
         body_cp, body_result = _invoke_controlled_exec(
-            "issue_body.update", state.issue_number, state.repo, state.body_input_ref
+            "issue_content.update", state.issue_number, state.repo, state.body_input_ref
         )
         if body_cp.returncode != 0:
             refreshed_issue, _ = _fetch_issue(state.issue_number, state.repo)
             refreshed_body = (refreshed_issue or {}).get("body", current_body)
+            refreshed_title = (refreshed_issue or {}).get("title", current_title)
             refreshed_sha = _sha256_text(refreshed_body)
             state.remote_current_body_sha256 = refreshed_sha
             state.body_status = "failed"
             state.errors.append(_child_error(body_cp, "issue_body_update_failed"))
-            if refreshed_sha == requested_new_sha:
+            if refreshed_sha == requested_new_sha and refreshed_title == requested_title:
                 state.mutation_started = True
                 return _render_result(
                     status="failed_after_mutation",
@@ -805,12 +796,13 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             )
 
         final_sha = _sha256_text(final_issue.get("body", ""))
+        final_title = final_issue.get("title", "")
         state.remote_current_body_sha256 = final_sha
-        if final_sha != requested_new_sha:
+        if final_sha != requested_new_sha or final_title != requested_title:
             state.errors.append(
                 {
-                    "code": "final_readback_body_sha_mismatch",
-                    "message": "controlled body update completed but final readback did not match requested body sha",
+                    "code": "final_readback_content_mismatch",
+                    "message": "controlled content update completed but final readback did not match requested title/body",
                 }
             )
             return _render_result(

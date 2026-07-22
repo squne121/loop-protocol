@@ -9,7 +9,7 @@ description: 既存 GitHub Issue 本文更新を transaction helper に集約す
 `.claude/skills/edit-issue/scripts/edit_issue_txn.py` に集約する。
 呼び出し側は candidate body と readiness context を用意し、helper が返す
 JSON result を次のルーティング判断に使う。本文の書き戻し authority は
-`issue_body.update` / `issue_comment.publish` の controlled executor command id
+`issue_content.update` / `issue_comment.publish` の controlled executor command id
 だけに限定する。
 
 ## 依存ポリシー
@@ -31,7 +31,7 @@ dependency_policy:
 - `readiness_forwarding_payload`（必須）: `READINESS_FORWARDING_PAYLOAD_V1`
 - `new_body_file`（必須）: candidate issue body を保存した repo-relative file
 - `comment_mode`（任意）: success comment を controlled publish するかどうかの指定
-- `title_update`（任意）: v1 では `required: true` を受け取っても no-mutation fail にする
+- `title_update`（任意）: `required: true` のとき non-empty の `proposed_title` と `reason` を必須とし、title/body を `issue_content.update` の単一 PATCH で更新する
 
 `READINESS_FORWARDING_PAYLOAD_V1.readiness_result.status` は
 `status: go | needs_fix | human_judgment | input_or_runtime_error`
@@ -79,7 +79,7 @@ dependency_policy:
 
 - `reviewer_feedback_url` / `reviewer_feedback_text` と `readiness_forwarding_payload` を使って candidate body を生成する
 - candidate body は repo-relative file に保存する
-- `title_update.required == true` が必要なら本文修正ではなく別ルーティングに分岐する
+- `title_update.required == true` のときは current title、current body hash、current updatedAt を同一 pre-readback に束縛する。title-only は candidate body に current body を渡す。
 - body authoring rule は [`../create-issue/references/body-authoring.md`](../create-issue/references/body-authoring.md) を参照する
 
 ### 2. helper を起動する
@@ -97,17 +97,16 @@ helper は以下の固定順序で進む。
 4. guard を実行する
 5. hygiene autofix を適用する
 6. static readiness check を実行する
-7. `issue_body.update` 用 input file を生成する
-8. controlled body update を実行する
-9. final readback を確認する
+7. `issue_content.update` 用 input file を生成する
+8. title/body を固定 endpoint の単一 PATCH で更新する
+9. title と body の final readback を確認する
 10. 必要な場合だけ `issue_comment.publish` を実行する
 11. bounded result を出力する
 
 ### 3. 失敗時ルーティング
 
-- `title_update.required == true` の場合 → `failed_no_mutation`
 - stale precondition / guard / readiness が失敗した場合 → `failed_no_mutation`
-- body update 後に final readback が失敗した場合 → `failed_after_mutation`
+- content update 後に title/body final readback が失敗した場合 → `failed_after_mutation`
 - body update 成功後に comment publish が失敗した場合 → `failed_after_mutation`
 - `readiness_forwarding_payload.readiness_result.status` が `human_judgment` または `input_or_runtime_error` → `human_judgment`
 
@@ -119,7 +118,7 @@ helper stdout は最後の 1 JSON object のみとし、old/new issue body や c
 ## ガードレール
 
 - existing issue body/comment mutation の本番経路は `edit_issue_txn.py` 経由に限定する
-- helper は `issue_body.update` / `issue_comment.publish` 以外の mutation command id を使わない
-- `title_update` は v1 scope 外。controlled title executor が無い限り no-mutation fail にする
+- helper は `issue_content.update` / `issue_comment.publish` 以外の mutation command id を使わない
+- `issue_content.update` は title/body だけを固定 endpoint へ一度だけ PATCH し、曖昧な PATCH failure は remote readback で `already_applied` または失敗に分類する。自動再試行・rollback・CAS は行わない
 - executor input は `artifacts/{issue_number}/issue-metadata/{command-id}/` 配下だけに生成する
 - helper は `capture_output=True, text=True, shell=False` で子プロセスを起動し、bounded diagnostics だけを result に残す

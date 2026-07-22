@@ -30,6 +30,7 @@ TRUSTED_REPO = "squne121/loop-protocol"
 EXECUTOR_SCRIPT = "scripts/agent-guards/controlled_skill_mutation_exec.py"
 COMMAND_ID_PUBLISH = "termination_report.publish"
 COMMAND_ID_ISSUE_BODY_UPDATE = "issue_body.update"
+COMMAND_ID_ISSUE_CONTENT_UPDATE = "issue_content.update"
 COMMAND_ID_ISSUE_COMMENT_PUBLISH = "issue_comment.publish"
 COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH = "contract_snapshot.publish"
 # Issue #1536: controlled review publisher. `--issue-number` is reused as the
@@ -232,6 +233,7 @@ ISSUE_METADATA_NAMESPACE_SEGMENT = "issue-metadata"
 INPUT_SCHEMA_BY_COMMAND: dict = {
     COMMAND_ID_PUBLISH: "TERMINATION_REPORT_INPUT_V1",
     COMMAND_ID_ISSUE_BODY_UPDATE: "ISSUE_BODY_UPDATE_INPUT_V1",
+    COMMAND_ID_ISSUE_CONTENT_UPDATE: "ISSUE_CONTENT_UPDATE_INPUT_V1",
     COMMAND_ID_ISSUE_COMMENT_PUBLISH: "ISSUE_COMMENT_PUBLISH_INPUT_V1",
     COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH: "CONTRACT_SNAPSHOT_PUBLISH_INPUT_V1",
     COMMAND_ID_PR_REVIEW_PUBLISH: "PR_REVIEW_PUBLISH_REQUEST_V1",
@@ -339,6 +341,44 @@ CONTROLLED_SKILL_MUTATION_COMMAND_POLICY: dict = {
                 f"{COMMAND_ID_ISSUE_BODY_UPDATE}/issue_body_update.marker.json"
             ),
             "marker_field": "new_body_sha256",
+        },
+        "env_sanitize": ENV_SANITIZE_KEYS,
+    },
+    COMMAND_ID_ISSUE_CONTENT_UPDATE: {
+        "command_id": COMMAND_ID_ISSUE_CONTENT_UPDATE,
+        "description": "Update GitHub issue title and body in one fixed PATCH with readback",
+        "executor_script": EXECUTOR_SCRIPT,
+        "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+        "input_namespace": (
+            f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{COMMAND_ID_ISSUE_CONTENT_UPDATE}/"
+        ),
+        "input_schema": INPUT_SCHEMA_BY_COMMAND[COMMAND_ID_ISSUE_CONTENT_UPDATE],
+        "github_mutation": {
+            "edit_issue_title_and_body": True,
+            "requires_repo": TRUSTED_REPO,
+            "requires_explicit_repo_flag": True,
+            "fixed_endpoint": "repos/{repo}/issues/{issue_number}",
+            "fixed_fields": ["title", "body"],
+        },
+        "precondition": {
+            "previous_title_must_match_readback": True,
+            "previous_body_sha256_must_match_readback": True,
+            "previous_updated_at_must_match_readback": True,
+        },
+        "postcondition": {
+            "no_tracked_source_changes": True,
+            "no_lockfile_changes": True,
+            "no_settings_changes": True,
+            "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+            "new_title_must_match_readback": True,
+            "new_body_sha256_must_match_readback": True,
+        },
+        "idempotency": {
+            "marker_file_pattern": (
+                f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/"
+                f"{COMMAND_ID_ISSUE_CONTENT_UPDATE}/issue_content_update.marker.json"
+            ),
+            "marker_field": "idempotency_key",
         },
         "env_sanitize": ENV_SANITIZE_KEYS,
     },

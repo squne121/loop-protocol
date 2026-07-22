@@ -7,8 +7,9 @@ Invoked by agents via the exact argv form defined in controlled_skill_mutation_p
 
 Design: Direct script allow for publish_termination_report.py / ensure_contract_snapshot.py
 is denied. Only this executor is allow-listed in settings.json. It handles four
-command ids: termination_report.publish (legacy, Issue #1166), and issue_body.update /
-issue_comment.publish / contract_snapshot.publish (Issue #1284 issue metadata mutation
+command ids: termination_report.publish (legacy, Issue #1166), issue_body.update /
+issue_content.update / issue_comment.publish / contract_snapshot.publish (Issue #1284
+issue metadata mutation
 lane). The executor enforces:
   - command_id whitelist (ALL_COMMAND_IDS)
   - repo binding (--repo must be TRUSTED_REPO)
@@ -78,9 +79,10 @@ _PROSE_BOUNDARY_REL = (
 # -- Import shared policy ------------------------------------------------------
 
 sys.path.insert(0, str(_THIS_FILE.parent))
-from controlled_skill_mutation_policy import (
+from controlled_skill_mutation_policy import (  # noqa: E402
     COMMAND_ID_PUBLISH,
     COMMAND_ID_ISSUE_BODY_UPDATE,
+    COMMAND_ID_ISSUE_CONTENT_UPDATE,
     COMMAND_ID_ISSUE_COMMENT_PUBLISH,
     COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
     COMMAND_ID_PR_REVIEW_PUBLISH,
@@ -512,6 +514,39 @@ def _validate_issue_body_update_fields(data: dict) -> str:
     return ""
 
 
+_ISSUE_CONTENT_UPDATE_ALLOWED_KEYS = frozenset({
+    "schema", "issue_number", "repo", "expected_previous_title",
+    "expected_previous_body_sha256", "expected_previous_updated_at",
+    "new_title", "new_body", "new_body_sha256", "operation_reason",
+    "idempotency_key",
+})
+
+
+def _validate_issue_content_update_fields(data: dict, repo: str, issue_number: int) -> str:
+    unknown_keys = set(data) - _ISSUE_CONTENT_UPDATE_ALLOWED_KEYS
+    if unknown_keys:
+        return f"issue_content_update_unknown_fields: {sorted(unknown_keys)}"
+    if data.get("repo") != repo:
+        return "issue_content_update_repo_mismatch"
+    if data.get("issue_number") != issue_number:
+        return "issue_content_update_issue_number_mismatch"
+    for field in (
+        "expected_previous_title", "expected_previous_body_sha256",
+        "expected_previous_updated_at", "new_title", "new_body",
+        "new_body_sha256", "operation_reason", "idempotency_key",
+    ):
+        if not isinstance(data.get(field), str) or not data[field]:
+            return f"issue_content_update_field_invalid: {field!r}"
+    for field in ("expected_previous_title", "new_title"):
+        value = data[field]
+        if not value.strip() or "\x00" in value or any(ord(char) < 32 for char in value):
+            return f"issue_content_update_title_invalid: {field!r}"
+    computed = "sha256:" + hashlib.sha256(data["new_body"].encode("utf-8")).hexdigest()
+    if computed != data["new_body_sha256"]:
+        return "issue_content_update_new_body_sha256_mismatch"
+    return ""
+
+
 def _validate_issue_comment_publish_fields(data: dict) -> str:
     for field in ("comment_body", "marker"):
         val = data.get(field)
@@ -777,6 +812,35 @@ def _classify_gh_error(prefix: str, stderr: str) -> str:
 # -- Issue #1284: issue body / comment mutation helpers ------------------------
 
 
+def _fetch_issue_content(
+    issue_number: int, repo: str, gh_bin: str
+) -> tuple[dict | None, str]:
+    """Read the fixed Issue endpoint without inheriting caller gh settings."""
+    try:
+        out = subprocess.run(
+            [
+                gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST,
+                f"repos/{repo}/issues/{issue_number}",
+                "--jq", "{title, body, updatedAt: .updated_at}",
+            ],
+            capture_output=True, text=True, timeout=15, shell=False,
+            env=_build_metadata_sanitized_env(),
+        )
+        if out.returncode != 0:
+            return None, f"gh_issue_fetch_failed_rc_{out.returncode}"
+        data = json.loads(out.stdout)
+        if not isinstance(data, dict) or not isinstance(data.get("body"), str) or not isinstance(data.get("updatedAt"), str):
+            return None, "gh_issue_fetch_schema_invalid"
+        # Existing body-only consumers use the same fixed endpoint but do not
+        # require a title fixture. ``issue_content.update`` enforces title
+        # presence at its own pre/postcondition boundary.
+        if "title" not in data:
+            data["title"] = None
+        return data, ""
+    except Exception as exc:
+        return None, f"gh_issue_fetch_exception: {exc}"
+
+
 def _fetch_issue_body_and_updated_at(
     issue_number: int, repo: str, gh_bin: str
 ) -> tuple[str | None, str | None, str]:
@@ -790,13 +854,9 @@ def _fetch_issue_body_and_updated_at(
     try:
         out = subprocess.run(
             [
-                gh_bin,
-                "api",
-                "--hostname",
-                _TRUSTED_GITHUB_HOST,
+                gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST,
                 f"repos/{repo}/issues/{issue_number}",
-                "--jq",
-                "{body, updatedAt: .updated_at}",
+                "--jq", "{body, updatedAt: .updated_at}",
             ],
             capture_output=True, text=True, timeout=15, shell=False,
             env=_build_metadata_sanitized_env(),
@@ -827,6 +887,36 @@ def _patch_issue_body(
                  f"repos/{repo}/issues/{issue_number}",
                  "--field", f"body=@{tmp_path}"],
                 capture_output=True, text=True, timeout=15, shell=False,
+            )
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        if out.returncode != 0:
+            return _classify_gh_error("gh_api_patch_failed", out.stderr or "")
+        return ""
+    except Exception as exc:
+        return f"gh_api_patch_exception: {exc}"
+
+
+def _patch_issue_content(issue_number: int, repo: str, title: str, body: str, gh_bin: str) -> str:
+    """Send title and body in exactly one fixed REST PATCH request."""
+    import tempfile
+
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as tmp:
+            tmp.write(body)
+            tmp_path = tmp.name
+        try:
+            out = subprocess.run(
+                [
+                    gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST,
+                    "--method", "PATCH", f"repos/{repo}/issues/{issue_number}",
+                    "--field", f"title={title}", "--field", f"body=@{tmp_path}",
+                ],
+                capture_output=True, text=True, timeout=15, shell=False,
+                env=_build_metadata_sanitized_env(),
             )
         finally:
             try:
@@ -1096,6 +1186,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_termination_report_publish(args, canonical_input, gh_bin, _fail, _ok)
     if args.command_id == COMMAND_ID_ISSUE_BODY_UPDATE:
         return _run_issue_body_update(args, input_data, gh_bin, _fail, _ok)
+    if args.command_id == COMMAND_ID_ISSUE_CONTENT_UPDATE:
+        return _run_issue_content_update(args, input_data, gh_bin, _fail, _ok)
     if args.command_id == COMMAND_ID_ISSUE_COMMENT_PUBLISH:
         return _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail, _ok)
     if args.command_id == COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH:
@@ -1357,6 +1449,90 @@ def _run_issue_body_update(args, input_data, gh_bin, _fail, _ok) -> int:
         "new_body_sha256": actual_new_sha256,
         "idempotency_marker_written": True,
         "marker_state": marker_state,
+    })
+
+
+def _run_issue_content_update(args, input_data, gh_bin, _fail, _ok) -> int:
+    """Execute the closed title/body update contract without retrying PATCH."""
+    field_err = _validate_issue_content_update_fields(input_data, args.repo, args.issue_number)
+    if field_err:
+        return _fail(field_err)
+
+    if args.dry_run:
+        return _ok({"status_detail": "dry_run_ok", "command_id": args.command_id})
+
+    marker_path = _issue_metadata_marker_path(
+        PROJECT_ROOT, args.issue_number, args.command_id, "issue_content_update.marker.json"
+    )
+    write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
+    marker_data = None
+    if marker_path.exists():
+        try:
+            marker_data = json.loads(marker_path.read_text(encoding="utf-8"))
+        except Exception:
+            return _fail("issue_content_update_marker_corrupt")
+        if marker_data.get("issue_number") != args.issue_number or marker_data.get("repo") != args.repo:
+            return _fail("issue_content_update_marker_metadata_mismatch")
+
+    before, err = _fetch_issue_content(args.issue_number, args.repo, gh_bin)
+    if before is None:
+        return _fail(err, status="failed")
+    if not isinstance(before.get("title"), str):
+        return _fail("gh_issue_fetch_schema_invalid", status="failed")
+    current_body_sha256 = "sha256:" + hashlib.sha256(before["body"].encode("utf-8")).hexdigest()
+    if marker_data is not None and before["title"] == input_data["new_title"] and current_body_sha256 == input_data["new_body_sha256"]:
+        return _ok({
+            "status_detail": "already_applied",
+            "idempotency_marker_found": True,
+            "new_body_sha256": current_body_sha256,
+        })
+    if before["title"] != input_data["expected_previous_title"]:
+        return _fail("stale_precondition_title_mismatch", status="failed")
+    if current_body_sha256 != input_data["expected_previous_body_sha256"]:
+        return _fail("stale_precondition_body_sha256_mismatch", status="failed")
+    if before["updatedAt"] != input_data["expected_previous_updated_at"]:
+        return _fail("stale_precondition_updated_at_mismatch", status="failed")
+
+    patch_err = _patch_issue_content(
+        args.issue_number, args.repo, input_data["new_title"], input_data["new_body"], gh_bin
+    )
+    if patch_err:
+        # PATCH timeout/transport ambiguity is read back once. Never retry PATCH.
+        after_ambiguous, after_err = _fetch_issue_content(args.issue_number, args.repo, gh_bin)
+        if after_ambiguous is not None:
+            body_sha = "sha256:" + hashlib.sha256(after_ambiguous["body"].encode("utf-8")).hexdigest()
+            if after_ambiguous["title"] == input_data["new_title"] and body_sha == input_data["new_body_sha256"]:
+                return _ok({"status_detail": "already_applied", "new_body_sha256": body_sha})
+        return _fail(patch_err if not after_err else f"{patch_err}; readback={after_err}", status="failed")
+
+    after, err = _fetch_issue_content(args.issue_number, args.repo, gh_bin)
+    if after is None:
+        return _fail(err, status="failed")
+    if not isinstance(after.get("title"), str):
+        return _fail("gh_issue_fetch_schema_invalid", status="failed")
+    actual_new_body_sha256 = "sha256:" + hashlib.sha256(after["body"].encode("utf-8")).hexdigest()
+    if after["title"] != input_data["new_title"]:
+        return _fail("postcondition_new_title_mismatch", status="failed")
+    if actual_new_body_sha256 != input_data["new_body_sha256"]:
+        return _fail("postcondition_new_body_sha256_mismatch", status="failed")
+    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+    if changed:
+        return _fail("postcondition_tracked_changes_detected", status="failed")
+
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(json.dumps({
+        "schema": "ISSUE_CONTENT_UPDATE_MARKER_V1",
+        "issue_number": args.issue_number,
+        "repo": args.repo,
+        "idempotency_key": input_data["idempotency_key"],
+        "new_title": input_data["new_title"],
+        "new_body_sha256": actual_new_body_sha256,
+        "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }, ensure_ascii=False, indent=2))
+    return _ok({
+        "new_title": input_data["new_title"],
+        "new_body_sha256": actual_new_body_sha256,
+        "idempotency_marker_written": True,
     })
 
 
