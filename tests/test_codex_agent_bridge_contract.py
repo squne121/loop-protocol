@@ -118,6 +118,33 @@ def test_negative_guard_text_present():
     assert ".codex/skills: must not exist as a repo-shared skill surface" in text
 
 
+def test_codex_scope_rollup_runner_dispatch_contract():
+    validator = (REPO_ROOT / "scripts" / "check_impl_review_loop_codex_dispatch.py").read_text(encoding="utf-8")
+    preparation = (REPO_ROOT / ".claude" / "skills" / "impl-review-loop" / "steps" / "preparation.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert '".claude/skills/impl-review-loop/steps/preparation.md": "scope-rollup-runner"' in validator
+    assert "Codex CLI: spawn the custom agent named scope-rollup-runner for this step; the root thread must not" in preparation
+    assert "generic/default/worker fallback" in preparation
+    assert ".codex/agents/scope-rollup-runner.toml" in preparation
+
+
+def test_scope_rollup_runner_parity_excludes_permission_profile_but_checks_contracts():
+    result = subprocess.run(
+        [sys.executable, "scripts/check_claude_codex_agent_parity.py", "--strict"],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "agent: scope-rollup-runner" in result.stdout
+    assert "claude.permissionMode=auto" in result.stdout
+    assert "MUTATION_BOUNDARY:" in result.stdout
+
+
 def _copy_fixture_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -259,7 +286,7 @@ def test_js_cli_passes_on_fixture_repo(tmp_path: Path):
     repo = _copy_fixture_repo(tmp_path)
     result = _run_js_validator(repo)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "ok 13 agents validated" in result.stdout
+    assert "ok 14 agents validated" in result.stdout
 
 
 def test_js_cli_detects_missing_marker_via_subprocess(tmp_path: Path):

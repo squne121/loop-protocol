@@ -25,6 +25,8 @@ created: "2026-05-24"
 
 ### Codex SubagentStop における scope-rollup capture の記録（#1527、Scope Delta (2)）
 
+Codex native agent registry の `scope-rollup-runner` dispatch source は `.codex/agents/scope-rollup-runner.toml` とする。これは named agent identity を capture producer の `agent_type: scope-rollup-runner` と整合させるための registry 定義であり、hook trust / runtime-active state の証跡ではない。generic/default/worker fallback は capture target として認めない。
+
 Codex の `SubagentStop` では、adapter は capture policy の適用と subprocess transport
 だけを担当し、canonical artifact の decision authority は既存
 `.claude/hooks/capture_scope_rollup_final_response.py` とする。adapter は marker parse、

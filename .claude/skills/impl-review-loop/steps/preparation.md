@@ -389,6 +389,8 @@ REQUESTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 **2. `scope-rollup-runner` を起動する**（`.claude/agents/scope-rollup-runner.md` 定義に従う）:
 
+**Codex custom named agent dispatch**: Codex CLI: spawn the custom agent named scope-rollup-runner for this step; the root thread must not use a generic/default/worker fallback. Codex は `.codex/agents/scope-rollup-runner.toml` を dispatch source とし、Claude source と混在させない。runner は nested delegation を行わず、exact executor 以外の mutation を行わない。
+
 以下の入力を渡して起動する:
 
 ```yaml

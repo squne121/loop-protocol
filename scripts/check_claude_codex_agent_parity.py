@@ -23,7 +23,7 @@ EXPECTATION_PATH = REPO_ROOT / "tests/fixtures/codex-agent-config/expected-runti
 CODEX_CONFIG_PATH = REPO_ROOT / ".codex/config.toml"
 
 # Agents in scope for parity check (issue-reviewer and issue-author)
-PARITY_AGENTS = {"issue-reviewer", "issue-author"}
+PARITY_AGENTS = {"issue-reviewer", "issue-author", "scope-rollup-runner"}
 CODEX_ONLY_ALLOWED_AGENTS = {"spark-skim", "spark-worker", "spark-deep"}
 CODEX_ONLY_PARITY_REASON = "manual_codex_spark_agent"
 CODEX_ONLY_MODEL = "gpt-5.3-codex-spark"
@@ -149,6 +149,10 @@ def is_codex_only_parity(expected: dict) -> bool:
     return expected.get("parity_mode") == "codex_only"
 
 
+def excludes_permission_parity(expected: dict) -> bool:
+    return expected.get("permission_parity") == "excluded"
+
+
 def validate_codex_only_expectation(agent_name: str, expected: dict) -> list[str]:
     failures: list[str] = []
     if agent_name not in CODEX_ONLY_ALLOWED_AGENTS:
@@ -241,6 +245,13 @@ def extract_final_output_schema_from_claude(text: str) -> str | None:
     m = re.search(r"emit\s+[`']?([A-Z][A-Z0-9_]+_V\d+)[`']?\s+via", text)
     if m:
         return m.group(1)
+    m = re.search(
+        r"最終応答の唯一の fenced YAML block.*?```yaml\s*\n([A-Z][A-Z0-9_]+_V\d+):",
+        text,
+        re.DOTALL,
+    )
+    if m:
+        return m.group(1)
     return None
 
 
@@ -330,6 +341,9 @@ def extract_claude_facts(
     permission_mode = str(fm.get("permissionMode", ""))
     facts.declared_permission = f"claude.permissionMode={permission_mode}"
     facts.mutation_boundary = CLAUDE_PERMISSION_LEVEL_MAP.get(permission_mode, "unknown")
+    if agent_name == "scope-rollup-runner":
+        readonly_contract = "GitHub への書き込み / repo への書き込みは一切行わない。read-only 実行のみ。"
+        facts.mutation_boundary = "readonly" if readonly_contract in claude_text else "unknown"
 
     # B7: store raw tools lists
     disallowed = fm.get("disallowedTools", [])
@@ -439,6 +453,8 @@ def compare_parity(
     codex_path: Path,
     claude_facts: AgentParityFacts,
     codex_facts: AgentParityFacts,
+    *,
+    compare_permission: bool = True,
 ) -> list[DriftEvidence]:
     """Compare Claude and Codex facts and return list of drift evidence.
 
@@ -472,7 +488,7 @@ def compare_parity(
     # --- Permission parity (AC2, AC8) ---
     c_boundary = claude_facts.mutation_boundary
     x_boundary = codex_facts.mutation_boundary
-    if c_boundary != x_boundary:
+    if compare_permission and c_boundary != x_boundary:
         claude_text = claude_path.read_text(encoding="utf-8")
         line = find_line_number(claude_text, "permissionMode")
         drifts.append(DriftEvidence(
@@ -750,14 +766,15 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if not codex_only:
-            permission_expected = "acceptEdits" if expected["default_permissions"] == "loop-protocol-rtk" else "dontAsk"
-            if agent_name == "post-merge-cleanup-worker":
-                permission_expected = "default"
-            if claude_frontmatter.get("permissionMode") != permission_expected:
-                failures.append(
-                    f"{expected['claude_agent_path']}: permissionMode must match"
-                    f" Codex permission profile {expected['default_permissions']}"
-                )
+            if not excludes_permission_parity(expected):
+                permission_expected = "acceptEdits" if expected["default_permissions"] == "loop-protocol-rtk" else "dontAsk"
+                if agent_name == "post-merge-cleanup-worker":
+                    permission_expected = "default"
+                if claude_frontmatter.get("permissionMode") != permission_expected:
+                    failures.append(
+                        f"{expected['claude_agent_path']}: permissionMode must match"
+                        f" Codex permission profile {expected['default_permissions']}"
+                    )
 
     # --- Extended parity checks for PARITY_AGENTS ---
     for agent_name in PARITY_AGENTS:
@@ -777,7 +794,14 @@ def main(argv: list[str] | None = None) -> int:
         claude_facts = extract_claude_facts(agent_name, claude_path, claude_text)
         codex_facts = extract_codex_facts(agent_name, codex_path, codex_doc)
 
-        drifts = compare_parity(agent_name, claude_path, codex_path, claude_facts, codex_facts)
+        drifts = compare_parity(
+            agent_name,
+            claude_path,
+            codex_path,
+            claude_facts,
+            codex_facts,
+            compare_permission=not excludes_permission_parity(expected),
+        )
         all_drifts.extend(drifts)
 
         permission_reports.append(build_permission_report(agent_name, claude_facts, codex_facts))
