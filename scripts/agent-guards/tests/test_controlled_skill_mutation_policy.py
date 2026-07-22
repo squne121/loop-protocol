@@ -23,9 +23,10 @@ _GUARDS_DIR = Path(__file__).resolve().parent.parent
 if str(_GUARDS_DIR) not in sys.path:
     sys.path.insert(0, str(_GUARDS_DIR))
 
-from controlled_skill_mutation_policy import (
+from controlled_skill_mutation_policy import (  # noqa: E402
     ALLOWED_WRITE_ROOTS,
     COMMAND_ID_PUBLISH,
+    COMMAND_ID_ISSUE_CONTENT_UPDATE,
     COMMAND_ID_ISSUE_DEPENDENCY_REMOVE,
     COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
     CONTROLLED_SKILL_MUTATION_COMMAND_POLICY,
@@ -130,14 +131,15 @@ class TestRegistryScope:
 
     def test_only_known_command_ids(self):
         # Issue #1284 extends the shared registry with issue metadata mutation
-        # command ids (issue_body.update / issue_comment.publish /
-        # contract_snapshot.publish). Issue #1536 adds pr_review.publish
+        # command ids (issue_body.update / issue_content.update /
+        # issue_comment.publish / contract_snapshot.publish). Issue #1536 adds pr_review.publish
         # (Option C controlled review publisher). This scope-pin is updated
         # deliberately as part of each Issue's explicit In Scope registry
         # extension.
         known_ids = {
             COMMAND_ID_PUBLISH,
             "issue_body.update",
+            COMMAND_ID_ISSUE_CONTENT_UPDATE,
             "issue_comment.publish",
             "contract_snapshot.publish",
             "pr_review.publish",
