@@ -759,13 +759,22 @@ def _normalize_inventory_node(kind: str, node: dict[str, Any]) -> dict[str, Any]
         "url": node["url"],
     }
     if kind == "issue":
-        result["stateReason"] = node.get("stateReason")
+        state_reason = node.get("stateReason")
+        if "stateReason" not in node or (state_reason is not None and not isinstance(state_reason, str)):
+            raise ScopeRollupPreflightError("inventory_schema_mismatch")
+        result["stateReason"] = state_reason
         return result
     if not isinstance(node.get("changedFiles"), int):
         raise ScopeRollupPreflightError("inventory_schema_mismatch")
     files = node.get("files")
     file_nodes = files.get("nodes") if isinstance(files, dict) else None
-    if not isinstance(file_nodes, list):
+    file_page_info = files.get("pageInfo") if isinstance(files, dict) else None
+    if not isinstance(file_nodes, list) or not isinstance(file_page_info, dict):
+        raise ScopeRollupPreflightError("inventory_schema_mismatch")
+    if not isinstance(file_page_info.get("hasNextPage"), bool):
+        raise ScopeRollupPreflightError("inventory_schema_mismatch")
+    file_end_cursor = file_page_info.get("endCursor")
+    if file_page_info["hasNextPage"] and (not isinstance(file_end_cursor, str) or not file_end_cursor):
         raise ScopeRollupPreflightError("inventory_schema_mismatch")
     if any(not isinstance(file, dict) or not isinstance(file.get("path"), str) for file in file_nodes):
         raise ScopeRollupPreflightError("inventory_schema_mismatch")

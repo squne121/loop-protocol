@@ -44,6 +44,8 @@ BUDGET_FIELDS = {
     "deadline_seconds",
 }
 
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
 FENCED_YAML_RE = re.compile(r"```ya?ml[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
 
@@ -169,28 +171,73 @@ def _has_valid_completeness_contract(inputs: Any) -> bool:
     # Marker schema v3 predates inventory projection schema v4.  Accept the
     # historical v3 projection and the current v4 projection, but never an
     # absent or unknown query schema version.
-    if not isinstance(inputs, dict) or inputs.get("query_schema_version") not in {3, 4}:
+    if not isinstance(inputs, dict):
         return False
+
+    query_schema_version = inputs.get("query_schema_version")
+    if type(query_schema_version) is not int or query_schema_version not in {3, 4}:
+        return False
+
+    def is_non_negative_int(value: Any) -> bool:
+        return type(value) is int and value >= 0
+
+    def is_sha256(value: Any) -> bool:
+        return isinstance(value, str) and _SHA256_RE.fullmatch(value) is not None
+
+    # These aliases are part of the marker's signed producer/consumer
+    # contract.  They must be present and match the canonical completeness
+    # blocks below; accepting an independently shaped alias silently permits
+    # a runner to describe a different inventory from the one it hashed.
+    for key in ("current_issue_sha256", "issues_all_sha256", "prs_all_sha256"):
+        if not is_sha256(inputs.get(key)):
+            return False
+    if not is_non_negative_int(inputs.get("issue_count")) or not is_non_negative_int(inputs.get("pr_count")):
+        return False
+
+    completeness_blocks: dict[str, dict[str, Any]] = {}
     for key in ("issues_completeness", "pull_requests_completeness"):
         block = inputs.get(key)
         if not isinstance(block, dict) or not COMPLETENESS_FIELDS.issubset(block):
             return False
         if (
-            not isinstance(block["page_count"], int)
+            type(block["page_count"]) is not int
             or block["page_count"] < 1
-            or not isinstance(block["item_count"], int)
+            or not is_non_negative_int(block["item_count"])
+            or not is_non_negative_int(block["total_count"])
             or block["item_count"] < 0
-            or not isinstance(block["total_count"], int)
             or block["total_count"] != block["item_count"]
             or block["pagination_complete"] is not True
-            or not isinstance(block["sha256"], str)
-            or not re.fullmatch(r"[0-9a-f]{64}", block["sha256"])
+            or not is_sha256(block["sha256"])
         ):
             return False
+        completeness_blocks[key] = block
+
+    if (
+        inputs["issue_count"] != completeness_blocks["issues_completeness"]["item_count"]
+        or inputs["pr_count"] != completeness_blocks["pull_requests_completeness"]["item_count"]
+        or inputs["issues_all_sha256"] != completeness_blocks["issues_completeness"]["sha256"]
+        or inputs["prs_all_sha256"] != completeness_blocks["pull_requests_completeness"]["sha256"]
+    ):
+        return False
+
     budget = inputs.get("transaction_budget")
     if not isinstance(budget, dict) or not BUDGET_FIELDS.issubset(budget):
         return False
-    return all(isinstance(budget[key], (int, float)) and not isinstance(budget[key], bool) for key in BUDGET_FIELDS)
+    integer_budget_fields = BUDGET_FIELDS - {"deadline_seconds"}
+    if any(not is_non_negative_int(budget[key]) for key in integer_budget_fields):
+        return False
+    deadline_seconds = budget["deadline_seconds"]
+    if (
+        not isinstance(deadline_seconds, (int, float))
+        or isinstance(deadline_seconds, bool)
+        or deadline_seconds <= 0
+    ):
+        return False
+    return (
+        budget["page_count"] <= budget["max_transaction_pages"]
+        and budget["response_bytes"] <= budget["max_response_bytes"]
+        and budget["inventory_items"] <= budget["max_inventory_items"]
+    )
 
 
 def _validate_marker_payload(

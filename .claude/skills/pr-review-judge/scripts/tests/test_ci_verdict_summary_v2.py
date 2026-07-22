@@ -197,6 +197,7 @@ class TestAC10EnumExhaustiveness:
             make_check("build", conclusion="success"),
             make_check("e2e", conclusion="success"),
             make_check("python-test", conclusion="success"),
+            make_check("node-backed-hook-tests", conclusion="success"),
             make_check("actionlint", conclusion="success"),
         ]
         artifact = build(v2, checks)
@@ -434,7 +435,7 @@ class TestB3NoRequiredEvidence:
         assert len(v2.REQUIRED_CHECKS) > 0
 
     def test_required_checks_contains_all_ci_jobs(self, v2):
-        """REQUIRED_CHECKS must include all 7 ci.yml required/evidence jobs."""
+        """REQUIRED_CHECKS must include all 8 ci.yml upstream evidence jobs."""
         expected = {
             ("ci", "typecheck"),
             ("ci", "lint"),
@@ -442,6 +443,7 @@ class TestB3NoRequiredEvidence:
             ("ci", "build"),
             ("ci", "e2e"),
             ("ci", "python-test"),
+            ("ci", "node-backed-hook-tests"),
             ("ci", "actionlint"),
         }
         assert expected.issubset(v2.REQUIRED_CHECKS)
@@ -455,6 +457,7 @@ class TestB3NoRequiredEvidence:
             make_check("build", conclusion="success"),
             make_check("e2e", conclusion="success"),
             make_check("python-test", conclusion="success"),
+            make_check("node-backed-hook-tests", conclusion="success"),
             make_check("actionlint", conclusion="success"),
         ]
         artifact = build(v2, checks)
@@ -470,6 +473,7 @@ class TestB3NoRequiredEvidence:
             make_check("build", conclusion="success"),
             make_check("e2e", conclusion="success"),
             make_check("python-test", conclusion="success"),
+            make_check("node-backed-hook-tests", conclusion="success"),
             # actionlint missing
         ]
         artifact = build(v2, checks)
@@ -581,6 +585,59 @@ class TestB1B2NeedsResultSynthetic:
         entry = v2.build_check_entry(raw, "ci", EXPECTED_SHA)
         assert entry["blocking_merge_ready"] is True
         assert entry["failure_reason"] == "stale_head_sha"
+
+
+class TestP0RealCheckRunApiEvidence:
+    """P0: merge-ready evidence must originate from CheckRun API rows."""
+
+    def _api_row(self, name: str, *, head_sha: str = EXPECTED_SHA, run_id: int = 123) -> dict:
+        return {
+            "id": len(name) + 1000,
+            "name": name,
+            "status": "completed",
+            "conclusion": "success",
+            "head_sha": head_sha,
+            "details_url": f"https://github.com/owner/repo/actions/runs/{run_id}/job/1",
+        }
+
+    def test_actual_check_runs_are_bound_to_current_workflow_and_head(self, v2):
+        names = [
+            "typecheck", "lint", "test", "build", "e2e", "python-test",
+            "node-backed-hook-tests", "actionlint",
+        ]
+        raw_checks = v2.check_runs_api_to_raw_checks(
+            {"check_runs": [self._api_row(name) for name in names]}, workflow_run_id=123
+        )
+        artifact = build(v2, raw_checks)
+        assert artifact["overall_status"] == "merge_ready"
+        assert all(check["head_sha"] == EXPECTED_SHA for check in artifact["checks"])
+        assert all(check["provenance"] == "github_check_run_api" for check in artifact["checks"])
+
+    def test_wrong_workflow_run_is_not_accepted_as_evidence(self, v2):
+        with pytest.raises(ValueError, match="no_current_workflow_evidence"):
+            v2.check_runs_api_to_raw_checks(
+                {"check_runs": [self._api_row("typecheck", run_id=999)]}, workflow_run_id=123
+            )
+
+    def test_cli_rejects_malformed_actual_check_run_payload(self, v2, tmp_path):
+        source = tmp_path / "check-runs.json"
+        output = tmp_path / "verdict.json"
+        source.write_text(json.dumps({"check_runs": [{"name": "test"}]}))
+        assert v2.main([
+            "--expected-head-sha", EXPECTED_SHA,
+            "--pr-head-sha", EXPECTED_SHA,
+            "--workflow-run-id", "123",
+            "--check-runs-api-json", str(source),
+            "--output", str(output),
+        ]) == 1
+        assert not output.exists()
+
+    def test_workflow_uses_commit_scoped_check_run_api_not_needs_result(self):
+        workflow = _WORKFLOW.read_text()
+        verdict_job = workflow[workflow.index("  ci-verdict-summary:"):]
+        assert "commits/${PR_HEAD_SHA}/check-runs?per_page=100" in verdict_job
+        assert "--check-runs-api-json ci_verdict_summary_v2_check_runs.json" in verdict_job
+        assert "--needs-json" not in verdict_job
 
 
 # ---------------------------------------------------------------------------

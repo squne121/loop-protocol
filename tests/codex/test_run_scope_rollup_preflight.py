@@ -77,7 +77,10 @@ def _pr_node(number: int, *, files_per_pr: int = 0, changed_files: int | None = 
         "state": "OPEN",
         "url": f"https://github.com/squne121/loop-protocol/pull/{number}",
         "changedFiles": changed_files if changed_files is not None else files_per_pr,
-        "files": {"nodes": [{"path": f"f{j}.py"} for j in range(files_per_pr)]},
+        "files": {
+            "nodes": [{"path": f"f{j}.py"} for j in range(files_per_pr)],
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+        },
     }
 
 

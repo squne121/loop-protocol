@@ -1794,24 +1794,18 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Generate ci_verdict_summary_v2 artifact
-        # B1: inline Python verdict calculation removed — ci_verdict_summary_v2.py called directly.
-        # B2: --expected-head-sha uses github.event.pull_request.head.sha (not GITHUB_SHA).
-        #     needs.result does not carry real head SHA, so provenance=needs_result_synthetic is set.
+        # P0: needs.result is synthetic and carries neither a CheckRun id nor
+        # a per-check head SHA. Read commit-scoped GitHub CheckRun evidence
+        # for this exact workflow run before generating a merge-ready artifact.
         env:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          NEEDS_JSON: >-
-            {
-              "typecheck": "${{ needs.typecheck.result }}",
-              "lint": "${{ needs.lint.result }}",
-              "test": "${{ needs.test.result }}",
-              "build": "${{ needs.build.result }}",
-              "e2e": "${{ needs.e2e.result }}",
-              "python-test": "${{ needs.python-test.result }}",
-              "node-backed-hook-tests": "${{ needs['node-backed-hook-tests'].result }}",
-              "actionlint": "${{ needs.actionlint.result }}"
-            }
+          GH_TOKEN: ${{ github.token }}
         run: |
           test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/commits/${PR_HEAD_SHA}/check-runs?per_page=100" \
+            > ci_verdict_summary_v2_check_runs.json
+          test -s ci_verdict_summary_v2_check_runs.json
           mkdir -p ci_verdict_summary_v2_artifacts
           uv run --locked python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
             --expected-head-sha "$PR_HEAD_SHA" \
@@ -1820,7 +1814,7 @@ jobs:
             --workflow-run-id "${{ github.run_id }}" \
             --workflow-run-attempt "${{ github.run_attempt }}" \
             --event-name "${{ github.event_name }}" \
-            --needs-json "${NEEDS_JSON}" \
+            --check-runs-api-json ci_verdict_summary_v2_check_runs.json \
             --artifact-id "${{ steps.upload-ci-verdict-summary-v2-binding.outputs.artifact-id }}" \
             --artifact-url "${{ steps.upload-ci-verdict-summary-v2-binding.outputs.artifact-url }}" \
             --artifact-digest "${{ steps.upload-ci-verdict-summary-v2-binding.outputs.artifact-digest }}" \
