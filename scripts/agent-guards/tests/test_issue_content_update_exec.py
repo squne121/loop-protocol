@@ -50,13 +50,23 @@ def content_input(issue_number: int = 1660, **overrides: object) -> dict:
 def tmp_project(tmp_path, monkeypatch):
     (tmp_path / "scripts" / "agent-guards").mkdir(parents=True)
     subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
-    subprocess.run(["git", "-C", str(tmp_path), "remote", "add", "origin", f"https://github.com/{TRUSTED_REPO}.git"], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git", "-C", str(tmp_path), "remote", "add", "origin",
+            f"https://github.com/{TRUSTED_REPO}.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
     monkeypatch.setattr(executor, "PROJECT_ROOT", tmp_path)
     return tmp_path
 
 
 def write_input(tmp_project: Path, data: dict) -> str:
-    path = tmp_project / "artifacts" / str(data["issue_number"]) / "issue-metadata" / COMMAND_ID_ISSUE_CONTENT_UPDATE / "input.json"
+    path = (
+        tmp_project / "artifacts" / str(data["issue_number"])
+        / "issue-metadata" / COMMAND_ID_ISSUE_CONTENT_UPDATE / "input.json"
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data), encoding="utf-8")
     return str(path.relative_to(tmp_project))
@@ -77,7 +87,10 @@ def run(tmp_project: Path, data: dict, monkeypatch, capsys) -> tuple[int, dict]:
 def test_issue_content_update_policy_schema_dispatch_parity():
     assert COMMAND_ID_ISSUE_CONTENT_UPDATE in ALL_COMMAND_IDS
     assert INPUT_SCHEMA_BY_COMMAND[COMMAND_ID_ISSUE_CONTENT_UPDATE] == "ISSUE_CONTENT_UPDATE_INPUT_V1"
-    assert CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_CONTENT_UPDATE]["github_mutation"]["fixed_fields"] == ["title", "body"]
+    mutation_policy = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[
+        COMMAND_ID_ISSUE_CONTENT_UPDATE
+    ]["github_mutation"]
+    assert mutation_policy["fixed_fields"] == ["title", "body"]
     assert "_run_issue_content_update" in Path(executor.__file__).read_text(encoding="utf-8")
 
 
@@ -98,7 +111,12 @@ def test_title_and_body_are_sent_in_one_patch(tmp_project, monkeypatch, capsys):
 
 def test_ambiguous_and_precondition_failures_do_not_retry_patch(tmp_project, monkeypatch, capsys):
     data = content_input()
-    monkeypatch.setattr(executor, "_fetch_issue_content", lambda *_: ({"title": "old title", "body": "old body", "updatedAt": "2026-07-22T00:00:00Z"}, ""))
+    old_content = {
+        "title": "old title",
+        "body": "old body",
+        "updatedAt": "2026-07-22T00:00:00Z",
+    }
+    monkeypatch.setattr(executor, "_fetch_issue_content", lambda *_: (old_content, ""))
     with patch.object(executor, "_patch_issue_content", return_value="gh_api_patch_failed: timeout") as patch_once:
         rc, payload = run(tmp_project, data, monkeypatch, capsys)
     assert rc == 1

@@ -140,7 +140,12 @@ def _validate_input_payload(data: dict[str, Any]) -> None:
         if title_update["required"]:
             proposed_title = title_update.get("proposed_title")
             reason = title_update.get("reason")
-            if not isinstance(proposed_title, str) or not proposed_title.strip() or "\x00" in proposed_title or any(ord(char) < 32 for char in proposed_title):
+            if (
+                not isinstance(proposed_title, str)
+                or not proposed_title.strip()
+                or "\x00" in proposed_title
+                or any(ord(char) < 32 for char in proposed_title)
+            ):
                 raise ValueError("title_update_proposed_title_invalid")
             if not isinstance(reason, str) or not reason.strip():
                 raise ValueError("title_update_reason_invalid")
@@ -585,7 +590,11 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             errors=[],
         )
 
-    if requested_new_sha == current_sha and requested_title == current_title and comment_mode.get("mode", "skip") == "skip":
+    if (
+        requested_new_sha == current_sha
+        and requested_title == current_title
+        and comment_mode.get("mode", "skip") == "skip"
+    ):
         return _render_result(
             status="no_change",
             issue_number=state.issue_number,
@@ -802,7 +811,10 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             state.errors.append(
                 {
                     "code": "final_readback_content_mismatch",
-                    "message": "controlled content update completed but final readback did not match requested title/body",
+                    "message": (
+                        "controlled content update completed but final readback "
+                        "did not match requested title/body"
+                    ),
                 }
             )
             return _render_result(

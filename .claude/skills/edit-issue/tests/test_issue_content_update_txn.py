@@ -35,7 +35,12 @@ def test_comment_failure_after_content_update_is_failed_after_mutation(monkeypat
     monkeypatch.setattr(txn, "_fetch_issue", lambda *_: (next(readbacks), ""))
     monkeypatch.setattr(txn, "_read_text_file", lambda _: body)
     monkeypatch.setattr(txn, "_run_command", lambda *_: subprocess.CompletedProcess([], 0, "", ""))
-    monkeypatch.setattr(txn, "_write_issue_metadata_input", lambda *_: "artifacts/1660/issue-metadata/issue_content.update/input.json")
+    metadata_input_path = (
+        "artifacts/1660/issue-metadata/issue_content.update/input.json"
+    )
+    monkeypatch.setattr(
+        txn, "_write_issue_metadata_input", lambda *_: metadata_input_path
+    )
     monkeypatch.setattr(txn, "_invoke_controlled_exec", lambda command, *_: (
         subprocess.CompletedProcess([], 0, "{}", ""), {"new_body_sha256": txn._sha256_text(body)}
     ) if command == "issue_content.update" else (subprocess.CompletedProcess([], 1, "", "comment failed"), None))

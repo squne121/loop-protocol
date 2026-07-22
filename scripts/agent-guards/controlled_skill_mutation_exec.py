@@ -829,7 +829,11 @@ def _fetch_issue_content(
         if out.returncode != 0:
             return None, f"gh_issue_fetch_failed_rc_{out.returncode}"
         data = json.loads(out.stdout)
-        if not isinstance(data, dict) or not isinstance(data.get("body"), str) or not isinstance(data.get("updatedAt"), str):
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("body"), str)
+            or not isinstance(data.get("updatedAt"), str)
+        ):
             return None, "gh_issue_fetch_schema_invalid"
         # Existing body-only consumers use the same fixed endpoint but do not
         # require a title fixture. ``issue_content.update`` enforces title
@@ -1480,7 +1484,11 @@ def _run_issue_content_update(args, input_data, gh_bin, _fail, _ok) -> int:
     if not isinstance(before.get("title"), str):
         return _fail("gh_issue_fetch_schema_invalid", status="failed")
     current_body_sha256 = "sha256:" + hashlib.sha256(before["body"].encode("utf-8")).hexdigest()
-    if marker_data is not None and before["title"] == input_data["new_title"] and current_body_sha256 == input_data["new_body_sha256"]:
+    if (
+        marker_data is not None
+        and before["title"] == input_data["new_title"]
+        and current_body_sha256 == input_data["new_body_sha256"]
+    ):
         return _ok({
             "status_detail": "already_applied",
             "idempotency_marker_found": True,
