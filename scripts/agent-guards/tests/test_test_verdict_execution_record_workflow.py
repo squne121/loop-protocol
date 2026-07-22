@@ -58,3 +58,62 @@ def test_given_schema_files_when_loaded_then_required_identity_fields_exist():
     for filename in ("test-verdict-execution-record.schema.json", "test-verdict-producer-receipt.schema.json"):
         schema = json.loads((ROOT / "schemas" / filename).read_text())
         assert "pass_eligible" in schema["required"]
+
+def test_given_identity_drift_after_upload_when_built_then_receipt_is_not_pass_eligible():
+    producer = load_producer()
+    data = fixture()
+    record = producer.build_record(**data)
+    assert record["pass_eligible"]
+    drifted_subject = dict(data["subject"], pr_head_sha="f" * 40)
+    receipt = producer.build_receipt(
+        record=record,
+        execution_artifact={"artifact_id": "1", "artifact_url": "url", "artifact_archive_digest": "sha256:" + "e" * 64},
+        final_subject=drifted_subject,
+        final_contract=data["contract"],
+    )
+    assert not receipt["pass_eligible"]
+
+
+def test_given_artifact_digest_missing_when_built_then_receipt_is_not_pass_eligible():
+    producer = load_producer()
+    data = fixture()
+    record = producer.build_record(**data)
+    assert record["pass_eligible"]
+    receipt = producer.build_receipt(
+        record=record,
+        execution_artifact={"artifact_id": "1", "artifact_url": "url", "artifact_archive_digest": ""},
+        final_subject=data["subject"],
+        final_contract=data["contract"],
+    )
+    assert not receipt["pass_eligible"]
+
+
+def test_given_receipt_input_missing_when_producer_invoked_then_process_fails_closed():
+    import subprocess
+    import sys
+    import tempfile
+
+    data = fixture()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        record_input = tmp / "record-input.json"
+        record_input.write_text(json.dumps(data))
+        missing_receipt_input = tmp / "receipt-input.json"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(PRODUCER),
+                "--record-input",
+                str(record_input),
+                "--receipt-input",
+                str(missing_receipt_input),
+                "--record-output",
+                str(tmp / "record-output.json"),
+                "--receipt-output",
+                str(tmp / "receipt-output.json"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+        assert not (tmp / "receipt-output.json").exists()

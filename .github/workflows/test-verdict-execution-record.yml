@@ -93,13 +93,25 @@ jobs:
           path: execution-record.json
           if-no-files-found: error
           retention-days: 30
+      - name: Read subject and contract after upload (final readback)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/pulls/${{ inputs.target_pr_number }}" > subject-final.json
+          gh api "repos/${{ github.repository }}/issues/${{ inputs.linked_issue_number }}" > issue-final.json
       - name: Generate producer receipt after upload readback
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, os
+          import hashlib, json, os
           record = json.load(open("record-input.json"))
-          receipt = {"execution_artifact": {"artifact_id": os.environ["ARTIFACT_ID"], "artifact_url": os.environ["ARTIFACT_URL"], "artifact_archive_digest": os.environ["ARTIFACT_DIGEST"]}, "final_subject": record["subject"], "final_contract": record["contract"]}
+          subject_final = json.load(open("subject-final.json"))
+          issue_final = json.load(open("issue-final.json"))
+          issue_body_sha256 = "sha256:" + hashlib.sha256((issue_final["body"] + chr(10)).encode()).hexdigest()
+          final_subject = {"target_pr_number": record["subject"]["target_pr_number"], "head_repository_id": subject_final["head"]["repo"]["id"], "pr_head_sha": subject_final["head"]["sha"]}
+          final_contract = {"linked_issue_number": record["contract"]["linked_issue_number"], "issue_body_sha256": issue_body_sha256, "command_manifest_sha256": record["contract"]["command_manifest_sha256"]}
+          receipt = {"execution_artifact": {"artifact_id": os.environ["ARTIFACT_ID"], "artifact_url": os.environ["ARTIFACT_URL"], "artifact_archive_digest": os.environ["ARTIFACT_DIGEST"]}, "final_subject": final_subject, "final_contract": final_contract}
           json.dump(receipt, open("receipt-input.json", "w"))
           PY
           uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py --record-input record-input.json --receipt-input receipt-input.json --record-output execution-record-final.json --receipt-output producer-receipt.json
