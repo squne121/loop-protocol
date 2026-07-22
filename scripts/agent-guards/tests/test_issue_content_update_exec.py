@@ -165,7 +165,10 @@ def test_ambiguous_and_precondition_failures_do_not_retry_patch(tmp_project, mon
     patch_never.assert_not_called()
 
 
-@pytest.mark.parametrize("title", ["", "  ", "bad\nvalue", "bad\x00value", "bad\x7fvalue", "bad\x85value", "bad\x9fvalue"])
+@pytest.mark.parametrize(
+    "title",
+    ["", "  ", "bad\nvalue", "bad\x00value", "bad\x7fvalue", "bad\x85value", "bad\x9fvalue"],
+)
 def test_invalid_title_is_rejected_before_patch(tmp_project, monkeypatch, capsys, title):
     data = content_input(new_title=title)
     with patch.object(executor, "_patch_issue_content") as patch_never:

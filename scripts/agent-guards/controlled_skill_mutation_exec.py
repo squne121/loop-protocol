@@ -1581,14 +1581,30 @@ def _run_issue_content_update(args, input_data, gh_bin, _fail, _ok) -> int:
     if after is None:
         return _fail(err, status="failed", extra={"patch_attempted": True, "mutation_outcome": "unknown"})
     if after.get("isPullRequest"):
-        return _fail("target_is_pull_request", status="failed", extra={"patch_attempted": True, "mutation_outcome": "unknown"})
+        return _fail(
+            "target_is_pull_request",
+            status="failed",
+            extra={"patch_attempted": True, "mutation_outcome": "unknown"},
+        )
     if not isinstance(after.get("title"), str):
-        return _fail("gh_issue_fetch_schema_invalid", status="failed", extra={"patch_attempted": True, "mutation_outcome": "unknown"})
+        return _fail(
+            "gh_issue_fetch_schema_invalid",
+            status="failed",
+            extra={"patch_attempted": True, "mutation_outcome": "unknown"},
+        )
     actual_new_body_sha256 = "sha256:" + hashlib.sha256(after["body"].encode("utf-8")).hexdigest()
     if after["title"] != input_data["new_title"]:
-        return _fail("postcondition_new_title_mismatch", status="failed", extra={"patch_attempted": True, "mutation_outcome": "unknown"})
+        return _fail(
+            "postcondition_new_title_mismatch",
+            status="failed",
+            extra={"patch_attempted": True, "mutation_outcome": "unknown"},
+        )
     if actual_new_body_sha256 != input_data["new_body_sha256"]:
-        return _fail("postcondition_new_body_sha256_mismatch", status="failed", extra={"patch_attempted": True, "mutation_outcome": "unknown"})
+        return _fail(
+            "postcondition_new_body_sha256_mismatch",
+            status="failed",
+            extra={"patch_attempted": True, "mutation_outcome": "unknown"},
+        )
     return _finalize_remote_success(
         status_detail="applied", body_sha256=actual_new_body_sha256, patch_attempted=True
     )

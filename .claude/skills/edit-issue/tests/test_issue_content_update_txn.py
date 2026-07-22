@@ -81,7 +81,11 @@ def test_title_only_preserves_noncanonical_current_body_byte_for_byte(monkeypatc
     monkeypatch.setattr(txn, "_fetch_issue", lambda *_: (next(readbacks), ""))
     monkeypatch.setattr(txn, "_read_text_file", lambda _: current_body)
     monkeypatch.setattr(txn, "_run_command", lambda *_: (_ for _ in ()).throw(AssertionError("hygiene must not run")))
-    monkeypatch.setattr(txn, "_write_issue_metadata_input", lambda _issue, _command, payload: captured.update(payload) or "artifacts/input.json")
+    monkeypatch.setattr(
+        txn,
+        "_write_issue_metadata_input",
+        lambda _issue, _command, payload: captured.update(payload) or "artifacts/input.json",
+    )
     monkeypatch.setattr(txn, "_invoke_controlled_exec", lambda *_: (
         subprocess.CompletedProcess([], 0, "{}", ""), {"new_body_sha256": txn._sha256_text(current_body)}
     ))
@@ -119,7 +123,11 @@ def test_post_hygiene_candidate_equal_to_current_returns_no_change(monkeypatch):
         return subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(txn, "_run_command", fake_run)
-    monkeypatch.setattr(txn, "_invoke_controlled_exec", lambda *_: (_ for _ in ()).throw(AssertionError("executor must not run")))
+    monkeypatch.setattr(
+        txn,
+        "_invoke_controlled_exec",
+        lambda *_: (_ for _ in ()).throw(AssertionError("executor must not run")),
+    )
 
     result = txn.run_transaction(input_data)
 

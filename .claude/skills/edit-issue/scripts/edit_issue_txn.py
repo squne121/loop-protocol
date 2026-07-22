@@ -654,7 +654,14 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
                     comment_body_sha256=None, errors=state.errors,
                 )
             hygiene_cp = _run_command(
-                [sys.executable, str(HYGIENE_SCRIPT), "--body-file", str(candidate_path), "--out-file", str(candidate_path)]
+                [
+                    sys.executable,
+                    str(HYGIENE_SCRIPT),
+                    "--body-file",
+                    str(candidate_path),
+                    "--out-file",
+                    str(candidate_path),
+                ]
             )
             if hygiene_cp.returncode not in (0, 1, 2):
                 state.errors.append(_child_error(hygiene_cp, "issue_contract_hygiene_runtime_error"))
