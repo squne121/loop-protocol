@@ -627,6 +627,46 @@ def test_ok_when_marker_schema_version_3_has_full_completeness_contract(tmp_path
         sidecar_path.unlink(missing_ok=True)
 
 
+def test_query_schema_v4(tmp_path):
+    """GIVEN a v4 inventory marker WHEN parser validates it THEN it is accepted."""
+    script_sha = _load_script_sha(PLAN_SCRIPT)
+    marker = _render_marker(
+        script_sha=script_sha,
+        overrides={
+            "marker_schema_version": 3,
+            "inputs": {
+                "current_issue_sha256": "deadbeef",
+                "issues_all_sha256": "deadbeef",
+                "prs_all_sha256": "deadbeef",
+                "issue_count": 2,
+                "pr_count": 0,
+                "query_schema_version": 4,
+                "issues_completeness": _full_v3_completeness_block(2),
+                "pull_requests_completeness": _full_v3_completeness_block(0),
+                "transaction_budget": _full_v3_budget_block(),
+            },
+        },
+    )
+    with NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
+        tmp.write(marker)
+        output_path = Path(tmp.name)
+    sidecar_path = output_path.with_suffix(".capture.yaml")
+    sidecar_path.write_text(_render_capture_sidecar(output_path), encoding="utf-8")
+    try:
+        result = _run_parser_cli(
+            output_path,
+            sidecar_path,
+            expected_script_sha=script_sha,
+            requested_at="2026-06-13T10:00:00+00:00",
+        )
+        assert result.returncode == 0, result.stderr
+        parsed = yaml.safe_load(result.stdout)["SCOPE_ROLLUP_MARKER_PARSE_RESULT_V1"]
+        assert parsed["status"] == "ok"
+    finally:
+        output_path.unlink(missing_ok=True)
+        sidecar_path.unlink(missing_ok=True)
+
+
 def test_ok_when_marker_schema_version_2_explicit_legacy_without_completeness(tmp_path):
     """An explicit marker_schema_version: 2 marker is accepted without the
     v3 completeness contract (explicit legacy discriminator, distinct from

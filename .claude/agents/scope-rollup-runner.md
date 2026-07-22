@@ -103,7 +103,7 @@ SCOPE_ROLLUP_RUN_RESULT_V1:
     requested_at: "<呼び出し元が渡した requested_at そのまま>"
     gh_realpath: "<trusted gh binary realpath>"
     gh_version: "<gh --version 出力先頭行>"
-    query_schema_version: 3
+    query_schema_version: 4
     fetched_at: "<ISO8601>"
     body_sha256: "<current issue view raw stdout の sha256>"
     planner_script_sha256: "<plan_issue_scope_rollup.py の sha256>"
@@ -160,7 +160,7 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
                              # marker whose completeness contract is missing or invalid, even if
                              # `inputs` itself was stripped entirely. This closes the silent-downgrade
                              # gap where deleting only `inputs.query_schema_version` (while this
-                             # runner's OTHER v3 fields remained) used to be misclassified as a
+                             # runner's OTHER completeness fields remained) used to be misclassified as a
                              # pre-#1593 legacy v2 marker.
   repo: "<repo>"
   current_issue: <issue_number>
@@ -176,7 +176,7 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
     prs_all_sha256: "<SCOPE_ROLLUP_RUN_RESULT_V1.manifest.pull_requests.sha256>"
     issue_count: <SCOPE_ROLLUP_RUN_RESULT_V1.manifest.issues.item_count>
     pr_count: <SCOPE_ROLLUP_RUN_RESULT_V1.manifest.pull_requests.item_count>
-    query_schema_version: 3
+    query_schema_version: 4
     issues_completeness: <SCOPE_ROLLUP_RUN_RESULT_V1.manifest.issues をそのまま埋め込む>
     pull_requests_completeness: <SCOPE_ROLLUP_RUN_RESULT_V1.manifest.pull_requests をそのまま埋め込む>
     transaction_budget: <SCOPE_ROLLUP_RUN_RESULT_V1.manifest.budget をそのまま埋め込む>

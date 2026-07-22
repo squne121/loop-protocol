@@ -24,7 +24,6 @@ def _node(kind: str, number: int) -> dict:
         "body": "",
         "state": "OPEN",
         "url": f"https://example.invalid/{kind}/{number}",
-        "labels": {"nodes": [{"name": "phase/implementation"}]},
     }
     if kind == "issue":
         base["stateReason"] = None
@@ -33,7 +32,6 @@ def _node(kind: str, number: int) -> dict:
             {
                 "changedFiles": 0,
                 "files": {"nodes": []},
-                "closingIssuesReferences": {"nodes": []},
             }
         )
     return base
@@ -61,6 +59,32 @@ def _paged_transport(inventory: dict[str, list[dict]]):
         }
 
     return fake
+
+
+def test_inventory_query_omits_unused_connections():
+    """GIVEN schema v4 WHEN inventory query is built THEN unused connections are absent."""
+    assert "labels(" not in rsrp._INVENTORY_CONNECTION_QUERY
+    assert "closingIssuesReferences" not in rsrp._INVENTORY_CONNECTION_QUERY
+
+
+def test_inventory_query_selection_set():
+    """GIVEN schema v4 WHEN inventory query is built THEN required fields remain explicit."""
+    query = rsrp._INVENTORY_CONNECTION_QUERY
+    assert "nodes { id number title body state stateReason url }" in query
+    assert "id number title body state url changedFiles" in query
+    assert "files(first: 100) { pageInfo { hasNextPage endCursor } nodes { path } }" in query
+    assert "labels" not in query
+    assert "closingIssuesReferences" not in query
+
+
+def test_inventory_normalization_omits_unused_connections():
+    """GIVEN schema v4 DTOs WHEN normalized THEN planner input has no unused keys."""
+    issue = rsrp._normalize_inventory_node("issue", _node("issue", 1))
+    pull_request = rsrp._normalize_inventory_node("pr", _node("pr", 2))
+
+    assert "labels" not in issue
+    assert "labels" not in pull_request
+    assert "closingIssuesReferences" not in pull_request
 
 
 def test_inventory_over_500_pages_to_total_count_without_truncation(monkeypatch, tmp_path):

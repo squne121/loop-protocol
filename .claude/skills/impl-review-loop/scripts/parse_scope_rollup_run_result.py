@@ -166,7 +166,10 @@ def _compute_payload_sha256(payload: dict[str, Any]) -> str:
 
 
 def _has_valid_completeness_contract(inputs: Any) -> bool:
-    if not isinstance(inputs, dict) or inputs.get("query_schema_version") != 3:
+    # Marker schema v3 predates inventory projection schema v4.  Accept the
+    # historical v3 projection and the current v4 projection, but never an
+    # absent or unknown query schema version.
+    if not isinstance(inputs, dict) or inputs.get("query_schema_version") not in {3, 4}:
         return False
     for key in ("issues_completeness", "pull_requests_completeness"):
         block = inputs.get(key)
