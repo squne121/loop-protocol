@@ -125,6 +125,7 @@ def determine_check_verdict(
     conclusion = check.get("conclusion")
     head_sha = check.get("head_sha")
     head_sha_match = check.get("head_sha_match", False)
+    check_run_id = check.get("check_run_id")
 
     # excluded checks never block
     if classification == "excluded":
@@ -132,6 +133,14 @@ def determine_check_verdict(
 
     # B5: unknown classification is conservatively blocking
     if classification == "unknown":
+        return True, "gh_error"
+
+    # Required/evidence rows are only merge-ready evidence when their exact
+    # GitHub CheckRun is addressable.  A status/conclusion without an id
+    # cannot be rebound to the current PR head during artifact readback.
+    if classification in {"required", "evidence"} and (
+        not isinstance(check_run_id, int) or isinstance(check_run_id, bool) or check_run_id <= 0
+    ):
         return True, "gh_error"
 
     # pending / in-progress status → wait
@@ -198,7 +207,9 @@ def build_check_entry(
     expected_head_sha: str,
 ) -> dict[str, Any]:
     name = raw.get("name", "")
-    check_run_id = raw.get("databaseId") or raw.get("id")
+    # REST CheckRun API uses ``id``. The API adapter intentionally preserves
+    # it as ``check_run_id`` so the artifact retains current-head provenance.
+    check_run_id = raw.get("databaseId") or raw.get("id") or raw.get("check_run_id")
     status = raw.get("status")
     conclusion = raw.get("conclusion")
 

@@ -55,6 +55,7 @@ def make_check(
     head_sha: str | None = EXPECTED_SHA,
 ) -> dict:
     return {
+        "id": 10_000 + len(name),
         "name": name,
         "workflow": workflow,
         "status": status,
@@ -572,8 +573,8 @@ class TestB1B2NeedsResultSynthetic:
         assert entry["head_sha_match"] is False
         assert entry.get("provenance") == "needs_result_synthetic"
 
-    def test_synthetic_success_blocks_because_head_sha_none(self, v2):
-        """needs_result_synthetic success on required check → blocks (head_sha=None, stale_head_sha)."""
+    def test_synthetic_success_blocks_without_check_run_id(self, v2):
+        """Synthetic needs results cannot supply an addressable CheckRun."""
         raw = {
             "name": "typecheck",
             "workflow": "ci",
@@ -584,7 +585,7 @@ class TestB1B2NeedsResultSynthetic:
         }
         entry = v2.build_check_entry(raw, "ci", EXPECTED_SHA)
         assert entry["blocking_merge_ready"] is True
-        assert entry["failure_reason"] == "stale_head_sha"
+        assert entry["failure_reason"] == "gh_error"
 
 
 class TestP0RealCheckRunApiEvidence:
@@ -611,7 +612,26 @@ class TestP0RealCheckRunApiEvidence:
         artifact = build(v2, raw_checks)
         assert artifact["overall_status"] == "merge_ready"
         assert all(check["head_sha"] == EXPECTED_SHA for check in artifact["checks"])
+        assert [check["check_run_id"] for check in artifact["checks"]] == [
+            row["check_run_id"] for row in raw_checks
+        ]
         assert all(check["provenance"] == "github_check_run_api" for check in artifact["checks"])
+
+    def test_required_check_without_check_run_id_blocks_merge_ready(self, v2):
+        raw = make_check("typecheck")
+        del raw["id"]
+        entry = v2.build_check_entry(raw, "ci", EXPECTED_SHA)
+        assert entry["check_run_id"] is None
+        assert entry["blocking_merge_ready"] is True
+        assert entry["failure_reason"] == "gh_error"
+
+    def test_actual_check_run_with_stale_head_blocks_merge_ready(self, v2):
+        raw = self._api_row("typecheck", head_sha=OTHER_SHA)
+        entry = v2.build_check_entry(raw, "ci", EXPECTED_SHA)
+        assert entry["check_run_id"] == raw["id"]
+        assert entry["head_sha_match"] is False
+        assert entry["blocking_merge_ready"] is True
+        assert entry["failure_reason"] == "stale_head_sha"
 
     def test_wrong_workflow_run_is_not_accepted_as_evidence(self, v2):
         with pytest.raises(ValueError, match="no_current_workflow_evidence"):

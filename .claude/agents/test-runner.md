@@ -198,7 +198,7 @@ TEST_VERDICT:
 
 `pr_review_only` の PASS を投稿する前に、test-runner は次を同じ current PR head に束縛して確認する。
 
-1. GitHub API で exact workflow run / CheckRun / artifact を readback し、artifact JSON の `expected_head_sha` と各 required CheckRun の `head_sha` が current PR head と一致することを確認する。null / stale head、unknown classification、または `blocking_merge_ready: true` が1件でもあれば FAIL とする。
+1. GitHub API で exact workflow run / CheckRun / artifact を readback し、artifact JSON の `expected_head_sha` と各 required CheckRun の `head_sha` が current PR head と一致し、各 `check_run_id` が正の GitHub CheckRun ID であることを確認する。`TEST_VERDICT.check_run_id` には、**current workflow run の `ci-verdict-summary` CheckRun ID**を artifact/readback から採用する。旧run・旧head・null/stale head・null ID・unknown classification、または `blocking_merge_ready: true` が1件でもあれば FAIL とする。
 2. artifact JSON が `overall_status: merge_ready` かつ `next_action: none` であることを確認する。artifact の ZIP digest は Actions API 値と一致させる。
 3. 投稿する `artifact_payload` は、Issue番号、PR番号、3種のhead、contract body SHA、**全 VC の command hash**から canonical JSON（sorted keys / compact separators / UTF-8）で1回だけ生成する。`artifact_payload_sha256` はその実値の64桁hex SHA-256 と一致しなければならない。
 4. `runtime_ac_results` は全 VC を被覆し、各行で `status: pass`、`exit_code: 0`、`fallback_detected: false`、`human_review_required: false`、`stop_condition_triggered: false` を満たす場合だけ PASS を許可する。
