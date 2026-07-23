@@ -1,0 +1,154 @@
+name: protected-test-verdict-execution-record
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_pr_number:
+        description: Subject pull request number
+        required: true
+        type: string
+      linked_issue_number:
+        description: Linked implementation issue number
+        required: true
+        type: string
+      expected_head_sha:
+        description: Subject PR head SHA obtained by the dispatcher
+        required: true
+        type: string
+      expected_issue_body_sha256:
+        description: Linked Issue body SHA obtained by the dispatcher
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  actions: read
+  checks: read
+
+jobs:
+  produce:
+    # A dispatch is trusted only after this definition exists on the default
+    # branch. Subject identity is always read separately, PR workflow code is
+    # never checked out or executed by this producer.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - uses: ./.github/actions/setup-python-uv
+
+      - name: Verify uv toolchain
+        run: uv --version
+
+      - name: Read subject before execution
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py gh-api --path repos/${{ github.repository }}/pulls/${{ inputs.target_pr_number }} --output subject-pre.json
+
+      - name: Read linked issue before execution
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py gh-api --path repos/${{ github.repository }}/issues/${{ inputs.linked_issue_number }} --output issue-pre.json
+
+      - name: Verify subject head SHA before execution
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assert-json-field --file subject-pre.json --pointer head.sha --equals "${{ inputs.expected_head_sha }}"
+
+      - name: Verify linked issue body SHA before execution
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assert-issue-body-sha --file issue-pre.json --equals "${{ inputs.expected_issue_body_sha256 }}"
+
+      - name: Resolve current job and check run via REST
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py resolve-job-and-check --repo ${{ github.repository }} --run-id ${{ github.run_id }} --run-attempt ${{ github.run_attempt }} --runner-name "${{ runner.name }}" --expected-head-sha ${{ github.sha }} --output-job job.json --output-check check-run.json
+
+      - name: Assemble producer identity
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assemble-producer --workflow-path .github/workflows/test-verdict-execution-record.yml --workflow-source-ref ${{ github.ref }} --workflow-source-sha ${{ github.sha }} --run-id ${{ github.run_id }} --run-attempt ${{ github.run_attempt }} --job-file job.json --check-file check-run.json --output producer.json
+
+      - name: Assemble subject identity
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assemble-subject --subject-file subject-pre.json --target-pr-number ${{ inputs.target_pr_number }} --output subject.json
+
+      - name: Assemble contract identity
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assemble-contract --issue-file issue-pre.json --linked-issue-number ${{ inputs.linked_issue_number }} --output contract.json
+
+      - name: Execute closed manifest command for real
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py execute --command-id uv.pytest.execution-record --repo-root ${{ github.workspace }} --output execution-result.json
+        continue-on-error: true
+        id: execute-manifest
+
+      - name: Build execution-record artifact from the real result
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py build-record --command-id uv.pytest.execution-record --producer-input producer.json --subject-input subject.json --contract-input contract.json --execution-result execution-result.json --schema schemas/test-verdict-execution-record.schema.json --output execution-record.json
+        continue-on-error: true
+        id: build-execution-record
+
+      - name: Read subject after execution
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py gh-api --path repos/${{ github.repository }}/pulls/${{ inputs.target_pr_number }} --output subject-post.json
+
+      - name: Read linked issue after execution
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py gh-api --path repos/${{ github.repository }}/issues/${{ inputs.linked_issue_number }} --output issue-post.json
+
+      - name: Verify subject and issue identity are stable after execution
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assert-stable-fields --before subject-pre.json --after subject-post.json --pointers "number,head.repo.id,head.sha"
+
+      - name: Verify linked issue identity is stable after execution
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assert-stable-fields --before issue-pre.json --after issue-post.json --pointers "number"
+
+      - name: Verify linked issue body SHA after execution
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assert-issue-body-sha --file issue-post.json --equals "${{ inputs.expected_issue_body_sha256 }}"
+
+      - name: Upload execution record
+        id: upload-execution-record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-verdict-execution-record-${{ github.run_id }}-${{ github.run_attempt }}
+          path: execution-record.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Read subject after upload (final readback)
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py gh-api --path repos/${{ github.repository }}/pulls/${{ inputs.target_pr_number }} --output subject-final.json
+
+      - name: Read linked issue after upload (final readback)
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py gh-api --path repos/${{ github.repository }}/issues/${{ inputs.linked_issue_number }} --output issue-final.json
+
+      - name: Assemble final subject identity
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assemble-subject --subject-file subject-final.json --target-pr-number ${{ inputs.target_pr_number }} --output subject-final-assembled.json
+
+      - name: Assemble final contract identity
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assemble-contract --issue-file issue-final.json --linked-issue-number ${{ inputs.linked_issue_number }} --output contract-final-assembled.json
+
+      - name: Fetch uploaded execution-record artifact metadata via REST
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py gh-api --path repos/${{ github.repository }}/actions/artifacts/${{ steps.upload-execution-record.outputs.artifact-id }} --output artifact-rest.json
+
+      - name: Download and self-verify execution-record archive via REST
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py download-artifact --repo ${{ github.repository }} --artifact-id ${{ steps.upload-execution-record.outputs.artifact-id }} --output-json downloaded-execution-record.json --output-payload-sha256 downloaded-payload-sha256.txt
+
+      - name: Assemble execution artifact receipt input
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assemble-execution-artifact --rest-file artifact-rest.json --downloaded-payload-sha256-file downloaded-payload-sha256.txt --artifact-id "${{ steps.upload-execution-record.outputs.artifact-id }}" --artifact-url "${{ steps.upload-execution-record.outputs.artifact-url }}" --artifact-digest "${{ steps.upload-execution-record.outputs.artifact-digest }}" --expected-repository-id ${{ github.repository_id }} --expected-run-id ${{ github.run_id }} --expected-head-sha ${{ github.sha }} --expected-name "test-verdict-execution-record-${{ github.run_id }}-${{ github.run_attempt }}" --output execution-artifact-input.json
+
+      - name: Build producer receipt from readback-bound inputs
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py build-receipt --record execution-record.json --execution-artifact-input execution-artifact-input.json --final-subject subject-final-assembled.json --final-contract contract-final-assembled.json --schema schemas/test-verdict-producer-receipt.schema.json --output producer-receipt.json
+        continue-on-error: true
+        id: build-producer-receipt
+
+      - name: Upload producer receipt
+        id: upload-producer-receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-verdict-producer-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: producer-receipt.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Fetch uploaded producer-receipt artifact metadata via REST
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py gh-api --path repos/${{ github.repository }}/actions/artifacts/${{ steps.upload-producer-receipt.outputs.artifact-id }} --output receipt-artifact-rest.json
+
+      - name: Verify producer-receipt artifact identity via REST
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assert-json-field --file receipt-artifact-rest.json --pointer expired --equals "False"
+
+      - name: Verify producer-receipt artifact id via REST
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assert-json-field --file receipt-artifact-rest.json --pointer id --equals "${{ steps.upload-producer-receipt.outputs.artifact-id }}"
+
+      - name: Gate the job on pass_eligible (fail closed)
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assert-json-field --file producer-receipt.json --pointer pass_eligible --equals "True"

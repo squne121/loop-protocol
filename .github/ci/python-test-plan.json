@@ -69,6 +69,13 @@
         ]
       },
       {
+        "provider_job": "python-test",
+        "lane_id": "test-verdict-execution-record-producer",
+        "paths": [
+          "scripts/agent-ops/test_verdict_execution_record_producer.py"
+        ]
+      },
+      {
         "provider_job": "node-backed-hook-tests",
         "paths": [
           "tests/session_recording/codex/test_hook_adapter.py",
