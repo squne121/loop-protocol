@@ -155,7 +155,10 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
     producer_digest = "sha256:" + hashlib.sha256(CAPTURE_PATH.read_bytes()).hexdigest()
     digest = lambda path: "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
     eligibility.write_text(json.dumps({"schema": "SESSION_RECORDING_SCOPE_ROLLUP_ELIGIBILITY_V1", "artifact_version": 1, "repo_root_realpath": str(REPO_ROOT.resolve()), "head_sha": None, "policy_digest": digest(policy), "secret_policy_digest": digest(secret), "public_checkpoint_present": False, "visibility": "public", "secrets_mode": "none", "generated_at": "2026-07-15T11:00:00Z", "expires_at": "2030-01-01T00:00:00Z", "safety_verdict": "allow"}))
-    readiness.write_text(json.dumps({"schema": "SESSION_RECORDING_SCOPE_ROLLUP_READINESS_V1", "artifact_version": 1, "repo_root_realpath": str(REPO_ROOT.resolve()), "uv_lock_digest": None, "python_version_digest": None, "interpreter_realpath": str(Path(sys.executable).resolve()), "interpreter_version": sys.version.split()[0], "producer_digest": producer_digest, "prepared": True, "generated_at": "2026-07-15T11:00:00Z"}))
+    # Keep the uv-selected executable path intact. Resolving its venv symlink
+    # selects the base interpreter, which may not contain the capture
+    # producer's locked PyYAML dependency on a clean CI runner.
+    readiness.write_text(json.dumps({"schema": "SESSION_RECORDING_SCOPE_ROLLUP_READINESS_V1", "artifact_version": 1, "repo_root_realpath": str(REPO_ROOT.resolve()), "uv_lock_digest": None, "python_version_digest": None, "interpreter_realpath": sys.executable, "interpreter_version": sys.version.split()[0], "producer_digest": producer_digest, "prepared": True, "generated_at": "2026-07-15T11:00:00Z"}))
     os.chmod(eligibility, 0o600)
     os.chmod(readiness, 0o600)
     env = {**os.environ}
