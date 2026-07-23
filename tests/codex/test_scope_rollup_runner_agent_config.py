@@ -18,7 +18,7 @@ EXPECTATION_PATH = REPO_ROOT / "tests" / "fixtures" / "codex-agent-config" / "ex
 CAPTURE_PATH = REPO_ROOT / ".claude" / "hooks" / "capture_scope_rollup_final_response.py"
 ADAPTER_PATH = REPO_ROOT / "scripts" / "session-recording" / "codex-hook-adapter.mjs"
 RUNTIME_PROBE = REPO_ROOT / "scripts" / "agent-guards" / "check_scope_rollup_runtime.py"
-RAW_HOOK_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "session-recording" / "codex" / "subagent-stop-0.145.0.json"
+RAW_HOOK_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "session-recording" / "codex" / "subagent-stop-0.145.0.json.fixture"
 
 
 def _load_capture_module():
