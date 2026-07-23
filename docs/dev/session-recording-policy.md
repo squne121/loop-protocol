@@ -27,13 +27,13 @@ created: "2026-05-24"
 
 Codex native agent registry の `scope-rollup-runner` dispatch source は `.codex/agents/scope-rollup-runner.toml` とする。これは named agent identity を capture producer の `agent_type: scope-rollup-runner` と整合させるための registry 定義であり、hook trust / runtime-active state の証跡ではない。generic/default/worker fallback は capture target として認めない。
 
-#### Codex native runner の permission / runtime evidence 境界（#1671）
+#### Codex native runner の権限設定と実行時証跡の境界（#1671）
 
-`scope-rollup-runner` の declaration は generic `loop-protocol-readonly` のまま維持する一方、exact executor を実行する session は `loop-protocol-scope-rollup` を **effective parent permission profile** として明示しなければならない。この profile は repo と GitHub を read-only に保ち、executor-owned invocation-private directory のための `:tmpdir` / `:slash_tmp` だけを write とする。`uv run` / `uv sync` による暗黙 environment sync は hot path で禁止し、readiness artifact の interpreter realpath を直接 spawn する。
+`scope-rollup-runner` の定義は generic な `loop-protocol-readonly` のまま維持する。一方、exact executor を実行する session は `loop-protocol-scope-rollup` を **effective parent permission profile** として明示しなければならない。この profile は repo と GitHub を read-only に保ち、executor が所有する invocation-private directory 用の `:tmpdir` / `:slash_tmp` だけを書込み可能にする。`uv run` / `uv sync` による暗黙の environment sync は hot path で禁止し、readiness artifact の interpreter realpath を直接 spawn する。
 
-runtime probe は `SCOPE_ROLLUP_RUNTIME_EVIDENCE_V1` に release pin、effective parent profile、nested delegation session feature state、hook trust state、OS/architecture、`uv_sync_used: false` を記録する。pinned runtime または trust が unavailable の場合は `SKIP`（exit 77）であり、fixture / adapter subprocess の PASS を live runtime trust に昇格してはならない。`permissionMode: auto` を readonly へ coercion して parity PASS とすることは禁止する。permission comparison は allowlisted reason、expiry、follow-up を持つ `not_compared` のみを許可する。
+runtime probe は `SCOPE_ROLLUP_RUNTIME_EVIDENCE_V1` に release pin、effective parent profile、nested delegation の session feature state、hook trust state、OS/architecture、`uv_sync_used: false` を記録する。pinned runtime または trust が利用不能な場合は `SKIP`（exit 77）とし、fixture / adapter subprocess の PASS を live runtime trust に昇格してはならない。`permissionMode: auto` を readonly へ coercion して parity PASS とみなすことは禁止する。permission comparison は allowlisted reason、expiry、follow-up を備える `not_compared` のみを許可する。
 
-#### scope-rollup producer consumer inventory（#1671）
+#### scope-rollup の生成側・消費側 inventory（#1671）
 
 `ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1` の producer implementation change は schema semantics の変更ではないが、以下の consumer inventory を毎回確認する: exact executor `scripts/agent-guards/run_scope_rollup_preflight.py`、Node adapter `scripts/session-recording/codex-hook-adapter.mjs`、canonical capture producer `.claude/hooks/capture_scope_rollup_final_response.py` と sidecar、canonical parser/verifier `.claude/skills/impl-review-loop/scripts/{parse_scope_rollup_run_result.py,verify_scope_rollup_result.py}`、orchestrator preparation `.claude/skills/impl-review-loop/steps/preparation.md`。release-pinned raw `SubagentStop` fixture は Node adapter → capture/sidecar → parser/verifier を通し、named agent だけを許可する。
 
