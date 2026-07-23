@@ -134,6 +134,9 @@ def validate_intent(value: object) -> dict[str, object]:
         ("claude", "2.1.216", "Write", "Write", "write"),
         ("claude", "2.1.216", "Edit", "Write", "write"),
         ("claude", "2.1.216", "MultiEdit", "Write", "write"),
+        ("claude", "2.1.218", "Write", "Write", "write"),
+        ("claude", "2.1.218", "Edit", "Write", "write"),
+        ("claude", "2.1.218", "Bash", "Bash", "bash"),
         ("codex", "0.145.0", "apply_patch", "apply_patch", "apply_patch"),
     }
     if (runtime, version, identity, canonical, kind) not in supported:
