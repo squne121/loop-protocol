@@ -756,8 +756,7 @@ def main(argv: list[str] | None = None) -> int:
         if (
             not codex_only
             and claude_path
-            and
-            expected["runtime_followup_route"] != "none"
+            and expected["runtime_followup_route"] != "none"
             and expected["runtime_followup_route"].split("|")[0] not in claude_text
         ):
             failures.append(
