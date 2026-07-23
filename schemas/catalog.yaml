@@ -879,9 +879,9 @@ entries:
         paths:
           - "."
     required_test_commands:
-      - id: "test_execution_record_producer"
+      - id: "lint_catalog_yaml"
         runner: pytest
-        target: "scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py"
+        target: "schemas/tests/test_catalog.py"
     compatibility:
       mode: manual_policy
       direction: backward
@@ -899,7 +899,7 @@ entries:
       followup_issue_required: true
     last_verified:
       commit: "1a487a7e0a315a4283de916c222f7a0bacdd222b"
-      command_id: "test_execution_record_producer"
+      command_id: "lint_catalog_yaml"
 
   - schema_id: "TEST_VERDICT_PRODUCER_RECEIPT_V1"
     format: json_schema
@@ -923,9 +923,9 @@ entries:
         paths:
           - "."
     required_test_commands:
-      - id: "test_execution_record_producer"
+      - id: "lint_catalog_yaml"
         runner: pytest
-        target: "scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py"
+        target: "schemas/tests/test_catalog.py"
     compatibility:
       mode: manual_policy
       direction: backward
@@ -943,7 +943,7 @@ entries:
       followup_issue_required: true
     last_verified:
       commit: "1a487a7e0a315a4283de916c222f7a0bacdd222b"
-      command_id: "test_execution_record_producer"
+      command_id: "lint_catalog_yaml"
 
   - schema_id: "temp_residue_owner/v1"
     format: json_schema
