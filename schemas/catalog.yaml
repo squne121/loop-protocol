@@ -870,7 +870,8 @@ entries:
     consumers:
       - id: "test-verdict-publisher"
         paths:
-          - "scripts/agent-ops/test_verdict_comment_publisher.py"
+          - "scripts/agent-guards/controlled_skill_mutation_policy.py"
+          - "scripts/agent-guards/controlled_skill_mutation_exec.py"
     detection_patterns:
       - id: "execution-record-pattern"
         engine: ripgrep
@@ -892,8 +893,8 @@ entries:
           runner: pytest
           target: "schemas/tests/test_catalog.py"
       fixture_tests:
-        positive: ["scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py"]
-        negative: []
+        positive: ["scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py::test_given_matching_readbacks_when_built_then_record_and_receipt_are_pass_eligible"]
+        negative: ["scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py::test_given_drift_or_missing_coverage_when_built_then_receipt_is_not_pass_eligible", "scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py::test_given_identity_drift_after_upload_when_built_then_receipt_is_not_pass_eligible", "scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py::test_given_artifact_digest_missing_when_built_then_receipt_is_not_pass_eligible", "scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py::test_given_artifact_id_mismatch_when_receipt_built_then_receipt_is_not_pass_eligible", "scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py::test_given_artifact_digest_mismatch_when_receipt_built_then_receipt_is_not_pass_eligible", "scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py::test_given_receipt_input_missing_when_producer_invoked_then_process_fails_closed"]
     migration:
       required_for_breaking_change: true
       followup_issue_required: true
@@ -914,7 +915,8 @@ entries:
     consumers:
       - id: "test-verdict-publisher"
         paths:
-          - "scripts/agent-ops/test_verdict_comment_publisher.py"
+          - "scripts/agent-guards/controlled_skill_mutation_policy.py"
+          - "scripts/agent-guards/controlled_skill_mutation_exec.py"
     detection_patterns:
       - id: "producer-receipt-pattern"
         engine: ripgrep
@@ -936,8 +938,8 @@ entries:
           runner: pytest
           target: "schemas/tests/test_catalog.py"
       fixture_tests:
-        positive: ["scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py"]
-        negative: []
+        positive: ["scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py::test_given_matching_readbacks_when_built_then_record_and_receipt_are_pass_eligible"]
+        negative: ["scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py::test_given_drift_or_missing_coverage_when_built_then_receipt_is_not_pass_eligible", "scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py::test_given_identity_drift_after_upload_when_built_then_receipt_is_not_pass_eligible", "scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py::test_given_artifact_digest_missing_when_built_then_receipt_is_not_pass_eligible", "scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py::test_given_artifact_id_mismatch_when_receipt_built_then_receipt_is_not_pass_eligible", "scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py::test_given_artifact_digest_mismatch_when_receipt_built_then_receipt_is_not_pass_eligible", "scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py::test_given_receipt_input_missing_when_producer_invoked_then_process_fails_closed"]
     migration:
       required_for_breaking_change: true
       followup_issue_required: true

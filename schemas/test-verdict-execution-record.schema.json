@@ -1,15 +1,209 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "TEST_VERDICT_EXECUTION_RECORD_V1",
-  "type": "object",
-  "required": ["schema", "schema_version", "producer", "subject", "contract", "executions", "per_ac", "payload_sha256", "pass_eligible"],
+  "additionalProperties": false,
   "properties": {
-    "schema": {"const": "TEST_VERDICT_EXECUTION_RECORD_V1"},
-    "schema_version": {"const": 1},
-    "producer": {"type": "object", "required": ["workflow_path", "workflow_source_sha", "workflow_run_id", "job_id", "check_run_id"]},
-    "subject": {"type": "object", "required": ["target_pr_number", "head_repository_id", "pr_head_sha"]},
-    "contract": {"type": "object", "required": ["linked_issue_number", "issue_body_sha256", "command_manifest_sha256"]},
-    "executions": {"type": "array"}, "per_ac": {"type": "array"},
-    "payload_sha256": {"pattern": "^sha256:[0-9a-f]{64}$"}, "pass_eligible": {"type": "boolean"}
-  }
+    "contract": {
+      "additionalProperties": false,
+      "properties": {
+        "command_manifest_sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "issue_body_sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "linked_issue_number": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "linked_issue_number",
+        "issue_body_sha256",
+        "command_manifest_sha256"
+      ],
+      "type": "object"
+    },
+    "executions": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "argv_sha256": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "command_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "execution_id": {
+            "pattern": "^exec-[A-Za-z0-9_-]+$",
+            "type": "string"
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "fallback_detected": {
+            "type": "boolean"
+          },
+          "skipped": {
+            "type": "boolean"
+          },
+          "status": {
+            "enum": [
+              "pass",
+              "fail"
+            ],
+            "type": "string"
+          },
+          "stderr_sha256": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "stdout_sha256": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "timed_out": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "execution_id",
+          "command_id",
+          "argv_sha256",
+          "exit_code",
+          "status",
+          "skipped",
+          "fallback_detected",
+          "timed_out",
+          "stdout_sha256",
+          "stderr_sha256"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "pass_eligible": {
+      "type": "boolean"
+    },
+    "payload_sha256": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "per_ac": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "ac": {
+            "pattern": "^AC[0-9]+$",
+            "type": "string"
+          },
+          "execution_ids": {
+            "items": {
+              "pattern": "^exec-[A-Za-z0-9_-]+$",
+              "type": "string"
+            },
+            "minItems": 1,
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "ac",
+          "execution_ids"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "producer": {
+      "additionalProperties": false,
+      "properties": {
+        "check_run_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "job_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workflow_path": {
+          "pattern": "^\\.github/workflows/[A-Za-z0-9_.-]+\\.ya?ml$",
+          "type": "string"
+        },
+        "workflow_run_attempt": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workflow_run_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workflow_source_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "workflow_source_sha": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workflow_path",
+        "workflow_source_ref",
+        "workflow_source_sha",
+        "workflow_run_id",
+        "workflow_run_attempt",
+        "job_id",
+        "check_run_id"
+      ],
+      "type": "object"
+    },
+    "schema": {
+      "const": "TEST_VERDICT_EXECUTION_RECORD_V1"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "subject": {
+      "additionalProperties": false,
+      "properties": {
+        "head_repository_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "pr_head_sha": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "target_pr_number": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "target_pr_number",
+        "head_repository_id",
+        "pr_head_sha"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "producer",
+    "subject",
+    "contract",
+    "executions",
+    "per_ac",
+    "payload_sha256",
+    "pass_eligible"
+  ],
+  "title": "TEST_VERDICT_EXECUTION_RECORD_V1",
+  "type": "object"
 }

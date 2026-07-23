@@ -24,7 +24,6 @@
     ".claude/skills/issue-refinement-loop/tests/",
     "schemas/tests/",
     "scripts/ci/tests/",
-    "scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py",
     "scripts/agent-guards/tests/",
     "scripts/agent-ops/tests/",
     "tests/codex/test_codex_hook_surface_guard.py",

@@ -472,3 +472,67 @@ def test_last_verified_commit_is_full_sha(entries):
             f"schema_id={entry['schema_id']!r}: last_verified.commit={commit!r} "
             "は 40-char full SHA でなければならない"
         )
+
+
+
+# --------------------------------------------------------------------------- #
+# fix_delta P2-8: consumer / fixture path existence for the test-verdict
+# execution-record and producer-receipt schema entries.
+# --------------------------------------------------------------------------- #
+_TEST_VERDICT_SCHEMA_IDS = {"TEST_VERDICT_EXECUTION_RECORD_V1", "TEST_VERDICT_PRODUCER_RECEIPT_V1"}
+
+
+def _fixture_file_path(fixture_ref: str):
+    file_part = fixture_ref.split("::")[0]
+    return REPO_ROOT / file_part
+
+
+class TestTestVerdictConsumerAndFixturePathsExist:
+    def test_consumer_paths_exist_and_match_child_b_contract(self, entries: list):
+        for entry in entries:
+            if entry.get("schema_id") not in _TEST_VERDICT_SCHEMA_IDS:
+                continue
+            consumer_paths = []
+            for consumer in entry.get("consumers", []):
+                consumer_paths.extend(consumer.get("paths", []))
+            assert consumer_paths, entry["schema_id"]
+            for rel_path in consumer_paths:
+                assert (REPO_ROOT / rel_path).exists(), (
+                    entry["schema_id"] + ": consumer path does not exist: " + rel_path
+                )
+            expected = {
+                "scripts/agent-guards/controlled_skill_mutation_policy.py",
+                "scripts/agent-guards/controlled_skill_mutation_exec.py",
+            }
+            assert set(consumer_paths) == expected, entry["schema_id"]
+
+    def test_definition_paths_exist(self, entries: list):
+        for entry in entries:
+            if entry.get("schema_id") not in _TEST_VERDICT_SCHEMA_IDS:
+                continue
+            for rel_path in entry.get("definition_paths", []):
+                assert (REPO_ROOT / rel_path).exists(), (
+                    entry["schema_id"] + ": definition path does not exist: " + rel_path
+                )
+
+    def test_positive_fixture_paths_exist(self, entries: list):
+        for entry in entries:
+            if entry.get("schema_id") not in _TEST_VERDICT_SCHEMA_IDS:
+                continue
+            positive = entry["validation"]["fixture_tests"]["positive"]
+            assert positive, entry["schema_id"]
+            for fixture_ref in positive:
+                assert _fixture_file_path(fixture_ref).exists(), (
+                    entry["schema_id"] + ": positive fixture file missing: " + fixture_ref
+                )
+
+    def test_negative_fixture_paths_exist_and_are_non_empty(self, entries: list):
+        for entry in entries:
+            if entry.get("schema_id") not in _TEST_VERDICT_SCHEMA_IDS:
+                continue
+            negative = entry["validation"]["fixture_tests"]["negative"]
+            assert negative, entry["schema_id"] + ": negative fixtures must not be empty (P2-8)"
+            for fixture_ref in negative:
+                assert _fixture_file_path(fixture_ref).exists(), (
+                    entry["schema_id"] + ": negative fixture file missing: " + fixture_ref
+                )
