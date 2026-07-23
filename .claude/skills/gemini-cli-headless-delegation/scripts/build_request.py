@@ -90,6 +90,16 @@ def _load_run_gemini_headless_module():
     resolve_model_chain / PROVIDER_AUTO_* constants) -- Issue #1269 Blocker 5:
     the runtime resolver is the single source of truth and must not be
     reimplemented here.
+
+    Issue #1695 PR review (Blocker 1): ``spec.loader.exec_module()`` triggers
+    CPython's normal bytecode-cache behaviour, which would otherwise write
+    ``scripts/__pycache__/run_gemini_headless.cpython-*.pyc`` into the
+    repository's runtime source directory -- a real filesystem side effect
+    that the model-policy subcommand's "read-only, no-side-effect inspector"
+    claim (module docstring, AC6) must not have, independent of whether the
+    caller's environment happens to set ``PYTHONDONTWRITEBYTECODE``.
+    ``sys.dont_write_bytecode`` is saved/restored around the load so this
+    function never leaves global interpreter state changed for callers.
     """
     script_dir = Path(__file__).resolve().parent
     module_path = script_dir / "run_gemini_headless.py"
@@ -97,7 +107,12 @@ def _load_run_gemini_headless_module():
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load run_gemini_headless from {module_path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    previous_dont_write_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous_dont_write_bytecode
     return module
 
 
@@ -416,6 +431,23 @@ MODEL_POLICY_SCHEMA = "delegation_model_policy/v1"
 MODEL_POLICY_PROVIDERS: tuple[str, ...] = ("gemini", "agy", "auto")
 
 
+class _ModelPolicyArgumentError(Exception):
+    """Raised by _ModelPolicyArgumentParser.error() instead of SystemExit(2).
+
+    Issue #1695 PR review (Major 1): argparse's default ``error()`` prints
+    usage text to stderr and calls ``sys.exit(2)``, which drops model-policy
+    out of its own delegation_model_policy/v1 JSON contract on a CLI usage
+    error (invalid --provider, unknown option, etc). Raising this exception
+    instead lets main_model_policy() convert the failure into a normal
+    schema-conformant failure payload on stdout.
+    """
+
+
+class _ModelPolicyArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:  # type: ignore[override]
+        raise _ModelPolicyArgumentError(message)
+
+
 def _resolve_gemini_chain(
     rgh: Any,
     role: str | None,
@@ -433,10 +465,27 @@ def _agy_provider_info(role: str | None) -> dict[str, Any]:
     and "agy-default" (the literal actual_model the real runtime returns for
     provider=agy) is surfaced only as legacy_compatibility_label, never as
     actual_model itself (Blocker 4).
+
+    Issue #1695 PR review (Blocker 2): this function never calls
+    load_model_routing() / resolve_model_chain() and is never given a
+    ``rgh`` module handle -- AGY has no model-chain concept at runtime
+    (_run_delegation_core() dispatches provider="agy" entirely before
+    Gemini's routing/validation), so a broken model_routing.yaml, or any
+    routing config at all, must never affect this branch.
+
+    Issue #1695 PR review (Major 3): upstream_capability now distinguishes
+    "the wrapper does not document upstream supporting explicit model
+    selection" (documented_explicit_model_selection) from "we never probed
+    the installed CLI's version" (installed_version / installed_version_probed).
+    configured_chain / readiness_checked / credentials_checked /
+    provider_available make explicit that this is a static, offline
+    inspection -- none of them reflect a live probe of the agy CLI
+    (implementing a live probe is out of scope for this dry-run inspector).
     """
     info: dict[str, Any] = {
         "provider": "agy",
         "resolved_chain": None,
+        "configured_chain": None,
         "actual_model": None,
         "legacy_compatibility_label": "agy-default",
         "wrapper_capability": {
@@ -445,12 +494,18 @@ def _agy_provider_info(role: str | None) -> dict[str, Any]:
         },
         "upstream_capability": {
             "probed": False,
+            "documented_explicit_model_selection": False,
+            "installed_version": None,
+            "installed_version_probed": False,
             "note": (
                 "model-policy is a dry-run inspector; it does not invoke the "
                 "agy CLI, so upstream (Antigravity CLI) model capability is "
                 "not probed."
             ),
         },
+        "readiness_checked": False,
+        "credentials_checked": False,
+        "provider_available": None,
     }
     if role:
         info["role_applied"] = False
@@ -460,6 +515,49 @@ def _agy_provider_info(role: str | None) -> dict[str, Any]:
             "calls resolve_model_chain() for provider=agy."
         )
     return info
+
+
+def _config_invalid_payload(base: dict[str, Any], exc: ValueError) -> dict[str, Any]:
+    return {
+        **base,
+        "ok": False,
+        "failure_class": "config_invalid",
+        "reason_code": "routing_config_invalid",
+        "failure_reason": str(exc),
+    }
+
+
+def _resolve_gemini_chain_or_failure(
+    rgh: Any,
+    role: str | None,
+    config_path: Path | None,
+    base: dict[str, Any],
+) -> tuple[list[str] | None, dict[str, Any] | None, int]:
+    """Load routing and resolve the Gemini chain, or build a failure payload.
+
+    Returns (chain, failure_payload, failure_exit_code). Exactly one of
+    (chain, failure_payload) is non-None: failure_payload is None on
+    success, chain is None on any failure. Shared by provider="gemini" and
+    provider="auto" (profile-eligible) -- both resolve the chain the same
+    way (Issue #1695 PR review: extracted to avoid duplicating the
+    routing-load / resolve-chain / failure-classification logic).
+    """
+    try:
+        routing = rgh.load_model_routing(config_path=config_path)
+    except ValueError as exc:
+        return None, _config_invalid_payload(base, exc), 1
+
+    chain, error = _resolve_gemini_chain(rgh, role, routing)
+    if error:
+        failure_class = error.split(":", 1)[0].strip()
+        payload = {
+            **base,
+            "ok": False,
+            "failure_class": failure_class,
+            "failure_reason": error,
+        }
+        return None, payload, 1
+    return chain, None, 0
 
 
 def build_model_policy(
@@ -473,11 +571,28 @@ def build_model_policy(
     Returns (payload, exit_code). exit_code follows the same convention as
     build_request(): 0 = success, 1 = validation/usage error (including
     unknown_role / empty_chain / routing_config_invalid / missing --profile
-    for provider=auto), 2 = internal error.
+    for provider=auto / invalid provider), 2 = internal error.
 
     config_path is not exposed on the CLI (Issue #1269 In Scope is limited to
     --provider/--role/--profile); it exists so tests can inject a hermetic
     model_routing.yaml override without touching the real config file.
+
+    Issue #1695 PR review (Blocker 2): control flow here mirrors
+    run_gemini_headless.py's own dispatch order, not an independent
+    ordering invented for this inspector:
+      1. provider is validated against MODEL_POLICY_PROVIDERS up front
+         (Minor fix) -- the Python API can be called directly, bypassing
+         argparse's ``choices`` constraint.
+      2. provider="agy" is dispatched immediately, with no routing config
+         ever loaded -- matching _run_delegation_core()'s early agy branch,
+         which runs entirely before Gemini validation/routing.
+      3. provider="auto" checks --profile presence, then
+         PROVIDER_AUTO_ELIGIBLE_PROFILES eligibility -- BOTH before loading
+         any routing config -- matching provider_auto_dispatch(), which
+         returns a "no provider attempted" result (and therefore never
+         loads routing) for an ineligible profile.
+      4. Only provider="gemini", or provider="auto" with an eligible
+         profile, ever call load_model_routing() / resolve_model_chain().
     """
     base: dict[str, Any] = {
         "schema": MODEL_POLICY_SCHEMA,
@@ -486,39 +601,14 @@ def build_model_policy(
         "profile": profile,
     }
 
-    if provider == "auto" and not profile:
+    if provider not in MODEL_POLICY_PROVIDERS:
         payload = {
             **base,
             "ok": False,
-            "failure_class": "profile_required_for_auto",
+            "failure_class": "invalid_provider",
             "failure_reason": (
-                "--provider auto requires --profile: dry-run inspection "
-                "mirrors runtime provider_auto_policy_v1 eligibility gating "
-                "(PROVIDER_AUTO_ELIGIBLE_PROFILES), which is profile-scoped."
+                f"provider must be one of {list(MODEL_POLICY_PROVIDERS)}, got {provider!r}"
             ),
-        }
-        return payload, 1
-
-    try:
-        rgh = _load_run_gemini_headless_module()
-    except Exception as exc:  # pylint: disable=broad-except
-        payload = {
-            **base,
-            "ok": False,
-            "failure_class": "internal_error",
-            "failure_reason": f"Failed to load run_gemini_headless: {exc}",
-        }
-        return payload, 2
-
-    try:
-        routing = rgh.load_model_routing(config_path=config_path)
-    except ValueError as exc:
-        payload = {
-            **base,
-            "ok": False,
-            "failure_class": "config_invalid",
-            "reason_code": "routing_config_invalid",
-            "failure_reason": str(exc),
         }
         return payload, 1
 
@@ -533,83 +623,144 @@ def build_model_policy(
         }
         return payload, 0
 
-    # provider in {"gemini", "auto"}: both resolve the gemini chain directly
-    # via resolve_model_chain() (auto's own runtime dispatch tries gemini
-    # first -- PROVIDER_AUTO_RUNTIME_ORDER).
-    chain, error = _resolve_gemini_chain(rgh, role, routing)
-    if error:
-        failure_class = error.split(":", 1)[0].strip()
-        payload = {
-            **base,
-            "ok": False,
-            "failure_class": failure_class,
-            "failure_reason": error,
-        }
-        return payload, 1
+    if provider == "auto":
+        if not profile:
+            payload = {
+                **base,
+                "ok": False,
+                "failure_class": "profile_required_for_auto",
+                "failure_reason": (
+                    "--provider auto requires --profile: dry-run inspection "
+                    "mirrors runtime provider_auto_policy_v1 eligibility gating "
+                    "(PROVIDER_AUTO_ELIGIBLE_PROFILES), which is profile-scoped."
+                ),
+            }
+            return payload, 1
 
-    if provider == "gemini":
+        try:
+            rgh = _load_run_gemini_headless_module()
+        except Exception as exc:  # pylint: disable=broad-except
+            payload = {
+                **base,
+                "ok": False,
+                "failure_class": "internal_error",
+                "failure_reason": f"Failed to load run_gemini_headless: {exc}",
+            }
+            return payload, 2
+
+        runtime_order = list(rgh.PROVIDER_AUTO_RUNTIME_ORDER)
+        profile_eligible = profile in rgh.PROVIDER_AUTO_ELIGIBLE_PROFILES
+
+        if not profile_eligible:
+            # Mirrors provider_auto_dispatch()'s own stop-condition: no
+            # provider is attempted at all for an ineligible profile, so no
+            # routing config is loaded and no chain is resolved here either
+            # -- a broken model_routing.yaml or an unknown --role must not
+            # fail this branch.
+            payload = {
+                **base,
+                "ok": True,
+                "failure_class": None,
+                "failure_reason": None,
+                "runtime_order": runtime_order,
+                "profile_eligible": False,
+                "provider_candidates": None,
+                "consumer_constraints": None,
+            }
+            return payload, 0
+
+        chain, failure_payload, failure_exit = _resolve_gemini_chain_or_failure(
+            rgh, role, config_path, base
+        )
+        if failure_payload is not None:
+            return failure_payload, failure_exit
+
+        provider_candidates: list[dict[str, Any]] = []
+        for candidate in runtime_order:
+            if candidate == "gemini":
+                provider_candidates.append(
+                    {
+                        "provider": "gemini",
+                        "resolved_chain": chain,
+                        "actual_model": None,
+                    }
+                )
+            elif candidate == "agy":
+                provider_candidates.append(_agy_provider_info(role))
+            else:
+                provider_candidates.append(
+                    {"provider": candidate, "resolved_chain": None, "actual_model": None}
+                )
+
+        consumer_constraints = {
+            # Major 2 (Issue #1695 PR review): provider_auto_dispatch()
+            # attempts exactly one provider at a time because
+            # PROVIDER_AUTO_RETRYABLE_FAILURE_CLASSES / get_retry_budget()
+            # define per-provider attempt/backoff budgets -- running two
+            # providers concurrently would make attempts_by_model /
+            # provider_attempts unauditable and would let a single request
+            # exceed its configured retry budget across providers (not
+            # merely "it happens to run sequentially"). reason_code is read
+            # from run_gemini_headless.py's own exported constant so this
+            # value cannot drift from the runtime's own definition.
+            "fan_out": {
+                "supported": False,
+                "reason_code": rgh.PROVIDER_AUTO_FAN_OUT_UNSUPPORTED_REASON_CODE,
+            },
+            # _validate_agy_request() rejects an empty/missing "prompt" field
+            # (agy_empty_prompt) for every AGY-eligible profile, so a fallback
+            # attempt to provider=agy always requires a non-empty prompt.
+            "agy_fallback_requires_prompt": True,
+            # _validate_agy_request() rejects request["model"] outright
+            # (unsupported_provider_option), so an explicit model set for the
+            # initial gemini attempt does not survive a fallback to agy.
+            "explicit_model_survives_fallback": False,
+        }
+
         payload = {
             **base,
             "ok": True,
             "failure_class": None,
             "failure_reason": None,
-            "resolved_chain": chain,
-            "actual_model": None,
-            "resolver_source": "run_gemini_headless.resolve_model_chain",
+            "runtime_order": runtime_order,
+            "profile_eligible": True,
+            "provider_candidates": provider_candidates,
+            "consumer_constraints": consumer_constraints,
         }
         return payload, 0
 
-    # provider == "auto"
-    runtime_order = list(rgh.PROVIDER_AUTO_RUNTIME_ORDER)
-    profile_eligible = profile in rgh.PROVIDER_AUTO_ELIGIBLE_PROFILES
+    # provider == "gemini"
+    try:
+        rgh = _load_run_gemini_headless_module()
+    except Exception as exc:  # pylint: disable=broad-except
+        payload = {
+            **base,
+            "ok": False,
+            "failure_class": "internal_error",
+            "failure_reason": f"Failed to load run_gemini_headless: {exc}",
+        }
+        return payload, 2
 
-    provider_candidates: list[dict[str, Any]] = []
-    for candidate in runtime_order:
-        if candidate == "gemini":
-            provider_candidates.append(
-                {
-                    "provider": "gemini",
-                    "resolved_chain": chain,
-                    "actual_model": None,
-                }
-            )
-        elif candidate == "agy":
-            provider_candidates.append(_agy_provider_info(role))
-        else:
-            provider_candidates.append(
-                {"provider": candidate, "resolved_chain": None, "actual_model": None}
-            )
-
-    consumer_constraints = {
-        # provider_auto_dispatch() loops sequentially over
-        # PROVIDER_AUTO_RUNTIME_ORDER; it never attempts multiple providers
-        # concurrently.
-        "fan_out": False,
-        # _validate_agy_request() rejects an empty/missing "prompt" field
-        # (agy_empty_prompt) for every AGY-eligible profile, so a fallback
-        # attempt to provider=agy always requires a non-empty prompt.
-        "agy_fallback_requires_prompt": True,
-        # _validate_agy_request() rejects request["model"] outright
-        # (unsupported_provider_option), so an explicit model set for the
-        # initial gemini attempt does not survive a fallback to agy.
-        "explicit_model_survives_fallback": False,
-    }
+    chain, failure_payload, failure_exit = _resolve_gemini_chain_or_failure(
+        rgh, role, config_path, base
+    )
+    if failure_payload is not None:
+        return failure_payload, failure_exit
 
     payload = {
         **base,
         "ok": True,
         "failure_class": None,
         "failure_reason": None,
-        "runtime_order": runtime_order,
-        "profile_eligible": profile_eligible,
-        "provider_candidates": provider_candidates,
-        "consumer_constraints": consumer_constraints,
+        "resolved_chain": chain,
+        "actual_model": None,
+        "resolver_source": "run_gemini_headless.resolve_model_chain",
     }
     return payload, 0
 
 
 def build_model_policy_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _ModelPolicyArgumentParser(
         prog="build_request.py model-policy",
         description=(
             "Inspect the provider/role model policy that run_gemini_headless.py "
@@ -648,7 +799,24 @@ def build_model_policy_arg_parser() -> argparse.ArgumentParser:
 
 def main_model_policy(argv: list[str]) -> int:
     parser = build_model_policy_arg_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except _ModelPolicyArgumentError as exc:
+        # Major 1 (Issue #1695 PR review): keep argparse usage errors (invalid
+        # --provider, unknown option, etc) inside the delegation_model_policy/v1
+        # JSON contract instead of falling back to argparse's own usage text +
+        # bare exit code 2.
+        payload = {
+            "schema": MODEL_POLICY_SCHEMA,
+            "provider": None,
+            "role": None,
+            "profile": None,
+            "ok": False,
+            "failure_class": "invalid_cli_arguments",
+            "failure_reason": str(exc),
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 1
     payload, exit_code = build_model_policy(
         provider=args.provider,
         role=args.role,
