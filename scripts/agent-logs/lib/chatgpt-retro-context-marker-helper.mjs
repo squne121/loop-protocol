@@ -13,7 +13,6 @@ import {
 } from '../../lib/agent-run-report-validation.mjs'
 import {
   GhCliIssueCommentsClient,
-  listAllIssueComments,
   listAllIssueCommentsStructured,
   parseMarkerComment,
   sha256Hex,
@@ -133,12 +132,19 @@ function ownershipEquals(left, right) {
     && left.parentIssue === right.parentIssue
 }
 
+// CommonMark 0.31.2 defines a blank line as a line containing nothing but
+// U+0020 SPACE / U+0009 TAB characters (or nothing at all). `String.prototype.trim()`
+// strips a much wider set of Unicode whitespace (NBSP U+00A0, em space U+2003,
+// form feed U+000C, etc.), which would incorrectly classify those lines as
+// blank and let a later line be mistaken for the "first non-empty line".
+const COMMONMARK_BLANK_LINE_PATTERN = /^[\t ]*$/u
+
 function findColumnZeroNonEmptyLines(body, count) {
   const rawLines = typeof body === 'string' ? body.split('\n') : []
   const result = []
   for (const rawLine of rawLines) {
     const stripped = rawLine.replace(/\r$/u, '')
-    if (stripped.trim().length === 0) {
+    if (COMMONMARK_BLANK_LINE_PATTERN.test(stripped)) {
       continue
     }
     result.push(stripped)
@@ -255,6 +261,7 @@ export function validateChatgptRetroContextCommentBody(body, {
     byteLength,
     ownership,
     digest,
+    classificationState: classification.state,
   }
 }
 
@@ -314,7 +321,16 @@ export function parseChatgptRetroContextComment(comment) {
   if (!validation.ownership) {
     return {
       ok: false,
-      malformed: false,
+      // A comment whose first non-empty line clearly intends to be a
+      // CHATGPT_RETRO_CONTEXT_V1 marker but fails the strict ownership
+      // pattern (classification `malformed_marker_intent`) must still be
+      // reported as malformed even when ownership could not be parsed at
+      // all -- otherwise it silently falls through as "not a marker" and
+      // upsert/post-write callers would treat the write path as clear
+      // while resolve-live (which classifies independently of ownership)
+      // blocks on the very same comment (split-brain, see #1501 P0 review).
+      malformed: validation.classificationState === 'malformed_marker_intent',
+      classificationState: validation.classificationState,
       body,
       comment,
     }
@@ -322,6 +338,7 @@ export function parseChatgptRetroContextComment(comment) {
   return {
     ok: validation.valid,
     malformed: !validation.valid,
+    classificationState: validation.classificationState,
     body,
     comment,
     ownership: validation.ownership,
@@ -331,15 +348,71 @@ export function parseChatgptRetroContextComment(comment) {
   }
 }
 
+// Finds any comment in the given list whose first non-empty line clearly
+// intends to be a CHATGPT_RETRO_CONTEXT_V1 / CHATGPT_RETRO_CONTEXT_DIGEST_V1
+// marker but fails strict validation, regardless of whether ownership could
+// be parsed from it. Mirrors the unconditional (not ownership-filtered)
+// scan resolveChatgptRetroContextLive() already performs, so upsert/readback
+// and resolve-live never disagree about a malformed marker intent comment
+// (see #1501 P0 review: split-brain between post and resolve paths).
+function findMalformedMarkerIntentComment(comments) {
+  return comments.find((comment) => (
+    classifyChatgptRetroContextMarkerCandidate(comment?.body).state === 'malformed_marker_intent'
+  )) ?? null
+}
+
+// Lists every issue comment for a write-path pre-check or post-write
+// readback. Uses the structured pagination result and refuses to proceed
+// (fail-closed) whenever pagination did not fully complete, instead of the
+// thin `listAllIssueComments()` wrapper which only throws on the
+// `pagination_exhausted` link-header case and silently swallows
+// `page_budget_exhausted` (fixed-page-budget clients), which could hide a
+// later page containing a duplicate or malformed ownership marker.
+async function listAllCommentsForWrite(client, { repo, issueNumber }) {
+  const listed = await listAllIssueCommentsStructured(client, { repo, issueNumber })
+  if (listed.page_budget_exhausted || listed.pagination_exhausted) {
+    throw runtimeError('chatgpt_retro_context.blocked_page_budget_exhausted', 'comment pagination did not complete before write; refusing to write to avoid missing an existing marker on a later page')
+  }
+  return listed.comments
+}
+
 /**
  * Post-write readback (AC12): re-lists all issue comments and confirms
  * that exactly one comment matches the stable ownership marker after a
- * create or supersede write. This guards against a concurrent write
- * (race) creating a duplicate ownership marker that the pre-write
- * duplicate check could not have observed.
+ * create or supersede write, and that the comment actually written
+ * matches the candidate that was supposed to be written (comment id,
+ * digest, ok/malformed state). This guards against a concurrent write
+ * (race) creating a duplicate ownership marker, and against a readback
+ * that merely counts ownership matches without confirming the write's
+ * own content landed correctly.
  */
-async function verifySingleOwnershipMarkerAfterWrite(client, { repo, issueNumber, ownership }) {
-  const comments = await listAllIssueComments(client, { repo, issueNumber })
+async function verifySingleOwnershipMarkerAfterWrite(client, {
+  repo,
+  issueNumber,
+  ownership,
+  candidateDigest,
+  writtenCommentId,
+}) {
+  if (typeof client.getIssueComment === 'function' && writtenCommentId !== null && writtenCommentId !== undefined) {
+    const directComment = await client.getIssueComment({ repo, commentId: writtenCommentId })
+    const directParsed = parseChatgptRetroContextComment(directComment)
+    if (
+      !directParsed.ok
+      || directParsed.malformed
+      || !directParsed.ownership
+      || !ownershipEquals(directParsed.ownership, ownership)
+      || directParsed.digest !== candidateDigest
+      || directParsed.comment?.id !== writtenCommentId
+    ) {
+      throw runtimeError('chatgpt_retro_context.blocked_post_write_mismatch', 'post-write direct readback of the written comment id does not match the candidate that was written (ok/malformed/ownership/digest/comment id)')
+    }
+  }
+
+  const comments = await listAllCommentsForWrite(client, { repo, issueNumber })
+  const malformedIntent = findMalformedMarkerIntentComment(comments)
+  if (malformedIntent) {
+    throw runtimeError('chatgpt_retro_context.blocked_malformed_marker_syntax', 'post-write readback found a comment with malformed marker intent syntax')
+  }
   const matches = comments
     .map((comment) => parseChatgptRetroContextComment(comment))
     .filter((entry) => entry.ownership && ownershipEquals(entry.ownership, ownership))
@@ -349,7 +422,16 @@ async function verifySingleOwnershipMarkerAfterWrite(client, { repo, issueNumber
   if (matches.length >= 2) {
     throw runtimeError('chatgpt_retro_context.blocked_post_write_duplicate', 'post-write readback found more than one ownership marker comment after writing')
   }
-  return matches[0]
+  const [singleMatch] = matches
+  if (
+    !singleMatch.ok
+    || singleMatch.malformed
+    || singleMatch.digest !== candidateDigest
+    || singleMatch.comment?.id !== writtenCommentId
+  ) {
+    throw runtimeError('chatgpt_retro_context.blocked_post_write_mismatch', 'post-write readback found a comment for this ownership but it does not match what was written (ok/malformed/digest/comment id)')
+  }
+  return singleMatch
 }
 
 export async function upsertChatgptRetroContextComment(client, {
@@ -363,10 +445,22 @@ export async function upsertChatgptRetroContextComment(client, {
 }) {
   const ownership = buildChatgptRetroContextOwnership({ repo, targetType, targetNumber, parentIssue })
   const candidate = buildChatgptRetroContextCommentBody({ ownership, payloadMarkdown })
-  const comments = await listAllIssueComments(client, {
+  const comments = await listAllCommentsForWrite(client, {
     repo,
     issueNumber: ownership.targetNumber,
   })
+  // Reject unconditionally on malformed_marker_intent (not filtered by
+  // ownership) *before* any ownership-scoped matching. Without this, a
+  // comment whose ownership cannot be parsed (e.g. missing parent_issue)
+  // classifies as malformed_marker_intent but has no `ownership` tuple, so
+  // the ownership-scoped `matches` filter below would never see it and
+  // upsert would fall through to `create` -- while resolve-live classifies
+  // the very same comment independently and blocks with
+  // blocked_malformed_marker_syntax. See #1501 P0 review.
+  const malformedIntent = findMalformedMarkerIntentComment(comments)
+  if (malformedIntent) {
+    throw runtimeError('chatgpt_retro_context.blocked_malformed_marker_syntax', 'existing comment on this target has malformed marker intent syntax; refusing to write until it is resolved')
+  }
   const parsedComments = comments.map((comment) => parseChatgptRetroContextComment(comment))
   const malformedMatch = parsedComments.find((entry) => entry.ownership && ownershipEquals(entry.ownership, ownership) && entry.malformed)
   if (malformedMatch) {
@@ -385,7 +479,13 @@ export async function upsertChatgptRetroContextComment(client, {
       issueNumber: ownership.targetNumber,
       body: candidate.body,
     })
-    await verifySingleOwnershipMarkerAfterWrite(client, { repo, issueNumber: ownership.targetNumber, ownership })
+    await verifySingleOwnershipMarkerAfterWrite(client, {
+      repo,
+      issueNumber: ownership.targetNumber,
+      ownership,
+      candidateDigest: candidate.digest,
+      writtenCommentId: created?.id ?? null,
+    })
     return { action: 'create', digest: candidate.digest, comment_id: created?.id ?? null, comment_url: created?.html_url ?? created?.url ?? null }
   }
 
@@ -431,7 +531,13 @@ export async function upsertChatgptRetroContextComment(client, {
     commentId: existing.comment.id,
     body: candidate.body,
   })
-  await verifySingleOwnershipMarkerAfterWrite(client, { repo, issueNumber: ownership.targetNumber, ownership })
+  await verifySingleOwnershipMarkerAfterWrite(client, {
+    repo,
+    issueNumber: ownership.targetNumber,
+    ownership,
+    candidateDigest: candidate.digest,
+    writtenCommentId: updated?.id ?? existing.comment?.id ?? null,
+  })
   return {
     action: 'supersede',
     digest: candidate.digest,

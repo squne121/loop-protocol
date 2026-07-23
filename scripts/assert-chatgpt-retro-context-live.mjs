@@ -120,7 +120,16 @@ export function assertChatgptRetroContextLiveResult(resolveResult, expected) {
     ['comment_chain.pagination.reference_comments_complete', resolveResult?.comment_chain?.pagination?.reference_comments_complete],
   ]
   if (isPullRequestTarget) {
-    paginationChecks.push(['pr_review_surface.pagination.complete', resolveResult?.pr_review_surface?.pagination?.complete])
+    // Check every component pagination-completeness field individually
+    // (not just the aggregate `complete` value) -- an inconsistent producer
+    // could report every component field incomplete-but-aggregate-true (or
+    // vice versa) and a pure aggregate check would not catch it.
+    const prReviewSurfacePagination = resolveResult?.pr_review_surface?.pagination
+    paginationChecks.push(['pr_review_surface.pagination.reviews_complete', prReviewSurfacePagination?.reviews_complete])
+    paginationChecks.push(['pr_review_surface.pagination.review_comments_complete', prReviewSurfacePagination?.review_comments_complete])
+    paginationChecks.push(['pr_review_surface.pagination.review_threads_complete', prReviewSurfacePagination?.review_threads_complete])
+    paginationChecks.push(['pr_review_surface.pagination.thread_comments_complete', prReviewSurfacePagination?.thread_comments_complete])
+    paginationChecks.push(['pr_review_surface.pagination.complete', prReviewSurfacePagination?.complete])
   }
   for (const [path, value] of paginationChecks) {
     if (value !== true) {
@@ -132,13 +141,37 @@ export function assertChatgptRetroContextLiveResult(resolveResult, expected) {
     }
   }
 
+  if (isPullRequestTarget) {
+    const prReviewSurfacePagination = resolveResult?.pr_review_surface?.pagination ?? {}
+    const recomputedComplete = prReviewSurfacePagination.reviews_complete === true
+      && prReviewSurfacePagination.review_comments_complete === true
+      && prReviewSurfacePagination.review_threads_complete === true
+      && prReviewSurfacePagination.thread_comments_complete === true
+    if (prReviewSurfacePagination.complete !== recomputedComplete) {
+      errors.push({
+        path: 'pr_review_surface.pagination.complete',
+        code: 'chatgpt_retro_context_live_assertion.pagination_complete_recompute_mismatch',
+        message: `pr_review_surface.pagination.complete is ${JSON.stringify(prReviewSurfacePagination.complete)} but recomputing from the four component completeness fields yields ${JSON.stringify(recomputedComplete)}`,
+      })
+    }
+  }
+
   return {
     ok: errors.length === 0,
     errors,
   }
 }
 
-function classifySpawnFailure(spawnResult) {
+// Timeout classification must be based on Node's own ETIMEDOUT error code,
+// never on the raw signal name. `child_process.spawnSync({ timeout })` sets
+// BOTH `result.error.code === 'ETIMEDOUT'` AND `result.signal === killSignal`
+// (SIGTERM by default) when the bounded timeout actually fires -- so the
+// `spawnResult.error` branch below already reliably classifies real
+// timeouts. Treating every SIGTERM/SIGKILL exit as a timeout (regardless of
+// `error.code`) would misclassify an externally-sent SIGTERM/SIGKILL (e.g. a
+// CI job cancellation, `kill -9`, an OOM killer) as a bounded-timeout
+// exceeded, which is a different failure mode.
+export function classifySpawnFailure(spawnResult) {
   if (spawnResult.error) {
     if (spawnResult.error.code === 'ENOBUFS' || spawnResult.error.code === 'E2BIG') {
       return { code: 'buffer_exceeded', message: `resolver subprocess output exceeded the buffer limit: ${spawnResult.error.message}` }
@@ -149,9 +182,6 @@ function classifySpawnFailure(spawnResult) {
     return { code: 'spawn_failed', message: `resolver subprocess failed to spawn: ${spawnResult.error.message}` }
   }
   if (spawnResult.signal) {
-    if (spawnResult.signal === 'SIGTERM' || spawnResult.signal === 'SIGKILL') {
-      return { code: 'timeout', message: `resolver subprocess was terminated by signal ${spawnResult.signal} (bounded timeout exceeded)` }
-    }
     return { code: 'signal_terminated', message: `resolver subprocess was terminated by signal ${spawnResult.signal}` }
   }
   return null
@@ -169,21 +199,89 @@ function runResolverSubprocess({ repo, targetType, targetNumber, parentIssue, ma
   if (markerCommentUrl) {
     args.push('--marker-comment-url', markerCommentUrl)
   }
-  return spawnSync(process.execPath, args, {
+  // `detached: true` puts the resolver child in its own process group so a
+  // bounded-timeout kill can be extended to any grandchild it spawns (the
+  // resolver itself runs a synchronous `gh api` subprocess) by signalling
+  // the negative pid (the whole process group) below, instead of relying on
+  // Linux to automatically reap orphaned grandchildren.
+  const spawnResult = spawnSync(process.execPath, args, {
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: timeoutMs,
     killSignal: 'SIGTERM',
     maxBuffer: DEFAULT_MAX_BUFFER,
+    detached: true,
   })
+  if (spawnResult.error?.code === 'ETIMEDOUT' && typeof spawnResult.pid === 'number') {
+    // Best-effort defensive cleanup: spawnSync's own timeout-kill only
+    // targets the immediate child pid. If the resolver was blocked inside
+    // its own synchronous `gh` call when the timeout fired, that grandchild
+    // process can be left running as an orphan; killing the process group
+    // reaps it too.
+    try {
+      process.kill(-spawnResult.pid, 'SIGKILL')
+    } catch {
+      // ESRCH (already exited) / EPERM -- nothing more we can safely do.
+    }
+  }
+  return spawnResult
 }
 
-function resolveGitCommit() {
-  const result = spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf-8' })
-  if (result.status !== 0 || typeof result.stdout !== 'string') {
-    return null
+const REPO_ROOT = resolvePath(SCRIPT_DIR, '..')
+
+function isFortyHexCommit(value) {
+  return typeof value === 'string' && /^[0-9a-f]{40}$/u.test(value)
+}
+
+function runGit(repoRoot, args) {
+  return spawnSync('git', ['-C', repoRoot, ...args], { encoding: 'utf-8' })
+}
+
+/**
+ * Determines whether a `resolver_commit` is trustworthy enough for an
+ * otherwise-passing live assertion to be marked `live_evidence_eligible`.
+ * A bare `git rev-parse HEAD` run against `process.cwd()` can report an
+ * unrelated commit if the CLI happens to be invoked with a different
+ * repository as cwd, and does not detect an uncommitted working tree.
+ * This instead:
+ * - always resolves against the resolver script's own directory (`git -C`),
+ *   never the caller's `process.cwd()`
+ * - requires a full 40-hex commit id (`rev-parse --verify HEAD^{commit}`)
+ * - requires that directory's git toplevel to equal `repoRoot` exactly
+ *   (guards against `repoRoot` being a non-root subdirectory nested inside
+ *   an unrelated outer repository)
+ * - requires a clean working tree and index (`git diff --quiet` /
+ *   `git diff --cached --quiet`)
+ */
+export function evaluateLiveEvidenceProvenance({ repoRoot }) {
+  const commitResult = runGit(repoRoot, ['rev-parse', '--verify', 'HEAD^{commit}'])
+  if (commitResult.status !== 0 || typeof commitResult.stdout !== 'string') {
+    return { commit: null, eligible: false }
   }
-  return result.stdout.trim() || null
+  const commit = commitResult.stdout.trim()
+  if (!isFortyHexCommit(commit)) {
+    return { commit: null, eligible: false }
+  }
+
+  const toplevelResult = runGit(repoRoot, ['rev-parse', '--show-toplevel'])
+  if (toplevelResult.status !== 0 || typeof toplevelResult.stdout !== 'string') {
+    return { commit, eligible: false }
+  }
+  if (resolvePath(toplevelResult.stdout.trim()) !== resolvePath(repoRoot)) {
+    return { commit, eligible: false }
+  }
+
+  const workingTreeClean = runGit(repoRoot, ['diff', '--quiet']).status === 0
+  const indexClean = runGit(repoRoot, ['diff', '--cached', '--quiet']).status === 0
+  if (!workingTreeClean || !indexClean) {
+    return { commit, eligible: false }
+  }
+
+  return { commit, eligible: true }
+}
+
+function computeLiveEvidenceProvenance() {
+  return evaluateLiveEvidenceProvenance({ repoRoot: REPO_ROOT })
 }
 
 function computeCommandArgsDigest(expected) {
@@ -201,11 +299,12 @@ function buildOutput({
   errorMessage = null,
   includeLiveMetadata = false,
 }) {
+  const provenance = includeLiveMetadata ? computeLiveEvidenceProvenance() : null
   const output = {
     schema: SCHEMA,
     assertion_status: assertionStatus,
     execution_profile: executionProfile,
-    live_evidence_eligible: assertionStatus === 'pass' && executionProfile === 'live',
+    live_evidence_eligible: assertionStatus === 'pass' && executionProfile === 'live' && provenance?.eligible === true,
     repo: expected.repo,
     target: { type: expected.targetType, number: expected.targetNumber },
     parent_issue: expected.parentIssue,
@@ -219,15 +318,100 @@ function buildOutput({
   }
   if (includeLiveMetadata) {
     output.checked_at = new Date().toISOString()
-    output.resolver_commit = resolveGitCommit()
+    output.resolver_commit = provenance.commit
     output.command_args_digest = computeCommandArgsDigest(expected)
   }
   return output
 }
 
 function exitWith(output, exitCode) {
-  console.log(JSON.stringify(output))
-  process.exit(exitCode)
+  // `process.exit()` can truncate stdout before it finishes flushing,
+  // especially when stdout is a pipe (exactly how a test harness / CI job
+  // captures this CLI's output) rather than a TTY. Setting
+  // `process.exitCode` and letting the event loop drain naturally instead
+  // guarantees the full JSON payload is flushed before the process exits.
+  process.stdout.write(`${JSON.stringify(output)}\n`)
+  process.exitCode = exitCode
+}
+
+/**
+ * Pure(ish) evaluation of an already-completed resolver `spawnSync` result:
+ * classifies spawn failure, parses stdout, and runs the domain assertion.
+ * Exported (dependency-injectable input) so subprocess failure modes
+ * (ENOBUFS/E2BIG, spawn ENOENT, external signal termination, ordinary
+ * resolver non-zero exit, multiple/extra-text stdout) can be tested
+ * deterministically against synthetic `spawnResult` objects without
+ * actually spawning an OS subprocess.
+ */
+export function evaluateResolverSpawnResult(spawnResult, { expected, executionProfile }) {
+  const spawnFailure = classifySpawnFailure(spawnResult)
+  if (spawnFailure) {
+    return {
+      output: buildOutput({
+        assertionStatus: 'error',
+        executionProfile,
+        expected,
+        errorCode: `chatgpt_retro_context_live_assertion.${spawnFailure.code}`,
+        errorMessage: spawnFailure.message,
+        includeLiveMetadata: true,
+      }),
+      exitCode: 2,
+    }
+  }
+
+  const stdout = typeof spawnResult.stdout === 'string' ? spawnResult.stdout.trim() : ''
+  let parsedStdout = null
+  if (stdout.length > 0) {
+    try {
+      parsedStdout = JSON.parse(stdout)
+    } catch {
+      parsedStdout = null
+    }
+  }
+
+  if (spawnResult.status !== 0) {
+    const errorCode = parsedStdout?.error_code ?? 'chatgpt_retro_context_live_assertion.resolver_nonzero_exit'
+    const errorMessage = parsedStdout?.error_message
+      ?? `resolver subprocess exited with status ${spawnResult.status}: ${(spawnResult.stderr ?? '').trim() || stdout}`
+    return {
+      output: buildOutput({
+        assertionStatus: 'error',
+        executionProfile,
+        expected,
+        errorCode,
+        errorMessage,
+        includeLiveMetadata: true,
+      }),
+      exitCode: 2,
+    }
+  }
+
+  if (parsedStdout === null) {
+    return {
+      output: buildOutput({
+        assertionStatus: 'error',
+        executionProfile,
+        expected,
+        errorCode: 'chatgpt_retro_context_live_assertion.invalid_json_output',
+        errorMessage: 'resolver subprocess did not emit a single parsable JSON object on stdout',
+        includeLiveMetadata: true,
+      }),
+      exitCode: 2,
+    }
+  }
+
+  const assertion = assertChatgptRetroContextLiveResult(parsedStdout, expected)
+  return {
+    output: buildOutput({
+      assertionStatus: assertion.ok ? 'pass' : 'fail',
+      executionProfile,
+      expected,
+      resolveResult: parsedStdout,
+      domainErrors: assertion.errors,
+      includeLiveMetadata: true,
+    }),
+    exitCode: assertion.ok ? 0 : 1,
+  }
 }
 
 async function loadFixtureResolveResult(filePath) {
@@ -276,69 +460,15 @@ async function runCli() {
   }
 
   const spawnResult = runResolverSubprocess({ ...expected, timeoutMs })
-  const spawnFailure = classifySpawnFailure(spawnResult)
-  if (spawnFailure) {
-    return exitWith(buildOutput({
-      assertionStatus: 'error',
-      executionProfile,
-      expected,
-      errorCode: `chatgpt_retro_context_live_assertion.${spawnFailure.code}`,
-      errorMessage: spawnFailure.message,
-      includeLiveMetadata: true,
-    }), 2)
-  }
-
-  const stdout = typeof spawnResult.stdout === 'string' ? spawnResult.stdout.trim() : ''
-  let parsedStdout = null
-  if (stdout.length > 0) {
-    try {
-      parsedStdout = JSON.parse(stdout)
-    } catch {
-      parsedStdout = null
-    }
-  }
-
-  if (spawnResult.status !== 0) {
-    const errorCode = parsedStdout?.error_code ?? 'chatgpt_retro_context_live_assertion.resolver_nonzero_exit'
-    const errorMessage = parsedStdout?.error_message
-      ?? `resolver subprocess exited with status ${spawnResult.status}: ${(spawnResult.stderr ?? '').trim() || stdout}`
-    return exitWith(buildOutput({
-      assertionStatus: 'error',
-      executionProfile,
-      expected,
-      errorCode,
-      errorMessage,
-      includeLiveMetadata: true,
-    }), 2)
-  }
-
-  if (parsedStdout === null) {
-    return exitWith(buildOutput({
-      assertionStatus: 'error',
-      executionProfile,
-      expected,
-      errorCode: 'chatgpt_retro_context_live_assertion.invalid_json_output',
-      errorMessage: 'resolver subprocess did not emit a single parsable JSON object on stdout',
-      includeLiveMetadata: true,
-    }), 2)
-  }
-
-  const assertion = assertChatgptRetroContextLiveResult(parsedStdout, expected)
-  return exitWith(buildOutput({
-    assertionStatus: assertion.ok ? 'pass' : 'fail',
-    executionProfile,
-    expected,
-    resolveResult: parsedStdout,
-    domainErrors: assertion.errors,
-    includeLiveMetadata: true,
-  }), assertion.ok ? 0 : 1)
+  const { output, exitCode } = evaluateResolverSpawnResult(spawnResult, { expected, executionProfile })
+  return exitWith(output, exitCode)
 }
 
 const isDirectExecution = process.argv[1] === fileURLToPath(import.meta.url)
 if (isDirectExecution) {
   runCli().catch((error) => {
     const isCliError = error instanceof CliError
-    console.log(JSON.stringify({
+    process.stdout.write(`${JSON.stringify({
       schema: SCHEMA,
       assertion_status: 'error',
       execution_profile: null,
@@ -350,7 +480,7 @@ if (isDirectExecution) {
       checked_at: null,
       resolver_commit: null,
       command_args_digest: null,
-    }))
-    process.exit(2)
+    })}\n`)
+    process.exitCode = 2
   })
 }
