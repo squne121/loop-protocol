@@ -22,6 +22,17 @@ CODEX_ONLY_ALLOWED_AGENTS = {"spark-skim", "spark-worker", "spark-deep"}
 CODEX_ONLY_PARITY_REASON = "manual_codex_spark_agent"
 CODEX_ONLY_MODEL = "gpt-5.3-codex-spark"
 EXPECTED_HOOK_KEYS = ["command", "statusMessage", "timeout", "type"]
+SCOPE_ROLLUP_PROFILE = "loop-protocol-scope-rollup"
+SCOPE_ROLLUP_MARKER_TOKENS = (
+    "marker_schema_version: 3",
+    "query_schema_version: 4",
+    "issues_completeness",
+    "pull_requests_completeness",
+    "transaction_budget",
+    "result_sha256",
+    "verify_status: verified",
+    "payload: {schema_version: 2}",
+)
 CHECK_CODEX_AGENTS_BASE = 'rtk pnpm exec node "$(git rev-parse --show-toplevel)/scripts/check-codex-agents.mjs"'
 COMPOSITE_BASE = 'rtk pnpm exec node "$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs"'
 EXPECTED_PRETOOL_HOOKS = {
@@ -167,6 +178,60 @@ def load_agent(path: Path) -> dict:
     return data
 
 
+def validate_scope_rollup_runtime_contract(expectations: dict) -> list[str]:
+    """Validate the isolated temp-write exception without widening readonly.
+
+    This is a declaration validator, not proof that an unmanaged parent
+    runtime honored the profile.  Live evidence is separately availability
+    gated by the runtime probe.
+    """
+    failures: list[str] = []
+    expected = expectations["required_agents"].get("scope-rollup-runner")
+    if not isinstance(expected, dict):
+        return ["scope-rollup-runner: missing expectation"]
+    exclusion = expected.get("permission_exclusion")
+    if not isinstance(exclusion, dict):
+        return ["scope-rollup-runner: permission exclusion must be structured"]
+    required_exclusion = {
+        "allowlisted_agent": "scope-rollup-runner",
+        "reason": "claude_auto_permission_is_not_comparable_to_codex_ephemeral_write_profile",
+        "follow_up_issue": "#1686",
+        "expires_on": "2026-12-31",
+    }
+    if exclusion != required_exclusion:
+        failures.append("scope-rollup-runner: permission exclusion allowlist/reason/expiry/follow-up mismatch")
+
+    config = read_toml(CONFIG_PATH)
+    profile = config.get("permissions", {}).get(SCOPE_ROLLUP_PROFILE)
+    if not isinstance(profile, dict):
+        return failures + [f".codex/config.toml: missing {SCOPE_ROLLUP_PROFILE} profile"]
+    filesystem = profile.get("filesystem", {})
+    roots = filesystem.get(":workspace_roots", {}) if isinstance(filesystem, dict) else {}
+    if not isinstance(filesystem, dict) or filesystem.get(":tmpdir") != "write" or filesystem.get(":slash_tmp") != "write":
+        failures.append(f".codex/config.toml: {SCOPE_ROLLUP_PROFILE} must write only :tmpdir and :slash_tmp")
+    if not isinstance(roots, dict) or roots.get(".") != "read":
+        failures.append(f".codex/config.toml: {SCOPE_ROLLUP_PROFILE} workspace must remain read-only")
+
+    agent = load_agent(REPO_ROOT / expected["path"])
+    instructions = str(agent.get("developer_instructions", ""))
+    if agent.get("default_permissions") != "loop-protocol-readonly":
+        failures.append("scope-rollup-runner: default_permissions must remain loop-protocol-readonly")
+    for token in SCOPE_ROLLUP_MARKER_TOKENS:
+        if token not in instructions:
+            failures.append(f"scope-rollup-runner: missing exact marker contract token {token!r}")
+    for token in (
+        "required_effective_permission_profile: loop-protocol-scope-rollup",
+        "DECLARED_PERMISSION: loop-protocol-readonly",
+        "MUTATION_BOUNDARY: repo_remote_readonly_with_ephemeral_local_write",
+        "uv sync",
+        "session feature set",
+        "release_pin: codex-0.145.0",
+    ):
+        if token not in instructions:
+            failures.append(f"scope-rollup-runner: missing runtime contract token {token!r}")
+    return failures
+
+
 def expected_canonical_target_for_surface(surface: Path) -> str:
     return f"../../../.claude/skills/{surface.parent.name}/SKILL.md"
 
@@ -260,7 +325,7 @@ def assert_required_fields(expectations: dict) -> list[str]:
             )
         if codex_only:
             failures.extend(validate_codex_only_expectation(agent_name, expected))
-    return failures
+    return failures + validate_scope_rollup_runtime_contract(expectations)
 
 
 def assert_runtime_contract(expectations: dict) -> list[str]:
@@ -398,7 +463,7 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
     if parity_main() != 0:
         failures.append("scripts/check_claude_codex_agent_parity.py: parity validation failed")
 
-    return failures
+    return failures + validate_scope_rollup_runtime_contract(expectations)
 
 
 

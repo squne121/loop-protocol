@@ -60,6 +60,33 @@ enabled = true
 "api.github.com" = "allow"
 "objects.githubusercontent.com" = "allow"
 
+# Scope-rollup is repository/GitHub read-only, but its canonical executor
+# atomically writes an invocation-private inventory under the platform temp
+# directory.  This profile is deliberately separate from the generic readonly
+# profile so the exception cannot silently widen other reviewer sessions.
+[permissions.loop-protocol-scope-rollup]
+description = "Read-only repository/GitHub access with a dedicated ephemeral executor directory."
+
+[permissions.loop-protocol-scope-rollup.filesystem]
+":minimal" = "read"
+":tmpdir" = "write"
+":slash_tmp" = "write"
+"~/.codex/packages/standalone/releases" = "read"
+
+[permissions.loop-protocol-scope-rollup.filesystem.":workspace_roots"]
+"." = "read"
+"assets" = "read"
+"LICENSES" = "read"
+"secrets" = "read"
+
+[permissions.loop-protocol-scope-rollup.network]
+enabled = true
+
+[permissions.loop-protocol-scope-rollup.network.domains]
+"github.com" = "allow"
+"api.github.com" = "allow"
+"objects.githubusercontent.com" = "allow"
+
 [permissions.loop-protocol-bootstrap.filesystem]
 ":minimal" = "read"
 "~/.codex/packages/standalone/releases" = "read"

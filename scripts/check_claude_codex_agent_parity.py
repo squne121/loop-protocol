@@ -150,7 +150,17 @@ def is_codex_only_parity(expected: dict) -> bool:
 
 
 def excludes_permission_parity(expected: dict) -> bool:
-    return expected.get("permission_parity") == "excluded"
+    exclusion = expected.get("permission_exclusion")
+    return (
+        expected.get("permission_parity") == "excluded"
+        and isinstance(exclusion, dict)
+        and exclusion == {
+            "allowlisted_agent": "scope-rollup-runner",
+            "reason": "claude_auto_permission_is_not_comparable_to_codex_ephemeral_write_profile",
+            "follow_up_issue": "#1686",
+            "expires_on": "2026-12-31",
+        }
+    )
 
 
 def validate_codex_only_expectation(agent_name: str, expected: dict) -> list[str]:
@@ -341,9 +351,6 @@ def extract_claude_facts(
     permission_mode = str(fm.get("permissionMode", ""))
     facts.declared_permission = f"claude.permissionMode={permission_mode}"
     facts.mutation_boundary = CLAUDE_PERMISSION_LEVEL_MAP.get(permission_mode, "unknown")
-    if agent_name == "scope-rollup-runner":
-        readonly_contract = "GitHub への書き込み / repo への書き込みは一切行わない。read-only 実行のみ。"
-        facts.mutation_boundary = "readonly" if readonly_contract in claude_text else "unknown"
 
     # B7: store raw tools lists
     disallowed = fm.get("disallowedTools", [])
@@ -415,15 +422,22 @@ def extract_codex_facts(
     default_perms = str(codex_doc.get("default_permissions", ""))
     facts.declared_permission = f"codex.default_permissions={default_perms}"
     facts.mutation_boundary = MUTATION_BOUNDARY_MAP.get(default_perms, "unknown")
+    if agent_name == "scope-rollup-runner":
+        declared = extract_runtime_field(instructions, "MUTATION_BOUNDARY")
+        facts.mutation_boundary = declared or "unknown"
 
-    # Nested delegation: Codex uses [agents].max_depth == 1 in config.toml
-    # We read it as read-only dependency (no re-implementation)
+    # max_depth is only a depth limit.  The scope-rollup runner additionally
+    # requires an explicit session-feature-set disable declaration.
     try:
         config = read_toml(CODEX_CONFIG_PATH)
         max_depth = config.get("agents", {}).get("max_depth")
         facts.nested_delegation_blocked = max_depth == 1
+        if agent_name == "scope-rollup-runner":
+            facts.nested_delegation_blocked = (
+                max_depth == 1 and "session feature set で disabled" in instructions
+            )
         facts.nested_delegation_evidence = (
-            f"[agents].max_depth={max_depth} in .codex/config.toml"
+            f"[agents].max_depth={max_depth} plus session feature-set disable declaration"
         )
     except (FileNotFoundError, KeyError):
         facts.nested_delegation_blocked = False
@@ -484,6 +498,34 @@ def compare_parity(
             expected=x_schema or "(none)",
             actual=c_schema or "(none)",
         ))
+
+    # scope-rollup has a producer/consumer marker rather than a compact
+    # response schema.  Compare its required structural discriminators, not
+    # merely the schema-name token.
+    if agent_name == "scope-rollup-runner":
+        claude_text = claude_path.read_text(encoding="utf-8")
+        codex_text = codex_path.read_text(encoding="utf-8")
+        structural_requirements = {
+            "marker_schema_version": ("marker_schema_version: 3", "marker_schema_version: 3"),
+            "query_schema_version": ("query_schema_version", "query_schema_version: 4"),
+            "issues_completeness": ("issues_completeness", "issues_completeness"),
+            "pull_requests_completeness": ("pull_requests_completeness", "pull_requests_completeness"),
+            "transaction_budget": ("transaction_budget", "transaction_budget"),
+            "structured_payload": ("payload:", "payload: {schema_version: 2}"),
+            "result_sha256": ("result_sha256", "result_sha256"),
+            "verify_status": ("verify_status", "verify_status: verified"),
+        }
+        for name, (claude_token, codex_token) in structural_requirements.items():
+            if claude_token not in claude_text or codex_token not in codex_text:
+                drifts.append(DriftEvidence(
+                    rule_id="SCHEMA_STRUCTURE_PARITY_001",
+                    file=str(codex_path),
+                    line=find_line_number(codex_text, codex_token),
+                    launcher="codex",
+                    agent=agent_name,
+                    expected=f"structural field {name}",
+                    actual="missing",
+                ))
 
     # --- Permission parity (AC2, AC8) ---
     c_boundary = claude_facts.mutation_boundary
@@ -551,6 +593,9 @@ def build_permission_report(
     if claude_facts.claude_disallowed_tools:
         claude_permission_info["disallowedTools"] = claude_facts.claude_disallowed_tools
 
+    permission_comparison: bool | str = claude_facts.mutation_boundary == codex_facts.mutation_boundary
+    if agent_name == "scope-rollup-runner":
+        permission_comparison = "not_compared"
     return {
         "agent": agent_name,
         "DECLARED_PERMISSION": {
@@ -561,7 +606,7 @@ def build_permission_report(
         "MUTATION_BOUNDARY": {
             "claude": claude_facts.mutation_boundary,
             "codex": codex_facts.mutation_boundary,
-            "match": claude_facts.mutation_boundary == codex_facts.mutation_boundary,
+            "match": permission_comparison,
         },
         "RUNTIME_PROOF_NOTE": claude_facts.runtime_proof_note,
     }
