@@ -160,9 +160,26 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
     os.chmod(readiness, 0o600)
     env = {**os.environ, "SCOPE_ROLLUP_CAPTURE_DIR": str(capture_dir), "SCOPE_ROLLUP_ELIGIBILITY_ARTIFACT_PATH": str(eligibility), "SCOPE_ROLLUP_READINESS_ARTIFACT_PATH": str(readiness), "CODEX_SESSION_RECORDING_PRODUCER": str(REPO_ROOT / "tests" / "hooks" / "_stub-producer.mjs"), "CODEX_HOOK_MANIFEST_ROOT": str(tmp_path / "manifest")}
     named = subprocess.run(["node", str(ADAPTER_PATH), "--event", "SubagentStop"], input=json.dumps(payload), text=True, capture_output=True, cwd=REPO_ROOT, env=env, check=False)
-    assert named.returncode == 0 and named.stdout.strip() == '{"continue":true}'
-    captured = next(capture_dir.glob("*.txt"))
-    sidecar = next(capture_dir.glob("*.capture.yaml"))
+    capture_dir_items = sorted(path.name for path in capture_dir.iterdir())
+    capture_sidecars = sorted(path.name for path in capture_dir.glob("*.capture.yaml"))
+    max_dump_len = 512
+    named_stdout = named.stdout[:max_dump_len]
+    named_stderr = named.stderr[:max_dump_len]
+    assert named.returncode == 0, (
+        f"named adapter failed [returncode={named.returncode}] "
+        f"stdout={repr(named_stdout)} stderr={repr(named_stderr)} "
+        f"capture_dir_entries={capture_dir_items} sidecars={capture_sidecars}"
+    )
+    assert named.stdout.strip() == '{"continue":true}', (
+        f"named adapter unexpectedly returned {named.stdout!r} "
+        f"capture_dir_entries={capture_dir_items} sidecars={capture_sidecars}"
+    )
+    captured_matches = list(capture_dir.glob("*.txt"))
+    sidecar_matches = list(capture_dir.glob("*.capture.yaml"))
+    assert captured_matches, f"missing scope_rollup txt capture; capture_dir_entries={capture_dir_items} sidecars={capture_sidecars}"
+    assert sidecar_matches, f"missing scope_rollup sidecar capture; capture_dir_entries={capture_dir_items} sidecars={capture_sidecars}"
+    captured = captured_matches[0]
+    sidecar = sidecar_matches[0]
     parser = _load_capture_module().__file__.replace("capture_scope_rollup_final_response.py", "../skills/impl-review-loop/scripts/parse_scope_rollup_run_result.py")
     spec = importlib.util.spec_from_file_location("canonical_parser", Path(parser).resolve())
     module = importlib.util.module_from_spec(spec)
