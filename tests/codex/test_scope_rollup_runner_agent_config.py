@@ -107,6 +107,7 @@ def test_release_pinned_raw_hook_fixture_traverses_adapter_capture_and_canonical
     }
     planner = REPO_ROOT / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "plan_issue_scope_rollup.py"
     planner_sha = hashlib.sha256(planner.read_bytes()).hexdigest()
+    invocation_id = f"scope-rollup-e2e-{tmp_path.name}"
     plan_payload = {
         "schema_version": 2, "repo": "squne121/loop-protocol", "generated_at": "2026-07-15T12:00:01Z",
         "source": "plan_issue_scope_rollup", "body_sha256": "0" * 64,
@@ -120,7 +121,7 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   marker_schema_version: 3
   repo: squne121/loop-protocol
   current_issue: 1671
-  invocation_id: scope-rollup-e2e-001
+  invocation_id: {invocation_id}
   requested_at: "2026-07-15T12:00:00Z"
   generated_at: "2026-07-15T12:00:01Z"
   script_blob_sha256: "{planner_sha}"
@@ -167,7 +168,7 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(module)
-    parsed = module.parse_scope_rollup_output(assistant_output=captured.read_text(), assistant_output_file=captured, capture_sidecar_file=sidecar, repo="squne121/loop-protocol", issue_number=1671, invocation_id="scope-rollup-e2e-001", expected_script_sha=planner_sha, requested_at="2026-07-15T12:00:00Z")
+    parsed = module.parse_scope_rollup_output(assistant_output=captured.read_text(), assistant_output_file=captured, capture_sidecar_file=sidecar, repo="squne121/loop-protocol", issue_number=1671, invocation_id=invocation_id, expected_script_sha=planner_sha, requested_at="2026-07-15T12:00:00Z")
     assert parsed["SCOPE_ROLLUP_MARKER_PARSE_RESULT_V1"]["status"] == "ok"
     payload["agent_type"] = "worker"
     rejected = subprocess.run(["node", str(ADAPTER_PATH), "--event", "SubagentStop"], input=json.dumps(payload), text=True, capture_output=True, cwd=REPO_ROOT, env={**env, "SCOPE_ROLLUP_CAPTURE_DIR": str(tmp_path / "rejected")}, check=False)
