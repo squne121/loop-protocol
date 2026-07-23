@@ -144,7 +144,7 @@ wrapper 内降格（model_chain 試行） → 全 model 失敗 → chain_exhaust
 wrapper が `ok: false` + `reason_code: "model_chain_exhausted"` を返した後に
 caller（`web-researcher` 等）が ClaudeCode 直接生成 fallback を発動する。
 
-## model-policy subcommand（`build_request.py model-policy`、Issue #1269）
+## model-policy subcommand の追加（`build_request.py model-policy`、Issue #1269）
 
 `build_request.py` の `model-policy` サブコマンドは、provider・role・runtime が
 実際に解決する model chain を **読み取り専用・副作用なし**で確認する dry-run
