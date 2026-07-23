@@ -158,7 +158,16 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
     readiness.write_text(json.dumps({"schema": "SESSION_RECORDING_SCOPE_ROLLUP_READINESS_V1", "artifact_version": 1, "repo_root_realpath": str(REPO_ROOT.resolve()), "uv_lock_digest": None, "python_version_digest": None, "interpreter_realpath": str(Path(sys.executable).resolve()), "interpreter_version": sys.version.split()[0], "producer_digest": producer_digest, "prepared": True, "generated_at": "2026-07-15T11:00:00Z"}))
     os.chmod(eligibility, 0o600)
     os.chmod(readiness, 0o600)
-    env = {**os.environ, "SCOPE_ROLLUP_CAPTURE_DIR": str(capture_dir), "SCOPE_ROLLUP_ELIGIBILITY_ARTIFACT_PATH": str(eligibility), "SCOPE_ROLLUP_READINESS_ARTIFACT_PATH": str(readiness), "CODEX_SESSION_RECORDING_PRODUCER": str(REPO_ROOT / "tests" / "hooks" / "_stub-producer.mjs"), "CODEX_HOOK_MANIFEST_ROOT": str(tmp_path / "manifest")}
+    env = {**os.environ}
+    env.pop("CODEX_SCOPE_ROLLUP_CAPTURE_SCRIPT", None)
+    env["NODE_ENV"] = "production"
+    env.update({
+        "SCOPE_ROLLUP_CAPTURE_DIR": str(capture_dir),
+        "SCOPE_ROLLUP_ELIGIBILITY_ARTIFACT_PATH": str(eligibility),
+        "SCOPE_ROLLUP_READINESS_ARTIFACT_PATH": str(readiness),
+        "CODEX_SESSION_RECORDING_PRODUCER": str(REPO_ROOT / "tests" / "hooks" / "_stub-producer.mjs"),
+        "CODEX_HOOK_MANIFEST_ROOT": str(tmp_path / "manifest"),
+    })
     named = subprocess.run(["node", str(ADAPTER_PATH), "--event", "SubagentStop"], input=json.dumps(payload), text=True, capture_output=True, cwd=REPO_ROOT, env=env, check=False)
     capture_dir_items = sorted(path.name for path in capture_dir.iterdir())
     capture_sidecars = sorted(path.name for path in capture_dir.glob("*.capture.yaml"))
