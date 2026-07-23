@@ -108,6 +108,15 @@ def test_parallel_run_ignores_parallel_exclude(tmp_path):
     assert "--ignore=pkg/test_timing.py" in argv
 
 
+def test_parallel_run_removes_explicit_excluded_target(tmp_path):
+    plan = _plan_with_exclude()
+    plan["targets"] = ["pkg/test_timing.py", "schemas/tests/"]
+    loaded = mod.load_plan(_write_plan(tmp_path, plan))
+    argv = mod.run_argv(loaded, mode="parallel")
+    assert "pkg/test_timing.py" not in argv
+    assert "--ignore=pkg/test_timing.py" in argv
+
+
 def test_serial_lane_argv_inherits_ignore_and_deselect(tmp_path):
     """Serial lane runs the excluded paths AND inherits plan ignore/deselect (no drift)."""
     loaded = mod.load_plan(_write_plan(tmp_path, _plan_with_exclude()))
