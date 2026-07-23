@@ -461,6 +461,201 @@ def test_contract_bound_waiver_rejects_invalid_live_contract_or_snapshot(monkeyp
 
 
 # ---------------------------------------------------------------------------
+# AC10: #1675 → #1677 ordered continuation waiver.
+# ---------------------------------------------------------------------------
+
+
+def _ordered_continuation_waiver(**overrides: object) -> dict:
+    waiver = {
+        "candidate_issue": "#1677",
+        "candidate_updated_at": "2026-07-23T11:44:01Z",
+        "candidate_reasons": [
+            "successor_dependency_ordering",
+            "structural_or_textual_collision_detected",
+            "independent_strong_signal_detected",
+        ],
+        "relation": "successor",
+        "first": "#1675",
+        "next": "#1677",
+        "expires_on": "2026-07-25",
+        "approved_by": "user_session",
+    }
+    waiver.update(overrides)
+    return waiver
+
+
+def _ordered_continuation_live_body(waiver: dict) -> str:
+    reasons = "\n".join(f'    - "{reason}"' for reason in waiver["candidate_reasons"])
+    return f"""## Machine-Readable Contract
+
+```yaml
+overlap_ordered_continuation_waiver:
+  candidate_issue: "{waiver["candidate_issue"]}"
+  candidate_updated_at: "{waiver["candidate_updated_at"]}"
+  candidate_reasons:
+{reasons}
+  relation: "{waiver["relation"]}"
+  first: "{waiver["first"]}"
+  next: "{waiver["next"]}"
+  expires_on: "{waiver["expires_on"]}"
+  approved_by: "{waiver["approved_by"]}"
+```
+"""
+
+
+def _ordered_continuation_evidence(body_sha256: str, *, native_blocked_by: list[dict] | None = None) -> dict:
+    evidence = {
+        "schema": open_pr.OVERLAP_PREFLIGHT_SCHEMA,
+        "repository": "squne121/loop-protocol",
+        "current_issue": {"number": 1675, "body_sha256": body_sha256},
+        "source": {
+            "complete": True,
+            "saturated": False,
+            "limit": 100,
+            "collection_mode": "exhaustive_cursor_pagination",
+            "page_size": 50,
+            "page_count": 1,
+            "fetched_count": 1,
+            "has_next_page": False,
+        },
+        "route": "human_review_required",
+        "candidates": [
+            {
+                "issue_number": 1677,
+                "updated_at": "2026-07-23T11:44:01Z",
+                "readback_complete": True,
+                "policy_class": "C3",
+                "reasons": [
+                    "successor_dependency_ordering",
+                    "structural_or_textual_collision_detected",
+                    "independent_strong_signal_detected",
+                ],
+            }
+        ],
+        "dependency_resolution": {
+            "unresolved_refs": [],
+            "blocking_predecessor": None,
+            "native_blocked_by": native_blocked_by if native_blocked_by is not None else [],
+            # current #1675 が後続 #1677/#1674 を止める向きは、#1675 の
+            # predecessor blocker ではない。ここで非空でも happy path を通す。
+            "native_blocking": [{"number": 1677}, {"number": 1674}],
+        },
+        "validation_errors": {},
+        "decision_inputs_sha256": "sha256:" + "c" * 64,
+    }
+    canonical = json.dumps(
+        evidence, sort_keys=True, ensure_ascii=True, separators=(",", ":")
+    )
+    evidence["evidence_sha256"] = f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+    return evidence
+
+
+def test_ordered_continuation_waiver_allows_only_1675_then_1677(monkeypatch):
+    waiver = _ordered_continuation_waiver()
+    body = _ordered_continuation_live_body(waiver)
+    sha = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+    _patch_live_waiver_readback(monkeypatch, 1675, body, [_snapshot_comment(sha, 1675)])
+
+    loaded, error, live_body_sha256 = open_pr._load_verified_ordered_continuation_waiver(
+        "squne121/loop-protocol", 1675, today=open_pr.date(2026, 7, 24)
+    )
+    assert error is None
+    assert loaded == waiver
+    assert live_body_sha256 == sha
+
+    stored = _ordered_continuation_evidence(sha)
+    assert open_pr._ordered_continuation_candidate_matches_waiver(stored, waiver) is True
+    timestamp_drift = json.loads(json.dumps(stored))
+    timestamp_drift["candidates"][0]["updated_at"] = "2026-07-23T11:44:02Z"
+    assert open_pr._ordered_continuation_candidate_matches_waiver(timestamp_drift, waiver) is False
+    extra_candidate = json.loads(json.dumps(stored))
+    extra_candidate["candidates"].append(json.loads(json.dumps(stored["candidates"][0])))
+    assert open_pr._ordered_continuation_candidate_matches_waiver(extra_candidate, waiver) is False
+    reason_drift = json.loads(json.dumps(stored))
+    reason_drift["candidates"][0]["reasons"].append("unapproved_reason")
+    assert open_pr._ordered_continuation_candidate_matches_waiver(reason_drift, waiver) is False
+    evidence_path = Path(str(Path(__file__).parent / "_tmp_ac10_ordered.json"))
+    evidence_path.write_text(json.dumps(stored), encoding="utf-8")
+    monkeypatch.setattr(
+        open_pr.subprocess,
+        "run",
+        lambda cmd, **kwargs: FakeCompletedProcess(0, json.dumps(stored), ""),
+    )
+    monkeypatch.setattr(
+        open_pr,
+        "_load_verified_ordered_continuation_waiver",
+        lambda repo, linked_issue: (waiver, None, sha),
+    )
+    try:
+        ok, error_code, detail, effective = open_pr.run_overlap_preflight_gate(
+            repo="squne121/loop-protocol",
+            linked_issue=1675,
+            evidence_file=evidence_path,
+            expected_evidence_sha256=stored["evidence_sha256"],
+            expected_decision_inputs_sha256=stored["decision_inputs_sha256"],
+        )
+        assert ok is True, (error_code, detail)
+        assert effective is not None
+        assert effective["route"] == "proceed_with_collision_evidence"
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+def test_ordered_continuation_waiver_rejects_reverse_direction_and_native_predecessor(monkeypatch):
+    reverse = _ordered_continuation_waiver(
+        candidate_issue="#1675", relation="predecessor", first="#1677", next="#1675"
+    )
+    reverse_body = _ordered_continuation_live_body(reverse)
+    reverse_sha = "sha256:" + hashlib.sha256(reverse_body.encode("utf-8")).hexdigest()
+    _patch_live_waiver_readback(monkeypatch, 1675, reverse_body, [_snapshot_comment(reverse_sha, 1675)])
+    loaded, error, _live_body_sha256 = open_pr._load_verified_ordered_continuation_waiver(
+        "squne121/loop-protocol", 1675, today=open_pr.date(2026, 7, 24)
+    )
+    assert loaded is None
+    assert error is not None
+
+    expired = _ordered_continuation_waiver(expires_on="2026-07-23")
+    expired_body = _ordered_continuation_live_body(expired)
+    expired_sha = "sha256:" + hashlib.sha256(expired_body.encode("utf-8")).hexdigest()
+    _patch_live_waiver_readback(monkeypatch, 1675, expired_body, [_snapshot_comment(expired_sha, 1675)])
+    loaded, error, _live_body_sha256 = open_pr._load_verified_ordered_continuation_waiver(
+        "squne121/loop-protocol", 1675, today=open_pr.date(2026, 7, 24)
+    )
+    assert loaded is None
+    assert error is not None
+    assert "期限" in error
+
+    waiver = _ordered_continuation_waiver()
+    body = _ordered_continuation_live_body(waiver)
+    sha = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+    stored = _ordered_continuation_evidence(sha, native_blocked_by=[{"number": 1669}])
+    evidence_path = Path(str(Path(__file__).parent / "_tmp_ac10_native_predecessor.json"))
+    evidence_path.write_text(json.dumps(stored), encoding="utf-8")
+    monkeypatch.setattr(
+        open_pr.subprocess,
+        "run",
+        lambda cmd, **kwargs: FakeCompletedProcess(0, json.dumps(stored), ""),
+    )
+    monkeypatch.setattr(
+        open_pr,
+        "_load_verified_ordered_continuation_waiver",
+        lambda repo, linked_issue: (waiver, None, sha),
+    )
+    try:
+        ok, error_code, _detail, _effective = open_pr.run_overlap_preflight_gate(
+            repo="squne121/loop-protocol",
+            linked_issue=1675,
+            evidence_file=evidence_path,
+            expected_evidence_sha256=stored["evidence_sha256"],
+            expected_decision_inputs_sha256=stored["decision_inputs_sha256"],
+        )
+        assert ok is False
+        assert error_code == open_pr.E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE
+    finally:
+        evidence_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Schema validation (supporting coverage for AC2/AC3).
 # ---------------------------------------------------------------------------
 
