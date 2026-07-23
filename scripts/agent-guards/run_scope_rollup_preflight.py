@@ -543,6 +543,12 @@ def _run_streaming(
     except subprocess.TimeoutExpired:
         pass
 
+    # ``BufferedReader.read`` may only publish the cap event after the child
+    # has exited.  Resolve the event after both reader threads have joined so
+    # a poll() race cannot turn an oversized response into a normal return.
+    if out_exceeded.is_set() or err_exceeded.is_set():
+        cap_exceeded = True
+
     if timed_out:
         raise ScopeRollupPreflightError(timeout_reason_code, f"exceeded {timeout}s timeout")
     if cap_exceeded:
