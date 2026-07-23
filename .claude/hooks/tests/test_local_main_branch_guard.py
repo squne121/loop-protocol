@@ -516,7 +516,14 @@ class TestAC6HookOrder:
     """AC6: secret_boundary_guard before local_main_branch_guard before worktree_scope_guard."""
 
     def test_hook_order_in_settings_json(self):
-        """Verify PreToolUse hook order in .claude/settings.json."""
+        """Verify PreToolUse hook order in .claude/settings.json.
+
+        Issue #1690 note: local_main_branch_guard and worktree_scope_guard
+        are temporarily removed from settings.json pending the #1690 policy
+        decision. This test now only verifies secret_boundary_guard remains
+        wired and the other two are absent. Restore the full ordering
+        assertion once #1690 resolves.
+        """
         settings_path = REPO_ROOT / ".claude" / "settings.json"
         if not settings_path.exists():
             pytest.skip(".claude/settings.json not found")
@@ -532,20 +539,11 @@ class TestAC6HookOrder:
                 order.append(name)
 
         assert "secret_boundary_guard" in order, "secret_boundary_guard must be in PreToolUse"
-        assert "local_main_branch_guard" in order, "local_main_branch_guard must be in PreToolUse"
-        assert "worktree_scope_guard" in order, "worktree_scope_guard must be in PreToolUse"
-
-        idx_secret = order.index("secret_boundary_guard")
-        idx_local = order.index("local_main_branch_guard")
-        idx_worktree = order.index("worktree_scope_guard")
-
-        assert idx_secret < idx_local, (
-            f"secret_boundary_guard (index {idx_secret}) must come before "
-            f"local_main_branch_guard (index {idx_local})"
+        assert "local_main_branch_guard" not in order, (
+            "local_main_branch_guard is expected to be absent pending #1690"
         )
-        assert idx_local < idx_worktree, (
-            f"local_main_branch_guard (index {idx_local}) must come before "
-            f"worktree_scope_guard (index {idx_worktree})"
+        assert "worktree_scope_guard" not in order, (
+            "worktree_scope_guard is expected to be absent pending #1690"
         )
 
 
@@ -565,14 +563,29 @@ class TestAC7HookBoundariesManifest:
         )
 
     def test_check_hook_boundaries_passes(self):
-        """scripts/check_hook_boundaries.py must pass with no drift."""
+        """scripts/check_hook_boundaries.py drift must be limited to the two
+        known #1690 removals (local_main_branch_guard, worktree_scope_guard).
+
+        Issue #1690 note: these two hooks are temporarily removed from
+        settings.json pending the #1690 policy decision, so
+        check_hook_boundaries.py is expected to report exactly this drift
+        (and nothing else) until #1690 resolves.
+        """
         result = subprocess.run(
             [sys.executable, str(REPO_ROOT / "scripts" / "check_hook_boundaries.py")],
             capture_output=True,
             text=True,
         )
-        assert result.returncode == 0, (
-            f"check_hook_boundaries.py failed:\n{result.stderr}\n{result.stdout}"
+        expected_drift_lines = {
+            "  [drift] manifest に存在するが settings.json にない "
+            "(handler_id='local_main_branch_guard', event='PreToolUse')",
+            "  [drift] manifest に存在するが settings.json にない "
+            "(handler_id='worktree_scope_guard', event='PreToolUse')",
+        }
+        stderr_lines = {line for line in result.stderr.splitlines() if line.startswith("  [drift]")}
+        assert stderr_lines == expected_drift_lines, (
+            f"check_hook_boundaries.py drift must be exactly the two #1690 "
+            f"removals; got:\n{result.stderr}\n{result.stdout}"
         )
 
 
