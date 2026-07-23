@@ -175,10 +175,22 @@ class TestSettingsManifestAlignment:
         manifest_entries: list[dict[str, Any]],
         settings_hook_entries: list[dict[str, Any]],
     ) -> None:
-        """AC4: settings.json と manifest の間に drift がない。"""
+        """AC4: settings.json と manifest の間に drift がない。
+
+        Issue #1690 note: local_main_branch_guard と worktree_scope_guard は
+        #1690 の方針決定までの間 settings.json から一時的に外されている。
+        drift はこの2件のみに限定されることを検証する。#1690 の結論で
+        復元された場合、drift-free assertion を復元すること。
+        """
         errors = checker.check_drift(manifest_entries, settings_hook_entries)
-        assert not errors, (
-            "drift を検出しました:\n" + "\n".join(f"  {e}" for e in errors)
+        expected_errors = {
+            "[drift] manifest に存在するが settings.json にない "
+            "(handler_id='local_main_branch_guard', event='PreToolUse')",
+            "[drift] manifest に存在するが settings.json にない "
+            "(handler_id='worktree_scope_guard', event='PreToolUse')",
+        }
+        assert set(errors) == expected_errors, (
+            "drift は #1690 の2件のみである想定:\n" + "\n".join(f"  {e}" for e in errors)
         )
 
     def test_handler_event_keys_match(
@@ -186,12 +198,22 @@ class TestSettingsManifestAlignment:
         manifest_entries: list[dict[str, Any]],
         settings_hook_entries: list[dict[str, Any]],
     ) -> None:
-        """manifest の (handler_id, event) 複合キーが settings.json にも存在する。"""
+        """manifest の (handler_id, event) 複合キーが settings.json にも存在する。
+
+        Issue #1690 note: local_main_branch_guard と worktree_scope_guard は
+        方針決定までの間 settings.json から外れている想定のため、この2件のみ
+        欠落を許容する。#1690 の結論で復元された場合、strict assertion を
+        復元すること。
+        """
         manifest_keys = {(e["handler_id"], e["event"]) for e in manifest_entries}
         settings_keys = {(e["handler_id"], e["event"]) for e in settings_hook_entries}
         missing = manifest_keys - settings_keys
-        assert not missing, (
-            f"manifest にあるが settings.json にない (handler_id, event): {missing}"
+        expected_missing = {
+            ("local_main_branch_guard", "PreToolUse"),
+            ("worktree_scope_guard", "PreToolUse"),
+        }
+        assert missing == expected_missing, (
+            f"missing は #1690 の2件のみである想定: {missing}"
         )
 
     def test_settings_hooks_covered_by_manifest(

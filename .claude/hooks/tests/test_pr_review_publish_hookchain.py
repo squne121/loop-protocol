@@ -137,28 +137,39 @@ class TestAC8FullRealHookChainAggregate:
     hookchain_harness.run_pretool_hook_chain(), and asserts on the aggregate."""
 
     def test_settings_json_registers_all_seven_expected_bash_hooks(self):
+        """Issue #1690 note: local_main_branch_guard and worktree_scope_guard
+        are temporarily removed from settings.json pending the #1690 policy
+        decision, so the Bash chain now has 5 hooks instead of 7. Restore
+        the full 7-hook expectation once #1690 resolves."""
         commands = hookchain_harness.load_pretool_hook_commands("Bash")
         hook_names = {Path(c.split(" ")[0]).stem for c in commands}
         expected = {
             "secret_boundary_guard",
-            "local_main_branch_guard",
-            "worktree_scope_guard",
             "guard-japanese-prose",
             "rtk_boundary_shadow_guard",
             "ci_test_performance_advisory",
             "root_temporary_residue_advisory",
         }
+        removed_pending_1690 = {"local_main_branch_guard", "worktree_scope_guard"}
         missing = expected - hook_names
         assert not missing, f"settings.json PreToolUse|Bash chain is missing: {missing}"
+        assert not (removed_pending_1690 & hook_names), (
+            f"local_main_branch_guard/worktree_scope_guard are expected to be "
+            f"absent pending #1690; found: {removed_pending_1690 & hook_names}"
+        )
 
     def test_full_chain_aggregate_allow_for_pr_review_publish_command(self, tmp_git_repo):
+        """Issue #1690 note: worktree_scope_guard is temporarily removed from
+        settings.json pending the #1690 policy decision, so it is no longer
+        expected to be invoked here. Restore the invocation assertion once
+        #1690 resolves."""
         payload = _pretool_payload(PR_REVIEW_PUBLISH_CMD, str(tmp_git_repo))
         results = hookchain_harness.run_pretool_hook_chain(payload, tmp_git_repo)
 
         executed_names = {r["hook_name"] for r in results}
-        assert "worktree_scope_guard" in executed_names, (
-            "worktree_scope_guard.sh must actually be invoked as part of the "
-            "chain, not skipped -- it is registered on the same Bash matcher."
+        assert "worktree_scope_guard" not in executed_names, (
+            "worktree_scope_guard is expected to be absent from the chain "
+            "pending #1690"
         )
 
         permission_aggregate = hookchain_harness.aggregate_permission_decision(results)
@@ -181,6 +192,14 @@ class TestAC8FullRealHookChainAggregate:
                 f"(exit={r['returncode']}); stderr={r['stderr']}"
             )
 
+    @pytest.mark.skip(
+        reason=(
+            "Issue #1690: local_main_branch_guard (the hook that denied raw "
+            "`gh pr review --approve` from local root) is temporarily removed "
+            "from settings.json pending the #1690 policy decision. Re-enable "
+            "once #1690 restores or replaces this guard."
+        )
+    )
     def test_full_chain_aggregate_blocks_raw_gh_pr_review_mutation(self, tmp_git_repo):
         """Negative control: proves the harness genuinely detects a real
         block (not a fail-open false negative). A raw `gh pr review --approve`

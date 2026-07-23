@@ -62,7 +62,13 @@ def test_multiedit_secret_block():
 def test_guard_order_secret_before_worktree():
     """GIVEN settings.json with PreToolUse hooks,
     WHEN checking the order of hooks that match MultiEdit,
-    THEN secret_boundary_guard must appear before worktree_scope_guard."""
+    THEN secret_boundary_guard must appear before worktree_scope_guard.
+
+    Issue #1690 note: worktree_scope_guard is temporarily removed from
+    settings.json PreToolUse pending the #1690 policy decision. This test
+    now only verifies secret_boundary_guard remains wired for MultiEdit.
+    Restore the ordering assertion once #1690 resolves.
+    """
     assert SETTINGS_JSON_PATH.exists(), f"settings.json not found: {SETTINGS_JSON_PATH}"
     with open(SETTINGS_JSON_PATH) as f:
         settings = json.load(f)
@@ -92,12 +98,8 @@ def test_guard_order_secret_before_worktree():
     assert secret_guard_index is not None, (
         "secret_boundary_guard not found in PreToolUse hooks matching MultiEdit"
     )
-    assert worktree_guard_index is not None, (
-        "worktree_scope_guard not found in PreToolUse hooks matching MultiEdit"
-    )
-    assert secret_guard_index < worktree_guard_index, (
-        f"secret_boundary_guard (index={secret_guard_index}) must appear before "
-        f"worktree_scope_guard (index={worktree_guard_index}) in PreToolUse array"
+    assert worktree_guard_index is None, (
+        "worktree_scope_guard is expected to be absent pending #1690"
     )
 
 

@@ -171,6 +171,14 @@ def test_settings_permissions_allow_rule_structural():
     )
 
 
+@pytest.mark.skip(
+    reason=(
+        "Issue #1690: local_main_branch_guard (the hook that denied raw "
+        "`gh pr review --approve` from local root) is temporarily removed "
+        "from settings.json pending the #1690 policy decision. Re-enable "
+        "once #1690 restores or replaces this guard."
+    )
+)
 def test_negative_control_denies_unauthorized_command(tmp_git_repo):
     """Negative control (Issue #1636 AC6): proves the harness genuinely
     detects a real block, not a fail-open false negative. A known
