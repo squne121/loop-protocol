@@ -33,6 +33,7 @@
     "tests/codex/test_scope_rollup_run_exact_executor.py",
     "tests/codex/test_run_scope_rollup_preflight.py",
     "tests/codex/test_scope_rollup_graphql_pagination_v3.py",
+    "tests/codex/test_scope_rollup_runner_agent_config.py",
     "tests/test_codex_agent_bridge_contract.py",
     "tests/test_codex_agent_model_refresh_evidence.py",
     "tests/test_subagent_launch_ledger.py",
