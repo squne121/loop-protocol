@@ -64,6 +64,23 @@ Stop Condition に到達する前に次フェーズへ進まない。
 - `PR_REVIEW_SURFACE_LIVE_PROOF_V1` comment には raw diff hunk、raw API response、review body、secret、trace を含めない
 - `chatgpt-retro-context:resolve-live` は `resolved | missing | blocked_duplicate | blocked_malformed | blocked_malformed_marker_syntax | blocked_invalid_reference_chain | blocked_page_budget_exhausted | blocked_stale_write` の structured result を返す
 - `chatgpt-retro-context:post` の blocked state は helper 内部では throw / nonzero exit を使うが、CLI surface では `error_code` を持つ machine-readable JSON を stdout に返す
+- `chatgpt-retro-context:resolve-live` の結果は issue / pull request の両 target で常に `comment_chain`（コメントチェーンの component object）と `pr_review_surface`（PR review surface の component object。issue target では `status: not_applicable` の placeholder）の total result 構造を返す。トップレベルの `status` はこの 2 つの component status の aggregate である
+- `comment_chain.pagination` / `pr_review_surface.pagination` はそれぞれ `comments_complete` / `reference_comments_complete` / `complete` の明示的 boolean 完全性フィールドを持つ。これらが厳密に `true` でない限り、resolver は `resolved` を返さない
+
+### Marker candidate classifier / marker候補判定
+
+- `chatgpt-retro-context-marker-helper.mjs` がエクスポートする `classifyChatgptRetroContextMarkerCandidate(body)` は、コメント本文の **first non-empty line（column 0）だけ** を検査し、`not_marker` / `valid_marker` / `malformed_marker_intent` の3状態を返す共有 classifier である
+- prose 中の marker 名の言及、inline code、fenced code（backtick / tilde）、blockquote、list item、4-space/tab indented code 内の marker 文字列は、いずれも first non-empty line が `<!--` で始まらないため `not_marker` になる（candidate として検査されない）
+- resolve-live の malformed marker検出、`validateChatgptRetroContextCommentBody`（post/upsert・duplicate検出・fixture resolver・post-write readback が共通で経由する）は、すべてこの共有 classifier を使用する（判定の split-brain を排除する）
+- `upsertChatgptRetroContextComment` は create / supersede の live write 後に post-write readback を行い、同一 ownership marker がちょうど1件だけ存在することを再確認する（`blocked_post_write_duplicate` / `blocked_post_write_missing` で fail-closed）
+
+### chatgpt-retro-context:assert-live
+
+- `scripts/assert-chatgpt-retro-context-live.mjs`（`chatgpt-retro-context:assert-live`）は `resolve-live` 結果に対する fail-closed assertion CLI である。純粋な domain assertion 関数（`assertChatgptRetroContextLiveResult`）と、CLI adapter（`execution_profile: live | fixture` の分離・終了コード契約・resolver subprocess の timeout/signal/error 分類）を分離する
+- 検証項目: repo / target / parent_issue / marker_comment_url / `comment_chain` の digest・payload_digest・matched_comment_count の identity、`comment_chain.status` と（pull_request target のみ）`pr_review_surface.status` が `resolved` であること、該当する全 pagination completeness field が明示的に `true` であること
+- 終了コード: 引数不備・JSON parse失敗・subprocess spawn失敗・timeout・signal終了・GitHub API error は exit 2（`assertion_status: error`）、component mismatch・pagination不完全・identity不一致は exit 1（`assertion_status: fail`）、全項目満たす場合のみ exit 0（`assertion_status: pass`）
+- `execution_profile: fixture` は subprocess regression test 専用であり、stdout JSON の `live_evidence_eligible` は execution_profile が `live` かつ `assertion_status: pass` のときだけ `true` になる。fixture profile の成功結果は `#1415` の live evidence として受理されない
+- stdout には単一の `chatgpt_retro_context_live_assertion/v1` JSON を出力する。live profile では `checked_at` / `resolver_commit` / `command_args_digest` を追加で記録する
 
 この責務境界により、`agent-run:post` を ChatGPT retro marker や retro index update と混同しない。
 
