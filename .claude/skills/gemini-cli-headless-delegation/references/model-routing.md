@@ -144,6 +144,71 @@ wrapper 内降格（model_chain 試行） → 全 model 失敗 → chain_exhaust
 wrapper が `ok: false` + `reason_code: "model_chain_exhausted"` を返した後に
 caller（`web-researcher` 等）が ClaudeCode 直接生成 fallback を発動する。
 
+## model-policy subcommand（`build_request.py model-policy`、Issue #1269）
+
+`build_request.py` の `model-policy` サブコマンドは、provider・role・runtime が
+実際に解決する model chain を **読み取り専用・副作用なし**で確認する dry-run
+inspector である。`load_model_routing()` / `resolve_model_chain()` をそのまま
+呼び出すだけで、YAML parsing・default merge・precedence をこのサブコマンド側
+で再実装しない。`--profile` / `--objective` を要求する既存の legacy invocation
+（request 生成）とは非破壊で共存し、`argv[0] == "model-policy"` のときのみ
+専用 parser へ dispatch する。request file・output file は一切書き込まない。
+
+### 使用例
+
+```bash
+# gemini + role: resolve_model_chain() の戻り値をそのまま stdout に出す
+uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/build_request.py \
+  model-policy --provider gemini --role implementation
+
+# agy: actual_model は常に null。"agy-default" は legacy_compatibility_label としてのみ出力
+uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/build_request.py \
+  model-policy --provider agy
+
+# auto: --profile が必須。provider_candidates / runtime_order / profile_eligible /
+# consumer_constraints を出力する
+uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/build_request.py \
+  model-policy --provider auto --profile no_tools
+```
+
+### 出力スキーマ `delegation_model_policy/v1`
+
+| フィールド | 説明 |
+|---|---|
+| `schema` | 常に `"delegation_model_policy/v1"` |
+| `provider` / `role` / `profile` | CLI 引数のエコー |
+| `ok` | `true`/`false`（fail-closed 時は `false`） |
+| `failure_class` / `failure_reason` | fail-closed 時のみ非 null |
+| `resolved_chain` | `provider=gemini` のときのみ非 null。`resolve_model_chain()` の戻り値そのもの |
+| `actual_model` | 常に `null`（dry-run のため観測値を持たない） |
+
+### AGY / auto の capability 表示ルール（Blocker 4 / Blocker 6）
+
+- `--provider agy`: `run_delegation()` は `provider="agy"` に対して
+  `resolve_model_chain()` を一切呼び出さない（AGY に model chain の概念が
+  存在しない）ため、`resolved_chain` は常に `null`。実行時に返る
+  `actual_model: "agy-default"`（リテラル固定値）は、model-policy の
+  `actual_model` フィールドには**絶対に出力せず**、`legacy_compatibility_label`
+  としてのみ表示する。`wrapper_capability`（`explicit_model_selection`:
+  false、`role_based_model_chain`: false）と `upstream_capability`
+  （`probed`: false、Antigravity CLI 自体は起動しない旨の note）を分離して
+  出力する。
+- `--provider auto`: `--profile` を省略すると `failure_class:
+  "profile_required_for_auto"` で fail-closed する（`PROVIDER_AUTO_ELIGIBLE_PROFILES`
+  がプロファイル単位のゲートであるため）。`--profile` 指定時は
+  `runtime_order`（`PROVIDER_AUTO_RUNTIME_ORDER` そのもの）、
+  `profile_eligible`（指定 profile が `PROVIDER_AUTO_ELIGIBLE_PROFILES` に
+  含まれるか）、`provider_candidates`（`runtime_order` の各 provider ごとの
+  解決結果。`gemini` 候補は `resolved_chain` を、`agy` 候補は agy 分岐と同じ
+  capability 情報を持つ）、`consumer_constraints`
+  （`fan_out: false` — `provider_auto_dispatch()` は
+  `PROVIDER_AUTO_RUNTIME_ORDER` を逐次試行し並行実行しない、
+  `agy_fallback_requires_prompt: true` — `_validate_agy_request()` が
+  非空 `prompt` を必須とする、`explicit_model_survives_fallback: false` —
+  `_validate_agy_request()` は `request["model"]` を拒否するため、gemini
+  側で指定した explicit model は agy へのフォールバックを生き残らない）
+  を出力する。
+
 ## 関連ファイル
 
 - `scripts/run_gemini_headless.py`: `DEFAULT_MODEL_ROUTING`, `load_model_routing`, `resolve_model_chain`, `run_delegation`
