@@ -33,6 +33,14 @@
     - "## テスト戦略（3 層責務分離）"
     - "## Worktree 配置規約"
 
+- id: execution-planning-policy
+  path: docs/dev/workflow.md
+  title: Execution Planning Policy (canonical SSOT)
+  keywords: [execution-planning, issue-execution-decision, semantic-planning, collision-derived, dual-write, consumer-compatibility]
+  description: ISSUE_EXECUTION_DECISION_V1 の静的契約、namespace 分離、migration、open-pr hard gate 維持の正本
+  sections:
+    - "## Execution Planning Policy (canonical SSOT)"
+
 - id: agent-skill-boundaries
   path: docs/dev/agent-skill-boundaries.md
   title: Agent / Skill 責務境界

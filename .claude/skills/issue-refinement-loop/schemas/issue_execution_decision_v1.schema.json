@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "issue_execution_decision/v1",
+  "title": "ISSUE_EXECUTION_DECISION_V1",
+  "description": "Static planning contract. It is not a runtime state or a permission to mutate a PR.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "identity", "source_manifest", "graph", "execution", "integrity", "provenance", "consumer_compatibility"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "ISSUE_EXECUTION_DECISION_V1"},
+    "identity": {"$ref": "#/$defs/identity"},
+    "source_manifest": {"$ref": "#/$defs/source_manifest"},
+    "graph": {"$ref": "#/$defs/graph"},
+    "execution": {"$ref": "#/$defs/execution"},
+    "integrity": {"$ref": "#/$defs/integrity"},
+    "provenance": {"$ref": "#/$defs/provenance"},
+    "consumer_compatibility": {"$ref": "#/$defs/consumer_compatibility"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repository_id", "repository_full_name", "target_issue_number", "body_sha256", "updated_at"],
+      "properties": {
+        "repository_id": {"type": "string", "minLength": 1},
+        "repository_full_name": {"type": "string", "pattern": "^[^/]+/[^/]+$"},
+        "target_issue_number": {"type": "integer", "minimum": 1},
+        "body_sha256": {"$ref": "#/$defs/sha256"},
+        "updated_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "source_manifest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["collected_at", "issues_complete", "pull_requests_complete", "dependencies_complete", "unresolved_references", "issues_sha256", "pull_requests_sha256", "dependencies_sha256"],
+      "properties": {
+        "collected_at": {"type": "string", "format": "date-time"},
+        "issues_complete": {"type": "boolean"},
+        "pull_requests_complete": {"type": "boolean"},
+        "dependencies_complete": {"type": "boolean"},
+        "unresolved_references": {"type": "array", "items": {"type": "string"}},
+        "issues_sha256": {"$ref": "#/$defs/sha256"},
+        "pull_requests_sha256": {"$ref": "#/$defs/sha256"},
+        "dependencies_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "graph": {
+      "type": "object", "additionalProperties": false,
+      "required": ["canonical_sort", "nodes", "edges"],
+      "properties": {
+        "canonical_sort": {"type": "string", "const": "issue_number_ascending_then_relation"},
+        "nodes": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["issue_number"], "properties": {"issue_number": {"type": "integer", "minimum": 1}}}},
+        "edges": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["source_issue_number", "target_issue_number", "relation", "evidence_refs"], "properties": {"source_issue_number": {"type": "integer", "minimum": 1}, "target_issue_number": {"type": "integer", "minimum": 1}, "relation": {"type": "string", "enum": ["depends_on", "supersedes", "absorbs", "duplicates"]}, "evidence_refs": {"type": "array", "items": {"type": "string"}}}}}
+      }
+    },
+    "execution": {
+      "type": "object", "additionalProperties": false,
+      "required": ["target_state", "predecessor_issue_numbers", "reason_codes"],
+      "properties": {"target_state": {"type": "string", "enum": ["selected", "deferred", "duplicate", "superseded"]}, "predecessor_issue_numbers": {"type": "array", "items": {"type": "integer", "minimum": 1}}, "reason_codes": {"type": "array", "items": {"type": "string", "minLength": 1}}}
+    },
+    "integrity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["canonicalization_id", "decision_inputs_sha256", "artifact_sha256"],
+      "properties": {"canonicalization_id": {"type": "string", "minLength": 1}, "decision_inputs_sha256": {"$ref": "#/$defs/sha256"}, "artifact_sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["producer_name", "producer_version", "policy_version", "policy_sha256"],
+      "properties": {"producer_name": {"type": "string", "minLength": 1}, "producer_version": {"type": "string", "minLength": 1}, "policy_version": {"type": "string", "minLength": 1}, "policy_sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "consumer_compatibility": {
+      "type": "object", "additionalProperties": false,
+      "required": ["consumer_contract_version", "supported_schema_versions", "projection_compatibility"],
+      "properties": {"consumer_contract_version": {"type": "string", "minLength": 1}, "supported_schema_versions": {"type": "array", "minItems": 1, "items": {"type": "string", "const": "ISSUE_EXECUTION_DECISION_V1"}}, "projection_compatibility": {"type": "string", "enum": ["dual_write", "dual_read", "new_authoritative", "legacy_removed"]}}
+    }
+  }
+}

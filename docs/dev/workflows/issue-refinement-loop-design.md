@@ -320,6 +320,14 @@ claims:
 | SubAgent 責務境界 | `docs/dev/agent-skill-boundaries.md` | 境界ルールへの参照リンク | 境界ルールを再定義 |
 | anchor comment handling | `.claude/skills/issue-refinement-loop/references/anchor-comment-handling.md` | 正規化ルールの設計根拠を記録 | raw handling ロジックを複製 |
 
+## Static execution decision projection
+
+`ISSUE_EXECUTION_DECISION_V1` is a static contract for the planning producer → schema validation →
+state/handoff projection → consumer route path. Its canonical policy is `docs/dev/workflow.md#execution-planning-policy-canonical-ssot`;
+the schema is `.claude/skills/issue-refinement-loop/schemas/issue_execution_decision_v1.schema.json`.
+This derived design note does not change runtime state/handoff or planner consumers. The migration projection is
+`dual-write` → `dual-read` → `equivalence` → `new-authoritative` → `old removal`, with existing open-pr hard gates retained.
+
 ## Traceability（追跡可能性）
 
 実装 Issue および関連 Issue:

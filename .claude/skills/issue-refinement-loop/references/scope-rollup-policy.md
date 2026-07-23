@@ -4,12 +4,14 @@ schema_version: 1
 related_script: ../scripts/plan_issue_scope_rollup.py
 related_issues: ["#316", "#550"]
 status: active
+canonical_policy: docs/dev/workflow.md#execution-planning-policy-canonical-ssot
 ---
 
 # Scope Rollup Policy
 
-このポリシーは `plan_issue_scope_rollup.py` の判定ロジックと、
+この文書は `docs/dev/workflow.md#execution-planning-policy-canonical-ssot` の canonical policy を、`plan_issue_scope_rollup.py` の判定ロジックと
 `issue-refinement-loop` / `impl-review-loop` における統合アクションの選択基準を定義する。
+普遍的な planning state、freshness、collision、merge readiness、quality/safety gate の設計正本ではない。
 
 ## 目的
 
