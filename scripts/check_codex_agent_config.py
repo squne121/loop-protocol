@@ -207,7 +207,11 @@ def validate_scope_rollup_runtime_contract(expectations: dict) -> list[str]:
         return failures + [f".codex/config.toml: missing {SCOPE_ROLLUP_PROFILE} profile"]
     filesystem = profile.get("filesystem", {})
     roots = filesystem.get(":workspace_roots", {}) if isinstance(filesystem, dict) else {}
-    if not isinstance(filesystem, dict) or filesystem.get(":tmpdir") != "write" or filesystem.get(":slash_tmp") != "write":
+    if (
+        not isinstance(filesystem, dict)
+        or filesystem.get(":tmpdir") != "write"
+        or filesystem.get(":slash_tmp") != "write"
+    ):
         failures.append(f".codex/config.toml: {SCOPE_ROLLUP_PROFILE} must write only :tmpdir and :slash_tmp")
     if not isinstance(roots, dict) or roots.get(".") != "read":
         failures.append(f".codex/config.toml: {SCOPE_ROLLUP_PROFILE} workspace must remain read-only")

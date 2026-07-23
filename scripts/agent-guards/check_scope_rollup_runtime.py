@@ -8,13 +8,11 @@ SKIP and exits 77.  A caller may persist the JSON as its private artifact.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import platform
 import shutil
 import subprocess
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,11 +26,21 @@ def main() -> int:
     version = None
     if codex:
         completed = subprocess.run([codex, "--version"], text=True, capture_output=True, check=False)
-        version = completed.stdout.strip().splitlines()[0] if completed.returncode == 0 and completed.stdout.strip() else None
+        version = (
+            completed.stdout.strip().splitlines()[0]
+            if completed.returncode == 0 and completed.stdout.strip() else None
+        )
     effective_profile = os.environ.get("CODEX_SCOPE_ROLLUP_EFFECTIVE_PROFILE")
     nested_disabled = os.environ.get("CODEX_SCOPE_ROLLUP_NESTED_DELEGATION_DISABLED") == "1"
     hook_trust = os.environ.get("CODEX_SCOPE_ROLLUP_HOOK_TRUST_ACTIVE") == "1"
-    available = bool(codex and version and EXPECTED_RELEASE in version and effective_profile == EXPECTED_PROFILE and nested_disabled and hook_trust)
+    available = bool(
+        codex
+        and version
+        and EXPECTED_RELEASE in version
+        and effective_profile == EXPECTED_PROFILE
+        and nested_disabled
+        and hook_trust
+    )
     status = "PASS" if available else "SKIP"
     reason = None if available else "pinned_codex_or_effective_session_features_unavailable"
     result = {
