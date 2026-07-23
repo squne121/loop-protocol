@@ -454,8 +454,10 @@ def test_stderr_bounded_no_leak_for_bash(tmp_path):
 
 
 def test_guard_ordering_secret_precedes_worktree(tmp_path):
-    """AC6: in settings.json PreToolUse, the shared-tool secret_boundary_guard
-    entry appears before the worktree_scope_guard entry."""
+    """AC6（#1690 で一時変更）: worktree_scope_guard は #1690 の方針決定までの間
+    settings.json の PreToolUse から一時的に外されている。secret_boundary_guard
+    の配線は維持されていることのみ検証する。#1690 の結論で worktree_scope_guard
+    が復元された場合、本テストの ordering assertion も復元すること。"""
     settings = json.loads(SETTINGS_JSON.read_text())
     pre = settings["hooks"]["PreToolUse"]
 
@@ -469,15 +471,17 @@ def test_guard_ordering_secret_precedes_worktree(tmp_path):
     secret_idx = _index_of("secret_boundary_guard")
     worktree_idx = _index_of("worktree_scope_guard")
     assert secret_idx != -1, "secret_boundary_guard missing from PreToolUse"
-    assert worktree_idx != -1, "worktree_scope_guard missing from PreToolUse"
-    assert secret_idx < worktree_idx, (
-        f"secret guard (idx {secret_idx}) must precede worktree guard (idx {worktree_idx})"
+    assert worktree_idx == -1, (
+        "worktree_scope_guard は #1690 の方針決定までの間 PreToolUse から外れている想定"
     )
+    assert GUARD_PY.exists(), "worktree_scope_guard.py 本体は削除されていない想定"
 
 
 def test_guard_ordering_worktree_matcher_shape(tmp_path):
-    """AC6: worktree_scope_guard matcher includes Bash|Write|Edit|MultiEdit and
-    secret guard also includes MultiEdit (#970 で追加済み)."""
+    """AC6（#1690 で一時変更）: worktree_scope_guard は現在 settings.json に
+    配線されていないため matcher shape は検証しない。secret guard に
+    MultiEdit が含まれること（#970）のみ検証する。#1690 の結論で
+    worktree_scope_guard が復元された場合、matcher shape assertion も復元すること。"""
     settings = json.loads(SETTINGS_JSON.read_text())
     pre = settings["hooks"]["PreToolUse"]
 
@@ -491,9 +495,9 @@ def test_guard_ordering_worktree_matcher_shape(tmp_path):
             if "secret_boundary_guard" in cmd:
                 secret_matcher = entry.get("matcher", "")
 
-    assert worktree_matcher is not None
-    for tool in ("Bash", "Write", "Edit", "MultiEdit"):
-        assert tool in worktree_matcher, f"{tool} missing from worktree matcher"
+    assert worktree_matcher is None, (
+        "worktree_scope_guard は #1690 の方針決定までの間 PreToolUse から外れている想定"
+    )
     # #970 にて secret_boundary_guard にも MultiEdit を追加済み。
     assert secret_matcher is not None
     assert "MultiEdit" in secret_matcher, "secret_boundary_guard matcher must include MultiEdit (#970)"
@@ -849,11 +853,13 @@ def test_fail_closed_git_binary_unavailable_for_mutation(tmp_path):
 
 
 def test_settings_json_is_valid_and_wires_worktree_guard(tmp_path):
-    """settings.json parses and references worktree_scope_guard in PreToolUse."""
+    """settings.json parses（#1690 で一時変更: worktree_scope_guard は方針決定
+    までの間 PreToolUse から外れている想定。settings.json 自体の valid性のみ
+    検証する）。#1690 の結論で復元された場合、wiring assertion を復元すること。"""
     settings = json.loads(SETTINGS_JSON.read_text())
     pre = settings["hooks"]["PreToolUse"]
     found = any("worktree_scope_guard" in h.get("command", "") for entry in pre for h in entry.get("hooks", []))
-    assert found, "worktree_scope_guard not wired in PreToolUse"
+    assert not found, "worktree_scope_guard は #1690 の方針決定までの間 PreToolUse から外れている想定"
 
 
 # =============================================================================

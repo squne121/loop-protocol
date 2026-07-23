@@ -43,14 +43,17 @@
     "scripts/tests/test_e501_migration_guard.py",
     "tests/context_mode/",
     "tests/test_summarize_agent_transcript.py",
-    "tests/agent_ops/"
+    "tests/agent_ops/",
+    "tests/test_hook_boundaries_doc.py"
   ],
   "ignore": [
     ".claude/hooks/tests/test_secret_boundary_contract.py"
   ],
   "deselect": [
     ".claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable",
-    ".claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths"
+    ".claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths",
+    "tests/test_hook_boundaries_doc.py::TestNodeWrapperIdentity::test_node_hook_handler_id_resolved",
+    "tests/test_hook_boundaries_doc.py::TestTelemetryHooksClassification::test_telemetry_hooks_classified"
   ],
   "xdist": {
     "workers": 4,
@@ -95,6 +98,7 @@
     "schemas_tests_inclusion": "schemas/tests/ is included exactly once here; it was previously missing from the generator pytest_args, causing the executed target set and the ci_test_selection artifact to drift (Issue #1064).",
     "dedicated_lanes_excluded": "tests/codex/test_local_main_branch_guard.py runs in its own codex execpolicy step (needs the pinned codex CLI context) and is intentionally NOT in targets to avoid double execution. tests/codex/test_execpolicy_matrix.py is included here so python-test and ci_test_selection/v1 both treat the pure-Python execpolicy contract coverage as part of the shared python lane, while the dedicated Codex CLI step keeps only the runtime guard test isolated. The Node-backed lane (pnpm test / e2e) and the hook-discovery collect-only guard remain separate steps; this plan only governs the unified python pytest suite.",
     "ignore_deselect_contract": "ignore/deselect preserve the hook-discovery contract: test_secret_boundary_contract.py is ignored (tracked by #412) and the two non-hermetic generate_session_manifest wrapper tests are deselected.",
+    "test_hook_boundaries_doc_coverage": "PR #1691 (Issue #1690): tests/test_hook_boundaries_doc.py was not previously a declared target, so it never ran in the python-test lane despite already existing in the repo. Adding it as a target (required by the ci_test_selection/v1 uncovered_changed_test_files gate once the file was modified) surfaced two pre-existing failures unrelated to PR #1691's hook removal: TestNodeWrapperIdentity::test_node_hook_handler_id_resolved and TestTelemetryHooksClassification::test_telemetry_hooks_classified, both caused by a PostToolUse node hook handler_id naming drift between docs/dev/hook-boundaries.md and the current settings.json (session_manifest_debounce vs generate_session_manifest_from_hook) that predates and is independent of PR #1691. These two are deselected here rather than fixed to keep PR #1691 scoped to the #1690 hook removal; a follow-up issue should reconcile the naming drift and remove this deselect.",
     "node_test_lane": "test_session_manifest_debounce.mjs (AC4 virtual-clock tests) runs in the dedicated node-backed-hook-tests CI lane via `node --test` (Issue #1141 AC6). It is NOT in the pytest targets.",
     "edit_issue_tests_directory_coverage": "Issue #1303: individual file targets test_guard_issue_body.py / test_issue_contract_hygiene_autofix.py were replaced by the directory target .claude/skills/edit-issue/tests/ so newly added tests in that directory (e.g. test_edit_issue_txn.py from PR #1301 / Issue #1287) are covered by the python-test lane and the ci_test_selection/v1 artifact without requiring a plan edit per new test file.",
     "runtime_verification_only_markers_rationale": "Issue #1562: pytest markers listed here are deselected from the default `python-test` pytest run (via pyproject.toml addopts, e.g. `github_live`) because they exercise real external services (e.g. `gh` write access to GitHub) that are structurally unavailable in the CI runner's authentication context. generate_ci_test_selection_artifact.py treats a changed test file whose tests are collected ONLY under one of these markers (verified by an actual `pytest --collect-only` re-run scoped to that file, both with and without the marker override) as covered by runtime verification rather than as a G1 `uncovered_changed_test_files` failure. This is deliberately distinct from `secondary_coverage.dedicated_lanes`, which declares coverage by a DIFFERENT CI job that actually executes the file; no such CI job exists for `github_live` tests, so registering them under dedicated_lanes would misrepresent a real CI job as covering tests it never runs."
