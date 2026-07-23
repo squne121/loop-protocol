@@ -766,7 +766,11 @@ def main(argv: list[str] | None = None) -> int:
 
         if not codex_only:
             if not excludes_permission_parity(expected):
-                permission_expected = "acceptEdits" if expected["default_permissions"] == "loop-protocol-rtk" else "dontAsk"
+                permission_expected = (
+                    "acceptEdits"
+                    if expected["default_permissions"] == "loop-protocol-rtk"
+                    else "dontAsk"
+                )
                 if agent_name == "post-merge-cleanup-worker":
                     permission_expected = "default"
                 if claude_frontmatter.get("permissionMode") != permission_expected:
