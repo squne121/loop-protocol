@@ -39,6 +39,7 @@
     "chatgpt-retro-context:post": "node scripts/agent-logs/lib/chatgpt-retro-context-marker-helper.mjs --command post",
     "chatgpt-retro-context:resolve-fixture": "node scripts/agent-logs/lib/chatgpt-retro-context-marker-helper.mjs --command resolve-fixture",
     "chatgpt-retro-context:resolve-live": "node scripts/agent-logs/lib/chatgpt-retro-context-marker-helper.mjs --command resolve-live",
+    "chatgpt-retro-context:assert-live": "node scripts/assert-chatgpt-retro-context-live.mjs",
     "agent-retro-index:check": "node scripts/check-agent-run-reports.mjs",
     "agent-retro-index:verify-digest": "node scripts/agent-logs/update-retro-index.mjs --verify-artifact-json",
     "agent-retro-index:update": "node scripts/agent-logs/update-retro-index.mjs",

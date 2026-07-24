@@ -1,0 +1,56 @@
+{
+  "status": "missing",
+  "repo": "squne121/loop-protocol",
+  "target": {
+    "type": "issue",
+    "number": 1224,
+    "endpoint_kind": "issue_comments_for_issue"
+  },
+  "parent_issue": 1153,
+  "marker_comment_url": "https://github.com/squne121/loop-protocol/issues/1224#issuecomment-41",
+  "comment_chain": {
+    "status": "missing",
+    "pagination": {
+      "page_count": 1,
+      "scanned_comments": 4,
+      "max_pages": 100,
+      "per_page": 100,
+      "endpoint": "repos/squne121/loop-protocol/issues/1224/comments",
+      "pagination_mode": "link_header",
+      "comments_complete": true,
+      "reference_page_count": null,
+      "reference_scanned_comments": null,
+      "reference_pagination_mode": null,
+      "reference_comments_complete": null
+    },
+    "comment_count": 4,
+    "matched_comment_count": 0,
+    "marker_comment": null,
+    "digest": null,
+    "payload_digest": null,
+    "evidence_ref_count": 1,
+    "source_manifest_count": 3,
+    "error_code": null,
+    "error_message": null
+  },
+  "pr_review_surface": {
+    "status": "not_applicable",
+    "pagination": null,
+    "review_ids": [],
+    "review_comment_ids": [],
+    "review_thread_node_ids": [],
+    "review_count": 0,
+    "review_comment_count": 0,
+    "review_thread_count": 0,
+    "resolved_thread_count": 0,
+    "sample_review": null,
+    "sample_review_comment": null,
+    "sample_review_thread": null,
+    "object_catalog": {
+      "reviews_by_id": {},
+      "review_comments_by_id": {},
+      "review_threads_by_node_id": {}
+    },
+    "projection_digest": null
+  }
+}
