@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,15 @@ try:
     _YAML_AVAILABLE = True
 except ImportError:
     _YAML_AVAILABLE = False
+
+# Issue #1705: AGY profile-scoped isolated permission policy. Loaded by path
+# (not package-relative import) so this module keeps working both when
+# executed as a script and when tests load it via
+# importlib.util.spec_from_file_location() with a synthetic module name.
+_AGY_PERMISSION_POLICY_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_AGY_PERMISSION_POLICY_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGY_PERMISSION_POLICY_SCRIPTS_DIR))
+import agy_permission_policy as _agy_permission_policy  # noqa: E402
 
 DEFAULT_MODEL = "gemini-3-flash-preview"
 DEFAULT_TIMEOUT_SEC = 600
@@ -1940,16 +1950,64 @@ def _build_agy_raw_command(prompt: str) -> list[str]:
     return [agy_bin, "-p", "<prompt>"]
 
 
+# Issue #1705: carries the current call's tool_profile from run_delegation()
+# into _run_agy() without widening _run_agy()'s own call signature. Existing
+# tests (test_agy_provider.py, outside this Issue's Allowed Paths) mock
+# `rgh._run_agy` with 2-positional-argument replacement functions and call
+# `rgh._run_agy(prompt, timeout_sec)` directly; a contextvar lets the profile
+# flow through without changing that call convention. Defaults to None
+# (back-compat: `_minimal_agy_env()` fallback, unchanged prior behavior) for
+# any caller -- including direct/mocked calls -- that does not go through
+# run_delegation()'s agy branch.
+_AGY_TOOL_PROFILE_CTX: "contextvars.ContextVar[str | None]" = contextvars.ContextVar(
+    "_agy_tool_profile_ctx", default=None
+)
+
+
 def _run_agy(
     prompt: str,
     timeout_sec: int,
 ) -> "subprocess.CompletedProcess[str]":
-    """Run agy -p <prompt> in an isolated temp cwd with minimal env.
+    """Run agy -p <prompt> in an isolated temp cwd with a profile-scoped permission workspace.
 
     Uses shell=False and AGY_BIN override for hermetic test injection.
+
+    When `_AGY_TOOL_PROFILE_CTX` holds a recognized
+    `agy_permission_policy.ALLOWED_PROFILES` value (set by `run_delegation()`
+    for the current call), an isolated Antigravity workspace
+    (workspace-scoped `.antigravity/settings.json` deny policy) is
+    materialized via `agy_permission_policy.materialize_isolated_agy_workspace()`
+    and its env (HOME/XDG_* redirected into the isolated workspace) is used
+    instead of `_minimal_agy_env()`. Because that env's `HOME` points at the
+    fresh isolated workspace rather than the caller's real `$HOME`, any
+    pre-existing global `$HOME/.antigravity/settings.json` allow rules are
+    structurally unreachable -- the workspace deny policy always applies
+    (Issue #1705 AC5/AC6 config precedence). Falls back to
+    `_minimal_agy_env()` when no profile is set in the contextvar
+    (back-compat with direct/mocked callers).
     """
     agy_bin = str(os.environ.get("AGY_BIN") or "agy")
     command = [agy_bin, "-p", prompt]
+    tool_profile = _AGY_TOOL_PROFILE_CTX.get()
+    if tool_profile in _agy_permission_policy.ALLOWED_PROFILES:
+        workspace = _agy_permission_policy.materialize_isolated_agy_workspace(tool_profile)
+        env = dict(workspace.env)
+        agy_bin_override = os.environ.get("AGY_BIN")
+        if agy_bin_override is not None:
+            env["AGY_BIN"] = agy_bin_override
+        try:
+            return subprocess.run(
+                command,
+                cwd=str(workspace.workspace_dir),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                check=False,
+                shell=False,
+            )
+        finally:
+            shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
     env = _minimal_agy_env()
     with tempfile.TemporaryDirectory(prefix="agy-headless-") as tmp:
         return subprocess.run(
@@ -3611,7 +3669,11 @@ def _run_delegation_core(
             )
             timeout_sec_agy = 300
         try:
-            agy_completed = _run_agy(prompt_text, timeout_sec_agy)
+            _agy_tool_profile_ctx_token = _AGY_TOOL_PROFILE_CTX.set(tool_profile)
+            try:
+                agy_completed = _run_agy(prompt_text, timeout_sec_agy)
+            finally:
+                _AGY_TOOL_PROFILE_CTX.reset(_agy_tool_profile_ctx_token)
         except subprocess.TimeoutExpired:
             return {
                 "schema": "delegation_result/v1",
