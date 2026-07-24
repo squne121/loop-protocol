@@ -1203,7 +1203,7 @@ uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/fan_out_orc
 ```
 
 
-## `agy_tool_provenance_v1` Schema Governance（Issue #1708）
+## `agy_tool_provenance_v1` のスキーマ統治方針（Issue #1708 対応、Schema Governance）
 
 AGY fan-out 実行時の WebSearch/`read_url_content` 成功判定の正本は、AGY stdout
 自己申告（`tool_calls` JSON や `AGY_WEBSEARCH:` 等の marker line）ではなく、AGY
@@ -1239,7 +1239,7 @@ Canonical web tool 名: `search_web`, `read_url_content`（installed Antigravity
 `read_url` / `fetch_url` / `fetch` は canonical name ではなく、fail-closed
 （`unknown_tool_provenance` / `unknown_tool_provenance:legacy_alias`）で拒否する。
 
-### Consumer Inventory（Consumer 一覧）
+### 利用者一覧（Consumer Inventory）
 
 - `agy_tool_provenance.py`: schema の producer（`build_provenance_event()` /
   generated hook wrapper script）であり、かつ唯一の validator/evaluator

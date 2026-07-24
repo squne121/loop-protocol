@@ -210,7 +210,7 @@ agy 優先の fallback 順序を確認できる。
 
 2 つの順序が意図的に異なる理由: `setup_check_order` は「まず agy が使えるかを優先的に確認したい」という診断上の関心であるのに対し、`runtime_order` は「Gemini を既定 provider として維持しつつ quota/capacity 失敗時のみ agy にフォールバックする」という実行時の安全側デフォルトである。両者は独立したポリシーであり、一致している必要はない（`config/model_routing.yaml` の `provider_auto_policy_v1` ブロックのコメントを参照）。なお `references/model-routing.md` は現時点では model downgrade / role / model_chain のみを扱い、`provider_auto_policy_v1` 自体は未記載であることに注意する（本節が現状の唯一の docs 上の説明）。
 
-## AGY PreToolUse Hook Provenance（Issue #1708 readback）
+## AGY PreToolUse フックの来歴記録（Issue #1708 の実機 readback 調査結果）
 
 - installed Antigravity CLI version: `agy --version` → `1.1.5`（2026-07-25 readback）。
 - 公式 lifecycle hook 仕様は installed CLI 同梱の
