@@ -301,6 +301,16 @@ PROVIDER_AUTO_RESULT_FIELDS: tuple[str, ...] = (
     "fallback_policy_version",
     "attempts_by_model",
 )
+# Issue #1695 PR review (Major 2): named reason_code for why provider="auto"
+# never fans out to multiple providers concurrently. provider_auto_dispatch()
+# attempts exactly one provider at a time because PROVIDER_AUTO_RETRYABLE_FAILURE_CLASSES
+# and get_retry_budget() define per-provider attempt/backoff budgets --
+# running two providers concurrently would make attempts_by_model /
+# provider_attempts unauditable and would let a single request exceed its
+# configured retry budget across providers. This is exported so
+# build_request.py's model-policy inspector can reference the real
+# runtime reason instead of hand-writing a duplicate literal.
+PROVIDER_AUTO_FAN_OUT_UNSUPPORTED_REASON_CODE = "provider_auto_attempts_unbudgeted_v1"
 
 # --- AGY generic failure classifier (Issue #1270 / supersedes #1274 gap) ----
 # Generalizes AGY stdout/stderr quota-or-capacity detection beyond the
