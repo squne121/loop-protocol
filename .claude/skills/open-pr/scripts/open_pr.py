@@ -87,6 +87,29 @@ _ORDERED_CONTINUATION_WAIVER_CANDIDATE_REASONS = frozenset(
     }
 )
 
+# #1675 が native dependency 上で後続 Issue を止めているだけの状態を、
+# current Issue 自身の predecessor blocker と誤分類しないための限定 waiver。
+# ordered continuation と異なり candidate は必ず空であり、live body には
+# snapshot SHA を保存しない。consumer が実行時に live body と fresh go snapshot
+# および fresh overlap evidence の SHA を接続して検証する。
+_OUTBOUND_ONLY_WAIVER_TOP_LEVEL_KEYS = frozenset(
+    {
+        "route",
+        "repo",
+        "issue",
+        "expires_on",
+        "approved_by",
+        "source",
+        "candidates",
+        "dependency_resolution",
+        "native_blocked_by",
+        "native_blocking",
+    }
+)
+_OUTBOUND_ONLY_WAIVER_SOURCE_KEYS = frozenset({"complete", "saturated"})
+_OUTBOUND_ONLY_WAIVER_DEPENDENCY_KEYS = frozenset({"blocking_predecessor"})
+_OUTBOUND_ONLY_WAIVER_NATIVE_BLOCKING = [1677, 1674]
+
 # linked issue がこのラベルを持つ場合、`overlap_preflight` が未指定または
 # `required: false` でも gate を省略しない（AC2, bypass-via-omission 対策）。
 FORCE_OVERLAP_PREFLIGHT_LABEL = "phase/implementation"
@@ -1301,6 +1324,128 @@ def _ordered_continuation_candidate_matches_waiver(fresh: dict, waiver: dict) ->
     return True
 
 
+def _validate_outbound_only_waiver_schema(waiver: object) -> str | None:
+    """#1675 の outbound-only waiver を closed schema で検証する。"""
+    if not isinstance(waiver, dict):
+        return "outbound_only_waiver が object ではありません"
+    unknown_keys = set(waiver.keys()) - _OUTBOUND_ONLY_WAIVER_TOP_LEVEL_KEYS
+    if unknown_keys:
+        return f"outbound_only_waiver に未知のキーがあります: {sorted(unknown_keys)}"
+    if waiver.get("route") != "human_review_required":
+        return "outbound_only_waiver.route が human_review_required ではありません"
+    if waiver.get("repo") != OVERLAP_ORDERED_CONTINUATION_WAIVER_REPOSITORY:
+        return "outbound_only_waiver.repo が canonical repository と一致しません"
+    if waiver.get("issue") != OVERLAP_ORDERED_CONTINUATION_WAIVER_LINKED_ISSUE:
+        return "outbound_only_waiver.issue が #1675 ではありません"
+    expires_on = waiver.get("expires_on")
+    if not isinstance(expires_on, str) or not _ISO_DATE_RE.match(expires_on):
+        return "outbound_only_waiver.expires_on が不正です"
+    try:
+        date.fromisoformat(expires_on)
+    except ValueError:
+        return "outbound_only_waiver.expires_on の日付形式が不正です"
+    if waiver.get("approved_by") != "user_session":
+        return "outbound_only_waiver.approved_by が user_session ではありません"
+    source = waiver.get("source")
+    if not isinstance(source, dict) or set(source.keys()) != _OUTBOUND_ONLY_WAIVER_SOURCE_KEYS:
+        return "outbound_only_waiver.source のキー集合が不正です"
+    if source.get("complete") is not True or source.get("saturated") is not False:
+        return "outbound_only_waiver.source が complete=true / saturated=false ではありません"
+    if waiver.get("candidates") != []:
+        return "outbound_only_waiver.candidates が空配列ではありません"
+    dependency_resolution = waiver.get("dependency_resolution")
+    if (
+        not isinstance(dependency_resolution, dict)
+        or set(dependency_resolution.keys()) != _OUTBOUND_ONLY_WAIVER_DEPENDENCY_KEYS
+        or dependency_resolution.get("blocking_predecessor") is not None
+    ):
+        return "outbound_only_waiver.dependency_resolution が不正です"
+    if waiver.get("native_blocked_by") != []:
+        return "outbound_only_waiver.native_blocked_by が空配列ではありません"
+    if waiver.get("native_blocking") != _OUTBOUND_ONLY_WAIVER_NATIVE_BLOCKING:
+        return "outbound_only_waiver.native_blocking が [1677, 1674] と一致しません"
+    return None
+
+
+def _load_verified_outbound_only_waiver(
+    repo: str,
+    linked_issue: int,
+    *,
+    today: date | None = None,
+) -> tuple[dict | None, str | None, str | None]:
+    """#1675 の candidate-empty waiver を live/snapshot SHA binding で読む。"""
+    if (
+        _canonicalize_repo_static(repo) != OVERLAP_ORDERED_CONTINUATION_WAIVER_REPOSITORY
+        or linked_issue != OVERLAP_ORDERED_CONTINUATION_WAIVER_LINKED_ISSUE
+    ):
+        return None, "outbound_only_waiver の canonical repository / linked issue が固定 binding と一致しません", None
+    waiver, live_body_sha256, binding_error = _load_verified_waiver_binding(
+        repo,
+        linked_issue,
+        waiver_key="outbound_only_waiver",
+    )
+    if binding_error is not None:
+        return None, binding_error, None
+    schema_error = _validate_outbound_only_waiver_schema(waiver)
+    if schema_error is not None:
+        return None, schema_error, None
+    if (today or _utc_today()) > date.fromisoformat(waiver["expires_on"]):
+        return None, "outbound_only_waiver の期限が切れています", None
+    return waiver, None, live_body_sha256
+
+
+def _canonical_native_blocking_numbers(value: object) -> list[int] | None:
+    """producer の native dependency object を契約上の番号列へ正規化する。
+
+    Issue 本文の waiver は portability のため ``[1677, 1674]`` を保持するが、
+    overlap producer の runtime evidence は repository/number/state を持つ object
+    配列で返す。object の repository と number を fail-closed で検証してからのみ
+    番号列へ投影するため、異なる repository・型不正・順序 drift は通さない。
+    """
+    if not isinstance(value, list):
+        return None
+    numbers: list[int] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            return None
+        repository = entry.get("repository")
+        number = entry.get("number")
+        if (
+            _canonicalize_repo_static(repository)
+            != OVERLAP_ORDERED_CONTINUATION_WAIVER_REPOSITORY
+            or isinstance(number, bool)
+            or not isinstance(number, int)
+            or number <= 0
+        ):
+            return None
+        numbers.append(number)
+    return numbers
+
+
+def _outbound_only_evidence_matches_waiver(fresh: dict) -> bool:
+    """candidate-empty の #1675 evidence が waiver の固定安全条件を満たすか。"""
+    if fresh.get("route") != "human_review_required":
+        return False
+    source = fresh.get("source")
+    if not isinstance(source, dict) or source.get("complete") is not True or source.get("saturated") is not False:
+        return False
+    if fresh.get("candidates") != []:
+        return False
+    dependency_resolution = fresh.get("dependency_resolution")
+    if not isinstance(dependency_resolution, dict):
+        return False
+    if dependency_resolution.get("blocking_predecessor") is not None:
+        return False
+    if dependency_resolution.get("native_blocked_by") != []:
+        return False
+    if (
+        _canonical_native_blocking_numbers(dependency_resolution.get("native_blocking"))
+        != _OUTBOUND_ONLY_WAIVER_NATIVE_BLOCKING
+    ):
+        return False
+    return True
+
+
 def _overlap_preflight_safety_reason(fresh: dict, linked_issue: int) -> str | None:
     """AC4 の安全性 predicate を検証する。violation があれば理由文字列、
     なければ None を返す。"""
@@ -1601,14 +1746,31 @@ def run_overlap_preflight_gate(
             repo == OVERLAP_ORDERED_CONTINUATION_WAIVER_REPOSITORY
             and linked_issue == OVERLAP_ORDERED_CONTINUATION_WAIVER_LINKED_ISSUE
         ):
-            waiver, waiver_error, live_body_sha256 = _load_verified_ordered_continuation_waiver(
-                repo, linked_issue
-            )
+            # candidate がある既存経路と、candidate が空で native_blocking
+            # だけを観測した outbound-only 経路は排他的に扱う。これにより、
+            # #1675 本文が両方の waiver を保持していても片方の malformed
+            # contract が他方の条件付き経路を誤って有効化しない。
+            is_outbound_only = fresh.get("candidates") == []
+            if is_outbound_only:
+                waiver, waiver_error, live_body_sha256 = _load_verified_outbound_only_waiver(
+                    repo, linked_issue
+                )
+                waiver_name = "outbound_only_waiver"
+                matches_waiver = _outbound_only_evidence_matches_waiver
+            else:
+                waiver, waiver_error, live_body_sha256 = _load_verified_ordered_continuation_waiver(
+                    repo, linked_issue
+                )
+                waiver_name = "overlap_ordered_continuation_waiver"
+                matches_waiver = lambda evidence: (
+                    waiver is not None
+                    and _ordered_continuation_candidate_matches_waiver(evidence, waiver)
+                )
             if waiver_error is not None:
                 return (
                     False,
                     E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID,
-                    f"overlap_ordered_continuation_waiver が検証できません: {waiver_error}",
+                    f"{waiver_name} が検証できません: {waiver_error}",
                     fresh,
                 )
             fresh_current_issue = fresh.get("current_issue")
@@ -1625,11 +1787,11 @@ def run_overlap_preflight_gate(
                 return (
                     False,
                     E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID,
-                    "fresh evidence の current_issue.body_sha256 が ordered continuation waiver "
+                    f"fresh evidence の current_issue.body_sha256 が {waiver_name} "
                     "検証時の live body SHA と一致しません",
                     fresh,
                 )
-            if waiver is not None and _ordered_continuation_candidate_matches_waiver(fresh, waiver):
+            if waiver is not None and matches_waiver(fresh):
                 effective_fresh = dict(fresh)
                 effective_fresh["route"] = "proceed_with_collision_evidence"
                 remaining_unsafe_reason = _overlap_preflight_safety_reason(
