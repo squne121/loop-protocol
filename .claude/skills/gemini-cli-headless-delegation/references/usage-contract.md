@@ -1202,3 +1202,75 @@ uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/fan_out_orc
   --audit-log delegation_audit.jsonl
 ```
 
+
+## `agy_tool_provenance_v1` Schema Governance（Issue #1708）
+
+AGY fan-out 実行時の WebSearch/`read_url_content` 成功判定の正本は、AGY stdout
+自己申告（`tool_calls` JSON や `AGY_WEBSEARCH:` 等の marker line）ではなく、AGY
+`PreToolUse` lifecycle hook（`.agents/hooks.json`、公式仕様は installed Antigravity
+CLI 同梱の `builtin/skills/agy-customizations/docs/hooks.md` を参照）から採取する
+`agy_tool_provenance_v1` イベントである。実装は
+`.claude/skills/gemini-cli-headless-delegation/scripts/agy_tool_provenance.py`。
+
+### Schema 定義
+
+`schema: "agy_tool_provenance_v1"`, `version: 1`。必須フィールド:
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `schema` / `version` | string / int | 固定値。 |
+| `event` | string | `"PreToolUse"`。 |
+| `toolCall.name` | string | canonical web tool 名のみ許可（下記）。 |
+| `toolCall.args_sha256` | string(hex64) | raw args ではなく canonicalized args の sha256。 |
+| `stepIdx` | int | AGY native `PreToolUse` payload 由来。 |
+| `conversationId` | string | AGY native `PreToolUse` payload 由来。 |
+| `transcript_path_ref` | string | `transcriptPath` の public-safe identifier（`sha256:` prefix）。raw absolute path は含めない。 |
+| `transcript_sha256` | string(hex64) | orchestrator 側で計算する transcript hash。 |
+| `parent_run_id` / `subtask_id` / `attempt_id` | string | fan-out run binding。 |
+| `provider` | string | `"agy"` 固定。 |
+| `tool_profile` | string | `no_tools` / `local_asset_research` / `grounded_research` 等。 |
+| `monotonic_ns` | int | `time.monotonic_ns()`。 |
+| `utc` | string(ISO8601) | UTC タイムスタンプ。 |
+
+Canonical web tool 名: `search_web`, `read_url_content`（installed Antigravity CLI
+1.1.5 の `PreToolUse` transcript サンプル `~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl`
+で `toolCall.name == "search_web"` を実 readback 済み）。旧実装（#1266）が誤認識して
+いた `web_search` / `websearch` / `browser_navigate` / `browser` / `url_read` /
+`read_url` / `fetch_url` / `fetch` は canonical name ではなく、fail-closed
+（`unknown_tool_provenance` / `unknown_tool_provenance:legacy_alias`）で拒否する。
+
+### Consumer Inventory（Consumer 一覧）
+
+- `agy_tool_provenance.py`: schema の producer（`build_provenance_event()` /
+  generated hook wrapper script）であり、かつ唯一の validator/evaluator
+  （`validate_provenance_event()`, `evaluate_websearch_provenance()`）。
+- `tests/test_agy_tool_provenance.py`, `tests/test_agy_provenance_schema_governance.py`:
+  closed-schema tests（下記参照）。
+- `run_gemini_headless.py` `_run_agy()`: workspace-scoped hook config
+  （`.agents/hooks.json` + wrapper script）を AGY 実行ごとの isolated temp cwd に
+  動的生成する producer 側 integration point。
+- 他の既存 schema（`delegation_result/v1`, `delegation_audit_v1`,
+  `fanout_result/v1` 等）の consumer は `agy_tool_provenance_v1` を直接消費しない
+  （2026-07-25 時点で `rg -l "agy_tool_provenance_v1"` の hit は本 schema の
+  producer/validator/tests のみ）。
+
+### Compatibility Decision（互換性方針）
+
+- `agy_tool_provenance_v1` は既存の `delegation_audit_v1` とは**別 schema**であり、
+  既存 schema のフィールド集合・意味論を変更しない（additive, non-breaking）。
+- `agy_tool_provenance_v1` イベントを `delegation_audit_v1` へどう取り込むか
+  （embed するか、別 artifact として並置するか）は本 Issue の Out of Scope。
+  取り込みが必要になった場合は互換性判断（新フィールド追加 = minor, 既存フィールド
+  変更 = 新 schema version）を別 Issue で行う。
+- 本 schema の必須フィールド集合はここに記載した 15 フィールドで固定（closed
+  schema）。フィールド追加は許可されるが、削除・型変更は breaking change として
+  `version` を上げる。
+
+### Closed-Schema Tests（正本テスト）
+
+- `.claude/skills/gemini-cli-headless-delegation/tests/test_agy_tool_provenance.py`
+- `.claude/skills/gemini-cli-headless-delegation/tests/test_agy_provenance_schema_governance.py`
+
+両ファイルとも hermetic（fixture 済み hook event・モック AGY 実行のみ、live AGY
+バイナリ起動なし）。schema のフィールド集合を変更する場合は、上記 2 ファイルの
+`REQUIRED_TOP_FIELDS` / `REQUIRED_TOOL_CALL_FIELDS` 網羅テストを更新すること。

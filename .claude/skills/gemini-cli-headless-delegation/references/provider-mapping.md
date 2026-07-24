@@ -209,3 +209,23 @@ agy 優先の fallback 順序を確認できる。
 | `--fix` | `unsupported_provider_option` で拒否（副作用対象が曖昧なため） | 該当なし（runtime dispatch に `--fix` 相当の概念はない） |
 
 2 つの順序が意図的に異なる理由: `setup_check_order` は「まず agy が使えるかを優先的に確認したい」という診断上の関心であるのに対し、`runtime_order` は「Gemini を既定 provider として維持しつつ quota/capacity 失敗時のみ agy にフォールバックする」という実行時の安全側デフォルトである。両者は独立したポリシーであり、一致している必要はない（`config/model_routing.yaml` の `provider_auto_policy_v1` ブロックのコメントを参照）。なお `references/model-routing.md` は現時点では model downgrade / role / model_chain のみを扱い、`provider_auto_policy_v1` 自体は未記載であることに注意する（本節が現状の唯一の docs 上の説明）。
+
+## AGY PreToolUse Hook Provenance（Issue #1708 readback）
+
+- installed Antigravity CLI version: `agy --version` → `1.1.5`（2026-07-25 readback）。
+- 公式 lifecycle hook 仕様は installed CLI 同梱の
+  `builtin/skills/agy-customizations/docs/hooks.md` を正本とする（`.agents/hooks.json`
+  配置、`PreToolUse` は `{"toolCall": {"name", "args"}, "stepIdx", "conversationId",
+  "transcriptPath", "workspacePaths", "artifactDirectoryPath", "modelName"}` を stdin
+  で受け取り、`{"decision": "allow"|"deny"|"ask"|"force_ask", ...}` を stdout へ返す
+  contract）。
+- canonical web tool 名: **`search_web`**, **`read_url_content`**（installed CLI の
+  live `PreToolUse` transcript サンプルで `toolCall.name == "search_web"` を確認
+  済み）。AGY fan-out の WebSearch/grounding 成功判定は、この `PreToolUse` hook から
+  採取する `agy_tool_provenance_v1` イベント（schema 定義は
+  `references/usage-contract.md` の「`agy_tool_provenance_v1` Schema Governance」節
+  を参照）を正本とし、AGY stdout の `tool_calls`/marker JSON は非正本の補助情報
+  （`stdout_self_report`）として扱う。
+- 実装: `.claude/skills/gemini-cli-headless-delegation/scripts/agy_tool_provenance.py`
+  （workspace-scoped `.agents/hooks.json` 動的生成、schema validator、
+  conversation/run 一致検証、redaction）。
