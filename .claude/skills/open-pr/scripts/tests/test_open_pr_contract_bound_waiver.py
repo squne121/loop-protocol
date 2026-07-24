@@ -375,9 +375,7 @@ def test_contract_bound_waiver_rejects_invalid_live_contract_or_snapshot(monkeyp
     mismatched_repo_waiver = _generic_waiver(repository="someone-else/other-repo", linked_issue=1503)
     mismatched_body = _waiver_live_body(mismatched_repo_waiver)
     mismatched_sha = "sha256:" + hashlib.sha256(mismatched_body.encode("utf-8")).hexdigest()
-    _patch_live_waiver_readback(
-        monkeypatch, 1503, mismatched_body, [_snapshot_comment(mismatched_sha, 1503)]
-    )
+    _patch_live_waiver_readback(monkeypatch, 1503, mismatched_body, [_snapshot_comment(mismatched_sha, 1503)])
     loaded, error, _live_body_sha256 = open_pr._load_verified_generic_overlap_readback_waiver(
         "squne121/loop-protocol", 1503, today=open_pr.date(2026, 6, 15)
     )
@@ -419,9 +417,7 @@ def test_contract_bound_waiver_rejects_invalid_live_contract_or_snapshot(monkeyp
 
     # trusted go snapshot body_sha256 does not match the live body (stale /
     # tampered snapshot).
-    _patch_live_waiver_readback(
-        monkeypatch, 1503, body, [_snapshot_comment("sha256:" + "0" * 64, 1503)]
-    )
+    _patch_live_waiver_readback(monkeypatch, 1503, body, [_snapshot_comment("sha256:" + "0" * 64, 1503)])
     loaded, error, _live_body_sha256 = open_pr._load_verified_generic_overlap_readback_waiver(
         "squne121/loop-protocol", 1503, today=open_pr.date(2026, 6, 15)
     )
@@ -543,9 +539,7 @@ def _ordered_continuation_evidence(body_sha256: str, *, native_blocked_by: list[
         "validation_errors": {},
         "decision_inputs_sha256": "sha256:" + "c" * 64,
     }
-    canonical = json.dumps(
-        evidence, sort_keys=True, ensure_ascii=True, separators=(",", ":")
-    )
+    canonical = json.dumps(evidence, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
     evidence["evidence_sha256"] = f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
     return evidence
 
@@ -602,9 +596,7 @@ def test_ordered_continuation_waiver_allows_only_1675_then_1677(monkeypatch):
 
 
 def test_ordered_continuation_waiver_rejects_reverse_direction_and_native_predecessor(monkeypatch):
-    reverse = _ordered_continuation_waiver(
-        candidate_issue="#1675", relation="predecessor", first="#1677", next="#1675"
-    )
+    reverse = _ordered_continuation_waiver(candidate_issue="#1675", relation="predecessor", first="#1677", next="#1675")
     reverse_body = _ordered_continuation_live_body(reverse)
     reverse_sha = "sha256:" + hashlib.sha256(reverse_body.encode("utf-8")).hexdigest()
     _patch_live_waiver_readback(monkeypatch, 1675, reverse_body, [_snapshot_comment(reverse_sha, 1675)])
@@ -679,6 +671,9 @@ def _outbound_only_waiver(**overrides: object) -> dict:
 
 
 def _outbound_only_live_body(waiver: dict) -> str:
+    source = waiver["source"]
+    source_complete = str(source["complete"]).lower()
+    source_saturated = str(source["saturated"]).lower()
     return f'''## Machine-Readable Contract
 
 ```yaml
@@ -688,7 +683,7 @@ outbound_only_waiver:
   issue: {waiver["issue"]}
   expires_on: "{waiver["expires_on"]}"
   approved_by: "{waiver["approved_by"]}"
-  source: {{complete: {str(waiver["source"]["complete"]).lower()}, saturated: {str(waiver["source"]["saturated"]).lower()}}}
+  source: {{complete: {source_complete}, saturated: {source_saturated}}}
   candidates: {waiver["candidates"]}
   dependency_resolution: {{blocking_predecessor: null}}
   native_blocked_by: {waiver["native_blocked_by"]}
@@ -791,9 +786,7 @@ def test_outbound_only_waiver_schema_rejects_unsafe_or_unknown_fields(monkeypatc
                 {"repository": "squne121/loop-protocol", "number": 1677, "state": "OPEN"},
             ],
         ),
-        lambda evidence: evidence["dependency_resolution"].__setitem__(
-            "native_blocking", [1677, 1674]
-        ),
+        lambda evidence: evidence["dependency_resolution"].__setitem__("native_blocking", [1677, 1674]),
         lambda evidence: evidence["dependency_resolution"]["native_blocking"][0].__setitem__(
             "repository", "other/repository"
         ),
@@ -997,7 +990,6 @@ def test_generic_waiver_path_does_not_activate_for_the_fixed_1477_binding(monkey
         evidence_path.unlink(missing_ok=True)
 
 
-
 # ---------------------------------------------------------------------------
 # PR #1627 review fix_delta (P1-binding-gap): the generic waiver loader's
 # live_body_sha256 must be connected to the fresh evidence's own
@@ -1056,9 +1048,7 @@ def _run_binding_gap_case(monkeypatch, tmp_name: str, *, current_issue_body_sha2
     _patch_live_waiver_readback(monkeypatch, 1503, body_a, [_snapshot_comment(sha_a, 1503)])
 
     candidates = [
-        _readback_incomplete_candidate(
-            521, "2026-06-01T00:00:00Z", "readback_incomplete_missing_outcome_or_in_scope"
-        ),
+        _readback_incomplete_candidate(521, "2026-06-01T00:00:00Z", "readback_incomplete_missing_outcome_or_in_scope"),
     ]
     current_issue = {"number": 1503}
     if current_issue_body_sha256 is not _UNSET:
@@ -1172,7 +1162,4 @@ def test_incomplete_candidates_match_generic_waiver_rejects_extra_reason_added_t
             },
         ],
     }
-    assert (
-        open_pr._incomplete_candidates_match_generic_waiver(fresh_with_extra_reason, waiver)
-        is False
-    )
+    assert open_pr._incomplete_candidates_match_generic_waiver(fresh_with_extra_reason, waiver) is False

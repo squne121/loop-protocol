@@ -15,13 +15,48 @@ SHA = "sha256:" + "a" * 64
 def valid_fixture() -> dict:
     return {
         "schema_version": "ISSUE_EXECUTION_DECISION_V1",
-        "identity": {"repository_id": "R_1", "repository_full_name": "owner/repo", "target_issue_number": 1675, "body_sha256": SHA, "updated_at": "2026-07-23T00:00:00Z"},
-        "source_manifest": {"collected_at": "2026-07-23T00:00:00Z", "issues_complete": True, "pull_requests_complete": True, "dependencies_complete": True, "unresolved_references": [], "issues_sha256": SHA, "pull_requests_sha256": SHA, "dependencies_sha256": SHA},
-        "graph": {"canonical_sort": "issue_number_ascending_then_relation", "nodes": [{"issue_number": 1675}, {"issue_number": 1677}], "edges": [{"source_issue_number": 1677, "target_issue_number": 1675, "relation": "depends_on", "evidence_refs": ["issue:1677"]}]},
+        "identity": {
+            "repository_id": "R_1",
+            "repository_full_name": "owner/repo",
+            "target_issue_number": 1675,
+            "body_sha256": SHA,
+            "updated_at": "2026-07-23T00:00:00Z",
+        },
+        "source_manifest": {
+            "collected_at": "2026-07-23T00:00:00Z",
+            "issues_complete": True,
+            "pull_requests_complete": True,
+            "dependencies_complete": True,
+            "unresolved_references": [],
+            "issues_sha256": SHA,
+            "pull_requests_sha256": SHA,
+            "dependencies_sha256": SHA,
+        },
+        "graph": {
+            "canonical_sort": "issue_number_ascending_then_relation",
+            "nodes": [{"issue_number": 1675}, {"issue_number": 1677}],
+            "edges": [
+                {
+                    "source_issue_number": 1677,
+                    "target_issue_number": 1675,
+                    "relation": "depends_on",
+                    "evidence_refs": ["issue:1677"],
+                }
+            ],
+        },
         "execution": {"target_state": "selected", "predecessor_issue_numbers": [], "reason_codes": ["owner_priority"]},
         "integrity": {"canonicalization_id": "rfc8785", "decision_inputs_sha256": SHA, "artifact_sha256": SHA},
-        "provenance": {"producer_name": "issue-refinement-loop", "producer_version": "v1", "policy_version": "v1", "policy_sha256": SHA},
-        "consumer_compatibility": {"consumer_contract_version": "v1", "supported_schema_versions": ["ISSUE_EXECUTION_DECISION_V1"], "projection_compatibility": "dual_write"},
+        "provenance": {
+            "producer_name": "issue-refinement-loop",
+            "producer_version": "v1",
+            "policy_version": "v1",
+            "policy_sha256": SHA,
+        },
+        "consumer_compatibility": {
+            "consumer_contract_version": "v1",
+            "supported_schema_versions": ["ISSUE_EXECUTION_DECISION_V1"],
+            "projection_compatibility": "dual_write",
+        },
     }
 
 
@@ -42,6 +77,7 @@ def validate_graph_invariants(instance: dict) -> None:
         if relation == "depends_on":
             adjacency[source].append(target)
     visiting, visited = set(), set()
+
     def visit(node: int) -> None:
         assert node not in visiting, "depends_on cycle is invalid"
         if node not in visited:
@@ -50,6 +86,7 @@ def validate_graph_invariants(instance: dict) -> None:
                 visit(neighbor)
             visiting.remove(node)
             visited.add(node)
+
     for node in nodes:
         visit(node)
 
@@ -65,12 +102,15 @@ def test_given_valid_fixture_when_validated_then_accepts():
     validate(valid_fixture())
 
 
-@pytest.mark.parametrize("mutation", [
-    lambda item: item.pop("identity"),
-    lambda item: item.__setitem__("unexpected", True),
-    lambda item: item["execution"].__setitem__("target_state", "blocked"),
-    lambda item: item["identity"].__setitem__("target_issue_number", "1675"),
-])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda item: item.pop("identity"),
+        lambda item: item.__setitem__("unexpected", True),
+        lambda item: item["execution"].__setitem__("target_state", "blocked"),
+        lambda item: item["identity"].__setitem__("target_issue_number", "1675"),
+    ],
+)
 def test_given_invalid_schema_fixture_when_validated_then_rejects(mutation):
     fixture = copy.deepcopy(valid_fixture())
     mutation(fixture)
@@ -78,10 +118,13 @@ def test_given_invalid_schema_fixture_when_validated_then_rejects(mutation):
         validate(fixture)
 
 
-@pytest.mark.parametrize("edge", [
-    {"source_issue_number": 1675, "target_issue_number": 1675, "relation": "depends_on", "evidence_refs": []},
-    {"source_issue_number": 1675, "target_issue_number": 9999, "relation": "depends_on", "evidence_refs": []},
-])
+@pytest.mark.parametrize(
+    "edge",
+    [
+        {"source_issue_number": 1675, "target_issue_number": 1675, "relation": "depends_on", "evidence_refs": []},
+        {"source_issue_number": 1675, "target_issue_number": 9999, "relation": "depends_on", "evidence_refs": []},
+    ],
+)
 def test_graph_invariants(edge):
     fixture = valid_fixture()
     fixture["graph"]["edges"] = [edge]
@@ -96,14 +139,18 @@ def test_given_unsorted_or_contradictory_graph_when_validated_then_rejects():
         validate(fixture)
 
     fixture = valid_fixture()
-    fixture["graph"]["edges"].append({"source_issue_number": 1675, "target_issue_number": 1677, "relation": "depends_on", "evidence_refs": []})
+    fixture["graph"]["edges"].append(
+        {"source_issue_number": 1675, "target_issue_number": 1677, "relation": "depends_on", "evidence_refs": []}
+    )
     with pytest.raises(AssertionError):
         validate(fixture)
 
 
 def test_given_depends_on_cycle_when_validated_then_rejects():
     fixture = valid_fixture()
-    fixture["graph"]["edges"].append({"source_issue_number": 1675, "target_issue_number": 1677, "relation": "depends_on", "evidence_refs": []})
+    fixture["graph"]["edges"].append(
+        {"source_issue_number": 1675, "target_issue_number": 1677, "relation": "depends_on", "evidence_refs": []}
+    )
     with pytest.raises(AssertionError):
         validate(fixture)
 

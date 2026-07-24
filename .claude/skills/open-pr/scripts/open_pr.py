@@ -10,6 +10,7 @@ LOOP_PROTOCOL の PR 起票を決定論的に行う。skill (SKILL.md) の手順
 - gh pr create 実行
 - KEY=VALUE stdout contract
 """
+
 from __future__ import annotations
 
 import argparse
@@ -24,9 +25,7 @@ from datetime import date, datetime, timezone
 
 import yaml
 
-_ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR = (
-    Path(__file__).resolve().parent.parent.parent / "issue-contract-review" / "scripts"
-)
+_ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "issue-contract-review" / "scripts"
 if str(_ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR))
 
@@ -117,8 +116,7 @@ FORCE_OVERLAP_PREFLIGHT_LABEL = "phase/implementation"
 # `.claude/skills/implement-issue/scripts/check_implementation_overlap.py`
 # （open-pr の Allowed Paths 外、変更しない。subprocess として再実行するのみ）。
 _CHECK_IMPLEMENTATION_OVERLAP_SCRIPT = (
-    Path(__file__).resolve().parent.parent.parent
-    / "implement-issue" / "scripts" / "check_implementation_overlap.py"
+    Path(__file__).resolve().parent.parent.parent / "implement-issue" / "scripts" / "check_implementation_overlap.py"
 )
 
 # P1-1 (PR #1467 review fix): 旧実装は get_linked_issue_state() が処理前半で
@@ -303,9 +301,7 @@ def resolve_canonical_repository(requested_repo: str) -> str | None:
 
 def get_linked_issue_state(repo: str, issue_number: int) -> str | None:
     try:
-        result = run_gh(
-            "issue", "view", str(issue_number), "--repo", repo, "--json", "state"
-        )
+        result = run_gh("issue", "view", str(issue_number), "--repo", repo, "--json", "state")
         data = json.loads(result.stdout)
     except (subprocess.SubprocessError, json.JSONDecodeError):
         return None
@@ -314,9 +310,7 @@ def get_linked_issue_state(repo: str, issue_number: int) -> str | None:
     return data.get("state")
 
 
-def fetch_current_linked_issue_labels(
-    repo: str, issue_number: int
-) -> tuple[list[str] | None, str | None]:
+def fetch_current_linked_issue_labels(repo: str, issue_number: int) -> tuple[list[str] | None, str | None]:
     """gate 起動要否 (forced_by_label) の判定 **直前** に labels をオンライン
     再取得する（P1-1: TOCTOU 対策。PR #1467 review fix）。
 
@@ -342,9 +336,7 @@ def fetch_current_linked_issue_labels(
     labels = data.get("labels")
     if not isinstance(labels, list):
         return None, "labels フィールドが list ではありません"
-    label_names = [
-        (lbl.get("name") if isinstance(lbl, dict) else str(lbl)) for lbl in labels
-    ]
+    label_names = [(lbl.get("name") if isinstance(lbl, dict) else str(lbl)) for lbl in labels]
     return label_names, None
 
 
@@ -408,9 +400,7 @@ def _run_pr_body_validator(
     changed_paths: list[str] | None,
     linked_issue: int,
 ) -> dict[str, object]:
-    validator_script = (
-        Path(__file__).resolve().parent / "validate_pr_body.py"
-    )
+    validator_script = Path(__file__).resolve().parent / "validate_pr_body.py"
 
     body_file = tempfile.NamedTemporaryFile(
         mode="w",
@@ -533,7 +523,6 @@ def _run_pr_body_validator(
             Path(changed_paths_file.name).unlink(missing_ok=True)
 
 
-
 def _run_japanese_content_validator(
     body_text: str,
     threshold: float = 0.1,
@@ -549,8 +538,7 @@ def _run_japanese_content_validator(
       - stderr: str (on fail/internal)
     """
     validator_script = (
-        Path(__file__).resolve().parent.parent.parent
-        / "create-issue" / "scripts" / "validate_japanese_content.py"
+        Path(__file__).resolve().parent.parent.parent / "create-issue" / "scripts" / "validate_japanese_content.py"
     )
 
     body_sha256 = f"sha256:{hashlib.sha256(body_text.encode('utf-8')).hexdigest()}"
@@ -656,6 +644,7 @@ def _run_japanese_content_validator(
             }
     finally:
         Path(body_file.name).unlink(missing_ok=True)
+
 
 def _overlap_preflight_evidence_sha256(payload: dict) -> str:
     """producer（`check_implementation_overlap.py`）と同一の canonicalization
@@ -801,9 +790,7 @@ _ISSUE_URL_RE = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/issues/(\d+)$"
 _SHA256_HEX_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _RFC3339_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
-_GENERIC_WAIVER_TOP_LEVEL_KEYS = frozenset(
-    {"repository", "linked_issue", "candidates", "expires_on", "approved_by"}
-)
+_GENERIC_WAIVER_TOP_LEVEL_KEYS = frozenset({"repository", "linked_issue", "candidates", "expires_on", "approved_by"})
 _GENERIC_WAIVER_CANDIDATE_KEYS = frozenset({"issue_number", "updated_at", "reason"})
 
 
@@ -922,9 +909,7 @@ def _load_verified_waiver_binding(
     if comments_error is not None:
         return None, None, f"contract snapshot comment readback が不完全です: {comments_error}"
     latest = contract_review_parser.find_latest_result(
-        contract_review_parser.parse_contract_review_results(
-            comments, expected_issue_url=expected_url
-        ),
+        contract_review_parser.parse_contract_review_results(comments, expected_issue_url=expected_url),
         trusted_only=True,
     )
     if latest is None:
@@ -993,7 +978,8 @@ def _has_only_fixed_readback_incomplete_blockers(fresh: dict) -> bool:
     if not isinstance(candidates, list):
         return False
     incomplete = [
-        candidate for candidate in candidates
+        candidate
+        for candidate in candidates
         if isinstance(candidate, dict) and candidate.get("readback_complete") is False
     ]
     if len(incomplete) != len(OVERLAP_READBACK_WAIVER_ISSUE_NUMBERS):
@@ -1032,7 +1018,8 @@ def _is_readback_incomplete_only_blocker(fresh: dict) -> bool:
     if not isinstance(candidates, list):
         return False
     incomplete = [
-        candidate for candidate in candidates
+        candidate
+        for candidate in candidates
         if isinstance(candidate, dict) and candidate.get("readback_complete") is False
     ]
     if not incomplete:
@@ -1042,10 +1029,7 @@ def _is_readback_incomplete_only_blocker(fresh: dict) -> bool:
         if (
             not isinstance(reasons, list)
             or not reasons
-            or not all(
-                isinstance(reason, str) and reason.startswith("readback_incomplete")
-                for reason in reasons
-            )
+            or not all(isinstance(reason, str) and reason.startswith("readback_incomplete") for reason in reasons)
         ):
             return False
     for candidate in candidates:
@@ -1072,11 +1056,7 @@ def _validate_generic_overlap_readback_waiver_schema(waiver: object) -> str | No
     if not isinstance(repository, str) or not repository:
         return "overlap_readback_waiver.repository が不正です"
     linked_issue = waiver.get("linked_issue")
-    if (
-        isinstance(linked_issue, bool)
-        or not isinstance(linked_issue, int)
-        or linked_issue <= 0
-    ):
+    if isinstance(linked_issue, bool) or not isinstance(linked_issue, int) or linked_issue <= 0:
         return "overlap_readback_waiver.linked_issue が不正です"
     candidates = waiver.get("candidates")
     if not isinstance(candidates, list) or not candidates:
@@ -1087,10 +1067,7 @@ def _validate_generic_overlap_readback_waiver_schema(waiver: object) -> str | No
             return "overlap_readback_waiver.candidates の要素が object ではありません"
         unknown_candidate_keys = set(candidate.keys()) - _GENERIC_WAIVER_CANDIDATE_KEYS
         if unknown_candidate_keys:
-            return (
-                "overlap_readback_waiver.candidates[] に未知のキーがあります: "
-                f"{sorted(unknown_candidate_keys)}"
-            )
+            return f"overlap_readback_waiver.candidates[] に未知のキーがあります: {sorted(unknown_candidate_keys)}"
         number = candidate.get("issue_number")
         if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
             return "overlap_readback_waiver.candidates[].issue_number が不正です"
@@ -1166,7 +1143,8 @@ def _incomplete_candidates_match_generic_waiver(fresh: dict, waiver: dict) -> bo
     if not isinstance(candidates, list):
         return False
     incomplete = [
-        candidate for candidate in candidates
+        candidate
+        for candidate in candidates
         if isinstance(candidate, dict) and candidate.get("readback_complete") is False
     ]
     waiver_candidates = waiver.get("candidates")
@@ -1200,10 +1178,7 @@ def _incomplete_candidates_match_generic_waiver(fresh: dict, waiver: dict) -> bo
         if (
             not isinstance(reasons, list)
             or not reasons
-            or not all(
-                isinstance(reason, str) and reason.startswith("readback_incomplete")
-                for reason in reasons
-            )
+            or not all(isinstance(reason, str) and reason.startswith("readback_incomplete") for reason in reasons)
         ):
             return False
         # Issue #1509 P2 review fix_delta: waiver は candidate ごとに単一の
@@ -1230,7 +1205,7 @@ def _validate_ordered_continuation_waiver_schema(waiver: object) -> str | None:
         return "overlap_ordered_continuation_waiver が object ではありません"
     unknown_keys = set(waiver.keys()) - _ORDERED_CONTINUATION_WAIVER_TOP_LEVEL_KEYS
     if unknown_keys:
-        return "overlap_ordered_continuation_waiver に未知のキーがあります: " f"{sorted(unknown_keys)}"
+        return f"overlap_ordered_continuation_waiver に未知のキーがあります: {sorted(unknown_keys)}"
     candidate_issue = waiver.get("candidate_issue")
     if candidate_issue not in {"#1677", 1677}:
         return "overlap_ordered_continuation_waiver.candidate_issue が #1677 ではありません"
@@ -1273,7 +1248,11 @@ def _load_verified_ordered_continuation_waiver(
         _canonicalize_repo_static(repo) != OVERLAP_ORDERED_CONTINUATION_WAIVER_REPOSITORY
         or linked_issue != OVERLAP_ORDERED_CONTINUATION_WAIVER_LINKED_ISSUE
     ):
-        return None, "overlap_ordered_continuation_waiver の canonical repository / linked issue が固定 binding と一致しません", None
+        return (
+            None,
+            "overlap_ordered_continuation_waiver の canonical repository / linked issue が固定 binding と一致しません",
+            None,
+        )
     waiver, live_body_sha256, binding_error = _load_verified_waiver_binding(
         repo,
         linked_issue,
@@ -1302,7 +1281,10 @@ def _ordered_continuation_candidate_matches_waiver(fresh: dict, waiver: dict) ->
     if not isinstance(candidates, list) or len(candidates) != 1:
         return False
     candidate = candidates[0]
-    if not isinstance(candidate, dict) or candidate.get("issue_number") != OVERLAP_ORDERED_CONTINUATION_WAIVER_CANDIDATE_ISSUE:
+    if (
+        not isinstance(candidate, dict)
+        or candidate.get("issue_number") != OVERLAP_ORDERED_CONTINUATION_WAIVER_CANDIDATE_ISSUE
+    ):
         return False
     if candidate.get("updated_at") != waiver.get("candidate_updated_at"):
         return False
@@ -1411,8 +1393,7 @@ def _canonical_native_blocking_numbers(value: object) -> list[int] | None:
         repository = entry.get("repository")
         number = entry.get("number")
         if (
-            _canonicalize_repo_static(repository)
-            != OVERLAP_ORDERED_CONTINUATION_WAIVER_REPOSITORY
+            _canonicalize_repo_static(repository) != OVERLAP_ORDERED_CONTINUATION_WAIVER_REPOSITORY
             or isinstance(number, bool)
             or not isinstance(number, int)
             or number <= 0
@@ -1505,8 +1486,7 @@ def run_overlap_preflight_gate(
         return (
             False,
             E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID,
-            f"evidence_sha256 不一致: stored={stored_sha} recomputed={recomputed} "
-            f"expected={expected_evidence_sha256}",
+            f"evidence_sha256 不一致: stored={stored_sha} recomputed={recomputed} expected={expected_evidence_sha256}",
             None,
         )
 
@@ -1518,10 +1498,7 @@ def run_overlap_preflight_gate(
     # 別リポジトリの evidence を誤って再利用しても gh pr create は一度も呼ばれない。
     target_repo = repo
     stored_repository = stored.get("repository")
-    if (
-        stored_repository != _canonicalize_repo_static(stored_repository)
-        or stored_repository != target_repo
-    ):
+    if stored_repository != _canonicalize_repo_static(stored_repository) or stored_repository != target_repo:
         return (
             False,
             E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID,
@@ -1607,8 +1584,7 @@ def run_overlap_preflight_gate(
         return (
             False,
             E_OVERLAP_PREFLIGHT_SOURCE_FAILURE,
-            f"check_implementation_overlap.py exit {cp.returncode}: "
-            f"{(cp.stderr or cp.stdout or '').strip()[:500]}",
+            f"check_implementation_overlap.py exit {cp.returncode}: {(cp.stderr or cp.stdout or '').strip()[:500]}",
             None,
         )
 
@@ -1634,8 +1610,7 @@ def run_overlap_preflight_gate(
         return (
             False,
             E_OVERLAP_PREFLIGHT_DRIFT,
-            f"fresh repository が canonical target と一致しません: "
-            f"fresh={fresh_repository!r} target={target_repo!r}",
+            f"fresh repository が canonical target と一致しません: fresh={fresh_repository!r} target={target_repo!r}",
             fresh,
         )
 
@@ -1664,8 +1639,7 @@ def run_overlap_preflight_gate(
         return (
             False,
             E_OVERLAP_PREFLIGHT_DRIFT,
-            f"fresh evidence に collection contract の必須 field がありません: "
-            f"{sorted(fresh_missing_contract_keys)}",
+            f"fresh evidence に collection contract の必須 field がありません: {sorted(fresh_missing_contract_keys)}",
             fresh,
         )
 
@@ -1710,8 +1684,7 @@ def run_overlap_preflight_gate(
         return (
             False,
             E_OVERLAP_PREFLIGHT_DRIFT,
-            f"decision_inputs_sha256 drift: expected={expected_decision_inputs_sha256} "
-            f"fresh={fresh_decision_inputs}",
+            f"decision_inputs_sha256 drift: expected={expected_decision_inputs_sha256} fresh={fresh_decision_inputs}",
             fresh,
         )
 
@@ -1737,9 +1710,7 @@ def run_overlap_preflight_gate(
             effective_fresh = dict(fresh)
             if waiver is not None:
                 effective_fresh["route"] = "proceed_with_collision_evidence"
-                remaining_unsafe_reason = _overlap_preflight_safety_reason(
-                    effective_fresh, linked_issue
-                )
+                remaining_unsafe_reason = _overlap_preflight_safety_reason(effective_fresh, linked_issue)
                 if remaining_unsafe_reason is None:
                     return True, None, "", effective_fresh
         elif (
@@ -1752,20 +1723,15 @@ def run_overlap_preflight_gate(
             # contract が他方の条件付き経路を誤って有効化しない。
             is_outbound_only = fresh.get("candidates") == []
             if is_outbound_only:
-                waiver, waiver_error, live_body_sha256 = _load_verified_outbound_only_waiver(
-                    repo, linked_issue
-                )
+                waiver, waiver_error, live_body_sha256 = _load_verified_outbound_only_waiver(repo, linked_issue)
                 waiver_name = "outbound_only_waiver"
                 matches_waiver = _outbound_only_evidence_matches_waiver
             else:
-                waiver, waiver_error, live_body_sha256 = _load_verified_ordered_continuation_waiver(
-                    repo, linked_issue
-                )
+                waiver, waiver_error, live_body_sha256 = _load_verified_ordered_continuation_waiver(repo, linked_issue)
                 waiver_name = "overlap_ordered_continuation_waiver"
-                matches_waiver = lambda evidence: (
-                    waiver is not None
-                    and _ordered_continuation_candidate_matches_waiver(evidence, waiver)
-                )
+
+                def matches_waiver(evidence: dict) -> bool:
+                    return waiver is not None and _ordered_continuation_candidate_matches_waiver(evidence, waiver)
             if waiver_error is not None:
                 return (
                     False,
@@ -1775,9 +1741,7 @@ def run_overlap_preflight_gate(
                 )
             fresh_current_issue = fresh.get("current_issue")
             fresh_body_sha256 = (
-                fresh_current_issue.get("body_sha256")
-                if isinstance(fresh_current_issue, dict)
-                else None
+                fresh_current_issue.get("body_sha256") if isinstance(fresh_current_issue, dict) else None
             )
             if (
                 not isinstance(fresh_body_sha256, str)
@@ -1794,9 +1758,7 @@ def run_overlap_preflight_gate(
             if waiver is not None and matches_waiver(fresh):
                 effective_fresh = dict(fresh)
                 effective_fresh["route"] = "proceed_with_collision_evidence"
-                remaining_unsafe_reason = _overlap_preflight_safety_reason(
-                    effective_fresh, linked_issue
-                )
+                remaining_unsafe_reason = _overlap_preflight_safety_reason(effective_fresh, linked_issue)
                 if remaining_unsafe_reason is None:
                     return True, None, "", effective_fresh
         elif not is_fixed_1477_target and _is_readback_incomplete_only_blocker(fresh):
@@ -1806,9 +1768,7 @@ def run_overlap_preflight_gate(
             # のみを通り、この elif には一切到達しない -- 既存 regression
             # gate（test_open_pr_overlap_gate.py、本 Issue の Allowed Paths
             # 外）の挙動を寸分違わず維持するため）。
-            waiver, waiver_error, live_body_sha256 = _load_verified_generic_overlap_readback_waiver(
-                repo, linked_issue
-            )
+            waiver, waiver_error, live_body_sha256 = _load_verified_generic_overlap_readback_waiver(repo, linked_issue)
             if waiver_error is not None:
                 return (
                     False,
@@ -1824,9 +1784,7 @@ def run_overlap_preflight_gate(
             # 検出できない。
             fresh_current_issue = fresh.get("current_issue")
             fresh_body_sha256 = (
-                fresh_current_issue.get("body_sha256")
-                if isinstance(fresh_current_issue, dict)
-                else None
+                fresh_current_issue.get("body_sha256") if isinstance(fresh_current_issue, dict) else None
             )
             if (
                 not isinstance(fresh_body_sha256, str)
@@ -1836,16 +1794,13 @@ def run_overlap_preflight_gate(
                 return (
                     False,
                     E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID,
-                    "fresh evidence の current_issue.body_sha256 が waiver 検証時の"
-                    " live body SHA と一致しません",
+                    "fresh evidence の current_issue.body_sha256 が waiver 検証時の live body SHA と一致しません",
                     fresh,
                 )
             if waiver is not None and _incomplete_candidates_match_generic_waiver(fresh, waiver):
                 effective_fresh = dict(fresh)
                 effective_fresh["route"] = "proceed_with_collision_evidence"
-                remaining_unsafe_reason = _overlap_preflight_safety_reason(
-                    effective_fresh, linked_issue
-                )
+                remaining_unsafe_reason = _overlap_preflight_safety_reason(effective_fresh, linked_issue)
                 if remaining_unsafe_reason is None:
                     return True, None, "", effective_fresh
         return False, E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE, unsafe_reason, fresh
@@ -1972,9 +1927,7 @@ def main(argv: list[str] | None = None) -> int:
         # P1-1 (PR #1467 review fix): forced_by_label の判定はここでオンライン
         # 再取得した fresh labels のみを使う（stale cache は使わない）。取得
         # 失敗は fail-closed（gate を必ず有効化する）として扱う。
-        fresh_labels, labels_fetch_error = fetch_current_linked_issue_labels(
-            repo, args.linked_issue
-        )
+        fresh_labels, labels_fetch_error = fetch_current_linked_issue_labels(repo, args.linked_issue)
         if labels_fetch_error is not None:
             forced_by_label = True
         else:
