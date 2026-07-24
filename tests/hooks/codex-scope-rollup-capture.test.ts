@@ -180,60 +180,61 @@ describe('Codex SubagentStop scope-rollup capture adapter', () => {
     expect(result.stderr).toContain('eligibility_missing')
   })
 
-  it('source-bound eligibility rejects missing stale invalid and mismatched artifacts', () => {
-    const basePayload = readFixture('codex-scope-rollup-runner-stop.json')
-    const cases: Array<{ name: string; overrides: FixedLocationOverrides; expectReason: string }> = [
-      {
-        name: 'missing readiness artifact',
-        overrides: { skipReadiness: true },
-        expectReason: 'readiness_missing',
+  const sourceBoundRejectionCases: Array<{ name: string; overrides: FixedLocationOverrides; expectReason: string }> = [
+    {
+      name: 'missing readiness artifact',
+      overrides: { skipReadiness: true },
+      expectReason: 'readiness_missing',
+    },
+    {
+      name: 'stale (future) eligibility artifact',
+      overrides: { eligibilityGeneratedAt: new Date(Date.now() + 60_000).toISOString() },
+      expectReason: 'eligibility_stale_future_generated_at',
+    },
+    {
+      name: 'expired eligibility artifact',
+      overrides: {
+        eligibilityGeneratedAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+        eligibilityExpiresAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
       },
-      {
-        name: 'stale (future) eligibility artifact',
-        overrides: { eligibilityGeneratedAt: new Date(Date.now() + 60_000).toISOString() },
-        expectReason: 'eligibility_stale_future_generated_at',
-      },
-      {
-        name: 'expired eligibility artifact',
-        overrides: {
-          eligibilityGeneratedAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
-          eligibilityExpiresAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
-        },
-        expectReason: 'eligibility_stale_expired',
-      },
-      {
-        name: 'invalid readiness (unprepared)',
-        overrides: { readinessPrepared: false },
-        expectReason: 'readiness_unprepared',
-      },
-      {
-        name: 'mismatched repo root binding',
-        overrides: { eligibilityRepoRootRealpath: '/nonexistent/other/repo' },
-        expectReason: 'eligibility_binding_repo_mismatch',
-      },
-      {
-        name: 'unsafe secrets_mode',
-        overrides: { eligibilitySecretsMode: 'app_secret' },
-        expectReason: 'eligibility_binding_secrets_mode_unsafe',
-      },
-      {
-        name: 'safety_verdict deny',
-        overrides: { eligibilitySafetyVerdict: 'deny' },
-        expectReason: 'eligibility_binding_safety_verdict_denied',
-      },
-      {
-        name: 'additionalProperties rejected',
-        overrides: { eligibilityExtraKey: true },
-        expectReason: 'eligibility_invalid_additional_properties',
-      },
-      {
-        name: 'missing required key rejected',
-        overrides: { eligibilityMissingKey: true },
-        expectReason: 'eligibility_invalid_additional_properties',
-      },
-    ]
+      expectReason: 'eligibility_stale_expired',
+    },
+    {
+      name: 'invalid readiness (unprepared)',
+      overrides: { readinessPrepared: false },
+      expectReason: 'readiness_unprepared',
+    },
+    {
+      name: 'mismatched repo root binding',
+      overrides: { eligibilityRepoRootRealpath: '/nonexistent/other/repo' },
+      expectReason: 'eligibility_binding_repo_mismatch',
+    },
+    {
+      name: 'unsafe secrets_mode',
+      overrides: { eligibilitySecretsMode: 'app_secret' },
+      expectReason: 'eligibility_binding_secrets_mode_unsafe',
+    },
+    {
+      name: 'safety_verdict deny',
+      overrides: { eligibilitySafetyVerdict: 'deny' },
+      expectReason: 'eligibility_binding_safety_verdict_denied',
+    },
+    {
+      name: 'additionalProperties rejected',
+      overrides: { eligibilityExtraKey: true },
+      expectReason: 'eligibility_invalid_additional_properties',
+    },
+    {
+      name: 'missing required key rejected',
+      overrides: { eligibilityMissingKey: true },
+      expectReason: 'eligibility_invalid_additional_properties',
+    },
+  ]
 
-    for (const { overrides, expectReason } of cases) {
+  it.each(sourceBoundRejectionCases)(
+    'source-bound eligibility rejects: $name',
+    ({ overrides, expectReason }) => {
+      const basePayload = readFixture('codex-scope-rollup-runner-stop.json')
       const captureDirectory = isolatedDirectory()
       const artifactDirectory = isolatedDirectory()
       const env = writeFixedLocationArtifacts(artifactDirectory, overrides)
@@ -242,8 +243,8 @@ describe('Codex SubagentStop scope-rollup capture adapter', () => {
       expect(result.status).toBe(0)
       expect(readdirSync(captureDirectory).filter((name) => name.endsWith('.txt'))).toHaveLength(0)
       expect(result.stderr).toContain(expectReason)
-    }
-  })
+    },
+  )
 
   it('valid eligibility writes canonical capture', () => {
     const captureDirectory = isolatedDirectory()
