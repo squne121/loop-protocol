@@ -348,3 +348,11 @@ def test_real_plan_includes_pr_body_validator_exactly_once():
     path = "scripts/tests/test_pr_body_validator.py"
     assert plan["targets"].count(path) == 1
     assert mod.scope_argv(plan).count(path) == 1
+
+
+def test_real_plan_includes_agent_ops_tests_exactly_once():
+    """Issue #1403: cleanup executor tests must be in the shared CI scope once."""
+    plan = mod.load_plan(_PLAN_PATH)
+    path = "scripts/agent-ops/tests/"
+    assert plan["targets"].count(path) == 1
+    assert mod.scope_argv(plan).count(path) == 1
