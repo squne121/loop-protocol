@@ -220,6 +220,41 @@ def test_given_matching_readbacks_when_built_then_record_and_receipt_are_pass_el
     assert record["payload_sha256"] != receipt["execution_artifact"]["artifact_archive_digest"]
 
 
+def test_given_final_receipt_contract_missing_or_mismatched_manifest_when_built_then_receipt_is_not_pass_eligible():
+    producer = load_producer()
+    data = identity_fixture()
+    record = build_record_from_fixture(producer, data, execution_result(producer))
+    ea = matching_execution_artifact(record)
+
+    missing_manifest = dict(record["contract"])
+    missing_manifest.pop("command_manifest_sha256")
+    missing_receipt = producer.build_receipt(record, ea, record["subject"], missing_manifest)
+    assert not missing_receipt["pass_eligible"]
+
+    mismatched_manifest = dict(record["contract"], command_manifest_sha256="sha256:" + ("0" * 64))
+    mismatched_receipt = producer.build_receipt(record, ea, record["subject"], mismatched_manifest)
+    assert not mismatched_receipt["pass_eligible"]
+
+
+def test_given_failed_run_30120049703_artifact_8606984998_when_workflow_renders_then_receipt_manifest_is_explicitly_propagated():
+    text = WORKFLOW.read_text()
+    data = identity_fixture()
+    data["producer"]["workflow_run_id"] = 30120049703
+    producer = load_producer()
+    record = build_record_from_fixture(producer, data, execution_result(producer))
+    receipt = producer.build_receipt(
+        record,
+        matching_execution_artifact(record, artifact_id=8606984998),
+        record["subject"],
+        record["contract"],
+    )
+
+    assert receipt["pass_eligible"]
+    assert receipt["contract"]["command_manifest_sha256"] == record["contract"]["command_manifest_sha256"]
+    assert "assemble-contract --issue-file issue-final.json" in text
+    assert "--execution-record execution-record.json" in text
+
+
 def test_given_drift_or_missing_coverage_when_built_then_receipt_is_not_pass_eligible():
     producer = load_producer()
     data = identity_fixture()

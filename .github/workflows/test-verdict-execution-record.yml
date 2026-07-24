@@ -116,7 +116,7 @@ jobs:
         run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assemble-subject --subject-file subject-final.json --target-pr-number ${{ inputs.target_pr_number }} --output subject-final-assembled.json
 
       - name: Assemble final contract identity
-        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assemble-contract --issue-file issue-final.json --linked-issue-number ${{ inputs.linked_issue_number }} --output contract-final-assembled.json
+        run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assemble-contract --issue-file issue-final.json --linked-issue-number ${{ inputs.linked_issue_number }} --execution-record execution-record.json --output contract-final-assembled.json
 
       - name: Fetch uploaded execution-record artifact metadata via REST
         run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py gh-api --path repos/${{ github.repository }}/actions/artifacts/${{ steps.upload-execution-record.outputs.artifact-id }} --output artifact-rest.json

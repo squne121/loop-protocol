@@ -236,7 +236,27 @@ def _is_positive_int(value):
 
 
 def build_receipt(record, execution_artifact, final_subject, final_contract):
-    stable = final_subject == record["subject"] and final_contract == record["contract"]
+    record_contract = record.get("contract")
+    record_manifest_sha256 = (
+        record_contract.get("command_manifest_sha256")
+        if isinstance(record_contract, dict)
+        else None
+    )
+    final_manifest_sha256 = (
+        final_contract.get("command_manifest_sha256")
+        if isinstance(final_contract, dict)
+        else None
+    )
+    manifest_is_bound = (
+        isinstance(record_manifest_sha256, str)
+        and bool(_SHA256_PREFIXED_RE.fullmatch(record_manifest_sha256))
+        and final_manifest_sha256 == record_manifest_sha256
+    )
+    stable = (
+        final_subject == record["subject"]
+        and final_contract == record_contract
+        and manifest_is_bound
+    )
 
     reported = {
         "artifact_id": execution_artifact.get("artifact_id"),
@@ -538,6 +558,17 @@ def _cmd_assemble_contract(args):
         "linked_issue_number": int(args.linked_issue_number),
         "issue_body_sha256": sha256_of(issue_data.get("body") or ""),
     }
+    if args.execution_record is not None:
+        record = json.loads(args.execution_record.read_text(encoding="utf-8"))
+        record_contract = record.get("contract")
+        manifest_sha256 = (
+            record_contract.get("command_manifest_sha256")
+            if isinstance(record_contract, dict)
+            else None
+        )
+        if not isinstance(manifest_sha256, str) or not _SHA256_PREFIXED_RE.fullmatch(manifest_sha256):
+            raise ValueError("execution record has no valid command_manifest_sha256")
+        contract["command_manifest_sha256"] = manifest_sha256
     args.output.write_text(json.dumps(contract, indent=2, sort_keys=True) + chr(10), encoding="utf-8")
     return 0
 
@@ -667,6 +698,7 @@ def main():
     p_acon = sub.add_parser("assemble-contract")
     p_acon.add_argument("--issue-file", type=Path, required=True)
     p_acon.add_argument("--linked-issue-number", required=True)
+    p_acon.add_argument("--execution-record", type=Path, required=False)
     p_acon.add_argument("--output", type=Path, required=True)
     p_acon.set_defaults(func=_cmd_assemble_contract)
 
