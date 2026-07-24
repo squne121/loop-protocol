@@ -1,0 +1,54 @@
+{
+  "status": "resolved",
+  "repo": "squne121/loop-protocol",
+  "target": { "type": "pull_request", "number": 1224, "endpoint_kind": "issue_comments_for_pull_request" },
+  "parent_issue": 1153,
+  "marker_comment_url": "https://github.com/squne121/loop-protocol/issues/1224#issuecomment-41",
+  "comment_chain": {
+    "status": "resolved",
+    "pagination": {
+      "page_count": 1,
+      "scanned_comments": 4,
+      "max_pages": 100,
+      "per_page": 100,
+      "endpoint": "repos/squne121/loop-protocol/issues/1224/comments",
+      "pagination_mode": "link_header",
+      "comments_complete": true,
+      "reference_page_count": 2,
+      "reference_scanned_comments": 2,
+      "reference_pagination_mode": ["link_header", "link_header"],
+      "reference_comments_complete": true
+    },
+    "comment_count": 4,
+    "matched_comment_count": 1,
+    "marker_comment": { "id": 41, "url": "https://github.com/squne121/loop-protocol/issues/1224#issuecomment-41" },
+    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "payload_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "evidence_ref_count": 1,
+    "source_manifest_count": 3,
+    "error_code": null,
+    "error_message": null
+  },
+  "pr_review_surface": {
+    "status": "resolved",
+    "pagination": {
+      "reviews_complete": true,
+      "review_comments_complete": true,
+      "review_threads_complete": true,
+      "thread_comments_complete": true,
+      "complete": true
+    },
+    "review_ids": [4671349811],
+    "review_comment_ids": [3558855703],
+    "review_thread_node_ids": ["PRRT_kwDOSfQcDc6P4Sca"],
+    "review_count": 1,
+    "review_comment_count": 1,
+    "review_thread_count": 1,
+    "resolved_thread_count": 1,
+    "sample_review": { "id": 4671349811 },
+    "sample_review_comment": { "id": 3558855703 },
+    "sample_review_thread": { "thread_node_id": "PRRT_kwDOSfQcDc6P4Sca" },
+    "object_catalog": { "reviews_by_id": {}, "review_comments_by_id": {}, "review_threads_by_node_id": {} },
+    "projection_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  }
+}

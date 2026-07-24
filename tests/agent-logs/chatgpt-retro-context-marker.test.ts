@@ -4,6 +4,7 @@ import { spawnSync } from 'child_process'
 import { renderPublicMarkdown, validateChatgptRetrospectiveResultAgainstSchema } from '../../scripts/lib/agent-run-report-validation.mjs'
 import {
   buildChatgptRetroContextCommentBody,
+  classifyChatgptRetroContextMarkerCandidate,
   computeChatgptRetroContextPayloadDigest,
   parseChatgptRetroContextComment,
   resolveChatgptRetroContextFromFixtures,
@@ -166,6 +167,290 @@ describe('chatgpt retro context marker helper', () => {
       parentIssue: 1153,
       payloadMarkdown,
     })).rejects.toThrow(/multiple existing context marker comments/)
+  })
+
+  it('GIVEN ownershipをparseできないmalformed_marker_intentが既存 WHEN upsert THEN createIssueComment/updateIssueCommentは一度も呼ばれずfail-closed', async () => {
+    // Missing `parent_issue=` -- classifyChatgptRetroContextMarkerCandidate()
+    // reports `malformed_marker_intent`, but validateChatgptRetroContextCommentBody()
+    // cannot parse an `ownership` tuple from it at all. Before the P0 fix,
+    // the ownership-scoped `matches` filter in upsertChatgptRetroContextComment()
+    // would never see this comment, so upsert would fall through to `create`
+    // even though resolveChatgptRetroContextLive() classifies the identical
+    // body as malformed_marker_intent and blocks (split-brain).
+    const payloadMarkdown = renderPublicMarkdown(createPayload())
+    const client = {
+      listIssueComments: async () => [
+        {
+          id: 5,
+          html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-5',
+          body: '<!-- CHATGPT_RETRO_CONTEXT_V1 repo=squne121/loop-protocol target=issue:1224 -->',
+        },
+      ],
+      createIssueComment: async () => {
+        throw new Error('create should not run')
+      },
+      updateIssueComment: async () => {
+        throw new Error('update should not run')
+      },
+    }
+
+    await expect(upsertChatgptRetroContextComment(client, {
+      repo: 'squne121/loop-protocol',
+      targetType: 'issue',
+      targetNumber: 1224,
+      parentIssue: 1153,
+      payloadMarkdown,
+      dryRun: false,
+    })).rejects.toThrow(/malformed marker intent/)
+  })
+
+  it('GIVEN a comment whose body has malformed marker intent but ownership cannot be parsed WHEN parsing it directly THEN parseChatgptRetroContextComment reports malformed:true (not silently false)', () => {
+    const parsed = parseChatgptRetroContextComment({
+      id: 5,
+      body: '<!-- CHATGPT_RETRO_CONTEXT_V1 repo=squne121/loop-protocol target=issue:1224 -->',
+    })
+    expect(parsed.ownership).toBeUndefined()
+    expect(parsed.classificationState).toBe('malformed_marker_intent')
+    expect(parsed.malformed).toBe(true)
+  })
+
+  it('GIVEN a fresh create WHEN upsert runs live and the post-write readback finds exactly one marker THEN it succeeds', async () => {
+    const payloadMarkdown = renderPublicMarkdown(createPayload())
+    const built = buildChatgptRetroContextCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        targetType: 'issue',
+        targetNumber: 1224,
+        parentIssue: 1153,
+      },
+      payloadMarkdown,
+    })
+    let listCallCount = 0
+    const client = {
+      listIssueComments: async () => {
+        listCallCount += 1
+        if (listCallCount === 1) {
+          return []
+        }
+        return [{ id: 99, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-99', body: built.body }]
+      },
+      createIssueComment: async () => ({ id: 99, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-99' }),
+      updateIssueComment: async () => {
+        throw new Error('update should not run')
+      },
+    }
+
+    await expect(upsertChatgptRetroContextComment(client, {
+      repo: 'squne121/loop-protocol',
+      targetType: 'issue',
+      targetNumber: 1224,
+      parentIssue: 1153,
+      payloadMarkdown,
+      dryRun: false,
+    })).resolves.toMatchObject({
+      action: 'create',
+      comment_id: 99,
+    })
+    expect(listCallCount).toBe(2)
+  })
+
+  it('GIVEN a fresh create WHEN the post-write readback finds two markers (a concurrent-write race) THEN it fails closed', async () => {
+    const payloadMarkdown = renderPublicMarkdown(createPayload())
+    const built = buildChatgptRetroContextCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        targetType: 'issue',
+        targetNumber: 1224,
+        parentIssue: 1153,
+      },
+      payloadMarkdown,
+    })
+    let listCallCount = 0
+    const client = {
+      listIssueComments: async () => {
+        listCallCount += 1
+        if (listCallCount === 1) {
+          return []
+        }
+        return [
+          { id: 99, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-99', body: built.body },
+          { id: 100, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-100', body: built.body },
+        ]
+      },
+      createIssueComment: async () => ({ id: 99, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-99' }),
+      updateIssueComment: async () => {
+        throw new Error('update should not run')
+      },
+    }
+
+    await expect(upsertChatgptRetroContextComment(client, {
+      repo: 'squne121/loop-protocol',
+      targetType: 'issue',
+      targetNumber: 1224,
+      parentIssue: 1153,
+      payloadMarkdown,
+      dryRun: false,
+    })).rejects.toThrow(/post-write readback found more than one/)
+  })
+
+  it('GIVEN a fresh create WHEN the post-write readback finds a single ownership match with a different digest than what was written THEN it fails closed instead of only counting ownership matches', async () => {
+    // Fix 6: verifySingleOwnershipMarkerAfterWrite() must not merely count
+    // "how many comments have this ownership" -- it must confirm the one
+    // match it found is the exact candidate that was written (ok / not
+    // malformed / matching digest / matching comment id).
+    const payloadMarkdown = renderPublicMarkdown(createPayload())
+    const staleObject = createPayload()
+    staleObject.created_at = '2026-07-01T00:50:00.000Z'
+    staleObject.canonicalization.payload_digest = computeChatgptRetroContextPayloadDigest(staleObject)
+    const stale = buildChatgptRetroContextCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        targetType: 'issue',
+        targetNumber: 1224,
+        parentIssue: 1153,
+      },
+      payloadMarkdown: renderPublicMarkdown(staleObject),
+    })
+    let listCallCount = 0
+    const client = {
+      listIssueComments: async () => {
+        listCallCount += 1
+        if (listCallCount === 1) {
+          return []
+        }
+        // A race/corruption scenario: the readback finds exactly one
+        // ownership match (so the naive "count === 1" check would pass),
+        // but its digest/body is not what upsert actually wrote.
+        return [{ id: 99, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-99', body: stale.body }]
+      },
+      createIssueComment: async () => ({ id: 99, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-99' }),
+      updateIssueComment: async () => {
+        throw new Error('update should not run')
+      },
+    }
+
+    await expect(upsertChatgptRetroContextComment(client, {
+      repo: 'squne121/loop-protocol',
+      targetType: 'issue',
+      targetNumber: 1224,
+      parentIssue: 1153,
+      payloadMarkdown,
+      dryRun: false,
+    })).rejects.toThrow(/does not match what was written/)
+    expect(listCallCount).toBe(2)
+  })
+
+  it('GIVEN a client that exposes getIssueComment WHEN a fresh create succeeds THEN the post-write readback performs a direct GET on the written comment id before the pagination scan', async () => {
+    // Fix 6: when available, the direct GET-by-id readback stage must also
+    // run (not just the pagination scan), and must itself fail closed if
+    // the directly-fetched comment does not match the candidate.
+    const payloadMarkdown = renderPublicMarkdown(createPayload())
+    const built = buildChatgptRetroContextCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        targetType: 'issue',
+        targetNumber: 1224,
+        parentIssue: 1153,
+      },
+      payloadMarkdown,
+    })
+    let listCallCount = 0
+    let getIssueCommentCallCount = 0
+    const client = {
+      listIssueComments: async () => {
+        listCallCount += 1
+        if (listCallCount === 1) {
+          return []
+        }
+        return [{ id: 99, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-99', body: built.body }]
+      },
+      getIssueComment: async ({ commentId }) => {
+        getIssueCommentCallCount += 1
+        expect(commentId).toBe(99)
+        return { id: 99, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-99', body: built.body }
+      },
+      createIssueComment: async () => ({ id: 99, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-99' }),
+      updateIssueComment: async () => {
+        throw new Error('update should not run')
+      },
+    }
+
+    await expect(upsertChatgptRetroContextComment(client, {
+      repo: 'squne121/loop-protocol',
+      targetType: 'issue',
+      targetNumber: 1224,
+      parentIssue: 1153,
+      payloadMarkdown,
+      dryRun: false,
+    })).resolves.toMatchObject({ action: 'create', comment_id: 99 })
+    expect(getIssueCommentCallCount).toBe(1)
+  })
+
+  it('GIVEN an existing comment WHEN upsert supersedes it live and the post-write readback finds exactly one marker THEN it succeeds', async () => {
+    const originalPayload = renderPublicMarkdown(createPayload())
+    const original = buildChatgptRetroContextCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        targetType: 'issue',
+        targetNumber: 1224,
+        parentIssue: 1153,
+      },
+      payloadMarkdown: originalPayload,
+    })
+    const nextPayloadObject = createPayload()
+    nextPayloadObject.created_at = '2026-07-01T00:40:00.000Z'
+    nextPayloadObject.canonicalization.payload_digest = computeChatgptRetroContextPayloadDigest(nextPayloadObject)
+    const nextPayload = renderPublicMarkdown(nextPayloadObject)
+    const nextBuilt = buildChatgptRetroContextCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        targetType: 'issue',
+        targetNumber: 1224,
+        parentIssue: 1153,
+      },
+      payloadMarkdown: nextPayload,
+    })
+    let listCallCount = 0
+    let getIssueCommentCallCount = 0
+    const client = {
+      listIssueComments: async () => {
+        listCallCount += 1
+        if (listCallCount === 1) {
+          return [{ id: 9, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-9', body: original.body }]
+        }
+        return [{ id: 9, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-9', body: nextBuilt.body }]
+      },
+      // Called twice: once for the pre-update stale-write check (must still
+      // see the original body / digest at that point), and once more for
+      // the post-write direct-GET readback stage added by the #1696 P2 fix
+      // (must see the freshly-written nextBuilt body after the update).
+      getIssueComment: async () => {
+        getIssueCommentCallCount += 1
+        if (getIssueCommentCallCount === 1) {
+          return { id: 9, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-9', body: original.body }
+        }
+        return { id: 9, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-9', body: nextBuilt.body }
+      },
+      createIssueComment: async () => {
+        throw new Error('create should not run')
+      },
+      updateIssueComment: async () => ({ id: 9, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-9' }),
+    }
+
+    await expect(upsertChatgptRetroContextComment(client, {
+      repo: 'squne121/loop-protocol',
+      targetType: 'issue',
+      targetNumber: 1224,
+      parentIssue: 1153,
+      payloadMarkdown: nextPayload,
+      dryRun: false,
+      expectedSupersedesDigest: original.digest,
+    })).resolves.toMatchObject({
+      action: 'supersede',
+      comment_id: 9,
+    })
+    expect(listCallCount).toBe(2)
+    expect(getIssueCommentCallCount).toBe(2)
   })
 
   it('GIVEN a new payload with a supersedes digest WHEN upsert dry-run runs THEN it reports supersede', async () => {
@@ -515,18 +800,28 @@ describe('chatgpt retro context marker helper', () => {
         number: 1224,
         endpoint_kind: 'issue_comments_for_pull_request',
       },
-      marker_comment: {
-        id: 41,
-        url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-41',
+      comment_chain: {
+        status: 'resolved',
+        marker_comment: {
+          id: 41,
+          url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-41',
+        },
+        matched_comment_count: 1,
+        evidence_ref_count: 1,
+        source_manifest_count: 3,
+        pagination: {
+          comments_complete: true,
+          reference_comments_complete: true,
+        },
       },
-      matched_comment_count: 1,
-      evidence_ref_count: 1,
-      source_manifest_count: 3,
       pr_review_surface: {
         status: 'resolved',
         review_count: 1,
         review_comment_count: 1,
         resolved_thread_count: 1,
+        pagination: {
+          complete: true,
+        },
       },
     })
   })
@@ -549,8 +844,14 @@ describe('chatgpt retro context marker helper', () => {
       parentIssue: 1153,
     })).resolves.toMatchObject({
       status: 'blocked_malformed_marker_syntax',
-      marker_comment: {
-        id: 7,
+      comment_chain: {
+        status: 'blocked_malformed_marker_syntax',
+        marker_comment: {
+          id: 7,
+        },
+      },
+      pr_review_surface: {
+        status: 'not_applicable',
       },
     })
   })
@@ -622,7 +923,9 @@ describe('chatgpt retro context marker helper', () => {
       parentIssue: 1153,
     })).resolves.toMatchObject({
       status: 'blocked_malformed_marker_syntax',
-      comment_chain_status: 'blocked_malformed_marker_syntax',
+      comment_chain: {
+        status: 'blocked_malformed_marker_syntax',
+      },
       pr_review_surface: {
         status: 'resolved',
       },
@@ -652,7 +955,16 @@ describe('chatgpt retro context marker helper', () => {
         number: 1224,
         endpoint_kind: 'issue_comments_for_issue',
       },
-      matched_comment_count: 0,
+      comment_chain: {
+        status: 'blocked_page_budget_exhausted',
+        matched_comment_count: 0,
+        pagination: {
+          comments_complete: false,
+        },
+      },
+      pr_review_surface: {
+        status: 'not_applicable',
+      },
     })
   })
 
@@ -754,4 +1066,122 @@ describe('chatgpt retro context marker helper', () => {
       rmSync(tempDir, { recursive: true, force: true })
     }
   })
+
+describe('classifyChatgptRetroContextMarkerCandidate', () => {
+  it('GIVEN a canonical ownership marker as the first non-empty line WHEN classifying THEN it is a valid_marker', () => {
+    const body = '<!-- CHATGPT_RETRO_CONTEXT_V1 repo=squne121/loop-protocol target=issue:1224 parent_issue=1153 -->\n<!-- CHATGPT_RETRO_CONTEXT_DIGEST_V1 sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->\n\npayload'
+    expect(classifyChatgptRetroContextMarkerCandidate(body).state).toBe('valid_marker')
+  })
+
+  it('GIVEN leading blank lines before the canonical ownership marker WHEN classifying THEN it is still a valid_marker', () => {
+    const body = '\n\n<!-- CHATGPT_RETRO_CONTEXT_V1 repo=squne121/loop-protocol target=issue:1224 parent_issue=1153 -->\n<!-- CHATGPT_RETRO_CONTEXT_DIGEST_V1 sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->'
+    expect(classifyChatgptRetroContextMarkerCandidate(body).state).toBe('valid_marker')
+  })
+
+  it('GIVEN a broken ownership marker (missing parent_issue) at column 0 WHEN classifying THEN it is malformed_marker_intent', () => {
+    const body = '<!-- CHATGPT_RETRO_CONTEXT_V1 repo=squne121/loop-protocol target=issue:1224 -->'
+    expect(classifyChatgptRetroContextMarkerCandidate(body).state).toBe('malformed_marker_intent')
+  })
+
+  it('GIVEN an unclosed ownership marker at column 0 WHEN classifying THEN it is malformed_marker_intent', () => {
+    const body = '<!-- CHATGPT_RETRO_CONTEXT_V1 repo=squne121/loop-protocol target=issue:1224 parent_issue=1153'
+    expect(classifyChatgptRetroContextMarkerCandidate(body).state).toBe('malformed_marker_intent')
+  })
+
+  it('GIVEN a digest-marker-shaped first line WHEN classifying THEN it is malformed_marker_intent (wrong position for ownership)', () => {
+    const body = '<!-- CHATGPT_RETRO_CONTEXT_DIGEST_V1 sha256=zz -->'
+    expect(classifyChatgptRetroContextMarkerCandidate(body).state).toBe('malformed_marker_intent')
+  })
+
+  it('GIVEN prose mentioning the marker name WHEN classifying THEN it is not_marker', () => {
+    const body = 'The CHATGPT_RETRO_CONTEXT_V1 marker starts every context comment.'
+    expect(classifyChatgptRetroContextMarkerCandidate(body).state).toBe('not_marker')
+  })
+
+  it('GIVEN the marker wrapped in inline code WHEN classifying THEN it is not_marker', () => {
+    const body = 'Example: `<!-- CHATGPT_RETRO_CONTEXT_V1 repo=a/b target=issue:1 parent_issue=2 -->` is the marker.'
+    expect(classifyChatgptRetroContextMarkerCandidate(body).state).toBe('not_marker')
+  })
+
+  it('GIVEN the marker inside a backtick fenced code block WHEN classifying THEN it is not_marker', () => {
+    const body = '```\n<!-- CHATGPT_RETRO_CONTEXT_V1 repo=a/b target=issue:1 parent_issue=2 -->\n```'
+    expect(classifyChatgptRetroContextMarkerCandidate(body).state).toBe('not_marker')
+  })
+
+  it('GIVEN the marker inside a tilde fenced code block WHEN classifying THEN it is not_marker', () => {
+    const body = '~~~\n<!-- CHATGPT_RETRO_CONTEXT_V1 repo=a/b target=issue:1 parent_issue=2 -->\n~~~'
+    expect(classifyChatgptRetroContextMarkerCandidate(body).state).toBe('not_marker')
+  })
+
+  it('GIVEN the marker inside a blockquote WHEN classifying THEN it is not_marker', () => {
+    const body = '> <!-- CHATGPT_RETRO_CONTEXT_V1 repo=a/b target=issue:1 parent_issue=2 -->'
+    expect(classifyChatgptRetroContextMarkerCandidate(body).state).toBe('not_marker')
+  })
+
+  it('GIVEN the marker inside a list item WHEN classifying THEN it is not_marker', () => {
+    const body = '- <!-- CHATGPT_RETRO_CONTEXT_V1 repo=a/b target=issue:1 parent_issue=2 -->'
+    expect(classifyChatgptRetroContextMarkerCandidate(body).state).toBe('not_marker')
+  })
+
+  it.each([1, 2, 3, 4])('GIVEN the marker indented by %i spaces WHEN classifying THEN it is not_marker', (spaceCount) => {
+    const body = `${' '.repeat(spaceCount)}<!-- CHATGPT_RETRO_CONTEXT_V1 repo=a/b target=issue:1 parent_issue=2 -->`
+    expect(classifyChatgptRetroContextMarkerCandidate(body).state).toBe('not_marker')
+  })
+
+  it('GIVEN the marker indented by a tab WHEN classifying THEN it is not_marker', () => {
+    const body = '\t<!-- CHATGPT_RETRO_CONTEXT_V1 repo=a/b target=issue:1 parent_issue=2 -->'
+    expect(classifyChatgptRetroContextMarkerCandidate(body).state).toBe('not_marker')
+  })
+
+  it('GIVEN an empty body WHEN classifying THEN it is not_marker', () => {
+    expect(classifyChatgptRetroContextMarkerCandidate('').state).toBe('not_marker')
+  })
+
+  it('GIVEN a non-string body WHEN classifying THEN it is not_marker', () => {
+    expect(classifyChatgptRetroContextMarkerCandidate(undefined).state).toBe('not_marker')
+  })
+})
+
+describe('classifyChatgptRetroContextMarkerCandidate CommonMark blank-line regression (Unicode whitespace)', () => {
+  // CommonMark 0.31.2 defines a blank line as a line containing nothing but
+  // U+0020 SPACE / U+0009 TAB (or nothing at all). `String.prototype.trim()`
+  // strips a much wider set of Unicode whitespace than that, so a line
+  // consisting solely of e.g. NBSP was previously (incorrectly) treated as
+  // blank and skipped, letting a later line be mistaken for the "first
+  // non-empty line" that determines marker candidacy.
+  it('GIVEN a first line containing only a NBSP (U+00A0) character WHEN classifying THEN it counts as the first non-empty line so a canonical marker on line 2 is not_marker', () => {
+    const body = '\u00A0\n<!-- CHATGPT_RETRO_CONTEXT_V1 repo=squne121/loop-protocol target=issue:1224 parent_issue=1153 -->\n<!-- CHATGPT_RETRO_CONTEXT_DIGEST_V1 sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->'
+    expect(classifyChatgptRetroContextMarkerCandidate(body).state).toBe('not_marker')
+  })
+
+  it('GIVEN a first line containing only an em space (U+2003) character WHEN classifying THEN it counts as the first non-empty line so a canonical marker on line 2 is not_marker', () => {
+    const body = '\u2003\n<!-- CHATGPT_RETRO_CONTEXT_V1 repo=squne121/loop-protocol target=issue:1224 parent_issue=1153 -->\n<!-- CHATGPT_RETRO_CONTEXT_DIGEST_V1 sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->'
+    expect(classifyChatgptRetroContextMarkerCandidate(body).state).toBe('not_marker')
+  })
+
+  it('GIVEN a first line containing only a form feed (U+000C) character WHEN classifying THEN it counts as the first non-empty line so a canonical marker on line 2 is not_marker', () => {
+    const body = '\u000C\n<!-- CHATGPT_RETRO_CONTEXT_V1 repo=squne121/loop-protocol target=issue:1224 parent_issue=1153 -->\n<!-- CHATGPT_RETRO_CONTEXT_DIGEST_V1 sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->'
+    expect(classifyChatgptRetroContextMarkerCandidate(body).state).toBe('not_marker')
+  })
+
+  it('GIVEN a first line that is truly empty (CommonMark blank) WHEN classifying THEN it is still skipped and a canonical marker on line 2 is valid_marker', () => {
+    const body = '\n<!-- CHATGPT_RETRO_CONTEXT_V1 repo=squne121/loop-protocol target=issue:1224 parent_issue=1153 -->\n<!-- CHATGPT_RETRO_CONTEXT_DIGEST_V1 sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->'
+    expect(classifyChatgptRetroContextMarkerCandidate(body).state).toBe('valid_marker')
+  })
+
+  it('GIVEN a first line containing only ASCII spaces and a tab (CommonMark blank) WHEN classifying THEN it is still skipped and a canonical marker on line 2 is valid_marker', () => {
+    const body = '  \t  \n<!-- CHATGPT_RETRO_CONTEXT_V1 repo=squne121/loop-protocol target=issue:1224 parent_issue=1153 -->\n<!-- CHATGPT_RETRO_CONTEXT_DIGEST_V1 sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->'
+    expect(classifyChatgptRetroContextMarkerCandidate(body).state).toBe('valid_marker')
+  })
+})
+
+describe('validateChatgptRetroContextCommentBody indentation regression (via parseChatgptRetroContextComment)', () => {
+  it('GIVEN an ownership marker indented by 4 spaces WHEN parsing the comment THEN it is not treated as an ownership marker at all', () => {
+    const body = '    <!-- CHATGPT_RETRO_CONTEXT_V1 repo=squne121/loop-protocol target=issue:1224 parent_issue=1153 -->\n<!-- CHATGPT_RETRO_CONTEXT_DIGEST_V1 sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->'
+    const parsed = parseChatgptRetroContextComment({ body })
+    expect(parsed.ownership).toBeUndefined()
+    expect(parsed.malformed).toBe(false)
+  })
+})
+
 })
