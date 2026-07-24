@@ -56,6 +56,7 @@ related_issue: "#135"
 | `REVIEWER_BLOCKER_CLAIM_V1` | `.claude/skills/issue-refinement-loop/scripts/compact_review_result.py`（`REVIEWER_BLOCKER_CLAIM` stdout field） | issue-reviewer SubAgent（`compact_review_result.py` 経由。`{schema, body_sha256, blockers: [...]}` のみ。`findings` / `checker_evidence` / `deterministic_checks` は禁止 — additionalProperties: false で fail-closed 拒否） | parent_replay_binding.py（`validate_reviewer_blocker_claim()` で shape 検証してから replay 入力にする。監査目的でのみ envelope に残る） | `rg -n "REVIEWER_BLOCKER_CLAIM_V1\|REVIEWER_BLOCKER_CLAIM" .claude/skills/issue-refinement-loop` |
 | `ISSUE_REVIEW_RESULT_COMPACT_V2` / `REVIEW_COMPACT_VALIDATION_RESULT_V2` | `.claude/skills/issue-refinement-loop/scripts/validate_review_compact_output.py`（`NEEDS_FIX_FIELDS_V2` / `validate_review_compact_output_v2` / `SCHEMA_V2`） | `emit_parent_review_envelope_v2.py`（issue-refinement-loop orchestrator が唯一の呼び出し元。strict 検証済みの child intermediate と `PARENT_REPLAY_BINDING_ARTIFACT_V1` から `PARENT_REPLAY_*` 6行を決定論的に導出し15行 envelope を組み立てる。Issue #1541 — 旧来の orchestrator 手動 f-string assembly は production 経路から廃止） | issue-refinement-loop（Step 2a V2 routing gate。routing は `PARENT_REPLAY_*` のみを参照する）、reviewer_claim_replay_state_store.py（`--write-v2`） | `rg -n "REVIEW_COMPACT_VALIDATION_RESULT_V2\|PARENT_REPLAY_BINDING_DIGEST\|NEEDS_FIX_FIELDS_V2" .claude/skills/issue-refinement-loop` |
 | `EMIT_PARENT_REVIEW_ENVELOPE_V2_FAILURE` | `.claude/skills/issue-refinement-loop/scripts/emit_parent_review_envelope_v2.py` | emit_parent_review_envelope_v2.py（`main()` の contract-invalid / runtime-error stderr diagnostic） | issue-refinement-loop orchestrator（Step 2a、emitter 非 0 exit 時の human-readable/machine-readable diagnostic） | `rg -n "EMIT_PARENT_REVIEW_ENVELOPE_V2_FAILURE" .claude/skills/issue-refinement-loop/scripts` |
+| `delegation_model_policy/v1` | `.claude/skills/gemini-cli-headless-delegation/scripts/build_request.py`（`model-policy` サブコマンド）、`.claude/skills/gemini-cli-headless-delegation/references/model-routing.md` | build_request.py の `build_model_policy()` / `main_model_policy()`（読み取り専用・副作用なしの dry-run inspector。`run_gemini_headless.py` の `load_model_routing()` / `resolve_model_chain()` / `PROVIDER_AUTO_*` を直接呼び出す） | 人間オペレータ・エージェント（`model-policy` CLI 呼び出しの stdout consumer）、test_build_request_model_policy.py | `rg -n "delegation_model_policy/v1\|model-policy\|build_model_policy" .claude/skills/gemini-cli-headless-delegation` |
 
 ### 信頼境界（Trust boundary、Issue #1532）
 
@@ -311,6 +312,81 @@ validation_commands:
 notes:
   - "approve envelope（8行）は binding artifact / claim / replay / state write を一切起動しない（AC6）。"
   - "失敗時（contract-invalid / runtime error）は stdout を常に空のまま保ち、部分 envelope を書かない（AC8）。"
+```
+
+## delegation_model_policy/v1 詳細登録
+
+```yaml
+schema_id: delegation_model_policy/v1
+definition: .claude/skills/gemini-cli-headless-delegation/scripts/build_request.py（`model-policy` サブコマンド）、.claude/skills/gemini-cli-headless-delegation/references/model-routing.md
+related_issue: "#1269"
+producer:
+  - build_request.py（`build_model_policy()` / `main_model_policy()`。読み取り専用・副作用なしの dry-run inspector。request file・output file は一切書き込まない）
+consumer:
+  - 人間オペレータ・エージェント（`build_request.py model-policy` CLI の stdout consumer）
+  - .claude/skills/gemini-cli-headless-delegation/tests/test_build_request_model_policy.py
+shape: |
+  discriminated union（discriminator は `provider` フィールドと `ok`/`failure_class`）。
+  全 variant 共通のベースフィールド: schema, provider, role, profile, ok,
+  failure_class, failure_reason（成功時は failure_class/failure_reason とも null）。
+  - provider が MODEL_POLICY_PROVIDERS 外: ベースのみ（failure_class: "invalid_provider"）。
+  - provider="gemini" 成功: + resolved_chain(list[string]), actual_model(null),
+    resolver_source(string)。
+  - provider="gemini" 失敗（unknown_role/empty_chain）: ベースのみ。
+  - provider="gemini"/"auto"(eligible) の config_invalid: + reason_code("routing_config_invalid")。
+  - provider="agy"（常に ok:true。load_model_routing() を一切呼ばない）:
+    + resolved_chain(null), configured_chain(null), actual_model(null),
+    legacy_compatibility_label("agy-default"), wrapper_capability(object),
+    upstream_capability(object: probed, documented_explicit_model_selection,
+    installed_version, installed_version_probed, note), readiness_checked(false),
+    credentials_checked(false), provider_available(null)。--role 指定時のみ
+    role_applied(false)/role_note(string) を追加。
+  - provider="auto" で --profile 省略: ベースのみ（failure_class: "profile_required_for_auto"）。
+  - provider="auto" で profile が PROVIDER_AUTO_ELIGIBLE_PROFILES 外: routing 未読込のまま
+    + runtime_order(list[string]), profile_eligible(false), provider_candidates(null),
+    consumer_constraints(null)（ok:true）。
+  - provider="auto" で profile eligible・成功: + runtime_order(list[string]),
+    profile_eligible(true), provider_candidates(list[object] -- 各要素は
+    provider フィールドで discriminate: "gemini" は {provider,resolved_chain,actual_model}
+    の3キーのみ、"agy" は上記 agy variant と同じキー集合)、
+    consumer_constraints({fan_out: {supported:false, reason_code:string},
+    agy_fallback_requires_prompt:true, explicit_model_survives_fallback:false})。
+control_flow_order: |
+  build_model_policy() の分岐順序は run_gemini_headless.py 自身の dispatch 順序を
+  鏡写しにする（独自順序を発明しない）: (1) provider を MODEL_POLICY_PROVIDERS と
+  照合、(2) provider="agy" は load_model_routing() を一切呼ばずに即座に確定、
+  (3) provider="auto" は --profile 有無 → PROVIDER_AUTO_ELIGIBLE_PROFILES 該当有無を
+  routing 読込より前に判定（ineligible なら routing 未読込のまま返す）、
+  (4) provider="gemini" または auto(eligible) のみ load_model_routing() /
+  resolve_model_chain() を呼ぶ。
+no_side_effect_guarantee: |
+  `_load_run_gemini_headless_module()` は run_gemini_headless.py の動的 import
+  前後で sys.dont_write_bytecode を True に設定・復元し、
+  scripts/__pycache__/*.pyc の生成を PYTHONDONTWRITEBYTECODE の設定有無に
+  依存せず防止する（AC6 の no-side-effect 主張の一部）。
+compatibility:
+  breaking_changes:
+    - schema フィールドの削除・rename
+    - discriminator（provider / ok / failure_class の組み合わせ）による variant 判定条件の変更
+    - resolved_chain / actual_model の null/非null セマンティクスの変更
+    - fan_out の型変更（現在は object; bool への逆行は breaking）
+    - failure_class の既存値の意味変更・削除
+  non_breaking_changes:
+    - 新規 variant の追加（provider 追加等）
+    - upstream_capability / consumer_constraints への新規オプショナルフィールド追加
+    - 新規 failure_class 値の追加
+detection_patterns:
+  - 'delegation_model_policy/v1'
+  - 'model-policy'
+  - 'build_model_policy'
+  - 'PROVIDER_AUTO_FAN_OUT_UNSUPPORTED_REASON_CODE'
+validation_commands:
+  - "uv run --locked pytest .claude/skills/gemini-cli-headless-delegation/tests/test_build_request_model_policy.py -q"
+  - "uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/build_request.py model-policy --provider agy"
+notes:
+  - "actual_model は全 variant で常に null（dry-run のため観測値を持たない）。実行時の観測値は delegation_result/v1 側の actual_model であり、本 schema とは別 field/別 producer。"
+  - "resolved_chain / configured_chain は「設定から解決された候補チェーン」であり「現在実行可能な chain（readiness）」ではない。readiness_checked / credentials_checked / provider_available は live probe 未実装（scope 外）を明示するための常に静的な値。"
+  - "fan_out の reason_code は run_gemini_headless.py の PROVIDER_AUTO_FAN_OUT_UNSUPPORTED_REASON_CODE をそのまま参照する（build_request.py 側でハードコードされた別リテラルを持たない）。"
 ```
 
 ## #934 public-surface boundary cleanup note（公開境界クリーンアップ注記）
