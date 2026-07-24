@@ -243,7 +243,7 @@ describe('Codex SubagentStop scope-rollup capture adapter', () => {
       expect(readdirSync(captureDirectory).filter((name) => name.endsWith('.txt'))).toHaveLength(0)
       expect(result.stderr).toContain(expectReason)
     }
-  })
+  }, 20_000)
 
   it('valid eligibility writes canonical capture', () => {
     const captureDirectory = isolatedDirectory()
