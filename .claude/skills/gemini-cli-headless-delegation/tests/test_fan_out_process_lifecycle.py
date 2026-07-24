@@ -224,7 +224,9 @@ def test_process_exit_event_recorded_after_reap(tmp_path):
     assert len(exits) == 1
     assert exits[0]["returncode"] == 7
     assert exits[0]["termination_reason"] == "exited_nonzero"
-    starts = [e for e in events if e.get("schema") == "process_lifecycle_event_v1" and e.get("event") == "process_start"]
+    starts = [
+        e for e in events if e.get("schema") == "process_lifecycle_event_v1" and e.get("event") == "process_start"
+    ]
     assert len(starts) == 1
     assert exits[0]["exited_monotonic_ns"] >= starts[0]["started_monotonic_ns"]
 
