@@ -3,7 +3,7 @@
 LOOP_PROTOCOL の Issue 駆動開発で使う各 SubAgent / Skill の責務境界を、開発者が運用上参照するためのドキュメント。
 SKILL.md / SubAgent 定義に書くとコンテクスト汚染になるため、本ドキュメントを正本とする。
 
-## Execution planning consumer boundary
+## 実行計画 consumer 境界 (Execution planning consumer boundary)
 
 `ISSUE_EXECUTION_DECISION_V1` の semantic planning は `issue-refinement-loop` が一度だけ produce する。
 consumer は JSON Schema、#1677 の normative semantic validator、identity、freshness/integrity、consumer compatibility を検証して opaque decision を consume し、
