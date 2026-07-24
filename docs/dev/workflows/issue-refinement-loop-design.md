@@ -320,6 +320,12 @@ claims:
 | SubAgent 責務境界 | `docs/dev/agent-skill-boundaries.md` | 境界ルールへの参照リンク | 境界ルールを再定義 |
 | anchor comment handling | `.claude/skills/issue-refinement-loop/references/anchor-comment-handling.md` | 正規化ルールの設計根拠を記録 | raw handling ロジックを複製 |
 
+## 静的実行判断の投影 (Static execution decision projection)
+
+`ISSUE_EXECUTION_DECISION_V1` は、planning producer から schema validation、state/handoff projection、consumer route path へ渡る静的契約である。canonical policy は `docs/dev/workflow.md#execution-planning-policy-canonical-ssot`、schema は `.claude/skills/issue-refinement-loop/schemas/issue_execution_decision_v1.schema.json` とする。
+この derived design note は runtime state/handoff や planner consumer を変更しない。正規化済みの static projection は `identity`、issue-number-sorted `nodes`、relation-tuple-sorted `relations[].relation_type`、`execution.state/predecessors/defer_reason`、`downstream_policy`、`completeness` を持つ。
+移行 projection は `dual_write` → `equivalence` → `dual_read` → `new_authoritative` → `legacy_removed` とする。canonicalized digest が不一致なら `migration_required: yes` として fail-closed にし、既存の open-pr hard gate を維持する。shared normative semantic validator は #1677 の所有であり、この static projection は runtime consumer を実装しない。
+
 ## Traceability（追跡可能性）
 
 実装 Issue および関連 Issue:
