@@ -376,6 +376,13 @@ SERENA_TOOL_CONTRACT_UNKNOWN_POLICY = "exact_match"
 LOCAL_ASSET_MAX_CONTEXT_FILES = 32
 LOCAL_ASSET_MAX_CONTEXT_BYTES = 200_000
 LOCAL_ASSET_MAX_CONTEXT_TOTAL_BYTES = 600_000
+
+# Issue #1638: AGY local_asset_research targeted source-evidence contract bounds.
+TARGETED_EVIDENCE_MAX_TARGETS = 8
+TARGETED_EVIDENCE_MAX_LINES_PER_TARGET = 400
+TARGETED_EVIDENCE_MAX_BYTES_PER_TARGET = 200_000
+TARGETED_EVIDENCE_MAX_TOTAL_BYTES = 600_000
+TARGETED_EVIDENCE_ALLOWED_SELECTOR_KINDS = frozenset({"line_range"})
 SERENA_TOOL_MANIFEST_RELATIVE_PATH = Path(
     ".claude/skills/gemini-cli-headless-delegation/references/serena-tool-manifest.json"
 )
@@ -1126,7 +1133,15 @@ def validate_request(request: Mapping[str, Any], request_path: Path | None = Non
     errors.extend(_validate_string_list("output_sections", request.get("output_sections"), 1))
     if tool_profile == PROPOSAL_ONLY_PROFILE:
         errors.extend(_validate_proposal_only_output_sections(request.get("output_sections")))
-    errors.extend(_validate_string_list("context_files", request.get("context_files"), 1))
+    # Issue #1638: targeted-evidence contract (evidence_targets) replaces the
+    # legacy context_files requirement for local_asset_research requests that
+    # declare it; context_files stays required for every other case.
+    uses_targeted_evidence = (
+        tool_profile == LOCAL_ASSET_RESEARCH_PROFILE
+        and isinstance(request.get("evidence_targets"), list)
+    )
+    if not uses_targeted_evidence:
+        errors.extend(_validate_string_list("context_files", request.get("context_files"), 1))
 
     timeout_sec = request.get("timeout_sec", DEFAULT_TIMEOUT_SEC)
     if not isinstance(timeout_sec, int) or timeout_sec <= 0:
@@ -1136,7 +1151,7 @@ def validate_request(request: Mapping[str, Any], request_path: Path | None = Non
     if not isinstance(model, str) or not model.strip():
         errors.append("model must be a non-empty string when present")
 
-    if isinstance(request.get("context_files"), list):
+    if isinstance(request.get("context_files"), list) and not uses_targeted_evidence:
         base_dir = request_path.parent if request_path is not None else Path.cwd()
         repo_root = _repo_root().resolve() if tool_profile == LOCAL_ASSET_RESEARCH_PROFILE else None
         for raw_path in request["context_files"]:
@@ -1240,6 +1255,209 @@ def _validate_local_asset_context_files(
             else:
                 resolved_paths.append(resolved)
     return errors, resolved_paths
+
+
+def _validate_evidence_target_selector(selector: Any) -> list[str]:
+    """Validate a single evidence_targets[].selector (Issue #1638).
+
+    Only ``line_range`` is a supported selector kind; anything else fails
+    closed so an unbounded or unrepresentable selector never reaches AGY.
+    """
+    errors: list[str] = []
+    if not isinstance(selector, Mapping):
+        return ["selector must be an object"]
+    kind = selector.get("kind")
+    if kind not in TARGETED_EVIDENCE_ALLOWED_SELECTOR_KINDS:
+        return [
+            "selector.kind must be one of "
+            f"{sorted(TARGETED_EVIDENCE_ALLOWED_SELECTOR_KINDS)}; got {_truncate_repr(kind)}"
+        ]
+    start_line = selector.get("start_line")
+    end_line = selector.get("end_line")
+    if not isinstance(start_line, int) or isinstance(start_line, bool) or start_line < 1:
+        errors.append("selector.start_line must be a positive integer")
+    if not isinstance(end_line, int) or isinstance(end_line, bool) or end_line < 1:
+        errors.append("selector.end_line must be a positive integer")
+    if errors:
+        return errors
+    if end_line < start_line:
+        return ["selector.end_line must be >= selector.start_line"]
+    if (end_line - start_line + 1) > TARGETED_EVIDENCE_MAX_LINES_PER_TARGET:
+        errors.append(
+            f"selector line range must not exceed {TARGETED_EVIDENCE_MAX_LINES_PER_TARGET} lines"
+        )
+    return errors
+
+
+def _validate_evidence_targets(
+    evidence_targets: Any,
+    request_path: Path | None,
+    repo_root: Path,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Validate AGY local_asset_research targeted-evidence contract targets (Issue #1638).
+
+    Fail-closes on: non-list/empty/oversized target lists, non-object targets,
+    non-repo-relative or symlink-crossing paths, path traversal outside the
+    repository, missing/non-file targets, and unsafe or unbounded selectors.
+    """
+    errors: list[str] = []
+    validated: list[dict[str, Any]] = []
+    if not isinstance(evidence_targets, list):
+        return ["evidence_targets must be a list"], validated
+    if len(evidence_targets) == 0:
+        return ["evidence_targets requires at least one target"], validated
+    if len(evidence_targets) > TARGETED_EVIDENCE_MAX_TARGETS:
+        return (
+            [
+                f"evidence_targets must not exceed {TARGETED_EVIDENCE_MAX_TARGETS} targets; "
+                f"got {len(evidence_targets)}"
+            ],
+            validated,
+        )
+
+    base_dir = request_path.parent if request_path is not None else Path.cwd()
+    for index, target in enumerate(evidence_targets):
+        if not isinstance(target, Mapping):
+            errors.append(f"evidence_targets[{index}] must be an object")
+            continue
+        raw_path = target.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            errors.append(f"evidence_targets[{index}].path must be a non-empty string")
+            continue
+        if Path(raw_path).is_absolute():
+            errors.append(
+                f"evidence_targets[{index}].path must be repo-relative, not absolute: "
+                f"{_truncate_repr(raw_path)}"
+            )
+            continue
+        selector = target.get("selector")
+        selector_errors = _validate_evidence_target_selector(selector)
+        if selector_errors:
+            errors.extend(f"evidence_targets[{index}].{msg}" for msg in selector_errors)
+            continue
+        candidate = _resolve_context_file(raw_path, base_dir)
+        symlink_violation = False
+        for ancestor in [candidate] + list(candidate.parents):
+            if ancestor.is_symlink():
+                errors.append(
+                    f"evidence_targets[{index}].path must not include symlink paths: "
+                    f"{_truncate_repr(raw_path)}"
+                )
+                symlink_violation = True
+                break
+        if symlink_violation:
+            continue
+        resolved = candidate.resolve()
+        if not _is_relative_to(resolved, repo_root):
+            errors.append(
+                f"evidence_targets[{index}].path must be inside repository: "
+                f"{_truncate_repr(raw_path)} -> {_truncate_repr(str(resolved))}"
+            )
+            continue
+        if not candidate.exists():
+            errors.append(f"evidence_targets[{index}] missing target file: {_truncate_repr(raw_path)}")
+            continue
+        if not candidate.is_file():
+            errors.append(f"evidence_targets[{index}] target is not a file: {_truncate_repr(raw_path)}")
+            continue
+        validated.append({
+            "index": index,
+            "raw_path": raw_path,
+            "resolved_path": resolved,
+            "repo_relative_path": resolved.relative_to(repo_root).as_posix(),
+            "selector": {
+                "kind": selector["kind"],
+                "start_line": int(selector["start_line"]),
+                "end_line": int(selector["end_line"]),
+            },
+        })
+    return errors, validated
+
+
+def _collect_targeted_source_evidence(
+    validated_targets: list[dict[str, Any]],
+    repo_root: Path,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Build bounded targeted source-evidence envelopes (Issue #1638 AC2).
+
+    Fails closed (returns errors, no envelope) on a target that cannot produce
+    real source text -- out-of-range selector, empty content, oversized
+    payload, or credential-like content -- instead of ever emitting a
+    metadata-only envelope as a success (Issue #1638 AC3).
+    """
+    envelopes: list[dict[str, Any]] = []
+    errors: list[str] = []
+    total_bytes = 0
+    for target in validated_targets:
+        path = target["resolved_path"]
+        repo_relative_path = target["repo_relative_path"]
+        selector = target["selector"]
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            errors.append(f"targeted-evidence cannot read {repo_relative_path}: {exc}")
+            continue
+        source_lines = text.splitlines()
+        start_line = selector["start_line"]
+        end_line = selector["end_line"]
+        if end_line > len(source_lines):
+            errors.append(
+                "targeted-evidence target unmet (selector exceeds file length): "
+                f"{repo_relative_path} requested end_line={end_line} file_lines={len(source_lines)}"
+            )
+            continue
+        selected_text = "\n".join(source_lines[start_line - 1:end_line])
+        if not selected_text.strip():
+            errors.append(f"targeted-evidence target unmet (empty evidence): {repo_relative_path}")
+            continue
+        encoded = selected_text.encode("utf-8")
+        if len(encoded) > TARGETED_EVIDENCE_MAX_BYTES_PER_TARGET:
+            errors.append(f"targeted-evidence target evidence too large: {repo_relative_path}")
+            continue
+        total_bytes += len(encoded)
+        if total_bytes > TARGETED_EVIDENCE_MAX_TOTAL_BYTES:
+            errors.append(
+                f"targeted-evidence total evidence payload exceeds {TARGETED_EVIDENCE_MAX_TOTAL_BYTES} bytes"
+            )
+            continue
+        if _contains_credential(selected_text):
+            errors.append(
+                "targeted-evidence target evidence appears to contain credential-like material: "
+                f"{repo_relative_path}"
+            )
+            continue
+        envelopes.append({
+            "repo_relative_path": repo_relative_path,
+            "selector": selector,
+            "line_range": [start_line, end_line],
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "source_kind": "wrapper_read_only_targeted_evidence",
+            "content": selected_text,
+        })
+    return envelopes, errors
+
+
+def _validate_agy_targeted_evidence_request(
+    request: Mapping[str, Any], request_path: Path | None = None
+) -> list[str]:
+    """Full fail-close validation for the AGY local_asset_research
+    targeted-evidence contract (Issue #1638): schema/selector validation,
+    repo-boundary and symlink checks, then bounded evidence collection so
+    missing/empty/oversized/credential-like target evidence is rejected
+    before AGY ever launches.
+    """
+    errors: list[str] = []
+    repo_root = _repo_root().resolve()
+    target_errors, validated_targets = _validate_evidence_targets(
+        request.get("evidence_targets"), request_path, repo_root
+    )
+    errors.extend(target_errors)
+    if target_errors:
+        return errors
+    errors.extend(_validate_local_asset_research_settings())
+    _, evidence_errors = _collect_targeted_source_evidence(validated_targets, repo_root)
+    errors.extend(evidence_errors)
+    return errors
 
 
 def _collect_serena_read_only_evidence(
@@ -2627,9 +2845,17 @@ def _validate_agy_request(request: Mapping[str, Any]) -> list[str]:
 
 
 def _validate_agy_local_asset_request(request: Mapping[str, Any], request_path: Path | None = None) -> list[str]:
-    """Full validation path for provider=agy + local_asset_research."""
+    """Full validation path for provider=agy + local_asset_research.
+
+    Issue #1638: requests that declare ``evidence_targets`` use the
+    targeted-evidence contract (repo-relative path + bounded selector) and
+    skip the legacy whole-file ``context_files`` requirement entirely.
+    """
     errors: list[str] = []
     errors.extend(validate_request(request, request_path=request_path))
+    if isinstance(request.get("evidence_targets"), list):
+        errors.extend(_validate_agy_targeted_evidence_request(request, request_path=request_path))
+        return errors
     context_files = request.get("context_files")
     if not isinstance(context_files, list) or len(context_files) == 0:
         errors.append("local_asset_research requires at least one context file")
@@ -3513,71 +3739,145 @@ def _run_delegation_core(
         local_asset_retrieval_metadata: dict[str, Any] | None = None
         if tool_profile == LOCAL_ASSET_RESEARCH_PROFILE:
             repo_root = _repo_root().resolve()
-            _, context_paths = _validate_local_asset_context_files(
-                request.get("context_files", []),
-                request_path,
-                repo_root,
-            )
-            manifest = load_serena_tool_manifest(repo_root)
-            try:
-                local_asset_result = _collect_live_serena_read_only_evidence(
-                    context_paths, repo_root, manifest
+            if isinstance(request.get("evidence_targets"), list):
+                # Issue #1638: targeted source-evidence contract. Wrapper-side
+                # read-only retrieval bounded to declared repo-relative
+                # targets; this mode never falls back to live Serena MCP
+                # retrieval and never launches AGY on unmet evidence.
+                _, validated_evidence_targets = _validate_evidence_targets(
+                    request.get("evidence_targets"), request_path, repo_root
                 )
-                evidence_documents, local_asset_retrieval_metadata = _coerce_live_serena_retrieval_result(
-                    local_asset_result,
-                    context_paths=context_paths,
+                evidence_envelopes, evidence_errors = _collect_targeted_source_evidence(
+                    validated_evidence_targets, repo_root
                 )
-                if local_asset_retrieval_metadata is not None:
-                    local_asset_retrieval_metadata = {
-                        **local_asset_retrieval_metadata,
-                        "retrieval_status": "succeeded",
-                        "context_files_count": len(context_paths),
-                        "failure_class": None,
-                    }
-            except Exception as exc:
-                manifest_id = _serena_manifest_id(manifest)
-                return {
-                    "schema": "delegation_result/v1",
-                    "transport": "agy",
-                    "ok": False,
-                    "provider": "agy",
-                    "safety_mode": "degraded_wrapper_only",
-                    "requested_model": None,
-                    "actual_model": None,
-                    "tool_profile": LOCAL_ASSET_RESEARCH_PROFILE,
-                    "exit_code": 1,
-                    "result_surface": {
+                if evidence_errors:
+                    # Defensive fail-close: _validate_agy_local_asset_request
+                    # already gates this before dispatch is reached, but AGY
+                    # must never launch on evidence collected after that gate
+                    # either (Issue #1638 AC3).
+                    return {
+                        "schema": "delegation_result/v1",
+                        "transport": "agy",
                         "ok": False,
-                        "summary": "local_asset_research live Serena MCP retrieval failed",
+                        "provider": "agy",
+                        "safety_mode": "degraded_wrapper_only",
+                        "requested_model": None,
+                        "actual_model": None,
+                        "tool_profile": LOCAL_ASSET_RESEARCH_PROFILE,
+                        "exit_code": 1,
+                        "result_surface": {
+                            "ok": False,
+                            "summary": "local_asset_research targeted evidence unmet",
+                            "response_text": None,
+                        },
                         "response_text": None,
-                    },
-                    "response_text": None,
-                    "stats": None,
-                    "stderr": str(exc),
-                    "warnings": [f"local_asset_research live_serena_mcp_failed: {exc}"],
-                    "failure_reason": f"local_asset_research live_serena_mcp_failed: {exc}",
-                    "failure_class": "local_asset_research live_serena_mcp_failed",
-                    "raw_command": _build_agy_raw_command(""),
-                    "model_chain": [],
-                    "model_downgrades": [],
-                    "local_asset_retrieval_metadata": {
-                        "retrieval_status": "failed",
-                        "retrieval_mode": "live_serena_mcp",
-                        "serena_manifest_id": manifest_id,
-                        "serena_pinned_ref": manifest.get("pinned_ref"),
-                        "read_only_allowlist_sha256": _sha256_stable_json(
-                            list(manifest.get("read_only_allowlist", []))
+                        "stats": None,
+                        "stderr": evidence_errors[0],
+                        "warnings": evidence_errors[:],
+                        "failure_reason": evidence_errors[0],
+                        "failure_class": "local_asset_research_targeted_evidence_unmet",
+                        "raw_command": _build_agy_raw_command(""),
+                        "model_chain": [],
+                        "model_downgrades": [],
+                        "local_asset_retrieval_metadata": {
+                            "retrieval_status": "failed",
+                            "retrieval_mode": "wrapper_read_only_targeted_evidence",
+                            "targets_requested": len(request.get("evidence_targets") or []),
+                            "evidence_record_count": 0,
+                            "failure_class": "local_asset_research_targeted_evidence_unmet",
+                        },
+                    }
+                evidence_documents = [
+                    {
+                        "path": envelope["repo_relative_path"],
+                        "content": json.dumps(
+                            {
+                                "repo_relative_path": envelope["repo_relative_path"],
+                                "selector": envelope["selector"],
+                                "line_range": envelope["line_range"],
+                                "sha256": envelope["sha256"],
+                                "source_kind": envelope["source_kind"],
+                                "content": envelope["content"],
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
                         ),
-                        "dangerous_denylist_sha256": _sha256_stable_json(
-                            list(manifest.get("dangerous_denylist", []))
-                        ),
-                        "live_tools_list_sha256": None,
-                        "manifest_drift_failed": True,
-                        "context_files_count": len(context_paths),
-                        "evidence_record_count": 0,
-                        "failure_class": "local_asset_research live_serena_mcp_failed",
-                    },
+                    }
+                    for envelope in evidence_envelopes
+                ]
+                local_asset_retrieval_metadata = {
+                    "retrieval_mode": "wrapper_read_only_targeted_evidence",
+                    "retrieval_status": "succeeded",
+                    "targets_requested": len(request.get("evidence_targets") or []),
+                    "evidence_record_count": len(evidence_envelopes),
+                    "failure_class": None,
                 }
+            else:
+                _, context_paths = _validate_local_asset_context_files(
+                    request.get("context_files", []),
+                    request_path,
+                    repo_root,
+                )
+                manifest = load_serena_tool_manifest(repo_root)
+                try:
+                    local_asset_result = _collect_live_serena_read_only_evidence(
+                        context_paths, repo_root, manifest
+                    )
+                    evidence_documents, local_asset_retrieval_metadata = _coerce_live_serena_retrieval_result(
+                        local_asset_result,
+                        context_paths=context_paths,
+                    )
+                    if local_asset_retrieval_metadata is not None:
+                        local_asset_retrieval_metadata = {
+                            **local_asset_retrieval_metadata,
+                            "retrieval_status": "succeeded",
+                            "context_files_count": len(context_paths),
+                            "failure_class": None,
+                        }
+                except Exception as exc:
+                    manifest_id = _serena_manifest_id(manifest)
+                    return {
+                        "schema": "delegation_result/v1",
+                        "transport": "agy",
+                        "ok": False,
+                        "provider": "agy",
+                        "safety_mode": "degraded_wrapper_only",
+                        "requested_model": None,
+                        "actual_model": None,
+                        "tool_profile": LOCAL_ASSET_RESEARCH_PROFILE,
+                        "exit_code": 1,
+                        "result_surface": {
+                            "ok": False,
+                            "summary": "local_asset_research live Serena MCP retrieval failed",
+                            "response_text": None,
+                        },
+                        "response_text": None,
+                        "stats": None,
+                        "stderr": str(exc),
+                        "warnings": [f"local_asset_research live_serena_mcp_failed: {exc}"],
+                        "failure_reason": f"local_asset_research live_serena_mcp_failed: {exc}",
+                        "failure_class": "local_asset_research live_serena_mcp_failed",
+                        "raw_command": _build_agy_raw_command(""),
+                        "model_chain": [],
+                        "model_downgrades": [],
+                        "local_asset_retrieval_metadata": {
+                            "retrieval_status": "failed",
+                            "retrieval_mode": "live_serena_mcp",
+                            "serena_manifest_id": manifest_id,
+                            "serena_pinned_ref": manifest.get("pinned_ref"),
+                            "read_only_allowlist_sha256": _sha256_stable_json(
+                                list(manifest.get("read_only_allowlist", []))
+                            ),
+                            "dangerous_denylist_sha256": _sha256_stable_json(
+                                list(manifest.get("dangerous_denylist", []))
+                            ),
+                            "live_tools_list_sha256": None,
+                            "manifest_drift_failed": True,
+                            "context_files_count": len(context_paths),
+                            "evidence_record_count": 0,
+                            "failure_class": "local_asset_research live_serena_mcp_failed",
+                        },
+                    }
             prompt_text = _build_local_asset_prompt(
                 request,
                 request_path,
