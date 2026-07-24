@@ -325,8 +325,13 @@ claims:
 `ISSUE_EXECUTION_DECISION_V1` is a static contract for the planning producer → schema validation →
 state/handoff projection → consumer route path. Its canonical policy is `docs/dev/workflow.md#execution-planning-policy-canonical-ssot`;
 the schema is `.claude/skills/issue-refinement-loop/schemas/issue_execution_decision_v1.schema.json`.
-This derived design note does not change runtime state/handoff or planner consumers. The migration projection is
-`dual-write` → `dual-read` → `equivalence` → `new-authoritative` → `old removal`, with existing open-pr hard gates retained.
+This derived design note does not change runtime state/handoff or planner consumers. The normalized static projection has
+`identity`, issue-number-sorted `nodes`, relation-tuple-sorted `relations[].relation_type`,
+`execution.state/predecessors/defer_reason`, `downstream_policy`, and `completeness`.
+Its migration projection is `dual_write` → `equivalence` → `dual_read` → `new_authoritative` →
+`legacy_removed`; canonicalized digest mismatch is fail-closed with `migration_required: yes`, and existing
+open-pr hard gates remain retained. The shared normative semantic validator is owned by #1677; this static projection
+does not implement a runtime consumer.
 
 ## Traceability（追跡可能性）
 

@@ -13,6 +13,9 @@ description: この文書はスコープ統合の判断手順を定義する。
 この文書は `docs/dev/workflow.md#execution-planning-policy-canonical-ssot` の canonical policy を、`plan_issue_scope_rollup.py` の判定ロジックと
 `issue-refinement-loop` / `impl-review-loop` における統合アクションの選択基準を定義する。
 普遍的な planning state、freshness、collision、merge readiness、quality/safety gate の設計正本ではない。
+canonical `ISSUE_EXECUTION_DECISION_V1` の field/enum/semantic validator は #1677 が所有し、本書は
+normalised decision を再解釈しない。legacy graph adapter の equivalence digest が不一致なら
+`migration_required: yes` として fail-closed にする。
 
 ## 目的
 

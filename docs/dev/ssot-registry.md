@@ -36,8 +36,8 @@
 - id: execution-planning-policy
   path: docs/dev/workflow.md
   title: Execution Planning Policy (canonical SSOT)
-  keywords: [execution-planning, issue-execution-decision, semantic-planning, collision-derived, dual-write, consumer-compatibility]
-  description: ISSUE_EXECUTION_DECISION_V1 の静的契約、namespace 分離、migration、open-pr hard gate 維持の正本
+  keywords: [execution-planning, issue-execution-decision, semantic-planning, collision-derived, relation-type, downstream-policy, equivalence, consumer-compatibility]
+  description: ISSUE_EXECUTION_DECISION_V1 の正規化静的契約、namespace 分離、legacy/V1 digest equivalence migration、open-pr hard gate 維持の正本
   sections:
     - "## Execution Planning Policy (canonical SSOT)"
 

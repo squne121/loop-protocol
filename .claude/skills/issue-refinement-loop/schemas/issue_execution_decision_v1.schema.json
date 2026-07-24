@@ -2,75 +2,142 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "issue_execution_decision/v1",
   "title": "ISSUE_EXECUTION_DECISION_V1",
-  "description": "Static planning contract. It is not a runtime state or a permission to mutate a PR.",
+  "description": "Canonical static decision shape. Semantic invariants and canonical digest verification are owned by the normative validator in Issue #1677.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "identity", "source_manifest", "graph", "execution", "integrity", "provenance", "consumer_compatibility"],
+  "required": [
+    "schema_version",
+    "identity",
+    "nodes",
+    "relations",
+    "execution",
+    "downstream_policy",
+    "completeness"
+  ],
   "properties": {
     "schema_version": {"type": "string", "const": "ISSUE_EXECUTION_DECISION_V1"},
     "identity": {"$ref": "#/$defs/identity"},
-    "source_manifest": {"$ref": "#/$defs/source_manifest"},
-    "graph": {"$ref": "#/$defs/graph"},
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/node"}
+    },
+    "relations": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/relation"}
+    },
     "execution": {"$ref": "#/$defs/execution"},
-    "integrity": {"$ref": "#/$defs/integrity"},
-    "provenance": {"$ref": "#/$defs/provenance"},
-    "consumer_compatibility": {"$ref": "#/$defs/consumer_compatibility"}
+    "downstream_policy": {"$ref": "#/$defs/downstream_policy"},
+    "completeness": {"$ref": "#/$defs/completeness"}
   },
   "$defs": {
-    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "issue_number": {
+      "type": "integer",
+      "minimum": 1
+    },
     "identity": {
-      "type": "object", "additionalProperties": false,
-      "required": ["repository_id", "repository_full_name", "target_issue_number", "body_sha256", "updated_at"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_issue_number",
+        "target_body_sha256",
+        "generated_at",
+        "collection_digest"
+      ],
       "properties": {
-        "repository_id": {"type": "string", "minLength": 1},
-        "repository_full_name": {"type": "string", "pattern": "^[^/]+/[^/]+$"},
-        "target_issue_number": {"type": "integer", "minimum": 1},
-        "body_sha256": {"$ref": "#/$defs/sha256"},
-        "updated_at": {"type": "string", "format": "date-time"}
+        "target_issue_number": {"$ref": "#/$defs/issue_number"},
+        "target_body_sha256": {"$ref": "#/$defs/sha256"},
+        "generated_at": {"type": "string", "format": "date-time"},
+        "collection_digest": {"$ref": "#/$defs/sha256"}
       }
     },
-    "source_manifest": {
-      "type": "object", "additionalProperties": false,
-      "required": ["collected_at", "issues_complete", "pull_requests_complete", "dependencies_complete", "unresolved_references", "issues_sha256", "pull_requests_sha256", "dependencies_sha256"],
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["issue_number", "body_sha256"],
       "properties": {
-        "collected_at": {"type": "string", "format": "date-time"},
-        "issues_complete": {"type": "boolean"},
-        "pull_requests_complete": {"type": "boolean"},
-        "dependencies_complete": {"type": "boolean"},
-        "unresolved_references": {"type": "array", "items": {"type": "string"}},
-        "issues_sha256": {"$ref": "#/$defs/sha256"},
-        "pull_requests_sha256": {"$ref": "#/$defs/sha256"},
-        "dependencies_sha256": {"$ref": "#/$defs/sha256"}
+        "issue_number": {"$ref": "#/$defs/issue_number"},
+        "body_sha256": {"$ref": "#/$defs/sha256"}
       }
     },
-    "graph": {
-      "type": "object", "additionalProperties": false,
-      "required": ["canonical_sort", "nodes", "edges"],
+    "relation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_issue_number",
+        "target_issue_number",
+        "relation_type",
+        "evidence"
+      ],
       "properties": {
-        "canonical_sort": {"type": "string", "const": "issue_number_ascending_then_relation"},
-        "nodes": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["issue_number"], "properties": {"issue_number": {"type": "integer", "minimum": 1}}}},
-        "edges": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["source_issue_number", "target_issue_number", "relation", "evidence_refs"], "properties": {"source_issue_number": {"type": "integer", "minimum": 1}, "target_issue_number": {"type": "integer", "minimum": 1}, "relation": {"type": "string", "enum": ["depends_on", "supersedes", "absorbs", "duplicates"]}, "evidence_refs": {"type": "array", "items": {"type": "string"}}}}}
+        "source_issue_number": {"$ref": "#/$defs/issue_number"},
+        "target_issue_number": {"$ref": "#/$defs/issue_number"},
+        "relation_type": {
+          "type": "string",
+          "enum": ["depends_on", "duplicate", "absorb", "supersedes", "coordinates"]
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        }
       }
     },
     "execution": {
-      "type": "object", "additionalProperties": false,
-      "required": ["target_state", "predecessor_issue_numbers", "reason_codes"],
-      "properties": {"target_state": {"type": "string", "enum": ["selected", "deferred", "duplicate", "superseded"]}, "predecessor_issue_numbers": {"type": "array", "items": {"type": "integer", "minimum": 1}}, "reason_codes": {"type": "array", "items": {"type": "string", "minLength": 1}}}
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "target_issue_number", "predecessors", "defer_reason"],
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": ["selected", "deferred", "blocked", "duplicate"]
+        },
+        "target_issue_number": {"$ref": "#/$defs/issue_number"},
+        "predecessors": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/issue_number"}
+        },
+        "defer_reason": {
+          "type": ["string", "null"],
+          "minLength": 1
+        }
+      }
     },
-    "integrity": {
-      "type": "object", "additionalProperties": false,
-      "required": ["canonicalization_id", "decision_inputs_sha256", "artifact_sha256"],
-      "properties": {"canonicalization_id": {"type": "string", "minLength": 1}, "decision_inputs_sha256": {"$ref": "#/$defs/sha256"}, "artifact_sha256": {"$ref": "#/$defs/sha256"}}
+    "downstream_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "semantic_reclassification",
+        "freshness_validation",
+        "stale_action"
+      ],
+      "properties": {
+        "semantic_reclassification": {"type": "string", "const": "forbidden"},
+        "freshness_validation": {"type": "string", "const": "required"},
+        "stale_action": {"type": "string", "const": "rerun_issue_refinement"}
+      }
     },
-    "provenance": {
-      "type": "object", "additionalProperties": false,
-      "required": ["producer_name", "producer_version", "policy_version", "policy_sha256"],
-      "properties": {"producer_name": {"type": "string", "minLength": 1}, "producer_version": {"type": "string", "minLength": 1}, "policy_version": {"type": "string", "minLength": 1}, "policy_sha256": {"$ref": "#/$defs/sha256"}}
-    },
-    "consumer_compatibility": {
-      "type": "object", "additionalProperties": false,
-      "required": ["consumer_contract_version", "supported_schema_versions", "projection_compatibility"],
-      "properties": {"consumer_contract_version": {"type": "string", "minLength": 1}, "supported_schema_versions": {"type": "array", "minItems": 1, "items": {"type": "string", "const": "ISSUE_EXECUTION_DECISION_V1"}}, "projection_compatibility": {"type": "string", "enum": ["dual_write", "dual_read", "new_authoritative", "legacy_removed"]}}
+    "completeness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "issues_complete",
+        "dependencies_complete",
+        "unresolved_references"
+      ],
+      "properties": {
+        "issues_complete": {"type": "boolean"},
+        "dependencies_complete": {"type": "boolean"},
+        "unresolved_references": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/issue_number"}
+        }
+      }
     }
   }
 }
+
