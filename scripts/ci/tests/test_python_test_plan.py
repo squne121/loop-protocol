@@ -108,6 +108,15 @@ def test_parallel_run_ignores_parallel_exclude(tmp_path):
     assert "--ignore=pkg/test_timing.py" in argv
 
 
+def test_parallel_run_removes_explicit_excluded_target(tmp_path):
+    plan = _plan_with_exclude()
+    plan["targets"] = ["pkg/test_timing.py", "schemas/tests/"]
+    loaded = mod.load_plan(_write_plan(tmp_path, plan))
+    argv = mod.run_argv(loaded, mode="parallel")
+    assert "pkg/test_timing.py" not in argv
+    assert "--ignore=pkg/test_timing.py" in argv
+
+
 def test_serial_lane_argv_inherits_ignore_and_deselect(tmp_path):
     """Serial lane runs the excluded paths AND inherits plan ignore/deselect (no drift)."""
     loaded = mod.load_plan(_write_plan(tmp_path, _plan_with_exclude()))
@@ -158,8 +167,9 @@ def test_real_plan_serial_lane_has_debounce():
     scripts/agent-guards/tests/test_skill_runtime_exec_session_manifest.py to
     parallel_exclude to remove a real xdist race: its repo-tree snapshot window can
     be polluted by a concurrent worker running test_summarize_agent_transcript.py.
-    That is the only entry expected in the real plan; the debounce test itself must
-    NOT be excluded.
+    tests/codex/test_scope_rollup_runner_agent_config.py is also serial because
+    its raw adapter-to-capture E2E is parallel-unsafe on the GitHub runner. The
+    debounce test itself must NOT be excluded.
     """
     plan = mod.load_plan(_PLAN_PATH)
     lane = mod.serial_lane_argv(plan)
@@ -167,6 +177,7 @@ def test_real_plan_serial_lane_has_debounce():
         "-n",
         "0",
         "scripts/agent-guards/tests/test_skill_runtime_exec_session_manifest.py",
+        "tests/codex/test_scope_rollup_runner_agent_config.py",
         "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py",
         "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable",
         "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths",
@@ -180,6 +191,7 @@ def test_real_plan_serial_lane_has_debounce():
     par = mod.run_argv(plan, mode="parallel")
     assert not any(a.startswith("--ignore=") and "session_manifest_debounce" in a for a in par)
     assert "--ignore=scripts/agent-guards/tests/test_skill_runtime_exec_session_manifest.py" in par
+    assert "--ignore=tests/codex/test_scope_rollup_runner_agent_config.py" in par
 
 
 def test_real_plan_uses_fixed_worker_count():

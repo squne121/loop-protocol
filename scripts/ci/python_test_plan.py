@@ -11,10 +11,11 @@ Design constraints:
 - No shell ``eval``. The CLI emits the scope argv as a NUL-separated stream
   (``--format nul``) or a JSON array (``--format json``) so the workflow can read it
   with ``mapfile -d ''`` without word-splitting or glob expansion.
-- ``scope_argv`` (targets + ``--ignore=`` + ``--deselect=``) is the collection scope
-  shared by the executed pytest run, the ``--collect-only`` guard, and the artifact.
+- ``scope_argv`` (targets + ``--ignore=`` + ``--deselect=``) is the complete collection
+  scope shared by the ``--collect-only`` guard and the artifact. ``parallel_scope_argv``
+  derives its disjoint parallel partition from it.
 - ``run_argv`` adds the xdist worker/scheduler knobs (``-n`` / ``--dist``) on top of
-  the scope; ``mode=serial`` forces ``-n 0`` for the serial-equivalence proof.
+  the selected lane scope; ``mode=serial`` forces ``-n 0`` for the serial-equivalence proof.
 - ``serial_lane_argv`` runs the ``parallel_exclude`` tests at ``-n 0`` and inherits the
   same ``--ignore`` / ``--deselect`` as the parallel run so the parallel ∪ serial
   collection equals the full scope and stays drift-free (Issue #1064 review).
@@ -186,6 +187,22 @@ def scope_argv(plan: Dict[str, Any]) -> List[str]:
     return list(plan["targets"]) + _ignore_deselect_flags(plan)
 
 
+def parallel_scope_argv(plan: Dict[str, Any]) -> List[str]:
+    """Return the parallel lane's collection argv without xdist knobs.
+
+    ``--ignore`` does not exclude a file when that same file is also an explicit
+    positional pytest target.  Remove an exactly matching target before adding
+    the ignore flags so ``parallel_exclude`` remains a true lane partition;
+    directory targets stay in place and their contained excluded files are
+    handled by ``--ignore``.
+    """
+    excluded = set(plan.get("parallel_exclude", []))
+    targets = [target for target in plan["targets"] if target not in excluded]
+    return targets + _ignore_deselect_flags(plan) + [
+        f"--ignore={path}" for path in plan.get("parallel_exclude", [])
+    ]
+
+
 def resolved_workers(plan: Dict[str, Any]) -> Any:
     """Return the configured worker setting (``"auto"`` or a positive int)."""
     return plan.get("xdist", {}).get("workers", "auto")
@@ -208,11 +225,7 @@ def run_argv(plan: Dict[str, Any], *, mode: str = "parallel") -> List[str]:
     if mode == "serial":
         return ["-n", "0"] + scope_argv(plan)
     argv: List[str] = ["-n", str(resolved_workers(plan)), "--dist", scheduler(plan)]
-    argv += scope_argv(plan)
-    # Parallel-unsafe tests are ignored here and run in the serial lane (serial_lane_argv).
-    for path in plan.get("parallel_exclude", []):
-        argv.append(f"--ignore={path}")
-    return argv
+    return argv + parallel_scope_argv(plan)
 
 
 def serial_lane_argv(plan: Dict[str, Any]) -> List[str]:

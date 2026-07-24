@@ -52,7 +52,7 @@ def _collect(argv: list[str]) -> set[str]:
 def main() -> int:
     plan = plan_mod.load_plan()
     scope = plan_mod.scope_argv(plan)
-    parallel = list(scope) + [f"--ignore={pe}" for pe in plan.get("parallel_exclude", [])]
+    parallel = plan_mod.parallel_scope_argv(plan)
     # serial collection: parallel_exclude paths + inherited ignore/deselect (drop -n 0).
     serial = plan_mod.serial_lane_argv(plan)
     serial = [a for a in serial if a not in ("-n", "0")]
