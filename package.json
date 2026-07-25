@@ -28,6 +28,7 @@
     "playwright:install:ci": "playwright install --with-deps chromium",
     "policy:check:secret": "uv run --locked python .claude/scripts/check_secret_policy.py docs/dev/secret-policy.md",
     "policy:check:session": "uv run --locked python .claude/scripts/check_session_recording_policy.py docs/dev/session-recording-policy.md",
+    "policy:check:ci-performance": "uv run --locked pytest .claude/skills/ci-test-performance/scripts/tests/test_validate_ci_performance_assessment_v2.py",
     "policy:check": "pnpm run policy:check:secret && pnpm run policy:check:session",
     "manifest:check": "node scripts/check-agent-session-manifests.mjs",
     "smoke-verdict:check": "node scripts/check-session-recording-smoke-verdict.mjs",

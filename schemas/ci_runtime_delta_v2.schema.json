@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.local/schemas/ci_runtime_delta_v2.schema.json",
+  "title": "CI Runtime Delta V2",
+  "description": "Runtime delta report for a CI performance comparison. mode=comparative requires before/after/delta; mode=absolute requires an after cohort and a budget threshold. This is a versioned addition alongside ci_runtime_delta_v1 (templates/runtime-delta.md) and does not replace it.",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "issue_number",
+    "pr_number",
+    "mode",
+    "after",
+    "outlier_exclusions"
+  ],
+  "unevaluatedProperties": false,
+  "properties": {
+    "schema": { "const": "ci_runtime_delta_v2" },
+    "schema_version": { "const": 2 },
+    "issue_number": { "type": "integer" },
+    "pr_number": { "type": ["integer", "null"] },
+    "measured_at": { "type": "string", "minLength": 1 },
+    "mode": { "type": "string", "enum": ["comparative", "absolute"] },
+    "before": { "$ref": "#/$defs/Cohort" },
+    "after": { "$ref": "#/$defs/Cohort" },
+    "budget": { "$ref": "#/$defs/Budget" },
+    "delta": { "$ref": "#/$defs/Delta" },
+    "outlier_exclusions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/OutlierExclusion" }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "mode": { "const": "comparative" } },
+        "required": ["mode"]
+      },
+      "then": { "required": ["before", "after", "delta"] }
+    },
+    {
+      "if": {
+        "properties": { "mode": { "const": "absolute" } },
+        "required": ["mode"]
+      },
+      "then": { "required": ["after", "budget"] }
+    }
+  ],
+  "$defs": {
+    "Cohort": {
+      "type": "object",
+      "required": [
+        "job",
+        "p50_seconds",
+        "p95_seconds",
+        "run_ids",
+        "run_count",
+        "runner_image",
+        "workers",
+        "scheduler",
+        "command_manifest_digest",
+        "test_selection_digest"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "job": { "type": "string", "minLength": 1 },
+        "p50_seconds": { "type": "number" },
+        "p95_seconds": { "type": "number" },
+        "run_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1
+        },
+        "run_count": { "type": "integer", "minimum": 0 },
+        "runner_image": { "type": "string", "minLength": 1 },
+        "workers": { "type": "integer", "minimum": 1 },
+        "scheduler": { "type": "string", "minLength": 1 },
+        "command_manifest_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "test_selection_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "Budget": {
+      "type": "object",
+      "required": ["metric", "maximum_value_ms"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "metric": { "type": "string", "minLength": 1 },
+        "maximum_value_ms": { "type": "number" }
+      }
+    },
+    "Delta": {
+      "type": "object",
+      "required": [
+        "p50_delta_seconds",
+        "p95_delta_seconds",
+        "p50_improvement_pct",
+        "p95_improvement_pct"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "p50_delta_seconds": { "type": "number" },
+        "p95_delta_seconds": { "type": "number" },
+        "p50_improvement_pct": { "type": "number" },
+        "p95_improvement_pct": { "type": "number" }
+      }
+    },
+    "OutlierExclusion": {
+      "type": "object",
+      "required": ["run_id", "reason", "rule_id"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "run_id": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "rule_id": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

@@ -1,0 +1,325 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.local/schemas/ci_test_performance_assessment_v2.schema.json",
+  "title": "CI Test Performance Assessment V2",
+  "description": "Versioned addition alongside CI_TEST_PERFORMANCE_DECISION_V1 (references/decision-matrix.md). Separates claim (author intent), performance_evidence (evidence sufficiency), observation (measured outcome) and claim_evaluation (whether the claim holds) into 4 orthogonal axes so that structural/semantic validity (structural_valid / semantic_valid) can be distinguished from reviewer-gate approval eligibility (approval_eligible). Does not replace or in-place modify CI_TEST_PERFORMANCE_DECISION_V1 / ci_runtime_delta_v1.",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "issue_number",
+    "pr_number",
+    "claim",
+    "performance_evidence",
+    "observation",
+    "claim_evaluation",
+    "functional_evidence",
+    "declared_impact",
+    "risk_acknowledgement"
+  ],
+  "unevaluatedProperties": false,
+  "properties": {
+    "schema": { "const": "CI_TEST_PERFORMANCE_ASSESSMENT_V2" },
+    "schema_version": { "const": 2 },
+    "issue_number": { "type": "integer" },
+    "pr_number": { "type": ["integer", "null"] },
+    "measured_at": { "type": "string", "minLength": 1 },
+    "decision_scope": {
+      "type": "string",
+      "enum": ["docs_only", "ci_change", "dependency_change", "review_only"]
+    },
+    "claim": { "$ref": "#/$defs/Claim" },
+    "performance_evidence": { "$ref": "#/$defs/PerformanceEvidence" },
+    "observation": { "$ref": "#/$defs/Observation" },
+    "claim_evaluation": { "$ref": "#/$defs/ClaimEvaluation" },
+    "functional_evidence": { "$ref": "#/$defs/FunctionalEvidence" },
+    "declared_impact": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Self-reported impact statement. Not verified against the actual diff (trusted base/head SHA diff_evidence is Out of Scope for this schema version)."
+    },
+    "risk_acknowledgement": { "$ref": "#/$defs/RiskAcknowledgement" },
+    "decision": {
+      "$ref": "#/$defs/Decision",
+      "description": "Output field produced by validate_ci_performance_assessment_v2.py / reviewer. Not a required input field."
+    }
+  },
+  "$defs": {
+    "Claim": {
+      "type": "object",
+      "required": ["kind"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["none", "improvement", "non_regression", "absolute_budget"]
+        },
+        "metric": { "type": "string", "minLength": 1 },
+        "minimum_improvement_pct": { "type": "number" },
+        "maximum_regression_pct": { "type": "number" },
+        "maximum_value_ms": { "type": "number" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "kind": { "const": "absolute_budget" } },
+            "required": ["kind"]
+          },
+          "then": { "required": ["metric", "maximum_value_ms"] }
+        }
+      ]
+    },
+    "PerformanceEvidence": {
+      "type": "object",
+      "required": ["status"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "not_required",
+            "not_instrumented",
+            "unavailable",
+            "insufficient_samples",
+            "incomparable_cohort",
+            "complete"
+          ]
+        },
+        "sample_count": { "type": "integer", "minimum": 0 },
+        "notes": { "type": "string" },
+        "runtime_delta": { "$ref": "#/$defs/RuntimeDelta" }
+      }
+    },
+    "RuntimeDelta": {
+      "type": "object",
+      "description": "Embedded ci_runtime_delta_v2-shaped cohort comparison used by the semantic validator for cohort-comparability checks. See schemas/ci_runtime_delta_v2.schema.json for the standalone schema.",
+      "required": ["mode", "after", "outlier_exclusions"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "mode": { "type": "string", "enum": ["comparative", "absolute"] },
+        "before": { "$ref": "#/$defs/Cohort" },
+        "after": { "$ref": "#/$defs/Cohort" },
+        "budget": { "$ref": "#/$defs/Budget" },
+        "delta": { "$ref": "#/$defs/Delta" },
+        "outlier_exclusions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/OutlierExclusion" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "mode": { "const": "comparative" } },
+            "required": ["mode"]
+          },
+          "then": { "required": ["before", "after", "delta"] }
+        },
+        {
+          "if": {
+            "properties": { "mode": { "const": "absolute" } },
+            "required": ["mode"]
+          },
+          "then": { "required": ["after", "budget"] }
+        }
+      ]
+    },
+    "Cohort": {
+      "type": "object",
+      "required": [
+        "job",
+        "p50_seconds",
+        "p95_seconds",
+        "run_ids",
+        "run_count",
+        "runner_image",
+        "workers",
+        "scheduler",
+        "command_manifest_digest",
+        "test_selection_digest"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "job": { "type": "string", "minLength": 1 },
+        "p50_seconds": { "type": "number" },
+        "p95_seconds": { "type": "number" },
+        "run_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1
+        },
+        "run_count": { "type": "integer", "minimum": 0 },
+        "runner_image": { "type": "string", "minLength": 1 },
+        "workers": { "type": "integer", "minimum": 1 },
+        "scheduler": { "type": "string", "minLength": 1 },
+        "command_manifest_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "test_selection_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "Budget": {
+      "type": "object",
+      "required": ["metric", "maximum_value_ms"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "metric": { "type": "string", "minLength": 1 },
+        "maximum_value_ms": { "type": "number" }
+      }
+    },
+    "Delta": {
+      "type": "object",
+      "required": [
+        "p50_delta_seconds",
+        "p95_delta_seconds",
+        "p50_improvement_pct",
+        "p95_improvement_pct"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "p50_delta_seconds": { "type": "number" },
+        "p95_delta_seconds": { "type": "number" },
+        "p50_improvement_pct": { "type": "number" },
+        "p95_improvement_pct": { "type": "number" }
+      }
+    },
+    "OutlierExclusion": {
+      "type": "object",
+      "required": ["run_id", "reason", "rule_id"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "run_id": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "rule_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "Observation": {
+      "type": "object",
+      "required": ["outcome"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "not_observed",
+            "improved",
+            "regressed",
+            "equivalent_within_threshold",
+            "budget_met",
+            "budget_exceeded",
+            "inconclusive"
+          ]
+        },
+        "details": { "type": "string" }
+      }
+    },
+    "ClaimEvaluation": {
+      "type": "object",
+      "required": ["outcome"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "enum": ["not_applicable", "satisfied", "not_satisfied", "inconclusive"]
+        },
+        "reason": { "type": "string" }
+      }
+    },
+    "FunctionalEvidence": {
+      "type": "object",
+      "description": "functional smoke provenance reused from ci_verdict_summary_v2.py (pr-review-judge canonical consumer). Green Check Run alone is not proof of coverage; proof_level/coverage_bound bound the guarantee.",
+      "required": ["proof_level", "coverage_bound"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "proof_level": { "const": "check_run_only" },
+        "coverage_bound": { "const": false },
+        "ci_verdict_summary_ref": { "$ref": "#/$defs/CiVerdictSummaryRef" }
+      }
+    },
+    "CiVerdictSummaryRef": {
+      "type": "object",
+      "required": ["artifact_schema", "expected_head_sha", "selected_checks"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "artifact_schema": { "const": "ci_verdict_summary_v2" },
+        "expected_head_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "overall_status": { "type": "string" },
+        "selected_checks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SelectedCheck" }
+        }
+      }
+    },
+    "SelectedCheck": {
+      "type": "object",
+      "required": ["check_run_id", "status", "conclusion", "head_sha_match", "classification"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "check_run_id": { "type": ["integer", "null"] },
+        "status": { "type": "string", "minLength": 1 },
+        "conclusion": { "type": ["string", "null"] },
+        "head_sha_match": { "type": "boolean" },
+        "classification": {
+          "type": "string",
+          "enum": ["required", "evidence", "advisory", "excluded", "unknown"]
+        },
+        "provenance": { "type": "string" }
+      }
+    },
+    "RiskAcknowledgement": {
+      "type": "object",
+      "description": "Not an accepted/actor self-report. A pointer to where the risk was raised plus a fixed unverified verification_status.",
+      "required": ["reference", "verification_status"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "reference": { "$ref": "#/$defs/RiskReference" },
+        "verification_status": { "const": "unverified" }
+      }
+    },
+    "RiskReference": {
+      "type": "object",
+      "required": ["source_kind", "source_id"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "source_kind": {
+          "type": "string",
+          "enum": [
+            "issue_comment",
+            "pr_comment",
+            "review_comment",
+            "external_doc",
+            "commit_message",
+            "other"
+          ]
+        },
+        "source_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "Decision": {
+      "type": "object",
+      "required": [
+        "structural_valid",
+        "semantic_valid",
+        "approval_eligible",
+        "errors",
+        "blockers",
+        "warnings"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "structural_valid": { "type": "boolean" },
+        "semantic_valid": { "type": "boolean" },
+        "approval_eligible": { "type": "boolean" },
+        "errors": { "type": "array", "items": { "type": "string" } },
+        "blockers": { "type": "array", "items": { "type": "string" } },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}
