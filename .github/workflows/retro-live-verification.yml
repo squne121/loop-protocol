@@ -4,9 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       manifest_json_path:
-        description: Workspace-relative path to a pre-generated retro_live_verification/v2 manifest JSON file (no absolute paths, no path traversal, no symlinks)
+        description: Workspace-relative path to a pre-generated retro_live_verification/v2 manifest JSON file (no absolute paths, no path traversal, no symlinks). Mutually exclusive with dual_target_manifest_json_path.
         type: string
-        required: true
+        required: false
+        default: ''
+      # Issue #1415 P0-3 fix_delta (post-#1747 adversarial review): the v3
+      # dual-target (retro_live_verification/v3) counterpart to
+      # manifest_json_path above. Exactly one of the two must be non-empty;
+      # the "Validate manifest path safety" step below enforces this and
+      # applies the same path-safety checks to whichever one is set.
+      dual_target_manifest_json_path:
+        description: Workspace-relative path to a pre-generated retro_live_verification/v3 dual-target bundle JSON file (no absolute paths, no path traversal, no symlinks). Mutually exclusive with manifest_json_path.
+        type: string
+        required: false
+        default: ''
       dry_run:
         description: Keep the post step in dry-run mode (no GitHub write)
         type: boolean
@@ -37,7 +48,7 @@ permissions: {}
 # have no `inputs`) fall back to `github.ref` so unrelated PRs never
 # needlessly serialize against each other.
 concurrency:
-  group: retro-live-verification-${{ github.workflow }}-${{ inputs.manifest_json_path || github.ref }}
+  group: retro-live-verification-${{ github.workflow }}-${{ inputs.manifest_json_path || inputs.dual_target_manifest_json_path || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -93,6 +104,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       MANIFEST_PATH: ${{ inputs.manifest_json_path }}
+      DUAL_TARGET_MANIFEST_PATH: ${{ inputs.dual_target_manifest_json_path }}
       DRY_RUN: ${{ inputs.dry_run }}
       # `github.triggering_actor` is the authenticated identity that actually
       # invoked this run (via the GitHub API / UI), not a free-text workflow
@@ -116,29 +128,47 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Issue #1415 P0-3 fix_delta: manifest_json_path (v2) and
+      # dual_target_manifest_json_path (v3) are mutually exclusive inputs;
+      # exactly one must be non-empty. The path-safety checks below apply
+      # identically to whichever one is set.
+      - name: Validate exactly one manifest input is set
+        run: |
+          set -euo pipefail
+          if [ -n "$MANIFEST_PATH" ] && [ -n "$DUAL_TARGET_MANIFEST_PATH" ]; then
+            echo "manifest_json_path and dual_target_manifest_json_path are mutually exclusive; set only one" >&2
+            exit 1
+          fi
+          if [ -z "$MANIFEST_PATH" ] && [ -z "$DUAL_TARGET_MANIFEST_PATH" ]; then
+            echo "one of manifest_json_path or dual_target_manifest_json_path is required" >&2
+            exit 1
+          fi
+
       - name: Validate manifest path safety
         run: |
           set -euo pipefail
-          case "$MANIFEST_PATH" in
+          target_path="${MANIFEST_PATH:-$DUAL_TARGET_MANIFEST_PATH}"
+          case "$target_path" in
             /*)
-              echo "manifest_json_path must be a workspace-relative path, not absolute: $MANIFEST_PATH" >&2
+              echo "manifest path must be workspace-relative, not absolute: $target_path" >&2
               exit 1
               ;;
           esac
-          if [ -L "$MANIFEST_PATH" ]; then
-            echo "manifest_json_path must not be a symlink: $MANIFEST_PATH" >&2
+          if [ -L "$target_path" ]; then
+            echo "manifest path must not be a symlink: $target_path" >&2
             exit 1
           fi
-          resolved="$(realpath -m -- "$GITHUB_WORKSPACE/$MANIFEST_PATH")"
+          resolved="$(realpath -m -- "$GITHUB_WORKSPACE/$target_path")"
           case "$resolved" in
             "$GITHUB_WORKSPACE"/*) ;;
             *)
-              echo "manifest_json_path escapes the workspace: $resolved" >&2
+              echo "manifest path escapes the workspace: $resolved" >&2
               exit 1
               ;;
           esac
 
-      - name: Post canonical retro-live-verification comment
+      - name: Post canonical retro-live-verification comment (v2)
+        if: ${{ inputs.manifest_json_path != '' }}
         run: pnpm retro-live-verification:post -- --manifest-json "$MANIFEST_PATH" --current-actor "$CURRENT_ACTOR" --dry-run "$DRY_RUN"
 
       # `inputs.dry_run` is a Boolean workflow_dispatch input; the GitHub
@@ -148,6 +178,15 @@ jobs:
       # and this step would silently always be skipped (Issue #1709 PR
       # review P0-1). `!inputs.dry_run` operates on the Boolean value
       # directly.
-      - name: Verify canonical comment landed correctly
-        if: ${{ !inputs.dry_run }}
+      - name: Verify canonical comment landed correctly (v2)
+        if: ${{ inputs.manifest_json_path != '' && !inputs.dry_run }}
         run: pnpm retro-live-verification:verify -- --manifest-json "$MANIFEST_PATH"
+
+      # Issue #1415 P0-3 fix_delta: the v3 dual-target counterpart. Trust is
+      # bound to the same authenticated `github.triggering_actor`; there is
+      # no separate trusted-actor input to keep this consistent with the v2
+      # branch above rather than accepting a free-text allowlist from the
+      # dispatch caller.
+      - name: Post canonical retro-live-verification comment (v3 dual-target)
+        if: ${{ inputs.dual_target_manifest_json_path != '' }}
+        run: pnpm retro-live-verification:post -- --dual-target-manifest-json "$DUAL_TARGET_MANIFEST_PATH" --current-actor "$CURRENT_ACTOR" --trusted-actor "$CURRENT_ACTOR" --dry-run "$DRY_RUN"
