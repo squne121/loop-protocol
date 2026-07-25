@@ -2,9 +2,9 @@
 issue: 1752
 parent_issue: 1265
 related_issue: 1494
-status: live_verification_complete_hypothesis_refuted
+status: finding2_hook_discovery_path_fixed
 last_updated: 2026-07-26
-note: "本ドキュメントは Issue 1752 の静的調査結果、および Issue 1758 の live agy 実行による Finding 1 仮説検証結果を記録する。"
+note: "本ドキュメントは Issue 1752 の静的調査結果、Issue 1758 の live agy 実行による Finding 1 仮説検証結果、および Issue 1768 の Finding 2（hooks.json discover パス）live 再調査・対処結果を記録する。"
 ---
 
 # isolated workspace 内で grounded_research の search_web / read_url_content が発火しない原因の再調査（静的解析）
@@ -261,3 +261,119 @@ Issue #1758 の live 検証により、Finding 1（`toolPermission` isolated wor
 4. **#1494 側で 7 回目の live E2E fan-out 試行を計画する場合**: 上記 3 の follow-up Issue
    が先に必要になる可能性が高い（tool 呼び出し自体は成功しうるが、evidence gate が
    それを正しく検出できない限り validator が pass しないため）。
+
+## Finding 2 Live Verification (#1768)
+
+Issue #1768 が扱った「実際に `search_web` が成功したケースでも `agy_provenance_hook_events`
+が常に空になる」問題を、live `agy -p` 実行（インストール済み Antigravity CLI 1.1.7、
+`--log-file` 出力の解析）で再調査した結果を記録する。
+
+### hooks_manager_discovery_path_confirmed（AC1: 実際の hooks.json discover パスの確認）
+
+`agy_tool_provenance.generate_workspace_hook_config()` が書き込む
+`<workspace_dir>/.agents/hooks.json`（isolated workspace では `workspace_dir == HOME`）を
+live `agy -p` 実行で観測したところ、`--log-file` 出力に次のログが記録された。
+
+```
+I ... hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
+```
+
+これは workspace が `trustedWorkspaces` に含まれる場合（本リポジトリ相当の trusted
+環境での control test）でも再現し、workspace trust の有無とは無関係であることを確認した。
+
+一方、`<HOME>/.gemini/antigravity-cli/hooks.json` へ hooks.json を配置した場合、次の
+migration ログが観測され、実際に hook が登録・発火することを確認した。
+
+```
+I ... migrate.go:132] Migrating file <HOME>/.gemini/antigravity-cli/hooks.json to <HOME>/.gemini/config/hooks.json
+I ... migrate.go:151] Created symlink from <HOME>/.gemini/antigravity-cli/hooks.json to <HOME>/.gemini/config/hooks.json
+I ... hooks_manager.go:53] loaded 1 named hooks from 2 hooks.json file(s)
+I ... jsonhook.go:314] Loaded hooks.json from <HOME>/.gemini/config/hooks.json: 1 named hooks, 1 total handlers
+```
+
+`<HOME>/.gemini/config/hooks.json`（`agy changelog` 1.0.8 リリースノートが "shared
+`~/.gemini/config/hooks.json`" と呼ぶ、TUI `/hooks` コマンドと共有される正本パス）へ直接
+hooks.json を配置した場合も同様に発火することを確認した。**結論**:
+`<workspace_dir>/.agents/hooks.json` は `https://antigravity.google/docs/hooks` の公式
+記述と文字面では一致するが、インストール済み Antigravity CLI 1.1.7 の headless print mode
+（`agy -p`）では一度も discover されない。実際に discover されるのは
+`<HOME>/.gemini/config/hooks.json`（および legacy `<HOME>/.gemini/antigravity-cli/hooks.json`
+からの自動 migration）である。**hooks_manager_discovery_path_confirmed**。
+
+### 対処内容
+
+`agy_tool_provenance.generate_workspace_hook_config()` に `home_dir` 引数を追加し、
+指定された場合は `<workspace_dir>/.agents/hooks.json`（既存、forward-compat のため維持）
+に加えて `<home_dir>/.gemini/config/hooks.json` にも同一内容を書き込むようにした。
+`run_gemini_headless._run_agy()` の isolated workspace 分岐（`materialize_isolated_agy_workspace()`
+使用時）でのみ、isolated HOME を `home_dir` として渡す。非隔離フォールバック分岐は変更して
+いない（実 host のグローバル hooks.json を書き換えないため）。`home_dir` が実 host の
+`$HOME`（`Path.home()`、symlink 解決込み）と一致する場合は `ProvenanceWorkspaceHookError`
+を送出し書き込みを拒否する fail-closed guard を追加した。
+
+さらに、`run_gemini_headless._build_agy_grounded_research_metadata()` に
+`hook_events` 引数を追加し、`agy_provenance_hook_events` の中に schema/canonical tool
+name が妥当な hook event が 1 件以上あれば、stdout 自己申告の有無に関わらず「tool 呼び出し
+が発生した」と判定するよう変更した。実装時に、`_run_agy()` の唯一の実本番呼び出し元
+（`run_delegation()`）が `run_context` 引数を渡していない（`_run_agy(prompt_text,
+timeout_sec_agy)` のみ）ため、fan-out 相関 ID（`parent_run_id` / `subtask_id` /
+`attempt_id` / `tool_profile` / `transcript_sha256`）が常に空文字列であり、
+`agy_tool_provenance.validate_provenance_event()`（これらのフィールドを必須とする）を
+そのまま流用すると standalone（非 fan-out）呼び出しでは常に検証が失敗してしまうことが
+live 再検証で判明した。このため、fan-out 相関 ID を要求しない、より狭い専用の構造検証
+（`_hook_event_confirms_tool_call()`: schema/version/event 種別、canonical tool name、
+`args_sha256` の形式、`conversationId`/`monotonic_ns`/`utc` の妥当性のみを検証）を
+新設して使用した。cross-run 集約用途（`build_fanout_evidence_bundle.py` 等）ではこれまで
+通り `agy_tool_provenance.evaluate_websearch_provenance()` / `match_run_context()` の
+厳格な検証を使用する。
+
+### live_reverification_hook_events_nonempty（AC7: 修正後の live 再検証結果）
+
+修正後のコード（`home_dir` 付き `generate_workspace_hook_config()` 呼び出し + hook
+events 組み込み済み `_build_agy_grounded_research_metadata()`）を isolated workspace
+内で live `agy -p` grounded_research 実行し、実際の `run_delegation()` 相当のコード
+パス（`_run_agy()` → `_normalize_agy_result()`）を通して確認した。
+
+1回目（プロンプト「現在のパリの天気を検索して一言で教えて」、stdout に構造化
+self-report JSON や引用 URL を含まないケース）:
+
+```
+agy_provenance_hook_events: n=1
+agy_provenance_hook_load_error: None
+grounding_status: attempted_no_citations   (修正前は attempted_no_web_tool_call)
+grounding_backend: agy_native_websearch
+web_tool_call_count: 1
+url_citation_count: 0
+result.ok: False（citation 不在のため。tool 呼び出し自体は正しく検出されている）
+```
+
+2回目（プロンプト「現在のベルリンの天気を検索して、参照した検索結果のURLも含めて教えて」、
+stdout に実在する `vertexaisearch.cloud.google.com/grounding-api-redirect/...` 形式の
+citation URL を含むケース）:
+
+```
+agy_provenance_hook_events: n=1
+grounding_status: grounded
+grounding_backend: agy_native_websearch
+web_tool_call_count: 1
+url_citation_count: 1
+citation_evidence[0].url: https://vertexaisearch.cloud.google.com/grounding-api-redirect/...
+result.ok: True
+```
+
+**live_reverification_hook_events_nonempty**: いずれのケースでも `agy_provenance_hook_events`
+は非空となり、fail-closed evidence gate（#1708）は実際に成功している tool 呼び出しを
+`attempted_no_web_tool_call` と誤判定しなくなったことを確認した。
+
+回帰確認として、hook event が存在しない・schema 不正・canonical でない tool 名のケースは
+引き続き `attempted_no_web_tool_call` で fail-closed 判定されることを hermetic テスト
+（`tests/test_agy_provenance_grounding_wiring.py`）で確認済み。
+
+## Next Action Update (#1768)
+
+Finding 2（hooks.json discover パス不一致）は本 Issue で確認され、対処が完了した。
+`#1494` 側で live E2E fan-out を再試行する場合、grounded_research の tool 呼び出し
+自体（Finding 1、#1758 で既に修正不要と結論済み）と hook provenance capture（Finding 2、
+本 Issue で対処済み）の両方が解消されているため、`#1494` 側の validator（
+`validate_agy_fanout_e2e_evidence.py`）が実際の tool 呼び出し成功を正しく認識できる
+状態になっている。

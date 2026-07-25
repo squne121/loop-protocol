@@ -2521,6 +2521,12 @@ def _run_agy(
                     tmp_path,
                     hook_log_path=hook_log_path,
                     hook_context_path=hook_context_path,
+                    # Issue #1768: HOME is fully redirected to tmp_path in this isolated
+                    # branch (env["HOME"] == str(workspace_dir), set by
+                    # materialize_isolated_agy_workspace() above), so tmp_path is a safe,
+                    # fully isolated home_dir -- writing the canonical-path hooks.json
+                    # under it never touches the real host's global Antigravity settings.
+                    home_dir=tmp_path,
                 )
                 _agy_provenance.write_hook_context(
                     hook_context_path,
@@ -2782,21 +2788,140 @@ def _extract_grounded_research_output(stdout: str) -> dict[str, Any]:
     return {}
 
 
-def _build_agy_grounded_research_metadata(stdout: str) -> dict[str, Any]:
+# Issue #1768: real Google grounding-search citation redirect URLs. Only vertexaisearch's
+# own grounding-api-redirect host+path shape counts here -- a generic bare URL elsewhere in
+# stdout is NOT treated as citation evidence (Issue #1266 Blocker 1 remains in force). This
+# pattern is used only as a *citation* signal, combined with (never instead of) a validated
+# provenance hook event confirming the tool call itself (Issue #1708's stdout-is-never-
+# authoritative-alone design intent).
+_VERTEX_GROUNDING_CITATION_RE = re.compile(
+    r"https?://vertexaisearch\.cloud\.google\.com/grounding-api-redirect/[^\s\]\)\},<>']+"
+)
+
+
+def _extract_vertex_grounding_citation_urls(stdout: str) -> list[str]:
+    """Extract real Google grounding-search citation redirect URLs from *stdout*."""
+    if not stdout:
+        return []
+    seen: list[str] = []
+    for match in _VERTEX_GROUNDING_CITATION_RE.findall(stdout):
+        normalized = match.strip().rstrip(")]},.\"'")
+        if normalized and normalized not in seen:
+            seen.append(normalized)
+    return seen
+
+
+def _hook_event_confirms_tool_call(raw_event: Any) -> "str | None":
+    """Issue #1768: minimal, purpose-specific structural check for one hook event.
+
+    Returns the canonical tool name (lowercased) if *raw_event* is a well-formed
+    ``agy_tool_provenance_v1`` PreToolUse event for a canonical web tool, else ``None``.
+
+    Deliberately narrower than ``agy_tool_provenance.validate_provenance_event()``: that
+    stricter validator additionally requires non-empty ``parent_run_id`` /
+    ``subtask_id`` / ``attempt_id`` / ``tool_profile`` / ``transcript_sha256`` fan-out
+    correlation fields, which `_run_agy()`'s only real production caller
+    (``run_delegation()``) never populates for standalone (non-fan-out) grounded_research
+    calls -- it calls ``_run_agy(prompt_text, timeout_sec_agy)`` without a ``run_context``
+    argument at all, so those fields are legitimately empty strings in that (the common)
+    case. Requiring them here would make this evidence path silently inert for exactly
+    the calls Issue #1768 targets. This function instead checks only the fields that
+    prove "a real PreToolUse hook fired for a canonical web tool in this subprocess run":
+    schema/version/event identity, a canonical ``toolCall.name`` with a well-formed
+    ``args_sha256`` hash, a non-empty ``conversationId``, an integer ``monotonic_ns``, and
+    a well-formed ``utc`` timestamp. The stronger, cross-run correlation-id matching in
+    ``agy_tool_provenance.evaluate_websearch_provenance()`` / ``match_run_context()``
+    remains the authority for consumers that aggregate hook events across multiple runs
+    (e.g. ``build_fanout_evidence_bundle.py``), where those ids are always populated.
+    """
+    if not _AGY_PROVENANCE_AVAILABLE or not isinstance(raw_event, dict):
+        return None
+    if raw_event.get("schema") != _agy_provenance.SCHEMA_NAME:
+        return None
+    if raw_event.get("version") != _agy_provenance.SCHEMA_VERSION:
+        return None
+    if raw_event.get("event") != "PreToolUse":
+        return None
+    tool_call = raw_event.get("toolCall")
+    if not isinstance(tool_call, dict):
+        return None
+    name = tool_call.get("name")
+    if not isinstance(name, str):
+        return None
+    normalized_name = name.strip().lower()
+    if normalized_name not in _agy_provenance.CANONICAL_WEB_TOOL_NAMES:
+        return None
+    args_sha256 = tool_call.get("args_sha256")
+    if not isinstance(args_sha256, str) or not _agy_provenance._HEX64_RE.match(args_sha256):
+        return None
+    if not isinstance(raw_event.get("conversationId"), str) or not raw_event.get("conversationId"):
+        return None
+    monotonic_value = raw_event.get("monotonic_ns")
+    if not isinstance(monotonic_value, int):
+        return None
+    utc_value = raw_event.get("utc")
+    if not isinstance(utc_value, str) or not _agy_provenance._ISO_UTC_RE.match(utc_value):
+        return None
+    return normalized_name
+
+
+def _hook_events_confirm_web_tool_call(
+    hook_events: "list[dict[str, Any]] | None",
+) -> "tuple[bool, list[str]]":
+    """Issue #1768: authoritative check for a validated, canonical-name provenance hook event.
+
+    ``hook_events`` (``completed.agy_provenance_hook_events``, see ``_run_agy()``) is always
+    scoped to exactly the single subprocess call that produced it -- a fresh, per-run
+    isolated ``hook_events.jsonl`` under a temp workspace that is deleted immediately after
+    the subprocess exits -- so no additional run-context (conversationId / parent_run_id /
+    etc.) cross-checking is required here beyond per-event structural validation
+    (``_hook_event_confirms_tool_call()``); that stronger, cross-run-safe matching lives in
+    ``agy_tool_provenance.evaluate_websearch_provenance()`` / ``match_run_context()`` for
+    consumers that aggregate hook events across multiple runs (e.g.
+    ``build_fanout_evidence_bundle.py``). This function never trusts AGY's stdout
+    self-report -- only validated hook events count (Issue #1708's original design intent).
+    """
+    if not _AGY_PROVENANCE_AVAILABLE or not hook_events:
+        return False, []
+    validated_tool_names: list[str] = []
+    for raw_event in hook_events:
+        name = _hook_event_confirms_tool_call(raw_event)
+        if name is not None:
+            validated_tool_names.append(name)
+    return (len(validated_tool_names) > 0), validated_tool_names
+
+
+def _build_agy_grounded_research_metadata(
+    stdout: str,
+    *,
+    hook_events: "list[dict[str, Any]] | None" = None,
+) -> dict[str, Any]:
     """Build bounded AGY native WebSearch evidence metadata from stdout (fail-closed).
 
     Classification order:
     1. Redaction violations (secret / repo path / HOME path) -> agy_web_grounding_redaction_failed.
     2. Quota exhaustion signals -> agy_web_grounding_quota_exhausted.
-    3. No machine-verifiable web tool-call trace -> agy_web_grounding_tool_call_missing
-       (a bare URL string in stdout is weak evidence only and is never treated as a
-       WebSearch tool-call execution proof; `web_tool_call_count` is never inferred from a
-       URL count — see Issue #1266 Blocker 1).
+    3. No machine-verifiable web tool-call trace (neither a recognized stdout self-report
+       trace NOR a validated `agy_tool_provenance_v1` hook event) ->
+       agy_web_grounding_tool_call_missing (a bare URL string in stdout is weak evidence
+       only and is never treated as a WebSearch tool-call execution proof on its own —
+       see Issue #1266 Blocker 1).
     4. Tool-call trace present but no citation -> agy_web_grounding_no_citations.
     5. Tool-call trace + citation -> grounded (bounded to 1 citation / 1 tool call per the
        1 query / 1 URL quota contract).
+
+    Issue #1768: a *validated* `agy_tool_provenance_v1` hook event (see
+    `_hook_events_confirm_web_tool_call()`) is now an authoritative, additional source of
+    "a web tool call happened" evidence, independent of whether AGY's stdout self-report
+    contains a structured `tool_calls` JSON trace. Live investigation showed real,
+    successful `search_web` calls whose stdout response was plain prose with no self-report
+    JSON at all -- previously these were always misclassified as
+    `attempted_no_web_tool_call` even though the tool call genuinely happened and a
+    validated hook event proved it. Hallucination cases (no validated hook event, stdout-
+    only claims) remain fail-closed and unaffected by this change.
     """
     stdout = stdout or ""
+    hook_validated, _hook_tool_names = _hook_events_confirm_web_tool_call(hook_events)
     redacted_excerpt = _redact_text(stdout)[:500]
     excerpt_sha256 = hashlib.sha256(redacted_excerpt.encode("utf-8")).hexdigest()
     transcript_evidence = [
@@ -2856,8 +2981,9 @@ def _build_agy_grounded_research_metadata(stdout: str) -> dict[str, Any]:
 
     parsed = _extract_grounded_research_output(stdout)
     tool_calls = _extract_recognized_tool_calls(parsed)
+    tool_call_confirmed = bool(tool_calls) or hook_validated
 
-    if not tool_calls:
+    if not tool_call_confirmed:
         return _fail_closed(
             grounding_status="attempted_no_web_tool_call",
             grounding_backend="none",
@@ -2866,10 +2992,19 @@ def _build_agy_grounded_research_metadata(stdout: str) -> dict[str, Any]:
         )
 
     structured_citations = _extract_structured_citations(parsed)
+    if not structured_citations and hook_validated:
+        # Issue #1768: when the tool-call evidence comes from a validated hook event
+        # rather than a stdout self-report structured trace, also accept a real Google
+        # grounding-search citation redirect URL scraped from stdout as citation
+        # evidence (the Outcome's suggested "combine URL pattern + hook event" fallback).
+        # A bare/generic URL is still never accepted here — only the vertexaisearch
+        # grounding-api-redirect shape counts (Issue #1266 Blocker 1 remains in force).
+        vertex_urls = _extract_vertex_grounding_citation_urls(stdout)
+        structured_citations = [{"url": url, "title": None} for url in vertex_urls]
     # Bounded to 1 citation / 1 tool call (Issue #1266 quota-bound contract: 1 query / 1 URL).
     citation_evidence = structured_citations[:1]
     url_citation_count = len(citation_evidence)
-    web_tool_call_count = min(len(tool_calls), 1)
+    web_tool_call_count = 1 if tool_call_confirmed else 0
 
     if url_citation_count > 0:
         grounding_status = "grounded"
@@ -3018,7 +3153,10 @@ def _normalize_agy_result(
         }
 
     grounded_research_evidence = (
-        _build_agy_grounded_research_metadata(completed.stdout or "")
+        _build_agy_grounded_research_metadata(
+            completed.stdout or "",
+            hook_events=agy_provenance_hook_events,
+        )
         if tool_profile == GROUNDED_RESEARCH_PROFILE
         else None
     )
