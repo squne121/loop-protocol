@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import datetime
 import hashlib
 import importlib.util
 import json
@@ -59,6 +60,31 @@ from typing import Any, Callable, Mapping
 
 FANOUT_REQUEST_SCHEMA = "delegation_fanout_request_v1"
 FANOUT_RESULT_SCHEMA = "delegation_fanout_result_v1"
+
+# ---------------------------------------------------------------------------
+# Process lifecycle telemetry (Issue #1707 -- review Blocker 2 replacement
+# for the previous subtask_started-event-order-only parallelism claim).
+# ---------------------------------------------------------------------------
+
+# journal event schema for process-start / process-exit records emitted by
+# make_subprocess_runner(). Distinct from FANOUT_RESULT_SCHEMA / the existing
+# subtask_started / subtask_finished audit-correlation events -- this is a
+# purely additive journal event, the public request/result schemas are
+# unchanged.
+PROCESS_LIFECYCLE_SCHEMA = "process_lifecycle_event_v1"
+
+# process_role distinguishes the run_gemini_headless.py wrapper subprocess
+# that make_subprocess_runner() spawns (delegation_wrapper) from the actual
+# provider CLI process it may invoke internally (provider_cli, e.g. the
+# `agy` binary). Issue #1707 implements delegation_wrapper telemetry only:
+# run_gemini_headless.py itself spawns the `agy` CLI via subprocess.run()
+# internally (see _run_agy()), and that spawn point is outside this Issue's
+# Allowed Paths (scripts/run_gemini_headless.py), so provider_cli events are
+# not emitted by this module yet -- see the Issue #1707 "Remaining Parent
+# Gaps" / Stop Conditions for the deferred follow-up. The constants are
+# still exposed so overlap/validator logic never hard-codes a single role.
+PROCESS_ROLE_DELEGATION_WRAPPER = "delegation_wrapper"
+PROCESS_ROLE_PROVIDER_CLI = "provider_cli"
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _RUN_GEMINI_HEADLESS_PATH = _SCRIPT_DIR / "run_gemini_headless.py"
@@ -515,6 +541,13 @@ class RunnerContext:
     run_dir: Path
     audit_log_path: Path | None
     cancel_event: threading.Event
+    # Issue #1707: optional sink for process lifecycle telemetry events
+    # (schema PROCESS_LIFECYCLE_SCHEMA). Defaults to None so existing callers
+    # that construct a RunnerContext directly (tests, other integrations)
+    # keep working unchanged -- when None, make_subprocess_runner() simply
+    # does not emit lifecycle events. run_fanout() always wires this to its
+    # single-writer ``_journal`` closure.
+    journal: Callable[[dict[str, Any]], None] | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _processes: dict[str, subprocess.Popen] = field(default_factory=dict)
 
@@ -574,6 +607,73 @@ def _write_ndjson_record(fd: int, line: bytes, journal_path: Path) -> None:
         raise OSError(f"partial NDJSON journal write: wrote {written} of {len(line)} bytes to {journal_path}")
 
 
+def _utc_now_iso() -> str:
+    """Timezone-aware UTC ISO-8601 timestamp for process lifecycle events.
+
+    Wall-clock only (human-readable correlation); overlap detection itself
+    uses the monotonic clock fields (``*_monotonic_ns``), never this value.
+    """
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _public_safe_executable_identity(path: str | Path) -> str:
+    """Redact an executable path to a public-safe identity (Issue #1707 AC10).
+
+    Process lifecycle events are written to the run's NDJSON journal, which
+    may end up in artifacts/logs read outside the local machine's trust
+    boundary -- so the ``executable`` field must never leak the local
+    filesystem's absolute path layout (home directory names, worktree
+    paths, etc). basename is deterministic, sufficient to identify *what*
+    ran, and carries no local-path information.
+    """
+    return os.path.basename(str(path)) or "unknown"
+
+
+def _classify_termination_reason(returncode: int | None, *, timed_out: bool) -> str:
+    """Classify how a reaped child process ended (Issue #1707 AC3/AC6).
+
+    Negative POSIX returncodes are classified by signal number regardless
+    of which code path observed the timeout locally: ``run_fanout()``'s
+    deadline watcher thread (``ctx.terminate_all()``) and this runner's own
+    cancel_event poll loop both call ``_terminate_process_group()`` against
+    the *same* registered process, so either one may win the race to
+    SIGTERM/SIGKILL and reap it -- the resulting returncode is what matters,
+    not which thread observed it first. ``timed_out`` (this runner's own
+    local observation of ``ctx.cancel_event``) is only used as a fallback
+    label for the rare case of a non-negative returncode reaped after a
+    timeout was observed.
+    """
+    if returncode is None:
+        return "unknown_not_reaped"
+    if returncode == 0:
+        return "exited_normally"
+    if returncode < 0:
+        try:
+            sig = signal.Signals(-returncode)
+        except ValueError:
+            return f"signal_{-returncode}"
+        if sig == signal.SIGTERM:
+            return "sigterm"
+        if sig == signal.SIGKILL:
+            return "sigkill"
+        return f"signal_{sig.name.lower()}"
+    if timed_out:
+        return "timeout_terminated"
+    return "exited_nonzero"
+
+
+def _emit_process_lifecycle_event(ctx: RunnerContext, event_name: str, fields: Mapping[str, Any]) -> None:
+    """Write one process lifecycle event through ``ctx.journal`` (Issue #1707
+    AC1/AC2). No-op when ``ctx.journal`` is unset (e.g. tests that construct
+    a bare RunnerContext without wiring a journal sink).
+    """
+    if ctx.journal is None:
+        return
+    record: dict[str, Any] = {"schema": PROCESS_LIFECYCLE_SCHEMA, "event": event_name}
+    record.update(fields)
+    ctx.journal(record)
+
+
 def _synthetic_failure_result(request: Mapping[str, Any], failure_class: str, failure_reason: str) -> dict:
     return {
         "schema": "delegation_result/v1",
@@ -622,21 +722,69 @@ def make_subprocess_runner(script_path: Path, python_executable: str | None = No
         if ctx.audit_log_path is not None:
             argv.extend(["--audit-log", str(ctx.audit_log_path)])
 
+        # Issue #1707: correlation fields shared by both the process-start
+        # and process-exit lifecycle events for this spawn. Pulled from
+        # job.request (stamped by run_fanout()._run_one()) with defensive
+        # .get() fallbacks so a bare RunnerContext/ChildJob built directly by
+        # a test (without going through run_fanout()) never raises here.
+        process_role = PROCESS_ROLE_DELEGATION_WRAPPER
+        provider = str(job.request.get("provider") or "unknown")
+        parent_run_id = job.request.get("parent_run_id")
+        subtask_id = job.subtask_id
+        attempt_id = job.request.get("attempt_id")
+        artifact_stem = job.artifact_stem
+        executable_identity = _public_safe_executable_identity(script_path)
+
         try:
             proc = subprocess.Popen(  # noqa: S603
                 argv, cwd=str(ctx.run_dir), start_new_session=True
             )
         except OSError as exc:
+            # Issue #1707 AC1: spawn failure must never be recorded as
+            # started -- no process-start event is emitted on this path.
             return _synthetic_failure_result(job.request, "child_spawn_failed", str(exc))
 
+        started_monotonic_ns = time.monotonic_ns()
+        started_utc = _utc_now_iso()
+        pid = proc.pid
+        try:
+            pgid = os.getpgid(pid)
+        except (ProcessLookupError, OSError):
+            pgid = None
+
+        _emit_process_lifecycle_event(
+            ctx,
+            "process_start",
+            {
+                "process_role": process_role,
+                "provider": provider,
+                "parent_run_id": parent_run_id,
+                "subtask_id": subtask_id,
+                "attempt_id": attempt_id,
+                "artifact_stem": artifact_stem,
+                "pid": pid,
+                "pgid": pgid,
+                "executable": executable_identity,
+                "started_monotonic_ns": started_monotonic_ns,
+                "started_utc": started_utc,
+            },
+        )
+
         ctx.register_process(job.artifact_stem, proc)
+        timed_out = False
         try:
             while True:
                 if ctx.cancel_event.is_set():
+                    timed_out = True
                     _terminate_process_group(proc, _CHILD_TERMINATE_GRACE_SEC)
-                    return _synthetic_failure_result(
-                        job.request, "overall_timeout_terminated", "terminated due to overall_timeout_sec"
-                    )
+                    # _terminate_process_group() only signals -- reap here so
+                    # proc.returncode / the exit event reflect the real
+                    # outcome (SIGTERM success vs SIGKILL escalation).
+                    try:
+                        proc.wait(timeout=_CHILD_TERMINATE_GRACE_SEC + 2.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    break
                 try:
                     proc.wait(timeout=_CHILD_POLL_INTERVAL_SEC)
                     break
@@ -644,6 +792,38 @@ def make_subprocess_runner(script_path: Path, python_executable: str | None = No
                     continue
         finally:
             ctx.unregister_process(job.artifact_stem)
+
+        exited_monotonic_ns = time.monotonic_ns()
+        exited_utc = _utc_now_iso()
+        returncode = proc.returncode
+        termination_reason = _classify_termination_reason(returncode, timed_out=timed_out)
+
+        # Issue #1707 AC2: process-exit event recorded once, right after
+        # reap, regardless of which branch above detected the exit.
+        _emit_process_lifecycle_event(
+            ctx,
+            "process_exit",
+            {
+                "process_role": process_role,
+                "provider": provider,
+                "parent_run_id": parent_run_id,
+                "subtask_id": subtask_id,
+                "attempt_id": attempt_id,
+                "artifact_stem": artifact_stem,
+                "pid": pid,
+                "pgid": pgid,
+                "executable": executable_identity,
+                "exited_monotonic_ns": exited_monotonic_ns,
+                "exited_utc": exited_utc,
+                "returncode": returncode,
+                "termination_reason": termination_reason,
+            },
+        )
+
+        if timed_out:
+            return _synthetic_failure_result(
+                job.request, "overall_timeout_terminated", "terminated due to overall_timeout_sec"
+            )
 
         if ctx.cancel_event.is_set():
             # Raced with the deadline: the child finished, but too late to be
@@ -663,6 +843,125 @@ def make_subprocess_runner(script_path: Path, python_executable: str | None = No
         return data
 
     return _runner
+
+
+# ---------------------------------------------------------------------------
+# Process lifecycle event pairing + overlap validator (Issue #1707 AC4-AC6)
+# ---------------------------------------------------------------------------
+
+
+def build_process_lifecycle_pairs(events: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Pair ``process_start`` / ``process_exit`` journal events by
+    ``artifact_stem`` into complete lifecycle intervals.
+
+    Only ``PROCESS_LIFECYCLE_SCHEMA`` events are considered (the existing
+    ``subtask_started`` / ``subtask_finished`` audit-correlation events, and
+    anything malformed, are ignored). ``artifact_stem`` is the pairing key
+    because it is the orchestrator-generated, per-spawn-unique registry key
+    (never reused within a run -- unlike ``pid``, which the OS can recycle).
+
+    A start event with no matching exit event (crash, truncated journal,
+    process still running when the journal was read) -- or an exit event
+    with no matching start (malformed/out-of-order journal) -- is dropped
+    rather than raising (Issue #1707 AC8g: the validator must handle
+    malformed/missing exit events safely, not crash).
+    """
+    starts: dict[str, dict[str, Any]] = {}
+    pairs: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, Mapping):
+            continue
+        if event.get("schema") != PROCESS_LIFECYCLE_SCHEMA:
+            continue
+        stem = event.get("artifact_stem")
+        if not isinstance(stem, str) or not stem:
+            continue
+        kind = event.get("event")
+        if kind == "process_start":
+            if isinstance(event.get("started_monotonic_ns"), int):
+                starts[stem] = dict(event)
+            continue
+        if kind == "process_exit":
+            start = starts.pop(stem, None)
+            if start is None:
+                continue
+            if not isinstance(event.get("exited_monotonic_ns"), int):
+                continue
+            merged = dict(start)
+            merged.update({k: v for k, v in event.items() if k not in ("event", "schema")})
+            pairs.append(merged)
+    return pairs
+
+
+def process_lifecycle_intervals_overlap(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
+    """Pure overlap predicate for two process lifecycle intervals (Issue
+    #1707 AC4): the intervals ``[started_monotonic_ns, exited_monotonic_ns)``
+    overlap iff the later of the two starts is strictly before the earlier
+    of the two ends.
+    """
+    return max(a["started_monotonic_ns"], b["started_monotonic_ns"]) < min(
+        a["exited_monotonic_ns"], b["exited_monotonic_ns"]
+    )
+
+
+def actual_provider_process_overlap(pairs: list[Mapping[str, Any]]) -> bool:
+    """Return True iff at least one pair of *distinct-pid, distinct-subtask*
+    process lifecycle intervals actually overlapped in wall/monotonic time
+    (Issue #1707 AC5).
+
+    Same-``subtask_id`` intervals (e.g. a wrapper process and a future
+    provider_cli process for the same subtask) and same-``pid`` intervals
+    (PID reuse across two spawns) are never treated as evidence of parallel
+    execution on their own -- only overlap between two genuinely distinct
+    process identities/subtasks counts.
+    """
+    n = len(pairs)
+    for i in range(n):
+        a = pairs[i]
+        a_pid = a.get("pid")
+        a_subtask = a.get("subtask_id")
+        for j in range(i + 1, n):
+            b = pairs[j]
+            if a_pid is not None and a_pid == b.get("pid"):
+                continue
+            if a_subtask is not None and a_subtask == b.get("subtask_id"):
+                continue
+            if process_lifecycle_intervals_overlap(a, b):
+                return True
+    return False
+
+
+def validate_fanout_parallelism(events: list[Mapping[str, Any]]) -> dict[str, Any]:
+    """Replace the previous ``subtask_started``-event-order-only parallelism
+    claim (Issue #1707 review Blocker 2) with a validator grounded in actual
+    process lifecycle telemetry.
+
+    Journal-append ordering of ``subtask_started`` events across threads
+    does not guarantee wall-clock overlap (thread scheduling can interleave
+    log lines for subtasks that never actually ran concurrently), so a FAIL
+    is returned whenever multiple ``subtask_started`` events are present but
+    ``actual_provider_process_overlap()`` cannot confirm real process
+    overlap from the paired lifecycle events (Issue #1707 AC6).
+    """
+    subtask_started_count = sum(
+        1 for event in events if isinstance(event, Mapping) and event.get("event") == "subtask_started"
+    )
+    pairs = build_process_lifecycle_pairs(events)
+    overlap = actual_provider_process_overlap(pairs)
+
+    if subtask_started_count <= 1:
+        status = "not_applicable"
+    elif overlap:
+        status = "pass"
+    else:
+        status = "fail"
+
+    return {
+        "status": status,
+        "actual_provider_process_overlap": overlap,
+        "subtask_started_count": subtask_started_count,
+        "process_lifecycle_pair_count": len(pairs),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -788,7 +1087,9 @@ def run_fanout(
                 os.close(fd)
 
     cancel_event = threading.Event()
-    ctx = RunnerContext(run_dir=run_dir, audit_log_path=audit_log_path, cancel_event=cancel_event)
+    ctx = RunnerContext(
+        run_dir=run_dir, audit_log_path=audit_log_path, cancel_event=cancel_event, journal=_journal
+    )
     all_done_event = threading.Event()
 
     def _watch_deadline() -> None:
