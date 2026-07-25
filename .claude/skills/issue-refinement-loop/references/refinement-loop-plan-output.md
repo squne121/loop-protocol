@@ -212,7 +212,7 @@
 
 `scope_signal_guard_decision_v2` は任意 object ではなく、`raw_signal` / `scope_context` / `scope_delta_approval` / `security_sensitive` / `route` を必須とする strict schema です。`scope_delta_authority` を含む場合も nested object は `additionalProperties: false` で拘束され、unknown enum や欠落 field は schema validation で reject されます。
 
-## `issue_execution_decision` (`ISSUE_EXECUTION_DECISION_V1`)（#1677）
+## `issue_execution_decision`（`ISSUE_EXECUTION_DECISION_V1`、Issue #1677 で追加）
 
 plan 出力の `issue_execution_decision` は `ISSUE_EXECUTION_DECISION_V1`（`schemas/issue_execution_decision_v1.schema.json`）の versioned relation graph です。`identity` / `nodes` / `relations`（`relation_type`: `depends_on` / `duplicate` / `absorb` / `supersedes` / `coordinates`）/ `execution`（`state`: `selected` / `deferred` / `blocked` / `duplicate`、`predecessors`、`defer_reason`）/ `downstream_policy` / `completeness` を持ちます。`known_context.scope_rollup_result`（`run_refinement_preflight.py` が `ISSUE_SCOPE_ROLLUP_PLAN_V2` artifact から結合）が与えられない場合は、対象 Issue 単独の `selected` 最小形を返します。cross-field invariant（順序・一意性・endpoint・cycle・state semantics）は `plan_refinement_loop.validate_issue_execution_decision()` が検証し、違反時は `execution.state: deferred` に自己修復されます。詳細な downstream handoff 契約は `SKILL.md` の「ISSUE_EXECUTION_DECISION_V1 ハンドオフ契約」節を参照してください。
 
