@@ -248,7 +248,7 @@ Issue #1758 の live 検証により、Finding 1（`toolPermission` isolated wor
    「検索する価値のある具体的事実」を要求する形になっているか（`antigravity.google` の
    ような検索不能な対象を尋ねる prompt は避ける）、および (b) 後述の hook provenance
    capture の未解決ギャップ、の両方を疑うべきである。
-3. **新規 follow-up Issue で扱うべき事項（本 Issue のスコープ外、`agy_tool_provenance.py`
+3. **follow-up Issue #1768 で扱うべき事項（本 Issue のスコープ外、`agy_tool_provenance.py`
    が Allowed Paths 外のため）**: 実際に search_web / read_url_content が呼ばれた
    ケース（本ドキュメントの #3/#4 で確認済み）でも `agy_provenance_hook_events` が常に
    空になる問題。hooks.json のパス・イベント名自体は公式ドキュメントと一致することを
