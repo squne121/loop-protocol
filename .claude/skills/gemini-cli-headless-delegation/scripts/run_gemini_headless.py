@@ -401,6 +401,18 @@ TARGETED_EVIDENCE_MAX_LINES_PER_TARGET = 400
 TARGETED_EVIDENCE_MAX_BYTES_PER_TARGET = 200_000
 TARGETED_EVIDENCE_MAX_TOTAL_BYTES = 600_000
 TARGETED_EVIDENCE_ALLOWED_SELECTOR_KINDS = frozenset({"line_range"})
+
+# Issue #1706: fan-out local_asset_research Serena evidence hash chain /
+# actor vocabulary. `wrapper_serena_mcp` is the retrieval actor (the
+# read-only Serena evidence collector living in this wrapper process);
+# `antigravity_cli` is the analysis actor (the AGY subprocess that only ever
+# receives a redacted prompt envelope, never direct Serena/MCP access).
+RETRIEVAL_ACTOR_WRAPPER_SERENA_MCP = "wrapper_serena_mcp"
+ANALYSIS_ACTOR_ANTIGRAVITY_CLI = "antigravity_cli"
+AGY_DIRECT_MCP_ACCESS = False
+# Minimum length for an objective token to count toward the deterministic
+# objective/evidence relevance check (Issue #1706 AC8).
+_OBJECTIVE_RELEVANCE_MIN_TOKEN_LEN = 4
 SERENA_TOOL_MANIFEST_RELATIVE_PATH = Path(
     ".claude/skills/gemini-cli-headless-delegation/references/serena-tool-manifest.json"
 )
@@ -1455,6 +1467,231 @@ def _collect_targeted_source_evidence(
     return envelopes, errors
 
 
+def _hash_objective(objective: Any) -> str | None:
+    """Hash the request's objective string (Issue #1706 AC2).
+
+    Returns ``None`` when the objective is missing/blank so callers can
+    distinguish "no objective supplied" from a deterministic hash of an
+    actual objective.
+    """
+    if not isinstance(objective, str) or not objective.strip():
+        return None
+    return _sha256_stable_json(objective)
+
+
+def _build_target_contract(validated_targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Canonical (order-preserving) target contract used for hashing (Issue
+    #1706 AC2): repo-relative path + selector only -- no absolute paths, no
+    file content."""
+    return [
+        {"repo_relative_path": target["repo_relative_path"], "selector": target["selector"]}
+        for target in validated_targets
+    ]
+
+
+def _hash_target_contract(validated_targets: list[dict[str, Any]]) -> str:
+    """Hash the target contract (Issue #1706 AC2): identical target lists
+    always hash identically (deterministic canonical JSON)."""
+    return _sha256_stable_json(_build_target_contract(validated_targets))
+
+
+def _hash_request_for_chain(request: Mapping[str, Any]) -> str:
+    """Hash the full inbound delegation request (Issue #1706 AC6
+    ``request_sha256``)."""
+    return _sha256_stable_json(dict(request))
+
+
+def _args_sha256(arguments: Mapping[str, Any]) -> str:
+    return _sha256_stable_json(dict(arguments))
+
+
+def _derive_serena_selector_calls(
+    validated_targets: list[dict[str, Any]],
+    evidence_envelopes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Derive Serena ``tools/call`` identities from the objective's
+    targeted-evidence contract (Issue #1706 AC1) instead of the legacy fixed
+    smoke-query probe (``find_file`` -> ``search_for_pattern`` hardcoded to
+    the literal ``"local_asset_research"`` -> ``get_symbols_overview``).
+
+    Each validated target contributes a ``find_file`` / ``search_for_pattern``
+    / ``get_symbols_overview`` triple scoped to that target's repo-relative
+    path, with the ``search_for_pattern`` substring derived from the actual
+    selected evidence text (never a fixed literal), so the resulting calls
+    are unique to the subtask's objective-driven selector.
+    """
+    envelope_by_path = {envelope["repo_relative_path"]: envelope for envelope in evidence_envelopes}
+    calls: list[dict[str, Any]] = []
+    for target in validated_targets:
+        repo_relative_path = target["repo_relative_path"]
+        envelope = envelope_by_path.get(repo_relative_path)
+        content = envelope["content"] if envelope is not None else ""
+        first_line = next(
+            (line.strip() for line in content.splitlines() if line.strip()),
+            repo_relative_path,
+        )
+        pattern = first_line[:200]
+        file_name = Path(repo_relative_path).name
+        parent_dir = Path(repo_relative_path).parent.as_posix()
+        calls.append({
+            "tool_name": "find_file",
+            "arguments": {"relative_path": parent_dir, "file_mask": file_name},
+            "repo_relative_path": repo_relative_path,
+        })
+        calls.append({
+            "tool_name": "search_for_pattern",
+            "arguments": {"relative_path": parent_dir, "substring_pattern": pattern},
+            "repo_relative_path": repo_relative_path,
+        })
+        calls.append({
+            "tool_name": "get_symbols_overview",
+            "arguments": {"relative_path": repo_relative_path},
+            "repo_relative_path": repo_relative_path,
+        })
+    return calls
+
+
+def _build_serena_evidence_records(
+    validated_targets: list[dict[str, Any]],
+    evidence_envelopes: list[dict[str, Any]],
+    manifest: Mapping[str, Any],
+    correlation: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Build fully-provenanced task-linked Serena evidence records (Issue
+    #1706 AC6): retrieval actor, fan-out correlation ids, tool identity,
+    ``args_sha256``, ``is_error``, Serena pinned ref/manifest id, and
+    repo-relative provenance -- for tool calls derived from the objective's
+    targeted-evidence contract (never a fixed smoke query).
+    """
+    calls = _derive_serena_selector_calls(validated_targets, evidence_envelopes)
+    envelope_by_path = {envelope["repo_relative_path"]: envelope for envelope in evidence_envelopes}
+    manifest_id = _serena_manifest_id(manifest)
+    records: list[dict[str, Any]] = []
+    for call in calls:
+        envelope = envelope_by_path[call["repo_relative_path"]]
+        records.append({
+            "actor": RETRIEVAL_ACTOR_WRAPPER_SERENA_MCP,
+            "parent_run_id": correlation.get("parent_run_id"),
+            "subtask_id": correlation.get("subtask_id"),
+            "attempt_id": correlation.get("attempt_id"),
+            "tool_name": call["tool_name"],
+            "args_sha256": _args_sha256(call["arguments"]),
+            "is_error": False,
+            "repo_relative_path": call["repo_relative_path"],
+            "selector": envelope["selector"],
+            "line_range": envelope["line_range"],
+            "content_sha256": envelope["sha256"],
+            "source_kind": envelope["source_kind"],
+            "serena_pinned_ref": manifest.get("pinned_ref"),
+            "serena_manifest_id": manifest_id,
+        })
+    return records
+
+
+def _hash_evidence(evidence_records: list[dict[str, Any]]) -> str:
+    """Hash the full ordered evidence-record set as canonical JSON (Issue
+    #1706 AC3): mutating even a single byte of any record's content changes
+    ``evidence_sha256`` (tamper detection)."""
+    return _sha256_stable_json(evidence_records)
+
+
+def _hash_prompt_envelope(
+    evidence_sha256: str,
+    objective_sha256: str | None,
+    target_contract_sha256: str,
+    tool_profile: str,
+) -> str:
+    """Deterministically derive the AGY prompt envelope hash from the
+    evidence hash (Issue #1706 AC4): identical ``evidence_sha256`` (+
+    identical objective/target-contract hashes and tool_profile) always
+    yields the same ``prompt_envelope_sha256``.
+    """
+    return _sha256_stable_json({
+        "evidence_sha256": evidence_sha256,
+        "objective_sha256": objective_sha256,
+        "target_contract_sha256": target_contract_sha256,
+        "tool_profile": tool_profile,
+    })
+
+
+def _hash_result_binding(evidence_sha256: str, prompt_envelope_sha256: str) -> str:
+    """Deterministically derive the child-result binding hash (Issue #1706
+    AC5) from ``evidence_sha256`` + ``prompt_envelope_sha256``, so tampering
+    with either input changes ``result_binding_sha256``.
+    """
+    return _sha256_stable_json({
+        "evidence_sha256": evidence_sha256,
+        "prompt_envelope_sha256": prompt_envelope_sha256,
+    })
+
+
+def verify_serena_hash_chain(record: Mapping[str, Any]) -> bool:
+    """Independently recompute ``prompt_envelope_sha256`` /
+    ``result_binding_sha256`` from ``evidence_sha256`` and compare against
+    the stored values (Issue #1706 AC5/AC8 tamper detection). Returns
+    ``False`` on any mismatch or malformed input -- fail-closed, never
+    raises.
+    """
+    try:
+        evidence_sha256 = record["evidence_sha256"]
+        target_contract_sha256 = record["target_contract_sha256"]
+        objective_sha256 = record.get("objective_sha256")
+        tool_profile = record.get("tool_profile")
+        prompt_envelope_sha256 = record["prompt_envelope_sha256"]
+        result_binding_sha256 = record["result_binding_sha256"]
+    except (KeyError, TypeError):
+        return False
+    if not isinstance(evidence_sha256, str) or not isinstance(target_contract_sha256, str):
+        return False
+    expected_prompt_envelope_sha256 = _hash_prompt_envelope(
+        evidence_sha256, objective_sha256, target_contract_sha256, str(tool_profile)
+    )
+    if expected_prompt_envelope_sha256 != prompt_envelope_sha256:
+        return False
+    expected_result_binding_sha256 = _hash_result_binding(evidence_sha256, expected_prompt_envelope_sha256)
+    return expected_result_binding_sha256 == result_binding_sha256
+
+
+def _objective_relevance_tokens(objective: str) -> list[str]:
+    return [
+        token
+        for token in re.findall(r"[A-Za-z0-9_]+", objective.lower())
+        if len(token) >= _OBJECTIVE_RELEVANCE_MIN_TOKEN_LEN
+    ]
+
+
+def _evidence_matches_objective(objective: Any, evidence_envelopes: list[dict[str, Any]]) -> bool:
+    """Deterministic fail-close relevance check (Issue #1706 AC8): the
+    objective must contribute at least one non-trivial token that appears
+    (case-insensitively) in either the repo-relative path or the retrieved
+    content of at least one evidence envelope. A missing/blank objective, or
+    an objective with no overlapping token, is treated as "evidence
+    irrelevant to the subtask objective" and fails closed.
+    """
+    if not isinstance(objective, str) or not objective.strip():
+        return False
+    tokens = _objective_relevance_tokens(objective)
+    if not tokens:
+        return False
+    haystacks = [
+        f"{envelope.get('repo_relative_path', '')}\n{envelope.get('content', '')}".lower()
+        for envelope in evidence_envelopes
+    ]
+    return any(token in haystack for token in tokens for haystack in haystacks)
+
+
+def _is_fanout_correlated_request(request: Mapping[str, Any]) -> bool:
+    """True when the request carries at least one non-empty fan-out
+    correlation id (``parent_run_id`` / ``subtask_id`` / ``attempt_id``),
+    i.e. it was stamped by ``fan_out_orchestrator.run_fanout()`` rather than
+    invoked as a standalone single-shot delegation request (Issue #1706).
+    """
+    return any(
+        isinstance(request.get(key), str) and request.get(key, "").strip()
+        for key in ("parent_run_id", "subtask_id", "attempt_id")
+    )
+
+
 def _validate_agy_targeted_evidence_request(
     request: Mapping[str, Any], request_path: Path | None = None
 ) -> list[str]:
@@ -1463,6 +1700,12 @@ def _validate_agy_targeted_evidence_request(
     repo-boundary and symlink checks, then bounded evidence collection so
     missing/empty/oversized/credential-like target evidence is rejected
     before AGY ever launches.
+
+    Issue #1706: for fan-out-correlated requests (``parent_run_id`` /
+    ``subtask_id`` / ``attempt_id`` present), also fail-closes when the
+    collected evidence has no deterministic overlap with the subtask
+    ``objective`` -- evidence must be demonstrably task-linked, not just
+    schema-valid, before an AGY subprocess is ever launched.
     """
     errors: list[str] = []
     repo_root = _repo_root().resolve()
@@ -1473,8 +1716,17 @@ def _validate_agy_targeted_evidence_request(
     if target_errors:
         return errors
     errors.extend(_validate_local_asset_research_settings())
-    _, evidence_errors = _collect_targeted_source_evidence(validated_targets, repo_root)
+    evidence_envelopes, evidence_errors = _collect_targeted_source_evidence(validated_targets, repo_root)
     errors.extend(evidence_errors)
+    if evidence_errors:
+        return errors
+    if _is_fanout_correlated_request(request) and not _evidence_matches_objective(
+        request.get("objective"), evidence_envelopes
+    ):
+        errors.append(
+            "local_asset_research task-linked evidence is unrelated to the subtask objective "
+            "(evidence_sha256 chain rejected: no deterministic objective/evidence overlap)"
+        )
     return errors
 
 
@@ -3906,6 +4158,11 @@ def _run_delegation_core(
             }
         # local_asset_research uses wrapper-side Serena evidence + prompt injection.
         local_asset_retrieval_metadata: dict[str, Any] | None = None
+        # Issue #1706: set only for fan-out-correlated targeted-evidence
+        # requests; injected into the AGY prompt envelope below so
+        # prompt_envelope_sha256 is machine-verifiable from the actual text
+        # sent to AGY (AC4), not just carried in out-of-band metadata.
+        prompt_envelope_sha256_for_injection: str | None = None
         if tool_profile == LOCAL_ASSET_RESEARCH_PROFILE:
             repo_root = _repo_root().resolve()
             if isinstance(request.get("evidence_targets"), list):
@@ -3981,6 +4238,54 @@ def _run_delegation_core(
                     "evidence_record_count": len(evidence_envelopes),
                     "failure_class": None,
                 }
+                # Issue #1706: fan-out task-linked Serena evidence hash chain
+                # / correlation. Scoped to requests actually stamped by
+                # fan_out_orchestrator.run_fanout() (parent_run_id /
+                # subtask_id / attempt_id present) so standalone #1638
+                # targeted-evidence callers (no fan-out context, no Serena
+                # tool manifest guaranteed on disk) are completely
+                # unaffected -- this never runs on the #1638 regression path.
+                if _is_fanout_correlated_request(request):
+                    manifest = load_serena_tool_manifest(repo_root)
+                    correlation = {
+                        "parent_run_id": request.get("parent_run_id"),
+                        "subtask_id": request.get("subtask_id"),
+                        "attempt_id": request.get("attempt_id"),
+                    }
+                    serena_evidence_records = _build_serena_evidence_records(
+                        validated_evidence_targets, evidence_envelopes, manifest, correlation
+                    )
+                    objective_sha256 = _hash_objective(request.get("objective"))
+                    target_contract_sha256 = _hash_target_contract(validated_evidence_targets)
+                    request_sha256 = _hash_request_for_chain(request)
+                    evidence_sha256 = _hash_evidence(serena_evidence_records)
+                    prompt_envelope_sha256 = _hash_prompt_envelope(
+                        evidence_sha256,
+                        objective_sha256,
+                        target_contract_sha256,
+                        LOCAL_ASSET_RESEARCH_PROFILE,
+                    )
+                    result_binding_sha256 = _hash_result_binding(evidence_sha256, prompt_envelope_sha256)
+                    prompt_envelope_sha256_for_injection = prompt_envelope_sha256
+                    local_asset_retrieval_metadata = {
+                        **local_asset_retrieval_metadata,
+                        "actor": RETRIEVAL_ACTOR_WRAPPER_SERENA_MCP,
+                        "retrieval_actor": RETRIEVAL_ACTOR_WRAPPER_SERENA_MCP,
+                        "analysis_actor": ANALYSIS_ACTOR_ANTIGRAVITY_CLI,
+                        "agy_direct_mcp_access": AGY_DIRECT_MCP_ACCESS,
+                        "parent_run_id": correlation["parent_run_id"],
+                        "subtask_id": correlation["subtask_id"],
+                        "attempt_id": correlation["attempt_id"],
+                        "request_sha256": request_sha256,
+                        "objective_sha256": objective_sha256,
+                        "target_contract_sha256": target_contract_sha256,
+                        "evidence_sha256": evidence_sha256,
+                        "prompt_envelope_sha256": prompt_envelope_sha256,
+                        "result_binding_sha256": result_binding_sha256,
+                        "serena_pinned_ref": manifest.get("pinned_ref"),
+                        "serena_manifest_id": _serena_manifest_id(manifest),
+                        "serena_evidence_records": serena_evidence_records,
+                    }
             else:
                 _, context_paths = _validate_local_asset_context_files(
                     request.get("context_files", []),
@@ -4055,6 +4360,18 @@ def _run_delegation_core(
             prompt_hint = str(request.get("prompt") or "").strip()
             if prompt_hint:
                 prompt_text = f"{prompt_text}\n\nOperator objective:\n{prompt_hint}"
+            if prompt_envelope_sha256_for_injection is not None:
+                # Issue #1706 AC4: the AGY prompt envelope itself carries
+                # prompt_envelope_sha256, so the value is machine-verifiable
+                # from the exact text handed to the AGY subprocess.
+                prompt_text = (
+                    f"{prompt_text}\n\nEvidence correlation (Issue #1706 task-linked hash chain):\n"
+                    + json.dumps(
+                        {"prompt_envelope_sha256": prompt_envelope_sha256_for_injection},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
             prompt_text = _build_local_asset_prompt_for_agy(
                 {
                     "prompt": prompt_text,
