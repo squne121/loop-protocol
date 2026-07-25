@@ -23,6 +23,7 @@ import {
   isPaginationRejected as isPostPaginationRejected,
   planPost,
 } from '../scripts/post-retro-live-verification.mjs'
+import { fetchPullRequestReviewSurfaceLive } from '../scripts/agent-logs/lib/github-comments.mjs'
 import {
   checkCanonicalComment,
   checkCaptureToPostLag,
@@ -864,6 +865,108 @@ describe('Issue #1415 AC5-7: evaluatePrReviewSurfaceBinding', () => {
   it('skips the selected-id cross-checks (but still enforces the >=1 minimums) when selected_review_id is null', () => {
     const result = evaluatePrReviewSurfaceBinding({ surface: makeSurface(), prReviewBinding: makeBinding({ selected_review_id: null, selected_review_comment_id: null, selected_review_thread_node_id: null }) })
     expect(result.ok).toBe(true)
+  })
+})
+
+describe('Issue #1415 AC5-7 / AC14: fetchPullRequestReviewSurfaceLive (GraphQL fetch orchestration, malformed/errors/pagination fail-closed)', () => {
+  const ARGS = { repo: 'squne121/loop-protocol', pullNumber: 1411 }
+  const EMPTY_REVIEWS_PAGE = { ok: true, errors: [], repositoryNull: false, pullRequestNull: false, headRefOid: 'a'.repeat(40), items: [], hasNextPage: false, endCursor: null }
+  const EMPTY_THREADS_PAGE = { ok: true, errors: [], repositoryNull: false, pullRequestNull: false, items: [], hasNextPage: false, endCursor: null, threadCommentsPaginationIncomplete: false }
+
+  it('GIVEN a GraphQL response with a non-empty `errors` array WHEN fetching reviews THEN it fails closed with pr_review_surface.graphql_errors rather than treating partial data as complete (AC14: malformed GraphQL partial response)', async () => {
+    const client = {
+      fetchReviewsPage: async () => ({ ok: false, errors: [{ message: 'Something went wrong while executing your query.' }], repositoryNull: false, pullRequestNull: false }),
+      fetchReviewThreadsPage: async () => EMPTY_THREADS_PAGE,
+    }
+    const result = await fetchPullRequestReviewSurfaceLive(client, ARGS)
+    expect(result.ok).toBe(false)
+    expect(result.errorCode).toBe('pr_review_surface.graphql_errors')
+  })
+
+  it('GIVEN repository resolves to null (e.g. renamed/deleted repo) WHEN fetching reviews THEN it fails closed rather than treating null as an empty result set (AC14: repository/pullRequest null)', async () => {
+    const client = {
+      fetchReviewsPage: async () => ({ ok: false, errors: [], repositoryNull: true, pullRequestNull: false }),
+      fetchReviewThreadsPage: async () => EMPTY_THREADS_PAGE,
+    }
+    const result = await fetchPullRequestReviewSurfaceLive(client, ARGS)
+    expect(result.ok).toBe(false)
+    expect(result.errorCode).toBe('pr_review_surface.repository_null')
+  })
+
+  it('GIVEN pullRequest resolves to null (e.g. PR number does not exist) WHEN fetching review threads THEN it fails closed', async () => {
+    const client = {
+      fetchReviewsPage: async () => EMPTY_REVIEWS_PAGE,
+      fetchReviewThreadsPage: async () => ({ ok: false, errors: [], repositoryNull: false, pullRequestNull: true }),
+    }
+    const result = await fetchPullRequestReviewSurfaceLive(client, ARGS)
+    expect(result.ok).toBe(false)
+    expect(result.errorCode).toBe('pr_review_surface.pull_request_null')
+  })
+
+  it('GIVEN the reviews connection never reaches hasNextPage: false within maxPages WHEN fetching THEN it fails closed with reviews_page_budget_exhausted (AC14: pagination incomplete, never silently truncated)', async () => {
+    const client = {
+      fetchReviewsPage: async () => ({ ok: true, errors: [], repositoryNull: false, pullRequestNull: false, headRefOid: 'a'.repeat(40), items: [{ databaseId: 1 }], hasNextPage: true, endCursor: 'cursor' }),
+      fetchReviewThreadsPage: async () => EMPTY_THREADS_PAGE,
+    }
+    const result = await fetchPullRequestReviewSurfaceLive(client, { ...ARGS, maxPages: 2 })
+    expect(result.ok).toBe(false)
+    expect(result.errorCode).toBe('pr_review_surface.reviews_page_budget_exhausted')
+  })
+
+  it('GIVEN the reviewThreads connection never reaches hasNextPage: false within maxPages WHEN fetching THEN it fails closed with review_threads_page_budget_exhausted', async () => {
+    const client = {
+      fetchReviewsPage: async () => EMPTY_REVIEWS_PAGE,
+      fetchReviewThreadsPage: async () => ({ ok: true, errors: [], repositoryNull: false, pullRequestNull: false, items: [{ id: 't1' }], hasNextPage: true, endCursor: 'cursor', threadCommentsPaginationIncomplete: false }),
+    }
+    const result = await fetchPullRequestReviewSurfaceLive(client, { ...ARGS, maxPages: 2 })
+    expect(result.ok).toBe(false)
+    expect(result.errorCode).toBe('pr_review_surface.review_threads_page_budget_exhausted')
+  })
+
+  it('GIVEN a single thread whose own comments sub-connection has hasNextPage: true WHEN fetching THEN it fails closed with thread_comments_page_budget_exhausted rather than silently truncating that thread\'s comments (AC14: pagination incomplete, sub-connection)', async () => {
+    const client = {
+      fetchReviewsPage: async () => EMPTY_REVIEWS_PAGE,
+      fetchReviewThreadsPage: async () => ({ ok: true, errors: [], repositoryNull: false, pullRequestNull: false, items: [{ id: 't1' }], hasNextPage: false, endCursor: null, threadCommentsPaginationIncomplete: true }),
+    }
+    const result = await fetchPullRequestReviewSurfaceLive(client, ARGS)
+    expect(result.ok).toBe(false)
+    expect(result.errorCode).toBe('pr_review_surface.thread_comments_page_budget_exhausted')
+  })
+
+  it('GIVEN reviews has zero items and reviewThreads has zero items (a PR with no review activity yet) WHEN fetched THEN the fetch itself still succeeds (the >=1 minimums are evaluatePrReviewSurfaceBinding\'s responsibility, not the fetch layer\'s) but the surface is empty', async () => {
+    const client = {
+      fetchReviewsPage: async () => EMPTY_REVIEWS_PAGE,
+      fetchReviewThreadsPage: async () => EMPTY_THREADS_PAGE,
+    }
+    const result = await fetchPullRequestReviewSurfaceLive(client, ARGS)
+    expect(result.ok).toBe(true)
+    expect(result.reviews).toEqual([])
+    expect(result.reviewThreads).toEqual([])
+    // AC14 (zero review object): the downstream check must still reject this.
+    const binding = evaluatePrReviewSurfaceBinding({
+      surface: { headRefOid: result.headRefOid, reviews: result.reviews, reviewThreads: result.reviewThreads },
+      prReviewBinding: { reviewed_head_sha: 'a'.repeat(40), selected_review_id: null, selected_review_comment_id: null, selected_review_thread_node_id: null },
+    })
+    expect(binding.ok).toBe(false)
+    expect(binding.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_zero_reviews')).toBe(true)
+  })
+
+  it('GIVEN reviews resolves across two pages WHEN fetched THEN both pages\' items are concatenated and headRefOid comes from the (first) page response', async () => {
+    let call = 0
+    const client = {
+      fetchReviewsPage: async () => {
+        call += 1
+        if (call === 1) {
+          return { ok: true, errors: [], repositoryNull: false, pullRequestNull: false, headRefOid: 'a'.repeat(40), items: [{ databaseId: 1 }], hasNextPage: true, endCursor: 'cursor-1' }
+        }
+        return { ok: true, errors: [], repositoryNull: false, pullRequestNull: false, headRefOid: 'a'.repeat(40), items: [{ databaseId: 2 }], hasNextPage: false, endCursor: null }
+      },
+      fetchReviewThreadsPage: async () => EMPTY_THREADS_PAGE,
+    }
+    const result = await fetchPullRequestReviewSurfaceLive(client, { ...ARGS, maxPages: 5 })
+    expect(result.ok).toBe(true)
+    expect(result.reviews.map((review) => review.databaseId)).toEqual([1, 2])
+    expect(result.headRefOid).toBe('a'.repeat(40))
   })
 })
 
