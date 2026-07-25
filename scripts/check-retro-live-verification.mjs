@@ -162,6 +162,14 @@ const CLI_OPTION_SPEC = {
   // to both targets rather than just the manifest-mode single target).
   '--fixture-resolve-result-json-issue-target': { key: 'fixtureResolveResultJsonIssueTarget' },
   '--fixture-resolve-result-json-pull-request-target': { key: 'fixtureResolveResultJsonPullRequestTarget' },
+  // Issue #1415 P0-2 fix_delta: when passed with --schema
+  // retro_live_verification/v3, additionally re-derive every comment URL /
+  // proof_payload_digest / target_head_sha claim in the bundle from the
+  // live GitHub API (see verifyDualTargetTargetLiveArtifacts). Without this
+  // flag the dual-target standalone check remains structural-only
+  // (schema + context-assertion binding), matching pre-fix_delta behavior
+  // exactly -- existing fixture-based tests are unaffected.
+  '--live': { key: 'live', defaultValue: 'false' },
 }
 
 /**
@@ -717,6 +725,129 @@ function evaluateDualTargetContextAssertions({ targetKey, contextAssertions, exe
 }
 
 /**
+ * Issue #1415 P0-2 fix_delta (post-#1747 adversarial review): parses a
+ * GitHub issue/PR comment `html_url` (the shape `commentUrl` in the v3
+ * schema requires) into the `owner/repo` + numeric comment id the REST
+ * issue-comments endpoint needs. Returns null for anything that doesn't
+ * match -- never guesses.
+ */
+function parseIssueCommentUrl(url) {
+  const match = String(url ?? '').match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/(?:issues|pull)\/\d+#issuecomment-(\d+)$/u)
+  if (!match) return null
+  const [, owner, repoName, commentId] = match
+  return { repo: `${owner}/${repoName}`, commentId }
+}
+
+/**
+ * Issue #1415 P0-2 fix_delta: live-fetches a single issue/PR comment by id
+ * (PR conversation comments and issue comments share the same REST
+ * endpoint). A non-zero gh exit or non-JSON stdout is a failure, never a
+ * silently-skipped pass.
+ */
+function fetchIssueCommentLive({ repo, commentId }) {
+  const result = spawnSync('gh', [
+    'api',
+    '-H', 'Accept: application/vnd.github+json',
+    '-H', 'X-GitHub-Api-Version: 2022-11-28',
+    `repos/${repo}/issues/comments/${commentId}`,
+  ], { encoding: 'utf-8', maxBuffer: DEFAULT_MAX_BUFFER })
+  if (result.status !== 0) {
+    return { ok: false, error: (result.stderr || result.stdout || 'gh api exited non-zero').trim() }
+  }
+  try {
+    const parsed = JSON.parse(result.stdout)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ok: false, error: 'gh api returned a non-object payload' }
+    }
+    return { ok: true, comment: parsed }
+  } catch (error) {
+    return { ok: false, error: `gh api returned invalid JSON: ${error.message}` }
+  }
+}
+
+function extractFirstFencedJson(body) {
+  const match = String(body ?? '').match(JSON_FENCE_PATTERN)
+  if (!match?.groups) return { ok: false }
+  try {
+    return { ok: true, payload: JSON.parse(match.groups.payload) }
+  } catch {
+    return { ok: false }
+  }
+}
+
+/**
+ * Issue #1415 P0-2 fix_delta: `--live` mode for the dual-target bundle.
+ * Schema validation alone lets every comment URL/digest/status field in a
+ * v3 payload be an unverified self-declaration -- this function makes the
+ * bundle's claims falsifiable by re-deriving them from the live GitHub API:
+ *   - every required comment URL for both targets is live-fetched and must
+ *     resolve (a 404/deleted/never-posted comment is a failure, not a skip)
+ *   - `proof_comment_url`'s body must contain a fenced JSON payload whose
+ *     recomputed canonical-json-v1 digest equals `proof_payload_digest`
+ *     byte-for-byte (the digest field itself is never trusted on its own)
+ *   - `pull_request_target.target_head_sha` must equal the PR's live head
+ *     SHA (stale-head detection)
+ * Digest/URL fields that this check cannot yet independently re-derive
+ * (readback.canonical_comment_count / duplicate_count against the parent
+ * issue's own comment stream, and a v3-native runtime_provenance object --
+ * the schema has no `canonical_comment.ownership_marker` or
+ * `runtime_provenance` field to bind against) are explicitly NOT claimed
+ * as verified here; they remain open follow-up work, not a silent gap.
+ */
+async function verifyDualTargetTargetLiveArtifacts({ repo, targetKey, target }) {
+  const errors = []
+  const urlFields = ['operation_index_comment_url', 'marker_comment_url', 'proof_comment_url', 'retrospective_result_comment_url']
+  if (targetKey === 'pull_request_target') urlFields.push('review_surface_proof_comment_url')
+
+  for (const field of urlFields) {
+    const url = target[field]
+    const parsed = parseIssueCommentUrl(url)
+    if (!parsed) {
+      errors.push({ code: 'retro_live_verification_check.dual_target_live_url_unparseable', message: `[${targetKey}] ${field} is not a well-formed GitHub comment URL: ${JSON.stringify(url)}` })
+      continue
+    }
+    if (parsed.repo.toLowerCase() !== repo.toLowerCase()) {
+      errors.push({ code: 'retro_live_verification_check.dual_target_live_url_repo_mismatch', message: `[${targetKey}] ${field} points at repo ${parsed.repo}, expected ${repo}` })
+      continue
+    }
+    const fetched = fetchIssueCommentLive(parsed)
+    if (!fetched.ok) {
+      errors.push({ code: 'retro_live_verification_check.dual_target_live_artifact_not_found', message: `[${targetKey}] ${field} could not be live-fetched: ${fetched.error}` })
+      continue
+    }
+    if (field === 'proof_comment_url') {
+      const extraction = extractFirstFencedJson(fetched.comment.body)
+      if (!extraction.ok) {
+        errors.push({ code: 'retro_live_verification_check.dual_target_proof_payload_unparseable', message: `[${targetKey}] proof_comment_url body does not contain a well-formed fenced JSON payload` })
+        continue
+      }
+      const recomputed = `sha256:${sha256Hex(canonicalJsonStringify(extraction.payload))}`
+      if (recomputed !== target.proof_payload_digest) {
+        errors.push({ code: 'retro_live_verification_check.dual_target_proof_payload_digest_mismatch', message: `[${targetKey}] recomputed proof payload digest ${recomputed} does not match target.proof_payload_digest ${target.proof_payload_digest}` })
+      }
+    }
+  }
+
+  if (targetKey === 'pull_request_target') {
+    const prView = spawnSync('gh', ['pr', 'view', String(target.number), '--repo', repo, '--json', 'headRefOid'], { encoding: 'utf-8' })
+    if (prView.status !== 0) {
+      errors.push({ code: 'retro_live_verification_check.dual_target_pr_head_fetch_failed', message: `[${targetKey}] gh pr view failed: ${(prView.stderr || prView.stdout || '').trim()}` })
+    } else {
+      try {
+        const { headRefOid } = JSON.parse(prView.stdout)
+        if (headRefOid !== target.target_head_sha) {
+          errors.push({ code: 'retro_live_verification_check.dual_target_stale_pr_head', message: `[${targetKey}] live PR head ${headRefOid} does not match target.target_head_sha ${target.target_head_sha} (stale PR head)` })
+        }
+      } catch (error) {
+        errors.push({ code: 'retro_live_verification_check.dual_target_pr_head_response_invalid', message: `[${targetKey}] gh pr view returned invalid JSON: ${error.message}` })
+      }
+    }
+  }
+
+  return { ok: errors.length === 0, errors }
+}
+
+/**
  * Issue #1415 (dual-target bundle): structural + context-assertion checks
  * for a retro_live_verification/v3 payload. Schema validation alone can
  * confirm both targets' comment URLs/digests are present and shaped
@@ -724,8 +855,14 @@ function evaluateDualTargetContextAssertions({ targetKey, contextAssertions, exe
  * assert-live binding for BOTH issue_target.context_assertions and
  * pull_request_target.context_assertions -- there is no PR-only special
  * case here, matching the manifest-mode fix.
+ *
+ * Issue #1415 P0-2 fix_delta: when `live` is true, this additionally
+ * re-derives every comment URL/digest/head-SHA claim in the bundle from the
+ * live GitHub API instead of trusting the payload's self-declared values
+ * (see verifyDualTargetTargetLiveArtifacts doc comment for exactly what is,
+ * and is not yet, independently verified).
  */
-export async function checkDualTargetBundle(payload, { executionProfile, fixtureResolveResultJsonIssueTarget, fixtureResolveResultJsonPullRequestTarget }) {
+export async function checkDualTargetBundle(payload, { executionProfile, fixtureResolveResultJsonIssueTarget, fixtureResolveResultJsonPullRequestTarget, live = false }) {
   const errors = []
   const schemaValidation = await validateAgainstSchemaFile(DUAL_TARGET_BUNDLE_SCHEMA_FILE, payload)
   if (!schemaValidation.valid) {
@@ -753,6 +890,13 @@ export async function checkDualTargetBundle(payload, { executionProfile, fixture
   })
   errors.push(...pullRequestCheck.errors)
 
+  if (live) {
+    const issueLive = await verifyDualTargetTargetLiveArtifacts({ repo: payload.repo, targetKey: 'issue_target', target: payload.issue_target })
+    errors.push(...issueLive.errors)
+    const pullRequestLive = await verifyDualTargetTargetLiveArtifacts({ repo: payload.repo, targetKey: 'pull_request_target', target: payload.pull_request_target })
+    errors.push(...pullRequestLive.errors)
+  }
+
   return { ok: errors.length === 0, errors }
 }
 
@@ -769,6 +913,7 @@ async function runStandaloneSchemaCheck(options) {
       executionProfile,
       fixtureResolveResultJsonIssueTarget: options.fixtureResolveResultJsonIssueTarget,
       fixtureResolveResultJsonPullRequestTarget: options.fixtureResolveResultJsonPullRequestTarget,
+      live: parseBooleanFlag(options.live),
     })
     errors.push(...bundleCheck.errors)
     const ok = bundleCheck.ok
