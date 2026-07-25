@@ -105,6 +105,71 @@ const CLI_OPTION_SPEC = {
   '--fixture-comments-json': { key: 'fixtureCommentsJson' },
   '--fixture-resolve-result-json': { key: 'fixtureResolveResultJson' },
   '--fixture-pr-review-json': { key: 'fixturePrReviewJson' },
+  // Issue #1415 AC13 (additive, optional gate): when passed, require
+  // runtime_provenance's locally-derivable fields to be non-null.
+  '--require-runtime-provenance': { key: 'requireRuntimeProvenance', defaultValue: 'false' },
+  // Issue #1415 AC15 (additive, optional gate): when passed, fail-closed if
+  // the elapsed time between runtime_provenance.generated_at (capture) and
+  // --posted-at (or "now" when omitted) exceeds the given number of seconds.
+  '--max-capture-to-post-lag-seconds': { key: 'maxCaptureToPostLagSeconds' },
+  '--posted-at': { key: 'postedAt' },
+}
+
+/**
+ * Issue #1415 AC13: pure presence/type check over an already-loaded
+ * manifest's runtime_provenance. node_version/pnpm_version/
+ * pnpm_lockfile_digest/gh_cli_version are always locally derivable and must
+ * be non-null; github_api_version/workflow_run_identity may legitimately be
+ * null outside a live-API / GitHub-Actions context, but the keys themselves
+ * must be present (not simply absent from an old-shaped manifest).
+ */
+export function checkRuntimeProvenanceComplete(runtimeProvenance) {
+  const errors = []
+  const requiredNonNullKeys = ['node_version', 'pnpm_version', 'pnpm_lockfile_digest', 'gh_cli_version']
+  for (const key of requiredNonNullKeys) {
+    if (!Object.prototype.hasOwnProperty.call(runtimeProvenance ?? {}, key) || runtimeProvenance[key] === null || runtimeProvenance[key] === undefined) {
+      errors.push({ code: 'retro_live_verification_check.runtime_provenance_missing_field', message: `runtime_provenance.${key} is required and must be non-null` })
+    }
+  }
+  for (const key of ['github_api_version', 'workflow_run_identity']) {
+    if (!Object.prototype.hasOwnProperty.call(runtimeProvenance ?? {}, key)) {
+      errors.push({ code: 'retro_live_verification_check.runtime_provenance_missing_field', message: `runtime_provenance.${key} key must be present (may be null)` })
+    }
+  }
+  return { ok: errors.length === 0, errors }
+}
+
+/**
+ * Issue #1415 AC15: pure freshness/max-lag check. `captureIso` is the
+ * manifest's runtime_provenance.generated_at; `postedIso` is either an
+ * explicit --posted-at value or the current time. A negative lag (posted
+ * before captured) is also fail-closed -- it indicates a tampered or
+ * inconsistent manifest/post timeline, never a pass.
+ */
+export function checkCaptureToPostLag({ captureIso, postedIso, maxLagSeconds }) {
+  const captureMs = Date.parse(captureIso)
+  const postedMs = Date.parse(postedIso)
+  if (Number.isNaN(captureMs)) {
+    return { ok: false, errors: [{ code: 'retro_live_verification_check.capture_timestamp_invalid', message: `runtime_provenance.generated_at is not a valid timestamp: ${JSON.stringify(captureIso)}` }] }
+  }
+  if (Number.isNaN(postedMs)) {
+    return { ok: false, errors: [{ code: 'retro_live_verification_check.posted_timestamp_invalid', message: `--posted-at is not a valid timestamp: ${JSON.stringify(postedIso)}` }] }
+  }
+  const lagSeconds = (postedMs - captureMs) / 1000
+  if (lagSeconds < 0) {
+    return { ok: false, errors: [{ code: 'retro_live_verification_check.capture_to_post_lag_negative', message: `posted timestamp (${postedIso}) is earlier than capture timestamp (${captureIso})` }] }
+  }
+  if (lagSeconds > maxLagSeconds) {
+    return { ok: false, errors: [{ code: 'retro_live_verification_check.capture_to_post_lag_exceeded', message: `capture-to-post lag ${lagSeconds}s exceeds max-capture-to-post-lag-seconds ${maxLagSeconds}s` }] }
+  }
+  return { ok: true, errors: [], lagSeconds }
+}
+
+function normalizeMaxLagSeconds(value) {
+  if (!/^(0|[1-9][0-9]*)$/u.test(String(value))) {
+    throw usageError('retro_live_verification_check.max_capture_to_post_lag_seconds', 'max-capture-to-post-lag-seconds must be a non-negative integer')
+  }
+  return Number(value)
 }
 
 /**
@@ -117,6 +182,10 @@ const CLI_OPTION_SPEC = {
  */
 export function isPaginationRejected(listing) {
   return listing?.pagination_exhausted === true || listing?.page_budget_exhausted === true
+}
+
+function parseBooleanFlag(value) {
+  return value === 'true'
 }
 
 function normalizeExecutionProfile(value) {
@@ -483,7 +552,26 @@ async function runCli() {
     errors.push(...prReviewBindingCheck.errors)
   }
 
-  const ok = commentCheck.ok && contextAssertionsCheck.ok && prReviewBindingCheck.ok
+  // Issue #1415 AC13 (additive, optional gate).
+  let runtimeProvenanceCheck = { ok: true, errors: [] }
+  if (parseBooleanFlag(options.requireRuntimeProvenance)) {
+    runtimeProvenanceCheck = checkRuntimeProvenanceComplete(manifest.runtime_provenance)
+    errors.push(...runtimeProvenanceCheck.errors)
+  }
+
+  // Issue #1415 AC15 (additive, optional gate).
+  let captureToPostLagCheck = { ok: true, errors: [] }
+  if (options.maxCaptureToPostLagSeconds !== undefined) {
+    const maxLagSeconds = normalizeMaxLagSeconds(options.maxCaptureToPostLagSeconds)
+    captureToPostLagCheck = checkCaptureToPostLag({
+      captureIso: manifest.runtime_provenance?.generated_at,
+      postedIso: options.postedAt ?? new Date().toISOString(),
+      maxLagSeconds,
+    })
+    errors.push(...captureToPostLagCheck.errors)
+  }
+
+  const ok = commentCheck.ok && contextAssertionsCheck.ok && prReviewBindingCheck.ok && runtimeProvenanceCheck.ok && captureToPostLagCheck.ok
   process.stdout.write(`${JSON.stringify({
     schema: SCHEMA,
     verification_status: ok ? 'pass' : 'fail',

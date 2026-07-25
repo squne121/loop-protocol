@@ -40,6 +40,7 @@
 
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -168,6 +169,64 @@ function resolveGeneratorCommit() {
   return /^[0-9a-f]{40}$/u.test(commit) ? commit : null
 }
 
+/**
+ * Issue #1415 AC13 (additive, optional): runtime provenance beyond
+ * generated_at/generator_commit/generator_version. Every field degrades to
+ * `null` when unavailable (e.g. `pnpm`/`gh` not on PATH, no lockfile, running
+ * outside GitHub Actions) rather than throwing -- this manifest must still be
+ * generatable in a bare local checkout.
+ */
+export function resolveNodeVersion() {
+  return typeof process.version === 'string' && process.version.length > 0 ? process.version : null
+}
+
+function resolveCommandVersion(cmd, args) {
+  const result = spawnSync(cmd, args, { encoding: 'utf-8' })
+  if (result.status !== 0 || typeof result.stdout !== 'string') {
+    return null
+  }
+  const firstLine = result.stdout.split('\n')[0]?.trim() ?? ''
+  return firstLine.length > 0 ? firstLine : null
+}
+
+export function resolvePnpmVersion() {
+  return resolveCommandVersion('pnpm', ['--version'])
+}
+
+export function resolveGhCliVersion() {
+  return resolveCommandVersion('gh', ['--version'])
+}
+
+export function resolvePnpmLockfileDigest() {
+  try {
+    const raw = readFileSync(resolvePath(REPO_ROOT, 'pnpm-lock.yaml'), 'utf-8')
+    return sha256Hex(raw)
+  } catch {
+    return null
+  }
+}
+
+export function resolveWorkflowRunIdentity(env = process.env) {
+  const runId = typeof env.GITHUB_RUN_ID === 'string' && env.GITHUB_RUN_ID.length > 0 ? env.GITHUB_RUN_ID : null
+  const runAttempt = typeof env.GITHUB_RUN_ATTEMPT === 'string' && env.GITHUB_RUN_ATTEMPT.length > 0 ? env.GITHUB_RUN_ATTEMPT : null
+  const workflowRef = typeof env.GITHUB_WORKFLOW_REF === 'string' && env.GITHUB_WORKFLOW_REF.length > 0 ? env.GITHUB_WORKFLOW_REF : null
+  if (runId === null && runAttempt === null && workflowRef === null) {
+    return null
+  }
+  return { run_id: runId, run_attempt: runAttempt, workflow_ref: workflowRef }
+}
+
+export function collectExtendedRuntimeProvenance({ githubApiVersion = null } = {}) {
+  return {
+    node_version: resolveNodeVersion(),
+    pnpm_version: resolvePnpmVersion(),
+    pnpm_lockfile_digest: resolvePnpmLockfileDigest(),
+    gh_cli_version: resolveGhCliVersion(),
+    github_api_version: typeof githubApiVersion === 'string' && githubApiVersion.length > 0 ? githubApiVersion : null,
+    workflow_run_identity: resolveWorkflowRunIdentity(),
+  }
+}
+
 function normalizePositiveInteger(value, code) {
   if (!/^[1-9][0-9]*$/u.test(String(value))) {
     throw usageError(code, `${code} must be a positive integer`)
@@ -292,6 +351,9 @@ const CLI_OPTION_SPEC = {
   '--issue-number': { key: 'issueNumber', required: true },
   '--trusted-actor': { key: 'trustedActor', required: true },
   '--expected-previous-digest': { key: 'expectedPreviousDigest' },
+  '--selected-review-comment-id': { key: 'selectedReviewCommentId' },
+  '--selected-review-thread-node-id': { key: 'selectedReviewThreadNodeId' },
+  '--github-api-version': { key: 'githubApiVersion' },
   '--out': { key: 'out', required: true },
 }
 
@@ -312,6 +374,12 @@ export function buildManifest(options) {
   const expectedPreviousDigest = options.expectedPreviousDigest === undefined || options.expectedPreviousDigest === null || options.expectedPreviousDigest === ''
     ? null
     : normalizeSha256Hex(options.expectedPreviousDigest, 'retro_live_verification.expected_previous_digest')
+  const selectedReviewCommentId = options.selectedReviewCommentId === undefined || options.selectedReviewCommentId === null
+    ? null
+    : normalizePositiveInteger(options.selectedReviewCommentId, 'retro_live_verification.selected_review_comment_id')
+  const selectedReviewThreadNodeId = options.selectedReviewThreadNodeId === undefined || options.selectedReviewThreadNodeId === null || options.selectedReviewThreadNodeId === ''
+    ? null
+    : String(options.selectedReviewThreadNodeId)
 
   const contextAssertions = {
     repo,
@@ -323,10 +391,18 @@ export function buildManifest(options) {
     expected_payload_digest: expectedPayloadDigest,
     expected_matched_comment_count: expectedMatchedCommentCount,
   }
+  // Issue #1415 AC5-7 fields are additive/optional: only included in the
+  // digested payload when the caller actually supplies a value, so a v2
+  // caller that never passes --selected-review-comment-id / --selected-
+  // review-thread-node-id reproduces a byte-identical prReviewBinding shape
+  // (and therefore the same canonical-json-v1 body_digest) as before this
+  // change -- no existing fixture/manifest digest constant needs migration.
   const prReviewBinding = {
     review_artifact_ref: options.reviewArtifactRef,
     reviewed_head_sha: reviewedHeadSha,
     selected_review_id: selectedReviewId,
+    ...(selectedReviewCommentId !== null ? { selected_review_comment_id: selectedReviewCommentId } : {}),
+    ...(selectedReviewThreadNodeId !== null ? { selected_review_thread_node_id: selectedReviewThreadNodeId } : {}),
   }
   const ownershipMarker = buildOwnershipMarker({ repo, issueNumber })
   const { bodyDigest } = computeCanonicalCommentBody({ contextAssertions, prReviewBinding, ownershipMarker })
@@ -351,6 +427,10 @@ export function buildManifest(options) {
       generated_at: new Date().toISOString(),
       generator_commit: resolveGeneratorCommit(),
       generator_version: GENERATOR_VERSION,
+      // Issue #1415 AC13 (additive, optional): not part of the digested
+      // canonical-comment payload (only context_assertions/pr_review_binding
+      // are), so populating these unconditionally cannot change body_digest.
+      ...collectExtendedRuntimeProvenance({ githubApiVersion: options.githubApiVersion }),
     },
     canonicalization_profile: {
       algorithm: 'canonical-json-v1',
