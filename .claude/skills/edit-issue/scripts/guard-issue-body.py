@@ -8,8 +8,11 @@ Guards:
   1. Template Guard         — 必須セクションが存在するか（ISSUE_TEMPLATE 動的取得）
   2. Outcome Quality Guard  — Outcome が成果物形式・完了条件を含むか
  3. Diff Threshold         — 削減率が 50% 以下か（--orig-file 指定時）
- 4. AC-VC Alignment        — AC 番号集合と VC の # AC<N> 番号集合が一致するか
-                              （issue_kind 別 skip: VC セクションが不要な種別ではスキップ）
+ 4. AC-VC Alignment        — `## Acceptance Criteria` セクション内の AC 番号集合と
+                              `## Verification Commands` セクション内 bash fence 内の
+                              # AC<N> 番号集合（grouped marker・inline suffix 含む）が
+                              一致するか（issue_kind 別 skip: VC セクションが不要な
+                              種別ではスキップ）。AC 側の重複定義は fail。
   5. Issue Body Validation   — create-issue の validate_issue_body.py を実行し、
                               LP ルール違反を編集前に検出する。
 
@@ -29,6 +32,7 @@ import re
 import shlex
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 try:
@@ -430,17 +434,39 @@ def _extract_vc_section(body: str) -> str:
     return "\n".join(section_lines)
 
 
+def _extract_ac_section(body: str) -> str:
+    """
+    本文から `## Acceptance Criteria` セクションのテキストを返す。
+    次の `## ` 見出しまで、または本文末尾までを切り出す。
+
+    Returns:
+        str: AC セクションのテキスト（セクションが存在しない場合は空文字列）
+    """
+    lines = body.splitlines()
+    in_section = False
+    section_lines = []
+    for line in lines:
+        if re.match(r'^##[ \t]+Acceptance Criteria[ \t]*$', line):
+            in_section = True
+            continue
+        if in_section:
+            if re.match(r'^##[ \t]+', line):
+                break
+            section_lines.append(line)
+    return "\n".join(section_lines)
+
+
 def guard_ac_vc_alignment(body: str, issue_kind: str, template_dir=None) -> dict:
     """
-    AC 番号集合と VC の # AC<N> 番号集合が一致するか確認する。
+    `## Acceptance Criteria` セクション内の AC 番号集合と `## Verification Commands`
+    セクション内 bash fence 内の # AC<N> 番号集合が一致するか確認する。
     issue_kind が VC セクションを必須に持たない種別（parent 等）では skipped: true を返す。
 
     「VC セクションを必須に持つ種別か」は ISSUE_TEMPLATE の required label に
     'Verification Commands' が含まれるかで動的に判定する（ハードコードしない）。
 
-    AC 番号は `- [x] AC<N>` 形式から抽出し、VC 番号は `## Verification Commands`
-    セクション配下の `# AC<N>` コメントから抽出する。
-    重複番号がある場合も集合一致で判定するため偽陽性を防ぐ。
+    抽出・比較の実処理は `_evaluate_ac_vc_alignment()` に一本化している
+    （main() の issue_kind 未確定フォールバック分岐と共通利用するため）。
     """
     if template_dir is None:
         try:
@@ -467,26 +493,16 @@ def guard_ac_vc_alignment(body: str, issue_kind: str, template_dir=None) -> dict
             "reason": f"issue_kind '{issue_kind}' does not require Verification Commands section",
         }
 
-    # AC 番号を Acceptance Criteria から抽出（集合で管理）
-    ac_numbers = re.findall(r'^- \[.\] AC(\d+)\b', body, re.MULTILINE)
-    # VC 番号を Verification Commands セクション配下からのみ抽出（集合で管理）
-    vc_section = _extract_vc_section(body)
-    vc_numbers = re.findall(r'# AC(\d+)\b', vc_section)
-
-    ac_count = len(ac_numbers)
-    vc_ac_count = len(vc_numbers)
-
-    if ac_count == 0:
-        passed = True
-    else:
-        passed = set(ac_numbers) == set(vc_numbers)
-
+    result = _evaluate_ac_vc_alignment(body)
     return {
         "name": "ac_vc_alignment",
-        "passed": passed,
+        "passed": result["passed"],
         "skipped": False,
-        "ac_count": ac_count,
-        "vc_ac_count": vc_ac_count,
+        "ac_count": result["ac_count"],
+        "vc_ac_count": result["vc_ac_count"],
+        "duplicate_ac_ids": result["duplicate_ac_ids"],
+        "missing_in_vc": result["missing_in_vc"],
+        "extra_in_vc": result["extra_in_vc"],
     }
 
 
@@ -509,6 +525,99 @@ def _strip_inline_ac_and_extract(command_line: str) -> tuple:
         clean = command_line[:m.start()]
         return clean.strip(), ac_label
     return command_line.strip(), None
+
+
+# AC 番号参照抽出用（grouped marker "# AC1, AC2" にも対応する findall パターン）
+_AC_REF_RE = re.compile(r'AC(\d+)')
+
+
+def _extract_vc_ac_occurrences(vc_section: str) -> list:
+    """
+    VC セクションの fenced bash block 内からのみ AC<N> 参照を抽出する
+    （fence 外の `# AC1` 風コメントは VC として数えない）。
+
+    以下の両方から AC 番号を抽出する（grouped marker・inline suffix 対応）:
+    - コメント行（`#` で始まる行）: `# AC1` / `# AC1, AC2` / `# AC1: 説明` 等から
+      全ての AC 番号を抽出する
+    - コマンド行の inline suffix（`$ some_command  # AC1` のように行末に
+      `#` 以降で AC 参照を付与するパターン）: `#` 以降の部分から全ての AC 番号を抽出する
+
+    Returns:
+        list[str]: 検出した AC 番号文字列のリスト（重複を許容する。VC 側は
+                   同一 AC を複数コマンドから束ねる正当なパターンがあるため）
+    """
+    occurrences = []
+    for match in _BASH_FENCE_RE.finditer(vc_section):
+        block_text = match.group(1)
+        for line in block_text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith('#'):
+                occurrences.extend(_AC_REF_RE.findall(stripped))
+                continue
+            # inline suffix: コマンド行中の "  # ..." 以降から AC 参照を抽出する
+            inline_match = re.search(r'\s+#(.*)$', stripped)
+            if inline_match:
+                occurrences.extend(_AC_REF_RE.findall(inline_match.group(1)))
+    return occurrences
+
+
+def _evaluate_ac_vc_alignment(body: str) -> dict:
+    """
+    AC-VC alignment の抽出・比較ロジック本体（共通関数）。
+
+    `guard_ac_vc_alignment()`（issue_kind 解決済みパス）と main() 内の
+    issue_kind 未確定時のフォールバック分岐の両方から呼ばれる（P2: 重複実装の統合）。
+
+    - AC 番号は `## Acceptance Criteria` セクション境界内の `- [x] AC<N>` 形式からのみ
+      抽出する（セクション外のチェックボックスは数えない）
+    - VC 番号は `## Verification Commands` セクション内の bash fence 内からのみ抽出する
+      （grouped marker・inline suffix 含む。fence 外のコメントは数えない）
+    - AC 側の重複定義（同じ AC 番号が複数回定義されている異常系）は fail とする
+      （B2: set() 化により意図せず許容してしまう副作用を修正）
+    - VC 側の重複参照（1 つの AC を複数コマンドから束ねる正当なパターン）は許容する
+    - AC/VC 双方が空の場合は set() == set() で自然に pass する
+      （B3: ac_count == 0 の fail-open 特例は削除した）
+
+    Returns:
+        dict: {
+            "passed": bool,
+            "ac_count": int,
+            "vc_ac_count": int,
+            "duplicate_ac_ids": list[str],
+            "missing_in_vc": list[str],
+            "extra_in_vc": list[str],
+        }
+    """
+    ac_section = _extract_ac_section(body)
+    ac_occurrences = re.findall(r'^- \[.\] AC(\d+)\b', ac_section, re.MULTILINE)
+
+    vc_section = _extract_vc_section(body)
+    vc_occurrences = _extract_vc_ac_occurrences(vc_section)
+
+    ac_counts = Counter(ac_occurrences)
+    duplicate_ac_ids = sorted(
+        (ac_id for ac_id, count in ac_counts.items() if count > 1),
+        key=int,
+    )
+
+    ac_refs = set(ac_counts)
+    vc_refs = set(vc_occurrences)
+
+    missing_in_vc = sorted((ac_refs - vc_refs), key=int)
+    extra_in_vc = sorted((vc_refs - ac_refs), key=int)
+
+    passed = not duplicate_ac_ids and ac_refs == vc_refs
+
+    return {
+        "passed": passed,
+        "ac_count": len(ac_occurrences),
+        "vc_ac_count": len(vc_occurrences),
+        "duplicate_ac_ids": duplicate_ac_ids,
+        "missing_in_vc": missing_in_vc,
+        "extra_in_vc": extra_in_vc,
+    }
 
 
 def _extract_bash_commands_from_vc_section(vc_section: str) -> list:
@@ -943,22 +1052,19 @@ def main() -> None:
             orig_body = args.orig_file.read_text(encoding="utf-8")
             results.append(guard_diff_threshold(orig_body, body))
 
-        # ac_vc_alignment は issue_kind 不明のためスキップしない（安全側）
-        ac_numbers = re.findall(r'^- \[.\] AC(\d+)\b', body, re.MULTILINE)
-        vc_section = _extract_vc_section(body)
-        vc_numbers = re.findall(r'# AC(\d+)\b', vc_section)
-        ac_count = len(ac_numbers)
-        vc_ac_count = len(vc_numbers)
-        if ac_count == 0:
-            passed = True
-        else:
-            passed = set(ac_numbers) == set(vc_numbers)
+        # ac_vc_alignment は issue_kind 不明のためスキップしない（安全側）。
+        # 抽出・比較ロジックは _evaluate_ac_vc_alignment() に一本化している
+        # （P2: guard_ac_vc_alignment() との重複実装を解消）。
+        _alignment_result = _evaluate_ac_vc_alignment(body)
         results.append({
             "name": "ac_vc_alignment",
-            "passed": passed,
+            "passed": _alignment_result["passed"],
             "skipped": False,
-            "ac_count": ac_count,
-            "vc_ac_count": vc_ac_count,
+            "ac_count": _alignment_result["ac_count"],
+            "vc_ac_count": _alignment_result["vc_ac_count"],
+            "duplicate_ac_ids": _alignment_result["duplicate_ac_ids"],
+            "missing_in_vc": _alignment_result["missing_in_vc"],
+            "extra_in_vc": _alignment_result["extra_in_vc"],
         })
         results.append(guard_vc_compound_shell_disallowed(body))
         # ready_tuple guard (when --check-ready-tuple is set)
