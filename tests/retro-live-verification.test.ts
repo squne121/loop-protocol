@@ -416,6 +416,55 @@ describe('required negative test 9: retro-live-verification.yml workflow contrac
 })
 
 
+describe('required negative test 3 (end-to-end subprocess): repository/pullRequest/reviewThreads null-shape resolve result must fail closed through the real check-retro-live-verification.mjs process (Issue #1709 PR review P1-2, #1718 REQUEST_CHANGES follow-up)', () => {
+  const checkScriptPath = resolvePath(REPO_ROOT, 'scripts/check-retro-live-verification.mjs')
+  const manifestPath = resolvePath(FIXTURES_DIR, 'manifest.json')
+  const validCommentsPath = resolvePath(FIXTURES_DIR, 'valid-comments.json')
+  const prReviewValidPath = resolvePath(FIXTURES_DIR, 'pr-review-valid.json')
+  const resolveResultNullShapePath = resolvePath(FIXTURES_DIR, 'resolve-result-null-shape.json')
+  const resolveResultValidPath = resolvePath(FIXTURES_DIR, 'resolve-result-valid.json')
+
+  it('GIVEN the checked-in resolve-result-null-shape.json fixture (a resolved-but-null GraphQL repository/pullRequest/reviewThreads shape) WHEN check-retro-live-verification.mjs is actually spawned as a subprocess THEN the real process exits non-zero and reports verification_status "fail" via the context_assertions live-binding delegation, never a pass', () => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        checkScriptPath,
+        '--manifest-json', manifestPath,
+        '--execution-profile', 'fixture',
+        '--fixture-comments-json', validCommentsPath,
+        '--fixture-resolve-result-json', resolveResultNullShapePath,
+        '--fixture-pr-review-json', prReviewValidPath,
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).toBe(1)
+    const payload = JSON.parse(result.stdout.trim())
+    expect(payload.verification_status).toBe('fail')
+    expect(
+      payload.errors.some((error: { code: string }) => error.code === 'retro_live_verification_check.context_assertions_live_binding_failed'),
+    ).toBe(true)
+  })
+
+  it('GIVEN the checked-in resolve-result-valid.json fixture (matching the manifest\'s own context_assertions) WHEN check-retro-live-verification.mjs is actually spawned as a subprocess THEN the real process exits zero and reports verification_status "pass"', () => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        checkScriptPath,
+        '--manifest-json', manifestPath,
+        '--execution-profile', 'fixture',
+        '--fixture-comments-json', validCommentsPath,
+        '--fixture-resolve-result-json', resolveResultValidPath,
+        '--fixture-pr-review-json', prReviewValidPath,
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).toBe(0)
+    const payload = JSON.parse(result.stdout.trim())
+    expect(payload.verification_status).toBe('pass')
+    expect(payload.errors).toEqual([])
+  })
+})
+
 describe('argument-free CLI wrapper fallback (Issue #1709 PR review P0-5, AC5/AC7)', () => {
   const generateScriptPath = resolvePath(REPO_ROOT, 'scripts/generate-retro-live-verification.mjs')
   const checkScriptPath = resolvePath(REPO_ROOT, 'scripts/check-retro-live-verification.mjs')
