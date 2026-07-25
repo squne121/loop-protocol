@@ -334,7 +334,9 @@ def test_result_preserves_retrieval_and_analysis_actor_fields() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_isolated_workspace_does_not_copy_credential_files(tmp_path: Path) -> None:
+def test_isolated_workspace_does_not_copy_credential_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # Simulate a real $HOME that has credential-bearing files sitting next
     # to it, to prove materialize_isolated_agy_workspace() never reaches
     # into (or copies out of) that directory.
@@ -347,6 +349,13 @@ def test_isolated_workspace_does_not_copy_credential_files(tmp_path: Path) -> No
         json.dumps({"oauth_token": "should-never-be-copied"}), encoding="utf-8"
     )
     (fake_real_home / ".netrc").write_text("machine example.com login x password y", encoding="utf-8")
+    # Issue #1740: pin $HOME to the fake fixture home so this test's file
+    # count assertion (exactly settings.json + hook_path, no gcloud ADC /
+    # agy OAuth token symlinks) is hermetic and does not depend on whether
+    # the real ambient $HOME happens to have a
+    # $HOME/.config/gcloud or $HOME/.gemini/antigravity-cli/antigravity-oauth-token
+    # present on the machine actually running this test.
+    monkeypatch.setenv("HOME", str(fake_real_home))
 
     for profile in ALL_PROFILES:
         workspace = app.materialize_isolated_agy_workspace(profile, parent_dir=tmp_path)
