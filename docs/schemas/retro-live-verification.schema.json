@@ -35,6 +35,9 @@
     },
     "canonicalization_profile": {
       "$ref": "#/$defs/canonicalizationProfile"
+    },
+    "resolved_comment_set_digest": {
+      "$ref": "#/$defs/resolvedCommentSetDigest"
     }
   },
   "$defs": {
@@ -114,6 +117,16 @@
         "selected_review_id": {
           "type": ["integer", "null"],
           "minimum": 1
+        },
+        "selected_review_comment_id": {
+          "description": "Issue #1415 AC5-7 (additive, optional): the numeric databaseId of the review comment cross-bound to selected_review_id. Absent entirely, verification falls back to the v2 review-only check unchanged (backward compatible).",
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "selected_review_thread_node_id": {
+          "description": "Issue #1415 AC5-7 (additive, optional): the GraphQL node id of the resolved review thread that must contain selected_review_comment_id.",
+          "type": ["string", "null"],
+          "minLength": 1
         }
       }
     },
@@ -142,6 +155,15 @@
           "items": {
             "type": "string",
             "minLength": 1
+          },
+          "minItems": 1
+        },
+        "trusted_actor_id_allowlist": {
+          "description": "Issue #1415 AC4 (additive, optional): numeric GitHub user IDs bound alongside trusted_actor_allowlist logins. A login string alone can be reused after account rename/deletion; when this field is present and non-empty, a marker/canonical-comment author must match BOTH an allowed login AND an allowed numeric id to be treated as trusted. Absent entirely, verification falls back to the v2 login-only check unchanged (backward compatible).",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1
           },
           "minItems": 1
         }
@@ -201,6 +223,49 @@
         "generator_version": {
           "type": "string",
           "minLength": 1
+        },
+        "node_version": {
+          "description": "Issue #1415 AC13 (additive, optional).",
+          "type": ["string", "null"],
+          "minLength": 1
+        },
+        "pnpm_version": {
+          "description": "Issue #1415 AC13 (additive, optional).",
+          "type": ["string", "null"],
+          "minLength": 1
+        },
+        "pnpm_lockfile_digest": {
+          "description": "Issue #1415 AC13 (additive, optional): sha256 of pnpm-lock.yaml.",
+          "anyOf": [
+            { "$ref": "#/$defs/sha256Digest" },
+            { "type": "null" }
+          ]
+        },
+        "gh_cli_version": {
+          "description": "Issue #1415 AC13 (additive, optional).",
+          "type": ["string", "null"],
+          "minLength": 1
+        },
+        "github_api_version": {
+          "description": "Issue #1415 AC13 (additive, optional).",
+          "type": ["string", "null"],
+          "minLength": 1
+        },
+        "workflow_run_identity": {
+          "description": "Issue #1415 AC13 (additive, optional): null when generated outside GitHub Actions.",
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["run_id", "run_attempt", "workflow_ref"],
+              "properties": {
+                "run_id": { "type": ["string", "null"], "minLength": 1 },
+                "run_attempt": { "type": ["string", "null"], "minLength": 1 },
+                "workflow_ref": { "type": ["string", "null"], "minLength": 1 }
+              }
+            },
+            { "type": "null" }
+          ]
         }
       }
     },
@@ -219,6 +284,23 @@
         "digest_encoding": {
           "type": "string",
           "const": "sha256-hex"
+        }
+      }
+    },
+    "resolvedCommentSetDigest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "digest",
+        "canonicalization_profile"
+      ],
+      "properties": {
+        "digest": {
+          "$ref": "#/$defs/sha256Digest"
+        },
+        "canonicalization_profile": {
+          "type": "string",
+          "const": "loop-comment-set-canonical-json-v1"
         }
       }
     }

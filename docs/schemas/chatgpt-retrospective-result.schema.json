@@ -132,6 +132,11 @@
         }
       }
     },
+    "no_findings_rationale": {
+      "description": "Issue #1415 AC10 (additive, optional field; required whenever findings is empty -- see check-retro-live-verification.mjs's --require-findings-or-rationale gate, which additionally rejects boilerplate placeholder phrases such as 'no findings'/'nothing to report' that this schema's minLength alone cannot detect): an explicit, non-trivial rationale for why zero findings were produced.",
+      "type": "string",
+      "minLength": 40
+    },
     "follow_up_issue_candidates": {
       "type": "array",
       "items": {

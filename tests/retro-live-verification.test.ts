@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { resolve as resolvePath, dirname } from 'node:path'
@@ -6,10 +6,12 @@ import { parse as parseYaml } from 'yaml'
 import { describe, expect, it } from 'vitest'
 
 import {
+  CANONICALIZATION_PROFILE_LOOP_V1,
   RETRO_LIVE_VERIFICATION_ALLOWED_PATHS,
   buildManifest,
   canonicalJsonStringify,
   computeCanonicalCommentBody,
+  computeResolvedCommentSetDigest,
   fromSha256Prefixed,
   normalizeTrustedActorAllowlist,
   sha256Hex,
@@ -21,10 +23,18 @@ import {
   isPaginationRejected as isPostPaginationRejected,
   planPost,
 } from '../scripts/post-retro-live-verification.mjs'
+import { fetchPullRequestReviewSurfaceLive } from '../scripts/agent-logs/lib/github-comments.mjs'
 import {
   checkCanonicalComment,
+  checkCaptureToPostLag,
+  checkDualTargetBundle,
+  checkRuntimeProvenanceComplete,
   evaluateContextAssertionsBinding,
+  evaluateFindingsOrRationale,
+  evaluatePrReviewSurfaceBinding,
+  evaluateResolvedCommentSetDigest,
   isPaginationRejected,
+  validateAgainstSchemaFile,
   verifyPrReviewBindingLive,
 } from '../scripts/check-retro-live-verification.mjs'
 
@@ -194,6 +204,19 @@ describe('planPost (producer compare-and-swap / trusted actor / negative fixture
     expect(plan.ok).toBe(true)
     expect(plan.action).toBe('noop')
   })
+
+  it('Issue #1415 AC4: GIVEN manifest WITH trusted_actor_id_allowlist WHEN --current-actor-id does not match THEN the trusted login alone is insufficient and posting is rejected', () => {
+    const manifestWithIdAllowlist = { ...manifest, execution_boundary: { ...manifest.execution_boundary, trusted_actor_id_allowlist: [63350259] } }
+    const plan = planPost({ manifest: manifestWithIdAllowlist, existingComments: [], currentActor: 'squne121', currentActorId: 111111 })
+    expect(plan.ok).toBe(false)
+    expect(plan.errorCode).toBe('retro_live_verification.untrusted_actor')
+  })
+
+  it('Issue #1415 AC4: GIVEN manifest WITH trusted_actor_id_allowlist WHEN both login and --current-actor-id match THEN posting proceeds', () => {
+    const manifestWithIdAllowlist = { ...manifest, execution_boundary: { ...manifest.execution_boundary, trusted_actor_id_allowlist: [63350259] } }
+    const plan = planPost({ manifest: manifestWithIdAllowlist, existingComments: [], currentActor: 'squne121', currentActorId: 63350259 })
+    expect(plan.ok).toBe(true)
+  })
 })
 
 describe('required negative test 7: concurrent-create post-write uniqueness (Issue #1709 PR review P1-1)', () => {
@@ -301,6 +324,53 @@ describe('checkCanonicalComment (verifier / negative fixtures)', () => {
     const result = checkCanonicalComment({ manifest, comments: loadFixture('trailing-content-comments.json') })
     expect(result.ok).toBe(false)
     expect(result.errors.some((e: { code: string }) => e.code === 'retro_live_verification_check.payload_trailing_content')).toBe(true)
+  })
+})
+
+describe('Issue #1415 AC4: marker authority numeric author id binding (additive, optional trusted_actor_id_allowlist)', () => {
+  const manifest = loadFixture('manifest.json')
+  const validComments = loadFixture('valid-comments.json')
+  const trustedLogin = validComments[0].user.login
+  const withAuthorId = (id: number | null) => [
+    { ...validComments[0], user: { ...validComments[0].user, id } },
+  ]
+
+  it('GIVEN manifest WITHOUT trusted_actor_id_allowlist (v2 default) WHEN a comment has no numeric id THEN it still passes on login alone (backward compatible)', () => {
+    const result = checkCanonicalComment({ manifest, comments: withAuthorId(null) })
+    expect(result.ok).toBe(true)
+  })
+
+  it('GIVEN manifest WITH trusted_actor_id_allowlist WHEN the comment author login matches but the numeric id does NOT THEN it fails closed with untrusted_marker_author (a bare login match is insufficient once a numeric allowlist is declared)', () => {
+    const manifestWithIdAllowlist = {
+      ...manifest,
+      execution_boundary: { ...manifest.execution_boundary, trusted_actor_id_allowlist: [999999] },
+    }
+    const result = checkCanonicalComment({ manifest: manifestWithIdAllowlist, comments: withAuthorId(63350259) })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'retro_live_verification_check.untrusted_marker_author')).toBe(true)
+  })
+
+  it('GIVEN manifest WITH trusted_actor_id_allowlist WHEN both login and numeric id match THEN it passes', () => {
+    const manifestWithIdAllowlist = {
+      ...manifest,
+      execution_boundary: { ...manifest.execution_boundary, trusted_actor_id_allowlist: [63350259] },
+    }
+    const result = checkCanonicalComment({ manifest: manifestWithIdAllowlist, comments: withAuthorId(63350259) })
+    expect(result.ok).toBe(true)
+  })
+
+  it('GIVEN two comments matching the ownership marker, one trusted and one authored by an untrusted login WHEN checked THEN the untrusted one is excluded from candidate/duplicate counting and the single trusted one is checked normally (not a false duplicate block)', () => {
+    const untrustedDuplicate = { ...validComments[0], id: 900002, user: { login: 'not-trusted-actor' } }
+    const result = checkCanonicalComment({ manifest, comments: [...validComments, untrustedDuplicate] })
+    expect(result.ok).toBe(true)
+    expect(trustedLogin).toBe('squne121')
+  })
+
+  it('GIVEN two trusted-author comments both matching the ownership marker WHEN checked THEN it still fails closed with matched_comment_count_mismatch (a trusted duplicate must never be treated as consensus)', () => {
+    const trustedDuplicate = { ...validComments[0], id: 900003 }
+    const result = checkCanonicalComment({ manifest, comments: [...validComments, trustedDuplicate] })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.matched_comment_count_mismatch')
   })
 })
 
@@ -465,6 +535,68 @@ describe('required negative test 3 (end-to-end subprocess): repository/pullReque
   })
 })
 
+describe('Issue #1415 AC2: context_assertions binding runs for issue targets too, not only pull_request targets', () => {
+  const checkScriptPath = resolvePath(REPO_ROOT, 'scripts/check-retro-live-verification.mjs')
+  const manifestPath = resolvePath(FIXTURES_DIR, 'gate-manifest.json')
+  const commentsPath = resolvePath(FIXTURES_DIR, 'gate-comments.json')
+  const resolveResultIssueValidPath = resolvePath(FIXTURES_DIR, 'gate-resolve-result-issue.json')
+  const resolveResultIssueMismatchPath = resolvePath(FIXTURES_DIR, 'gate-resolve-result-issue-mismatch.json')
+
+  it('GIVEN an issue-target manifest with a resolve-result fixture that MATCHES its context_assertions WHEN checked THEN the process passes', () => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        checkScriptPath,
+        '--manifest-json', manifestPath,
+        '--execution-profile', 'fixture',
+        '--fixture-comments-json', commentsPath,
+        '--fixture-resolve-result-json', resolveResultIssueValidPath,
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).toBe(0)
+    const payload = JSON.parse(result.stdout.trim())
+    expect(payload.verification_status).toBe('pass')
+  })
+
+  it('GIVEN an issue-target manifest with a resolve-result fixture whose matched_comment_count does NOT match its context_assertions WHEN checked THEN the process fails closed (regression guard: before the AC2 fix, this block was skipped entirely for target_type "issue" and always defaulted to ok:true)', () => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        checkScriptPath,
+        '--manifest-json', manifestPath,
+        '--execution-profile', 'fixture',
+        '--fixture-comments-json', commentsPath,
+        '--fixture-resolve-result-json', resolveResultIssueMismatchPath,
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).toBe(1)
+    const payload = JSON.parse(result.stdout.trim())
+    expect(payload.verification_status).toBe('fail')
+    expect(
+      payload.errors.some((error: { code: string }) => error.code === 'retro_live_verification_check.context_assertions_live_binding_failed'),
+    ).toBe(true)
+  })
+
+  it('GIVEN an issue-target manifest in fixture mode WITHOUT --fixture-resolve-result-json WHEN checked THEN it is a usage error, never a silent skip', () => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        checkScriptPath,
+        '--manifest-json', manifestPath,
+        '--execution-profile', 'fixture',
+        '--fixture-comments-json', commentsPath,
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).toBe(2)
+    const payload = JSON.parse(result.stdout.trim())
+    expect(payload.verification_status).toBe('error')
+    expect(payload.error_code).toBe('retro_live_verification_check.fixture_resolve_result_json_required')
+  })
+})
+
 describe('argument-free CLI wrapper fallback (Issue #1709 PR review P0-5, AC5/AC7)', () => {
   const generateScriptPath = resolvePath(REPO_ROOT, 'scripts/generate-retro-live-verification.mjs')
   const checkScriptPath = resolvePath(REPO_ROOT, 'scripts/check-retro-live-verification.mjs')
@@ -502,6 +634,12 @@ describe('argument-free CLI wrapper fallback (Issue #1709 PR review P0-5, AC5/AC
         'fixture',
         '--fixture-comments-json',
         resolvePath(FIXTURES_DIR, 'stale-digest-comments.json'),
+        // Issue #1415 AC2: context-assertions binding now runs unconditionally
+        // (both issue and pull_request targets), so fixture mode always
+        // requires a fixture-resolve-result-json even when this test's intent
+        // is to exercise the *comment-check* failure path below.
+        '--fixture-resolve-result-json',
+        resolvePath(FIXTURES_DIR, 'gate-resolve-result-issue.json'),
       ],
       { cwd: REPO_ROOT, encoding: 'utf-8' },
     )
@@ -509,5 +647,703 @@ describe('argument-free CLI wrapper fallback (Issue #1709 PR review P0-5, AC5/AC
     const payload = JSON.parse(result.stdout.trim())
     expect(payload.verification_status).toBe('fail')
     expect(payload.errors.some((error: { code: string }) => error.code === 'retro_live_verification_check.matched_comment_count_mismatch')).toBe(true)
+  })
+})
+
+describe('Issue #1415 AC13: checkRuntimeProvenanceComplete', () => {
+  const COMPLETE_PROVENANCE = {
+    generated_at: '2026-07-25T06:00:00Z',
+    generator_commit: '1bb6aa2f'.padEnd(40, '0'),
+    generator_version: '1.0.0',
+    node_version: 'v24.15.0',
+    pnpm_version: '11.7.0',
+    pnpm_lockfile_digest: 'sha256:' + 'a'.repeat(64),
+    gh_cli_version: '2.63.0',
+    github_api_version: null,
+    workflow_run_identity: null,
+  }
+
+  it('passes when all required-non-null fields are present and non-null, and optional-null keys are present', () => {
+    const result = checkRuntimeProvenanceComplete(COMPLETE_PROVENANCE)
+    expect(result.ok).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+
+  it('fails closed when a required-non-null field is missing entirely', () => {
+    const rest: Record<string, unknown> = { ...COMPLETE_PROVENANCE }
+    delete rest.node_version
+    const result = checkRuntimeProvenanceComplete(rest)
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.runtime_provenance_missing_field' && error.message.includes('node_version'))).toBe(true)
+  })
+
+  it('fails closed when a required-non-null field is explicitly null', () => {
+    const result = checkRuntimeProvenanceComplete({ ...COMPLETE_PROVENANCE, pnpm_version: null })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.message.includes('pnpm_version'))).toBe(true)
+  })
+
+  it('fails closed when an optional-null key (github_api_version) is absent rather than explicitly null', () => {
+    const rest: Record<string, unknown> = { ...COMPLETE_PROVENANCE }
+    delete rest.github_api_version
+    const result = checkRuntimeProvenanceComplete(rest)
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.message.includes('github_api_version'))).toBe(true)
+  })
+
+  it('fails closed for an empty/undefined runtime_provenance object', () => {
+    const result = checkRuntimeProvenanceComplete(undefined)
+    expect(result.ok).toBe(false)
+    expect(result.errors.length).toBeGreaterThanOrEqual(6)
+  })
+})
+
+describe('Issue #1415 AC15: checkCaptureToPostLag', () => {
+  it('passes when posted-at is within the max lag window', () => {
+    const result = checkCaptureToPostLag({
+      captureIso: '2026-07-25T06:00:00Z',
+      postedIso: '2026-07-25T06:10:00Z',
+      maxLagSeconds: 900,
+    })
+    expect(result.ok).toBe(true)
+    expect(result.lagSeconds).toBe(600)
+  })
+
+  it('fails closed when the lag exceeds max-capture-to-post-lag-seconds', () => {
+    const result = checkCaptureToPostLag({
+      captureIso: '2026-07-25T06:00:00Z',
+      postedIso: '2026-07-25T06:16:00Z',
+      maxLagSeconds: 900,
+    })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.capture_to_post_lag_exceeded')
+  })
+
+  it('fails closed when posted-at is earlier than capture (negative lag), even if within magnitude of max lag', () => {
+    const result = checkCaptureToPostLag({
+      captureIso: '2026-07-25T06:10:00Z',
+      postedIso: '2026-07-25T06:00:00Z',
+      maxLagSeconds: 900,
+    })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.capture_to_post_lag_negative')
+  })
+
+  it('fails closed on an invalid capture timestamp', () => {
+    const result = checkCaptureToPostLag({ captureIso: 'not-a-date', postedIso: '2026-07-25T06:00:00Z', maxLagSeconds: 900 })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.capture_timestamp_invalid')
+  })
+
+  it('fails closed on an invalid posted timestamp', () => {
+    const result = checkCaptureToPostLag({ captureIso: '2026-07-25T06:00:00Z', postedIso: 'not-a-date', maxLagSeconds: 900 })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.posted_timestamp_invalid')
+  })
+})
+
+describe('Issue #1415 AC5-7: evaluatePrReviewSurfaceBinding', () => {
+  const HEAD_SHA = 'b'.repeat(40)
+  const REVIEW_ID = 111
+  const COMMENT_ID = 222
+  const THREAD_NODE_ID = 'PRRT_thread1'
+
+  function makeSurface(overrides = {}) {
+    return {
+      headRefOid: HEAD_SHA,
+      reviews: [{ databaseId: REVIEW_ID, state: 'COMMENTED', commit: { oid: HEAD_SHA } }],
+      reviewThreads: [
+        {
+          id: THREAD_NODE_ID,
+          isResolved: true,
+          comments: { nodes: [{ databaseId: COMMENT_ID, pullRequestReview: { databaseId: REVIEW_ID } }] },
+        },
+      ],
+      ...overrides,
+    }
+  }
+
+  function makeBinding(overrides = {}) {
+    return {
+      reviewed_head_sha: HEAD_SHA,
+      selected_review_id: REVIEW_ID,
+      selected_review_comment_id: COMMENT_ID,
+      selected_review_thread_node_id: THREAD_NODE_ID,
+      ...overrides,
+    }
+  }
+
+  it('passes when review/comment/thread are mutually bound, resolved, and the head sha matches', () => {
+    const result = evaluatePrReviewSurfaceBinding({ surface: makeSurface(), prReviewBinding: makeBinding() })
+    expect(result.ok).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+
+  it('fails closed when there are zero reviews', () => {
+    const result = evaluatePrReviewSurfaceBinding({ surface: makeSurface({ reviews: [] }), prReviewBinding: makeBinding({ selected_review_id: null, selected_review_comment_id: null, selected_review_thread_node_id: null }) })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_zero_reviews')).toBe(true)
+  })
+
+  it('fails closed when there are zero review comments', () => {
+    const surface = makeSurface({ reviewThreads: [{ id: THREAD_NODE_ID, isResolved: true, comments: { nodes: [] } }] })
+    const result = evaluatePrReviewSurfaceBinding({ surface, prReviewBinding: makeBinding({ selected_review_comment_id: null, selected_review_thread_node_id: null }) })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_zero_review_comments')).toBe(true)
+  })
+
+  it('fails closed when there are zero resolved threads', () => {
+    const surface = makeSurface({ reviewThreads: [{ id: THREAD_NODE_ID, isResolved: false, comments: { nodes: [{ databaseId: COMMENT_ID, pullRequestReview: { databaseId: REVIEW_ID } }] } }] })
+    const result = evaluatePrReviewSurfaceBinding({ surface, prReviewBinding: makeBinding() })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_zero_resolved_threads')).toBe(true)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_thread_unresolved')).toBe(true)
+  })
+
+  it('fails closed when selected_review_id does not exist in the live surface', () => {
+    const result = evaluatePrReviewSurfaceBinding({ surface: makeSurface(), prReviewBinding: makeBinding({ selected_review_id: 999 }) })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_selected_review_missing')).toBe(true)
+  })
+
+  it('fails closed on stale PR head: live headRefOid diverges from manifest reviewed_head_sha', () => {
+    const result = evaluatePrReviewSurfaceBinding({ surface: makeSurface({ headRefOid: 'c'.repeat(40) }), prReviewBinding: makeBinding() })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_stale_pr_head')).toBe(true)
+  })
+
+  it('fails closed when the selected review comment does not belong to the selected review', () => {
+    const surface = makeSurface({
+      reviewThreads: [
+        {
+          id: THREAD_NODE_ID,
+          isResolved: true,
+          comments: { nodes: [{ databaseId: COMMENT_ID, pullRequestReview: { databaseId: 999 } }] },
+        },
+      ],
+    })
+    const result = evaluatePrReviewSurfaceBinding({ surface, prReviewBinding: makeBinding() })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_comment_review_mismatch')).toBe(true)
+  })
+
+  it('fails closed when the selected thread is unresolved', () => {
+    const surface = makeSurface({
+      reviewThreads: [
+        {
+          id: THREAD_NODE_ID,
+          isResolved: false,
+          comments: { nodes: [{ databaseId: COMMENT_ID, pullRequestReview: { databaseId: REVIEW_ID } }] },
+        },
+      ],
+    })
+    const result = evaluatePrReviewSurfaceBinding({ surface, prReviewBinding: makeBinding() })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_thread_unresolved')).toBe(true)
+  })
+
+  it('fails closed when the selected comment is not a member of the selected thread', () => {
+    const surface = makeSurface({
+      reviewThreads: [
+        {
+          id: THREAD_NODE_ID,
+          isResolved: true,
+          comments: { nodes: [{ databaseId: 333, pullRequestReview: { databaseId: REVIEW_ID } }] },
+        },
+        {
+          id: 'PRRT_other_thread',
+          isResolved: true,
+          comments: { nodes: [{ databaseId: COMMENT_ID, pullRequestReview: { databaseId: REVIEW_ID } }] },
+        },
+      ],
+    })
+    const result = evaluatePrReviewSurfaceBinding({ surface, prReviewBinding: makeBinding() })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_comment_not_in_thread')).toBe(true)
+  })
+
+  it('skips the selected-id cross-checks (but still enforces the >=1 minimums) when selected_review_id is null', () => {
+    const result = evaluatePrReviewSurfaceBinding({ surface: makeSurface(), prReviewBinding: makeBinding({ selected_review_id: null, selected_review_comment_id: null, selected_review_thread_node_id: null }) })
+    expect(result.ok).toBe(true)
+  })
+})
+
+describe('Issue #1415 AC5-7 / AC14: fetchPullRequestReviewSurfaceLive (GraphQL fetch orchestration, malformed/errors/pagination fail-closed)', () => {
+  const ARGS = { repo: 'squne121/loop-protocol', pullNumber: 1411 }
+  const EMPTY_REVIEWS_PAGE = { ok: true, errors: [], repositoryNull: false, pullRequestNull: false, headRefOid: 'a'.repeat(40), items: [], hasNextPage: false, endCursor: null }
+  const EMPTY_THREADS_PAGE = { ok: true, errors: [], repositoryNull: false, pullRequestNull: false, items: [], hasNextPage: false, endCursor: null, threadCommentsPaginationIncomplete: false }
+
+  it('GIVEN a GraphQL response with a non-empty `errors` array WHEN fetching reviews THEN it fails closed with pr_review_surface.graphql_errors rather than treating partial data as complete (AC14: malformed GraphQL partial response)', async () => {
+    const client = {
+      fetchReviewsPage: async () => ({ ok: false, errors: [{ message: 'Something went wrong while executing your query.' }], repositoryNull: false, pullRequestNull: false }),
+      fetchReviewThreadsPage: async () => EMPTY_THREADS_PAGE,
+    }
+    const result = await fetchPullRequestReviewSurfaceLive(client, ARGS)
+    expect(result.ok).toBe(false)
+    expect(result.errorCode).toBe('pr_review_surface.graphql_errors')
+  })
+
+  it('GIVEN repository resolves to null (e.g. renamed/deleted repo) WHEN fetching reviews THEN it fails closed rather than treating null as an empty result set (AC14: repository/pullRequest null)', async () => {
+    const client = {
+      fetchReviewsPage: async () => ({ ok: false, errors: [], repositoryNull: true, pullRequestNull: false }),
+      fetchReviewThreadsPage: async () => EMPTY_THREADS_PAGE,
+    }
+    const result = await fetchPullRequestReviewSurfaceLive(client, ARGS)
+    expect(result.ok).toBe(false)
+    expect(result.errorCode).toBe('pr_review_surface.repository_null')
+  })
+
+  it('GIVEN pullRequest resolves to null (e.g. PR number does not exist) WHEN fetching review threads THEN it fails closed', async () => {
+    const client = {
+      fetchReviewsPage: async () => EMPTY_REVIEWS_PAGE,
+      fetchReviewThreadsPage: async () => ({ ok: false, errors: [], repositoryNull: false, pullRequestNull: true }),
+    }
+    const result = await fetchPullRequestReviewSurfaceLive(client, ARGS)
+    expect(result.ok).toBe(false)
+    expect(result.errorCode).toBe('pr_review_surface.pull_request_null')
+  })
+
+  it('GIVEN the reviews connection never reaches hasNextPage: false within maxPages WHEN fetching THEN it fails closed with reviews_page_budget_exhausted (AC14: pagination incomplete, never silently truncated)', async () => {
+    const client = {
+      fetchReviewsPage: async () => ({ ok: true, errors: [], repositoryNull: false, pullRequestNull: false, headRefOid: 'a'.repeat(40), items: [{ databaseId: 1 }], hasNextPage: true, endCursor: 'cursor' }),
+      fetchReviewThreadsPage: async () => EMPTY_THREADS_PAGE,
+    }
+    const result = await fetchPullRequestReviewSurfaceLive(client, { ...ARGS, maxPages: 2 })
+    expect(result.ok).toBe(false)
+    expect(result.errorCode).toBe('pr_review_surface.reviews_page_budget_exhausted')
+  })
+
+  it('GIVEN the reviewThreads connection never reaches hasNextPage: false within maxPages WHEN fetching THEN it fails closed with review_threads_page_budget_exhausted', async () => {
+    const client = {
+      fetchReviewsPage: async () => EMPTY_REVIEWS_PAGE,
+      fetchReviewThreadsPage: async () => ({ ok: true, errors: [], repositoryNull: false, pullRequestNull: false, items: [{ id: 't1' }], hasNextPage: true, endCursor: 'cursor', threadCommentsPaginationIncomplete: false }),
+    }
+    const result = await fetchPullRequestReviewSurfaceLive(client, { ...ARGS, maxPages: 2 })
+    expect(result.ok).toBe(false)
+    expect(result.errorCode).toBe('pr_review_surface.review_threads_page_budget_exhausted')
+  })
+
+  it('GIVEN a single thread whose own comments sub-connection has hasNextPage: true WHEN fetching THEN it fails closed with thread_comments_page_budget_exhausted rather than silently truncating that thread\'s comments (AC14: pagination incomplete, sub-connection)', async () => {
+    const client = {
+      fetchReviewsPage: async () => EMPTY_REVIEWS_PAGE,
+      fetchReviewThreadsPage: async () => ({ ok: true, errors: [], repositoryNull: false, pullRequestNull: false, items: [{ id: 't1' }], hasNextPage: false, endCursor: null, threadCommentsPaginationIncomplete: true }),
+    }
+    const result = await fetchPullRequestReviewSurfaceLive(client, ARGS)
+    expect(result.ok).toBe(false)
+    expect(result.errorCode).toBe('pr_review_surface.thread_comments_page_budget_exhausted')
+  })
+
+  it('GIVEN reviews has zero items and reviewThreads has zero items (a PR with no review activity yet) WHEN fetched THEN the fetch itself still succeeds (the >=1 minimums are evaluatePrReviewSurfaceBinding\'s responsibility, not the fetch layer\'s) but the surface is empty', async () => {
+    const client = {
+      fetchReviewsPage: async () => EMPTY_REVIEWS_PAGE,
+      fetchReviewThreadsPage: async () => EMPTY_THREADS_PAGE,
+    }
+    const result = await fetchPullRequestReviewSurfaceLive(client, ARGS)
+    expect(result.ok).toBe(true)
+    expect(result.reviews).toEqual([])
+    expect(result.reviewThreads).toEqual([])
+    // AC14 (zero review object): the downstream check must still reject this.
+    const binding = evaluatePrReviewSurfaceBinding({
+      surface: { headRefOid: result.headRefOid, reviews: result.reviews, reviewThreads: result.reviewThreads },
+      prReviewBinding: { reviewed_head_sha: 'a'.repeat(40), selected_review_id: null, selected_review_comment_id: null, selected_review_thread_node_id: null },
+    })
+    expect(binding.ok).toBe(false)
+    expect(binding.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_zero_reviews')).toBe(true)
+  })
+
+  it('GIVEN reviews resolves across two pages WHEN fetched THEN both pages\' items are concatenated and headRefOid comes from the (first) page response', async () => {
+    let call = 0
+    const client = {
+      fetchReviewsPage: async () => {
+        call += 1
+        if (call === 1) {
+          return { ok: true, errors: [], repositoryNull: false, pullRequestNull: false, headRefOid: 'a'.repeat(40), items: [{ databaseId: 1 }], hasNextPage: true, endCursor: 'cursor-1' }
+        }
+        return { ok: true, errors: [], repositoryNull: false, pullRequestNull: false, headRefOid: 'a'.repeat(40), items: [{ databaseId: 2 }], hasNextPage: false, endCursor: null }
+      },
+      fetchReviewThreadsPage: async () => EMPTY_THREADS_PAGE,
+    }
+    const result = await fetchPullRequestReviewSurfaceLive(client, { ...ARGS, maxPages: 5 })
+    expect(result.ok).toBe(true)
+    expect(result.reviews.map((review) => review.databaseId)).toEqual([1, 2])
+    expect(result.headRefOid).toBe('a'.repeat(40))
+  })
+})
+
+describe('Issue #1415 AC8-9: computeResolvedCommentSetDigest / evaluateResolvedCommentSetDigest', () => {
+  const BASE_COMMENTS = [
+    {
+      surface_kind: 'issue_comment',
+      comment_id: 1,
+      author_id: 63350259,
+      created_at: '2026-07-25T06:00:00Z',
+      updated_at: '2026-07-25T06:00:00Z',
+      body: 'hello',
+    },
+    {
+      surface_kind: 'pr_review',
+      comment_id: 2,
+      author_id: 63350259,
+      created_at: '2026-07-25T06:05:00Z',
+      updated_at: '2026-07-25T06:05:00Z',
+      body: 'lgtm',
+      review_state: 'APPROVED',
+      review_commit_id: 'a'.repeat(40),
+    },
+  ]
+
+  it('is deterministic for the same repo_id/target_node_id/comments input', () => {
+    const first = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    const second = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    expect(first).toBe(second)
+    expect(first).toMatch(/^[a-f0-9]{64}$/u)
+  })
+
+  it('is independent of input comment array order (canonical sort by surface_kind:comment_id)', () => {
+    const forward = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    const reversed = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: [...BASE_COMMENTS].reverse() })
+    expect(forward).toBe(reversed)
+  })
+
+  it('changes when repo_id or target_node_id changes, even with the same comments (binds identity, not just content)', () => {
+    const original = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    const differentRepo = computeResolvedCommentSetDigest({ repoId: 'R_other', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    const differentTarget = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_other', comments: BASE_COMMENTS })
+    expect(differentRepo).not.toBe(original)
+    expect(differentTarget).not.toBe(original)
+  })
+
+  it('changes when updated_at changes (mutable-comment detection) even though body is unchanged', () => {
+    const original = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    const mutated = computeResolvedCommentSetDigest({
+      repoId: 'R_repo',
+      targetNodeId: 'I_target',
+      comments: [{ ...BASE_COMMENTS[0], updated_at: '2026-07-25T07:00:00Z' }, BASE_COMMENTS[1]],
+    })
+    expect(mutated).not.toBe(original)
+  })
+
+  it('changes when body content changes (body digest substitution detection)', () => {
+    const original = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    const bodySwapped = computeResolvedCommentSetDigest({
+      repoId: 'R_repo',
+      targetNodeId: 'I_target',
+      comments: [{ ...BASE_COMMENTS[0], body: 'goodbye' }, BASE_COMMENTS[1]],
+    })
+    expect(bodySwapped).not.toBe(original)
+  })
+
+  it('NFC-normalizes body text before hashing, so canonically-equivalent Unicode is digest-identical', () => {
+    const precomposed = '\u00e9' // U+00E9 LATIN SMALL LETTER E WITH ACUTE (single NFC codepoint)
+    const decomposed = 'e\u0301' // 'e' + U+0301 COMBINING ACUTE ACCENT (NFD form)
+    expect(precomposed).not.toBe(decomposed) // sanity: byte-distinct inputs
+    const precomposedDigest = computeResolvedCommentSetDigest({ repoId: 'R', targetNodeId: 'T', comments: [{ surface_kind: 'issue_comment', comment_id: 1, author_id: 1, created_at: 'x', updated_at: 'x', body: precomposed }] })
+    const decomposedDigest = computeResolvedCommentSetDigest({ repoId: 'R', targetNodeId: 'T', comments: [{ surface_kind: 'issue_comment', comment_id: 1, author_id: 1, created_at: 'x', updated_at: 'x', body: decomposed }] })
+    expect(precomposedDigest).toBe(decomposedDigest)
+  })
+
+  it('evaluateResolvedCommentSetDigest passes when the recomputed digest matches the stored manifest value', () => {
+    const digest = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    const manifest = { resolved_comment_set_digest: { digest, canonicalization_profile: CANONICALIZATION_PROFILE_LOOP_V1 } }
+    const result = evaluateResolvedCommentSetDigest({ manifest, commentSet: { repo_id: 'R_repo', target_node_id: 'I_target', comments: BASE_COMMENTS } })
+    expect(result.ok).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+
+  it('evaluateResolvedCommentSetDigest fails closed when the recomputed digest does not match (tampered/stale comment set)', () => {
+    const digest = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    const manifest = { resolved_comment_set_digest: { digest, canonicalization_profile: CANONICALIZATION_PROFILE_LOOP_V1 } }
+    const result = evaluateResolvedCommentSetDigest({ manifest, commentSet: { repo_id: 'R_repo', target_node_id: 'I_target', comments: [{ ...BASE_COMMENTS[0], body: 'tampered' }, BASE_COMMENTS[1]] } })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.resolved_comment_set_digest_mismatch')
+  })
+
+  it('evaluateResolvedCommentSetDigest fails closed when the manifest has no resolved_comment_set_digest to recompute against', () => {
+    const result = evaluateResolvedCommentSetDigest({ manifest: {}, commentSet: { repo_id: 'R_repo', target_node_id: 'I_target', comments: BASE_COMMENTS } })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.resolved_comment_set_digest_missing')
+  })
+
+  it('evaluateResolvedCommentSetDigest fails closed on a canonicalization_profile mismatch', () => {
+    const digest = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    const manifest = { resolved_comment_set_digest: { digest, canonicalization_profile: 'some-other-profile-v1' } }
+    const result = evaluateResolvedCommentSetDigest({ manifest, commentSet: { repo_id: 'R_repo', target_node_id: 'I_target', comments: BASE_COMMENTS } })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.resolved_comment_set_digest_profile_mismatch')
+  })
+})
+
+describe('Issue #1415 AC10: evaluateFindingsOrRationale', () => {
+  it('passes when at least one finding is present, regardless of no_findings_rationale', () => {
+    const result = evaluateFindingsOrRationale({ findings: [{ severity: 'low', title: 'x' }] })
+    expect(result.ok).toBe(true)
+  })
+
+  it('fails closed when findings is empty and no_findings_rationale is absent', () => {
+    const result = evaluateFindingsOrRationale({ findings: [] })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.no_findings_rationale_missing')
+  })
+
+  it('fails closed when findings is empty and no_findings_rationale is an empty/whitespace string', () => {
+    const result = evaluateFindingsOrRationale({ findings: [], no_findings_rationale: '   ' })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.no_findings_rationale_missing')
+  })
+
+  it.each(['No findings.', 'nothing to report', 'N/A', 'none.', '  NO FINDINGS  '])(
+    'fails closed on the boilerplate placeholder rationale %j',
+    (boilerplate) => {
+      const result = evaluateFindingsOrRationale({ findings: [], no_findings_rationale: boilerplate })
+      expect(result.ok).toBe(false)
+      expect(result.errors[0].code).toBe('retro_live_verification_check.no_findings_rationale_boilerplate')
+    },
+  )
+
+  it('passes when findings is empty and no_findings_rationale is a genuine, non-boilerplate explanation', () => {
+    const result = evaluateFindingsOrRationale({
+      findings: [],
+      no_findings_rationale: 'Reviewed all 12 changed files against the linked issue AC list; every AC has a passing deterministic VC and no gaps were found in this pass.',
+    })
+    expect(result.ok).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+})
+
+describe('Issue #1415 AC10-11: standalone --schema checker (chatgpt_retrospective_result/v1, chatgpt-retro-execution-proof)', () => {
+  const RETROSPECTIVE_SCHEMA_FILE = resolvePath(REPO_ROOT, 'docs/schemas/chatgpt-retrospective-result.schema.json')
+  const EXECUTION_PROOF_SCHEMA_FILE = resolvePath(REPO_ROOT, 'docs/schemas/chatgpt-retro-execution-proof.schema.json')
+
+  const VALID_RETROSPECTIVE_RESULT = {
+    schema: 'chatgpt_retrospective_result/v1',
+    target: { repo: 'squne121/loop-protocol', type: 'issue', number: 1153 },
+    input_marker_digest: `sha256:${'a'.repeat(64)}`,
+    verdict: 'approve',
+    findings: [],
+    no_findings_rationale: 'Reviewed the full artifact chain against the linked issue AC list and found no gaps in this pass.',
+    follow_up_issue_candidates: [],
+    raw_values_emitted: false,
+  }
+
+  it('GIVEN a schema-valid retrospective result with a genuine no_findings_rationale WHEN validated THEN it passes', async () => {
+    const result = await validateAgainstSchemaFile(RETROSPECTIVE_SCHEMA_FILE, VALID_RETROSPECTIVE_RESULT)
+    expect(result.valid).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+
+  it('GIVEN a retrospective result with raw_values_emitted: true WHEN validated THEN schema validation fails closed (const false)', async () => {
+    const result = await validateAgainstSchemaFile(RETROSPECTIVE_SCHEMA_FILE, { ...VALID_RETROSPECTIVE_RESULT, raw_values_emitted: true })
+    expect(result.valid).toBe(false)
+  })
+
+  it('GIVEN a no_findings_rationale shorter than the schema minLength WHEN validated THEN schema validation fails closed', async () => {
+    const result = await validateAgainstSchemaFile(RETROSPECTIVE_SCHEMA_FILE, { ...VALID_RETROSPECTIVE_RESULT, no_findings_rationale: 'too short' })
+    expect(result.valid).toBe(false)
+  })
+
+  it('GIVEN proof_strength using only the allowed enum values (declared_by_session_operator) WHEN validated against its own sub-schema THEN it passes (AC11: operator_attested vs machine_verified boundary)', async () => {
+    const schemaText = readFileSync(EXECUTION_PROOF_SCHEMA_FILE, 'utf-8')
+    const schema = JSON.parse(schemaText)
+    const proofStrengthSchema = schema.properties.chatgpt_context.properties.proof_strength
+    const AjvModule = await import('ajv/dist/2020.js')
+    const Ajv2020 = AjvModule.default
+    const ajv = new Ajv2020({ strict: false, allErrors: true })
+    const validate = ajv.compile(proofStrengthSchema)
+    const valid = validate({
+      context_resolvability: 'machine_verified',
+      retrospective_result_schema: 'machine_verified',
+      connector_only_execution: 'declared_by_session_operator',
+      local_file_non_use: 'declared_by_session_operator',
+      latitude_direct_non_use: 'declared_by_session_operator',
+      machine_verifies_actual_chatgpt_tool_boundary: false,
+    })
+    expect(valid).toBe(true)
+  })
+
+  it('GIVEN machine_verifies_actual_chatgpt_tool_boundary: true (an over-claim) WHEN validated THEN it is rejected (const false)', async () => {
+    const schemaText = readFileSync(EXECUTION_PROOF_SCHEMA_FILE, 'utf-8')
+    const schema = JSON.parse(schemaText)
+    const proofStrengthSchema = schema.properties.chatgpt_context.properties.proof_strength
+    const AjvModule = await import('ajv/dist/2020.js')
+    const Ajv2020 = AjvModule.default
+    const ajv = new Ajv2020({ strict: false, allErrors: true })
+    const validate = ajv.compile(proofStrengthSchema)
+    const valid = validate({
+      context_resolvability: 'machine_verified',
+      retrospective_result_schema: 'machine_verified',
+      connector_only_execution: 'declared_by_session_operator',
+      local_file_non_use: 'declared_by_session_operator',
+      latitude_direct_non_use: 'declared_by_session_operator',
+      machine_verifies_actual_chatgpt_tool_boundary: true,
+    })
+    expect(valid).toBe(false)
+  })
+
+  it('GIVEN proof_strength.connector_only_execution mis-declared as a free-form "machine_verified_by_operator" string WHEN validated against the enum THEN it is rejected (never silently accepted as machine_verified)', async () => {
+    const schemaText = readFileSync(EXECUTION_PROOF_SCHEMA_FILE, 'utf-8')
+    const schema = JSON.parse(schemaText)
+    const proofStrengthSchema = schema.properties.chatgpt_context.properties.proof_strength
+    const AjvModule = await import('ajv/dist/2020.js')
+    const Ajv2020 = AjvModule.default
+    const ajv = new Ajv2020({ strict: false, allErrors: true })
+    const validate = ajv.compile(proofStrengthSchema)
+    const valid = validate({
+      context_resolvability: 'machine_verified',
+      retrospective_result_schema: 'machine_verified',
+      connector_only_execution: 'machine_verified_by_operator',
+      local_file_non_use: 'declared_by_session_operator',
+      latitude_direct_non_use: 'declared_by_session_operator',
+      machine_verifies_actual_chatgpt_tool_boundary: false,
+    })
+    expect(valid).toBe(false)
+  })
+
+  it('GIVEN the CLI --schema chatgpt_retrospective_result/v1 --require-findings-or-rationale standalone mode WHEN findings is empty with no rationale THEN the subprocess exits non-zero with the expected error code', () => {
+    const tmpFile = resolvePath(REPO_ROOT, 'tmp', `retro-standalone-test-${process.pid}.json`)
+    mkdirSync(dirname(tmpFile), { recursive: true })
+    writeFileSync(tmpFile, JSON.stringify({ ...VALID_RETROSPECTIVE_RESULT, no_findings_rationale: undefined, findings: [] }))
+    try {
+      const result = spawnSync(
+        'node',
+        [
+          resolvePath(REPO_ROOT, 'scripts/check-retro-live-verification.mjs'),
+          '--',
+          '--schema', 'chatgpt_retrospective_result/v1',
+          '--require-findings-or-rationale', 'true',
+          '--input', tmpFile,
+        ],
+        { cwd: REPO_ROOT, encoding: 'utf-8' },
+      )
+      expect(result.status).toBe(1)
+      const payload = JSON.parse(result.stdout.trim())
+      expect(payload.verification_status).toBe('fail')
+      expect(payload.errors.some((error: { code: string }) => error.code === 'retro_live_verification_check.no_findings_rationale_missing')).toBe(true)
+    } finally {
+      unlinkSync(tmpFile)
+    }
+  })
+})
+
+describe('Issue #1415 dual-target bundle (retro_live_verification/v3, additive sibling of v2)', () => {
+  const DUAL_TARGET_SCHEMA_FILE = resolvePath(REPO_ROOT, 'docs/schemas/retro-live-verification-dual-target.schema.json')
+  const VALID_BUNDLE = loadFixture('dual-target-bundle-valid.json')
+  const ISSUE_RESOLVE_RESULT = resolvePath(FIXTURES_DIR, 'dual-target-resolve-result-issue.json')
+  const PR_RESOLVE_RESULT = resolvePath(FIXTURES_DIR, 'dual-target-resolve-result-pull-request.json')
+
+  it('GIVEN a valid dual-target bundle WHEN validated against retro_live_verification/v3 THEN it passes schema validation', async () => {
+    const result = await validateAgainstSchemaFile(DUAL_TARGET_SCHEMA_FILE, VALID_BUNDLE)
+    expect(result.valid).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+
+  it('GIVEN a bundle missing pull_request_target entirely WHEN validated THEN it fails closed (never treated as issue-only)', async () => {
+    const withoutPrTarget: Record<string, unknown> = { ...VALID_BUNDLE }
+    delete withoutPrTarget.pull_request_target
+    const result = await validateAgainstSchemaFile(DUAL_TARGET_SCHEMA_FILE, withoutPrTarget)
+    expect(result.valid).toBe(false)
+  })
+
+  it('GIVEN a bundle with an existing retro_live_verification/v2 manifest payload WHEN validated against v3 THEN it is rejected (schema const mismatch, v2 documents are never silently accepted as v3)', async () => {
+    const v2Manifest = loadFixture('gate-manifest.json')
+    const result = await validateAgainstSchemaFile(DUAL_TARGET_SCHEMA_FILE, v2Manifest)
+    expect(result.valid).toBe(false)
+  })
+
+  it('GIVEN a v2 manifest fixture WHEN validated against the original v2 schema THEN it still passes unchanged (v3 addition does not regress v2)', async () => {
+    const v2Manifest = loadFixture('gate-manifest.json')
+    const validation = await validateManifestWithAjv(v2Manifest)
+    expect(validation.valid).toBe(true)
+  })
+
+  it('GIVEN a schema-valid dual-target bundle with matching fixture resolve-results for BOTH targets WHEN checkDualTargetBundle runs THEN both targets pass their assert-live context-assertion binding (AC2 dual-target: issue_target is never skipped)', async () => {
+    const result = await checkDualTargetBundle(VALID_BUNDLE, {
+      executionProfile: 'fixture',
+      fixtureResolveResultJsonIssueTarget: ISSUE_RESOLVE_RESULT,
+      fixtureResolveResultJsonPullRequestTarget: PR_RESOLVE_RESULT,
+    })
+    expect(result.ok).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+
+  it('GIVEN a dual-target bundle WHEN issue_target.context_assertions.expected_digest does not match the fixture resolve-result THEN issue_target fails closed even though pull_request_target is untouched (per-target isolation, issue side is never silently skipped)', async () => {
+    const tampered = {
+      ...VALID_BUNDLE,
+      issue_target: {
+        ...VALID_BUNDLE.issue_target,
+        context_assertions: { ...VALID_BUNDLE.issue_target.context_assertions, expected_digest: `sha256:${'0'.repeat(64)}` },
+      },
+    }
+    const result = await checkDualTargetBundle(tampered, {
+      executionProfile: 'fixture',
+      fixtureResolveResultJsonIssueTarget: ISSUE_RESOLVE_RESULT,
+      fixtureResolveResultJsonPullRequestTarget: PR_RESOLVE_RESULT,
+    })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error: { message: string }) => error.message.startsWith('[issue_target]'))).toBe(true)
+    expect(result.errors.some((error: { message: string }) => error.message.startsWith('[pull_request_target]'))).toBe(false)
+  })
+
+  it('GIVEN a dual-target bundle WHEN pull_request_target.context_assertions.expected_matched_comment_count does not match the fixture resolve-result THEN pull_request_target fails closed and is labeled distinctly from issue_target', async () => {
+    const tampered = {
+      ...VALID_BUNDLE,
+      pull_request_target: {
+        ...VALID_BUNDLE.pull_request_target,
+        context_assertions: { ...VALID_BUNDLE.pull_request_target.context_assertions, expected_matched_comment_count: 99 },
+      },
+    }
+    const result = await checkDualTargetBundle(tampered, {
+      executionProfile: 'fixture',
+      fixtureResolveResultJsonIssueTarget: ISSUE_RESOLVE_RESULT,
+      fixtureResolveResultJsonPullRequestTarget: PR_RESOLVE_RESULT,
+    })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error: { message: string }) => error.message.startsWith('[pull_request_target]'))).toBe(true)
+  })
+
+  it('GIVEN a structurally invalid bundle (missing issue_target) WHEN checkDualTargetBundle runs THEN it fails closed at the schema stage without attempting to dereference the missing target (no crash, no false pass)', async () => {
+    const withoutIssueTarget: Record<string, unknown> = { ...VALID_BUNDLE }
+    delete withoutIssueTarget.issue_target
+    const result = await checkDualTargetBundle(withoutIssueTarget, {
+      executionProfile: 'fixture',
+      fixtureResolveResultJsonIssueTarget: ISSUE_RESOLVE_RESULT,
+      fixtureResolveResultJsonPullRequestTarget: PR_RESOLVE_RESULT,
+    })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error: { code: string }) => error.code === 'retro_live_verification_check.dual_target_bundle_schema_invalid')).toBe(true)
+  })
+
+  it('GIVEN the CLI --schema retro_live_verification/v3 standalone mode WHEN both targets fixture-resolve cleanly THEN the subprocess exits 0 with verification_status pass', () => {
+    const result = spawnSync(
+      'node',
+      [
+        resolvePath(REPO_ROOT, 'scripts/check-retro-live-verification.mjs'),
+        '--',
+        '--schema', 'retro_live_verification/v3',
+        '--execution-profile', 'fixture',
+        '--input', resolvePath(FIXTURES_DIR, 'dual-target-bundle-valid.json'),
+        '--fixture-resolve-result-json-issue-target', ISSUE_RESOLVE_RESULT,
+        '--fixture-resolve-result-json-pull-request-target', PR_RESOLVE_RESULT,
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).toBe(0)
+    const payload = JSON.parse(result.stdout.trim())
+    expect(payload.verification_status).toBe('pass')
+  })
+
+  it('GIVEN the CLI --schema retro_live_verification/v3 standalone mode WHEN --fixture-resolve-result-json-pull-request-target is omitted in fixture mode THEN it exits with a usage error rather than silently skipping the pull_request_target assertion', () => {
+    const result = spawnSync(
+      'node',
+      [
+        resolvePath(REPO_ROOT, 'scripts/check-retro-live-verification.mjs'),
+        '--',
+        '--schema', 'retro_live_verification/v3',
+        '--execution-profile', 'fixture',
+        '--input', resolvePath(FIXTURES_DIR, 'dual-target-bundle-valid.json'),
+        '--fixture-resolve-result-json-issue-target', ISSUE_RESOLVE_RESULT,
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).not.toBe(0)
   })
 })
