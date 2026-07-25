@@ -74,7 +74,11 @@ const GITHUB_LOGIN_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?(?:\
 
 let Ajv2020
 let addFormats
-async function loadAjv() {
+// Issue #1415 AC10-11: exported so check-retro-live-verification.mjs can
+// validate an independent schema file (chatgpt-retrospective-result) with
+// the same Ajv2020 setup, instead of re-implementing ajv/ajv-formats
+// dynamic import wiring a second time.
+export async function loadAjv() {
   if (Ajv2020 && addFormats) {
     return { Ajv2020, addFormats }
   }

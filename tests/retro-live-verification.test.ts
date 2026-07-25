@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { resolve as resolvePath, dirname } from 'node:path'
@@ -28,9 +28,11 @@ import {
   checkCaptureToPostLag,
   checkRuntimeProvenanceComplete,
   evaluateContextAssertionsBinding,
+  evaluateFindingsOrRationale,
   evaluatePrReviewSurfaceBinding,
   evaluateResolvedCommentSetDigest,
   isPaginationRejected,
+  validateAgainstSchemaFile,
   verifyPrReviewBindingLive,
 } from '../scripts/check-retro-live-verification.mjs'
 
@@ -964,5 +966,155 @@ describe('Issue #1415 AC8-9: computeResolvedCommentSetDigest / evaluateResolvedC
     const result = evaluateResolvedCommentSetDigest({ manifest, commentSet: { repo_id: 'R_repo', target_node_id: 'I_target', comments: BASE_COMMENTS } })
     expect(result.ok).toBe(false)
     expect(result.errors[0].code).toBe('retro_live_verification_check.resolved_comment_set_digest_profile_mismatch')
+  })
+})
+
+describe('Issue #1415 AC10: evaluateFindingsOrRationale', () => {
+  it('passes when at least one finding is present, regardless of no_findings_rationale', () => {
+    const result = evaluateFindingsOrRationale({ findings: [{ severity: 'low', title: 'x' }] })
+    expect(result.ok).toBe(true)
+  })
+
+  it('fails closed when findings is empty and no_findings_rationale is absent', () => {
+    const result = evaluateFindingsOrRationale({ findings: [] })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.no_findings_rationale_missing')
+  })
+
+  it('fails closed when findings is empty and no_findings_rationale is an empty/whitespace string', () => {
+    const result = evaluateFindingsOrRationale({ findings: [], no_findings_rationale: '   ' })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.no_findings_rationale_missing')
+  })
+
+  it.each(['No findings.', 'nothing to report', 'N/A', 'none.', '  NO FINDINGS  '])(
+    'fails closed on the boilerplate placeholder rationale %j',
+    (boilerplate) => {
+      const result = evaluateFindingsOrRationale({ findings: [], no_findings_rationale: boilerplate })
+      expect(result.ok).toBe(false)
+      expect(result.errors[0].code).toBe('retro_live_verification_check.no_findings_rationale_boilerplate')
+    },
+  )
+
+  it('passes when findings is empty and no_findings_rationale is a genuine, non-boilerplate explanation', () => {
+    const result = evaluateFindingsOrRationale({
+      findings: [],
+      no_findings_rationale: 'Reviewed all 12 changed files against the linked issue AC list; every AC has a passing deterministic VC and no gaps were found in this pass.',
+    })
+    expect(result.ok).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+})
+
+describe('Issue #1415 AC10-11: standalone --schema checker (chatgpt_retrospective_result/v1, chatgpt-retro-execution-proof)', () => {
+  const RETROSPECTIVE_SCHEMA_FILE = resolvePath(REPO_ROOT, 'docs/schemas/chatgpt-retrospective-result.schema.json')
+  const EXECUTION_PROOF_SCHEMA_FILE = resolvePath(REPO_ROOT, 'docs/schemas/chatgpt-retro-execution-proof.schema.json')
+
+  const VALID_RETROSPECTIVE_RESULT = {
+    schema: 'chatgpt_retrospective_result/v1',
+    target: { repo: 'squne121/loop-protocol', type: 'issue', number: 1153 },
+    input_marker_digest: `sha256:${'a'.repeat(64)}`,
+    verdict: 'approve',
+    findings: [],
+    no_findings_rationale: 'Reviewed the full artifact chain against the linked issue AC list and found no gaps in this pass.',
+    follow_up_issue_candidates: [],
+    raw_values_emitted: false,
+  }
+
+  it('GIVEN a schema-valid retrospective result with a genuine no_findings_rationale WHEN validated THEN it passes', async () => {
+    const result = await validateAgainstSchemaFile(RETROSPECTIVE_SCHEMA_FILE, VALID_RETROSPECTIVE_RESULT)
+    expect(result.valid).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+
+  it('GIVEN a retrospective result with raw_values_emitted: true WHEN validated THEN schema validation fails closed (const false)', async () => {
+    const result = await validateAgainstSchemaFile(RETROSPECTIVE_SCHEMA_FILE, { ...VALID_RETROSPECTIVE_RESULT, raw_values_emitted: true })
+    expect(result.valid).toBe(false)
+  })
+
+  it('GIVEN a no_findings_rationale shorter than the schema minLength WHEN validated THEN schema validation fails closed', async () => {
+    const result = await validateAgainstSchemaFile(RETROSPECTIVE_SCHEMA_FILE, { ...VALID_RETROSPECTIVE_RESULT, no_findings_rationale: 'too short' })
+    expect(result.valid).toBe(false)
+  })
+
+  it('GIVEN proof_strength using only the allowed enum values (declared_by_session_operator) WHEN validated against its own sub-schema THEN it passes (AC11: operator_attested vs machine_verified boundary)', async () => {
+    const schemaText = readFileSync(EXECUTION_PROOF_SCHEMA_FILE, 'utf-8')
+    const schema = JSON.parse(schemaText)
+    const proofStrengthSchema = schema.properties.chatgpt_context.properties.proof_strength
+    const AjvModule = await import('ajv/dist/2020.js')
+    const Ajv2020 = AjvModule.default
+    const ajv = new Ajv2020({ strict: false, allErrors: true })
+    const validate = ajv.compile(proofStrengthSchema)
+    const valid = validate({
+      context_resolvability: 'machine_verified',
+      retrospective_result_schema: 'machine_verified',
+      connector_only_execution: 'declared_by_session_operator',
+      local_file_non_use: 'declared_by_session_operator',
+      latitude_direct_non_use: 'declared_by_session_operator',
+      machine_verifies_actual_chatgpt_tool_boundary: false,
+    })
+    expect(valid).toBe(true)
+  })
+
+  it('GIVEN machine_verifies_actual_chatgpt_tool_boundary: true (an over-claim) WHEN validated THEN it is rejected (const false)', async () => {
+    const schemaText = readFileSync(EXECUTION_PROOF_SCHEMA_FILE, 'utf-8')
+    const schema = JSON.parse(schemaText)
+    const proofStrengthSchema = schema.properties.chatgpt_context.properties.proof_strength
+    const AjvModule = await import('ajv/dist/2020.js')
+    const Ajv2020 = AjvModule.default
+    const ajv = new Ajv2020({ strict: false, allErrors: true })
+    const validate = ajv.compile(proofStrengthSchema)
+    const valid = validate({
+      context_resolvability: 'machine_verified',
+      retrospective_result_schema: 'machine_verified',
+      connector_only_execution: 'declared_by_session_operator',
+      local_file_non_use: 'declared_by_session_operator',
+      latitude_direct_non_use: 'declared_by_session_operator',
+      machine_verifies_actual_chatgpt_tool_boundary: true,
+    })
+    expect(valid).toBe(false)
+  })
+
+  it('GIVEN proof_strength.connector_only_execution mis-declared as a free-form "machine_verified_by_operator" string WHEN validated against the enum THEN it is rejected (never silently accepted as machine_verified)', async () => {
+    const schemaText = readFileSync(EXECUTION_PROOF_SCHEMA_FILE, 'utf-8')
+    const schema = JSON.parse(schemaText)
+    const proofStrengthSchema = schema.properties.chatgpt_context.properties.proof_strength
+    const AjvModule = await import('ajv/dist/2020.js')
+    const Ajv2020 = AjvModule.default
+    const ajv = new Ajv2020({ strict: false, allErrors: true })
+    const validate = ajv.compile(proofStrengthSchema)
+    const valid = validate({
+      context_resolvability: 'machine_verified',
+      retrospective_result_schema: 'machine_verified',
+      connector_only_execution: 'machine_verified_by_operator',
+      local_file_non_use: 'declared_by_session_operator',
+      latitude_direct_non_use: 'declared_by_session_operator',
+      machine_verifies_actual_chatgpt_tool_boundary: false,
+    })
+    expect(valid).toBe(false)
+  })
+
+  it('GIVEN the CLI --schema chatgpt_retrospective_result/v1 --require-findings-or-rationale standalone mode WHEN findings is empty with no rationale THEN the subprocess exits non-zero with the expected error code', () => {
+    const tmpFile = resolvePath(REPO_ROOT, 'tmp', `retro-standalone-test-${process.pid}.json`)
+    writeFileSync(tmpFile, JSON.stringify({ ...VALID_RETROSPECTIVE_RESULT, no_findings_rationale: undefined, findings: [] }))
+    try {
+      const result = spawnSync(
+        'node',
+        [
+          resolvePath(REPO_ROOT, 'scripts/check-retro-live-verification.mjs'),
+          '--',
+          '--schema', 'chatgpt_retrospective_result/v1',
+          '--require-findings-or-rationale', 'true',
+          '--input', tmpFile,
+        ],
+        { cwd: REPO_ROOT, encoding: 'utf-8' },
+      )
+      expect(result.status).toBe(1)
+      const payload = JSON.parse(result.stdout.trim())
+      expect(payload.verification_status).toBe('fail')
+      expect(payload.errors.some((error: { code: string }) => error.code === 'retro_live_verification_check.no_findings_rationale_missing')).toBe(true)
+    } finally {
+      unlinkSync(tmpFile)
+    }
   })
 })

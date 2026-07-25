@@ -78,13 +78,23 @@ import {
   CANONICALIZATION_PROFILE_LOOP_V1,
   canonicalJsonStringify,
   computeResolvedCommentSetDigest,
+  loadAjv,
   sha256Hex,
   validateManifestWithAjv,
 } from './generate-retro-live-verification.mjs'
 
 export const SCHEMA = 'retro_live_verification_check_result/v1'
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
+const REPO_ROOT = resolvePath(SCRIPT_DIR, '..')
 const ASSERT_LIVE_SCRIPT_PATH = resolvePath(SCRIPT_DIR, 'assert-chatgpt-retro-context-live.mjs')
+// Issue #1415 AC10-11 (additive, optional gate).
+const RETROSPECTIVE_RESULT_SCHEMA_FILE = resolvePath(REPO_ROOT, 'docs/schemas/chatgpt-retrospective-result.schema.json')
+const RETROSPECTIVE_RESULT_SCHEMA_ID = 'chatgpt_retrospective_result/v1'
+// Boilerplate placeholder phrases that must not, by themselves, satisfy
+// no_findings_rationale -- a caller writing one of these (with or without
+// surrounding whitespace/trailing punctuation) is not providing a real
+// rationale, just rubber-stamping the empty-findings case.
+const NO_FINDINGS_RATIONALE_BOILERPLATE_PATTERN = /^(no findings|nothing to report|n\/a|none)\.?$/iu
 const DEFAULT_SUBPROCESS_TIMEOUT_MS = 30000
 const DEFAULT_MAX_BUFFER = 10 * 1024 * 1024
 const JSON_FENCE_PATTERN = /```json\r?\n(?<payload>[\s\S]*?)\r?\n```/u
@@ -107,7 +117,11 @@ export const DEFAULT_CHECK_ARGS = Object.freeze([
 ])
 
 const CLI_OPTION_SPEC = {
-  '--manifest-json': { key: 'manifestJson', required: true },
+  // Issue #1415 AC10-11: not marked `required: true` here because the
+  // standalone --schema mode (below) does not use a retro_live_verification
+  // manifest at all; runCli() enforces manifest-json's presence explicitly
+  // for the (default) manifest-checking mode instead.
+  '--manifest-json': { key: 'manifestJson' },
   '--execution-profile': { key: 'executionProfile', defaultValue: 'live' },
   '--fixture-comments-json': { key: 'fixtureCommentsJson' },
   '--fixture-resolve-result-json': { key: 'fixtureResolveResultJson' },
@@ -128,6 +142,13 @@ const CLI_OPTION_SPEC = {
   // JSON file and compare against the value stored in the manifest.
   '--recompute-digests': { key: 'recomputeDigests', defaultValue: 'false' },
   '--comment-set-json': { key: 'commentSetJson' },
+  // Issue #1415 AC10-11 (additive, standalone mode -- these two flags run a
+  // single independent schema/content check over --input and exit, they do
+  // not combine with the retro_live_verification manifest checks above).
+  '--schema': { key: 'targetSchema' },
+  '--require-findings-or-rationale': { key: 'requireFindingsOrRationale', defaultValue: 'false' },
+  '--check-execution-boundary': { key: 'checkExecutionBoundary', defaultValue: 'false' },
+  '--input': { key: 'standaloneInput' },
 }
 
 /**
@@ -608,9 +629,100 @@ async function loadJsonFile(filePath, code) {
   }
 }
 
+/**
+ * Issue #1415 AC10: pure check over an already schema-valid
+ * chatgpt_retrospective_result/v1 payload. Fails closed when findings is
+ * empty and no_findings_rationale is either absent or matches a boilerplate
+ * placeholder phrase (schema minLength alone cannot reject e.g. "no findings
+ * at all, nothing to report here" style padding designed only to clear a
+ * length check -- this additionally rejects the exact boilerplate phrases).
+ */
+export function evaluateFindingsOrRationale(payload) {
+  const findings = Array.isArray(payload?.findings) ? payload.findings : []
+  if (findings.length > 0) {
+    return { ok: true, errors: [] }
+  }
+  const rationale = payload?.no_findings_rationale
+  if (typeof rationale !== 'string' || rationale.trim().length === 0) {
+    return { ok: false, errors: [{ code: 'retro_live_verification_check.no_findings_rationale_missing', message: 'findings is empty and no_findings_rationale is absent/empty' }] }
+  }
+  if (NO_FINDINGS_RATIONALE_BOILERPLATE_PATTERN.test(rationale.trim())) {
+    return { ok: false, errors: [{ code: 'retro_live_verification_check.no_findings_rationale_boilerplate', message: `no_findings_rationale is a rejected boilerplate placeholder: ${JSON.stringify(rationale)}` }] }
+  }
+  return { ok: true, errors: [] }
+}
+
+/**
+ * Issue #1415 AC11: the operator_attested/machine_verified distinction is
+ * enforced structurally by docs/schemas/chatgpt-retro-execution-proof.schema.json
+ * (proof_strength.{connector_only_execution,local_file_non_use,latitude_direct_non_use}
+ * are a closed enum of exactly "machine_verified"/"declared_by_session_operator",
+ * and machine_verifies_actual_chatgpt_tool_boundary is pinned `const: false`) --
+ * this function is a thin ajv-validation wrapper so --check-execution-boundary
+ * can be driven from this CLI without duplicating that schema's constraints.
+ */
+export async function validateAgainstSchemaFile(schemaFilePath, payload) {
+  const { Ajv2020: AjvCtor, addFormats: applyFormats } = await loadAjv()
+  const ajv = new AjvCtor({ strict: true, allErrors: true })
+  applyFormats(ajv)
+  const schemaText = await readFile(schemaFilePath, 'utf-8')
+  const schema = JSON.parse(schemaText)
+  const validate = ajv.compile(schema)
+  const valid = validate(payload)
+  return {
+    valid,
+    errors: valid ? [] : (validate.errors ?? []).map((error) => ({
+      path: error.instancePath || '/',
+      keyword: error.keyword,
+      message: error.message ?? 'schema validation failed',
+    })),
+  }
+}
+
+async function runStandaloneSchemaCheck(options) {
+  if (!options.standaloneInput) {
+    throw usageError('retro_live_verification_check.input_required', '--input is required when --schema is passed')
+  }
+  const payload = await loadJsonFile(options.standaloneInput, 'retro_live_verification_check.input_json_invalid')
+  const errors = []
+
+  if (options.targetSchema === RETROSPECTIVE_RESULT_SCHEMA_ID) {
+    const schemaValidation = await validateAgainstSchemaFile(RETROSPECTIVE_RESULT_SCHEMA_FILE, payload)
+    if (!schemaValidation.valid) {
+      errors.push(...schemaValidation.errors.map((error) => ({ code: 'retro_live_verification_check.retrospective_result_schema_invalid', message: `${error.path}: ${error.message}` })))
+    }
+    if (parseBooleanFlag(options.requireFindingsOrRationale)) {
+      const findingsCheck = evaluateFindingsOrRationale(payload)
+      errors.push(...findingsCheck.errors)
+    }
+  } else if (parseBooleanFlag(options.checkExecutionBoundary)) {
+    const schemaValidation = await validateAgainstSchemaFile(resolvePath(REPO_ROOT, 'docs/schemas/chatgpt-retro-execution-proof.schema.json'), payload)
+    if (!schemaValidation.valid) {
+      errors.push(...schemaValidation.errors.map((error) => ({ code: 'retro_live_verification_check.execution_boundary_schema_invalid', message: `${error.path}: ${error.message}` })))
+    }
+  } else {
+    throw usageError('retro_live_verification_check.unknown_standalone_schema', `unsupported --schema value: ${JSON.stringify(options.targetSchema)}`)
+  }
+
+  const ok = errors.length === 0
+  process.stdout.write(`${JSON.stringify({ schema: SCHEMA, verification_status: ok ? 'pass' : 'fail', checked_at: new Date().toISOString(), errors }, null, 2)}\n`)
+  process.exitCode = ok ? 0 : 1
+}
+
 async function runCli() {
   const rawArgs = process.argv.slice(2)
   const options = parseArgs(rawArgs.length === 0 ? DEFAULT_CHECK_ARGS : rawArgs, CLI_OPTION_SPEC)
+
+  // Issue #1415 AC10-11 (additive, standalone mode): --schema short-circuits
+  // the retro_live_verification manifest checks entirely.
+  if (options.targetSchema || parseBooleanFlag(options.checkExecutionBoundary)) {
+    await runStandaloneSchemaCheck(options)
+    return
+  }
+  if (!options.manifestJson) {
+    throw usageError('retro_live_verification_check.manifest_json_required', '--manifest-json is required unless --schema/--check-execution-boundary standalone mode is used')
+  }
+
   const executionProfile = normalizeExecutionProfile(options.executionProfile)
 
   const manifestText = await readFile(options.manifestJson, 'utf-8')
