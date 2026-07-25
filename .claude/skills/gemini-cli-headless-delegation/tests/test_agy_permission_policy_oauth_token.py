@@ -1,15 +1,21 @@
-"""Tests for the Issue #1740 agy OAuth token file exposure extension of
-`materialize_isolated_agy_workspace()` in `agy_permission_policy.py`.
+"""Tests for the Issue #1740 / #1743 agy OAuth token file exposure extension
+of `materialize_isolated_agy_workspace()` in `agy_permission_policy.py`.
 
-Covers AC1-AC8:
+Covers AC1-AC8 (this file's own numbering; distinct from Issue #1743's AC1-9):
 - AC1: `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` (when present)
-  is exposed read-only under the isolated workspace's `XDG_CONFIG_HOME`.
+  is exposed read-only under the *isolated* workspace's own `HOME`
+  (`<isolated HOME>/.gemini/antigravity-cli/antigravity-oauth-token`) --
+  never under `XDG_CONFIG_HOME` (Issue #1743: the real `agy` binary reads
+  this file from `$HOME/.gemini/antigravity-cli/`, not from
+  `$XDG_CONFIG_HOME`; #1740's original `XDG_CONFIG_HOME`-based placement
+  left `agy -p` failing with `agy_auth_required` inside isolated
+  workspaces even though the symlink itself was created successfully).
 - AC2: when the real token file is absent, exposure is a no-op and workspace
   materialization does not fail.
 - AC3: the exposure function never opens/reads the target file's content.
-- AC4: only the minimal `antigravity-cli/antigravity-oauth-token` subpath is
-  exposed -- no other real `$HOME` subdirectory (`.ssh`, `.netrc`, other
-  `.gemini/*` state) is reachable.
+- AC4: only the minimal `.gemini/antigravity-cli/antigravity-oauth-token`
+  subpath is exposed -- no other real `$HOME` subdirectory (`.ssh`,
+  `.netrc`, other `.gemini/*` state) is reachable.
 - AC5: tool deny matrix (hostile_global_settings_fixture) regression after
   the agy OAuth token exposure change.
 - AC6: adversarial redaction -- a credential-like value inside the fixture
@@ -19,15 +25,20 @@ Covers AC1-AC8:
 - AC7: `find_credential_like_files()` still detects credential-like basenames
   elsewhere in the workspace, excluding only the intentionally-exposed
   gcloud ADC / agy OAuth token subtrees.
-- AC8: hermetic integration test -- the agy OAuth token file is reachable at
-  an existence-check level from inside the isolated workspace.
+- AC8: hermetic integration test -- the agy OAuth token file is reachable,
+  at an existence-check level, from a subprocess whose `HOME` is redirected
+  to the isolated workspace's `HOME` -- simulating the file-path resolution
+  `agy -p` performs, without invoking the real `agy` binary or reading the
+  token's content (Issue #1743 AC7).
 """
 
 from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shutil
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -92,10 +103,16 @@ def test_agy_oauth_token_exposed_read_only(tmp_path: Path, monkeypatch: pytest.M
             assert workspace.agy_oauth_token_path.is_symlink()
             # existence-check level only -- Path.exists(), never opened/read
             assert workspace.agy_oauth_token_path.exists()
-            # exposed under the isolated workspace's own XDG_CONFIG_HOME
+            # Issue #1743 AC1/AC2: exposed under the isolated workspace's own
+            # HOME -- this is the path the real `agy` binary reads from.
             assert workspace.agy_oauth_token_path == (
-                Path(workspace.env["XDG_CONFIG_HOME"]) / "antigravity-cli" / "antigravity-oauth-token"
+                Path(workspace.env["HOME"]) / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
             )
+            # Issue #1743 AC1: never placed under XDG_CONFIG_HOME (the
+            # pre-#1743 buggy placement `agy` never actually reads from).
+            assert not (
+                Path(workspace.env["XDG_CONFIG_HOME"]) / "antigravity-cli" / "antigravity-oauth-token"
+            ).exists()
         finally:
             shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
 
@@ -113,6 +130,7 @@ def test_expose_agy_oauth_token_noop_when_absent(tmp_path: Path, monkeypatch: py
     workspace = app.materialize_isolated_agy_workspace(app.GROUNDED_RESEARCH_PROFILE, parent_dir=tmp_path)
     try:
         assert workspace.agy_oauth_token_path is None
+        assert not (Path(workspace.env["HOME"]) / ".gemini" / "antigravity-cli").exists()
         assert not (Path(workspace.env["XDG_CONFIG_HOME"]) / "antigravity-cli").exists()
     finally:
         shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
@@ -123,11 +141,11 @@ def test_expose_agy_oauth_token_noop_returns_none_directly(tmp_path: Path, monke
     fake_real_home.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(fake_real_home))
 
-    xdg_config = tmp_path / "xdg-config-standalone"
-    xdg_config.mkdir(parents=True)
-    result = app._expose_agy_oauth_token_read_only(xdg_config)
+    isolated_home = tmp_path / "isolated-home-standalone"
+    isolated_home.mkdir(parents=True)
+    result = app._expose_agy_oauth_token_read_only(isolated_home)
     assert result is None
-    assert not (xdg_config / "antigravity-cli").exists()
+    assert not (isolated_home / ".gemini" / "antigravity-cli").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -164,12 +182,13 @@ def test_expose_agy_oauth_token_never_reads_content(tmp_path: Path, monkeypatch:
     monkeypatch.setattr(Path, "read_text", _guarded_read_text)
     monkeypatch.setattr(Path, "read_bytes", _guarded_read_bytes)
 
-    xdg_config = tmp_path / "xdg-config-guarded"
-    xdg_config.mkdir(parents=True)
-    result = app._expose_agy_oauth_token_read_only(xdg_config)
+    isolated_home = tmp_path / "isolated-home-guarded"
+    isolated_home.mkdir(parents=True)
+    result = app._expose_agy_oauth_token_read_only(isolated_home)
 
     assert result is not None
     assert result.is_symlink()
+    assert result == isolated_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
 
 
 # ---------------------------------------------------------------------------
@@ -200,9 +219,10 @@ def test_expose_agy_oauth_token_minimal_subpath_only(tmp_path: Path, monkeypatch
         workspace = app.materialize_isolated_agy_workspace(profile, parent_dir=tmp_path)
         try:
             antigravity_cli_children = sorted(
-                p.name for p in (Path(workspace.env["XDG_CONFIG_HOME"]) / "antigravity-cli").iterdir()
+                p.name for p in (Path(workspace.env["HOME"]) / ".gemini" / "antigravity-cli").iterdir()
             )
             assert antigravity_cli_children == ["antigravity-oauth-token"]
+            assert not (Path(workspace.env["XDG_CONFIG_HOME"]) / "antigravity-cli").exists()
             assert workspace.env["HOME"] == str(workspace.workspace_dir)
             assert str(fake_real_home) != workspace.env["HOME"]
 
@@ -336,21 +356,52 @@ def test_agy_oauth_token_reachability_integration(tmp_path: Path, monkeypatch: p
 
     workspace = app.materialize_isolated_agy_workspace(app.GROUNDED_RESEARCH_PROFILE, parent_dir=tmp_path)
     try:
-        # simulate the isolated `agy` subprocess resolving its OAuth token
-        # the way the real agy client would: from its own (isolated)
-        # XDG_CONFIG_HOME, matching the
-        # `$XDG_CONFIG_HOME/antigravity-cli/antigravity-oauth-token`
-        # convention this exposure creates.
+        # Issue #1743: `agy` resolves its OAuth token from
+        # `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`, matching
+        # the state-directory layout its own auth flow writes to on a
+        # non-isolated host -- not from `$XDG_CONFIG_HOME`.
         isolated_token_path = (
-            Path(workspace.env["XDG_CONFIG_HOME"]) / "antigravity-cli" / "antigravity-oauth-token"
+            Path(workspace.env["HOME"]) / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
         )
         assert isolated_token_path.exists()
         assert isolated_token_path.is_symlink()
+        # the pre-#1743 (buggy) XDG_CONFIG_HOME placement must be absent.
+        assert not (
+            Path(workspace.env["XDG_CONFIG_HOME"]) / "antigravity-cli" / "antigravity-oauth-token"
+        ).exists()
 
         # HOME/XDG_CACHE_HOME/XDG_STATE_HOME stay isolated even while agy
         # OAuth token reachability is preserved.
         assert workspace.env["HOME"] == str(workspace.workspace_dir)
         assert workspace.env["XDG_CACHE_HOME"] == str(workspace.workspace_dir / "xdg-cache")
         assert workspace.env["XDG_STATE_HOME"] == str(workspace.workspace_dir / "xdg-state")
+
+        # Issue #1743 AC7: a lightweight `agy -p` smoke-test simulation --
+        # run a subprocess with HOME redirected to the isolated workspace's
+        # HOME and perform the exact existence-check-level path resolution
+        # `agy` performs before authenticating. This never invokes the real
+        # `agy` binary and never opens/reads the token file's content (only
+        # `Path.is_file()` / `Path.exists()`), matching the diagnosis
+        # recorded in Issue #1743's Source section
+        # (`LOOP_AGY_ISOLATED_SMOKE_OK` on success).
+        smoke_script = (
+            "import os, sys\n"
+            "from pathlib import Path\n"
+            "home = os.environ.get('HOME')\n"
+            "token = Path(home) / '.gemini' / 'antigravity-cli' / 'antigravity-oauth-token'\n"
+            "if token.is_file():\n"
+            "    print('LOOP_AGY_ISOLATED_SMOKE_OK')\n"
+            "    sys.exit(0)\n"
+            "sys.exit(1)  # would surface as agy_auth_required\n"
+        )
+        smoke_result = subprocess.run(
+            [sys.executable, "-c", smoke_script],
+            env={**os.environ, "HOME": workspace.env["HOME"]},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert smoke_result.returncode == 0, smoke_result.stderr
+        assert "LOOP_AGY_ISOLATED_SMOKE_OK" in smoke_result.stdout
     finally:
         shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
