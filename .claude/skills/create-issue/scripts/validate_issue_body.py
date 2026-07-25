@@ -186,20 +186,52 @@ def _get_context_lines(
     return result, truncated
 
 
+# #1704: Recognises "-"/"*"/"+" task-list bullet markers (not only
+# hyphen), 1-4 spaces between the marker and the checkbox, and any
+# "[ ]"/"[x]"/"[X]" checkbox state. Anchored to the start of the line
+# (optional leading indent only) so that an "AC<N>"-shaped token that
+# merely appears inside prose, a URL, a filename, inline code, or fenced
+# code within the same section is never mistaken for an AC *definition*
+# line (Issue #1704 AC1/AC4).
+_AC_DEFINITION_LINE_RE = re.compile(
+    r'^[ \t]*[-*+][ ]{1,4}\[[^\]]*\][ \t]+AC(\d+)\b'
+)
+
+
+def _iter_non_fenced_lines(content: str):
+    """Yield (line) for every line in `content` that is NOT inside a
+    fenced code block (``` ... ```). Used so AC-shaped tokens inside
+    fenced code samples are never extracted as AC definitions (#1704 AC4).
+    """
+    in_fence = False
+    for line in content.split('\n'):
+        if line.lstrip().startswith('```'):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        yield line
+
+
 def _extract_ac_numbers(body: str) -> set[str]:
-    """Extract AC numbers from 'Acceptance Criteria' section."""
+    """Extract AC numbers from 'Acceptance Criteria' section.
+
+    #1704: recognises "-"/"*"/"+" bullet markers (mixed-bullet bodies no
+    longer produce false negatives), and never extracts an "AC<N>"-shaped
+    token that appears in prose, a URL, a filename, inline code, or fenced
+    code rather than at the start of a checkbox list-item line.
+    """
     section_info = _extract_section(body, "Acceptance Criteria")
     if not section_info:
         return set()
 
     content, _, _ = section_info
-    # Match lines like:
-    # - [ ] AC1: ...
-    # - [ ] AC1 ...
-    # - [x] AC1: ...
-    pattern = r'- \[[^\]]*\]\s+AC(\d+)\b'
-    matches = re.findall(pattern, content)
-    return {f"AC{m}" for m in matches}
+    numbers: set[str] = set()
+    for line in _iter_non_fenced_lines(content):
+        m = _AC_DEFINITION_LINE_RE.match(line)
+        if m:
+            numbers.add(f"AC{m.group(1)}")
+    return numbers
 
 
 def _extract_vc_ac_numbers(body: str) -> set[str]:
@@ -390,13 +422,43 @@ def _validate_lp002_invalid_machine_readable_contract(body: str) -> list[Validat
     return errors
 
 
+# #1704 AC2: guards against a *vacuous* empty-set match. A checkbox-shaped
+# list-item line uses ANY bullet marker (not just the "-"/"*"/"+" set that
+# `_extract_ac_numbers()` recognises as AC-definition syntax), so if the
+# section contains checkbox-shaped lines but `_extract_ac_numbers()`
+# extracted zero AC numbers, that is an extraction anomaly -- not
+# legitimate evidence that the Issue truly defines zero ACs. Comparing
+# that spurious empty set against an (also legitimately empty) VC
+# reference set must never be treated as a "match".
+_ANY_BULLET_CHECKBOX_LINE_RE = re.compile(r'^[ \t]*\S[ ]{0,4}\[[^\]]*\]')
+
+
+def _has_checkbox_shaped_lines(content: str) -> bool:
+    """True if `content` has at least one checkbox-shaped list-item line
+    (any bullet marker), outside of fenced code blocks."""
+    for line in _iter_non_fenced_lines(content):
+        if _ANY_BULLET_CHECKBOX_LINE_RE.match(line):
+            return True
+    return False
+
+
 def _validate_lp010_ac_vc_mismatch(body: str) -> list[ValidationError]:
     """LP010: Detect mismatch between AC and VC numbers."""
     ac_numbers = _extract_ac_numbers(body)
     vc_numbers = _extract_vc_ac_numbers(body)
 
     if ac_numbers == vc_numbers:
-        return []
+        # #1704 AC2: an empty/empty "match" is vacuous if the AC section
+        # actually contains checkbox-shaped list items that failed to
+        # yield any AC number -- fail closed instead of silently passing.
+        if not ac_numbers:
+            ac_section_info = _extract_section(body, "Acceptance Criteria")
+            if ac_section_info and _has_checkbox_shaped_lines(ac_section_info[0]):
+                pass  # fall through to mismatch reporting below
+            else:
+                return []
+        else:
+            return []
 
     # Find which section to report error on
     vc_section_info = _extract_section(body, "Verification Commands")
