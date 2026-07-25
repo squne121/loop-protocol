@@ -205,7 +205,9 @@ def test_serena_task_linked_hash_chain_predicates(tmp_path):
     assert _predicate_status(verdict3, "predicate_13") == "fail"
 
     def mutate_actor_collision(content):
-        content["children"]["local_asset_research"]["result"]["actor"] = "wrapper_serena_mcp"
+        content["children"]["local_asset_research"]["result"]["local_asset_retrieval_metadata"][
+            "analysis_actor"
+        ] = "wrapper_serena_mcp"
 
     bundle_dir4 = build_bundle.build_and_materialize(tmp_path / "actor-collision", mutate=mutate_actor_collision)
     verdict4 = validator.build_verdict(bundle_dir4)
@@ -320,7 +322,7 @@ def test_success_condition_and_fail_close_predicates(tmp_path):
     assert _predicate_status(verdict, "predicate_24") == "pass"
 
     def mutate_failed_child(content):
-        content["children"]["local_asset_research"]["result"]["status"] = "error"
+        content["children"]["local_asset_research"]["result"]["ok"] = False
 
     bundle_dir2 = build_bundle.build_and_materialize(tmp_path / "failed-child", mutate=mutate_failed_child)
     verdict2 = validator.build_verdict(bundle_dir2)
@@ -368,7 +370,7 @@ def test_tampering_file_content_edited_without_manifest_update_is_detected(tmp_p
     bundle_dir = build_bundle.build_and_materialize(tmp_path / "tampered2")
     result_path = bundle_dir / "children" / "grounded_research" / "result.json"
     original = result_path.read_text(encoding="utf-8")
-    tampered = original.replace('"status": "ok"', '"status": "ok_but_edited"')
+    tampered = original.replace('"ok": true', '"ok": false')
     assert tampered != original
     result_path.write_text(tampered, encoding="utf-8")
     verdict = validator.build_verdict(bundle_dir)

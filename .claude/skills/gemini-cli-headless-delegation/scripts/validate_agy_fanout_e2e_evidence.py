@@ -342,7 +342,7 @@ _KNOWN_SCHEMA_VALUES: frozenset[str] = frozenset(
         FANOUT_REQUEST_EVIDENCE_SCHEMA,
         ENVIRONMENT_MANIFEST_SCHEMA,
         "delegation_request_v1",
-        "delegation_result_v1",
+        "delegation_result/v1",
         "delegation_audit_v1",
         "agy_tool_provenance_v1",
         "process_lifecycle_event_v1",
@@ -724,8 +724,15 @@ def _predicate_serena_hash_chain(bundle: dict[str, Any]) -> list[PredicateResult
 
     # P14: retrieval actor (wrapper_serena_mcp) vs analysis actor (antigravity_cli)
     # are distinguished -- the child result must declare the analysis actor,
-    # and it must differ from the Serena records' retrieval actor.
-    analysis_actor = result.get("actor")
+    # and it must differ from the Serena records' retrieval actor. The real
+    # ``delegation_result/v1`` shape run_gemini_headless.py produces does not
+    # carry a top-level ``actor`` key; the analysis actor is nested under
+    # ``local_asset_retrieval_metadata.analysis_actor`` (see
+    # run_gemini_headless.py's local-asset-research retrieval path).
+    local_asset_retrieval_metadata = result.get("local_asset_retrieval_metadata")
+    if not isinstance(local_asset_retrieval_metadata, dict):
+        local_asset_retrieval_metadata = {}
+    analysis_actor = local_asset_retrieval_metadata.get("analysis_actor")
     p14_ok = (
         analysis_actor == _agy_permission_policy.ANALYSIS_ACTOR_ANTIGRAVITY_CLI
         and analysis_actor != _agy_permission_policy.RETRIEVAL_ACTOR_WRAPPER_SERENA_MCP
@@ -739,7 +746,10 @@ def _predicate_serena_hash_chain(bundle: dict[str, Any]) -> list[PredicateResult
             detail=(
                 ""
                 if p14_ok
-                else f"result.actor={analysis_actor!r}, expected 'antigravity_cli' distinct from Serena retrieval actor"
+                else (
+                    f"result.local_asset_retrieval_metadata.analysis_actor={analysis_actor!r}, "
+                    "expected 'antigravity_cli' distinct from Serena retrieval actor"
+                )
             ),
             evidence={"analysis_actor": analysis_actor},
         )
@@ -942,11 +952,15 @@ def _predicate_redaction(
 def _predicate_success_and_fail_close(bundle: dict[str, Any]) -> list[PredicateResult]:
     results: list[PredicateResult] = []
 
+    # The real ``delegation_result/v1`` shape does not carry a ``status``
+    # string field -- success is a top-level boolean ``"ok"`` key (see
+    # run_gemini_headless.py). ``result.get("ok")`` must be the literal
+    # ``True`` (not merely truthy) to count as success.
     failures: dict[str, Any] = {}
     for profile, child in bundle["children"].items():
         result = child["result"]
-        if result.get("status") != "ok":
-            failures[profile] = result.get("status")
+        if result.get("ok") is not True:
+            failures[profile] = result.get("ok")
     p23_ok = not failures
     results.append(
         PredicateResult(
