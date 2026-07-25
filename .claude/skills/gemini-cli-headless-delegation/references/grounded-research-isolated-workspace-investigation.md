@@ -218,6 +218,7 @@ fail-closed 判定される。実際の tool 呼び出しが発生したこと�
 
 > "Hooks are configured in a `hooks.json` file located in your customization directory
 > (e.g., `.agents/` in your workspace or `~/.gemini/config/`)."
+（日本語訳: hooks.json はカスタマイズディレクトリ内に配置される。workspace 内では `.agents/`、ユーザーレベルでは `~/.gemini/config/` の 2 通りが公式に有効なパスとして明記されている。）
 
 `agy_tool_provenance.generate_workspace_hook_config()` が書き込む `<workspace>/.agents/hooks.json`
 というパス自体は、この公式記述の「workspace-level: `.agents/`」パターンと**一致している**
@@ -230,7 +231,7 @@ hooks（`~/.gemini/antigravity-cli/plugins/<plugin_name>/hooks.json`）と works
 hooks の優先順位・排他関係、または hook 自体は起動するがラッパースクリプトの書き込み
 タイミングと `_run_agy()` の読み取りタイミングの競合、などが考えられるが、いずれも未検証。
 
-## Next Action Update (#1758)
+## Next Action Update (#1758)（次のアクション更新）
 
 Issue #1758 の live 検証により、Finding 1（`toolPermission` isolated workspace 未設定
 仮説）は**誤りと確認された**。したがって、以下の通り方針を更新する。
