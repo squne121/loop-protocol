@@ -461,10 +461,19 @@ dbus secret-service（#1726 の到達性追加）でも gcloud ADC（#1730 の�
 
 - `materialize_isolated_agy_workspace()` は、実行環境の
   `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` ファイルが存在する場合、
-  そのファイルを isolated workspace の `XDG_CONFIG_HOME` 配下
-  （`<isolated>/xdg-config/antigravity-cli/antigravity-oauth-token`）へ symlink として
-  read-only に露出する（`_expose_agy_oauth_token_read_only()`、`_expose_gcloud_adc_read_only()`
-  （Issue #1730）と同型のパターン）
+  そのファイルを isolated workspace 自身の `HOME` 配下
+  （`<isolated HOME>/.gemini/antigravity-cli/antigravity-oauth-token`）へ symlink として
+  read-only に露出する（`_expose_agy_oauth_token_read_only()`）。**Issue #1743**:
+  #1740 の初期実装は誤って isolated workspace の `XDG_CONFIG_HOME` 配下
+  （isolated workspace の `XDG_CONFIG_HOME` 配下の `antigravity-cli/antigravity-oauth-token` サブパス）へ配置しており、
+  実際の `agy` バイナリはこのファイルを `$HOME/.gemini/antigravity-cli/` から直接読むため、
+  この配置先の symlink 自体は作成に成功しても `agy -p` は引き続き `agy_auth_required` で
+  失敗していた。#1494 の 4 回目の live fan-out 試行時の control-plane 診断（値は一切読まず、
+  symlink 到達性のみで検証）で、配置先を isolated `HOME`（`$ISOLATED_HOME/.gemini/antigravity-cli/`、
+  `agy` 自身が生成する state directory 構造と一致）に変更すれば `agy -p` が成功することを確認し、
+  #1743 で `_expose_agy_oauth_token_read_only()` の配置先ロジックを修正した
+  （`_expose_gcloud_adc_read_only()`（Issue #1730、gcloud ADC 側）は `XDG_CONFIG_HOME` 配下の
+  ままで変更していない -- gcloud ADC は本来 `$XDG_CONFIG_HOME/gcloud` 規約に従うため）
 - symlink の作成はパス文字列の書き込みのみであり、実装コード自身はファイル内容を一切 open/read しない
   （`Path.is_file()` などの存在確認とパス操作のみ、Issue #1740 AC1/AC3）
 - 露出される範囲は `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` の 1 ファイルのみであり、
