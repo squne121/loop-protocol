@@ -143,6 +143,17 @@ declared target ごとに実ファイルを直接 read-only で読み、selector
 `grounded_research` / `github_research` の AGY 対応や Serena MCP upstream の manifest allowlist
 拡張は本契約の scope 外のままとする。
 
+### fan-out task-linked hash chain（Issue #1706 の相関ハッシュ連鎖）
+
+`fan_out_orchestrator.run_fanout()` が `parent_run_id` / `subtask_id` / `attempt_id` を
+stamp した子 subtask request に限り、上記 `evidence_targets` 契約の上に hash chain
+（`objective_sha256` / `target_contract_sha256` / `request_sha256` / `evidence_sha256` /
+`prompt_envelope_sha256` / `result_binding_sha256`）と actor 区別（`retrieval_actor:
+wrapper_serena_mcp` / `analysis_actor: antigravity_cli` / `agy_direct_mcp_access: false`）を
+追加する。詳細な hash 定義・格納先・fail-close 条件は `usage-contract.md` の
+「fan-out task-linked Serena evidence hash chain」節を正本とする。単発（非 fan-out）の
+`evidence_targets` request にはこの拡張は一切適用されない。
+
 ### AC3 / AC8: JSON envelope と結果正規化の差分
 
 `agy` の stdout は Gemini JSON envelope（`_parse_envelope` が解析する `{"response": ...}` 形式）を返さない。
