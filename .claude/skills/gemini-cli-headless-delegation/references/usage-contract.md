@@ -164,6 +164,50 @@ AGY prompt (成功時) に注入されるのは、上記 evidence envelope（`re
 （`- Do not infer or request absolute paths, shell execution, MCP access, ...` の既存 prompt-only
 境界をそのまま継承する）。
 
+### fan-out task-linked Serena evidence hash chain（Issue #1706）
+
+`fan_out_orchestrator.run_fanout()` が生成する子 subtask request（`parent_run_id` /
+`subtask_id` / `attempt_id` を持つ request）に対しては、上記 `evidence_targets` 契約の上に
+task-linked hash chain と相関情報を追加する。この経路は `parent_run_id` / `subtask_id` /
+`attempt_id` のいずれかが request に含まれる場合にのみ有効になり、単発（非 fan-out）の
+`evidence_targets` request（#1638 の既存契約）には一切影響しない。
+
+Serena の呼び出し対象（`find_file` / `search_for_pattern` / `get_symbols_overview` の引数）は、
+固定 smoke query（検索語 `"local_asset_research"` 固定）ではなく、`evidence_targets` の
+repo-relative path と実際に選択された evidence テキストから決定論的に導出される
+（`search_for_pattern` の `substring_pattern` は選択範囲の先頭の非空行）。
+
+hash chain は以下を含み、それぞれ決定論的に導出される（同一入力は常に同一 hash）。
+
+- `objective_sha256`: request の `objective` の hash。
+- `target_contract_sha256`: `evidence_targets` から導出した repo-relative path + selector の
+  contract の hash。
+- `request_sha256`: request 全体の hash。
+- `evidence_sha256`: task-linked Serena evidence record 集合（tool 呼び出し・selector・
+  content hash・provenance を含む）の canonical JSON hash。evidence を 1 byte でも改変すると
+  変化する（改ざん検出）。
+- `prompt_envelope_sha256`: `evidence_sha256` / `objective_sha256` / `target_contract_sha256` /
+  `tool_profile` から決定論的に導出され、AGY へ渡す prompt envelope 本文にも同じ値が
+  literal に含まれる。
+- `result_binding_sha256`: `evidence_sha256` + `prompt_envelope_sha256` から決定論的に導出され、
+  child result（fan-out orchestrator が返す subtask result の `result.local_asset_retrieval_metadata`）
+  に格納される。`run_gemini_headless.verify_serena_hash_chain()` で独立に再計算し、改ざん時は
+  `False` を返す。
+
+上記 5 つの hash はすべて `result.local_asset_retrieval_metadata` に格納され、加えて以下も
+格納される: `actor` / `retrieval_actor`（固定値 `"wrapper_serena_mcp"`）、`analysis_actor`
+（固定値 `"antigravity_cli"`）、`agy_direct_mcp_access`（固定値 `false`）、`parent_run_id` /
+`subtask_id` / `attempt_id`（request からそのまま転記）、`serena_pinned_ref` /
+`serena_manifest_id`（checked-in `serena-tool-manifest.json` の pin）、`serena_evidence_records`
+（各 record に `tool_name` / `args_sha256` / `is_error` / repo-relative provenance を含む）。
+
+evidence が subtask の `objective` と決定論的に無関係（objective のいかなるトークンも evidence の
+path/content に出現しない）と判定された場合、AGY 起動前に `ok: false` で fail-close する。
+「AGY が Serena に直接アクセスした」という記述は行わない。Serena MCP へのアクセスは常に
+wrapper プロセス（`retrieval_actor: wrapper_serena_mcp`）が行い、AGY（`analysis_actor:
+antigravity_cli`）は redaction 済みの prompt envelope だけを受け取る
+（`agy_direct_mcp_access: false`）。
+
 AGY prompt に渡す legacy local asset context は、以下を持つ JSON evidence envelope に限定する。
 
 - `tool_name`: wrapper 側が実行した Serena read-only tool 名。
