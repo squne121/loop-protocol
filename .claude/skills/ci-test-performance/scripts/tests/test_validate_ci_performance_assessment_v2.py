@@ -249,7 +249,6 @@ class TestSchemaFiles:
         assert list(validator_.iter_errors(comparative_with_budget))
 
     def test_run_ids_must_be_unique(self):
-        from jsonschema import Draft202012Validator
 
         with RUNTIME_DELTA_SCHEMA_PATH.open(encoding="utf-8") as handle:
             schema = json.load(handle)
