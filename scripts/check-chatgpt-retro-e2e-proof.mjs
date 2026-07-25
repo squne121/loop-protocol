@@ -53,6 +53,14 @@ import {
   computeAgentOperationSessionIndexPayloadDigest,
   validateAgentOperationSessionIndex,
 } from './check-agent-operation-session-index.mjs'
+// Issue #1415 P0-4 fix_delta (post-#1747 adversarial review): the AC10
+// findings-or-rationale gate previously only existed on the standalone
+// `--schema chatgpt_retrospective_result/v1 --require-findings-or-rationale`
+// CLI path -- the actual E2E proof chain (this file) never called it, so a
+// retrospective result with empty findings and no rationale could pass
+// `chatgpt-retro-e2e-proof:check`. Import (not re-implement) the same
+// function so both entry points share one fail-closed definition.
+import { evaluateFindingsOrRationale } from './check-retro-live-verification.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 export const REPO_ROOT = resolve(__dirname, '..')
@@ -1130,6 +1138,17 @@ export function validateChatgptRetroExecutionProof(proof, retroResult) {
           })
         }
       }
+    }
+
+    // Issue #1415 AC10 / P0-4 fix_delta: findings-or-rationale is enforced
+    // as part of the actual proof chain, not only the standalone checker.
+    const findingsOrRationale = evaluateFindingsOrRationale(retroResult)
+    if (!findingsOrRationale.ok) {
+      errors.push(...findingsOrRationale.errors.map((error) => ({
+        path: 'retrospective_result_payload',
+        code: error.code,
+        message: error.message,
+      })))
     }
 
     // verdict.resolver_not_resolved
