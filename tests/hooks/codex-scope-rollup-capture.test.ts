@@ -326,8 +326,23 @@ describe('Codex SubagentStop scope-rollup capture adapter', () => {
     expect(readFileSync(resolve(captureDirectory, names[0]), 'utf8')).toContain('capture_status: parser_rejected')
   })
 
-  it('GIVEN transport fixture failures WHEN the adapter runs THEN transport failures are bounded and redacted', () => {
-    for (const fixture of ['nonzero.py', 'timeout.py']) {
+  // Issue #1727: split via it.each (following the sourceBoundRejectionCases
+  // pattern established for #1693 / PR #1699) so nonzero.py and timeout.py
+  // are independently named test cases rather than a shared for-loop body —
+  // a failure in one fixture no longer masks or aggregates with the other,
+  // and each case can assert its own fixed reason code. The elapsedMs upper
+  // bound assertion is intentionally removed (performance_claim: no_claim);
+  // each case's own Vitest timeout (8000ms) is kept comfortably above the
+  // adapter's outer spawnSync watchdog (7000ms) so a timeout failure surfaces
+  // as a clear assertion failure rather than a Vitest-level test timeout.
+  const transportFixtureFailureCases: Array<{ name: string; fixture: string; expectedReasonCode: string }> = [
+    { name: 'nonzero.py', fixture: 'nonzero.py', expectedReasonCode: 'capture_nonzero' },
+    { name: 'timeout.py', fixture: 'timeout.py', expectedReasonCode: 'capture_timeout' },
+  ]
+
+  it.each(transportFixtureFailureCases)(
+    'GIVEN transport fixture failures WHEN the adapter runs THEN transport failures are bounded and redacted: $name',
+    ({ fixture, expectedReasonCode }) => {
       const captureDirectory = isolatedDirectory()
       const artifactDirectory = isolatedDirectory()
       const env = writeFixedLocationArtifacts(artifactDirectory)
@@ -339,13 +354,17 @@ describe('Codex SubagentStop scope-rollup capture adapter', () => {
         { NODE_ENV: 'test', ...env },
       )
 
+      expect(result.error).toBeUndefined()
+      expect(result.signal).toBeNull()
       expect(result.status).toBe(0)
-      expect(result.elapsedMs).toBeLessThan(6500)
       expect(result.stdout.trim()).toBe('{"continue":true}')
+      expect(readdirSync(captureDirectory).filter((name) => name.endsWith('.txt'))).toHaveLength(0)
       expect(result.stderr).not.toContain('scope-rollup-fixture')
       expect(result.stderr).not.toContain(payloadText(payload))
-    }
-  }, 7000)
+      expect(result.stderr).toContain(expectedReasonCode)
+    },
+    8000,
+  )
 
   it('timeout terminates process tree without late write', () => {
     const captureDirectory = isolatedDirectory()
