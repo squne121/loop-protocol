@@ -21,10 +21,22 @@ import { defineConfig, devices } from '@playwright/test'
  * is `true` (`testMatch`), which also forces `reuseExistingServer: false` so
  * a stale server from a different worktree/build/PR cannot be reused. See
  * `pnpm run test:e2e:preview-namespace` in package.json.
+ *
+ * VRT lane (Issue #1386 PR #1721 review fix, P1 Blocker 4): `LOOP_VRT_LANE=true`
+ * (set by the `test:vrt` / `test:vrt:e2e` package scripts) forces
+ * `reuseExistingServer: false` for the same reason as the preview-namespace
+ * lane above — `pnpm test:vrt` rebuilds `dist/` with `VITE_E2E_MODE=true`
+ * baked in at build time (Vite's `import.meta.env` is a build-time static
+ * replacement, so setting the env var only on the `webServer.command`
+ * itself is NOT sufficient once a server is already running), and a stale
+ * preview server left over from a different worktree/commit/build (with or
+ * without `VITE_E2E_MODE`) must never be silently reused for a VRT
+ * comparison.
  */
 
 const PREVIEW_NAMESPACE_LANE = process.env.LOOP_E2E_PREVIEW_NAMESPACE_LANE === 'true'
 const PREVIEW_NAMESPACE_SPEC = '**/m4-preview-namespace.spec.ts'
+const VRT_LANE = process.env.LOOP_VRT_LANE === 'true'
 
 export default defineConfig({
   testDir: './tests/e2e',
@@ -83,7 +95,7 @@ export default defineConfig({
       ? 'pnpm exec vite preview --host 127.0.0.1 --port 4173 --strictPort'
       : 'VITE_E2E_MODE=true pnpm exec vite preview --host 127.0.0.1 --port 4173 --strictPort',
     url: 'http://127.0.0.1:4173',
-    reuseExistingServer: PREVIEW_NAMESPACE_LANE ? false : !process.env.CI,
+    reuseExistingServer: PREVIEW_NAMESPACE_LANE || VRT_LANE ? false : !process.env.CI,
     timeout: 120_000,
     stdout: 'pipe',
     stderr: 'pipe',
