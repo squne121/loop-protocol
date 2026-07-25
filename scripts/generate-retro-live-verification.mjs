@@ -13,7 +13,7 @@
 // verification.mjs` consume later. This breaks the circularity of a
 // resolver asserting against its own most-recent output.
 //
-// Usage:
+// Usage (explicit CLI args, real operator-supplied expectations):
 //   node scripts/generate-retro-live-verification.mjs \
 //     --repo owner/name --target-type issue --target-number 123 \
 //     --parent-issue 1153 --marker-comment-url https://... \
@@ -24,6 +24,19 @@
 //     --out artifacts/retro-live-verification-manifest.json
 //
 // pnpm run retro-live-verification:generate -- <flags above>
+//
+// Usage (argument-free wrapper, Issue #1709 PR review P0-5 / AC5): the
+// `retro-live-verification:generate` package.json script itself must remain
+// the bare, argument-free CLI invocation the Issue #1709 Verification
+// Command matches verbatim (`pnpm_gate_registry.py`'s exact-two-token gate
+// never forwards extra argv). When invoked with *zero* CLI arguments, this
+// script falls back to `DEFAULT_GENERATE_ARGS` -- the same checked-in,
+// fixture-derived expectation values embedded in
+// `tests/fixtures/retro-live-verification/gate-manifest.json` -- and writes
+// a fresh manifest to `artifacts/retro-live-verification-gate-manifest.json`.
+// This is a read-only, deterministic fixture default: it never re-derives
+// expectations from a live resolver run. Any explicit CLI argument still
+// takes precedence and is used verbatim, exactly as documented above.
 
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
@@ -241,6 +254,29 @@ export function normalizeTrustedActorAllowlist(rawValue) {
   return deduplicated
 }
 
+// Argument-free wrapper default (Issue #1709 PR review P0-5 / AC5): mirrors
+// the checked-in fixture expectations in
+// `tests/fixtures/retro-live-verification/gate-manifest.json` so a bare
+// `node scripts/generate-retro-live-verification.mjs` (no CLI args) is a
+// read-only, deterministic invocation rather than a required-option usage
+// error. Only used when `process.argv` supplies zero flags; any explicit
+// CLI argument overrides this default entirely.
+export const DEFAULT_GENERATE_ARGS = Object.freeze([
+  '--repo', 'squne121/loop-protocol',
+  '--target-type', 'issue',
+  '--target-number', '1',
+  '--parent-issue', '1',
+  '--marker-comment-url', 'https://github.com/squne121/loop-protocol/issues/1#issuecomment-1',
+  '--expected-digest', `sha256:${'a'.repeat(64)}`,
+  '--expected-payload-digest', `sha256:${'c'.repeat(64)}`,
+  '--expected-matched-comment-count', '1',
+  '--review-artifact-ref', 'https://github.com/squne121/loop-protocol/pull/1#pullrequestreview-1',
+  '--reviewed-head-sha', 'b'.repeat(40),
+  '--issue-number', '1',
+  '--trusted-actor', 'squne121',
+  '--out', 'artifacts/retro-live-verification-gate-manifest.json',
+])
+
 const CLI_OPTION_SPEC = {
   '--repo': { key: 'repo', required: true },
   '--target-type': { key: 'targetType', required: true },
@@ -324,7 +360,8 @@ export function buildManifest(options) {
 }
 
 async function runCli() {
-  const options = parseArgs(process.argv.slice(2), CLI_OPTION_SPEC)
+  const rawArgs = process.argv.slice(2)
+  const options = parseArgs(rawArgs.length === 0 ? DEFAULT_GENERATE_ARGS : rawArgs, CLI_OPTION_SPEC)
   const manifest = buildManifest(options)
   const validation = await validateManifestWithAjv(manifest)
   if (!validation.valid) {

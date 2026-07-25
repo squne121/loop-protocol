@@ -45,36 +45,25 @@ _SCRIPTS = {
         "'CLAUDE.md' 'AGENTS.md' 'SECURITY.md' '.claude/**/*.md'"
     ),
     "validate:roadmap-refs": "node scripts/validate-roadmap-refs.mjs",
-    # Fixed, argument-free wrapper invocations against checked-in fixtures
-    # (Issue #1709 PR review P0-5). The underlying CLIs require repo/target/
-    # digest/review-ref/output-path (generate) or --manifest-json (verify)
-    # arguments that this fail-closed, exact-two-token gate registry never
-    # forwards, so a bare `pnpm retro-live-verification:generate` /
-    # `:verify` with no baked-in arguments would always be a usage error.
+    # Argument-free wrapper invocations (Issue #1709 PR review P0-5 / AC5,
+    # AC7). The package.json script strings themselves are bare, no-argv
+    # invocations -- the Issue #1709 Verification Commands match these
+    # literal strings verbatim, and this fail-closed, exact-two-token gate
+    # registry never forwards extra argv to the underlying CLI. Both
+    # `generate-retro-live-verification.mjs` and `check-retro-live-
+    # verification.mjs` fall back to their own checked-in, fixture-derived
+    # default arguments whenever they are invoked with zero CLI flags (see
+    # `DEFAULT_GENERATE_ARGS` / `DEFAULT_CHECK_ARGS` in those scripts), so a
+    # bare `pnpm retro-live-verification:generate` / `:verify` performs a
+    # real, read-only fixture validation instead of failing with a
+    # required-option usage error.
     # `retro-live-verification:post` is a mutation command (it can create/
     # update a live GitHub comment) and is deliberately NOT registered here;
     # it must only ever be invoked by the protected
     # `.github/workflows/retro-live-verification.yml` `post-canonical-
     # comment` job, never through this generic agent-facing gate registry.
-    "retro-live-verification:generate": (
-        "node scripts/generate-retro-live-verification.mjs "
-        "--repo squne121/loop-protocol --target-type issue --target-number 1 "
-        "--parent-issue 1 "
-        "--marker-comment-url https://github.com/squne121/loop-protocol/issues/1#issuecomment-1 "
-        "--expected-digest sha256:" + ("a" * 64) + " "
-        "--expected-payload-digest sha256:" + ("c" * 64) + " "
-        "--expected-matched-comment-count 1 "
-        "--review-artifact-ref https://github.com/squne121/loop-protocol/pull/1#pullrequestreview-1 "
-        "--reviewed-head-sha " + ("b" * 40) + " "
-        "--issue-number 1 --trusted-actor squne121 "
-        "--out artifacts/retro-live-verification-gate-manifest.json"
-    ),
-    "retro-live-verification:verify": (
-        "node scripts/check-retro-live-verification.mjs "
-        "--manifest-json tests/fixtures/retro-live-verification/gate-manifest.json "
-        "--execution-profile fixture "
-        "--fixture-comments-json tests/fixtures/retro-live-verification/gate-comments.json"
-    ),
+    "retro-live-verification:generate": "node scripts/generate-retro-live-verification.mjs",
+    "retro-live-verification:verify": "node scripts/check-retro-live-verification.mjs",
 }
 
 _GATES = (

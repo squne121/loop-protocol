@@ -50,6 +50,18 @@
 //     --fixture-pr-review-json <path>
 //
 // pnpm run retro-live-verification:verify -- <flags above>
+//
+// Usage (argument-free wrapper, Issue #1709 PR review P0-5 / AC7): the
+// `retro-live-verification:verify` package.json script itself must remain
+// the bare, argument-free CLI invocation the Issue #1709 Verification
+// Command matches verbatim (`pnpm_gate_registry.py`'s exact-two-token gate
+// never forwards extra argv). When invoked with *zero* CLI arguments, this
+// script falls back to `DEFAULT_CHECK_ARGS` -- fixture execution profile
+// against the checked-in
+// `tests/fixtures/retro-live-verification/gate-manifest.json` /
+// `gate-comments.json` -- so the bare invocation is a read-only,
+// deterministic fixture check rather than a required-option usage error.
+// Any explicit CLI argument still takes precedence and is used verbatim.
 
 import { spawnSync } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
@@ -69,6 +81,19 @@ const ASSERT_LIVE_SCRIPT_PATH = resolvePath(SCRIPT_DIR, 'assert-chatgpt-retro-co
 const DEFAULT_SUBPROCESS_TIMEOUT_MS = 30000
 const DEFAULT_MAX_BUFFER = 10 * 1024 * 1024
 const JSON_FENCE_PATTERN = /```json\r?\n(?<payload>[\s\S]*?)\r?\n```/u
+
+// Argument-free wrapper default (Issue #1709 PR review P0-5 / AC7): mirrors
+// the checked-in fixture pair used by the `retro-live-verification:verify`
+// negative-path test suite so a bare `node
+// scripts/check-retro-live-verification.mjs` (no CLI args) is a read-only,
+// deterministic fixture verification rather than a required-option usage
+// error. Only used when `process.argv` supplies zero flags; any explicit
+// CLI argument overrides this default entirely.
+export const DEFAULT_CHECK_ARGS = Object.freeze([
+  '--manifest-json', 'tests/fixtures/retro-live-verification/gate-manifest.json',
+  '--execution-profile', 'fixture',
+  '--fixture-comments-json', 'tests/fixtures/retro-live-verification/gate-comments.json',
+])
 
 const CLI_OPTION_SPEC = {
   '--manifest-json': { key: 'manifestJson', required: true },
@@ -346,7 +371,8 @@ async function loadJsonFile(filePath, code) {
 }
 
 async function runCli() {
-  const options = parseArgs(process.argv.slice(2), CLI_OPTION_SPEC)
+  const rawArgs = process.argv.slice(2)
+  const options = parseArgs(rawArgs.length === 0 ? DEFAULT_CHECK_ARGS : rawArgs, CLI_OPTION_SPEC)
   const executionProfile = normalizeExecutionProfile(options.executionProfile)
 
   const manifestText = await readFile(options.manifestJson, 'utf-8')

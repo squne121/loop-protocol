@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { resolve as resolvePath, dirname } from 'node:path'
 import { parse as parseYaml } from 'yaml'
@@ -411,5 +412,53 @@ describe('required negative test 9: retro-live-verification.yml workflow contrac
       const [, ref] = uses.split('@')
       expect(ref).toMatch(/^[0-9a-f]{40}$/u)
     }
+  })
+})
+
+
+describe('argument-free CLI wrapper fallback (Issue #1709 PR review P0-5, AC5/AC7)', () => {
+  const generateScriptPath = resolvePath(REPO_ROOT, 'scripts/generate-retro-live-verification.mjs')
+  const checkScriptPath = resolvePath(REPO_ROOT, 'scripts/check-retro-live-verification.mjs')
+
+  it('GIVEN generate-retro-live-verification.mjs invoked with zero CLI args WHEN run THEN it succeeds against the checked-in fixture defaults instead of failing with a required-option usage error', () => {
+    const result = spawnSync(process.execPath, [generateScriptPath], {
+      cwd: REPO_ROOT,
+      encoding: 'utf-8',
+    })
+    expect(result.status).toBe(0)
+    const payload = JSON.parse(result.stdout.trim())
+    expect(payload.status).toBe('ok')
+    expect(payload.schema).toBe('retro_live_verification/v2')
+  })
+
+  it('GIVEN check-retro-live-verification.mjs invoked with zero CLI args WHEN run THEN it succeeds against the checked-in fixture defaults instead of failing with a required-option usage error', () => {
+    const result = spawnSync(process.execPath, [checkScriptPath], {
+      cwd: REPO_ROOT,
+      encoding: 'utf-8',
+    })
+    expect(result.status).toBe(0)
+    const payload = JSON.parse(result.stdout.trim())
+    expect(payload.verification_status).toBe('pass')
+    expect(payload.execution_profile).toBe('fixture')
+  })
+
+  it('GIVEN check-retro-live-verification.mjs invoked with explicit CLI args WHEN run THEN the explicit args override the zero-arg fixture defaults', () => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        checkScriptPath,
+        '--manifest-json',
+        resolvePath(FIXTURES_DIR, 'gate-manifest.json'),
+        '--execution-profile',
+        'fixture',
+        '--fixture-comments-json',
+        resolvePath(FIXTURES_DIR, 'stale-digest-comments.json'),
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).toBe(1)
+    const payload = JSON.parse(result.stdout.trim())
+    expect(payload.verification_status).toBe('fail')
+    expect(payload.errors.some((error: { code: string }) => error.code === 'retro_live_verification_check.matched_comment_count_mismatch')).toBe(true)
   })
 })

@@ -57,9 +57,9 @@
     "security:session-recording:host": "uv run --locked python3 .claude/scripts/check_session_recording_runtime_safety.py --json --execution-profile host",
     "latitude:real-pilot:preflight": "uv run --locked python3 .claude/scripts/check_session_recording_runtime_safety.py --json --execution-profile host --require-real-pilot-activation",
     "entirecli:check": "node scripts/agent-logs/check-entirecli-safety.mjs",
-    "retro-live-verification:generate": "node scripts/generate-retro-live-verification.mjs --repo squne121/loop-protocol --target-type issue --target-number 1 --parent-issue 1 --marker-comment-url https://github.com/squne121/loop-protocol/issues/1#issuecomment-1 --expected-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --expected-payload-digest sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc --expected-matched-comment-count 1 --review-artifact-ref https://github.com/squne121/loop-protocol/pull/1#pullrequestreview-1 --reviewed-head-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --issue-number 1 --trusted-actor squne121 --out artifacts/retro-live-verification-gate-manifest.json",
+    "retro-live-verification:generate": "node scripts/generate-retro-live-verification.mjs",
     "retro-live-verification:post": "node scripts/post-retro-live-verification.mjs",
-    "retro-live-verification:verify": "node scripts/check-retro-live-verification.mjs --manifest-json tests/fixtures/retro-live-verification/gate-manifest.json --execution-profile fixture --fixture-comments-json tests/fixtures/retro-live-verification/gate-comments.json"
+    "retro-live-verification:verify": "node scripts/check-retro-live-verification.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
