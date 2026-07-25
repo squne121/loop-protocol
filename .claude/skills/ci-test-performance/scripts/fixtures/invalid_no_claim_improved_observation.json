@@ -1,0 +1,45 @@
+{
+  "schema": "CI_TEST_PERFORMANCE_ASSESSMENT_V2",
+  "schema_version": 2,
+  "issue_number": 1724,
+  "pr_number": 1730,
+  "measured_at": "2026-07-25T00:00:00Z",
+  "claim": {
+    "kind": "none"
+  },
+  "performance_evidence": {
+    "status": "complete"
+  },
+  "observation": {
+    "outcome": "improved"
+  },
+  "claim_evaluation": {
+    "outcome": "not_applicable"
+  },
+  "functional_evidence": {
+    "proof_level": "check_run_only",
+    "coverage_bound": false,
+    "ci_verdict_summary_ref": {
+      "artifact_schema": "ci_verdict_summary_v2",
+      "expected_head_sha": "1234567890abcdef1234567890abcdef12345678",
+      "overall_status": "merge_ready",
+      "selected_checks": [
+        {
+          "check_run_id": 1001,
+          "status": "completed",
+          "conclusion": "success",
+          "head_sha_match": true,
+          "classification": "required"
+        }
+      ]
+    }
+  },
+  "declared_impact": "No performance-relevant changes; schema/docs addition only.",
+  "risk_acknowledgement": {
+    "reference": {
+      "source_kind": "issue_comment",
+      "source_id": "issuecomment-5077131957"
+    },
+    "verification_status": "unverified"
+  }
+}

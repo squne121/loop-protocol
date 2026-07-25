@@ -1,0 +1,44 @@
+{
+  "schema": "ci_verdict_summary_v2",
+  "schema_version": 2,
+  "generated_at": "2026-07-25T00:00:00+00:00",
+  "repository": "squne121/loop-protocol",
+  "workflow_run_id": 555000111,
+  "workflow_run_attempt": 1,
+  "event_name": "pull_request",
+  "expected_head_sha": "1234567890abcdef1234567890abcdef12345678",
+  "head_sha": "1234567890abcdef1234567890abcdef12345678",
+  "overall_status": "merge_ready",
+  "next_action": "none",
+  "artifact_refs": [],
+  "checks": [
+    {
+      "name": "typecheck",
+      "workflow": "ci",
+      "check_run_id": 1001,
+      "status": "completed",
+      "conclusion": "success",
+      "classification": "required",
+      "head_sha": "1234567890abcdef1234567890abcdef12345678",
+      "expected_head_sha": "1234567890abcdef1234567890abcdef12345678",
+      "head_sha_match": true,
+      "blocking_merge_ready": false,
+      "failure_reason": "none",
+      "artifact_refs": []
+    },
+    {
+      "name": "lint",
+      "workflow": "ci",
+      "check_run_id": 1002,
+      "status": "completed",
+      "conclusion": "success",
+      "classification": "required",
+      "head_sha": "1234567890abcdef1234567890abcdef12345678",
+      "expected_head_sha": "1234567890abcdef1234567890abcdef12345678",
+      "head_sha_match": true,
+      "blocking_merge_ready": false,
+      "failure_reason": "none",
+      "artifact_refs": []
+    }
+  ]
+}
