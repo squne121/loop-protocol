@@ -209,6 +209,22 @@ export async function assertAllowedVisualTarget(locator: Locator): Promise<void>
 
 export interface DomOverlayScreenshotOptions {
   maxDiffPixels?: number
+  /**
+   * `toHaveScreenshot()` `maxDiffPixelRatio` (fraction of total pixels
+   * allowed to differ). Preferred over `maxDiffPixels` for this DOM overlay
+   * capture: unlike `m2-combat-mvp.spec.ts`'s single-field HUD screenshots
+   * (`maxDiffPixelRatio: 0.08` there), this capture spans the full
+   * `[data-battle-ui-root]` overlay, so it includes several rendered text
+   * nodes whose glyph anti-aliasing / sub-pixel rasterization is not
+   * bit-identical across otherwise-matching Chromium/font-package
+   * environments (same viewport, same deterministic fixture, same freeze
+   * CSS). A hard `maxDiffPixels: 1` budget is smaller than the pixel count
+   * a single anti-aliased text edge can touch, so it fails closed on
+   * environment-level font-rasterization noise rather than a real visual
+   * regression. Ignored when `maxDiffPixels` is explicitly provided
+   * (Playwright accepts only one of the two).
+   */
+  maxDiffPixelRatio?: number
 }
 
 /**
@@ -252,9 +268,14 @@ export async function expectDomOverlayScreenshot(
 
   await assertAllowedVisualTarget(locator)
 
+  const diffToleranceOption =
+    options.maxDiffPixels !== undefined
+      ? { maxDiffPixels: options.maxDiffPixels }
+      : { maxDiffPixelRatio: options.maxDiffPixelRatio ?? 0.02 }
+
   await expect(locator).toHaveScreenshot(name, {
     animations: 'disabled',
-    maxDiffPixels: options.maxDiffPixels ?? 1,
+    ...diffToleranceOption,
     stylePath: VISUAL_FREEZE_CSS_PATH,
     // BLOCKER 4 (Issue #1385 review): mask every canvas so a transparent
     // DOM overlay (e.g. `.battle-ui-layer`, `position: absolute; inset: 0`)
