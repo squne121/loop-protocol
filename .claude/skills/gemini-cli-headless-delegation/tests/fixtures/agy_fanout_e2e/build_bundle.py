@@ -261,12 +261,16 @@ def build_positive_bundle_content() -> dict[str, Any]:
             "objective": "summarize local asset research objective",
         },
         "result": {
-            "schema": "delegation_result_v1",
-            "status": "ok",
+            "schema": "delegation_result/v1",
+            "ok": True,
             "parent_run_id": PARENT_RUN_ID,
             "subtask_id": "local_asset_research",
             "attempt_id": _ATTEMPT_ID,
-            "actor": "antigravity_cli",
+            "local_asset_retrieval_metadata": {
+                "actor": "wrapper_serena_mcp",
+                "retrieval_actor": "wrapper_serena_mcp",
+                "analysis_actor": "antigravity_cli",
+            },
         },
         "audit": _audit_records(
             run_id=_ATTEMPT_ID,
@@ -315,8 +319,8 @@ def build_positive_bundle_content() -> dict[str, Any]:
             "requires_read_url_content": True,
         },
         "result": {
-            "schema": "delegation_result_v1",
-            "status": "ok",
+            "schema": "delegation_result/v1",
+            "ok": True,
             "parent_run_id": PARENT_RUN_ID,
             "subtask_id": "grounded_research",
             "attempt_id": _ATTEMPT_ID,
@@ -351,12 +355,11 @@ def build_positive_bundle_content() -> dict[str, Any]:
             "objective": "answer from model knowledge only, no tools",
         },
         "result": {
-            "schema": "delegation_result_v1",
-            "status": "ok",
+            "schema": "delegation_result/v1",
+            "ok": True,
             "parent_run_id": PARENT_RUN_ID,
             "subtask_id": "no_tools",
             "attempt_id": _ATTEMPT_ID,
-            "actor": "antigravity_cli",
         },
         "audit": _audit_records(
             run_id=_ATTEMPT_ID,
