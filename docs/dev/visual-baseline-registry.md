@@ -38,6 +38,21 @@ registry は推測ではなく現行テスト実体に基づいて分類する�
   `snapshotPathTemplate: '{testDir}/__screenshots__/{testFilePath}/{arg}{ext}'`。
   `deviceScaleFactor` / `colorScheme` / `reducedMotion` / `locale` / `timezoneId` は未指定
   （`Desktop Chrome` device の既定値に従う。`deviceScaleFactor` は既定 1）。
+- `tests/e2e/visual-overlay.spec.ts`（primary VRT gate。#1386）の実行コマンドは 2 種類ある
+  （PR #1721 review fix, P1 #4）。
+  - `pnpm test:vrt`: ローカル用。`VITE_E2E_MODE=true pnpm build` で hermetic に再 build してから
+    実行する（`import.meta.env.VITE_E2E_MODE` は Vite の build 時静的置換のため、`webServer.command`
+    への env 注入だけでは既存 `dist` に対して手遅れ）。
+  - `pnpm test:vrt:e2e`: CI 用。**「直前の CI ステップで `VITE_E2E_MODE=true` build 済みの `dist`
+    が存在する」ことを precondition とする**。ローカルで単体実行する場合は先に
+    `VITE_E2E_MODE=true pnpm build` を実行すること。
+  - 両コマンドとも `LOOP_VRT_LANE=true` を設定し、`playwright.config.ts` の `webServer.reuseExistingServer`
+    を強制的に `false` にする。別 worktree / 別 commit / E2E モード無しで build された preview server
+    が 4173 番ポートに残っていても、それを再利用せず必ず新しい preview server を起動する。
+  - `tests/e2e/visual.freeze.css` は `[data-battle-ui-root]` 配下の `font-family` を generic family
+    （`sans-serif`）に固定する。`src/style.css` の `--sans` / `--mono` は named font
+    （`Segoe UI Variable` 等）の fallback chain のため、named font の有無がホストごとに異なると
+    同じテキストでも折り返しが変わり得る（font metrics drift）。
 
 ## 2. registry schema（台帳スキーマ）
 
@@ -81,7 +96,8 @@ registry は推測ではなく現行テスト実体に基づいて分類する�
 | id | kind | maturity | artifact/test | spec | fixed contract | mutable elements | tolerance | update condition | invalidated_by |
 |---|---|---|---|---|---|---|---|---|---|
 | timeout-overlay | screenshot-baseline | frozen | `tests/e2e/__screenshots__/m2-combat-mvp.spec.ts/m2-timeout-overlay-baseline.png`（`m2-combat-mvp.spec.ts` の timeout overlay baseline test） | #732 / #681 / #747 | timeout は defeat ではない中立終了表示であること・背景 tint・可読性・整数段階表示 | 色味 / 最終配置は UI 再設計で変更可 | `maxDiffPixels: 1`（理由: CI Chromium + 固定 viewport 1280x720 + 決定論的 E2E モード前提でのみ妥当） | 意図した視覚仕様変更を人間がレビューし承認した場合のみ（§4 checklist 経由） | #727（HUD/layout 再設計） |
-| running-hud | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/m2-combat-mvp.spec.ts/m2-running-hud-baseline.png`（`m2-combat-mvp.spec.ts` の running HUD baseline test） | #681 / #726 / #727 / #1370 / #1375 / #1377 / #1380 | running HUD が描画されること・HULL/HP の小数露出がないこと・桁溢れがないこと | 色味 / 詳細配置 / right rail 依存は再設計まで可変 | `maxDiffPixels: 1`（理由: legacy-current。#727 再設計時に再評価する） | #727 再開時または #1370 / #1375 / #1377 / #1380 系の overlay rollout 進行時に破棄 / 再分類可 | #727 / #1370 / #1375 / #1377 / #1380（HUD/layout 再設計と overlay rollout） |
+| running-hud | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/m2-combat-mvp.spec.ts/m2-running-hud-baseline.png`（`m2-combat-mvp.spec.ts` の running HUD baseline test、`[data-field="sortie-status"]` 単一 field、118x66px） | #681 / #726 / #727 / #1370 / #1375 / #1377 / #1380 | running HUD が描画されること・HULL/HP の小数露出がないこと・桁溢れがないこと | 色味 / 詳細配置 / right rail 依存は再設計まで可変 | `maxDiffPixelRatio: 0.08`（PR #1721 review fix で実コードに合わせて修正。理由: legacy-current・単一 field の小capture。#727 再設計時に再評価する） | #727 再開時または #1370 / #1375 / #1377 / #1380 系の overlay rollout 進行時に破棄 / 再分類可 | #727 / #1370 / #1375 / #1377 / #1380（HUD/layout 再設計と overlay rollout） |
+| running-hud-overlay-legacy-current | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-running-hud-overlay.png`（`tests/e2e/visual-overlay.spec.ts` の `[data-battle-ui-root]` DOM overlay baseline test） | #1386 / #1380 / #1370 | `[data-battle-ui-root]` DOM overlay 全体（HUD 各 field を含む）が描画されること。`running-hud`（`m2-combat-mvp.spec.ts` の単一 field baseline）とは別の独立した baseline であり、両者は衝突しない | 色味 / 詳細配置 / right rail・command-rail 依存は再設計まで可変。将来の overlay 再設計で `frozen` 化するまでは legacy-current のまま | `maxDiffPixels: 100`（絶対ピクセル数。理由: capture root が canvas mask を含み全体の過半を占めるため `maxDiffPixelRatio` は不採用。非mask領域のfont-rasterizationノイズに対しこのworktree環境で複数回実測し PASS した最小幅に margin を加えた値。`tests/e2e/visual.freeze.css` で capture root 配下の font-family を generic family（`sans-serif`）に固定し、host font fallback chain 依存を除去済み） | §4 の `maturity transition` を満たした時点で `legacy-current -> frozen`（#1375/#1376/#1377 マージ後） | #1375 / #1376 / #1377 / #1380（overlay UI 実装マージで破棄・再生成対象） |
 | defeat-overlay | pixel-contract | predicate-only | `getImageData` smoke（`m2-combat-mvp.spec.ts` の defeat overlay 赤支配ピクセル検証 / AC8） | #681 / #732 | defeat overlay が赤系・終端状態として識別可能であること | exact pixels は未固定。最終 layout / 色味は未確定 | N/A（screenshot baseline ではない） | predicate（赤支配）が壊れた場合のみテスト側を調整 | #727 |
 | hp-label | predicate-only | predicate-only | HP label bounds smoke（`m2-combat-mvp.spec.ts` の HP label bounding box 検証 / AC5） | #726 / #727 | HP label が viewport 外 / NaN 表示にならない・bounds 内・可読であること | 最終 UI 表現 / 配置は未固定 | N/A（screenshot baseline ではない） | predicate（bounds / 可読）が壊れた場合のみテスト側を調整 | #727 |
 | running-hud-paused | screenshot-baseline | pending-baseline | pending: no PNG/test | #1380 / #1375 / #1376 / #1377 / #1391 | running HUD の停止状態でも command-rail / right rail / two-column shell / `.battle-stage` 外 controls への依存がないことを明示し、pause overlay の focus / inert / keyboard 証跡を #1376 側で確認する | frozen 適用対象外。duration 等の固定は `durationMs` / `fixedDeltaMs` で判定可能な場合に限定 | pending: no PNG/test（active PASS claim 保留） | §4 の `maturity transition` を満たした時点で `pending-baseline -> frozen` | #1370 / #1375 / #1376 / #1377 / #1380 |

@@ -22,10 +22,13 @@
  */
 
 import { test, expect } from '@playwright/test'
+import { existsSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import {
   installVisualScenario,
   expectDomOverlayScreenshot,
   isPendingFixtureScenario,
+  VISUAL_BASELINE_REGISTRY_MATURITY,
   type VisualScenarioFixture,
 } from './visual-utils'
 
@@ -89,7 +92,15 @@ test('GIVEN the running-hud active-fixture-only scenario WHEN the DOM overlay ro
   await page.goto('/')
 
   const overlayRoot = page.locator('[data-battle-ui-root]')
-  await expectDomOverlayScreenshot(overlayRoot, 'vrt-running-hud-overlay.png')
+  // registryId + explicit maxDiffPixels (Issue #1386 PR #1721 review fix, P1
+  // Blocker 1 / Blocker 2): `running-hud-overlay-legacy-current` is a
+  // distinct registry row from `running-hud` (docs/dev/visual-baseline-registry.md),
+  // and the tolerance is an absolute pixel budget (not a ratio of the full
+  // masked capture) measured empirically against this capture root — see
+  // the registry row's `tolerance` column for the measurement method.
+  await expectDomOverlayScreenshot(overlayRoot, 'vrt-running-hud-overlay.png', 'running-hud-overlay-legacy-current', {
+    maxDiffPixels: 100,
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -111,8 +122,57 @@ const PENDING_SCENARIO_REGISTRY_IDS = {
   'final-no-command-rail': 'final-no-command-rail',
 } as const
 
+/**
+ * Committed screenshot baselines directory for this spec file
+ * (`playwright.config.ts`'s `snapshotPathTemplate`). Used only for the
+ * registry-drift guard below (Issue #1386 PR #1721 review fix, P2 Blocker
+ * #6) — never to decide what to capture.
+ */
+const SCREENSHOTS_DIR = fileURLToPath(new URL('./__screenshots__/visual-overlay.spec.ts/', import.meta.url))
+
+/**
+ * Registry-drift guard (Issue #1386 PR #1721 review fix, P2 Blocker #6).
+ * The `test.skip()` loop below is a hand-authored constant describing
+ * `docs/dev/visual-baseline-registry.md`'s current pending-baseline rows —
+ * it does not automatically re-derive from the registry doc or from
+ * `VISUAL_SCENARIO_STATUS`. Without a check, this constant could silently
+ * drift from the registry (e.g. a future PR promotes a registry row to
+ * `legacy-current` / `frozen` and adds a committed PNG/active test, but
+ * forgets to remove the entry here) and this suite would keep skipping a
+ * scenario that should now be actively captured, instead of failing loudly.
+ * This asserts, for every entry above:
+ *   1. `VISUAL_BASELINE_REGISTRY_MATURITY[registryId]` is still
+ *      `pending-baseline` (registry says pending).
+ *   2. no baseline PNG for that registry id is committed under
+ *      `tests/e2e/__screenshots__/visual-overlay.spec.ts/` (no premature
+ *      capture exists that the registry doesn't know about).
+ * Both directions fail closed: if either check fails, this suite fails
+ * loudly instead of silently continuing to skip a scenario that is (or
+ * should be) active.
+ */
 for (const [scenarioName, registryId] of Object.entries(PENDING_SCENARIO_REGISTRY_IDS)) {
   test(`GIVEN the ${scenarioName} scenario is pending-baseline (registry id: ${registryId}) WHEN this primary VRT suite runs THEN it is skipped explicitly (AC4)`, () => {
+    const maturity = VISUAL_BASELINE_REGISTRY_MATURITY[registryId]
+    expect(
+      maturity,
+      `registry/test drift: "${registryId}" is hard-coded pending here but ` +
+        `docs/dev/visual-baseline-registry.md / VISUAL_BASELINE_REGISTRY_MATURITY reports maturity ` +
+        `"${maturity}" — update this suite (and stop skipping) instead of leaving it silently pending.`,
+    ).toBe('pending-baseline')
+
+    const candidatePngPaths = [
+      `${SCREENSHOTS_DIR}vrt-${scenarioName}-overlay.png`,
+      `${SCREENSHOTS_DIR}vrt-${registryId}.png`,
+    ]
+    const committedPng = candidatePngPaths.find((path) => existsSync(path))
+    expect(
+      committedPng,
+      `registry/test drift: "${registryId}" is pending-baseline but a baseline PNG already exists ` +
+        `at ${String(committedPng)} — the registry says "pending: no PNG/test" (§2/§3 of ` +
+        'docs/dev/visual-baseline-registry.md); either the PNG is stale and must be removed, or the ' +
+        'registry/test must be promoted together.',
+    ).toBeUndefined()
+
     test.skip(
       true,
       `pending-baseline: "${registryId}" is pending-baseline in ` +
