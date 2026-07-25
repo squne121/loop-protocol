@@ -299,7 +299,9 @@ def load_bundle(bundle_dir: Path) -> BundleLoadResult:
             "raw_files": raw_files,
             "fanout_request": json.loads(raw_files["fanout_request.json"]),
             "process_lifecycle_events": [
-                json.loads(line) for line in raw_files["process_lifecycle_events.jsonl"].decode("utf-8").splitlines() if line.strip()
+                json.loads(line)
+                for line in raw_files["process_lifecycle_events.jsonl"].decode("utf-8").splitlines()
+                if line.strip()
             ],
             "environment_manifest": json.loads(raw_files["environment_manifest.json"]),
             "children": {},
@@ -477,12 +479,13 @@ def _predicate_fanout_request_shape(bundle: dict[str, Any]) -> list[PredicateRes
     # P3: profile set exactly {local_asset_research, grounded_research, no_tools}.
     profiles = {s.get("profile") for s in subtasks if isinstance(s, dict)}
     ok = profiles == REQUIRED_PROFILES
+    _profile_list = sorted(p for p in profiles if p)
     results.append(
         PredicateResult(
             "predicate_03",
             "profile_set_exact",
             "pass" if ok else "fail",
-            detail="" if ok else f"expected profiles {sorted(REQUIRED_PROFILES)}, got {sorted(p for p in profiles if p)}",
+            detail="" if ok else f"expected profiles {sorted(REQUIRED_PROFILES)}, got {_profile_list}",
             evidence={"profiles": sorted(p for p in profiles if p)},
         )
     )
@@ -598,14 +601,15 @@ def _predicate_hook_provenance(bundle: dict[str, Any]) -> list[PredicateResult]:
 
     # P8: search_web executed (via validated + matched hook event only).
     tool_names = {(e.get("toolCall") or {}).get("name") for e in matched_events}
+    _matched_tool_names = sorted(n for n in tool_names if n)
     p8_ok = "search_web" in tool_names
     results.append(
         PredicateResult(
             "predicate_08",
             "grounded_research_executes_search_web",
             "pass" if p8_ok else "fail",
-            detail="" if p8_ok else f"search_web not found among matched hook tool names {sorted(n for n in tool_names if n)}",
-            evidence={"tool_names": sorted(n for n in tool_names if n)},
+            detail="" if p8_ok else f"search_web not found among matched hook tool names {_matched_tool_names}",
+            evidence={"tool_names": _matched_tool_names},
         )
     )
 
@@ -621,8 +625,12 @@ def _predicate_hook_provenance(bundle: dict[str, Any]) -> list[PredicateResult]:
             "predicate_09",
             "grounded_research_read_url_content_when_required",
             p9_status,
-            detail="" if p9_status != "fail" else "requires_read_url_content=true but no matched read_url_content event",
-            evidence={"requires_read_url_content": requires_read_url, "tool_names": sorted(n for n in tool_names if n)},
+            detail=(
+                ""
+                if p9_status != "fail"
+                else "requires_read_url_content=true but no matched read_url_content event"
+            ),
+            evidence={"requires_read_url_content": requires_read_url, "tool_names": _matched_tool_names},
         )
     )
 
@@ -728,7 +736,11 @@ def _predicate_serena_hash_chain(bundle: dict[str, Any]) -> list[PredicateResult
             "predicate_14",
             "retrieval_and_analysis_actor_distinguished",
             "pass" if p14_ok else "fail",
-            detail="" if p14_ok else f"result.actor={analysis_actor!r}, expected 'antigravity_cli' distinct from Serena retrieval actor",
+            detail=(
+                ""
+                if p14_ok
+                else f"result.actor={analysis_actor!r}, expected 'antigravity_cli' distinct from Serena retrieval actor"
+            ),
             evidence={"analysis_actor": analysis_actor},
         )
     )
@@ -889,7 +901,9 @@ def _predicate_audit_and_correlation(bundle: dict[str, Any]) -> list[PredicateRe
 # ---------------------------------------------------------------------------
 
 
-def _predicate_redaction(bundle: dict[str, Any], *, home: str | None = None, repo_root: str | None = None) -> list[PredicateResult]:
+def _predicate_redaction(
+    bundle: dict[str, Any], *, home: str | None = None, repo_root: str | None = None
+) -> list[PredicateResult]:
     violations = scan_for_redaction_violations(bundle, home=home, repo_root=repo_root)
 
     p21_ok = not violations

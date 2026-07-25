@@ -91,7 +91,14 @@ def _make_serena_evidence_record(*, parent_run_id: str, subtask_id: str, attempt
 
 
 def _make_hook_event(
-    *, tool_name: str, parent_run_id: str, subtask_id: str, attempt_id: str, conversation_id: str, transcript_sha256: str, step_idx: int
+    *,
+    tool_name: str,
+    parent_run_id: str,
+    subtask_id: str,
+    attempt_id: str,
+    conversation_id: str,
+    transcript_sha256: str,
+    step_idx: int,
 ) -> dict[str, Any]:
     return {
         "schema": "agy_tool_provenance_v1",
@@ -112,7 +119,15 @@ def _make_hook_event(
     }
 
 
-def _audit_records(*, run_id: str, provider_requested: str, tool_profile: str, parent_run_id: str, subtask_id: str, attempt_id: str) -> list[dict[str, Any]]:
+def _audit_records(
+    *,
+    run_id: str,
+    provider_requested: str,
+    tool_profile: str,
+    parent_run_id: str,
+    subtask_id: str,
+    attempt_id: str,
+) -> list[dict[str, Any]]:
     start = {
         "schema": "delegation_audit_v1",
         "record_type": "start",

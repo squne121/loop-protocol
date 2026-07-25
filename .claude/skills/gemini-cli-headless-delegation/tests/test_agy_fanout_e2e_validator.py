@@ -153,8 +153,9 @@ def test_hook_provenance_predicates(tmp_path):
     assert content_claims_search_web_but_fails(verdict2)
 
     def mutate_no_read_url(content):
+        events = content["children"]["grounded_research"]["hook_events"]
         content["children"]["grounded_research"]["hook_events"] = [
-            e for e in content["children"]["grounded_research"]["hook_events"] if e["toolCall"]["name"] != "read_url_content"
+            e for e in events if e["toolCall"]["name"] != "read_url_content"
         ]
 
     bundle_dir3 = build_bundle.build_and_materialize(tmp_path / "no-read-url", mutate=mutate_no_read_url)
@@ -245,7 +246,9 @@ def test_permission_isolation_predicates(tmp_path):
             {"tool_name": "run_shell_command", "source": "agy_direct", "executed": True}
         )
 
-    bundle_dir4 = build_bundle.build_and_materialize(tmp_path / "grounded-unexpected", mutate=mutate_grounded_unexpected)
+    bundle_dir4 = build_bundle.build_and_materialize(
+        tmp_path / "grounded-unexpected", mutate=mutate_grounded_unexpected
+    )
     verdict4 = validator.build_verdict(bundle_dir4)
     assert _predicate_status(verdict4, "predicate_17") == "fail"
 
