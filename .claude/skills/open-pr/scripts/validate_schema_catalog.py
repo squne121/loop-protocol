@@ -92,6 +92,13 @@ _COMMAND_REGISTRY: dict[str, dict[str, str]] = {
         "runner": "pytest",
         "target": "schemas/tests/test_catalog.py",
     },
+    "validate_ci_performance_assessment_v2": {
+        "runner": "pytest",
+        "target": (
+            ".claude/skills/ci-test-performance/scripts/tests/"
+            "test_validate_ci_performance_assessment_v2.py"
+        ),
+    },
 }
 
 ALLOWED_COMMANDS = set(_COMMAND_REGISTRY.keys())

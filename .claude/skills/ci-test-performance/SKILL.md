@@ -199,7 +199,7 @@ hook 実装（`FileChanged` / `PreToolUse` による `ci-test-performance` の�
 
 `risk_acknowledgement` は `reference.source_kind` / `reference.source_id`（リスクが提起された場所へのポインタ）と `verification_status: unverified` を持つ。`accepted` / `actor` のような自己申告フィールドは持たない。
 
-### validator CLI
+### validator CLI（検証コマンド）
 
 ```bash
 uv run --locked python3 .claude/skills/ci-test-performance/scripts/validate_ci_performance_assessment_v2.py \
