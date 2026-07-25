@@ -4,11 +4,12 @@ parent_issue: 1265
 related_issue: 1494
 status: resolved
 last_updated: 2026-07-25
+note: "本ドキュメントは Issue 1749 の調査結果を日本語で記録する"
 ---
 
 # AGY headless print mode（`agy -p`）で grounded_research の search_web/read_url_content が発火しない原因調査
 
-## TL;DR
+## TL;DR（要約）
 
 - 根本原因: `agy -p`（headless print mode, v1.1.7）は **デフォルトモデル（Gemini 3.x 系）を使うと、宣言済みの `search_web`/`read_url_content` ツールを実際には呼び出さず、「検索した」体の hallucination 回答を返す**。CLI フラグ・permission 設定（`--dangerously-skip-permissions` を含む）は無関係で、live 再現でも改善しなかった。
 - 対処: `_run_agy()` が `tool_profile=grounded_research` のときのみ `agy -p <prompt> --model claude-sonnet-4-6` を実行するよう変更した。`claude-sonnet-4-6` を明示指定すると、同一 CLI・同一アカウント・同一 workspace 設定のまま実際に `search_web`/`read_url_content` を呼び出し、`vertexaisearch.cloud.google.com/grounding-api-redirect/...` 形式の実在する grounding citation URL を返すことを live 再現で複数回確認した。
