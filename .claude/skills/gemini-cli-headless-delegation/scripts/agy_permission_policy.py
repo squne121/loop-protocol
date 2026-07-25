@@ -280,6 +280,15 @@ class IsolatedAgyWorkspace:
     # this file from `$HOME/.gemini/antigravity-cli/`, not from
     # `$XDG_CONFIG_HOME`, so the isolated HOME is the required placement.
     agy_oauth_token_path: "Path | None" = None
+    # Issue #1758: path to the explicitly-generated real AGY settings.json
+    # (`<workspace>/.gemini/antigravity-cli/settings.json`) that sets
+    # `toolPermission: "always-proceed"`. Always non-None -- unlike the
+    # gcloud ADC / OAuth token exposures above (which are conditional on a
+    # real host file existing), this file is generated unconditionally
+    # because it never reads or reuses any real-host settings value; see
+    # `_write_agy_tool_permission_settings()` docstring for the live
+    # evidence this addresses.
+    agy_tool_permission_settings_path: "Path | None" = None
 
 
 # Issue #1730: gcloud Application Default Credentials (ADC) are cached
@@ -443,6 +452,72 @@ def _expose_agy_oauth_token_read_only(isolated_home: Path) -> "Path | None":
     return link_path
 
 
+# Issue #1758: AGY's *own* built-in safety preset -- distinct from and
+# evaluated *before* this module's workspace-scoped `.antigravity/settings.json`
+# deny policy / `workspace_deny_gate` PreToolCall hook above -- is controlled by
+# a `toolPermission` field inside the real AGY settings file
+# (`~/.gemini/antigravity-cli/settings.json`, confirmed via live WebFetch of
+# `https://antigravity.google/docs/cli/reference` /
+# `https://antigravity.google/docs/cli/using`; see
+# `references/grounded-research-isolated-workspace-investigation.md` Live
+# Verification section). Its default (when the file/key is absent, which is
+# always true for `materialize_isolated_agy_workspace()` prior to this fix --
+# it never wrote to this path at all) is `"request-review"`: write/bash/web
+# tool calls require interactive confirmation. In headless print mode
+# (`agy -p`) there is nobody to answer that prompt, so the tool call is
+# silently never attempted and the model instead returns a hallucinated
+# "searched" answer -- reproduced live for this Issue with
+# `web_tool_call_count: 0` in the isolated workspace baseline (before this
+# fix). `"always-proceed"` ("never prompts") is the only enum value that
+# removes this confirmation gate entirely; it is safe to use here precisely
+# *because* the deny-by-default `.antigravity/settings.json` policy above
+# (`build_workspace_permission_policy()`) and its `workspace_deny_gate`
+# PreToolCall hook remain the actual tool allowlist authority -- this fix
+# only removes AGY's own redundant confirmation gate for whatever the
+# workspace policy already allows, it does not widen what may be called
+# (Issue #1705 AC5/AC6 config precedence is unaffected; see
+# `test_isolated_workspace_injects_tool_permission_for_grounded_research`
+# and the existing `test_hostile_global_settings_do_not_override_workspace_deny`
+# / `test_workspace_hook_deny_precedence_over_global_allow` regression tests).
+AGY_TOOL_PERMISSION_ALWAYS_PROCEED = "always-proceed"
+AGY_SETTINGS_FILENAME = "settings.json"
+
+
+def _write_agy_tool_permission_settings(isolated_home: Path) -> "Path | None":
+    """Write `<isolated_home>/.gemini/antigravity-cli/settings.json` with an
+    explicit `toolPermission: "always-proceed"` value.
+
+    Unlike `_expose_gcloud_adc_read_only()` / `_expose_agy_oauth_token_read_only()`
+    above, this function never reads or reuses any value from the real host's
+    `$HOME/.gemini/antigravity-cli/settings.json` -- it always generates a
+    brand-new, isolated-workspace-only file with a fixed value. This follows
+    the `references/grounded-research-isolated-workspace-investigation.md`
+    `## Next Action` recommendation to keep true isolation (the isolated
+    workspace's `toolPermission` must not depend on whatever a developer
+    happens to have configured on their real host) rather than symlinking the
+    real settings file the way the OAuth token / gcloud ADC exposures do.
+
+    Returns the path to the written file, or `None` if directory creation or
+    the write itself fails for any reason -- like the other exposure helpers
+    in this module, this is an additive reachability improvement, never a
+    hard requirement for workspace materialization to succeed.
+    """
+    settings_dir = isolated_home / ".gemini" / ANTIGRAVITY_CLI_DIRNAME
+    try:
+        settings_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    settings_path = settings_dir / AGY_SETTINGS_FILENAME
+    try:
+        settings_path.write_text(
+            json.dumps({"toolPermission": AGY_TOOL_PERMISSION_ALWAYS_PROCEED}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    except OSError:
+        return None
+    return settings_path
+
+
 def materialize_isolated_agy_workspace(
     profile: str,
     *,
@@ -545,6 +620,12 @@ def materialize_isolated_agy_workspace(
     # channel `agy` uses; see `_expose_agy_oauth_token_read_only()` docstring.
     agy_oauth_token_path = _expose_agy_oauth_token_read_only(workspace_dir)
 
+    # Issue #1758: generate the real AGY settings.json with an explicit
+    # toolPermission so the isolated `agy` subprocess does not fall back to
+    # the built-in "request-review" default, which silently drops tool calls
+    # in headless print mode; see `_write_agy_tool_permission_settings()`.
+    agy_tool_permission_settings_path = _write_agy_tool_permission_settings(workspace_dir)
+
     return IsolatedAgyWorkspace(
         profile=profile,
         workspace_dir=workspace_dir,
@@ -553,6 +634,7 @@ def materialize_isolated_agy_workspace(
         env=env,
         gcloud_adc_path=gcloud_adc_path,
         agy_oauth_token_path=agy_oauth_token_path,
+        agy_tool_permission_settings_path=agy_tool_permission_settings_path,
     )
 
 

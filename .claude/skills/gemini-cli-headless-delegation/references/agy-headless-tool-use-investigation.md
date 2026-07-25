@@ -123,3 +123,7 @@ hermetic pytest（`test_agy_provider.py`）に以下を追加し、実際に sub
 ## 未解決の副次的観察（本 Issue のスコープ外・別 Issue 候補）
 
 - `agy_permission_policy.py` の `build_workspace_permission_policy()` が生成する `.antigravity/settings.json` は、実際の AGY CLI が読む設定ファイルパス（`~/.gemini/antigravity-cli/settings.json`）ともスキーマ（`toolPermission` enum）とも異なる。isolated workspace の deny policy が AGY 本体に対して機能しているかどうかは本調査で確認できていない（`workspace_deny_gate.py` hook が別経路で機能している可能性はあるが未検証）。この setting file 自体が実際に consumed されているかの検証は本 Issue の Allowed Paths（`run_gemini_headless.py` / `tests/` / `references/`）の外（`agy_permission_policy.py` は Allowed Paths に含まれない）であり、対処しない。follow-up Issue 化を検討可能。
+
+## Live 確認の追記（Issue #1758）
+
+Issue #1752/#1758 は上記の「実際の AGY CLI が読む設定ファイルパス（`~/.gemini/antigravity-cli/settings.json`）」の記述を live WebFetch で再確認し、`toolPermission` の 4 値 enum（`request-review` デフォルト / `proceed-in-sandbox` / `always-proceed` / `strict`）を確定させた。詳細な live 検証結果と、「isolated workspace が toolPermission 未設定のまま grounded_research を実行できない」という仮説が live `agy -p` 実行の結果として誤りだったことの確認は `references/grounded-research-isolated-workspace-investigation.md` の `## Finding 1 Live Verification` セクションを参照。
