@@ -14,6 +14,7 @@ import {
   computeResolvedCommentSetDigest,
   fromSha256Prefixed,
   normalizeTrustedActorAllowlist,
+  normalizeTrustedActorIdAllowlist,
   sha256Hex,
   toSha256Prefixed,
   validateManifestWithAjv,
@@ -33,6 +34,7 @@ import {
   evaluateFindingsOrRationale,
   evaluatePrReviewSurfaceBinding,
   evaluateResolvedCommentSetDigest,
+  fetchLiveCommentSet,
   isPaginationRejected,
   validateAgainstSchemaFile,
   verifyPrReviewBindingLive,
@@ -124,6 +126,32 @@ describe('normalizeTrustedActorAllowlist', () => {
 
   it('GIVEN an empty allowlist WHEN normalized THEN it throws instead of defaulting to "trust everyone"', () => {
     expect(() => normalizeTrustedActorAllowlist('')).toThrow()
+  })
+})
+
+describe('normalizeTrustedActorIdAllowlist (Issue #1415 P1-1 fix_delta)', () => {
+  it('GIVEN --trusted-actor-id omitted (undefined) THEN it returns null, not an empty array (v2 back-compat: field omitted from manifest entirely)', () => {
+    expect(normalizeTrustedActorIdAllowlist(undefined)).toBeNull()
+  })
+
+  it('GIVEN a comma-separated numeric id list with duplicates WHEN normalized THEN it deduplicates and parses to integers', () => {
+    expect(normalizeTrustedActorIdAllowlist('63350259, 63350259,12345')).toEqual([63350259, 12345])
+  })
+
+  it('GIVEN a non-numeric entry WHEN normalized THEN it throws instead of silently dropping the malformed entry', () => {
+    expect(() => normalizeTrustedActorIdAllowlist('63350259,not-a-number')).toThrow()
+  })
+
+  it('GIVEN buildManifest called WITHOUT --trusted-actor-id THEN execution_boundary omits trusted_actor_id_allowlist entirely (byte-identical v2 manifest shape)', () => {
+    const manifest = buildManifest(BASE_ARGS)
+    expect(manifest.execution_boundary).not.toHaveProperty('trusted_actor_id_allowlist')
+  })
+
+  it('GIVEN buildManifest called WITH --trusted-actor-id THEN execution_boundary.trusted_actor_id_allowlist is populated and canonical_comment.body_digest is unaffected (not part of the digested payload)', () => {
+    const withoutId = buildManifest(BASE_ARGS)
+    const withId = buildManifest({ ...BASE_ARGS, trustedActorId: '63350259' })
+    expect(withId.execution_boundary.trusted_actor_id_allowlist).toEqual([63350259])
+    expect(withId.canonical_comment.body_digest).toBe(withoutId.canonical_comment.body_digest)
   })
 })
 
@@ -448,7 +476,7 @@ describe('required negative test 9: retro-live-verification.yml workflow contrac
   })
 
   it('GIVEN the verify step WHEN parsed THEN its condition is the Boolean-safe negation, not a broken string comparison', () => {
-    const verifyStep = postJob.steps.find((step) => String(step.name) === 'Verify canonical comment landed correctly')
+    const verifyStep = postJob.steps.find((step) => String(step.name) === 'Verify canonical comment landed correctly (v2)')
     expect(verifyStep).toBeDefined()
     const condition = String(verifyStep?.if ?? '')
     expect(condition).not.toContain("== 'false'")
@@ -1073,6 +1101,75 @@ describe('Issue #1415 AC8-9: computeResolvedCommentSetDigest / evaluateResolvedC
   })
 })
 
+describe('Issue #1415 P1-2 fix_delta: fetchLiveCommentSet (post-#1747 adversarial review)', () => {
+  it('builds a commentSet from a mocked GhCliIssueCommentsClient (repo_id, target_node_id, and per-comment tuple fields all sourced from the live client, not a caller-supplied file)', async () => {
+    const mockClient = {
+      getRepo: async () => ({ id: 999888777 }),
+      getIssue: async () => ({ node_id: 'I_kwDOexample' }),
+      listIssueCommentsPage: async ({ page }) => {
+        if (page > 1) {
+          return { items: [], hasNextPage: false }
+        }
+        return {
+          items: [
+            { id: 42, user: { id: 63350259 }, created_at: '2026-07-25T06:00:00Z', updated_at: '2026-07-25T06:00:00Z', body: 'hello' },
+          ],
+          hasNextPage: false,
+        }
+      },
+    }
+    const result = await fetchLiveCommentSet(mockClient, { repo: 'squne121/loop-protocol', targetNumber: 1153 })
+    expect(result.ok).toBe(true)
+    expect(result.commentSet.repo_id).toBe(999888777)
+    expect(result.commentSet.target_node_id).toBe('I_kwDOexample')
+    expect(result.commentSet.comments).toEqual([
+      { surface_kind: 'issue_comment', comment_id: 42, author_id: 63350259, created_at: '2026-07-25T06:00:00Z', updated_at: '2026-07-25T06:00:00Z', body: 'hello' },
+    ])
+  })
+
+  it('fails closed when comment pagination is exhausted before a terminal page (GIVEN hasNextPage stays true through the page budget)', async () => {
+    const mockClient = {
+      getRepo: async () => ({ id: 1 }),
+      getIssue: async () => ({ node_id: 'I_x' }),
+      listIssueCommentsPage: async () => ({ items: [{ id: 1, user: { id: 1 }, created_at: 'x', updated_at: 'x', body: 'x' }], hasNextPage: true }),
+    }
+    const result = await fetchLiveCommentSet(mockClient, { repo: 'o/r', targetNumber: 1 })
+    expect(result.ok).toBe(false)
+    expect(result.errorCode).toBe('retro_live_verification_check.live_comment_set_pagination_exhausted')
+  })
+
+  it('a digest recomputed from fetchLiveCommentSet output matches computeResolvedCommentSetDigest on the same tuple fields (live fetch and offline recompute agree)', async () => {
+    // repo_id is always a numeric GitHub id in practice (getRepo() returns
+    // it typed as number and fetchLiveCommentSet nulls out non-numeric
+    // values), so the mock must be numeric here too, unlike target_node_id
+    // (a GraphQL node id, always a string).
+    const mockClient = {
+      getRepo: async () => ({ id: 555444333 }),
+      getIssue: async () => ({ node_id: 'I_target' }),
+      listIssueCommentsPage: async ({ page }) => {
+        if (page > 1) return { items: [], hasNextPage: false }
+        return {
+          items: [{ id: 1, user: { id: 63350259 }, created_at: '2026-07-25T06:00:00Z', updated_at: '2026-07-25T06:00:00Z', body: 'hello' }],
+          hasNextPage: false,
+        }
+      },
+    }
+    const fetched = await fetchLiveCommentSet(mockClient, { repo: 'squne121/loop-protocol', targetNumber: 1153 })
+    expect(fetched.ok).toBe(true)
+    const liveDigest = computeResolvedCommentSetDigest({
+      repoId: fetched.commentSet.repo_id,
+      targetNodeId: fetched.commentSet.target_node_id,
+      comments: fetched.commentSet.comments,
+    })
+    const offlineDigest = computeResolvedCommentSetDigest({
+      repoId: 555444333,
+      targetNodeId: 'I_target',
+      comments: [{ surface_kind: 'issue_comment', comment_id: 1, author_id: 63350259, created_at: '2026-07-25T06:00:00Z', updated_at: '2026-07-25T06:00:00Z', body: 'hello' }],
+    })
+    expect(liveDigest).toBe(offlineDigest)
+  })
+})
+
 describe('Issue #1415 AC10: evaluateFindingsOrRationale', () => {
   it('passes when at least one finding is present, regardless of no_findings_rationale', () => {
     const result = evaluateFindingsOrRationale({ findings: [{ severity: 'low', title: 'x' }] })
@@ -1345,5 +1442,61 @@ describe('Issue #1415 dual-target bundle (retro_live_verification/v3, additive s
       { cwd: REPO_ROOT, encoding: 'utf-8' },
     )
     expect(result.status).not.toBe(0)
+  })
+})
+
+describe('Issue #1415 P0-3 fix_delta: generate-retro-live-verification.mjs --schema-version v3 producer branch', () => {
+  const ISSUE_TARGET_JSON = resolvePath(FIXTURES_DIR, 'dual-target-generator-issue-target.json')
+  const PR_TARGET_JSON = resolvePath(FIXTURES_DIR, 'dual-target-generator-pull-request-target.json')
+
+  it('GIVEN --schema-version v3 with valid per-target JSON files WHEN the generator CLI runs THEN it emits a schema-valid retro_live_verification/v3 bundle to stdout', () => {
+    const result = spawnSync(
+      'node',
+      [
+        resolvePath(REPO_ROOT, 'scripts/generate-retro-live-verification.mjs'),
+        '--schema-version', 'v3',
+        '--repo', 'squne121/loop-protocol',
+        '--parent-issue', '1153',
+        '--issue-target-json', ISSUE_TARGET_JSON,
+        '--pull-request-target-json', PR_TARGET_JSON,
+        '--out', '-',
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).toBe(0)
+    const bundle = JSON.parse(result.stdout.trim())
+    expect(bundle.schema).toBe('retro_live_verification/v3')
+    expect(bundle.issue_target.number).toBe(1153)
+    expect(bundle.pull_request_target.number).toBe(1411)
+    expect(bundle.execution.command_args_digest).toMatch(/^sha256:[a-f0-9]{64}$/)
+    expect(bundle.safety.raw_values_emitted).toBe(false)
+  })
+
+  it('GIVEN --schema-version v3 without --pull-request-target-json WHEN the generator CLI runs THEN it exits non-zero with a usage error rather than emitting a partial bundle', () => {
+    const result = spawnSync(
+      'node',
+      [
+        resolvePath(REPO_ROOT, 'scripts/generate-retro-live-verification.mjs'),
+        '--schema-version', 'v3',
+        '--repo', 'squne121/loop-protocol',
+        '--parent-issue', '1153',
+        '--issue-target-json', ISSUE_TARGET_JSON,
+        '--out', '-',
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).not.toBe(0)
+  })
+
+  it('GIVEN zero CLI args (no --schema-version) WHEN the generator CLI runs THEN it still falls back to the v2 argument-free fixture default, unaffected by the v3 branch addition', () => {
+    const result = spawnSync(
+      'node',
+      [resolvePath(REPO_ROOT, 'scripts/generate-retro-live-verification.mjs')],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).toBe(0)
+    const payload = JSON.parse(result.stdout.trim())
+    expect(payload.schema).toBe('retro_live_verification/v2')
+    expect(payload.status).toBe('ok')
   })
 })

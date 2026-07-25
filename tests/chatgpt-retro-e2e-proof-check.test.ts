@@ -214,6 +214,24 @@ describe('chatgpt_retro_execution_proof/v1 checker: negative fixtures (AC4, AC7-
     expect(result.errors.some((e: { code: string }) => e.code === 'verdict.real_capture_claim_forbidden')).toBe(true)
   })
 
+  it('GIVEN findings is empty and no_findings_rationale is absent THEN retro_live_verification_check.no_findings_rationale_missing is raised by the actual E2E proof checker, not only the standalone checker (Issue #1415 AC10 / P0-4 fix_delta)', () => {
+    const markdown = mutateMarkdown((_proof, retroResult) => {
+      retroResult.findings = []
+      delete retroResult.no_findings_rationale
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'retro_live_verification_check.no_findings_rationale_missing')).toBe(true)
+  })
+
+  it('GIVEN findings is non-empty and no_findings_rationale is absent THEN evaluateFindingsOrRationale does not block (findings alone satisfy AC10, Issue #1415 P0-4 fix_delta)', () => {
+    const markdown = mutateMarkdown((_proof, retroResult) => {
+      delete retroResult.no_findings_rationale
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.errors.some((e: { code: string }) => e.code.startsWith('retro_live_verification_check.no_findings_rationale'))).toBe(false)
+  })
+
   it('GIVEN real_pilot_verified_claimed = true THEN both schema const AND the explicit semantic gate fail closed (P0-3, Issue #1405 OWNER review: real pilot flags are fixed false for this synthetic-only proof kind)', () => {
     // real_pilot_verified_claimed is now `const: false` in the schema, so setting it
     // true fails schema validation directly (which also short-circuits the
