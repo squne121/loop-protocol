@@ -90,6 +90,12 @@ const ASSERT_LIVE_SCRIPT_PATH = resolvePath(SCRIPT_DIR, 'assert-chatgpt-retro-co
 // Issue #1415 AC10-11 (additive, optional gate).
 const RETROSPECTIVE_RESULT_SCHEMA_FILE = resolvePath(REPO_ROOT, 'docs/schemas/chatgpt-retrospective-result.schema.json')
 const RETROSPECTIVE_RESULT_SCHEMA_ID = 'chatgpt_retrospective_result/v1'
+// Issue #1415 (dual-target bundle, additive standalone mode): a distinct
+// schema/file from retro_live_verification/v2 (retro-live-verification.
+// schema.json) -- v3 is never a mutation of a v2 manifest, so v2 producers/
+// consumers are unaffected by this constant's existence.
+const DUAL_TARGET_BUNDLE_SCHEMA_FILE = resolvePath(REPO_ROOT, 'docs/schemas/retro-live-verification-dual-target.schema.json')
+const DUAL_TARGET_BUNDLE_SCHEMA_ID = 'retro_live_verification/v3'
 // Boilerplate placeholder phrases that must not, by themselves, satisfy
 // no_findings_rationale -- a caller writing one of these (with or without
 // surrounding whitespace/trailing punctuation) is not providing a real
@@ -149,6 +155,13 @@ const CLI_OPTION_SPEC = {
   '--require-findings-or-rationale': { key: 'requireFindingsOrRationale', defaultValue: 'false' },
   '--check-execution-boundary': { key: 'checkExecutionBoundary', defaultValue: 'false' },
   '--input': { key: 'standaloneInput' },
+  // Issue #1415 dual-target bundle (--schema retro_live_verification/v3):
+  // per-target fixture resolve-result files for the assert-live context-
+  // assertion binding that this standalone mode runs unconditionally for
+  // BOTH issue_target and pull_request_target (mirrors the AC2 fix, applied
+  // to both targets rather than just the manifest-mode single target).
+  '--fixture-resolve-result-json-issue-target': { key: 'fixtureResolveResultJsonIssueTarget' },
+  '--fixture-resolve-result-json-pull-request-target': { key: 'fixtureResolveResultJsonPullRequestTarget' },
 }
 
 /**
@@ -679,12 +692,90 @@ export async function validateAgainstSchemaFile(schemaFilePath, payload) {
   }
 }
 
+/**
+ * Issue #1415 (dual-target bundle): runs the assert-live context-assertion
+ * binding for a single target's context_assertions object, reusing the same
+ * hardened subprocess delegation the v2 manifest path uses (never a second,
+ * weaker re-implementation). Returns the same shape as
+ * evaluateContextAssertionsBinding's input errors array, prefixed with which
+ * target failed so a dual-target failure is never ambiguous about which side
+ * broke.
+ */
+function evaluateDualTargetContextAssertions({ targetKey, contextAssertions, executionProfile, fixtureResolveResultJson }) {
+  if (executionProfile === 'fixture' && !fixtureResolveResultJson) {
+    throw usageError(
+      'retro_live_verification_check.dual_target_fixture_resolve_result_json_required',
+      `--fixture-resolve-result-json-${targetKey === 'issue_target' ? 'issue-target' : 'pull-request-target'} is required when --execution-profile is fixture`,
+    )
+  }
+  const spawnResult = runContextAssertionsBindingSubprocess({ contextAssertions, executionProfile, fixtureResolveResultJson })
+  const check = evaluateContextAssertionsBinding(spawnResult)
+  return {
+    ok: check.ok,
+    errors: check.errors.map((error) => ({ ...error, message: `[${targetKey}] ${error.message}` })),
+  }
+}
+
+/**
+ * Issue #1415 (dual-target bundle): structural + context-assertion checks
+ * for a retro_live_verification/v3 payload. Schema validation alone can
+ * confirm both targets' comment URLs/digests are present and shaped
+ * correctly, but per the AC2 fix this also unconditionally runs the
+ * assert-live binding for BOTH issue_target.context_assertions and
+ * pull_request_target.context_assertions -- there is no PR-only special
+ * case here, matching the manifest-mode fix.
+ */
+export async function checkDualTargetBundle(payload, { executionProfile, fixtureResolveResultJsonIssueTarget, fixtureResolveResultJsonPullRequestTarget }) {
+  const errors = []
+  const schemaValidation = await validateAgainstSchemaFile(DUAL_TARGET_BUNDLE_SCHEMA_FILE, payload)
+  if (!schemaValidation.valid) {
+    errors.push(...schemaValidation.errors.map((error) => ({ code: 'retro_live_verification_check.dual_target_bundle_schema_invalid', message: `${error.path}: ${error.message}` })))
+    // A structurally invalid bundle cannot be safely dereferenced further
+    // (e.g. issue_target may be entirely absent) -- fail closed here rather
+    // than risk a TypeError-as-crash or an undefined-context-assertions
+    // false pass.
+    return { ok: false, errors }
+  }
+
+  const issueCheck = evaluateDualTargetContextAssertions({
+    targetKey: 'issue_target',
+    contextAssertions: payload.issue_target.context_assertions,
+    executionProfile,
+    fixtureResolveResultJson: fixtureResolveResultJsonIssueTarget,
+  })
+  errors.push(...issueCheck.errors)
+
+  const pullRequestCheck = evaluateDualTargetContextAssertions({
+    targetKey: 'pull_request_target',
+    contextAssertions: payload.pull_request_target.context_assertions,
+    executionProfile,
+    fixtureResolveResultJson: fixtureResolveResultJsonPullRequestTarget,
+  })
+  errors.push(...pullRequestCheck.errors)
+
+  return { ok: errors.length === 0, errors }
+}
+
 async function runStandaloneSchemaCheck(options) {
   if (!options.standaloneInput) {
     throw usageError('retro_live_verification_check.input_required', '--input is required when --schema is passed')
   }
   const payload = await loadJsonFile(options.standaloneInput, 'retro_live_verification_check.input_json_invalid')
   const errors = []
+
+  if (options.targetSchema === DUAL_TARGET_BUNDLE_SCHEMA_ID) {
+    const executionProfile = normalizeExecutionProfile(options.executionProfile)
+    const bundleCheck = await checkDualTargetBundle(payload, {
+      executionProfile,
+      fixtureResolveResultJsonIssueTarget: options.fixtureResolveResultJsonIssueTarget,
+      fixtureResolveResultJsonPullRequestTarget: options.fixtureResolveResultJsonPullRequestTarget,
+    })
+    errors.push(...bundleCheck.errors)
+    const ok = bundleCheck.ok
+    process.stdout.write(`${JSON.stringify({ schema: SCHEMA, verification_status: ok ? 'pass' : 'fail', execution_profile: executionProfile, checked_at: new Date().toISOString(), errors }, null, 2)}\n`)
+    process.exitCode = ok ? 0 : 1
+    return
+  }
 
   if (options.targetSchema === RETROSPECTIVE_RESULT_SCHEMA_ID) {
     const schemaValidation = await validateAgainstSchemaFile(RETROSPECTIVE_RESULT_SCHEMA_FILE, payload)

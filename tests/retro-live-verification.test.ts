@@ -26,6 +26,7 @@ import {
 import {
   checkCanonicalComment,
   checkCaptureToPostLag,
+  checkDualTargetBundle,
   checkRuntimeProvenanceComplete,
   evaluateContextAssertionsBinding,
   evaluateFindingsOrRationale,
@@ -1116,5 +1117,127 @@ describe('Issue #1415 AC10-11: standalone --schema checker (chatgpt_retrospectiv
     } finally {
       unlinkSync(tmpFile)
     }
+  })
+})
+
+describe('Issue #1415 dual-target bundle (retro_live_verification/v3, additive sibling of v2)', () => {
+  const DUAL_TARGET_SCHEMA_FILE = resolvePath(REPO_ROOT, 'docs/schemas/retro-live-verification-dual-target.schema.json')
+  const VALID_BUNDLE = loadFixture('dual-target-bundle-valid.json')
+  const ISSUE_RESOLVE_RESULT = resolvePath(FIXTURES_DIR, 'dual-target-resolve-result-issue.json')
+  const PR_RESOLVE_RESULT = resolvePath(FIXTURES_DIR, 'dual-target-resolve-result-pull-request.json')
+
+  it('GIVEN a valid dual-target bundle WHEN validated against retro_live_verification/v3 THEN it passes schema validation', async () => {
+    const result = await validateAgainstSchemaFile(DUAL_TARGET_SCHEMA_FILE, VALID_BUNDLE)
+    expect(result.valid).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+
+  it('GIVEN a bundle missing pull_request_target entirely WHEN validated THEN it fails closed (never treated as issue-only)', async () => {
+    const { pull_request_target: _omit, ...withoutPrTarget } = VALID_BUNDLE
+    const result = await validateAgainstSchemaFile(DUAL_TARGET_SCHEMA_FILE, withoutPrTarget)
+    expect(result.valid).toBe(false)
+  })
+
+  it('GIVEN a bundle with an existing retro_live_verification/v2 manifest payload WHEN validated against v3 THEN it is rejected (schema const mismatch, v2 documents are never silently accepted as v3)', async () => {
+    const v2Manifest = loadFixture('gate-manifest.json')
+    const result = await validateAgainstSchemaFile(DUAL_TARGET_SCHEMA_FILE, v2Manifest)
+    expect(result.valid).toBe(false)
+  })
+
+  it('GIVEN a v2 manifest fixture WHEN validated against the original v2 schema THEN it still passes unchanged (v3 addition does not regress v2)', async () => {
+    const v2Manifest = loadFixture('gate-manifest.json')
+    const validation = await validateManifestWithAjv(v2Manifest)
+    expect(validation.valid).toBe(true)
+  })
+
+  it('GIVEN a schema-valid dual-target bundle with matching fixture resolve-results for BOTH targets WHEN checkDualTargetBundle runs THEN both targets pass their assert-live context-assertion binding (AC2 dual-target: issue_target is never skipped)', async () => {
+    const result = await checkDualTargetBundle(VALID_BUNDLE, {
+      executionProfile: 'fixture',
+      fixtureResolveResultJsonIssueTarget: ISSUE_RESOLVE_RESULT,
+      fixtureResolveResultJsonPullRequestTarget: PR_RESOLVE_RESULT,
+    })
+    expect(result.ok).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+
+  it('GIVEN a dual-target bundle WHEN issue_target.context_assertions.expected_digest does not match the fixture resolve-result THEN issue_target fails closed even though pull_request_target is untouched (per-target isolation, issue side is never silently skipped)', async () => {
+    const tampered = {
+      ...VALID_BUNDLE,
+      issue_target: {
+        ...VALID_BUNDLE.issue_target,
+        context_assertions: { ...VALID_BUNDLE.issue_target.context_assertions, expected_digest: `sha256:${'0'.repeat(64)}` },
+      },
+    }
+    const result = await checkDualTargetBundle(tampered, {
+      executionProfile: 'fixture',
+      fixtureResolveResultJsonIssueTarget: ISSUE_RESOLVE_RESULT,
+      fixtureResolveResultJsonPullRequestTarget: PR_RESOLVE_RESULT,
+    })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error: { message: string }) => error.message.startsWith('[issue_target]'))).toBe(true)
+    expect(result.errors.some((error: { message: string }) => error.message.startsWith('[pull_request_target]'))).toBe(false)
+  })
+
+  it('GIVEN a dual-target bundle WHEN pull_request_target.context_assertions.expected_matched_comment_count does not match the fixture resolve-result THEN pull_request_target fails closed and is labeled distinctly from issue_target', async () => {
+    const tampered = {
+      ...VALID_BUNDLE,
+      pull_request_target: {
+        ...VALID_BUNDLE.pull_request_target,
+        context_assertions: { ...VALID_BUNDLE.pull_request_target.context_assertions, expected_matched_comment_count: 99 },
+      },
+    }
+    const result = await checkDualTargetBundle(tampered, {
+      executionProfile: 'fixture',
+      fixtureResolveResultJsonIssueTarget: ISSUE_RESOLVE_RESULT,
+      fixtureResolveResultJsonPullRequestTarget: PR_RESOLVE_RESULT,
+    })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error: { message: string }) => error.message.startsWith('[pull_request_target]'))).toBe(true)
+  })
+
+  it('GIVEN a structurally invalid bundle (missing issue_target) WHEN checkDualTargetBundle runs THEN it fails closed at the schema stage without attempting to dereference the missing target (no crash, no false pass)', async () => {
+    const { issue_target: _omit, ...withoutIssueTarget } = VALID_BUNDLE
+    const result = await checkDualTargetBundle(withoutIssueTarget, {
+      executionProfile: 'fixture',
+      fixtureResolveResultJsonIssueTarget: ISSUE_RESOLVE_RESULT,
+      fixtureResolveResultJsonPullRequestTarget: PR_RESOLVE_RESULT,
+    })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error: { code: string }) => error.code === 'retro_live_verification_check.dual_target_bundle_schema_invalid')).toBe(true)
+  })
+
+  it('GIVEN the CLI --schema retro_live_verification/v3 standalone mode WHEN both targets fixture-resolve cleanly THEN the subprocess exits 0 with verification_status pass', () => {
+    const result = spawnSync(
+      'node',
+      [
+        resolvePath(REPO_ROOT, 'scripts/check-retro-live-verification.mjs'),
+        '--',
+        '--schema', 'retro_live_verification/v3',
+        '--execution-profile', 'fixture',
+        '--input', resolvePath(FIXTURES_DIR, 'dual-target-bundle-valid.json'),
+        '--fixture-resolve-result-json-issue-target', ISSUE_RESOLVE_RESULT,
+        '--fixture-resolve-result-json-pull-request-target', PR_RESOLVE_RESULT,
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).toBe(0)
+    const payload = JSON.parse(result.stdout.trim())
+    expect(payload.verification_status).toBe('pass')
+  })
+
+  it('GIVEN the CLI --schema retro_live_verification/v3 standalone mode WHEN --fixture-resolve-result-json-pull-request-target is omitted in fixture mode THEN it exits with a usage error rather than silently skipping the pull_request_target assertion', () => {
+    const result = spawnSync(
+      'node',
+      [
+        resolvePath(REPO_ROOT, 'scripts/check-retro-live-verification.mjs'),
+        '--',
+        '--schema', 'retro_live_verification/v3',
+        '--execution-profile', 'fixture',
+        '--input', resolvePath(FIXTURES_DIR, 'dual-target-bundle-valid.json'),
+        '--fixture-resolve-result-json-issue-target', ISSUE_RESOLVE_RESULT,
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).not.toBe(0)
   })
 })

@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/squne121/loop-protocol/docs/schemas/retro-live-verification-dual-target.schema.json",
+  "title": "retro_live_verification/v3",
+  "description": "Issue #1415: the two-target (Issue #1153 + PR #1411 shaped) canonical parent verification bundle. Additive sibling of retro_live_verification/v2 (retro-live-verification.schema.json) -- v2 remains the single-target schema unchanged; a v3 payload is a distinct document, never a mutation of a v2 manifest, so v2 producers/consumers (#1709/#1415 AC2/AC4/AC5-7/AC8-9/AC10-11/AC13/AC15) are unaffected by this file's existence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "repo",
+    "parent_issue",
+    "evidence_mode",
+    "issue_target",
+    "pull_request_target",
+    "execution",
+    "safety",
+    "readback"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "retro_live_verification/v3"
+    },
+    "repo": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    },
+    "parent_issue": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "evidence_mode": {
+      "type": "string",
+      "enum": ["synthetic_route_proof", "real_pilot_verified"]
+    },
+    "issue_target": {
+      "$ref": "#/$defs/issueTarget"
+    },
+    "pull_request_target": {
+      "$ref": "#/$defs/pullRequestTarget"
+    },
+    "execution": {
+      "$ref": "#/$defs/execution"
+    },
+    "safety": {
+      "$ref": "#/$defs/safety"
+    },
+    "readback": {
+      "$ref": "#/$defs/readback"
+    }
+  },
+  "$defs": {
+    "sha256PrefixedDigest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "commentUrl": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(issues|pull)/[0-9]+#issuecomment-[0-9]+$"
+    },
+    "commonTargetFields": {
+      "type": "object",
+      "required": [
+        "number",
+        "operation_index_comment_url",
+        "marker_comment_url",
+        "proof_comment_url",
+        "retrospective_result_comment_url",
+        "proof_payload_digest",
+        "context_assertions"
+      ],
+      "properties": {
+        "number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "operation_index_comment_url": { "$ref": "#/$defs/commentUrl" },
+        "marker_comment_url": { "$ref": "#/$defs/commentUrl" },
+        "proof_comment_url": { "$ref": "#/$defs/commentUrl" },
+        "retrospective_result_comment_url": { "$ref": "#/$defs/commentUrl" },
+        "proof_payload_digest": { "$ref": "#/$defs/sha256PrefixedDigest" },
+        "context_assertions": {
+          "description": "Issue #1415 AC2 (dual-target form): a retro_live_verification/v2-shaped context_assertions object. The checker executes the assert-live context-assertion binding for THIS target unconditionally -- there is no PR-only special case in the v3 dual-target path.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "repo",
+            "target_type",
+            "target_number",
+            "parent_issue",
+            "marker_comment_url",
+            "expected_digest",
+            "expected_payload_digest",
+            "expected_matched_comment_count"
+          ],
+          "properties": {
+            "repo": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$" },
+            "target_type": { "type": "string", "enum": ["issue", "pull_request"] },
+            "target_number": { "type": "integer", "minimum": 1 },
+            "parent_issue": { "type": "integer", "minimum": 1 },
+            "marker_comment_url": { "$ref": "#/$defs/commentUrl" },
+            "expected_digest": { "$ref": "#/$defs/sha256PrefixedDigest" },
+            "expected_payload_digest": { "$ref": "#/$defs/sha256PrefixedDigest" },
+            "expected_matched_comment_count": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "issueTarget": {
+      "allOf": [{ "$ref": "#/$defs/commonTargetFields" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["number", "operation_index_comment_url", "marker_comment_url", "proof_comment_url", "retrospective_result_comment_url", "proof_payload_digest", "context_assertions", "resolver_status"],
+      "properties": {
+        "number": { "type": "integer", "minimum": 1 },
+        "operation_index_comment_url": { "$ref": "#/$defs/commentUrl" },
+        "marker_comment_url": { "$ref": "#/$defs/commentUrl" },
+        "proof_comment_url": { "$ref": "#/$defs/commentUrl" },
+        "retrospective_result_comment_url": { "$ref": "#/$defs/commentUrl" },
+        "proof_payload_digest": { "$ref": "#/$defs/sha256PrefixedDigest" },
+        "context_assertions": { "$ref": "#/$defs/commonTargetFields/properties/context_assertions" },
+        "resolver_status": {
+          "type": "string",
+          "const": "resolved"
+        }
+      }
+    },
+    "pullRequestTarget": {
+      "allOf": [{ "$ref": "#/$defs/commonTargetFields" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "number",
+        "operation_index_comment_url",
+        "marker_comment_url",
+        "proof_comment_url",
+        "retrospective_result_comment_url",
+        "proof_payload_digest",
+        "context_assertions",
+        "target_head_sha",
+        "review_surface_proof_comment_url",
+        "projection_digest",
+        "comment_chain_status",
+        "review_surface_status"
+      ],
+      "properties": {
+        "number": { "type": "integer", "minimum": 1 },
+        "operation_index_comment_url": { "$ref": "#/$defs/commentUrl" },
+        "marker_comment_url": { "$ref": "#/$defs/commentUrl" },
+        "proof_comment_url": { "$ref": "#/$defs/commentUrl" },
+        "retrospective_result_comment_url": { "$ref": "#/$defs/commentUrl" },
+        "proof_payload_digest": { "$ref": "#/$defs/sha256PrefixedDigest" },
+        "context_assertions": { "$ref": "#/$defs/commonTargetFields/properties/context_assertions" },
+        "target_head_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "review_surface_proof_comment_url": { "$ref": "#/$defs/commentUrl" },
+        "projection_digest": { "$ref": "#/$defs/sha256PrefixedDigest" },
+        "comment_chain_status": {
+          "type": "string",
+          "const": "resolved"
+        },
+        "review_surface_status": {
+          "type": "string",
+          "const": "resolved"
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checked_at", "resolver_commit", "command_args_digest", "github_connector_only_session_declared"],
+      "properties": {
+        "checked_at": { "type": "string", "format": "date-time" },
+        "resolver_commit": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "command_args_digest": { "$ref": "#/$defs/sha256PrefixedDigest" },
+        "github_connector_only_session_declared": { "type": "boolean" }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["raw_values_emitted", "forbidden_fields_scan"],
+      "properties": {
+        "raw_values_emitted": { "type": "boolean", "const": false },
+        "forbidden_fields_scan": { "type": "string", "const": "pass" }
+      }
+    },
+    "readback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["canonical_comment_count", "digest_revalidation", "duplicate_count"],
+      "properties": {
+        "canonical_comment_count": { "type": "integer", "const": 1 },
+        "digest_revalidation": { "type": "string", "const": "pass" },
+        "duplicate_count": { "type": "integer", "const": 0 }
+      }
+    }
+  }
+}

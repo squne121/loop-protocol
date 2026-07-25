@@ -1,0 +1,63 @@
+{
+  "schema": "retro_live_verification/v3",
+  "repo": "squne121/loop-protocol",
+  "parent_issue": 1153,
+  "evidence_mode": "synthetic_route_proof",
+  "issue_target": {
+    "number": 1153,
+    "operation_index_comment_url": "https://github.com/squne121/loop-protocol/issues/1153#issuecomment-10",
+    "marker_comment_url": "https://github.com/squne121/loop-protocol/issues/1153#issuecomment-1",
+    "proof_comment_url": "https://github.com/squne121/loop-protocol/issues/1153#issuecomment-11",
+    "retrospective_result_comment_url": "https://github.com/squne121/loop-protocol/issues/1153#issuecomment-12",
+    "proof_payload_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "resolver_status": "resolved",
+    "context_assertions": {
+      "repo": "squne121/loop-protocol",
+      "target_type": "issue",
+      "target_number": 1153,
+      "parent_issue": 1153,
+      "marker_comment_url": "https://github.com/squne121/loop-protocol/issues/1153#issuecomment-1",
+      "expected_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_payload_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "expected_matched_comment_count": 1
+    }
+  },
+  "pull_request_target": {
+    "number": 1411,
+    "operation_index_comment_url": "https://github.com/squne121/loop-protocol/pull/1411#issuecomment-20",
+    "marker_comment_url": "https://github.com/squne121/loop-protocol/pull/1411#issuecomment-2",
+    "proof_comment_url": "https://github.com/squne121/loop-protocol/pull/1411#issuecomment-21",
+    "retrospective_result_comment_url": "https://github.com/squne121/loop-protocol/pull/1411#issuecomment-22",
+    "proof_payload_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "target_head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "review_surface_proof_comment_url": "https://github.com/squne121/loop-protocol/pull/1411#issuecomment-23",
+    "projection_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "comment_chain_status": "resolved",
+    "review_surface_status": "resolved",
+    "context_assertions": {
+      "repo": "squne121/loop-protocol",
+      "target_type": "pull_request",
+      "target_number": 1411,
+      "parent_issue": 1153,
+      "marker_comment_url": "https://github.com/squne121/loop-protocol/pull/1411#issuecomment-2",
+      "expected_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "expected_payload_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "expected_matched_comment_count": 1
+    }
+  },
+  "execution": {
+    "checked_at": "2026-07-25T03:18:05.310Z",
+    "resolver_commit": "d4de064db260ec53e41aa71481ea2a24cb9ecc1d",
+    "command_args_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "github_connector_only_session_declared": true
+  },
+  "safety": {
+    "raw_values_emitted": false,
+    "forbidden_fields_scan": "pass"
+  },
+  "readback": {
+    "canonical_comment_count": 1,
+    "digest_revalidation": "pass",
+    "duplicate_count": 0
+  }
+}
