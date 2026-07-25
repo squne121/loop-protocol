@@ -892,8 +892,9 @@ pnpm test
 # ---------------------------------------------------------------------------
 
 class TestGuardAcVcAlignmentFinding5:
-    def test_duplicate_vc_ac1_causes_failure(self, template_dir):
-        """GIVEN # AC1 が VC に 2 回ある WHEN guard_ac_vc_alignment THEN AC 番号集合と不一致で fail"""
+    def test_duplicate_vc_ac1_passes_as_bundled_commands(self, template_dir):
+        """GIVEN # AC1 が VC に複数回ある（1 AC に複数 VC コマンドを束ねる正当なパターン）
+        WHEN guard_ac_vc_alignment THEN 集合一致で pass する（#1694: false positive 解消）"""
         body = """\
 ## Machine-Readable Contract
 
@@ -917,8 +918,8 @@ pnpm test --watch
 """
         result = guard_ac_vc_alignment(body, "implementation", template_dir=template_dir)
         assert result["skipped"] is False
-        # AC: [1], VC: [1, 1] → sorted([1]) != sorted([1, 1]) → fail
-        assert result["passed"] is False
+        # AC: {1}, VC: {1, 1} -> set({1}) == set({1}) -> pass（集合一致・重複は許容）
+        assert result["passed"] is True
 
     def test_vc_ac_outside_vc_section_not_counted(self, template_dir):
         """GIVEN ## Verification Commands セクション外の # AC1 WHEN guard_ac_vc_alignment THEN カウントしない"""
