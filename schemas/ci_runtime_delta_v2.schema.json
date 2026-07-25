@@ -191,7 +191,7 @@
     },
     "RunDetail": {
       "type": "object",
-      "description": "Per-run raw evidence. Required by the semantic validator (not JSON Schema alone) whenever performance_evidence.status == complete, so that P50/P95/delta can be recomputed from raw samples instead of trusted self-reported aggregates.",
+      "description": "Per-run raw evidence. Structurally defined but currently unreferenced by the semantic validator (validate_ci_performance_assessment_v2.py does not read run_details or duration_seconds); it is an optional field not listed in Cohort.required. Recomputing P50/P95/delta from these raw samples is a possible future validator extension, not a current enforcement guarantee.",
       "required": [
         "run_id",
         "workflow_run_id",
