@@ -3,6 +3,21 @@
 LOOP_PROTOCOL の Issue 駆動開発で使う各 SubAgent / Skill の責務境界を、開発者が運用上参照するためのドキュメント。
 SKILL.md / SubAgent 定義に書くとコンテクスト汚染になるため、本ドキュメントを正本とする。
 
+## 実行計画 consumer 境界 (Execution planning consumer boundary)
+
+`ISSUE_EXECUTION_DECISION_V1` の semantic planning は `issue-refinement-loop` が一度だけ produce する。
+consumer は JSON Schema、#1677 の normative semantic validator、identity、freshness/integrity、consumer compatibility を検証して opaque decision を consume し、
+semantic relation / `execution.state` を再分類しない。`deferred` / `blocked` は planner decision の明示 state であり、
+worker や CI/review/security/permission/publication の safety stop と混同しない。
+
+| Role | 責務 | 禁止事項 |
+|---|---|---|
+| semantic planner | normalized closed schema に identity/nodes/relations/execution/downstream_policy/completeness を生成する | consumer ごとの safety gate を削除すること |
+| freshness verifier | source completeness、digest、body/updatedAt を確認し stale/incomplete/invalid を再収集へ route | collision 観測を推測すること |
+| conflict observer | SHA 束縛された Git conflict と GitHub merge readiness を観測 | `UNKNOWN` / null / `BLOCKED` / `DRAFT` / `BEHIND` を conflict と正規化すること |
+| merge-readiness consumer | GitHub の `mergeable_state` と `merge_state_status` を別 field で consume | semantic planning を再分類すること |
+| open-pr consumer | existing hard gate と unsafe-decision mutation deny を維持し、legacy/V1 digest equivalence を fail-closed で扱う | new decision 導入前に旧 checker を除去すること |
+
 ## SubAgent 役割分類と permissionMode 一覧
 
 各 SubAgent を役割カテゴリ別に分類し、それぞれの `permissionMode` と主要ツール制約を示す。
