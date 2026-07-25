@@ -339,6 +339,24 @@ request の `provider` が `"auto"` の場合のみ、`run_gemini_headless.py` �
 `provider="auto"` の `eligible_profiles` は `no_tools` / `proposal_only` のみで、それ以外の `tool_profile` を指定した場合は
 provider 試行自体を行わず `provider_profile_unsupported`（`fallback_reason: "stop_if:provider_profile_unsupported"`）で即時 fail-closed する。
 
+### `provider=agy` 関連フィールド（条件付き）
+
+`provider` が `"agy"` の場合のみ、`_normalize_agy_result()`（`run_gemini_headless.py`）が
+以下の 2 フィールドを `delegation_result/v1` へ追加する（Issue #1752）。`provider="gemini"`
+の場合はこれらのフィールドは付与されない。
+
+| フィールド | 型 | 必須条件 | 説明 |
+|----------|--|---------|------|
+| `agy_provenance_hook_events` | array&#91;object&#93; | `provider="agy"` の場合は常に存在 | `_run_agy()` が isolated workspace 削除前にメモリへ読み込んだ `agy_tool_provenance_v1` PreToolUse hook event の list（`agy_tool_provenance.load_hook_events()` の戻り値をそのまま転記）。hook イベントが 1 件も記録されなかった場合、または `completed`（`_run_agy` を経由しない直接呼び出し・モックテスト互換）に本属性が存在しない場合は `[]` |
+| `agy_provenance_hook_load_error` | string &#124; null | `provider="agy"` の場合は常に存在 | hook event log の読み込みに失敗した場合の fail-closed エラーメッセージ（`agy_tool_provenance.ProvenanceParseError` 由来）。エラーがない場合、または `completed` に本属性が存在しない場合は `null` |
+
+これにより `run_delegation()` の呼び出し元（`build_fanout_evidence_bundle.py` の
+`--hook-events-file` 等）が、`_run_agy()` が既に削除済みの isolated workspace の
+`_provenance/hook_events.jsonl` を再読み込みすることなく、`delegation_result/v1` の
+返り値だけから hook events bundle を組み立てられる。`exit_code != 0` 分岐・stdout 空
+分岐でも同じ 2 フィールドが含まれる（fail-closed 診断のため、失敗時も hook 証跡を
+捨てない）。
+
 ### `result_surface` の形
 
 `result_surface` は `references/result-surface.md` を正本とし、少なくとも以下を含む:
