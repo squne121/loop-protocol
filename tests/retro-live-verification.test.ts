@@ -34,6 +34,7 @@ import {
   evaluateFindingsOrRationale,
   evaluatePrReviewSurfaceBinding,
   evaluateResolvedCommentSetDigest,
+  fetchLiveCommentSet,
   isPaginationRejected,
   validateAgainstSchemaFile,
   verifyPrReviewBindingLive,
@@ -475,7 +476,7 @@ describe('required negative test 9: retro-live-verification.yml workflow contrac
   })
 
   it('GIVEN the verify step WHEN parsed THEN its condition is the Boolean-safe negation, not a broken string comparison', () => {
-    const verifyStep = postJob.steps.find((step) => String(step.name) === 'Verify canonical comment landed correctly')
+    const verifyStep = postJob.steps.find((step) => String(step.name) === 'Verify canonical comment landed correctly (v2)')
     expect(verifyStep).toBeDefined()
     const condition = String(verifyStep?.if ?? '')
     expect(condition).not.toContain("== 'false'")
@@ -1097,6 +1098,75 @@ describe('Issue #1415 AC8-9: computeResolvedCommentSetDigest / evaluateResolvedC
     const result = evaluateResolvedCommentSetDigest({ manifest, commentSet: { repo_id: 'R_repo', target_node_id: 'I_target', comments: BASE_COMMENTS } })
     expect(result.ok).toBe(false)
     expect(result.errors[0].code).toBe('retro_live_verification_check.resolved_comment_set_digest_profile_mismatch')
+  })
+})
+
+describe('Issue #1415 P1-2 fix_delta: fetchLiveCommentSet (post-#1747 adversarial review)', () => {
+  it('builds a commentSet from a mocked GhCliIssueCommentsClient (repo_id, target_node_id, and per-comment tuple fields all sourced from the live client, not a caller-supplied file)', async () => {
+    const mockClient = {
+      getRepo: async () => ({ id: 999888777 }),
+      getIssue: async () => ({ node_id: 'I_kwDOexample' }),
+      listIssueCommentsPage: async ({ page }) => {
+        if (page > 1) {
+          return { items: [], hasNextPage: false }
+        }
+        return {
+          items: [
+            { id: 42, user: { id: 63350259 }, created_at: '2026-07-25T06:00:00Z', updated_at: '2026-07-25T06:00:00Z', body: 'hello' },
+          ],
+          hasNextPage: false,
+        }
+      },
+    }
+    const result = await fetchLiveCommentSet(mockClient, { repo: 'squne121/loop-protocol', targetNumber: 1153 })
+    expect(result.ok).toBe(true)
+    expect(result.commentSet.repo_id).toBe(999888777)
+    expect(result.commentSet.target_node_id).toBe('I_kwDOexample')
+    expect(result.commentSet.comments).toEqual([
+      { surface_kind: 'issue_comment', comment_id: 42, author_id: 63350259, created_at: '2026-07-25T06:00:00Z', updated_at: '2026-07-25T06:00:00Z', body: 'hello' },
+    ])
+  })
+
+  it('fails closed when comment pagination is exhausted before a terminal page (GIVEN hasNextPage stays true through the page budget)', async () => {
+    const mockClient = {
+      getRepo: async () => ({ id: 1 }),
+      getIssue: async () => ({ node_id: 'I_x' }),
+      listIssueCommentsPage: async () => ({ items: [{ id: 1, user: { id: 1 }, created_at: 'x', updated_at: 'x', body: 'x' }], hasNextPage: true }),
+    }
+    const result = await fetchLiveCommentSet(mockClient, { repo: 'o/r', targetNumber: 1 })
+    expect(result.ok).toBe(false)
+    expect(result.errorCode).toBe('retro_live_verification_check.live_comment_set_pagination_exhausted')
+  })
+
+  it('a digest recomputed from fetchLiveCommentSet output matches computeResolvedCommentSetDigest on the same tuple fields (live fetch and offline recompute agree)', async () => {
+    // repo_id is always a numeric GitHub id in practice (getRepo() returns
+    // it typed as number and fetchLiveCommentSet nulls out non-numeric
+    // values), so the mock must be numeric here too, unlike target_node_id
+    // (a GraphQL node id, always a string).
+    const mockClient = {
+      getRepo: async () => ({ id: 555444333 }),
+      getIssue: async () => ({ node_id: 'I_target' }),
+      listIssueCommentsPage: async ({ page }) => {
+        if (page > 1) return { items: [], hasNextPage: false }
+        return {
+          items: [{ id: 1, user: { id: 63350259 }, created_at: '2026-07-25T06:00:00Z', updated_at: '2026-07-25T06:00:00Z', body: 'hello' }],
+          hasNextPage: false,
+        }
+      },
+    }
+    const fetched = await fetchLiveCommentSet(mockClient, { repo: 'squne121/loop-protocol', targetNumber: 1153 })
+    expect(fetched.ok).toBe(true)
+    const liveDigest = computeResolvedCommentSetDigest({
+      repoId: fetched.commentSet.repo_id,
+      targetNodeId: fetched.commentSet.target_node_id,
+      comments: fetched.commentSet.comments,
+    })
+    const offlineDigest = computeResolvedCommentSetDigest({
+      repoId: 555444333,
+      targetNodeId: 'I_target',
+      comments: [{ surface_kind: 'issue_comment', comment_id: 1, author_id: 63350259, created_at: '2026-07-25T06:00:00Z', updated_at: '2026-07-25T06:00:00Z', body: 'hello' }],
+    })
+    expect(liveDigest).toBe(offlineDigest)
   })
 })
 

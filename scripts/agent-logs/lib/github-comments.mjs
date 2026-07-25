@@ -390,6 +390,28 @@ function splitRepo(repo) {
 }
 
 export class GhCliIssueCommentsClient {
+  // Issue #1415 P1-2 fix_delta: repo/issue metadata lookups used by
+  // fetchLiveCommentSet() in scripts/check-retro-live-verification.mjs to
+  // bind resolved_comment_set_digest to a live repo_id/target_node_id
+  // instead of caller-supplied values.
+  async getRepo({ repo }) {
+    const response = runGhApi([
+      '-H', 'Accept: application/vnd.github+json',
+      '-H', 'X-GitHub-Api-Version: 2022-11-28',
+      `repos/${repo}`,
+    ])
+    return response.body
+  }
+
+  async getIssue({ repo, issueNumber }) {
+    const response = runGhApi([
+      '-H', 'Accept: application/vnd.github+json',
+      '-H', 'X-GitHub-Api-Version: 2022-11-28',
+      `repos/${repo}/issues/${issueNumber}`,
+    ])
+    return response.body
+  }
+
   async listIssueComments({ repo, issueNumber, page, perPage }) {
     const response = await this.listIssueCommentsPage({ repo, issueNumber, page, perPage })
     return response.items

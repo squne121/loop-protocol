@@ -148,6 +148,11 @@ const CLI_OPTION_SPEC = {
   // JSON file and compare against the value stored in the manifest.
   '--recompute-digests': { key: 'recomputeDigests', defaultValue: 'false' },
   '--comment-set-json': { key: 'commentSetJson' },
+  // Issue #1415 P1-2 fix_delta (post-#1747 adversarial review): fetches the
+  // comment set live from GitHub instead of trusting a caller-supplied file.
+  // Mutually exclusive with --comment-set-json.
+  '--live-comment-set': { key: 'liveCommentSet', defaultValue: 'false' },
+  '--live-comment-set-target-number': { key: 'liveCommentSetTargetNumber' },
   // Issue #1415 AC10-11 (additive, standalone mode -- these two flags run a
   // single independent schema/content check over --input and exit, they do
   // not combine with the retro_live_verification manifest checks above).
@@ -267,6 +272,42 @@ export function evaluateResolvedCommentSetDigest({ manifest, commentSet }) {
  */
 export function isPaginationRejected(listing) {
   return listing?.pagination_exhausted === true || listing?.page_budget_exhausted === true
+}
+
+/**
+ * Issue #1415 P1-2 fix_delta (post-#1747 adversarial review): builds the
+ * `commentSet` input for evaluateResolvedCommentSetDigest() from a fresh
+ * live GitHub fetch instead of a caller-supplied JSON file, so the digest
+ * binds the actual current comment set rather than an unverified snapshot
+ * the caller claims was fetched live. Scope: this fetches and includes every
+ * comment currently on the target issue (not a filtered subset of only the
+ * artifact comments the manifest references) -- a coarser binding than an
+ * exact-subset match, but one that cannot be satisfied by a stale or
+ * fabricated file the way --comment-set-json can. Fails closed on
+ * pagination incompleteness, matching the rest of this file's live-fetch
+ * paths.
+ */
+export async function fetchLiveCommentSet(client, { repo, targetNumber }) {
+  const repoInfo = await client.getRepo({ repo })
+  const repoId = typeof repoInfo?.id === 'number' ? repoInfo.id : null
+  const targetInfo = await client.getIssue({ repo, issueNumber: targetNumber })
+  const targetNodeId = typeof targetInfo?.node_id === 'string' ? targetInfo.node_id : null
+
+  const listing = await listAllIssueCommentsStructured(client, { repo, issueNumber: targetNumber })
+  if (isPaginationRejected(listing)) {
+    return { ok: false, errorCode: 'retro_live_verification_check.live_comment_set_pagination_exhausted' }
+  }
+
+  const comments = listing.comments.map((comment) => ({
+    surface_kind: 'issue_comment',
+    comment_id: typeof comment?.id === 'number' ? comment.id : null,
+    author_id: typeof comment?.user?.id === 'number' ? comment.user.id : null,
+    created_at: comment?.created_at ?? null,
+    updated_at: comment?.updated_at ?? null,
+    body: typeof comment?.body === 'string' ? comment.body : '',
+  }))
+
+  return { ok: true, commentSet: { repo_id: repoId, target_node_id: targetNodeId, comments } }
 }
 
 function parseBooleanFlag(value) {
@@ -1086,10 +1127,29 @@ async function runCli() {
   // Issue #1415 AC8-9 (additive, optional gate).
   let resolvedCommentSetDigestCheck = { ok: true, errors: [] }
   if (parseBooleanFlag(options.recomputeDigests)) {
-    if (!options.commentSetJson) {
-      throw usageError('retro_live_verification_check.comment_set_json_required', '--comment-set-json is required when --recompute-digests is true')
+    if (options.commentSetJson && parseBooleanFlag(options.liveCommentSet)) {
+      throw usageError('retro_live_verification_check.comment_set_source_conflict', '--comment-set-json and --live-comment-set are mutually exclusive')
     }
-    const commentSet = await loadJsonFile(options.commentSetJson, 'retro_live_verification_check.comment_set_json_invalid')
+    let commentSet
+    if (parseBooleanFlag(options.liveCommentSet)) {
+      // Issue #1415 P1-2 fix_delta: bind the recomputed digest to a fresh
+      // live GitHub fetch rather than an unverifiable caller-supplied file.
+      const targetNumber = options.liveCommentSetTargetNumber ?? manifest.canonical_comment?.issue_number
+      if (targetNumber === undefined || targetNumber === null) {
+        throw usageError('retro_live_verification_check.live_comment_set_target_required', '--live-comment-set-target-number is required when the manifest has no canonical_comment.issue_number to fall back on')
+      }
+      const client = new GhCliIssueCommentsClient()
+      const fetched = await fetchLiveCommentSet(client, { repo: manifest.canonical_comment.repo, targetNumber })
+      if (!fetched.ok) {
+        throw usageError(fetched.errorCode, 'live comment-set fetch failed (pagination exhausted before a terminal page)')
+      }
+      commentSet = fetched.commentSet
+    } else {
+      if (!options.commentSetJson) {
+        throw usageError('retro_live_verification_check.comment_set_json_required', '--comment-set-json is required when --recompute-digests is true and --live-comment-set is not set')
+      }
+      commentSet = await loadJsonFile(options.commentSetJson, 'retro_live_verification_check.comment_set_json_invalid')
+    }
     resolvedCommentSetDigestCheck = evaluateResolvedCommentSetDigest({ manifest, commentSet })
     errors.push(...resolvedCommentSetDigestCheck.errors)
   }
