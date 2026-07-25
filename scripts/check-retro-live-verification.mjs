@@ -70,6 +70,7 @@ import { fileURLToPath } from 'node:url'
 
 import { CliError, parseArgs, usageError } from './agent-logs/lib/args.mjs'
 import {
+  fetchPullRequestReviewSurfaceLive,
   GhCliIssueCommentsClient,
   listAllIssueCommentsStructured,
 } from './agent-logs/lib/github-comments.mjs'
@@ -105,6 +106,9 @@ const CLI_OPTION_SPEC = {
   '--fixture-comments-json': { key: 'fixtureCommentsJson' },
   '--fixture-resolve-result-json': { key: 'fixtureResolveResultJson' },
   '--fixture-pr-review-json': { key: 'fixturePrReviewJson' },
+  // Issue #1415 AC5-7 (additive, optional gate).
+  '--refetch-pr-review-surface': { key: 'refetchPrReviewSurface', defaultValue: 'false' },
+  '--fixture-pr-review-surface-json': { key: 'fixturePrReviewSurfaceJson' },
   // Issue #1415 AC13 (additive, optional gate): when passed, require
   // runtime_provenance's locally-derivable fields to be non-null.
   '--require-runtime-provenance': { key: 'requireRuntimeProvenance', defaultValue: 'false' },
@@ -449,6 +453,90 @@ export function verifyPrReviewBindingLive({ prReviewBinding, review }) {
   return { ok: errors.length === 0, errors }
 }
 
+/**
+ * Issue #1415 AC5-7: pure cross-validation over an already-fetched (or
+ * fixture-loaded) PR review surface (`{ headRefOid, reviews, reviewThreads }`
+ * from `fetchPullRequestReviewSurfaceLive`). Never defaults an absent/null
+ * surface field to "no binding to check" when the manifest's
+ * `pr_review_binding` declares a non-null selector for it.
+ *
+ * Requires (when `selected_review_id` is non-null):
+ *   - review_count >= 1, review_comment_count >= 1 (across all threads),
+ *     resolved_thread_count >= 1
+ *   - a review with databaseId === selected_review_id exists, and its
+ *     commit.oid equals both manifest.reviewed_head_sha AND the live
+ *     surface's headRefOid (stale-PR-head detection)
+ *   - when selected_review_comment_id is non-null: a review comment with
+ *     that databaseId exists, and its pullRequestReview.databaseId equals
+ *     selected_review_id
+ *   - when selected_review_thread_node_id is non-null: a thread with that
+ *     node id exists, is isResolved === true, and its comments include the
+ *     selected review comment
+ */
+export function evaluatePrReviewSurfaceBinding({ surface, prReviewBinding }) {
+  const errors = []
+  const reviews = Array.isArray(surface?.reviews) ? surface.reviews : []
+  const reviewThreads = Array.isArray(surface?.reviewThreads) ? surface.reviewThreads : []
+  const allComments = reviewThreads.flatMap((thread) => (Array.isArray(thread?.comments?.nodes) ? thread.comments.nodes : []))
+  const resolvedThreads = reviewThreads.filter((thread) => thread?.isResolved === true)
+
+  if (reviews.length < 1) {
+    errors.push({ code: 'retro_live_verification_check.pr_review_surface_zero_reviews', message: 'expected at least 1 review, found 0' })
+  }
+  if (allComments.length < 1) {
+    errors.push({ code: 'retro_live_verification_check.pr_review_surface_zero_review_comments', message: 'expected at least 1 review comment, found 0' })
+  }
+  if (resolvedThreads.length < 1) {
+    errors.push({ code: 'retro_live_verification_check.pr_review_surface_zero_resolved_threads', message: 'expected at least 1 resolved review thread, found 0' })
+  }
+
+  if (prReviewBinding.selected_review_id === null || prReviewBinding.selected_review_id === undefined) {
+    return { ok: errors.length === 0, errors }
+  }
+
+  const selectedReview = reviews.find((review) => review?.databaseId === prReviewBinding.selected_review_id)
+  if (!selectedReview) {
+    errors.push({ code: 'retro_live_verification_check.pr_review_surface_selected_review_missing', message: `no live review with databaseId ${prReviewBinding.selected_review_id} was found` })
+  } else {
+    const reviewCommitOid = selectedReview.commit?.oid ?? null
+    if (reviewCommitOid !== prReviewBinding.reviewed_head_sha) {
+      errors.push({ code: 'retro_live_verification_check.pr_review_surface_reviewed_head_sha_mismatch', message: `selected review commit.oid ${JSON.stringify(reviewCommitOid)} does not match manifest reviewed_head_sha ${prReviewBinding.reviewed_head_sha}` })
+    }
+    if (surface.headRefOid !== null && surface.headRefOid !== undefined && surface.headRefOid !== prReviewBinding.reviewed_head_sha) {
+      errors.push({ code: 'retro_live_verification_check.pr_review_surface_stale_pr_head', message: `live PR headRefOid ${JSON.stringify(surface.headRefOid)} no longer matches manifest reviewed_head_sha ${prReviewBinding.reviewed_head_sha}` })
+    }
+  }
+
+  let selectedComment = null
+  if (prReviewBinding.selected_review_comment_id !== null && prReviewBinding.selected_review_comment_id !== undefined) {
+    selectedComment = allComments.find((comment) => comment?.databaseId === prReviewBinding.selected_review_comment_id) ?? null
+    if (!selectedComment) {
+      errors.push({ code: 'retro_live_verification_check.pr_review_surface_selected_comment_missing', message: `no live review comment with databaseId ${prReviewBinding.selected_review_comment_id} was found` })
+    } else if (selectedComment.pullRequestReview?.databaseId !== prReviewBinding.selected_review_id) {
+      errors.push({ code: 'retro_live_verification_check.pr_review_surface_comment_review_mismatch', message: `selected review comment's pullRequestReview.databaseId ${JSON.stringify(selectedComment.pullRequestReview?.databaseId)} does not match selected_review_id ${prReviewBinding.selected_review_id}` })
+    }
+  }
+
+  if (prReviewBinding.selected_review_thread_node_id !== null && prReviewBinding.selected_review_thread_node_id !== undefined) {
+    const selectedThread = reviewThreads.find((thread) => thread?.id === prReviewBinding.selected_review_thread_node_id)
+    if (!selectedThread) {
+      errors.push({ code: 'retro_live_verification_check.pr_review_surface_selected_thread_missing', message: `no live review thread with id ${prReviewBinding.selected_review_thread_node_id} was found` })
+    } else {
+      if (selectedThread.isResolved !== true) {
+        errors.push({ code: 'retro_live_verification_check.pr_review_surface_thread_unresolved', message: `selected review thread ${prReviewBinding.selected_review_thread_node_id} is not resolved` })
+      }
+      if (selectedComment) {
+        const threadCommentIds = new Set((selectedThread.comments?.nodes ?? []).map((comment) => comment?.databaseId))
+        if (!threadCommentIds.has(selectedComment.databaseId)) {
+          errors.push({ code: 'retro_live_verification_check.pr_review_surface_comment_not_in_thread', message: `selected review comment ${selectedComment.databaseId} is not a member of selected review thread ${prReviewBinding.selected_review_thread_node_id}` })
+        }
+      }
+    }
+  }
+
+  return { ok: errors.length === 0, errors }
+}
+
 function fetchPullRequestReviewLive({ repo, pullNumber, reviewId }) {
   const result = spawnSync('gh', [
     'api',
@@ -552,6 +640,43 @@ async function runCli() {
     errors.push(...prReviewBindingCheck.errors)
   }
 
+  // Issue #1415 AC5-7 (additive, optional gate).
+  let prReviewSurfaceCheck = { ok: true, errors: [] }
+  if (parseBooleanFlag(options.refetchPrReviewSurface)) {
+    if (manifest.context_assertions.target_type !== 'pull_request') {
+      throw usageError('retro_live_verification_check.refetch_pr_review_surface_requires_pull_request', '--refetch-pr-review-surface requires context_assertions.target_type to be pull_request')
+    }
+    let surface
+    if (executionProfile === 'fixture') {
+      if (!options.fixturePrReviewSurfaceJson) {
+        throw usageError('retro_live_verification_check.fixture_pr_review_surface_json_required', '--fixture-pr-review-surface-json is required when --execution-profile is fixture and --refetch-pr-review-surface is true')
+      }
+      surface = await loadJsonFile(options.fixturePrReviewSurfaceJson, 'retro_live_verification_check.fixture_pr_review_surface_json_invalid')
+      if (surface?.ok !== true) {
+        prReviewSurfaceCheck = { ok: false, errors: [{ code: surface?.errorCode ?? 'retro_live_verification_check.pr_review_surface_fetch_failed', message: `pr review surface fetch reported failure: ${JSON.stringify(surface?.errors ?? [])}` }] }
+        errors.push(...prReviewSurfaceCheck.errors)
+        surface = null
+      }
+    } else {
+      const client = new GhCliIssueCommentsClient()
+      const fetched = await fetchPullRequestReviewSurfaceLive(client, {
+        repo: manifest.canonical_comment.repo,
+        pullNumber: manifest.context_assertions.target_number,
+      })
+      if (!fetched.ok) {
+        prReviewSurfaceCheck = { ok: false, errors: [{ code: fetched.errorCode, message: `pr review surface fetch reported failure: ${JSON.stringify(fetched.errors)}` }] }
+        errors.push(...prReviewSurfaceCheck.errors)
+        surface = null
+      } else {
+        surface = fetched
+      }
+    }
+    if (surface) {
+      prReviewSurfaceCheck = evaluatePrReviewSurfaceBinding({ surface, prReviewBinding: manifest.pr_review_binding })
+      errors.push(...prReviewSurfaceCheck.errors)
+    }
+  }
+
   // Issue #1415 AC13 (additive, optional gate).
   let runtimeProvenanceCheck = { ok: true, errors: [] }
   if (parseBooleanFlag(options.requireRuntimeProvenance)) {
@@ -571,7 +696,7 @@ async function runCli() {
     errors.push(...captureToPostLagCheck.errors)
   }
 
-  const ok = commentCheck.ok && contextAssertionsCheck.ok && prReviewBindingCheck.ok && runtimeProvenanceCheck.ok && captureToPostLagCheck.ok
+  const ok = commentCheck.ok && contextAssertionsCheck.ok && prReviewBindingCheck.ok && prReviewSurfaceCheck.ok && runtimeProvenanceCheck.ok && captureToPostLagCheck.ok
   process.stdout.write(`${JSON.stringify({
     schema: SCHEMA,
     verification_status: ok ? 'pass' : 'fail',

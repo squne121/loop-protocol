@@ -23,7 +23,10 @@ import {
 } from '../scripts/post-retro-live-verification.mjs'
 import {
   checkCanonicalComment,
+  checkCaptureToPostLag,
+  checkRuntimeProvenanceComplete,
   evaluateContextAssertionsBinding,
+  evaluatePrReviewSurfaceBinding,
   isPaginationRejected,
   verifyPrReviewBindingLive,
 } from '../scripts/check-retro-live-verification.mjs'
@@ -637,5 +640,223 @@ describe('argument-free CLI wrapper fallback (Issue #1709 PR review P0-5, AC5/AC
     const payload = JSON.parse(result.stdout.trim())
     expect(payload.verification_status).toBe('fail')
     expect(payload.errors.some((error: { code: string }) => error.code === 'retro_live_verification_check.matched_comment_count_mismatch')).toBe(true)
+  })
+})
+
+describe('Issue #1415 AC13: checkRuntimeProvenanceComplete', () => {
+  const COMPLETE_PROVENANCE = {
+    generated_at: '2026-07-25T06:00:00Z',
+    generator_commit: '1bb6aa2f'.padEnd(40, '0'),
+    generator_version: '1.0.0',
+    node_version: 'v24.15.0',
+    pnpm_version: '11.7.0',
+    pnpm_lockfile_digest: 'sha256:' + 'a'.repeat(64),
+    gh_cli_version: '2.63.0',
+    github_api_version: null,
+    workflow_run_identity: null,
+  }
+
+  it('passes when all required-non-null fields are present and non-null, and optional-null keys are present', () => {
+    const result = checkRuntimeProvenanceComplete(COMPLETE_PROVENANCE)
+    expect(result.ok).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+
+  it('fails closed when a required-non-null field is missing entirely', () => {
+    const rest: Record<string, unknown> = { ...COMPLETE_PROVENANCE }
+    delete rest.node_version
+    const result = checkRuntimeProvenanceComplete(rest)
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.runtime_provenance_missing_field' && error.message.includes('node_version'))).toBe(true)
+  })
+
+  it('fails closed when a required-non-null field is explicitly null', () => {
+    const result = checkRuntimeProvenanceComplete({ ...COMPLETE_PROVENANCE, pnpm_version: null })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.message.includes('pnpm_version'))).toBe(true)
+  })
+
+  it('fails closed when an optional-null key (github_api_version) is absent rather than explicitly null', () => {
+    const rest: Record<string, unknown> = { ...COMPLETE_PROVENANCE }
+    delete rest.github_api_version
+    const result = checkRuntimeProvenanceComplete(rest)
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.message.includes('github_api_version'))).toBe(true)
+  })
+
+  it('fails closed for an empty/undefined runtime_provenance object', () => {
+    const result = checkRuntimeProvenanceComplete(undefined)
+    expect(result.ok).toBe(false)
+    expect(result.errors.length).toBeGreaterThanOrEqual(6)
+  })
+})
+
+describe('Issue #1415 AC15: checkCaptureToPostLag', () => {
+  it('passes when posted-at is within the max lag window', () => {
+    const result = checkCaptureToPostLag({
+      captureIso: '2026-07-25T06:00:00Z',
+      postedIso: '2026-07-25T06:10:00Z',
+      maxLagSeconds: 900,
+    })
+    expect(result.ok).toBe(true)
+    expect(result.lagSeconds).toBe(600)
+  })
+
+  it('fails closed when the lag exceeds max-capture-to-post-lag-seconds', () => {
+    const result = checkCaptureToPostLag({
+      captureIso: '2026-07-25T06:00:00Z',
+      postedIso: '2026-07-25T06:16:00Z',
+      maxLagSeconds: 900,
+    })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.capture_to_post_lag_exceeded')
+  })
+
+  it('fails closed when posted-at is earlier than capture (negative lag), even if within magnitude of max lag', () => {
+    const result = checkCaptureToPostLag({
+      captureIso: '2026-07-25T06:10:00Z',
+      postedIso: '2026-07-25T06:00:00Z',
+      maxLagSeconds: 900,
+    })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.capture_to_post_lag_negative')
+  })
+
+  it('fails closed on an invalid capture timestamp', () => {
+    const result = checkCaptureToPostLag({ captureIso: 'not-a-date', postedIso: '2026-07-25T06:00:00Z', maxLagSeconds: 900 })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.capture_timestamp_invalid')
+  })
+
+  it('fails closed on an invalid posted timestamp', () => {
+    const result = checkCaptureToPostLag({ captureIso: '2026-07-25T06:00:00Z', postedIso: 'not-a-date', maxLagSeconds: 900 })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.posted_timestamp_invalid')
+  })
+})
+
+describe('Issue #1415 AC5-7: evaluatePrReviewSurfaceBinding', () => {
+  const HEAD_SHA = 'b'.repeat(40)
+  const REVIEW_ID = 111
+  const COMMENT_ID = 222
+  const THREAD_NODE_ID = 'PRRT_thread1'
+
+  function makeSurface(overrides = {}) {
+    return {
+      headRefOid: HEAD_SHA,
+      reviews: [{ databaseId: REVIEW_ID, state: 'COMMENTED', commit: { oid: HEAD_SHA } }],
+      reviewThreads: [
+        {
+          id: THREAD_NODE_ID,
+          isResolved: true,
+          comments: { nodes: [{ databaseId: COMMENT_ID, pullRequestReview: { databaseId: REVIEW_ID } }] },
+        },
+      ],
+      ...overrides,
+    }
+  }
+
+  function makeBinding(overrides = {}) {
+    return {
+      reviewed_head_sha: HEAD_SHA,
+      selected_review_id: REVIEW_ID,
+      selected_review_comment_id: COMMENT_ID,
+      selected_review_thread_node_id: THREAD_NODE_ID,
+      ...overrides,
+    }
+  }
+
+  it('passes when review/comment/thread are mutually bound, resolved, and the head sha matches', () => {
+    const result = evaluatePrReviewSurfaceBinding({ surface: makeSurface(), prReviewBinding: makeBinding() })
+    expect(result.ok).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+
+  it('fails closed when there are zero reviews', () => {
+    const result = evaluatePrReviewSurfaceBinding({ surface: makeSurface({ reviews: [] }), prReviewBinding: makeBinding({ selected_review_id: null, selected_review_comment_id: null, selected_review_thread_node_id: null }) })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_zero_reviews')).toBe(true)
+  })
+
+  it('fails closed when there are zero review comments', () => {
+    const surface = makeSurface({ reviewThreads: [{ id: THREAD_NODE_ID, isResolved: true, comments: { nodes: [] } }] })
+    const result = evaluatePrReviewSurfaceBinding({ surface, prReviewBinding: makeBinding({ selected_review_comment_id: null, selected_review_thread_node_id: null }) })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_zero_review_comments')).toBe(true)
+  })
+
+  it('fails closed when there are zero resolved threads', () => {
+    const surface = makeSurface({ reviewThreads: [{ id: THREAD_NODE_ID, isResolved: false, comments: { nodes: [{ databaseId: COMMENT_ID, pullRequestReview: { databaseId: REVIEW_ID } }] } }] })
+    const result = evaluatePrReviewSurfaceBinding({ surface, prReviewBinding: makeBinding() })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_zero_resolved_threads')).toBe(true)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_thread_unresolved')).toBe(true)
+  })
+
+  it('fails closed when selected_review_id does not exist in the live surface', () => {
+    const result = evaluatePrReviewSurfaceBinding({ surface: makeSurface(), prReviewBinding: makeBinding({ selected_review_id: 999 }) })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_selected_review_missing')).toBe(true)
+  })
+
+  it('fails closed on stale PR head: live headRefOid diverges from manifest reviewed_head_sha', () => {
+    const result = evaluatePrReviewSurfaceBinding({ surface: makeSurface({ headRefOid: 'c'.repeat(40) }), prReviewBinding: makeBinding() })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_stale_pr_head')).toBe(true)
+  })
+
+  it('fails closed when the selected review comment does not belong to the selected review', () => {
+    const surface = makeSurface({
+      reviewThreads: [
+        {
+          id: THREAD_NODE_ID,
+          isResolved: true,
+          comments: { nodes: [{ databaseId: COMMENT_ID, pullRequestReview: { databaseId: 999 } }] },
+        },
+      ],
+    })
+    const result = evaluatePrReviewSurfaceBinding({ surface, prReviewBinding: makeBinding() })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_comment_review_mismatch')).toBe(true)
+  })
+
+  it('fails closed when the selected thread is unresolved', () => {
+    const surface = makeSurface({
+      reviewThreads: [
+        {
+          id: THREAD_NODE_ID,
+          isResolved: false,
+          comments: { nodes: [{ databaseId: COMMENT_ID, pullRequestReview: { databaseId: REVIEW_ID } }] },
+        },
+      ],
+    })
+    const result = evaluatePrReviewSurfaceBinding({ surface, prReviewBinding: makeBinding() })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_thread_unresolved')).toBe(true)
+  })
+
+  it('fails closed when the selected comment is not a member of the selected thread', () => {
+    const surface = makeSurface({
+      reviewThreads: [
+        {
+          id: THREAD_NODE_ID,
+          isResolved: true,
+          comments: { nodes: [{ databaseId: 333, pullRequestReview: { databaseId: REVIEW_ID } }] },
+        },
+        {
+          id: 'PRRT_other_thread',
+          isResolved: true,
+          comments: { nodes: [{ databaseId: COMMENT_ID, pullRequestReview: { databaseId: REVIEW_ID } }] },
+        },
+      ],
+    })
+    const result = evaluatePrReviewSurfaceBinding({ surface, prReviewBinding: makeBinding() })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.pr_review_surface_comment_not_in_thread')).toBe(true)
+  })
+
+  it('skips the selected-id cross-checks (but still enforces the >=1 minimums) when selected_review_id is null', () => {
+    const result = evaluatePrReviewSurfaceBinding({ surface: makeSurface(), prReviewBinding: makeBinding({ selected_review_id: null, selected_review_comment_id: null, selected_review_thread_node_id: null }) })
+    expect(result.ok).toBe(true)
   })
 })

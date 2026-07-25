@@ -352,6 +352,35 @@ function parseLinkHeader(linkHeader) {
   }).filter(Boolean)
 }
 
+/**
+ * Issue #1415 AC5-7: thin `gh api graphql` wrapper that always surfaces a
+ * partial-success `errors` array explicitly, instead of relying on `gh`'s
+ * own exit code. A GraphQL response can return HTTP 200 with *both* `data`
+ * and a non-empty `errors` array (a partial-success response); `gh api
+ * graphql` does not reliably turn that into a non-zero exit code, so a
+ * caller that only checked exit status could silently accept a
+ * partially-failed response as "resolved".
+ */
+export function runGraphqlQuery(query, variables) {
+  const args = ['graphql']
+  for (const [key, value] of Object.entries(variables ?? {})) {
+    args.push('-F', `${key}=${value === null || value === undefined ? '' : value}`)
+  }
+  args.push('-f', `query=${query}`)
+  let response
+  try {
+    response = runGhApi(args)
+  } catch (error) {
+    if (error instanceof GithubApiError) {
+      return { data: null, errors: [{ message: error.message, http_status: error.httpStatus, reason_code: error.reasonCode }] }
+    }
+    throw error
+  }
+  const body = response.body
+  const errors = Array.isArray(body?.errors) ? body.errors : []
+  return { data: body?.data ?? null, errors }
+}
+
 function splitRepo(repo) {
   const [owner, name] = String(repo).split('/')
   if (!owner || !name) {
@@ -491,6 +520,178 @@ export class GhCliIssueCommentsClient {
       endCursor: reviewThreads?.pageInfo?.endCursor ?? null,
     }
   }
+  /**
+   * Issue #1415 AC5-7: reviews connection, GraphQL, with `errors` and
+   * `repository`/`pullRequest` null-safety surfaced explicitly (never
+   * collapsed to an empty array).
+   */
+  async fetchReviewsPage({ repo, pullNumber, first, after }) {
+    const { owner, name } = splitRepo(repo)
+    const query = [
+      'query($owner: String!, $name: String!, $pullNumber: Int!, $first: Int!, $after: String) {',
+      '  repository(owner: $owner, name: $name) {',
+      '    pullRequest(number: $pullNumber) {',
+      '      headRefOid',
+      '      reviews(first: $first, after: $after) {',
+      '        totalCount',
+      '        pageInfo { hasNextPage endCursor }',
+      '        nodes {',
+      '          id',
+      '          databaseId',
+      '          state',
+      '          commit { oid }',
+      '          author { login ... on User { databaseId } }',
+      '          createdAt',
+      '        }',
+      '      }',
+      '    }',
+      '  }',
+      '}',
+    ].join('\n')
+    const { data, errors } = runGraphqlQuery(query, { owner, name, pullNumber, first, after: after ?? '' })
+    if (errors.length > 0) {
+      return { ok: false, errors, repositoryNull: false, pullRequestNull: false }
+    }
+    const repository = data?.repository
+    if (repository === null || repository === undefined) {
+      return { ok: false, errors: [], repositoryNull: true, pullRequestNull: false }
+    }
+    const pullRequest = repository.pullRequest
+    if (pullRequest === null || pullRequest === undefined) {
+      return { ok: false, errors: [], repositoryNull: false, pullRequestNull: true }
+    }
+    const reviews = pullRequest.reviews
+    return {
+      ok: true,
+      errors: [],
+      repositoryNull: false,
+      pullRequestNull: false,
+      headRefOid: pullRequest.headRefOid ?? null,
+      items: Array.isArray(reviews?.nodes) ? reviews.nodes : [],
+      hasNextPage: reviews?.pageInfo?.hasNextPage === true,
+      endCursor: reviews?.pageInfo?.endCursor ?? null,
+    }
+  }
+
+  /**
+   * Issue #1415 AC5-7: reviewThreads connection with per-thread comments
+   * (including the review each comment belongs to, via
+   * `pullRequestReview.databaseId`), GraphQL, with the same explicit
+   * `errors` / null-safety contract as `fetchReviewsPage`. A thread whose
+   * *comments* sub-connection itself has `hasNextPage: true` is reported via
+   * `threadCommentsPaginationIncomplete` rather than silently truncated --
+   * the top-level 100-comments-per-thread page size is expected to cover
+   * ordinary threads, but a caller must fail closed rather than assume
+   * completeness for an unusually large thread.
+   */
+  async fetchReviewThreadsPage({ repo, pullNumber, first, after }) {
+    const { owner, name } = splitRepo(repo)
+    const query = [
+      'query($owner: String!, $name: String!, $pullNumber: Int!, $first: Int!, $after: String) {',
+      '  repository(owner: $owner, name: $name) {',
+      '    pullRequest(number: $pullNumber) {',
+      '      reviewThreads(first: $first, after: $after) {',
+      '        pageInfo { hasNextPage endCursor }',
+      '        nodes {',
+      '          id',
+      '          isResolved',
+      '          isOutdated',
+      '          comments(first: 100) {',
+      '            pageInfo { hasNextPage }',
+      '            nodes {',
+      '              id',
+      '              databaseId',
+      '              pullRequestReview { databaseId }',
+      '              author { login ... on User { databaseId } }',
+      '              createdAt',
+      '              updatedAt',
+      '              body',
+      '              url',
+      '            }',
+      '          }',
+      '        }',
+      '        pageInfo { hasNextPage endCursor }',
+      '      }',
+      '    }',
+      '  }',
+      '}',
+    ].join('\n')
+    const { data, errors } = runGraphqlQuery(query, { owner, name, pullNumber, first, after: after ?? '' })
+    if (errors.length > 0) {
+      return { ok: false, errors, repositoryNull: false, pullRequestNull: false }
+    }
+    const repository = data?.repository
+    if (repository === null || repository === undefined) {
+      return { ok: false, errors: [], repositoryNull: true, pullRequestNull: false }
+    }
+    const pullRequest = repository.pullRequest
+    if (pullRequest === null || pullRequest === undefined) {
+      return { ok: false, errors: [], repositoryNull: false, pullRequestNull: true }
+    }
+    const reviewThreads = pullRequest.reviewThreads
+    const nodes = Array.isArray(reviewThreads?.nodes) ? reviewThreads.nodes : []
+    const threadCommentsPaginationIncomplete = nodes.some((thread) => thread?.comments?.pageInfo?.hasNextPage === true)
+    return {
+      ok: true,
+      errors: [],
+      repositoryNull: false,
+      pullRequestNull: false,
+      items: nodes,
+      hasNextPage: reviewThreads?.pageInfo?.hasNextPage === true,
+      endCursor: reviewThreads?.pageInfo?.endCursor ?? null,
+      threadCommentsPaginationIncomplete,
+    }
+  }
+}
+
+/**
+ * Issue #1415 AC5-7: fetches the full PR review surface (reviews +
+ * reviewThreads with their comments) to page-budget-bounded completeness,
+ * fail-closed on any GraphQL `errors`, null `repository`/`pullRequest`, or
+ * incomplete pagination (top-level connection OR a thread's own comments
+ * sub-connection). Never returns a partial result labelled as complete.
+ */
+export async function fetchPullRequestReviewSurfaceLive(client, { repo, pullNumber, maxPages = 20, perPage = 50 }) {
+  let headRefOid = null
+  const reviews = []
+  let after = null
+  for (let page = 1; page <= maxPages; page += 1) {
+    const result = await client.fetchReviewsPage({ repo, pullNumber, first: perPage, after })
+    if (!result.ok) {
+      return { ok: false, errorCode: result.errors.length > 0 ? 'pr_review_surface.graphql_errors' : (result.repositoryNull ? 'pr_review_surface.repository_null' : 'pr_review_surface.pull_request_null'), errors: result.errors }
+    }
+    headRefOid = result.headRefOid
+    reviews.push(...result.items)
+    if (result.hasNextPage === false) {
+      break
+    }
+    if (page === maxPages) {
+      return { ok: false, errorCode: 'pr_review_surface.reviews_page_budget_exhausted', errors: [] }
+    }
+    after = result.endCursor
+  }
+
+  const reviewThreads = []
+  after = null
+  for (let page = 1; page <= maxPages; page += 1) {
+    const result = await client.fetchReviewThreadsPage({ repo, pullNumber, first: perPage, after })
+    if (!result.ok) {
+      return { ok: false, errorCode: result.errors.length > 0 ? 'pr_review_surface.graphql_errors' : (result.repositoryNull ? 'pr_review_surface.repository_null' : 'pr_review_surface.pull_request_null'), errors: result.errors }
+    }
+    if (result.threadCommentsPaginationIncomplete) {
+      return { ok: false, errorCode: 'pr_review_surface.thread_comments_page_budget_exhausted', errors: [] }
+    }
+    reviewThreads.push(...result.items)
+    if (result.hasNextPage === false) {
+      break
+    }
+    if (page === maxPages) {
+      return { ok: false, errorCode: 'pr_review_surface.review_threads_page_budget_exhausted', errors: [] }
+    }
+    after = result.endCursor
+  }
+
+  return { ok: true, errors: [], headRefOid, reviews, reviewThreads }
 }
 
 export async function listAllIssueComments(client, { repo, issueNumber, perPage = 100 }) {
