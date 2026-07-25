@@ -48,6 +48,7 @@ ALLOWED_PNPM_ACTION_SETUP_CONSUMERS = frozenset(
         ".github/workflows/deploy-pages.yml",
         ".github/workflows/session-manifest.yml",
         ".github/workflows/agent-retro-index.yml",
+        ".github/workflows/retro-live-verification.yml",
         ".github/actions/setup-node-pnpm/action.yml",
     }
 )

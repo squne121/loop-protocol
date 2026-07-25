@@ -1,0 +1,52 @@
+{
+  "schema": "retro_live_verification/v2",
+  "context_assertions": {
+    "repo": "squne121/loop-protocol",
+    "target_type": "issue",
+    "target_number": 1,
+    "parent_issue": 1,
+    "marker_comment_url": "https://github.com/squne121/loop-protocol/issues/1#issuecomment-1",
+    "expected_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "expected_payload_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "expected_matched_comment_count": 1
+  },
+  "pr_review_binding": {
+    "review_artifact_ref": "https://github.com/squne121/loop-protocol/pull/1#pullrequestreview-1",
+    "reviewed_head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "selected_review_id": null
+  },
+  "execution_boundary": {
+    "mode": "generate",
+    "allowed_paths": [
+      "package.json",
+      "docs/schemas/retro-live-verification.schema.json",
+      "scripts/generate-retro-live-verification.mjs",
+      "scripts/check-retro-live-verification.mjs",
+      "scripts/post-retro-live-verification.mjs",
+      "tests/retro-live-verification.test.ts",
+      "tests/fixtures/retro-live-verification/",
+      ".github/workflows/retro-live-verification.yml",
+      ".claude/skills/issue-contract-review/scripts/pnpm_gate_registry.py",
+      ".claude/skills/issue-contract-review/tests/test_pnpm_gate_security_boundary.py"
+    ],
+    "trusted_actor_allowlist": [
+      "squne121"
+    ]
+  },
+  "canonical_comment": {
+    "repo": "squne121/loop-protocol",
+    "issue_number": 1,
+    "ownership_marker": "<!-- retro_live_verification:v1 repo=squne121/loop-protocol issue=1 -->",
+    "body_digest": "438d122b1076711e2671b96b93e1b3c3645f44f418d788a6fc6f664f722176d5",
+    "expected_previous_digest": null
+  },
+  "runtime_provenance": {
+    "generated_at": "2026-07-25T03:18:05.310Z",
+    "generator_commit": "d4de064db260ec53e41aa71481ea2a24cb9ecc1d",
+    "generator_version": "retro-live-verification-generator/1"
+  },
+  "canonicalization_profile": {
+    "algorithm": "canonical-json-v1",
+    "digest_encoding": "sha256-hex"
+  }
+}

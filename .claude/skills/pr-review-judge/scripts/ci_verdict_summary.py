@@ -66,6 +66,7 @@ HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES: frozenset[tuple[str, str]] = frozenset({
     ("Check Japanese Content", "Issue Body Japanese Check (retrospective)"),
     ("Check Japanese Content", "Issue Comment Japanese Check (retrospective)"),
     ("Check Japanese Content", "PR Review Japanese Check (retrospective)"),
+    ("retro-live-verification", "post-canonical-comment"),
 })
 
 # Artifact truncation limit (bytes)
