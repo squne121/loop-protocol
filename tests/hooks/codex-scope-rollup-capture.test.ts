@@ -40,6 +40,22 @@ function payloadText(payload: Record<string, unknown>) {
   return String(payload.last_assistant_message ?? '')
 }
 
+// Extract several high-distinctiveness fragments from the payload body so a
+// partial leak (a single line, a truncated tail, a dropped trailing newline)
+// is caught even though it would not match a full-text `toContain` check
+// against the entire `payloadText(payload)` string (PR #1741 review P1-2).
+function payloadCanaryFragments(payload: Record<string, unknown>): string[] {
+  const text = payloadText(payload)
+  const fragments: string[] = []
+  const schemaMatch = text.match(/ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:/)
+  if (schemaMatch) fragments.push(schemaMatch[0])
+  const invocationMatch = text.match(/invocation_id:\s*\S+/)
+  if (invocationMatch) fragments.push(invocationMatch[0])
+  const generatedAtMatch = text.match(/generated_at:\s*\S+/)
+  if (generatedAtMatch) fragments.push(generatedAtMatch[0])
+  return fragments
+}
+
 // Resolve a real python3 interpreter once — the adapter's Node-only gate
 // requires readiness.interpreter_realpath to be an existing regular file
 // (Issue #1527 Scope Delta (2) AC1/AC17).
@@ -332,9 +348,21 @@ describe('Codex SubagentStop scope-rollup capture adapter', () => {
   // a failure in one fixture no longer masks or aggregates with the other,
   // and each case can assert its own fixed reason code. The elapsedMs upper
   // bound assertion is intentionally removed (performance_claim: no_claim);
-  // each case's own Vitest timeout (8000ms) is kept comfortably above the
-  // adapter's outer spawnSync watchdog (7000ms) so a timeout failure surfaces
-  // as a clear assertion failure rather than a Vitest-level test timeout.
+  // each case's own Vitest timeout (10000ms) leaves headroom past the
+  // adapter's outer spawnSync watchdog (7000ms) for the child process's own
+  // termination/grace handling and Vitest/runner scheduling overhead — the
+  // watchdog fires the diagnostic well before this per-case timeout would
+  // ever be reached under normal conditions, but spawnSync does not
+  // guarantee the child is reaped and control returned at exactly 7000ms,
+  // so a hard "comfortably above" upper bound is not asserted here.
+  //
+  // Fixture canary note (PR #1741 review P1-2): `nonzero.py` writes a
+  // literal 'scope-rollup-fixture' canary to stdout/stderr before exiting
+  // non-zero, so the canary non-leak assertion below is meaningful for that
+  // case. `timeout.py` only sleeps and is killed by the watchdog before it
+  // ever produces output, so the same canary assertion is vacuously true for
+  // that case (it never had a canary to leak) — the payload-fragment
+  // non-leak assertions are what actually exercise redaction for both cases.
   const transportFixtureFailureCases: Array<{ name: string; fixture: string; expectedReasonCode: string }> = [
     { name: 'nonzero.py', fixture: 'nonzero.py', expectedReasonCode: 'capture_nonzero' },
     { name: 'timeout.py', fixture: 'timeout.py', expectedReasonCode: 'capture_timeout' },
@@ -358,12 +386,27 @@ describe('Codex SubagentStop scope-rollup capture adapter', () => {
       expect(result.signal).toBeNull()
       expect(result.status).toBe(0)
       expect(result.stdout.trim()).toBe('{"continue":true}')
-      expect(readdirSync(captureDirectory).filter((name) => name.endsWith('.txt'))).toHaveLength(0)
+      // P2-2: the capture directory must be entirely empty, not merely free
+      // of `.txt` canonical captures — a transport failure must not leave
+      // behind any unexpected artifact (sidecar, partial write, etc.).
+      expect(readdirSync(captureDirectory)).toEqual([])
       expect(result.stderr).not.toContain('scope-rollup-fixture')
-      expect(result.stderr).not.toContain(payloadText(payload))
-      expect(result.stderr).toContain(expectedReasonCode)
+      const canaryFragments = payloadCanaryFragments(payload)
+      expect(canaryFragments.length).toBeGreaterThan(0)
+      for (const fragment of canaryFragments) {
+        expect(result.stderr).not.toContain(fragment)
+        expect(result.stdout).not.toContain(fragment)
+      }
+      // P1-1: assert the exact fixed diagnostic line rather than a
+      // substring match, so a diagnostic that mixes in an unexpected
+      // reason code (or omits the expected one entirely) cannot pass.
+      const expectedDiagnostic = `[codex-hook-adapter] warn: scope-rollup capture skipped (${expectedReasonCode})`
+      const transportDiagnostics = result.stderr
+        .split(/\r?\n/)
+        .filter((line) => line.includes('scope-rollup capture skipped ('))
+      expect(transportDiagnostics).toEqual([expectedDiagnostic])
     },
-    8000,
+    10000,
   )
 
   it('timeout terminates process tree without late write', () => {
