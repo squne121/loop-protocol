@@ -262,7 +262,7 @@ Issue #1758 の live 検証により、Finding 1（`toolPermission` isolated wor
    が先に必要になる可能性が高い（tool 呼び出し自体は成功しうるが、evidence gate が
    それを正しく検出できない限り validator が pass しないため）。
 
-## Finding 2 Live Verification (#1768)
+## Finding 2 Live Verification (#1768)（Issue #1768、live `agy -p` 実行による hook 探索パス修正後の再検証）
 
 Issue #1768 が扱った「実際に `search_web` が成功したケースでも `agy_provenance_hook_events`
 が常に空になる」問題を、live `agy -p` 実行（インストール済み Antigravity CLI 1.1.7、
@@ -369,7 +369,7 @@ result.ok: True
 引き続き `attempted_no_web_tool_call` で fail-closed 判定されることを hermetic テスト
 （`tests/test_agy_provenance_grounding_wiring.py`）で確認済み。
 
-## Next Action Update (#1768)
+## Next Action Update (#1768)（次のアクション更新）
 
 Finding 2（hooks.json discover パス不一致）は本 Issue で確認され、対処が完了した。
 `#1494` 側で live E2E fan-out を再試行する場合、grounded_research の tool 呼び出し
