@@ -1005,11 +1005,11 @@ entries:
     producer:
       owner: "ci-test-performance"
       paths:
-        - ".claude/skills/ci-test-performance/scripts/validate_ci_performance_assessment_v2.py"
+        - ".claude/skills/ci-test-performance/SKILL.md"
     consumers:
       - id: "ci-test-performance"
         paths:
-          - ".claude/skills/ci-test-performance/SKILL.md"
+          - ".claude/skills/ci-test-performance/scripts/validate_ci_performance_assessment_v2.py"
       - id: "pr-review-judge"
         paths:
           - ".claude/skills/pr-review-judge/SKILL.md"
@@ -1059,11 +1059,11 @@ entries:
     producer:
       owner: "ci-test-performance"
       paths:
-        - ".claude/skills/ci-test-performance/scripts/validate_ci_performance_assessment_v2.py"
+        - ".claude/skills/ci-test-performance/SKILL.md"
     consumers:
       - id: "ci-test-performance"
         paths:
-          - ".claude/skills/ci-test-performance/SKILL.md"
+          - ".claude/skills/ci-test-performance/scripts/validate_ci_performance_assessment_v2.py"
       - id: "pr-review-judge"
         paths:
           - ".claude/skills/pr-review-judge/SKILL.md"
@@ -1100,4 +1100,54 @@ entries:
       followup_issue_required: true
     last_verified:
       commit: "1df57fcbf9eeeeaa7f58ce7138b008fdb07365ee"
+      command_id: "lint_catalog_yaml"
+
+  - schema_id: "CI_TEST_PERFORMANCE_ASSESSMENT_V2_VALIDATION_RESULT_V1"
+    format: json_schema
+    source_kind: repo_path
+    definition_paths:
+      - "schemas/ci_test_performance_assessment_v2_validation_result_v1.schema.json"
+      - ".claude/skills/ci-test-performance/scripts/validate_ci_performance_assessment_v2.py"
+    producer:
+      owner: "ci-test-performance"
+      paths:
+        - ".claude/skills/ci-test-performance/scripts/validate_ci_performance_assessment_v2.py"
+    consumers:
+      - id: "ci-test-performance"
+        paths:
+          - ".claude/skills/ci-test-performance/SKILL.md"
+      - id: "pr-review-judge"
+        paths:
+          - ".claude/skills/pr-review-judge/SKILL.md"
+    detection_patterns:
+      - id: "ci-test-performance-assessment-v2-validation-result-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "CI_TEST_PERFORMANCE_ASSESSMENT_V2_VALIDATION_RESULT"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "validate_ci_performance_assessment_v2"
+        runner: pytest
+        target: ".claude/skills/ci-test-performance/scripts/tests/test_validate_ci_performance_assessment_v2.py"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: []
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1ffd543dbb5ccfaa9d1fb9d1788e8be830c296c7"
       command_id: "lint_catalog_yaml"
