@@ -266,16 +266,19 @@ class IsolatedAgyWorkspace:
     # outside the isolated workspace tree even though its *target* (via
     # symlink) is the real `$HOME/.config/gcloud` directory.
     gcloud_adc_path: "Path | None" = None
-    # Issue #1740: path to the read-only-exposed agy OAuth token file under
-    # this workspace's isolated XDG_CONFIG_HOME
-    # (`<workspace>/xdg-config/antigravity-cli/antigravity-oauth-token`), or
+    # Issue #1740/#1743: path to the read-only-exposed agy OAuth token file
+    # under this workspace's isolated HOME
+    # (`<workspace>/.gemini/antigravity-cli/antigravity-oauth-token`), or
     # None when the real
     # `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` did not exist.
     # Never points outside the isolated workspace tree even though its
     # *target* (via symlink) is the real token file. This is the actual auth
     # channel `agy` uses -- neither dbus secret-service (#1726) nor gcloud
     # ADC (#1730) resolved `agy_auth_required`; see Issue #1740 Source
-    # section for the confirmed diagnosis.
+    # section for the confirmed diagnosis. Issue #1743: the symlink was
+    # originally (incorrectly) placed under `XDG_CONFIG_HOME` -- `agy` reads
+    # this file from `$HOME/.gemini/antigravity-cli/`, not from
+    # `$XDG_CONFIG_HOME`, so the isolated HOME is the required placement.
     agy_oauth_token_path: "Path | None" = None
 
 
@@ -382,9 +385,9 @@ def _real_home_agy_oauth_token_file() -> "Path | None":
     return None
 
 
-def _expose_agy_oauth_token_read_only(xdg_config_home: Path) -> "Path | None":
+def _expose_agy_oauth_token_read_only(isolated_home: Path) -> "Path | None":
     """Expose the real agy OAuth token file under
-    *xdg_config_home*/antigravity-cli/antigravity-oauth-token.
+    *isolated_home*/.gemini/antigravity-cli/antigravity-oauth-token.
 
     Issue #1740: because `materialize_isolated_agy_workspace()` fully
     redirects `HOME`/`XDG_*` into a brand-new isolated tmp workspace, the
@@ -394,8 +397,22 @@ def _expose_agy_oauth_token_read_only(xdg_config_home: Path) -> "Path | None":
     same failure class #1726's dbus reachability and #1730's gcloud ADC
     reachability additions did not resolve).
 
+    Issue #1743: `agy` reads this token file from
+    `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` -- the same
+    state-directory layout its own auth flow writes to on a non-isolated
+    host -- not from `$XDG_CONFIG_HOME`. #1740's original implementation
+    placed the symlink under `xdg_config_home` (`<isolated>/xdg-config/...`),
+    which `agy` never looks at, so `agy -p` inside the isolated workspace
+    still failed with `agy_auth_required` even though the symlink itself was
+    created successfully. Live diagnosis during #1494's fourth fan-out
+    attempt confirmed that placing the symlink under the isolated `HOME`
+    (this function's *isolated_home* argument, i.e. `workspace.env["HOME"]`
+    / `workspace_dir`) instead of `XDG_CONFIG_HOME` allows `agy -p` to
+    succeed -- see the parent Issue #1743 Source section for the confirmed
+    diagnosis.
+
     This creates a *symlink* (never a copy) from
-    `<isolated>/xdg-config/antigravity-cli/antigravity-oauth-token` to the
+    `<isolated home>/.gemini/antigravity-cli/antigravity-oauth-token` to the
     real `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` file.
     `Path.symlink_to()` only writes a path string into a new filesystem
     entry; it never opens or reads a single byte of the target's file
@@ -413,7 +430,7 @@ def _expose_agy_oauth_token_read_only(xdg_config_home: Path) -> "Path | None":
     token_file = _real_home_agy_oauth_token_file()
     if token_file is None:
         return None
-    link_dir = xdg_config_home / ANTIGRAVITY_CLI_DIRNAME
+    link_dir = isolated_home / ".gemini" / ANTIGRAVITY_CLI_DIRNAME
     try:
         link_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -523,10 +540,10 @@ def materialize_isolated_agy_workspace(
     # path back to any real $HOME content this function ever creates.
     gcloud_adc_path = _expose_gcloud_adc_read_only(xdg_config)
 
-    # Issue #1740 AC1/AC2: expose the real agy OAuth token file (if any) read
-    # only under this workspace's isolated XDG_CONFIG_HOME -- the actual auth
+    # Issue #1740 AC1/AC2, #1743: expose the real agy OAuth token file (if
+    # any) read only under this workspace's isolated HOME -- the actual auth
     # channel `agy` uses; see `_expose_agy_oauth_token_read_only()` docstring.
-    agy_oauth_token_path = _expose_agy_oauth_token_read_only(xdg_config)
+    agy_oauth_token_path = _expose_agy_oauth_token_read_only(workspace_dir)
 
     return IsolatedAgyWorkspace(
         profile=profile,
