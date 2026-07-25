@@ -390,6 +390,20 @@ LOCAL_ASSET_RESEARCH_PROFILE = "local_asset_research"
 GROUNDED_RESEARCH_PROFILE = "grounded_research"
 PROPOSAL_ONLY_PROFILE = "proposal_only"
 GITHUB_RESEARCH_PROFILE = "github_research"
+
+# Issue #1749: `agy -p` headless print mode's default model (Gemini 3.x) does
+# not reliably invoke the declared `search_web` / `read_url_content` tools --
+# it narrates a plausible-looking "I searched..." answer instead of emitting a
+# real tool call (hallucination), even with `--dangerously-skip-permissions`.
+# Live investigation (see
+# `.claude/skills/gemini-cli-headless-delegation/references/agy-headless-tool-use-investigation.md`)
+# found that passing `--model claude-sonnet-4-6` makes `agy -p` reliably call
+# the declared tools in headless print mode, producing verifiable
+# (non-hallucinated) grounded output with real
+# `vertexaisearch.cloud.google.com/grounding-api-redirect/...` citation URLs.
+# This constant is only applied to the `grounded_research` tool_profile's
+# `agy -p` invocation; it does not change any other profile's model routing.
+AGY_GROUNDED_RESEARCH_MODEL = "claude-sonnet-4-6"
 SERENA_TOOL_CONTRACT_UNKNOWN_POLICY = "exact_match"
 LOCAL_ASSET_MAX_CONTEXT_FILES = 32
 LOCAL_ASSET_MAX_CONTEXT_BYTES = 200_000
@@ -2482,6 +2496,12 @@ def _run_agy(
     agy_bin = str(os.environ.get("AGY_BIN") or "agy")
     command = [agy_bin, "-p", prompt]
     tool_profile = _AGY_TOOL_PROFILE_CTX.get()
+    if tool_profile == GROUNDED_RESEARCH_PROFILE:
+        # Issue #1749: force a model that actually calls the declared
+        # search_web/read_url_content tools in headless print mode instead
+        # of hallucinating a "searched" answer. See AGY_GROUNDED_RESEARCH_MODEL
+        # docstring above for the live-investigation evidence.
+        command = [agy_bin, "-p", prompt, "--model", AGY_GROUNDED_RESEARCH_MODEL]
     if tool_profile in _agy_permission_policy.ALLOWED_PROFILES:
         workspace = _agy_permission_policy.materialize_isolated_agy_workspace(tool_profile)
         env = dict(workspace.env)
