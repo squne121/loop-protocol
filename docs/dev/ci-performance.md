@@ -165,6 +165,16 @@ Node-backed hook test 専用 job では、Node.js / pnpm 依存の hook wrapper 
 | pnpm_install    | 45000           | 52000           | 12000          | 15000          | -73%      |
 ```
 
+## CI_TEST_PERFORMANCE_ASSESSMENT_V2: claim/evidence の意味検証（#1724）
+
+`.claude/skills/ci-test-performance/` Skill が定義する `CI_TEST_PERFORMANCE_DECISION_V1`（レーン判定契約）とは別に、`CI_TEST_PERFORMANCE_ASSESSMENT_V2` を versioned addition として追加する。`CI_TEST_PERFORMANCE_DECISION_V1` / `ci_runtime_delta_v1` は in-place 変更しない。
+
+`CI_TEST_PERFORMANCE_ASSESSMENT_V2` は「性能主張の有無・種類」（`claim.kind`: `none | improvement | non_regression | absolute_budget`）と「その主張を裏付ける証拠の充足状態」（`performance_evidence.status`: `not_required | not_instrumented | unavailable | insufficient_samples | incomparable_cohort | complete`）を分離した契約であり、性能主張を伴わない correctness/provisioning 変更が 20-run baseline 不足を理由に誤ブロックされないようにする。`observation.outcome`（実測結果）と `claim_evaluation.outcome`（claim が実測で成立したか）を含む 4 軸で構成され、`declared_impact`（diff から未検証の自己申告値）・`functional_evidence`（`ci_verdict_summary_v2.py` の provenance を再利用し `proof_level: check_run_only` / `coverage_bound: false` で保証範囲を明示）・`risk_acknowledgement`（`reference` + `verification_status: unverified`）を持つ。
+
+意味検証は `.claude/skills/ci-test-performance/scripts/validate_ci_performance_assessment_v2.py`（`pnpm policy:check:ci-performance`）が行い、`structural_valid` / `semantic_valid` / `approval_eligible` を分離して出力する。「assessment としての妥当性」と「reviewer gate 上の承認可否」は別軸であり、意味論的に valid でも functional evidence 不足・sample 不足で `approval_eligible: false` になり得る。詳細スキーマは `schemas/ci_test_performance_assessment_v2.schema.json` / `schemas/ci_runtime_delta_v2.schema.json`、詳細な使い分けは `.claude/skills/ci-test-performance/SKILL.md` を参照する。
+
+`.github/workflows/*.yml` への実配線（reviewer gate を V2 evidence 必須へ切り替える作業）は本ドキュメント更新時点では follow-up。
+
 ## 責務分離: ci_runtime_baseline_v1 vs ci_verdict_summary_v2
 
 | 関心事 | 担当 |
