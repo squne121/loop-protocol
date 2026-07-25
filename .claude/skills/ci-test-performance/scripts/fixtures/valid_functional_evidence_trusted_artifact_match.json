@@ -2,21 +2,19 @@
   "schema": "CI_TEST_PERFORMANCE_ASSESSMENT_V2",
   "schema_version": 2,
   "issue_number": 1724,
-  "pr_number": 1730,
+  "pr_number": 1739,
   "measured_at": "2026-07-25T00:00:00Z",
   "claim": {
-    "kind": "non_regression",
-    "metric": "pnpm_test_p50_seconds",
-    "maximum_regression_pct": 5.0
+    "kind": "none"
   },
   "performance_evidence": {
-    "status": "incomparable_cohort"
+    "status": "not_instrumented"
   },
   "observation": {
-    "outcome": "inconclusive"
+    "outcome": "not_observed"
   },
   "claim_evaluation": {
-    "outcome": "inconclusive"
+    "outcome": "not_applicable"
   },
   "functional_evidence": {
     "proof_level": "check_run_only",
@@ -32,15 +30,22 @@
           "conclusion": "success",
           "head_sha_match": true,
           "classification": "required"
+        },
+        {
+          "check_run_id": 1002,
+          "status": "completed",
+          "conclusion": "success",
+          "head_sha_match": true,
+          "classification": "required"
         }
       ]
     }
   },
-  "declared_impact": "No performance-relevant changes; schema/docs addition only.",
+  "declared_impact": "No performance-relevant changes; validator functional evidence cross-check against a trusted ci_verdict_summary_v2 artifact.",
   "risk_acknowledgement": {
     "reference": {
       "source_kind": "issue_comment",
-      "source_id": "issuecomment-5077131957"
+      "source_id": "issuecomment-5077564154"
     },
     "verification_status": "unverified"
   }

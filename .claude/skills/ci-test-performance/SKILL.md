@@ -204,14 +204,20 @@ hook 実装（`FileChanged` / `PreToolUse` による `ci-test-performance` の�
 ```bash
 uv run --locked python3 .claude/skills/ci-test-performance/scripts/validate_ci_performance_assessment_v2.py \
   --assessment <path-to-assessment.json> \
-  --output <path-to-result.json>
+  --output <path-to-result.json> \
+  --ci-verdict-summary <path-to-ci_verdict_summary_v2.json> \
+  --expected-head-sha <trusted PR head SHA> \
+  --expected-artifact-digest <sha256:...>
 ```
 
-`pnpm policy:check:ci-performance` からも同じ validator を実行できる。
+`pnpm policy:check:ci-performance` からも同じ validator の pytest スイートを実行できる。CLI 単体は `pnpm policy:validate:ci-performance -- --assessment ... --output ...` からも実行できる。
 
 - exit code: `0=valid`（structural_valid かつ semantic_valid） / `2=structural または semantic invalid` / `3=operational failure`（ファイル不在・strict JSON parse 失敗）
 - JSON parsing は重複キー・`NaN`・`Infinity` を拒否する strict parsing
 - `--output` に書き出す結果は `structural_valid` / `semantic_valid` / `approval_eligible` / `errors` / `blockers` / `warnings` を持つ。「assessment としての妥当性」（structural_valid/semantic_valid）と「reviewer gate 上の承認可否」（approval_eligible）は別軸であり、意味論的に valid でも証拠不足・functional evidence 不足で `approval_eligible: false` になり得る
+- `decision` は assessment の *入力* スキーマには存在しない。producer が虚偽の decision を埋め込めないよう、`decision` 相当の判定は常に `--output` の validation result（`CI_TEST_PERFORMANCE_ASSESSMENT_V2_VALIDATION_RESULT`）としてのみ出力される
+- `functional_evidence.ci_verdict_summary_ref.selected_checks` は自己申告であり単独では `approval_eligible: true` の根拠にならない。`--ci-verdict-summary` で canonical `ci_verdict_summary_v2` artifact を、`--expected-head-sha` で trusted head SHA（`git rev-parse HEAD` / gh CLI 由来）を渡し、validator が artifact 側の `expected_head_sha` 一致・`overall_status: merge_ready`・required check 集合の completeness（`status: completed` / `conclusion: success` / 正の `check_run_id` / `head_sha_match: true` / 非 synthetic provenance）を独立に再検証したときのみ `approval_eligible: true` になり得る。`--expected-artifact-digest` を渡すと artifact ファイルの sha256 digest も照合する
+- `performance_evidence.status: complete` の場合、`runtime_delta` を伴わないと `complete_status_missing_runtime_delta_evidence` で承認 blocked になる。`runtime_delta.delta` の値は before/after の `p50_seconds`/`p95_seconds` から validator が再計算した値と一致しないと `delta_recomputation_mismatch` で invalid になる
 
 詳細スキーマは `schemas/ci_test_performance_assessment_v2.schema.json` / `schemas/ci_runtime_delta_v2.schema.json` を参照する。fixture は `.claude/skills/ci-test-performance/scripts/fixtures/` を参照する。
 

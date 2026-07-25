@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://loop-protocol.local/schemas/ci_runtime_delta_v2.schema.json",
   "title": "CI Runtime Delta V2",
-  "description": "Runtime delta report for a CI performance comparison. mode=comparative requires before/after/delta; mode=absolute requires an after cohort and a budget threshold. This is a versioned addition alongside ci_runtime_delta_v1 (templates/runtime-delta.md) and does not replace it.",
+  "description": "Runtime delta report for a CI performance comparison. mode=comparative requires before/after/delta and forbids budget; mode=absolute requires an after cohort and a budget threshold and forbids before/delta. This is a versioned addition alongside ci_runtime_delta_v1 (templates/runtime-delta.md) and does not replace it.",
   "type": "object",
   "required": [
     "schema",
@@ -15,35 +15,108 @@
   ],
   "unevaluatedProperties": false,
   "properties": {
-    "schema": { "const": "ci_runtime_delta_v2" },
-    "schema_version": { "const": 2 },
-    "issue_number": { "type": "integer" },
-    "pr_number": { "type": ["integer", "null"] },
-    "measured_at": { "type": "string", "minLength": 1 },
-    "mode": { "type": "string", "enum": ["comparative", "absolute"] },
-    "before": { "$ref": "#/$defs/Cohort" },
-    "after": { "$ref": "#/$defs/Cohort" },
-    "budget": { "$ref": "#/$defs/Budget" },
-    "delta": { "$ref": "#/$defs/Delta" },
+    "schema": {
+      "const": "ci_runtime_delta_v2"
+    },
+    "schema_version": {
+      "const": 2
+    },
+    "issue_number": {
+      "type": "integer"
+    },
+    "pr_number": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "measured_at": {
+      "type": "string",
+      "minLength": 1,
+      "format": "date-time"
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "comparative",
+        "absolute"
+      ]
+    },
+    "before": {
+      "$ref": "#/$defs/Cohort"
+    },
+    "after": {
+      "$ref": "#/$defs/Cohort"
+    },
+    "budget": {
+      "$ref": "#/$defs/Budget"
+    },
+    "delta": {
+      "$ref": "#/$defs/Delta"
+    },
     "outlier_exclusions": {
       "type": "array",
-      "items": { "$ref": "#/$defs/OutlierExclusion" }
+      "items": {
+        "$ref": "#/$defs/OutlierExclusion"
+      }
     }
   },
   "allOf": [
     {
       "if": {
-        "properties": { "mode": { "const": "comparative" } },
-        "required": ["mode"]
+        "properties": {
+          "mode": {
+            "const": "comparative"
+          }
+        },
+        "required": [
+          "mode"
+        ]
       },
-      "then": { "required": ["before", "after", "delta"] }
+      "then": {
+        "required": [
+          "before",
+          "after",
+          "delta"
+        ],
+        "not": {
+          "required": [
+            "budget"
+          ]
+        }
+      }
     },
     {
       "if": {
-        "properties": { "mode": { "const": "absolute" } },
-        "required": ["mode"]
+        "properties": {
+          "mode": {
+            "const": "absolute"
+          }
+        },
+        "required": [
+          "mode"
+        ]
       },
-      "then": { "required": ["after", "budget"] }
+      "then": {
+        "required": [
+          "after",
+          "budget"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "before"
+              ]
+            },
+            {
+              "required": [
+                "delta"
+              ]
+            }
+          ]
+        }
+      }
     }
   ],
   "$defs": {
@@ -63,18 +136,43 @@
       ],
       "unevaluatedProperties": false,
       "properties": {
-        "job": { "type": "string", "minLength": 1 },
-        "p50_seconds": { "type": "number" },
-        "p95_seconds": { "type": "number" },
+        "job": {
+          "type": "string",
+          "minLength": 1
+        },
+        "p50_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "p95_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
         "run_ids": {
           "type": "array",
-          "items": { "type": "string", "minLength": 1 },
-          "minItems": 1
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "uniqueItems": true
         },
-        "run_count": { "type": "integer", "minimum": 0 },
-        "runner_image": { "type": "string", "minLength": 1 },
-        "workers": { "type": "integer", "minimum": 1 },
-        "scheduler": { "type": "string", "minLength": 1 },
+        "run_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "runner_image": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workers": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "scheduler": {
+          "type": "string",
+          "minLength": 1
+        },
         "command_manifest_digest": {
           "type": "string",
           "pattern": "^sha256:[0-9a-f]{64}$"
@@ -82,16 +180,76 @@
         "test_selection_digest": {
           "type": "string",
           "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "run_details": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RunDetail"
+          }
+        }
+      }
+    },
+    "RunDetail": {
+      "type": "object",
+      "description": "Per-run raw evidence. Required by the semantic validator (not JSON Schema alone) whenever performance_evidence.status == complete, so that P50/P95/delta can be recomputed from raw samples instead of trusted self-reported aggregates.",
+      "required": [
+        "run_id",
+        "workflow_run_id",
+        "run_attempt",
+        "commit_sha",
+        "conclusion",
+        "duration_seconds"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workflow_run_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "run_attempt": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "commit_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "conclusion": {
+          "type": "string",
+          "enum": [
+            "success",
+            "failure",
+            "cancelled",
+            "skipped",
+            "timed_out"
+          ]
+        },
+        "duration_seconds": {
+          "type": "number",
+          "minimum": 0
         }
       }
     },
     "Budget": {
       "type": "object",
-      "required": ["metric", "maximum_value_ms"],
+      "required": [
+        "metric",
+        "maximum_value_ms"
+      ],
       "unevaluatedProperties": false,
       "properties": {
-        "metric": { "type": "string", "minLength": 1 },
-        "maximum_value_ms": { "type": "number" }
+        "metric": {
+          "type": "string",
+          "minLength": 1
+        },
+        "maximum_value_ms": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
       }
     },
     "Delta": {
@@ -104,20 +262,41 @@
       ],
       "unevaluatedProperties": false,
       "properties": {
-        "p50_delta_seconds": { "type": "number" },
-        "p95_delta_seconds": { "type": "number" },
-        "p50_improvement_pct": { "type": "number" },
-        "p95_improvement_pct": { "type": "number" }
+        "p50_delta_seconds": {
+          "type": "number"
+        },
+        "p95_delta_seconds": {
+          "type": "number"
+        },
+        "p50_improvement_pct": {
+          "type": "number"
+        },
+        "p95_improvement_pct": {
+          "type": "number"
+        }
       }
     },
     "OutlierExclusion": {
       "type": "object",
-      "required": ["run_id", "reason", "rule_id"],
+      "required": [
+        "run_id",
+        "reason",
+        "rule_id"
+      ],
       "unevaluatedProperties": false,
       "properties": {
-        "run_id": { "type": "string", "minLength": 1 },
-        "reason": { "type": "string", "minLength": 1 },
-        "rule_id": { "type": "string", "minLength": 1 }
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rule_id": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     }
   }

@@ -6,7 +6,8 @@
   "measured_at": "2026-07-25T00:00:00Z",
   "claim": {
     "kind": "improvement",
-    "metric": "pnpm_test_p50_seconds"
+    "metric": "pnpm_test_p50_seconds",
+    "minimum_improvement_pct": 5.0
   },
   "performance_evidence": {
     "status": "insufficient_samples"

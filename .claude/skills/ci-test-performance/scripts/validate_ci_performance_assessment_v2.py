@@ -13,6 +13,19 @@ Separates:
   assessment can still be approval_eligible=false (e.g. insufficient
   samples, unusable functional evidence) -- these are two separate axes.
 
+`decision` is NOT part of the CI_TEST_PERFORMANCE_ASSESSMENT_V2 *input*
+schema. It is an output-only contract produced by this script (see
+CI_TEST_PERFORMANCE_ASSESSMENT_V2_VALIDATION_RESULT below). Producers can
+never embed a fabricated verdict into the assessment they author.
+
+functional_evidence.ci_verdict_summary_ref.selected_checks is a
+self-report and is NEVER sufficient on its own for approval_eligible.
+approval_eligible additionally requires the trusted canonical
+ci_verdict_summary_v2 artifact to be supplied out-of-band via
+--ci-verdict-summary (plus --expected-head-sha, and optionally
+--expected-artifact-digest), and the artifact's own (not self-reported)
+required-check set must independently satisfy the merge-ready floor.
+
 Does NOT read or modify CI_TEST_PERFORMANCE_DECISION_V1 / ci_runtime_delta_v1
 (references/decision-matrix.md, templates/runtime-delta.md). Those V1
 contracts are unaffected by this validator.
@@ -27,7 +40,9 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import sys
 from typing import Any
@@ -52,6 +67,19 @@ COHORT_COMPARABILITY_FIELDS = [
 ]
 
 MIN_DECISION_SAMPLE_RUN_COUNT = 20
+DELTA_TOLERANCE = 1e-6
+PCT_TOLERANCE = 1e-6
+
+# Outcomes that only make sense when an active (non-"none") claim/threshold
+# is being evaluated. "improved" is deliberately excluded: an unclaimed
+# incidental improvement is a legitimate observation, not a contradiction.
+_ACTIVE_CLAIM_ONLY_OUTCOMES = (
+    "budget_met",
+    "budget_exceeded",
+    "equivalent_within_threshold",
+)
+
+_NON_COMPLETE_ALLOWED_OUTCOMES = ("not_observed", "inconclusive")
 
 
 class StrictJSONError(ValueError):
@@ -124,12 +152,7 @@ def _check_claim_state_machine(
     if kind == "none":
         if claim_outcome != "not_applicable":
             _append_unique(errors, "no_claim_claim_evaluation_must_be_not_applicable")
-        if outcome in (
-            "improved",
-            "budget_met",
-            "budget_exceeded",
-            "equivalent_within_threshold",
-        ):
+        if outcome in _ACTIVE_CLAIM_ONLY_OUTCOMES:
             _append_unique(errors, "no_claim_but_observation_implies_active_claim")
         if outcome == "regressed":
             warnings.append("no_claim_observed_regression_review_recommended")
@@ -143,15 +166,22 @@ def _check_claim_state_machine(
                 _append_unique(
                     errors, "claim_evaluation_conclusive_without_complete_evidence"
                 )
+        if status == "not_required":
+            _append_unique(errors, "active_claim_status_not_required_forbidden")
+        if (
+            kind in ("improvement", "non_regression")
+            and outcome == "regressed"
+            and claim_outcome == "satisfied"
+        ):
+            _append_unique(errors, "claim_evaluation_contradicts_regressed_observation")
 
     if status == "insufficient_samples" and outcome == "improved":
         _append_unique(errors, "insufficient_samples_observation_improved")
 
-    if kind == "improvement" and status == "insufficient_samples":
-        _append_unique(errors, "improvement_claim_insufficient_samples")
-
-    if kind == "non_regression" and status == "incomparable_cohort":
-        _append_unique(errors, "non_regression_claim_incomparable_cohort")
+    # performance_evidence.status != complete: no conclusive measured
+    # outcome may be reported (only not_observed / inconclusive are valid).
+    if status != "complete" and outcome not in _NON_COMPLETE_ALLOWED_OUTCOMES:
+        _append_unique(errors, "observation_requires_complete_evidence")
 
 
 def _check_docs_only_runtime_delta(
@@ -164,9 +194,11 @@ def _check_docs_only_runtime_delta(
         warnings.append("docs_only_change_with_runtime_delta_reported")
 
 
-def _check_functional_evidence(
+def _check_functional_evidence_self_report(
     functional_evidence: dict[str, Any], blockers: list[str]
 ) -> None:
+    """Structural self-report floor. Never sufficient alone for approval --
+    see _check_trusted_functional_artifact for the mandatory cross-check."""
     ref = functional_evidence.get("ci_verdict_summary_ref")
     if ref is None:
         _append_unique(blockers, "functional_evidence_missing_ci_verdict_summary_ref")
@@ -195,8 +227,137 @@ def _check_functional_evidence(
         _append_unique(blockers, "functional_evidence_no_usable_checks")
 
 
+def _sha256_of_file(path: str) -> str:
+    with open(path, "rb") as handle:
+        return "sha256:" + hashlib.sha256(handle.read()).hexdigest()
+
+
+def _check_trusted_functional_artifact(
+    assessment: dict[str, Any],
+    blockers: list[str],
+    ci_verdict_summary_path: str | None,
+    expected_head_sha: str | None,
+    expected_artifact_digest: str | None,
+) -> None:
+    """Cross-checks functional_evidence against the canonical
+    ci_verdict_summary_v2 artifact, supplied out-of-band. Self-reported
+    check details inside the assessment (ci_verdict_summary_ref.selected_checks)
+    are advisory only and are never trusted for approval_eligible."""
+    ref = assessment.get("functional_evidence", {}).get("ci_verdict_summary_ref")
+    if ref is None:
+        # already caught by _check_functional_evidence_self_report
+        return
+
+    if ci_verdict_summary_path is None:
+        _append_unique(blockers, "functional_evidence_missing_trusted_artifact_input")
+        return
+
+    try:
+        with open(ci_verdict_summary_path, "rb") as handle:
+            raw_bytes = handle.read()
+    except OSError:
+        _append_unique(blockers, "functional_evidence_trusted_artifact_not_readable")
+        return
+
+    if expected_artifact_digest is not None:
+        actual_digest = "sha256:" + hashlib.sha256(raw_bytes).hexdigest()
+        if actual_digest != expected_artifact_digest:
+            _append_unique(blockers, "functional_evidence_artifact_digest_mismatch")
+            return
+
+    try:
+        artifact = strict_json_loads(raw_bytes.decode("utf-8"))
+    except StrictJSONError:
+        _append_unique(blockers, "functional_evidence_trusted_artifact_not_parseable")
+        return
+
+    if artifact.get("schema") != "ci_verdict_summary_v2":
+        _append_unique(blockers, "functional_evidence_artifact_schema_mismatch")
+        return
+
+    if expected_head_sha is None:
+        _append_unique(blockers, "functional_evidence_missing_expected_head_sha_input")
+        return
+
+    if artifact.get("expected_head_sha") != expected_head_sha:
+        _append_unique(blockers, "functional_evidence_artifact_head_sha_mismatch")
+        return
+
+    if ref.get("expected_head_sha") != expected_head_sha:
+        _append_unique(
+            blockers, "functional_evidence_self_reported_head_sha_mismatch"
+        )
+        return
+
+    if artifact.get("overall_status") != "merge_ready":
+        _append_unique(blockers, "functional_evidence_artifact_not_merge_ready")
+        return
+
+    checks = artifact.get("checks", [])
+    required_checks = [c for c in checks if c.get("classification") == "required"]
+    if not required_checks:
+        _append_unique(blockers, "functional_evidence_artifact_no_required_checks")
+        return
+
+    for check in required_checks:
+        if (
+            check.get("status") != "completed"
+            or check.get("conclusion") != "success"
+            or not _is_positive_int(check.get("check_run_id"))
+            or check.get("head_sha_match") is not True
+            or check.get("provenance") == "needs_result_synthetic"
+        ):
+            _append_unique(blockers, "functional_evidence_required_check_incomplete")
+            return
+
+    # Self-reported selected_checks (if any carry a check_run_id) must match
+    # the trusted artifact's entry for that same check_run_id -- a self
+    # report that disagrees with the canonical artifact is untrustworthy.
+    by_id = {c.get("check_run_id"): c for c in checks if c.get("check_run_id")}
+    for self_reported in ref.get("selected_checks", []):
+        run_id = self_reported.get("check_run_id")
+        if run_id is None:
+            continue
+        artifact_check = by_id.get(run_id)
+        if artifact_check is None:
+            _append_unique(
+                blockers, "functional_evidence_self_report_unknown_check_run_id"
+            )
+            continue
+        for field in ("status", "conclusion", "head_sha_match", "classification"):
+            if self_reported.get(field) != artifact_check.get(field):
+                _append_unique(
+                    blockers,
+                    "functional_evidence_self_report_mismatch_trusted_artifact",
+                )
+                break
+
+
+def _recompute_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, float]:
+    p50_delta = before["p50_seconds"] - after["p50_seconds"]
+    p95_delta = before["p95_seconds"] - after["p95_seconds"]
+    p50_pct = (
+        (p50_delta / before["p50_seconds"]) * 100.0
+        if before["p50_seconds"]
+        else 0.0
+    )
+    p95_pct = (
+        (p95_delta / before["p95_seconds"]) * 100.0
+        if before["p95_seconds"]
+        else 0.0
+    )
+    return {
+        "p50_delta_seconds": p50_delta,
+        "p95_delta_seconds": p95_delta,
+        "p50_improvement_pct": p50_pct,
+        "p95_improvement_pct": p95_pct,
+    }
+
+
 def _check_cohort_comparability(
-    performance_evidence: dict[str, Any], errors: list[str], blockers: list[str]
+    performance_evidence: dict[str, Any],
+    errors: list[str],
+    blockers: list[str],
 ) -> None:
     status = performance_evidence["status"]
     runtime_delta = performance_evidence.get("runtime_delta")
@@ -204,14 +365,39 @@ def _check_cohort_comparability(
     if status == "insufficient_samples":
         _append_unique(blockers, "insufficient_samples_gate_blocked")
 
+    if status == "incomparable_cohort":
+        _append_unique(blockers, "incomparable_cohort_gate_blocked")
+
+    if status == "complete" and runtime_delta is None:
+        _append_unique(blockers, "complete_status_missing_runtime_delta_evidence")
+
     if runtime_delta is None:
         return
+
+    for cohort_key in ("before", "after"):
+        cohort = runtime_delta.get(cohort_key)
+        if not cohort:
+            continue
+        run_ids = cohort.get("run_ids", [])
+        run_count = cohort.get("run_count")
+        if run_count is not None and run_count != len(run_ids):
+            _append_unique(
+                errors,
+                f"run_count_mismatches_run_ids_length: {cohort_key}",
+            )
 
     if runtime_delta.get("mode") != "comparative":
         return
 
     before = runtime_delta.get("before", {})
     after = runtime_delta.get("after", {})
+
+    before_ids = set(before.get("run_ids", []))
+    after_ids = set(after.get("run_ids", []))
+    overlap = before_ids & after_ids
+    if overlap:
+        _append_unique(errors, "run_ids_overlap_before_after")
+
     mismatched = [
         field
         for field in COHORT_COMPARABILITY_FIELDS
@@ -231,6 +417,22 @@ def _check_cohort_comparability(
     if run_count < MIN_DECISION_SAMPLE_RUN_COUNT and status == "complete":
         _append_unique(errors, "insufficient_sample_run_count_but_status_complete")
 
+    delta = runtime_delta.get("delta")
+    if delta and "p50_seconds" in before and "p50_seconds" in after:
+        recomputed = _recompute_delta(before, after)
+        for field, recomputed_value in recomputed.items():
+            declared_value = delta.get(field)
+            if declared_value is None:
+                continue
+            tolerance = (
+                PCT_TOLERANCE if field.endswith("_pct") else DELTA_TOLERANCE
+            )
+            if not math.isclose(
+                declared_value, recomputed_value, rel_tol=1e-6, abs_tol=tolerance
+            ):
+                _append_unique(errors, "delta_recomputation_mismatch")
+                break
+
 
 def _check_approval_gates(
     assessment: dict[str, Any], blockers: list[str]
@@ -245,15 +447,30 @@ def _check_approval_gates(
     if claim["kind"] == "absolute_budget" and outcome == "budget_exceeded":
         _append_unique(blockers, "budget_exceeded_blocks_approval")
 
+    if outcome == "regressed":
+        _append_unique(blockers, "observed_regression_blocks_approval")
 
-def run_semantic_checks(assessment: dict[str, Any]) -> dict[str, Any]:
+
+def run_semantic_checks(
+    assessment: dict[str, Any],
+    ci_verdict_summary_path: str | None = None,
+    expected_head_sha: str | None = None,
+    expected_artifact_digest: str | None = None,
+) -> dict[str, Any]:
     errors: list[str] = []
     blockers: list[str] = []
     warnings: list[str] = []
 
     _check_claim_state_machine(assessment, errors, warnings)
     _check_docs_only_runtime_delta(assessment, warnings)
-    _check_functional_evidence(assessment["functional_evidence"], blockers)
+    _check_functional_evidence_self_report(assessment["functional_evidence"], blockers)
+    _check_trusted_functional_artifact(
+        assessment,
+        blockers,
+        ci_verdict_summary_path,
+        expected_head_sha,
+        expected_artifact_digest,
+    )
     _check_cohort_comparability(assessment["performance_evidence"], errors, blockers)
     _check_approval_gates(assessment, blockers)
 
@@ -289,7 +506,34 @@ def load_assessment_schema() -> dict[str, Any]:
         return json.load(handle)
 
 
-def validate_assessment(assessment_path: str) -> tuple[int, dict[str, Any]]:
+def _build_format_checker():
+    """jsonschema only enforces format: date-time when an optional
+    rfc3339-validator/isodate extra is installed; without it FormatChecker
+    silently accepts any string. Register an explicit RFC3339-ish check
+    (stdlib only) so this repo's pinned dependency set does not silently
+    disable format validation."""
+    from jsonschema import FormatChecker
+    from datetime import datetime
+
+    checker = FormatChecker()
+
+    @checker.checks("date-time", raises=ValueError)
+    def _check_date_time(value: object) -> bool:
+        if not isinstance(value, str):
+            return True
+        candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+        datetime.fromisoformat(candidate)
+        return True
+
+    return checker
+
+
+def validate_assessment(
+    assessment_path: str,
+    ci_verdict_summary_path: str | None = None,
+    expected_head_sha: str | None = None,
+    expected_artifact_digest: str | None = None,
+) -> tuple[int, dict[str, Any]]:
     try:
         with open(assessment_path, encoding="utf-8") as handle:
             raw_text = handle.read()
@@ -311,8 +555,11 @@ def validate_assessment(assessment_path: str) -> tuple[int, dict[str, Any]]:
         }
 
     schema = load_assessment_schema()
-    validator = Draft202012Validator(schema)
-    schema_errors = sorted(validator.iter_errors(assessment), key=lambda e: e.path)
+    Draft202012Validator.check_schema(schema)
+    validator_instance = Draft202012Validator(schema, format_checker=_build_format_checker())
+    schema_errors = sorted(
+        validator_instance.iter_errors(assessment), key=lambda e: e.path
+    )
     if schema_errors:
         error_messages = [
             f"{'/'.join(str(p) for p in err.path) or '<root>'}: {err.message}"
@@ -320,7 +567,12 @@ def validate_assessment(assessment_path: str) -> tuple[int, dict[str, Any]]:
         ]
         return EXIT_INVALID, structural_invalid_decision(error_messages)
 
-    decision = run_semantic_checks(assessment)
+    decision = run_semantic_checks(
+        assessment,
+        ci_verdict_summary_path=ci_verdict_summary_path,
+        expected_head_sha=expected_head_sha,
+        expected_artifact_digest=expected_artifact_digest,
+    )
     exit_code = EXIT_VALID if decision["semantic_valid"] else EXIT_INVALID
     return exit_code, decision
 
@@ -335,13 +587,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output", required=True, help="Path to write the decision result JSON"
     )
+    parser.add_argument(
+        "--ci-verdict-summary",
+        default=None,
+        help=(
+            "Path to the canonical ci_verdict_summary_v2 artifact JSON. "
+            "Required for approval_eligible=true when functional_evidence "
+            "declares a ci_verdict_summary_ref; the assessment's own "
+            "self-reported selected_checks are never trusted alone."
+        ),
+    )
+    parser.add_argument(
+        "--expected-head-sha",
+        default=None,
+        help="Trusted PR head SHA (e.g. from `git rev-parse HEAD` / gh CLI).",
+    )
+    parser.add_argument(
+        "--expected-artifact-digest",
+        default=None,
+        help="Expected sha256:<hex> digest of the --ci-verdict-summary file.",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    exit_code, decision = validate_assessment(args.assessment)
+    exit_code, decision = validate_assessment(
+        args.assessment,
+        ci_verdict_summary_path=args.ci_verdict_summary,
+        expected_head_sha=args.expected_head_sha,
+        expected_artifact_digest=args.expected_artifact_digest,
+    )
 
     result: dict[str, Any] = {
         "schema": "CI_TEST_PERFORMANCE_ASSESSMENT_V2_VALIDATION_RESULT",
