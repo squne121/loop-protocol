@@ -22,7 +22,7 @@ isolated workspace 内の grounded_research subtask で `search_web` 呼び出�
 本ドキュメントは、この isolated-workspace-specific な不発の原因を **静的解析のみ**（本 Issue の
 Stop Conditions により live agy 実行は行わない）で再調査した結果を記録する。
 
-## Findings
+## Findings（調査結果）
 
 ### Finding 1: isolated workspace は AGY の実際の設定ファイルパスを書き込んでいない（有力な原因候補）
 
@@ -112,7 +112,7 @@ agy OAuth token の isolated workspace への read-only 露出は、`agy_auth_re
 ではなく、認証は成功した上で tool 呼び出し自体がスキップされている可能性が高い
 （`web_tool_call_count: 0` であり、`ok: false` の認証失敗ではなかったとの Issue 本文の記述と整合）。
 
-## Next Action
+## Next Action（次のアクション）
 
 1. **最有力候補（Finding 1）の追加修正は本 Issue の Allowed Paths 外**: `materialize_isolated_agy_workspace()`
    が実際の `~/.gemini/antigravity-cli/settings.json` を isolated workspace の
