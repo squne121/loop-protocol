@@ -38,6 +38,18 @@ from pathlib import Path
 from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
+# #1677 AC4/AC12: reuse plan_refinement_loop.py's normative semantic
+# validator for ISSUE_EXECUTION_DECISION_V1 instead of re-implementing the
+# graph invariants here.
+# ---------------------------------------------------------------------------
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from plan_refinement_loop import validate_issue_execution_decision
+except ImportError:  # pragma: no cover - defensive fallback
+    validate_issue_execution_decision = None
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -137,6 +149,40 @@ def write_json_deterministic(path: Path, obj: Any) -> None:
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
+
+
+def project_issue_execution_decision_ref(
+    issue_execution_decision: "dict[str, Any] | None",
+) -> "dict[str, Any] | None":
+    """
+    Project a full ISSUE_EXECUTION_DECISION_V1 down to the small
+    'issue_execution_decision_ref' reference embedded in
+    LOOP_HANDOFF_RESULT_V1 (#1677 AC5). Carries only what downstream
+    freshness validation needs: schema_version, target_issue_number, and
+    collection_digest -- the same digest that reached LOOP_STATE_V1 via
+    build_loop_state().
+
+    Returns None when issue_execution_decision is absent/malformed (the
+    caller then omits issue_execution_decision_ref from the handoff, rather
+    than emitting a partial/misleading reference).
+    """
+    if not isinstance(issue_execution_decision, dict):
+        return None
+    identity = issue_execution_decision.get("identity")
+    if not isinstance(identity, dict):
+        return None
+    target_issue_number = identity.get("target_issue_number")
+    collection_digest = identity.get("collection_digest")
+    schema_version = issue_execution_decision.get("schema_version")
+    if not isinstance(target_issue_number, int) or not isinstance(collection_digest, str):
+        return None
+    if schema_version != "ISSUE_EXECUTION_DECISION_V1":
+        return None
+    return {
+        "schema_version": schema_version,
+        "target_issue_number": target_issue_number,
+        "collection_digest": collection_digest,
+    }
 
 
 def validate_loop_state(
@@ -468,6 +514,24 @@ def build_loop_state(
     scope_signal_guard_decision_v2 = plan.get("scope_signal_guard_decision_v2")
     if not isinstance(scope_signal_guard_decision_v2, dict):
         scope_signal_guard_decision_v2 = None
+
+    # #1677 AC4: project ISSUE_EXECUTION_DECISION_V1 from the planner output
+    # into LOOP_STATE_V1 verbatim (same schema_version/identity/nodes/
+    # relations/execution/downstream_policy/completeness), so downstream
+    # consumers reach the same collection_digest as the planner emitted.
+    # Re-validated here (not just schema-checked) so a semantically invalid
+    # decision never reaches LOOP_STATE_V1 silently.
+    issue_execution_decision = plan.get("issue_execution_decision")
+    if isinstance(issue_execution_decision, dict):
+        if validate_issue_execution_decision is not None:
+            _violations = validate_issue_execution_decision(issue_execution_decision)
+            if _violations:
+                blocked.append(
+                    "issue_execution_decision_invalid: "
+                    + ", ".join(_violations)
+                )
+                return None, blocked, None
+        loop_state["issue_execution_decision"] = issue_execution_decision
 
     return loop_state, [], scope_signal_guard_decision_v2
 

@@ -388,6 +388,14 @@ echo '{
 
 詳細な publisher 仕様は `.claude/skills/issue-refinement-loop/scripts/publish_termination_report.py` を参照する。
 
+## ISSUE_EXECUTION_DECISION_V1 ハンドオフ契約 (#1677)
+
+`plan_refinement_loop.py` の `issue_execution_decision`（`ISSUE_EXECUTION_DECISION_V1`）は `build_loop_state.py` → `LOOP_HANDOFF_RESULT_V1.issue_execution_decision_ref` → termination report まで同一 digest（`identity.collection_digest`）で到達する。normative semantic validator は `plan_refinement_loop.validate_issue_execution_decision`（producer/`build_loop_state.py`/handoff/termination report/downstream consumer が共通利用、test 専用実装への依存禁止）。
+
+downstream skill（impl-review-loop・implement-issue・issue-contract-review・open-pr）は `downstream_policy`（`semantic_reclassification: forbidden` / `freshness_validation: required` / `stale_action: rerun_issue_refinement`）に従い、semantic relation を再分類しない。stale 検出時は issue-refinement-loop を再実行する。
+
+legacy `graph.nodes/graph.edges` + `execution.target_state` からの移行は `dual_write | equivalence | dual_read | new_authoritative | legacy_removed` phase で管理し、`equivalence` phase の digest 不一致は fail-closed とする。詳細は `references/refinement-loop-plan-output.md` の `issue_execution_decision` 節を参照する。
+
 ## 参照マップ (Reference Map)
 
 | topic | primary reference |

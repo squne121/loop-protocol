@@ -426,6 +426,406 @@ def _canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
+# ---------------------------------------------------------------------------
+# ISSUE_EXECUTION_DECISION_V1 (#1677): canonical relation-graph decision.
+#
+# This module is the canonical producer AND the normative semantic validator
+# owner for ISSUE_EXECUTION_DECISION_V1 (schemas/issue_execution_decision_v1.
+# schema.json owns the static/closed shape; validate_issue_execution_decision()
+# below owns the cross-field graph invariants). Other scripts in this skill
+# (run_refinement_preflight.py, build_loop_state.py) import
+# validate_issue_execution_decision from this module rather than
+# re-implementing the invariants, per the #1677 Canonical Contract Freeze.
+# ---------------------------------------------------------------------------
+
+ISSUE_EXECUTION_DECISION_SCHEMA_VERSION = "ISSUE_EXECUTION_DECISION_V1"
+
+ISSUE_EXECUTION_DECISION_DOWNSTREAM_POLICY = {
+    "semantic_reclassification": "forbidden",
+    "freshness_validation": "required",
+    "stale_action": "rerun_issue_refinement",
+}
+
+_VALID_RELATION_TYPES = frozenset(
+    {"depends_on", "duplicate", "absorb", "supersedes", "coordinates"}
+)
+_VALID_EXECUTION_STATES = frozenset({"selected", "deferred", "blocked", "duplicate"})
+_DUPLICATE_LIKE_RELATIONS = frozenset({"duplicate", "absorb"})
+
+_ROLLUP_ACTION_DUPLICATE = frozenset({"merge_into_current_pr", "amend_current_issue"})
+_ROLLUP_ACTION_ABSORB = frozenset({"create_parent_rollup_issue"})
+_ROLLUP_ACTION_COORDINATE = frozenset({"proceed_with_coordination"})
+_ROLLUP_ORDERING_BLOCKS = frozenset({"candidate_first", "sequential_required"})
+
+
+def _sha256_prefixed(text: str) -> str:
+    """SHA256 digest with the 'sha256:' prefix required by ISSUE_EXECUTION_DECISION_V1."""
+    return "sha256:" + _sha256(text)
+
+
+def _node_body_sha256_for_candidate(candidate: dict[str, Any]) -> str:
+    """Deterministic node digest for a scope-rollup candidate (no raw body available)."""
+    return _sha256_prefixed(_canonical_json(candidate))
+
+
+def _derive_execution_decision_inputs(
+    target_issue_number: int,
+    scope_rollup_result: "dict[str, Any] | None",
+) -> tuple[
+    list[dict[str, Any]],
+    dict[int, str],
+    list[int],
+    bool,
+    bool,
+    bool,
+    list[int],
+]:
+    """
+    Derive (relations, extra_nodes, predecessors, duplicate_hit,
+    issues_complete, dependencies_complete, unresolved_references) from an
+    ISSUE_SCOPE_ROLLUP_PLAN_V2 artifact (#1677 AC4 join).
+
+    When scope_rollup_result is absent, returns an empty/complete baseline
+    (no relations, fully complete, no unresolved references) so that
+    build_issue_execution_decision() can still emit a valid 'selected' plan
+    for Issues that have not gone through the scope-rollup preflight.
+    """
+    relations: list[dict[str, Any]] = []
+    extra_nodes: dict[int, str] = {}
+    predecessors: list[int] = []
+    duplicate_hit = False
+
+    if not isinstance(scope_rollup_result, dict):
+        return relations, extra_nodes, predecessors, duplicate_hit, True, True, []
+
+    input_meta = scope_rollup_result.get("input")
+    completeness_str = (input_meta or {}).get("completeness") if isinstance(input_meta, dict) else None
+    issues_complete = completeness_str != "partial"
+    dependencies_complete = issues_complete
+    unresolved_references = [] if issues_complete else [target_issue_number]
+
+    candidates = scope_rollup_result.get("candidates")
+    if not isinstance(candidates, list):
+        candidates = []
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        number = candidate.get("number")
+        if not isinstance(number, int):
+            continue
+
+        signals = candidate.get("signals")
+        evidence = [f"signal:{s}" for s in signals] if isinstance(signals, list) and signals else [
+            f"scope_rollup_candidate:{number}"
+        ]
+
+        action = candidate.get("suggested_action")
+        ordering = candidate.get("ordering_constraint")
+        candidate_state = str(candidate.get("state") or "").upper()
+
+        relation_type = None
+        if action in _ROLLUP_ACTION_DUPLICATE:
+            relation_type = "duplicate"
+        elif action in _ROLLUP_ACTION_ABSORB:
+            relation_type = "absorb"
+        elif ordering in _ROLLUP_ORDERING_BLOCKS and candidate_state == "OPEN":
+            relation_type = "depends_on"
+        elif action in _ROLLUP_ACTION_COORDINATE:
+            relation_type = "coordinates"
+
+        if relation_type is None:
+            continue
+
+        relations.append(
+            {
+                "source_issue_number": target_issue_number,
+                "target_issue_number": number,
+                "relation_type": relation_type,
+                "evidence": evidence,
+            }
+        )
+        extra_nodes[number] = _node_body_sha256_for_candidate(candidate)
+
+        if relation_type in _DUPLICATE_LIKE_RELATIONS:
+            duplicate_hit = True
+        elif relation_type == "depends_on":
+            predecessors.append(number)
+
+    predecessors = sorted(set(predecessors))
+    return (
+        relations,
+        extra_nodes,
+        predecessors,
+        duplicate_hit,
+        issues_complete,
+        dependencies_complete,
+        unresolved_references,
+    )
+
+
+def build_issue_execution_decision(
+    issue_number: int,
+    issue_body_sha256: str,
+    generated_at: str,
+    known_context: "dict[str, Any] | None",
+) -> dict[str, Any]:
+    """
+    Build an ISSUE_EXECUTION_DECISION_V1 dict (#1677).
+
+    Reads known_context['scope_rollup_result'] (ISSUE_SCOPE_ROLLUP_PLAN_V2,
+    joined in by run_refinement_preflight.py) when present. Absent that key,
+    emits a minimal 'selected' decision for the target Issue alone.
+    """
+    scope_rollup_result = None
+    if isinstance(known_context, dict):
+        scope_rollup_result = known_context.get("scope_rollup_result")
+
+    (
+        relations,
+        extra_nodes,
+        predecessors,
+        duplicate_hit,
+        issues_complete,
+        dependencies_complete,
+        unresolved_references,
+    ) = _derive_execution_decision_inputs(issue_number, scope_rollup_result)
+
+    # issue_body_sha256 passed in is already unprefixed (matches source.issue_body_sha256
+    # elsewhere in this module); ISSUE_EXECUTION_DECISION_V1 requires the 'sha256:' prefix.
+    target_body_sha256 = (
+        issue_body_sha256
+        if issue_body_sha256.startswith("sha256:")
+        else _sha256_prefixed(issue_body_sha256)
+    )
+    nodes_map: dict[int, str] = {issue_number: target_body_sha256}
+    for number, body_sha in extra_nodes.items():
+        nodes_map.setdefault(number, body_sha)
+
+    nodes = [
+        {"issue_number": n, "body_sha256": nodes_map[n]}
+        for n in sorted(nodes_map)
+    ]
+    relations_sorted = sorted(
+        relations,
+        key=lambda r: (r["source_issue_number"], r["target_issue_number"], r["relation_type"]),
+    )
+
+    if not issues_complete or not dependencies_complete or unresolved_references:
+        state = "deferred"
+        defer_reason = "scope rollup evidence incomplete; rerun issue-refinement-loop"
+        final_predecessors: list[int] = []
+    elif duplicate_hit:
+        state = "duplicate"
+        defer_reason = "duplicate or absorb relation detected via scope rollup"
+        final_predecessors = []
+    elif predecessors:
+        state = "blocked"
+        defer_reason = (
+            "open predecessor issue(s) pending: "
+            + ", ".join(f"#{p}" for p in predecessors)
+        )
+        final_predecessors = predecessors
+    else:
+        state = "selected"
+        defer_reason = None
+        final_predecessors = []
+
+    collection_digest = _sha256_prefixed(
+        _canonical_json({"nodes": nodes, "relations": relations_sorted})
+    )
+
+    return {
+        "schema_version": ISSUE_EXECUTION_DECISION_SCHEMA_VERSION,
+        "identity": {
+            "target_issue_number": issue_number,
+            "target_body_sha256": target_body_sha256,
+            "generated_at": generated_at,
+            "collection_digest": collection_digest,
+        },
+        "nodes": nodes,
+        "relations": relations_sorted,
+        "execution": {
+            "state": state,
+            "target_issue_number": issue_number,
+            "predecessors": final_predecessors,
+            "defer_reason": defer_reason,
+        },
+        "downstream_policy": dict(ISSUE_EXECUTION_DECISION_DOWNSTREAM_POLICY),
+        "completeness": {
+            "issues_complete": issues_complete,
+            "dependencies_complete": dependencies_complete,
+            "unresolved_references": unresolved_references,
+        },
+    }
+
+
+def validate_issue_execution_decision(decision: dict[str, Any]) -> list[str]:
+    """
+    Normative semantic validator for ISSUE_EXECUTION_DECISION_V1 (#1677 AC11).
+
+    Returns a list of violation reason strings (empty == valid). Only checks
+    cross-field / graph invariants that the closed JSON Schema
+    (schemas/issue_execution_decision_v1.schema.json) cannot express:
+    ordering, node/relation uniqueness, endpoint existence, self-edges,
+    conflicting parallel edges, depends_on cycles, target/predecessor
+    agreement, state semantics, and completeness gating.
+
+    Callers (planner/preflight, build_loop_state.py, handoff parser,
+    termination report, downstream consumers) MUST use this function as the
+    single semantic-validation authority instead of re-deriving invariants.
+    """
+    violations: list[str] = []
+
+    if not isinstance(decision, dict):
+        return ["not_a_mapping"]
+
+    nodes = decision.get("nodes")
+    relations = decision.get("relations")
+    execution = decision.get("execution")
+    completeness = decision.get("completeness")
+
+    if not isinstance(nodes, list) or not isinstance(relations, list):
+        return ["missing_nodes_or_relations"]
+    if not isinstance(execution, dict) or not isinstance(completeness, dict):
+        return ["missing_execution_or_completeness"]
+
+    # --- node uniqueness + ordering ---
+    node_numbers = []
+    for n in nodes:
+        if not isinstance(n, dict) or "issue_number" not in n:
+            violations.append("malformed_node")
+            continue
+        node_numbers.append(n["issue_number"])
+
+    if len(node_numbers) != len(set(node_numbers)):
+        violations.append("duplicate_node")
+    if node_numbers != sorted(node_numbers):
+        violations.append("nodes_not_sorted")
+
+    node_set = set(node_numbers)
+
+    # --- relation ordering + uniqueness + endpoint + self-edge ---
+    relation_tuples = []
+    depends_on_edges: list[tuple[int, int]] = []
+    seen_unordered_pairs: dict[frozenset, set[str]] = {}
+
+    for r in relations:
+        if not isinstance(r, dict):
+            violations.append("malformed_relation")
+            continue
+        src = r.get("source_issue_number")
+        tgt = r.get("target_issue_number")
+        rtype = r.get("relation_type")
+
+        if rtype not in _VALID_RELATION_TYPES:
+            violations.append(f"unknown_relation_type:{rtype}")
+            continue
+        if src == tgt:
+            violations.append(f"self_edge:{src}")
+        if src not in node_set or tgt not in node_set:
+            violations.append(f"unknown_endpoint:{src}->{tgt}")
+
+        relation_tuples.append((src, tgt, rtype))
+        if rtype == "depends_on":
+            depends_on_edges.append((src, tgt))
+
+        pair = frozenset({src, tgt})
+        seen_unordered_pairs.setdefault(pair, set()).add(rtype)
+
+    if len(relation_tuples) != len(set(relation_tuples)):
+        violations.append("duplicate_relation")
+    if relation_tuples != sorted(relation_tuples):
+        violations.append("relations_not_sorted")
+
+    for pair, rtypes in seen_unordered_pairs.items():
+        if rtypes & _DUPLICATE_LIKE_RELATIONS and "depends_on" in rtypes:
+            violations.append(f"conflicting_parallel_edge:{sorted(pair)}")
+
+    # --- depends_on cycle detection (general graph, not just pairwise) ---
+    adjacency: dict[int, list[int]] = {}
+    for src, tgt in depends_on_edges:
+        adjacency.setdefault(src, []).append(tgt)
+
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {n: WHITE for n in node_set}
+
+    def _has_cycle(start: int) -> bool:
+        stack = [(start, iter(adjacency.get(start, [])))]
+        color[start] = GRAY
+        while stack:
+            node, it = stack[-1]
+            advanced = False
+            for nxt in it:
+                if color.get(nxt, WHITE) == GRAY:
+                    return True
+                if color.get(nxt, WHITE) == WHITE:
+                    color[nxt] = GRAY
+                    stack.append((nxt, iter(adjacency.get(nxt, []))))
+                    advanced = True
+                    break
+            if not advanced:
+                color[node] = BLACK
+                stack.pop()
+        return False
+
+    for n in list(node_set):
+        if color.get(n, WHITE) == WHITE:
+            if _has_cycle(n):
+                violations.append("depends_on_cycle")
+                break
+
+    # --- execution / predecessor agreement ---
+    target = execution.get("target_issue_number")
+    predecessors = execution.get("predecessors")
+    state = execution.get("state")
+    defer_reason = execution.get("defer_reason")
+
+    if target not in node_set:
+        violations.append("execution_target_not_in_nodes")
+
+    # Convention: relation(source_issue_number=X, target_issue_number=Y,
+    # relation_type="depends_on") reads as "X depends_on Y" (Y must complete
+    # before X proceeds). Predecessors of execution.target_issue_number are
+    # therefore the *targets* of depends_on edges whose *source* is the
+    # execution target (i.e. what the target issue itself depends on).
+    expected_predecessors = sorted(
+        {tgt for (src, tgt) in depends_on_edges if src == target}
+    )
+    if isinstance(predecessors, list) and sorted(set(predecessors)) != expected_predecessors:
+        violations.append("predecessors_do_not_match_depends_on_edges")
+
+    if state not in _VALID_EXECUTION_STATES:
+        violations.append(f"unknown_execution_state:{state}")
+
+    issues_complete = completeness.get("issues_complete")
+    dependencies_complete = completeness.get("dependencies_complete")
+    unresolved_references = completeness.get("unresolved_references")
+    incomplete = (
+        issues_complete is not True
+        or dependencies_complete is not True
+        or bool(unresolved_references)
+    )
+
+    if state == "selected":
+        if predecessors:
+            violations.append("selected_state_with_predecessors")
+        if incomplete:
+            violations.append("selected_state_with_incomplete_evidence")
+    elif state in ("deferred", "blocked"):
+        if not defer_reason:
+            violations.append(f"{state}_state_missing_defer_reason")
+    elif state == "duplicate":
+        has_duplicate_relation = any(
+            rtype in _DUPLICATE_LIKE_RELATIONS and (src == target or tgt == target)
+            for (src, tgt, rtype) in relation_tuples
+        )
+        if not has_duplicate_relation:
+            violations.append("duplicate_state_without_duplicate_relation")
+
+    return violations
+
+
 def _extract_sections(text: str) -> dict[str, str]:
     if delta_extract_sections is not None:
         return delta_extract_sections(text)
@@ -2182,6 +2582,45 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
 
         if scope_signal_guard_decision_v2 is not None:
             plan["scope_signal_guard_decision_v2"] = scope_signal_guard_decision_v2
+
+        # #1677: ISSUE_EXECUTION_DECISION_V1 (relation graph, execution state,
+        # downstream_policy). Self-validated via validate_issue_execution_decision
+        # so a malformed derivation never reaches downstream consumers silently.
+        issue_execution_decision = build_issue_execution_decision(
+            issue_number, issue_body_sha256, generated_at, known_context
+        )
+        _decision_violations = validate_issue_execution_decision(issue_execution_decision)
+        if _decision_violations:
+            # Fail closed on the graph derivation itself rather than emit an
+            # invalid ISSUE_EXECUTION_DECISION_V1 (#1677 AC11/AC12 fail-closed
+            # contract). Downgrade to a safe, always-valid 'deferred' shape.
+            issue_execution_decision = {
+                "schema_version": ISSUE_EXECUTION_DECISION_SCHEMA_VERSION,
+                "identity": issue_execution_decision["identity"],
+                "nodes": [
+                    {
+                        "issue_number": issue_number,
+                        "body_sha256": issue_execution_decision["identity"]["target_body_sha256"],
+                    }
+                ],
+                "relations": [],
+                "execution": {
+                    "state": "deferred",
+                    "target_issue_number": issue_number,
+                    "predecessors": [],
+                    "defer_reason": (
+                        "issue_execution_decision derivation failed semantic validation: "
+                        + ", ".join(_decision_violations)
+                    ),
+                },
+                "downstream_policy": dict(ISSUE_EXECUTION_DECISION_DOWNSTREAM_POLICY),
+                "completeness": {
+                    "issues_complete": False,
+                    "dependencies_complete": False,
+                    "unresolved_references": [issue_number],
+                },
+            }
+        plan["issue_execution_decision"] = issue_execution_decision
 
         return plan, 0
 

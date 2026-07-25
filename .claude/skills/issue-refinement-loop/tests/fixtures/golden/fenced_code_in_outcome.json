@@ -50,6 +50,38 @@
     "reason_codes": [],
     "required": false
   },
+  "issue_execution_decision": {
+    "completeness": {
+      "dependencies_complete": true,
+      "issues_complete": true,
+      "unresolved_references": []
+    },
+    "downstream_policy": {
+      "freshness_validation": "required",
+      "semantic_reclassification": "forbidden",
+      "stale_action": "rerun_issue_refinement"
+    },
+    "execution": {
+      "defer_reason": null,
+      "predecessors": [],
+      "state": "selected",
+      "target_issue_number": 17
+    },
+    "identity": {
+      "collection_digest": "sha256:a0f3e9961904094bb74f2e946beb567780d049102cb0b9084d3dbedb875d2875",
+      "generated_at": "2025-05-25T12:00:00+00:00",
+      "target_body_sha256": "sha256:89cc0b14040b727f89d6342e0c5ef1d96ba024c855d02551ac5149223a4a1f4d",
+      "target_issue_number": 17
+    },
+    "nodes": [
+      {
+        "body_sha256": "sha256:89cc0b14040b727f89d6342e0c5ef1d96ba024c855d02551ac5149223a4a1f4d",
+        "issue_number": 17
+      }
+    ],
+    "relations": [],
+    "schema_version": "ISSUE_EXECUTION_DECISION_V1"
+  },
   "schema_version": "refinement_loop_plan/v1",
   "source": {
     "comments_sha256": null,

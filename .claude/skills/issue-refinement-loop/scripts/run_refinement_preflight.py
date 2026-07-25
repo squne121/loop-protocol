@@ -83,6 +83,23 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# #1677 AC4/AC12: reuse plan_refinement_loop.py's normative semantic
+# validator instead of re-implementing ISSUE_EXECUTION_DECISION_V1
+# invariants here. Import is best-effort (subprocess/CLI callers of this
+# module do not require it; only _join_scope_rollup_into_planner_input's
+# self-check below uses it).
+# ---------------------------------------------------------------------------
+
+import sys as _sys_for_import
+
+_sys_for_import.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from plan_refinement_loop import validate_issue_execution_decision
+except ImportError:  # pragma: no cover - defensive fallback
+    validate_issue_execution_decision = None
+
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -835,6 +852,52 @@ def _validate_anchor_comments_batch(
 # ---------------------------------------------------------------------------
 # Planner invocation
 # ---------------------------------------------------------------------------
+
+
+
+def _load_scope_rollup_artifact(repo_root: Path, issue_number: int) -> Optional[dict]:
+    """
+    Load a previously-persisted ISSUE_SCOPE_ROLLUP_PLAN_V2 artifact for this
+    Issue, if one exists (#1677 AC4 join). Rerunning plan_issue_scope_rollup.py
+    itself is out of scope here (#1677 Out of Scope); this function only
+    consumes an artifact that a prior preflight step already produced.
+
+    Returns None (non-blocking) when no artifact is present or it fails to
+    parse -- absence of scope-rollup evidence must not block the refinement
+    preflight, it only means the planner falls back to a minimal
+    ISSUE_EXECUTION_DECISION_V1 ('selected', no relations).
+    """
+    artifact_path = _issue_artifact_dir(repo_root, issue_number) / "issue_scope_rollup_plan_v2.json"
+    if not artifact_path.exists():
+        return None
+    try:
+        return json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _join_scope_rollup_into_planner_input(
+    planner_input: dict[str, Any],
+    scope_rollup_plan: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Join an ISSUE_SCOPE_ROLLUP_PLAN_V2 artifact into planner_input's
+    known_context.scope_rollup_result (#1677 AC4).
+
+    plan_refinement_loop.py's build_issue_execution_decision() reads
+    known_context['scope_rollup_result'] to derive ISSUE_EXECUTION_DECISION_V1
+    relations/execution state. Without this join, the planner always emits
+    the minimal 'selected' shape regardless of known collisions.
+
+    Pure function: does not mutate the input dict in place.
+    """
+    if not scope_rollup_plan:
+        return planner_input
+    joined = dict(planner_input)
+    known_context = dict(joined.get("known_context") or {})
+    known_context["scope_rollup_result"] = scope_rollup_plan
+    joined["known_context"] = known_context
+    return joined
 
 
 def _build_planner_input(
@@ -1908,6 +1971,11 @@ def run_preflight(
         anchor_comment_ids=anchor_comment_ids,
         now=now,
     )
+    # #1677 AC4: join a previously-persisted scope-rollup artifact (if any)
+    # into the planner input so ISSUE_EXECUTION_DECISION_V1 reflects known
+    # collisions instead of always defaulting to 'selected'.
+    _scope_rollup_plan = _load_scope_rollup_artifact(repo_root, issue_number)
+    planner_input_dict = _join_scope_rollup_into_planner_input(planner_input_dict, _scope_rollup_plan)
     plan, planner_exit_code, planner_stderr, planner_stdout_raw = _invoke_planner(planner_input_dict)
 
     if plan is None:
