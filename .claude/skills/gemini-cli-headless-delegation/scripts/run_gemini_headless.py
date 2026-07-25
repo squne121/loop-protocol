@@ -2915,6 +2915,21 @@ def _normalize_agy_result(
     is_ci = os.environ.get("CI", "").lower() in {"1", "true", "yes", "on"}
     warnings = list(request_warnings or [])
 
+    # Issue #1752: `_run_agy()` attaches `agy_provenance_hook_events` /
+    # `agy_provenance_hook_load_error` as dynamic attributes on `completed`
+    # (see `_run_agy()` docstring above) *before* the isolated workspace is
+    # removed, so the values are still valid in-memory at this point even
+    # though the on-disk `_provenance/hook_events.jsonl` file itself is gone
+    # by the time this function runs. Every return branch below must copy
+    # these through to the `delegation_result/v1` dict so that
+    # `run_delegation()` callers (e.g. `build_fanout_evidence_bundle.py`) can
+    # rebuild a hook-events bundle without re-reading the (already deleted)
+    # workspace. `getattr(..., default)` keeps this safe for direct/mocked
+    # `CompletedProcess` callers that never went through `_run_agy()` and
+    # therefore never got these attributes attached (AC4).
+    agy_provenance_hook_events = list(getattr(completed, "agy_provenance_hook_events", []) or [])
+    agy_provenance_hook_load_error = getattr(completed, "agy_provenance_hook_load_error", None)
+
     if completed.returncode != 0:
         # Issue #1270: classify quota/capacity/auth/permission failures
         # generically from stdout+stderr instead of always defaulting to
@@ -2946,6 +2961,8 @@ def _normalize_agy_result(
             "model_chain": [],
             "model_downgrades": [],
             "attempts_by_model": {"agy-default": 1},
+            "agy_provenance_hook_events": agy_provenance_hook_events,
+            "agy_provenance_hook_load_error": agy_provenance_hook_load_error,
         }
 
     if not stdout:
@@ -2975,6 +2992,8 @@ def _normalize_agy_result(
             "model_chain": [],
             "model_downgrades": [],
             "attempts_by_model": {"agy-default": 1},
+            "agy_provenance_hook_events": agy_provenance_hook_events,
+            "agy_provenance_hook_load_error": agy_provenance_hook_load_error,
         }
 
     grounded_research_evidence = (
@@ -3019,6 +3038,8 @@ def _normalize_agy_result(
         "model_chain": [],
         "model_downgrades": [],
         "attempts_by_model": {"agy-default": 1},
+        "agy_provenance_hook_events": agy_provenance_hook_events,
+        "agy_provenance_hook_load_error": agy_provenance_hook_load_error,
     }
 
 
