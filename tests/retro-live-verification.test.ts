@@ -1374,3 +1374,59 @@ describe('Issue #1415 dual-target bundle (retro_live_verification/v3, additive s
     expect(result.status).not.toBe(0)
   })
 })
+
+describe('Issue #1415 P0-3 fix_delta: generate-retro-live-verification.mjs --schema-version v3 producer branch', () => {
+  const ISSUE_TARGET_JSON = resolvePath(FIXTURES_DIR, 'dual-target-generator-issue-target.json')
+  const PR_TARGET_JSON = resolvePath(FIXTURES_DIR, 'dual-target-generator-pull-request-target.json')
+
+  it('GIVEN --schema-version v3 with valid per-target JSON files WHEN the generator CLI runs THEN it emits a schema-valid retro_live_verification/v3 bundle to stdout', () => {
+    const result = spawnSync(
+      'node',
+      [
+        resolvePath(REPO_ROOT, 'scripts/generate-retro-live-verification.mjs'),
+        '--schema-version', 'v3',
+        '--repo', 'squne121/loop-protocol',
+        '--parent-issue', '1153',
+        '--issue-target-json', ISSUE_TARGET_JSON,
+        '--pull-request-target-json', PR_TARGET_JSON,
+        '--out', '-',
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).toBe(0)
+    const bundle = JSON.parse(result.stdout.trim())
+    expect(bundle.schema).toBe('retro_live_verification/v3')
+    expect(bundle.issue_target.number).toBe(1153)
+    expect(bundle.pull_request_target.number).toBe(1411)
+    expect(bundle.execution.command_args_digest).toMatch(/^sha256:[a-f0-9]{64}$/)
+    expect(bundle.safety.raw_values_emitted).toBe(false)
+  })
+
+  it('GIVEN --schema-version v3 without --pull-request-target-json WHEN the generator CLI runs THEN it exits non-zero with a usage error rather than emitting a partial bundle', () => {
+    const result = spawnSync(
+      'node',
+      [
+        resolvePath(REPO_ROOT, 'scripts/generate-retro-live-verification.mjs'),
+        '--schema-version', 'v3',
+        '--repo', 'squne121/loop-protocol',
+        '--parent-issue', '1153',
+        '--issue-target-json', ISSUE_TARGET_JSON,
+        '--out', '-',
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).not.toBe(0)
+  })
+
+  it('GIVEN zero CLI args (no --schema-version) WHEN the generator CLI runs THEN it still falls back to the v2 argument-free fixture default, unaffected by the v3 branch addition', () => {
+    const result = spawnSync(
+      'node',
+      [resolvePath(REPO_ROOT, 'scripts/generate-retro-live-verification.mjs')],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).toBe(0)
+    const payload = JSON.parse(result.stdout.trim())
+    expect(payload.schema).toBe('retro_live_verification/v2')
+    expect(payload.status).toBe('ok')
+  })
+})
