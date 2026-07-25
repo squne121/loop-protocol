@@ -396,6 +396,21 @@ child process に親 env をそのまま継承せず、`PATH` / `HOME` / locale 
 - その場合は allowlist 拡張の可否を人間レビューで判断する
 - stdout / stderr sample は redact-before-truncate の順序で保存する
 
+### `materialize_isolated_agy_workspace()` の環境変数 allowlist 拡張（Issue #1726）
+
+`agy_permission_policy.py` の `materialize_isolated_agy_workspace()` は、`PATH` / `LANG` / `LC_ALL` / `TERM` に加え、
+既存の認証済みセッション（system keyring / dbus secret service）へ子プロセスが到達できるよう
+`DBUS_SESSION_BUS_ADDRESS` と `XDG_RUNTIME_DIR` を環境変数 allowlist に追加している。
+
+- `DBUS_SESSION_BUS_ADDRESS`（例: `unix:path=/run/user/1000/bus`）と `XDG_RUNTIME_DIR`（例: `/run/user/1000`）は
+  いずれも Unix ソケットパス／ソケットディレクトリパスという *接続先エンドポイント* の値であり、
+  credential 値（token 文字列・cookie・鍵の内容）そのものではない
+- 上記2変数の追加後も `HOME` / `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` / `XDG_STATE_HOME` は
+  isolated tmp workspace 配下へ差し替えたまま維持しており（#1705 の secret-hygiene 設計の根幹は不変）、
+  `dbus_session_bus_present` / `xdg_runtime_dir_present`（上記 `auth_diagnostics_metadata`）が
+  `true` になった状態で isolated workspace 内から到達性が確認できることを
+  `test_agy_permission_policy_env_allowlist.py` の hermetic テスト（モック化した dbus/keyring エンドポイント）で回帰確認する
+
 ## Live Evidence 保存方針 / 証跡保存ルール
 
 `docs/dev/agy-cli-contract-20260701.md` は手書きメモではなく、sanitized `preflight_agy.py --json` 出力を要約する一次証跡として維持する。
