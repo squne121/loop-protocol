@@ -74,7 +74,13 @@ import {
   GhCliIssueCommentsClient,
   listAllIssueCommentsStructured,
 } from './agent-logs/lib/github-comments.mjs'
-import { canonicalJsonStringify, sha256Hex, validateManifestWithAjv } from './generate-retro-live-verification.mjs'
+import {
+  CANONICALIZATION_PROFILE_LOOP_V1,
+  canonicalJsonStringify,
+  computeResolvedCommentSetDigest,
+  sha256Hex,
+  validateManifestWithAjv,
+} from './generate-retro-live-verification.mjs'
 
 export const SCHEMA = 'retro_live_verification_check_result/v1'
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
@@ -117,6 +123,11 @@ const CLI_OPTION_SPEC = {
   // --posted-at (or "now" when omitted) exceeds the given number of seconds.
   '--max-capture-to-post-lag-seconds': { key: 'maxCaptureToPostLagSeconds' },
   '--posted-at': { key: 'postedAt' },
+  // Issue #1415 AC8-9 (additive, optional gate): recompute
+  // resolved_comment_set_digest from an independently-supplied comment-set
+  // JSON file and compare against the value stored in the manifest.
+  '--recompute-digests': { key: 'recomputeDigests', defaultValue: 'false' },
+  '--comment-set-json': { key: 'commentSetJson' },
 }
 
 /**
@@ -174,6 +185,34 @@ function normalizeMaxLagSeconds(value) {
     throw usageError('retro_live_verification_check.max_capture_to_post_lag_seconds', 'max-capture-to-post-lag-seconds must be a non-negative integer')
   }
   return Number(value)
+}
+
+/**
+ * Issue #1415 AC8-9: recomputes `resolved_comment_set_digest` from an
+ * independently-supplied comment-set (never from the manifest's own stored
+ * digest, and never from the same resolver invocation that produced the
+ * manifest -- the caller is expected to have fetched `commentSet` fresh) and
+ * compares it byte-exact against `manifest.resolved_comment_set_digest`.
+ * Fails closed if the manifest field is absent (nothing to recompute
+ * against) or the canonicalization_profile does not match.
+ */
+export function evaluateResolvedCommentSetDigest({ manifest, commentSet }) {
+  const stored = manifest?.resolved_comment_set_digest
+  if (stored === null || stored === undefined) {
+    return { ok: false, errors: [{ code: 'retro_live_verification_check.resolved_comment_set_digest_missing', message: 'manifest.resolved_comment_set_digest is required when --recompute-digests is passed' }] }
+  }
+  if (stored.canonicalization_profile !== CANONICALIZATION_PROFILE_LOOP_V1) {
+    return { ok: false, errors: [{ code: 'retro_live_verification_check.resolved_comment_set_digest_profile_mismatch', message: `manifest.resolved_comment_set_digest.canonicalization_profile ${JSON.stringify(stored.canonicalization_profile)} does not match expected ${JSON.stringify(CANONICALIZATION_PROFILE_LOOP_V1)}` }] }
+  }
+  const recomputed = computeResolvedCommentSetDigest({
+    repoId: commentSet?.repo_id ?? null,
+    targetNodeId: commentSet?.target_node_id ?? null,
+    comments: commentSet?.comments ?? [],
+  })
+  if (recomputed !== stored.digest) {
+    return { ok: false, errors: [{ code: 'retro_live_verification_check.resolved_comment_set_digest_mismatch', message: `recomputed resolved_comment_set_digest ${recomputed} does not match manifest value ${stored.digest}` }] }
+  }
+  return { ok: true, errors: [] }
 }
 
 /**
@@ -696,7 +735,18 @@ async function runCli() {
     errors.push(...captureToPostLagCheck.errors)
   }
 
-  const ok = commentCheck.ok && contextAssertionsCheck.ok && prReviewBindingCheck.ok && prReviewSurfaceCheck.ok && runtimeProvenanceCheck.ok && captureToPostLagCheck.ok
+  // Issue #1415 AC8-9 (additive, optional gate).
+  let resolvedCommentSetDigestCheck = { ok: true, errors: [] }
+  if (parseBooleanFlag(options.recomputeDigests)) {
+    if (!options.commentSetJson) {
+      throw usageError('retro_live_verification_check.comment_set_json_required', '--comment-set-json is required when --recompute-digests is true')
+    }
+    const commentSet = await loadJsonFile(options.commentSetJson, 'retro_live_verification_check.comment_set_json_invalid')
+    resolvedCommentSetDigestCheck = evaluateResolvedCommentSetDigest({ manifest, commentSet })
+    errors.push(...resolvedCommentSetDigestCheck.errors)
+  }
+
+  const ok = commentCheck.ok && contextAssertionsCheck.ok && prReviewBindingCheck.ok && prReviewSurfaceCheck.ok && runtimeProvenanceCheck.ok && captureToPostLagCheck.ok && resolvedCommentSetDigestCheck.ok
   process.stdout.write(`${JSON.stringify({
     schema: SCHEMA,
     verification_status: ok ? 'pass' : 'fail',

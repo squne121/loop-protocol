@@ -6,10 +6,12 @@ import { parse as parseYaml } from 'yaml'
 import { describe, expect, it } from 'vitest'
 
 import {
+  CANONICALIZATION_PROFILE_LOOP_V1,
   RETRO_LIVE_VERIFICATION_ALLOWED_PATHS,
   buildManifest,
   canonicalJsonStringify,
   computeCanonicalCommentBody,
+  computeResolvedCommentSetDigest,
   fromSha256Prefixed,
   normalizeTrustedActorAllowlist,
   sha256Hex,
@@ -27,6 +29,7 @@ import {
   checkRuntimeProvenanceComplete,
   evaluateContextAssertionsBinding,
   evaluatePrReviewSurfaceBinding,
+  evaluateResolvedCommentSetDigest,
   isPaginationRejected,
   verifyPrReviewBindingLive,
 } from '../scripts/check-retro-live-verification.mjs'
@@ -858,5 +861,108 @@ describe('Issue #1415 AC5-7: evaluatePrReviewSurfaceBinding', () => {
   it('skips the selected-id cross-checks (but still enforces the >=1 minimums) when selected_review_id is null', () => {
     const result = evaluatePrReviewSurfaceBinding({ surface: makeSurface(), prReviewBinding: makeBinding({ selected_review_id: null, selected_review_comment_id: null, selected_review_thread_node_id: null }) })
     expect(result.ok).toBe(true)
+  })
+})
+
+describe('Issue #1415 AC8-9: computeResolvedCommentSetDigest / evaluateResolvedCommentSetDigest', () => {
+  const BASE_COMMENTS = [
+    {
+      surface_kind: 'issue_comment',
+      comment_id: 1,
+      author_id: 63350259,
+      created_at: '2026-07-25T06:00:00Z',
+      updated_at: '2026-07-25T06:00:00Z',
+      body: 'hello',
+    },
+    {
+      surface_kind: 'pr_review',
+      comment_id: 2,
+      author_id: 63350259,
+      created_at: '2026-07-25T06:05:00Z',
+      updated_at: '2026-07-25T06:05:00Z',
+      body: 'lgtm',
+      review_state: 'APPROVED',
+      review_commit_id: 'a'.repeat(40),
+    },
+  ]
+
+  it('is deterministic for the same repo_id/target_node_id/comments input', () => {
+    const first = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    const second = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    expect(first).toBe(second)
+    expect(first).toMatch(/^[a-f0-9]{64}$/u)
+  })
+
+  it('is independent of input comment array order (canonical sort by surface_kind:comment_id)', () => {
+    const forward = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    const reversed = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: [...BASE_COMMENTS].reverse() })
+    expect(forward).toBe(reversed)
+  })
+
+  it('changes when repo_id or target_node_id changes, even with the same comments (binds identity, not just content)', () => {
+    const original = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    const differentRepo = computeResolvedCommentSetDigest({ repoId: 'R_other', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    const differentTarget = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_other', comments: BASE_COMMENTS })
+    expect(differentRepo).not.toBe(original)
+    expect(differentTarget).not.toBe(original)
+  })
+
+  it('changes when updated_at changes (mutable-comment detection) even though body is unchanged', () => {
+    const original = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    const mutated = computeResolvedCommentSetDigest({
+      repoId: 'R_repo',
+      targetNodeId: 'I_target',
+      comments: [{ ...BASE_COMMENTS[0], updated_at: '2026-07-25T07:00:00Z' }, BASE_COMMENTS[1]],
+    })
+    expect(mutated).not.toBe(original)
+  })
+
+  it('changes when body content changes (body digest substitution detection)', () => {
+    const original = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    const bodySwapped = computeResolvedCommentSetDigest({
+      repoId: 'R_repo',
+      targetNodeId: 'I_target',
+      comments: [{ ...BASE_COMMENTS[0], body: 'goodbye' }, BASE_COMMENTS[1]],
+    })
+    expect(bodySwapped).not.toBe(original)
+  })
+
+  it('NFC-normalizes body text before hashing, so canonically-equivalent Unicode is digest-identical', () => {
+    const precomposed = '\u00e9' // U+00E9 LATIN SMALL LETTER E WITH ACUTE (single NFC codepoint)
+    const decomposed = 'e\u0301' // 'e' + U+0301 COMBINING ACUTE ACCENT (NFD form)
+    expect(precomposed).not.toBe(decomposed) // sanity: byte-distinct inputs
+    const precomposedDigest = computeResolvedCommentSetDigest({ repoId: 'R', targetNodeId: 'T', comments: [{ surface_kind: 'issue_comment', comment_id: 1, author_id: 1, created_at: 'x', updated_at: 'x', body: precomposed }] })
+    const decomposedDigest = computeResolvedCommentSetDigest({ repoId: 'R', targetNodeId: 'T', comments: [{ surface_kind: 'issue_comment', comment_id: 1, author_id: 1, created_at: 'x', updated_at: 'x', body: decomposed }] })
+    expect(precomposedDigest).toBe(decomposedDigest)
+  })
+
+  it('evaluateResolvedCommentSetDigest passes when the recomputed digest matches the stored manifest value', () => {
+    const digest = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    const manifest = { resolved_comment_set_digest: { digest, canonicalization_profile: CANONICALIZATION_PROFILE_LOOP_V1 } }
+    const result = evaluateResolvedCommentSetDigest({ manifest, commentSet: { repo_id: 'R_repo', target_node_id: 'I_target', comments: BASE_COMMENTS } })
+    expect(result.ok).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+
+  it('evaluateResolvedCommentSetDigest fails closed when the recomputed digest does not match (tampered/stale comment set)', () => {
+    const digest = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    const manifest = { resolved_comment_set_digest: { digest, canonicalization_profile: CANONICALIZATION_PROFILE_LOOP_V1 } }
+    const result = evaluateResolvedCommentSetDigest({ manifest, commentSet: { repo_id: 'R_repo', target_node_id: 'I_target', comments: [{ ...BASE_COMMENTS[0], body: 'tampered' }, BASE_COMMENTS[1]] } })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.resolved_comment_set_digest_mismatch')
+  })
+
+  it('evaluateResolvedCommentSetDigest fails closed when the manifest has no resolved_comment_set_digest to recompute against', () => {
+    const result = evaluateResolvedCommentSetDigest({ manifest: {}, commentSet: { repo_id: 'R_repo', target_node_id: 'I_target', comments: BASE_COMMENTS } })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.resolved_comment_set_digest_missing')
+  })
+
+  it('evaluateResolvedCommentSetDigest fails closed on a canonicalization_profile mismatch', () => {
+    const digest = computeResolvedCommentSetDigest({ repoId: 'R_repo', targetNodeId: 'I_target', comments: BASE_COMMENTS })
+    const manifest = { resolved_comment_set_digest: { digest, canonicalization_profile: 'some-other-profile-v1' } }
+    const result = evaluateResolvedCommentSetDigest({ manifest, commentSet: { repo_id: 'R_repo', target_node_id: 'I_target', comments: BASE_COMMENTS } })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.resolved_comment_set_digest_profile_mismatch')
   })
 })

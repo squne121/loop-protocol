@@ -117,6 +117,76 @@ export function sha256Hex(text) {
   return createHash('sha256').update(text, 'utf8').digest('hex')
 }
 
+/**
+ * Issue #1415 AC8-9 / P1-6: versioned canonicalization profile used only for
+ * the new `resolved_comment_set_digest` (never for the pre-existing v2
+ * `body_digest`/`expected_payload_digest`, which keep using the unversioned
+ * `canonicalize`/`canonicalJsonStringify` above -- no migration is required
+ * for those). `loop-canonical-json-v1` differs from plain `canonicalize` in
+ * one respect: string values are NFC-normalized before hashing, so two byte-
+ * distinct-but-canonically-equivalent Unicode representations of the same
+ * text (e.g. combining-character sequences vs precomposed characters) always
+ * hash identically. Key sort order, array order, and null/absent handling
+ * are otherwise identical to `canonicalize`. This is a same-repo canonical
+ * JSON convention, not a claim of RFC 8785 (JCS) compliance.
+ */
+export const CANONICALIZATION_PROFILE_LOOP_V1 = 'loop-comment-set-canonical-json-v1'
+
+export function canonicalizeLoopV1(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => canonicalizeLoopV1(item))
+  }
+  if (typeof value === 'string') {
+    return value.normalize('NFC')
+  }
+  if (value !== null && typeof value === 'object') {
+    const sortedKeys = Object.keys(value).sort()
+    const result = {}
+    for (const key of sortedKeys) {
+      result[key] = canonicalizeLoopV1(value[key])
+    }
+    return result
+  }
+  return value
+}
+
+export function canonicalJsonStringifyLoopV1(value) {
+  return JSON.stringify(canonicalizeLoopV1(value))
+}
+
+/**
+ * Issue #1415 AC8-9: `resolved_comment_set_digest` must bind more than the
+ * comment URL set -- it must bind identity (repo/target/comment ids),
+ * authorship, timestamps, and body content, using `loop-canonical-json-v1`.
+ * Each entry in `comments` is reduced to a fixed canonical tuple shape
+ * before hashing, so callers cannot accidentally widen/narrow the bound
+ * field set by passing extra/fewer object keys through unnoticed -- any
+ * field not in this explicit list is dropped, and any of these fields being
+ * absent becomes an explicit `null` (never "key absent", which would let a
+ * pre/post comparison silently ignore a field that stopped being reported).
+ */
+export function computeResolvedCommentSetDigest({ repoId, targetNodeId, comments }) {
+  const tuples = (comments ?? []).map((comment) => ({
+    repo_id: repoId ?? null,
+    target_node_id: targetNodeId ?? null,
+    surface_kind: comment.surface_kind ?? null,
+    comment_id: comment.comment_id ?? null,
+    author_id: comment.author_id ?? null,
+    created_at: comment.created_at ?? null,
+    updated_at: comment.updated_at ?? null,
+    body_sha256: comment.body != null ? sha256Hex(comment.body.normalize('NFC')) : (comment.body_sha256 ?? null),
+    review_state: comment.review_state ?? null,
+    review_commit_id: comment.review_commit_id ?? null,
+    thread_resolved: comment.thread_resolved ?? null,
+  }))
+  tuples.sort((left, right) => {
+    const leftKey = `${left.surface_kind}:${left.comment_id}`
+    const rightKey = `${right.surface_kind}:${right.comment_id}`
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0
+  })
+  return sha256Hex(canonicalJsonStringifyLoopV1({ canonicalization_profile: CANONICALIZATION_PROFILE_LOOP_V1, tuples }))
+}
+
 export function buildOwnershipMarker({ repo, issueNumber }) {
   return `<!-- retro_live_verification:v1 repo=${repo} issue=${issueNumber} -->`
 }

@@ -35,6 +35,9 @@
     },
     "canonicalization_profile": {
       "$ref": "#/$defs/canonicalizationProfile"
+    },
+    "resolved_comment_set_digest": {
+      "$ref": "#/$defs/resolvedCommentSetDigest"
     }
   },
   "$defs": {
@@ -281,6 +284,23 @@
         "digest_encoding": {
           "type": "string",
           "const": "sha256-hex"
+        }
+      }
+    },
+    "resolvedCommentSetDigest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "digest",
+        "canonicalization_profile"
+      ],
+      "properties": {
+        "digest": {
+          "$ref": "#/$defs/sha256Digest"
+        },
+        "canonicalization_profile": {
+          "type": "string",
+          "const": "loop-comment-set-canonical-json-v1"
         }
       }
     }
