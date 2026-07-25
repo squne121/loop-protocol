@@ -479,7 +479,7 @@ def guard_ac_vc_alignment(body: str, issue_kind: str, template_dir=None) -> dict
     if ac_count == 0:
         passed = True
     else:
-        passed = sorted(ac_numbers) == sorted(vc_numbers)
+        passed = set(ac_numbers) == set(vc_numbers)
 
     return {
         "name": "ac_vc_alignment",
@@ -952,7 +952,7 @@ def main() -> None:
         if ac_count == 0:
             passed = True
         else:
-            passed = sorted(ac_numbers) == sorted(vc_numbers)
+            passed = set(ac_numbers) == set(vc_numbers)
         results.append({
             "name": "ac_vc_alignment",
             "passed": passed,
