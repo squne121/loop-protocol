@@ -1236,7 +1236,8 @@ describe('Issue #1415 dual-target bundle (retro_live_verification/v3, additive s
   })
 
   it('GIVEN a bundle missing pull_request_target entirely WHEN validated THEN it fails closed (never treated as issue-only)', async () => {
-    const { pull_request_target: _omit, ...withoutPrTarget } = VALID_BUNDLE
+    const withoutPrTarget: Record<string, unknown> = { ...VALID_BUNDLE }
+    delete withoutPrTarget.pull_request_target
     const result = await validateAgainstSchemaFile(DUAL_TARGET_SCHEMA_FILE, withoutPrTarget)
     expect(result.valid).toBe(false)
   })
@@ -1299,7 +1300,8 @@ describe('Issue #1415 dual-target bundle (retro_live_verification/v3, additive s
   })
 
   it('GIVEN a structurally invalid bundle (missing issue_target) WHEN checkDualTargetBundle runs THEN it fails closed at the schema stage without attempting to dereference the missing target (no crash, no false pass)', async () => {
-    const { issue_target: _omit, ...withoutIssueTarget } = VALID_BUNDLE
+    const withoutIssueTarget: Record<string, unknown> = { ...VALID_BUNDLE }
+    delete withoutIssueTarget.issue_target
     const result = await checkDualTargetBundle(withoutIssueTarget, {
       executionProfile: 'fixture',
       fixtureResolveResultJsonIssueTarget: ISSUE_RESOLVE_RESULT,
