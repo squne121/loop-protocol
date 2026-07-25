@@ -390,6 +390,20 @@ LOCAL_ASSET_RESEARCH_PROFILE = "local_asset_research"
 GROUNDED_RESEARCH_PROFILE = "grounded_research"
 PROPOSAL_ONLY_PROFILE = "proposal_only"
 GITHUB_RESEARCH_PROFILE = "github_research"
+
+# Issue #1749: `agy -p` headless print mode's default model (Gemini 3.x) does
+# not reliably invoke the declared `search_web` / `read_url_content` tools --
+# it narrates a plausible-looking "I searched..." answer instead of emitting a
+# real tool call (hallucination), even with `--dangerously-skip-permissions`.
+# Live investigation (see
+# `.claude/skills/gemini-cli-headless-delegation/references/agy-headless-tool-use-investigation.md`)
+# found that passing `--model claude-sonnet-4-6` makes `agy -p` reliably call
+# the declared tools in headless print mode, producing verifiable
+# (non-hallucinated) grounded output with real
+# `vertexaisearch.cloud.google.com/grounding-api-redirect/...` citation URLs.
+# This constant is only applied to the `grounded_research` tool_profile's
+# `agy -p` invocation; it does not change any other profile's model routing.
+AGY_GROUNDED_RESEARCH_MODEL = "claude-sonnet-4-6"
 SERENA_TOOL_CONTRACT_UNKNOWN_POLICY = "exact_match"
 LOCAL_ASSET_MAX_CONTEXT_FILES = 32
 LOCAL_ASSET_MAX_CONTEXT_BYTES = 200_000
@@ -2482,6 +2496,12 @@ def _run_agy(
     agy_bin = str(os.environ.get("AGY_BIN") or "agy")
     command = [agy_bin, "-p", prompt]
     tool_profile = _AGY_TOOL_PROFILE_CTX.get()
+    if tool_profile == GROUNDED_RESEARCH_PROFILE:
+        # Issue #1749: force a model that actually calls the declared
+        # search_web/read_url_content tools in headless print mode instead
+        # of hallucinating a "searched" answer. See AGY_GROUNDED_RESEARCH_MODEL
+        # docstring above for the live-investigation evidence.
+        command = [agy_bin, "-p", prompt, "--model", AGY_GROUNDED_RESEARCH_MODEL]
     if tool_profile in _agy_permission_policy.ALLOWED_PROFILES:
         workspace = _agy_permission_policy.materialize_isolated_agy_workspace(tool_profile)
         env = dict(workspace.env)
@@ -2884,16 +2904,46 @@ def _normalize_agy_result(
     tool_profile: str,
     requested_model: str | None,
     request_warnings: list[str] | None = None,
+    parent_run_id: str | None = None,
+    subtask_id: str | None = None,
+    attempt_id: str | None = None,
 ) -> dict[str, Any]:
     """Normalize agy subprocess result into delegation_result/v1 shape.
 
     Does NOT use _parse_envelope() — agy stdout is plain text.
     Always includes provider="agy" and safety_mode="degraded_wrapper_only".
+
+    Issue #1753: ``parent_run_id`` / ``subtask_id`` / ``attempt_id`` are the
+    fan-out correlation ids (``fan_out_orchestrator.run_fanout()`` stamps
+    these onto each subtask request; see ``_is_fanout_correlated_request()``)
+    and are copied verbatim onto every ``delegation_result/v1`` top-level
+    dict this function returns, so that ``validate_agy_fanout_e2e_evidence.py``
+    predicate_19 (``run_ids_consistent_across_all_artifacts``) can read them
+    directly from the result without unpacking the nested
+    ``local_asset_retrieval_metadata`` copy (Issue #1706). Standalone
+    (non-fan-out) callers never pass these keyword arguments, so the values
+    default to ``None`` — an optional, purely additive field with no effect
+    on any other existing key/value.
     """
     stdout = (completed.stdout or "").strip()
     stderr_text = (completed.stderr or "").strip()
     is_ci = os.environ.get("CI", "").lower() in {"1", "true", "yes", "on"}
     warnings = list(request_warnings or [])
+
+    # Issue #1752: `_run_agy()` attaches `agy_provenance_hook_events` /
+    # `agy_provenance_hook_load_error` as dynamic attributes on `completed`
+    # (see `_run_agy()` docstring above) *before* the isolated workspace is
+    # removed, so the values are still valid in-memory at this point even
+    # though the on-disk `_provenance/hook_events.jsonl` file itself is gone
+    # by the time this function runs. Every return branch below must copy
+    # these through to the `delegation_result/v1` dict so that
+    # `run_delegation()` callers (e.g. `build_fanout_evidence_bundle.py`) can
+    # rebuild a hook-events bundle without re-reading the (already deleted)
+    # workspace. `getattr(..., default)` keeps this safe for direct/mocked
+    # `CompletedProcess` callers that never went through `_run_agy()` and
+    # therefore never got these attributes attached (AC4).
+    agy_provenance_hook_events = list(getattr(completed, "agy_provenance_hook_events", []) or [])
+    agy_provenance_hook_load_error = getattr(completed, "agy_provenance_hook_load_error", None)
 
     if completed.returncode != 0:
         # Issue #1270: classify quota/capacity/auth/permission failures
@@ -2926,6 +2976,11 @@ def _normalize_agy_result(
             "model_chain": [],
             "model_downgrades": [],
             "attempts_by_model": {"agy-default": 1},
+            "agy_provenance_hook_events": agy_provenance_hook_events,
+            "agy_provenance_hook_load_error": agy_provenance_hook_load_error,
+            "parent_run_id": parent_run_id,
+            "subtask_id": subtask_id,
+            "attempt_id": attempt_id,
         }
 
     if not stdout:
@@ -2955,6 +3010,11 @@ def _normalize_agy_result(
             "model_chain": [],
             "model_downgrades": [],
             "attempts_by_model": {"agy-default": 1},
+            "agy_provenance_hook_events": agy_provenance_hook_events,
+            "agy_provenance_hook_load_error": agy_provenance_hook_load_error,
+            "parent_run_id": parent_run_id,
+            "subtask_id": subtask_id,
+            "attempt_id": attempt_id,
         }
 
     grounded_research_evidence = (
@@ -2999,6 +3059,11 @@ def _normalize_agy_result(
         "model_chain": [],
         "model_downgrades": [],
         "attempts_by_model": {"agy-default": 1},
+        "agy_provenance_hook_events": agy_provenance_hook_events,
+        "agy_provenance_hook_load_error": agy_provenance_hook_load_error,
+        "parent_run_id": parent_run_id,
+        "subtask_id": subtask_id,
+        "attempt_id": attempt_id,
     }
 
 
@@ -3182,6 +3247,9 @@ def _normalize_acp_result(
     tool_profile: str,
     request_warnings: list[str],
     model_chain: list[str] | None = None,
+    parent_run_id: str | None = None,
+    subtask_id: str | None = None,
+    attempt_id: str | None = None,
 ) -> dict[str, Any]:
     """Normalize a ``run_acp()`` result into a ``delegation_result/v1`` shape.
 
@@ -3227,6 +3295,9 @@ def _normalize_acp_result(
         "model_chain": resolved_chain,
         "model_downgrades": [],
         "raw_command": _resolve_acp_raw_command(),
+        "parent_run_id": parent_run_id,
+        "subtask_id": subtask_id,
+        "attempt_id": attempt_id,
         "transport_details": {
             "schema": raw_acp.get("schema", "acp_result_v1"),
             "structured_events": raw_acp.get("structured_events") or [],
@@ -4120,6 +4191,9 @@ def _run_delegation_core(
             "raw_command": [],
             "model_chain": [],
             "model_downgrades": [],
+            "parent_run_id": request.get("parent_run_id"),
+            "subtask_id": request.get("subtask_id"),
+            "attempt_id": request.get("attempt_id"),
         }
 
     if provider == "agy":
@@ -4155,6 +4229,9 @@ def _run_delegation_core(
                 "raw_command": _build_agy_raw_command(""),
                 "model_chain": [],
                 "model_downgrades": [],
+                "parent_run_id": request.get("parent_run_id"),
+                "subtask_id": request.get("subtask_id"),
+                "attempt_id": request.get("attempt_id"),
             }
         # local_asset_research uses wrapper-side Serena evidence + prompt injection.
         local_asset_retrieval_metadata: dict[str, Any] | None = None
@@ -4205,6 +4282,9 @@ def _run_delegation_core(
                         "raw_command": _build_agy_raw_command(""),
                         "model_chain": [],
                         "model_downgrades": [],
+                        "parent_run_id": request.get("parent_run_id"),
+                        "subtask_id": request.get("subtask_id"),
+                        "attempt_id": request.get("attempt_id"),
                         "local_asset_retrieval_metadata": {
                             "retrieval_status": "failed",
                             "retrieval_mode": "wrapper_read_only_targeted_evidence",
@@ -4334,6 +4414,9 @@ def _run_delegation_core(
                         "raw_command": _build_agy_raw_command(""),
                         "model_chain": [],
                         "model_downgrades": [],
+                        "parent_run_id": request.get("parent_run_id"),
+                        "subtask_id": request.get("subtask_id"),
+                        "attempt_id": request.get("attempt_id"),
                         "local_asset_retrieval_metadata": {
                             "retrieval_status": "failed",
                             "retrieval_mode": "live_serena_mcp",
@@ -4429,6 +4512,9 @@ def _run_delegation_core(
                 "model_chain": [],
                 "model_downgrades": [],
                 "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
+                "parent_run_id": request.get("parent_run_id"),
+                "subtask_id": request.get("subtask_id"),
+                "attempt_id": request.get("attempt_id"),
             }
         except FileNotFoundError:
             return {
@@ -4457,6 +4543,9 @@ def _run_delegation_core(
                 "model_chain": [],
                 "model_downgrades": [],
                 "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
+                "parent_run_id": request.get("parent_run_id"),
+                "subtask_id": request.get("subtask_id"),
+                "attempt_id": request.get("attempt_id"),
             }
         except PermissionError:
             return {
@@ -4493,6 +4582,9 @@ def _run_delegation_core(
                 "model_chain": [],
                 "model_downgrades": [],
                 "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
+                "parent_run_id": request.get("parent_run_id"),
+                "subtask_id": request.get("subtask_id"),
+                "attempt_id": request.get("attempt_id"),
             }
         except Exception as exc:
             return {
@@ -4521,12 +4613,22 @@ def _run_delegation_core(
                 "model_chain": [],
                 "model_downgrades": [],
                 "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
+                "parent_run_id": request.get("parent_run_id"),
+                "subtask_id": request.get("subtask_id"),
+                "attempt_id": request.get("attempt_id"),
             }
         result = _normalize_agy_result(
             agy_completed,
             tool_profile=tool_profile_str,
             requested_model=None,
             request_warnings=request_warnings,
+            # Issue #1753: fan-out correlation ids read straight from the
+            # request (fan_out_orchestrator.run_fanout() stamps these; a
+            # standalone request simply has them absent, so .get() yields
+            # None and delegation_result/v1 stays backward-compatible).
+            parent_run_id=request.get("parent_run_id"),
+            subtask_id=request.get("subtask_id"),
+            attempt_id=request.get("attempt_id"),
         )
         if local_asset_retrieval_metadata is not None:
             result["local_asset_retrieval_metadata"] = local_asset_retrieval_metadata
@@ -4566,6 +4668,13 @@ def _run_delegation_core(
         "raw_command": [],
         "model_chain": [],
         "model_downgrades": [],
+        # Issue #1753: fan-out correlation ids, uniform across every
+        # delegation_result/v1 construction site in this module. base_result
+        # is reused/mutated across every gemini (provider="gemini") branch
+        # below, so setting this once here covers all of them.
+        "parent_run_id": request.get("parent_run_id"),
+        "subtask_id": request.get("subtask_id"),
+        "attempt_id": request.get("attempt_id"),
     }
 
     if validation_errors:
@@ -4726,6 +4835,9 @@ def _run_delegation_core(
             # Non-blocker: pass the computed model chain so the normalized
             # result carries the real chain, not a [actual_model] stub.
             model_chain=list(model_chain),
+            parent_run_id=request.get("parent_run_id"),
+            subtask_id=request.get("subtask_id"),
+            attempt_id=request.get("attempt_id"),
         )
 
     # --- Model chain loop ---
@@ -5116,6 +5228,9 @@ def _provider_auto_unsupported_profile_result(
         "raw_command": [],
         "model_chain": [],
         "model_downgrades": [],
+        "parent_run_id": request.get("parent_run_id"),
+        "subtask_id": request.get("subtask_id"),
+        "attempt_id": request.get("attempt_id"),
         "selected_provider": None,
         "provider_attempts": [],
         "fallback_reason": "stop_if:provider_profile_unsupported",
@@ -5426,6 +5541,11 @@ def main(argv: list[str] | None = None) -> int:
                 "warnings": ["request file must contain a JSON object"],
                 "failure_reason": "request file must contain a JSON object",
                 "raw_command": [],
+                # Issue #1753: request is not a Mapping here, so there is no
+                # source to read fan-out correlation ids from.
+                "parent_run_id": None,
+                "subtask_id": None,
+                "attempt_id": None,
             }
         else:
             result = run_delegation(request, request_path=request_file)

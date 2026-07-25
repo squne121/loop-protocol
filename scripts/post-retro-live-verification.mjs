@@ -33,8 +33,12 @@ import {
   summarizeGithubApiError,
 } from './agent-logs/lib/github-comments.mjs'
 import {
+  canonicalJsonStringify,
   computeCanonicalCommentBody,
+  normalizeTrustedActorAllowlist,
+  normalizeTrustedActorIdAllowlist,
   sha256Hex,
+  validateDualTargetBundleWithAjv,
   validateManifestWithAjv,
 } from './generate-retro-live-verification.mjs'
 
@@ -49,6 +53,181 @@ const CLI_OPTION_SPEC = {
   // v2 login-only trust check is unchanged.
   '--current-actor-id': { key: 'currentActorId' },
   '--dry-run': { key: 'dryRun', defaultValue: 'true' },
+}
+
+// Issue #1415 P0-3 fix_delta (post-#1747 adversarial review): a dedicated
+// dual-target (retro_live_verification/v3) posting branch. `--dual-target-
+// manifest-json` is a distinct flag from v2's `--manifest-json` (never both
+// at once) so the v2 CLI_OPTION_SPEC/runCli() path below is untouched by
+// this addition. The v3 bundle schema (docs/schemas/retro-live-
+// verification-dual-target.schema.json) has no execution_boundary field of
+// its own, so the trusted-actor allowlist is supplied directly on this CLI
+// (same normalizeTrustedActorAllowlist/normalizeTrustedActorIdAllowlist
+// validators the v2 generator already uses) rather than being read back out
+// of the bundle being posted.
+const CLI_OPTION_SPEC_V3 = {
+  '--dual-target-manifest-json': { key: 'dualTargetManifestJson', required: true },
+  '--current-actor': { key: 'currentActor', required: true },
+  '--current-actor-id': { key: 'currentActorId' },
+  '--trusted-actor': { key: 'trustedActor', required: true },
+  '--trusted-actor-id': { key: 'trustedActorId' },
+  '--expected-previous-digest': { key: 'expectedPreviousDigest' },
+  '--dry-run': { key: 'dryRun', defaultValue: 'true' },
+}
+
+export function buildDualTargetOwnershipMarker({ repo, parentIssue }) {
+  return `<!-- retro_live_verification_v3:v1 repo=${repo} issue=${parentIssue} -->`
+}
+
+/**
+ * Mirrors computeCanonicalCommentBody() for the v3 dual-target bundle: the
+ * digested payload is the entire bundle (minus the wrapper's own `schema`
+ * field, which is a version discriminator, not verified content) rather
+ * than v2's { context_assertions, pr_review_binding } pair.
+ */
+export function computeDualTargetCanonicalCommentBody({ bundle, ownershipMarker }) {
+  const { schema: _schema, ...payload } = bundle
+  const canonicalPayloadJson = canonicalJsonStringify(payload)
+  const bodyDigest = sha256Hex(canonicalPayloadJson)
+  const body = [
+    ownershipMarker,
+    `<!-- retro_live_verification_v3_digest:v1 sha256=${bodyDigest} -->`,
+    '',
+    '```json',
+    JSON.stringify(payload, null, 2),
+    '```',
+  ].join('\n')
+  return { body, bodyDigest, canonicalPayloadJson }
+}
+
+function normalizeCurrentActorIdV3(value, code) {
+  if (value === undefined || value === null || value === '') {
+    return null
+  }
+  if (!/^[1-9][0-9]*$/u.test(String(value))) {
+    throw usageError(code, `${code} must be a positive integer`)
+  }
+  return Number(value)
+}
+
+async function runDualTargetCli(rawArgs) {
+  const options = parseArgs(rawArgs, CLI_OPTION_SPEC_V3)
+  const dryRun = parseBooleanFlag(options.dryRun, 'retro_live_verification_v3.dry_run')
+
+  const bundleText = await readFile(options.dualTargetManifestJson, 'utf-8')
+  const bundle = JSON.parse(bundleText)
+  const validation = await validateDualTargetBundleWithAjv(bundle)
+  if (!validation.valid) {
+    process.stdout.write(`${JSON.stringify({ schema: SCHEMA, status: 'error', error_code: 'retro_live_verification_v3.manifest_schema_invalid', errors: validation.errors })}\n`)
+    process.exitCode = 1
+    return
+  }
+
+  const trustedActorAllowlist = normalizeTrustedActorAllowlist(options.trustedActor)
+  const trustedActorIdAllowlist = normalizeTrustedActorIdAllowlist(options.trustedActorId)
+  const currentActorId = normalizeCurrentActorIdV3(options.currentActorId, 'retro_live_verification_v3.current_actor_id')
+  const expectedPreviousDigest = options.expectedPreviousDigest === undefined || options.expectedPreviousDigest === null || options.expectedPreviousDigest === ''
+    ? null
+    : options.expectedPreviousDigest
+
+  const ownershipMarker = buildDualTargetOwnershipMarker({ repo: bundle.repo, parentIssue: bundle.parent_issue })
+  const { body, bodyDigest } = computeDualTargetCanonicalCommentBody({ bundle, ownershipMarker })
+
+  const client = new GhCliIssueCommentsClient()
+  const listing = await listAllIssueCommentsStructured(client, { repo: bundle.repo, issueNumber: bundle.parent_issue })
+  if (isPaginationRejected(listing)) {
+    process.stdout.write(`${JSON.stringify({ schema: SCHEMA, status: 'error', error_code: 'retro_live_verification_v3.pagination_exhausted', errors: [] })}\n`)
+    process.exitCode = 2
+    return
+  }
+
+  // Reuses planPost()'s CAS/trust/duplicate decision core by synthesizing
+  // the subset of a v2 manifest shape it actually reads (execution_boundary,
+  // canonical_comment) from v3-native inputs -- the decision logic is
+  // schema-version-agnostic and should not be duplicated.
+  const syntheticManifest = {
+    execution_boundary: {
+      trusted_actor_allowlist: trustedActorAllowlist,
+      ...(trustedActorIdAllowlist !== null ? { trusted_actor_id_allowlist: trustedActorIdAllowlist } : {}),
+    },
+    canonical_comment: {
+      ownership_marker: ownershipMarker,
+      body_digest: bodyDigest,
+      expected_previous_digest: expectedPreviousDigest,
+    },
+  }
+  const plan = planPost({ manifest: syntheticManifest, existingComments: listing.comments, currentActor: options.currentActor, currentActorId })
+  if (!plan.ok) {
+    process.stdout.write(`${JSON.stringify({ schema: SCHEMA, status: 'error', error_code: plan.errorCode, error_message: plan.errorMessage })}\n`)
+    process.exitCode = 1
+    return
+  }
+
+  if (dryRun || plan.action === 'noop') {
+    process.stdout.write(`${JSON.stringify({
+      schema: SCHEMA,
+      status: 'ok',
+      action: plan.action,
+      dry_run: dryRun,
+      comment_id: plan.existing?.id ?? null,
+      comment_url: plan.existing?.html_url ?? plan.existing?.url ?? null,
+      body_digest: plan.bodyDigest,
+      readback_verified: false,
+    })}\n`)
+    return
+  }
+
+  let written
+  if (plan.action === 'create') {
+    written = await client.createIssueComment({ repo: bundle.repo, issueNumber: bundle.parent_issue, body })
+  } else {
+    written = await client.updateIssueComment({ repo: bundle.repo, commentId: plan.existing.id, body })
+  }
+
+  const commentId = written?.id ?? plan.existing?.id ?? null
+  if (commentId === null) {
+    process.stdout.write(`${JSON.stringify({ schema: SCHEMA, status: 'error', error_code: 'retro_live_verification_v3.write_response_missing_id', error_message: 'GitHub API write response did not include a comment id' })}\n`)
+    process.exitCode = 2
+    return
+  }
+
+  const readback = await client.getIssueComment({ repo: bundle.repo, commentId })
+  const readbackBody = typeof readback?.body === 'string' ? readback.body : ''
+  const readbackDigestOk = readbackBody === body && sha256Hex(readbackBody) === sha256Hex(body)
+  if (!readbackDigestOk) {
+    process.stdout.write(`${JSON.stringify({ schema: SCHEMA, status: 'error', error_code: 'retro_live_verification_v3.post_write_readback_mismatch', error_message: 'post-write readback body did not match the intended canonical comment body byte-for-byte' })}\n`)
+    process.exitCode = 2
+    return
+  }
+
+  const postWriteListing = await listAllIssueCommentsStructured(client, { repo: bundle.repo, issueNumber: bundle.parent_issue })
+  if (isPaginationRejected(postWriteListing)) {
+    process.stdout.write(`${JSON.stringify({ schema: SCHEMA, status: 'error', error_code: 'retro_live_verification_v3.post_write_pagination_exhausted', errors: [] })}\n`)
+    process.exitCode = 2
+    return
+  }
+  const uniqueness = evaluatePostWriteUniqueness({
+    postWriteComments: postWriteListing.comments,
+    ownershipMarker,
+    expectedCommentId: commentId,
+    expectedDigest: plan.bodyDigest,
+  })
+  if (!uniqueness.ok) {
+    process.stdout.write(`${JSON.stringify({ schema: SCHEMA, status: 'error', error_code: uniqueness.errorCode, error_message: uniqueness.errorMessage })}\n`)
+    process.exitCode = 2
+    return
+  }
+
+  process.stdout.write(`${JSON.stringify({
+    schema: SCHEMA,
+    status: 'ok',
+    action: plan.action,
+    dry_run: false,
+    comment_id: commentId,
+    comment_url: readback?.html_url ?? readback?.url ?? written?.html_url ?? written?.url ?? null,
+    body_digest: plan.bodyDigest,
+    readback_verified: true,
+  })}\n`)
 }
 
 /**
@@ -293,9 +472,24 @@ async function runCli() {
   })}\n`)
 }
 
+/**
+ * Issue #1415 P0-3 fix_delta: dispatches to the v3 dual-target posting
+ * branch when `--dual-target-manifest-json` is present, otherwise runs the
+ * unchanged v2 `--manifest-json` path. The two flags are mutually exclusive
+ * by construction (distinct required options in each CLI_OPTION_SPEC), so
+ * this is a pure presence check on the raw argv, not a parsed-option branch.
+ */
+async function runEntrypoint(rawArgs) {
+  if (rawArgs.includes('--dual-target-manifest-json')) {
+    await runDualTargetCli(rawArgs)
+    return
+  }
+  await runCli()
+}
+
 const isDirectExecution = process.argv[1] === fileURLToPath(import.meta.url)
 if (isDirectExecution) {
-  runCli().catch((error) => {
+  runEntrypoint(process.argv.slice(2)).catch((error) => {
     const isCliError = error instanceof CliError
     const githubSummary = summarizeGithubApiError(error)
     process.stdout.write(`${JSON.stringify({

@@ -339,6 +339,47 @@ request の `provider` が `"auto"` の場合のみ、`run_gemini_headless.py` �
 `provider="auto"` の `eligible_profiles` は `no_tools` / `proposal_only` のみで、それ以外の `tool_profile` を指定した場合は
 provider 試行自体を行わず `provider_profile_unsupported`（`fallback_reason: "stop_if:provider_profile_unsupported"`）で即時 fail-closed する。
 
+### `provider=agy` 関連フィールド（条件付き）
+
+`provider` が `"agy"` の場合のみ、`_normalize_agy_result()`（`run_gemini_headless.py`）が
+以下の 2 フィールドを `delegation_result/v1` へ追加する（Issue #1752）。`provider="gemini"`
+の場合はこれらのフィールドは付与されない。
+
+| フィールド | 型 | 必須条件 | 説明 |
+|----------|--|---------|------|
+| `agy_provenance_hook_events` | array&#91;object&#93; | `provider="agy"` の場合は常に存在 | `_run_agy()` が isolated workspace 削除前にメモリへ読み込んだ `agy_tool_provenance_v1` PreToolUse hook event の list（`agy_tool_provenance.load_hook_events()` の戻り値をそのまま転記）。hook イベントが 1 件も記録されなかった場合、または `completed`（`_run_agy` を経由しない直接呼び出し・モックテスト互換）に本属性が存在しない場合は `[]` |
+| `agy_provenance_hook_load_error` | string &#124; null | `provider="agy"` の場合は常に存在 | hook event log の読み込みに失敗した場合の fail-closed エラーメッセージ（`agy_tool_provenance.ProvenanceParseError` 由来）。エラーがない場合、または `completed` に本属性が存在しない場合は `null` |
+
+これにより `run_delegation()` の呼び出し元（`build_fanout_evidence_bundle.py` の
+`--hook-events-file` 等）が、`_run_agy()` が既に削除済みの isolated workspace の
+`_provenance/hook_events.jsonl` を再読み込みすることなく、`delegation_result/v1` の
+返り値だけから hook events bundle を組み立てられる。`exit_code != 0` 分岐・stdout 空
+分岐でも同じ 2 フィールドが含まれる（fail-closed 診断のため、失敗時も hook 証跡を
+捨てない）。
+
+### fan-out 相関 ID フィールド（条件付き、Issue #1753）
+
+`run_delegation()` / `_run_delegation_core()` が返す `delegation_result/v1` トップレベルには、
+provider（`gemini` / `agy` / `auto`）・transport（`headless_json` / `acp`）を問わず、常に以下の
+3 フィールドが含まれる（この 3 フィールドの追加は既存フィールドの集合・値に影響しない）。
+
+| フィールド | 型 | 必須条件 | 説明 |
+|----------|--|---------|------|
+| `parent_run_id` | string &#124; null | 常に存在 | `fan_out_orchestrator.run_fanout()` が fan-out 実行全体に付与した run id。fan-out 相関済み request（`_is_fanout_correlated_request()` が true を返す request）ではリクエストと同じ値がそのまま転記される。単体 delegation 呼び出し（fan-out 以外）では `null` |
+| `subtask_id` | string &#124; null | 常に存在 | fan-out 内の当該 subtask を一意に識別する id。単体 delegation 呼び出しでは `null` |
+| `attempt_id` | string &#124; null | 常に存在 | 同一 subtask 内の再試行を識別する id。単体 delegation 呼び出しでは `null` |
+
+値は request の `parent_run_id` / `subtask_id` / `attempt_id`（`fan_out_orchestrator.run_fanout()`
+が各 subtask request にスタンプする値）をそのまま読み取ったもので、この関数群は値を生成・変換しない
+（read-through）。`tool_profile=local_asset_research` の fan-out 相関済み request では、既存の
+`local_asset_retrieval_metadata`（Issue #1706）内にも同じ値のネストしたコピーが含まれるが、この
+トップレベル 3 フィールドはそれとは独立して常に存在する。
+
+`validate_agy_fanout_e2e_evidence.py` の predicate_19（`run_ids_consistent_across_all_artifacts`）は、
+`build_fanout_evidence_bundle.py` が組み立てる bundle 内の各 child の `result.parent_run_id` /
+`result.subtask_id` / `result.attempt_id`（＝この節のフィールド）を `request.*` の対応値および
+`fanout_request.parent_run_id` と突き合わせて相関の一貫性を検証する。
+
 ### `result_surface` の形
 
 `result_surface` は `references/result-surface.md` を正本とし、少なくとも以下を含む:
