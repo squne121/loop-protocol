@@ -411,6 +411,33 @@ child process に親 env をそのまま継承せず、`PATH` / `HOME` / locale 
   `true` になった状態で isolated workspace 内から到達性が確認できることを
   `test_agy_permission_policy_env_allowlist.py` の hermetic テスト（モック化した dbus/keyring エンドポイント）で回帰確認する
 
+### `materialize_isolated_agy_workspace()` の gcloud ADC 露出（Issue #1730）
+
+#1726 で `DBUS_SESSION_BUS_ADDRESS` / `XDG_RUNTIME_DIR` を到達性変数として追加した後も、
+#1494 の live fan-out 実行では全 subtask が `failure_class: "agy_auth_required"` で失敗し続けた。
+原因調査の結果、実行環境の `agy` 認証キャッシュは dbus secret-service ではなく、
+`$HOME/.config/gcloud/application_default_credentials.json` / `$HOME/.config/gcloud/access_tokens.db`
+（gcloud Application Default Credentials、ファイルベース）に依存していることが判明した。
+
+- `materialize_isolated_agy_workspace()` は、実行環境の `$HOME/.config/gcloud` ディレクトリが存在する場合、
+  そのディレクトリを isolated workspace の `XDG_CONFIG_HOME` 配下（`<isolated>/xdg-config/gcloud`）へ
+  symlink として read-only に露出する（`_expose_gcloud_adc_read_only()`）
+- symlink の作成はパス文字列の書き込みのみであり、実装コード自身はファイル内容を一切 open/read しない
+  （`Path.is_dir()` / `Path.is_file()` などの存在確認とパス操作のみ、Issue #1730 AC1/AC5）
+- 露出される範囲は `$HOME/.config/gcloud` 配下のみであり、isolated `HOME` 自体や `.ssh` / `.netrc` /
+  他の `.config/*` アプリなど、他の実 `$HOME` 配下ディレクトリは一切露出されない（AC3）
+- `GOOGLE_APPLICATION_CREDENTIALS` が実行環境に設定済みの場合は、そのパス文字列（credential 値ではない）
+  をそのまま isolated workspace の env へ透過する（AC2）
+- 上記変更後も `HOME` / `XDG_CACHE_HOME` / `XDG_STATE_HOME` の isolated tmp workspace への差し替えは
+  維持されており（#1705 の secret-hygiene 設計の根幹は不変）、tool deny 機構（no_tools/local_asset_research
+  全 deny、grounded_research allowlist 限定）も影響を受けない（AC4）ことを
+  `test_agy_permission_policy_gcloud_adc.py` の hermetic テストで回帰確認する
+- `preflight_agy.py` の `_build_auth_diagnostics()` は `_detect_gcloud_adc()` により
+  `$HOME/.config/gcloud` の存在確認レベルの検出を行い、D-Bus セッションバスが存在しない環境でも
+  `auth_mode: "gcloud_adc_file_based"` を報告できる（AC7、`test_preflight_agy_gcloud_adc.py` で回帰確認）
+- live AGY 実行（`run_fanout()`）が実際に gcloud ADC を使って成功することの動作確認は、本 hermetic 変更の
+  スコープ外であり、#1494 の最終 E2E run に委ねる
+
 ## Live Evidence 保存方針 / 証跡保存ルール
 
 `docs/dev/agy-cli-contract-20260701.md` は手書きメモではなく、sanitized `preflight_agy.py --json` 出力を要約する一次証跡として維持する。
