@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -58,7 +60,6 @@ def test_registry_is_the_only_pnpm_gate_authority():
         ("pnpm", "typecheck:e2e"),
         ("pnpm", "lint:docs"),
         ("pnpm", "retro-live-verification:generate"),
-        ("pnpm", "retro-live-verification:post"),
         ("pnpm", "retro-live-verification:verify"),
     }
     assert baseline._canonical_pnpm_gate(["pnpm", "lint:docs"]) == ("pnpm", "lint:docs")
@@ -177,3 +178,60 @@ def test_repository_manifest_test_script_matches_registry() -> None:
     """
     manifest = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
     assert manifest["scripts"]["test"] == registry.expected_scripts()["test"]
+
+
+def test_retro_live_verification_post_is_not_a_generic_gate():
+    """GIVEN the mutation-capable post command WHEN gates are queried THEN it is absent.
+
+    (Issue #1709 PR review P0-5.) `retro-live-verification:post` can create
+    or update a live GitHub comment; it must never be reachable through this
+    generic, agent-facing gate registry -- only the protected
+    `post-canonical-comment` job in
+    `.github/workflows/retro-live-verification.yml` may invoke it.
+    """
+    assert registry.gate_for_request(["pnpm", "retro-live-verification:post"]) is None
+    assert "retro-live-verification:post" not in registry.expected_scripts()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["pnpm", "retro-live-verification:generate"],
+        ["pnpm", "retro-live-verification:verify"],
+    ],
+)
+def test_retro_live_verification_gates_actually_execute_the_intended_check(
+    argv: list[str],
+):
+    """GIVEN the real repository fixtures WHEN a registered gate is launched THEN it
+    performs its intended validation successfully instead of failing with a CLI
+    usage error.
+
+    (Issue #1709 PR review P0-5, required negative test 8.) Before this fix, the
+    registry never forwarded any argv to the underlying CLI even though both
+    `generate-retro-live-verification.mjs` and `check-retro-live-
+    verification.mjs` have required arguments, so any canonical two-token
+    invocation was guaranteed to fail with a CLI usage error (exit code 2),
+    never to actually run the validation it claims to gate.
+    """
+    launch_argv, evidence, error = registry.prepare_launch(argv, str(REPO_ROOT))
+    assert error is None, error
+    assert evidence is not None
+    result = subprocess.run(
+        launch_argv,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, "CI": "true"},
+    )
+    assert result.returncode == 0, (
+        f"expected the wrapped {argv[1]} gate to exit 0 (real validation, not a "
+        f"usage error); got exit {result.returncode}\nstdout={result.stdout}\n"
+        f"stderr={result.stderr}"
+    )
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload.get("status") == "ok" or payload.get("verification_status") == "pass", (
+        f"gate ran but did not report a passing validation result: {payload}"
+    )
+

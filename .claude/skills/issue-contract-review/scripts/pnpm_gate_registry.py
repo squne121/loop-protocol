@@ -45,9 +45,36 @@ _SCRIPTS = {
         "'CLAUDE.md' 'AGENTS.md' 'SECURITY.md' '.claude/**/*.md'"
     ),
     "validate:roadmap-refs": "node scripts/validate-roadmap-refs.mjs",
-    "retro-live-verification:generate": "node scripts/generate-retro-live-verification.mjs",
-    "retro-live-verification:post": "node scripts/post-retro-live-verification.mjs",
-    "retro-live-verification:verify": "node scripts/check-retro-live-verification.mjs",
+    # Fixed, argument-free wrapper invocations against checked-in fixtures
+    # (Issue #1709 PR review P0-5). The underlying CLIs require repo/target/
+    # digest/review-ref/output-path (generate) or --manifest-json (verify)
+    # arguments that this fail-closed, exact-two-token gate registry never
+    # forwards, so a bare `pnpm retro-live-verification:generate` /
+    # `:verify` with no baked-in arguments would always be a usage error.
+    # `retro-live-verification:post` is a mutation command (it can create/
+    # update a live GitHub comment) and is deliberately NOT registered here;
+    # it must only ever be invoked by the protected
+    # `.github/workflows/retro-live-verification.yml` `post-canonical-
+    # comment` job, never through this generic agent-facing gate registry.
+    "retro-live-verification:generate": (
+        "node scripts/generate-retro-live-verification.mjs "
+        "--repo squne121/loop-protocol --target-type issue --target-number 1 "
+        "--parent-issue 1 "
+        "--marker-comment-url https://github.com/squne121/loop-protocol/issues/1#issuecomment-1 "
+        "--expected-digest sha256:" + ("a" * 64) + " "
+        "--expected-payload-digest sha256:" + ("c" * 64) + " "
+        "--expected-matched-comment-count 1 "
+        "--review-artifact-ref https://github.com/squne121/loop-protocol/pull/1#pullrequestreview-1 "
+        "--reviewed-head-sha " + ("b" * 40) + " "
+        "--issue-number 1 --trusted-actor squne121 "
+        "--out artifacts/retro-live-verification-gate-manifest.json"
+    ),
+    "retro-live-verification:verify": (
+        "node scripts/check-retro-live-verification.mjs "
+        "--manifest-json tests/fixtures/retro-live-verification/gate-manifest.json "
+        "--execution-profile fixture "
+        "--fixture-comments-json tests/fixtures/retro-live-verification/gate-comments.json"
+    ),
 }
 
 _GATES = (
@@ -72,12 +99,6 @@ _GATES = (
         ("pnpm", "retro-live-verification:generate"),
         "retro-live-verification:generate",
         ("retro-live-verification:generate",),
-    ),
-    GateDescriptor(
-        "pnpm.retro-live-verification-post.v1",
-        ("pnpm", "retro-live-verification:post"),
-        "retro-live-verification:post",
-        ("retro-live-verification:post",),
     ),
     GateDescriptor(
         "pnpm.retro-live-verification-verify.v1",
