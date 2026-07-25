@@ -23,6 +23,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
+import prose_boundary_policy as _pbp
+
 # Path to ISSUE_TEMPLATE directory (relative to repo root, resolved at runtime)
 # __file__ is at: <repo>/.claude/skills/create-issue/scripts/validate_issue_body.py
 # parents: [0]=scripts, [1]=create-issue, [2]=skills, [3]=.claude, [4]=<repo root>
@@ -187,30 +189,33 @@ def _get_context_lines(
 
 
 # #1704: Recognises "-"/"*"/"+" task-list bullet markers (not only
-# hyphen), 1-4 spaces between the marker and the checkbox, and any
-# "[ ]"/"[x]"/"[X]" checkbox state. Anchored to the start of the line
-# (optional leading indent only) so that an "AC<N>"-shaped token that
-# merely appears inside prose, a URL, a filename, inline code, or fenced
-# code within the same section is never mistaken for an AC *definition*
-# line (Issue #1704 AC1/AC4).
+# hyphen), 1-4 spaces between the marker and the checkbox, and ONLY a
+# GFM-valid checkbox state ("[ ]"/"[x]"/"[X]", nothing else -- PR #1717
+# review B1). Anchored to the start of the line (up to 3 leading spaces,
+# matching GFM list-marker indentation, not arbitrary leading whitespace)
+# so that an "AC<N>"-shaped token that merely appears in prose, a URL, a
+# filename, inline code, or fenced code within the same section is never
+# mistaken for an AC *definition* line (Issue #1704 AC1/AC4). AC numbers
+# are constrained to ASCII digits ([0-9]+, not \d+) so full-width digit
+# forms (e.g. "AC１２") are never extracted (PR #1717 review B1).
 _AC_DEFINITION_LINE_RE = re.compile(
-    r'^[ \t]*[-*+][ ]{1,4}\[[^\]]*\][ \t]+AC(\d+)\b'
+    r"^ {0,3}[-*+] {1,4}\[[ xX]\][ \t]+AC([0-9]+)\b"
 )
 
 
 def _iter_non_fenced_lines(content: str):
     """Yield (line) for every line in `content` that is NOT inside a
-    fenced code block (``` ... ```). Used so AC-shaped tokens inside
-    fenced code samples are never extracted as AC definitions (#1704 AC4).
+    fenced code block. Delegates fence detection to the shared,
+    GFM-compliant `prose_boundary_policy.iter_markdown_blocks()` SSOT
+    (tilde fences, 4-backtick fences containing literal 3-backtick lines,
+    fence-length/char-type matching, indented code blocks, etc.) instead
+    of a bespoke ``` toggle -- PR #1717 review B2. Used so AC-shaped
+    tokens inside fenced code samples are never extracted as AC
+    definitions (#1704 AC4).
     """
-    in_fence = False
-    for line in content.split('\n'):
-        if line.lstrip().startswith('```'):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
-        yield line
+    for block_text, block_kind in _pbp.iter_markdown_blocks(content):
+        if block_kind != _pbp.BLOCK_KIND_CODE_FENCE:
+            yield from block_text.splitlines()
 
 
 def _extract_ac_numbers(body: str) -> set[str]:
@@ -422,43 +427,24 @@ def _validate_lp002_invalid_machine_readable_contract(body: str) -> list[Validat
     return errors
 
 
-# #1704 AC2: guards against a *vacuous* empty-set match. A checkbox-shaped
-# list-item line uses ANY bullet marker (not just the "-"/"*"/"+" set that
-# `_extract_ac_numbers()` recognises as AC-definition syntax), so if the
-# section contains checkbox-shaped lines but `_extract_ac_numbers()`
-# extracted zero AC numbers, that is an extraction anomaly -- not
-# legitimate evidence that the Issue truly defines zero ACs. Comparing
-# that spurious empty set against an (also legitimately empty) VC
-# reference set must never be treated as a "match".
-_ANY_BULLET_CHECKBOX_LINE_RE = re.compile(r'^[ \t]*\S[ ]{0,4}\[[^\]]*\]')
-
-
-def _has_checkbox_shaped_lines(content: str) -> bool:
-    """True if `content` has at least one checkbox-shaped list-item line
-    (any bullet marker), outside of fenced code blocks."""
-    for line in _iter_non_fenced_lines(content):
-        if _ANY_BULLET_CHECKBOX_LINE_RE.match(line):
-            return True
-    return False
-
-
+# #1704 AC2 / PR #1717 review B3: the previous "vacuous empty-set match"
+# guard (`_has_checkbox_shaped_lines()` matching ANY bullet marker) was
+# itself over-broad -- it matched non-list-marker lines such as Markdown
+# table rows (e.g. "| [ ] | unchecked |"), producing an
+# expected=[]/actual=[] contradictory mismatch even when both the AC and
+# VC sections genuinely define zero ACs. With `_AC_DEFINITION_LINE_RE`
+# now strictly GFM-grammar-bound (B1), the original false-negative this
+# guard was defending against (an all-asterisk/all-plus AC section
+# silently extracting to an empty set) no longer occurs, so the guard is
+# removed rather than patched -- an empty/empty match is always a
+# legitimate pass.
 def _validate_lp010_ac_vc_mismatch(body: str) -> list[ValidationError]:
     """LP010: Detect mismatch between AC and VC numbers."""
     ac_numbers = _extract_ac_numbers(body)
     vc_numbers = _extract_vc_ac_numbers(body)
 
     if ac_numbers == vc_numbers:
-        # #1704 AC2: an empty/empty "match" is vacuous if the AC section
-        # actually contains checkbox-shaped list items that failed to
-        # yield any AC number -- fail closed instead of silently passing.
-        if not ac_numbers:
-            ac_section_info = _extract_section(body, "Acceptance Criteria")
-            if ac_section_info and _has_checkbox_shaped_lines(ac_section_info[0]):
-                pass  # fall through to mismatch reporting below
-            else:
-                return []
-        else:
-            return []
+        return []
 
     # Find which section to report error on
     vc_section_info = _extract_section(body, "Verification Commands")

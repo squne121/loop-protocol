@@ -132,3 +132,85 @@ class TestLp010ErrorDrivesDeterministicFailConfirmed:
         assert artifact["replay_result"]["routing"] == "proceed_to_rewrite"
         assert artifact["replay_result"]["verdict"] != "reviewer_claim_unbacked_by_deterministic_checker"
         assert artifact["replay_result"]["verdict"] != "reviewer_false_positive_suspected"
+
+
+class TestLp010ErrorRepeatedStateStaysDeterministicFailConfirmed:
+    def test_lp010_repeated_replay_of_previous_state_stays_deterministic_fail_confirmed(
+        self, tmp_path: Path
+    ):
+        """GIVEN the same LP010-tripping fixture body and the SAME
+        REVIEWER_BLOCKER_CLAIM_V1 replayed TWICE in a row -- the second
+        call feeds the first call's own `replay_next_state` back in as
+        `previous_state` (simulating a parent orchestrator that persists
+        state across iterations without the underlying Issue body ever
+        changing) -- WHEN `build_parent_replay_binding()` runs both times
+        THEN the second replay's verdict is STILL
+        `deterministic_fail_confirmed` / `proceed_to_rewrite` (never
+        `reviewer_false_positive_suspected` / `human_escalation`), and
+        `consecutive_unbacked_count` in the resulting next_state stays
+        `0` both times (PR #1717 review required_tests: parent replay
+        repeated-state test). A deterministically-backed LP010 finding
+        must never accumulate an "unbacked claim" streak just because
+        the SAME real failure is replayed again."""
+        readiness_result, exit_code = _run_contract_readiness_check(
+            tmp_path, _LP010_TRIPPING_BODY
+        )
+        assert exit_code == 1
+        lp010_errors = [e for e in readiness_result["errors"] if e["rule_id"] == "LP010"]
+        assert len(lp010_errors) > 0
+
+        body_bytes = _LP010_TRIPPING_BODY.encode("utf-8")
+        body_sha256 = "sha256:" + hashlib.sha256(body_bytes).hexdigest()
+        assert readiness_result["body_sha256"] == body_sha256
+
+        reviewer_blocker_claim = {
+            "schema": "REVIEWER_BLOCKER_CLAIM_V1",
+            "body_sha256": body_sha256,
+            "blockers": [
+                {
+                    "reviewer_blocker_code": "lp010",
+                    "message": "AC <=> VC number set mismatch (LP010)",
+                    "line_start": lp010_errors[0]["line_start"],
+                    "line_end": lp010_errors[0]["line_end"],
+                }
+            ],
+        }
+
+        first_artifact = build_parent_replay_binding(
+            reviewer_blocker_claim=reviewer_blocker_claim,
+            readiness_result=readiness_result,
+            vc_syntax_result=None,
+            vc_preflight_result=None,
+            previous_state=None,
+            current_body_bytes=body_bytes,
+            issue_url="https://github.com/squne121/loop-protocol/issues/1415",
+            repository_full_name="squne121/loop-protocol",
+            issue_number=1415,
+            refinement_session_id="test-session-1704-repeat",
+            iteration_id="iteration-1",
+        )
+
+        assert first_artifact["replay_result"]["verdict"] == "deterministic_fail_confirmed"
+        assert first_artifact["replay_result"]["routing"] == "proceed_to_rewrite"
+        assert first_artifact["replay_next_state"]["consecutive_unbacked_count"] == 0
+
+        # Second replay: feed the FIRST call's own next_state back in as
+        # previous_state -- same body, same claim, same lane.
+        second_artifact = build_parent_replay_binding(
+            reviewer_blocker_claim=reviewer_blocker_claim,
+            readiness_result=readiness_result,
+            vc_syntax_result=None,
+            vc_preflight_result=None,
+            previous_state=first_artifact["replay_next_state"],
+            current_body_bytes=body_bytes,
+            issue_url="https://github.com/squne121/loop-protocol/issues/1415",
+            repository_full_name="squne121/loop-protocol",
+            issue_number=1415,
+            refinement_session_id="test-session-1704-repeat",
+            iteration_id="iteration-2",
+        )
+
+        assert second_artifact["replay_result"]["verdict"] == "deterministic_fail_confirmed"
+        assert second_artifact["replay_result"]["routing"] == "proceed_to_rewrite"
+        assert second_artifact["replay_result"]["verdict"] != "reviewer_false_positive_suspected"
+        assert second_artifact["replay_next_state"]["consecutive_unbacked_count"] == 0
