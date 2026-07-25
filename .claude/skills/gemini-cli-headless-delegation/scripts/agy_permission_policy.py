@@ -266,6 +266,17 @@ class IsolatedAgyWorkspace:
     # outside the isolated workspace tree even though its *target* (via
     # symlink) is the real `$HOME/.config/gcloud` directory.
     gcloud_adc_path: "Path | None" = None
+    # Issue #1740: path to the read-only-exposed agy OAuth token file under
+    # this workspace's isolated XDG_CONFIG_HOME
+    # (`<workspace>/xdg-config/antigravity-cli/antigravity-oauth-token`), or
+    # None when the real
+    # `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` did not exist.
+    # Never points outside the isolated workspace tree even though its
+    # *target* (via symlink) is the real token file. This is the actual auth
+    # channel `agy` uses -- neither dbus secret-service (#1726) nor gcloud
+    # ADC (#1730) resolved `agy_auth_required`; see Issue #1740 Source
+    # section for the confirmed diagnosis.
+    agy_oauth_token_path: "Path | None" = None
 
 
 # Issue #1730: gcloud Application Default Credentials (ADC) are cached
@@ -331,6 +342,85 @@ def _expose_gcloud_adc_read_only(xdg_config_home: Path) -> "Path | None":
     link_path = xdg_config_home / GCLOUD_CONFIG_DIRNAME
     try:
         link_path.symlink_to(gcloud_dir, target_is_directory=True)
+    except OSError:
+        return None
+    return link_path
+
+
+# Issue #1740: `agy` (Antigravity CLI) does not authenticate via dbus
+# secret-service (#1726) or gcloud ADC (#1730) -- diagnosis during #1494's
+# third live fan-out attempt confirmed it uses its own OAuth token file,
+# `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` (mode 600).
+# Exposing *only* this file read-only inside the isolated workspace was
+# confirmed sufficient for `agy -p "..."` to exit 0 (see Issue #1740 Source
+# section). `$HOME/.gemini/antigravity-cli/` also contains other mode-600
+# files (`jetski_state.pbtxt`, `history.jsonl`, `settings.json`) that were
+# investigated but are not exposed here: the OAuth token file alone was
+# already confirmed sufficient for auth reachability, and exposing only the
+# minimal necessary subpath keeps the #1705 secret-hygiene design intact.
+ANTIGRAVITY_CLI_DIRNAME = "antigravity-cli"
+AGY_OAUTH_TOKEN_FILENAME = "antigravity-oauth-token"
+
+
+def _real_home_agy_oauth_token_file() -> "Path | None":
+    """Return the real `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`
+    file if it exists.
+
+    Existence-check only (`Path.is_file()`) -- this function never opens or
+    reads the file's content (Issue #1740 AC3: presence and path operations
+    only, no content access).
+    """
+    real_home = os.environ.get("HOME")
+    if not real_home:
+        return None
+    candidate = Path(real_home) / ".gemini" / ANTIGRAVITY_CLI_DIRNAME / AGY_OAUTH_TOKEN_FILENAME
+    try:
+        if candidate.is_file():
+            return candidate
+    except OSError:
+        return None
+    return None
+
+
+def _expose_agy_oauth_token_read_only(xdg_config_home: Path) -> "Path | None":
+    """Expose the real agy OAuth token file under
+    *xdg_config_home*/antigravity-cli/antigravity-oauth-token.
+
+    Issue #1740: because `materialize_isolated_agy_workspace()` fully
+    redirects `HOME`/`XDG_*` into a brand-new isolated tmp workspace, the
+    host's real agy OAuth token file is otherwise structurally unreachable by
+    the isolated `agy` subprocess -- causing `agy_auth_required` failures
+    even when the host already has a valid, existing agy auth session (the
+    same failure class #1726's dbus reachability and #1730's gcloud ADC
+    reachability additions did not resolve).
+
+    This creates a *symlink* (never a copy) from
+    `<isolated>/xdg-config/antigravity-cli/antigravity-oauth-token` to the
+    real `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` file.
+    `Path.symlink_to()` only writes a path string into a new filesystem
+    entry; it never opens or reads a single byte of the target's file
+    contents (AC1/AC3). Only this one file of the real `$HOME` is exposed
+    this way -- the isolated `HOME` itself and every other real `$HOME`
+    subdirectory (`.ssh`, `.netrc`, other `.gemini/*` state, etc.) remain
+    fully isolated and unreachable (AC4).
+
+    Returns `None` (a no-op) when the real
+    `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` file does not
+    exist, or if symlink creation fails for any reason -- agy OAuth token
+    exposure is an additive reachability improvement, never a hard
+    requirement for workspace materialization to succeed (AC2).
+    """
+    token_file = _real_home_agy_oauth_token_file()
+    if token_file is None:
+        return None
+    link_dir = xdg_config_home / ANTIGRAVITY_CLI_DIRNAME
+    try:
+        link_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    link_path = link_dir / AGY_OAUTH_TOKEN_FILENAME
+    try:
+        link_path.symlink_to(token_file)
     except OSError:
         return None
     return link_path
@@ -433,6 +523,11 @@ def materialize_isolated_agy_workspace(
     # path back to any real $HOME content this function ever creates.
     gcloud_adc_path = _expose_gcloud_adc_read_only(xdg_config)
 
+    # Issue #1740 AC1/AC2: expose the real agy OAuth token file (if any) read
+    # only under this workspace's isolated XDG_CONFIG_HOME -- the actual auth
+    # channel `agy` uses; see `_expose_agy_oauth_token_read_only()` docstring.
+    agy_oauth_token_path = _expose_agy_oauth_token_read_only(xdg_config)
+
     return IsolatedAgyWorkspace(
         profile=profile,
         workspace_dir=workspace_dir,
@@ -440,6 +535,7 @@ def materialize_isolated_agy_workspace(
         hook_path=hook_path,
         env=env,
         gcloud_adc_path=gcloud_adc_path,
+        agy_oauth_token_path=agy_oauth_token_path,
     )
 
 
@@ -447,27 +543,38 @@ def find_credential_like_files(workspace: IsolatedAgyWorkspace) -> list[Path]:
     """Return any file under *workspace* whose basename looks credential-like.
 
     `materialize_isolated_agy_workspace()` should always yield an empty list
-    here (aside from the intentionally-exposed `gcloud_adc_path` subtree, see
-    below); kept as an explicit runtime assertion helper for regression
-    safety (Issue #1705 AC12), rather than relying solely on code-review
-    inspection.
+    here (aside from the intentionally-exposed `gcloud_adc_path` /
+    `agy_oauth_token_path` subtrees, see below); kept as an explicit runtime
+    assertion helper for regression safety (Issue #1705 AC12), rather than
+    relying solely on code-review inspection.
 
     Issue #1730: `workspace.gcloud_adc_path` (when not `None`) is an
     intentional, documented read-only exposure of the real
     `$HOME/.config/gcloud` directory (AC1) -- not a credential-copying leak
-    this invariant check should flag. Its subtree is excluded from the scan;
-    everything else under `workspace.workspace_dir` must still be exactly
-    what `materialize_isolated_agy_workspace()` freshly created.
+    this invariant check should flag. Its subtree is excluded from the scan.
+
+    Issue #1740: `workspace.agy_oauth_token_path` (when not `None`) is
+    likewise an intentional, documented read-only exposure of the real
+    `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` file (AC1/AC4)
+    -- also excluded from the scan. Everything else under
+    `workspace.workspace_dir` must still be exactly what
+    `materialize_isolated_agy_workspace()` freshly created.
     """
-    exposed = workspace.gcloud_adc_path
+    exposed_paths = [
+        p for p in (workspace.gcloud_adc_path, workspace.agy_oauth_token_path) if p is not None
+    ]
     hits: list[Path] = []
     for path in workspace.workspace_dir.rglob("*"):
-        if exposed is not None:
+        excluded = False
+        for exposed in exposed_paths:
             try:
                 if path == exposed or path.is_relative_to(exposed):
-                    continue
+                    excluded = True
+                    break
             except ValueError:
                 pass
+        if excluded:
+            continue
         if path.is_file() and path.name.lower() in CREDENTIAL_FILE_BASENAMES:
             hits.append(path)
     return hits
