@@ -164,7 +164,7 @@ AGY prompt (成功時) に注入されるのは、上記 evidence envelope（`re
 （`- Do not infer or request absolute paths, shell execution, MCP access, ...` の既存 prompt-only
 境界をそのまま継承する）。
 
-### fan-out task-linked Serena evidence hash chain（Issue #1706）
+### fan-out task-linked Serena evidence hash chain（Issue #1706 の相関ハッシュ連鎖）
 
 `fan_out_orchestrator.run_fanout()` が生成する子 subtask request（`parent_run_id` /
 `subtask_id` / `attempt_id` を持つ request）に対しては、上記 `evidence_targets` 契約の上に

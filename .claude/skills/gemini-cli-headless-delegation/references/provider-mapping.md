@@ -143,7 +143,7 @@ declared target ごとに実ファイルを直接 read-only で読み、selector
 `grounded_research` / `github_research` の AGY 対応や Serena MCP upstream の manifest allowlist
 拡張は本契約の scope 外のままとする。
 
-### fan-out task-linked hash chain（Issue #1706）
+### fan-out task-linked hash chain（Issue #1706 の相関ハッシュ連鎖）
 
 `fan_out_orchestrator.run_fanout()` が `parent_run_id` / `subtask_id` / `attempt_id` を
 stamp した子 subtask request に限り、上記 `evidence_targets` 契約の上に hash chain

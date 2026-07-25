@@ -172,9 +172,11 @@ def test_objective_and_target_contract_hash_are_deterministic() -> None:
     assert rgh._hash_objective(None) is None
     assert rgh._hash_objective("   ") is None
 
-    targets_a = [{"repo_relative_path": "pkg/foo.py", "selector": {"kind": "line_range", "start_line": 1, "end_line": 2}}]
-    targets_b = [{"repo_relative_path": "pkg/foo.py", "selector": {"kind": "line_range", "start_line": 1, "end_line": 2}}]
-    targets_c = [{"repo_relative_path": "pkg/foo.py", "selector": {"kind": "line_range", "start_line": 1, "end_line": 3}}]
+    range_1_2 = {"kind": "line_range", "start_line": 1, "end_line": 2}
+    range_1_3 = {"kind": "line_range", "start_line": 1, "end_line": 3}
+    targets_a = [{"repo_relative_path": "pkg/foo.py", "selector": range_1_2}]
+    targets_b = [{"repo_relative_path": "pkg/foo.py", "selector": range_1_2}]
+    targets_c = [{"repo_relative_path": "pkg/foo.py", "selector": range_1_3}]
     assert rgh._hash_target_contract(targets_a) == rgh._hash_target_contract(targets_b)
     assert rgh._hash_target_contract(targets_a) != rgh._hash_target_contract(targets_c)
 
