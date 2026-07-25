@@ -337,7 +337,10 @@ class _FanoutRunDirFixture:
             self.hook_events_files["grounded_research"] = hook_events_path
 
             for profile, events in (
-                ("local_asset_research", [{"tool_name": "read_file", "source": "wrapper_serena_mcp", "executed": True}]),
+                (
+                    "local_asset_research",
+                    [{"tool_name": "read_file", "source": "wrapper_serena_mcp", "executed": True}],
+                ),
                 (
                     "grounded_research",
                     [
