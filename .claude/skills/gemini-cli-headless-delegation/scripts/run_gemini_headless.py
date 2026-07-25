@@ -3042,6 +3042,7 @@ def _normalize_agy_result(
     parent_run_id: str | None = None,
     subtask_id: str | None = None,
     attempt_id: str | None = None,
+    transcript_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Normalize agy subprocess result into delegation_result/v1 shape.
 
@@ -3080,6 +3081,20 @@ def _normalize_agy_result(
     agy_provenance_hook_events = list(getattr(completed, "agy_provenance_hook_events", []) or [])
     agy_provenance_hook_load_error = getattr(completed, "agy_provenance_hook_load_error", None)
 
+    # Issue #1771: surface the real AGY conversationId from the first captured
+    # hook event that has one (rather than re-deriving/guessing it), so
+    # delegation_result/v1's top-level conversation_id is the authoritative
+    # value the isolated-workspace PreToolUse wrapper actually observed --
+    # never fabricated when no hook event fired (e.g. AGY made no tool call).
+    agy_conversation_id: str | None = None
+    for _agy_hook_event in agy_provenance_hook_events:
+        if not isinstance(_agy_hook_event, dict):
+            continue
+        _candidate_conversation_id = _agy_hook_event.get("conversationId")
+        if isinstance(_candidate_conversation_id, str) and _candidate_conversation_id.strip():
+            agy_conversation_id = _candidate_conversation_id
+            break
+
     if completed.returncode != 0:
         # Issue #1270: classify quota/capacity/auth/permission failures
         # generically from stdout+stderr instead of always defaulting to
@@ -3116,6 +3131,8 @@ def _normalize_agy_result(
             "parent_run_id": parent_run_id,
             "subtask_id": subtask_id,
             "attempt_id": attempt_id,
+            "conversation_id": agy_conversation_id,
+            "transcript_sha256": transcript_sha256,
         }
 
     if not stdout:
@@ -3150,6 +3167,8 @@ def _normalize_agy_result(
             "parent_run_id": parent_run_id,
             "subtask_id": subtask_id,
             "attempt_id": attempt_id,
+            "conversation_id": agy_conversation_id,
+            "transcript_sha256": transcript_sha256,
         }
 
     grounded_research_evidence = (
@@ -3202,6 +3221,8 @@ def _normalize_agy_result(
         "parent_run_id": parent_run_id,
         "subtask_id": subtask_id,
         "attempt_id": attempt_id,
+        "conversation_id": agy_conversation_id,
+        "transcript_sha256": transcript_sha256,
     }
 
 
@@ -4617,10 +4638,54 @@ def _run_delegation_core(
                 " clamped to 300"
             )
             timeout_sec_agy = 300
+        # Issue #1771: deterministic hash of the exact outgoing prompt text
+        # (the "transcript" sent to AGY), computed once here so the same
+        # value can be (a) stamped into the isolated workspace hook context
+        # via run_context below -- and therefore embedded in every
+        # agy_tool_provenance_v1 hook event the wrapper emits for this run
+        # -- and (b) surfaced verbatim on delegation_result/v1 (see the
+        # _normalize_agy_result() call below), so validate_agy_fanout_e2e_
+        # evidence.py's match_run_context() can correlate the two. Computed
+        # before the AGY subprocess ever starts (hook context is written
+        # pre-execution inside _run_agy()), so it must hash the prompt sent,
+        # not the (not-yet-known) response.
+        _agy_transcript_sha256 = _sha256_stable_json(prompt_text)
+        # Issue #1771: only stamp fan-out correlation ids onto the isolated
+        # workspace hook context for the grounded_research call site (this
+        # Issue's stated scope -- predicate_07/08/10 are WebSearch hook-
+        # provenance checks specific to grounded_research), and only when
+        # the request actually carries them (fan_out_orchestrator.run_fanout()
+        # stamps parent_run_id/subtask_id/attempt_id onto fan-out subtask
+        # requests; standalone/single-shot callers never do, and other agy
+        # tool_profiles such as local_asset_research already have their own
+        # independent Serena-evidence correlation path -- Issue #1706 --
+        # untouched by this Issue). This keeps AC4 backward compatibility: a
+        # standalone grounded_research call, or any non-grounded_research
+        # call, still invokes _run_agy() with the identical pre-#1771 call
+        # shape; it never picks up fabricated correlation ids.
+        _agy_run_context: dict[str, Any] | None = None
+        if tool_profile == GROUNDED_RESEARCH_PROFILE and _is_fanout_correlated_request(request):
+            _agy_run_context = {
+                "parent_run_id": request.get("parent_run_id"),
+                "subtask_id": request.get("subtask_id"),
+                "attempt_id": request.get("attempt_id"),
+                "tool_profile": tool_profile_str,
+                "transcript_sha256": _agy_transcript_sha256,
+            }
         try:
             _agy_tool_profile_ctx_token = _AGY_TOOL_PROFILE_CTX.set(tool_profile)
             try:
-                agy_completed = _run_agy(prompt_text, timeout_sec_agy)
+                # Issue #1771 AC4: only pass run_context= at all when this is
+                # a fan-out-correlated request. A bare positional call
+                # (identical to pre-#1771: `_run_agy(prompt_text,
+                # timeout_sec_agy)`) is preserved for the standalone case so
+                # that pre-existing test doubles / monkeypatched fakes with a
+                # 2-positional-arg-only signature (no `run_context` keyword
+                # parameter at all) keep working unmodified.
+                if _agy_run_context is not None:
+                    agy_completed = _run_agy(prompt_text, timeout_sec_agy, run_context=_agy_run_context)
+                else:
+                    agy_completed = _run_agy(prompt_text, timeout_sec_agy)
             finally:
                 _AGY_TOOL_PROFILE_CTX.reset(_agy_tool_profile_ctx_token)
         except subprocess.TimeoutExpired:
@@ -4767,6 +4832,13 @@ def _run_delegation_core(
             parent_run_id=request.get("parent_run_id"),
             subtask_id=request.get("subtask_id"),
             attempt_id=request.get("attempt_id"),
+            # Issue #1771: same deterministic prompt-text hash computed
+            # earlier in this function (and, for fan-out-correlated
+            # requests, also stamped into the isolated workspace hook
+            # context via run_context on the _run_agy() call above), so
+            # delegation_result/v1's top-level transcript_sha256 always
+            # matches what the hook events for this run carry.
+            transcript_sha256=_agy_transcript_sha256,
         )
         if local_asset_retrieval_metadata is not None:
             result["local_asset_retrieval_metadata"] = local_asset_retrieval_metadata
