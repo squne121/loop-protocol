@@ -45,6 +45,25 @@ _SCRIPTS = {
         "'CLAUDE.md' 'AGENTS.md' 'SECURITY.md' '.claude/**/*.md'"
     ),
     "validate:roadmap-refs": "node scripts/validate-roadmap-refs.mjs",
+    # Argument-free wrapper invocations (Issue #1709 PR review P0-5 / AC5,
+    # AC7). The package.json script strings themselves are bare, no-argv
+    # invocations -- the Issue #1709 Verification Commands match these
+    # literal strings verbatim, and this fail-closed, exact-two-token gate
+    # registry never forwards extra argv to the underlying CLI. Both
+    # `generate-retro-live-verification.mjs` and `check-retro-live-
+    # verification.mjs` fall back to their own checked-in, fixture-derived
+    # default arguments whenever they are invoked with zero CLI flags (see
+    # `DEFAULT_GENERATE_ARGS` / `DEFAULT_CHECK_ARGS` in those scripts), so a
+    # bare `pnpm retro-live-verification:generate` / `:verify` performs a
+    # real, read-only fixture validation instead of failing with a
+    # required-option usage error.
+    # `retro-live-verification:post` is a mutation command (it can create/
+    # update a live GitHub comment) and is deliberately NOT registered here;
+    # it must only ever be invoked by the protected
+    # `.github/workflows/retro-live-verification.yml` `post-canonical-
+    # comment` job, never through this generic agent-facing gate registry.
+    "retro-live-verification:generate": "node scripts/generate-retro-live-verification.mjs",
+    "retro-live-verification:verify": "node scripts/check-retro-live-verification.mjs",
 }
 
 _GATES = (
@@ -63,6 +82,18 @@ _GATES = (
         ("pnpm", "lint:docs"),
         "lint:docs",
         ("lint:docs", "lint:md", "lint:prose", "validate:roadmap-refs"),
+    ),
+    GateDescriptor(
+        "pnpm.retro-live-verification-generate.v1",
+        ("pnpm", "retro-live-verification:generate"),
+        "retro-live-verification:generate",
+        ("retro-live-verification:generate",),
+    ),
+    GateDescriptor(
+        "pnpm.retro-live-verification-verify.v1",
+        ("pnpm", "retro-live-verification:verify"),
+        "retro-live-verification:verify",
+        ("retro-live-verification:verify",),
     ),
 )
 

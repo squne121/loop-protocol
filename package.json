@@ -24,6 +24,8 @@
     "test:e2e:debug": "playwright test --debug",
     "test:e2e:headed": "playwright test --headed",
     "test:e2e:preview-namespace": "rm -rf dist && pnpm build && LOOP_E2E_PREVIEW_NAMESPACE_LANE=true playwright test",
+    "test:vrt": "VITE_E2E_MODE=true pnpm build && LOOP_VRT_LANE=true playwright test tests/e2e/visual-overlay.spec.ts",
+    "test:vrt:e2e": "LOOP_VRT_LANE=true playwright test tests/e2e/visual-overlay.spec.ts",
     "playwright:install": "playwright install",
     "playwright:install:ci": "playwright install --with-deps chromium",
     "policy:check:secret": "uv run --locked python .claude/scripts/check_secret_policy.py docs/dev/secret-policy.md",
@@ -57,7 +59,10 @@
     "security:session-recording:runtime": "pnpm run security:session-recording:fixture",
     "security:session-recording:host": "uv run --locked python3 .claude/scripts/check_session_recording_runtime_safety.py --json --execution-profile host",
     "latitude:real-pilot:preflight": "uv run --locked python3 .claude/scripts/check_session_recording_runtime_safety.py --json --execution-profile host --require-real-pilot-activation",
-    "entirecli:check": "node scripts/agent-logs/check-entirecli-safety.mjs"
+    "entirecli:check": "node scripts/agent-logs/check-entirecli-safety.mjs",
+    "retro-live-verification:generate": "node scripts/generate-retro-live-verification.mjs",
+    "retro-live-verification:post": "node scripts/post-retro-live-verification.mjs",
+    "retro-live-verification:verify": "node scripts/check-retro-live-verification.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

@@ -243,6 +243,47 @@ def _detect_keyring(env_snapshot: dict[str, bool], platform_info: dict[str, Any]
     return {"available": None, "backend_hint": None, "failure_class": None}
 
 
+def _detect_gcloud_adc(env_home: str | None = None) -> dict[str, Any]:
+    """Detect gcloud Application Default Credentials (ADC) file-based presence.
+
+    Existence-check only (Issue #1730 AC7) -- never opens or reads the ADC
+    file / token DB content, only whether the well-known gcloud config paths
+    exist under `$HOME/.config/gcloud`. This is a distinct auth channel from
+    `_detect_keyring()`'s D-Bus secret-service inference: gcloud ADC is a
+    file-based auth cache that works even when no D-Bus session bus is
+    present at all (the exact scenario Issue #1730's Source section
+    describes: WSL2, `DBUS_SESSION_BUS_ADDRESS`/`XDG_RUNTIME_DIR` propagated,
+    but auth still resolves via `$HOME/.config/gcloud`, not a keyring).
+    """
+    real_home = env_home if env_home is not None else os.environ.get("HOME")
+    if not real_home:
+        return {
+            "config_dir_present": False,
+            "adc_file_present": False,
+            "access_tokens_db_present": False,
+        }
+    gcloud_dir = Path(real_home) / ".config" / "gcloud"
+    adc_file = gcloud_dir / "application_default_credentials.json"
+    tokens_db = gcloud_dir / "access_tokens.db"
+    try:
+        config_dir_present = gcloud_dir.is_dir()
+    except OSError:
+        config_dir_present = False
+    try:
+        adc_file_present = adc_file.is_file()
+    except OSError:
+        adc_file_present = False
+    try:
+        access_tokens_db_present = tokens_db.is_file()
+    except OSError:
+        access_tokens_db_present = False
+    return {
+        "config_dir_present": config_dir_present,
+        "adc_file_present": adc_file_present,
+        "access_tokens_db_present": access_tokens_db_present,
+    }
+
+
 def _classify_auth_signal(raw_text: str) -> str | None:
     """Classify agy stdout/stderr text for explicit auth/keyring evidence.
 
@@ -303,6 +344,7 @@ def _build_auth_diagnostics(
     platform_info = _detect_platform()
     env_snapshot = _diagnostic_env_snapshot()
     keyring_info = _detect_keyring(env_snapshot, platform_info)
+    gcloud_adc_info = _detect_gcloud_adc()
     auth_signal = _classify_auth_signal(combined_output)
 
     if auth_signal is not None:
@@ -325,6 +367,14 @@ def _build_auth_diagnostics(
             auth_mode, auth_mode_confidence = "api_key_env_present", "inferred"
         else:
             auth_mode, auth_mode_confidence = "system_keyring_cached", "inferred"
+    elif gcloud_adc_info.get("adc_file_present") or gcloud_adc_info.get("access_tokens_db_present"):
+        # Issue #1730: gcloud ADC is a file-based auth cache that does not
+        # require a D-Bus session bus at all. Checked ahead of the
+        # keyring-failure_class fallback below so that a real, existing
+        # gcloud ADC session is not misreported as "unauthenticated" purely
+        # because no D-Bus session bus is present (Issue #1730 Source: this
+        # is exactly the WSL2 fan-out scenario that motivated this Issue).
+        auth_mode, auth_mode_confidence = "gcloud_adc_file_based", "inferred"
     elif keyring_info.get("failure_class"):
         auth_mode, auth_mode_confidence = "unauthenticated", "inferred"
     else:
@@ -345,6 +395,9 @@ def _build_auth_diagnostics(
             "backend_hint": keyring_info.get("backend_hint"),
             "failure_class": keyring_info.get("failure_class"),
         },
+        # Issue #1730 AC7: gcloud ADC file-based auth cache presence
+        # (existence-check only -- never the file content).
+        "gcloud_adc": gcloud_adc_info,
         "tty": tty_info,
         "platform": platform_info,
         "recovery_action": recovery_action,

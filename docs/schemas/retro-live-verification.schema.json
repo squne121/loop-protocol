@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/squne121/loop-protocol/docs/schemas/retro-live-verification.schema.json",
+  "title": "retro_live_verification/v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "context_assertions",
+    "pr_review_binding",
+    "execution_boundary",
+    "canonical_comment",
+    "runtime_provenance",
+    "canonicalization_profile"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "retro_live_verification/v2"
+    },
+    "context_assertions": {
+      "$ref": "#/$defs/contextAssertions"
+    },
+    "pr_review_binding": {
+      "$ref": "#/$defs/prReviewBinding"
+    },
+    "execution_boundary": {
+      "$ref": "#/$defs/executionBoundary"
+    },
+    "canonical_comment": {
+      "$ref": "#/$defs/canonicalComment"
+    },
+    "runtime_provenance": {
+      "$ref": "#/$defs/runtimeProvenance"
+    },
+    "canonicalization_profile": {
+      "$ref": "#/$defs/canonicalizationProfile"
+    }
+  },
+  "$defs": {
+    "sha256Digest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "sha256PrefixedDigest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "contextAssertions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repo",
+        "target_type",
+        "target_number",
+        "parent_issue",
+        "marker_comment_url",
+        "expected_digest",
+        "expected_payload_digest",
+        "expected_matched_comment_count"
+      ],
+      "properties": {
+        "repo": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        },
+        "target_type": {
+          "type": "string",
+          "enum": ["issue", "pull_request"]
+        },
+        "target_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "parent_issue": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "marker_comment_url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(issues|pull)/[0-9]+#issuecomment-[0-9]+$"
+        },
+        "expected_digest": {
+          "$ref": "#/$defs/sha256PrefixedDigest"
+        },
+        "expected_payload_digest": {
+          "$ref": "#/$defs/sha256PrefixedDigest"
+        },
+        "expected_matched_comment_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "prReviewBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "review_artifact_ref",
+        "reviewed_head_sha",
+        "selected_review_id"
+      ],
+      "properties": {
+        "review_artifact_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "reviewed_head_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "selected_review_id": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        }
+      }
+    },
+    "executionBoundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "allowed_paths",
+        "trusted_actor_allowlist"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["generate", "post", "verify"]
+        },
+        "allowed_paths": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "trusted_actor_allowlist": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        }
+      }
+    },
+    "canonicalComment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repo",
+        "issue_number",
+        "ownership_marker",
+        "body_digest",
+        "expected_previous_digest"
+      ],
+      "properties": {
+        "repo": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        },
+        "issue_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "ownership_marker": {
+          "type": "string",
+          "pattern": "^<!-- retro_live_verification:v1 repo=[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+ issue=[0-9]+ -->$"
+        },
+        "body_digest": {
+          "$ref": "#/$defs/sha256Digest"
+        },
+        "expected_previous_digest": {
+          "anyOf": [
+            { "$ref": "#/$defs/sha256Digest" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "runtimeProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "generated_at",
+        "generator_commit",
+        "generator_version"
+      ],
+      "properties": {
+        "generated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "generator_commit": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "generator_version": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "canonicalizationProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "algorithm",
+        "digest_encoding"
+      ],
+      "properties": {
+        "algorithm": {
+          "type": "string",
+          "const": "canonical-json-v1"
+        },
+        "digest_encoding": {
+          "type": "string",
+          "const": "sha256-hex"
+        }
+      }
+    }
+  }
+}

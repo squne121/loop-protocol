@@ -260,6 +260,80 @@ class IsolatedAgyWorkspace:
     settings_path: Path
     hook_path: Path
     env: dict[str, str]
+    # Issue #1730: path to the read-only-exposed gcloud ADC config dir under
+    # this workspace's isolated XDG_CONFIG_HOME (`<workspace>/xdg-config/gcloud`),
+    # or None when the real `$HOME/.config/gcloud` did not exist. Never points
+    # outside the isolated workspace tree even though its *target* (via
+    # symlink) is the real `$HOME/.config/gcloud` directory.
+    gcloud_adc_path: "Path | None" = None
+
+
+# Issue #1730: gcloud Application Default Credentials (ADC) are cached
+# file-based under `$HOME/.config/gcloud` (`application_default_credentials.json`,
+# `access_tokens.db`) -- not via a D-Bus secret-service session. This is the
+# XDG_CONFIG_HOME-relative directory name `materialize_isolated_agy_workspace()`
+# exposes the real gcloud config dir under, matching gcloud's own
+# `$XDG_CONFIG_HOME/gcloud` lookup convention.
+GCLOUD_CONFIG_DIRNAME = "gcloud"
+
+# Issue #1730 AC2: when the real environment already has this env var set,
+# its *path string* (never file content) is propagated through unchanged --
+# a path string is not credential material in itself (same reasoning as the
+# DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR endpoint pointers in Issue #1726).
+GOOGLE_APPLICATION_CREDENTIALS_ENV = "GOOGLE_APPLICATION_CREDENTIALS"
+
+
+def _real_home_gcloud_config_dir() -> "Path | None":
+    """Return the real `$HOME/.config/gcloud` directory if it exists.
+
+    Existence-check only (`Path.is_dir()`) -- this function never opens or
+    reads any file inside the directory it returns (Issue #1730 AC1/AC3/AC5:
+    presence and path operations only, no content access).
+    """
+    real_home = os.environ.get("HOME")
+    if not real_home:
+        return None
+    candidate = Path(real_home) / ".config" / "gcloud"
+    try:
+        if candidate.is_dir():
+            return candidate
+    except OSError:
+        return None
+    return None
+
+
+def _expose_gcloud_adc_read_only(xdg_config_home: Path) -> "Path | None":
+    """Expose the real gcloud ADC config dir under *xdg_config_home*/gcloud.
+
+    Issue #1730: because `materialize_isolated_agy_workspace()` fully
+    redirects `HOME`/`XDG_*` into a brand-new isolated tmp workspace, the
+    host's real gcloud ADC cache is otherwise structurally unreachable by the
+    isolated `agy` subprocess -- causing `agy_auth_required` failures even
+    when the host already has a valid, existing gcloud ADC session.
+
+    This creates a *symlink* (never a copy) from
+    `<isolated>/xdg-config/gcloud` to the real `$HOME/.config/gcloud`
+    directory. `Path.symlink_to()` only writes a path string into a new
+    filesystem entry; it never opens or reads a single byte of the target's
+    file contents (AC1/AC5). Only this one subpath of the real `$HOME` is
+    exposed this way -- the isolated `HOME` itself and every other real
+    `$HOME` subdirectory (`.ssh`, `.netrc`, other `.config/*` apps, etc.)
+    remain fully isolated and unreachable (AC3).
+
+    Returns `None` (a no-op) when the real `$HOME/.config/gcloud` directory
+    does not exist, or if symlink creation fails for any reason -- gcloud ADC
+    exposure is an additive reachability improvement, never a hard
+    requirement for workspace materialization to succeed.
+    """
+    gcloud_dir = _real_home_gcloud_config_dir()
+    if gcloud_dir is None:
+        return None
+    link_path = xdg_config_home / GCLOUD_CONFIG_DIRNAME
+    try:
+        link_path.symlink_to(gcloud_dir, target_is_directory=True)
+    except OSError:
+        return None
+    return link_path
 
 
 def materialize_isolated_agy_workspace(
@@ -310,10 +384,54 @@ def materialize_isolated_agy_workspace(
         "XDG_STATE_HOME": str(xdg_state),
         "AGY_WORKSPACE_SETTINGS": str(settings_path),
     }
-    for key in ("PATH", "LANG", "LC_ALL", "TERM"):
+    # Reachability variables (Issue #1726): each of these is an *endpoint*
+    # pointer (a filesystem path to a Unix domain socket or a socket
+    # directory), never a credential value in itself. Propagating them lets
+    # the isolated `agy` subprocess reach the *existing*, already-authenticated
+    # OS keyring / dbus secret service session on the host, without granting
+    # it access to -- or a copy of -- any credential file, token string, or
+    # cookie. This is distinct from `HOME`/`XDG_CONFIG_HOME`/`XDG_CACHE_HOME`/
+    # `XDG_STATE_HOME` above, which remain fully redirected into the isolated
+    # workspace (Issue #1705 secret-hygiene design is unchanged).
+    #
+    # - DBUS_SESSION_BUS_ADDRESS: the well-known D-Bus session bus address,
+    #   e.g. `unix:path=/run/user/1000/bus`. It names *where* to connect to
+    #   reach the running session/secret-service bus; it carries no secret
+    #   material itself (the actual credential bytes stay inside the OS
+    #   keyring process behind that socket and are never read or copied by
+    #   this function).
+    # - XDG_RUNTIME_DIR: the per-user runtime directory
+    #   (e.g. `/run/user/1000`) that typically *contains* the D-Bus socket
+    #   and other session sockets `agy`/dbus tooling may need to resolve a
+    #   default bus address from. It is a directory path, not credential
+    #   content, and propagating it does not expose any file contents to the
+    #   subprocess beyond what the isolated `HOME`/`XDG_*` redirection above
+    #   already scopes for config/cache/state.
+    for key in (
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_RUNTIME_DIR",
+    ):
         value = os.environ.get(key)
         if value is not None:
             env[key] = value
+
+    # Issue #1730 AC2: GOOGLE_APPLICATION_CREDENTIALS, when already set in the
+    # real environment, is a *path string* pointing at a credential file --
+    # not credential content itself -- so it is propagated through the same
+    # way the Issue #1726 endpoint-pointer variables above are: verbatim,
+    # without ever opening or reading the file it names.
+    google_application_credentials = os.environ.get(GOOGLE_APPLICATION_CREDENTIALS_ENV)
+    if google_application_credentials is not None:
+        env[GOOGLE_APPLICATION_CREDENTIALS_ENV] = google_application_credentials
+
+    # Issue #1730 AC1/AC3: expose the real gcloud ADC config dir (if any)
+    # read-only under this workspace's isolated XDG_CONFIG_HOME -- the only
+    # path back to any real $HOME content this function ever creates.
+    gcloud_adc_path = _expose_gcloud_adc_read_only(xdg_config)
 
     return IsolatedAgyWorkspace(
         profile=profile,
@@ -321,6 +439,7 @@ def materialize_isolated_agy_workspace(
         settings_path=settings_path,
         hook_path=hook_path,
         env=env,
+        gcloud_adc_path=gcloud_adc_path,
     )
 
 
@@ -328,11 +447,27 @@ def find_credential_like_files(workspace: IsolatedAgyWorkspace) -> list[Path]:
     """Return any file under *workspace* whose basename looks credential-like.
 
     `materialize_isolated_agy_workspace()` should always yield an empty list
-    here; kept as an explicit runtime assertion helper for regression safety
-    (Issue #1705 AC12), rather than relying solely on code-review inspection.
+    here (aside from the intentionally-exposed `gcloud_adc_path` subtree, see
+    below); kept as an explicit runtime assertion helper for regression
+    safety (Issue #1705 AC12), rather than relying solely on code-review
+    inspection.
+
+    Issue #1730: `workspace.gcloud_adc_path` (when not `None`) is an
+    intentional, documented read-only exposure of the real
+    `$HOME/.config/gcloud` directory (AC1) -- not a credential-copying leak
+    this invariant check should flag. Its subtree is excluded from the scan;
+    everything else under `workspace.workspace_dir` must still be exactly
+    what `materialize_isolated_agy_workspace()` freshly created.
     """
+    exposed = workspace.gcloud_adc_path
     hits: list[Path] = []
     for path in workspace.workspace_dir.rglob("*"):
+        if exposed is not None:
+            try:
+                if path == exposed or path.is_relative_to(exposed):
+                    continue
+            except ValueError:
+                pass
         if path.is_file() and path.name.lower() in CREDENTIAL_FILE_BASENAMES:
             hits.append(path)
     return hits
