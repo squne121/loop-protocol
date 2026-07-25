@@ -194,6 +194,19 @@ describe('planPost (producer compare-and-swap / trusted actor / negative fixture
     expect(plan.ok).toBe(true)
     expect(plan.action).toBe('noop')
   })
+
+  it('Issue #1415 AC4: GIVEN manifest WITH trusted_actor_id_allowlist WHEN --current-actor-id does not match THEN the trusted login alone is insufficient and posting is rejected', () => {
+    const manifestWithIdAllowlist = { ...manifest, execution_boundary: { ...manifest.execution_boundary, trusted_actor_id_allowlist: [63350259] } }
+    const plan = planPost({ manifest: manifestWithIdAllowlist, existingComments: [], currentActor: 'squne121', currentActorId: 111111 })
+    expect(plan.ok).toBe(false)
+    expect(plan.errorCode).toBe('retro_live_verification.untrusted_actor')
+  })
+
+  it('Issue #1415 AC4: GIVEN manifest WITH trusted_actor_id_allowlist WHEN both login and --current-actor-id match THEN posting proceeds', () => {
+    const manifestWithIdAllowlist = { ...manifest, execution_boundary: { ...manifest.execution_boundary, trusted_actor_id_allowlist: [63350259] } }
+    const plan = planPost({ manifest: manifestWithIdAllowlist, existingComments: [], currentActor: 'squne121', currentActorId: 63350259 })
+    expect(plan.ok).toBe(true)
+  })
 })
 
 describe('required negative test 7: concurrent-create post-write uniqueness (Issue #1709 PR review P1-1)', () => {
@@ -301,6 +314,53 @@ describe('checkCanonicalComment (verifier / negative fixtures)', () => {
     const result = checkCanonicalComment({ manifest, comments: loadFixture('trailing-content-comments.json') })
     expect(result.ok).toBe(false)
     expect(result.errors.some((e: { code: string }) => e.code === 'retro_live_verification_check.payload_trailing_content')).toBe(true)
+  })
+})
+
+describe('Issue #1415 AC4: marker authority numeric author id binding (additive, optional trusted_actor_id_allowlist)', () => {
+  const manifest = loadFixture('manifest.json')
+  const validComments = loadFixture('valid-comments.json')
+  const trustedLogin = validComments[0].user.login
+  const withAuthorId = (id: number | null) => [
+    { ...validComments[0], user: { ...validComments[0].user, id } },
+  ]
+
+  it('GIVEN manifest WITHOUT trusted_actor_id_allowlist (v2 default) WHEN a comment has no numeric id THEN it still passes on login alone (backward compatible)', () => {
+    const result = checkCanonicalComment({ manifest, comments: withAuthorId(null) })
+    expect(result.ok).toBe(true)
+  })
+
+  it('GIVEN manifest WITH trusted_actor_id_allowlist WHEN the comment author login matches but the numeric id does NOT THEN it fails closed with untrusted_marker_author (a bare login match is insufficient once a numeric allowlist is declared)', () => {
+    const manifestWithIdAllowlist = {
+      ...manifest,
+      execution_boundary: { ...manifest.execution_boundary, trusted_actor_id_allowlist: [999999] },
+    }
+    const result = checkCanonicalComment({ manifest: manifestWithIdAllowlist, comments: withAuthorId(63350259) })
+    expect(result.ok).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'retro_live_verification_check.untrusted_marker_author')).toBe(true)
+  })
+
+  it('GIVEN manifest WITH trusted_actor_id_allowlist WHEN both login and numeric id match THEN it passes', () => {
+    const manifestWithIdAllowlist = {
+      ...manifest,
+      execution_boundary: { ...manifest.execution_boundary, trusted_actor_id_allowlist: [63350259] },
+    }
+    const result = checkCanonicalComment({ manifest: manifestWithIdAllowlist, comments: withAuthorId(63350259) })
+    expect(result.ok).toBe(true)
+  })
+
+  it('GIVEN two comments matching the ownership marker, one trusted and one authored by an untrusted login WHEN checked THEN the untrusted one is excluded from candidate/duplicate counting and the single trusted one is checked normally (not a false duplicate block)', () => {
+    const untrustedDuplicate = { ...validComments[0], id: 900002, user: { login: 'not-trusted-actor' } }
+    const result = checkCanonicalComment({ manifest, comments: [...validComments, untrustedDuplicate] })
+    expect(result.ok).toBe(true)
+    expect(trustedLogin).toBe('squne121')
+  })
+
+  it('GIVEN two trusted-author comments both matching the ownership marker WHEN checked THEN it still fails closed with matched_comment_count_mismatch (a trusted duplicate must never be treated as consensus)', () => {
+    const trustedDuplicate = { ...validComments[0], id: 900003 }
+    const result = checkCanonicalComment({ manifest, comments: [...validComments, trustedDuplicate] })
+    expect(result.ok).toBe(false)
+    expect(result.errors[0].code).toBe('retro_live_verification_check.matched_comment_count_mismatch')
   })
 })
 

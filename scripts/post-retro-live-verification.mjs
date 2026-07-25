@@ -43,7 +43,28 @@ export const SCHEMA = 'retro_live_verification_post_result/v1'
 const CLI_OPTION_SPEC = {
   '--manifest-json': { key: 'manifestJson', required: true },
   '--current-actor': { key: 'currentActor', required: true },
+  // Issue #1415 AC4 (additive, optional): numeric GitHub user id of
+  // --current-actor, checked against the manifest's optional
+  // trusted_actor_id_allowlist alongside the login. Omitted entirely, the
+  // v2 login-only trust check is unchanged.
+  '--current-actor-id': { key: 'currentActorId' },
   '--dry-run': { key: 'dryRun', defaultValue: 'true' },
+}
+
+/**
+ * Mirrors scripts/check-retro-live-verification.mjs's isTrustedMarkerAuthor:
+ * a login match is required, and when the manifest declares a non-empty
+ * trusted_actor_id_allowlist, the numeric id must ALSO match (a bare login
+ * match is insufficient once a numeric allowlist is declared).
+ */
+export function isTrustedPostingActor({ currentActor, currentActorId }, executionBoundary) {
+  const loginTrusted = executionBoundary.trusted_actor_allowlist.includes(currentActor)
+  const idAllowlist = executionBoundary.trusted_actor_id_allowlist
+  if (!Array.isArray(idAllowlist) || idAllowlist.length === 0) {
+    return loginTrusted
+  }
+  const idTrusted = typeof currentActorId === 'number' && idAllowlist.includes(currentActorId)
+  return loginTrusted && idTrusted
 }
 
 /**
@@ -85,6 +106,13 @@ export function evaluatePostWriteUniqueness({ postWriteComments, ownershipMarker
   return { ok: true }
 }
 
+function normalizeCurrentActorId(value) {
+  if (!/^[1-9][0-9]*$/u.test(String(value))) {
+    throw usageError('retro_live_verification.current_actor_id', 'current-actor-id must be a positive integer')
+  }
+  return Number(value)
+}
+
 function parseBooleanFlag(value, code) {
   if (value === 'true') {
     return true
@@ -120,9 +148,9 @@ export function parseExistingCanonicalComment(comment, ownershipMarker) {
  * `currentActor` are plain inputs), so the compare-and-swap / trusted-actor
  * / dry-run branches are unit-testable without a live GitHub call.
  */
-export function planPost({ manifest, existingComments, currentActor }) {
-  if (!manifest.execution_boundary.trusted_actor_allowlist.includes(currentActor)) {
-    return { ok: false, errorCode: 'retro_live_verification.untrusted_actor', errorMessage: `actor ${currentActor} is not in the trusted_actor_allowlist` }
+export function planPost({ manifest, existingComments, currentActor, currentActorId = null }) {
+  if (!isTrustedPostingActor({ currentActor, currentActorId }, manifest.execution_boundary)) {
+    return { ok: false, errorCode: 'retro_live_verification.untrusted_actor', errorMessage: `actor ${currentActor} (id ${currentActorId}) is not in the trusted_actor_allowlist / trusted_actor_id_allowlist` }
   }
 
   const { ownership_marker: ownershipMarker, body_digest: bodyDigest, expected_previous_digest: expectedPreviousDigest } = manifest.canonical_comment
@@ -175,7 +203,10 @@ async function runCli() {
     return
   }
 
-  const plan = planPost({ manifest, existingComments: listing.comments, currentActor: options.currentActor })
+  const currentActorId = options.currentActorId === undefined || options.currentActorId === null
+    ? null
+    : normalizeCurrentActorId(options.currentActorId)
+  const plan = planPost({ manifest, existingComments: listing.comments, currentActor: options.currentActor, currentActorId })
   if (!plan.ok) {
     process.stdout.write(`${JSON.stringify({ schema: SCHEMA, status: 'error', error_code: plan.errorCode, error_message: plan.errorMessage })}\n`)
     process.exitCode = 1

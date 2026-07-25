@@ -134,10 +134,34 @@ function parseCanonicalCommentMarkers(comment, ownershipMarker) {
     return { matches: false, malformed: false }
   }
   const digestMatch = (secondLine ?? '').match(/^<!-- retro_live_verification_digest:v1 sha256=(?<digest>[a-f0-9]{64}) -->$/u)
+  const authorLogin = comment?.user?.login ?? null
+  const authorId = typeof comment?.user?.id === 'number' && Number.isInteger(comment.user.id) ? comment.user.id : null
   if (!digestMatch?.groups) {
-    return { matches: true, malformed: true, body }
+    return { matches: true, malformed: true, authorLogin, authorId, body }
   }
-  return { matches: true, malformed: false, digest: digestMatch.groups.digest, authorLogin: comment?.user?.login ?? null, body }
+  return { matches: true, malformed: false, digest: digestMatch.groups.digest, authorLogin, authorId, body }
+}
+
+/**
+ * Issue #1415 AC4: trust judgment must be evaluated before malformed/
+ * duplicate candidate counting, and author association (login) alone is not
+ * a sufficient trust anchor on its own. When the manifest declares an
+ * optional `trusted_actor_id_allowlist` (Issue #1709's `trusted_actor_allowlist`
+ * remains login-only for v2 backward compatibility), an author must match
+ * BOTH an allowed login AND an allowed numeric GitHub user id to be trusted;
+ * a bare login match is insufficient once a numeric allowlist is declared
+ * (defeats a renamed/impersonating account reusing a trusted login string).
+ * When `trusted_actor_id_allowlist` is absent entirely, this degrades to the
+ * v2 login-only check unchanged.
+ */
+export function isTrustedMarkerAuthor({ authorLogin, authorId }, executionBoundary) {
+  const loginTrusted = typeof authorLogin === 'string' && executionBoundary.trusted_actor_allowlist.includes(authorLogin)
+  const idAllowlist = executionBoundary.trusted_actor_id_allowlist
+  if (!Array.isArray(idAllowlist) || idAllowlist.length === 0) {
+    return loginTrusted
+  }
+  const idTrusted = typeof authorId === 'number' && idAllowlist.includes(authorId)
+  return loginTrusted && idTrusted
 }
 
 /**
@@ -187,21 +211,35 @@ export function checkCanonicalComment({ manifest, comments }) {
   const errors = []
   const { ownership_marker: ownershipMarker, body_digest: expectedDigest } = manifest.canonical_comment
   const parsed = comments.map((comment) => ({ comment, ...parseCanonicalCommentMarkers(comment, ownershipMarker) }))
-  const matches = parsed.filter((entry) => entry.matches)
+  const allMatches = parsed.filter((entry) => entry.matches)
 
-  if (matches.some((entry) => entry.malformed)) {
-    errors.push({ code: 'retro_live_verification_check.malformed_canonical_comment', message: 'a comment matches the ownership marker but its digest marker is malformed' })
+  // Issue #1415 AC4: trust is judged first. Untrusted candidates are
+  // excluded from the canonical/duplicate candidate count entirely -- they
+  // must never be able to trigger a false "multiple canonical comments"
+  // block, nor (conversely) hide a genuine trusted duplicate by diluting the
+  // count. Malformed-marker and duplicate-count fail-closed checks below
+  // therefore only ever look at the trusted subset.
+  const trustedMatches = allMatches.filter((entry) => isTrustedMarkerAuthor(entry, manifest.execution_boundary))
+
+  if (trustedMatches.length === 0) {
+    if (allMatches.length === 0) {
+      errors.push({ code: 'retro_live_verification_check.matched_comment_count_mismatch', message: 'expected exactly 1 canonical comment, found 0' })
+    } else {
+      const [untrusted] = allMatches
+      errors.push({ code: 'retro_live_verification_check.untrusted_marker_author', message: `canonical comment author ${untrusted.authorLogin} (id ${untrusted.authorId}) is not in the trusted_actor_allowlist / trusted_actor_id_allowlist` })
+    }
     return { ok: false, errors }
   }
-  if (matches.length !== 1) {
-    errors.push({ code: 'retro_live_verification_check.matched_comment_count_mismatch', message: `expected exactly 1 canonical comment, found ${matches.length}` })
+  if (trustedMatches.some((entry) => entry.malformed)) {
+    errors.push({ code: 'retro_live_verification_check.malformed_canonical_comment', message: 'a trusted-author comment matches the ownership marker but its digest marker is malformed' })
+    return { ok: false, errors }
+  }
+  if (trustedMatches.length !== 1) {
+    errors.push({ code: 'retro_live_verification_check.matched_comment_count_mismatch', message: `expected exactly 1 trusted canonical comment, found ${trustedMatches.length}` })
     return { ok: false, errors }
   }
 
-  const [match] = matches
-  if (!manifest.execution_boundary.trusted_actor_allowlist.includes(match.authorLogin)) {
-    errors.push({ code: 'retro_live_verification_check.untrusted_marker_author', message: `canonical comment author ${match.authorLogin} is not in the trusted_actor_allowlist` })
-  }
+  const [match] = trustedMatches
   if (match.digest !== expectedDigest) {
     errors.push({ code: 'retro_live_verification_check.stale_digest', message: `canonical comment digest marker ${match.digest} does not match manifest expectation ${expectedDigest}` })
   }

@@ -144,6 +144,15 @@
             "minLength": 1
           },
           "minItems": 1
+        },
+        "trusted_actor_id_allowlist": {
+          "description": "Issue #1415 AC4 (additive, optional): numeric GitHub user IDs bound alongside trusted_actor_allowlist logins. A login string alone can be reused after account rename/deletion; when this field is present and non-empty, a marker/canonical-comment author must match BOTH an allowed login AND an allowed numeric id to be treated as trusted. Absent entirely, verification falls back to the v2 login-only check unchanged (backward compatible).",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "minItems": 1
         }
       }
     },
