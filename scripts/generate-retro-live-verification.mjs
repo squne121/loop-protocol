@@ -183,6 +183,40 @@ function normalizeSha256Hex(value, code) {
   return value.toLowerCase()
 }
 
+/**
+ * Normalizes a digest value to the `sha256:<64hex>` representation used by
+ * the existing `chatgpt-retro-context:assert-live` consumer (Issue #1709 PR
+ * review, P0-4). Accepts either a bare 64-hex digest or an already-prefixed
+ * `sha256:<64hex>` value as input so CLI callers do not need to know which
+ * representation an upstream resolver happened to emit, but always emits
+ * the prefixed form so producer and consumer never disagree on wire format.
+ */
+export function toSha256Prefixed(value) {
+  if (typeof value === 'string' && /^sha256:[a-f0-9]{64}$/iu.test(value)) {
+    return `sha256:${value.slice('sha256:'.length).toLowerCase()}`
+  }
+  if (typeof value === 'string' && /^[a-f0-9]{64}$/iu.test(value)) {
+    return `sha256:${value.toLowerCase()}`
+  }
+  return null
+}
+
+export function fromSha256Prefixed(value) {
+  if (typeof value !== 'string') {
+    return null
+  }
+  const match = value.match(/^sha256:(?<hex>[a-f0-9]{64})$/iu)
+  return match?.groups ? match.groups.hex.toLowerCase() : null
+}
+
+function normalizeSha256PrefixedDigest(value, code) {
+  const normalized = toSha256Prefixed(value)
+  if (normalized === null) {
+    throw usageError(code, `${code} must be a 64-character hex sha256 digest, optionally prefixed with "sha256:"`)
+  }
+  return normalized
+}
+
 function normalizeCommitSha(value, code) {
   if (typeof value !== 'string' || !/^[0-9a-f]{40}$/iu.test(value)) {
     throw usageError(code, `${code} must be a 40-character lowercase hex commit sha`)
@@ -231,8 +265,8 @@ export function buildManifest(options) {
   const targetNumber = normalizePositiveInteger(options.targetNumber, 'retro_live_verification.target_number')
   const parentIssue = normalizePositiveInteger(options.parentIssue, 'retro_live_verification.parent_issue')
   const issueNumber = normalizePositiveInteger(options.issueNumber, 'retro_live_verification.issue_number')
-  const expectedDigest = normalizeSha256Hex(options.expectedDigest, 'retro_live_verification.expected_digest')
-  const expectedPayloadDigest = normalizeSha256Hex(options.expectedPayloadDigest, 'retro_live_verification.expected_payload_digest')
+  const expectedDigest = normalizeSha256PrefixedDigest(options.expectedDigest, 'retro_live_verification.expected_digest')
+  const expectedPayloadDigest = normalizeSha256PrefixedDigest(options.expectedPayloadDigest, 'retro_live_verification.expected_payload_digest')
   const expectedMatchedCommentCount = normalizeNonNegativeInteger(options.expectedMatchedCommentCount, 'retro_live_verification.expected_matched_comment_count')
   const reviewedHeadSha = normalizeCommitSha(options.reviewedHeadSha, 'retro_live_verification.reviewed_head_sha')
   const selectedReviewId = options.selectedReviewId === undefined || options.selectedReviewId === null

@@ -2,7 +2,9 @@
   {
     "id": 900004,
     "html_url": "https://github.com/squne121/loop-protocol/issues/1415#issuecomment-900004",
-    "user": { "login": "squne121" },
-    "body": "<!-- retro_live_verification:v1 repo=squne121/loop-protocol issue=1415 -->\n<!-- retro_live_verification_digest:v1 sha256=0000000000000000000000000000000000000000000000000000000000000000 -->\n\n```json\n{}\n```"
+    "user": {
+      "login": "squne121"
+    },
+    "body": "<!-- retro_live_verification:v1 repo=squne121/loop-protocol issue=1415 -->\n<!-- retro_live_verification_digest:v1 sha256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff -->\n\n```json\n{\n  \"context_assertions\": {\n    \"repo\": \"squne121/loop-protocol\",\n    \"target_type\": \"pull_request\",\n    \"target_number\": 1415,\n    \"parent_issue\": 1153,\n    \"marker_comment_url\": \"https://github.com/squne121/loop-protocol/issues/1153#issuecomment-1\",\n    \"expected_digest\": \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n    \"expected_payload_digest\": \"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\n    \"expected_matched_comment_count\": 3\n  },\n  \"pr_review_binding\": {\n    \"review_artifact_ref\": \"https://github.com/squne121/loop-protocol/pull/1415#pullrequestreview-1\",\n    \"reviewed_head_sha\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\n    \"selected_review_id\": 1\n  }\n}\n```"
   }
 ]

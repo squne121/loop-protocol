@@ -46,6 +46,45 @@ const CLI_OPTION_SPEC = {
   '--dry-run': { key: 'dryRun', defaultValue: 'true' },
 }
 
+/**
+ * Fail-closed on *either* pagination completeness flag (Issue #1709 PR
+ * review P1-3). See scripts/check-retro-live-verification.mjs for the
+ * matching verifier-side helper and rationale.
+ */
+export function isPaginationRejected(listing) {
+  return listing?.pagination_exhausted === true || listing?.page_budget_exhausted === true
+}
+
+/**
+ * Pure decision core for the post-write full re-enumeration uniqueness
+ * check (Issue #1709 PR review P1-1). Given every comment observed by a
+ * fresh, complete re-list after a write, requires that exactly one of them
+ * matches the ownership marker and that it is the comment this run itself
+ * just wrote (by id) with the intended digest -- so two concurrent writers
+ * that both observed "no existing comment" and both created a comment can
+ * never both report success.
+ */
+export function evaluatePostWriteUniqueness({ postWriteComments, ownershipMarker, expectedCommentId, expectedDigest }) {
+  const matches = postWriteComments
+    .map((comment) => ({ comment, ...parseExistingCanonicalComment(comment, ownershipMarker) }))
+    .filter((entry) => entry.matches && !entry.malformed)
+  if (matches.length !== 1 || matches[0].comment?.id !== expectedCommentId) {
+    return {
+      ok: false,
+      errorCode: 'retro_live_verification.post_write_duplicate_detected',
+      errorMessage: `expected exactly 1 canonical comment with id ${expectedCommentId} after write, found ${matches.length} matching comment(s)`,
+    }
+  }
+  if (matches[0].digest !== expectedDigest) {
+    return {
+      ok: false,
+      errorCode: 'retro_live_verification.post_write_digest_mismatch',
+      errorMessage: 'post-write full re-list digest did not match the intended canonical comment digest',
+    }
+  }
+  return { ok: true }
+}
+
 function parseBooleanFlag(value, code) {
   if (value === 'true') {
     return true
@@ -62,7 +101,7 @@ function parseBooleanFlag(value, code) {
  * comment format follows, so an existing non-canonical comment (or a
  * malformed prior canonical comment) is never silently overwritten.
  */
-function parseExistingCanonicalComment(comment, ownershipMarker) {
+export function parseExistingCanonicalComment(comment, ownershipMarker) {
   const body = typeof comment?.body === 'string' ? comment.body : ''
   const lines = body.split('\n').map((line) => line.trim()).filter((line) => line.length > 0)
   const [firstLine, secondLine] = lines
@@ -130,7 +169,7 @@ async function runCli() {
   const client = new GhCliIssueCommentsClient()
   const { repo, issue_number: issueNumber } = manifest.canonical_comment
   const listing = await listAllIssueCommentsStructured(client, { repo, issueNumber })
-  if (listing.pagination_exhausted) {
+  if (isPaginationRejected(listing)) {
     process.stdout.write(`${JSON.stringify({ schema: SCHEMA, status: 'error', error_code: 'retro_live_verification.pagination_exhausted', errors: [] })}\n`)
     process.exitCode = 2
     return
@@ -183,6 +222,30 @@ async function runCli() {
   const readbackDigestOk = readbackBody === body && sha256Hex(readbackBody) === sha256Hex(body)
   if (!readbackDigestOk) {
     process.stdout.write(`${JSON.stringify({ schema: SCHEMA, status: 'error', error_code: 'retro_live_verification.post_write_readback_mismatch', error_message: 'post-write readback body did not match the intended canonical comment body byte-for-byte' })}\n`)
+    process.exitCode = 2
+    return
+  }
+
+  // Full re-enumeration + exactly-one-match uniqueness check (Issue #1709
+  // PR review P1-1). A single-comment GET readback (above) cannot detect a
+  // concurrent second writer that also observed "no existing comment" and
+  // also created one: both writers would each see their own write succeed.
+  // Re-listing every comment on the target and requiring the ownership
+  // marker to match *exactly this* comment_id closes that gap.
+  const postWriteListing = await listAllIssueCommentsStructured(client, { repo, issueNumber })
+  if (isPaginationRejected(postWriteListing)) {
+    process.stdout.write(`${JSON.stringify({ schema: SCHEMA, status: 'error', error_code: 'retro_live_verification.post_write_pagination_exhausted', errors: [] })}\n`)
+    process.exitCode = 2
+    return
+  }
+  const uniqueness = evaluatePostWriteUniqueness({
+    postWriteComments: postWriteListing.comments,
+    ownershipMarker,
+    expectedCommentId: commentId,
+    expectedDigest: plan.bodyDigest,
+  })
+  if (!uniqueness.ok) {
+    process.stdout.write(`${JSON.stringify({ schema: SCHEMA, status: 'error', error_code: uniqueness.errorCode, error_message: uniqueness.errorMessage })}\n`)
     process.exitCode = 2
     return
   }

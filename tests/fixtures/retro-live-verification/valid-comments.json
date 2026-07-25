@@ -2,7 +2,9 @@
   {
     "id": 900001,
     "html_url": "https://github.com/squne121/loop-protocol/issues/1415#issuecomment-900001",
-    "user": { "login": "squne121" },
-    "body": "<!-- retro_live_verification:v1 repo=squne121/loop-protocol issue=1415 -->\n<!-- retro_live_verification_digest:v1 sha256=ed49dde9d07336e8801945114de51d6fa204b5f612af8bfade673b35667fa9f8 -->\n\n```json\n{}\n```"
+    "user": {
+      "login": "squne121"
+    },
+    "body": "<!-- retro_live_verification:v1 repo=squne121/loop-protocol issue=1415 -->\n<!-- retro_live_verification_digest:v1 sha256=d6d82bb20ec4737980af1a3239025aa415458678369825ac5be96835f3d56557 -->\n\n```json\n{\n  \"context_assertions\": {\n    \"repo\": \"squne121/loop-protocol\",\n    \"target_type\": \"pull_request\",\n    \"target_number\": 1415,\n    \"parent_issue\": 1153,\n    \"marker_comment_url\": \"https://github.com/squne121/loop-protocol/issues/1153#issuecomment-1\",\n    \"expected_digest\": \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n    \"expected_payload_digest\": \"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\n    \"expected_matched_comment_count\": 3\n  },\n  \"pr_review_binding\": {\n    \"review_artifact_ref\": \"https://github.com/squne121/loop-protocol/pull/1415#pullrequestreview-1\",\n    \"reviewed_head_sha\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\n    \"selected_review_id\": 1\n  }\n}\n```"
   }
 ]
