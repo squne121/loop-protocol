@@ -284,6 +284,37 @@ def _detect_gcloud_adc(env_home: str | None = None) -> dict[str, Any]:
     }
 
 
+# Issue #1740: `agy` (Antigravity CLI) does not authenticate via dbus
+# secret-service (#1726) or gcloud ADC (#1730). Diagnosis during #1494's
+# third live fan-out attempt confirmed it uses its own OAuth token file,
+# `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` (mode 600) -- see
+# Issue #1740 Source section.
+ANTIGRAVITY_CLI_DIRNAME = "antigravity-cli"
+AGY_OAUTH_TOKEN_FILENAME = "antigravity-oauth-token"
+
+
+def _detect_agy_oauth_token(env_home: str | None = None) -> dict[str, Any]:
+    """Detect agy's own OAuth token file-based auth cache presence.
+
+    Existence-check only (Issue #1740 AC3) -- never opens or reads the token
+    file content, only whether
+    `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` exists. This is
+    the actual auth channel `agy` uses; it is distinct from both
+    `_detect_keyring()`'s D-Bus secret-service inference (#1726) and
+    `_detect_gcloud_adc()`'s gcloud ADC file-based cache (#1730), neither of
+    which `agy` consults for auth (confirmed during #1740's diagnosis).
+    """
+    real_home = env_home if env_home is not None else os.environ.get("HOME")
+    if not real_home:
+        return {"token_file_present": False}
+    token_file = Path(real_home) / ".gemini" / ANTIGRAVITY_CLI_DIRNAME / AGY_OAUTH_TOKEN_FILENAME
+    try:
+        token_file_present = token_file.is_file()
+    except OSError:
+        token_file_present = False
+    return {"token_file_present": token_file_present}
+
+
 def _classify_auth_signal(raw_text: str) -> str | None:
     """Classify agy stdout/stderr text for explicit auth/keyring evidence.
 
@@ -345,6 +376,7 @@ def _build_auth_diagnostics(
     env_snapshot = _diagnostic_env_snapshot()
     keyring_info = _detect_keyring(env_snapshot, platform_info)
     gcloud_adc_info = _detect_gcloud_adc()
+    agy_oauth_token_info = _detect_agy_oauth_token()
     auth_signal = _classify_auth_signal(combined_output)
 
     if auth_signal is not None:
@@ -367,6 +399,16 @@ def _build_auth_diagnostics(
             auth_mode, auth_mode_confidence = "api_key_env_present", "inferred"
         else:
             auth_mode, auth_mode_confidence = "system_keyring_cached", "inferred"
+    elif agy_oauth_token_info.get("token_file_present"):
+        # Issue #1740: agy's own OAuth token file is the actual auth channel
+        # `agy` uses -- confirmed during #1494's live fan-out diagnosis that
+        # neither dbus secret-service (#1726) nor gcloud ADC (#1730) resolve
+        # `agy_auth_required` on their own. Checked ahead of the gcloud ADC /
+        # keyring-failure_class fallbacks below so a real, existing agy OAuth
+        # token session is not misreported as "unauthenticated" or
+        # "gcloud_adc_file_based" purely because those other signals are also
+        # present or absent.
+        auth_mode, auth_mode_confidence = "agy_oauth_token_file_based", "inferred"
     elif gcloud_adc_info.get("adc_file_present") or gcloud_adc_info.get("access_tokens_db_present"):
         # Issue #1730: gcloud ADC is a file-based auth cache that does not
         # require a D-Bus session bus at all. Checked ahead of the
@@ -374,6 +416,10 @@ def _build_auth_diagnostics(
         # gcloud ADC session is not misreported as "unauthenticated" purely
         # because no D-Bus session bus is present (Issue #1730 Source: this
         # is exactly the WSL2 fan-out scenario that motivated this Issue).
+        # Issue #1740 diagnosis established gcloud ADC is not actually
+        # consulted by `agy` for auth, so this branch is now reached only
+        # when the agy OAuth token file is absent -- see the
+        # `agy_oauth_token_file_based` branch above, which takes priority.
         auth_mode, auth_mode_confidence = "gcloud_adc_file_based", "inferred"
     elif keyring_info.get("failure_class"):
         auth_mode, auth_mode_confidence = "unauthenticated", "inferred"
@@ -398,6 +444,10 @@ def _build_auth_diagnostics(
         # Issue #1730 AC7: gcloud ADC file-based auth cache presence
         # (existence-check only -- never the file content).
         "gcloud_adc": gcloud_adc_info,
+        # Issue #1740 AC9: agy's own OAuth token file presence
+        # (existence-check only -- never the file content). This is the
+        # actual auth channel `agy` uses.
+        "agy_oauth_token": agy_oauth_token_info,
         "tty": tty_info,
         "platform": platform_info,
         "recovery_action": recovery_action,
