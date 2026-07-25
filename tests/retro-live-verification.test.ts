@@ -1,4 +1,4 @@
-import { readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { resolve as resolvePath, dirname } from 'node:path'
@@ -1200,6 +1200,7 @@ describe('Issue #1415 AC10-11: standalone --schema checker (chatgpt_retrospectiv
 
   it('GIVEN the CLI --schema chatgpt_retrospective_result/v1 --require-findings-or-rationale standalone mode WHEN findings is empty with no rationale THEN the subprocess exits non-zero with the expected error code', () => {
     const tmpFile = resolvePath(REPO_ROOT, 'tmp', `retro-standalone-test-${process.pid}.json`)
+    mkdirSync(dirname(tmpFile), { recursive: true })
     writeFileSync(tmpFile, JSON.stringify({ ...VALID_RETROSPECTIVE_RESULT, no_findings_rationale: undefined, findings: [] }))
     try {
       const result = spawnSync(
