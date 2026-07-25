@@ -370,6 +370,34 @@ function normalizeCommitSha(value, code) {
   return value.toLowerCase()
 }
 
+// Issue #1415 P1-1 fix_delta (post-#1747 adversarial review): the schema's
+// optional `trusted_actor_id_allowlist` had no way to be populated from the
+// normal generate path (only login-only `trusted_actor_allowlist` was
+// wireable), so every ordinarily-generated manifest fell back to the
+// login-only AC4 check even after that check was implemented. Absent
+// entirely (the CLI flag omitted) this returns null and the manifest omits
+// the field -- byte-identical v2 behavior, no digest impact (this lives
+// under execution_boundary, which is not part of the digested payload).
+export function normalizeTrustedActorIdAllowlist(rawValue) {
+  if (rawValue === undefined || rawValue === null || rawValue === '') {
+    return null
+  }
+  const entries = String(rawValue)
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+  if (entries.length === 0) {
+    throw usageError('retro_live_verification.trusted_actor_id_allowlist', 'trusted-actor-id allowlist must contain at least one entry when the flag is passed')
+  }
+  const ids = entries.map((entry) => {
+    if (!/^[0-9]+$/u.test(entry)) {
+      throw usageError('retro_live_verification.trusted_actor_id_allowlist', `trusted-actor-id entry is not a non-negative integer: ${entry}`)
+    }
+    return Number(entry)
+  })
+  return [...new Set(ids)]
+}
+
 export function normalizeTrustedActorAllowlist(rawValue) {
   const entries = String(rawValue ?? '')
     .split(',')
@@ -428,6 +456,9 @@ const CLI_OPTION_SPEC = {
   '--selected-review-comment-id': { key: 'selectedReviewCommentId' },
   '--selected-review-thread-node-id': { key: 'selectedReviewThreadNodeId' },
   '--github-api-version': { key: 'githubApiVersion' },
+  // Issue #1415 P1-1 fix_delta: optional; comma-separated numeric GitHub
+  // user ids. Omitted entirely by default (v2 back-compat, login-only).
+  '--trusted-actor-id': { key: 'trustedActorId' },
   '--out': { key: 'out', required: true },
 }
 
@@ -445,6 +476,7 @@ export function buildManifest(options) {
     ? null
     : normalizePositiveInteger(options.selectedReviewId, 'retro_live_verification.selected_review_id')
   const trustedActorAllowlist = normalizeTrustedActorAllowlist(options.trustedActor)
+  const trustedActorIdAllowlist = normalizeTrustedActorIdAllowlist(options.trustedActorId)
   const expectedPreviousDigest = options.expectedPreviousDigest === undefined || options.expectedPreviousDigest === null || options.expectedPreviousDigest === ''
     ? null
     : normalizeSha256Hex(options.expectedPreviousDigest, 'retro_live_verification.expected_previous_digest')
@@ -489,6 +521,7 @@ export function buildManifest(options) {
       mode: 'generate',
       allowed_paths: [...RETRO_LIVE_VERIFICATION_ALLOWED_PATHS],
       trusted_actor_allowlist: trustedActorAllowlist,
+      ...(trustedActorIdAllowlist !== null ? { trusted_actor_id_allowlist: trustedActorIdAllowlist } : {}),
     },
     canonical_comment: {
       repo,

@@ -14,6 +14,7 @@ import {
   computeResolvedCommentSetDigest,
   fromSha256Prefixed,
   normalizeTrustedActorAllowlist,
+  normalizeTrustedActorIdAllowlist,
   sha256Hex,
   toSha256Prefixed,
   validateManifestWithAjv,
@@ -124,6 +125,32 @@ describe('normalizeTrustedActorAllowlist', () => {
 
   it('GIVEN an empty allowlist WHEN normalized THEN it throws instead of defaulting to "trust everyone"', () => {
     expect(() => normalizeTrustedActorAllowlist('')).toThrow()
+  })
+})
+
+describe('normalizeTrustedActorIdAllowlist (Issue #1415 P1-1 fix_delta)', () => {
+  it('GIVEN --trusted-actor-id omitted (undefined) THEN it returns null, not an empty array (v2 back-compat: field omitted from manifest entirely)', () => {
+    expect(normalizeTrustedActorIdAllowlist(undefined)).toBeNull()
+  })
+
+  it('GIVEN a comma-separated numeric id list with duplicates WHEN normalized THEN it deduplicates and parses to integers', () => {
+    expect(normalizeTrustedActorIdAllowlist('63350259, 63350259,12345')).toEqual([63350259, 12345])
+  })
+
+  it('GIVEN a non-numeric entry WHEN normalized THEN it throws instead of silently dropping the malformed entry', () => {
+    expect(() => normalizeTrustedActorIdAllowlist('63350259,not-a-number')).toThrow()
+  })
+
+  it('GIVEN buildManifest called WITHOUT --trusted-actor-id THEN execution_boundary omits trusted_actor_id_allowlist entirely (byte-identical v2 manifest shape)', () => {
+    const manifest = buildManifest(BASE_ARGS)
+    expect(manifest.execution_boundary).not.toHaveProperty('trusted_actor_id_allowlist')
+  })
+
+  it('GIVEN buildManifest called WITH --trusted-actor-id THEN execution_boundary.trusted_actor_id_allowlist is populated and canonical_comment.body_digest is unaffected (not part of the digested payload)', () => {
+    const withoutId = buildManifest(BASE_ARGS)
+    const withId = buildManifest({ ...BASE_ARGS, trustedActorId: '63350259' })
+    expect(withId.execution_boundary.trusted_actor_id_allowlist).toEqual([63350259])
+    expect(withId.canonical_comment.body_digest).toBe(withoutId.canonical_comment.body_digest)
   })
 })
 
