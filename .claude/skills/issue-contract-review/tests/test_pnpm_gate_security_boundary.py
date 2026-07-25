@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -213,7 +214,16 @@ def test_retro_live_verification_gates_actually_execute_the_intended_check(
     verification.mjs` have required arguments, so any canonical two-token
     invocation was guaranteed to fail with a CLI usage error (exit code 2),
     never to actually run the validation it claims to gate.
+
+    This test needs a real `pnpm` + Node.js toolchain (the `python-test` CI
+    lane deliberately does not install one; see
+    `.claude/skills/ci-test-performance/SKILL.md` Operative Status). Skip
+    rather than fail-closed-block the python-only lane; `node-backed-hook-
+    tests` / local development both have pnpm available and will exercise
+    this contract for real.
     """
+    if shutil.which("pnpm") is None:
+        pytest.skip("pnpm is not installed in this CI lane (python-test does not bootstrap Node/pnpm)")
     launch_argv, evidence, error = registry.prepare_launch(argv, str(REPO_ROOT))
     assert error is None, error
     assert evidence is not None
