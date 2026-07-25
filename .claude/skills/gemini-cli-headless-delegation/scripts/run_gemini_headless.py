@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,9 +25,15 @@ try:
 except ImportError:
     _YAML_AVAILABLE = False
 
-_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
-if _SCRIPTS_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPTS_DIR)
+# Issue #1705 / #1714: AGY profile-scoped isolated permission policy and
+# WebSearch provenance modules. Loaded by path (not package-relative import)
+# so this module keeps working both when executed as a script and when tests
+# load it via importlib.util.spec_from_file_location() with a synthetic
+# module name.
+_AGY_PERMISSION_POLICY_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_AGY_PERMISSION_POLICY_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGY_PERMISSION_POLICY_SCRIPTS_DIR))
+import agy_permission_policy as _agy_permission_policy  # noqa: E402
 
 try:
     import agy_tool_provenance as _agy_provenance
@@ -1951,35 +1958,128 @@ def _build_agy_raw_command(prompt: str) -> list[str]:
     return [agy_bin, "-p", "<prompt>"]
 
 
+# Issue #1705: carries the current call's tool_profile from run_delegation()
+# into _run_agy() without widening _run_agy()'s own call signature. Existing
+# tests (test_agy_provider.py, outside this Issue's Allowed Paths) mock
+# `rgh._run_agy` with 2-positional-argument replacement functions and call
+# `rgh._run_agy(prompt, timeout_sec)` directly; a contextvar lets the profile
+# flow through without changing that call convention. Defaults to None
+# (back-compat: `_minimal_agy_env()` fallback, unchanged prior behavior) for
+# any caller -- including direct/mocked calls -- that does not go through
+# run_delegation()'s agy branch.
+_AGY_TOOL_PROFILE_CTX: "contextvars.ContextVar[str | None]" = contextvars.ContextVar(
+    "_agy_tool_profile_ctx", default=None
+)
+
+
 def _run_agy(
     prompt: str,
     timeout_sec: int,
     *,
     run_context: dict[str, Any] | None = None,
 ) -> "subprocess.CompletedProcess[str]":
-    """Run agy -p <prompt> in an isolated temp cwd with minimal env.
+    """Run agy -p <prompt> in an isolated temp cwd with a profile-scoped permission workspace.
 
     Uses shell=False and AGY_BIN override for hermetic test injection.
 
-    Issue #1708: also generates a *workspace-scoped* AGY `PreToolUse` hook config
-    (`.agents/hooks.json` + wrapper script) inside the isolated temp cwd, so any
-    `search_web` / `read_url_content` tool call the AGY subprocess makes is captured
-    as an `agy_tool_provenance_v1` event. This never touches the user's global
-    Antigravity settings/hooks file -- only files inside the per-run temp dir. The
-    resulting hook events (or a fail-closed load error) are attached to the returned
-    `CompletedProcess` as `agy_provenance_hook_events` / `agy_provenance_hook_load_error`
-    -- callers MUST NOT infer WebSearch success from stdout alone when these are
-    present; see `agy_tool_provenance.evaluate_websearch_provenance()`. Wiring these
-    attached fields into the default `grounding_backend` decision path is deferred to
+    When `_AGY_TOOL_PROFILE_CTX` holds a recognized
+    `agy_permission_policy.ALLOWED_PROFILES` value (set by `run_delegation()`
+    for the current call), an isolated Antigravity workspace
+    (workspace-scoped `.antigravity/settings.json` deny policy) is
+    materialized via `agy_permission_policy.materialize_isolated_agy_workspace()`
+    and its env (HOME/XDG_* redirected into the isolated workspace) is used
+    instead of `_minimal_agy_env()`. Because that env's `HOME` points at the
+    fresh isolated workspace rather than the caller's real `$HOME`, any
+    pre-existing global `$HOME/.antigravity/settings.json` allow rules are
+    structurally unreachable -- the workspace deny policy always applies
+    (Issue #1705 AC5/AC6 config precedence). Falls back to
+    `_minimal_agy_env()` when no profile is set in the contextvar
+    (back-compat with direct/mocked callers).
+
+    Issue #1708: in both branches above, also generates a *workspace-scoped* AGY
+    `PreToolUse` hook config (`.agents/hooks.json` + wrapper script) inside the
+    isolated workspace/temp cwd, so any `search_web` / `read_url_content` tool call
+    the AGY subprocess makes is captured as an `agy_tool_provenance_v1` event. This
+    never touches the user's global Antigravity settings/hooks file -- only files
+    inside the per-run isolated workspace/temp dir. The resulting hook events (or a
+    fail-closed load error) are attached to the returned `CompletedProcess` as
+    `agy_provenance_hook_events` / `agy_provenance_hook_load_error` -- callers MUST
+    NOT infer WebSearch success from stdout alone when these are present; see
+    `agy_tool_provenance.evaluate_websearch_provenance()`. Wiring these attached
+    fields into the default `grounding_backend` decision path is deferred to
     #1494's live E2E run (see Issue #1708 Runtime Verification Applicability).
     """
     agy_bin = str(os.environ.get("AGY_BIN") or "agy")
     command = [agy_bin, "-p", prompt]
+    tool_profile = _AGY_TOOL_PROFILE_CTX.get()
+    if tool_profile in _agy_permission_policy.ALLOWED_PROFILES:
+        workspace = _agy_permission_policy.materialize_isolated_agy_workspace(tool_profile)
+        env = dict(workspace.env)
+        agy_bin_override = os.environ.get("AGY_BIN")
+        if agy_bin_override is not None:
+            env["AGY_BIN"] = agy_bin_override
+        tmp_path = workspace.workspace_dir
+        hook_events: list[dict[str, Any]] = []
+        hook_load_error: str | None = None
+        hook_log_path = tmp_path / "_provenance" / "hook_events.jsonl"
+        hook_context_path = tmp_path / "_provenance" / "hook_context.json"
+
+        if _AGY_PROVENANCE_AVAILABLE:
+            ctx = run_context or {}
+            try:
+                _agy_provenance.generate_workspace_hook_config(
+                    tmp_path,
+                    hook_log_path=hook_log_path,
+                    hook_context_path=hook_context_path,
+                )
+                _agy_provenance.write_hook_context(
+                    hook_context_path,
+                    parent_run_id=str(ctx.get("parent_run_id", "")),
+                    subtask_id=str(ctx.get("subtask_id", "")),
+                    attempt_id=str(ctx.get("attempt_id", "")),
+                    tool_profile=str(ctx.get("tool_profile", "")),
+                    transcript_sha256=str(ctx.get("transcript_sha256", "")),
+                    repo_root=str(_repo_root()),
+                )
+                env = {**env, **_agy_provenance.hook_env(hook_log_path, hook_context_path)}
+            except _agy_provenance.ProvenanceWorkspaceHookError as exc:
+                # Fail-closed: do not fall back to running agy without the hook wired
+                # up silently succeeding as if provenance were captured. Record the
+                # failure; callers must not treat a missing hook log as "no web tool
+                # calls happened" without also checking this field (Issue #1708 AC9).
+                hook_load_error = f"workspace_hook_generation_failed: {exc}"
+
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(workspace.workspace_dir),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                check=False,
+                shell=False,
+            )
+
+            if _AGY_PROVENANCE_AVAILABLE and hook_load_error is None:
+                try:
+                    hook_events = _agy_provenance.load_hook_events(hook_log_path)
+                except _agy_provenance.ProvenanceParseError as exc:
+                    hook_load_error = f"hook_event_log_parse_failed: {exc}"
+
+            # Attached for forward-compatibility with the authoritative provenance
+            # evaluator; existing stdout-marker-based grounding logic below is
+            # unaffected by these attributes (Issue #1708 AC12 regression guard).
+            completed.agy_provenance_hook_events = hook_events  # type: ignore[attr-defined]
+            completed.agy_provenance_hook_load_error = hook_load_error  # type: ignore[attr-defined]
+            return completed
+        finally:
+            shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
     env = _minimal_agy_env()
     with tempfile.TemporaryDirectory(prefix="agy-headless-") as tmp:
         tmp_path = Path(tmp)
-        hook_events: list[dict[str, Any]] = []
-        hook_load_error: str | None = None
+        hook_events = []
+        hook_load_error = None
         hook_log_path = tmp_path / "_provenance" / "hook_events.jsonl"
         hook_context_path = tmp_path / "_provenance" / "hook_context.json"
 
@@ -3680,7 +3780,11 @@ def _run_delegation_core(
             )
             timeout_sec_agy = 300
         try:
-            agy_completed = _run_agy(prompt_text, timeout_sec_agy)
+            _agy_tool_profile_ctx_token = _AGY_TOOL_PROFILE_CTX.set(tool_profile)
+            try:
+                agy_completed = _run_agy(prompt_text, timeout_sec_agy)
+            finally:
+                _AGY_TOOL_PROFILE_CTX.reset(_agy_tool_profile_ctx_token)
         except subprocess.TimeoutExpired:
             return {
                 "schema": "delegation_result/v1",
