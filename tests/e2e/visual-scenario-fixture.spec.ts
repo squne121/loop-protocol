@@ -15,6 +15,15 @@
  * **rejection** (the guard throws before `toHaveScreenshot()` is ever
  * reached), or via predicate-only checks (no baseline PNG), matching this
  * repo's `predicate-only` registry kind (`docs/dev/visual-baseline-registry.md`).
+ *
+ * `expectDomOverlayScreenshot()` calls below pass a placeholder
+ * `'running-hud'` registryId and `{ maxDiffPixels: 1 }` tolerance (Issue
+ * #1386 PR #1721 review fix, P1 Blocker 1/2 — these two parameters became
+ * required when the shared `maxDiffPixelRatio: 0.02` default was removed).
+ * Both are unreachable filler: every call site here asserts a REJECTION
+ * that happens before the function ever reads `registryId` or the
+ * tolerance options (missing scenario binding / rejected screenshot
+ * target), so their actual values are inert.
  */
 
 import { test, expect, type Page } from '@playwright/test'
@@ -100,7 +109,7 @@ test('GIVEN no visual scenario installed on the page WHEN expectDomOverlayScreen
   await page.goto('/')
   const overlay = page.locator('[data-battle-ui-root]')
 
-  await expect(expectDomOverlayScreenshot(overlay, 'no-scenario-bound')).rejects.toThrow(
+  await expect(expectDomOverlayScreenshot(overlay, 'no-scenario-bound', 'running-hud', { maxDiffPixels: 1 })).rejects.toThrow(
     /no visual scenario is bound to this page/,
   )
 })
@@ -151,7 +160,7 @@ test('GIVEN a fixture payload shaped for a pending scenario relabeled with an ac
   // binding for this page (installVisualScenario() was never called), so
   // the screenshot helper independently refuses to capture.
   const overlay = page.locator('[data-battle-ui-root]')
-  await expect(expectDomOverlayScreenshot(overlay, 'relabeled-pending')).rejects.toThrow(
+  await expect(expectDomOverlayScreenshot(overlay, 'relabeled-pending', 'running-hud', { maxDiffPixels: 1 })).rejects.toThrow(
     /no visual scenario is bound to this page/,
   )
 })
@@ -167,7 +176,7 @@ test('GIVEN a compound selector locator for the Canvas WHEN expectDomOverlayScre
   await page.goto('/')
 
   const compoundCanvasLocator = page.locator('canvas.battle-stage__canvas')
-  await expect(expectDomOverlayScreenshot(compoundCanvasLocator, 'compound-canvas')).rejects.toThrow(
+  await expect(expectDomOverlayScreenshot(compoundCanvasLocator, 'compound-canvas', 'running-hud', { maxDiffPixels: 1 })).rejects.toThrow(
     /rejected default screenshot target/,
   )
 })
@@ -179,7 +188,7 @@ test('GIVEN a Canvas locator disguised via .describe() WHEN expectDomOverlayScre
   await page.goto('/')
 
   const disguisedCanvasLocator = page.locator('canvas').describe('totally-not-a-canvas')
-  await expect(expectDomOverlayScreenshot(disguisedCanvasLocator, 'describe-disguised-canvas')).rejects.toThrow(
+  await expect(expectDomOverlayScreenshot(disguisedCanvasLocator, 'describe-disguised-canvas', 'running-hud', { maxDiffPixels: 1 })).rejects.toThrow(
     /rejected default screenshot target/,
   )
 })
@@ -191,7 +200,7 @@ test('GIVEN the <body> element WHEN expectDomOverlayScreenshot OR expectCanvasVi
   await page.goto('/')
 
   const bodyLocator = page.locator('body')
-  await expect(expectDomOverlayScreenshot(bodyLocator, 'body-target')).rejects.toThrow(
+  await expect(expectDomOverlayScreenshot(bodyLocator, 'body-target', 'running-hud', { maxDiffPixels: 1 })).rejects.toThrow(
     /rejected default screenshot target/,
   )
   await expect(
