@@ -93,6 +93,10 @@ export const DEFAULT_CHECK_ARGS = Object.freeze([
   '--manifest-json', 'tests/fixtures/retro-live-verification/gate-manifest.json',
   '--execution-profile', 'fixture',
   '--fixture-comments-json', 'tests/fixtures/retro-live-verification/gate-comments.json',
+  // Issue #1415 AC2: the context-assertions binding now runs unconditionally
+  // (both issue and pull_request targets), so the argument-free fixture
+  // default must supply a matching fixture-resolve-result-json too.
+  '--fixture-resolve-result-json', 'tests/fixtures/retro-live-verification/gate-resolve-result-issue.json',
 ])
 
 const CLI_OPTION_SPEC = {
@@ -404,19 +408,23 @@ async function runCli() {
   const commentCheck = checkCanonicalComment({ manifest, comments })
   const errors = [...commentCheck.errors]
 
-  let contextAssertionsCheck = { ok: true, errors: [] }
-  if (manifest.context_assertions.target_type === 'pull_request') {
-    if (executionProfile === 'fixture' && !options.fixtureResolveResultJson) {
-      throw usageError('retro_live_verification_check.fixture_resolve_result_json_required', '--fixture-resolve-result-json is required when --execution-profile is fixture and target-type is pull_request')
-    }
-    const spawnResult = runContextAssertionsBindingSubprocess({
-      contextAssertions: manifest.context_assertions,
-      executionProfile,
-      fixtureResolveResultJson: options.fixtureResolveResultJson,
-    })
-    contextAssertionsCheck = evaluateContextAssertionsBinding(spawnResult)
-    errors.push(...contextAssertionsCheck.errors)
+  // Issue #1415 AC2: the assert-live context-assertion binding must run for
+  // *both* target types. Prior to this fix, this block only executed when
+  // `target_type === 'pull_request'`, so an issue-target manifest silently
+  // skipped context-assertion verification entirely (contextAssertionsCheck
+  // stayed at its `{ ok: true, errors: [] }` default) -- the exact defect
+  // Issue #1415 names explicitly ("現行の『PR targetのみcontext assertionを
+  // 実行』の挙動").
+  if (executionProfile === 'fixture' && !options.fixtureResolveResultJson) {
+    throw usageError('retro_live_verification_check.fixture_resolve_result_json_required', '--fixture-resolve-result-json is required when --execution-profile is fixture')
   }
+  const contextAssertionsSpawnResult = runContextAssertionsBindingSubprocess({
+    contextAssertions: manifest.context_assertions,
+    executionProfile,
+    fixtureResolveResultJson: options.fixtureResolveResultJson,
+  })
+  const contextAssertionsCheck = evaluateContextAssertionsBinding(contextAssertionsSpawnResult)
+  errors.push(...contextAssertionsCheck.errors)
 
   let prReviewBindingCheck = { ok: true, errors: [] }
   if (manifest.context_assertions.target_type === 'pull_request' && manifest.pr_review_binding.selected_review_id !== null) {

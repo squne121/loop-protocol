@@ -465,6 +465,68 @@ describe('required negative test 3 (end-to-end subprocess): repository/pullReque
   })
 })
 
+describe('Issue #1415 AC2: context_assertions binding runs for issue targets too, not only pull_request targets', () => {
+  const checkScriptPath = resolvePath(REPO_ROOT, 'scripts/check-retro-live-verification.mjs')
+  const manifestPath = resolvePath(FIXTURES_DIR, 'gate-manifest.json')
+  const commentsPath = resolvePath(FIXTURES_DIR, 'gate-comments.json')
+  const resolveResultIssueValidPath = resolvePath(FIXTURES_DIR, 'gate-resolve-result-issue.json')
+  const resolveResultIssueMismatchPath = resolvePath(FIXTURES_DIR, 'gate-resolve-result-issue-mismatch.json')
+
+  it('GIVEN an issue-target manifest with a resolve-result fixture that MATCHES its context_assertions WHEN checked THEN the process passes', () => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        checkScriptPath,
+        '--manifest-json', manifestPath,
+        '--execution-profile', 'fixture',
+        '--fixture-comments-json', commentsPath,
+        '--fixture-resolve-result-json', resolveResultIssueValidPath,
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).toBe(0)
+    const payload = JSON.parse(result.stdout.trim())
+    expect(payload.verification_status).toBe('pass')
+  })
+
+  it('GIVEN an issue-target manifest with a resolve-result fixture whose matched_comment_count does NOT match its context_assertions WHEN checked THEN the process fails closed (regression guard: before the AC2 fix, this block was skipped entirely for target_type "issue" and always defaulted to ok:true)', () => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        checkScriptPath,
+        '--manifest-json', manifestPath,
+        '--execution-profile', 'fixture',
+        '--fixture-comments-json', commentsPath,
+        '--fixture-resolve-result-json', resolveResultIssueMismatchPath,
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).toBe(1)
+    const payload = JSON.parse(result.stdout.trim())
+    expect(payload.verification_status).toBe('fail')
+    expect(
+      payload.errors.some((error: { code: string }) => error.code === 'retro_live_verification_check.context_assertions_live_binding_failed'),
+    ).toBe(true)
+  })
+
+  it('GIVEN an issue-target manifest in fixture mode WITHOUT --fixture-resolve-result-json WHEN checked THEN it is a usage error, never a silent skip', () => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        checkScriptPath,
+        '--manifest-json', manifestPath,
+        '--execution-profile', 'fixture',
+        '--fixture-comments-json', commentsPath,
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).toBe(2)
+    const payload = JSON.parse(result.stdout.trim())
+    expect(payload.verification_status).toBe('error')
+    expect(payload.error_code).toBe('retro_live_verification_check.fixture_resolve_result_json_required')
+  })
+})
+
 describe('argument-free CLI wrapper fallback (Issue #1709 PR review P0-5, AC5/AC7)', () => {
   const generateScriptPath = resolvePath(REPO_ROOT, 'scripts/generate-retro-live-verification.mjs')
   const checkScriptPath = resolvePath(REPO_ROOT, 'scripts/check-retro-live-verification.mjs')
@@ -502,6 +564,12 @@ describe('argument-free CLI wrapper fallback (Issue #1709 PR review P0-5, AC5/AC
         'fixture',
         '--fixture-comments-json',
         resolvePath(FIXTURES_DIR, 'stale-digest-comments.json'),
+        // Issue #1415 AC2: context-assertions binding now runs unconditionally
+        // (both issue and pull_request targets), so fixture mode always
+        // requires a fixture-resolve-result-json even when this test's intent
+        // is to exercise the *comment-check* failure path below.
+        '--fixture-resolve-result-json',
+        resolvePath(FIXTURES_DIR, 'gate-resolve-result-issue.json'),
       ],
       { cwd: REPO_ROOT, encoding: 'utf-8' },
     )
