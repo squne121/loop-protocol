@@ -70,14 +70,37 @@ import { fileURLToPath } from 'node:url'
 
 import { CliError, parseArgs, usageError } from './agent-logs/lib/args.mjs'
 import {
+  fetchPullRequestReviewSurfaceLive,
   GhCliIssueCommentsClient,
   listAllIssueCommentsStructured,
 } from './agent-logs/lib/github-comments.mjs'
-import { canonicalJsonStringify, sha256Hex, validateManifestWithAjv } from './generate-retro-live-verification.mjs'
+import {
+  CANONICALIZATION_PROFILE_LOOP_V1,
+  canonicalJsonStringify,
+  computeResolvedCommentSetDigest,
+  loadAjv,
+  sha256Hex,
+  validateManifestWithAjv,
+} from './generate-retro-live-verification.mjs'
 
 export const SCHEMA = 'retro_live_verification_check_result/v1'
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
+const REPO_ROOT = resolvePath(SCRIPT_DIR, '..')
 const ASSERT_LIVE_SCRIPT_PATH = resolvePath(SCRIPT_DIR, 'assert-chatgpt-retro-context-live.mjs')
+// Issue #1415 AC10-11 (additive, optional gate).
+const RETROSPECTIVE_RESULT_SCHEMA_FILE = resolvePath(REPO_ROOT, 'docs/schemas/chatgpt-retrospective-result.schema.json')
+const RETROSPECTIVE_RESULT_SCHEMA_ID = 'chatgpt_retrospective_result/v1'
+// Issue #1415 (dual-target bundle, additive standalone mode): a distinct
+// schema/file from retro_live_verification/v2 (retro-live-verification.
+// schema.json) -- v3 is never a mutation of a v2 manifest, so v2 producers/
+// consumers are unaffected by this constant's existence.
+const DUAL_TARGET_BUNDLE_SCHEMA_FILE = resolvePath(REPO_ROOT, 'docs/schemas/retro-live-verification-dual-target.schema.json')
+const DUAL_TARGET_BUNDLE_SCHEMA_ID = 'retro_live_verification/v3'
+// Boilerplate placeholder phrases that must not, by themselves, satisfy
+// no_findings_rationale -- a caller writing one of these (with or without
+// surrounding whitespace/trailing punctuation) is not providing a real
+// rationale, just rubber-stamping the empty-findings case.
+const NO_FINDINGS_RATIONALE_BOILERPLATE_PATTERN = /^(no findings|nothing to report|n\/a|none)\.?$/iu
 const DEFAULT_SUBPROCESS_TIMEOUT_MS = 30000
 const DEFAULT_MAX_BUFFER = 10 * 1024 * 1024
 const JSON_FENCE_PATTERN = /```json\r?\n(?<payload>[\s\S]*?)\r?\n```/u
@@ -93,14 +116,137 @@ export const DEFAULT_CHECK_ARGS = Object.freeze([
   '--manifest-json', 'tests/fixtures/retro-live-verification/gate-manifest.json',
   '--execution-profile', 'fixture',
   '--fixture-comments-json', 'tests/fixtures/retro-live-verification/gate-comments.json',
+  // Issue #1415 AC2: the context-assertions binding now runs unconditionally
+  // (both issue and pull_request targets), so the argument-free fixture
+  // default must supply a matching fixture-resolve-result-json too.
+  '--fixture-resolve-result-json', 'tests/fixtures/retro-live-verification/gate-resolve-result-issue.json',
 ])
 
 const CLI_OPTION_SPEC = {
-  '--manifest-json': { key: 'manifestJson', required: true },
+  // Issue #1415 AC10-11: not marked `required: true` here because the
+  // standalone --schema mode (below) does not use a retro_live_verification
+  // manifest at all; runCli() enforces manifest-json's presence explicitly
+  // for the (default) manifest-checking mode instead.
+  '--manifest-json': { key: 'manifestJson' },
   '--execution-profile': { key: 'executionProfile', defaultValue: 'live' },
   '--fixture-comments-json': { key: 'fixtureCommentsJson' },
   '--fixture-resolve-result-json': { key: 'fixtureResolveResultJson' },
   '--fixture-pr-review-json': { key: 'fixturePrReviewJson' },
+  // Issue #1415 AC5-7 (additive, optional gate).
+  '--refetch-pr-review-surface': { key: 'refetchPrReviewSurface', defaultValue: 'false' },
+  '--fixture-pr-review-surface-json': { key: 'fixturePrReviewSurfaceJson' },
+  // Issue #1415 AC13 (additive, optional gate): when passed, require
+  // runtime_provenance's locally-derivable fields to be non-null.
+  '--require-runtime-provenance': { key: 'requireRuntimeProvenance', defaultValue: 'false' },
+  // Issue #1415 AC15 (additive, optional gate): when passed, fail-closed if
+  // the elapsed time between runtime_provenance.generated_at (capture) and
+  // --posted-at (or "now" when omitted) exceeds the given number of seconds.
+  '--max-capture-to-post-lag-seconds': { key: 'maxCaptureToPostLagSeconds' },
+  '--posted-at': { key: 'postedAt' },
+  // Issue #1415 AC8-9 (additive, optional gate): recompute
+  // resolved_comment_set_digest from an independently-supplied comment-set
+  // JSON file and compare against the value stored in the manifest.
+  '--recompute-digests': { key: 'recomputeDigests', defaultValue: 'false' },
+  '--comment-set-json': { key: 'commentSetJson' },
+  // Issue #1415 AC10-11 (additive, standalone mode -- these two flags run a
+  // single independent schema/content check over --input and exit, they do
+  // not combine with the retro_live_verification manifest checks above).
+  '--schema': { key: 'targetSchema' },
+  '--require-findings-or-rationale': { key: 'requireFindingsOrRationale', defaultValue: 'false' },
+  '--check-execution-boundary': { key: 'checkExecutionBoundary', defaultValue: 'false' },
+  '--input': { key: 'standaloneInput' },
+  // Issue #1415 dual-target bundle (--schema retro_live_verification/v3):
+  // per-target fixture resolve-result files for the assert-live context-
+  // assertion binding that this standalone mode runs unconditionally for
+  // BOTH issue_target and pull_request_target (mirrors the AC2 fix, applied
+  // to both targets rather than just the manifest-mode single target).
+  '--fixture-resolve-result-json-issue-target': { key: 'fixtureResolveResultJsonIssueTarget' },
+  '--fixture-resolve-result-json-pull-request-target': { key: 'fixtureResolveResultJsonPullRequestTarget' },
+}
+
+/**
+ * Issue #1415 AC13: pure presence/type check over an already-loaded
+ * manifest's runtime_provenance. node_version/pnpm_version/
+ * pnpm_lockfile_digest/gh_cli_version are always locally derivable and must
+ * be non-null; github_api_version/workflow_run_identity may legitimately be
+ * null outside a live-API / GitHub-Actions context, but the keys themselves
+ * must be present (not simply absent from an old-shaped manifest).
+ */
+export function checkRuntimeProvenanceComplete(runtimeProvenance) {
+  const errors = []
+  const requiredNonNullKeys = ['node_version', 'pnpm_version', 'pnpm_lockfile_digest', 'gh_cli_version']
+  for (const key of requiredNonNullKeys) {
+    if (!Object.prototype.hasOwnProperty.call(runtimeProvenance ?? {}, key) || runtimeProvenance[key] === null || runtimeProvenance[key] === undefined) {
+      errors.push({ code: 'retro_live_verification_check.runtime_provenance_missing_field', message: `runtime_provenance.${key} is required and must be non-null` })
+    }
+  }
+  for (const key of ['github_api_version', 'workflow_run_identity']) {
+    if (!Object.prototype.hasOwnProperty.call(runtimeProvenance ?? {}, key)) {
+      errors.push({ code: 'retro_live_verification_check.runtime_provenance_missing_field', message: `runtime_provenance.${key} key must be present (may be null)` })
+    }
+  }
+  return { ok: errors.length === 0, errors }
+}
+
+/**
+ * Issue #1415 AC15: pure freshness/max-lag check. `captureIso` is the
+ * manifest's runtime_provenance.generated_at; `postedIso` is either an
+ * explicit --posted-at value or the current time. A negative lag (posted
+ * before captured) is also fail-closed -- it indicates a tampered or
+ * inconsistent manifest/post timeline, never a pass.
+ */
+export function checkCaptureToPostLag({ captureIso, postedIso, maxLagSeconds }) {
+  const captureMs = Date.parse(captureIso)
+  const postedMs = Date.parse(postedIso)
+  if (Number.isNaN(captureMs)) {
+    return { ok: false, errors: [{ code: 'retro_live_verification_check.capture_timestamp_invalid', message: `runtime_provenance.generated_at is not a valid timestamp: ${JSON.stringify(captureIso)}` }] }
+  }
+  if (Number.isNaN(postedMs)) {
+    return { ok: false, errors: [{ code: 'retro_live_verification_check.posted_timestamp_invalid', message: `--posted-at is not a valid timestamp: ${JSON.stringify(postedIso)}` }] }
+  }
+  const lagSeconds = (postedMs - captureMs) / 1000
+  if (lagSeconds < 0) {
+    return { ok: false, errors: [{ code: 'retro_live_verification_check.capture_to_post_lag_negative', message: `posted timestamp (${postedIso}) is earlier than capture timestamp (${captureIso})` }] }
+  }
+  if (lagSeconds > maxLagSeconds) {
+    return { ok: false, errors: [{ code: 'retro_live_verification_check.capture_to_post_lag_exceeded', message: `capture-to-post lag ${lagSeconds}s exceeds max-capture-to-post-lag-seconds ${maxLagSeconds}s` }] }
+  }
+  return { ok: true, errors: [], lagSeconds }
+}
+
+function normalizeMaxLagSeconds(value) {
+  if (!/^(0|[1-9][0-9]*)$/u.test(String(value))) {
+    throw usageError('retro_live_verification_check.max_capture_to_post_lag_seconds', 'max-capture-to-post-lag-seconds must be a non-negative integer')
+  }
+  return Number(value)
+}
+
+/**
+ * Issue #1415 AC8-9: recomputes `resolved_comment_set_digest` from an
+ * independently-supplied comment-set (never from the manifest's own stored
+ * digest, and never from the same resolver invocation that produced the
+ * manifest -- the caller is expected to have fetched `commentSet` fresh) and
+ * compares it byte-exact against `manifest.resolved_comment_set_digest`.
+ * Fails closed if the manifest field is absent (nothing to recompute
+ * against) or the canonicalization_profile does not match.
+ */
+export function evaluateResolvedCommentSetDigest({ manifest, commentSet }) {
+  const stored = manifest?.resolved_comment_set_digest
+  if (stored === null || stored === undefined) {
+    return { ok: false, errors: [{ code: 'retro_live_verification_check.resolved_comment_set_digest_missing', message: 'manifest.resolved_comment_set_digest is required when --recompute-digests is passed' }] }
+  }
+  if (stored.canonicalization_profile !== CANONICALIZATION_PROFILE_LOOP_V1) {
+    return { ok: false, errors: [{ code: 'retro_live_verification_check.resolved_comment_set_digest_profile_mismatch', message: `manifest.resolved_comment_set_digest.canonicalization_profile ${JSON.stringify(stored.canonicalization_profile)} does not match expected ${JSON.stringify(CANONICALIZATION_PROFILE_LOOP_V1)}` }] }
+  }
+  const recomputed = computeResolvedCommentSetDigest({
+    repoId: commentSet?.repo_id ?? null,
+    targetNodeId: commentSet?.target_node_id ?? null,
+    comments: commentSet?.comments ?? [],
+  })
+  if (recomputed !== stored.digest) {
+    return { ok: false, errors: [{ code: 'retro_live_verification_check.resolved_comment_set_digest_mismatch', message: `recomputed resolved_comment_set_digest ${recomputed} does not match manifest value ${stored.digest}` }] }
+  }
+  return { ok: true, errors: [] }
 }
 
 /**
@@ -113,6 +259,10 @@ const CLI_OPTION_SPEC = {
  */
 export function isPaginationRejected(listing) {
   return listing?.pagination_exhausted === true || listing?.page_budget_exhausted === true
+}
+
+function parseBooleanFlag(value) {
+  return value === 'true'
 }
 
 function normalizeExecutionProfile(value) {
@@ -130,10 +280,34 @@ function parseCanonicalCommentMarkers(comment, ownershipMarker) {
     return { matches: false, malformed: false }
   }
   const digestMatch = (secondLine ?? '').match(/^<!-- retro_live_verification_digest:v1 sha256=(?<digest>[a-f0-9]{64}) -->$/u)
+  const authorLogin = comment?.user?.login ?? null
+  const authorId = typeof comment?.user?.id === 'number' && Number.isInteger(comment.user.id) ? comment.user.id : null
   if (!digestMatch?.groups) {
-    return { matches: true, malformed: true, body }
+    return { matches: true, malformed: true, authorLogin, authorId, body }
   }
-  return { matches: true, malformed: false, digest: digestMatch.groups.digest, authorLogin: comment?.user?.login ?? null, body }
+  return { matches: true, malformed: false, digest: digestMatch.groups.digest, authorLogin, authorId, body }
+}
+
+/**
+ * Issue #1415 AC4: trust judgment must be evaluated before malformed/
+ * duplicate candidate counting, and author association (login) alone is not
+ * a sufficient trust anchor on its own. When the manifest declares an
+ * optional `trusted_actor_id_allowlist` (Issue #1709's `trusted_actor_allowlist`
+ * remains login-only for v2 backward compatibility), an author must match
+ * BOTH an allowed login AND an allowed numeric GitHub user id to be trusted;
+ * a bare login match is insufficient once a numeric allowlist is declared
+ * (defeats a renamed/impersonating account reusing a trusted login string).
+ * When `trusted_actor_id_allowlist` is absent entirely, this degrades to the
+ * v2 login-only check unchanged.
+ */
+export function isTrustedMarkerAuthor({ authorLogin, authorId }, executionBoundary) {
+  const loginTrusted = typeof authorLogin === 'string' && executionBoundary.trusted_actor_allowlist.includes(authorLogin)
+  const idAllowlist = executionBoundary.trusted_actor_id_allowlist
+  if (!Array.isArray(idAllowlist) || idAllowlist.length === 0) {
+    return loginTrusted
+  }
+  const idTrusted = typeof authorId === 'number' && idAllowlist.includes(authorId)
+  return loginTrusted && idTrusted
 }
 
 /**
@@ -183,21 +357,35 @@ export function checkCanonicalComment({ manifest, comments }) {
   const errors = []
   const { ownership_marker: ownershipMarker, body_digest: expectedDigest } = manifest.canonical_comment
   const parsed = comments.map((comment) => ({ comment, ...parseCanonicalCommentMarkers(comment, ownershipMarker) }))
-  const matches = parsed.filter((entry) => entry.matches)
+  const allMatches = parsed.filter((entry) => entry.matches)
 
-  if (matches.some((entry) => entry.malformed)) {
-    errors.push({ code: 'retro_live_verification_check.malformed_canonical_comment', message: 'a comment matches the ownership marker but its digest marker is malformed' })
+  // Issue #1415 AC4: trust is judged first. Untrusted candidates are
+  // excluded from the canonical/duplicate candidate count entirely -- they
+  // must never be able to trigger a false "multiple canonical comments"
+  // block, nor (conversely) hide a genuine trusted duplicate by diluting the
+  // count. Malformed-marker and duplicate-count fail-closed checks below
+  // therefore only ever look at the trusted subset.
+  const trustedMatches = allMatches.filter((entry) => isTrustedMarkerAuthor(entry, manifest.execution_boundary))
+
+  if (trustedMatches.length === 0) {
+    if (allMatches.length === 0) {
+      errors.push({ code: 'retro_live_verification_check.matched_comment_count_mismatch', message: 'expected exactly 1 canonical comment, found 0' })
+    } else {
+      const [untrusted] = allMatches
+      errors.push({ code: 'retro_live_verification_check.untrusted_marker_author', message: `canonical comment author ${untrusted.authorLogin} (id ${untrusted.authorId}) is not in the trusted_actor_allowlist / trusted_actor_id_allowlist` })
+    }
     return { ok: false, errors }
   }
-  if (matches.length !== 1) {
-    errors.push({ code: 'retro_live_verification_check.matched_comment_count_mismatch', message: `expected exactly 1 canonical comment, found ${matches.length}` })
+  if (trustedMatches.some((entry) => entry.malformed)) {
+    errors.push({ code: 'retro_live_verification_check.malformed_canonical_comment', message: 'a trusted-author comment matches the ownership marker but its digest marker is malformed' })
+    return { ok: false, errors }
+  }
+  if (trustedMatches.length !== 1) {
+    errors.push({ code: 'retro_live_verification_check.matched_comment_count_mismatch', message: `expected exactly 1 trusted canonical comment, found ${trustedMatches.length}` })
     return { ok: false, errors }
   }
 
-  const [match] = matches
-  if (!manifest.execution_boundary.trusted_actor_allowlist.includes(match.authorLogin)) {
-    errors.push({ code: 'retro_live_verification_check.untrusted_marker_author', message: `canonical comment author ${match.authorLogin} is not in the trusted_actor_allowlist` })
-  }
+  const [match] = trustedMatches
   if (match.digest !== expectedDigest) {
     errors.push({ code: 'retro_live_verification_check.stale_digest', message: `canonical comment digest marker ${match.digest} does not match manifest expectation ${expectedDigest}` })
   }
@@ -338,6 +526,90 @@ export function verifyPrReviewBindingLive({ prReviewBinding, review }) {
   return { ok: errors.length === 0, errors }
 }
 
+/**
+ * Issue #1415 AC5-7: pure cross-validation over an already-fetched (or
+ * fixture-loaded) PR review surface (`{ headRefOid, reviews, reviewThreads }`
+ * from `fetchPullRequestReviewSurfaceLive`). Never defaults an absent/null
+ * surface field to "no binding to check" when the manifest's
+ * `pr_review_binding` declares a non-null selector for it.
+ *
+ * Requires (when `selected_review_id` is non-null):
+ *   - review_count >= 1, review_comment_count >= 1 (across all threads),
+ *     resolved_thread_count >= 1
+ *   - a review with databaseId === selected_review_id exists, and its
+ *     commit.oid equals both manifest.reviewed_head_sha AND the live
+ *     surface's headRefOid (stale-PR-head detection)
+ *   - when selected_review_comment_id is non-null: a review comment with
+ *     that databaseId exists, and its pullRequestReview.databaseId equals
+ *     selected_review_id
+ *   - when selected_review_thread_node_id is non-null: a thread with that
+ *     node id exists, is isResolved === true, and its comments include the
+ *     selected review comment
+ */
+export function evaluatePrReviewSurfaceBinding({ surface, prReviewBinding }) {
+  const errors = []
+  const reviews = Array.isArray(surface?.reviews) ? surface.reviews : []
+  const reviewThreads = Array.isArray(surface?.reviewThreads) ? surface.reviewThreads : []
+  const allComments = reviewThreads.flatMap((thread) => (Array.isArray(thread?.comments?.nodes) ? thread.comments.nodes : []))
+  const resolvedThreads = reviewThreads.filter((thread) => thread?.isResolved === true)
+
+  if (reviews.length < 1) {
+    errors.push({ code: 'retro_live_verification_check.pr_review_surface_zero_reviews', message: 'expected at least 1 review, found 0' })
+  }
+  if (allComments.length < 1) {
+    errors.push({ code: 'retro_live_verification_check.pr_review_surface_zero_review_comments', message: 'expected at least 1 review comment, found 0' })
+  }
+  if (resolvedThreads.length < 1) {
+    errors.push({ code: 'retro_live_verification_check.pr_review_surface_zero_resolved_threads', message: 'expected at least 1 resolved review thread, found 0' })
+  }
+
+  if (prReviewBinding.selected_review_id === null || prReviewBinding.selected_review_id === undefined) {
+    return { ok: errors.length === 0, errors }
+  }
+
+  const selectedReview = reviews.find((review) => review?.databaseId === prReviewBinding.selected_review_id)
+  if (!selectedReview) {
+    errors.push({ code: 'retro_live_verification_check.pr_review_surface_selected_review_missing', message: `no live review with databaseId ${prReviewBinding.selected_review_id} was found` })
+  } else {
+    const reviewCommitOid = selectedReview.commit?.oid ?? null
+    if (reviewCommitOid !== prReviewBinding.reviewed_head_sha) {
+      errors.push({ code: 'retro_live_verification_check.pr_review_surface_reviewed_head_sha_mismatch', message: `selected review commit.oid ${JSON.stringify(reviewCommitOid)} does not match manifest reviewed_head_sha ${prReviewBinding.reviewed_head_sha}` })
+    }
+    if (surface.headRefOid !== null && surface.headRefOid !== undefined && surface.headRefOid !== prReviewBinding.reviewed_head_sha) {
+      errors.push({ code: 'retro_live_verification_check.pr_review_surface_stale_pr_head', message: `live PR headRefOid ${JSON.stringify(surface.headRefOid)} no longer matches manifest reviewed_head_sha ${prReviewBinding.reviewed_head_sha}` })
+    }
+  }
+
+  let selectedComment = null
+  if (prReviewBinding.selected_review_comment_id !== null && prReviewBinding.selected_review_comment_id !== undefined) {
+    selectedComment = allComments.find((comment) => comment?.databaseId === prReviewBinding.selected_review_comment_id) ?? null
+    if (!selectedComment) {
+      errors.push({ code: 'retro_live_verification_check.pr_review_surface_selected_comment_missing', message: `no live review comment with databaseId ${prReviewBinding.selected_review_comment_id} was found` })
+    } else if (selectedComment.pullRequestReview?.databaseId !== prReviewBinding.selected_review_id) {
+      errors.push({ code: 'retro_live_verification_check.pr_review_surface_comment_review_mismatch', message: `selected review comment's pullRequestReview.databaseId ${JSON.stringify(selectedComment.pullRequestReview?.databaseId)} does not match selected_review_id ${prReviewBinding.selected_review_id}` })
+    }
+  }
+
+  if (prReviewBinding.selected_review_thread_node_id !== null && prReviewBinding.selected_review_thread_node_id !== undefined) {
+    const selectedThread = reviewThreads.find((thread) => thread?.id === prReviewBinding.selected_review_thread_node_id)
+    if (!selectedThread) {
+      errors.push({ code: 'retro_live_verification_check.pr_review_surface_selected_thread_missing', message: `no live review thread with id ${prReviewBinding.selected_review_thread_node_id} was found` })
+    } else {
+      if (selectedThread.isResolved !== true) {
+        errors.push({ code: 'retro_live_verification_check.pr_review_surface_thread_unresolved', message: `selected review thread ${prReviewBinding.selected_review_thread_node_id} is not resolved` })
+      }
+      if (selectedComment) {
+        const threadCommentIds = new Set((selectedThread.comments?.nodes ?? []).map((comment) => comment?.databaseId))
+        if (!threadCommentIds.has(selectedComment.databaseId)) {
+          errors.push({ code: 'retro_live_verification_check.pr_review_surface_comment_not_in_thread', message: `selected review comment ${selectedComment.databaseId} is not a member of selected review thread ${prReviewBinding.selected_review_thread_node_id}` })
+        }
+      }
+    }
+  }
+
+  return { ok: errors.length === 0, errors }
+}
+
 function fetchPullRequestReviewLive({ repo, pullNumber, reviewId }) {
   const result = spawnSync('gh', [
     'api',
@@ -370,9 +642,178 @@ async function loadJsonFile(filePath, code) {
   }
 }
 
+/**
+ * Issue #1415 AC10: pure check over an already schema-valid
+ * chatgpt_retrospective_result/v1 payload. Fails closed when findings is
+ * empty and no_findings_rationale is either absent or matches a boilerplate
+ * placeholder phrase (schema minLength alone cannot reject e.g. "no findings
+ * at all, nothing to report here" style padding designed only to clear a
+ * length check -- this additionally rejects the exact boilerplate phrases).
+ */
+export function evaluateFindingsOrRationale(payload) {
+  const findings = Array.isArray(payload?.findings) ? payload.findings : []
+  if (findings.length > 0) {
+    return { ok: true, errors: [] }
+  }
+  const rationale = payload?.no_findings_rationale
+  if (typeof rationale !== 'string' || rationale.trim().length === 0) {
+    return { ok: false, errors: [{ code: 'retro_live_verification_check.no_findings_rationale_missing', message: 'findings is empty and no_findings_rationale is absent/empty' }] }
+  }
+  if (NO_FINDINGS_RATIONALE_BOILERPLATE_PATTERN.test(rationale.trim())) {
+    return { ok: false, errors: [{ code: 'retro_live_verification_check.no_findings_rationale_boilerplate', message: `no_findings_rationale is a rejected boilerplate placeholder: ${JSON.stringify(rationale)}` }] }
+  }
+  return { ok: true, errors: [] }
+}
+
+/**
+ * Issue #1415 AC11: the operator_attested/machine_verified distinction is
+ * enforced structurally by docs/schemas/chatgpt-retro-execution-proof.schema.json
+ * (proof_strength.{connector_only_execution,local_file_non_use,latitude_direct_non_use}
+ * are a closed enum of exactly "machine_verified"/"declared_by_session_operator",
+ * and machine_verifies_actual_chatgpt_tool_boundary is pinned `const: false`) --
+ * this function is a thin ajv-validation wrapper so --check-execution-boundary
+ * can be driven from this CLI without duplicating that schema's constraints.
+ */
+export async function validateAgainstSchemaFile(schemaFilePath, payload) {
+  const { Ajv2020: AjvCtor, addFormats: applyFormats } = await loadAjv()
+  const ajv = new AjvCtor({ strict: true, allErrors: true })
+  applyFormats(ajv)
+  const schemaText = await readFile(schemaFilePath, 'utf-8')
+  const schema = JSON.parse(schemaText)
+  const validate = ajv.compile(schema)
+  const valid = validate(payload)
+  return {
+    valid,
+    errors: valid ? [] : (validate.errors ?? []).map((error) => ({
+      path: error.instancePath || '/',
+      keyword: error.keyword,
+      message: error.message ?? 'schema validation failed',
+    })),
+  }
+}
+
+/**
+ * Issue #1415 (dual-target bundle): runs the assert-live context-assertion
+ * binding for a single target's context_assertions object, reusing the same
+ * hardened subprocess delegation the v2 manifest path uses (never a second,
+ * weaker re-implementation). Returns the same shape as
+ * evaluateContextAssertionsBinding's input errors array, prefixed with which
+ * target failed so a dual-target failure is never ambiguous about which side
+ * broke.
+ */
+function evaluateDualTargetContextAssertions({ targetKey, contextAssertions, executionProfile, fixtureResolveResultJson }) {
+  if (executionProfile === 'fixture' && !fixtureResolveResultJson) {
+    throw usageError(
+      'retro_live_verification_check.dual_target_fixture_resolve_result_json_required',
+      `--fixture-resolve-result-json-${targetKey === 'issue_target' ? 'issue-target' : 'pull-request-target'} is required when --execution-profile is fixture`,
+    )
+  }
+  const spawnResult = runContextAssertionsBindingSubprocess({ contextAssertions, executionProfile, fixtureResolveResultJson })
+  const check = evaluateContextAssertionsBinding(spawnResult)
+  return {
+    ok: check.ok,
+    errors: check.errors.map((error) => ({ ...error, message: `[${targetKey}] ${error.message}` })),
+  }
+}
+
+/**
+ * Issue #1415 (dual-target bundle): structural + context-assertion checks
+ * for a retro_live_verification/v3 payload. Schema validation alone can
+ * confirm both targets' comment URLs/digests are present and shaped
+ * correctly, but per the AC2 fix this also unconditionally runs the
+ * assert-live binding for BOTH issue_target.context_assertions and
+ * pull_request_target.context_assertions -- there is no PR-only special
+ * case here, matching the manifest-mode fix.
+ */
+export async function checkDualTargetBundle(payload, { executionProfile, fixtureResolveResultJsonIssueTarget, fixtureResolveResultJsonPullRequestTarget }) {
+  const errors = []
+  const schemaValidation = await validateAgainstSchemaFile(DUAL_TARGET_BUNDLE_SCHEMA_FILE, payload)
+  if (!schemaValidation.valid) {
+    errors.push(...schemaValidation.errors.map((error) => ({ code: 'retro_live_verification_check.dual_target_bundle_schema_invalid', message: `${error.path}: ${error.message}` })))
+    // A structurally invalid bundle cannot be safely dereferenced further
+    // (e.g. issue_target may be entirely absent) -- fail closed here rather
+    // than risk a TypeError-as-crash or an undefined-context-assertions
+    // false pass.
+    return { ok: false, errors }
+  }
+
+  const issueCheck = evaluateDualTargetContextAssertions({
+    targetKey: 'issue_target',
+    contextAssertions: payload.issue_target.context_assertions,
+    executionProfile,
+    fixtureResolveResultJson: fixtureResolveResultJsonIssueTarget,
+  })
+  errors.push(...issueCheck.errors)
+
+  const pullRequestCheck = evaluateDualTargetContextAssertions({
+    targetKey: 'pull_request_target',
+    contextAssertions: payload.pull_request_target.context_assertions,
+    executionProfile,
+    fixtureResolveResultJson: fixtureResolveResultJsonPullRequestTarget,
+  })
+  errors.push(...pullRequestCheck.errors)
+
+  return { ok: errors.length === 0, errors }
+}
+
+async function runStandaloneSchemaCheck(options) {
+  if (!options.standaloneInput) {
+    throw usageError('retro_live_verification_check.input_required', '--input is required when --schema is passed')
+  }
+  const payload = await loadJsonFile(options.standaloneInput, 'retro_live_verification_check.input_json_invalid')
+  const errors = []
+
+  if (options.targetSchema === DUAL_TARGET_BUNDLE_SCHEMA_ID) {
+    const executionProfile = normalizeExecutionProfile(options.executionProfile)
+    const bundleCheck = await checkDualTargetBundle(payload, {
+      executionProfile,
+      fixtureResolveResultJsonIssueTarget: options.fixtureResolveResultJsonIssueTarget,
+      fixtureResolveResultJsonPullRequestTarget: options.fixtureResolveResultJsonPullRequestTarget,
+    })
+    errors.push(...bundleCheck.errors)
+    const ok = bundleCheck.ok
+    process.stdout.write(`${JSON.stringify({ schema: SCHEMA, verification_status: ok ? 'pass' : 'fail', execution_profile: executionProfile, checked_at: new Date().toISOString(), errors }, null, 2)}\n`)
+    process.exitCode = ok ? 0 : 1
+    return
+  }
+
+  if (options.targetSchema === RETROSPECTIVE_RESULT_SCHEMA_ID) {
+    const schemaValidation = await validateAgainstSchemaFile(RETROSPECTIVE_RESULT_SCHEMA_FILE, payload)
+    if (!schemaValidation.valid) {
+      errors.push(...schemaValidation.errors.map((error) => ({ code: 'retro_live_verification_check.retrospective_result_schema_invalid', message: `${error.path}: ${error.message}` })))
+    }
+    if (parseBooleanFlag(options.requireFindingsOrRationale)) {
+      const findingsCheck = evaluateFindingsOrRationale(payload)
+      errors.push(...findingsCheck.errors)
+    }
+  } else if (parseBooleanFlag(options.checkExecutionBoundary)) {
+    const schemaValidation = await validateAgainstSchemaFile(resolvePath(REPO_ROOT, 'docs/schemas/chatgpt-retro-execution-proof.schema.json'), payload)
+    if (!schemaValidation.valid) {
+      errors.push(...schemaValidation.errors.map((error) => ({ code: 'retro_live_verification_check.execution_boundary_schema_invalid', message: `${error.path}: ${error.message}` })))
+    }
+  } else {
+    throw usageError('retro_live_verification_check.unknown_standalone_schema', `unsupported --schema value: ${JSON.stringify(options.targetSchema)}`)
+  }
+
+  const ok = errors.length === 0
+  process.stdout.write(`${JSON.stringify({ schema: SCHEMA, verification_status: ok ? 'pass' : 'fail', checked_at: new Date().toISOString(), errors }, null, 2)}\n`)
+  process.exitCode = ok ? 0 : 1
+}
+
 async function runCli() {
   const rawArgs = process.argv.slice(2)
   const options = parseArgs(rawArgs.length === 0 ? DEFAULT_CHECK_ARGS : rawArgs, CLI_OPTION_SPEC)
+
+  // Issue #1415 AC10-11 (additive, standalone mode): --schema short-circuits
+  // the retro_live_verification manifest checks entirely.
+  if (options.targetSchema || parseBooleanFlag(options.checkExecutionBoundary)) {
+    await runStandaloneSchemaCheck(options)
+    return
+  }
+  if (!options.manifestJson) {
+    throw usageError('retro_live_verification_check.manifest_json_required', '--manifest-json is required unless --schema/--check-execution-boundary standalone mode is used')
+  }
+
   const executionProfile = normalizeExecutionProfile(options.executionProfile)
 
   const manifestText = await readFile(options.manifestJson, 'utf-8')
@@ -404,19 +845,23 @@ async function runCli() {
   const commentCheck = checkCanonicalComment({ manifest, comments })
   const errors = [...commentCheck.errors]
 
-  let contextAssertionsCheck = { ok: true, errors: [] }
-  if (manifest.context_assertions.target_type === 'pull_request') {
-    if (executionProfile === 'fixture' && !options.fixtureResolveResultJson) {
-      throw usageError('retro_live_verification_check.fixture_resolve_result_json_required', '--fixture-resolve-result-json is required when --execution-profile is fixture and target-type is pull_request')
-    }
-    const spawnResult = runContextAssertionsBindingSubprocess({
-      contextAssertions: manifest.context_assertions,
-      executionProfile,
-      fixtureResolveResultJson: options.fixtureResolveResultJson,
-    })
-    contextAssertionsCheck = evaluateContextAssertionsBinding(spawnResult)
-    errors.push(...contextAssertionsCheck.errors)
+  // Issue #1415 AC2: the assert-live context-assertion binding must run for
+  // *both* target types. Prior to this fix, this block only executed when
+  // `target_type === 'pull_request'`, so an issue-target manifest silently
+  // skipped context-assertion verification entirely (contextAssertionsCheck
+  // stayed at its `{ ok: true, errors: [] }` default) -- the exact defect
+  // Issue #1415 names explicitly ("現行の『PR targetのみcontext assertionを
+  // 実行』の挙動").
+  if (executionProfile === 'fixture' && !options.fixtureResolveResultJson) {
+    throw usageError('retro_live_verification_check.fixture_resolve_result_json_required', '--fixture-resolve-result-json is required when --execution-profile is fixture')
   }
+  const contextAssertionsSpawnResult = runContextAssertionsBindingSubprocess({
+    contextAssertions: manifest.context_assertions,
+    executionProfile,
+    fixtureResolveResultJson: options.fixtureResolveResultJson,
+  })
+  const contextAssertionsCheck = evaluateContextAssertionsBinding(contextAssertionsSpawnResult)
+  errors.push(...contextAssertionsCheck.errors)
 
   let prReviewBindingCheck = { ok: true, errors: [] }
   if (manifest.context_assertions.target_type === 'pull_request' && manifest.pr_review_binding.selected_review_id !== null) {
@@ -437,7 +882,74 @@ async function runCli() {
     errors.push(...prReviewBindingCheck.errors)
   }
 
-  const ok = commentCheck.ok && contextAssertionsCheck.ok && prReviewBindingCheck.ok
+  // Issue #1415 AC5-7 (additive, optional gate).
+  let prReviewSurfaceCheck = { ok: true, errors: [] }
+  if (parseBooleanFlag(options.refetchPrReviewSurface)) {
+    if (manifest.context_assertions.target_type !== 'pull_request') {
+      throw usageError('retro_live_verification_check.refetch_pr_review_surface_requires_pull_request', '--refetch-pr-review-surface requires context_assertions.target_type to be pull_request')
+    }
+    let surface
+    if (executionProfile === 'fixture') {
+      if (!options.fixturePrReviewSurfaceJson) {
+        throw usageError('retro_live_verification_check.fixture_pr_review_surface_json_required', '--fixture-pr-review-surface-json is required when --execution-profile is fixture and --refetch-pr-review-surface is true')
+      }
+      surface = await loadJsonFile(options.fixturePrReviewSurfaceJson, 'retro_live_verification_check.fixture_pr_review_surface_json_invalid')
+      if (surface?.ok !== true) {
+        prReviewSurfaceCheck = { ok: false, errors: [{ code: surface?.errorCode ?? 'retro_live_verification_check.pr_review_surface_fetch_failed', message: `pr review surface fetch reported failure: ${JSON.stringify(surface?.errors ?? [])}` }] }
+        errors.push(...prReviewSurfaceCheck.errors)
+        surface = null
+      }
+    } else {
+      const client = new GhCliIssueCommentsClient()
+      const fetched = await fetchPullRequestReviewSurfaceLive(client, {
+        repo: manifest.canonical_comment.repo,
+        pullNumber: manifest.context_assertions.target_number,
+      })
+      if (!fetched.ok) {
+        prReviewSurfaceCheck = { ok: false, errors: [{ code: fetched.errorCode, message: `pr review surface fetch reported failure: ${JSON.stringify(fetched.errors)}` }] }
+        errors.push(...prReviewSurfaceCheck.errors)
+        surface = null
+      } else {
+        surface = fetched
+      }
+    }
+    if (surface) {
+      prReviewSurfaceCheck = evaluatePrReviewSurfaceBinding({ surface, prReviewBinding: manifest.pr_review_binding })
+      errors.push(...prReviewSurfaceCheck.errors)
+    }
+  }
+
+  // Issue #1415 AC13 (additive, optional gate).
+  let runtimeProvenanceCheck = { ok: true, errors: [] }
+  if (parseBooleanFlag(options.requireRuntimeProvenance)) {
+    runtimeProvenanceCheck = checkRuntimeProvenanceComplete(manifest.runtime_provenance)
+    errors.push(...runtimeProvenanceCheck.errors)
+  }
+
+  // Issue #1415 AC15 (additive, optional gate).
+  let captureToPostLagCheck = { ok: true, errors: [] }
+  if (options.maxCaptureToPostLagSeconds !== undefined) {
+    const maxLagSeconds = normalizeMaxLagSeconds(options.maxCaptureToPostLagSeconds)
+    captureToPostLagCheck = checkCaptureToPostLag({
+      captureIso: manifest.runtime_provenance?.generated_at,
+      postedIso: options.postedAt ?? new Date().toISOString(),
+      maxLagSeconds,
+    })
+    errors.push(...captureToPostLagCheck.errors)
+  }
+
+  // Issue #1415 AC8-9 (additive, optional gate).
+  let resolvedCommentSetDigestCheck = { ok: true, errors: [] }
+  if (parseBooleanFlag(options.recomputeDigests)) {
+    if (!options.commentSetJson) {
+      throw usageError('retro_live_verification_check.comment_set_json_required', '--comment-set-json is required when --recompute-digests is true')
+    }
+    const commentSet = await loadJsonFile(options.commentSetJson, 'retro_live_verification_check.comment_set_json_invalid')
+    resolvedCommentSetDigestCheck = evaluateResolvedCommentSetDigest({ manifest, commentSet })
+    errors.push(...resolvedCommentSetDigestCheck.errors)
+  }
+
+  const ok = commentCheck.ok && contextAssertionsCheck.ok && prReviewBindingCheck.ok && prReviewSurfaceCheck.ok && runtimeProvenanceCheck.ok && captureToPostLagCheck.ok && resolvedCommentSetDigestCheck.ok
   process.stdout.write(`${JSON.stringify({
     schema: SCHEMA,
     verification_status: ok ? 'pass' : 'fail',

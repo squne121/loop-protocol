@@ -40,6 +40,7 @@
 
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -73,7 +74,11 @@ const GITHUB_LOGIN_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?(?:\
 
 let Ajv2020
 let addFormats
-async function loadAjv() {
+// Issue #1415 AC10-11: exported so check-retro-live-verification.mjs can
+// validate an independent schema file (chatgpt-retrospective-result) with
+// the same Ajv2020 setup, instead of re-implementing ajv/ajv-formats
+// dynamic import wiring a second time.
+export async function loadAjv() {
   if (Ajv2020 && addFormats) {
     return { Ajv2020, addFormats }
   }
@@ -114,6 +119,76 @@ export function canonicalJsonStringify(value) {
 
 export function sha256Hex(text) {
   return createHash('sha256').update(text, 'utf8').digest('hex')
+}
+
+/**
+ * Issue #1415 AC8-9 / P1-6: versioned canonicalization profile used only for
+ * the new `resolved_comment_set_digest` (never for the pre-existing v2
+ * `body_digest`/`expected_payload_digest`, which keep using the unversioned
+ * `canonicalize`/`canonicalJsonStringify` above -- no migration is required
+ * for those). `loop-canonical-json-v1` differs from plain `canonicalize` in
+ * one respect: string values are NFC-normalized before hashing, so two byte-
+ * distinct-but-canonically-equivalent Unicode representations of the same
+ * text (e.g. combining-character sequences vs precomposed characters) always
+ * hash identically. Key sort order, array order, and null/absent handling
+ * are otherwise identical to `canonicalize`. This is a same-repo canonical
+ * JSON convention, not a claim of RFC 8785 (JCS) compliance.
+ */
+export const CANONICALIZATION_PROFILE_LOOP_V1 = 'loop-comment-set-canonical-json-v1'
+
+export function canonicalizeLoopV1(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => canonicalizeLoopV1(item))
+  }
+  if (typeof value === 'string') {
+    return value.normalize('NFC')
+  }
+  if (value !== null && typeof value === 'object') {
+    const sortedKeys = Object.keys(value).sort()
+    const result = {}
+    for (const key of sortedKeys) {
+      result[key] = canonicalizeLoopV1(value[key])
+    }
+    return result
+  }
+  return value
+}
+
+export function canonicalJsonStringifyLoopV1(value) {
+  return JSON.stringify(canonicalizeLoopV1(value))
+}
+
+/**
+ * Issue #1415 AC8-9: `resolved_comment_set_digest` must bind more than the
+ * comment URL set -- it must bind identity (repo/target/comment ids),
+ * authorship, timestamps, and body content, using `loop-canonical-json-v1`.
+ * Each entry in `comments` is reduced to a fixed canonical tuple shape
+ * before hashing, so callers cannot accidentally widen/narrow the bound
+ * field set by passing extra/fewer object keys through unnoticed -- any
+ * field not in this explicit list is dropped, and any of these fields being
+ * absent becomes an explicit `null` (never "key absent", which would let a
+ * pre/post comparison silently ignore a field that stopped being reported).
+ */
+export function computeResolvedCommentSetDigest({ repoId, targetNodeId, comments }) {
+  const tuples = (comments ?? []).map((comment) => ({
+    repo_id: repoId ?? null,
+    target_node_id: targetNodeId ?? null,
+    surface_kind: comment.surface_kind ?? null,
+    comment_id: comment.comment_id ?? null,
+    author_id: comment.author_id ?? null,
+    created_at: comment.created_at ?? null,
+    updated_at: comment.updated_at ?? null,
+    body_sha256: comment.body != null ? sha256Hex(comment.body.normalize('NFC')) : (comment.body_sha256 ?? null),
+    review_state: comment.review_state ?? null,
+    review_commit_id: comment.review_commit_id ?? null,
+    thread_resolved: comment.thread_resolved ?? null,
+  }))
+  tuples.sort((left, right) => {
+    const leftKey = `${left.surface_kind}:${left.comment_id}`
+    const rightKey = `${right.surface_kind}:${right.comment_id}`
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0
+  })
+  return sha256Hex(canonicalJsonStringifyLoopV1({ canonicalization_profile: CANONICALIZATION_PROFILE_LOOP_V1, tuples }))
 }
 
 export function buildOwnershipMarker({ repo, issueNumber }) {
@@ -166,6 +241,64 @@ function resolveGeneratorCommit() {
   }
   const commit = result.stdout.trim()
   return /^[0-9a-f]{40}$/u.test(commit) ? commit : null
+}
+
+/**
+ * Issue #1415 AC13 (additive, optional): runtime provenance beyond
+ * generated_at/generator_commit/generator_version. Every field degrades to
+ * `null` when unavailable (e.g. `pnpm`/`gh` not on PATH, no lockfile, running
+ * outside GitHub Actions) rather than throwing -- this manifest must still be
+ * generatable in a bare local checkout.
+ */
+export function resolveNodeVersion() {
+  return typeof process.version === 'string' && process.version.length > 0 ? process.version : null
+}
+
+function resolveCommandVersion(cmd, args) {
+  const result = spawnSync(cmd, args, { encoding: 'utf-8' })
+  if (result.status !== 0 || typeof result.stdout !== 'string') {
+    return null
+  }
+  const firstLine = result.stdout.split('\n')[0]?.trim() ?? ''
+  return firstLine.length > 0 ? firstLine : null
+}
+
+export function resolvePnpmVersion() {
+  return resolveCommandVersion('pnpm', ['--version'])
+}
+
+export function resolveGhCliVersion() {
+  return resolveCommandVersion('gh', ['--version'])
+}
+
+export function resolvePnpmLockfileDigest() {
+  try {
+    const raw = readFileSync(resolvePath(REPO_ROOT, 'pnpm-lock.yaml'), 'utf-8')
+    return sha256Hex(raw)
+  } catch {
+    return null
+  }
+}
+
+export function resolveWorkflowRunIdentity(env = process.env) {
+  const runId = typeof env.GITHUB_RUN_ID === 'string' && env.GITHUB_RUN_ID.length > 0 ? env.GITHUB_RUN_ID : null
+  const runAttempt = typeof env.GITHUB_RUN_ATTEMPT === 'string' && env.GITHUB_RUN_ATTEMPT.length > 0 ? env.GITHUB_RUN_ATTEMPT : null
+  const workflowRef = typeof env.GITHUB_WORKFLOW_REF === 'string' && env.GITHUB_WORKFLOW_REF.length > 0 ? env.GITHUB_WORKFLOW_REF : null
+  if (runId === null && runAttempt === null && workflowRef === null) {
+    return null
+  }
+  return { run_id: runId, run_attempt: runAttempt, workflow_ref: workflowRef }
+}
+
+export function collectExtendedRuntimeProvenance({ githubApiVersion = null } = {}) {
+  return {
+    node_version: resolveNodeVersion(),
+    pnpm_version: resolvePnpmVersion(),
+    pnpm_lockfile_digest: resolvePnpmLockfileDigest(),
+    gh_cli_version: resolveGhCliVersion(),
+    github_api_version: typeof githubApiVersion === 'string' && githubApiVersion.length > 0 ? githubApiVersion : null,
+    workflow_run_identity: resolveWorkflowRunIdentity(),
+  }
 }
 
 function normalizePositiveInteger(value, code) {
@@ -292,6 +425,9 @@ const CLI_OPTION_SPEC = {
   '--issue-number': { key: 'issueNumber', required: true },
   '--trusted-actor': { key: 'trustedActor', required: true },
   '--expected-previous-digest': { key: 'expectedPreviousDigest' },
+  '--selected-review-comment-id': { key: 'selectedReviewCommentId' },
+  '--selected-review-thread-node-id': { key: 'selectedReviewThreadNodeId' },
+  '--github-api-version': { key: 'githubApiVersion' },
   '--out': { key: 'out', required: true },
 }
 
@@ -312,6 +448,12 @@ export function buildManifest(options) {
   const expectedPreviousDigest = options.expectedPreviousDigest === undefined || options.expectedPreviousDigest === null || options.expectedPreviousDigest === ''
     ? null
     : normalizeSha256Hex(options.expectedPreviousDigest, 'retro_live_verification.expected_previous_digest')
+  const selectedReviewCommentId = options.selectedReviewCommentId === undefined || options.selectedReviewCommentId === null
+    ? null
+    : normalizePositiveInteger(options.selectedReviewCommentId, 'retro_live_verification.selected_review_comment_id')
+  const selectedReviewThreadNodeId = options.selectedReviewThreadNodeId === undefined || options.selectedReviewThreadNodeId === null || options.selectedReviewThreadNodeId === ''
+    ? null
+    : String(options.selectedReviewThreadNodeId)
 
   const contextAssertions = {
     repo,
@@ -323,10 +465,18 @@ export function buildManifest(options) {
     expected_payload_digest: expectedPayloadDigest,
     expected_matched_comment_count: expectedMatchedCommentCount,
   }
+  // Issue #1415 AC5-7 fields are additive/optional: only included in the
+  // digested payload when the caller actually supplies a value, so a v2
+  // caller that never passes --selected-review-comment-id / --selected-
+  // review-thread-node-id reproduces a byte-identical prReviewBinding shape
+  // (and therefore the same canonical-json-v1 body_digest) as before this
+  // change -- no existing fixture/manifest digest constant needs migration.
   const prReviewBinding = {
     review_artifact_ref: options.reviewArtifactRef,
     reviewed_head_sha: reviewedHeadSha,
     selected_review_id: selectedReviewId,
+    ...(selectedReviewCommentId !== null ? { selected_review_comment_id: selectedReviewCommentId } : {}),
+    ...(selectedReviewThreadNodeId !== null ? { selected_review_thread_node_id: selectedReviewThreadNodeId } : {}),
   }
   const ownershipMarker = buildOwnershipMarker({ repo, issueNumber })
   const { bodyDigest } = computeCanonicalCommentBody({ contextAssertions, prReviewBinding, ownershipMarker })
@@ -351,6 +501,10 @@ export function buildManifest(options) {
       generated_at: new Date().toISOString(),
       generator_commit: resolveGeneratorCommit(),
       generator_version: GENERATOR_VERSION,
+      // Issue #1415 AC13 (additive, optional): not part of the digested
+      // canonical-comment payload (only context_assertions/pr_review_binding
+      // are), so populating these unconditionally cannot change body_digest.
+      ...collectExtendedRuntimeProvenance({ githubApiVersion: options.githubApiVersion }),
     },
     canonicalization_profile: {
       algorithm: 'canonical-json-v1',

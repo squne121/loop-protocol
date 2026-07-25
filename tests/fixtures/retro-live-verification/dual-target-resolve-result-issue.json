@@ -1,0 +1,24 @@
+{
+  "status": "resolved",
+  "repo": "squne121/loop-protocol",
+  "target": {
+    "type": "issue",
+    "number": 1153,
+    "endpoint_kind": "issue_comments"
+  },
+  "parent_issue": 1153,
+  "marker_comment_url": "https://github.com/squne121/loop-protocol/issues/1153#issuecomment-1",
+  "comment_chain": {
+    "status": "resolved",
+    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "payload_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "matched_comment_count": 1,
+    "pagination": {
+      "comments_complete": true,
+      "reference_comments_complete": true
+    }
+  },
+  "pr_review_surface": {
+    "status": "not_applicable"
+  }
+}
