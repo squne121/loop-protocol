@@ -1,0 +1,53 @@
+{
+  "schema": "retro_live_verification/v2",
+  "context_assertions": {
+    "repo": "squne121/loop-protocol",
+    "target_type": "pull_request",
+    "target_number": 1415,
+    "parent_issue": 1153,
+    "marker_comment_url": "https://github.com/squne121/loop-protocol/issues/1153#issuecomment-1",
+    "expected_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "expected_payload_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "expected_matched_comment_count": 3
+  },
+  "pr_review_binding": {
+    "review_artifact_ref": "https://github.com/squne121/loop-protocol/pull/1415#pullrequestreview-1",
+    "reviewed_head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "selected_review_id": 1
+  },
+  "execution_boundary": {
+    "mode": "generate",
+    "allowed_paths": [
+      "package.json",
+      "docs/schemas/retro-live-verification.schema.json",
+      "scripts/generate-retro-live-verification.mjs",
+      "scripts/check-retro-live-verification.mjs",
+      "scripts/post-retro-live-verification.mjs",
+      "tests/retro-live-verification.test.ts",
+      "tests/fixtures/retro-live-verification/",
+      ".github/workflows/retro-live-verification.yml",
+      ".claude/skills/issue-contract-review/scripts/pnpm_gate_registry.py",
+      ".claude/skills/issue-contract-review/tests/test_pnpm_gate_security_boundary.py"
+    ],
+    "trusted_actor_allowlist": [
+      "squne121",
+      "github-actions[bot]"
+    ]
+  },
+  "canonical_comment": {
+    "repo": "squne121/loop-protocol",
+    "issue_number": 1415,
+    "ownership_marker": "<!-- retro_live_verification:v1 repo=squne121/loop-protocol issue=1415 -->",
+    "body_digest": "ed49dde9d07336e8801945114de51d6fa204b5f612af8bfade673b35667fa9f8",
+    "expected_previous_digest": null
+  },
+  "runtime_provenance": {
+    "generated_at": "2026-07-25T00:54:05.113Z",
+    "generator_commit": "65d44f570a6fffb10c5bc6a64ee1ed19b2a7646f",
+    "generator_version": "retro-live-verification-generator/1"
+  },
+  "canonicalization_profile": {
+    "algorithm": "canonical-json-v1",
+    "digest_encoding": "sha256-hex"
+  }
+}

@@ -1,0 +1,10 @@
+[
+  {
+    "errors": [
+      { "message": "Something went wrong while executing your query.", "type": "SERVICE_UNAVAILABLE" }
+    ],
+    "threadCount": 0,
+    "hasNextPage": false,
+    "endCursor": null
+  }
+]

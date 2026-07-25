@@ -1,0 +1,96 @@
+name: retro-live-verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_json_path:
+        description: Path to a pre-generated retro_live_verification/v2 manifest JSON file
+        type: string
+        required: true
+      dry_run:
+        description: Keep the post step in dry-run mode (no GitHub write)
+        type: boolean
+        required: true
+        default: true
+      current_actor:
+        description: GitHub login of the actor posting the canonical comment (must be in the manifest trusted_actor_allowlist)
+        type: string
+        required: true
+  pull_request:
+    paths:
+      - package.json
+      - pnpm-lock.yaml
+      - docs/schemas/retro-live-verification.schema.json
+      - scripts/generate-retro-live-verification.mjs
+      - scripts/check-retro-live-verification.mjs
+      - scripts/post-retro-live-verification.mjs
+      - tests/retro-live-verification.test.ts
+      - tests/fixtures/retro-live-verification/**
+      - .github/workflows/retro-live-verification.yml
+
+permissions: {}
+
+# Single-writer constraint (Issue #1709 In Scope): only one post-retro-live-
+# verification write should ever be in flight for a given manifest/target at
+# a time. Concurrency is scoped per-workflow-ref (not per-branch) so a
+# workflow_dispatch re-run cancels/queues behind a prior in-flight run rather
+# than racing it, which would otherwise defeat the producer's own
+# expected_previous_digest compare-and-swap guard.
+concurrency:
+  group: retro-live-verification-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Read-only static verification: schema validation + Vitest unit/negative
+  # fixtures + pnpm gate registry security-boundary regression. Runs on
+  # pull_request; never posts a live GitHub comment.
+  verify-static:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run retro-live-verification Vitest suite
+        run: pnpm vitest run tests/retro-live-verification.test.ts
+
+  # Single-writer live post job (workflow_dispatch only). Never runs on
+  # pull_request, matching the single-writer / trusted-actor-allowlist
+  # constraints in scripts/post-retro-live-verification.mjs.
+  post-canonical-comment:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Post canonical retro-live-verification comment
+        run: pnpm retro-live-verification:post -- --manifest-json "${{ inputs.manifest_json_path }}" --current-actor "${{ inputs.current_actor }}" --dry-run "${{ inputs.dry_run }}"
+
+      - name: Verify canonical comment landed correctly
+        if: inputs.dry_run == 'false'
+        run: pnpm retro-live-verification:verify -- --manifest-json "${{ inputs.manifest_json_path }}"

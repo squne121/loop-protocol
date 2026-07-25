@@ -45,6 +45,9 @@ _SCRIPTS = {
         "'CLAUDE.md' 'AGENTS.md' 'SECURITY.md' '.claude/**/*.md'"
     ),
     "validate:roadmap-refs": "node scripts/validate-roadmap-refs.mjs",
+    "retro-live-verification:generate": "node scripts/generate-retro-live-verification.mjs",
+    "retro-live-verification:post": "node scripts/post-retro-live-verification.mjs",
+    "retro-live-verification:verify": "node scripts/check-retro-live-verification.mjs",
 }
 
 _GATES = (
@@ -63,6 +66,24 @@ _GATES = (
         ("pnpm", "lint:docs"),
         "lint:docs",
         ("lint:docs", "lint:md", "lint:prose", "validate:roadmap-refs"),
+    ),
+    GateDescriptor(
+        "pnpm.retro-live-verification-generate.v1",
+        ("pnpm", "retro-live-verification:generate"),
+        "retro-live-verification:generate",
+        ("retro-live-verification:generate",),
+    ),
+    GateDescriptor(
+        "pnpm.retro-live-verification-post.v1",
+        ("pnpm", "retro-live-verification:post"),
+        "retro-live-verification:post",
+        ("retro-live-verification:post",),
+    ),
+    GateDescriptor(
+        "pnpm.retro-live-verification-verify.v1",
+        ("pnpm", "retro-live-verification:verify"),
+        "retro-live-verification:verify",
+        ("retro-live-verification:verify",),
     ),
 )
 

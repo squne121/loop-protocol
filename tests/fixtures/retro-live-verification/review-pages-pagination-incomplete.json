@@ -1,0 +1,4 @@
+[
+  { "errors": [], "threadCount": 2, "hasNextPage": true, "endCursor": "cursor-1" },
+  { "errors": [], "threadCount": 2, "hasNextPage": true, "endCursor": "cursor-2" }
+]

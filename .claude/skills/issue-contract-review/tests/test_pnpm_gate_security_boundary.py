@@ -57,6 +57,9 @@ def test_registry_is_the_only_pnpm_gate_authority():
         ("pnpm", "build"),
         ("pnpm", "typecheck:e2e"),
         ("pnpm", "lint:docs"),
+        ("pnpm", "retro-live-verification:generate"),
+        ("pnpm", "retro-live-verification:post"),
+        ("pnpm", "retro-live-verification:verify"),
     }
     assert baseline._canonical_pnpm_gate(["pnpm", "lint:docs"]) == ("pnpm", "lint:docs")
     assert triage.registry.gate_for_request(["pnpm", "lint:docs"]) is not None
