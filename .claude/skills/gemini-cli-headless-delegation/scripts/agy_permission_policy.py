@@ -310,7 +310,37 @@ def materialize_isolated_agy_workspace(
         "XDG_STATE_HOME": str(xdg_state),
         "AGY_WORKSPACE_SETTINGS": str(settings_path),
     }
-    for key in ("PATH", "LANG", "LC_ALL", "TERM"):
+    # Reachability variables (Issue #1726): each of these is an *endpoint*
+    # pointer (a filesystem path to a Unix domain socket or a socket
+    # directory), never a credential value in itself. Propagating them lets
+    # the isolated `agy` subprocess reach the *existing*, already-authenticated
+    # OS keyring / dbus secret service session on the host, without granting
+    # it access to -- or a copy of -- any credential file, token string, or
+    # cookie. This is distinct from `HOME`/`XDG_CONFIG_HOME`/`XDG_CACHE_HOME`/
+    # `XDG_STATE_HOME` above, which remain fully redirected into the isolated
+    # workspace (Issue #1705 secret-hygiene design is unchanged).
+    #
+    # - DBUS_SESSION_BUS_ADDRESS: the well-known D-Bus session bus address,
+    #   e.g. `unix:path=/run/user/1000/bus`. It names *where* to connect to
+    #   reach the running session/secret-service bus; it carries no secret
+    #   material itself (the actual credential bytes stay inside the OS
+    #   keyring process behind that socket and are never read or copied by
+    #   this function).
+    # - XDG_RUNTIME_DIR: the per-user runtime directory
+    #   (e.g. `/run/user/1000`) that typically *contains* the D-Bus socket
+    #   and other session sockets `agy`/dbus tooling may need to resolve a
+    #   default bus address from. It is a directory path, not credential
+    #   content, and propagating it does not expose any file contents to the
+    #   subprocess beyond what the isolated `HOME`/`XDG_*` redirection above
+    #   already scopes for config/cache/state.
+    for key in (
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_RUNTIME_DIR",
+    ):
         value = os.environ.get(key)
         if value is not None:
             env[key] = value
