@@ -29,7 +29,9 @@ NO_CLAIM_TEXT = (
 )
 
 
-def _run_validator(*, diff_text: str | None = None, pr_body_text: str | None = None) -> subprocess.CompletedProcess[str]:
+def _run_validator(
+    *, diff_text: str | None = None, pr_body_text: str | None = None
+) -> subprocess.CompletedProcess[str]:
     args = [sys.executable, str(SCRIPT)]
     tmp_paths = []
     try:

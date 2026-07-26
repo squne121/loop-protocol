@@ -12,13 +12,13 @@ description: >-
 
 implementation child issue を **実装 → 検証 → PR レビュー** の 3 ステップループで自律完了させるオーケストレーター skill。各ステップを SubAgent に委譲し、メインの control-plane（state tracking + routing）に責務を限定する。
 
-## Inputs
+## Inputs（入力）
 
 - `issue_number`（必須）: implementation child issue 番号
 - `contract_snapshot_url`（任意、省略時は preparation ステップで検出）: `issue-contract-review` で `status: go` を返したコメントの URL。未提供の場合は preparation ステップが Issue コメントから `CONTRACT_REVIEW_RESULT_V1 status: go` コメントを自動検出する（存在すれば採用）。`status: go` コメントが見つからない場合は `ensure_contract_snapshot` を呼び出して自動 materialize を試みる（`steps/preparation.md` Section 2 の `missing_contract_go` 分岐を参照）
 - `max_iterations`（任意、デフォルト 3）: 上限回数。超過時は fail-close で人間判断を仰ぐ
 
-## Loop Structure
+## Loop Structure（ループ構造）
 
 ```
 [Step 1: Implementation]  → implementation-worker SubAgent (implement-issue skill)
@@ -38,7 +38,7 @@ implementation child issue を **実装 → 検証 → PR レビュー** の 3 �
 
 > Step 3（adversarial review）と Step 1.5（spec document review）は LOOP_PROTOCOL では採用しない（PR #12 / #20 方針）。Step 番号は履歴互換のため 1 → 2 → 4 → 5 のまま保持する。
 
-## Procedure
+## Procedure（手順）
 
 各 Step の詳細は `steps/` 配下に分割。実行時は下記の順で読む:
 
@@ -102,7 +102,7 @@ LOOP_STATE:
 
 外部仕様調査が必要な場合は `gemini-cli-headless-delegation` skill を default 経路として使い、結果を LOOP_STATE の `external_research_skip_basis` に記録する。LOOP_PROTOCOL は internal-only 変更が多い前提のため、デフォルトはスキップで構わない（スキップ時も判定根拠を記録する）。
 
-## Allowed Paths Gate Routing (LOOP_VERDICT_V2.allowed_paths_gate)
+## Allowed Paths Gate Routing（許可パスゲートのルーティング, LOOP_VERDICT_V2.allowed_paths_gate）
 
 PR review judge（review_subagent）が生成する `ALLOWED_PATHS_GATE_RESULT_V1` の status に基づいて、以下の routing table に従う。
 
@@ -125,11 +125,11 @@ PR review judge（review_subagent）が生成する `ALLOWED_PATHS_GATE_RESULT_V
 
 preparation step で取得した contract snapshot 内の以下の情報を Step 1-4 で参照する:
 
-### VC Preflight Reference
+### VC Preflight Reference（検証コマンド事前確認の参照）
 
 `vc_preflight` JSON（`baseline_vc_preflight.py` が生成）を参照し、impl-review-loop 側で `baseline_vc_preflight.py` を重複実行しない。VC 分類の正本は contract snapshot の `vc_preflight.classifications[]` に従う。
 
-### Product Spec Check Reference (Issue #333)
+### Product Spec Check Reference（プロダクト仕様確認の参照, Issue #333）
 
 `checks.product_spec_check` を contract snapshot から読み取り、Step 1 delegation 前に `LOOP_STATE.product_spec_preflight` に正規化して格納する。以下のルールに従う:
 
@@ -145,7 +145,7 @@ preparation step で取得した contract snapshot 内の以下の情報を Step
 
 **実装例**: `.claude/skills/impl-review-loop/scripts/evaluate_product_spec_gate.py` が mutation-free CLI として `PRODUCT_SPEC_GATE_DECISION_V1` を出力する（routing_action: continue | stop_human | refresh_contract_snapshot）。
 
-## Guardrails
+## Guardrails（安全策）
 
 - loop policy（何回まで自動で回すか）と Claude Code permission mode（ツール呼び出しの承認方式）は直交する概念であり、loop policy の継続判断に `--permission-mode` / `permissions.defaultMode` / `--dangerously-skip-permissions` を参照しない
 - control-plane だけを担い、data-plane 操作（push / `gh pr edit` / マージ等）は SubAgent に委譲する
@@ -155,7 +155,7 @@ preparation step で取得した contract snapshot 内の以下の情報を Step
 - 全 SubAgent 出力は構造化フォーマット（YAML / KEY=VALUE）で受け取り、散文サマリで上書きしない
 - **missing_contract_go routing**: `status: go` が存在しない場合は `ensure_contract_snapshot.py` を呼び出して自動 materialize を試みる（#817）。`ensure_contract_snapshot` が `status: human_judgment` / `blocked_needs_refinement` / `stale_or_conflicting_snapshot` を返した場合のみ停止する。旧設計（無条件 fail-only gate、#564）は #817 で置き換え。
 
-## Related
+## Related（関連ファイル）
 
 - `.claude/skills/implement-issue/SKILL.md` — Step 1 で使う実装手順
 - `.claude/skills/pr-review-judge/SKILL.md` — Step 4 で使うレビュー判定手順
