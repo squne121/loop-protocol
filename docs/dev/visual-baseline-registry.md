@@ -309,7 +309,7 @@ required check が fail して止まる。手元実行だけのゲートにし�
   の参照として記録し、存在しない場合（pass 時）は **N/A と明記する**。常に link を要求しない
   （pass run では actual/expected/diff が存在しないため）。
 
-### capture 単位の CI evidence（Issue #1387）
+### capture 単位の CI 証跡契約（Issue #1387 で追加）
 
 - CI summary と `scripts/check-visual-artifact-pipeline.py` は、e2e ジョブ全体を単一の
   suite フィンガープリントとして扱うのではなく、個々の VRT **capture**（test file 内の
