@@ -495,7 +495,8 @@ uv run python3 .claude/skills/impl-review-loop/scripts/parse_scope_rollup_run_re
   - `LOOP_STATE.scope_rollup_decision.termination_cause` を `scope_rollup_marker_missing` / `scope_rollup_marker_malformed` に保存する
   - Step 3 へ進めず停止する
 
-- runner が `status: runner_unavailable` を返し、marker 検証が構文上有効な場合は、従来どおり `decision: deferred` を許容する（必要に応じて `human_escalation`）
+- runner が `status: runner_unavailable` を返す場合は、`repo`、`current_issue`、`invocation_id`、`requested_at`、`generated_at` が期待値に一致し、かつ `generated_at > requested_at` であることだけを検証して `decision: deferred` を許容する。runner が未実行のため、script SHA、result payload/hash/verify、capture sidecar は要求しない（必要に応じて `human_escalation`）。
+- `runner_unavailable` であっても identity の不一致、timestamp の不正・stale、または malformed marker は `decision: human_review_required` として停止する。`ok` / `failed` とそれらの capture-sidecar failures は従来どおり `stop_human` semantics を維持する。
 - runner が `status: failed` を返す場合は、`decision: human_review_required` として停止する
 
 ### orchestrator の判断ルール（marker 採用後）
