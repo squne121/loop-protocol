@@ -127,3 +127,10 @@ hermetic pytest（`test_agy_provider.py`）に以下を追加し、実際に sub
 ## Live 確認の追記（Issue #1758）
 
 Issue #1752/#1758 は上記の「実際の AGY CLI が読む設定ファイルパス（`~/.gemini/antigravity-cli/settings.json`）」の記述を live WebFetch で再確認し、`toolPermission` の 4 値 enum（`request-review` デフォルト / `proceed-in-sandbox` / `always-proceed` / `strict`）を確定させた。詳細な live 検証結果と、「isolated workspace が toolPermission 未設定のまま grounded_research を実行できない」という仮説が live `agy -p` 実行の結果として誤りだったことの確認は `references/grounded-research-isolated-workspace-investigation.md` の `## Finding 1 Live Verification` セクションを参照。
+
+
+## 敵対的再監査への追記（Issue #1778）
+
+CLOSED 済みの #1494（実 AGY/Serena/WebSearch fan-out E2E 検証）に対する control-plane の敵対的再監査（独立監査 3 本 + controlled live experiment 3 本）により、`agy_permission_policy.py` の認証 surface 過剰露出（`agy_oauth_token_path` のみが認証成功に必要十分であることを ablation experiment で実証）と、`_expose_gcloud_adc_read_only()` / `_expose_agy_oauth_token_read_only()` の read-only 未強制（`bwrap` PoC で実際に `OSError: Read-only file system` を発生させることを確認）が新たに判明した。実験そのものの詳細は別途 follow-up Issue で検証済みとして記録し、本ドキュメントの既存本文は変更しない。両者を機械可読に検出する baseline は `.claude/skills/gemini-cli-headless-delegation/scripts/audit_agy_auth_surface.py`（Issue #1778）を参照。
+
+また、本ドキュメント冒頭の `## Live 確認の追記（Issue #1758）` セクションは `status: resolved` の本ドキュメントに包含された結論であるにもかかわらず、`agy_permission_policy.py` 側の `Issue #1758` 参照コメント（複数箇所）に逆参照マーカー（`# SUPERSEDED (Issue #M): ...`）が付いていないことが同監査で判明した。このコメント/ドキュメント間の causal claim drift を機械的に検出する baseline は `scripts/check_agy_causal_claim_drift.py`（Issue #1778）を参照。
