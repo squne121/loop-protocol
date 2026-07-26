@@ -642,6 +642,25 @@ jobs:
       # Visual regression evidence pipeline — docs/dev/visual-baseline-registry.md §5
       # Upload on success AND failure (not just failure()) so baseline evidence is
       # always retained. Uses !cancelled() (not always()) — see registry §5 for rationale.
+      # Compute a content digest of each artifact directory BEFORE upload (Issue
+      # #1387 AC2): every active VRT capture below currently shares the single
+      # job-level `test-results/` / `playwright-report/` artifact (artifact
+      # scope: job, not per-capture/per-suite) — this digest is what the
+      # per-capture summary rows reference.
+      - name: Compute VRT artifact digests
+        id: vrt-artifact-digests
+        if: ${{ !cancelled() }}
+        run: |
+          digest_of() {
+            local dir="$1"
+            if [ -d "$dir" ] && find "$dir" -type f -print -quit | grep -q .; then
+              find "$dir" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print "sha256:"$1}'
+            else
+              echo "sha256:none"
+            fi
+          }
+          echo "test_results_digest=$(digest_of test-results)" >> "$GITHUB_OUTPUT"
+          echo "playwright_report_digest=$(digest_of playwright-report)" >> "$GITHUB_OUTPUT"
       - name: Upload Playwright report
         id: upload-playwright-report
         if: ${{ !cancelled() }}
@@ -799,8 +818,33 @@ jobs:
         env:
           PLAYWRIGHT_REPORT_URL: ${{ steps.upload-playwright-report.outputs.artifact-url || 'N/A' }}
           TEST_RESULTS_URL: ${{ steps.upload-test-results.outputs.artifact-url || 'N/A' }}
+          TEST_RESULTS_DIGEST: ${{ steps.vrt-artifact-digests.outputs.test_results_digest || 'sha256:none' }}
+          PLAYWRIGHT_REPORT_DIGEST: ${{ steps.vrt-artifact-digests.outputs.playwright_report_digest || 'sha256:none' }}
+          UPLOAD_PLAYWRIGHT_REPORT_OUTCOME: ${{ steps.upload-playwright-report.outcome }}
+          UPLOAD_TEST_RESULTS_OUTCOME: ${{ steps.upload-test-results.outcome }}
         run: |
           PW_VERSION="$(node -p "require('@playwright/test/package.json').version" 2>/dev/null || echo 'unknown')"
+          # Artifact absence-state classification (Issue #1387 AC7): distinguish
+          # uploaded / no_files / step_not_run / upload_failed rather than a
+          # bare presence check.
+          classify_artifact_status() {
+            local outcome="$1" dir="$2"
+            if [ "$outcome" = "skipped" ]; then
+              echo "step_not_run"
+            elif [ "$outcome" = "failure" ]; then
+              echo "upload_failed"
+            elif [ "$outcome" = "success" ]; then
+              if [ -d "$dir" ] && find "$dir" -type f -print -quit 2>/dev/null | grep -q .; then
+                echo "uploaded"
+              else
+                echo "no_files"
+              fi
+            else
+              echo "step_not_run"
+            fi
+          }
+          TEST_RESULTS_STATE="$(classify_artifact_status "$UPLOAD_TEST_RESULTS_OUTCOME" test-results)"
+          PLAYWRIGHT_REPORT_STATE="$(classify_artifact_status "$UPLOAD_PLAYWRIGHT_REPORT_OUTCOME" playwright-report)"
           {
             echo "## CI Runtime Baseline: ${{ github.job }}"
             echo ""
@@ -834,8 +878,8 @@ jobs:
             echo "- screenshot options: animations=disabled, maxDiffPixels=1"
             echo ""
             echo "### Artifacts"
-            echo "- playwright-report: ${PLAYWRIGHT_REPORT_URL}"
-            echo "- test-results: ${TEST_RESULTS_URL}"
+            echo "- playwright-report: ${PLAYWRIGHT_REPORT_URL} (status: ${PLAYWRIGHT_REPORT_STATE}, digest: ${PLAYWRIGHT_REPORT_DIGEST})"
+            echo "- test-results: ${TEST_RESULTS_URL} (status: ${TEST_RESULTS_STATE}, digest: ${TEST_RESULTS_DIGEST})"
             echo ""
             echo "### actual / expected / diff"
             if [ -d test-results ] && find test-results -name '*-diff.png' -print -quit | grep -q .; then
@@ -843,6 +887,88 @@ jobs:
             else
               echo "- N/A (no visual mismatch; expected/actual/diff are only emitted on toHaveScreenshot failure)"
             fi
+            echo ""
+            echo "### Active VRT captures"
+            echo ""
+            echo "Each row below is one active capture (an individual toHaveScreenshot() /"
+            echo "expectDomOverlayScreenshot() call site) — not a suite. Cross-validated against"
+            echo "the real spec sources by scripts/check-visual-artifact-pipeline.py (Issue #1387)."
+            echo "| capture_id | screenshot directory | browser | project | viewport | DPR | comparator | stylePath | artifact scope | artifact URL | digest | retention (days) |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
+            TEST_RESULTS_URL="$TEST_RESULTS_URL" TEST_RESULTS_DIGEST="$TEST_RESULTS_DIGEST" python3 - <<'PY'
+          import os
+          # ACTIVE_VRT_CAPTURES_BEGIN
+          # Single source of truth for the per-capture fingerprint this
+          # summary echoes (Issue #1387). scripts/check-visual-artifact-pipeline.py
+          # parses this exact literal (between the BEGIN/END markers) and
+          # cross-validates it against a fresh, independent derivation from
+          # tests/e2e/*.spec.ts / playwright.config.ts / visual-utils.ts — so
+          # this list drifting from the real spec sources is a hard CI fail.
+          CAPTURES = [
+              {
+                  "capture_id": "m2-combat-mvp.spec.ts::m2-timeout-overlay-baseline.png",
+                  "spec_file": "tests/e2e/m2-combat-mvp.spec.ts",
+                  "screenshot_name": "m2-timeout-overlay-baseline.png",
+                  "registry_id": "timeout-overlay",
+                  "directory": "tests/e2e/__screenshots__/m2-combat-mvp.spec.ts/",
+                  "browser": "chromium",
+                  "project": "chromium",
+                  "viewport": "1280x720",
+                  "device_scale_factor": 1,
+                  "comparator_kind": "maxDiffPixels",
+                  "comparator_value": "1",
+                  "style_path": False,
+                  "artifact_scope": "job",
+                  "digest_env": "TEST_RESULTS_DIGEST",
+                  "retention_days": 30,
+              },
+              {
+                  "capture_id": "m2-combat-mvp.spec.ts::m2-running-hud-baseline.png",
+                  "spec_file": "tests/e2e/m2-combat-mvp.spec.ts",
+                  "screenshot_name": "m2-running-hud-baseline.png",
+                  "registry_id": "running-hud",
+                  "directory": "tests/e2e/__screenshots__/m2-combat-mvp.spec.ts/",
+                  "browser": "chromium",
+                  "project": "chromium",
+                  "viewport": "1280x720",
+                  "device_scale_factor": 1,
+                  "comparator_kind": "maxDiffPixelRatio",
+                  "comparator_value": "0.08",
+                  "style_path": False,
+                  "artifact_scope": "job",
+                  "digest_env": "TEST_RESULTS_DIGEST",
+                  "retention_days": 30,
+              },
+              {
+                  "capture_id": "visual-overlay.spec.ts::vrt-running-hud-overlay.png",
+                  "spec_file": "tests/e2e/visual-overlay.spec.ts",
+                  "screenshot_name": "vrt-running-hud-overlay.png",
+                  "registry_id": "running-hud-overlay-legacy-current",
+                  "directory": "tests/e2e/__screenshots__/visual-overlay.spec.ts/",
+                  "browser": "chromium",
+                  "project": "chromium",
+                  "viewport": "1280x720",
+                  "device_scale_factor": 1,
+                  "comparator_kind": "maxDiffPixels",
+                  "comparator_value": "100",
+                  "style_path": True,
+                  "artifact_scope": "job",
+                  "digest_env": "TEST_RESULTS_DIGEST",
+                  "retention_days": 30,
+              },
+          ]
+          # ACTIVE_VRT_CAPTURES_END
+          artifact_url = os.environ.get("TEST_RESULTS_URL", "N/A")
+          for c in CAPTURES:
+              digest = os.environ.get(c["digest_env"], "sha256:none")
+              style = "yes" if c["style_path"] else "no"
+              comparator = f"{c['comparator_kind']}={c['comparator_value']}"
+              print(
+                  f"| {c['capture_id']} | {c['directory']} | {c['browser']} | {c['project']} | "
+                  f"{c['viewport']} | {c['device_scale_factor']} | {comparator} | {style} | "
+                  f"{c['artifact_scope']} | {artifact_url} | {digest} | {c['retention_days']} |"
+              )
+          PY
           } >> "$GITHUB_STEP_SUMMARY"
 
   python-test:

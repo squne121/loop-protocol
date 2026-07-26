@@ -309,12 +309,38 @@ required check が fail して止まる。手元実行だけのゲートにし�
   の参照として記録し、存在しない場合（pass 時）は **N/A と明記する**。常に link を要求しない
   （pass run では actual/expected/diff が存在しないため）。
 
+### capture 単位の CI evidence（Issue #1387）
+
+- CI summary と `scripts/check-visual-artifact-pipeline.py` は、e2e ジョブ全体を単一の
+  suite フィンガープリントとして扱うのではなく、個々の VRT **capture**（test file 内の
+  個別の `toHaveScreenshot()` / `expectDomOverlayScreenshot()` 呼び出し）を列挙する。
+- 各 capture の screenshot directory / browser / project / viewport / deviceScaleFactor /
+  comparator 種別と値（`maxDiffPixels` または `maxDiffPixelRatio` のいずれか一方）/
+  stylePath 有無 / artifact scope（`job` か `suite` か）/ artifact URL / digest /
+  retention を summary が出力し、validator がこれを spec ファイル・
+  `playwright.config.ts`・`tests/e2e/visual-utils.ts` の registry maturity から
+  再導出した値と cross-validate する（drift すれば hard fail）。
+- 現行の active capture はすべて標準 `e2e` ジョブ内で実行され、`test-results/` /
+  `playwright-report/` という単一のジョブ単位 artifact を共有する
+  （artifact scope: `job`。suite 単位の分離 artifact は現状存在しない）。
+- `pending-baseline`（maturity）の registryId を参照する capture は、
+  `expectDomOverlayScreenshot()` 側で実行時に fail closed するため、決して
+  active capture として宣言してはならない。validator はこれを registry
+  maturity 側から独立に検査する。
+
 ### component VRT / active suite 依存（コンポーネント視覚テストの前提）
 
 - 現行 repo には `@vitest/browser-playwright` と `vitest.visual.config.ts` が未導入である。
   これらと対象 overlay module の 3 要件が揃うまでは、Component VRT は未導入として扱い、
   上記 `running-hud-paused` / `result-overlay-timeout` /
   `final-no-command-rail` は `pending-baseline` 維持とする。
+- **Playwright / Vitest baseline root 分離契約**: Playwright E2E VRT の baseline は
+  `tests/e2e/__screenshots__/` 配下にのみ置く。将来 Vitest component VRT を導入する
+  際は、専用の別ルート `tests/component/__screenshots__/`（予約済み）配下にのみ
+  baseline を置き、両者のディレクトリを混線させない。
+  `scripts/check-visual-artifact-pipeline.py` はこの 2 ルートを定数として保持し、
+  capture の宣言ディレクトリがどちらのルートにも一致しない、または誤って
+  Vitest 側ルートに置かれている場合は hard fail する。
 - `active CI suites` と `check-visual-artifact-pipeline` の `cross-validation` が揃っていない場合、`legacy-current` / `pending-baseline`
   からの frozen 昇格は保留する。frozen 昇格時には `merged PR SHA`、`CI summary`、`artifact path` を再確認する。
 - `focus` / `inert` / `keyboard` / `dialog` の振る舞いを理由に frozen 昇格を代替しない。#1373-#1376 の
