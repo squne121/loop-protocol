@@ -25,10 +25,10 @@ Issue 本文の構造品質を `.claude/skills/review-issue/scripts/check_issue_
    
    `ISSUE_CONTRACT_READINESS_RESULT_V1` の `errors[]` が空でない場合、以下のルールで `REVIEW_ISSUE_RESULT_V1` へ合成する：
    - `blocking_issues` には各 error の `fix_hint` 文字列を転写する（人間向け要約）。`check_issue_contract.py` の `blocking_issues` も同配列にマージする。
-   - `structured_blockers` には `errors[]` の構造体をそのまま転写する（機械処理用・issue-author への修復 payload）。`source_check` / `source_payload.decision` / `source_payload.classification` / `exit_code` / `command_hash` を損失なく保持すること（lossless pass-through）。
+   - `structured_blockers` には `errors[]` の構造体を**そのまま転写しない**。`check_issue_contract.py` が公開する `readiness_error_to_structured_blocker()` / `readiness_errors_to_structured_blockers()`（`_append_findings` と同じ finding 構築ヘルパーを再利用する変換関数、Issue #1791）を呼び、`code` / `message` / `finding_kind` / `deterministic_domain_key` / `blocking` / `checker_evidence`（`source_check` / `rule_id` / `category` / `artifact_path` / `artifact_schema` / `body_sha256` / `iteration_id` / `line_start` / `line_end` を含む）を備えた**変換後の形状**にしてから追記する。`compact_review_result.py` の `REVIEW_ISSUE_RESULT_V1` スキーマ検証（`schemas/review_issue_result_v1.json`）と非互換にならないよう、生の readiness error 構造体を `structured_blockers` へ直接コピーしてはならない。
    - `status: needs_fix` の errors → `verdict: needs-fix` に反映する。
-   - `status: human_judgment` の errors（`env_missing_dep` / `timeout` / unknown 分類など）は `verdict: needs-fix` に畳み込まない。`structured_blockers` に `failure_class: contract_readiness_human_judgment` を付与して別扱いとする。overall verdict は `needs-fix` ではなく `human_judgment` として区別する。
-   - 判定ロジックは `contract_readiness_check.py` に集約し、本 skill では再実装しない。
+   - `status: human_judgment` の errors（`env_missing_dep` / `timeout` / unknown 分類など）は `verdict: needs-fix` に畳み込まない。`readiness_errors_to_structured_blockers(..., readiness_status="human_judgment")` を使うと変換後の `structured_blockers` に `failure_class: contract_readiness_human_judgment` が付与され別扱いとなる。overall verdict は `needs-fix` ではなく `human_judgment` として区別する。
+   - 判定ロジックは `contract_readiness_check.py` に集約し、本 skill では再実装しない。変換ロジックは `check_issue_contract.py` の変換関数に集約し、SKILL.md には変換規則の詳細（フィールド対応表・regex 等）を重複記載しない。
    
    Note: `--mode execute` は `compound_command_disallowed`（静的検出）と `unexpected_pass`（VC 実行結果）の両方を検出する。`shell=True` は導入しない（既存の `shell=False` 前提を維持）。
 3. checker の JSON をそのまま `REVIEW_ISSUE_RESULT_V1` に整形する（`verdict` / `deterministic_checks` / `blocking_issues` / `non_blocking_improvements` / `diff_proposal` を保持）。
@@ -71,7 +71,7 @@ REVIEW_ISSUE_RESULT_V1:
   blocking_issues: <checker JSON blocking_issues をそのまま>
   non_blocking_improvements: <checker JSON non_blocking_improvements をそのまま>
   diff_proposal: <checker JSON diff_proposal をそのまま>
-  structured_blockers: <contract_readiness_check.py errors[] をそのまま（機械処理用）>
+  structured_blockers: <readiness_error_to_structured_blocker() で変換後の形状（機械処理用・code/finding_kind/deterministic_domain_key/blocking/checker_evidence を保持）>
   update_applied: true | false
   comment_url: <変更経緯コメント URL、適用時のみ>
 ```

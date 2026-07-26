@@ -256,11 +256,16 @@ REVIEW_ISSUE_RESULT_SCHEMA = "REVIEW_ISSUE_RESULT_V1"
 REVIEW_ISSUE_RESULT_SCHEMA_FILE = (
     Path(__file__).resolve().parent.parent / "schemas" / "review_issue_result_v1.json"
 )
+# ISSUE_CONTRACT_READINESS_RESULT_V1 は contract_readiness_check.py --mode execute
+# の producer schema。readiness_error_to_structured_blocker() が合成する
+# checker_evidence.artifact_schema はこの値を使う（Issue #1791）。
+READINESS_CHECKER_ARTIFACT_SCHEMA = "ISSUE_CONTRACT_READINESS_RESULT_V1"
 REVIEW_ISSUE_CHECKER_ARTIFACT_SCHEMAS = frozenset(
     {
         REVIEW_ISSUE_RESULT_SCHEMA,
         "CHECK_ISSUE_CONTRACT_V1",
         "product_spec_check/v1",
+        READINESS_CHECKER_ARTIFACT_SCHEMA,
     }
 )
 REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER = "deterministic_domain_blocker"
@@ -333,6 +338,106 @@ def _validate_finding_kind(kind: str) -> str:
     if kind in VALID_REVIEW_FINDING_KINDS:
         return kind
     raise ValueError(f"Unsupported finding_kind: {kind!r}")
+
+
+def readiness_error_to_structured_blocker(
+    readiness_error: dict,
+    *,
+    body_sha256: str,
+    iteration_id: str,
+    failure_class: Optional[str] = None,
+    artifact_path: str = "contract_readiness_check_result",
+) -> dict:
+    """Convert one ISSUE_CONTRACT_READINESS_RESULT_V1 errors[] element into the
+    REVIEW_ISSUE_RESULT_V1.structured_blocker shape required by
+    compact_review_result.py (Issue #1791).
+
+    `contract_readiness_check.py --mode execute` の errors[] は
+    rule_id / severity / source_check / category / section / line_start /
+    line_end / minimal_context / fix_hint / autofixable という形状であり、
+    `code` / `finding_kind` / `deterministic_domain_key` / `blocking` /
+    `checker_evidence` を必須とする structured_blocker スキーマとは非互換。
+    本関数は readiness error を**そのまま転写せず**、finding 構築ヘルパー
+    （`_append_findings` と同じ finding_kind / checker_evidence 形状規約）を
+    再利用して変換後の structured_blocker 形状を組み立てる。
+
+    `failure_class` は `status: human_judgment` の readiness error（
+    `env_missing_dep` / `timeout` / unknown 分類など）を区別するための
+    additive フィールド。`needs_fix` 系の readiness error では None のまま
+    渡し、`failure_class` キー自体を出力に含めない。
+    """
+    rule_id = str(readiness_error.get("rule_id") or "READINESS_UNKNOWN")
+    category = str(readiness_error.get("category") or "contract_readiness")
+    source_check = str(
+        readiness_error.get("source_check") or "contract_readiness_check"
+    )
+    message = str(
+        readiness_error.get("fix_hint")
+        or readiness_error.get("message")
+        or rule_id
+    )
+    line_start = readiness_error.get("line_start")
+    line_end = readiness_error.get("line_end")
+    if not isinstance(line_start, int):
+        line_start = None
+    if not isinstance(line_end, int):
+        line_end = None
+
+    checker_evidence_entry = {
+        "source_check": source_check,
+        "rule_id": rule_id,
+        "category": category,
+        "artifact_path": artifact_path,
+        "artifact_schema": READINESS_CHECKER_ARTIFACT_SCHEMA,
+        "body_sha256": body_sha256,
+        "iteration_id": iteration_id,
+        "line_start": line_start,
+        "line_end": line_end,
+    }
+
+    structured_blocker = {
+        "code": rule_id,
+        "message": message,
+        "finding_kind": REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,  # finding_kind: deterministic_domain_blocker
+        "deterministic_domain_key": category,
+        "blocking": True,
+        "checker_evidence": [checker_evidence_entry],
+    }
+    if failure_class:
+        structured_blocker["failure_class"] = failure_class
+    return structured_blocker
+
+
+def readiness_errors_to_structured_blockers(
+    readiness_errors: list[dict],
+    *,
+    body_sha256: str,
+    iteration_id: str,
+    readiness_status: Optional[str] = None,
+) -> list[dict]:
+    """Convert a full ISSUE_CONTRACT_READINESS_RESULT_V1 errors[] list into
+    REVIEW_ISSUE_RESULT_V1.structured_blockers (Issue #1791).
+
+    `readiness_status` (`ISSUE_CONTRACT_READINESS_RESULT_V1.status`) drives the
+    `failure_class` annotation: `human_judgment` readiness results are tagged
+    `contract_readiness_human_judgment` so callers can keep the overall verdict
+    separate from `needs-fix` (SKILL.md Step 2 rule), without changing the
+    structured_blocker schema shape itself.
+    """
+    failure_class = (
+        "contract_readiness_human_judgment"
+        if readiness_status == "human_judgment"
+        else None
+    )
+    return [
+        readiness_error_to_structured_blocker(
+            error,
+            body_sha256=body_sha256,
+            iteration_id=iteration_id,
+            failure_class=failure_class,
+        )
+        for error in readiness_errors
+    ]
 
 
 def _validate_status(status: str) -> str:

@@ -496,3 +496,153 @@ def test_compact_review_result_rejects_path_traversal():
     from compact_review_result import _validate_artifact_path
     with pytest.raises(ValueError, match="traversal"):
         _validate_artifact_path("../../etc/passwd")
+
+
+# ---------------------------------------------------------------------------
+# Issue #1791: readiness_error_to_structured_blocker() converted shape must
+# satisfy the REVIEW_ISSUE_RESULT_V1 structured_blocker schema so that
+# compact_review_result.py does not fail with schema_mismatch (AC1/AC2/AC3).
+# ---------------------------------------------------------------------------
+
+REVIEW_ISSUE_SCRIPTS_DIR = (
+    SKILLS_ROOT.parent / "review-issue" / "scripts"
+)
+if str(REVIEW_ISSUE_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(REVIEW_ISSUE_SCRIPTS_DIR))
+
+from check_issue_contract import (  # noqa: E402
+    readiness_error_to_structured_blocker,
+    readiness_errors_to_structured_blockers,
+)
+
+_SAMPLE_BODY_SHA256 = (
+    "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+)
+
+_SAMPLE_READINESS_ERRORS = [
+    {
+        "rule_id": "LP021",
+        "severity": "error",
+        "source_check": "validate_issue_body",
+        "category": "body_lint",
+        "section": "Allowed Paths",
+        "line_start": 12,
+        "line_end": 12,
+        "minimal_context": ["## Allowed Paths"],
+        "fix_hint": "Allowed Paths を明記してください",
+        "autofixable": False,
+    },
+    {
+        "rule_id": "BASELINE_VC_UNEXPECTED_PASS",
+        "severity": "error",
+        "source_check": "baseline_vc_preflight",
+        "category": "vc_preflight",
+        "section": "Verification Commands",
+        "line_start": 40,
+        "line_end": 42,
+        "minimal_context": [],
+        "fix_hint": "baseline で unexpected pass が検出されました",
+        "autofixable": False,
+    },
+]
+
+
+def test_readiness_error_to_structured_blocker_matches_schema_required_fields():
+    """GIVEN a raw readiness errors[] element WHEN converted THEN the
+    structured_blocker has code/message/finding_kind/deterministic_domain_key/
+    blocking/checker_evidence (AC1)."""
+    blocker = readiness_error_to_structured_blocker(
+        _SAMPLE_READINESS_ERRORS[0],
+        body_sha256=_SAMPLE_BODY_SHA256,
+        iteration_id="iter-1",
+    )
+
+    for required_field in (
+        "code",
+        "message",
+        "finding_kind",
+        "deterministic_domain_key",
+        "blocking",
+        "checker_evidence",
+    ):
+        assert required_field in blocker, f"missing {required_field}"
+
+    assert blocker["finding_kind"] == "deterministic_domain_blocker"
+    assert blocker["blocking"] is True
+    assert blocker["checker_evidence"], "checker_evidence must be non-empty"
+
+
+def test_readiness_error_to_structured_blocker_checker_evidence_fields_complete():
+    """GIVEN a converted structured_blocker WHEN inspecting checker_evidence
+    THEN all required evidence fields are present and non-empty (AC3)."""
+    blocker = readiness_error_to_structured_blocker(
+        _SAMPLE_READINESS_ERRORS[1],
+        body_sha256=_SAMPLE_BODY_SHA256,
+        iteration_id="iter-1",
+    )
+    evidence = blocker["checker_evidence"][0]
+
+    for required_field in (
+        "source_check",
+        "rule_id",
+        "category",
+        "artifact_path",
+        "artifact_schema",
+        "body_sha256",
+        "iteration_id",
+        "line_start",
+        "line_end",
+    ):
+        assert required_field in evidence, f"missing checker_evidence.{required_field}"
+
+    assert evidence["source_check"] == "baseline_vc_preflight"
+    assert evidence["rule_id"] == "BASELINE_VC_UNEXPECTED_PASS"
+    assert evidence["category"] == "vc_preflight"
+    assert evidence["artifact_schema"] == "ISSUE_CONTRACT_READINESS_RESULT_V1"
+    assert evidence["body_sha256"] == _SAMPLE_BODY_SHA256
+    assert evidence["iteration_id"] == "iter-1"
+
+
+def test_readiness_errors_to_structured_blockers_no_schema_mismatch_via_compact(
+    tmp_path,
+):
+    """GIVEN a REVIEW_ISSUE_RESULT_V1 whose structured_blockers were built via
+    readiness_errors_to_structured_blockers() WHEN passed through
+    compact_review_result() THEN no schema_mismatch/ValueError is raised (AC2)."""
+    fixture = FIXTURES_DIR / "review_result_needs_fix.json"
+    raw_result = json.loads(fixture.read_text(encoding="utf-8"))
+    raw_result["structured_blockers"] = readiness_errors_to_structured_blockers(
+        _SAMPLE_READINESS_ERRORS,
+        body_sha256=raw_result["body_sha256"],
+        iteration_id="iter-1",
+    )
+
+    compact_data, stdout_lines, *_ = compact_review_result(
+        raw_result,
+        artifact_dir=tmp_path / ".claude/artifacts/issue-refinement-loop",
+        issue_number=1791,
+    )
+
+    assert compact_data["STATUS"] == "ok"
+    assert compact_data["VERDICT"] == "needs-fix"
+    lines_text = "\n".join(stdout_lines)
+    assert "STATUS: ok" in lines_text
+
+
+def test_readiness_errors_to_structured_blockers_human_judgment_failure_class():
+    """GIVEN readiness_status="human_judgment" WHEN converted THEN each
+    structured_blocker carries failure_class: contract_readiness_human_judgment
+    while still satisfying the required schema fields (SKILL.md Step 2 rule)."""
+    blockers = readiness_errors_to_structured_blockers(
+        _SAMPLE_READINESS_ERRORS,
+        body_sha256=_SAMPLE_BODY_SHA256,
+        iteration_id="iter-1",
+        readiness_status="human_judgment",
+    )
+
+    assert len(blockers) == len(_SAMPLE_READINESS_ERRORS)
+    for blocker in blockers:
+        assert blocker["failure_class"] == "contract_readiness_human_judgment"
+        assert blocker["finding_kind"] == "deterministic_domain_blocker"
+        assert blocker["blocking"] is True
+
