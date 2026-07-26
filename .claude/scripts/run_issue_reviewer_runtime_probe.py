@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -21,8 +22,8 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCENARIOS = {"allow", "block-repair"}
-RECEIPT_SCHEMA = "CLAUDE_SUBAGENT_RUNTIME_RECEIPT_V1"
-SELF_REPORT_SCHEMA = "ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1"
+SESSION_REPORT_SCHEMA = "CLAUDE_ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1"
+SESSION_REPORT_PREFIX = "CLAUDE_ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1:"
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -48,45 +49,6 @@ def current_head() -> str | None:
     return completed.stdout.strip() or None
 
 
-def receipt_records(receipt_dir: Path, issue: int) -> list[dict[str, object]]:
-    records: list[dict[str, object]] = []
-    for path in sorted(receipt_dir.glob("receipt-*.json")):
-        try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(record, dict) and record.get("schema") == RECEIPT_SCHEMA and record.get("issue") == issue:
-            records.append(record)
-    return records
-
-
-def receipt_set_sha256(records: list[dict[str, object]]) -> str:
-    canonical = json.dumps(records, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return sha256_bytes(canonical)
-
-
-def build_local_self_report(
-    issue: int,
-    head_sha: str | None,
-    scenarios: list[dict[str, object]],
-    receipts: list[dict[str, object]],
-) -> dict[str, object]:
-    """Create comparison data from local observations, never model prose."""
-    scenario_statuses = {
-        str(item["scenario"]): str(item["status"])
-        for item in scenarios
-        if isinstance(item.get("scenario"), str) and isinstance(item.get("status"), str)
-    }
-    return {
-        "schema": SELF_REPORT_SCHEMA,
-        "issue": issue,
-        "head_sha": head_sha,
-        "scenario_statuses": scenario_statuses,
-        "receipt_count": len(receipts),
-        "receipt_set_sha256": receipt_set_sha256(receipts),
-    }
-
-
 def atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
@@ -107,35 +69,73 @@ def trusted_claude_binary() -> tuple[str | None, str | None]:
     return binary, None
 
 
-def prompt_for(scenario: str) -> str:
-    if scenario == "allow":
-        instruction = "canonical compact stdout をそのまま返してください。"
-    else:
-        instruction = (
-            "controlled fault-injection: 初回は canonical envelope 外の短い prose を返し、"
-            "SubagentStop の block 後は compact helper の stdout をそのまま再生成してください。"
-        )
+def prompt_for(scenarios: list[str]) -> str:
+    requested = ", ".join(scenarios)
     return (
-        "Run exactly one issue-reviewer subagent in this repository. "
-        "Do not publish, edit an Issue, or expose transcript content. "
-        + instruction
+        "Run the requested issue-reviewer runtime scenarios in this repository: "
+        f"{requested}. For allow, return canonical compact stdout. For block-repair, use the "
+        "controlled fault injection once, then repair with canonical compact stdout. Do not publish "
+        "or edit an Issue. At the end, emit exactly one line with this prefix followed by strict JSON: "
+        f"{SESSION_REPORT_PREFIX} "
+        '{"schema":"CLAUDE_ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1","issue":1754,'
+        '"head_sha":"<current HEAD>","scenarios":{"allow":"pass","block-repair":"pass"},'
+        '"receipt_set_sha256":"sha256:<64 hex>"}. Derive every value from this actual session and '
+        "the receipts it produced. Do not emit raw transcript, prompt, absolute path, or secret."
     )
 
 
-def run_scenario(
+def _candidate_reports(stream: str) -> list[dict[str, object]]:
+    reports: list[dict[str, object]] = []
+    for line in stream.splitlines():
+        if SESSION_REPORT_PREFIX not in line:
+            continue
+        encoded = line.split(SESSION_REPORT_PREFIX, 1)[1].strip()
+        try:
+            report = json.loads(encoded)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(report, dict):
+            reports.append(report)
+    return reports
+
+
+def extract_session_self_report(stream: str, scenarios: list[str]) -> dict[str, object] | None:
+    reports = _candidate_reports(stream)
+    if len(reports) != 1:
+        return None
+    report = reports[0]
+    expected_keys = {"schema", "issue", "head_sha", "scenarios", "receipt_set_sha256"}
+    if set(report) != expected_keys or report.get("schema") != SESSION_REPORT_SCHEMA:
+        return None
+    if not isinstance(report.get("issue"), int) or not isinstance(report.get("head_sha"), str):
+        return None
+    if re.fullmatch(r"[0-9a-f]{40,64}", report["head_sha"]) is None:
+        return None
+    report_scenarios = report.get("scenarios")
+    if not isinstance(report_scenarios, dict) or set(report_scenarios) != set(scenarios):
+        return None
+    if any(status != "pass" for status in report_scenarios.values()):
+        return None
+    receipt_digest = report.get("receipt_set_sha256")
+    if not isinstance(receipt_digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", receipt_digest) is None:
+        return None
+    return report
+
+
+def run_probe_session(
     binary: str,
-    scenario: str,
+    scenarios: list[str],
     debug_file: Path,
     runtime_env: dict[str, str],
 ) -> dict[str, object]:
     command = [
         binary,
         "-p",
-        prompt_for(scenario),
+        prompt_for(scenarios),
         "--output-format",
         "stream-json",
         "--max-turns",
-        "4",
+        "8",
         "--max-budget-usd",
         "0.50",
         "--debug-file",
@@ -152,17 +152,17 @@ def run_scenario(
             env=runtime_env,
         )
     except subprocess.TimeoutExpired:
-        return {"scenario": scenario, "status": "fail", "reason": "runtime_timeout"}
+        return {"status": "fail", "reason": "runtime_timeout", "session_self_report": None}
     stream = (completed.stdout or "").encode("utf-8")
     stderr = (completed.stderr or "").encode("utf-8")
     # The raw stream/debug file are only ephemeral inputs to these digests.
     return {
-        "scenario": scenario,
         "status": "pass" if completed.returncode == 0 else "fail",
         "exit_code": completed.returncode,
         "stream_sha256": sha256_bytes(stream),
         "stderr_sha256": sha256_bytes(stderr),
         "debug_sha256": sha256_bytes(debug_file.read_bytes()) if debug_file.exists() else None,
+        "session_self_report": extract_session_self_report(completed.stdout or "", scenarios),
     }
 
 
@@ -203,21 +203,19 @@ def main() -> int:
             "LOOP_RUNTIME_ISSUE": str(args.issue),
             "LOOP_RUNTIME_HEAD_SHA": head_sha or "",
         }
-        scenario_results = [
-            run_scenario(binary, scenario, temp_root / f"{scenario}.debug", runtime_env)
-            for scenario in args.scenario
-        ]
-    receipts = receipt_records(args.artifact_dir / "runtime-receipts", args.issue)
+        session = run_probe_session(binary, args.scenario, temp_root / "runtime.debug", runtime_env)
     result = {
         "schema": "ISSUE_REVIEWER_RUNTIME_PROBE_V1",
         "issue": args.issue,
-        "result": "pass" if all(item["status"] == "pass" for item in scenario_results) else "fail",
-        "scenarios": scenario_results,
+        "result": session["status"],
+        "scenarios": args.scenario,
+        "session": session,
         "generated_at": now(),
         "raw_transcript_persisted": False,
         "publish_requested": not args.no_publish,
         "trusted_host_provenance": "present",
-        "self_report": build_local_self_report(args.issue, head_sha, scenario_results, receipts),
+        "session_self_report": session["session_self_report"],
+        "runtime_evidence_source": "claude_stream_json",
     }
     atomic_json(artifact, result)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))

@@ -51,17 +51,22 @@ def _receipts(head_sha: str) -> list[dict[str, object]]:
     ]
 
 
-def _probe_with_local_report(head_sha: str, receipts: list[dict[str, object]]) -> dict[str, object]:
-    scenarios: list[dict[str, object]] = [
-        {"scenario": "allow", "status": "pass"},
-        {"scenario": "block-repair", "status": "pass"},
-    ]
+def _probe_with_session_report(head_sha: str, receipts: list[dict[str, object]]) -> dict[str, object]:
+    scenarios = ["allow", "block-repair"]
     return {
         "schema": "ISSUE_REVIEWER_RUNTIME_PROBE_V1",
         "issue": 1754,
         "result": "pass",
         "scenarios": scenarios,
-        "self_report": probe_mod.build_local_self_report(1754, head_sha, scenarios, receipts),
+        "runtime_evidence_source": "claude_stream_json",
+        "session": {"status": "pass"},
+        "session_self_report": {
+            "schema": "CLAUDE_ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1",
+            "issue": 1754,
+            "head_sha": head_sha,
+            "scenarios": {"allow": "pass", "block-repair": "pass"},
+            "receipt_set_sha256": collector_mod.receipt_set_sha256(receipts),
+        },
     }
 
 
@@ -103,43 +108,75 @@ def test_collector_treats_skip_as_skip_not_pass(tmp_path: Path) -> None:
     assert payload["TEST_VERDICT_MACHINE"]["result"] == "skip"
 
 
-def test_local_self_report_matches_independent_receipt_observations() -> None:
+def test_session_self_report_matches_independent_receipt_observations() -> None:
     head_sha = collector_mod.current_head()
     assert head_sha is not None
     receipts = _receipts(head_sha)
-    probe = _probe_with_local_report(head_sha, receipts)
+    probe = _probe_with_session_report(head_sha, receipts)
 
     result, errors = collector_mod.validate(probe, receipts, head_sha, verify_self_report=True)
 
     assert result == "pass"
     assert errors == []
-    assert "prompt" not in probe["self_report"]
-    assert "transcript" not in probe["self_report"]
-
-
-def test_collector_rejects_mismatched_local_self_report() -> None:
-    head_sha = collector_mod.current_head()
-    assert head_sha is not None
-    receipts = _receipts(head_sha)
-    probe = _probe_with_local_report(head_sha, receipts)
-    report = probe["self_report"]
+    report = probe["session_self_report"]
     assert isinstance(report, dict)
-    report["receipt_count"] = 99
-
-    result, errors = collector_mod.validate(probe, receipts, head_sha, verify_self_report=True)
-
-    assert result == "fail"
-    assert "self_report_observation_mismatch" in errors
+    assert "prompt" not in report
+    assert "transcript" not in report
 
 
-def test_collector_rejects_missing_local_self_report() -> None:
+def test_collector_rejects_mismatched_session_self_report() -> None:
     head_sha = collector_mod.current_head()
     assert head_sha is not None
     receipts = _receipts(head_sha)
-    probe = _probe_with_local_report(head_sha, receipts)
-    del probe["self_report"]
+    probe = _probe_with_session_report(head_sha, receipts)
+    report = probe["session_self_report"]
+    assert isinstance(report, dict)
+    report["receipt_set_sha256"] = "sha256:" + "0" * 64
 
     result, errors = collector_mod.validate(probe, receipts, head_sha, verify_self_report=True)
 
     assert result == "fail"
-    assert "self_report_missing" in errors
+    assert "session_self_report_observation_mismatch" in errors
+
+
+def test_collector_rejects_missing_session_self_report() -> None:
+    head_sha = collector_mod.current_head()
+    assert head_sha is not None
+    receipts = _receipts(head_sha)
+    probe = _probe_with_session_report(head_sha, receipts)
+    del probe["session_self_report"]
+
+    result, errors = collector_mod.validate(probe, receipts, head_sha, verify_self_report=True)
+
+    assert result == "fail"
+    assert "session_self_report_missing" in errors
+
+
+def test_synthetic_stream_fixture_is_not_runtime_evidence() -> None:
+    head_sha = collector_mod.current_head()
+    assert head_sha is not None
+    receipts = _receipts(head_sha)
+    probe = _probe_with_session_report(head_sha, receipts)
+    probe["runtime_evidence_source"] = "synthetic_fixture"
+
+    result, errors = collector_mod.validate(probe, receipts, head_sha, verify_self_report=True)
+
+    assert result == "fail"
+    assert "runtime_evidence_source_invalid" in errors
+
+
+def test_stream_json_report_parser_rejects_untrusted_shape() -> None:
+    valid = {
+        "schema": "CLAUDE_ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1",
+        "issue": 1754,
+        "head_sha": "a" * 40,
+        "scenarios": {"allow": "pass", "block-repair": "pass"},
+        "receipt_set_sha256": "sha256:" + "b" * 64,
+    }
+    stream = "event\nCLAUDE_ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1: " + json.dumps(valid)
+
+    assert probe_mod.extract_session_self_report(stream, ["allow", "block-repair"]) == valid
+    assert probe_mod.extract_session_self_report(stream + "\n" + stream, ["allow", "block-repair"]) is None
+    invalid = valid | {"receipt_set_sha256": "not-a-digest"}
+    invalid_stream = "CLAUDE_ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1: " + json.dumps(invalid)
+    assert probe_mod.extract_session_self_report(invalid_stream, ["allow", "block-repair"]) is None

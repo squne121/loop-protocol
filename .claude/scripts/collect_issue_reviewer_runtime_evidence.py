@@ -22,7 +22,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RECEIPT_SCHEMA = "CLAUDE_SUBAGENT_RUNTIME_RECEIPT_V1"
 PROBE_SCHEMA = "ISSUE_REVIEWER_RUNTIME_PROBE_V1"
-SELF_REPORT_SCHEMA = "ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1"
+SESSION_REPORT_SCHEMA = "CLAUDE_ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1"
 
 
 def digest(value: bytes) -> str:
@@ -79,20 +79,16 @@ def receipt_set_sha256(records: list[dict[str, Any]]) -> str:
     return digest(canonical)
 
 
-def scenario_statuses(probe: dict[str, Any]) -> dict[str, str] | None:
+def requested_scenarios(probe: dict[str, Any]) -> set[str] | None:
     scenarios = probe.get("scenarios")
     if not isinstance(scenarios, list):
         return None
-    statuses: dict[str, str] = {}
+    requested: set[str] = set()
     for scenario in scenarios:
-        if not isinstance(scenario, dict):
+        if not isinstance(scenario, str) or scenario in requested:
             return None
-        name = scenario.get("scenario")
-        status = scenario.get("status")
-        if not isinstance(name, str) or not isinstance(status, str) or name in statuses:
-            return None
-        statuses[name] = status
-    return statuses
+        requested.add(scenario)
+    return requested
 
 
 def validate(
@@ -109,6 +105,8 @@ def validate(
         return "skip", errors
     if probe.get("result") != "pass":
         errors.append("runtime_probe_not_pass")
+    if probe.get("runtime_evidence_source") != "claude_stream_json":
+        errors.append("runtime_evidence_source_invalid")
     if not head:
         errors.append("head_unavailable")
     if not receipts:
@@ -128,18 +126,21 @@ def validate(
     ):
         errors.append("retry_invalid_parent_fail_close_missing")
     if verify_self_report:
-        report = probe.get("self_report")
+        report = probe.get("session_self_report")
+        scenarios = requested_scenarios(probe)
         if not isinstance(report, dict):
-            errors.append("self_report_missing")
+            errors.append("session_self_report_missing")
         elif (
-            report.get("schema") != SELF_REPORT_SCHEMA
+            set(report) != {"schema", "issue", "head_sha", "scenarios", "receipt_set_sha256"}
+            or report.get("schema") != SESSION_REPORT_SCHEMA
             or report.get("issue") != probe.get("issue")
             or report.get("head_sha") != head
-            or report.get("scenario_statuses") != scenario_statuses(probe)
-            or report.get("receipt_count") != len(receipts)
+            or not isinstance(report.get("scenarios"), dict)
+            or set(report["scenarios"]) != scenarios
+            or any(status != "pass" for status in report["scenarios"].values())
             or report.get("receipt_set_sha256") != receipt_set_sha256(receipts)
         ):
-            errors.append("self_report_observation_mismatch")
+            errors.append("session_self_report_observation_mismatch")
     return ("pass" if not errors else "fail"), errors
 
 
