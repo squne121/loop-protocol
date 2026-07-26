@@ -21,6 +21,8 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCENARIOS = {"allow", "block-repair"}
+RECEIPT_SCHEMA = "CLAUDE_SUBAGENT_RUNTIME_RECEIPT_V1"
+SELF_REPORT_SCHEMA = "ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1"
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -29,6 +31,60 @@ def sha256_bytes(value: bytes) -> str:
 
 def now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def current_head() -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return completed.stdout.strip() or None
+
+
+def receipt_records(receipt_dir: Path, issue: int) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for path in sorted(receipt_dir.glob("receipt-*.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(record, dict) and record.get("schema") == RECEIPT_SCHEMA and record.get("issue") == issue:
+            records.append(record)
+    return records
+
+
+def receipt_set_sha256(records: list[dict[str, object]]) -> str:
+    canonical = json.dumps(records, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return sha256_bytes(canonical)
+
+
+def build_local_self_report(
+    issue: int,
+    head_sha: str | None,
+    scenarios: list[dict[str, object]],
+    receipts: list[dict[str, object]],
+) -> dict[str, object]:
+    """Create comparison data from local observations, never model prose."""
+    scenario_statuses = {
+        str(item["scenario"]): str(item["status"])
+        for item in scenarios
+        if isinstance(item.get("scenario"), str) and isinstance(item.get("status"), str)
+    }
+    return {
+        "schema": SELF_REPORT_SCHEMA,
+        "issue": issue,
+        "head_sha": head_sha,
+        "scenario_statuses": scenario_statuses,
+        "receipt_count": len(receipts),
+        "receipt_set_sha256": receipt_set_sha256(receipts),
+    }
 
 
 def atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -66,7 +122,12 @@ def prompt_for(scenario: str) -> str:
     )
 
 
-def run_scenario(binary: str, scenario: str, debug_file: Path) -> dict[str, object]:
+def run_scenario(
+    binary: str,
+    scenario: str,
+    debug_file: Path,
+    runtime_env: dict[str, str],
+) -> dict[str, object]:
     command = [
         binary,
         "-p",
@@ -81,7 +142,15 @@ def run_scenario(binary: str, scenario: str, debug_file: Path) -> dict[str, obje
         str(debug_file),
     ]
     try:
-        completed = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True, timeout=120, check=False)
+        completed = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+            env=runtime_env,
+        )
     except subprocess.TimeoutExpired:
         return {"scenario": scenario, "status": "fail", "reason": "runtime_timeout"}
     stream = (completed.stdout or "").encode("utf-8")
@@ -128,10 +197,17 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="issue-reviewer-runtime-") as temporary:
         temp_root = Path(temporary)
+        head_sha = current_head()
+        runtime_env = os.environ | {
+            "ISSUE_REVIEWER_RUNTIME_RECEIPT_DIR": str(args.artifact_dir / "runtime-receipts"),
+            "LOOP_RUNTIME_ISSUE": str(args.issue),
+            "LOOP_RUNTIME_HEAD_SHA": head_sha or "",
+        }
         scenario_results = [
-            run_scenario(binary, scenario, temp_root / f"{scenario}.debug")
+            run_scenario(binary, scenario, temp_root / f"{scenario}.debug", runtime_env)
             for scenario in args.scenario
         ]
+    receipts = receipt_records(args.artifact_dir / "runtime-receipts", args.issue)
     result = {
         "schema": "ISSUE_REVIEWER_RUNTIME_PROBE_V1",
         "issue": args.issue,
@@ -141,6 +217,7 @@ def main() -> int:
         "raw_transcript_persisted": False,
         "publish_requested": not args.no_publish,
         "trusted_host_provenance": "present",
+        "self_report": build_local_self_report(args.issue, head_sha, scenario_results, receipts),
     }
     atomic_json(artifact, result)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))

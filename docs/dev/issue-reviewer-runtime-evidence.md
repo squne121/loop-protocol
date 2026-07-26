@@ -30,8 +30,10 @@ decision、reason、時刻、hook/settings digest に限る。
 がそろわない場合、`SKIP:` と exit 77 を返す。SKIP は PASS ではない。probe の
 stream/debug は temporary input として digest 化した後に破棄する。
 
-`collect_issue_reviewer_runtime_evidence.py` は current HEAD、receipt decision列、
-probe digest を独立に検査し、self-report は一致比較だけを行う。
+`run_issue_reviewer_runtime_probe.py` は実行後に、current HEAD、scenario結果、receipt
+集合digestだけから sanitize 済みの local self-report を生成する。人間やmodelのproseは
+入力にしない。`collect_issue_reviewer_runtime_evidence.py` は current HEAD、receipt
+decision列、probe digest を独立に検査し、このlocal self-reportは一致比較だけを行う。
 `TEST_VERDICT_MACHINE/v2` 候補は head-bound である。publisher は sanitized summary
 だけを controlled `update_pr.py` 経路で投稿し、PR URL・body hash・HEAD を readback
 する。local transcript を artifact や PR に投稿してはならない。

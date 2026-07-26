@@ -22,6 +22,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RECEIPT_SCHEMA = "CLAUDE_SUBAGENT_RUNTIME_RECEIPT_V1"
 PROBE_SCHEMA = "ISSUE_REVIEWER_RUNTIME_PROBE_V1"
+SELF_REPORT_SCHEMA = "ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1"
 
 
 def digest(value: bytes) -> str:
@@ -73,6 +74,27 @@ def receipt_records(receipt_dir: Path, issue: int) -> tuple[list[dict[str, Any]]
     return records, errors
 
 
+def receipt_set_sha256(records: list[dict[str, Any]]) -> str:
+    canonical = json.dumps(records, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return digest(canonical)
+
+
+def scenario_statuses(probe: dict[str, Any]) -> dict[str, str] | None:
+    scenarios = probe.get("scenarios")
+    if not isinstance(scenarios, list):
+        return None
+    statuses: dict[str, str] = {}
+    for scenario in scenarios:
+        if not isinstance(scenario, dict):
+            return None
+        name = scenario.get("scenario")
+        status = scenario.get("status")
+        if not isinstance(name, str) or not isinstance(status, str) or name in statuses:
+            return None
+        statuses[name] = status
+    return statuses
+
+
 def validate(
     probe: dict[str, Any] | None,
     receipts: list[dict[str, Any]],
@@ -109,7 +131,14 @@ def validate(
         report = probe.get("self_report")
         if not isinstance(report, dict):
             errors.append("self_report_missing")
-        elif report.get("head_sha") != head or report.get("receipt_count") != len(receipts):
+        elif (
+            report.get("schema") != SELF_REPORT_SCHEMA
+            or report.get("issue") != probe.get("issue")
+            or report.get("head_sha") != head
+            or report.get("scenario_statuses") != scenario_statuses(probe)
+            or report.get("receipt_count") != len(receipts)
+            or report.get("receipt_set_sha256") != receipt_set_sha256(receipts)
+        ):
             errors.append("self_report_observation_mismatch")
     return ("pass" if not errors else "fail"), errors
 
