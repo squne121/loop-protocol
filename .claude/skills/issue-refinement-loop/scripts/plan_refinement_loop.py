@@ -426,6 +426,385 @@ def _canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
+# ---------------------------------------------------------------------------
+# ISSUE_EXECUTION_DECISION_V1 (#1677): canonical relation-graph decision.
+#
+# This module is the canonical producer AND the normative semantic validator
+# owner for ISSUE_EXECUTION_DECISION_V1 (schemas/issue_execution_decision_v1.
+# schema.json owns the static/closed shape; validate_issue_execution_decision()
+# below owns the cross-field graph invariants). Other scripts in this skill
+# (run_refinement_preflight.py, build_loop_state.py) import
+# validate_issue_execution_decision from this module rather than
+# re-implementing the invariants, per the #1677 Canonical Contract Freeze.
+# ---------------------------------------------------------------------------
+
+# PR #1767 owner review (P0-4/AC12 Scope Delta): validate_issue_execution_
+# decision.py is now the standalone canonical module (schema+semantic
+# validator, provenance/migration helpers). plan_refinement_loop.py imports
+# from it rather than defining its own copy, so producer/LOOP_STATE builder/
+# handoff producer/downstream consumer share one authority. Import failure
+# is fail-closed (validate_issue_execution_decision left as None; callers
+# below check for this and refuse to emit an unvalidated decision).
+try:
+    from validate_issue_execution_decision import (
+        ISSUE_EXECUTION_DECISION_DOWNSTREAM_POLICY,
+        ISSUE_EXECUTION_DECISION_SCHEMA_VERSION,
+        validate_issue_execution_decision,
+    )
+except ImportError:  # pragma: no cover - subprocess/CLI fallback path
+    validate_issue_execution_decision = None
+    ISSUE_EXECUTION_DECISION_SCHEMA_VERSION = "ISSUE_EXECUTION_DECISION_V1"
+    ISSUE_EXECUTION_DECISION_DOWNSTREAM_POLICY = {
+        "semantic_reclassification": "forbidden",
+        "freshness_validation": "required",
+        "stale_action": "rerun_issue_refinement",
+    }
+
+# PR #1767 owner review (P0-2): ISSUE_SCOPE_ROLLUP_PLAN_V2 is a coordination
+# plan, not a semantic dependency graph. suggested_action /
+# ordering_constraint values do NOT carry a confirmed direction or a
+# confirmed duplicate/absorb relationship -- only "proceed_with_coordination"
+# maps to a genuinely non-committal "coordinates" relation. All other
+# suggested_action / ordering_constraint values that previously asserted a
+# fabricated direction or relation type (sequential_required -> depends_on,
+# merge_into_current_pr/amend_current_issue -> duplicate,
+# create_parent_rollup_issue -> absorb) have been removed; they now route to
+# an "unclassified" bucket that forces execution.state=deferred instead of
+# silently defaulting to selected/duplicate/blocked.
+_ROLLUP_ACTION_COORDINATE = frozenset({"proceed_with_coordination"})
+_ROLLUP_UNCLASSIFIED_ACTIONS = frozenset(
+    {
+        "merge_into_current_pr",
+        "amend_current_issue",
+        "create_parent_rollup_issue",
+        "human_review_required",
+    }
+)
+_ROLLUP_UNCLASSIFIED_ORDERINGS = frozenset({"sequential_required"})
+_KNOWN_ROLLUP_COMPLETENESS_VALUES = frozenset({"full", "partial"})
+
+
+def _sha256_prefixed(text: str) -> str:
+    """SHA256 digest with the 'sha256:' prefix required by ISSUE_EXECUTION_DECISION_V1."""
+    return "sha256:" + _sha256(text)
+
+
+def _node_body_sha256_for_candidate(candidate: dict[str, Any]) -> str:
+    """Deterministic node digest for a scope-rollup candidate (no raw body available)."""
+    return _sha256_prefixed(_canonical_json(candidate))
+
+
+def _derive_execution_decision_inputs(
+    target_issue_number: int,
+    scope_rollup_result: "dict[str, Any] | None",
+) -> tuple[
+    list[dict[str, Any]],
+    dict[int, str],
+    list[int],
+    bool,
+    bool,
+    bool,
+    list[int],
+    list[str],
+]:
+    """
+    Derive (relations, extra_nodes, predecessors, duplicate_hit,
+    issues_complete, dependencies_complete, unresolved_references,
+    unclassified_notes) from an ISSUE_SCOPE_ROLLUP_PLAN_V2 artifact (#1677
+    AC4 join).
+
+    PR #1767 owner review fixes (P0-1, P0-2):
+    - Artifact absence, wrong schema_version, unknown/missing
+      input.completeness, and malformed candidates are now treated as
+      INCOMPLETE evidence (issues_complete=False), not as "complete ->
+      selected". A missing/corrupt/stale artifact must never fail-open into
+      an implementation-permitting decision.
+    - suggested_action / ordering_constraint values that would have asserted
+      a fabricated direction or relation type are routed to
+      unclassified_notes instead of becoming depends_on/duplicate/absorb
+      relations. Only "proceed_with_coordination" produces a relation
+      ("coordinates" -- non-committal, no direction/duplication claim).
+    - PR candidates (candidate.kind == "pr") are excluded from the Issue
+      node/relation graph entirely (Issue #N and PR #N must not collide as
+      the same node).
+    """
+    relations: list[dict[str, Any]] = []
+    extra_nodes: dict[int, str] = {}
+    predecessors: list[int] = []
+    duplicate_hit = False
+    unclassified_notes: list[str] = []
+
+    if not isinstance(scope_rollup_result, dict):
+        return (
+            relations,
+            extra_nodes,
+            predecessors,
+            duplicate_hit,
+            False,
+            False,
+            [target_issue_number],
+            ["scope_rollup_artifact_absent"],
+        )
+
+    if scope_rollup_result.get("schema_version") != 2:
+        return (
+            relations,
+            extra_nodes,
+            predecessors,
+            duplicate_hit,
+            False,
+            False,
+            [target_issue_number],
+            ["scope_rollup_artifact_schema_version_mismatch"],
+        )
+
+    input_meta = scope_rollup_result.get("input")
+    completeness_str = (input_meta or {}).get("completeness") if isinstance(input_meta, dict) else None
+    if completeness_str not in _KNOWN_ROLLUP_COMPLETENESS_VALUES:
+        return (
+            relations,
+            extra_nodes,
+            predecessors,
+            duplicate_hit,
+            False,
+            False,
+            [target_issue_number],
+            ["scope_rollup_completeness_unknown_or_missing"],
+        )
+
+    issues_complete = completeness_str == "full"
+    dependencies_complete = issues_complete
+    unresolved_references = [] if issues_complete else [target_issue_number]
+
+    candidates = scope_rollup_result.get("candidates")
+    if not isinstance(candidates, list):
+        return (
+            relations,
+            extra_nodes,
+            predecessors,
+            duplicate_hit,
+            False,
+            False,
+            [target_issue_number],
+            ["scope_rollup_candidates_malformed"],
+        )
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            # Malformed candidate: cannot assert completeness of the
+            # collision picture (was previously silently skipped).
+            issues_complete = False
+            dependencies_complete = False
+            if target_issue_number not in unresolved_references:
+                unresolved_references.append(target_issue_number)
+            unclassified_notes.append("malformed_candidate_entry")
+            continue
+
+        number = candidate.get("number")
+        kind = candidate.get("kind")
+        if not isinstance(number, int) or kind not in ("issue", "pr"):
+            issues_complete = False
+            dependencies_complete = False
+            if target_issue_number not in unresolved_references:
+                unresolved_references.append(target_issue_number)
+            unclassified_notes.append("malformed_candidate_entry")
+            continue
+
+        if kind == "pr":
+            # P0-2: PR candidates must not collide with Issue nodes in the
+            # Issue relation graph (separate namespace). PR-vs-Issue
+            # collision is out of scope for this decision.
+            continue
+
+        signals = candidate.get("signals")
+        evidence = [f"signal:{s}" for s in signals] if isinstance(signals, list) and signals else [
+            f"scope_rollup_candidate:{number}"
+        ]
+
+        action = candidate.get("suggested_action")
+        ordering = candidate.get("ordering_constraint")
+
+        if action in _ROLLUP_ACTION_COORDINATE:
+            relations.append(
+                {
+                    "source_issue_number": target_issue_number,
+                    "target_issue_number": number,
+                    "relation_type": "coordinates",
+                    "evidence": evidence,
+                }
+            )
+            extra_nodes[number] = _node_body_sha256_for_candidate(candidate)
+        elif action in _ROLLUP_UNCLASSIFIED_ACTIONS or ordering in _ROLLUP_UNCLASSIFIED_ORDERINGS:
+            # Ambiguous / direction-undetermined coordination signal. Do NOT
+            # fabricate a depends_on/duplicate/absorb relation from it.
+            unclassified_notes.append(
+                f"candidate #{number}: suggested_action={action!r} "
+                f"ordering_constraint={ordering!r} requires human "
+                f"classification (not auto-converted to a semantic relation)"
+            )
+        # Any other suggested_action/ordering_constraint combination (e.g.
+        # keep_separate_with_reason + parallel_ok) is genuinely resolved:
+        # no relation, no unclassified note needed.
+
+    predecessors = sorted(set(predecessors))
+    return (
+        relations,
+        extra_nodes,
+        predecessors,
+        duplicate_hit,
+        issues_complete,
+        dependencies_complete,
+        unresolved_references,
+        unclassified_notes,
+    )
+
+
+def build_issue_execution_decision(
+    issue_number: int,
+    issue_body_sha256: str,
+    generated_at: str,
+    known_context: "dict[str, Any] | None",
+) -> dict[str, Any]:
+    """
+    Build an ISSUE_EXECUTION_DECISION_V1 dict (#1677).
+
+    Reads known_context['scope_rollup_result'] (ISSUE_SCOPE_ROLLUP_PLAN_V2,
+    joined in by run_refinement_preflight.py) when present. Absent that key,
+    emits a minimal 'selected' decision for the target Issue alone.
+    """
+    scope_rollup_result = None
+    if isinstance(known_context, dict):
+        scope_rollup_result = known_context.get("scope_rollup_result")
+
+    (
+        relations,
+        extra_nodes,
+        predecessors,
+        duplicate_hit,
+        issues_complete,
+        dependencies_complete,
+        unresolved_references,
+        unclassified_notes,
+    ) = _derive_execution_decision_inputs(issue_number, scope_rollup_result)
+
+    # issue_body_sha256 passed in is already the computed hex digest of the
+    # issue body (matches source.issue_body_sha256 elsewhere in this module).
+    # BUGFIX (PR #1767 owner review, P0-3.1): the previous code called
+    # _sha256_prefixed(issue_body_sha256), which re-hashes the already-hex
+    # digest (SHA256(hex(SHA256(body))) instead of SHA256(body)), making
+    # target_body_sha256 useless for freshness verification against the live
+    # Issue body. A verified hex digest must only be prefixed, never re-hashed.
+    target_body_sha256 = (
+        issue_body_sha256
+        if issue_body_sha256.startswith("sha256:")
+        else f"sha256:{issue_body_sha256}"
+    )
+    nodes_map: dict[int, str] = {issue_number: target_body_sha256}
+    for number, body_sha in extra_nodes.items():
+        nodes_map.setdefault(number, body_sha)
+
+    nodes = [
+        {"issue_number": n, "body_sha256": nodes_map[n]}
+        for n in sorted(nodes_map)
+    ]
+    relations_sorted = sorted(
+        relations,
+        key=lambda r: (r["source_issue_number"], r["target_issue_number"], r["relation_type"]),
+    )
+
+    if not issues_complete or not dependencies_complete or unresolved_references:
+        state = "deferred"
+        defer_reason = (
+            "scope rollup evidence incomplete ("
+            + "; ".join(unclassified_notes or ["scope_rollup_evidence_incomplete"])
+            + "); rerun issue-refinement-loop"
+        )
+        final_predecessors: list[int] = []
+    elif duplicate_hit:
+        # Reachable only if a future, genuinely reliable source (explicit
+        # duplicate marker / GitHub duplicate event) populates duplicate_hit
+        # -- ISSUE_SCOPE_ROLLUP_PLAN_V2 heuristics no longer set this
+        # (PR #1767 owner review, P0-2).
+        state = "duplicate"
+        defer_reason = "duplicate or absorb relation confirmed by an authoritative source"
+        final_predecessors = []
+    elif predecessors:
+        # Reachable only once a genuinely directional dependency source
+        # (GitHub native blockedBy/blocking) populates predecessors --
+        # ISSUE_SCOPE_ROLLUP_PLAN_V2 heuristics no longer do (P0-2).
+        state = "blocked"
+        defer_reason = (
+            "open predecessor issue(s) pending: "
+            + ", ".join(f"#{p}" for p in predecessors)
+        )
+        final_predecessors = predecessors
+    elif unclassified_notes:
+        # PR #1767 owner review (P0-2): ambiguous scope-rollup coordination
+        # signals (undetermined direction, human_review_required, or a
+        # merge/amend/absorb suggestion) must not silently resolve to
+        # 'selected'. They require human classification.
+        state = "deferred"
+        defer_reason = (
+            "unclassified scope-rollup coordination signal(s) require human "
+            "classification: " + "; ".join(unclassified_notes)
+        )
+        final_predecessors = []
+    else:
+        state = "selected"
+        defer_reason = None
+        final_predecessors = []
+
+    execution_block = {
+        "state": state,
+        "target_issue_number": issue_number,
+        "predecessors": final_predecessors,
+        "defer_reason": defer_reason,
+    }
+    completeness_block = {
+        "issues_complete": issues_complete,
+        "dependencies_complete": dependencies_complete,
+        "unresolved_references": unresolved_references,
+    }
+
+    # PR #1767 owner review (P0-3.3): collection_digest previously covered
+    # only nodes/relations, so execution.state could change (e.g. blocked ->
+    # deferred) without changing the digest handoff to downstream consumers
+    # claim as unchanged. Cover the full semantic decision surface instead.
+    collection_digest = _sha256_prefixed(
+        _canonical_json(
+            {
+                "nodes": nodes,
+                "relations": relations_sorted,
+                "execution": execution_block,
+                "completeness": completeness_block,
+                "downstream_policy": ISSUE_EXECUTION_DECISION_DOWNSTREAM_POLICY,
+            }
+        )
+    )
+
+    return {
+        "schema_version": ISSUE_EXECUTION_DECISION_SCHEMA_VERSION,
+        "identity": {
+            "target_issue_number": issue_number,
+            "target_body_sha256": target_body_sha256,
+            "generated_at": generated_at,
+            "collection_digest": collection_digest,
+        },
+        "nodes": nodes,
+        "relations": relations_sorted,
+        "execution": execution_block,
+        "downstream_policy": dict(ISSUE_EXECUTION_DECISION_DOWNSTREAM_POLICY),
+        "completeness": completeness_block,
+    }
+
+
+# validate_issue_execution_decision (schema-first combined check) and its
+# validate_schema()/validate_semantics() split now live in the standalone
+# canonical module validate_issue_execution_decision.py (#1677 AC11/AC12
+# Scope Delta), imported above. This module no longer defines its own
+# copy of the semantic invariants.
+
+
 def _extract_sections(text: str) -> dict[str, str]:
     if delta_extract_sections is not None:
         return delta_extract_sections(text)
@@ -2182,6 +2561,85 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
 
         if scope_signal_guard_decision_v2 is not None:
             plan["scope_signal_guard_decision_v2"] = scope_signal_guard_decision_v2
+
+        # #1677: ISSUE_EXECUTION_DECISION_V1 (relation graph, execution state,
+        # downstream_policy). Self-validated via validate_issue_execution_decision
+        # so a malformed derivation never reaches downstream consumers silently.
+        issue_execution_decision = build_issue_execution_decision(
+            issue_number, issue_body_sha256, generated_at, known_context
+        )
+        if validate_issue_execution_decision is None:
+            # #1677 AC12 (PR #1767 owner review, P0-4): a failed import of
+            # the canonical validate_issue_execution_decision module must
+            # fail-closed, not silently skip validation.
+            raise RuntimeError(
+                "validate_issue_execution_decision module import failed; "
+                "refusing to emit an unvalidated issue_execution_decision"
+            )
+        _decision_violations = validate_issue_execution_decision(issue_execution_decision)
+        if _decision_violations:
+            # PR #1767 owner review (P0-3.4): a prior version of this
+            # fallback reused the pre-violation identity/collection_digest
+            # verbatim, so the "self-healed" artifact's digest never matched
+            # its own (now different) nodes/relations/execution/completeness
+            # -- an internally inconsistent artifact. The fallback below
+            # recomputes collection_digest from its own actual content, and
+            # the result is re-validated before being accepted; a producer
+            # bug is never hidden behind an unvalidated "self-repair".
+            _target_body_sha256 = issue_execution_decision["identity"]["target_body_sha256"]
+            _fallback_nodes = [{"issue_number": issue_number, "body_sha256": _target_body_sha256}]
+            _fallback_relations: list[dict[str, Any]] = []
+            _fallback_execution = {
+                "state": "deferred",
+                "target_issue_number": issue_number,
+                "predecessors": [],
+                "defer_reason": (
+                    "issue_execution_decision derivation failed semantic validation: "
+                    + ", ".join(_decision_violations)
+                ),
+            }
+            _fallback_completeness = {
+                "issues_complete": False,
+                "dependencies_complete": False,
+                "unresolved_references": [issue_number],
+            }
+            _fallback_digest = _sha256_prefixed(
+                _canonical_json(
+                    {
+                        "nodes": _fallback_nodes,
+                        "relations": _fallback_relations,
+                        "execution": _fallback_execution,
+                        "completeness": _fallback_completeness,
+                        "downstream_policy": ISSUE_EXECUTION_DECISION_DOWNSTREAM_POLICY,
+                    }
+                )
+            )
+            issue_execution_decision = {
+                "schema_version": ISSUE_EXECUTION_DECISION_SCHEMA_VERSION,
+                "identity": {
+                    "target_issue_number": issue_number,
+                    "target_body_sha256": _target_body_sha256,
+                    "generated_at": generated_at,
+                    "collection_digest": _fallback_digest,
+                },
+                "nodes": _fallback_nodes,
+                "relations": _fallback_relations,
+                "execution": _fallback_execution,
+                "downstream_policy": dict(ISSUE_EXECUTION_DECISION_DOWNSTREAM_POLICY),
+                "completeness": _fallback_completeness,
+            }
+            _fallback_violations = validate_issue_execution_decision(issue_execution_decision)
+            if _fallback_violations:
+                # The fallback itself is not schema/semantically valid (should
+                # not happen given its fixed minimal shape) -- do not emit
+                # any issue_execution_decision at all; propagate as an
+                # internal error so the whole plan fails closed rather than
+                # publishing an inconsistent artifact.
+                raise RuntimeError(
+                    "issue_execution_decision fallback failed re-validation: "
+                    + ", ".join(_fallback_violations)
+                )
+        plan["issue_execution_decision"] = issue_execution_decision
 
         return plan, 0
 

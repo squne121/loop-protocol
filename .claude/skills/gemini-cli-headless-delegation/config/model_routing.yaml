@@ -43,6 +43,22 @@ roles:
       - gemini-3-pro-preview
       - gemini-3-flash-preview
       - gemini-2.5-flash
+  # grounded_research (Issue #1777): capability-driven routing replacement
+  # for the former hardcoded AGY_GROUNDED_RESEARCH_MODEL constant in
+  # run_gemini_headless.py. Consumed only by provider="agy"
+  # tool_profile="grounded_research" via
+  # resolve_agy_grounded_research_model() -- unrelated to the gemini-model
+  # roles above (this role's model_chain is a list of AGY `--model`
+  # candidate ids, not Gemini model ids). Model specification stays
+  # optional: resolve_agy_grounded_research_model() falls back to no
+  # `--model` flag at all (AGY account_default) if this chain is empty or
+  # every candidate fails the availability preflight. A controlled
+  # grounding matrix experiment (#1777) found prompt construction, not
+  # model selection, to be the dominant reliability factor -- see
+  # references/agy-headless-tool-use-investigation.md.
+  grounded_research:
+    model_chain:
+      - claude-sonnet-4-6
 
 # provider_auto_policy_v1 (Issue #1270)
 #

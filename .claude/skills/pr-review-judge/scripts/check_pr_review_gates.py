@@ -105,7 +105,7 @@ class PRReviewGateResult:
 
 
 class CheckPRReviewGates:
-    """Main checker class implementing G1-G5."""
+    """Main checker class implementing G1-G6."""
 
     def __init__(self, strict: bool = False):
         self.result = PRReviewGateResult()
@@ -788,6 +788,44 @@ class CheckPRReviewGates:
         parsed["tests"] = tests
         return parsed
 
+    def g6_allowed_paths_gate_producer_role_presence(self, pr_body: str = "") -> GateResult:
+        """
+        G6: allowed_paths_gate / producer_role block presence (Issue #1776)
+
+        Detects PR review bodies that omit the allowed_paths_gate block or
+        the producer_role field entirely. Both omissions are treated as
+        indeterminate (merge-blocking), matching the existing
+        `producer_role != review_subagent` routing already documented in
+        impl-review-loop/SKILL.md's Allowed Paths Gate Routing table.
+
+        Not applicable when no PR review body is supplied at all (no data
+        to evaluate -- distinct from a body that omits the fields).
+        """
+        gate = GateResult(
+            gate_id="g6",
+            gate_name="allowed_paths_gate_producer_role_presence",
+            status=GateStatus.NOT_APPLICABLE.value
+        )
+
+        if not pr_body or not pr_body.strip():
+            return gate
+
+        missing: List[str] = []
+        if not re.search(r"allowed_paths_gate\s*:", pr_body):
+            missing.append("allowed_paths_gate block missing")
+        if not re.search(r'["\']?producer_role["\']?\s*[:=]', pr_body):
+            missing.append("producer_role field missing")
+
+        if missing:
+            gate.status = GateStatus.FAIL.value
+            gate.minimal_context = (
+                "G6: indeterminate (merge-blocking) -- " + "; ".join(missing)
+            )
+            return gate
+
+        gate.status = GateStatus.PASS.value
+        return gate
+
     def run_gate(self, gate_id: str, **kwargs) -> GateResult:
         """Run a specific gate by ID."""
         if gate_id == "g1":
@@ -813,6 +851,10 @@ class CheckPRReviewGates:
             return self.g5_fixture_guard_path_coverage(
                 kwargs.get("trace_log"),
                 kwargs.get("coverage_file")
+            )
+        elif gate_id == "g6":
+            return self.g6_allowed_paths_gate_producer_role_presence(
+                kwargs.get("pr_body", "")
             )
         raise ValueError(f"Unknown gate: {gate_id}")
 
@@ -875,7 +917,7 @@ def validate_against_schema(output_dict: Dict[str, Any], schema_path: Path) -> L
         minimal_context = gate.get("minimal_context")
 
         # Validate required gate fields
-        if gate_id not in ["g1", "g2", "g3", "g4", "g5"]:
+        if gate_id not in ["g1", "g2", "g3", "g4", "g5", "g6"]:
             errors.append(f"Invalid gate_id: {gate_id}")
         if gate_status not in ["pass", "fail", "not_applicable"]:
             errors.append(f"Invalid gate status: {gate_status}")
@@ -916,11 +958,11 @@ def validate_against_schema(output_dict: Dict[str, Any], schema_path: Path) -> L
 
 def main():
     parser = argparse.ArgumentParser(
-        description="PR Review Deterministic Gates Checker (G1-G5)"
+        description="PR Review Deterministic Gates Checker (G1-G6)"
     )
     parser.add_argument(
         "--rule", "-r",
-        help="Gate to run: g1|g2|g3|g4|g5 or all (default: all)",
+        help="Gate to run: g1|g2|g3|g4|g5|g6 or all (default: all)",
         default="all"
     )
     parser.add_argument(
@@ -980,7 +1022,7 @@ def main():
     strict_mode = args.strict if args.strict else is_all_rule
 
     checker = CheckPRReviewGates(strict=strict_mode)
-    gates_to_run = args.rule.split(",") if args.rule != "all" else ["g1", "g2", "g3", "g4", "g5"]
+    gates_to_run = args.rule.split(",") if args.rule != "all" else ["g1", "g2", "g3", "g4", "g5", "g6"]
 
     for gate in gates_to_run:
         gate = gate.strip().lower()

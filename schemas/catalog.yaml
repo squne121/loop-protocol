@@ -2,6 +2,106 @@ catalog_schema_version: "v1"
 catalog_id: "loop-protocol.schema-catalog/v1"
 generated_from: null
 entries:
+
+  - schema_id: "AGY_GROUNDING_EVIDENCE_VERDICT_V1"
+    format: yaml
+    source_kind: repo_path
+    definition_paths:
+      - ".claude/skills/gemini-cli-headless-delegation/scripts/validate_agy_grounding_evidence.py"
+    producer:
+      owner: "validate-agy-grounding-evidence"
+      paths:
+        - ".claude/skills/gemini-cli-headless-delegation/scripts/validate_agy_grounding_evidence.py"
+    consumers:
+      - id: "pr-review-judge"
+        paths:
+          - ".claude/skills/pr-review-judge/SKILL.md"
+      - id: "gemini-cli-headless-delegation-tests"
+        paths:
+          - ".claude/skills/gemini-cli-headless-delegation/tests/test_validate_agy_grounding_evidence.py"
+    detection_patterns:
+      - id: "agy-grounding-evidence-verdict-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "AGY_GROUNDING_EVIDENCE_VERDICT_V1|validate_agy_grounding_evidence"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "validate_gemini_grounding_evidence_tests"
+        runner: pytest
+        target: ".claude/skills/gemini-cli-headless-delegation/tests/"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: []
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "8a2d3f94b89ae19607a144f64fe6833ac8758fa6"
+      command_id: "validate_gemini_grounding_evidence_tests"
+
+
+  - schema_id: "OVERLAP_GATE_BYPASS_V1"
+    format: yaml
+    source_kind: repo_path
+    definition_paths:
+      - ".claude/skills/open-pr/scripts/validate_pr_body.py"
+    producer:
+      owner: "pr-body-author"
+      paths:
+        - ".claude/skills/open-pr/scripts/validate_pr_body.py"
+    consumers:
+      - id: "open-pr"
+        paths:
+          - ".claude/skills/open-pr/SKILL.md"
+      - id: "open-pr-tests"
+        paths:
+          - ".claude/skills/open-pr/tests/test_validate_pr_body_overlap_gate_bypass.py"
+    detection_patterns:
+      - id: "overlap-gate-bypass-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "OVERLAP_GATE_BYPASS_V1|bypassed_gate_class"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "validate_open_pr_body_overlap_gate_bypass_tests"
+        runner: pytest
+        target: ".claude/skills/open-pr/tests/"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: []
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "8a2d3f94b89ae19607a144f64fe6833ac8758fa6"
+      command_id: "validate_open_pr_body_overlap_gate_bypass_tests"
+
   - schema_id: "issue_contract/v1"
     format: github_issue_body
     source_kind: github_issue_body

@@ -388,6 +388,18 @@ echo '{
 
 詳細な publisher 仕様は `.claude/skills/issue-refinement-loop/scripts/publish_termination_report.py` を参照する。
 
+## ISSUE_EXECUTION_DECISION_V1 ハンドオフ契約 (#1677)
+
+**現在 production 接続済みの契約**（PR #1767 owner review + Scope Delta 反映後）: `scripts/validate_issue_execution_decision.py` が standalone canonical module（`validate_schema()` / `validate_semantics()` を明示的に分離、schema-first の `validate_issue_execution_decision()`、`project_issue_execution_decision_ref()`、legacy adapter・migration envelope helper）として存在し、`plan_refinement_loop.py`（producer）・`build_loop_state.py`（LOOP_STATE builder）・`render_termination_report.py`（handoff/termination report producer）・`decide_next_loop_action.py`（downstream consumer）が同一モジュールを import して呼び出す。import 失敗は全消費者で fail-closed（silent skip 禁止）。`render_termination_report.py` は `data["issue_execution_decision"]`（full decision）から `issue_execution_decision_ref` を production code が自動生成し、caller 提供の ref を信用しない。
+
+**未接続（follow-up）**: `REFINEMENT_LOOP_PLAN_V1`/`LOOP_STATE_V1`/`LOOP_HANDOFF_RESULT_V1` の required 化（現状は additive/optional）。genuine な `depends_on`/`duplicate`/`absorb` を GitHub native dependency・明示的 duplicate marker・方向付き Machine-Readable Contract から直接構築する結線（現状は `ISSUE_SCOPE_ROLLUP_PLAN_V2` からの derivation を撤去した保守的な `deferred` fallback のみ）。
+
+downstream skill（impl-review-loop・implement-issue・issue-contract-review・open-pr）は `downstream_policy`（`semantic_reclassification: forbidden` / `freshness_validation: required` / `stale_action: rerun_issue_refinement`）に従い、semantic relation を再分類しない。stale 検出時は issue-refinement-loop を再実行する。
+
+**semantic relation の情報源について**: `ISSUE_SCOPE_ROLLUP_PLAN_V2` は coordination plan であり semantic dependency graph ではない。方向未確定の `sequential_required` や `merge_into_current_pr` 等の suggested_action は、depends_on/duplicate/absorb relation へ自動変換しない（誤変換は PR #1767 owner review で指摘され撤去済み）。`proceed_with_coordination` のみ非committal な `coordinates` relation に変換する。それ以外の曖昧な signal は `execution.state: deferred` にして human 判断を要求する。
+
+**Canonical schema の digest provenance / legacy compatibility metadata**（AC10）: `schemas/issue_execution_decision_v1.schema.json` に additive/optional な `provenance`（`policy_version`・producer/collector provenance・`canonicalization_id`・`digests.{source_manifest_sha256,semantic_decision_sha256,artifact_sha256}`・`legacy_compatibility.{legacy_schema_identifiers,supported_consumer_versions}`）と `migration`（`phase: dual_write | equivalence | dual_read | new_authoritative | legacy_removed`・`legacy_digest`・`new_digest`・`equivalence_result`・`producer_version`・`consumer_capability`）ブロックを追加した。`equivalence` phase の digest 不一致は `validate_issue_execution_decision.validate_migration()` が fail-closed で拒否する（AC13）。legacy `graph.nodes/graph.edges` + `execution.target_state/predecessor_issue_numbers/reason_codes` からの adapter は `validate_issue_execution_decision.adapt_legacy_graph_to_v1()` が実装し、canonical output は常に V1 へ正規化する。詳細は `references/refinement-loop-plan-output.md` の `issue_execution_decision` 節を参照する。
+
 ## 参照マップ (Reference Map)
 
 | topic | primary reference |

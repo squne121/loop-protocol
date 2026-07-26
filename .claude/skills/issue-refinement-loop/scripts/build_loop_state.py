@@ -38,6 +38,33 @@ from pathlib import Path
 from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
+# #1677 AC4/AC12: reuse plan_refinement_loop.py's normative semantic
+# validator for ISSUE_EXECUTION_DECISION_V1 instead of re-implementing the
+# graph invariants here.
+# ---------------------------------------------------------------------------
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    # PR #1767 owner review (P0-4/AC12 Scope Delta): import the standalone
+    # canonical module directly rather than re-exporting through
+    # plan_refinement_loop.py, so every consumer shares one authority.
+    # project_issue_execution_decision_ref also now lives there (canonical
+    # home for the ISSUE_EXECUTION_DECISION_V1 contract); re-exported here
+    # under the same name for backward compatibility with existing callers.
+    from validate_issue_execution_decision import (
+        project_issue_execution_decision_ref,
+        validate_issue_execution_decision,
+    )
+except ImportError:  # pragma: no cover - defensive fallback
+    validate_issue_execution_decision = None
+
+    def project_issue_execution_decision_ref(
+        issue_execution_decision: "dict[str, Any] | None",
+    ) -> "dict[str, Any] | None":
+        """Fallback stub when validate_issue_execution_decision import fails (fail-closed: always None)."""
+        return None
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -468,6 +495,34 @@ def build_loop_state(
     scope_signal_guard_decision_v2 = plan.get("scope_signal_guard_decision_v2")
     if not isinstance(scope_signal_guard_decision_v2, dict):
         scope_signal_guard_decision_v2 = None
+
+    # #1677 AC4: project ISSUE_EXECUTION_DECISION_V1 from the planner output
+    # into LOOP_STATE_V1 verbatim (same schema_version/identity/nodes/
+    # relations/execution/downstream_policy/completeness), so downstream
+    # consumers reach the same collection_digest as the planner emitted.
+    # Re-validated here (not just schema-checked) so a semantically invalid
+    # decision never reaches LOOP_STATE_V1 silently.
+    issue_execution_decision = plan.get("issue_execution_decision")
+    if isinstance(issue_execution_decision, dict):
+        # PR #1767 owner review (P0-4): a missing/failed validator import
+        # must fail-closed, not silently skip semantic validation and pass
+        # the decision through to LOOP_STATE_V1 unchecked.
+        if validate_issue_execution_decision is None:
+            blocked.append(
+                "issue_execution_decision_validator_unavailable: "
+                "validate_issue_execution_decision import failed; refusing "
+                "to project an un-validated issue_execution_decision into "
+                "LOOP_STATE_V1"
+            )
+            return None, blocked, None
+        _violations = validate_issue_execution_decision(issue_execution_decision)
+        if _violations:
+            blocked.append(
+                "issue_execution_decision_invalid: "
+                + ", ".join(_violations)
+            )
+            return None, blocked, None
+        loop_state["issue_execution_decision"] = issue_execution_decision
 
     return loop_state, [], scope_signal_guard_decision_v2
 

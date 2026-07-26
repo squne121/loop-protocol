@@ -51,6 +51,21 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+# PR #1767 owner review (P0-4/AC12 Scope Delta): decide_next_loop_action.py
+# is a downstream consumer of ISSUE_EXECUTION_DECISION_V1 (via LOOP_STATE_V1)
+# and must call the same canonical semantic validator as every other
+# consumer rather than trusting the schema-validated shape alone. Import
+# failure is fail-closed (validate_loop_state() below refuses to pass a
+# LOOP_STATE carrying issue_execution_decision when the validator is
+# unavailable).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from validate_issue_execution_decision import (
+        validate_issue_execution_decision as _validate_issue_execution_decision,
+    )
+except ImportError:  # pragma: no cover - defensive fallback
+    _validate_issue_execution_decision = None
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -131,6 +146,26 @@ def validate_loop_state(data: Any) -> tuple[bool, str]:
         jsonschema.validate(instance=data, schema=schema)
     except jsonschema.ValidationError as e:
         return False, f"Schema validation failed: {e.message}"
+
+    # PR #1767 owner review (P0-4/AC12 Scope Delta): a schema-valid
+    # issue_execution_decision is not necessarily semantically valid (cycle,
+    # digest mismatch, identity/node inconsistency, etc.). This downstream
+    # consumer calls the same canonical validator as producer/LOOP_STATE
+    # builder/handoff producer rather than trusting the shape alone.
+    issue_execution_decision = data.get("issue_execution_decision")
+    if isinstance(issue_execution_decision, dict):
+        if _validate_issue_execution_decision is None:
+            return False, (
+                "issue_execution_decision present but "
+                "validate_issue_execution_decision module import failed "
+                "(fail-closed)"
+            )
+        violations = _validate_issue_execution_decision(issue_execution_decision)
+        if violations:
+            return False, (
+                "issue_execution_decision semantic validation failed: "
+                + ", ".join(violations)
+            )
 
     return True, ""
 
