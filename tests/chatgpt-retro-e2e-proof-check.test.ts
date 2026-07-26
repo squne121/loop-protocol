@@ -195,6 +195,55 @@ describe('chatgpt_retro_execution_proof/v1 checker: negative fixtures (AC4, AC7-
     expect(result.errors.some((e: { code: string }) => e.code === 'evidence_refs.unresolvable')).toBe(true)
   })
 
+  it('GIVEN a github_comment evidence_ref matching a chatgpt_context.additional_resolvable_comment_refs entry by comment_url and digest THEN it resolves and no evidence_refs.unresolvable is raised (Issue #1799 AC2)', () => {
+    const markdown = mutateMarkdown((proof, retroResult) => {
+      proof.chatgpt_context.additional_resolvable_comment_refs = [
+        {
+          comment_url: 'https://github.com/squne121/loop-protocol/issues/1405#issuecomment-4930000001',
+          payload_digest: 'sha256:86c882e91dada55e290cde2709982bb6f15634c267371f4a811b32bba369872a',
+        },
+      ]
+      retroResult.findings[0].evidence_refs.push({
+        kind: 'github_comment',
+        ref: 'https://github.com/squne121/loop-protocol/issues/1405#issuecomment-4930000001',
+        digest: 'sha256:86c882e91dada55e290cde2709982bb6f15634c267371f4a811b32bba369872a',
+      })
+      proof.retrospective_result.payload_digest = computeChatgptRetroExecutionProofDigest(retroResult)
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.errors.some((e: { code: string }) => e.code === 'evidence_refs.unresolvable')).toBe(false)
+    expect(result.valid).toBe(true)
+  })
+
+  it('GIVEN a github_comment evidence_ref whose comment_url matches a chatgpt_context.additional_resolvable_comment_refs entry but whose digest does not THEN evidence_refs.unresolvable is raised (Issue #1799 AC4)', () => {
+    const markdown = mutateMarkdown((proof, retroResult) => {
+      proof.chatgpt_context.additional_resolvable_comment_refs = [
+        {
+          comment_url: 'https://github.com/squne121/loop-protocol/issues/1405#issuecomment-4930000001',
+          payload_digest: 'sha256:86c882e91dada55e290cde2709982bb6f15634c267371f4a811b32bba369872a',
+        },
+      ]
+      retroResult.findings[0].evidence_refs.push({
+        kind: 'github_comment',
+        ref: 'https://github.com/squne121/loop-protocol/issues/1405#issuecomment-4930000001',
+        digest: computeChatgptRetroExecutionProofDigest('tampered-additional-ref-digest'),
+      })
+      proof.retrospective_result.payload_digest = computeChatgptRetroExecutionProofDigest(retroResult)
+    })
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((e: { code: string }) => e.code === 'evidence_refs.unresolvable')).toBe(true)
+  })
+
+  it('GIVEN a proof fixture without chatgpt_context.additional_resolvable_comment_refs THEN existing evidence_refs still resolve via the operation_index_ref/marker anchors (Issue #1799 AC3, backward compatibility)', () => {
+    const markdown = readFixture('valid-issue-retro-proof.md')
+    const [proof] = extractJsonBlocks(markdown)
+    expect(proof.chatgpt_context.additional_resolvable_comment_refs).toBeUndefined()
+    const result = validateChatgptRetroE2eProofMarkdown(markdown)
+    expect(result.errors).toEqual([])
+    expect(result.valid).toBe(true)
+  })
+
   it('GIVEN resolve_live_status not "resolved" and verdict "approve" THEN verdict.resolver_not_resolved is raised', () => {
     const markdown = mutateMarkdown((proof) => {
       proof.chatgpt_context.resolve_live_status = 'stale'
