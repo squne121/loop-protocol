@@ -130,7 +130,13 @@ def test_expose_agy_oauth_token_noop_when_absent(tmp_path: Path, monkeypatch: py
     workspace = app.materialize_isolated_agy_workspace(app.GROUNDED_RESEARCH_PROFILE, parent_dir=tmp_path)
     try:
         assert workspace.agy_oauth_token_path is None
-        assert not (Path(workspace.env["HOME"]) / ".gemini" / "antigravity-cli").exists()
+        # Issue #1758: the `.gemini/antigravity-cli` dir is now always created
+        # (unconditionally, unlike the oauth-token symlink) to hold the
+        # explicit-toolPermission settings.json -- but it must contain
+        # exactly that file and never the (absent) oauth token.
+        antigravity_cli_dir = Path(workspace.env["HOME"]) / ".gemini" / "antigravity-cli"
+        assert antigravity_cli_dir.exists()
+        assert sorted(p.name for p in antigravity_cli_dir.iterdir()) == ["settings.json"]
         assert not (Path(workspace.env["XDG_CONFIG_HOME"]) / "antigravity-cli").exists()
     finally:
         shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
@@ -221,7 +227,9 @@ def test_expose_agy_oauth_token_minimal_subpath_only(tmp_path: Path, monkeypatch
             antigravity_cli_children = sorted(
                 p.name for p in (Path(workspace.env["HOME"]) / ".gemini" / "antigravity-cli").iterdir()
             )
-            assert antigravity_cli_children == ["antigravity-oauth-token"]
+            # Issue #1758: settings.json (explicit toolPermission) now also
+            # lives alongside the oauth token symlink in this directory.
+            assert antigravity_cli_children == ["antigravity-oauth-token", "settings.json"]
             assert not (Path(workspace.env["XDG_CONFIG_HOME"]) / "antigravity-cli").exists()
             assert workspace.env["HOME"] == str(workspace.workspace_dir)
             assert str(fake_real_home) != workspace.env["HOME"]
@@ -236,10 +244,18 @@ def test_expose_agy_oauth_token_minimal_subpath_only(tmp_path: Path, monkeypatch
             # "settings.json" from the *real* .gemini/antigravity-cli dir must
             # not appear; the workspace's own .antigravity/settings.json
             # (freshly generated policy doc) is a distinct, expected file.
+            # Issue #1758: `<workspace>/.gemini/antigravity-cli/settings.json`
+            # now legitimately exists -- but only as the fresh, fixed-value
+            # toolPermission document `_write_agy_tool_permission_settings()`
+            # generates, never a copy of the *real* fake_real_home
+            # `.gemini/antigravity-cli/settings.json` (`{}`) written above.
             gemini_settings_paths = [
                 p for p in workspace.workspace_dir.rglob("settings.json") if "antigravity-cli" in p.parts
             ]
-            assert gemini_settings_paths == []
+            assert gemini_settings_paths == [workspace.agy_tool_permission_settings_path]
+            assert json.loads(gemini_settings_paths[0].read_text(encoding="utf-8")) == {
+                "toolPermission": "always-proceed"
+            }
         finally:
             shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
 

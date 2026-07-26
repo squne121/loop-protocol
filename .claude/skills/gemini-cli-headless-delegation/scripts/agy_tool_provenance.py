@@ -405,12 +405,37 @@ def generate_workspace_hook_config(
     hook_log_path: str | Path,
     hook_context_path: str | Path,
     matcher: str = "search_web|read_url_content",
+    home_dir: "str | Path | None" = None,
 ) -> Path:
     """Write a workspace-scoped ``.agents/hooks.json`` + wrapper script into *workspace_dir*.
 
     Writes ONLY inside *workspace_dir* -- never touches a user's global Antigravity
     settings/hooks file (Issue #1708 AC5). Raises :class:`ProvenanceWorkspaceHookError`
     on any write failure instead of silently degrading (fail-closed, Issue #1708 AC9).
+
+    Issue #1768: the installed Antigravity CLI (1.1.7) does not, in practice, discover
+    ``<workspace_dir>/.agents/hooks.json`` in headless print mode (``agy -p``), despite
+    that path matching the official docs (confirmed via live ``--log-file`` inspection --
+    ``hooks_manager.go`` reports ``loaded 0 named hooks from 0 hooks.json file(s)`` for
+    this path even in a *trusted* workspace). Live investigation showed the CLI instead
+    discovers ``<HOME>/.gemini/config/hooks.json`` (the "shared" path the ``/hooks`` TUI
+    command and a ``<HOME>/.gemini/antigravity-cli/hooks.json`` -> ``.gemini/config/hooks.json``
+    legacy auto-migration both write to; see ``migrate.go`` / ``jsonhook.go`` log lines in
+    ``references/grounded-research-isolated-workspace-investigation.md``).
+
+    When *home_dir* is given, this function additionally writes the identical hooks.json
+    content to ``<home_dir>/.gemini/config/hooks.json`` so the isolated-workspace AGY
+    subprocess (whose ``HOME`` env var is redirected to *home_dir*) actually discovers and
+    registers the hook. The ``<workspace_dir>/.agents/hooks.json`` write above is kept
+    unconditionally for forward-compatibility with the officially documented path (in case
+    a future Antigravity CLI version honors it).
+
+    *home_dir* MUST be a fully isolated per-run HOME (e.g. the isolated workspace's own
+    ``HOME``), never the real host `$HOME` -- callers must never pass the process's actual
+    home directory here, since that would silently overwrite a developer's real, shared
+    Antigravity hooks configuration. This function refuses (fail-closed) to write when
+    *home_dir* resolves to the same path as the real host `$HOME` (``Path.home()``), even
+    if a caller passes it by mistake.
     """
     workspace_dir = Path(workspace_dir)
     agents_dir = workspace_dir / ".agents"
@@ -442,11 +467,36 @@ def generate_workspace_hook_config(
             }
         }
         hooks_json_path = agents_dir / "hooks.json"
-        hooks_json_path.write_text(
-            json.dumps(hooks_config, indent=2, sort_keys=True), encoding="utf-8"
-        )
+        hooks_json_text = json.dumps(hooks_config, indent=2, sort_keys=True)
+        hooks_json_path.write_text(hooks_json_text, encoding="utf-8")
     except OSError as exc:
         raise ProvenanceWorkspaceHookError(f"failed to write workspace-scoped hook config: {exc}") from exc
+
+    if home_dir is not None:
+        home_dir_path = Path(home_dir)
+        real_host_home = Path(os.environ.get("HOME") or os.path.expanduser("~"))
+        try:
+            home_dir_resolved = home_dir_path.resolve()
+        except OSError:
+            home_dir_resolved = home_dir_path
+        try:
+            real_host_home_resolved = real_host_home.resolve()
+        except OSError:
+            real_host_home_resolved = real_host_home
+        if home_dir_resolved == real_host_home_resolved:
+            raise ProvenanceWorkspaceHookError(
+                "refusing to write hooks.json to the real host $HOME "
+                f"({real_host_home_resolved}) -- home_dir must be an isolated, per-run "
+                "HOME, never the real host home directory (Issue #1768 fail-closed guard)"
+            )
+        canonical_hooks_dir = home_dir_path / ".gemini" / "config"
+        try:
+            canonical_hooks_dir.mkdir(parents=True, exist_ok=True)
+            (canonical_hooks_dir / "hooks.json").write_text(hooks_json_text, encoding="utf-8")
+        except OSError as exc:
+            raise ProvenanceWorkspaceHookError(
+                f"failed to write canonical-path hooks.json under home_dir: {exc}"
+            ) from exc
 
     # hook_log_path / hook_context_path are handed back to the caller so it can set
     # the env vars the wrapper script reads; validate they are writable-looking paths.

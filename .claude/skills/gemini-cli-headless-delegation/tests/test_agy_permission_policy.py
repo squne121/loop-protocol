@@ -350,11 +350,12 @@ def test_isolated_workspace_does_not_copy_credential_files(
     )
     (fake_real_home / ".netrc").write_text("machine example.com login x password y", encoding="utf-8")
     # Issue #1740: pin $HOME to the fake fixture home so this test's file
-    # count assertion (exactly settings.json + hook_path, no gcloud ADC /
-    # agy OAuth token symlinks) is hermetic and does not depend on whether
-    # the real ambient $HOME happens to have a
-    # $HOME/.config/gcloud or $HOME/.gemini/antigravity-cli/antigravity-oauth-token
-    # present on the machine actually running this test.
+    # count assertion (exactly settings.json + hook_path + the Issue #1758
+    # real-AGY-settings toolPermission file, no gcloud ADC / agy OAuth token
+    # symlinks) is hermetic and does not depend on whether the real ambient
+    # $HOME happens to have a $HOME/.config/gcloud or
+    # $HOME/.gemini/antigravity-cli/antigravity-oauth-token present on the
+    # machine actually running this test.
     monkeypatch.setenv("HOME", str(fake_real_home))
 
     for profile in ALL_PROFILES:
@@ -362,16 +363,27 @@ def test_isolated_workspace_does_not_copy_credential_files(
         try:
             assert app.find_credential_like_files(workspace) == []
             all_files = sorted(p for p in workspace.workspace_dir.rglob("*") if p.is_file())
-            assert all_files == [workspace.hook_path, workspace.settings_path] or all_files == [
-                workspace.settings_path,
-                workspace.hook_path,
-            ]
+            expected_files = sorted(
+                [
+                    workspace.hook_path,
+                    workspace.settings_path,
+                    workspace.agy_tool_permission_settings_path,
+                ]
+            )
+            assert all_files == expected_files
             for f in all_files:
                 assert f.name.lower() not in app.CREDENTIAL_FILE_BASENAMES
             # the fake real-home credential file content never appears anywhere
             settings_text = workspace.settings_path.read_text(encoding="utf-8")
             assert "should-never-be-copied" not in settings_text
             assert str(fake_real_home) not in workspace.env.get("HOME", "")
+            # Issue #1758: the real-AGY-settings file is always a fresh
+            # fixed-value document, never a copy/reuse of the fake real
+            # home's settings.json (which sets permissions.default: "allow").
+            tool_permission_text = workspace.agy_tool_permission_settings_path.read_text(encoding="utf-8")
+            assert "should-never-be-copied" not in tool_permission_text
+            assert "permissions" not in tool_permission_text
+            assert json.loads(tool_permission_text) == {"toolPermission": "always-proceed"}
         finally:
             import shutil
 
