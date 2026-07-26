@@ -33,7 +33,8 @@ stream/debug は temporary input として digest 化した後に破棄する。
 trusted hostでの `claude -p --output-format stream-json` は、実sessionが生成した
 `CLAUDE_ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1` を一件だけ返す。reportにはschema、HEAD、
 allow/block-repair結果、receipt集合digestだけを許可し、raw transcript・prompt・path・secretを
-含めない。`collect_issue_reviewer_runtime_evidence.py` は current HEAD、receipt decision列、
+含めない。JSONLはassistant envelopeの`message.content`に含まれるtextだけを解析し、unknown・
+malformed・複数report・assistant以外由来のmarkerはFAILである。`collect_issue_reviewer_runtime_evidence.py` は current HEAD、receipt decision列、
 probe digestを独立に検査し、session reportを比較対象としてのみ照合する。fixtureやcaller
 controlled値はruntime evidence sourceになれず、欠落・無効・不一致はFAILである。
 `TEST_VERDICT_MACHINE/v2` 候補は head-bound である。publisher は sanitized summary

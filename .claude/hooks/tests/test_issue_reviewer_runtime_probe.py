@@ -165,7 +165,24 @@ def test_synthetic_stream_fixture_is_not_runtime_evidence() -> None:
     assert "runtime_evidence_source_invalid" in errors
 
 
-def test_stream_json_report_parser_rejects_untrusted_shape() -> None:
+def _assistant_jsonl(text: str) -> str:
+    return json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+                "stop_reason": "end_turn",
+            },
+        }
+    )
+
+
+def _result_jsonl(result: str) -> str:
+    return json.dumps({"type": "result", "result": result})
+
+
+def test_stream_json_assistant_envelope_extracts_one_report() -> None:
     valid = {
         "schema": "CLAUDE_ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1",
         "issue": 1754,
@@ -173,10 +190,45 @@ def test_stream_json_report_parser_rejects_untrusted_shape() -> None:
         "scenarios": {"allow": "pass", "block-repair": "pass"},
         "receipt_set_sha256": "sha256:" + "b" * 64,
     }
-    stream = "event\nCLAUDE_ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1: " + json.dumps(valid)
+    stream = "\n".join(
+        [
+            json.dumps({"type": "system", "subtype": "init"}),
+            _assistant_jsonl("検証完了\nCLAUDE_ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1: " + json.dumps(valid)),
+            _result_jsonl("完了"),
+        ]
+    )
 
     assert probe_mod.extract_session_self_report(stream, ["allow", "block-repair"]) == valid
-    assert probe_mod.extract_session_self_report(stream + "\n" + stream, ["allow", "block-repair"]) is None
+
+
+def test_stream_json_parser_rejects_missing_invalid_multiple_and_nonassistant_report() -> None:
+    valid = {
+        "schema": "CLAUDE_ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1",
+        "issue": 1754,
+        "head_sha": "a" * 40,
+        "scenarios": {"allow": "pass", "block-repair": "pass"},
+        "receipt_set_sha256": "sha256:" + "b" * 64,
+    }
+    missing = "\n".join([_assistant_jsonl("検証完了"), _result_jsonl("完了")])
+    assert probe_mod.extract_session_self_report(missing, ["allow", "block-repair"]) is None
+
     invalid = valid | {"receipt_set_sha256": "not-a-digest"}
-    invalid_stream = "CLAUDE_ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1: " + json.dumps(invalid)
+    invalid_stream = _assistant_jsonl("CLAUDE_ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1: " + json.dumps(invalid))
     assert probe_mod.extract_session_self_report(invalid_stream, ["allow", "block-repair"]) is None
+
+    report_text = "CLAUDE_ISSUE_REVIEWER_RUNTIME_SELF_REPORT_V1: " + json.dumps(valid)
+    multiple = "\n".join([_assistant_jsonl(report_text), _assistant_jsonl(report_text)])
+    assert probe_mod.extract_session_self_report(multiple, ["allow", "block-repair"]) is None
+
+    non_assistant = _result_jsonl(report_text)
+    assert probe_mod.extract_session_self_report(non_assistant, ["allow", "block-repair"]) is None
+    unknown = json.dumps({"type": "tool", "payload": report_text})
+    assert probe_mod.extract_session_self_report(unknown, ["allow", "block-repair"]) is None
+    wrong_role = json.dumps(
+        {
+            "type": "assistant",
+            "message": {"role": "user", "content": [{"type": "text", "text": report_text}]},
+        }
+    )
+    assert probe_mod.extract_session_self_report(wrong_role, ["allow", "block-repair"]) is None
+    assert probe_mod.extract_session_self_report("{not-json", ["allow", "block-repair"]) is None

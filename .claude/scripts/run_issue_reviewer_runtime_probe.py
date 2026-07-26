@@ -84,24 +84,83 @@ def prompt_for(scenarios: list[str]) -> str:
     )
 
 
-def _candidate_reports(stream: str) -> list[dict[str, object]]:
+def _marker_in_value(value: object) -> bool:
+    if isinstance(value, str):
+        return SESSION_REPORT_PREFIX in value
+    if isinstance(value, list):
+        return any(_marker_in_value(item) for item in value)
+    if isinstance(value, dict):
+        return any(_marker_in_value(item) for item in value.values())
+    return False
+
+
+def _assistant_text(envelope: dict[str, object]) -> str | None:
+    message = envelope.get("message")
+    allowed_message_keys = {
+        "content",
+        "role",
+        "model",
+        "id",
+        "type",
+        "usage",
+        "stop_reason",
+        "stop_sequence",
+    }
+    if (
+        not isinstance(message, dict)
+        or set(message) - allowed_message_keys
+        or message.get("role") != "assistant"
+    ):
+        return None
+    content = message.get("content")
+    if not isinstance(content, list):
+        return None
+    text_parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "text" or not isinstance(block.get("text"), str):
+            return None
+        text_parts.append(block["text"])
+    return "\n".join(text_parts)
+
+
+def _candidate_reports(stream: str) -> list[dict[str, object]] | None:
     reports: list[dict[str, object]] = []
     for line in stream.splitlines():
-        if SESSION_REPORT_PREFIX not in line:
+        if not line.strip():
             continue
-        encoded = line.split(SESSION_REPORT_PREFIX, 1)[1].strip()
         try:
-            report = json.loads(encoded)
+            envelope = json.loads(line)
         except json.JSONDecodeError:
+            return None
+        if not isinstance(envelope, dict) or not isinstance(envelope.get("type"), str):
+            return None
+        event_type = envelope["type"]
+        if event_type not in {"system", "assistant", "result"}:
+            return None
+        if event_type != "assistant":
+            if _marker_in_value(envelope):
+                return None
             continue
-        if isinstance(report, dict):
+        text = _assistant_text(envelope)
+        if text is None:
+            return None
+        for text_line in text.splitlines():
+            if SESSION_REPORT_PREFIX not in text_line:
+                continue
+            encoded = text_line.split(SESSION_REPORT_PREFIX, 1)[1].strip()
+            try:
+                report = json.loads(encoded)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(report, dict):
+                return None
             reports.append(report)
     return reports
 
 
 def extract_session_self_report(stream: str, scenarios: list[str]) -> dict[str, object] | None:
     reports = _candidate_reports(stream)
-    if len(reports) != 1:
+    if reports is None or len(reports) != 1:
         return None
     report = reports[0]
     expected_keys = {"schema", "issue", "head_sha", "scenarios", "receipt_set_sha256"}
