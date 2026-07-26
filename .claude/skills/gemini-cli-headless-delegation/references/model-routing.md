@@ -152,8 +152,11 @@ if chain 使い切り:
 > caller-side fallback の前に **provider レベルのフォールバック**
 > （`provider_auto_dispatch()`、次節）が挟まる。図の `chain_exhausted` は
 > `PROVIDER_AUTO_RETRYABLE_FAILURE_CLASSES["gemini"]` に含まれる retryable な
-> failure_class の一つであり、`provider="auto"` では次候補（`agy`）へのフォール
-> バックを引き起こしうる。
+> failure_class の一つである。ただし現行の `PROVIDER_AUTO_RUNTIME_ORDER`
+> （`("agy", "gemini")`）では `gemini` が最終候補であるため、`gemini` の
+> `chain_exhausted` から次候補へのフォールバックは発生せず、fail-closed で
+> 終了する（`agy` の `chain_exhausted`（該当する場合）であれば次候補
+> `gemini` へのフォールバックを引き起こしうる）。
 
 ```
 wrapper 内降格（model_chain 試行） → 全 model 失敗 → chain_exhausted を返す
@@ -168,7 +171,7 @@ provider フォールバックも尽きた場合）。
 
 ## provider="auto" のフォールバック（`provider_auto_policy_v1`、Issue #1270）
 
-`provider="auto"` は `PROVIDER_AUTO_RUNTIME_ORDER`（`("gemini", "agy")`）を
+`provider="auto"` は `PROVIDER_AUTO_RUNTIME_ORDER`（`("agy", "gemini")`）を
 逐次試行するメタ provider である。各 provider は自身の retry_budget
 （`get_retry_budget()`）を使い切った後にのみ次の provider へフォールバックし、
 `PROVIDER_AUTO_RETRYABLE_FAILURE_CLASSES` に含まれない failure_class

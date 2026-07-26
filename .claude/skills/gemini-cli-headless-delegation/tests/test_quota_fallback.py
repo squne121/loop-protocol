@@ -3,7 +3,7 @@
 
 Covers AC0/AC2/AC3/AC4/AC5/AC6/AC7:
   - provider="auto" reaching runtime dispatch without unknown_provider
-  - Gemini model_chain_exhausted -> AGY fallback
+  - AGY (first, per Issue #1692) retryable failure -> Gemini fallback
   - non-retryable failures (auth/permission/unsupported profile/post_to_issue_url)
     stop fallback immediately
   - retry_budget YAML validation (type / unknown key fail-closed)
@@ -11,6 +11,13 @@ Covers AC0/AC2/AC3/AC4/AC5/AC6/AC7:
   - model_chain_exhausted result carries a top-level failure_class
   - AC7 (#1274): _normalize_agy_result warnings[0] leading token always
     matches failure_class
+
+Issue #1692 (human decision, 2026-07-26): PROVIDER_AUTO_RUNTIME_ORDER is now
+("agy", "gemini") -- agy is attempted first. The provider-order-dependent
+assertions below were updated accordingly; the underlying fallback-policy
+behaviors under test (retryable-failure fallback / non-retryable stop /
+post_to_issue_url idempotency guard / unsupported-profile no-attempt) are
+unchanged.
 """
 from __future__ import annotations
 
@@ -83,62 +90,62 @@ def test_provider_auto_is_supported_not_unknown_provider() -> None:
         result = rgh.run_delegation(dict(BASE_REQUEST, provider="auto"))
 
     assert result["failure_class"] != "unknown_provider"
-    assert result.get("selected_provider") == "gemini"
+    assert result.get("selected_provider") == "agy"
 
 
 # ---------------------------------------------------------------------------
-# Gemini quota -> AGY fallback (AC3/AC4)
+# AGY quota -> Gemini fallback (AC3/AC4, Issue #1692: agy is now first)
 # ---------------------------------------------------------------------------
 
 
-def test_gemini_model_chain_exhausted_falls_back_to_agy_success() -> None:
+def test_agy_retryable_failure_falls_back_to_gemini_success() -> None:
     calls: list[str] = []
 
     def fake_run_delegation(request, request_path=None, _routing=None):
         calls.append(request["provider"])
-        if request["provider"] == "gemini":
-            return _result(False, failure_class="model_chain_exhausted")
+        if request["provider"] == "agy":
+            return _result(False, failure_class="agy_rate_limited")
         return _result(True)
 
     with patch.object(rgh, "run_delegation", side_effect=fake_run_delegation):
         result = rgh.provider_auto_dispatch(BASE_REQUEST)
 
-    assert calls == ["gemini", "agy"]
+    assert calls == ["agy", "gemini"]
     assert result["ok"] is True
-    assert result["selected_provider"] == "agy"
+    assert result["selected_provider"] == "gemini"
     assert len(result["provider_attempts"]) == 2
-    assert result["provider_attempts"][0]["provider"] == "gemini"
-    assert result["provider_attempts"][0]["failure_class"] == "model_chain_exhausted"
+    assert result["provider_attempts"][0]["provider"] == "agy"
+    assert result["provider_attempts"][0]["failure_class"] == "agy_rate_limited"
     assert result["fallback_policy_version"] == "v1"
     assert "fallback_reason" in result
     assert "attempts_by_model" in result
 
 
-def test_gemini_success_on_first_try_no_fallback() -> None:
+def test_agy_success_on_first_try_no_fallback() -> None:
     def fake_run_delegation(request, request_path=None, _routing=None):
-        assert request["provider"] == "gemini"
+        assert request["provider"] == "agy"
         return _result(True)
 
     with patch.object(rgh, "run_delegation", side_effect=fake_run_delegation):
         result = rgh.provider_auto_dispatch(BASE_REQUEST)
 
     assert result["ok"] is True
-    assert result["selected_provider"] == "gemini"
+    assert result["selected_provider"] == "agy"
     assert result["fallback_reason"] is None
     assert len(result["provider_attempts"]) == 1
 
 
 def test_both_providers_exhausted_reports_provider_fallback_exhausted() -> None:
     def fake_run_delegation(request, request_path=None, _routing=None):
-        if request["provider"] == "gemini":
-            return _result(False, failure_class="model_chain_exhausted")
-        return _result(False, failure_class="agy_rate_limited")
+        if request["provider"] == "agy":
+            return _result(False, failure_class="agy_rate_limited")
+        return _result(False, failure_class="model_chain_exhausted")
 
     with patch.object(rgh, "run_delegation", side_effect=fake_run_delegation):
         result = rgh.provider_auto_dispatch(BASE_REQUEST)
 
     assert result["ok"] is False
-    assert result["selected_provider"] == "agy"
+    assert result["selected_provider"] == "gemini"
     assert result["fallback_reason"] == "provider_fallback_exhausted"
 
 
@@ -174,8 +181,8 @@ def test_non_retryable_gemini_failure_does_not_fall_back(
     with patch.object(rgh, "run_delegation", side_effect=fake_run_delegation):
         result = rgh.provider_auto_dispatch(BASE_REQUEST)
 
-    assert calls == ["gemini"]
-    assert result["selected_provider"] == "gemini"
+    assert calls == ["agy"]
+    assert result["selected_provider"] == "agy"
     assert result["fallback_reason"] == expected_fallback_reason
 
 
@@ -190,7 +197,7 @@ def test_post_to_issue_url_stops_fallback_even_on_failure() -> None:
     with patch.object(rgh, "run_delegation", side_effect=fake_run_delegation):
         result = rgh.provider_auto_dispatch(request)
 
-    assert calls == ["gemini"]
+    assert calls == ["agy"]
     assert result["fallback_reason"] == "stop_if:request_has_post_to_issue_url"
 
 
@@ -349,7 +356,7 @@ def test_model_routing_default_config_file_has_provider_auto_policy_v1() -> None
     routing = rgh.load_model_routing()
     assert "provider_auto_policy_v1" in routing
     policy = routing["provider_auto_policy_v1"]
-    assert policy["runtime_order"] == ["gemini", "agy"]
+    assert policy["runtime_order"] == ["agy", "gemini"]
     assert policy["setup_check_order"] == ["agy", "gemini"]
     assert set(policy["eligible_profiles"]) == {"no_tools", "proposal_only"}
 
@@ -399,7 +406,7 @@ def test_non_retryable_first_provider_sets_stop_fallback_reason() -> None:
     with patch.object(rgh, "run_delegation", side_effect=fake_run_delegation):
         result = rgh.provider_auto_dispatch(BASE_REQUEST)
 
-    assert calls == ["gemini"]
+    assert calls == ["agy"]
     assert result["fallback_reason"] == "stop_if:non_retryable_failure_class:auth_missing_or_expired"
     assert result["provider_attempts"][0]["stopped_by"] == result["fallback_reason"]
 
@@ -414,8 +421,8 @@ def test_provider_attempts_include_failure_reason_exit_code_retryable_decision()
         return {
             "schema": "delegation_result/v1",
             "ok": False,
-            "failure_class": "model_chain_exhausted",
-            "failure_reason": "model_chain_exhausted: all models in chain failed with quota errors",
+            "failure_class": "agy_rate_limited",
+            "failure_reason": "agy_rate_limited: RESOURCE_EXHAUSTED",
             "exit_code": 1,
             "model_downgrades": [{"from": "gemini-3-flash-preview", "to": "gemini-2.5-flash", "reason": "x"}],
             "model_chain": ["gemini-3-flash-preview", "gemini-2.5-flash"],
@@ -426,13 +433,13 @@ def test_provider_attempts_include_failure_reason_exit_code_retryable_decision()
     with patch.object(rgh, "run_delegation", side_effect=fake_run_delegation):
         result = rgh.provider_auto_dispatch(BASE_REQUEST)
 
-    gemini_attempt = result["provider_attempts"][0]
-    assert gemini_attempt["failure_reason"] == "model_chain_exhausted: all models in chain failed with quota errors"
-    assert gemini_attempt["exit_code"] == 1
-    assert gemini_attempt["retryable_for_provider_fallback"] is True
-    assert gemini_attempt["model_chain"] == ["gemini-3-flash-preview", "gemini-2.5-flash"]
-    assert gemini_attempt["attempts_by_model"] == {"gemini-3-flash-preview": 3, "gemini-2.5-flash": 3}
-    assert gemini_attempt["post_to_issue_url_requested"] is False
+    first_attempt = result["provider_attempts"][0]
+    assert first_attempt["failure_reason"] == "agy_rate_limited: RESOURCE_EXHAUSTED"
+    assert first_attempt["exit_code"] == 1
+    assert first_attempt["retryable_for_provider_fallback"] is True
+    assert first_attempt["model_chain"] == ["gemini-3-flash-preview", "gemini-2.5-flash"]
+    assert first_attempt["attempts_by_model"] == {"gemini-3-flash-preview": 3, "gemini-2.5-flash": 3}
+    assert first_attempt["post_to_issue_url_requested"] is False
     assert result["attempts_by_model"]["gemini-3-flash-preview"] >= 3
 
 
@@ -530,7 +537,7 @@ def test_post_to_issue_url_post_failure_does_not_fallback_but_is_visible() -> No
     with patch.object(rgh, "run_delegation", side_effect=fake_run_delegation):
         result = rgh.provider_auto_dispatch(request)
 
-    assert calls == ["gemini"]
+    assert calls == ["agy"]
     assert result["ok"] is False
     assert result["post_result"] == "failed: some gh error"
     assert result["post_failure_class"] == "post_to_issue_url_failed"
