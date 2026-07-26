@@ -569,7 +569,7 @@ describe('chatgpt retro context marker helper', () => {
     })).rejects.toThrow(/expectedSupersedesDigest is required/)
   })
 
-  it('GIVEN referenced comments with recomputed source-set digest mismatch WHEN resolving marker mode THEN it fails closed', async () => {
+  it('GIVEN a marker declaring a source-set digest that differs from the retro index comment\'s own embedded digest WHEN resolving marker mode THEN it fails closed', async () => {
     const tempDir = mkdtempSync(resolve(tmpdir(), 'chatgpt-retro-context-resolve-'))
     try {
       const reportPayload = createRunReport()
@@ -617,7 +617,11 @@ describe('chatgpt retro context marker helper', () => {
       markerPayload.refs.run_reports[0].payload_digest = reportDigest
       markerPayload.refs.retro_index.comment_url = 'https://github.com/squne121/loop-protocol/issues/1153#issuecomment-12'
       markerPayload.refs.retro_index.payload_digest = 'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
-      markerPayload.refs.retro_index.source_set_digest = 'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
+      // Deliberately declare a source_set_digest that does NOT match the retro index
+      // comment's own embedded digest (retroSourceSetDigest, ending in ...dddd), so this
+      // exercises the genuine retro_index_comment_verification check (source-set digest
+      // mismatch against the producer-stated value), not the removed recompute check.
+      markerPayload.refs.retro_index.source_set_digest = 'sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
       markerPayload.canonicalization.payload_digest = computeChatgptRetroContextPayloadDigest(markerPayload)
       const markerComment = buildChatgptRetroContextCommentBody({
         ownership: {
@@ -640,7 +644,7 @@ describe('chatgpt retro context marker helper', () => {
       await expect(resolveChatgptRetroContextFromFixtures({
         markerCommentJson: markerFile,
         githubCommentsJson: [commentsFile],
-      })).rejects.toThrow(/source-set digest must match the recomputed referenced comment set/)
+      })).rejects.toThrow(/retro index source-set digest mismatch/)
     } finally {
       rmSync(tempDir, { recursive: true, force: true })
     }
