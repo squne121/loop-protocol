@@ -20,6 +20,8 @@ EXPECTED_TARGET_PATHS = (
     ".claude/skills",
 )
 RULE_OVERRIDE_OPTIONS = {
+    "--config",
+    "--isolated",
     "--select",
     "--extend-select",
     "--ignore",
@@ -27,6 +29,10 @@ RULE_OVERRIDE_OPTIONS = {
     "--per-file-ignores",
     "--extend-per-file-ignores",
 }
+SKILL_RELATIVE_PATH = Path(".claude/skills/ci-test-performance/SKILL.md")
+EXPECTED_SKILL_COMMAND = (
+    "uv run --locked ruff check .claude/scripts scripts schemas .claude/skills"
+)
 
 
 @dataclass(frozen=True)
@@ -52,6 +58,37 @@ def _is_specific_path(path: Any) -> bool:
     return isinstance(path, str) and path and not any(token in path for token in "*?[")
 
 
+def _is_expected_target_file(root: Path, candidate: Path) -> bool:
+    """Return whether a per-file exception is a linted Python source file."""
+    if not candidate.is_file() or candidate.suffix not in {".py", ".pyi"}:
+        return False
+
+    resolved_root = root.resolve()
+    resolved_candidate = candidate.resolve()
+    if not resolved_candidate.is_relative_to(resolved_root):
+        return False
+
+    return any(
+        resolved_candidate.is_relative_to((root / target).resolve())
+        for target in EXPECTED_TARGET_PATHS
+    )
+
+
+def _find_ruff_configuration_files(root: Path) -> list[Path]:
+    """Find config files which could override the root pyproject authority."""
+    candidates: list[Path] = []
+    ignored_parts = {".git", ".venv", "node_modules"}
+    for path in root.rglob("*"):
+        if not path.is_file() or ignored_parts.intersection(path.relative_to(root).parts):
+            continue
+        relative = path.relative_to(root)
+        if path.name in {"ruff.toml", ".ruff.toml"}:
+            candidates.append(relative)
+        elif path.name == "pyproject.toml" and relative != Path("pyproject.toml"):
+            candidates.append(relative)
+    return sorted(candidates)
+
+
 def _validate_ruff_config(root: Path) -> list[Violation]:
     config_path = root / "pyproject.toml"
     if not config_path.is_file():
@@ -66,9 +103,26 @@ def _validate_ruff_config(root: Path) -> list[Violation]:
     lint = ruff.get("lint", {}) if isinstance(ruff, dict) else {}
     violations: list[Violation] = []
 
-    if not isinstance(lint, dict) or tuple(lint.get("select", ())) != EXPECTED_SELECT:
+    select = _as_code_list(lint.get("select")) if isinstance(lint, dict) else None
+    if select is None or len(select) != len(EXPECTED_SELECT) or set(select) != set(EXPECTED_SELECT):
         violations.append(
             Violation("ruff_select_not_e_f", "[tool.ruff.lint].select は [\"E\", \"F\"] 必須")
+        )
+
+    if isinstance(ruff, dict) and "extend" in ruff:
+        violations.append(
+            Violation(
+                "ruff_config_extend_not_allowed",
+                "[tool.ruff].extend は設定 authority を分散させるため許可されません",
+            )
+        )
+
+    for path in _find_ruff_configuration_files(root):
+        violations.append(
+            Violation(
+                "ruff_configuration_source_not_pyproject",
+                f"Ruff 設定を上書きし得るファイルは許可されません: {path}",
+            )
         )
 
     for table_name, table in (("tool.ruff", ruff), ("tool.ruff.lint", lint)):
@@ -95,7 +149,12 @@ def _validate_ruff_config(root: Path) -> list[Violation]:
                 )
                 continue
             for path, codes in entries.items():
-                if not _is_specific_path(path) or _as_code_list(codes) != ["E402"]:
+                candidate = root / path if _is_specific_path(path) else root
+                if (
+                    not _is_specific_path(path)
+                    or _as_code_list(codes) != ["E402"]
+                    or not _is_expected_target_file(root, candidate)
+                ):
                     violations.append(
                         Violation(
                             "ruff_per_file_e402_exception_invalid",
@@ -138,6 +197,51 @@ def _is_rule_override(token: str) -> bool:
     return token in RULE_OVERRIDE_OPTIONS or any(
         token.startswith(f"{option}=") for option in RULE_OVERRIDE_OPTIONS
     )
+
+
+def _validate_ci_test_performance_skill(root: Path) -> list[Violation]:
+    skill_path = root / SKILL_RELATIVE_PATH
+    if not skill_path.is_file():
+        return [
+            Violation(
+                "ci_test_performance_skill_missing",
+                f"{SKILL_RELATIVE_PATH} がありません",
+            )
+        ]
+
+    try:
+        commands = [
+            shlex.split(line.strip())
+            for line in skill_path.read_text(encoding="utf-8").splitlines()
+            if line.strip().startswith("uv run --locked ruff check")
+        ]
+    except (OSError, ValueError) as exc:
+        return [Violation("ci_test_performance_skill_invalid", str(exc))]
+
+    if len(commands) != 1:
+        return [
+            Violation(
+                "ci_test_performance_skill_ruff_command_invalid",
+                "Skill には Ruff の推奨 command がちょうど 1 つ必要です",
+            )
+        ]
+
+    command = commands[0]
+    if any(_is_rule_override(token) for token in command):
+        return [
+            Violation(
+                "ci_test_performance_skill_cli_rule_override",
+                "Skill の Ruff command に rule/config override を指定できません",
+            )
+        ]
+    if " ".join(command) != EXPECTED_SKILL_COMMAND:
+        return [
+            Violation(
+                "ci_test_performance_skill_ruff_command_invalid",
+                "Skill の Ruff command は workflow と同じ対象 path 集合を使用する必要があります",
+            )
+        ]
+    return []
 
 
 def _validate_workflow(root: Path) -> list[Violation]:
@@ -193,7 +297,12 @@ def _validate_workflow(root: Path) -> list[Violation]:
         )
         return violations
 
-    if tuple(tokens[len(expected_prefix) :]) != EXPECTED_TARGET_PATHS:
+    target_paths = tokens[len(expected_prefix) :]
+    if (
+        len(target_paths) != len(EXPECTED_TARGET_PATHS)
+        or len(set(target_paths)) != len(target_paths)
+        or set(target_paths) != set(EXPECTED_TARGET_PATHS)
+    ):
         violations.append(
             Violation(
                 "workflow_ruff_target_paths_changed",
@@ -205,7 +314,11 @@ def _validate_workflow(root: Path) -> list[Violation]:
 
 def collect_violations(root: Path) -> list[Violation]:
     """Collect all deterministic contract violations for ``root``."""
-    return _validate_ruff_config(root) + _validate_workflow(root)
+    return (
+        _validate_ruff_config(root)
+        + _validate_workflow(root)
+        + _validate_ci_test_performance_skill(root)
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
