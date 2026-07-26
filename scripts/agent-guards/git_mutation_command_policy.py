@@ -8,6 +8,8 @@ the rest fail-closed.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import shlex
@@ -152,6 +154,16 @@ class PublishGuardContext:
     allowed_paths_gate_issue_number: str
     allowed_paths_gate_base_sha: str
     allowed_paths_gate_head_sha: str
+    # Issue #1688: these fields are populated only when the repo-approved
+    # hook adapter explicitly injects CONTROLLED_PUBLISH_CONTEXT_V1.  Keeping
+    # them in the same bounded value object lets the existing decision core
+    # stay independent from ambient environment reads.
+    repository: str | None = None
+    invocation_issue_number: str | None = None
+    active_branch: str | None = None
+    invocation_head: str | None = None
+    remote: str | None = None
+    allowed_paths_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -836,6 +848,82 @@ def execute_initial_branch_create_transaction(
         remote_oid=readback_oid,
         push_returncode=push_returncode,
         push_error_category=None,
+    )
+
+
+@dataclass(frozen=True)
+class ExistingBranchUpdateTransactionResult:
+    """Bounded existing-branch update outcome for Issue #1688.
+
+    The outer terminal command is denied by the hook after this result is
+    produced.  Therefore a successful result proves exactly one in-process
+    push attempt followed by a fresh readback, rather than authorizing a
+    second ambient shell push.
+    """
+
+    status: str
+    reason_code: str
+    remote_oid: str | None
+    push_returncode: int | None
+
+
+def execute_existing_branch_update_transaction(
+    cwd: str, target_branch: str, expected_remote_head: str, verified_local_head: str, timeout: int = 30
+) -> ExistingBranchUpdateTransactionResult:
+    """Verify -> push once -> read back an existing remote branch.
+
+    The supplied SHA is embedded into the in-process argv instead of relying
+    on a later `HEAD` resolution.  This narrows the check-to-push race while
+    staying within the trusted-local model; it is not distributed exactly-once
+    or host attestation.
+    """
+    push_url, url_reason = resolve_single_push_url(cwd, remote="origin")
+    if push_url is None:
+        return ExistingBranchUpdateTransactionResult("denied", url_reason, None, None)
+    if _current_branch(cwd) != target_branch:
+        return ExistingBranchUpdateTransactionResult("denied", "branch_mismatch", None, None)
+    if _current_head(cwd) != verified_local_head:
+        return ExistingBranchUpdateTransactionResult("denied", "head_mismatch", None, None)
+    state, remote_oid, _error_category = classify_remote_branch_state(cwd, push_url, target_branch, timeout=timeout)
+    if state != REMOTE_STATE_PRESENT:
+        return ExistingBranchUpdateTransactionResult("denied", "remote_mismatch", remote_oid, None)
+    # The policy has already compared the same live ref to expected_head; do
+    # it again in this controlled executor immediately before the write.
+    if remote_oid != expected_remote_head:
+        return ExistingBranchUpdateTransactionResult("denied", "remote_mismatch", remote_oid, None)
+    if _current_head(cwd) != verified_local_head:
+        return ExistingBranchUpdateTransactionResult("denied", "head_mismatch", remote_oid, None)
+
+    push_returncode: int | None = None
+    try:
+        proc = subprocess.run(
+            ["git", "push", push_url, f"{verified_local_head}:refs/heads/{target_branch}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        push_returncode = proc.returncode
+    except (OSError, subprocess.TimeoutExpired):
+        matched, _reason, readback_oid = verify_initial_branch_create_readback(
+            cwd, push_url, target_branch, verified_local_head, timeout=timeout
+        )
+        if matched:
+            return ExistingBranchUpdateTransactionResult(
+                "completed", "existing_branch_update_completed", readback_oid, None
+            )
+        return ExistingBranchUpdateTransactionResult("denied", "push_failed", readback_oid, None)
+
+    matched, _reason, readback_oid = verify_initial_branch_create_readback(
+        cwd, push_url, target_branch, verified_local_head, timeout=timeout
+    )
+    if push_returncode != 0:
+        return ExistingBranchUpdateTransactionResult("denied", "push_failed", readback_oid, push_returncode)
+    if not matched:
+        return ExistingBranchUpdateTransactionResult("denied", "postcondition_mismatch", readback_oid, push_returncode)
+    return ExistingBranchUpdateTransactionResult(
+        "completed", "existing_branch_update_completed", readback_oid, push_returncode
     )
 
 
@@ -2262,19 +2350,94 @@ def _extract_git_argv(tokens: list[str]) -> list[str] | None:
     return None
 
 
-def _load_publish_guard_context() -> tuple[PublishGuardContext | None, str | None]:
-    expected_remote_head = os.environ.get("LOOP_PUBLISH_EXPECTED_REMOTE_HEAD", "").strip().lower()
-    current_remote_head = os.environ.get("LOOP_PUBLISH_CURRENT_REMOTE_HEAD", "").strip().lower()
-    declared_publish_head = os.environ.get("LOOP_PUBLISH_DECLARED_PUBLISH_HEAD", "").strip().lower()
-    verified_head = os.environ.get("LOOP_PUBLISH_VERIFIED_HEAD", "").strip().lower()
-    allowed_paths_gate_status = os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS", "").strip().lower()
-    remote_readback_source = os.environ.get("LOOP_PUBLISH_REMOTE_READBACK_SOURCE", "").strip().lower()
+_CONTROLLED_PUBLISH_CONTEXT_SCHEMA = "CONTROLLED_PUBLISH_CONTEXT_V1"
+_CONTROLLED_PUBLISH_CONTEXT_KEYS = frozenset(
+    {
+        "schema_version",
+        "repository",
+        "issue_number",
+        "active_branch",
+        "head",
+        "remote",
+        "allowed_paths_digest",
+        "expected_remote_head",
+        "current_remote_head",
+        "declared_publish_head",
+        "verified_head",
+        "allowed_paths_gate_status",
+        "remote_readback_source",
+        "allowed_paths_gate_issue_number",
+        "allowed_paths_gate_base_sha",
+        "allowed_paths_gate_head_sha",
+    }
+)
+
+
+def _allowed_paths_digest() -> str:
+    """Return the exact digest the hook adapter injects for this invocation.
+
+    The digest intentionally binds the inherited, trusted-local hook-process
+    value only.  A terminal `env VAR=...` prefix is command text and never
+    changes this process environment before PreToolUse evaluates it.
+    """
+    raw = os.environ.get("CODEX_ALLOWED_PATHS", "")
+    return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _load_publish_guard_context(
+    explicit_context: dict[str, object] | None = None,
+) -> tuple[PublishGuardContext | None, str | None]:
+    """Load legacy env context or the bounded hook-injected JSON context.
+
+    `explicit_context` is an exact-schema capability passed as one CLI
+    argument by the repo-approved hook adapter.  It deliberately has no
+    fallback to per-command environment text, so `env LOOP_...=... rtk ...`
+    cannot impersonate injection.
+    """
+    if explicit_context is not None:
+        if set(explicit_context) != _CONTROLLED_PUBLISH_CONTEXT_KEYS:
+            return None, "context_invalid"
+        if any(not isinstance(value, str) for value in explicit_context.values()):
+            return None, "context_invalid"
+        values = {key: str(value).strip() for key, value in explicit_context.items()}
+        required = _CONTROLLED_PUBLISH_CONTEXT_KEYS - {"schema_version"}
+        if values.get("schema_version") != _CONTROLLED_PUBLISH_CONTEXT_SCHEMA:
+            return None, "context_invalid"
+        if any(not values[key] for key in required):
+            return None, "context_missing"
+        if not values["issue_number"].isdigit():
+            return None, "context_invalid"
+        if values["repository"] != CANONICAL_REPO_IDENTITY_DEFAULT:
+            return None, "remote_mismatch"
+        if values["remote"] != "origin":
+            return None, "remote_mismatch"
+        if not _SHA_RE.fullmatch(values["head"].lower()):
+            return None, "context_invalid"
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", values["allowed_paths_digest"].lower()):
+            return None, "context_invalid"
+        expected_remote_head = values["expected_remote_head"].lower()
+        current_remote_head = values["current_remote_head"].lower()
+        declared_publish_head = values["declared_publish_head"].lower()
+        verified_head = values["verified_head"].lower()
+        allowed_paths_gate_status = values["allowed_paths_gate_status"].lower()
+        remote_readback_source = values["remote_readback_source"].lower()
+        allowed_paths_gate_issue_number = values["allowed_paths_gate_issue_number"]
+        allowed_paths_gate_base_sha = values["allowed_paths_gate_base_sha"].lower()
+        allowed_paths_gate_head_sha = values["allowed_paths_gate_head_sha"].lower()
+    else:
+        expected_remote_head = os.environ.get("LOOP_PUBLISH_EXPECTED_REMOTE_HEAD", "").strip().lower()
+        current_remote_head = os.environ.get("LOOP_PUBLISH_CURRENT_REMOTE_HEAD", "").strip().lower()
+        declared_publish_head = os.environ.get("LOOP_PUBLISH_DECLARED_PUBLISH_HEAD", "").strip().lower()
+        verified_head = os.environ.get("LOOP_PUBLISH_VERIFIED_HEAD", "").strip().lower()
+        allowed_paths_gate_status = os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS", "").strip().lower()
+        remote_readback_source = os.environ.get("LOOP_PUBLISH_REMOTE_READBACK_SOURCE", "").strip().lower()
+        allowed_paths_gate_issue_number = os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_ISSUE_NUMBER", "").strip()
+        allowed_paths_gate_base_sha = os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_BASE_SHA", "").strip().lower()
+        allowed_paths_gate_head_sha = os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_HEAD_SHA", "").strip().lower()
+        values = {}
     # Issue #1408 iteration-2 (P2): bind the Allowed Paths gate `status: ok`
     # to the issue / base / head it was evaluated against, so a stale `ok`
     # from a prior head or a different issue cannot be replayed.
-    allowed_paths_gate_issue_number = os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_ISSUE_NUMBER", "").strip()
-    allowed_paths_gate_base_sha = os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_BASE_SHA", "").strip().lower()
-    allowed_paths_gate_head_sha = os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_HEAD_SHA", "").strip().lower()
     fields = (
         expected_remote_head,
         current_remote_head,
@@ -2321,6 +2484,12 @@ def _load_publish_guard_context() -> tuple[PublishGuardContext | None, str | Non
         allowed_paths_gate_issue_number=allowed_paths_gate_issue_number,
         allowed_paths_gate_base_sha=allowed_paths_gate_base_sha,
         allowed_paths_gate_head_sha=allowed_paths_gate_head_sha,
+        repository=values.get("repository"),
+        invocation_issue_number=values.get("issue_number"),
+        active_branch=values.get("active_branch"),
+        invocation_head=values.get("head", "").lower() or None,
+        remote=values.get("remote"),
+        allowed_paths_digest=values.get("allowed_paths_digest", "").lower() or None,
     ), None
 
 
@@ -3054,6 +3223,8 @@ def classify_rtk_git_mutation(
     cwd: str,
     require_active_branch_push: bool,
     boundary_layer: str = "worktree_scope_guard_denied",
+    publish_context: dict[str, object] | None = None,
+    execute_existing_branch_update: bool = False,
 ) -> GitMutationPolicyResult | None:
     """Return a bounded policy result for recognized `rtk git` commands.
 
@@ -3225,32 +3396,74 @@ def classify_rtk_git_mutation(
                 suggested_command="rtk git push origin HEAD:refs/heads/<active-branch>",
                 verification_command="git branch --show-current",
             )
-    publish_guard, publish_guard_error = _load_publish_guard_context()
+    publish_guard, publish_guard_error = _load_publish_guard_context(publish_context)
     local_head = _current_head(cwd)
     if publish_guard is None:
+        context_values = publish_context or {}
         return _publish_safety_stop_result(
             reason_code=publish_guard_error or "publish_guard_context_missing",
             target_branch=target_branch,
-            expected_remote_head=os.environ.get("LOOP_PUBLISH_EXPECTED_REMOTE_HEAD", "").strip().lower(),
-            current_remote_head=os.environ.get("LOOP_PUBLISH_CURRENT_REMOTE_HEAD", "").strip().lower(),
+            expected_remote_head=str(context_values.get("expected_remote_head", os.environ.get("LOOP_PUBLISH_EXPECTED_REMOTE_HEAD", ""))).strip().lower(),
+            current_remote_head=str(context_values.get("current_remote_head", os.environ.get("LOOP_PUBLISH_CURRENT_REMOTE_HEAD", ""))).strip().lower(),
             local_head=local_head,
-            verified_head=os.environ.get("LOOP_PUBLISH_VERIFIED_HEAD", "").strip().lower(),
-            declared_publish_head=os.environ.get("LOOP_PUBLISH_DECLARED_PUBLISH_HEAD", "").strip().lower(),
+            verified_head=str(context_values.get("verified_head", os.environ.get("LOOP_PUBLISH_VERIFIED_HEAD", ""))).strip().lower(),
+            declared_publish_head=str(context_values.get("declared_publish_head", os.environ.get("LOOP_PUBLISH_DECLARED_PUBLISH_HEAD", ""))).strip().lower(),
             allowed_paths_gate_status=(
-                os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS", "").strip().lower()
+                str(context_values.get("allowed_paths_gate_status", os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS", ""))).strip().lower()
                 or "indeterminate"
             ),
             pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
-            remote_readback_source=os.environ.get("LOOP_PUBLISH_REMOTE_READBACK_SOURCE", "").strip().lower(),
+            remote_readback_source=str(context_values.get("remote_readback_source", os.environ.get("LOOP_PUBLISH_REMOTE_READBACK_SOURCE", ""))).strip().lower(),
             decision_inputs_complete=False,
             boundary_layer=boundary_layer,
         )
     if publish_guard is not None:
+        # Issue #1688: when the hook adapter supplies the bounded JSON
+        # capability, bind every invocation-scoped value to a fresh local
+        # probe before consulting the legacy publish decision core.
+        if publish_context is not None:
+            current_branch = _current_branch(cwd)
+            if publish_guard.active_branch != current_branch or current_branch != target_branch:
+                return _publish_safety_stop_result(
+                    reason_code="branch_mismatch", target_branch=target_branch,
+                    expected_remote_head=publish_guard.expected_remote_head,
+                    current_remote_head=publish_guard.current_remote_head,
+                    local_head=local_head, verified_head=publish_guard.verified_head,
+                    declared_publish_head=publish_guard.declared_publish_head,
+                    allowed_paths_gate_status=publish_guard.allowed_paths_gate_status,
+                    pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+                    remote_readback_source=publish_guard.remote_readback_source,
+                    decision_inputs_complete=False, boundary_layer=boundary_layer,
+                )
+            if publish_guard.invocation_head != local_head:
+                return _publish_safety_stop_result(
+                    reason_code="head_mismatch", target_branch=target_branch,
+                    expected_remote_head=publish_guard.expected_remote_head,
+                    current_remote_head=publish_guard.current_remote_head,
+                    local_head=local_head, verified_head=publish_guard.verified_head,
+                    declared_publish_head=publish_guard.declared_publish_head,
+                    allowed_paths_gate_status=publish_guard.allowed_paths_gate_status,
+                    pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+                    remote_readback_source=publish_guard.remote_readback_source,
+                    decision_inputs_complete=False, boundary_layer=boundary_layer,
+                )
+            if publish_guard.allowed_paths_digest != _allowed_paths_digest():
+                return _publish_safety_stop_result(
+                    reason_code="allowed_paths_digest_mismatch", target_branch=target_branch,
+                    expected_remote_head=publish_guard.expected_remote_head,
+                    current_remote_head=publish_guard.current_remote_head,
+                    local_head=local_head, verified_head=publish_guard.verified_head,
+                    declared_publish_head=publish_guard.declared_publish_head,
+                    allowed_paths_gate_status=publish_guard.allowed_paths_gate_status,
+                    pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+                    remote_readback_source=publish_guard.remote_readback_source,
+                    decision_inputs_complete=False, boundary_layer=boundary_layer,
+                )
         # Issue #1408 iteration-2 (P2): bind the Allowed Paths gate `ok` to
         # this issue and to the *actual* local HEAD (not the self-declared
         # `declared_publish_head` / `verified_head` claims), so a stale gate
         # from a prior head or a different issue cannot be replayed.
-        loop_issue_number = os.environ.get("LOOP_ISSUE_NUMBER", "").strip()
+        loop_issue_number = publish_guard.invocation_issue_number or os.environ.get("LOOP_ISSUE_NUMBER", "").strip()
         if (
             publish_guard.allowed_paths_gate_issue_number != loop_issue_number
             or publish_guard.allowed_paths_gate_base_sha != publish_guard.expected_remote_head
@@ -3332,7 +3545,7 @@ def classify_rtk_git_mutation(
             decision_inputs_complete=publish_guard.decision_inputs_complete,
             remote_drift_reason=remote_drift_reason,
             boundary_layer=boundary_layer,
-            issue_number=int(os.environ.get("LOOP_ISSUE_NUMBER", "0") or "0"),
+            issue_number=int(loop_issue_number or "0"),
             pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
         )
         if decision.status != "allow_retry":
@@ -3369,6 +3582,32 @@ def classify_rtk_git_mutation(
                 decision_inputs_complete=publish_guard.decision_inputs_complete,
                 boundary_layer=boundary_layer,
             )
+    if execute_existing_branch_update:
+        # The hook must deny the outer command after this controlled
+        # transaction, otherwise Codex would execute a second ambient push.
+        transaction = execute_existing_branch_update_transaction(
+            cwd,
+            target_branch,
+            publish_guard.expected_remote_head if publish_guard else "",
+            local_head or "",
+            timeout=30,
+        )
+        return GitMutationPolicyResult(
+            status="deny",
+            command_class=COMMAND_CLASS_RTK_GIT_PUSH,
+            reason_code=transaction.reason_code,
+            expected_remote_head=publish_guard.expected_remote_head if publish_guard else None,
+            current_remote_head=transaction.remote_oid,
+            local_head=local_head,
+            verified_head=publish_guard.verified_head if publish_guard else None,
+            declared_publish_head=publish_guard.declared_publish_head if publish_guard else None,
+            allowed_paths_gate_status=publish_guard.allowed_paths_gate_status if publish_guard else None,
+            target_branch=target_branch,
+            pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+            remote_readback_source=publish_guard.remote_readback_source,
+            decision_inputs_complete=publish_guard.decision_inputs_complete,
+            boundary_layer=boundary_layer,
+        )
     return GitMutationPolicyResult(
         status="allow",
         command_class=COMMAND_CLASS_RTK_GIT_PUSH,
@@ -3450,6 +3689,15 @@ def _build_cli_parser():
         action="store_true",
         help="disable the require_active_branch_push check (default: enabled)",
     )
+    parser.add_argument(
+        "--publish-context-json",
+        help="exact CONTROLLED_PUBLISH_CONTEXT_V1 JSON injected by the hook adapter",
+    )
+    parser.add_argument(
+        "--execute-existing-branch-update",
+        action="store_true",
+        help="perform the bounded existing-branch push/readback and deny the outer shell command",
+    )
     return parser
 
 
@@ -3458,11 +3706,23 @@ def _main(argv: list[str] | None = None) -> int:
     import sys
 
     args = _build_cli_parser().parse_args(argv if argv is not None else sys.argv[1:])
+    publish_context: dict[str, object] | None = None
+    if args.publish_context_json is not None:
+        try:
+            parsed_context = json_module.loads(args.publish_context_json)
+            if isinstance(parsed_context, dict):
+                publish_context = parsed_context
+            else:
+                publish_context = {"_invalid": "not_an_object"}
+        except json_module.JSONDecodeError:
+            publish_context = {"_invalid": "malformed_json"}
     result = classify_rtk_git_mutation(
         args.command,
         cwd=args.cwd,
         require_active_branch_push=not args.no_require_active_branch_push,
         boundary_layer=args.boundary_layer,
+        publish_context=publish_context,
+        execute_existing_branch_update=args.execute_existing_branch_update,
     )
     print(json_module.dumps(_result_to_json(result)))
     return 0

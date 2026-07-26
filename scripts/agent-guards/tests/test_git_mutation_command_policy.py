@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import sys
 import subprocess
@@ -344,6 +345,48 @@ def test_rtk_git_push_rejects_partial_or_abbreviated_publish_context(
     assert result.status == "deny"
     assert result.reason_code == "publish_guard_context_invalid"
     assert result.decision_inputs_complete is False
+
+
+def test_given_injected_context_with_allowed_paths_digest_mismatch_when_canonical_push_then_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """GIVEN an explicit bounded context whose Allowed Paths digest differs
+    from the hook-process binding WHEN canonical publish is evaluated THEN it
+    stops before any remote probe or push."""
+    _init_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "topic"], cwd=tmp_path, check=True)
+    head = _commit(tmp_path, "tracked.txt", "initial")
+    monkeypatch.setenv("CODEX_ALLOWED_PATHS", "tracked.txt\n")
+    digest = "sha256:" + hashlib.sha256(b"different-path\n").hexdigest()
+    context = {
+        "schema_version": "CONTROLLED_PUBLISH_CONTEXT_V1",
+        "repository": "squne121/loop-protocol",
+        "issue_number": "1688",
+        "active_branch": "topic",
+        "head": head,
+        "remote": "origin",
+        "allowed_paths_digest": digest,
+        "expected_remote_head": head,
+        "current_remote_head": head,
+        "declared_publish_head": head,
+        "verified_head": head,
+        "allowed_paths_gate_status": "ok",
+        "remote_readback_source": "ls_remote",
+        "allowed_paths_gate_issue_number": "1688",
+        "allowed_paths_gate_base_sha": head,
+        "allowed_paths_gate_head_sha": head,
+    }
+
+    result = classify_rtk_git_mutation(
+        "rtk git push origin HEAD:refs/heads/topic",
+        cwd=str(tmp_path),
+        require_active_branch_push=True,
+        publish_context=context,
+    )
+
+    assert result is not None
+    assert result.status == "deny"
+    assert result.reason_code == "allowed_paths_digest_mismatch"
 
 
 def test_rtk_git_push_denies_allowed_paths_gate_binding_mismatch(tmp_path: Path, monkeypatch):

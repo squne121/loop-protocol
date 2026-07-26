@@ -189,12 +189,12 @@ hook_boundaries_manifest_v1:
       bootstrap 系の追加 allowlist はこの PR では導入しない。
       Issue #1241 以降は issue worktree publish path の `rtk git add/commit/push` だけを shared bounded
       policy で解釈し、deny 時は `HOOK_COMMAND_REPAIR_HINT_V1` を stderr に返す。
-      Issue #1402 以降は strict publish lane 用 env binding
-      (`LOOP_PUBLISH_EXPECTED_REMOTE_HEAD`, `LOOP_PUBLISH_CURRENT_REMOTE_HEAD`,
-      `LOOP_PUBLISH_DECLARED_PUBLISH_HEAD`, `LOOP_PUBLISH_VERIFIED_HEAD`,
-      `LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS`, `LOOP_PUBLISH_REMOTE_READBACK_SOURCE`)
-      が全て揃った場合だけ allow retry を検討する。欠落・partial・malformed な場合、shared policy は
-      `publish_guard_context_missing` / `publish_guard_context_invalid` の `PUBLISH_SAFETY_STOP_REPORT_V1` とともに停止する。
+      Issue #1688 以降は hook adapter が hook process と fresh git probe から
+      `CONTROLLED_PUBLISH_CONTEXT_V1` を生成し、policy CLI に JSON 引数として明示注入する。
+      canonical existing-branch push は controlled transaction 内で 1 回だけ実行し、同じ remote ref の
+      readback が local HEAD と一致した場合だけ完了する。外側の shell push は transaction 完了後も deny
+      して二重実行を防ぐ。context の欠落・partial・malformed、branch/HEAD/remote/Allowed Paths digest の
+      不一致は fail-closed とする。`env LOOP_PUBLISH_...=... rtk git push ...` は context injection ではない。
 
   - handler_id: guard-japanese-prose
     event: PreToolUse
@@ -488,6 +488,8 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 | `commit_staged_changes_outside_allowed_paths` | staged diff を Allowed Paths subset に戻す | `rtk git commit -m "issue-1241 update"` / `git diff --cached --name-only` |
 | `push_refspec_requires_active_branch` | `PUBLISH_LANE_DECISION_V1 status=allow_retry` の allowed command だけを使う | suggestion なし / `git ls-remote --refs --exit-code origin refs/heads/<active-branch>` |
 | `publish_guard_context_missing` / `publish_guard_context_invalid` | publish lane の decision inputs を live readback 証跡付きで揃える | suggestion なし / `git ls-remote --refs --exit-code origin refs/heads/<branch>` |
+| `context_missing` / `context_invalid` / `allowed_paths_digest_mismatch` | adapter が生成した invocation-scoped bounded context を復旧する。terminal の env prefix で代替しない | suggestion なし / hook subprocess fixture を再実行 |
+| `branch_mismatch` / `head_mismatch` / `remote_mismatch` / `postcondition_mismatch` | controlled transaction の fresh probe/readback が不一致。raw retry や force push をしない | suggestion なし / `git branch --show-current` と `git ls-remote --refs --exit-code origin refs/heads/<branch>` |
 | `allowed_paths_gate_not_ok` | Allowed Paths gate を `ok` にできる current-head 証跡を取得する | suggestion なし / `allowed_paths_review_gate.py status == ok` |
 | `issue_context_required` | issue 未解決の root / unrelated cwd では mutation しない | `git worktree list` / `git branch --show-current` |
 | `target_dir_outside_worktree` | active issue worktree 配下へ戻る | `git status --short` / `git branch --show-current` |

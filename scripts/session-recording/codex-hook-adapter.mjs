@@ -648,13 +648,51 @@ function looksLikeRtkGitPush(command) {
  *  parsed policy JSON, or null when the policy CLI is unavailable or the
  *  command does not match a recognized `rtk git` shape (fail-closed: callers
  *  keep the generic remote_write_requires_approval deny in that case). */
+function buildControlledPublishContext(cwd) {
+  // Issue #1688: this is a trusted-local, per-hook-invocation capability.
+  // It is deliberately constructed from the hook process and fresh git
+  // probes, never by parsing `env VAR=...` text in the pending terminal
+  // command.  It is not a host-attestation or malicious-same-UID boundary.
+  try {
+    const activeBranch = execFileSync('git', ['branch', '--show-current'], {
+      cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000,
+    }).trim()
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000,
+    }).trim().toLowerCase()
+    return {
+      schema_version: 'CONTROLLED_PUBLISH_CONTEXT_V1',
+      repository: 'squne121/loop-protocol',
+      issue_number: process.env.LOOP_ISSUE_NUMBER ?? '',
+      active_branch: activeBranch,
+      head,
+      remote: 'origin',
+      allowed_paths_digest: sha256Hex(process.env.CODEX_ALLOWED_PATHS ?? ''),
+      expected_remote_head: process.env.LOOP_PUBLISH_EXPECTED_REMOTE_HEAD ?? '',
+      current_remote_head: process.env.LOOP_PUBLISH_CURRENT_REMOTE_HEAD ?? '',
+      declared_publish_head: process.env.LOOP_PUBLISH_DECLARED_PUBLISH_HEAD ?? '',
+      verified_head: process.env.LOOP_PUBLISH_VERIFIED_HEAD ?? '',
+      allowed_paths_gate_status: process.env.LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS ?? '',
+      remote_readback_source: process.env.LOOP_PUBLISH_REMOTE_READBACK_SOURCE ?? '',
+      allowed_paths_gate_issue_number: process.env.LOOP_PUBLISH_ALLOWED_PATHS_GATE_ISSUE_NUMBER ?? '',
+      allowed_paths_gate_base_sha: process.env.LOOP_PUBLISH_ALLOWED_PATHS_GATE_BASE_SHA ?? '',
+      allowed_paths_gate_head_sha: process.env.LOOP_PUBLISH_ALLOWED_PATHS_GATE_HEAD_SHA ?? '',
+    }
+  } catch {
+    return null
+  }
+}
+
 function classifyRtkGitPushPublishLane(command, cwd) {
   try {
+    const context = buildControlledPublishContext(cwd)
     const stdout = execFileSync('python3', [
       gitMutationPolicyScript,
       '--command', command,
       '--cwd', cwd,
       '--boundary-layer', 'codex_hook_adapter_pretooluse',
+      '--execute-existing-branch-update',
+      '--publish-context-json', JSON.stringify(context ?? {}),
     ], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -808,6 +846,22 @@ function evaluateGuard(payload, eventName) {
     }
   }
 
+  // Issue #1688 AC3: a terminal `env LOOP_PUBLISH_...=... rtk git push ...`
+  // prefix is untrusted command text, not hook-process context injection.
+  // Reject it before stripEnvPrefix would make it look like the canonical
+  // command shape.  Benign env prefixes keep their existing read-only path.
+  const inlinePublishContextSpoof = /^\s*env\s+(?:(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]*\s+)+)rtk\s+git\s+push\b/.test(rawCommand)
+    && /(?:^|\s)(?:LOOP_PUBLISH_[A-Z0-9_]*|LOOP_ISSUE_NUMBER|CODEX_ALLOWED_PATHS)=/.test(rawCommand)
+  if (inlinePublishContextSpoof) {
+    const preview = redactCommandPreview(rawCommand)
+    return {
+      action: 'deny',
+      reason_code: 'context_invalid',
+      command_kind: 'rtk_git_push',
+      message: `${eventName}: publish_lane_safety_stop [reason_code=context_invalid] blocked_command_preview="${preview}"`,
+    }
+  }
+
   // Normalize env VAR=val prefix before classification.
   // env dump variants (bare "env", "env -0", etc.) are denied immediately.
   const { stripped: command, isEnvDump } = stripEnvPrefix(rawCommand)
@@ -873,6 +927,20 @@ function evaluateGuard(payload, eventName) {
             + `blocked_command_preview="${preview}" `
             + '(the trusted transaction already executed the probe/push/readback — '
             + 'do not retry the raw command; inspect transaction_status above)',
+        }
+      }
+      if (publishLane && publishLane.reason_code === 'existing_branch_update_completed') {
+        const preview = redactCommandPreview(rawCommand)
+        return {
+          action: 'deny',
+          reason_code: 'existing_branch_update_transaction_result',
+          command_kind: publishLane.command_class ?? 'rtk_git_push',
+          message: `${eventName}: existing_branch_update_transaction_result `
+            + `[transaction_status=${publishLane.reason_code}] `
+            + `[remote_oid=${publishLane.current_remote_head ?? 'null'}] `
+            + `[local_head=${publishLane.local_head}] `
+            + `blocked_command_preview="${preview}" `
+            + '(the controlled transaction already executed one push and readback; do not retry the raw command)',
         }
       }
       if (publishLane && publishLane.status === 'deny') {

@@ -625,19 +625,73 @@ def _publish_lane_env(head: str, remote: Path) -> dict:
     return env
 
 
-def test_pre_tool_use_rtk_git_push_allowed_with_validated_publish_lane(tmp_path: Path):
-    """AC1: rtk git push origin HEAD:refs/heads/<active-branch> with matching publish
-    lane evidence is NOT denied by the generic remote_write_requires_approval guard."""
+def _init_existing_branch_update_repo(repo: Path, branch: str) -> tuple[str, str, Path, Path]:
+    """Prepare one real existing-branch update and a bare-remote counter.
+
+    The pre-receive hook is fixture-local.  It makes the AC1 assertion prove
+    that the controlled transaction invoked exactly one remote write; no live
+    GitHub remote is involved.
+    """
+    remote_head, remote = _init_publish_lane_repo(repo, branch)
+    (repo / "tracked.txt").write_text("updated")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "update"], cwd=repo, check=True)
+    local_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    counter = repo.parent / "push-counter"
+    hook = remote / "hooks" / "pre-receive"
+    hook.write_text(f"#!/bin/sh\nprintf x >> '{counter}'\n")
+    hook.chmod(0o755)
+    return remote_head, local_head, remote, counter
+
+
+def test_given_bounded_context_when_canonical_existing_branch_push_then_single_push_and_readback(tmp_path: Path):
+    """AC1/AC5: GIVEN an adapter-injected bounded context and temporary bare
+    remote WHEN canonical existing-branch publish fires THEN the controlled
+    transaction performs exactly one push, verifies the ref, and denies the
+    outer raw shell command so it cannot execute a second time."""
     repo = tmp_path / "repo"
     repo.mkdir()
     branch = "worktree-issue-1408-publish-lane"
-    head, remote = _init_publish_lane_repo(repo, branch)
-    env = _publish_lane_env(head, remote)
+    remote_head, local_head, remote, counter = _init_existing_branch_update_repo(repo, branch)
+    env = _publish_lane_env(local_head, remote)
+    env["LOOP_PUBLISH_EXPECTED_REMOTE_HEAD"] = remote_head
+    env["LOOP_PUBLISH_CURRENT_REMOTE_HEAD"] = remote_head
+    env["LOOP_PUBLISH_ALLOWED_PATHS_GATE_BASE_SHA"] = remote_head
 
     command = f"rtk git push origin HEAD:refs/heads/{branch}"
     result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}}, env=env, cwd=repo)
-    # Allowed: adapter emits no deny (null guard result => stdout stays empty).
-    assert result.stdout == "", result.stdout
+    response = json.loads(result.stdout)
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "existing_branch_update_transaction_result" in reason
+    assert "transaction_status=existing_branch_update_completed" in reason
+    assert counter.read_text() == "x"
+    readback = subprocess.run(
+        ["git", "ls-remote", "--refs", "origin", f"refs/heads/{branch}"],
+        cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.split()[0]
+    assert readback == local_head
+
+
+def test_given_terminal_env_publish_values_when_canonical_push_then_context_spoof_is_denied(tmp_path: Path):
+    """AC3: GIVEN only terminal `env LOOP_PUBLISH_...` assignments WHEN the
+    command is evaluated THEN they never become bounded context injection."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    branch = "worktree-issue-1408-publish-lane"
+    head, _remote = _init_publish_lane_repo(repo, branch)
+    command = (
+        f"env LOOP_PUBLISH_EXPECTED_REMOTE_HEAD={head} "
+        f"LOOP_PUBLISH_CURRENT_REMOTE_HEAD={head} "
+        f"rtk git push origin HEAD:refs/heads/{branch}"
+    )
+    result = run_adapter("PreToolUse", {"tool_name": "Bash", "tool_input": {"command": command}}, cwd=repo)
+    response = json.loads(result.stdout)
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "reason_code=context_invalid" in reason
 
 
 def test_pre_tool_use_rtk_git_push_denied_without_publish_lane_context(tmp_path: Path):
@@ -669,7 +723,7 @@ def test_pre_tool_use_rtk_git_push_denied_without_publish_lane_context(tmp_path:
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
     assert "publish_lane_safety_stop" in reason
     assert "boundary_layer=codex_hook_adapter_pretooluse" in reason
-    assert "reason_code=publish_guard_context_missing" in reason
+    assert "reason_code=context_missing" in reason
     assert "required_decisions=" in reason
 
 
