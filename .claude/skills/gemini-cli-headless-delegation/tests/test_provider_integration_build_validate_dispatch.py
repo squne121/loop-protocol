@@ -69,7 +69,7 @@ def test_auto_build_validate_dispatch_pipeline_agy_first(tmp_path, monkeypatch):
         base_dir=tmp_path,
         provider="auto",
     )
-    assert build_exit_code == 0, f"build_request.py failed to build a provider=auto request"
+    assert build_exit_code == 0, "build_request.py failed to build a provider=auto request"
 
     request = json.loads(output.read_text(encoding="utf-8"))
     assert request["provider"] == "auto"
