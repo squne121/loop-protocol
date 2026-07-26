@@ -47,8 +47,8 @@ YAML_FENCE_PATTERN = re.compile(r"^```(?:yaml|yml)?\s*$", re.IGNORECASE)
 YAML_BLOCK_MARKER = "SAFETY_CLAIMS_V1"
 OVERLAP_GATE_BYPASS_YAML_MARKER = "OVERLAP_GATE_BYPASS_V1"
 OVERLAP_GATE_BYPASS_TRIGGER_PATTERN = re.compile(
-    r"(?is)(?:overlap.{0,400}?\b(?:C2a|C3)\b.{0,400}?(?:bypass|バイパス|経由せず|直接実行)"
-    r"|(?:bypass|バイパス|経由せず|直接実行).{0,400}?overlap.{0,400}?\b(?:C2a|C3)\b)"
+    r"(?is)(?:overlap.{0,400}?\b(?:C2a|C3)\b.{0,400}?(?:\bbypass\b|バイパス|経由せず|直接実行)"
+    r"|(?:\bbypass\b|バイパス|経由せず|直接実行).{0,400}?overlap.{0,400}?\b(?:C2a|C3)\b)"
 )
 OVERLAP_GATE_BYPASS_REQUIRED_KEYS = (
     "bypass_reason",
@@ -229,7 +229,9 @@ def _extract_overlap_gate_bypass_yaml(body: str) -> tuple[str | None, int | None
             continue
         if in_yaml and line.strip() == "```":
             block = "\n".join(collected)
-            if OVERLAP_GATE_BYPASS_YAML_MARKER in block or re.search(
+            if re.search(
+                rf"(?m)^{re.escape(OVERLAP_GATE_BYPASS_YAML_MARKER)}:\s*$", block
+            ) or re.search(
                 r"(?m)^bypass_reason:\s*\S", block
             ):
                 return block, start_line, idx - 1
