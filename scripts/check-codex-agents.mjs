@@ -72,6 +72,7 @@ const requiredAgentNames = [
   'pr-reviewer-lite',
   'pr-reviewer',
   'review-issue',
+  'scope-rollup-runner',
   'spark-deep',
   'spark-skim',
   'spark-worker',
@@ -93,8 +94,8 @@ function loadReasoningMap() {
     throw new Error(`runtime contract is malformed: ${runtimeContractPath}`);
   }
   const entries = Object.entries(contract.required_agents);
-  if (entries.length !== 13) {
-    throw new Error(`runtime contract must declare exactly 13 agents: ${runtimeContractPath}`);
+  if (entries.length !== 14) {
+    throw new Error(`runtime contract must declare exactly 14 agents: ${runtimeContractPath}`);
   }
   for (const [name, expected] of entries) {
     for (const field of ['path', 'model', 'model_reasoning_effort', 'default_permissions']) {
@@ -123,6 +124,7 @@ const readOnlyAgents = new Set([
   'issue-reviewer',
   'pr-reviewer-lite',
   'pr-reviewer',
+  'scope-rollup-runner',
   'spark-deep',
   'spark-skim',
   'test-runner',
