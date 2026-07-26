@@ -237,6 +237,40 @@ def test_materializer_rejects_allowed_paths_fingerprint_mismatch(tmp_path: Path,
         _materialize(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("issue_body", "expected"),
+    [
+        (
+            "## Allowed Paths\n\n- `scripts/agent-guards/example.py`\n\n## Stop Conditions\n",
+            ["scripts/agent-guards/example.py"],
+        ),
+        (
+            "## Allowed Paths\n\n- `scripts/agent-guards/example.py` (説明)\n"
+            "scripts/agent-guards/extra.py（補足）\n\n## Stop Conditions\n",
+            ["scripts/agent-guards/example.py", "scripts/agent-guards/extra.py"],
+        ),
+    ],
+)
+def test_materializer_allowed_paths_match_canonical_contract_review_grammar(issue_body, expected):
+    assert materializer._allowed_paths(issue_body) == expected
+
+
+def test_materializer_accepts_matching_fingerprint_for_backtick_wrapped_path(tmp_path: Path, monkeypatch):
+    issue_body = "## Allowed Paths\n\n- `scripts/agent-guards/example.py`\n\n## Stop Conditions\n"
+    expected_hash = controlled.compute_allowed_paths_sha256(["scripts/agent-guards/example.py"])
+    _patch_common(
+        monkeypatch,
+        tmp_path,
+        comments=[_comment(_go_comment_body(issue_body=issue_body, allowed_paths_hash=expected_hash))],
+    )
+    monkeypatch.setattr(
+        "materialize_issue_scope_snapshot._load_live_issue",
+        lambda gh_bin, issue_number, repo, root, env: {"body": issue_body, "updatedAt": "2026-07-19T00:00:00Z"},
+    )
+
+    assert _materialize(tmp_path)["status"] == "ok"
+
+
 def test_materializer_rejects_base_ref_not_default_branch(tmp_path: Path, monkeypatch):
     _patch_common(monkeypatch, tmp_path, comments=[_comment(_go_comment_body())])
     monkeypatch.setattr(
