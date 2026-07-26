@@ -316,7 +316,15 @@ def _build_agy_request(
             output=output,
             failure_class="invalid_profile",
             failure_reason=f"tool_profile '{profile}' is not valid; choose one of: {sorted(VALID_PROFILES)}",
-            next_action_argv=["build_request.py", "--provider", "agy", "--profile", "<valid_profile>", "--prompt", "<prompt>"],
+            next_action_argv=[
+                "build_request.py",
+                "--provider",
+                "agy",
+                "--profile",
+                "<valid_profile>",
+                "--prompt",
+                "<prompt>",
+            ],
         )
         return 1
 
@@ -380,7 +388,16 @@ def _build_agy_request(
             output=output,
             failure_class="validation_error",
             failure_reason=validation_errors[0],
-            next_action_argv=["build_request.py", "--provider", "agy", "--profile", profile, "--prompt", str(prompt), "--help"],
+            next_action_argv=[
+                "build_request.py",
+                "--provider",
+                "agy",
+                "--profile",
+                profile,
+                "--prompt",
+                str(prompt),
+                "--help",
+            ],
         )
         return 1
 
@@ -525,7 +542,13 @@ def build_request(
             output=output,
             failure_class="invalid_profile",
             failure_reason=f"tool_profile '{profile}' is not valid; choose one of: {sorted(VALID_PROFILES)}",
-            next_action_argv=["build_request.py", "--profile", "<valid_profile>", "--objective", objective or "<objective>"],
+            next_action_argv=[
+                "build_request.py",
+                "--profile",
+                "<valid_profile>",
+                "--objective",
+                objective or "<objective>",
+            ],
         )
         return 1
 
@@ -654,7 +677,14 @@ def build_request(
             output=output,
             failure_class="validation_error",
             failure_reason=validation_errors[0],
-            next_action_argv=["build_request.py", "--profile", profile, "--objective", objective or "<objective>", "--help"],
+            next_action_argv=[
+                "build_request.py",
+                "--profile",
+                profile,
+                "--objective",
+                objective or "<objective>",
+                "--help",
+            ],
         )
         return 1
 
