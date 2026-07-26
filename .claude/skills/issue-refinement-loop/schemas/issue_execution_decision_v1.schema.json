@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "issue_execution_decision/v1",
+  "$id": "urn:loop-protocol:issue-execution-decision:v1",
   "title": "ISSUE_EXECUTION_DECISION_V1",
   "description": "Canonical static decision shape. Semantic invariants and canonical digest verification are owned by the normative validator in Issue #1677.",
   "type": "object",
