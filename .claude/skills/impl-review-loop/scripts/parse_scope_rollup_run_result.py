@@ -23,14 +23,13 @@ OUTPUT_MARKER = "SCOPE_ROLLUP_MARKER_PARSE_RESULT_V1"
 CAPTURE_MARKER = "SCOPE_ROLLUP_CAPTURE_RESULT_V1"
 
 ALLOWED_MARKER_STATUS = {"ok", "failed", "runner_unavailable"}
-REQUIRED_FIELDS_BASE = {
+REQUIRED_IDENTITY_FIELDS = {
     "status",
     "repo",
     "current_issue",
     "invocation_id",
     "requested_at",
     "generated_at",
-    "script_blob_sha256",
 }
 REQUIRE_RESULT_FIELDS = {"raw_plan_location", "result_sha256", "payload"}
 COMPLETENESS_FIELDS = {"page_count", "item_count", "total_count", "pagination_complete", "sha256"}
@@ -254,7 +253,7 @@ def _validate_marker_payload(
 
     Returns (parse_status, termination_cause, reject_reason, raw_plan_location_allowed).
     """
-    for field in REQUIRED_FIELDS_BASE:
+    for field in REQUIRED_IDENTITY_FIELDS:
         if field not in marker_payload:
             return "marker_malformed", "scope_rollup_marker_malformed", "marker_malformed", False
 
@@ -262,37 +261,54 @@ def _validate_marker_payload(
     if status not in ALLOWED_MARKER_STATUS:
         return "marker_malformed", "scope_rollup_marker_malformed", "marker_malformed", False
 
-    if marker_payload.get("repo") != expected_repo:
+    repo = marker_payload.get("repo")
+    invocation_id = marker_payload.get("invocation_id")
+    marker_requested_at = marker_payload.get("requested_at")
+    generated_at = marker_payload.get("generated_at")
+    current_issue = marker_payload.get("current_issue")
+    if (
+        not isinstance(repo, str)
+        or not isinstance(invocation_id, str)
+        or not isinstance(marker_requested_at, str)
+        or not isinstance(generated_at, str)
+        or type(current_issue) is not int
+    ):
+        return "marker_malformed", "scope_rollup_marker_malformed", "marker_malformed", False
+
+    if repo != expected_repo:
         return "rejected", "scope_rollup_marker_malformed", "repo_mismatch", False
 
-    try:
-        current_issue = int(marker_payload.get("current_issue"))
-    except Exception:
-        return "marker_malformed", "scope_rollup_marker_malformed", "issue_mismatch", False
     if current_issue != expected_issue_number:
         return "rejected", "scope_rollup_marker_malformed", "issue_mismatch", False
 
-    if str(marker_payload.get("invocation_id", "")) != str(expected_invocation_id):
+    if invocation_id != expected_invocation_id:
         return "rejected", "scope_rollup_marker_malformed", "invocation_id_mismatch", False
-
-    if not isinstance(marker_payload.get("script_blob_sha256"), str):
-        return "marker_malformed", "scope_rollup_marker_malformed", "marker_malformed", False
-    if marker_payload.get("script_blob_sha256") != expected_script_sha:
-        return "rejected", "scope_rollup_marker_malformed", "script_sha_mismatch", False
 
     try:
         requested_at_dt = _parse_iso8601(requested_at)
-        marker_requested_at_dt = _parse_iso8601(str(marker_payload.get("requested_at")))
+        marker_requested_at_dt = _parse_iso8601(marker_requested_at)
         if marker_requested_at_dt != requested_at_dt:
             return "rejected", "scope_rollup_marker_malformed", "requested_at_mismatch", False
-        generated_at_dt = _parse_iso8601(str(marker_payload.get("generated_at")))
+        generated_at_dt = _parse_iso8601(generated_at)
     except Exception:
         return "marker_malformed", "scope_rollup_marker_malformed", "marker_malformed", False
 
     if generated_at_dt <= requested_at_dt:
         return "rejected", "scope_rollup_marker_malformed", "stale", False
 
-    if status in {"failed", "runner_unavailable"}:
+    # A runner-unavailable marker proves only that the runner could not
+    # execute.  Its route is intentionally bound to the invocation identity
+    # and timestamp ordering above; it must not require artifacts that a
+    # runner which never ran cannot produce.
+    if status == "runner_unavailable":
+        return status, None, None, False
+
+    if not isinstance(marker_payload.get("script_blob_sha256"), str):
+        return "marker_malformed", "scope_rollup_marker_malformed", "marker_malformed", False
+    if marker_payload.get("script_blob_sha256") != expected_script_sha:
+        return "rejected", "scope_rollup_marker_malformed", "script_sha_mismatch", False
+
+    if status == "failed":
         return status, None, None, False
 
     inputs = marker_payload.get("inputs")

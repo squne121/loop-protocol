@@ -16,6 +16,7 @@ import json
 import subprocess
 import sys
 from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Dict
@@ -73,6 +74,7 @@ def _render_marker(
     generated_at: str = "2026-06-13T10:01:00+00:00",
     overrides: Dict[str, Any] | None = None,
     script_sha: str | None = None,
+    include_script_sha: bool = True,
     raw_plan_location: Any = None,
     payload: Dict[str, Any] | None = None,
     result_sha: str | None = None,
@@ -89,8 +91,9 @@ def _render_marker(
         "generated_at": generated_at,
         "git_head_sha": "0000000000000000000000000000000000000000",
         "script_path": str(PLAN_SCRIPT),
-        "script_blob_sha256": script_sha,
     }
+    if include_script_sha:
+        marker["script_blob_sha256"] = script_sha
 
     if include_result:
         effective_payload = payload if payload is not None else _default_payload()
@@ -323,18 +326,93 @@ def test_non_escalation_for_runner_unavailable_marker(tmp_path):
     marker = _render_marker(
         status="runner_unavailable",
         include_result=False,
-        script_sha=_load_script_sha(PLAN_SCRIPT),
+        include_script_sha=False,
         requested_at="2026-06-13T10:00:00+00:00",
         generated_at="2026-06-13T10:01:00+00:00",
     )
     result = _run_parser(
         marker,
-        expected_script_sha=_load_script_sha(PLAN_SCRIPT),
+        expected_script_sha="not-required-for-runner-unavailable",
         requested_at="2026-06-13T10:00:00+00:00",
-        capture_sidecar_text="SCOPE_ROLLUP_CAPTURE_RESULT_V1:\n  capture_mode: unsupported\n",
     )
     assert result["status"] == "runner_unavailable"
     assert result["routing_action"] == "deferred"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_reason"),
+    [
+        ({"repo": "other/repository"}, "repo_mismatch"),
+        ({"current_issue": 842}, "issue_mismatch"),
+        ({"invocation_id": "other-invocation"}, "invocation_id_mismatch"),
+        ({"requested_at": "2026-06-13T09:59:00+00:00"}, "requested_at_mismatch"),
+        ({"generated_at": "2026-06-13T10:00:00+00:00"}, "stale"),
+    ],
+)
+def test_runner_unavailable_identity_or_timestamp_mismatch_stops_human(
+    overrides: Dict[str, Any], expected_reason: str
+):
+    marker = _render_marker(
+        status="runner_unavailable",
+        include_result=False,
+        include_script_sha=False,
+        overrides=overrides,
+    )
+    result = _run_parser(
+        marker,
+        expected_script_sha="not-required-for-runner-unavailable",
+        requested_at="2026-06-13T10:00:00+00:00",
+    )
+    assert result["routing_action"] == "stop_human"
+    assert result["reject_reason"] == expected_reason
+
+
+def test_runner_unavailable_without_identity_field_stops_human():
+    marker = yaml.safe_load(
+        _render_marker(
+            status="runner_unavailable",
+            include_result=False,
+            include_script_sha=False,
+        ).removeprefix("```yaml\n").removesuffix("\n```")
+    )
+    del marker["ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1"]["generated_at"]
+    result = _run_parser(
+        "```yaml\n" + yaml.safe_dump(marker, sort_keys=False).rstrip() + "\n```",
+        expected_script_sha="not-required-for-runner-unavailable",
+        requested_at="2026-06-13T10:00:00+00:00",
+    )
+    assert result["status"] == "marker_malformed"
+    assert result["routing_action"] == "stop_human"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"current_issue": True},
+        {"current_issue": 841.0},
+        {"current_issue": "841"},
+        {"repo": 1805},
+        {"invocation_id": True},
+        {"requested_at": datetime(2026, 6, 13, 10, 0, tzinfo=timezone.utc)},
+        {"generated_at": datetime(2026, 6, 13, 10, 1, tzinfo=timezone.utc)},
+    ],
+)
+def test_runner_unavailable_identity_native_types_must_match_schema(
+    overrides: Dict[str, Any],
+):
+    marker = _render_marker(
+        status="runner_unavailable",
+        include_result=False,
+        include_script_sha=False,
+        overrides=overrides,
+    )
+    result = _run_parser(
+        marker,
+        expected_script_sha="not-required-for-runner-unavailable",
+        requested_at="2026-06-13T10:00:00+00:00",
+    )
+    assert result["status"] == "marker_malformed"
+    assert result["routing_action"] == "stop_human"
 
 
 def test_failed_marker_stops_human():
