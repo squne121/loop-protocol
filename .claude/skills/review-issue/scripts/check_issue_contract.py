@@ -398,7 +398,8 @@ def readiness_error_to_structured_blocker(
     structured_blocker = {
         "code": rule_id,
         "message": message,
-        "finding_kind": REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,  # finding_kind: deterministic_domain_blocker
+        # finding_kind: deterministic_domain_blocker
+        "finding_kind": REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,
         "deterministic_domain_key": category,
         "blocking": True,
         "checker_evidence": [checker_evidence_entry],
