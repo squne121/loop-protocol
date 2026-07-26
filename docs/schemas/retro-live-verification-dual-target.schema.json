@@ -194,11 +194,25 @@
     "readback": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["canonical_comment_count", "digest_revalidation", "duplicate_count"],
+      "required": ["status", "canonical_comment_count", "digest_revalidation", "duplicate_count"],
       "properties": {
-        "canonical_comment_count": { "type": "integer", "const": 1 },
-        "digest_revalidation": { "type": "string", "const": "pass" },
-        "duplicate_count": { "type": "integer", "const": 0 }
+        "status": {
+          "description": "Issue #1415 digest-contract fix_delta: distinguishes a pre-post generated manifest (pending, no live GitHub readback has occurred yet) from a manifest that has actually been posted and re-verified against live GitHub state (verified) or whose post-write readback failed (failed). Generators must emit 'pending'; only the post/verify live path may emit 'verified' or 'failed', and only after actually performing the readback.",
+          "type": "string",
+          "enum": ["pending", "verified", "failed"]
+        },
+        "canonical_comment_count": {
+          "description": "null until status != pending. When verified, must be the live-counted number of trusted canonical comments (contract requires exactly 1).",
+          "type": ["integer", "null"]
+        },
+        "digest_revalidation": {
+          "type": "string",
+          "enum": ["pending", "pass", "fail"]
+        },
+        "duplicate_count": {
+          "description": "null until status != pending. When verified, must be the live-counted number of duplicate canonical comments (contract requires 0).",
+          "type": ["integer", "null"]
+        }
       }
     }
   }

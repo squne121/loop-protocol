@@ -668,10 +668,16 @@ export function buildDualTargetManifest(options) {
       raw_values_emitted: false,
       forbidden_fields_scan: 'pass',
     },
+    // Issue #1415 digest-contract fix_delta: this is a pre-post generated manifest -- no
+    // live GitHub posting or readback has happened yet, so these fields must not claim a
+    // pass/count that hasn't been observed. The post/verify live path is responsible for
+    // overwriting this block with real readback values after it actually posts and
+    // re-fetches the canonical comment.
     readback: {
-      canonical_comment_count: 1,
-      digest_revalidation: 'pass',
-      duplicate_count: 0,
+      status: 'pending',
+      canonical_comment_count: null,
+      digest_revalidation: 'pending',
+      duplicate_count: null,
     },
   }
 }
