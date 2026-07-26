@@ -512,6 +512,28 @@ describe('required negative test 9: retro-live-verification.yml workflow contrac
       expect(ref).toMatch(/^[0-9a-f]{40}$/u)
     }
   })
+
+  it('Issue #1415 P0-G fix_delta: GIVEN workflow_dispatch.inputs WHEN parsed THEN there is no caller-controllable `trusted_actor` input (a workflow_dispatch input, even with a "safe" default, is not a valid trust root -- a dispatching actor could always override it)', () => {
+    const dispatchInputs = (workflow as unknown as {
+      on: { workflow_dispatch?: { inputs?: Record<string, unknown> } }
+    }).on.workflow_dispatch?.inputs ?? {}
+    expect(Object.keys(dispatchInputs)).not.toContain('trusted_actor')
+  })
+
+  it('Issue #1415 P0-G fix_delta: GIVEN the post-canonical-comment job env WHEN parsed THEN TRUSTED_ACTOR is a literal string committed to this file, not an `inputs.*` or `github.triggering_actor` expression', () => {
+    const trustedActorEnv = String(postJob.env?.TRUSTED_ACTOR ?? '')
+    expect(trustedActorEnv).not.toMatch(/\$\{\{/u)
+    expect(trustedActorEnv.length).toBeGreaterThan(0)
+  })
+
+  it('Issue #1415 P0-G/P0-C fix_delta: GIVEN CURRENT_ACTOR and TRUSTED_ACTOR env values WHEN parsed THEN they are bound to distinct sources (authenticated triggering actor vs. a fixed committed literal), never the same expression', () => {
+    const currentActorEnv = String(postJob.env?.CURRENT_ACTOR ?? '')
+    const trustedActorEnv = String(postJob.env?.TRUSTED_ACTOR ?? '')
+    expect(currentActorEnv).toContain('github.triggering_actor')
+    expect(trustedActorEnv).not.toBe(currentActorEnv)
+    expect(trustedActorEnv).not.toContain('triggering_actor')
+    expect(trustedActorEnv).not.toContain('inputs.')
+  })
 })
 
 
