@@ -149,7 +149,7 @@ def test_execution_state_selected_fixture():
     assert prl.validate_issue_execution_decision(decision) == []
 
 
-def test_execution_state_blocked_shape_is_schema_and_semantically_valid():
+def test_execution_state_blocked_fixture():
     """
     AC7: 'blocked' with non-empty predecessors is a valid, schema+semantic-
     conformant ISSUE_EXECUTION_DECISION_V1 shape.
@@ -207,7 +207,7 @@ def test_execution_state_blocked_shape_is_schema_and_semantically_valid():
     assert prl.validate_issue_execution_decision(decision) == []
 
 
-def test_relations_duplicate_shape_is_schema_and_semantically_valid():
+def test_relations_duplicate_fixture():
     """
     AC8: relations containing relation_type 'duplicate' with execution.state
     == duplicate is a valid, schema+semantic-conformant shape.
