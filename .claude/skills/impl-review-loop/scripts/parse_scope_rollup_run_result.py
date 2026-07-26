@@ -261,25 +261,35 @@ def _validate_marker_payload(
     if status not in ALLOWED_MARKER_STATUS:
         return "marker_malformed", "scope_rollup_marker_malformed", "marker_malformed", False
 
-    if marker_payload.get("repo") != expected_repo:
+    repo = marker_payload.get("repo")
+    invocation_id = marker_payload.get("invocation_id")
+    marker_requested_at = marker_payload.get("requested_at")
+    generated_at = marker_payload.get("generated_at")
+    current_issue = marker_payload.get("current_issue")
+    if (
+        not isinstance(repo, str)
+        or not isinstance(invocation_id, str)
+        or not isinstance(marker_requested_at, str)
+        or not isinstance(generated_at, str)
+        or type(current_issue) is not int
+    ):
+        return "marker_malformed", "scope_rollup_marker_malformed", "marker_malformed", False
+
+    if repo != expected_repo:
         return "rejected", "scope_rollup_marker_malformed", "repo_mismatch", False
 
-    try:
-        current_issue = int(marker_payload.get("current_issue"))
-    except Exception:
-        return "marker_malformed", "scope_rollup_marker_malformed", "issue_mismatch", False
     if current_issue != expected_issue_number:
         return "rejected", "scope_rollup_marker_malformed", "issue_mismatch", False
 
-    if str(marker_payload.get("invocation_id", "")) != str(expected_invocation_id):
+    if invocation_id != expected_invocation_id:
         return "rejected", "scope_rollup_marker_malformed", "invocation_id_mismatch", False
 
     try:
         requested_at_dt = _parse_iso8601(requested_at)
-        marker_requested_at_dt = _parse_iso8601(str(marker_payload.get("requested_at")))
+        marker_requested_at_dt = _parse_iso8601(marker_requested_at)
         if marker_requested_at_dt != requested_at_dt:
             return "rejected", "scope_rollup_marker_malformed", "requested_at_mismatch", False
-        generated_at_dt = _parse_iso8601(str(marker_payload.get("generated_at")))
+        generated_at_dt = _parse_iso8601(generated_at)
     except Exception:
         return "marker_malformed", "scope_rollup_marker_malformed", "marker_malformed", False
 

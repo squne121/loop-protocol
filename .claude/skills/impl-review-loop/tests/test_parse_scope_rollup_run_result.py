@@ -16,6 +16,7 @@ import json
 import subprocess
 import sys
 from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Dict
@@ -377,6 +378,36 @@ def test_runner_unavailable_without_identity_field_stops_human():
     del marker["ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1"]["generated_at"]
     result = _run_parser(
         "```yaml\n" + yaml.safe_dump(marker, sort_keys=False).rstrip() + "\n```",
+        expected_script_sha="not-required-for-runner-unavailable",
+        requested_at="2026-06-13T10:00:00+00:00",
+    )
+    assert result["status"] == "marker_malformed"
+    assert result["routing_action"] == "stop_human"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"current_issue": True},
+        {"current_issue": 841.0},
+        {"current_issue": "841"},
+        {"repo": 1805},
+        {"invocation_id": True},
+        {"requested_at": datetime(2026, 6, 13, 10, 0, tzinfo=timezone.utc)},
+        {"generated_at": datetime(2026, 6, 13, 10, 1, tzinfo=timezone.utc)},
+    ],
+)
+def test_runner_unavailable_identity_native_types_must_match_schema(
+    overrides: Dict[str, Any],
+):
+    marker = _render_marker(
+        status="runner_unavailable",
+        include_result=False,
+        include_script_sha=False,
+        overrides=overrides,
+    )
+    result = _run_parser(
+        marker,
         expected_script_sha="not-required-for-runner-unavailable",
         requested_at="2026-06-13T10:00:00+00:00",
     )
