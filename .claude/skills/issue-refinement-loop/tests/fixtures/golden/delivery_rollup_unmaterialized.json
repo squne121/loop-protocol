@@ -79,9 +79,11 @@
   },
   "issue_execution_decision": {
     "completeness": {
-      "dependencies_complete": true,
-      "issues_complete": true,
-      "unresolved_references": []
+      "dependencies_complete": false,
+      "issues_complete": false,
+      "unresolved_references": [
+        3
+      ]
     },
     "downstream_policy": {
       "freshness_validation": "required",
@@ -89,20 +91,20 @@
       "stale_action": "rerun_issue_refinement"
     },
     "execution": {
-      "defer_reason": null,
+      "defer_reason": "scope rollup evidence incomplete (scope_rollup_artifact_absent); rerun issue-refinement-loop",
       "predecessors": [],
-      "state": "selected",
+      "state": "deferred",
       "target_issue_number": 3
     },
     "identity": {
-      "collection_digest": "sha256:45ba21abf38c8e85810d1a7d288ac4fb810cbbee61a6f579200cef37698110cd",
+      "collection_digest": "sha256:12a680895822c501d9605c1f3ac77151b54bddd987f7385df945ed415074ea5e",
       "generated_at": "2025-05-25T12:00:00+00:00",
-      "target_body_sha256": "sha256:d180549c195d0769a61643212055c6ab126f09368fc7bdc29e62f9cd26a7d2bb",
+      "target_body_sha256": "sha256:d0034240a7b45b4855e3188520c952c3169aaaa5d74549f79a804f63448cc9b7",
       "target_issue_number": 3
     },
     "nodes": [
       {
-        "body_sha256": "sha256:d180549c195d0769a61643212055c6ab126f09368fc7bdc29e62f9cd26a7d2bb",
+        "body_sha256": "sha256:d0034240a7b45b4855e3188520c952c3169aaaa5d74549f79a804f63448cc9b7",
         "issue_number": 3
       }
     ],

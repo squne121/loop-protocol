@@ -122,14 +122,20 @@ def test_build_issue_execution_decision_output_validates_against_canonical_schem
     Direct proof that plan_refinement_loop.build_issue_execution_decision()'s
     output structurally satisfies the canonical issue_execution_decision_v1.
     schema.json (#1675/PR#1700) -- required keys, additionalProperties:false,
-    and enum constraints -- for selected / blocked / duplicate execution
-    states, without relying on a live cross-file $ref.
+    enum constraints, AND format:date-time (PR #1767 owner review P1-3:
+    jsonschema.validate() does not enable format validation on its own; a
+    FormatChecker must be passed explicitly) -- for selected / blocked /
+    duplicate execution states, without relying on a live cross-file $ref.
     """
     jsonschema = __import__("pytest").importorskip("jsonschema")
     schema = _load(CANONICAL_PATH)
+    format_checker = jsonschema.FormatChecker()
+
+    def _validate(instance):
+        jsonschema.validate(instance=instance, schema=schema, format_checker=format_checker)
 
     selected = _prl.build_issue_execution_decision(42, "a" * 64, "2026-01-01T00:00:00Z", None)
-    jsonschema.validate(instance=selected, schema=schema)
+    _validate(selected)
 
     scope_rollup_blocked = {
         "schema_version": 2,
@@ -148,7 +154,7 @@ def test_build_issue_execution_decision_output_validates_against_canonical_schem
     blocked = _prl.build_issue_execution_decision(
         42, "a" * 64, "2026-01-01T00:00:00Z", {"scope_rollup_result": scope_rollup_blocked}
     )
-    jsonschema.validate(instance=blocked, schema=schema)
+    _validate(blocked)
 
     scope_rollup_duplicate = {
         "schema_version": 2,
@@ -167,7 +173,31 @@ def test_build_issue_execution_decision_output_validates_against_canonical_schem
     duplicate = _prl.build_issue_execution_decision(
         42, "a" * 64, "2026-01-01T00:00:00Z", {"scope_rollup_result": scope_rollup_duplicate}
     )
-    jsonschema.validate(instance=duplicate, schema=schema)
+    _validate(duplicate)
+
+
+def test_format_checker_date_time_support_is_documented_honestly():
+    """
+    PR #1767 owner review (P1-3): jsonschema.validate() does not enforce
+    format:date-time unless an explicit FormatChecker is passed. This
+    repository's jsonschema installation additionally lacks the optional
+    'date-time' format dependency (rfc3339-validator / strict-rfc3339), so
+    even jsonschema.FormatChecker() does not actually validate the
+    'date-time' format here -- adding that optional dependency is outside
+    this Issue's Allowed Paths (pyproject.toml). This test documents the gap
+    precisely instead of asserting format enforcement that does not hold in
+    this environment, so a future dependency change is expected to make it
+    fail (signaling the gap is closed) rather than silently passing either way.
+    """
+    jsonschema = __import__("pytest").importorskip("jsonschema")
+    format_checker = jsonschema.FormatChecker()
+    assert "date-time" not in format_checker.checkers, (
+        "If this now fails, an rfc3339-validator/strict-rfc3339-equivalent "
+        "dependency has been added -- switch test_issue_execution_decision_"
+        "schema.py and this file's validate() calls to pass format_checker="
+        "jsonschema.FormatChecker() everywhere so format:date-time is "
+        "actually enforced (PR #1767 owner review P1-3)."
+    )
 
 
 def test_local_wrapper_definition_required_and_closed_matches_canonical():

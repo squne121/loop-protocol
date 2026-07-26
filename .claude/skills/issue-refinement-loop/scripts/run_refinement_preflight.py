@@ -143,6 +143,8 @@ BLOCKER_REWRITE_CONSTRAINTS_NOT_JSON_SERIALIZABLE = "REWRITE_CONSTRAINTS_NOT_JSO
 BLOCKER_REWRITE_CONSTRAINTS_INVARIANT_VIOLATION = "REWRITE_CONSTRAINTS_INVARIANT_VIOLATION"
 BLOCKER_PLANNER_FAIL_CLOSED_PAYLOAD_INVALID = "planner_fail_closed_payload_invalid"
 BLOCKER_ARTIFACT_PROJECTION_MISMATCH = "ARTIFACT_PROJECTION_MISMATCH"
+BLOCKER_ISSUE_EXECUTION_DECISION_INVALID = "ISSUE_EXECUTION_DECISION_INVALID"
+BLOCKER_ISSUE_EXECUTION_DECISION_VALIDATOR_UNAVAILABLE = "ISSUE_EXECUTION_DECISION_VALIDATOR_UNAVAILABLE"
 
 
 def _render_artifact_projection_lines(artifacts: dict[str, str]) -> list[str]:
@@ -2059,6 +2061,22 @@ def run_preflight(
     commands = _commands_from_plan(plan, issue_number, repo)
 
     # Planner blockers
+    # #1677 AC12 (PR #1767 owner review, P0-4): actually invoke the shared
+    # semantic validator here instead of importing it unused. A missing
+    # validator import or a semantically invalid issue_execution_decision
+    # blocks the preflight rather than silently passing plan.
+    _issue_execution_decision = plan.get("issue_execution_decision")
+    if isinstance(_issue_execution_decision, dict):
+        if validate_issue_execution_decision is None:
+            blockers.append(BLOCKER_ISSUE_EXECUTION_DECISION_VALIDATOR_UNAVAILABLE)
+        else:
+            _ied_violations = validate_issue_execution_decision(_issue_execution_decision)
+            if _ied_violations:
+                blockers.append(
+                    f"{BLOCKER_ISSUE_EXECUTION_DECISION_INVALID}: "
+                    + ", ".join(_ied_violations)
+                )
+
     if planner_exit_code == 2:
         blockers.append(BLOCKER_PLANNER_INVALID_INPUT)
     elif planner_exit_code == 3:

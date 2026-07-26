@@ -23,8 +23,23 @@ import plan_refinement_loop as prl  # noqa: E402
 SHA = "sha256:" + "a" * 64
 
 
+def _recompute_digest(decision: dict) -> str:
+    """Mirror plan_refinement_loop's collection_digest formula (P0-3.3 scope)."""
+    return prl._sha256_prefixed(
+        prl._canonical_json(
+            {
+                "nodes": decision["nodes"],
+                "relations": decision["relations"],
+                "execution": decision["execution"],
+                "completeness": decision["completeness"],
+                "downstream_policy": decision["downstream_policy"],
+            }
+        )
+    )
+
+
 def _valid_decision() -> dict:
-    return {
+    decision = {
         "schema_version": "ISSUE_EXECUTION_DECISION_V1",
         "identity": {
             "target_issue_number": 1,
@@ -57,6 +72,8 @@ def _valid_decision() -> dict:
             "unresolved_references": [],
         },
     }
+    decision["identity"]["collection_digest"] = _recompute_digest(decision)
+    return decision
 
 
 def test_given_valid_decision_when_validated_then_no_violations():
@@ -72,6 +89,7 @@ def test_given_selected_state_with_no_predecessors_then_valid():
         "predecessors": [],
         "defer_reason": None,
     }
+    decision["identity"]["collection_digest"] = _recompute_digest(decision)
     assert prl.validate_issue_execution_decision(decision) == []
 
 

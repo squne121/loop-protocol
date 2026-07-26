@@ -523,14 +523,24 @@ def build_loop_state(
     # decision never reaches LOOP_STATE_V1 silently.
     issue_execution_decision = plan.get("issue_execution_decision")
     if isinstance(issue_execution_decision, dict):
-        if validate_issue_execution_decision is not None:
-            _violations = validate_issue_execution_decision(issue_execution_decision)
-            if _violations:
-                blocked.append(
-                    "issue_execution_decision_invalid: "
-                    + ", ".join(_violations)
-                )
-                return None, blocked, None
+        # PR #1767 owner review (P0-4): a missing/failed validator import
+        # must fail-closed, not silently skip semantic validation and pass
+        # the decision through to LOOP_STATE_V1 unchecked.
+        if validate_issue_execution_decision is None:
+            blocked.append(
+                "issue_execution_decision_validator_unavailable: "
+                "validate_issue_execution_decision import failed; refusing "
+                "to project an un-validated issue_execution_decision into "
+                "LOOP_STATE_V1"
+            )
+            return None, blocked, None
+        _violations = validate_issue_execution_decision(issue_execution_decision)
+        if _violations:
+            blocked.append(
+                "issue_execution_decision_invalid: "
+                + ", ".join(_violations)
+            )
+            return None, blocked, None
         loop_state["issue_execution_decision"] = issue_execution_decision
 
     return loop_state, [], scope_signal_guard_decision_v2

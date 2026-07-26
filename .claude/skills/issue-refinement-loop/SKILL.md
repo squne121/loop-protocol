@@ -390,11 +390,15 @@ echo '{
 
 ## ISSUE_EXECUTION_DECISION_V1 ハンドオフ契約 (#1677)
 
-`plan_refinement_loop.py` の `issue_execution_decision`（`ISSUE_EXECUTION_DECISION_V1`）は `build_loop_state.py` → `LOOP_HANDOFF_RESULT_V1.issue_execution_decision_ref` → termination report まで同一 digest（`identity.collection_digest`）で到達する。normative semantic validator は `plan_refinement_loop.validate_issue_execution_decision`（producer/`build_loop_state.py`/handoff/termination report/downstream consumer が共通利用、test 専用実装への依存禁止）。
+**現在 production 接続済みの契約**（PR #1767 owner review 反映後）: `plan_refinement_loop.py` が `issue_execution_decision`（`ISSUE_EXECUTION_DECISION_V1`）を生成し、`plan_refinement_loop.validate_issue_execution_decision` で自己検証する（違反時は digest を再計算した安全な `deferred` shape へ fallback、fallback 自体も再検証する）。`run_refinement_preflight.py` は同じ validator を実際に呼び出し、import 失敗または semantic violation を preflight blocker にする（fail-closed、import-failure による silent skip は禁止）。`build_loop_state.py` も同じ validator を呼び、import 失敗時は `LOOP_STATE_V1` への投影を拒否する（fail-closed）。
+
+**未接続（このIssueのスコープ外として残っている契約）**: `LOOP_HANDOFF_RESULT_V1.issue_execution_decision_ref` を production code が LOOP_STATE から自動生成する経路、termination report renderer/publisher 側での cross-check、`REFINEMENT_LOOP_PLAN_V1`/`LOOP_STATE_V1` の required 化、standalone `scripts/validate_issue_execution_decision.py` としての配布は未実装。現状 validator は `plan_refinement_loop.py` 内の関数であり、handoff ref の組み立てはテストが手動で行っている。
 
 downstream skill（impl-review-loop・implement-issue・issue-contract-review・open-pr）は `downstream_policy`（`semantic_reclassification: forbidden` / `freshness_validation: required` / `stale_action: rerun_issue_refinement`）に従い、semantic relation を再分類しない。stale 検出時は issue-refinement-loop を再実行する。
 
-legacy `graph.nodes/graph.edges` + `execution.target_state` からの移行は `dual_write | equivalence | dual_read | new_authoritative | legacy_removed` phase で管理し、`equivalence` phase の digest 不一致は fail-closed とする。詳細は `references/refinement-loop-plan-output.md` の `issue_execution_decision` 節を参照する。
+**semantic relation の情報源について**: `ISSUE_SCOPE_ROLLUP_PLAN_V2` は coordination plan であり semantic dependency graph ではない。方向未確定の `sequential_required` や `merge_into_current_pr` 等の suggested_action は、depends_on/duplicate/absorb relation へ自動変換しない（誤変換は PR #1767 owner review で指摘され撤去済み）。`proceed_with_coordination` のみ非committal な `coordinates` relation に変換する。それ以外の曖昧な signal は `execution.state: deferred` にして human 判断を要求する。genuine な `depends_on`/`duplicate`/`absorb` は GitHub native dependency・明示的 duplicate marker・方向付き Machine-Readable Contract から構築する設計を予定しているが、この結線は未実装（follow-up）。
+
+legacy `graph.nodes/graph.edges` + `execution.target_state` からの移行は `dual_write | equivalence | dual_read | new_authoritative | legacy_removed` phase で管理する予定だが、migration envelope（phase/legacy digest/new digest/equivalence result 等）を保持する schema・実行する adapter は未実装（follow-up、`equivalence` phase の digest 不一致 fail-closed も未実装）。詳細は `references/refinement-loop-plan-output.md` の `issue_execution_decision` 節を参照する。
 
 ## 参照マップ (Reference Map)
 

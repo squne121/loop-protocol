@@ -186,11 +186,20 @@ def test_run_preflight_joins_persisted_scope_rollup_artifact(tmp_path):
     # from the persisted planner_input.json, and confirm the digest matches
     # what build_loop_state.py would project from the plan (same source ->
     # same digest end to end, #1677 AC4/AC5).
+    #
+    # PR #1767 owner review (P0-2): SCOPE_ROLLUP_PLAN's candidate has
+    # ordering_constraint=sequential_required, which means "direction
+    # undetermined, human judgment required" -- it must NOT be converted
+    # into a directed depends_on/blocked relation. The join is proven by the
+    # candidate's presence forcing a non-selected outcome (deferred), not by
+    # a fabricated 'blocked' verdict.
     plan, plan_exit_code = prl.plan_refinement_loop(persisted_planner_input)
     assert plan_exit_code == 0
     decision = plan["issue_execution_decision"]
-    assert decision["execution"]["state"] == "blocked"
-    assert decision["execution"]["predecessors"] == [9101]
+    assert decision["execution"]["state"] == "deferred"
+    relation_types = {r["relation_type"] for r in decision["relations"]}
+    assert "depends_on" not in relation_types
+    assert decision["execution"]["predecessors"] == []
     assert prl.validate_issue_execution_decision(decision) == []
 
 
