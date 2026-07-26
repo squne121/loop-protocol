@@ -87,11 +87,28 @@ VC 実行前に静的に弾くカテゴリ:
 
 ### 6) Worktree / Branch preflight（作業ツリー・ブランチ事前確認）
 
-`git worktree list` と branch 競合をチェック（`implement-issue` が使う worktree/branch の命名衝突確認のみ。本 skill 自身は worktree を作らない）。
+`git worktree list` と branch 競合をチェック（`implement-issue` が使う worktree/branch の命名衝突確認のみ。本 skill 自身は worktree を作らない）。`worktree_branch_collision`（命名衝突）は `declared_path_overlap`（OPEN PR の changed-file 名重複）とは別 check であり、混同しない。
+
+### 6.5) declared_path_overlap（OPEN PR changed-file 名重複、advisory のみ、#1680）
+
+`scripts/declared_path_overlap.py` の `compute_declared_path_overlap_for_issue()` が、対象 Issue の Allowed Paths と OPEN PR の changed-file 名（`gh pr diff --name-only` 相当）の単純な重なりを **advisory のみ**で記録する。この check は実 Git merge 競合（3-way merge・hunk 競合・rename/delete 競合）を評価・証明しない。単独では `blocked` にしない — `declared_path_overlap` の結果は `run_contract_review_once.py` の `status`（go/blocked/human_judgment）に一切影響しない。
+
+OPEN PR 一覧の取得は完全性契約（completeness contract）を持つ:
+
+- `state`: 常に `open` 固定
+- `base_ref`: 各 PR エントリが自身の base branch を明示的に保持する
+- `draft_policy`: `include_drafts`（draft PR も inventory に含める）
+- fork PR は `head_repository_owner` / `head_repository_name` / `head_ref_oid` / `is_cross_repository` で識別する
+- GraphQL cursor pagination で `hasNextPage` が `false` になるまで取得し、`totalCount` と `fetched_count` を cross-check する
+- `complete: true|false` フラグを持ち、safety cap（`limit`）に到達しても `hasNextPage` が残る場合は `saturated: true` として `complete: false` に倒す（全件性を証明できない場合は complete を騙らない）
+
+実 Git merge 競合の blocking 判定（`pairwise_merge_conflict`）は本 skill の責務ではない。commit/PR 作成後にのみ評価可能なタイミングで呼ばれる独立 producer（Issue #1792、`PAIRWISE_MERGE_OBSERVATION_V1`）と、その呼び出し元配線（Issue #1793）に分離されている。`issue-contract-review` は worktree/branch/PR を作らず `go` で `implement-issue` に処理を渡して終了する preflight であるため、commit/PR 作成後にのみ評価可能な blocking 判定をこの preflight に混ぜることはできない。
+
+OPEN Issue 重複そのものの再判定は行わない。重複判定は `issue-refinement-loop` の責務であり、`issue-contract-review` は relation / priority を**再判定しない**。OPEN Issue duplicate 候補が存在するだけでは `blocked` にしない。
 
 ### 7) 実行結果の出力
 
-`CONTRACT_REVIEW_RESULT_V1` を `go | blocked` で返却し、`go` の場合のみ `implement-issue` へ handoff。
+`CONTRACT_REVIEW_RESULT_V1` を `go | blocked` で返却し、`go` の場合のみ `implement-issue` へ handoff。`generated_at` を含む freshness 判定（contract snapshot / body hash / generated_at）は本 Issue（#1680）で変更しない — 既存挙動のまま維持する。
 
 ## Output Contract（最小）
 
@@ -140,8 +157,19 @@ VC 実行前に静的に弾くカテゴリ:
 - `ac_verifiability`（受け入れ条件の検証可能性）
 - `product_spec_check`（プロダクト仕様確認）
 - `worktree_branch_collision`（作業ツリー・ブランチ衝突）
+- `declared_path_overlap`（OPEN PR の changed-file 名重複、advisory のみ。単独では blocking にしない。#1680）
 - `next_action`（次のアクション）
 - `blocked_reasons`（ブロック理由）
+
+## Schema Change Applicability（スキーマ変更適用性）
+
+本 skill の `CONTRACT_REVIEW_RESULT_V1.checks` / `CONTRACT_REVIEW_ONCE_RESULT_V1.checks` へのフィールド追加は、原則として Stop Conditions（「In Scope の固定契約（キー集合・スキーマ・型定義）の変更が必要になった場合」）により一度停止する。ただし Issue #1680 は `declared_path_overlap` の追加を `additive_fields` として明示的に許可する（`unknown_fields_allowed_by_legacy_consumers: true`）。additive schema change は次を満たす場合に限り Stop Conditions と矛盾しない。
+
+- 追加フィールドが既存フィールドの意味・型を変更しない
+- 追加フィールドが `advisory` のみで `status`（go/blocked/human_judgment）の決定に影響しない
+- 追加フィールドを消費しない既存 consumer が unknown field を無視できる（後方互換）
+
+`pairwise_merge_conflict`（実 Git merge 競合、blocking）は本 Issue のスキーマ変更対象に含めない。別スキーマ（`PAIRWISE_MERGE_OBSERVATION_V1`、Issue #1792）に分離されており、本 skill の checks へは追加しない。
 
 `vc_preflight` は各 classification を保持し、`scope_class`（baseline_fail_expected / regression_gate / pr_review_only / runtime_only）を含める。
 
