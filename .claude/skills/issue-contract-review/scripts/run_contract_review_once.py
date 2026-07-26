@@ -393,13 +393,22 @@ def run_once(
             result["errors"].append(f"idempotency_check_error: {id_err}")
             # non-fatal: continue
         elif existing_go:
-            # Already has a valid go comment — return deduped
+            # Already has a valid go comment — return deduped.
+            # P0-2 (#1794 PR review): declared_path_overlap observes the
+            # *live* OPEN PR set, which can change at any time independent
+            # of the issue body. It must therefore be recomputed fresh on
+            # every reuse rather than replayed from the saved comment's
+            # checks -- a saved value would go stale immediately. This is
+            # advisory-only: recomputing it here never changes result["status"].
             result["status"] = "go"
             result["source"] = "existing_go_comment"
             result["go_comment_url"] = existing_url
             result["idempotency_check"]["deduped"] = True
             checks = existing_go.get("inner", {}).get("checks", {})
             result["checks"]["product_spec_check"] = checks.get("product_spec_check")
+            result["checks"]["declared_path_overlap"] = _run_declared_path_overlap_check(
+                issue_number, repo
+            )
             return result
 
     # Step 2: contract_readiness_check.py (static check)
@@ -649,6 +658,26 @@ def run_once(
 # ---------------------------------------------------------------------------
 
 
+# P0-3 (#1794 PR review): base branch this repo's contract review targets.
+# Passed explicitly to compute_declared_path_overlap_for_issue() so the
+# OPEN PR inventory is scoped to the same base branch as the Allowed Paths
+# review, instead of leaving base_ref unset (P1-3).
+_DECLARED_PATH_OVERLAP_BASE_REF = "main"
+
+
+def _unavailable_declared_path_overlap_result(reason: str) -> dict[str, Any]:
+    return {
+        "schema": "declared_path_overlap/v1",
+        "advisory": True,
+        "blocking": False,
+        "decision": "unavailable",
+        "disjoint": None,
+        "overlapping_prs": [],
+        "inventory": None,
+        "errors": [reason],
+    }
+
+
 def _run_declared_path_overlap_check(issue_number: int, repo: str) -> dict[str, Any]:
     """
     declared_path_overlap (Issue #1680): OPEN PR の changed-file 名と対象
@@ -659,32 +688,51 @@ def _run_declared_path_overlap_check(issue_number: int, repo: str) -> dict[str, 
     PAIRWISE_MERGE_OBSERVATION_V1 producer と、その呼び出し元配線
     Issue #1793 に分離済み）。単独では blocking にしない — 呼び出し側
     (run_once) はこの check の結果によって status を変えてはならない。
+
+    P0-3 (#1794 PR review): the producer call (dynamic import +
+    compute_declared_path_overlap_for_issue()) runs BEFORE result["status"]
+    is set to "go" in run_once(). An uncaught exception here previously
+    propagated out of run_once() entirely, losing the CLI's JSON stdout
+    contract. The whole producer call is now isolated in a try/except so
+    any internal failure degrades to an advisory "unavailable" result
+    instead of crashing the caller.
     """
     try:
-        from declared_path_overlap import compute_declared_path_overlap_for_issue
-    except ImportError:
-        import importlib.util
+        try:
+            from declared_path_overlap import compute_declared_path_overlap_for_issue
+        except ImportError:
+            import importlib.util
 
-        spec = importlib.util.spec_from_file_location(
-            "declared_path_overlap", _SCRIPTS_DIR / "declared_path_overlap.py"
+            spec = importlib.util.spec_from_file_location(
+                "declared_path_overlap", _SCRIPTS_DIR / "declared_path_overlap.py"
+            )
+            if spec is None or spec.loader is None:
+                return _unavailable_declared_path_overlap_result("module_load_error")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)  # type: ignore[union-attr]
+            compute_declared_path_overlap_for_issue = module.compute_declared_path_overlap_for_issue
+
+        overlap_result = compute_declared_path_overlap_for_issue(
+            issue_number, repo, base_ref=_DECLARED_PATH_OVERLAP_BASE_REF
         )
-        if spec is None or spec.loader is None:
-            return {
-                "schema": "declared_path_overlap/v1",
-                "advisory": True,
-                "blocking": False,
-                "decision": "unavailable",
-                "disjoint": None,
-                "overlapping_prs": [],
-                "inventory": None,
-                "errors": ["module_load_error"],
-            }
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-        compute_declared_path_overlap_for_issue = module.compute_declared_path_overlap_for_issue
-
-    overlap_result = compute_declared_path_overlap_for_issue(issue_number, repo)
+        if not isinstance(overlap_result, dict):
+            overlap_result = _unavailable_declared_path_overlap_result(
+                "declared_path_overlap_non_dict_result"
+            )
+    except Exception as exc:
+        overlap_result = {
+            "schema": "declared_path_overlap/v1",
+            "advisory": True,
+            "blocking": False,
+            "decision": "unavailable",
+            "disjoint": None,
+            "overlapping_prs": [],
+            "inventory": None,
+            "errors": [
+                f"declared_path_overlap_internal_exception: {type(exc).__name__}: {exc}"
+            ],
+        }
 
     # advisory-only の契約を呼び出し側で防御的に強制する: この check が
     # どのような結果を返しても blocking にしてはならない。将来の実装ミスで

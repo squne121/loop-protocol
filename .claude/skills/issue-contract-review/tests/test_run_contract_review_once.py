@@ -470,6 +470,75 @@ class TestDeclaredPathOverlapAdvisoryOnly:
             for e in checked["errors"]
         )
 
+    def test_producer_exception_degrades_to_unavailable_advisory(self, monkeypatch):
+        """P0-3: an uncaught exception in the producer must not propagate out of
+        _run_declared_path_overlap_check (and therefore not out of run_once(),
+        which calls this before result["status"] is set to "go")."""
+
+        def raise_boom(*args, **kwargs):
+            raise RuntimeError("boom: transient gh failure")
+
+        with patch(
+            "declared_path_overlap.compute_declared_path_overlap_for_issue",
+            create=True,
+            side_effect=raise_boom,
+        ):
+            checked = _rcr_mod._run_declared_path_overlap_check(_ISSUE_NUMBER, _REPO)
+
+        assert checked["advisory"] is True
+        assert checked["blocking"] is False
+        assert checked["decision"] == "unavailable"
+        assert checked["disjoint"] is None
+        assert any(
+            "declared_path_overlap_internal_exception" in e for e in checked["errors"]
+        )
+
+    def test_producer_exception_does_not_abort_run_once(self, monkeypatch):
+        """P0-3: run_once() as a whole must still reach status: go and emit its
+        JSON contract even when the declared_path_overlap producer explodes."""
+        run_script_results, shell_results = _make_all_pass_side_effects()
+        run_iter = iter(run_script_results)
+        shell_iter = iter(shell_results)
+
+        def raise_boom(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=lambda *a, **kw: next(run_iter)):
+            with patch.object(_rcr_mod, "_run_shell_script", side_effect=lambda *a, **kw: next(shell_iter)):
+                with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, None)):
+                    with patch(
+                        "declared_path_overlap.compute_declared_path_overlap_for_issue",
+                        create=True,
+                        side_effect=raise_boom,
+                    ):
+                        result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+
+        assert result["status"] == "go"
+        assert result["checks"]["declared_path_overlap"]["decision"] == "unavailable"
+        assert result["checks"]["declared_path_overlap"]["disjoint"] is None
+
+    def test_base_ref_forwarded_to_producer(self, monkeypatch):
+        """P1-3: the wrapper must scope the OPEN PR inventory to the same base
+        branch ("main") as the Allowed Paths review, not leave it unset."""
+        captured = {}
+
+        def fake_compute(issue_number, repo, base_ref=None, **kwargs):
+            captured["issue_number"] = issue_number
+            captured["repo"] = repo
+            captured["base_ref"] = base_ref
+            return _make_declared_path_overlap_result(disjoint=True)
+
+        with patch(
+            "declared_path_overlap.compute_declared_path_overlap_for_issue",
+            create=True,
+            side_effect=fake_compute,
+        ):
+            _rcr_mod._run_declared_path_overlap_check(_ISSUE_NUMBER, _REPO)
+
+        assert captured["base_ref"] == "main"
+        assert captured["issue_number"] == _ISSUE_NUMBER
+        assert captured["repo"] == _REPO
+
 
 class TestStatusRouting:
     """Test that run_once correctly routes based on readiness status."""
@@ -582,13 +651,52 @@ class TestIdempotencyCheck:
         }
 
         with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(existing_go, None)):
-            result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=False)
+            with patch.object(
+                _rcr_mod,
+                "_run_declared_path_overlap_check",
+                return_value=_make_declared_path_overlap_result(disjoint=True),
+            ) as overlap_check:
+                result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=False)
 
         assert result["status"] == "go"
         assert result["source"] == "existing_go_comment"
         assert result["checks"]["product_spec_check"]["schema"] == "product_spec_check/v1"
         assert result["go_comment_url"] == existing_url
         assert result["idempotency_check"]["deduped"] is True
+        # P0-2 (#1794 PR review): declared_path_overlap is a volatile,
+        # OPEN-PR-live observation and must be recomputed fresh even on the
+        # existing-go reuse path, never replayed from the saved comment.
+        overlap_check.assert_called_once_with(_ISSUE_NUMBER, _REPO)
+        assert result["checks"]["declared_path_overlap"]["disjoint"] is True
+
+    def test_existing_go_deduped_recomputes_declared_path_overlap_fresh(self, monkeypatch):
+        """AC (P0-2): reuse path must recompute declared_path_overlap, not replay a
+        stale saved value even when the saved comment carried a different result."""
+        existing_url = f"{_ISSUE_URL}#issuecomment-1002"
+        stale_overlap = _make_declared_path_overlap_result(disjoint=True)
+        existing_go = {
+            "html_url": existing_url,
+            "inner": {
+                "checks": {
+                    "product_spec_check": _make_product_spec_json("pass"),
+                    "declared_path_overlap": stale_overlap,
+                }
+            },
+        }
+        fresh_overlap = _make_declared_path_overlap_result(disjoint=False)
+
+        with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(existing_go, None)):
+            with patch.object(
+                _rcr_mod, "_run_declared_path_overlap_check", return_value=fresh_overlap
+            ) as overlap_check:
+                result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=False)
+
+        overlap_check.assert_called_once_with(_ISSUE_NUMBER, _REPO)
+        # status stays go: declared_path_overlap is advisory only and never
+        # blocks, even when the freshly recomputed value shows an overlap.
+        assert result["status"] == "go"
+        assert result["checks"]["declared_path_overlap"] == fresh_overlap
+        assert result["checks"]["declared_path_overlap"]["disjoint"] is False
 
     def test_idempotency_check_error_non_fatal(self, monkeypatch):
         """Idempotency check error → non-fatal, continue with review."""
