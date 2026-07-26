@@ -39,6 +39,7 @@ from typing import Any
 
 try:
     import jsonschema as _jsonschema
+
     _JSONSCHEMA_AVAILABLE = True
 except ImportError:  # pragma: no cover - defensive
     _jsonschema = None
@@ -79,9 +80,7 @@ ISSUE_EXECUTION_DECISION_DOWNSTREAM_POLICY = {
     "stale_action": "rerun_issue_refinement",
 }
 
-_VALID_RELATION_TYPES = frozenset(
-    {"depends_on", "duplicate", "absorb", "supersedes", "coordinates"}
-)
+_VALID_RELATION_TYPES = frozenset({"depends_on", "duplicate", "absorb", "supersedes", "coordinates"})
 _VALID_EXECUTION_STATES = frozenset({"selected", "deferred", "blocked", "duplicate"})
 _DUPLICATE_LIKE_RELATIONS = frozenset({"duplicate", "absorb"})
 
@@ -100,21 +99,17 @@ def validate_schema(decision: Any) -> list[str]:
         return ["jsonschema_not_available"]
     try:
         schema = _load_schema()
-    except (OSError, json.JSONDecodeError) as exc:
-        return [f"schema_file_unavailable:{exc}"]
-
-    format_checker = _jsonschema.FormatChecker()
-    try:
         validator_cls = _jsonschema.validators.validator_for(schema)
-    except Exception:
-        validator_cls = _jsonschema.Draft202012Validator
-    validator = validator_cls(schema, format_checker=format_checker)
-
-    violations = []
-    for error in validator.iter_errors(decision):
-        path_str = "/".join(str(p) for p in error.path) if error.path else "<root>"
-        violations.append(f"schema_violation:{path_str}:{error.message}")
-    return violations
+        validator_cls.check_schema(schema)
+        format_checker = _jsonschema.FormatChecker()
+        validator = validator_cls(schema, format_checker=format_checker)
+        violations = []
+        for error in validator.iter_errors(decision):
+            path_str = "/".join(str(p) for p in error.path) if error.path else "<root>"
+            violations.append(f"schema_violation:{path_str}:{error.message}")
+        return violations
+    except Exception as exc:
+        return [f"schema_validation_error:{type(exc).__name__}:{str(exc)[:500]}"]
 
 
 def _is_valid_issue_number(value: Any) -> bool:
@@ -203,9 +198,7 @@ def _validate_semantics_impl(decision: dict[str, Any]) -> list[str]:
     # Relation types that are mutually exclusive on the same unordered node
     # pair -- a pair cannot simultaneously be e.g. duplicate AND depends_on,
     # or duplicate AND supersedes (PR #1767 owner review, P1-1).
-    _mutually_exclusive_relations = frozenset(
-        {"depends_on", "duplicate", "absorb", "supersedes"}
-    )
+    _mutually_exclusive_relations = frozenset({"depends_on", "duplicate", "absorb", "supersedes"})
 
     for r in relations:
         if not isinstance(r, dict):
@@ -241,9 +234,7 @@ def _validate_semantics_impl(decision: dict[str, Any]) -> list[str]:
     for pair, rtypes in seen_unordered_pairs.items():
         exclusive_hits = rtypes & _mutually_exclusive_relations
         if len(exclusive_hits) > 1:
-            violations.append(
-                f"conflicting_parallel_edge:{sorted(pair)}:{sorted(exclusive_hits)}"
-            )
+            violations.append(f"conflicting_parallel_edge:{sorted(pair)}:{sorted(exclusive_hits)}")
 
     # --- depends_on cycle detection (general graph, not just pairwise) ---
     adjacency: dict[int, list[int]] = {}
@@ -294,12 +285,8 @@ def _validate_semantics_impl(decision: dict[str, Any]) -> list[str]:
     # before X proceeds). Predecessors of execution.target_issue_number are
     # therefore the *targets* of depends_on edges whose *source* is the
     # execution target (i.e. what the target issue itself depends on).
-    expected_predecessors = sorted(
-        {tgt for (src, tgt) in depends_on_edges if src == target}
-    )
-    predecessors_valid = isinstance(predecessors, list) and all(
-        _is_valid_issue_number(p) for p in predecessors
-    )
+    expected_predecessors = sorted({tgt for (src, tgt) in depends_on_edges if src == target})
+    predecessors_valid = isinstance(predecessors, list) and all(_is_valid_issue_number(p) for p in predecessors)
     if not predecessors_valid:
         violations.append("malformed_predecessors")
     elif sorted(set(predecessors)) != expected_predecessors:
@@ -311,11 +298,7 @@ def _validate_semantics_impl(decision: dict[str, Any]) -> list[str]:
     issues_complete = completeness.get("issues_complete")
     dependencies_complete = completeness.get("dependencies_complete")
     unresolved_references = completeness.get("unresolved_references")
-    incomplete = (
-        issues_complete is not True
-        or dependencies_complete is not True
-        or bool(unresolved_references)
-    )
+    incomplete = issues_complete is not True or dependencies_complete is not True or bool(unresolved_references)
 
     # P1-1: unresolved_references node correspondence -- every referenced
     # issue number must at least be a known node (otherwise it references
@@ -395,6 +378,7 @@ def _validate_semantics_impl(decision: dict[str, Any]) -> list[str]:
 
     return violations
 
+
 # ---------------------------------------------------------------------------
 # Combined schema-first validator (backward-compatible entry point; PR #1767
 # owner review P1-1: semantics are only evaluated once the schema itself is
@@ -433,9 +417,7 @@ LEGACY_SCHEMA_IDENTIFIERS = [
     "execution.target_state/predecessor_issue_numbers/reason_codes",
 ]
 
-MIGRATION_PHASES = frozenset(
-    {"dual_write", "equivalence", "dual_read", "new_authoritative", "legacy_removed"}
-)
+MIGRATION_PHASES = frozenset({"dual_write", "equivalence", "dual_read", "new_authoritative", "legacy_removed"})
 
 
 def adapt_legacy_graph_to_v1(
@@ -608,9 +590,7 @@ def validate_migration(envelope: Any) -> list[str]:
 
     recomputed = compute_equivalence(legacy_digest, new_digest)
     if equivalence_result != recomputed:
-        violations.append(
-            f"equivalence_result_mismatch:declared={equivalence_result}:recomputed={recomputed}"
-        )
+        violations.append(f"equivalence_result_mismatch:declared={equivalence_result}:recomputed={recomputed}")
 
     if phase == "equivalence" and recomputed != "equivalent":
         violations.append("equivalence_phase_digest_mismatch_fail_closed")
@@ -632,9 +612,7 @@ def build_provenance(
 ) -> dict[str, Any]:
     """Build the additive `provenance` block (#1677 AC10)."""
     source_manifest_sha256 = (
-        _sha256_prefixed(_canonical_json(scope_rollup_result))
-        if isinstance(scope_rollup_result, dict)
-        else None
+        _sha256_prefixed(_canonical_json(scope_rollup_result)) if isinstance(scope_rollup_result, dict) else None
     )
     return {
         "policy_version": policy_version,
