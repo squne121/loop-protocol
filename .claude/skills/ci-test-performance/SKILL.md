@@ -138,14 +138,14 @@ CI_TEST_PERFORMANCE_DECISION_V1:
 
 ## Target Policy（#1063/#1064 以降の目標ポリシー）
 
-- ruff check . （#1063 で導入済み）
+- uv run --locked ruff check .claude/scripts scripts schemas .claude/skills （#1063 で導入済み）
 - pytest -n auto （#1064 で導入済み。worker 数・scheduler は `.github/ci/python-test-plan.json` で集中管理）
 
 ### Ruff 使用に関する注意
 
 ```bash
 # 正しい使用法
-uv run --locked ruff check --select E,F .claude/scripts scripts schemas .claude/skills
+uv run --locked ruff check .claude/scripts scripts schemas .claude/skills
 
 # 禁止
 ruff check --fix      # 自動修正禁止（コードの意図を変える可能性）
