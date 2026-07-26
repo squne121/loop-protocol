@@ -23,6 +23,21 @@ on:
         type: boolean
         required: true
         default: true
+      # Issue #1415 P0-C fix_delta: the v3 dual-target bundle has no
+      # execution_boundary field of its own (unlike v2, whose trust
+      # allowlist is embedded in the manifest at generation time), so the
+      # trusted-actor allowlist must come from somewhere other than
+      # `github.triggering_actor` -- otherwise whoever dispatches this
+      # workflow could self-register as the trusted actor. This input is a
+      # separate, explicit, auditable value (visible in the workflow run's
+      # recorded inputs) distinct from the authenticated dispatching
+      # identity below. It only affects the v3 branch; the v2 branch's
+      # trust boundary (manifest-embedded allowlist) is unchanged.
+      trusted_actor:
+        description: Trusted actor login for v3 dual-target posting (must differ from the dispatching actor's self-registration; defaults to the repository owner)
+        type: string
+        required: false
+        default: 'squne121'
   pull_request:
     paths:
       - package.json
@@ -112,6 +127,11 @@ jobs:
       # input was a self-reported string never bound to any authenticated
       # identity.
       CURRENT_ACTOR: ${{ github.triggering_actor }}
+      # Issue #1415 P0-C fix_delta: deliberately NOT `github.triggering_actor`
+      # (see the `trusted_actor` input above) -- keeping these two env vars
+      # distinct is the actual fix; do not collapse them back to the same
+      # source.
+      TRUSTED_ACTOR: ${{ inputs.trusted_actor }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -182,11 +202,20 @@ jobs:
         if: ${{ inputs.manifest_json_path != '' && !inputs.dry_run }}
         run: pnpm retro-live-verification:verify -- --manifest-json "$MANIFEST_PATH"
 
-      # Issue #1415 P0-3 fix_delta: the v3 dual-target counterpart. Trust is
-      # bound to the same authenticated `github.triggering_actor`; there is
-      # no separate trusted-actor input to keep this consistent with the v2
-      # branch above rather than accepting a free-text allowlist from the
-      # dispatch caller.
+      # Issue #1415 P0-3 fix_delta (superseded by P0-C fix_delta below): the
+      # v3 dual-target counterpart. `--trusted-actor` now comes from the
+      # `trusted_actor` workflow input (see env.TRUSTED_ACTOR above), not
+      # from the same authenticated `github.triggering_actor` used for
+      # `--current-actor` -- reusing one value for both defeated the purpose
+      # of having a separate trust boundary (whoever dispatched the run
+      # could otherwise self-register as trusted).
       - name: Post canonical retro-live-verification comment (v3 dual-target)
         if: ${{ inputs.dual_target_manifest_json_path != '' }}
-        run: pnpm retro-live-verification:post -- --dual-target-manifest-json "$DUAL_TARGET_MANIFEST_PATH" --current-actor "$CURRENT_ACTOR" --trusted-actor "$CURRENT_ACTOR" --dry-run "$DRY_RUN"
+        run: pnpm retro-live-verification:post -- --dual-target-manifest-json "$DUAL_TARGET_MANIFEST_PATH" --current-actor "$CURRENT_ACTOR" --trusted-actor "$TRUSTED_ACTOR" --dry-run "$DRY_RUN"
+
+      # Issue #1415 P0-A fix_delta: the v2 branch above re-verifies the
+      # posted comment live; the v3 branch previously had no equivalent
+      # step, so a broken/incomplete post could land without being caught.
+      - name: Verify canonical comment landed correctly (v3 dual-target)
+        if: ${{ inputs.dual_target_manifest_json_path != '' && !inputs.dry_run }}
+        run: pnpm retro-live-verification:verify -- --schema retro_live_verification/v3 --input "$DUAL_TARGET_MANIFEST_PATH" --live true --require-live true

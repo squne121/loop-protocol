@@ -45,6 +45,17 @@ FENCE_PATTERN = re.compile(r"^(```|~~~)")
 HEADING_PATTERN = re.compile(r"^##\s+(.+?)\s*$")
 YAML_FENCE_PATTERN = re.compile(r"^```(?:yaml|yml)?\s*$", re.IGNORECASE)
 YAML_BLOCK_MARKER = "SAFETY_CLAIMS_V1"
+OVERLAP_GATE_BYPASS_YAML_MARKER = "OVERLAP_GATE_BYPASS_V1"
+OVERLAP_GATE_BYPASS_TRIGGER_PATTERN = re.compile(
+    r"(?is)(?:overlap.{0,400}?\b(?:C2a|C3)\b.{0,400}?(?:\bbypass\b|バイパス|経由せず|直接実行)"
+    r"|(?:\bbypass\b|バイパス|経由せず|直接実行).{0,400}?overlap.{0,400}?\b(?:C2a|C3)\b)"
+)
+OVERLAP_GATE_BYPASS_REQUIRED_KEYS = (
+    "bypass_reason",
+    "approver",
+    "independent_verification_basis",
+    "bypassed_gate_class",
+)
 FOLLOW_UP_PATTERN = re.compile(r"#\d+")
 
 
@@ -201,6 +212,125 @@ def _extract_safety_claims_yaml(content: str) -> tuple[str | None, int | None, i
         if in_yaml:
             collected.append(line)
     return None, None, None
+
+
+def _extract_overlap_gate_bypass_yaml(body: str) -> tuple[str | None, int | None, int | None]:
+    """Scan the entire PR body (not scoped to a single section) for a fenced
+    YAML block carrying the OVERLAP_GATE_BYPASS_V1 marker or top-level key."""
+    lines = body.splitlines()
+    in_yaml = False
+    collected: list[str] = []
+    start_line = None
+    for idx, line in enumerate(lines, 1):
+        if not in_yaml and YAML_FENCE_PATTERN.match(line.strip()):
+            in_yaml = True
+            start_line = idx + 1
+            collected = []
+            continue
+        if in_yaml and line.strip() == "```":
+            block = "\n".join(collected)
+            if re.search(
+                rf"(?m)^{re.escape(OVERLAP_GATE_BYPASS_YAML_MARKER)}:\s*$", block
+            ) or re.search(
+                r"(?m)^bypass_reason:\s*\S", block
+            ):
+                return block, start_line, idx - 1
+            in_yaml = False
+            collected = []
+            start_line = None
+            continue
+        if in_yaml:
+            collected.append(line)
+    return None, None, None
+
+
+def _validate_overlap_gate_bypass(body: str) -> list[ValidationError]:
+    """LP059 / E_OVERLAP_GATE_BYPASS_*: when a PR body indicates that the
+    open_pr.py hard overlap gate (C2a closed_predecessor / C3
+    parent_child_collision) was intentionally bypassed to run `gh pr create`
+    directly, require a fenced OVERLAP_GATE_BYPASS_V1 YAML record with the
+    required accountability keys (Issue #1776)."""
+    if not OVERLAP_GATE_BYPASS_TRIGGER_PATTERN.search(body):
+        return []
+    yaml_block, line_start, line_end = _extract_overlap_gate_bypass_yaml(body)
+    if yaml_block is None:
+        return [_error(
+            body,
+            "LP059",
+            "Notes",
+            1,
+            1,
+            "PR body indicates an overlap gate (C2a/C3) bypass but no "
+            "OVERLAP_GATE_BYPASS_V1 fenced YAML record was found.",
+            "Add a fenced ```yaml``` block with OVERLAP_GATE_BYPASS_V1 keys: "
+            "bypass_reason, approver, independent_verification_basis, "
+            "bypassed_gate_class (C2a|C3), and optional precedent_refs[]."
+        )]
+    line_start = line_start or 1
+    line_end = line_end or line_start
+    try:
+        payload = yaml.safe_load(yaml_block)
+    except yaml.YAMLError as exc:
+        return [_error(
+            body,
+            "E_OVERLAP_GATE_BYPASS_SCHEMA_INVALID",
+            "Notes",
+            line_start,
+            line_end,
+            f"OVERLAP_GATE_BYPASS_V1 YAML parse failed: {exc}",
+            "Use yaml.safe_load-compatible YAML for the OVERLAP_GATE_BYPASS_V1 block."
+        )]
+    if not isinstance(payload, dict):
+        return [_error(
+            body,
+            "E_OVERLAP_GATE_BYPASS_SCHEMA_INVALID",
+            "Notes",
+            line_start,
+            line_end,
+            "OVERLAP_GATE_BYPASS_V1 block must be a YAML mapping.",
+            "Provide OVERLAP_GATE_BYPASS_V1 as a mapping with the required keys."
+        )]
+    if (
+        set(payload.keys()) == {OVERLAP_GATE_BYPASS_YAML_MARKER}
+        and isinstance(payload[OVERLAP_GATE_BYPASS_YAML_MARKER], dict)
+    ):
+        payload = payload[OVERLAP_GATE_BYPASS_YAML_MARKER]
+    for key in OVERLAP_GATE_BYPASS_REQUIRED_KEYS:
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return [_error(
+                body,
+                "E_OVERLAP_GATE_BYPASS_SCHEMA_INVALID",
+                "Notes",
+                line_start,
+                line_end,
+                f"OVERLAP_GATE_BYPASS_V1.{key} must be a non-empty string.",
+                f"Set {key} to a concrete, non-placeholder value."
+            )]
+    if payload.get("bypassed_gate_class") not in {"C2a", "C3"}:
+        return [_error(
+            body,
+            "E_OVERLAP_GATE_BYPASS_SCHEMA_INVALID",
+            "Notes",
+            line_start,
+            line_end,
+            "OVERLAP_GATE_BYPASS_V1.bypassed_gate_class must be C2a or C3.",
+            "Set bypassed_gate_class to C2a (closed_predecessor) or C3 (parent_child_collision)."
+        )]
+    precedent_refs = payload.get("precedent_refs", []) or []
+    if not isinstance(precedent_refs, list) or not all(
+        isinstance(item, str) and item.strip() for item in precedent_refs
+    ):
+        return [_error(
+            body,
+            "E_OVERLAP_GATE_BYPASS_SCHEMA_INVALID",
+            "Notes",
+            line_start,
+            line_end,
+            "OVERLAP_GATE_BYPASS_V1.precedent_refs must be a list of non-empty strings when present.",
+            "Provide precedent_refs as a list of PR/Issue reference strings, or omit the key."
+        )]
+    return []
 
 
 def _error(
@@ -636,6 +766,7 @@ def validate_pr_body(
     errors.extend(_validate_safety_claims_v1_yaml_contract(body, sections))
     errors.extend(_validate_lp057(body, sections, linked_issue))
     errors.extend(_validate_lp058(body, changed_paths))
+    errors.extend(_validate_overlap_gate_bypass(body))
     return ValidationResult("loop_body_lint/v1", "pr", body_sha256, "fail" if errors else "pass", errors)
 
 

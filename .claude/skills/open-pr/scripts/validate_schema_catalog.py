@@ -99,6 +99,14 @@ _COMMAND_REGISTRY: dict[str, dict[str, str]] = {
             "test_validate_ci_performance_assessment_v2.py"
         ),
     },
+    "validate_gemini_grounding_evidence_tests": {
+        "runner": "pytest",
+        "target": ".claude/skills/gemini-cli-headless-delegation/tests/",
+    },
+    "validate_open_pr_body_overlap_gate_bypass_tests": {
+        "runner": "pytest",
+        "target": ".claude/skills/open-pr/tests/",
+    },
 }
 
 ALLOWED_COMMANDS = set(_COMMAND_REGISTRY.keys())

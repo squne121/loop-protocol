@@ -50,7 +50,7 @@ schema:
         properties:
           gate_id:
             type: string
-            enum: [g1, g2, g3, g4, g5]
+            enum: [g1, g2, g3, g4, g5, g6]
             description: "Gate identifier"
           gate_name:
             type: string
@@ -60,6 +60,7 @@ schema:
               - implementation_oracle
               - head_sha_consistency
               - fixture_guard_path_coverage
+              - allowed_paths_gate_producer_role_presence
             description: "Human-readable gate name"
           status:
             type: string

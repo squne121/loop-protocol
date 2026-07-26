@@ -83,6 +83,26 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# #1677 AC4/AC12: reuse plan_refinement_loop.py's normative semantic
+# validator instead of re-implementing ISSUE_EXECUTION_DECISION_V1
+# invariants here. Import is best-effort (subprocess/CLI callers of this
+# module do not require it; only _join_scope_rollup_into_planner_input's
+# self-check below uses it).
+# ---------------------------------------------------------------------------
+
+import sys as _sys_for_import
+
+_sys_for_import.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    # PR #1767 owner review (P0-4/AC12 Scope Delta): import the standalone
+    # canonical module directly rather than re-exporting through
+    # plan_refinement_loop.py, so every consumer shares one authority.
+    from validate_issue_execution_decision import validate_issue_execution_decision
+except ImportError:  # pragma: no cover - defensive fallback
+    validate_issue_execution_decision = None
+
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -126,6 +146,8 @@ BLOCKER_REWRITE_CONSTRAINTS_NOT_JSON_SERIALIZABLE = "REWRITE_CONSTRAINTS_NOT_JSO
 BLOCKER_REWRITE_CONSTRAINTS_INVARIANT_VIOLATION = "REWRITE_CONSTRAINTS_INVARIANT_VIOLATION"
 BLOCKER_PLANNER_FAIL_CLOSED_PAYLOAD_INVALID = "planner_fail_closed_payload_invalid"
 BLOCKER_ARTIFACT_PROJECTION_MISMATCH = "ARTIFACT_PROJECTION_MISMATCH"
+BLOCKER_ISSUE_EXECUTION_DECISION_INVALID = "ISSUE_EXECUTION_DECISION_INVALID"
+BLOCKER_ISSUE_EXECUTION_DECISION_VALIDATOR_UNAVAILABLE = "ISSUE_EXECUTION_DECISION_VALIDATOR_UNAVAILABLE"
 
 
 def _render_artifact_projection_lines(artifacts: dict[str, str]) -> list[str]:
@@ -835,6 +857,52 @@ def _validate_anchor_comments_batch(
 # ---------------------------------------------------------------------------
 # Planner invocation
 # ---------------------------------------------------------------------------
+
+
+
+def _load_scope_rollup_artifact(repo_root: Path, issue_number: int) -> Optional[dict]:
+    """
+    Load a previously-persisted ISSUE_SCOPE_ROLLUP_PLAN_V2 artifact for this
+    Issue, if one exists (#1677 AC4 join). Rerunning plan_issue_scope_rollup.py
+    itself is out of scope here (#1677 Out of Scope); this function only
+    consumes an artifact that a prior preflight step already produced.
+
+    Returns None (non-blocking) when no artifact is present or it fails to
+    parse -- absence of scope-rollup evidence must not block the refinement
+    preflight, it only means the planner falls back to a minimal
+    ISSUE_EXECUTION_DECISION_V1 ('selected', no relations).
+    """
+    artifact_path = _issue_artifact_dir(repo_root, issue_number) / "issue_scope_rollup_plan_v2.json"
+    if not artifact_path.exists():
+        return None
+    try:
+        return json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _join_scope_rollup_into_planner_input(
+    planner_input: dict[str, Any],
+    scope_rollup_plan: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Join an ISSUE_SCOPE_ROLLUP_PLAN_V2 artifact into planner_input's
+    known_context.scope_rollup_result (#1677 AC4).
+
+    plan_refinement_loop.py's build_issue_execution_decision() reads
+    known_context['scope_rollup_result'] to derive ISSUE_EXECUTION_DECISION_V1
+    relations/execution state. Without this join, the planner always emits
+    the minimal 'selected' shape regardless of known collisions.
+
+    Pure function: does not mutate the input dict in place.
+    """
+    if not scope_rollup_plan:
+        return planner_input
+    joined = dict(planner_input)
+    known_context = dict(joined.get("known_context") or {})
+    known_context["scope_rollup_result"] = scope_rollup_plan
+    joined["known_context"] = known_context
+    return joined
 
 
 def _build_planner_input(
@@ -1908,6 +1976,11 @@ def run_preflight(
         anchor_comment_ids=anchor_comment_ids,
         now=now,
     )
+    # #1677 AC4: join a previously-persisted scope-rollup artifact (if any)
+    # into the planner input so ISSUE_EXECUTION_DECISION_V1 reflects known
+    # collisions instead of always defaulting to 'selected'.
+    _scope_rollup_plan = _load_scope_rollup_artifact(repo_root, issue_number)
+    planner_input_dict = _join_scope_rollup_into_planner_input(planner_input_dict, _scope_rollup_plan)
     plan, planner_exit_code, planner_stderr, planner_stdout_raw = _invoke_planner(planner_input_dict)
 
     if plan is None:
@@ -1991,6 +2064,22 @@ def run_preflight(
     commands = _commands_from_plan(plan, issue_number, repo)
 
     # Planner blockers
+    # #1677 AC12 (PR #1767 owner review, P0-4): actually invoke the shared
+    # semantic validator here instead of importing it unused. A missing
+    # validator import or a semantically invalid issue_execution_decision
+    # blocks the preflight rather than silently passing plan.
+    _issue_execution_decision = plan.get("issue_execution_decision")
+    if isinstance(_issue_execution_decision, dict):
+        if validate_issue_execution_decision is None:
+            blockers.append(BLOCKER_ISSUE_EXECUTION_DECISION_VALIDATOR_UNAVAILABLE)
+        else:
+            _ied_violations = validate_issue_execution_decision(_issue_execution_decision)
+            if _ied_violations:
+                blockers.append(
+                    f"{BLOCKER_ISSUE_EXECUTION_DECISION_INVALID}: "
+                    + ", ".join(_ied_violations)
+                )
+
     if planner_exit_code == 2:
         blockers.append(BLOCKER_PLANNER_INVALID_INPUT)
     elif planner_exit_code == 3:

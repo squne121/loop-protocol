@@ -65,6 +65,25 @@ def _load_module() -> types.ModuleType:
 
 app = _load_module()
 
+
+@pytest.fixture(autouse=True)
+def _force_bwrap_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #1779: this file's tests (#1740/#1743 scope) exercise
+    `agy_oauth_token_path` *exposure/reachability* behavior, which is
+    unaffected by `auth_profile` or the new `bwrap`-based read-only
+    enforcement mode. Several tests below iterate `ALL_PROFILES` /
+    `ALL_DENY_PROFILES` (including the security-sensitive `no_tools` /
+    `local_asset_research`) against a *fixture* real-home token file; without
+    pinning `_bwrap_available()` here, whether `materialize_isolated_agy_workspace()`
+    fail-closes (Issue #1779 AC7) would depend on whether the host actually
+    has `bwrap` installed, making this file's pre-existing (#1740/#1743)
+    assertions environment-dependent by accident. Pinning it `True` keeps
+    this file deterministic and focused on its own scope; the fail-closed /
+    degraded-mode *selection logic itself* is covered independently by
+    `test_agy_permission_policy_readonly_boundary.py`.
+    """
+    monkeypatch.setattr(app, "_bwrap_available", lambda: True)
+
 ALL_PROFILES = [
     app.NO_TOOLS_PROFILE,
     app.LOCAL_ASSET_RESEARCH_PROFILE,

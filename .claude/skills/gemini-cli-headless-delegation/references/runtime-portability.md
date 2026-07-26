@@ -396,7 +396,92 @@ child process に親 env をそのまま継承せず、`PATH` / `HOME` / locale 
 - その場合は allowlist 拡張の可否を人間レビューで判断する
 - stdout / stderr sample は redact-before-truncate の順序で保存する
 
-### `materialize_isolated_agy_workspace()` の環境変数 allowlist 拡張（Issue #1726）
+### `materialize_isolated_agy_workspace()` の認証 surface 最小化と read-only 境界（Issue #1779）
+
+#1726 → #1730 → #1740 → #1743 の一連の実装は、「認証が通らない → 仮説 → 追加」の反復で
+5 つの認証 surface（`DBUS_SESSION_BUS_ADDRESS` / `XDG_RUNTIME_DIR` / `GOOGLE_APPLICATION_CREDENTIALS` /
+`gcloud_adc_path` / `agy_oauth_token_path`）を無条件・デフォルトで露出する設計になっていた。
+#1494 に対する敵対的再監査（controlled ablation experiment）の結果、以下が実証された。
+
+```yaml
+AGY_AUTH_ABLATION_V1:
+  decision:
+    oauth_only_sufficient: true
+    dbus_required: false
+    gcloud_adc_required: false
+```
+
+また read-only 境界についても、`_expose_agy_oauth_token_read_only()` は `Path.symlink_to()` のみで
+OS レベルの強制を伴わず、symlink 経由の書込みが実際に成功することが実証された。
+
+```yaml
+AGY_READONLY_BOUNDARY_V1:
+  symlink_write_test:
+    dummy_file_overwritable_via_symlink: true
+  bwrap_available: true
+  ro_bind_poc_result: success
+  decision:
+    readonly_technically_enforced: false
+    recommended_terminology: degraded_symlink_reachability
+    recommended_mechanism: ro_bind
+```
+
+#### `auth_profile`: 認証 surface 最小化（`tool_profile` とは別軸）
+
+`materialize_isolated_agy_workspace(profile, *, auth_profile=AGY_AUTH_PROFILE_MINIMAL)` の
+`auth_profile` 引数（既定値 `AGY_AUTH_PROFILE_MINIMAL`）は、`no_tools` / `local_asset_research` /
+`grounded_research` / `proposal_only` の `tool_profile`（AGY *tool 呼び出し* を制御する軸）とは
+**別軸** のパラメータであり、AGY *認証 surface の到達可能性* のみを制御する。
+
+- `AGY_AUTH_PROFILE_MINIMAL`（既定）: `agy_oauth_token_path` のみを露出する。
+  `DBUS_SESSION_BUS_ADDRESS` / `XDG_RUNTIME_DIR` / `GOOGLE_APPLICATION_CREDENTIALS` は env に含まれず、
+  `gcloud_adc_path` は `None` になる。`AGY_AUTH_ABLATION_V1` により認証成功に必要十分であることが
+  実証済みの surface のみを既定で露出する。
+- `AGY_AUTH_PROFILE_EXTENDED`: #1726 / #1730 が追加した 4 surface（DBus / XDG_RUNTIME_DIR /
+  GOOGLE_APPLICATION_CREDENTIALS / gcloud ADC）を明示的な opt-in として従来どおり露出する。
+  将来これらが必要になる環境を想定し、実装（`_expose_gcloud_adc_read_only()` 等）自体は削除せず維持する。
+
+`run_gemini_headless.py::_run_agy()` / `build_agy_run_context()` は、`auth_profile` を明示指定しない
+限り `AGY_AUTH_PROFILE_MINIMAL` で動作する（既存呼び出し元の挙動を破壊的に変更しない形での既定値変更）。
+
+#### `agy_oauth_token_readonly_mode`: read-only 境界の真正性
+
+`IsolatedAgyWorkspace.agy_oauth_token_readonly_mode` は、`agy_oauth_token_path` の read-only 主張が
+実際にどう担保されているかを明示する（値: `kernel_enforced_ro_bind` | `degraded_symlink_reachability` | `absent`）。
+
+- `kernel_enforced_ro_bind`: `bwrap` が利用可能な環境では、`_build_bwrap_ro_bind_prefix()` が
+  `bwrap --dev-bind / / --tmpfs <dir> --ro-bind <real> <link> -- <command...>` 形の argv prefix を
+  組み立てる。`run_gemini_headless.py::_run_agy()` は、実際に `agy` subprocess を起動する
+  `subprocess.run(command, ...)` 呼び出し箇所のみでこの prefix を `command` へ前置する。これにより
+  トークンファイルへの書込み試行はカーネルレベルで `EROFS`（Read-only file system）となり実際に失敗する
+  （読み取りは成功する）ことを `test_agy_permission_policy_readonly_boundary.py` の hermetic 統合テスト
+  （ダミー fixture、実 credential は使わない）で検証している。
+- `degraded_symlink_reachability`: `bwrap` が利用不可能な環境でのフォールバック。`agy_oauth_token_path`
+  は引き続き到達可能（symlink）だが、OS レベルの read-only 強制は行われない。関数名・戻り値・ログ文字列
+  から「read_only」という未実証の主張は除去し、この用語を明示的に使う。
+- `absent`: 実ホストに `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` が存在しない場合。
+
+`no_tools` / `local_asset_research` プロファイルでは、`bwrap` が利用不可能かつ実トークンファイルが
+存在する場合に `AgyReadOnlyBoundaryError` で fail-closed する（workspace を作らない）。
+`grounded_research` / `proposal_only` は `degraded_symlink_reachability` での続行を許容する。
+`bwrap` が CI 実行環境に存在しない場合でも、実トークンファイルが存在しない（CI の通常状態）限り
+fail-closed は発生せず、CI green は `bwrap` の存在に依存しない。
+
+#### `_WORKSPACE_DENY_GATE_HOOK_SOURCE`: no-op placeholder の明示
+
+AGY 公式ドキュメント（`https://antigravity.google/docs/cli/reference` / `https://antigravity.google/docs/cli/using`、
+#1758 が `toolPermission` 設定を確認したのと同じソース）を #1779 で再調査したが、実際に機能する
+`PreToolCall`/`PreToolUse` 相当のフック機構は確認できなかった。`_WORKSPACE_DENY_GATE_HOOK_SOURCE` は
+モジュール冒頭コメントで no-op placeholder であることを明示するファイルとして生成され続ける。
+tool deny の唯一の実効的な防御機構は、`PROFILE_ALLOWED_TOOLS` ベースの静的 allowlist
+（`resolve_tool_permission()` / `build_workspace_permission_policy()` の `permissions.allow`/`.deny`）である。
+
+### `materialize_isolated_agy_workspace()` の環境変数 allowlist 拡張（Issue #1726、後継 Issue で置換済み）
+
+> **注意（superseded_by: #1779、再検証日時: 2026-07-26）**: 以下は #1726 起票時点の記録として維持するが、
+> `DBUS_SESSION_BUS_ADDRESS` / `XDG_RUNTIME_DIR` は #1779 の `AGY_AUTH_PROFILE_MINIMAL`（既定）では
+> もはや既定で露出されない。`AGY_AUTH_PROFILE_EXTENDED` を明示指定した場合のみ、以下の記述どおりに
+> 動作する。実装自体は削除していない（将来必要になる環境のための opt-in として維持）。
 
 `agy_permission_policy.py` の `materialize_isolated_agy_workspace()` は、`PATH` / `LANG` / `LC_ALL` / `TERM` に加え、
 既存の認証済みセッション（system keyring / dbus secret service）へ子プロセスが到達できるよう
@@ -411,7 +496,11 @@ child process に親 env をそのまま継承せず、`PATH` / `HOME` / locale 
   `true` になった状態で isolated workspace 内から到達性が確認できることを
   `test_agy_permission_policy_env_allowlist.py` の hermetic テスト（モック化した dbus/keyring エンドポイント）で回帰確認する
 
-### `materialize_isolated_agy_workspace()` の gcloud ADC 露出（Issue #1730）
+### `materialize_isolated_agy_workspace()` の gcloud ADC 露出（Issue #1730、後継 Issue で置換済み）
+
+> **注意（superseded_by: #1779、再検証日時: 2026-07-26）**: `gcloud_adc_path` / `GOOGLE_APPLICATION_CREDENTIALS` は
+> #1779 の `AGY_AUTH_PROFILE_MINIMAL`（既定）ではもはや既定で露出されない。
+> `AGY_AUTH_PROFILE_EXTENDED` を明示指定した場合のみ、以下の記述どおりに動作する（実装は維持）。
 
 #1726 で `DBUS_SESSION_BUS_ADDRESS` / `XDG_RUNTIME_DIR` を到達性変数として追加した後も、
 #1494 の live fan-out 実行では全 subtask が `failure_class: "agy_auth_required"` で失敗し続けた。
@@ -438,7 +527,14 @@ child process に親 env をそのまま継承せず、`PATH` / `HOME` / locale 
 - live AGY 実行（`run_fanout()`）が実際に gcloud ADC を使って成功することの動作確認は、本 hermetic 変更の
   スコープ外であり、#1494 の最終 E2E run に委ねる
 
-### `materialize_isolated_agy_workspace()` の agy 独自 OAuth トークンファイル露出（Issue #1740）
+### `materialize_isolated_agy_workspace()` の agy 独自 OAuth トークンファイル露出（Issue #1740、read-only 境界の真正性は後継 Issue で置換済み）
+
+> **注意（superseded_by: #1779、再検証日時: 2026-07-26）**: 露出そのもの（`agy_oauth_token_path`、
+> `auth_profile` に関わらず無条件）は変更していない -- `AGY_AUTH_ABLATION_V1` で認証成功に
+> 必要十分と実証済みの唯一の surface だからである。変更したのは「read only」という *主張の真正性* のみ:
+> 本セクション下部の「symlink として read-only に露出する」という記述は、実際には OS レベルの強制を
+> 伴わない到達可能性の付与にすぎなかった（`AGY_READONLY_BOUNDARY_V1`）。上の
+> 「`agy_oauth_token_readonly_mode`: read-only 境界の真正性」セクションを参照。
 
 #1730 で gcloud ADC 到達性（`$HOME/.config/gcloud` の read-only 露出）を追加した後も、
 #1494 の live fan-out 実行（3 回目の試行）では依然として全 subtask が
