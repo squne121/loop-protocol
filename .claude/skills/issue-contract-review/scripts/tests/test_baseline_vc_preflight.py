@@ -179,7 +179,9 @@ def run_preflight(fixture_file: str, issue_num: int = 999) -> dict:
         ],
         capture_output=True,
         text=True,
-        timeout=90,
+        # #1754: fixture 内の複数 VC の合計実行時間を許容する外側上限。
+        # baseline_vc_preflight.py の command ごとの timeout 仕様は変更しない。
+        timeout=180,
     )
     # C2: exit code は 0, 1, 2, 3 など様々な値
     # JSON parse が成功すれば status フィールドで判定する
