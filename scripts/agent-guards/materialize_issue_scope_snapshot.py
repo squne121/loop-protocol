@@ -340,15 +340,25 @@ def _validate_contract_source(
 
 
 def _allowed_paths(issue_body: str) -> list[str]:
-    marker = "## Allowed Paths"
-    start = issue_body.find(marker)
-    if start < 0:
-        raise ValueError("allowed_paths_missing")
-    section = issue_body[start + len(marker):]
-    next_heading = section.find("\n## ")
-    if next_heading >= 0:
-        section = section[:next_heading]
-    paths = [line[2:].strip() for line in section.splitlines() if line.startswith("- ")]
+    """Use the contract-review parser for fingerprint-bound path entries."""
+    canonical_parser = (
+        _project_root()
+        / ".claude"
+        / "skills"
+        / "issue-contract-review"
+        / "scripts"
+        / "baseline_vc_preflight.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "baseline_vc_preflight_allowed_paths_for_materializer", canonical_parser
+    )
+    if spec is None or spec.loader is None:
+        raise ValueError("canonical_allowed_paths_extractor_unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    paths = module.extract_allowed_paths(issue_body or "")
+    if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+        raise ValueError("canonical_allowed_paths_extractor_invalid")
     if not paths:
         raise ValueError("allowed_paths_empty")
     return paths
