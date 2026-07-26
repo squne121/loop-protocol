@@ -343,7 +343,7 @@ hook_boundaries_manifest_v1:
       event: SubagentStop
       exit_2_effect: prevents_subagent_stop
       structured_decision_block_effect: prevents_subagent_stop_and_requests_one_regeneration
-    stdout_contract: json_decision_block_on_invalid_or_runtime_error_silent_on_allow
+    stdout_contract: json_decision_block_on_initial_invalid_json_allow_parent_fail_close_on_retry_invalid_silent_on_valid_allow
     stderr_contract: silent
     redaction_contract:
       no_raw_command: true
@@ -360,8 +360,11 @@ hook_boundaries_manifest_v1:
       exact 8-line approve または 9-line needs-fix 以外は
       {"decision":"block","reason":"..."} を stdout に一度だけ返して
       canonical compact stdout の再生成を要求する。payload 不正・message 型不正・
-      validator runtime error も同じ structured block で fail-closed にする。
-      stop_hook_active の継続では再 block せず、parent validator の既存 fail-close を維持する。
+      validator runtime error も同じ structured block で fail-closed にする。実 payload は
+      一度だけ読み、raw payload / message / transcript は保存せず digest-only atomic receipt
+      を decision 前に書き出す。stop_hook_active の retry valid は allow、retry invalid は
+      `parent_fail_close_required` を receipt と allow JSON に残して再 block せず、parent
+      validator の既存 fail-close を維持する。
       issue-reviewer 以外には matcher が適用されず、routing / binding / replay の
       artifact を生成・上書きしない。
 
