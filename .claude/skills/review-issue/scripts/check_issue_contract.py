@@ -580,6 +580,18 @@ def merge_readiness_into_review_result(
         failure_class = readiness_status_to_failure_class(readiness_status)
         if failure_class:
             merged["failure_class"] = failure_class
+            # `compact_review_result.py` checks `verdict == "approve"` first
+            # and short-circuits to `NEXT_ACTION: proceed` before it ever
+            # looks at `failure_class` (Issue #1791 review remediation
+            # iteration 3). If the underlying contract check itself
+            # returned `verdict: approve` (readiness errors such as
+            # env_missing_dep/timeout are independent of body content and
+            # can coexist with an approve verdict), force it to
+            # `needs-fix` here so the human_judgment failure_class is not
+            # silently dropped by compact_review_result.py's
+            # verdict-first branching.
+            if merged.get("verdict") == "approve":
+                merged["verdict"] = "needs-fix"
         elif new_blockers:
             merged["verdict"] = "needs-fix"
 

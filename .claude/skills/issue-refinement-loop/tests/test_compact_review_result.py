@@ -891,6 +891,47 @@ def test_merge_readiness_into_review_result_human_judgment_next_action(tmp_path)
     assert compact_data["NEXT_ACTION"] == "human_judgment_required"
 
 
+def test_merge_readiness_into_review_result_approve_verdict_human_judgment_end_to_end(tmp_path):
+    """GIVEN an *approve*-verdict REVIEW_ISSUE_RESULT_V1 (check_issue_contract.py
+    itself found the body clean) merged with a human_judgment readiness
+    result WHEN the merged output is passed through compact_review_result()
+    THEN NEXT_ACTION is human_judgment_required, not proceed (Issue #1791
+    review remediation, iteration 3 fix_delta).
+
+    This is the exact gap the iteration-2 regression tests missed:
+    compact_review_result() checks `verdict == "approve"` first and
+    short-circuits to NEXT_ACTION: proceed before ever consulting
+    failure_class, so merge_readiness_into_review_result() must rewrite an
+    approve verdict to needs-fix whenever it sets a human_judgment
+    failure_class."""
+    review_result = _needs_fix_review_result()
+    review_result["verdict"] = "approve"
+    review_result["structured_blockers"] = []
+    readiness_result = {
+        "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+        "status": "human_judgment",
+        "body_sha256": review_result["body_sha256"],
+        "errors": _SAMPLE_READINESS_ERRORS,
+    }
+
+    merged = merge_readiness_into_review_result(
+        review_result,
+        readiness_result,
+        readiness_artifact_path="artifacts/issue-refinement-loop/1791/readiness_result.json",
+        iteration_id="iter-1",
+    )
+
+    assert merged["verdict"] == "needs-fix"
+    assert merged["failure_class"] == "contract_readiness_human_judgment"
+
+    compact_data, *_ = compact_review_result(
+        merged,
+        artifact_dir=tmp_path / ".claude/artifacts/issue-refinement-loop",
+        issue_number=1791,
+    )
+    assert compact_data["NEXT_ACTION"] == "human_judgment_required"
+
+
 def test_merge_readiness_into_review_result_body_sha256_mismatch_fail_closed():
     """GIVEN mismatched body_sha256 between REVIEW_ISSUE_RESULT_V1 and
     ISSUE_CONTRACT_READINESS_RESULT_V1 WHEN merged THEN ValueError is raised
