@@ -17,7 +17,6 @@ import {
   parseMarkerComment,
   sha256Hex,
 } from './github-comments.mjs'
-import { buildSourceCommentSetDigest } from './retro-index-builder.mjs'
 import {
   parseRetroDigestMarker,
   parseRetroOwnershipMarker,
@@ -609,7 +608,6 @@ function buildReferenceChainFromParsedMarker(parsedMarker, comments) {
 
   const reportPayloads = []
   const evidenceRefs = []
-  const sourceCommentRefs = []
   for (const reportRef of payload.refs.run_reports) {
     const reportComment = findCommentByUrl(comments, reportRef.comment_url)
     if (!reportComment) {
@@ -629,12 +627,6 @@ function buildReferenceChainFromParsedMarker(parsedMarker, comments) {
     }
     assertValidation(validateAgentRunReport(reportExtraction.payload), 'chatgpt_retro_context.report_payload_invalid')
     reportPayloads.push(reportExtraction.payload)
-    sourceCommentRefs.push({
-      comment_url: reportRef.comment_url,
-      source_kind: 'issues',
-      source_number: payload.target.number,
-      body_digest: reportRef.payload_digest,
-    })
     evidenceRefs.push({
       kind: 'github_comment',
       ref: reportRef.comment_url,
@@ -651,6 +643,19 @@ function buildReferenceChainFromParsedMarker(parsedMarker, comments) {
   if (!parsedRetro.ok) {
     throw runtimeError('chatgpt_retro_context.retro_comment_invalid', 'referenced retro index comment is invalid')
   }
+  // retro_index_comment_verification (Issue #1415 digest-contract fix_delta): verify the
+  // retro index comment's *own* self-consistency only -- both its canonicalDigest and
+  // sourceSetDigest are producer-computed values embedded by update-retro-index.mjs (over
+  // whatever source comments collectSourceComments() discovered), and the marker's job here
+  // is just to confirm it is citing that same producer-stated pair, not to re-derive them
+  // from the marker's own run_report citation set. A prior version of this function also
+  // recomputed buildSourceCommentSetDigest() over [cited run_reports, retro_index comment]
+  // and compared that unrelated value against this same source_set_digest field -- those two
+  // sets are only equal when the retro index producer's discovery scan happens to be exactly
+  // the marker's citation set, which is not guaranteed (e.g. a parent issue or a directly
+  // cited PR target that collectSourceComments() does not scan as a source). That redundant,
+  // semantically-mismatched check has been removed; each run_report's digest is already
+  // independently verified above, and the retro index comment's digest is verified below.
   if (parsedRetro.digest?.canonicalDigest !== payload.refs.retro_index.payload_digest) {
     throw runtimeError('chatgpt_retro_context.retro_digest_mismatch', 'retro index payload digest mismatch')
   }
@@ -668,16 +673,6 @@ function buildReferenceChainFromParsedMarker(parsedMarker, comments) {
     throw runtimeError(retroExtraction.error.code, retroExtraction.error.message)
   }
   assertValidation(validateAgentRetroIndex(retroExtraction.payload), 'chatgpt_retro_context.retro_payload_invalid')
-  sourceCommentRefs.push({
-    comment_url: payload.refs.retro_index.comment_url,
-    source_kind: 'issues',
-    source_number: payload.parent_issue,
-    body_digest: payload.refs.retro_index.payload_digest,
-  })
-  const recomputedSourceSetDigest = buildSourceCommentSetDigest(sourceCommentRefs)
-  if (recomputedSourceSetDigest !== payload.refs.retro_index.source_set_digest) {
-    throw runtimeError('chatgpt_retro_context.source_set_digest_recompute_mismatch', 'retro index source-set digest must match the recomputed referenced comment set')
-  }
 
   const safetyScan = scanPublicSafety(payload)
   if (!safetyScan.valid) {

@@ -57,6 +57,27 @@
         ".agents/skills/review-issue/SKILL.md"
       ]
     },
+    "scope-rollup-runner": {
+      "path": ".codex/agents/scope-rollup-runner.toml",
+      "claude_agent_path": ".claude/agents/scope-rollup-runner.md",
+      "claude_model": "haiku",
+      "claude_permission_mode": "auto",
+      "model": "gpt-5.6-terra",
+      "model_reasoning_effort": "medium",
+      "default_permissions": "loop-protocol-readonly",
+      "runtime_dependency_status": "codex_native",
+      "runtime_followup_route": "none",
+      "permission_parity": "excluded",
+      "permission_exclusion": {
+        "allowlisted_agent": "scope-rollup-runner",
+        "reason": "claude_auto_permission_is_not_comparable_to_codex_ephemeral_write_profile",
+        "follow_up_issue": "#1686",
+        "expires_on": "2026-12-31"
+      },
+      "semantic_mutation_boundary": "repo_remote_readonly_with_ephemeral_local_write",
+      "required_effective_permission_profile": "loop-protocol-scope-rollup",
+      "release_pin": "codex-0.145.0"
+    },
     "spark-deep": {
       "path": ".codex/agents/spark-deep.toml",
       "claude_agent_path": null,

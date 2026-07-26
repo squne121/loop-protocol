@@ -377,3 +377,10 @@ Finding 2（hooks.json discover パス不一致）は本 Issue で確認され�
 本 Issue で対処済み）の両方が解消されているため、`#1494` 側の validator（
 `validate_agy_fanout_e2e_evidence.py`）が実際の tool 呼び出し成功を正しく認識できる
 状態になっている。
+
+
+## 敵対的再監査への追記（Issue #1778）
+
+control-plane が実施した controlled grounding matrix experiment（model_selector × prompt_template、各セル 3 反復、計 12 live attempt）により、`run_gemini_headless.py:406` の `AGY_GROUNDED_RESEARCH_MODEL = "claude-sonnet-4-6"` ハードコードについて、prompt_template（`explicit_search_required_v1`）が支配的要因であり model_selector には限界効果がないことが実証された（`account_default` + `explicit_search_required_v1` は 3/3 成功、`claude-sonnet-4-6` + 同一 prompt の 2/3 を上回った）。実験そのものの詳細は別途 follow-up Issue で検証済みとして記録し、本ドキュメントの既存本文は変更しない。model hardcode の因果主張を機械可読に検出する baseline は `scripts/check_agy_causal_claim_drift.py`（Issue #1778）を参照。
+
+また、`_WORKSPACE_DENY_GATE_HOOK_SOURCE`（`agy_permission_policy.py:227`）が triple-quoted docstring のみで実行コードを含まないことが同監査で判明した。既存テストは hook_path の存在確認のみで deny ロジックの機能を検証しておらず、AGY 本体がこの機構を実際に消費する裏付けも取れていない。この発見は記録のみであり、`_WORKSPACE_DENY_GATE_HOOK_SOURCE` への実行コード追加自体は本 Issue（#1778）の Out of Scope（別途 follow-up Issue D で検討）。

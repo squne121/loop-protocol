@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.local/schemas/agy_causal_claim_manifest_v1.schema.json",
+  "title": "AGY_CAUSAL_CLAIM_MANIFEST_V1",
+  "description": "Machine-readable output contract shared by audit_agy_auth_surface.py and check_agy_causal_claim_drift.py (Issue #1778). Both scripts audit the AGY (Antigravity CLI) provider integration for undocumented authentication surface exposure and stale causal-claim code comments, and emit findings in this shape so downstream consumers can diff/aggregate them without per-producer parsing.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "producer", "target_files", "findings", "summary"],
+  "properties": {
+    "schema": {
+      "const": "AGY_CAUSAL_CLAIM_MANIFEST_V1"
+    },
+    "producer": {
+      "type": "string",
+      "enum": ["audit_agy_auth_surface", "check_agy_causal_claim_drift"],
+      "description": "Which of the two Issue #1778 scripts emitted this manifest."
+    },
+    "target_files": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "Repo-relative paths of the source file(s) that were statically analyzed to produce findings."
+    },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finding" }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 },
+      "description": "Counts keyed by finding kind (e.g. {\"auth_surface\": 5, \"unenforced_read_only\": 2})."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ok", "findings_detected"],
+      "description": "Overall result. check_agy_causal_claim_drift.py fail-closes (non-zero exit) whenever status is findings_detected and any finding has severity p0."
+    }
+  },
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["finding_id", "kind", "detail", "severity"],
+      "properties": {
+        "finding_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable, deterministic identifier for this finding (e.g. \"auth_surface:agy_oauth_token_path\")."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["auth_surface", "unenforced_read_only", "causal_claim_drift"]
+        },
+        "identifier": {
+          "type": "string",
+          "description": "The surface name, function name, or Issue reference this finding is about."
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Human-readable explanation of the finding."
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["info", "warning", "p0"]
+        },
+        "rationale_present": {
+          "type": "boolean",
+          "description": "auth_surface findings only: whether a nearby comment documents the necessity of exposing this surface."
+        },
+        "source_file": {
+          "type": "string",
+          "description": "Repo-relative path of the file the finding's evidence line lives in."
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1-based line number of the finding's primary evidence in source_file."
+        },
+        "issue_number": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "causal_claim_drift findings only: the Issue #N referenced by the code comment."
+        },
+        "doc_path": {
+          "type": "string",
+          "description": "causal_claim_drift findings only: the references/*.md document whose status contradicts the code comment."
+        },
+        "doc_status": {
+          "type": "string",
+          "description": "causal_claim_drift findings only: the frontmatter status value found in doc_path."
+        }
+      }
+    }
+  }
+}

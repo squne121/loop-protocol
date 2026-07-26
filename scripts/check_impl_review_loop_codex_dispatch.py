@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = REPO_ROOT / ".codex/config.toml"
 
 SPAWN_NOTE_EXPECTATIONS = {
+    ".claude/skills/impl-review-loop/steps/preparation.md": "scope-rollup-runner",
     ".claude/skills/impl-review-loop/steps/step-1-implementation.md": "implementation-worker",
     ".claude/skills/impl-review-loop/steps/step-2-verification.md": "test-runner",
     ".claude/skills/impl-review-loop/steps/step-4-pr-review.md": "pr-reviewer",
