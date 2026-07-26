@@ -42,7 +42,14 @@ def load_json(path: Path) -> dict[str, Any] | None:
 
 def current_head() -> str | None:
     try:
-        result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True, check=True, timeout=10)
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
     except (OSError, subprocess.SubprocessError):
         return None
     return result.stdout.strip() or None
@@ -66,7 +73,12 @@ def receipt_records(receipt_dir: Path, issue: int) -> tuple[list[dict[str, Any]]
     return records, errors
 
 
-def validate(probe: dict[str, Any] | None, receipts: list[dict[str, Any]], head: str | None, verify_self_report: bool) -> tuple[str, list[str]]:
+def validate(
+    probe: dict[str, Any] | None,
+    receipts: list[dict[str, Any]],
+    head: str | None,
+    verify_self_report: bool,
+) -> tuple[str, list[str]]:
     errors: list[str] = []
     if probe is None or probe.get("schema") != PROBE_SCHEMA:
         errors.append("runtime_probe_missing_or_invalid")
@@ -87,7 +99,11 @@ def validate(probe: dict[str, Any] | None, receipts: list[dict[str, Any]], head:
     retries = [record for record in receipts if record.get("attempt") == "retry"]
     if not any(record.get("validation_status") == "valid" and record.get("decision") == "allow" for record in retries):
         errors.append("retry_valid_allow_missing")
-    if not any(record.get("validation_status") == "invalid" and record.get("reason") == "parent_fail_close_required" for record in retries):
+    if not any(
+        record.get("validation_status") == "invalid"
+        and record.get("reason") == "parent_fail_close_required"
+        for record in retries
+    ):
         errors.append("retry_invalid_parent_fail_close_missing")
     if verify_self_report:
         report = probe.get("self_report")
@@ -159,7 +175,18 @@ def publish_summary(verdict: dict[str, Any], artifact_dir: Path) -> dict[str, An
     try:
         updater = REPO_ROOT / ".claude" / "skills" / "open-pr" / "scripts" / "update_pr.py"
         completed = subprocess.run(
-            [sys.executable, str(updater), "--pr-number", str(pr_number), "--repo", repo, "--body-file", str(body_file), "--linked-issue", "1754"],
+            [
+                sys.executable,
+                str(updater),
+                "--pr-number",
+                str(pr_number),
+                "--repo",
+                repo,
+                "--body-file",
+                str(body_file),
+                "--linked-issue",
+                "1754",
+            ],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
