@@ -1628,6 +1628,32 @@ jobs:
           PY
           } >> "$GITHUB_STEP_SUMMARY"
 
+  agy-causal-claim-drift-gate:
+    # Issue #1788: CI required check integration for
+    # scripts/check_agy_causal_claim_drift.py (added by Issue #1778 / PR
+    # #1780 but never wired into CI). Baseline policy: `--apply-baseline`
+    # only fails closed on NEW causal-claim drift beyond the pre-existing
+    # baseline captured in _CI_GATE_BASELINE_KEYS (script docstring /
+    # docs/dev/ci-operations.md have the rationale). Detection logic itself
+    # is unchanged (Issue #1788 Out of Scope).
+    if: ${{ github.event.inputs.python_test_bench != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python-uv
+      - name: uv sync
+        run: uv sync --locked --group dev
+      - name: AGY causal-claim drift gate integration tests (AC4/AC5)
+        run: |
+          uv run --locked pytest \
+            scripts/tests/test_check_agy_causal_claim_drift_ci_gate.py -q
+      - name: AGY causal-claim drift gate (baseline-applied, merge-blocking on NEW drift)
+        run: |
+          uv run --locked python3 scripts/check_agy_causal_claim_drift.py \
+            --apply-baseline
+
   actionlint:
     if: ${{ github.event.inputs.python_test_bench != 'true' }}
     runs-on: ubuntu-latest
@@ -1750,7 +1776,7 @@ jobs:
   ci-verdict-summary:
     runs-on: ubuntu-latest
     if: ${{ !cancelled() && github.event.inputs.python_test_bench != 'true' }}
-    needs: [typecheck, lint, test, build, e2e, python-test, node-backed-hook-tests, actionlint]
+    needs: [typecheck, lint, test, build, e2e, python-test, node-backed-hook-tests, actionlint, agy-causal-claim-drift-gate]
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:

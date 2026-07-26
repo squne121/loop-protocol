@@ -46,6 +46,8 @@ CLASSIFICATION_MAP: dict[tuple[str, str], str] = {
     ("ci", "python-test"): "evidence",
     ("ci", "node-backed-hook-tests"): "evidence",
     ("ci", "actionlint"): "required",
+    # Issue #1788: AGY causal-claim drift CI gate (baseline-applied)
+    ("ci", "agy-causal-claim-drift-gate"): "required",
     # ci-verdict-summary aggregator (evidence producer)
     ("ci", "ci-verdict-summary"): "evidence",
     # Check Japanese Content workflow
@@ -67,6 +69,7 @@ REQUIRED_CHECKS: set[tuple[str, str]] = {
     ("ci", "python-test"),
     ("ci", "node-backed-hook-tests"),
     ("ci", "actionlint"),
+    ("ci", "agy-causal-claim-drift-gate"),
 }
 
 OVERALL_STATUS_ENUM = [
