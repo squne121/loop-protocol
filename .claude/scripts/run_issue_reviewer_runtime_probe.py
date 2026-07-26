@@ -128,7 +128,10 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="issue-reviewer-runtime-") as temporary:
         temp_root = Path(temporary)
-        scenario_results = [run_scenario(binary, scenario, temp_root / f"{scenario}.debug") for scenario in args.scenario]
+        scenario_results = [
+            run_scenario(binary, scenario, temp_root / f"{scenario}.debug")
+            for scenario in args.scenario
+        ]
     result = {
         "schema": "ISSUE_REVIEWER_RUNTIME_PROBE_V1",
         "issue": args.issue,

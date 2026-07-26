@@ -1,16 +1,17 @@
 ---
 doc_id: issue-reviewer-runtime-evidence
+doc_title_ja: issue-reviewer 実行時証跡
 status: stable
 related_issue: 1754
 ---
 
-# issue-reviewer runtime evidence
+# issue-reviewer runtime evidence（実行時証跡）
 
 `issue-reviewer` の Claude Code / Haiku runtime gate は、fixture の成功や
 self-report を runtime PASS の根拠にしない。対象 host で実際の `claude -p`
 が SubagentStop を発火した場合だけ runtime evidence を収集する。
 
-## Receipt boundary
+## Receipt boundary（receipt の境界）
 
 `validate_issue_reviewer_compact_output.py` は hook stdin を一回だけ読み、既存
 child intermediate grammar を検証する。`CLAUDE_SUBAGENT_RUNTIME_RECEIPT_V1` は
@@ -23,7 +24,7 @@ decision、reason、時刻、hook/settings digest に限る。
 - retry invalid: retry receipt に `parent_fail_close_required` を保存し、再 block
   しない。未変更の応答は parent validator が fail-close する。
 
-## Probe and collection
+## Probe and collection（probe と収集）
 
 `run_issue_reviewer_runtime_probe.py` は trusted host provenance と real `claude`
 がそろわない場合、`SKIP:` と exit 77 を返す。SKIP は PASS ではない。probe の
