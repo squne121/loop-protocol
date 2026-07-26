@@ -116,6 +116,7 @@ PR review judge（review_subagent）が生成する `ALLOWED_PATHS_GATE_RESULT_V
 | `indeterminate` | REQUEST_CHANGES（merge-blocking） | true | 人間判断を仰ぐ（head SHA mismatch 等） |
 | result 欠落 | indeterminate 扱い（merge-blocking） | true | 人間判断を仰ぐ |
 | `producer_role != review_subagent` | indeterminate 扱い（merge-blocking） | true | producer role の確認が必要 |
+| allowed_paths_gate ブロック欠落（PR review 本文自体に `allowed_paths_gate` ブロックが存在しない） | indeterminate 扱い（merge-blocking） | true | `check_pr_review_gates.py` G6 が fail を返す。producer_role フィールド欠落と同様、人間判断を仰ぐ（Issue #1776） |
 | malformed（スキーマ不正） | indeterminate 扱い（merge-blocking） | true | 人間判断を仰ぐ |
 
 `status: ok` 以外の場合は merge-blocking であり、PR merge 前に人間 approval または contract 再確認が必要。
