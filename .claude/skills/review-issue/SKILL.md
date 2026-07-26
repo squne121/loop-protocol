@@ -17,19 +17,20 @@ Issue 本文の構造品質を `.claude/skills/review-issue/scripts/check_issue_
 ## Procedure（手順）
 
 1. `gh issue view <番号> --json title,body,labels` で本文を取得する。
-2. 本文を一時ファイルに保存し、以下の 2 スクリプトを順に実行する:
-   - `uv run python3 .claude/skills/review-issue/scripts/check_issue_contract.py --file <tmp> --json`
-   - `uv run python3 .claude/skills/issue-contract-review/scripts/contract_readiness_check.py --body-file <tmp> --mode execute`
+2. 本文を一時ファイルに保存し、以下のスクリプトを**決定論的に**順に実行する（LLM は JSON を整形・転送するだけで、合成ロジック自体を実行しない。Issue #1791 review remediation, Critical #1）:
+   - `uv run python3 .claude/skills/review-issue/scripts/check_issue_contract.py --file <tmp> --json > <review_result.json>`
+   - `uv run python3 .claude/skills/issue-contract-review/scripts/contract_readiness_check.py --body-file <tmp> --mode execute > <readiness_result.json>`
+   - `uv run python3 .claude/skills/review-issue/scripts/check_issue_contract.py --mode merge_readiness --review-result-file <review_result.json> --readiness-result-file <readiness_result.json> --readiness-artifact-path <readiness_result.json の実パス> --iteration-id <iteration_id> --output-file <merged_review_result.json>`
 
    `check_issue_contract.py` は内部で `check_product_spec_contract.py --body-file <tmp>` を同一 body snapshot に対して実行し、`body_sha256` mismatch / malformed output / pair invariant violation / timeout を fail-closed に合成する。
-   
-   `ISSUE_CONTRACT_READINESS_RESULT_V1` の `errors[]` が空でない場合、以下のルールで `REVIEW_ISSUE_RESULT_V1` へ合成する：
-   - `blocking_issues` には各 error の `fix_hint` 文字列を転写する（人間向け要約）。`check_issue_contract.py` の `blocking_issues` も同配列にマージする。
-   - `structured_blockers` には `errors[]` の構造体を**そのまま転写しない**。`check_issue_contract.py` が公開する `readiness_error_to_structured_blocker()` / `readiness_errors_to_structured_blockers()`（`_append_findings` と同じ finding 構築ヘルパーを再利用する変換関数、Issue #1791）を呼び、`code` / `message` / `finding_kind` / `deterministic_domain_key` / `blocking` / `checker_evidence`（`source_check` / `rule_id` / `category` / `artifact_path` / `artifact_schema` / `body_sha256` / `iteration_id` / `line_start` / `line_end` を含む）を備えた**変換後の形状**にしてから追記する。`compact_review_result.py` の `REVIEW_ISSUE_RESULT_V1` スキーマ検証（`schemas/review_issue_result_v1.json`）と非互換にならないよう、生の readiness error 構造体を `structured_blockers` へ直接コピーしてはならない。
-   - `status: needs_fix` の errors → `verdict: needs-fix` に反映する。
-   - `status: human_judgment` の errors（`env_missing_dep` / `timeout` / unknown 分類など）は `verdict: needs-fix` に畳み込まない。`readiness_errors_to_structured_blockers(..., readiness_status="human_judgment")` を使うと変換後の `structured_blockers` に `failure_class: contract_readiness_human_judgment` が付与され別扱いとなる。overall verdict は `needs-fix` ではなく `human_judgment` として区別する。
-   - 判定ロジックは `contract_readiness_check.py` に集約し、本 skill では再実装しない。変換ロジックは `check_issue_contract.py` の変換関数に集約し、SKILL.md には変換規則の詳細（フィールド対応表・regex 等）を重複記載しない。
-   
+
+   3 番目のコマンド（`--mode merge_readiness`）が `ISSUE_CONTRACT_READINESS_RESULT_V1.errors[]` を `REVIEW_ISSUE_RESULT_V1` へ合成する唯一の producer であり、この合成は `merge_readiness_into_review_result()`（`check_issue_contract.py`）が決定論的に行う。本 skill / LLM は合成規則を再実装せず、上記コマンドを実行し `<merged_review_result.json>` を Step 3 以降の `REVIEW_ISSUE_RESULT_V1` として扱う。合成規則の要点（実装の詳細規則は `check_issue_contract.py` の docstring に集約し、ここでは重複記載しない）:
+   - `blocking_issues` には各 error の `fix_hint` 文字列が追記される（人間向け要約）。
+   - `structured_blockers` には `errors[]` の構造体は**そのまま転写されない**。`code` / `message` / `finding_kind` / `deterministic_domain_key` / `blocking` / `checker_evidence`（`source_check` / `rule_id` / `category` / `artifact_path` / `artifact_schema` / `body_sha256` / `iteration_id` / `line_start` / `line_end` を含む）を備えた**変換後の形状**に限り追記される。生の readiness error 構造体が `structured_blockers` へ直接コピーされることはない。
+   - `status: needs_fix` の errors → `verdict: needs-fix` に反映される。
+   - `status: human_judgment` の errors（`env_missing_dep` / `timeout` / unknown 分類など）は `structured_blockers` に追加されない（deterministic blocker として扱うと Issue 本文書き換えで解決しない事象を「修復対象」に誤分類するため）。代わりにトップレベルの `REVIEW_ISSUE_RESULT_V1.failure_class: contract_readiness_human_judgment` が設定される。`verdict` はスキーマ上 `approve | needs-fix` のみを許可するため `needs-fix` のまま据え置かれ、`compact_review_result.py` が `raw_result.failure_class`（トップレベル）を見て `NEXT_ACTION: human_judgment_required` に routing する。
+   - 判定ロジックは `contract_readiness_check.py` に集約し、本 skill では再実装しない。合成ロジックは `check_issue_contract.py` の `merge_readiness_into_review_result()` に集約し、SKILL.md には合成規則の詳細（フィールド対応表・regex 等）を重複記載しない。
+
    Note: `--mode execute` は `compound_command_disallowed`（静的検出）と `unexpected_pass`（VC 実行結果）の両方を検出する。`shell=True` は導入しない（既存の `shell=False` 前提を維持）。
 3. checker の JSON をそのまま `REVIEW_ISSUE_RESULT_V1` に整形する（`verdict` / `deterministic_checks` / `blocking_issues` / `non_blocking_improvements` / `diff_proposal` を保持）。
    `findings[]` / `checker_evidence[]` / `body_sha256` / producer schema version も lossless に保持し、compact consumer が provenance を失わないようにする。
@@ -71,7 +72,8 @@ REVIEW_ISSUE_RESULT_V1:
   blocking_issues: <checker JSON blocking_issues をそのまま>
   non_blocking_improvements: <checker JSON non_blocking_improvements をそのまま>
   diff_proposal: <checker JSON diff_proposal をそのまま>
-  structured_blockers: <readiness_error_to_structured_blocker() で変換後の形状（機械処理用・code/finding_kind/deterministic_domain_key/blocking/checker_evidence を保持）>
+  structured_blockers: <merge_readiness_into_review_result() で変換後の形状（機械処理用・code/finding_kind/deterministic_domain_key/blocking/checker_evidence を保持。status:human_judgment の readiness error はここに含まれない）>
+  failure_class: <readiness status:human_judgment のときのみ contract_readiness_human_judgment、それ以外は省略またはnull>
   update_applied: true | false
   comment_url: <変更経緯コメント URL、適用時のみ>
 ```

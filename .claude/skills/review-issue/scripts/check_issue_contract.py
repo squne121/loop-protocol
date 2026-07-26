@@ -340,14 +340,72 @@ def _validate_finding_kind(kind: str) -> str:
     raise ValueError(f"Unsupported finding_kind: {kind!r}")
 
 
+def _normalize_readiness_line(value: object) -> Optional[int]:
+    """Normalize a readiness error's line_start/line_end value.
+
+    The real `contract_readiness_check.py` producer emits `0` (not omitted,
+    not `null`) for validator-timeout / internal-error / JSON-decode-error /
+    VC-extraction-failure cases (see `map_validate_errors_to_readiness_errors`
+    and the JSON-decode-error branch, both of which default to
+    `"line_start": 0`). The consumer schema
+    (`schemas/review_issue_result_v1.json` $defs.checker_evidence) requires
+    `line_start`/`line_end` to be `null` or an integer `>= 1`. A naive
+    `isinstance(value, int)` check lets `0` pass through unchanged and the
+    resulting payload is rejected by `jsonschema.validate()` in
+    `compact_review_result.py` (`schema_mismatch` — Issue #1791 review
+    remediation, Critical #2). `bool` is also excluded because `bool` is an
+    `int` subclass in Python.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value >= 1:
+        return value
+    return None
+
+
+def _readiness_error_to_checker_evidence(
+    readiness_error: dict,
+    *,
+    body_sha256: str,
+    iteration_id: str,
+    artifact_path: str,
+) -> dict:
+    """Build the `checker_evidence` entry for one readiness errors[] element.
+
+    Preserves the real producer's `source_payload` (decision / classification
+    / exit_code / command_hash / ...) when present, instead of dropping it
+    (Issue #1791 review remediation, High #5). `checker_evidence` allows
+    additional properties, so this does not require a schema change.
+    """
+    rule_id = str(readiness_error.get("rule_id") or "READINESS_UNKNOWN")
+    category = str(readiness_error.get("category") or "contract_readiness")
+    source_check = str(
+        readiness_error.get("source_check") or "contract_readiness_check"
+    )
+    evidence_entry = {
+        "source_check": source_check,
+        "rule_id": rule_id,
+        "category": category,
+        "artifact_path": artifact_path,
+        "artifact_schema": READINESS_CHECKER_ARTIFACT_SCHEMA,
+        "body_sha256": body_sha256,
+        "iteration_id": iteration_id,
+        "line_start": _normalize_readiness_line(readiness_error.get("line_start")),
+        "line_end": _normalize_readiness_line(readiness_error.get("line_end")),
+    }
+    source_payload = readiness_error.get("source_payload")
+    if isinstance(source_payload, dict):
+        evidence_entry["source_payload"] = source_payload
+    return evidence_entry
+
+
 def readiness_error_to_structured_blocker(
     readiness_error: dict,
     *,
     body_sha256: str,
     iteration_id: str,
-    failure_class: Optional[str] = None,
     artifact_path: str = "contract_readiness_check_result",
-) -> dict:
+) -> Optional[dict]:
     """Convert one ISSUE_CONTRACT_READINESS_RESULT_V1 errors[] element into the
     REVIEW_ISSUE_RESULT_V1.structured_blocker shape required by
     compact_review_result.py (Issue #1791).
@@ -361,41 +419,42 @@ def readiness_error_to_structured_blocker(
     （`_append_findings` と同じ finding_kind / checker_evidence 形状規約）を
     再利用して変換後の structured_blocker 形状を組み立てる。
 
-    `failure_class` は `status: human_judgment` の readiness error（
-    `env_missing_dep` / `timeout` / unknown 分類など）を区別するための
-    additive フィールド。`needs_fix` 系の readiness error では None のまま
-    渡し、`failure_class` キー自体を出力に含めない。
+    Provenance is validated via the existing `_is_valid_deterministic_evidence()`
+    gate (same fail-closed rule `_append_findings()` applies elsewhere in this
+    module): if the produced `checker_evidence` entry does not carry a
+    non-empty `source_check` / `rule_id` / `category` / `artifact_path` /
+    `artifact_schema` (one of `REVIEW_ISSUE_CHECKER_ARTIFACT_SCHEMAS`) /
+    `body_sha256` / `iteration_id`, or if `body_sha256` does not match the
+    caller-provided `body_sha256`, this function returns `None` instead of a
+    fabricated deterministic blocker (Issue #1791 review remediation, High #5).
+    Callers (`readiness_errors_to_structured_blockers()` /
+    `merge_readiness_into_review_result()`) must drop `None` entries rather
+    than emit an invalid structured_blocker.
+
+    `readiness_status == "human_judgment"` errors are never converted to
+    deterministic structured_blockers at all — see
+    `readiness_errors_to_structured_blockers()` for the routing rule (Issue
+    #1791 review remediation, Critical #3).
     """
     rule_id = str(readiness_error.get("rule_id") or "READINESS_UNKNOWN")
     category = str(readiness_error.get("category") or "contract_readiness")
-    source_check = str(
-        readiness_error.get("source_check") or "contract_readiness_check"
-    )
     message = str(
         readiness_error.get("fix_hint")
         or readiness_error.get("message")
         or rule_id
     )
-    line_start = readiness_error.get("line_start")
-    line_end = readiness_error.get("line_end")
-    if not isinstance(line_start, int):
-        line_start = None
-    if not isinstance(line_end, int):
-        line_end = None
+    checker_evidence_entry = _readiness_error_to_checker_evidence(
+        readiness_error,
+        body_sha256=body_sha256,
+        iteration_id=iteration_id,
+        artifact_path=artifact_path,
+    )
 
-    checker_evidence_entry = {
-        "source_check": source_check,
-        "rule_id": rule_id,
-        "category": category,
-        "artifact_path": artifact_path,
-        "artifact_schema": READINESS_CHECKER_ARTIFACT_SCHEMA,
-        "body_sha256": body_sha256,
-        "iteration_id": iteration_id,
-        "line_start": line_start,
-        "line_end": line_end,
-    }
+    evidence_shim = _EvidenceBodyShaShim(body_sha256=body_sha256)
+    if not _is_valid_deterministic_evidence(evidence_shim, checker_evidence_entry):
+        return None
 
-    structured_blocker = {
+    return {
         "code": rule_id,
         "message": message,
         # finding_kind: deterministic_domain_blocker
@@ -404,9 +463,6 @@ def readiness_error_to_structured_blocker(
         "blocking": True,
         "checker_evidence": [checker_evidence_entry],
     }
-    if failure_class:
-        structured_blocker["failure_class"] = failure_class
-    return structured_blocker
 
 
 def readiness_errors_to_structured_blockers(
@@ -415,36 +471,137 @@ def readiness_errors_to_structured_blockers(
     body_sha256: str,
     iteration_id: str,
     readiness_status: Optional[str] = None,
+    artifact_path: str = "contract_readiness_check_result",
 ) -> list[dict]:
     """Convert a full ISSUE_CONTRACT_READINESS_RESULT_V1 errors[] list into
     REVIEW_ISSUE_RESULT_V1.structured_blockers (Issue #1791).
 
-    `readiness_status` (`ISSUE_CONTRACT_READINESS_RESULT_V1.status`) drives the
-    `failure_class` annotation: `human_judgment` readiness results are tagged
-    `contract_readiness_human_judgment` so callers can keep the overall verdict
-    separate from `needs-fix` (SKILL.md Step 2 rule), without changing the
-    structured_blocker schema shape itself.
+    `readiness_status == "human_judgment"` readiness results (e.g.
+    `env_missing_dep` / `timeout` / unknown classification) are NOT
+    deterministic, body-editable blockers, so this function returns an empty
+    list for them instead of fabricating `deterministic_domain_blocker` /
+    `blocking: true` entries (Issue #1791 review remediation, Critical #3).
+    Callers that need to route `human_judgment` distinctly must set the
+    top-level `REVIEW_ISSUE_RESULT_V1.failure_class` field instead (see
+    `readiness_status_to_failure_class()` and
+    `merge_readiness_into_review_result()`), because
+    `compact_review_result.py` derives `NEXT_ACTION: human_judgment_required`
+    from the top-level `failure_class`, not from any per-blocker field.
+
+    Entries whose provenance fails `_is_valid_deterministic_evidence()` (e.g.
+    `body_sha256` mismatch) are silently dropped rather than emitted as
+    fail-open blockers — see `readiness_error_to_structured_blocker()`.
     """
-    failure_class = (
-        "contract_readiness_human_judgment"
-        if readiness_status == "human_judgment"
-        else None
-    )
-    return [
-        readiness_error_to_structured_blocker(
+    if readiness_status == "human_judgment":
+        return []
+    blockers = []
+    for error in readiness_errors:
+        blocker = readiness_error_to_structured_blocker(
             error,
             body_sha256=body_sha256,
             iteration_id=iteration_id,
-            failure_class=failure_class,
+            artifact_path=artifact_path,
         )
-        for error in readiness_errors
-    ]
+        if blocker is not None:
+            blockers.append(blocker)
+    return blockers
+
+
+def readiness_status_to_failure_class(readiness_status: Optional[str]) -> Optional[str]:
+    """Map `ISSUE_CONTRACT_READINESS_RESULT_V1.status` to the top-level
+    `REVIEW_ISSUE_RESULT_V1.failure_class` value that
+    `compact_review_result.py` reads to derive
+    `NEXT_ACTION: human_judgment_required` (Issue #1791 review remediation,
+    Critical #3). Returns `None` for `needs_fix` / `go` / other statuses.
+    """
+    if readiness_status == "human_judgment":
+        return "contract_readiness_human_judgment"
+    return None
+
+
+def merge_readiness_into_review_result(
+    review_result: dict,
+    readiness_result: dict,
+    *,
+    readiness_artifact_path: str,
+    iteration_id: str,
+) -> dict:
+    """Deterministically merge ISSUE_CONTRACT_READINESS_RESULT_V1 (producer:
+    `contract_readiness_check.py --mode execute`) into REVIEW_ISSUE_RESULT_V1.
+
+    This is the CLI-wired replacement for the previously prompt-driven merge
+    described in `SKILL.md` Step 2 (Issue #1791 review remediation, Critical
+    #1): no LLM call sits between the two producers and
+    `compact_review_result.py`. Invoked via
+    `check_issue_contract.py --mode merge_readiness`.
+
+    Fail-closed: if `readiness_result.errors` is non-empty but
+    `review_result.body_sha256` does not match `readiness_result.body_sha256`,
+    this raises `ValueError` rather than emitting deterministic blockers built
+    on stale/mismatched evidence (Issue #1791 review remediation, High #5).
+    Individual errors whose evidence is otherwise invalid are dropped by
+    `readiness_errors_to_structured_blockers()`.
+    """
+    merged = json.loads(json.dumps(review_result))
+    review_body_sha256 = merged.get("body_sha256")
+    readiness_body_sha256 = readiness_result.get("body_sha256")
+    readiness_errors = readiness_result.get("errors") or []
+    readiness_status = readiness_result.get("status")
+
+    if readiness_errors:
+        if not review_body_sha256 or review_body_sha256 != readiness_body_sha256:
+            raise ValueError(
+                "body_sha256 mismatch between REVIEW_ISSUE_RESULT_V1 "
+                f"({review_body_sha256!r}) and "
+                "ISSUE_CONTRACT_READINESS_RESULT_V1 "
+                f"({readiness_body_sha256!r}); refusing to merge (fail-closed)"
+            )
+
+        new_blockers = readiness_errors_to_structured_blockers(
+            readiness_errors,
+            body_sha256=review_body_sha256,
+            iteration_id=iteration_id,
+            readiness_status=readiness_status,
+            artifact_path=readiness_artifact_path,
+        )
+        merged["structured_blockers"] = (
+            list(merged.get("structured_blockers") or []) + new_blockers
+        )
+        merged["blocking_issues"] = list(merged.get("blocking_issues") or []) + [
+            str(
+                error.get("fix_hint")
+                or error.get("message")
+                or error.get("rule_id")
+                or "readiness_error"
+            )
+            for error in readiness_errors
+        ]
+
+        failure_class = readiness_status_to_failure_class(readiness_status)
+        if failure_class:
+            merged["failure_class"] = failure_class
+        elif new_blockers:
+            merged["verdict"] = "needs-fix"
+
+    _validate_review_issue_result_payload(merged)
+    return merged
 
 
 def _validate_status(status: str) -> str:
     if status in VALID_REVIEW_ISSUE_STATUS:
         return status
     raise ValueError(f"Unsupported REVIEW_ISSUE_RESULT status: {status!r}")
+
+
+@dataclass
+class _EvidenceBodyShaShim:
+    """Minimal duck-typed stand-in for `CheckerResult` used to reuse
+    `_is_valid_deterministic_evidence()`'s fail-closed evidence gate from
+    contexts (e.g. `readiness_error_to_structured_blocker()`) that only need
+    the `body_sha256` comparison and do not have a full `CheckerResult`
+    instance available (Issue #1791 review remediation, High #5)."""
+
+    body_sha256: str
 
 
 def _is_valid_deterministic_evidence(result: "CheckerResult", entry: dict) -> bool:
@@ -2356,7 +2513,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="C1〜C13 決定論的チェッカー — Issue 本文を機械的に検査する"
     )
-    group = parser.add_mutually_exclusive_group(required=True)
+    parser.add_argument(
+        "--mode",
+        choices=["check", "merge_readiness"],
+        default="check",
+        help=(
+            "check（既定）: Issue 本文を C1〜C13 で判定する。"
+            "merge_readiness: ISSUE_CONTRACT_READINESS_RESULT_V1 を "
+            "REVIEW_ISSUE_RESULT_V1 へ決定論的に合成する（Issue #1791）。"
+        ),
+    )
+    group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument("--file", "-f", help="フィクスチャファイルパス（テスト用）")
     group.add_argument("--issue", "-i", type=int, help="GitHub Issue 番号")
     parser.add_argument("--repo", "-r", help="GitHub repo (owner/repo)。--issue と共に使用")
@@ -2369,7 +2536,77 @@ def main() -> None:
         ),
     )
     parser.add_argument("--vc-preflight-json", help="VC preflight JSON path for C13 check")
+    parser.add_argument(
+        "--review-result-file",
+        help="merge_readiness mode: REVIEW_ISSUE_RESULT_V1 JSON ファイルパス",
+    )
+    parser.add_argument(
+        "--readiness-result-file",
+        help="merge_readiness mode: ISSUE_CONTRACT_READINESS_RESULT_V1 JSON ファイルパス",
+    )
+    parser.add_argument(
+        "--readiness-artifact-path",
+        help="merge_readiness mode: checker_evidence.artifact_path に記録する readiness artifact の実パス",
+    )
+    parser.add_argument(
+        "--iteration-id",
+        help="merge_readiness mode: checker_evidence.iteration_id に記録する iteration 識別子",
+    )
+    parser.add_argument(
+        "--output-file",
+        help="merge_readiness mode: 合成後の REVIEW_ISSUE_RESULT_V1 出力先（省略時は stdout）",
+    )
     args = parser.parse_args()
+
+    if args.mode == "merge_readiness":
+        missing = [
+            flag
+            for flag, value in (
+                ("--review-result-file", args.review_result_file),
+                ("--readiness-result-file", args.readiness_result_file),
+                ("--readiness-artifact-path", args.readiness_artifact_path),
+                ("--iteration-id", args.iteration_id),
+            )
+            if not value
+        ]
+        if missing:
+            print(
+                "ERROR: --mode merge_readiness には "
+                f"{', '.join(missing)} が全て必要です",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+        review_result = json.loads(
+            Path(args.review_result_file).read_text(encoding="utf-8")
+        )
+        readiness_result = json.loads(
+            Path(args.readiness_result_file).read_text(encoding="utf-8")
+        )
+        try:
+            merged = merge_readiness_into_review_result(
+                review_result,
+                readiness_result,
+                readiness_artifact_path=args.readiness_artifact_path,
+                iteration_id=args.iteration_id,
+            )
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        output_text = json.dumps(merged, ensure_ascii=False, indent=2, allow_nan=False)
+        if args.output_file:
+            Path(args.output_file).write_text(output_text + "\n", encoding="utf-8")
+        else:
+            print(output_text)
+        sys.exit(0 if merged.get("verdict") == "approve" else 1)
+
+    if not args.file and not args.issue:
+        print(
+            "ERROR: --mode check には --file または --issue が必要です",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     if args.issue and not args.repo:
         print("ERROR: --issue には --repo が必要です", file=sys.stderr)
