@@ -102,6 +102,38 @@ def _make_current_head_vc_preflight_json(status: str = "pass") -> dict:
     }
 
 
+def _make_declared_path_overlap_result(disjoint: bool = True) -> dict:
+    """declared_path_overlap（advisory のみ、Issue #1680）の固定 stub 結果。"""
+    overlapping_prs = [] if disjoint else [
+        {
+            "pr_number": 9999,
+            "url": "https://github.com/squne121/loop-protocol/pull/9999",
+            "head_ref_oid": "c" * 40,
+            "is_draft": False,
+            "is_cross_repository": False,
+            "matched_files": [".claude/skills/issue-contract-review/SKILL.md"],
+        }
+    ]
+    return {
+        "schema": "declared_path_overlap/v1",
+        "advisory": True,
+        "blocking": False,
+        "decision": "advisory_only",
+        "disjoint": disjoint,
+        "overlapping_prs": overlapping_prs,
+        "inventory": {
+            "schema": "OPEN_PR_INVENTORY_V1",
+            "totalCount": len(overlapping_prs),
+            "fetched_count": len(overlapping_prs),
+            "has_next_page": False,
+            "complete": True,
+            "saturated": False,
+        },
+        "errors": [],
+        "note": "changed-file 名の単純な重なりのみを証明する advisory check。",
+    }
+
+
 def _make_subprocess_result(stdout: str, returncode: int = 0) -> MagicMock:
     result = MagicMock()
     result.stdout = stdout
@@ -155,7 +187,12 @@ class TestAllChecksCalledB1:
         with patch.object(_rcr_mod, "_run_script", side_effect=lambda *a, **kw: next(run_iter)):
             with patch.object(_rcr_mod, "_run_shell_script", side_effect=lambda *a, **kw: next(shell_iter)):
                 with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, None)):
-                    result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+                    with patch.object(
+                        _rcr_mod,
+                        "_run_declared_path_overlap_check",
+                        return_value=_make_declared_path_overlap_result(disjoint=True),
+                    ):
+                        result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
 
         assert result["status"] == "go"
         assert result["checks"]["readiness"] == "go"
@@ -165,6 +202,9 @@ class TestAllChecksCalledB1:
             "pass", "applicable"
         )
         assert result["checks"]["vc_preflight"] == "pass"
+        assert result["checks"]["declared_path_overlap"]["disjoint"] is True
+        assert result["checks"]["declared_path_overlap"]["advisory"] is True
+        assert result["checks"]["declared_path_overlap"]["blocking"] is False
 
     def test_current_head_arguments_are_forwarded_to_producer(self):
         """GIVEN certified current-head input WHEN review runs THEN it preserves the full envelope."""
@@ -178,10 +218,15 @@ class TestAllChecksCalledB1:
 
         with patch.object(_rcr_mod, "_run_script", side_effect=run_script):
             with patch.object(_rcr_mod, "_run_shell_script", return_value=shell_results[0]):
-                result = run_once(
-                    _ISSUE_NUMBER, _REPO, skip_idempotency_check=True,
-                    evidence_mode="current-head", cwd="/tmp/pr-worktree", reviewed_head_sha="a" * 40,
-                )
+                with patch.object(
+                    _rcr_mod,
+                    "_run_declared_path_overlap_check",
+                    return_value=_make_declared_path_overlap_result(disjoint=True),
+                ):
+                    result = run_once(
+                        _ISSUE_NUMBER, _REPO, skip_idempotency_check=True,
+                        evidence_mode="current-head", cwd="/tmp/pr-worktree", reviewed_head_sha="a" * 40,
+                    )
 
         producer_command = captured[-1]
         assert result["status"] == "go"
@@ -302,7 +347,12 @@ class TestAllChecksCalledB1:
         with patch.object(_rcr_mod, "_run_script", side_effect=lambda *a, **kw: next(run_script_iter)):
             with patch.object(_rcr_mod, "_run_shell_script", return_value=(0, "OK", "")):
                 with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, None)):
-                    result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+                    with patch.object(
+                        _rcr_mod,
+                        "_run_declared_path_overlap_check",
+                        return_value=_make_declared_path_overlap_result(disjoint=True),
+                    ):
+                        result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
 
         assert result["status"] == "go"
         assert result["checks"]["product_spec"] == "pass"
@@ -354,6 +404,73 @@ class TestAllChecksCalledB1:
 # ---------------------------------------------------------------------------
 
 
+class TestDeclaredPathOverlapAdvisoryOnly:
+    """Issue #1680: declared_path_overlap is advisory only and never blocks."""
+
+    def test_disjoint_open_pr_continues_go(self, monkeypatch):
+        """AC2: OPEN PR が存在しても changed files が Allowed Paths と disjoint なら go を継続する。"""
+        run_script_results, shell_results = _make_all_pass_side_effects()
+        run_iter = iter(run_script_results)
+        shell_iter = iter(shell_results)
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=lambda *a, **kw: next(run_iter)):
+            with patch.object(_rcr_mod, "_run_shell_script", side_effect=lambda *a, **kw: next(shell_iter)):
+                with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, None)):
+                    with patch.object(
+                        _rcr_mod,
+                        "_run_declared_path_overlap_check",
+                        return_value=_make_declared_path_overlap_result(disjoint=True),
+                    ):
+                        result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+
+        assert result["status"] == "go"
+        assert result["checks"]["declared_path_overlap"]["disjoint"] is True
+
+    def test_overlapping_open_pr_does_not_block_go(self, monkeypatch):
+        """AC1/AC3: OPEN PR の changed-file 名重複（非 disjoint）だけでは blocked にならない。"""
+        run_script_results, shell_results = _make_all_pass_side_effects()
+        run_iter = iter(run_script_results)
+        shell_iter = iter(shell_results)
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=lambda *a, **kw: next(run_iter)):
+            with patch.object(_rcr_mod, "_run_shell_script", side_effect=lambda *a, **kw: next(shell_iter)):
+                with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, None)):
+                    with patch.object(
+                        _rcr_mod,
+                        "_run_declared_path_overlap_check",
+                        return_value=_make_declared_path_overlap_result(disjoint=False),
+                    ):
+                        result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+
+        # declared_path_overlap は advisory のみ: disjoint=False (overlap あり)
+        # でも status は go のまま — 単独では blocking にしない。
+        assert result["status"] == "go"
+        assert result["checks"]["declared_path_overlap"]["disjoint"] is False
+        assert result["checks"]["declared_path_overlap"]["advisory"] is True
+        assert result["checks"]["declared_path_overlap"]["blocking"] is False
+        assert len(result["checks"]["declared_path_overlap"]["overlapping_prs"]) == 1
+
+    def test_declared_path_overlap_contract_violation_forced_advisory(self, monkeypatch):
+        """AC3: check の advisory/blocking フラグが崩れていても呼び出し側が安全側に強制する。"""
+        broken_result = _make_declared_path_overlap_result(disjoint=False)
+        broken_result["advisory"] = False
+        broken_result["blocking"] = True
+
+        with patch(
+            "declared_path_overlap.compute_declared_path_overlap_for_issue",
+            create=True,
+            return_value=broken_result,
+        ):
+            checked = _rcr_mod._run_declared_path_overlap_check(_ISSUE_NUMBER, _REPO)
+
+        assert checked["advisory"] is True
+        assert checked["blocking"] is False
+        assert any(
+            "declared_path_overlap_contract_violation_forced_advisory" in e
+            for e in checked["errors"]
+        )
+
+
 class TestStatusRouting:
     """Test that run_once correctly routes based on readiness status."""
 
@@ -366,7 +483,12 @@ class TestStatusRouting:
         with patch.object(_rcr_mod, "_run_script", side_effect=lambda *a, **kw: next(run_iter)):
             with patch.object(_rcr_mod, "_run_shell_script", side_effect=lambda *a, **kw: next(shell_iter)):
                 with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, None)):
-                    result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+                    with patch.object(
+                        _rcr_mod,
+                        "_run_declared_path_overlap_check",
+                        return_value=_make_declared_path_overlap_result(disjoint=True),
+                    ):
+                        result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
 
         assert result["status"] == "go"
         assert result["source"] == "all_checks_pass"
@@ -477,7 +599,12 @@ class TestIdempotencyCheck:
         with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, "gh_timeout")):
             with patch.object(_rcr_mod, "_run_script", side_effect=lambda *a, **kw: next(run_iter)):
                 with patch.object(_rcr_mod, "_run_shell_script", side_effect=lambda *a, **kw: next(shell_iter)):
-                    result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=False)
+                    with patch.object(
+                        _rcr_mod,
+                        "_run_declared_path_overlap_check",
+                        return_value=_make_declared_path_overlap_result(disjoint=True),
+                    ):
+                        result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=False)
 
         # Error recorded but not fatal
         assert any("idempotency_check_error" in e for e in result["errors"])
@@ -563,7 +690,12 @@ class TestSchemaOutput:
         with patch.object(_rcr_mod, "_run_script", side_effect=lambda *a, **kw: next(run_iter)):
             with patch.object(_rcr_mod, "_run_shell_script", side_effect=lambda *a, **kw: next(shell_iter)):
                 with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, None)):
-                    result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+                    with patch.object(
+                        _rcr_mod,
+                        "_run_declared_path_overlap_check",
+                        return_value=_make_declared_path_overlap_result(disjoint=True),
+                    ):
+                        result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
 
         required_fields = [
             "schema",

@@ -630,6 +630,10 @@ def run_once(
         return result
     elif vc_status == "pass":
         result["checks"]["vc_preflight"] = "pass"
+        # Step 6: declared_path_overlap (Issue #1680, advisory only).
+        result["checks"]["declared_path_overlap"] = _run_declared_path_overlap_check(
+            issue_number, repo
+        )
         result["status"] = "go"
         result["source"] = "all_checks_pass"
         return result
@@ -638,6 +642,70 @@ def run_once(
         result["status"] = "runtime_error"
         result["errors"].append(f"unknown_vc_preflight_status: {vc_status}")
         return result
+
+
+# ---------------------------------------------------------------------------
+# declared_path_overlap (Issue #1680, advisory only)
+# ---------------------------------------------------------------------------
+
+
+def _run_declared_path_overlap_check(issue_number: int, repo: str) -> dict[str, Any]:
+    """
+    declared_path_overlap (Issue #1680): OPEN PR の changed-file 名と対象
+    Issue の Allowed Paths の単純な重なりを advisory のみで記録する。
+
+    これは実 Git merge 競合の証明ではない。3-way merge・hunk 競合・
+    rename/delete 競合は評価しない（実 Git merge 競合の判定は Issue #1792 の
+    PAIRWISE_MERGE_OBSERVATION_V1 producer と、その呼び出し元配線
+    Issue #1793 に分離済み）。単独では blocking にしない — 呼び出し側
+    (run_once) はこの check の結果によって status を変えてはならない。
+    """
+    try:
+        from declared_path_overlap import compute_declared_path_overlap_for_issue
+    except ImportError:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "declared_path_overlap", _SCRIPTS_DIR / "declared_path_overlap.py"
+        )
+        if spec is None or spec.loader is None:
+            return {
+                "schema": "declared_path_overlap/v1",
+                "advisory": True,
+                "blocking": False,
+                "decision": "unavailable",
+                "disjoint": None,
+                "overlapping_prs": [],
+                "inventory": None,
+                "errors": ["module_load_error"],
+            }
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        compute_declared_path_overlap_for_issue = module.compute_declared_path_overlap_for_issue
+
+    overlap_result = compute_declared_path_overlap_for_issue(issue_number, repo)
+
+    # advisory-only の契約を呼び出し側で防御的に強制する: この check が
+    # どのような結果を返しても blocking にしてはならない。将来の実装ミスで
+    # advisory/blocking フラグが崩れていた場合は、安全側 (advisory=True /
+    # blocking=False) に強制上書きし、違反を errors に記録する。
+    if overlap_result.get("advisory") is not True or overlap_result.get("blocking") is not False:
+        overlap_result["advisory"] = True
+        overlap_result["blocking"] = False
+        overlap_result.setdefault("errors", []).append(
+            "declared_path_overlap_contract_violation_forced_advisory"
+        )
+
+    inventory = overlap_result.get("inventory") or {}
+    total_count = inventory.get("totalCount")
+    if total_count is not None and not inventory.get("complete", False):
+        overlap_result.setdefault("errors", []).append(
+            f"declared_path_overlap_inventory_incomplete: "
+            f"fetched={inventory.get('fetched_count')} totalCount={total_count}"
+        )
+
+    return overlap_result
 
 
 # ---------------------------------------------------------------------------

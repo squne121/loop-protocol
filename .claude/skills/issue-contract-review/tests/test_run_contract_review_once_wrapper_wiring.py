@@ -169,7 +169,10 @@ class TestBaselineVcPreflightTimeoutArgvAC3:
         with patch.object(_rcr_mod, "_run_script", side_effect=_fake_run_script):
             with patch.object(_rcr_mod, "_run_shell_script", return_value=(0, "OK", "")):
                 with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, None)):
-                    result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+                    with patch.object(
+                        _rcr_mod, "_run_declared_path_overlap_check", return_value={"disjoint": True}
+                    ):
+                        result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
 
         assert result["status"] == "go"
 
@@ -222,7 +225,10 @@ class TestVcPreflightMaxWorkersWiringAC9:
         with patch.object(_rcr_mod, "_run_script", side_effect=_fake_run_script):
             with patch.object(_rcr_mod, "_run_shell_script", return_value=(0, "OK", "")):
                 with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, None)):
-                    result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+                    with patch.object(
+                        _rcr_mod, "_run_declared_path_overlap_check", return_value={"disjoint": True}
+                    ):
+                        result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
 
         assert result["status"] == "go"
 
