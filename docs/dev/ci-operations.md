@@ -1,6 +1,6 @@
 # CI Operations Design
 
-**Status:** normative design / decision record
+**Status:** normative design / decision record（規範設計・意思決定記録）
 **Issue:** #894
 **Allowed Paths:** `docs/dev/ci-operations.md`
 
@@ -31,7 +31,7 @@ GitHub branch protection 上の "required check" と LOOP_PROTOCOL 独自の "ag
 
 ---
 
-## 3. CI Job Inventory（実 Job 名）
+## 3. CI ジョブ一覧（CI Job Inventory、実 Job 名を使用）
 
 `.github/workflows/ci.yml` 上の実際の job 名を使用する。チェック名を発明しない。
 
@@ -49,7 +49,7 @@ GitHub branch protection 上の "required check" と LOOP_PROTOCOL 独自の "ag
 
 **注意:** `e2e` は単なる runtime gate ではなく、Playwright report / test-results / visual evidence summary を持つ evidence producer でもある。現在の workflow は `playwright-report` と `test-results` を `!cancelled()` 条件で upload し、環境 fingerprint や artifact URL を summary に書く。`test-results` は visual mismatch 等で差分が発生した場合のみ artifact が生成されるため、conditional evidence として扱う（Section 8.1 参照）。
 
-### 3.1 PR Hygiene / Retrospective Checks（Check Japanese Content workflow）
+### 3.1 PR 衛生チェックと事後点検（PR Hygiene / Retrospective Checks、Check Japanese Content workflow）
 
 `.github/workflows/ci.yml` 外のチェックも merge-ready 判定に現れる。
 
@@ -64,9 +64,9 @@ GitHub branch protection 上の "required check" と LOOP_PROTOCOL 独自の "ag
 
 ---
 
-## 4. GitHub Branch Protection Semantics vs Agent Merge-Ready Semantics
+## 4. GitHub Branch Protection の意味論 と Agent Merge-Ready の意味論の対比（GitHub Branch Protection Semantics vs Agent Merge-Ready Semantics）
 
-### 4.1 GitHub Branch Protection Semantics
+### 4.1 GitHub 標準機能としての Branch Protection の意味論（GitHub Branch Protection Semantics）
 
 GitHub の branch protection 上の "required status check" は、GitHub プラットフォームが merge gate として判断する状態に基づく。
 
@@ -77,7 +77,7 @@ GitHub 公式仕様では、required status check は次の conclusion で満た
 
 ただし **LOOP_PROTOCOL の agent merge-ready ではこの扱いを採用しない**。詳細は 4.2 を参照。
 
-### 4.2 Agent Merge-Ready Semantics（LOOP_PROTOCOL 固有）
+### 4.2 Agent Merge-Ready の意味論（Agent Merge-Ready Semantics、LOOP_PROTOCOL 固有の定義）
 
 AI エージェントが merge-ready と判断してよいのは、以下の条件をすべて満たす場合のみ:
 
@@ -155,7 +155,7 @@ agent merge-ready = すべての required job が (head_sha == expected_head_sha
 
 ---
 
-## 7. concurrency / cancellation の扱い
+## 7. 同時実行制御・取消の扱い（concurrency / cancellation の扱い）
 
 現在の `.github/workflows/ci.yml` は `concurrency.cancel-in-progress: true` を設定している。
 これにより古い PR head の CI run がキャンセルされ得る。
@@ -169,9 +169,9 @@ agent merge-ready = すべての required job が (head_sha == expected_head_sha
 
 ---
 
-## 8. Evidence Artifact Policy
+## 8. 証跡アーティファクト方針（Evidence Artifact Policy）
 
-### 8.1 Required evidence artifact の missing policy
+### 8.1 必須証跡アーティファクトの欠落時方針（Required evidence artifact の missing policy）
 
 | job | artifact 名 | if-no-files-found | missing 時の verdict |
 |---|---|---|---|
@@ -184,7 +184,7 @@ agent merge-ready = すべての required job が (head_sha == expected_head_sha
 > `required evidence` と位置づけるなら `error` にすべきだが、現時点では warn 運用。
 > 変更スコープは別 Issue。
 
-### 8.2 Retention Policy
+### 8.2 保持期間方針（Retention Policy）
 
 | artifact 名 | retention-days | 根拠 |
 |---|---|---|
@@ -302,7 +302,7 @@ S3 / external cache は次を**すべて**満たす別 Issue まで採用しな�
 
 ---
 
-## 10.5 Implementation Status Matrix
+## 10.5 実装状況マトリクス（Implementation Status Matrix）
 
 この文書の設計ポリシーと現行実装の対応状況を示す。`operative now? = no` の行は normative design のみであり、実装済みと誤読しないこと。
 
@@ -319,7 +319,7 @@ S3 / external cache は次を**すべて**満たす別 Issue まで採用しな�
 
 ---
 
-## 11. ci_verdict_summary_v2 Schema
+## 11. ci_verdict_summary_v2 スキーマ定義（Schema）
 
 ### 11.1 目的と位置づけ
 
@@ -413,7 +413,7 @@ checks:
 
 以下は `ci_verdict_summary_v2` の generator が保証しなければならない不変条件。
 
-#### required / evidence invariant
+#### required / evidence の不変条件（invariant）
 
 1. `skipped` 結論は `required` / `evidence` check で `pass` とみなさない
    - `failure_reason = skipped_required`、`blocking_merge_ready = true`
@@ -423,12 +423,12 @@ checks:
    - `required` / `evidence` 分類かつ `head_sha=null` → `blocking_merge_ready = true`
    - `excluded` 分類かつ `head_sha=null + skipped` → `blocking_merge_ready = false`（allowlist のみ）
 
-#### head_sha invariant
+#### head_sha の不変条件（invariant）
 
-4. `head_sha_match = (head_sha is not null) AND (head_sha == expected_head_sha)`
-5. `head_sha != expected_head_sha`（mismatch） → `failure_reason = stale_head_sha`
+4. `head_sha_match = (head_sha is not null) AND (head_sha == expected_head_sha)` という一致判定式を用いる
+5. `head_sha != expected_head_sha`（mismatch） → `failure_reason = stale_head_sha` に分類する
 
-#### overall_status invariant
+#### overall_status の不変条件（invariant）
 
 6. `blocking_merge_ready = true` な check が 1 件でもある → `overall_status != merge_ready`
 7. `overall_status = merge_ready` ↔ `all checks: blocking_merge_ready = false`
@@ -455,7 +455,7 @@ checks:
 | V1 deprecation | V2 が CI に安定稼働し、consumer（pr-review-judge）が V2 に完全移行した後。別 Issue で決定 |
 | V1 removal | V2 移行完了・consumer 移行後。別 Issue で決定 |
 
-### 12.2 V1 → V2 migration table
+### 12.2 V1 → V2 移行対応表（migration table）
 
 | 項目 | CI_VERDICT_SUMMARY_V1 | ci_verdict_summary_v2 |
 |---|---|---|

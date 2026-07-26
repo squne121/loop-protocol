@@ -168,7 +168,11 @@ def test_real_plan_serial_lane_has_debounce():
     parallel_exclude to remove a real xdist race: its repo-tree snapshot window can
     be polluted by a concurrent worker running test_summarize_agent_transcript.py.
     tests/codex/test_scope_rollup_runner_agent_config.py is also serial because
-    its raw adapter-to-capture E2E is parallel-unsafe on the GitHub runner. The
+    its raw adapter-to-capture E2E is parallel-unsafe on the GitHub runner.
+    .claude/skills/issue-contract-review/scripts/tests/test_baseline_vc_preflight.py
+    was added to parallel_exclude (Issue #1788 PR #1790 CI fixup) because
+    test_issue_393_snapshot_fixture_processed's real subprocess call hit its 90s
+    timeout under 4-way xdist CPU saturation on the GitHub-hosted runner. The
     debounce test itself must NOT be excluded.
     """
     plan = mod.load_plan(_PLAN_PATH)
@@ -178,6 +182,7 @@ def test_real_plan_serial_lane_has_debounce():
         "0",
         "scripts/agent-guards/tests/test_skill_runtime_exec_session_manifest.py",
         "tests/codex/test_scope_rollup_runner_agent_config.py",
+        ".claude/skills/issue-contract-review/scripts/tests/test_baseline_vc_preflight.py",
         "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py",
         "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable",
         "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths",
