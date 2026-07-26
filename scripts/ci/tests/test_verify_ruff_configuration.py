@@ -40,6 +40,8 @@ select = ["E", "F"]
 jobs:
   python-test:
     steps:
+      - name: Verify Ruff configuration authority
+        run: uv run --locked python3 scripts/ci/verify_ruff_configuration.py --root .
       - name: Ruff check (timed)
         run: |
           run_timed ruff_check %s
@@ -76,7 +78,7 @@ def _run_cli(root: Path) -> subprocess.CompletedProcess[str]:
 def _write_linted_python_file(root: Path, relative_path: str) -> None:
     path = root / relative_path
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("value = 1\n", encoding="utf-8")
+    path.write_text("value = 1\nimport os\n", encoding="utf-8")
 
 
 def test_given_valid_authorities_when_verified_then_no_failure_keys(tmp_path: Path):
@@ -96,6 +98,35 @@ def test_rejects_workflow_cli_rule_override(tmp_path: Path):
         tmp_path,
         ruff_command=(
             "uv run --locked ruff check --select E,F "
+            ".claude/scripts scripts schemas .claude/skills"
+        ),
+    )
+
+    assert "workflow_cli_rule_override" in _failure_keys(fixture)
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--select", "E"),
+        ("--extend-select", "I"),
+        ("--ignore", "E402"),
+        ("--extend-ignore", "E402"),
+        ("--per-file-ignores", "*.py:E402"),
+        ("--extend-per-file-ignores", "*.py:E402"),
+        ("--config", "lint.select=['ALL']"),
+        ("--isolated", None),
+        ("--preview", None),
+    ],
+)
+def test_given_each_rule_override_when_verified_then_rejects_workflow_authority_override(
+    tmp_path: Path, option: str, value: str | None
+):
+    override = option if value is None else f"{option} {value}"
+    fixture = _write_fixture(
+        tmp_path,
+        ruff_command=(
+            f"uv run --locked ruff check {override} "
             ".claude/scripts scripts schemas .claude/skills"
         ),
     )
@@ -281,7 +312,7 @@ per-file-ignores = { "tests/example.py" = ["E402"] }
 
 @pytest.mark.parametrize("relative_path", ["scripts/example.py", "scripts/example.pyi"])
 def test_given_existing_target_python_e402_exception_when_verified_then_accepts_exception(
-    tmp_path: Path, relative_path: str
+    tmp_path: Path, relative_path: str, monkeypatch: pytest.MonkeyPatch
 ):
     fixture = _write_fixture(
         tmp_path,
@@ -292,8 +323,102 @@ per-file-ignores = {{ "{relative_path}" = ["E402"] }}
 """.lstrip(),
     )
     _write_linted_python_file(fixture, relative_path)
+    monkeypatch.setattr(checker, "_probe_e402_diagnostic", lambda _root, _path: (True, "E402 diagnostic observed"))
 
     assert _failure_keys(fixture) == set()
+
+
+def test_given_e402_exception_without_isolated_diagnostic_when_verified_then_rejects_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    fixture = _write_fixture(
+        tmp_path,
+        pyproject="""
+[tool.ruff.lint]
+select = ["E", "F"]
+per-file-ignores = { "scripts/example.py" = ["E402"] }
+""".lstrip(),
+    )
+    _write_linted_python_file(fixture, "scripts/example.py")
+    monkeypatch.setattr(checker, "_probe_e402_diagnostic", lambda _root, _path: (False, "timeout"))
+
+    assert "ruff_per_file_e402_diagnostic_missing" in _failure_keys(fixture)
+
+
+def test_given_e402_probe_timeout_when_probed_then_reports_no_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    def _timeout(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd="ruff", timeout=checker.E402_PROBE_TIMEOUT_SECONDS)
+
+    monkeypatch.setattr(checker.subprocess, "run", _timeout)
+
+    observed, detail = checker._probe_e402_diagnostic(tmp_path, "scripts/example.py")
+
+    assert not observed
+    assert "failed" in detail
+
+
+def test_given_current_e402_exception_when_isolated_probe_runs_then_observes_actual_diagnostic():
+    root = Path(__file__).resolve().parents[3]
+
+    observed, detail = checker._probe_e402_diagnostic(
+        root,
+        ".claude/skills/create-issue/scripts/validate_issue_body.py",
+    )
+
+    assert observed, detail
+
+
+def test_given_additional_workflow_ruff_invocation_when_verified_then_rejects_all_workflow_invocations(
+    tmp_path: Path,
+):
+    fixture = _write_fixture(tmp_path)
+    workflow = fixture / ".github/workflows/ci.yml"
+    workflow.write_text(
+        workflow.read_text(encoding="utf-8")
+        + """
+  extra:
+    steps:
+      - name: Extra Ruff
+        run: uv run --locked ruff check --select E .
+""",
+        encoding="utf-8",
+    )
+
+    assert "workflow_ruff_invocation_count_invalid" in _failure_keys(fixture)
+
+
+def test_given_missing_ci_root_verifier_when_verified_then_rejects_workflow(
+    tmp_path: Path,
+):
+    fixture = _write_fixture(tmp_path)
+    workflow = fixture / ".github/workflows/ci.yml"
+    workflow.write_text(
+        workflow.read_text(encoding="utf-8").replace(
+            "      - name: Verify Ruff configuration authority\n"
+            "        run: uv run --locked python3 scripts/ci/verify_ruff_configuration.py --root .\n",
+            "",
+        ),
+        encoding="utf-8",
+    )
+
+    assert "workflow_ruff_verifier_root_step_invalid" in _failure_keys(fixture)
+
+
+def test_given_extend_select_when_verified_then_rejects_unresolved_rule_configuration(
+    tmp_path: Path,
+):
+    fixture = _write_fixture(
+        tmp_path,
+        pyproject="""
+[tool.ruff.lint]
+select = ["E", "F"]
+extend-select = ["I"]
+""".lstrip(),
+    )
+
+    assert "ruff_rule_configuration_not_resolved" in _failure_keys(fixture)
 
 
 @pytest.mark.parametrize(

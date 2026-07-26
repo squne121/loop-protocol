@@ -920,6 +920,8 @@ jobs:
             return $status
           }
           run_timed ruff_check uv run --locked ruff check .claude/scripts scripts schemas .claude/skills
+      - name: Verify Ruff configuration authority
+        run: uv run --locked python3 scripts/ci/verify_ruff_configuration.py --root .
       - name: Install ripgrep
         run: sudo apt-get install -y ripgrep
       - name: Verify Python version
