@@ -1570,6 +1570,21 @@ CONTRACT_SNAPSHOT_MATERIALIZATION_PENDING_V1:
         vc_preflight_classifications, ensure_ascii=False, separators=(",", ":")
     )
 
+    # P0-2 (#1794 PR review): declared_path_overlap (Issue #1680, advisory
+    # only) was being dropped when building the authoritative
+    # CONTRACT_REVIEW_RESULT_V1 comment -- run_contract_review_once.py
+    # produces it in review_result["checks"]["declared_path_overlap"] but
+    # this builder only ever forwarded a fixed set of keys. Persist it as a
+    # compact JSON string, matching the product_spec_check embedding style,
+    # so the authoritative go snapshot round-trips this volatile,
+    # OPEN-PR-live observation instead of silently discarding it.
+    declared_path_overlap = checks.get("declared_path_overlap")
+    if not isinstance(declared_path_overlap, dict):
+        declared_path_overlap = {}
+    declared_path_overlap_json = json.dumps(
+        declared_path_overlap, ensure_ascii=False, separators=(",", ":")
+    )
+
     fingerprint_json = json.dumps(
         expected_contract_fingerprint, ensure_ascii=False, separators=(",", ":")
     )
@@ -1594,6 +1609,7 @@ CONTRACT_REVIEW_RESULT_V1:
     vc_preflight:
       decision: {vc_preflight_check}
       classifications: {classifications_json}
+    declared_path_overlap: {declared_path_overlap_json}
   source: ensure_contract_snapshot_auto{fingerprint_yaml}
 ```
 """
