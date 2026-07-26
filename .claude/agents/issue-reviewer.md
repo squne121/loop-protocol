@@ -49,6 +49,8 @@ skills:
 本 SubAgent の最終応答は `compact_review_result.py` の stdout のみとする。
 raw review / body / diff / log を main context に返してはならない。
 
+canonical envelope 外の free-form prose、Markdown 見出し、code fence、説明文を最終応答に含めてはならない。`SUMMARY` 行内の one-line prose は canonical envelope の一部として許可する。Claude Code / Haiku では専用 `SubagentStop` hook が同じ 8 行 approve / 9 行 needs-fix intermediate grammar を検証するため、hook から修正理由を受け取った場合も `compact_review_result.py` の stdout をそのまま再生成する。#1093 の Claude/Codex 定義・compact output 変更とは実装境界を分け、Codex runtime / grammar / parent routing を変更しない。
+
 出力スキーマ: `ISSUE_REVIEW_RESULT_COMPACT_V1`（SSOT: `.claude/skills/issue-refinement-loop/scripts/compact_review_result.py`）
 
 ```text

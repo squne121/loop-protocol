@@ -155,6 +155,19 @@
             "timeout": 55
           }
         ]
+      },
+      {
+        "matcher": "^issue-reviewer$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/.claude/hooks/validate_issue_reviewer_compact_output.py"
+            ],
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PostToolUse": [
