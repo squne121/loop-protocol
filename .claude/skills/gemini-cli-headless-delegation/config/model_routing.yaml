@@ -72,14 +72,17 @@ roles:
 # tests/test_quota_fallback.py compares every key below against the Python
 # constants and fails closed on drift.
 #
-# setup_check_order (setup_check.py --provider auto) is agy-first and is a
-# SEPARATE policy from runtime_order below -- see references/model-routing.md
-# for why the two orders intentionally differ.
+# Issue #1692 (human decision, 2026-07-26, PR #1798 comment): agy is now
+# the first provider, gemini the second/fallback provider. setup_check_order
+# (setup_check.py --provider auto) is also agy-first, so it now matches
+# runtime_order below (previously the two intentionally differed -- see
+# references/model-routing.md, which still documents the pre-#1692
+# gemini-first runtime_order and is a documented follow-up to refresh).
 provider_auto_policy_v1:
   schema_version: v1
   runtime_order:
-    - gemini
     - agy
+    - gemini
   setup_check_order:
     - agy
     - gemini
