@@ -263,6 +263,14 @@ wrapper は **isolated temp cwd**（`tempfile.mkdtemp()` で生成されたデ�
 `validate_request(request, request_path=...)` の `request_path` 引数は省略可能だが、
 省略した場合は `Path.cwd()` を基準に `context_files` の相対パスを解決する。
 
+**`validate_request_for_provider(request, request_path=...)`（Issue #1692）**: provider-aware な検証 entrypoint。
+`request["provider"]`（省略時 `"gemini"`）に応じて `provider="gemini"`/`"auto"` は `validate_request()`、
+`provider="agy"` は `_validate_agy_request()`（`tool_profile="local_asset_research"` のときはさらに
+`_validate_agy_local_asset_request()` も）へ dispatch する。`build_request.py` と
+`run_gemini_headless.py --validate-only` はこの単一 entrypoint を共有し、どちらも private validator
+（`_validate_agy_request` 等）を直接呼ばない（validate-only を通過した request が実行時に別の
+validator で失敗する split-brain を防止する）。
+
 **テストで `validate_request` を呼ぶ場合の注意**:
 - `context_files` に相対パスを指定するときは、必ず `request_path` を渡すか `monkeypatch.chdir` でカレントディレクトリを合わせること。
 - `request_path` を渡す場合: `context_files` は `request_path.parent` を基準に解決される。
@@ -510,6 +518,25 @@ while IFS= read -r line; do echo "$line" | jq . > /dev/null && echo "OK" || echo
 ```
 
 - `--compact` と `--output-format ndjson` は組み合わせ可能。compact 後のオブジェクトを1行で追記する。
+
+### `build_request.py`（provider-aware request builder, Issue #1692）
+
+```
+build_request.py --profile <TOOL_PROFILE> --objective <STR> [--instruction <STR> ...] \
+  [--context-file <PATH> ...] [--gh-pr <N>] [--gh-issue <N>] [--output <PATH>] \
+  [--provider {gemini,agy,auto}] [--role <ROLE_NAME>] [--model <MODEL>] [--prompt <STR>]
+```
+
+| オプション | 説明 |
+|---|---|
+| `--provider` | 生成する request の provider。省略時は legacy 挙動（request に `provider` フィールドを一切埋め込まない、既存 caller 完全後方互換）。明示指定時（`gemini` / `agy` / `auto` いずれでも）は `provider` フィールドが request に埋め込まれる。 |
+| `--role` | request に埋め込む `role`（quota 枯渇時の降格チェーン選択に使用）。`--model` と同時指定は builder レベルで fail-closed（`failure_class=model_role_conflict`）。 |
+| `--model` | request に埋め込む明示 `model`。`--role` と同時指定不可。`--provider agy`（`failure_class=agy_model_not_supported`）・`--provider auto`（`failure_class=auto_model_not_supported`）では指定不可。 |
+| `--prompt` | `--provider agy` の prompt-first request 用（必須。空/空白のみは `failure_class=agy_prompt_required`）。`--provider gemini`（`failure_class=gemini_prompt_not_supported`）・`--provider auto`（`failure_class=auto_prompt_not_supported`）では指定不可（`auto` は `provider_auto_dispatch()` が request をコピーして `provider` のみ差し替えるため、caller 任意 prompt を許すと Gemini 経路と AGY フォールバック経路で異なるタスクを処理しうる）。 |
+
+`--provider agy` 時は `--objective`/`--instruction`/`--context-file` は不要（`tool_profile` と `--prompt` のみで prompt-first request を構築する。`--context-file` を指定した場合は resolve 済み `context_files` として request に含める）。`--provider gemini`（省略時含む）・`--provider auto` は既存の構造化入力（`--objective`/`--instruction`/`--context-file`）契約を使う。
+
+生成した request は `run_gemini_headless.validate_request_for_provider()`（`build_request.py` と `run_gemini_headless.py --validate-only` が共有する単一の provider-aware entrypoint）で検証してから書き出す。
 
 ### `preflight_gemini_headless.py`
 

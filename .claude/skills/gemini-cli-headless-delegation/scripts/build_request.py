@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """build_request.py — Build a delegation_request_v1 JSON for gemini-cli-headless-delegation.
 
-Usage:
+Usage (legacy, provider=gemini shape, unspecified --provider):
     uv run python3 build_request.py \\
       --profile <tool_profile> \\
       --objective <str> \\
@@ -10,6 +10,30 @@ Usage:
       [--gh-pr <N>] \\
       [--gh-issue <N>] \\
       [--output <path>]
+
+Usage (provider-aware, Issue #1692):
+    uv run python3 build_request.py \\
+      --provider {gemini,agy,auto} \\
+      [--role <role_name>] \\
+      [--model <MODEL>] \\
+      [--prompt <STR>]            # provider=agy only (prompt-first contract)
+      --profile <tool_profile> \\
+      --objective <str> \\
+      [--instruction <str> ...]  \\
+      [--context-file <path> ...] \\
+      [--output <path>]
+
+    --model and --role are mutually exclusive (builder-level fail-closed:
+    failure_class=model_role_conflict).
+    --provider agy requires --prompt (non-empty) and forbids --model
+    (failure_class=agy_prompt_required / agy_model_not_supported).
+    --provider auto forbids both --prompt and --model
+    (failure_class=auto_prompt_not_supported / auto_model_not_supported):
+    provider_auto_dispatch() copies the request and only swaps the
+    `provider` field, so an independently caller-specified --prompt could
+    make the Gemini attempt (objective/instructions -> build_prompt()) and
+    the AGY fallback attempt (request["prompt"] verbatim) diverge onto
+    different tasks (Issue #1692 Blocker 1).
 
     uv run python3 build_request.py model-policy \\
       --provider {gemini,agy,auto} \\
@@ -24,7 +48,11 @@ Exit codes:
     2  Internal error.
 
 The generated JSON conforms to delegation_request_v1 schema and is validated
-against run_gemini_headless.validate_request before being written.
+against run_gemini_headless.validate_request_for_provider() before being
+written -- the same provider-aware entrypoint that
+run_gemini_headless.py --validate-only uses, so a request that passes
+validate-only cannot fail at runtime under a different validator
+(Issue #1692: validator split-brain fix).
 
 The `model-policy` subcommand is a read-only, no-side-effect inspector: it
 never writes a request file. It dispatches only when argv[0] == "model-policy"
@@ -116,9 +144,15 @@ def _load_run_gemini_headless_module():
     return module
 
 
-def _load_validate_request():
-    """Dynamically load validate_request from run_gemini_headless.py."""
-    return _load_run_gemini_headless_module().validate_request
+def _load_validate_request_for_provider():
+    """Dynamically load validate_request_for_provider from run_gemini_headless.py.
+
+    Issue #1692: build_request.py and run_gemini_headless.py --validate-only
+    must share this single provider-aware entrypoint. Private validators
+    (_validate_agy_request / _validate_agy_local_asset_request) must never be
+    called directly from this file.
+    """
+    return _load_run_gemini_headless_module().validate_request_for_provider
 
 
 # ---------------------------------------------------------------------------
@@ -258,26 +292,240 @@ def _resolve_context_files(
 # ---------------------------------------------------------------------------
 
 
-def build_request(
+def _build_agy_request(
+    *,
     profile: str,
-    objective: str,
-    instructions: list[str] | None,
+    role: str | None,
+    model: str | None,
+    prompt: str | None,
     context_files: list[str] | None,
-    gh_pr: int | None,
-    gh_issue: int | None,
     output: Path | None,
-    base_dir: Path | None = None,
+    base_dir: Path | None,
 ) -> int:
-    """Build and validate a delegation_request_v1.
+    """Build and validate a provider=agy (prompt-first) delegation_request_v1.
 
-    Returns exit code: 0 = success, 1 = validation/usage error, 2 = internal error.
+    Issue #1692 AC5: the generated request contains `prompt` and never
+    contains `model`. `objective`/`instructions` are not required for this
+    contract (usage-contract.md: "objective / instructions / output_sections
+    / context_files は既存 caller 互換のため指定されていてもよいが... primary
+    contract は prompt / tool_profile"); `context_files` is passed through
+    (resolved) only when explicitly given (e.g. local_asset_research).
     """
     if profile not in VALID_PROFILES:
         _write_failure(
             output=output,
             failure_class="invalid_profile",
             failure_reason=f"tool_profile '{profile}' is not valid; choose one of: {sorted(VALID_PROFILES)}",
-            next_action_argv=["build_request.py", "--profile", "<valid_profile>", "--objective", objective],
+            next_action_argv=["build_request.py", "--provider", "agy", "--profile", "<valid_profile>", "--prompt", "<prompt>"],
+        )
+        return 1
+
+    if model is not None:
+        _write_failure(
+            output=output,
+            failure_class="agy_model_not_supported",
+            failure_reason=(
+                "--provider agy does not support explicit model selection "
+                "(prompt-first contract): the AGY wrapper has no configurable "
+                "model chain at runtime."
+            ),
+            next_action_argv=["build_request.py", "--provider", "agy", "--profile", profile, "--prompt", "<prompt>"],
+        )
+        return 1
+
+    if prompt is None or not str(prompt).strip():
+        _write_failure(
+            output=output,
+            failure_class="agy_prompt_required",
+            failure_reason="--provider agy requires a non-empty --prompt (prompt-first contract).",
+            next_action_argv=["build_request.py", "--provider", "agy", "--profile", profile, "--prompt", "<prompt>"],
+        )
+        return 1
+
+    request: dict[str, Any] = {
+        "schema": SCHEMA,
+        "provider": "agy",
+        "tool_profile": profile,
+        "prompt": prompt,
+    }
+    if role:
+        request["role"] = role
+
+    if context_files:
+        cwd = base_dir or Path.cwd()
+        resolved_context = _resolve_context_files(
+            raw_paths=context_files,
+            base_dir=cwd,
+            output=output,
+            profile=profile,
+        )
+        if resolved_context is None:
+            return 1
+        request["context_files"] = resolved_context
+
+    try:
+        validate_request_for_provider = _load_validate_request_for_provider()
+        validation_errors = validate_request_for_provider(request, request_path=output)
+    except Exception as exc:  # pylint: disable=broad-except
+        _write_failure(
+            output=output,
+            failure_class="internal_error",
+            failure_reason=f"Failed to load validate_request_for_provider: {exc}",
+            next_action_argv=["build_request.py", "--help"],
+        )
+        return 2
+
+    if validation_errors:
+        _write_failure(
+            output=output,
+            failure_class="validation_error",
+            failure_reason=validation_errors[0],
+            next_action_argv=["build_request.py", "--provider", "agy", "--profile", profile, "--prompt", str(prompt), "--help"],
+        )
+        return 1
+
+    payload_str = json.dumps(request, ensure_ascii=False, indent=2) + "\n"
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(payload_str, encoding="utf-8")
+        print(f"[build_request] request written to: {output}")
+    else:
+        print(payload_str, end="")
+
+    return 0
+
+
+def build_request(
+    profile: str,
+    objective: str | None,
+    instructions: list[str] | None,
+    context_files: list[str] | None,
+    gh_pr: int | None,
+    gh_issue: int | None,
+    output: Path | None,
+    base_dir: Path | None = None,
+    provider: str | None = None,
+    role: str | None = None,
+    model: str | None = None,
+    prompt: str | None = None,
+) -> int:
+    """Build and validate a delegation_request_v1.
+
+    Issue #1692 (provider-aware builder): `provider=None` means "unspecified"
+    (legacy invocation) -- the generated request never gains a `provider`
+    field and the legacy gemini-only request shape does not regress (AC1).
+    Any other explicit value ("gemini", "agy", "auto") causes the
+    corresponding `provider` field (and `role`/`model`, when given) to be
+    embedded in the generated request.
+
+    `--model` and `--role` are mutually exclusive at the builder level for
+    every provider (AC2): the runtime keeps "explicit model wins"
+    precedence for backward compatibility, but a caller-facing builder must
+    not silently let a caller's `--role` be ignored.
+
+    `provider="agy"` dispatches to `_build_agy_request()` (prompt-first
+    contract, AC5). `provider="auto"` rejects `--prompt`/`--model`
+    (AC6) and otherwise reuses the same structured (objective/instructions/
+    context_files) contract as `provider="gemini"`.
+
+    Returns exit code: 0 = success, 1 = validation/usage error, 2 = internal error.
+    """
+    # AC2: --model and --role are mutually exclusive, regardless of provider.
+    if model is not None and role is not None:
+        _write_failure(
+            output=output,
+            failure_class="model_role_conflict",
+            failure_reason=(
+                "--model and --role must not both be specified: pick either an "
+                "explicit --model or a --role for downgrade-chain resolution."
+            ),
+            next_action_argv=[
+                "build_request.py",
+                "--role",
+                role,
+                "--profile",
+                profile,
+                "--objective",
+                objective or "<objective>",
+            ],
+        )
+        return 1
+
+    effective_provider = provider if provider is not None else "gemini"
+
+    if effective_provider == "agy":
+        return _build_agy_request(
+            profile=profile,
+            role=role,
+            model=model,
+            prompt=prompt,
+            context_files=context_files,
+            output=output,
+            base_dir=base_dir,
+        )
+
+    if effective_provider == "auto":
+        if prompt is not None:
+            _write_failure(
+                output=output,
+                failure_class="auto_prompt_not_supported",
+                failure_reason=(
+                    "--provider auto does not accept --prompt: provider_auto_dispatch() "
+                    "copies the request and only swaps the provider field, so an "
+                    "independently caller-specified prompt could diverge from the "
+                    "objective/instructions used by the gemini attempt "
+                    "(Issue #1692 Blocker 1). Use --objective/--instruction/--context-file."
+                ),
+                next_action_argv=[
+                    "build_request.py",
+                    "--provider",
+                    "auto",
+                    "--profile",
+                    profile,
+                    "--objective",
+                    objective or "<objective>",
+                ],
+            )
+            return 1
+        if model is not None:
+            _write_failure(
+                output=output,
+                failure_class="auto_model_not_supported",
+                failure_reason=(
+                    "--provider auto does not accept --model: an explicit model would "
+                    "carry over into an AGY fallback attempt and fail there with "
+                    "unsupported_provider_option."
+                ),
+                next_action_argv=[
+                    "build_request.py",
+                    "--provider",
+                    "auto",
+                    "--profile",
+                    profile,
+                    "--objective",
+                    objective or "<objective>",
+                ],
+            )
+            return 1
+
+    if effective_provider == "gemini" and prompt is not None:
+        _write_failure(
+            output=output,
+            failure_class="gemini_prompt_not_supported",
+            failure_reason=(
+                "--prompt is only supported with --provider agy (prompt-first contract); "
+                "provider=gemini uses --objective/--instruction/--context-file."
+            ),
+            next_action_argv=["build_request.py", "--profile", profile, "--objective", objective or "<objective>"],
+        )
+        return 1
+
+    if profile not in VALID_PROFILES:
+        _write_failure(
+            output=output,
+            failure_class="invalid_profile",
+            failure_reason=f"tool_profile '{profile}' is not valid; choose one of: {sorted(VALID_PROFILES)}",
+            next_action_argv=["build_request.py", "--profile", "<valid_profile>", "--objective", objective or "<objective>"],
         )
         return 1
 
@@ -377,10 +625,21 @@ def build_request(
     if gh_commands:
         request["gh_commands"] = gh_commands
 
-    # Validate via run_gemini_headless.validate_request
+    # Issue #1692 AC1: embed provider/role/model only when explicitly given
+    # (provider is None => legacy invocation => legacy request shape).
+    if provider is not None:
+        request["provider"] = provider
+    if role:
+        request["role"] = role
+    if model:
+        request["model"] = model
+
+    # Validate via run_gemini_headless.validate_request_for_provider (Issue #1692:
+    # single provider-aware entrypoint shared with --validate-only; never call
+    # a private validator directly from this file).
     try:
-        validate_request = _load_validate_request()
-        validation_errors = validate_request(request, request_path=output)
+        validate_request_for_provider = _load_validate_request_for_provider()
+        validation_errors = validate_request_for_provider(request, request_path=output)
     except Exception as exc:  # pylint: disable=broad-except
         _write_failure(
             output=output,
@@ -395,7 +654,7 @@ def build_request(
             output=output,
             failure_class="validation_error",
             failure_reason=validation_errors[0],
-            next_action_argv=["build_request.py", "--profile", profile, "--objective", objective, "--help"],
+            next_action_argv=["build_request.py", "--profile", profile, "--objective", objective or "<objective>", "--help"],
         )
         return 1
 
@@ -844,9 +1103,56 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--objective",
-        required=True,
+        required=False,
+        default=None,
         metavar="STR",
-        help="Specific objective for the Gemini delegation.",
+        help=(
+            "Specific objective for the Gemini delegation. Required for "
+            "--provider gemini/auto (or when --provider is omitted); not used "
+            "for --provider agy (prompt-first contract, see --prompt)."
+        ),
+    )
+    parser.add_argument(
+        "--provider",
+        choices=list(MODEL_POLICY_PROVIDERS),
+        default=None,
+        metavar="{gemini,agy,auto}",
+        help=(
+            "Provider for the generated request (Issue #1692). Default: "
+            "unspecified, which produces the legacy gemini-shape request with "
+            "no `provider` field embedded. Explicitly passing --provider "
+            "gemini/agy/auto embeds the corresponding `provider` field."
+        ),
+    )
+    parser.add_argument(
+        "--role",
+        default=None,
+        metavar="ROLE_NAME",
+        help=(
+            "Role embedded in the generated request (used for downgrade-chain "
+            "resolution). Mutually exclusive with --model (builder-level "
+            "fail-closed: failure_class=model_role_conflict)."
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        metavar="MODEL",
+        help=(
+            "Explicit model embedded in the generated request. Mutually "
+            "exclusive with --role. Not supported for --provider agy/auto "
+            "(builder-level fail-closed)."
+        ),
+    )
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        metavar="STR",
+        help=(
+            "Prompt for a --provider agy request (prompt-first contract, "
+            "required for provider=agy). Not supported for --provider gemini "
+            "or --provider auto (builder-level fail-closed)."
+        ),
     )
     parser.add_argument(
         "--instruction",
@@ -908,6 +1214,10 @@ def main(argv: list[str] | None = None) -> int:
         gh_pr=args.gh_pr,
         gh_issue=args.gh_issue,
         output=args.output,
+        provider=args.provider,
+        role=args.role,
+        model=args.model,
+        prompt=args.prompt,
     )
 
 

@@ -1347,6 +1347,47 @@ def validate_request(request: Mapping[str, Any], request_path: Path | None = Non
     return errors
 
 
+def validate_request_for_provider(
+    request: Mapping[str, Any], request_path: Path | None = None
+) -> list[str]:
+    """Provider-aware validation entrypoint (Issue #1692).
+
+    Dispatches by request["provider"] (default "gemini", matching
+    _run_delegation_core()'s own default):
+
+      - provider="gemini" (default): validate_request() -- the full Gemini
+        delegation_request_v1 contract.
+      - provider="auto": validate_request() as well. provider="auto" shares
+        the same structured (objective/instructions/context_files) request
+        shape as provider="gemini" at build/validate time; the concrete
+        gemini/agy candidate is only chosen at execution time by
+        provider_auto_dispatch().
+      - provider="agy": _validate_agy_request() (schema / tool_profile /
+        forbidden `model` / non-empty `prompt`), plus
+        _validate_agy_local_asset_request() when tool_profile is
+        "local_asset_research" -- mirroring _run_delegation_core()'s own
+        agy dispatch order exactly (see the `provider == "agy"` branch
+        there), so this function never invents an independent ordering.
+      - any other provider: a single unknown_provider error, mirroring
+        _run_delegation_core()'s SUPPORTED_PROVIDERS fail-closed default.
+
+    This is the single entrypoint that build_request.py and
+    run_gemini_headless.py --validate-only must share -- callers must not
+    call _validate_agy_request() / _validate_agy_local_asset_request()
+    directly, or a request that passes validate-only could still fail at
+    execution time under a different validator (validator split-brain).
+    """
+    provider = request.get("provider", "gemini")
+    if provider in ("gemini", "auto"):
+        return validate_request(request, request_path=request_path)
+    if provider == "agy":
+        errors = list(_validate_agy_request(request))
+        if request.get("tool_profile") == LOCAL_ASSET_RESEARCH_PROFILE:
+            errors = errors + _validate_agy_local_asset_request(request, request_path=request_path)
+        return errors
+    return [f"unknown_provider: {provider!r} is not in SUPPORTED_PROVIDERS {sorted(SUPPORTED_PROVIDERS)}"]
+
+
 def _read_context_files(context_files: list[str], base_dir: Path) -> list[dict[str, str]]:
     contexts: list[dict[str, str]] = []
     for raw_path in context_files:
@@ -5898,7 +5939,7 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(request, Mapping):
                 print("[gemini-headless] error: request file must contain a JSON object")
                 return 1
-            errors = validate_request(request, request_path=request_file)
+            errors = validate_request_for_provider(request, request_path=request_file)
             if errors:
                 print(f"[gemini-headless] validation FAIL: {errors[0]}")
                 for err in errors[1:]:
