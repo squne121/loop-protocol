@@ -1,12 +1,22 @@
 """Tests for the Issue #1726 env-allowlist extension of
 `materialize_isolated_agy_workspace()` in `agy_permission_policy.py`.
 
-Covers AC1-AC7:
-- AC1: `DBUS_SESSION_BUS_ADDRESS` propagation when present in the real env.
+Covers AC1-AC7 (Issue #1726 original numbering) plus Issue #1779's
+`auth_profile` minimization -- Issue #1779 AC1/AC3 (this file's canonical
+VC target):
+
+- AC1 (#1726) / AC3 (#1779): `DBUS_SESSION_BUS_ADDRESS` / `XDG_RUNTIME_DIR`
+  propagate through **only** when the caller explicitly opts in via
+  `auth_profile=app.AGY_AUTH_PROFILE_EXTENDED`. With the default
+  `auth_profile` (omitted -- `AGY_AUTH_PROFILE_MINIMAL`), neither surface is
+  exposed even when present in the real env (Issue #1779 AC1: env excludes
+  DBUS_SESSION_BUS_ADDRESS/XDG_RUNTIME_DIR/GOOGLE_APPLICATION_CREDENTIALS
+  and `gcloud_adc_path` is `None`).
 - AC2: `HOME`/`XDG_CONFIG_HOME`/`XDG_CACHE_HOME`/`XDG_STATE_HOME` isolation
-  regression (still redirected into the isolated tmp workspace).
-- AC3 is a static `rg` check on the source comments (see the Issue VC list);
-  not exercised here.
+  regression (still redirected into the isolated tmp workspace) for both
+  `auth_profile` values.
+- AC3 (#1726) is a static `rg` check on the source comments (see the Issue
+  VC list); not exercised here.
 - AC4: adversarial redaction -- a credential-like value that happens to be
   assigned to `DBUS_SESSION_BUS_ADDRESS` must never leak into any public
   artifact string (env dict values are opaque pass-through; the *helpers*
@@ -18,7 +28,8 @@ Covers AC1-AC7:
   extension.
 - AC7: hermetic integration test simulating isolated-workspace auth
   reachability via a mocked dbus/keyring endpoint (a fake Unix domain
-  socket bound at the propagated `DBUS_SESSION_BUS_ADDRESS` path).
+  socket bound at the propagated `DBUS_SESSION_BUS_ADDRESS` path), under
+  `auth_profile=app.AGY_AUTH_PROFILE_EXTENDED`.
 """
 
 from __future__ import annotations
@@ -73,17 +84,71 @@ def _materialize_and_cleanup(profile: str, *, parent_dir: Path | None = None):
 
 
 # ---------------------------------------------------------------------------
-# AC1: DBUS_SESSION_BUS_ADDRESS propagates through when present in real env
+# Issue #1779 AC1: default (auth_profile omitted == AGY_AUTH_PROFILE_MINIMAL)
+# excludes DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR /
+# GOOGLE_APPLICATION_CREDENTIALS and gcloud_adc_path stays None, even when
+# all are present/set in the real env.
 # ---------------------------------------------------------------------------
 
 
-def test_isolated_workspace_env_includes_dbus_session_bus_address(
+def test_isolated_workspace_minimal_auth_profile_omits_env_allowlist_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/home/real-user/.config/gcloud/adc.json")
+
+    # auth_profile omitted -- defaults to AGY_AUTH_PROFILE_MINIMAL.
+    workspace = app.materialize_isolated_agy_workspace(app.GROUNDED_RESEARCH_PROFILE)
+    try:
+        assert "DBUS_SESSION_BUS_ADDRESS" not in workspace.env
+        assert "XDG_RUNTIME_DIR" not in workspace.env
+        assert "GOOGLE_APPLICATION_CREDENTIALS" not in workspace.env
+        assert workspace.gcloud_adc_path is None
+    finally:
+        shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
+
+
+def test_isolated_workspace_explicit_minimal_auth_profile_omits_env_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+
+    workspace = app.materialize_isolated_agy_workspace(
+        app.GROUNDED_RESEARCH_PROFILE, auth_profile=app.AGY_AUTH_PROFILE_MINIMAL
+    )
+    try:
+        assert "DBUS_SESSION_BUS_ADDRESS" not in workspace.env
+        assert "XDG_RUNTIME_DIR" not in workspace.env
+        assert workspace.gcloud_adc_path is None
+    finally:
+        shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
+
+
+def test_materialize_isolated_agy_workspace_rejects_unknown_auth_profile() -> None:
+    with pytest.raises(ValueError):
+        app.materialize_isolated_agy_workspace(
+            app.GROUNDED_RESEARCH_PROFILE, auth_profile="not_a_real_auth_profile"
+        )
+
+
+# ---------------------------------------------------------------------------
+# AC1 (#1726) / AC3 (#1779): DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR
+# propagate through only under the explicit
+# auth_profile=AGY_AUTH_PROFILE_EXTENDED opt-in.
+# ---------------------------------------------------------------------------
+
+
+def test_isolated_workspace_env_includes_dbus_session_bus_address_when_extended(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_bus_address = "unix:path=/run/user/1000/bus"
     monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", fake_bus_address)
 
-    workspace = app.materialize_isolated_agy_workspace(app.GROUNDED_RESEARCH_PROFILE)
+    workspace = app.materialize_isolated_agy_workspace(
+        app.GROUNDED_RESEARCH_PROFILE, auth_profile=app.AGY_AUTH_PROFILE_EXTENDED
+    )
     try:
         assert workspace.env.get("DBUS_SESSION_BUS_ADDRESS") == fake_bus_address
     finally:
@@ -95,19 +160,23 @@ def test_isolated_workspace_env_omits_dbus_session_bus_address_when_unset(
 ) -> None:
     monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
 
-    workspace = app.materialize_isolated_agy_workspace(app.GROUNDED_RESEARCH_PROFILE)
+    workspace = app.materialize_isolated_agy_workspace(
+        app.GROUNDED_RESEARCH_PROFILE, auth_profile=app.AGY_AUTH_PROFILE_EXTENDED
+    )
     try:
         assert "DBUS_SESSION_BUS_ADDRESS" not in workspace.env
     finally:
         shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
 
 
-def test_isolated_workspace_env_includes_xdg_runtime_dir_when_present(
+def test_isolated_workspace_env_includes_xdg_runtime_dir_when_present_and_extended(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
 
-    workspace = app.materialize_isolated_agy_workspace(app.GROUNDED_RESEARCH_PROFILE)
+    workspace = app.materialize_isolated_agy_workspace(
+        app.GROUNDED_RESEARCH_PROFILE, auth_profile=app.AGY_AUTH_PROFILE_EXTENDED
+    )
     try:
         assert workspace.env.get("XDG_RUNTIME_DIR") == "/run/user/1000"
     finally:
@@ -128,7 +197,9 @@ def test_isolated_workspace_home_and_xdg_still_redirected(
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
 
     for profile in ALL_PROFILES:
-        workspace = app.materialize_isolated_agy_workspace(profile)
+        workspace = app.materialize_isolated_agy_workspace(
+            profile, auth_profile=app.AGY_AUTH_PROFILE_EXTENDED
+        )
         try:
             assert workspace.env["HOME"] == str(workspace.workspace_dir)
             assert workspace.env["HOME"] != real_home
@@ -148,6 +219,26 @@ def test_isolated_workspace_home_and_xdg_still_redirected(
             shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
 
 
+def test_isolated_workspace_home_and_xdg_still_redirected_minimal_auth_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same isolation guarantee holds for the default (minimal) auth_profile,
+    which never exposes the reachability variables at all (Issue #1779)."""
+    real_home = os.environ.get("HOME", "/home/real-user")
+    monkeypatch.setenv("HOME", real_home)
+
+    for profile in ALL_PROFILES:
+        workspace = app.materialize_isolated_agy_workspace(profile)
+        try:
+            assert workspace.env["HOME"] == str(workspace.workspace_dir)
+            assert workspace.env["HOME"] != real_home
+            assert workspace.env["XDG_CONFIG_HOME"] == str(workspace.workspace_dir / "xdg-config")
+            assert workspace.env["XDG_CACHE_HOME"] == str(workspace.workspace_dir / "xdg-cache")
+            assert workspace.env["XDG_STATE_HOME"] == str(workspace.workspace_dir / "xdg-state")
+        finally:
+            shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # AC4: adversarial redaction -- credential-like DBUS_SESSION_BUS_ADDRESS value
 # ---------------------------------------------------------------------------
@@ -163,7 +254,9 @@ def test_env_allowlist_extension_never_leaks_credential_like_value(
     adversarial_value = "unix:path=/run/user/1000/bus;token=sk-abcdefghijklmnopqrstuvwx"
     monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", adversarial_value)
 
-    workspace = app.materialize_isolated_agy_workspace(app.GROUNDED_RESEARCH_PROFILE)
+    workspace = app.materialize_isolated_agy_workspace(
+        app.GROUNDED_RESEARCH_PROFILE, auth_profile=app.AGY_AUTH_PROFILE_EXTENDED
+    )
     try:
         # The raw env dict is an internal wiring structure (never printed to
         # a public artifact directly) and does propagate the value verbatim
@@ -286,7 +379,9 @@ def test_isolated_workspace_reaches_mocked_dbus_secret_service(
         monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", bus_address)
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(socket_dir))
 
-        workspace = app.materialize_isolated_agy_workspace(app.GROUNDED_RESEARCH_PROFILE)
+        workspace = app.materialize_isolated_agy_workspace(
+            app.GROUNDED_RESEARCH_PROFILE, auth_profile=app.AGY_AUTH_PROFILE_EXTENDED
+        )
         try:
             # env carries the endpoint pointer through the isolation boundary
             assert workspace.env["DBUS_SESSION_BUS_ADDRESS"] == bus_address

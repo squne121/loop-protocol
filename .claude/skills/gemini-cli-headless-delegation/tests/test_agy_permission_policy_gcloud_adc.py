@@ -1,7 +1,15 @@
 """Tests for the Issue #1730 gcloud ADC exposure extension of
 `materialize_isolated_agy_workspace()` in `agy_permission_policy.py`.
 
-Covers AC1-AC6:
+Covers AC1-AC6 (Issue #1730 original numbering). Issue #1779: gcloud ADC
+exposure (`gcloud_adc_path` / `GOOGLE_APPLICATION_CREDENTIALS`) moved behind
+the explicit `auth_profile=app.AGY_AUTH_PROFILE_EXTENDED` opt-in (default
+`AGY_AUTH_PROFILE_MINIMAL` never exposes it -- see
+`test_agy_permission_policy_env_allowlist.py` Issue #1779 AC1 tests for the
+default-exclusion coverage). All tests below that previously relied on the
+old unconditional-exposure default now pass `auth_profile=EXTENDED`
+explicitly to keep exercising the #1730 behavior this file documents.
+
 - AC1: `$HOME/.config/gcloud` (when present) is exposed read-only under the
   isolated workspace's `XDG_CONFIG_HOME`.
 - AC2: `GOOGLE_APPLICATION_CREDENTIALS`, when already set in the real
@@ -84,7 +92,9 @@ def test_gcloud_config_dir_exposed_read_only(tmp_path: Path, monkeypatch: pytest
     monkeypatch.setenv("HOME", str(fake_real_home))
 
     for profile in ALL_PROFILES:
-        workspace = app.materialize_isolated_agy_workspace(profile, parent_dir=tmp_path)
+        workspace = app.materialize_isolated_agy_workspace(
+            profile, parent_dir=tmp_path, auth_profile=app.AGY_AUTH_PROFILE_EXTENDED
+        )
         try:
             assert workspace.gcloud_adc_path is not None
             assert workspace.gcloud_adc_path.is_symlink()
@@ -103,7 +113,9 @@ def test_gcloud_adc_path_is_none_when_real_gcloud_dir_absent(tmp_path: Path, mon
     fake_real_home.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(fake_real_home))
 
-    workspace = app.materialize_isolated_agy_workspace(app.GROUNDED_RESEARCH_PROFILE, parent_dir=tmp_path)
+    workspace = app.materialize_isolated_agy_workspace(
+        app.GROUNDED_RESEARCH_PROFILE, parent_dir=tmp_path, auth_profile=app.AGY_AUTH_PROFILE_EXTENDED
+    )
     try:
         assert workspace.gcloud_adc_path is None
         assert not (Path(workspace.env["XDG_CONFIG_HOME"]) / "gcloud").exists()
@@ -120,7 +132,9 @@ def test_google_application_credentials_env_passthrough(tmp_path: Path, monkeypa
     fake_path = "/home/real-user/.config/gcloud/legacy_credentials/user@example.com/adc.json"
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", fake_path)
 
-    workspace = app.materialize_isolated_agy_workspace(app.GROUNDED_RESEARCH_PROFILE, parent_dir=tmp_path)
+    workspace = app.materialize_isolated_agy_workspace(
+        app.GROUNDED_RESEARCH_PROFILE, parent_dir=tmp_path, auth_profile=app.AGY_AUTH_PROFILE_EXTENDED
+    )
     try:
         assert workspace.env.get("GOOGLE_APPLICATION_CREDENTIALS") == fake_path
     finally:
@@ -130,7 +144,9 @@ def test_google_application_credentials_env_passthrough(tmp_path: Path, monkeypa
 def test_google_application_credentials_env_absent_when_unset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
 
-    workspace = app.materialize_isolated_agy_workspace(app.GROUNDED_RESEARCH_PROFILE, parent_dir=tmp_path)
+    workspace = app.materialize_isolated_agy_workspace(
+        app.GROUNDED_RESEARCH_PROFILE, parent_dir=tmp_path, auth_profile=app.AGY_AUTH_PROFILE_EXTENDED
+    )
     try:
         assert "GOOGLE_APPLICATION_CREDENTIALS" not in workspace.env
     finally:
@@ -155,7 +171,9 @@ def test_only_gcloud_subpath_exposed_not_full_home(tmp_path: Path, monkeypatch: 
     monkeypatch.setenv("HOME", str(fake_real_home))
 
     for profile in ALL_PROFILES:
-        workspace = app.materialize_isolated_agy_workspace(profile, parent_dir=tmp_path)
+        workspace = app.materialize_isolated_agy_workspace(
+            profile, parent_dir=tmp_path, auth_profile=app.AGY_AUTH_PROFILE_EXTENDED
+        )
         try:
             xdg_config_children = sorted(p.name for p in Path(workspace.env["XDG_CONFIG_HOME"]).iterdir())
             assert xdg_config_children == ["gcloud"]
@@ -201,7 +219,9 @@ def test_tool_deny_matrix_unaffected_by_gcloud_adc_exposure(tmp_path: Path, monk
     # materialize still isolates HOME (and denies via workspace policy) even
     # while gcloud ADC is exposed.
     for profile in ALL_DENY_PROFILES:
-        workspace = app.materialize_isolated_agy_workspace(profile, parent_dir=tmp_path)
+        workspace = app.materialize_isolated_agy_workspace(
+            profile, parent_dir=tmp_path, auth_profile=app.AGY_AUTH_PROFILE_EXTENDED
+        )
         try:
             assert workspace.env["HOME"] == str(workspace.workspace_dir)
             assert workspace.gcloud_adc_path is not None
@@ -233,7 +253,9 @@ def test_credential_like_value_never_leaked_by_gcloud_adc_exposure(
     monkeypatch.setenv("HOME", str(fake_real_home))
 
     for profile in ALL_PROFILES:
-        workspace = app.materialize_isolated_agy_workspace(profile, parent_dir=tmp_path)
+        workspace = app.materialize_isolated_agy_workspace(
+            profile, parent_dir=tmp_path, auth_profile=app.AGY_AUTH_PROFILE_EXTENDED
+        )
         try:
             assert dummy_secret not in json.dumps(workspace.env)
             assert dummy_secret not in workspace.settings_path.read_text(encoding="utf-8")
@@ -259,7 +281,9 @@ def test_isolated_workspace_reaches_mocked_gcloud_adc_file(tmp_path: Path, monke
     fake_real_home = _make_fake_gcloud_home(tmp_path)
     monkeypatch.setenv("HOME", str(fake_real_home))
 
-    workspace = app.materialize_isolated_agy_workspace(app.GROUNDED_RESEARCH_PROFILE, parent_dir=tmp_path)
+    workspace = app.materialize_isolated_agy_workspace(
+        app.GROUNDED_RESEARCH_PROFILE, parent_dir=tmp_path, auth_profile=app.AGY_AUTH_PROFILE_EXTENDED
+    )
     try:
         # simulate the isolated `agy` subprocess resolving gcloud ADC the way
         # the real gcloud/agy client would: from its own (isolated)
