@@ -62,10 +62,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -77,6 +80,7 @@ from urllib.parse import urlparse
 
 try:
     import jsonschema as _jsonschema
+
     _JSONSCHEMA_AVAILABLE = True
 except ImportError:
     _JSONSCHEMA_AVAILABLE = False
@@ -157,15 +161,11 @@ def _render_artifact_projection_lines(artifacts: dict[str, str]) -> list[str]:
     return lines
 
 
-def _validate_artifact_projection(
-    *, repo_root: Path, issue_number: int, artifacts: dict[str, str]
-) -> list[str]:
+def _validate_artifact_projection(*, repo_root: Path, issue_number: int, artifacts: dict[str, str]) -> list[str]:
     if not artifacts:
         return []
 
-    expected_root = (
-        repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
-    ).resolve()
+    expected_root = (repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)).resolve()
     failures: list[str] = []
 
     for key, raw_path in artifacts.items():
@@ -181,22 +181,19 @@ def _validate_artifact_projection(
 
         if resolved != expected_root and not resolved.is_relative_to(expected_root):
             normalized = (
-                resolved.relative_to(repo_root).as_posix()
-                if resolved.is_relative_to(repo_root)
-                else str(resolved)
+                resolved.relative_to(repo_root).as_posix() if resolved.is_relative_to(repo_root) else str(resolved)
             )
             failures.append(f"artifact_path_outside_issue_root: {key} -> {normalized}")
             continue
 
         if not resolved.exists():
             normalized = (
-                resolved.relative_to(repo_root).as_posix()
-                if resolved.is_relative_to(repo_root)
-                else str(resolved)
+                resolved.relative_to(repo_root).as_posix() if resolved.is_relative_to(repo_root) else str(resolved)
             )
             failures.append(f"artifact_path_missing: {key} -> {normalized}")
 
     return failures
+
 
 # Trusted author associations for ANCHOR_SCOPE_REFRAME_V1
 TRUSTED_ANCHOR_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
@@ -226,18 +223,12 @@ def _as_string_list(
 ) -> tuple[list[str], bool]:
     """Extract a list[str] payload or record a blocker and fail closed."""
     if not isinstance(value, list):
-        blockers.append(
-            f"{BLOCKER_REWRITE_CONSTRAINTS_NON_STRING_PAYLOAD}:"
-            f" {field_name} must be a list"
-        )
+        blockers.append(f"{BLOCKER_REWRITE_CONSTRAINTS_NON_STRING_PAYLOAD}: {field_name} must be a list")
         return [], False
 
     for item in value:
         if not isinstance(item, str):
-            blockers.append(
-                f"{BLOCKER_REWRITE_CONSTRAINTS_NON_STRING_PAYLOAD}:"
-                f" {field_name} contains non-string item"
-            )
+            blockers.append(f"{BLOCKER_REWRITE_CONSTRAINTS_NON_STRING_PAYLOAD}: {field_name} contains non-string item")
             return [], False
 
     return value, True
@@ -283,10 +274,7 @@ def _ensure_json_serializable(value: Any, field_name: str, blockers: list[str]) 
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
         return True
     except (TypeError, ValueError) as exc:
-        blockers.append(
-            f"{BLOCKER_REWRITE_CONSTRAINTS_NOT_JSON_SERIALIZABLE}:"
-            f" {field_name} serialization error: {exc}"
-        )
+        blockers.append(f"{BLOCKER_REWRITE_CONSTRAINTS_NOT_JSON_SERIALIZABLE}: {field_name} serialization error: {exc}")
         return False
 
 
@@ -315,9 +303,7 @@ def _load_schema(schema_filename: str) -> dict | None:
         return None
 
 
-def _validate_with_schema(
-    data: dict, schema: dict
-) -> tuple[bool, list[str]]:
+def _validate_with_schema(data: dict, schema: dict) -> tuple[bool, list[str]]:
     """
     Validate data against schema using jsonschema.
 
@@ -386,12 +372,8 @@ _ISSUE_COMMENT_RE = re.compile(
 )
 
 # PR review comment pattern (different from issue comment)
-_PR_REVIEW_COMMENT_RE = re.compile(
-    r"^https://github\.com/[^/]+/[^/]+/pull/\d+#issuecomment-\d+$"
-)
-_PR_REVIEW_DISCUSSION_RE = re.compile(
-    r"^https://github\.com/[^/]+/[^/]+/pull/\d+#discussion_r\d+$"
-)
+_PR_REVIEW_COMMENT_RE = re.compile(r"^https://github\.com/[^/]+/[^/]+/pull/\d+#issuecomment-\d+$")
+_PR_REVIEW_DISCUSSION_RE = re.compile(r"^https://github\.com/[^/]+/[^/]+/pull/\d+#discussion_r\d+$")
 
 # Valid --repo pattern
 _REPO_PATTERN = re.compile(r"^[^/]+/[^/]+$")
@@ -466,9 +448,7 @@ def _run_gh(argv: list[str], timeout: int = GH_API_TIMEOUT) -> tuple[dict | list
 def _fetch_issue(repo: str, issue_number: int) -> tuple[dict | None, str]:
     """Fetch issue data via gh issue view --json."""
     data, err = _run_gh(
-        ["gh", "issue", "view", str(issue_number),
-         "--repo", repo,
-         "--json", "number,title,body,labels,url"]
+        ["gh", "issue", "view", str(issue_number), "--repo", repo, "--json", "number,title,body,labels,url"]
     )
     return data, err
 
@@ -481,11 +461,10 @@ def _fetch_issue_comments(repo: str, issue_number: int) -> tuple[list | None, st
     """
     try:
         from command_registry import render_command as _render_command
+
         _argv = _render_command("gh.issue.comments.list", {"repo": repo, "issue_number": issue_number})
     except Exception as exc:
-        raise RuntimeError(
-            f"BLOCKER_COMMAND_REGISTRY_UNAVAILABLE: gh.issue.comments.list failed: {exc}"
-        ) from exc
+        raise RuntimeError(f"BLOCKER_COMMAND_REGISTRY_UNAVAILABLE: gh.issue.comments.list failed: {exc}") from exc
     data, err = _run_gh(_argv)
     if data is None:
         return None, err
@@ -507,16 +486,13 @@ def _fetch_issue_comments(repo: str, issue_number: int) -> tuple[list | None, st
 
 def _fetch_single_comment(repo: str, comment_id: int) -> tuple[dict | None, str]:
     """Fetch a single issue comment via gh api to validate issue_url field."""
-    data, err = _run_gh(
-        ["gh", "api", f"repos/{repo}/issues/comments/{comment_id}"]
-    )
+    data, err = _run_gh(["gh", "api", f"repos/{repo}/issues/comments/{comment_id}"])
     return data, err
 
 
 def _load_loop_state_schema() -> dict[str, Any]:
     schema_path = _SCHEMAS_DIR / "loop_state.schema.json"
     return json.loads(schema_path.read_text(encoding="utf-8"))
-
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +509,7 @@ def _parse_anchor_scope_reframe_body(comment_body: str) -> "dict | None":
     Returns None if not found or malformed.
     """
     import re
+
     fenced_pattern = re.compile(r"^```yaml\s*\n(.*?)^```", re.MULTILINE | re.DOTALL)
     for match in fenced_pattern.finditer(comment_body):
         yaml_content = match.group(1)
@@ -543,6 +520,7 @@ def _parse_anchor_scope_reframe_body(comment_body: str) -> "dict | None":
             continue
         try:
             import yaml as _yaml
+
             data = _yaml.safe_load(yaml_content)
         except Exception:
             return None
@@ -658,6 +636,7 @@ def _classify_anchor_scope_reframe(
         "allowed_path_deltas": payload.get("allowed_path_deltas", []),
         "required_rerun": payload.get("required_rerun", []),
     }
+
 
 def _build_anchor_comment_state(
     *,
@@ -789,11 +768,7 @@ def _validate_anchor_comment_url(
     # Structural check via urlparse (not substring)
     parsed_url = urlparse(issue_url_field)
     path_parts = parsed_url.path.rstrip("/").split("/")
-    if (
-        len(path_parts) >= 4
-        and path_parts[-2] == "issues"
-        and path_parts[-1] == str(issue_number)
-    ):
+    if len(path_parts) >= 4 and path_parts[-2] == "issues" and path_parts[-1] == str(issue_number):
         # Repo path should be /<owner>/<repo>/
         if (
             len(path_parts) >= 5
@@ -837,9 +812,7 @@ def _validate_anchor_comments_batch(
         return [], [BLOCKER_ANCHOR_COMMENT_MULTIPLE_UNSUPPORTED]
 
     for url in sorted_urls:
-        valid, blockers = _validate_anchor_comment_url(
-            url, repo, issue_number, fixture_comments=fixture_comments
-        )
+        valid, blockers = _validate_anchor_comment_url(url, repo, issue_number, fixture_comments=fixture_comments)
         if not valid:
             all_blockers.extend(blockers)
 
@@ -857,7 +830,6 @@ def _validate_anchor_comments_batch(
 # ---------------------------------------------------------------------------
 # Planner invocation
 # ---------------------------------------------------------------------------
-
 
 
 def _load_scope_rollup_artifact(repo_root: Path, issue_number: int) -> Optional[dict]:
@@ -989,9 +961,7 @@ def _snapshot_archive_path(repo_root: Path, issue_number: int, snapshot: dict[st
     fetched_at = _snapshot_fetched_at(snapshot) or "unknown"
     safe_fetched_at = re.sub(r"[^0-9A-Za-z_-]+", "_", fetched_at)
     body_sha = _sha256(_snapshot_body(snapshot))
-    return _snapshot_archive_dir(repo_root, issue_number) / (
-        f"raw_issue_snapshot_{safe_fetched_at}_{body_sha}.json"
-    )
+    return _snapshot_archive_dir(repo_root, issue_number) / (f"raw_issue_snapshot_{safe_fetched_at}_{body_sha}.json")
 
 
 def _snapshot_source_ref(snapshot_path: Path, snapshot: dict[str, Any]) -> str:
@@ -1073,9 +1043,7 @@ def _find_previous_immutable_snapshot(
             path = _materialize_immutable_snapshot(repo_root, issue_number, snapshot)
             candidates.append(
                 (
-                    datetime.fromisoformat(
-                        _snapshot_fetched_at(snapshot).replace("Z", "+00:00")
-                    )
+                    datetime.fromisoformat(_snapshot_fetched_at(snapshot).replace("Z", "+00:00"))
                     if _snapshot_fetched_at(snapshot)
                     else datetime.fromtimestamp(0, tz=timezone.utc),
                     snapshot,
@@ -1143,9 +1111,7 @@ def _invoke_repair(body: str) -> dict:
     import sys as _sys
     import subprocess as _sp
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".md", delete=False, encoding="utf-8"
-    ) as tf:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as tf:
         tf.write(body)
         tmp_path = tf.name
 
@@ -1157,13 +1123,14 @@ def _invoke_repair(body: str) -> dict:
             timeout=30,
         )
         import json as _json
+
         if proc.stdout:
             return _json.loads(proc.stdout)
         return {
             "schema": "repair_issue_contract/v1",
             "changed": False,
             "repairs": [],
-            "error": proc.stderr or "no output"
+            "error": proc.stderr or "no output",
         }
     except Exception as exc:
         return {"schema": "repair_issue_contract/v1", "changed": False, "repairs": [], "error": str(exc)}
@@ -1279,10 +1246,7 @@ def _apply_exit_code_mapping(
             BLOCKER_PLANNER_FAIL_CLOSED_PAYLOAD_INVALID,
             BLOCKER_ARTIFACT_PROJECTION_MISMATCH,
         }
-        if any(
-            any(b.split(":", 1)[0] == rb for rb in rewrite_env_blockers)
-            for b in blockers
-        ):
+        if any(any(b.split(":", 1)[0] == rb for rb in rewrite_env_blockers) for b in blockers):
             has_env = True
 
         if has_env:
@@ -1340,26 +1304,55 @@ def _write_artifacts(
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     snapshot_path = artifact_dir / "raw_issue_snapshot.json"
-    snapshot_path.write_text(
-        json.dumps(raw_snapshot, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
-    )
-    _materialize_immutable_snapshot(repo_root, issue_number, raw_snapshot)
-
     planner_input_path = artifact_dir / "planner_input.json"
-    planner_input_path.write_text(
-        json.dumps(planner_input, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
-    )
-
     result_path = artifact_dir / "refinement_preflight_result_v1.json"
-    result_path.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
-    )
-
-    return {
+    artifacts = {
         "raw_issue_snapshot": str(snapshot_path),
         "planner_input": str(planner_input_path),
         "refinement_preflight_result_v1": str(result_path),
     }
+    if result.get("artifacts") != artifacts:
+        raise ValueError("final_result_artifact_projection_mismatch")
+    schema_errors = _validate_result_artifact(result)
+    if schema_errors:
+        raise ValueError("final_result_schema_invalid: " + "; ".join(schema_errors))
+    _atomic_write_json(snapshot_path, raw_snapshot)
+    _materialize_immutable_snapshot(repo_root, issue_number, raw_snapshot)
+    _atomic_write_json(planner_input_path, planner_input)
+    _atomic_write_json(result_path, result)
+    try:
+        readback = json.loads(result_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"result_artifact_readback_error:{type(exc).__name__}:{exc}") from exc
+    readback_errors = _validate_result_artifact(readback)
+    if readback_errors:
+        raise ValueError("result_artifact_readback_schema_invalid: " + "; ".join(readback_errors))
+    return artifacts
+
+
+def _atomic_write_json(path: Path, value: Any) -> None:
+    encoded = (json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _validate_result_artifact(result: Any) -> list[str]:
+    schema = _load_schema("refinement_preflight_result_v1.schema.json")
+    if schema is None:
+        return ["result_schema_unavailable"]
+    valid, errors = _validate_with_schema(result, schema)
+    return [] if valid else errors
 
 
 # ---------------------------------------------------------------------------
@@ -1393,20 +1386,23 @@ def _build_compact_stdout(result: dict) -> str:
     if commands:
         try:
             from command_registry import REGISTRY as _REG
+
             spec_objects = []
             for cmd in commands:
                 cmd_id = cmd.get("id") or cmd.get("kind", "?")
                 entry = _REG.get(cmd_id, {})
-                spec_objects.append({
-                    "id": cmd_id,
-                    "argv": cmd.get("argv", []),
-                    "shell": cmd.get("shell", False),
-                    "cwd_policy": entry.get("cwd_policy", "repo_root"),
-                    "stdin_contract": entry.get("stdin_contract", "none"),
-                    "stdout_contract": entry.get("stdout_contract", "unknown"),
-                    "timeout_seconds": entry.get("timeout_seconds", 120),
-                    "mutation": entry.get("mutation", False),
-                })
+                spec_objects.append(
+                    {
+                        "id": cmd_id,
+                        "argv": cmd.get("argv", []),
+                        "shell": cmd.get("shell", False),
+                        "cwd_policy": entry.get("cwd_policy", "repo_root"),
+                        "stdin_contract": entry.get("stdin_contract", "none"),
+                        "stdout_contract": entry.get("stdout_contract", "unknown"),
+                        "timeout_seconds": entry.get("timeout_seconds", 120),
+                        "mutation": entry.get("mutation", False),
+                    }
+                )
             lines.append("COMMANDS_JSON: " + json.dumps(spec_objects, ensure_ascii=False, separators=(",", ":")))
             lines.append("COMMANDS_DISPLAY:")
             for cmd in commands:
@@ -1507,18 +1503,19 @@ def _commands_from_plan(plan: dict, issue_number: int, repo: str) -> list[dict]:
     """Build commands[] from ISSUE_REFINEMENT_COMMAND_REGISTRY_V1 preflight.run entry."""
     try:
         from command_registry import render_command as _render_command, REGISTRY as _REGISTRY
+
         _entry = _REGISTRY.get("preflight.run", {})
         _argv = _render_command("preflight.run", {"issue_number": issue_number, "repo": repo})
     except Exception as exc:
-        raise RuntimeError(
-            f"BLOCKER_COMMAND_REGISTRY_UNAVAILABLE: command_registry render failed: {exc}"
-        ) from exc
-    return [{
-        "kind": "run_preflight",
-        "argv": _argv,
-        "shell": False,
-        "source": "registry",
-    }]
+        raise RuntimeError(f"BLOCKER_COMMAND_REGISTRY_UNAVAILABLE: command_registry render failed: {exc}") from exc
+    return [
+        {
+            "kind": "run_preflight",
+            "argv": _argv,
+            "shell": False,
+            "source": "registry",
+        }
+    ]
 
 
 def _emit_failure_result(
@@ -1556,36 +1553,12 @@ def _emit_failure_result(
 
     artifacts: dict[str, str] = {}
     if raw_snapshot is not None and planner_input is not None:
-        # Build partial result (without artifacts/hashes) to write
-        result_core = _build_result(
-            status=status,
-            issue_number=issue_number,
-            repo=repo,
-            planner_exit_code=planner_exit_code,
-            planner_fail_closed=planner_fail_closed,
-            next_action=next_action,
-            must_read=[],
-            do_not_read=[],
-            commands=[],
-            blockers=blockers,
-            planner_fail_closed_reason_codes=planner_fail_closed_reason_codes or [],
-            required_sections=required_sections or [],
-            required_contract_keys=required_contract_keys or [],
-            rewrite_constraints=rewrite_constraints,
-            artifacts={},
-            hashes=hashes,
-        )
-        artifacts = _write_artifacts(repo_root, issue_number, raw_snapshot, planner_input, result_core)
-        projection_failures = _validate_artifact_projection(
-            repo_root=repo_root,
-            issue_number=issue_number,
-            artifacts=artifacts,
-        )
-        if projection_failures:
-            blockers = [*blockers, BLOCKER_ARTIFACT_PROJECTION_MISMATCH, *projection_failures]
-            status = "environment_failure"
-            next_action = "fix_environment"
-            artifacts = {}
+        artifact_dir = _issue_artifact_dir(repo_root, issue_number)
+        artifacts = {
+            "raw_issue_snapshot": str(artifact_dir / "raw_issue_snapshot.json"),
+            "planner_input": str(artifact_dir / "planner_input.json"),
+            "refinement_preflight_result_v1": str(artifact_dir / "refinement_preflight_result_v1.json"),
+        }
 
     result = _build_result(
         status=status,
@@ -1606,9 +1579,22 @@ def _emit_failure_result(
         hashes=hashes,
     )
 
-    _, exit_code = _apply_exit_code_mapping(
-        planner_exit_code, planner_fail_closed, blockers
-    )
+    if raw_snapshot is not None and planner_input is not None:
+        try:
+            _write_artifacts(repo_root, issue_number, raw_snapshot, planner_input, result)
+        except Exception as exc:
+            result["blockers"] = [
+                *result["blockers"],
+                BLOCKER_RESULT_SCHEMA_INVALID,
+                f"failure_artifact_write_error:{type(exc).__name__}:{str(exc)[:500]}",
+            ]
+            result["status"] = "environment_failure"
+            result["next_action"] = "fix_environment"
+            result["artifacts"] = {}
+
+    _, exit_code = _apply_exit_code_mapping(planner_exit_code, planner_fail_closed, result["blockers"])
+    if result["status"] == "environment_failure":
+        exit_code = EXIT_ENVIRONMENT_FAILURE
     print(_build_compact_stdout(result))
     return result, exit_code
 
@@ -1999,9 +1985,7 @@ def run_preflight(
             python_executable=sys.executable,
         )
         try:
-            _cls_dir = (
-                repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
-            )
+            _cls_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
             _cls_dir.mkdir(parents=True, exist_ok=True)
             (_cls_dir / "planner_failure_classification_v1.json").write_text(
                 json.dumps(failure_cls, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
@@ -2030,6 +2014,8 @@ def run_preflight(
             pass
 
         status_str, _ = _apply_exit_code_mapping(planner_exit_code, None, blockers)
+        if planner_exit_code == 3:
+            status_str = "environment_failure"
         return _emit_failure_result(
             repo_root=repo_root,
             issue_number=issue_number,
@@ -2037,11 +2023,12 @@ def run_preflight(
             status=status_str,
             next_action="fix_environment" if status_str == "environment_failure" else "human_judgment_required",
             blockers=blockers,
-            planner_fail_closed_reason_codes=[],
+            planner_fail_closed_reason_codes=[BLOCKER_PLANNER_INTERNAL_ERROR],
             required_sections=[],
             required_contract_keys=[],
-            rewrite_constraints=None,
+            rewrite_constraints=_build_safe_rewrite_constraints([], []),
             planner_exit_code=planner_exit_code,
+            planner_fail_closed=True,
             planner_input=planner_input_dict,
             raw_snapshot=raw_snapshot,
         )
@@ -2075,10 +2062,7 @@ def run_preflight(
         else:
             _ied_violations = validate_issue_execution_decision(_issue_execution_decision)
             if _ied_violations:
-                blockers.append(
-                    f"{BLOCKER_ISSUE_EXECUTION_DECISION_INVALID}: "
-                    + ", ".join(_ied_violations)
-                )
+                blockers.append(f"{BLOCKER_ISSUE_EXECUTION_DECISION_INVALID}: " + ", ".join(_ied_violations))
 
     if planner_exit_code == 2:
         blockers.append(BLOCKER_PLANNER_INVALID_INPUT)
@@ -2151,7 +2135,6 @@ def run_preflight(
                 required_contract_keys = []
                 reason_codes_ok = False
 
-
         if not reason_codes_ok:
             # Schema-safe deterministic forwarding requires aligned payloads.
             # Non-string / non-list fields are treated as schema violation.
@@ -2175,17 +2158,17 @@ def run_preflight(
     # If repair detected changes, add a blocker so orchestrator is informed
     if _repair_result.get("changed") is True and repair_artifact_path is not None:
         blockers.append(
-            json.dumps({
-                "kind": "repair_diagnostics",
-                "message": "repair_issue_contract detected changes: see repair artifact for details",
-                "artifact_path": repair_artifact_path,
-            })
+            json.dumps(
+                {
+                    "kind": "repair_diagnostics",
+                    "message": "repair_issue_contract detected changes: see repair artifact for details",
+                    "artifact_path": repair_artifact_path,
+                }
+            )
         )
 
     # --- Apply exit code mapping (with plan for warn detection, after all blockers finalized) ---
-    status, exit_code = _apply_exit_code_mapping(
-        planner_exit_code, planner_fail_closed, blockers, plan=plan
-    )
+    status, exit_code = _apply_exit_code_mapping(planner_exit_code, planner_fail_closed, blockers, plan=plan)
 
     # Determine next_action
     if status == "pass":
@@ -2227,7 +2210,12 @@ def run_preflight(
         "result_core_sha256": _sha256(result_core_text),
     }
 
-    # --- Build final result (once, before writing) ---
+    artifact_dir = _issue_artifact_dir(repo_root, issue_number)
+    artifacts = {
+        "raw_issue_snapshot": str(artifact_dir / "raw_issue_snapshot.json"),
+        "planner_input": str(artifact_dir / "planner_input.json"),
+        "refinement_preflight_result_v1": str(artifact_dir / "refinement_preflight_result_v1.json"),
+    }
     result = _build_result(
         status=status,
         issue_number=issue_number,
@@ -2243,43 +2231,35 @@ def run_preflight(
         required_sections=required_sections,
         required_contract_keys=required_contract_keys,
         rewrite_constraints=rewrite_constraints,
-        artifacts={},  # filled below
+        artifacts=artifacts,
         hashes=hashes,
     )
-
-    # --- Validate result against result schema before writing ---
-    result_schema = _load_schema("refinement_preflight_result_v1.schema.json")
-    if result_schema is not None:
-        is_valid, schema_errors = _validate_with_schema(result, result_schema)
-        if not is_valid:
-            err_detail = "; ".join(schema_errors)
-            result["blockers"] = result.get("blockers", []) + [
-                BLOCKER_RESULT_SCHEMA_INVALID, f"result_schema_errors: {err_detail}"
-            ]
-            result["status"] = "environment_failure"
-            result["next_action"] = "fix_environment"
-            exit_code = EXIT_ENVIRONMENT_FAILURE
-
-    # --- Write artifacts (once, after result is fully built) ---
-    artifacts = _write_artifacts(
-        repo_root, issue_number, raw_snapshot, planner_input_dict, result
-    )
-    projection_failures = _validate_artifact_projection(
-        repo_root=repo_root,
-        issue_number=issue_number,
-        artifacts=artifacts,
-    )
-    if projection_failures:
-        result["blockers"] = result.get("blockers", []) + [
-            BLOCKER_ARTIFACT_PROJECTION_MISMATCH,
-            *projection_failures,
-        ]
-        result["status"] = "environment_failure"
-        result["next_action"] = "fix_environment"
-        result["artifacts"] = {}
+    try:
+        _write_artifacts(repo_root, issue_number, raw_snapshot, planner_input_dict, result)
+    except Exception as exc:
+        result = _build_result(
+            status="environment_failure",
+            issue_number=issue_number,
+            repo=repo,
+            planner_exit_code=planner_exit_code,
+            planner_fail_closed=planner_fail_closed,
+            next_action="fix_environment",
+            must_read=sorted(set(must_read)),
+            do_not_read=do_not_read,
+            commands=commands,
+            blockers=[
+                *blockers,
+                BLOCKER_RESULT_SCHEMA_INVALID,
+                f"result_artifact_write_error:{type(exc).__name__}:{str(exc)[:500]}",
+            ],
+            planner_fail_closed_reason_codes=planner_fail_closed_reason_codes,
+            required_sections=required_sections,
+            required_contract_keys=required_contract_keys,
+            rewrite_constraints=rewrite_constraints,
+            artifacts={},
+            hashes=hashes,
+        )
         exit_code = EXIT_ENVIRONMENT_FAILURE
-    else:
-        result["artifacts"] = artifacts
 
     # --- Blocker 1 (success path): provenance sidecar ---
     try:
@@ -2300,11 +2280,6 @@ def run_preflight(
     except Exception:
         pass
 
-    # Update artifact file with final artifacts field included
-    artifact_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
-    result_path = artifact_dir / "refinement_preflight_result_v1.json"
-    result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-
     # Print compact stdout (no raw body/comments/sentinels) — same result dict
     print(_build_compact_stdout(result))
 
@@ -2321,7 +2296,10 @@ def _git_head_sha(repo_root: Path) -> str:
     try:
         proc = subprocess.run(
             ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=5, shell=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            shell=False,
         )
         return proc.stdout.strip() if proc.returncode == 0 else "unknown"
     except Exception:
@@ -2333,7 +2311,10 @@ def _git_blob_sha(file_path: Path, repo_root: Path) -> str:
     try:
         proc = subprocess.run(
             ["git", "-C", str(repo_root), "hash-object", str(file_path.resolve())],
-            capture_output=True, text=True, timeout=5, shell=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            shell=False,
         )
         return proc.stdout.strip() if proc.returncode == 0 else "unknown"
     except Exception:
@@ -2346,7 +2327,10 @@ def _git_head_tree_blob_sha(file_path: Path, repo_root: Path) -> str:
         relpath = file_path.resolve().relative_to(repo_root.resolve())
         proc = subprocess.run(
             ["git", "-C", str(repo_root), "rev-parse", f"HEAD:{relpath}"],
-            capture_output=True, text=True, timeout=5, shell=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            shell=False,
         )
         return proc.stdout.strip() if proc.returncode == 0 else "unknown"
     except Exception:
@@ -2359,7 +2343,10 @@ def _git_worktree_status(file_path: Path, repo_root: Path) -> str:
         relpath = file_path.resolve().relative_to(repo_root.resolve())
         proc = subprocess.run(
             ["git", "-C", str(repo_root), "status", "--short", "--", str(relpath)],
-            capture_output=True, text=True, timeout=5, shell=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            shell=False,
         )
         return proc.stdout.strip() if proc.returncode == 0 else "unknown"
     except Exception:
@@ -2476,8 +2463,7 @@ def classify_planner_failure(
     if category == "syntax_compile_failure":
         lines = stderr_str.splitlines()
         relevant = [
-            ln for ln in lines
-            if "SyntaxError" in ln or ln.strip().startswith("File ") or "line " in ln.lower()
+            ln for ln in lines if "SyntaxError" in ln or ln.strip().startswith("File ") or "line " in ln.lower()
         ]
         traceback_excerpt = "\n".join(relevant[:10])
 
@@ -2536,6 +2522,12 @@ def build_provenance(
     raw_snapshot_text = _canonical_json(raw_snapshot)
     stderr_str = stderr or ""
 
+    def _dependency_version(name: str) -> str:
+        try:
+            return importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            return "not_installed"
+
     return {
         "schema_version": "REFINEMENT_PREFLIGHT_PROVENANCE_V1",
         "repo": repo,
@@ -2551,6 +2543,10 @@ def build_provenance(
         "wrapper_script_blob_sha": _git_blob_sha(wrapper_script, repo_root),
         "python_executable": sys.executable,
         "python_version": sys.version,
+        "dependency_versions": {
+            "jsonschema": _dependency_version("jsonschema"),
+            "referencing": _dependency_version("referencing"),
+        },
         "cwd": str(Path.cwd()),
         "py_compile_status": py_compile_proof["py_compile_status"],
         # Issue #1439 AC12: persist the full PY_SYNTAX_COMPILE_PROOF_V2 proof
@@ -2613,14 +2609,10 @@ def write_provenance_artifact(
     provenance: dict,
 ) -> str:
     """Write provenance dict to the artifacts directory and return the path."""
-    artifact_dir = (
-        repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
-    )
+    artifact_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     prov_path = artifact_dir / "refinement_preflight_provenance_v1.json"
-    prov_path.write_text(
-        json.dumps(provenance, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
-    )
+    prov_path.write_text(json.dumps(provenance, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
     return str(prov_path)
 
 
@@ -2634,12 +2626,8 @@ def main(argv: list[str] | None = None) -> None:
         description="Deterministic preflight wrapper for issue-refinement-loop.",
         allow_abbrev=False,
     )
-    parser.add_argument(
-        "--issue-number", type=int, required=True, help="GitHub Issue number (positive int)."
-    )
-    parser.add_argument(
-        "--repo", required=True, help="owner/repo string (must match ^[^/]+/[^/]+$)."
-    )
+    parser.add_argument("--issue-number", type=int, required=True, help="GitHub Issue number (positive int).")
+    parser.add_argument("--repo", required=True, help="owner/repo string (must match ^[^/]+/[^/]+$).")
     parser.add_argument(
         "--anchor-comment-url",
         dest="anchor_comment_urls",
@@ -2669,15 +2657,11 @@ def main(argv: list[str] | None = None) -> None:
         input_errors.append(f"--issue-number must be a positive int, got {args.issue_number}")
 
     if not _REPO_PATTERN.match(args.repo):
-        input_errors.append(
-            f"--repo must match ^[^/]+/[^/]+$, got {args.repo!r}"
-        )
+        input_errors.append(f"--repo must match ^[^/]+/[^/]+$, got {args.repo!r}")
 
     for url in args.anchor_comment_urls:
         if not url.startswith(_GITHUB_URL_PREFIX):
-            input_errors.append(
-                f"--anchor-comment-url must start with {_GITHUB_URL_PREFIX!r}, got {url!r}"
-            )
+            input_errors.append(f"--anchor-comment-url must start with {_GITHUB_URL_PREFIX!r}, got {url!r}")
 
     if input_errors:
         # Build minimal blocked result for argparse validation failure
