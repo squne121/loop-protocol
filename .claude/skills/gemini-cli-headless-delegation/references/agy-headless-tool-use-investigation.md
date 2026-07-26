@@ -134,3 +134,31 @@ Issue #1752/#1758 は上記の「実際の AGY CLI が読む設定ファイル�
 CLOSED 済みの #1494（実 AGY/Serena/WebSearch fan-out E2E 検証）に対する control-plane の敵対的再監査（独立監査 3 本 + controlled live experiment 3 本）により、`agy_permission_policy.py` の認証 surface 過剰露出（`agy_oauth_token_path` のみが認証成功に必要十分であることを ablation experiment で実証）と、`_expose_gcloud_adc_read_only()` / `_expose_agy_oauth_token_read_only()` の read-only 未強制（`bwrap` PoC で実際に `OSError: Read-only file system` を発生させることを確認）が新たに判明した。実験そのものの詳細は別途 follow-up Issue で検証済みとして記録し、本ドキュメントの既存本文は変更しない。両者を機械可読に検出する baseline は `.claude/skills/gemini-cli-headless-delegation/scripts/audit_agy_auth_surface.py`（Issue #1778）を参照。
 
 また、本ドキュメント冒頭の `## Live 確認の追記（Issue #1758）` セクションは `status: resolved` の本ドキュメントに包含された結論であるにもかかわらず、`agy_permission_policy.py` 側の `Issue #1758` 参照コメント（複数箇所）に逆参照マーカー（`# SUPERSEDED (Issue #M): ...`）が付いていないことが同監査で判明した。このコメント/ドキュメント間の causal claim drift を機械的に検出する baseline は `scripts/check_agy_causal_claim_drift.py`（Issue #1778）を参照。
+
+
+## 訂正: capability-driven routing への置換（Issue #1777）
+
+CLOSED 済み #1494 に対する敵対的再監査で、上記「確定した根本原因」節の因果主張（「`claude-sonnet-4-6` を指定すれば確実にツールを実行する」）が、実験的根拠を欠くコード内固定（`run_gemini_headless.py` の `AGY_GROUNDED_RESEARCH_MODEL = "claude-sonnet-4-6"` 定数）のまま運用されている設計 gap として指摘された。#1777 は control-plane が実施した controlled grounding matrix experiment（`model_selector × prompt_template`、各セル 3 反復、計 12 live 実行）でこの因果主張を再検証した。
+
+```yaml
+AGY_GROUNDING_MATRIX_V1:
+  marginal_summary:
+    by_prompt_template:
+      minimal_fact_search_v1: "1/6 success (17%)"
+      explicit_search_required_v1: "5/6 success (83%)"
+    by_model_selector:
+      account_default: "3/6 success (50%)"
+      current_configured_candidate: "3/6 success (50%)"
+```
+
+`account_default`（モデル未指定）+ `explicit_search_required_v1` は 3/3（100%）成功し、`claude-sonnet-4-6` 明示指定 + 同一 prompt の 2/3（67%）を上回った。model 選択には限界効果がなく、prompt 構成（明示的な web 検索指示の有無）が支配的要因であることが実証された。**したがって上記「確定した根本原因」節の「`claude-sonnet-4-6` を指定すれば確実にツールを実行する」という因果主張は、この controlled experiment によって支持されなかった（実験的に反証された）。**
+
+この結果を受け、`_run_agy()` の `grounded_research` モデル選択は次のように置換された:
+
+- `AGY_GROUNDED_RESEARCH_MODEL` 定数は削除され、`config/model_routing.yaml` の `roles.grounded_research.model_chain`（`resolve_agy_grounded_research_model()` 経由）から読み込む capability-driven routing に置換した。
+- model 指定は optional 化した。候補が空、または availability preflight（`_agy_model_is_available()`）を全候補が満たさない場合は `--model` フラグなしで `agy -p` を実行する（account_default）。
+- 主要な信頼性担保手段を prompt/context contract 側へ移した。`AGY_GROUNDED_RESEARCH_EXPLICIT_SEARCH_INSTRUCTION`（`explicit_search_required_v1` 相当の明示指示）を grounded_research の全呼び出しへ常時付与する。
+- hallucination / no-citation 失敗（`agy_web_grounding_tool_call_missing` / `agy_web_grounding_no_citations`）に対して、`AGY_GROUNDED_RESEARCH_RETRY_LIMIT`（既定 2）を上限とした bounded retry を追加した。各 retry は新しい `_run_agy()` subprocess 呼び出し（fresh session）として実行され、前回試行の応答は次回試行へ持ち越さない。
+- 上記いずれの変更も、#1708/#1710/#1771 の fail-closed evidence gate（`_build_agy_grounded_research_metadata()` / hook provenance 検証）のロジック自体は変更していない。model 選択の有無に関わらず同一の判定が適用されることを `test_agy_provider.py` の回帰テストで確認済み。
+
+この訂正は、CLOSED 済み #1494 を再オープンするものではない。#1494 に記録された過去の run 結果（PASS）は変更・削除しない。
