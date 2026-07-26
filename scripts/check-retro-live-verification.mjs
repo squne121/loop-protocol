@@ -175,6 +175,14 @@ const CLI_OPTION_SPEC = {
   // (schema + context-assertion binding), matching pre-fix_delta behavior
   // exactly -- existing fixture-based tests are unaffected.
   '--live': { key: 'live', defaultValue: 'false' },
+  // Issue #1415 P0-D fix_delta: closure-only callers (e.g. the
+  // retro-live-verification.yml workflow's post-write verify step) must be
+  // able to assert "this is genuinely a live run, not a silent fixture
+  // fallback" and fail closed otherwise. Without this flag, an argument
+  // typo or missing --live (defaulting to 'false') would silently downgrade
+  // to structural-only checking and still exit 0. This flag changes no
+  // existing default behavior; --require-live is opt-in.
+  '--require-live': { key: 'requireLive', defaultValue: 'false' },
 }
 
 /**
@@ -950,6 +958,18 @@ async function runStandaloneSchemaCheck(options) {
 
   if (options.targetSchema === DUAL_TARGET_BUNDLE_SCHEMA_ID) {
     const executionProfile = normalizeExecutionProfile(options.executionProfile)
+    // Issue #1415 P0-D fix_delta: --require-live is a closure-only gate.
+    // It does not change what executionProfile/--live default to; it just
+    // refuses to silently accept a fixture-profile or non-live run when the
+    // caller explicitly declared this must be a live closure check.
+    if (parseBooleanFlag(options.requireLive)) {
+      if (executionProfile !== 'live') {
+        throw usageError('retro_live_verification_check.require_live_fixture_fallback', `--require-live was set but --execution-profile resolved to ${JSON.stringify(executionProfile)}, not 'live'`)
+      }
+      if (!parseBooleanFlag(options.live)) {
+        throw usageError('retro_live_verification_check.require_live_missing_live_flag', '--require-live was set but --live was not also passed as true; live artifact re-derivation would be skipped')
+      }
+    }
     const bundleCheck = await checkDualTargetBundle(payload, {
       executionProfile,
       fixtureResolveResultJsonIssueTarget: options.fixtureResolveResultJsonIssueTarget,

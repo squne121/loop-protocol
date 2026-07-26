@@ -1443,6 +1443,42 @@ describe('Issue #1415 dual-target bundle (retro_live_verification/v3, additive s
     )
     expect(result.status).not.toBe(0)
   })
+
+  it('GIVEN --require-live true WHEN --execution-profile resolves to fixture (the default) THEN it exits with a usage error instead of silently passing on fixture data', () => {
+    const result = spawnSync(
+      'node',
+      [
+        resolvePath(REPO_ROOT, 'scripts/check-retro-live-verification.mjs'),
+        '--',
+        '--schema', 'retro_live_verification/v3',
+        '--execution-profile', 'fixture',
+        '--require-live', 'true',
+        '--input', resolvePath(FIXTURES_DIR, 'dual-target-bundle-valid.json'),
+        '--fixture-resolve-result-json-issue-target', ISSUE_RESOLVE_RESULT,
+        '--fixture-resolve-result-json-pull-request-target', PR_RESOLVE_RESULT,
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).not.toBe(0)
+    expect(result.stdout).toContain('retro_live_verification_check.require_live_fixture_fallback')
+  })
+
+  it('GIVEN --require-live true and --execution-profile live WHEN --live is not also passed THEN it exits with a usage error rather than skipping live artifact re-derivation', () => {
+    const result = spawnSync(
+      'node',
+      [
+        resolvePath(REPO_ROOT, 'scripts/check-retro-live-verification.mjs'),
+        '--',
+        '--schema', 'retro_live_verification/v3',
+        '--execution-profile', 'live',
+        '--require-live', 'true',
+        '--input', resolvePath(FIXTURES_DIR, 'dual-target-bundle-valid.json'),
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8' },
+    )
+    expect(result.status).not.toBe(0)
+    expect(result.stdout).toContain('retro_live_verification_check.require_live_missing_live_flag')
+  })
 })
 
 describe('Issue #1415 P0-3 fix_delta: generate-retro-live-verification.mjs --schema-version v3 producer branch', () => {
