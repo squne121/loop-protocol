@@ -100,21 +100,17 @@ def validate_schema(decision: Any) -> list[str]:
         return ["jsonschema_not_available"]
     try:
         schema = _load_schema()
-    except (OSError, json.JSONDecodeError) as exc:
-        return [f"schema_file_unavailable:{exc}"]
-
-    format_checker = _jsonschema.FormatChecker()
-    try:
         validator_cls = _jsonschema.validators.validator_for(schema)
-    except Exception:
-        validator_cls = _jsonschema.Draft202012Validator
-    validator = validator_cls(schema, format_checker=format_checker)
-
-    violations = []
-    for error in validator.iter_errors(decision):
-        path_str = "/".join(str(p) for p in error.path) if error.path else "<root>"
-        violations.append(f"schema_violation:{path_str}:{error.message}")
-    return violations
+        validator_cls.check_schema(schema)
+        format_checker = _jsonschema.FormatChecker()
+        validator = validator_cls(schema, format_checker=format_checker)
+        violations = []
+        for error in validator.iter_errors(decision):
+            path_str = "/".join(str(p) for p in error.path) if error.path else "<root>"
+            violations.append(f"schema_violation:{path_str}:{error.message}")
+        return violations
+    except Exception as exc:
+        return [f"schema_validation_error:{type(exc).__name__}:{str(exc)[:500]}"]
 
 
 def _is_valid_issue_number(value: Any) -> bool:

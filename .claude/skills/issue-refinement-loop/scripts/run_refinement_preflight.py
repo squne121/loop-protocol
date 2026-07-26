@@ -62,10 +62,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -1340,26 +1343,55 @@ def _write_artifacts(
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     snapshot_path = artifact_dir / "raw_issue_snapshot.json"
-    snapshot_path.write_text(
-        json.dumps(raw_snapshot, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
-    )
-    _materialize_immutable_snapshot(repo_root, issue_number, raw_snapshot)
-
     planner_input_path = artifact_dir / "planner_input.json"
-    planner_input_path.write_text(
-        json.dumps(planner_input, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
-    )
-
     result_path = artifact_dir / "refinement_preflight_result_v1.json"
-    result_path.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
-    )
-
-    return {
+    artifacts = {
         "raw_issue_snapshot": str(snapshot_path),
         "planner_input": str(planner_input_path),
         "refinement_preflight_result_v1": str(result_path),
     }
+    if result.get("artifacts") != artifacts:
+        raise ValueError("final_result_artifact_projection_mismatch")
+    schema_errors = _validate_result_artifact(result)
+    if schema_errors:
+        raise ValueError("final_result_schema_invalid: " + "; ".join(schema_errors))
+    _atomic_write_json(snapshot_path, raw_snapshot)
+    _materialize_immutable_snapshot(repo_root, issue_number, raw_snapshot)
+    _atomic_write_json(planner_input_path, planner_input)
+    _atomic_write_json(result_path, result)
+    try:
+        readback = json.loads(result_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"result_artifact_readback_error:{type(exc).__name__}:{exc}") from exc
+    readback_errors = _validate_result_artifact(readback)
+    if readback_errors:
+        raise ValueError("result_artifact_readback_schema_invalid: " + "; ".join(readback_errors))
+    return artifacts
+
+
+def _atomic_write_json(path: Path, value: Any) -> None:
+    encoded = (json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _validate_result_artifact(result: Any) -> list[str]:
+    schema = _load_schema("refinement_preflight_result_v1.schema.json")
+    if schema is None:
+        return ["result_schema_unavailable"]
+    valid, errors = _validate_with_schema(result, schema)
+    return [] if valid else errors
 
 
 # ---------------------------------------------------------------------------
@@ -1556,36 +1588,12 @@ def _emit_failure_result(
 
     artifacts: dict[str, str] = {}
     if raw_snapshot is not None and planner_input is not None:
-        # Build partial result (without artifacts/hashes) to write
-        result_core = _build_result(
-            status=status,
-            issue_number=issue_number,
-            repo=repo,
-            planner_exit_code=planner_exit_code,
-            planner_fail_closed=planner_fail_closed,
-            next_action=next_action,
-            must_read=[],
-            do_not_read=[],
-            commands=[],
-            blockers=blockers,
-            planner_fail_closed_reason_codes=planner_fail_closed_reason_codes or [],
-            required_sections=required_sections or [],
-            required_contract_keys=required_contract_keys or [],
-            rewrite_constraints=rewrite_constraints,
-            artifacts={},
-            hashes=hashes,
-        )
-        artifacts = _write_artifacts(repo_root, issue_number, raw_snapshot, planner_input, result_core)
-        projection_failures = _validate_artifact_projection(
-            repo_root=repo_root,
-            issue_number=issue_number,
-            artifacts=artifacts,
-        )
-        if projection_failures:
-            blockers = [*blockers, BLOCKER_ARTIFACT_PROJECTION_MISMATCH, *projection_failures]
-            status = "environment_failure"
-            next_action = "fix_environment"
-            artifacts = {}
+        artifact_dir = _issue_artifact_dir(repo_root, issue_number)
+        artifacts = {
+            "raw_issue_snapshot": str(artifact_dir / "raw_issue_snapshot.json"),
+            "planner_input": str(artifact_dir / "planner_input.json"),
+            "refinement_preflight_result_v1": str(artifact_dir / "refinement_preflight_result_v1.json"),
+        }
 
     result = _build_result(
         status=status,
@@ -1606,9 +1614,21 @@ def _emit_failure_result(
         hashes=hashes,
     )
 
+    if raw_snapshot is not None and planner_input is not None:
+        try:
+            _write_artifacts(repo_root, issue_number, raw_snapshot, planner_input, result)
+        except Exception as exc:
+            result["blockers"] = [*result["blockers"], BLOCKER_RESULT_SCHEMA_INVALID,
+                                  f"failure_artifact_write_error:{type(exc).__name__}:{str(exc)[:500]}"]
+            result["status"] = "environment_failure"
+            result["next_action"] = "fix_environment"
+            result["artifacts"] = {}
+
     _, exit_code = _apply_exit_code_mapping(
-        planner_exit_code, planner_fail_closed, blockers
+        planner_exit_code, planner_fail_closed, result["blockers"]
     )
+    if result["status"] == "environment_failure":
+        exit_code = EXIT_ENVIRONMENT_FAILURE
     print(_build_compact_stdout(result))
     return result, exit_code
 
@@ -2030,6 +2050,8 @@ def run_preflight(
             pass
 
         status_str, _ = _apply_exit_code_mapping(planner_exit_code, None, blockers)
+        if planner_exit_code == 3:
+            status_str = "environment_failure"
         return _emit_failure_result(
             repo_root=repo_root,
             issue_number=issue_number,
@@ -2037,11 +2059,12 @@ def run_preflight(
             status=status_str,
             next_action="fix_environment" if status_str == "environment_failure" else "human_judgment_required",
             blockers=blockers,
-            planner_fail_closed_reason_codes=[],
+            planner_fail_closed_reason_codes=[BLOCKER_PLANNER_INTERNAL_ERROR],
             required_sections=[],
             required_contract_keys=[],
-            rewrite_constraints=None,
+            rewrite_constraints=_build_safe_rewrite_constraints([], []),
             planner_exit_code=planner_exit_code,
+            planner_fail_closed=True,
             planner_input=planner_input_dict,
             raw_snapshot=raw_snapshot,
         )
@@ -2227,7 +2250,12 @@ def run_preflight(
         "result_core_sha256": _sha256(result_core_text),
     }
 
-    # --- Build final result (once, before writing) ---
+    artifact_dir = _issue_artifact_dir(repo_root, issue_number)
+    artifacts = {
+        "raw_issue_snapshot": str(artifact_dir / "raw_issue_snapshot.json"),
+        "planner_input": str(artifact_dir / "planner_input.json"),
+        "refinement_preflight_result_v1": str(artifact_dir / "refinement_preflight_result_v1.json"),
+    }
     result = _build_result(
         status=status,
         issue_number=issue_number,
@@ -2243,43 +2271,21 @@ def run_preflight(
         required_sections=required_sections,
         required_contract_keys=required_contract_keys,
         rewrite_constraints=rewrite_constraints,
-        artifacts={},  # filled below
+        artifacts=artifacts,
         hashes=hashes,
     )
-
-    # --- Validate result against result schema before writing ---
-    result_schema = _load_schema("refinement_preflight_result_v1.schema.json")
-    if result_schema is not None:
-        is_valid, schema_errors = _validate_with_schema(result, result_schema)
-        if not is_valid:
-            err_detail = "; ".join(schema_errors)
-            result["blockers"] = result.get("blockers", []) + [
-                BLOCKER_RESULT_SCHEMA_INVALID, f"result_schema_errors: {err_detail}"
-            ]
-            result["status"] = "environment_failure"
-            result["next_action"] = "fix_environment"
-            exit_code = EXIT_ENVIRONMENT_FAILURE
-
-    # --- Write artifacts (once, after result is fully built) ---
-    artifacts = _write_artifacts(
-        repo_root, issue_number, raw_snapshot, planner_input_dict, result
-    )
-    projection_failures = _validate_artifact_projection(
-        repo_root=repo_root,
-        issue_number=issue_number,
-        artifacts=artifacts,
-    )
-    if projection_failures:
-        result["blockers"] = result.get("blockers", []) + [
-            BLOCKER_ARTIFACT_PROJECTION_MISMATCH,
-            *projection_failures,
-        ]
-        result["status"] = "environment_failure"
-        result["next_action"] = "fix_environment"
-        result["artifacts"] = {}
+    try:
+        _write_artifacts(repo_root, issue_number, raw_snapshot, planner_input_dict, result)
+    except Exception as exc:
+        result = _build_result(status="environment_failure", issue_number=issue_number, repo=repo,
+            planner_exit_code=planner_exit_code, planner_fail_closed=planner_fail_closed,
+            next_action="fix_environment", must_read=sorted(set(must_read)), do_not_read=do_not_read,
+            commands=commands, blockers=[*blockers, BLOCKER_RESULT_SCHEMA_INVALID,
+            f"result_artifact_write_error:{type(exc).__name__}:{str(exc)[:500]}"],
+            planner_fail_closed_reason_codes=planner_fail_closed_reason_codes,
+            required_sections=required_sections, required_contract_keys=required_contract_keys,
+            rewrite_constraints=rewrite_constraints, artifacts={}, hashes=hashes)
         exit_code = EXIT_ENVIRONMENT_FAILURE
-    else:
-        result["artifacts"] = artifacts
 
     # --- Blocker 1 (success path): provenance sidecar ---
     try:
@@ -2299,11 +2305,6 @@ def run_preflight(
         write_provenance_artifact(repo_root, issue_number, _provenance)
     except Exception:
         pass
-
-    # Update artifact file with final artifacts field included
-    artifact_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
-    result_path = artifact_dir / "refinement_preflight_result_v1.json"
-    result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # Print compact stdout (no raw body/comments/sentinels) — same result dict
     print(_build_compact_stdout(result))
@@ -2536,6 +2537,12 @@ def build_provenance(
     raw_snapshot_text = _canonical_json(raw_snapshot)
     stderr_str = stderr or ""
 
+    def _dependency_version(name: str) -> str:
+        try:
+            return importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            return "not_installed"
+
     return {
         "schema_version": "REFINEMENT_PREFLIGHT_PROVENANCE_V1",
         "repo": repo,
@@ -2551,6 +2558,7 @@ def build_provenance(
         "wrapper_script_blob_sha": _git_blob_sha(wrapper_script, repo_root),
         "python_executable": sys.executable,
         "python_version": sys.version,
+        "dependency_versions": {"jsonschema": _dependency_version("jsonschema"), "referencing": _dependency_version("referencing")},
         "cwd": str(Path.cwd()),
         "py_compile_status": py_compile_proof["py_compile_status"],
         # Issue #1439 AC12: persist the full PY_SYNTAX_COMPILE_PROOF_V2 proof
