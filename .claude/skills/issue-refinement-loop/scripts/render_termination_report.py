@@ -48,6 +48,24 @@ sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS))
 
 from prose_boundary_policy import classify_block, iter_markdown_blocks  # noqa: E402
 
+# PR #1767 owner review (P0-4/AC12 Scope Delta): render_termination_report.py
+# is the actual LOOP_HANDOFF_RESULT_V1 producer (it emits the
+# <!-- LOOP_HANDOFF_RESULT_V1 --> marker). It must build
+# issue_execution_decision_ref from a full ISSUE_EXECUTION_DECISION_V1 using
+# the same canonical validator/projection as every other consumer, rather
+# than trusting a caller-supplied ref (which a prior version of this file --
+# and its tests -- did by manual assignment).
+_SCRIPTS_DIR_SELF = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPTS_DIR_SELF))
+try:
+    from validate_issue_execution_decision import (
+        project_issue_execution_decision_ref,
+        validate_issue_execution_decision,
+    )
+except ImportError:  # pragma: no cover - defensive fallback
+    validate_issue_execution_decision = None
+    project_issue_execution_decision_ref = None
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -584,6 +602,38 @@ def normalize_input(raw: Any) -> dict[str, Any]:
 
     if "loop_handoff" in data and data["loop_handoff"] is not None:
         data["loop_handoff"] = _normalize_loop_handoff(data["loop_handoff"])
+
+    # #1677 AC5/AC12 (PR #1767 owner review, P0-4): production auto-generation
+    # of issue_execution_decision_ref from a full ISSUE_EXECUTION_DECISION_V1,
+    # instead of relying on the caller (or a test) to assign the ref by hand.
+    # A caller-supplied issue_execution_decision_ref is always overwritten --
+    # this producer is the single source of truth for the ref, matching
+    # downstream_policy.semantic_reclassification: forbidden.
+    if "issue_execution_decision" in data and data["issue_execution_decision"] is not None:
+        _issue_execution_decision = data.pop("issue_execution_decision")
+        if validate_issue_execution_decision is None or project_issue_execution_decision_ref is None:
+            raise InputValidationError(
+                "issue_execution_decision provided but validate_issue_execution_decision "
+                "module import failed; refusing to auto-generate issue_execution_decision_ref"
+            )
+        if not isinstance(_issue_execution_decision, dict):
+            raise InputValidationError("issue_execution_decision must be an object")
+        _decision_violations = validate_issue_execution_decision(_issue_execution_decision)
+        if _decision_violations:
+            raise InputValidationError(
+                "issue_execution_decision failed validation: " + ", ".join(_decision_violations)
+            )
+        _ref = project_issue_execution_decision_ref(_issue_execution_decision)
+        if _ref is None:
+            raise InputValidationError(
+                "issue_execution_decision passed validation but could not be "
+                "projected to issue_execution_decision_ref"
+            )
+        loop_handoff = data.get("loop_handoff")
+        if isinstance(loop_handoff, dict):
+            loop_handoff = dict(loop_handoff)
+            loop_handoff["issue_execution_decision_ref"] = _ref
+            data["loop_handoff"] = loop_handoff
 
     if "scope_signal_guard_decision_v2" in data:
         decision = data.pop("scope_signal_guard_decision_v2")

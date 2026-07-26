@@ -58,6 +58,40 @@
     "reason_codes": [],
     "required": false
   },
+  "issue_execution_decision": {
+    "completeness": {
+      "dependencies_complete": false,
+      "issues_complete": false,
+      "unresolved_references": [
+        18
+      ]
+    },
+    "downstream_policy": {
+      "freshness_validation": "required",
+      "semantic_reclassification": "forbidden",
+      "stale_action": "rerun_issue_refinement"
+    },
+    "execution": {
+      "defer_reason": "scope rollup evidence incomplete (scope_rollup_artifact_absent); rerun issue-refinement-loop",
+      "predecessors": [],
+      "state": "deferred",
+      "target_issue_number": 18
+    },
+    "identity": {
+      "collection_digest": "sha256:bd05601ecdcc561cb00df06ab3ae8e0959be5741ebc4962bebdc37f62e938142",
+      "generated_at": "2025-05-25T12:00:00+00:00",
+      "target_body_sha256": "sha256:f688d3a56ad9ef41240975710a0c99284deacdaafd42bc9d92cc4bebfa8b37d6",
+      "target_issue_number": 18
+    },
+    "nodes": [
+      {
+        "body_sha256": "sha256:f688d3a56ad9ef41240975710a0c99284deacdaafd42bc9d92cc4bebfa8b37d6",
+        "issue_number": 18
+      }
+    ],
+    "relations": [],
+    "schema_version": "ISSUE_EXECUTION_DECISION_V1"
+  },
   "schema_version": "refinement_loop_plan/v1",
   "source": {
     "comments_sha256": null,

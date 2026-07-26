@@ -4,7 +4,9 @@
   "title": "LOOP_HANDOFF_RESULT_V1",
   "description": "Terminal output of issue-refinement-loop on approved termination. SSOT: references/termination-policy.md",
   "type": "object",
-  "required": ["LOOP_HANDOFF_RESULT_V1"],
+  "required": [
+    "LOOP_HANDOFF_RESULT_V1"
+  ],
   "additionalProperties": false,
   "properties": {
     "LOOP_HANDOFF_RESULT_V1": {
@@ -23,20 +25,37 @@
       "properties": {
         "status": {
           "type": "string",
-          "enum": ["impl_ready", "human_judgment_required", "blocked"]
+          "enum": [
+            "impl_ready",
+            "human_judgment_required",
+            "blocked"
+          ]
         },
         "routing_action": {
           "type": "string",
-          "enum": ["run_impl_review_loop", "ask_human", "blocked"]
+          "enum": [
+            "run_impl_review_loop",
+            "ask_human",
+            "blocked"
+          ]
         },
         "contract_review": {
           "type": "object",
-          "required": ["status", "gate_result", "latest_comment_url", "generated_at", "body_sha256"],
+          "required": [
+            "status",
+            "gate_result",
+            "latest_comment_url",
+            "generated_at",
+            "body_sha256"
+          ],
           "additionalProperties": false,
           "properties": {
             "status": {
               "type": "string",
-              "enum": ["go", "blocked"],
+              "enum": [
+                "go",
+                "blocked"
+              ],
               "description": "Mirrors CONTRACT_REVIEW_RESULT_V1.status. Does not collide with top-level LOOP_HANDOFF_RESULT_V1.status."
             },
             "gate_result": {
@@ -63,7 +82,10 @@
         },
         "metadata": {
           "type": "object",
-          "required": ["title_prefix_ready", "phase_label_ready"],
+          "required": [
+            "title_prefix_ready",
+            "phase_label_ready"
+          ],
           "additionalProperties": false,
           "properties": {
             "title_prefix_ready": {
@@ -76,20 +98,32 @@
         },
         "auto_fixes": {
           "type": "object",
-          "required": ["result", "required", "skipped"],
+          "required": [
+            "result",
+            "required",
+            "skipped"
+          ],
           "additionalProperties": false,
           "properties": {
             "result": {
               "type": "string",
-              "enum": ["auto_fixed", "human_judgment_required", "blocked"]
+              "enum": [
+                "auto_fixed",
+                "human_judgment_required",
+                "blocked"
+              ]
             },
             "required": {
               "type": "array",
-              "items": { "$ref": "#/definitions/auto_fix_item" }
+              "items": {
+                "$ref": "#/definitions/auto_fix_item"
+              }
             },
             "skipped": {
               "type": "array",
-              "items": { "$ref": "#/definitions/auto_fix_item" }
+              "items": {
+                "$ref": "#/definitions/auto_fix_item"
+              }
             }
           }
         },
@@ -97,22 +131,33 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["kind", "description"],
+            "required": [
+              "kind",
+              "description"
+            ],
             "additionalProperties": false,
             "properties": {
-              "kind": { "type": "string" },
-              "description": { "type": "string" }
+              "kind": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              }
             }
           }
         },
         "permissions": {
           "type": "object",
-          "required": ["unavailable"],
+          "required": [
+            "unavailable"
+          ],
           "additionalProperties": false,
           "properties": {
             "unavailable": {
               "type": "array",
-              "items": { "type": "string" }
+              "items": {
+                "type": "string"
+              }
             }
           }
         },
@@ -127,40 +172,93 @@
         "checker_exit_code": {
           "type": "integer",
           "description": "チェックスクリプトの終了コード（0: pass, 1: fail）",
-          "enum": [0, 1]
+          "enum": [
+            0,
+            1
+          ]
         },
         "missing_sections": {
           "type": "array",
           "description": "不足しているセクション名のリスト（pass 時は空）",
-          "items": {"type": "string"}
+          "items": {
+            "type": "string"
+          }
         },
         "missing_contract_keys": {
           "type": "array",
           "description": "不足している contract キーのリスト（pass 時は空）",
-          "items": {"type": "string"}
+          "items": {
+            "type": "string"
+          }
+        },
+        "issue_execution_decision_ref": {
+          "type": "object",
+          "description": "Reference to the ISSUE_EXECUTION_DECISION_V1 that authorized this handoff (#1677 AC5). Downstream consumers MUST re-run issue-refinement-loop if this digest is stale rather than re-classifying semantics themselves.",
+          "required": [
+            "schema_version",
+            "target_issue_number",
+            "collection_digest"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "schema_version": {
+              "type": "string",
+              "const": "ISSUE_EXECUTION_DECISION_V1"
+            },
+            "target_issue_number": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "collection_digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            }
+          }
         }
       },
       "allOf": [
         {
           "if": {
-            "properties": { "status": { "const": "impl_ready" } },
-            "required": ["status"]
+            "properties": {
+              "status": {
+                "const": "impl_ready"
+              }
+            },
+            "required": [
+              "status"
+            ]
           },
           "then": {
             "properties": {
-              "routing_action": { "const": "run_impl_review_loop" },
+              "routing_action": {
+                "const": "run_impl_review_loop"
+              },
               "contract_review": {
                 "properties": {
-                  "status": { "const": "go" },
-                  "gate_result": { "const": "fresh_go" }
+                  "status": {
+                    "const": "go"
+                  },
+                  "gate_result": {
+                    "const": "fresh_go"
+                  }
                 }
               },
-              "blockers": { "maxItems": 0 },
+              "blockers": {
+                "maxItems": 0
+              },
               "permissions": {
-                "properties": { "unavailable": { "maxItems": 0 } }
+                "properties": {
+                  "unavailable": {
+                    "maxItems": 0
+                  }
+                }
               },
               "auto_fixes": {
-                "properties": { "skipped": { "maxItems": 0 } }
+                "properties": {
+                  "skipped": {
+                    "maxItems": 0
+                  }
+                }
               }
             }
           }
@@ -171,7 +269,12 @@
   "definitions": {
     "auto_fix_item": {
       "type": "object",
-      "required": ["kind", "executor", "result", "evidence"],
+      "required": [
+        "kind",
+        "executor",
+        "result",
+        "evidence"
+      ],
       "additionalProperties": false,
       "properties": {
         "kind": {
@@ -186,20 +289,36 @@
         },
         "executor": {
           "type": "string",
-          "enum": ["implementation-worker"]
+          "enum": [
+            "implementation-worker"
+          ]
         },
         "result": {
           "type": "string",
-          "enum": ["applied", "skipped", "failed"]
+          "enum": [
+            "applied",
+            "skipped",
+            "failed"
+          ]
         },
         "evidence": {
           "type": "object",
-          "required": ["before", "after", "comment_url"],
+          "required": [
+            "before",
+            "after",
+            "comment_url"
+          ],
           "additionalProperties": false,
           "properties": {
-            "before": { "type": "string" },
-            "after": { "type": "string" },
-            "comment_url": { "type": "string" }
+            "before": {
+              "type": "string"
+            },
+            "after": {
+              "type": "string"
+            },
+            "comment_url": {
+              "type": "string"
+            }
           }
         }
       }
