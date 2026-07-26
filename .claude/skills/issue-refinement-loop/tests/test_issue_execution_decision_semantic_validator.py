@@ -18,6 +18,7 @@ SCRIPT_DIR = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import plan_refinement_loop as prl  # noqa: E402
+import validate_issue_execution_decision as vied  # noqa: E402
 
 
 SHA = "sha256:" + "a" * 64
@@ -201,17 +202,30 @@ def test_duplicate_state_without_duplicate_relation_rejected():
 
 
 def test_unknown_relation_type_rejected():
+    """
+    PR #1767 owner review (P1-1): validate_issue_execution_decision() is now
+    schema-first (validate_schema() short-circuits before
+    validate_semantics()), so an invalid enum value is caught at the schema
+    layer first. The combined entry point must still reject it (non-empty
+    violations); the semantic-layer-specific message is checked directly
+    against validate_semantics() (bypassing schema-first short-circuit).
+    """
     decision = _valid_decision()
     decision["relations"][0]["relation_type"] = "absorbs"  # legacy misspelling
-    violations = prl.validate_issue_execution_decision(decision)
-    assert any(v.startswith("unknown_relation_type") for v in violations)
+    combined_violations = prl.validate_issue_execution_decision(decision)
+    assert combined_violations  # rejected somewhere in the chain
+    semantic_violations = vied.validate_semantics(decision)
+    assert any(v.startswith("unknown_relation_type") for v in semantic_violations)
 
 
 def test_unknown_execution_state_rejected():
+    """See test_unknown_relation_type_rejected docstring for the schema-first rationale."""
     decision = _valid_decision()
     decision["execution"]["state"] = "superseded"
-    violations = prl.validate_issue_execution_decision(decision)
-    assert any(v.startswith("unknown_execution_state") for v in violations)
+    combined_violations = prl.validate_issue_execution_decision(decision)
+    assert combined_violations
+    semantic_violations = vied.validate_semantics(decision)
+    assert any(v.startswith("unknown_execution_state") for v in semantic_violations)
 
 
 def test_nodes_not_sorted_rejected():

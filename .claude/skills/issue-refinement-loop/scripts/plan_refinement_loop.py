@@ -438,19 +438,27 @@ def _canonical_json(obj: Any) -> str:
 # re-implementing the invariants, per the #1677 Canonical Contract Freeze.
 # ---------------------------------------------------------------------------
 
-ISSUE_EXECUTION_DECISION_SCHEMA_VERSION = "ISSUE_EXECUTION_DECISION_V1"
-
-ISSUE_EXECUTION_DECISION_DOWNSTREAM_POLICY = {
-    "semantic_reclassification": "forbidden",
-    "freshness_validation": "required",
-    "stale_action": "rerun_issue_refinement",
-}
-
-_VALID_RELATION_TYPES = frozenset(
-    {"depends_on", "duplicate", "absorb", "supersedes", "coordinates"}
-)
-_VALID_EXECUTION_STATES = frozenset({"selected", "deferred", "blocked", "duplicate"})
-_DUPLICATE_LIKE_RELATIONS = frozenset({"duplicate", "absorb"})
+# PR #1767 owner review (P0-4/AC12 Scope Delta): validate_issue_execution_
+# decision.py is now the standalone canonical module (schema+semantic
+# validator, provenance/migration helpers). plan_refinement_loop.py imports
+# from it rather than defining its own copy, so producer/LOOP_STATE builder/
+# handoff producer/downstream consumer share one authority. Import failure
+# is fail-closed (validate_issue_execution_decision left as None; callers
+# below check for this and refuse to emit an unvalidated decision).
+try:
+    from validate_issue_execution_decision import (
+        ISSUE_EXECUTION_DECISION_DOWNSTREAM_POLICY,
+        ISSUE_EXECUTION_DECISION_SCHEMA_VERSION,
+        validate_issue_execution_decision,
+    )
+except ImportError:  # pragma: no cover - subprocess/CLI fallback path
+    validate_issue_execution_decision = None
+    ISSUE_EXECUTION_DECISION_SCHEMA_VERSION = "ISSUE_EXECUTION_DECISION_V1"
+    ISSUE_EXECUTION_DECISION_DOWNSTREAM_POLICY = {
+        "semantic_reclassification": "forbidden",
+        "freshness_validation": "required",
+        "stale_action": "rerun_issue_refinement",
+    }
 
 # PR #1767 owner review (P0-2): ISSUE_SCOPE_ROLLUP_PLAN_V2 is a coordination
 # plan, not a semantic dependency graph. suggested_action /
@@ -790,283 +798,12 @@ def build_issue_execution_decision(
     }
 
 
-def _is_valid_issue_number(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
+# validate_issue_execution_decision (schema-first combined check) and its
+# validate_schema()/validate_semantics() split now live in the standalone
+# canonical module validate_issue_execution_decision.py (#1677 AC11/AC12
+# Scope Delta), imported above. This module no longer defines its own
+# copy of the semantic invariants.
 
-
-def validate_issue_execution_decision(decision: dict[str, Any]) -> list[str]:
-    """
-    Normative semantic validator for ISSUE_EXECUTION_DECISION_V1 (#1677 AC11,
-    hardened per PR #1767 owner review P0-3.4/P1-1).
-
-    Returns a list of violation reason strings (empty == valid). Checks
-    cross-field / graph invariants that the closed JSON Schema
-    (schemas/issue_execution_decision_v1.schema.json) cannot express:
-    ordering, node/relation uniqueness, endpoint existence, self-edges,
-    conflicting parallel edges, depends_on cycles, target/predecessor
-    agreement, state semantics, completeness gating, identity/node/digest
-    cross-consistency. Never raises for malformed/type-invalid input --
-    schema-invalid shapes are reported as violations, not exceptions (P1-1).
-
-    Callers (planner/preflight, build_loop_state.py, handoff parser,
-    termination report, downstream consumers) MUST use this function as the
-    single semantic-validation authority instead of re-deriving invariants.
-    """
-    try:
-        return _validate_issue_execution_decision_impl(decision)
-    except Exception as exc:  # pragma: no cover - defensive fail-closed net
-        # P1-1: a type-invalid instance (unhashable issue_number, mixed
-        # int/string endpoints, malformed predecessor list, etc.) must
-        # surface as a violation, never as an uncaught exception in a
-        # downstream consumer that calls this as the sole validation gate.
-        return [f"internal_validator_error:{type(exc).__name__}:{exc}"]
-
-
-def _validate_issue_execution_decision_impl(decision: dict[str, Any]) -> list[str]:
-    violations: list[str] = []
-
-    if not isinstance(decision, dict):
-        return ["not_a_mapping"]
-
-    schema_version = decision.get("schema_version")
-    identity = decision.get("identity")
-    nodes = decision.get("nodes")
-    relations = decision.get("relations")
-    execution = decision.get("execution")
-    completeness = decision.get("completeness")
-    downstream_policy = decision.get("downstream_policy")
-
-    if schema_version != ISSUE_EXECUTION_DECISION_SCHEMA_VERSION:
-        violations.append(f"unknown_schema_version:{schema_version}")
-
-    if not isinstance(nodes, list) or not isinstance(relations, list):
-        return violations + ["missing_nodes_or_relations"]
-    if not isinstance(execution, dict) or not isinstance(completeness, dict):
-        return violations + ["missing_execution_or_completeness"]
-    if not isinstance(identity, dict):
-        violations.append("missing_identity")
-        identity = {}
-    if not isinstance(downstream_policy, dict):
-        violations.append("missing_downstream_policy")
-        downstream_policy = {}
-
-    # --- node uniqueness + ordering (type-safe: reject unhashable/malformed
-    # issue_number before it ever reaches set()/sorted()) ---
-    node_numbers: list[int] = []
-    node_body_sha_by_number: dict[int, Any] = {}
-    for n in nodes:
-        if not isinstance(n, dict) or not _is_valid_issue_number(n.get("issue_number")):
-            violations.append("malformed_node")
-            continue
-        num = n["issue_number"]
-        node_numbers.append(num)
-        node_body_sha_by_number[num] = n.get("body_sha256")
-
-    if len(node_numbers) != len(set(node_numbers)):
-        violations.append("duplicate_node")
-    if node_numbers != sorted(node_numbers):
-        violations.append("nodes_not_sorted")
-
-    node_set = set(node_numbers)
-
-    # --- relation ordering + uniqueness + endpoint + self-edge (type-safe) ---
-    relation_tuples = []
-    depends_on_edges: list[tuple[int, int]] = []
-    seen_unordered_pairs: dict[frozenset, set[str]] = {}
-    # Relation types that are mutually exclusive on the same unordered node
-    # pair -- a pair cannot simultaneously be e.g. duplicate AND depends_on,
-    # or duplicate AND supersedes (PR #1767 owner review, P1-1).
-    _mutually_exclusive_relations = frozenset(
-        {"depends_on", "duplicate", "absorb", "supersedes"}
-    )
-
-    for r in relations:
-        if not isinstance(r, dict):
-            violations.append("malformed_relation")
-            continue
-        src = r.get("source_issue_number")
-        tgt = r.get("target_issue_number")
-        rtype = r.get("relation_type")
-
-        if not _is_valid_issue_number(src) or not _is_valid_issue_number(tgt):
-            violations.append("malformed_relation_endpoint")
-            continue
-        if rtype not in _VALID_RELATION_TYPES:
-            violations.append(f"unknown_relation_type:{rtype}")
-            continue
-        if src == tgt:
-            violations.append(f"self_edge:{src}")
-        if src not in node_set or tgt not in node_set:
-            violations.append(f"unknown_endpoint:{src}->{tgt}")
-
-        relation_tuples.append((src, tgt, rtype))
-        if rtype == "depends_on":
-            depends_on_edges.append((src, tgt))
-
-        pair = frozenset({src, tgt})
-        seen_unordered_pairs.setdefault(pair, set()).add(rtype)
-
-    if len(relation_tuples) != len(set(relation_tuples)):
-        violations.append("duplicate_relation")
-    if relation_tuples != sorted(relation_tuples):
-        violations.append("relations_not_sorted")
-
-    for pair, rtypes in seen_unordered_pairs.items():
-        exclusive_hits = rtypes & _mutually_exclusive_relations
-        if len(exclusive_hits) > 1:
-            violations.append(
-                f"conflicting_parallel_edge:{sorted(pair)}:{sorted(exclusive_hits)}"
-            )
-
-    # --- depends_on cycle detection (general graph, not just pairwise) ---
-    adjacency: dict[int, list[int]] = {}
-    for src, tgt in depends_on_edges:
-        adjacency.setdefault(src, []).append(tgt)
-
-    WHITE, GRAY, BLACK = 0, 1, 2
-    color = {n: WHITE for n in node_set}
-
-    def _has_cycle(start: int) -> bool:
-        stack = [(start, iter(adjacency.get(start, [])))]
-        color[start] = GRAY
-        while stack:
-            node, it = stack[-1]
-            advanced = False
-            for nxt in it:
-                if color.get(nxt, WHITE) == GRAY:
-                    return True
-                if color.get(nxt, WHITE) == WHITE:
-                    color[nxt] = GRAY
-                    stack.append((nxt, iter(adjacency.get(nxt, []))))
-                    advanced = True
-                    break
-            if not advanced:
-                color[node] = BLACK
-                stack.pop()
-        return False
-
-    for n in list(node_set):
-        if color.get(n, WHITE) == WHITE:
-            if _has_cycle(n):
-                violations.append("depends_on_cycle")
-                break
-
-    # --- execution / predecessor agreement ---
-    target = execution.get("target_issue_number")
-    predecessors = execution.get("predecessors")
-    state = execution.get("state")
-    defer_reason = execution.get("defer_reason")
-
-    if not _is_valid_issue_number(target):
-        violations.append("malformed_execution_target")
-    elif target not in node_set:
-        violations.append("execution_target_not_in_nodes")
-
-    # Convention: relation(source_issue_number=X, target_issue_number=Y,
-    # relation_type="depends_on") reads as "X depends_on Y" (Y must complete
-    # before X proceeds). Predecessors of execution.target_issue_number are
-    # therefore the *targets* of depends_on edges whose *source* is the
-    # execution target (i.e. what the target issue itself depends on).
-    expected_predecessors = sorted(
-        {tgt for (src, tgt) in depends_on_edges if src == target}
-    )
-    predecessors_valid = isinstance(predecessors, list) and all(
-        _is_valid_issue_number(p) for p in predecessors
-    )
-    if not predecessors_valid:
-        violations.append("malformed_predecessors")
-    elif sorted(set(predecessors)) != expected_predecessors:
-        violations.append("predecessors_do_not_match_depends_on_edges")
-
-    if state not in _VALID_EXECUTION_STATES:
-        violations.append(f"unknown_execution_state:{state}")
-
-    issues_complete = completeness.get("issues_complete")
-    dependencies_complete = completeness.get("dependencies_complete")
-    unresolved_references = completeness.get("unresolved_references")
-    incomplete = (
-        issues_complete is not True
-        or dependencies_complete is not True
-        or bool(unresolved_references)
-    )
-
-    # P1-1: unresolved_references node correspondence -- every referenced
-    # issue number must at least be a known node (otherwise it references
-    # nothing the graph can act on).
-    if isinstance(unresolved_references, list):
-        for ref in unresolved_references:
-            if _is_valid_issue_number(ref) and ref not in node_set and ref != target:
-                violations.append(f"unresolved_reference_not_in_nodes:{ref}")
-
-    if predecessors_valid and state == "selected" and predecessors:
-        violations.append("selected_state_with_predecessors")
-    if state == "selected" and incomplete:
-        violations.append("selected_state_with_incomplete_evidence")
-
-    if state in ("deferred", "blocked") and not defer_reason:
-        violations.append(f"{state}_state_missing_defer_reason")
-
-    # PR #1767 owner review (P1-1): 'blocked' without any predecessor is
-    # meaningless under this schema (predecessors is the only blocking
-    # mechanism modeled) -- must use 'deferred' instead for non-predecessor
-    # blockers.
-    if state == "blocked" and predecessors_valid and not predecessors:
-        violations.append("blocked_state_without_predecessors")
-
-    # PR #1767 owner review (P1-1): 'deferred' must not carry an unresolved
-    # depends_on predecessor -- that combination means the target IS
-    # actionably blocked on something, which is 'blocked', not 'deferred'.
-    if state == "deferred" and predecessors_valid and predecessors:
-        violations.append("deferred_state_with_depends_on_predecessor")
-
-    if state == "duplicate":
-        has_duplicate_relation = any(
-            rtype in _DUPLICATE_LIKE_RELATIONS and (src == target or tgt == target)
-            for (src, tgt, rtype) in relation_tuples
-        )
-        if not has_duplicate_relation:
-            violations.append("duplicate_state_without_duplicate_relation")
-
-    # --- downstream_policy semantic check (defense in depth; schema also
-    # enforces this via const, but the standalone semantic validator should
-    # not silently accept a policy-shaped dict with the wrong values if ever
-    # called before schema validation) ---
-    if downstream_policy != ISSUE_EXECUTION_DECISION_DOWNSTREAM_POLICY:
-        violations.append("downstream_policy_mismatch")
-
-    # --- identity / node / digest cross-consistency (PR #1767 owner review,
-    # P0-3.4) ---
-    identity_target = identity.get("target_issue_number")
-    identity_body_sha = identity.get("target_body_sha256")
-    declared_digest = identity.get("collection_digest")
-
-    if _is_valid_issue_number(identity_target) and _is_valid_issue_number(target):
-        if identity_target != target:
-            violations.append("identity_target_execution_target_mismatch")
-    if _is_valid_issue_number(identity_target) and identity_target not in node_set:
-        violations.append("identity_target_not_in_nodes")
-    if (
-        _is_valid_issue_number(identity_target)
-        and identity_target in node_body_sha_by_number
-        and node_body_sha_by_number[identity_target] != identity_body_sha
-    ):
-        violations.append("identity_target_body_sha256_node_mismatch")
-
-    recomputed_digest = _sha256_prefixed(
-        _canonical_json(
-            {
-                "nodes": nodes,
-                "relations": relations,
-                "execution": execution,
-                "completeness": completeness,
-                "downstream_policy": downstream_policy,
-            }
-        )
-    )
-    if declared_digest != recomputed_digest:
-        violations.append("collection_digest_mismatch")
-
-    return violations
 
 def _extract_sections(text: str) -> dict[str, str]:
     if delta_extract_sections is not None:
@@ -2831,6 +2568,14 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
         issue_execution_decision = build_issue_execution_decision(
             issue_number, issue_body_sha256, generated_at, known_context
         )
+        if validate_issue_execution_decision is None:
+            # #1677 AC12 (PR #1767 owner review, P0-4): a failed import of
+            # the canonical validate_issue_execution_decision module must
+            # fail-closed, not silently skip validation.
+            raise RuntimeError(
+                "validate_issue_execution_decision module import failed; "
+                "refusing to emit an unvalidated issue_execution_decision"
+            )
         _decision_violations = validate_issue_execution_decision(issue_execution_decision)
         if _decision_violations:
             # PR #1767 owner review (P0-3.4): a prior version of this

@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 import jsonschema
+import pytest
 import yaml
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
@@ -174,25 +175,30 @@ def test_loop_handoff_ref_schema_valid():
 
 def test_termination_report_marker_carries_same_digest_end_to_end():
     """
-    AC5 (production test): the full chain (planner -> LOOP_STATE ->
-    project_ref -> termination report marker) reaches the termination
-    report with the exact same collection_digest, and the rendered
-    marker YAML validates against loop_handoff_result_v1.json.
+    AC5 (production test, PR #1767 owner review P0-4): the full chain
+    (planner -> LOOP_STATE -> termination report marker) reaches the
+    termination report with the exact same collection_digest.
+
+    issue_execution_decision_ref is NOT assembled by this test -- it is
+    passed as data["issue_execution_decision"] (the full LOOP_STATE
+    decision) and render_termination_report.normalize_input() auto-generates
+    and attaches the ref via the shared validate_issue_execution_decision /
+    project_issue_execution_decision_ref API (production E2E, not a
+    test-assembled substitute for missing orchestration).
     """
     plan = _plan(2004)
     review = {"VERDICT": "approve", "issue_number": 2004}
     loop_state, blocked, _ = bls.build_loop_state(plan, review, issue_number=2004, iteration=0)
     assert blocked == []
 
-    ref = bls.project_issue_execution_decision_ref(loop_state["issue_execution_decision"])
     loop_handoff = _base_loop_handoff()
-    loop_handoff["issue_execution_decision_ref"] = ref
 
     data = {
         "termination_reason": "approved",
         "issue_number": 2004,
         "iteration": 0,
         "loop_handoff": loop_handoff,
+        "issue_execution_decision": loop_state["issue_execution_decision"],
     }
     result = rtr.render(data)
     assert result["publishable"] is True
@@ -211,3 +217,21 @@ def test_termination_report_marker_carries_same_digest_end_to_end():
     validator = jsonschema.Draft7Validator(schema, format_checker=jsonschema.FormatChecker())
     errors = list(validator.iter_errors({"LOOP_HANDOFF_RESULT_V1": parsed["LOOP_HANDOFF_RESULT_V1"]}))
     assert errors == [], f"schema validation errors: {errors}"
+
+
+def test_termination_report_rejects_invalid_issue_execution_decision():
+    """
+    PR #1767 owner review (P0-4 negative test): render_termination_report.py
+    must fail closed (not silently drop the ref) when given a malformed
+    issue_execution_decision, rather than trusting caller-provided shape.
+    """
+    loop_handoff = _base_loop_handoff()
+    data = {
+        "termination_reason": "approved",
+        "issue_number": 2005,
+        "iteration": 0,
+        "loop_handoff": loop_handoff,
+        "issue_execution_decision": {"schema_version": "not-a-real-schema"},
+    }
+    with pytest.raises(rtr.InputValidationError):
+        rtr.render(data)

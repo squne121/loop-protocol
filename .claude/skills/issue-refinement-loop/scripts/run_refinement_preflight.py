@@ -94,7 +94,10 @@ import sys as _sys_for_import
 
 _sys_for_import.path.insert(0, str(Path(__file__).resolve().parent))
 try:
-    from plan_refinement_loop import validate_issue_execution_decision
+    # PR #1767 owner review (P0-4/AC12 Scope Delta): import the standalone
+    # canonical module directly rather than re-exporting through
+    # plan_refinement_loop.py, so every consumer shares one authority.
+    from validate_issue_execution_decision import validate_issue_execution_decision
 except ImportError:  # pragma: no cover - defensive fallback
     validate_issue_execution_decision = None
 
