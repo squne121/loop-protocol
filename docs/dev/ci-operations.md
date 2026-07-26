@@ -44,6 +44,7 @@ GitHub branch protection 上の "required check" と LOOP_PROTOCOL 独自の "ag
 | `e2e` | runtime / browser evidence gate | required + evidence | yes | `playwright-report`（required）, `test-results`（conditional） | expected head で success 必須。artifact は Section 8.1 参照 |
 | `python-test` | agent-ops / skill regression gate | required + evidence | yes | `ci_test_selection` | expected head で success 必須 |
 | `actionlint` | agent-ops / CI lint gate | required | yes | なし | expected head で success 必須 |
+| `agy-causal-claim-drift-gate` | agent-ops / static drift gate | required | yes | なし | expected head で success 必須。baseline 方針は Section 9.1 参照 |
 | `ci-verdict-summary` | aggregator / artifact producer | evidence | yes | `ci_verdict_summary_v2` | expected head で success 必須。artifact は Section 11.3 参照 |
 
 **注意:** `e2e` は単なる runtime gate ではなく、Playwright report / test-results / visual evidence summary を持つ evidence producer でもある。現在の workflow は `playwright-report` と `test-results` を `!cancelled()` 条件で upload し、環境 fingerprint や artifact URL を summary に書く。`test-results` は visual mismatch 等で差分が発生した場合のみ artifact が生成されるため、conditional evidence として扱う（Section 8.1 参照）。
@@ -195,6 +196,79 @@ agent merge-ready = すべての required job が (head_sha == expected_head_sha
 `!cancelled()` 条件で upload することで、テスト失敗時にも証跡を保持する（success / failure 両方で artifact を取得できる）。
 
 ---
+
+## 8.3 AGY causal-claim drift gate 採用方針（Issue #1788）
+
+`scripts/check_agy_causal_claim_drift.py`（Issue #1778 / PR #1780 で追加）は、
+`.claude/skills/gemini-cli-headless-delegation/scripts/agy_permission_policy.py`
+/ `run_gemini_headless.py` のコードコメント中の `Issue #N` 参照と、対応する
+`references/*.md` 調査文書の YAML frontmatter `status:`（`resolved` /
+`refuted`）との不整合（causal-claim drift: 調査で結論が出た主張を、コードコメ
+ントが `# SUPERSEDED (Issue #M): ...` の逆参照マーカーなしに現在も有効な主張
+として提示し続けている状態）を検出する fail-closed スクリプトである。
+
+Issue #1778 merge 時点でこのスクリプトは追加されたが、どの CI workflow から
+も呼び出されておらず、CI required check として機能していなかった（Issue
+#1788 の起票理由）。着手時点（2026-07-26）の実測は **54 件**（一意な
+`(source_file, issue_number, doc_path, doc_status)` の組は 5 件、同一組み合
+わせがコード内の複数行に出現するため raw finding 数は増える）。
+
+### 採用方針: baseline snapshot 方式
+
+Issue #1788 の AC1 が提示する 3 方針（baseline / 修正済み厳格モード /
+diff-scoped）のうち、**baseline snapshot 方式**を採用した。判断根拠:
+
+- 54 件の既存 finding は 2 ファイル（`agy_permission_policy.py` /
+  `run_gemini_headless.py`）に集中しており、その場で正しさを再調査して
+  `# SUPERSEDED (Issue #M): ...` マーカーを追加する「修正済み厳格モード」
+  は、各コメントが指す設計判断の現況確認を要する別スコープの作業になる
+  （Issue #1788 Out of Scope: 検出ロジック自体は変えない・大規模な既存
+  コード修正は Stop Conditions 対象）。
+- diff-scoped 方式（変更ファイルのみ検査）は、この 2 ファイルを実際に触る
+  将来の PR でしか drift を検出できず、既存 54 件を実質的に永久放置する
+  点で baseline 方式と実効性が変わらない一方、diff 判定ロジックの追加実装
+  コストがかかる。
+- baseline snapshot 方式は、既存の検出ロジックを一切変更せず（Out of
+  Scope 順守）、`check_agy_causal_claim_drift.py` に追加した
+  `--apply-baseline` フラグ一つで「既存 54 件は許容しつつ、新規の drift
+  だけを fail-close する」を実現できる。
+
+### 実装
+
+- `scripts/check_agy_causal_claim_drift.py` に `--apply-baseline` フラグを
+  追加した。フラグなしの挙動は Issue #1788 以前と完全に同一（p0 finding が
+  1 件でもあれば exit 1）。フラグありの場合、finding のうち
+  `_CI_GATE_BASELINE_KEYS`（`(source_file, issue_number, doc_path,
+  doc_status)` の集合。`line` は意図的に除外し、同一ファイル内の無関係な
+  行番号シフトで誤って「新規 drift」と判定されないようにしている）に含ま
+  れるものは manifest には引き続き出力されるが（`baseline_count`）、exit
+  code には影響しない。集合に含まれない finding が 1 件でもあれば
+  `new_finding_count > 0` となり exit 1（fail-closed）。
+- `.github/workflows/ci.yml` に `agy-causal-claim-drift-gate` job を追加
+  し、`uv run --locked python3 scripts/check_agy_causal_claim_drift.py
+  --apply-baseline` を実行する。`ci-verdict-summary` の `needs:` に追加済み。
+- `.claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py` の
+  `CLASSIFICATION_MAP` / `REQUIRED_CHECKS` に `("ci",
+  "agy-causal-claim-drift-gate"): "required"` を追加した（Issue #1788
+  Scope Delta: この登録がないと新規 check が常に `unknown` 分類 = 常時
+  blocking のまま success でも merge-ready を妨げ続けるため、AC6 の実現に
+  必須）。対応する既存 contract test（
+  `.claude/skills/pr-review-judge/scripts/tests/test_ci_verdict_summary_v2.py`）
+  のうち、全 required check success を前提とする fixture も本 gate 追加分
+  だけ更新した。
+
+### fail-close 時の対応手順
+
+1. `uv run --locked python3 scripts/check_agy_causal_claim_drift.py
+   --apply-baseline` をローカルで実行し、`new_finding_count` が 0 より大き
+   い場合の finding 詳細（`detail` フィールド）を確認する。
+2. 新規に追加した `Issue #N` へのコード参照が、既に `resolved` /
+   `refuted` の調査文書で扱われている場合は、その参照の近傍コメントブロック
+   に `# SUPERSEDED (Issue #M): ...` マーカーを追加して再実行する。
+3. 誤検知（実際には drift でない）と判断した場合は、この Issue の Out of
+   Scope（検出ロジック自体は変えない）を踏まえ、検出ロジックの変更ではな
+   く `_CI_GATE_BASELINE_KEYS` への追加を個別 PR のレビューで判断する
+   （既存 54 件の baseline burn-down は Issue #1788 の follow-up 対象）。
 
 ## 9. CI 高速化方針
 
@@ -416,3 +490,4 @@ checks:
 | 2026-06-14 | 初版作成（#894） |
 | 2026-06-14 | e2e artifact conditional 化・PR hygiene inventory 追加・Implementation Status Matrix 追加（#894 adversarial review 対応） |
 | 2026-06-14 | ci_verdict_summary_v2 schema・invariant・移行方針・migration table を追加（#898） |
+| 2026-07-26 | `agy-causal-claim-drift-gate` job 追加・AGY causal-claim drift gate 採用方針（baseline snapshot 方式）を Section 8.3 に追加（#1788） |
