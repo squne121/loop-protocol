@@ -11,7 +11,7 @@ import {
   resolveChatgptRetroContextLive,
   upsertChatgptRetroContextComment,
 } from '../../scripts/agent-logs/lib/chatgpt-retro-context-marker-helper.mjs'
-import { buildSourceCommentSetDigest } from '../../scripts/agent-logs/lib/retro-index-builder.mjs'
+import { buildRetroIndex, buildSourceCommentSetDigest } from '../../scripts/agent-logs/lib/retro-index-builder.mjs'
 import { buildRetroIndexCommentBody } from '../../scripts/agent-logs/lib/retro-index-comment-helper.mjs'
 import { buildAgentRunReportCommentBody } from '../../scripts/agent-logs/lib/github-comments.mjs'
 import { mkdtempSync, writeFileSync, rmSync } from 'fs'
@@ -569,7 +569,7 @@ describe('chatgpt retro context marker helper', () => {
     })).rejects.toThrow(/expectedSupersedesDigest is required/)
   })
 
-  it('GIVEN referenced comments with recomputed source-set digest mismatch WHEN resolving marker mode THEN it fails closed', async () => {
+  it('GIVEN a marker declaring a source-set digest that differs from the retro index comment\'s own embedded digest WHEN resolving marker mode THEN it fails closed', async () => {
     const tempDir = mkdtempSync(resolve(tmpdir(), 'chatgpt-retro-context-resolve-'))
     try {
       const reportPayload = createRunReport()
@@ -617,7 +617,11 @@ describe('chatgpt retro context marker helper', () => {
       markerPayload.refs.run_reports[0].payload_digest = reportDigest
       markerPayload.refs.retro_index.comment_url = 'https://github.com/squne121/loop-protocol/issues/1153#issuecomment-12'
       markerPayload.refs.retro_index.payload_digest = 'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
-      markerPayload.refs.retro_index.source_set_digest = 'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
+      // Deliberately declare a source_set_digest that does NOT match the retro index
+      // comment's own embedded digest (retroSourceSetDigest, ending in ...dddd), so this
+      // exercises the genuine retro_index_comment_verification check (source-set digest
+      // mismatch against the producer-stated value), not the removed recompute check.
+      markerPayload.refs.retro_index.source_set_digest = 'sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
       markerPayload.canonicalization.payload_digest = computeChatgptRetroContextPayloadDigest(markerPayload)
       const markerComment = buildChatgptRetroContextCommentBody({
         ownership: {
@@ -640,7 +644,214 @@ describe('chatgpt retro context marker helper', () => {
       await expect(resolveChatgptRetroContextFromFixtures({
         markerCommentJson: markerFile,
         githubCommentsJson: [commentsFile],
-      })).rejects.toThrow(/source-set digest must match the recomputed referenced comment set/)
+      })).rejects.toThrow(/retro index source-set digest mismatch/)
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN a real buildRetroIndex() producer output for a parent-issue-as-target run report WHEN a marker cites it and resolves via fixtures THEN it resolves (Issue #1415 digest-contract fix_delta round-trip)', async () => {
+    // Regression for the Issue #1415 producer/resolver source_set_digest mismatch:
+    // this feeds buildRetroIndex()'s *real* output (not a hand-crafted digest) into the
+    // marker resolver, for a run report posted directly on the parent issue itself --
+    // exactly the case collectSourceComments() previously could not discover and the
+    // resolver's removed recompute check could never have satisfied.
+    const tempDir = mkdtempSync(resolve(tmpdir(), 'chatgpt-retro-context-roundtrip-'))
+    try {
+      const reportPayload = createRunReport()
+      const reportComment = buildAgentRunReportCommentBody({
+        ownership: {
+          repo: 'squne121/loop-protocol',
+          issueNumber: 1153,
+          prNumber: null,
+          runId: 'run-1153-parent-target',
+        },
+        payloadMarkdown: renderPublicMarkdown(reportPayload),
+      })
+      const reportCommentUrl = 'https://github.com/squne121/loop-protocol/issues/1153#issuecomment-11'
+
+      // Real producer call: this is exactly what collectSourceComments() + buildRetroIndex()
+      // compute once the parent-issue-self-scan fix_delta is applied.
+      const producerResult = buildRetroIndex({
+        sourceComments: [{ html_url: reportCommentUrl, body: reportComment.body }],
+        parentIssue: 1153,
+        prMetadataByNumber: new Map(),
+        associatedPrByMergeSha: new Map(),
+        parentChildIssueNumbers: [],
+      })
+      expect(producerResult.sourceCommentRefs).toHaveLength(1)
+      const retroDigestHex = producerResult.canonicalIndexDigest.replace(/^sha256:/, '')
+      const sourceSetDigestHex = producerResult.sourceCommentSetDigest.replace(/^sha256:/, '')
+      const retroDigest = `sha256:${retroDigestHex}`
+      const sourceSetDigest = `sha256:${sourceSetDigestHex}`
+
+      const retroComment = buildRetroIndexCommentBody({
+        repo: 'squne121/loop-protocol',
+        parentIssue: 1153,
+        algorithm: 'retro-index-builder@1',
+        payloadMarkdown: renderPublicMarkdown(producerResult.index),
+        canonicalIndexDigest: retroDigestHex,
+        sourceCommentSetDigest: sourceSetDigestHex,
+      })
+      const retroCommentUrl = 'https://github.com/squne121/loop-protocol/issues/1153#issuecomment-12'
+
+      const payload = createPayload()
+      payload.target = { type: 'issue', number: 1153 }
+      payload.refs.run_reports[0].comment_url = reportCommentUrl
+      payload.refs.run_reports[0].payload_digest = `sha256:${reportComment.digest}`
+      payload.refs.retro_index.comment_url = retroCommentUrl
+      payload.refs.retro_index.payload_digest = retroDigest
+      // The fix: the marker only needs to copy the retro index comment's own producer-stated
+      // source_set_digest -- it must NOT be re-derived from the marker's own citation set.
+      payload.refs.retro_index.source_set_digest = sourceSetDigest
+      payload.canonicalization.payload_digest = computeChatgptRetroContextPayloadDigest(payload)
+
+      const markerComment = buildChatgptRetroContextCommentBody({
+        ownership: {
+          repo: 'squne121/loop-protocol',
+          targetType: 'issue',
+          targetNumber: 1153,
+          parentIssue: 1153,
+        },
+        payloadMarkdown: renderPublicMarkdown(payload),
+      })
+
+      const markerFile = resolve(tempDir, 'marker.json')
+      const commentsFile = resolve(tempDir, 'comments.json')
+      writeFileSync(markerFile, JSON.stringify({ id: 31, html_url: 'https://github.com/squne121/loop-protocol/issues/1153#issuecomment-31', body: markerComment.body }))
+      writeFileSync(commentsFile, JSON.stringify([
+        { id: 11, html_url: reportCommentUrl, body: reportComment.body },
+        { id: 12, html_url: retroCommentUrl, body: retroComment.body },
+      ]))
+
+      const result = await resolveChatgptRetroContextFromFixtures({
+        markerCommentJson: markerFile,
+        githubCommentsJson: [commentsFile],
+      })
+      expect(result.sources.target_issue_json).toEqual({ number: 1153, title: 'Target issue #1153' })
+      expect(result.sources.retro_index_json).toBeDefined()
+      expect(result.sources.run_reports).toHaveLength(1)
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN a tampered run report comment body WHEN resolving via fixtures THEN it fails closed on report digest mismatch', async () => {
+    const tempDir = mkdtempSync(resolve(tmpdir(), 'chatgpt-retro-context-tampered-report-'))
+    try {
+      const reportPayload = createRunReport()
+      const reportComment = buildAgentRunReportCommentBody({
+        ownership: { repo: 'squne121/loop-protocol', issueNumber: 1153, prNumber: null, runId: 'run-1153-tampered' },
+        payloadMarkdown: renderPublicMarkdown(reportPayload),
+      })
+      const reportCommentUrl = 'https://github.com/squne121/loop-protocol/issues/1153#issuecomment-11'
+      const producerResult = buildRetroIndex({
+        sourceComments: [{ html_url: reportCommentUrl, body: reportComment.body }],
+        parentIssue: 1153,
+        prMetadataByNumber: new Map(),
+        associatedPrByMergeSha: new Map(),
+        parentChildIssueNumbers: [],
+      })
+      const retroDigestHex = producerResult.canonicalIndexDigest.replace(/^sha256:/, '')
+      const sourceSetDigestHex = producerResult.sourceCommentSetDigest.replace(/^sha256:/, '')
+      const retroComment = buildRetroIndexCommentBody({
+        repo: 'squne121/loop-protocol',
+        parentIssue: 1153,
+        algorithm: 'retro-index-builder@1',
+        payloadMarkdown: renderPublicMarkdown(producerResult.index),
+        canonicalIndexDigest: retroDigestHex,
+        sourceCommentSetDigest: sourceSetDigestHex,
+      })
+      const retroCommentUrl = 'https://github.com/squne121/loop-protocol/issues/1153#issuecomment-12'
+
+      const payload = createPayload()
+      payload.target = { type: 'issue', number: 1153 }
+      payload.refs.run_reports[0].comment_url = reportCommentUrl
+      // Tamper: declare a payload_digest that does not match the run report comment's
+      // own embedded digest marker (as if the comment body were edited after the marker
+      // recorded its digest, or the marker itself lied about which version it cites).
+      payload.refs.run_reports[0].payload_digest = 'sha256:1111111111111111111111111111111111111111111111111111111111111111'
+      payload.refs.retro_index.comment_url = retroCommentUrl
+      payload.refs.retro_index.payload_digest = `sha256:${retroDigestHex}`
+      payload.refs.retro_index.source_set_digest = `sha256:${sourceSetDigestHex}`
+      payload.canonicalization.payload_digest = computeChatgptRetroContextPayloadDigest(payload)
+      const markerComment = buildChatgptRetroContextCommentBody({
+        ownership: { repo: 'squne121/loop-protocol', targetType: 'issue', targetNumber: 1153, parentIssue: 1153 },
+        payloadMarkdown: renderPublicMarkdown(payload),
+      })
+
+      const markerFile = resolve(tempDir, 'marker.json')
+      const commentsFile = resolve(tempDir, 'comments.json')
+      writeFileSync(markerFile, JSON.stringify({ id: 31, html_url: 'https://github.com/squne121/loop-protocol/issues/1153#issuecomment-31', body: markerComment.body }))
+      writeFileSync(commentsFile, JSON.stringify([
+        { id: 11, html_url: reportCommentUrl, body: reportComment.body },
+        { id: 12, html_url: retroCommentUrl, body: retroComment.body },
+      ]))
+
+      await expect(resolveChatgptRetroContextFromFixtures({
+        markerCommentJson: markerFile,
+        githubCommentsJson: [commentsFile],
+      })).rejects.toThrow(/report_digest_mismatch|run report digest mismatch/)
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN a tampered retro index comment body WHEN resolving via fixtures THEN it fails closed on retro index payload digest mismatch', async () => {
+    const tempDir = mkdtempSync(resolve(tmpdir(), 'chatgpt-retro-context-tampered-retro-'))
+    try {
+      const reportPayload = createRunReport()
+      const reportComment = buildAgentRunReportCommentBody({
+        ownership: { repo: 'squne121/loop-protocol', issueNumber: 1153, prNumber: null, runId: 'run-1153-tampered-retro' },
+        payloadMarkdown: renderPublicMarkdown(reportPayload),
+      })
+      const reportCommentUrl = 'https://github.com/squne121/loop-protocol/issues/1153#issuecomment-11'
+      const producerResult = buildRetroIndex({
+        sourceComments: [{ html_url: reportCommentUrl, body: reportComment.body }],
+        parentIssue: 1153,
+        prMetadataByNumber: new Map(),
+        associatedPrByMergeSha: new Map(),
+        parentChildIssueNumbers: [],
+      })
+      const retroDigestHex = producerResult.canonicalIndexDigest.replace(/^sha256:/, '')
+      const sourceSetDigestHex = producerResult.sourceCommentSetDigest.replace(/^sha256:/, '')
+      const retroComment = buildRetroIndexCommentBody({
+        repo: 'squne121/loop-protocol',
+        parentIssue: 1153,
+        algorithm: 'retro-index-builder@1',
+        payloadMarkdown: renderPublicMarkdown(producerResult.index),
+        canonicalIndexDigest: retroDigestHex,
+        sourceCommentSetDigest: sourceSetDigestHex,
+      })
+      const retroCommentUrl = 'https://github.com/squne121/loop-protocol/issues/1153#issuecomment-12'
+
+      const payload = createPayload()
+      payload.target = { type: 'issue', number: 1153 }
+      payload.refs.run_reports[0].comment_url = reportCommentUrl
+      payload.refs.run_reports[0].payload_digest = `sha256:${reportComment.digest}`
+      payload.refs.retro_index.comment_url = retroCommentUrl
+      // Tamper: declare a retro index payload_digest that does not match the retro index
+      // comment's own embedded canonical digest marker (as if the comment were edited).
+      payload.refs.retro_index.payload_digest = 'sha256:2222222222222222222222222222222222222222222222222222222222222222'
+      payload.refs.retro_index.source_set_digest = `sha256:${sourceSetDigestHex}`
+      payload.canonicalization.payload_digest = computeChatgptRetroContextPayloadDigest(payload)
+      const markerComment = buildChatgptRetroContextCommentBody({
+        ownership: { repo: 'squne121/loop-protocol', targetType: 'issue', targetNumber: 1153, parentIssue: 1153 },
+        payloadMarkdown: renderPublicMarkdown(payload),
+      })
+
+      const markerFile = resolve(tempDir, 'marker.json')
+      const commentsFile = resolve(tempDir, 'comments.json')
+      writeFileSync(markerFile, JSON.stringify({ id: 31, html_url: 'https://github.com/squne121/loop-protocol/issues/1153#issuecomment-31', body: markerComment.body }))
+      writeFileSync(commentsFile, JSON.stringify([
+        { id: 11, html_url: reportCommentUrl, body: reportComment.body },
+        { id: 12, html_url: retroCommentUrl, body: retroComment.body },
+      ]))
+
+      await expect(resolveChatgptRetroContextFromFixtures({
+        markerCommentJson: markerFile,
+        githubCommentsJson: [commentsFile],
+      })).rejects.toThrow(/retro_digest_mismatch|retro index payload digest mismatch/)
     } finally {
       rmSync(tempDir, { recursive: true, force: true })
     }

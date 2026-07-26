@@ -56,6 +56,7 @@
     "forbidden_fields_scan": "pass"
   },
   "readback": {
+    "status": "verified",
     "canonical_comment_count": 1,
     "digest_revalidation": "pass",
     "duplicate_count": 0
