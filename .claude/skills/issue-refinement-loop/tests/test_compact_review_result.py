@@ -496,3 +496,567 @@ def test_compact_review_result_rejects_path_traversal():
     from compact_review_result import _validate_artifact_path
     with pytest.raises(ValueError, match="traversal"):
         _validate_artifact_path("../../etc/passwd")
+
+
+# ---------------------------------------------------------------------------
+# Issue #1791 review remediation (PR #1801 REQUEST_CHANGES fix_delta):
+#
+# - Critical #1: check_issue_contract.py --mode merge_readiness is now the
+#   single deterministic producer that merges ISSUE_CONTRACT_READINESS_RESULT_V1
+#   into REVIEW_ISSUE_RESULT_V1 (no LLM-driven merge step).
+# - Critical #2: line_start/line_end == 0 (the real producer's value for
+#   validator-timeout / internal-error / JSON-decode-error / VC-extraction
+#   failure) must normalize to null, not pass through unchanged.
+# - Critical #3: readiness_status == "human_judgment" errors must NOT become
+#   deterministic_domain_blocker / blocking:true structured_blockers; the
+#   distinction is carried via the top-level REVIEW_ISSUE_RESULT_V1.failure_class
+#   field that compact_review_result.py already reads.
+# - High #5: provenance (body_sha256 match, non-fabricated artifact_path,
+#   source_payload passthrough) is validated via the existing
+#   _is_valid_deterministic_evidence() gate; invalid evidence is dropped
+#   fail-closed rather than emitted as a blocker.
+# ---------------------------------------------------------------------------
+
+REVIEW_ISSUE_SCRIPTS_DIR = (
+    SKILLS_ROOT.parent / "review-issue" / "scripts"
+)
+if str(REVIEW_ISSUE_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(REVIEW_ISSUE_SCRIPTS_DIR))
+
+from check_issue_contract import (  # noqa: E402
+    _normalize_readiness_line,
+    merge_readiness_into_review_result,
+    readiness_error_to_structured_blocker,
+    readiness_errors_to_structured_blockers,
+    readiness_status_to_failure_class,
+)
+
+_SAMPLE_BODY_SHA256 = (
+    "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+)
+
+_SAMPLE_READINESS_ERRORS = [
+    {
+        "rule_id": "LP021",
+        "severity": "error",
+        "source_check": "validate_issue_body",
+        "category": "body_lint",
+        "section": "Allowed Paths",
+        "line_start": 12,
+        "line_end": 12,
+        "minimal_context": ["## Allowed Paths"],
+        "fix_hint": "Allowed Paths を明記してください",
+        "autofixable": False,
+    },
+    {
+        "rule_id": "BASELINE_VC_UNEXPECTED_PASS",
+        "severity": "error",
+        "source_check": "baseline_vc_preflight",
+        "category": "vc_preflight",
+        "section": "Verification Commands",
+        "line_start": 40,
+        "line_end": 42,
+        "minimal_context": [],
+        "fix_hint": "baseline で unexpected pass が検出されました",
+        "autofixable": False,
+        "source_payload": {
+            "classification": "unexpected_pass",
+            "category": "vc_preflight",
+            "decision": "immediate",
+            "exit_code": 0,
+            "command_hash": "sha256:deadbeef",
+        },
+    },
+]
+
+# Real-producer-shaped errors: contract_readiness_check.py emits line_start=0 /
+# line_end=0 (not omitted, not null) for JSON-decode-error and
+# map_validate_errors_to_readiness_errors() default-value branches.
+_REAL_PRODUCER_ZERO_LINE_ERRORS = [
+    {
+        "rule_id": "READINESS_JSON_DECODE_ERROR",
+        "severity": "error",
+        "source_check": "validate_issue_body",
+        "category": "internal_error",
+        "section": "(global)",
+        "line_start": 0,
+        "line_end": 0,
+        "minimal_context": [],
+        "fix_hint": "validator 実行環境を確認してください",
+        "autofixable": False,
+    },
+    {
+        "rule_id": "LP000",
+        "severity": "error",
+        "source_check": "validate_issue_body",
+        "category": "body_lint",
+        "section": "",
+        "line_start": 0,
+        "line_end": 0,
+        "minimal_context": [],
+        "fix_hint": "",
+        "autofixable": False,
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# Critical #2: line_start/line_end normalization
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (0, None),
+        (-1, None),
+        (True, None),  # bool is an int subclass; must not leak through as 1
+        (False, None),
+        (None, None),
+        ("12", None),
+        (1, 1),
+        (12, 12),
+    ],
+)
+def test_normalize_readiness_line(value, expected):
+    """GIVEN various raw line values WHEN normalized THEN only ints >= 1
+    survive; 0 (the real producer's failure-mode value), negative, bool, and
+    non-int values normalize to None (AC2 regression, Critical #2)."""
+    assert _normalize_readiness_line(value) == expected
+
+
+def test_readiness_error_to_structured_blocker_normalizes_real_producer_zero_line():
+    """GIVEN a real-producer-shaped readiness error with line_start=0 /
+    line_end=0 WHEN converted THEN checker_evidence.line_start/line_end are
+    null (schema requires null or >=1), not the raw 0 (Critical #2)."""
+    blocker = readiness_error_to_structured_blocker(
+        _REAL_PRODUCER_ZERO_LINE_ERRORS[0],
+        body_sha256=_SAMPLE_BODY_SHA256,
+        iteration_id="iter-1",
+        artifact_path="artifacts/issue-refinement-loop/1791/readiness_result.json",
+    )
+    assert blocker is not None
+    evidence = blocker["checker_evidence"][0]
+    assert evidence["line_start"] is None
+    assert evidence["line_end"] is None
+
+
+def test_readiness_errors_to_structured_blockers_real_producer_zero_line_via_compact(
+    tmp_path,
+):
+    """GIVEN real-producer-shaped errors (line_start/line_end=0, VALIDATOR
+    JSON-decode-error shape) WHEN merged into a REVIEW_ISSUE_RESULT_V1 and
+    passed through compact_review_result() THEN no schema_mismatch/ValueError
+    is raised (AC2 regression against actual producer payloads, Critical #2)."""
+    fixture = FIXTURES_DIR / "review_result_needs_fix.json"
+    raw_result = json.loads(fixture.read_text(encoding="utf-8"))
+    raw_result["structured_blockers"] = readiness_errors_to_structured_blockers(
+        _REAL_PRODUCER_ZERO_LINE_ERRORS,
+        body_sha256=raw_result["body_sha256"],
+        iteration_id="iter-1",
+        artifact_path="artifacts/issue-refinement-loop/1791/readiness_result.json",
+    )
+
+    compact_data, stdout_lines, *_ = compact_review_result(
+        raw_result,
+        artifact_dir=tmp_path / ".claude/artifacts/issue-refinement-loop",
+        issue_number=1791,
+    )
+
+    assert compact_data["STATUS"] == "ok"
+    assert compact_data["VERDICT"] == "needs-fix"
+    assert compact_data["NEXT_ACTION"] == "request_changes"
+    lines_text = "\n".join(stdout_lines)
+    assert "STATUS: ok" in lines_text
+
+
+# ---------------------------------------------------------------------------
+# AC1 / AC3: converted shape + checker_evidence completeness (incl. source_payload)
+# ---------------------------------------------------------------------------
+
+
+def test_readiness_error_to_structured_blocker_matches_schema_required_fields():
+    """GIVEN a raw readiness errors[] element WHEN converted THEN the
+    structured_blocker has code/message/finding_kind/deterministic_domain_key/
+    blocking/checker_evidence (AC1)."""
+    blocker = readiness_error_to_structured_blocker(
+        _SAMPLE_READINESS_ERRORS[0],
+        body_sha256=_SAMPLE_BODY_SHA256,
+        iteration_id="iter-1",
+        artifact_path="artifacts/issue-refinement-loop/1791/readiness_result.json",
+    )
+
+    assert blocker is not None
+    for required_field in (
+        "code",
+        "message",
+        "finding_kind",
+        "deterministic_domain_key",
+        "blocking",
+        "checker_evidence",
+    ):
+        assert required_field in blocker, f"missing {required_field}"
+
+    assert blocker["finding_kind"] == "deterministic_domain_blocker"
+    assert blocker["blocking"] is True
+    assert blocker["checker_evidence"], "checker_evidence must be non-empty"
+
+
+def test_readiness_error_to_structured_blocker_checker_evidence_fields_complete():
+    """GIVEN a converted structured_blocker WHEN inspecting checker_evidence
+    THEN all required evidence fields are present and non-empty, and
+    source_payload is preserved rather than dropped (AC3, High #5)."""
+    blocker = readiness_error_to_structured_blocker(
+        _SAMPLE_READINESS_ERRORS[1],
+        body_sha256=_SAMPLE_BODY_SHA256,
+        iteration_id="iter-1",
+        artifact_path="artifacts/issue-refinement-loop/1791/readiness_result.json",
+    )
+    assert blocker is not None
+    evidence = blocker["checker_evidence"][0]
+
+    for required_field in (
+        "source_check",
+        "rule_id",
+        "category",
+        "artifact_path",
+        "artifact_schema",
+        "body_sha256",
+        "iteration_id",
+        "line_start",
+        "line_end",
+    ):
+        assert required_field in evidence, f"missing checker_evidence.{required_field}"
+
+    assert evidence["source_check"] == "baseline_vc_preflight"
+    assert evidence["rule_id"] == "BASELINE_VC_UNEXPECTED_PASS"
+    assert evidence["category"] == "vc_preflight"
+    assert evidence["artifact_schema"] == "ISSUE_CONTRACT_READINESS_RESULT_V1"
+    assert evidence["artifact_path"] == (
+        "artifacts/issue-refinement-loop/1791/readiness_result.json"
+    )
+    assert evidence["body_sha256"] == _SAMPLE_BODY_SHA256
+    assert evidence["iteration_id"] == "iter-1"
+    assert evidence["source_payload"] == _SAMPLE_READINESS_ERRORS[1]["source_payload"]
+
+
+def test_readiness_errors_to_structured_blockers_no_schema_mismatch_via_compact(
+    tmp_path,
+):
+    """GIVEN a REVIEW_ISSUE_RESULT_V1 whose structured_blockers were built via
+    readiness_errors_to_structured_blockers() WHEN passed through
+    compact_review_result() THEN no schema_mismatch/ValueError is raised (AC2)."""
+    fixture = FIXTURES_DIR / "review_result_needs_fix.json"
+    raw_result = json.loads(fixture.read_text(encoding="utf-8"))
+    raw_result["structured_blockers"] = readiness_errors_to_structured_blockers(
+        _SAMPLE_READINESS_ERRORS,
+        body_sha256=raw_result["body_sha256"],
+        iteration_id="iter-1",
+        artifact_path="artifacts/issue-refinement-loop/1791/readiness_result.json",
+    )
+
+    compact_data, stdout_lines, *_ = compact_review_result(
+        raw_result,
+        artifact_dir=tmp_path / ".claude/artifacts/issue-refinement-loop",
+        issue_number=1791,
+    )
+
+    assert compact_data["STATUS"] == "ok"
+    assert compact_data["VERDICT"] == "needs-fix"
+    lines_text = "\n".join(stdout_lines)
+    assert "STATUS: ok" in lines_text
+
+
+# ---------------------------------------------------------------------------
+# Critical #3: human_judgment must not become a deterministic blocker
+# ---------------------------------------------------------------------------
+
+
+def test_readiness_errors_to_structured_blockers_human_judgment_returns_empty():
+    """GIVEN readiness_status="human_judgment" WHEN converted THEN NO
+    structured_blockers are produced (human_judgment is not a body-editable
+    deterministic blocker; see readiness_status_to_failure_class() /
+    merge_readiness_into_review_result() for the top-level routing, Critical
+    #3)."""
+    blockers = readiness_errors_to_structured_blockers(
+        _SAMPLE_READINESS_ERRORS,
+        body_sha256=_SAMPLE_BODY_SHA256,
+        iteration_id="iter-1",
+        readiness_status="human_judgment",
+    )
+    assert blockers == []
+
+
+def test_readiness_status_to_failure_class():
+    """GIVEN readiness statuses WHEN mapped THEN only human_judgment yields a
+    failure_class value (Critical #3)."""
+    assert (
+        readiness_status_to_failure_class("human_judgment")
+        == "contract_readiness_human_judgment"
+    )
+    assert readiness_status_to_failure_class("needs_fix") is None
+    assert readiness_status_to_failure_class("go") is None
+    assert readiness_status_to_failure_class(None) is None
+
+
+# ---------------------------------------------------------------------------
+# merge_readiness_into_review_result(): fail-closed body_sha256 + full pipeline
+# ---------------------------------------------------------------------------
+
+
+def _needs_fix_review_result() -> dict:
+    fixture = FIXTURES_DIR / "review_result_needs_fix.json"
+    return json.loads(fixture.read_text(encoding="utf-8"))
+
+
+def test_merge_readiness_into_review_result_needs_fix_adds_blockers():
+    """GIVEN a needs_fix readiness result WHEN merged THEN structured_blockers
+    are appended and verdict stays needs-fix (Critical #1)."""
+    review_result = _needs_fix_review_result()
+    readiness_result = {
+        "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+        "status": "needs_fix",
+        "body_sha256": review_result["body_sha256"],
+        "errors": _SAMPLE_READINESS_ERRORS,
+    }
+
+    merged = merge_readiness_into_review_result(
+        review_result,
+        readiness_result,
+        readiness_artifact_path="artifacts/issue-refinement-loop/1791/readiness_result.json",
+        iteration_id="iter-1",
+    )
+
+    assert merged["verdict"] == "needs-fix"
+    assert merged.get("failure_class") is None
+    assert len(merged["structured_blockers"]) == len(_SAMPLE_READINESS_ERRORS)
+    for blocker in merged["structured_blockers"]:
+        assert blocker["finding_kind"] == "deterministic_domain_blocker"
+        assert blocker["blocking"] is True
+
+
+def test_merge_readiness_into_review_result_human_judgment_sets_top_level_failure_class():
+    """GIVEN a human_judgment readiness result WHEN merged THEN no
+    structured_blockers are added, but the top-level failure_class is set so
+    compact_review_result.py routes to human_judgment_required (Critical #3)."""
+    review_result = _needs_fix_review_result()
+    review_result["verdict"] = "approve"
+    review_result["structured_blockers"] = []
+    readiness_result = {
+        "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+        "status": "human_judgment",
+        "body_sha256": review_result["body_sha256"],
+        "errors": _SAMPLE_READINESS_ERRORS,
+    }
+
+    merged = merge_readiness_into_review_result(
+        review_result,
+        readiness_result,
+        readiness_artifact_path="artifacts/issue-refinement-loop/1791/readiness_result.json",
+        iteration_id="iter-1",
+    )
+
+    assert merged["structured_blockers"] == []
+    assert merged["failure_class"] == "contract_readiness_human_judgment"
+    # NEXT_ACTION routing through compact_review_result() is exercised in
+    # test_merge_readiness_into_review_result_human_judgment_next_action below.
+
+
+def test_merge_readiness_into_review_result_human_judgment_next_action(tmp_path):
+    """GIVEN the human_judgment merge output WHEN passed through
+    compact_review_result() THEN NEXT_ACTION is human_judgment_required, not
+    request_changes (Critical #3, full pipeline)."""
+    review_result = _needs_fix_review_result()
+    review_result["verdict"] = "needs-fix"
+    review_result["structured_blockers"] = []
+    readiness_result = {
+        "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+        "status": "human_judgment",
+        "body_sha256": review_result["body_sha256"],
+        "errors": _SAMPLE_READINESS_ERRORS,
+    }
+
+    merged = merge_readiness_into_review_result(
+        review_result,
+        readiness_result,
+        readiness_artifact_path="artifacts/issue-refinement-loop/1791/readiness_result.json",
+        iteration_id="iter-1",
+    )
+
+    compact_data, *_ = compact_review_result(
+        merged,
+        artifact_dir=tmp_path / ".claude/artifacts/issue-refinement-loop",
+        issue_number=1791,
+    )
+    assert compact_data["NEXT_ACTION"] == "human_judgment_required"
+
+
+def test_merge_readiness_into_review_result_approve_verdict_human_judgment_end_to_end(tmp_path):
+    """GIVEN an *approve*-verdict REVIEW_ISSUE_RESULT_V1 (check_issue_contract.py
+    itself found the body clean) merged with a human_judgment readiness
+    result WHEN the merged output is passed through compact_review_result()
+    THEN NEXT_ACTION is human_judgment_required, not proceed (Issue #1791
+    review remediation, iteration 3 fix_delta).
+
+    This is the exact gap the iteration-2 regression tests missed:
+    compact_review_result() checks `verdict == "approve"` first and
+    short-circuits to NEXT_ACTION: proceed before ever consulting
+    failure_class, so merge_readiness_into_review_result() must rewrite an
+    approve verdict to needs-fix whenever it sets a human_judgment
+    failure_class."""
+    review_result = _needs_fix_review_result()
+    review_result["verdict"] = "approve"
+    review_result["structured_blockers"] = []
+    readiness_result = {
+        "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+        "status": "human_judgment",
+        "body_sha256": review_result["body_sha256"],
+        "errors": _SAMPLE_READINESS_ERRORS,
+    }
+
+    merged = merge_readiness_into_review_result(
+        review_result,
+        readiness_result,
+        readiness_artifact_path="artifacts/issue-refinement-loop/1791/readiness_result.json",
+        iteration_id="iter-1",
+    )
+
+    assert merged["verdict"] == "needs-fix"
+    assert merged["failure_class"] == "contract_readiness_human_judgment"
+
+    compact_data, *_ = compact_review_result(
+        merged,
+        artifact_dir=tmp_path / ".claude/artifacts/issue-refinement-loop",
+        issue_number=1791,
+    )
+    assert compact_data["NEXT_ACTION"] == "human_judgment_required"
+
+
+def test_merge_readiness_into_review_result_body_sha256_mismatch_fail_closed():
+    """GIVEN mismatched body_sha256 between REVIEW_ISSUE_RESULT_V1 and
+    ISSUE_CONTRACT_READINESS_RESULT_V1 WHEN merged THEN ValueError is raised
+    and no deterministic blockers are fabricated from stale evidence (High
+    #5)."""
+    review_result = _needs_fix_review_result()
+    readiness_result = {
+        "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+        "status": "needs_fix",
+        "body_sha256": "sha256:" + "9" * 64,
+        "errors": _SAMPLE_READINESS_ERRORS,
+    }
+
+    with pytest.raises(ValueError, match="body_sha256 mismatch"):
+        merge_readiness_into_review_result(
+            review_result,
+            readiness_result,
+            readiness_artifact_path="artifacts/issue-refinement-loop/1791/readiness_result.json",
+            iteration_id="iter-1",
+        )
+
+
+def test_merge_readiness_into_review_result_no_errors_is_noop():
+    """GIVEN an empty readiness errors[] WHEN merged THEN the review result is
+    returned unchanged (no spurious mismatch failure on go/approve paths)."""
+    review_result = _needs_fix_review_result()
+    review_result["body_sha256"] = "sha256:" + "0" * 64  # deliberately mismatched
+    readiness_result = {
+        "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+        "status": "go",
+        "body_sha256": "sha256:" + "1" * 64,
+        "errors": [],
+    }
+
+    merged = merge_readiness_into_review_result(
+        review_result,
+        readiness_result,
+        readiness_artifact_path="artifacts/issue-refinement-loop/1791/readiness_result.json",
+        iteration_id="iter-1",
+    )
+    assert merged["structured_blockers"] == review_result["structured_blockers"]
+    assert merged.get("failure_class") == review_result.get("failure_class")
+
+
+# ---------------------------------------------------------------------------
+# CLI wiring (Critical #1): real subprocess invocation of
+# check_issue_contract.py --mode merge_readiness, not just an in-process
+# function call, so production wiring regressions are caught (review point 7).
+# ---------------------------------------------------------------------------
+
+
+def test_check_issue_contract_cli_merge_readiness_mode(tmp_path):
+    """GIVEN review-result and readiness-result JSON files on disk WHEN
+    `check_issue_contract.py --mode merge_readiness` is invoked as a real
+    subprocess THEN it writes a schema-valid merged REVIEW_ISSUE_RESULT_V1
+    with the expected structured_blockers (Critical #1 production wiring)."""
+    import subprocess
+
+    review_result = _needs_fix_review_result()
+    review_result_file = tmp_path / "review_result.json"
+    review_result_file.write_text(json.dumps(review_result), encoding="utf-8")
+
+    readiness_result_file = tmp_path / "readiness_result.json"
+    readiness_result_file.write_text(
+        json.dumps(
+            {
+                "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+                "status": "needs_fix",
+                "body_sha256": review_result["body_sha256"],
+                "errors": _SAMPLE_READINESS_ERRORS,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output_file = tmp_path / "merged_review_result.json"
+    script = REVIEW_ISSUE_SCRIPTS_DIR / "check_issue_contract.py"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--mode",
+            "merge_readiness",
+            "--review-result-file",
+            str(review_result_file),
+            "--readiness-result-file",
+            str(readiness_result_file),
+            "--readiness-artifact-path",
+            str(readiness_result_file),
+            "--iteration-id",
+            "iter-1",
+            "--output-file",
+            str(output_file),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1, result.stderr  # needs-fix → exit 1
+    merged = json.loads(output_file.read_text(encoding="utf-8"))
+    assert merged["verdict"] == "needs-fix"
+    assert len(merged["structured_blockers"]) == len(_SAMPLE_READINESS_ERRORS)
+
+    # Full pipeline: the merged CLI output must itself be schema-valid input
+    # to compact_review_result.py (no schema_mismatch — Critical #1/#2).
+    compact_data, *_ = compact_review_result(
+        merged,
+        artifact_dir=tmp_path / ".claude/artifacts/issue-refinement-loop",
+        issue_number=1791,
+    )
+    assert compact_data["STATUS"] == "ok"
+    assert compact_data["VERDICT"] == "needs-fix"
+
+
+def test_check_issue_contract_cli_merge_readiness_mode_missing_args_exits_2(tmp_path):
+    """GIVEN --mode merge_readiness without the required file arguments WHEN
+    invoked THEN it exits 2 rather than silently doing nothing."""
+    import subprocess
+
+    script = REVIEW_ISSUE_SCRIPTS_DIR / "check_issue_contract.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--mode", "merge_readiness"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+
