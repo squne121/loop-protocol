@@ -406,6 +406,60 @@ def test_given_missing_ci_root_verifier_when_verified_then_rejects_workflow(
     assert "workflow_ruff_verifier_root_step_invalid" in _failure_keys(fixture)
 
 
+def test_given_verifier_after_canonical_ruff_when_verified_then_rejects_order(
+    tmp_path: Path,
+):
+    fixture = _write_fixture(tmp_path)
+    workflow = fixture / ".github/workflows/ci.yml"
+    verifier = (
+        "      - name: Verify Ruff configuration authority\n"
+        "        run: uv run --locked python3 "
+        "scripts/ci/verify_ruff_configuration.py --root .\n"
+    )
+    workflow.write_text(
+        workflow.read_text(encoding="utf-8").replace(verifier, "") + verifier,
+        encoding="utf-8",
+    )
+
+    assert "workflow_ruff_verifier_order_invalid" in _failure_keys(fixture)
+
+
+@pytest.mark.parametrize(
+    "ruff_command",
+    [
+        "bash -c 'uv run --locked ruff check .claude/scripts scripts schemas .claude/skills'",
+        "bash -c 'uv run --locked ruff check --select E,F .claude/scripts scripts schemas .claude/skills'",
+        "$RUFF_COMMAND",
+        "uv run --locked ruff check @ruff-args.txt",
+        "uv run --locked ruff check .claude/scripts scripts schemas .claude/skills && true",
+    ],
+)
+def test_given_ruff_wrapper_or_indirection_when_verified_then_rejects_it(
+    tmp_path: Path, ruff_command: str
+):
+    keys = _failure_keys(_write_fixture(tmp_path, ruff_command=ruff_command))
+
+    assert "workflow_ruff_indirection_not_allowed" in keys
+
+
+def test_given_shell_wrapped_verifier_when_verified_then_rejects_indirection(
+    tmp_path: Path,
+):
+    fixture = _write_fixture(tmp_path)
+    workflow = fixture / ".github/workflows/ci.yml"
+    workflow.write_text(
+        workflow.read_text(encoding="utf-8").replace(
+            "run: uv run --locked python3 scripts/ci/verify_ruff_configuration.py --root .",
+            "run: bash -c 'uv run --locked python3 scripts/ci/verify_ruff_configuration.py --root .'",
+        ),
+        encoding="utf-8",
+    )
+
+    keys = _failure_keys(fixture)
+    assert "workflow_ruff_verifier_root_step_invalid" in keys
+    assert "workflow_ruff_verifier_indirection_not_allowed" in keys
+
+
 def test_given_extend_select_when_verified_then_rejects_unresolved_rule_configuration(
     tmp_path: Path,
 ):
@@ -442,6 +496,63 @@ def test_given_nested_pyproject_when_verified_then_rejects_split_authority(tmp_p
     (fixture / "scripts/pyproject.toml").write_text("[tool.ruff]\n", encoding="utf-8")
 
     assert "ruff_configuration_source_not_pyproject" in _failure_keys(fixture)
+
+
+def test_given_nested_pyproject_without_ruff_when_verified_then_allows_project_metadata(
+    tmp_path: Path,
+):
+    fixture = _write_fixture(tmp_path)
+    (fixture / "scripts").mkdir()
+    (fixture / "scripts/pyproject.toml").write_text(
+        "[project]\nname = 'metadata-only'\nversion = '0.1.0'\n",
+        encoding="utf-8",
+    )
+
+    assert _failure_keys(fixture) == set()
+
+
+def test_given_invalid_nested_pyproject_when_verified_then_allows_non_discoverable_file(
+    tmp_path: Path,
+):
+    fixture = _write_fixture(tmp_path)
+    (fixture / "scripts").mkdir()
+    (fixture / "scripts/pyproject.toml").write_text("[tool.ruff\n", encoding="utf-8")
+
+    assert _failure_keys(fixture) == set()
+
+
+def test_given_ruff_nested_pyproject_outside_lint_targets_when_verified_then_allows_it(
+    tmp_path: Path,
+):
+    fixture = _write_fixture(tmp_path)
+    (fixture / "tests").mkdir()
+    (fixture / "tests/pyproject.toml").write_text("[tool.ruff]\n", encoding="utf-8")
+
+    assert _failure_keys(fixture) == set()
+
+
+def test_given_same_directory_ruff_toml_when_verified_then_rejects_priority_override(
+    tmp_path: Path,
+):
+    fixture = _write_fixture(tmp_path)
+    (fixture / "ruff.toml").write_text("[lint]\nselect = ['E', 'F']\n", encoding="utf-8")
+
+    assert "ruff_configuration_source_not_pyproject" in _failure_keys(fixture)
+
+
+@pytest.mark.parametrize(
+    "pyproject",
+    [
+        "[tool.ruff]\npreview = true\n\n[tool.ruff.lint]\nselect = ['E', 'F']\n",
+        "[tool.ruff.lint]\nselect = ['E', 'F']\npreview = true\n",
+    ],
+)
+def test_given_config_side_preview_when_verified_then_rejects_preview_authority(
+    tmp_path: Path, pyproject: str
+):
+    keys = _failure_keys(_write_fixture(tmp_path, pyproject=pyproject))
+
+    assert "ruff_config_preview_not_allowed" in keys
 
 
 def test_given_extend_when_verified_then_rejects_split_authority(tmp_path: Path):
