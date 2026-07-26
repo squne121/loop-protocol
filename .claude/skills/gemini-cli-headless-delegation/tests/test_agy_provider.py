@@ -407,13 +407,20 @@ def test_agy_grounded_research_redacts_evidence_envelope() -> None:
 
 
 def test_ac7_agy_local_asset_research_rejected() -> None:
-    """AC7: provider=agy with local_asset_research requires local_asset_research context files."""
+    """AC7: provider=agy with local_asset_research requires local_asset_research context files.
+
+    Issue #1692 AC12: _validate_agy_local_asset_request() no longer delegates
+    to the Gemini-only validate_request() (which produced the generic
+    "context_files must contain at least 1 item(s)" message); the
+    local_asset_research-specific check now produces its own dedicated
+    message.
+    """
     req = _agy_request(tool_profile="local_asset_research")
     with patch.object(rgh, "_validate_local_asset_research_settings", lambda: []):  # type: ignore[call-arg]
         result = rgh.run_delegation(req)
     assert result["ok"] is False
-    assert result["failure_reason"].startswith("context_files must contain at least 1 item(s)")
-    assert result["failure_class"].startswith("context_files must contain at least 1 item(s)")
+    assert result["failure_reason"].startswith("local_asset_research requires at least one context file")
+    assert result["failure_class"].startswith("local_asset_research requires at least one context file")
 
 
 def test_ac7_agy_local_asset_research_success_with_wrapper_validation(tmp_path, monkeypatch) -> None:

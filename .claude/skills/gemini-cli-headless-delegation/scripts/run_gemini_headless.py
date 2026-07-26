@@ -357,12 +357,15 @@ SUPPORTED_PROVIDERS: frozenset[str] = frozenset({"gemini", "agy", "auto"})
 # not per-deployment tunables -- retry_budget numbers are the tunable part and
 # DO come from model_routing.yaml (see load_model_routing()).
 #
-# setup_check_order (setup_check.py --provider auto) is agy-first; this
-# runtime_order is intentionally gemini-first and DIFFERS from setup order.
-# The two are separate policies (setup diagnostics vs. runtime dispatch) and
-# are not required to match -- see references/model-routing.md.
+# Issue #1692 (human decision, 2026-07-26, PR #1798 comment): Antigravity
+# CLI (agy) is now the first provider, Gemini CLI the second/fallback
+# provider. setup_check_order (setup_check.py --provider auto) is also
+# agy-first, so runtime_order now matches setup order (previously the two
+# were intentionally different -- see references/model-routing.md, which
+# still documents the pre-#1692 gemini-first runtime_order and is a
+# documented follow-up to refresh, outside this Issue's Allowed Paths).
 PROVIDER_AUTO_FALLBACK_POLICY_VERSION = "v1"
-PROVIDER_AUTO_RUNTIME_ORDER: tuple[str, ...] = ("gemini", "agy")
+PROVIDER_AUTO_RUNTIME_ORDER: tuple[str, ...] = ("agy", "gemini")
 PROVIDER_AUTO_ELIGIBLE_PROFILES: frozenset[str] = frozenset({"no_tools", "proposal_only"})
 PROVIDER_AUTO_RETRYABLE_FAILURE_CLASSES: dict[str, frozenset[str]] = {
     "gemini": frozenset({
@@ -1345,6 +1348,64 @@ def validate_request(request: Mapping[str, Any], request_path: Path | None = Non
                 errors.append(f"context file is not a file: {_truncate_repr(raw_path)}")
 
     return errors
+
+
+def validate_request_for_provider(
+    request: Mapping[str, Any], request_path: Path | None = None
+) -> list[str]:
+    """Provider-aware validation entrypoint (Issue #1692).
+
+    Dispatches by request["provider"] (default "gemini", matching
+    _run_delegation_core()'s own default):
+
+      - provider="gemini" (default): validate_request() -- the full Gemini
+        delegation_request_v1 contract.
+      - provider="auto": validate_request() as well. provider="auto" shares
+        the same structured (objective/instructions/context_files) request
+        shape as provider="gemini" at build/validate time; the concrete
+        gemini/agy candidate is only chosen at execution time by
+        provider_auto_dispatch().
+      - provider="agy": _validate_agy_request() (schema / tool_profile /
+        forbidden `model` / non-empty `prompt`), plus
+        _validate_agy_local_asset_request() when tool_profile is
+        "local_asset_research" -- mirroring _run_delegation_core()'s own
+        agy dispatch order exactly (see the `provider == "agy"` branch
+        there), so this function never invents an independent ordering.
+      - any other provider: a single unknown_provider error, mirroring
+        _run_delegation_core()'s SUPPORTED_PROVIDERS fail-closed default.
+
+    This is the single entrypoint that build_request.py and
+    run_gemini_headless.py --validate-only must share -- callers must not
+    call _validate_agy_request() / _validate_agy_local_asset_request()
+    directly, or a request that passes validate-only could still fail at
+    execution time under a different validator (validator split-brain).
+    """
+    provider = request.get("provider", "gemini")
+    if provider == "gemini":
+        return validate_request(request, request_path=request_path)
+    if provider == "auto":
+        # Issue #1692 AC10: provider="auto" must fail closed at
+        # build/validate-only time for any tool_profile that
+        # provider_auto_dispatch() (the runtime dispatcher) would reject
+        # outright via PROVIDER_AUTO_ELIGIBLE_PROFILES. Without this check,
+        # a provider="auto" + tool_profile="grounded_research" (etc.)
+        # request passes validate-only / build_request.py and only fails
+        # later, at runtime, with provider_profile_unsupported -- this
+        # mirrors that same failure_class/message so the fail-closed
+        # reason is identical whether it is caught here or at runtime.
+        tool_profile = request.get("tool_profile")
+        if tool_profile not in PROVIDER_AUTO_ELIGIBLE_PROFILES:
+            return [
+                f"provider_profile_unsupported: provider=auto (v1) only supports "
+                f"tool_profile in {sorted(PROVIDER_AUTO_ELIGIBLE_PROFILES)}, got {tool_profile!r}"
+            ]
+        return validate_request(request, request_path=request_path)
+    if provider == "agy":
+        errors = list(_validate_agy_request(request))
+        if request.get("tool_profile") == LOCAL_ASSET_RESEARCH_PROFILE:
+            errors = errors + _validate_agy_local_asset_request(request, request_path=request_path)
+        return errors
+    return [f"unknown_provider: {provider!r} is not in SUPPORTED_PROVIDERS {sorted(SUPPORTED_PROVIDERS)}"]
 
 
 def _read_context_files(context_files: list[str], base_dir: Path) -> list[dict[str, str]]:
@@ -3645,14 +3706,35 @@ def _validate_agy_request(request: Mapping[str, Any]) -> list[str]:
 
 
 def _validate_agy_local_asset_request(request: Mapping[str, Any], request_path: Path | None = None) -> list[str]:
-    """Full validation path for provider=agy + local_asset_research.
+    """Profile-specific validation path for provider=agy + local_asset_research.
 
     Issue #1638: requests that declare ``evidence_targets`` use the
     targeted-evidence contract (repo-relative path + bounded selector) and
     skip the legacy whole-file ``context_files`` requirement entirely.
+
+    Issue #1692 AC12: this function used to delegate the shared
+    envelope/profile checks to the Gemini-only validate_request(), which
+    requires `objective` (non-empty, non-vague) / `instructions` (>= 2
+    entries) / `output_sections` (>= 1 entry) -- fields the AGY
+    prompt-first request shape produced by build_request.py's
+    _build_agy_request() (schema/provider/tool_profile/prompt/role/
+    context_files only) never has. That made every provider=agy +
+    tool_profile=local_asset_research request fail validation
+    unconditionally, regardless of whether the actual local_asset_research
+    checks below (context files / evidence targets / payload bounds) would
+    have passed -- Issue #1692 AC1-AC8 never exercised this combination, so
+    the gap went undetected. The common envelope + AGY-specific checks
+    (schema / post_to_issue_url ban for all agy profiles / forbidden model
+    / required prompt / tool_profile membership) are already performed by
+    the caller -- validate_request_for_provider() and
+    _run_delegation_core()'s own provider=="agy" branch both call
+    _validate_agy_request(request) before this function runs -- so this
+    function now only performs the local_asset_research-specific checks
+    that are independent of the Gemini structured-request contract.
     """
     errors: list[str] = []
-    errors.extend(validate_request(request, request_path=request_path))
+    if request.get("post_to_issue_url"):
+        errors.append("local_asset_research forbids post_to_issue_url")
     if isinstance(request.get("evidence_targets"), list):
         errors.extend(_validate_agy_targeted_evidence_request(request, request_path=request_path))
         return errors
@@ -5580,6 +5662,126 @@ def run_delegation(
         _AUDIT_REENTRANCY_DEPTH_VAR.set(depth - 1)
 
 
+# --- provider="auto" candidate materialization (Issue #1692 AC8/AC9) --------
+# provider_auto_dispatch() previously built each candidate attempt by
+# shallow-copying the caller's request and swapping only the "provider"
+# field. That works for the gemini candidate (the canonical request shape
+# IS the gemini request shape), but produces a broken agy candidate: the
+# AGY runtime contract is prompt-first (_validate_agy_request() requires a
+# non-empty "prompt" and rejects "model"), so an agy candidate that is just
+# "the gemini request with provider=agy" always fails validation with
+# agy_empty_prompt as soon as agy is actually attempted (previously
+# unreachable because runtime_order was gemini-first and gemini almost
+# always succeeded or was retried before agy).
+#
+# _materialize_auto_candidate_request() fixes this by deriving each
+# candidate from the same canonical task fields (objective / instructions /
+# tool_profile / context_files / output_sections) rather than mutating a
+# single shared dict: the gemini candidate keeps the canonical structured
+# shape, the agy candidate gets a deterministically synthesized non-empty
+# "prompt". Both candidates carry an identical task_contract_sha256 so a
+# caller/test can verify they represent the same underlying task even
+# though their request *shapes* differ.
+_TASK_CONTRACT_FIELDS: tuple[str, ...] = (
+    "objective",
+    "instructions",
+    "tool_profile",
+    "context_files",
+    "output_sections",
+)
+
+
+def _compute_task_contract_sha256(request: Mapping[str, Any]) -> str:
+    """Deterministic hash of the canonical task fields of *request*.
+
+    Issue #1692 AC8: used to prove the agy and gemini candidates
+    materialized by provider_auto_dispatch() for a single provider="auto"
+    request represent the same underlying task.
+    """
+    canonical = {field: request.get(field) for field in _TASK_CONTRACT_FIELDS}
+    return _sha256_stable_json(canonical)
+
+
+def _synthesize_agy_prompt_from_canonical_task(request: Mapping[str, Any]) -> str:
+    """Deterministically synthesize a non-empty AGY ``prompt`` string from the
+    canonical, Gemini-shaped task fields (``objective`` / ``instructions`` /
+    ``context_files``).
+
+    Issue #1692 AC9: the result is non-empty whenever at least one of
+    ``objective`` / ``instructions`` / ``context_files`` is itself non-empty
+    (which validate_request_for_provider() already guarantees for every
+    provider="auto" request that reaches provider_auto_dispatch(), since
+    provider="auto" is restricted to PROVIDER_AUTO_ELIGIBLE_PROFILES and
+    those profiles require a non-empty ``objective`` at validate time).
+    Deliberately simple and deterministic (no LLM/network call, no
+    randomness) so repeated calls with the same request always synthesize
+    byte-identical prompts.
+    """
+    parts: list[str] = []
+
+    objective = request.get("objective")
+    if isinstance(objective, str) and objective.strip():
+        parts.append(objective.strip())
+
+    instructions = request.get("instructions")
+    if isinstance(instructions, list) and instructions:
+        instruction_lines = [
+            f"- {item.strip()}" for item in instructions if isinstance(item, str) and item.strip()
+        ]
+        if instruction_lines:
+            parts.append("Instructions:\n" + "\n".join(instruction_lines))
+
+    context_files = request.get("context_files")
+    if isinstance(context_files, list) and context_files:
+        context_lines = [
+            f"- {item}" for item in context_files if isinstance(item, str) and item.strip()
+        ]
+        if context_lines:
+            parts.append("Context files (for reference; not attached inline):\n" + "\n".join(context_lines))
+
+    return "\n\n".join(parts)
+
+
+def _materialize_auto_candidate_request(
+    request: Mapping[str, Any], candidate_provider: str
+) -> dict[str, Any]:
+    """Build the concrete per-provider candidate request for one
+    provider="auto" dispatch attempt (Issue #1692 AC8/AC9).
+
+    ``candidate_provider`` must be "gemini" or "agy" (the only two members
+    of PROVIDER_AUTO_RUNTIME_ORDER). Both candidates carry an identical
+    ``task_contract_sha256`` derived from the same canonical task fields.
+    """
+    task_contract_sha256 = _compute_task_contract_sha256(request)
+
+    if candidate_provider == "gemini":
+        candidate = dict(request)
+        candidate["provider"] = "gemini"
+        candidate["task_contract_sha256"] = task_contract_sha256
+        return candidate
+
+    if candidate_provider == "agy":
+        agy_candidate: dict[str, Any] = {
+            "schema": request.get("schema", "delegation_request_v1"),
+            "provider": "agy",
+            "tool_profile": request.get("tool_profile"),
+            "prompt": _synthesize_agy_prompt_from_canonical_task(request),
+            "task_contract_sha256": task_contract_sha256,
+        }
+        role = request.get("role")
+        if role:
+            agy_candidate["role"] = role
+        context_files = request.get("context_files")
+        if isinstance(context_files, list) and context_files:
+            agy_candidate["context_files"] = context_files
+        for passthrough_field in ("parent_run_id", "subtask_id", "attempt_id"):
+            if request.get(passthrough_field) is not None:
+                agy_candidate[passthrough_field] = request[passthrough_field]
+        return agy_candidate
+
+    raise ValueError(f"unknown provider_auto_dispatch candidate_provider: {candidate_provider!r}")
+
+
 def _provider_auto_unsupported_profile_result(
     request: Mapping[str, Any],
     tool_profile: str,
@@ -5717,8 +5919,7 @@ def provider_auto_dispatch(
     fallback_reason: str | None = None
 
     for index, candidate_provider in enumerate(PROVIDER_AUTO_RUNTIME_ORDER):
-        attempt_request = dict(request)
-        attempt_request["provider"] = candidate_provider
+        attempt_request = _materialize_auto_candidate_request(request, candidate_provider)
         result = run_delegation(attempt_request, request_path=request_path, _routing=_routing)
         failure_class = result.get("failure_class")
         retryable = PROVIDER_AUTO_RETRYABLE_FAILURE_CLASSES.get(candidate_provider, frozenset())
@@ -5898,7 +6099,7 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(request, Mapping):
                 print("[gemini-headless] error: request file must contain a JSON object")
                 return 1
-            errors = validate_request(request, request_path=request_file)
+            errors = validate_request_for_provider(request, request_path=request_file)
             if errors:
                 print(f"[gemini-headless] validation FAIL: {errors[0]}")
                 for err in errors[1:]:
