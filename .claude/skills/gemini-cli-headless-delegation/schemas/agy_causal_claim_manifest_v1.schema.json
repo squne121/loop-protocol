@@ -34,6 +34,20 @@
       "type": "string",
       "enum": ["ok", "findings_detected"],
       "description": "Overall result. check_agy_causal_claim_drift.py fail-closes (non-zero exit) whenever status is findings_detected and any finding has severity p0."
+    },
+    "baseline_applied": {
+      "type": "boolean",
+      "description": "Issue #1788: present only when producer is check_agy_causal_claim_drift. True when invoked with --apply-baseline (CI gate baseline/allowlist mode); false for a plain invocation. Absent for audit_agy_auth_surface (no baseline concept)."
+    },
+    "baseline_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Issue #1788: present only when baseline_applied is true. Count of findings whose stable identity matched the built-in CI-gate baseline (pre-existing, non-blocking)."
+    },
+    "new_finding_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Issue #1788: present only when baseline_applied is true. Count of findings NOT in the baseline; a non-zero value here (with severity p0) is what causes the --apply-baseline invocation to fail closed."
     }
   },
   "$defs": {

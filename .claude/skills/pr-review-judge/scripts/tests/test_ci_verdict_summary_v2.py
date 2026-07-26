@@ -200,6 +200,7 @@ class TestAC10EnumExhaustiveness:
             make_check("python-test", conclusion="success"),
             make_check("node-backed-hook-tests", conclusion="success"),
             make_check("actionlint", conclusion="success"),
+            make_check("agy-causal-claim-drift-gate", conclusion="success"),
         ]
         artifact = build(v2, checks)
         assert artifact["overall_status"] == "merge_ready"
@@ -436,7 +437,8 @@ class TestB3NoRequiredEvidence:
         assert len(v2.REQUIRED_CHECKS) > 0
 
     def test_required_checks_contains_all_ci_jobs(self, v2):
-        """REQUIRED_CHECKS must include all 8 ci.yml upstream evidence jobs."""
+        """REQUIRED_CHECKS must include all 9 ci.yml upstream evidence jobs
+        (Issue #1788 added agy-causal-claim-drift-gate)."""
         expected = {
             ("ci", "typecheck"),
             ("ci", "lint"),
@@ -446,6 +448,7 @@ class TestB3NoRequiredEvidence:
             ("ci", "python-test"),
             ("ci", "node-backed-hook-tests"),
             ("ci", "actionlint"),
+            ("ci", "agy-causal-claim-drift-gate"),
         }
         assert expected.issubset(v2.REQUIRED_CHECKS)
 
@@ -460,6 +463,7 @@ class TestB3NoRequiredEvidence:
             make_check("python-test", conclusion="success"),
             make_check("node-backed-hook-tests", conclusion="success"),
             make_check("actionlint", conclusion="success"),
+            make_check("agy-causal-claim-drift-gate", conclusion="success"),
         ]
         artifact = build(v2, checks)
         assert artifact["overall_status"] == "merge_ready"
@@ -604,7 +608,7 @@ class TestP0RealCheckRunApiEvidence:
     def test_actual_check_runs_are_bound_to_current_workflow_and_head(self, v2):
         names = [
             "typecheck", "lint", "test", "build", "e2e", "python-test",
-            "node-backed-hook-tests", "actionlint",
+            "node-backed-hook-tests", "actionlint", "agy-causal-claim-drift-gate",
         ]
         raw_checks = v2.check_runs_api_to_raw_checks(
             {"check_runs": [self._api_row(name) for name in names]}, workflow_run_id=123

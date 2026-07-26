@@ -510,18 +510,20 @@ function extractCommentUrlNumber(url, kindSegment) {
 const ALLOWED_REPO_FILE_PREFIXES = ['docs/', 'tests/fixtures/', 'scripts/']
 const SHA256_DIGEST_RE = /^sha256:[0-9a-f]{64}$/
 
-// isResolvableEvidenceRef (P0-4, Issue #1405 OWNER review): narrowed allowlist-closed
-// resolver. github_comment refs must exactly match one of the two comment URLs the
-// proof itself declares AND carry a digest equal to the corresponding payload digest
-// (operation_index_ref.payload_digest / chatgpt_context.marker_digest). Arbitrary
-// issue/pull comment URLs are no longer accepted as a generic fallback.
+// isResolvableEvidenceRef (P0-4, Issue #1405 OWNER review; extended by Issue #1799):
+// allowlist-closed resolver. github_comment refs must exactly match one of the comment
+// URLs the proof itself declares AND carry a digest equal to the corresponding payload
+// digest (operation_index_ref.payload_digest / pr_review_surface_live_proof_ref.payload_digest
+// / chatgpt_context.marker_digest). Arbitrary issue/pull comment URLs are not accepted as
+// a generic fallback.
 //
-// Note (bounded scope): marker refs.run_reports[*].comment_url / refs.retro_index
-// resolution described in the OWNER review requires a live-resolved marker payload
-// that is not part of chatgpt_retro_execution_proof/v1's current schema shape (no
-// "refs" object is carried on the proof). Extending resolution to those additional
-// marker-derived comment URLs is deferred to a follow-up issue that also extends the
-// marker payload schema; this checker only resolves what the proof itself declares.
+// Issue #1799 additive extension: marker refs.run_reports[*].comment_url /
+// refs.retro_index.comment_url (and other marker-derived comment URLs) are resolvable
+// when the proof carries them in chatgpt_context.additional_resolvable_comment_refs
+// (an additive optional array of {comment_url, payload_digest} the schema now allows).
+// An evidence_ref only resolves against an entry in this array when both the comment_url
+// and the digest match exactly; a comment_url match with a mismatched digest remains
+// unresolvable (same fail-closed policy as the other three anchors above).
 function isResolvableEvidenceRef(ref, proof) {
   if (!ref || typeof ref !== 'object' || typeof ref.ref !== 'string') {
     return false
@@ -535,6 +537,15 @@ function isResolvableEvidenceRef(ref, proof) {
     }
     if (ref.ref === proof?.chatgpt_context?.marker_comment_url) {
       return typeof ref.digest === 'string' && ref.digest === proof?.chatgpt_context?.marker_digest
+    }
+    const additionalRefs = Array.isArray(proof?.chatgpt_context?.additional_resolvable_comment_refs)
+      ? proof.chatgpt_context.additional_resolvable_comment_refs
+      : []
+    const matchedAdditionalRef = additionalRefs.find(
+      (entry) => entry && typeof entry === 'object' && entry.comment_url === ref.ref,
+    )
+    if (matchedAdditionalRef) {
+      return typeof ref.digest === 'string' && ref.digest === matchedAdditionalRef.payload_digest
     }
     return false
   }
