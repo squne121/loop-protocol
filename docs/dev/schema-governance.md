@@ -58,6 +58,8 @@ related_issue: "#135"
 | `EMIT_PARENT_REVIEW_ENVELOPE_V2_FAILURE` | `.claude/skills/issue-refinement-loop/scripts/emit_parent_review_envelope_v2.py` | emit_parent_review_envelope_v2.py（`main()` の contract-invalid / runtime-error stderr diagnostic） | issue-refinement-loop orchestrator（Step 2a、emitter 非 0 exit 時の human-readable/machine-readable diagnostic） | `rg -n "EMIT_PARENT_REVIEW_ENVELOPE_V2_FAILURE" .claude/skills/issue-refinement-loop/scripts` |
 | `delegation_model_policy/v1` | `.claude/skills/gemini-cli-headless-delegation/scripts/build_request.py`（`model-policy` サブコマンド）、`.claude/skills/gemini-cli-headless-delegation/references/model-routing.md` | build_request.py の `build_model_policy()` / `main_model_policy()`（読み取り専用・副作用なしの dry-run inspector。`run_gemini_headless.py` の `load_model_routing()` / `resolve_model_chain()` / `PROVIDER_AUTO_*` を直接呼び出す） | 人間オペレータ・エージェント（`model-policy` CLI 呼び出しの stdout consumer）、test_build_request_model_policy.py | `rg -n "delegation_model_policy/v1\|model-policy\|build_model_policy" .claude/skills/gemini-cli-headless-delegation` |
 | `AGY_CAUSAL_CLAIM_MANIFEST_V1` | `.claude/skills/gemini-cli-headless-delegation/schemas/agy_causal_claim_manifest_v1.schema.json`（JSON Schema draft 2020-12。Issue #1778、CLOSED 済み #1494 の敵対的再監査 follow-up） | `.claude/skills/gemini-cli-headless-delegation/scripts/audit_agy_auth_surface.py`（`agy_permission_policy.py` の認証 surface 露出・`read_only` 命名関数の OS レベル強制有無を静的検出）、`scripts/check_agy_causal_claim_drift.py`（`agy_permission_policy.py` / `run_gemini_headless.py` の `Issue #N` 参照コメントと `references/*.md` frontmatter `status` の整合を検出し fail-close） | 人間レビュワー・エージェント（両スクリプトの stdout JSON consumer）、`test_audit_agy_auth_surface.py`、`test_check_agy_causal_claim_drift.py` | `rg -n "AGY_CAUSAL_CLAIM_MANIFEST_V1" .claude/skills/gemini-cli-headless-delegation scripts docs/dev/schema-governance.md` |
+| `AGY_GROUNDING_EVIDENCE_VERDICT_V1` | `.claude/skills/gemini-cli-headless-delegation/scripts/validate_agy_grounding_evidence.py` | validate_agy_grounding_evidence.py（causal claim extraction + evidence binding check） | pr-review-judge（clean-room review の experimental-validity reviewer）、test_validate_agy_grounding_evidence.py | `rg -n "AGY_GROUNDING_EVIDENCE_VERDICT_V1\|validate_agy_grounding_evidence" .` |
+| `OVERLAP_GATE_BYPASS_V1` | `.claude/skills/open-pr/scripts/validate_pr_body.py` | PR 本文の作者（overlap gate C2a/C3 バイパス時） | validate_pr_body.py、test_validate_pr_body_overlap_gate_bypass.py | `rg -n "OVERLAP_GATE_BYPASS_V1\|bypassed_gate_class" .` |
 
 **Compatibility Decision**: `AGY_CAUSAL_CLAIM_MANIFEST_V1` は本 Issue（#1778）で新規追加された schema であり、既存 schema の破壊的変更は含まない（`additive` — 新規 producer 2 件、既存 consumer への影響なし）。`agy_permission_policy.py` / `run_gemini_headless.py` はどちらも read-only の分析対象であり、本 Issue の PR では一切変更されない（behavior change なし）。
 
@@ -390,6 +392,96 @@ notes:
   - "actual_model は全 variant で常に null（dry-run のため観測値を持たない）。実行時の観測値は delegation_result/v1 側の actual_model であり、本 schema とは別 field/別 producer。"
   - "resolved_chain / configured_chain は「設定から解決された候補チェーン」であり「現在実行可能な chain（readiness）」ではない。readiness_checked / credentials_checked / provider_available は live probe 未実装（scope 外）を明示するための常に静的な値。"
   - "fan_out の reason_code は run_gemini_headless.py の PROVIDER_AUTO_FAN_OUT_UNSUPPORTED_REASON_CODE をそのまま参照する（build_request.py 側でハードコードされた別リテラルを持たない）。"
+```
+
+## AGY_GROUNDING_EVIDENCE_VERDICT_V1 詳細登録
+
+```yaml
+schema_id: AGY_GROUNDING_EVIDENCE_VERDICT_V1
+definition: .claude/skills/gemini-cli-headless-delegation/scripts/validate_agy_grounding_evidence.py
+related_issue: "#1776"
+producer:
+  - validate_agy_grounding_evidence.py（`evaluate_grounding_evidence()` / CLI main()。読み取り専用・副作用なし。--output 指定時のみファイル書き込み）
+consumer:
+  - pr-review-judge（clean-room review の experimental-validity reviewer が一次情報源として使用。.claude/skills/pr-review-judge/SKILL.md#4.7 Clean-Room Review）
+  - .claude/skills/gemini-cli-headless-delegation/tests/test_validate_agy_grounding_evidence.py
+shape: |
+  固定フィールド集合: schema（"AGY_GROUNDING_EVIDENCE_VERDICT_V1" 固定）、
+  status（ok | fail_closed。indeterminate は将来の拡張用に予約済みだが
+  現行 producer は出力しない）、evidence_bindings[]（各要素: claim,
+  paragraph_index, evidence_ref）、unsupported_claims[]（各要素: claim,
+  paragraph_index, reason）。
+  status は unsupported_claims が非空なら fail_closed、それ以外は ok。
+control_flow_order: |
+  入力（--diff-file / --pr-body-file の少なくとも一方が必須）を結合し、
+  空行区切りの paragraph に分割 → 各 paragraph 内の causal claim 文（
+  「〜が原因」「〜により解消/修正/解決/改善」等の正規表現）を抽出 →
+  同一 paragraph 内に evidence 参照（backtick 付きファイルパス/URL/
+  sha256 ダイジェスト）と evidence キーワード（hook/citation/content
+  evidence/ログ/証跡/引用/出典）が共存するかを判定 → 共存すれば
+  evidence_bindings、しなければ unsupported_claims に分類する。
+compatibility:
+  breaking_changes:
+    - status の既存値（ok / fail_closed）の意味変更・削除
+    - evidence_bindings[] / unsupported_claims[] の必須フィールド削除・rename
+    - claim 抽出パターンの後方非互換な狭小化（既存 fixture が unsupported→ok に反転する変更）
+  non_breaking_changes:
+    - 新規 causal-claim パターンの追加
+    - 新規 evidence キーワードの追加
+    - indeterminate ステータスの実装追加（値自体は既に予約済み）
+detection_patterns:
+  - 'AGY_GROUNDING_EVIDENCE_VERDICT_V1'
+  - 'validate_agy_grounding_evidence'
+  - 'evaluate_grounding_evidence'
+validation_commands:
+  - "uv run --locked pytest .claude/skills/gemini-cli-headless-delegation/tests/test_validate_agy_grounding_evidence.py -q"
+notes:
+  - "モデルの自己申告のみに基づく causal claim を検出するための clean-room review 支援ツールであり、merge-blocking 判定自体は pr-review-judge の責務（本 schema は verdict 材料の一つ）。"
+```
+
+## OVERLAP_GATE_BYPASS_V1 詳細登録
+
+```yaml
+schema_id: OVERLAP_GATE_BYPASS_V1
+definition: .claude/skills/open-pr/scripts/validate_pr_body.py（`_validate_overlap_gate_bypass()` / LP059・E_OVERLAP_GATE_BYPASS_SCHEMA_INVALID）
+related_issue: "#1776"
+producer:
+  - PR 本文の作者（open_pr.py の hard overlap gate を C2a（closed_predecessor）/ C3（parent_child_collision）ルートで意図的にバイパスして `gh pr create` を直接実行する場合に、PR 本文中へ fenced ```yaml``` ブロックとして自ら記述する）
+consumer:
+  - .claude/skills/open-pr/scripts/validate_pr_body.py（LP059: ブロック欠落を fail、E_OVERLAP_GATE_BYPASS_SCHEMA_INVALID: スキーマ不正を fail）
+  - .claude/skills/open-pr/tests/test_validate_pr_body_overlap_gate_bypass.py
+shape: |
+  トリガー条件（PR 本文中に overlap + C2a/C3 + bypass 系語彙が共起した場合のみ
+  検証対象）を満たす PR 本文は、fenced YAML ブロック内に以下いずれかの形で
+  OVERLAP_GATE_BYPASS_V1 を記述する: (a) トップレベルキーとして
+  bypass_reason / approver / independent_verification_basis /
+  bypassed_gate_class / precedent_refs を直接持つ、または (b) 単一の
+  トップレベルキー `OVERLAP_GATE_BYPASS_V1:` の下にネストする。
+  必須キー（非空文字列）: bypass_reason, approver,
+  independent_verification_basis, bypassed_gate_class（列挙値 C2a | C3
+  のみ）。任意キー: precedent_refs（非空文字列のリスト）。
+control_flow_order: |
+  PR 本文全体を対象に OVERLAP_GATE_BYPASS_TRIGGER_PATTERN で trigger 判定
+  （overlap 語彙と C2a/C3 と bypass 語彙の近接共起）→ trigger しない場合は
+  検証をスキップ（既存 PR 本文への非破壊）→ trigger した場合は fenced YAML
+  ブロックを本文全体からスキャンして抽出 → YAML parse → 必須キー・
+  bypassed_gate_class の列挙値・precedent_refs の型を検証。
+compatibility:
+  breaking_changes:
+    - 必須キー集合の変更・削除
+    - bypassed_gate_class の許容値（C2a | C3）の変更
+    - トリガー条件の後方非互換な拡大（既存の非バイパス PR 本文が新たに fail になる変更）
+  non_breaking_changes:
+    - precedent_refs 以外の新規オプショナルキーの追加
+    - トリガー語彙の追加（誤検知抑制方向のみ）
+detection_patterns:
+  - 'OVERLAP_GATE_BYPASS_V1'
+  - 'bypassed_gate_class'
+  - '_validate_overlap_gate_bypass'
+validation_commands:
+  - "uv run --locked pytest .claude/skills/open-pr/tests/test_validate_pr_body_overlap_gate_bypass.py -q"
+notes:
+  - "#1752/PR#1756・#1753/PR#1763・#1771/PR#1772 で観測された「自由記述のみでバイパスを正当化し、後続バイパスが先行バイパスを前例として引用する自己強化パターン」への対策として、bypass の説明責任を構造化データとして固定する（Issue #1776 背景）。過去 PR 本文の遡及的な修正は求めない（forward-only）。"
 ```
 
 ## #934 public-surface boundary cleanup note（公開境界クリーンアップ注記）

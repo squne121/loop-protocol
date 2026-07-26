@@ -90,6 +90,29 @@ PR が schema を変更しうると判断される場合:
 
 `Not controlled` 列が非空の際は bounded な主張であること、証跡一致、必要 follow-up があることを確認。
 
+### 4.7) Clean-Room Review（grounded_research / 認証 surface 変更）
+
+grounded_research 関連（`.claude/skills/gemini-cli-headless-delegation/**` の
+provider 呼び出し・fan-out・grounding evidence 検証を含む差分）または AGY / OAuth
+等の認証 surface に関する変更の PR は、**security-boundary reviewer** と
+**experimental-validity reviewer** の 2 名独立 parallel review を要求する
+（Issue #1776; #1494 敵対的再監査 follow-up）。
+
+- **security-boundary reviewer**: 認証境界・権限境界・secret 取り扱いの安全性を
+  判定する。security-boundary reviewer には実装者（implementation-worker）の
+  raw transcript を渡さない。渡してよいのは Issue contract、PR diff、
+  test result manifest、experiment manifest、public-safe artifact hash の
+  みに限定する（clean-room 制約）。実装者の推論過程・自己申告コメントを
+  そのまま信頼材料にしない。
+- **experimental-validity reviewer**: 実験手順・evidence binding・causal claim
+  の妥当性を判定する。`validate_agy_grounding_evidence.py` の
+  `AGY_GROUNDING_EVIDENCE_VERDICT_V1`（`unsupported_claims[]` を含む）を
+  一次情報源として使う。
+- 2 名の判定が食い違う場合は `REQUEST_CHANGES` を優先する（fail-closed）。
+- clean-room 制約（raw transcript 非共有）の遵守は verdict コメント内に
+  明記し、`producer_role` / `allowed_paths_gate` ブロックと同様に
+  merge-blocking な監査証跡として扱う。
+
 ### 5) verdict 決定
 
 - blocker あり → `REQUEST_CHANGES`

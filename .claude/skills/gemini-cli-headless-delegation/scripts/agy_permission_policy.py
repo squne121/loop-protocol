@@ -46,6 +46,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,6 +78,61 @@ ALLOWED_PROFILES: frozenset[str] = frozenset(
         PROPOSAL_ONLY_PROFILE,
     }
 )
+
+# ---------------------------------------------------------------------------
+# Auth surface profiles (Issue #1779)
+# ---------------------------------------------------------------------------
+#
+# Distinct axis from `tool_profile` (NO_TOOLS_PROFILE / ... / PROPOSAL_ONLY_PROFILE
+# above): `tool_profile` governs which AGY *tool calls* are allowed
+# (`PROFILE_ALLOWED_TOOLS`); `auth_profile` governs which *auth-reachability
+# env vars / symlinks* `materialize_isolated_agy_workspace()` grants the
+# isolated `agy` subprocess a path back to the real host's credential state.
+# Deliberately named to avoid the `no_tools` / `local_asset_research` /
+# `grounded_research` / `proposal_only` vocabulary (Issue #1779 Notes for
+# Reviewer).
+#
+# `AGY_AUTH_ABLATION_V1` (recorded in Issue #1779's Source section) proved
+# that only `agy_oauth_token_path` is necessary and sufficient for AGY auth
+# to succeed -- `DBUS_SESSION_BUS_ADDRESS` / `XDG_RUNTIME_DIR` /
+# `GOOGLE_APPLICATION_CREDENTIALS` / `gcloud_adc_path` (added defensively by
+# #1726 / #1730 while diagnosing #1494's `agy_auth_required` failures) are
+# not required. `AGY_AUTH_PROFILE_MINIMAL` is therefore the default and
+# excludes all four; `AGY_AUTH_PROFILE_EXTENDED` is an explicit opt-in for
+# environments that may need them in the future (kept, not deleted, per
+# Issue #1779 In Scope item 1).
+AGY_AUTH_PROFILE_MINIMAL = "auth_minimal"
+AGY_AUTH_PROFILE_EXTENDED = "auth_extended"
+
+ALLOWED_AUTH_PROFILES: frozenset[str] = frozenset(
+    {AGY_AUTH_PROFILE_MINIMAL, AGY_AUTH_PROFILE_EXTENDED}
+)
+
+# Profiles for which materialize_isolated_agy_workspace() fail-closes
+# (refuses to create a workspace at all) when the real agy OAuth token file
+# exists but `bwrap` is unavailable -- i.e. when only
+# `degraded_symlink_reachability` (not `kernel_enforced_ro_bind`) could be
+# offered for the one credential-bearing file this module intentionally
+# exposes. `grounded_research` / `proposal_only` are excluded: they already
+# invoke real AGY tool calls (`grounded_research`) or have no local
+# filesystem/tool-call attack surface materially widened by a readable
+# (but not kernel-enforced-read-only) token symlink, so degraded-mode
+# continuation is judged acceptable for them (Issue #1779 In Scope item 2).
+_AUTH_READONLY_FAIL_CLOSED_PROFILES: frozenset[str] = frozenset(
+    {NO_TOOLS_PROFILE, LOCAL_ASSET_RESEARCH_PROFILE}
+)
+
+
+class AgyReadOnlyBoundaryError(RuntimeError):
+    """Raised by materialize_isolated_agy_workspace() when a security-sensitive
+    profile (`no_tools` / `local_asset_research`) would only be able to offer
+    `degraded_symlink_reachability` (not `kernel_enforced_ro_bind`) for the
+    real agy OAuth token file, because `bwrap` is unavailable on this host.
+
+    Fail-closed by design (Issue #1779 AC7): no workspace is materialized in
+    this case, rather than silently downgrading a security-sensitive
+    profile's read-only guarantee.
+    """
 
 # Canonical taxonomy of the AGY *direct* tool surface this policy governs:
 # shell/command execution, filesystem, MCP, GitHub, browser, and web tools.
@@ -224,14 +280,35 @@ def resolve_tool_permission(
 # Isolated workspace materialization
 # ---------------------------------------------------------------------------
 
-_WORKSPACE_DENY_GATE_HOOK_SOURCE = '''"""Workspace-scoped PreToolCall deny gate.
+# Issue #1779 AC8: no-op placeholder. Issue #1705 originally generated this
+# file assuming AGY would execute a `PreToolCall`-style hook against it (the
+# same `hooks.PreToolCall` shape `build_workspace_permission_policy()`
+# writes into `settings.json`). Re-investigation for #1779 (re-reviewing
+# https://antigravity.google/docs/cli/reference and
+# https://antigravity.google/docs/cli/using, the same sources #1758 used to
+# confirm the *separate* `toolPermission` setting) found no documented AGY
+# hook schema that would ever invoke this file as executable code -- AGY has
+# no confirmed `PreToolCall`/`PreToolUse`-style hook mechanism at all, only
+# the static `permissions.allow`/`permissions.deny` list in `settings.json`
+# (already enforced independently, see below) and the unrelated
+# `toolPermission` confirmation-prompt setting (#1758). This file is
+# therefore an inert **no-op placeholder**: it is written for forward
+# compatibility (if AGY later documents a working hook schema, a stable path
+# already exists to populate) but nothing in AGY or this module ever
+# executes it. The only actually-effective tool-call deny mechanism is the
+# static allowlist -- `PROFILE_ALLOWED_TOOLS` via `resolve_tool_permission()`
+# / `build_workspace_permission_policy()`'s `permissions.allow`/`.deny` lists
+# -- which this file's docstring-only content does not alter and does not
+# need to.
+_WORKSPACE_DENY_GATE_HOOK_SOURCE = '''"""Workspace-scoped PreToolCall deny gate -- no-op placeholder (Issue #1779).
 
-Generated by agy_permission_policy.py (Issue #1705). Denies any tool call
-whose name is not present in this workspace's settings.json
-`permissions.allow`, taking precedence over any global
-$HOME/.antigravity/settings.json allow rules -- because this workspace *is*
-the isolated $HOME for the AGY subprocess, there is no global settings file
-to fall back to at all.
+Generated by agy_permission_policy.py (Issue #1705; re-confirmed no-op by
+Issue #1779). No documented AGY `PreToolCall`/`PreToolUse`-style hook schema
+was found that would ever execute this file -- it is written for forward
+compatibility only. The actually-effective tool-call deny mechanism is the
+static `permissions.allow`/`permissions.deny` allowlist in this workspace's
+own settings.json (`PROFILE_ALLOWED_TOOLS` / `resolve_tool_permission()`),
+not this file.
 """
 '''
 
@@ -251,6 +328,22 @@ CREDENTIAL_FILE_BASENAMES: frozenset[str] = frozenset(
         ".git-credentials",
     }
 )
+
+# ---------------------------------------------------------------------------
+# agy OAuth token read-only enforcement mode (Issue #1779)
+# ---------------------------------------------------------------------------
+#
+# `AGY_READONLY_BOUNDARY_V1` (Issue #1779 Source section) proved that a bare
+# `Path.symlink_to()` exposure (the pre-#1779 `_expose_agy_oauth_token_read_only()`
+# behavior, unchanged by this Issue -- see below) is NOT kernel-enforced
+# read-only: a process can open the symlink and write through it to mutate
+# the real host token file. These three values name what
+# `materialize_isolated_agy_workspace()` actually delivers for a given call,
+# replacing the prior unqualified "read_only" claim with an explicit,
+# truthful mode:
+AGY_OAUTH_TOKEN_READONLY_KERNEL_ENFORCED = "kernel_enforced_ro_bind"
+AGY_OAUTH_TOKEN_READONLY_DEGRADED = "degraded_symlink_reachability"
+AGY_OAUTH_TOKEN_READONLY_ABSENT = "absent"
 
 
 @dataclass(frozen=True)
@@ -289,6 +382,23 @@ class IsolatedAgyWorkspace:
     # `_write_agy_tool_permission_settings()` docstring for the live
     # evidence this addresses.
     agy_tool_permission_settings_path: "Path | None" = None
+    # Issue #1779: whether the exposure above is actually kernel-enforced
+    # read-only (`AGY_OAUTH_TOKEN_READONLY_KERNEL_ENFORCED`, only when
+    # `bwrap` is available), merely reachable via a writable symlink with no
+    # OS-level enforcement (`AGY_OAUTH_TOKEN_READONLY_DEGRADED`), or the real
+    # token file did not exist at all (`AGY_OAUTH_TOKEN_READONLY_ABSENT`).
+    # Replaces the prior unqualified "read only" naming that
+    # `AGY_READONLY_BOUNDARY_V1` proved was not actually enforced.
+    agy_oauth_token_readonly_mode: str = AGY_OAUTH_TOKEN_READONLY_ABSENT
+    # Issue #1779: `bwrap` argv prefix that, when prepended to the actual
+    # `agy` subprocess command, kernel-enforces read-only access to
+    # `agy_oauth_token_path` (and the `agy_tool_permission_settings_path`
+    # sitting alongside it). Non-None only when
+    # `agy_oauth_token_readonly_mode == AGY_OAUTH_TOKEN_READONLY_KERNEL_ENFORCED`.
+    # Consumed by `run_gemini_headless.py::_run_agy()` at the single
+    # `subprocess.run(command, ...)` call site that actually launches `agy`
+    # (Issue #1779 Allowed Paths); this module never invokes it itself.
+    agy_oauth_token_bwrap_prefix: "list[str] | None" = None
 
 
 # Issue #1730: gcloud Application Default Credentials (ADC) are cached
@@ -452,6 +562,59 @@ def _expose_agy_oauth_token_read_only(isolated_home: Path) -> "Path | None":
     return link_path
 
 
+# ---------------------------------------------------------------------------
+# bwrap-based kernel-enforced read-only (Issue #1779)
+# ---------------------------------------------------------------------------
+
+
+def _bwrap_available() -> bool:
+    """Return True if the `bwrap` (bubblewrap) binary is on `PATH`.
+
+    Issue #1779 AC4/AC6: `_expose_agy_oauth_token_read_only()` above only
+    ever creates a plain symlink -- reachable, but not kernel-enforced
+    read-only (`AGY_READONLY_BOUNDARY_V1` proved a process can write through
+    it). When `bwrap` is available, `materialize_isolated_agy_workspace()`
+    additionally builds a `bwrap` argv prefix (`_build_bwrap_ro_bind_prefix()`)
+    that *is* kernel-enforced; when it is not, the workspace is annotated
+    `AGY_OAUTH_TOKEN_READONLY_DEGRADED` instead of silently claiming
+    read-only.
+    """
+    return shutil.which("bwrap") is not None
+
+
+def _build_bwrap_ro_bind_prefix(
+    scratch_dir: Path, ro_bind_pairs: Sequence[tuple[Path, Path]]
+) -> list[str]:
+    """Build a `bwrap` argv prefix that kernel-enforces read-only access to
+    each `dest` in *ro_bind_pairs*, prepended to the real `agy` subprocess
+    argv by `run_gemini_headless.py::_run_agy()`.
+
+    Issue #1779: `bwrap --dev-bind / /` first binds the real filesystem onto
+    itself unchanged (the sandboxed subprocess sees exactly the same tree as
+    without this prefix). `--tmpfs <scratch_dir>` then replaces *scratch_dir*
+    (the directory containing the pre-created reachability symlink(s) from
+    `_expose_agy_oauth_token_read_only()` / the agy tool-permission settings
+    file) with a fresh, empty, in-namespace-only view -- required because
+    `bwrap --ro-bind` refuses to bind onto a destination that already exists
+    as a symlink (confirmed empirically: `bwrap: Can't create file at
+    <path>: No such file or directory`), and `--tmpfs` is scoped to a single
+    directory so sibling paths under `--dev-bind / /` remain unaffected.
+    Each `(source, dest)` pair is then remounted read-only from the real,
+    unmodified host file at `source` (resolved from the original, pre-tmpfs
+    filesystem view, not the fresh `scratch_dir` overlay) onto `dest`. Any
+    write attempt through `dest` inside the sandboxed subprocess fails with
+    a kernel-level `EROFS` ("Read-only file system") error; reads succeed
+    with the real content. This function only builds an argv list -- it
+    never itself opens, reads, or mounts anything (the real `bwrap` process
+    that does so is spawned by the caller's own `subprocess.run(...)`).
+    """
+    argv: list[str] = ["bwrap", "--dev-bind", "/", "/", "--tmpfs", str(scratch_dir)]
+    for source, dest in ro_bind_pairs:
+        argv.extend(["--ro-bind", str(source), str(dest)])
+    argv.append("--")
+    return argv
+
+
 # Issue #1758: AGY's *own* built-in safety preset -- distinct from and
 # evaluated *before* this module's workspace-scoped `.antigravity/settings.json`
 # deny policy / `workspace_deny_gate` PreToolCall hook above -- is controlled by
@@ -522,21 +685,65 @@ def materialize_isolated_agy_workspace(
     profile: str,
     *,
     parent_dir: "str | Path | None" = None,
+    auth_profile: str = AGY_AUTH_PROFILE_MINIMAL,
 ) -> IsolatedAgyWorkspace:
     """Create a fresh, isolated temp workspace with a profile-scoped policy.
 
     Only new, empty structure is created under a brand-new temp directory:
     `.antigravity/settings.json` (the policy document from
     `build_workspace_permission_policy()`), `.antigravity/workspace_deny_gate.py`
-    (the hook), and empty `xdg-config` / `xdg-cache` / `xdg-state`
-    directories. Nothing is read from or copied out of the caller's real
-    `$HOME` / `XDG_*` directories -- credential files (OAuth tokens, SSH
-    keys, `.netrc`, etc.) are never copied (Issue #1705 AC12). The returned
-    `env` redirects `HOME`/`XDG_CONFIG_HOME`/`XDG_CACHE_HOME`/`XDG_STATE_HOME`
-    into this workspace, so any pre-existing global Antigravity settings on
-    the real host are structurally unreachable by the AGY subprocess.
+    (the hook -- see its own docstring: a no-op placeholder, not an
+    executable enforcement mechanism), and empty `xdg-config` / `xdg-cache` /
+    `xdg-state` directories. Nothing is read from or copied out of the
+    caller's real `$HOME` / `XDG_*` directories -- credential files (OAuth
+    tokens, SSH keys, `.netrc`, etc.) are never copied (Issue #1705 AC12).
+    The returned `env` redirects
+    `HOME`/`XDG_CONFIG_HOME`/`XDG_CACHE_HOME`/`XDG_STATE_HOME` into this
+    workspace, so any pre-existing global Antigravity settings on the real
+    host are structurally unreachable by the AGY subprocess.
+
+    `auth_profile` (Issue #1779, default `AGY_AUTH_PROFILE_MINIMAL`, distinct
+    from `profile`/`tool_profile` above -- see the "Auth surface profiles"
+    section docstring) controls whether the `DBUS_SESSION_BUS_ADDRESS` /
+    `XDG_RUNTIME_DIR` / `GOOGLE_APPLICATION_CREDENTIALS` env vars and the
+    `gcloud_adc_path` symlink are exposed at all: only
+    `auth_profile=AGY_AUTH_PROFILE_EXTENDED` exposes them (unchanged
+    behavior from #1726/#1730); the default `AGY_AUTH_PROFILE_MINIMAL`
+    exposes none of them, since `AGY_AUTH_ABLATION_V1` proved they are not
+    required for AGY auth to succeed. `agy_oauth_token_path` is exposed
+    unconditionally regardless of `auth_profile` -- it is the one surface
+    proven necessary and sufficient.
+
+    Raises `AgyReadOnlyBoundaryError` (fail-closed, no workspace created) when
+    `profile` is `no_tools` or `local_asset_research`, the real agy OAuth
+    token file exists, and `bwrap` is unavailable -- see
+    `AgyReadOnlyBoundaryError` docstring (Issue #1779 AC7).
     """
     validate_profile(profile)
+    if auth_profile not in ALLOWED_AUTH_PROFILES:
+        raise ValueError(
+            f"unknown AGY auth_profile: {auth_profile!r}; expected one of "
+            f"{sorted(ALLOWED_AUTH_PROFILES)}"
+        )
+
+    # Issue #1779 AC7: fail-closed *before* any workspace is created (not
+    # merely annotated as degraded) when a security-sensitive profile cannot
+    # be given a kernel-enforced read-only guarantee for the real agy OAuth
+    # token file. When the real token file does not exist there is nothing
+    # to protect, so this check never fires for hermetic/CI environments
+    # that have no such file regardless of `bwrap` availability.
+    if profile in _AUTH_READONLY_FAIL_CLOSED_PROFILES and not _bwrap_available():
+        if _real_home_agy_oauth_token_file() is not None:
+            raise AgyReadOnlyBoundaryError(
+                f"materialize_isolated_agy_workspace(): profile={profile!r} "
+                "requires a kernel-enforced read-only guarantee "
+                f"({AGY_OAUTH_TOKEN_READONLY_KERNEL_ENFORCED}) for the real "
+                "agy OAuth token file, but `bwrap` is unavailable on this "
+                "host -- refusing to materialize a workspace that could "
+                f"only offer {AGY_OAUTH_TOKEN_READONLY_DEGRADED} (Issue "
+                "#1779 AC7)."
+            )
+
     workspace_dir = Path(
         tempfile.mkdtemp(
             prefix=f"agy-isolated-{profile}-",
@@ -550,6 +757,13 @@ def materialize_isolated_agy_workspace(
     policy = build_workspace_permission_policy(profile)
     settings_path.write_text(json.dumps(policy, indent=2, sort_keys=True), encoding="utf-8")
 
+    # Issue #1779 AC8: `_WORKSPACE_DENY_GATE_HOOK_SOURCE` is a documented
+    # no-op placeholder (see its own docstring) -- no AGY `PreToolCall`
+    # hook schema that would execute this file was found. It is still
+    # written so any environment that later gains a working hook mechanism
+    # has a stable path to populate; `PROFILE_ALLOWED_TOOLS` (via
+    # `resolve_tool_permission()` / `build_workspace_permission_policy()`)
+    # remains the sole *actually effective* tool-call deny mechanism.
     hook_path = antigravity_dir / "workspace_deny_gate.py"
     hook_path.write_text(_WORKSPACE_DENY_GATE_HOOK_SOURCE, encoding="utf-8")
 
@@ -566,58 +780,71 @@ def materialize_isolated_agy_workspace(
         "XDG_STATE_HOME": str(xdg_state),
         "AGY_WORKSPACE_SETTINGS": str(settings_path),
     }
-    # Reachability variables (Issue #1726): each of these is an *endpoint*
-    # pointer (a filesystem path to a Unix domain socket or a socket
-    # directory), never a credential value in itself. Propagating them lets
-    # the isolated `agy` subprocess reach the *existing*, already-authenticated
-    # OS keyring / dbus secret service session on the host, without granting
-    # it access to -- or a copy of -- any credential file, token string, or
-    # cookie. This is distinct from `HOME`/`XDG_CONFIG_HOME`/`XDG_CACHE_HOME`/
-    # `XDG_STATE_HOME` above, which remain fully redirected into the isolated
-    # workspace (Issue #1705 secret-hygiene design is unchanged).
-    #
-    # - DBUS_SESSION_BUS_ADDRESS: the well-known D-Bus session bus address,
-    #   e.g. `unix:path=/run/user/1000/bus`. It names *where* to connect to
-    #   reach the running session/secret-service bus; it carries no secret
-    #   material itself (the actual credential bytes stay inside the OS
-    #   keyring process behind that socket and are never read or copied by
-    #   this function).
-    # - XDG_RUNTIME_DIR: the per-user runtime directory
-    #   (e.g. `/run/user/1000`) that typically *contains* the D-Bus socket
-    #   and other session sockets `agy`/dbus tooling may need to resolve a
-    #   default bus address from. It is a directory path, not credential
-    #   content, and propagating it does not expose any file contents to the
-    #   subprocess beyond what the isolated `HOME`/`XDG_*` redirection above
-    #   already scopes for config/cache/state.
-    for key in (
-        "PATH",
-        "LANG",
-        "LC_ALL",
-        "TERM",
-        "DBUS_SESSION_BUS_ADDRESS",
-        "XDG_RUNTIME_DIR",
-    ):
+    for key in ("PATH", "LANG", "LC_ALL", "TERM"):
         value = os.environ.get(key)
         if value is not None:
             env[key] = value
 
-    # Issue #1730 AC2: GOOGLE_APPLICATION_CREDENTIALS, when already set in the
-    # real environment, is a *path string* pointing at a credential file --
-    # not credential content itself -- so it is propagated through the same
-    # way the Issue #1726 endpoint-pointer variables above are: verbatim,
-    # without ever opening or reading the file it names.
-    google_application_credentials = os.environ.get(GOOGLE_APPLICATION_CREDENTIALS_ENV)
-    if google_application_credentials is not None:
-        env[GOOGLE_APPLICATION_CREDENTIALS_ENV] = google_application_credentials
+    gcloud_adc_path: "Path | None" = None
+    if auth_profile == AGY_AUTH_PROFILE_EXTENDED:
+        # Reachability variables (Issue #1726): each of these is an
+        # *endpoint* pointer (a filesystem path to a Unix domain socket or a
+        # socket directory), never a credential value in itself. Propagating
+        # them lets the isolated `agy` subprocess reach the *existing*,
+        # already-authenticated OS keyring / dbus secret service session on
+        # the host, without granting it access to -- or a copy of -- any
+        # credential file, token string, or cookie. This is distinct from
+        # `HOME`/`XDG_CONFIG_HOME`/`XDG_CACHE_HOME`/`XDG_STATE_HOME` above,
+        # which remain fully redirected into the isolated workspace
+        # regardless of `auth_profile` (Issue #1705 secret-hygiene design is
+        # unchanged). Issue #1779: `AGY_AUTH_ABLATION_V1` proved these are
+        # not required for AGY auth to succeed, so they are only exposed
+        # under the explicit `auth_profile=AGY_AUTH_PROFILE_EXTENDED` opt-in
+        # (default `AGY_AUTH_PROFILE_MINIMAL` omits them entirely) --
+        # superseded_by: #1779 (2026-07-26).
+        #
+        # - DBUS_SESSION_BUS_ADDRESS: the well-known D-Bus session bus
+        #   address, e.g. `unix:path=/run/user/1000/bus`. It names *where*
+        #   to connect to reach the running session/secret-service bus; it
+        #   carries no secret material itself (the actual credential bytes
+        #   stay inside the OS keyring process behind that socket and are
+        #   never read or copied by this function).
+        # - XDG_RUNTIME_DIR: the per-user runtime directory
+        #   (e.g. `/run/user/1000`) that typically *contains* the D-Bus
+        #   socket and other session sockets `agy`/dbus tooling may need to
+        #   resolve a default bus address from. It is a directory path, not
+        #   credential content, and propagating it does not expose any file
+        #   contents to the subprocess beyond what the isolated `HOME`/
+        #   `XDG_*` redirection above already scopes for config/cache/state.
+        for key in ("DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"):
+            value = os.environ.get(key)
+            if value is not None:
+                env[key] = value
 
-    # Issue #1730 AC1/AC3: expose the real gcloud ADC config dir (if any)
-    # read-only under this workspace's isolated XDG_CONFIG_HOME -- the only
-    # path back to any real $HOME content this function ever creates.
-    gcloud_adc_path = _expose_gcloud_adc_read_only(xdg_config)
+        # Issue #1730 AC2, superseded_by: #1779 (2026-07-26): only exposed
+        # under `auth_profile=AGY_AUTH_PROFILE_EXTENDED`. When already set in
+        # the real environment, this is a *path string* pointing at a
+        # credential file -- not credential content itself -- so it is
+        # propagated through the same way the Issue #1726 endpoint-pointer
+        # variables above are: verbatim, without ever opening or reading the
+        # file it names.
+        google_application_credentials = os.environ.get(GOOGLE_APPLICATION_CREDENTIALS_ENV)
+        if google_application_credentials is not None:
+            env[GOOGLE_APPLICATION_CREDENTIALS_ENV] = google_application_credentials
+
+        # Issue #1730 AC1/AC3, superseded_by: #1779 (2026-07-26): only
+        # exposed under `auth_profile=AGY_AUTH_PROFILE_EXTENDED`. Expose the
+        # real gcloud ADC config dir (if any) read-only under this
+        # workspace's isolated XDG_CONFIG_HOME.
+        gcloud_adc_path = _expose_gcloud_adc_read_only(xdg_config)
 
     # Issue #1740 AC1/AC2, #1743: expose the real agy OAuth token file (if
-    # any) read only under this workspace's isolated HOME -- the actual auth
-    # channel `agy` uses; see `_expose_agy_oauth_token_read_only()` docstring.
+    # any) as a reachable symlink under this workspace's isolated HOME --
+    # the actual auth channel `agy` uses; see
+    # `_expose_agy_oauth_token_read_only()` docstring. Unconditional
+    # regardless of `auth_profile` -- `AGY_AUTH_ABLATION_V1` proved this is
+    # the one surface necessary and sufficient for auth to succeed (Issue
+    # #1779 AC2).
     agy_oauth_token_path = _expose_agy_oauth_token_read_only(workspace_dir)
 
     # Issue #1758: generate the real AGY settings.json with an explicit
@@ -625,6 +852,29 @@ def materialize_isolated_agy_workspace(
     # the built-in "request-review" default, which silently drops tool calls
     # in headless print mode; see `_write_agy_tool_permission_settings()`.
     agy_tool_permission_settings_path = _write_agy_tool_permission_settings(workspace_dir)
+
+    # Issue #1779 AC4/AC5/AC6: determine the actual (not merely claimed)
+    # read-only enforcement mode for `agy_oauth_token_path`, and build the
+    # `bwrap` prefix that delivers it when possible.
+    if agy_oauth_token_path is None:
+        agy_oauth_token_readonly_mode = AGY_OAUTH_TOKEN_READONLY_ABSENT
+        agy_oauth_token_bwrap_prefix: "list[str] | None" = None
+    elif _bwrap_available():
+        real_token_file = _real_home_agy_oauth_token_file()
+        # real_token_file is not None here: agy_oauth_token_path (a symlink
+        # to it) was just successfully created above.
+        ro_bind_pairs: list[tuple[Path, Path]] = [(real_token_file, agy_oauth_token_path)]  # type: ignore[list-item]
+        if agy_tool_permission_settings_path is not None:
+            ro_bind_pairs.append(
+                (agy_tool_permission_settings_path, agy_tool_permission_settings_path)
+            )
+        agy_oauth_token_readonly_mode = AGY_OAUTH_TOKEN_READONLY_KERNEL_ENFORCED
+        agy_oauth_token_bwrap_prefix = _build_bwrap_ro_bind_prefix(
+            agy_oauth_token_path.parent, ro_bind_pairs
+        )
+    else:
+        agy_oauth_token_readonly_mode = AGY_OAUTH_TOKEN_READONLY_DEGRADED
+        agy_oauth_token_bwrap_prefix = None
 
     return IsolatedAgyWorkspace(
         profile=profile,
@@ -635,6 +885,8 @@ def materialize_isolated_agy_workspace(
         gcloud_adc_path=gcloud_adc_path,
         agy_oauth_token_path=agy_oauth_token_path,
         agy_tool_permission_settings_path=agy_tool_permission_settings_path,
+        agy_oauth_token_readonly_mode=agy_oauth_token_readonly_mode,
+        agy_oauth_token_bwrap_prefix=agy_oauth_token_bwrap_prefix,
     )
 
 
@@ -856,14 +1108,32 @@ def build_agy_run_context(
     profile: str,
     *,
     parent_dir: "str | Path | None" = None,
+    auth_profile: str = AGY_AUTH_PROFILE_MINIMAL,
 ) -> dict[str, Any]:
-    """Build the isolated workspace + env context for wiring into `_run_agy()`."""
+    """Build the isolated workspace + env context for wiring into `_run_agy()`.
+
+    Issue #1779: `auth_profile` defaults to `AGY_AUTH_PROFILE_MINIMAL`
+    (forwarded to `materialize_isolated_agy_workspace()` unchanged) so
+    callers that do not explicitly opt in to `AGY_AUTH_PROFILE_EXTENDED`
+    get the minimized auth surface by default. The returned dict also
+    carries `agy_oauth_token_readonly_mode` / `agy_oauth_token_bwrap_prefix`
+    so `run_gemini_headless.py::_run_agy()` can prepend the `bwrap` prefix to
+    the actual `agy` subprocess argv when kernel enforcement is available.
+    """
     validate_profile(profile)
-    workspace = materialize_isolated_agy_workspace(profile, parent_dir=parent_dir)
+    workspace = materialize_isolated_agy_workspace(
+        profile, parent_dir=parent_dir, auth_profile=auth_profile
+    )
     return {
         "profile": profile,
         "workspace_dir": str(workspace.workspace_dir),
         "settings_path": str(workspace.settings_path),
         "hook_path": str(workspace.hook_path),
         "env": dict(workspace.env),
+        "agy_oauth_token_readonly_mode": workspace.agy_oauth_token_readonly_mode,
+        "agy_oauth_token_bwrap_prefix": (
+            list(workspace.agy_oauth_token_bwrap_prefix)
+            if workspace.agy_oauth_token_bwrap_prefix is not None
+            else None
+        ),
     }
