@@ -38,6 +38,11 @@ const OPTION_SPEC = {
   '--summary-json-in': { key: 'summaryJsonIn' },
   '--expected-canonical-digest': { key: 'expectedCanonicalDigest' },
   '--expected-source-comment-set-digest': { key: 'expectedSourceCommentSetDigest' },
+  // Issue #1415 digest-contract fix_delta (additive): scan an explicit pull request's
+  // conversation comments as a source too, for dual-target designs where the pr-target
+  // is not discoverable via a checklist child issue's body (e.g. a directly-declared
+  // Target Scope pull_request). Omitting this flag preserves existing v2 behavior exactly.
+  '--additional-pull-number': { key: 'additionalPullNumbers', multiple: true },
 }
 
 function ensureAllowedRepo(repo) {
@@ -117,11 +122,11 @@ function issueCommentShape(comment, linkedPrHints, linkedIssueHints, branchHint)
   }
 }
 
-async function collectSourceComments({ repo, parentIssue, issueCommentClient }) {
+async function collectSourceComments({ repo, parentIssue, issueCommentClient, additionalPullNumbers = [] }) {
   const parent = fetchIssue(repo, parentIssue)
   const childIssues = parseChecklistIssueNumbers(parent.body)
   const childIssueObjects = childIssues.map((number) => fetchIssue(repo, number))
-  const pullNumbers = new Set()
+  const pullNumbers = new Set(additionalPullNumbers)
   const prMetadataByNumber = new Map()
   const associatedPrByMergeSha = new Map()
   const sourceComments = []
@@ -132,6 +137,21 @@ async function collectSourceComments({ repo, parentIssue, issueCommentClient }) 
     }
     for (const number of parsePullRequestNumbers(issue.title)) {
       pullNumbers.add(number)
+    }
+  }
+
+  // Issue #1415 digest-contract fix_delta: the parent issue itself can be a valid
+  // dual-target issue-target (Issue #1415's Target Scope names the parent issue #1153
+  // as its own issue-target), so its own comments must be scannable as a source too --
+  // not only the checklist-tracked children's comments. Additive: does not change the
+  // existing child-issue / linked-PR discovery behavior above or below.
+  {
+    const parentComments = await listAllIssueComments(issueCommentClient, {
+      repo,
+      issueNumber: parent.number,
+    })
+    for (const comment of parentComments) {
+      sourceComments.push(issueCommentShape(comment, [], [parent.number], null))
     }
   }
 
@@ -322,6 +342,7 @@ export async function updateRetroIndex({
   issueCommentClient = new GhCliIssueCommentsClient(),
   sourceBundle = null,
   artifactBundle = null,
+  additionalPullNumbers = [],
 }) {
   ensureAllowedRepo(repo)
   if (!dryRun && !confirmLive) {
@@ -333,6 +354,7 @@ export async function updateRetroIndex({
       repo,
       parentIssue,
       issueCommentClient,
+      additionalPullNumbers,
     })
     return Promise.resolve(bundle).then((resolvedBundle) => buildRetroIndex({
       sourceComments: resolvedBundle.sourceComments,
@@ -428,12 +450,14 @@ async function main() {
       expectedSourceCommentSetDigest: options.expectedSourceCommentSetDigest ?? null,
     })
     : null
+  const additionalPullNumbers = (options.additionalPullNumbers ?? []).map((value) => Number(value))
   const result = await updateRetroIndex({
     repo: options.repo,
     parentIssue: Number(options.parentIssue),
     dryRun: parseBooleanFlag(options.dryRun, '--dry-run'),
     confirmLive: parseBooleanFlag(options.confirmLive, '--confirm-live'),
     artifactBundle,
+    additionalPullNumbers,
   })
 
   if (options.artifactJsonOut) {
