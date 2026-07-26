@@ -25,14 +25,42 @@ This is a **read-only, static** check: `agy_permission_policy.py` /
 edited (Issue #1778 Out of Scope / Stop Conditions -- no behavior change).
 
 Exit codes:
-  0 = no drift detected
+  0 = no drift detected (or, with --apply-baseline, no NEW drift beyond the
+      pre-existing baseline)
   1 = drift detected (fail-closed)
   2 = usage / input error (a target file is missing)
 
 Design references:
 - Issue #1778 Source item 5, AC3
+- Issue #1788 (CI gate integration): `--apply-baseline` added below
 - `.claude/skills/gemini-cli-headless-delegation/references/agy-headless-tool-use-investigation.md`
 - `.claude/skills/gemini-cli-headless-delegation/schemas/agy_causal_claim_manifest_v1.schema.json`
+
+## Issue #1788: CI gate baseline/allowlist mechanism
+
+`build_manifest()` / the underlying drift detection rule (an `Issue #N`
+comment reference with no `SUPERSEDED` marker, where the referenced Issue's
+findings doc is `resolved`/`refuted`) is **unchanged** by this addition
+(Issue #1788 Out of Scope). What is added is a purely additive,
+opt-in *exit-code* filter: `--apply-baseline` compares each detected
+finding's stable identity (`source_file` + `issue_number` + `doc_path` +
+`doc_status` -- deliberately NOT `line`, so unrelated line-number churn in
+the same file does not spuriously "un-baseline" an already-known finding)
+against `_CI_GATE_BASELINE_KEYS` below. Findings whose stable key is already
+in the baseline still appear in the printed manifest (`baseline_count`),
+but do not contribute to the fail-closed exit code; only a finding whose
+stable key is NOT in the baseline (a genuinely NEW drift) causes exit 1.
+
+Without `--apply-baseline`, behavior is 100% unchanged: any p0 finding
+fails closed (exit 1), same as before Issue #1788.
+
+The baseline below was captured against the repo state as of Issue #1788
+(54 raw findings / 5 stable keys, see PR for the Issue #1788 implementation
+for the exact capture command and count). Burning down this baseline (fixing
+the pre-existing drift and removing entries here) is intentionally left as
+follow-up work -- Issue #1788 Out of Scope forbids changing the detection
+logic itself, and bulk-fixing 24+ existing code comments is a separate,
+larger effort.
 """
 
 from __future__ import annotations
@@ -55,6 +83,84 @@ _DEFAULT_CODE_TARGETS: tuple[str, ...] = (
 _DEFAULT_REFERENCES_DIR = (
     ".claude/skills/gemini-cli-headless-delegation/references"
 )
+
+# Issue #1788: baseline of causal-claim drift findings known to exist at CI
+# gate activation time. Each entry is the STABLE identity of a finding
+# (source_file, issue_number, doc_path, doc_status) -- intentionally
+# excluding `line`, so that unrelated line-number shifts within an already
+# -baselined (source_file, issue_number, doc_path, doc_status) combination
+# do not spuriously register as new drift. A genuinely new combination
+# (e.g. a fresh `Issue #N` reference to a different resolved/refuted Issue,
+# or a reference in a file not covered here) is NOT in this set and will
+# still fail the gate. See module docstring "Issue #1788: CI gate
+# baseline/allowlist mechanism" above.
+_CI_GATE_BASELINE_KEYS: frozenset[tuple[str, int, str, str]] = frozenset(
+    {
+        (
+            ".claude/skills/gemini-cli-headless-delegation/scripts/"
+            "agy_permission_policy.py",
+            1758,
+            ".claude/skills/gemini-cli-headless-delegation/references/"
+            "agy-headless-tool-use-investigation.md",
+            "resolved",
+        ),
+        (
+            ".claude/skills/gemini-cli-headless-delegation/scripts/"
+            "run_gemini_headless.py",
+            1708,
+            ".claude/skills/gemini-cli-headless-delegation/references/"
+            "agy-headless-tool-use-investigation.md",
+            "resolved",
+        ),
+        (
+            ".claude/skills/gemini-cli-headless-delegation/scripts/"
+            "run_gemini_headless.py",
+            1752,
+            ".claude/skills/gemini-cli-headless-delegation/references/"
+            "agy-headless-tool-use-investigation.md",
+            "resolved",
+        ),
+        (
+            ".claude/skills/gemini-cli-headless-delegation/scripts/"
+            "run_gemini_headless.py",
+            1771,
+            ".claude/skills/gemini-cli-headless-delegation/references/"
+            "agy-headless-tool-use-investigation.md",
+            "resolved",
+        ),
+        (
+            ".claude/skills/gemini-cli-headless-delegation/scripts/"
+            "run_gemini_headless.py",
+            1777,
+            ".claude/skills/gemini-cli-headless-delegation/references/"
+            "agy-headless-tool-use-investigation.md",
+            "resolved",
+        ),
+    }
+)
+
+
+def _finding_baseline_key(finding: dict[str, Any]) -> tuple[str, int, str, str]:
+    return (
+        finding["source_file"],
+        finding["issue_number"],
+        finding["doc_path"],
+        finding["doc_status"],
+    )
+
+
+def partition_baseline_findings(
+    findings: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split findings into (baselined, new) using `_CI_GATE_BASELINE_KEYS`."""
+    baselined: list[dict[str, Any]] = []
+    new: list[dict[str, Any]] = []
+    for finding in findings:
+        if _finding_baseline_key(finding) in _CI_GATE_BASELINE_KEYS:
+            baselined.append(finding)
+        else:
+            new.append(finding)
+    return baselined, new
 
 _ISSUE_REF_RE = re.compile(r"Issue\s*#(\d+)")
 _SUPERSEDED_RE = re.compile(r"SUPERSEDED\s*\(Issue\s*#\d+\)", re.IGNORECASE)
@@ -238,6 +344,19 @@ def main(argv: "list[str] | None" = None) -> int:
         default=_DEFAULT_REFERENCES_DIR,
         help="Repo-relative path to the references/*.md directory to check.",
     )
+    parser.add_argument(
+        "--apply-baseline",
+        action="store_true",
+        default=False,
+        help=(
+            "Issue #1788: only fail closed on findings NOT already present "
+            "in the built-in _CI_GATE_BASELINE_KEYS baseline. Findings "
+            "matching the baseline are still reported in the manifest "
+            "(baseline_count) but do not affect the exit code. Without "
+            "this flag, behavior is unchanged from pre-#1788: any p0 "
+            "finding fails closed."
+        ),
+    )
     args = parser.parse_args(argv)
 
     code_target_strs = args.code_targets or list(_DEFAULT_CODE_TARGETS)
@@ -260,8 +379,20 @@ def main(argv: "list[str] | None" = None) -> int:
     references_dir = _resolve_repo_relative(args.references_dir)
 
     manifest = build_manifest(code_targets, references_dir)
-    print(json.dumps(manifest, indent=2, sort_keys=True))
 
+    if args.apply_baseline:
+        baselined, new_findings = partition_baseline_findings(
+            manifest["findings"]
+        )
+        manifest["baseline_applied"] = True
+        manifest["baseline_count"] = len(baselined)
+        manifest["new_finding_count"] = len(new_findings)
+        print(json.dumps(manifest, indent=2, sort_keys=True))
+        has_new_p0 = any(f["severity"] == "p0" for f in new_findings)
+        return 1 if has_new_p0 else 0
+
+    manifest["baseline_applied"] = False
+    print(json.dumps(manifest, indent=2, sort_keys=True))
     has_p0 = any(f["severity"] == "p0" for f in manifest["findings"])
     return 1 if has_p0 else 0
 
