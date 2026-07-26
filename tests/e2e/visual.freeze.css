@@ -50,3 +50,27 @@
 [data-visual-mask='true'] {
   visibility: hidden !important;
 }
+
+/*
+ * Deterministic font pin for the DOM overlay VRT capture root (Issue #1386
+ * PR #1721 review fix, P1 Blocker 1). `src/style.css`'s `--sans` /
+ * `--mono` custom properties resolve through a named-font fallback chain
+ * (`'Segoe UI Variable', 'Segoe UI', sans-serif` /
+ * `'IBM Plex Mono', 'Cascadia Code', monospace`). Whether the named fonts
+ * are actually installed varies per host (dev machine vs CI runner vs this
+ * worktree's sandbox), so the SAME text (e.g. "In Progress" in
+ * `[data-field="sortie-status"]`) can wrap differently across environments
+ * purely from glyph-metric drift — not a real visual regression. Pinning
+ * every element under the capture root (`[data-battle-ui-root]`) to the
+ * bare CSS generic family removes the named-font fallback chain entirely,
+ * so the comparison only ever depends on the browser's own built-in
+ * generic-family resolution (deterministic for a given Chromium build),
+ * not on which named fonts happen to be installed on the host. Scoped to
+ * `[data-battle-ui-root]` only — this must never change the visible
+ * font-family for `m2-combat-mvp.spec.ts`'s unrelated `.command-rail` /
+ * canvas screenshot baselines, which do not use this stylesheet.
+ */
+[data-battle-ui-root],
+[data-battle-ui-root] * {
+  font-family: sans-serif !important;
+}

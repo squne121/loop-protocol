@@ -64,6 +64,7 @@
 | `tool_profile` | `"no_tools"`、`"proposal_only"`、`"local_asset_research"`、または `"grounded_research"`。 |
 | `prompt` | 必須。空文字・空白のみは `agy_empty_prompt` で拒否。 |
 | `context_files` | `local_asset_research` 時は必須。repo 境界とシンボリックリンク境界検証後に wrapper が repo-relative JSON evidence envelope を集約し、AGY へ prompt 注入する。 |
+| `evidence_targets` | Issue #1638 の targeted-evidence 契約（任意、`local_asset_research` 専用）。指定時は `context_files` の代わりに使われ、legacy 全文 context path 要件を置き換える。形式は「`evidence_targets` （targeted-evidence 契約）」セクション参照。 |
 | `model` | 指定禁止。`unsupported_provider_option` で拒否。 |
 | `post_to_issue_url` | 指定禁止。`provider_forbids_post_to_issue_url` で拒否。 |
 | `grounded_research` | `agy` ネイティブの WebSearch/WebGrounding（`agy -p` 実行）を使用。 Gemini API `google_search` tool や Google Search grounding API は呼ばない（Gemini provider の `grounded_research` とは別の provider-specific 実装）。 |
@@ -112,7 +113,102 @@ quota exceeded（`RESOURCE_EXHAUSTED` / HTTP 429 / `quota_exhausted` / `Individu
 - `includeTools` / `excludeTools` / pinned ref は manifest と exact/superset 照合し、unknown tool または drift は fail-closed する。
 - `--live-serena` preflight は `.agents/mcp_config.json` の pinned command から SerenaMCP stdio server を起動し、`initialize`、`tools/list`、`find_file`、`search_for_pattern`、`get_symbols_overview` の transcript と evidence count を返す。
 
-AGY prompt に渡す local asset context は、以下を持つ JSON evidence envelope に限定する。
+### `evidence_targets`（targeted-evidence 契約、Issue #1638）
+
+`local_asset_research` + `provider=agy` の request は、legacy な全文 `context_files` の代わりに
+`evidence_targets` を指定できる。`evidence_targets` は repo-relative path と bounded な source
+selector を持つ target のリストであり、consumer 契約で要求された実装行そのものを検証可能な
+provenance 付きで返すために使う。
+
+```json
+"evidence_targets": [
+  {
+    "path": "src/service.py",
+    "selector": {"kind": "line_range", "start_line": 120, "end_line": 148}
+  }
+]
+```
+
+- `path`: repo-relative path。絶対パス、`../` traversal、symlink 越境は fail-close。
+- `selector.kind`: `"line_range"` のみ許可。未知の kind は fail-close（unauthorized selector）。
+- `selector.start_line` / `selector.end_line`: 1-indexed の正整数、`start_line <= end_line`、
+  範囲幅は `TARGETED_EVIDENCE_MAX_LINES_PER_TARGET`（400 行）以下に bound される。
+- target 数の上限は `TARGETED_EVIDENCE_MAX_TARGETS`（8 件）。
+- `evidence_targets` を指定した request は `context_files` を要求しない（`evidence_targets` が
+  canonical になり、legacy context_files 経路とは排他的に扱われる）。
+
+wrapper-side retrieval は各 valid target について、実ファイルから selector の行範囲を直接読み取り、
+以下の provenance を持つ bounded evidence envelope を生成する。
+
+- `repo_relative_path`: repo root からの相対パス。
+- `selector`: request の selector（`kind` / `start_line` / `end_line`）をそのまま反映。
+- `line_range`: `[start_line, end_line]`。
+- `content`: 実際のソーステキスト（selector で指定された行そのもの）。metadata だけの envelope
+  は成功として扱わない。
+- `sha256`: `content` の hash。
+- `source_kind`: `"wrapper_read_only_targeted_evidence"`（live SerenaMCP retrieval とは別 source_kind
+  として区別する）。
+
+証跡が次のいずれかに該当する target は、AGY subprocess を起動する前に fail-close する
+（`failure_class` は先頭の validation エラーメッセージから導出される）。
+
+- target の行範囲がファイル長を超える（selector が実ファイルに存在しない範囲を指す）。
+- selector 範囲内のテキストが空白のみ（metadata-only / 空 evidence）。
+- 単一 target または合計の evidence byte 数が上限（それぞれ `TARGETED_EVIDENCE_MAX_BYTES_PER_TARGET`
+  200,000 bytes、`TARGETED_EVIDENCE_MAX_TOTAL_BYTES` 600,000 bytes）を超える。
+- target のテキストが credential-like pattern を含む。
+
+AGY prompt (成功時) に注入されるのは、上記 evidence envelope（`repo_relative_path` / `selector` /
+`line_range` / `sha256` / `source_kind` / `content`）だけである。repo 絶対パス、`.agents/mcp_config.json`
+の内容、MCP server 起動設定、direct tool 呼び出し手順、credential-like payload は決して含まれない
+（`- Do not infer or request absolute paths, shell execution, MCP access, ...` の既存 prompt-only
+境界をそのまま継承する）。
+
+### fan-out task-linked Serena evidence hash chain（Issue #1706 の相関ハッシュ連鎖）
+
+`fan_out_orchestrator.run_fanout()` が生成する子 subtask request（`parent_run_id` /
+`subtask_id` / `attempt_id` を持つ request）に対しては、上記 `evidence_targets` 契約の上に
+task-linked hash chain と相関情報を追加する。この経路は `parent_run_id` / `subtask_id` /
+`attempt_id` のいずれかが request に含まれる場合にのみ有効になり、単発（非 fan-out）の
+`evidence_targets` request（#1638 の既存契約）には一切影響しない。
+
+Serena の呼び出し対象（`find_file` / `search_for_pattern` / `get_symbols_overview` の引数）は、
+固定 smoke query（検索語 `"local_asset_research"` 固定）ではなく、`evidence_targets` の
+repo-relative path と実際に選択された evidence テキストから決定論的に導出される
+（`search_for_pattern` の `substring_pattern` は選択範囲の先頭の非空行）。
+
+hash chain は以下を含み、それぞれ決定論的に導出される（同一入力は常に同一 hash）。
+
+- `objective_sha256`: request の `objective` の hash。
+- `target_contract_sha256`: `evidence_targets` から導出した repo-relative path + selector の
+  contract の hash。
+- `request_sha256`: request 全体の hash。
+- `evidence_sha256`: task-linked Serena evidence record 集合（tool 呼び出し・selector・
+  content hash・provenance を含む）の canonical JSON hash。evidence を 1 byte でも改変すると
+  変化する（改ざん検出）。
+- `prompt_envelope_sha256`: `evidence_sha256` / `objective_sha256` / `target_contract_sha256` /
+  `tool_profile` から決定論的に導出され、AGY へ渡す prompt envelope 本文にも同じ値が
+  literal に含まれる。
+- `result_binding_sha256`: `evidence_sha256` + `prompt_envelope_sha256` から決定論的に導出され、
+  child result（fan-out orchestrator が返す subtask result の `result.local_asset_retrieval_metadata`）
+  に格納される。`run_gemini_headless.verify_serena_hash_chain()` で独立に再計算し、改ざん時は
+  `False` を返す。
+
+上記 5 つの hash はすべて `result.local_asset_retrieval_metadata` に格納され、加えて以下も
+格納される: `actor` / `retrieval_actor`（固定値 `"wrapper_serena_mcp"`）、`analysis_actor`
+（固定値 `"antigravity_cli"`）、`agy_direct_mcp_access`（固定値 `false`）、`parent_run_id` /
+`subtask_id` / `attempt_id`（request からそのまま転記）、`serena_pinned_ref` /
+`serena_manifest_id`（checked-in `serena-tool-manifest.json` の pin）、`serena_evidence_records`
+（各 record に `tool_name` / `args_sha256` / `is_error` / repo-relative provenance を含む）。
+
+evidence が subtask の `objective` と決定論的に無関係（objective のいかなるトークンも evidence の
+path/content に出現しない）と判定された場合、AGY 起動前に `ok: false` で fail-close する。
+「AGY が Serena に直接アクセスした」という記述は行わない。Serena MCP へのアクセスは常に
+wrapper プロセス（`retrieval_actor: wrapper_serena_mcp`）が行い、AGY（`analysis_actor:
+antigravity_cli`）は redaction 済みの prompt envelope だけを受け取る
+（`agy_direct_mcp_access: false`）。
+
+AGY prompt に渡す legacy local asset context は、以下を持つ JSON evidence envelope に限定する。
 
 - `tool_name`: wrapper 側が実行した Serena read-only tool 名。
 - `query`: 取得対象を示す query または selector。
@@ -185,6 +281,8 @@ wrapper は **isolated temp cwd**（`tempfile.mkdtemp()` で生成されたデ�
 - `objective` is only vague verbs or filler words
   - Exception: objectives containing paths, filenames, or line numbers are accepted regardless of language（言語問わず、パス・ファイル名・行番号を含む objective は受理される）
 - `context_files` is missing, empty, or any referenced file is absent
+- `evidence_targets`（`local_asset_research` かつ指定時）は非 list、空、上限超過件数、非オブジェクトの target、非文字列/空/絶対パスの `path`、未許可の `selector.kind`、不正な `start_line`/`end_line`、上限を超える行範囲、repo 外に解決される path、symlink 越境のいずれかで即時 reject する
+- `evidence_targets`（`local_asset_research` かつ指定時）で選択された target の証跡が欠落・空・ファイル長超過・上限超過・credential-like のいずれかである場合、AGY subprocess を起動せず fail-close する
 - `instructions` has fewer than 2 entries
 - `output_sections` is empty
 - `tool_profile` is not explicit
@@ -240,6 +338,47 @@ request の `provider` が `"auto"` の場合のみ、`run_gemini_headless.py` �
 
 `provider="auto"` の `eligible_profiles` は `no_tools` / `proposal_only` のみで、それ以外の `tool_profile` を指定した場合は
 provider 試行自体を行わず `provider_profile_unsupported`（`fallback_reason: "stop_if:provider_profile_unsupported"`）で即時 fail-closed する。
+
+### `provider=agy` 関連フィールド（条件付き）
+
+`provider` が `"agy"` の場合のみ、`_normalize_agy_result()`（`run_gemini_headless.py`）が
+以下の 2 フィールドを `delegation_result/v1` へ追加する（Issue #1752）。`provider="gemini"`
+の場合はこれらのフィールドは付与されない。
+
+| フィールド | 型 | 必須条件 | 説明 |
+|----------|--|---------|------|
+| `agy_provenance_hook_events` | array&#91;object&#93; | `provider="agy"` の場合は常に存在 | `_run_agy()` が isolated workspace 削除前にメモリへ読み込んだ `agy_tool_provenance_v1` PreToolUse hook event の list（`agy_tool_provenance.load_hook_events()` の戻り値をそのまま転記）。hook イベントが 1 件も記録されなかった場合、または `completed`（`_run_agy` を経由しない直接呼び出し・モックテスト互換）に本属性が存在しない場合は `[]` |
+| `agy_provenance_hook_load_error` | string &#124; null | `provider="agy"` の場合は常に存在 | hook event log の読み込みに失敗した場合の fail-closed エラーメッセージ（`agy_tool_provenance.ProvenanceParseError` 由来）。エラーがない場合、または `completed` に本属性が存在しない場合は `null` |
+
+これにより `run_delegation()` の呼び出し元（`build_fanout_evidence_bundle.py` の
+`--hook-events-file` 等）が、`_run_agy()` が既に削除済みの isolated workspace の
+`_provenance/hook_events.jsonl` を再読み込みすることなく、`delegation_result/v1` の
+返り値だけから hook events bundle を組み立てられる。`exit_code != 0` 分岐・stdout 空
+分岐でも同じ 2 フィールドが含まれる（fail-closed 診断のため、失敗時も hook 証跡を
+捨てない）。
+
+### fan-out 相関 ID フィールド（条件付き、Issue #1753）
+
+`run_delegation()` / `_run_delegation_core()` が返す `delegation_result/v1` トップレベルには、
+provider（`gemini` / `agy` / `auto`）・transport（`headless_json` / `acp`）を問わず、常に以下の
+3 フィールドが含まれる（この 3 フィールドの追加は既存フィールドの集合・値に影響しない）。
+
+| フィールド | 型 | 必須条件 | 説明 |
+|----------|--|---------|------|
+| `parent_run_id` | string &#124; null | 常に存在 | `fan_out_orchestrator.run_fanout()` が fan-out 実行全体に付与した run id。fan-out 相関済み request（`_is_fanout_correlated_request()` が true を返す request）ではリクエストと同じ値がそのまま転記される。単体 delegation 呼び出し（fan-out 以外）では `null` |
+| `subtask_id` | string &#124; null | 常に存在 | fan-out 内の当該 subtask を一意に識別する id。単体 delegation 呼び出しでは `null` |
+| `attempt_id` | string &#124; null | 常に存在 | 同一 subtask 内の再試行を識別する id。単体 delegation 呼び出しでは `null` |
+
+値は request の `parent_run_id` / `subtask_id` / `attempt_id`（`fan_out_orchestrator.run_fanout()`
+が各 subtask request にスタンプする値）をそのまま読み取ったもので、この関数群は値を生成・変換しない
+（read-through）。`tool_profile=local_asset_research` の fan-out 相関済み request では、既存の
+`local_asset_retrieval_metadata`（Issue #1706）内にも同じ値のネストしたコピーが含まれるが、この
+トップレベル 3 フィールドはそれとは独立して常に存在する。
+
+`validate_agy_fanout_e2e_evidence.py` の predicate_19（`run_ids_consistent_across_all_artifacts`）は、
+`build_fanout_evidence_bundle.py` が組み立てる bundle 内の各 child の `result.parent_run_id` /
+`result.subtask_id` / `result.attempt_id`（＝この節のフィールド）を `request.*` の対応値および
+`fanout_request.parent_run_id` と突き合わせて相関の一貫性を検証する。
 
 ### `result_surface` の形
 
@@ -1202,3 +1341,75 @@ uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/fan_out_orc
   --audit-log delegation_audit.jsonl
 ```
 
+
+## `agy_tool_provenance_v1` のスキーマ統治方針（Issue #1708 対応、Schema Governance）
+
+AGY fan-out 実行時の WebSearch/`read_url_content` 成功判定の正本は、AGY stdout
+自己申告（`tool_calls` JSON や `AGY_WEBSEARCH:` 等の marker line）ではなく、AGY
+`PreToolUse` lifecycle hook（`.agents/hooks.json`、公式仕様は installed Antigravity
+CLI 同梱の `builtin/skills/agy-customizations/docs/hooks.md` を参照）から採取する
+`agy_tool_provenance_v1` イベントである。実装は
+`.claude/skills/gemini-cli-headless-delegation/scripts/agy_tool_provenance.py`。
+
+### Schema 定義
+
+`schema: "agy_tool_provenance_v1"`, `version: 1`。必須フィールド:
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `schema` / `version` | string / int | 固定値。 |
+| `event` | string | `"PreToolUse"`。 |
+| `toolCall.name` | string | canonical web tool 名のみ許可（下記）。 |
+| `toolCall.args_sha256` | string(hex64) | raw args ではなく canonicalized args の sha256。 |
+| `stepIdx` | int | AGY native `PreToolUse` payload 由来。 |
+| `conversationId` | string | AGY native `PreToolUse` payload 由来。 |
+| `transcript_path_ref` | string | `transcriptPath` の public-safe identifier（`sha256:` prefix）。raw absolute path は含めない。 |
+| `transcript_sha256` | string(hex64) | orchestrator 側で計算する transcript hash。 |
+| `parent_run_id` / `subtask_id` / `attempt_id` | string | fan-out run binding。 |
+| `provider` | string | `"agy"` 固定。 |
+| `tool_profile` | string | `no_tools` / `local_asset_research` / `grounded_research` 等。 |
+| `monotonic_ns` | int | `time.monotonic_ns()`。 |
+| `utc` | string(ISO8601) | UTC タイムスタンプ。 |
+
+Canonical web tool 名: `search_web`, `read_url_content`（installed Antigravity CLI
+1.1.5 の `PreToolUse` transcript サンプル `~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl`
+で `toolCall.name == "search_web"` を実 readback 済み）。旧実装（#1266）が誤認識して
+いた `web_search` / `websearch` / `browser_navigate` / `browser` / `url_read` /
+`read_url` / `fetch_url` / `fetch` は canonical name ではなく、fail-closed
+（`unknown_tool_provenance` / `unknown_tool_provenance:legacy_alias`）で拒否する。
+
+### 利用者一覧（Consumer Inventory）
+
+- `agy_tool_provenance.py`: schema の producer（`build_provenance_event()` /
+  generated hook wrapper script）であり、かつ唯一の validator/evaluator
+  （`validate_provenance_event()`, `evaluate_websearch_provenance()`）。
+- `tests/test_agy_tool_provenance.py`, `tests/test_agy_provenance_schema_governance.py`:
+  closed-schema tests（下記参照）。
+- `run_gemini_headless.py` `_run_agy()`: workspace-scoped hook config
+  （`.agents/hooks.json` + wrapper script）を AGY 実行ごとの isolated temp cwd に
+  動的生成する producer 側 integration point。
+- 他の既存 schema（`delegation_result/v1`, `delegation_audit_v1`,
+  `fanout_result/v1` 等）の consumer は `agy_tool_provenance_v1` を直接消費しない
+  （2026-07-25 時点で `rg -l "agy_tool_provenance_v1"` の hit は本 schema の
+  producer/validator/tests のみ）。
+
+### Compatibility Decision（互換性方針）
+
+- `agy_tool_provenance_v1` は既存の `delegation_audit_v1` とは**別 schema**であり、
+  既存 schema のフィールド集合・意味論を変更しない（additive, non-breaking）。
+- `agy_tool_provenance_v1` イベントを `delegation_audit_v1` へどう取り込むか
+  （embed するか、別 artifact として並置するか）は本 Issue の Out of Scope。
+  取り込みが必要になった場合は互換性判断（新フィールド追加 = minor, 既存フィールド
+  変更 = 新 schema version）を別 Issue で行う。
+- 本 schema の必須フィールド集合はここに記載した 15 フィールドで固定（closed
+  schema）。フィールド追加は許可されるが、削除・型変更は breaking change として
+  `version` を上げる。
+
+### Closed-Schema Tests（正本テスト）
+
+- `.claude/skills/gemini-cli-headless-delegation/tests/test_agy_tool_provenance.py`
+- `.claude/skills/gemini-cli-headless-delegation/tests/test_agy_provenance_schema_governance.py`
+
+両ファイルとも hermetic（fixture 済み hook event・モック AGY 実行のみ、live AGY
+バイナリ起動なし）。schema のフィールド集合を変更する場合は、上記 2 ファイルの
+`REQUIRED_TOP_FIELDS` / `REQUIRED_TOOL_CALL_FIELDS` 網羅テストを更新すること。

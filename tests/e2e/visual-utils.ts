@@ -99,9 +99,44 @@ export const VISUAL_BASELINE_REGISTRY_IDS = [
   'running-hud-paused',
   'result-overlay-timeout',
   'final-no-command-rail',
+  // Issue #1386 / PR #1721 review fix, P1 Blocker 2: a distinct id for this
+  // spec's `[data-battle-ui-root]` full-overlay capture. Deliberately NOT
+  // `running-hud` — the existing `running-hud` registry row already points
+  // to `m2-combat-mvp.spec.ts`'s single `[data-field="sortie-status"]` field
+  // baseline (118x66px, `maxDiffPixelRatio: 0.08` in that spec). Reusing the
+  // same id for two unrelated baselines (different test file, different
+  // capture root, different tolerance) would make the registry ambiguous.
+  'running-hud-overlay-legacy-current',
 ] as const
 
 export type VisualBaselineRegistryId = (typeof VISUAL_BASELINE_REGISTRY_IDS)[number]
+
+/**
+ * `maturity` column of `docs/dev/visual-baseline-registry.md`, mirrored here
+ * (Issue #1386 PR #1721 review fix, P1 Blocker 2) so `expectDomOverlayScreenshot()`
+ * can fail closed if a caller passes a `registryId` whose registry row is
+ * `pending-baseline` (no committed PNG/test per the registry contract) —
+ * without parsing the Markdown table at test time. Keep in sync with the
+ * registry table by hand; a mismatch here is a docs/test drift bug, not a
+ * runtime concern this module can fully own. `defeat-overlay` / `hp-label`
+ * are `predicate-only` in the registry (not screenshot baselines), so they
+ * are intentionally excluded from this screenshot-tolerant maturity union —
+ * `expectDomOverlayScreenshot()` / `expectCanvasVisualCueScreenshot()` never
+ * accept them as a screenshot `registryId` target.
+ */
+export const VISUAL_BASELINE_REGISTRY_MATURITY: Readonly<
+  Record<
+    Exclude<VisualBaselineRegistryId, 'defeat-overlay' | 'hp-label'>,
+    'frozen' | 'provisional' | 'legacy-current' | 'pending-baseline'
+  >
+> = {
+  'timeout-overlay': 'frozen',
+  'running-hud': 'legacy-current',
+  'running-hud-paused': 'pending-baseline',
+  'result-overlay-timeout': 'pending-baseline',
+  'final-no-command-rail': 'pending-baseline',
+  'running-hud-overlay-legacy-current': 'legacy-current',
+}
 
 // ---------------------------------------------------------------------------
 // Scenario installation (AC3, AC4)
@@ -208,7 +243,20 @@ export async function assertAllowedVisualTarget(locator: Locator): Promise<void>
 // ---------------------------------------------------------------------------
 
 export interface DomOverlayScreenshotOptions {
+  /**
+   * `toHaveScreenshot()` absolute pixel-count tolerance. Mutually exclusive
+   * with `maxDiffPixelRatio` (Playwright accepts only one). Prefer this over
+   * `maxDiffPixelRatio` when the capture root includes a large masked
+   * region (e.g. a `canvas` mask): `maxDiffPixelRatio` is computed against
+   * the TOTAL pixel count including masked pixels, so a comparator budgeted
+   * as a ratio of the full image silently allows a much larger absolute
+   * pixel count to differ in the small non-masked (actually-compared)
+   * region than the ratio number suggests (Issue #1386 PR #1721 review fix,
+   * P1 Blocker 1).
+   */
   maxDiffPixels?: number
+  /** `toHaveScreenshot()` `maxDiffPixelRatio` (fraction of TOTAL pixels, mask included). */
+  maxDiffPixelRatio?: number
 }
 
 /**
@@ -228,11 +276,28 @@ export interface DomOverlayScreenshotOptions {
  * Matrix): this helper refuses to capture a baseline for a scenario whose
  * implementation surface has not merged, so the current pre-overlay UI is
  * never accidentally frozen as the expected baseline.
+ *
+ * `registryId` (Issue #1386 PR #1721 review fix, P1 Blocker 2) is required
+ * and must name an ACTIVE (non-`pending-baseline`) row in
+ * `VISUAL_BASELINE_REGISTRY_MATURITY` / `docs/dev/visual-baseline-registry.md`
+ * — an ad hoc string can no longer authorize a DOM overlay baseline capture,
+ * mirroring `expectCanvasVisualCueScreenshot()`'s existing `registryId`
+ * contract.
+ *
+ * `options` no longer defaults `maxDiffPixelRatio` to a shared 0.02 value
+ * (Issue #1386 PR #1721 review fix, P1 Blocker 1): the previous shared
+ * default was computed against the FULL capture (including the large
+ * `canvas` mask this helper always applies), so it silently tolerated a
+ * much larger fraction of the actually-compared non-masked pixels than
+ * 0.02 suggests, and was loose enough to pass through a real text-reflow
+ * layout regression. Every call site must now pass an explicit
+ * `maxDiffPixels` or `maxDiffPixelRatio`; this throws if neither is given.
  */
 export async function expectDomOverlayScreenshot(
   locator: Locator,
   name: string,
-  options: DomOverlayScreenshotOptions = {},
+  registryId: VisualBaselineRegistryId,
+  options: DomOverlayScreenshotOptions,
 ): Promise<void> {
   const page = locator.page()
   const installed = installedScenarios.get(page)
@@ -249,12 +314,38 @@ export async function expectDomOverlayScreenshot(
         'baseline for a surface whose implementation child issue has not merged.',
     )
   }
+  if (!(registryId in VISUAL_BASELINE_REGISTRY_MATURITY)) {
+    throw new Error(
+      `expectDomOverlayScreenshot(): registryId "${String(registryId)}" has no maturity entry in ` +
+        'VISUAL_BASELINE_REGISTRY_MATURITY / docs/dev/visual-baseline-registry.md.',
+    )
+  }
+  const maturity = (VISUAL_BASELINE_REGISTRY_MATURITY as Record<string, string>)[registryId]
+  if (maturity === 'pending-baseline') {
+    throw new Error(
+      `expectDomOverlayScreenshot(): registryId "${registryId}" is pending-baseline in ` +
+        'docs/dev/visual-baseline-registry.md (no committed PNG/test per the registry contract) — ' +
+        'it must not be captured yet.',
+    )
+  }
+  if (options.maxDiffPixels === undefined && options.maxDiffPixelRatio === undefined) {
+    throw new Error(
+      'expectDomOverlayScreenshot(): an explicit maxDiffPixels or maxDiffPixelRatio is required ' +
+        '(no shared default — Issue #1386 PR #1721 review fix, P1 Blocker 1). Measure the tolerance ' +
+        'against this capture root empirically rather than reusing another registry entry\'s value.',
+    )
+  }
 
   await assertAllowedVisualTarget(locator)
 
+  const diffToleranceOption =
+    options.maxDiffPixels !== undefined
+      ? { maxDiffPixels: options.maxDiffPixels }
+      : { maxDiffPixelRatio: options.maxDiffPixelRatio }
+
   await expect(locator).toHaveScreenshot(name, {
     animations: 'disabled',
-    maxDiffPixels: options.maxDiffPixels ?? 1,
+    ...diffToleranceOption,
     stylePath: VISUAL_FREEZE_CSS_PATH,
     // BLOCKER 4 (Issue #1385 review): mask every canvas so a transparent
     // DOM overlay (e.g. `.battle-ui-layer`, `position: absolute; inset: 0`)

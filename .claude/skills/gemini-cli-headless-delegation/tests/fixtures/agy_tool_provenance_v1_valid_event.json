@@ -1,0 +1,20 @@
+{
+  "schema": "agy_tool_provenance_v1",
+  "version": 1,
+  "event": "PreToolUse",
+  "toolCall": {
+    "name": "search_web",
+    "args_sha256": "0000000000000000000000000000000000000000000000000000000000aa"
+  },
+  "stepIdx": 3,
+  "conversationId": "conv-fixture-123",
+  "transcript_path_ref": "sha256:1111111111111111111111111111111111111111111111111111111111bb",
+  "transcript_sha256": "2222222222222222222222222222222222222222222222222222222222cc",
+  "parent_run_id": "run-fixture-abc",
+  "subtask_id": "subtask-fixture-1",
+  "attempt_id": "attempt-fixture-1",
+  "provider": "agy",
+  "tool_profile": "grounded_research",
+  "monotonic_ns": 123456789,
+  "utc": "2026-07-25T00:00:00.000000Z"
+}

@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.local/schemas/ci_test_performance_assessment_v2_validation_result_v1.schema.json",
+  "title": "CI Test Performance Assessment V2 Validation Result V1",
+  "description": "Output-only contract produced by .claude/skills/ci-test-performance/scripts/validate_ci_performance_assessment_v2.py. Never authored by producers of CI_TEST_PERFORMANCE_ASSESSMENT_V2 (see schemas/ci_test_performance_assessment_v2.schema.json). Distinguishes structural_valid / semantic_valid (assessment validity) from approval_eligible (reviewer-gate eligibility) as separate axes. When exit_code == 3 (operational failure: unreadable file, jsonschema not installed, or strict-JSON parse failure), only operational_error is populated and structural_valid/semantic_valid/approval_eligible/errors/blockers/warnings are absent; otherwise (exit_code 0 or 2) those fields are always present and operational_error is absent.",
+  "type": "object",
+  "unevaluatedProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "assessment_path",
+    "exit_code"
+  ],
+  "properties": {
+    "schema": {
+      "const": "CI_TEST_PERFORMANCE_ASSESSMENT_V2_VALIDATION_RESULT"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "assessment_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "exit_code": {
+      "type": "integer",
+      "enum": [0, 2, 3]
+    },
+    "operational_error": {
+      "type": "string",
+      "minLength": 1
+    },
+    "structural_valid": {
+      "type": "boolean"
+    },
+    "semantic_valid": {
+      "type": "boolean"
+    },
+    "approval_eligible": {
+      "type": "boolean"
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "exit_code": {
+            "const": 3
+          }
+        },
+        "required": ["exit_code"]
+      },
+      "then": {
+        "required": ["operational_error"],
+        "not": {
+          "anyOf": [
+            {"required": ["structural_valid"]},
+            {"required": ["semantic_valid"]},
+            {"required": ["approval_eligible"]},
+            {"required": ["errors"]},
+            {"required": ["blockers"]},
+            {"required": ["warnings"]}
+          ]
+        }
+      },
+      "else": {
+        "required": [
+          "structural_valid",
+          "semantic_valid",
+          "approval_eligible",
+          "errors",
+          "blockers",
+          "warnings"
+        ],
+        "not": {
+          "required": ["operational_error"]
+        }
+      }
+    }
+  ]
+}

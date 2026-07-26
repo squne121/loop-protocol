@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,23 @@ try:
     _YAML_AVAILABLE = True
 except ImportError:
     _YAML_AVAILABLE = False
+
+# Issue #1705 / #1714: AGY profile-scoped isolated permission policy and
+# WebSearch provenance modules. Loaded by path (not package-relative import)
+# so this module keeps working both when executed as a script and when tests
+# load it via importlib.util.spec_from_file_location() with a synthetic
+# module name.
+_AGY_PERMISSION_POLICY_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_AGY_PERMISSION_POLICY_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGY_PERMISSION_POLICY_SCRIPTS_DIR))
+import agy_permission_policy as _agy_permission_policy  # noqa: E402
+
+try:
+    import agy_tool_provenance as _agy_provenance
+    _AGY_PROVENANCE_AVAILABLE = True
+except ImportError:  # pragma: no cover - script always ships alongside this module
+    _agy_provenance = None  # type: ignore[assignment]
+    _AGY_PROVENANCE_AVAILABLE = False
 
 DEFAULT_MODEL = "gemini-3-flash-preview"
 DEFAULT_TIMEOUT_SEC = 600
@@ -372,10 +390,43 @@ LOCAL_ASSET_RESEARCH_PROFILE = "local_asset_research"
 GROUNDED_RESEARCH_PROFILE = "grounded_research"
 PROPOSAL_ONLY_PROFILE = "proposal_only"
 GITHUB_RESEARCH_PROFILE = "github_research"
+
+# Issue #1749: `agy -p` headless print mode's default model (Gemini 3.x) does
+# not reliably invoke the declared `search_web` / `read_url_content` tools --
+# it narrates a plausible-looking "I searched..." answer instead of emitting a
+# real tool call (hallucination), even with `--dangerously-skip-permissions`.
+# Live investigation (see
+# `.claude/skills/gemini-cli-headless-delegation/references/agy-headless-tool-use-investigation.md`)
+# found that passing `--model claude-sonnet-4-6` makes `agy -p` reliably call
+# the declared tools in headless print mode, producing verifiable
+# (non-hallucinated) grounded output with real
+# `vertexaisearch.cloud.google.com/grounding-api-redirect/...` citation URLs.
+# This constant is only applied to the `grounded_research` tool_profile's
+# `agy -p` invocation; it does not change any other profile's model routing.
+AGY_GROUNDED_RESEARCH_MODEL = "claude-sonnet-4-6"
 SERENA_TOOL_CONTRACT_UNKNOWN_POLICY = "exact_match"
 LOCAL_ASSET_MAX_CONTEXT_FILES = 32
 LOCAL_ASSET_MAX_CONTEXT_BYTES = 200_000
 LOCAL_ASSET_MAX_CONTEXT_TOTAL_BYTES = 600_000
+
+# Issue #1638: AGY local_asset_research targeted source-evidence contract bounds.
+TARGETED_EVIDENCE_MAX_TARGETS = 8
+TARGETED_EVIDENCE_MAX_LINES_PER_TARGET = 400
+TARGETED_EVIDENCE_MAX_BYTES_PER_TARGET = 200_000
+TARGETED_EVIDENCE_MAX_TOTAL_BYTES = 600_000
+TARGETED_EVIDENCE_ALLOWED_SELECTOR_KINDS = frozenset({"line_range"})
+
+# Issue #1706: fan-out local_asset_research Serena evidence hash chain /
+# actor vocabulary. `wrapper_serena_mcp` is the retrieval actor (the
+# read-only Serena evidence collector living in this wrapper process);
+# `antigravity_cli` is the analysis actor (the AGY subprocess that only ever
+# receives a redacted prompt envelope, never direct Serena/MCP access).
+RETRIEVAL_ACTOR_WRAPPER_SERENA_MCP = "wrapper_serena_mcp"
+ANALYSIS_ACTOR_ANTIGRAVITY_CLI = "antigravity_cli"
+AGY_DIRECT_MCP_ACCESS = False
+# Minimum length for an objective token to count toward the deterministic
+# objective/evidence relevance check (Issue #1706 AC8).
+_OBJECTIVE_RELEVANCE_MIN_TOKEN_LEN = 4
 SERENA_TOOL_MANIFEST_RELATIVE_PATH = Path(
     ".claude/skills/gemini-cli-headless-delegation/references/serena-tool-manifest.json"
 )
@@ -1126,7 +1177,15 @@ def validate_request(request: Mapping[str, Any], request_path: Path | None = Non
     errors.extend(_validate_string_list("output_sections", request.get("output_sections"), 1))
     if tool_profile == PROPOSAL_ONLY_PROFILE:
         errors.extend(_validate_proposal_only_output_sections(request.get("output_sections")))
-    errors.extend(_validate_string_list("context_files", request.get("context_files"), 1))
+    # Issue #1638: targeted-evidence contract (evidence_targets) replaces the
+    # legacy context_files requirement for local_asset_research requests that
+    # declare it; context_files stays required for every other case.
+    uses_targeted_evidence = (
+        tool_profile == LOCAL_ASSET_RESEARCH_PROFILE
+        and isinstance(request.get("evidence_targets"), list)
+    )
+    if not uses_targeted_evidence:
+        errors.extend(_validate_string_list("context_files", request.get("context_files"), 1))
 
     timeout_sec = request.get("timeout_sec", DEFAULT_TIMEOUT_SEC)
     if not isinstance(timeout_sec, int) or timeout_sec <= 0:
@@ -1136,7 +1195,7 @@ def validate_request(request: Mapping[str, Any], request_path: Path | None = Non
     if not isinstance(model, str) or not model.strip():
         errors.append("model must be a non-empty string when present")
 
-    if isinstance(request.get("context_files"), list):
+    if isinstance(request.get("context_files"), list) and not uses_targeted_evidence:
         base_dir = request_path.parent if request_path is not None else Path.cwd()
         repo_root = _repo_root().resolve() if tool_profile == LOCAL_ASSET_RESEARCH_PROFILE else None
         for raw_path in request["context_files"]:
@@ -1240,6 +1299,449 @@ def _validate_local_asset_context_files(
             else:
                 resolved_paths.append(resolved)
     return errors, resolved_paths
+
+
+def _validate_evidence_target_selector(selector: Any) -> list[str]:
+    """Validate a single evidence_targets[].selector (Issue #1638).
+
+    Only ``line_range`` is a supported selector kind; anything else fails
+    closed so an unbounded or unrepresentable selector never reaches AGY.
+    """
+    errors: list[str] = []
+    if not isinstance(selector, Mapping):
+        return ["selector must be an object"]
+    kind = selector.get("kind")
+    if kind not in TARGETED_EVIDENCE_ALLOWED_SELECTOR_KINDS:
+        return [
+            "selector.kind must be one of "
+            f"{sorted(TARGETED_EVIDENCE_ALLOWED_SELECTOR_KINDS)}; got {_truncate_repr(kind)}"
+        ]
+    start_line = selector.get("start_line")
+    end_line = selector.get("end_line")
+    if not isinstance(start_line, int) or isinstance(start_line, bool) or start_line < 1:
+        errors.append("selector.start_line must be a positive integer")
+    if not isinstance(end_line, int) or isinstance(end_line, bool) or end_line < 1:
+        errors.append("selector.end_line must be a positive integer")
+    if errors:
+        return errors
+    if end_line < start_line:
+        return ["selector.end_line must be >= selector.start_line"]
+    if (end_line - start_line + 1) > TARGETED_EVIDENCE_MAX_LINES_PER_TARGET:
+        errors.append(
+            f"selector line range must not exceed {TARGETED_EVIDENCE_MAX_LINES_PER_TARGET} lines"
+        )
+    return errors
+
+
+def _validate_evidence_targets(
+    evidence_targets: Any,
+    request_path: Path | None,
+    repo_root: Path,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Validate AGY local_asset_research targeted-evidence contract targets (Issue #1638).
+
+    Fail-closes on: non-list/empty/oversized target lists, non-object targets,
+    non-repo-relative or symlink-crossing paths, path traversal outside the
+    repository, missing/non-file targets, and unsafe or unbounded selectors.
+    """
+    errors: list[str] = []
+    validated: list[dict[str, Any]] = []
+    if not isinstance(evidence_targets, list):
+        return ["evidence_targets must be a list"], validated
+    if len(evidence_targets) == 0:
+        return ["evidence_targets requires at least one target"], validated
+    if len(evidence_targets) > TARGETED_EVIDENCE_MAX_TARGETS:
+        return (
+            [
+                f"evidence_targets must not exceed {TARGETED_EVIDENCE_MAX_TARGETS} targets; "
+                f"got {len(evidence_targets)}"
+            ],
+            validated,
+        )
+
+    base_dir = request_path.parent if request_path is not None else Path.cwd()
+    for index, target in enumerate(evidence_targets):
+        if not isinstance(target, Mapping):
+            errors.append(f"evidence_targets[{index}] must be an object")
+            continue
+        raw_path = target.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            errors.append(f"evidence_targets[{index}].path must be a non-empty string")
+            continue
+        if Path(raw_path).is_absolute():
+            errors.append(
+                f"evidence_targets[{index}].path must be repo-relative, not absolute: "
+                f"{_truncate_repr(raw_path)}"
+            )
+            continue
+        selector = target.get("selector")
+        selector_errors = _validate_evidence_target_selector(selector)
+        if selector_errors:
+            errors.extend(f"evidence_targets[{index}].{msg}" for msg in selector_errors)
+            continue
+        candidate = _resolve_context_file(raw_path, base_dir)
+        symlink_violation = False
+        for ancestor in [candidate] + list(candidate.parents):
+            if ancestor.is_symlink():
+                errors.append(
+                    f"evidence_targets[{index}].path must not include symlink paths: "
+                    f"{_truncate_repr(raw_path)}"
+                )
+                symlink_violation = True
+                break
+        if symlink_violation:
+            continue
+        resolved = candidate.resolve()
+        if not _is_relative_to(resolved, repo_root):
+            errors.append(
+                f"evidence_targets[{index}].path must be inside repository: "
+                f"{_truncate_repr(raw_path)} -> {_truncate_repr(str(resolved))}"
+            )
+            continue
+        if not candidate.exists():
+            errors.append(f"evidence_targets[{index}] missing target file: {_truncate_repr(raw_path)}")
+            continue
+        if not candidate.is_file():
+            errors.append(f"evidence_targets[{index}] target is not a file: {_truncate_repr(raw_path)}")
+            continue
+        validated.append({
+            "index": index,
+            "raw_path": raw_path,
+            "resolved_path": resolved,
+            "repo_relative_path": resolved.relative_to(repo_root).as_posix(),
+            "selector": {
+                "kind": selector["kind"],
+                "start_line": int(selector["start_line"]),
+                "end_line": int(selector["end_line"]),
+            },
+        })
+    return errors, validated
+
+
+def _collect_targeted_source_evidence(
+    validated_targets: list[dict[str, Any]],
+    repo_root: Path,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Build bounded targeted source-evidence envelopes (Issue #1638 AC2).
+
+    Fails closed (returns errors, no envelope) on a target that cannot produce
+    real source text -- out-of-range selector, empty content, oversized
+    payload, or credential-like content -- instead of ever emitting a
+    metadata-only envelope as a success (Issue #1638 AC3).
+    """
+    envelopes: list[dict[str, Any]] = []
+    errors: list[str] = []
+    total_bytes = 0
+    for target in validated_targets:
+        path = target["resolved_path"]
+        repo_relative_path = target["repo_relative_path"]
+        selector = target["selector"]
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            errors.append(f"targeted-evidence cannot read {repo_relative_path}: {exc}")
+            continue
+        source_lines = text.splitlines()
+        start_line = selector["start_line"]
+        end_line = selector["end_line"]
+        if end_line > len(source_lines):
+            errors.append(
+                "targeted-evidence target unmet (selector exceeds file length): "
+                f"{repo_relative_path} requested end_line={end_line} file_lines={len(source_lines)}"
+            )
+            continue
+        selected_text = "\n".join(source_lines[start_line - 1:end_line])
+        if not selected_text.strip():
+            errors.append(f"targeted-evidence target unmet (empty evidence): {repo_relative_path}")
+            continue
+        encoded = selected_text.encode("utf-8")
+        if len(encoded) > TARGETED_EVIDENCE_MAX_BYTES_PER_TARGET:
+            errors.append(f"targeted-evidence target evidence too large: {repo_relative_path}")
+            continue
+        total_bytes += len(encoded)
+        if total_bytes > TARGETED_EVIDENCE_MAX_TOTAL_BYTES:
+            errors.append(
+                f"targeted-evidence total evidence payload exceeds {TARGETED_EVIDENCE_MAX_TOTAL_BYTES} bytes"
+            )
+            continue
+        if _contains_credential(selected_text):
+            errors.append(
+                "targeted-evidence target evidence appears to contain credential-like material: "
+                f"{repo_relative_path}"
+            )
+            continue
+        envelopes.append({
+            "repo_relative_path": repo_relative_path,
+            "selector": selector,
+            "line_range": [start_line, end_line],
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "source_kind": "wrapper_read_only_targeted_evidence",
+            "content": selected_text,
+        })
+    return envelopes, errors
+
+
+def _hash_objective(objective: Any) -> str | None:
+    """Hash the request's objective string (Issue #1706 AC2).
+
+    Returns ``None`` when the objective is missing/blank so callers can
+    distinguish "no objective supplied" from a deterministic hash of an
+    actual objective.
+    """
+    if not isinstance(objective, str) or not objective.strip():
+        return None
+    return _sha256_stable_json(objective)
+
+
+def _build_target_contract(validated_targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Canonical (order-preserving) target contract used for hashing (Issue
+    #1706 AC2): repo-relative path + selector only -- no absolute paths, no
+    file content."""
+    return [
+        {"repo_relative_path": target["repo_relative_path"], "selector": target["selector"]}
+        for target in validated_targets
+    ]
+
+
+def _hash_target_contract(validated_targets: list[dict[str, Any]]) -> str:
+    """Hash the target contract (Issue #1706 AC2): identical target lists
+    always hash identically (deterministic canonical JSON)."""
+    return _sha256_stable_json(_build_target_contract(validated_targets))
+
+
+def _hash_request_for_chain(request: Mapping[str, Any]) -> str:
+    """Hash the full inbound delegation request (Issue #1706 AC6
+    ``request_sha256``)."""
+    return _sha256_stable_json(dict(request))
+
+
+def _args_sha256(arguments: Mapping[str, Any]) -> str:
+    return _sha256_stable_json(dict(arguments))
+
+
+def _derive_serena_selector_calls(
+    validated_targets: list[dict[str, Any]],
+    evidence_envelopes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Derive Serena ``tools/call`` identities from the objective's
+    targeted-evidence contract (Issue #1706 AC1) instead of the legacy fixed
+    smoke-query probe (``find_file`` -> ``search_for_pattern`` hardcoded to
+    the literal ``"local_asset_research"`` -> ``get_symbols_overview``).
+
+    Each validated target contributes a ``find_file`` / ``search_for_pattern``
+    / ``get_symbols_overview`` triple scoped to that target's repo-relative
+    path, with the ``search_for_pattern`` substring derived from the actual
+    selected evidence text (never a fixed literal), so the resulting calls
+    are unique to the subtask's objective-driven selector.
+    """
+    envelope_by_path = {envelope["repo_relative_path"]: envelope for envelope in evidence_envelopes}
+    calls: list[dict[str, Any]] = []
+    for target in validated_targets:
+        repo_relative_path = target["repo_relative_path"]
+        envelope = envelope_by_path.get(repo_relative_path)
+        content = envelope["content"] if envelope is not None else ""
+        first_line = next(
+            (line.strip() for line in content.splitlines() if line.strip()),
+            repo_relative_path,
+        )
+        pattern = first_line[:200]
+        file_name = Path(repo_relative_path).name
+        parent_dir = Path(repo_relative_path).parent.as_posix()
+        calls.append({
+            "tool_name": "find_file",
+            "arguments": {"relative_path": parent_dir, "file_mask": file_name},
+            "repo_relative_path": repo_relative_path,
+        })
+        calls.append({
+            "tool_name": "search_for_pattern",
+            "arguments": {"relative_path": parent_dir, "substring_pattern": pattern},
+            "repo_relative_path": repo_relative_path,
+        })
+        calls.append({
+            "tool_name": "get_symbols_overview",
+            "arguments": {"relative_path": repo_relative_path},
+            "repo_relative_path": repo_relative_path,
+        })
+    return calls
+
+
+def _build_serena_evidence_records(
+    validated_targets: list[dict[str, Any]],
+    evidence_envelopes: list[dict[str, Any]],
+    manifest: Mapping[str, Any],
+    correlation: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Build fully-provenanced task-linked Serena evidence records (Issue
+    #1706 AC6): retrieval actor, fan-out correlation ids, tool identity,
+    ``args_sha256``, ``is_error``, Serena pinned ref/manifest id, and
+    repo-relative provenance -- for tool calls derived from the objective's
+    targeted-evidence contract (never a fixed smoke query).
+    """
+    calls = _derive_serena_selector_calls(validated_targets, evidence_envelopes)
+    envelope_by_path = {envelope["repo_relative_path"]: envelope for envelope in evidence_envelopes}
+    manifest_id = _serena_manifest_id(manifest)
+    records: list[dict[str, Any]] = []
+    for call in calls:
+        envelope = envelope_by_path[call["repo_relative_path"]]
+        records.append({
+            "actor": RETRIEVAL_ACTOR_WRAPPER_SERENA_MCP,
+            "parent_run_id": correlation.get("parent_run_id"),
+            "subtask_id": correlation.get("subtask_id"),
+            "attempt_id": correlation.get("attempt_id"),
+            "tool_name": call["tool_name"],
+            "args_sha256": _args_sha256(call["arguments"]),
+            "is_error": False,
+            "repo_relative_path": call["repo_relative_path"],
+            "selector": envelope["selector"],
+            "line_range": envelope["line_range"],
+            "content_sha256": envelope["sha256"],
+            "source_kind": envelope["source_kind"],
+            "serena_pinned_ref": manifest.get("pinned_ref"),
+            "serena_manifest_id": manifest_id,
+        })
+    return records
+
+
+def _hash_evidence(evidence_records: list[dict[str, Any]]) -> str:
+    """Hash the full ordered evidence-record set as canonical JSON (Issue
+    #1706 AC3): mutating even a single byte of any record's content changes
+    ``evidence_sha256`` (tamper detection)."""
+    return _sha256_stable_json(evidence_records)
+
+
+def _hash_prompt_envelope(
+    evidence_sha256: str,
+    objective_sha256: str | None,
+    target_contract_sha256: str,
+    tool_profile: str,
+) -> str:
+    """Deterministically derive the AGY prompt envelope hash from the
+    evidence hash (Issue #1706 AC4): identical ``evidence_sha256`` (+
+    identical objective/target-contract hashes and tool_profile) always
+    yields the same ``prompt_envelope_sha256``.
+    """
+    return _sha256_stable_json({
+        "evidence_sha256": evidence_sha256,
+        "objective_sha256": objective_sha256,
+        "target_contract_sha256": target_contract_sha256,
+        "tool_profile": tool_profile,
+    })
+
+
+def _hash_result_binding(evidence_sha256: str, prompt_envelope_sha256: str) -> str:
+    """Deterministically derive the child-result binding hash (Issue #1706
+    AC5) from ``evidence_sha256`` + ``prompt_envelope_sha256``, so tampering
+    with either input changes ``result_binding_sha256``.
+    """
+    return _sha256_stable_json({
+        "evidence_sha256": evidence_sha256,
+        "prompt_envelope_sha256": prompt_envelope_sha256,
+    })
+
+
+def verify_serena_hash_chain(record: Mapping[str, Any]) -> bool:
+    """Independently recompute ``prompt_envelope_sha256`` /
+    ``result_binding_sha256`` from ``evidence_sha256`` and compare against
+    the stored values (Issue #1706 AC5/AC8 tamper detection). Returns
+    ``False`` on any mismatch or malformed input -- fail-closed, never
+    raises.
+    """
+    try:
+        evidence_sha256 = record["evidence_sha256"]
+        target_contract_sha256 = record["target_contract_sha256"]
+        objective_sha256 = record.get("objective_sha256")
+        tool_profile = record.get("tool_profile")
+        prompt_envelope_sha256 = record["prompt_envelope_sha256"]
+        result_binding_sha256 = record["result_binding_sha256"]
+    except (KeyError, TypeError):
+        return False
+    if not isinstance(evidence_sha256, str) or not isinstance(target_contract_sha256, str):
+        return False
+    expected_prompt_envelope_sha256 = _hash_prompt_envelope(
+        evidence_sha256, objective_sha256, target_contract_sha256, str(tool_profile)
+    )
+    if expected_prompt_envelope_sha256 != prompt_envelope_sha256:
+        return False
+    expected_result_binding_sha256 = _hash_result_binding(evidence_sha256, expected_prompt_envelope_sha256)
+    return expected_result_binding_sha256 == result_binding_sha256
+
+
+def _objective_relevance_tokens(objective: str) -> list[str]:
+    return [
+        token
+        for token in re.findall(r"[A-Za-z0-9_]+", objective.lower())
+        if len(token) >= _OBJECTIVE_RELEVANCE_MIN_TOKEN_LEN
+    ]
+
+
+def _evidence_matches_objective(objective: Any, evidence_envelopes: list[dict[str, Any]]) -> bool:
+    """Deterministic fail-close relevance check (Issue #1706 AC8): the
+    objective must contribute at least one non-trivial token that appears
+    (case-insensitively) in either the repo-relative path or the retrieved
+    content of at least one evidence envelope. A missing/blank objective, or
+    an objective with no overlapping token, is treated as "evidence
+    irrelevant to the subtask objective" and fails closed.
+    """
+    if not isinstance(objective, str) or not objective.strip():
+        return False
+    tokens = _objective_relevance_tokens(objective)
+    if not tokens:
+        return False
+    haystacks = [
+        f"{envelope.get('repo_relative_path', '')}\n{envelope.get('content', '')}".lower()
+        for envelope in evidence_envelopes
+    ]
+    return any(token in haystack for token in tokens for haystack in haystacks)
+
+
+def _is_fanout_correlated_request(request: Mapping[str, Any]) -> bool:
+    """True when the request carries at least one non-empty fan-out
+    correlation id (``parent_run_id`` / ``subtask_id`` / ``attempt_id``),
+    i.e. it was stamped by ``fan_out_orchestrator.run_fanout()`` rather than
+    invoked as a standalone single-shot delegation request (Issue #1706).
+    """
+    return any(
+        isinstance(request.get(key), str) and request.get(key, "").strip()
+        for key in ("parent_run_id", "subtask_id", "attempt_id")
+    )
+
+
+def _validate_agy_targeted_evidence_request(
+    request: Mapping[str, Any], request_path: Path | None = None
+) -> list[str]:
+    """Full fail-close validation for the AGY local_asset_research
+    targeted-evidence contract (Issue #1638): schema/selector validation,
+    repo-boundary and symlink checks, then bounded evidence collection so
+    missing/empty/oversized/credential-like target evidence is rejected
+    before AGY ever launches.
+
+    Issue #1706: for fan-out-correlated requests (``parent_run_id`` /
+    ``subtask_id`` / ``attempt_id`` present), also fail-closes when the
+    collected evidence has no deterministic overlap with the subtask
+    ``objective`` -- evidence must be demonstrably task-linked, not just
+    schema-valid, before an AGY subprocess is ever launched.
+    """
+    errors: list[str] = []
+    repo_root = _repo_root().resolve()
+    target_errors, validated_targets = _validate_evidence_targets(
+        request.get("evidence_targets"), request_path, repo_root
+    )
+    errors.extend(target_errors)
+    if target_errors:
+        return errors
+    errors.extend(_validate_local_asset_research_settings())
+    evidence_envelopes, evidence_errors = _collect_targeted_source_evidence(validated_targets, repo_root)
+    errors.extend(evidence_errors)
+    if evidence_errors:
+        return errors
+    if _is_fanout_correlated_request(request) and not _evidence_matches_objective(
+        request.get("objective"), evidence_envelopes
+    ):
+        errors.append(
+            "local_asset_research task-linked evidence is unrelated to the subtask objective "
+            "(evidence_sha256 chain rejected: no deterministic objective/evidence overlap)"
+        )
+    return errors
 
 
 def _collect_serena_read_only_evidence(
@@ -1940,19 +2442,169 @@ def _build_agy_raw_command(prompt: str) -> list[str]:
     return [agy_bin, "-p", "<prompt>"]
 
 
+# Issue #1705: carries the current call's tool_profile from run_delegation()
+# into _run_agy() without widening _run_agy()'s own call signature. Existing
+# tests (test_agy_provider.py, outside this Issue's Allowed Paths) mock
+# `rgh._run_agy` with 2-positional-argument replacement functions and call
+# `rgh._run_agy(prompt, timeout_sec)` directly; a contextvar lets the profile
+# flow through without changing that call convention. Defaults to None
+# (back-compat: `_minimal_agy_env()` fallback, unchanged prior behavior) for
+# any caller -- including direct/mocked calls -- that does not go through
+# run_delegation()'s agy branch.
+_AGY_TOOL_PROFILE_CTX: "contextvars.ContextVar[str | None]" = contextvars.ContextVar(
+    "_agy_tool_profile_ctx", default=None
+)
+
+
 def _run_agy(
     prompt: str,
     timeout_sec: int,
+    *,
+    run_context: dict[str, Any] | None = None,
 ) -> "subprocess.CompletedProcess[str]":
-    """Run agy -p <prompt> in an isolated temp cwd with minimal env.
+    """Run agy -p <prompt> in an isolated temp cwd with a profile-scoped permission workspace.
 
     Uses shell=False and AGY_BIN override for hermetic test injection.
+
+    When `_AGY_TOOL_PROFILE_CTX` holds a recognized
+    `agy_permission_policy.ALLOWED_PROFILES` value (set by `run_delegation()`
+    for the current call), an isolated Antigravity workspace
+    (workspace-scoped `.antigravity/settings.json` deny policy) is
+    materialized via `agy_permission_policy.materialize_isolated_agy_workspace()`
+    and its env (HOME/XDG_* redirected into the isolated workspace) is used
+    instead of `_minimal_agy_env()`. Because that env's `HOME` points at the
+    fresh isolated workspace rather than the caller's real `$HOME`, any
+    pre-existing global `$HOME/.antigravity/settings.json` allow rules are
+    structurally unreachable -- the workspace deny policy always applies
+    (Issue #1705 AC5/AC6 config precedence). Falls back to
+    `_minimal_agy_env()` when no profile is set in the contextvar
+    (back-compat with direct/mocked callers).
+
+    Issue #1708: in both branches above, also generates a *workspace-scoped* AGY
+    `PreToolUse` hook config (`.agents/hooks.json` + wrapper script) inside the
+    isolated workspace/temp cwd, so any `search_web` / `read_url_content` tool call
+    the AGY subprocess makes is captured as an `agy_tool_provenance_v1` event. This
+    never touches the user's global Antigravity settings/hooks file -- only files
+    inside the per-run isolated workspace/temp dir. The resulting hook events (or a
+    fail-closed load error) are attached to the returned `CompletedProcess` as
+    `agy_provenance_hook_events` / `agy_provenance_hook_load_error` -- callers MUST
+    NOT infer WebSearch success from stdout alone when these are present; see
+    `agy_tool_provenance.evaluate_websearch_provenance()`. Wiring these attached
+    fields into the default `grounding_backend` decision path is deferred to
+    #1494's live E2E run (see Issue #1708 Runtime Verification Applicability).
     """
     agy_bin = str(os.environ.get("AGY_BIN") or "agy")
     command = [agy_bin, "-p", prompt]
+    tool_profile = _AGY_TOOL_PROFILE_CTX.get()
+    if tool_profile == GROUNDED_RESEARCH_PROFILE:
+        # Issue #1749: force a model that actually calls the declared
+        # search_web/read_url_content tools in headless print mode instead
+        # of hallucinating a "searched" answer. See AGY_GROUNDED_RESEARCH_MODEL
+        # docstring above for the live-investigation evidence.
+        command = [agy_bin, "-p", prompt, "--model", AGY_GROUNDED_RESEARCH_MODEL]
+    if tool_profile in _agy_permission_policy.ALLOWED_PROFILES:
+        workspace = _agy_permission_policy.materialize_isolated_agy_workspace(tool_profile)
+        env = dict(workspace.env)
+        agy_bin_override = os.environ.get("AGY_BIN")
+        if agy_bin_override is not None:
+            env["AGY_BIN"] = agy_bin_override
+        tmp_path = workspace.workspace_dir
+        hook_events: list[dict[str, Any]] = []
+        hook_load_error: str | None = None
+        hook_log_path = tmp_path / "_provenance" / "hook_events.jsonl"
+        hook_context_path = tmp_path / "_provenance" / "hook_context.json"
+
+        if _AGY_PROVENANCE_AVAILABLE:
+            ctx = run_context or {}
+            try:
+                _agy_provenance.generate_workspace_hook_config(
+                    tmp_path,
+                    hook_log_path=hook_log_path,
+                    hook_context_path=hook_context_path,
+                    # Issue #1768: HOME is fully redirected to tmp_path in this isolated
+                    # branch (env["HOME"] == str(workspace_dir), set by
+                    # materialize_isolated_agy_workspace() above), so tmp_path is a safe,
+                    # fully isolated home_dir -- writing the canonical-path hooks.json
+                    # under it never touches the real host's global Antigravity settings.
+                    home_dir=tmp_path,
+                )
+                _agy_provenance.write_hook_context(
+                    hook_context_path,
+                    parent_run_id=str(ctx.get("parent_run_id", "")),
+                    subtask_id=str(ctx.get("subtask_id", "")),
+                    attempt_id=str(ctx.get("attempt_id", "")),
+                    tool_profile=str(ctx.get("tool_profile", "")),
+                    transcript_sha256=str(ctx.get("transcript_sha256", "")),
+                    repo_root=str(_repo_root()),
+                )
+                env = {**env, **_agy_provenance.hook_env(hook_log_path, hook_context_path)}
+            except _agy_provenance.ProvenanceWorkspaceHookError as exc:
+                # Fail-closed: do not fall back to running agy without the hook wired
+                # up silently succeeding as if provenance were captured. Record the
+                # failure; callers must not treat a missing hook log as "no web tool
+                # calls happened" without also checking this field (Issue #1708 AC9).
+                hook_load_error = f"workspace_hook_generation_failed: {exc}"
+
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(workspace.workspace_dir),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                check=False,
+                shell=False,
+            )
+
+            if _AGY_PROVENANCE_AVAILABLE and hook_load_error is None:
+                try:
+                    hook_events = _agy_provenance.load_hook_events(hook_log_path)
+                except _agy_provenance.ProvenanceParseError as exc:
+                    hook_load_error = f"hook_event_log_parse_failed: {exc}"
+
+            # Attached for forward-compatibility with the authoritative provenance
+            # evaluator; existing stdout-marker-based grounding logic below is
+            # unaffected by these attributes (Issue #1708 AC12 regression guard).
+            completed.agy_provenance_hook_events = hook_events  # type: ignore[attr-defined]
+            completed.agy_provenance_hook_load_error = hook_load_error  # type: ignore[attr-defined]
+            return completed
+        finally:
+            shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
     env = _minimal_agy_env()
     with tempfile.TemporaryDirectory(prefix="agy-headless-") as tmp:
-        return subprocess.run(
+        tmp_path = Path(tmp)
+        hook_events = []
+        hook_load_error = None
+        hook_log_path = tmp_path / "_provenance" / "hook_events.jsonl"
+        hook_context_path = tmp_path / "_provenance" / "hook_context.json"
+
+        if _AGY_PROVENANCE_AVAILABLE:
+            ctx = run_context or {}
+            try:
+                _agy_provenance.generate_workspace_hook_config(
+                    tmp_path,
+                    hook_log_path=hook_log_path,
+                    hook_context_path=hook_context_path,
+                )
+                _agy_provenance.write_hook_context(
+                    hook_context_path,
+                    parent_run_id=str(ctx.get("parent_run_id", "")),
+                    subtask_id=str(ctx.get("subtask_id", "")),
+                    attempt_id=str(ctx.get("attempt_id", "")),
+                    tool_profile=str(ctx.get("tool_profile", "")),
+                    transcript_sha256=str(ctx.get("transcript_sha256", "")),
+                    repo_root=str(_repo_root()),
+                )
+                env = {**env, **_agy_provenance.hook_env(hook_log_path, hook_context_path)}
+            except _agy_provenance.ProvenanceWorkspaceHookError as exc:
+                # Fail-closed: do not fall back to running agy without the hook wired
+                # up silently succeeding as if provenance were captured. Record the
+                # failure; callers must not treat a missing hook log as "no web tool
+                # calls happened" without also checking this field (Issue #1708 AC9).
+                hook_load_error = f"workspace_hook_generation_failed: {exc}"
+
+        completed = subprocess.run(
             command,
             cwd=tmp,
             env=env,
@@ -1962,6 +2614,19 @@ def _run_agy(
             check=False,
             shell=False,
         )
+
+        if _AGY_PROVENANCE_AVAILABLE and hook_load_error is None:
+            try:
+                hook_events = _agy_provenance.load_hook_events(hook_log_path)
+            except _agy_provenance.ProvenanceParseError as exc:
+                hook_load_error = f"hook_event_log_parse_failed: {exc}"
+
+        # Attached for forward-compatibility with the authoritative provenance
+        # evaluator; existing stdout-marker-based grounding logic below is
+        # unaffected by these attributes (Issue #1708 AC12 regression guard).
+        completed.agy_provenance_hook_events = hook_events  # type: ignore[attr-defined]
+        completed.agy_provenance_hook_load_error = hook_load_error  # type: ignore[attr-defined]
+        return completed
 
 
 def _extract_urls(text: str) -> list[str]:
@@ -2123,21 +2788,140 @@ def _extract_grounded_research_output(stdout: str) -> dict[str, Any]:
     return {}
 
 
-def _build_agy_grounded_research_metadata(stdout: str) -> dict[str, Any]:
+# Issue #1768: real Google grounding-search citation redirect URLs. Only vertexaisearch's
+# own grounding-api-redirect host+path shape counts here -- a generic bare URL elsewhere in
+# stdout is NOT treated as citation evidence (Issue #1266 Blocker 1 remains in force). This
+# pattern is used only as a *citation* signal, combined with (never instead of) a validated
+# provenance hook event confirming the tool call itself (Issue #1708's stdout-is-never-
+# authoritative-alone design intent).
+_VERTEX_GROUNDING_CITATION_RE = re.compile(
+    r"https?://vertexaisearch\.cloud\.google\.com/grounding-api-redirect/[^\s\]\)\},<>']+"
+)
+
+
+def _extract_vertex_grounding_citation_urls(stdout: str) -> list[str]:
+    """Extract real Google grounding-search citation redirect URLs from *stdout*."""
+    if not stdout:
+        return []
+    seen: list[str] = []
+    for match in _VERTEX_GROUNDING_CITATION_RE.findall(stdout):
+        normalized = match.strip().rstrip(")]},.\"'")
+        if normalized and normalized not in seen:
+            seen.append(normalized)
+    return seen
+
+
+def _hook_event_confirms_tool_call(raw_event: Any) -> "str | None":
+    """Issue #1768: minimal, purpose-specific structural check for one hook event.
+
+    Returns the canonical tool name (lowercased) if *raw_event* is a well-formed
+    ``agy_tool_provenance_v1`` PreToolUse event for a canonical web tool, else ``None``.
+
+    Deliberately narrower than ``agy_tool_provenance.validate_provenance_event()``: that
+    stricter validator additionally requires non-empty ``parent_run_id`` /
+    ``subtask_id`` / ``attempt_id`` / ``tool_profile`` / ``transcript_sha256`` fan-out
+    correlation fields, which `_run_agy()`'s only real production caller
+    (``run_delegation()``) never populates for standalone (non-fan-out) grounded_research
+    calls -- it calls ``_run_agy(prompt_text, timeout_sec_agy)`` without a ``run_context``
+    argument at all, so those fields are legitimately empty strings in that (the common)
+    case. Requiring them here would make this evidence path silently inert for exactly
+    the calls Issue #1768 targets. This function instead checks only the fields that
+    prove "a real PreToolUse hook fired for a canonical web tool in this subprocess run":
+    schema/version/event identity, a canonical ``toolCall.name`` with a well-formed
+    ``args_sha256`` hash, a non-empty ``conversationId``, an integer ``monotonic_ns``, and
+    a well-formed ``utc`` timestamp. The stronger, cross-run correlation-id matching in
+    ``agy_tool_provenance.evaluate_websearch_provenance()`` / ``match_run_context()``
+    remains the authority for consumers that aggregate hook events across multiple runs
+    (e.g. ``build_fanout_evidence_bundle.py``), where those ids are always populated.
+    """
+    if not _AGY_PROVENANCE_AVAILABLE or not isinstance(raw_event, dict):
+        return None
+    if raw_event.get("schema") != _agy_provenance.SCHEMA_NAME:
+        return None
+    if raw_event.get("version") != _agy_provenance.SCHEMA_VERSION:
+        return None
+    if raw_event.get("event") != "PreToolUse":
+        return None
+    tool_call = raw_event.get("toolCall")
+    if not isinstance(tool_call, dict):
+        return None
+    name = tool_call.get("name")
+    if not isinstance(name, str):
+        return None
+    normalized_name = name.strip().lower()
+    if normalized_name not in _agy_provenance.CANONICAL_WEB_TOOL_NAMES:
+        return None
+    args_sha256 = tool_call.get("args_sha256")
+    if not isinstance(args_sha256, str) or not _agy_provenance._HEX64_RE.match(args_sha256):
+        return None
+    if not isinstance(raw_event.get("conversationId"), str) or not raw_event.get("conversationId"):
+        return None
+    monotonic_value = raw_event.get("monotonic_ns")
+    if not isinstance(monotonic_value, int):
+        return None
+    utc_value = raw_event.get("utc")
+    if not isinstance(utc_value, str) or not _agy_provenance._ISO_UTC_RE.match(utc_value):
+        return None
+    return normalized_name
+
+
+def _hook_events_confirm_web_tool_call(
+    hook_events: "list[dict[str, Any]] | None",
+) -> "tuple[bool, list[str]]":
+    """Issue #1768: authoritative check for a validated, canonical-name provenance hook event.
+
+    ``hook_events`` (``completed.agy_provenance_hook_events``, see ``_run_agy()``) is always
+    scoped to exactly the single subprocess call that produced it -- a fresh, per-run
+    isolated ``hook_events.jsonl`` under a temp workspace that is deleted immediately after
+    the subprocess exits -- so no additional run-context (conversationId / parent_run_id /
+    etc.) cross-checking is required here beyond per-event structural validation
+    (``_hook_event_confirms_tool_call()``); that stronger, cross-run-safe matching lives in
+    ``agy_tool_provenance.evaluate_websearch_provenance()`` / ``match_run_context()`` for
+    consumers that aggregate hook events across multiple runs (e.g.
+    ``build_fanout_evidence_bundle.py``). This function never trusts AGY's stdout
+    self-report -- only validated hook events count (Issue #1708's original design intent).
+    """
+    if not _AGY_PROVENANCE_AVAILABLE or not hook_events:
+        return False, []
+    validated_tool_names: list[str] = []
+    for raw_event in hook_events:
+        name = _hook_event_confirms_tool_call(raw_event)
+        if name is not None:
+            validated_tool_names.append(name)
+    return (len(validated_tool_names) > 0), validated_tool_names
+
+
+def _build_agy_grounded_research_metadata(
+    stdout: str,
+    *,
+    hook_events: "list[dict[str, Any]] | None" = None,
+) -> dict[str, Any]:
     """Build bounded AGY native WebSearch evidence metadata from stdout (fail-closed).
 
     Classification order:
     1. Redaction violations (secret / repo path / HOME path) -> agy_web_grounding_redaction_failed.
     2. Quota exhaustion signals -> agy_web_grounding_quota_exhausted.
-    3. No machine-verifiable web tool-call trace -> agy_web_grounding_tool_call_missing
-       (a bare URL string in stdout is weak evidence only and is never treated as a
-       WebSearch tool-call execution proof; `web_tool_call_count` is never inferred from a
-       URL count — see Issue #1266 Blocker 1).
+    3. No machine-verifiable web tool-call trace (neither a recognized stdout self-report
+       trace NOR a validated `agy_tool_provenance_v1` hook event) ->
+       agy_web_grounding_tool_call_missing (a bare URL string in stdout is weak evidence
+       only and is never treated as a WebSearch tool-call execution proof on its own —
+       see Issue #1266 Blocker 1).
     4. Tool-call trace present but no citation -> agy_web_grounding_no_citations.
     5. Tool-call trace + citation -> grounded (bounded to 1 citation / 1 tool call per the
        1 query / 1 URL quota contract).
+
+    Issue #1768: a *validated* `agy_tool_provenance_v1` hook event (see
+    `_hook_events_confirm_web_tool_call()`) is now an authoritative, additional source of
+    "a web tool call happened" evidence, independent of whether AGY's stdout self-report
+    contains a structured `tool_calls` JSON trace. Live investigation showed real,
+    successful `search_web` calls whose stdout response was plain prose with no self-report
+    JSON at all -- previously these were always misclassified as
+    `attempted_no_web_tool_call` even though the tool call genuinely happened and a
+    validated hook event proved it. Hallucination cases (no validated hook event, stdout-
+    only claims) remain fail-closed and unaffected by this change.
     """
     stdout = stdout or ""
+    hook_validated, _hook_tool_names = _hook_events_confirm_web_tool_call(hook_events)
     redacted_excerpt = _redact_text(stdout)[:500]
     excerpt_sha256 = hashlib.sha256(redacted_excerpt.encode("utf-8")).hexdigest()
     transcript_evidence = [
@@ -2197,8 +2981,9 @@ def _build_agy_grounded_research_metadata(stdout: str) -> dict[str, Any]:
 
     parsed = _extract_grounded_research_output(stdout)
     tool_calls = _extract_recognized_tool_calls(parsed)
+    tool_call_confirmed = bool(tool_calls) or hook_validated
 
-    if not tool_calls:
+    if not tool_call_confirmed:
         return _fail_closed(
             grounding_status="attempted_no_web_tool_call",
             grounding_backend="none",
@@ -2207,10 +2992,19 @@ def _build_agy_grounded_research_metadata(stdout: str) -> dict[str, Any]:
         )
 
     structured_citations = _extract_structured_citations(parsed)
+    if not structured_citations and hook_validated:
+        # Issue #1768: when the tool-call evidence comes from a validated hook event
+        # rather than a stdout self-report structured trace, also accept a real Google
+        # grounding-search citation redirect URL scraped from stdout as citation
+        # evidence (the Outcome's suggested "combine URL pattern + hook event" fallback).
+        # A bare/generic URL is still never accepted here — only the vertexaisearch
+        # grounding-api-redirect shape counts (Issue #1266 Blocker 1 remains in force).
+        vertex_urls = _extract_vertex_grounding_citation_urls(stdout)
+        structured_citations = [{"url": url, "title": None} for url in vertex_urls]
     # Bounded to 1 citation / 1 tool call (Issue #1266 quota-bound contract: 1 query / 1 URL).
     citation_evidence = structured_citations[:1]
     url_citation_count = len(citation_evidence)
-    web_tool_call_count = min(len(tool_calls), 1)
+    web_tool_call_count = 1 if tool_call_confirmed else 0
 
     if url_citation_count > 0:
         grounding_status = "grounded"
@@ -2245,16 +3039,61 @@ def _normalize_agy_result(
     tool_profile: str,
     requested_model: str | None,
     request_warnings: list[str] | None = None,
+    parent_run_id: str | None = None,
+    subtask_id: str | None = None,
+    attempt_id: str | None = None,
+    transcript_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Normalize agy subprocess result into delegation_result/v1 shape.
 
     Does NOT use _parse_envelope() — agy stdout is plain text.
     Always includes provider="agy" and safety_mode="degraded_wrapper_only".
+
+    Issue #1753: ``parent_run_id`` / ``subtask_id`` / ``attempt_id`` are the
+    fan-out correlation ids (``fan_out_orchestrator.run_fanout()`` stamps
+    these onto each subtask request; see ``_is_fanout_correlated_request()``)
+    and are copied verbatim onto every ``delegation_result/v1`` top-level
+    dict this function returns, so that ``validate_agy_fanout_e2e_evidence.py``
+    predicate_19 (``run_ids_consistent_across_all_artifacts``) can read them
+    directly from the result without unpacking the nested
+    ``local_asset_retrieval_metadata`` copy (Issue #1706). Standalone
+    (non-fan-out) callers never pass these keyword arguments, so the values
+    default to ``None`` — an optional, purely additive field with no effect
+    on any other existing key/value.
     """
     stdout = (completed.stdout or "").strip()
     stderr_text = (completed.stderr or "").strip()
     is_ci = os.environ.get("CI", "").lower() in {"1", "true", "yes", "on"}
     warnings = list(request_warnings or [])
+
+    # Issue #1752: `_run_agy()` attaches `agy_provenance_hook_events` /
+    # `agy_provenance_hook_load_error` as dynamic attributes on `completed`
+    # (see `_run_agy()` docstring above) *before* the isolated workspace is
+    # removed, so the values are still valid in-memory at this point even
+    # though the on-disk `_provenance/hook_events.jsonl` file itself is gone
+    # by the time this function runs. Every return branch below must copy
+    # these through to the `delegation_result/v1` dict so that
+    # `run_delegation()` callers (e.g. `build_fanout_evidence_bundle.py`) can
+    # rebuild a hook-events bundle without re-reading the (already deleted)
+    # workspace. `getattr(..., default)` keeps this safe for direct/mocked
+    # `CompletedProcess` callers that never went through `_run_agy()` and
+    # therefore never got these attributes attached (AC4).
+    agy_provenance_hook_events = list(getattr(completed, "agy_provenance_hook_events", []) or [])
+    agy_provenance_hook_load_error = getattr(completed, "agy_provenance_hook_load_error", None)
+
+    # Issue #1771: surface the real AGY conversationId from the first captured
+    # hook event that has one (rather than re-deriving/guessing it), so
+    # delegation_result/v1's top-level conversation_id is the authoritative
+    # value the isolated-workspace PreToolUse wrapper actually observed --
+    # never fabricated when no hook event fired (e.g. AGY made no tool call).
+    agy_conversation_id: str | None = None
+    for _agy_hook_event in agy_provenance_hook_events:
+        if not isinstance(_agy_hook_event, dict):
+            continue
+        _candidate_conversation_id = _agy_hook_event.get("conversationId")
+        if isinstance(_candidate_conversation_id, str) and _candidate_conversation_id.strip():
+            agy_conversation_id = _candidate_conversation_id
+            break
 
     if completed.returncode != 0:
         # Issue #1270: classify quota/capacity/auth/permission failures
@@ -2287,6 +3126,13 @@ def _normalize_agy_result(
             "model_chain": [],
             "model_downgrades": [],
             "attempts_by_model": {"agy-default": 1},
+            "agy_provenance_hook_events": agy_provenance_hook_events,
+            "agy_provenance_hook_load_error": agy_provenance_hook_load_error,
+            "parent_run_id": parent_run_id,
+            "subtask_id": subtask_id,
+            "attempt_id": attempt_id,
+            "conversation_id": agy_conversation_id,
+            "transcript_sha256": transcript_sha256,
         }
 
     if not stdout:
@@ -2316,10 +3162,20 @@ def _normalize_agy_result(
             "model_chain": [],
             "model_downgrades": [],
             "attempts_by_model": {"agy-default": 1},
+            "agy_provenance_hook_events": agy_provenance_hook_events,
+            "agy_provenance_hook_load_error": agy_provenance_hook_load_error,
+            "parent_run_id": parent_run_id,
+            "subtask_id": subtask_id,
+            "attempt_id": attempt_id,
+            "conversation_id": agy_conversation_id,
+            "transcript_sha256": transcript_sha256,
         }
 
     grounded_research_evidence = (
-        _build_agy_grounded_research_metadata(completed.stdout or "")
+        _build_agy_grounded_research_metadata(
+            completed.stdout or "",
+            hook_events=agy_provenance_hook_events,
+        )
         if tool_profile == GROUNDED_RESEARCH_PROFILE
         else None
     )
@@ -2360,6 +3216,13 @@ def _normalize_agy_result(
         "model_chain": [],
         "model_downgrades": [],
         "attempts_by_model": {"agy-default": 1},
+        "agy_provenance_hook_events": agy_provenance_hook_events,
+        "agy_provenance_hook_load_error": agy_provenance_hook_load_error,
+        "parent_run_id": parent_run_id,
+        "subtask_id": subtask_id,
+        "attempt_id": attempt_id,
+        "conversation_id": agy_conversation_id,
+        "transcript_sha256": transcript_sha256,
     }
 
 
@@ -2543,6 +3406,9 @@ def _normalize_acp_result(
     tool_profile: str,
     request_warnings: list[str],
     model_chain: list[str] | None = None,
+    parent_run_id: str | None = None,
+    subtask_id: str | None = None,
+    attempt_id: str | None = None,
 ) -> dict[str, Any]:
     """Normalize a ``run_acp()`` result into a ``delegation_result/v1`` shape.
 
@@ -2588,6 +3454,9 @@ def _normalize_acp_result(
         "model_chain": resolved_chain,
         "model_downgrades": [],
         "raw_command": _resolve_acp_raw_command(),
+        "parent_run_id": parent_run_id,
+        "subtask_id": subtask_id,
+        "attempt_id": attempt_id,
         "transport_details": {
             "schema": raw_acp.get("schema", "acp_result_v1"),
             "structured_events": raw_acp.get("structured_events") or [],
@@ -2627,9 +3496,17 @@ def _validate_agy_request(request: Mapping[str, Any]) -> list[str]:
 
 
 def _validate_agy_local_asset_request(request: Mapping[str, Any], request_path: Path | None = None) -> list[str]:
-    """Full validation path for provider=agy + local_asset_research."""
+    """Full validation path for provider=agy + local_asset_research.
+
+    Issue #1638: requests that declare ``evidence_targets`` use the
+    targeted-evidence contract (repo-relative path + bounded selector) and
+    skip the legacy whole-file ``context_files`` requirement entirely.
+    """
     errors: list[str] = []
     errors.extend(validate_request(request, request_path=request_path))
+    if isinstance(request.get("evidence_targets"), list):
+        errors.extend(_validate_agy_targeted_evidence_request(request, request_path=request_path))
+        return errors
     context_files = request.get("context_files")
     if not isinstance(context_files, list) or len(context_files) == 0:
         errors.append("local_asset_research requires at least one context file")
@@ -3473,6 +4350,9 @@ def _run_delegation_core(
             "raw_command": [],
             "model_chain": [],
             "model_downgrades": [],
+            "parent_run_id": request.get("parent_run_id"),
+            "subtask_id": request.get("subtask_id"),
+            "attempt_id": request.get("attempt_id"),
         }
 
     if provider == "agy":
@@ -3508,76 +4388,212 @@ def _run_delegation_core(
                 "raw_command": _build_agy_raw_command(""),
                 "model_chain": [],
                 "model_downgrades": [],
+                "parent_run_id": request.get("parent_run_id"),
+                "subtask_id": request.get("subtask_id"),
+                "attempt_id": request.get("attempt_id"),
             }
         # local_asset_research uses wrapper-side Serena evidence + prompt injection.
         local_asset_retrieval_metadata: dict[str, Any] | None = None
+        # Issue #1706: set only for fan-out-correlated targeted-evidence
+        # requests; injected into the AGY prompt envelope below so
+        # prompt_envelope_sha256 is machine-verifiable from the actual text
+        # sent to AGY (AC4), not just carried in out-of-band metadata.
+        prompt_envelope_sha256_for_injection: str | None = None
         if tool_profile == LOCAL_ASSET_RESEARCH_PROFILE:
             repo_root = _repo_root().resolve()
-            _, context_paths = _validate_local_asset_context_files(
-                request.get("context_files", []),
-                request_path,
-                repo_root,
-            )
-            manifest = load_serena_tool_manifest(repo_root)
-            try:
-                local_asset_result = _collect_live_serena_read_only_evidence(
-                    context_paths, repo_root, manifest
+            if isinstance(request.get("evidence_targets"), list):
+                # Issue #1638: targeted source-evidence contract. Wrapper-side
+                # read-only retrieval bounded to declared repo-relative
+                # targets; this mode never falls back to live Serena MCP
+                # retrieval and never launches AGY on unmet evidence.
+                _, validated_evidence_targets = _validate_evidence_targets(
+                    request.get("evidence_targets"), request_path, repo_root
                 )
-                evidence_documents, local_asset_retrieval_metadata = _coerce_live_serena_retrieval_result(
-                    local_asset_result,
-                    context_paths=context_paths,
+                evidence_envelopes, evidence_errors = _collect_targeted_source_evidence(
+                    validated_evidence_targets, repo_root
                 )
-                if local_asset_retrieval_metadata is not None:
+                if evidence_errors:
+                    # Defensive fail-close: _validate_agy_local_asset_request
+                    # already gates this before dispatch is reached, but AGY
+                    # must never launch on evidence collected after that gate
+                    # either (Issue #1638 AC3).
+                    return {
+                        "schema": "delegation_result/v1",
+                        "transport": "agy",
+                        "ok": False,
+                        "provider": "agy",
+                        "safety_mode": "degraded_wrapper_only",
+                        "requested_model": None,
+                        "actual_model": None,
+                        "tool_profile": LOCAL_ASSET_RESEARCH_PROFILE,
+                        "exit_code": 1,
+                        "result_surface": {
+                            "ok": False,
+                            "summary": "local_asset_research targeted evidence unmet",
+                            "response_text": None,
+                        },
+                        "response_text": None,
+                        "stats": None,
+                        "stderr": evidence_errors[0],
+                        "warnings": evidence_errors[:],
+                        "failure_reason": evidence_errors[0],
+                        "failure_class": "local_asset_research_targeted_evidence_unmet",
+                        "raw_command": _build_agy_raw_command(""),
+                        "model_chain": [],
+                        "model_downgrades": [],
+                        "parent_run_id": request.get("parent_run_id"),
+                        "subtask_id": request.get("subtask_id"),
+                        "attempt_id": request.get("attempt_id"),
+                        "local_asset_retrieval_metadata": {
+                            "retrieval_status": "failed",
+                            "retrieval_mode": "wrapper_read_only_targeted_evidence",
+                            "targets_requested": len(request.get("evidence_targets") or []),
+                            "evidence_record_count": 0,
+                            "failure_class": "local_asset_research_targeted_evidence_unmet",
+                        },
+                    }
+                evidence_documents = [
+                    {
+                        "path": envelope["repo_relative_path"],
+                        "content": json.dumps(
+                            {
+                                "repo_relative_path": envelope["repo_relative_path"],
+                                "selector": envelope["selector"],
+                                "line_range": envelope["line_range"],
+                                "sha256": envelope["sha256"],
+                                "source_kind": envelope["source_kind"],
+                                "content": envelope["content"],
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                    }
+                    for envelope in evidence_envelopes
+                ]
+                local_asset_retrieval_metadata = {
+                    "retrieval_mode": "wrapper_read_only_targeted_evidence",
+                    "retrieval_status": "succeeded",
+                    "targets_requested": len(request.get("evidence_targets") or []),
+                    "evidence_record_count": len(evidence_envelopes),
+                    "failure_class": None,
+                }
+                # Issue #1706: fan-out task-linked Serena evidence hash chain
+                # / correlation. Scoped to requests actually stamped by
+                # fan_out_orchestrator.run_fanout() (parent_run_id /
+                # subtask_id / attempt_id present) so standalone #1638
+                # targeted-evidence callers (no fan-out context, no Serena
+                # tool manifest guaranteed on disk) are completely
+                # unaffected -- this never runs on the #1638 regression path.
+                if _is_fanout_correlated_request(request):
+                    manifest = load_serena_tool_manifest(repo_root)
+                    correlation = {
+                        "parent_run_id": request.get("parent_run_id"),
+                        "subtask_id": request.get("subtask_id"),
+                        "attempt_id": request.get("attempt_id"),
+                    }
+                    serena_evidence_records = _build_serena_evidence_records(
+                        validated_evidence_targets, evidence_envelopes, manifest, correlation
+                    )
+                    objective_sha256 = _hash_objective(request.get("objective"))
+                    target_contract_sha256 = _hash_target_contract(validated_evidence_targets)
+                    request_sha256 = _hash_request_for_chain(request)
+                    evidence_sha256 = _hash_evidence(serena_evidence_records)
+                    prompt_envelope_sha256 = _hash_prompt_envelope(
+                        evidence_sha256,
+                        objective_sha256,
+                        target_contract_sha256,
+                        LOCAL_ASSET_RESEARCH_PROFILE,
+                    )
+                    result_binding_sha256 = _hash_result_binding(evidence_sha256, prompt_envelope_sha256)
+                    prompt_envelope_sha256_for_injection = prompt_envelope_sha256
                     local_asset_retrieval_metadata = {
                         **local_asset_retrieval_metadata,
-                        "retrieval_status": "succeeded",
-                        "context_files_count": len(context_paths),
-                        "failure_class": None,
-                    }
-            except Exception as exc:
-                manifest_id = _serena_manifest_id(manifest)
-                return {
-                    "schema": "delegation_result/v1",
-                    "transport": "agy",
-                    "ok": False,
-                    "provider": "agy",
-                    "safety_mode": "degraded_wrapper_only",
-                    "requested_model": None,
-                    "actual_model": None,
-                    "tool_profile": LOCAL_ASSET_RESEARCH_PROFILE,
-                    "exit_code": 1,
-                    "result_surface": {
-                        "ok": False,
-                        "summary": "local_asset_research live Serena MCP retrieval failed",
-                        "response_text": None,
-                    },
-                    "response_text": None,
-                    "stats": None,
-                    "stderr": str(exc),
-                    "warnings": [f"local_asset_research live_serena_mcp_failed: {exc}"],
-                    "failure_reason": f"local_asset_research live_serena_mcp_failed: {exc}",
-                    "failure_class": "local_asset_research live_serena_mcp_failed",
-                    "raw_command": _build_agy_raw_command(""),
-                    "model_chain": [],
-                    "model_downgrades": [],
-                    "local_asset_retrieval_metadata": {
-                        "retrieval_status": "failed",
-                        "retrieval_mode": "live_serena_mcp",
-                        "serena_manifest_id": manifest_id,
+                        "actor": RETRIEVAL_ACTOR_WRAPPER_SERENA_MCP,
+                        "retrieval_actor": RETRIEVAL_ACTOR_WRAPPER_SERENA_MCP,
+                        "analysis_actor": ANALYSIS_ACTOR_ANTIGRAVITY_CLI,
+                        "agy_direct_mcp_access": AGY_DIRECT_MCP_ACCESS,
+                        "parent_run_id": correlation["parent_run_id"],
+                        "subtask_id": correlation["subtask_id"],
+                        "attempt_id": correlation["attempt_id"],
+                        "request_sha256": request_sha256,
+                        "objective_sha256": objective_sha256,
+                        "target_contract_sha256": target_contract_sha256,
+                        "evidence_sha256": evidence_sha256,
+                        "prompt_envelope_sha256": prompt_envelope_sha256,
+                        "result_binding_sha256": result_binding_sha256,
                         "serena_pinned_ref": manifest.get("pinned_ref"),
-                        "read_only_allowlist_sha256": _sha256_stable_json(
-                            list(manifest.get("read_only_allowlist", []))
-                        ),
-                        "dangerous_denylist_sha256": _sha256_stable_json(
-                            list(manifest.get("dangerous_denylist", []))
-                        ),
-                        "live_tools_list_sha256": None,
-                        "manifest_drift_failed": True,
-                        "context_files_count": len(context_paths),
-                        "evidence_record_count": 0,
+                        "serena_manifest_id": _serena_manifest_id(manifest),
+                        "serena_evidence_records": serena_evidence_records,
+                    }
+            else:
+                _, context_paths = _validate_local_asset_context_files(
+                    request.get("context_files", []),
+                    request_path,
+                    repo_root,
+                )
+                manifest = load_serena_tool_manifest(repo_root)
+                try:
+                    local_asset_result = _collect_live_serena_read_only_evidence(
+                        context_paths, repo_root, manifest
+                    )
+                    evidence_documents, local_asset_retrieval_metadata = _coerce_live_serena_retrieval_result(
+                        local_asset_result,
+                        context_paths=context_paths,
+                    )
+                    if local_asset_retrieval_metadata is not None:
+                        local_asset_retrieval_metadata = {
+                            **local_asset_retrieval_metadata,
+                            "retrieval_status": "succeeded",
+                            "context_files_count": len(context_paths),
+                            "failure_class": None,
+                        }
+                except Exception as exc:
+                    manifest_id = _serena_manifest_id(manifest)
+                    return {
+                        "schema": "delegation_result/v1",
+                        "transport": "agy",
+                        "ok": False,
+                        "provider": "agy",
+                        "safety_mode": "degraded_wrapper_only",
+                        "requested_model": None,
+                        "actual_model": None,
+                        "tool_profile": LOCAL_ASSET_RESEARCH_PROFILE,
+                        "exit_code": 1,
+                        "result_surface": {
+                            "ok": False,
+                            "summary": "local_asset_research live Serena MCP retrieval failed",
+                            "response_text": None,
+                        },
+                        "response_text": None,
+                        "stats": None,
+                        "stderr": str(exc),
+                        "warnings": [f"local_asset_research live_serena_mcp_failed: {exc}"],
+                        "failure_reason": f"local_asset_research live_serena_mcp_failed: {exc}",
                         "failure_class": "local_asset_research live_serena_mcp_failed",
-                    },
-                }
+                        "raw_command": _build_agy_raw_command(""),
+                        "model_chain": [],
+                        "model_downgrades": [],
+                        "parent_run_id": request.get("parent_run_id"),
+                        "subtask_id": request.get("subtask_id"),
+                        "attempt_id": request.get("attempt_id"),
+                        "local_asset_retrieval_metadata": {
+                            "retrieval_status": "failed",
+                            "retrieval_mode": "live_serena_mcp",
+                            "serena_manifest_id": manifest_id,
+                            "serena_pinned_ref": manifest.get("pinned_ref"),
+                            "read_only_allowlist_sha256": _sha256_stable_json(
+                                list(manifest.get("read_only_allowlist", []))
+                            ),
+                            "dangerous_denylist_sha256": _sha256_stable_json(
+                                list(manifest.get("dangerous_denylist", []))
+                            ),
+                            "live_tools_list_sha256": None,
+                            "manifest_drift_failed": True,
+                            "context_files_count": len(context_paths),
+                            "evidence_record_count": 0,
+                            "failure_class": "local_asset_research live_serena_mcp_failed",
+                        },
+                    }
             prompt_text = _build_local_asset_prompt(
                 request,
                 request_path,
@@ -3586,6 +4602,18 @@ def _run_delegation_core(
             prompt_hint = str(request.get("prompt") or "").strip()
             if prompt_hint:
                 prompt_text = f"{prompt_text}\n\nOperator objective:\n{prompt_hint}"
+            if prompt_envelope_sha256_for_injection is not None:
+                # Issue #1706 AC4: the AGY prompt envelope itself carries
+                # prompt_envelope_sha256, so the value is machine-verifiable
+                # from the exact text handed to the AGY subprocess.
+                prompt_text = (
+                    f"{prompt_text}\n\nEvidence correlation (Issue #1706 task-linked hash chain):\n"
+                    + json.dumps(
+                        {"prompt_envelope_sha256": prompt_envelope_sha256_for_injection},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
             prompt_text = _build_local_asset_prompt_for_agy(
                 {
                     "prompt": prompt_text,
@@ -3610,8 +4638,56 @@ def _run_delegation_core(
                 " clamped to 300"
             )
             timeout_sec_agy = 300
+        # Issue #1771: deterministic hash of the exact outgoing prompt text
+        # (the "transcript" sent to AGY), computed once here so the same
+        # value can be (a) stamped into the isolated workspace hook context
+        # via run_context below -- and therefore embedded in every
+        # agy_tool_provenance_v1 hook event the wrapper emits for this run
+        # -- and (b) surfaced verbatim on delegation_result/v1 (see the
+        # _normalize_agy_result() call below), so validate_agy_fanout_e2e_
+        # evidence.py's match_run_context() can correlate the two. Computed
+        # before the AGY subprocess ever starts (hook context is written
+        # pre-execution inside _run_agy()), so it must hash the prompt sent,
+        # not the (not-yet-known) response.
+        _agy_transcript_sha256 = _sha256_stable_json(prompt_text)
+        # Issue #1771: only stamp fan-out correlation ids onto the isolated
+        # workspace hook context for the grounded_research call site (this
+        # Issue's stated scope -- predicate_07/08/10 are WebSearch hook-
+        # provenance checks specific to grounded_research), and only when
+        # the request actually carries them (fan_out_orchestrator.run_fanout()
+        # stamps parent_run_id/subtask_id/attempt_id onto fan-out subtask
+        # requests; standalone/single-shot callers never do, and other agy
+        # tool_profiles such as local_asset_research already have their own
+        # independent Serena-evidence correlation path -- Issue #1706 --
+        # untouched by this Issue). This keeps AC4 backward compatibility: a
+        # standalone grounded_research call, or any non-grounded_research
+        # call, still invokes _run_agy() with the identical pre-#1771 call
+        # shape; it never picks up fabricated correlation ids.
+        _agy_run_context: dict[str, Any] | None = None
+        if tool_profile == GROUNDED_RESEARCH_PROFILE and _is_fanout_correlated_request(request):
+            _agy_run_context = {
+                "parent_run_id": request.get("parent_run_id"),
+                "subtask_id": request.get("subtask_id"),
+                "attempt_id": request.get("attempt_id"),
+                "tool_profile": tool_profile_str,
+                "transcript_sha256": _agy_transcript_sha256,
+            }
         try:
-            agy_completed = _run_agy(prompt_text, timeout_sec_agy)
+            _agy_tool_profile_ctx_token = _AGY_TOOL_PROFILE_CTX.set(tool_profile)
+            try:
+                # Issue #1771 AC4: only pass run_context= at all when this is
+                # a fan-out-correlated request. A bare positional call
+                # (identical to pre-#1771: `_run_agy(prompt_text,
+                # timeout_sec_agy)`) is preserved for the standalone case so
+                # that pre-existing test doubles / monkeypatched fakes with a
+                # 2-positional-arg-only signature (no `run_context` keyword
+                # parameter at all) keep working unmodified.
+                if _agy_run_context is not None:
+                    agy_completed = _run_agy(prompt_text, timeout_sec_agy, run_context=_agy_run_context)
+                else:
+                    agy_completed = _run_agy(prompt_text, timeout_sec_agy)
+            finally:
+                _AGY_TOOL_PROFILE_CTX.reset(_agy_tool_profile_ctx_token)
         except subprocess.TimeoutExpired:
             return {
                 "schema": "delegation_result/v1",
@@ -3639,6 +4715,9 @@ def _run_delegation_core(
                 "model_chain": [],
                 "model_downgrades": [],
                 "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
+                "parent_run_id": request.get("parent_run_id"),
+                "subtask_id": request.get("subtask_id"),
+                "attempt_id": request.get("attempt_id"),
             }
         except FileNotFoundError:
             return {
@@ -3667,6 +4746,9 @@ def _run_delegation_core(
                 "model_chain": [],
                 "model_downgrades": [],
                 "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
+                "parent_run_id": request.get("parent_run_id"),
+                "subtask_id": request.get("subtask_id"),
+                "attempt_id": request.get("attempt_id"),
             }
         except PermissionError:
             return {
@@ -3703,6 +4785,9 @@ def _run_delegation_core(
                 "model_chain": [],
                 "model_downgrades": [],
                 "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
+                "parent_run_id": request.get("parent_run_id"),
+                "subtask_id": request.get("subtask_id"),
+                "attempt_id": request.get("attempt_id"),
             }
         except Exception as exc:
             return {
@@ -3731,12 +4816,29 @@ def _run_delegation_core(
                 "model_chain": [],
                 "model_downgrades": [],
                 "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
+                "parent_run_id": request.get("parent_run_id"),
+                "subtask_id": request.get("subtask_id"),
+                "attempt_id": request.get("attempt_id"),
             }
         result = _normalize_agy_result(
             agy_completed,
             tool_profile=tool_profile_str,
             requested_model=None,
             request_warnings=request_warnings,
+            # Issue #1753: fan-out correlation ids read straight from the
+            # request (fan_out_orchestrator.run_fanout() stamps these; a
+            # standalone request simply has them absent, so .get() yields
+            # None and delegation_result/v1 stays backward-compatible).
+            parent_run_id=request.get("parent_run_id"),
+            subtask_id=request.get("subtask_id"),
+            attempt_id=request.get("attempt_id"),
+            # Issue #1771: same deterministic prompt-text hash computed
+            # earlier in this function (and, for fan-out-correlated
+            # requests, also stamped into the isolated workspace hook
+            # context via run_context on the _run_agy() call above), so
+            # delegation_result/v1's top-level transcript_sha256 always
+            # matches what the hook events for this run carry.
+            transcript_sha256=_agy_transcript_sha256,
         )
         if local_asset_retrieval_metadata is not None:
             result["local_asset_retrieval_metadata"] = local_asset_retrieval_metadata
@@ -3776,6 +4878,13 @@ def _run_delegation_core(
         "raw_command": [],
         "model_chain": [],
         "model_downgrades": [],
+        # Issue #1753: fan-out correlation ids, uniform across every
+        # delegation_result/v1 construction site in this module. base_result
+        # is reused/mutated across every gemini (provider="gemini") branch
+        # below, so setting this once here covers all of them.
+        "parent_run_id": request.get("parent_run_id"),
+        "subtask_id": request.get("subtask_id"),
+        "attempt_id": request.get("attempt_id"),
     }
 
     if validation_errors:
@@ -3936,6 +5045,9 @@ def _run_delegation_core(
             # Non-blocker: pass the computed model chain so the normalized
             # result carries the real chain, not a [actual_model] stub.
             model_chain=list(model_chain),
+            parent_run_id=request.get("parent_run_id"),
+            subtask_id=request.get("subtask_id"),
+            attempt_id=request.get("attempt_id"),
         )
 
     # --- Model chain loop ---
@@ -4326,6 +5438,9 @@ def _provider_auto_unsupported_profile_result(
         "raw_command": [],
         "model_chain": [],
         "model_downgrades": [],
+        "parent_run_id": request.get("parent_run_id"),
+        "subtask_id": request.get("subtask_id"),
+        "attempt_id": request.get("attempt_id"),
         "selected_provider": None,
         "provider_attempts": [],
         "fallback_reason": "stop_if:provider_profile_unsupported",
@@ -4636,6 +5751,11 @@ def main(argv: list[str] | None = None) -> int:
                 "warnings": ["request file must contain a JSON object"],
                 "failure_reason": "request file must contain a JSON object",
                 "raw_command": [],
+                # Issue #1753: request is not a Mapping here, so there is no
+                # source to read fan-out correlation ids from.
+                "parent_run_id": None,
+                "subtask_id": None,
+                "attempt_id": None,
             }
         else:
             result = run_delegation(request, request_path=request_file)

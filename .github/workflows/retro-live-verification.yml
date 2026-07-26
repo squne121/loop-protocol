@@ -1,0 +1,192 @@
+name: retro-live-verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_json_path:
+        description: Workspace-relative path to a pre-generated retro_live_verification/v2 manifest JSON file (no absolute paths, no path traversal, no symlinks). Mutually exclusive with dual_target_manifest_json_path.
+        type: string
+        required: false
+        default: ''
+      # Issue #1415 P0-3 fix_delta (post-#1747 adversarial review): the v3
+      # dual-target (retro_live_verification/v3) counterpart to
+      # manifest_json_path above. Exactly one of the two must be non-empty;
+      # the "Validate manifest path safety" step below enforces this and
+      # applies the same path-safety checks to whichever one is set.
+      dual_target_manifest_json_path:
+        description: Workspace-relative path to a pre-generated retro_live_verification/v3 dual-target bundle JSON file (no absolute paths, no path traversal, no symlinks). Mutually exclusive with manifest_json_path.
+        type: string
+        required: false
+        default: ''
+      dry_run:
+        description: Keep the post step in dry-run mode (no GitHub write)
+        type: boolean
+        required: true
+        default: true
+  pull_request:
+    paths:
+      - package.json
+      - pnpm-lock.yaml
+      - docs/schemas/retro-live-verification.schema.json
+      - scripts/generate-retro-live-verification.mjs
+      - scripts/check-retro-live-verification.mjs
+      - scripts/post-retro-live-verification.mjs
+      - tests/retro-live-verification.test.ts
+      - tests/fixtures/retro-live-verification/**
+      - .github/workflows/retro-live-verification.yml
+
+permissions: {}
+
+# Single-writer constraint (Issue #1709 In Scope): only one post-retro-live-
+# verification write should ever be in flight for a given manifest/target at
+# a time. Concurrency is scoped per-workflow-dispatch-input manifest path (the
+# closest available proxy for "target" in the workflow_dispatch event
+# context; GitHub Actions concurrency-group expressions cannot read file
+# content, so the true `repo + issue_number + ownership_marker` key the
+# manifest encodes cannot be evaluated here -- Issue #1709 PR review P1-1
+# accepted limitation, tracked as a follow-up). `pull_request` runs (which
+# have no `inputs`) fall back to `github.ref` so unrelated PRs never
+# needlessly serialize against each other.
+concurrency:
+  group: retro-live-verification-${{ github.workflow }}-${{ inputs.manifest_json_path || inputs.dual_target_manifest_json_path || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Read-only static verification: schema validation + Vitest unit/negative
+  # fixtures + pnpm gate registry security-boundary regression. Runs on
+  # pull_request; never posts a live GitHub comment.
+  verify-static:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5, persist-credentials defaults to true here but this job never pushes
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run retro-live-verification Vitest suite
+        run: pnpm vitest run tests/retro-live-verification.test.ts
+
+  # Single-writer live post job (workflow_dispatch only, protected default
+  # branch only). Never runs on pull_request, matching the single-writer /
+  # trusted-actor-allowlist constraints in
+  # scripts/post-retro-live-verification.mjs.
+  #
+  # Trust boundary (Issue #1709 PR review P0-2): `workflow_dispatch` lets any
+  # actor with write access choose an arbitrary ref to run. This job is
+  # gated to `github.ref == 'refs/heads/main'` so it can only ever execute
+  # code from the protected default branch, and should additionally be
+  # bound to a GitHub Environment (`retro-live-verification-write`, to be
+  # configured in repository settings with required reviewers) so a human
+  # approval gate sits between "someone triggered workflow_dispatch" and
+  # "write-token code actually runs" -- environment protection rules
+  # themselves cannot be expressed in this YAML file and must be configured
+  # out-of-band by a repository admin.
+  post-canonical-comment:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: retro-live-verification-write
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MANIFEST_PATH: ${{ inputs.manifest_json_path }}
+      DUAL_TARGET_MANIFEST_PATH: ${{ inputs.dual_target_manifest_json_path }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      # `github.triggering_actor` is the authenticated identity that actually
+      # invoked this run (via the GitHub API / UI), not a free-text workflow
+      # input. Issue #1709 PR review P0-2: the previous `current_actor`
+      # input was a self-reported string never bound to any authenticated
+      # identity.
+      CURRENT_ACTOR: ${{ github.triggering_actor }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Issue #1415 P0-3 fix_delta: manifest_json_path (v2) and
+      # dual_target_manifest_json_path (v3) are mutually exclusive inputs;
+      # exactly one must be non-empty. The path-safety checks below apply
+      # identically to whichever one is set.
+      - name: Validate exactly one manifest input is set
+        run: |
+          set -euo pipefail
+          if [ -n "$MANIFEST_PATH" ] && [ -n "$DUAL_TARGET_MANIFEST_PATH" ]; then
+            echo "manifest_json_path and dual_target_manifest_json_path are mutually exclusive; set only one" >&2
+            exit 1
+          fi
+          if [ -z "$MANIFEST_PATH" ] && [ -z "$DUAL_TARGET_MANIFEST_PATH" ]; then
+            echo "one of manifest_json_path or dual_target_manifest_json_path is required" >&2
+            exit 1
+          fi
+
+      - name: Validate manifest path safety
+        run: |
+          set -euo pipefail
+          target_path="${MANIFEST_PATH:-$DUAL_TARGET_MANIFEST_PATH}"
+          case "$target_path" in
+            /*)
+              echo "manifest path must be workspace-relative, not absolute: $target_path" >&2
+              exit 1
+              ;;
+          esac
+          if [ -L "$target_path" ]; then
+            echo "manifest path must not be a symlink: $target_path" >&2
+            exit 1
+          fi
+          resolved="$(realpath -m -- "$GITHUB_WORKSPACE/$target_path")"
+          case "$resolved" in
+            "$GITHUB_WORKSPACE"/*) ;;
+            *)
+              echo "manifest path escapes the workspace: $resolved" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Post canonical retro-live-verification comment (v2)
+        if: ${{ inputs.manifest_json_path != '' }}
+        run: pnpm retro-live-verification:post -- --manifest-json "$MANIFEST_PATH" --current-actor "$CURRENT_ACTOR" --dry-run "$DRY_RUN"
+
+      # `inputs.dry_run` is a Boolean workflow_dispatch input; the GitHub
+      # Actions expression language's loose (in)equality coerces a
+      # non-numeric string like 'false' to NaN, so a string comparison
+      # (`inputs.dry_run == 'false'`) can never be true for a Boolean input
+      # and this step would silently always be skipped (Issue #1709 PR
+      # review P0-1). `!inputs.dry_run` operates on the Boolean value
+      # directly.
+      - name: Verify canonical comment landed correctly (v2)
+        if: ${{ inputs.manifest_json_path != '' && !inputs.dry_run }}
+        run: pnpm retro-live-verification:verify -- --manifest-json "$MANIFEST_PATH"
+
+      # Issue #1415 P0-3 fix_delta: the v3 dual-target counterpart. Trust is
+      # bound to the same authenticated `github.triggering_actor`; there is
+      # no separate trusted-actor input to keep this consistent with the v2
+      # branch above rather than accepting a free-text allowlist from the
+      # dispatch caller.
+      - name: Post canonical retro-live-verification comment (v3 dual-target)
+        if: ${{ inputs.dual_target_manifest_json_path != '' }}
+        run: pnpm retro-live-verification:post -- --dual-target-manifest-json "$DUAL_TARGET_MANIFEST_PATH" --current-actor "$CURRENT_ACTOR" --trusted-actor "$CURRENT_ACTOR" --dry-run "$DRY_RUN"

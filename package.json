@@ -24,11 +24,15 @@
     "test:e2e:debug": "playwright test --debug",
     "test:e2e:headed": "playwright test --headed",
     "test:e2e:preview-namespace": "rm -rf dist && pnpm build && LOOP_E2E_PREVIEW_NAMESPACE_LANE=true playwright test",
+    "test:vrt": "VITE_E2E_MODE=true pnpm build && LOOP_VRT_LANE=true playwright test tests/e2e/visual-overlay.spec.ts",
+    "test:vrt:e2e": "LOOP_VRT_LANE=true playwright test tests/e2e/visual-overlay.spec.ts",
     "playwright:install": "playwright install",
     "playwright:install:ci": "playwright install --with-deps chromium",
     "policy:check:secret": "uv run --locked python .claude/scripts/check_secret_policy.py docs/dev/secret-policy.md",
     "policy:check:session": "uv run --locked python .claude/scripts/check_session_recording_policy.py docs/dev/session-recording-policy.md",
-    "policy:check": "pnpm run policy:check:secret && pnpm run policy:check:session",
+    "policy:check:ci-performance": "uv run --locked pytest .claude/skills/ci-test-performance/scripts/tests/test_validate_ci_performance_assessment_v2.py",
+    "policy:validate:ci-performance": "uv run --locked python .claude/skills/ci-test-performance/scripts/validate_ci_performance_assessment_v2.py",
+    "policy:check": "pnpm run policy:check:secret && pnpm run policy:check:session && pnpm run policy:check:ci-performance",
     "manifest:check": "node scripts/check-agent-session-manifests.mjs",
     "smoke-verdict:check": "node scripts/check-session-recording-smoke-verdict.mjs",
     "agent-run-report:check": "node scripts/check-agent-run-reports.mjs",
@@ -56,7 +60,10 @@
     "security:session-recording:runtime": "pnpm run security:session-recording:fixture",
     "security:session-recording:host": "uv run --locked python3 .claude/scripts/check_session_recording_runtime_safety.py --json --execution-profile host",
     "latitude:real-pilot:preflight": "uv run --locked python3 .claude/scripts/check_session_recording_runtime_safety.py --json --execution-profile host --require-real-pilot-activation",
-    "entirecli:check": "node scripts/agent-logs/check-entirecli-safety.mjs"
+    "entirecli:check": "node scripts/agent-logs/check-entirecli-safety.mjs",
+    "retro-live-verification:generate": "node scripts/generate-retro-live-verification.mjs",
+    "retro-live-verification:post": "node scripts/post-retro-live-verification.mjs",
+    "retro-live-verification:verify": "node scripts/check-retro-live-verification.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

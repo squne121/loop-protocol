@@ -40,6 +40,22 @@ function payloadText(payload: Record<string, unknown>) {
   return String(payload.last_assistant_message ?? '')
 }
 
+// Extract several high-distinctiveness fragments from the payload body so a
+// partial leak (a single line, a truncated tail, a dropped trailing newline)
+// is caught even though it would not match a full-text `toContain` check
+// against the entire `payloadText(payload)` string (PR #1741 review P1-2).
+function payloadCanaryFragments(payload: Record<string, unknown>): string[] {
+  const text = payloadText(payload)
+  const fragments: string[] = []
+  const schemaMatch = text.match(/ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:/)
+  if (schemaMatch) fragments.push(schemaMatch[0])
+  const invocationMatch = text.match(/invocation_id:\s*\S+/)
+  if (invocationMatch) fragments.push(invocationMatch[0])
+  const generatedAtMatch = text.match(/generated_at:\s*\S+/)
+  if (generatedAtMatch) fragments.push(generatedAtMatch[0])
+  return fragments
+}
+
 // Resolve a real python3 interpreter once — the adapter's Node-only gate
 // requires readiness.interpreter_realpath to be an existing regular file
 // (Issue #1527 Scope Delta (2) AC1/AC17).
@@ -180,60 +196,61 @@ describe('Codex SubagentStop scope-rollup capture adapter', () => {
     expect(result.stderr).toContain('eligibility_missing')
   })
 
-  it('source-bound eligibility rejects missing stale invalid and mismatched artifacts', () => {
-    const basePayload = readFixture('codex-scope-rollup-runner-stop.json')
-    const cases: Array<{ name: string; overrides: FixedLocationOverrides; expectReason: string }> = [
-      {
-        name: 'missing readiness artifact',
-        overrides: { skipReadiness: true },
-        expectReason: 'readiness_missing',
+  const sourceBoundRejectionCases: Array<{ name: string; overrides: FixedLocationOverrides; expectReason: string }> = [
+    {
+      name: 'missing readiness artifact',
+      overrides: { skipReadiness: true },
+      expectReason: 'readiness_missing',
+    },
+    {
+      name: 'stale (future) eligibility artifact',
+      overrides: { eligibilityGeneratedAt: new Date(Date.now() + 60_000).toISOString() },
+      expectReason: 'eligibility_stale_future_generated_at',
+    },
+    {
+      name: 'expired eligibility artifact',
+      overrides: {
+        eligibilityGeneratedAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+        eligibilityExpiresAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
       },
-      {
-        name: 'stale (future) eligibility artifact',
-        overrides: { eligibilityGeneratedAt: new Date(Date.now() + 60_000).toISOString() },
-        expectReason: 'eligibility_stale_future_generated_at',
-      },
-      {
-        name: 'expired eligibility artifact',
-        overrides: {
-          eligibilityGeneratedAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
-          eligibilityExpiresAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
-        },
-        expectReason: 'eligibility_stale_expired',
-      },
-      {
-        name: 'invalid readiness (unprepared)',
-        overrides: { readinessPrepared: false },
-        expectReason: 'readiness_unprepared',
-      },
-      {
-        name: 'mismatched repo root binding',
-        overrides: { eligibilityRepoRootRealpath: '/nonexistent/other/repo' },
-        expectReason: 'eligibility_binding_repo_mismatch',
-      },
-      {
-        name: 'unsafe secrets_mode',
-        overrides: { eligibilitySecretsMode: 'app_secret' },
-        expectReason: 'eligibility_binding_secrets_mode_unsafe',
-      },
-      {
-        name: 'safety_verdict deny',
-        overrides: { eligibilitySafetyVerdict: 'deny' },
-        expectReason: 'eligibility_binding_safety_verdict_denied',
-      },
-      {
-        name: 'additionalProperties rejected',
-        overrides: { eligibilityExtraKey: true },
-        expectReason: 'eligibility_invalid_additional_properties',
-      },
-      {
-        name: 'missing required key rejected',
-        overrides: { eligibilityMissingKey: true },
-        expectReason: 'eligibility_invalid_additional_properties',
-      },
-    ]
+      expectReason: 'eligibility_stale_expired',
+    },
+    {
+      name: 'invalid readiness (unprepared)',
+      overrides: { readinessPrepared: false },
+      expectReason: 'readiness_unprepared',
+    },
+    {
+      name: 'mismatched repo root binding',
+      overrides: { eligibilityRepoRootRealpath: '/nonexistent/other/repo' },
+      expectReason: 'eligibility_binding_repo_mismatch',
+    },
+    {
+      name: 'unsafe secrets_mode',
+      overrides: { eligibilitySecretsMode: 'app_secret' },
+      expectReason: 'eligibility_binding_secrets_mode_unsafe',
+    },
+    {
+      name: 'safety_verdict deny',
+      overrides: { eligibilitySafetyVerdict: 'deny' },
+      expectReason: 'eligibility_binding_safety_verdict_denied',
+    },
+    {
+      name: 'additionalProperties rejected',
+      overrides: { eligibilityExtraKey: true },
+      expectReason: 'eligibility_invalid_additional_properties',
+    },
+    {
+      name: 'missing required key rejected',
+      overrides: { eligibilityMissingKey: true },
+      expectReason: 'eligibility_invalid_additional_properties',
+    },
+  ]
 
-    for (const { overrides, expectReason } of cases) {
+  it.each(sourceBoundRejectionCases)(
+    'source-bound eligibility rejects: $name',
+    ({ overrides, expectReason }) => {
+      const basePayload = readFixture('codex-scope-rollup-runner-stop.json')
       const captureDirectory = isolatedDirectory()
       const artifactDirectory = isolatedDirectory()
       const env = writeFixedLocationArtifacts(artifactDirectory, overrides)
@@ -242,8 +259,8 @@ describe('Codex SubagentStop scope-rollup capture adapter', () => {
       expect(result.status).toBe(0)
       expect(readdirSync(captureDirectory).filter((name) => name.endsWith('.txt'))).toHaveLength(0)
       expect(result.stderr).toContain(expectReason)
-    }
-  })
+    },
+  )
 
   it('valid eligibility writes canonical capture', () => {
     const captureDirectory = isolatedDirectory()
@@ -325,8 +342,35 @@ describe('Codex SubagentStop scope-rollup capture adapter', () => {
     expect(readFileSync(resolve(captureDirectory, names[0]), 'utf8')).toContain('capture_status: parser_rejected')
   })
 
-  it('GIVEN transport fixture failures WHEN the adapter runs THEN transport failures are bounded and redacted', () => {
-    for (const fixture of ['nonzero.py', 'timeout.py']) {
+  // Issue #1727: split via it.each (following the sourceBoundRejectionCases
+  // pattern established for #1693 / PR #1699) so nonzero.py and timeout.py
+  // are independently named test cases rather than a shared for-loop body —
+  // a failure in one fixture no longer masks or aggregates with the other,
+  // and each case can assert its own fixed reason code. The elapsedMs upper
+  // bound assertion is intentionally removed (performance_claim: no_claim);
+  // each case's own Vitest timeout (10000ms) leaves headroom past the
+  // adapter's outer spawnSync watchdog (7000ms) for the child process's own
+  // termination/grace handling and Vitest/runner scheduling overhead — the
+  // watchdog fires the diagnostic well before this per-case timeout would
+  // ever be reached under normal conditions, but spawnSync does not
+  // guarantee the child is reaped and control returned at exactly 7000ms,
+  // so a hard "comfortably above" upper bound is not asserted here.
+  //
+  // Fixture canary note (PR #1741 review P1-2): `nonzero.py` writes a
+  // literal 'scope-rollup-fixture' canary to stdout/stderr before exiting
+  // non-zero, so the canary non-leak assertion below is meaningful for that
+  // case. `timeout.py` only sleeps and is killed by the watchdog before it
+  // ever produces output, so the same canary assertion is vacuously true for
+  // that case (it never had a canary to leak) — the payload-fragment
+  // non-leak assertions are what actually exercise redaction for both cases.
+  const transportFixtureFailureCases: Array<{ name: string; fixture: string; expectedReasonCode: string }> = [
+    { name: 'nonzero.py', fixture: 'nonzero.py', expectedReasonCode: 'capture_nonzero' },
+    { name: 'timeout.py', fixture: 'timeout.py', expectedReasonCode: 'capture_timeout' },
+  ]
+
+  it.each(transportFixtureFailureCases)(
+    'GIVEN transport fixture failures WHEN the adapter runs THEN transport failures are bounded and redacted: $name',
+    ({ fixture, expectedReasonCode }) => {
       const captureDirectory = isolatedDirectory()
       const artifactDirectory = isolatedDirectory()
       const env = writeFixedLocationArtifacts(artifactDirectory)
@@ -338,13 +382,32 @@ describe('Codex SubagentStop scope-rollup capture adapter', () => {
         { NODE_ENV: 'test', ...env },
       )
 
+      expect(result.error).toBeUndefined()
+      expect(result.signal).toBeNull()
       expect(result.status).toBe(0)
-      expect(result.elapsedMs).toBeLessThan(6500)
       expect(result.stdout.trim()).toBe('{"continue":true}')
+      // P2-2: the capture directory must be entirely empty, not merely free
+      // of `.txt` canonical captures — a transport failure must not leave
+      // behind any unexpected artifact (sidecar, partial write, etc.).
+      expect(readdirSync(captureDirectory)).toEqual([])
       expect(result.stderr).not.toContain('scope-rollup-fixture')
-      expect(result.stderr).not.toContain(payloadText(payload))
-    }
-  }, 7000)
+      const canaryFragments = payloadCanaryFragments(payload)
+      expect(canaryFragments.length).toBeGreaterThan(0)
+      for (const fragment of canaryFragments) {
+        expect(result.stderr).not.toContain(fragment)
+        expect(result.stdout).not.toContain(fragment)
+      }
+      // P1-1: assert the exact fixed diagnostic line rather than a
+      // substring match, so a diagnostic that mixes in an unexpected
+      // reason code (or omits the expected one entirely) cannot pass.
+      const expectedDiagnostic = `[codex-hook-adapter] warn: scope-rollup capture skipped (${expectedReasonCode})`
+      const transportDiagnostics = result.stderr
+        .split(/\r?\n/)
+        .filter((line) => line.includes('scope-rollup capture skipped ('))
+      expect(transportDiagnostics).toEqual([expectedDiagnostic])
+    },
+    10000,
+  )
 
   it('timeout terminates process tree without late write', () => {
     const captureDirectory = isolatedDirectory()

@@ -396,6 +396,104 @@ child process に親 env をそのまま継承せず、`PATH` / `HOME` / locale 
 - その場合は allowlist 拡張の可否を人間レビューで判断する
 - stdout / stderr sample は redact-before-truncate の順序で保存する
 
+### `materialize_isolated_agy_workspace()` の環境変数 allowlist 拡張（Issue #1726）
+
+`agy_permission_policy.py` の `materialize_isolated_agy_workspace()` は、`PATH` / `LANG` / `LC_ALL` / `TERM` に加え、
+既存の認証済みセッション（system keyring / dbus secret service）へ子プロセスが到達できるよう
+`DBUS_SESSION_BUS_ADDRESS` と `XDG_RUNTIME_DIR` を環境変数 allowlist に追加している。
+
+- `DBUS_SESSION_BUS_ADDRESS`（例: `unix:path=/run/user/1000/bus`）と `XDG_RUNTIME_DIR`（例: `/run/user/1000`）は
+  いずれも Unix ソケットパス／ソケットディレクトリパスという *接続先エンドポイント* の値であり、
+  credential 値（token 文字列・cookie・鍵の内容）そのものではない
+- 上記2変数の追加後も `HOME` / `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` / `XDG_STATE_HOME` は
+  isolated tmp workspace 配下へ差し替えたまま維持しており（#1705 の secret-hygiene 設計の根幹は不変）、
+  `dbus_session_bus_present` / `xdg_runtime_dir_present`（上記 `auth_diagnostics_metadata`）が
+  `true` になった状態で isolated workspace 内から到達性が確認できることを
+  `test_agy_permission_policy_env_allowlist.py` の hermetic テスト（モック化した dbus/keyring エンドポイント）で回帰確認する
+
+### `materialize_isolated_agy_workspace()` の gcloud ADC 露出（Issue #1730）
+
+#1726 で `DBUS_SESSION_BUS_ADDRESS` / `XDG_RUNTIME_DIR` を到達性変数として追加した後も、
+#1494 の live fan-out 実行では全 subtask が `failure_class: "agy_auth_required"` で失敗し続けた。
+原因調査の結果、実行環境の `agy` 認証キャッシュは dbus secret-service ではなく、
+`$HOME/.config/gcloud/application_default_credentials.json` / `$HOME/.config/gcloud/access_tokens.db`
+（gcloud Application Default Credentials、ファイルベース）に依存していることが判明した。
+
+- `materialize_isolated_agy_workspace()` は、実行環境の `$HOME/.config/gcloud` ディレクトリが存在する場合、
+  そのディレクトリを isolated workspace の `XDG_CONFIG_HOME` 配下（`<isolated>/xdg-config/gcloud`）へ
+  symlink として read-only に露出する（`_expose_gcloud_adc_read_only()`）
+- symlink の作成はパス文字列の書き込みのみであり、実装コード自身はファイル内容を一切 open/read しない
+  （`Path.is_dir()` / `Path.is_file()` などの存在確認とパス操作のみ、Issue #1730 AC1/AC5）
+- 露出される範囲は `$HOME/.config/gcloud` 配下のみであり、isolated `HOME` 自体や `.ssh` / `.netrc` /
+  他の `.config/*` アプリなど、他の実 `$HOME` 配下ディレクトリは一切露出されない（AC3）
+- `GOOGLE_APPLICATION_CREDENTIALS` が実行環境に設定済みの場合は、そのパス文字列（credential 値ではない）
+  をそのまま isolated workspace の env へ透過する（AC2）
+- 上記変更後も `HOME` / `XDG_CACHE_HOME` / `XDG_STATE_HOME` の isolated tmp workspace への差し替えは
+  維持されており（#1705 の secret-hygiene 設計の根幹は不変）、tool deny 機構（no_tools/local_asset_research
+  全 deny、grounded_research allowlist 限定）も影響を受けない（AC4）ことを
+  `test_agy_permission_policy_gcloud_adc.py` の hermetic テストで回帰確認する
+- `preflight_agy.py` の `_build_auth_diagnostics()` は `_detect_gcloud_adc()` により
+  `$HOME/.config/gcloud` の存在確認レベルの検出を行い、D-Bus セッションバスが存在しない環境でも
+  `auth_mode: "gcloud_adc_file_based"` を報告できる（AC7、`test_preflight_agy_gcloud_adc.py` で回帰確認）
+- live AGY 実行（`run_fanout()`）が実際に gcloud ADC を使って成功することの動作確認は、本 hermetic 変更の
+  スコープ外であり、#1494 の最終 E2E run に委ねる
+
+### `materialize_isolated_agy_workspace()` の agy 独自 OAuth トークンファイル露出（Issue #1740）
+
+#1730 で gcloud ADC 到達性（`$HOME/.config/gcloud` の read-only 露出）を追加した後も、
+#1494 の live fan-out 実行（3 回目の試行）では依然として全 subtask が
+`failure_class: "agy_auth_required"` で失敗し続けた。3 回目の詳細診断（read-only 存在確認・
+symlink 到達性検証のみ、値は一切読んでいない）で、以下が確定した。
+
+1. 隔離 workspace + as-shipped env → `agy_auth_required`
+2. 隔離 workspace + `GOOGLE_APPLICATION_CREDENTIALS` を実 gcloud ADC ファイルパスへ明示設定
+   → それでも `agy_auth_required`（**#1730 の前提は誤りだったと判明**: `agy` は gcloud ADC /
+   `GOOGLE_APPLICATION_CREDENTIALS` を一切参照していない）
+3. 隔離 workspace + `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`（mode 600）を
+   read-only symlink として露出 → 成功（`agy -p "..."` が exit_code 0 で応答）
+
+実行環境の `agy`（Antigravity CLI）は独自の OAuth トークンファイル
+`$HOME/.gemini/antigravity-cli/antigravity-oauth-token` を認証に使用しており、
+dbus secret-service（#1726 の到達性追加）でも gcloud ADC（#1730 の到達性追加）でもなかった。
+#1726 / #1730 で追加した dbus / gcloud ADC 到達性変数・symlink 自体は、将来別環境で必要になる
+可能性があるため削除せず維持する（`DBUS_SESSION_BUS_ADDRESS` / `XDG_RUNTIME_DIR` /
+`_expose_gcloud_adc_read_only()` はそのまま）。
+
+- `materialize_isolated_agy_workspace()` は、実行環境の
+  `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` ファイルが存在する場合、
+  そのファイルを isolated workspace 自身の `HOME` 配下
+  （`<isolated HOME>/.gemini/antigravity-cli/antigravity-oauth-token`）へ symlink として
+  read-only に露出する（`_expose_agy_oauth_token_read_only()`）。**Issue #1743**:
+  #1740 の初期実装は誤って isolated workspace の `XDG_CONFIG_HOME` 配下
+  （isolated workspace の `XDG_CONFIG_HOME` 配下の `antigravity-cli/antigravity-oauth-token` サブパス）へ配置しており、
+  実際の `agy` バイナリはこのファイルを `$HOME/.gemini/antigravity-cli/` から直接読むため、
+  この配置先の symlink 自体は作成に成功しても `agy -p` は引き続き `agy_auth_required` で
+  失敗していた。#1494 の 4 回目の live fan-out 試行時の control-plane 診断（値は一切読まず、
+  symlink 到達性のみで検証）で、配置先を isolated `HOME`（`$ISOLATED_HOME/.gemini/antigravity-cli/`、
+  `agy` 自身が生成する state directory 構造と一致）に変更すれば `agy -p` が成功することを確認し、
+  #1743 で `_expose_agy_oauth_token_read_only()` の配置先ロジックを修正した
+  （`_expose_gcloud_adc_read_only()`（Issue #1730、gcloud ADC 側）は `XDG_CONFIG_HOME` 配下の
+  ままで変更していない -- gcloud ADC は本来 `$XDG_CONFIG_HOME/gcloud` 規約に従うため）
+- symlink の作成はパス文字列の書き込みのみであり、実装コード自身はファイル内容を一切 open/read しない
+  （`Path.is_file()` などの存在確認とパス操作のみ、Issue #1740 AC1/AC3）
+- 露出される範囲は `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` の 1 ファイルのみであり、
+  isolated `HOME` 自体や `.ssh` / `.netrc` / 同ディレクトリ内の他ファイル
+  （`jetski_state.pbtxt` / `history.jsonl` / `settings.json`、いずれも実行環境で存在確認済みだが
+  今回は露出対象外と判断した）など、他の実 `$HOME` 配下ファイル・ディレクトリは一切露出されない（AC4）。
+  トークンファイル単体の露出のみで `agy -p` の成功が確認できたため、secret-hygiene 設計の趣旨
+  （Issue #1705）を維持する最小露出とした
+- 上記変更後も `HOME` / `XDG_CACHE_HOME` / `XDG_STATE_HOME` の isolated tmp workspace への
+  差し替えは維持されており（#1705 の secret-hygiene 設計の根幹は不変）、tool deny 機構
+  （no_tools/local_asset_research 全 deny、grounded_research allowlist 限定）も影響を受けない
+  （AC5）ことを `test_agy_permission_policy_oauth_token.py` の hermetic テストで回帰確認する
+- `preflight_agy.py` の `_build_auth_diagnostics()` は `_detect_agy_oauth_token()` により
+  `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` の存在確認レベルの検出を行い、
+  `auth_mode: "agy_oauth_token_file_based"` を、gcloud ADC / dbus 推定より優先して報告する
+  （AC9、`test_preflight_agy_oauth_token.py` で回帰確認）。gcloud ADC 推定（`gcloud_adc_file_based`）
+  は agy OAuth トークンファイルが存在しない場合のフォールバックとして維持する
+- live AGY 実行（`run_fanout()`）が実際に agy OAuth トークンファイルを使って成功することの
+  動作確認は、本 hermetic 変更のスコープ外であり、#1494 の最終 E2E run に委ねる
+
 ## Live Evidence 保存方針 / 証跡保存ルール
 
 `docs/dev/agy-cli-contract-20260701.md` は手書きメモではなく、sanitized `preflight_agy.py --json` 出力を要約する一次証跡として維持する。

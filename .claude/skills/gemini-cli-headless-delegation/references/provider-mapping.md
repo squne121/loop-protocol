@@ -121,6 +121,39 @@ agy は isolated temp cwd から実行し、repo のファイルシステムに�
 
 context path の repo boundary / symlink / payload 検証で 1 件でも失敗した場合、wrapper は payload の `stat()` / `read_text()` へ進まず fail-closed する。
 
+### `evidence_targets`（targeted-evidence 契約、Issue #1638）
+
+`local_asset_research` request は `context_files` の代わりに `evidence_targets`（repo-relative path
++ bounded selector のリスト）を宣言できる。この経路は live SerenaMCP retrieval を使わず、wrapper が
+declared target ごとに実ファイルを直接 read-only で読み、selector（現状 `line_range` のみ）が示す
+行範囲そのものを source text として evidence envelope に含める。
+
+- `path` / `selector`（`kind: "line_range"`, `start_line`, `end_line`）を宣言する。
+- wrapper は repo 境界・symlink 越境・selector 上限（400 行/target、8 target まで）を検証し、
+  違反があれば AGY を起動せず fail-close する。
+- 生成される envelope は `repo_relative_path` / `selector` / `line_range` / `sha256` /
+  `source_kind: "wrapper_read_only_targeted_evidence"` / `content`（実ソーステキスト）を持つ。
+  `content` を持たない、または空の envelope を成功として扱うことはない（metadata-only fail-close）。
+- target のファイル長超過、空 evidence、byte 数上限超過、credential-like content は、いずれも
+  AGY subprocess 起動前に fail-close する。
+- prompt に注入されるのは上記 envelope のみで、repo 絶対パス、`.agents/mcp_config.json` の内容、
+  direct tool access 手順は含まれない（既存の prompt-only 境界をそのまま継承する）。
+
+`evidence_targets` は legacy `context_files` + live SerenaMCP retrieval 経路とは排他的であり、
+`grounded_research` / `github_research` の AGY 対応や Serena MCP upstream の manifest allowlist
+拡張は本契約の scope 外のままとする。
+
+### fan-out task-linked hash chain（Issue #1706 の相関ハッシュ連鎖）
+
+`fan_out_orchestrator.run_fanout()` が `parent_run_id` / `subtask_id` / `attempt_id` を
+stamp した子 subtask request に限り、上記 `evidence_targets` 契約の上に hash chain
+（`objective_sha256` / `target_contract_sha256` / `request_sha256` / `evidence_sha256` /
+`prompt_envelope_sha256` / `result_binding_sha256`）と actor 区別（`retrieval_actor:
+wrapper_serena_mcp` / `analysis_actor: antigravity_cli` / `agy_direct_mcp_access: false`）を
+追加する。詳細な hash 定義・格納先・fail-close 条件は `usage-contract.md` の
+「fan-out task-linked Serena evidence hash chain」節を正本とする。単発（非 fan-out）の
+`evidence_targets` request にはこの拡張は一切適用されない。
+
 ### AC3 / AC8: JSON envelope と結果正規化の差分
 
 `agy` の stdout は Gemini JSON envelope（`_parse_envelope` が解析する `{"response": ...}` 形式）を返さない。
@@ -209,3 +242,23 @@ agy 優先の fallback 順序を確認できる。
 | `--fix` | `unsupported_provider_option` で拒否（副作用対象が曖昧なため） | 該当なし（runtime dispatch に `--fix` 相当の概念はない） |
 
 2 つの順序が意図的に異なる理由: `setup_check_order` は「まず agy が使えるかを優先的に確認したい」という診断上の関心であるのに対し、`runtime_order` は「Gemini を既定 provider として維持しつつ quota/capacity 失敗時のみ agy にフォールバックする」という実行時の安全側デフォルトである。両者は独立したポリシーであり、一致している必要はない（`config/model_routing.yaml` の `provider_auto_policy_v1` ブロックのコメントを参照）。なお `references/model-routing.md` は現時点では model downgrade / role / model_chain のみを扱い、`provider_auto_policy_v1` 自体は未記載であることに注意する（本節が現状の唯一の docs 上の説明）。
+
+## AGY PreToolUse フックの来歴記録（Issue #1708 の実機 readback 調査結果）
+
+- installed Antigravity CLI version: `agy --version` → `1.1.5`（2026-07-25 readback）。
+- 公式 lifecycle hook 仕様は installed CLI 同梱の
+  `builtin/skills/agy-customizations/docs/hooks.md` を正本とする（`.agents/hooks.json`
+  配置、`PreToolUse` は `{"toolCall": {"name", "args"}, "stepIdx", "conversationId",
+  "transcriptPath", "workspacePaths", "artifactDirectoryPath", "modelName"}` を stdin
+  で受け取り、`{"decision": "allow"|"deny"|"ask"|"force_ask", ...}` を stdout へ返す
+  contract）。
+- canonical web tool 名: **`search_web`**, **`read_url_content`**（installed CLI の
+  live `PreToolUse` transcript サンプルで `toolCall.name == "search_web"` を確認
+  済み）。AGY fan-out の WebSearch/grounding 成功判定は、この `PreToolUse` hook から
+  採取する `agy_tool_provenance_v1` イベント（schema 定義は
+  `references/usage-contract.md` の「`agy_tool_provenance_v1` Schema Governance」節
+  を参照）を正本とし、AGY stdout の `tool_calls`/marker JSON は非正本の補助情報
+  （`stdout_self_report`）として扱う。
+- 実装: `.claude/skills/gemini-cli-headless-delegation/scripts/agy_tool_provenance.py`
+  （workspace-scoped `.agents/hooks.json` 動的生成、schema validator、
+  conversation/run 一致検証、redaction）。

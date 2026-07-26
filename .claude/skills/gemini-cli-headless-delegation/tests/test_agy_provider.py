@@ -955,3 +955,82 @@ def test_agy_empty_stdout_warning_matches_failure_class_when_ci_unset(monkeypatc
 
     assert result["failure_class"] == "agy_empty_stdout"
     assert result["warnings"][0].startswith("agy_empty_stdout")
+
+
+# ---------------------------------------------------------------------------
+# Issue #1749: grounded_research forces --model claude-sonnet-4-6 so agy -p
+# actually calls search_web/read_url_content instead of hallucinating a
+# "searched" answer with the default model. See run_gemini_headless.py's
+# AGY_GROUNDED_RESEARCH_MODEL docstring for the live-investigation evidence.
+# ---------------------------------------------------------------------------
+
+
+def test_issue_1749_grounded_research_forces_tool_capable_model() -> None:
+    """grounded_research profile's agy -p invocation includes --model claude-sonnet-4-6."""
+    captured_cmd: dict[str, Any] = {"value": None}
+
+    def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        captured_cmd["value"] = list(cmd)
+        return _make_completed(0, stdout="ok")
+
+    token = rgh._AGY_TOOL_PROFILE_CTX.set("grounded_research")
+    try:
+        with patch("subprocess.run", side_effect=mock_run):
+            rgh._run_agy("test prompt", 30)
+    finally:
+        rgh._AGY_TOOL_PROFILE_CTX.reset(token)
+
+    cmd = captured_cmd["value"]
+    assert cmd is not None
+    assert "--model" in cmd
+    model_index = cmd.index("--model")
+    assert cmd[model_index + 1] == rgh.AGY_GROUNDED_RESEARCH_MODEL
+    assert rgh.AGY_GROUNDED_RESEARCH_MODEL == "claude-sonnet-4-6"
+
+
+def test_issue_1749_non_grounded_research_profile_omits_model_flag() -> None:
+    """no_tools profile's agy -p invocation does NOT get the forced --model flag."""
+    captured_cmd: dict[str, Any] = {"value": None}
+
+    def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        captured_cmd["value"] = list(cmd)
+        return _make_completed(0, stdout="ok")
+
+    token = rgh._AGY_TOOL_PROFILE_CTX.set("no_tools")
+    try:
+        with patch("subprocess.run", side_effect=mock_run):
+            rgh._run_agy("test prompt", 30)
+    finally:
+        rgh._AGY_TOOL_PROFILE_CTX.reset(token)
+
+    cmd = captured_cmd["value"]
+    assert cmd is not None
+    assert "--model" not in cmd
+
+
+def test_issue_1749_grounded_research_end_to_end_forces_model_via_run_delegation() -> None:
+    """AC3/AC4: run_delegation(tool_profile=grounded_research) drives _run_agy with
+    the forced --model flag actually present in the real subprocess.run argv (not
+    just unit-level on _run_agy), proving the flag reaches the real invocation path
+    used in production, with a grounded tool_calls trace still recognized correctly.
+    """
+    captured_cmd: dict[str, Any] = {"value": None}
+    grounded_output = (
+        "Response from AGY.\n"
+        '{"grounding":{"queries":["AGY WebSearch"],"sources":[{"url":"https://example.com","title":"example"}]},'
+        '"tool_calls":[{"name":"web_search"}]}'
+    )
+
+    def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        captured_cmd["value"] = list(cmd)
+        return _make_completed(0, stdout=grounded_output)
+
+    with patch("subprocess.run", side_effect=mock_run):
+        result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
+
+    assert result["ok"] is True
+    cmd = captured_cmd["value"]
+    assert cmd is not None
+    assert "--model" in cmd
+    model_index = cmd.index("--model")
+    assert cmd[model_index + 1] == "claude-sonnet-4-6"
