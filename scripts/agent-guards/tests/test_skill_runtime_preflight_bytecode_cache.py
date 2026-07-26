@@ -269,6 +269,10 @@ def _real_repair_source() -> str:
     return (SCRIPTS_DIR / "repair_issue_contract.py").read_text(encoding="utf-8")
 
 
+def _real_validate_issue_execution_decision_source() -> str:
+    return (SCRIPTS_DIR / "validate_issue_execution_decision.py").read_text(encoding="utf-8")
+
+
 def _fixture_input_json() -> dict:
     """Reuse the repository's own known-good `preflight_pass.json` fixture
     body (already exercised by other issue-refinement-loop tests) so the
@@ -363,6 +367,10 @@ def _install_real_preflight_fixture(repo_root: Path, *, negative_writer: str | N
     _write_text(dest_scripts / "plan_refinement_loop.py", _real_planner_source())
     _write_text(dest_scripts / "command_registry.py", _real_command_registry_source())
     _write_text(dest_scripts / "repair_issue_contract.py", _real_repair_source())
+    _write_text(
+        dest_scripts / "validate_issue_execution_decision.py",
+        _real_validate_issue_execution_decision_source(),
+    )
     _write_text(
         repo_root / "docs" / "dev" / "github-ops.md",
         (REPO_ROOT / "docs" / "dev" / "github-ops.md").read_text(encoding="utf-8"),
