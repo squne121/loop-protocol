@@ -82,6 +82,7 @@ import {
   sha256Hex,
   validateManifestWithAjv,
 } from './generate-retro-live-verification.mjs'
+import { buildDualTargetOwnershipMarker } from './post-retro-live-verification.mjs'
 
 export const SCHEMA = 'retro_live_verification_check_result/v1'
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
@@ -897,6 +898,43 @@ async function verifyDualTargetTargetLiveArtifacts({ repo, targetKey, target }) 
 }
 
 /**
+ * Issue #1415 P0-B fix_delta (post-#1781 adversarial review): the v3
+ * generator emits `readback: { status: 'pending', ... }` at generation time
+ * (necessarily, since nothing has been posted yet) but nothing previously
+ * transitioned that field away from `pending` after a live post. This
+ * function is that transition: it live-lists every comment on the bundle's
+ * `parent_issue`, counts how many carry the v3 ownership marker for this
+ * exact repo/parent_issue, and reports the *observed* canonical_comment_count
+ * / duplicate_count -- not the bundle's self-declared readback block, which
+ * is never trusted here.
+ */
+export async function verifyDualTargetCanonicalReadback({ repo, parentIssue, client = new GhCliIssueCommentsClient() }) {
+  const listing = await listAllIssueCommentsStructured(client, { repo, issueNumber: parentIssue })
+  if (isPaginationRejected(listing)) {
+    return {
+      status: 'failed',
+      canonical_comment_count: null,
+      duplicate_count: null,
+      errors: [{ code: 'retro_live_verification_check.dual_target_readback_pagination_exhausted', message: `pagination did not complete while listing comments on parent issue ${parentIssue} for canonical readback` }],
+    }
+  }
+  const ownershipMarker = buildDualTargetOwnershipMarker({ repo, parentIssue })
+  const matches = (listing.comments ?? []).filter((comment) => typeof comment?.body === 'string' && comment.body.startsWith(ownershipMarker))
+  const canonicalCommentCount = matches.length
+  const duplicateCount = canonicalCommentCount > 0 ? canonicalCommentCount - 1 : 0
+  const errors = []
+  if (canonicalCommentCount !== 1) {
+    errors.push({ code: 'retro_live_verification_check.dual_target_readback_count_mismatch', message: `expected exactly 1 canonical v3 comment on parent issue ${parentIssue}, observed ${canonicalCommentCount}` })
+  }
+  return {
+    status: errors.length === 0 ? 'verified' : 'failed',
+    canonical_comment_count: canonicalCommentCount,
+    duplicate_count: duplicateCount,
+    errors,
+  }
+}
+
+/**
  * Issue #1415 (dual-target bundle): structural + context-assertion checks
  * for a retro_live_verification/v3 payload. Schema validation alone can
  * confirm both targets' comment URLs/digests are present and shaped
@@ -939,14 +977,21 @@ export async function checkDualTargetBundle(payload, { executionProfile, fixture
   })
   errors.push(...pullRequestCheck.errors)
 
+  let readback = null
   if (live) {
     const issueLive = await verifyDualTargetTargetLiveArtifacts({ repo: payload.repo, targetKey: 'issue_target', target: payload.issue_target })
     errors.push(...issueLive.errors)
     const pullRequestLive = await verifyDualTargetTargetLiveArtifacts({ repo: payload.repo, targetKey: 'pull_request_target', target: payload.pull_request_target })
     errors.push(...pullRequestLive.errors)
+
+    // Issue #1415 P0-B fix_delta: transition readback out of the generator's
+    // `pending` placeholder using an independently observed comment count,
+    // not the bundle's own self-declared readback block.
+    readback = await verifyDualTargetCanonicalReadback({ repo: payload.repo, parentIssue: payload.parent_issue })
+    errors.push(...readback.errors)
   }
 
-  return { ok: errors.length === 0, errors }
+  return { ok: errors.length === 0, errors, readback }
 }
 
 async function runStandaloneSchemaCheck(options) {
@@ -978,7 +1023,7 @@ async function runStandaloneSchemaCheck(options) {
     })
     errors.push(...bundleCheck.errors)
     const ok = bundleCheck.ok
-    process.stdout.write(`${JSON.stringify({ schema: SCHEMA, verification_status: ok ? 'pass' : 'fail', execution_profile: executionProfile, checked_at: new Date().toISOString(), errors }, null, 2)}\n`)
+    process.stdout.write(`${JSON.stringify({ schema: SCHEMA, verification_status: ok ? 'pass' : 'fail', execution_profile: executionProfile, checked_at: new Date().toISOString(), errors, readback: bundleCheck.readback }, null, 2)}\n`)
     process.exitCode = ok ? 0 : 1
     return
   }

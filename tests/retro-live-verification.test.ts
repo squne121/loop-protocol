@@ -37,6 +37,7 @@ import {
   fetchLiveCommentSet,
   isPaginationRejected,
   validateAgainstSchemaFile,
+  verifyDualTargetCanonicalReadback,
   verifyPrReviewBindingLive,
 } from '../scripts/check-retro-live-verification.mjs'
 
@@ -1478,6 +1479,75 @@ describe('Issue #1415 dual-target bundle (retro_live_verification/v3, additive s
     )
     expect(result.status).not.toBe(0)
     expect(result.stdout).toContain('retro_live_verification_check.require_live_missing_live_flag')
+  })
+})
+
+describe('Issue #1415 P0-B fix_delta: verifyDualTargetCanonicalReadback (post-#1781 adversarial review)', () => {
+  const REPO = 'squne121/loop-protocol'
+  const PARENT_ISSUE = 1153
+  const OWNERSHIP_MARKER_LINE = `<!-- retro_live_verification_v3:v1 repo=${REPO} issue=${PARENT_ISSUE} -->`
+
+  it('GIVEN exactly one comment carrying the v3 ownership marker WHEN readback runs THEN it transitions to verified with canonical_comment_count 1 and duplicate_count 0 (not the generator\'s self-declared pending)', async () => {
+    const mockClient = {
+      listIssueCommentsPage: async ({ page }) => {
+        if (page > 1) return { items: [], hasNextPage: false }
+        return {
+          items: [
+            { id: 1, body: 'some unrelated comment' },
+            { id: 2, body: `${OWNERSHIP_MARKER_LINE}\nrest of canonical body` },
+          ],
+          hasNextPage: false,
+        }
+      },
+    }
+    const result = await verifyDualTargetCanonicalReadback({ repo: REPO, parentIssue: PARENT_ISSUE, client: mockClient })
+    expect(result.status).toBe('verified')
+    expect(result.canonical_comment_count).toBe(1)
+    expect(result.duplicate_count).toBe(0)
+    expect(result.errors).toEqual([])
+  })
+
+  it('GIVEN two comments carrying the v3 ownership marker WHEN readback runs THEN it fails closed with duplicate_count 1 instead of silently reporting pass', async () => {
+    const mockClient = {
+      listIssueCommentsPage: async ({ page }) => {
+        if (page > 1) return { items: [], hasNextPage: false }
+        return {
+          items: [
+            { id: 1, body: `${OWNERSHIP_MARKER_LINE}\nfirst` },
+            { id: 2, body: `${OWNERSHIP_MARKER_LINE}\nsecond` },
+          ],
+          hasNextPage: false,
+        }
+      },
+    }
+    const result = await verifyDualTargetCanonicalReadback({ repo: REPO, parentIssue: PARENT_ISSUE, client: mockClient })
+    expect(result.status).toBe('failed')
+    expect(result.canonical_comment_count).toBe(2)
+    expect(result.duplicate_count).toBe(1)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.dual_target_readback_count_mismatch')).toBe(true)
+  })
+
+  it('GIVEN zero comments carry the v3 ownership marker WHEN readback runs THEN it fails closed rather than treating an unposted canonical comment as verified', async () => {
+    const mockClient = {
+      listIssueCommentsPage: async ({ page }) => {
+        if (page > 1) return { items: [], hasNextPage: false }
+        return { items: [{ id: 1, body: 'nothing relevant here' }], hasNextPage: false }
+      },
+    }
+    const result = await verifyDualTargetCanonicalReadback({ repo: REPO, parentIssue: PARENT_ISSUE, client: mockClient })
+    expect(result.status).toBe('failed')
+    expect(result.canonical_comment_count).toBe(0)
+    expect(result.duplicate_count).toBe(0)
+  })
+
+  it('GIVEN pagination never reaches a terminal page WHEN readback runs THEN it fails closed instead of reporting a count based on a partial scan', async () => {
+    const mockClient = {
+      listIssueCommentsPage: async () => ({ items: [{ id: 1, body: OWNERSHIP_MARKER_LINE }], hasNextPage: true }),
+    }
+    const result = await verifyDualTargetCanonicalReadback({ repo: REPO, parentIssue: PARENT_ISSUE, client: mockClient })
+    expect(result.status).toBe('failed')
+    expect(result.canonical_comment_count).toBe(null)
+    expect(result.errors.some((error) => error.code === 'retro_live_verification_check.dual_target_readback_pagination_exhausted')).toBe(true)
   })
 })
 
