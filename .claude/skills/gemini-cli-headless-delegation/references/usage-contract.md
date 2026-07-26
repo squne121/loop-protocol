@@ -519,7 +519,7 @@ while IFS= read -r line; do echo "$line" | jq . > /dev/null && echo "OK" || echo
 
 - `--compact` と `--output-format ndjson` は組み合わせ可能。compact 後のオブジェクトを1行で追記する。
 
-### `build_request.py`（provider-aware request builder, Issue #1692）
+### `build_request.py`（provider-aware な request builder。Issue #1692 で追加）
 
 ```
 build_request.py --profile <TOOL_PROFILE> --objective <STR> [--instruction <STR> ...] \
