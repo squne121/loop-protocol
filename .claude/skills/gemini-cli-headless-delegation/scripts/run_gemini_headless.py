@@ -58,6 +58,12 @@ DEFAULT_MODEL_ROUTING: dict[str, Any] = {
         "github_research": {"model_chain": ["gemini-3-flash-preview", "gemini-2.5-flash"]},
         "implementation": {"model_chain": ["gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-flash"]},
         "issue_authoring": {"model_chain": ["gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-flash"]},
+        # Issue #1777: capability-driven routing replacement for the former
+        # hardcoded (now-removed) exact-model constant. Consumed only by
+        # provider="agy" tool_profile="grounded_research" via
+        # resolve_agy_grounded_research_model() -- unrelated to the
+        # gemini-model roles above.
+        "grounded_research": {"model_chain": ["claude-sonnet-4-6"]},
     },
 }
 
@@ -272,6 +278,75 @@ def resolve_model_chain(
     if not default_chain:
         return [], "empty_chain: default_chain is empty"
     return list(default_chain), None
+
+
+def _agy_model_availability_overrides() -> dict[str, bool] | None:
+    """Issue #1777 AC3: parse the hermetic test-injection env var for the AGY
+    grounded_research model availability preflight. Returns ``None`` when
+    unset or unparsable (production default -- see `_agy_model_is_available`)."""
+    raw = os.environ.get(AGY_MODEL_AVAILABILITY_OVERRIDE_ENV)
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return {str(key): bool(value) for key, value in parsed.items()}
+
+
+def _agy_model_is_available(model: str) -> bool:
+    """Issue #1777 AC3: availability preflight for one grounded_research
+    model candidate. Every configured candidate is treated as available by
+    default (no live account/plan lookup is performed -- that live
+    verification is out of this Issue's scope, see the Issue's "Remaining
+    Parent Gaps"); `AGY_MODEL_AVAILABILITY_OVERRIDE_ENV` lets tests
+    deterministically simulate an unavailable candidate to exercise the
+    fallback-to-next-candidate / fallback-to-account_default path."""
+    overrides = _agy_model_availability_overrides()
+    if overrides is not None and model in overrides:
+        return overrides[model]
+    return True
+
+
+def resolve_agy_grounded_research_model(routing: dict[str, Any] | None = None) -> str | None:
+    """Issue #1777: resolve the AGY grounded_research `--model` candidate.
+
+    Replaces the former hardcoded exact-model constant (Issue #1777) with
+    capability-driven routing: reads
+    `roles.grounded_research.model_chain` (via `resolve_model_chain()`, so
+    `config/model_routing.yaml` overrides `DEFAULT_MODEL_ROUTING` the same
+    way every other role does), preflight-checks each candidate in order via
+    `_agy_model_is_available()`, and returns the first available one.
+
+    Returns ``None`` (meaning: run `agy -p <prompt>` with no `--model` flag
+    at all -- AGY's account_default) when the chain is empty or every
+    candidate fails the availability preflight. Model specification for
+    grounded_research is optional by design (Issue #1777 Outcome); it is
+    never a hard requirement for the call to proceed.
+    """
+    chain, _error = resolve_model_chain({"role": AGY_GROUNDED_RESEARCH_ROLE}, routing)
+    for candidate in chain:
+        if _agy_model_is_available(candidate):
+            return candidate
+    return None
+
+
+def _apply_agy_grounded_research_explicit_search_instruction(prompt_text: str) -> str:
+    """Issue #1777 AC2: ensure the outgoing grounded_research prompt always
+    carries the explicit-search-required instruction
+    (`AGY_GROUNDED_RESEARCH_EXPLICIT_SEARCH_INSTRUCTION`), which the #1777
+    grounding matrix experiment found to be the dominant reliability factor.
+    Idempotent -- does not duplicate the instruction if it is already present
+    in the supplied prompt text."""
+    if AGY_GROUNDED_RESEARCH_EXPLICIT_SEARCH_INSTRUCTION in prompt_text:
+        return prompt_text
+    if not prompt_text:
+        return AGY_GROUNDED_RESEARCH_EXPLICIT_SEARCH_INSTRUCTION
+    return f"{prompt_text}\n\n{AGY_GROUNDED_RESEARCH_EXPLICIT_SEARCH_INSTRUCTION}"
+
+
 ALLOWED_TOOL_PROFILES = {"no_tools", "grounded_research", "local_asset_research", "proposal_only", "github_research"}
 SUPPORTED_PROVIDERS: frozenset[str] = frozenset({"gemini", "agy", "auto"})
 
@@ -395,15 +470,71 @@ GITHUB_RESEARCH_PROFILE = "github_research"
 # not reliably invoke the declared `search_web` / `read_url_content` tools --
 # it narrates a plausible-looking "I searched..." answer instead of emitting a
 # real tool call (hallucination), even with `--dangerously-skip-permissions`.
-# Live investigation (see
-# `.claude/skills/gemini-cli-headless-delegation/references/agy-headless-tool-use-investigation.md`)
-# found that passing `--model claude-sonnet-4-6` makes `agy -p` reliably call
-# the declared tools in headless print mode, producing verifiable
-# (non-hallucinated) grounded output with real
-# `vertexaisearch.cloud.google.com/grounding-api-redirect/...` citation URLs.
-# This constant is only applied to the `grounded_research` tool_profile's
-# `agy -p` invocation; it does not change any other profile's model routing.
-AGY_GROUNDED_RESEARCH_MODEL = "claude-sonnet-4-6"
+# SUPERSEDED (Issue #1777): the model-selection causal claim below is
+# corrected -- see the #1777 paragraph immediately following.
+# Issue #1749's live investigation found that passing `--model
+# claude-sonnet-4-6` made `agy -p` reliably call the declared tools in
+# headless print mode. Issue #1777 ran a controlled grounding matrix
+# experiment (model_selector x prompt_template, 12 live executions) that
+# found this causal claim was NOT supported: prompt/context construction
+# (an explicit "you must search and cite the URL" instruction --
+# AGY_GROUNDED_RESEARCH_EXPLICIT_SEARCH_INSTRUCTION below) was the dominant
+# factor, not model selection (account_default and the previously-hardcoded
+# model performed statistically the same). See
+# `.claude/skills/gemini-cli-headless-delegation/references/agy-headless-tool-use-investigation.md`
+# for both the original #1749 investigation and the #1777 correction.
+#
+# Consequently, model selection for `grounded_research` is now
+# capability-driven routing (Issue #1777): candidates come from
+# `config/model_routing.yaml`'s `roles.grounded_research.model_chain` (see
+# `resolve_agy_grounded_research_model()`), model specification is optional
+# (falls back to `agy`'s account_default -- no `--model` flag at all -- when
+# the chain is empty or every candidate fails the availability preflight),
+# and the explicit-search prompt instruction is always applied regardless of
+# which model (if any) ends up selected.
+AGY_GROUNDED_RESEARCH_ROLE = "grounded_research"
+
+# Issue #1777 AC4/AC5: bounded retry budget for grounded_research
+# hallucination/no-citation failures. Each retry re-invokes `_run_agy()` as a
+# brand-new subprocess (fresh session -- no prior natural-language response
+# is carried over); this is a *count* of additional attempts beyond the
+# first, so the total number of `agy -p` invocations for one
+# `run_delegation(tool_profile="grounded_research")` call is bounded by
+# `AGY_GROUNDED_RESEARCH_RETRY_LIMIT + 1`.
+AGY_GROUNDED_RESEARCH_RETRY_LIMIT = 2
+
+# Issue #1777 AC2: explicit-search-required instruction. The #1777 grounding
+# matrix experiment found this instruction text was the dominant factor in
+# whether `agy -p` actually called the declared `search_web` tool (83%
+# success with it vs 17% without, across the tested model selectors) -- far
+# more significant than which model was selected. Always applied to the
+# outgoing `grounded_research` prompt for provider="agy" (see
+# `_apply_agy_grounded_research_explicit_search_instruction()`).
+AGY_GROUNDED_RESEARCH_EXPLICIT_SEARCH_INSTRUCTION = (
+    "You MUST call a real web search tool (search_web / read_url_content) for this "
+    "request before answering, and you MUST cite the exact source URL(s) returned by "
+    "that tool call in your response. Do not answer from prior knowledge alone, and do "
+    "not narrate a plausible-looking \"I searched...\" answer without a real tool call."
+)
+
+# Issue #1777 AC3: hermetic test-injection point for the grounded_research
+# model availability preflight (`_agy_model_is_available()`). JSON mapping of
+# {model_id: bool}. Unset in production -- every configured candidate is
+# treated as available there; tests set this to simulate an unavailable
+# candidate to exercise the fallback-to-account_default (no `--model` flag)
+# path deterministically, without any live account/plan lookup.
+AGY_MODEL_AVAILABILITY_OVERRIDE_ENV = "AGY_MODEL_AVAILABILITY_OVERRIDE_JSON"
+
+# Issue #1777 AC4: the only `_build_agy_grounded_research_metadata()`
+# `grounding_failure_class` values that are worth a fresh-session retry --
+# both are hallucination/no-citation shaped (AGY either never made a
+# verifiable web tool call, or made one but returned no citation). Every
+# other failure_class (redaction failure, quota exhaustion, process-level
+# errors) is NOT in this set and is returned immediately without retrying.
+_AGY_GROUNDED_RESEARCH_RETRYABLE_FAILURE_CLASSES = frozenset({
+    "agy_web_grounding_tool_call_missing",
+    "agy_web_grounding_no_citations",
+})
 SERENA_TOOL_CONTRACT_UNKNOWN_POLICY = "exact_match"
 LOCAL_ASSET_MAX_CONTEXT_FILES = 32
 LOCAL_ASSET_MAX_CONTEXT_BYTES = 200_000
@@ -2497,11 +2628,15 @@ def _run_agy(
     command = [agy_bin, "-p", prompt]
     tool_profile = _AGY_TOOL_PROFILE_CTX.get()
     if tool_profile == GROUNDED_RESEARCH_PROFILE:
-        # Issue #1749: force a model that actually calls the declared
-        # search_web/read_url_content tools in headless print mode instead
-        # of hallucinating a "searched" answer. See AGY_GROUNDED_RESEARCH_MODEL
-        # docstring above for the live-investigation evidence.
-        command = [agy_bin, "-p", prompt, "--model", AGY_GROUNDED_RESEARCH_MODEL]
+        # Issue #1777: capability-driven routing. Model selection is optional
+        # -- resolve_agy_grounded_research_model() returns None (no --model
+        # flag; AGY account_default) when the configured model_chain is
+        # empty or every candidate fails the availability preflight. See
+        # AGY_GROUNDED_RESEARCH_ROLE docstring above for why the former
+        # hardcoded-model causal claim was corrected.
+        selected_model = resolve_agy_grounded_research_model()
+        if selected_model:
+            command = [agy_bin, "-p", prompt, "--model", selected_model]
     if tool_profile in _agy_permission_policy.ALLOWED_PROFILES:
         workspace = _agy_permission_policy.materialize_isolated_agy_workspace(tool_profile)
         env = dict(workspace.env)
@@ -4641,6 +4776,10 @@ def _run_delegation_core(
             )
         else:
             prompt_text = request.get("prompt") or ""
+            if tool_profile == GROUNDED_RESEARCH_PROFILE:
+                # Issue #1777 AC2: always apply, regardless of caller-supplied
+                # prompt content.
+                prompt_text = _apply_agy_grounded_research_explicit_search_instruction(prompt_text)
 
         try:
             timeout_sec_agy = int(request.get("timeout_sec", DEFAULT_TIMEOUT_SEC))
@@ -4686,176 +4825,203 @@ def _run_delegation_core(
                 "tool_profile": tool_profile_str,
                 "transcript_sha256": _agy_transcript_sha256,
             }
-        try:
-            _agy_tool_profile_ctx_token = _AGY_TOOL_PROFILE_CTX.set(tool_profile)
-            try:
-                # Issue #1771 AC4: only pass run_context= at all when this is
-                # a fan-out-correlated request. A bare positional call
-                # (identical to pre-#1771: `_run_agy(prompt_text,
-                # timeout_sec_agy)`) is preserved for the standalone case so
-                # that pre-existing test doubles / monkeypatched fakes with a
-                # 2-positional-arg-only signature (no `run_context` keyword
-                # parameter at all) keep working unmodified.
-                if _agy_run_context is not None:
-                    agy_completed = _run_agy(prompt_text, timeout_sec_agy, run_context=_agy_run_context)
-                else:
-                    agy_completed = _run_agy(prompt_text, timeout_sec_agy)
-            finally:
-                _AGY_TOOL_PROFILE_CTX.reset(_agy_tool_profile_ctx_token)
-        except subprocess.TimeoutExpired:
-            return {
-                "schema": "delegation_result/v1",
-                "provider": "agy",
-                "safety_mode": "degraded_wrapper_only",
-                "ok": False,
-                "requested_model": None,
-                "actual_model": "agy-default",
-                "tool_profile": tool_profile_str,
-                "exit_code": 1,
-                "result_surface": {
-                    "mode": "artifact-first",
-                    "summary": None,
-                    "primary_artifact_type": "none",
-                    "primary_artifact": None,
-                    "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
-                },
-                "response_text": None,
-                "stats": None,
-                "stderr": f"agy_timeout: process exceeded {timeout_sec_agy}s",
-                "warnings": [f"agy_timeout: process exceeded {timeout_sec_agy}s"],
-                "failure_reason": f"agy_timeout: process exceeded {timeout_sec_agy}s",
-                "failure_class": "agy_timeout",
-                "raw_command": _build_agy_raw_command(""),
-                "model_chain": [],
-                "model_downgrades": [],
-                "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
-                "parent_run_id": request.get("parent_run_id"),
-                "subtask_id": request.get("subtask_id"),
-                "attempt_id": request.get("attempt_id"),
-            }
-        except FileNotFoundError:
-            return {
-                "schema": "delegation_result/v1",
-                "provider": "agy",
-                "safety_mode": "degraded_wrapper_only",
-                "ok": False,
-                "requested_model": None,
-                "actual_model": "agy-default",
-                "tool_profile": tool_profile_str,
-                "exit_code": 1,
-                "result_surface": {
-                    "mode": "artifact-first",
-                    "summary": None,
-                    "primary_artifact_type": "none",
-                    "primary_artifact": None,
-                    "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
-                },
-                "response_text": None,
-                "stats": None,
-                "stderr": "agy_not_found: agy binary not found in PATH",
-                "warnings": ["agy_not_found: agy binary not found in PATH"],
-                "failure_reason": "agy_not_found: agy binary not found in PATH",
-                "failure_class": "agy_not_found",
-                "raw_command": _build_agy_raw_command(""),
-                "model_chain": [],
-                "model_downgrades": [],
-                "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
-                "parent_run_id": request.get("parent_run_id"),
-                "subtask_id": request.get("subtask_id"),
-                "attempt_id": request.get("attempt_id"),
-            }
-        except PermissionError:
-            return {
-                "schema": "delegation_result/v1",
-                "provider": "agy",
-                "safety_mode": "degraded_wrapper_only",
-                "ok": False,
-                "requested_model": None,
-                "actual_model": "agy-default",
-                "tool_profile": tool_profile_str,
-                "exit_code": 1,
-                "result_surface": {
-                    "mode": "artifact-first",
-                    "summary": None,
-                    "primary_artifact_type": "none",
-                    "primary_artifact": None,
-                    "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
-                },
-                "response_text": None,
-                "stats": None,
-                # Issue #1270 fix_delta Blocker 6: PermissionError from the
-                # exec path must classify into the SAME canonical
-                # agy_permission_denied class that _classify_agy_failure()
-                # already uses for stdout/stderr-detected 403/forbidden
-                # signals, so provider_auto_dispatch() and the taxonomy see
-                # one class for "AGY permission denied" regardless of
-                # whether the signal came from stdout/stderr or from the
-                # OS-level PermissionError raised on exec.
-                "stderr": "agy_permission_denied: permission denied executing agy",
-                "warnings": ["agy_permission_denied: permission denied executing agy"],
-                "failure_reason": "agy_permission_denied: permission denied executing agy",
-                "failure_class": "agy_permission_denied",
-                "raw_command": _build_agy_raw_command(""),
-                "model_chain": [],
-                "model_downgrades": [],
-                "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
-                "parent_run_id": request.get("parent_run_id"),
-                "subtask_id": request.get("subtask_id"),
-                "attempt_id": request.get("attempt_id"),
-            }
-        except Exception as exc:
-            return {
-                "schema": "delegation_result/v1",
-                "provider": "agy",
-                "safety_mode": "degraded_wrapper_only",
-                "ok": False,
-                "requested_model": None,
-                "actual_model": "agy-default",
-                "tool_profile": tool_profile_str,
-                "exit_code": 1,
-                "result_surface": {
-                    "mode": "artifact-first",
-                    "summary": None,
-                    "primary_artifact_type": "none",
-                    "primary_artifact": None,
-                    "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
-                },
-                "response_text": None,
-                "stats": None,
-                "stderr": str(exc),
-                "warnings": [str(exc)],
-                "failure_reason": str(exc),
-                "failure_class": "agy_unexpected_error",
-                "raw_command": _build_agy_raw_command(""),
-                "model_chain": [],
-                "model_downgrades": [],
-                "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
-                "parent_run_id": request.get("parent_run_id"),
-                "subtask_id": request.get("subtask_id"),
-                "attempt_id": request.get("attempt_id"),
-            }
-        result = _normalize_agy_result(
-            agy_completed,
-            tool_profile=tool_profile_str,
-            requested_model=None,
-            request_warnings=request_warnings,
-            # Issue #1753: fan-out correlation ids read straight from the
-            # request (fan_out_orchestrator.run_fanout() stamps these; a
-            # standalone request simply has them absent, so .get() yields
-            # None and delegation_result/v1 stays backward-compatible).
-            parent_run_id=request.get("parent_run_id"),
-            subtask_id=request.get("subtask_id"),
-            attempt_id=request.get("attempt_id"),
-            # Issue #1771: same deterministic prompt-text hash computed
-            # earlier in this function (and, for fan-out-correlated
-            # requests, also stamped into the isolated workspace hook
-            # context via run_context on the _run_agy() call above), so
-            # delegation_result/v1's top-level transcript_sha256 always
-            # matches what the hook events for this run carry.
-            transcript_sha256=_agy_transcript_sha256,
+        # Issue #1777 AC4/AC5: bounded retry for grounded_research
+        # hallucination/no-citation failures. Every non-grounded_research
+        # profile keeps the pre-#1777 single-attempt behavior (max_attempts
+        # == 1, loop body runs exactly once). Each iteration is a brand new
+        # `_run_agy()` subprocess call (fresh session -- no natural-language
+        # response is carried over from a prior attempt); only a
+        # `grounding_failure_class` in `_AGY_GROUNDED_RESEARCH_RETRYABLE_FAILURE_CLASSES`
+        # (hallucination / no-citation) triggers another attempt. Process-level
+        # failures (timeout / agy not found / permission denied / unexpected
+        # exception) return immediately without retrying, unchanged from
+        # pre-#1777 behavior.
+        _agy_max_attempts = (
+            AGY_GROUNDED_RESEARCH_RETRY_LIMIT + 1 if tool_profile == GROUNDED_RESEARCH_PROFILE else 1
         )
-        if local_asset_retrieval_metadata is not None:
-            result["local_asset_retrieval_metadata"] = local_asset_retrieval_metadata
+        result: dict[str, Any] | None = None
+        for _agy_attempt_number in range(1, _agy_max_attempts + 1):
+            try:
+                _agy_tool_profile_ctx_token = _AGY_TOOL_PROFILE_CTX.set(tool_profile)
+                try:
+                    # Issue #1771 AC4: only pass run_context= at all when this is
+                    # a fan-out-correlated request. A bare positional call
+                    # (identical to pre-#1771: `_run_agy(prompt_text,
+                    # timeout_sec_agy)`) is preserved for the standalone case so
+                    # that pre-existing test doubles / monkeypatched fakes with a
+                    # 2-positional-arg-only signature (no `run_context` keyword
+                    # parameter at all) keep working unmodified.
+                    if _agy_run_context is not None:
+                        agy_completed = _run_agy(prompt_text, timeout_sec_agy, run_context=_agy_run_context)
+                    else:
+                        agy_completed = _run_agy(prompt_text, timeout_sec_agy)
+                finally:
+                    _AGY_TOOL_PROFILE_CTX.reset(_agy_tool_profile_ctx_token)
+            except subprocess.TimeoutExpired:
+                return {
+                    "schema": "delegation_result/v1",
+                    "provider": "agy",
+                    "safety_mode": "degraded_wrapper_only",
+                    "ok": False,
+                    "requested_model": None,
+                    "actual_model": "agy-default",
+                    "tool_profile": tool_profile_str,
+                    "exit_code": 1,
+                    "result_surface": {
+                        "mode": "artifact-first",
+                        "summary": None,
+                        "primary_artifact_type": "none",
+                        "primary_artifact": None,
+                        "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
+                    },
+                    "response_text": None,
+                    "stats": None,
+                    "stderr": f"agy_timeout: process exceeded {timeout_sec_agy}s",
+                    "warnings": [f"agy_timeout: process exceeded {timeout_sec_agy}s"],
+                    "failure_reason": f"agy_timeout: process exceeded {timeout_sec_agy}s",
+                    "failure_class": "agy_timeout",
+                    "raw_command": _build_agy_raw_command(""),
+                    "model_chain": [],
+                    "model_downgrades": [],
+                    "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
+                    "parent_run_id": request.get("parent_run_id"),
+                    "subtask_id": request.get("subtask_id"),
+                    "attempt_id": request.get("attempt_id"),
+                }
+            except FileNotFoundError:
+                return {
+                    "schema": "delegation_result/v1",
+                    "provider": "agy",
+                    "safety_mode": "degraded_wrapper_only",
+                    "ok": False,
+                    "requested_model": None,
+                    "actual_model": "agy-default",
+                    "tool_profile": tool_profile_str,
+                    "exit_code": 1,
+                    "result_surface": {
+                        "mode": "artifact-first",
+                        "summary": None,
+                        "primary_artifact_type": "none",
+                        "primary_artifact": None,
+                        "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
+                    },
+                    "response_text": None,
+                    "stats": None,
+                    "stderr": "agy_not_found: agy binary not found in PATH",
+                    "warnings": ["agy_not_found: agy binary not found in PATH"],
+                    "failure_reason": "agy_not_found: agy binary not found in PATH",
+                    "failure_class": "agy_not_found",
+                    "raw_command": _build_agy_raw_command(""),
+                    "model_chain": [],
+                    "model_downgrades": [],
+                    "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
+                    "parent_run_id": request.get("parent_run_id"),
+                    "subtask_id": request.get("subtask_id"),
+                    "attempt_id": request.get("attempt_id"),
+                }
+            except PermissionError:
+                return {
+                    "schema": "delegation_result/v1",
+                    "provider": "agy",
+                    "safety_mode": "degraded_wrapper_only",
+                    "ok": False,
+                    "requested_model": None,
+                    "actual_model": "agy-default",
+                    "tool_profile": tool_profile_str,
+                    "exit_code": 1,
+                    "result_surface": {
+                        "mode": "artifact-first",
+                        "summary": None,
+                        "primary_artifact_type": "none",
+                        "primary_artifact": None,
+                        "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
+                    },
+                    "response_text": None,
+                    "stats": None,
+                    # Issue #1270 fix_delta Blocker 6: PermissionError from the
+                    # exec path must classify into the SAME canonical
+                    # agy_permission_denied class that _classify_agy_failure()
+                    # already uses for stdout/stderr-detected 403/forbidden
+                    # signals, so provider_auto_dispatch() and the taxonomy see
+                    # one class for "AGY permission denied" regardless of
+                    # whether the signal came from stdout/stderr or from the
+                    # OS-level PermissionError raised on exec.
+                    "stderr": "agy_permission_denied: permission denied executing agy",
+                    "warnings": ["agy_permission_denied: permission denied executing agy"],
+                    "failure_reason": "agy_permission_denied: permission denied executing agy",
+                    "failure_class": "agy_permission_denied",
+                    "raw_command": _build_agy_raw_command(""),
+                    "model_chain": [],
+                    "model_downgrades": [],
+                    "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
+                    "parent_run_id": request.get("parent_run_id"),
+                    "subtask_id": request.get("subtask_id"),
+                    "attempt_id": request.get("attempt_id"),
+                }
+            except Exception as exc:
+                return {
+                    "schema": "delegation_result/v1",
+                    "provider": "agy",
+                    "safety_mode": "degraded_wrapper_only",
+                    "ok": False,
+                    "requested_model": None,
+                    "actual_model": "agy-default",
+                    "tool_profile": tool_profile_str,
+                    "exit_code": 1,
+                    "result_surface": {
+                        "mode": "artifact-first",
+                        "summary": None,
+                        "primary_artifact_type": "none",
+                        "primary_artifact": None,
+                        "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
+                    },
+                    "response_text": None,
+                    "stats": None,
+                    "stderr": str(exc),
+                    "warnings": [str(exc)],
+                    "failure_reason": str(exc),
+                    "failure_class": "agy_unexpected_error",
+                    "raw_command": _build_agy_raw_command(""),
+                    "model_chain": [],
+                    "model_downgrades": [],
+                    "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
+                    "parent_run_id": request.get("parent_run_id"),
+                    "subtask_id": request.get("subtask_id"),
+                    "attempt_id": request.get("attempt_id"),
+                }
+            result = _normalize_agy_result(
+                agy_completed,
+                tool_profile=tool_profile_str,
+                requested_model=None,
+                request_warnings=request_warnings,
+                # Issue #1753: fan-out correlation ids read straight from the
+                # request (fan_out_orchestrator.run_fanout() stamps these; a
+                # standalone request simply has them absent, so .get() yields
+                # None and delegation_result/v1 stays backward-compatible).
+                parent_run_id=request.get("parent_run_id"),
+                subtask_id=request.get("subtask_id"),
+                attempt_id=request.get("attempt_id"),
+                # Issue #1771: same deterministic prompt-text hash computed
+                # earlier in this function (and, for fan-out-correlated
+                # requests, also stamped into the isolated workspace hook
+                # context via run_context on the _run_agy() call above), so
+                # delegation_result/v1's top-level transcript_sha256 always
+                # matches what the hook events for this run carry.
+                transcript_sha256=_agy_transcript_sha256,
+            )
+            if local_asset_retrieval_metadata is not None:
+                result["local_asset_retrieval_metadata"] = local_asset_retrieval_metadata
+            if tool_profile == GROUNDED_RESEARCH_PROFILE:
+                # Issue #1777 AC4: observability -- how many fresh-session
+                # attempts this call actually made, always <=
+                # AGY_GROUNDED_RESEARCH_RETRY_LIMIT + 1.
+                result["agy_grounded_research_attempts"] = _agy_attempt_number
+            if (
+                result.get("failure_class") not in _AGY_GROUNDED_RESEARCH_RETRYABLE_FAILURE_CLASSES
+                or _agy_attempt_number >= _agy_max_attempts
+            ):
+                break
+        assert result is not None  # loop always runs >= 1 iteration
         return result
 
     validation_errors = validate_request(request, request_path=request_path)

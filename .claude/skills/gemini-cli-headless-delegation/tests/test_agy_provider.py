@@ -958,15 +958,27 @@ def test_agy_empty_stdout_warning_matches_failure_class_when_ci_unset(monkeypatc
 
 
 # ---------------------------------------------------------------------------
-# Issue #1749: grounded_research forces --model claude-sonnet-4-6 so agy -p
-# actually calls search_web/read_url_content instead of hallucinating a
-# "searched" answer with the default model. See run_gemini_headless.py's
-# AGY_GROUNDED_RESEARCH_MODEL docstring for the live-investigation evidence.
+# Issue #1749 (superseded by Issue #1777): grounded_research forces
+# --model claude-sonnet-4-6 so agy -p actually calls
+# search_web/read_url_content instead of hallucinating a "searched" answer
+# with the default model.
+#
+# Issue #1777 ran a controlled grounding matrix experiment and found the
+# model-selection causal claim was NOT supported (prompt construction was
+# the dominant factor, not model selection); the exact-model-hardcode
+# AGY_GROUNDED_RESEARCH_MODEL constant was replaced by capability-driven
+# routing (resolve_agy_grounded_research_model(), config/model_routing.yaml
+# roles.grounded_research.model_chain). The tests below (AC7) are replaced
+# to verify the new capability contract instead of the exact
+# `claude-sonnet-4-6` string.
 # ---------------------------------------------------------------------------
 
 
-def test_issue_1749_grounded_research_forces_tool_capable_model() -> None:
-    """grounded_research profile's agy -p invocation includes --model claude-sonnet-4-6."""
+def test_issue_1749_grounded_research_uses_capability_driven_model_candidate() -> None:
+    """AC7 (replaces the old exact-string test): grounded_research's agy -p
+    invocation includes --model with a candidate resolved from
+    config/model_routing.yaml roles.grounded_research.model_chain, not a
+    hardcoded constant."""
     captured_cmd: dict[str, Any] = {"value": None}
 
     def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
@@ -984,8 +996,10 @@ def test_issue_1749_grounded_research_forces_tool_capable_model() -> None:
     assert cmd is not None
     assert "--model" in cmd
     model_index = cmd.index("--model")
-    assert cmd[model_index + 1] == rgh.AGY_GROUNDED_RESEARCH_MODEL
-    assert rgh.AGY_GROUNDED_RESEARCH_MODEL == "claude-sonnet-4-6"
+    expected_chain, error = rgh.resolve_model_chain({"role": "grounded_research"})
+    assert error is None
+    assert cmd[model_index + 1] == expected_chain[0]
+    assert not hasattr(rgh, "AGY_GROUNDED_RESEARCH_MODEL")
 
 
 def test_issue_1749_non_grounded_research_profile_omits_model_flag() -> None:
@@ -1009,11 +1023,11 @@ def test_issue_1749_non_grounded_research_profile_omits_model_flag() -> None:
 
 
 def test_issue_1749_grounded_research_end_to_end_forces_model_via_run_delegation() -> None:
-    """AC3/AC4: run_delegation(tool_profile=grounded_research) drives _run_agy with
-    the forced --model flag actually present in the real subprocess.run argv (not
-    just unit-level on _run_agy), proving the flag reaches the real invocation path
-    used in production, with a grounded tool_calls trace still recognized correctly.
-    """
+    """AC3/AC4 (pre-#1777): run_delegation(tool_profile=grounded_research) drives
+    _run_agy with the resolved --model flag actually present in the real
+    subprocess.run argv (not just unit-level on _run_agy), proving the flag
+    reaches the real invocation path used in production, with a grounded
+    tool_calls trace still recognized correctly."""
     captured_cmd: dict[str, Any] = {"value": None}
     grounded_output = (
         "Response from AGY.\n"
@@ -1033,4 +1047,156 @@ def test_issue_1749_grounded_research_end_to_end_forces_model_via_run_delegation
     assert cmd is not None
     assert "--model" in cmd
     model_index = cmd.index("--model")
-    assert cmd[model_index + 1] == "claude-sonnet-4-6"
+    expected_chain, error = rgh.resolve_model_chain({"role": "grounded_research"})
+    assert error is None
+    assert cmd[model_index + 1] == expected_chain[0]
+
+
+# ---------------------------------------------------------------------------
+# Issue #1777 AC1-AC6: capability-driven routing / explicit-search prompt /
+# optional model / bounded retry / fresh session / evidence gate regression.
+# ---------------------------------------------------------------------------
+
+
+def test_issue_1777_ac1_model_routing_yaml_defines_grounded_research_role() -> None:
+    """AC1: grounded_research model candidates are loaded from
+    model_routing.yaml's roles section (not a Python constant)."""
+    routing = rgh.load_model_routing()
+    assert "grounded_research" in routing["roles"]
+    chain = routing["roles"]["grounded_research"]["model_chain"]
+    assert isinstance(chain, list) and len(chain) >= 1
+    assert all(isinstance(entry, str) and entry.strip() for entry in chain)
+    assert rgh.resolve_agy_grounded_research_model() == chain[0]
+
+
+def test_issue_1777_ac2_grounded_research_prompt_contains_explicit_search_instruction() -> None:
+    """AC2: the outgoing agy grounded_research prompt always carries the
+    explicit-search-required instruction, even when the caller supplied no
+    prompt text at all (bounded default) or already-had-content prompt text
+    (appended, not silently dropped)."""
+    captured_prompts: list[str] = []
+    grounded_output = (
+        "Response from AGY.\n"
+        '{"grounding":{"queries":["AGY WebSearch"],"sources":[{"url":"https://example.com","title":"example"}]},'
+        '"tool_calls":[{"name":"web_search"}]}'
+    )
+
+    def mock_run_agy(prompt: str, timeout_sec: int, **kwargs: Any) -> subprocess.CompletedProcess:
+        captured_prompts.append(prompt)
+        return _make_completed(0, stdout=grounded_output)
+
+    with patch.object(rgh, "_run_agy", side_effect=mock_run_agy):
+        rgh.run_delegation(
+            _agy_request(tool_profile="grounded_research", timeout_sec=120, prompt="Find the current release notes")
+        )
+
+    assert len(captured_prompts) == 1
+    assert rgh.AGY_GROUNDED_RESEARCH_EXPLICIT_SEARCH_INSTRUCTION in captured_prompts[0]
+    assert "Find the current release notes" in captured_prompts[0]
+
+
+def test_issue_1777_ac3_grounded_research_model_optional_account_default(monkeypatch) -> None:
+    """AC3: when every configured model candidate fails the availability
+    preflight, _run_agy() issues agy -p with NO --model flag (account_default)
+    and run_delegation(tool_profile=grounded_research) still returns ok: true."""
+    monkeypatch.setenv(
+        rgh.AGY_MODEL_AVAILABILITY_OVERRIDE_ENV,
+        '{"claude-sonnet-4-6": false}',
+    )
+    captured_cmd: dict[str, Any] = {"value": None}
+    grounded_output = (
+        "Response from AGY.\n"
+        '{"grounding":{"queries":["AGY WebSearch"],"sources":[{"url":"https://example.com","title":"example"}]},'
+        '"tool_calls":[{"name":"web_search"}]}'
+    )
+
+    def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        captured_cmd["value"] = list(cmd)
+        return _make_completed(0, stdout=grounded_output)
+
+    assert rgh.resolve_agy_grounded_research_model() is None
+
+    with patch("subprocess.run", side_effect=mock_run):
+        result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
+
+    assert result["ok"] is True
+    cmd = captured_cmd["value"]
+    assert cmd is not None
+    assert "--model" not in cmd
+
+
+def test_issue_1777_ac4_grounded_research_bounded_retry_does_not_exceed_limit() -> None:
+    """AC4: when every attempt hallucinates (no verifiable tool call), the
+    number of agy -p invocations is bounded by
+    AGY_GROUNDED_RESEARCH_RETRY_LIMIT + 1 -- it does not retry forever."""
+    call_count = {"value": 0}
+
+    def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        call_count["value"] += 1
+        return _make_completed(0, stdout="I searched and found nothing relevant.")
+
+    with patch("subprocess.run", side_effect=mock_run):
+        result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_web_grounding_tool_call_missing"
+    assert call_count["value"] == rgh.AGY_GROUNDED_RESEARCH_RETRY_LIMIT + 1
+    assert result["agy_grounded_research_attempts"] == rgh.AGY_GROUNDED_RESEARCH_RETRY_LIMIT + 1
+
+
+def test_issue_1777_ac5_grounded_research_retry_uses_fresh_session() -> None:
+    """AC5: each bounded-retry attempt is a brand-new subprocess.run() call
+    (fresh session) -- the failing first attempt's output is never fed back
+    into a later attempt's prompt/argv, and a later attempt that succeeds
+    stops the loop without exhausting the retry budget."""
+    captured_cmds: list[list[str]] = []
+    grounded_output = (
+        "Response from AGY.\n"
+        '{"grounding":{"queries":["AGY WebSearch"],"sources":[{"url":"https://example.com","title":"example"}]},'
+        '"tool_calls":[{"name":"web_search"}]}'
+    )
+
+    def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        captured_cmds.append(list(cmd))
+        call_number = len(captured_cmds)
+        if call_number < 2:
+            return _make_completed(0, stdout="I searched and found nothing relevant.")
+        return _make_completed(0, stdout=grounded_output)
+
+    with patch("subprocess.run", side_effect=mock_run):
+        result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
+
+    assert result["ok"] is True
+    assert result["agy_grounded_research_attempts"] == 2
+    # Fresh session: each attempt is its own subprocess.run() call (argv
+    # sent -- including the prompt text embedded via `-p` -- is identical
+    # across attempts; the prior failing attempt's stdout is never fed back
+    # into a later attempt's argv/prompt).
+    assert len(captured_cmds) == 2
+    prompt_index = captured_cmds[0].index("-p") + 1
+    assert captured_cmds[0][prompt_index] == captured_cmds[1][prompt_index]
+
+
+def test_issue_1777_ac6_grounded_research_evidence_gate_applies_regardless_of_model() -> None:
+    """AC6: the #1708/#1710/#1771 fail-closed evidence gate
+    (grounding_failure_class -> top-level ok=False) still applies exactly
+    the same way whether or not a --model candidate was actually selected
+    (account_default path included)."""
+    hallucinated_output = "I searched and found the answer without citing anything."
+
+    def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        return _make_completed(0, stdout=hallucinated_output)
+
+    with patch("subprocess.run", side_effect=mock_run):
+        with_model_result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
+    assert with_model_result["ok"] is False
+    assert with_model_result["failure_class"] == "agy_web_grounding_tool_call_missing"
+
+    with patch.dict(
+        os.environ, {rgh.AGY_MODEL_AVAILABILITY_OVERRIDE_ENV: '{"claude-sonnet-4-6": false}'}
+    ):
+        assert rgh.resolve_agy_grounded_research_model() is None
+        with patch("subprocess.run", side_effect=mock_run):
+            no_model_result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
+    assert no_model_result["ok"] is False
+    assert no_model_result["failure_class"] == "agy_web_grounding_tool_call_missing"
