@@ -476,9 +476,9 @@ AGY 公式ドキュメント（`https://antigravity.google/docs/cli/reference` /
 tool deny の唯一の実効的な防御機構は、`PROFILE_ALLOWED_TOOLS` ベースの静的 allowlist
 （`resolve_tool_permission()` / `build_workspace_permission_policy()` の `permissions.allow`/`.deny`）である。
 
-### `materialize_isolated_agy_workspace()` の環境変数 allowlist 拡張（Issue #1726、superseded_by: #1779, 2026-07-26）
+### `materialize_isolated_agy_workspace()` の環境変数 allowlist 拡張（Issue #1726、後継 Issue で置換済み）
 
-> **注意（#1779 による再検証日時: 2026-07-26）**: 以下は #1726 起票時点の記録として維持するが、
+> **注意（superseded_by: #1779、再検証日時: 2026-07-26）**: 以下は #1726 起票時点の記録として維持するが、
 > `DBUS_SESSION_BUS_ADDRESS` / `XDG_RUNTIME_DIR` は #1779 の `AGY_AUTH_PROFILE_MINIMAL`（既定）では
 > もはや既定で露出されない。`AGY_AUTH_PROFILE_EXTENDED` を明示指定した場合のみ、以下の記述どおりに
 > 動作する。実装自体は削除していない（将来必要になる環境のための opt-in として維持）。
@@ -496,9 +496,9 @@ tool deny の唯一の実効的な防御機構は、`PROFILE_ALLOWED_TOOLS` ベ�
   `true` になった状態で isolated workspace 内から到達性が確認できることを
   `test_agy_permission_policy_env_allowlist.py` の hermetic テスト（モック化した dbus/keyring エンドポイント）で回帰確認する
 
-### `materialize_isolated_agy_workspace()` の gcloud ADC 露出（Issue #1730、superseded_by: #1779, 2026-07-26）
+### `materialize_isolated_agy_workspace()` の gcloud ADC 露出（Issue #1730、後継 Issue で置換済み）
 
-> **注意（#1779 による再検証日時: 2026-07-26）**: `gcloud_adc_path` / `GOOGLE_APPLICATION_CREDENTIALS` は
+> **注意（superseded_by: #1779、再検証日時: 2026-07-26）**: `gcloud_adc_path` / `GOOGLE_APPLICATION_CREDENTIALS` は
 > #1779 の `AGY_AUTH_PROFILE_MINIMAL`（既定）ではもはや既定で露出されない。
 > `AGY_AUTH_PROFILE_EXTENDED` を明示指定した場合のみ、以下の記述どおりに動作する（実装は維持）。
 
@@ -527,9 +527,9 @@ tool deny の唯一の実効的な防御機構は、`PROFILE_ALLOWED_TOOLS` ベ�
 - live AGY 実行（`run_fanout()`）が実際に gcloud ADC を使って成功することの動作確認は、本 hermetic 変更の
   スコープ外であり、#1494 の最終 E2E run に委ねる
 
-### `materialize_isolated_agy_workspace()` の agy 独自 OAuth トークンファイル露出（Issue #1740、read-only 境界の真正性は superseded_by: #1779, 2026-07-26）
+### `materialize_isolated_agy_workspace()` の agy 独自 OAuth トークンファイル露出（Issue #1740、read-only 境界の真正性は後継 Issue で置換済み）
 
-> **注意（#1779 による再検証日時: 2026-07-26）**: 露出そのもの（`agy_oauth_token_path`、
+> **注意（superseded_by: #1779、再検証日時: 2026-07-26）**: 露出そのもの（`agy_oauth_token_path`、
 > `auth_profile` に関わらず無条件）は変更していない -- `AGY_AUTH_ABLATION_V1` で認証成功に
 > 必要十分と実証済みの唯一の surface だからである。変更したのは「read only」という *主張の真正性* のみ:
 > 本セクション下部の「symlink として read-only に露出する」という記述は、実際には OS レベルの強制を
