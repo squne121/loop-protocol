@@ -326,6 +326,45 @@ hook_boundaries_manifest_v1:
       task blocker にしてはならない（AC2）。
       hook failure は diagnostic artifact 欠落として記録・報告される（AC10）。
 
+  - handler_id: python3
+    event: SubagentStop
+    matcher: "^issue-reviewer$"
+    command: "python3"
+    args:
+      - "${CLAUDE_PROJECT_DIR}/.claude/hooks/validate_issue_reviewer_compact_output.py"
+    timeout: 10
+    classification: blocker
+    fail_policy: fail_closed
+    script_exit_contract:
+      normal: 0
+      block: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: SubagentStop
+      exit_2_effect: prevents_subagent_stop
+      structured_decision_block_effect: prevents_subagent_stop_and_requests_one_regeneration
+    stdout_contract: json_decision_block_on_invalid_or_runtime_error_silent_on_allow
+    stderr_contract: silent
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
+    agent_action:
+      on_nonzero: stop_tool_call
+      on_structured_block: regenerate_canonical_compact_stdout_once
+      on_zero_without_block: proceed
+    notes: >
+      Claude Code / Haiku の issue-reviewer 専用 SubagentStop blocker。
+      last_assistant_message を改変せず既存 child intermediate validator に渡し、
+      exact 8-line approve または 9-line needs-fix 以外は
+      {"decision":"block","reason":"..."} を stdout に一度だけ返して
+      canonical compact stdout の再生成を要求する。payload 不正・message 型不正・
+      validator runtime error も同じ structured block で fail-closed にする。
+      stop_hook_active の継続では再 block せず、parent validator の既存 fail-close を維持する。
+      issue-reviewer 以外には matcher が適用されず、routing / binding / replay の
+      artifact を生成・上書きしない。
+
   - handler_id: session_manifest_debounce
     event: PostToolUse
     matcher: "Bash|Edit|Write"
@@ -527,6 +566,7 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 | `ci_test_performance_advisory.sh` | warning / fail_open | 継続（advisory 出力のみ、block なし） |
 | `session_manifest_coordinator.sh`（Stop） | telemetry | 継続 |
 | `session_manifest_coordinator.sh`（SubagentStop） | telemetry | 継続 |
+| `validate_issue_reviewer_compact_output.py`（SubagentStop） | blocker | structured `decision: block` 時は canonical compact stdout を 1 回再生成。runtime error も block、継続時は parent validator の fail-close を維持 |
 | `session_manifest_debounce.mjs` | telemetry | 継続 |
 | `save_loop_state_before_compaction.sh` | telemetry | 継続 |
 
