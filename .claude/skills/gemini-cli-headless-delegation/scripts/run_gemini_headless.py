@@ -2546,8 +2546,22 @@ def _run_agy(
                 hook_load_error = f"workspace_hook_generation_failed: {exc}"
 
         try:
+            # Issue #1779: when materialize_isolated_agy_workspace() (above)
+            # determined the real agy OAuth token file can be exposed with a
+            # kernel-enforced read-only guarantee (`bwrap` available --
+            # `workspace.agy_oauth_token_readonly_mode ==
+            # AGY_OAUTH_TOKEN_READONLY_KERNEL_ENFORCED`), prepend the `bwrap`
+            # prefix it built to the actual `agy` subprocess argv so that
+            # guarantee is real, not merely claimed (`AGY_READONLY_BOUNDARY_V1`
+            # proved a bare symlink is not kernel-enforced). No other wiring
+            # in this branch changes -- `degraded_symlink_reachability` /
+            # `absent` modes leave `agy_oauth_token_bwrap_prefix` `None` and
+            # `command` unchanged, matching pre-#1779 behavior exactly.
+            run_command = command
+            if workspace.agy_oauth_token_bwrap_prefix:
+                run_command = list(workspace.agy_oauth_token_bwrap_prefix) + command
             completed = subprocess.run(
-                command,
+                run_command,
                 cwd=str(workspace.workspace_dir),
                 env=env,
                 capture_output=True,
