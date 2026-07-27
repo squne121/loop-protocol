@@ -262,3 +262,164 @@ agy 優先の fallback 順序を確認できる。
 - 実装: `.claude/skills/gemini-cli-headless-delegation/scripts/agy_tool_provenance.py`
   （workspace-scoped `.agents/hooks.json` 動的生成、schema validator、
   conversation/run 一致検証、redaction）。
+
+
+## GeminiCLI Legacy化判断根拠
+
+`.claude/skills/gemini-cli-headless-delegation/config/profile_provider_contract_matrix.yaml`
+（Issue #1806、schema: `profile_provider_contract_matrix/v1`）が示す実測状態を根拠に、
+GeminiCLI を default provider から外す（legacy 化する）べきかどうかを、可観測性・
+テスト密度・認証堅牢性の 3 観点で評価する。
+
+### 可観測性
+
+- agy 側は `agy_tool_provenance_v1`（`references/usage-contract.md` の
+  「`agy_tool_provenance_v1` Schema Governance」節）により、`PreToolUse` hook から
+  採取した構造化イベントを正本とし、stdout の自己申告（`stdout_self_report`）を
+  非正本の補助情報に格下げする可観測性契約が既に整備されている
+  （`scripts/agy_tool_provenance.py`）。
+- GeminiCLI 側には同等の hook-based provenance 契約が存在せず、`_parse_envelope`
+  による stdout JSON envelope の parse 結果をそのまま正本として扱っている
+  （本ファイル「AC3 / AC8: JSON envelope と結果正規化の差分」節）。grounding の
+  実行証跡を hook 経由で独立検証する仕組みは GeminiCLI 側に未実装であり、
+  agy 側と比べて可観測性が相対的に弱い。
+
+### テスト密度
+
+- `.claude/skills/gemini-cli-headless-delegation/tests/` には agy 固有のテストが
+  多数存在する（`test_agy_provider.py` / `test_agy_permission_policy*.py`
+  （5 ファイル）/ `test_agy_provenance_grounding_wiring.py` /
+  `test_agy_provenance_schema_governance.py` / `test_agy_local_asset_research_contract.py` /
+  `test_agy_targeted_evidence.py` / `test_agy_serena_fanout_correlation.py` /
+  `test_agy_tool_provenance*.py`（2 ファイル）/
+  `test_agy_isolated_workspace_tool_permission.py` /
+  `test_agy_invocation_argv_allowlist.py` /
+  `test_agy_fanout_e2e_validator*.py`（2 ファイル）/ `test_audit_agy_auth_surface.py` 等、
+  20 ファイル超）。GeminiCLI 固有のテストは `test_run_gemini_headless.py` /
+  `test_quota_fallback.py` / `test_preflight_gemini_headless.py` /
+  `test_golden_tasks.py` 等が中心で、profile x provider の 10 セル中
+  `profile_provider_contract_matrix.yaml` が `implemented` と判定した 9 セルは
+  GeminiCLI 側でも実装済みだが、agy 側で最近追加された provenance / permission
+  boundary 系の専用テスト密度には及ばない。
+- ただし GeminiCLI は `no_tools` / `proposal_only` / `grounded_research` /
+  `local_asset_research` / `github_research` の全 5 profile が `implemented`
+  であるのに対し、agy は `github_research` が `unsupported_by_design` であり、
+  profile カバレッジでは GeminiCLI が上回る（`profile_provider_contract_matrix.yaml`
+  参照）。
+
+### 認証堅牢性
+
+- agy は `_minimal_agy_env()` による allowlist 環境変数（`PATH` / `HOME` / `LANG` /
+  `LC_ALL` / `TERM` / `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` / `XDG_STATE_HOME` のみ）と
+  `shell=False` subprocess 起動（本ファイル「AC2: 実行境界（agy の cwd / env）」節）
+  により、secret 環境変数の継承を構造的に遮断している。
+- GeminiCLI は OAuth / Google アカウント認証に依存し、cached credential・trusted
+  workspace・`.env`・MCP 設定の整合性を都度確認する運用（本ファイル「既知の制約」節）
+  であり、agy の allowlist 方式ほど構造的に閉じた認証境界を持たない。
+- **限定**: 上記の「agy は allowlist 方式で secret 環境変数の継承を構造的に遮断している」
+  という主張は env var 継承境界に限定されたものであり、agy の認証手続き自体
+  （OAuth / Google アカウント認証）が GeminiCLI より堅牢であることは意味しない。
+  agy も GeminiCLI と同様に WSL2 環境で system keyring（D-Bus session bus）に
+  到達できず OAuth 再認証が silent に失敗する既知の問題を抱える
+  （`.claude/skills/gemini-cli-headless-delegation/SKILL.md` の
+  「AGY 認証診断・既知の環境課題（WSL2 / non-TTY）（Issue #1267）」節、
+  `auth.keyring.failure_class: system_keyring_unavailable` 参照）。したがって
+  「認証堅牢性は agy が優位」という評価は env var isolation の構造に限定した比較
+  であり、WSL2 実行環境における OAuth 到達性・再認証の脆さという観点では
+  両 provider に共通の既知課題が残る。
+
+### `legacy_decision:`
+
+```yaml
+legacy_decision:
+  state: blocked
+  reason: >-
+    profile_provider_contract_matrix.yaml が示す通り、agy は github_research
+    が unsupported_by_design（upstream の Antigravity CLI 自体に GitHub アクセス
+    能力が無いという主張ではなく、repo wrapper のポリシー — AGY_SUPPORTED_PROFILES,
+    scripts/run_gemini_headless.py — が github_research を対象 profile の集合に
+    含めていないという設計判断が原因で fail-closed）であり、GeminiCLI が唯一
+    github_research をサポートする provider である。GeminiCLI を default から
+    外す/legacy 化すると github_research profile が provider 非依存で利用不能に
+    なり、機能同等性のギャップが生じる。可観測性（hook-based provenance）と
+    テスト密度は agy が優位、認証堅牢性は agy の allowlist 方式（env var
+    isolation に限定）が優位だが、github_research の provider parity が未解消の
+    間は legacy 化を承認しない。
+  effective_scope: >-
+    この legacy_decision は「GeminiCLI を default provider から外す/legacy 化
+    するかどうか」の判断単位ごとに、以下の状態を個別に評価する（単一の
+    all-or-nothing 判断ではない）。
+  effective_scope_by_unit:
+    runtime_auto_priority: >-
+      blocked ではない。実コード上の `PROVIDER_AUTO_RUNTIME_ORDER`
+      （`.claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py`）
+      は既に `("agy", "gemini")` という agy-first 順序であり（PR #1798 /
+      Issue #1692 で反転済み）、`eligible_profiles` が
+      `{"no_tools", "proposal_only"}` のみで github_research を含まないため、
+      本 legacy_decision の blocking_gap（github_research の provider parity
+      未解消）によって blocking されない。この事実確認（runtime auto が実コード
+      上は既に agy-first であること）は github_research の legacy 化 blocking
+      判断（`blocking_gap`）自体には影響しない（github_research は runtime
+      auto の対象 profile ではないため）。なお本ファイル上部「runtime
+      `provider=auto`」節の 216/240/244 行目付近（`runtime_order` =
+      `("gemini", "agy")` という gemini-first の記述・比較表・理由説明）は、
+      この実コードの現況（agy-first）と矛盾した記述のまま本 PR（#1823）では
+      変更していない。当該箇所の修正は Issue #1804 が別途担当する（下記
+      「#1804 との関係」参照）。読者は本節の事実確認と、本ファイル上部の未更新
+      の記述を混同しないこと。
+    builder_default: >-
+      blocked ではない。`build_request.py` 等での既定 provider 選択で
+      github_research を要求しない呼び出し経路については、agy-first 化を
+      本 legacy_decision は妨げない。
+    documented_recommendation: >-
+      blocked ではない。docs 上で「新規呼び出しは agy を優先的に検討する」旨を
+      推奨として記載することは、github_research profile が必要な場合の
+      GeminiCLI 使用を排除しない限り妨げない。
+    gemini_fallback_only: >-
+      blocked ではない。GeminiCLI を「agy で対応できない profile
+      （github_research）専用の fallback provider」として位置づけることは、
+      本 legacy_decision が要求する機能同等性を満たしたまま legacy 化に相当する
+      縮退運用であり、blocking_gap を解消する現実的な移行経路になり得る。
+    gemini_implementation_removal: >-
+      blocked。GeminiCLI の実装・provider 選択肢自体を削除することは
+      github_research profile を provider 非依存で利用不能にするため、
+      blocking_gap（github_research の agy 対応、provider parity 未確立）が
+      解消されるまで承認しない。
+  blocking_gap: >-
+    github_research の agy 対応（現状 unsupported_by_design。follow-up #1821
+    の capability tier 分割検討を含め、provider parity 確立が legacy 化判断の
+    前提条件）
+  reevaluate_when: >-
+    github_research が agy で implemented になった時点、または
+    github_research 自体が明示的な意図的除外として承認された場合
+    （`deferred` は機能同等性のギャップを解消しないため、単独では reevaluate
+    条件にならない）
+  provenance:
+    observed_at: "2026-07-27"
+    repo_sha: d529c062f7eb12bd6124b619911627153ef3fa63
+    gemini_cli_version: "0.52.0"
+    agy_cli_version: "1.1.7"
+    auth_mode: >-
+      観測環境では GeminiCLI は既存の cached OAuth credential
+      （`~/.gemini/gemini-credentials.json`）で認証済み、agy は Issue #1267 の
+      WSL2 keyring 到達性問題が未解消の場合 `auth_mode: unknown` /
+      `system_keyring_unavailable` になり得る（本ファイル「認証堅牢性」節の
+      限定を参照）。両 CLI のバージョン・認証状態は流動的であり、本
+      `legacy_decision` の再評価時には再観測が必要。
+```
+
+### `legacy_decision:` と Issue #1804 との関係
+
+`references/provider-mapping.md` の「runtime `provider=auto`」節にある
+`runtime_order`（216/240/244 行目付近、`PROVIDER_AUTO_RUNTIME_ORDER` =
+`("gemini", "agy")` という gemini-first の記述・比較表・理由説明）は、実
+コード上の `PROVIDER_AUTO_RUNTIME_ORDER`（既に `("agy", "gemini")` の
+agy-first、PR #1798 / Issue #1692 で反転済み）と矛盾した記述のままである。
+この既存記述の修正は Issue #1804 が対象とするスコープであり、本 PR（#1823 /
+Issue #1806）ではその記述（該当箇所の値・比較表・理由説明）を変更しない。
+上記 `effective_scope_by_unit.runtime_auto_priority` は、legacy 化判断の
+観点から runtime auto が実コード上は既に agy-first であるという事実を記録
+し、それが本 legacy_decision の blocking_gap によって妨げられないことを
+明確化するものであり、github_research の legacy 化 blocking 判断
+（`blocking_gap`）自体には影響しない。上記 docs 記述矛盾（216/240/244
+行目）の解消そのものは Issue #1804 側で扱う。
