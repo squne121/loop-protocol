@@ -132,6 +132,7 @@ hook による CI skill suggestion の実装は本 Issue スコープ外とし�
 - `docs/dev/agent-skill-boundaries.md`: consumer routing 定義
 
 ## CI_TEST_PERFORMANCE_DECISION_V1 (#1192)
+以下は #1192 の CI レーン判断記録である。
 
 ```yaml
 CI_TEST_PERFORMANCE_DECISION_V1:
@@ -216,6 +217,7 @@ CI_TEST_PERFORMANCE_DECISION_V1:
 ```
 
 ## CI_TEST_PERFORMANCE_DECISION_V1 (#1193)
+以下は #1193 の CI レーン判断記録である。
 
 ```yaml
 CI_TEST_PERFORMANCE_DECISION_V1:
@@ -321,7 +323,7 @@ substitution・`${{ }}` 認識のうえ分割）、全 simple command を分類�
   violation として報告する。command/process substitution `$(...)` / `<(...)` /
   backtick は内部コマンドを再帰分類し、隠れた違反が false green にならないようにする。
 
-### direct interpreter / inline code の判定
+### direct interpreter / inline code の判定（判定基準の説明）
 
 - direct interpreter 例外は `exact_argv`（argv トークンの完全列）との **exact full-argv 一致**で
   照合する（prefix / glob / regex 不使用）。`scope: stdlib_only` の script 例外は
