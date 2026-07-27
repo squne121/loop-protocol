@@ -67,15 +67,9 @@ _THIS_FILE = Path(__file__).resolve()
 # scripts/agent-guards/ -> scripts/ -> project_root
 PROJECT_ROOT = _THIS_FILE.parent.parent.parent
 
-_PUBLISHER_SCRIPT_REL = (
-    ".claude/skills/issue-refinement-loop/scripts/publish_termination_report.py"
-)
-_RENDERER_SCRIPT_REL = (
-    ".claude/skills/issue-refinement-loop/scripts/render_termination_report.py"
-)
-_PROSE_BOUNDARY_REL = (
-    ".claude/skills/create-issue/scripts/prose_boundary_policy.py"
-)
+_PUBLISHER_SCRIPT_REL = ".claude/skills/issue-refinement-loop/scripts/publish_termination_report.py"
+_RENDERER_SCRIPT_REL = ".claude/skills/issue-refinement-loop/scripts/render_termination_report.py"
+_PROSE_BOUNDARY_REL = ".claude/skills/create-issue/scripts/prose_boundary_policy.py"
 
 # -- Import shared policy ------------------------------------------------------
 
@@ -87,6 +81,7 @@ from controlled_skill_mutation_policy import (  # noqa: E402
     COMMAND_ID_ISSUE_COMMENT_PUBLISH,
     COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
     COMMAND_ID_PR_REVIEW_PUBLISH,
+    COMMAND_ID_TEST_VERDICT_PUBLISH,
     COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
     COMMAND_ID_ISSUE_DEPENDENCY_REMOVE,
     ALL_COMMAND_IDS,
@@ -99,18 +94,10 @@ from controlled_skill_mutation_policy import (  # noqa: E402
     validate_issue_dependency_remove_input,
 )
 
-_ENSURE_CONTRACT_SNAPSHOT_REL = (
-    ".claude/skills/impl-review-loop/scripts/ensure_contract_snapshot.py"
-)
-_RUN_CONTRACT_REVIEW_ONCE_REL = (
-    ".claude/skills/issue-contract-review/scripts/run_contract_review_once.py"
-)
-_EVALUATE_PRODUCT_SPEC_GATE_REL = (
-    ".claude/skills/impl-review-loop/scripts/evaluate_product_spec_gate.py"
-)
-_CONTRACT_REVIEW_RESULT_PARSER_REL = (
-    ".claude/skills/issue-contract-review/scripts/contract_review_result_parser.py"
-)
+_ENSURE_CONTRACT_SNAPSHOT_REL = ".claude/skills/impl-review-loop/scripts/ensure_contract_snapshot.py"
+_RUN_CONTRACT_REVIEW_ONCE_REL = ".claude/skills/issue-contract-review/scripts/run_contract_review_once.py"
+_EVALUATE_PRODUCT_SPEC_GATE_REL = ".claude/skills/impl-review-loop/scripts/evaluate_product_spec_gate.py"
+_CONTRACT_REVIEW_RESULT_PARSER_REL = ".claude/skills/issue-contract-review/scripts/contract_review_result_parser.py"
 _ISSUE_SCOPE_SNAPSHOT_MATERIALIZER_REL = "scripts/agent-guards/materialize_issue_scope_snapshot.py"
 
 # -- Result schema -------------------------------------------------------------
@@ -185,15 +172,16 @@ def _parse_trusted_github_remote(url: str) -> str | None:
     return _normalize_owner_repo(path)
 
 
-def _verify_git_remote_origin(
-    project_root: Path, trusted_repo: str, env: dict[str, str] | None = None
-) -> str:
+def _verify_git_remote_origin(project_root: Path, trusted_repo: str, env: dict[str, str] | None = None) -> str:
     """Return empty string if origin is a canonical github.com/trusted_repo
     HTTPS or SSH remote, else a descriptive error string."""
     try:
         out = subprocess.run(
             ["git", "-C", str(project_root), "remote", "get-url", "origin"],
-            capture_output=True, text=True, timeout=10, env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=env,
         )
         if out.returncode != 0:
             return f"git_remote_origin_failed: {out.stderr.strip()[:100]}"
@@ -211,9 +199,7 @@ def _verify_git_remote_origin(
 # -- Environment sanitization --------------------------------------------------
 
 
-def _build_sanitized_env(
-    project_root: Path, issue_number: int, exec_marker: str = ""
-) -> dict[str, str]:
+def _build_sanitized_env(project_root: Path, issue_number: int, exec_marker: str = "") -> dict[str, str]:
     """Build a sanitized environment for the publisher subprocess.
 
     Removes or overrides env vars that could redirect artifacts, shadow modules,
@@ -294,10 +280,7 @@ def _check_contract_snapshot_module_realpaths(project_root: Path) -> list[str]:
             errors.append(f"module_missing: {rel} not found at {canonical}")
             continue
         if not canonical.is_relative_to(resolved_project_root):
-            errors.append(
-                f"module_shadowing: {rel} resolved to {canonical}, "
-                f"expected under {resolved_project_root}"
-            )
+            errors.append(f"module_shadowing: {rel} resolved to {canonical}, expected under {resolved_project_root}")
     return errors
 
 
@@ -318,26 +301,23 @@ def _check_module_realpaths(project_root: Path) -> list[str]:
             errors.append(f"module_missing: {rel} not found at {canonical}")
             continue
         if not str(canonical).startswith(str(project_root)):
-            errors.append(
-                f"module_shadowing: {rel} resolved to {canonical}, "
-                f"expected under {project_root}"
-            )
+            errors.append(f"module_shadowing: {rel} resolved to {canonical}, expected under {project_root}")
 
     # Import origin check for prose_boundary_policy via subprocess probe
     prose_canonical = (project_root / _PROSE_BOUNDARY_REL).resolve()
     if prose_canonical.exists():
         try:
             probe_code = (
-                "import sys; sys.path.insert(0, '"
-                + str(prose_canonical.parent).replace("'", "\\'")
-                + "'); "
+                "import sys; sys.path.insert(0, '" + str(prose_canonical.parent).replace("'", "\\'") + "'); "
                 "import prose_boundary_policy; "
                 "import pathlib; "
                 "print(pathlib.Path(prose_boundary_policy.__file__).resolve())"
             )
             probe = subprocess.run(
                 [sys.executable, "-c", probe_code],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
                 cwd=str(project_root),
             )
             if probe.returncode == 0:
@@ -364,13 +344,7 @@ def _issue_metadata_subtree(project_root: Path, issue_number: int, command_id: s
     Issue #1284: namespace is unified under
     artifacts/{issue_number}/issue-metadata/{command-id}/
     """
-    return (
-        project_root
-        / "artifacts"
-        / str(issue_number)
-        / ISSUE_METADATA_NAMESPACE_SEGMENT
-        / command_id
-    ).resolve()
+    return (project_root / "artifacts" / str(issue_number) / ISSUE_METADATA_NAMESPACE_SEGMENT / command_id).resolve()
 
 
 def _validate_and_resolve_input_file(
@@ -441,10 +415,7 @@ def _validate_and_resolve_input_file(
     try:
         canonical.relative_to(artifact_subtree)
     except ValueError:
-        return None, (
-            f"input_file_outside_issue_subtree: {canonical} "
-            f"not under {artifact_subtree}"
-        )
+        return None, (f"input_file_outside_issue_subtree: {canonical} not under {artifact_subtree}")
 
     return canonical, ""
 
@@ -452,9 +423,7 @@ def _validate_and_resolve_input_file(
 # -- Input JSON validation -----------------------------------------------------
 
 
-def _load_and_validate_input_json(
-    canonical_input: Path, issue_number: int, command_id: str
-) -> tuple[dict | None, str]:
+def _load_and_validate_input_json(canonical_input: Path, issue_number: int, command_id: str) -> tuple[dict | None, str]:
     """Read and validate input JSON against the per-command-id schema (AC10).
 
     Returns (input_data, error_message). input_data is None on error.
@@ -470,9 +439,7 @@ def _load_and_validate_input_json(
     expected_schema = INPUT_SCHEMA_BY_COMMAND.get(command_id)
     if input_data.get("schema") != expected_schema:
         schema_val = input_data.get("schema")
-        return None, (
-            f"input_schema_mismatch: expected {expected_schema}, got {schema_val!r}"
-        )
+        return None, (f"input_schema_mismatch: expected {expected_schema}, got {schema_val!r}")
 
     input_issue = input_data.get("issue_number")
     if input_issue is None:
@@ -485,9 +452,7 @@ def _load_and_validate_input_json(
     return input_data, ""
 
 
-def _validate_input_json(
-    canonical_input: Path, issue_number: int
-) -> str:
+def _validate_input_json(canonical_input: Path, issue_number: int) -> str:
     """Backward-compatible wrapper for termination_report.publish (AC10 legacy)."""
     _, err = _load_and_validate_input_json(canonical_input, issue_number, COMMAND_ID_PUBLISH)
     return err
@@ -508,19 +473,25 @@ def _validate_issue_body_update_fields(data: dict) -> str:
             return f"issue_body_update_field_invalid: {field!r}"
     computed = "sha256:" + hashlib.sha256(data["new_body"].encode("utf-8")).hexdigest()
     if computed != data["new_body_sha256"]:
-        return (
-            f"issue_body_update_new_body_sha256_mismatch: computed={computed} "
-            f"declared={data['new_body_sha256']}"
-        )
+        return f"issue_body_update_new_body_sha256_mismatch: computed={computed} declared={data['new_body_sha256']}"
     return ""
 
 
-_ISSUE_CONTENT_UPDATE_ALLOWED_KEYS = frozenset({
-    "schema", "issue_number", "repo", "expected_previous_title",
-    "expected_previous_body_sha256", "expected_previous_updated_at",
-    "new_title", "new_body", "new_body_sha256", "operation_reason",
-    "idempotency_key",
-})
+_ISSUE_CONTENT_UPDATE_ALLOWED_KEYS = frozenset(
+    {
+        "schema",
+        "issue_number",
+        "repo",
+        "expected_previous_title",
+        "expected_previous_body_sha256",
+        "expected_previous_updated_at",
+        "new_title",
+        "new_body",
+        "new_body_sha256",
+        "operation_reason",
+        "idempotency_key",
+    }
+)
 
 
 def _validate_issue_content_update_fields(data: dict, repo: str, issue_number: int) -> str:
@@ -532,9 +503,14 @@ def _validate_issue_content_update_fields(data: dict, repo: str, issue_number: i
     if data.get("issue_number") != issue_number:
         return "issue_content_update_issue_number_mismatch"
     for field in (
-        "expected_previous_title", "expected_previous_body_sha256",
-        "expected_previous_updated_at", "new_title", "new_body",
-        "new_body_sha256", "operation_reason", "idempotency_key",
+        "expected_previous_title",
+        "expected_previous_body_sha256",
+        "expected_previous_updated_at",
+        "new_title",
+        "new_body",
+        "new_body_sha256",
+        "operation_reason",
+        "idempotency_key",
     ):
         if not isinstance(data.get(field), str) or (field != "new_body" and not data[field]):
             return f"issue_content_update_field_invalid: {field!r}"
@@ -565,11 +541,123 @@ _PR_HEAD_SHA_RE = _re.compile(r"^[0-9a-f]{40}$")
 # outside this set is rejected before any mutation. Applies to the
 # --input-file code path (the --render-body-file code path never accepts an
 # arbitrary dict at all -- see _render_pr_review_publish_request()).
-_PR_REVIEW_PUBLISH_ALLOWED_KEYS = frozenset({
-    "schema", "issue_number", "repo", "pr_number", "expected_head_sha",
-    "event", "producer_role", "body", "body_sha256", "idempotency_key",
-})
+_PR_REVIEW_PUBLISH_ALLOWED_KEYS = frozenset(
+    {
+        "schema",
+        "issue_number",
+        "repo",
+        "pr_number",
+        "expected_head_sha",
+        "event",
+        "producer_role",
+        "body",
+        "body_sha256",
+        "idempotency_key",
+    }
+)
 _PR_REVIEW_BODY_MAX_BYTES = 60000
+
+# Issue #1647: this transaction is deliberately distinct from the generic
+# issue-comment publisher.  The CLI issue number is the linked Issue; the PR
+# is a separate, mandatory field and is never inferred from it.
+_TEST_VERDICT_PUBLISH_ALLOWED_KEYS = frozenset(
+    {
+        "schema",
+        "issue_number",
+        "repo",
+        "target_pr_number",
+        "linked_issue_number",
+        "expected_head_sha",
+        "linked_issue_body_sha256",
+        "producer_receipt",
+        "receipt_sha256",
+        "body",
+        "body_sha256",
+        "idempotency_key",
+    }
+)
+_TEST_VERDICT_BODY_MAX_BYTES = 60000
+TEST_VERDICT_MARKER_PREFIX = "<!-- TEST_VERDICT_PUBLISH_MARKER:"
+TEST_VERDICT_MARKER_SUFFIX = " -->"
+
+
+def _canonical_sha256(value: object) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _test_verdict_marker_str(idempotency_key: str) -> str:
+    digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:32]
+    return f"{TEST_VERDICT_MARKER_PREFIX}{digest}{TEST_VERDICT_MARKER_SUFFIX}"
+
+
+def _validate_test_verdict_publish_fields(data: dict, repo: str, issue_number: int) -> str:
+    unknown_keys = set(data.keys()) - _TEST_VERDICT_PUBLISH_ALLOWED_KEYS
+    if unknown_keys:
+        return f"test_verdict_publish_unknown_fields: {sorted(unknown_keys)}"
+    if data.get("repo") != repo:
+        return "test_verdict_publish_repo_mismatch"
+    if data.get("linked_issue_number") != issue_number or data.get("issue_number") != issue_number:
+        return "test_verdict_publish_linked_issue_number_mismatch"
+    target_pr_number = data.get("target_pr_number")
+    if type(target_pr_number) is not int or target_pr_number <= 0 or target_pr_number == issue_number:
+        return "test_verdict_publish_target_pr_number_invalid"
+    expected_head_sha = data.get("expected_head_sha")
+    if not isinstance(expected_head_sha, str) or not _PR_HEAD_SHA_RE.match(expected_head_sha):
+        return "test_verdict_publish_expected_head_sha_invalid"
+    linked_issue_body_sha256 = data.get("linked_issue_body_sha256")
+    if not isinstance(linked_issue_body_sha256, str) or not _re.fullmatch(
+        r"sha256:[0-9a-f]{64}", linked_issue_body_sha256
+    ):
+        return "test_verdict_publish_linked_issue_body_sha256_invalid"
+    receipt = data.get("producer_receipt")
+    if not isinstance(receipt, dict):
+        return "test_verdict_publish_receipt_invalid"
+    if receipt.get("schema") != "TEST_VERDICT_PRODUCER_RECEIPT_V1" or receipt.get("schema_version") != 1:
+        return "test_verdict_publish_receipt_schema_invalid"
+    if receipt.get("pass_eligible") is not True:
+        return "test_verdict_publish_receipt_not_pass_eligible"
+    subject = receipt.get("subject")
+    contract = receipt.get("contract")
+    artifact = receipt.get("execution_artifact")
+    if (
+        not isinstance(subject, dict)
+        or subject.get("target_pr_number") != target_pr_number
+        or subject.get("pr_head_sha") != expected_head_sha
+    ):
+        return "test_verdict_publish_receipt_subject_mismatch"
+    if (
+        not isinstance(contract, dict)
+        or contract.get("linked_issue_number") != issue_number
+        or contract.get("issue_body_sha256") != linked_issue_body_sha256
+    ):
+        return "test_verdict_publish_receipt_contract_mismatch"
+    if (
+        not isinstance(artifact, dict)
+        or not isinstance(artifact.get("artifact_id"), int)
+        or artifact["artifact_id"] <= 0
+        or not isinstance(artifact.get("artifact_url"), str)
+        or not artifact["artifact_url"]
+        or not isinstance(artifact.get("artifact_archive_digest"), str)
+        or not _re.fullmatch(r"sha256:[0-9a-f]{64}", artifact["artifact_archive_digest"])
+    ):
+        return "test_verdict_publish_receipt_artifact_invalid"
+    receipt_sha256 = data.get("receipt_sha256")
+    if receipt_sha256 != _canonical_sha256(receipt):
+        return "test_verdict_publish_receipt_sha256_mismatch"
+    body = data.get("body")
+    if not isinstance(body, str) or not body or "TEST_VERDICT_MACHINE/v2" not in body:
+        return "test_verdict_publish_body_invalid"
+    if len(body.encode("utf-8")) > _TEST_VERDICT_BODY_MAX_BYTES:
+        return "test_verdict_publish_body_too_large"
+    body_sha256 = data.get("body_sha256")
+    computed_body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    if body_sha256 != computed_body_sha256:
+        return "test_verdict_publish_body_sha256_mismatch"
+    expected_key = f"{repo}:{target_pr_number}:{issue_number}:{expected_head_sha}:{receipt_sha256}:{body_sha256}"
+    if data.get("idempotency_key") != expected_key:
+        return "test_verdict_publish_idempotency_key_mismatch"
+    return ""
 
 
 def _validate_pr_review_publish_fields(
@@ -623,10 +711,7 @@ def _validate_pr_review_publish_fields(
     body_sha256 = data.get("body_sha256")
     computed_body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
     if body_sha256 != computed_body_sha256:
-        return (
-            f"pr_review_publish_body_sha256_mismatch: computed={computed_body_sha256} "
-            f"declared={body_sha256!r}"
-        )
+        return f"pr_review_publish_body_sha256_mismatch: computed={computed_body_sha256} declared={body_sha256!r}"
 
     idempotency_key = data.get("idempotency_key")
     expected_idempotency_key = f"{repo}:{pr_number}:{expected_head_sha}:{body_sha256}"
@@ -689,10 +774,7 @@ def _check_issue_env_binding(command_id: str, issue_number: int) -> str:
     if not env_issue.isdigit():
         return f"loop_issue_number_env_not_digit: {env_issue!r}"
     if int(env_issue) != issue_number:
-        return (
-            f"issue_number_mismatch: --issue-number {issue_number} "
-            f"!= LOOP_ISSUE_NUMBER {env_issue}"
-        )
+        return f"issue_number_mismatch: --issue-number {issue_number} != LOOP_ISSUE_NUMBER {env_issue}"
     return ""
 
 
@@ -743,25 +825,22 @@ EXEC_MARKER_PREFIX = "<!-- CONTROLLED_EXEC_MARKER:"
 EXEC_MARKER_SUFFIX = " -->"
 
 
-def _compute_exec_marker(
-    command_id: str, repo: str, issue_number: int, canonical_input: Path
-) -> str:
+def _compute_exec_marker(command_id: str, repo: str, issue_number: int, canonical_input: Path) -> str:
     """Compute deterministic exec marker for comment injection."""
     input_sha = hashlib.sha256(canonical_input.read_bytes()).hexdigest()
     marker_src = f"{command_id}:{repo}:{issue_number}:{input_sha}"
     return hashlib.sha256(marker_src.encode()).hexdigest()[:32]
 
 
-def _readback_by_marker(
-    exec_marker: str, issue_number: int, repo: str, gh_bin: str
-) -> dict:
+def _readback_by_marker(exec_marker: str, issue_number: int, repo: str, gh_bin: str) -> dict:
     """Search comments for exec_marker and return comment metadata."""
     marker_str = f"{EXEC_MARKER_PREFIX}{exec_marker}{EXEC_MARKER_SUFFIX}"
     try:
         out = subprocess.run(
-            [gh_bin, "issue", "view", str(issue_number),
-             "--repo", repo, "--json", "comments"],
-            capture_output=True, text=True, timeout=15,
+            [gh_bin, "issue", "view", str(issue_number), "--repo", repo, "--json", "comments"],
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
         if out.returncode != 0:
             return {"error": f"gh_failed_rc_{out.returncode}"}
@@ -819,18 +898,23 @@ def _classify_gh_error(prefix: str, stderr: str) -> str:
 # -- Issue #1284: issue body / comment mutation helpers ------------------------
 
 
-def _fetch_issue_content(
-    issue_number: int, repo: str, gh_bin: str
-) -> tuple[dict | None, str]:
+def _fetch_issue_content(issue_number: int, repo: str, gh_bin: str) -> tuple[dict | None, str]:
     """Read the fixed Issue endpoint without inheriting caller gh settings."""
     try:
         out = subprocess.run(
             [
-                gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST,
+                gh_bin,
+                "api",
+                "--hostname",
+                _TRUSTED_GITHUB_HOST,
                 f"repos/{repo}/issues/{issue_number}",
-                "--jq", "{title, body, updatedAt: .updated_at, isPullRequest: has(\"pull_request\")}",
+                "--jq",
+                '{title, body, updatedAt: .updated_at, isPullRequest: has("pull_request")}',
             ],
-            capture_output=True, text=True, timeout=15, shell=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
             env=_build_metadata_sanitized_env(),
         )
         if out.returncode != 0:
@@ -854,9 +938,7 @@ def _fetch_issue_content(
         return None, f"gh_issue_fetch_exception: {exc}"
 
 
-def _fetch_issue_body_and_updated_at(
-    issue_number: int, repo: str, gh_bin: str
-) -> tuple[str | None, str | None, str]:
+def _fetch_issue_body_and_updated_at(issue_number: int, repo: str, gh_bin: str) -> tuple[str | None, str | None, str]:
     """Fetch live Issue state from the trusted GitHub host only.
 
     ``contract_snapshot.publish`` uses this helper for both its stale-write
@@ -867,11 +949,18 @@ def _fetch_issue_body_and_updated_at(
     try:
         out = subprocess.run(
             [
-                gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST,
+                gh_bin,
+                "api",
+                "--hostname",
+                _TRUSTED_GITHUB_HOST,
                 f"repos/{repo}/issues/{issue_number}",
-                "--jq", "{body, updatedAt: .updated_at}",
+                "--jq",
+                "{body, updatedAt: .updated_at}",
             ],
-            capture_output=True, text=True, timeout=15, shell=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
             env=_build_metadata_sanitized_env(),
         )
         if out.returncode != 0:
@@ -882,24 +971,29 @@ def _fetch_issue_body_and_updated_at(
         return None, None, f"gh_issue_fetch_exception: {exc}"
 
 
-def _patch_issue_body(
-    issue_number: int, repo: str, new_body: str, gh_bin: str
-) -> str:
+def _patch_issue_body(issue_number: int, repo: str, new_body: str, gh_bin: str) -> str:
     """PATCH issue body via gh api argv-list (no gh issue edit CLI). Returns error or ''."""
     import tempfile
 
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".md", delete=False, encoding="utf-8"
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as tmp:
             tmp.write(new_body)
             tmp_path = tmp.name
         try:
             out = subprocess.run(
-                [gh_bin, "api", "--method", "PATCH",
-                 f"repos/{repo}/issues/{issue_number}",
-                 "--field", f"body=@{tmp_path}"],
-                capture_output=True, text=True, timeout=15, shell=False,
+                [
+                    gh_bin,
+                    "api",
+                    "--method",
+                    "PATCH",
+                    f"repos/{repo}/issues/{issue_number}",
+                    "--field",
+                    f"body=@{tmp_path}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                shell=False,
             )
         finally:
             try:
@@ -918,19 +1012,26 @@ def _patch_issue_content(issue_number: int, repo: str, title: str, body: str, gh
     import tempfile
 
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False, encoding="utf-8"
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tmp:
             json.dump({"title": title, "body": body}, tmp, ensure_ascii=False)
             tmp_path = tmp.name
         try:
             out = subprocess.run(
                 [
-                    gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST,
-                    "--method", "PATCH", f"repos/{repo}/issues/{issue_number}",
-                    "--input", tmp_path,
+                    gh_bin,
+                    "api",
+                    "--hostname",
+                    _TRUSTED_GITHUB_HOST,
+                    "--method",
+                    "PATCH",
+                    f"repos/{repo}/issues/{issue_number}",
+                    "--input",
+                    tmp_path,
                 ],
-                capture_output=True, text=True, timeout=15, shell=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                shell=False,
                 env=_build_metadata_sanitized_env(),
             )
         finally:
@@ -945,24 +1046,29 @@ def _patch_issue_content(issue_number: int, repo: str, title: str, body: str, gh
         return f"gh_api_patch_exception: {exc}"
 
 
-def _post_gh_comment(
-    issue_number: int, repo: str, body: str, gh_bin: str
-) -> tuple[str, str, str]:
+def _post_gh_comment(issue_number: int, repo: str, body: str, gh_bin: str) -> tuple[str, str, str]:
     """POST a comment via gh api argv-list. Returns (comment_url, comment_id, error)."""
     import tempfile
 
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".md", delete=False, encoding="utf-8"
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as tmp:
             tmp.write(body)
             tmp_path = tmp.name
         try:
             out = subprocess.run(
-                [gh_bin, "api", "--method", "POST",
-                 f"repos/{repo}/issues/{issue_number}/comments",
-                 "--field", f"body=@{tmp_path}"],
-                capture_output=True, text=True, timeout=15, shell=False,
+                [
+                    gh_bin,
+                    "api",
+                    "--method",
+                    "POST",
+                    f"repos/{repo}/issues/{issue_number}/comments",
+                    "--field",
+                    f"body=@{tmp_path}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                shell=False,
             )
         finally:
             try:
@@ -983,9 +1089,7 @@ def _post_gh_comment(
 # -- Postcondition check -------------------------------------------------------
 
 
-def _check_no_tracked_changes(
-    project_root: Path, issue_number: int, allowed_prefix: str | None = None
-) -> list[str]:
+def _check_no_tracked_changes(project_root: Path, issue_number: int, allowed_prefix: str | None = None) -> list[str]:
     """Return list of violations (staged, unstaged, untracked source files). Empty = OK (AC14).
 
     Uses git status --porcelain=v1 --untracked-files=all.
@@ -997,8 +1101,7 @@ def _check_no_tracked_changes(
     """
     try:
         out = subprocess.run(
-            ["git", "-C", str(project_root), "status", "--porcelain=v1",
-             "--untracked-files=all"],
+            ["git", "-C", str(project_root), "status", "--porcelain=v1", "--untracked-files=all"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -1042,9 +1145,12 @@ def _invoke_publisher(
     cmd = [
         sys.executable,
         str(publisher),
-        "--issue-number", str(issue_number),
-        "--input-file", input_file,
-        "--repo", repo,
+        "--issue-number",
+        str(issue_number),
+        "--input-file",
+        input_file,
+        "--repo",
+        repo,
     ]
     try:
         proc = subprocess.run(
@@ -1067,13 +1173,12 @@ def _invoke_publisher(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Controlled skill mutation executor (Issue #1166 / #1284)"
-    )
+    parser = argparse.ArgumentParser(description="Controlled skill mutation executor (Issue #1166 / #1284)")
     parser.add_argument("--command-id", required=True, help="Command ID")
     parser.add_argument("--issue-number", type=int, required=True, help="GitHub issue number")
     parser.add_argument(
-        "--input-file", default=None,
+        "--input-file",
+        default=None,
         help="Relative path to input JSON file (artifact subtree)",
     )
     parser.add_argument("--repo", required=True, help="GitHub repo slug (owner/repo)")
@@ -1087,9 +1192,9 @@ def main(argv: list[str] | None = None) -> int:
     # idempotency_key and hardcodes producer_role="pr-reviewer" / event=
     # "COMMENT" itself instead of trusting a pre-built, self-hashed JSON.
     parser.add_argument(
-        "--render-body-file", default=None,
-        help="Relative path to a raw review body TEXT file (artifact subtree, "
-             "pr_review.publish render mode only)",
+        "--render-body-file",
+        default=None,
+        help="Relative path to a raw review body TEXT file (artifact subtree, pr_review.publish render mode only)",
     )
     # Issue #1822: linked --issue-number and target --pr-number are
     # independent identifiers (e.g. Issue #1688 -> PR #1818). The artifact
@@ -1101,19 +1206,24 @@ def main(argv: list[str] | None = None) -> int:
              "only, independent from --issue-number)",
     )
     parser.add_argument(
-        "--verdict", default=None, choices=["APPROVE", "REQUEST_CHANGES", "COMMENT"],
+        "--verdict",
+        default=None,
+        choices=["APPROVE", "REQUEST_CHANGES", "COMMENT"],
         help="Declared verdict (render mode only)",
     )
     parser.add_argument(
-        "--reviewed-head-sha", default=None,
+        "--reviewed-head-sha",
+        default=None,
         help="Head SHA the reviewer actually inspected (render mode only)",
     )
     parser.add_argument(
-        "--expected-head-sha", default=None,
+        "--expected-head-sha",
+        default=None,
         help="Head SHA the review must be commit_id-bound to (render mode only)",
     )
     parser.add_argument(
-        "--merge-ready", action="store_true",
+        "--merge-ready",
+        action="store_true",
         help="Declared merge_ready flag (render mode only; requires --verdict APPROVE)",
     )
     args = parser.parse_args(argv)
@@ -1201,9 +1311,7 @@ def main(argv: list[str] | None = None) -> int:
             return _fail(input_err)
 
         # -- AC10: per-command-id input schema validation ------------------------
-        input_data, json_err = _load_and_validate_input_json(
-            canonical_input, args.issue_number, args.command_id
-        )
+        input_data, json_err = _load_and_validate_input_json(canonical_input, args.issue_number, args.command_id)
         if json_err:
             return _fail(json_err)
 
@@ -1232,6 +1340,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_pr_review_publish(
             args, input_data, gh_bin, _fail, _ok, enforce_issue_pr_match=not render_mode
         )
+    if args.command_id == COMMAND_ID_TEST_VERDICT_PUBLISH:
+        return _run_test_verdict_publish(args, input_data, gh_bin, _fail, _ok)
     if args.command_id == COMMAND_ID_ISSUE_DEPENDENCY_REMOVE:
         return _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok)
 
@@ -1245,8 +1355,7 @@ def _run_issue_scope_snapshot_materialize(args, input_data, gh_bin, _fail, _ok) 
     if input_data["worktree_path"] != str(PROJECT_ROOT.resolve()):
         return _fail("issue_scope_snapshot_materialize_worktree_binding_mismatch")
     expected_output = (
-        f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/"
-        f"{args.command_id}/issue_scope_snapshot.json"
+        f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/issue_scope_snapshot.json"
     )
     if input_data["output_path"] != expected_output:
         return _fail("issue_scope_snapshot_materialize_output_binding_mismatch")
@@ -1321,9 +1430,7 @@ def _run_termination_report_publish(args, canonical_input, gh_bin, _fail, _ok) -
         return 0
 
     # -- Compute exec marker --------------------------------------------------
-    exec_marker = _compute_exec_marker(
-        args.command_id, args.repo, args.issue_number, canonical_input
-    )
+    exec_marker = _compute_exec_marker(args.command_id, args.repo, args.issue_number, canonical_input)
 
     # -- AC13: sanitized environment ------------------------------------------
     sanitized_env = _build_sanitized_env(PROJECT_ROOT, args.issue_number, exec_marker)
@@ -1362,16 +1469,16 @@ def _run_termination_report_publish(args, canonical_input, gh_bin, _fail, _ok) -
     body_hash = readback.get("body_sha256") or ""
 
     # Write idempotency marker only after successful read-back
-    _write_idempotency_marker(
-        PROJECT_ROOT, args.issue_number, comment_id, comment_url, body_hash
-    )
+    _write_idempotency_marker(PROJECT_ROOT, args.issue_number, comment_id, comment_url, body_hash)
 
-    return _ok({
-        "comment_id": comment_id,
-        "comment_url": comment_url,
-        "body_sha256": body_hash,
-        "idempotency_marker_written": True,
-    })
+    return _ok(
+        {
+            "comment_id": comment_id,
+            "comment_url": comment_url,
+            "body_sha256": body_hash,
+            "idempotency_marker_written": True,
+        }
+    )
 
 
 def _issue_metadata_marker_path(project_root: Path, issue_number: int, command_id: str, name: str) -> Path:
@@ -1390,8 +1497,12 @@ def _run_issue_body_update(args, input_data, gh_bin, _fail, _ok) -> int:
     write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
 
     if args.dry_run:
-        result = {"schema": RESULT_SCHEMA, "status": "dry_run_ok", "command_id": args.command_id,
-                   "issue_number": args.issue_number}
+        result = {
+            "schema": RESULT_SCHEMA,
+            "status": "dry_run_ok",
+            "command_id": args.command_id,
+            "issue_number": args.issue_number,
+        }
         if args.output_json:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
@@ -1406,10 +1517,7 @@ def _run_issue_body_update(args, input_data, gh_bin, _fail, _ok) -> int:
             marker_data = json.loads(marker_path.read_text())
         except Exception:
             return _fail("issue_body_update_marker_corrupt")
-        if (
-            marker_data.get("issue_number") != args.issue_number
-            or marker_data.get("repo") != args.repo
-        ):
+        if marker_data.get("issue_number") != args.issue_number or marker_data.get("repo") != args.repo:
             return _fail("issue_body_update_marker_metadata_mismatch")
 
     # -- Readback current remote state (authority for both the marker-hit path
@@ -1421,12 +1529,14 @@ def _run_issue_body_update(args, input_data, gh_bin, _fail, _ok) -> int:
 
     if marker_data is not None:
         if current_body_sha256 == input_data["new_body_sha256"]:
-            return _ok({
-                "status_detail": "already_applied",
-                "marker_state": "already_applied_remote_authority",
-                "new_body_sha256": current_body_sha256,
-                "idempotency_marker_found": True,
-            })
+            return _ok(
+                {
+                    "status_detail": "already_applied",
+                    "marker_state": "already_applied_remote_authority",
+                    "new_body_sha256": current_body_sha256,
+                    "idempotency_marker_found": True,
+                }
+            )
         marker_state = "stale_local_marker_recovered"
 
     # -- AC9: stale-write precondition — readback must match previous_* --------
@@ -1449,9 +1559,7 @@ def _run_issue_body_update(args, input_data, gh_bin, _fail, _ok) -> int:
         return _fail(patch_err, status="failed")
 
     # -- AC4/AC9: postcondition readback — new_body_sha256 must match ------------
-    body_after, _updated_at_after, err_after = _fetch_issue_body_and_updated_at(
-        args.issue_number, args.repo, gh_bin
-    )
+    body_after, _updated_at_after, err_after = _fetch_issue_body_and_updated_at(args.issue_number, args.repo, gh_bin)
     if err_after:
         return _fail(err_after, status="failed")
     actual_new_sha256 = "sha256:" + hashlib.sha256((body_after or "").encode("utf-8")).hexdigest()
@@ -1473,19 +1581,27 @@ def _run_issue_body_update(args, input_data, gh_bin, _fail, _ok) -> int:
         )
 
     marker_path.parent.mkdir(parents=True, exist_ok=True)
-    marker_path.write_text(json.dumps({
-        "schema": "ISSUE_BODY_UPDATE_MARKER_V1",
-        "issue_number": args.issue_number,
-        "repo": args.repo,
-        "new_body_sha256": actual_new_sha256,
-        "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    }, ensure_ascii=False, indent=2))
+    marker_path.write_text(
+        json.dumps(
+            {
+                "schema": "ISSUE_BODY_UPDATE_MARKER_V1",
+                "issue_number": args.issue_number,
+                "repo": args.repo,
+                "new_body_sha256": actual_new_sha256,
+                "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
-    return _ok({
-        "new_body_sha256": actual_new_sha256,
-        "idempotency_marker_written": True,
-        "marker_state": marker_state,
-    })
+    return _ok(
+        {
+            "new_body_sha256": actual_new_sha256,
+            "idempotency_marker_written": True,
+            "marker_state": marker_state,
+        }
+    )
 
 
 def _run_issue_content_update(args, input_data, gh_bin, _fail, _ok) -> int:
@@ -1515,15 +1631,22 @@ def _run_issue_content_update(args, input_data, gh_bin, _fail, _ok) -> int:
         marker_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = marker_path.with_name(f".{marker_path.name}.{os.getpid()}.tmp")
         try:
-            temporary.write_text(json.dumps({
-                "schema": "ISSUE_CONTENT_UPDATE_MARKER_V1",
-                "issue_number": args.issue_number,
-                "repo": args.repo,
-                "idempotency_key": input_data["idempotency_key"],
-                "new_title": input_data["new_title"],
-                "new_body_sha256": body_sha256,
-                "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.write_text(
+                json.dumps(
+                    {
+                        "schema": "ISSUE_CONTENT_UPDATE_MARKER_V1",
+                        "issue_number": args.issue_number,
+                        "repo": args.repo,
+                        "idempotency_key": input_data["idempotency_key"],
+                        "new_title": input_data["new_title"],
+                        "new_body_sha256": body_sha256,
+                        "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
             os.replace(temporary, marker_path)
             return ""
         except Exception as exc:
@@ -1533,9 +1656,7 @@ def _run_issue_content_update(args, input_data, gh_bin, _fail, _ok) -> int:
                 pass
             return f"issue_content_update_marker_write_failed: {exc}"
 
-    def _finalize_remote_success(
-        *, status_detail: str, body_sha256: str, patch_attempted: bool
-    ) -> int:
+    def _finalize_remote_success(*, status_detail: str, body_sha256: str, patch_attempted: bool) -> int:
         changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
         if changed:
             return _fail(
@@ -1550,14 +1671,16 @@ def _run_issue_content_update(args, input_data, gh_bin, _fail, _ok) -> int:
                 status="failed",
                 extra={"patch_attempted": patch_attempted, "mutation_outcome": "applied"},
             )
-        return _ok({
-            "status_detail": status_detail,
-            "mutation_outcome": "applied" if patch_attempted else status_detail,
-            "patch_attempted": patch_attempted,
-            "new_title": input_data["new_title"],
-            "new_body_sha256": body_sha256,
-            "idempotency_marker_written": True,
-        })
+        return _ok(
+            {
+                "status_detail": status_detail,
+                "mutation_outcome": "applied" if patch_attempted else status_detail,
+                "patch_attempted": patch_attempted,
+                "new_title": input_data["new_title"],
+                "new_body_sha256": body_sha256,
+                "idempotency_marker_written": True,
+            }
+        )
 
     # Remote state is authoritative. Local marker state is repairable audit
     # cache only and never decides whether a PATCH is needed.
@@ -1625,9 +1748,7 @@ def _run_issue_content_update(args, input_data, gh_bin, _fail, _ok) -> int:
             status="failed",
             extra={"patch_attempted": True, "mutation_outcome": "unknown"},
         )
-    return _finalize_remote_success(
-        status_detail="applied", body_sha256=actual_new_body_sha256, patch_attempted=True
-    )
+    return _finalize_remote_success(status_detail="applied", body_sha256=actual_new_body_sha256, patch_attempted=True)
 
 
 def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail, _ok) -> int:
@@ -1644,23 +1765,33 @@ def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail,
     write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
 
     if args.dry_run:
-        result = {"schema": RESULT_SCHEMA, "status": "dry_run_ok", "command_id": args.command_id,
-                   "issue_number": args.issue_number}
+        result = {
+            "schema": RESULT_SCHEMA,
+            "status": "dry_run_ok",
+            "command_id": args.command_id,
+            "issue_number": args.issue_number,
+        }
         if args.output_json:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
     def _write_marker(comment_id, comment_url) -> None:
         marker_path.parent.mkdir(parents=True, exist_ok=True)
-        marker_path.write_text(json.dumps({
-            "schema": "ISSUE_COMMENT_PUBLISH_MARKER_V1",
-            "issue_number": args.issue_number,
-            "repo": args.repo,
-            "marker": marker,
-            "comment_id": comment_id,
-            "comment_url": comment_url,
-            "published_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        }, ensure_ascii=False, indent=2))
+        marker_path.write_text(
+            json.dumps(
+                {
+                    "schema": "ISSUE_COMMENT_PUBLISH_MARKER_V1",
+                    "issue_number": args.issue_number,
+                    "repo": args.repo,
+                    "marker": marker,
+                    "comment_id": comment_id,
+                    "comment_url": comment_url,
+                    "published_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
 
     # -- Blocker 2/3: pre-mutation remote marker precheck. A local marker file
     # is never authority by itself; remote GitHub state decides no-op vs. post
@@ -1681,18 +1812,18 @@ def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail,
         # No-op: already published by a prior run (or another agent). Refresh
         # the local cache/audit marker but do not POST again.
         _write_marker(c.get("id", ""), c.get("url", ""))
-        return _ok({
-            "status_detail": "already_published",
-            "comment_id": c.get("id", ""),
-            "comment_url": c.get("url", ""),
-            "body_sha256": remote_body_sha256,
-            "idempotency_marker_written": True,
-        })
+        return _ok(
+            {
+                "status_detail": "already_published",
+                "comment_id": c.get("id", ""),
+                "comment_url": c.get("url", ""),
+                "body_sha256": remote_body_sha256,
+                "idempotency_marker_written": True,
+            }
+        )
 
     # -- matches == 0: no remote marker yet, proceed to post --------------------
-    comment_url, comment_id, post_err = _post_gh_comment(
-        args.issue_number, args.repo, comment_body, gh_bin
-    )
+    comment_url, comment_id, post_err = _post_gh_comment(args.issue_number, args.repo, comment_body, gh_bin)
     if post_err:
         return _fail(post_err, status="failed")
 
@@ -1715,12 +1846,14 @@ def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail,
 
     _write_marker(readback.get("comment_id"), readback.get("comment_url"))
 
-    return _ok({
-        "comment_id": readback.get("comment_id"),
-        "comment_url": readback.get("comment_url"),
-        "body_sha256": readback.get("body_sha256"),
-        "idempotency_marker_written": True,
-    })
+    return _ok(
+        {
+            "comment_id": readback.get("comment_id"),
+            "comment_url": readback.get("comment_url"),
+            "body_sha256": readback.get("body_sha256"),
+            "idempotency_marker_written": True,
+        }
+    )
 
 
 def _find_marker_matches(marker_literal: str, issue_number: int, repo: str, gh_bin: str) -> tuple[list[dict], str]:
@@ -1733,7 +1866,10 @@ def _find_marker_matches(marker_literal: str, issue_number: int, repo: str, gh_b
     try:
         out = subprocess.run(
             [gh_bin, "issue", "view", str(issue_number), "--repo", repo, "--json", "comments"],
-            capture_output=True, text=True, timeout=15, shell=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
         )
         if out.returncode != 0:
             return [], f"gh_failed_rc_{out.returncode}"
@@ -1752,7 +1888,10 @@ def _readback_by_marker_literal(marker_literal: str, issue_number: int, repo: st
     try:
         out = subprocess.run(
             [gh_bin, "issue", "view", str(issue_number), "--repo", repo, "--json", "comments"],
-            capture_output=True, text=True, timeout=15, shell=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
         )
         if out.returncode != 0:
             return {"error": f"gh_failed_rc_{out.returncode}"}
@@ -1784,9 +1923,15 @@ PR_REVIEW_MARKER_SUFFIX = " -->"
 # (GH_HOST / GH_REPO / GH_CONFIG_DIR / GH_DEBUG / DEBUG can silently redirect
 # `gh` to a different host/config or leak debug output; an inherited parent
 # env is never trusted here).
-_PR_REVIEW_GH_ENV_STRIP_KEYS = frozenset(ENV_SANITIZE_KEYS) | frozenset({
-    "GH_HOST", "GH_REPO", "GH_CONFIG_DIR", "GH_DEBUG", "DEBUG",
-})
+_PR_REVIEW_GH_ENV_STRIP_KEYS = frozenset(ENV_SANITIZE_KEYS) | frozenset(
+    {
+        "GH_HOST",
+        "GH_REPO",
+        "GH_CONFIG_DIR",
+        "GH_DEBUG",
+        "DEBUG",
+    }
+)
 
 
 def _build_pr_review_gh_env() -> dict[str, str]:
@@ -1821,9 +1966,12 @@ def _fetch_pr_head_sha(
     """Fetch the current remote PR head commit SHA. Returns (sha, error)."""
     try:
         out = subprocess.run(
-            [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST,
-             f"repos/{repo}/pulls/{pr_number}", "--jq", ".head.sha"],
-            capture_output=True, text=True, timeout=15, shell=False, env=env,
+            [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST, f"repos/{repo}/pulls/{pr_number}", "--jq", ".head.sha"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+            env=env,
         )
         if out.returncode != 0:
             return None, _classify_gh_error("gh_api_pr_head_fetch_failed", out.stderr or "")
@@ -1835,9 +1983,7 @@ def _fetch_pr_head_sha(
         return None, f"gh_api_pr_head_fetch_exception: {exc}"
 
 
-def _fetch_authenticated_login(
-    gh_bin: str, env: dict[str, str] | None = None
-) -> tuple[str | None, str]:
+def _fetch_authenticated_login(gh_bin: str, env: dict[str, str] | None = None) -> tuple[str | None, str]:
     """Fetch the authenticated gh identity's login. Used as a postcondition
     identity binding when re-verifying an idempotent-retry review (Issue #1539
     fix_delta Blocker 3): the review author must be the SAME identity this
@@ -1845,7 +1991,11 @@ def _fetch_authenticated_login(
     try:
         out = subprocess.run(
             [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST, "user", "--jq", ".login"],
-            capture_output=True, text=True, timeout=15, shell=False, env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+            env=env,
         )
         if out.returncode != 0:
             return None, _classify_gh_error("gh_api_authenticated_user_failed", out.stderr or "")
@@ -1858,7 +2008,10 @@ def _fetch_authenticated_login(
 
 
 def _find_pr_review_marker_matches(
-    marker_literal: str, pr_number: int, repo: str, gh_bin: str,
+    marker_literal: str,
+    pr_number: int,
+    repo: str,
+    gh_bin: str,
     env: dict[str, str] | None = None,
 ) -> tuple[list[dict], str]:
     """List all remote reviews on the PR whose body embeds marker_literal AT
@@ -1869,9 +2022,21 @@ def _find_pr_review_marker_matches(
     transaction never leaves a remote side effect (AC7)."""
     try:
         out = subprocess.run(
-            [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST,
-             f"repos/{repo}/pulls/{pr_number}/reviews", "--paginate", "--jq", "."],
-            capture_output=True, text=True, timeout=15, shell=False, env=env,
+            [
+                gh_bin,
+                "api",
+                "--hostname",
+                _TRUSTED_GITHUB_HOST,
+                f"repos/{repo}/pulls/{pr_number}/reviews",
+                "--paginate",
+                "--jq",
+                ".",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+            env=env,
         )
         if out.returncode != 0:
             return [], _classify_gh_error("gh_api_pr_reviews_list_failed", out.stderr or "")
@@ -1885,17 +2050,19 @@ def _find_pr_review_marker_matches(
                 reviews.extend(parsed)
             else:
                 reviews.append(parsed)
-        matches = [
-            r for r in reviews
-            if _marker_at_expected_position(r.get("body") or "", marker_literal)
-        ]
+        matches = [r for r in reviews if _marker_at_expected_position(r.get("body") or "", marker_literal)]
         return matches, ""
     except Exception as exc:
         return [], f"pr_review_marker_list_exception: {exc}"
 
 
 def _post_pr_review(
-    pr_number: int, repo: str, commit_id: str, event: str, body: str, gh_bin: str,
+    pr_number: int,
+    repo: str,
+    commit_id: str,
+    event: str,
+    body: str,
+    gh_bin: str,
     env: dict[str, str] | None = None,
 ) -> tuple[dict | None, str]:
     """POST a PR review via gh api with JSON stdin (--input -), never via
@@ -1904,9 +2071,23 @@ def _post_pr_review(
     payload = json.dumps({"commit_id": commit_id, "event": event, "body": body})
     try:
         out = subprocess.run(
-            [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST, "--method", "POST",
-             f"repos/{repo}/pulls/{pr_number}/reviews", "--input", "-"],
-            input=payload, capture_output=True, text=True, timeout=20, shell=False, env=env,
+            [
+                gh_bin,
+                "api",
+                "--hostname",
+                _TRUSTED_GITHUB_HOST,
+                "--method",
+                "POST",
+                f"repos/{repo}/pulls/{pr_number}/reviews",
+                "--input",
+                "-",
+            ],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            shell=False,
+            env=env,
         )
         if out.returncode != 0:
             return None, _classify_gh_error("gh_api_post_review_failed", out.stderr or "")
@@ -1918,16 +2099,17 @@ def _post_pr_review(
         return None, f"gh_api_post_review_exception: {exc}"
 
 
-def _readback_pr_review(
-    review_id, pr_number: int, repo: str, gh_bin: str, env: dict[str, str] | None = None
-) -> dict:
+def _readback_pr_review(review_id, pr_number: int, repo: str, gh_bin: str, env: dict[str, str] | None = None) -> dict:
     """Fetch exactly one review by id (not a marker search) for postcondition
     verification (AC4: state == COMMENTED, commit_id == expected_head_sha)."""
     try:
         out = subprocess.run(
-            [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST,
-             f"repos/{repo}/pulls/{pr_number}/reviews/{review_id}"],
-            capture_output=True, text=True, timeout=15, shell=False, env=env,
+            [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST, f"repos/{repo}/pulls/{pr_number}/reviews/{review_id}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+            env=env,
         )
         if out.returncode != 0:
             return {"error": _classify_gh_error("gh_api_pr_review_readback_failed", out.stderr or "")}
@@ -1953,10 +2135,11 @@ def _validate_pr_review_postcondition(
     if review.get("state") != "COMMENTED":
         return False, f"postcondition_review_state_mismatch: {review.get('state')!r}", ""
     if review.get("commit_id") != expected_head_sha:
-        return False, (
-            f"postcondition_review_commit_id_mismatch: {review.get('commit_id')!r} "
-            f"!= {expected_head_sha!r}"
-        ), ""
+        return (
+            False,
+            (f"postcondition_review_commit_id_mismatch: {review.get('commit_id')!r} != {expected_head_sha!r}"),
+            "",
+        )
     if not review.get("submitted_at"):
         return False, "postcondition_review_submitted_at_missing", ""
     body = review.get("body") or ""
@@ -1980,17 +2163,19 @@ def _validate_pr_review_postcondition(
         stripped_body = pre_marker
     stripped_body_sha256 = hashlib.sha256(stripped_body.encode("utf-8")).hexdigest()
     if stripped_body_sha256 != body_sha256:
-        return False, (
-            f"postcondition_body_sha256_mismatch: readback={stripped_body_sha256} "
-            f"expected={body_sha256}"
-        ), ""
+        return (
+            False,
+            (f"postcondition_body_sha256_mismatch: readback={stripped_body_sha256} expected={body_sha256}"),
+            "",
+        )
     if authenticated_login is not None:
         actual_login = (review.get("user") or {}).get("login")
         if actual_login != authenticated_login:
-            return False, (
-                f"postcondition_review_author_identity_mismatch: {actual_login!r} "
-                f"!= {authenticated_login!r}"
-            ), ""
+            return (
+                False,
+                (f"postcondition_review_author_identity_mismatch: {actual_login!r} != {authenticated_login!r}"),
+                "",
+            )
     return True, "", stripped_body_sha256
 
 
@@ -2004,12 +2189,8 @@ def _validate_pr_review_postcondition(
 # against the CLI-declared --verdict/--merge-ready so the two can never
 # silently diverge (High 2: no self-reported hash/schema/producer_role).
 
-_LOOP_VERDICT_V2_BLOCK_RE = _re.compile(
-    r"```ya?ml\s*\n\s*LOOP_VERDICT_V2\s*:\s*\n(?P<block>.*?)```", _re.DOTALL
-)
-_LOOP_VERDICT_V2_VERDICT_FIELD_RE = _re.compile(
-    r"^\s*verdict\s*:\s*([A-Za-z_]+)\s*$", _re.MULTILINE
-)
+_LOOP_VERDICT_V2_BLOCK_RE = _re.compile(r"```ya?ml\s*\n\s*LOOP_VERDICT_V2\s*:\s*\n(?P<block>.*?)```", _re.DOTALL)
+_LOOP_VERDICT_V2_VERDICT_FIELD_RE = _re.compile(r"^\s*verdict\s*:\s*([A-Za-z_]+)\s*$", _re.MULTILINE)
 _LOOP_VERDICT_V2_MERGE_READY_FIELD_RE = _re.compile(
     r"^\s*merge_ready\s*:\s*(true|false)\s*$", _re.MULTILINE | _re.IGNORECASE
 )
@@ -2066,15 +2247,15 @@ def _render_pr_review_publish_request(args, project_root: Path) -> tuple[dict | 
 
     # High 2: merge_ready may only be declared true alongside verdict APPROVE.
     if args.merge_ready and args.verdict != "APPROVE":
-        return None, (
-            f"pr_review_render_merge_ready_requires_approve: verdict={args.verdict!r}"
-        )
+        return None, (f"pr_review_render_merge_ready_requires_approve: verdict={args.verdict!r}")
 
     # -- render-body-file path safety: same lexical/symlink/hardlink/subtree
     # containment checks as --input-file, scoped to the pr_review.publish
     # artifact subtree.
     canonical_body_file, path_err = _validate_and_resolve_input_file(
-        args.render_body_file, args.issue_number, project_root,
+        args.render_body_file,
+        args.issue_number,
+        project_root,
         command_id=COMMAND_ID_PR_REVIEW_PUBLISH,
     )
     if path_err:
@@ -2102,14 +2283,10 @@ def _render_pr_review_publish_request(args, project_root: Path) -> tuple[dict | 
     if extract_err:
         return None, extract_err
     if body_verdict != args.verdict:
-        return None, (
-            f"pr_review_render_body_verdict_mismatch: body={body_verdict!r} "
-            f"declared={args.verdict!r}"
-        )
+        return None, (f"pr_review_render_body_verdict_mismatch: body={body_verdict!r} declared={args.verdict!r}")
     if body_merge_ready != bool(args.merge_ready):
         return None, (
-            f"pr_review_render_body_merge_ready_mismatch: body={body_merge_ready!r} "
-            f"declared={bool(args.merge_ready)!r}"
+            f"pr_review_render_body_merge_ready_mismatch: body={body_merge_ready!r} declared={bool(args.merge_ready)!r}"
         )
 
     body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
@@ -2154,8 +2331,12 @@ def _run_pr_review_publish(
     write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
 
     if args.dry_run:
-        result = {"schema": RESULT_SCHEMA, "status": "dry_run_ok", "command_id": args.command_id,
-                   "issue_number": args.issue_number}
+        result = {
+            "schema": RESULT_SCHEMA,
+            "status": "dry_run_ok",
+            "command_id": args.command_id,
+            "issue_number": args.issue_number,
+        }
         if args.output_json:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
@@ -2164,25 +2345,29 @@ def _run_pr_review_publish(
 
     def _write_marker(review_id, review_url) -> None:
         marker_path.parent.mkdir(parents=True, exist_ok=True)
-        marker_path.write_text(json.dumps({
-            "schema": "PR_REVIEW_PUBLISH_MARKER_V1",
-            "pr_number": pr_number,
-            "repo": args.repo,
-            "idempotency_key": idempotency_key,
-            "expected_head_sha": expected_head_sha,
-            "review_id": review_id,
-            "review_url": review_url,
-            "published_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        }, ensure_ascii=False, indent=2))
+        marker_path.write_text(
+            json.dumps(
+                {
+                    "schema": "PR_REVIEW_PUBLISH_MARKER_V1",
+                    "pr_number": pr_number,
+                    "repo": args.repo,
+                    "idempotency_key": idempotency_key,
+                    "expected_head_sha": expected_head_sha,
+                    "review_id": review_id,
+                    "review_url": review_url,
+                    "published_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
 
     # -- AC7: pre-mutation idempotency precheck. Remote review list is the
     # authority; a local marker file never substitutes for it. Runs BEFORE
     # any POST so a failed/ambiguous transaction never leaves a remote
     # side effect. _find_pr_review_marker_matches() itself now only returns
     # reviews where the marker is at the expected trailing position (Blocker 3).
-    matches, list_err = _find_pr_review_marker_matches(
-        marker_str, pr_number, args.repo, gh_bin, env=gh_env
-    )
+    matches, list_err = _find_pr_review_marker_matches(marker_str, pr_number, args.repo, gh_bin, env=gh_env)
     if list_err:
         return _fail(f"pr_review_marker_precheck_failed: {list_err}", status="failed")
 
@@ -2240,8 +2425,7 @@ def _run_pr_review_publish(
             # verdict that is no longer current (High 1 TOCTOU symmetry).
             _write_marker(review.get("id"), review.get("html_url", ""))
             return _fail(
-                f"published_but_stale: current_head={current_head_sha} "
-                f"expected_head={expected_head_sha}",
+                f"published_but_stale: current_head={current_head_sha} expected_head={expected_head_sha}",
                 [f"posted_review_id: {review.get('id')}"],
                 status="published_but_stale",
             )
@@ -2255,14 +2439,16 @@ def _run_pr_review_publish(
             )
 
         _write_marker(review.get("id"), review.get("html_url", ""))
-        return _ok({
-            "status_detail": "already_published",
-            "review_id": review.get("id"),
-            "review_url": review.get("html_url", ""),
-            "commit_id": review.get("commit_id"),
-            "body_sha256": stripped_body_sha256,
-            "idempotency_marker_written": True,
-        })
+        return _ok(
+            {
+                "status_detail": "already_published",
+                "review_id": review.get("id"),
+                "review_url": review.get("html_url", ""),
+                "commit_id": review.get("commit_id"),
+                "body_sha256": stripped_body_sha256,
+                "idempotency_marker_written": True,
+            }
+        )
 
     # -- AC3: stale-head precondition. GitHub review must never be created
     # against a PR head that has moved since the reviewer inspected it.
@@ -2271,8 +2457,7 @@ def _run_pr_review_publish(
         return _fail(head_err, status="failed")
     if current_head_sha != expected_head_sha:
         return _fail(
-            f"stale_review_request: current_head={current_head_sha} "
-            f"expected_head={expected_head_sha}",
+            f"stale_review_request: current_head={current_head_sha} expected_head={expected_head_sha}",
             status="failed",
         )
 
@@ -2324,9 +2509,7 @@ def _run_pr_review_publish(
     # and postcondition-verified; if it has moved, the review evidence is kept
     # (a GitHub review cannot be un-posted) but success is NOT reported --
     # callers must route to a fresh review against the new head.
-    post_publish_head_sha, post_head_err = _fetch_pr_head_sha(
-        pr_number, args.repo, gh_bin, env=gh_env
-    )
+    post_publish_head_sha, post_head_err = _fetch_pr_head_sha(pr_number, args.repo, gh_bin, env=gh_env)
     if post_head_err:
         _write_marker(review.get("id"), review.get("html_url", ""))
         return _fail(
@@ -2337,22 +2520,264 @@ def _run_pr_review_publish(
     if post_publish_head_sha != expected_head_sha:
         _write_marker(review.get("id"), review.get("html_url", ""))
         return _fail(
-            f"published_but_stale: current_head={post_publish_head_sha} "
-            f"expected_head={expected_head_sha}",
+            f"published_but_stale: current_head={post_publish_head_sha} expected_head={expected_head_sha}",
             [f"posted_review_id: {review_id}"],
             status="published_but_stale",
         )
 
     _write_marker(review.get("id"), review.get("html_url", ""))
 
-    return _ok({
-        "review_id": review.get("id"),
-        "review_url": review.get("html_url", ""),
-        "commit_id": review.get("commit_id"),
-        "state": review.get("state"),
-        "body_sha256": readback_body_sha256,
-        "idempotency_marker_written": True,
-    })
+    return _ok(
+        {
+            "review_id": review.get("id"),
+            "review_url": review.get("html_url", ""),
+            "commit_id": review.get("commit_id"),
+            "state": review.get("state"),
+            "body_sha256": readback_body_sha256,
+            "idempotency_marker_written": True,
+        }
+    )
+
+
+# -- Issue #1647: dedicated receipt-bound TEST_VERDICT publisher ------------
+
+
+def _fetch_linked_issue_body_sha256(
+    issue_number: int, repo: str, gh_bin: str, env: dict[str, str]
+) -> tuple[str | None, str]:
+    try:
+        out = subprocess.run(
+            [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST, f"repos/{repo}/issues/{issue_number}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+            env=env,
+        )
+        if out.returncode != 0:
+            return None, _classify_gh_error("gh_api_linked_issue_fetch_failed", out.stderr or "")
+        body = json.loads(out.stdout).get("body")
+        if not isinstance(body, str):
+            return None, "gh_api_linked_issue_body_invalid"
+        return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest(), ""
+    except Exception as exc:
+        return None, f"gh_api_linked_issue_fetch_exception: {exc}"
+
+
+def _find_test_verdict_marker_matches(
+    marker: str, pr_number: int, repo: str, gh_bin: str, env: dict[str, str]
+) -> tuple[list[dict], str]:
+    try:
+        out = subprocess.run(
+            [
+                gh_bin,
+                "api",
+                "--hostname",
+                _TRUSTED_GITHUB_HOST,
+                f"repos/{repo}/issues/{pr_number}/comments",
+                "--paginate",
+                "--jq",
+                ".",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+            env=env,
+        )
+        if out.returncode != 0:
+            return [], _classify_gh_error("gh_api_test_verdict_comment_list_failed", out.stderr or "")
+        comments: list[dict] = []
+        for line in out.stdout.splitlines():
+            if not line.strip():
+                continue
+            parsed = json.loads(line)
+            comments.extend(parsed if isinstance(parsed, list) else [parsed])
+        return [c for c in comments if _marker_at_expected_position(c.get("body") or "", marker)], ""
+    except Exception as exc:
+        return [], f"test_verdict_marker_list_exception: {exc}"
+
+
+def _post_test_verdict_comment(
+    pr_number: int, repo: str, body: str, gh_bin: str, env: dict[str, str]
+) -> tuple[dict | None, str]:
+    try:
+        out = subprocess.run(
+            [
+                gh_bin,
+                "api",
+                "--hostname",
+                _TRUSTED_GITHUB_HOST,
+                "--method",
+                "POST",
+                f"repos/{repo}/issues/{pr_number}/comments",
+                "--input",
+                "-",
+            ],
+            input=json.dumps({"body": body}),
+            capture_output=True,
+            text=True,
+            timeout=20,
+            shell=False,
+            env=env,
+        )
+        if out.returncode != 0:
+            return None, _classify_gh_error("gh_api_test_verdict_comment_post_failed", out.stderr or "")
+        return json.loads(out.stdout), ""
+    except Exception as exc:
+        return None, f"test_verdict_comment_post_exception: {exc}"
+
+
+def _readback_test_verdict_comment(
+    comment_id: object, repo: str, gh_bin: str, env: dict[str, str]
+) -> tuple[dict | None, str]:
+    try:
+        out = subprocess.run(
+            [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST, f"repos/{repo}/issues/comments/{comment_id}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+            env=env,
+        )
+        if out.returncode != 0:
+            return None, _classify_gh_error("gh_api_test_verdict_comment_readback_failed", out.stderr or "")
+        return json.loads(out.stdout), ""
+    except Exception as exc:
+        return None, f"test_verdict_comment_readback_exception: {exc}"
+
+
+def _validate_test_verdict_comment(comment: dict, marker: str, body_sha256: str, authenticated_login: str) -> str:
+    if not _marker_at_expected_position(comment.get("body") or "", marker):
+        return "test_verdict_postcondition_marker_mismatch"
+    body = comment["body"]
+    marker_idx = body.rfind(marker)
+    raw_body = body[:marker_idx]
+    if raw_body.endswith("\n\n"):
+        raw_body = raw_body[:-2]
+    if hashlib.sha256(raw_body.encode("utf-8")).hexdigest() != body_sha256:
+        return "test_verdict_postcondition_body_mismatch"
+    if (comment.get("user") or {}).get("login") != authenticated_login:
+        return "test_verdict_postcondition_author_mismatch"
+    if not comment.get("id") or not comment.get("html_url"):
+        return "test_verdict_postcondition_comment_identity_missing"
+    return ""
+
+
+def _run_test_verdict_publish(args, input_data, gh_bin, _fail, _ok) -> int:
+    field_err = _validate_test_verdict_publish_fields(input_data, args.repo, args.issue_number)
+    if field_err:
+        return _fail(field_err)
+    if args.dry_run:
+        return _ok({"status_detail": "dry_run_ok"})
+
+    pr_number = input_data["target_pr_number"]
+    expected_head_sha = input_data["expected_head_sha"]
+    linked_issue_number = input_data["linked_issue_number"]
+    marker = _test_verdict_marker_str(input_data["idempotency_key"])
+    rendered_body = f"{input_data['body']}\n\n{marker}\n"
+    write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
+    marker_path = _issue_metadata_marker_path(
+        PROJECT_ROOT, args.issue_number, args.command_id, "test_verdict_publish.marker.json"
+    )
+    gh_env = _build_pr_review_gh_env()
+
+    def _write_marker(comment: dict) -> None:
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(
+            json.dumps(
+                {
+                    "schema": "TEST_VERDICT_PUBLISH_MARKER_V1",
+                    "repo": args.repo,
+                    "target_pr_number": pr_number,
+                    "linked_issue_number": linked_issue_number,
+                    "expected_head_sha": expected_head_sha,
+                    "receipt_sha256": input_data["receipt_sha256"],
+                    "idempotency_key": input_data["idempotency_key"],
+                    "comment_id": comment["id"],
+                    "comment_url": comment["html_url"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    matches, match_err = _find_test_verdict_marker_matches(marker, pr_number, args.repo, gh_bin, gh_env)
+    if match_err:
+        return _fail(f"test_verdict_marker_precheck_failed: {match_err}", status="failed")
+    if len(matches) > 1:
+        return _fail("test_verdict_duplicate_marker_conflict_pre_mutation", status="failed")
+
+    current_head, head_err = _fetch_pr_head_sha(pr_number, args.repo, gh_bin, env=gh_env)
+    if head_err:
+        return _fail(head_err, status="failed")
+    linked_body_sha, issue_err = _fetch_linked_issue_body_sha256(linked_issue_number, args.repo, gh_bin, gh_env)
+    if issue_err:
+        return _fail(issue_err, status="failed")
+    if current_head != expected_head_sha:
+        return _fail("test_verdict_pre_publish_head_mismatch", status="failed")
+    if linked_body_sha != input_data["linked_issue_body_sha256"]:
+        return _fail("test_verdict_pre_publish_linked_issue_body_mismatch", status="failed")
+    authenticated_login, login_err = _fetch_authenticated_login(gh_bin, env=gh_env)
+    if login_err:
+        return _fail(login_err, status="failed")
+
+    if len(matches) == 1:
+        comment, readback_err = _readback_test_verdict_comment(matches[0].get("id"), args.repo, gh_bin, gh_env)
+        if readback_err:
+            return _fail(readback_err, status="failed")
+        post_err = _validate_test_verdict_comment(comment, marker, input_data["body_sha256"], authenticated_login)
+        if post_err:
+            return _fail(post_err, status="failed")
+        _write_marker(comment)
+        return _ok(
+            {
+                "status_detail": "already_published",
+                "comment_id": comment["id"],
+                "comment_url": comment["html_url"],
+                "idempotency_marker_written": True,
+            }
+        )
+
+    posted, post_err = _post_test_verdict_comment(pr_number, args.repo, rendered_body, gh_bin, gh_env)
+    if post_err:
+        return _fail(post_err, status="failed")
+    if not isinstance(posted, dict) or not posted.get("id"):
+        return _fail("test_verdict_post_response_missing_id", status="failed")
+    comment, readback_err = _readback_test_verdict_comment(posted["id"], args.repo, gh_bin, gh_env)
+    if readback_err:
+        return _fail(readback_err, [f"posted_comment_id: {posted['id']}"], status="failed")
+    postcondition_err = _validate_test_verdict_comment(comment, marker, input_data["body_sha256"], authenticated_login)
+    if postcondition_err:
+        return _fail(postcondition_err, [f"posted_comment_id: {posted['id']}"], status="failed")
+    post_head, post_head_err = _fetch_pr_head_sha(pr_number, args.repo, gh_bin, env=gh_env)
+    post_body_sha, post_issue_err = _fetch_linked_issue_body_sha256(linked_issue_number, args.repo, gh_bin, gh_env)
+    if (
+        post_head_err
+        or post_issue_err
+        or post_head != expected_head_sha
+        or post_body_sha != input_data["linked_issue_body_sha256"]
+    ):
+        _write_marker(comment)
+        return _fail(
+            "test_verdict_published_but_precondition_drifted",
+            [f"posted_comment_id: {posted['id']}"],
+            status="published_but_stale",
+        )
+    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+    if changed:
+        return _fail("postcondition_tracked_changes_detected", [f"changed: {f}" for f in changed[:20]], status="failed")
+    _write_marker(comment)
+    return _ok(
+        {
+            "comment_id": comment["id"],
+            "comment_url": comment["html_url"],
+            "expected_head_sha": expected_head_sha,
+            "receipt_sha256": input_data["receipt_sha256"],
+            "idempotency_marker_written": True,
+        }
+    )
 
 
 _ISSUECOMMENT_ID_RE = _re.compile(r"#issuecomment-(\d+)$")
@@ -2386,7 +2811,10 @@ def _fetch_single_comment_by_id(comment_id: str, repo: str, gh_bin: str) -> dict
                 "--jq",
                 _CANONICAL_SINGLE_COMMENT_PROJECTION,
             ],
-            capture_output=True, text=True, timeout=15, shell=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
             env=_build_metadata_sanitized_env(),
         )
         if out.returncode != 0:
@@ -2454,9 +2882,7 @@ def _readback_contract_snapshot(
             snapshot = authoritative_go(results)
         else:
             try:
-                snapshot = parser_mod.find_latest_go(
-                    results, trusted_only=True, fingerprint_ready_only=True
-                )
+                snapshot = parser_mod.find_latest_go(results, trusted_only=True, fingerprint_ready_only=True)
             except TypeError:  # legacy test-double only; production parser has the predicate
                 snapshot = parser_mod.find_latest_go(results, trusted_only=True)
         if snapshot is None or not ensure_mod.is_go_current(snapshot, expected_body_sha256):
@@ -2471,27 +2897,19 @@ def _readback_contract_snapshot(
         # hash, the outer (comment-bound) hash, and the nested product-spec
         # hash carried inside the just-verified snapshot -- all three must
         # agree, not just the outer one.
-        live_body, _live_updated_at, live_body_err = _fetch_issue_body_and_updated_at(
-            issue_number, repo, gh_bin
-        )
+        live_body, _live_updated_at, live_body_err = _fetch_issue_body_and_updated_at(issue_number, repo, gh_bin)
         if live_body_err:
             return {
                 "error": f"failed_after_mutation:live_body_refetch_error:{live_body_err}",
                 "comment_id": comment.get("id", ""),
                 "comment_url": comment.get("html_url", ""),
             }
-        live_body_sha256 = "sha256:" + hashlib.sha256(
-            (live_body or "").encode("utf-8")
-        ).hexdigest()
+        live_body_sha256 = "sha256:" + hashlib.sha256((live_body or "").encode("utf-8")).hexdigest()
         inner = snapshot.get("inner") if isinstance(snapshot, dict) else None
         checks = inner.get("checks") if isinstance(inner, dict) else None
-        product_spec_check = (
-            checks.get("product_spec_check") if isinstance(checks, dict) else None
-        )
+        product_spec_check = checks.get("product_spec_check") if isinstance(checks, dict) else None
         nested_product_spec_sha256 = (
-            product_spec_check.get("body_sha256")
-            if isinstance(product_spec_check, dict)
-            else None
+            product_spec_check.get("body_sha256") if isinstance(product_spec_check, dict) else None
         )
         hashes_to_check = {
             "expected_body_sha256": expected_body_sha256,
@@ -2501,8 +2919,7 @@ def _readback_contract_snapshot(
         if len(set(hashes_to_check.values())) != 1:
             return {
                 "error": (
-                    "failed_after_mutation:live_body_hash_mismatch:"
-                    f"{json.dumps(hashes_to_check, sort_keys=True)}"
+                    f"failed_after_mutation:live_body_hash_mismatch:{json.dumps(hashes_to_check, sort_keys=True)}"
                 ),
                 "comment_id": comment.get("id", ""),
                 "comment_url": comment.get("html_url", ""),
@@ -2533,8 +2950,12 @@ def _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok) -> int:
         return _fail("module_shadowing_detected", realpath_errors)
 
     if args.dry_run:
-        result = {"schema": RESULT_SCHEMA, "status": "dry_run_ok", "command_id": args.command_id,
-                   "issue_number": args.issue_number}
+        result = {
+            "schema": RESULT_SCHEMA,
+            "status": "dry_run_ok",
+            "command_id": args.command_id,
+            "issue_number": args.issue_number,
+        }
         if args.output_json:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
@@ -2557,26 +2978,33 @@ def _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok) -> int:
     if not publisher.exists():
         return _fail(f"publisher_missing: {publisher}", status="failed")
 
-    artifact_dir = _issue_metadata_marker_path(
-        PROJECT_ROOT, args.issue_number, args.command_id, ""
-    ).parent
+    artifact_dir = _issue_metadata_marker_path(PROJECT_ROOT, args.issue_number, args.command_id, "").parent
     write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
     cmd = [
         sys.executable,
         str(publisher),
-        "--issue-number", str(args.issue_number),
-        "--repo", args.repo,
-        "--mode", "auto",
+        "--issue-number",
+        str(args.issue_number),
+        "--repo",
+        args.repo,
+        "--mode",
+        "auto",
         "--post",
-        "--artifact-dir", str(artifact_dir),
+        "--artifact-dir",
+        str(artifact_dir),
     ]
     # -- Blocker 5: sanitized env (PYTHONPATH / PYTHONHOME / editor / browser /
     # prompt overrides removed), same boundary as _build_sanitized_env().
     sanitized_env = _build_metadata_sanitized_env()
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=180, cwd=str(PROJECT_ROOT),
-            shell=False, env=sanitized_env,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            cwd=str(PROJECT_ROOT),
+            shell=False,
+            env=sanitized_env,
         )
     except subprocess.TimeoutExpired:
         return _fail("publisher_timeout_180s", status="failed")
@@ -2629,12 +3057,14 @@ def _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok) -> int:
             status="failed",
         )
 
-    return _ok({
-        "contract_snapshot_url": readback["comment_url"],
-        "post_status": pub_result.get("post_status"),
-        "remote_postcondition_verified": True,
-        "idempotency_marker_written": False,
-    })
+    return _ok(
+        {
+            "contract_snapshot_url": readback["comment_url"],
+            "post_status": pub_result.get("post_status"),
+            "remote_postcondition_verified": True,
+            "idempotency_marker_written": False,
+        }
+    )
 
 
 # -- Issue #1632: controlled removal of a stale closed-blocker GitHub native
@@ -2704,9 +3134,7 @@ def _build_issue_dependency_remove_gh_env() -> dict[str, str]:
     return env
 
 
-def _graphql_call(
-    gh_bin: str, env: dict[str, str], query: str, variables: dict
-) -> tuple[dict | None, str]:
+def _graphql_call(gh_bin: str, env: dict[str, str], query: str, variables: dict) -> tuple[dict | None, str]:
     """Execute a single fixed-host GraphQL call via `gh api graphql --input -`.
 
     Never uses shell-interpolated -f/-F flags for the query text (mirrors
@@ -2719,7 +3147,12 @@ def _graphql_call(
     try:
         out = subprocess.run(
             [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST, "graphql", "--input", "-"],
-            input=payload, capture_output=True, text=True, timeout=20, shell=False, env=env,
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            shell=False,
+            env=env,
         )
         if out.returncode != 0:
             return None, _classify_gh_error("gh_api_graphql_failed", out.stderr or "")
@@ -2750,14 +3183,23 @@ def _fetch_issue_dependency_remove_actor(
         return None, None, err
     try:
         out = subprocess.run(
-            [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST,
-             f"repos/{repo}/collaborators/{login}/permission", "--jq", ".permission"],
-            capture_output=True, text=True, timeout=15, shell=False, env=env,
+            [
+                gh_bin,
+                "api",
+                "--hostname",
+                _TRUSTED_GITHUB_HOST,
+                f"repos/{repo}/collaborators/{login}/permission",
+                "--jq",
+                ".permission",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+            env=env,
         )
         if out.returncode != 0:
-            return login, None, _classify_gh_error(
-                "gh_api_permission_fetch_failed", out.stderr or ""
-            )
+            return login, None, _classify_gh_error("gh_api_permission_fetch_failed", out.stderr or "")
         permission = out.stdout.strip()
         if not permission:
             return login, None, "gh_api_permission_empty"
@@ -2793,7 +3235,9 @@ def _fetch_blocked_by_all_pages(
 
     while True:
         data, err = _graphql_call(
-            gh_bin, env, _ISSUE_DEPENDENCY_REMOVE_BLOCKED_BY_QUERY,
+            gh_bin,
+            env,
+            _ISSUE_DEPENDENCY_REMOVE_BLOCKED_BY_QUERY,
             {"owner": owner, "name": name, "number": issue_number, "cursor": cursor},
         )
         if err:
@@ -2874,16 +3318,11 @@ def _fetch_blocked_by_all_pages(
     }, ""
 
 
-def _compute_blocked_by_snapshot_sha256(
-    blocked_issue_id: str, blocked_issue_number: int, nodes: list[dict]
-) -> str:
+def _compute_blocked_by_snapshot_sha256(blocked_issue_id: str, blocked_issue_number: int, nodes: list[dict]) -> str:
     """Deterministic hash binding blocked-issue identity + the full sorted
     (number, id, state) set of its blockedBy relationships."""
     canonical_nodes = sorted(
-        (
-            {"id": n["id"], "number": n["number"], "state": n["state"]}
-            for n in nodes
-        ),
+        ({"id": n["id"], "number": n["number"], "state": n["state"]} for n in nodes),
         key=lambda n: n["number"],
     )
     payload = {
@@ -3021,8 +3460,12 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
     write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
 
     if args.dry_run:
-        result = {"schema": RESULT_SCHEMA, "status": "dry_run_ok", "command_id": args.command_id,
-                   "issue_number": args.issue_number}
+        result = {
+            "schema": RESULT_SCHEMA,
+            "status": "dry_run_ok",
+            "command_id": args.command_id,
+            "issue_number": args.issue_number,
+        }
         if args.output_json:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
@@ -3058,22 +3501,28 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
         # triggered this write.
         try:
             marker_path.parent.mkdir(parents=True, exist_ok=True)
-            marker_path.write_text(json.dumps({
-                "schema": _ISSUE_DEPENDENCY_REMOVE_MARKER_SCHEMA,
-                "issue_number": args.issue_number,
-                "repo": args.repo,
-                "target_blocker_number": target_blocker_number,
-                "blocked_issue_id": blocked_issue_id or expected_blocked_issue_node_id,
-                "blocked_issue_number": blocked_issue_number or args.issue_number,
-                "blocker_node_id": blocker_node_id or expected_blocker_node_id,
-                "idempotency_key": idempotency_key,
-                "actor_login": login,
-                "actor_permission": permission,
-                "pre_mutation_snapshot_sha256": pre_hash,
-                "post_mutation_snapshot_sha256": post_hash,
-                "status_detail": status_detail,
-                "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            }, ensure_ascii=False, indent=2))
+            marker_path.write_text(
+                json.dumps(
+                    {
+                        "schema": _ISSUE_DEPENDENCY_REMOVE_MARKER_SCHEMA,
+                        "issue_number": args.issue_number,
+                        "repo": args.repo,
+                        "target_blocker_number": target_blocker_number,
+                        "blocked_issue_id": blocked_issue_id or expected_blocked_issue_node_id,
+                        "blocked_issue_number": blocked_issue_number or args.issue_number,
+                        "blocker_node_id": blocker_node_id or expected_blocker_node_id,
+                        "idempotency_key": idempotency_key,
+                        "actor_login": login,
+                        "actor_permission": permission,
+                        "pre_mutation_snapshot_sha256": pre_hash,
+                        "post_mutation_snapshot_sha256": post_hash,
+                        "status_detail": status_detail,
+                        "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
         except Exception as exc:
             marker_write_errors.append(f"marker_write_failed:{status_detail}:{exc}")
 
@@ -3140,9 +3589,7 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
 
     target_nodes = [n for n in pre_state["nodes"] if n["number"] == target_blocker_number]
     if len(target_nodes) != 1:
-        return _fail(
-            "precondition_target_blocker_not_found_exactly_once", status="precondition_rejected"
-        )
+        return _fail("precondition_target_blocker_not_found_exactly_once", status="precondition_rejected")
     target_node = target_nodes[0]
     if target_node["id"] != expected_blocker_node_id:
         return _fail("precondition_target_blocker_node_id_mismatch", status="precondition_rejected")
@@ -3175,7 +3622,8 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
     # interpreter crash) still leaves an audit trail proving the mutation
     # was attempted.
     _write_marker(
-        "mutation_attempted", computed_pre_hash,
+        "mutation_attempted",
+        computed_pre_hash,
         blocked_issue_id=pre_state["blocked_issue_id"],
         blocked_issue_number=pre_state["blocked_issue_number"],
         blocker_node_id=expected_blocker_node_id,
@@ -3184,7 +3632,9 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
     # -- AC4: single mutation attempt. No automatic retry on transport/GraphQL
     # error -- a failed call is recorded and reported, never retried here.
     _mutation_data, mutation_err = _graphql_call(
-        gh_bin, gh_env, _ISSUE_DEPENDENCY_REMOVE_MUTATION,
+        gh_bin,
+        gh_env,
+        _ISSUE_DEPENDENCY_REMOVE_MUTATION,
         {
             "issueId": expected_blocked_issue_node_id,
             "blockingIssueId": expected_blocker_node_id,
@@ -3193,7 +3643,8 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
     )
     if mutation_err:
         _write_marker(
-            "transport_or_schema_error", computed_pre_hash,
+            "transport_or_schema_error",
+            computed_pre_hash,
             blocked_issue_id=pre_state["blocked_issue_id"],
             blocked_issue_number=pre_state["blocked_issue_number"],
             blocker_node_id=expected_blocker_node_id,
@@ -3213,11 +3664,10 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
         expected_client_mutation_id=idempotency_key,
     )
     if response_err:
-        response_status = (
-            "transport_or_schema_error" if response_is_schema_error else "postcondition_rejected"
-        )
+        response_status = "transport_or_schema_error" if response_is_schema_error else "postcondition_rejected"
         _write_marker(
-            response_status, computed_pre_hash,
+            response_status,
+            computed_pre_hash,
             blocked_issue_id=pre_state["blocked_issue_id"],
             blocked_issue_number=pre_state["blocked_issue_number"],
             blocker_node_id=expected_blocker_node_id,
@@ -3228,7 +3678,8 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
     post_state, post_err = _fetch_blocked_by_all_pages(args.issue_number, args.repo, gh_bin, gh_env)
     if post_err:
         _write_marker(
-            "transport_or_schema_error", computed_pre_hash,
+            "transport_or_schema_error",
+            computed_pre_hash,
             blocked_issue_id=pre_state["blocked_issue_id"],
             blocked_issue_number=pre_state["blocked_issue_number"],
             blocker_node_id=expected_blocker_node_id,
@@ -3237,7 +3688,8 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
 
     if post_state["blocked_issue_id"] != expected_blocked_issue_node_id:
         _write_marker(
-            "postcondition_rejected", computed_pre_hash,
+            "postcondition_rejected",
+            computed_pre_hash,
             blocked_issue_id=pre_state["blocked_issue_id"],
             blocked_issue_number=pre_state["blocked_issue_number"],
             blocker_node_id=expected_blocker_node_id,
@@ -3248,24 +3700,23 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
     expected_post_numbers = sorted(n for n in expected_numbers if n != target_blocker_number)
     if target_blocker_number in post_numbers:
         _write_marker(
-            "postcondition_rejected", computed_pre_hash,
+            "postcondition_rejected",
+            computed_pre_hash,
             blocked_issue_id=pre_state["blocked_issue_id"],
             blocked_issue_number=pre_state["blocked_issue_number"],
             blocker_node_id=expected_blocker_node_id,
         )
-        return _fail(
-            "postcondition_target_relationship_still_present", status="postcondition_rejected"
-        )
+        return _fail("postcondition_target_relationship_still_present", status="postcondition_rejected")
     if post_numbers != expected_post_numbers:
         _write_marker(
-            "postcondition_rejected", computed_pre_hash,
+            "postcondition_rejected",
+            computed_pre_hash,
             blocked_issue_id=pre_state["blocked_issue_id"],
             blocked_issue_number=pre_state["blocked_issue_number"],
             blocker_node_id=expected_blocker_node_id,
         )
         return _fail(
-            f"postcondition_non_target_set_changed: current={post_numbers} "
-            f"expected={expected_post_numbers}",
+            f"postcondition_non_target_set_changed: current={post_numbers} expected={expected_post_numbers}",
             status="postcondition_rejected",
         )
 
@@ -3273,14 +3724,13 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
     for n in post_state["nodes"]:
         if pre_by_number.get(n["number"]) != n["id"]:
             _write_marker(
-                "postcondition_rejected", computed_pre_hash,
+                "postcondition_rejected",
+                computed_pre_hash,
                 blocked_issue_id=pre_state["blocked_issue_id"],
                 blocked_issue_number=pre_state["blocked_issue_number"],
                 blocker_node_id=expected_blocker_node_id,
             )
-            return _fail(
-                "postcondition_non_target_node_id_drift", status="postcondition_rejected"
-            )
+            return _fail("postcondition_non_target_node_id_drift", status="postcondition_rejected")
 
     computed_post_hash = _compute_blocked_by_snapshot_sha256(
         post_state["blocked_issue_id"], post_state["blocked_issue_number"], post_state["nodes"]
@@ -3293,7 +3743,9 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
     changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
     if changed:
         _write_marker(
-            "postcondition_rejected", computed_pre_hash, computed_post_hash,
+            "postcondition_rejected",
+            computed_pre_hash,
+            computed_post_hash,
             blocked_issue_id=pre_state["blocked_issue_id"],
             blocked_issue_number=pre_state["blocked_issue_number"],
             blocker_node_id=expected_blocker_node_id,
@@ -3305,7 +3757,9 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
         )
 
     _write_marker(
-        "removed", computed_pre_hash, computed_post_hash,
+        "removed",
+        computed_pre_hash,
+        computed_post_hash,
         blocked_issue_id=pre_state["blocked_issue_id"],
         blocked_issue_number=pre_state["blocked_issue_number"],
         blocker_node_id=expected_blocker_node_id,
