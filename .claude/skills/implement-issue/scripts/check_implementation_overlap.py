@@ -1746,6 +1746,7 @@ def _verified_native_successor_predicate(
     policy_class: str,
     dependency_relation: str,
     readback_complete: bool,
+    source_complete: bool,
     dependency_provenance: Sequence[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """Build the #1797 candidate-local evidence-only eligibility predicate.
@@ -1781,6 +1782,7 @@ def _verified_native_successor_predicate(
             policy_class == "C2a",
             dependency_relation == "successor",
             readback_complete,
+            source_complete,
             provenance_nonempty,
             native_sources_only,
             repository_match,
@@ -1799,6 +1801,7 @@ def _verified_native_successor_predicate(
         "provenance_sources": sources,
         "readback_complete": readback_complete,
         "repository_match": repository_match,
+        "source_complete": source_complete,
     }
 
 
@@ -2220,6 +2223,7 @@ def _classify(
             policy_class=policy_class,
             dependency_relation=dependency_relation,
             readback_complete=bool(rb["readback_complete"]),
+            source_complete=source_complete,
             dependency_provenance=dependency_provenance,
         )
         if verified_native_successor["accepted"]:

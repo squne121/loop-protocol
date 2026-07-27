@@ -1259,6 +1259,7 @@ def test_given_verified_current_native_successor_structural_collision_then_evide
         "provenance_sources": ["current_native_blocking"],
         "readback_complete": True,
         "repository_match": True,
+        "source_complete": True,
     }
 
 
@@ -1314,6 +1315,157 @@ def test_given_native_and_contract_successor_provenance_then_fail_closed(tmp_pat
         "candidate_contract_blocked_by",
         "current_native_blocking",
     ]
+
+
+ISSUE_1745_EXACT_FIXTURE = {
+    "issue_number": 1745,
+    "current_body_sha256": "sha256:7810ee472b70c9e20ba65644cfd62c9304e3b213854a505702e03613cb357147",
+    "before_route": "human_review_required",
+    "after_route": "proceed_with_collision_evidence",
+    "nodeid": "test_issue_1745_exact_fixture_before_human_review_after_evidence_route",
+    "accepted_c1_count": 13,
+    "c2a_successors": (63, 159, 224, 225, 360, 964, 1429, 1573, 1736, 1754, 1775),
+}
+
+
+def _issue_1745_exact_fixture_inputs(tmp_path: Path) -> tuple[dict, list[dict]]:
+    """Create the fixed #1745 preflight shape without making tests depend on
+    mutable GitHub state.  The pinned live body fingerprint above identifies
+    the contract snapshot; the local records exercise its C1/C2a route mix.
+    """
+    current = _current_with_shared_target(tmp_path)
+    current["number"] = ISSUE_1745_EXACT_FIXTURE["issue_number"]
+    current["url"] = f"https://github.com/{DEFAULT_REPO}/issues/{current['number']}"
+
+    c1_numbers = tuple(range(7401, 7401 + ISSUE_1745_EXACT_FIXTURE["accepted_c1_count"]))
+    c1_candidates = [_collision_candidate(number) for number in c1_numbers]
+    successors = [_collision_candidate(number) for number in ISSUE_1745_EXACT_FIXTURE["c2a_successors"]]
+    current["blocking"] = [
+        {"repository": DEFAULT_REPO, "number": candidate["number"], "state": "OPEN"}
+        for candidate in successors
+    ]
+    current["comments"] = [
+        _human_c1_comment(current=current, candidate=candidate, comment_id=9100000000 + index)
+        for index, candidate in enumerate(c1_candidates, start=1)
+    ]
+    return current, [*c1_candidates, *successors]
+
+
+def test_issue_1745_exact_fixture_before_human_review_after_evidence_route(tmp_path: Path) -> None:
+    """#1797 AC2 fixed reproducer.
+
+    The historical pre-fix aggregation classified the pinned #1745 contract
+    as ``human_review_required``.  The candidate-local predicate must now
+    keep exactly the declared native successors as C2a evidence while the
+    thirteen OWNER-approved C1 candidates remain independently bound.
+    """
+    fixture = ISSUE_1745_EXACT_FIXTURE
+    assert fixture["current_body_sha256"] == (
+        "sha256:7810ee472b70c9e20ba65644cfd62c9304e3b213854a505702e03613cb357147"
+    )
+    assert fixture["before_route"] == "human_review_required"
+    assert fixture["nodeid"] == "test_issue_1745_exact_fixture_before_human_review_after_evidence_route"
+
+    current, candidates = _issue_1745_exact_fixture_inputs(tmp_path)
+    exit_code, payload = _run_cli(current["number"], *_write_overlap_inputs(tmp_path, current, candidates))
+
+    assert exit_code == EXIT_OK
+    assert payload["route"] == fixture["after_route"], payload
+    assert len(payload["human_c1_decisions"]["accepted"]) == fixture["accepted_c1_count"]
+    accepted_successors = {
+        candidate["issue_number"]
+        for candidate in payload["candidates"]
+        if candidate["verified_native_successor_predicate"]["accepted"]
+    }
+    assert accepted_successors == set(fixture["c2a_successors"])
+
+
+@pytest.mark.parametrize(
+    (
+        "policy_class,dependency_relation,readback_complete,source_complete,provenance,"
+        "current_url,candidate_url,expected"
+    ),
+    [
+        pytest.param("C2a", "successor", True, True, ["current_native_blocking"], None, None, True,
+                     id="current_native_blocking_success"),
+        pytest.param("C2a", "successor", True, True, ["candidate_native_blocked_by"], None, None, True,
+                     id="candidate_native_blocked_by_success"),
+        pytest.param("C2a", "successor", True, True, [], None, None, False, id="empty_provenance"),
+        pytest.param("C2a", "successor", True, True, ["unknown_native_source"], None, None, False,
+                     id="unknown_provenance"),
+        pytest.param("C2a", "successor", True, True,
+                     ["current_native_blocking", "candidate_contract_blocked_by"], None, None, False,
+                     id="mixed_provenance_unsafe"),
+        pytest.param("C2a", "successor", True, True, ["current_native_blocking"], None,
+                     "https://github.com/other/repository/issues/8201", False, id="candidate_identity_mismatch"),
+        pytest.param("C2a", "successor", True, True, ["current_native_blocking"],
+                     "https://github.com/other/repository/issues/8200", None, False, id="current_identity_mismatch"),
+        pytest.param("C2a", "successor", True, True, ["current_native_blocking"], None, None, False,
+                     id="repository_identity_mismatch"),
+        pytest.param("C2a", "successor", False, True, ["current_native_blocking"], None, None, False,
+                     id="readback_incomplete"),
+        pytest.param("C2a", "predecessor", True, True, ["current_native_blocking"], None, None, False,
+                     id="predecessor_direction"),
+        pytest.param("C2a", "none", True, True, ["current_native_blocking"], None, None, False,
+                     id="missing_direction"),
+        pytest.param("C2a", "unknown", True, True, ["current_native_blocking"], None, None, False,
+                     id="unknown_direction"),
+        pytest.param("duplicate_candidate", "successor", True, True, ["current_native_blocking"], None, None,
+                     False, id="duplicate"),
+        pytest.param("C3", "successor", True, True, ["current_native_blocking"], None, None, False,
+                     id="unresolved"),
+        pytest.param("C1", "successor", True, True, ["current_native_blocking"], None, None, False,
+                     id="rejected_c1"),
+        pytest.param("C2a", "successor", True, False, ["current_native_blocking"], None, None, False,
+                     id="saturated_source"),
+        pytest.param("C2a", "successor", True, True,
+                     ["candidate_native_blocked_by", "current_native_blocking"], None, None, True,
+                     id="native_source_order_independent"),
+    ],
+)
+def test_verified_native_successor_decision_matrix_fail_closed(
+    policy_class: str,
+    dependency_relation: str,
+    readback_complete: bool,
+    source_complete: bool,
+    provenance: list[str],
+    current_url: str | None,
+    candidate_url: str | None,
+    expected: bool,
+) -> None:
+    """#1797 AC3/AC4: every non-exact predicate input is fail-closed."""
+    current_number = 8200
+    candidate_number = 8201
+    current = {
+        "number": current_number,
+        "url": current_url or f"https://github.com/{DEFAULT_REPO}/issues/{current_number}",
+    }
+    candidate = {
+        "number": candidate_number,
+        "url": candidate_url or f"https://github.com/{DEFAULT_REPO}/issues/{candidate_number}",
+    }
+    dependency_provenance = [
+        {
+            "source": source,
+            "repository": "other/repository" if source_complete and source == "current_native_blocking" and expected is False and current_url is None and candidate_url is None and policy_class == "C2a" and dependency_relation == "successor" and provenance == ["current_native_blocking"] else DEFAULT_REPO,
+            "issue_number": current_number,
+        }
+        for source in provenance
+    ]
+    result = checker_module._verified_native_successor_predicate(
+        repository=DEFAULT_REPO,
+        current_number=current_number,
+        current_raw=current,
+        candidate_number=candidate_number,
+        candidate_raw=candidate,
+        policy_class=policy_class,
+        dependency_relation=dependency_relation,
+        readback_complete=readback_complete,
+        source_complete=source_complete,
+        dependency_provenance=dependency_provenance,
+    )
+    assert result["accepted"] is expected
+    assert result["source_complete"] is source_complete
 
 
 def test_given_mixed_normal_c1_and_successor_candidates_then_policy_class_distinguished_per_candidate(
