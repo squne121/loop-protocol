@@ -906,3 +906,168 @@ describe('Issue #1282: HUD upgrade purchase surface (AC1, AC2, AC3, AC5)', () =>
     expect(textSurface).toContain('Earn 100 resources before upgrading.')
   })
 })
+
+// ---------------------------------------------------------------------------
+// Issue #1374: phase screen overlay — title / preparation / load_menu screens
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal getByRole(role, { name }) equivalent (AC4): this repo does not
+ * depend on @testing-library/dom, so visible-control assertions query by
+ * implicit ARIA role (native <button> => role "button") and accessible
+ * name (aria-label, falling back to trimmed textContent) instead of
+ * relying on data-action selectors alone.
+ */
+function accessibleName(element: HTMLElement): string {
+  return element.getAttribute('aria-label') ?? element.textContent?.trim() ?? ''
+}
+
+function getByRole(container: HTMLElement, role: string, name: string): HTMLElement | null {
+  const candidates =
+    role === 'button'
+      ? Array.from(container.querySelectorAll<HTMLElement>('button, [role="button"]'))
+      : Array.from(container.querySelectorAll<HTMLElement>(`[role="${role}"]`))
+
+  return candidates.find((candidate) => accessibleName(candidate) === name) ?? null
+}
+
+describe('Issue #1374: phase screen overlay', () => {
+  let container: HTMLElement
+  let actions: {
+    onNewGame: ReturnType<typeof vi.fn>
+    onStartSortie: ReturnType<typeof vi.fn>
+    onClaimReward: ReturnType<typeof vi.fn>
+    onConfirmResult: ReturnType<typeof vi.fn>
+    onNextSortie: ReturnType<typeof vi.fn>
+    onSave: ReturnType<typeof vi.fn>
+    onLoadGame: ReturnType<typeof vi.fn>
+    onReset: ReturnType<typeof vi.fn>
+    canLoadGame: ReturnType<typeof vi.fn>
+    onTogglePause: ReturnType<typeof vi.fn>
+  }
+  let hudController: ReturnType<typeof createHudController>
+
+  beforeEach(() => {
+    container = document.createElement('div')
+    actions = {
+      onNewGame: vi.fn(),
+      onStartSortie: vi.fn(),
+      onClaimReward: vi.fn(),
+      onConfirmResult: vi.fn(),
+      onNextSortie: vi.fn(),
+      onSave: vi.fn(),
+      onLoadGame: vi.fn(),
+      onReset: vi.fn(),
+      canLoadGame: vi.fn(() => true),
+      onTogglePause: vi.fn(),
+    }
+    hudController = createHudController(container, actions)
+  })
+
+  it('GIVEN title_menu WHEN render called THEN the title screen is visible via role/name query (AC1, AC4)', () => {
+    hudController.render(createState('title_menu'), false)
+
+    expect(container.querySelector('[data-phase-screen="title"]')?.hidden).toBe(false)
+    expect(getByRole(container, 'button', 'Begin new run')).not.toBeNull()
+    expect(getByRole(container, 'button', 'Open save')).not.toBeNull()
+  })
+
+  it('GIVEN preparation WHEN render called THEN the preparation screen is visible and Launch sortie / Save / Reset are operable (AC2, AC4)', () => {
+    hudController.render(createState('preparation'), false)
+
+    expect(container.querySelector('[data-phase-screen="preparation"]')?.hidden).toBe(false)
+    const launchSortie = getByRole(container, 'button', 'Launch sortie')
+    const save = getByRole(container, 'button', 'Save progress')
+    const reset = getByRole(container, 'button', 'Reset sortie')
+    expect(launchSortie).not.toBeNull()
+    expect(save).not.toBeNull()
+    expect(reset).not.toBeNull()
+    expect((launchSortie as HTMLButtonElement).disabled).toBe(false)
+    expect((save as HTMLButtonElement).disabled).toBe(false)
+    expect((reset as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('GIVEN running WHEN render called THEN the title and preparation screens are hidden and inert and excluded from tab order (AC3, AC6)', () => {
+    hudController.render(createState('running'), false)
+
+    const titleScreen = container.querySelector<HTMLElement>('[data-phase-screen="title"]')
+    const preparationScreen = container.querySelector<HTMLElement>('[data-phase-screen="preparation"]')
+
+    expect(titleScreen?.hidden).toBe(true)
+    expect(titleScreen?.hasAttribute('inert')).toBe(true)
+    expect(preparationScreen?.hidden).toBe(true)
+    expect(preparationScreen?.hasAttribute('inert')).toBe(true)
+
+    // AC6: New Game / Save / Load / Reset are not focusable during running.
+    expect(queryButton(container, 'new-game').disabled).toBe(true)
+    expect(queryButton(container, 'save').disabled).toBe(true)
+    expect(queryButton(container, 'load-game').disabled).toBe(true)
+    expect(queryButton(container, 'preparation-load').disabled).toBe(true)
+    expect(queryButton(container, 'reset').disabled).toBe(true)
+    expect(container.querySelector('[data-action="load-game"]')?.hasAttribute('inert')).toBe(true)
+  })
+
+  it('GIVEN preparation WHEN Load is clicked THEN load_menu opens and is tracked as the Back origin (AC8)', () => {
+    hudController.render(createState('preparation'), false)
+
+    queryButton(container, 'preparation-load').click()
+
+    const state = createState('load_menu')
+    hudController.render(state, false)
+    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Restore briefing')
+    expect(container.querySelector('[data-phase-screen="load"]')?.hidden).toBe(false)
+  })
+
+  it('GIVEN load_menu opened from preparation WHEN Back is clicked THEN the transition targets preparation (AC8)', () => {
+    const state = createState('preparation')
+    hudController.render(state, false)
+
+    queryButton(container, 'preparation-load').click()
+    expect(state.loopPhase).toBe('load_menu')
+
+    hudController.render(state, false)
+    queryButton(container, 'back-from-load-menu').click()
+
+    expect(state.loopPhase).toBe('preparation')
+  })
+
+  it('GIVEN load_menu opened from title_menu WHEN Back is clicked THEN the transition targets title_menu (AC8)', () => {
+    const state = createState('title_menu')
+    hudController.render(state, false)
+
+    // Opening load_menu from title_menu delegates to actions.onLoadGame()
+    // (main.ts performs the transition); this HUD-side origin tracking
+    // fires in the same click before that delegation.
+    queryButton(container, 'load-game').click()
+    state.loopPhase = 'load_menu'
+
+    hudController.render(state, false)
+    queryButton(container, 'back-from-load-menu').click()
+
+    expect(state.loopPhase).toBe('title_menu')
+  })
+
+  it('GIVEN load_menu WHEN a load failure is reported (loadFailure) THEN the phase stays at load_menu and status shows the error (AC9)', () => {
+    const state = createState('load_menu')
+    // Simulates main.ts's setHudFeedback() call on a load failure — no
+    // phase transition occurs; only the status copy changes.
+    state.telemetry.status = 'Load Game failed.'
+    state.telemetry.lastCommandSummary = 'No save data found.'
+
+    hudController.render(state, false)
+
+    expect(state.loopPhase).toBe('load_menu')
+    expect(container.querySelector('[data-field="status"]')?.textContent).toBe('Load Game failed.')
+    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Restore briefing')
+    expect(container.querySelector('[data-phase-screen="load"]')?.hidden).toBe(false)
+  })
+
+  it('GIVEN any state WHEN rendered THEN no raw LoopPhase or telemetry enum copy leaks into overlay text (AC contract: normal overlay text boundary)', () => {
+    hudController.render(createState('load_menu'), false)
+
+    const textSurface = container.textContent ?? ''
+    expect(textSurface).not.toContain('title_menu')
+    expect(textSurface).not.toContain('load_menu')
+    expect(textSurface).not.toContain('preparation')
+  })
+})

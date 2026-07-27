@@ -1,6 +1,14 @@
 import type { GameState } from '../state'
 import { formatCombatNumber } from '../render/renderUtils'
 import type { UpgradePurchaseFailureReason } from '../systems/UpgradeSystem'
+import { resolvePhaseTransition } from '../systems/PhaseTransitionSystem'
+import {
+  getVisiblePhaseScreen,
+  isLoadGameReachable,
+  resolveLoadMenuBackIntent,
+  setPhaseScreenVisibility,
+  type LoadMenuOrigin,
+} from './phaseScreens'
 
 export interface HudActions {
   onNewGame?(): void
@@ -192,7 +200,16 @@ export function createHudController(
       <h1>LOOP_PROTOCOL</h1>
       <p class="lede">Canvas battle sandbox with DOM-side command surfaces.</p>
     </section>
-    <section class="panel">
+    <section class="panel panel-screen" data-phase-screen="title">
+      <p class="eyebrow">Command deck</p>
+      <button type="button" data-action="new-game" data-battle-interactive="true">Begin new run</button>
+    </section>
+    <button
+      type="button"
+      data-action="load-game"
+      data-battle-interactive="true"
+    >Open save</button>
+    <section class="panel panel-screen" data-phase-screen="preparation">
       <p class="eyebrow">Progress</p>
       <dl class="stat-grid">
         <div><dt>Hull</dt><dd data-field="hp"></dd></div>
@@ -200,8 +217,6 @@ export function createHudController(
         <div><dt>Shots</dt><dd data-field="shots"></dd></div>
         <div><dt>Cooldown</dt><dd data-field="cooldown"></dd></div>
       </dl>
-    </section>
-    <section class="panel">
       <p class="eyebrow">Sortie</p>
       <dl class="stat-grid">
         <div><dt>Mission phase</dt><dd data-field="loop-phase"></dd></div>
@@ -210,6 +225,22 @@ export function createHudController(
         <div><dt>Duration</dt><dd data-field="sortie-duration"></dd></div>
         <div><dt>Outcome</dt><dd data-field="sortie-result"></dd></div>
       </dl>
+      <button type="button" data-action="start-sortie" data-battle-interactive="true">Launch sortie</button>
+      <button type="button" data-action="save" data-battle-interactive="true">Save progress</button>
+      <button type="button" data-action="preparation-load" data-battle-interactive="true">Open save</button>
+      <button
+        type="button"
+        data-action="reset"
+        data-battle-interactive="true"
+        title="Reset sortie is a destructive boundary and is only available during preparation."
+      >
+        Reset sortie
+      </button>
+    </section>
+    <section class="panel panel-screen" data-phase-screen="load">
+      <p class="eyebrow">Load Game</p>
+      <p class="status-copy status-copy--muted">Select a save slot to load, or go back.</p>
+      <button type="button" data-action="back-from-load-menu" data-battle-interactive="true">Back</button>
     </section>
     <section class="panel">
       <p class="eyebrow">Wingmates</p>
@@ -246,21 +277,9 @@ export function createHudController(
       <p class="status-copy" data-field="pause-status" role="status" aria-live="polite" aria-atomic="true"></p>
     </section>
     <section class="panel panel--actions">
-      <button type="button" data-action="new-game" data-battle-interactive="true">Begin new run</button>
-      <button type="button" data-action="start-sortie" data-battle-interactive="true">Launch sortie</button>
       <button type="button" data-action="claim-reward" data-battle-interactive="true">Collect payout</button>
       <button type="button" data-action="confirm-result" data-battle-interactive="true">Return to hangar</button>
       <button type="button" data-action="next-sortie" data-battle-interactive="true">Prepare next sortie</button>
-      <button type="button" data-action="save" data-battle-interactive="true">Save progress</button>
-      <button type="button" data-action="load-game" data-battle-interactive="true">Open save</button>
-      <button
-        type="button"
-        data-action="reset"
-        data-battle-interactive="true"
-        title="Reset sortie is a destructive boundary and is only available during preparation."
-      >
-        Reset sortie
-      </button>
       <button
         type="button"
         data-action="toggle-pause"
@@ -271,6 +290,17 @@ export function createHudController(
       >Pause</button>
     </section>
   `
+
+  // Live GameState reference captured on every render() so click handlers
+  // (registered once, below) can read/transition the current phase without
+  // main.ts (out of Allowed Paths for this Issue) wiring new callbacks
+  // (Issue #1374, AC5, AC8). main.ts mutates `state.loopPhase` in place via
+  // the same resolvePhaseTransition() contract (see transitionByIntent()),
+  // so mutating the same live object here is consistent with that pattern.
+  let latestState: GameState | undefined
+  // Tracks which phase opened load_menu so Back can return to the correct
+  // origin (AC8). Defaults to the pre-existing sole Back destination.
+  let loadMenuOrigin: LoadMenuOrigin = 'title_menu'
 
   if (actions.onNewGame) {
     container
@@ -306,8 +336,49 @@ export function createHudController(
   if (loadGameHandler) {
     container
       .querySelector<HTMLButtonElement>('[data-action="load-game"]')
-      ?.addEventListener('click', loadGameHandler)
+      ?.addEventListener('click', () => {
+        // AC8: the shared Load Game control is only reachable from
+        // title_menu / load_menu (see isLoadGameReachable()). Clicking it
+        // from title_menu opens load_menu (delegated to the caller's
+        // onLoadGame, unchanged); record the origin here so a subsequent
+        // Back press on load_menu returns to title_menu.
+        if (latestState?.loopPhase === 'title_menu') {
+          loadMenuOrigin = 'title_menu'
+        }
+        loadGameHandler()
+      })
   }
+  container
+    .querySelector<HTMLButtonElement>('[data-action="preparation-load"]')
+    ?.addEventListener('click', () => {
+      // AC8: preparation opens load_menu directly — main.ts's onLoadGame()
+      // seam does not (and cannot, without expanding Allowed Paths) handle
+      // the preparation phase, so this control drives the phase transition
+      // itself via the same resolvePhaseTransition() contract main.ts uses.
+      if (!latestState) {
+        return
+      }
+      const transition = resolvePhaseTransition(latestState.loopPhase, 'open_load_menu')
+      if (!transition.ok) {
+        return
+      }
+      loadMenuOrigin = 'preparation'
+      latestState.loopPhase = transition.to
+    })
+  container
+    .querySelector<HTMLButtonElement>('[data-action="back-from-load-menu"]')
+    ?.addEventListener('click', () => {
+      // AC8: Back returns to whichever phase opened load_menu.
+      if (!latestState) {
+        return
+      }
+      const intent = resolveLoadMenuBackIntent(loadMenuOrigin)
+      const transition = resolvePhaseTransition(latestState.loopPhase, intent)
+      if (!transition.ok) {
+        return
+      }
+      latestState.loopPhase = transition.to
+    })
   container
     .querySelector<HTMLButtonElement>('[data-action="reset"]')
     ?.addEventListener('click', actions.onReset)
@@ -344,12 +415,20 @@ export function createHudController(
   const nextSortieButton = queryAction(container, 'next-sortie')
   const saveButton = queryAction(container, 'save')
   const loadGameButton = queryAction(container, 'load-game')
+  const preparationLoadButton = queryAction(container, 'preparation-load')
+  const backFromLoadMenuButton = queryAction(container, 'back-from-load-menu')
   const resetButton = queryAction(container, 'reset')
   const togglePauseButton = queryAction(container, 'toggle-pause')
   const upgradeWeaponButton = queryAction(container, 'upgrade-weapon')
 
+  const titleScreenSection = queryPhaseScreen(container, 'title')
+  const preparationScreenSection = queryPhaseScreen(container, 'preparation')
+  const loadScreenSection = queryPhaseScreen(container, 'load')
+
   return {
     render(state, isPaused, upgradeView) {
+      latestState = state
+
       hp.textContent = `${formatCombatNumber(state.player.hp)}/${formatCombatNumber(state.player.maxHp)}`
       resources.textContent = `${state.progress.resources}`
       weaponPowerField.textContent = `${upgradeView?.weaponPower ?? state.progress.weaponPower}`
@@ -359,6 +438,14 @@ export function createHudController(
       status.textContent = state.telemetry.status
       command.textContent = state.telemetry.lastCommandSummary
       loopPhase.textContent = getMissionPhaseCopy(state.loopPhase)
+
+      // Phase screen visibility (AC1, AC2, AC3, AC5, AC6): derived solely
+      // from state.loopPhase, never a separate uiScreen state.
+      const visibleScreen = getVisiblePhaseScreen(state.loopPhase)
+      setPhaseScreenVisibility(titleScreenSection, visibleScreen === 'title')
+      setPhaseScreenVisibility(preparationScreenSection, visibleScreen === 'preparation')
+      setPhaseScreenVisibility(loadScreenSection, visibleScreen === 'load')
+      setPhaseScreenVisibility(loadGameButton, isLoadGameReachable(state.loopPhase))
 
       // Button enable policy derived from phase state machine (AC2, AC3, AC7, AC8, AC9)
       const isMenuPhase = state.loopPhase === 'title_menu' || state.loopPhase === 'load_menu'
@@ -378,6 +465,12 @@ export function createHudController(
       // canLoadGame is preferred; falls back to deprecated canQuickLoad for backward compat
       const canLoad = (actions.canLoadGame ?? actions.canQuickLoad)?.() ?? false
       loadGameButton.disabled = !isMenuPhase || !canLoad
+      // preparation-load: preparation only (AC8), gated on the same
+      // canLoadGame() authority so a preparation player without a save
+      // still sees why Load is unavailable via the disabled state.
+      preparationLoadButton.disabled = state.loopPhase !== 'preparation' || !canLoad
+      // back-from-load-menu: load_menu only (AC8)
+      backFromLoadMenuButton.disabled = state.loopPhase !== 'load_menu'
       resetButton.disabled = state.loopPhase !== 'preparation'
 
       // Upgrade weapon (AC2, AC3, AC6): `quoteUpgrade()` result (via upgradeView.buttonDisabled)
@@ -462,6 +555,16 @@ function queryField(container: HTMLElement, name: string): HTMLElement {
 
   if (!element) {
     throw new Error(`HUD field "${name}" is missing.`)
+  }
+
+  return element
+}
+
+function queryPhaseScreen(container: HTMLElement, screen: string): HTMLElement {
+  const element = container.querySelector<HTMLElement>(`[data-phase-screen="${screen}"]`)
+
+  if (!element) {
+    throw new Error(`HUD phase screen "${screen}" is missing.`)
   }
 
   return element
