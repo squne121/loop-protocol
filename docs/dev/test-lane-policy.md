@@ -8,8 +8,10 @@
 
 現行 CI（`.github/workflows/ci.yml`）での実装状態:
 
-- `python-test` job は `setup-python-uv` / `uv python install` / `uv sync --locked --group dev` を実行し、`setup-node-pnpm` と `pnpm install --frozen-lockfile` は実行しない
-- `python-test` の `.claude/hooks/tests/` 実行では、Node-backed 2 nodeid を `--deselect=<exact nodeid>` で除外し、Python-only hook tests を継続実行している
+- Issue #1760: `python-test` job は Node/Codex CLI から分離された `python-test-core`（Python-only、`setup-python-uv` / `uv python install` / `uv sync --locked --group dev` のみ）と `codex-execpolicy`（Node/npm/codex CLI + execpolicy matrix + `tests/codex/test_local_main_branch_guard.py` 専用）に分割され、`python-test` は required status check 名を維持したまま `needs: [python-test-core, codex-execpolicy]` + `if: always()` の集約 job になった（`node-backed-hook-tests` と同様 `setup-node-pnpm` は実行しない）
+- `python-test-core` job は `setup-python-uv` / `uv python install` / `uv sync --locked --group dev` を実行し、`setup-node-pnpm` と `pnpm install --frozen-lockfile` は実行しない
+- `python-test-core` の `.claude/hooks/tests/` 実行では、Node-backed 2 nodeid を `--deselect=<exact nodeid>` で除外し、Python-only hook tests を継続実行している
+- `codex-execpolicy` job は `scripts/ci/verify_python_test_lane.py`（`python-test-core`/`codex-execpolicy`/`python-test` の YAML AST 不変条件）と `scripts/ci/verify_ci_check_conclusions.py`（同一 head SHA の実 check conclusion + AC6 sentinel artifact 検証）の対象トポロジである
 - `node-backed-hook-tests` job は `setup-node-pnpm` / `setup-python-uv` / `pnpm install --frozen-lockfile` を行った上で、Node-backed hook test nodeid だけを実行している
 - `ci_test_selection/v1` の split evidence は `ci_test_selection_summary_v1.json` で統合され、python-test 側 absent / node-backed 側 exactly 2 / union-disjointness を機械検証している
 - `pytest` の python_unit レーンは `.github/ci/python-test-plan.json`（python-test-plan SSOT）を `scripts/ci/python_test_plan.py` loader 経由で消費する単一 step に統合された（#1064）
