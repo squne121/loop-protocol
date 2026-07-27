@@ -12,16 +12,28 @@ AC5: 失敗パターン fixture（preflight pass → scope_signal_guard.triggere
      human_escalation）を再発防止。
 
 Issue #1507 AC24 (Scope Delta): `make_phase_state()` now auto-provisions a
-valid REVIEW_COMPACT_VALIDATION_RESULT_V1 fixture file (validation_status:
-valid) and passes `--review-validation-result-path` whenever phase="review"
-and source_kind="issue_review_result_compact_v1", since
-build_refinement_phase_state.py now requires that argument for this exact
+valid REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1 fixture file
+(validation_status: valid) and passes `--review-validation-result-path` and
+`--issue-number` whenever phase="review" and
+source_kind="issue_review_result_compact_v1", since
+build_refinement_phase_state.py now requires those arguments for this exact
 (phase, source_kind) combination (structural validator-first gate). This
 keeps all pre-existing AC1-AC5/B2/B3/M1/M3 call sites in this file working
 unchanged; only the shared helper and the one raw (non-helper) subprocess
 call in test_validate_router_in_phase_parametrize needed updating.
+
+Issue #1755 (Scope Delta): the review-phase gate now requires the
+INTERMEDIATE schema literal (`REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1`,
+not the legacy `REVIEW_COMPACT_VALIDATION_RESULT_V1`), a matching
+`input_sha256` bound to the actual `--source-path` bytes, and a matching
+`--issue-number` bound to `normalized_payload.ARTIFACT`'s issue segment.
+`write_valid_review_validation_result()` and `make_phase_state()` were
+updated accordingly (they still hand-craft a minimal valid fixture rather
+than invoking the real producer -- AC6's real-producer regression coverage
+lives in test_refinement_phase_gate_validation_seam_gates.py).
 """
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -47,18 +59,46 @@ def load_loop_state_fixture() -> dict[str, Any]:
     return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
 
-def write_valid_review_validation_result() -> str:
-    """Write a minimal valid REVIEW_COMPACT_VALIDATION_RESULT_V1 fixture
-    (Issue #1507 AC24) and return its path."""
+_DEFAULT_REVIEW_GATE_ISSUE_NUMBER = 999999
+
+def write_valid_review_validation_result(
+    source_path: "str | None" = None,
+    issue_number: int = _DEFAULT_REVIEW_GATE_ISSUE_NUMBER,
+) -> str:
+    """Write a minimal valid REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1
+    fixture (Issue #1507 AC24 / Issue #1755 AC2-AC5) and return its path.
+
+    `input_sha256` is computed from the ACTUAL bytes of `source_path` (or
+    b"{}" if not supplied, matching the default make_phase_state() source
+    fixture) so the AC4 SHA256 binding check passes. `normalized_payload.ARTIFACT`
+    carries `issue_number`'s segment so the AC5 issue-number binding check
+    passes."""
+    if source_path is not None:
+        source_bytes = Path(source_path).read_bytes()
+    else:
+        source_bytes = b"{}"
+    input_sha256 = f"sha256:{hashlib.sha256(source_bytes).hexdigest()}"
+
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False
     ) as f:
         json.dump(
             {
-                "schema": "REVIEW_COMPACT_VALIDATION_RESULT_V1",
+                "schema": "REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1",
                 "schema_version": "1",
                 "validation_status": "valid",
                 "envelope_kind": "approve",
+                "input_sha256": input_sha256,
+                "input_byte_count": len(source_bytes),
+                "normalized_payload": {
+                    "ARTIFACT": (
+                        "compact_review_result_v1="
+                        f".claude/artifacts/issue-refinement-loop/{issue_number}/"
+                        "compact_review_result_fixture.json"
+                    ),
+                },
+                "canonical_reviewer_blocker_claim": None,
+                "violations": [],
             },
             f,
         )
@@ -70,16 +110,19 @@ def make_phase_state(
     source_kind: str = "refinement_preflight_result_v1",
     source_path: str | None = None,
     review_validation_result_path: str | None = None,
+    issue_number: "int | None" = None,
 ) -> dict[str, Any]:
     """Build a minimal ISSUE_REFINEMENT_PHASE_STATE_V1 via build_refinement_phase_state.py.
 
     source_path defaults to a temporary file created automatically (M1: source_path must exist).
 
-    Issue #1507 AC24: when phase="review" and
+    Issue #1507 AC24 / Issue #1755 AC2-AC5: when phase="review" and
     source_kind="issue_review_result_compact_v1", a valid
-    REVIEW_COMPACT_VALIDATION_RESULT_V1 fixture is auto-provisioned (unless
-    the caller explicitly supplies review_validation_result_path) so that
-    existing (phase, source_kind) call sites in this file keep passing
+    REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1 fixture (bound to
+    source_path's actual bytes and to issue_number) is auto-provisioned
+    (unless the caller explicitly supplies review_validation_result_path),
+    and --issue-number is auto-supplied (unless explicitly overridden), so
+    that existing (phase, source_kind) call sites in this file keep passing
     unchanged under the new structural validator-first gate.
     """
     # Create a real temp file for source_path (M1 requires source_path to exist)
@@ -92,12 +135,15 @@ def make_phase_state(
             source_path = sf.name
         _source_file = source_path
 
-    if (
-        phase == "review"
-        and source_kind == "issue_review_result_compact_v1"
-        and review_validation_result_path is None
-    ):
-        review_validation_result_path = write_valid_review_validation_result()
+    gate_applies = (
+        phase == "review" and source_kind == "issue_review_result_compact_v1"
+    )
+    if gate_applies and issue_number is None:
+        issue_number = _DEFAULT_REVIEW_GATE_ISSUE_NUMBER
+    if gate_applies and review_validation_result_path is None:
+        review_validation_result_path = write_valid_review_validation_result(
+            source_path=source_path, issue_number=issue_number
+        )
 
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False
@@ -114,6 +160,8 @@ def make_phase_state(
     ]
     if review_validation_result_path is not None:
         argv += ["--review-validation-result-path", review_validation_result_path]
+    if issue_number is not None:
+        argv += ["--issue-number", str(issue_number)]
 
     result = subprocess.run(
         argv,
@@ -734,13 +782,17 @@ def test_build_phase_state_review_phase_rejects_invalid_validation_status(tmp_pa
 
 
 def test_build_phase_state_review_phase_with_valid_validation_result_succeeds(tmp_path):
-    """AC24: a valid REVIEW_COMPACT_VALIDATION_RESULT_V1 (validation_status:
-    valid) allows phase-state generation to proceed as before."""
+    """AC24 / Issue #1755 AC2-AC5: a valid
+    REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1 (validation_status:
+    valid, correct schema literal, empty violations, input_sha256 bound to
+    --source-path bytes, ARTIFACT issue segment bound to --issue-number)
+    allows phase-state generation to proceed."""
     source_file = tmp_path / "source.json"
     source_file.write_text("{}", encoding="utf-8")
-    validation_file = tmp_path / "validation.json"
-    validation_file.write_text(
-        json.dumps({"validation_status": "valid"}), encoding="utf-8"
+    validation_file = Path(
+        write_valid_review_validation_result(
+            source_path=str(source_file), issue_number=1755
+        )
     )
     out_file = tmp_path / "out.json"
 
@@ -752,6 +804,7 @@ def test_build_phase_state_review_phase_with_valid_validation_result_succeeds(tm
             "--source-kind", "issue_review_result_compact_v1",
             "--source-path", str(source_file),
             "--review-validation-result-path", str(validation_file),
+            "--issue-number", "1755",
             "--output-path", str(out_file),
         ],
         capture_output=True,
@@ -850,14 +903,20 @@ def test_validate_router_in_phase_parametrize(phase, router, expected_allowed, t
         "--source-path", str(source_file),
         "--output-path", str(out_file),
     ]
-    # Issue #1507 AC24: review phase + issue_review_result_compact_v1 requires
-    # a valid REVIEW_COMPACT_VALIDATION_RESULT_V1 fixture.
+    # Issue #1507 AC24 / Issue #1755 AC2-AC5: review phase +
+    # issue_review_result_compact_v1 requires a valid
+    # REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1 fixture bound to
+    # source_file's bytes and --issue-number.
     if phase == "review" and source_kind == "issue_review_result_compact_v1":
-        validation_file = tmp_path / "review_validation.json"
-        validation_file.write_text(
-            json.dumps({"validation_status": "valid"}), encoding="utf-8"
+        validation_file = Path(
+            write_valid_review_validation_result(
+                source_path=str(source_file), issue_number=1755
+            )
         )
-        build_argv += ["--review-validation-result-path", str(validation_file)]
+        build_argv += [
+            "--review-validation-result-path", str(validation_file),
+            "--issue-number", "1755",
+        ]
 
     result_build = subprocess.run(
         build_argv,
