@@ -1,0 +1,95 @@
+schema: profile_provider_contract_matrix/v1
+
+# profile_provider_contract_matrix/v1
+#
+# 5 profile x 2 provider = 10 セルを機械可読な 4 値 enum
+# (implemented | unsupported_by_design | deferred | unsafe) で記録する。
+# 各セルは判定根拠となる evidence (実コード/テストファイルパスまたは
+# Issue/PR 番号、最低1件) と known_gaps (既知の制限事項、空配列可) を持つ。
+#
+# related: #1806, parent #1265 (Parent Closure Rule AC4)
+
+profiles:
+  no_tools:
+    gemini:
+      value: implemented
+      evidence:
+        - .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py
+        - .claude/skills/gemini-cli-headless-delegation/references/provider-mapping.md
+      known_gaps: []
+    agy:
+      value: implemented
+      evidence:
+        - .claude/skills/gemini-cli-headless-delegation/tests/test_agy_provider.py
+        - .claude/skills/gemini-cli-headless-delegation/references/provider-mapping.md
+      known_gaps:
+        - "safety mode は degraded_wrapper_only（guaranteed read-only ではなく wrapper-constrained）"
+
+  proposal_only:
+    gemini:
+      value: implemented
+      evidence:
+        - .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py
+        - .claude/skills/gemini-cli-headless-delegation/references/provider-mapping.md
+      known_gaps: []
+    agy:
+      value: implemented
+      evidence:
+        - .claude/skills/gemini-cli-headless-delegation/tests/test_agy_provider.py
+        - .claude/skills/gemini-cli-headless-delegation/references/provider-mapping.md
+      known_gaps:
+        - "safety mode は degraded_wrapper_only（guaranteed read-only ではなく wrapper-constrained）"
+
+  grounded_research:
+    gemini:
+      value: implemented
+      evidence:
+        - .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py
+        - .claude/skills/gemini-cli-headless-delegation/references/provider-mapping.md
+      known_gaps: []
+    agy:
+      value: implemented
+      evidence:
+        - .claude/skills/gemini-cli-headless-delegation/scripts/validate_agy_grounding_evidence.py
+        - .claude/skills/gemini-cli-headless-delegation/tests/test_agy_provenance_grounding_wiring.py
+        - .claude/skills/gemini-cli-headless-delegation/tests/test_validate_agy_grounding_evidence.py
+        - .claude/skills/gemini-cli-headless-delegation/references/provider-mapping.md
+      known_gaps:
+        - "grounded 判定は構造化 tool_calls トレース必須。stdout の bare URL 文字列だけでは実行証跡と扱わない（トレース欠如は agy_web_grounding_tool_call_missing で fail-closed）"
+
+  local_asset_research:
+    gemini:
+      value: implemented
+      evidence:
+        - .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py
+        - .claude/skills/gemini-cli-headless-delegation/scripts/build_request.py
+        - .claude/skills/gemini-cli-headless-delegation/references/provider-mapping.md
+      known_gaps:
+        - "`.gemini/settings.json` の Serena allowlist（mcp.allowed == [\"serena\"] と read-only includeTools）を machine-checkable に確認できる場合のみ使用可"
+    agy:
+      value: implemented
+      evidence:
+        - .claude/skills/gemini-cli-headless-delegation/tests/test_agy_local_asset_research_contract.py
+        - .claude/skills/gemini-cli-headless-delegation/tests/test_agy_targeted_evidence.py
+        - .claude/skills/gemini-cli-headless-delegation/tests/test_agy_serena_fanout_correlation.py
+        - .claude/skills/gemini-cli-headless-delegation/references/provider-mapping.md
+      known_gaps:
+        - "wrapper 側のみが pinned SerenaMCP read-only retrieval を実行し、repo-relative JSON evidence envelope のみを prompt-only で AGY に渡す（AGY に repo root / MCP config / direct tool access は渡さない）"
+
+  github_research:
+    gemini:
+      value: implemented
+      evidence:
+        - .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py
+        - .claude/skills/gemini-cli-headless-delegation/scripts/build_request.py
+        - .claude/skills/gemini-cli-headless-delegation/tests/test_build_request.py
+        - .claude/skills/gemini-cli-headless-delegation/references/provider-mapping.md
+      known_gaps:
+        - "gh_commands は argv ベースの許可コマンドリストに限定され、tool_profile=github_research 以外での指定は validation で拒否される。GitHub read-only 調査のみで書込は許可しない"
+    agy:
+      value: unsupported_by_design
+      evidence:
+        - .claude/skills/gemini-cli-headless-delegation/tests/test_agy_provider.py
+        - .claude/skills/gemini-cli-headless-delegation/references/provider-mapping.md
+      known_gaps:
+        - "agy は GitHub アクセス機能を持たないため fail-closed（unsupported_provider_profile）。fallback や自動 profile 変換は行わない"
