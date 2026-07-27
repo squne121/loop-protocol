@@ -9,7 +9,6 @@ the rest fail-closed.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import shlex
@@ -3403,17 +3402,47 @@ def classify_rtk_git_mutation(
         return _publish_safety_stop_result(
             reason_code=publish_guard_error or "publish_guard_context_missing",
             target_branch=target_branch,
-            expected_remote_head=str(context_values.get("expected_remote_head", os.environ.get("LOOP_PUBLISH_EXPECTED_REMOTE_HEAD", ""))).strip().lower(),
-            current_remote_head=str(context_values.get("current_remote_head", os.environ.get("LOOP_PUBLISH_CURRENT_REMOTE_HEAD", ""))).strip().lower(),
+            expected_remote_head=str(
+                context_values.get(
+                    "expected_remote_head",
+                    os.environ.get("LOOP_PUBLISH_EXPECTED_REMOTE_HEAD", ""),
+                )
+            ).strip().lower(),
+            current_remote_head=str(
+                context_values.get(
+                    "current_remote_head",
+                    os.environ.get("LOOP_PUBLISH_CURRENT_REMOTE_HEAD", ""),
+                )
+            ).strip().lower(),
             local_head=local_head,
-            verified_head=str(context_values.get("verified_head", os.environ.get("LOOP_PUBLISH_VERIFIED_HEAD", ""))).strip().lower(),
-            declared_publish_head=str(context_values.get("declared_publish_head", os.environ.get("LOOP_PUBLISH_DECLARED_PUBLISH_HEAD", ""))).strip().lower(),
+            verified_head=str(
+                context_values.get(
+                    "verified_head",
+                    os.environ.get("LOOP_PUBLISH_VERIFIED_HEAD", ""),
+                )
+            ).strip().lower(),
+            declared_publish_head=str(
+                context_values.get(
+                    "declared_publish_head",
+                    os.environ.get("LOOP_PUBLISH_DECLARED_PUBLISH_HEAD", ""),
+                )
+            ).strip().lower(),
             allowed_paths_gate_status=(
-                str(context_values.get("allowed_paths_gate_status", os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS", ""))).strip().lower()
+                str(
+                    context_values.get(
+                        "allowed_paths_gate_status",
+                        os.environ.get("LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS", ""),
+                    )
+                ).strip().lower()
                 or "indeterminate"
             ),
             pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
-            remote_readback_source=str(context_values.get("remote_readback_source", os.environ.get("LOOP_PUBLISH_REMOTE_READBACK_SOURCE", ""))).strip().lower(),
+            remote_readback_source=str(
+                context_values.get(
+                    "remote_readback_source",
+                    os.environ.get("LOOP_PUBLISH_REMOTE_READBACK_SOURCE", ""),
+                )
+            ).strip().lower(),
             decision_inputs_complete=False,
             boundary_layer=boundary_layer,
         )
