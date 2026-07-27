@@ -8,6 +8,8 @@ is loaded via `importlib.util.spec_from_file_location` instead.
 from __future__ import annotations
 
 import importlib.util
+import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -19,9 +21,7 @@ SCRIPT_PATH = REPO_ROOT / "scripts" / "check-visual-artifact-pipeline.py"
 
 
 def _load_module():
-    spec = importlib.util.spec_from_file_location(
-        "check_visual_artifact_pipeline", SCRIPT_PATH
-    )
+    spec = importlib.util.spec_from_file_location("check_visual_artifact_pipeline", SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -143,9 +143,7 @@ def test_ac9e_pending_baseline_registered_as_active_fails():
 # AC9(f) — Playwright and Vitest component VRT baseline roots must not mix.
 # ---------------------------------------------------------------------------
 def test_ac9f_playwright_vitest_baseline_root_mixing_fails():
-    declared = [
-        _base_capture(directory="tests/component/__screenshots__/widget.spec.ts/")
-    ]
+    declared = [_base_capture(directory="tests/component/__screenshots__/widget.spec.ts/")]
     derived: list[dict] = []
     failures = mod.cross_validate_active_captures(declared, derived, {})
     assert any("reserved Vitest component snapshot root" in f for f in failures)
@@ -169,12 +167,59 @@ def test_ac9g_missing_digest_env_fails():
 
 
 # ---------------------------------------------------------------------------
+# PR #1813 review fix, P1 Blocker 1 / Blocker 7 (marge condition 7): every
+# other declared field the validator can independently re-derive is tampered
+# ONE AT A TIME and must be caught as a hard fail — closing the gap where
+# only directory/comparator_kind/comparator_value/style_path were checked.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "field,bad_value",
+    [
+        ("spec_file", "tests/e2e/tampered.spec.ts"),
+        ("screenshot_name", "tampered.png"),
+        ("registry_id", "tampered-registry-id"),
+        ("browser", "firefox"),
+        ("project", "firefox"),
+        ("viewport", "1920x1080"),
+        ("device_scale_factor", 2),
+        ("artifact_scope", "suite"),
+        ("digest_env", "PLAYWRIGHT_REPORT_DIGEST"),
+        ("retention_days", 14),
+    ],
+)
+def test_field_level_tampering_is_hard_failed(field, bad_value):
+    declared = [_base_capture(**{field: bad_value})]
+    derived = [_base_capture()]
+    failures = mod.cross_validate_active_captures(declared, derived, {})
+    assert any(field in f for f in failures), f"tampering {field!r} was not hard-failed: {failures}"
+
+
+def test_directory_tampering_is_hard_failed():
+    declared = [_base_capture(directory="tests/e2e/__screenshots__/tampered.spec.ts/")]
+    derived = [_base_capture()]
+    failures = mod.cross_validate_active_captures(declared, derived, {})
+    assert any("directory" in f for f in failures)
+
+
+def test_comparator_value_tampering_is_hard_failed():
+    declared = [_base_capture(comparator_value="999")]
+    derived = [_base_capture()]
+    failures = mod.cross_validate_active_captures(declared, derived, {})
+    assert any("comparator_value" in f for f in failures)
+
+
+def test_style_path_tampering_is_hard_failed():
+    declared = [_base_capture(style_path=True)]
+    derived = [_base_capture(style_path=False)]
+    failures = mod.cross_validate_active_captures(declared, derived, {})
+    assert any("style_path" in f for f in failures)
+
+
+# ---------------------------------------------------------------------------
 # AC7 — artifact absence-state classification wiring.
 # ---------------------------------------------------------------------------
 def test_artifact_status_wiring_requires_all_four_states():
-    incomplete_summary = (
-        "steps.upload-test-results.outcome steps.upload-playwright-report.outcome uploaded"
-    )
+    incomplete_summary = "steps.upload-test-results.outcome steps.upload-playwright-report.outcome uploaded"
     failures = mod.check_artifact_status_wiring(incomplete_summary)
     assert any("no_files" in f for f in failures)
     assert any("step_not_run" in f for f in failures)
@@ -185,6 +230,13 @@ def test_artifact_status_wiring_passes_when_all_tokens_present():
     complete_summary = " ".join(mod.ARTIFACT_STATUS_REQUIRED_TOKENS)
     failures = mod.check_artifact_status_wiring(complete_summary)
     assert failures == []
+
+
+def test_artifact_status_wiring_requires_artifact_id_tokens():
+    # PR #1813 review fix, P1 Blocker 3: classification must be based on the
+    # upload step's own artifact-id output, not a post-hoc directory scan.
+    assert "steps.upload-playwright-report.outputs.artifact-id" in mod.ARTIFACT_STATUS_REQUIRED_TOKENS
+    assert "steps.upload-test-results.outputs.artifact-id" in mod.ARTIFACT_STATUS_REQUIRED_TOKENS
 
 
 # ---------------------------------------------------------------------------
@@ -250,11 +302,172 @@ test('pending scenario', async ({ page }) => {
     pw_snapshot_config = {
         "test_dir": "tests/e2e",
         "snapshot_path_template": "{testDir}/__screenshots__/{testFilePath}/{arg}{ext}",
+        "browser": "chromium",
+        "project": "chromium",
+        "viewport": "1280x720",
+        "device_scale_factor": 1,
     }
     captures, errors = mod.extract_derived_active_captures(e2e_dir, pw_snapshot_config, registry_maturity)
     assert errors == []
     names = {c["screenshot_name"] for c in captures}
     assert names == {"real.png"}
+
+
+# ---------------------------------------------------------------------------
+# PR #1813 review fix, P2 Blocker 5 — the TS-lite parser must not be
+# fail-open: subdirectories are walked (rglob), double-quoted / array names
+# are supported, comments/strings never desynchronise paren-balance
+# counting, and calls this validator genuinely cannot resolve to a
+# capture_id (options-only, no-args) are hard-failed rather than silently
+# skipped.
+# ---------------------------------------------------------------------------
+def _default_pw_snapshot_config() -> dict:
+    return {
+        "test_dir": "tests/e2e",
+        "snapshot_path_template": "{testDir}/__screenshots__/{testFilePath}/{arg}{ext}",
+        "browser": "chromium",
+        "project": "chromium",
+        "viewport": "1280x720",
+        "device_scale_factor": 1,
+    }
+
+
+def test_extract_derived_active_captures_walks_nested_subdirectories(tmp_path):
+    e2e_dir = tmp_path / "tests" / "e2e"
+    nested_dir = e2e_dir / "nested"
+    nested_dir.mkdir(parents=True)
+    spec = nested_dir / "nested.spec.ts"
+    spec.write_text(
+        "test('nested', async ({ page }) => {\n"
+        "  await expect(page.locator('canvas')).toHaveScreenshot('nested.png', { maxDiffPixels: 1 })\n"
+        "})\n",
+        encoding="utf-8",
+    )
+    captures, errors = mod.extract_derived_active_captures(e2e_dir, _default_pw_snapshot_config(), {})
+    assert errors == []
+    assert {"nested.png"} == {c["screenshot_name"] for c in captures}
+
+
+def test_extract_derived_active_captures_supports_double_quoted_name(tmp_path):
+    e2e_dir = tmp_path / "tests" / "e2e"
+    e2e_dir.mkdir(parents=True)
+    spec = e2e_dir / "fixture.spec.ts"
+    spec.write_text(
+        "test('double quoted', async ({ page }) => {\n"
+        "  await expect(page.locator('canvas')).toHaveScreenshot(\"double-quoted.png\", { maxDiffPixels: 1 })\n"
+        "})\n",
+        encoding="utf-8",
+    )
+    captures, errors = mod.extract_derived_active_captures(e2e_dir, _default_pw_snapshot_config(), {})
+    assert errors == []
+    assert {"double-quoted.png"} == {c["screenshot_name"] for c in captures}
+
+
+def test_extract_derived_active_captures_supports_array_name(tmp_path):
+    e2e_dir = tmp_path / "tests" / "e2e"
+    e2e_dir.mkdir(parents=True)
+    spec = e2e_dir / "fixture.spec.ts"
+    spec.write_text(
+        "test('array name', async ({ page }) => {\n"
+        "  await expect(page.locator('canvas')).toHaveScreenshot(['group', 'array-name.png'], { maxDiffPixels: 1 })\n"
+        "})\n",
+        encoding="utf-8",
+    )
+    captures, errors = mod.extract_derived_active_captures(e2e_dir, _default_pw_snapshot_config(), {})
+    assert errors == []
+    assert {"group/array-name.png"} == {c["screenshot_name"] for c in captures}
+
+
+def test_extract_derived_active_captures_hard_fails_on_options_only_call(tmp_path):
+    e2e_dir = tmp_path / "tests" / "e2e"
+    e2e_dir.mkdir(parents=True)
+    spec = e2e_dir / "fixture.spec.ts"
+    spec.write_text(
+        "test('options only', async ({ page }) => {\n"
+        "  await expect(page.locator('canvas')).toHaveScreenshot({ maxDiffPixels: 1 })\n"
+        "})\n",
+        encoding="utf-8",
+    )
+    captures, errors = mod.extract_derived_active_captures(e2e_dir, _default_pw_snapshot_config(), {})
+    assert captures == []
+    assert any("options-only" in e for e in errors)
+
+
+def test_extract_derived_active_captures_hard_fails_on_zero_arg_call(tmp_path):
+    e2e_dir = tmp_path / "tests" / "e2e"
+    e2e_dir.mkdir(parents=True)
+    spec = e2e_dir / "fixture.spec.ts"
+    spec.write_text(
+        "test('implicit name', async ({ page }) => {\n  await expect(page.locator('canvas')).toHaveScreenshot()\n})\n",
+        encoding="utf-8",
+    )
+    captures, errors = mod.extract_derived_active_captures(e2e_dir, _default_pw_snapshot_config(), {})
+    assert captures == []
+    assert any("no arguments" in e for e in errors)
+
+
+def test_extract_derived_active_captures_ignores_call_site_inside_comment(tmp_path):
+    e2e_dir = tmp_path / "tests" / "e2e"
+    e2e_dir.mkdir(parents=True)
+    spec = e2e_dir / "fixture.spec.ts"
+    spec.write_text(
+        "// example: toHaveScreenshot('fake-from-comment.png', { maxDiffPixels: 1 })\n"
+        "test('real', async ({ page }) => {\n"
+        "  await expect(page.locator('canvas')).toHaveScreenshot('real.png', { maxDiffPixels: 1 })\n"
+        "})\n",
+        encoding="utf-8",
+    )
+    captures, errors = mod.extract_derived_active_captures(e2e_dir, _default_pw_snapshot_config(), {})
+    assert errors == []
+    assert {"real.png"} == {c["screenshot_name"] for c in captures}
+
+
+def test_extract_derived_active_captures_pathtemplate_override_changes_directory(tmp_path):
+    e2e_dir = tmp_path / "tests" / "e2e"
+    e2e_dir.mkdir(parents=True)
+    spec = e2e_dir / "fixture.spec.ts"
+    spec.write_text(
+        "test('custom path template', async ({ page }) => {\n"
+        "  await expect(page.locator('canvas')).toHaveScreenshot('custom.png', {\n"
+        "    maxDiffPixels: 1,\n"
+        "    pathTemplate: '{testDir}/__custom_screenshots__/{testFilePath}/{arg}{ext}',\n"
+        "  })\n"
+        "})\n",
+        encoding="utf-8",
+    )
+    captures, errors = mod.extract_derived_active_captures(e2e_dir, _default_pw_snapshot_config(), {})
+    assert errors == []
+    assert captures[0]["directory"] == "tests/e2e/__custom_screenshots__/fixture.spec.ts/"
+
+
+def test_parse_registry_filename_to_id_extracts_mapping_from_table():
+    registry_md_text = (
+        "| id | kind | maturity | artifact/test | spec |\n"
+        "|---|---|---|---|---|\n"
+        "| timeout-overlay | screenshot-baseline | frozen | "
+        "`tests/e2e/__screenshots__/m2-combat-mvp.spec.ts/m2-timeout-overlay-baseline.png` | #1 |\n"
+        "| defeat-overlay | pixel-contract | predicate-only | `getImageData` smoke | #2 |\n"
+    )
+    mapping = mod.parse_registry_filename_to_id(registry_md_text)
+    assert mapping == {"m2-timeout-overlay-baseline.png": "timeout-overlay"}
+
+
+def test_extract_derived_active_captures_resolves_registry_id_for_raw_call_via_registry_doc(tmp_path):
+    e2e_dir = tmp_path / "tests" / "e2e"
+    e2e_dir.mkdir(parents=True)
+    spec = e2e_dir / "fixture.spec.ts"
+    spec.write_text(
+        "test('raw call with registry mapping', async ({ page }) => {\n"
+        "  await expect(page.locator('canvas')).toHaveScreenshot('mapped.png', { maxDiffPixels: 1 })\n"
+        "})\n",
+        encoding="utf-8",
+    )
+    registry_filename_to_id = {"mapped.png": "some-registry-id"}
+    captures, errors = mod.extract_derived_active_captures(
+        e2e_dir, _default_pw_snapshot_config(), {}, registry_filename_to_id
+    )
+    assert errors == []
+    assert captures[0]["registry_id"] == "some-registry-id"
 
 
 # ---------------------------------------------------------------------------
@@ -266,14 +479,27 @@ def test_extract_derived_active_captures_against_real_repo_spec_files():
     e2e_dir = REPO_ROOT / "tests" / "e2e"
     visual_utils_text = (e2e_dir / "visual-utils.ts").read_text(encoding="utf-8")
     pw_config_text = (REPO_ROOT / "playwright.config.ts").read_text(encoding="utf-8")
+    registry_doc_text = (REPO_ROOT / "docs" / "dev" / "visual-baseline-registry.md").read_text(encoding="utf-8")
     registry_maturity = mod.parse_registry_maturity(visual_utils_text)
+    registry_filename_to_id = mod.parse_registry_filename_to_id(registry_doc_text)
     pw_snapshot_config = mod.parse_playwright_snapshot_config(pw_config_text)
-    captures, errors = mod.extract_derived_active_captures(e2e_dir, pw_snapshot_config, registry_maturity)
+    captures, errors = mod.extract_derived_active_captures(
+        e2e_dir, pw_snapshot_config, registry_maturity, registry_filename_to_id
+    )
     assert errors == []
     capture_ids = {c["capture_id"] for c in captures}
     assert "m2-combat-mvp.spec.ts::m2-timeout-overlay-baseline.png" in capture_ids
     assert "m2-combat-mvp.spec.ts::m2-running-hud-baseline.png" in capture_ids
     assert "visual-overlay.spec.ts::vrt-running-hud-overlay.png" in capture_ids
+
+
+def test_parse_playwright_snapshot_config_resolves_project_fields_from_real_config():
+    pw_config_text = (REPO_ROOT / "playwright.config.ts").read_text(encoding="utf-8")
+    result = mod.parse_playwright_snapshot_config(pw_config_text)
+    assert result["browser"] == "chromium"
+    assert result["project"] == "chromium"
+    assert result["viewport"] == "1280x720"
+    assert result["device_scale_factor"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -318,3 +544,55 @@ def test_main_fails_closed_on_missing_workflow_file(tmp_path):
 )
 def test_resolve_capture_directory(template, test_dir, spec_filename, expected):
     assert mod.resolve_capture_directory(test_dir, template, spec_filename) == expected
+
+
+# ---------------------------------------------------------------------------
+# PR #1813 review fix, P1 Blocker 3 / marge condition 8 — integration test:
+# the standard e2e lane's `test-results/` VRT evidence must never be
+# clobbered by the AC9 preview-namespace lane that runs immediately after it
+# in the same job. This is asserted against playwright.config.ts's ACTUAL
+# `outputDir` formula (not a hardcoded pair of directory names), so a
+# regression that re-merges the two lanes' output directories fails this
+# test even if the literal directory names it uses happen to change.
+# ---------------------------------------------------------------------------
+def _parse_output_dir_by_lane(pw_config_text: str) -> tuple[str, str]:
+    m = re.search(
+        r"outputDir:\s*PREVIEW_NAMESPACE_LANE\s*\?\s*'([^']+)'\s*:\s*'([^']+)'",
+        pw_config_text,
+    )
+    assert m, "playwright.config.ts must declare a lane-specific outputDir (Issue #1387 P1 Blocker 3)"
+    return m.group(1), m.group(2)
+
+
+def test_preview_namespace_and_standard_lane_use_distinct_output_dirs():
+    pw_config_text = (REPO_ROOT / "playwright.config.ts").read_text(encoding="utf-8")
+    preview_dir_name, standard_dir_name = _parse_output_dir_by_lane(pw_config_text)
+    assert preview_dir_name != standard_dir_name
+
+
+def test_preview_namespace_lane_cleanup_does_not_clobber_standard_lane_artifacts(tmp_path):
+    pw_config_text = (REPO_ROOT / "playwright.config.ts").read_text(encoding="utf-8")
+    preview_dir_name, standard_dir_name = _parse_output_dir_by_lane(pw_config_text)
+
+    # Simulate the standard e2e lane having already run and left VRT evidence
+    # (actual/expected/diff PNGs on a mismatch, or just trace files) in its
+    # own outputDir.
+    standard_dir = tmp_path / standard_dir_name
+    standard_dir.mkdir()
+    marker = standard_dir / "m2-timeout-overlay-baseline-actual.png"
+    marker.write_bytes(b"standard-lane-evidence")
+
+    # Simulate Playwright's own "clean outputDir at run start" behavior for
+    # the SECOND (preview-namespace) lane that runs afterwards in the same
+    # CI job — it must only ever touch its OWN outputDir.
+    preview_dir = tmp_path / preview_dir_name
+    if preview_dir.exists():
+        shutil.rmtree(preview_dir)
+    preview_dir.mkdir()
+    (preview_dir / "some-preview-lane-file.txt").write_bytes(b"preview-lane-only")
+
+    assert marker.exists(), (
+        "preview-namespace lane cleanup clobbered the standard lane's test-results "
+        "evidence (Issue #1387 / PR #1813 review fix, P1 Blocker 3)"
+    )
+    assert marker.read_bytes() == b"standard-lane-evidence"

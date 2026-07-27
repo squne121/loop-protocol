@@ -642,25 +642,13 @@ jobs:
       # Visual regression evidence pipeline — docs/dev/visual-baseline-registry.md §5
       # Upload on success AND failure (not just failure()) so baseline evidence is
       # always retained. Uses !cancelled() (not always()) — see registry §5 for rationale.
-      # Compute a content digest of each artifact directory BEFORE upload (Issue
-      # #1387 AC2): every active VRT capture below currently shares the single
-      # job-level `test-results/` / `playwright-report/` artifact (artifact
-      # scope: job, not per-capture/per-suite) — this digest is what the
-      # per-capture summary rows reference.
-      - name: Compute VRT artifact digests
-        id: vrt-artifact-digests
-        if: ${{ !cancelled() }}
-        run: |
-          digest_of() {
-            local dir="$1"
-            if [ -d "$dir" ] && find "$dir" -type f -print -quit | grep -q .; then
-              find "$dir" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print "sha256:"$1}'
-            else
-              echo "sha256:none"
-            fi
-          }
-          echo "test_results_digest=$(digest_of test-results)" >> "$GITHUB_OUTPUT"
-          echo "playwright_report_digest=$(digest_of playwright-report)" >> "$GITHUB_OUTPUT"
+      # Artifact digest (PR #1813 review fix, P1 Blocker 4): the official
+      # `upload-artifact` `outputs.artifact-digest` is used directly (below, in
+      # the summary step env) instead of a repo-computed tree digest — a
+      # locally-computed `find | sha256sum` digest can silently diverge from
+      # what GitHub actually uploads (e.g. hidden files are excluded from
+      # upload by default but were previously included in the local `find`),
+      # so it is not a trustworthy substitute for the platform's own digest.
       - name: Upload Playwright report
         id: upload-playwright-report
         if: ${{ !cancelled() }}
@@ -818,23 +806,34 @@ jobs:
         env:
           PLAYWRIGHT_REPORT_URL: ${{ steps.upload-playwright-report.outputs.artifact-url || 'N/A' }}
           TEST_RESULTS_URL: ${{ steps.upload-test-results.outputs.artifact-url || 'N/A' }}
-          TEST_RESULTS_DIGEST: ${{ steps.vrt-artifact-digests.outputs.test_results_digest || 'sha256:none' }}
-          PLAYWRIGHT_REPORT_DIGEST: ${{ steps.vrt-artifact-digests.outputs.playwright_report_digest || 'sha256:none' }}
+          # Official GitHub `upload-artifact` digest output (PR #1813 review
+          # fix, P1 Blocker 4) — not a repo-computed tree digest.
+          TEST_RESULTS_DIGEST: ${{ steps.upload-test-results.outputs.artifact-digest || 'sha256:none' }}
+          PLAYWRIGHT_REPORT_DIGEST: ${{ steps.upload-playwright-report.outputs.artifact-digest || 'sha256:none' }}
           UPLOAD_PLAYWRIGHT_REPORT_OUTCOME: ${{ steps.upload-playwright-report.outcome }}
           UPLOAD_TEST_RESULTS_OUTCOME: ${{ steps.upload-test-results.outcome }}
+          # `outputs.artifact-id` is only populated when the step actually
+          # uploaded content (PR #1813 review fix, P1 Blocker 3) — used below
+          # instead of a post-hoc local directory scan, which can no longer
+          # be trusted once a later step in the same job reuses a
+          # differently-scoped `test-results`-named directory (see the
+          # dedicated `outputDir` split in playwright.config.ts).
+          UPLOAD_PLAYWRIGHT_REPORT_ARTIFACT_ID: ${{ steps.upload-playwright-report.outputs.artifact-id }}
+          UPLOAD_TEST_RESULTS_ARTIFACT_ID: ${{ steps.upload-test-results.outputs.artifact-id }}
         run: |
           PW_VERSION="$(node -p "require('@playwright/test/package.json').version" 2>/dev/null || echo 'unknown')"
-          # Artifact absence-state classification (Issue #1387 AC7): distinguish
-          # uploaded / no_files / step_not_run / upload_failed rather than a
-          # bare presence check.
+          # Artifact absence-state classification (Issue #1387 AC7; PR #1813
+          # review fix, P1 Blocker 3): distinguish uploaded / no_files /
+          # step_not_run / upload_failed from the upload step's own outcome +
+          # artifact-id output — not a local directory scan.
           classify_artifact_status() {
-            local outcome="$1" dir="$2"
+            local outcome="$1" artifact_id="$2"
             if [ "$outcome" = "skipped" ]; then
               echo "step_not_run"
             elif [ "$outcome" = "failure" ]; then
               echo "upload_failed"
             elif [ "$outcome" = "success" ]; then
-              if [ -d "$dir" ] && find "$dir" -type f -print -quit 2>/dev/null | grep -q .; then
+              if [ -n "$artifact_id" ]; then
                 echo "uploaded"
               else
                 echo "no_files"
@@ -843,8 +842,8 @@ jobs:
               echo "step_not_run"
             fi
           }
-          TEST_RESULTS_STATE="$(classify_artifact_status "$UPLOAD_TEST_RESULTS_OUTCOME" test-results)"
-          PLAYWRIGHT_REPORT_STATE="$(classify_artifact_status "$UPLOAD_PLAYWRIGHT_REPORT_OUTCOME" playwright-report)"
+          TEST_RESULTS_STATE="$(classify_artifact_status "$UPLOAD_TEST_RESULTS_OUTCOME" "$UPLOAD_TEST_RESULTS_ARTIFACT_ID")"
+          PLAYWRIGHT_REPORT_STATE="$(classify_artifact_status "$UPLOAD_PLAYWRIGHT_REPORT_OUTCOME" "$UPLOAD_PLAYWRIGHT_REPORT_ARTIFACT_ID")"
           {
             echo "## CI Runtime Baseline: ${{ github.job }}"
             echo ""
@@ -874,8 +873,6 @@ jobs:
             echo "- viewport: 1280x720"
             echo "- deviceScaleFactor: 1 (Desktop Chrome default; not overridden)"
             echo "- snapshotPathTemplate: {testDir}/__screenshots__/{testFilePath}/{arg}{ext}"
-            echo "- baseline path: tests/e2e/__screenshots__/m2-combat-mvp.spec.ts/"
-            echo "- screenshot options: animations=disabled, maxDiffPixels=1"
             echo ""
             echo "### Artifacts"
             echo "- playwright-report: ${PLAYWRIGHT_REPORT_URL} (status: ${PLAYWRIGHT_REPORT_STATE}, digest: ${PLAYWRIGHT_REPORT_DIGEST})"
@@ -891,8 +888,10 @@ jobs:
             echo "### Active VRT captures"
             echo ""
             echo "Each row below is one active capture (an individual toHaveScreenshot() /"
-            echo "expectDomOverlayScreenshot() call site) — not a suite. Cross-validated against"
-            echo "the real spec sources by scripts/check-visual-artifact-pipeline.py (Issue #1387)."
+            echo "expectDomOverlayScreenshot() / expectCanvasVisualCueScreenshot() call site) —"
+            echo "not a suite. There is no separate suite-level fingerprint (PR #1813 review"
+            echo "fix, P1 Blocker 2) — every field below is cross-validated against the real"
+            echo "spec sources by scripts/check-visual-artifact-pipeline.py (Issue #1387)."
             echo "| capture_id | screenshot directory | browser | project | viewport | DPR | comparator | stylePath | artifact scope | artifact URL | digest | retention (days) |"
             echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
             TEST_RESULTS_URL="$TEST_RESULTS_URL" TEST_RESULTS_DIGEST="$TEST_RESULTS_DIGEST" python3 - <<'PY'
@@ -901,9 +900,11 @@ jobs:
           # Single source of truth for the per-capture fingerprint this
           # summary echoes (Issue #1387). scripts/check-visual-artifact-pipeline.py
           # parses this exact literal (between the BEGIN/END markers) and
-          # cross-validates it against a fresh, independent derivation from
-          # tests/e2e/*.spec.ts / playwright.config.ts / visual-utils.ts — so
-          # this list drifting from the real spec sources is a hard CI fail.
+          # cross-validates EVERY field against a fresh, independent
+          # derivation from tests/e2e/*.spec.ts / playwright.config.ts /
+          # tests/e2e/visual-utils.ts / docs/dev/visual-baseline-registry.md
+          # (PR #1813 review fix, P1 Blocker 1) — so this list drifting from
+          # the real spec sources in ANY field is a hard CI fail.
           CAPTURES = [
               {
                   "capture_id": "m2-combat-mvp.spec.ts::m2-timeout-overlay-baseline.png",
