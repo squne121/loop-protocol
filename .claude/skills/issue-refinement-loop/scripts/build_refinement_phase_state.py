@@ -52,6 +52,21 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+# Issue #1755 fix_delta (OWNER REQUEST_CHANGES, PR #1826) P0: the review-phase
+# gate must re-invoke the REAL validator (review_compact.validate_intermediate_v1
+# / emit_parent_review_envelope_v2.build_validate_intermediate_result()) against
+# the ACTUAL --source-path bytes and compare its full output against the
+# caller-supplied validation result, instead of only checking individual
+# fields in isolation (which a hand-crafted "forged receipt" can always
+# satisfy without ever having passed through the real validator). This module
+# only READS these sibling scripts (never modifies them -- both are Out of
+# Scope per Issue #1755's Stop Conditions).
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+import emit_parent_review_envelope_v2 as _emit2  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Phase definitions
 # ---------------------------------------------------------------------------
@@ -113,6 +128,35 @@ _REVIEW_VALIDATION_COMPACT_ARTIFACT_PREFIX = "compact_review_result_v1="
 _REVIEW_VALIDATION_ARTIFACT_ISSUE_SEGMENT_RE = re.compile(
     r"^\.claude/artifacts/issue-refinement-loop/(?P<segment>[0-9]+|unknown)/"
 )
+
+# Issue #1755 fix_delta P2-1/P2-5: the exact top-level key set of
+# REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1
+# (build_validate_intermediate_result()'s return shape). Any additional
+# top-level key in a caller-supplied validation result is rejected
+# fail-closed.
+_REVIEW_VALIDATION_KNOWN_KEYS = frozenset(
+    {
+        "schema",
+        "schema_version",
+        "validation_status",
+        "envelope_kind",
+        "input_sha256",
+        "input_byte_count",
+        "normalized_payload",
+        "canonical_reviewer_blocker_claim",
+        "violations",
+    }
+)
+
+# Issue #1755 fix_delta P2-2: bounded-read caps. --source-path (in the review
+# gate) is bound to the SAME MAX_INPUT_BYTES cap the intermediate validator
+# itself enforces (emit_parent_review_envelope_v2.py), so a caller can never
+# smuggle an oversized child stdout past the input_sha256/input_byte_count
+# checks by relying on an unbounded read here. --review-validation-result-path
+# is a small, structured JSON receipt; 64 KiB is a generous-but-bounded cap
+# (never an unbounded read).
+_REVIEW_VALIDATION_SOURCE_MAX_BYTES = _emit2.MAX_INPUT_BYTES
+_REVIEW_VALIDATION_RESULT_MAX_BYTES = 65536
 
 # Router name constants
 ROUTER_DECIDE_NEXT_LOOP_ACTION = "decide_next_loop_action.py"
@@ -238,8 +282,49 @@ def _reject_nonfinite_json(token: str) -> None:
     raise ValueError(f"Non-finite JSON constant rejected: {token}")
 
 
+def _reject_duplicate_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Issue #1755 fix_delta P2-1: reject duplicate JSON object member names.
+
+    `object_pairs_hook` is invoked by `json.loads()` for EVERY JSON object it
+    parses, at every nesting level -- so this rejects duplicate keys in the
+    top-level object AND in any nested object (e.g.
+    `normalized_payload`), not just the outermost one."""
+    seen: set[str] = set()
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate JSON object key rejected: {key!r}")
+        seen.add(key)
+        result[key] = value
+    return result
+
+
 def _strict_json_loads(text: str) -> dict[str, Any]:
-    return json.loads(text, parse_constant=_reject_nonfinite_json)
+    return json.loads(
+        text,
+        parse_constant=_reject_nonfinite_json,
+        object_pairs_hook=_reject_duplicate_object_keys,
+    )
+
+
+def _read_bytes_bounded(path: str, *, max_bytes: int, label: str) -> bytes:
+    """Issue #1755 fix_delta P2-2: bounded byte read. Never reads more than
+    `max_bytes + 1` bytes into memory before failing closed on an oversized
+    input -- the size bound is enforced BEFORE any content is trusted, not
+    just checked against a claimed size after an unbounded read."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(max_bytes + 1)
+    except FileNotFoundError as exc:
+        raise ValueError(f"{label} not found: {path}") from exc
+    except OSError as exc:
+        raise ValueError(f"{label} unable to read {path!r}: {exc}") from exc
+    if len(data) > max_bytes:
+        raise ValueError(
+            f"{label} exceeds bounded-read max_bytes={max_bytes} limit "
+            f"(refusing to trust an oversized input): {path}"
+        )
+    return data
 
 
 def _validate_json_input(path: str | None, *, label: str) -> None:
@@ -281,7 +366,7 @@ def _validate_review_validation_gate(
     source_path: str,
     review_validation_result_path: Optional[str],
     issue_number: Optional[int],
-) -> None:
+) -> Optional[dict[str, Any]]:
     """Issue #1507 AC24 / Issue #1755 AC2-AC5: structural enforcement of the
     SKILL.md Step 2 validator-first mandate for the review phase, bound to
     the child-intermediate validator (`review_compact.validate_intermediate_v1`)
@@ -291,25 +376,43 @@ def _validate_review_validation_gate(
       - the gate applies (phase == "review" and
         source_kind == "issue_review_result_compact_v1") but
         --review-validation-result-path or --issue-number was not supplied
-      - the referenced file does not exist / is not valid JSON
+      - --issue-number is not a positive integer (Issue #1755 fix_delta P3)
+      - the referenced file does not exist / is not valid JSON / exceeds the
+        bounded-read size cap / carries an unknown top-level field
       - `schema` is the legacy `REVIEW_COMPACT_VALIDATION_RESULT_V1` literal
         or anything other than `REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1`
       - `schema_version != "1"`
       - `validation_status != "valid"`
       - `envelope_kind` is not one of {"approve", "needs_fix_intermediate"}
       - `violations` is not an empty list
+      - `input_byte_count` does not match the ACTUAL number of bytes read
+        from `--source-path` (Issue #1755 fix_delta P2-2)
       - the SHA256 recomputed from `--source-path`'s actual bytes does not
         match the validation result's `input_sha256` (stale / cross-input
         receipt rejection)
       - `normalized_payload.ARTIFACT`'s issue-number segment does not match
         `--issue-number` (cross-issue receipt rejection)
+      - (Issue #1755 fix_delta P0) the validation result, taken as a whole,
+        does not EXACTLY match the result of re-running the REAL
+        `review_compact.validate_intermediate_v1` validator
+        (`emit_parent_review_envelope_v2.build_validate_intermediate_result()`)
+        against `--source-path`'s actual bytes and `--issue-number` -- this is
+        the final closing check: every individual field check above can be
+        satisfied by a hand-crafted "forged receipt" that never actually
+        passed through the real validator (e.g. a syntactically-invalid raw
+        source paired with a receipt that merely CLAIMS `validation_status:
+        valid`, or a receipt whose `normalized_payload` /
+        `canonical_reviewer_blocker_claim` was fabricated rather than
+        produced by the validator); only re-deriving the expected result from
+        the SAME trusted producer function and requiring an exact match
+        closes that gap.
     """
     gate_applies = (
         phase == _REVIEW_VALIDATION_GATED_PHASE
         and source_kind == _REVIEW_VALIDATION_GATED_SOURCE_KIND
     )
     if not gate_applies:
-        return
+        return None
 
     if not review_validation_result_path:
         raise ValueError(
@@ -325,18 +428,56 @@ def _validate_review_validation_gate(
             "(Issue #1755 AC5 issue-number binding gate)"
         )
 
-    try:
-        validation_payload = _strict_json_loads(
-            Path(review_validation_result_path).read_text(encoding="utf-8")
-        )
-    except FileNotFoundError as exc:
+    # Issue #1755 fix_delta P3: enforce the positive-integer constraint
+    # inside the gate function itself, not only at the argparse layer --
+    # closes the bypass available to a direct build_phase_state() caller.
+    if issue_number <= 0:
         raise ValueError(
-            f"review_validation_result_path not found: {review_validation_result_path}"
+            f"--issue-number must be a positive integer, got {issue_number!r} "
+            "(Issue #1755 fix_delta P3 gate-internal enforcement)"
+        )
+
+    # Issue #1755 fix_delta P2-2: bounded read (never unbounded) before any
+    # content is trusted.
+    validation_bytes = _read_bytes_bounded(
+        review_validation_result_path,
+        max_bytes=_REVIEW_VALIDATION_RESULT_MAX_BYTES,
+        label="review_validation_result_path",
+    )
+    try:
+        validation_text = validation_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"review_validation_result_path utf-8 decode error: {exc}"
         ) from exc
+    try:
+        validation_payload = _strict_json_loads(validation_text)
     except json.JSONDecodeError as exc:
         raise ValueError(
             f"review_validation_result_path json decode error: {exc}"
         ) from exc
+    except ValueError as exc:
+        raise ValueError(
+            f"review_validation_result_path strict json validation error: {exc}"
+        ) from exc
+
+    if not isinstance(validation_payload, dict):
+        raise ValueError(
+            "review_validation_result_path must contain a JSON object, got "
+            f"{type(validation_payload).__name__}"
+        )
+
+    # Issue #1755 fix_delta P2-5: reject any top-level field this schema does
+    # not define (a forged receipt padded with extra fields is rejected here,
+    # and would also be caught by the P0 full round-trip check below).
+    unknown_top_keys = set(validation_payload.keys()) - _REVIEW_VALIDATION_KNOWN_KEYS
+    if unknown_top_keys:
+        raise ValueError(
+            "review_validation_result_path carries unknown top-level "
+            f"field(s) {sorted(unknown_top_keys)} "
+            "(Issue #1755 fix_delta P2: unknown_field rejected; "
+            "phase-state was NOT generated)"
+        )
 
     schema = validation_payload.get("schema")
     if schema == _REVIEW_VALIDATION_LEGACY_SCHEMA:
@@ -391,15 +532,30 @@ def _validate_review_validation_gate(
             "phase-state was NOT generated)"
         )
 
-    # Issue #1755 AC4: bind the validation result to the ACTUAL bytes of
-    # --source-path (never trust the caller-supplied input_sha256 alone --
-    # stale / different-input validation results must be rejected).
-    try:
-        source_bytes = Path(source_path).read_bytes()
-    except FileNotFoundError as exc:
+    # Issue #1755 AC4 / fix_delta P2-2: bind the validation result to the
+    # ACTUAL bytes of --source-path (never trust the caller-supplied
+    # input_sha256 alone -- stale / different-input validation results must
+    # be rejected). Bounded to the SAME MAX_INPUT_BYTES cap the intermediate
+    # validator itself enforces.
+    source_bytes = _read_bytes_bounded(
+        source_path,
+        max_bytes=_REVIEW_VALIDATION_SOURCE_MAX_BYTES,
+        label="source_path",
+    )
+
+    # Issue #1755 fix_delta P2-2: input_byte_count must match the ACTUAL
+    # number of bytes read from --source-path (a forged receipt cannot claim
+    # a byte count disjoint from what --source-path actually contains).
+    input_byte_count = validation_payload.get("input_byte_count")
+    if input_byte_count != len(source_bytes):
         raise ValueError(
-            f"source_path not found for input_sha256 binding check: {source_path}"
-        ) from exc
+            "review_validation_result_path input_byte_count mismatch: "
+            f"validation result claims {input_byte_count!r}, actual "
+            f"{len(source_bytes)} bytes read from --source-path "
+            "(Issue #1755 fix_delta P2-2 fail-closed: input_byte_count bound "
+            "to --source-path's actual bytes; phase-state was NOT generated)"
+        )
+
     recomputed_sha256 = f"sha256:{hashlib.sha256(source_bytes).hexdigest()}"
     input_sha256 = validation_payload.get("input_sha256")
     if input_sha256 != recomputed_sha256:
@@ -440,6 +596,43 @@ def _validate_review_validation_gate(
             "(Issue #1755 AC5 fail-closed: cross-issue receipt rejected; "
             "phase-state was NOT generated)"
         )
+
+    # Issue #1755 fix_delta P0 (OWNER REQUEST_CHANGES, PR #1826): the
+    # closing check. Re-run the REAL validator
+    # (review_compact.validate_intermediate_v1 /
+    # emit_parent_review_envelope_v2.build_validate_intermediate_result())
+    # against --source-path's ACTUAL bytes and --issue-number, and require an
+    # EXACT match (dict equality -- order-independent, i.e. "normalized")
+    # against the caller-supplied validation_payload. Every check above can
+    # be satisfied by a hand-crafted payload that never actually passed
+    # through the real validator; this is the only check that cannot be
+    # forged without also reproducing the real validator's exact output.
+    expected_result = _emit2.build_validate_intermediate_result(
+        source_bytes, issue_number=issue_number
+    )
+    if validation_payload != expected_result:
+        differing_keys = sorted(
+            key
+            for key in set(validation_payload) | set(expected_result)
+            if validation_payload.get(key) != expected_result.get(key)
+        )
+        raise ValueError(
+            "review_validation_result_path does not match the REAL "
+            "review_compact.validate_intermediate_v1 output recomputed from "
+            "--source-path's actual bytes and --issue-number (forged / "
+            f"stale receipt rejected; differing field(s): {differing_keys}) "
+            "(Issue #1755 fix_delta P0 fail-closed gate; phase-state was NOT "
+            "generated)"
+        )
+
+    # Issue #1755 fix_delta P2-4: return the review-validation binding
+    # metadata so build_phase_state() can persist it in the phase-state
+    # output (source_sha256 / source_byte_count), instead of discarding it
+    # once this gate function returns.
+    return {
+        "source_sha256": recomputed_sha256,
+        "source_byte_count": len(source_bytes),
+    }
 
 
 def build_phase_state(
@@ -502,8 +695,10 @@ def build_phase_state(
     # Issue #1507 AC24: review-phase validator-first structural gate.
     # Raises ValueError (fail-closed) BEFORE the phase-state dict is built,
     # so no output is ever written for a missing/invalid/non-valid
-    # validation result.
-    _validate_review_validation_gate(
+    # validation result. Issue #1755 fix_delta P2-4: when the gate applies,
+    # it also returns the source_sha256/source_byte_count binding metadata
+    # to persist in the phase-state output below.
+    _review_validation_binding = _validate_review_validation_gate(
         phase, source_kind, source_path, review_validation_result_path, issue_number
     )
 
@@ -521,6 +716,22 @@ def build_phase_state(
         "allowed_routers": list(rules["allowed_routers"]),
         "forbidden_routers": list(rules["forbidden_routers"]),
         "scope_signal_semantics": dict(rules["scope_signal_semantics"]),
+        # Issue #1755 fix_delta P2-4: persist the review-validation binding
+        # (SHA256 / byte-count of --source-path, and the active
+        # --issue-number) in the phase-state itself. All three are None when
+        # the review-validation gate does not apply (any phase other than
+        # "review" combined with source_kind "issue_review_result_compact_v1").
+        "source_sha256": (
+            _review_validation_binding["source_sha256"]
+            if _review_validation_binding is not None
+            else None
+        ),
+        "source_byte_count": (
+            _review_validation_binding["source_byte_count"]
+            if _review_validation_binding is not None
+            else None
+        ),
+        "issue_number": issue_number,
     }
 
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import subprocess
 import sys
@@ -13,6 +12,31 @@ SCRIPTS_DIR = SKILL_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import build_refinement_phase_state as phase_state_builder  # noqa: E402
+import emit_parent_review_envelope_v2 as _emit2  # noqa: E402
+
+
+def _real_approve_child_bytes(issue_number: int) -> bytes:
+    """Issue #1755 fix_delta P0 (OWNER REQUEST_CHANGES, PR #1826): a REAL,
+    grammar-valid 8-line child-intermediate approve envelope (the exact shape
+    `review_compact.validate_intermediate_v1` accepts), used so a genuine
+    receipt can be produced by actually RUNNING the real validator against
+    these bytes -- the review-phase gate now re-runs this same validator and
+    rejects any hand-crafted receipt that does not match its output."""
+    artifact_path = (
+        f".claude/artifacts/issue-refinement-loop/{issue_number}/"
+        "compact_review_result_20260728T000000Z.json"
+    )
+    lines = [
+        "STATUS: ok",
+        "VERDICT: approve",
+        "SUMMARY: contract ready",
+        "BLOCKERS: 0",
+        "NEXT_ACTION: proceed",
+        "MUST_READ: ",
+        f"EVIDENCE: {artifact_path}",
+        f"ARTIFACT: compact_review_result_v1={artifact_path}",
+    ]
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 def test_build_refinement_phase_state_rejects_nan_on_write(tmp_path, monkeypatch):
@@ -53,36 +77,34 @@ def test_build_refinement_phase_state_rejects_nan_on_write(tmp_path, monkeypatch
 
 
 def test_build_refinement_phase_state_cli_writes_strict_json(tmp_path):
-    """GIVEN normal CLI usage WHEN output written THEN file contains parseable strict JSON."""
+    """GIVEN normal CLI usage WHEN output written THEN file contains parseable strict JSON.
+
+    Issue #1755 fix_delta P0 (OWNER REQUEST_CHANGES, PR #1826): the
+    review-phase gate now re-runs the REAL
+    review_compact.validate_intermediate_v1 validator against --source-path's
+    actual bytes and rejects any validation result that does not match its
+    output exactly. This test therefore uses a REAL, grammar-valid child
+    intermediate approve envelope as --source-path content, and produces the
+    validation result by actually invoking the real validator function
+    (never a hand-crafted "claimed valid" payload)."""
     source_path = tmp_path / "source.json"
+    # Issue #1755 fix_delta: --source-path is now bound to REAL child
+    # intermediate text (not JSON), so --review-result-path (a separate,
+    # generically strict-JSON-validated argument) needs its OWN valid-JSON
+    # file rather than reusing source_path.
+    review_result_path = tmp_path / "review_result.json"
     output_path = tmp_path / "phase_state.json"
     validation_path = tmp_path / "validation.json"
-    source_bytes = b"{}"
+    issue_number = 1755
+    source_bytes = _real_approve_child_bytes(issue_number)
     source_path.write_bytes(source_bytes)
-    input_sha256 = f"sha256:{hashlib.sha256(source_bytes).hexdigest()}"
+    review_result_path.write_text("{}", encoding="utf-8")
+    validation_result = _emit2.build_validate_intermediate_result(
+        source_bytes, issue_number=issue_number
+    )
+    assert validation_result["validation_status"] == "valid", validation_result
     validation_path.write_text(
-        json.dumps(
-            {
-                # Issue #1755 AC2-AC5: schema/schema_version/envelope_kind/
-                # violations/input_sha256/normalized_payload.ARTIFACT bound
-                # to --source-path bytes and --issue-number.
-                "schema": "REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1",
-                "schema_version": "1",
-                "validation_status": "valid",
-                "envelope_kind": "approve",
-                "input_sha256": input_sha256,
-                "input_byte_count": len(source_bytes),
-                "normalized_payload": {
-                    "ARTIFACT": (
-                        "compact_review_result_v1="
-                        ".claude/artifacts/issue-refinement-loop/1755/"
-                        "compact_review_result_fixture.json"
-                    ),
-                },
-                "canonical_reviewer_blocker_claim": None,
-                "violations": [],
-            }
-        ),
+        json.dumps(validation_result),
         encoding="utf-8",
     )
 
@@ -97,7 +119,7 @@ def test_build_refinement_phase_state_cli_writes_strict_json(tmp_path):
             "--source-path",
             str(source_path),
             "--review-result-path",
-            str(source_path),
+            str(review_result_path),
             # Issue #1507 AC24 / Issue #1755: required for --phase review +
             # --source-kind issue_review_result_compact_v1.
             "--review-validation-result-path",
