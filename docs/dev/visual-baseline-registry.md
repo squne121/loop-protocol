@@ -232,17 +232,20 @@ capture 内で表示される要素構成が変化し、`running-hud-overlay-leg
   （`docs/dev/visual-baseline-registry.md`）は Issue #1374 契約の元の Allowed Paths に
   含まれていなかったため、本更新は Issue #1374 に対する Scope Delta として Allowed Paths を
   拡張した上で行う（人間承認: Issue #1374 実装ループ内, PR #1815 iteration 3 対応）。
-- **evidence**: PR #1815（`worktree-issue-1374-phase-screen-overlay`）。`test-results/` の
-  `*-actual.png` / `*-diff.png` で差分を目視確認した上で baseline を再生成した
-  （`playwright test tests/e2e/visual-overlay.spec.ts --update-snapshots`）。再生成後は
-  同一コマンドの非 update 実行で PASS することを確認済み。
+- **evidence**: PR #1815（`worktree-issue-1374-phase-screen-overlay`）。ローカル worktree 環境で
+  一度 `playwright test tests/e2e/visual-overlay.spec.ts --update-snapshots` により baseline を
+  再生成したが、CI（GitHub Actions ubuntu runner）で実行した際に font-rasterization 差（ローカル
+  Linux 環境と CI runner 間のフォント fallback 差）に起因すると見られる追加 diff（約 11000px 台）
+  が再発した。そのため、CI 実行結果の `test-results` artifact（run id `30256680928`,
+  job id `89946808958`）から `vrt-running-hud-overlay-actual.png` を取得し、これを最終 baseline
+  として採用した（CI 環境自身が描画した画像を人間承認済みの Scope Delta commit として反映する運用。
+  CI が自動で baseline を書き換えるわけではない — §4「自動更新の禁止」に抵触しない）。
 - **maturity**: 変更なし（`legacy-current` のまま）。`frozen` 化条件（#1375/#1376/#1377
   マージ後）は本更新の対象外。
-- **environment fingerprint**: 本更新はローカル worktree 環境（Linux, Chromium,
-  Playwright config 既定 viewport, `tests/e2e/visual.freeze.css` の generic
-  `sans-serif` 固定込み）で生成した。CI 環境（GitHub Actions ubuntu runner）との
-  fingerprint 一致は、本 PR の CI `e2e` job の実行結果で確認する
-  （§5 の summary step 参照）。差異が生じた場合は追加の baseline 再生成が必要になる。
+- **environment fingerprint**: 最終的に採用した baseline は CI 実行環境（GitHub Actions ubuntu
+  runner, Chromium, Playwright config 既定 viewport, `tests/e2e/visual.freeze.css` の generic
+  `sans-serif` 固定込み, run id `30256680928`）で生成された画像そのものである。以降の CI 再実行
+  （同一コミット・同一 runner image 前提）でこの baseline との一致が期待される。
 
 ## 4. baseline update policy（更新ポリシー）
 
