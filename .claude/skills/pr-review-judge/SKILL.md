@@ -139,16 +139,19 @@ merge_ready は impl-review-loop の終端条件。
 pr-reviewer（本 SubAgent）は `Edit`/`Write`/`MultiEdit` を持たず、Bash 経由のファイル書き込みも禁止されている（`disallowedTools`）。そのため `PR_REVIEW_PUBLISH_REQUEST_V1` の JSON（`body_sha256` / `idempotency_key` / `producer_role` を含む）を自ら組み立てて `--input-file` に渡すことはできない（Issue #1539 fix_delta Blocker 1）。
 
 - pr-reviewer は verdict 本文（`LOOP_VERDICT_V2` フェンス YAML を含む Markdown）と `verdict` / `merge_ready` / `reviewed_head_sha` を構造化出力として **呼び出し元（impl-review-loop control-plane）に返すのみ**。JSON の組み立て・ハッシュ計算・`producer_role` の付与は行わない。
-- 呼び出し元（Write ツールを持つ trusted orchestrator）が、pr-reviewer の返した本文テキストをそのまま `artifacts/<PR番号>/issue-metadata/pr_review.publish/<name>.md` に書き込み（本文のみ。ハッシュや schema は含まない）、controlled review publisher を **render mode** で起動する。呼び出しコマンド例:
+- 呼び出し元（Write ツールを持つ trusted orchestrator）が、pr-reviewer の返した本文テキストをそのまま `artifacts/<紐づく Issue番号>/issue-metadata/pr_review.publish/<name>.md` に書き込み（本文のみ。ハッシュや schema は含まない）、controlled review publisher を **render mode** で起動する。呼び出しコマンド例:
 
 ```bash
 uv run --locked python3 scripts/agent-guards/controlled_skill_mutation_exec.py \
-  --command-id pr_review.publish --issue-number <PR番号> --repo <owner>/<repo> \
+  --command-id pr_review.publish --issue-number <紐づく Issue 番号> \
+  --pr-number <PR番号> --repo <owner>/<repo> \
   --render-body-file <本文テキストのパス> \
   --verdict <APPROVE または REQUEST_CHANGES または COMMENT のいずれか> \
   --reviewed-head-sha <SHA> --expected-head-sha <SHA> \
   [--merge-ready] --json
 ```
+
+`--issue-number`（紐づく Issue）と `--pr-number`（レビュー対象の PR）は独立した識別子であり、必ずしも一致しない（例: Issue #1688 に対する PR #1818）。artifact subtree のパス（`artifacts/<Issue番号>/issue-metadata/pr_review.publish/`）は常に `--issue-number` を基準にし、GitHub への投稿先・idempotency key（`repo:pr_number:expected_head_sha:body_sha256`）は常に `--pr-number` を基準にする（Issue #1822）。
 
 - render mode の executor（trusted bridge）は `body_sha256` / `idempotency_key` を自前で再計算し、`producer_role: pr-reviewer` と `event: COMMENT` を自ら固定する（入力からは受け取らない）。本文中の `LOOP_VERDICT_V2.verdict` / `merge_ready` が CLI で宣言した値と一致しない場合は投稿前に fail-closed で拒否する。
 - publisher が `expected_head_sha` を GitHub REST API の `commit_id` へ拘束し、投稿前 stale 検出・投稿後 readback・idempotency marker 判定・投稿後の current-head 再検証（TOCTOU close-out）を行う（詳細: `scripts/agent-guards/controlled_skill_mutation_policy.py` / `_exec.py`）
