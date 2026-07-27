@@ -13,6 +13,7 @@ import os
 import re
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -105,6 +106,33 @@ INITIAL_BRANCH_CREATE_STATUS_TRANSPORT_ERROR_ABSENT = "transport_error_remote_ab
 INITIAL_BRANCH_CREATE_STATUS_READBACK_MISMATCH = "readback_mismatch"
 INITIAL_BRANCH_CREATE_STATUS_READBACK_UNAVAILABLE = "readback_unavailable"
 INITIAL_BRANCH_CREATE_STATUS_DENIED = "denied"
+
+# Issue #1688 fix delta (P0 EVENT-BOUNDARY-01 / no_caller_authentication_on_
+# mutation_executing_cli): the two lanes that perform a real remote write as
+# a side effect of classification -- existing_branch_update
+# (`execute_existing_branch_update_transaction`, gated by the CLI's
+# `--execute-existing-branch-update` flag) and initial_branch_create
+# (`execute_initial_branch_create_transaction`, always attempted once the
+# `--force-with-lease=` argv shape and every precondition above it match) --
+# MUST NOT execute unless `boundary_layer` identifies one of the two known
+# trusted PreToolUse-equivalent callers below. This is a second, independent
+# layer of defense behind the hook adapter's own `eventName === 'PreToolUse'`
+# gate (scripts/session-recording/codex-hook-adapter.mjs) -- it is not a
+# cryptographic caller-authentication scheme (a `--boundary-layer
+# codex_hook_adapter_pretooluse` string is not a secret), but it does close
+# the concrete PermissionRequest-mutates-remote hole and gives a fail-closed
+# default for any other/unknown boundary_layer value (including a bare
+# terminal invocation of this CLI).
+#   - "worktree_scope_guard_denied": the default used by
+#     scripts/agent-guards/worktree_scope_guard.py, the Claude Code
+#     PreToolUse-equivalent trusted in-process caller (Issue #1449).
+#   - "codex_hook_adapter_pretooluse": the Codex `PreToolUse` hook adapter
+#     (Issue #1408 / #1688). The adapter never passes this value for a
+#     `PermissionRequest` event.
+_AUTHORIZED_EXECUTION_BOUNDARY_LAYERS = frozenset(
+    {"worktree_scope_guard_denied", "codex_hook_adapter_pretooluse"}
+)
+EXECUTION_NOT_AUTHORIZED_FOR_BOUNDARY_LAYER = "execution_not_authorized_for_boundary_layer"
 
 
 @dataclass(frozen=True)
@@ -850,14 +878,50 @@ def execute_initial_branch_create_transaction(
     )
 
 
+# Issue #1688 fix delta (P0 nested_timeout_mismatch): this is the ONE place
+# that owns an absolute wall-clock budget for the whole existing-branch
+# probe -> push -> readback transaction. The hook adapter's own subprocess
+# timeout (`EXISTING_BRANCH_PUBLISH_LANE_TIMEOUT_MS` in
+# scripts/session-recording/codex-hook-adapter.mjs) is deliberately set
+# larger than this, with margin, and stays under the `.codex/hooks.json`
+# 30s hook-wide budget -- so this function should always be able to return a
+# structured result of its own before any external SIGTERM ever arrives.
+_EXISTING_BRANCH_UPDATE_DEADLINE_SECONDS = 20.0
+# Floor timeout for the one readback attempt performed when the deadline has
+# already been exhausted -- never skip the readback outright.
+_EXISTING_BRANCH_UPDATE_MIN_READBACK_TIMEOUT_SECONDS = 3
+
+EXISTING_BRANCH_UPDATE_STATUS_COMPLETED = "completed"
+EXISTING_BRANCH_UPDATE_STATUS_DENIED = "denied"
+# Issue #1688 fix delta (P0 nested_timeout_mismatch): a distinct, structured
+# outcome bucket -- never silently folded into "completed" (P1
+# transport_error_conflated_with_own_success) or into a bare crash/hang.
+EXISTING_BRANCH_UPDATE_STATUS_INDETERMINATE_TIMEOUT = "indeterminate_timeout"
+
+EXISTING_BRANCH_UPDATE_REASON_COMPLETED = "existing_branch_update_completed"
+# Issue #1688 fix delta (P1 transport_error_conflated_with_own_success): used
+# ONLY when a transport error / timeout occurred during the push attempt
+# itself but a subsequent readback happens to match -- this proves the
+# remote ref matches, but NOT that this process's own push (as opposed to a
+# concurrent/prior write) is what put it there. Never reported as
+# `existing_branch_update_completed`.
+EXISTING_BRANCH_UPDATE_REASON_TRANSPORT_ERROR_VERIFIED = "existing_branch_update_transport_error_but_verified"
+EXISTING_BRANCH_UPDATE_REASON_DEADLINE_EXCEEDED = "existing_branch_update_deadline_exceeded"
+EXISTING_BRANCH_UPDATE_REASON_DEADLINE_EXCEEDED_VERIFIED = "existing_branch_update_deadline_exceeded_but_verified"
+
+
 @dataclass(frozen=True)
 class ExistingBranchUpdateTransactionResult:
     """Bounded existing-branch update outcome for Issue #1688.
 
     The outer terminal command is denied by the hook after this result is
-    produced.  Therefore a successful result proves exactly one in-process
-    push attempt followed by a fresh readback, rather than authorizing a
-    second ambient shell push.
+    produced.  Therefore a `completed` result proves exactly one in-process
+    push attempt (observed return code 0) followed by a matching readback,
+    rather than authorizing a second ambient shell push.
+    `indeterminate_timeout` means the transaction's own deadline was
+    exhausted, or a transport error occurred during the push -- `reason_code`
+    distinguishes whether a readback happened to confirm a matching remote
+    ref (which does NOT prove this process caused it) from one that did not.
     """
 
     status: str
@@ -867,31 +931,101 @@ class ExistingBranchUpdateTransactionResult:
 
 
 def execute_existing_branch_update_transaction(
-    cwd: str, target_branch: str, expected_remote_head: str, verified_local_head: str, timeout: int = 30
+    cwd: str,
+    target_branch: str,
+    expected_remote_head: str,
+    verified_local_head: str,
+    timeout: int = 30,
+    deadline_seconds: float = _EXISTING_BRANCH_UPDATE_DEADLINE_SECONDS,
 ) -> ExistingBranchUpdateTransactionResult:
     """Verify -> push once -> read back an existing remote branch.
 
     The supplied SHA is embedded into the in-process argv instead of relying
     on a later `HEAD` resolution.  This narrows the check-to-push race while
-    staying within the trusted-local model; it is not distributed exactly-once
-    or host attestation.
+    staying within the trusted-local model; it is not distributed
+    exactly-once or host attestation -- a probe-to-push race window remains
+    (Issue #1688 fix delta P1 no_cas_at_write_time_toctou_undocumented): a
+    concurrent update landing between the probe above and the push below is
+    not detected by a strict compare-and-swap, but the plain (non-force)
+    `git push` still fails closed on a non-fast-forward rejection (git's own
+    receive-side check) rather than silently overwriting the concurrent
+    write -- see `test_concurrent_remote_update_is_not_overwritten`.
+
+    `deadline_seconds` bounds the WHOLE transaction (remaining checks, the
+    push attempt, and the final readback) with a single absolute wall-clock
+    budget owned by this function (Issue #1688 fix delta P0
+    nested_timeout_mismatch) -- never left to an uncoordinated per-subprocess
+    `timeout` value that could, in aggregate, exceed the caller's own
+    timeout.
     """
+    deadline_start = time.monotonic()
+
+    def _remaining_seconds() -> float:
+        return deadline_seconds - (time.monotonic() - deadline_start)
+
+    def _bounded_timeout(default: int) -> int:
+        remaining = _remaining_seconds()
+        if remaining <= 0:
+            return 1
+        return max(1, min(default, int(remaining)))
+
     push_url, url_reason = resolve_single_push_url(cwd, remote="origin")
     if push_url is None:
-        return ExistingBranchUpdateTransactionResult("denied", url_reason, None, None)
+        return ExistingBranchUpdateTransactionResult(EXISTING_BRANCH_UPDATE_STATUS_DENIED, url_reason, None, None)
     if _current_branch(cwd) != target_branch:
-        return ExistingBranchUpdateTransactionResult("denied", "branch_mismatch", None, None)
+        return ExistingBranchUpdateTransactionResult(
+            EXISTING_BRANCH_UPDATE_STATUS_DENIED, "branch_mismatch", None, None
+        )
     if _current_head(cwd) != verified_local_head:
-        return ExistingBranchUpdateTransactionResult("denied", "head_mismatch", None, None)
-    state, remote_oid, _error_category = classify_remote_branch_state(cwd, push_url, target_branch, timeout=timeout)
+        return ExistingBranchUpdateTransactionResult(EXISTING_BRANCH_UPDATE_STATUS_DENIED, "head_mismatch", None, None)
+    state, remote_oid, _error_category = classify_remote_branch_state(
+        cwd, push_url, target_branch, timeout=_bounded_timeout(timeout)
+    )
     if state != REMOTE_STATE_PRESENT:
-        return ExistingBranchUpdateTransactionResult("denied", "remote_mismatch", remote_oid, None)
+        return ExistingBranchUpdateTransactionResult(
+            EXISTING_BRANCH_UPDATE_STATUS_DENIED, "remote_mismatch", remote_oid, None
+        )
     # The policy has already compared the same live ref to expected_head; do
     # it again in this controlled executor immediately before the write.
     if remote_oid != expected_remote_head:
-        return ExistingBranchUpdateTransactionResult("denied", "remote_mismatch", remote_oid, None)
+        return ExistingBranchUpdateTransactionResult(
+            EXISTING_BRANCH_UPDATE_STATUS_DENIED, "remote_mismatch", remote_oid, None
+        )
     if _current_head(cwd) != verified_local_head:
-        return ExistingBranchUpdateTransactionResult("denied", "head_mismatch", remote_oid, None)
+        return ExistingBranchUpdateTransactionResult(
+            EXISTING_BRANCH_UPDATE_STATUS_DENIED, "head_mismatch", remote_oid, None
+        )
+
+    def _bounded_readback():
+        readback_timeout = (
+            _bounded_timeout(timeout)
+            if _remaining_seconds() > 0
+            else _EXISTING_BRANCH_UPDATE_MIN_READBACK_TIMEOUT_SECONDS
+        )
+        return verify_initial_branch_create_readback(
+            cwd, push_url, target_branch, verified_local_head, timeout=readback_timeout
+        )
+
+    if _remaining_seconds() <= _EXISTING_BRANCH_UPDATE_MIN_READBACK_TIMEOUT_SECONDS:
+        # Issue #1688 fix delta (P0 nested_timeout_mismatch): the deadline is
+        # already exhausted before the push was even attempted (e.g. the
+        # remote-state probe above consumed the whole budget). Never skip
+        # the readback -- a concurrent/prior write may already match.
+        matched, _reason, readback_oid = verify_initial_branch_create_readback(
+            cwd, push_url, target_branch, verified_local_head,
+            timeout=_EXISTING_BRANCH_UPDATE_MIN_READBACK_TIMEOUT_SECONDS,
+        )
+        if matched:
+            return ExistingBranchUpdateTransactionResult(
+                EXISTING_BRANCH_UPDATE_STATUS_INDETERMINATE_TIMEOUT,
+                EXISTING_BRANCH_UPDATE_REASON_DEADLINE_EXCEEDED_VERIFIED,
+                readback_oid, None,
+            )
+        return ExistingBranchUpdateTransactionResult(
+            EXISTING_BRANCH_UPDATE_STATUS_INDETERMINATE_TIMEOUT,
+            EXISTING_BRANCH_UPDATE_REASON_DEADLINE_EXCEEDED,
+            readback_oid, None,
+        )
 
     push_returncode: int | None = None
     try:
@@ -900,29 +1034,56 @@ def execute_existing_branch_update_transaction(
             cwd=cwd,
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=_bounded_timeout(timeout),
             check=False,
+            # Issue #1688 fix delta (P0 nested_timeout_mismatch): run the
+            # push in its own session so an external SIGTERM/SIGKILL of THIS
+            # python3 process (e.g. the hook adapter's own outer subprocess
+            # timeout firing) cannot leave an orphaned `git push` still
+            # writing to the remote after this function has already reported
+            # a result.
+            start_new_session=True,
         )
         push_returncode = proc.returncode
-    except (OSError, subprocess.TimeoutExpired):
-        matched, _reason, readback_oid = verify_initial_branch_create_readback(
-            cwd, push_url, target_branch, verified_local_head, timeout=timeout
-        )
+    except subprocess.TimeoutExpired:
+        matched, _reason, readback_oid = _bounded_readback()
         if matched:
             return ExistingBranchUpdateTransactionResult(
-                "completed", "existing_branch_update_completed", readback_oid, None
+                EXISTING_BRANCH_UPDATE_STATUS_INDETERMINATE_TIMEOUT,
+                EXISTING_BRANCH_UPDATE_REASON_TRANSPORT_ERROR_VERIFIED,
+                readback_oid, None,
             )
-        return ExistingBranchUpdateTransactionResult("denied", "push_failed", readback_oid, None)
+        return ExistingBranchUpdateTransactionResult(
+            EXISTING_BRANCH_UPDATE_STATUS_INDETERMINATE_TIMEOUT,
+            EXISTING_BRANCH_UPDATE_REASON_DEADLINE_EXCEEDED,
+            readback_oid, None,
+        )
+    except OSError:
+        matched, _reason, readback_oid = _bounded_readback()
+        if matched:
+            return ExistingBranchUpdateTransactionResult(
+                EXISTING_BRANCH_UPDATE_STATUS_INDETERMINATE_TIMEOUT,
+                EXISTING_BRANCH_UPDATE_REASON_TRANSPORT_ERROR_VERIFIED,
+                readback_oid, None,
+            )
+        return ExistingBranchUpdateTransactionResult(
+            EXISTING_BRANCH_UPDATE_STATUS_DENIED, "push_failed", readback_oid, None
+        )
 
-    matched, _reason, readback_oid = verify_initial_branch_create_readback(
-        cwd, push_url, target_branch, verified_local_head, timeout=timeout
-    )
+    matched, _reason, readback_oid = _bounded_readback()
     if push_returncode != 0:
-        return ExistingBranchUpdateTransactionResult("denied", "push_failed", readback_oid, push_returncode)
+        return ExistingBranchUpdateTransactionResult(
+            EXISTING_BRANCH_UPDATE_STATUS_DENIED, "push_failed", readback_oid, push_returncode
+        )
     if not matched:
-        return ExistingBranchUpdateTransactionResult("denied", "postcondition_mismatch", readback_oid, push_returncode)
+        return ExistingBranchUpdateTransactionResult(
+            EXISTING_BRANCH_UPDATE_STATUS_DENIED, "postcondition_mismatch", readback_oid, push_returncode
+        )
+    # push_returncode == 0 AND the readback matches: this is the ONLY case
+    # that may claim exact, this-process-caused completion (Issue #1688 fix
+    # delta P1 transport_error_conflated_with_own_success).
     return ExistingBranchUpdateTransactionResult(
-        "completed", "existing_branch_update_completed", readback_oid, push_returncode
+        EXISTING_BRANCH_UPDATE_STATUS_COMPLETED, EXISTING_BRANCH_UPDATE_REASON_COMPLETED, readback_oid, push_returncode
     )
 
 
@@ -2879,6 +3040,30 @@ def _classify_initial_branch_create_push(
             command_class=COMMAND_CLASS_RTK_GIT_INITIAL_BRANCH_CREATE,
         )
 
+    # Issue #1688 fix delta (P0 EVENT-BOUNDARY-01 / no_caller_authentication_
+    # on_mutation_executing_cli): second-layer defense -- never reach the real
+    # remote write below unless `boundary_layer` identifies one of the two
+    # known trusted PreToolUse-equivalent callers (see
+    # `_AUTHORIZED_EXECUTION_BOUNDARY_LAYERS`). A `PermissionRequest`-origin
+    # or unauthenticated direct-CLI invocation never has an authorized value
+    # here and is denied before the transaction (and therefore before any
+    # remote probe/push) is ever attempted.
+    if boundary_layer not in _AUTHORIZED_EXECUTION_BOUNDARY_LAYERS:
+        return _publish_safety_stop_result(
+            reason_code=EXECUTION_NOT_AUTHORIZED_FOR_BOUNDARY_LAYER,
+            target_branch=target_branch,
+            expected_remote_head=None,
+            current_remote_head=None,
+            local_head=local_head,
+            verified_head=publish_guard.verified_head,
+            declared_publish_head=publish_guard.declared_publish_head,
+            allowed_paths_gate_status=publish_guard.allowed_paths_gate_status,
+            pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+            remote_readback_source=publish_guard.remote_readback_source,
+            decision_inputs_complete=publish_guard.decision_inputs_complete,
+            boundary_layer=boundary_layer,
+            command_class=COMMAND_CLASS_RTK_GIT_INITIAL_BRANCH_CREATE,
+        )
     # Issue #1449 (PR #1479 OWNER review, P1 Blocker 1/2/3, P1 High): the
     # actual remote write happens HERE, inside this single trusted
     # classify-and-execute boundary — probe, push (with the verified SHA
@@ -3612,6 +3797,30 @@ def _classify_rtk_git_mutation_with_context(
                 boundary_layer=boundary_layer,
             )
     if execute_existing_branch_update:
+        # Issue #1688 fix delta (P0 EVENT-BOUNDARY-01 / no_caller_
+        # authentication_on_mutation_executing_cli): second-layer defense --
+        # never perform the real remote write below unless `boundary_layer`
+        # identifies one of the two known trusted PreToolUse-equivalent
+        # callers (see `_AUTHORIZED_EXECUTION_BOUNDARY_LAYERS`). This is
+        # independent of, and in addition to, the hook adapter's own
+        # `eventName === 'PreToolUse'` gate.
+        if boundary_layer not in _AUTHORIZED_EXECUTION_BOUNDARY_LAYERS:
+            return GitMutationPolicyResult(
+                status="deny",
+                command_class=COMMAND_CLASS_RTK_GIT_PUSH,
+                reason_code=EXECUTION_NOT_AUTHORIZED_FOR_BOUNDARY_LAYER,
+                expected_remote_head=publish_guard.expected_remote_head if publish_guard else None,
+                current_remote_head=current_remote_head,
+                local_head=local_head,
+                verified_head=publish_guard.verified_head if publish_guard else None,
+                declared_publish_head=publish_guard.declared_publish_head if publish_guard else None,
+                allowed_paths_gate_status=publish_guard.allowed_paths_gate_status if publish_guard else None,
+                target_branch=target_branch,
+                pr_number=os.environ.get("LOOP_PR_NUMBER", ""),
+                remote_readback_source=publish_guard.remote_readback_source,
+                decision_inputs_complete=publish_guard.decision_inputs_complete,
+                boundary_layer=boundary_layer,
+            )
         # The hook must deny the outer command after this controlled
         # transaction, otherwise Codex would execute a second ambient push.
         transaction = execute_existing_branch_update_transaction(

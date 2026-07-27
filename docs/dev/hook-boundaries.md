@@ -195,6 +195,15 @@ hook_boundaries_manifest_v1:
       readback が local HEAD と一致した場合だけ完了する。外側の shell push は transaction 完了後も deny
       して二重実行を防ぐ。context の欠落・partial・malformed、branch/HEAD/remote/Allowed Paths digest の
       不一致は fail-closed とする。`env LOOP_PUBLISH_...=... rtk git push ...` は context injection ではない。
+      #1688 fix delta: existing_branch_update / initial_branch_create の real remote write は、
+      `boundary_layer` が `worktree_scope_guard_denied`（本 hook の既定値）または
+      `codex_hook_adapter_pretooluse`（Codex 側 `PreToolUse`）のいずれかであることを
+      `git_mutation_command_policy.py` 側でも独立に fail-closed 検証する（second-layer
+      defense）。Codex 側の `PermissionRequest` は同じ transaction を一切起動しない
+      （event boundary gate は adapter 側の呼び出し口で行う）。詳細は
+      `docs/dev/session-recording-policy.md` の「existing_branch_update /
+      initial_branch_create レーンの event boundary と timeout budget（#1688 fix delta）」を
+      参照。
 
   - handler_id: guard-japanese-prose
     event: PreToolUse

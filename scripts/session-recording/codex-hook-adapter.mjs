@@ -327,6 +327,23 @@ const shellCommandAnalyzerScript = configuredShellCommandAnalyzerScript.startsWi
   : defaultShellCommandAnalyzerScript
 const SHELL_COMMAND_ANALYSIS_SCHEMA = 'SHELL_COMMAND_ANALYSIS_V1'
 const SHELL_ANALYZER_TIMEOUT_MS = 5000
+// Issue #1688 fix delta (P0 nested_timeout_mismatch): the existing-branch
+// publish-lane policy CLI owns a single absolute wall-clock deadline for its
+// whole probe -> push -> readback transaction
+// (`_EXISTING_BRANCH_UPDATE_DEADLINE_SECONDS` in
+// scripts/agent-guards/git_mutation_command_policy.py). This adapter-side
+// subprocess timeout MUST stay strictly greater than that policy deadline
+// (with margin) and strictly less than the `.codex/hooks.json` hook-wide
+// 30s budget (out of Allowed Paths, not editable here) -- otherwise Node
+// could SIGTERM the python3 process before it has had a chance to return
+// its own structured indeterminate-timeout result.
+const EXISTING_BRANCH_PUBLISH_LANE_TIMEOUT_MS = 27_000
+// Issue #1688 fix delta (P2 unbounded_execfilesync_for_manifest_producer):
+// every other execFileSync/spawn call in this file has an explicit timeout;
+// the manifest-producer subprocess spawned by `produceManifest` did not,
+// so a stuck producer could block Stop/SubagentStop indefinitely aside from
+// the outer `.codex/hooks.json` 30s hook budget.
+const MANIFEST_PRODUCER_TIMEOUT_MS = 20_000
 const SHELL_ANALYZER_MAX_BUFFER = 1024 * 1024
 
 const PUSH_COMMAND_KINDS = new Set(['git_push', 'rtk_git_push'])
@@ -683,7 +700,21 @@ function buildControlledPublishContext(cwd) {
   }
 }
 
-function classifyRtkGitPushPublishLane(command, cwd) {
+/** Issue #1688 fix delta (P0 EVENT-BOUNDARY-01): this is the ONLY call site
+ *  that may trigger the bounded existing-branch-update / initial-branch-create
+ *  transactions (both of which perform a real remote write). Callers MUST
+ *  gate invocation to `eventName === 'PreToolUse'` -- a `PermissionRequest`
+ *  hook fires purely to ask "would this be allowed", and the final approval
+ *  decision (allow/deny) may still be pending or reversed, so it must never
+ *  itself cause a remote mutation. `--boundary-layer
+ *  codex_hook_adapter_pretooluse` is echoed back by the Python policy result
+ *  and is independently re-checked there (defense-in-depth second layer) --
+ *  see `_AUTHORIZED_EXECUTION_BOUNDARY_LAYERS` in
+ *  scripts/agent-guards/git_mutation_command_policy.py. */
+function classifyRtkGitPushPublishLane(command, cwd, eventName) {
+  if (eventName !== 'PreToolUse') {
+    return null
+  }
   try {
     const context = buildControlledPublishContext(cwd)
     const stdout = execFileSync('python3', [
@@ -696,7 +727,7 @@ function classifyRtkGitPushPublishLane(command, cwd) {
     ], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 10_000,
+      timeout: EXISTING_BRANCH_PUBLISH_LANE_TIMEOUT_MS,
     })
     const parsed = JSON.parse(stdout)
     if (parsed && typeof parsed === 'object' && parsed.status && parsed.status !== 'no_match') {
@@ -704,6 +735,17 @@ function classifyRtkGitPushPublishLane(command, cwd) {
     }
     return null
   } catch {
+    // Issue #1688 fix delta (P0 nested_timeout_mismatch): a timeout/transport
+    // failure here means the policy CLI's OWN internal deadline
+    // (`_EXISTING_BRANCH_UPDATE_DEADLINE_SECONDS`) has, by construction,
+    // already elapsed with margin to spare before this outer timeout could
+    // fire -- the policy always returns a structured
+    // `indeterminate_timeout`-status JSON result of its own well before that
+    // point. Reaching this catch block therefore indicates an exceptional
+    // failure (process spawn failure, malformed JSON, etc.), not an
+    // in-flight ambiguous push; falling back to the generic
+    // remote_write_requires_approval deny below is the correct fail-closed
+    // behavior for that case.
     return null
   }
 }
@@ -897,7 +939,7 @@ function evaluateGuard(payload, eventName) {
     // `git -C <dir> push`, and wrapper-bypass variants never reach this branch
     // (looksLikeRtkGitPush returns false) and keep the existing deny (AC2).
     if (looksLikeRtkGitPush(command)) {
-      const publishLane = classifyRtkGitPushPublishLane(command, getCwd(payload))
+      const publishLane = classifyRtkGitPushPublishLane(command, getCwd(payload), eventName)
       if (publishLane && publishLane.status === 'allow') {
         // AC1: validated publish lane evidence — no denial, command passes through.
         return null
@@ -929,7 +971,20 @@ function evaluateGuard(payload, eventName) {
             + 'do not retry the raw command; inspect transaction_status above)',
         }
       }
-      if (publishLane && publishLane.reason_code === 'existing_branch_update_completed') {
+      // Issue #1688 fix delta (P1 transport_error_conflated_with_own_success):
+      // `existing_branch_update_completed` is reserved for an exactly-observed
+      // own-process push (return code 0) plus a matching readback. The other
+      // three reason codes below mean the transaction ran out of its bounded
+      // deadline, or hit a transport error, and can only report that a
+      // *readback* matched -- never that THIS process's push definitely
+      // caused it (a concurrent/prior write could coincidentally match).
+      const EXISTING_BRANCH_UPDATE_EXECUTED_REASON_CODES = new Set([
+        'existing_branch_update_completed',
+        'existing_branch_update_transport_error_but_verified',
+        'existing_branch_update_deadline_exceeded',
+        'existing_branch_update_deadline_exceeded_but_verified',
+      ])
+      if (publishLane && EXISTING_BRANCH_UPDATE_EXECUTED_REASON_CODES.has(publishLane.reason_code)) {
         const preview = redactCommandPreview(rawCommand)
         return {
           action: 'deny',
@@ -940,7 +995,10 @@ function evaluateGuard(payload, eventName) {
             + `[remote_oid=${publishLane.current_remote_head ?? 'null'}] `
             + `[local_head=${publishLane.local_head}] `
             + `blocked_command_preview="${preview}" `
-            + '(the controlled transaction already executed one push and readback; do not retry the raw command)',
+            + '(the controlled transaction already executed one push attempt and a readback; '
+            + 'do not retry the raw command; inspect transaction_status above -- '
+            + 'deadline_exceeded / transport_error variants mean the push outcome could not be '
+            + "independently confirmed as this process's own completion)",
         }
       }
       if (publishLane && publishLane.status === 'deny') {
@@ -1025,6 +1083,7 @@ function produceManifest(eventName, payload, evidenceSourceRef) {
     cwd: repoRoot,
     encoding: 'utf8',
     stdio: ['pipe', 'pipe', 'pipe'],
+    timeout: MANIFEST_PRODUCER_TIMEOUT_MS,
   }))
   manifest.secret_policy.runtime_boundary = {
     attested: true,
