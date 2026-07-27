@@ -41,6 +41,7 @@ import { SORTIE_DURATION_MS } from './systems/SortieSystem'
 import {
   configureBattleOverlayFoundation,
   createHudController,
+  createPhaseScreenController,
   getUpgradeStatusCopy,
   resolveBattleOverlayElements,
   syncBattleOverlayPlaceholderRail,
@@ -445,26 +446,30 @@ function handleTogglePause(): void {
   setHudFeedback('Paused', 'Simulation frozen. Rendering and HUD continue.')
 }
 
+/**
+ * Which phase opened `load_menu` (title_menu or preparation) — the caller
+ * (this module) owns this, not the UI controllers (Issue #1374 PR #1815
+ * review, required fix 5). `phaseScreens.ts` only notifies intent via
+ * `onOpenLoadMenu(origin)` / `onBackFromLoadMenu()`.
+ */
+let loadMenuOrigin: 'title_menu' | 'preparation' = 'title_menu'
+
+/** Opens load_menu from `title_menu` or `preparation` (AC8). */
+function openLoadMenu(origin: 'title_menu' | 'preparation'): void {
+  if (!transitionByIntent('open_load_menu')) {
+    return
+  }
+  loadMenuOrigin = origin
+  setHudFeedback('Load Menu.', 'Select a save slot to load.')
+}
+
+/** Returns to whichever phase opened `load_menu` (AC8). */
+function backFromLoadMenu(): void {
+  const intent = loadMenuOrigin === 'preparation' ? 'back_to_preparation' : 'back_to_title'
+  transitionByIntent(intent)
+}
+
 const hud = battleHudLayer ? createHudController(battleHudLayer, {
-  onNewGame() {
-    // AC1: title_menu → preparation (New Game). Separate from onStartSortie (AC2).
-    const nextState = createTransitionedInitialGameState(state.loopPhase, 'new_game')
-    if (nextState === null) {
-      return
-    }
-    state = nextState
-    resizeArena(state)
-    productPause.isPaused = false
-    setHudFeedback('New Game started.', 'Preparation phase. Start sortie when ready.')
-  },
-  onStartSortie() {
-    // AC2: preparation only. title_menu New Game is handled by onNewGame().
-    const started = startSortie(state, defaultSimulationConfig.fixedDeltaMs)
-    if (!started) {
-      return
-    }
-    setHudFeedback('Sortie started.', 'Preparation controls are now locked until result.')
-  },
   onAssistPlayerCommand() {
     queueAssistPlayerCommand(state.loopPhase, inputState)
   },
@@ -524,25 +529,49 @@ const hud = battleHudLayer ? createHudController(battleHudLayer, {
     resizeArena(state)
     productPause.isPaused = false
   },
-  onSave() {
-    // AC2, AC8: Save only allowed in preparation phase
-    if (!transitionByIntent('save_progress')) {
+  onTogglePause() {
+    handleTogglePause()
+  },
+}) : null
+
+/**
+ * title / load / preparation menu overlay, owned by `phaseScreens.ts` and
+ * rendered into `battle-screen-layer` (Issue #1374 PR #1815 review, required
+ * fix 1). This controller never mutates `GameState` — it only notifies
+ * intent (`onOpenLoadMenu` / `onBackFromLoadMenu`); this module owns
+ * `transitionByIntent()`, origin bookkeeping, and feedback (required fix 5).
+ */
+const phaseScreens = battleScreenLayer ? createPhaseScreenController(battleScreenLayer, {
+  onNewGame() {
+    // AC1: title_menu → preparation (New Game). Separate from onStartSortie (AC2).
+    const nextState = createTransitionedInitialGameState(state.loopPhase, 'new_game')
+    if (nextState === null) {
       return
     }
-
-    persistProgressionSnapshot('save')
+    state = nextState
+    resizeArena(state)
+    productPause.isPaused = false
+    setHudFeedback('New Game started.', 'Preparation phase. Start sortie when ready.')
   },
-  onLoadGame() {
-    // Delegated to runLoadGame() seam for testability (AC3).
+  onOpenLoadMenu(origin) {
+    openLoadMenu(origin)
+  },
+  onBackFromLoadMenu() {
+    backFromLoadMenu()
+  },
+  onConfirmLoad() {
+    // Delegated to runLoadGame() seam for testability (AC3). By the time this
+    // fires, the phase is always load_menu (title_menu/preparation now open
+    // load_menu directly via onOpenLoadMenu(), never through this handler).
     runLoadGame(state.loopPhase, hasLoadableSnapshot, {
       storage,
       reportLoadFailure(result) { reportStorageFailure('load', result) },
       setHudFeedback,
       onTitleMenuTransition() {
-        if (!transitionByIntent('open_load_menu')) {
-          return
-        }
-        setHudFeedback('Load Menu.', 'Select a save slot to load.')
+        // Unreachable from the current UI (title_menu opens load_menu via
+        // onOpenLoadMenu() before this handler can fire). Kept so
+        // runLoadGame()'s existing tested seam shape is unchanged.
+        openLoadMenu('title_menu')
       },
       onLoadSuccess(snapshot) {
         const nextState = createTransitionedInitialGameState(state.loopPhase, 'load_success', snapshot)
@@ -559,6 +588,22 @@ const hud = battleHudLayer ? createHudController(battleHudLayer, {
       },
     })
   },
+  onStartSortie() {
+    // AC2: preparation only. title_menu New Game is handled by onNewGame().
+    const started = startSortie(state, defaultSimulationConfig.fixedDeltaMs)
+    if (!started) {
+      return
+    }
+    setHudFeedback('Sortie started.', 'Preparation controls are now locked until result.')
+  },
+  onSave() {
+    // AC2, AC8: Save only allowed in preparation phase
+    if (!transitionByIntent('save_progress')) {
+      return
+    }
+
+    persistProgressionSnapshot('save')
+  },
   onReset() {
     const nextState = createTransitionedInitialGameState(state.loopPhase, 'reset_sortie')
     if (nextState === null) {
@@ -572,12 +617,6 @@ const hud = battleHudLayer ? createHudController(battleHudLayer, {
       'Reset sortie complete.',
       'Reset sortie is a destructive boundary. Preparation only.',
     )
-  },
-  canLoadGame() {
-    return hasLoadableSnapshot
-  },
-  onTogglePause() {
-    handleTogglePause()
   },
   onUpgradeWeapon() {
     // Delegated to runUpgradeWeaponHandler seam for testability (Issue #1282).
@@ -597,9 +636,13 @@ const hud = battleHudLayer ? createHudController(battleHudLayer, {
       },
       renderHud() {
         syncBattleOverlayLayout()
-        hud?.render(state, productPause.isPaused, buildUpgradeView())
+        hud?.render(state, productPause.isPaused)
+        phaseScreens?.render(state, buildUpgradeView())
       },
     })
+  },
+  canLoadGame() {
+    return hasLoadableSnapshot
   },
 }) : null
 
@@ -999,7 +1042,8 @@ function frame(now: number): void {
 
   // AC4: render and HUD continue regardless of pause state
   syncBattleOverlayLayout()
-  hud.render(state, productPause.isPaused, buildUpgradeView())
+  hud.render(state, productPause.isPaused)
+  phaseScreens?.render(state, buildUpgradeView())
   renderer.render(state)
   window.requestAnimationFrame(frame)
 }

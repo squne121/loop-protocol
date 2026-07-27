@@ -5,6 +5,7 @@ export type PhaseTransitionIntent =
   | 'new_game'
   | 'open_load_menu'
   | 'back_to_title'
+  | 'back_to_preparation'
   | 'load_success'
   | 'save_progress'
   | 'reset_sortie'
@@ -32,10 +33,18 @@ export const LOOP_PHASE_TRANSITIONS = {
   },
   load_menu: {
     back_to_title: 'title_menu',
+    // Issue #1374 (AC8): load_menu opened from preparation returns to
+    // preparation on Back, not title_menu. The caller (HudController /
+    // phaseScreens.ts) tracks the origin phase and selects this intent.
+    back_to_preparation: 'preparation',
     load_success: 'preparation',
   },
   preparation: {
     bootstrap_title_menu: 'title_menu',
+    // Issue #1374 (AC8): preparation can open load_menu directly (Load
+    // Game on the preparation screen), reusing the existing intent name
+    // already defined for title_menu.
+    open_load_menu: 'load_menu',
     save_progress: 'preparation',
     reset_sortie: 'preparation',
     start_sortie: 'running',
