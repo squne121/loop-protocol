@@ -373,6 +373,20 @@ export interface CanvasVisualCueScreenshotOptions {
  * exception. Still requires an installed, non-pending scenario (same
  * binding + fail-closed rules as `expectDomOverlayScreenshot()`), and still
  * applies the shared freeze CSS — but does NOT mask canvases.
+ *
+ * `options.maxDiffPixels` is REQUIRED for a REAL capture (PR #1813 review
+ * fix, P2 Blocker 6): the previous shared `maxDiffPixels ?? 1` runtime
+ * default silently diverged from `scripts/check-visual-artifact-pipeline.py`,
+ * which treats a call site with no comparator option as a hard-fail contract
+ * violation ("neither maxDiffPixels nor maxDiffPixelRatio declared"). A
+ * future caller that omitted `options` would pass at runtime while failing
+ * CI's static validator. This check runs AFTER the Canvas-target guard
+ * below (not before) so existing negative/guard tests that intentionally
+ * omit `options` while asserting a DIFFERENT rejection reason (a non-Canvas
+ * target, an unknown registryId) keep failing for that reason, not this one
+ * — `options` itself stays an optional parameter (default `{}`) for that
+ * reason; only an actual Canvas-target, valid-registryId call requires an
+ * explicit `maxDiffPixels`.
  */
 export async function expectCanvasVisualCueScreenshot(
   locator: Locator,
@@ -418,10 +432,17 @@ export async function expectCanvasVisualCueScreenshot(
         'this exception helper.',
     )
   }
+  if (options.maxDiffPixels === undefined) {
+    throw new Error(
+      'expectCanvasVisualCueScreenshot(): an explicit maxDiffPixels is required (no shared ' +
+        'default — PR #1813 review fix, P2 Blocker 6). Measure the tolerance against this ' +
+        'capture root empirically rather than relying on a previous implicit default.',
+    )
+  }
 
   await expect(locator).toHaveScreenshot(name, {
     animations: 'disabled',
-    maxDiffPixels: options.maxDiffPixels ?? 1,
+    maxDiffPixels: options.maxDiffPixels,
     stylePath: VISUAL_FREEZE_CSS_PATH,
   })
 }
