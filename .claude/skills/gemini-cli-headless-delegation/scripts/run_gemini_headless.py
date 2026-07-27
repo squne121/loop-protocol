@@ -2622,6 +2622,78 @@ def _minimal_agy_env() -> dict[str, str]:
     return env
 
 
+class AgyInvocationPolicyError(Exception):
+    """Raised by `_validate_agy_invocation_argv()` when the agy invocation
+    argv does not match the approved positional structure allowlist
+    (Issue #1807). This is distinct from `agy_permission_denied` (which
+    signals an AGY-side / OS-level permission rejection) -- this class
+    signals a *wrapper-side* fail-closed rejection of an argv shape that
+    was never supposed to reach `subprocess.run()` in the first place."""
+
+
+def _build_agy_inner_argv(agy_bin: str, prompt: str, model: str | None = None) -> list[str]:
+    """Single canonical builder for the agy invocation argv (Issue #1807).
+
+    Both the real execution argv (`_run_agy()`, passed to `subprocess.run()`)
+    and the sanitized audit-display argv (`_build_agy_raw_command()`) are
+    derived from this one function, so a fix to the invocation shape here
+    can never silently diverge between what actually executes and what is
+    displayed/audited. Structure: `[agy_bin, "-p", prompt]`, optionally
+    followed by `["--model", model]` when *model* is truthy.
+    """
+    argv = [agy_bin, "-p", prompt]
+    if model:
+        argv.extend(["--model", model])
+    return argv
+
+
+def _validate_agy_invocation_argv(argv: list[str]) -> None:
+    """Fail-closed positional structure allowlist for the agy invocation argv
+    (Issue #1807, AC1/AC9 permission-bypass-flag-rejection defense-in-depth).
+
+    This is a *structural* allowlist, not a string denylist against a
+    specific flag name (e.g. `--dangerously-skip-permissions`): it validates
+    that the argv has exactly the approved shape --
+
+    - index 0: the agy binary (any value; already resolved by the caller)
+    - index 1: must be the literal `-p` flag
+    - index 2: the prompt value (any string; unconditionally allowed --
+      arbitrary prompt text is not itself a flag-injection vector because
+      it occupies a fixed positional slot, never parsed as an option)
+    - the remaining trailing argv must be either empty, or exactly
+      `["--model", <model>]` where `<model>` is a non-empty string that
+      does not itself look like another flag (does not start with `-`)
+
+    Any other trailing content (including a known-real flag such as
+    `--dangerously-skip-permissions`, or any other unrecognized option) is
+    rejected. This means the allowlist also fail-closed-rejects permission
+    bypass flags that do not exist yet, unlike a denylist keyed on today's
+    known flag names.
+
+    Raises `AgyInvocationPolicyError` on any violation; callers must not
+    pass the resulting argv to `subprocess.run()`.
+    """
+    if len(argv) < 3:
+        raise AgyInvocationPolicyError(
+            f"agy invocation argv too short (expected at least [agy_bin, '-p', prompt]): {argv!r}"
+        )
+    if argv[1] != "-p":
+        raise AgyInvocationPolicyError(f"agy invocation argv index 1 must be '-p', got {argv[1]!r}")
+    trailing = argv[3:]
+    if trailing:
+        if (
+            len(trailing) != 2
+            or trailing[0] != "--model"
+            or not isinstance(trailing[1], str)
+            or not trailing[1]
+            or trailing[1].startswith("-")
+        ):
+            raise AgyInvocationPolicyError(
+                "agy invocation argv trailing options must be empty or exactly "
+                f"['--model', <model>]; got {trailing!r}"
+            )
+
+
 def _build_agy_raw_command(prompt: str) -> list[str]:
     """Build sanitized raw_command for agy execution.
 
@@ -2631,7 +2703,7 @@ def _build_agy_raw_command(prompt: str) -> list[str]:
     agy_bin = str(os.environ.get("AGY_BIN") or "agy")
     if os.sep in agy_bin or (os.altsep and os.altsep in agy_bin):
         agy_bin = os.path.basename(agy_bin) or "agy"
-    return [agy_bin, "-p", "<prompt>"]
+    return _build_agy_inner_argv(agy_bin, "<prompt>")
 
 
 # Issue #1705: carries the current call's tool_profile from run_delegation()
@@ -2686,8 +2758,8 @@ def _run_agy(
     #1494's live E2E run (see Issue #1708 Runtime Verification Applicability).
     """
     agy_bin = str(os.environ.get("AGY_BIN") or "agy")
-    command = [agy_bin, "-p", prompt]
     tool_profile = _AGY_TOOL_PROFILE_CTX.get()
+    selected_model: str | None = None
     if tool_profile == GROUNDED_RESEARCH_PROFILE:
         # Issue #1777: capability-driven routing. Model selection is optional
         # -- resolve_agy_grounded_research_model() returns None (no --model
@@ -2696,8 +2768,16 @@ def _run_agy(
         # AGY_GROUNDED_RESEARCH_ROLE docstring above for why the former
         # hardcoded-model causal claim was corrected.
         selected_model = resolve_agy_grounded_research_model()
-        if selected_model:
-            command = [agy_bin, "-p", prompt, "--model", selected_model]
+    # Issue #1807: build the real execution argv from the single canonical
+    # `_build_agy_inner_argv()` builder (shared with the audit-display
+    # `_build_agy_raw_command()`), then validate it against the positional
+    # structure allowlist before it is ever passed to `subprocess.run()`.
+    # Fail-closed: `_validate_agy_invocation_argv()` raises
+    # `AgyInvocationPolicyError` on any violation, which `run_delegation()`
+    # classifies into the `agy_invocation_policy_denied` failure_class
+    # (distinct from `agy_permission_denied`; see failure-class-taxonomy.md).
+    command = _build_agy_inner_argv(agy_bin, prompt, selected_model)
+    _validate_agy_invocation_argv(command)
     if tool_profile in _agy_permission_policy.ALLOWED_PROFILES:
         workspace = _agy_permission_policy.materialize_isolated_agy_workspace(tool_profile)
         env = dict(workspace.env)
@@ -5032,6 +5112,44 @@ def _run_delegation_core(
                     "warnings": ["agy_permission_denied: permission denied executing agy"],
                     "failure_reason": "agy_permission_denied: permission denied executing agy",
                     "failure_class": "agy_permission_denied",
+                    "raw_command": _build_agy_raw_command(""),
+                    "model_chain": [],
+                    "model_downgrades": [],
+                    "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
+                    "parent_run_id": request.get("parent_run_id"),
+                    "subtask_id": request.get("subtask_id"),
+                    "attempt_id": request.get("attempt_id"),
+                }
+            except AgyInvocationPolicyError as exc:
+                # Issue #1807: the agy invocation argv failed the
+                # position-based structure allowlist in
+                # `_validate_agy_invocation_argv()` (e.g. an unknown
+                # trailing option / permission-bypass flag). This is a
+                # wrapper-side fail-closed rejection -- distinct from
+                # `agy_permission_denied` (an AGY-side / OS-level
+                # permission rejection) -- and is non-retryable.
+                return {
+                    "schema": "delegation_result/v1",
+                    "provider": "agy",
+                    "safety_mode": "degraded_wrapper_only",
+                    "ok": False,
+                    "requested_model": None,
+                    "actual_model": "agy-default",
+                    "tool_profile": tool_profile_str,
+                    "exit_code": 1,
+                    "result_surface": {
+                        "mode": "artifact-first",
+                        "summary": None,
+                        "primary_artifact_type": "none",
+                        "primary_artifact": None,
+                        "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
+                    },
+                    "response_text": None,
+                    "stats": None,
+                    "stderr": f"agy_invocation_policy_denied: {exc}",
+                    "warnings": [f"agy_invocation_policy_denied: {exc}"],
+                    "failure_reason": f"agy_invocation_policy_denied: {exc}",
+                    "failure_class": "agy_invocation_policy_denied",
                     "raw_command": _build_agy_raw_command(""),
                     "model_chain": [],
                     "model_downgrades": [],
