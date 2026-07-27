@@ -237,15 +237,15 @@ capture 内で表示される要素構成が変化し、`running-hud-overlay-leg
   一度 `playwright test tests/e2e/visual-overlay.spec.ts --update-snapshots` により baseline を
   再生成したが、CI（GitHub Actions ubuntu runner）で実行した際に font-rasterization 差（ローカル
   Linux 環境と CI runner 間のフォント fallback 差）に起因すると見られる追加 diff（約 11000px 台）
-  が再発した。そのため、CI 実行結果の `test-results` artifact（run id `30256680928`,
-  job id `89946808958`）から `vrt-running-hud-overlay-actual.png` を取得し、これを最終 baseline
+  が再発した。そのため、CI 実行結果の `test-results` artifact（run id `30265197189`,
+  job id `89974089069`（iteration 6, HudController の running 最小 HUD 再構成後の再取得））から `vrt-running-hud-overlay-actual.png` を取得し、これを最終 baseline
   として採用した（CI 環境自身が描画した画像を人間承認済みの Scope Delta commit として反映する運用。
   CI が自動で baseline を書き換えるわけではない — §4「自動更新の禁止」に抵触しない）。
 - **maturity**: 変更なし（`legacy-current` のまま）。`frozen` 化条件（#1375/#1376/#1377
   マージ後）は本更新の対象外。
 - **environment fingerprint**: 最終的に採用した baseline は CI 実行環境（GitHub Actions ubuntu
   runner, Chromium, Playwright config 既定 viewport, `tests/e2e/visual.freeze.css` の generic
-  `sans-serif` 固定込み, run id `30256680928`）で生成された画像そのものである。以降の CI 再実行
+  `sans-serif` 固定込み, run id `30265197189`）で生成された画像そのものである。以降の CI 再実行
   （同一コミット・同一 runner image 前提）でこの baseline との一致が期待される。
 
 ## 4. baseline update policy（更新ポリシー）
