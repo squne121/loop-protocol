@@ -195,21 +195,27 @@ test(
       'title_menu',
     )
 
-    // AC2: title menu -> Load Game (two-step navigation: open load menu, then apply).
-    const loadGameButton = page.locator('[data-action="load-game"]')
-    await expect(loadGameButton).toBeEnabled({ timeout: 5_000 })
-    await loadGameButton.click()
+    // AC2: title menu -> Load Game (Issue #1374 PR #1815 review: navigation
+    // (open-load-menu-title, into load_menu) and the actual load
+    // (confirm-load, only reachable from load_menu) are now separate
+    // intent-only controls -- main.ts owns the transition via
+    // transitionByIntent(), not a single dual-purpose button).
+    const openLoadMenuButton = page.locator('[data-action="open-load-menu-title"]')
+    await expect(openLoadMenuButton).toBeEnabled({ timeout: 5_000 })
+    await openLoadMenuButton.click()
     await expect(page.locator('[data-field="status"]')).toHaveText('Load Menu.', {
       timeout: 5_000,
     })
-    await loadGameButton.click()
+    const confirmLoadButton = page.locator('[data-action="confirm-load"]')
+    await expect(confirmLoadButton).toBeEnabled({ timeout: 5_000 })
+    await confirmLoadButton.click()
     await expect(page.locator('[data-field="status"]')).toHaveText('Load Game complete.', {
       timeout: 5_000,
     })
 
-    // AC2: HUD shows the seeded snapshot.
-    await expect(page.locator('[data-field="resources"]')).toHaveText('100', { timeout: 5_000 })
-    await expect(page.locator('[data-field="weapon-power"]')).toHaveText('1', { timeout: 5_000 })
+    // AC2: HUD shows the seeded snapshot (preparation screen fields).
+    await expect(page.locator('[data-field="prep-resources"]')).toHaveText('100', { timeout: 5_000 })
+    await expect(page.locator('[data-field="prep-weapon-power"]')).toHaveText('1', { timeout: 5_000 })
 
     const stateAfterLoad = await getGameState(page)
     expect(stateAfterLoad.loopPhase, 'phase must be preparation after Load Game (AC2)').toBe(
@@ -228,8 +234,8 @@ test(
     await expect(upgradeButton).toBeEnabled({ timeout: 5_000 })
     await upgradeButton.click()
 
-    await expect(page.locator('[data-field="resources"]')).toHaveText('0', { timeout: 5_000 })
-    await expect(page.locator('[data-field="weapon-power"]')).toHaveText('2', { timeout: 5_000 })
+    await expect(page.locator('[data-field="prep-resources"]')).toHaveText('0', { timeout: 5_000 })
+    await expect(page.locator('[data-field="prep-weapon-power"]')).toHaveText('2', { timeout: 5_000 })
 
     const savedAfterPurchase = await readStorageKey(page, e2eKey)
     expect(savedAfterPurchase, 'E2E key must hold a snapshot after purchase (AC3)').not.toBeNull()
@@ -270,18 +276,20 @@ test(
     ).toBe(2)
 
     // AC5: Load Game after reload restores weaponPower 2 to runtime and HUD.
-    const loadGameButtonAfterReload = page.locator('[data-action="load-game"]')
-    await expect(loadGameButtonAfterReload).toBeEnabled({ timeout: 5_000 })
-    await loadGameButtonAfterReload.click()
+    const openLoadMenuButtonAfterReload = page.locator('[data-action="open-load-menu-title"]')
+    await expect(openLoadMenuButtonAfterReload).toBeEnabled({ timeout: 5_000 })
+    await openLoadMenuButtonAfterReload.click()
     await expect(page.locator('[data-field="status"]')).toHaveText('Load Menu.', {
       timeout: 5_000,
     })
-    await loadGameButtonAfterReload.click()
+    const confirmLoadButtonAfterReload = page.locator('[data-action="confirm-load"]')
+    await expect(confirmLoadButtonAfterReload).toBeEnabled({ timeout: 5_000 })
+    await confirmLoadButtonAfterReload.click()
     await expect(page.locator('[data-field="status"]')).toHaveText('Load Game complete.', {
       timeout: 5_000,
     })
 
-    await expect(page.locator('[data-field="weapon-power"]')).toHaveText('2', { timeout: 5_000 })
+    await expect(page.locator('[data-field="prep-weapon-power"]')).toHaveText('2', { timeout: 5_000 })
 
     const stateAfterRestore = await getGameState(page)
     expect(
