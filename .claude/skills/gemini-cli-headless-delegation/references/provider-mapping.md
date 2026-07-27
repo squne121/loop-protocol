@@ -351,14 +351,22 @@ legacy_decision:
     all-or-nothing 判断ではない）。
   effective_scope_by_unit:
     runtime_auto_priority: >-
-      blocked ではない。runtime `provider=auto`（`PROVIDER_AUTO_RUNTIME_ORDER`
-      が `("gemini", "agy")` である現行の gemini-first 順序、本ファイル
-      「runtime `provider=auto`」節参照）の agy-first 化は、`eligible_profiles`
-      が `{"no_tools", "proposal_only"}` のみであり github_research を含まない
-      ため、本 legacy_decision の blocking_gap（github_research の provider
-      parity 未解消）によって blocking されない。ただし `runtime_order` 自体の
-      変更は Issue #1804 の対象であり、本 PR（#1823）ではその変更を実施しない
-      （下記「#1804 との関係」参照）。
+      blocked ではない。実コード上の `PROVIDER_AUTO_RUNTIME_ORDER`
+      （`.claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py`）
+      は既に `("agy", "gemini")` という agy-first 順序であり（PR #1798 /
+      Issue #1692 で反転済み）、`eligible_profiles` が
+      `{"no_tools", "proposal_only"}` のみで github_research を含まないため、
+      本 legacy_decision の blocking_gap（github_research の provider parity
+      未解消）によって blocking されない。この事実確認（runtime auto が実コード
+      上は既に agy-first であること）は github_research の legacy 化 blocking
+      判断（`blocking_gap`）自体には影響しない（github_research は runtime
+      auto の対象 profile ではないため）。なお本ファイル上部「runtime
+      `provider=auto`」節の 216/240/244 行目付近（`runtime_order` =
+      `("gemini", "agy")` という gemini-first の記述・比較表・理由説明）は、
+      この実コードの現況（agy-first）と矛盾した記述のまま本 PR（#1823）では
+      変更していない。当該箇所の修正は Issue #1804 が別途担当する（下記
+      「#1804 との関係」参照）。読者は本節の事実確認と、本ファイル上部の未更新
+      の記述を混同しないこと。
     builder_default: >-
       blocked ではない。`build_request.py` 等での既定 provider 選択で
       github_research を要求しない呼び出し経路については、agy-first 化を
@@ -403,11 +411,15 @@ legacy_decision:
 ### `legacy_decision:` と Issue #1804 との関係
 
 `references/provider-mapping.md` の「runtime `provider=auto`」節にある
-`runtime_order`（`PROVIDER_AUTO_RUNTIME_ORDER` = `("gemini", "agy")`、
-gemini-first）の記述自体は、Issue #1804 が対象とするスコープであり、本 PR
-（#1823 / Issue #1806）ではその記述（該当箇所の値・比較表・理由説明）を変更
-しない。上記 `effective_scope_by_unit.runtime_auto_priority` は、legacy 化
-判断の観点からは runtime auto の agy-first 化が本 legacy_decision の
-blocking_gap によって妨げられないことのみを明確化するものであり、
-`runtime_order` の実際の値やそれに伴う実装変更（agy-first 化そのもの）は
-Issue #1804 側で扱う。
+`runtime_order`（216/240/244 行目付近、`PROVIDER_AUTO_RUNTIME_ORDER` =
+`("gemini", "agy")` という gemini-first の記述・比較表・理由説明）は、実
+コード上の `PROVIDER_AUTO_RUNTIME_ORDER`（既に `("agy", "gemini")` の
+agy-first、PR #1798 / Issue #1692 で反転済み）と矛盾した記述のままである。
+この既存記述の修正は Issue #1804 が対象とするスコープであり、本 PR（#1823 /
+Issue #1806）ではその記述（該当箇所の値・比較表・理由説明）を変更しない。
+上記 `effective_scope_by_unit.runtime_auto_priority` は、legacy 化判断の
+観点から runtime auto が実コード上は既に agy-first であるという事実を記録
+し、それが本 legacy_decision の blocking_gap によって妨げられないことを
+明確化するものであり、github_research の legacy 化 blocking 判断
+（`blocking_gap`）自体には影響しない。上記 docs 記述矛盾（216/240/244
+行目）の解消そのものは Issue #1804 側で扱う。
