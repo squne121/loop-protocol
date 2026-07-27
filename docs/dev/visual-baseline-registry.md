@@ -110,9 +110,10 @@ registry は推測ではなく現行テスト実体に基づいて分類する�
 
 - merged PR SHA、active test path、committed PNG path、right rail / command-rail / two-column 依存除外の
   レビュー記録がそろっていること。
-- `artifact URL` は CI summary から復元可能であること。`artifact digest` は現行 CI summary /
-  `check-visual-artifact-pipeline.py` では未配線のため、#1387 で `artifact-digest` の記録と検証が
-  実装されるまで frozen 昇格不可とする。
+- `artifact URL` / `artifact digest` は CI summary から復元可能であること。`artifact digest` は
+  GitHub `upload-artifact` の公式 `outputs.artifact-digest` を CI summary が記録し、
+  `check-visual-artifact-pipeline.py` が capture 単位で cross-validate する（#1387 / PR #1813
+  review fix で配線・検証を実装済み）。
 - deterministic fixture / freeze or mask 条件、`duration` / `timer` の源泉を `durationMs` / `fixedDeltaMs` / 
   `elapsedTicks` の優先順で定義すること（`elapsedTicks` だけの `fixed` は不可）。
 - `expected / actual / diff` の review 記録（有無を含む）を残すこと。
@@ -296,13 +297,17 @@ required check が fail して止まる。手元実行だけのゲートにし�
   `playwright-report` / `test-results`、`with.path` が `playwright-report/` / `test-results/`。
 - `if-no-files-found == warn`、`retention-days == 30`。
 - upload 後の summary step が `$GITHUB_STEP_SUMMARY` と両 upload step の
-  `outputs.artifact-url`、および必須 fingerprint トークン（runner / node / Playwright / browser /
-  project / viewport / deviceScaleFactor / snapshotPathTemplate / baseline path / animations）を含む。
-- **fingerprint cross-validation（嘘防止）**: summary が echo する `viewport` /
-  `snapshotPathTemplate` / `maxDiffPixels` を `playwright.config.ts` と
-  `tests/e2e/m2-combat-mvp.spec.ts` の実値と照合する。config / spec を変更して summary を
-  更新し忘れた（またはその逆）場合は fail する。これにより fingerprint が「人間向けメモ」では
-  なく実際の比較条件を表す監査情報であることを保証する。
+  `outputs.artifact-url` / `outputs.artifact-id`、および必須 fingerprint トークン（runner /
+  node / Playwright / browser / project / viewport / deviceScaleFactor /
+  snapshotPathTemplate）を含む。
+- **capture 単位の cross-validation（嘘防止、PR #1813 review fix で単一 suite フィンガープリント
+  から全面移行）**: suite 単位の固定フィンガープリントは存在しない。summary が declare する
+  `CAPTURES` 配列の **全フィールド**（`spec_file` / `screenshot_name` / `registry_id` /
+  `directory` / `browser` / `project` / `viewport` / `device_scale_factor` / `comparator_kind` /
+  `comparator_value` / `style_path` / `artifact_scope` / `digest_env` / `retention_days`）を、
+  `tests/e2e/*.spec.ts`・`playwright.config.ts`・`tests/e2e/visual-utils.ts`・本台帳（registry
+  id ⇔ screenshot filename の対応）から独立に再導出した値と 1 フィールドずつ完全一致検査する。
+  いずれかのフィールドが drift した場合は hard fail する。
 
 ### artifact upload（証跡アップロード）
 
@@ -334,11 +339,41 @@ required check が fail して止まる。手元実行だけのゲートにし�
 - summary step は `$GITHUB_STEP_SUMMARY` に以下の環境 fingerprint と artifact link を記録する:
   runner / OS（`RUNNER_OS` / `RUNNER_ARCH` / image version）・Node version・Playwright version・
   browser（chromium）・project（`chromium` / `Desktop Chrome`）・viewport（1280x720）・
-  deviceScaleFactor（1）・`snapshotPathTemplate`・baseline path・screenshot options
-  （`animations` / `maxDiffPixels`）・`outputs.artifact-url`。
+  deviceScaleFactor（1）・`snapshotPathTemplate`・`outputs.artifact-url`・
+  `outputs.artifact-digest`（GitHub 公式 digest。capture 単位の digest 列が参照する）。
+  baseline path や screenshot options（`animations` / `maxDiffPixels`）といった suite 単位の
+  固定値は記録しない — capture ごとに directory / comparator が異なり得るため、下記
+  「capture 単位の CI 証跡契約」の表でのみ表現する。
 - actual / expected / diff は **visual mismatch が発生した場合のみ** `test-results` artifact 内
   の参照として記録し、存在しない場合（pass 時）は **N/A と明記する**。常に link を要求しない
   （pass run では actual/expected/diff が存在しないため）。
+
+### capture 単位の CI 証跡契約（Issue #1387 で追加）
+
+- CI summary と `scripts/check-visual-artifact-pipeline.py` は、e2e ジョブ全体を単一の
+  suite フィンガープリントとして扱うのではなく、個々の VRT **capture**（test file 内の
+  個別の `toHaveScreenshot()` / `expectDomOverlayScreenshot()` 呼び出し）を列挙する。
+- 各 capture の screenshot directory / browser / project / viewport / deviceScaleFactor /
+  comparator 種別と値（`maxDiffPixels` または `maxDiffPixelRatio` のいずれか一方）/
+  stylePath 有無 / artifact scope（`job` か `suite` か）/ artifact URL / digest /
+  retention を summary が出力し、validator がこれを spec ファイル・
+  `playwright.config.ts`・`tests/e2e/visual-utils.ts` の registry maturity・本台帳の
+  `artifact/test` 列（screenshot filename ⇔ registry id の対応。`toHaveScreenshot()` の直接
+  呼び出しは呼び出し箇所自体に registryId を持たないため）から再導出した値と cross-validate
+  する（drift すれば hard fail）。
+- digest は GitHub `upload-artifact` の公式 `outputs.artifact-digest` を使う。リポジトリ側で
+  独自計算する tree digest は使わない — hidden file の扱いなど upload 対象集合と食い違い得る
+  ローカル計算より、プラットフォーム自身の digest を正本とする。
+- 現行の active capture はすべて標準 `e2e` ジョブ内で実行され、`test-results/` /
+  `playwright-report/` という単一のジョブ単位 artifact を共有する
+  （artifact scope: `job`。suite 単位の分離 artifact は現状存在しない）。
+- `pending-baseline`（maturity）の registryId を参照する capture は、
+  `expectDomOverlayScreenshot()` 側で実行時に fail closed するため、決して
+  active capture として宣言してはならない。validator はこれを registry
+  maturity 側から独立に検査する。
+- validator が静的に解釈できない `toHaveScreenshot()` 呼び出し（options-only の暗黙 name、
+  引数なし呼び出し、name/registryId が解釈不能な呼び出し）は、黙って active capture 列挙から
+  除外（skip）せず hard fail する。実在する capture が気づかれずに証跡契約から漏れることを防ぐ。
 
 ### component VRT / active suite 依存（コンポーネント視覚テストの前提）
 
@@ -346,6 +381,13 @@ required check が fail して止まる。手元実行だけのゲートにし�
   これらと対象 overlay module の 3 要件が揃うまでは、Component VRT は未導入として扱い、
   上記 `running-hud-paused` / `result-overlay-timeout` /
   `final-no-command-rail` は `pending-baseline` 維持とする。
+- **Playwright / Vitest baseline root 分離契約**: Playwright E2E VRT の baseline は
+  `tests/e2e/__screenshots__/` 配下にのみ置く。将来 Vitest component VRT を導入する
+  際は、専用の別ルート `tests/component/__screenshots__/`（予約済み）配下にのみ
+  baseline を置き、両者のディレクトリを混線させない。
+  `scripts/check-visual-artifact-pipeline.py` はこの 2 ルートを定数として保持し、
+  capture の宣言ディレクトリがどちらのルートにも一致しない、または誤って
+  Vitest 側ルートに置かれている場合は hard fail する。
 - `active CI suites` と `check-visual-artifact-pipeline` の `cross-validation` が揃っていない場合、`legacy-current` / `pending-baseline`
   からの frozen 昇格は保留する。frozen 昇格時には `merged PR SHA`、`CI summary`、`artifact path` を再確認する。
 - `focus` / `inert` / `keyboard` / `dialog` の振る舞いを理由に frozen 昇格を代替しない。#1373-#1376 の
