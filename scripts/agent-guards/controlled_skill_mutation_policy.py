@@ -574,6 +574,10 @@ _EXECUTOR_VALUE_FLAGS: frozenset[str] = frozenset({
     "--verdict",
     "--reviewed-head-sha",
     "--expected-head-sha",
+    # Issue #1822 fix_delta AC7: pr_review.publish PR number, distinct from
+    # --issue-number. Command-id/mode-specific grammar (see
+    # _PR_REVIEW_PUBLISH_ONLY_FLAGS below) restricts when this flag may appear.
+    "--pr-number",
 })
 _EXECUTOR_BOOL_FLAGS: frozenset[str] = frozenset({
     "--json",
@@ -593,6 +597,23 @@ _EXECUTOR_RENDER_MODE_REQUIRED_FLAGS: frozenset[str] = frozenset({
     "--verdict",
     "--reviewed-head-sha",
     "--expected-head-sha",
+    # Issue #1822 fix_delta AC7: render mode for pr_review.publish requires an
+    # explicit --pr-number (checked jointly with --command-id pr_review.publish
+    # in _validate_executor_argv; this set alone only enforces presence).
+    "--pr-number",
+})
+
+# Issue #1822 fix_delta AC7: flags that only pr_review.publish may ever use.
+# Any other command-id that carries one of these flags is rejected outright
+# (render mode itself, --merge-ready, and --pr-number are all pr_review.publish
+# -only surface area).
+_PR_REVIEW_PUBLISH_ONLY_FLAGS: frozenset[str] = frozenset({
+    "--pr-number",
+    "--render-body-file",
+    "--verdict",
+    "--reviewed-head-sha",
+    "--expected-head-sha",
+    "--merge-ready",
 })
 
 # Shell metacharacters that make a command unparseable / compound
@@ -614,6 +635,7 @@ def _validate_executor_argv(args: list[str]) -> bool:
     those are enforced by the executor itself.
     """
     seen: set[str] = set()
+    values: dict[str, str] = {}
     i = 0
     while i < len(args):
         tok = args[i]
@@ -637,6 +659,7 @@ def _validate_executor_argv(args: list[str]) -> bool:
             val = args[i + 1]
             if val.startswith("--"):
                 return False  # value looks like another flag
+            values[tok] = val
             i += 2
             continue
         # Unknown flag
@@ -654,6 +677,28 @@ def _validate_executor_argv(args: list[str]) -> bool:
         return False
     if has_render_mode and not _EXECUTOR_RENDER_MODE_REQUIRED_FLAGS.issubset(seen):
         return False
+
+    # Issue #1822 fix_delta AC7: --pr-number and the other pr_review.publish
+    # -only flags are gated by --command-id, not merely by input-file vs.
+    # render mode. This closes the gap where any command-id could smuggle
+    # --pr-number / render-mode flags through the executor argv shape.
+    command_id = values.get("--command-id")
+    if command_id == COMMAND_ID_PR_REVIEW_PUBLISH:
+        # render mode requires an explicit --pr-number (already enforced via
+        # _EXECUTOR_RENDER_MODE_REQUIRED_FLAGS.issubset(seen) above, but this
+        # explicit check documents/guards intent even if that set changes).
+        if has_render_mode and "--pr-number" not in seen:
+            return False
+        # input-file mode must NOT carry --pr-number: the PR number for that
+        # mode lives inside the input file's PR_REVIEW_PUBLISH_REQUEST_V1
+        # payload, not on the CLI.
+        if has_input_file and "--pr-number" in seen:
+            return False
+    else:
+        # Any other command-id must not carry pr_review.publish-only flags at
+        # all (--pr-number, render mode flags, --merge-ready).
+        if seen & _PR_REVIEW_PUBLISH_ONLY_FLAGS:
+            return False
 
     return True
 
