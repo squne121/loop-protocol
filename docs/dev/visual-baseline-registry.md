@@ -97,7 +97,7 @@ registry は推測ではなく現行テスト実体に基づいて分類する�
 |---|---|---|---|---|---|---|---|---|---|
 | timeout-overlay | screenshot-baseline | frozen | `tests/e2e/__screenshots__/m2-combat-mvp.spec.ts/m2-timeout-overlay-baseline.png`（`m2-combat-mvp.spec.ts` の timeout overlay baseline test） | #732 / #681 / #747 | timeout は defeat ではない中立終了表示であること・背景 tint・可読性・整数段階表示 | 色味 / 最終配置は UI 再設計で変更可 | `maxDiffPixels: 1`（理由: CI Chromium + 固定 viewport 1280x720 + 決定論的 E2E モード前提でのみ妥当） | 意図した視覚仕様変更を人間がレビューし承認した場合のみ（§4 checklist 経由） | #727（HUD/layout 再設計） |
 | running-hud | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/m2-combat-mvp.spec.ts/m2-running-hud-baseline.png`（`m2-combat-mvp.spec.ts` の running HUD baseline test、`[data-field="sortie-status"]` 単一 field、118x66px） | #681 / #726 / #727 / #1370 / #1375 / #1377 / #1380 | running HUD が描画されること・HULL/HP の小数露出がないこと・桁溢れがないこと | 色味 / 詳細配置 / right rail 依存は再設計まで可変 | `maxDiffPixelRatio: 0.08`（PR #1721 review fix で実コードに合わせて修正。理由: legacy-current・単一 field の小capture。#727 再設計時に再評価する） | #727 再開時または #1370 / #1375 / #1377 / #1380 系の overlay rollout 進行時に破棄 / 再分類可 | #727 / #1370 / #1375 / #1377 / #1380（HUD/layout 再設計と overlay rollout） |
-| running-hud-overlay-legacy-current | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-running-hud-overlay.png`（`tests/e2e/visual-overlay.spec.ts` の `[data-battle-ui-root]` DOM overlay baseline test） | #1386 / #1380 / #1370 | `[data-battle-ui-root]` DOM overlay 全体（HUD 各 field を含む）が描画されること。`running-hud`（`m2-combat-mvp.spec.ts` の単一 field baseline）とは別の独立した baseline であり、両者は衝突しない | 色味 / 詳細配置 / right rail・command-rail 依存は再設計まで可変。将来の overlay 再設計で `frozen` 化するまでは legacy-current のまま | `maxDiffPixels: 100`（絶対ピクセル数。理由: capture root が canvas mask を含み全体の過半を占めるため `maxDiffPixelRatio` は不採用。非mask領域のfont-rasterizationノイズに対しこのworktree環境で複数回実測し PASS した最小幅に margin を加えた値。`tests/e2e/visual.freeze.css` で capture root 配下の font-family を generic family（`sans-serif`）に固定し、host font fallback chain 依存を除去済み） | §4 の `maturity transition` を満たした時点で `legacy-current -> frozen`（#1375/#1376/#1377 マージ後） | #1375 / #1376 / #1377 / #1380（overlay UI 実装マージで破棄・再生成対象） |
+| running-hud-overlay-legacy-current | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-running-hud-overlay.png`（`tests/e2e/visual-overlay.spec.ts` の `[data-battle-ui-root]` DOM overlay baseline test） | #1386 / #1380 / #1370 / #1374 | `[data-battle-ui-root]` DOM overlay 全体（HUD 各 field を含む）が描画されること。`running-hud`（`m2-combat-mvp.spec.ts` の単一 field baseline）とは別の独立した baseline であり、両者は衝突しない | 色味 / 詳細配置 / right rail・command-rail 依存は再設計まで可変。将来の overlay 再設計で `frozen` 化するまでは legacy-current のまま | `maxDiffPixels: 100`（絶対ピクセル数。理由: capture root が canvas mask を含み全体の過半を占めるため `maxDiffPixelRatio` は不採用。非mask領域のfont-rasterizationノイズに対しこのworktree環境で複数回実測し PASS した最小幅に margin を加えた値。`tests/e2e/visual.freeze.css` で capture root 配下の font-family を generic family（`sans-serif`）に固定し、host font fallback chain 依存を除去済み） | §4 の `maturity transition` を満たした時点で `legacy-current -> frozen`（#1375/#1376/#1377 マージ後） | #1375 / #1376 / #1377 / #1380（overlay UI 実装マージで破棄・再生成対象） |
 | defeat-overlay | pixel-contract | predicate-only | `getImageData` smoke（`m2-combat-mvp.spec.ts` の defeat overlay 赤支配ピクセル検証 / AC8） | #681 / #732 | defeat overlay が赤系・終端状態として識別可能であること | exact pixels は未固定。最終 layout / 色味は未確定 | N/A（screenshot baseline ではない） | predicate（赤支配）が壊れた場合のみテスト側を調整 | #727 |
 | hp-label | predicate-only | predicate-only | HP label bounds smoke（`m2-combat-mvp.spec.ts` の HP label bounding box 検証 / AC5） | #726 / #727 | HP label が viewport 外 / NaN 表示にならない・bounds 内・可読であること | 最終 UI 表現 / 配置は未固定 | N/A（screenshot baseline ではない） | predicate（bounds / 可読）が壊れた場合のみテスト側を調整 | #727 |
 | running-hud-paused | screenshot-baseline | pending-baseline | pending: no PNG/test | #1380 / #1375 / #1376 / #1377 / #1391 | running HUD の停止状態でも command-rail / right rail / two-column shell / `.battle-stage` 外 controls への依存がないことを明示し、pause overlay の focus / inert / keyboard 証跡を #1376 側で確認する | frozen 適用対象外。duration 等の固定は `durationMs` / `fixedDeltaMs` で判定可能な場合に限定 | pending: no PNG/test（active PASS claim 保留） | §4 の `maturity transition` を満たした時点で `pending-baseline -> frozen` | #1370 / #1375 / #1376 / #1377 / #1380 |
@@ -215,6 +215,34 @@ defeat-overlay は **#681 時点では screenshot-baseline 候補**として扱�
 - **削除 follow-up Issue（必須）**: 削除は follow-up Issue **#761** で実施する。`tests/e2e/__screenshots__/**`
   は本 Issue（#749）の Allowed Paths 外のため本 PR では削除しない。削除完了までの残置は
   本台帳に登録しないことで新たな frozen 契約を生まない扱いとする（#761 でファイル削除を完了する）。
+
+### running-hud-overlay-legacy-current の #1374 baseline 更新（明示）
+
+Issue #1374（title / preparation を phase screen overlay に移す）は AC3 の要求どおり、
+`running` phase で title / preparation の大パネルを `hidden` + `inert` にし、tab order
+から除外する実装を追加した。この実装により `[data-battle-ui-root]` の running-hud
+capture 内で表示される要素構成が変化し、`running-hud-overlay-legacy-current` の
+既存 baseline（`vrt-running-hud-overlay.png`）との間に `maxDiffPixels: 100` を超える
+差分（約 2%、12000px 台）が生じた。
+
+- **判断根拠**: この差分は意図しない退行ではなく、AC3 が明示的に要求する仕様変更
+  （running 中の title/preparation 大パネルの hidden/inert 化）の意図した副作用である
+  （§4 checklist の「意図した仕様変更か退行固定化かの判断」に基づく確認）。
+- **Scope Delta**: `tests/e2e/__screenshots__/`（本 baseline PNG）と本ファイル
+  （`docs/dev/visual-baseline-registry.md`）は Issue #1374 契約の元の Allowed Paths に
+  含まれていなかったため、本更新は Issue #1374 に対する Scope Delta として Allowed Paths を
+  拡張した上で行う（人間承認: Issue #1374 実装ループ内, PR #1815 iteration 3 対応）。
+- **evidence**: PR #1815（`worktree-issue-1374-phase-screen-overlay`）。`test-results/` の
+  `*-actual.png` / `*-diff.png` で差分を目視確認した上で baseline を再生成した
+  （`playwright test tests/e2e/visual-overlay.spec.ts --update-snapshots`）。再生成後は
+  同一コマンドの非 update 実行で PASS することを確認済み。
+- **maturity**: 変更なし（`legacy-current` のまま）。`frozen` 化条件（#1375/#1376/#1377
+  マージ後）は本更新の対象外。
+- **environment fingerprint**: 本更新はローカル worktree 環境（Linux, Chromium,
+  Playwright config 既定 viewport, `tests/e2e/visual.freeze.css` の generic
+  `sans-serif` 固定込み）で生成した。CI 環境（GitHub Actions ubuntu runner）との
+  fingerprint 一致は、本 PR の CI `e2e` job の実行結果で確認する
+  （§5 の summary step 参照）。差異が生じた場合は追加の baseline 再生成が必要になる。
 
 ## 4. baseline update policy（更新ポリシー）
 
