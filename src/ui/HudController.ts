@@ -209,7 +209,7 @@ export function createHudController(
       data-action="load-game"
       data-battle-interactive="true"
     >Open save</button>
-    <section class="panel panel-screen" data-phase-screen="preparation">
+    <section class="panel">
       <p class="eyebrow">Progress</p>
       <dl class="stat-grid">
         <div><dt>Hull</dt><dd data-field="hp"></dd></div>
@@ -225,6 +225,9 @@ export function createHudController(
         <div><dt>Duration</dt><dd data-field="sortie-duration"></dd></div>
         <div><dt>Outcome</dt><dd data-field="sortie-result"></dd></div>
       </dl>
+    </section>
+    <section class="panel panel-screen" data-phase-screen="preparation">
+      <p class="eyebrow">Preparation</p>
       <button type="button" data-action="start-sortie" data-battle-interactive="true">Launch sortie</button>
       <button type="button" data-action="save" data-battle-interactive="true">Save progress</button>
       <button type="button" data-action="preparation-load" data-battle-interactive="true">Open save</button>
