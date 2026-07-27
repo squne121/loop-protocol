@@ -602,6 +602,72 @@ def test_given_online_run_when_readback_candidate_exists_then_native_dependencie
     assert set(payload["dependency_resolution"]["native_dependency_candidates_fetched"]) == readback_numbers
 
 
+def test_given_closed_native_predecessor_outside_candidate_pool_when_fetched_then_readback_is_complete(
+    monkeypatch, capsys
+) -> None:
+    """CLOSED native ``blockedBy`` predecessor は候補外でも個別取得して readback する。"""
+    current_raw = json.loads(
+        (_FIXTURES_DIR / "current_with_native_blocked_by_closed.json").read_text(encoding="utf-8")
+    )
+    predecessor_raw = json.loads(
+        (_FIXTURES_DIR / "candidates_closed_predecessor.json").read_text(encoding="utf-8")
+    )[0]
+    predecessor_number = predecessor_raw["number"]
+    fetched_predecessors: List[int] = []
+
+    def fake_fetch_current_issue(repo, issue_number):
+        assert repo == REPO
+        assert issue_number == current_raw["number"]
+        return dict(current_raw)
+
+    def fake_fetch_all_native_dependencies(repo, issue_number):
+        assert repo == REPO
+        if issue_number == current_raw["number"]:
+            return {
+                "blockedBy": (
+                    {
+                        "repository": REPO,
+                        "number": predecessor_number,
+                        "state": "CLOSED",
+                    },
+                ),
+                "blocking": (),
+            }
+        return {"blockedBy": (), "blocking": ()}
+
+    def fake_fetch_predecessor_issue(repo, issue_number):
+        assert repo == REPO
+        fetched_predecessors.append(issue_number)
+        return dict(predecessor_raw) if issue_number == predecessor_number else None
+
+    monkeypatch.setattr(module, "fetch_current_issue", fake_fetch_current_issue)
+    monkeypatch.setattr(module, "fetch_issue_comments", lambda repo, issue_number: [])
+    monkeypatch.setattr(
+        module,
+        "fetch_implementation_candidates",
+        lambda repo, limit: ([], _fake_source_metadata(0)),
+    )
+    monkeypatch.setattr(module, "fetch_all_native_dependencies", fake_fetch_all_native_dependencies)
+    monkeypatch.setattr(module, "fetch_predecessor_issue", fake_fetch_predecessor_issue)
+
+    exit_code = module.run(["--issue-number", str(current_raw["number"]), "--repo", REPO])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0, payload
+    assert fetched_predecessors == [predecessor_number]
+    assert payload["route"] == "proceed_with_collision_evidence", payload
+    assert payload["dependency_resolution"]["closed_predecessors"] == [predecessor_number]
+    evidence = next(
+        candidate
+        for candidate in payload["candidates"]
+        if candidate["issue_number"] == predecessor_number
+    )
+    assert evidence["readback_complete"] is True
+    assert "closed_predecessor_via_blocked_by" in evidence["reasons"]
+    assert "readback_confirmed_disjoint" in evidence["reasons"]
+    assert "readback_incomplete_missing_outcome_or_in_scope" not in evidence["reasons"]
+
+
 def test_given_online_run_when_no_readback_candidate_then_native_dependencies_fetched_only_for_current(
     monkeypatch, capsys
 ) -> None:
