@@ -7,12 +7,14 @@ AC1  test_render_mode_requires_pr_number
 AC2  test_render_mode_issue_number_and_pr_number_distinct
 AC3  test_render_mode_idempotency_key_uses_pr_number
 AC4  test_render_mode_fail_closed_on_head_mismatch
+AC9  test_input_file_mode_rejects_issue_pr_number_mismatch (fix_delta)
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -318,4 +320,51 @@ class TestAC4FailClosedOnHeadMismatch:
                         rel, issue_number=ISSUE_NUMBER, pr_number=PR_NUMBER,
                     ))
         assert rc == 1
+        mock_post.assert_not_called()
+
+
+
+class TestAC9InputFileModeEnforcesIssuePrMatch:
+    """AC9 (fix_delta): the legacy --input-file code path must still reject
+    pr_number != issue_number -- only render mode treats them as independent
+    identifiers. This restores the pre-#1822 behavior for --input-file mode
+    while keeping render mode's Issue/PR separation intact."""
+
+    def _write_input_file(self, tmp_project, issue_number: int, data: dict) -> str:
+        d = (
+            tmp_project / "artifacts" / str(issue_number) / "issue-metadata"
+            / COMMAND_ID_PR_REVIEW_PUBLISH
+        )
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / "in.json"
+        p.write_text(json.dumps(data))
+        return f"artifacts/{issue_number}/issue-metadata/{COMMAND_ID_PR_REVIEW_PUBLISH}/in.json"
+
+    def test_input_file_mode_rejects_issue_pr_number_mismatch(self, tmp_project, monkeypatch):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        body, body_sha256 = _APPROVE_BODY, hashlib.sha256(_APPROVE_BODY.encode("utf-8")).hexdigest()
+        data = {
+            "schema": "PR_REVIEW_PUBLISH_REQUEST_V1",
+            "issue_number": ISSUE_NUMBER,
+            "repo": TRUSTED_REPO,
+            "pr_number": PR_NUMBER,
+            "expected_head_sha": HEAD_SHA,
+            "event": "COMMENT",
+            "body": body,
+            "body_sha256": body_sha256,
+            "producer_role": "pr-reviewer",
+            "idempotency_key": f"{TRUSTED_REPO}:{PR_NUMBER}:{HEAD_SHA}:{body_sha256}",
+        }
+        rel = self._write_input_file(tmp_project, ISSUE_NUMBER, data)
+        p1, p2 = _base_patches()
+        with p1, p2:
+            with patch.object(_exec, "_post_pr_review") as mock_post:
+                rc = _exec.main([
+                    "--command-id", COMMAND_ID_PR_REVIEW_PUBLISH,
+                    "--issue-number", str(ISSUE_NUMBER),
+                    "--input-file", rel,
+                    "--repo", TRUSTED_REPO,
+                    "--json",
+                ])
+        assert rc == 2
         mock_post.assert_not_called()

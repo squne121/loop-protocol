@@ -139,7 +139,7 @@ merge_ready は impl-review-loop の終端条件。
 pr-reviewer（本 SubAgent）は `Edit`/`Write`/`MultiEdit` を持たず、Bash 経由のファイル書き込みも禁止されている（`disallowedTools`）。そのため `PR_REVIEW_PUBLISH_REQUEST_V1` の JSON（`body_sha256` / `idempotency_key` / `producer_role` を含む）を自ら組み立てて `--input-file` に渡すことはできない（Issue #1539 fix_delta Blocker 1）。
 
 - pr-reviewer は verdict 本文（`LOOP_VERDICT_V2` フェンス YAML を含む Markdown）と `verdict` / `merge_ready` / `reviewed_head_sha` を構造化出力として **呼び出し元（impl-review-loop control-plane）に返すのみ**。JSON の組み立て・ハッシュ計算・`producer_role` の付与は行わない。
-- 呼び出し元（Write ツールを持つ trusted orchestrator）が、pr-reviewer の返した本文テキストをそのまま `artifacts/<PR番号>/issue-metadata/pr_review.publish/<name>.md` に書き込み（本文のみ。ハッシュや schema は含まない）、controlled review publisher を **render mode** で起動する。呼び出しコマンド例:
+- 呼び出し元（Write ツールを持つ trusted orchestrator）が、pr-reviewer の返した本文テキストをそのまま `artifacts/<紐づく Issue番号>/issue-metadata/pr_review.publish/<name>.md` に書き込み（本文のみ。ハッシュや schema は含まない）、controlled review publisher を **render mode** で起動する。呼び出しコマンド例:
 
 ```bash
 uv run --locked python3 scripts/agent-guards/controlled_skill_mutation_exec.py \

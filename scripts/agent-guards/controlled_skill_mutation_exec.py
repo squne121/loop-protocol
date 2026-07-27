@@ -572,11 +572,19 @@ _PR_REVIEW_PUBLISH_ALLOWED_KEYS = frozenset({
 _PR_REVIEW_BODY_MAX_BYTES = 60000
 
 
-def _validate_pr_review_publish_fields(data: dict, repo: str, issue_number: int) -> str:
+def _validate_pr_review_publish_fields(
+    data: dict, repo: str, issue_number: int, enforce_issue_pr_match: bool = False
+) -> str:
     """Issue #1536 AC1/AC2/AC5/AC6: PR_REVIEW_PUBLISH_REQUEST_V1 field validation.
 
     All checks below run before any GitHub API call (AC2/AC3/AC5 require
     fail-closed rejection with zero remote side effect for malformed input).
+
+    Issue #1822 fix_delta AC9: `enforce_issue_pr_match` restores the legacy
+    `pr_number == issue_number` binding for the legacy `--input-file` code
+    path ONLY. Render mode (Issue #1822 AC1-AC3) intentionally treats
+    issue_number and pr_number as independent identifiers (e.g. Issue #1688 ->
+    PR #1818) and must call this with `enforce_issue_pr_match=False`.
     """
     unknown_keys = set(data.keys()) - _PR_REVIEW_PUBLISH_ALLOWED_KEYS
     if unknown_keys:
@@ -586,13 +594,12 @@ def _validate_pr_review_publish_fields(data: dict, repo: str, issue_number: int)
     if declared_repo != repo:
         return f"pr_review_publish_repo_mismatch: {declared_repo!r} != {repo!r}"
 
-    # Issue #1822: pr_number and issue_number are independent identifiers
-    # (linked Issue vs target PR are commonly different, e.g. Issue #1688 ->
-    # PR #1818). pr_number is validated as a standalone positive int only --
-    # it is never compared against issue_number.
     pr_number = data.get("pr_number")
     if type(pr_number) is not int or pr_number <= 0:
         return f"pr_review_publish_pr_number_invalid: {pr_number!r}"
+
+    if enforce_issue_pr_match and pr_number != issue_number:
+        return f"pr_review_publish_pr_number_issue_number_mismatch: {pr_number!r} != {issue_number!r}"
 
     expected_head_sha = data.get("expected_head_sha")
     if not isinstance(expected_head_sha, str) or not _PR_HEAD_SHA_RE.match(expected_head_sha):
@@ -1219,7 +1226,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command_id == COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE:
         return _run_issue_scope_snapshot_materialize(args, input_data, gh_bin, _fail, _ok)
     if args.command_id == COMMAND_ID_PR_REVIEW_PUBLISH:
-        return _run_pr_review_publish(args, input_data, gh_bin, _fail, _ok)
+        # Issue #1822 fix_delta AC9: the issue_number/pr_number match
+        # requirement is restored for the legacy --input-file code path
+        # ONLY. Render mode keeps them independent (Issue #1822 AC1-AC3).
+        return _run_pr_review_publish(
+            args, input_data, gh_bin, _fail, _ok, enforce_issue_pr_match=not render_mode
+        )
     if args.command_id == COMMAND_ID_ISSUE_DEPENDENCY_REMOVE:
         return _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok)
 
@@ -2119,8 +2131,12 @@ def _render_pr_review_publish_request(args, project_root: Path) -> tuple[dict | 
     }, ""
 
 
-def _run_pr_review_publish(args, input_data, gh_bin, _fail, _ok) -> int:
-    field_err = _validate_pr_review_publish_fields(input_data, args.repo, args.issue_number)
+def _run_pr_review_publish(
+    args, input_data, gh_bin, _fail, _ok, enforce_issue_pr_match: bool = False
+) -> int:
+    field_err = _validate_pr_review_publish_fields(
+        input_data, args.repo, args.issue_number, enforce_issue_pr_match=enforce_issue_pr_match
+    )
     if field_err:
         return _fail(field_err)
 
