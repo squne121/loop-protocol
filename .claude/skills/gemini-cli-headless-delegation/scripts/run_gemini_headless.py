@@ -2647,7 +2647,7 @@ def _build_agy_inner_argv(agy_bin: str, prompt: str, model: str | None = None) -
     return argv
 
 
-def _validate_agy_invocation_argv(argv: list[str]) -> None:
+def _validate_agy_invocation_argv(argv: list[str], *, approved_models: "frozenset[str] | None" = None) -> None:
     """Fail-closed positional structure allowlist for the agy invocation argv
     (Issue #1807, AC1/AC9 permission-bypass-flag-rejection defense-in-depth).
 
@@ -2661,8 +2661,14 @@ def _validate_agy_invocation_argv(argv: list[str]) -> None:
       arbitrary prompt text is not itself a flag-injection vector because
       it occupies a fixed positional slot, never parsed as an option)
     - the remaining trailing argv must be either empty, or exactly
-      `["--model", <model>]` where `<model>` is a non-empty string that
-      does not itself look like another flag (does not start with `-`)
+      `["--model", <model>]` where `<model>` is a syntactically-valid model
+      token (a non-empty string that does not itself look like another flag
+      -- does not start with `-`) and, when *approved_models* is supplied,
+      is also a member of that set (Issue #1807 fix_delta Blocker/Medium 1
+      -- `_run_agy()` passes the caller's resolved
+      `roles.grounded_research.model_chain` here so an unknown/corrupted
+      model value cannot pass this allowlist merely by being
+      syntactically well-formed)
 
     Any other trailing content (including a known-real flag such as
     `--dangerously-skip-permissions`, or any other unrecognized option) is
@@ -2671,14 +2677,22 @@ def _validate_agy_invocation_argv(argv: list[str]) -> None:
     known flag names.
 
     Raises `AgyInvocationPolicyError` on any violation; callers must not
-    pass the resulting argv to `subprocess.run()`.
+    pass the resulting argv to `subprocess.run()`. The exception message is
+    a structural diagnostic only (index / count / whether a value looked
+    like a flag) -- it never echoes the rejected argv or option values
+    verbatim (Issue #1807 fix_delta Blocker 2: a future builder defect that
+    smuggled a secret-bearing option, e.g. `--api-key <value>`, into this
+    argv must not turn this fail-closed rejection path itself into a
+    secret-exfiltration path via `stderr` / `warnings` / `failure_reason`,
+    all of which are populated verbatim from this exception's message by
+    `run_delegation()`).
     """
     if len(argv) < 3:
         raise AgyInvocationPolicyError(
-            f"agy invocation argv too short (expected at least [agy_bin, '-p', prompt]): {argv!r}"
+            f"agy invocation argv too short (expected at least [agy_bin, '-p', prompt]); argv_len={len(argv)}"
         )
     if argv[1] != "-p":
-        raise AgyInvocationPolicyError(f"agy invocation argv index 1 must be '-p', got {argv[1]!r}")
+        raise AgyInvocationPolicyError("agy invocation argv rejected: index 1 must be the literal '-p' flag")
     trailing = argv[3:]
     if trailing:
         if (
@@ -2688,22 +2702,82 @@ def _validate_agy_invocation_argv(argv: list[str]) -> None:
             or not trailing[1]
             or trailing[1].startswith("-")
         ):
+            # Only surface option_name when it looks like a flag (starts with
+            # "-"); a bare positional value (e.g. an argument that should
+            # have been paired with a flag) is never echoed, since it may
+            # itself be an option *value* rather than an option *name*.
+            option_name = trailing[0] if isinstance(trailing[0], str) and trailing[0].startswith("-") else "<redacted>"
             raise AgyInvocationPolicyError(
-                "agy invocation argv trailing options must be empty or exactly "
-                f"['--model', <model>]; got {trailing!r}"
+                "agy invocation argv rejected: unexpected trailing option(s) after the approved "
+                f"[-p, <prompt>] prefix; trailing_arg_count={len(trailing)}, "
+                f"option_name={option_name!r}, option_value=<redacted>"
+            )
+        if approved_models is not None and trailing[1] not in approved_models:
+            raise AgyInvocationPolicyError(
+                "agy invocation argv rejected: --model value is not a member of the approved "
+                f"model chain; approved_model_count={len(approved_models)}, option_value=<redacted>"
             )
 
 
+def _sanitize_agy_argv_for_audit(argv: list[str]) -> list[str]:
+    """Build a sanitized, displayable copy of an *already-validated* agy
+    invocation argv for audit purposes (Issue #1807 fix_delta Blocker 1).
+
+    Unlike `_build_agy_raw_command()` (retained only as a fallback -- see
+    `_get_agy_audit_raw_command()` -- for call sites that never reached a
+    real, validated argv), this function derives the sanitized form from the
+    *exact* argv that was passed to `_validate_agy_invocation_argv()` and
+    then to `subprocess.run()`, so an execution that included `--model
+    <selected_model>` can never be audited as if it had not.
+
+    Replaces the prompt (index 2) with the placeholder `<prompt>` and
+    basename-izes the executable (index 0) so no absolute path/prompt text
+    leaks into `raw_command`. The rest of the argv (currently: nothing, or
+    `--model <model>`) is preserved verbatim -- Issue #1807's positional
+    allowlist already guarantees only that shape can ever reach this
+    function once validation has passed, so no option value here can be a
+    secret.
+    """
+    if not argv:
+        return []
+    sanitized = list(argv)
+    agy_bin = sanitized[0]
+    if os.sep in agy_bin or (os.altsep and os.altsep in agy_bin):
+        agy_bin = os.path.basename(agy_bin) or "agy"
+    sanitized[0] = agy_bin
+    if len(sanitized) > 2:
+        sanitized[2] = "<prompt>"
+    return sanitized
+
+
 def _build_agy_raw_command(prompt: str) -> list[str]:
-    """Build sanitized raw_command for agy execution.
+    """Build a *placeholder* sanitized raw_command for agy execution.
 
     Returns a placeholder representation that does NOT include the actual
-    prompt text, absolute paths, or secrets — only the command basename.
+    prompt text, absolute paths, secrets, or any `--model` flag that may
+    have actually been used. This is a conservative fallback only -- call
+    sites that already have a real, validated invocation argv (i.e. every
+    code path downstream of a `_run_agy()` call that reached
+    `subprocess.run()`) MUST prefer `_get_agy_audit_raw_command()` /
+    `_sanitize_agy_argv_for_audit()` so `raw_command` reflects what actually
+    executed (Issue #1807 fix_delta Blocker 1). This function remains the
+    correct choice only for request-validation failures that occur *before*
+    any agy invocation argv was ever built.
+
+    Deliberately does NOT call `_build_agy_inner_argv()` (Issue #1807
+    fix_delta Blocker 2): this placeholder is also the safety net used when
+    `_validate_agy_invocation_argv()` has just rejected an argv, which can
+    include the case where `_build_agy_inner_argv()` itself is the
+    (hypothetical, future) defective component that produced the rejected
+    argv in the first place -- re-invoking that same possibly-still-broken
+    builder to construct even a placeholder could re-leak whatever it
+    fabricated. This function's shape is therefore a self-contained
+    constant with no dependency on the builder under audit.
     """
     agy_bin = str(os.environ.get("AGY_BIN") or "agy")
     if os.sep in agy_bin or (os.altsep and os.altsep in agy_bin):
         agy_bin = os.path.basename(agy_bin) or "agy"
-    return _build_agy_inner_argv(agy_bin, "<prompt>")
+    return [agy_bin, "-p", "<prompt>"]
 
 
 # Issue #1705: carries the current call's tool_profile from run_delegation()
@@ -2718,6 +2792,39 @@ def _build_agy_raw_command(prompt: str) -> list[str]:
 _AGY_TOOL_PROFILE_CTX: "contextvars.ContextVar[str | None]" = contextvars.ContextVar(
     "_agy_tool_profile_ctx", default=None
 )
+
+# Issue #1807 fix_delta Blocker 1: holds the sanitized, audit-display form
+# (`_sanitize_agy_argv_for_audit()`) of the *exact* argv that the most
+# recent `_run_agy()` call in this context validated and passed to
+# `subprocess.run()` -- including any `--model` flag actually used. `None`
+# whenever no such validated argv exists yet in the current context: before
+# the first real `_run_agy()` call, after `_validate_agy_invocation_argv()`
+# rejected the built argv (Blocker 2: a rejected argv is never surfaced via
+# this contextvar, so a future builder defect cannot leak rejected option
+# values through `raw_command` either), or when `_run_agy()` itself was
+# replaced by a test double that bypassed the real command-building code
+# path entirely. `run_delegation()` resets this to `None` before every
+# `_run_agy()` attempt (see `_get_agy_audit_raw_command()`) so a prior
+# attempt's value can never leak into a later attempt's result.
+_AGY_LAST_RAW_COMMAND_CTX: "contextvars.ContextVar[list[str] | None]" = contextvars.ContextVar(
+    "_agy_last_raw_command_ctx", default=None
+)
+
+
+def _get_agy_audit_raw_command() -> list[str]:
+    """Return the `raw_command` value for the current agy invocation
+    (Issue #1807 fix_delta Blocker 1).
+
+    Prefers the sanitized form of the argv that the most recent real
+    `_run_agy()` call in this context actually validated and executed
+    (`_AGY_LAST_RAW_COMMAND_CTX`), so a `--model` flag actually used is
+    always reflected in `raw_command`. Falls back to the placeholder
+    `_build_agy_raw_command("")` reconstruction only when no such value is
+    available (e.g. `_run_agy()` was replaced by a test double, or the
+    invocation argv was rejected by `_validate_agy_invocation_argv()` before
+    ever being set here).
+    """
+    return _AGY_LAST_RAW_COMMAND_CTX.get() or _build_agy_raw_command("")
 
 
 def _run_agy(
@@ -2760,6 +2867,7 @@ def _run_agy(
     agy_bin = str(os.environ.get("AGY_BIN") or "agy")
     tool_profile = _AGY_TOOL_PROFILE_CTX.get()
     selected_model: str | None = None
+    approved_models: "frozenset[str] | None" = None
     if tool_profile == GROUNDED_RESEARCH_PROFILE:
         # Issue #1777: capability-driven routing. Model selection is optional
         # -- resolve_agy_grounded_research_model() returns None (no --model
@@ -2768,6 +2876,14 @@ def _run_agy(
         # AGY_GROUNDED_RESEARCH_ROLE docstring above for why the former
         # hardcoded-model causal claim was corrected.
         selected_model = resolve_agy_grounded_research_model()
+        # Issue #1807 fix_delta Medium 1: the full configured model_chain
+        # (not just the single candidate resolve_agy_grounded_research_model()
+        # picked) is the approved model set -- passed to
+        # _validate_agy_invocation_argv() so a corrupted/unknown --model
+        # value can never pass the allowlist merely by being syntactically
+        # well-formed.
+        _approved_model_chain, _ = resolve_model_chain({"role": AGY_GROUNDED_RESEARCH_ROLE})
+        approved_models = frozenset(_approved_model_chain)
     # Issue #1807: build the real execution argv from the single canonical
     # `_build_agy_inner_argv()` builder (shared with the audit-display
     # `_build_agy_raw_command()`), then validate it against the positional
@@ -2777,7 +2893,14 @@ def _run_agy(
     # classifies into the `agy_invocation_policy_denied` failure_class
     # (distinct from `agy_permission_denied`; see failure-class-taxonomy.md).
     command = _build_agy_inner_argv(agy_bin, prompt, selected_model)
-    _validate_agy_invocation_argv(command)
+    _validate_agy_invocation_argv(command, approved_models=approved_models)
+    # Issue #1807 fix_delta Blocker 1: only once validation has actually
+    # succeeded is the sanitized form of *this exact* argv (including any
+    # --model flag) published for `raw_command` -- see
+    # `_AGY_LAST_RAW_COMMAND_CTX` / `_get_agy_audit_raw_command()`. A
+    # rejected argv never reaches this line, so it can never leak through
+    # `raw_command` either (Blocker 2).
+    _AGY_LAST_RAW_COMMAND_CTX.set(_sanitize_agy_argv_for_audit(command))
     if tool_profile in _agy_permission_policy.ALLOWED_PROFILES:
         workspace = _agy_permission_policy.materialize_isolated_agy_workspace(tool_profile)
         env = dict(workspace.env)
@@ -3412,7 +3535,7 @@ def _normalize_agy_result(
             "warnings": warnings,
             "failure_reason": warning,
             "failure_class": failure_class,
-            "raw_command": _build_agy_raw_command(""),
+            "raw_command": _get_agy_audit_raw_command(),
             "model_chain": [],
             "model_downgrades": [],
             "attempts_by_model": {"agy-default": 1},
@@ -3448,7 +3571,7 @@ def _normalize_agy_result(
             "warnings": [warning] + warnings,
             "failure_reason": failure_class,
             "failure_class": failure_class,
-            "raw_command": _build_agy_raw_command(""),
+            "raw_command": _get_agy_audit_raw_command(),
             "model_chain": [],
             "model_downgrades": [],
             "attempts_by_model": {"agy-default": 1},
@@ -3501,7 +3624,7 @@ def _normalize_agy_result(
         "warnings": warnings,
         "failure_reason": top_level_failure_reason,
         "failure_class": top_level_failure_class,
-        "raw_command": _build_agy_raw_command(""),
+        "raw_command": _get_agy_audit_raw_command(),
         "grounded_research_evidence": grounded_research_evidence,
         "model_chain": [],
         "model_downgrades": [],
@@ -5004,6 +5127,12 @@ def _run_delegation_core(
         result: dict[str, Any] | None = None
         for _agy_attempt_number in range(1, _agy_max_attempts + 1):
             try:
+                # Issue #1807 fix_delta Blocker 1/2: reset before every
+                # attempt so a prior attempt's validated raw_command can
+                # never leak into this attempt's result if this attempt's
+                # _run_agy() raises before reaching validation success (or
+                # is a test double that never sets it at all).
+                _AGY_LAST_RAW_COMMAND_CTX.set(None)
                 _agy_tool_profile_ctx_token = _AGY_TOOL_PROFILE_CTX.set(tool_profile)
                 try:
                     # Issue #1771 AC4: only pass run_context= at all when this is
@@ -5042,7 +5171,7 @@ def _run_delegation_core(
                     "warnings": [f"agy_timeout: process exceeded {timeout_sec_agy}s"],
                     "failure_reason": f"agy_timeout: process exceeded {timeout_sec_agy}s",
                     "failure_class": "agy_timeout",
-                    "raw_command": _build_agy_raw_command(""),
+                    "raw_command": _get_agy_audit_raw_command(),
                     "model_chain": [],
                     "model_downgrades": [],
                     "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
@@ -5073,7 +5202,7 @@ def _run_delegation_core(
                     "warnings": ["agy_not_found: agy binary not found in PATH"],
                     "failure_reason": "agy_not_found: agy binary not found in PATH",
                     "failure_class": "agy_not_found",
-                    "raw_command": _build_agy_raw_command(""),
+                    "raw_command": _get_agy_audit_raw_command(),
                     "model_chain": [],
                     "model_downgrades": [],
                     "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
@@ -5112,7 +5241,7 @@ def _run_delegation_core(
                     "warnings": ["agy_permission_denied: permission denied executing agy"],
                     "failure_reason": "agy_permission_denied: permission denied executing agy",
                     "failure_class": "agy_permission_denied",
-                    "raw_command": _build_agy_raw_command(""),
+                    "raw_command": _get_agy_audit_raw_command(),
                     "model_chain": [],
                     "model_downgrades": [],
                     "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
@@ -5150,7 +5279,7 @@ def _run_delegation_core(
                     "warnings": [f"agy_invocation_policy_denied: {exc}"],
                     "failure_reason": f"agy_invocation_policy_denied: {exc}",
                     "failure_class": "agy_invocation_policy_denied",
-                    "raw_command": _build_agy_raw_command(""),
+                    "raw_command": _get_agy_audit_raw_command(),
                     "model_chain": [],
                     "model_downgrades": [],
                     "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
@@ -5181,7 +5310,7 @@ def _run_delegation_core(
                     "warnings": [str(exc)],
                     "failure_reason": str(exc),
                     "failure_class": "agy_unexpected_error",
-                    "raw_command": _build_agy_raw_command(""),
+                    "raw_command": _get_agy_audit_raw_command(),
                     "model_chain": [],
                     "model_downgrades": [],
                     "local_asset_retrieval_metadata": local_asset_retrieval_metadata,
