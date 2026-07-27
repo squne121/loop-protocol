@@ -103,6 +103,7 @@ stdout / stderr の両方から判別する failure_class。`_normalize_agy_resu
 | `agy_empty_stdout` | 非 CI 環境で exit 0 だが stdout が空 | no |
 | `agy_output_missing` | CI 環境で exit 0 だが stdout が空（`agy_empty_stdout` と同一原因、CI 判定のみ異なる。#1274: `warnings[0]` の leading token は必ず `failure_class` と一致させる） | no |
 | `agy_unexpected_error` | AGY 実行時の未分類例外（terminal / non-retryable） | no |
+| `agy_invocation_policy_denied` | agy 実行用 argv が位置ベースの構造 allowlist （`_validate_agy_invocation_argv()`、Issue #1807）に違反（`--dangerously-skip-permissions` 等の permission-bypass flag を含む未知の trailing option 混入等）。`agy_permission_denied`（AGY 側/OS レベルの権限拒否）とは異なり、wrapper 側が `subprocess.run()` 呼び出し前にfail-closed で拒否したことを示す。retryable: false | no |
 
 ### provider_auto_policy_v1 fallback classes（フォールバック分類、Issue #1270）
 
