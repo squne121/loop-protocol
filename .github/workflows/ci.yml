@@ -1502,8 +1502,13 @@ jobs:
     if: ${{ github.event.inputs.python_test_bench != 'true' }}
     runs-on: ubuntu-latest
     outputs:
-      artifact_id: ${{ steps.upload-codex-execpolicy-artifacts.outputs.artifact-id }}
-      artifact_name: codex-execpolicy-${{ github.run_attempt }}
+      # Issue #1824 P1-4: ci-verdict-summary only needs the small status sentinel
+      # (a few KB), never the full evidence artifact -- see the split upload steps
+      # below. Downloading the status-only artifact avoids fetching the (formerly
+      # ~110MB) npm install tree that used to be nested inside
+      # codex_execpolicy_artifacts/.
+      artifact_id: ${{ steps.upload-codex-execpolicy-status.outputs.artifact-id }}
+      artifact_name: codex-execpolicy-status-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -1547,8 +1552,15 @@ jobs:
           # The required gate is fail-closed only if install, version, and
           # `codex execpolicy check --help` all succeed inside the same
           # artifact-writing orchestrator.
+          # Issue #1824 P1-4: --npm-prefix installs the FULL @openai/codex npm
+          # package tree (node_modules, native binaries, etc) -- several orders of
+          # magnitude larger than the JSON evidence this job actually needs to
+          # keep. Installing it OUTSIDE codex_execpolicy_artifacts/ (the directory
+          # actually uploaded as an artifact below) is the fix for the reported
+          # ~110MB codex-execpolicy-1 artifact; only the small JSON files under
+          # codex_execpolicy_artifacts/ are ever uploaded.
           python3 scripts/ci/codex_execpolicy_matrix.py \
-            --npm-prefix codex_execpolicy_artifacts/codex-cli \
+            --npm-prefix "${RUNNER_TEMP}/codex-cli-npm-prefix" \
             --package-spec "@openai/codex@0.142.0" \
             --expected-version "codex-cli 0.142.0" \
             --rules .codex/rules/default.rules \
@@ -1597,15 +1609,108 @@ jobs:
               data = {"schema": "codex_execpolicy_matrix_status_v1", "status": "bootstrap_failed"}
           p.write_text(json.dumps(data, indent=2))
           PY
-      - name: Upload codex execpolicy artifacts
-        id: upload-codex-execpolicy-artifacts
+      - name: Upload codex-execpolicy STATUS artifact (small, always)
+        # Issue #1824 P1-4: the status sentinel is the ONLY thing ci-verdict-summary
+        # downloads (a few KB). Split from the fuller evidence artifact below so a
+        # merge-ready check never has to fetch a large ZIP just to read one small
+        # JSON file.
+        id: upload-codex-execpolicy-status
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
-          name: codex-execpolicy-${{ github.run_attempt }}
-          path: codex_execpolicy_artifacts/
+          name: codex-execpolicy-status-${{ github.run_attempt }}
+          path: codex_execpolicy_artifacts/codex_execpolicy_matrix_status_v1.json
           if-no-files-found: error
           retention-days: 30
+      - name: Upload codex-execpolicy EVIDENCE artifact (npm ls / native binary sha / probes)
+        # Issue #1824 P1-4: kept SEPARATE from the status artifact and with a SHORT
+        # retention -- this is diagnostic detail (npm ls output, native binary
+        # realpath/sha256, version/help probe stdout+stderr), not merge-ready
+        # evidence. The npm install tree itself (~110MB) is never inside this path
+        # because --npm-prefix now installs to $RUNNER_TEMP, outside
+        # codex_execpolicy_artifacts/.
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: codex-execpolicy-evidence-${{ github.run_attempt }}
+          path: codex_execpolicy_artifacts/codex_execpolicy_matrix_v1.json
+          if-no-files-found: warn
+          retention-days: 3
+      - name: Collect ci_runtime_baseline_v1 artifact
+        # Issue #1824 P1-5: docs/dev/ci-performance.md documents codex-execpolicy
+        # as a ci_runtime_baseline_v1 job, but this job previously only appended to
+        # measurements.jsonl without ever generating/uploading the baseline
+        # artifact -- connect the same collector used by every other timed job.
+        if: ${{ !cancelled() }}
+        env:
+          GH_JOB: ${{ github.job }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p ci_runtime_baseline_artifacts
+          python3 - <<'PY'
+          import json, os, pathlib
+          measurements = []
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ["GH_HEAD_SHA"],
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+                          "measurement_method": "date_plus3N_ms"
+                      })
+                      measurements.append(r)
+          artifact = {
+              "schema": "ci_runtime_baseline_v1",
+              "run_id": os.environ["GH_RUN_ID"],
+              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+              "head_sha": os.environ["GH_HEAD_SHA"],
+              "merge_sha": os.environ["GH_SHA"],
+              "job": os.environ["GH_JOB"],
+              "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+              "measurement_method": "date_plus3N_ms",
+              "measurements": measurements,
+          }
+          out = pathlib.Path("ci_runtime_baseline_artifacts/ci_runtime_baseline_v1.json")
+          out.write_text(json.dumps(artifact, indent=2))
+          print(f"Written: {out}")
+          PY
+      - name: Upload ci-runtime-baseline artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
+          path: ci_runtime_baseline_artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Output CI runtime summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## CI Runtime Baseline: ${{ github.job }}"
+            echo ""
+            echo "| step_id | elapsed_ms | status |"
+            echo "|---|---|---|"
+            python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      m = json.loads(line)
+                      print(f"| {m['step_id']} | {m['elapsed_ms']} | {m['status']} |")
+          PY
+          } >> "$GITHUB_STEP_SUMMARY"
 
   python-test:
     # Issue #1760 AC5: required aggregate status check (name unchanged --
@@ -1618,36 +1723,24 @@ jobs:
     needs: [python-test-core, codex-execpolicy]
     if: always()
     steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python-uv
       - name: Evaluate python_test_bench_aggregate_policy (AC5/AC10)
-        env:
-          CORE_RESULT: ${{ needs.python-test-core.result }}
-          CODEX_RESULT: ${{ needs.codex-execpolicy.result }}
-          PYTHON_TEST_BENCH: ${{ github.event.inputs.python_test_bench }}
+        # Issue #1824 P1-1: the aggregate policy decision is delegated to a
+        # dedicated, table-driven-tested script (scripts/ci/evaluate_python_test_aggregate.py)
+        # instead of an inline heredoc, because a string-search verifier
+        # ("does the run: text contain 'python_test_bench_aggregate_policy'?")
+        # cannot detect a heredoc body being replaced with a no-op stub that
+        # still contains that string. scripts/ci/verify_python_test_lane.py
+        # additionally requires this EXACT invocation (no `if:`, no
+        # continue-on-error, exactly one occurrence) -- see check_aggregate_job.
         run: |
-          python3 - <<'PY'
-          import os
-          import sys
-
-          core = os.environ["CORE_RESULT"]
-          codex = os.environ["CODEX_RESULT"]
-          bench = os.environ.get("PYTHON_TEST_BENCH") == "true"
-
-          # python_test_bench_aggregate_policy (AC10): during a
-          # python_test_bench workflow_dispatch run, codex-execpolicy is
-          # skipped by its own `if:` condition (bench mode's documented
-          # contract is "run ONLY python-test-core"), so a codex-execpolicy
-          # result of "skipped" is expected and must NOT fail the aggregate.
-          # Outside bench mode, both dependency jobs must succeed.
-          if bench:
-              ok = core == "success"
-              if codex != "skipped":
-                  print(f"::warning::codex-execpolicy result={codex!r} during python_test_bench dispatch (expected 'skipped')")
-          else:
-              ok = core == "success" and codex == "success"
-
-          print(f"python_test_bench_aggregate_policy: bench={bench} core={core} codex={codex} ok={ok}")
-          sys.exit(0 if ok else 1)
-          PY
+          uv run --locked python3 scripts/ci/evaluate_python_test_aggregate.py \
+            --core-result "${{ needs.python-test-core.result }}" \
+            --codex-result "${{ needs.codex-execpolicy.result }}" \
+            --bench-mode "${{ github.event.inputs.python_test_bench }}"
 
   node-backed-hook-tests:
     if: ${{ github.event.inputs.python_test_bench != 'true' }}
@@ -2252,9 +2345,19 @@ jobs:
           PYTHON_TEST_BENCH: ${{ github.event.inputs.python_test_bench }}
         run: |
           if [ "$PYTHON_TEST_BENCH" = "true" ]; then
-            uv run --locked python3 scripts/ci/verify_ci_check_conclusions.py               --check-runs-api-json ci_verdict_summary_v2_check_runs.json               --expected-head-sha "$PR_HEAD_SHA"               --bench-mode
+            uv run --locked python3 scripts/ci/verify_ci_check_conclusions.py \
+              --check-runs-api-json ci_verdict_summary_v2_check_runs.json \
+              --expected-head-sha "$PR_HEAD_SHA" \
+              --workflow-run-id "${{ github.run_id }}" \
+              --workflow-run-attempt "${{ github.run_attempt }}" \
+              --bench-mode
           else
-            uv run --locked python3 scripts/ci/verify_ci_check_conclusions.py               --check-runs-api-json ci_verdict_summary_v2_check_runs.json               --codex-sentinel-json codex_execpolicy_artifacts_downloaded/codex_execpolicy_matrix_status_v1.json               --expected-head-sha "$PR_HEAD_SHA"
+            uv run --locked python3 scripts/ci/verify_ci_check_conclusions.py \
+              --check-runs-api-json ci_verdict_summary_v2_check_runs.json \
+              --codex-sentinel-json codex_execpolicy_artifacts_downloaded/codex_execpolicy_matrix_status_v1.json \
+              --expected-head-sha "$PR_HEAD_SHA" \
+              --workflow-run-id "${{ github.run_id }}" \
+              --workflow-run-attempt "${{ github.run_attempt }}"
           fi
       - name: Output ci_verdict_summary_v2 Step Summary
         # Render the exact uploaded payload; never regenerate it after upload.
@@ -2262,3 +2365,26 @@ jobs:
         run: |
           uv run --locked python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
             --summary-input ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json
+      - name: Enforce ci_verdict_summary_v2 overall_status gate (Issue #1824 P0-1)
+        # The ci-verdict-summary job itself must fail closed whenever the generated
+        # artifact's overall_status is not merge_ready -- otherwise an unclassified
+        # (CLASSIFICATION_MAP-missing) upstream job can silently produce a
+        # gh_error/blocked verdict that no CI check surfaces as a failure.
+        if: ${{ !cancelled() }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import sys
+
+          with open("ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json") as f:
+              artifact = json.load(f)
+
+          overall_status = artifact.get("overall_status")
+          print(f"ci_verdict_summary_v2 overall_status={overall_status!r}")
+          if overall_status != "merge_ready":
+              print(
+                  f"::error::ci_verdict_summary_v2 overall_status={overall_status!r} "
+                  "(expected 'merge_ready'); failing ci-verdict-summary closed"
+              )
+              sys.exit(1)
+          PY
