@@ -3216,7 +3216,7 @@ def classify_agent_lane_add_commit(command: str) -> GitMutationPolicyResult | No
     return None
 
 
-def classify_rtk_git_mutation(
+def _classify_rtk_git_mutation_with_context(
     command: str,
     *,
     cwd: str,
@@ -3655,6 +3655,22 @@ def classify_rtk_git_mutation(
     )
 
 
+def classify_rtk_git_mutation(
+    command: str,
+    *,
+    cwd: str,
+    require_active_branch_push: bool,
+    boundary_layer: str = "worktree_scope_guard_denied",
+) -> GitMutationPolicyResult | None:
+    """Preserve the analyzer-facing policy API without context injection."""
+    return _classify_rtk_git_mutation_with_context(
+        command,
+        cwd=cwd,
+        require_active_branch_push=require_active_branch_push,
+        boundary_layer=boundary_layer,
+    )
+
+
 def _result_to_json(result: GitMutationPolicyResult | None) -> dict:
     """Serialize a `classify_rtk_git_mutation` result for the `--json` CLI mode
     (Issue #1408: consumed by `scripts/session-recording/codex-hook-adapter.mjs`
@@ -3745,7 +3761,7 @@ def _main(argv: list[str] | None = None) -> int:
                 publish_context = {"_invalid": "not_an_object"}
         except json_module.JSONDecodeError:
             publish_context = {"_invalid": "malformed_json"}
-    result = classify_rtk_git_mutation(
+    result = _classify_rtk_git_mutation_with_context(
         args.command,
         cwd=args.cwd,
         require_active_branch_push=not args.no_require_active_branch_push,

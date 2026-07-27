@@ -12,7 +12,11 @@ _GUARDS_DIR = Path(__file__).resolve().parent.parent
 if str(_GUARDS_DIR) not in sys.path:
     sys.path.insert(0, str(_GUARDS_DIR))
 
-from git_mutation_command_policy import classify_rtk_git_mutation, evaluate_publish_lane
+from git_mutation_command_policy import (
+    _classify_rtk_git_mutation_with_context,
+    classify_rtk_git_mutation,
+    evaluate_publish_lane,
+)
 
 
 def _init_repo(repo: Path) -> None:
@@ -377,7 +381,7 @@ def test_given_injected_context_with_allowed_paths_digest_mismatch_when_canonica
         "allowed_paths_gate_head_sha": head,
     }
 
-    result = classify_rtk_git_mutation(
+    result = _classify_rtk_git_mutation_with_context(
         "rtk git push origin HEAD:refs/heads/topic",
         cwd=str(tmp_path),
         require_active_branch_push=True,
