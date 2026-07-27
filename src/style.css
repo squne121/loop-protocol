@@ -148,6 +148,41 @@ button:focus-visible {
   overscroll-behavior: contain;
 }
 
+/* Issue #1374 PR #1815 review fix 1: title/load/preparation render as a
+ * single centered menu overlay in the screen layer, never the right-aligned
+ * HUD layer. */
+.battle-screen-layer {
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  overflow-y: auto;
+  background: rgba(6, 10, 18, 0.55);
+}
+
+/* Same UA-stylesheet-override concern as .phase-screen-panel[hidden] below. */
+.battle-screen-layer[hidden] {
+  display: none;
+}
+
+.phase-screen-panel {
+  pointer-events: auto;
+  width: min(420px, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  display: grid;
+  gap: 12px;
+  align-content: start;
+}
+
+/* The `display: grid` rule above has higher specificity than the UA
+ * stylesheet's `[hidden] { display: none }`, so it must be restated here
+ * explicitly -- otherwise a hidden phase screen keeps rendering (Issue
+ * #1374 PR #1815 review: this caused title/load/preparation to render
+ * stacked simultaneously). */
+.phase-screen-panel[hidden] {
+  display: none;
+}
+
 .battle-ui-layer [data-battle-interactive='true'] {
   pointer-events: auto;
 }

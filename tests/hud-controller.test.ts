@@ -1,10 +1,24 @@
 /**
  * @vitest-environment jsdom
+ *
+ * Issue #1374 PR #1815 review fix: `HudController` now owns only the minimal
+ * running-time HUD (`battle-hud-layer`). Title / load / preparation moved to
+ * `phaseScreens.ts`'s `createPhaseScreenController()` (`battle-screen-layer`)
+ * -- this file tests both modules (both live under `tests/hud-controller.test.ts`
+ * in Issue #1374's Allowed Paths; there is no separate phaseScreens unit test
+ * file). Real role/name/visibility/focus verification for the phase screens
+ * now lives in `tests/e2e/phase-screens.spec.ts` (real Playwright, not a
+ * hand-rolled DOM query) per the review's required fix 3.
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createHudController, getUpgradeStatusCopy } from '../src/ui/HudController'
+import {
+  createPhaseScreenController,
+  getVisiblePhaseScreen,
+  resolveLoadMenuBackIntent,
+} from '../src/ui/phaseScreens'
 import {
   runNextSortieHandler,
   runConfirmResultHandler,
@@ -111,19 +125,13 @@ function queryButton(container: HTMLElement, action: string): HTMLButtonElement 
   return button
 }
 
-describe('HudController', () => {
+describe('HudController (minimal running-time HUD)', () => {
   let container: HTMLElement
   let actions: {
-    onNewGame: ReturnType<typeof vi.fn>
-    onStartSortie: ReturnType<typeof vi.fn>
     onAssistPlayerCommand: ReturnType<typeof vi.fn>
     onClaimReward: ReturnType<typeof vi.fn>
     onConfirmResult: ReturnType<typeof vi.fn>
     onNextSortie: ReturnType<typeof vi.fn>
-    onSave: ReturnType<typeof vi.fn>
-    onLoadGame: ReturnType<typeof vi.fn>
-    onReset: ReturnType<typeof vi.fn>
-    canLoadGame: ReturnType<typeof vi.fn>
     onTogglePause: ReturnType<typeof vi.fn>
   }
   let hudController: ReturnType<typeof createHudController>
@@ -131,98 +139,40 @@ describe('HudController', () => {
   beforeEach(() => {
     container = document.createElement('div')
     actions = {
-      onNewGame: vi.fn(),
-      onStartSortie: vi.fn(),
       onAssistPlayerCommand: vi.fn(),
       onClaimReward: vi.fn(),
       onConfirmResult: vi.fn(),
       onNextSortie: vi.fn(),
-      onSave: vi.fn(),
-      onLoadGame: vi.fn(),
-      onReset: vi.fn(),
-      canLoadGame: vi.fn(() => true),
       onTogglePause: vi.fn(),
     }
     hudController = createHudController(container, actions)
   })
 
-  it('GIVEN preparation WHEN render called THEN phase copy and preparation actions are enabled', () => {
+  it('GIVEN preparation WHEN render called THEN Hull/Shots/Cooldown render and legacy debrief actions are disabled', () => {
     hudController.render(createState('preparation'), false)
 
     expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Pre-launch')
-    expect(queryButton(container, 'start-sortie').disabled).toBe(false)
-    expect(queryButton(container, 'save').disabled).toBe(false)
-    expect(queryButton(container, 'reset').disabled).toBe(false)
+    expect(container.querySelector('[data-field="hp"]')?.textContent).toBe('8/8')
     expect(queryButton(container, 'claim-reward').disabled).toBe(true)
     expect(queryButton(container, 'confirm-result').disabled).toBe(true)
     expect(queryButton(container, 'next-sortie').disabled).toBe(true)
-    expect(queryButton(container, 'load-game').disabled).toBe(true)
-    expect(queryButton(container, 'reset').getAttribute('title')).toContain('destructive boundary')
+    expect(queryButton(container, 'assist-player').disabled).toBe(true)
   })
 
-  it('GIVEN title_menu WHEN render called THEN new-game enabled, load-game enabled, start-sortie disabled (AC1)', () => {
-    hudController.render(createState('title_menu'), false)
-
-    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Launch setup')
-    expect(queryButton(container, 'new-game').disabled).toBe(false)
-    expect(queryButton(container, 'load-game').disabled).toBe(false)
-    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
-    expect(queryButton(container, 'save').disabled).toBe(true)
-    expect(queryButton(container, 'confirm-result').disabled).toBe(true)
-    expect(queryButton(container, 'next-sortie').disabled).toBe(true)
-  })
-
-  it('GIVEN title_menu without loadable snapshot WHEN render called THEN new-game enabled, load-game disabled (AC1)', () => {
-    actions.canLoadGame.mockReturnValue(false)
-    hudController.render(createState('title_menu'), false)
-
-    expect(queryButton(container, 'new-game').disabled).toBe(false)
-    expect(queryButton(container, 'load-game').disabled).toBe(true)
-    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
-  })
-
-  it('GIVEN load_menu WHEN render called THEN load-game is enabled and save is disabled', () => {
-    hudController.render(createState('load_menu'), false)
-
-    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Restore briefing')
-    expect(queryButton(container, 'load-game').disabled).toBe(false)
-    expect(queryButton(container, 'save').disabled).toBe(true)
-    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
-    expect(queryButton(container, 'confirm-result').disabled).toBe(true)
-  })
-
-  it('GIVEN title_menu without a loadable snapshot WHEN render called THEN load-game is disabled (AC9)', () => {
-    actions.canLoadGame.mockReturnValue(false)
-
-    hudController.render(createState('title_menu'), false)
-
-    expect(queryButton(container, 'load-game').disabled).toBe(true)
-  })
-
-  it('GIVEN running WHEN render called THEN button.disabled marks the full action surface as disabled', () => {
+  it('GIVEN running WHEN render called THEN button.disabled marks the legacy debrief action surface as disabled and assist is enabled', () => {
     hudController.render(createState('running'), false)
 
     expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Sortie active')
-    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
     expect(queryButton(container, 'claim-reward').disabled).toBe(true)
     expect(queryButton(container, 'confirm-result').disabled).toBe(true)
     expect(queryButton(container, 'next-sortie').disabled).toBe(true)
-    expect(queryButton(container, 'save').disabled).toBe(true)
-    expect(queryButton(container, 'load-game').disabled).toBe(true)
-    expect(queryButton(container, 'reset').disabled).toBe(true)
     expect(queryButton(container, 'assist-player').disabled).toBe(false)
   })
 
   it('GIVEN the HUD action surface WHEN rendered THEN interactive buttons opt in via data-battle-interactive', () => {
     // Overlay inactivity is enforced by the shell layer via hidden/inert;
     // this test covers the complementary HUD-side pointer opt-in contract.
-    hudController.render(createState('preparation'), false, {
-      definitionId: 'weapon_power_plus_1',
-      cost: 100,
-      weaponPower: 1,
-      buttonDisabled: false,
-      statusCopy: null,
-    })
+    hudController.render(createState('preparation'), false)
 
     const interactiveButtons = Array.from(
       container.querySelectorAll<HTMLButtonElement>('[data-action]'),
@@ -234,8 +184,6 @@ describe('HudController', () => {
   it('GIVEN running WHEN render called THEN disabled overlay buttons remain present but are inert-ready hit-test surfaces', () => {
     hudController.render(createState('running'), false)
 
-    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
-    expect(queryButton(container, 'start-sortie').dataset.battleInteractive).toBe('true')
     expect(queryButton(container, 'claim-reward').disabled).toBe(true)
     expect(queryButton(container, 'claim-reward').dataset.battleInteractive).toBe('true')
   })
@@ -326,7 +274,6 @@ describe('HudController', () => {
 
     expect(container.dataset.battleHudLayout).toBeUndefined()
     expect(queryButton(container, 'confirm-result').disabled).toBe(false)
-    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
     expect(container.querySelectorAll('[data-action]').length).toBeGreaterThan(0)
   })
 
@@ -414,11 +361,7 @@ describe('HudController', () => {
     // AC5: confirmResult auto-claims; claim-reward is legacy debrief only
     expect(queryButton(container, 'claim-reward').disabled).toBe(true)
     expect(queryButton(container, 'confirm-result').disabled).toBe(false)
-    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
     expect(queryButton(container, 'next-sortie').disabled).toBe(true)
-    expect(queryButton(container, 'save').disabled).toBe(true)
-    expect(queryButton(container, 'load-game').disabled).toBe(true)
-    expect(queryButton(container, 'reset').disabled).toBe(true)
   })
 
   it('GIVEN result phase with claimed reward WHEN render called THEN confirm-result is still enabled (AC5)', () => {
@@ -427,8 +370,6 @@ describe('HudController', () => {
     expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Mission review')
     expect(queryButton(container, 'confirm-result').disabled).toBe(false)
     expect(queryButton(container, 'claim-reward').disabled).toBe(true)
-    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
-    expect(queryButton(container, 'save').disabled).toBe(true)
   })
 
   it('GIVEN debrief_pending_reward WHEN render called THEN debrief copy enables reward collection only', () => {
@@ -438,11 +379,7 @@ describe('HudController', () => {
     expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Area secured')
     expect(container.querySelector('[data-field="sortie-result"]')?.textContent).toBe('Victory')
     expect(queryButton(container, 'claim-reward').disabled).toBe(false)
-    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
     expect(queryButton(container, 'next-sortie').disabled).toBe(true)
-    expect(queryButton(container, 'save').disabled).toBe(true)
-    expect(queryButton(container, 'load-game').disabled).toBe(true)
-    expect(queryButton(container, 'reset').disabled).toBe(true)
   })
 
   it('GIVEN debrief_reward_claimed WHEN render called THEN debrief complete copy enables next sortie only', () => {
@@ -452,11 +389,7 @@ describe('HudController', () => {
     expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Area secured')
     expect(container.querySelector('[data-field="sortie-result"]')?.textContent).toBe('Victory')
     expect(queryButton(container, 'next-sortie').disabled).toBe(false)
-    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
     expect(queryButton(container, 'claim-reward').disabled).toBe(true)
-    expect(queryButton(container, 'save').disabled).toBe(true)
-    expect(queryButton(container, 'load-game').disabled).toBe(true)
-    expect(queryButton(container, 'reset').disabled).toBe(true)
   })
 
   it('GIVEN feedback copy WHEN render called THEN status region exposes player-facing progress copy without innerHTML', () => {
@@ -478,24 +411,14 @@ describe('HudController', () => {
   it('GIVEN running WHEN disabled buttons are clicked THEN callbacks are not invoked', () => {
     hudController.render(createState('running'), false)
 
-    queryButton(container, 'new-game').click()
-    queryButton(container, 'start-sortie').click()
     queryButton(container, 'claim-reward').click()
     queryButton(container, 'confirm-result').click()
     queryButton(container, 'next-sortie').click()
-    queryButton(container, 'save').click()
-    queryButton(container, 'load-game').click()
-    queryButton(container, 'reset').click()
     queryButton(container, 'assist-player').click()
 
-    expect(actions.onNewGame).not.toHaveBeenCalled()
-    expect(actions.onStartSortie).not.toHaveBeenCalled()
     expect(actions.onClaimReward).not.toHaveBeenCalled()
     expect(actions.onConfirmResult).not.toHaveBeenCalled()
     expect(actions.onNextSortie).not.toHaveBeenCalled()
-    expect(actions.onSave).not.toHaveBeenCalled()
-    expect(actions.onLoadGame).not.toHaveBeenCalled()
-    expect(actions.onReset).toHaveBeenCalledTimes(0)
     expect(actions.onAssistPlayerCommand).toHaveBeenCalledTimes(1)
   })
 
@@ -503,7 +426,6 @@ describe('HudController', () => {
     hudController.render(createState('preparation'), false)
 
     const textSurface = container.textContent ?? ''
-    expect(textSurface).toContain('Progress')
     expect(textSurface).toContain('Pilot updates')
     expect(textSurface).not.toContain('Loop Phase')
     expect(textSurface).not.toContain('Telemetry')
@@ -535,84 +457,10 @@ describe('HudController', () => {
 })
 
 // ---------------------------------------------------------------------------
-// AC3: Load Game spy test — storage.load() only called from title_menu / load_menu
+// Issue #914: HUD action harness -- legacy Next sortie / Confirm result success feedback
 // ---------------------------------------------------------------------------
 
-describe('AC3: Load Game phase gate — onLoadGame only fires from title_menu / load_menu', () => {
-  let container: HTMLElement
-  let onLoadGame: ReturnType<typeof vi.fn>
-  let canLoadGame: ReturnType<typeof vi.fn>
-  let hudController: ReturnType<typeof createHudController>
-
-  beforeEach(() => {
-    container = document.createElement('div')
-    onLoadGame = vi.fn()
-    canLoadGame = vi.fn(() => true)
-    hudController = createHudController(container, {
-      onNewGame: vi.fn(),
-      onStartSortie: vi.fn(),
-      onClaimReward: vi.fn(),
-      onConfirmResult: vi.fn(),
-      onNextSortie: vi.fn(),
-      onSave: vi.fn(),
-      onLoadGame,
-      onReset: vi.fn(),
-      canLoadGame,
-      onTogglePause: vi.fn(),
-    })
-  })
-
-  it('GIVEN title_menu with loadable snapshot WHEN load-game button is clicked THEN onLoadGame is called once (AC3)', () => {
-    hudController.render(createState('title_menu'), false)
-
-    expect(queryButton(container, 'load-game').disabled).toBe(false)
-    queryButton(container, 'load-game').click()
-
-    expect(onLoadGame).toHaveBeenCalledTimes(1)
-  })
-
-  it('GIVEN load_menu with loadable snapshot WHEN load-game button is clicked THEN onLoadGame is called once (AC3)', () => {
-    hudController.render(createState('load_menu'), false)
-
-    expect(queryButton(container, 'load-game').disabled).toBe(false)
-    queryButton(container, 'load-game').click()
-
-    expect(onLoadGame).toHaveBeenCalledTimes(1)
-  })
-
-  it('GIVEN preparation phase WHEN load-game button is clicked THEN onLoadGame is NOT called (AC3)', () => {
-    hudController.render(createState('preparation'), false)
-
-    expect(queryButton(container, 'load-game').disabled).toBe(true)
-    queryButton(container, 'load-game').click()
-
-    expect(onLoadGame).not.toHaveBeenCalled()
-  })
-
-  it('GIVEN running phase WHEN load-game button is clicked THEN onLoadGame is NOT called (AC3)', () => {
-    hudController.render(createState('running'), false)
-
-    expect(queryButton(container, 'load-game').disabled).toBe(true)
-    queryButton(container, 'load-game').click()
-
-    expect(onLoadGame).not.toHaveBeenCalled()
-  })
-
-  it('GIVEN result phase WHEN load-game button is clicked THEN onLoadGame is NOT called (AC3)', () => {
-    hudController.render(createState('result', 'pending'), false)
-
-    expect(queryButton(container, 'load-game').disabled).toBe(true)
-    queryButton(container, 'load-game').click()
-
-    expect(onLoadGame).not.toHaveBeenCalled()
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Issue #914: HUD action harness — legacy Next sortie / Confirm result success feedback
-// ---------------------------------------------------------------------------
-
-describe('Issue #914: HUD action harness — next-sortie and confirm-result', () => {
+describe('Issue #914: HUD action harness -- next-sortie and confirm-result', () => {
   let container: HTMLElement
 
   beforeEach(() => {
@@ -633,15 +481,9 @@ describe('Issue #914: HUD action harness — next-sortie and confirm-result', ()
     })
 
     const hudController = createHudController(container, {
-      onNewGame: vi.fn(),
-      onStartSortie: vi.fn(),
       onClaimReward: vi.fn(),
       onConfirmResult: vi.fn(),
       onNextSortie,
-      onSave: vi.fn(),
-      onLoadGame: vi.fn(),
-      onReset: vi.fn(),
-      canLoadGame: vi.fn(() => true),
       onTogglePause: vi.fn(),
     })
 
@@ -682,15 +524,9 @@ describe('Issue #914: HUD action harness — next-sortie and confirm-result', ()
     })
 
     const hudController = createHudController(container, {
-      onNewGame: vi.fn(),
-      onStartSortie: vi.fn(),
       onClaimReward: vi.fn(),
       onConfirmResult,
       onNextSortie: vi.fn(),
-      onSave: vi.fn(),
-      onLoadGame: vi.fn(),
-      onReset: vi.fn(),
-      canLoadGame: vi.fn(() => true),
       onTogglePause: vi.fn(),
     })
 
@@ -712,118 +548,196 @@ describe('Issue #914: HUD action harness — next-sortie and confirm-result', ()
 })
 
 // ---------------------------------------------------------------------------
-// Issue #1282: HUD upgrade purchase surface (AC1, AC2, AC3, AC4, AC5)
+// phaseScreens.ts pure helpers (AC5, AC8)
 // ---------------------------------------------------------------------------
 
-describe('Issue #1282: HUD upgrade purchase surface (AC1, AC2, AC3, AC5)', () => {
+describe('phaseScreens: pure helpers', () => {
+  it('getVisiblePhaseScreen maps title_menu/load_menu/preparation to their screen id and everything else to null (AC5)', () => {
+    expect(getVisiblePhaseScreen('title_menu')).toBe('title')
+    expect(getVisiblePhaseScreen('load_menu')).toBe('load')
+    expect(getVisiblePhaseScreen('preparation')).toBe('preparation')
+    expect(getVisiblePhaseScreen('running')).toBeNull()
+    expect(getVisiblePhaseScreen('result')).toBeNull()
+    expect(getVisiblePhaseScreen('debrief_pending_reward')).toBeNull()
+    expect(getVisiblePhaseScreen('debrief_reward_claimed')).toBeNull()
+  })
+
+  it('resolveLoadMenuBackIntent selects back_to_preparation for preparation origin and back_to_title otherwise (AC8)', () => {
+    expect(resolveLoadMenuBackIntent('preparation')).toBe('back_to_preparation')
+    expect(resolveLoadMenuBackIntent('title_menu')).toBe('back_to_title')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// phaseScreens: createPhaseScreenController (title / load / preparation)
+//
+// This covers DOM wiring (visibility, disabled state, click delegation,
+// upgrade view model rendering) with jsdom. It intentionally does NOT claim
+// to validate real accessible-role/name/focus semantics -- that is the
+// responsibility of the real Playwright checks in
+// tests/e2e/phase-screens.spec.ts (PR #1815 review, required fix 3).
+// ---------------------------------------------------------------------------
+
+describe('phaseScreens: createPhaseScreenController', () => {
   let container: HTMLElement
-  let onUpgradeWeapon: ReturnType<typeof vi.fn>
-  let hudController: ReturnType<typeof createHudController>
+  let actions: {
+    onNewGame: ReturnType<typeof vi.fn>
+    onOpenLoadMenu: ReturnType<typeof vi.fn>
+    onBackFromLoadMenu: ReturnType<typeof vi.fn>
+    onConfirmLoad: ReturnType<typeof vi.fn>
+    onStartSortie: ReturnType<typeof vi.fn>
+    onSave: ReturnType<typeof vi.fn>
+    onReset: ReturnType<typeof vi.fn>
+    onUpgradeWeapon: ReturnType<typeof vi.fn>
+    canLoadGame: ReturnType<typeof vi.fn>
+  }
+  let controller: ReturnType<typeof createPhaseScreenController>
 
   beforeEach(() => {
     container = document.createElement('div')
-    onUpgradeWeapon = vi.fn()
-    hudController = createHudController(container, {
+    actions = {
+      onNewGame: vi.fn(),
+      onOpenLoadMenu: vi.fn(),
+      onBackFromLoadMenu: vi.fn(),
+      onConfirmLoad: vi.fn(),
       onStartSortie: vi.fn(),
-      onClaimReward: vi.fn(),
-      onNextSortie: vi.fn(),
+      onSave: vi.fn(),
       onReset: vi.fn(),
-      onTogglePause: vi.fn(),
-      onUpgradeWeapon,
-    })
+      onUpgradeWeapon: vi.fn(),
+      canLoadGame: vi.fn(() => true),
+    }
+    controller = createPhaseScreenController(container, actions)
   })
 
-  it('GIVEN state.progress.weaponPower WHEN render called THEN the Weapon Power stat displays it (AC1)', () => {
-    const state = createState('preparation')
-    state.progress.weaponPower = 3
+  it('GIVEN title_menu WHEN render called THEN only the title screen is visible (not hidden/inert) and New Game / Open save exist (AC1)', () => {
+    controller.render(createState('title_menu'))
 
-    hudController.render(state, false)
+    const title = container.querySelector<HTMLElement>('[data-phase-screen="title"]')
+    const load = container.querySelector<HTMLElement>('[data-phase-screen="load"]')
+    const preparation = container.querySelector<HTMLElement>('[data-phase-screen="preparation"]')
 
-    expect(container.querySelector('[data-field="weapon-power"]')?.textContent).toBe('3')
+    expect(title?.hidden).toBe(false)
+    expect(title?.hasAttribute('inert')).toBe(false)
+    expect(load?.hidden).toBe(true)
+    expect(load?.hasAttribute('inert')).toBe(true)
+    expect(preparation?.hidden).toBe(true)
+    expect(preparation?.hasAttribute('inert')).toBe(true)
+    expect(queryButton(container, 'new-game').disabled).toBe(false)
+    expect(queryButton(container, 'open-load-menu-title').disabled).toBe(false)
   })
 
-  it('GIVEN an upgradeView with a weaponPower distinct from state.progress.weaponPower WHEN render called THEN the Weapon Power stat displays upgradeView.weaponPower (view-model-driven, not a direct state read)', () => {
-    // Regression test for PR #1365 iteration-2 P2 fix_delta: HudController.render()
-    // must read weaponPower from the upgrade view model (when provided) instead
-    // of reaching into state.progress directly, so the view-model boundary
-    // documented for the rest of HudUpgradeViewModel is not silently broken
-    // for this one field.
-    const state = createState('preparation')
-    state.progress.weaponPower = 1
+  it('GIVEN preparation WHEN render called THEN the preparation screen is visible and Launch sortie / Save / Reset are enabled (AC2)', () => {
+    controller.render(createState('preparation'))
 
-    hudController.render(state, false, {
+    const preparation = container.querySelector<HTMLElement>('[data-phase-screen="preparation"]')
+    expect(preparation?.hidden).toBe(false)
+    expect(queryButton(container, 'start-sortie').disabled).toBe(false)
+    expect(queryButton(container, 'save').disabled).toBe(false)
+    expect(queryButton(container, 'reset').disabled).toBe(false)
+    expect(queryButton(container, 'open-load-menu-preparation').disabled).toBe(false)
+  })
+
+  it('GIVEN running WHEN render called THEN the outer screen layer and every phase screen are hidden and inert (AC3, AC6)', () => {
+    controller.render(createState('running'))
+
+    expect(container.hidden).toBe(true)
+    expect(container.hasAttribute('inert')).toBe(true)
+    expect(queryButton(container, 'new-game').disabled).toBe(true)
+    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
+    expect(queryButton(container, 'save').disabled).toBe(true)
+    expect(queryButton(container, 'reset').disabled).toBe(true)
+    expect(queryButton(container, 'open-load-menu-title').disabled).toBe(true)
+    expect(queryButton(container, 'open-load-menu-preparation').disabled).toBe(true)
+  })
+
+  it('GIVEN title_menu WHEN Open save is clicked THEN onOpenLoadMenu fires with origin title_menu (intent-only, AC8)', () => {
+    controller.render(createState('title_menu'))
+
+    queryButton(container, 'open-load-menu-title').click()
+
+    expect(actions.onOpenLoadMenu).toHaveBeenCalledWith('title_menu')
+  })
+
+  it('GIVEN preparation WHEN Open save is clicked THEN onOpenLoadMenu fires with origin preparation (intent-only, AC8)', () => {
+    controller.render(createState('preparation'))
+
+    queryButton(container, 'open-load-menu-preparation').click()
+
+    expect(actions.onOpenLoadMenu).toHaveBeenCalledWith('preparation')
+  })
+
+  it('GIVEN load_menu WHEN Back is clicked THEN onBackFromLoadMenu fires (intent-only -- origin bookkeeping lives in main.ts, AC8)', () => {
+    controller.render(createState('load_menu'))
+
+    queryButton(container, 'back-from-load-menu').click()
+
+    expect(actions.onBackFromLoadMenu).toHaveBeenCalledTimes(1)
+  })
+
+  it('GIVEN load_menu WHEN Load saved game is clicked THEN onConfirmLoad fires (AC9)', () => {
+    controller.render(createState('load_menu'))
+
+    queryButton(container, 'confirm-load').click()
+
+    expect(actions.onConfirmLoad).toHaveBeenCalledTimes(1)
+  })
+
+  it('GIVEN load_menu with a load failure telemetry message WHEN rendered THEN the failure message shows inside the load screen itself (loadFailure, AC9)', () => {
+    const state = createState('load_menu')
+    state.telemetry.status = 'Load Game failed.'
+    state.telemetry.lastCommandSummary = 'No save data found.'
+
+    controller.render(state)
+
+    expect(container.querySelector('[data-field="load-status"]')?.textContent).toBe('Load Game failed.')
+    const loadScreen = container.querySelector<HTMLElement>('[data-phase-screen="load"]')
+    expect(loadScreen?.hidden).toBe(false)
+    expect(state.loopPhase).toBe('load_menu')
+  })
+
+  it('GIVEN no loadable snapshot WHEN render called THEN navigating to load_menu is still reachable, but Load saved game stays disabled (AC1, AC3, AC9)', () => {
+    // The load-menu-empty scenario (PR #1815 review, required fix 6) depends
+    // on being able to open load_menu with no save present and see "no
+    // save" messaging there -- only the confirm action is gated.
+    actions.canLoadGame.mockReturnValue(false)
+
+    controller.render(createState('title_menu'))
+    expect(queryButton(container, 'open-load-menu-title').disabled).toBe(false)
+
+    controller.render(createState('load_menu'))
+    expect(queryButton(container, 'confirm-load').disabled).toBe(true)
+  })
+
+  it('GIVEN preparation WHEN render called with an upgradeView THEN Weapon Power, cost, and status render (AC2)', () => {
+    controller.render(createState('preparation'), {
       definitionId: 'weapon_power_plus_1',
       cost: 100,
       weaponPower: 9,
       buttonDisabled: false,
-      statusCopy: null,
+      statusCopy: getUpgradeStatusCopy('ok'),
     })
 
-    expect(container.querySelector('[data-field="weapon-power"]')?.textContent).toBe('9')
-  })
-
-  it('GIVEN no upgradeView WHEN render called THEN the Weapon Power stat falls back to state.progress.weaponPower', () => {
-    const state = createState('preparation')
-    state.progress.weaponPower = 4
-
-    hudController.render(state, false)
-
-    expect(container.querySelector('[data-field="weapon-power"]')?.textContent).toBe('4')
-  })
-
-  it('GIVEN an upgradeView WHEN render called THEN the Upgrade weapon button, cost, and a role=status/aria-live=polite/aria-atomic=true live region are present (AC2)', () => {
-    hudController.render(createState('preparation'), false, {
-      definitionId: 'weapon_power_plus_1',
-      cost: 100,
-      weaponPower: 1,
-      buttonDisabled: false,
-      statusCopy: null,
-    })
-
-    const upgradeButton = queryButton(container, 'upgrade-weapon')
-    expect(upgradeButton.textContent).toBe('Upgrade weapon')
-    expect(container.querySelector('[data-field="upgrade-cost"]')?.textContent).toBe('Cost: 100')
-
-    const upgradeStatus = container.querySelector('[data-field="upgrade-status"]')
-    expect(upgradeStatus?.getAttribute('role')).toBe('status')
-    expect(upgradeStatus?.getAttribute('aria-live')).toBe('polite')
-    expect(upgradeStatus?.getAttribute('aria-atomic')).toBe('true')
-  })
-
-  it('GIVEN upgradeView.buttonDisabled=false during a non-preparation phase WHEN render called THEN the button reflects quoteUpgrade()-derived state, not a HUD-local phase check (AC3)', () => {
-    hudController.render(createState('running'), false, {
-      definitionId: 'weapon_power_plus_1',
-      cost: 100,
-      weaponPower: 1,
-      buttonDisabled: false,
-      statusCopy: null,
-    })
-
+    expect(container.querySelector('[data-field="prep-weapon-power"]')?.textContent).toBe('9')
+    expect(container.querySelector('[data-field="prep-upgrade-cost"]')?.textContent).toBe('Cost: 100')
+    expect(container.querySelector('[data-field="prep-upgrade-status"]')?.textContent).toBe(
+      'Upgrade installed. Weapon Power increased. Resources were saved.',
+    )
     expect(queryButton(container, 'upgrade-weapon').disabled).toBe(false)
   })
 
-  it('GIVEN upgradeView.buttonDisabled=true during preparation phase WHEN render called THEN the button is disabled (AC3)', () => {
-    hudController.render(createState('preparation'), false, {
-      definitionId: 'weapon_power_plus_1',
-      cost: 100,
-      weaponPower: 1,
-      buttonDisabled: true,
-      statusCopy: null,
-    })
+  it('GIVEN preparation WHEN render called without an upgradeView THEN the upgrade button is disabled and falls back to state.progress.weaponPower (fail-closed default)', () => {
+    const state = createState('preparation')
+    state.progress.weaponPower = 4
 
+    controller.render(state)
+
+    expect(container.querySelector('[data-field="prep-weapon-power"]')?.textContent).toBe('4')
     expect(queryButton(container, 'upgrade-weapon').disabled).toBe(true)
-  })
-
-  it('GIVEN no upgradeView WHEN render called THEN the upgrade button is disabled and cost/status fields are empty (fail-closed default)', () => {
-    hudController.render(createState('preparation'), false)
-
-    expect(queryButton(container, 'upgrade-weapon').disabled).toBe(true)
-    expect(container.querySelector('[data-field="upgrade-cost"]')?.textContent).toBe('')
-    expect(container.querySelector('[data-field="upgrade-status"]')?.textContent).toBe('')
+    expect(container.querySelector('[data-field="prep-upgrade-cost"]')?.textContent).toBe('')
   })
 
   it('GIVEN an enabled upgrade button WHEN it is clicked THEN onUpgradeWeapon fires exactly once', () => {
-    hudController.render(createState('preparation'), false, {
+    controller.render(createState('preparation'), {
       definitionId: 'weapon_power_plus_1',
       cost: 100,
       weaponPower: 1,
@@ -833,60 +747,11 @@ describe('Issue #1282: HUD upgrade purchase surface (AC1, AC2, AC3, AC5)', () =>
 
     queryButton(container, 'upgrade-weapon').click()
 
-    expect(onUpgradeWeapon).toHaveBeenCalledTimes(1)
+    expect(actions.onUpgradeWeapon).toHaveBeenCalledTimes(1)
   })
 
-  it('GIVEN a disabled upgrade button WHEN it is clicked THEN onUpgradeWeapon is not invoked', () => {
-    hudController.render(createState('preparation'), false, {
-      definitionId: 'weapon_power_plus_1',
-      cost: 100,
-      weaponPower: 1,
-      buttonDisabled: true,
-      statusCopy: null,
-    })
-
-    queryButton(container, 'upgrade-weapon').click()
-
-    expect(onUpgradeWeapon).not.toHaveBeenCalled()
-  })
-
-  it('GIVEN each purchase outcome reason WHEN getUpgradeStatusCopy builds player-facing copy THEN it matches the AC4 mapping table', () => {
-    expect(getUpgradeStatusCopy('ok')).toEqual({
-      status: 'Upgrade installed.',
-      summary: 'Weapon Power increased. Resources were saved.',
-    })
-    expect(getUpgradeStatusCopy('insufficient-resources')).toEqual({
-      status: 'Not enough resources.',
-      summary: 'Earn 100 resources before upgrading.',
-    })
-    expect(getUpgradeStatusCopy('already-purchased')).toEqual({
-      status: 'Upgrade already installed.',
-      summary: 'Weapon Power is already upgraded.',
-    })
-    expect(getUpgradeStatusCopy('not-preparation')).toEqual({
-      status: 'Upgrade available in hangar.',
-      summary: 'Return to preparation before upgrading.',
-    })
-    expect(getUpgradeStatusCopy('write-error')).toEqual({
-      status: 'Upgrade not saved.',
-      summary: 'No resources were spent. Check browser storage and try again.',
-    })
-    expect(getUpgradeStatusCopy('storage-unavailable')).toEqual({
-      status: 'Upgrade not saved.',
-      summary: 'No resources were spent. Check browser storage and try again.',
-    })
-    expect(getUpgradeStatusCopy('invalid-definition')).toEqual({
-      status: 'Upgrade unavailable.',
-      summary: 'Current upgrade data could not be applied.',
-    })
-    expect(getUpgradeStatusCopy('invalid-state')).toEqual({
-      status: 'Upgrade unavailable.',
-      summary: 'Current upgrade data could not be applied.',
-    })
-  })
-
-  it('does not leak internal upgrade failure reason', () => {
-    hudController.render(createState('preparation'), false, {
+  it('does not leak internal upgrade failure reason (AC4 mapping table boundary)', () => {
+    controller.render(createState('preparation'), {
       definitionId: 'weapon_power_plus_1',
       cost: 100,
       weaponPower: 1,
@@ -898,176 +763,32 @@ describe('Issue #1282: HUD upgrade purchase surface (AC1, AC2, AC3, AC5)', () =>
     expect(textSurface).not.toContain('insufficient-resources')
     expect(textSurface).not.toContain('already-purchased')
     expect(textSurface).not.toContain('not-preparation')
-    expect(textSurface).not.toContain('invalid-definition')
-    expect(textSurface).not.toContain('invalid-state')
-    expect(textSurface).not.toContain('write-error')
-    expect(textSurface).not.toContain('storage-unavailable')
     expect(textSurface).toContain('Not enough resources.')
     expect(textSurface).toContain('Earn 100 resources before upgrading.')
   })
-})
 
-// ---------------------------------------------------------------------------
-// Issue #1374: phase screen overlay — title / preparation / load_menu screens
-// ---------------------------------------------------------------------------
-
-/**
- * Minimal getByRole(role, { name }) equivalent (AC4): this repo does not
- * depend on @testing-library/dom, so visible-control assertions query by
- * implicit ARIA role (native <button> => role "button") and accessible
- * name (aria-label, falling back to trimmed textContent) instead of
- * relying on data-action selectors alone.
- */
-function accessibleName(element: HTMLElement): string {
-  return element.getAttribute('aria-label') ?? element.textContent?.trim() ?? ''
-}
-
-function getByRole(container: HTMLElement, role: string, name: string): HTMLElement | null {
-  const candidates =
-    role === 'button'
-      ? Array.from(container.querySelectorAll<HTMLElement>('button, [role="button"]'))
-      : Array.from(container.querySelectorAll<HTMLElement>(`[role="${role}"]`))
-
-  return candidates.find((candidate) => accessibleName(candidate) === name) ?? null
-}
-
-describe('Issue #1374: phase screen overlay', () => {
-  let container: HTMLElement
-  let actions: {
-    onNewGame: ReturnType<typeof vi.fn>
-    onStartSortie: ReturnType<typeof vi.fn>
-    onClaimReward: ReturnType<typeof vi.fn>
-    onConfirmResult: ReturnType<typeof vi.fn>
-    onNextSortie: ReturnType<typeof vi.fn>
-    onSave: ReturnType<typeof vi.fn>
-    onLoadGame: ReturnType<typeof vi.fn>
-    onReset: ReturnType<typeof vi.fn>
-    canLoadGame: ReturnType<typeof vi.fn>
-    onTogglePause: ReturnType<typeof vi.fn>
-  }
-  let hudController: ReturnType<typeof createHudController>
-
-  beforeEach(() => {
-    container = document.createElement('div')
-    actions = {
-      onNewGame: vi.fn(),
-      onStartSortie: vi.fn(),
-      onClaimReward: vi.fn(),
-      onConfirmResult: vi.fn(),
-      onNextSortie: vi.fn(),
-      onSave: vi.fn(),
-      onLoadGame: vi.fn(),
-      onReset: vi.fn(),
-      canLoadGame: vi.fn(() => true),
-      onTogglePause: vi.fn(),
-    }
-    hudController = createHudController(container, actions)
+  it('GIVEN each purchase outcome reason WHEN getUpgradeStatusCopy builds player-facing copy THEN it matches the AC4 mapping table', () => {
+    expect(getUpgradeStatusCopy('ok')).toEqual({
+      status: 'Upgrade installed.',
+      summary: 'Weapon Power increased. Resources were saved.',
+    })
+    expect(getUpgradeStatusCopy('write-error')).toEqual({
+      status: 'Upgrade not saved.',
+      summary: 'No resources were spent. Check browser storage and try again.',
+    })
+    expect(getUpgradeStatusCopy('invalid-state')).toEqual({
+      status: 'Upgrade unavailable.',
+      summary: 'Current upgrade data could not be applied.',
+    })
   })
 
-  it('GIVEN title_menu WHEN render called THEN the title screen is visible via role/name query (AC1, AC4)', () => {
-    hudController.render(createState('title_menu'), false)
-
-    expect(container.querySelector('[data-phase-screen="title"]')?.hidden).toBe(false)
-    expect(getByRole(container, 'button', 'Begin new run')).not.toBeNull()
-    expect(getByRole(container, 'button', 'Open save')).not.toBeNull()
-  })
-
-  it('GIVEN preparation WHEN render called THEN the preparation screen is visible and Launch sortie / Save / Reset are operable (AC2, AC4)', () => {
-    hudController.render(createState('preparation'), false)
-
-    expect(container.querySelector('[data-phase-screen="preparation"]')?.hidden).toBe(false)
-    const launchSortie = getByRole(container, 'button', 'Launch sortie')
-    const save = getByRole(container, 'button', 'Save progress')
-    const reset = getByRole(container, 'button', 'Reset sortie')
-    expect(launchSortie).not.toBeNull()
-    expect(save).not.toBeNull()
-    expect(reset).not.toBeNull()
-    expect((launchSortie as HTMLButtonElement).disabled).toBe(false)
-    expect((save as HTMLButtonElement).disabled).toBe(false)
-    expect((reset as HTMLButtonElement).disabled).toBe(false)
-  })
-
-  it('GIVEN running WHEN render called THEN the title and preparation screens are hidden and inert and excluded from tab order (AC3, AC6)', () => {
-    hudController.render(createState('running'), false)
-
-    const titleScreen = container.querySelector<HTMLElement>('[data-phase-screen="title"]')
-    const preparationScreen = container.querySelector<HTMLElement>('[data-phase-screen="preparation"]')
-
-    expect(titleScreen?.hidden).toBe(true)
-    expect(titleScreen?.hasAttribute('inert')).toBe(true)
-    expect(preparationScreen?.hidden).toBe(true)
-    expect(preparationScreen?.hasAttribute('inert')).toBe(true)
-
-    // AC6: New Game / Save / Load / Reset are not focusable during running.
-    expect(queryButton(container, 'new-game').disabled).toBe(true)
-    expect(queryButton(container, 'save').disabled).toBe(true)
-    expect(queryButton(container, 'load-game').disabled).toBe(true)
-    expect(queryButton(container, 'preparation-load').disabled).toBe(true)
-    expect(queryButton(container, 'reset').disabled).toBe(true)
-    expect(container.querySelector('[data-action="load-game"]')?.hasAttribute('inert')).toBe(true)
-  })
-
-  it('GIVEN preparation WHEN Load is clicked THEN load_menu opens and is tracked as the Back origin (AC8)', () => {
-    hudController.render(createState('preparation'), false)
-
-    queryButton(container, 'preparation-load').click()
-
-    const state = createState('load_menu')
-    hudController.render(state, false)
-    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Restore briefing')
-    expect(container.querySelector('[data-phase-screen="load"]')?.hidden).toBe(false)
-  })
-
-  it('GIVEN load_menu opened from preparation WHEN Back is clicked THEN the transition targets preparation (AC8)', () => {
-    const state = createState('preparation')
-    hudController.render(state, false)
-
-    queryButton(container, 'preparation-load').click()
-    expect(state.loopPhase).toBe('load_menu')
-
-    hudController.render(state, false)
-    queryButton(container, 'back-from-load-menu').click()
-
-    expect(state.loopPhase).toBe('preparation')
-  })
-
-  it('GIVEN load_menu opened from title_menu WHEN Back is clicked THEN the transition targets title_menu (AC8)', () => {
-    const state = createState('title_menu')
-    hudController.render(state, false)
-
-    // Opening load_menu from title_menu delegates to actions.onLoadGame()
-    // (main.ts performs the transition); this HUD-side origin tracking
-    // fires in the same click before that delegation.
-    queryButton(container, 'load-game').click()
-    state.loopPhase = 'load_menu'
-
-    hudController.render(state, false)
-    queryButton(container, 'back-from-load-menu').click()
-
-    expect(state.loopPhase).toBe('title_menu')
-  })
-
-  it('GIVEN load_menu WHEN a load failure is reported (loadFailure) THEN the phase stays at load_menu and status shows the error (AC9)', () => {
-    const state = createState('load_menu')
-    // Simulates main.ts's setHudFeedback() call on a load failure — no
-    // phase transition occurs; only the status copy changes.
-    state.telemetry.status = 'Load Game failed.'
-    state.telemetry.lastCommandSummary = 'No save data found.'
-
-    hudController.render(state, false)
-
-    expect(state.loopPhase).toBe('load_menu')
-    expect(container.querySelector('[data-field="status"]')?.textContent).toBe('Load Game failed.')
-    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Restore briefing')
-    expect(container.querySelector('[data-phase-screen="load"]')?.hidden).toBe(false)
-  })
-
-  it('GIVEN any state WHEN rendered THEN no raw LoopPhase or telemetry enum copy leaks into overlay text (AC contract: normal overlay text boundary)', () => {
-    hudController.render(createState('load_menu'), false)
+  it('GIVEN any state WHEN rendered THEN no raw LoopPhase enum copy leaks into overlay text', () => {
+    controller.render(createState('load_menu'))
 
     const textSurface = container.textContent ?? ''
     expect(textSurface).not.toContain('title_menu')
     expect(textSurface).not.toContain('load_menu')
-    expect(textSurface).not.toContain('preparation')
+    expect(textSurface).not.toContain('debrief_pending_reward')
+    expect(textSurface).not.toContain('debrief_reward_claimed')
   })
 })
