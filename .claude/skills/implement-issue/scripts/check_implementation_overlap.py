@@ -907,6 +907,13 @@ _NATIVE_DEPENDENCY_DIRECTIONS: Dict[str, str] = {
 _NATIVE_DEPENDENCY_PAGE_SIZE = 100
 _NATIVE_DEPENDENCY_MAX_PAGES = 1000  # safety cap; fail-closed if exceeded
 
+# #1797: structural collision は native successor として candidate 単位で
+# 完全に検証できる場合だけ evidence route に残す。contract/legacy 由来を混ぜた
+# provenance は native direction を偽装し得るため、closed set 外として扱う。
+_VERIFIED_NATIVE_SUCCESSOR_SOURCES = frozenset(
+    {"current_native_blocking", "candidate_native_blocked_by"}
+)
+
 
 _REPOSITORY_URL_RE = re.compile(r"^https://api\.github\.com/repos/([^/]+)/([^/]+)$")
 _NATIVE_DEPENDENCY_VALID_STATES = frozenset({"open", "closed"})
@@ -1715,6 +1722,86 @@ def _successor_dependency_provenance(
     return provenance
 
 
+def _issue_identity_matches(raw: Dict[str, Any], *, repository: str, issue_number: int) -> bool:
+    """Return whether one readback record is bound to the expected Issue URL.
+
+    The overlap collector is repository-scoped, but evidence must retain an
+    explicit identity check before a structural collision can become an
+    evidence-only successor.  A partial/offline record without its canonical
+    URL therefore remains fail-closed.
+    """
+    return (
+        raw.get("number") == issue_number
+        and raw.get("url") == f"https://github.com/{repository}/issues/{issue_number}"
+    )
+
+
+def _verified_native_successor_predicate(
+    *,
+    repository: str,
+    current_number: int,
+    current_raw: Dict[str, Any],
+    candidate_number: int,
+    candidate_raw: Dict[str, Any],
+    policy_class: str,
+    dependency_relation: str,
+    readback_complete: bool,
+    dependency_provenance: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build the #1797 candidate-local evidence-only eligibility predicate.
+
+    This deliberately does not reinterpret a C1/C2b/duplicate verdict.  It is
+    only an auditable exception for an already classified C2a successor whose
+    direction is proven exclusively by either native GitHub dependency side.
+    """
+    sources = sorted(
+        {
+            item.get("source")
+            for item in dependency_provenance
+            if isinstance(item, dict) and isinstance(item.get("source"), str)
+        }
+    )
+    current_identity_match = _issue_identity_matches(
+        current_raw, repository=repository, issue_number=current_number
+    )
+    candidate_identity_match = _issue_identity_matches(
+        candidate_raw, repository=repository, issue_number=candidate_number
+    )
+    repository_match = all(
+        item.get("repository") == repository and item.get("issue_number") == current_number
+        for item in dependency_provenance
+        if isinstance(item, dict)
+    )
+    provenance_nonempty = bool(sources)
+    native_sources_only = provenance_nonempty and set(sources).issubset(
+        _VERIFIED_NATIVE_SUCCESSOR_SOURCES
+    )
+    accepted = all(
+        (
+            policy_class == "C2a",
+            dependency_relation == "successor",
+            readback_complete,
+            provenance_nonempty,
+            native_sources_only,
+            repository_match,
+            current_identity_match,
+            candidate_identity_match,
+        )
+    )
+    return {
+        "accepted": accepted,
+        "allowed_sources": sorted(_VERIFIED_NATIVE_SUCCESSOR_SOURCES),
+        "candidate_identity_match": candidate_identity_match,
+        "current_identity_match": current_identity_match,
+        "dependency_relation": dependency_relation,
+        "policy_class": policy_class,
+        "provenance_nonempty": provenance_nonempty,
+        "provenance_sources": sources,
+        "readback_complete": readback_complete,
+        "repository_match": repository_match,
+    }
+
+
 def _predecessor_dependency_provenance(
     *,
     current_number: int,
@@ -2036,6 +2123,7 @@ def _classify(
         readback_targets.setdefault(num, "dependency_c2a")
 
     candidates_evidence: List[Dict[str, Any]] = []
+    verified_native_successor_numbers: set[int] = set()
     any_incomplete = False
     any_collision = False
     duplicate_confirmed = False
@@ -2123,6 +2211,20 @@ def _classify(
                 current_native_successor_index=current_native_successor_index,
             )
 
+        verified_native_successor = _verified_native_successor_predicate(
+            repository=repository,
+            current_number=args.issue_number,
+            current_raw=current_raw,
+            candidate_number=num,
+            candidate_raw=candidate_raw_by_number.get(key, {}),
+            policy_class=policy_class,
+            dependency_relation=dependency_relation,
+            readback_complete=bool(rb["readback_complete"]),
+            dependency_provenance=dependency_provenance,
+        )
+        if verified_native_successor["accepted"]:
+            verified_native_successor_numbers.add(num)
+
         if rb["readback_complete"]:
             if rb["heading_overlap"]:
                 reasons.append("structural_or_textual_collision_detected")
@@ -2156,6 +2258,7 @@ def _classify(
                 "non_conflict_reason": rb["non_conflict_reason"],
                 "dependency_relation": dependency_relation,
                 "dependency_provenance": dependency_provenance,
+                "verified_native_successor_predicate": verified_native_successor,
             }
         )
 
@@ -2174,16 +2277,19 @@ def _classify(
         current_body=current_body,
         candidates_evidence=candidates_evidence,
     )
-    if human_c1_decisions["accepted"]:
-        accepted_numbers = {int(item["candidate_issue_number"]) for item in human_c1_decisions["accepted"]}
-        any_incomplete = any(
-            not item["readback_complete"] and item["issue_number"] not in accepted_numbers
-            for item in candidates_evidence
-        )
-        any_collision = any(
-            item["heading_overlap"] and item["issue_number"] not in accepted_numbers
-            for item in candidates_evidence
-        )
+    accepted_numbers = set(verified_native_successor_numbers)
+    accepted_numbers.update(
+        int(item["candidate_issue_number"])
+        for item in human_c1_decisions["accepted"]
+    )
+    any_incomplete = any(
+        not item["readback_complete"] and item["issue_number"] not in accepted_numbers
+        for item in candidates_evidence
+    )
+    any_collision = any(
+        item["heading_overlap"] and item["issue_number"] not in accepted_numbers
+        for item in candidates_evidence
+    )
 
     # --- route 決定 ---
     route: str

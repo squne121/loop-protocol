@@ -1200,6 +1200,122 @@ def test_given_shared_parent_native_blocking_successor_then_route_is_c2a_not_par
     ], payload
 
 
+def test_given_verified_current_native_successor_structural_collision_then_evidence_route(
+    tmp_path: Path,
+) -> None:
+    """GIVEN exact native successor evidence WHEN headings collide THEN only that
+    verified candidate may use the evidence route without a human C1 decision.
+    """
+    current_number = 9780
+    candidate_number = 9781
+    shared_path = "docs/dev/verified_native_successor.md"
+    current = {
+        "number": current_number,
+        "title": "実装: current verified native successor",
+        "body": _body_with_paths(
+            parent_issue="#9770",
+            goal_ref="shared verified native successor goal",
+            outcome="shared structural collision outcome AC1.",
+            paths=[shared_path],
+        ),
+        "updatedAt": "2026-07-27T00:00:00Z",
+        "url": f"https://github.com/{DEFAULT_REPO}/issues/{current_number}",
+        "blocking": [
+            {"repository": DEFAULT_REPO, "number": candidate_number, "state": "OPEN"}
+        ],
+    }
+    candidate = {
+        "number": candidate_number,
+        "title": "実装: candidate verified native successor",
+        "body": _body_with_paths(
+            parent_issue="#9770",
+            goal_ref="shared verified native successor goal",
+            outcome="shared structural collision outcome AC1.",
+            paths=[shared_path],
+        ),
+        "labels": [{"name": "phase/implementation"}],
+        "updatedAt": "2026-07-27T00:01:00Z",
+        "url": f"https://github.com/{DEFAULT_REPO}/issues/{candidate_number}",
+        "state": "OPEN",
+    }
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [candidate])
+
+    exit_code, payload = _run_cli(current_number, current_file, candidates_file)
+
+    assert exit_code == EXIT_OK
+    assert payload["route"] == "proceed_with_collision_evidence", payload
+    evidence = payload["candidates"][0]
+    assert evidence["heading_overlap"] is True
+    assert evidence["policy_class"] == "C2a"
+    assert evidence["dependency_relation"] == "successor"
+    assert evidence["verified_native_successor_predicate"] == {
+        "accepted": True,
+        "allowed_sources": ["candidate_native_blocked_by", "current_native_blocking"],
+        "candidate_identity_match": True,
+        "current_identity_match": True,
+        "dependency_relation": "successor",
+        "policy_class": "C2a",
+        "provenance_nonempty": True,
+        "provenance_sources": ["current_native_blocking"],
+        "readback_complete": True,
+        "repository_match": True,
+    }
+
+
+def test_given_native_and_contract_successor_provenance_then_fail_closed(tmp_path: Path) -> None:
+    """GIVEN mixed native and contract provenance WHEN headings collide THEN the
+    evidence route is rejected because the predicate is native-only.
+    """
+    current_number = 9790
+    candidate_number = 9791
+    shared_path = "docs/dev/mixed_successor_provenance.md"
+    current = {
+        "number": current_number,
+        "title": "実装: current mixed provenance",
+        "body": _body_with_paths(
+            parent_issue="#9770",
+            goal_ref="shared mixed provenance goal",
+            outcome="shared mixed provenance collision.",
+            paths=[shared_path],
+        ),
+        "updatedAt": "2026-07-27T00:00:00Z",
+        "url": f"https://github.com/{DEFAULT_REPO}/issues/{current_number}",
+        "blocking": [
+            {"repository": DEFAULT_REPO, "number": candidate_number, "state": "OPEN"}
+        ],
+    }
+    candidate_body = _body_with_paths(
+        parent_issue="#9770",
+        goal_ref="shared mixed provenance goal",
+        outcome="shared mixed provenance collision.",
+        paths=[shared_path],
+    ).replace(
+        "change_kind: code",
+        f"change_kind: code\nblocked_by: [\"#{current_number}\"]",
+    )
+    candidate = {
+        "number": candidate_number,
+        "title": "実装: candidate mixed provenance",
+        "body": candidate_body,
+        "labels": [{"name": "phase/implementation"}],
+        "updatedAt": "2026-07-27T00:01:00Z",
+        "url": f"https://github.com/{DEFAULT_REPO}/issues/{candidate_number}",
+        "state": "OPEN",
+    }
+    current_file, candidates_file = _write_overlap_inputs(tmp_path, current, [candidate])
+
+    exit_code, payload = _run_cli(current_number, current_file, candidates_file)
+
+    assert exit_code == EXIT_OK
+    assert payload["route"] == "human_review_required", payload
+    predicate = payload["candidates"][0]["verified_native_successor_predicate"]
+    assert predicate["accepted"] is False
+    assert predicate["provenance_sources"] == [
+        "candidate_contract_blocked_by",
+        "current_native_blocking",
+    ]
+
+
 def test_given_mixed_normal_c1_and_successor_candidates_then_policy_class_distinguished_per_candidate(
     tmp_path: Path,
 ) -> None:
