@@ -38,6 +38,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 LOCAL_MAIN_GUARD_SH = REPO_ROOT / ".claude" / "hooks" / "local_main_branch_guard.sh"
 JAPANESE_PROSE_GUARD_SH = REPO_ROOT / ".claude" / "hooks" / "guard-japanese-prose.sh"
 
+_GUARDS_DIR = REPO_ROOT / "scripts" / "agent-guards"
+if str(_GUARDS_DIR) not in sys.path:
+    sys.path.insert(0, str(_GUARDS_DIR))
+import controlled_skill_mutation_policy as _policy  # noqa: E402
+
 PR_NUMBER = 1530
 INPUT_REL = f"artifacts/{PR_NUMBER}/issue-metadata/pr_review.publish/in.json"
 
@@ -214,3 +219,50 @@ class TestAC8FullRealHookChainAggregate:
             f"raw `gh pr review --approve` must be denied by the real hook "
             f"chain; results={results}"
         )
+
+
+
+class TestAC10RenderModeArgvPassesPolicyValidation:
+    """Issue #1822 fix_delta AC10: the render-mode exact argv for
+    pr_review.publish (--command-id pr_review.publish --issue-number
+    --pr-number --render-body-file --verdict --reviewed-head-sha
+    --expected-head-sha --json) must pass
+    controlled_skill_mutation_policy._validate_executor_argv().
+
+    Issue #1690 removed worktree_scope_guard / local_main_branch_guard from
+    `.claude/settings.json` (see the Issue #1690 notes on
+    TestAC8FullRealHookChainAggregate above), so this test exercises
+    _validate_executor_argv() directly rather than shelling out to either
+    guard script -- there is no longer a guard subprocess in the real Claude
+    Code hook chain that re-validates this argv shape. `.codex/hooks.json`
+    (the Codex CLI equivalent hook registration, a separate runtime from
+    Claude Code's `.claude/settings.json`) still wires the same guard/policy
+    lane for Codex CLI sessions.
+    """
+
+    ISSUE_NUMBER = 1822
+    PR_NUMBER = 1825
+    HEAD_SHA = "a" * 40
+
+    def _render_mode_argv(self) -> list[str]:
+        return [
+            "--command-id", "pr_review.publish",
+            "--issue-number", str(self.ISSUE_NUMBER),
+            "--pr-number", str(self.PR_NUMBER),
+            "--render-body-file", f"artifacts/{self.ISSUE_NUMBER}/issue-metadata/pr_review.publish/body.md",
+            "--verdict", "APPROVE",
+            "--reviewed-head-sha", self.HEAD_SHA,
+            "--expected-head-sha", self.HEAD_SHA,
+            "--repo", "squne121/loop-protocol",
+            "--json",
+        ]
+
+    def test_render_mode_exact_argv_passes_validate_executor_argv(self):
+        assert _policy._validate_executor_argv(self._render_mode_argv()) is True
+
+    def test_render_mode_argv_missing_pr_number_denied(self):
+        argv = [
+            tok for tok in self._render_mode_argv()
+            if tok not in {"--pr-number", str(self.PR_NUMBER)}
+        ]
+        assert _policy._validate_executor_argv(argv) is False

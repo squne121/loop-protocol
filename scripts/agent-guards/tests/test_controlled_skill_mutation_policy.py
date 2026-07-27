@@ -29,6 +29,7 @@ from controlled_skill_mutation_policy import (  # noqa: E402
     COMMAND_ID_ISSUE_CONTENT_UPDATE,
     COMMAND_ID_ISSUE_DEPENDENCY_REMOVE,
     COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
+    COMMAND_ID_PR_REVIEW_PUBLISH,
     CONTROLLED_SKILL_MUTATION_COMMAND_POLICY,
     ENV_SANITIZE_KEYS,
     EXECUTOR_SCRIPT,
@@ -650,3 +651,88 @@ class TestIssueDependencyRemoveInputValidator:
         req["idempotency_key"] = ""
         err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
         assert "idempotency_key_invalid" in err
+
+
+
+# =============================================================================
+# Issue #1822 fix_delta AC7: --pr-number command-id/mode-specific grammar
+# =============================================================================
+
+class TestPrReviewPublishPrNumberGrammar:
+    """AC7: --pr-number is only ever valid for pr_review.publish, and only in
+    render mode (never in legacy --input-file mode, where the PR number lives
+    inside the input file's PR_REVIEW_PUBLISH_REQUEST_V1 payload instead)."""
+
+    def _render_mode_args(self, pr_number=None):
+        args = [
+            "--command-id", COMMAND_ID_PR_REVIEW_PUBLISH,
+            "--issue-number", "1822",
+            "--repo", TRUSTED_REPO,
+            "--render-body-file", "artifacts/1822/body.txt",
+            "--verdict", "APPROVE",
+            "--reviewed-head-sha", "a" * 40,
+            "--expected-head-sha", "a" * 40,
+        ]
+        if pr_number is not None:
+            args += ["--pr-number", str(pr_number)]
+        return args
+
+    def _input_file_mode_args(self, pr_number=None, command_id=COMMAND_ID_PR_REVIEW_PUBLISH):
+        args = [
+            "--command-id", command_id,
+            "--issue-number", "1822",
+            "--repo", TRUSTED_REPO,
+            "--input-file", "artifacts/1822/issue-metadata/pr_review.publish/request.json",
+        ]
+        if pr_number is not None:
+            args += ["--pr-number", str(pr_number)]
+        return args
+
+    # ── Allowed combinations ────────────────────────────────────────────────
+
+    def test_pr_review_publish_render_mode_with_pr_number_allowed(self):
+        assert _validate_executor_argv(self._render_mode_args(pr_number=1825)) is True
+
+    def test_pr_review_publish_input_file_mode_without_pr_number_allowed(self):
+        assert _validate_executor_argv(self._input_file_mode_args()) is True
+
+    # ── Rejected combinations ────────────────────────────────────────────────
+
+    def test_pr_review_publish_render_mode_without_pr_number_denied(self):
+        assert _validate_executor_argv(self._render_mode_args(pr_number=None)) is False
+
+    def test_pr_review_publish_input_file_mode_with_pr_number_denied(self):
+        assert _validate_executor_argv(
+            self._input_file_mode_args(pr_number=1825)
+        ) is False
+
+    def test_other_command_id_input_file_mode_with_pr_number_denied(self):
+        assert _validate_executor_argv(
+            self._input_file_mode_args(
+                pr_number=1825, command_id=COMMAND_ID_PUBLISH
+            )
+        ) is False
+
+    def test_other_command_id_render_mode_flags_denied(self):
+        """Even with --pr-number present (bypassing the render-mode required-flags
+        subset check), a non-pr_review.publish command-id must still be denied
+        because render mode / --pr-number / --merge-ready are pr_review.publish
+        -only surface area."""
+        args = [
+            "--command-id", COMMAND_ID_PUBLISH,
+            "--issue-number", "1822",
+            "--repo", TRUSTED_REPO,
+            "--render-body-file", "artifacts/1822/body.txt",
+            "--verdict", "APPROVE",
+            "--reviewed-head-sha", "a" * 40,
+            "--expected-head-sha", "a" * 40,
+            "--pr-number", "1825",
+        ]
+        assert _validate_executor_argv(args) is False
+
+    def test_other_command_id_merge_ready_denied(self):
+        args = self._input_file_mode_args(command_id=COMMAND_ID_PUBLISH) + [
+            "--merge-ready"
+        ]
+        assert _validate_executor_argv(args) is False
+
