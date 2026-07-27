@@ -586,14 +586,13 @@ def _validate_pr_review_publish_fields(data: dict, repo: str, issue_number: int)
     if declared_repo != repo:
         return f"pr_review_publish_repo_mismatch: {declared_repo!r} != {repo!r}"
 
+    # Issue #1822: pr_number and issue_number are independent identifiers
+    # (linked Issue vs target PR are commonly different, e.g. Issue #1688 ->
+    # PR #1818). pr_number is validated as a standalone positive int only --
+    # it is never compared against issue_number.
     pr_number = data.get("pr_number")
     if type(pr_number) is not int or pr_number <= 0:
         return f"pr_review_publish_pr_number_invalid: {pr_number!r}"
-    if pr_number != issue_number:
-        return (
-            f"pr_review_publish_pr_number_mismatch: pr_number={pr_number} "
-            f"!= --issue-number={issue_number}"
-        )
 
     expected_head_sha = data.get("expected_head_sha")
     if not isinstance(expected_head_sha, str) or not _PR_HEAD_SHA_RE.match(expected_head_sha):
@@ -1084,6 +1083,15 @@ def main(argv: list[str] | None = None) -> int:
         "--render-body-file", default=None,
         help="Relative path to a raw review body TEXT file (artifact subtree, "
              "pr_review.publish render mode only)",
+    )
+    # Issue #1822: linked --issue-number and target --pr-number are
+    # independent identifiers (e.g. Issue #1688 -> PR #1818). The artifact
+    # subtree / issue binding always use --issue-number; the GitHub review
+    # target (endpoint, idempotency key) always uses --pr-number.
+    parser.add_argument(
+        "--pr-number", type=int, default=None,
+        help="Target PR number to publish the review against (render mode "
+             "only, independent from --issue-number)",
     )
     parser.add_argument(
         "--verdict", default=None, choices=["APPROVE", "REQUEST_CHANGES", "COMMENT"],
@@ -2022,6 +2030,14 @@ def _render_pr_review_publish_request(args, project_root: Path) -> tuple[dict | 
         return None, "pr_review_render_missing_reviewed_head_sha"
     if args.expected_head_sha is None:
         return None, "pr_review_render_missing_expected_head_sha"
+    # Issue #1822 AC1: --pr-number is a mandatory, independent identifier in
+    # render mode. It must be resolvable to a positive int before any POST --
+    # a missing/non-integer/zero-or-negative value is rejected fail-closed
+    # here, never downstream against a live PR.
+    if args.pr_number is None:
+        return None, "pr_review_render_missing_pr_number"
+    if type(args.pr_number) is not int or args.pr_number <= 0:
+        return None, f"pr_review_render_pr_number_invalid: {args.pr_number!r}"
 
     if not _PR_HEAD_SHA_RE.match(args.expected_head_sha):
         return None, f"pr_review_render_expected_head_sha_invalid: {args.expected_head_sha!r}"
@@ -2085,13 +2101,15 @@ def _render_pr_review_publish_request(args, project_root: Path) -> tuple[dict | 
         )
 
     body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    idempotency_key = f"{args.repo}:{args.issue_number}:{args.expected_head_sha}:{body_sha256}"
+    # Issue #1822 AC3: idempotency key stays keyed on the independent
+    # pr_number (the actual review target), not on issue_number.
+    idempotency_key = f"{args.repo}:{args.pr_number}:{args.expected_head_sha}:{body_sha256}"
 
     return {
         "schema": "PR_REVIEW_PUBLISH_REQUEST_V1",
         "issue_number": args.issue_number,
         "repo": args.repo,
-        "pr_number": args.issue_number,
+        "pr_number": args.pr_number,
         "expected_head_sha": args.expected_head_sha,
         "event": "COMMENT",
         "producer_role": "pr-reviewer",
