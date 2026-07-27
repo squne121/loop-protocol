@@ -17,7 +17,7 @@ import {
 } from '../src/main'
 import { resolvePhaseTransition } from '../src/systems/PhaseTransitionSystem'
 import { createInputState, mapInputToCommands } from '../src/input'
-import type { SaveResult } from '../src/storage'
+import type { LoadResult, SaveResult } from '../src/storage'
 import { upgradeDefinitions } from '../src/data/upgrades'
 import type { HudUpgradeStatusCopy } from '../src/ui/HudController'
 
@@ -362,6 +362,67 @@ describe('AC3: runLoadGame — storage.load() only called from load_menu', () =>
     })
     expect(loadSpy).toHaveBeenCalledTimes(1)
     expect(successSpy).toHaveBeenCalledTimes(1)
+  })
+
+  // Issue #1374 (AC9): load failure keeps the phase at load_menu (no
+  // transition callback fires) and reports the failure via setHudFeedback
+  // so the HUD's persistent status view can show it while load_menu is
+  // showing (loadFailure).
+  it('GIVEN load_menu without a loadable snapshot WHEN runLoadGame called THEN loadFailure is reported via setHudFeedback and no transition occurs', () => {
+    const loadSpy = vi.fn()
+    const feedbackSpy = vi.fn()
+    const successSpy = vi.fn()
+    const failSpy = vi.fn()
+    runLoadGame('load_menu', false, {
+      storage: { load: loadSpy },
+      reportLoadFailure: vi.fn(),
+      setHudFeedback: feedbackSpy,
+      onTitleMenuTransition: vi.fn(),
+      onLoadSuccess: successSpy,
+      onLoadFail: failSpy,
+    })
+    expect(loadSpy).not.toHaveBeenCalled()
+    expect(successSpy).not.toHaveBeenCalled()
+    expect(failSpy).not.toHaveBeenCalled()
+    expect(feedbackSpy).toHaveBeenCalledWith('Load Game failed.', 'No save data available.')
+  })
+
+  it('GIVEN load_menu with a snapshot WHEN storage.load() reports a loadFailure result THEN reportLoadFailure is invoked and no success callback fires', () => {
+    const loadFailureResult: LoadResult = { ok: false, snapshot: null, reason: 'storage-unavailable' }
+    const loadSpy = vi.fn(() => loadFailureResult)
+    const reportSpy = vi.fn()
+    const feedbackSpy = vi.fn()
+    const successSpy = vi.fn()
+    runLoadGame('load_menu', true, {
+      storage: { load: loadSpy },
+      reportLoadFailure: reportSpy,
+      setHudFeedback: feedbackSpy,
+      onTitleMenuTransition: vi.fn(),
+      onLoadSuccess: successSpy,
+      onLoadFail: vi.fn(),
+    })
+    expect(loadSpy).toHaveBeenCalledTimes(1)
+    expect(reportSpy).toHaveBeenCalledWith(loadFailureResult)
+    expect(successSpy).not.toHaveBeenCalled()
+    expect(feedbackSpy).toHaveBeenCalledWith('Load Game failed.', 'Current state unchanged.')
+  })
+
+  it('GIVEN load_menu with a snapshot WHEN storage.load() returns no snapshot THEN onLoadFail fires as the loadFailure signal and no transition occurs', () => {
+    const loadSpy = vi.fn(() => ({ ok: true as const, snapshot: null, reason: 'absent' as const }))
+    const failSpy = vi.fn()
+    const feedbackSpy = vi.fn()
+    const successSpy = vi.fn()
+    runLoadGame('load_menu', true, {
+      storage: { load: loadSpy },
+      reportLoadFailure: vi.fn(),
+      setHudFeedback: feedbackSpy,
+      onTitleMenuTransition: vi.fn(),
+      onLoadSuccess: successSpy,
+      onLoadFail: failSpy,
+    })
+    expect(failSpy).toHaveBeenCalledTimes(1)
+    expect(successSpy).not.toHaveBeenCalled()
+    expect(feedbackSpy).toHaveBeenCalledWith('Load Game failed.', 'No save data found.')
   })
 
   it('GIVEN preparation phase WHEN runLoadGame called THEN storage.load is NOT called (no-op)', () => {
