@@ -1755,6 +1755,15 @@ def _verified_native_successor_predicate(
     only an auditable exception for an already classified C2a successor whose
     direction is proven exclusively by either native GitHub dependency side.
     """
+    provenance_records_valid = all(
+        isinstance(item, dict)
+        and isinstance(item.get("source"), str)
+        and item.get("source") in _VERIFIED_NATIVE_SUCCESSOR_SOURCES
+        and item.get("repository") == repository
+        and type(item.get("issue_number")) is int
+        and item.get("issue_number") == current_number
+        for item in dependency_provenance
+    )
     sources = sorted(
         {
             item.get("source")
@@ -1768,13 +1777,13 @@ def _verified_native_successor_predicate(
     candidate_identity_match = _issue_identity_matches(
         candidate_raw, repository=repository, issue_number=candidate_number
     )
-    repository_match = all(
+    repository_match = provenance_records_valid and all(
         item.get("repository") == repository and item.get("issue_number") == current_number
         for item in dependency_provenance
         if isinstance(item, dict)
     )
-    provenance_nonempty = bool(sources)
-    native_sources_only = provenance_nonempty and set(sources).issubset(
+    provenance_nonempty = bool(dependency_provenance)
+    native_sources_only = provenance_records_valid and provenance_nonempty and set(sources).issubset(
         _VERIFIED_NATIVE_SUCCESSOR_SOURCES
     )
     accepted = all(
@@ -1798,6 +1807,7 @@ def _verified_native_successor_predicate(
         "dependency_relation": dependency_relation,
         "policy_class": policy_class,
         "provenance_nonempty": provenance_nonempty,
+        "provenance_records_valid": provenance_records_valid,
         "provenance_sources": sources,
         "readback_complete": readback_complete,
         "repository_match": repository_match,

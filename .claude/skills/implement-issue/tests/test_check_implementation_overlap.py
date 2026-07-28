@@ -1256,6 +1256,7 @@ def test_given_verified_current_native_successor_structural_collision_then_evide
         "dependency_relation": "successor",
         "policy_class": "C2a",
         "provenance_nonempty": True,
+        "provenance_records_valid": True,
         "provenance_sources": ["current_native_blocking"],
         "readback_complete": True,
         "repository_match": True,
@@ -1481,6 +1482,53 @@ def test_verified_native_successor_decision_matrix_fail_closed(
     )
     assert result["accepted"] is expected
     assert result["source_complete"] is source_complete
+
+
+@pytest.mark.parametrize(
+    "malformed_provenance",
+    [
+        pytest.param(
+            "candidate_contract_blocked_by",
+            id="string_candidate_contract_blocked_by_is_not_silently_discarded",
+        ),
+    ],
+)
+def test_verified_native_successor_rejects_malformed_mixed_provenance(
+    malformed_provenance: object,
+) -> None:
+    """#1797 AC3/AC4: malformed provenance must not be discarded fail-open."""
+    current_number = 8200
+    candidate_number = 8201
+    current = {
+        "number": current_number,
+        "url": f"https://github.com/{DEFAULT_REPO}/issues/{current_number}",
+    }
+    candidate = {
+        "number": candidate_number,
+        "url": f"https://github.com/{DEFAULT_REPO}/issues/{candidate_number}",
+    }
+    result = checker_module._verified_native_successor_predicate(
+        repository=DEFAULT_REPO,
+        current_number=current_number,
+        current_raw=current,
+        candidate_number=candidate_number,
+        candidate_raw=candidate,
+        policy_class="C2a",
+        dependency_relation="successor",
+        readback_complete=True,
+        source_complete=True,
+        dependency_provenance=[
+            {
+                "source": "current_native_blocking",
+                "repository": DEFAULT_REPO,
+                "issue_number": current_number,
+            },
+            malformed_provenance,
+        ],
+    )
+
+    assert result["accepted"] is False
+    assert result["provenance_records_valid"] is False
 
 
 def test_given_mixed_normal_c1_and_successor_candidates_then_policy_class_distinguished_per_candidate(
