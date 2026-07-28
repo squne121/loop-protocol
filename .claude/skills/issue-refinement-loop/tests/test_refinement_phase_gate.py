@@ -12,14 +12,36 @@ AC5: 失敗パターン fixture（preflight pass → scope_signal_guard.triggere
      human_escalation）を再発防止。
 
 Issue #1507 AC24 (Scope Delta): `make_phase_state()` now auto-provisions a
-valid REVIEW_COMPACT_VALIDATION_RESULT_V1 fixture file (validation_status:
-valid) and passes `--review-validation-result-path` whenever phase="review"
-and source_kind="issue_review_result_compact_v1", since
-build_refinement_phase_state.py now requires that argument for this exact
+valid REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1 fixture file
+(validation_status: valid) and passes `--review-validation-result-path` and
+`--issue-number` whenever phase="review" and
+source_kind="issue_review_result_compact_v1", since
+build_refinement_phase_state.py now requires those arguments for this exact
 (phase, source_kind) combination (structural validator-first gate). This
 keeps all pre-existing AC1-AC5/B2/B3/M1/M3 call sites in this file working
 unchanged; only the shared helper and the one raw (non-helper) subprocess
 call in test_validate_router_in_phase_parametrize needed updating.
+
+Issue #1755 (Scope Delta): the review-phase gate now requires the
+INTERMEDIATE schema literal (`REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1`,
+not the legacy `REVIEW_COMPACT_VALIDATION_RESULT_V1`), a matching
+`input_sha256` bound to the actual `--source-path` bytes, and a matching
+`--issue-number` bound to `normalized_payload.ARTIFACT`'s issue segment.
+`write_valid_review_validation_result()` and `make_phase_state()` were
+updated accordingly.
+
+Issue #1755 fix_delta (OWNER REQUEST_CHANGES, PR #1826) P0: the review-phase
+gate now re-runs the REAL `review_compact.validate_intermediate_v1` validator
+(`emit_parent_review_envelope_v2.build_validate_intermediate_result()`)
+against `--source-path`'s actual bytes and rejects any validation result that
+does not match its output exactly -- a hand-crafted "claimed valid" receipt
+divorced from the real grammar (e.g. one built for `b"{}"`, which is not a
+valid child-intermediate envelope) is no longer accepted. `make_phase_state()`
+and `write_valid_review_validation_result()` were updated to provision a
+REAL, grammar-valid child-intermediate approve envelope as `--source-path`
+content whenever the review-phase gate applies, and to produce the
+validation-result fixture by actually INVOKING the real validator function
+against those bytes (never a hand-crafted claim).
 """
 
 import json
@@ -36,6 +58,12 @@ DECIDE_SCRIPT = SKILL_ROOT / "scripts" / "decide_next_loop_action.py"
 BUILD_SCRIPT = SKILL_ROOT / "scripts" / "build_refinement_phase_state.py"
 FIXTURE_PATH = SKILL_ROOT / "fixtures" / "loop_state_v1_fixture.json"
 
+_SCRIPTS_DIR = SKILL_ROOT / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+import emit_parent_review_envelope_v2 as _emit2  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -47,21 +75,68 @@ def load_loop_state_fixture() -> dict[str, Any]:
     return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
 
-def write_valid_review_validation_result() -> str:
-    """Write a minimal valid REVIEW_COMPACT_VALIDATION_RESULT_V1 fixture
-    (Issue #1507 AC24) and return its path."""
+_DEFAULT_REVIEW_GATE_ISSUE_NUMBER = 999999
+
+
+def _real_approve_child_bytes(issue_number: int) -> bytes:
+    """Issue #1755 fix_delta P0 (OWNER REQUEST_CHANGES, PR #1826): a REAL,
+    grammar-valid 8-line child-intermediate approve envelope (the exact shape
+    `review_compact.validate_intermediate_v1` accepts). Used as
+    --source-path content so `write_valid_review_validation_result()` can
+    produce a genuine receipt by actually RUNNING the real validator against
+    these bytes, instead of hand-crafting a claimed-valid payload divorced
+    from the real grammar (which the review-phase gate now rejects -- it
+    re-runs this same validator and requires an exact match)."""
+    artifact_path = (
+        f".claude/artifacts/issue-refinement-loop/{issue_number}/"
+        "compact_review_result_20260728T000000Z.json"
+    )
+    lines = [
+        "STATUS: ok",
+        "VERDICT: approve",
+        "SUMMARY: contract ready",
+        "BLOCKERS: 0",
+        "NEXT_ACTION: proceed",
+        "MUST_READ: ",
+        f"EVIDENCE: {artifact_path}",
+        f"ARTIFACT: compact_review_result_v1={artifact_path}",
+    ]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def write_valid_review_validation_result(
+    source_path: "str | None" = None,
+    issue_number: int = _DEFAULT_REVIEW_GATE_ISSUE_NUMBER,
+) -> str:
+    """Write a GENUINE REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1
+    receipt (Issue #1507 AC24 / Issue #1755 AC2-AC5 / fix_delta P0) and
+    return its path.
+
+    Issue #1755 fix_delta P0: the receipt is produced by actually INVOKING
+    the real `emit_parent_review_envelope_v2.build_validate_intermediate_result()`
+    validator against `source_path`'s ACTUAL bytes (or a real, grammar-valid
+    approve envelope bound to `issue_number` if `source_path` is not
+    supplied) -- never a hand-crafted claim of validity. The review-phase
+    gate independently re-runs this same validator and rejects any receipt
+    that does not match its own output byte-for-byte, so a receipt not
+    actually produced by this validator no longer passes the gate."""
+    if source_path is not None:
+        source_bytes = Path(source_path).read_bytes()
+    else:
+        source_bytes = _real_approve_child_bytes(issue_number)
+
+    result = _emit2.build_validate_intermediate_result(
+        source_bytes, issue_number=issue_number
+    )
+    assert result["validation_status"] == "valid", (
+        "write_valid_review_validation_result() fixture is not actually "
+        f"valid per the real validator: {result}"
+    )
+
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False
     ) as f:
-        json.dump(
-            {
-                "schema": "REVIEW_COMPACT_VALIDATION_RESULT_V1",
-                "schema_version": "1",
-                "validation_status": "valid",
-                "envelope_kind": "approve",
-            },
-            f,
-        )
+        json.dump(result, f)
         return f.name
 
 
@@ -70,34 +145,51 @@ def make_phase_state(
     source_kind: str = "refinement_preflight_result_v1",
     source_path: str | None = None,
     review_validation_result_path: str | None = None,
+    issue_number: "int | None" = None,
 ) -> dict[str, Any]:
     """Build a minimal ISSUE_REFINEMENT_PHASE_STATE_V1 via build_refinement_phase_state.py.
 
     source_path defaults to a temporary file created automatically (M1: source_path must exist).
 
-    Issue #1507 AC24: when phase="review" and
+    Issue #1507 AC24 / Issue #1755 AC2-AC5: when phase="review" and
     source_kind="issue_review_result_compact_v1", a valid
-    REVIEW_COMPACT_VALIDATION_RESULT_V1 fixture is auto-provisioned (unless
-    the caller explicitly supplies review_validation_result_path) so that
-    existing (phase, source_kind) call sites in this file keep passing
+    REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1 fixture (bound to
+    source_path's actual bytes and to issue_number) is auto-provisioned
+    (unless the caller explicitly supplies review_validation_result_path),
+    and --issue-number is auto-supplied (unless explicitly overridden), so
+    that existing (phase, source_kind) call sites in this file keep passing
     unchanged under the new structural validator-first gate.
+
+    Issue #1755 fix_delta P0: when the review-phase gate applies, the
+    auto-created source_path file contains a REAL, grammar-valid
+    child-intermediate approve envelope (not a "{}" placeholder), because
+    build_refinement_phase_state.py now re-runs the real validator against
+    these exact bytes and rejects any receipt that does not match its own
+    recomputed output.
     """
+    gate_applies = (
+        phase == "review" and source_kind == "issue_review_result_compact_v1"
+    )
+    if gate_applies and issue_number is None:
+        issue_number = _DEFAULT_REVIEW_GATE_ISSUE_NUMBER
+
     # Create a real temp file for source_path (M1 requires source_path to exist)
     _source_file = None
     if source_path is None:
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
+            mode="wb", suffix=".json", delete=False
         ) as sf:
-            sf.write("{}")
+            if gate_applies:
+                sf.write(_real_approve_child_bytes(issue_number))
+            else:
+                sf.write(b"{}")
             source_path = sf.name
         _source_file = source_path
 
-    if (
-        phase == "review"
-        and source_kind == "issue_review_result_compact_v1"
-        and review_validation_result_path is None
-    ):
-        review_validation_result_path = write_valid_review_validation_result()
+    if gate_applies and review_validation_result_path is None:
+        review_validation_result_path = write_valid_review_validation_result(
+            source_path=source_path, issue_number=issue_number
+        )
 
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False
@@ -114,6 +206,8 @@ def make_phase_state(
     ]
     if review_validation_result_path is not None:
         argv += ["--review-validation-result-path", review_validation_result_path]
+    if issue_number is not None:
+        argv += ["--issue-number", str(issue_number)]
 
     result = subprocess.run(
         argv,
@@ -734,13 +828,21 @@ def test_build_phase_state_review_phase_rejects_invalid_validation_status(tmp_pa
 
 
 def test_build_phase_state_review_phase_with_valid_validation_result_succeeds(tmp_path):
-    """AC24: a valid REVIEW_COMPACT_VALIDATION_RESULT_V1 (validation_status:
-    valid) allows phase-state generation to proceed as before."""
+    """AC24 / Issue #1755 AC2-AC5: a valid
+    REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1 (validation_status:
+    valid, correct schema literal, empty violations, input_sha256 bound to
+    --source-path bytes, ARTIFACT issue segment bound to --issue-number)
+    allows phase-state generation to proceed.
+
+    Issue #1755 fix_delta P0: --source-path must contain a REAL,
+    grammar-valid child-intermediate envelope (the gate now re-runs the real
+    validator against these exact bytes)."""
     source_file = tmp_path / "source.json"
-    source_file.write_text("{}", encoding="utf-8")
-    validation_file = tmp_path / "validation.json"
-    validation_file.write_text(
-        json.dumps({"validation_status": "valid"}), encoding="utf-8"
+    source_file.write_bytes(_real_approve_child_bytes(1755))
+    validation_file = Path(
+        write_valid_review_validation_result(
+            source_path=str(source_file), issue_number=1755
+        )
     )
     out_file = tmp_path / "out.json"
 
@@ -752,6 +854,7 @@ def test_build_phase_state_review_phase_with_valid_validation_result_succeeds(tm
             "--source-kind", "issue_review_result_compact_v1",
             "--source-path", str(source_file),
             "--review-validation-result-path", str(validation_file),
+            "--issue-number", "1755",
             "--output-path", str(out_file),
         ],
         capture_output=True,
@@ -838,7 +941,15 @@ def test_validate_router_in_phase_parametrize(phase, router, expected_allowed, t
     }
     source_kind = source_kind_map.get(phase, "loop_state_v1")
     source_file = tmp_path / "source.json"
-    source_file.write_text("{}", encoding="utf-8")
+    _gate_applies = phase == "review" and source_kind == "issue_review_result_compact_v1"
+    # Issue #1755 fix_delta P0: when the review-phase gate applies,
+    # --source-path must contain a REAL, grammar-valid child-intermediate
+    # envelope (not a "{}" placeholder), since the gate re-runs the real
+    # validator against these exact bytes.
+    if _gate_applies:
+        source_file.write_bytes(_real_approve_child_bytes(1755))
+    else:
+        source_file.write_text("{}", encoding="utf-8")
 
     # Build phase state
     out_file = tmp_path / f"phase_state_{phase}.json"
@@ -850,14 +961,20 @@ def test_validate_router_in_phase_parametrize(phase, router, expected_allowed, t
         "--source-path", str(source_file),
         "--output-path", str(out_file),
     ]
-    # Issue #1507 AC24: review phase + issue_review_result_compact_v1 requires
-    # a valid REVIEW_COMPACT_VALIDATION_RESULT_V1 fixture.
-    if phase == "review" and source_kind == "issue_review_result_compact_v1":
-        validation_file = tmp_path / "review_validation.json"
-        validation_file.write_text(
-            json.dumps({"validation_status": "valid"}), encoding="utf-8"
+    # Issue #1507 AC24 / Issue #1755 AC2-AC5: review phase +
+    # issue_review_result_compact_v1 requires a valid
+    # REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1 fixture bound to
+    # source_file's bytes and --issue-number.
+    if _gate_applies:
+        validation_file = Path(
+            write_valid_review_validation_result(
+                source_path=str(source_file), issue_number=1755
+            )
         )
-        build_argv += ["--review-validation-result-path", str(validation_file)]
+        build_argv += [
+            "--review-validation-result-path", str(validation_file),
+            "--issue-number", "1755",
+        ]
 
     result_build = subprocess.run(
         build_argv,
