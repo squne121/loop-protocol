@@ -43,6 +43,15 @@ CLASSIFICATION_MAP: dict[tuple[str, str], str] = {
     ("ci", "test"): "required",
     ("ci", "build"): "required",
     ("ci", "e2e"): "evidence",
+    # Issue #1760: python-test-core / codex-execpolicy are the two dedicated lane
+    # jobs that python-test (the required aggregate, still classified below) depends
+    # on. Without an explicit classification entry both fall through to "unknown"
+    # (get_classification default), which determine_check_verdict() treats as
+    # ALWAYS blocking with failure_reason=gh_error -- even when both jobs actually
+    # succeeded. Registering them here as "evidence" restores the intended
+    # merge_ready computation.
+    ("ci", "python-test-core"): "evidence",
+    ("ci", "codex-execpolicy"): "evidence",
     ("ci", "python-test"): "evidence",
     ("ci", "node-backed-hook-tests"): "evidence",
     ("ci", "actionlint"): "required",
@@ -66,6 +75,11 @@ REQUIRED_CHECKS: set[tuple[str, str]] = {
     ("ci", "test"),
     ("ci", "build"),
     ("ci", "e2e"),
+    # Issue #1760: the two dedicated lane jobs that feed the "python-test"
+    # required aggregate must themselves be present with conclusion=success
+    # for the aggregate's own success to count as real merge-ready evidence.
+    ("ci", "python-test-core"),
+    ("ci", "codex-execpolicy"),
     ("ci", "python-test"),
     ("ci", "node-backed-hook-tests"),
     ("ci", "actionlint"),
@@ -488,6 +502,45 @@ def needs_json_to_raw_checks(needs_map: dict[str, str]) -> list[dict[str, Any]]:
     return raw_checks
 
 
+def filter_check_runs_by_workflow_run(
+    check_runs_payload: Any,
+    *,
+    workflow_run_id: int,
+) -> list[dict[str, Any]]:
+    """Return only the raw check-run rows whose ``details_url`` is bound to the
+    given Actions ``workflow_run_id``.
+
+    Shared by ``ci_verdict_summary_v2.py`` (canonical producer) and
+    ``scripts/ci/verify_ci_check_conclusions.py`` (P1-3, Issue #1824 review) so
+    both consumers apply the IDENTICAL same-run binding rule instead of
+    grouping candidate check runs by (name, head_sha) alone -- which would
+    accept a mismatched rerun's check run as evidence for a different run of
+    the same commit.
+
+    Raises ``ValueError`` on a structurally invalid payload. Returns an empty
+    list (not an error) when the payload is well-formed but nothing matches
+    this run -- callers decide whether that is fatal for their use case.
+    """
+    check_runs = (
+        check_runs_payload.get("check_runs")
+        if isinstance(check_runs_payload, dict)
+        else check_runs_payload
+    )
+    if not isinstance(check_runs, list):
+        raise ValueError("check_runs_api_payload_invalid")
+
+    expected_run_fragment = f"/actions/runs/{workflow_run_id}/"
+    matched: list[dict[str, Any]] = []
+    for row in check_runs:
+        if not isinstance(row, dict):
+            raise ValueError("check_runs_api_payload_invalid")
+        details_url = row.get("details_url") or row.get("detailsUrl")
+        if not isinstance(details_url, str) or expected_run_fragment not in details_url:
+            continue
+        matched.append(row)
+    return matched
+
+
 def check_runs_api_to_raw_checks(
     payload: Any,
     *,
@@ -498,20 +551,14 @@ def check_runs_api_to_raw_checks(
 
     ``needs.<job>.result`` has no CheckRun id or head SHA and must never be
     used to produce merge-ready evidence. The REST endpoint is commit-scoped;
-    each retained row is additionally bound to this Actions run via its URL.
+    each retained row is additionally bound to this Actions run via its URL
+    (see ``filter_check_runs_by_workflow_run``).
     """
-    check_runs = payload.get("check_runs") if isinstance(payload, dict) else payload
-    if not isinstance(check_runs, list):
-        raise ValueError("check_runs_api_payload_invalid")
+    matched = filter_check_runs_by_workflow_run(payload, workflow_run_id=workflow_run_id)
 
-    expected_run_fragment = f"/actions/runs/{workflow_run_id}/"
     raw_checks: list[dict[str, Any]] = []
-    for row in check_runs:
-        if not isinstance(row, dict):
-            raise ValueError("check_runs_api_payload_invalid")
+    for row in matched:
         details_url = row.get("details_url") or row.get("detailsUrl")
-        if not isinstance(details_url, str) or expected_run_fragment not in details_url:
-            continue
         name = row.get("name")
         head_sha = row.get("head_sha") or row.get("headSha")
         check_run_id = row.get("id") or row.get("databaseId")
