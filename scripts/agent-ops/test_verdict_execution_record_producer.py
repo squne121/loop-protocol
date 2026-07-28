@@ -32,6 +32,8 @@ RECEIPT_SCHEMA = "TEST_VERDICT_PRODUCER_RECEIPT_V1"
 _SHA256_PREFIXED_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SHA256_BARE_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
+_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
 COMMAND_MANIFEST: dict[str, dict[str, Any]] = {
     "uv.pytest.execution-record": {
         "argv": [
@@ -174,6 +176,33 @@ def pass_eligible(executions, per_ac, required_acs):
     return True
 
 
+def classify_contract_manifest_binding(record_contract, final_contract, expected_manifest_sha256):
+    # Independently classifies the command_manifest_sha256 binding between the
+    # record's own contract and the separately-assembled final contract
+    # against a freshly recomputed expected value (from COMMAND_MANIFEST via
+    # resolve_manifest_entry, never self-attested from either input). Returns
+    # None when the binding is sound, otherwise a machine-readable reason
+    # category string. This is the sole gate used by build_receipt to reject
+    # missing / malformed / tampered / self-attested manifests and
+    # final-contract self-copies (Issue 1711 regression fix).
+    record_value = record_contract.get("command_manifest_sha256")
+    final_value = final_contract.get("command_manifest_sha256")
+    if record_value is None or final_value is None:
+        return "command_manifest_sha256_missing"
+    if not (
+        isinstance(record_value, str)
+        and isinstance(final_value, str)
+        and _SHA256_PREFIXED_RE.fullmatch(record_value)
+        and _SHA256_PREFIXED_RE.fullmatch(final_value)
+    ):
+        return "command_manifest_sha256_malformed"
+    if record_value != final_value:
+        return "command_manifest_sha256_tampered"
+    if record_value != expected_manifest_sha256:
+        return "command_manifest_sha256_self_attested"
+    return None
+
+
 def build_record(producer, subject, contract, executions, per_ac, required_acs):
     # Pure record assembly. Retained for fixture-driven unit tests that
     # exercise pass_eligible logic directly. The CLI never forwards raw
@@ -235,7 +264,11 @@ def _is_positive_int(value):
     return operator.gt(value, 0)
 
 
-def build_receipt(record, execution_artifact, final_subject, final_contract):
+def build_receipt(record, execution_artifact, final_subject, final_contract, expected_manifest_sha256=None):
+    if expected_manifest_sha256 is not None:
+        reason = classify_contract_manifest_binding(record["contract"], final_contract, expected_manifest_sha256)
+        if reason is not None:
+            raise ValueError("reason_category=" + reason)
     stable = final_subject == record["subject"] and final_contract == record["contract"]
 
     reported = {
@@ -345,7 +378,24 @@ def _cmd_build_receipt(args):
     execution_artifact = json.loads(args.execution_artifact_input.read_text(encoding="utf-8"))
     final_subject = json.loads(args.final_subject.read_text(encoding="utf-8"))
     final_contract = json.loads(args.final_contract.read_text(encoding="utf-8"))
-    receipt = build_receipt(record, execution_artifact, final_subject, final_contract)
+    expected_manifest_sha256 = None
+    if args.command_id is not None:
+        expected_manifest_sha256 = resolve_manifest_entry(args.command_id)["manifest_sha256"]
+    try:
+        receipt = build_receipt(
+            record,
+            execution_artifact,
+            final_subject,
+            final_contract,
+            expected_manifest_sha256=expected_manifest_sha256,
+        )
+    except ValueError as exc:
+        # Direct, machine-readable failure diagnostics (Issue 1711 AC5): no
+        # partial/invalid receipt is written, so the subsequent
+        # upload-artifact step's "no files found" error is never mistaken
+        # for the real cause. The reason category is always printed here.
+        print(str(exc))
+        return 1
     if args.schema is not None:
         _validate_against_schema(receipt, args.schema)
     args.output.write_text(json.dumps(receipt, indent=2, sort_keys=True) + chr(10), encoding="utf-8")
@@ -538,7 +588,58 @@ def _cmd_assemble_contract(args):
         "linked_issue_number": int(args.linked_issue_number),
         "issue_body_sha256": sha256_of(issue_data.get("body") or ""),
     }
+    if args.command_id is not None:
+        # Independent recompute: resolve_manifest_entry is called fresh here,
+        # in a separate process invocation from build-record's own resolve,
+        # so this contract assembly never copies command_manifest_sha256 from
+        # any prior artifact (Issue 1711 AC1/AC2).
+        resolved = resolve_manifest_entry(args.command_id)
+        contract["command_manifest_sha256"] = resolved["manifest_sha256"]
     args.output.write_text(json.dumps(contract, indent=2, sort_keys=True) + chr(10), encoding="utf-8")
+    return 0
+
+
+def _cmd_assemble_source_provenance(args):
+    # Runs inside the untrusted source job, against the target PR's exact
+    # head SHA checkout only. No gh api / token access here -- everything is
+    # derived from local git plumbing against the already-checked-out tree
+    # (Issue 1711 AC3/AC4).
+    provenance = {
+        "repository_full_name": args.repository_full_name,
+        "commit_sha": args.commit_sha,
+        "tree_sha": args.tree_sha,
+    }
+    args.output.write_text(json.dumps(provenance, indent=2, sort_keys=True) + chr(10), encoding="utf-8")
+    return 0
+
+
+def _cmd_assert_source_provenance(args):
+    # Runs inside the trusted producer job and independently rejects any
+    # provenance that does not exactly bind to the dispatcher-supplied exact
+    # PR head SHA and the expected repository (Issue 1711 AC3). Missing,
+    # malformed, or mismatched provenance is fail-closed.
+    provenance = json.loads(args.file.read_text(encoding="utf-8"))
+    commit_sha = provenance.get("commit_sha")
+    tree_sha = provenance.get("tree_sha")
+    repository_full_name = provenance.get("repository_full_name")
+    failures = []
+    if repository_full_name != args.expected_repository_full_name:
+        failures.append(
+            "repository_full_name mismatch: expected "
+            + args.expected_repository_full_name + " got " + str(repository_full_name)
+        )
+    if commit_sha != args.expected_commit_sha:
+        failures.append(
+            "commit_sha mismatch: expected " + args.expected_commit_sha + " got " + str(commit_sha)
+        )
+    if not (isinstance(tree_sha, str) and _COMMIT_SHA_RE.fullmatch(tree_sha)):
+        failures.append("tree_sha is missing or malformed: " + str(tree_sha))
+    if not (isinstance(commit_sha, str) and _COMMIT_SHA_RE.fullmatch(commit_sha)):
+        failures.append("commit_sha is missing or malformed: " + str(commit_sha))
+    if failures:
+        for failure in failures:
+            print("reason_category=source_provenance_mismatch: " + failure)
+        return 1
     return 0
 
 
@@ -603,6 +704,7 @@ def main():
     p_receipt.add_argument("--execution-artifact-input", type=Path, required=True)
     p_receipt.add_argument("--final-subject", type=Path, required=True)
     p_receipt.add_argument("--final-contract", type=Path, required=True)
+    p_receipt.add_argument("--command-id", required=False, default=None)
     p_receipt.add_argument("--schema", type=Path, required=False)
     p_receipt.add_argument("--output", type=Path, required=True)
     p_receipt.set_defaults(func=_cmd_build_receipt)
@@ -667,6 +769,7 @@ def main():
     p_acon = sub.add_parser("assemble-contract")
     p_acon.add_argument("--issue-file", type=Path, required=True)
     p_acon.add_argument("--linked-issue-number", required=True)
+    p_acon.add_argument("--command-id", required=False, default=None)
     p_acon.add_argument("--output", type=Path, required=True)
     p_acon.set_defaults(func=_cmd_assemble_contract)
 
@@ -682,6 +785,19 @@ def main():
     p_aea.add_argument("--expected-name", required=True)
     p_aea.add_argument("--output", type=Path, required=True)
     p_aea.set_defaults(func=_cmd_assemble_execution_artifact)
+
+    p_asp = sub.add_parser("assemble-source-provenance")
+    p_asp.add_argument("--repository-full-name", required=True)
+    p_asp.add_argument("--commit-sha", required=True)
+    p_asp.add_argument("--tree-sha", required=True)
+    p_asp.add_argument("--output", type=Path, required=True)
+    p_asp.set_defaults(func=_cmd_assemble_source_provenance)
+
+    p_assertsp = sub.add_parser("assert-source-provenance")
+    p_assertsp.add_argument("--file", type=Path, required=True)
+    p_assertsp.add_argument("--expected-repository-full-name", required=True)
+    p_assertsp.add_argument("--expected-commit-sha", required=True)
+    p_assertsp.set_defaults(func=_cmd_assert_source_provenance)
 
     args = parser.parse_args()
     return args.func(args)
