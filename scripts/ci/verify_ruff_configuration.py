@@ -481,11 +481,14 @@ def _validate_workflow(root: Path) -> list[Violation]:
         return violations
 
     ruff_invocation = ruff_invocations[0]
-    if (ruff_invocation.job_name, ruff_invocation.step_name) != ("python-test", "Ruff check (timed)"):
+    if (ruff_invocation.job_name, ruff_invocation.step_name) != (
+        "python-test-core",
+        "Ruff check (timed)",
+    ):
         violations.append(
             Violation(
                 "workflow_ruff_step_invalid",
-                "Ruff invocation は python-test job の Ruff check (timed) step に限定されます",
+                "Ruff invocation は python-test-core job の Ruff check (timed) step に限定されます",
             )
         )
     if _has_rule_override(ruff_invocation):

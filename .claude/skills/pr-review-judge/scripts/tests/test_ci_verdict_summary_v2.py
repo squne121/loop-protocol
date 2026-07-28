@@ -197,6 +197,8 @@ class TestAC10EnumExhaustiveness:
             make_check("test", conclusion="success"),
             make_check("build", conclusion="success"),
             make_check("e2e", conclusion="success"),
+            make_check("python-test-core", conclusion="success"),
+            make_check("codex-execpolicy", conclusion="success"),
             make_check("python-test", conclusion="success"),
             make_check("node-backed-hook-tests", conclusion="success"),
             make_check("actionlint", conclusion="success"),
@@ -437,14 +439,17 @@ class TestB3NoRequiredEvidence:
         assert len(v2.REQUIRED_CHECKS) > 0
 
     def test_required_checks_contains_all_ci_jobs(self, v2):
-        """REQUIRED_CHECKS must include all 9 ci.yml upstream evidence jobs
-        (Issue #1788 added agy-causal-claim-drift-gate)."""
+        """REQUIRED_CHECKS must include all ci.yml upstream evidence jobs
+        (Issue #1788 added agy-causal-claim-drift-gate; Issue #1760/#1824 added
+        python-test-core and codex-execpolicy)."""
         expected = {
             ("ci", "typecheck"),
             ("ci", "lint"),
             ("ci", "test"),
             ("ci", "build"),
             ("ci", "e2e"),
+            ("ci", "python-test-core"),
+            ("ci", "codex-execpolicy"),
             ("ci", "python-test"),
             ("ci", "node-backed-hook-tests"),
             ("ci", "actionlint"),
@@ -460,6 +465,8 @@ class TestB3NoRequiredEvidence:
             make_check("test", conclusion="success"),
             make_check("build", conclusion="success"),
             make_check("e2e", conclusion="success"),
+            make_check("python-test-core", conclusion="success"),
+            make_check("codex-execpolicy", conclusion="success"),
             make_check("python-test", conclusion="success"),
             make_check("node-backed-hook-tests", conclusion="success"),
             make_check("actionlint", conclusion="success"),
@@ -607,7 +614,8 @@ class TestP0RealCheckRunApiEvidence:
 
     def test_actual_check_runs_are_bound_to_current_workflow_and_head(self, v2):
         names = [
-            "typecheck", "lint", "test", "build", "e2e", "python-test",
+            "typecheck", "lint", "test", "build", "e2e",
+            "python-test-core", "codex-execpolicy", "python-test",
             "node-backed-hook-tests", "actionlint", "agy-causal-claim-drift-gate",
         ]
         raw_checks = v2.check_runs_api_to_raw_checks(
@@ -768,3 +776,75 @@ class TestAC10AC11UploadedArtifactBinding:
         summary = tmp_path / "summary.md"
         assert v2.main(["--summary-input", str(source), "--summary-output", str(summary)]) == 0
         assert "CI Verdict Summary V2" in summary.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Issue #1824 P0-1: every real ci.yml job feeding ci-verdict-summary must be
+# classified (never fall through to "unknown", which is ALWAYS blocking with
+# failure_reason=gh_error even when the underlying job actually succeeded).
+# ---------------------------------------------------------------------------
+
+class TestP0_1AllRealCiJobsClassified:
+    """Regression guard for PR #1824 review: python-test-core / codex-execpolicy
+    were added as new ci.yml jobs but never registered in CLASSIFICATION_MAP,
+    so a fully-green real run still produced overall_status=gh_error."""
+
+    def _ci_verdict_summary_needs(self) -> list[str]:
+        import yaml
+
+        workflow = yaml.safe_load(_WORKFLOW.read_text())
+        needs = workflow["jobs"]["ci-verdict-summary"]["needs"]
+        assert isinstance(needs, list) and needs
+        return needs
+
+    def test_every_needed_job_has_a_non_unknown_classification(self, v2):
+        needs = self._ci_verdict_summary_needs()
+        unclassified = [
+            job for job in needs if v2.get_classification("ci", job) == "unknown"
+        ]
+        assert not unclassified, (
+            f"ci.yml jobs feeding ci-verdict-summary with no CLASSIFICATION_MAP "
+            f"entry (would be treated as blocking/gh_error): {unclassified}"
+        )
+
+    def test_python_test_core_and_codex_execpolicy_are_classified(self, v2):
+        assert v2.get_classification("ci", "python-test-core") != "unknown"
+        assert v2.get_classification("ci", "codex-execpolicy") != "unknown"
+
+    def test_real_ci_jobs_all_green_yields_merge_ready_not_gh_error(self, v2):
+        """End-to-end reproduction of the reported bug (run 30271027218):
+        every job that feeds ci-verdict-summary succeeds at the current head,
+        and overall_status must be merge_ready, never gh_error."""
+        needs = self._ci_verdict_summary_needs()
+        run_id = 4242
+
+        def api_row(name: str) -> dict:
+            return {
+                "id": abs(hash(name)) % 100000 + 1,
+                "name": name,
+                "status": "completed",
+                "conclusion": "success",
+                "head_sha": EXPECTED_SHA,
+                "details_url": f"https://github.com/owner/repo/actions/runs/{run_id}/job/1",
+            }
+
+        raw_checks = v2.check_runs_api_to_raw_checks(
+            {"check_runs": [api_row(name) for name in needs if name != "ci-verdict-summary"]},
+            workflow_run_id=run_id,
+        )
+        artifact = build(v2, raw_checks)
+        assert artifact["overall_status"] == "merge_ready", artifact
+        assert not any(c["failure_reason"] == "gh_error" for c in artifact["checks"]), artifact["checks"]
+
+
+    def test_ci_yml_fails_closed_when_overall_status_not_merge_ready(self):
+        """PR #1824 review: ci-verdict-summary must not silently succeed when the
+        generated artifact's overall_status is not merge_ready."""
+        workflow = _WORKFLOW.read_text()
+        verdict_job = workflow[workflow.index("  ci-verdict-summary:"):]
+        gate_idx = verdict_job.index("Enforce ci_verdict_summary_v2 overall_status gate")
+        summary_idx = verdict_job.index("Output ci_verdict_summary_v2 Step Summary")
+        assert summary_idx < gate_idx
+        gate_block = verdict_job[gate_idx:]
+        assert 'overall_status != "merge_ready"' in gate_block
+        assert "sys.exit(1)" in gate_block

@@ -49,7 +49,7 @@ artifact 名: `ci-runtime-baseline-<job>-<run_attempt>`
 | `run_attempt` | string | GitHub Actions の `run_attempt` |
 | `head_sha` | string | PR head SHA（push 時は `github.sha` と同値） |
 | `merge_sha` | string | `github.sha`（merge commit SHA） |
-| `job` | string | job 名（`typecheck` / `lint` / `test` / `build` / `e2e` / `python-test` / `node-backed-hook-tests` / `actionlint`） |
+| `job` | string | job 名（`typecheck` / `lint` / `test` / `build` / `e2e` / `python-test-core` / `codex-execpolicy` / `python-test`（required aggregate）/ `node-backed-hook-tests` / `actionlint`）。Issue #1760 で `python-test` は `python-test-core` + `codex-execpolicy` に分割された |
 | `runner_image` | string | `${ImageOS}/${ImageVersion}` |
 | `measurement_method` | string | `"date_plus3N_ms"`（`date +%s%3N` による ms 計測） |
 | `measurements[].step_id` | string | ステップ識別子（granular; python-test では pytest_edit_issue_tests 等） |
@@ -77,12 +77,12 @@ artifact 名: `ci-runtime-baseline-<job>-<run_attempt>`
 | `pnpm_build_e2e` | `VITE_E2E_MODE=true pnpm build` | e2e |
 | `playwright_install` | `pnpm playwright:install:ci` | e2e |
 | `test_e2e_ci` | `pnpm test:e2e:ci` | e2e |
-| `uv_python_install` | `uv python install` | python-test / node-backed-hook-tests |
-| `uv_sync` | `uv sync --locked --group dev` | python-test / node-backed-hook-tests |
-| `ruff_check` | `uv run --locked ruff check --select E,F .claude/scripts scripts schemas .claude/skills` | python-test |
-| `pytest_parallel` | pytest（python-test-plan SSOT を xdist 並列実行する step `pytest_parallel`） | python-test |
-| `pytest_serial` | pytest（plan `parallel_exclude` を `-n 0` で実行する serial lane step `pytest_serial`） | python-test |
-| `codex_execpolicy` | codex execpolicy matrix + `tests/codex/`（専用 step `codex_execpolicy_matrix`） | python-test |
+| `uv_python_install` | `uv python install` | python-test-core / codex-execpolicy / node-backed-hook-tests |
+| `uv_sync` | `uv sync --locked --group dev` | python-test-core / codex-execpolicy / node-backed-hook-tests |
+| `ruff_check` | `uv run --locked ruff check --select E,F .claude/scripts scripts schemas .claude/skills` | python-test-core |
+| `pytest_parallel` | pytest（python-test-plan SSOT を xdist 並列実行する step `pytest_parallel`） | python-test-core |
+| `pytest_serial` | pytest（plan `parallel_exclude` を `-n 0` で実行する serial lane step `pytest_serial`） | python-test-core |
+| `codex_execpolicy` | codex execpolicy matrix + `tests/codex/`（専用 step `codex_execpolicy_matrix`） | codex-execpolicy（Issue #1760 で python-test-core から分離） |
 | `pytest_node_backed_hooks` | Node-backed hook test nodeid 2 件 | node-backed-hook-tests |
 | `actionlint_install` | actionlint バイナリのダウンロード・インストール | actionlint |
 | `actionlint` | `actionlint` | actionlint |

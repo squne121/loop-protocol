@@ -38,7 +38,7 @@ select = ["E", "F"]
     (root / ".github/workflows/ci.yml").write_text(
         """
 jobs:
-  python-test:
+  python-test-core:
     steps:
       - name: Verify Ruff configuration authority
         run: uv run --locked python3 scripts/ci/verify_ruff_configuration.py --root .
