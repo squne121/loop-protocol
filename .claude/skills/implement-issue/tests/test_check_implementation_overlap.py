@@ -1444,14 +1444,29 @@ def test_verified_native_successor_decision_matrix_fail_closed(
         "number": candidate_number,
         "url": candidate_url or f"https://github.com/{DEFAULT_REPO}/issues/{candidate_number}",
     }
-    dependency_provenance = [
-        {
-            "source": source,
-            "repository": "other/repository" if source_complete and source == "current_native_blocking" and expected is False and current_url is None and candidate_url is None and policy_class == "C2a" and dependency_relation == "successor" and provenance == ["current_native_blocking"] else DEFAULT_REPO,
-            "issue_number": current_number,
-        }
-        for source in provenance
-    ]
+    dependency_provenance = []
+    for source in provenance:
+        is_foreign_current_native_blocking = (
+            source_complete
+            and source == "current_native_blocking"
+            and expected is False
+            and current_url is None
+            and candidate_url is None
+            and policy_class == "C2a"
+            and dependency_relation == "successor"
+            and provenance == ["current_native_blocking"]
+        )
+        dependency_provenance.append(
+            {
+                "source": source,
+                "repository": (
+                    "other/repository"
+                    if is_foreign_current_native_blocking
+                    else DEFAULT_REPO
+                ),
+                "issue_number": current_number,
+            }
+        )
     result = checker_module._verified_native_successor_predicate(
         repository=DEFAULT_REPO,
         current_number=current_number,
