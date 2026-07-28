@@ -26,6 +26,19 @@ All scenarios run the real scripts as subprocesses (no monkeypatching of
 validation logic), matching the "actual compact_review_result.py /
 validate_review_compact_output.py output" spirit of Issue #1507's
 Verification Commands.
+
+Issue #1755 (Scope Delta): the legacy `validate_review_compact_output.py`
+V1 final grammar (`REVIEW_COMPACT_VALIDATION_RESULT_V1`) is now REJECTED by
+build_refinement_phase_state.py's review-phase gate (AC2). The (a)/(b)/(c)
+fail-closed scenarios above remain valid unmodified (a legacy-schema invalid
+result is still rejected, just for an additional reason now). Only the
+control-case success test
+(`test_valid_approve_with_valid_validation_result_succeeds`) is updated to
+use the real `emit_parent_review_envelope_v2.py --validate-intermediate`
+(`review_compact.validate_intermediate_v1`) producer -- the only wiring now
+accepted by the review-phase gate -- and to pass the new required
+`--issue-number` argument with a source_path bound to the real raw
+child-stdout bytes (AC6 regression coverage).
 """
 
 from __future__ import annotations
@@ -38,6 +51,7 @@ from pathlib import Path
 SKILL_ROOT = Path(__file__).parent.parent
 SCRIPTS_DIR = SKILL_ROOT / "scripts"
 VALIDATOR_SCRIPT = SCRIPTS_DIR / "validate_review_compact_output.py"
+INTERMEDIATE_VALIDATOR_SCRIPT = SCRIPTS_DIR / "emit_parent_review_envelope_v2.py"
 BUILD_SCRIPT = SCRIPTS_DIR / "build_refinement_phase_state.py"
 
 
@@ -78,12 +92,33 @@ def _run_validator(stdin_text: str, *, issue_number: int = 1507) -> subprocess.C
     )
 
 
+def _run_intermediate_validator(
+    stdin_bytes: bytes, *, issue_number: int = 1507
+) -> subprocess.CompletedProcess:
+    """Issue #1755: run the real review_compact.validate_intermediate_v1
+    producer (emit_parent_review_envelope_v2.py --validate-intermediate)."""
+    return subprocess.run(
+        [
+            sys.executable,
+            str(INTERMEDIATE_VALIDATOR_SCRIPT),
+            "--validate-intermediate",
+            "--issue-number", str(issue_number),
+        ],
+        input=stdin_bytes,
+        capture_output=True,
+        timeout=30,
+    )
+
+
 def _run_build_phase_state(
     tmp_path: Path,
     review_validation_result_path: "Path | None",
+    *,
+    source_bytes: bytes = b"{}",
+    issue_number: "int | None" = None,
 ) -> subprocess.CompletedProcess:
     source_file = tmp_path / "review_source.json"
-    source_file.write_text("{}", encoding="utf-8")
+    source_file.write_bytes(source_bytes)
     out_file = tmp_path / "phase_state_out.json"
 
     argv = [
@@ -96,6 +131,8 @@ def _run_build_phase_state(
     ]
     if review_validation_result_path is not None:
         argv += ["--review-validation-result-path", str(review_validation_result_path)]
+    if issue_number is not None:
+        argv += ["--issue-number", str(issue_number)]
 
     proc = subprocess.run(argv, capture_output=True, text=True)
     proc.out_file = out_file  # type: ignore[attr-defined]
@@ -196,21 +233,34 @@ class TestValidationSeamFailClosed:
         )
 
     def test_valid_approve_with_valid_validation_result_succeeds(self, tmp_path):
-        """Control case: a real, valid approve envelope validated by the
-        real validator DOES allow phase-state generation to proceed
-        (proves the gate is not permanently fail-closed -- only invalid
-        inputs are rejected)."""
-        validator_proc = _run_validator(_approve_envelope_text())
-        assert validator_proc.returncode == 0
+        """Control case (Issue #1755): a real, valid approve envelope
+        validated by the real `review_compact.validate_intermediate_v1`
+        producer (emit_parent_review_envelope_v2.py --validate-intermediate)
+        DOES allow phase-state generation to proceed (proves the gate is
+        not permanently fail-closed -- only invalid / legacy-schema /
+        mismatched inputs are rejected). --source-path is bound to the
+        EXACT raw bytes fed to the intermediate validator (AC4), and
+        --issue-number matches the ARTIFACT issue segment (AC5)."""
+        raw_bytes = _approve_envelope_text().encode("utf-8")
+        validator_proc = _run_intermediate_validator(raw_bytes, issue_number=1507)
+        assert validator_proc.returncode == 0, (
+            f"stdout: {validator_proc.stdout}\nstderr: {validator_proc.stderr}"
+        )
         validation_payload = json.loads(validator_proc.stdout.decode("utf-8"))
         assert validation_payload["validation_status"] == "valid"
+        assert validation_payload["schema"] == "REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1"
 
         validation_file = tmp_path / "validation_result.json"
         validation_file.write_text(
             json.dumps(validation_payload), encoding="utf-8"
         )
 
-        build_proc = _run_build_phase_state(tmp_path, validation_file)
+        build_proc = _run_build_phase_state(
+            tmp_path,
+            validation_file,
+            source_bytes=raw_bytes,
+            issue_number=1507,
+        )
         assert build_proc.returncode == 0, (
             f"stdout: {build_proc.stdout}\nstderr: {build_proc.stderr}"
         )
