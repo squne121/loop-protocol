@@ -52,7 +52,7 @@ jobs:
         id: resolve-provenance
         run: |
           echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "tree_sha=$(git rev-parse HEAD^{tree})" >> "$GITHUB_OUTPUT"
+          echo "tree_sha=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
 
       - name: Assemble source provenance artifact
         run: uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assemble-source-provenance --repository-full-name "${{ github.repository }}" --commit-sha "${{ steps.resolve-provenance.outputs.commit_sha }}" --tree-sha "${{ steps.resolve-provenance.outputs.tree_sha }}" --output source-provenance.json
