@@ -39,6 +39,7 @@ COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH = "contract_snapshot.publish"
 # numbering space). The pr_review.publish field validator additionally
 # requires an explicit `pr_number` field and checks it matches.
 COMMAND_ID_PR_REVIEW_PUBLISH = "pr_review.publish"
+COMMAND_ID_TEST_VERDICT_PUBLISH = "test_verdict.publish"
 COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE = "issue_scope_snapshot.materialize"
 
 # Issue #1632: closed-blocker-only GitHub native `blockedBy` relationship
@@ -60,14 +61,18 @@ ISSUE_DEPENDENCY_REMOVE_MAX_BLOCKED_BY_NUMBERS = 500
 # controlled_skill_mutation_exec.py --command-id issue_comment.publish.
 ISOLATION_ISSUE_COMMENT_REQUEST_SCHEMA = "ISOLATION_ISSUE_COMMENT_REQUEST_V1"
 
-ISOLATION_ISSUE_COMMENT_REQUEST_ALLOWED_KEYS = frozenset({
-    "schema", "issue_number", "repo", "comment_body", "marker",
-})
+ISOLATION_ISSUE_COMMENT_REQUEST_ALLOWED_KEYS = frozenset(
+    {
+        "schema",
+        "issue_number",
+        "repo",
+        "comment_body",
+        "marker",
+    }
+)
 
 
-def validate_isolation_issue_comment_request(
-    data: object, issue_number: int, repo: str
-) -> str:
+def validate_isolation_issue_comment_request(data: object, issue_number: int, repo: str) -> str:
     """Validate a bounded ISOLATION_ISSUE_COMMENT_REQUEST_V1 dict (Issue #1633).
 
     Returns "" on success, else a descriptive error string. Enforces a
@@ -86,17 +91,11 @@ def validate_isolation_issue_comment_request(
         return f"isolation_issue_comment_request_unknown_fields: {sorted(unknown_keys)}"
 
     if data.get("schema") != ISOLATION_ISSUE_COMMENT_REQUEST_SCHEMA:
-        return (
-            "isolation_issue_comment_request_schema_mismatch: "
-            f"{data.get('schema')!r}"
-        )
+        return f"isolation_issue_comment_request_schema_mismatch: {data.get('schema')!r}"
 
     req_issue_number = data.get("issue_number")
     if type(req_issue_number) is not int or req_issue_number != issue_number:
-        return (
-            "isolation_issue_comment_request_issue_number_mismatch: "
-            f"{req_issue_number!r} != {issue_number!r}"
-        )
+        return f"isolation_issue_comment_request_issue_number_mismatch: {req_issue_number!r} != {issue_number!r}"
 
     req_repo = data.get("repo")
     if req_repo != repo:
@@ -120,17 +119,19 @@ def validate_isolation_issue_comment_request(
 # schema for the issue_dependency.remove command id.
 ISSUE_DEPENDENCY_REMOVE_INPUT_SCHEMA = "ISSUE_DEPENDENCY_REMOVE_INPUT_V1"
 
-ISSUE_DEPENDENCY_REMOVE_INPUT_ALLOWED_KEYS = frozenset({
-    "schema",
-    "issue_number",
-    "repo",
-    "target_blocker_number",
-    "expected_blocked_issue_node_id",
-    "expected_blocker_node_id",
-    "expected_blocked_by_numbers",
-    "expected_pre_mutation_snapshot_sha256",
-    "idempotency_key",
-})
+ISSUE_DEPENDENCY_REMOVE_INPUT_ALLOWED_KEYS = frozenset(
+    {
+        "schema",
+        "issue_number",
+        "repo",
+        "target_blocker_number",
+        "expected_blocked_issue_node_id",
+        "expected_blocker_node_id",
+        "expected_blocked_by_numbers",
+        "expected_pre_mutation_snapshot_sha256",
+        "idempotency_key",
+    }
+)
 
 
 def _is_strict_positive_int(value: object) -> bool:
@@ -138,9 +139,7 @@ def _is_strict_positive_int(value: object) -> bool:
     return type(value) is int and value > 0
 
 
-def validate_issue_dependency_remove_input(
-    data: object, issue_number: int, repo: str
-) -> str:
+def validate_issue_dependency_remove_input(data: object, issue_number: int, repo: str) -> str:
     """Validate a bounded ISSUE_DEPENDENCY_REMOVE_INPUT_V1 dict (Issue #1632).
 
     Returns "" on success, else a descriptive error string. Enforces a closed
@@ -160,17 +159,11 @@ def validate_issue_dependency_remove_input(
         return f"issue_dependency_remove_input_unknown_fields: {sorted(unknown_keys)}"
 
     if data.get("schema") != ISSUE_DEPENDENCY_REMOVE_INPUT_SCHEMA:
-        return (
-            "issue_dependency_remove_input_schema_mismatch: "
-            f"{data.get('schema')!r}"
-        )
+        return f"issue_dependency_remove_input_schema_mismatch: {data.get('schema')!r}"
 
     req_issue_number = data.get("issue_number")
     if not _is_strict_positive_int(req_issue_number) or req_issue_number != issue_number:
-        return (
-            "issue_dependency_remove_input_issue_number_mismatch: "
-            f"{req_issue_number!r} != {issue_number!r}"
-        )
+        return f"issue_dependency_remove_input_issue_number_mismatch: {req_issue_number!r} != {issue_number!r}"
 
     req_repo = data.get("repo")
     if req_repo != repo:
@@ -178,10 +171,7 @@ def validate_issue_dependency_remove_input(
 
     target_blocker_number = data.get("target_blocker_number")
     if not _is_strict_positive_int(target_blocker_number):
-        return (
-            "issue_dependency_remove_input_target_blocker_number_invalid: "
-            f"{target_blocker_number!r}"
-        )
+        return f"issue_dependency_remove_input_target_blocker_number_invalid: {target_blocker_number!r}"
     if target_blocker_number == issue_number:
         return "issue_dependency_remove_input_target_blocker_equals_issue_number"
 
@@ -194,10 +184,7 @@ def validate_issue_dependency_remove_input(
     if not isinstance(expected_numbers, list) or not expected_numbers:
         return "issue_dependency_remove_input_expected_blocked_by_numbers_invalid"
     if len(expected_numbers) > ISSUE_DEPENDENCY_REMOVE_MAX_BLOCKED_BY_NUMBERS:
-        return (
-            "issue_dependency_remove_input_expected_blocked_by_numbers_size_cap_exceeded: "
-            f"{len(expected_numbers)}"
-        )
+        return f"issue_dependency_remove_input_expected_blocked_by_numbers_size_cap_exceeded: {len(expected_numbers)}"
     if not all(_is_strict_positive_int(n) for n in expected_numbers):
         return "issue_dependency_remove_input_expected_blocked_by_numbers_not_all_positive_ints"
     if len(set(expected_numbers)) != len(expected_numbers):
@@ -205,10 +192,7 @@ def validate_issue_dependency_remove_input(
     if expected_numbers != sorted(expected_numbers):
         return "issue_dependency_remove_input_expected_blocked_by_numbers_not_sorted"
     if target_blocker_number not in expected_numbers:
-        return (
-            "issue_dependency_remove_input_target_blocker_not_in_expected_set: "
-            f"{target_blocker_number!r}"
-        )
+        return f"issue_dependency_remove_input_target_blocker_not_in_expected_set: {target_blocker_number!r}"
 
     snapshot_sha256 = data.get("expected_pre_mutation_snapshot_sha256")
     if not isinstance(snapshot_sha256, str) or not snapshot_sha256.startswith("sha256:"):
@@ -237,6 +221,7 @@ INPUT_SCHEMA_BY_COMMAND: dict = {
     COMMAND_ID_ISSUE_COMMENT_PUBLISH: "ISSUE_COMMENT_PUBLISH_INPUT_V1",
     COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH: "CONTRACT_SNAPSHOT_PUBLISH_INPUT_V1",
     COMMAND_ID_PR_REVIEW_PUBLISH: "PR_REVIEW_PUBLISH_REQUEST_V1",
+    COMMAND_ID_TEST_VERDICT_PUBLISH: "TEST_VERDICT_PUBLISH_INPUT_V1",
     COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE: "ISSUE_SCOPE_SNAPSHOT_MATERIALIZE_INPUT_V1",
     COMMAND_ID_ISSUE_DEPENDENCY_REMOVE: ISSUE_DEPENDENCY_REMOVE_INPUT_SCHEMA,
 }
@@ -424,9 +409,7 @@ CONTROLLED_SKILL_MUTATION_COMMAND_POLICY: dict = {
             f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH}/"
         ),
         "input_schema": INPUT_SCHEMA_BY_COMMAND[COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH],
-        "publisher_script": (
-            ".claude/skills/impl-review-loop/scripts/ensure_contract_snapshot.py"
-        ),
+        "publisher_script": (".claude/skills/impl-review-loop/scripts/ensure_contract_snapshot.py"),
         "github_mutation": {
             "comment_on_issue": True,
             "requires_repo": TRUSTED_REPO,
@@ -487,6 +470,40 @@ CONTROLLED_SKILL_MUTATION_COMMAND_POLICY: dict = {
         },
         "env_sanitize": ENV_SANITIZE_KEYS,
     },
+    COMMAND_ID_TEST_VERDICT_PUBLISH: {
+        "command_id": COMMAND_ID_TEST_VERDICT_PUBLISH,
+        "description": "Publish a receipt-bound TEST_VERDICT comment on a current PR head",
+        "executor_script": EXECUTOR_SCRIPT,
+        "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+        "input_namespace": (
+            f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{COMMAND_ID_TEST_VERDICT_PUBLISH}/"
+        ),
+        "input_schema": INPUT_SCHEMA_BY_COMMAND[COMMAND_ID_TEST_VERDICT_PUBLISH],
+        "github_mutation": {
+            "comment_on_pull_request": True,
+            "requires_repo": TRUSTED_REPO,
+            "requires_explicit_repo_flag": True,
+        },
+        "precondition": {
+            "target_pr_head_sha_must_match_readback": True,
+            "linked_issue_body_sha256_must_match_readback": True,
+            "producer_receipt_must_bind_target_and_linked_issue": True,
+        },
+        "postcondition": {
+            "target_pr_head_sha_must_match_readback": True,
+            "published_comment_author_marker_and_body_must_match": True,
+            "no_tracked_source_changes": True,
+            "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+        },
+        "idempotency": {
+            "marker_file_pattern": (
+                f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/"
+                f"{COMMAND_ID_TEST_VERDICT_PUBLISH}/test_verdict_publish.marker.json"
+            ),
+            "marker_field": "comment_id",
+        },
+        "env_sanitize": ENV_SANITIZE_KEYS,
+    },
     COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE: {
         "command_id": COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
         "description": "Materialize a live GitHub-bound ISSUE_SCOPE_SNAPSHOT_V1 artifact",
@@ -517,8 +534,7 @@ CONTROLLED_SKILL_MUTATION_COMMAND_POLICY: dict = {
         "executor_script": EXECUTOR_SCRIPT,
         "allowed_write_roots": ALLOWED_WRITE_ROOTS,
         "input_namespace": (
-            f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/"
-            f"{COMMAND_ID_ISSUE_DEPENDENCY_REMOVE}/"
+            f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{COMMAND_ID_ISSUE_DEPENDENCY_REMOVE}/"
         ),
         "input_schema": INPUT_SCHEMA_BY_COMMAND[COMMAND_ID_ISSUE_DEPENDENCY_REMOVE],
         "github_mutation": {

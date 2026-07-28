@@ -26,6 +26,7 @@ if str(_GUARDS_DIR) not in sys.path:
 from controlled_skill_mutation_policy import (  # noqa: E402
     ALLOWED_WRITE_ROOTS,
     COMMAND_ID_PUBLISH,
+    COMMAND_ID_TEST_VERDICT_PUBLISH,
     COMMAND_ID_ISSUE_CONTENT_UPDATE,
     COMMAND_ID_ISSUE_DEPENDENCY_REMOVE,
     COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
@@ -50,6 +51,7 @@ from controlled_skill_mutation_policy import (  # noqa: E402
 # AC3: Policy registry schema
 # =============================================================================
 
+
 class TestPolicySchema:
     """AC3: CONTROLLED_SKILL_MUTATION_COMMAND_POLICY schema validation."""
 
@@ -70,9 +72,7 @@ class TestPolicySchema:
             "idempotency",
             "env_sanitize",
         }
-        assert required_keys.issubset(set(entry.keys())), (
-            f"Missing keys: {required_keys - set(entry.keys())}"
-        )
+        assert required_keys.issubset(set(entry.keys())), f"Missing keys: {required_keys - set(entry.keys())}"
 
     def test_publish_entry_github_mutation(self):
         entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_PUBLISH]
@@ -104,8 +104,7 @@ class TestPolicySchema:
         assert "artifacts/" in ALLOWED_WRITE_ROOTS
 
     def test_env_sanitize_keys_contains_required(self):
-        required = {"PUBLISH_ARTIFACT_DIR", "PYTHONPATH", "PYTHONHOME",
-                    "GH_EDITOR", "EDITOR", "VISUAL", "BROWSER"}
+        required = {"PUBLISH_ARTIFACT_DIR", "PYTHONPATH", "PYTHONHOME", "GH_EDITOR", "EDITOR", "VISUAL", "BROWSER"}
         assert required.issubset(set(ENV_SANITIZE_KEYS))
 
     def test_env_sanitize_keys_contains_gh_token_and_github_token(self):
@@ -127,6 +126,7 @@ class TestPolicySchema:
 # AC8: only termination_report.publish is in the registry
 # =============================================================================
 
+
 class TestRegistryScope:
     """AC8: registry contains only the expected command IDs."""
 
@@ -134,7 +134,8 @@ class TestRegistryScope:
         # Issue #1284 extends the shared registry with issue metadata mutation
         # command ids (issue_body.update / issue_content.update /
         # issue_comment.publish / contract_snapshot.publish). Issue #1536 adds pr_review.publish
-        # (Option C controlled review publisher). This scope-pin is updated
+        # (Option C controlled review publisher). Issue #1647 adds the
+        # dedicated receipt-bound TEST_VERDICT publisher. This scope-pin is updated
         # deliberately as part of each Issue's explicit In Scope registry
         # extension.
         known_ids = {
@@ -144,18 +145,18 @@ class TestRegistryScope:
             "issue_comment.publish",
             "contract_snapshot.publish",
             "pr_review.publish",
+            COMMAND_ID_TEST_VERDICT_PUBLISH,
             COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
             COMMAND_ID_ISSUE_DEPENDENCY_REMOVE,
         }
         actual_ids = set(CONTROLLED_SKILL_MUTATION_COMMAND_POLICY.keys())
-        assert actual_ids == known_ids, (
-            f"Unexpected extra entries: {actual_ids - known_ids}"
-        )
+        assert actual_ids == known_ids, f"Unexpected extra entries: {actual_ids - known_ids}"
 
 
 # =============================================================================
 # AC4/AC17: is_controlled_skill_mutation_exec_command
 # =============================================================================
+
 
 class TestIsControlledSkillMutationExecCommand:
     """AC4/AC17: shared policy function validates executor argv."""
@@ -331,6 +332,7 @@ class TestIsControlledSkillMutationExecCommand:
 # AC17: single source of truth
 # =============================================================================
 
+
 class TestSingleSourceOfTruth:
     """AC17: verify no per-guard allowlists duplicate the executor path."""
 
@@ -347,20 +349,28 @@ class TestSingleSourceOfTruth:
     def test_validate_executor_argv_all_required(self):
         """All required flags must produce True."""
         valid_args = [
-            "--command-id", "termination_report.publish",
-            "--issue-number", "1166",
-            "--input-file", "artifacts/1166/input.json",
-            "--repo", "squne121/loop-protocol",
+            "--command-id",
+            "termination_report.publish",
+            "--issue-number",
+            "1166",
+            "--input-file",
+            "artifacts/1166/input.json",
+            "--repo",
+            "squne121/loop-protocol",
         ]
         assert _validate_executor_argv(valid_args) is True
 
     def test_validate_executor_argv_missing_one_required(self):
         """Missing any required flag returns False."""
         base = [
-            "--command-id", "termination_report.publish",
-            "--issue-number", "1166",
-            "--input-file", "artifacts/1166/input.json",
-            "--repo", "squne121/loop-protocol",
+            "--command-id",
+            "termination_report.publish",
+            "--issue-number",
+            "1166",
+            "--input-file",
+            "artifacts/1166/input.json",
+            "--repo",
+            "squne121/loop-protocol",
         ]
         # Remove --repo and its value
         args_without_repo = base[:-2]
@@ -370,6 +380,7 @@ class TestSingleSourceOfTruth:
 # =============================================================================
 # AC1 (Issue #1633): ISOLATION_ISSUE_COMMENT_REQUEST_V1 bounded schema
 # =============================================================================
+
 
 class TestIsolationIssueCommentRequestSchema:
     """AC1: closed-key bounded request schema for isolation worktree agent
@@ -448,10 +459,10 @@ class TestIsolationIssueCommentRequestSchema:
         assert "marker_not_embedded_in_body" in err
 
 
-
 # =============================================================================
 # AC1 (Issue #1632): issue_dependency.remove command id / schema registration
 # =============================================================================
+
 
 class TestIssueDependencyRemoveRegistration:
     """AC1: issue_dependency.remove and ISSUE_DEPENDENCY_REMOVE_INPUT_V1 are
@@ -481,9 +492,7 @@ class TestIssueDependencyRemoveRegistration:
             "idempotency",
             "env_sanitize",
         }
-        assert required_keys.issubset(set(entry.keys())), (
-            f"Missing keys: {required_keys - set(entry.keys())}"
-        )
+        assert required_keys.issubset(set(entry.keys())), f"Missing keys: {required_keys - set(entry.keys())}"
 
     def test_entry_github_mutation_graphql_only(self):
         entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_DEPENDENCY_REMOVE]
@@ -509,17 +518,14 @@ class TestIssueDependencyRemoveRegistration:
         assert entry["postcondition"]["no_tracked_source_changes"] is True
 
     def test_read_only_compatibility_gate_issue_scope_snapshot_unchanged(self):
-        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[
-            COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE
-        ]
-        assert entry["materializer_script"] == (
-            "scripts/agent-guards/materialize_issue_scope_snapshot.py"
-        )
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE]
+        assert entry["materializer_script"] == ("scripts/agent-guards/materialize_issue_scope_snapshot.py")
 
 
 # =============================================================================
 # AC1 (Issue #1632): ISSUE_DEPENDENCY_REMOVE_INPUT_V1 closed-schema validator
 # =============================================================================
+
 
 class TestIssueDependencyRemoveInputValidator:
     """AC1: closed key set, unknown key / null / bool-as-int / duplicate /
@@ -542,12 +548,19 @@ class TestIssueDependencyRemoveInputValidator:
         assert ISSUE_DEPENDENCY_REMOVE_INPUT_SCHEMA == "ISSUE_DEPENDENCY_REMOVE_INPUT_V1"
 
     def test_allowed_keys_are_closed(self):
-        assert ISSUE_DEPENDENCY_REMOVE_INPUT_ALLOWED_KEYS == frozenset({
-            "schema", "issue_number", "repo", "target_blocker_number",
-            "expected_blocked_issue_node_id", "expected_blocker_node_id",
-            "expected_blocked_by_numbers", "expected_pre_mutation_snapshot_sha256",
-            "idempotency_key",
-        })
+        assert ISSUE_DEPENDENCY_REMOVE_INPUT_ALLOWED_KEYS == frozenset(
+            {
+                "schema",
+                "issue_number",
+                "repo",
+                "target_blocker_number",
+                "expected_blocked_issue_node_id",
+                "expected_blocker_node_id",
+                "expected_blocked_by_numbers",
+                "expected_pre_mutation_snapshot_sha256",
+                "idempotency_key",
+            }
+        )
 
     def test_valid_request_passes(self):
         req = self._valid_request()
@@ -555,9 +568,7 @@ class TestIssueDependencyRemoveInputValidator:
         assert err == ""
 
     def test_not_a_dict_rejected(self):
-        err = validate_issue_dependency_remove_input(
-            ["not", "a", "dict"], 1523, "squne121/loop-protocol"
-        )
+        err = validate_issue_dependency_remove_input(["not", "a", "dict"], 1523, "squne121/loop-protocol")
         assert "not_object" in err
 
     def test_unknown_key_rejected(self):
