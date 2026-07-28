@@ -571,12 +571,16 @@ _TEST_VERDICT_PUBLISH_ALLOWED_KEYS = frozenset(
         "linked_issue_body_sha256",
         "producer_receipt",
         "receipt_sha256",
-        "body",
-        "body_sha256",
         "idempotency_key",
     }
 )
+# Issue #1647 Scope Delta AC8: the published body is never accepted as
+# free-form caller input. It is rendered deterministically from the
+# verified receipt inside the executor (see _render_test_verdict_body).
 _TEST_VERDICT_BODY_MAX_BYTES = 60000
+# Issue #1647 Scope Delta AC5: read-only reference to the locked receipt
+# schema. This file is never written by test_verdict.publish.
+_TEST_VERDICT_RECEIPT_SCHEMA_PATH = PROJECT_ROOT / "schemas" / "test-verdict-producer-receipt.schema.json"
 TEST_VERDICT_MARKER_PREFIX = "<!-- TEST_VERDICT_PUBLISH_MARKER:"
 TEST_VERDICT_MARKER_SUFFIX = " -->"
 
@@ -589,6 +593,30 @@ def _canonical_sha256(value: object) -> str:
 def _test_verdict_marker_str(idempotency_key: str) -> str:
     digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:32]
     return f"{TEST_VERDICT_MARKER_PREFIX}{digest}{TEST_VERDICT_MARKER_SUFFIX}"
+
+
+def _validate_producer_receipt_schema(receipt: dict) -> str:
+    """Issue #1647 Scope Delta AC5: full-schema fail-closed validation of
+    ``producer_receipt`` against the locked TEST_VERDICT_PRODUCER_RECEIPT_V1
+    schema (``required`` + ``additionalProperties: false``, including the
+    ``producer`` object and ``execution_payload_sha256`` that the previous
+    partial hand-rolled checks never enforced). Mirrors the
+    ``_validate_against_schema`` pattern in
+    scripts/agent-ops/test_verdict_execution_record_producer.py."""
+    try:
+        from jsonschema import Draft202012Validator
+    except Exception as exc:
+        return f"test_verdict_publish_receipt_schema_validator_unavailable: {exc}"
+    try:
+        schema = json.loads(_TEST_VERDICT_RECEIPT_SCHEMA_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return f"test_verdict_publish_receipt_schema_file_unreadable: {exc}"
+    validator = Draft202012Validator(schema)
+    errors = list(validator.iter_errors(receipt))
+    if errors:
+        messages = " and ".join(str(e) for e in errors[:5])
+        return f"test_verdict_publish_receipt_schema_invalid: {messages}"
+    return ""
 
 
 def _validate_test_verdict_publish_fields(data: dict, repo: str, issue_number: int) -> str:
@@ -613,8 +641,9 @@ def _validate_test_verdict_publish_fields(data: dict, repo: str, issue_number: i
     receipt = data.get("producer_receipt")
     if not isinstance(receipt, dict):
         return "test_verdict_publish_receipt_invalid"
-    if receipt.get("schema") != "TEST_VERDICT_PRODUCER_RECEIPT_V1" or receipt.get("schema_version") != 1:
-        return "test_verdict_publish_receipt_schema_invalid"
+    schema_err = _validate_producer_receipt_schema(receipt)
+    if schema_err:
+        return schema_err
     if receipt.get("pass_eligible") is not True:
         return "test_verdict_publish_receipt_not_pass_eligible"
     subject = receipt.get("subject")
@@ -645,16 +674,11 @@ def _validate_test_verdict_publish_fields(data: dict, repo: str, issue_number: i
     receipt_sha256 = data.get("receipt_sha256")
     if receipt_sha256 != _canonical_sha256(receipt):
         return "test_verdict_publish_receipt_sha256_mismatch"
-    body = data.get("body")
-    if not isinstance(body, str) or not body or "TEST_VERDICT_MACHINE/v2" not in body:
-        return "test_verdict_publish_body_invalid"
-    if len(body.encode("utf-8")) > _TEST_VERDICT_BODY_MAX_BYTES:
-        return "test_verdict_publish_body_too_large"
-    body_sha256 = data.get("body_sha256")
-    computed_body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    if body_sha256 != computed_body_sha256:
-        return "test_verdict_publish_body_sha256_mismatch"
-    expected_key = f"{repo}:{target_pr_number}:{issue_number}:{expected_head_sha}:{receipt_sha256}:{body_sha256}"
+    # Issue #1647 Scope Delta AC8: the body is never accepted as free-form
+    # caller input -- it is rendered deterministically from the verified
+    # receipt (see _render_test_verdict_body), so the idempotency key no
+    # longer binds a caller-supplied body_sha256.
+    expected_key = f"{repo}:{target_pr_number}:{issue_number}:{expected_head_sha}:{receipt_sha256}"
     if data.get("idempotency_key") != expected_key:
         return "test_verdict_publish_idempotency_key_mismatch"
     return ""
@@ -2545,9 +2569,22 @@ def _run_pr_review_publish(
 def _fetch_linked_issue_body_sha256(
     issue_number: int, repo: str, gh_bin: str, env: dict[str, str]
 ) -> tuple[str | None, str]:
+    # Issue #1647 Scope Delta AC11: the linked Issue endpoint must not
+    # resolve to a pull request. GitHub's Issues REST endpoint returns PRs
+    # too; the presence of the `pull_request` key is the documented signal
+    # (mirrors _fetch_issue_content's `isPullRequest: has("pull_request")`
+    # jq expression).
     try:
         out = subprocess.run(
-            [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST, f"repos/{repo}/issues/{issue_number}"],
+            [
+                gh_bin,
+                "api",
+                "--hostname",
+                _TRUSTED_GITHUB_HOST,
+                f"repos/{repo}/issues/{issue_number}",
+                "--jq",
+                '{body, isPullRequest: has("pull_request")}',
+            ],
             capture_output=True,
             text=True,
             timeout=15,
@@ -2556,7 +2593,12 @@ def _fetch_linked_issue_body_sha256(
         )
         if out.returncode != 0:
             return None, _classify_gh_error("gh_api_linked_issue_fetch_failed", out.stderr or "")
-        body = json.loads(out.stdout).get("body")
+        parsed = json.loads(out.stdout)
+        if not isinstance(parsed, dict):
+            return None, "gh_api_linked_issue_body_invalid"
+        if parsed.get("isPullRequest"):
+            return None, "test_verdict_linked_issue_is_pull_request"
+        body = parsed.get("body")
         if not isinstance(body, str):
             return None, "gh_api_linked_issue_body_invalid"
         return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest(), ""
@@ -2664,6 +2706,211 @@ def _validate_test_verdict_comment(comment: dict, marker: str, body_sha256: str,
     return ""
 
 
+def _gh_api_get(gh_bin: str, env: dict, path: str) -> tuple[dict | None, str]:
+    """Generic single-endpoint JSON GET used by the Issue #1647 Scope Delta
+    live readback checks (AC6). Never uses shell redirection."""
+    try:
+        out = subprocess.run(
+            [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST, path],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+            env=env,
+        )
+        if out.returncode != 0:
+            return None, _classify_gh_error("gh_api_fetch_failed", out.stderr or "")
+        return json.loads(out.stdout), ""
+    except Exception as exc:
+        return None, f"gh_api_fetch_exception: {exc}"
+
+
+def _verify_producer_run_and_job(receipt: dict, repo: str, expected_head_sha: str, gh_bin: str, env: dict) -> str:
+    """Issue #1647 Scope Delta AC6: live readback of the GitHub Actions
+    workflow run / job / check run the receipt claims to originate from.
+    Confirms the run's repository and head SHA, that the job belongs to
+    that run, and that the check run is linked to the same job/run."""
+    producer = receipt.get("producer") or {}
+    run_id = producer.get("workflow_run_id")
+    run_attempt = producer.get("workflow_run_attempt")
+    job_id = producer.get("job_id")
+    check_run_id = producer.get("check_run_id")
+
+    run_data, err = _gh_api_get(gh_bin, env, f"repos/{repo}/actions/runs/{run_id}/attempts/{run_attempt}")
+    if err:
+        return f"gh_api_workflow_run_fetch_failed: {err}"
+    if not isinstance(run_data, dict) or run_data.get("head_sha") != expected_head_sha:
+        return "test_verdict_publish_receipt_workflow_run_head_sha_mismatch"
+    if (run_data.get("repository") or {}).get("full_name") != repo:
+        return "test_verdict_publish_receipt_workflow_run_repository_mismatch"
+
+    job_data, err = _gh_api_get(gh_bin, env, f"repos/{repo}/actions/jobs/{job_id}")
+    if err:
+        return f"gh_api_job_fetch_failed: {err}"
+    if not isinstance(job_data, dict) or job_data.get("run_id") != run_id:
+        return "test_verdict_publish_receipt_job_run_id_mismatch"
+    if job_data.get("head_sha") != expected_head_sha:
+        return "test_verdict_publish_receipt_job_head_sha_mismatch"
+    check_run_url = job_data.get("check_run_url") or ""
+    if not check_run_url.endswith(f"/check-runs/{check_run_id}"):
+        return "test_verdict_publish_receipt_job_check_run_linkage_mismatch"
+
+    check_data, err = _gh_api_get(gh_bin, env, f"repos/{repo}/check-runs/{check_run_id}")
+    if err:
+        return f"gh_api_check_run_fetch_failed: {err}"
+    if not isinstance(check_data, dict) or check_data.get("id") != check_run_id:
+        return "test_verdict_publish_receipt_check_run_id_mismatch"
+    if check_data.get("head_sha") != expected_head_sha:
+        return "test_verdict_publish_receipt_check_run_head_sha_mismatch"
+    return ""
+
+
+def _verify_execution_artifact_metadata(receipt: dict, repo: str, gh_bin: str, env: dict) -> str:
+    """Issue #1647 Scope Delta AC6: live readback of the execution-record
+    artifact metadata (id / non-expired) the receipt claims."""
+    artifact = receipt.get("execution_artifact") or {}
+    artifact_id = artifact.get("artifact_id")
+    meta, err = _gh_api_get(gh_bin, env, f"repos/{repo}/actions/artifacts/{artifact_id}")
+    if err:
+        return f"gh_api_artifact_metadata_fetch_failed: {err}"
+    if not isinstance(meta, dict) or meta.get("id") != artifact_id:
+        return "test_verdict_publish_receipt_artifact_metadata_id_mismatch"
+    if meta.get("expired") is not False:
+        return "test_verdict_publish_receipt_artifact_metadata_expired"
+    return ""
+
+
+def _download_and_verify_artifact_archive(receipt: dict, repo: str, gh_bin: str, env: dict) -> tuple[dict | None, str]:
+    """Issue #1647 Scope Delta AC7: download the actual artifact archive,
+    recompute its sha256, and confirm it matches the receipt's
+    ``artifact_archive_digest``. Also parses the single execution-record
+    file inside the archive (mirrors
+    scripts/agent-ops/test_verdict_execution_record_producer.py's
+    _cmd_download_artifact) and cross-checks its self-reported
+    ``payload_sha256`` against the receipt's ``execution_payload_sha256``
+    (AC5/AC6). Returns the parsed record (which carries ``per_ac``
+    coverage used to render the published body, AC8) or an error."""
+    import io
+    import zipfile
+
+    artifact = receipt.get("execution_artifact") or {}
+    artifact_id = artifact.get("artifact_id")
+    expected_digest = artifact.get("artifact_archive_digest")
+    try:
+        out = subprocess.run(
+            [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST, f"repos/{repo}/actions/artifacts/{artifact_id}/zip"],
+            capture_output=True,
+            timeout=30,
+            shell=False,
+            env=env,
+        )
+    except Exception as exc:
+        return None, f"gh_api_artifact_download_exception: {exc}"
+    if out.returncode != 0:
+        stderr = out.stderr.decode("utf-8", errors="replace") if isinstance(out.stderr, bytes) else (out.stderr or "")
+        return None, _classify_gh_error("gh_api_artifact_download_failed", stderr)
+    data = out.stdout
+    computed_digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    if computed_digest != expected_digest:
+        return None, "test_verdict_publish_receipt_artifact_archive_digest_mismatch"
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+        names = archive.namelist()
+        if len(names) != 1:
+            return None, "test_verdict_publish_receipt_artifact_archive_unexpected_file_count"
+        record = json.loads(archive.read(names[0]).decode("utf-8"))
+    except Exception as exc:
+        return None, f"test_verdict_publish_receipt_artifact_archive_parse_exception: {exc}"
+    if not isinstance(record, dict):
+        return None, "test_verdict_publish_receipt_artifact_archive_record_invalid"
+    reported_payload_sha256 = record.get("payload_sha256")
+    stripped_record = dict(record)
+    stripped_record.pop("payload_sha256", None)
+    if _canonical_sha256(stripped_record) != reported_payload_sha256:
+        return None, "test_verdict_publish_receipt_artifact_archive_payload_self_check_failed"
+    if reported_payload_sha256 != receipt.get("execution_payload_sha256"):
+        return None, "test_verdict_publish_receipt_artifact_archive_payload_sha256_mismatch"
+    return record, ""
+
+
+_TEST_VERDICT_BODY_PR_RE = _re.compile(r"^target_pr_number: (\d+)$", _re.M)
+_TEST_VERDICT_BODY_ISSUE_RE = _re.compile(r"^linked_issue_number: (\d+)$", _re.M)
+_TEST_VERDICT_BODY_HEAD_RE = _re.compile(r"^head_sha: ([0-9a-f]{40})$", _re.M)
+_TEST_VERDICT_BODY_ARTIFACT_RE = _re.compile(r"^artifact_id: (\d+)$", _re.M)
+_TEST_VERDICT_BODY_RESULT_RE = _re.compile(r"^result: (PASS|FAIL)$", _re.M)
+_TEST_VERDICT_BODY_AC_RE = _re.compile(r"^  - ac: (\S+)$", _re.M)
+
+
+def _render_test_verdict_body(
+    receipt: dict,
+    target_pr_number: int,
+    linked_issue_number: int,
+    expected_head_sha: str,
+    artifact_id: int,
+    per_ac_coverage: list,
+) -> str:
+    """Issue #1647 Scope Delta AC8: the published comment body is rendered
+    deterministically from the verified receipt. No free-form caller body
+    string is ever accepted (see _TEST_VERDICT_PUBLISH_ALLOWED_KEYS)."""
+    result = "PASS" if receipt.get("pass_eligible") is True else "FAIL"
+    lines = [
+        "TEST_VERDICT_MACHINE/v2",
+        f"target_pr_number: {target_pr_number}",
+        f"linked_issue_number: {linked_issue_number}",
+        f"head_sha: {expected_head_sha}",
+        f"artifact_id: {artifact_id}",
+        f"result: {result}",
+    ]
+    acs = sorted(
+        {str(entry.get("ac")) for entry in (per_ac_coverage or []) if isinstance(entry, dict) and entry.get("ac")}
+    )
+    if acs:
+        lines.append("per_ac_coverage:")
+        for ac in acs:
+            lines.append(f"  - ac: {ac}")
+    return "\n".join(lines)
+
+
+def _cross_check_test_verdict_body(
+    body: str,
+    *,
+    target_pr_number: int,
+    linked_issue_number: int,
+    expected_head_sha: str,
+    artifact_id: int,
+    pass_eligible: bool,
+    per_ac_coverage: list,
+) -> str:
+    """Issue #1647 Scope Delta AC8: defense-in-depth cross-check that the
+    rendered/candidate body's embedded PR/Issue/HEAD/artifact/result/
+    per-AC-coverage fields match the verified receipt's values. Used both
+    as a self-check on the deterministically rendered body and as an
+    independently testable validator."""
+    match = _TEST_VERDICT_BODY_PR_RE.search(body)
+    if not match or int(match.group(1)) != target_pr_number:
+        return "test_verdict_publish_body_pr_number_mismatch"
+    match = _TEST_VERDICT_BODY_ISSUE_RE.search(body)
+    if not match or int(match.group(1)) != linked_issue_number:
+        return "test_verdict_publish_body_issue_number_mismatch"
+    match = _TEST_VERDICT_BODY_HEAD_RE.search(body)
+    if not match or match.group(1) != expected_head_sha:
+        return "test_verdict_publish_body_head_sha_mismatch"
+    match = _TEST_VERDICT_BODY_ARTIFACT_RE.search(body)
+    if not match or int(match.group(1)) != artifact_id:
+        return "test_verdict_publish_body_artifact_id_mismatch"
+    expected_result = "PASS" if pass_eligible else "FAIL"
+    match = _TEST_VERDICT_BODY_RESULT_RE.search(body)
+    if not match or match.group(1) != expected_result:
+        return "test_verdict_publish_body_result_mismatch"
+    expected_acs = sorted(
+        {str(entry.get("ac")) for entry in (per_ac_coverage or []) if isinstance(entry, dict) and entry.get("ac")}
+    )
+    found_acs = sorted(_TEST_VERDICT_BODY_AC_RE.findall(body))
+    if found_acs != expected_acs:
+        return "test_verdict_publish_body_per_ac_coverage_mismatch"
+    return ""
+
+
 def _run_test_verdict_publish(args, input_data, gh_bin, _fail, _ok) -> int:
     field_err = _validate_test_verdict_publish_fields(input_data, args.repo, args.issue_number)
     if field_err:
@@ -2674,8 +2921,8 @@ def _run_test_verdict_publish(args, input_data, gh_bin, _fail, _ok) -> int:
     pr_number = input_data["target_pr_number"]
     expected_head_sha = input_data["expected_head_sha"]
     linked_issue_number = input_data["linked_issue_number"]
-    marker = _test_verdict_marker_str(input_data["idempotency_key"])
-    rendered_body = f"{input_data['body']}\n\n{marker}\n"
+    receipt = input_data["producer_receipt"]
+    artifact_id = receipt["execution_artifact"]["artifact_id"]
     write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
     marker_path = _issue_metadata_marker_path(
         PROJECT_ROOT, args.issue_number, args.command_id, "test_verdict_publish.marker.json"
@@ -2703,11 +2950,54 @@ def _run_test_verdict_publish(args, input_data, gh_bin, _fail, _ok) -> int:
             encoding="utf-8",
         )
 
+    marker = _test_verdict_marker_str(input_data["idempotency_key"])
+
     matches, match_err = _find_test_verdict_marker_matches(marker, pr_number, args.repo, gh_bin, gh_env)
     if match_err:
         return _fail(f"test_verdict_marker_precheck_failed: {match_err}", status="failed")
     if len(matches) > 1:
         return _fail("test_verdict_duplicate_marker_conflict_pre_mutation", status="failed")
+
+    # Issue #1647 Scope Delta AC6/AC7: live GitHub Actions readback of the
+    # receipt's producer/workflow-run/job/check-run identity and the
+    # execution-record artifact, before any mutation is attempted.
+    live_err = _verify_producer_run_and_job(receipt, args.repo, expected_head_sha, gh_bin, gh_env)
+    if live_err:
+        return _fail(f"test_verdict_publish_receipt_live_readback_failed: {live_err}", status="failed")
+    meta_err = _verify_execution_artifact_metadata(receipt, args.repo, gh_bin, gh_env)
+    if meta_err:
+        return _fail(f"test_verdict_publish_receipt_live_readback_failed: {meta_err}", status="failed")
+    record, archive_err = _download_and_verify_artifact_archive(receipt, args.repo, gh_bin, gh_env)
+    if archive_err:
+        return _fail(f"test_verdict_publish_receipt_live_readback_failed: {archive_err}", status="failed")
+    per_ac_coverage = record.get("per_ac") if isinstance(record, dict) else []
+
+    # Issue #1647 Scope Delta AC8: deterministic body rendering from the
+    # verified receipt, then a self cross-check (defense in depth).
+    rendered_body = _render_test_verdict_body(
+        receipt, pr_number, linked_issue_number, expected_head_sha, artifact_id, per_ac_coverage
+    )
+    cross_check_err = _cross_check_test_verdict_body(
+        rendered_body,
+        target_pr_number=pr_number,
+        linked_issue_number=linked_issue_number,
+        expected_head_sha=expected_head_sha,
+        artifact_id=artifact_id,
+        pass_eligible=receipt.get("pass_eligible") is True,
+        per_ac_coverage=per_ac_coverage,
+    )
+    if cross_check_err:
+        return _fail(cross_check_err, status="failed")
+    if len(rendered_body.encode("utf-8")) > _TEST_VERDICT_BODY_MAX_BYTES:
+        return _fail("test_verdict_publish_body_too_large", status="failed")
+
+    # Issue #1647 Scope Delta AC10: reject if the rendered body already
+    # contains the marker literal before it is appended and POSTed.
+    if TEST_VERDICT_MARKER_PREFIX in rendered_body:
+        return _fail("test_verdict_publish_marker_preembedded_in_body", status="failed")
+
+    body_sha256 = hashlib.sha256(rendered_body.encode("utf-8")).hexdigest()
+    full_body = f"{rendered_body}\n\n{marker}\n"
 
     current_head, head_err = _fetch_pr_head_sha(pr_number, args.repo, gh_bin, env=gh_env)
     if head_err:
@@ -2727,9 +3017,33 @@ def _run_test_verdict_publish(args, input_data, gh_bin, _fail, _ok) -> int:
         comment, readback_err = _readback_test_verdict_comment(matches[0].get("id"), args.repo, gh_bin, gh_env)
         if readback_err:
             return _fail(readback_err, status="failed")
-        post_err = _validate_test_verdict_comment(comment, marker, input_data["body_sha256"], authenticated_login)
+        post_err = _validate_test_verdict_comment(comment, marker, body_sha256, authenticated_login)
         if post_err:
             return _fail(post_err, status="failed")
+        # Issue #1647 Scope Delta AC9: idempotent retry must not rely on the
+        # readback taken before this branch was known -- re-check PR HEAD and
+        # linked Issue body for drift that may have occurred while this
+        # comment/postcondition check ran, and re-confirm no tracked source
+        # changes leaked out of the write root.
+        retry_head, retry_head_err = _fetch_pr_head_sha(pr_number, args.repo, gh_bin, env=gh_env)
+        retry_body_sha, retry_issue_err = _fetch_linked_issue_body_sha256(
+            linked_issue_number, args.repo, gh_bin, gh_env
+        )
+        if (
+            retry_head_err
+            or retry_issue_err
+            or retry_head != expected_head_sha
+            or retry_body_sha != input_data["linked_issue_body_sha256"]
+        ):
+            return _fail(
+                f"published_but_stale: current_head={retry_head} expected_head={expected_head_sha}",
+                status="published_but_stale",
+            )
+        changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+        if changed:
+            return _fail(
+                "postcondition_tracked_changes_detected", [f"changed: {f}" for f in changed[:20]], status="failed"
+            )
         _write_marker(comment)
         return _ok(
             {
@@ -2740,7 +3054,7 @@ def _run_test_verdict_publish(args, input_data, gh_bin, _fail, _ok) -> int:
             }
         )
 
-    posted, post_err = _post_test_verdict_comment(pr_number, args.repo, rendered_body, gh_bin, gh_env)
+    posted, post_err = _post_test_verdict_comment(pr_number, args.repo, full_body, gh_bin, gh_env)
     if post_err:
         return _fail(post_err, status="failed")
     if not isinstance(posted, dict) or not posted.get("id"):
@@ -2748,9 +3062,24 @@ def _run_test_verdict_publish(args, input_data, gh_bin, _fail, _ok) -> int:
     comment, readback_err = _readback_test_verdict_comment(posted["id"], args.repo, gh_bin, gh_env)
     if readback_err:
         return _fail(readback_err, [f"posted_comment_id: {posted['id']}"], status="failed")
-    postcondition_err = _validate_test_verdict_comment(comment, marker, input_data["body_sha256"], authenticated_login)
+    postcondition_err = _validate_test_verdict_comment(comment, marker, body_sha256, authenticated_login)
     if postcondition_err:
         return _fail(postcondition_err, [f"posted_comment_id: {posted['id']}"], status="failed")
+
+    # Issue #1647 Scope Delta AC10: this is best-effort duplicate detection
+    # only (not a substitute for a real distributed exactly-once guarantee --
+    # see the Safety Claim Matrix "not_controlled" entry). Re-list markers
+    # after POST; anything other than exactly one match means a concurrent
+    # publisher may have raced this one.
+    post_matches, post_match_err = _find_test_verdict_marker_matches(marker, pr_number, args.repo, gh_bin, gh_env)
+    if post_match_err or len(post_matches) != 1:
+        _write_marker(comment)
+        return _fail(
+            f"test_verdict_publish_post_marker_recheck_failed: {post_match_err}",
+            [f"posted_comment_id: {posted['id']}"],
+            status="published_but_conflicted",
+        )
+
     post_head, post_head_err = _fetch_pr_head_sha(pr_number, args.repo, gh_bin, env=gh_env)
     post_body_sha, post_issue_err = _fetch_linked_issue_body_sha256(linked_issue_number, args.repo, gh_bin, gh_env)
     if (
