@@ -2,24 +2,28 @@
 """materialize_test_verdict_artifact.py
 
 Issue #1648 (Child C of #1645): receipt-aware materializer that turns a
-Child A (Issue #1646) TEST_VERDICT_EXECUTION_RECORD_V1 artifact plus a
 Child B (Issue #1647) TEST_VERDICT_PUBLISH_INPUT_V1-shaped request into a
 TEST_VERDICT_MACHINE/v2 input bundle (consumable by
 adjudicate_vc_result.py --test-verdict-file --require-producer-receipt)
 and a private/audit bundle.
 
-This module is a pure verification/binding layer -- it performs no GitHub
-API calls itself. Callers (e.g. the Step 2 verification handoff) are
-responsible for independently reading back the *current* live GitHub state
-(current PR head SHA, current Issue body SHA256, current PR/Issue numbers)
-and passing those values in explicitly. This keeps materialization
-deterministic and fully testable offline, while still binding the
-materialized bundle to fresh (non-stale) GitHub state at the caller
-boundary.
+Issue #1648 OWNER fix_delta (PR #1831 review): this module now performs a
+*live* GitHub readback itself instead of trusting a caller-supplied
+``execution_record``. It imports and re-executes Child B's exact live
+readback functions (``_verify_producer_run_and_job`` /
+``_verify_execution_artifact_metadata`` / ``_download_and_verify_artifact_archive``,
+all defined in ``scripts/agent-guards/controlled_skill_mutation_exec.py``)
+so that materialization can never proceed from a purely self-attested,
+internally-consistent-but-fabricated ``producer_receipt``. The execution
+record used for binding is *only* the one actually downloaded and digest
+-verified from the GitHub Actions artifact the receipt claims -- callers
+can no longer substitute an arbitrary in-memory execution record.
 
-Fail-closed contract (Issue #1648 AC1): materialization only produces an
+Fail-closed contract (Issue #1648 AC1/AC6): materialization only produces an
 input/private bundle when ALL of the following bindings hold. Any mismatch
-returns status "blocked" with zero output files written:
+returns status "blocked" with zero output files written (and any stale
+existing output files at the target paths are invalidated -- Issue #1648
+fix_delta AC10):
 
   - the Child B publish_request (schema TEST_VERDICT_PUBLISH_INPUT_V1)
     passes the exact same field/schema validation Child B's dedicated
@@ -33,13 +37,24 @@ returns status "blocked" with zero output files written:
     (independently supplied) live GitHub state -- this is the freshness /
     drift guard that a merely internally-consistent-but-stale publish
     request cannot satisfy
-  - the execution_record (the actual downloaded GitHub Actions artifact
-    payload) hashes to the receipt's declared execution_payload_sha256,
-    and its subject/contract exactly match the receipt's subject/contract
-  - every AC referenced by the execution_record's per_ac coverage resolves
-    to a caller-supplied command_hash (sourced from the Issue contract
-    snapshot's vc_preflight classifications) and to real, PASS-classified
-    executions
+  - the receipt's claimed workflow run / job / check run actually exist on
+    GitHub and match the expected head SHA and repository (live readback,
+    Issue #1648 fix_delta AC6)
+  - the receipt's claimed artifact actually exists, is not expired, and its
+    archive bytes actually download and hash to the receipt's declared
+    ``artifact_archive_digest`` (live readback + download, Issue #1648
+    fix_delta AC6)
+  - the downloaded execution record hashes to the receipt's declared
+    execution_payload_sha256, and its subject/contract exactly match the
+    receipt's subject/contract
+  - every AC referenced by the downloaded execution_record's per_ac
+    coverage resolves to a caller-supplied command_hash (sourced from the
+    Issue contract snapshot's vc_preflight classifications), to real
+    executions, and each of those executions independently satisfies
+    exit_code == 0, status == "pass", skipped in (False, None), timed_out
+    in (False, None), and fallback_detected == False (Issue #1648 fix_delta
+    AC7 -- no blanket status/fallback_detected-only shortcut, and no
+    unconditional exit_code normalization on output)
 """
 
 from __future__ import annotations
@@ -48,6 +63,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,7 +79,7 @@ EXECUTION_RECORD_SCHEMA = "TEST_VERDICT_EXECUTION_RECORD_V1"
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _CONTROLLED_EXEC_PATH = _REPO_ROOT / "scripts" / "agent-guards" / "controlled_skill_mutation_exec.py"
 
-_PUBLISH_VALIDATOR = None
+_CONTROLLED_EXEC_MODULE = None
 
 
 def _canonical_json(value: Any) -> str:
@@ -93,15 +109,15 @@ def _load_json_file(path: str | None) -> tuple[Any, list[str]]:
         return None, [f"input_json_error:{path}:{exc}"]
 
 
-def _load_publish_validator():
-    """Lazily import Child B's exact TEST_VERDICT_PUBLISH_INPUT_V1 field
-    validator (which itself validates the embedded producer_receipt against
-    the full TEST_VERDICT_PRODUCER_RECEIPT_V1 schema). Reused verbatim so
-    materialization can never drift from the sanctioned publisher contract
-    (DRY, single source of truth)."""
-    global _PUBLISH_VALIDATOR
-    if _PUBLISH_VALIDATOR is not None:
-        return _PUBLISH_VALIDATOR, None
+def _load_controlled_exec_module():
+    """Lazily import scripts/agent-guards/controlled_skill_mutation_exec.py
+    (DRY, single source of truth) so the materializer can reuse both Child
+    B's exact TEST_VERDICT_PUBLISH_INPUT_V1 field validator *and* Child B's
+    exact live GitHub readback / artifact download functions (Issue #1648
+    fix_delta AC6)."""
+    global _CONTROLLED_EXEC_MODULE
+    if _CONTROLLED_EXEC_MODULE is not None:
+        return _CONTROLLED_EXEC_MODULE, None
     spec = importlib.util.spec_from_file_location(
         "controlled_skill_mutation_exec_for_materializer", _CONTROLLED_EXEC_PATH
     )
@@ -112,11 +128,78 @@ def _load_publish_validator():
         spec.loader.exec_module(module)
     except Exception as exc:  # pragma: no cover
         return None, f"controlled_skill_mutation_exec_import_failed:{type(exc).__name__}"
+    _CONTROLLED_EXEC_MODULE = module
+    return _CONTROLLED_EXEC_MODULE, None
+
+
+def _load_publish_validator():
+    module, import_error = _load_controlled_exec_module()
+    if module is None:
+        return None, import_error
     validator = getattr(module, "_validate_test_verdict_publish_fields", None)
     if validator is None:
         return None, "controlled_skill_mutation_exec_missing_validator"
-    _PUBLISH_VALIDATOR = validator
-    return _PUBLISH_VALIDATOR, None
+    return validator, None
+
+
+def _live_readback_execution_record(
+    receipt: dict[str, Any],
+    repo: str,
+    expected_head_sha: str,
+    gh_bin: str | None,
+    gh_env: dict[str, str] | None,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Issue #1648 fix_delta AC6: perform the actual live GitHub readback
+    (workflow run / job / check run identity, artifact metadata, artifact
+    archive download + digest recomputation) that Child B's dedicated
+    publisher performs before ever accepting a receipt as evidence. Returns
+    (record, errors) -- record is the parsed execution-record payload
+    actually inside the downloaded artifact archive, never a caller-
+    supplied value."""
+    module, import_error = _load_controlled_exec_module()
+    if module is None:
+        return None, [import_error]
+
+    resolved_gh_bin = gh_bin
+    if resolved_gh_bin is None:
+        find_gh_bin = getattr(module, "_find_gh_bin", None)
+        if find_gh_bin is None:
+            return None, ["controlled_skill_mutation_exec_missing_find_gh_bin"]
+        resolved_gh_bin, gh_bin_error = find_gh_bin()
+        if resolved_gh_bin is None:
+            return None, [gh_bin_error or "gh_not_found_in_trusted_path"]
+
+    resolved_env = gh_env
+    if resolved_env is None:
+        build_env = getattr(module, "_build_pr_review_gh_env", None)
+        if build_env is None:
+            return None, ["controlled_skill_mutation_exec_missing_gh_env_builder"]
+        resolved_env = build_env()
+
+    verify_producer_run_and_job = getattr(module, "_verify_producer_run_and_job", None)
+    verify_execution_artifact_metadata = getattr(module, "_verify_execution_artifact_metadata", None)
+    download_and_verify_artifact_archive = getattr(module, "_download_and_verify_artifact_archive", None)
+    if (
+        verify_producer_run_and_job is None
+        or verify_execution_artifact_metadata is None
+        or download_and_verify_artifact_archive is None
+    ):
+        return None, ["controlled_skill_mutation_exec_missing_live_readback_functions"]
+
+    live_err = verify_producer_run_and_job(receipt, repo, expected_head_sha, resolved_gh_bin, resolved_env)
+    if live_err:
+        return None, [f"test_verdict_materialize_live_readback_failed:{live_err}"]
+
+    meta_err = verify_execution_artifact_metadata(receipt, repo, resolved_gh_bin, resolved_env)
+    if meta_err:
+        return None, [f"test_verdict_materialize_live_readback_failed:{meta_err}"]
+
+    record, archive_err = download_and_verify_artifact_archive(receipt, repo, resolved_gh_bin, resolved_env)
+    if archive_err:
+        return None, [f"test_verdict_materialize_live_readback_failed:{archive_err}"]
+    if not isinstance(record, dict):
+        return None, ["test_verdict_materialize_live_readback_record_invalid"]
+    return record, []
 
 
 def _validate_execution_record(record: Any) -> list[str]:
@@ -145,6 +228,21 @@ def _validate_execution_record(record: Any) -> list[str]:
     return errors
 
 
+def _execution_satisfies_pass(execution: dict[str, Any]) -> bool:
+    """Issue #1648 fix_delta AC7: strict per-execution PASS gate. All of
+    exit_code == 0, status == "pass", skipped in (False, None), timed_out in
+    (False, None), and fallback_detected == False must hold individually --
+    a mere status == "pass" (with an unchecked non-zero exit_code, or a
+    skipped/timed_out execution) is never treated as PASS."""
+    return (
+        execution.get("exit_code") == 0
+        and execution.get("status") == "pass"
+        and execution.get("skipped") in (False, None)
+        and execution.get("timed_out") in (False, None)
+        and execution.get("fallback_detected") is False
+    )
+
+
 def _build_runtime_ac_results(
     record: dict[str, Any], command_hash_map: dict[str, str]
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -154,10 +252,15 @@ def _build_runtime_ac_results(
         if not isinstance(execution, dict) or not isinstance(execution.get("execution_id"), str):
             errors.append("execution_record_execution_entry_invalid")
             continue
-        executions_by_id[execution["execution_id"]] = execution
+        execution_id = execution["execution_id"]
+        if execution_id in executions_by_id:
+            errors.append(f"execution_record_execution_id_duplicate:{execution_id}")
+            continue
+        executions_by_id[execution_id] = execution
 
     runtime_ac_results: list[dict[str, Any]] = []
     seen_acs: set[str] = set()
+    referenced_execution_ids: set[str] = set()
     for entry in record.get("per_ac", []):
         if not isinstance(entry, dict):
             errors.append("execution_record_per_ac_entry_invalid")
@@ -177,21 +280,26 @@ def _build_runtime_ac_results(
             errors.append(f"command_hash_map_missing_ac:{ac}")
             continue
 
-        statuses: list[Any] = []
-        exit_codes: list[Any] = []
+        ac_pass = True
+        exit_codes_seen: list[Any] = []
         fallback_detected = False
         for execution_id in execution_ids:
+            referenced_execution_ids.add(execution_id)
             execution = executions_by_id.get(execution_id)
             if execution is None:
                 errors.append(f"execution_record_execution_id_unresolved:{execution_id}")
+                ac_pass = False
                 continue
-            statuses.append(execution.get("status"))
-            exit_codes.append(execution.get("exit_code"))
+            exit_codes_seen.append(execution.get("exit_code"))
             if execution.get("fallback_detected"):
                 fallback_detected = True
+            if not _execution_satisfies_pass(execution):
+                ac_pass = False
 
-        status = "pass" if statuses and all(item == "pass" for item in statuses) and not fallback_detected else "fail"
-        exit_code = 0 if status == "pass" else (exit_codes[0] if exit_codes else 1)
+        status = "pass" if ac_pass and execution_ids else "fail"
+        # Issue #1648 fix_delta AC7: reflect the actual input exit_code
+        # rather than unconditionally normalizing to 0/1 on output.
+        exit_code = exit_codes_seen[0] if exit_codes_seen else 1
         runtime_ac_results.append(
             {
                 "ac": ac,
@@ -203,12 +311,21 @@ def _build_runtime_ac_results(
                 "stop_condition_triggered": False,
             }
         )
+
+    expected_acs = set(command_hash_map.keys())
+    missing_acs = expected_acs - seen_acs
+    if missing_acs:
+        errors.append(f"execution_record_per_ac_missing_acs:{sorted(missing_acs)}")
+
+    unreferenced_execution_ids = set(executions_by_id) - referenced_execution_ids
+    if unreferenced_execution_ids:
+        errors.append(f"execution_record_unreferenced_executions:{sorted(unreferenced_execution_ids)}")
+
     return runtime_ac_results, errors
 
 
 def materialize_test_verdict_artifact(
     *,
-    execution_record: Any,
     publish_request: Any,
     command_hash_map: Any,
     repo: str,
@@ -220,11 +337,17 @@ def materialize_test_verdict_artifact(
     diff_head_sha: str,
     run_id: str,
     run_url: str,
+    gh_bin: str | None = None,
+    gh_env: dict[str, str] | None = None,
 ) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None, list[str]]:
     """Return (status, input_bundle, private_bundle, errors).
 
     status is "ok" (bundles materialized) or "blocked" (fail-closed, no
-    bundle files should be written by the caller)."""
+    bundle files should be written by the caller). Issue #1648 fix_delta:
+    the execution record is no longer caller-supplied -- it is obtained via
+    a live GitHub readback of the publish_request's embedded
+    producer_receipt, which is why this function no longer accepts an
+    ``execution_record`` argument."""
     errors: list[str] = []
 
     if not isinstance(publish_request, dict):
@@ -235,8 +358,6 @@ def materialize_test_verdict_artifact(
     if not isinstance(command_hash_map, dict) or not command_hash_map:
         errors.append("command_hash_map_invalid")
         command_hash_map = {}
-
-    errors.extend(_validate_execution_record(execution_record))
 
     if errors:
         return "blocked", None, None, errors
@@ -254,7 +375,8 @@ def materialize_test_verdict_artifact(
     # Freshness / drift guard: the publish_request proved internally
     # consistent above, but that alone does not prove it reflects the
     # *current* live GitHub state -- bind it against independently supplied
-    # current values (Issue #1648 AC1 "current Issue/PR/HEAD/body SHA").
+    # current values (Issue #1648 AC1 "current Issue/PR/HEAD/body SHA")
+    # before spending any network calls on a stale request.
     if publish_request.get("target_pr_number") != current_pr_number:
         errors.append("current_pr_number_mismatch")
     if publish_request.get("expected_head_sha") != current_head_sha:
@@ -264,8 +386,26 @@ def materialize_test_verdict_artifact(
     if publish_request.get("linked_issue_number") != issue_number:
         errors.append("current_issue_number_mismatch")
 
-    # Artifact digest binding: the execution_record actually in hand must be
-    # the exact one the receipt endorses.
+    if errors:
+        return "blocked", None, None, errors
+
+    # Issue #1648 fix_delta AC6: live readback of the receipt's claimed
+    # workflow run/job/check run and artifact, plus an actual archive
+    # download + digest recomputation. The execution_record used below is
+    # only ever the record parsed out of that downloaded archive.
+    execution_record, live_errors = _live_readback_execution_record(
+        receipt, repo, current_head_sha, gh_bin, gh_env
+    )
+    if live_errors:
+        return "blocked", None, None, live_errors
+
+    errors.extend(_validate_execution_record(execution_record))
+    if errors:
+        return "blocked", None, None, errors
+
+    # Artifact digest binding: the downloaded execution_record must be the
+    # exact one the receipt endorses (also cross-checked inside the live
+    # readback itself; repeated here for defense in depth).
     if receipt.get("execution_payload_sha256") != execution_record.get("payload_sha256"):
         errors.append("execution_record_receipt_digest_mismatch")
     if receipt.get("subject") != execution_record.get("subject"):
@@ -335,6 +475,9 @@ def materialize_test_verdict_artifact(
         "execution_record": execution_record,
         "publish_request": publish_request,
         "verification_trace": [
+            "live_producer_run_and_job_verified",
+            "live_execution_artifact_metadata_verified",
+            "artifact_archive_downloaded_and_digest_verified",
             "execution_record_digest_verified",
             "publish_request_field_and_receipt_schema_verified",
             "current_state_binding_verified",
@@ -360,9 +503,28 @@ def _build_result(
     }
 
 
+def _atomic_write(path_str: str, content: str) -> None:
+    """Issue #1648 fix_delta AC10: publish output bundles atomically (write
+    to a temp file in the same directory, then os.replace()) so a crash or
+    concurrent read can never observe a partially-written bundle file."""
+    path = Path(path_str)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    tmp_path.write_text(content, encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _invalidate_stale_bundle(path_str: str) -> None:
+    """Issue #1648 fix_delta AC10: on a blocked materialization, delete any
+    pre-existing bundle file at the target path so a previously-succeeded
+    (now stale) bundle can never be mistaken for the result of this run."""
+    path = Path(path_str)
+    if path.exists():
+        path.unlink()
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Materialize a receipt-bound TEST_VERDICT_MACHINE/v2 bundle")
-    parser.add_argument("--execution-record-file", required=True)
     parser.add_argument("--publish-request-file", required=True)
     parser.add_argument("--command-hash-map-file", required=True)
     parser.add_argument("--repo", required=True)
@@ -382,18 +544,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    execution_record, execution_record_errors = _load_json_file(args.execution_record_file)
     publish_request, publish_request_errors = _load_json_file(args.publish_request_file)
     command_hash_map, command_hash_map_errors = _load_json_file(args.command_hash_map_file)
 
-    preload_errors = execution_record_errors + publish_request_errors + command_hash_map_errors
+    preload_errors = publish_request_errors + command_hash_map_errors
     if preload_errors:
+        _invalidate_stale_bundle(args.out_input_file)
+        _invalidate_stale_bundle(args.out_private_file)
         result = _build_result("blocked", None, None, preload_errors)
         sys.stdout.write(_canonical_json(result) + "\n")
         return 1
 
     status, input_bundle, private_bundle, errors = materialize_test_verdict_artifact(
-        execution_record=execution_record,
         publish_request=publish_request,
         command_hash_map=command_hash_map,
         repo=args.repo,
@@ -408,8 +570,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if status == "ok":
-        Path(args.out_input_file).write_text(_canonical_json(input_bundle), encoding="utf-8")
-        Path(args.out_private_file).write_text(_canonical_json(private_bundle), encoding="utf-8")
+        _atomic_write(args.out_input_file, _canonical_json(input_bundle))
+        _atomic_write(args.out_private_file, _canonical_json(private_bundle))
+    else:
+        _invalidate_stale_bundle(args.out_input_file)
+        _invalidate_stale_bundle(args.out_private_file)
 
     result = _build_result(status, input_bundle, private_bundle, errors)
     sys.stdout.write(_canonical_json(result) + "\n")

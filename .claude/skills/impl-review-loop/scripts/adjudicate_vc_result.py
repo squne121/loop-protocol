@@ -832,6 +832,16 @@ def adjudicate_vc_result(
     test_verdict: Any | None = None,
     require_producer_receipt: bool = False,
 ) -> dict[str, Any]:
+    # Issue #1648 fix_delta AC9 (P1-3): a caller that forgets to pass
+    # --require-producer-receipt must not silently accept a materialized
+    # TEST_VERDICT_MACHINE/v2 bundle (which always embeds a producer_receipt)
+    # as if it were self-attested. If the test_verdict itself carries a
+    # producer_receipt field, receipt verification is forced on regardless
+    # of the caller-supplied flag. Legacy self-attested TEST_VERDICT input
+    # (no producer_receipt field at all) is unaffected -- non-regression.
+    effective_require_producer_receipt = require_producer_receipt or (
+        isinstance(test_verdict, dict) and "producer_receipt" in test_verdict
+    )
     baseline_items, baseline_errors, baseline_schema = _normalize_list_payload(contract_snapshot)
     current_items, current_errors, _ = _normalize_list_payload(current_vc_result)
     changed_paths, changed_paths_present, diff_errors = _extract_changed_paths(diff_summary)
@@ -964,7 +974,7 @@ def adjudicate_vc_result(
             current_vc_result=current_vc_result,
             diff_summary=diff_summary,
             expected_keys=set(baseline_by_key) | excluded_pr_review_only_keys,
-            require_producer_receipt=require_producer_receipt,
+            require_producer_receipt=effective_require_producer_receipt,
         )
         if binding_error is not None:
             return _result(
