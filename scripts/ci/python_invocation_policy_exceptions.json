@@ -46,7 +46,7 @@
     {
       "id": "codex_execpolicy_matrix",
       "scope": "stdlib_only",
-      "exact_argv": ["python3", "scripts/ci/codex_execpolicy_matrix.py", "--npm-prefix", "codex_execpolicy_artifacts/codex-cli", "--package-spec", "@openai/codex@0.142.0", "--expected-version", "codex-cli 0.142.0", "--rules", ".codex/rules/default.rules", "--artifact", "codex_execpolicy_artifacts/codex_execpolicy_matrix_v1.json"],
+      "exact_argv": ["python3", "scripts/ci/codex_execpolicy_matrix.py", "--npm-prefix", "${RUNNER_TEMP}/codex-cli-npm-prefix", "--package-spec", "@openai/codex@0.142.0", "--expected-version", "codex-cli 0.142.0", "--rules", ".codex/rules/default.rules", "--artifact", "codex_execpolicy_artifacts/codex_execpolicy_matrix_v1.json"],
       "reason": "Codex execpolicy matrix runner uses stdlib only (subprocess, json, os, hashlib, shlex, importlib.util, tempfile); runs in a dedicated CI context as a bootstrap step.",
       "proof": "stdlib_import_scan"
     },

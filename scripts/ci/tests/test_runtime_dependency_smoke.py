@@ -171,12 +171,12 @@ def test_command_shape() -> None:
     import yaml as _yaml
 
     ci = _yaml.safe_load(CI_YML_PATH.read_text())
-    steps = ci["jobs"]["python-test"]["steps"]
+    steps = ci["jobs"]["python-test-core"]["steps"]  # Issue #1760: split from python-test
     smoke_step = next(
         (s for s in steps if s.get("name") == "Runtime dependency smoke (isolated, #1192)"),
         None,
     )
-    assert smoke_step is not None, "Smoke step not found in python-test job"
+    assert smoke_step is not None, "Smoke step not found in python-test-core job"
     assert smoke_step["run"] == CANONICAL_SMOKE_CMD, (
         f"CI run: {smoke_step['run']!r} != CANONICAL_SMOKE_CMD: {CANONICAL_SMOKE_CMD!r}"
     )
@@ -279,14 +279,14 @@ def test_ci_wiring_runtime_only() -> None:
     import yaml as _yaml
 
     ci = _yaml.safe_load(CI_YML_PATH.read_text())
-    steps = ci["jobs"]["python-test"]["steps"]
+    steps = ci["jobs"]["python-test-core"]["steps"]  # Issue #1760: split from python-test
     names = [step.get("name", "") for step in steps]
 
     lock_name = "uv lock --check (drift guard)"
     smoke_name = "Runtime dependency smoke (isolated, #1192)"
     sync_name = "uv sync (timed)"
 
-    assert lock_name in names, f"Step {lock_name!r} not found in python-test job steps: {names}"
+    assert lock_name in names, f"Step {lock_name!r} not found in python-test-core job steps: {names}"
     assert smoke_name in names, f"Step {smoke_name!r} not found in python-test job steps: {names}"
     assert sync_name in names, f"Step {sync_name!r} not found in python-test job steps: {names}"
 

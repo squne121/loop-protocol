@@ -25,7 +25,9 @@ runtime delta テンプレートは `templates/runtime-delta.md` を参照する
 
 この Skill が定義する Target Policy と現行 CI 実装の差分:
 
-- `python-test` job は現在 `setup-python-uv` / `uv python install` / `uv sync --locked --group dev` を実行し、`setup-node-pnpm` / `pnpm install --frozen-lockfile` は実行しない
+- Issue #1760: `python-test` job は `python-test-core`（Python-only、`setup-python-uv` / `uv python install` / `uv sync --locked --group dev` のみ）と `codex-execpolicy`（Node/npm/codex CLI + execpolicy matrix + `tests/codex/test_local_main_branch_guard.py` 専用）に分割され、`python-test` は required status check 名を維持したまま `needs: [python-test-core, codex-execpolicy]` + `if: always()` の集約 job になった
+- `python-test-core` job は現在 `setup-python-uv` / `uv python install` / `uv sync --locked --group dev` を実行し、`setup-node-pnpm` / `pnpm install --frozen-lockfile` は実行しない
+- `scripts/ci/verify_python_test_lane.py` が `python-test-core` の Python-only invariant と `python-test` 集約 job の `needs`/`if` 契約を、`scripts/ci/verify_ci_check_conclusions.py` が実 CI check conclusion + AC6 sentinel artifact を検証する
 - `python-test` の hook pytest は Python-only hook tests を継続実行し、Node-backed 2 nodeid は `--deselect=<exact nodeid>` で除外している
 - `node-backed-hook-tests` job が Node.js / pnpm 依存の hook wrapper 検証を専用に実行している
 - `ci_test_selection/v1` の split evidence は `ci_test_selection_summary_v1.json` で統合され、python-test 側 absent / node-backed 側 exactly 2 / union-disjointness を機械検証している
