@@ -77,6 +77,7 @@ RESULT_SCHEMA = "TERMINATION_REPORT_RENDER_RESULT_V1"
 # SSOT for the schema and the Routing Rules table is
 # .claude/skills/issue-refinement-loop/references/termination-policy.md
 LOOP_HANDOFF_MARKER = "<!-- LOOP_HANDOFF_RESULT_V1 -->"
+FOLLOW_UP_MATERIALIZATION_MARKER = "<!-- FOLLOW_UP_MATERIALIZATION_RESULT_V1 -->"
 LOOP_HANDOFF_SCHEMA_PATH = (
     _SKILLS_ROOT / "issue-refinement-loop" / "schemas" / "loop_handoff_result_v1.json"
 )
@@ -346,6 +347,38 @@ def _render_loop_handoff_marker(loop_handoff: dict[str, Any]) -> str:
         fence,
     ]
     return "\n".join(lines)
+
+
+def _render_empty_follow_up_materialization_marker() -> str:
+    """Render the canonical empty follow-up materialization result.
+
+    The termination policy requires this result for every terminal route.  A
+    no-candidate termination is still an explicit materialization outcome, so
+    both result arrays remain present rather than being omitted.
+    """
+    payload = {
+        "FOLLOW_UP_MATERIALIZATION_RESULT_V1": {
+            "schema_version": 1,
+            "materialized_by": "issue-refinement-loop",
+            "follow_up_issues": [],
+            "note_only_observations": [],
+        }
+    }
+    yaml_text = yaml.safe_dump(
+        payload,
+        sort_keys=False,
+        allow_unicode=True,
+        default_flow_style=False,
+    ).rstrip("\n")
+    fence = _make_dynamic_fence(yaml_text)
+    return "\n".join(
+        [
+            FOLLOW_UP_MATERIALIZATION_MARKER,
+            f"{fence}yaml",
+            yaml_text,
+            fence,
+        ]
+    )
 
 VALID_TERMINATION_REASONS = frozenset({
     "approved",
@@ -718,6 +751,7 @@ def render(data: dict[str, Any]) -> dict[str, Any]:
     body1 = _render_normal_template(data)
     if attach_loop_handoff_marker:
         body1 = body1 + "\n" + _render_loop_handoff_marker(loop_handoff) + "\n"
+    body1 = body1 + "\n" + _render_empty_follow_up_materialization_marker() + "\n"
     ok1, errs1 = _run_guard(body1)
     attempts_log.append({
         "attempt": 1,
@@ -748,6 +782,7 @@ def render(data: dict[str, Any]) -> dict[str, Any]:
     body2 = _render_fallback_minimal_template(data)
     if attach_loop_handoff_marker:
         body2 = body2 + "\n" + _render_loop_handoff_marker(loop_handoff) + "\n"
+    body2 = body2 + "\n" + _render_empty_follow_up_materialization_marker() + "\n"
     ok2, errs2 = _run_guard(body2)
     attempts_log.append({
         "attempt": 2,
