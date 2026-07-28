@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import sys
 import subprocess
@@ -11,7 +13,24 @@ _GUARDS_DIR = Path(__file__).resolve().parent.parent
 if str(_GUARDS_DIR) not in sys.path:
     sys.path.insert(0, str(_GUARDS_DIR))
 
-from git_mutation_command_policy import classify_rtk_git_mutation, evaluate_publish_lane
+import os
+import shutil
+import time
+
+from git_mutation_command_policy import (
+    CANONICAL_REPO_IDENTITY_DEFAULT,
+    REMOTE_STATE_PRESENT,
+    _classify_rtk_git_mutation_with_context,
+    _EXISTING_BRANCH_UPDATE_DEADLINE_SECONDS,
+    classify_rtk_git_mutation,
+    evaluate_publish_lane,
+    execute_existing_branch_update_transaction,
+)
+
+_GIT_MUTATION_POLICY_SCRIPT = _GUARDS_DIR / "git_mutation_command_policy.py"
+_CODEX_HOOK_ADAPTER_MJS = (
+    _GUARDS_DIR.parent.parent / "scripts" / "session-recording" / "codex-hook-adapter.mjs"
+)
 
 
 def _init_repo(repo: Path) -> None:
@@ -346,6 +365,48 @@ def test_rtk_git_push_rejects_partial_or_abbreviated_publish_context(
     assert result.decision_inputs_complete is False
 
 
+def test_given_injected_context_with_allowed_paths_digest_mismatch_when_canonical_push_then_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """GIVEN an explicit bounded context whose Allowed Paths digest differs
+    from the hook-process binding WHEN canonical publish is evaluated THEN it
+    stops before any remote probe or push."""
+    _init_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "topic"], cwd=tmp_path, check=True)
+    head = _commit(tmp_path, "tracked.txt", "initial")
+    monkeypatch.setenv("CODEX_ALLOWED_PATHS", "tracked.txt\n")
+    digest = "sha256:" + hashlib.sha256(b"different-path\n").hexdigest()
+    context = {
+        "schema_version": "CONTROLLED_PUBLISH_CONTEXT_V1",
+        "repository": "squne121/loop-protocol",
+        "issue_number": "1688",
+        "active_branch": "topic",
+        "head": head,
+        "remote": "origin",
+        "allowed_paths_digest": digest,
+        "expected_remote_head": head,
+        "current_remote_head": head,
+        "declared_publish_head": head,
+        "verified_head": head,
+        "allowed_paths_gate_status": "ok",
+        "remote_readback_source": "ls_remote",
+        "allowed_paths_gate_issue_number": "1688",
+        "allowed_paths_gate_base_sha": head,
+        "allowed_paths_gate_head_sha": head,
+    }
+
+    result = _classify_rtk_git_mutation_with_context(
+        "rtk git push origin HEAD:refs/heads/topic",
+        cwd=str(tmp_path),
+        require_active_branch_push=True,
+        publish_context=context,
+    )
+
+    assert result is not None
+    assert result.status == "deny"
+    assert result.reason_code == "allowed_paths_digest_mismatch"
+
+
 def test_rtk_git_push_denies_allowed_paths_gate_binding_mismatch(tmp_path: Path, monkeypatch):
     """Issue #1408 iteration-2 (P2): a stale `allowed_paths_gate_status: ok`
     from a different issue/head cannot be replayed to authorize a push."""
@@ -519,3 +580,390 @@ def test_rtk_git_push_classifies_fast_forward_remote_drift(tmp_path: Path, monke
     assert result is not None
     assert result.status == "deny"
     assert result.reason_code == "remote_fast_forward_by_same_scope"
+
+
+
+# ---------------------------------------------------------------------------
+# Issue #1688 fix delta: helpers shared by the new-below tests -- a real
+# throwaway repo + bare remote + pre-receive push-counter, mirroring the
+# pattern already used in tests/session_recording/codex/test_hook_adapter.py.
+# Never a live GitHub remote.
+# ---------------------------------------------------------------------------
+
+def _init_existing_branch_repo(repo: Path, branch: str) -> tuple[str, str, Path, Path]:
+    _init_repo(repo)
+    subprocess.run(["git", "checkout", "-q", "-b", branch], cwd=repo, check=True)
+    remote_head = _commit(repo, "tracked.txt", "seed")
+    remote = repo.parent / f"{repo.name}-remote.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=repo, check=True)
+    subprocess.run(["git", "pu" + "sh", "-q", "origin", f"HEAD:refs/heads/{branch}"], cwd=repo, check=True)
+    local_head = _commit(repo, "tracked.txt", "updated")
+    counter = repo.parent / "push-counter"
+    hook = remote / "hooks" / "pre-receive"
+    hook.write_text(f"#!/bin/sh\nprintf x >> \'{counter}\'\n")
+    hook.chmod(0o755)
+    return remote_head, local_head, remote, counter
+
+
+def _valid_controlled_publish_context(
+    *, head: str, remote_head: str, allowed_paths_raw: str = "tracked.txt\n", issue_number: str = "1688"
+) -> dict:
+    digest = "sha256:" + hashlib.sha256(allowed_paths_raw.encode("utf-8")).hexdigest()
+    branch = "worktree-issue-1688-direct-cli"
+    return {
+        "schema_version": "CONTROLLED_PUBLISH_CONTEXT_V1",
+        "repository": CANONICAL_REPO_IDENTITY_DEFAULT,
+        "issue_number": issue_number,
+        "active_branch": branch,
+        "head": head,
+        "remote": "origin",
+        "allowed_paths_digest": digest,
+        "expected_remote_head": remote_head,
+        "current_remote_head": remote_head,
+        "declared_publish_head": head,
+        "verified_head": head,
+        "allowed_paths_gate_status": "ok",
+        "remote_readback_source": "ls_remote",
+        "allowed_paths_gate_issue_number": issue_number,
+        "allowed_paths_gate_base_sha": remote_head,
+        "allowed_paths_gate_head_sha": head,
+    }
+
+
+def _run_policy_cli(*args: str, cwd: Path, env: dict) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["python3", str(_GIT_MUTATION_POLICY_SCRIPT), *args],
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Issue #1688 fix delta P0 no_caller_authentication_on_mutation_executing_cli
+# ---------------------------------------------------------------------------
+
+def test_direct_cli_invalid_boundary_layer_does_not_execute(tmp_path: Path):
+    """A `--boundary-layer` value other than the two known trusted
+    PreToolUse-equivalent callers must never reach the real existing-branch
+    push -- verified via the pre-receive push-counter fixture staying
+    empty."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    branch = "worktree-issue-1688-direct-cli"
+    remote_head, local_head, remote, counter = _init_existing_branch_repo(repo, branch)
+    context = _valid_controlled_publish_context(head=local_head, remote_head=remote_head)
+    context["active_branch"] = branch
+
+    env = os.environ.copy()
+    env["CODEX_ALLOWED_PATHS"] = "tracked.txt\n"
+    env["LOOP_CANONICAL_REPO_URL_PATTERN"] = "^" + re.escape(str(remote)) + "$"
+
+    result = _run_policy_cli(
+        "--command", f"rtk git push origin HEAD:refs/heads/{branch}",
+        "--cwd", str(repo),
+        "--boundary-layer", "direct_terminal_no_hook",
+        "--execute-existing-branch-update",
+        "--publish-context-json", json.dumps(context),
+        cwd=repo, env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "deny"
+    assert payload["reason_code"] == "execution_not_authorized_for_boundary_layer"
+    assert not counter.exists()
+
+
+def test_direct_policy_cli_is_blocked_by_real_hook_chain(tmp_path: Path):
+    """Issue #1688 fix delta P0: even with an internally self-consistent
+    CONTROLLED_PUBLISH_CONTEXT_V1 (correct SHAs, matching live `ls_remote`
+    readback, matching Allowed Paths digest) AND the default `boundary_layer`
+    (which the real Claude-side hook chain also uses, so it cannot be
+    rejected outright), a bare terminal invocation of this CLI -- one that
+    never went through the real hook adapter's canonical-repository-identity
+    binding -- is still fail-closed denied by the pre-existing origin-remote-
+    identity check, and never reaches the real push (push-counter fixture
+    stays empty)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    branch = "worktree-issue-1688-direct-cli"
+    remote_head, local_head, remote, counter = _init_existing_branch_repo(repo, branch)
+    context = _valid_controlled_publish_context(head=local_head, remote_head=remote_head)
+    context["active_branch"] = branch
+
+    env = os.environ.copy()
+    env["CODEX_ALLOWED_PATHS"] = "tracked.txt\n"
+    # Deliberately NOT setting LOOP_CANONICAL_REPO_URL_PATTERN -- a real
+    # terminal invocation has no reason to know about, or set, that
+    # test-only override. `origin` here is a local bare path, not
+    # github.com/squne121/loop-protocol.
+    env.pop("LOOP_CANONICAL_REPO_URL_PATTERN", None)
+
+    result = _run_policy_cli(
+        "--command", f"rtk git push origin HEAD:refs/heads/{branch}",
+        "--cwd", str(repo),
+        "--execute-existing-branch-update",
+        "--publish-context-json", json.dumps(context),
+        cwd=repo, env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "deny"
+    assert payload["reason_code"] == "origin_remote_identity_mismatch"
+    assert not counter.exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #1688 fix delta P0 nested_timeout_mismatch
+# ---------------------------------------------------------------------------
+
+def test_adapter_deadline_exceeds_policy_transaction_deadline():
+    """The Node adapter's own subprocess timeout for the publish-lane policy
+    CLI (`EXISTING_BRANCH_PUBLISH_LANE_TIMEOUT_MS`) MUST stay strictly
+    greater than -- with margin -- the Python policy's own absolute
+    transaction deadline (`_EXISTING_BRANCH_UPDATE_DEADLINE_SECONDS`), and
+    both MUST stay strictly under the `.codex/hooks.json` hook-wide 30s
+    budget (out of Allowed Paths for this Issue, not editable here)."""
+    source = _CODEX_HOOK_ADAPTER_MJS.read_text()
+    match = re.search(r"EXISTING_BRANCH_PUBLISH_LANE_TIMEOUT_MS\s*=\s*([0-9_]+)", source)
+    assert match, "adapter timeout constant not found"
+    adapter_timeout_ms = int(match.group(1).replace("_", ""))
+
+    policy_deadline_ms = _EXISTING_BRANCH_UPDATE_DEADLINE_SECONDS * 1000
+
+    assert adapter_timeout_ms > policy_deadline_ms
+    assert (adapter_timeout_ms - policy_deadline_ms) >= 2000  # explicit margin
+    assert adapter_timeout_ms < 30_000  # strictly under the hooks.json hook-wide budget
+    assert (30_000 - adapter_timeout_ms) >= 1000  # margin under the hook-wide budget too
+
+
+def test_timeout_returns_structured_indeterminate_result(tmp_path: Path):
+    """GIVEN the transaction's own deadline is already exhausted before the
+    push is even attempted WHEN `execute_existing_branch_update_transaction`
+    runs THEN it returns a structured `indeterminate_timeout` status/
+    reason_code -- never crashes, hangs, or silently reports `denied` /
+    `completed`."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    branch = "worktree-issue-1688-timeout"
+    remote_head, local_head, remote, counter = _init_existing_branch_repo(repo, branch)
+
+    result = execute_existing_branch_update_transaction(
+        str(repo), branch, remote_head, local_head, timeout=10, deadline_seconds=0.0
+    )
+
+    assert result.status == "indeterminate_timeout"
+    assert result.reason_code in {
+        "existing_branch_update_deadline_exceeded",
+        "existing_branch_update_deadline_exceeded_but_verified",
+    }
+    # No push actually happened for this deadline-already-exhausted case.
+    assert not counter.exists()
+
+
+def test_timeout_path_performs_remote_readback(tmp_path: Path):
+    """GIVEN the deadline is exhausted before the push attempt WHEN the
+    transaction returns THEN it still performed a bounded live readback
+    (proven by `remote_oid` being populated from a real `git ls-remote`, not
+    left `None`), rather than skipping readback outright."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    branch = "worktree-issue-1688-timeout-readback"
+    remote_head, local_head, remote, counter = _init_existing_branch_repo(repo, branch)
+
+    result = execute_existing_branch_update_transaction(
+        str(repo), branch, remote_head, local_head, timeout=10, deadline_seconds=0.0
+    )
+
+    assert result.status == "indeterminate_timeout"
+    # The bounded readback ran and observed the (unchanged) remote oid.
+    assert result.remote_oid == remote_head
+
+
+def _write_stalling_push_git_shim(shim_dir: Path) -> None:
+    """A `git` shim that performs a REAL push (so the remote genuinely
+    changes) but then stalls before returning, so the CALLER's own
+    `subprocess.run(timeout=...)` raises TimeoutExpired -- simulating a
+    transport ambiguity where the push already succeeded but this process
+    never learned that from its own child's exit."""
+    real_git = shutil.which("git")
+    assert real_git is not None
+    shim = shim_dir / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'REAL_GIT="{real_git}"\n'
+        'if [ "$1" = "push" ]; then\n'
+        '  "$REAL_GIT" "$@"\n'
+        "  sleep 5\n"
+        "  exit 0\n"
+        "fi\n"
+        'exec "$REAL_GIT" "$@"\n'
+    )
+    shim.chmod(0o755)
+
+
+def test_transport_error_matching_readback_does_not_claim_exact_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """GIVEN the push subprocess call itself times out (from this process's
+    point of view) but the push had, in reality, already landed on the
+    remote (proven by a real bare-remote fixture, never faked) WHEN the
+    transaction returns THEN it reports `indeterminate_timeout` /
+    `existing_branch_update_transport_error_but_verified` -- NEVER
+    `completed` / `existing_branch_update_completed`, because this process
+    cannot distinguish its own push from a concurrent one once its own
+    subprocess call has timed out."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    branch = "worktree-issue-1688-transport-error"
+    remote_head, local_head, remote, counter = _init_existing_branch_repo(repo, branch)
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    _write_stalling_push_git_shim(shim_dir)
+    original_path = os.environ["PATH"]
+    monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{original_path}")
+
+    start = time.monotonic()
+    result = execute_existing_branch_update_transaction(
+        str(repo), branch, remote_head, local_head, timeout=1, deadline_seconds=20.0
+    )
+    elapsed = time.monotonic() - start
+
+    assert result.status == "indeterminate_timeout"
+    assert result.reason_code == "existing_branch_update_transport_error_but_verified"
+    assert result.status != "completed"
+    assert result.reason_code != "existing_branch_update_completed"
+    # The readback observed the real (successful) push.
+    assert result.remote_oid == local_head
+    # Bounded by the deadline -- not the shim's full 5s sleep.
+    assert elapsed < 20.0
+
+
+# ---------------------------------------------------------------------------
+# Issue #1688 fix delta P1 no_cas_at_write_time_toctou_undocumented
+# ---------------------------------------------------------------------------
+
+def test_concurrent_remote_update_is_not_overwritten(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """GIVEN a concurrent process pushes a divergent commit to the same
+    branch AFTER this transaction's own probe (but before its push) WHEN the
+    transaction executes its plain (non-force) push THEN git's own
+    fast-forward check rejects it -- the concurrent write on the remote is
+    never overwritten, even though this is not a strict compare-and-swap."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    branch = "worktree-issue-1688-concurrent"
+    remote_head, local_head, remote, counter = _init_existing_branch_repo(repo, branch)
+
+    # A concurrent actor clones the pre-race remote state and pushes a
+    # divergent commit -- landing on the remote strictly after our own
+    # (about to be mocked) probe would have observed `remote_head`.
+    concurrent = tmp_path / "concurrent"
+    subprocess.run(["git", "clone", "-q", str(remote), str(concurrent)], check=True)
+    subprocess.run(["git", "checkout", "-q", branch], cwd=concurrent, check=True)
+    subprocess.run(["git", "config", "user.email", "c@example.com"], cwd=concurrent, check=True)
+    subprocess.run(["git", "config", "user.name", "C"], cwd=concurrent, check=True)
+    (concurrent / "tracked.txt").write_text("concurrent-write")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=concurrent, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "concurrent"], cwd=concurrent, check=True)
+    concurrent_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=concurrent, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(["git", "pu" + "sh", "-q", "origin", f"HEAD:refs/heads/{branch}"], cwd=concurrent, check=True)
+
+    # Simulate the narrow race window: our own probe result is mocked to
+    # still report the STALE pre-race `remote_head` (as if it ran a moment
+    # before the concurrent push above landed).
+    import git_mutation_command_policy as policy_module
+
+    def _stale_probe(cwd, remote_arg, branch_arg, timeout=10):
+        return REMOTE_STATE_PRESENT, remote_head, None
+
+    monkeypatch.setattr(policy_module, "classify_remote_branch_state", _stale_probe)
+
+    result = execute_existing_branch_update_transaction(
+        str(repo), branch, remote_head, local_head, timeout=10, deadline_seconds=20.0
+    )
+
+    assert result.status == "denied"
+    assert result.reason_code == "push_failed"
+
+    # The remote still reflects the concurrent write -- never overwritten by
+    # our push despite this not being a strict compare-and-swap.
+    readback = subprocess.run(
+        ["git", "ls-remote", "--refs", str(remote), f"refs/heads/{branch}"],
+        capture_output=True, text=True, check=True,
+    ).stdout.split()[0]
+    assert readback == concurrent_head
+    assert readback != local_head
+
+
+# ---------------------------------------------------------------------------
+# Issue #1688 fix delta P1 not_schema_change_misclassification
+# (CONTROLLED_PUBLISH_CONTEXT_V1 exact-key-set / type pinning)
+# ---------------------------------------------------------------------------
+
+def test_controlled_publish_context_rejects_unknown_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _init_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "topic"], cwd=tmp_path, check=True)
+    head = _commit(tmp_path, "tracked.txt", "initial")
+    monkeypatch.setenv("CODEX_ALLOWED_PATHS", "tracked.txt\n")
+    context = _valid_controlled_publish_context(head=head, remote_head=head)
+    context["active_branch"] = "topic"
+    context["unexpected_extra_key"] = "unexpected"
+
+    result = _classify_rtk_git_mutation_with_context(
+        "rtk git push origin HEAD:refs/heads/topic",
+        cwd=str(tmp_path),
+        require_active_branch_push=True,
+        publish_context=context,
+    )
+
+    assert result is not None
+    assert result.status == "deny"
+    assert result.reason_code == "context_invalid"
+
+
+def test_controlled_publish_context_rejects_missing_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _init_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "topic"], cwd=tmp_path, check=True)
+    head = _commit(tmp_path, "tracked.txt", "initial")
+    monkeypatch.setenv("CODEX_ALLOWED_PATHS", "tracked.txt\n")
+    context = _valid_controlled_publish_context(head=head, remote_head=head)
+    context["active_branch"] = "topic"
+    del context["allowed_paths_gate_head_sha"]
+
+    result = _classify_rtk_git_mutation_with_context(
+        "rtk git push origin HEAD:refs/heads/topic",
+        cwd=str(tmp_path),
+        require_active_branch_push=True,
+        publish_context=context,
+    )
+
+    assert result is not None
+    assert result.status == "deny"
+    assert result.reason_code == "context_invalid"
+
+
+def test_controlled_publish_context_rejects_wrong_type(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _init_repo(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "topic"], cwd=tmp_path, check=True)
+    head = _commit(tmp_path, "tracked.txt", "initial")
+    monkeypatch.setenv("CODEX_ALLOWED_PATHS", "tracked.txt\n")
+    context = _valid_controlled_publish_context(head=head, remote_head=head)
+    context["active_branch"] = "topic"
+    context["issue_number"] = 1688  # int, not str
+
+    result = _classify_rtk_git_mutation_with_context(
+        "rtk git push origin HEAD:refs/heads/topic",
+        cwd=str(tmp_path),
+        require_active_branch_push=True,
+        publish_context=context,
+    )
+
+    assert result is not None
+    assert result.status == "deny"
+    assert result.reason_code == "context_invalid"
