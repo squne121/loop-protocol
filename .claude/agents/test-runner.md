@@ -127,9 +127,14 @@ gh pr view <PR番号> --json mergeable,mergeStateStatus
 
 contract snapshot で「動作検証 VC」として指定されたスクリプトは、worktree-local の `artifacts/` 配下への出力を許可する。test-runner 自体は書き込みを行わないが、VC スクリプトが artifact を生成する場合は実行後に存在を確認して報告する。
 
-## TEST_VERDICT 報告フォーマット
+## TEST_VERDICT 報告フォーマット（read-only report）
 
-PR コメントに以下を含める。machine-readable marker と YAML ブロックにより、`pr-review-judge` / `impl-review-loop` が機械的に parse できる。
+test-runner は本フォーマットを **呼び出し元への read-only report として返すのみ**であり、PR へのコメント投稿は行わない（Issue #1648）。実際の PR 投稿は以下の2段を経由する:
+
+1. **materializer**（`.claude/skills/impl-review-loop/scripts/materialize_test_verdict_artifact.py`）が、この read-only report と Child A（#1646）の producer receipt・execution record artifact、Child B（#1647）の `test_verdict.publish` request 相当の入力を突き合わせ、current Issue/PR/HEAD/body SHA/artifact digest binding を検証した上で `TEST_VERDICT_MACHINE/v2` input bundle を生成する。
+2. **dedicated publisher**（`scripts/agent-guards/controlled_skill_mutation_exec.py` の `test_verdict.publish` コマンド、Child B）が、その input bundle 由来の publish request のみを受け付けて実際に PR へコメントを投稿する。
+
+以下は read-only report の内容（machine-readable marker と YAML ブロックにより、`pr-review-judge` / `impl-review-loop` / materializer が機械的に parse できる形式）:
 
 ```
 <!-- TEST_VERDICT_MACHINE v2 -->
@@ -196,13 +201,13 @@ TEST_VERDICT:
 
 ### CI artifact / public verdict fail-closed protocol（AC7）
 
-`pr_review_only` の PASS を投稿する前に、test-runner は次を同じ current PR head に束縛して確認する。
+`pr_review_only` の PASS を **materializer が生成する input bundle に含める前に**、test-runner の read-only report は次を同じ current PR head に束縛して確認しておく（Issue #1648: 実際の投稿判断・producer receipt binding は materializer / dedicated publisher の責務であり、test-runner 自身は投稿を行わない）。
 
 1. GitHub API で exact workflow run / CheckRun / artifact を readback し、artifact JSON の `expected_head_sha` と各 required CheckRun の `head_sha` が current PR head と一致し、各 `check_run_id` が正の GitHub CheckRun ID であることを確認する。`TEST_VERDICT.check_run_id` には、**current workflow run の `ci-verdict-summary` CheckRun ID**を artifact/readback から採用する。旧run・旧head・null/stale head・null ID・unknown classification、または `blocking_merge_ready: true` が1件でもあれば FAIL とする。
 2. artifact JSON が `overall_status: merge_ready` かつ `next_action: none` であることを確認する。artifact の ZIP digest は Actions API 値と一致させる。
 3. 投稿する `artifact_payload` は、Issue番号、PR番号、3種のhead、contract body SHA、**全 VC の command hash**から canonical JSON（sorted keys / compact separators / UTF-8）で1回だけ生成する。`artifact_payload_sha256` はその実値の64桁hex SHA-256 と一致しなければならない。
 4. `runtime_ac_results` は全 VC を被覆し、各行で `status: pass`、`exit_code: 0`、`fallback_detected: false`、`human_review_required: false`、`stop_condition_triggered: false` を満たす場合だけ PASS を許可する。
-5. 投稿後に PR コメントと GitHub API artifact を readback し、artifact identity/digest、canonical payload hash、contract body SHA、current head、全 command hash が投稿済み `TEST_VERDICT_MACHINE/v2` と一致することを再検証する。不一致なら投稿を merge 根拠に使わず fail-closed とする。
+5. 投稿後の再検証（PR コメントと GitHub API artifact の readback、artifact identity/digest・canonical payload hash・contract body SHA・current head・全 command hash の一致確認）は dedicated publisher（`test_verdict.publish`）側の責務。不一致なら投稿を merge 根拠に使わず fail-closed とする。
 
 ## 出力形式
 
@@ -235,6 +240,7 @@ TEST_VERDICT:
 - Allowed Paths 外のファイル変更
 - git 操作（add / commit / push / checkout）
 - AC リストや Verification Commands の推測補完（欠落時は即停止）
+- PR / Issue へのコメント投稿（raw comment を正規経路にしない。read-only report を返すのみで、実際の投稿は materializer が生成する bundle を経由した dedicated publisher `test_verdict.publish` の責務、Issue #1648）
 
 ## 出力制約 (OUTPUT_BUDGET_V1)
 

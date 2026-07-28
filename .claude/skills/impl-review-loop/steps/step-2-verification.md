@@ -19,11 +19,21 @@ inputs:
   diff_head_sha: <diff summaryのhead_sha>
 ```
 
-SubAgent 側は `.claude/agents/test-runner.md` の手順を実行し、Verification Commands を実行して `TEST_VERDICT_MACHINE v2` マーカー付きコメントを PR に投稿する。
+SubAgent 側は `.claude/agents/test-runner.md` の手順を実行し、Verification Commands を実行して結果を **read-only report として呼び出し元へ返す**。test-runner は PR へのコメント投稿を行わない（Issue #1648）。
+
+## read-only report -> materializer -> dedicated publisher の3段構成（Issue #1648）
+
+`pr_review_only` を含む VC adjudication で current-head PASS を主張するには、以下の3段を経由する。raw comment（自己申告 JSON をそのまま PR へ貼るだけの経路）は正規経路ではない。
+
+1. **test-runner（read-only report）**: Verification Commands を実行し、AC ごとの PASS/FAIL/SKIP と mergeable 状態を read-only report として返す（PR への書き込み・投稿は行わない）。
+2. **materializer（`.claude/skills/impl-review-loop/scripts/materialize_test_verdict_artifact.py`）**: Child A（#1646）の producer receipt（`schemas/test-verdict-producer-receipt.schema.json`）と実際にダウンロードした execution record artifact、Child B（#1647）の `test_verdict.publish` request 相当の入力を受け取り、current Issue/PR/HEAD/body SHA/artifact digest binding を独立に検証する。binding を満たす場合のみ `TEST_VERDICT_MACHINE/v2` input bundle と private/audit bundle を生成する（満たさない場合は fail-closed で何も生成しない）。
+3. **dedicated publisher（`scripts/agent-guards/controlled_skill_mutation_exec.py` の `test_verdict.publish` コマンド、Child B）**: materializer が生成した input bundle 由来の publish request のみを受け付け、PR へ実際にコメントを投稿する。
+
+`adjudicate_vc_result.py` は、materializer が生成した bundle を評価する際は `--require-producer-receipt` を指定して呼び出す。これにより producer receipt・artifact bytes digest・repository identity を検証しない handwritten TEST_VERDICT は fail-closed で拒否される（`--require-producer-receipt` を指定しない legacy 呼び出しは、既存の self-attested TEST_VERDICT 経路の後方互換のため従来通り動作する）。
 
 ## 受け取り結果の期待値
 
-test-runner が PR コメントに投稿する `TEST_VERDICT` YAML:
+materializer が生成し dedicated publisher が投稿する `TEST_VERDICT` YAML（producer_receipt / receipt_sha256 を含む）:
 
 ```yaml
 TEST_VERDICT:
@@ -59,9 +69,11 @@ TEST_VERDICT:
   baseline_only: true | false
   verification_commands_pass: <int>
   verification_commands_fail: <int>
+  producer_receipt: <Child A TEST_VERDICT_PRODUCER_RECEIPT_V1、materializer が埋め込む>
+  receipt_sha256: "sha256:<canonical producer_receipt SHA256>"
 ```
 
-`pr_review_only` を baseline comparison から除外する adjudication では、`adjudicate_vc_result.py --test-verdict-file <TEST_VERDICT_MACHINE/v2 JSON>` に GitHub API readback 済みの artifact とこの実行済み証跡を渡す。adjudicator は producer/repository、Issue/PR、current/reviewed/diff HEAD、contract body SHA、run ID/URL、workflow/check run、artifact digest と payload binding、全対象ACの command hash と PASS/exit 0/no fallback/no skip を検証し、欠落または不一致なら fail-closed とする。PASS は正規VCと `pr_review_only` 除外VCを含む非空の `per_ac` coverage を必須とする。
+`pr_review_only` を baseline comparison から除外する adjudication では、`adjudicate_vc_result.py --test-verdict-file <TEST_VERDICT_MACHINE/v2 JSON> --require-producer-receipt` に materializer が生成した bundle を渡す。adjudicator は producer/repository、Issue/PR、current/reviewed/diff HEAD、contract body SHA、run ID/URL、workflow/check run、artifact digest と payload binding、全対象ACの command hash と PASS/exit 0/no fallback/no skip に加え、`producer_receipt` のフルスキーマ検証・`receipt_sha256` 一致・`pass_eligible: true`・artifact digest の receipt 側との一致を検証し、欠落または不一致なら fail-closed とする。PASS は正規VCと `pr_review_only` 除外VCを含む非空の `per_ac` coverage を必須とする。
 
 `TEST_VERDICT` は Step 2 の実行結果を示すみにし、`baseline_only` は**routing の正本ではない**。
 `baseline_only` は `adjudicate_vc_result.py` の evidence input としてのみ扱い、`VC_ADJUDICATION_RESULT_V1` の評価に渡す。
@@ -99,3 +111,7 @@ branch の更新（`gh pr update-branch` 等）は Step 5 および `#67` の責
 ## 出力
 
 LOOP_STATE.last_step = "verification" に更新し、`VC_ADJUDICATION_RESULT_V1` を会話履歴に保持して次ステップへ。
+
+## #88 との関係（Issue #1648 AC5）
+
+`#88`（Step 2/4 の docs-only 責務記述）は、本ドキュメントが定める read-only report -> materializer -> dedicated publisher の実装経路によって実現された。`#88` 自体のクローズは本 Issue（#1648）のマージ後、merged readback を前提とした supersede close の対象として別途判断する（本ドキュメント更新自体は `#88` を自動でクローズしない）。

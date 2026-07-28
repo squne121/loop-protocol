@@ -43,6 +43,32 @@ _ALLOWED_PATHS_GATE_PATH = (
 )
 _ALLOWED_PATHS_MATCHER = None
 
+# Issue #1648: receipt-aware verification of Child A
+# (TEST_VERDICT_PRODUCER_RECEIPT_V1) provenance embedded in a
+# TEST_VERDICT_MACHINE/v2 input. Only consulted when the caller opts in via
+# require_producer_receipt=True (adjudicate_vc_result()) /
+# --require-producer-receipt (CLI) -- the legacy self-attested TEST_VERDICT
+# path (no producer_receipt field checked) is left unchanged so existing
+# non-regression fixtures keep passing (Issue #1648 body).
+_PRODUCER_RECEIPT_SCHEMA_PATH = _REPO_ROOT / "schemas" / "test-verdict-producer-receipt.schema.json"
+_PRODUCER_RECEIPT_VALIDATOR = None
+
+
+def _get_producer_receipt_validator():
+    global _PRODUCER_RECEIPT_VALIDATOR
+    if _PRODUCER_RECEIPT_VALIDATOR is not None:
+        return _PRODUCER_RECEIPT_VALIDATOR, None
+    try:
+        from jsonschema import Draft202012Validator
+    except Exception as exc:  # pragma: no cover
+        return None, f"jsonschema_unavailable:{type(exc).__name__}"
+    try:
+        schema = json.loads(_PRODUCER_RECEIPT_SCHEMA_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, f"producer_receipt_schema_unreadable:{type(exc).__name__}"
+    _PRODUCER_RECEIPT_VALIDATOR = Draft202012Validator(schema)
+    return _PRODUCER_RECEIPT_VALIDATOR, None
+
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -337,6 +363,7 @@ def _test_verdict_binding_error(
     current_vc_result: Any,
     diff_summary: Any,
     expected_keys: set[tuple[str, str]],
+    require_producer_receipt: bool = False,
 ) -> str | None:
     """Return a fail-closed reason unless runtime execution evidence is bound."""
     if not isinstance(test_verdict, dict):
@@ -447,6 +474,37 @@ def _test_verdict_binding_error(
             return f"test_verdict_runtime_ac_not_executed_pass:{ac}"
     if observed_keys != expected_keys:
         return "test_verdict_runtime_ac_coverage_mismatch"
+
+    if require_producer_receipt:
+        receipt = test_verdict.get("producer_receipt")
+        if not isinstance(receipt, dict):
+            return "test_verdict_producer_receipt_missing"
+        validator, validator_error = _get_producer_receipt_validator()
+        if validator is None:
+            return f"test_verdict_producer_receipt_validator_unavailable:{validator_error}"
+        if list(validator.iter_errors(receipt)):
+            return "test_verdict_producer_receipt_schema_invalid"
+        receipt_sha256 = test_verdict.get("receipt_sha256")
+        if receipt_sha256 != _sha256(_canonical_json(receipt)):
+            return "test_verdict_receipt_sha256_mismatch"
+        if receipt.get("pass_eligible") is not True:
+            return "test_verdict_receipt_not_pass_eligible"
+        receipt_subject = receipt.get("subject")
+        if not isinstance(receipt_subject, dict) or receipt_subject.get("pr_head_sha") != test_verdict.get("head_sha"):
+            return "test_verdict_receipt_subject_head_sha_mismatch"
+        if receipt_subject.get("target_pr_number") != test_verdict.get("pr_number"):
+            return "test_verdict_receipt_subject_pr_number_mismatch"
+        receipt_contract = receipt.get("contract")
+        if not isinstance(receipt_contract, dict) or receipt_contract.get("linked_issue_number") != test_verdict.get(
+            "issue_number"
+        ):
+            return "test_verdict_receipt_contract_issue_number_mismatch"
+        if receipt_contract.get("issue_body_sha256") != test_verdict.get("contract_body_sha256"):
+            return "test_verdict_receipt_contract_body_sha256_mismatch"
+        receipt_artifact = receipt.get("execution_artifact")
+        if not isinstance(receipt_artifact, dict) or receipt_artifact.get("artifact_archive_digest") != artifact_digest:
+            return "test_verdict_receipt_artifact_digest_mismatch"
+
     return None
 
 
@@ -772,6 +830,7 @@ def adjudicate_vc_result(
     diff_summary: dict[str, Any] | None,
     allowed_paths: list[str] | None,
     test_verdict: Any | None = None,
+    require_producer_receipt: bool = False,
 ) -> dict[str, Any]:
     baseline_items, baseline_errors, baseline_schema = _normalize_list_payload(contract_snapshot)
     current_items, current_errors, _ = _normalize_list_payload(current_vc_result)
@@ -905,6 +964,7 @@ def adjudicate_vc_result(
             current_vc_result=current_vc_result,
             diff_summary=diff_summary,
             expected_keys=set(baseline_by_key) | excluded_pr_review_only_keys,
+            require_producer_receipt=require_producer_receipt,
         )
         if binding_error is not None:
             return _result(
@@ -1089,6 +1149,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--diff-summary-file")
     parser.add_argument("--allowed-paths-file")
     parser.add_argument("--test-verdict-file")
+    parser.add_argument(
+        "--require-producer-receipt",
+        action="store_true",
+        help=(
+            "Issue #1648: reject a pr_review_only test_verdict unless it embeds a "
+            "schema-valid Child A producer_receipt bound to its own head_sha/pr_number/"
+            "issue_number/contract_body_sha256/artifact digest. Legacy self-attested "
+            "TEST_VERDICT input (no producer_receipt) stays accepted when this flag is "
+            "absent."
+        ),
+    )
     parser.add_argument("--artifact-out")
     parser.add_argument("--max-stdout-bytes", type=int, default=4096)
     return parser.parse_args(argv)
@@ -1123,6 +1194,7 @@ def main(argv: list[str] | None = None) -> int:
         diff_summary=diff_summary,
         allowed_paths=allowed_paths,
         test_verdict=test_verdict,
+        require_producer_receipt=args.require_producer_receipt,
     )
     result["errors"].extend(contract_errors or [])
     result["errors"].extend(current_errors or [])
