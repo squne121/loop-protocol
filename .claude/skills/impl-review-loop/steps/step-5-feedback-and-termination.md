@@ -137,15 +137,21 @@ branch publish が hook / approval 境界または remote head drift で止ま�
 4. `status: allow_retry` の場合だけ bounded publish command を再試行する
 5. 不一致時は `PUBLISH_SAFETY_STOP_REPORT_V1` を残し、manual remote update や force update に暗黙フォールバックしない
 
-strict publish lane を hook 側で再利用する場合は、以下の env binding を与える。
+strict publish lane を Codex hook 側で再利用する場合、terminal command に env binding を付けない。
+repo-approved `codex-hook-adapter.mjs` が hook process と fresh git probe から
+`CONTROLLED_PUBLISH_CONTEXT_V1` を生成し、policy CLI へ invocation-scoped JSON として注入する。
+canonical existing-branch push は policy の controlled transaction が 1 回だけ実行して readback を確認し、
+外側の shell command は deny して二重実行を防ぐ。`env LOOP_PUBLISH_...=... rtk git push ...` は
+`context_invalid` として fail-closed に扱う。
 
 ```yaml
-LOOP_PUBLISH_EXPECTED_REMOTE_HEAD: "<sha>"
-LOOP_PUBLISH_CURRENT_REMOTE_HEAD: "<sha>"
-LOOP_PUBLISH_DECLARED_PUBLISH_HEAD: "<sha>"
-LOOP_PUBLISH_VERIFIED_HEAD: "<sha>"
-LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS: "ok|fail_closed|indeterminate"
-LOOP_PUBLISH_REMOTE_READBACK_SOURCE: "ls_remote|github_branch_api|fetch_then_show_ref"
+CONTROLLED_PUBLISH_CONTEXT_V1:
+  repository: "squne121/loop-protocol"
+  issue_number: "<issue-number>"
+  active_branch: "<active-branch>"
+  head: "<local-head-sha>"
+  remote: "origin"
+  allowed_paths_digest: "sha256:<digest>"
 ```
 
 ```yaml
