@@ -21,7 +21,7 @@ inputs:
 
 SubAgent 側は `.claude/agents/test-runner.md` の手順を実行し、Verification Commands を実行して結果を **read-only report として呼び出し元へ返す**。test-runner は PR へのコメント投稿を行わない（Issue #1648）。
 
-## read-only report -> materializer -> dedicated publisher の3段構成（Issue #1648）
+## 読み取り専用レポート -> materializer -> 専用publisherの3段構成（Issue #1648）
 
 `pr_review_only` を含む VC adjudication で current-head PASS を主張するには、以下の3段を経由する。raw comment（自己申告 JSON をそのまま PR へ貼るだけの経路）は正規経路ではない。
 
