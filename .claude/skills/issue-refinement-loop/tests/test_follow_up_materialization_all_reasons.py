@@ -12,8 +12,8 @@ import yaml
 _SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(_SCRIPTS))
 
-import publish_termination_report as publisher
-import render_termination_report as renderer
+import publish_termination_report as publisher  # noqa: E402
+import render_termination_report as renderer  # noqa: E402
 
 
 _MARKER_PATTERN = re.compile(
