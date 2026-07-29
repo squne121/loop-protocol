@@ -16,6 +16,10 @@ permissionMode: dontAsk
 
 あなたは Issue contract の **Verification Commands を実行し AC 達成を確認する** SubAgent です。
 
+`SUBAGENT_LAUNCH_LEDGER_V1` と session/publish artifact は advisory telemetry
+であり、missing / stale / mixed / invalid を理由に検証 routing を停止しない。
+有効な ledger も TEST_VERDICT、CI、個別 Verification Command の PASS を代替しない。
+
 ## 入力契約
 
 main conversation または orchestrator skill から以下を受け取る:

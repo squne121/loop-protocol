@@ -234,17 +234,25 @@ implementation_triage_profile:
 
 ### Hard gate（強制ゲート）
 
-以下をすべて満たした場合のみ着手できる。
+着手権限は取得時点の Issue と正規の連結作業ツリー識別情報に置く。
+スコープ集約、重複確認、契約スナップショット、本文 SHA、起動台帳、セッション記録、
+公開文脈、制御 executor の成果物は前提条件ではない。欠落、古い状態、不正、混在、
+形式不良、フック未実行はいずれも警告に留める。
 
-- `issue-contract-review` が `status: go` を返していること
-  - この判定には DoR 準拠・VC preflight・GitHub native dependency または `Depends on #N` で表現された blocker / dependency の全 close・human escalation 非該当の確認を含む（詳細は `issue-contract-review` skill 参照）
-- `state/needs-human` 等の human escalation 条件が残っていないこと
+Codex のコマンド強制はリポジトリ内フックを権限根拠とせず、標準の隔離環境と
+承認機構による `managed configuration` を正本とする。隔離済みの事前ツール実行
+ガードについて `enforcement 再導入` を行う場合は、別 Issue で公式実行環境の
+到達性と閉鎖的失敗契約を再検証してから管理対象設定として導入する。
+安全停止は root checkout、detached HEAD、dirty worktree、Issue/branch mismatch、
+Allowed Paths 違反、実テスト・CI・PR review failure に基づく。
 
 ### Codex custom-agent dispatch guardrail（Codex custom-agent 委譲ガードレール）
 
 - Codex CLI では `impl-review-loop` / `post-merge-cleanup` の root thread は control-plane のみを担当し、data-plane 操作は明示 spawn した custom agent に委譲する
-- repo-side deterministic guardrail の正本は `.codex/agents/*.toml`、`.codex/hooks.json`、dispatch validator、`SUBAGENT_LAUNCH_LEDGER_V1` fixture 群、`--audit-mode` で監査する generated ledger artifact とする
-- live spawn 実証は別スコープの `#601` に deferred し、本 workflow では evidence 不足時に fail-closed する repo-side 監査を成功条件にする
+- `.codex/agents/*.toml` と dispatch validator は設定整合性の検査に使える。
+  `SUBAGENT_LAUNCH_LEDGER_V1` は advisory telemetry のみで、missing/invalid を
+  routing stop にせず、PASS・承認・CI・review・merge readiness の証拠にしない。
+- parallel-safe ledger V2 は別 Issue で再設計し、未実装を通常 workflow の停止理由にしない。
 
 ### human_escalation 後の Issue 本文変更と contract review 再実行
 

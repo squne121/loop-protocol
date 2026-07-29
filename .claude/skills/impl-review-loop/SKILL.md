@@ -4,18 +4,26 @@ description: >-
   implementation child issue を **実装→検証→PR レビュー** の 3 ステップループで自律完了させるオーケストレーター。
   Issue 番号を受け取り、pr-reviewer の LOOP_VERDICT が APPROVE になるまで反復する。
   `/impl-review-loop <N>` または「Issue ◯◯ をループで実装して」のトリガーで使う。
-  着手前に `docs/dev/workflow.md` の「Issue contract を作業計画の正本として扱う条件」と
-  `issue-contract-review` の `status: go` を確認する。
+  着手前に `docs/dev/workflow.md` の通常 workflow safety boundary を確認する。
 ---
 
 # Impl Review Loop
+
+## Advisory artifact policy（助言的 artifact の方針、Issue #1830）
+
+scope-rollup、overlap、contract snapshot、body SHA、launch ledger、
+session manifest、publish context、controlled-executor receipt は観測情報であり、
+存在・freshness・identity・digest の欠落や不正を routing の停止条件にしない。
+`SUBAGENT_LAUNCH_LEDGER_V1` は warning のみで、PASS、承認、merge readiness の
+証拠として使用禁止とする。routing は live Issue、linked worktree の
+cwd/branch/HEAD/dirty state、Allowed Paths、実テスト、CI、PR review に基づける。
 
 implementation child issue を **実装 → 検証 → PR レビュー** の 3 ステップループで自律完了させるオーケストレーター skill。各ステップを SubAgent に委譲し、メインの control-plane（state tracking + routing）に責務を限定する。
 
 ## Inputs（入力）
 
 - `issue_number`（必須）: implementation child issue 番号
-- `contract_snapshot_url`（任意、省略時は preparation ステップで検出）: `issue-contract-review` で `status: go` を返したコメントの URL。未提供の場合は preparation ステップが Issue コメントから `CONTRACT_REVIEW_RESULT_V1 status: go` コメントを自動検出する（存在すれば採用）。`status: go` コメントが見つからない場合は `ensure_contract_snapshot` を呼び出して自動 materialize を試みる（`steps/preparation.md` Section 2 の `missing_contract_go` 分岐を参照）
+- `contract_snapshot_url`（任意）: 参照用 telemetry。欠落時に materialize を要求せず routing を継続する。
 - `max_iterations`（任意、デフォルト 3）: 上限回数。超過時は fail-close で人間判断を仰ぐ
 
 ## Loop Structure（ループ構造）

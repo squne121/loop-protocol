@@ -18,6 +18,29 @@ schema_version: hook_boundaries_manifest_v1
 > セキュリティ上の保護は branch protection / GitHub Actions CI / repository permission で行う。  
 > Codex hooks は `.codex/hooks.json` に集約し、`.codex/config.toml` に inline hooks を混在させない。
 
+## Codex advisory hook allowlist（助言的 hook の許可一覧、Issue #1830）
+
+project-local Codex hook の active allowlist は `SessionEnd` と `SubagentStop` の
+passive recorder だけである。`PreToolUse`、`PermissionRequest`、`Stop`、
+`SubagentStart` および旧 enforcing harness は quarantine 済みであり、
+`.codex/hooks.json` から実行されない。SessionEnd の hook timeout は 3 秒以内、
+SubagentStop stdout は厳密に `{"continue":true}` のみとする。
+
+recorder は event、記録時刻、allowlist 済みの非本文 ID だけを user-local state に
+best effort で追記する。transcript、message、command、tool input/output、decision、
+additional context は解析・保存しない。network、GitHub、git 操作、subprocess、
+permission/continuation decision、required gate は実装しない。malformed input、
+timeout、EACCES、ENOSPC、EIO、schema error を含む全エラーは exit 0 の fail-open
+とする。外部の user / managed / plugin configuration は変更せず、存在する場合も
+project-local validator の authority 外として報告だけに留める。
+
+通常 workflow は scope-rollup、overlap、contract snapshot、body SHA、launch
+ledger、session-manifest、publish-context、controlled executor artifact を
+前提条件としない。quarantine した enforcement の再導入には別 Issue が必要である。
+コードレビュー、product CI、Codex built-in sandbox / approval、GitHub protection
+は引き続き適用し、git/network の可否は選択中の sandbox、approval、
+managed configuration（管理対象設定）に依存する。
+
 ---
 
 ## 1. 分類の定義
