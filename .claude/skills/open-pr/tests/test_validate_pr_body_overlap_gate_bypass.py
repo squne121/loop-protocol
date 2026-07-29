@@ -93,6 +93,21 @@ def test_missing_bypass_record_fail_closed():
     assert '"status": "fail"' in result.stdout
 
 
+def test_verified_successor_claim_does_not_allow_unsafe_publication_without_record():
+    """#1797 AC6: producer が safe evidence と主張しても、open-pr consumer
+    は required record を欠く bypass publication を受け入れない。
+    """
+    body = _generate_base_body() + (
+        "\n\n## Overlap Preflight 自動判定結果の補足説明\n\n"
+        "C2a verified native successor predicate により `route: proceed_with_collision_evidence` "
+        "と判断したため、overlap gate を経由せず `gh pr create` を直接実行する。\n"
+    )
+    changed_files = [".claude/skills/open-pr/scripts/validate_pr_body.py"]
+    result = _run_validate_pr_body(body, changed_files)
+    assert "LP059" in result.stdout
+    assert '"status": "fail"' in result.stdout
+
+
 def test_complete_bypass_record_pass():
     body = _generate_base_body() + BYPASS_TRIGGER_TEXT + COMPLETE_BYPASS_RECORD
     changed_files = [".claude/skills/open-pr/scripts/validate_pr_body.py"]
