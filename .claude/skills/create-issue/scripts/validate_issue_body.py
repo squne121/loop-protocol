@@ -31,6 +31,25 @@ import prose_boundary_policy as _pbp
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _ISSUE_TEMPLATE_DIR = _REPO_ROOT / ".github" / "ISSUE_TEMPLATE"
 
+# Existing-issue readiness is an independently versioned compatibility
+# contract. It intentionally does not read ISSUE_TEMPLATE/parent.yml: a
+# template edit must not silently rewrite requirements for an open Issue.
+EXISTING_ISSUE_READINESS_V1 = "existing_issue_readiness_v1"
+_EXISTING_ISSUE_READINESS_V1_PARENT_SECTIONS = (
+    "Machine-Readable Contract",
+    "Summary",
+    "Goal",
+    "Desired Destination",
+    "Current Validated Scope",
+    "Decisions Fixed",
+    "Quality Decision Record",
+    "Parent Closure Rule",
+    "Child Issues",
+    "Remaining Parent Gaps",
+    "Phase Handoff Contract",
+    "Acceptance Criteria",
+)
+
 _SHARED_VC_SYNTAX_DIR = _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts"
 if str(_SHARED_VC_SYNTAX_DIR) not in sys.path:
     sys.path.insert(0, str(_SHARED_VC_SYNTAX_DIR))
@@ -321,13 +340,19 @@ def _load_stop_condition_keywords(kind: str) -> list[str]:
     return []
 
 
-def _validate_lp001_missing_required_section(body: str, kind: str | None = None) -> list[ValidationError]:
+def _validate_lp001_missing_required_section(
+    body: str,
+    kind: str | None = None,
+    validation_profile: str | None = None,
+) -> list[ValidationError]:
     """LP001: Detect missing required sections.
 
     When kind is provided, loads required sections dynamically from ISSUE_TEMPLATE/<kind>.yml.
     Falls back to a minimal static set when kind is None or template is not found.
     """
-    if kind:
+    if validation_profile == EXISTING_ISSUE_READINESS_V1 and kind == "parent":
+        required_sections = list(_EXISTING_ISSUE_READINESS_V1_PARENT_SECTIONS)
+    elif kind:
         required_sections = _load_required_section_labels(kind)
     else:
         required_sections = [
@@ -1111,6 +1136,7 @@ def validate_issue_body(
     body: str,
     kind: str | None = None,
     title: str | None = None,
+    validation_profile: str | None = None,
 ) -> ValidationResult:
     """Run all validation rules and return aggregated results.
 
@@ -1147,7 +1173,13 @@ def validate_issue_body(
     kind_mismatch_errors = _validate_lp031_kind_mismatch(body, kind)
     all_errors.extend(kind_mismatch_errors)
 
-    all_errors.extend(_validate_lp001_missing_required_section(body, kind=effective_kind))
+    all_errors.extend(
+        _validate_lp001_missing_required_section(
+            body,
+            kind=effective_kind,
+            validation_profile=validation_profile,
+        )
+    )
     all_errors.extend(_validate_lp002_invalid_machine_readable_contract(body))
     all_errors.extend(_validate_lp010_ac_vc_mismatch(body))
     all_errors.extend(_validate_lp011_verification_command_format(body))
@@ -1236,6 +1268,15 @@ def main(argv: list[str] | None = None) -> int:
             "LP031 checks that title starts with '実装:' or 'implement:'."
         )
     )
+    parser.add_argument(
+        "--validation-profile",
+        choices=[EXISTING_ISSUE_READINESS_V1],
+        default=None,
+        help=(
+            "Versioned existing-issue readiness profile. It owns required "
+            "sections and does not load ISSUE_TEMPLATE fields."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -1255,7 +1296,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     # Validate
-    result = validate_issue_body(body, kind=args.kind, title=args.title)
+    result = validate_issue_body(
+        body,
+        kind=args.kind,
+        title=args.title,
+        validation_profile=args.validation_profile,
+    )
 
     # Output JSON
     output = {

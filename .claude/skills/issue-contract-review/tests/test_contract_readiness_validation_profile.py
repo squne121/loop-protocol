@@ -25,7 +25,7 @@ def _mrc(issue_kind: str) -> str:
 
 ```yaml
 contract_schema_version: v1
-issue_kind: {issue_kind}
+issue_kind: "{issue_kind}"
 goal_ref: validation profile regression
 change_kind: workflow
 ```
@@ -33,7 +33,10 @@ change_kind: workflow
 
 
 def _parent_body() -> str:
-    return _mrc("parent") + """
+    return _mrc("parent").replace(
+        "change_kind: workflow\n",
+        "change_kind: workflow\nparent_mode: delivery-rollup\nclosure_mode: child-complete\n",
+    ) + """
 ## Summary
 
 Parent tracker summary.
@@ -56,7 +59,7 @@ Readiness selection only.
 
 ## Quality Decision Record
 
-N/A
+- Status: N/A
 
 ## Parent Closure Rule
 
@@ -96,8 +99,10 @@ def _lp001_missing_sections(result: dict) -> set[str]:
     }
 
 
-def test_parent_profile_forwards_only_parent_kind(monkeypatch: pytest.MonkeyPatch) -> None:
-    """GIVEN a valid parent MRC WHEN readiness runs THEN it invokes only `--kind parent`."""
+def test_1844_parent_profile_uses_versioned_existing_readiness_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent readiness check must opt into the versioned, non-template profile."""
     captured: list[list[str]] = []
 
     class _Completed:
@@ -111,7 +116,82 @@ def test_parent_profile_forwards_only_parent_kind(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(_CRC.subprocess, "run", _run)
 
     assert _CRC.run_validate_issue_body(_parent_body())["status"] == "pass"
-    assert captured[0][-2:] == ["--kind", "parent"]
+    assert captured[0][-4:] == [
+        "--kind",
+        "parent",
+        "--validation-profile",
+        "existing_issue_readiness_v1",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("raw_kind", "status", "canonical_kind", "reason_code"),
+    [
+        ("parent", "profile", "parent", None),
+        ("tracking", "profile", "parent", None),
+        ("implementation", "legacy_no_kind", "implementation", None),
+        ("design", "legacy_no_kind", "research", None),
+        ("future-kind", "blocked", None, "unknown_issue_kind"),
+        (" parent", "blocked", None, "issue_kind_whitespace_not_normalized"),
+    ],
+)
+def test_1844_existing_profile_resolution_uses_ssot_quad_state(
+    raw_kind: str,
+    status: str,
+    canonical_kind: str | None,
+    reason_code: str | None,
+) -> None:
+    """The resolver distinguishes profile, legacy, parser, and blocked outcomes."""
+    resolution = _CRC.resolve_existing_issue_validation_profile(_mrc(raw_kind))
+
+    assert resolution.status == status
+    assert resolution.canonical_issue_kind == canonical_kind
+    assert resolution.reason_code == reason_code
+
+
+def test_1844_existing_profile_resolution_keeps_mrc_parse_failure_distinct() -> None:
+    resolution = _CRC.resolve_existing_issue_validation_profile(
+        "## Machine-Readable Contract\n\n```yaml\nissue_kind: parent\nissue_kind: implementation\n```\n"
+    )
+
+    assert resolution.status == "parse_failure"
+    assert resolution.reason_code == "duplicate_key"
+
+
+@pytest.mark.parametrize(
+    ("target", "replacement", "rule_id"),
+    [
+        ("contract_schema_version: v1", "contract_schema_version: v2", "MRC_PARENT_SCHEMA"),
+        (
+            "parent_mode: delivery-rollup\nclosure_mode: child-complete",
+            "parent_mode: delivery-rollup\nclosure_mode: routing-complete",
+            "MRC_PARENT_CLOSURE",
+        ),
+        (
+            "parent_mode: delivery-rollup\nclosure_mode: child-complete",
+            "parent_mode: quality-gate\nclosure_mode: measurement-ready",
+            "MRC_PARENT_QDR_STATUS",
+        ),
+        (
+            "parent_mode: delivery-rollup\nclosure_mode: child-complete",
+            'parent_mode: "<required: delivery-rollup>"\nclosure_mode: child-complete',
+            "MRC_PARENT_MODE",
+        ),
+    ],
+)
+def test_1844_parent_semantic_validation_is_fail_closed(
+    target: str,
+    replacement: str,
+    rule_id: str,
+) -> None:
+    body = _parent_body().replace(
+        target,
+        replacement,
+    )
+    readiness = _CRC.build_result(body, "static", _CRC.run_validate_issue_body(body), None, None)
+
+    assert readiness["status"] == "needs_fix"
+    assert any(error["rule_id"] == rule_id for error in readiness["errors"])
 
 
 def test_parent_kind_no_lp001_for_implementation_only_sections() -> None:

@@ -35,7 +35,9 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, NamedTuple, Optional
+
+import yaml
 
 # Locate sibling scripts (relative to this file)
 _SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -120,39 +122,233 @@ def sha256_of(body: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-# Existing issue readiness is deliberately more permissive than the authoring
-# path.  `issue_kind` is classification data from the MRC, whereas a validation
-# profile controls whether the caller explicitly opts in to validate_issue_body
-# kind-specific checks.  Keep the opt-in closed: unsupported kinds and invalid
-# MRC input must retain the legacy kind-agnostic fallback.
-_EXISTING_ISSUE_VALIDATION_PROFILES = {
-    "parent": "parent",
-}
+_ISSUE_KIND_POLICY_PATH = _REPO_ROOT / "docs" / "dev" / "github-ops.md"
+_EXISTING_ISSUE_READINESS_PROFILE = "existing_issue_readiness_v1"
 
 
-def resolve_existing_issue_validation_profile(body: str) -> Optional[str]:
-    """Return an allow-listed validation profile for existing issue readiness.
+class ExistingIssueValidationResolution(NamedTuple):
+    """Classify existing-issue readiness without conflating fallback states.
 
-    The shared MRC parser is authoritative.  In particular, a parser failure
-    must not be repaired by regex inference because it could reintroduce the
-    parser differential that MRC validation prevents.
+    ``profile`` is currently restricted to canonical ``parent``.  Known
+    implementation/research kinds deliberately retain the historical no-kind
+    validator path.  Parse failures and policy blocks never silently become a
+    profile or a known-kind fallback.
     """
+
+    status: Literal["profile", "legacy_no_kind", "parse_failure", "blocked"]
+    canonical_issue_kind: Optional[str]
+    validation_profile: Optional[str]
+    reason_code: Optional[str]
+
+
+def _load_issue_kind_policy() -> dict[str, Any]:
+    """Load ISSUE_KIND_POLICY_V1 from its documented SSOT, fail-closed."""
+    try:
+        text = _ISSUE_KIND_POLICY_PATH.read_text(encoding="utf-8")
+        match = re.search(r"```yaml\s*\nISSUE_KIND_POLICY_V1:(.*?)```", text, re.DOTALL)
+        if not match:
+            raise ValueError("issue_kind_policy_block_missing")
+        parsed = yaml.safe_load("ISSUE_KIND_POLICY_V1:" + match.group(1))
+        policy = parsed.get("ISSUE_KIND_POLICY_V1") if isinstance(parsed, dict) else None
+        if not isinstance(policy, dict) or policy.get("schema_version") != "1":
+            raise ValueError("issue_kind_policy_invalid")
+        canonical_kinds = policy.get("canonical_kinds")
+        aliases = policy.get("aliases")
+        reason_code = policy.get("unknown_kind_reason_code")
+        if (
+            not isinstance(canonical_kinds, list)
+            or not all(isinstance(kind, str) for kind in canonical_kinds)
+            or not isinstance(aliases, dict)
+            or not all(isinstance(key, str) and isinstance(value, str) for key, value in aliases.items())
+            or not isinstance(reason_code, str)
+            or not reason_code
+        ):
+            raise ValueError("issue_kind_policy_invalid")
+        return {
+            "canonical_kinds": frozenset(canonical_kinds),
+            "aliases": dict(aliases),
+            "unknown_kind_reason_code": reason_code,
+        }
+    except (OSError, ValueError, yaml.YAMLError, TypeError) as exc:
+        raise ValueError("issue_kind_policy_load_error") from exc
+
+
+def resolve_existing_issue_validation_profile(body: str) -> ExistingIssueValidationResolution:
+    """Resolve the versioned profile using MRC parsing and ISSUE_KIND_POLICY_V1."""
     parsed = parse_machine_readable_contract(body)
     if not parsed.ok:
-        return None
+        return ExistingIssueValidationResolution(
+            status="parse_failure",
+            canonical_issue_kind=None,
+            validation_profile=None,
+            reason_code=parsed.reason,
+        )
 
     issue_kind = parsed.get("issue_kind")
-    if not isinstance(issue_kind, str):
-        return None
-    return _EXISTING_ISSUE_VALIDATION_PROFILES.get(issue_kind)
+    if not isinstance(issue_kind, str) or not issue_kind:
+        return ExistingIssueValidationResolution(
+            status="parse_failure",
+            canonical_issue_kind=None,
+            validation_profile=None,
+            reason_code="issue_kind_missing",
+        )
+    if issue_kind != issue_kind.strip():
+        return ExistingIssueValidationResolution(
+            status="blocked",
+            canonical_issue_kind=None,
+            validation_profile=None,
+            reason_code="issue_kind_whitespace_not_normalized",
+        )
+
+    try:
+        policy = _load_issue_kind_policy()
+    except ValueError:
+        return ExistingIssueValidationResolution(
+            status="blocked",
+            canonical_issue_kind=None,
+            validation_profile=None,
+            reason_code="issue_kind_policy_load_error",
+        )
+
+    canonical_kind = issue_kind
+    if canonical_kind not in policy["canonical_kinds"]:
+        canonical_kind = policy["aliases"].get(issue_kind)
+    if canonical_kind not in policy["canonical_kinds"]:
+        return ExistingIssueValidationResolution(
+            status="blocked",
+            canonical_issue_kind=None,
+            validation_profile=None,
+            reason_code=policy["unknown_kind_reason_code"],
+        )
+
+    if canonical_kind == "parent":
+        return ExistingIssueValidationResolution(
+            status="profile",
+            canonical_issue_kind=canonical_kind,
+            validation_profile=_EXISTING_ISSUE_READINESS_PROFILE,
+            reason_code=None,
+        )
+    return ExistingIssueValidationResolution(
+        status="legacy_no_kind",
+        canonical_issue_kind=canonical_kind,
+        validation_profile=None,
+        reason_code=None,
+    )
+
+
+_PARENT_CLOSURE_COMPATIBILITY = {
+    "delivery-rollup": frozenset({"child-complete"}),
+    "quality-gate": frozenset({"measurement-ready", "quality-validated"}),
+    "routing-map": frozenset({"routing-complete"}),
+    "decision-log": frozenset({"decision-recorded"}),
+}
+_PARENT_PLACEHOLDER_RE = re.compile(r"<required:\s*[^>]+>", re.IGNORECASE)
+_QDR_SECTION_RE = re.compile(
+    r"^##\s+Quality Decision Record\s*$(.+?)(?=^##|\Z)", re.MULTILINE | re.DOTALL
+)
+_QDR_STATUS_RE = re.compile(r"^\s*[-*]\s*`?Status`?\s*:\s*(?P<value>.+?)\s*$", re.MULTILINE)
+
+
+def _existing_readiness_error(rule_id: str, category: str, context: str, hint: str) -> dict[str, Any]:
+    return {
+        "rule_id": rule_id,
+        "severity": "error",
+        "source_check": "existing_issue_readiness_v1",
+        "category": category,
+        "section": "Machine-Readable Contract",
+        "line_start": 0,
+        "line_end": 0,
+        "minimal_context": [context],
+        "fix_hint": hint,
+        "autofixable": False,
+    }
+
+
+def check_existing_issue_readiness_semantics(body: str) -> list[dict[str, Any]]:
+    """Validate versioned existing-parent semantics independently of templates."""
+    resolution = resolve_existing_issue_validation_profile(body)
+    if resolution.status == "blocked":
+        return [
+            _existing_readiness_error(
+                "MRC_ISSUE_KIND",
+                resolution.reason_code or "issue_kind_blocked",
+                resolution.reason_code or "issue_kind_blocked",
+                "Use an exact ISSUE_KIND_POLICY_V1 canonical kind or alias without whitespace.",
+            )
+        ]
+    if resolution.status != "profile":
+        return []
+
+    parsed = parse_machine_readable_contract(body)
+    data = parsed.data if parsed.ok and isinstance(parsed.data, dict) else {}
+    errors: list[dict[str, Any]] = []
+    if data.get("contract_schema_version") != "v1":
+        errors.append(
+            _existing_readiness_error(
+                "MRC_PARENT_SCHEMA",
+                "parent_contract_schema_invalid",
+                f"contract_schema_version={data.get('contract_schema_version')!r}",
+                "Set contract_schema_version: v1 for a parent MRC.",
+            )
+        )
+
+    parent_mode = data.get("parent_mode")
+    closure_mode = data.get("closure_mode")
+    if (
+        not isinstance(parent_mode, str)
+        or _PARENT_PLACEHOLDER_RE.search(parent_mode)
+        or parent_mode not in _PARENT_CLOSURE_COMPATIBILITY
+    ):
+        errors.append(
+            _existing_readiness_error(
+                "MRC_PARENT_MODE",
+                "parent_mode_invalid",
+                f"parent_mode={parent_mode!r}",
+                "Use a concrete parent_mode enum from docs/dev/github-ops.md.",
+            )
+        )
+    if not isinstance(closure_mode, str) or _PARENT_PLACEHOLDER_RE.search(closure_mode):
+        errors.append(
+            _existing_readiness_error(
+                "MRC_PARENT_CLOSURE",
+                "closure_mode_invalid",
+                f"closure_mode={closure_mode!r}",
+                "Use a concrete closure_mode enum from docs/dev/github-ops.md.",
+            )
+        )
+    elif isinstance(parent_mode, str) and parent_mode in _PARENT_CLOSURE_COMPATIBILITY:
+        if closure_mode not in _PARENT_CLOSURE_COMPATIBILITY[parent_mode]:
+            errors.append(
+                _existing_readiness_error(
+                    "MRC_PARENT_CLOSURE",
+                    "parent_closure_mode_incompatible",
+                    f"parent_mode={parent_mode!r}, closure_mode={closure_mode!r}",
+                    "Use a closure_mode compatible with parent_mode.",
+                )
+            )
+
+    if parent_mode == "quality-gate":
+        qdr_match = _QDR_SECTION_RE.search(body)
+        status_match = _QDR_STATUS_RE.search(qdr_match.group(1)) if qdr_match else None
+        qdr_status = status_match.group("value").strip().strip("`") if status_match else None
+        if qdr_status != closure_mode:
+            errors.append(
+                _existing_readiness_error(
+                    "MRC_PARENT_QDR_STATUS",
+                    "quality_decision_record_status_incompatible",
+                    f"closure_mode={closure_mode!r}, qdr_status={qdr_status!r}",
+                    "For quality-gate, set Quality Decision Record Status equal to closure_mode.",
+                )
+            )
+    return errors
 
 
 def run_validate_issue_body(body: str) -> dict[str, Any]:
     """
     Run validate_issue_body.py via subprocess with --body-file.
-    The existing-issue readiness path forwards --kind only for an explicitly
-    allow-listed validation profile (currently parent); all other kinds retain
-    the legacy kind-agnostic invocation.
+    The existing-issue readiness path dispatches only canonical parent through
+    the versioned profile. Known implementation/research kinds keep the legacy
+    kind-agnostic invocation; parser and policy failures remain separate.
     Returns parsed JSON output (loop_body_lint/v1 schema).
     --mode static: no network, no execution beyond python subprocess.
     """
@@ -164,9 +360,9 @@ def run_validate_issue_body(body: str) -> dict[str, Any]:
 
     try:
         args = [sys.executable, str(_VALIDATE_ISSUE_BODY_PY), "--body-file", tmp_path]
-        validation_profile = resolve_existing_issue_validation_profile(body)
-        if validation_profile is not None:
-            args.extend(["--kind", validation_profile])
+        resolution = resolve_existing_issue_validation_profile(body)
+        if resolution.status == "profile":
+            args.extend(["--kind", "parent", "--validation-profile", resolution.validation_profile])
 
         result = subprocess.run(
             args,
@@ -881,6 +1077,7 @@ def compute_aggregate_status(
     rva_errors: list[dict],
     static_vc_errors: list[dict],
     preflight_aggregate: str,
+    existing_readiness_errors: Optional[list[dict]] = None,
 ) -> str:
     """
     Compute overall readiness status from all sources.
@@ -897,6 +1094,9 @@ def compute_aggregate_status(
             status = _raise_status(status, "human_judgment")
         else:
             status = _raise_status(status, "needs_fix")
+
+    if existing_readiness_errors:
+        status = _raise_status(status, "needs_fix")
 
     # RVA immediate field errors: author can add fields → needs_fix
     if rva_errors:
@@ -951,6 +1151,7 @@ def build_result(
         )
 
     validate_errors = map_validate_errors_to_readiness_errors(validate_result)
+    existing_readiness_errors = check_existing_issue_readiness_semantics(body)
     rva_errors = check_rva_immediate_fields(body)
     rdr_errors = check_required_design_references(body)
 
@@ -966,7 +1167,14 @@ def build_result(
     if mode in ("static", "preflight-static"):
         static_vc_errors = check_vc_static_syntax(body)
 
-    all_errors = validate_errors + rva_errors + rdr_errors + static_vc_errors + preflight_errors
+    all_errors = (
+        validate_errors
+        + existing_readiness_errors
+        + rva_errors
+        + rdr_errors
+        + static_vc_errors
+        + preflight_errors
+    )
 
     overall_status = compute_aggregate_status(
         validate_errors,
@@ -974,6 +1182,7 @@ def build_result(
         rva_errors,
         static_vc_errors,
         preflight_aggregate,
+        existing_readiness_errors,
     )
     if rdr_errors:
         overall_status = _raise_status(overall_status, "needs_fix")

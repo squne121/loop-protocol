@@ -183,6 +183,109 @@ def test_no_mutation_before_guard_readiness_or_stale_precondition(
         assert events == ["guard", "hygiene", "readiness"]
 
 
+def test_1844_parent_candidate_runs_real_local_validators_before_executor(
+    repo_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real guard, hygiene, and readiness reject/accept before remote mutation."""
+    parent_body = """## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: parent
+goal_ref: parent readiness integration
+change_kind: workflow
+parent_mode: delivery-rollup
+closure_mode: child-complete
+```
+
+## Summary
+
+Parent summary.
+
+## Goal
+
+Keep parent readiness valid.
+
+## Desired Destination
+
+Validated parent mutation.
+
+## Current Validated Scope
+
+Readiness consumer integration.
+
+## Decisions Fixed
+
+- 2026-07-30: use the existing issue readiness profile.
+
+## Quality Decision Record
+
+- Status: N/A
+
+## Parent Closure Rule
+
+- Close after child completion.
+
+## Child Issues
+
+- [ ] #1
+
+## Remaining Parent Gaps
+
+- [ ] none
+
+## Phase Handoff Contract
+
+- Parent handoff remains explicit.
+
+## Acceptance Criteria
+
+- [ ] AC1: real local validators run before remote mutation.
+"""
+    payload = _minimal_input(repo_tmp)
+    (repo_tmp / "tmp" / "new_body.md").write_text(parent_body, encoding="utf-8")
+    payload["expected_previous_body_sha256"] = txn._sha256_text("old issue body")
+
+    production_root = Path(__file__).resolve().parents[4]
+    monkeypatch.setattr(
+        txn,
+        "GUARD_SCRIPT",
+        production_root / ".claude/skills/edit-issue/scripts/guard-issue-body.py",
+    )
+    monkeypatch.setattr(
+        txn,
+        "HYGIENE_SCRIPT",
+        production_root / ".claude/skills/edit-issue/scripts/issue_contract_hygiene_autofix.py",
+    )
+    monkeypatch.setattr(
+        txn,
+        "READINESS_SCRIPT",
+        production_root / ".claude/skills/issue-contract-review/scripts/contract_readiness_check.py",
+    )
+
+    readbacks = iter([
+        {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"},
+        {"title": "old", "body": parent_body, "updatedAt": "2026-07-03T10:41:51Z"},
+    ])
+    invoked: list[str] = []
+
+    monkeypatch.setattr(txn, "_fetch_issue", lambda *_args, **_kwargs: (next(readbacks), ""))
+
+    def _invoke(command_id: str, *_args: object, **_kwargs: object) -> tuple[_CP, dict | None]:
+        invoked.append(command_id)
+        return _CP(0, stdout=json.dumps({"new_body_sha256": txn._sha256_text(parent_body)})), {
+            "new_body_sha256": txn._sha256_text(parent_body)
+        }
+
+    monkeypatch.setattr(txn, "_invoke_controlled_exec", _invoke)
+    result = txn.run_transaction(payload)
+
+    assert result["status"] == "ok"
+    assert result["mutation_started"] is True
+    assert invoked == ["issue_content.update"]
+
+
 def test_controlled_executor_invoked_with_json_and_parsed(
     repo_tmp: Path,
     monkeypatch: pytest.MonkeyPatch,
