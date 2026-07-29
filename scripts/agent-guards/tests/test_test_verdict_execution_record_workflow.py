@@ -143,13 +143,37 @@ def test_given_closed_manifest_when_rendered_then_no_issue_shell_is_executed():
 
 
 def test_given_workflow_when_rendered_then_setup_python_uv_is_used_before_uv_commands():
-    import operator
-    text = WORKFLOW.read_text()
-    setup_index = text.find("setup-python-uv")
-    first_uv_run_index = text.find("uv run --locked")
-    assert setup_index != -1
-    assert first_uv_run_index != -1
-    assert operator.lt(setup_index, first_uv_run_index)
+    # Job-scoped (not whole-file/global) ordering check: within each job's
+    # own step list, any step whose "uses" references setup-python-uv must
+    # appear before that same job's first step whose "run" invokes
+    # "uv run". A global/whole-file string-position comparison (as this test
+    # previously did) would pass even if a later job used "uv run" before its
+    # own setup-python-uv step, as long as an earlier job's setup-python-uv
+    # occurrence preceded it textually -- Issue 1711 iteration 3 regression.
+    workflow = load_workflow_dict()
+    jobs = workflow["jobs"]
+    assert jobs, "expected at least one job in the workflow"
+    checked_a_job_with_uv_usage = False
+    for job_name, job in jobs.items():
+        steps = job.get("steps", [])
+        setup_indices = [
+            i for i, step in enumerate(steps)
+            if "setup-python-uv" in str(step.get("uses", ""))
+        ]
+        uv_run_indices = [
+            i for i, step in enumerate(steps)
+            if "uv run" in str(step.get("run", ""))
+        ]
+        if not uv_run_indices:
+            continue
+        checked_a_job_with_uv_usage = True
+        assert setup_indices, (
+            f"job {job_name!r} runs 'uv run' steps but has no setup-python-uv step"
+        )
+        assert min(setup_indices) < min(uv_run_indices), (
+            f"job {job_name!r} runs 'uv run' before its own setup-python-uv step"
+        )
+    assert checked_a_job_with_uv_usage, "expected at least one job exercising uv run"
 
 
 def test_given_workflow_when_rendered_then_upload_artifact_pin_supports_digest_output():

@@ -120,16 +120,16 @@ jobs:
           ref: ${{ needs.trusted-preflight.outputs.head_commit_sha }}
           path: source
 
-      - name: Verify checked-out source tree matches trusted-resolved identity (pure git plumbing, no PR code executed)
-        working-directory: source
-        run: |
-          uv run --locked python3 ../harness/scripts/agent-ops/test_verdict_execution_record_producer.py assert-source-tree-matches --actual-commit-sha "$(git rev-parse HEAD)" --actual-tree-sha "$(git rev-parse 'HEAD^{tree}')" --expected-commit-sha "${{ needs.trusted-preflight.outputs.head_commit_sha }}" --expected-tree-sha "${{ needs.trusted-preflight.outputs.head_tree_sha }}"
-
       - uses: ./harness/.github/actions/setup-python-uv
 
       - name: Verify uv toolchain
         working-directory: harness
         run: uv --version
+
+      - name: Verify checked-out source tree matches trusted-resolved identity (pure git plumbing, no PR code executed)
+        working-directory: source
+        run: |
+          uv run --locked python3 ../harness/scripts/agent-ops/test_verdict_execution_record_producer.py assert-source-tree-matches --actual-commit-sha "$(git rev-parse HEAD)" --actual-tree-sha "$(git rev-parse 'HEAD^{tree}')" --expected-commit-sha "${{ needs.trusted-preflight.outputs.head_commit_sha }}" --expected-tree-sha "${{ needs.trusted-preflight.outputs.head_tree_sha }}"
 
       - name: Execute closed manifest command against the untrusted source tree, using only the trusted harness environment
         working-directory: harness
