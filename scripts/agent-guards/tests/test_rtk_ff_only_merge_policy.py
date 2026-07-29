@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -151,10 +152,39 @@ def test_two_linked_worktree_executors_do_not_cross_attribute_identity_or_head(
         targets.append(target)
 
     executor = str(_AGENT_OPS_DIR / "verified_ff_merge_exec.py")
+    wrapper_dir = tmp_path / "git-wrapper"
+    wrapper_dir.mkdir()
+    event_fifo = tmp_path / "identity-events.fifo"
+    release_fifo = tmp_path / "identity-release.fifo"
+    event_dir = tmp_path / "identity-event-files"
+    event_dir.mkdir()
+    os.mkfifo(event_fifo)
+    os.mkfifo(release_fifo)
+    real_git = shutil.which("git")
+    assert real_git is not None
+    git_wrapper = wrapper_dir / "git"
+    git_wrapper.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = branch ] && [ \"$2\" = --show-current ]; then\n"
+        "  marker=\"$AC13_EVENT_DIR/$(basename \"$PWD\")\"\n"
+        "  if mkdir \"$marker\" 2>/dev/null; then\n"
+        "    printf '%s\\n' \"$PWD\" > \"$AC13_EVENT_FIFO\"\n"
+        "    IFS= read -r _release < \"$AC13_RELEASE_FIFO\"\n"
+        "  fi\n"
+        "fi\n"
+        f"exec {real_git} \"$@\"\n",
+        encoding="utf-8",
+    )
+    git_wrapper.chmod(0o755)
     child_env = os.environ.copy()
     child_env.pop("LOOP_ISSUE_NUMBER", None)
     child_env["LOOP_CANONICAL_REPO_URL_PATTERN"] = "^" + re.escape(str(remote)) + chr(92) + chr(90)
-    # Popen both children before waiting: this is a real concurrent subprocess barrier.
+    child_env["PATH"] = str(wrapper_dir) + os.pathsep + child_env["PATH"]
+    child_env["AC13_EVENT_FIFO"] = str(event_fifo)
+    child_env["AC13_RELEASE_FIFO"] = str(release_fifo)
+    child_env["AC13_EVENT_DIR"] = str(event_dir)
+    event_fd = os.open(event_fifo, os.O_RDWR)
+    release_fd = os.open(release_fifo, os.O_RDWR)
     children = [
         subprocess.Popen(
             [sys.executable, executor, "--target-sha", target],
@@ -166,6 +196,12 @@ def test_two_linked_worktree_executors_do_not_cross_attribute_identity_or_head(
         )
         for worktree, target in zip(worktrees, targets, strict=True)
     ]
+    with os.fdopen(event_fd, "r", encoding="utf-8", closefd=True) as event_reader:
+        reached = {event_reader.readline().strip(), event_reader.readline().strip()}
+    assert reached == {str(worktree) for worktree in worktrees}
+    with os.fdopen(release_fd, "w", encoding="utf-8", closefd=True) as release_writer:
+        release_writer.write("release\nrelease\n")
+        release_writer.flush()
     results = []
     for child in children:
         stdout, stderr = child.communicate(timeout=30)

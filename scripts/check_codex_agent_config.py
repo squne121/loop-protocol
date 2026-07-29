@@ -478,85 +478,31 @@ REQUIRED_PREFLIGHT_GATE_CMD = "uv run python3 scripts/check_local_main_branch_st
 
 def assert_local_main_branch_guard_preflight(hooks: dict) -> list[str]:
     """
-    AC17: Validate startup preflight for local_main_branch_guard.
+    Quarantine 後の Codex guardrail を検証する。
 
-    Checks:
-    1. check_local_main_branch_state.py exists (startup preflight script)
-    2. .codex/rules/default.rules documents startup preflight gate (B5)
-    3. .codex/hooks.json has local_main_branch_guard in PreToolUse and PermissionRequest
-    4. No double-definition of local_main_branch_guard per event/matcher
-    5. Handler form is nested under hooks[] (not at matcher group level)
+    local_main_branch_guard は active hook ではない。標準 sandbox / approval
+    policy を authority とし、repo hook は passive allowlist のみに限定する。
     """
     failures: list[str] = []
-
-    # Check 1: startup preflight script exists
-    preflight_script = REPO_ROOT / "scripts" / "check_local_main_branch_state.py"
-    if not preflight_script.exists():
-        failures.append(
-            "scripts/check_local_main_branch_state.py: startup preflight script missing "
-            "(required for local_main_branch_guard — Codex PreToolUse is not a complete interception boundary)"
-        )
-
-    # B5: Check 2: .codex/rules/default.rules must document the startup preflight gate
-    if not CODEX_RULES_DEFAULT_PATH.exists():
-        failures.append(
-            f"{CODEX_RULES_DEFAULT_PATH.relative_to(REPO_ROOT)}: rules file missing — "
-            "startup preflight gate must be documented here"
-        )
-    else:
-        rules_text = CODEX_RULES_DEFAULT_PATH.read_text(encoding="utf-8")
-        if REQUIRED_PREFLIGHT_GATE_CMD not in rules_text:
-            failures.append(
-                f".codex/rules/default.rules: startup preflight gate not documented — "
-                f"must contain: {REQUIRED_PREFLIGHT_GATE_CMD!r}"
-            )
-
     hooks_root = hooks.get("hooks", {})
-
-    # Check 2 & 4: local_main_branch_guard in PreToolUse Bash matcher
-    pretool = hooks_root.get("PreToolUse", [])
-    bash_pretool = next((e for e in pretool if e.get("matcher") == "^Bash$"), None)
-    if bash_pretool is None:
-        failures.append(".codex/hooks.json: missing PreToolUse ^Bash$ matcher entry for local_main_branch_guard")
-    else:
-        # Check handler is nested under hooks[] (not at matcher level)
-        nested_hooks = bash_pretool.get("hooks", [])
-        if not isinstance(nested_hooks, list):
-            failures.append(".codex/hooks.json: PreToolUse ^Bash$ hooks must be a list (nested handler form)")
-        else:
-            guard_hooks = [h for h in nested_hooks if "local_main_branch_guard" in h.get("command", "")]
-            if not guard_hooks:
-                failures.append(
-                    ".codex/hooks.json: local_main_branch_guard not found in PreToolUse ^Bash$ hooks[] "
-                    "(startup preflight not registered)"
-                )
-            # Check 3: no double-definition
-            if len(guard_hooks) > 1:
-                failures.append(
-                    f".codex/hooks.json: local_main_branch_guard defined {len(guard_hooks)} times "
-                    "in PreToolUse ^Bash$ — must not be duplicated"
-                )
-
-    # Check 2 & 4: local_main_branch_guard in PermissionRequest Bash matcher
-    perm_req = hooks_root.get("PermissionRequest", [])
-    bash_perm = next((e for e in perm_req if e.get("matcher") == "^Bash$"), None)
-    if bash_perm is None:
-        failures.append(".codex/hooks.json: missing PermissionRequest ^Bash$ matcher entry for local_main_branch_guard")
-    else:
-        nested_hooks = bash_perm.get("hooks", [])
-        if not isinstance(nested_hooks, list):
-            failures.append(".codex/hooks.json: PermissionRequest ^Bash$ hooks must be a list (nested handler form)")
-        else:
-            guard_hooks = [h for h in nested_hooks if "local_main_branch_guard" in h.get("command", "")]
-            if not guard_hooks:
-                failures.append(
-                    ".codex/hooks.json: local_main_branch_guard not found in PermissionRequest ^Bash$ hooks[]"
-                )
-            if len(guard_hooks) > 1:
-                failures.append(
-                    f".codex/hooks.json: local_main_branch_guard defined {len(guard_hooks)} times "
-                    "in PermissionRequest ^Bash$ — must not be duplicated"
-                )
+    if set(hooks_root) != {"SessionEnd", "SubagentStop"}:
+        failures.append(
+            ".codex/hooks.json: active hooks must be the passive SessionEnd/SubagentStop allowlist"
+        )
+    commands = [
+        hook.get("command", "")
+        for entries in hooks_root.values()
+        for entry in entries
+        for hook in entry.get("hooks", [])
+    ]
+    if any("local_main_branch_guard" in command for command in commands):
+        failures.append(
+            ".codex/hooks.json: quarantined local_main_branch_guard must not be active"
+        )
+    if any(event in hooks_root for event in ("PreToolUse", "PermissionRequest")):
+        failures.append(
+            ".codex/hooks.json: command enforcement must use standard sandbox/approval, not repo hooks"
+        )
 
     return failures
 
@@ -565,7 +511,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--assert-required-fields", action="store_true")
     parser.add_argument("--assert-runtime-contract", action="store_true")
     parser.add_argument("--assert-local-main-branch-guard", action="store_true",
-                        help="Validate local_main_branch_guard startup preflight (AC17)")
+                        help="Validate post-quarantine Codex sandbox/approval and passive hook boundary")
     return parser
 
 

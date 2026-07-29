@@ -234,10 +234,15 @@ implementation_triage_profile:
 
 ### Hard gate（強制ゲート）
 
-着手 authority は live Issue と canonical linked worktree identity に置く。
-scope-rollup、overlap、contract snapshot、body SHA、launch ledger、session manifest、
-publish context、controlled-executor artifact は prerequisite ではない。missing /
-stale / invalid / mixed / malformed / hook-skipped は warning に留める。
+着手権限は取得時点の Issue と正規の連結作業ツリー識別情報に置く。
+スコープ集約、重複確認、契約スナップショット、本文 SHA、起動台帳、セッション記録、
+公開文脈、制御 executor の成果物は前提条件ではない。欠落、古い状態、不正、混在、
+形式不良、フック未実行はいずれも警告に留める。
+
+Codex のコマンド強制はリポジトリ内フックを権限根拠とせず、標準の隔離環境と
+承認機構による `managed configuration` を正本とする。隔離済みの事前ツール実行
+ガードについて `enforcement 再導入` を行う場合は、別 Issue で公式実行環境の
+到達性と閉鎖的失敗契約を再検証してから管理対象設定として導入する。
 安全停止は root checkout、detached HEAD、dirty worktree、Issue/branch mismatch、
 Allowed Paths 違反、実テスト・CI・PR review failure に基づく。
 

@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 
 import { appendFile, mkdir } from 'node:fs/promises'
+import { Buffer } from 'node:buffer'
 import { homedir } from 'node:os'
 import { resolve } from 'node:path'
+import { clearTimeout, setTimeout } from 'node:timers'
 
 const ALLOWED_EVENTS = new Set(['SessionEnd', 'SubagentStop'])
 const MAX_STDIN_BYTES = 64 * 1024

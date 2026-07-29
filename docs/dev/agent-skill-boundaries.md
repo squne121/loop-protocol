@@ -35,6 +35,11 @@ worker や CI/review/security/permission/publication の safety stop と混同�
 
 ## Codex Dispatch Guardrail（Codex ディスパッチ境界）
 
+Codex の変更操作制御は標準の隔離環境と承認機構による
+`managed configuration` を権限根拠とする。隔離済みリポジトリフックの
+`enforcement 再導入` は暗黙に行わず、公式実行環境で有効な到達性を証明する
+独立した変更として扱う。
+
 - Codex CLI の root thread は control-plane 専用とし、`implementation-worker` / `test-runner` / `pr-reviewer` / `post-merge-cleanup-worker` を明示 spawn して data-plane を委譲する
 - `SUBAGENT_LAUNCH_LEDGER_V1` は advisory telemetry とし、missing / stale /
   mixed / invalid / malformed / hook-skipped は warning のみとする。有効な ledger
