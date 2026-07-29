@@ -122,6 +122,22 @@ REVIEWER_CHECKER_TAXONOMY_V1: list[dict[str, Any]] = [
         "readiness_categories": ["broad_search_path_unbounded"],
         "readiness_category_source_check": "baseline_vc_preflight",
         "domain_keys": ["broad_search_path_unbounded"],
+        "producer_shape_policy": "blocked_baseline_v1",
+    },
+    {
+        "entry_id": "existing_file_missing_node_id_noncanonical",
+        "reviewer_codes": [
+            "vcp_existing_file_missin",
+            "VCP_EXISTING_FILE_MISSIN",
+            "existing_file_missing_node_id_noncanonical",
+        ],
+        "deterministic_checks": [],
+        "readiness_rule_ids": ["VCP_EXISTING_FILE_MISSIN"],
+        "readiness_rule_id_source_check": "baseline_vc_preflight",
+        "readiness_categories": ["existing_file_missing_node_id_noncanonical"],
+        "readiness_category_source_check": "baseline_vc_preflight",
+        "domain_keys": ["existing_file_missing_node_id_noncanonical"],
+        "producer_shape_policy": "blocked_baseline_v1",
     },
 ]
 
@@ -171,6 +187,61 @@ def _domain_key_for(kind: str) -> str | None:
         return None
     domain_keys = entry["domain_keys"]
     return domain_keys[0] if domain_keys else None
+
+
+def resolve_readiness_error_to_taxonomy(
+    readiness_error: dict[str, Any], *, taxonomy: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """Resolve a source-qualified readiness error through the taxonomy SSOT.
+
+    Rule id and category must independently resolve to exactly one same entry.
+    The returned domain key is intentionally distinct from the entry id so
+    existing ``domain_keys`` consumers remain compatible.
+    """
+    entries = REVIEWER_CHECKER_TAXONOMY_V1 if taxonomy is None else taxonomy
+    rule_id = str(readiness_error.get("rule_id") or "")
+    category = str(readiness_error.get("category") or "")
+    source_check = str(readiness_error.get("source_check") or "")
+
+    def _rule_matches(entry: dict[str, Any]) -> bool:
+        return rule_id in entry.get("readiness_rule_ids", []) and (
+            entry.get("readiness_rule_id_source_check") in (None, source_check)
+        )
+
+    def _category_matches(entry: dict[str, Any]) -> bool:
+        return category in entry.get("readiness_categories", []) and (
+            entry.get("readiness_category_source_check") in (None, source_check)
+        )
+
+    rule_matches = [entry for entry in entries if _rule_matches(entry)]
+    category_matches = [entry for entry in entries if _category_matches(entry)]
+    if not rule_matches or not category_matches:
+        return {"status": "failed", "reason_code": "unmapped_readiness_taxonomy"}
+    if len(rule_matches) != 1 or len(category_matches) != 1:
+        return {"status": "failed", "reason_code": "ambiguous_readiness_taxonomy"}
+    if rule_matches[0]["entry_id"] != category_matches[0]["entry_id"]:
+        return {"status": "failed", "reason_code": "readiness_taxonomy_conflict"}
+    entry = rule_matches[0]
+    return {
+        "status": "resolved",
+        "entry_id": entry["entry_id"],
+        "deterministic_domain_key": entry["domain_keys"][0],
+    }
+
+
+def _matches_producer_shape(entry: dict[str, Any], payload: Any) -> bool:
+    """Apply the entry-declared producer policy without per-entry branches."""
+    policy = entry.get("producer_shape_policy")
+    if policy is None:
+        return True
+    if policy != "blocked_baseline_v1" or not isinstance(payload, dict):
+        return False
+    return (
+        payload.get("classification") == "blocked"
+        and payload.get("category") in entry["readiness_categories"]
+        and payload.get("decision") == "blocked"
+        and payload.get("scope_class") == "baseline_fail_expected"
+    )
 
 
 def _deterministic_check_for(kind: str) -> str | None:
@@ -256,25 +327,6 @@ def _extract_findings(review_result: dict[str, Any]) -> list[dict[str, Any]]:
 # in this set, _matching_readiness_errors() requires rule_id AND category (not
 # OR) to match, plus a producer-shape source_payload (Blocker 2), before
 # treating a readiness error as broad-path evidence.
-_STRICT_READINESS_SOURCE_PAYLOAD_KINDS = frozenset({"broad_search_path_unbounded"})
-
-
-def _has_valid_broad_search_source_payload(err: dict[str, Any]) -> bool:
-    """PR #1412 review (Blocker 2): a readiness error's `source_payload` must
-    reflect the real baseline_vc_preflight.py producer shape for the
-    broad_search_path_unbounded category, not just carry a matching
-    rule_id/category label pair."""
-    payload = err.get("source_payload")
-    if not isinstance(payload, dict):
-        return False
-    return (
-        payload.get("classification") == "blocked"
-        and payload.get("category") == "broad_search_path_unbounded"
-        and payload.get("decision") == "blocked"
-        and payload.get("scope_class") == "baseline_fail_expected"
-    )
-
-
 def _matching_readiness_errors(kind: str, readiness_result: dict[str, Any]) -> list[dict[str, Any]]:
     entry = TAXONOMY_BY_ENTRY_ID.get(kind)
     if entry is None:
@@ -284,25 +336,22 @@ def _matching_readiness_errors(kind: str, readiness_result: dict[str, Any]) -> l
     rule_id_source_check = entry.get("readiness_rule_id_source_check")
     categories = frozenset(entry["readiness_categories"])
     category_source_check = entry.get("readiness_category_source_check")
-    strict_source_payload = kind in _STRICT_READINESS_SOURCE_PAYLOAD_KINDS
+    strict_policy = entry.get("producer_shape_policy") is not None
     for err in readiness_result.get("errors", []):
         if not isinstance(err, dict):
+            continue
+        if strict_policy:
+            resolved = resolve_readiness_error_to_taxonomy(err)
+            if (
+                resolved.get("status") == "resolved"
+                and resolved.get("entry_id") == kind
+                and _matches_producer_shape(entry, err.get("source_payload"))
+            ):
+                matches.append(err)
             continue
         rule_id = str(err.get("rule_id") or "")
         category = str(err.get("category") or "")
         source_check = str(err.get("source_check") or "")
-
-        if strict_source_payload:
-            rule_id_ok = rule_id in rule_ids and (
-                rule_id_source_check is None or source_check == rule_id_source_check
-            )
-            category_ok = category in categories and (
-                category_source_check is None or source_check == category_source_check
-            )
-            if rule_id_ok and category_ok and _has_valid_broad_search_source_payload(err):
-                matches.append(err)
-            continue
-
         if rule_id in rule_ids and (rule_id_source_check is None or source_check == rule_id_source_check):
             matches.append(err)
             continue
@@ -326,9 +375,6 @@ def _validate_minimal_schema(payload: dict[str, Any], label: str, required_keys:
 # schema mismatch is an artifact contract violation and fails closed
 # (ValueError -> input_or_runtime_error) rather than silently falling back
 # to "unbacked".
-_STRICT_VC_PREFLIGHT_PRODUCER_SHAPE_KINDS = frozenset({"broad_search_path_unbounded"})
-
-
 def _matching_vc_preflight(kind: str, vc_preflight_result: dict[str, Any] | None) -> list[dict[str, Any]]:
     if vc_preflight_result is None:
         return []
@@ -337,8 +383,11 @@ def _matching_vc_preflight(kind: str, vc_preflight_result: dict[str, Any] | None
         raise ValueError("vc-preflight-result-file.results must be a list")
     if str(vc_preflight_result.get("status") or "") != "blocked":
         return []
+    entry = TAXONOMY_BY_ENTRY_ID.get(kind)
+    if entry is None:
+        return []
     if (
-        kind in _STRICT_VC_PREFLIGHT_PRODUCER_SHAPE_KINDS
+        entry.get("producer_shape_policy") is not None
         and vc_preflight_result.get("schema") != "baseline_vc_preflight/v1"
     ):
         raise ValueError(
@@ -346,7 +395,6 @@ def _matching_vc_preflight(kind: str, vc_preflight_result: dict[str, Any] | None
             f"{kind!r} evidence (expected 'baseline_vc_preflight/v1', "
             f"got {vc_preflight_result.get('schema')!r})"
         )
-    entry = TAXONOMY_BY_ENTRY_ID.get(kind)
     categories = frozenset(entry["readiness_categories"]) if entry else frozenset()
     matches: list[dict[str, Any]] = []
     for item in results:
@@ -361,12 +409,7 @@ def _matching_vc_preflight(kind: str, vc_preflight_result: dict[str, Any] | None
             or item.get("category") != "unexpected_pass"
         ):
             continue
-        if kind == "broad_search_path_unbounded" and (
-            item.get("classification") != "blocked"
-            or item.get("category") != "broad_search_path_unbounded"
-            or item.get("decision") != "blocked"
-            or item.get("scope_class") != "baseline_fail_expected"
-        ):
+        if not _matches_producer_shape(entry, item):
             continue
         matches.append(item)
     return matches
@@ -959,6 +1002,7 @@ TAXONOMY_ENTRY_SCHEMA_V1: dict[str, Any] = {
         "readiness_categories": {"type": "array", "items": {"type": "string"}},
         "readiness_category_source_check": {"type": ["string", "null"]},
         "domain_keys": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "producer_shape_policy": {"type": "string"},
     },
 }
 
