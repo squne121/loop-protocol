@@ -21,7 +21,6 @@ from git_mutation_command_policy import (
     CANONICAL_REPO_IDENTITY_DEFAULT,
     REMOTE_STATE_PRESENT,
     _classify_rtk_git_mutation_with_context,
-    _EXISTING_BRANCH_UPDATE_DEADLINE_SECONDS,
     classify_rtk_git_mutation,
     evaluate_publish_lane,
     execute_existing_branch_update_transaction,
@@ -720,24 +719,13 @@ def test_direct_policy_cli_is_blocked_by_real_hook_chain(tmp_path: Path):
 # Issue #1688 fix delta P0 nested_timeout_mismatch
 # ---------------------------------------------------------------------------
 
-def test_adapter_deadline_exceeds_policy_transaction_deadline():
-    """The Node adapter's own subprocess timeout for the publish-lane policy
-    CLI (`EXISTING_BRANCH_PUBLISH_LANE_TIMEOUT_MS`) MUST stay strictly
-    greater than -- with margin -- the Python policy's own absolute
-    transaction deadline (`_EXISTING_BRANCH_UPDATE_DEADLINE_SECONDS`), and
-    both MUST stay strictly under the `.codex/hooks.json` hook-wide 30s
-    budget (out of Allowed Paths for this Issue, not editable here)."""
+def test_passive_adapter_has_no_publish_transaction_deadline():
+    """Quarantined passive hooks must not retain a transaction timeout or
+    invoke the existing-branch publish transaction at all."""
     source = _CODEX_HOOK_ADAPTER_MJS.read_text()
-    match = re.search(r"EXISTING_BRANCH_PUBLISH_LANE_TIMEOUT_MS\s*=\s*([0-9_]+)", source)
-    assert match, "adapter timeout constant not found"
-    adapter_timeout_ms = int(match.group(1).replace("_", ""))
-
-    policy_deadline_ms = _EXISTING_BRANCH_UPDATE_DEADLINE_SECONDS * 1000
-
-    assert adapter_timeout_ms > policy_deadline_ms
-    assert (adapter_timeout_ms - policy_deadline_ms) >= 2000  # explicit margin
-    assert adapter_timeout_ms < 30_000  # strictly under the hooks.json hook-wide budget
-    assert (30_000 - adapter_timeout_ms) >= 1000  # margin under the hook-wide budget too
+    assert "EXISTING_BRANCH_PUBLISH_LANE_TIMEOUT_MS" not in source
+    assert "--execute-existing-branch-update" not in source
+    assert "git_mutation_command_policy.py" not in source
 
 
 def test_timeout_returns_structured_indeterminate_result(tmp_path: Path):
