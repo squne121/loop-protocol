@@ -336,7 +336,6 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
     failures: list[str] = []
     config = read_toml(CONFIG_PATH)
     hooks = json.loads(HOOKS_PATH.read_text(encoding="utf-8"))
-    hook_command_fragment = expectations["required_hook_command_fragment"]
     all_surface_paths: list[Path] = []
     for agent_name, expected in expectations["required_agents"].items():
         agent = load_agent(REPO_ROOT / expected["path"])
@@ -395,68 +394,29 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
 
     if sorted(hooks.keys()) != ["hooks"]:
         failures.append(f".codex/hooks.json: root keys must be exactly ['hooks'], got {sorted(hooks.keys())!r}")
+    failures.extend(assert_local_main_branch_guard_preflight(hooks))
     hooks_root = hooks.get("hooks", {})
-    subagent_entries = hooks_root.get("SubagentStart")
-    if not isinstance(subagent_entries, list) or not subagent_entries:
-        failures.append(".codex/hooks.json: missing hooks for SubagentStart")
-    else:
-        if len(subagent_entries) != 1:
-            failures.append(".codex/hooks.json: SubagentStart must have exactly one matcher entry")
-        else:
-            entry = subagent_entries[0]
-            if entry.get("matcher") != ".*":
-                failures.append(".codex/hooks.json: SubagentStart matcher must be '.*'")
-            commands = [hook.get("command") for hook in entry.get("hooks", []) if isinstance(hook.get("command"), str)]
-            if len(commands) != 1 or "--hook-subagent-start" not in commands[0]:
-                failures.append(
-                    ".codex/hooks.json: SubagentStart must route exactly"
-                    " one command with --hook-subagent-start"
-                )
-
-    pretool_entries = hooks_root.get("PreToolUse")
-    if not isinstance(pretool_entries, list) or not pretool_entries:
-        failures.append(".codex/hooks.json: missing hooks for PreToolUse")
-        pretool_entries = []
-    actual_matchers = {entry.get("matcher"): entry for entry in pretool_entries if isinstance(entry, dict)}
-    if len(actual_matchers) != len(EXPECTED_PRETOOL_HOOKS):
-        failures.append(
-            f".codex/hooks.json: PreToolUse must have exactly {len(EXPECTED_PRETOOL_HOOKS)} matcher entries"
-        )
-    for matcher, expected_hooks in EXPECTED_PRETOOL_HOOKS.items():
-        entry = actual_matchers.get(matcher)
-        if entry is None:
-            failures.append(f".codex/hooks.json: missing PreToolUse matcher {matcher}")
-            continue
-        hooks_for_matcher = entry.get("hooks", [])
-        if not isinstance(hooks_for_matcher, list):
-            failures.append(f".codex/hooks.json: matcher {matcher} hooks must be a list")
-            continue
-        if hooks_for_matcher != expected_hooks:
+    for event_name, subject in (("SessionEnd", "session"), ("SubagentStop", "subagent")):
+        expected_entries = [
+            {
+                "matcher": ".*",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": (
+                            "node .codex/hooks/session-recording-composite.mjs"
+                            f" --event {event_name}"
+                        ),
+                        "timeout": 3,
+                        "statusMessage": f"Recording advisory Codex {subject} metadata",
+                    }
+                ],
+            }
+        ]
+        if hooks_root.get(event_name) != expected_entries:
             failures.append(
-                f".codex/hooks.json: matcher {matcher} must exactly match expected PreToolUse handler matrix"
+                f".codex/hooks.json: {event_name} must exactly match the passive advisory handler"
             )
-        for index, hook in enumerate(hooks_for_matcher):
-            if sorted(hook.keys()) != EXPECTED_HOOK_KEYS:
-                failures.append(
-                    f".codex/hooks.json: matcher {matcher} hook {index} keys must be exactly {EXPECTED_HOOK_KEYS!r}"
-                )
-
-    all_commands: list[str] = []
-    for event_name in expectations["required_hook_events"]:
-        hooks_for_event = hooks_root.get(event_name, [])
-        for entry in hooks_for_event:
-            for hook in entry.get("hooks", []):
-                command = hook.get("command")
-                if isinstance(command, str):
-                    all_commands.append(command)
-
-    if not any(hook_command_fragment in command for command in all_commands):
-        failures.append(
-            ".codex/hooks.json: expected hooks to route through scripts/check-codex-agents.mjs"
-        )
-
-    if not any("rtk pnpm exec node" in command for command in all_commands):
-        failures.append(".codex/hooks.json: hooks must invoke the validator through rtk pnpm exec node")
     if (REPO_ROOT / ".codex/skills").exists():
         failures.append(".codex/skills: must not exist as a repo-shared skill surface")
 
@@ -478,85 +438,31 @@ REQUIRED_PREFLIGHT_GATE_CMD = "uv run python3 scripts/check_local_main_branch_st
 
 def assert_local_main_branch_guard_preflight(hooks: dict) -> list[str]:
     """
-    AC17: Validate startup preflight for local_main_branch_guard.
+    Quarantine 後の Codex guardrail を検証する。
 
-    Checks:
-    1. check_local_main_branch_state.py exists (startup preflight script)
-    2. .codex/rules/default.rules documents startup preflight gate (B5)
-    3. .codex/hooks.json has local_main_branch_guard in PreToolUse and PermissionRequest
-    4. No double-definition of local_main_branch_guard per event/matcher
-    5. Handler form is nested under hooks[] (not at matcher group level)
+    local_main_branch_guard は active hook ではない。標準 sandbox / approval
+    policy を authority とし、repo hook は passive allowlist のみに限定する。
     """
     failures: list[str] = []
-
-    # Check 1: startup preflight script exists
-    preflight_script = REPO_ROOT / "scripts" / "check_local_main_branch_state.py"
-    if not preflight_script.exists():
-        failures.append(
-            "scripts/check_local_main_branch_state.py: startup preflight script missing "
-            "(required for local_main_branch_guard — Codex PreToolUse is not a complete interception boundary)"
-        )
-
-    # B5: Check 2: .codex/rules/default.rules must document the startup preflight gate
-    if not CODEX_RULES_DEFAULT_PATH.exists():
-        failures.append(
-            f"{CODEX_RULES_DEFAULT_PATH.relative_to(REPO_ROOT)}: rules file missing — "
-            "startup preflight gate must be documented here"
-        )
-    else:
-        rules_text = CODEX_RULES_DEFAULT_PATH.read_text(encoding="utf-8")
-        if REQUIRED_PREFLIGHT_GATE_CMD not in rules_text:
-            failures.append(
-                f".codex/rules/default.rules: startup preflight gate not documented — "
-                f"must contain: {REQUIRED_PREFLIGHT_GATE_CMD!r}"
-            )
-
     hooks_root = hooks.get("hooks", {})
-
-    # Check 2 & 4: local_main_branch_guard in PreToolUse Bash matcher
-    pretool = hooks_root.get("PreToolUse", [])
-    bash_pretool = next((e for e in pretool if e.get("matcher") == "^Bash$"), None)
-    if bash_pretool is None:
-        failures.append(".codex/hooks.json: missing PreToolUse ^Bash$ matcher entry for local_main_branch_guard")
-    else:
-        # Check handler is nested under hooks[] (not at matcher level)
-        nested_hooks = bash_pretool.get("hooks", [])
-        if not isinstance(nested_hooks, list):
-            failures.append(".codex/hooks.json: PreToolUse ^Bash$ hooks must be a list (nested handler form)")
-        else:
-            guard_hooks = [h for h in nested_hooks if "local_main_branch_guard" in h.get("command", "")]
-            if not guard_hooks:
-                failures.append(
-                    ".codex/hooks.json: local_main_branch_guard not found in PreToolUse ^Bash$ hooks[] "
-                    "(startup preflight not registered)"
-                )
-            # Check 3: no double-definition
-            if len(guard_hooks) > 1:
-                failures.append(
-                    f".codex/hooks.json: local_main_branch_guard defined {len(guard_hooks)} times "
-                    "in PreToolUse ^Bash$ — must not be duplicated"
-                )
-
-    # Check 2 & 4: local_main_branch_guard in PermissionRequest Bash matcher
-    perm_req = hooks_root.get("PermissionRequest", [])
-    bash_perm = next((e for e in perm_req if e.get("matcher") == "^Bash$"), None)
-    if bash_perm is None:
-        failures.append(".codex/hooks.json: missing PermissionRequest ^Bash$ matcher entry for local_main_branch_guard")
-    else:
-        nested_hooks = bash_perm.get("hooks", [])
-        if not isinstance(nested_hooks, list):
-            failures.append(".codex/hooks.json: PermissionRequest ^Bash$ hooks must be a list (nested handler form)")
-        else:
-            guard_hooks = [h for h in nested_hooks if "local_main_branch_guard" in h.get("command", "")]
-            if not guard_hooks:
-                failures.append(
-                    ".codex/hooks.json: local_main_branch_guard not found in PermissionRequest ^Bash$ hooks[]"
-                )
-            if len(guard_hooks) > 1:
-                failures.append(
-                    f".codex/hooks.json: local_main_branch_guard defined {len(guard_hooks)} times "
-                    "in PermissionRequest ^Bash$ — must not be duplicated"
-                )
+    if set(hooks_root) != {"SessionEnd", "SubagentStop"}:
+        failures.append(
+            ".codex/hooks.json: active hooks must be the passive SessionEnd/SubagentStop allowlist"
+        )
+    commands = [
+        hook.get("command", "")
+        for entries in hooks_root.values()
+        for entry in entries
+        for hook in entry.get("hooks", [])
+    ]
+    if any("local_main_branch_guard" in command for command in commands):
+        failures.append(
+            ".codex/hooks.json: quarantined local_main_branch_guard must not be active"
+        )
+    if any(event in hooks_root for event in ("PreToolUse", "PermissionRequest")):
+        failures.append(
+            ".codex/hooks.json: command enforcement must use standard sandbox/approval, not repo hooks"
+        )
 
     return failures
 
@@ -565,7 +471,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--assert-required-fields", action="store_true")
     parser.add_argument("--assert-runtime-contract", action="store_true")
     parser.add_argument("--assert-local-main-branch-guard", action="store_true",
-                        help="Validate local_main_branch_guard startup preflight (AC17)")
+                        help="Validate post-quarantine Codex sandbox/approval and passive hook boundary")
     return parser
 
 

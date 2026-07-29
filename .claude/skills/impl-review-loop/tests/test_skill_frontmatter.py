@@ -13,8 +13,7 @@ EXPECTED_DESCRIPTION = (
     "implementation child issue を **実装→検証→PR レビュー** の 3 ステップループで自律完了させる"
     "オーケストレーター。 Issue 番号を受け取り、pr-reviewer の LOOP_VERDICT が APPROVE に"
     "なるまで反復する。 `/impl-review-loop <N>` または「Issue ◯◯ をループで実装して」の"
-    "トリガーで使う。 着手前に `docs/dev/workflow.md` の「Issue contract を作業計画の正本"
-    "として扱う条件」と `issue-contract-review` の `status: go` を確認する。"
+    "トリガーで使う。 着手前に `docs/dev/workflow.md` の通常 workflow safety boundary を確認する。"
 )
 
 
@@ -33,8 +32,7 @@ def test_impl_review_loop_frontmatter_description_is_stable():
     assert "\n" not in desc
     assert desc.startswith("implementation child issue を")
     assert "Issue 番号を受け取り" in desc
-    assert "issue-contract-review" in desc
-    assert "`status: go`" in desc
+    assert "workflow safety boundary" in desc
 
 
 def test_all_skill_frontmatters_are_yaml_parseable():

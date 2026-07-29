@@ -164,7 +164,11 @@ def parse_machine_readable_contract(body: str) -> MRCParseResult:
         return MRCParseResult(
             ok=False, reason=REASON_DUPLICATE_KEY, duplicate_key=str(exc.key)
         )
-    except yaml.YAMLError:
+    except (yaml.YAMLError, TypeError):
+        # A complex YAML mapping key can be constructed as an unhashable
+        # Python object (for example, a list).  Treat it like every other
+        # malformed MRC input: callers receive a JSON-safe parse result,
+        # never a loader exception.
         return MRCParseResult(ok=False, reason=REASON_YAML_ERROR)
 
     if not isinstance(data, dict):

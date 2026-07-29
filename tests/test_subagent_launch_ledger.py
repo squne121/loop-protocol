@@ -33,12 +33,16 @@ def test_given_wrong_runtime_fixture_when_fixture_mode_then_records_mismatch():
     assert "runtime_contract_mismatch" in payload["error_codes"]
 
 
-def test_given_declared_only_ledger_when_audit_mode_then_fails_closed(tmp_path: Path):
+def test_given_declared_only_ledger_when_audit_mode_then_warns_without_usable_evidence(
+    tmp_path: Path,
+):
     source = json.loads((FIXTURES / "valid.json").read_text(encoding="utf-8"))
     for key in ("fixture_expectation", "project_trust_state", "hook_state", "tool_path_support"):
         source.pop(key, None)
     ledger = tmp_path / "ledger.json"
     ledger.write_text(json.dumps(source), encoding="utf-8")
     code, payload = run_validator("--audit-mode", str(ledger))
-    assert code == 1
+    assert code == 0
+    assert payload["status"] == "warning"
+    assert payload["evidence_usable"] is False
     assert "dispatch_evidence_missing" in payload["error_codes"]

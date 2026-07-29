@@ -1158,42 +1158,10 @@ def _find_unauthorized_repo_changes(
     shadow_log_before_bytes: bytes | None = None,
     shadow_log_before_identity: tuple[int, int, int, int] | None = None,
 ) -> str | None:
-    # Issue #1502: the stable-exact ledger transition is checked first and
-    # independently of the generic snapshot/status diff below. If the
-    # transition is not one of the two authorized kinds, fail closed on that
-    # exact path immediately (AC2) rather than folding it into the generic
-    # diff (which would only report the deepest-path heuristic winner).
+    # Issue #1830: launch-ledger state is advisory telemetry. Keep its exact
+    # paths out of the child-attribution diff, but never turn missing,
+    # malformed, mixed, or concurrent ledger state into a routing failure.
     ledger_before_kinds = ledger_before_kinds or {}
-    stable_before_kind = ledger_before_kinds.get(_LEDGER_STABLE_EXACT_REL, "absent")
-    stable_ledger_path = Path(project_root) / _LEDGER_STABLE_EXACT_REL
-    stable_after_kind = _path_kind_or_ancestor_absent(stable_ledger_path)
-    if not _is_allowed_stable_ledger_transition(stable_before_kind, stable_after_kind):
-        return _LEDGER_STABLE_EXACT_REL
-
-    # Issue #1502 REQUEST_CHANGES (Blocker 3): `regular -> regular` is a
-    # *type*-authorized transition, but the type check alone says nothing
-    # about content -- a peer could replace a valid ledger with malformed
-    # content (e.g. `"not-json-at-all"`), or with a replacement that silently
-    # drops/mutates existing `launches` / `root_thread_actions` entries.
-    # Validate the content transition here, independently of the generic
-    # snapshot/status diff below (which only compares mtime/size, not
-    # content). Byte-identical before/after content (nothing actually
-    # changed) is always safe regardless of schema validity, so a
-    # pre-existing malformed-but-untouched ledger never blocks detection of
-    # an unrelated sibling change.
-    if stable_before_kind == "regular" and stable_after_kind == "regular":
-        after_bytes = _read_bytes_or_none(stable_ledger_path)
-        if after_bytes is None or ledger_before_bytes is None:
-            return _LEDGER_STABLE_EXACT_REL
-        if after_bytes != ledger_before_bytes:
-            before_content = _parse_ledger_bytes(ledger_before_bytes)
-            after_content = _parse_ledger_bytes(after_bytes)
-            if (
-                before_content is None
-                or after_content is None
-                or not _is_authorized_ledger_content_transition(before_content, after_content)
-            ):
-                return _LEDGER_STABLE_EXACT_REL
 
     after_snapshot = _snapshot_repo_paths(project_root, issue_number)
     after_status = _git_status_paths(project_root)
@@ -1623,9 +1591,8 @@ def main(argv: list[str] | None = None) -> int:
     # generic diff. This must run before `_find_unauthorized_repo_changes`
     # takes its "after" snapshot, so quiescent peer writes never appear as
     # residue in that snapshot.
-    stale_transient = _wait_for_ledger_transient_quiescence(project_root)
-    if stale_transient:
-        return _emit_ledger_transient_residue_failure(args.issue_number, stale_transient)
+    # Advisory ledger residue may be reported by diagnostics, but it must not
+    # block the wrapped workflow command.
 
     unauthorized_path = _find_unauthorized_repo_changes(
         project_root,

@@ -6,14 +6,15 @@ description: 承認済みの implementation child issue（`issue-contract-review
 # Implement Issue
 
 承認済み contract に従い、implementation child issue を実装し、verify、PR、Issue 更新まで進める手順。
-`issue-contract-review` で `status: go` を得た後に呼ぶ。
+live Issue contract を取得できれば呼び出せる。artifact は着手権限ではない。
 
 ## Input（入力）
 
 - `Issue番号` または `Issue URL`（必須）
-- `issue-contract-review` の contract-snapshot comment URL（必須）
+- `issue-contract-review` の contract-snapshot comment URL（任意 telemetry）
 
-Note: `contract_snapshot_url` の省略時自動検出・自動 materialize は #149 の責務。本 skill 単体では URL 入力を必須とし、URL 未提供時は `impl-review-loop` / #149 実装後の preparation に委譲する。
+Note: `contract_snapshot_url` の欠落・stale・invalid は実装停止理由にしない。
+live Issue、canonical linked worktree、Allowed Paths、実テストを正本とする。
 
 ## Procedure（手順）
 
@@ -76,6 +77,8 @@ ROUTE=$(uv run python3 -c "import json,sys; print(json.load(sys.stdin)['route'])
 - 収集した comparable candidate JSON だけを `check_issue_overlap.py` の pure collision classifier に渡した上で、候補ごとに `## Outcome` / `## In Scope` を readback し、**構造的シグナル**（AC ID・output schema 名・Machine-Readable Contract の key/value・In Scope 内 edit target（inline-code パス）・goal_ref・supersedes/superseded-by）を主軸に意味的重複を判定する。自然言語類似度（Outcome の token Jaccard）は補助 signal に留め、`proceed_with_collision_evidence` を許可する唯一の根拠にはしない。
 - `Allowed Paths` が同一集合であることは duplicate の十分条件にしない。`same_path_set` に基づく duplicate 候補は readback + 構造シグナルによる確認を経て初めて `duplicate` route を確定し、確認できない場合は C1 と同様に扱う。
 - 全 candidate の number / body / updatedAt / dependency contract schema を検証し、一件でも欠ければ `human_review_required` に倒す（false positive での黙殺を防ぐ）。Allowed Paths 未記載だけは非比較対象として除外するため validation error に含めない。
+- structural collision を `proceed_with_collision_evidence` に残せるのは **verified native successor predicate** を candidate 単位で満たす場合だけである。`policy_class=C2a`、`dependency_relation=successor`、readback complete、nonempty provenance、repository/current/candidate identity、明示方向をすべて evidence に保持し、provenance source は `current_native_blocking` または `candidate_native_blocked_by` の closed set に限定する。
+- contract-only/legacy-only、native と contract/legacy の mixed provenance、identity/direction 不一致、readback incomplete、C2b/predecessor、duplicate、unresolved、source degraded、unsafe mixed set は例外なく fail-closed とする。global `any_collision` bypass や単一 source 名だけによる許可は禁止する。
 - `IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1` evidence（`current_issue` / `source` / `candidates`（candidate ごとの `policy_class` / `reasons` / `structural_signals`）/ `ignored_candidates`（`issue_number` と `reason: ignored_missing_allowed_paths`）/ `dependency_resolution` / `validation_errors` / `route` / `decision_inputs_sha256` / `evidence_sha256`）を標準出力に JSON で返す。
 
 #### route / exit code 契約（クローズドセット、Major 2 改訂）
@@ -83,7 +86,7 @@ ROUTE=$(uv run python3 -c "import json,sys; print(json.load(sys.stdin)['route'])
 | route | 意味 | 本 Section の対応 |
 |---|---|---|
 | `proceed` | C0（重複候補なし） | 実装を継続する |
-| `proceed_with_collision_evidence` | 証明済み C1/C2a（全候補 readback 完了かつ構造的に disjoint） | evidence を Issue コメントまたは worktree artifact に記録してから継続する |
+| `proceed_with_collision_evidence` | 証明済み C1、または verified native successor predicate を満たす C2a（全候補 readback 完了） | evidence を Issue コメントまたは worktree artifact に記録してから継続する |
 | `wait_for_predecessor` | C2b（open predecessor への依存が検出された） | 人間判断へ停止（predecessor 完了待ち） |
 | `human_review_required` | C3 / ambiguous / readback 不完全 / candidate schema 不備 / dependency 未解決 / source degraded（saturated 等） | 人間判断へ停止 |
 | `duplicate` | readback で確認済みの重複 | 人間判断へ停止（統合 PR を人間に提案） |
@@ -125,6 +128,8 @@ uv run --locked python3 .claude/skills/implement-issue/scripts/check_implementat
 再実行後の `evidence_sha256`（または各 candidate の `body_sha256` / `updated_at`）が Step 2 実行時の値と異なる場合は drift と判定し、**本 Section を再実行してから Step 3 以降をやり直す**。drift が解消しない、または新たに `wait_for_predecessor` / `human_review_required` / `duplicate` に route が変わった場合は、Step 7 へ進まず（`git push` / `gh pr create` を呼ばず）人間判断へ停止する。これは deterministic gate であり、自然言語での「再確認する」という指示に留めない。
 
 open-pr 側の validator が `overlap_preflight` evidence を強制検証する変更（`open-pr/scripts/update_pr.py` 等）は、本 Issue（#1452 / PR #1455）の Allowed Paths 外（follow-up 要）。現時点では本 SKILL.md の deterministic drift gate（上記）と、Step 7 で `gh pr create` を直接呼ばないこと（`open-pr` に委譲）が唯一の強制ポイントである。
+
+**Not controlled**: `open-pr` は stored/fresh evidence の digest・collection contract を検証して unsafe publication を拒否する consumer であり、producer の verified native successor predicate を再証明しない。producer predicate の不正な safe evidence、または required overlap evidence を欠く publication は `open-pr` integration test で fail-closed に保つ。
 
 `check_issue_overlap.py` 本体の scoring / schema ロジックの変更は本 Section の対象外（#1452 の Out of Scope）。また、本 preflight の continue 判定は OPEN Issue 間の意味的適合性のみを示し、active worktree / dirty path / 進行中 PR との同時編集安全性は証明しない（別 gate、#966 の責務）。
 

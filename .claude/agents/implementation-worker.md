@@ -27,7 +27,7 @@ permissionMode: acceptEdits
 ### 通常実装モード（V1）
 
 - `issue_number`（必須）
-- `contract_snapshot_url`（必須）: `issue-contract-review` の go 判定コメント URL
+- `contract_snapshot_url`（任意 telemetry）: 欠落・不正でも live Issue contract により継続する
 
 ### PR repair モード（V2）
 
@@ -39,18 +39,20 @@ permissionMode: acceptEdits
 
 ### V1 dispatch（通常実装モード）
 
-入力に `issue_number` と `contract_snapshot_url` が含まれる場合:
+入力に `issue_number` が含まれる場合:
 
-1. `issue-contract-review` が `status: go` を返していることを確認（未確認なら差し戻し）
+1. live Issue と canonical linked worktree identity を確認する。scope-rollup、
+   overlap、contract snapshot、body SHA、launch ledger、session manifest、
+   publish context、controlled-executor artifact は prerequisite にしない
 2. `.claude/skills/implement-issue/SKILL.md` の Procedure を実行（worktree 作成 → 実装 → verify → PR）
 3. `IMPLEMENT_RESULT_V1` を返す
 
-**V1 モードでは `issue-contract-review` preflight と worktree 作成が必須。**
+**V1 モードでは canonical linked worktree と live safety checks が必須。**
 
 worktree 作成は `scripts/agent-ops/worktree_bootstrap_exec.py` を使い `WORKTREE_BOOTSTRAP_RESULT_V1` を受け取る。
 executor が返す `WORKTREE_BOOTSTRAP_RESULT_V1.worktree_path` を `IMPLEMENT_RESULT_V1.worktree` にマップする。executor が返す `WORKTREE_BOOTSTRAP_RESULT_V1.branch` は `IMPLEMENT_RESULT_V1.branch` にそのままマップする。
 
-### V2 dispatch（PR repair executor モード）
+### V2 dispatch（PR repair executor の振り分けモード）
 
 入力に `IMPLEMENTATION_WORKER_REQUEST_V2` スキーマが含まれる場合:
 
@@ -101,7 +103,7 @@ IMPLEMENTATION_WORKER_REQUEST_V2:
 # commit_message_policy: "<pattern>" # 例: "fix: <ac_id> <description>"
 ```
 
-### required_auto_actions.kind → worker mode routing table
+### required_auto_actions.kind → worker mode の振り分け表
 
 | kind | worker mode | 委譲先 |
 |---|---|---|
@@ -156,7 +158,7 @@ IMPLEMENTATION_WORKER_RESULT_V2:
 #   reason: <string | null>
 ```
 
-## update_pr_body_hygiene mode
+## update_pr_body_hygiene mode（PR 本文衛生修正モード）
 
 PR body の hygiene 修正（closing keyword 追加等）を実行する mode。
 
@@ -181,7 +183,7 @@ uv run python3 .claude/skills/open-pr/scripts/update_pr.py \
 validator が fail を返した場合（`update_pr.py` が exit 1）、PR body を更新しない。
 `IMPLEMENTATION_WORKER_RESULT_V2.status: failed`、`wrapper_used: true`、`errors` に validator エラーを記録して返す。
 
-## update_branch mode
+## update_branch mode（ブランチ更新モード）
 
 PR ブランチを base branch の最新 HEAD まで更新する mode。GitHub REST API `PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch` を使用する（`UPDATE_BRANCH_REQUEST_V1` contract 参照）。
 
@@ -206,7 +208,7 @@ stale verdict（SHA mismatch）による誤更新を防ぐための race guard�
 `IMPLEMENTATION_WORKER_RESULT_V2.rerun_required.verification: true` と
 `IMPLEMENTATION_WORKER_RESULT_V2.rerun_required.pr_review: true` を返す。
 
-## apply_pr_review_fix_delta mode
+## apply_pr_review_fix_delta mode（PR レビュー修正差分の適用モード）
 
 `pr-review-judge` からの `REQUEST_CHANGES` フィードバックに基づいて実装修正を適用する mode。
 通常実装フローと同様に worktree 内で edit / commit を行い、push まで完了させる。

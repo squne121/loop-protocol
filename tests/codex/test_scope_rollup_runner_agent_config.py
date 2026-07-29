@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import hashlib
 import json
 import os
 import subprocess
@@ -94,114 +93,49 @@ def test_adapter_path_verified_fixture_allows_named_agent_and_rejects_generic_ag
     assert generic.capture_routing_action == "stop_human"
 
 
-def test_release_pinned_raw_hook_fixture_traverses_adapter_capture_and_canonical_parser(tmp_path: Path):
-    """GIVEN a pinned raw wire fixture WHEN adapter capture runs THEN only named passes.
-
-    The test runs the real Node adapter and canonical Python producer.  It
-    does not claim that a live Codex session or hook trust was active.
-    """
+def test_release_pinned_raw_hook_fixture_is_quarantined_to_passive_metadata(tmp_path: Path):
+    """A release-pinned raw payload reaches the passive recorder without
+    restoring the quarantined scope-rollup capture path."""
     payload = json.loads(RAW_HOOK_FIXTURE.read_text(encoding="utf-8"))
     assert set(payload) == {
         "hook_event_name", "session_id", "transcript_path", "cwd", "model", "permission_mode",
         "turn_id", "agent_id", "agent_type", "agent_transcript_path", "stop_hook_active", "last_assistant_message",
     }
-    planner = REPO_ROOT / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "plan_issue_scope_rollup.py"
-    planner_sha = hashlib.sha256(planner.read_bytes()).hexdigest()
-    invocation_id = f"scope-rollup-e2e-{tmp_path.name}"
-    plan_payload = {
-        "schema_version": 2, "repo": "squne121/loop-protocol", "generated_at": "2026-07-15T12:00:01Z",
-        "source": "plan_issue_scope_rollup", "body_sha256": "0" * 64,
-        "input": {"completeness": "full", "warnings": []}, "candidates": [],
-    }
-    result_sha = hashlib.sha256(json.dumps(plan_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    marker = f'''```yaml
-ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
-  status: ok
-  schema_version: 1
-  marker_schema_version: 3
-  repo: squne121/loop-protocol
-  current_issue: 1671
-  invocation_id: {invocation_id}
-  requested_at: "2026-07-15T12:00:00Z"
-  generated_at: "2026-07-15T12:00:01Z"
-  script_blob_sha256: "{planner_sha}"
-  inputs:
-    current_issue_sha256: "{'0' * 64}"
-    issues_all_sha256: "{'1' * 64}"
-    prs_all_sha256: "{'2' * 64}"
-    issue_count: 0
-    pr_count: 0
-    query_schema_version: 4
-    issues_completeness: {{page_count: 1, item_count: 0, total_count: 0, pagination_complete: true, sha256: "{'1' * 64}"}}
-    pull_requests_completeness: {{page_count: 1, item_count: 0, total_count: 0, pagination_complete: true, sha256: "{'2' * 64}"}}
-    transaction_budget: {{page_count: 2, response_bytes: 1, inventory_items: 0, max_transaction_pages: 10, max_response_bytes: 10, max_inventory_items: 10, deadline_seconds: 1}}
-  result:
-    plan_schema: ISSUE_SCOPE_ROLLUP_PLAN_V2
-    plan_schema_name: ISSUE_SCOPE_ROLLUP_PLAN_V2
-    plan_schema_version: 2
-    raw_plan_location: null
-    result_sha256: "{result_sha}"
-    verify_status: verified
-    payload: {json.dumps(plan_payload, ensure_ascii=False)}
-```\n'''
-    payload["cwd"] = str(REPO_ROOT)
-    payload["last_assistant_message"] = marker
-    capture_dir = tmp_path / "captures"
-    capture_dir.mkdir()
-    eligibility = tmp_path / "eligibility.json"
-    readiness = tmp_path / "readiness.json"
-    policy = REPO_ROOT / "docs" / "dev" / "session-recording-policy.md"
-    secret = REPO_ROOT / "docs" / "dev" / "secret-policy.md"
-    producer_digest = "sha256:" + hashlib.sha256(CAPTURE_PATH.read_bytes()).hexdigest()
-    digest = lambda path: "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
-    eligibility.write_text(json.dumps({"schema": "SESSION_RECORDING_SCOPE_ROLLUP_ELIGIBILITY_V1", "artifact_version": 1, "repo_root_realpath": str(REPO_ROOT.resolve()), "head_sha": None, "policy_digest": digest(policy), "secret_policy_digest": digest(secret), "public_checkpoint_present": False, "visibility": "public", "secrets_mode": "none", "generated_at": "2026-07-15T11:00:00Z", "expires_at": "2030-01-01T00:00:00Z", "safety_verdict": "allow"}))
-    # Keep the uv-selected executable path intact. Resolving its venv symlink
-    # selects the base interpreter, which may not contain the capture
-    # producer's locked PyYAML dependency on a clean CI runner.
-    readiness.write_text(json.dumps({"schema": "SESSION_RECORDING_SCOPE_ROLLUP_READINESS_V1", "artifact_version": 1, "repo_root_realpath": str(REPO_ROOT.resolve()), "uv_lock_digest": None, "python_version_digest": None, "interpreter_realpath": sys.executable, "interpreter_version": sys.version.split()[0], "producer_digest": producer_digest, "prepared": True, "generated_at": "2026-07-15T11:00:00Z"}))
-    os.chmod(eligibility, 0o600)
-    os.chmod(readiness, 0o600)
-    env = {**os.environ}
-    env.pop("CODEX_SCOPE_ROLLUP_CAPTURE_SCRIPT", None)
-    env.pop("CODEX_SESSION_RECORDING_PRODUCER", None)
-    env.pop("CODEX_HOOK_MANIFEST_ROOT", None)
-    env["NODE_ENV"] = "production"
-    env.update({
-        "SCOPE_ROLLUP_CAPTURE_DIR": str(capture_dir),
-        "SCOPE_ROLLUP_ELIGIBILITY_ARTIFACT_PATH": str(eligibility),
-        "SCOPE_ROLLUP_READINESS_ARTIFACT_PATH": str(readiness),
-    })
-    named = subprocess.run(["node", str(ADAPTER_PATH), "--event", "SubagentStop"], input=json.dumps(payload), text=True, capture_output=True, cwd=REPO_ROOT, env=env, check=False)
-    capture_dir_items = sorted(path.name for path in capture_dir.iterdir())
-    capture_sidecars = sorted(path.name for path in capture_dir.glob("*.capture.yaml"))
-    max_dump_len = 512
-    named_stdout = named.stdout[:max_dump_len]
-    named_stderr = named.stderr[:max_dump_len]
-    assert named.returncode == 0, (
-        f"named adapter failed [returncode={named.returncode}] "
-        f"stdout={repr(named_stdout)} stderr={repr(named_stderr)} "
-        f"capture_dir_entries={capture_dir_items} sidecars={capture_sidecars}"
+    recording_dir = tmp_path / "passive-recording"
+    env = {**os.environ, "CODEX_PASSIVE_RECORDING_DIR": str(recording_dir)}
+    named = subprocess.run(
+        ["node", str(ADAPTER_PATH), "--event", "SubagentStop"],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        cwd=REPO_ROOT,
+        env=env,
+        check=False,
     )
-    assert named.stdout.strip() == '{"continue":true}', (
-        f"named adapter unexpectedly returned {named.stdout!r} "
-        f"capture_dir_entries={capture_dir_items} sidecars={capture_sidecars}"
+    assert named.returncode == 0, named.stderr
+    assert named.stdout.strip() == '{"continue":true}'
+    records = (recording_dir / "passive-events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(records) == 1
+    record = json.loads(records[0])
+    assert record["schema"] == "codex_passive_session_record/v1"
+    assert record["event"] == "SubagentStop"
+    assert set(record) <= {"schema", "event", "recorded_at", "session_id", "thread_id", "agent_id"}
+    serialized = json.dumps(record)
+    assert payload["last_assistant_message"] not in serialized
+    assert payload["agent_type"] not in serialized
+
+    rejected = subprocess.run(
+        ["node", str(ADAPTER_PATH), "--event", "PreToolUse"],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        cwd=REPO_ROOT,
+        env=env,
+        check=False,
     )
-    captured_matches = list(capture_dir.glob("*.txt"))
-    sidecar_matches = list(capture_dir.glob("*.capture.yaml"))
-    assert captured_matches, f"missing scope_rollup txt capture; capture_dir_entries={capture_dir_items} sidecars={capture_sidecars}"
-    assert sidecar_matches, f"missing scope_rollup sidecar capture; capture_dir_entries={capture_dir_items} sidecars={capture_sidecars}"
-    captured = captured_matches[0]
-    sidecar = sidecar_matches[0]
-    parser = _load_capture_module().__file__.replace("capture_scope_rollup_final_response.py", "../skills/impl-review-loop/scripts/parse_scope_rollup_run_result.py")
-    spec = importlib.util.spec_from_file_location("canonical_parser", Path(parser).resolve())
-    module = importlib.util.module_from_spec(spec)
-    assert spec and spec.loader
-    spec.loader.exec_module(module)
-    parsed = module.parse_scope_rollup_output(assistant_output=captured.read_text(), assistant_output_file=captured, capture_sidecar_file=sidecar, repo="squne121/loop-protocol", issue_number=1671, invocation_id=invocation_id, expected_script_sha=planner_sha, requested_at="2026-07-15T12:00:00Z")
-    assert parsed["SCOPE_ROLLUP_MARKER_PARSE_RESULT_V1"]["status"] == "ok"
-    payload["agent_type"] = "worker"
-    rejected = subprocess.run(["node", str(ADAPTER_PATH), "--event", "SubagentStop"], input=json.dumps(payload), text=True, capture_output=True, cwd=REPO_ROOT, env={**env, "SCOPE_ROLLUP_CAPTURE_DIR": str(tmp_path / "rejected")}, check=False)
     assert rejected.returncode == 0
+    assert rejected.stdout == ""
+    assert len((recording_dir / "passive-events.jsonl").read_text().splitlines()) == 1
 
 
 def test_runtime_probe_is_availability_gated_and_never_promotes_skip_to_pass():
