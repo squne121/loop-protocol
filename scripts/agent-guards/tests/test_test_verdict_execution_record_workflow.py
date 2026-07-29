@@ -28,7 +28,14 @@ def resolved_manifest(producer):
     return producer.resolve_manifest_entry("uv.pytest.execution-record")
 
 
-def source_fixture(commit_sha="b" * 40, tree_sha="d" * 40, repository_id=1, repository_full_name="owner/repo", run_id=1, job_id=2):
+def source_fixture(
+    commit_sha="b" * 40,
+    tree_sha="d" * 40,
+    repository_id=1,
+    repository_full_name="owner/repo",
+    run_id=1,
+    job_id=2,
+):
     return {
         "repository_id": repository_id,
         "repository_full_name": repository_full_name,
@@ -312,7 +319,14 @@ def test_given_drift_or_missing_coverage_when_built_then_receipt_is_not_pass_eli
     assert not record["pass_eligible"]
     ea = matching_execution_artifact(record)
     manifest = resolved_manifest(producer)
-    receipt = producer.build_receipt(record, ea, record["subject"], record["contract"], manifest["manifest_sha256"], source)
+    receipt = producer.build_receipt(
+        record,
+        ea,
+        record["subject"],
+        record["contract"],
+        manifest["manifest_sha256"],
+        source,
+    )
     assert not receipt["pass_eligible"]
 
 
@@ -326,7 +340,14 @@ def test_given_identity_drift_after_upload_when_built_then_receipt_is_not_pass_e
     ea = matching_execution_artifact(record)
     manifest = resolved_manifest(producer)
     drifted_subject = dict(record["subject"], pr_head_sha="f" * 40)
-    receipt = producer.build_receipt(record, ea, drifted_subject, record["contract"], manifest["manifest_sha256"], source)
+    receipt = producer.build_receipt(
+        record,
+        ea,
+        drifted_subject,
+        record["contract"],
+        manifest["manifest_sha256"],
+        source,
+    )
     assert not receipt["pass_eligible"]
 
 
@@ -338,7 +359,14 @@ def test_given_artifact_digest_missing_when_built_then_receipt_is_not_pass_eligi
     record = build_record_from_fixture(producer, data, result, source=source)
     assert record["pass_eligible"]
     manifest = resolved_manifest(producer)
-    receipt = producer.build_receipt(record, {}, record["subject"], record["contract"], manifest["manifest_sha256"], source)
+    receipt = producer.build_receipt(
+        record,
+        {},
+        record["subject"],
+        record["contract"],
+        manifest["manifest_sha256"],
+        source,
+    )
     assert not receipt["pass_eligible"]
 
 
@@ -352,7 +380,14 @@ def test_given_artifact_id_mismatch_when_receipt_built_then_receipt_is_not_pass_
     ea = matching_execution_artifact(record)
     ea["artifact_id"] = 999999
     manifest = resolved_manifest(producer)
-    receipt = producer.build_receipt(record, ea, record["subject"], record["contract"], manifest["manifest_sha256"], source)
+    receipt = producer.build_receipt(
+        record,
+        ea,
+        record["subject"],
+        record["contract"],
+        manifest["manifest_sha256"],
+        source,
+    )
     assert not receipt["pass_eligible"]
 
 
@@ -366,7 +401,14 @@ def test_given_artifact_digest_mismatch_when_receipt_built_then_receipt_is_not_p
     ea = matching_execution_artifact(record)
     ea["artifact_archive_digest"] = "sha256:" + ("9" * 64)
     manifest = resolved_manifest(producer)
-    receipt = producer.build_receipt(record, ea, record["subject"], record["contract"], manifest["manifest_sha256"], source)
+    receipt = producer.build_receipt(
+        record,
+        ea,
+        record["subject"],
+        record["contract"],
+        manifest["manifest_sha256"],
+        source,
+    )
     assert not receipt["pass_eligible"]
 
 
@@ -405,7 +447,14 @@ def test_given_schema_files_when_validated_against_matching_record_then_no_error
 
     ea = matching_execution_artifact(record)
     manifest = resolved_manifest(producer)
-    receipt = producer.build_receipt(record, ea, record["subject"], record["contract"], manifest["manifest_sha256"], source)
+    receipt = producer.build_receipt(
+        record,
+        ea,
+        record["subject"],
+        record["contract"],
+        manifest["manifest_sha256"],
+        source,
+    )
     receipt_schema = json.loads((ROOT / "schemas" / "test-verdict-producer-receipt.schema.json").read_text())
     Draft202012Validator.check_schema(receipt_schema)
     errors = list(Draft202012Validator(receipt_schema).iter_errors(receipt))
