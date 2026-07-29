@@ -27,7 +27,7 @@ permissionMode: acceptEdits
 ### 通常実装モード（V1）
 
 - `issue_number`（必須）
-- `contract_snapshot_url`（必須）: `issue-contract-review` の go 判定コメント URL
+- `contract_snapshot_url`（任意 telemetry）: 欠落・不正でも live Issue contract により継続する
 
 ### PR repair モード（V2）
 
@@ -39,13 +39,15 @@ permissionMode: acceptEdits
 
 ### V1 dispatch（通常実装モード）
 
-入力に `issue_number` と `contract_snapshot_url` が含まれる場合:
+入力に `issue_number` が含まれる場合:
 
-1. `issue-contract-review` が `status: go` を返していることを確認（未確認なら差し戻し）
+1. live Issue と canonical linked worktree identity を確認する。scope-rollup、
+   overlap、contract snapshot、body SHA、launch ledger、session manifest、
+   publish context、controlled-executor artifact は prerequisite にしない
 2. `.claude/skills/implement-issue/SKILL.md` の Procedure を実行（worktree 作成 → 実装 → verify → PR）
 3. `IMPLEMENT_RESULT_V1` を返す
 
-**V1 モードでは `issue-contract-review` preflight と worktree 作成が必須。**
+**V1 モードでは canonical linked worktree と live safety checks が必須。**
 
 worktree 作成は `scripts/agent-ops/worktree_bootstrap_exec.py` を使い `WORKTREE_BOOTSTRAP_RESULT_V1` を受け取る。
 executor が返す `WORKTREE_BOOTSTRAP_RESULT_V1.worktree_path` を `IMPLEMENT_RESULT_V1.worktree` にマップする。executor が返す `WORKTREE_BOOTSTRAP_RESULT_V1.branch` は `IMPLEMENT_RESULT_V1.branch` にそのままマップする。

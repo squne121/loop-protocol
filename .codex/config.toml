@@ -1,7 +1,9 @@
 approval_policy = "on-request"
-default_permissions = "loop-protocol-rtk"
 
-# Project-local custom agents use default_permissions plus [permissions.*].
+[features]
+hooks = true
+
+# Project-local custom agents may explicitly select a profile from [permissions.*].
 # Repo-local hooks live in `.codex/hooks.json`; do not mix inline hooks here.
 # Known limitation: this is a fail-closed local guardrail, not a security boundary.
 # Project-local config is not evidence of profile routing; runtime evidence must

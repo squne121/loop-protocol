@@ -31,6 +31,11 @@ PR 番号が欠落していれば即座に `INSUFFICIENT_CONTEXT` を報告し�
 
 ### Allowed Paths Gate の生成
 
+launch ledger、scope-rollup、contract snapshot、body SHA、session manifest、
+publish context、controlled-executor receipt は advisory telemetry であり、欠落・
+stale・invalid を review stop にしない。有効な ledger も APPROVE、Allowed Paths、
+CI、TEST_VERDICT、merge readiness の証拠として使用しない。
+
 review_subagent（本 agent）は PR の実 changed files（`git diff --name-only <base_sha>...<head_sha>`）と linked issue 契約スナップショットの Allowed Paths から `ALLOWED_PATHS_GATE_RESULT_V1` を決定論的に再計算する。worker の self-report（`allowed_paths_compliance`）は input に使わない。review 実行時は `expected_contract_fingerprint` と `contract_source_kind/source_id` の binding を必須とし、欠落時は `indeterminate` として block する。gate result は `LOOP_VERDICT_V2.allowed_paths_gate` に埋め込み、`producer_role: review_subagent` / `worker_report_used_as_canonical: false` で明示する。
 
 完了時は skill が定義する LOOP_VERDICT_V2 YAML を含む verdict 本文を組み立て、verdict / merge_ready / reviewed_head_sha とともに呼び出し元へ返す。JSON の組み立て・`body_sha256`/`idempotency_key` の計算・`producer_role: pr-reviewer` の付与は本 agent の責務ではない -- 呼び出し元（Write ツールを持つ trusted orchestrator）が本文テキストを artifact パスへ書き込み、controlled review publisher を **render mode**（`--render-body-file` / `--verdict` / `--reviewed-head-sha` / `--expected-head-sha` / `--merge-ready`、`scripts/agent-guards/controlled_skill_mutation_exec.py --command-id pr_review.publish`）で起動する（trusted bridge、Issue #1539 fix_delta Blocker 1）。本 agent 自身は worktree を作成せず、生の `gh pr review` も呼ばない（`local_main_branch_guard.sh` が root checkout からの生 `gh pr review` を引き続き `gh_mutation_denied` として拒否するため）。 controlled review publisher の render mode 起動は `--command-id pr_review.publish --issue-number <紐づく Issue 番号> --pr-number <PR番号> --repo <owner>/<repo> --render-body-file ...` のように `--issue-number`（紐づく Issue）と `--pr-number`（レビュー対象の PR）を両方渡す（両者は独立した識別子であり一致しない場合がある、Issue #1822）。

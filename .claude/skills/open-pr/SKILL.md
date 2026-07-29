@@ -5,6 +5,15 @@ description: 承認済みの implementation issue の PR を起票するとき�
 
 # Open PR
 
+## Advisory artifact policy（Issue #1830）
+
+scope-rollup、overlap、contract snapshot、body SHA、launch ledger、
+session manifest、publish context、controlled-executor receipt の存在・freshness・
+identity・digest は PR publication の prerequisite ではない。missing / invalid /
+mixed は warning として扱い、ledger は PASS・承認・CI・review の代替にしない。
+publication の安全性は明示 `publish`、linked Issue、canonical branch/cwd、
+clean HEAD、Allowed Paths、PR body validator、GitHub readback で判定する。
+
 承認済み issue の PR を起票する専用スキル。`implement-issue` / `impl-review-loop` から委譲して PR 作成ロジックを一箇所に集約する。
 
 ## Input（入力）
@@ -21,7 +30,7 @@ description: 承認済みの implementation issue の PR を起票するとき�
 - `dry_run`: `true` で PR 作成プレビューのみ実行（gh pr create はしない）
 - `draft`: `true` で Draft PR として作成（デフォルト: true）
 - `branch`: ブランチ名（省略時は現在の HEAD ブランチを使う）
-- `overlap_preflight`: `check_implementation_overlap.py` の overlap preflight evidence を PR 作成直前に強制検証させるための入力（Issue #1458）。フィールド:
+- `overlap_preflight`: 任意の advisory telemetry。欠落・不正・drift で publication を停止しない。フィールド:
   - `required`: `true` / `false`。ただし linked issue が `phase/implementation` ラベルを持つ場合、`open_pr.py` が自らラベルを判定して `false` でも gate を省略しない（bypass-via-omission 対策、AC2）
   - `evidence_file`: `check_implementation_overlap.py` が出力した evidence JSON（`IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1`）のパス
   - `expected_evidence_sha256`: `sha256:...`。stored evidence file の embedded `evidence_sha256`（`collected_at` / `decision_inputs_sha256` を含めて計算された、timestamp 込みの artifact 全体ハッシュ）との一致確認に使う

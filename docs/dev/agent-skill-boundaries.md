@@ -36,7 +36,9 @@ worker や CI/review/security/permission/publication の safety stop と混同�
 ## Codex Dispatch Guardrail（Codex ディスパッチ境界）
 
 - Codex CLI の root thread は control-plane 専用とし、`implementation-worker` / `test-runner` / `pr-reviewer` / `post-merge-cleanup-worker` を明示 spawn して data-plane を委譲する
-- repo-side deterministic guardrail の canonical evidence は event-derived `SUBAGENT_LAUNCH_LEDGER_V1` とし、worker self-report 単独では spawn evidence とみなさない
+- `SUBAGENT_LAUNCH_LEDGER_V1` は advisory telemetry とし、missing / stale /
+  mixed / invalid / malformed / hook-skipped は warning のみとする。有効な ledger
+  も PASS・承認・CI・review・merge readiness の canonical evidence にしない
 - `SUBAGENT_LAUNCH_LEDGER_V1.coverage_scope` は support 済みの `SubagentStart` / `PreToolUse(Bash|apply_patch|Edit|Write)` 観測範囲を明示する。未対応 path の absence を「完全防止」の証拠として主張しない
 - project-local `.codex/config.toml` は profile routing の証拠として扱わず、actual runtime contract と launch-ledger evidence を validator 対象にする
 - live spawn の runtime verification は `#601` に deferred し、この文書で扱うのは evidence 不足時に fail-closed する repo-side 監査境界のみ

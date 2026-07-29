@@ -1,5 +1,19 @@
 # Preparation（事前準備）
 
+## Issue #1830 precedence: live-state intake
+
+本節の legacy capsule / snapshot / `status: go` gate より本項を優先する。
+`issue_number` で live Issue を読み、canonical linked worktree の cwd、branch、
+HEAD、dirty state を直接確認して準備を継続する。scope-rollup、overlap、
+contract snapshot、body SHA、launch ledger、session manifest、publish context、
+controlled-executor artifact は任意 telemetry であり、missing / stale / invalid /
+mixed / malformed / hook-skipped を warning として記録しても停止しない。
+ledger は有効に見える場合も PASS・承認・routing 証拠にしない。
+
+停止条件は live Issue の不在、明示 Issue と canonical worktree identity の不一致、
+root checkout、detached HEAD、dirty worktree、Allowed Paths 違反、実テスト・CI・
+PR review の失敗など、artifact chain から独立した安全境界に限定する。
+
 ループ開始前に LOOP_STATE を初期化し、必要な前提を確認する。
 
 ## 0-a. Intake capsule-first（インテーク処理をカプセル生成優先で行う）

@@ -6,14 +6,15 @@ description: 承認済みの implementation child issue（`issue-contract-review
 # Implement Issue
 
 承認済み contract に従い、implementation child issue を実装し、verify、PR、Issue 更新まで進める手順。
-`issue-contract-review` で `status: go` を得た後に呼ぶ。
+live Issue contract を取得できれば呼び出せる。artifact は着手権限ではない。
 
 ## Input（入力）
 
 - `Issue番号` または `Issue URL`（必須）
-- `issue-contract-review` の contract-snapshot comment URL（必須）
+- `issue-contract-review` の contract-snapshot comment URL（任意 telemetry）
 
-Note: `contract_snapshot_url` の省略時自動検出・自動 materialize は #149 の責務。本 skill 単体では URL 入力を必須とし、URL 未提供時は `impl-review-loop` / #149 実装後の preparation に委譲する。
+Note: `contract_snapshot_url` の欠落・stale・invalid は実装停止理由にしない。
+live Issue、canonical linked worktree、Allowed Paths、実テストを正本とする。
 
 ## Procedure（手順）
 

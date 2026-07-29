@@ -42,6 +42,11 @@ from git_mutation_command_policy import (  # noqa: E402
 import git_mutation_command_policy as _policy_mod  # noqa: E402
 from local_main_branch_guard import evaluate  # noqa: E402
 
+_AGENT_OPS_DIR = _GUARDS_DIR.parent / "agent-ops"
+if str(_AGENT_OPS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_OPS_DIR))
+import verified_ff_merge_exec as _executor_mod  # noqa: E402
+
 ISSUE_NUMBER = "1589"
 ISSUE_BRANCH = "worktree-issue-1589-verified-ff-merge"
 
@@ -82,7 +87,7 @@ def _make_main_and_linked_worktree(tmp_path, monkeypatch, branch=ISSUE_BRANCH, p
     _git("remote", "add", "origin", str(remote), cwd=main_repo)
     _git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=main_repo)
 
-    worktree = tmp_path / "worktree"
+    worktree = tmp_path / "issue-1589-verified-ff-merge"
     _git("worktree", "add", "-q", "-b", branch, str(worktree), cwd=main_repo)
     _git("push", "-q", "origin", "HEAD:refs/heads/" + branch, cwd=worktree)
 
@@ -104,6 +109,74 @@ def _git_path(cwd, relative):
     )
     out = result.stdout.strip()
     return out if os.path.isabs(out) else os.path.join(str(cwd), out)
+
+
+def test_executor_uses_canonical_worktree_identity_without_ambient_issue(tmp_path, monkeypatch):
+    worktree, _remote, _base_sha, ahead_sha = _make_main_and_linked_worktree(tmp_path, monkeypatch)
+    monkeypatch.delenv("LOOP_ISSUE_NUMBER", raising=False)
+    result = _executor_mod.run(ahead_sha, cwd=str(worktree))
+    assert result["status"] == MERGE_STATUS_MERGED_AND_VERIFIED, result
+    assert result["post_head"] == ahead_sha
+
+
+def test_executor_denies_explicit_issue_mismatch(tmp_path, monkeypatch):
+    worktree, _remote, _base_sha, ahead_sha = _make_main_and_linked_worktree(tmp_path, monkeypatch)
+    result = _executor_mod.run(ahead_sha, cwd=str(worktree), issue_number="999")
+    assert result == {"status": "denied", "reason_code": "branch_issue_number_mismatch"}
+
+
+def test_two_linked_worktree_executors_do_not_cross_attribute_identity_or_head(
+    tmp_path, monkeypatch
+):
+    main_repo = tmp_path / "main"
+    remote = tmp_path / "remote.git"
+    main_repo.mkdir()
+    _init_repo(main_repo, "main")
+    base_sha = _commit(main_repo, "tracked.txt", "base")
+    subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+    _git("remote", "add", "origin", str(remote), cwd=main_repo)
+    _git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=main_repo)
+    worktrees = []
+    targets = []
+    for issue in ("201", "202"):
+        branch = f"worktree-issue-{issue}-parallel"
+        worktree = tmp_path / f"issue-{issue}-parallel"
+        _git("worktree", "add", "-q", "-b", branch, str(worktree), cwd=main_repo)
+        _git("checkout", "-q", "-b", f"_ahead_{issue}", cwd=worktree)
+        target = _commit(worktree, f"{issue}.txt", issue)
+        _git("checkout", "-q", branch, cwd=worktree)
+        assert _rev_parse(worktree, "HEAD") == base_sha
+        _git("push", "-q", "origin", target + ":refs/heads/" + branch, cwd=worktree)
+        worktrees.append(worktree)
+        targets.append(target)
+
+    executor = str(_AGENT_OPS_DIR / "verified_ff_merge_exec.py")
+    child_env = os.environ.copy()
+    child_env.pop("LOOP_ISSUE_NUMBER", None)
+    child_env["LOOP_CANONICAL_REPO_URL_PATTERN"] = "^" + re.escape(str(remote)) + chr(92) + chr(90)
+    # Popen both children before waiting: this is a real concurrent subprocess barrier.
+    children = [
+        subprocess.Popen(
+            [sys.executable, executor, "--target-sha", target],
+            cwd=worktree,
+            env=child_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for worktree, target in zip(worktrees, targets, strict=True)
+    ]
+    results = []
+    for child in children:
+        stdout, stderr = child.communicate(timeout=30)
+        assert child.returncode == 0, stderr
+        import json
+        results.append(json.loads(stdout))
+    assert [result["post_head"] for result in results] == targets
+    assert [result["active_branch"] for result in results] == [
+        "worktree-issue-201-parallel",
+        "worktree-issue-202-parallel",
+    ]
 
 # P0 Blocker regression: classify_rtk_git_mutation must be a PURE shape
 # classifier for the merge lane -- it must never execute a real merge, and

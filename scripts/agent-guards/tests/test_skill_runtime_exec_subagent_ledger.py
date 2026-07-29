@@ -217,12 +217,12 @@ def test_hook_cold_and_warm_ledger_peer_write_is_quiescent(tmp_path: Path) -> No
     assert [entry["observed_dispatch"]["agent_id"] for entry in ledger["launches"]] == ["a1", "a2"]
 
 
-def test_ledger_exact_policy_rejects_nonregular_and_delete_transitions(tmp_path: Path) -> None:
+def test_ledger_exact_state_is_advisory_to_runtime_routing(tmp_path: Path) -> None:
     """GIVEN the stable-exact ledger final file
     WHEN it transitions to delete, symlink, directory, FIFO, socket, or
     device (from absent or from regular)
-    THEN the typed policy fails closed on that exact path, while
-    absent -> regular and regular -> regular remain authorized."""
+        THEN low-level classification remains available, but runtime change
+        attribution treats every exact ledger state as advisory."""
     assert sre._is_allowed_stable_ledger_transition("absent", "regular") is True
     assert sre._is_allowed_stable_ledger_transition("regular", "regular") is True
     assert sre._is_allowed_stable_ledger_transition("regular", "absent") is False
@@ -274,7 +274,7 @@ def test_ledger_exact_policy_rejects_nonregular_and_delete_transitions(tmp_path:
         is None
     )
 
-    # regular -> delete is rejected.
+    # Runtime routing ignores exact ledger deletion.
     before_snapshot_2 = sre._snapshot_repo_paths(str(repo), "9999")
     before_status_2 = sre._git_status_paths(str(repo))
     ledger_before_kinds_2, ledger_before_content_2, ledger_ancestor_before_kinds_2 = _ledger_before_state(repo)
@@ -289,10 +289,10 @@ def test_ledger_exact_policy_rejects_nonregular_and_delete_transitions(tmp_path:
             ledger_before_content_2,
             ledger_ancestor_before_kinds_2,
         )
-        == _LEDGER_REL
+        is None
     )
 
-    # regular -> symlink is rejected.
+    # Runtime routing ignores exact ledger replacement.
     outside = repo.parent / "outside-target.json"
     outside.write_text("{}", encoding="utf-8")
     before_snapshot_3 = sre._snapshot_repo_paths(str(repo), "9999")
@@ -304,10 +304,10 @@ def test_ledger_exact_policy_rejects_nonregular_and_delete_transitions(tmp_path:
         sre._find_unauthorized_repo_changes(
             str(repo), "9999", before_snapshot_3, before_status_3, ledger_before_kinds_3
         )
-        == _LEDGER_REL
+        is None
     )
 
-    # absent -> directory is rejected.
+    # Non-regular advisory state is not workflow authority.
     ledger_path.unlink()
     before_snapshot_4 = sre._snapshot_repo_paths(str(repo), "9999")
     before_status_4 = sre._git_status_paths(str(repo))
@@ -317,10 +317,10 @@ def test_ledger_exact_policy_rejects_nonregular_and_delete_transitions(tmp_path:
         sre._find_unauthorized_repo_changes(
             str(repo), "9999", before_snapshot_4, before_status_4, ledger_before_kinds_4
         )
-        == _LEDGER_REL
+        is None
     )
 
-    # absent -> FIFO is rejected.
+    # A malformed/mixed telemetry path remains non-blocking.
     ledger_path.rmdir()
     before_snapshot_5 = sre._snapshot_repo_paths(str(repo), "9999")
     before_status_5 = sre._git_status_paths(str(repo))
@@ -330,7 +330,7 @@ def test_ledger_exact_policy_rejects_nonregular_and_delete_transitions(tmp_path:
         sre._find_unauthorized_repo_changes(
             str(repo), "9999", before_snapshot_5, before_status_5, ledger_before_kinds_5
         )
-        == _LEDGER_REL
+        is None
     )
 
 
@@ -415,7 +415,7 @@ def _valid_ledger_doc(launches: list | None = None, root_thread_actions: list | 
     }
 
 
-def test_nonregular_to_regular_transition_fails_closed(tmp_path: Path) -> None:
+def test_nonregular_to_regular_transition_is_advisory_to_runtime(tmp_path: Path) -> None:
     """GIVEN the stable ledger path's before-kind was symlink, dir, fifo,
     socket, or device (never absent or regular)
     WHEN the after-kind is regular
@@ -452,10 +452,10 @@ def test_nonregular_to_regular_transition_fails_closed(tmp_path: Path) -> None:
         None,
         ledger_ancestor_before_kinds,
     )
-    assert unauthorized == _LEDGER_REL
+    assert unauthorized is None
 
 
-def test_regular_to_malformed_regular_fails_closed(tmp_path: Path) -> None:
+def test_regular_to_malformed_regular_is_advisory_to_runtime(tmp_path: Path) -> None:
     """GIVEN a valid `SUBAGENT_LAUNCH_LEDGER_V1` ledger
     WHEN it is replaced by malformed content (not valid JSON, or valid JSON
     that is not a valid ledger document)
@@ -478,11 +478,9 @@ def test_regular_to_malformed_regular_fails_closed(tmp_path: Path) -> None:
         str(repo), "9999", before_snapshot, before_status, ledger_before_kinds, ledger_before_bytes,
         ledger_ancestor_before_kinds,
     )
-    assert unauthorized == _LEDGER_REL
+    assert unauthorized is None
 
-    # Deleting an existing launch entry (instead of only appending) is also
-    # rejected even though the replacement is itself a structurally valid
-    # ledger document.
+    # Entry loss is also advisory and cannot stop workflow routing.
     before_snapshot_2 = sre._snapshot_repo_paths(str(repo), "9999")
     before_status_2 = sre._git_status_paths(str(repo))
     ledger_before_kinds_2, ledger_before_bytes_2, ledger_ancestor_before_kinds_2 = _ledger_before_state(repo)
@@ -491,7 +489,7 @@ def test_regular_to_malformed_regular_fails_closed(tmp_path: Path) -> None:
         str(repo), "9999", before_snapshot_2, before_status_2, ledger_before_kinds_2, ledger_before_bytes_2,
         ledger_ancestor_before_kinds_2,
     )
-    assert unauthorized_2 == _LEDGER_REL
+    assert unauthorized_2 is None
 
 
 def test_parent_symlink_to_real_directory_transition_fails_closed(tmp_path: Path) -> None:
