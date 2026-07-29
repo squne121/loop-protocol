@@ -282,3 +282,19 @@ def test_given_structural_signal_when_described_then_natural_language_similarity
     assert "構造的シグナル" in content
     assert "補助 signal" in content
     assert "唯一の根拠にはしない" in content
+
+
+def test_given_verified_native_successor_when_described_then_evidence_route_is_narrow() -> None:
+    """#1797 AC1/AC4/AC6: structural collision を evidence route に残せるのは
+    native provenance と identity/direction/readback が揃う candidate だけであり、
+    open-pr は producer predicate を再証明しない境界を明記する。
+    """
+    content = _skill_text()
+    for phrase in (
+        "verified native successor predicate",
+        "current_native_blocking",
+        "candidate_native_blocked_by",
+        "contract-only/legacy-only",
+        "Not controlled",
+    ):
+        assert phrase in content
