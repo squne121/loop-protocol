@@ -5,7 +5,7 @@ description: 承認済みの implementation issue の PR を起票するとき�
 
 # Open PR
 
-## Advisory artifact policy（Issue #1830）
+## Advisory artifact policy（助言的 artifact の方針、Issue #1830）
 
 scope-rollup、overlap、contract snapshot、body SHA、launch ledger、
 session manifest、publish context、controlled-executor receipt の存在・freshness・

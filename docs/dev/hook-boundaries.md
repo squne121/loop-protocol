@@ -18,7 +18,7 @@ schema_version: hook_boundaries_manifest_v1
 > セキュリティ上の保護は branch protection / GitHub Actions CI / repository permission で行う。  
 > Codex hooks は `.codex/hooks.json` に集約し、`.codex/config.toml` に inline hooks を混在させない。
 
-## Codex advisory hook allowlist（Issue #1830）
+## Codex advisory hook allowlist（助言的 hook の許可一覧、Issue #1830）
 
 project-local Codex hook の active allowlist は `SessionEnd` と `SubagentStop` の
 passive recorder だけである。`PreToolUse`、`PermissionRequest`、`Stop`、
@@ -38,8 +38,8 @@ project-local validator の authority 外として報告だけに留める。
 ledger、session-manifest、publish-context、controlled executor artifact を
 前提条件としない。quarantine した enforcement の再導入には別 Issue が必要である。
 コードレビュー、product CI、Codex built-in sandbox / approval、GitHub protection
-は引き続き適用し、git/network の可否は選択中の sandbox、approval、managed
-configuration に依存する。
+は引き続き適用し、git/network の可否は選択中の sandbox、approval、
+managed configuration（管理対象設定）に依存する。
 
 ---
 

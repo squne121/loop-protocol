@@ -1,6 +1,6 @@
 # Preparation（事前準備）
 
-## Issue #1830 precedence: live-state intake
+## Issue #1830 precedence: live-state intake（優先する live state の取り込み）
 
 本節の legacy capsule / snapshot / `status: go` gate より本項を優先する。
 `issue_number` で live Issue を読み、canonical linked worktree の cwd、branch、

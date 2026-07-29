@@ -9,7 +9,7 @@ description: >-
 
 # Impl Review Loop
 
-## Advisory artifact policy（Issue #1830）
+## Advisory artifact policy（助言的 artifact の方針、Issue #1830）
 
 scope-rollup、overlap、contract snapshot、body SHA、launch ledger、
 session manifest、publish context、controlled-executor receipt は観測情報であり、
