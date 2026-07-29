@@ -137,7 +137,7 @@ class TestNodeWrapperIdentity:
         ]
         assert node_hooks, "node ラッパー hook が見つかりません"
         hids = [e["handler_id"] for e in node_hooks]
-        assert "generate_session_manifest_from_hook" in hids, (
+        assert "session_manifest_debounce" in hids, (
             f"node ラッパーの handler_id が期待値と異なります: {hids}"
         )
 
@@ -235,7 +235,6 @@ class TestSettingsManifestAlignment:
 class TestTelemetryHooksClassification:
     TELEMETRY_HOOKS = {
         "session_manifest_coordinator",
-        "generate_session_manifest_from_hook",
         "save_loop_state_before_compaction",
         "rtk_boundary_shadow_guard",
     }

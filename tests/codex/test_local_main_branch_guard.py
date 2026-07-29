@@ -330,30 +330,19 @@ class TestIssue1543OwnerRequestChangesLauncherGrammarArityCodex:
         assert result["status"] == "allow"
 
     def test_codex_hooks_json_has_local_main_branch_guard(self):
-        """Codex .codex/hooks.json must include local_main_branch_guard hook."""
+        """Codex hook は quarantine 後の passive allowlist に限定する。"""
         hooks_path = REPO_ROOT / ".codex" / "hooks.json"
-        if not hooks_path.exists():
-            pytest.skip(".codex/hooks.json not found")
+        assert hooks_path.exists()
         hooks = json.loads(hooks_path.read_text())
         hooks_root = hooks.get("hooks", {})
-
-        # Check PreToolUse
-        pretool = hooks_root.get("PreToolUse", [])
-        bash_entry = next((e for e in pretool if e.get("matcher") == "^Bash$"), None)
-        assert bash_entry is not None, "PreToolUse must have ^Bash$ matcher"
-        commands = [h.get("command", "") for h in bash_entry.get("hooks", [])]
-        assert any("local_main_branch_guard" in cmd for cmd in commands), (
-            "PreToolUse ^Bash$ must include local_main_branch_guard hook"
-        )
-
-        # Check PermissionRequest
-        perm_req = hooks_root.get("PermissionRequest", [])
-        bash_perm = next((e for e in perm_req if e.get("matcher") == "^Bash$"), None)
-        assert bash_perm is not None, "PermissionRequest must have ^Bash$ matcher"
-        perm_commands = [h.get("command", "") for h in bash_perm.get("hooks", [])]
-        assert any("local_main_branch_guard" in cmd for cmd in perm_commands), (
-            "PermissionRequest ^Bash$ must include local_main_branch_guard hook"
-        )
+        assert set(hooks_root) == {"SessionEnd", "SubagentStop"}
+        commands = [
+            hook.get("command", "")
+            for entries in hooks_root.values()
+            for entry in entries
+            for hook in entry.get("hooks", [])
+        ]
+        assert not any("local_main_branch_guard" in command for command in commands)
 
     def test_codex_hook_script_exists(self):
         """Codex hook script .codex/hooks/local_main_branch_guard.sh must exist."""
@@ -552,24 +541,11 @@ class TestAC17CodexStartupPreflightMandatory:
         (i.e., it should be defined only once per event/matcher combination).
         """
         hooks_path = REPO_ROOT / ".codex" / "hooks.json"
-        if not hooks_path.exists():
-            pytest.skip(".codex/hooks.json not found")
+        assert hooks_path.exists()
         hooks = json.loads(hooks_path.read_text())
         hooks_root = hooks.get("hooks", {})
-
-        for event_name, entries in hooks_root.items():
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                matcher = entry.get("matcher", "")
-                # Count local_main_branch_guard occurrences in this matcher's hooks
-                guard_count = sum(
-                    1 for h in entry.get("hooks", []) if "local_main_branch_guard" in h.get("command", "")
-                )
-                assert guard_count <= 1, (
-                    f"local_main_branch_guard is defined {guard_count} times "
-                    f"in {event_name}/{matcher!r} — must not be duplicated"
-                )
+        assert "PreToolUse" not in hooks_root
+        assert "PermissionRequest" not in hooks_root
 
     def test_startup_preflight_runs_successfully_on_main(self, tmp_path):
         """

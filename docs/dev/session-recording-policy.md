@@ -17,6 +17,18 @@ created: "2026-05-24"
 
 ## Codex CLI Hook Boundary（Codex CLI フック境界）
 
+- Issue #1830 以後、project-local Codex active hook は `SessionEnd` と
+  `SubagentStop` の passive advisory recorder だけとする。以下に残る
+  PreToolUse、PermissionRequest、Stop、scope-rollup、manifest producer、
+  controlled publish の記述は履歴・再導入時の設計資料であり、active wiring
+  ではない。再導入には別 Issue が必要である。
+- recorder は transcript 本文を解析せず、network/GitHub/git mutation、
+  subprocess、permission/continuation/additional-context decision、post-run
+  verifier、required gate を行わない。全エラーは fail-open、SessionEnd は
+  3 秒以内、SubagentStop stdout は厳密に `{"continue":true}` のみとする。
+- `[features].hooks = true` を維持し、project default permissions の強制は
+  行わない。built-in sandbox / `approval_policy = "on-request"` と managed
+  configuration が実際の権限境界を決める。
 - `.codex/hooks.json` の structural validation は repo-local wiring の確認に限られ、runtime active hook state や trust state の証跡にはならない。
 - Codex CLI では `[features].hooks` を canonical key とし、`codex_hooks` は deprecated alias としてのみ扱う。
 - project `.codex/` layer は trust 済みでなければ load されない。`--dangerously-bypass-hook-trust` は one-off automation 向けの非既定 escape hatch であり、pilot の通常運用では使わない。

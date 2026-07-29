@@ -501,27 +501,20 @@ class TestMajorCodexHooksTopologyCheck:
     def test_topology_drift_is_detected_and_fails_closed(self):
         checker = _load_check_hook_boundaries()
         actual = checker.load_codex_hooks_topology()
-        assert actual, "expected at least one PreToolUse matcher in .codex/hooks.json"
+        assert actual == {}, "quarantined Codex surface must have no active PreToolUse matcher"
 
-        # Mutate a copy: add one handler to a matcher and verify exact topology
-        # validation fails closed.
-        drifted_expected = {matcher: list(hooks) for matcher, hooks in actual.items()}
-        first_matcher = next(iter(drifted_expected))
-        drifted_expected[first_matcher] = drifted_expected[first_matcher] + [
+        # Compare the active empty topology with a synthetic enforcing topology.
+        drifted_expected = {
+            "^Bash$": [
             {
                 "type": "command",
                 "command": "echo unexpected",
                 "timeout": 1,
                 "statusMessage": "Unexpected hook",
             }
-        ]
+            ]
+        }
 
         errors = checker.check_codex_hooks_pretool_topology(expected=drifted_expected)
         assert errors, "topology drift must be reported, not silently accepted"
         assert any("pretool_topology" in err for err in errors)
-
-        # Also verify a removed-matcher case fails closed.
-        removed_expected = dict(actual)
-        del removed_expected[first_matcher]
-        errors2 = checker.check_codex_hooks_pretool_topology(expected=removed_expected)
-        assert errors2

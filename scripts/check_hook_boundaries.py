@@ -36,90 +36,9 @@ CODEX_HOOKS_PATH = REPO_ROOT / ".codex" / "hooks.json"
 # .codex/hooks.json (it is imported by existing guards, not registered as an
 # independent hook).
 _FASTPATH_CLASSIFIER_MODULE_NAME = "pretool_fastpath_classifier"
-_CHECK_CODEX_AGENTS_PRETOOL = (
-    'rtk pnpm exec node "$(git rev-parse --show-toplevel)/scripts/check-codex-agents.mjs" '
-    "--hook-pretool"
-)
-_SESSION_RECORDING_PRETOOL = (
-    'rtk pnpm exec node "$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs" '
-    "--event PreToolUse"
-)
-
-# Issue #1367: fixed, fail-closed expected snapshot of .codex/hooks.json
-# PreToolUse hook entries. Drift in order, command, timeout, statusMessage,
-# type, or extra handler fields must fail closed.
-EXPECTED_CODEX_PRETOOL_TOPOLOGY: dict[str, list[dict[str, Any]]] = {
-    "^Bash$": [
-        {
-            "type": "command",
-            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/local_main_branch_guard.sh"',
-            "timeout": 10,
-            "statusMessage": "Checking local root branch policy",
-        },
-        {
-            "type": "command",
-            "command": 'python3 "$(git rev-parse --show-toplevel)/scripts/agent-guards/worktree_scope_guard.py"',
-            "timeout": 20,
-            "statusMessage": "Checking worktree cleanup scope policy (shared core)",
-        },
-        {
-            "type": "command",
-            "command": _CHECK_CODEX_AGENTS_PRETOOL,
-            "timeout": 30,
-            "statusMessage": "Checking LOOP_PROTOCOL Bash guardrail",
-        },
-        {
-            "type": "command",
-            "command": _SESSION_RECORDING_PRETOOL,
-            "timeout": 30,
-            "statusMessage": "Checking Codex session-recording PreToolUse guard",
-        },
-        {
-            "type": "command",
-            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/ci_test_performance_advisory.sh"',
-            "timeout": 10,
-            "statusMessage": "Checking CI/test-lane path advisory",
-        },
-        {
-            "type": "command",
-            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/root_temporary_residue_advisory.sh"',
-            "timeout": 10,
-            "statusMessage": "Checking root temporary residue advisory",
-        },
-    ],
-    "^(apply_patch|Edit|Write)$": [
-        {
-            "type": "command",
-            "command": 'python3 "$(git rev-parse --show-toplevel)/scripts/agent-guards/codex_apply_patch_adapter.py"',
-            "timeout": 20,
-            "statusMessage": "Checking worktree containment for apply_patch/Edit/Write (shared core)",
-        },
-        {
-            "type": "command",
-            "command": _CHECK_CODEX_AGENTS_PRETOOL,
-            "timeout": 30,
-            "statusMessage": "Checking LOOP_PROTOCOL patch guardrail",
-        },
-        {
-            "type": "command",
-            "command": _SESSION_RECORDING_PRETOOL,
-            "timeout": 30,
-            "statusMessage": "Checking Codex session-recording patch guard",
-        },
-        {
-            "type": "command",
-            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/ci_test_performance_advisory.sh"',
-            "timeout": 10,
-            "statusMessage": "Checking CI/test-lane path advisory",
-        },
-        {
-            "type": "command",
-            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/root_temporary_residue_advisory.sh"',
-            "timeout": 10,
-            "statusMessage": "Checking root temporary residue advisory",
-        },
-    ],
-}
+# Issue #1830: enforcing PreToolUse handlers are quarantined. Keep the existing
+# helper API for callers, but its exact expected topology is now empty.
+EXPECTED_CODEX_PRETOOL_TOPOLOGY: dict[str, list[dict[str, Any]]] = {}
 
 # ─── manifest 抽出 ────────────────────────────────────────────────────────────
 
@@ -529,8 +448,7 @@ def check_codex_hooks_pretool_topology(
     path: Path = CODEX_HOOKS_PATH,
     expected: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[str]:
-    """Fail-closed comparison of the current .codex/hooks.json PreToolUse
-    topology against the frozen expected handler matrix."""
+    """Verify that the quarantined Codex surface has no active PreToolUse hook."""
     if expected is None:
         expected = EXPECTED_CODEX_PRETOOL_TOPOLOGY
     errors: list[str] = []

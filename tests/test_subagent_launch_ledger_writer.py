@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WRITER_SOURCE = ROOT / "scripts" / "subagent-launch-ledger-writer.c"
@@ -157,14 +159,18 @@ def test_independent_trusted_processes_preserve_distinct_evidence(tmp_path: Path
         capture_output=True,
     )
     assert audit.returncode == 0, audit.stdout
-    assert json.loads(audit.stdout)["status"] == "pass"
+    audit_payload = json.loads(audit.stdout)
+    assert audit_payload["status"] == "observed"
+    assert audit_payload["evidence_usable"] is False
 
 
 def test_hook_builds_writer_and_records_dispatch_evidence(tmp_path: Path):
     agent_dir = tmp_path / ".codex" / "agents"
     agent_dir.mkdir(parents=True)
     (agent_dir / "spark-skim.toml").write_text(
-        "model = \"gpt-5.3-codex-spark\"\nmodel_reasoning_effort = \"medium\"\ndefault_permissions = \"loop-protocol-readonly\"\n",
+        "model = \"gpt-5.3-codex-spark\"\n"
+        "model_reasoning_effort = \"medium\"\n"
+        "default_permissions = \"loop-protocol-readonly\"\n",
         encoding="utf-8",
     )
     writer_dir = tmp_path / "scripts"
@@ -213,7 +219,9 @@ def test_hook_builds_writer_outside_repo_tree_cold_and_warm(tmp_path: Path):
     agent_dir = tmp_path / ".codex" / "agents"
     agent_dir.mkdir(parents=True)
     (agent_dir / "spark-skim.toml").write_text(
-        "model = \"gpt-5.3-codex-spark\"\nmodel_reasoning_effort = \"medium\"\ndefault_permissions = \"loop-protocol-readonly\"\n",
+        "model = \"gpt-5.3-codex-spark\"\n"
+        "model_reasoning_effort = \"medium\"\n"
+        "default_permissions = \"loop-protocol-readonly\"\n",
         encoding="utf-8",
     )
     writer_dir = tmp_path / "scripts"
@@ -302,7 +310,9 @@ def _make_ledger_writer_fixture_repo(tmp_path: Path, *, nonce_label: str) -> Pat
     agent_dir = repo / ".codex" / "agents"
     agent_dir.mkdir(parents=True)
     (agent_dir / "spark-skim.toml").write_text(
-        "model = \"gpt-5.3-codex-spark\"\nmodel_reasoning_effort = \"medium\"\ndefault_permissions = \"loop-protocol-readonly\"\n",
+        "model = \"gpt-5.3-codex-spark\"\n"
+        "model_reasoning_effort = \"medium\"\n"
+        "default_permissions = \"loop-protocol-readonly\"\n",
         encoding="utf-8",
     )
     writer_dir = repo / "scripts"
@@ -528,6 +538,25 @@ def test_schema_invalid_ledger_missing_coverage_scope_fails_closed_without_repla
     assert not (ledger_dir / "subagent-launch-ledger.json.tmp").exists()
 
 
+@pytest.mark.parametrize("content", [None, "{", "{}"])
+def test_audit_missing_or_invalid_ledger_is_advisory_and_never_pass_evidence(
+    tmp_path: Path, content: str | None
+):
+    ledger = tmp_path / "subagent-launch-ledger.json"
+    if content is not None:
+        ledger.write_text(content, encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, str(VALIDATOR), "--audit-mode", str(ledger)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "warning"
+    assert payload["evidence_usable"] is False
+
+
 def test_schema_invalid_launch_array_entry_fails_closed_without_replacement(tmp_path: Path):
     writer = build_writer(tmp_path)
     ledger_dir = tmp_path / "artifacts" / "codex"
@@ -600,8 +629,12 @@ def test_writer_accepts_node_classifier_kinds_and_defers_policy_to_canonical_aud
     ledger_path = tmp_path / "artifacts/codex/subagent-launch-ledger.json"
     payload = json.loads(ledger_path.read_text())
     assert [action["kind"] for action in payload["root_thread_actions"]] == list(classifier_kinds)
-    audit = subprocess.run([sys.executable, str(VALIDATOR), "--audit-mode", str(ledger_path)], text=True, capture_output=True)
-    assert audit.returncode == 1
+    audit = subprocess.run(
+        [sys.executable, str(VALIDATOR), "--audit-mode", str(ledger_path)],
+        text=True,
+        capture_output=True,
+    )
+    assert audit.returncode == 0
     assert "root_thread_data_plane_execution_observed" in json.loads(audit.stdout)["error_codes"]
 
 
@@ -719,8 +752,12 @@ def test_canonical_evidence_requires_launch_dispatch_and_correlation(tmp_path: P
     }
     ledger = tmp_path / "ledger.json"
     ledger.write_text(json.dumps(payload), encoding="utf-8")
-    result = subprocess.run([sys.executable, str(VALIDATOR), "--audit-mode", str(ledger)], text=True, capture_output=True)
-    assert result.returncode == 1
+    result = subprocess.run(
+        [sys.executable, str(VALIDATOR), "--audit-mode", str(ledger)],
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0
     assert "dispatch_evidence_missing" in json.loads(result.stdout)["error_codes"]
 
 
