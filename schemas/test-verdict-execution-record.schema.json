@@ -169,6 +169,44 @@
     "schema_version": {
       "const": 1
     },
+    "source": {
+      "additionalProperties": false,
+      "properties": {
+        "commit_sha": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "execution_job_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "execution_run_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "repository_full_name": {
+          "pattern": "^[^/\\s]+/[^/\\s]+$",
+          "type": "string"
+        },
+        "repository_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "tree_sha": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository_id",
+        "repository_full_name",
+        "commit_sha",
+        "tree_sha",
+        "execution_run_id",
+        "execution_job_id"
+      ],
+      "type": "object"
+    },
     "subject": {
       "additionalProperties": false,
       "properties": {
@@ -202,6 +240,7 @@
     "executions",
     "per_ac",
     "payload_sha256",
+    "source",
     "pass_eligible"
   ],
   "title": "TEST_VERDICT_EXECUTION_RECORD_V1",

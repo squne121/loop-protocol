@@ -80,6 +80,17 @@ GH_BIN = "/usr/bin/gh"
 # -- Fixture builders ----------------------------------------------------- #
 
 
+def _build_source() -> dict[str, Any]:
+    return {
+        "repository_id": 555,
+        "repository_full_name": REPO,
+        "commit_sha": HEAD_SHA,
+        "tree_sha": "9" * 40,
+        "execution_run_id": 1001,
+        "execution_job_id": 2002,
+    }
+
+
 def _build_execution_record(**overrides: Any) -> dict[str, Any]:
     producer = {
         "workflow_path": ".github/workflows/ci.yml",
@@ -100,6 +111,7 @@ def _build_execution_record(**overrides: Any) -> dict[str, Any]:
         "issue_body_sha256": ISSUE_BODY_SHA256,
         "command_manifest_sha256": "sha256:" + "e" * 64,
     }
+    source = _build_source()
     executions = overrides.pop("executions", None) or [
         {
             "execution_id": "exec-1",
@@ -121,6 +133,7 @@ def _build_execution_record(**overrides: Any) -> dict[str, Any]:
         "producer": producer,
         "subject": subject,
         "contract": contract,
+        "source": source,
         "executions": executions,
         "per_ac": per_ac,
         "pass_eligible": True,
@@ -150,6 +163,7 @@ def _build_receipt(execution_record: dict[str, Any]) -> dict[str, Any]:
         "producer": execution_record["producer"],
         "subject": execution_record["subject"],
         "contract": execution_record["contract"],
+        "source": execution_record.get("source", _build_source()),
         "pass_eligible": True,
     }
 

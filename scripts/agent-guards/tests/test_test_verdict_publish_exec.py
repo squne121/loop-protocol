@@ -55,6 +55,14 @@ def make_receipt(executor, *, target_pr_number=42, linked_issue_number=1647, hea
             "issue_body_sha256": linked_body,
             "command_manifest_sha256": "sha256:" + "c" * 64,
         },
+        "source": {
+            "repository_id": 1,
+            "repository_full_name": "squne121/loop-protocol",
+            "commit_sha": head,
+            "tree_sha": "d" * 40,
+            "execution_run_id": 111,
+            "execution_job_id": 444,
+        },
         "pass_eligible": True,
     }
     return receipt, linked_body
@@ -88,6 +96,14 @@ def make_record(executor, per_ac=None):
         "producer": {"workflow_run_id": 111},
         "subject": {"target_pr_number": 42},
         "contract": {"linked_issue_number": 1647},
+        "source": {
+            "repository_id": 1,
+            "repository_full_name": "squne121/loop-protocol",
+            "commit_sha": "a" * 40,
+            "tree_sha": "d" * 40,
+            "execution_run_id": 111,
+            "execution_job_id": 444,
+        },
         "executions": [{"execution_id": "exec-1", "exit_code": 0, "status": "pass"}],
         "per_ac": per_ac if per_ac is not None else [{"ac": "AC1", "execution_ids": ["exec-1"]}],
         "pass_eligible": True,
