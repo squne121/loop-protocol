@@ -53,6 +53,7 @@ _CREATE_ISSUE_SCRIPTS_DIR = _REPO_ROOT / ".claude" / "skills" / "create-issue" /
 if str(_CREATE_ISSUE_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS_DIR))
 
+from mrc_contract_parser import parse_machine_readable_contract  # noqa: E402
 from prose_boundary_policy import HEADING_POLICY  # noqa: E402
 
 # Required fields for `decision: immediate` in Runtime Verification Applicability section
@@ -119,9 +120,39 @@ def sha256_of(body: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Existing issue readiness is deliberately more permissive than the authoring
+# path.  `issue_kind` is classification data from the MRC, whereas a validation
+# profile controls whether the caller explicitly opts in to validate_issue_body
+# kind-specific checks.  Keep the opt-in closed: unsupported kinds and invalid
+# MRC input must retain the legacy kind-agnostic fallback.
+_EXISTING_ISSUE_VALIDATION_PROFILES = {
+    "parent": "parent",
+}
+
+
+def resolve_existing_issue_validation_profile(body: str) -> Optional[str]:
+    """Return an allow-listed validation profile for existing issue readiness.
+
+    The shared MRC parser is authoritative.  In particular, a parser failure
+    must not be repaired by regex inference because it could reintroduce the
+    parser differential that MRC validation prevents.
+    """
+    parsed = parse_machine_readable_contract(body)
+    if not parsed.ok:
+        return None
+
+    issue_kind = parsed.get("issue_kind")
+    if not isinstance(issue_kind, str):
+        return None
+    return _EXISTING_ISSUE_VALIDATION_PROFILES.get(issue_kind)
+
+
 def run_validate_issue_body(body: str) -> dict[str, Any]:
     """
     Run validate_issue_body.py via subprocess with --body-file.
+    The existing-issue readiness path forwards --kind only for an explicitly
+    allow-listed validation profile (currently parent); all other kinds retain
+    the legacy kind-agnostic invocation.
     Returns parsed JSON output (loop_body_lint/v1 schema).
     --mode static: no network, no execution beyond python subprocess.
     """
@@ -132,8 +163,13 @@ def run_validate_issue_body(body: str) -> dict[str, Any]:
         tmp_path = tf.name
 
     try:
+        args = [sys.executable, str(_VALIDATE_ISSUE_BODY_PY), "--body-file", tmp_path]
+        validation_profile = resolve_existing_issue_validation_profile(body)
+        if validation_profile is not None:
+            args.extend(["--kind", validation_profile])
+
         result = subprocess.run(
-            [sys.executable, str(_VALIDATE_ISSUE_BODY_PY), "--body-file", tmp_path],
+            args,
             capture_output=True,
             text=True,
             timeout=30,
