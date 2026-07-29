@@ -1,6 +1,7 @@
 ---
 adr_id: "0006"
 title: "Profile provider contract capability design（承認設計）"
+summary_ja: "profile/provider 契約の能力・認証・安全性・運用状態を分離し、GitHub 権限境界と後続実装契約を固定する設計判断。"
 status: proposed
 decision_date: null
 confirmed_date: null
@@ -96,7 +97,7 @@ Loop Protocol の profile provider 処理において、タスクインテント
 ### 禁止解釈
 - すべてのルートを単一化し、監査不能な自動 apply に収束させない。
 
-## Profile Provider GitHub Grants（action / endpoint family / permission / grant-or-deny / mutation / rationale / #1814 impact）
+## Profile Provider GitHub Grants（GitHub 権限付与の個別判断表・設計上の必須区分: action / endpoint family / permission / grant-or-deny / mutation / rationale / #1814 impact）
 
 | action | endpoint family | permission | grant-or-deny | mutation | rationale | #1814 impact |
 |---|---|---|---|---|---|---|
@@ -158,7 +159,7 @@ Loop Protocol の profile provider 処理において、タスクインテント
 - consumer migration 実装
 - 外部実装・コード変更（本 Issue では実装なし）
 
-## References
+## References（設計判断の根拠参照）
 - Issue #1821
 - Issue #1814
 - ADR 0005
