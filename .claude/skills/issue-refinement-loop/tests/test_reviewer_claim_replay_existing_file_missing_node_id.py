@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import subprocess
 import sys
 from pathlib import Path
-
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 SCRIPTS = REPO_ROOT / ".claude/skills/issue-refinement-loop/scripts"
@@ -29,15 +26,16 @@ from reviewer_claim_replay import (  # noqa: E402
     taxonomy_invariant_violations,
 )
 
-BODY = """## Acceptance Criteria
-- [ ] AC1: classifier proof
-
-## Verification Commands
-```bash
-# AC1
-$ uv run --locked pytest .claude/skills/issue-refinement-loop/tests/test_reviewer_claim_replay.py::test_missing_1549_node -q
-```
-"""
+BODY = (
+    "## Acceptance Criteria\n"
+    "- [ ] AC1: classifier proof\n\n"
+    "## Verification Commands\n"
+    "```bash\n"
+    "# AC1\n"
+    "$ uv run --locked pytest .claude/skills/issue-refinement-loop/tests/"
+    "test_reviewer_claim_replay.py::test_missing_1549_node -q\n"
+    "```\n"
+)
 BODY_SHA = "sha256:" + hashlib.sha256(BODY.encode()).hexdigest()
 CODE = "VCP_EXISTING_FILE_MISSIN"
 CATEGORY = "existing_file_missing_node_id_noncanonical"
@@ -145,10 +143,16 @@ def test_readiness_producer_preserves_source_and_sha(tmp_path: Path):
     readiness = _real_readiness(tmp_path, preflight)
     error = next(error for error in readiness["errors"] if error["category"] == CATEGORY)
     assert readiness["body_sha256"] == BODY_SHA
-    assert (error["rule_id"], error["category"], error["source_check"]) == (CODE, CATEGORY, "baseline_vc_preflight")
+    assert (error["rule_id"], error["category"], error["source_check"]) == (
+        CODE,
+        CATEGORY,
+        "baseline_vc_preflight",
+    )
     assert error["source_payload"]["classification"] == "blocked"
     assert resolve_readiness_error_to_taxonomy(error) == {
-        "status": "resolved", "entry_id": CATEGORY, "deterministic_domain_key": CATEGORY
+        "status": "resolved",
+        "entry_id": CATEGORY,
+        "deterministic_domain_key": CATEGORY,
     }
 
 
@@ -156,8 +160,12 @@ def test_full_cli_chain_parent_replay(tmp_path: Path):
     preflight = _real_preflight(tmp_path)
     readiness = _real_readiness(tmp_path, preflight)
     artifact = build_parent_replay_binding(
-        reviewer_blocker_claim=_claim(), readiness_result=readiness, vc_syntax_result=None,
-        vc_preflight_result=preflight, previous_state={}, current_body_bytes=BODY.encode(),
+        reviewer_blocker_claim=_claim(),
+        readiness_result=readiness,
+        vc_syntax_result=None,
+        vc_preflight_result=preflight,
+        previous_state={},
+        current_body_bytes=BODY.encode(),
         issue_url="https://github.com/squne121/loop-protocol/issues/1549",
         repository_full_name="squne121/loop-protocol", issue_number=1549,
         refinement_session_id="issue-1549-test", iteration_id="1",
@@ -173,15 +181,44 @@ def test_full_cli_chain_parent_replay(tmp_path: Path):
 
 def test_strict_negative_matrix_fail_closed():
     cases = [
-        {"rule_id": "OTHER"}, {"category": "other"}, {"source_check": "other"},
-        {"source_payload": {"classification": "expected_fail", "category": CATEGORY, "decision": "blocked", "scope_class": "baseline_fail_expected"}},
-        {"source_payload": {"classification": "blocked", "category": CATEGORY, "decision": "go", "scope_class": "baseline_fail_expected"}},
-        {"source_payload": {"classification": "blocked", "category": CATEGORY, "decision": "blocked", "scope_class": "wrong"}},
+        {"rule_id": "OTHER"},
+        {"category": "other"},
+        {"source_check": "other"},
+        {
+            "source_payload": {
+                "classification": "expected_fail",
+                "category": CATEGORY,
+                "decision": "blocked",
+                "scope_class": "baseline_fail_expected",
+            }
+        },
+        {
+            "source_payload": {
+                "classification": "blocked",
+                "category": CATEGORY,
+                "decision": "go",
+                "scope_class": "baseline_fail_expected",
+            }
+        },
+        {
+            "source_payload": {
+                "classification": "blocked",
+                "category": CATEGORY,
+                "decision": "blocked",
+                "scope_class": "wrong",
+            }
+        },
     ]
     for override in cases:
         err = _error()
         err.update(override)
-        result, _ = analyze(review_result=_review(), readiness_result=_readiness([err]), vc_syntax_result=None, vc_preflight_result=None, previous_state={})
+        result, _ = analyze(
+            review_result=_review(),
+            readiness_result=_readiness([err]),
+            vc_syntax_result=None,
+            vc_preflight_result=None,
+            previous_state={},
+        )
         assert result["should_consume_iteration"] is False
         assert result["blockers"][0]["deterministic_backed"] is False
     conflict = _error()
@@ -203,8 +240,11 @@ def test_fail_closed_state_contract():
 
 def test_natural_language_never_normalizes():
     result, _ = analyze(
-        review_result=_review(code="existing file has a missing pytest node id"), readiness_result=_readiness([_error()]),
-        vc_syntax_result=None, vc_preflight_result=None, previous_state={},
+        review_result=_review(code="existing file has a missing pytest node id"),
+        readiness_result=_readiness([_error()]),
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
     )
     assert result["blockers"][0]["normalized_kind"] == "unknown_blocker_type"
     assert result["blockers"][0]["checker_gap"] is True
@@ -215,8 +255,11 @@ def test_multiple_blockers_and_taxonomy_dump():
         review_result={**_review(), "structured_blockers": [
             {"reviewer_blocker_code": "unknown prose", "message": None},
             {"reviewer_blocker_code": CODE, "message": None},
-        ]}, readiness_result=_readiness([_error()]), vc_syntax_result=None,
-        vc_preflight_result=None, previous_state={},
+        ]},
+        readiness_result=_readiness([_error()]),
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
     )
     assert result["routing"] == "proceed_to_rewrite"
     assert state["consecutive_unbacked_count"] == 0
@@ -224,7 +267,9 @@ def test_multiple_blockers_and_taxonomy_dump():
 
 
 def test_downstream_ownership_contract():
-    entry = next(entry for entry in REVIEWER_CHECKER_TAXONOMY_V1 if entry["entry_id"] == CATEGORY)
+    entry = next(
+        entry for entry in REVIEWER_CHECKER_TAXONOMY_V1 if entry["entry_id"] == CATEGORY
+    )
     assert entry["entry_id"] == CATEGORY
     assert entry["domain_keys"] == [CATEGORY]
     assert not any(key.startswith("VCS") or key == "RVA001" for key in entry["readiness_rule_ids"])

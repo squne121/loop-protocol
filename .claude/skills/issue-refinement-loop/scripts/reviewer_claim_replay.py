@@ -386,7 +386,10 @@ def _matching_vc_preflight(kind: str, vc_preflight_result: dict[str, Any] | None
     entry = TAXONOMY_BY_ENTRY_ID.get(kind)
     if entry is None:
         return []
-    if entry.get("producer_shape_policy") is not None and vc_preflight_result.get("schema") != "baseline_vc_preflight/v1":
+    if (
+        entry.get("producer_shape_policy") is not None
+        and vc_preflight_result.get("schema") != "baseline_vc_preflight/v1"
+    ):
         raise ValueError(
             "vc-preflight-result-file has an unsupported schema for "
             f"{kind!r} evidence (expected 'baseline_vc_preflight/v1', "
