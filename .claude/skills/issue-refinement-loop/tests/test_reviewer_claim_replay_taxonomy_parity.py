@@ -358,6 +358,7 @@ def test_ac5_dump_taxonomy_json_drift_detection():
         "rva_immediate_field_missing",
         "unexpected_pass",
         "broad_search_path_unbounded",
+        "existing_file_missing_node_id_noncanonical",
     }
 
     # Pin deterministic_checks (checker name) parity per entry.
@@ -368,6 +369,7 @@ def test_ac5_dump_taxonomy_json_drift_detection():
         "rva_immediate_field_missing": ["C9_runtime_applicability_present"],
         "unexpected_pass": [],
         "broad_search_path_unbounded": [],
+        "existing_file_missing_node_id_noncanonical": [],
     }
     for entry_id, expected in expected_checks.items():
         assert entries_by_id[entry_id]["deterministic_checks"] == expected, entry_id
@@ -411,6 +413,10 @@ def test_ac5_dump_taxonomy_json_drift_detection():
         for key in entry["domain_keys"]
     }
     assert not set(broad_entry["domain_keys"]) & all_other_domain_keys
+    existing_file_entry = entries_by_id["existing_file_missing_node_id_noncanonical"]
+    assert existing_file_entry["readiness_rule_ids"] == ["VCP_EXISTING_FILE_MISSIN"]
+    assert existing_file_entry["readiness_categories"] == ["existing_file_missing_node_id_noncanonical"]
+    assert existing_file_entry["producer_shape_policy"] == "blocked_baseline_v1"
 
     # The in-process constant and the CLI-dumped JSON must be identical --
     # this is the actual "drift" the CLI flag is meant to catch (the dump
