@@ -69,17 +69,17 @@
     ".claude/skills/issue-contract-review/scripts/tests/test_baseline_vc_preflight.py"
   ],
   "secondary_coverage": {
-    "plan_targets_provider_job": "python-test",
+    "plan_targets_provider_job": "python-test-core",
     "dedicated_lanes": [
       {
-        "provider_job": "python-test",
+        "provider_job": "codex-execpolicy",
         "lane_id": "codex-execpolicy",
         "paths": [
           "tests/codex/test_local_main_branch_guard.py"
         ]
       },
       {
-        "provider_job": "python-test",
+        "provider_job": "python-test-core",
         "lane_id": "test-verdict-execution-record-producer",
         "paths": [
           "scripts/agent-ops/test_verdict_execution_record_producer.py"

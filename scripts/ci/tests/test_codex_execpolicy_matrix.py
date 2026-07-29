@@ -131,3 +131,24 @@ def test_given_npm_alias_platform_dir_when_selected_package_resolved_then_dir_na
     selected_dir, selected_pkg = mod._find_selected_platform_package(umbrella_dir)
     assert selected_dir == platform_dir
     assert selected_pkg["version"] == "0.142.0-linux-x64"
+
+
+
+def test_given_ci_yml_codex_execpolicy_job_when_inspected_then_sentinel_artifact_precedes_matrix():
+    """Issue #1760 AC6: the codex-execpolicy job must create a sentinel status
+    artifact BEFORE the matrix orchestrator step runs, so a bootstrap failure
+    (setup-node / uv sync / npm install failing before codex_execpolicy_matrix.py
+    even starts) still leaves a codex_execpolicy_matrix_status_v1.json artifact
+    behind for scripts/ci/verify_ci_check_conclusions.py to inspect.
+    """
+    workflow_path = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    job_start = workflow_text.index("  codex-execpolicy:")
+    job_end = workflow_text.index("  python-test:", job_start)
+    job_text = workflow_text[job_start:job_end]
+
+    sentinel_idx = job_text.index("codex_execpolicy_matrix_status_v1.json")
+    matrix_idx = job_text.index("python3 scripts/ci/codex_execpolicy_matrix.py")
+    assert sentinel_idx < matrix_idx, "sentinel artifact step must precede the matrix orchestrator step"
+    assert '"status": "started"' in job_text
+    assert "if: ${{ always() }}" in job_text

@@ -957,6 +957,126 @@ jobs:
                   "digest_env": "TEST_RESULTS_DIGEST",
                   "retention_days": 30,
               },
+         
+              {
+                  "capture_id": "phase-screens.spec.ts::title-menu.png",
+                  "spec_file": "tests/e2e/phase-screens.spec.ts",
+                  "screenshot_name": "title-menu.png",
+                  "registry_id": None,
+                  "directory": "tests/e2e/__screenshots__/phase-screens.spec.ts/",
+                  "browser": "chromium",
+                  "project": "chromium",
+                  "viewport": "1280x720",
+                  "device_scale_factor": 1,
+                  "comparator_kind": "maxDiffPixels",
+                  "comparator_value": "150",
+                  "style_path": False,
+                  "artifact_scope": "job",
+                  "digest_env": "TEST_RESULTS_DIGEST",
+                  "retention_days": 30,
+              },
+              {
+                  "capture_id": "phase-screens.spec.ts::load-menu-empty.png",
+                  "spec_file": "tests/e2e/phase-screens.spec.ts",
+                  "screenshot_name": "load-menu-empty.png",
+                  "registry_id": None,
+                  "directory": "tests/e2e/__screenshots__/phase-screens.spec.ts/",
+                  "browser": "chromium",
+                  "project": "chromium",
+                  "viewport": "1280x720",
+                  "device_scale_factor": 1,
+                  "comparator_kind": "maxDiffPixels",
+                  "comparator_value": "150",
+                  "style_path": False,
+                  "artifact_scope": "job",
+                  "digest_env": "TEST_RESULTS_DIGEST",
+                  "retention_days": 30,
+              },
+              {
+                  "capture_id": "phase-screens.spec.ts::load-menu-available.png",
+                  "spec_file": "tests/e2e/phase-screens.spec.ts",
+                  "screenshot_name": "load-menu-available.png",
+                  "registry_id": None,
+                  "directory": "tests/e2e/__screenshots__/phase-screens.spec.ts/",
+                  "browser": "chromium",
+                  "project": "chromium",
+                  "viewport": "1280x720",
+                  "device_scale_factor": 1,
+                  "comparator_kind": "maxDiffPixels",
+                  "comparator_value": "150",
+                  "style_path": False,
+                  "artifact_scope": "job",
+                  "digest_env": "TEST_RESULTS_DIGEST",
+                  "retention_days": 30,
+              },
+              {
+                  "capture_id": "phase-screens.spec.ts::load-menu-failure.png",
+                  "spec_file": "tests/e2e/phase-screens.spec.ts",
+                  "screenshot_name": "load-menu-failure.png",
+                  "registry_id": None,
+                  "directory": "tests/e2e/__screenshots__/phase-screens.spec.ts/",
+                  "browser": "chromium",
+                  "project": "chromium",
+                  "viewport": "1280x720",
+                  "device_scale_factor": 1,
+                  "comparator_kind": "maxDiffPixels",
+                  "comparator_value": "150",
+                  "style_path": False,
+                  "artifact_scope": "job",
+                  "digest_env": "TEST_RESULTS_DIGEST",
+                  "retention_days": 30,
+              },
+              {
+                  "capture_id": "phase-screens.spec.ts::preparation-default.png",
+                  "spec_file": "tests/e2e/phase-screens.spec.ts",
+                  "screenshot_name": "preparation-default.png",
+                  "registry_id": None,
+                  "directory": "tests/e2e/__screenshots__/phase-screens.spec.ts/",
+                  "browser": "chromium",
+                  "project": "chromium",
+                  "viewport": "1280x720",
+                  "device_scale_factor": 1,
+                  "comparator_kind": "maxDiffPixels",
+                  "comparator_value": "150",
+                  "style_path": False,
+                  "artifact_scope": "job",
+                  "digest_env": "TEST_RESULTS_DIGEST",
+                  "retention_days": 30,
+              },
+              {
+                  "capture_id": "phase-screens.spec.ts::preparation-upgrade-available.png",
+                  "spec_file": "tests/e2e/phase-screens.spec.ts",
+                  "screenshot_name": "preparation-upgrade-available.png",
+                  "registry_id": None,
+                  "directory": "tests/e2e/__screenshots__/phase-screens.spec.ts/",
+                  "browser": "chromium",
+                  "project": "chromium",
+                  "viewport": "1280x720",
+                  "device_scale_factor": 1,
+                  "comparator_kind": "maxDiffPixels",
+                  "comparator_value": "150",
+                  "style_path": False,
+                  "artifact_scope": "job",
+                  "digest_env": "TEST_RESULTS_DIGEST",
+                  "retention_days": 30,
+              },
+              {
+                  "capture_id": "phase-screens.spec.ts::running-minimal-hud.png",
+                  "spec_file": "tests/e2e/phase-screens.spec.ts",
+                  "screenshot_name": "running-minimal-hud.png",
+                  "registry_id": None,
+                  "directory": "tests/e2e/__screenshots__/phase-screens.spec.ts/",
+                  "browser": "chromium",
+                  "project": "chromium",
+                  "viewport": "1280x720",
+                  "device_scale_factor": 1,
+                  "comparator_kind": "maxDiffPixels",
+                  "comparator_value": "150",
+                  "style_path": False,
+                  "artifact_scope": "job",
+                  "digest_env": "TEST_RESULTS_DIGEST",
+                  "retention_days": 30,
+              },
           ]
           # ACTIVE_VRT_CAPTURES_END
           artifact_url = os.environ.get("TEST_RESULTS_URL", "N/A")
@@ -972,7 +1092,7 @@ jobs:
           PY
           } >> "$GITHUB_STEP_SUMMARY"
 
-  python-test:
+  python-test-core:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -1083,6 +1203,13 @@ jobs:
         # claude_permission_edit_rule_canonicalization_v1). Scoped path mutation is
         # expressed via Edit(path) instead.
         run: uv run --locked python scripts/ci/check_claude_settings_permissions.py --settings .claude/settings.json
+      - name: Verify python-test lane topology invariants (#1760)
+        # Fail-closed YAML-AST scan: python-test-core stays Python-only (no
+        # Node/npm/npx/pnpm/corepack/codex commands), codex-execpolicy owns the
+        # Node/Codex CLI bootstrap + matrix + tests/codex/test_local_main_branch_guard.py,
+        # the python-test required aggregate is needs:[python-test-core,codex-execpolicy]
+        # + if:always(), and this verifier itself stays wired (not disabled).
+        run: uv run --locked python scripts/ci/verify_python_test_lane.py --ci-yml .github/workflows/ci.yml
       - name: pytest python suite (parallel) (timed)
         # Plan-driven xdist parallel step (Issue #1064). Target set / --ignore / --deselect /
         # FIXED worker count / scheduler all come from the python-test-plan SSOT via the
@@ -1173,43 +1300,6 @@ jobs:
         with:
           name: python-test-junit-${{ github.run_attempt }}
           path: python_test_artifacts/
-          if-no-files-found: error
-          retention-days: 30
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "22"
-      - name: codex execpolicy + cleanup-route matrix (timed)
-        run: |
-          _t0=$(date +%s%3N)
-          set +e
-          mkdir -p codex_execpolicy_artifacts
-          # The required gate is fail-closed only if install, version, and
-          # `codex execpolicy check --help` all succeed inside the same
-          # artifact-writing orchestrator.
-          python3 scripts/ci/codex_execpolicy_matrix.py \
-            --npm-prefix codex_execpolicy_artifacts/codex-cli \
-            --package-spec "@openai/codex@0.142.0" \
-            --expected-version "codex-cli 0.142.0" \
-            --rules .codex/rules/default.rules \
-            --artifact codex_execpolicy_artifacts/codex_execpolicy_matrix_v1.json
-          _matrix=$?
-          uv run --locked pytest \
-            scripts/ci/tests/test_codex_execpolicy_matrix.py \
-            tests/codex/test_execpolicy_matrix.py \
-            tests/codex/test_local_main_branch_guard.py \
-            -q
-          _pytest=$?
-          _s=$(( _matrix != 0 ? _matrix : _pytest ))
-          set -e
-          printf '{"step_id":"codex_execpolicy_matrix","phase_id":"codex_execpolicy","status":%d,"elapsed_ms":%d}\n' \
-            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
-          exit $_s
-      - name: Upload codex execpolicy artifacts
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: codex-execpolicy-${{ github.run_attempt }}
-          path: codex_execpolicy_artifacts/
           if-no-files-found: error
           retention-days: 30
       - name: Verify hook test discovery exclusions
@@ -1311,7 +1401,7 @@ jobs:
               checked_out_sha=None,
               merge_sha="${{ github.sha }}",
               workflow="ci",
-              job="python-test",
+              job="python-test-core",
               ci_run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
           )
           sys.exit(module.generate_artifact(args))
@@ -1398,6 +1488,259 @@ jobs:
                       print(f"| {m['step_id']} | {m['elapsed_ms']} | {m['status']} |")
           PY
           } >> "$GITHUB_STEP_SUMMARY"
+
+  codex-execpolicy:
+    # Issue #1760: dedicated Node/Codex CLI lane. python-test-core (above) is
+    # Python-only (AC1/AC2); this job owns Node/npm/npx/codex commands, the
+    # real @openai/codex execpolicy matrix, and the codex-only runtime guard
+    # test tests/codex/test_local_main_branch_guard.py (secondary_coverage
+    # .dedicated_lanes[].provider_job in .github/ci/python-test-plan.json,
+    # AC4). scripts/ci/tests/test_codex_execpolicy_matrix.py and
+    # tests/codex/test_execpolicy_matrix.py stay plan targets in
+    # python-test-core (AC3) AND are re-run here against the real pinned
+    # codex binary (unchanged behavior, just relocated with the matrix step).
+    if: ${{ github.event.inputs.python_test_bench != 'true' }}
+    runs-on: ubuntu-latest
+    outputs:
+      # Issue #1824 P1-4: ci-verdict-summary only needs the small status sentinel
+      # (a few KB), never the full evidence artifact -- see the split upload steps
+      # below. Downloading the status-only artifact avoids fetching the (formerly
+      # ~110MB) npm install tree that used to be nested inside
+      # codex_execpolicy_artifacts/.
+      artifact_id: ${{ steps.upload-codex-execpolicy-status.outputs.artifact-id }}
+      artifact_name: codex-execpolicy-status-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python-uv
+      - name: uv python install
+        run: uv python install
+      - name: uv sync (locked, dev group)
+        run: uv sync --locked --group dev
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - name: Create codex-execpolicy sentinel artifact (AC6)
+        # Written BEFORE the matrix orchestrator starts so a hard bootstrap
+        # failure inside the next step (process killed, OOM, etc.) still
+        # leaves a status artifact behind for scripts/ci/verify_ci_check_conclusions.py.
+        run: |
+          mkdir -p codex_execpolicy_artifacts
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          pathlib.Path("codex_execpolicy_artifacts/codex_execpolicy_matrix_status_v1.json").write_text(
+              json.dumps(
+                  {
+                      "schema": "codex_execpolicy_matrix_status_v1",
+                      "status": "started",
+                      "run_id": os.environ.get("GITHUB_RUN_ID"),
+                      "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+                  },
+                  indent=2,
+              )
+          )
+          PY
+      - name: codex execpolicy + cleanup-route matrix (timed)
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          mkdir -p codex_execpolicy_artifacts
+          # The required gate is fail-closed only if install, version, and
+          # `codex execpolicy check --help` all succeed inside the same
+          # artifact-writing orchestrator.
+          # Issue #1824 P1-4: --npm-prefix installs the FULL @openai/codex npm
+          # package tree (node_modules, native binaries, etc) -- several orders of
+          # magnitude larger than the JSON evidence this job actually needs to
+          # keep. Installing it OUTSIDE codex_execpolicy_artifacts/ (the directory
+          # actually uploaded as an artifact below) is the fix for the reported
+          # ~110MB codex-execpolicy-1 artifact; only the small JSON files under
+          # codex_execpolicy_artifacts/ are ever uploaded.
+          python3 scripts/ci/codex_execpolicy_matrix.py \
+            --npm-prefix "${RUNNER_TEMP}/codex-cli-npm-prefix" \
+            --package-spec "@openai/codex@0.142.0" \
+            --expected-version "codex-cli 0.142.0" \
+            --rules .codex/rules/default.rules \
+            --artifact codex_execpolicy_artifacts/codex_execpolicy_matrix_v1.json
+          _matrix=$?
+          uv run --locked pytest \
+            scripts/ci/tests/test_codex_execpolicy_matrix.py \
+            tests/codex/test_execpolicy_matrix.py \
+            tests/codex/test_local_main_branch_guard.py \
+            -q
+          _pytest=$?
+          _s=$(( _matrix != 0 ? _matrix : _pytest ))
+          set -e
+          printf '{"step_id":"codex_execpolicy_matrix","phase_id":"codex_execpolicy","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          python3 - "$_s" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          exit_code = int(sys.argv[1])
+          p = pathlib.Path("codex_execpolicy_artifacts/codex_execpolicy_matrix_status_v1.json")
+          data = json.loads(p.read_text()) if p.exists() else {"schema": "codex_execpolicy_matrix_status_v1"}
+          data["status"] = "completed" if exit_code == 0 else "matrix_failed"
+          data["exit_code"] = exit_code
+          p.write_text(json.dumps(data, indent=2))
+          PY
+          exit $_s
+      - name: Ensure codex-execpolicy sentinel reflects bootstrap failure (AC6)
+        # If the matrix step above never ran to completion (setup-node /
+        # uv sync / install failed before python3 could update the sentinel),
+        # this always-run step still leaves a fail-closed status artifact.
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p codex_execpolicy_artifacts
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          p = pathlib.Path("codex_execpolicy_artifacts/codex_execpolicy_matrix_status_v1.json")
+          if p.exists():
+              data = json.loads(p.read_text())
+              if data.get("status") == "started":
+                  data["status"] = "bootstrap_failed"
+          else:
+              data = {"schema": "codex_execpolicy_matrix_status_v1", "status": "bootstrap_failed"}
+          p.write_text(json.dumps(data, indent=2))
+          PY
+      - name: Upload codex-execpolicy STATUS artifact (small, always)
+        # Issue #1824 P1-4: the status sentinel is the ONLY thing ci-verdict-summary
+        # downloads (a few KB). Split from the fuller evidence artifact below so a
+        # merge-ready check never has to fetch a large ZIP just to read one small
+        # JSON file.
+        id: upload-codex-execpolicy-status
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: codex-execpolicy-status-${{ github.run_attempt }}
+          path: codex_execpolicy_artifacts/codex_execpolicy_matrix_status_v1.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload codex-execpolicy EVIDENCE artifact (npm ls / native binary sha / probes)
+        # Issue #1824 P1-4: kept SEPARATE from the status artifact and with a SHORT
+        # retention -- this is diagnostic detail (npm ls output, native binary
+        # realpath/sha256, version/help probe stdout+stderr), not merge-ready
+        # evidence. The npm install tree itself (~110MB) is never inside this path
+        # because --npm-prefix now installs to $RUNNER_TEMP, outside
+        # codex_execpolicy_artifacts/.
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: codex-execpolicy-evidence-${{ github.run_attempt }}
+          path: codex_execpolicy_artifacts/codex_execpolicy_matrix_v1.json
+          if-no-files-found: warn
+          retention-days: 3
+      - name: Collect ci_runtime_baseline_v1 artifact
+        # Issue #1824 P1-5: docs/dev/ci-performance.md documents codex-execpolicy
+        # as a ci_runtime_baseline_v1 job, but this job previously only appended to
+        # measurements.jsonl without ever generating/uploading the baseline
+        # artifact -- connect the same collector used by every other timed job.
+        if: ${{ !cancelled() }}
+        env:
+          GH_JOB: ${{ github.job }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p ci_runtime_baseline_artifacts
+          python3 - <<'PY'
+          import json, os, pathlib
+          measurements = []
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ["GH_HEAD_SHA"],
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+                          "measurement_method": "date_plus3N_ms"
+                      })
+                      measurements.append(r)
+          artifact = {
+              "schema": "ci_runtime_baseline_v1",
+              "run_id": os.environ["GH_RUN_ID"],
+              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+              "head_sha": os.environ["GH_HEAD_SHA"],
+              "merge_sha": os.environ["GH_SHA"],
+              "job": os.environ["GH_JOB"],
+              "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+              "measurement_method": "date_plus3N_ms",
+              "measurements": measurements,
+          }
+          out = pathlib.Path("ci_runtime_baseline_artifacts/ci_runtime_baseline_v1.json")
+          out.write_text(json.dumps(artifact, indent=2))
+          print(f"Written: {out}")
+          PY
+      - name: Upload ci-runtime-baseline artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
+          path: ci_runtime_baseline_artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Output CI runtime summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## CI Runtime Baseline: ${{ github.job }}"
+            echo ""
+            echo "| step_id | elapsed_ms | status |"
+            echo "|---|---|---|"
+            python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      m = json.loads(line)
+                      print(f"| {m['step_id']} | {m['elapsed_ms']} | {m['status']} |")
+          PY
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  python-test:
+    # Issue #1760 AC5: required aggregate status check (name unchanged --
+    # docs/ops/branch-protection.md keeps referencing "python-test"). Fails
+    # or is skipped whenever either dependency job fails/skips, EXCEPT during
+    # a python_test_bench workflow_dispatch run (AC10), where codex-execpolicy
+    # is intentionally skipped by design (the dispatch input's documented
+    # contract is "run ONLY the python-test-core job").
+    runs-on: ubuntu-latest
+    needs: [python-test-core, codex-execpolicy]
+    if: always()
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python-uv
+      - name: Evaluate python_test_bench_aggregate_policy (AC5/AC10)
+        # Issue #1824 P1-1: the aggregate policy decision is delegated to a
+        # dedicated, table-driven-tested script (scripts/ci/evaluate_python_test_aggregate.py)
+        # instead of an inline heredoc, because a string-search verifier
+        # ("does the run: text contain 'python_test_bench_aggregate_policy'?")
+        # cannot detect a heredoc body being replaced with a no-op stub that
+        # still contains that string. scripts/ci/verify_python_test_lane.py
+        # additionally requires this EXACT invocation (no `if:`, no
+        # continue-on-error, exactly one occurrence) -- see check_aggregate_job.
+        run: |
+          uv run --locked python3 scripts/ci/evaluate_python_test_aggregate.py \
+            --core-result "${{ needs.python-test-core.result }}" \
+            --codex-result "${{ needs.codex-execpolicy.result }}" \
+            --bench-mode "${{ github.event.inputs.python_test_bench }}"
 
   node-backed-hook-tests:
     if: ${{ github.event.inputs.python_test_bench != 'true' }}
@@ -1905,7 +2248,7 @@ jobs:
   ci-verdict-summary:
     runs-on: ubuntu-latest
     if: ${{ !cancelled() && github.event.inputs.python_test_bench != 'true' }}
-    needs: [typecheck, lint, test, build, e2e, python-test, node-backed-hook-tests, actionlint, agy-causal-claim-drift-gate]
+    needs: [typecheck, lint, test, build, e2e, python-test-core, codex-execpolicy, python-test, node-backed-hook-tests, actionlint, agy-causal-claim-drift-gate]
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -1986,9 +2329,62 @@ jobs:
           path: ci_verdict_summary_v2_artifacts/
           if-no-files-found: error
           retention-days: 30
+      - name: Download codex-execpolicy sentinel artifact (AC9)
+        if: ${{ !cancelled() && github.event.inputs.python_test_bench != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p codex_execpolicy_artifacts_downloaded
+          gh api             "repos/${GITHUB_REPOSITORY}/actions/artifacts/${{ needs.codex-execpolicy.outputs.artifact_id }}/zip"             > codex-execpolicy-artifact.zip
+          unzip -o codex-execpolicy-artifact.zip -d codex_execpolicy_artifacts_downloaded
+          test -s codex_execpolicy_artifacts_downloaded/codex_execpolicy_matrix_status_v1.json
+      - name: Verify real CI check conclusions + AC6 sentinel (AC9)
+        if: ${{ !cancelled() }}
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PYTHON_TEST_BENCH: ${{ github.event.inputs.python_test_bench }}
+        run: |
+          if [ "$PYTHON_TEST_BENCH" = "true" ]; then
+            uv run --locked python3 scripts/ci/verify_ci_check_conclusions.py \
+              --check-runs-api-json ci_verdict_summary_v2_check_runs.json \
+              --expected-head-sha "$PR_HEAD_SHA" \
+              --workflow-run-id "${{ github.run_id }}" \
+              --workflow-run-attempt "${{ github.run_attempt }}" \
+              --bench-mode
+          else
+            uv run --locked python3 scripts/ci/verify_ci_check_conclusions.py \
+              --check-runs-api-json ci_verdict_summary_v2_check_runs.json \
+              --codex-sentinel-json codex_execpolicy_artifacts_downloaded/codex_execpolicy_matrix_status_v1.json \
+              --expected-head-sha "$PR_HEAD_SHA" \
+              --workflow-run-id "${{ github.run_id }}" \
+              --workflow-run-attempt "${{ github.run_attempt }}"
+          fi
       - name: Output ci_verdict_summary_v2 Step Summary
         # Render the exact uploaded payload; never regenerate it after upload.
         if: ${{ !cancelled() }}
         run: |
           uv run --locked python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
             --summary-input ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json
+      - name: Enforce ci_verdict_summary_v2 overall_status gate (Issue #1824 P0-1)
+        # The ci-verdict-summary job itself must fail closed whenever the generated
+        # artifact's overall_status is not merge_ready -- otherwise an unclassified
+        # (CLASSIFICATION_MAP-missing) upstream job can silently produce a
+        # gh_error/blocked verdict that no CI check surfaces as a failure.
+        if: ${{ !cancelled() }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import sys
+
+          with open("ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json") as f:
+              artifact = json.load(f)
+
+          overall_status = artifact.get("overall_status")
+          print(f"ci_verdict_summary_v2 overall_status={overall_status!r}")
+          if overall_status != "merge_ready":
+              print(
+                  f"::error::ci_verdict_summary_v2 overall_status={overall_status!r} "
+                  "(expected 'merge_ready'); failing ci-verdict-summary closed"
+              )
+              sys.exit(1)
+          PY

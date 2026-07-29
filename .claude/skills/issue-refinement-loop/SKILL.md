@@ -207,7 +207,7 @@ web-researcher が critical claim にエビデンスを示せず、ハルシネ�
 
 消費側契約 (consumer contract): `ISSUE_REVIEW_RESULT_COMPACT_V1`（正本 (SSOT): `.claude/skills/issue-refinement-loop/scripts/compact_review_result.py`）
 
-**validator-first 順序（Issue #1507 AC23、routing table より前に評価する）**: orchestrator は approve / needs-fix いずれの経路でも、SubAgent stdout の生フィールドを consume する前に、必ず `validate_review_compact_output.py`（`review_compact.validate`, command_registry.py 登録済み、`--issue-number` 必須引数）へ SubAgent の最終応答テキストをそのまま（re-transcribe せず）渡し、`REVIEW_COMPACT_VALIDATION_RESULT_V1` を得る。**validator 完了前に `VERDICT` / `NEXT_ACTION` / `ARTIFACT` / `REVIEWER_BLOCKER_CLAIM` を読んではならない。** `validation_status != valid` の場合は routing を `human_judgment_required` に固定する（fail-closed）。validation が `valid` の場合のみ、`normalized_payload` を根拠に以下の routing table を評価する:
+**validator-first 順序（Issue #1507 AC23 / #1755 で `review_compact.validate_intermediate_v1` へ統一、routing table より前に評価する）**: orchestrator は approve / needs-fix いずれの経路でも、SubAgent（child）stdout の raw bytes を consume する前に、必ず `emit_parent_review_envelope_v2.py --validate-intermediate`（`review_compact.validate_intermediate_v1`, command_registry.py 登録済み、`--issue-number` 必須引数）へ child の raw stdout bytes をそのまま（re-transcribe せず）渡し、`REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1` を得る。**`validate_review_compact_output.py` の V1 final grammar（command_registry.py 登録名の末尾に `_v2` も `_intermediate_v1` も付かない旧コマンド）を child の raw stdout に対して直接呼んではならない**（V1 final grammar は legacy 経路専用の独立 grammar であり、child intermediate の grammar とは異なる — #1755）。**validator 完了前に `VERDICT` / `NEXT_ACTION` / `ARTIFACT` / `REVIEWER_BLOCKER_CLAIM` を読んではならない。** `validation_status != valid` の場合は routing を `human_judgment_required` に固定する（fail-closed）。validation が `valid` の場合のみ、`normalized_payload` を根拠に以下の routing table を評価する:
 
 - `VERDICT: approve` → Step 4.5 へ
 - `VERDICT: needs-fix` → Step 2a（parent-local replay integrity binding、`parent_replay_binding.py`）を実行し、orchestrator 自身が計算した `PARENT_REPLAY_VERDICT` / `PARENT_REPLAY_ROUTING` / `PARENT_REPLAY_SHOULD_CONSUME` / `PARENT_REPLAY_BODY_SHA256` の結果のみで Step 4 / Step 2 / human escalation を分岐する（Issue #1532。子 SubAgent が返す `REVIEWER_BLOCKER_CLAIM` は bounded な untrusted claim であり、そのまま routing に使ってはならない。orchestrator は子 worktree の raw `compact_review_result_v1` artifact パスを別途 open/read しない — Issue #1472）
@@ -224,14 +224,15 @@ review 後、phase state を `review` フェーズに更新してから verdict 
 - `VERDICT: approve` → phase state を `decide_next_action` に更新してから Step 4.5 へ
 - `VERDICT: needs-fix` → phase state を `rewrite` に更新し、直後に Step 2a replay arbitration を実行してから Step 4 / Step 5 を決める
 
-phase state の更新（Issue #1507 AC24: `--review-validation-result-path` は上記 validator の出力先を指し、`validation_status: valid` でない場合は非ゼロ終了し phase-state を生成しない構造的ゲート。`--phase review` かつ `--source-kind issue_review_result_compact_v1` の組み合わせでのみ必須）:
+phase state の更新（Issue #1507 AC24 / #1755 で入力束縛を強化: `--review-validation-result-path` は上記 `review_compact.validate_intermediate_v1` の出力先（`REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1`）を指す。`--phase review` かつ `--source-kind issue_review_result_compact_v1` の組み合わせでのみ、`--review-validation-result-path` と新規必須引数 `--issue-number` の両方が必須。gate は `schema`/`schema_version`/`validation_status`/`envelope_kind`/`violations == []` に加え、`--source-path` の実バイトから再計算した SHA256 と validation result の `input_sha256` の一致、および `normalized_payload.ARTIFACT` の issue 番号セグメントと `--issue-number` の一致を検証する構造的ゲートであり、いずれかに違反すると非ゼロ終了し phase-state を生成しない）:
 
 ```bash
 uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/build_refinement_phase_state.py \
   --phase review \
   --source-kind issue_review_result_compact_v1 \
   --source-path <review_result_path> \
-  --review-validation-result-path <review_compact_validation_result_v1 path> \
+  --review-validation-result-path <review_compact_intermediate_validation_result_v1 path> \
+  --issue-number <ISSUE_NUMBER> \
   --output-path <phase_state_output_path>
 ```
 

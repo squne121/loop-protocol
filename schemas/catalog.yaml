@@ -346,6 +346,14 @@ entries:
       commit: "dc4f88fea6094269cc715cdd7959d31f2a670ee6"
       command_id: "lint_catalog_yaml"
 
+  # Issue #1648 fix_delta: additive_schema_change -- the runtime schema
+  # value (TEST_VERDICT_MACHINE/v2, see detection_patterns below) gained
+  # producer_receipt / receipt_sha256 fields (TEST_VERDICT_PRODUCER_RECEIPT_V1
+  # provenance binding, consumed via adjudicate_vc_result.py
+  # --require-producer-receipt). The catalog schema_id label below is left
+  # unchanged (pinned to the schema-governance.md golden set in
+  # schemas/tests/test_catalog.py); it identifies the catalog entry, not
+  # the runtime schema field value.
   - schema_id: "TEST_VERDICT_MACHINE v1"
     format: markdown_yaml_contract
     source_kind: repo_path
