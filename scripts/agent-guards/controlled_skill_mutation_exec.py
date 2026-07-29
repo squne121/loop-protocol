@@ -661,6 +661,27 @@ def _validate_test_verdict_publish_fields(data: dict, repo: str, issue_number: i
         or contract.get("issue_body_sha256") != linked_issue_body_sha256
     ):
         return "test_verdict_publish_receipt_contract_mismatch"
+    # Issue 1711 Blocker 3: the receipt's trusted source binding (repository
+    # id/full_name/commit sha/tree sha, independently resolved by the
+    # trusted-receipt job via GitHub REST API, never from the untrusted PR
+    # checkout) must cross-check against this same publish transaction's own
+    # repo/expected_head_sha, in addition to the schema-level required-field
+    # validation already performed above.
+    source = receipt.get("source")
+    if (
+        not isinstance(source, dict)
+        or source.get("repository_full_name") != repo
+        or source.get("commit_sha") != expected_head_sha
+        or not isinstance(source.get("repository_id"), int)
+        or source.get("repository_id") <= 0
+        or not isinstance(source.get("tree_sha"), str)
+        or not _re.fullmatch(r"[0-9a-f]{40}", source.get("tree_sha") or "")
+        or not isinstance(source.get("execution_run_id"), int)
+        or source.get("execution_run_id") <= 0
+        or not isinstance(source.get("execution_job_id"), int)
+        or source.get("execution_job_id") <= 0
+    ):
+        return "test_verdict_publish_receipt_source_mismatch"
     if (
         not isinstance(artifact, dict)
         or not isinstance(artifact.get("artifact_id"), int)

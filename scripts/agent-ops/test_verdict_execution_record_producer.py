@@ -16,6 +16,21 @@
 # contains exactly one command_id whose covers_acs claim is a
 # manifest-declared binding (Issue 1646 AC1-AC5 share the identical
 # Verification Command), not an independently isolated per-AC execution.
+#
+# Issue 1711 trust-boundary redesign: the protected workflow now separates a
+# trusted-preflight job (resolves the subject PR's exact source identity --
+# repository id/full_name, commit sha, tree sha -- exclusively from GitHub
+# REST API responses, never from a checkout of PR-controlled code), an
+# untrusted-execution job (checks out the target PR's exact head SHA into a
+# "source" workspace, separate from a "harness" workspace checked out from
+# the default branch; the harness's own setup-python-uv action and this
+# producer script drive the real pytest execution against the source tree;
+# no secrets/OIDC/write token are exposed to this job), and a trusted-receipt
+# job (never checks out PR-controlled code; treats the untrusted execution
+# artifact as untrusted data; independently re-resolves the trusted source
+# identity a second time and rejects any drift before binding the source
+# repository id/commit/tree/execution run+job ids into the schema-validated
+# execution record and producer receipt).
 from __future__ import annotations
 
 import hashlib
@@ -33,7 +48,17 @@ _SHA256_PREFIXED_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SHA256_BARE_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_REPO_FULL_NAME_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
 
+# Issue 1711: the pytest target is inside the untrusted "source" checkout,
+# while the interpreter / locked project environment / toolchain all come
+# from the trusted "harness" checkout (cwd, when execute_command runs the
+# resolved argv). "{source_root}" is a literal, reviewable placeholder inside
+# the versioned manifest entry -- resolve_manifest_entry() never substitutes
+# it, so manifest_sha256 stays a pure function of COMMAND_MANIFEST content
+# alone, independent of the runtime directory layout. Only execute_command()
+# substitutes the placeholder with the real absolute source_root path
+# immediately before invoking subprocess.run.
 COMMAND_MANIFEST: dict[str, dict[str, Any]] = {
     "uv.pytest.execution-record": {
         "argv": [
@@ -41,7 +66,7 @@ COMMAND_MANIFEST: dict[str, dict[str, Any]] = {
             "run",
             "--locked",
             "pytest",
-            "scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py",
+            "{source_root}/scripts/agent-guards/tests/test_test_verdict_execution_record_workflow.py",
             "-q",
         ],
         "cwd": "repo_root",
@@ -49,6 +74,9 @@ COMMAND_MANIFEST: dict[str, dict[str, Any]] = {
         "covers_acs": ["AC1", "AC2", "AC3", "AC4", "AC5"],
     }
 }
+
+_SOURCE_ROOT_PLACEHOLDER = "{source_root}"
+_SOURCE_CORE_FIELDS = ("repository_id", "repository_full_name", "commit_sha", "tree_sha")
 
 
 def sha256_of(text: str):
@@ -74,8 +102,9 @@ def normalize_artifact_digest(value: str):
 def resolve_manifest_entry(command_id: str):
     # Resolve command_id against the COMMAND_MANIFEST allowlist and return
     # a copy augmented with manifest_sha256, the canonical digest of the
-    # resolved entry. Raises KeyError for any command_id outside the
-    # allowlist. Returns dict.
+    # resolved entry (computed over the unsubstituted "{source_root}"
+    # placeholder form, so it never depends on runtime directory layout).
+    # Raises KeyError for any command_id outside the allowlist. Returns dict.
     if command_id not in COMMAND_MANIFEST:
         raise KeyError("command_id not in COMMAND_MANIFEST allowlist: " + repr(command_id))
     entry = COMMAND_MANIFEST[command_id]
@@ -91,22 +120,34 @@ def resolve_manifest_entry(command_id: str):
     return result
 
 
-def execute_command(command_id: str, repo_root: Path):
+def substitute_source_root(argv, source_root: Path):
+    # Replaces the literal "{source_root}" placeholder with the real
+    # absolute source_root path. This is the only argv mutation
+    # execute_command performs; it never accepts caller-supplied argv
+    # fragments (Issue 1711 AC1/AC4).
+    resolved_source_root = str(Path(source_root).resolve())
+    return [part.replace(_SOURCE_ROOT_PLACEHOLDER, resolved_source_root) for part in argv]
+
+
+def execute_command(command_id: str, repo_root: Path, source_root: Path):
     # Resolve command_id from COMMAND_MANIFEST and run it for real via
     # subprocess.run (shell=False). exit_code / status / timed_out and the
     # stdout / stderr digests are measured from the actual process. None of
     # them are ever self-attested before the process runs (fix_delta P0-4).
-    # Returns dict.
+    # repo_root is the trusted harness checkout (cwd, locked uv project);
+    # source_root is the untrusted target-PR checkout the manifest's pytest
+    # target path is resolved against (Issue 1711 AC3/AC4). Returns dict.
     resolved = resolve_manifest_entry(command_id)
     if resolved["cwd"] == "repo_root":
         cwd = repo_root
     else:
         cwd = repo_root / resolved["cwd"]
+    runtime_argv = substitute_source_root(resolved["argv"], source_root)
 
     timed_out = False
     try:
         completed = subprocess.run(
-            resolved["argv"],
+            runtime_argv,
             cwd=cwd,
             timeout=resolved["timeout_seconds"],
             shell=False,
@@ -203,7 +244,49 @@ def classify_contract_manifest_binding(record_contract, final_contract, expected
     return None
 
 
-def build_record(producer, subject, contract, executions, per_ac, required_acs):
+def _source_core(source: dict | None):
+    if not isinstance(source, dict):
+        return None
+    return {key: source.get(key) for key in _SOURCE_CORE_FIELDS}
+
+
+def classify_source_binding(record_source, final_source):
+    # Independently classifies the source repository/commit/tree binding
+    # between the record's own source claim and a freshly, independently
+    # re-resolved trusted source (Issue 1711 AC3/AC6). None of the compared
+    # values are ever read back from the untrusted execution artifact --
+    # both sides are trusted-job-resolved GitHub REST API data. Returns None
+    # when sound, otherwise a machine-readable reason category string.
+    record_core = _source_core(record_source)
+    final_core = _source_core(final_source)
+    if record_core is None or final_core is None:
+        return "source_missing"
+    for field in _SOURCE_CORE_FIELDS:
+        if record_core.get(field) is None or final_core.get(field) is None:
+            return "source_missing"
+    if not (
+        isinstance(record_core["commit_sha"], str)
+        and _COMMIT_SHA_RE.fullmatch(record_core["commit_sha"])
+        and isinstance(final_core["commit_sha"], str)
+        and _COMMIT_SHA_RE.fullmatch(final_core["commit_sha"])
+        and isinstance(record_core["tree_sha"], str)
+        and _COMMIT_SHA_RE.fullmatch(record_core["tree_sha"])
+        and isinstance(final_core["tree_sha"], str)
+        and _COMMIT_SHA_RE.fullmatch(final_core["tree_sha"])
+        and isinstance(record_core["repository_full_name"], str)
+        and _REPO_FULL_NAME_RE.fullmatch(record_core["repository_full_name"])
+        and isinstance(final_core["repository_full_name"], str)
+        and _REPO_FULL_NAME_RE.fullmatch(final_core["repository_full_name"])
+        and _is_positive_int(record_core["repository_id"])
+        and _is_positive_int(final_core["repository_id"])
+    ):
+        return "source_malformed"
+    if record_core != final_core:
+        return "source_tampered"
+    return None
+
+
+def build_record(producer, subject, contract, executions, per_ac, required_acs, source):
     # Pure record assembly. Retained for fixture-driven unit tests that
     # exercise pass_eligible logic directly. The CLI never forwards raw
     # caller-supplied executions / per_ac to this function directly. See
@@ -214,6 +297,7 @@ def build_record(producer, subject, contract, executions, per_ac, required_acs):
         "producer": producer,
         "subject": subject,
         "contract": contract,
+        "source": source,
         "executions": executions,
         "per_ac": per_ac,
         "pass_eligible": pass_eligible(executions, per_ac, required_acs),
@@ -222,7 +306,7 @@ def build_record(producer, subject, contract, executions, per_ac, required_acs):
     return record
 
 
-def build_record_for_command(producer, subject, contract, command_id, execution_result):
+def build_record_for_command(producer, subject, contract, command_id, execution_result, source):
     # The only CLI-reachable record builder. executions / per_ac /
     # required_acs are derived exclusively from COMMAND_MANIFEST[command_id]
     # and a single real execution_result (produced by execute_command / the
@@ -233,13 +317,13 @@ def build_record_for_command(producer, subject, contract, command_id, execution_
     resolved = resolve_manifest_entry(command_id)
     if execution_result.get("command_id") != command_id:
         raise ValueError(
-            "execution_result.command_id does not match requested command_id: "
+            "reason_category=execution_result_command_id_mismatch: "
             + repr(execution_result.get("command_id")) + " != " + repr(command_id)
         )
     if execution_result.get("argv_sha256") != resolved["manifest_sha256"]:
         raise ValueError(
-            "execution_result.argv_sha256 does not match the resolved "
-            "COMMAND_MANIFEST entry digest, refusing to build a record from it"
+            "reason_category=execution_result_argv_sha256_mismatch: execution_result.argv_sha256 "
+            "does not match the resolved COMMAND_MANIFEST entry digest, refusing to build a record from it"
         )
     per_ac = []
     for ac in resolved["covers_acs"]:
@@ -253,6 +337,7 @@ def build_record_for_command(producer, subject, contract, command_id, execution_
         [execution_result],
         per_ac,
         resolved["covers_acs"],
+        source,
     )
 
 
@@ -264,11 +349,18 @@ def _is_positive_int(value):
     return operator.gt(value, 0)
 
 
-def build_receipt(record, execution_artifact, final_subject, final_contract, expected_manifest_sha256=None):
-    if expected_manifest_sha256 is not None:
-        reason = classify_contract_manifest_binding(record["contract"], final_contract, expected_manifest_sha256)
-        if reason is not None:
-            raise ValueError("reason_category=" + reason)
+def build_receipt(record, execution_artifact, final_subject, final_contract, expected_manifest_sha256, final_source):
+    # Issue 1711 High fix: expected_manifest_sha256 and final_source are now
+    # required (no optional fail-open path). Every receipt build always
+    # independently classifies both the command_manifest_sha256 binding and
+    # the source repository/commit/tree binding before considering
+    # pass_eligible.
+    manifest_reason = classify_contract_manifest_binding(record["contract"], final_contract, expected_manifest_sha256)
+    if manifest_reason is not None:
+        raise ValueError("reason_category=" + manifest_reason)
+    source_reason = classify_source_binding(record.get("source"), final_source)
+    if source_reason is not None:
+        raise ValueError("reason_category=" + source_reason)
     stable = final_subject == record["subject"] and final_contract == record["contract"]
 
     reported = {
@@ -330,6 +422,7 @@ def build_receipt(record, execution_artifact, final_subject, final_contract, exp
         "producer": record["producer"],
         "subject": final_subject,
         "contract": final_contract,
+        "source": record.get("source"),
         "pass_eligible": bool(record["pass_eligible"] and stable and artifact_ok),
     }
 
@@ -342,7 +435,7 @@ def _validate_against_schema(payload, schema_path):
     errors = list(validator.iter_errors(payload))
     if errors:
         messages = " and ".join(str(e) for e in errors[:5])
-        raise ValueError("schema validation failed against " + str(schema_path) + ": " + messages)
+        raise ValueError("reason_category=schema_validation_failed: " + str(schema_path) + ": " + messages)
 
 
 def _cmd_sha256_of(args):
@@ -352,42 +445,69 @@ def _cmd_sha256_of(args):
 
 
 def _cmd_execute(args):
-    result = execute_command(args.command_id, args.repo_root)
+    result = execute_command(args.command_id, args.repo_root, args.source_root)
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + chr(10), encoding="utf-8")
     if result["status"] == "pass":
         return 0
     return 1
 
 
+def _load_json_inputs(*paths: Path):
+    # Shared fail-closed JSON loader for the build-record / build-receipt
+    # CLIs (Issue 1711 AC5): any malformed input file is diagnosed with a
+    # machine-readable reason_category before any output is written.
+    values = []
+    for path in paths:
+        try:
+            values.append(json.loads(path.read_text(encoding="utf-8")))
+        except Exception as exc:
+            raise ValueError("reason_category=input_json_invalid: " + str(path) + ": " + str(exc)) from exc
+    return values
+
+
 def _cmd_build_record(args):
-    producer = json.loads(args.producer_input.read_text(encoding="utf-8"))
-    subject = json.loads(args.subject_input.read_text(encoding="utf-8"))
-    contract = json.loads(args.contract_input.read_text(encoding="utf-8"))
-    execution_result = json.loads(args.execution_result.read_text(encoding="utf-8"))
-    record = build_record_for_command(producer, subject, contract, args.command_id, execution_result)
+    try:
+        producer, subject, contract, execution_result, source = _load_json_inputs(
+            args.producer_input, args.subject_input, args.contract_input, args.execution_result, args.source_input
+        )
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+    try:
+        record = build_record_for_command(producer, subject, contract, args.command_id, execution_result, source)
+    except ValueError as exc:
+        print(str(exc))
+        return 1
     if args.schema is not None:
-        _validate_against_schema(record, args.schema)
+        try:
+            _validate_against_schema(record, args.schema)
+        except ValueError as exc:
+            print(str(exc))
+            return 1
     args.output.write_text(json.dumps(record, indent=2, sort_keys=True) + chr(10), encoding="utf-8")
     if record["pass_eligible"]:
         return 0
+    print("reason_category=execution_record_not_pass_eligible")
     return 1
 
 
 def _cmd_build_receipt(args):
-    record = json.loads(args.record.read_text(encoding="utf-8"))
-    execution_artifact = json.loads(args.execution_artifact_input.read_text(encoding="utf-8"))
-    final_subject = json.loads(args.final_subject.read_text(encoding="utf-8"))
-    final_contract = json.loads(args.final_contract.read_text(encoding="utf-8"))
-    expected_manifest_sha256 = None
-    if args.command_id is not None:
-        expected_manifest_sha256 = resolve_manifest_entry(args.command_id)["manifest_sha256"]
+    try:
+        record, execution_artifact, final_subject, final_contract, final_source = _load_json_inputs(
+            args.record, args.execution_artifact_input, args.final_subject, args.final_contract, args.final_source
+        )
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+    expected_manifest_sha256 = resolve_manifest_entry(args.command_id)["manifest_sha256"]
     try:
         receipt = build_receipt(
             record,
             execution_artifact,
             final_subject,
             final_contract,
-            expected_manifest_sha256=expected_manifest_sha256,
+            expected_manifest_sha256,
+            final_source,
         )
     except ValueError as exc:
         # Direct, machine-readable failure diagnostics (Issue 1711 AC5): no
@@ -397,10 +517,15 @@ def _cmd_build_receipt(args):
         print(str(exc))
         return 1
     if args.schema is not None:
-        _validate_against_schema(receipt, args.schema)
+        try:
+            _validate_against_schema(receipt, args.schema)
+        except ValueError as exc:
+            print(str(exc))
+            return 1
     args.output.write_text(json.dumps(receipt, indent=2, sort_keys=True) + chr(10), encoding="utf-8")
     if receipt["pass_eligible"]:
         return 0
+    print("reason_category=receipt_not_pass_eligible")
     return 1
 
 
@@ -529,6 +654,31 @@ def _cmd_resolve_job_and_check(args):
     return 0
 
 
+def _cmd_resolve_job_id_by_name(args):
+    # Issue 1711 AC3/AC6: finds the untrusted-execution job's own job id
+    # inside the same run/attempt jobs list already independently fetched
+    # via gh-api, by exact job name match. Used by the trusted-receipt job
+    # to bind source.execution_job_id to the job that actually performed the
+    # untrusted PR-source execution (a different job than the one invoking
+    # this command).
+    jobs_data = json.loads(args.jobs_file.read_text(encoding="utf-8"))
+    jobs = jobs_data.get("jobs") or []
+    matched = [job for job in jobs if job.get("name") == args.job_name]
+    if len(matched) != 1:
+        print(
+            "reason_category=source_execution_job_lookup_failed: expected exactly one job named "
+            + args.job_name + ", found " + str(len(matched))
+        )
+        return 1
+    job = matched[0]
+    job_id = job.get("id")
+    if not _is_positive_int(job_id):
+        print("reason_category=source_execution_job_lookup_failed: job id missing or invalid")
+        return 1
+    args.output.write_text(json.dumps({"job_id": job_id}, indent=2, sort_keys=True) + chr(10), encoding="utf-8")
+    return 0
+
+
 def _cmd_download_artifact(args):
     import io
     import zipfile
@@ -599,77 +749,117 @@ def _cmd_assemble_contract(args):
     return 0
 
 
-def _cmd_assemble_source_provenance(args):
-    # Runs inside the untrusted source job, against the target PR's exact
-    # head SHA checkout only. No gh api / token access here -- everything is
-    # derived from local git plumbing against the already-checked-out tree
-    # (Issue 1711 AC3/AC4).
-    provenance = {
-        "repository_full_name": args.repository_full_name,
-        "commit_sha": args.commit_sha,
-        "tree_sha": args.tree_sha,
+def resolve_trusted_source(subject_data, commit_data, expected_repository_full_name, expected_commit_sha):
+    # Trusted-job-only resolution: derives repository_id / repository_full_name
+    # / commit_sha / tree_sha exclusively from GitHub REST API responses
+    # (the PR "head" object and the "GET commit" response's commit.tree.sha).
+    # Never reads a checkout of the target PR's own code (Issue 1711 AC3/AC4
+    # -- this is the fix for the previous self-attested
+    # assemble-source-provenance design, which ran inside the untrusted
+    # checkout). Raises ValueError with a reason_category on any mismatch or
+    # malformed field. Returns dict.
+    head = (subject_data or {}).get("head") or {}
+    repo = head.get("repo") or {}
+    repository_id = repo.get("id")
+    repository_full_name = repo.get("full_name")
+    commit_sha = commit_data.get("sha") if isinstance(commit_data, dict) else None
+    tree_sha = ((commit_data or {}).get("commit") or {}).get("tree", {}).get("sha")
+
+    if repository_full_name != expected_repository_full_name:
+        raise ValueError(
+            "reason_category=trusted_source_repository_mismatch: expected "
+            + str(expected_repository_full_name) + " got " + str(repository_full_name)
+        )
+    if commit_sha != expected_commit_sha:
+        raise ValueError(
+            "reason_category=trusted_source_commit_sha_mismatch: expected "
+            + str(expected_commit_sha) + " got " + str(commit_sha)
+        )
+    if head.get("sha") != expected_commit_sha:
+        raise ValueError(
+            "reason_category=trusted_source_subject_head_sha_mismatch: expected "
+            + str(expected_commit_sha) + " got " + str(head.get("sha"))
+        )
+    if not _is_positive_int(repository_id):
+        raise ValueError("reason_category=trusted_source_repository_id_invalid: " + repr(repository_id))
+    if not (isinstance(commit_sha, str) and _COMMIT_SHA_RE.fullmatch(commit_sha)):
+        raise ValueError("reason_category=trusted_source_commit_sha_malformed: " + repr(commit_sha))
+    if not (isinstance(tree_sha, str) and _COMMIT_SHA_RE.fullmatch(tree_sha)):
+        raise ValueError("reason_category=trusted_source_tree_sha_malformed: " + repr(tree_sha))
+
+    return {
+        "repository_id": repository_id,
+        "repository_full_name": repository_full_name,
+        "commit_sha": commit_sha,
+        "tree_sha": tree_sha,
     }
+
+
+def _cmd_resolve_trusted_source(args):
+    subject_data = json.loads(args.subject_file.read_text(encoding="utf-8"))
+    commit_data = json.loads(args.commit_file.read_text(encoding="utf-8"))
+    try:
+        provenance = resolve_trusted_source(
+            subject_data, commit_data, args.expected_repository_full_name, args.expected_commit_sha
+        )
+    except ValueError as exc:
+        print(str(exc))
+        return 1
     args.output.write_text(json.dumps(provenance, indent=2, sort_keys=True) + chr(10), encoding="utf-8")
+    if args.github_output_format:
+        # Emits plain key=value lines (no other stdout content on the
+        # success path) so the workflow step can redirect this command's
+        # stdout directly into $GITHUB_OUTPUT without any inline shell
+        # heredoc/Python snippet (Issue 1711 actionlint/shellcheck hygiene).
+        for key in ("repository_id", "repository_full_name", "commit_sha", "tree_sha"):
+            print(key + "=" + str(provenance[key]))
     return 0
 
 
-def _cmd_assert_source_provenance(args):
-    # Runs inside the trusted producer job and independently rejects any
-    # provenance that does not exactly bind to the dispatcher-supplied exact
-    # PR head SHA and the expected repository (Issue 1711 AC3). Missing,
-    # malformed, or mismatched provenance is fail-closed.
-    provenance = json.loads(args.file.read_text(encoding="utf-8"))
-    commit_sha = provenance.get("commit_sha")
-    tree_sha = provenance.get("tree_sha")
-    repository_full_name = provenance.get("repository_full_name")
+def _cmd_assemble_source(args):
+    # Merges a trusted source-core resolution (repository_id /
+    # repository_full_name / commit_sha / tree_sha, from
+    # resolve-trusted-source) with the execution run/job identity of the
+    # untrusted-execution job that actually ran the manifest command,
+    # producing the schema-shaped "source" object bound into the execution
+    # record and producer receipt (Issue 1711 AC3/AC6).
+    trusted_source = json.loads(args.trusted_source_file.read_text(encoding="utf-8"))
+    run_id = int(args.execution_run_id)
+    job_id = int(args.execution_job_id)
+    if not _is_positive_int(run_id):
+        print("reason_category=source_execution_run_id_invalid: " + repr(run_id))
+        return 1
+    if not _is_positive_int(job_id):
+        print("reason_category=source_execution_job_id_invalid: " + repr(job_id))
+        return 1
+    source = dict(trusted_source)
+    source["execution_run_id"] = run_id
+    source["execution_job_id"] = job_id
+    args.output.write_text(json.dumps(source, indent=2, sort_keys=True) + chr(10), encoding="utf-8")
+    return 0
+
+
+def _cmd_assert_source_tree_matches(args):
+    # Untrusted-execution job, pure git-plumbing defense-in-depth check
+    # (Issue 1711 AC3): confirms the checked-out source tree's own commit sha
+    # / tree sha (read via local `git rev-parse`, never via PR-controlled
+    # code) match the trusted-preflight-resolved values, before any pytest
+    # execution runs. This never invokes any PR-controlled action or script.
+    actual_commit_sha = args.actual_commit_sha
+    actual_tree_sha = args.actual_tree_sha
     failures = []
-    if repository_full_name != args.expected_repository_full_name:
+    if actual_commit_sha != args.expected_commit_sha:
         failures.append(
-            "repository_full_name mismatch: expected "
-            + args.expected_repository_full_name + " got " + str(repository_full_name)
+            "commit_sha mismatch: expected " + args.expected_commit_sha + " got " + str(actual_commit_sha)
         )
-    if commit_sha != args.expected_commit_sha:
+    if actual_tree_sha != args.expected_tree_sha:
         failures.append(
-            "commit_sha mismatch: expected " + args.expected_commit_sha + " got " + str(commit_sha)
+            "tree_sha mismatch: expected " + args.expected_tree_sha + " got " + str(actual_tree_sha)
         )
-    if not (isinstance(tree_sha, str) and _COMMIT_SHA_RE.fullmatch(tree_sha)):
-        failures.append("tree_sha is missing or malformed: " + str(tree_sha))
-    if not (isinstance(commit_sha, str) and _COMMIT_SHA_RE.fullmatch(commit_sha)):
-        failures.append("commit_sha is missing or malformed: " + str(commit_sha))
     if failures:
         for failure in failures:
-            print("reason_category=source_provenance_mismatch: " + failure)
+            print("reason_category=source_tree_checkout_mismatch: " + failure)
         return 1
-    return 0
-
-
-def _cmd_assemble_execution_artifact(args):
-    rest = json.loads(args.rest_file.read_text(encoding="utf-8"))
-    downloaded_sha = args.downloaded_payload_sha256_file.read_text(encoding="utf-8").strip()
-    execution_artifact = {
-        "artifact_id": int(args.artifact_id),
-        "artifact_url": args.artifact_url,
-        "artifact_archive_digest": normalize_artifact_digest(args.artifact_digest),
-        "rest": {
-            "id": rest.get("id"),
-            "name": rest.get("name"),
-            "expired": rest.get("expired"),
-            "digest": rest.get("digest"),
-            "repository_id": (rest.get("workflow_run") or {}).get("repository_id"),
-            "head_repository_id": (rest.get("workflow_run") or {}).get("head_repository_id"),
-            "workflow_run_id": (rest.get("workflow_run") or {}).get("id"),
-            "head_sha": (rest.get("workflow_run") or {}).get("head_sha"),
-        },
-        "expected": {
-            "repository_id": int(args.expected_repository_id),
-            "head_repository_id": int(args.expected_repository_id),
-            "workflow_run_id": int(args.expected_run_id),
-            "head_sha": args.expected_head_sha,
-            "name": args.expected_name,
-        },
-        "downloaded_payload_sha256": downloaded_sha,
-    }
-    args.output.write_text(json.dumps(execution_artifact, indent=2, sort_keys=True) + chr(10), encoding="utf-8")
     return 0
 
 
@@ -686,6 +876,7 @@ def main():
     p_exec = sub.add_parser("execute")
     p_exec.add_argument("--command-id", required=True)
     p_exec.add_argument("--repo-root", type=Path, required=True)
+    p_exec.add_argument("--source-root", type=Path, required=True)
     p_exec.add_argument("--output", type=Path, required=True)
     p_exec.set_defaults(func=_cmd_execute)
 
@@ -695,6 +886,7 @@ def main():
     p_rec.add_argument("--subject-input", type=Path, required=True)
     p_rec.add_argument("--contract-input", type=Path, required=True)
     p_rec.add_argument("--execution-result", type=Path, required=True)
+    p_rec.add_argument("--source-input", type=Path, required=True)
     p_rec.add_argument("--schema", type=Path, required=False)
     p_rec.add_argument("--output", type=Path, required=True)
     p_rec.set_defaults(func=_cmd_build_record)
@@ -704,7 +896,8 @@ def main():
     p_receipt.add_argument("--execution-artifact-input", type=Path, required=True)
     p_receipt.add_argument("--final-subject", type=Path, required=True)
     p_receipt.add_argument("--final-contract", type=Path, required=True)
-    p_receipt.add_argument("--command-id", required=False, default=None)
+    p_receipt.add_argument("--final-source", type=Path, required=True)
+    p_receipt.add_argument("--command-id", required=True)
     p_receipt.add_argument("--schema", type=Path, required=False)
     p_receipt.add_argument("--output", type=Path, required=True)
     p_receipt.set_defaults(func=_cmd_build_receipt)
@@ -741,6 +934,12 @@ def main():
     p_rjc.add_argument("--output-job", type=Path, required=True)
     p_rjc.add_argument("--output-check", type=Path, required=True)
     p_rjc.set_defaults(func=_cmd_resolve_job_and_check)
+
+    p_rjbn = sub.add_parser("resolve-job-id-by-name")
+    p_rjbn.add_argument("--jobs-file", type=Path, required=True)
+    p_rjbn.add_argument("--job-name", required=True)
+    p_rjbn.add_argument("--output", type=Path, required=True)
+    p_rjbn.set_defaults(func=_cmd_resolve_job_id_by_name)
 
     p_dl = sub.add_parser("download-artifact")
     p_dl.add_argument("--repo", required=True)
@@ -786,21 +985,61 @@ def main():
     p_aea.add_argument("--output", type=Path, required=True)
     p_aea.set_defaults(func=_cmd_assemble_execution_artifact)
 
-    p_asp = sub.add_parser("assemble-source-provenance")
-    p_asp.add_argument("--repository-full-name", required=True)
-    p_asp.add_argument("--commit-sha", required=True)
-    p_asp.add_argument("--tree-sha", required=True)
-    p_asp.add_argument("--output", type=Path, required=True)
-    p_asp.set_defaults(func=_cmd_assemble_source_provenance)
+    p_rts = sub.add_parser("resolve-trusted-source")
+    p_rts.add_argument("--subject-file", type=Path, required=True)
+    p_rts.add_argument("--commit-file", type=Path, required=True)
+    p_rts.add_argument("--expected-repository-full-name", required=True)
+    p_rts.add_argument("--expected-commit-sha", required=True)
+    p_rts.add_argument("--output", type=Path, required=True)
+    p_rts.add_argument("--github-output-format", action="store_true")
+    p_rts.set_defaults(func=_cmd_resolve_trusted_source)
 
-    p_assertsp = sub.add_parser("assert-source-provenance")
-    p_assertsp.add_argument("--file", type=Path, required=True)
-    p_assertsp.add_argument("--expected-repository-full-name", required=True)
-    p_assertsp.add_argument("--expected-commit-sha", required=True)
-    p_assertsp.set_defaults(func=_cmd_assert_source_provenance)
+    p_asrc = sub.add_parser("assemble-source")
+    p_asrc.add_argument("--trusted-source-file", type=Path, required=True)
+    p_asrc.add_argument("--execution-run-id", required=True)
+    p_asrc.add_argument("--execution-job-id", required=True)
+    p_asrc.add_argument("--output", type=Path, required=True)
+    p_asrc.set_defaults(func=_cmd_assemble_source)
+
+    p_astm = sub.add_parser("assert-source-tree-matches")
+    p_astm.add_argument("--actual-commit-sha", required=True)
+    p_astm.add_argument("--actual-tree-sha", required=True)
+    p_astm.add_argument("--expected-commit-sha", required=True)
+    p_astm.add_argument("--expected-tree-sha", required=True)
+    p_astm.set_defaults(func=_cmd_assert_source_tree_matches)
 
     args = parser.parse_args()
     return args.func(args)
+
+
+def _cmd_assemble_execution_artifact(args):
+    rest = json.loads(args.rest_file.read_text(encoding="utf-8"))
+    downloaded_sha = args.downloaded_payload_sha256_file.read_text(encoding="utf-8").strip()
+    execution_artifact = {
+        "artifact_id": int(args.artifact_id),
+        "artifact_url": args.artifact_url,
+        "artifact_archive_digest": normalize_artifact_digest(args.artifact_digest),
+        "rest": {
+            "id": rest.get("id"),
+            "name": rest.get("name"),
+            "expired": rest.get("expired"),
+            "digest": rest.get("digest"),
+            "repository_id": (rest.get("workflow_run") or {}).get("repository_id"),
+            "head_repository_id": (rest.get("workflow_run") or {}).get("head_repository_id"),
+            "workflow_run_id": (rest.get("workflow_run") or {}).get("id"),
+            "head_sha": (rest.get("workflow_run") or {}).get("head_sha"),
+        },
+        "expected": {
+            "repository_id": int(args.expected_repository_id),
+            "head_repository_id": int(args.expected_repository_id),
+            "workflow_run_id": int(args.expected_run_id),
+            "head_sha": args.expected_head_sha,
+            "name": args.expected_name,
+        },
+        "downloaded_payload_sha256": downloaded_sha,
+    }
+    args.output.write_text(json.dumps(execution_artifact, indent=2, sort_keys=True) + chr(10), encoding="utf-8")
+    return 0
 
 
 if __name__ == "__main__":
