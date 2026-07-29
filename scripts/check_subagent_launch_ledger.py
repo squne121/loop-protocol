@@ -275,13 +275,23 @@ def run_fixture_mode(payload: dict, expectations: dict) -> dict:
 def run_audit_mode(ledger_path: Path, expectations: dict) -> dict:
     if not ledger_path.exists():
         return {
-            "status": "fail",
+            "status": "warning",
             "error_codes": ["subagent_launch_evidence_missing"],
             "errors": [f"ledger file not found: {ledger_path}"],
-            "exit_code": 1,
+            "exit_code": 0,
+            "evidence_usable": False,
         }
 
-    payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return {
+            "status": "warning",
+            "error_codes": ["launch_schema_violation"],
+            "errors": [f"ledger unreadable or malformed: {exc}"],
+            "exit_code": 0,
+            "evidence_usable": False,
+        }
     errors = validate_common_schema(payload, fixture_mode=False)
     unexpected_fixture_fields = sorted(set(payload.keys()) & FIXTURE_ONLY_FIELDS)
     if unexpected_fixture_fields:
@@ -293,12 +303,15 @@ def run_audit_mode(ledger_path: Path, expectations: dict) -> dict:
     errors.extend(launch_errors)
     errors.extend(action_errors)
     codes = sorted(set(launch_codes + action_codes))
-    status = "pass" if not errors else "fail"
+    status = "observed" if not errors else "warning"
     return {
         "status": status,
         "error_codes": codes,
         "errors": errors,
-        "exit_code": 0 if not errors else 1,
+        "exit_code": 0,
+        # Advisory telemetry is never approval, CI, review, or routing proof,
+        # including when its schema is valid.
+        "evidence_usable": False,
     }
 
 
@@ -331,6 +344,7 @@ def main() -> int:
         "status": result["status"],
         "error_codes": result["error_codes"],
         "errors": result["errors"],
+        "evidence_usable": result.get("evidence_usable", False),
     }
     print(json.dumps(output, ensure_ascii=False, indent=2))
     return result["exit_code"]

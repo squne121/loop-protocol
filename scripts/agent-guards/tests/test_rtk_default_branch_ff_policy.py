@@ -668,13 +668,20 @@ def _make_bare_linked_worktree(tmp_path, branch, dir_basename):
     return main_repo, worktree
 
 
-def test_codex_executor_denies_zero_matching_worktrees(tmp_path, monkeypatch):
-    # Branch/path both belong to issue 1 -- issue 999 (below) has zero matches.
+def test_codex_executor_ignores_ambient_issue_number(tmp_path, monkeypatch):
+    # Ambient process state is telemetry only; canonical cwd/branch identity wins.
     _main_repo, worktree = _make_bare_linked_worktree(tmp_path, "worktree-issue-1-x", "issue-1-x")
     monkeypatch.setenv("LOOP_ISSUE_NUMBER", "999")
     result = _executor_mod.run("main", cwd=str(worktree))
     assert result["status"] == "denied"
-    assert result["reason_code"] == "zero_matching_worktrees"
+    assert result["reason_code"] == "origin_remote_identity_mismatch"
+
+
+def test_codex_executor_denies_explicit_issue_mismatch(tmp_path):
+    _main_repo, worktree = _make_bare_linked_worktree(tmp_path, "worktree-issue-1-x", "issue-1-x")
+    result = _executor_mod.run("main", cwd=str(worktree), issue_number="999")
+    assert result["status"] == "denied"
+    assert result["reason_code"] == "branch_issue_number_mismatch"
 
 
 def test_codex_executor_denies_multiple_matching_worktrees(tmp_path, monkeypatch):
@@ -702,7 +709,7 @@ def test_codex_executor_denies_noncanonical_worktree_path(tmp_path, monkeypatch)
     # to it.
     result = _executor_mod.run("main", cwd=str(main_repo))
     assert result["status"] == "denied"
-    assert result["reason_code"] == "cwd_not_expected_worktree"
+    assert result["reason_code"] == "active_branch_not_issue_worktree_branch"
 
 
 def test_executor_rejects_duplicate_candidate_flag(capsys):

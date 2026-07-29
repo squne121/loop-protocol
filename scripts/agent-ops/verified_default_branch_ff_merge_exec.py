@@ -81,15 +81,35 @@ def _resolve_authorized_worktree(cwd_real, issue_number):
     return expected_realpath, None
 
 
-def run(candidate_branch, cwd=None):
+def _current_branch(cwd):
+    catalog = _wcat.list_worktrees(cwd)
+    if not catalog:
+        return None
+    entry = _wcat.find_by_realpath(catalog, cwd)
+    if not entry or entry.get('detached'):
+        return None
+    return _wcat.branch_short_name(entry.get('branch_ref'))
+
+
+def run(candidate_branch, cwd=None, issue_number=None):
     resolved_cwd = os.path.realpath(cwd if cwd is not None else os.getcwd())
 
     if not _CANDIDATE_RE.fullmatch(candidate_branch or ''):
         return {'status': 'denied', 'reason_code': 'invalid_default_branch_candidate'}
 
-    active_issue_number = os.environ.get('LOOP_ISSUE_NUMBER', '').strip()
-    if not active_issue_number or not active_issue_number.isdigit():
-        return {'status': 'denied', 'reason_code': 'issue_context_required'}
+    active_branch = _current_branch(resolved_cwd)
+    if not active_branch:
+        return {'status': 'denied', 'reason_code': 'detached_head_not_supported'}
+    branch_match = re.fullmatch(r'worktree-issue-([0-9]+)-[a-z0-9][a-z0-9-]{0,63}', active_branch)
+    if not branch_match:
+        return {'status': 'denied', 'reason_code': 'active_branch_not_issue_worktree_branch'}
+    active_issue_number = branch_match.group(1)
+    if issue_number is not None:
+        explicit = str(issue_number).strip()
+        if not explicit.isdigit():
+            return {'status': 'denied', 'reason_code': 'invalid_issue_number'}
+        if explicit != active_issue_number:
+            return {'status': 'denied', 'reason_code': 'branch_issue_number_mismatch'}
 
     expected_realpath, bind_reason = _resolve_authorized_worktree(resolved_cwd, active_issue_number)
     if expected_realpath is None:
@@ -131,6 +151,10 @@ def _build_cli_parser():
         required=True,
         help='candidate default branch name (e.g. main) to verify and fast-forward to',
     )
+    parser.add_argument(
+        '--issue-number',
+        help='optional explicit Issue number; must equal the canonical linked-worktree branch identity',
+    )
     return parser
 
 
@@ -140,13 +164,18 @@ def _validate_exact_invocation_argv(raw_argv):
     `--flag=value` form, no positionals, no trailing tokens. This is the
     real enforcement the `.codex/rules/default.rules` PREFIX rule cannot
     provide by itself."""
-    if len(raw_argv) != 2:
+    if len(raw_argv) not in (2, 4):
         return False
     if raw_argv[0] != '--candidate-branch':
         return False
     value = raw_argv[1]
     if not value or value.startswith('-'):
         return False
+    if len(raw_argv) == 4:
+        if raw_argv[2] != '--issue-number':
+            return False
+        if not raw_argv[3].isdigit():
+            return False
     return True
 
 
@@ -158,7 +187,7 @@ def main(argv=None):
         sys.stdout.write(chr(10))
         return 1
     args = _build_cli_parser().parse_args(raw_argv)
-    result = run(args.candidate_branch)
+    result = run(args.candidate_branch, issue_number=args.issue_number)
     sys.stdout.write(json.dumps(result, ensure_ascii=True, separators=(',', ':')))
     sys.stdout.write(chr(10))
     ok = result.get('status') in (

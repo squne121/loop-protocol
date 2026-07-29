@@ -171,13 +171,19 @@ def _copy_fixture_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _run_python_validator(repo: Path) -> subprocess.CompletedProcess[str]:
+def _run_python_validator(
+    repo: Path, *, runtime_contract: bool = False
+) -> subprocess.CompletedProcess[str]:
+    assertion_flags = (
+        ["--assert-runtime-contract"]
+        if runtime_contract
+        else ["--assert-required-fields", "--assert-local-main-branch-guard"]
+    )
     return subprocess.run(
         [
             sys.executable,
             "scripts/check_codex_agent_config.py",
-            "--assert-required-fields",
-            "--assert-runtime-contract",
+            *assertion_flags,
         ],
         cwd=repo,
         text=True,
@@ -204,15 +210,13 @@ def test_python_cli_passes_on_fixture_repo(tmp_path: Path):
     assert "OK: Codex agent contract validation passed" in result.stdout
 
 
-def test_python_cli_detects_missing_marker_via_subprocess(tmp_path: Path):
+def test_python_bridge_validator_detects_missing_marker_in_fixture(tmp_path: Path):
     repo = _copy_fixture_repo(tmp_path)
     bridge = repo / ".agents/skills/create-issue/SKILL.md"
     bridge.write_text(bridge.read_text(encoding="utf-8").replace("derived/non-canonical ", ""), encoding="utf-8")
 
-    result = _run_python_validator(repo)
-
-    assert result.returncode == 1
-    assert "derived/non-canonical marker required" in result.stdout
+    failures = module.validate_bridge_surface(bridge)
+    assert any("derived/non-canonical marker required" in failure for failure in failures)
 
 
 def test_python_cli_detects_route_surface_mismatch_via_subprocess(tmp_path: Path):
@@ -226,60 +230,66 @@ def test_python_cli_detects_route_surface_mismatch_via_subprocess(tmp_path: Path
         encoding="utf-8",
     )
 
-    result = _run_python_validator(repo)
+    result = _run_python_validator(repo, runtime_contract=True)
 
     assert result.returncode == 1
     assert "runtime_followup_route expected 'create-issue|edit-issue' got 'create-issue'" in result.stdout
 
 
-def test_python_cli_detects_missing_subagent_hook_via_subprocess(tmp_path: Path):
+def test_python_cli_detects_missing_passive_session_hook_via_subprocess(tmp_path: Path):
     repo = _copy_fixture_repo(tmp_path)
     hooks_path = repo / ".codex/hooks.json"
     hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
-    hooks["hooks"].pop("SubagentStart")
+    hooks["hooks"].pop("SessionEnd")
     hooks_path.write_text(json.dumps(hooks, indent=2), encoding="utf-8")
 
     result = _run_python_validator(repo)
 
     assert result.returncode == 1
-    assert ".codex/hooks.json: missing hooks for SubagentStart" in result.stdout
+    assert "active hooks must be the passive SessionEnd/SubagentStop allowlist" in result.stdout
 
 
 def test_python_cli_detects_extra_hooks_root_metadata_via_subprocess(tmp_path: Path):
     repo = _copy_fixture_repo(tmp_path)
     hooks_path = repo / ".codex/hooks.json"
     hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
-    hooks["fastpathContract"] = {}
+    hooks["hooks"]["PreToolUse"] = []
     hooks_path.write_text(json.dumps(hooks, indent=2), encoding="utf-8")
 
     result = _run_python_validator(repo)
 
     assert result.returncode == 1
-    assert ".codex/hooks.json: root keys must be exactly" in result.stdout
+    assert "active hooks must be the passive SessionEnd/SubagentStop allowlist" in result.stdout
 
 
-def test_python_cli_detects_extra_pretool_handler_field_via_subprocess(tmp_path: Path):
+def test_python_cli_detects_active_pretool_hook_via_subprocess(tmp_path: Path):
     repo = _copy_fixture_repo(tmp_path)
     hooks_path = repo / ".codex/hooks.json"
     hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
-    hooks["hooks"]["PreToolUse"][0]["hooks"][0]["async"] = True
+    hooks["hooks"]["PreToolUse"] = []
     hooks_path.write_text(json.dumps(hooks, indent=2), encoding="utf-8")
 
     result = _run_python_validator(repo)
 
     assert result.returncode == 1
-    assert "must exactly match expected PreToolUse handler matrix" in result.stdout
-    assert "keys must be exactly" in result.stdout
+    assert "active hooks must be the passive SessionEnd/SubagentStop allowlist" in result.stdout
+    assert "command enforcement must use standard sandbox/approval, not repo hooks" in result.stdout
 
 
 def test_python_cli_detects_parity_failure_via_subprocess(tmp_path: Path):
     repo = _copy_fixture_repo(tmp_path)
     (repo / ".claude/agents/issue-author.md").unlink()
 
-    result = _run_python_validator(repo)
+    result = subprocess.run(
+        [sys.executable, "scripts/check_claude_codex_agent_parity.py", "--strict"],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
     assert result.returncode == 1
-    assert "scripts/check_claude_codex_agent_parity.py: parity validation failed" in result.stdout
+    assert "missing claude agent file" in result.stdout
 
 
 def test_js_cli_passes_on_fixture_repo(tmp_path: Path):

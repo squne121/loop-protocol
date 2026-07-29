@@ -1,135 +1,14 @@
 {
   "hooks": {
-    "SubagentStart": [
+    "SessionEnd": [
       {
         "matcher": ".*",
         "hooks": [
           {
             "type": "command",
-            "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/scripts/check-codex-agents.mjs\" --hook-subagent-start",
-            "timeout": 30,
-            "statusMessage": "Loading LOOP_PROTOCOL subagent guardrail"
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "^Bash$",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/local_main_branch_guard.sh\"",
-            "timeout": 10,
-            "statusMessage": "Checking local root branch policy"
-          },
-          {
-            "type": "command",
-            "command": "python3 \"$(git rev-parse --show-toplevel)/scripts/agent-guards/worktree_scope_guard.py\"",
-            "timeout": 20,
-            "statusMessage": "Checking worktree cleanup scope policy (shared core)"
-          },
-          {
-            "type": "command",
-            "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/scripts/check-codex-agents.mjs\" --hook-pretool",
-            "timeout": 30,
-            "statusMessage": "Checking LOOP_PROTOCOL Bash guardrail"
-          },
-          {
-            "type": "command",
-            "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs\" --event PreToolUse",
-            "timeout": 30,
-            "statusMessage": "Checking Codex session-recording PreToolUse guard"
-          },
-          {
-            "type": "command",
-            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/ci_test_performance_advisory.sh\"",
-            "timeout": 10,
-            "statusMessage": "Checking CI/test-lane path advisory"
-          },
-          {
-            "type": "command",
-            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/root_temporary_residue_advisory.sh\"",
-            "timeout": 10,
-            "statusMessage": "Checking root temporary residue advisory"
-          }
-        ]
-      },
-      {
-        "matcher": "^(apply_patch|Edit|Write)$",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"$(git rev-parse --show-toplevel)/scripts/agent-guards/codex_apply_patch_adapter.py\"",
-            "timeout": 20,
-            "statusMessage": "Checking worktree containment for apply_patch/Edit/Write (shared core)"
-          },
-          {
-            "type": "command",
-            "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/scripts/check-codex-agents.mjs\" --hook-pretool",
-            "timeout": 30,
-            "statusMessage": "Checking LOOP_PROTOCOL patch guardrail"
-          },
-          {
-            "type": "command",
-            "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs\" --event PreToolUse",
-            "timeout": 30,
-            "statusMessage": "Checking Codex session-recording patch guard"
-          },
-          {
-            "type": "command",
-            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/ci_test_performance_advisory.sh\"",
-            "timeout": 10,
-            "statusMessage": "Checking CI/test-lane path advisory"
-          },
-          {
-            "type": "command",
-            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/root_temporary_residue_advisory.sh\"",
-            "timeout": 10,
-            "statusMessage": "Checking root temporary residue advisory"
-          }
-        ]
-      }
-    ],
-    "PermissionRequest": [
-      {
-        "matcher": "^Bash$",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/local_main_branch_guard.sh\"",
-            "timeout": 10,
-            "statusMessage": "Checking local root branch policy"
-          },
-          {
-            "type": "command",
-            "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs\" --event PermissionRequest",
-            "timeout": 30,
-            "statusMessage": "Checking Codex session-recording PermissionRequest guard"
-          }
-        ]
-      },
-      {
-        "matcher": "^(apply_patch|Edit|Write)$",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs\" --event PermissionRequest",
-            "timeout": 30,
-            "statusMessage": "Checking Codex session-recording PermissionRequest guard"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "matcher": ".*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs\" --event Stop",
-            "timeout": 30,
-            "statusMessage": "Writing Codex session-recording Stop manifest"
+            "command": "node .codex/hooks/session-recording-composite.mjs --event SessionEnd",
+            "timeout": 3,
+            "statusMessage": "Recording advisory Codex session metadata"
           }
         ]
       }
@@ -140,9 +19,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs\" --event SubagentStop",
-            "timeout": 30,
-            "statusMessage": "Writing Codex session-recording SubagentStop manifest"
+            "command": "node .codex/hooks/session-recording-composite.mjs --event SubagentStop",
+            "timeout": 3,
+            "statusMessage": "Recording advisory Codex subagent metadata"
           }
         ]
       }

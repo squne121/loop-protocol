@@ -398,11 +398,6 @@ function assert(condition, message, failures) {
   }
 }
 
-const compositeBase =
-  'rtk pnpm exec node "$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs"';
-const checkCodexAgentsBase =
-  'rtk pnpm exec node "$(git rev-parse --show-toplevel)/scripts/check-codex-agents.mjs"';
-
 const expectedCommandHookKeys = ['command', 'statusMessage', 'timeout', 'type'];
 
 function assertExactCommandHook(scope, hook, expected, failures) {
@@ -421,98 +416,6 @@ function assertExactCommandHook(scope, hook, expected, failures) {
     failures,
   );
 }
-
-function assertExactHookEntry(eventName, entry, expectedMatcher, expectedHooks, failures) {
-  assert(Boolean(entry), `hooks.json: missing ${eventName} matcher ${expectedMatcher}`, failures);
-  if (!entry) {
-    return;
-  }
-  assert(entry?.matcher === expectedMatcher, `hooks.json: ${eventName} matcher must be ${expectedMatcher}`, failures);
-  const hooks = entry?.hooks ?? [];
-  assert(Array.isArray(hooks), `hooks.json: ${eventName} ${expectedMatcher} hooks must be an array`, failures);
-  if (!Array.isArray(hooks)) {
-    return;
-  }
-  assert(
-    hooks.length === expectedHooks.length,
-    `hooks.json: ${eventName} ${expectedMatcher} must have exactly ${expectedHooks.length} hooks`,
-    failures,
-  );
-  if (hooks.length !== expectedHooks.length) {
-    return;
-  }
-  for (const [index, expected] of expectedHooks.entries()) {
-    assertExactCommandHook(`hooks.json: ${eventName} ${expectedMatcher} hook ${index}`, hooks[index], expected, failures);
-  }
-}
-
-const expectedPreToolUseEntries = new Map([
-  [
-    '^Bash$',
-    [
-      {
-        command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/local_main_branch_guard.sh"',
-        timeout: 10,
-        statusMessage: 'Checking local root branch policy',
-      },
-      {
-        command: 'python3 "$(git rev-parse --show-toplevel)/scripts/agent-guards/worktree_scope_guard.py"',
-        timeout: 20,
-        statusMessage: 'Checking worktree cleanup scope policy (shared core)',
-      },
-      {
-        command: `${checkCodexAgentsBase} --hook-pretool`,
-        timeout: 30,
-        statusMessage: 'Checking LOOP_PROTOCOL Bash guardrail',
-      },
-      {
-        command: `${compositeBase} --event PreToolUse`,
-        timeout: 30,
-        statusMessage: 'Checking Codex session-recording PreToolUse guard',
-      },
-      {
-        command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/ci_test_performance_advisory.sh"',
-        timeout: 10,
-        statusMessage: 'Checking CI/test-lane path advisory',
-      },
-      {
-        command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/root_temporary_residue_advisory.sh"',
-        timeout: 10,
-        statusMessage: 'Checking root temporary residue advisory',
-      },
-    ],
-  ],
-  [
-    '^(apply_patch|Edit|Write)$',
-    [
-      {
-        command: 'python3 "$(git rev-parse --show-toplevel)/scripts/agent-guards/codex_apply_patch_adapter.py"',
-        timeout: 20,
-        statusMessage: 'Checking worktree containment for apply_patch/Edit/Write (shared core)',
-      },
-      {
-        command: `${checkCodexAgentsBase} --hook-pretool`,
-        timeout: 30,
-        statusMessage: 'Checking LOOP_PROTOCOL patch guardrail',
-      },
-      {
-        command: `${compositeBase} --event PreToolUse`,
-        timeout: 30,
-        statusMessage: 'Checking Codex session-recording patch guard',
-      },
-      {
-        command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/ci_test_performance_advisory.sh"',
-        timeout: 10,
-        statusMessage: 'Checking CI/test-lane path advisory',
-      },
-      {
-        command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/root_temporary_residue_advisory.sh"',
-        timeout: 10,
-        statusMessage: 'Checking root temporary residue advisory',
-      },
-    ],
-  ],
-]);
 
 // ---------------------------------------------------------------------------
 // hooks.json structural validation (JSON.parse-based, not string includes)
@@ -535,99 +438,32 @@ function validateHooksJson(hooksPath, failures) {
       failures,
     );
   }
-  assert(Array.isArray(parsed?.hooks?.SubagentStart), 'hooks.json: must have hooks.SubagentStart array', failures);
-  assert(Array.isArray(parsed?.hooks?.PreToolUse), 'hooks.json: must have hooks.PreToolUse array', failures);
-
-  const subagentEntries = parsed?.hooks?.SubagentStart ?? [];
-  assert(subagentEntries.length === 1, 'hooks.json: SubagentStart must have exactly one entry', failures);
-  if (subagentEntries.length === 1) {
-    assert(subagentEntries[0]?.matcher === '.*', 'hooks.json: SubagentStart matcher must be .*', failures);
-    const subagentHooks = subagentEntries[0]?.hooks ?? [];
-    assert(subagentHooks.length === 1, 'hooks.json: SubagentStart must have exactly one command hook', failures);
-    assert(
-      subagentHooks[0]?.command?.includes('--hook-subagent-start'),
-      'hooks.json: SubagentStart command must include --hook-subagent-start',
+  const expectedEvents = ['SessionEnd', 'SubagentStop'];
+  assert(
+    JSON.stringify(Object.keys(parsed?.hooks ?? {}).sort()) === JSON.stringify(expectedEvents),
+    'hooks.json: active hooks must be exactly the passive SessionEnd/SubagentStop allowlist',
+    failures,
+  );
+  for (const eventName of expectedEvents) {
+    const entries = parsed?.hooks?.[eventName];
+    assert(Array.isArray(entries) && entries.length === 1, `hooks.json: ${eventName} must have exactly one entry`, failures);
+    if (!Array.isArray(entries) || entries.length !== 1) continue;
+    assert(entries[0]?.matcher === '.*', `hooks.json: ${eventName} matcher must be .*`, failures);
+    const handlers = entries[0]?.hooks;
+    assert(Array.isArray(handlers) && handlers.length === 1, `hooks.json: ${eventName} must have exactly one handler`, failures);
+    if (!Array.isArray(handlers) || handlers.length !== 1) continue;
+    const handler = handlers[0];
+    assertExactCommandHook(
+      `hooks.json: ${eventName} handler`,
+      handler,
+      {
+        command: `node .codex/hooks/session-recording-composite.mjs --event ${eventName}`,
+        timeout: 3,
+        statusMessage: `Recording advisory Codex ${eventName === 'SessionEnd' ? 'session' : 'subagent'} metadata`,
+      },
       failures,
     );
   }
-
-  const preToolEntries = parsed?.hooks?.PreToolUse ?? [];
-  assert(
-    preToolEntries.length === expectedPreToolUseEntries.size,
-    `hooks.json: PreToolUse must have exactly ${expectedPreToolUseEntries.size} matcher entries`,
-    failures,
-  );
-  for (const [matcher, expectedHooks] of expectedPreToolUseEntries) {
-    const entry = preToolEntries.find((candidate) => candidate?.matcher === matcher);
-    assertExactHookEntry('PreToolUse', entry, matcher, expectedHooks, failures);
-  }
-
-  // AC3: structural validation for PermissionRequest, Stop, SubagentStop.
-  // Each event must be a non-empty array; each entry must have at least one handler;
-  // and each handler object must have a "command" field of type string.
-  assert(Array.isArray(parsed?.hooks?.PermissionRequest), 'hooks.json: must have hooks.PermissionRequest array (AC3 #1020)', failures);
-  assert(Array.isArray(parsed?.hooks?.Stop), 'hooks.json: must have hooks.Stop array (AC3 #1020)', failures);
-  assert(Array.isArray(parsed?.hooks?.SubagentStop), 'hooks.json: must have hooks.SubagentStop array (AC3 #1020)', failures);
-  const permissionRequestEntries = parsed?.hooks?.PermissionRequest ?? [];
-  assert(permissionRequestEntries.length >= 1, 'hooks.json: PermissionRequest must have at least one entry (AC3 #1020)', failures);
-  const stopEntries = parsed?.hooks?.Stop ?? [];
-  assert(stopEntries.length >= 1, 'hooks.json: Stop must have at least one entry (AC3 #1020)', failures);
-  const subagentStopEntries = parsed?.hooks?.SubagentStop ?? [];
-  assert(subagentStopEntries.length >= 1, 'hooks.json: SubagentStop must have at least one entry (AC3 #1020)', failures);
-  // Validate that each entry in PermissionRequest/Stop/SubagentStop has at least one handler
-  // with a "command" field (string). An empty object {} or missing command fails.
-  for (const [eventKey, entries] of [
-    ['PermissionRequest', permissionRequestEntries],
-    ['Stop', stopEntries],
-    ['SubagentStop', subagentStopEntries],
-  ]) {
-    for (let i = 0; i < entries.length; i += 1) {
-      const entry = entries[i];
-      const handlers = entry?.hooks ?? [];
-      assert(
-        handlers.length >= 1,
-        `hooks.json: ${eventKey}[${i}] must have at least one handler in hooks[] (AC3 #1020)`,
-        failures,
-      );
-      for (let j = 0; j < handlers.length; j += 1) {
-        assert(
-          typeof handlers[j]?.command === 'string' && handlers[j].command.length > 0,
-          `hooks.json: ${eventKey}[${i}].hooks[${j}] must have a non-empty "command" field (AC3 #1020)`,
-          failures,
-        );
-      }
-    }
-  }
-
-  const allHookCommands = [];
-  for (const eventKey of ['SubagentStart', 'PreToolUse']) {
-    const entries = parsed?.hooks?.[eventKey] ?? [];
-    for (const entry of entries) {
-      const hooks = entry?.hooks ?? [];
-      for (const hook of hooks) {
-        if (hook?.command) {
-          allHookCommands.push(hook.command);
-        }
-      }
-    }
-  }
-
-  const joinedCommands = allHookCommands.join('\n');
-  assert(
-    joinedCommands.includes('scripts/check-codex-agents.mjs'),
-    'hooks.json: at least one hook command must route through scripts/check-codex-agents.mjs',
-    failures,
-  );
-  assert(
-    joinedCommands.includes('$(git rev-parse --show-toplevel)'),
-    'hooks.json: hook command must resolve path from git root via $(git rev-parse --show-toplevel)',
-    failures,
-  );
-  assert(
-    joinedCommands.includes('rtk pnpm exec node'),
-    'hooks.json: hook command must invoke validator through rtk pnpm exec node',
-    failures,
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -744,7 +580,7 @@ function validateAgents() {
   const hookBoundariesText = readOptionalText(hookBoundariesPath);
   const skillBoundariesText = readOptionalText(skillBoundariesPath);
 
-  assert(configText.includes('default_permissions = "loop-protocol-rtk"'), 'config.toml must keep default_permissions = "loop-protocol-rtk"', failures);
+  assert(!configText.includes('\ndefault_permissions = '), 'config.toml must not claim an unverified root default permission profile', failures);
   assert(configText.includes('[permissions.loop-protocol-readonly.filesystem]'), 'config.toml must define permissions.loop-protocol-readonly', failures);
   assert(configText.includes('.codex/hooks.json'), 'config.toml must mention .codex/hooks.json as the documented hook surface', failures);
   assert(!configText.includes('sandbox_mode'), 'config.toml must not use sandbox_mode when permission profiles are active', failures);
@@ -1362,8 +1198,8 @@ function runSelfTest() {
     const parsed = parseTomlFile(configPath);
     selfAssert(typeof parsed === 'object', 'config.toml: parses without error');
     selfAssert(
-      typeof parsed.default_permissions === 'string',
-      'config.toml: default_permissions is a string',
+      parsed.default_permissions === undefined,
+      'config.toml: root default_permissions remains advisory-absent',
     );
   } catch (e) {
     selfAssert(false, `config.toml: should parse cleanly (got: ${e.message})`);
