@@ -1,0 +1,49 @@
+{
+  "schema": "CODEX_MULTI_AGENT_V2_RUNTIME_CAPABILITY_V1",
+  "generated_at": "2026-07-29T21:15:58Z",
+  "generated_by": "probe_codex_v2_runtime_capability",
+  "codex_cli_version": {
+    "status": "ok",
+    "version": "0.146.0",
+    "raw_output": "codex-cli 0.146.0",
+    "executable": {
+      "which_path": "/home/squne/.local/bin/codex",
+      "resolved_path": "/home/squne/.codex/packages/standalone/releases/0.146.0-x86_64-unknown-linux-musl/bin/codex",
+      "is_symlink": true,
+      "shim_detection": "no_shim_detected"
+    }
+  },
+  "v2_config_schema_loadable": true,
+  "v2_config_schema_check": {
+    "config_toml_parse": {
+      "parse_status": "ok_absent",
+      "features_table_present": false,
+      "multi_agent_v2_declared": null
+    },
+    "cli_feature_flag_probe": {
+      "status": "ok_recognized_but_disabled",
+      "stage": "stable",
+      "enabled": false,
+      "raw_output": null
+    }
+  },
+  "cli_feature_recognition": {
+    "probed": true,
+    "reason": null,
+    "method": "cli_help_text_scan",
+    "note": "Static substring scan of `codex --help` / `codex exec --help` output. spawn_agent / agent_type / task_name / fork_turns are internal agent tool-call schema, not top-level CLI flags, so `false` here is expected and does not by itself indicate the capability is unavailable to the running agent.",
+    "tokens": {
+      "spawn_agent_v2_form": false,
+      "agent_type_param": false,
+      "task_name_param": false,
+      "fork_turns_param": false,
+      "nested_delegation": false
+    }
+  },
+  "provenance": {
+    "repo_head_sha": "7fdcfb8402d81ed35dcd6686423918efa984f473",
+    "codex_hooks_json_sha256": "25213a38420fe3c5e3091db9bd61fa6a350c49a5631104e32a4fa5631cf0e09f",
+    "codex_hook_adapter_sha256": "0ae13700c6812a26095174b009321408233ffe5a5c58036ce5b946fd835e6aad",
+    "recorder_generation": "post_1830_advisory_subagent_stop_only"
+  }
+}
