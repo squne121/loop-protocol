@@ -8,6 +8,8 @@ from pathlib import Path
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import validate_issue_body as validator
+
 from validate_issue_body import (
     validate_issue_body,
     _extract_ac_numbers,
@@ -82,6 +84,46 @@ test -f file  # AC1
         result = validate_issue_body(body)
         lp001_errors = [e for e in result.errors if e.rule_id == "LP001"]
         assert len(lp001_errors) == 0
+
+    def test_1844_existing_parent_profile_does_not_read_template_sections(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The versioned readiness profile owns existing-parent required sections."""
+        body = """## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: parent
+parent_mode: delivery-rollup
+closure_mode: child-complete
+```
+
+## Summary
+## Goal
+## Desired Destination
+## Current Validated Scope
+## Decisions Fixed
+## Quality Decision Record
+## Parent Closure Rule
+## Child Issues
+## Remaining Parent Gaps
+## Phase Handoff Contract
+## Acceptance Criteria
+"""
+        monkeypatch.setattr(
+            validator,
+            "_load_required_section_labels",
+            lambda _kind: pytest.fail("existing profile must not consult ISSUE_TEMPLATE"),
+        )
+
+        result = validator.validate_issue_body(
+            body,
+            kind="parent",
+            validation_profile=validator.EXISTING_ISSUE_READINESS_V1,
+        )
+
+        assert result.status == "pass"
 
 
 class TestLP002InvalidYAML:
