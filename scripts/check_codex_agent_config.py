@@ -336,7 +336,6 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
     failures: list[str] = []
     config = read_toml(CONFIG_PATH)
     hooks = json.loads(HOOKS_PATH.read_text(encoding="utf-8"))
-    hook_command_fragment = expectations["required_hook_command_fragment"]
     all_surface_paths: list[Path] = []
     for agent_name, expected in expectations["required_agents"].items():
         agent = load_agent(REPO_ROOT / expected["path"])
@@ -395,68 +394,29 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
 
     if sorted(hooks.keys()) != ["hooks"]:
         failures.append(f".codex/hooks.json: root keys must be exactly ['hooks'], got {sorted(hooks.keys())!r}")
+    failures.extend(assert_local_main_branch_guard_preflight(hooks))
     hooks_root = hooks.get("hooks", {})
-    subagent_entries = hooks_root.get("SubagentStart")
-    if not isinstance(subagent_entries, list) or not subagent_entries:
-        failures.append(".codex/hooks.json: missing hooks for SubagentStart")
-    else:
-        if len(subagent_entries) != 1:
-            failures.append(".codex/hooks.json: SubagentStart must have exactly one matcher entry")
-        else:
-            entry = subagent_entries[0]
-            if entry.get("matcher") != ".*":
-                failures.append(".codex/hooks.json: SubagentStart matcher must be '.*'")
-            commands = [hook.get("command") for hook in entry.get("hooks", []) if isinstance(hook.get("command"), str)]
-            if len(commands) != 1 or "--hook-subagent-start" not in commands[0]:
-                failures.append(
-                    ".codex/hooks.json: SubagentStart must route exactly"
-                    " one command with --hook-subagent-start"
-                )
-
-    pretool_entries = hooks_root.get("PreToolUse")
-    if not isinstance(pretool_entries, list) or not pretool_entries:
-        failures.append(".codex/hooks.json: missing hooks for PreToolUse")
-        pretool_entries = []
-    actual_matchers = {entry.get("matcher"): entry for entry in pretool_entries if isinstance(entry, dict)}
-    if len(actual_matchers) != len(EXPECTED_PRETOOL_HOOKS):
-        failures.append(
-            f".codex/hooks.json: PreToolUse must have exactly {len(EXPECTED_PRETOOL_HOOKS)} matcher entries"
-        )
-    for matcher, expected_hooks in EXPECTED_PRETOOL_HOOKS.items():
-        entry = actual_matchers.get(matcher)
-        if entry is None:
-            failures.append(f".codex/hooks.json: missing PreToolUse matcher {matcher}")
-            continue
-        hooks_for_matcher = entry.get("hooks", [])
-        if not isinstance(hooks_for_matcher, list):
-            failures.append(f".codex/hooks.json: matcher {matcher} hooks must be a list")
-            continue
-        if hooks_for_matcher != expected_hooks:
+    for event_name, subject in (("SessionEnd", "session"), ("SubagentStop", "subagent")):
+        expected_entries = [
+            {
+                "matcher": ".*",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": (
+                            "node .codex/hooks/session-recording-composite.mjs"
+                            f" --event {event_name}"
+                        ),
+                        "timeout": 3,
+                        "statusMessage": f"Recording advisory Codex {subject} metadata",
+                    }
+                ],
+            }
+        ]
+        if hooks_root.get(event_name) != expected_entries:
             failures.append(
-                f".codex/hooks.json: matcher {matcher} must exactly match expected PreToolUse handler matrix"
+                f".codex/hooks.json: {event_name} must exactly match the passive advisory handler"
             )
-        for index, hook in enumerate(hooks_for_matcher):
-            if sorted(hook.keys()) != EXPECTED_HOOK_KEYS:
-                failures.append(
-                    f".codex/hooks.json: matcher {matcher} hook {index} keys must be exactly {EXPECTED_HOOK_KEYS!r}"
-                )
-
-    all_commands: list[str] = []
-    for event_name in expectations["required_hook_events"]:
-        hooks_for_event = hooks_root.get(event_name, [])
-        for entry in hooks_for_event:
-            for hook in entry.get("hooks", []):
-                command = hook.get("command")
-                if isinstance(command, str):
-                    all_commands.append(command)
-
-    if not any(hook_command_fragment in command for command in all_commands):
-        failures.append(
-            ".codex/hooks.json: expected hooks to route through scripts/check-codex-agents.mjs"
-        )
-
-    if not any("rtk pnpm exec node" in command for command in all_commands):
-        failures.append(".codex/hooks.json: hooks must invoke the validator through rtk pnpm exec node")
     if (REPO_ROOT / ".codex/skills").exists():
         failures.append(".codex/skills: must not exist as a repo-shared skill surface")
 
