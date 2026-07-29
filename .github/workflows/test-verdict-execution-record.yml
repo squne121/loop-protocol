@@ -219,7 +219,7 @@ jobs:
 
       - name: Assemble source identity bound to the independently re-resolved trusted provenance and the untrusted-execution job
         run: |
-          untrusted_job_id="$(uv run --locked python3 -c "import json;print(json.load(open('untrusted-job.json'))['job_id'])")"
+          untrusted_job_id=$(uv run --locked python3 -c "import json;print(json.load(open('untrusted-job.json'))['job_id'])")
           uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assemble-source --trusted-source-file trusted-source-final.json --execution-run-id ${{ github.run_id }} --execution-job-id "$untrusted_job_id" --output source.json
 
       - name: Build execution-record artifact from the untrusted execution result
@@ -267,7 +267,7 @@ jobs:
         run: |
           uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py gh-api --path repos/${{ github.repository }}/commits/${{ inputs.expected_head_sha }} --output commit-receipt.json
           uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py resolve-trusted-source --subject-file subject-final.json --commit-file commit-receipt.json --expected-repository-full-name "${{ github.repository }}" --expected-commit-sha "${{ inputs.expected_head_sha }}" --output trusted-source-receipt.json
-          untrusted_job_id="$(uv run --locked python3 -c "import json;print(json.load(open('untrusted-job.json'))['job_id'])")"
+          untrusted_job_id=$(uv run --locked python3 -c "import json;print(json.load(open('untrusted-job.json'))['job_id'])")
           uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py assemble-source --trusted-source-file trusted-source-receipt.json --execution-run-id ${{ github.run_id }} --execution-job-id "$untrusted_job_id" --output final-source.json
           uv run --locked python3 scripts/agent-ops/test_verdict_execution_record_producer.py build-receipt --record execution-record.json --execution-artifact-input execution-artifact-input.json --final-subject subject-final-assembled.json --final-contract contract-final-assembled.json --final-source final-source.json --command-id uv.pytest.execution-record --schema schemas/test-verdict-producer-receipt.schema.json --output producer-receipt.json
         continue-on-error: true
