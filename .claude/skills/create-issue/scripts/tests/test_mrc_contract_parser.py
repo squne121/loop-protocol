@@ -8,6 +8,7 @@ Verifies the shared, section-bound, strict Machine-Readable Contract parser:
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -133,6 +134,28 @@ class TestStructuralFailuresFailClosed:
         result = mp.parse_machine_readable_contract(body)
         assert result.ok is False
         assert result.reason == mp.REASON_YAML_ERROR
+
+    def test_1844_unhashable_mapping_key_is_structured_and_json_safe(self):
+        """A complex YAML key must fail closed instead of raising TypeError."""
+        body = (
+            "## Machine-Readable Contract\n\n"
+            "```yaml\n"
+            "? [unhashable, key]\n"
+            ": value\n"
+            "issue_kind: parent\n"
+            "```"
+        )
+
+        result = mp.parse_machine_readable_contract(body)
+
+        assert result.ok is False
+        assert result.reason == mp.REASON_YAML_ERROR
+        assert json.loads(json.dumps(result.__dict__)) == {
+            "ok": False,
+            "data": None,
+            "reason": mp.REASON_YAML_ERROR,
+            "duplicate_key": None,
+        }
 
     def test_structural_failures_fail_closed_non_mapping_root(self):
         body = (
