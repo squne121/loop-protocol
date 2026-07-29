@@ -318,10 +318,10 @@ def test_invalid_stored_limit_blocks_before_online_recheck(
                 "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
             ],
         )
-        assert rc == 2
-        assert create_called is False
+        assert rc == 0
+        assert create_called is True
         assert any(
-            line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines
+            line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines
         ), lines
     finally:
         evidence_path.unlink(missing_ok=True)
@@ -357,9 +357,9 @@ def test_invalid_or_mismatched_fresh_limit_blocks_pr_creation(
                 "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
             ],
         )
-        assert rc == 2
-        assert create_called is False
-        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_DRIFT}" for line in lines), lines
+        assert rc == 0
+        assert create_called is True
+        assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_DRIFT}" for line in lines), lines
     finally:
         evidence_path.unlink(missing_ok=True)
 
@@ -393,9 +393,9 @@ def test_drift_detected_blocks(monkeypatch: pytest.MonkeyPatch):
                 "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
             ],
         )
-        assert rc == 2
-        assert create_called is False
-        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_DRIFT}" for line in lines), lines
+        assert rc == 0
+        assert create_called is True
+        assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_DRIFT}" for line in lines), lines
     finally:
         evidence_path.unlink(missing_ok=True)
 
@@ -442,10 +442,10 @@ def test_decision_inputs_provenance_chain_blocks_on_stored_expected_mismatch(
                 "--overlap-preflight-expected-decision-inputs-sha256", d2,
             ],
         )
-        assert rc == 2
-        assert create_called is False
+        assert rc == 0
+        assert create_called is True
         assert any(
-            line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines
+            line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines
         ), lines
     finally:
         evidence_path.unlink(missing_ok=True)
@@ -474,9 +474,9 @@ def test_evidence_file_missing_blocks(monkeypatch: pytest.MonkeyPatch):
             "--overlap-preflight-expected-decision-inputs-sha256", "sha256:" + "b" * 64,
         ],
     )
-    assert rc == 2
-    assert create_called is False
-    assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING}" for line in lines), lines
+    assert rc == 0
+    assert create_called is True
+    assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING}" for line in lines), lines
 
 
 # ---------------------------------------------------------------------------
@@ -502,9 +502,9 @@ def test_phase_implementation_forced_blocks_without_overlap_preflight_args(
 
     # No --overlap-preflight-* args at all: caller omission must NOT bypass the gate.
     rc, lines, create_called = _run_main(monkeypatch, 1458, [])
-    assert rc == 2
-    assert create_called is False
-    assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING}" for line in lines), lines
+    assert rc == 0
+    assert create_called is True
+    assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING}" for line in lines), lines
     assert any(line == "OVERLAP_PREFLIGHT_FORCED_BY_LABEL=true" for line in lines), lines
 
 
@@ -546,9 +546,9 @@ def test_labels_fetch_failure_fails_closed_blocks_pr_creation(monkeypatch: pytes
     monkeypatch.setattr(open_pr.subprocess, "run", fail_if_called)
 
     rc, lines, create_called = _run_main(monkeypatch, 1458, [])
-    assert rc == 2
-    assert create_called is False
-    assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING}" for line in lines), lines
+    assert rc == 0
+    assert create_called is True
+    assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING}" for line in lines), lines
     assert any(line == "OVERLAP_PREFLIGHT_FORCED_BY_LABEL=true" for line in lines), lines
     assert any(
         line.startswith("OVERLAP_PREFLIGHT_LABELS_FETCH_ERROR=") for line in lines
@@ -579,9 +579,9 @@ def test_toctou_label_added_after_initial_fetch_still_forces_gate(
     monkeypatch.setattr(open_pr.subprocess, "run", fail_if_called)
 
     rc, lines, create_called = _run_main(monkeypatch, 1458, [])
-    assert rc == 2
-    assert create_called is False
-    assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING}" for line in lines), lines
+    assert rc == 0
+    assert create_called is True
+    assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING}" for line in lines), lines
     assert any(line == "OVERLAP_PREFLIGHT_FORCED_BY_LABEL=true" for line in lines), lines
 
 
@@ -617,9 +617,9 @@ def test_unsafe_route_blocks_even_with_hash_match(monkeypatch: pytest.MonkeyPatc
                 "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
             ],
         )
-        assert rc == 2
-        assert create_called is False
-        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE}" for line in lines), lines
+        assert rc == 0
+        assert create_called is True
+        assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE}" for line in lines), lines
     finally:
         evidence_path.unlink(missing_ok=True)
 
@@ -664,9 +664,9 @@ def test_source_incomplete_not_saturated_blocks_as_unsafe_route(monkeypatch: pyt
                 "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
             ],
         )
-        assert rc == 2
-        assert create_called is False
-        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE}" for line in lines), lines
+        assert rc == 0
+        assert create_called is True
+        assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE}" for line in lines), lines
     finally:
         evidence_path.unlink(missing_ok=True)
 
@@ -711,10 +711,10 @@ def test_source_complete_and_saturated_both_true_is_self_contradictory_and_block
                 "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
             ],
         )
-        assert rc == 2
-        assert create_called is False
+        assert rc == 0
+        assert create_called is True
         assert any(
-            line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines
+            line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines
         ), lines
         assert called["count"] == 0
     finally:
@@ -751,10 +751,10 @@ def test_evidence_invalid_non_json_blocks(monkeypatch: pytest.MonkeyPatch):
                 "--overlap-preflight-expected-decision-inputs-sha256", "sha256:" + "b" * 64,
             ],
         )
-        assert rc == 2
-        assert create_called is False
-        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
-        assert not any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING}" for line in lines)
+        assert rc == 0
+        assert create_called is True
+        assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
+        assert not any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING}" for line in lines)
     finally:
         evidence_path.unlink(missing_ok=True)
 
@@ -782,9 +782,9 @@ def test_evidence_invalid_hash_mismatch_blocks(monkeypatch: pytest.MonkeyPatch):
                 "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
             ],
         )
-        assert rc == 2
-        assert create_called is False
-        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
+        assert rc == 0
+        assert create_called is True
+        assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
     finally:
         evidence_path.unlink(missing_ok=True)
 
@@ -812,9 +812,9 @@ def test_evidence_invalid_schema_mismatch_blocks(monkeypatch: pytest.MonkeyPatch
                 "--overlap-preflight-expected-decision-inputs-sha256", "sha256:" + "b" * 64,
             ],
         )
-        assert rc == 2
-        assert create_called is False
-        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
+        assert rc == 0
+        assert create_called is True
+        assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
     finally:
         evidence_path.unlink(missing_ok=True)
 
@@ -849,9 +849,9 @@ def test_current_issue_number_mismatch_blocks(monkeypatch: pytest.MonkeyPatch):
                 "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
             ],
         )
-        assert rc == 2
-        assert create_called is False
-        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE}" for line in lines), lines
+        assert rc == 0
+        assert create_called is True
+        assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE}" for line in lines), lines
     finally:
         evidence_path.unlink(missing_ok=True)
 
@@ -883,9 +883,9 @@ def test_subprocess_timeout_blocks(monkeypatch: pytest.MonkeyPatch):
                 "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
             ],
         )
-        assert rc == 2
-        assert create_called is False
-        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_SOURCE_FAILURE}" for line in lines), lines
+        assert rc == 0
+        assert create_called is True
+        assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_SOURCE_FAILURE}" for line in lines), lines
     finally:
         evidence_path.unlink(missing_ok=True)
 
@@ -912,9 +912,9 @@ def test_subprocess_non_json_output_blocks(monkeypatch: pytest.MonkeyPatch):
                 "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
             ],
         )
-        assert rc == 2
-        assert create_called is False
-        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_SOURCE_FAILURE}" for line in lines), lines
+        assert rc == 0
+        assert create_called is True
+        assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_SOURCE_FAILURE}" for line in lines), lines
     finally:
         evidence_path.unlink(missing_ok=True)
 
@@ -947,9 +947,9 @@ def test_subprocess_nonzero_exit_auth_failure_blocks(monkeypatch: pytest.MonkeyP
                 "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
             ],
         )
-        assert rc == 2
-        assert create_called is False
-        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_SOURCE_FAILURE}" for line in lines), lines
+        assert rc == 0
+        assert create_called is True
+        assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_SOURCE_FAILURE}" for line in lines), lines
     finally:
         evidence_path.unlink(missing_ok=True)
 
@@ -1523,9 +1523,9 @@ def test_stored_repository_missing_blocks_before_online_recheck(monkeypatch: pyt
                 "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
             ],
         )
-        assert rc == 2
-        assert create_called is False
-        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
+        assert rc == 0
+        assert create_called is True
+        assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
     finally:
         evidence_path.unlink(missing_ok=True)
 
@@ -1560,9 +1560,9 @@ def test_stored_repository_invalid_type_blocks_before_online_recheck(monkeypatch
                 "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
             ],
         )
-        assert rc == 2
-        assert create_called is False
-        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
+        assert rc == 0
+        assert create_called is True
+        assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
     finally:
         evidence_path.unlink(missing_ok=True)
 
@@ -1595,9 +1595,9 @@ def test_stored_repository_mismatch_blocks_before_online_recheck(monkeypatch: py
                 "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
             ],
         )
-        assert rc == 2
-        assert create_called is False
-        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
+        assert rc == 0
+        assert create_called is True
+        assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
     finally:
         evidence_path.unlink(missing_ok=True)
 
@@ -1628,9 +1628,9 @@ def test_fresh_repository_missing_blocks_before_pr_creation(monkeypatch: pytest.
                 "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
             ],
         )
-        assert rc == 2
-        assert create_called is False
-        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_DRIFT}" for line in lines), lines
+        assert rc == 0
+        assert create_called is True
+        assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_DRIFT}" for line in lines), lines
     finally:
         evidence_path.unlink(missing_ok=True)
 
@@ -1661,9 +1661,9 @@ def test_fresh_repository_mismatch_blocks_before_pr_creation(monkeypatch: pytest
                 "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
             ],
         )
-        assert rc == 2
-        assert create_called is False
-        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_DRIFT}" for line in lines), lines
+        assert rc == 0
+        assert create_called is True
+        assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_DRIFT}" for line in lines), lines
     finally:
         evidence_path.unlink(missing_ok=True)
 
@@ -1805,10 +1805,10 @@ def test_repository_binding_precedes_generic_decision_hash_drift(monkeypatch: py
                 "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
             ],
         )
-        assert rc == 2
-        assert create_called is False
-        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_DRIFT}" for line in lines), lines
-        detail_line = next(line for line in lines if line.startswith("ERROR_DETAIL="))
+        assert rc == 0
+        assert create_called is True
+        assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_DRIFT}" for line in lines), lines
+        detail_line = next(line for line in lines if line.startswith("WARNING_DETAIL="))
         assert "repository" in detail_line
         assert "decision_inputs_sha256 drift" not in detail_line
     finally:
@@ -1845,9 +1845,9 @@ def test_cross_repo_same_issue_number_is_rejected(monkeypatch: pytest.MonkeyPatc
                 "--overlap-preflight-expected-decision-inputs-sha256", stored["decision_inputs_sha256"],
             ],
         )
-        assert rc == 2
-        assert create_called is False
-        assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
+        assert rc == 0
+        assert create_called is True
+        assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID}" for line in lines), lines
     finally:
         evidence_path.unlink(missing_ok=True)
 
@@ -1934,10 +1934,11 @@ def test_resolve_canonical_repository_catches_file_not_found_error(monkeypatch: 
     assert open_pr.resolve_canonical_repository("squne121/loop-protocol") is None
 
 
-def test_main_exits_2_with_source_failure_when_gh_missing(monkeypatch: pytest.MonkeyPatch):
+def test_main_warns_with_source_failure_when_gh_missing(monkeypatch: pytest.MonkeyPatch):
     """GIVEN `gh` is not installed WHEN the overlap gate is active THEN main()
-    exits 2 with E_OVERLAP_PREFLIGHT_SOURCE_FAILURE instead of raising
-    (Medium 2, end-to-end)."""
+    records E_OVERLAP_PREFLIGHT_SOURCE_FAILURE as a WARNING (not a blocking
+    ERROR) and still completes PR creation (#1851: overlap preflight is
+    optional telemetry, not a hard gate; Medium 2, end-to-end)."""
     _common_monkeypatches(monkeypatch, linked_issue=1458)
 
     def raise_file_not_found(*args, **kwargs):
@@ -1956,9 +1957,9 @@ def test_main_exits_2_with_source_failure_when_gh_missing(monkeypatch: pytest.Mo
             "--overlap-preflight-expected-decision-inputs-sha256", "sha256:" + "a" * 64,
         ],
     )
-    assert rc == 2, lines
-    assert create_called is False
-    assert any(line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_SOURCE_FAILURE}" for line in lines), lines
+    assert rc == 0, lines
+    assert create_called is True
+    assert any(line == f"WARNING={open_pr.E_OVERLAP_PREFLIGHT_SOURCE_FAILURE}" for line in lines), lines
 
 
 
