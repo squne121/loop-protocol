@@ -376,6 +376,25 @@ class TestBucket:
         assert out["status"] == "all_pass"
         assert out["failed_checks"] == []
 
+    def test_zero_required_checks_yields_no_required_evidence_not_all_pass(self):
+        """Issue #1856 AC11: required checks が 0 件のとき all_pass ではなく
+        no_required_evidence を返す（V1 fail-open の解消）。"""
+        mock_fn = make_mock_run_gh(head_sha=HEAD_SHA, checks=[], run_data=None)
+        with patch("ci_verdict_summary.run_gh", side_effect=mock_fn):
+            with patch("sys.argv", ["ci_verdict_summary.py",
+                                    "--pr", "1",
+                                    "--repo", "owner/repo",
+                                    "--expected-head-sha", HEAD_SHA]):
+                import io
+                from contextlib import redirect_stdout
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    exit_code = main()
+        assert exit_code == EXIT_NO_REQUIRED_EVIDENCE
+        out = json.loads(buf.getvalue())
+        assert out["status"] == "no_required_evidence"
+        assert out["status"] != "all_pass"
+
 
 # ---------------------------------------------------------------------------
 # AC: conclusion mapping

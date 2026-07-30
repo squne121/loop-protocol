@@ -740,7 +740,11 @@ def test_b5_fixture_matrix_approved():
 
 
 def test_b5_fixture_matrix_update_branch():
-    """B5: APPROVE + merge_ready=false + [update_branch] + BEHIND must route to route_to_update_branch."""
+    """B5: APPROVE + merge_ready=false + [update_branch] + BEHIND must route to route_to_update_branch.
+
+    Issue #1856 (AC1): route_loop_verdict_v2 no longer accepts test_verdict;
+    BEHIND is derived solely from merge_state_status.
+    """
     actions = [
         {
             "kind": "update_branch",
@@ -752,7 +756,7 @@ def test_b5_fixture_matrix_update_branch():
         }
     ]
     lv = _make_loop_verdict("APPROVE", False, actions, "BEHIND")
-    result = route_loop_verdict_v2(lv, test_verdict={"branch_behind_main": True})
+    result = route_loop_verdict_v2(lv)
     assert result.route == "route_to_update_branch", (
         f"Expected 'route_to_update_branch', got '{result.route}'. errors: {result.errors}"
     )

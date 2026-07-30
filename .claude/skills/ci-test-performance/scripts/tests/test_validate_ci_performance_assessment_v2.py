@@ -347,8 +347,8 @@ V1_DECISION_MATRIX_GOLDEN_LINES = [
     "    ci_runtime_baseline_v1_available: true | false",
     "  reviewer_gate:",
     "    approve_allowed: true | false",
-    "      - TEST_VERDICT_MACHINE            # test-runner による TEST_VERDICT_MACHINE/v1",
-    "      - CI_CHECK_RUN_SCOPED             # GitHub CI check の成功",
+    "      - CI_CHECK_RUN_SCOPED             # GitHub CI check の成功（authoritative、Issue #1856）",
+    "    approve_denied_reason: null | \"<理由>\"",
 ]
 
 V1_RUNTIME_DELTA_TEMPLATE_GOLDEN_LINES = [
@@ -361,7 +361,10 @@ V1_RUNTIME_DELTA_TEMPLATE_GOLDEN_LINES = [
 # CI_TEST_PERFORMANCE_DECISION_V1 / ci_runtime_delta_v1 fenced blocks --
 # enum value, required key, or line order -- changes this hash.
 V1_DECISION_MATRIX_FENCE_SHA256 = (
-    "f69c51ec3498b6a1561d795f756f1b31370626c5b8545b7608d93097684e7156"
+    # Issue #1856 (AC6): TEST_VERDICT_MACHINE removed from reviewer_gate.required_evidence;
+    # CI_CHECK_RUN_SCOPED is now the sole authoritative required_evidence entry
+    # (TEST_VERDICT_MACHINE remains as an advisory/non-authoritative comment only).
+    "2894fafe94122f37f08055d33bfb8984b50fe4d8f01ebbf17ed8f727cfd73897"
 )
 V1_RUNTIME_DELTA_TEMPLATE_FENCE_SHA256 = (
     "1d77239dc13cd1aed62962038c7a38b52374b25d85f907d9d13c6bc5f79d639d"
