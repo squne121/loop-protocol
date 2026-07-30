@@ -95,11 +95,10 @@ def test_ac2_contract_review_result_go_required():
 
 
 def test_ac2_subreason_priority_order_defined():
-    """AC2: The 4 subreasons are defined with explicit priority ordering."""
+    """AC2: The 4 subreasons are defined with explicit priority ordering (#1851: missing_contract_go removed)."""
     body = _read(PREPARATION_MD)
     subreasons = [
         "metadata_not_ready",
-        "missing_contract_go",
         "stale_contract_review",
         "body_snapshot_mismatch",
         "request_changes_after_go",
@@ -111,12 +110,12 @@ def test_ac2_subreason_priority_order_defined():
 
 
 def test_ac2_priority_ordering_metadata_not_ready_first():
-    """AC2: metadata_not_ready must appear before missing_contract_go in document."""
+    """AC2: metadata_not_ready must appear before stale_contract_review in document."""
     body = _read(PREPARATION_MD)
     idx_meta = body.find("metadata_not_ready")
-    idx_missing = body.find("missing_contract_go")
-    assert idx_meta < idx_missing, (
-        "metadata_not_ready must be defined before missing_contract_go (higher priority)"
+    idx_stale = body.find("stale_contract_review")
+    assert idx_meta < idx_stale, (
+        "metadata_not_ready must be defined before stale_contract_review (higher priority)"
     )
 
 
@@ -247,13 +246,12 @@ def test_ac5_request_changes_after_go_subreason():
 # ---------------------------------------------------------------------------
 
 
-def test_ac6_missing_contract_go_does_not_auto_run_issue_contract_review():
-    """AC6 regression (#561): missing status:go must not trigger auto issue-contract-review."""
+def test_ac6_missing_contract_go_removed():
+    """#1851: missing_contract_go stop logic must be fully removed from preparation.md."""
     body = _read(PREPARATION_MD)
-    # The preparation.md must explicitly state the fail-only gate design decision
-    assert "fail-only gate" in body or "自動実行しない" in body or "廃止" in body, (
-        "preparation.md must document that missing status:go triggers fail-only gate, "
-        "not automatic issue-contract-review execution (#561 regression)"
+    assert "missing_contract_go" not in body, (
+        "preparation.md must not reference missing_contract_go (#1851 removes the legacy "
+        "contract-go hard gate; contract_snapshot_url is optional telemetry)"
     )
 
 

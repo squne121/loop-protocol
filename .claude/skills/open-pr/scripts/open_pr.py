@@ -39,12 +39,24 @@ E_GH_FAILURE = "E_GH_FAILURE"
 E_SCHEMA_CONSUMER_INVENTORY_MISSING = "E_SCHEMA_CONSUMER_INVENTORY_MISSING"
 E_PR_BODY_JAPANESE_VALIDATION_FAILED = "E_PR_BODY_JAPANESE_VALIDATION_FAILED"
 
+# fail-closed exit code for non-overlap-gate hard failures (publish approval
+# missing, pr body file missing, gh/repo/branch resolution failure, validator
+# failure, gh pr create failure, etc). #1851 removes the overlap-preflight
+# hard gate specifically; these unrelated failures stay blocking.
+EXIT_BLOCKED = 2
+
 # --- Overlap preflight hard gate (Issue #1458) ---
 E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING = "E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING"
 E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID = "E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID"
 E_OVERLAP_PREFLIGHT_DRIFT = "E_OVERLAP_PREFLIGHT_DRIFT"
 E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE = "E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE"
 E_OVERLAP_PREFLIGHT_SOURCE_FAILURE = "E_OVERLAP_PREFLIGHT_SOURCE_FAILURE"
+# #1851 AC7 / Issue #1470: repository-binding failures (stored evidence
+# `repository` missing/invalid/mismatch, or fresh online re-run `repository`
+# missing/mismatch) are a distinct safety boundary from the rest of the
+# overlap preflight evidence (which is advisory-only per #1851). This code
+# is fail-closed in `main()` regardless of the general advisory policy.
+E_OVERLAP_PREFLIGHT_REPOSITORY_BINDING_INVALID = "E_OVERLAP_PREFLIGHT_REPOSITORY_BINDING_INVALID"
 
 # `check_implementation_overlap.py`（implement-issue 専用の overlap preflight
 # adapter）の evidence schema。本ファイルは producer を変更せず subprocess として
@@ -157,6 +169,21 @@ def emit_error(code: str, detail: str = "") -> None:
     emit_kv("ERROR", code)
     if detail:
         emit_kv("ERROR_DETAIL", detail)
+
+
+def emit_warning(code: str, detail: str = "") -> None:
+    """#1851: overlap preflight (contract_snapshot_url / status:go / overlap
+    artifact) is optional telemetry. Failures are recorded as WARNING kv
+    (stdout/PR body evidence) but never block PR publication.
+
+    #1851 fix_delta (Major 1): the same WARNING/WARNING_DETAIL pair is also
+    emitted to stderr so overlap-evidence warnings are visible in CI logs
+    even when stdout is captured/truncated elsewhere."""
+    emit_kv("WARNING", code)
+    print(f"WARNING={code}", file=sys.stderr)
+    if detail:
+        emit_kv("WARNING_DETAIL", detail)
+        print(f"WARNING_DETAIL={detail}", file=sys.stderr)
 
 
 def run_gh(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -642,7 +669,7 @@ def _load_overlap_preflight_evidence(
     # を持っていても）はここで一律拒否する。
     repository = stored.get("repository")
     if not isinstance(repository, str) or not repository:
-        return None, E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID
+        return None, E_OVERLAP_PREFLIGHT_REPOSITORY_BINDING_INVALID
     return stored, None
 
 
@@ -1246,7 +1273,7 @@ def run_overlap_preflight_gate(
     ):
         return (
             False,
-            E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID,
+            E_OVERLAP_PREFLIGHT_REPOSITORY_BINDING_INVALID,
             f"stored repository が canonical target と一致しません: "
             f"stored={stored_repository!r} target={target_repo!r}",
             None,
@@ -1355,7 +1382,7 @@ def run_overlap_preflight_gate(
     if fresh_repository != target_repo:
         return (
             False,
-            E_OVERLAP_PREFLIGHT_DRIFT,
+            E_OVERLAP_PREFLIGHT_REPOSITORY_BINDING_INVALID,
             f"fresh repository が canonical target と一致しません: "
             f"fresh={fresh_repository!r} target={target_repo!r}",
             fresh,
@@ -1539,27 +1566,84 @@ def create_pr(repo: str, title: str, body_file: Path, branch: str, draft: bool) 
     return result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
 
 
+# #1851 Major 1: overlap preflight evidence (advisory) warnings must be
+# persisted as a PR comment (not just ephemeral stdout/stderr) so a human
+# reviewer sees them after `gh pr create` succeeds. This marker identifies
+# the comment for idempotency / future tooling; it is intentionally fixed.
+OVERLAP_PREFLIGHT_WARNING_COMMENT_MARKER = "<!-- loop-protocol:overlap-preflight-warnings-v1 -->"
+
+
+def post_overlap_warning_comment(
+    repo: str, pr_number: str, warnings: list[tuple[str, str]]
+) -> bool:
+    """`warnings`（overlap preflight evidence 由来の (code, detail) 一覧）を
+    固定 marker 付きの PR コメントとして永続化する。
+
+    コメント投稿自体の失敗は PR publication を巻き戻さない（呼び出し元は
+    戻り値 False を warning として記録するのみでよい）。"""
+    if not warnings:
+        return True
+    lines = [
+        OVERLAP_PREFLIGHT_WARNING_COMMENT_MARKER,
+        "",
+        "## Overlap Preflight Warnings（advisory, #1851）",
+        "",
+        "overlap preflight evidence の検証で以下の warning が検出されましたが、"
+        "advisory telemetry のため PR 作成はブロックされていません。",
+        "",
+    ]
+    for code, detail in warnings:
+        if detail:
+            lines.append(f"- `{code}`: {detail}")
+        else:
+            lines.append(f"- `{code}`")
+    body = "\n".join(lines) + "\n"
+
+    comment_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".md", encoding="utf-8", delete=False
+    )
+    try:
+        comment_file.write(body)
+        comment_file.flush()
+        comment_file.close()
+        try:
+            run_gh(
+                "pr",
+                "comment",
+                pr_number,
+                "--repo",
+                repo,
+                "--body-file",
+                comment_file.name,
+            )
+            return True
+        except (subprocess.SubprocessError, OSError):
+            return False
+    finally:
+        Path(comment_file.name).unlink(missing_ok=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     if args.publish.strip().lower() != "yes":
         emit_error(E_APPROVAL_MISSING, "publish: yes が指定されていません")
-        return 2
+        return EXIT_BLOCKED
 
     if not args.pr_body_file.exists():
         emit_error(E_PR_BODY_VALIDATION_FAILED, f"pr-body-file が存在しません: {args.pr_body_file}")
-        return 2
+        return EXIT_BLOCKED
 
     original_body = args.pr_body_file.read_text(encoding="utf-8")
 
     repo = args.repo or resolve_repo()
     if not repo:
         emit_error(E_GH_FAILURE, "git remote から owner/repo を取得できませんでした")
-        return 2
+        return EXIT_BLOCKED
     branch = args.branch or resolve_branch()
     if not branch:
         emit_error(E_GH_FAILURE, "現在のブランチ名を取得できませんでした")
-        return 2
+        return EXIT_BLOCKED
 
     state = get_linked_issue_state(repo, args.linked_issue)
     if state is None:
@@ -1567,7 +1651,7 @@ def main(argv: list[str] | None = None) -> int:
             E_LINKED_ISSUE_STATE_UNKNOWN,
             f"linked issue #{args.linked_issue} の state を取得できませんでした",
         )
-        return 2
+        return EXIT_BLOCKED
 
     link_kind = "Closes" if state == "OPEN" else "Refs"
     final_body = apply_linked_issue_reference(original_body, args.linked_issue, link_kind)
@@ -1583,7 +1667,7 @@ def main(argv: list[str] | None = None) -> int:
             emit_kv("VALIDATOR_RULE_IDS", rule_ids)
         error_code = _classify_validator_errors(errors)
         emit_error(error_code, str(detail))
-        return 2
+        return EXIT_BLOCKED
 
     japanese_result = _run_japanese_content_validator(final_body)
     if japanese_result.get("status") != "pass":
@@ -1598,7 +1682,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         emit_kv("PR_BODY_PREFLIGHT_RESULT_V1", json.dumps(preflight, ensure_ascii=False))
         emit_error(E_PR_BODY_JAPANESE_VALIDATION_FAILED, japanese_result.get("stderr", ""))
-        return 2
+        return EXIT_BLOCKED
 
     existing = find_existing_pr(repo, branch)
     if existing:
@@ -1645,22 +1729,38 @@ def main(argv: list[str] | None = None) -> int:
         else:
             forced_by_label = FORCE_OVERLAP_PREFLIGHT_LABEL in (fresh_labels or [])
         overlap_gate_active = bool(args.overlap_preflight_required) or forced_by_label
-        pr_create_repo = repo
+
+        # Issue #1470 (AC1) / #1851 Blocker 2: PR mutation target を GitHub
+        # Repository API の canonical full_name (小文字化形) として一度だけ
+        # 解決し、fresh preflight のオンライン再実行と gh pr create --repo
+        # の両方に同じ値を使う。この解決自体は overlap_gate_active の値に
+        # 関わらず常に行い、失敗した場合は fallback せず fail-closed で
+        # 停止する（overlap preflight evidence 自体の advisory 化 (#1851) と
+        # は独立の安全境界）。
+        target_repo = resolve_canonical_repository(repo)
+        if target_repo is None:
+            emit_error(
+                E_OVERLAP_PREFLIGHT_SOURCE_FAILURE,
+                f"canonical repository を解決できませんでした: {repo}",
+            )
+            return EXIT_BLOCKED
+
+        overlap_evidence_warnings: list[tuple[str, str]] = []
+
+        def _record_overlap_evidence_warning(code: str, detail: str = "") -> None:
+            # #1851 Major 1: overlap preflight *evidence* validation failures
+            # (stored/fresh sha256, decision hash, collection contract shape,
+            # etc.) remain advisory -- warn and continue to gh pr create.
+            # Repository-binding failures never reach this helper (they are
+            # fail-closed above / below).
+            emit_warning(code, detail)
+            overlap_evidence_warnings.append((code, detail))
+
+        pr_create_repo = target_repo
         if overlap_gate_active:
-            # Issue #1470 (AC1): PR mutation target を GitHub Repository API の
-            # canonical full_name (小文字化形) として一度だけ解決し、fresh
-            # preflight のオンライン再実行と gh pr create --repo の両方に同じ
-            # 値を使う。解決に失敗した場合は fallback せず停止する。
-            target_repo = resolve_canonical_repository(repo)
             emit_kv("OVERLAP_PREFLIGHT_FORCED_BY_LABEL", str(forced_by_label).lower())
             if labels_fetch_error is not None:
                 emit_kv("OVERLAP_PREFLIGHT_LABELS_FETCH_ERROR", labels_fetch_error)
-            if target_repo is None:
-                emit_error(
-                    E_OVERLAP_PREFLIGHT_SOURCE_FAILURE,
-                    f"canonical repository を解決できませんでした: {repo}",
-                )
-                return 2
 
             # Issue #1470 (Medium 1): canonical repo が raw repo と異なる場合
             # （mixed-case / rename alias）、labels と既存 PR を canonical
@@ -1697,8 +1797,19 @@ def main(argv: list[str] | None = None) -> int:
                 expected_decision_inputs_sha256=args.overlap_preflight_expected_decision_inputs_sha256,
             )
             if not gate_ok:
-                emit_error(gate_error_code or E_OVERLAP_PREFLIGHT_SOURCE_FAILURE, gate_detail)
-                return 2
+                effective_code = gate_error_code or E_OVERLAP_PREFLIGHT_SOURCE_FAILURE
+                if effective_code == E_OVERLAP_PREFLIGHT_REPOSITORY_BINDING_INVALID:
+                    # #1851 AC7 / Issue #1470: repository-binding mismatches
+                    # (stored/fresh evidence bound to a different repository
+                    # than the canonical PR mutation target) remain
+                    # fail-closed -- never call gh pr create.
+                    emit_error(effective_code, gate_detail)
+                    return EXIT_BLOCKED
+                # #1851 Major 1: all other overlap preflight evidence
+                # validation failures (schema/hash/drift/collection-contract)
+                # are optional telemetry — record as warning and continue to
+                # gh pr create (does not block PR publication).
+                _record_overlap_evidence_warning(effective_code, gate_detail)
             pr_create_repo = target_repo
 
         try:
@@ -1707,11 +1818,11 @@ def main(argv: list[str] | None = None) -> int:
             emit_error(E_GH_FAILURE, f"gh pr create 失敗: exit {exc.returncode}")
             if exc.stderr:
                 emit_kv("COMMAND_STDERR", exc.stderr.strip()[:500])
-            return 2
+            return EXIT_BLOCKED
 
         if not pr_url:
             emit_error(E_GH_FAILURE, "gh pr create が URL を返しませんでした")
-            return 2
+            return EXIT_BLOCKED
 
         match = re.search(r"/pull/(\d+)", pr_url)
         pr_number = match.group(1) if match else ""
@@ -1722,6 +1833,17 @@ def main(argv: list[str] | None = None) -> int:
         emit_kv("LINK_KIND", link_kind)
         emit_kv("EXISTING", "false")
         emit_kv("DRY_RUN", "false")
+
+        # #1851 Major 1: persist any advisory overlap preflight evidence
+        # warnings as a PR comment so they are not lost once the process
+        # exits. A comment-posting failure does not roll back PR
+        # publication -- it is recorded as an additional warning only.
+        if overlap_evidence_warnings and pr_number:
+            comment_posted = post_overlap_warning_comment(
+                pr_create_repo, pr_number, overlap_evidence_warnings
+            )
+            emit_kv("OVERLAP_PREFLIGHT_WARNING_COMMENT_POSTED", str(comment_posted).lower())
+
         return 0
     finally:
         Path(final_body_file.name).unlink(missing_ok=True)

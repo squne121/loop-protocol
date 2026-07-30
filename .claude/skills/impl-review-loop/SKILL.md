@@ -161,7 +161,7 @@ preparation step で取得した contract snapshot 内の以下の情報を Step
 - `max_iterations` 超過時は必ず fail-close（無限ループ防止）
 - adversarial review は採用しないため `LOOP_VERDICT` 判定は pr-review-judge の APPROVE 一本で完結
 - 全 SubAgent 出力は構造化フォーマット（YAML / KEY=VALUE）で受け取り、散文サマリで上書きしない
-- **missing_contract_go routing**: `status: go` が存在しない場合は `ensure_contract_snapshot.py` を呼び出して自動 materialize を試みる（#817）。`ensure_contract_snapshot` が `status: human_judgment` / `blocked_needs_refinement` / `stale_or_conflicting_snapshot` を返した場合のみ停止する。旧設計（無条件 fail-only gate、#564）は #817 で置き換え。
+- **contract snapshot advisory routing**（#1851）: `contract_snapshot.normalized_status` が `go` / `missing_go` / `stale` / `runtime_error` のいずれかであれば、本節冒頭の advisory artifact policy に従い `next_action.route` は無条件で `proceed_to_step_1` を返し、live Issue の Allowed Paths と実テスト・CI・PR review に基づいて routing を継続する。`missing_go` / `stale` を検出した場合は参考情報として `ensure_contract_snapshot.py` による再 materialize を試みてよいが、その成否や `status: human_judgment` / `blocked_needs_refinement` / `stale_or_conflicting_snapshot` は routing の停止条件にしない。`latest_blocked`（trusted author による明示 blocked/request_changes）のみ人間判断（`run_contract_blocker_triage`）へ route する human veto 境界として維持する。
 
 ## Related（関連ファイル）
 

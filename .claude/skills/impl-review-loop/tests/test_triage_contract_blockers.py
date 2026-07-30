@@ -188,7 +188,7 @@ def test_top_level_list_returns_machine_json():
 
 
 def test_preparation_summary():
+    """#1851: the missing_contract_go-gated triage normalizer subsection was removed from
+    preparation.md (contract_snapshot_url is optional telemetry, not a blocking gate)."""
     body = PREPARATION_MD.read_text(encoding="utf-8")
-    assert "python3 .claude/skills/impl-review-loop/scripts/triage_contract_blockers.py" in body
-    assert "source_integrity.evidence_complete == true" in body
-    assert "raw stdout / stderr を埋め込まない" in body
+    assert "missing_contract_go" not in body

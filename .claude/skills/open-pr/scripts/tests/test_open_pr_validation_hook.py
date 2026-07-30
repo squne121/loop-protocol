@@ -864,6 +864,13 @@ def test_ac8_japanese_pass_allows_gh_pr_create(monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(open_pr, "resolve_branch", lambda: "worktree-issue-842-test")
         monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: "OPEN")
         monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda provided: ["src/example.ts"])
+        # #1851 fix_delta: main() は overlap_gate_active の値に関わらず
+        # resolve_canonical_repository() を常に呼ぶよう変更された（Issue
+        # #1470 の canonical repository binding を fail-closed で維持する
+        # ため）。このテストは gh 認証済みのローカル環境では偶然オンライン
+        # 解決が成功していたが、CI サンドボックス環境では None を返し
+        # EXIT_BLOCKED になっていた。決定論的に pass させるためモックする。
+        monkeypatch.setattr(open_pr, "resolve_canonical_repository", lambda repo: repo)
         monkeypatch.setattr(
             open_pr,
             "_run_pr_body_validator",
