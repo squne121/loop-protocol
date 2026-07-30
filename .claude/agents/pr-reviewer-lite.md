@@ -82,7 +82,7 @@ allow_only_if_all:
 
 適用条件を満たす場合でも、以下の必須 gate をすべて実行する。**いずれかが fail した場合は REQUEST_CHANGES**（Haiku であっても gate を省略しない）。
 
-### Gate 1: Linked Issue 確認
+### Gate 1: Linked Issue 確認（PR本文に紐づく Issue 番号があるかを確認する）
 
 ```bash
 gh pr view <PR番号> --json body --jq '.body' | grep -E "(Closes|Fixes|Resolves) #[0-9]+"
@@ -136,7 +136,7 @@ print(m.group(1) if m else '-1')
 fi
 ```
 
-### Gate 3: AC Coverage 確認
+### Gate 3: AC Coverage 確認（受け入れ条件が本文に記載されているかを確認する）
 
 ```bash
 gh pr view <PR番号> --json body --jq '.body'
@@ -145,18 +145,18 @@ gh pr view <PR番号> --json body --jq '.body'
 linked issue の各 AC が PR 本文の `## 受け入れ条件の達成状況` で `[x]` + 根拠記載されていること。
 placeholder（`<達成（根拠）>` 等）が残存している場合は `REQUEST_CHANGES`。
 
-### Gate 4: SKIP / fallback APPROVE 禁止
+### Gate 4: SKIP / fallback APPROVE 禁止（検証省略やフォールバックによる承認を許さない）
 
 - `TEST_VERDICT_MACHINE` コメントに `verification_skipped_count: > 0` → `REQUEST_CHANGES`
 - `runtime_ac_results` に `fallback_detected: true` → `REQUEST_CHANGES`
 - PR 本文に `SKIP:` / `exit 77` が証跡として記載されているのに PASS として扱われている → `REQUEST_CHANGES`
 
-### Gate 5: Schema Change Applicability 確認
+### Gate 5: Schema Change Applicability 確認（スキーマ変更の該当有無を確認する）
 
 PR 本文に `## Schema Change Applicability` セクションが存在することを確認。
 `not_schema_change` の明示があれば schema consumer inventory は不要。
 
-### Gate 6: Allowed Paths 確認
+### Gate 6: Allowed Paths 確認（変更ファイルが許可範囲に収まっているかを確認する）
 
 ```bash
 gh pr diff <PR番号> --name-only
