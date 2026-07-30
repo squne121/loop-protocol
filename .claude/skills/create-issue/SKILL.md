@@ -7,7 +7,7 @@ description: ユーザーの要求を Terminal AI Agent が再現可能に作業
 
 ユーザーの要求を分析し、Terminal AI Agent が安全・再現可能に着手できる GitHub Issue を生成するスキル。
 
-## Procedure
+## Procedure（手順）
 
 ### 0. テンプレートを読み込む（Issue Template Guard）
 
@@ -31,7 +31,7 @@ description: ユーザーの要求を Terminal AI Agent が再現可能に作業
 - **タイトル prefix と AC の性質のセルフチェック**: `research` / `調査` を名乗る Issue に `src/` や `tests/` の実装変更が AC として入っていないか確認する。入っている場合は `implementation` / `実装` に切り替えるか、Scope を分割して別 Issue にする
 - 不確実性が残る場合は `phase/research` / `state/needs-human` ラベルの付与要否を先に決める。implementation に昇格できる場合は `docs/dev/workflow.md` の implementation issue canonical contract を正本とし、`実装:` prefix + `phase/implementation` の consumer ready contract に沿って起票する（`state/queued` は deprecated のため付与しない）
 
-#### desired destination handoff guard
+#### desired destination handoff guard（委譲先ガード）
 
 orchestrator（`issue-refinement-loop` / `post-merge-cleanup` 等）から follow-up 候補を受ける場合:
 
@@ -133,15 +133,15 @@ AC は検証可能な記述にし、実装か調査かを自分で確認する�
 - **決定論的判定**: `grep` / `rg` の exit code、`diff` の exit code、`pnpm test` の exit code、`test -f` / `test -d`、ファイルサイズ・行数の数値比較
 - **意味的評価は VC に書かない**: 「コード品質の正当性」「算出値の妥当性」等は PR レビュアーの責務
 
-#### Issue Template Guard（fail-closed）
+#### Issue Template Guard（テンプレート検証、fail-closed）
 
 本文ドラフト完成後、ステップ 0 の必須セクション一覧と照合する。不足セクションがあれば `[Issue Template Guard] Missing sections: <セクション名一覧>` を出力して Issue 生成を中断する。Stop Conditions セクションが空欄・1 項目のみの場合も不完全とみなす。
 
-#### Machine-Readable Contract Guard（fail-closed）
+#### Machine-Readable Contract Guard（契約検証、fail-closed）
 
 `## Machine-Readable Contract` がない、または issue kind ごとの required key が欠ける場合は `[Issue Template Guard] Machine-Readable Contract keys are incomplete` を出力して中断する。
 
-#### Required Skills Guard（fail-closed）
+#### Required Skills Guard（必須スキル検証、fail-closed）
 
 `## Required Skills` を書いた場合、各 bullet を以下の順で分類し、1 つでも違反があれば中断する:
 
@@ -230,7 +230,7 @@ validator が exit 0 を返した後、人間承認なしで即座に `.claude/s
 
 helper は `--title` / `--body-file` / `--label` / `--parent-issue` / `--dependency` を受け取り、labels / sub-issue / dependency の read-back を同一 transaction で実施する。
 
-**post-create ready tuple validation（implementation issue のみ）**:
+**post-create ready tuple validation（起票後の状態検証、implementation issue のみ）**:
 
 `create_issue_txn.py` 実行後、implementation issue の場合は GitHub 上の最終状態を read-back して ready tuple を検証する。pre-create の body 検証と異なり、GitHub に実際に付与された title / labels を確認する。
 
@@ -281,7 +281,7 @@ gh issue comment "$CREATED_ISSUE_NUMBER" --repo "$REPO" \
 
 `create_issue_txn.py` 実行後（および post-create ready tuple validation 通過後）、起票した Issue URL（`issue_url`）を Output として提示する。
 
-### 4a. Delivery-rollup parent の child materialization（`CHILD_MATERIALIZATION_PLAN_V2` 経由）
+### 4a. Delivery-rollup parent の child materialization（子 Issue 生成、`CHILD_MATERIALIZATION_PLAN_V2` 経由）
 
 `delivery-rollup` parent が持つ child issue を起票する場合、`plan_child_materialization.py` が生成した `CHILD_MATERIALIZATION_PLAN_V2` を入口として使う。LLM が parent body 全体を都度読む必要をなくし、トークン消費を抑えるための標準フロー。
 
@@ -331,7 +331,7 @@ uv run --locked python3 .claude/skills/create-issue/scripts/materialize_child_is
 
 設計境界の詳細は `docs/dev/agent-skill-boundaries.md` の「child materialization executor」を参照。
 
-## Output
+## Output（出力）
 
 1. **Issue タイトル**: `<type>(<scope>): <description>` 形式で 1 案を決定（ユーザーへの選択肢提示は不要）
 2. **Issue 本文案**: ステップ 3 の項目を含む完全な本文
@@ -490,7 +490,7 @@ uv run --locked python3 .claude/skills/create-issue/scripts/create_issue_txn.py 
 script 正本経由のみで復旧すること（audit trail・idempotency の保証のため）。
 `gh api` 直接 mutation も同様に禁止する。
 
-## Guardrails
+## Guardrails（安全境界）
 
 - 曖昧な要件を推測で埋めて Issue を確定させない
 - `1 Issue = 1 PR` を超える Scope の Issue を単独で作成しない。黙って広げず、分割案を提示してから人間に確認する
@@ -503,7 +503,7 @@ script 正本経由のみで復旧すること（audit trail・idempotency の�
 - **inline `gh` / `jq` / `grep` / `awk` / heredoc 使用禁止**: anchor preflight での inline bash パイプラインは使用しない
 - **スクリプトは配列形式の `git grep` のみ実行**: `eval` 禁止、入力 anchor は `^[A-Za-z0-9._/: #-]+$` で validation 済み
 
-## Related
+## Related（関連資料）
 
 - [`references/body-authoring.md`](references/body-authoring.md) — 本文編集の共通参照（schema 定義・VC 作成ガイダンス・Anchor Verification・Blocker 検出）
 - `.claude/skills/review-issue/SKILL.md` — Issue 品質レビュー

@@ -272,9 +272,9 @@ branch publish が hook / approval 境界で止まった場合、agent は manua
 - `branch_mismatch` / `stale_remote_head` / `local_head_mismatch` / `remote_fast_forward_by_same_scope` / `remote_head_scope_contamination` / `allowed_paths_gate_not_ok` / `publish_guard_context_missing` / `publish_guard_context_invalid` のいずれかなら `PUBLISH_SAFETY_STOP_REPORT_V1` を残して停止する
 - strict lane を hook に束縛する場合は `LOOP_PUBLISH_EXPECTED_REMOTE_HEAD` / `LOOP_PUBLISH_CURRENT_REMOTE_HEAD` / `LOOP_PUBLISH_DECLARED_PUBLISH_HEAD` / `LOOP_PUBLISH_VERIFIED_HEAD` / `LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS` / `LOOP_PUBLISH_REMOTE_READBACK_SOURCE` をセットする
 
-### Scope Collision Preflight（スコープ衝突の事前確認、#1860 Owner Decision で advisory 化）
+### Scope Collision Preflight（スコープ衝突の事前確認、#1860 で advisory 化）
 
-Allowed Paths overlap 単独では hard stop ではない。OPEN な他 Implementation Issue と Allowed Paths が重複する場合、Scope Collision Preflight で以下の class を判定するが、判定結果自体は着手・実装・PR publication を止めない（#1860 Owner Decision: OPEN Issue 全件収集・semantic overlap 判定・declared Allowed Paths の文字列重複は advisory diagnostic であり blocking authority を持たない）。
+Allowed Paths overlap 単独では hard stop ではない。OPEN な他 Implementation Issue と Allowed Paths が重複する場合、Scope Collision Preflight で以下の class を判定するが、判定結果自体は着手・実装・PR publication を止めない（#1860: OPEN Issue 全件収集・semantic overlap 判定・Allowed Paths の文字列重複は advisory diagnostic であり blocking authority を持たない）。
 
 - `C0: no collision`
   - Allowed Paths が重複しない。通常どおり着手可。
@@ -298,9 +298,9 @@ Allowed Paths overlap 単独では hard stop ではない。OPEN な他 Implemen
   - 例: 同じ bug の別修正、同じ checker rule の別名追加、同じ SSOT policy の競合変更。
   - `C3` は duplicate / superseded / absorb / split の候補として Issue コメントに記録するが、着手を自動停止しない（human escalation は advisory な提案であり hard stop ではない）。
 
-着手を停止するのは以下の場合のみ（#1860 Owner Decision）:
+着手を停止するのは以下の場合のみ（#1860）:
 
-- Hard gate のいずれかを満たさない（作業場所、protected paths/secret、破壊的 Git 操作禁止、typecheck/lint/test/build、CI/required checks/branch protection、独立レビュー・人間の最終マージ）
+- Hard gate 未充足（作業場所、protected paths/secret、破壊的 Git 操作禁止、typecheck/lint/test/build、CI/required checks/branch protection、独立レビュー・最終マージ）
 - current head と対象 peer commit の実際の 3-way Git conflict
 - target PR について GitHub が `mergeable == CONFLICTING` または `merge_state_status == DIRTY` と判定した場合
 

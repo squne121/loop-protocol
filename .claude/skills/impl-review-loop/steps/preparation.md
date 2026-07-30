@@ -299,7 +299,7 @@ gh issue view <issue_number> --json title,labels --jq '.title + " | " + (.labels
 
 不一致なら停止し、人間判断を仰ぐ。blocker / dependency の close 状態が primary signal であり、state labels の有無は ready 判定に影響しない。ただし `phase/implementation` は issue kind / workflow routing の前提として維持する（`docs/dev/github-ops.md` 参照）。
 
-## 2.5. scope rollup preflight（任意の advisory diagnostic、automatic dispatch なし）
+## 2.5. scope rollup preflight（任意の advisory diagnostic、自動実行なし）
 
 **#1860 Owner Decision（2026-07-30）により、本 Section は production 経路の automatic dispatch から外れた任意 advisory diagnostic である。** worktree 作成・Step 3 以降の進行は本 Section の実行有無・結果と無関係に継続する。scope rollup preflight は、同一 Allowed Paths / 同一 skill family / 同一 parent_issue / 同一 dedupe_key を持つ OPEN Issue / PR の統合候補を人間が確認したい場合に手動で呼び出せる diagnostic として残す（preflight は引き続き mutation-free）。
 
