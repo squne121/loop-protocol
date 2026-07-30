@@ -121,7 +121,7 @@ issue-contract-review は `runtime-verification: true` タグを検出した場�
 
 動作検証 AC を実行不可能な環境（外部サービス未起動・権限不足・ネットワーク遮断等）では SKIP を宣言し、実行環境不可として Stop Condition を発火させる。SKIP は「検証をパスしたこと」を意味しない。
 
-### SKIP exit code: 77
+### SKIP exit code: 77（SKIP を宣言する exit code）
 
 VC スクリプトが SKIP を宣言する場合、exit code **77** を返す。
 
@@ -411,7 +411,7 @@ Runtime Verification Applicability が `immediate` の PR の本文には以下�
 4. **Evidence**: 主張を裏付ける Verification Command の結果または linked issue の VC との対応
 5. **Follow-up**: `Not controlled` が非空の場合の後続 Issue（必須）
 
-### SAFETY_CLAIMS_V1 machine-readable schema
+### SAFETY_CLAIMS_V1 machine-readable schema（機械可読スキーマ）
 
 PR 本文の Safety Claim Matrix は以下の YAML 形式でも表現できる（`## Safety Claim Matrix` セクション内に埋め込む場合）。自動検証ツールはこの schema を参照して parse する。
 
