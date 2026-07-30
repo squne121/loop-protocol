@@ -354,6 +354,12 @@ entries:
   # unchanged (pinned to the schema-governance.md golden set in
   # schemas/tests/test_catalog.py); it identifies the catalog entry, not
   # the runtime schema field value.
+  # Issue #1856 (evidence authority cutover, Phase 1): this schema/producer/consumer
+  # registration is unchanged, but the artifact it describes is
+  # non-authoritative-for-ordinary-review — pr-review-judge / impl-review-loop Step 2
+  # APPROVE/REQUEST_CHANGES decisions do not depend on it. Authoritative evidence is
+  # CI_CHECK_RUN_SCOPED and exact-head-SHA-bound independent Issue VC
+  # (.claude/skills/pr-review-judge/references/evidence-policy.md).
   - schema_id: "TEST_VERDICT_MACHINE v1"
     format: markdown_yaml_contract
     source_kind: repo_path
@@ -964,6 +970,12 @@ entries:
       commit: "2198d01374caedd3ad86a42e9dbb45ea285d4bb3"
       command_id: "lint_catalog_yaml"
 
+  # Issue #1856 (evidence authority cutover, Phase 1): this schema/producer/consumer
+  # registration is unchanged, but the artifact it describes is
+  # non-authoritative-for-ordinary-review — pr-review-judge / impl-review-loop Step 2
+  # APPROVE/REQUEST_CHANGES decisions do not depend on it. Authoritative evidence is
+  # CI_CHECK_RUN_SCOPED and exact-head-SHA-bound independent Issue VC
+  # (.claude/skills/pr-review-judge/references/evidence-policy.md).
   - schema_id: "TEST_VERDICT_EXECUTION_RECORD_V1"
     format: json_schema
     source_kind: repo_path
@@ -1010,6 +1022,12 @@ entries:
       commit: "1a487a7e0a315a4283de916c222f7a0bacdd222b"
       command_id: "lint_catalog_yaml"
 
+  # Issue #1856 (evidence authority cutover, Phase 1): this schema/producer/consumer
+  # registration is unchanged, but the artifact it describes is
+  # non-authoritative-for-ordinary-review — pr-review-judge / impl-review-loop Step 2
+  # APPROVE/REQUEST_CHANGES decisions do not depend on it. Authoritative evidence is
+  # CI_CHECK_RUN_SCOPED and exact-head-SHA-bound independent Issue VC
+  # (.claude/skills/pr-review-judge/references/evidence-policy.md).
   - schema_id: "TEST_VERDICT_PRODUCER_RECEIPT_V1"
     format: json_schema
     source_kind: repo_path

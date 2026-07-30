@@ -1,10 +1,14 @@
 scenario: negative_behind_branch_behind_main_key_absent
+description: >-
+  Issue #1856 (AC2): a merge_state_status other than BEHIND (CLEAN) with an
+  update_branch action present must fail-closed without relying on
+  branch_behind_main / test_verdict (removed).
 loop_verdict:
   verdict: APPROVE
   merge_ready: false
   reviewed_head_sha: "abc123def456"
   mergeability:
-    merge_state_status: BEHIND
+    merge_state_status: CLEAN
   required_auto_actions:
     - kind: update_branch
       executor: implementation-worker
@@ -12,9 +16,7 @@ loop_verdict:
       blocking_merge_ready: true
       mechanical: true
       expected_head_sha: "abc123def456"
-test_verdict:
-  result: pass
 expected:
   route: fail_closed
   fail_closed: true
-  reason_code: "missing_branch_behind_main_for_BEHIND"
+  reason_code: "update_branch_without_behind_status"

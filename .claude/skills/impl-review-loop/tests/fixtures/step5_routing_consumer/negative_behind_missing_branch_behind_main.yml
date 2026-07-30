@@ -1,19 +1,16 @@
 scenario: negative_behind_missing_branch_behind_main
+description: >-
+  Issue #1856 (AC2): BEHIND merge_state_status with an empty
+  required_auto_actions list must fail-closed without relying on
+  branch_behind_main / test_verdict (removed).
 loop_verdict:
   verdict: APPROVE
   merge_ready: false
   reviewed_head_sha: "abc123def456"
   mergeability:
     merge_state_status: BEHIND
-  required_auto_actions:
-    - kind: update_branch
-      executor: implementation-worker
-      skill: implement-issue.update_branch
-      blocking_merge_ready: true
-      mechanical: true
-      expected_head_sha: "abc123def456"
-test_verdict: null
+  required_auto_actions: []
 expected:
   route: fail_closed
   fail_closed: true
-  reason_code: "missing_branch_behind_main_for_BEHIND"
+  reason_code: "behind_without_update_branch_action"

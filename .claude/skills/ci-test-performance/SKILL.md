@@ -126,8 +126,9 @@ CI_TEST_PERFORMANCE_DECISION_V1:
   reviewer_gate:
     approve_allowed: true | false
     required_evidence:
-      - TEST_VERDICT_MACHINE
-      - CI_CHECK_RUN_SCOPED
+      - CI_CHECK_RUN_SCOPED  # authoritative（Issue #1856 evidence authority cutover）
+      # TEST_VERDICT_MACHINE は required_evidence に含めない（advisory のみ、Issue #1856）。
+      # 詳細な優先順位は `.claude/skills/pr-review-judge/references/evidence-policy.md` を参照。
   follow_up_required: []
 ```
 
