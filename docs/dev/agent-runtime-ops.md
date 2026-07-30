@@ -178,7 +178,7 @@ routine 操作は bounded な profile / rules / wrapper に寄せ、境界外だ
 - `rtk gh`
 - `rtk git`
 - `rtk pnpm`
-- read-only inspection
+- 読み取り専用の調査（read-only inspection）
 - repo 既定のVerification Commands
 
 ### 明示的に境界外として扱う操作
