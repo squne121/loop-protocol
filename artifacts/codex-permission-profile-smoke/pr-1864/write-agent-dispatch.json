@@ -1,0 +1,25 @@
+{
+  "schema": "CODEX_WRITE_AGENT_DISPATCH_SMOKE_V1",
+  "ac": "AC4",
+  "requested_agent_type": "implementation-worker",
+  "dispatch_mechanism": "spawn_agent (collaboration namespace), not --profile",
+  "spawn_confirmed_via_rollout": true,
+  "subagent_session_meta_agent_role": "implementation-worker",
+  "task_result": {
+    "create_tmp_pr1864_agent_write_probe_txt": "success",
+    "read_back": "success, contents='agent-write-probe-ok'",
+    "delete": "success",
+    "post_hoc_filesystem_check": "confirmed absent on host filesystem after the agent reported deletion",
+    "network_get_api_github_com": "success, HTTP 200"
+  },
+  "caveat": "See custom-agent-dispatch-findings.json IMPORTANT_FINDING section: the sub-agent's own turn_context.permission_profile in its rollout mirrors the ROOT session's file_system entries (write-capable) rather than being independently traceable to the loop-protocol-rtk agent-local declaration. Because this dispatch succeeded, it cannot demonstrate a negative-control contrast against the read-only agent's denial (both ran under an environment where write attempts to workspace/tmp are broadly allowed for the root profile itself).",
+  "evidence_files": [
+    "write-agent-dispatch-parent-rollout.jsonl",
+    "write-agent-dispatch-subagent-rollout.jsonl",
+    "write-agent-dispatch-exec-events.jsonl",
+    "write-agent-dispatch-prompt.txt"
+  ],
+  "tested_commit_sha": "22eb7f03d23607e93f1499b32df3722ec060799b",
+  "codex_version": "codex-cli 0.146.0",
+  "codex_binary_sha256": "2e863156ed35ecc5253b1e2f907a9143077b9f7cb51942070c61996471ff6e04"
+}

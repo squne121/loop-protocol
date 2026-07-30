@@ -219,12 +219,28 @@ function parseTomlFile(filePath) {
       continue;
     }
 
-    // Key = value
-    const kvMatch = /^([A-Za-z0-9_.-]+)\s*=\s*(.+)$/.exec(line);
+    // Key = value. Keys may be a bare identifier OR a quoted TOML "dotted
+    // key" segment (e.g. `"**.github.com" = "allow"`, `"." = "write"`),
+    // which is common in this repo's permission-profile network/filesystem
+    // allowlist tables. Quoted keys are unescaped the same way quoted string
+    // values are below.
+    const kvMatch = /^(?:"((?:[^"\\]|\\.)*)"|'([^']*)'|([A-Za-z0-9_.-]+))\s*=\s*(.+)$/.exec(line);
     if (!kvMatch) {
       continue;
     }
-    const [, key, rawValue] = kvMatch;
+    const [, doubleQuotedKey, singleQuotedKey, bareKey, rawValue] = kvMatch;
+    let key;
+    if (doubleQuotedKey !== undefined) {
+      try {
+        key = JSON.parse(`"${doubleQuotedKey}"`);
+      } catch {
+        throw new Error(`${filePath}:${i + 1}: invalid quoted key: ${line}`);
+      }
+    } else if (singleQuotedKey !== undefined) {
+      key = singleQuotedKey;
+    } else {
+      key = bareKey;
+    }
 
     // Duplicate key detection (within current section, by object identity)
     if (!sectionKeys.has(currentSection)) {
@@ -580,7 +596,80 @@ function validateAgents() {
   const hookBoundariesText = readOptionalText(hookBoundariesPath);
   const skillBoundariesText = readOptionalText(skillBoundariesPath);
 
-  assert(!configText.includes('\ndefault_permissions = '), 'config.toml must not claim an unverified root default permission profile', failures);
+  // Issue #1859 (re-revision): root default_permissions must be present and
+  // pinned to the repository-defined "loop-protocol-personal-dev" custom
+  // profile, which extends the built-in ":workspace" profile and layers on
+  // an explicit, bounded development network allowlist (owner
+  // HUMAN_PERMISSION_DECISION_V1). Loader/skills-list breaks without a root
+  // default whenever [permissions.*] profiles are non-empty (#1849
+  // regression). This is validated against the parsed TOML structure
+  // (configParsed), not raw-text regex, so misplacement into ANY table --
+  // not just [features] -- is detected.
+  const ROOT_DEFAULT_PROFILE = 'loop-protocol-personal-dev';
+  const ROOT_DEFAULT_EXTENDS = ':workspace';
+  const ROOT_DEFAULT_NETWORK_MODE = 'full';
+
+  function findMisplacedDefaultPermissionsLocations() {
+    const locations = [];
+    if (configParsed?.features && typeof configParsed.features === 'object' && Object.hasOwn(configParsed.features, 'default_permissions')) {
+      locations.push('[features]');
+    }
+    if (configParsed?.agents && typeof configParsed.agents === 'object' && Object.hasOwn(configParsed.agents, 'default_permissions')) {
+      locations.push('[agents]');
+    }
+    if (configParsed?.permissions && typeof configParsed.permissions === 'object') {
+      for (const [profileName, profile] of Object.entries(configParsed.permissions)) {
+        if (profile && typeof profile === 'object' && Object.hasOwn(profile, 'default_permissions')) {
+          locations.push(`[permissions.${profileName}]`);
+        }
+      }
+    }
+    return locations;
+  }
+
+  for (const location of findMisplacedDefaultPermissionsLocations()) {
+    failures.push(`config.toml: default_permissions must not be placed inside ${location} (misplacement makes it inert); it must live in the root TOML scope`);
+  }
+
+  const rootDefaultPermissionsValue = configParsed && typeof configParsed === 'object' ? configParsed.default_permissions : undefined;
+  assert(
+    typeof rootDefaultPermissionsValue === 'string',
+    'config.toml must set root-scope default_permissions (structural root key) when [permissions] profiles are non-empty',
+    failures,
+  );
+  if (typeof rootDefaultPermissionsValue === 'string') {
+    assert(
+      rootDefaultPermissionsValue === ROOT_DEFAULT_PROFILE,
+      `config.toml root default_permissions must be the repository-defined ${JSON.stringify(ROOT_DEFAULT_PROFILE)} profile, got ${JSON.stringify(rootDefaultPermissionsValue)}`,
+      failures,
+    );
+    if (rootDefaultPermissionsValue === ROOT_DEFAULT_PROFILE) {
+      const rootProfile = configParsed?.permissions?.[ROOT_DEFAULT_PROFILE];
+      assert(Boolean(rootProfile) && typeof rootProfile === 'object', `config.toml must define [permissions.${ROOT_DEFAULT_PROFILE}]`, failures);
+      if (rootProfile && typeof rootProfile === 'object') {
+        assert(
+          rootProfile.extends === ROOT_DEFAULT_EXTENDS,
+          `config.toml [permissions.${ROOT_DEFAULT_PROFILE}] must declare extends = ${JSON.stringify(ROOT_DEFAULT_EXTENDS)}, got ${JSON.stringify(rootProfile.extends)}`,
+          failures,
+        );
+        const network = rootProfile.network;
+        assert(Boolean(network) && typeof network === 'object', `config.toml [permissions.${ROOT_DEFAULT_PROFILE}.network] must be defined`, failures);
+        if (network && typeof network === 'object') {
+          // Issue #1859 (re-revision): the bundled TOML parser stores
+          // unquoted scalars (booleans) as raw strings; quoted strings
+          // (like `mode = "full"`) parse to real strings.
+          assert(network.enabled === 'true', `config.toml [permissions.${ROOT_DEFAULT_PROFILE}.network] enabled must be true`, failures);
+          assert(network.mode === ROOT_DEFAULT_NETWORK_MODE, `config.toml [permissions.${ROOT_DEFAULT_PROFILE}.network] mode must be ${JSON.stringify(ROOT_DEFAULT_NETWORK_MODE)}, got ${JSON.stringify(network.mode)}`, failures);
+          assert(network.allow_local_binding === 'false', `config.toml [permissions.${ROOT_DEFAULT_PROFILE}.network] allow_local_binding must be false`, failures);
+          const domains = network.domains;
+          assert(Boolean(domains) && typeof domains === 'object' && Object.keys(domains).length > 0, `config.toml [permissions.${ROOT_DEFAULT_PROFILE}.network.domains] must declare at least one explicit development allowlist domain`, failures);
+          if (domains && typeof domains === 'object') {
+            assert(!Object.hasOwn(domains, '*'), `config.toml [permissions.${ROOT_DEFAULT_PROFILE}.network.domains] must not use a global "*" allowlist`, failures);
+          }
+        }
+      }
+    }
+  }
   assert(configText.includes('[permissions.loop-protocol-readonly.filesystem]'), 'config.toml must define permissions.loop-protocol-readonly', failures);
   assert(configText.includes('.codex/hooks.json'), 'config.toml must mention .codex/hooks.json as the documented hook surface', failures);
   assert(!configText.includes('sandbox_mode'), 'config.toml must not use sandbox_mode when permission profiles are active', failures);
@@ -1198,8 +1287,12 @@ function runSelfTest() {
     const parsed = parseTomlFile(configPath);
     selfAssert(typeof parsed === 'object', 'config.toml: parses without error');
     selfAssert(
-      parsed.default_permissions === undefined,
-      'config.toml: root default_permissions remains advisory-absent',
+      parsed.default_permissions === 'loop-protocol-personal-dev',
+      'config.toml: root default_permissions is the repository-defined "loop-protocol-personal-dev" profile',
+    );
+    selfAssert(
+      parsed.permissions?.['loop-protocol-personal-dev']?.extends === ':workspace',
+      'config.toml: loop-protocol-personal-dev extends the built-in ":workspace" profile',
     );
   } catch (e) {
     selfAssert(false, `config.toml: should parse cleanly (got: ${e.message})`);
