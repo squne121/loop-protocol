@@ -129,6 +129,142 @@ def read_toml(path: Path) -> dict:
         return tomllib.load(fh)
 
 
+# Issue #1859 (re-revision): OpenAI-defined built-in permission profile
+# names. ":danger-full-access" and legacy `sandbox_mode` must never become
+# the root default (see Out of Scope / Stop Conditions). The root default
+# itself is the repository-defined custom profile below, which `extends`
+# the built-in `:workspace` profile and layers on an explicit development
+# network allowlist (owner `HUMAN_PERMISSION_DECISION_V1`, Issue #1859).
+BUILTIN_PERMISSION_PROFILES = frozenset({":read-only", ":workspace", ":danger-full-access"})
+CUSTOM_ROOT_DEFAULT_PROFILE = "loop-protocol-personal-dev"
+REQUIRED_ROOT_DEFAULT_PERMISSIONS = CUSTOM_ROOT_DEFAULT_PROFILE
+REQUIRED_ROOT_DEFAULT_EXTENDS = ":workspace"
+REQUIRED_ROOT_DEFAULT_NETWORK_MODE = "full"
+
+
+def _find_misplaced_default_permissions(config: dict) -> list[str]:
+    """Structural (not regex) scan for `default_permissions` in any table
+    other than the TOML root scope: `[features]`, `[agents]`, or any
+    `[permissions.*]` profile table. Misplacement makes the key inert."""
+    locations: list[str] = []
+    features = config.get("features", {})
+    if isinstance(features, dict) and "default_permissions" in features:
+        locations.append("[features]")
+    agents_table = config.get("agents", {})
+    if isinstance(agents_table, dict) and "default_permissions" in agents_table:
+        locations.append("[agents]")
+    permissions = config.get("permissions", {})
+    if isinstance(permissions, dict):
+        for profile_name, profile in permissions.items():
+            if isinstance(profile, dict) and "default_permissions" in profile:
+                locations.append(f"[permissions.{profile_name}]")
+    return locations
+
+
+def _assert_root_default_profile_definition(permissions: dict) -> list[str]:
+    """AC1/AC3: `loop-protocol-personal-dev` extends `:workspace` and layers
+    on an explicit, non-global, non-local-binding development network
+    allowlist."""
+    failures: list[str] = []
+    profile = permissions.get(CUSTOM_ROOT_DEFAULT_PROFILE)
+    if not isinstance(profile, dict):
+        return [f".codex/config.toml: [permissions.{CUSTOM_ROOT_DEFAULT_PROFILE}] must be defined"]
+
+    extends = profile.get("extends")
+    if extends != REQUIRED_ROOT_DEFAULT_EXTENDS:
+        failures.append(
+            f".codex/config.toml: [permissions.{CUSTOM_ROOT_DEFAULT_PROFILE}] must declare "
+            f"extends = {REQUIRED_ROOT_DEFAULT_EXTENDS!r}, got {extends!r}"
+        )
+
+    network = profile.get("network")
+    if not isinstance(network, dict):
+        return failures + [
+            f".codex/config.toml: [permissions.{CUSTOM_ROOT_DEFAULT_PROFILE}.network] must be defined"
+        ]
+
+    if network.get("enabled") is not True:
+        failures.append(
+            f".codex/config.toml: [permissions.{CUSTOM_ROOT_DEFAULT_PROFILE}.network] enabled must be true"
+        )
+    if network.get("mode") != REQUIRED_ROOT_DEFAULT_NETWORK_MODE:
+        failures.append(
+            f".codex/config.toml: [permissions.{CUSTOM_ROOT_DEFAULT_PROFILE}.network] mode must be "
+            f"{REQUIRED_ROOT_DEFAULT_NETWORK_MODE!r}, got {network.get('mode')!r}"
+        )
+    if network.get("allow_local_binding") is not False:
+        failures.append(
+            f".codex/config.toml: [permissions.{CUSTOM_ROOT_DEFAULT_PROFILE}.network] "
+            "allow_local_binding must be false"
+        )
+
+    domains = network.get("domains")
+    if not isinstance(domains, dict) or not domains:
+        failures.append(
+            f".codex/config.toml: [permissions.{CUSTOM_ROOT_DEFAULT_PROFILE}.network.domains] must "
+            "declare at least one explicit development allowlist domain"
+        )
+    elif "*" in domains:
+        failures.append(
+            f".codex/config.toml: [permissions.{CUSTOM_ROOT_DEFAULT_PROFILE}.network.domains] must not "
+            'use a global "*" allowlist'
+        )
+
+    return failures
+
+
+def assert_root_default_permissions(config: dict, config_text: str) -> list[str]:
+    """AC1/AC3/AC5/AC6: root `default_permissions` semantic contract.
+
+    - non-empty `[permissions]` requires a root-scope `default_permissions`.
+    - the value must be the repository-defined `loop-protocol-personal-dev`
+      profile, which must `extends = ":workspace"` and declare an explicit,
+      bounded development network allowlist; any other value (including a
+      reference to an undefined custom profile) is rejected.
+    - `default_permissions` must live in the root TOML scope, not inside
+      `[features]`, `[agents]`, or any `[permissions.*]` profile table
+      (structural check against the parsed TOML object, not raw-text regex).
+    - legacy `sandbox_mode` must not coexist with permission profiles.
+    """
+    del config_text  # retained for call-site compatibility; unused (AC5: structural, not regex)
+    failures: list[str] = []
+    permissions = config.get("permissions", {})
+    root_default = config.get("default_permissions")
+
+    failures.extend(
+        f".codex/config.toml: default_permissions must not be placed inside {location} "
+        "(misplacement makes it inert); it must live in the root TOML scope"
+        for location in _find_misplaced_default_permissions(config)
+    )
+
+    if permissions:
+        if root_default is None:
+            failures.append(
+                ".codex/config.toml: [permissions] profiles are defined but root "
+                "default_permissions is missing (Codex loader rejects this combination)"
+            )
+        else:
+            if root_default != REQUIRED_ROOT_DEFAULT_PERMISSIONS:
+                failures.append(
+                    f".codex/config.toml: root default_permissions must be "
+                    f"{REQUIRED_ROOT_DEFAULT_PERMISSIONS!r}, got {root_default!r}"
+                )
+            if root_default not in BUILTIN_PERMISSION_PROFILES and root_default not in permissions:
+                failures.append(
+                    f".codex/config.toml: root default_permissions references an "
+                    f"undefined custom profile: {root_default!r}"
+                )
+            if root_default == CUSTOM_ROOT_DEFAULT_PROFILE:
+                failures.extend(_assert_root_default_profile_definition(permissions))
+
+    if "sandbox_mode" in config:
+        failures.append(
+            ".codex/config.toml: legacy sandbox_mode must not coexist with permission profiles"
+        )
+
+    return failures
+
+
 def extract_runtime_field(instructions: str, field: str) -> str | None:
     match = re.search(rf"{re.escape(field)}:\s*([a-zA-Z0-9._|-]+)", instructions)
     return match.group(1) if match else None
@@ -391,6 +527,7 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
     failures.extend(find_duplicate_canonical_targets(deduped_surface_paths))
     if config.get("agents", {}).get("max_depth") != 1:
         failures.append(".codex/config.toml: [agents].max_depth must be 1")
+    failures.extend(assert_root_default_permissions(config, CONFIG_PATH.read_text(encoding="utf-8")))
 
     if sorted(hooks.keys()) != ["hooks"]:
         failures.append(f".codex/hooks.json: root keys must be exactly ['hooks'], got {sorted(hooks.keys())!r}")

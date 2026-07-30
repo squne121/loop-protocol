@@ -1,7 +1,52 @@
 approval_policy = "on-request"
 
+# Issue #1859 (re-revision): root default_permissions restored after the
+# #1849 P0 quarantine (which dropped the root default entirely and caused
+# `codex status` / `skills/list` to fail with "config defines [permissions]
+# profiles but does not set default_permissions"). The root default is
+# `loop-protocol-personal-dev`, a repository-defined custom profile that
+# `extends = ":workspace"` (the OpenAI-defined built-in profile) and layers
+# on a broad, explicit development network allowlist. This is an owner
+# `HUMAN_PERMISSION_DECISION_V1` for personal hobby development (see the
+# Background section of Issue #1859), not the built-in `:workspace` literal.
+#
+# `:workspace` filesystem semantics (inherited by `loop-protocol-personal-dev`
+# below): filesystem read is NOT restricted to the workspace -- it covers
+# whatever the OS-level file permissions allow the process to read across the
+# whole filesystem. Filesystem WRITE is restricted to active workspace roots
+# and system temporary directories. `.git`, `.agents`, and `.codex` are
+# protected metadata and are not writable even though they live inside the
+# workspace root, regardless of the extending profile's network settings.
+#
+# This does not reopen the #1849 quarantine -- hooks stay limited to the
+# passive SessionEnd/SubagentStop allowlist in `.codex/hooks.json`.
+default_permissions = "loop-protocol-personal-dev"
+
 [features]
 hooks = true
+
+[permissions.loop-protocol-personal-dev]
+description = "Personal hobby development profile: built-in workspace filesystem semantics plus broad development network access."
+extends = ":workspace"
+
+[permissions.loop-protocol-personal-dev.network]
+enabled = true
+mode = "full"
+allow_local_binding = false
+
+[permissions.loop-protocol-personal-dev.network.domains]
+"**.github.com" = "allow"
+"**.githubusercontent.com" = "allow"
+"**.npmjs.org" = "allow"
+"**.pypi.org" = "allow"
+"**.pythonhosted.org" = "allow"
+"**.crates.io" = "allow"
+"**.rust-lang.org" = "allow"
+"**.jsdelivr.net" = "allow"
+"**.unpkg.com" = "allow"
+"**.openai.com" = "allow"
+"**.anthropic.com" = "allow"
+"**.herdr.dev" = "allow"
 
 # Project-local custom agents may explicitly select a profile from [permissions.*].
 # Repo-local hooks live in `.codex/hooks.json`; do not mix inline hooks here.
