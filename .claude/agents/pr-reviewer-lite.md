@@ -56,10 +56,15 @@ deny_if_any:
   - safety_sensitive: true             # transport / permission / sandbox / auth 変更
 
   # 検証状態による除外
-  - TEST_VERDICT_MACHINE_missing: true  # test-runner コメントなし
   - verification_skipped_count: "> 0"
   - fallback_detected: true
 ```
+
+`TEST_VERDICT_MACHINE_missing` は deny-list から除去した（Issue #1856 AC16）。
+TEST_VERDICT は diagnostics 表示専用（`may_grant_approval: false` /
+`may_block_approval: false` / `may_change_routing: false`、
+`.claude/skills/pr-review-judge/references/evidence-policy.md` 参照）であり、
+コメント不在自体は Sonnet ルーティングの根拠にしない。
 
 deny-list に該当する場合のアクション:
 1. PR への mutation（コメント等）を行わない
@@ -92,49 +97,37 @@ gh pr view <PR番号> --json body --jq '.body' | grep -E "(Closes|Fixes|Resolves
 
 ### Gate 2: CI 確認
 
-**Issue #1856（evidence authority cutover, Phase 1）**: この Gate の authoritative
-evidence は `gh pr checks`（`CI_CHECK_RUN_SCOPED` 相当）である。以下の
-`TEST_VERDICT_MACHINE` コメントによるフォールバックは、GitHub Actions が
-未設定の場合のみ使用する advisory な代替経路であり、TEST_VERDICT の有無・内容が
-publish/write authority を持つわけではない。
+**Issue #1856（evidence authority cutover, Phase 1 / AC11）**: この Gate の
+唯一の authoritative evidence は canonical required-CI evaluator
+`.claude/skills/impl-review-loop/scripts/wait_ci_checks.py`
+（`CI_CHECK_RUN_SCOPED` 相当。pr-review-judge・impl-review-loop Step 4 と共有する
+同一 evaluator）である。GitHub Actions が未設定などで required checks が
+0 件の場合も `REQUEST_CHANGES`（`no_checks` 相当、fail-open にしない）。
 
 ```bash
-gh pr checks <PR番号>
+HEAD_SHA=$(gh pr view <PR番号> --json headRefOid --jq .headRefOid)
+uv run --locked python3 .claude/skills/impl-review-loop/scripts/wait_ci_checks.py \
+  --repo <owner>/<repo> --pr <PR番号> --head-sha "$HEAD_SHA" --required \
+  --interval 1 --timeout-seconds 1
+```
+
+`CI_WAIT_RESULT_V1.status` が `no_checks` / `skipped_only` / `failed` /
+`cancelled` / `pending_timeout` / `head_sha_changed` のいずれかであれば
+`REQUEST_CHANGES`。`wait_ci_checks.py` が使えない場合のみ、以下の raw
+`gh pr checks --required` を fallback として使用してよい:
+
+```bash
+gh pr checks <PR番号> --required
 ```
 
 - 全チェックが `pass` / `success` → CI pass
 - `fail` / `failure` が存在 → `REQUEST_CHANGES`（CI fail）
 - CI チェックなし / `pending` のみ → `REQUEST_CHANGES`（CI 証跡なし）
 
-フォールバック（GitHub Actions 未設定時、advisory）:
-```bash
-VERDICT_BODY=$(gh pr view <PR番号> --json comments --jq \
-  '[.comments[] | select(.body | contains("<!-- TEST_VERDICT_MACHINE v1 -->"))] | last | .body // empty')
-
-if [ -z "$VERDICT_BODY" ]; then
-  echo "TEST_VERDICT_MACHINE コメントが存在しない → REQUEST_CHANGES"
-else
-  # verification_commands_fail の値を数値として確認
-  FAIL_COUNT=$(echo "$VERDICT_BODY" | python3 -c "
-import sys, re
-body = sys.stdin.read()
-m = re.search(r'verification_commands_fail:\s*(\d+)', body)
-print(m.group(1) if m else '-1')
-")
-  SKIP_COUNT=$(echo "$VERDICT_BODY" | python3 -c "
-import sys, re
-body = sys.stdin.read()
-m = re.search(r'verification_skipped_count:\s*(\d+)', body)
-print(m.group(1) if m else '-1')
-")
-
-  if [ "$FAIL_COUNT" -gt 0 ] || [ "$SKIP_COUNT" -gt 0 ] || [ "$FAIL_COUNT" = "-1" ]; then
-    echo "verification fail/skip あり → REQUEST_CHANGES"
-  else
-    echo "TEST_VERDICT_MACHINE: verification_commands_fail=0, skipped=0 → pass"
-  fi
-fi
-```
+`TEST_VERDICT_MACHINE` コメントは診断表示専用の補助情報として PR コメントから
+参照してよいが、CI 確認の pass/fail 判定には使わない（`may_grant_approval: false` /
+`may_block_approval: false`、`.claude/skills/pr-review-judge/references/evidence-policy.md`
+参照）。
 
 ### Gate 3: AC Coverage 確認（受け入れ条件が本文に記載されているかを確認する）
 
@@ -147,7 +140,12 @@ placeholder（`<達成（根拠）>` 等）が残存している場合は `REQUE
 
 ### Gate 4: SKIP / fallback APPROVE 禁止（検証省略やフォールバックによる承認を許さない）
 
-- `TEST_VERDICT_MACHINE` コメントに `verification_skipped_count: > 0` → `REQUEST_CHANGES`
+**Issue #1856（evidence authority cutover, Phase 1 / AC16）**: この Gate の
+根拠は independent Issue VC の実行結果（Step 2 の独立検証）と PR 本文自己申告
+であり、`TEST_VERDICT_MACHINE` コメントの有無・内容を根拠にしない
+（TEST_VERDICT は diagnostics 表示専用）。
+
+- Step 2 の独立検証結果 / PR 本文の `verification_skipped_count: > 0` → `REQUEST_CHANGES`
 - `runtime_ac_results` に `fallback_detected: true` → `REQUEST_CHANGES`
 - PR 本文に `SKIP:` / `exit 77` が証跡として記載されているのに PASS として扱われている → `REQUEST_CHANGES`
 

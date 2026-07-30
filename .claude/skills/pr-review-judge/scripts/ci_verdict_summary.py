@@ -748,8 +748,11 @@ def main() -> int:
     # Overall status
     if not verdicts:
         # No checks found (check_name_filter が一致しない場合は B1 で gh_error 処理済み)
-        # verdicts が空 = フィルタなしで checks も 0 件 → 証跡なし → all_pass
-        overall_status = "all_pass"
+        # verdicts が空 = フィルタなしで required checks も 0 件 → 証跡なし →
+        # no_required_evidence（Issue #1856 AC11: 0 件を all_pass にする
+        # fail-open を解消。required checks が存在しないことは approve evidence
+        # にならない）。
+        overall_status = "no_required_evidence"
     else:
         overall_status = compute_overall_status(verdicts)
 

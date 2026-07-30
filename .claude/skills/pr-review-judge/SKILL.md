@@ -49,20 +49,42 @@ description: implementation child issue に紐づく PR をレビューし、lin
 
 ### 4) CI 証拠
 
-`ci_verdict_summary.py` を使用（raw `gh pr checks` は原則不使用）。
+**Issue #1856（evidence authority cutover, Phase 1 / AC11・AC12）**: required
+check の存在有無・pass/fail 判定の canonical evaluator は
+`.claude/skills/impl-review-loop/scripts/wait_ci_checks.py`
+（`gh pr checks --required --json` で live required set を取得し、CheckRun /
+StatusContext 双方を評価対象に含め、no-checks/skipped を fail-closed にする）
+であり、pr-review-judge・pr-reviewer-lite・impl-review-loop Step 4 の 3 経路が
+これを共有する。`ci_verdict_summary.py` はこれに加えて log excerpt 抽出・
+artifact 保存等の詳細 provenance 収集を行う拡張レイヤーとして使用する
+（raw `gh pr checks` は原則不使用）。
 
 ```bash
 HEAD_SHA=$(gh pr view <PR番号> --json headRefOid --jq .headRefOid)
+
+# canonical required-CI evaluator（3経路共通）
+uv run --locked python3 .claude/skills/impl-review-loop/scripts/wait_ci_checks.py \
+  --repo <owner>/<repo> --pr <PR番号> --head-sha "$HEAD_SHA" --required \
+  --interval 1 --timeout-seconds 1
+
+# 詳細 provenance（log excerpt / artifact）
 uv run --locked python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary.py --pr <PR番号> --repo <owner>/<repo> --expected-head-sha "$HEAD_SHA"
 ```
 
+`wait_ci_checks.py` の `CI_WAIT_RESULT_V1.status` が `no_checks` / `skipped_only` /
+`failed` / `cancelled` / `pending_timeout` / `head_sha_changed` のいずれかであれば
+fail-closed で `REQUEST_CHANGES` blocker とする。
+
+`ci_verdict_summary.py` の exit code:
+
 - `exit 0`: 補助証拠可
-- `exit 10`: blocker
+- `exit 10`: blocker（required checks が 0 件の場合の `no_required_evidence` を含む。
+  Issue #1856 AC11 により 0 件を `all_pass` として通過させない）
 - `exit 20`: CI 未確定 blocker
 - `exit 30`: stale_head_sha blocker
 - `exit 40`: gh error blocker
 
-`ci_verdict_summary.py` 不可用時は `gh pr checks` fallback を明記した上で停止判断。
+いずれのスクリプトも不可用時は `gh pr checks --required` fallback を明記した上で停止判断。
 
 ### 5) PR Evidence / AC の一致
 

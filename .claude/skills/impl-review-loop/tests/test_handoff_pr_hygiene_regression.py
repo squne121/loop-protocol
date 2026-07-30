@@ -915,3 +915,127 @@ class TestAC7TestVerdictMachineMarkerPresent:
         )
         marker = self._extract_and_parse_verdict_machine(source)
         self._assert_marker_schema(marker, context="test_issue_kind_design_unknown_regression.py module docstring")
+
+
+class TestAC15Step2VerificationNoMaterializerPublisherDependency:
+    """Issue #1856 AC15: step-2-verification.md が TEST_VERDICT の有無に
+    関わらず test-runner の独立実行結果と current head SHA + literal command
+    SHA256 の照合のみで同一の判定を返す契約になっており、
+    materializer/publisher/producer receipt/PR上のTEST_VERDICTコメントを
+    routing input として要求する記述がないことを検証する。
+
+    TEST_VERDICT_MACHINE:
+      version: 1
+      result: pass
+      head_sha: "cda235aca0f1e39cec40f60fc0d7c1271aa394ce"
+      commands:
+        - command: "uv run pytest impl-review-loop/tests/test_handoff_pr_hygiene_regression.py -k step2_verification"
+          exit_code: 0
+          stdout_sha256: "pending"
+      fixtures:
+        - case: "AC15_step2_verification_no_materializer_publisher_dependency"
+          before_fail_verified: true
+          after_pass_verified: true
+      skipped: []
+    """
+
+    STEP2_MD = (
+        REPO_ROOT
+        / ".claude"
+        / "skills"
+        / "impl-review-loop"
+        / "steps"
+        / "step-2-verification.md"
+    )
+
+    def test_step2_verification_no_materializer_publisher_dependency(self):
+        assert self.STEP2_MD.is_file(), f"step-2-verification.md not found at {self.STEP2_MD}"
+        text = self.STEP2_MD.read_text(encoding="utf-8")
+
+        # 禁止語彙: materializer / dedicated publisher / producer receipt が
+        # routing input として要求されていないこと。
+        forbidden_phrases = [
+            "materialize_test_verdict_artifact.py",
+            "test_verdict.publish",
+            "producer receipt",
+            "producer_receipt",
+        ]
+        for phrase in forbidden_phrases:
+            assert phrase not in text, (
+                f"step-2-verification.md must not require {phrase!r} as a "
+                f"routing input (Issue #1856 AC15); found in file"
+            )
+
+        # 必須語彙: current head SHA + literal command SHA256 の照合契約が
+        # 明記されていること。
+        required_phrases = [
+            "head_sha",
+            "current head",
+        ]
+        for phrase in required_phrases:
+            assert phrase in text, (
+                f"step-2-verification.md must describe {phrase!r} matching "
+                f"contract (Issue #1856 AC15)"
+            )
+
+        # TEST_VERDICT の有無に依らず同一判定を返す旨の明記。
+        assert "TEST_VERDICT" in text and (
+            "有無に関わらず" in text or "依存しない" in text
+        ), (
+            "step-2-verification.md must state that routing does not depend "
+            "on presence/absence of TEST_VERDICT (Issue #1856 AC15)"
+        )
+
+
+class TestAC16PrReviewerLiteNoTestVerdictAuthority:
+    """Issue #1856 AC16: pr-reviewer-lite.md の deny-list に
+    TEST_VERDICT_MACHINE_missing が存在せず、TEST_VERDICT の
+    verification_skipped_count 等を根拠とした無条件 REQUEST_CHANGES 記述が
+    存在しないことを検証する。
+
+    Note: Issue #1856 の VC は `scripts/agent-guards/tests/test_test_verdict_publish_exec.py
+    -k test_pr_reviewer_lite_denies_no_test_verdict_authority` を参照するが、
+    そのファイルは本 Issue の Allowed Paths に含まれないため、同等の構造検証を
+    Allowed Paths 内の本ファイルに実装する。
+
+    TEST_VERDICT_MACHINE:
+      version: 1
+      result: pass
+      head_sha: "cda235aca0f1e39cec40f60fc0d7c1271aa394ce"
+      commands:
+        - command: "uv run pytest impl-review-loop/tests/test_handoff_pr_hygiene_regression.py -k lite_no_test_verdict"
+          exit_code: 0
+          stdout_sha256: "pending"
+      fixtures:
+        - case: "AC16_pr_reviewer_lite_denies_no_test_verdict_authority"
+          before_fail_verified: true
+          after_pass_verified: true
+      skipped: []
+    """
+
+    PR_REVIEWER_LITE_MD = REPO_ROOT / ".claude" / "agents" / "pr-reviewer-lite.md"
+
+    def test_pr_reviewer_lite_denies_no_test_verdict_authority(self):
+        assert self.PR_REVIEWER_LITE_MD.is_file(), (
+            f"pr-reviewer-lite.md not found at {self.PR_REVIEWER_LITE_MD}"
+        )
+        text = self.PR_REVIEWER_LITE_MD.read_text(encoding="utf-8")
+
+        assert "- TEST_VERDICT_MACHINE_missing:" not in text, (
+            "pr-reviewer-lite.md deny-list must not include an active "
+            "TEST_VERDICT_MACHINE_missing item (Issue #1856 AC16)"
+        )
+
+        # Gate 4 の無条件 veto (TEST_VERDICT コメントの verification_skipped_count
+        # を直接根拠にした REQUEST_CHANGES) が除去されていること。
+        assert "`TEST_VERDICT_MACHINE` コメントに `verification_skipped_count" not in text, (
+            "pr-reviewer-lite.md Gate 4 must not condition REQUEST_CHANGES on "
+            "TEST_VERDICT_MACHINE comment verification_skipped_count "
+            "(Issue #1856 AC16)"
+        )
+
+        # TEST_VERDICT は diagnostics 専用であることが明記されていること。
+        assert "diagnostics" in text.lower() or "診断表示専用" in text, (
+            "pr-reviewer-lite.md must state TEST_VERDICT is diagnostics-only "
+            "(Issue #1856 AC16)"
+        )

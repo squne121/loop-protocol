@@ -27,10 +27,36 @@ producer/publisher/materializer/schema の物理削除は Phase 3（別 Issue、
 
 ### APPROVE 禁止条件（要約）
 
-- `verification_skipped_count > 0`
+- 独立実行 Issue VC（`independent_issue_vc`）の `verification_skipped_count > 0`
 - `SKIP:` / `exit 77`
 - `_*_fallback: true`
 - fallback 成功を PASS として扱う
 - `head_sha` stale
 - `CI_CHECK_RUN_SCOPED` が missing / skipped / neutral / cancelled / stale-head / unknown-classification
 - authoritative evidence（`CI_CHECK_RUN_SCOPED` または束縛済み独立実行 Issue VC）が一つも無い
+
+上記の `verification_skipped_count > 0` は、独立実行 Issue VC 自体の
+skipped 件数を指し、advisory な `TEST_VERDICT_MACHINE` コメントの
+`verification_skipped_count` フィールドを指さない（TEST_VERDICT は
+`may_block_approval: false` のため拒否根拠にしない。下記判定表を参照）。
+
+### 判定表（EVIDENCE_AUTHORITY_TABLE_V1、Issue #1856 Round 2 で明文化）
+
+以下は各 evidence source の authority を一意に定める判定表であり、
+本ドキュメント内の他記述と矛盾する場合はこの表を優先する。
+
+| evidence source | required | role | may_grant_approval | may_block_approval | may_change_routing |
+|---|---|---|---|---|---|
+| `current_head_required_ci`（`CI_CHECK_RUN_SCOPED` 相当） | always | authoritative | true | true | false |
+| `independent_issue_vc`（exact head SHA + literal command SHA256 束縛） | linked Issue に対象 VC がある場合 | authoritative | true | true | false |
+| `test_verdict`（`TEST_VERDICT_MACHINE`） | never | diagnostics_only | false | false | false |
+
+- `current_head_required_ci` と `independent_issue_vc` は「CI/VC のいずれも無い場合」に
+  fail-closed（`REQUEST_CHANGES`）の根拠になる。`current_head_required_ci` は常に
+  required、`independent_issue_vc` は linked Issue に対象 Verification Command が
+  存在する場合にのみ required（対象 VC が無い Issue では独立実行 VC 欠落を理由に
+  拒否しない）。
+- `test_verdict` は APPROVE の付与にも REQUEST_CHANGES の判断にも routing の変更にも
+  一切使わない（diagnostics 表示専用）。TEST_VERDICT コメントの有無・内容・
+  stale/SKIP 状態は、他の authoritative evidence が揃っていれば APPROVE を妨げず、
+  他の authoritative evidence が揃っていなければ APPROVE を与えない。
