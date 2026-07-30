@@ -102,7 +102,8 @@ def _run_command_side_effect_factory(commands):
     return _run
 
 
-def test_ac1_contract_snapshot_missing_routes_to_ensure_contract_snapshot():
+def test_ac1_contract_snapshot_missing_routes_to_proceed_to_step_1():
+    """#1851: missing_go is advisory -- it must not hard-block Step 1."""
     run_cmd = _run_command_side_effect_factory(
         [
             (0, _issue_view_json(), ""),
@@ -118,7 +119,7 @@ def test_ac1_contract_snapshot_missing_routes_to_ensure_contract_snapshot():
 
     assert exit_code == 0
     assert capsule["contract_snapshot"]["normalized_status"] == "missing_go"
-    assert capsule["next_action"]["route"] == "ensure_contract_snapshot"
+    assert capsule["next_action"]["route"] == "proceed_to_step_1"
     assert artifact["source_integrity"]["parse_warnings"]["invalid_json_lines_count"] == 0
 
 
@@ -171,7 +172,7 @@ def test_ac2_blocked_categories_from_ensure_contract_snapshot_result(tmp_path):
         "vc_no_tests_collected",
     ]
     assert capsule["contract_snapshot"]["contract_blocker_triage"]["schema"] == "CONTRACT_BLOCKER_TRIAGE_V1"
-    assert capsule["next_action"]["route"] == "run_contract_blocker_triage"
+    assert capsule["next_action"]["route"] == "proceed_to_step_1"
 
 
 def test_ac3_main_dirty_summary_shows_count_and_sample_only():
@@ -373,11 +374,13 @@ CONTRACT_REVIEW_RESULT_V1:
     assert capsule["next_action"]["route"] == "proceed_to_step_1"
 
 
-def test_ac3_go_without_fingerprint_routes_to_missing_go_not_proceed():
+def test_ac3_go_without_fingerprint_routes_to_missing_go_and_proceeds_advisory():
     """A trusted, schema-valid `status: go` that lacks a well-formed
     source-bound expected_contract_fingerprint must never be treated as a
-    loop-consumable fresh go -- it must route back to
-    ensure_contract_snapshot re-materialization instead."""
+    loop-consumable fresh go -- normalized_status stays missing_go so
+    ensure_contract_snapshot re-materialization is still recorded as the
+    correct remediation, but (#1851) routing itself is advisory and still
+    proceeds to Step 1."""
     go_body = """
 ```yaml
 CONTRACT_REVIEW_RESULT_V1:
@@ -403,7 +406,7 @@ CONTRACT_REVIEW_RESULT_V1:
 
     assert exit_code == 0
     assert capsule["contract_snapshot"]["normalized_status"] == "missing_go"
-    assert capsule["next_action"]["route"] == "ensure_contract_snapshot"
+    assert capsule["next_action"]["route"] == "proceed_to_step_1"
 
 
 def test_ac3_go_with_fingerprint_wrong_issue_number_routes_to_missing_go():
