@@ -1,0 +1,23 @@
+{
+  "schema": "CODEX_READONLY_AGENT_DISPATCH_SMOKE_V1",
+  "ac": "AC4",
+  "requested_agent_type": "codebase-investigator",
+  "dispatch_mechanism": "spawn_agent (collaboration namespace), not --profile",
+  "spawn_confirmed_via_rollout": true,
+  "spawn_agent_function_call_evidence": "readonly-agent-dispatch-parent-rollout.jsonl: function_call name=spawn_agent namespace=collaboration arguments.agent_type=codebase-investigator",
+  "subagent_session_meta_agent_role": "codebase-investigator",
+  "task_result": {
+    "read_config_toml_root_default_permissions": "loop-protocol-personal-dev (correct)",
+    "write_probe_tmp_readonly_agent_write_probe_txt": "denied: Rejected(\"approval required by policy, but AskForApproval is set to Never\")"
+  },
+  "caveat": "See custom-agent-dispatch-findings.json IMPORTANT_FINDING section: the sub-agent's own turn_context.permission_profile in its rollout mirrors the ROOT session's file_system entries rather than the loop-protocol-readonly agent-local declaration, so the write denial cannot be conclusively attributed to the declared read-only profile (vs. this host's broken OS-level sandbox, which denies all writes uniformly -- see root-runtime-probe.json). Dispatch itself (spawn_agent call with the correct agent_type, and a real reply from the spawned sub-thread) is confirmed; agent-local permission-profile *enforcement* by the native runtime is not.",
+  "evidence_files": [
+    "readonly-agent-dispatch-parent-rollout.jsonl",
+    "readonly-agent-dispatch-subagent-rollout.jsonl",
+    "readonly-agent-dispatch-exec-events.jsonl",
+    "readonly-agent-dispatch-prompt.txt"
+  ],
+  "tested_commit_sha": "22eb7f03d23607e93f1499b32df3722ec060799b",
+  "codex_version": "codex-cli 0.146.0",
+  "codex_binary_sha256": "2e863156ed35ecc5253b1e2f907a9143077b9f7cb51942070c61996471ff6e04"
+}

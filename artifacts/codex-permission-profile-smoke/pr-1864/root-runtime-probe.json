@@ -1,0 +1,60 @@
+{
+  "schema": "CODEX_ROOT_RUNTIME_PROBE_V1",
+  "codex_version": "codex-cli 0.146.0",
+  "codex_binary_path": "/home/squne/.local/bin/codex",
+  "codex_binary_realpath": "/home/squne/.codex/packages/standalone/releases/0.146.0-x86_64-unknown-linux-musl/bin/codex",
+  "invocation": "codex exec --json --skip-git-repo-check -C <worktree> - < prompt.txt",
+  "prompt_file": "root_probe_prompt.txt (not committed; scratchpad-only)",
+  "environment": "WSL2 (6.6.87.2-microsoft-standard-WSL2), HERDR_ENV=1",
+  "known_environment_limitation": "codex sandbox linux -- pwd fails with 'Failed to execvp linux: No such file or directory' (the documented self-binary ENOENT WSL2 issue in docs/dev/agent-runtime-ops.md; the /usr/local/bin/codex workaround requiring sudo install was not applied for this smoke, since privilege escalation is out of scope for this Issue). This means codex's OS-level sandbox subsystem does not function in this host, and codex exec (non-interactive, AskForApproval forced to Never) summarily REJECTS any command it classifies as requiring sandboxed-write approval, before execution, rather than actually sandboxing it.",
+  "results": [
+    {
+      "step": "workspace read",
+      "command": "echo workspace-read-ok && ls .codex/config.toml",
+      "outcome": "PASS",
+      "exit_code": 0,
+      "note": "confirms read access inside the workspace root works under the root default profile"
+    },
+    {
+      "step": "workspace write (/tmp)",
+      "command": "echo workspace-write-ok > /tmp/pr1864-root-probe-workspace-write.txt && cat ...",
+      "outcome": "SKIP_INCONCLUSIVE",
+      "reason": "rejected pre-execution with 'approval required by policy, but AskForApproval is set to Never' -- this is the broken sandbox subsystem's fail-closed behavior, not a permission-profile-attributable allow/deny decision. Cannot confirm filesystem write allow for system temporary directories via this invocation path."
+    },
+    {
+      "step": "slash-tmp write",
+      "command": "mkdir -p /tmp/pr1864-root-probe-slash-tmp && echo ... > .../probe.txt",
+      "outcome": "SKIP_INCONCLUSIVE",
+      "reason": "same as above: rejected pre-execution by the broken sandbox subsystem, not distinguishable from a permission-profile decision"
+    },
+    {
+      "step": "outside-workspace write ($HOME)",
+      "command": "echo outside-workspace-write-attempt > \"$HOME/pr1864-root-probe-outside-workspace.txt\"",
+      "outcome": "SKIP_INCONCLUSIVE",
+      "reason": "rejected pre-execution by the broken sandbox subsystem before any profile-level filesystem-boundary decision could be observed; cannot confirm this was denied *because* it is outside workspace roots (the expected :workspace semantics) as opposed to being denied for the same reason every other write in this probe was denied"
+    },
+    {
+      "step": "protected metadata write (.git/)",
+      "command": "echo git-metadata-write-attempt > .git/pr1864-root-probe-git.txt",
+      "outcome": "SKIP_INCONCLUSIVE",
+      "reason": "same as above -- rejected pre-execution by the broken sandbox subsystem, not distinguishable from a protected-metadata-specific deny"
+    },
+    {
+      "step": "allowlisted domain GET (api.github.com)",
+      "command": "curl -sS -o /dev/null -w \"%{http_code}\\n\" --max-time 10 https://api.github.com",
+      "outcome": "PASS_BUT_INCONCLUSIVE_FOR_DOMAIN_SPECIFICITY",
+      "http_status": 200,
+      "note": "network GET succeeded"
+    },
+    {
+      "step": "non-allowlisted domain GET (example.com)",
+      "command": "curl -sS -o /dev/null -w \"%{http_code}\\n\" --max-time 10 https://example.com",
+      "outcome": "FAIL_EXPECTED_BLOCK_NOT_OBSERVED",
+      "http_status": 200,
+      "note": "network GET also succeeded even though example.com is NOT in the loop-protocol-personal-dev.network.domains allowlist. This is an honest negative finding: in this WSL2 host with the broken linux sandbox subsystem, codex exec's network path does not appear to enforce the TOML-declared domain allowlist at all (both allowlisted and non-allowlisted domains succeeded identically). This could not be distinguished from a genuine profile misconfiguration using this invocation path alone, because the same host also cannot exercise the OS-level sandbox for filesystem writes. Per the Issue's fallback_policy ('loader-level smoke must not substitute for real dispatch'), this is reported as a FAIL/SKIP, not a fabricated PASS, and is NOT converted into a Stop Condition trigger on its own because it is confounded by the documented, pre-existing WSL2 sandbox-binary limitation rather than a clean demonstration that loop-protocol-personal-dev itself over-grants network access."
+    }
+  ],
+  "overall_assessment": "Read-path root filesystem access under loop-protocol-personal-dev is confirmed working (PASS). Write-boundary enforcement (workspace/tmp allow, outside-workspace/protected-metadata deny) and network domain-allowlist enforcement (allow vs block) could NOT be conclusively demonstrated via codex exec on this host, because the OS-level sandbox subsystem itself is broken here (pre-existing, documented WSL2 self-binary ENOENT issue, unrelated to this Issue's config changes). This is recorded as SKIP/inconclusive per Runtime Verification Applicability skip_conditions, not claimed as PASS.",
+  "tested_commit_sha": "22eb7f03d23607e93f1499b32df3722ec060799b",
+  "codex_binary_sha256": "2e863156ed35ecc5253b1e2f907a9143077b9f7cb51942070c61996471ff6e04"
+}
