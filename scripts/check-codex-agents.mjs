@@ -580,7 +580,28 @@ function validateAgents() {
   const hookBoundariesText = readOptionalText(hookBoundariesPath);
   const skillBoundariesText = readOptionalText(skillBoundariesPath);
 
-  assert(!configText.includes('\ndefault_permissions = '), 'config.toml must not claim an unverified root default permission profile', failures);
+  // Issue #1859: root default_permissions must be present and pinned to the
+  // built-in ":workspace" profile (active workspace roots + system temp
+  // dirs). Loader/skills-list breaks without a root default whenever
+  // [permissions.*] profiles are non-empty (#1849 regression). ":workspace"
+  // is deliberately narrower than the repository-defined loop-protocol-rtk
+  // profile (no GitHub/upload network allowlist), so an explicit rtk/
+  // danger-full-access root default is rejected below.
+  const rootDefaultPermissionsMatch = configText.match(/^default_permissions\s*=\s*(.+)$/m);
+  const rootDefaultPermissionsInFeatures = /\[features\][^[]*\bdefault_permissions\s*=/s.test(configText);
+  assert(
+    Boolean(rootDefaultPermissionsMatch) && !rootDefaultPermissionsInFeatures,
+    'config.toml must set root-scope default_permissions (before [features]) when [permissions] profiles are non-empty',
+    failures,
+  );
+  if (rootDefaultPermissionsMatch) {
+    const rootDefaultPermissionsValue = rootDefaultPermissionsMatch[1].trim();
+    assert(
+      rootDefaultPermissionsValue === '":workspace"',
+      `config.toml root default_permissions must be the built-in ":workspace" profile, got ${rootDefaultPermissionsValue}`,
+      failures,
+    );
+  }
   assert(configText.includes('[permissions.loop-protocol-readonly.filesystem]'), 'config.toml must define permissions.loop-protocol-readonly', failures);
   assert(configText.includes('.codex/hooks.json'), 'config.toml must mention .codex/hooks.json as the documented hook surface', failures);
   assert(!configText.includes('sandbox_mode'), 'config.toml must not use sandbox_mode when permission profiles are active', failures);
@@ -1198,8 +1219,8 @@ function runSelfTest() {
     const parsed = parseTomlFile(configPath);
     selfAssert(typeof parsed === 'object', 'config.toml: parses without error');
     selfAssert(
-      parsed.default_permissions === undefined,
-      'config.toml: root default_permissions remains advisory-absent',
+      parsed.default_permissions === ':workspace',
+      'config.toml: root default_permissions is the built-in ":workspace" profile',
     );
   } catch (e) {
     selfAssert(false, `config.toml: should parse cleanly (got: ${e.message})`);

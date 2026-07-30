@@ -29,6 +29,7 @@
     "scripts/agent-guards/tests/",
     "scripts/agent-ops/tests/",
     "tests/codex/test_codex_hook_surface_guard.py",
+    "tests/codex/test_codex_permission_profile_config.py",
     "tests/codex/test_execpolicy_matrix.py",
     "tests/codex/test_cleanup_exec_branch_only.py",
     "tests/codex/test_root_temporary_residue_advisory.py",

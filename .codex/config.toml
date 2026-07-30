@@ -1,5 +1,17 @@
 approval_policy = "on-request"
 
+# Issue #1859: root default_permissions restored after the #1849 P0
+# quarantine (which dropped the root default entirely and caused
+# `codex status` / `skills/list` to fail with "config defines [permissions]
+# profiles but does not set default_permissions"). ":workspace" is the
+# OpenAI-defined built-in profile (active workspace roots + system temporary
+# directories, read+write). This is deliberately narrower than the
+# repository-defined `loop-protocol-rtk` profile below (no GitHub/upload
+# network allowlist) and does not reopen the #1849 quarantine — hooks stay
+# limited to the passive SessionEnd/SubagentStop allowlist in
+# `.codex/hooks.json`.
+default_permissions = ":workspace"
+
 [features]
 hooks = true
 

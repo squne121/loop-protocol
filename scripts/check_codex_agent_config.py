@@ -129,6 +129,63 @@ def read_toml(path: Path) -> dict:
         return tomllib.load(fh)
 
 
+# Issue #1859: OpenAI-defined built-in permission profile names. ":workspace"
+# is the only one this repo pins as the root default (active workspace roots
+# + system temporary directories). ":danger-full-access" and legacy
+# `sandbox_mode` must never become the root default (see Out of Scope /
+# Stop Conditions).
+BUILTIN_PERMISSION_PROFILES = frozenset({":read-only", ":workspace", ":danger-full-access"})
+REQUIRED_ROOT_DEFAULT_PERMISSIONS = ":workspace"
+
+
+def assert_root_default_permissions(config: dict, config_text: str) -> list[str]:
+    """AC1/AC3/AC5/AC6: root `default_permissions` semantic contract.
+
+    - non-empty `[permissions]` requires a root-scope `default_permissions`.
+    - the value must be the built-in `:workspace` profile, or reference a
+      defined custom profile in `[permissions.*]` (undefined custom profiles
+      are rejected).
+    - `default_permissions` must live in the root TOML scope, not inside
+      `[features]` or any other misplaced table.
+    - legacy `sandbox_mode` must not coexist with permission profiles.
+    """
+    failures: list[str] = []
+    permissions = config.get("permissions", {})
+    root_default = config.get("default_permissions")
+
+    if permissions:
+        if root_default is None:
+            failures.append(
+                ".codex/config.toml: [permissions] profiles are defined but root "
+                "default_permissions is missing (Codex loader rejects this combination)"
+            )
+        else:
+            if root_default != REQUIRED_ROOT_DEFAULT_PERMISSIONS:
+                failures.append(
+                    f".codex/config.toml: root default_permissions must be "
+                    f"{REQUIRED_ROOT_DEFAULT_PERMISSIONS!r}, got {root_default!r}"
+                )
+            if root_default not in BUILTIN_PERMISSION_PROFILES and root_default not in permissions:
+                failures.append(
+                    f".codex/config.toml: root default_permissions references an "
+                    f"undefined custom profile: {root_default!r}"
+                )
+
+    features_match = re.search(r"^\[features\](.*?)(?=^\[|\Z)", config_text, re.MULTILINE | re.DOTALL)
+    if features_match and re.search(r"^default_permissions\s*=", features_match.group(1), re.MULTILINE):
+        failures.append(
+            ".codex/config.toml: default_permissions must not be placed inside [features] "
+            "(misplacement makes it inert)"
+        )
+
+    if "sandbox_mode" in config:
+        failures.append(
+            ".codex/config.toml: legacy sandbox_mode must not coexist with permission profiles"
+        )
+
+    return failures
+
+
 def extract_runtime_field(instructions: str, field: str) -> str | None:
     match = re.search(rf"{re.escape(field)}:\s*([a-zA-Z0-9._|-]+)", instructions)
     return match.group(1) if match else None
@@ -391,6 +448,7 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
     failures.extend(find_duplicate_canonical_targets(deduped_surface_paths))
     if config.get("agents", {}).get("max_depth") != 1:
         failures.append(".codex/config.toml: [agents].max_depth must be 1")
+    failures.extend(assert_root_default_permissions(config, CONFIG_PATH.read_text(encoding="utf-8")))
 
     if sorted(hooks.keys()) != ["hooks"]:
         failures.append(f".codex/hooks.json: root keys must be exactly ['hooks'], got {sorted(hooks.keys())!r}")

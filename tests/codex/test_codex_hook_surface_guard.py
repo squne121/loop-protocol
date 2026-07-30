@@ -22,7 +22,16 @@ def test_project_config_keeps_hooks_and_standard_approval() -> None:
     text = CONFIG_TOML.read_text()
     assert 'approval_policy = "on-request"' in text
     assert "hooks = true" in text
-    assert "default_permissions =" not in text
+    # Issue #1859: the root default_permissions must be restored (the #1849
+    # quarantine dropped it entirely, breaking `codex status` / `skills/list`
+    # whenever [permissions] profiles are non-empty). It is pinned to the
+    # built-in ":workspace" profile, not the repository-defined
+    # loop-protocol-rtk profile (which additionally allows a GitHub/upload
+    # network allowlist that must stay opt-in per custom agent).
+    assert 'default_permissions = ":workspace"' in text
+    # The root default must appear before [features] (root TOML scope), not
+    # inside it (misplacement would silently make it inert).
+    assert text.index('default_permissions = ":workspace"') < text.index("[features]")
 
 
 def test_passive_hook_validator_passes() -> None:
