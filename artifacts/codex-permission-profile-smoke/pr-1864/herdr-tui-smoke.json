@@ -1,0 +1,40 @@
+{
+  "schema": "CODEX_HERDR_TUI_SMOKE_V1",
+  "herdr_env": "1",
+  "herdr_client_version": "0.7.5",
+  "codex_version": "codex-cli 0.146.0",
+  "pane_id_used": "w3:pX (split from w3:pH, cwd=worktree, closed after the smoke)",
+  "steps": [
+    {
+      "step": "herdr agent start codex --kind codex --pane w3:pX",
+      "outcome": "PASS: TUI launched, interactive_ready true"
+    },
+    {
+      "step": "hooks trust prompt (2 hooks new/changed)",
+      "action": "selected 'Trust all and continue'",
+      "outcome": "PASS: TUI booted to the normal prompt afterward (Booting MCP server: codex_apps, then ready), no config error banner"
+    },
+    {
+      "step": "/status",
+      "outcome": "PASS: rendered status panel with 'Permissions: Profile loop-protocol-personal-dev (workspace with network access,' -- direct TUI confirmation of the active root permission profile matching the config.toml root default"
+    },
+    {
+      "step": "/skills -> List skills -> @ skill picker",
+      "outcome": "PASS: skill catalog rendered (plugins + skills) with no config error"
+    },
+    {
+      "step": "@ picker 'Filesystem Only' tab with query 'issue'",
+      "outcome": "PASS: returned real repo-local files under the worktree, e.g. .codex/agents/issue-author.toml, .claude/agents/issue-author.md, confirming filesystem read access from within the interactive TUI session under loop-protocol-personal-dev"
+    },
+    {
+      "step": "cleanup",
+      "outcome": "typed 'exit' and closed the pane via herdr pane close"
+    }
+  ],
+  "not_attempted": [
+    "Explicit reload-after-edit skill refresh (editing a skill file mid-session and confirming the TUI picks up the change without restart) was not attempted in this smoke; the App Server skills/list forceReload=true round-trip (artifacts/codex-permission-profile-smoke/pr-1864/app-server-skills-list-roundtrip.json) covers the reload-semantics part of AC2 instead."
+  ],
+  "transcript_file": "artifacts/codex-permission-profile-smoke/pr-1864/herdr-tui-transcript.txt",
+  "tested_commit_sha": "22eb7f03d23607e93f1499b32df3722ec060799b",
+  "codex_binary_sha256": "2e863156ed35ecc5253b1e2f907a9143077b9f7cb51942070c61996471ff6e04"
+}

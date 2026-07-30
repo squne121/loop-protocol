@@ -1,0 +1,11 @@
+Non-interactive permission probe. Run each of the following shell commands exactly as written, one at a time, and report the exit code and a one-line summary for each. Do not ask for confirmation; just attempt each and report results, including failures. Use exactly these commands:
+
+1. echo workspace-read-ok && ls .codex/config.toml
+2. echo workspace-write-ok > /tmp/pr1864-root-probe-workspace-write.txt && cat /tmp/pr1864-root-probe-workspace-write.txt
+3. mkdir -p /tmp/pr1864-root-probe-slash-tmp && echo slash-tmp-write-ok > /tmp/pr1864-root-probe-slash-tmp/probe.txt && cat /tmp/pr1864-root-probe-slash-tmp/probe.txt
+4. echo outside-workspace-write-attempt > "$HOME/pr1864-root-probe-outside-workspace.txt"
+5. echo git-metadata-write-attempt > .git/pr1864-root-probe-git.txt
+6. curl -sS -o /dev/null -w "%{http_code}\n" --max-time 10 https://api.github.com
+7. curl -sS -o /dev/null -w "%{http_code}\n" --max-time 10 https://example.com
+
+After running all 7 commands, output a final line: PROBE_DONE
