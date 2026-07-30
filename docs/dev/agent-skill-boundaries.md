@@ -16,7 +16,7 @@ worker や CI/review/security/permission/publication の safety stop と混同�
 | freshness verifier | source completeness、digest、body/updatedAt を確認し stale/incomplete/invalid を再収集へ route | collision 観測を推測すること |
 | conflict observer | SHA 束縛された Git conflict と GitHub merge readiness を観測 | `UNKNOWN` / null / `BLOCKED` / `DRAFT` / `BEHIND` を conflict と正規化すること |
 | merge-readiness consumer | GitHub の `mergeable_state` と `merge_state_status` を別 field で consume | semantic planning を再分類すること |
-| open-pr consumer | existing hard gate と unsafe-decision mutation deny を維持し、legacy/V1 digest equivalence を fail-closed で扱う | new decision 導入前に旧 checker を除去すること |
+| open-pr consumer | canonical repository 解決（`resolve_canonical_repository()`）と evidence の `repository` field binding 検証を fail-closed hard gate として維持し、legacy/V1 digest equivalence を fail-closed で扱う。overlap preflight evidence 自体の妥当性検証（stored/fresh hash・drift・collection contract・safety predicate route）は advisory（PR 作成は継続し WARNING として記録・PR コメントへ永続化、#1851） | new decision 導入前に旧 checker を除去すること、canonical repository 解決失敗時に raw repo へフォールバックすること |
 
 ## SubAgent 役割分類と permissionMode 一覧
 

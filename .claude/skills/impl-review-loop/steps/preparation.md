@@ -75,12 +75,12 @@ IMPL_REVIEW_INTAKE_CAPSULE_V1:
 
 ## 0. Intake Gate — `CONTRACT_REVIEW_RESULT_V1 status: go` 必須検査
 
-`impl-review-loop` preparation の最初のゲート。以下の 5 つのサブ理由を **優先順位の高い順**に評価し、いずれかに該当する場合は `intake_gate_failed` として停止する。後続ステップへは進まない。
+`impl-review-loop` preparation の最初のゲート。以下の 4 つのサブ理由を **優先順位の高い順**に評価し、いずれかに該当する場合は `intake_gate_failed` として停止する。後続ステップへは進まない。`contract_snapshot_url` の欠落や `CONTRACT_REVIEW_RESULT_V1 status: go` が検出できないこと自体は、本ファイル冒頭の Issue #1830 precedence（L1-17）に従い任意 telemetry として扱い、単独では停止理由にしない（#1851）。
 
 ```yaml
 INTAKE_GATE_RESULT_V1:
   status: pass | intake_gate_failed
-  subreason: null | metadata_not_ready | missing_contract_go | stale_contract_review | body_snapshot_mismatch | request_changes_after_go
+  subreason: null | metadata_not_ready | stale_contract_review | body_snapshot_mismatch | request_changes_after_go
   detail: "<人間向け説明>"
 ```
 
@@ -102,90 +102,7 @@ gh issue view <issue_number> --json title,labels \
 
 どちらか一方でも欠落していれば `intake_gate_failed: metadata_not_ready` で停止。
 
-#### 2. `missing_contract_go`（契約go判定が未検出の状態）
-
-`contract_snapshot_url` が提供されておらず、Issue コメントにも有効な `CONTRACT_REVIEW_RESULT_V1 status: go` が存在しない場合。
-
-- `contract_snapshot_url` 未提供 → Issue コメントを自動検出しても `status: go` の valid block が見つからない
-- この場合は `ensure_contract_snapshot` を呼び出して contract snapshot の自動 materialize を試みる
-
-> **設計決定 (#817)**: `missing_contract_go` 判定時は `ensure_contract_snapshot.py` へ routing する。
-> `ensure_contract_snapshot` の結果に応じて以下の分岐をたどる:
->
-> ```bash
-> uv run python3 .claude/skills/impl-review-loop/scripts/ensure_contract_snapshot.py \
->   --issue-number <issue_number> \
->   --repo <owner/repo> \
->   --mode auto \
->   --post
-> ```
->
-> `termination_reason` 有効値（`null | approved | max_iterations | human_escalation | intake_gate_failed`）は routing 結果に基づいて LOOP_STATE へ記録する。
->
-> | ensure_contract_snapshot 結果 | exit code | routing |
-> |---|---|---|
-> | `status: ok` (source: existing_go \| materialized_go) | 0 | contract_snapshot_url を LOOP_STATE に記録して Step 1 へ |
-> | `status: blocked_needs_refinement` | 10 | `intake_gate_failed: missing_contract_go` で停止。`contract_review_once_result.vc_preflight_classifications[]` がある場合のみ `triage_contract_blockers.py` で短い triage summary を生成し、人間に refinement を依頼 |
-> | `status: human_judgment` | 20 | 即停止。`termination_reason: human_escalation` を記録して人間判断へ |
-> | `status: stale_or_conflicting_snapshot` (exit 50) | 50 | 即停止。Issue body が materialization 中に更新された。人間判断へ |
-> | `status: runtime_error` | 40 | 即停止。環境エラーを記録して人間判断へ |
->
-> **旧設計との差分**: #564 以前の旧設計（fail-only gate）では `missing_contract_go` で無条件停止していた。
-> #817 以降は `ensure_contract_snapshot` への自動 routing を経由する。
-> `ensure_contract_snapshot` が ok を返した場合のみ、`LOOP_STATE.contract_snapshot_source: materialized_by_issue_contract_review` を記録してループを継続する。
-
-#### `blocked_needs_refinement` の triage normalizer（分類結果の要約処理・#959）
-
-`ensure_contract_snapshot` が `status: blocked_needs_refinement` を返した場合、preparation は **preflight の再実行や GitHub mutation を行わず**、既存の blocked evidence を `triage_contract_blockers.py` へ渡して short summary に正規化してよい。
-
-- 本 normalizer は **new classifier ではなく `normalizer_router`** として扱う。`vc_preflight.classifications[]` / `vc_preflight_classifications[]` / `baseline_vc_preflight/v1.results[]` を消費するだけで、raw command result の再分類はしない。
-- Section 6 の `vc_preflight.status: blocked` routing とは責務が異なる。本節は **Step 0 / `missing_contract_go`** で止まったとき専用、Section 6 は **`status: go` 受信後の Step 1-c** 専用。
-- accepted input:
-  - `CONTRACT_SNAPSHOT_ENSURE_RESULT_V1.contract_review_once_result.vc_preflight_classifications[]`
-  - `CONTRACT_REVIEW_ONCE_RESULT_V1.vc_preflight_classifications[]`
-  - `CONTRACT_REVIEW_RESULT_V1.checks.vc_preflight.classifications[]`（scalar は unsupported）
-  - `baseline_vc_preflight/v1.results[]`
-- unsupported input:
-  - `source: latest_blocked` で `contract_snapshot_url` しかない snapshot-only payload
-  - scalar-only `CONTRACT_REVIEW_RESULT_V1.checks.vc_preflight`
-- preparation が LOOP_STATE に記録するのは `CONTRACT_BLOCKER_TRIAGE_V1` の route key と **短い triage summary のみ**。raw stdout/stderr は埋め込まない（raw stdout / stderr を埋め込まない）。
-- `CONTRACT_BLOCKER_TRIAGE_V1` の route key には `aggregate_reason`, `step1_allowed`, `termination_reason`, `intake_gate_subreason`, `issue_refinement_recommended`, `environment_retry_recommended`, `body_author_fixable`, `suggested_actions`, `per_ac`, `source_integrity`, `mutation_free` を含める。
-- `aggregate_reason: mixed` は `step1_allowed: false` のまま停止し、human review を required route とする。
-
-minimum CLI invocation（最小限のコマンド実行例）:
-
-```bash
-python3 .claude/skills/impl-review-loop/scripts/triage_contract_blockers.py \
-  --input-file "$CONTRACT_SNAPSHOT_ENSURE_RESULT_FILE" \
-  > "$CONTRACT_BLOCKER_TRIAGE_FILE"
-```
-
-normalizer 実行後は次を機械的に検査する:
-
-```text
-schema == CONTRACT_BLOCKER_TRIAGE_V1
-status == ok
-source_integrity.evidence_complete == true
-step1_allowed == false
-```
-
-`unsupported_input` / `incomplete_evidence` / `invalid_input` / invalid JSON / non-zero exit はすべて fail-closed で `human_escalation` に route する。
-
-推奨する埋め込み形は次のとおり:
-
-```yaml
-intake_gate:
-  status: intake_gate_failed
-  subreason: missing_contract_go
-  contract_blocker_triage:
-    schema: CONTRACT_BLOCKER_TRIAGE_V1
-    aggregate_reason: mixed
-    step1_allowed: false
-    summary: "AC1 pytest exit 5 requires VC refinement; AC2 pnpm no-TTY is an environment artifact."
-    suggested_next_action: human_review
-```
-
-#### 3. `stale_contract_review`（陳腐化した契約レビュー）
+#### 2. `stale_contract_review`（陳腐化した契約レビュー）
 
 `CONTRACT_REVIEW_RESULT_V1.status == "go"` のコメントが存在するが、freshness チェックに失敗した場合:
 
@@ -194,12 +111,12 @@ intake_gate:
 
 いずれかの条件が真の場合は `intake_gate_failed: stale_contract_review` で停止し、`issue-contract-review` の再実行を人間に依頼する。
 
-#### 4. `body_snapshot_mismatch`（本文スナップショット不一致）
+#### 3. `body_snapshot_mismatch`（本文スナップショット不一致）
 
 `contract_snapshot_url` が明示的に提供され、かつ上記 freshness チェックで body_sha256 または generated_at の不一致が検出された場合。  
 （ステップ 3 の freshness チェックがコメント自動検出時に対応し、本サブ理由は明示提供 URL が stale な場合に使用）
 
-#### 5. `request_changes_after_go`（最低優先）
+#### 4. `request_changes_after_go`（最低優先）
 
 `status: go` のコメントより新しい `CONTRACT_REVIEW_RESULT_V1.status: blocked` または明示的な go 無効化 marker が存在する場合。
 
@@ -238,7 +155,7 @@ on_intake_gate_failed:
 ```yaml
 intake_gate:
   status: pass | intake_gate_failed
-  subreason: null | metadata_not_ready | missing_contract_go | stale_contract_review | body_snapshot_mismatch | request_changes_after_go
+  subreason: null | metadata_not_ready | stale_contract_review | body_snapshot_mismatch | request_changes_after_go
   evaluated_at: "<ISO8601>"
 ```
 
@@ -303,8 +220,7 @@ gh api --paginate \
 
 **ステップ 3: 既存 `status: go` が存在しない場合**
 
-Step 0 の intake gate で `missing_contract_go` が検出された場合は、`ensure_contract_snapshot` を呼び出す（Section 2 の `missing_contract_go` 分岐を参照）。
-Step 0 を通過して Step 1-b に到達するのは `contract_snapshot_url` が提供済みの場合のみのため、ここには通常到達しない。
+`status: go` の有効な block が検出できない場合でも、Issue #1830 precedence（本ファイル冒頭 L1-17）に従い `contract_snapshot_url` は任意 telemetry として扱う。live Issue contract（Outcome / Acceptance Criteria / Verification Commands / Allowed Paths / Stop Conditions）が確認できれば停止せず、`LOOP_STATE.contract_snapshot_source: none` を記録して Step 1 へ進む（#1851）。
 
 > **スコープ境界（#245 との関係）**: #245 のプリフライトで `contract_snapshot_url` 未提供問題が再現したため、本 Issue（#149）は contract snapshot materialization の canonical fix として扱う。一方で、#245 で観察された環境固有の ready tuple / 関連調整（#245 は session-recording docs Issue）は本 Issue の対象外であり、別 Issue または #245 側の refinement で扱う。本ステップは contract snapshot の取得（materialization）のみを担う。
 
@@ -588,7 +504,7 @@ LOOP_STATE:
   termination_reason: null
   intake_gate:
     status: pass | intake_gate_failed
-    subreason: null | metadata_not_ready | missing_contract_go | stale_contract_review | body_snapshot_mismatch | request_changes_after_go
+    subreason: null | metadata_not_ready | stale_contract_review | body_snapshot_mismatch | request_changes_after_go
     evaluated_at: "<ISO8601>"
   product_spec_preflight:
     source: contract_snapshot.checks.product_spec_check

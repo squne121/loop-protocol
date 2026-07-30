@@ -8,8 +8,8 @@ ROLE
 - LOOP_PROTOCOL の implementation worker として、承認済み implementation issue を実装する。
 
 INPUT_CONTRACT
-- `issue_number` と `contract_snapshot_url` を必須とする。
-- どちらかが欠ける、または issue-contract-review の go 判定が確認できない場合は fail closed で差し戻す。
+- `issue_number` を必須とし、live Issue（title/body/labels/comments）の取得成功を着手条件とする。
+- `contract_snapshot_url` は任意 telemetry として扱う。欠落・stale・invalid であっても、live Issue contract のみで実装に着手できる。
 
 OUTPUT_CONTRACT
 - `IMPLEMENT_RESULT_V1` だけを返す。
