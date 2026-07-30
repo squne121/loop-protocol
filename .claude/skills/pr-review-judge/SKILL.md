@@ -24,9 +24,7 @@ description: implementation child issue に紐づく PR をレビューし、lin
 
 ### 2) Mergeability 取得
 
-優先: TEST_VERDICT_MACHINE のコメント。
-
-見つからない場合のみ `gh pr view --json mergeable,mergeStateStatus` を利用。
+**Issue #1856（evidence authority cutover, Phase 1）**: `gh pr view --json mergeable,mergeStateStatus` を authoritative source として直接利用する（TEST_VERDICT_MACHINE の有無に依存しない）。BEHIND ルーティングは `merge_state_status == "BEHIND"` のみで判定し、`route_loop_verdict_v2()` は TEST_VERDICT の `branch_behind_main` を参照しない。
 
 判定:
 
@@ -36,17 +34,18 @@ description: implementation child issue に紐づく PR をレビューし、lin
 
 ### 3) VC 証拠ポリシー（PR_REVIEW_JUDGE_VC_EVIDENCE_POLICY）
 
-優先順位:
+**Issue #1856（evidence authority cutover, Phase 1）**: authoritative な証拠は以下の2系列のみ。`TEST_VERDICT_MACHINE` は advisory（non-authoritative）に降格した（詳細は `references/evidence-policy.md`）。
 
-1. 最優先は `TEST_VERDICT_MACHINE`
-2. 次点は `CI_CHECK_RUN_SCOPED`
+1. `CI_CHECK_RUN_SCOPED`（current-head, `expected_head_sha` / `check_run_id` 束縛）
+2. exact head SHA + literal command SHA256 に束縛された独立実行 Issue VC
 3. 補助報告は `PR_BODY_SELF_REPORT`（単独では APPROVE 不可）
+4. `TEST_VERDICT_MACHINE`（advisory のみ。APPROVE の必須条件にも REQUEST_CHANGES 回避の根拠にもしない）
 
 - APPROVE 禁止条件
   - `verification_skipped_count > 0`
   - `SKIP:` / `exit 77`
   - `_*_fallback: true` など fallback/偽装成功
-  - TEST_VERDICT head が stale
+  - `CI_CHECK_RUN_SCOPED` head が stale、または missing / skipped / neutral / cancelled / unknown-classification
 
 ### 4) CI 証拠
 

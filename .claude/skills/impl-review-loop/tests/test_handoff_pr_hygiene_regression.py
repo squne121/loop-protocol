@@ -421,10 +421,7 @@ class TestAC5BehindMergeableRequiredAutoActionsUpdateBranch:
 
         production consumer に branch_behind_main=True を渡して route_to_update_branch を確認する。
         """
-        result = route_loop_verdict_v2(
-            _LOOP_VERDICT_V2_BEHIND,
-            test_verdict={"branch_behind_main": True},
-        )
+        result = route_loop_verdict_v2(_LOOP_VERDICT_V2_BEHIND)
         assert result.route == "route_to_update_branch", (
             f"BEHIND + MERGEABLE verdict must route to update_branch (not '{result.route}'). "
             f"errors: {result.errors}. "
@@ -433,10 +430,7 @@ class TestAC5BehindMergeableRequiredAutoActionsUpdateBranch:
 
     def test_behind_not_approved_after_pass(self):
         """AC5 after-pass: BEHIND verdict で termination_reason: approved が立たないこと。"""
-        result = route_loop_verdict_v2(
-            _LOOP_VERDICT_V2_BEHIND,
-            test_verdict={"branch_behind_main": True},
-        )
+        result = route_loop_verdict_v2(_LOOP_VERDICT_V2_BEHIND)
         assert result.route != "approved", (
             f"BEHIND verdict must NOT route to 'approved'. Got: '{result.route}'. "
             f"APPROVE + BEHIND must not set termination_reason: approved."
@@ -737,10 +731,7 @@ def test_behind_mergeable_routes_to_update_branch():
       result: pass
       fixture: _LOOP_VERDICT_V2_BEHIND (inline)
     """
-    result = route_loop_verdict_v2(
-        _LOOP_VERDICT_V2_BEHIND,
-        test_verdict={"branch_behind_main": True},
-    )
+    result = route_loop_verdict_v2(_LOOP_VERDICT_V2_BEHIND)
     assert result.route == "route_to_update_branch", (
         f"BEHIND + MERGEABLE must route to update_branch (got '{result.route}'). "
         f"errors: {result.errors}"
@@ -754,10 +745,7 @@ def test_behind_mergeable_not_approved():
       version: 1
       result: pass
     """
-    result = route_loop_verdict_v2(
-        _LOOP_VERDICT_V2_BEHIND,
-        test_verdict={"branch_behind_main": True},
-    )
+    result = route_loop_verdict_v2(_LOOP_VERDICT_V2_BEHIND)
     assert result.route != "approved", (
         "BEHIND verdict must NOT route to 'approved'"
     )

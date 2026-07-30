@@ -92,6 +92,12 @@ gh pr view <PR番号> --json body --jq '.body' | grep -E "(Closes|Fixes|Resolves
 
 ### Gate 2: CI 確認
 
+**Issue #1856（evidence authority cutover, Phase 1）**: この Gate の authoritative
+evidence は `gh pr checks`（`CI_CHECK_RUN_SCOPED` 相当）である。以下の
+`TEST_VERDICT_MACHINE` コメントによるフォールバックは、GitHub Actions が
+未設定の場合のみ使用する advisory な代替経路であり、TEST_VERDICT の有無・内容が
+publish/write authority を持つわけではない。
+
 ```bash
 gh pr checks <PR番号>
 ```
@@ -100,7 +106,7 @@ gh pr checks <PR番号>
 - `fail` / `failure` が存在 → `REQUEST_CHANGES`（CI fail）
 - CI チェックなし / `pending` のみ → `REQUEST_CHANGES`（CI 証跡なし）
 
-フォールバック（GitHub Actions 未設定時）:
+フォールバック（GitHub Actions 未設定時、advisory）:
 ```bash
 VERDICT_BODY=$(gh pr view <PR番号> --json comments --jq \
   '[.comments[] | select(.body | contains("<!-- TEST_VERDICT_MACHINE v1 -->"))] | last | .body // empty')

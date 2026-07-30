@@ -4,9 +4,14 @@ Fixture-driven unit tests for route_loop_verdict_v2 production consumer.
 Issue #777: Exercises the positive/negative fixture files in this directory
 against the production consumer module.
 
+Issue #1856 (AC1): route_loop_verdict_v2() no longer accepts a test_verdict
+argument. Fixture files may still carry a legacy `test_verdict` key (kept
+for historical readability / other consumers) but this test module does not
+pass it to the production consumer; BEHIND routing is derived solely from
+loop_verdict.mergeability.merge_state_status.
+
 Each fixture file defines:
   - loop_verdict: LOOP_VERDICT_V2 dict
-  - test_verdict: optional TEST_VERDICT_MACHINE/v1 dict or null
   - expected.route: expected RouteDecision.route value
   - expected.fail_closed: expected RouteDecision.fail_closed value
   - expected.reason_code_prefix: optional prefix match for RouteDecision.reason_code
@@ -50,7 +55,6 @@ def test_positive_approved():
     fx = _load_fixture("positive_approved.yml")
     result = route_loop_verdict_v2(
         fx["loop_verdict"],
-        test_verdict=fx.get("test_verdict"),
     )
     assert result.route == fx["expected"]["route"], (
         f"Expected route '{fx['expected']['route']}', got '{result.route}'. errors: {result.errors}"
@@ -63,7 +67,6 @@ def test_positive_update_branch():
     fx = _load_fixture("positive_update_branch.yml")
     result = route_loop_verdict_v2(
         fx["loop_verdict"],
-        test_verdict=fx.get("test_verdict"),
     )
     assert result.route == fx["expected"]["route"], (
         f"Expected route '{fx['expected']['route']}', got '{result.route}'. errors: {result.errors}"
@@ -78,7 +81,6 @@ def test_positive_body_only_ensure_closing_keyword():
     fx = _load_fixture("positive_body_only_ensure_closing_keyword.yml")
     result = route_loop_verdict_v2(
         fx["loop_verdict"],
-        test_verdict=fx.get("test_verdict"),
     )
     assert result.route == fx["expected"]["route"], (
         f"Expected route '{fx['expected']['route']}', got '{result.route}'. errors: {result.errors}"
@@ -92,7 +94,6 @@ def test_positive_body_only_update_pr_body_hygiene():
     fx = _load_fixture("positive_body_only_update_pr_body_hygiene.yml")
     result = route_loop_verdict_v2(
         fx["loop_verdict"],
-        test_verdict=fx.get("test_verdict"),
     )
     assert result.route == fx["expected"]["route"], (
         f"Expected route '{fx['expected']['route']}', got '{result.route}'. errors: {result.errors}"
@@ -105,7 +106,6 @@ def test_positive_continue_loop():
     fx = _load_fixture("positive_continue_loop.yml")
     result = route_loop_verdict_v2(
         fx["loop_verdict"],
-        test_verdict=fx.get("test_verdict"),
     )
     assert result.route == fx["expected"]["route"], (
         f"Expected route '{fx['expected']['route']}', got '{result.route}'"
@@ -143,77 +143,72 @@ def _assert_fail_closed(result: RouteDecision, expected: dict, fixture_name: str
 def test_negative_wrong_executor():
     """negative_wrong_executor.yml: wrong executor → fail-closed."""
     fx = _load_fixture("negative_wrong_executor.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    result = route_loop_verdict_v2(fx["loop_verdict"])
     _assert_fail_closed(result, fx["expected"], "negative_wrong_executor")
 
 
 def test_negative_wrong_skill():
     """negative_wrong_skill.yml: wrong skill value → fail-closed."""
     fx = _load_fixture("negative_wrong_skill.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    result = route_loop_verdict_v2(fx["loop_verdict"])
     _assert_fail_closed(result, fx["expected"], "negative_wrong_skill")
 
 
 def test_negative_skill_no_subcommand():
     """negative_skill_no_subcommand.yml: skill=implement-issue (no subcommand) → fail-closed (AC4)."""
     fx = _load_fixture("negative_skill_no_subcommand.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    result = route_loop_verdict_v2(fx["loop_verdict"])
     _assert_fail_closed(result, fx["expected"], "negative_skill_no_subcommand")
 
 
 def test_negative_missing_skill():
     """negative_missing_skill.yml: missing skill field → fail-closed."""
     fx = _load_fixture("negative_missing_skill.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    result = route_loop_verdict_v2(fx["loop_verdict"])
     _assert_fail_closed(result, fx["expected"], "negative_missing_skill")
 
 
 def test_negative_unknown_kind():
     """negative_unknown_kind.yml: unknown kind → fail-closed."""
     fx = _load_fixture("negative_unknown_kind.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    result = route_loop_verdict_v2(fx["loop_verdict"])
     _assert_fail_closed(result, fx["expected"], "negative_unknown_kind")
 
 
 def test_negative_apply_pr_review_fix_delta():
     """negative_apply_pr_review_fix_delta.yml: rejected kind → fail-closed."""
     fx = _load_fixture("negative_apply_pr_review_fix_delta.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    result = route_loop_verdict_v2(fx["loop_verdict"])
     _assert_fail_closed(result, fx["expected"], "negative_apply_pr_review_fix_delta")
 
 
 def test_negative_body_only_action_behind():
     """negative_body_only_action_behind.yml: body-only action while BEHIND → fail-closed."""
     fx = _load_fixture("negative_body_only_action_behind.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    result = route_loop_verdict_v2(fx["loop_verdict"])
     _assert_fail_closed(result, fx["expected"], "negative_body_only_action_behind")
 
 
 def test_negative_multiple_actions():
     """negative_multiple_actions.yml: multiple required_auto_actions → fail-closed."""
     fx = _load_fixture("negative_multiple_actions.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    result = route_loop_verdict_v2(fx["loop_verdict"])
     _assert_fail_closed(result, fx["expected"], "negative_multiple_actions")
 
 
-def test_negative_branch_behind_true_clean():
-    """negative_branch_behind_true_clean.yml: branch_behind_main=true + CLEAN → AC6 invariant fail-closed."""
-    fx = _load_fixture("negative_branch_behind_true_clean.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
-    _assert_fail_closed(result, fx["expected"], "negative_branch_behind_true_clean")
-
-
-def test_negative_branch_behind_false_behind():
-    """negative_branch_behind_false_behind.yml: branch_behind_main=false + BEHIND → AC6 invariant fail-closed."""
-    fx = _load_fixture("negative_branch_behind_false_behind.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
-    _assert_fail_closed(result, fx["expected"], "negative_branch_behind_false_behind")
+# Issue #1856: the historical branch_behind_main / merge_state_status
+# cross-check (negative_branch_behind_true_clean.yml /
+# negative_branch_behind_false_behind.yml, both outside this Issue's
+# Allowed Paths) has been removed together with the test_verdict
+# argument. merge_state_status-only BEHIND/action consistency (AC2) is
+# covered by
+# test_route_loop_verdict_v2_merge_state_status_only.py::test_behind_action_consistency_without_branch_behind_main.
 
 
 def test_negative_string_list_actions():
     """negative_string_list_actions.yml: required_auto_actions as string-list → schema_invalid (AC7)."""
     fx = _load_fixture("negative_string_list_actions.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    result = route_loop_verdict_v2(fx["loop_verdict"])
     _assert_fail_closed(result, fx["expected"], "negative_string_list_actions")
 
 
@@ -225,7 +220,7 @@ def test_negative_string_list_actions():
 def test_negative_expected_head_sha_mismatch():
     """negative_expected_head_sha_mismatch.yml: expected_head_sha != reviewed_head_sha → fail-closed."""
     fx = _load_fixture("negative_expected_head_sha_mismatch.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    result = route_loop_verdict_v2(fx["loop_verdict"])
     _assert_fail_closed(result, fx["expected"], "negative_expected_head_sha_mismatch")
 
 
@@ -237,34 +232,22 @@ def test_negative_expected_head_sha_mismatch():
 def test_negative_missing_mechanical():
     """negative_missing_mechanical.yml: mechanical field absent → fail-closed."""
     fx = _load_fixture("negative_missing_mechanical.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    result = route_loop_verdict_v2(fx["loop_verdict"])
     _assert_fail_closed(result, fx["expected"], "negative_missing_mechanical")
 
 
 def test_negative_mechanical_false():
     """negative_mechanical_false.yml: mechanical=false → fail-closed."""
     fx = _load_fixture("negative_mechanical_false.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    result = route_loop_verdict_v2(fx["loop_verdict"])
     _assert_fail_closed(result, fx["expected"], "negative_mechanical_false")
 
 
-# ---------------------------------------------------------------------------
-# Blocker 4: merge_state_status=BEHIND requires test_verdict with branch_behind_main
-# ---------------------------------------------------------------------------
-
-
-def test_negative_behind_missing_branch_behind_main():
-    """negative_behind_missing_branch_behind_main.yml: BEHIND + test_verdict=None → fail-closed."""
-    fx = _load_fixture("negative_behind_missing_branch_behind_main.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
-    _assert_fail_closed(result, fx["expected"], "negative_behind_missing_branch_behind_main")
-
-
-def test_negative_behind_branch_behind_main_key_absent():
-    """negative_behind_branch_behind_main_key_absent.yml: BEHIND + branch_behind_main key missing → fail-closed."""
-    fx = _load_fixture("negative_behind_branch_behind_main_key_absent.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
-    _assert_fail_closed(result, fx["expected"], "negative_behind_branch_behind_main_key_absent")
+# Issue #1856 (AC2): negative_behind_missing_branch_behind_main.yml /
+# negative_behind_branch_behind_main_key_absent.yml have been
+# repurposed for merge_state_status-only BEHIND/action consistency and
+# are now exercised by
+# test_route_loop_verdict_v2_merge_state_status_only.py::test_behind_action_consistency_without_branch_behind_main.
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +262,7 @@ def test_negative_request_changes_with_malformed_update_branch_action():
     required_auto_actions. Action field validation only runs under APPROVE.
     """
     fx = _load_fixture("negative_request_changes_with_malformed_update_branch_action.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    result = route_loop_verdict_v2(fx["loop_verdict"])
     assert result.route == fx["expected"]["route"], (
         f"Expected route '{fx['expected']['route']}', got '{result.route}'. "
         f"reason_code: {result.reason_code}"
@@ -296,7 +279,7 @@ def test_route_decision_selected_action_is_immutable():
     """Extra 6: selected_action must be MappingProxyType (immutable)."""
     from types import MappingProxyType
     fx = _load_fixture("positive_update_branch.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    result = route_loop_verdict_v2(fx["loop_verdict"])
     assert result.selected_action is not None
     assert isinstance(result.selected_action, MappingProxyType), (
         f"Expected MappingProxyType, got {type(result.selected_action)}"
@@ -309,7 +292,7 @@ def test_route_decision_rerun_required_is_immutable():
     """Extra 6: rerun_required must be MappingProxyType (immutable)."""
     from types import MappingProxyType
     fx = _load_fixture("positive_update_branch.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    result = route_loop_verdict_v2(fx["loop_verdict"])
     assert isinstance(result.rerun_required, MappingProxyType), (
         f"Expected MappingProxyType, got {type(result.rerun_required)}"
     )

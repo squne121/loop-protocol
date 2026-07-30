@@ -211,6 +211,8 @@ Reason: <判定理由（FAIL/SKIP の場合は必須）>
 - test-runner は `disallowedTools: Edit, Write, MultiEdit` のため、直接ファイル書き込みはせず、VC スクリプト自身が artifacts/ を書く設計とする（test-runner.md の「読み取り専用スクリプトのみ実行可」例外として `artifacts/` への append を許容するルール更新は #83 で実施）。
 - 証跡の PR 引用は test-runner 結果を受けた implementation-worker または pr-reviewer が PR 本文 `## Runtime Verification Evidence` セクションへ inline 化する（次節参照）。
 
+**Issue #1856（evidence authority cutover, Phase 1）**: `TEST_VERDICT_MACHINE` は動作検証（Runtime Verification）の証跡集約フォーマットとして引き続き使用するが、通常レビュー（pr-review-judge / impl-review-loop Step 2）の APPROVE/REQUEST_CHANGES 判定に対しては non-authoritative（advisory）である。通常レビューの authoritative evidence は `CI_CHECK_RUN_SCOPED` と exact head SHA + literal command SHA256 に束縛された独立実行 Issue VC のみ（`.claude/skills/pr-review-judge/references/evidence-policy.md` 参照）。
+
 ---
 
 ## 5. テストシナリオ最小セット
