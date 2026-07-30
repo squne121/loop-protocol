@@ -93,12 +93,13 @@ CURRENT_HEAD=$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)
 | `APPROVE` | `true` | `CLEAN` | `[]` | **終了（approved）**: `step-5-feedback-and-termination.md` の全 gate pass |
 | `APPROVE` | `true` | `CLEAN` | 空でない | required_auto_actions 処理（`step-5-feedback-and-termination.md` の routing）→ 終了しない |
 | `APPROVE` | `false` | `BEHIND` | 任意 | BEHIND 分岐: 下記「BEHIND 分岐 routing」参照（`termination_reason: approved` は立てない） |
-| `APPROVE` | `false` | `BLOCKED` | 任意 | branch protection 設定待ち。人間判断（`termination_reason: approved` は立てない） |
-| `APPROVE` | `false` | `UNSTABLE` | 任意 | 人間判断（`termination_reason: approved` は立てない） |
+| `APPROVE` | `false` | `BLOCKED` | 任意 | required checks / review / branch protection の未充足を意味する（Git conflict ではない）。CI・review が揃うまで warning として記録し `termination_reason: approved` は立てず、次 test-runner/review サイクルで再評価する |
+| `APPROVE` | `false` | `UNSTABLE` | 任意 | Git conflict ではない（required でない check の失敗/pending）。warning として記録し、CI 結果を待って次サイクルで再評価する（`termination_reason: approved` は立てない） |
 | `REQUEST_CHANGES` | 任意 | 任意 | 任意 | 次イテレーションへ（blockers を fix_delta に） |
-| 任意 | 任意 | `DIRTY` | 任意 | CONFLICTING PR Escalation Runbook 発動 |
-| 任意 | 任意 | `CONFLICTING` | 任意 | CONFLICTING PR Escalation Runbook 発動 |
-| 任意 | 任意 | `UNKNOWN` | 任意 | 5 秒待機 × 最大 3 回 retry、それでも UNKNOWN なら human_escalation |
+| 任意 | 任意 | `DIRTY` | 任意 | **hard stop**: CONFLICTING PR Escalation Runbook 発動（#1860 Owner Decision の唯一の hard stop の一つ） |
+| 任意 | 任意 | `CONFLICTING` | 任意 | **hard stop**: CONFLICTING PR Escalation Runbook 発動（#1860 Owner Decision の唯一の hard stop の一つ） |
+| 任意 | 任意 | `UNKNOWN` / null | 任意 | 5 秒待機 × 最大 3 回 bounded retry。retry 後も `UNKNOWN`/null の場合は warning として記録し、最終 merge-ready 判定のみ保留する（`human_escalation` はしない。実装・レビューサイクル自体は継続する） |
+| 任意 | 任意 | `DRAFT` / `HAS_HOOKS` | 任意 | Git conflict ではない。他フィールドの判定（`verdict`/`merge_ready`/required_auto_actions）に従って通常どおり処理する |
 
 > **APPROVE + BEHIND の termination_reason**: `APPROVE + merge_ready == false`（BEHIND 含む）の場合、
 > `termination_reason: approved` を設定してはならない。BEHIND 分岐で update_branch が完了し、

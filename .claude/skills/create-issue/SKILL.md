@@ -179,8 +179,8 @@ gh issue list --search "<file_path> is:open" --state open --json number,title,ur
   ```
   gh issue view <N> --json body | uv run python3 -c "import json,sys; b=json.load(sys.stdin)['body']; print('found' if '<file_path>' in b else 'not found')"
   ```
-- literal 含有ありで scope 重複あり → 即座に停止し 3 択を提示
-- scope 重複なし → 重複なし旨を人間確認事項に添えて次へ
+- literal 含有ありで scope 重複あり → 3 択（分割/依存明記/統合）を Issue コメントまたは起票時の本文注記として提示した上で起票を継続する（#1860 Owner Decision: declared Allowed Paths の文字列重複は起票停止理由にしない。実 Git conflict は worktree/PR 作成時に別途検出される）
+- scope 重複なし → 重複なし旨を記録して次へ
 
 上記の gh ベース手動チェックに加え、title keyword search だけに依存しない決定論的判定として overlap preflight helper `.claude/skills/create-issue/scripts/check_issue_overlap.py` を使う。
 
@@ -194,16 +194,16 @@ uv run --locked python3 .claude/skills/create-issue/scripts/check_issue_overlap.
   --fail-on-unsafe
 ```
 
-helper は `ISSUE_OVERLAP_PREFLIGHT_RESULT_V1`（`decision` / `reason_code` / `policy_class` / `source_status` / `candidates[].matched_fields` / `comment_template`）を返す。`decision` 別の停止条件:
+helper は `ISSUE_OVERLAP_PREFLIGHT_RESULT_V1`（`decision` / `reason_code` / `policy_class` / `source_status` / `candidates[].matched_fields` / `comment_template`）を返す。`decision` 別の対応（#1860 Owner Decision により全 decision advisory。完全一致タイトルの exact dedupe のみ実質的な採否判断に使う）:
 
 - `safe_new_issue` → 起票続行。
 - `overlap_requires_comment`（C1/C2a）→ `comment_template` を新規 Issue に記録して起票。
-- `ambiguous_requires_human`（C2b/C3 / source degraded）→ **停止して人間判断**（`--fail-on-unsafe` 時は exit 3）。
-- `duplicate` → 起票中止し既存 Issue へ統合。
+- `ambiguous_requires_human`（C2b/C3 / source degraded）→ warning として記録し起票を継続する。完全一致タイトルの既存 OPEN Issue を実際に発見した場合のみ、それを再利用しリンクする（重複起票を避ける）。
+- `duplicate` → 完全一致または明確な重複と判断できる場合は既存 Issue を再利用しリンクする。断定できない場合は warning として記録し起票を継続する（統合要否は人間へ提案するに留め、起票自体は止めない）。
 
-GitHub source（search / read-back）失敗・partial・saturation は `ambiguous_requires_human` に倒れる（fail-closed。`safe_new_issue` の false green を作らない）。証跡として helper の JSON 出力（`ISSUE_OVERLAP_PREFLIGHT_RESULT_V1`）を Issue comment または PR 本文に残す。
+GitHub source（search / read-back）失敗・partial・saturation は `ambiguous_requires_human` として記録されるが、起票を止めない（#1860 Owner Decision: 検索失敗・saturation は起票停止理由にしない）。証跡として helper の JSON 出力（`ISSUE_OVERLAP_PREFLIGHT_RESULT_V1`）を Issue comment または PR 本文に残す。
 
-本 helper は preflight advisory であり、現時点で `create_issue_txn.py` の mutation hard gate には未配線（hard gate 化は follow-up issue）。child overlap は fixture-only であり #946 の child materialization gate ではない。
+本 helper は preflight advisory であり、`create_issue_txn.py` の mutation hard gate には配線しない。child overlap は fixture-only であり #946 の child materialization gate ではない。
 
 #### 同一 Allowed Paths への複数 Issue 集約ガイドライン（マージコンフリクト回避）
 
