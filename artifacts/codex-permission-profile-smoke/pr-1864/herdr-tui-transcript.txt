@@ -1,0 +1,51 @@
+squne@DESKTOP-TB4VBD9:~/projects/LOOP_PROTOCOL/.claude/worktrees/issue-1859-codex-permission-workspace-default$ codex
+
+╭──────────────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.146.0)                               │
+│                                                          │
+│ model:     gpt-5.6-terra high   /model to change         │
+│ directory: …ssue-1859-codex-permission-workspace-default │
+╰──────────────────────────────────────────────────────────╯
+
+  Tip: New Use /fast to enable our fastest inference with increased plan usage.
+
+• You have 3 usage limit resets available. Run /usage to use one.
+
+/status
+
+╭─────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│  >_ OpenAI Codex (v0.146.0)                                                                             │
+│                                                                                                         │
+│ Visit https://chatgpt.com/codex/settings/usage for up-to-date                                           │
+│ information on rate limits and credits                                                                  │
+│                                                                                                         │
+│  Model:                              gpt-5.6-terra (reasoning high, summaries auto)                     │
+│  Directory:                          ~/…/worktrees/issue-1859-codex-permission-workspace-default        │
+│  Permissions:                        Profile loop-protocol-personal-dev (workspace with network access, │
+│  Agents.md:                          /home/squne/.codex/AGENTS.md, AGENTS.md                            │
+│  Account:                            squne121@gmail.com (Pro Lite)                                      │
+│  Collaboration mode:                 Default                                                            │
+│  Session:                            019fb39b-ae85-74b0-b625-97096358b461                               │
+│                                                                                                         │
+│  Weekly limit:                       [██████████░░░░░░░░░░] 49% left (resets 18:26 on 5 Aug)            │
+│  GPT-5.3-Codex-Spark Weekly limit:   [███████████░░░░░░░░░] 56% left (resets 18:39 on 5 Aug)            │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+› //skills
+
+
+• 利用可能な主なスキル：
+
+  - Issue: create-issue / edit-issue / review-issue / issue-refinement-loop
+  - 実装・PR: implement-issue / impl-review-loop / open-pr / pr-review-judge
+  - 運用: post-merge-cleanup / milestone-rollup / ssot-discovery
+  - CI: ci-test-performance
+  - GitHub: github:github / github:gh-fix-ci / github:gh-address-comments / github:yeet
+  - Google/Gmail: Drive、Docs、Sheets、Slides、Calendar、Gmail関連
+  - Codex: openai-docs / skill-creator / skill-installer
+
+
+› @issue
+
+  gpt-5.6-terra high · ~/projects/LOOP_PROTOCOL/.claude/worktrees/issue-1859-codex-permission-workspace-de…

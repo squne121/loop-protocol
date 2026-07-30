@@ -1,0 +1,37 @@
+{
+  "schema": "CODEX_CUSTOM_AGENT_DISPATCH_SMOKE_V1",
+  "codex_version": "codex-cli 0.146.0",
+  "invocation_method": "codex exec --json (root session, loop-protocol-personal-dev root default) prompting the model to use its native spawn_agent/wait_agent collaboration tool -- NOT --profile, per Issue #1859 AC4",
+  "readonly_agent_dispatch": {
+    "requested_agent_type": "codebase-investigator",
+    "spawn_confirmed_via_rollout": true,
+    "spawn_agent_function_call_evidence": "artifacts/codex-permission-profile-smoke/pr-1864/readonly-agent-dispatch-parent-rollout.jsonl (function_call name=spawn_agent namespace=collaboration arguments.agent_type=codebase-investigator)",
+    "subagent_session_meta_agent_role": "codebase-investigator",
+    "subagent_rollout": "artifacts/codex-permission-profile-smoke/pr-1864/readonly-agent-dispatch-subagent-rollout.jsonl",
+    "task_result": {
+      "read_config_toml_root_default_permissions": "loop-protocol-personal-dev (correct, matches actual file content)",
+      "write_probe_tmp_readonly_agent_write_probe_txt": "denied: Rejected(\"approval required by policy, but AskForApproval is set to Never\")"
+    }
+  },
+  "write_capable_agent_dispatch": {
+    "requested_agent_type": "implementation-worker",
+    "spawn_confirmed_via_rollout": true,
+    "subagent_session_meta_agent_role": "implementation-worker",
+    "subagent_rollout": "artifacts/codex-permission-profile-smoke/pr-1864/write-agent-dispatch-subagent-rollout.jsonl",
+    "task_result": {
+      "create_tmp_pr1864_agent_write_probe_txt": "success",
+      "read_back": "success, contents='agent-write-probe-ok'",
+      "delete": "success",
+      "post_hoc_filesystem_check": "confirmed absent on host filesystem after the agent reported deletion (tmp/pr1864-agent-write-probe.txt does not exist)",
+      "network_get_api_github_com": "success, HTTP 200"
+    }
+  },
+  "IMPORTANT_FINDING_agent_local_profile_not_applied_to_spawn_agent_sandbox": {
+    "summary": "For BOTH sub-agent dispatches (codebase-investigator, declared read-only via loop-protocol-readonly in .codex/agents/codebase-investigator.toml; and implementation-worker, declared write-capable via loop-protocol-rtk), the spawned sub-thread's own turn_context.permission_profile.file_system.entries in the rollout file are IDENTICAL and both show workspace WRITE access to the repo root plus tmp/slash_tmp write -- i.e. they mirror the ROOT session's effective sandbox policy (loop-protocol-personal-dev, extending :workspace), NOT their respective agent-local .codex/agents/*.toml default_permissions declarations (loop-protocol-readonly should have denied '.' write; it did not appear in the sub-thread's own entries at all).",
+    "behavioral_consequence_observed": "In this run, the read-only agent's write attempt was still denied, but the denial reason recorded was the same generic 'approval required by policy, but AskForApproval is set to Never' error observed for EVERY write attempt in this WSL2 environment (see root-runtime-probe.json), not a read-only-profile-specific denial. Because this host's OS-level sandbox subsystem is broken (documented WSL2 self-binary ENOENT issue; see root-runtime-probe.json), it is NOT possible to distinguish 'denied because loop-protocol-readonly correctly restricted this sub-agent' from 'denied because every write is blocked on this host regardless of profile'.",
+    "scope_assessment": "This finding is about the .codex/agents/*.toml agent-local permission profile *enforcement plumbing* under Codex's native spawn_agent/collaboration runtime, which is explicitly Out of Scope for Issue #1859 (its Out of Scope section excludes changes to .codex/agents/*.toml profile definitions). It pre-dates this Issue's config.toml root-default change and is not something introduced or made worse by switching the root default from ':workspace' to 'loop-protocol-personal-dev'. It is reported here because Issue #1859 AC4 required actually attempting real spawn_agent dispatch for the first time (the prior PR #1864 deferred this to Issue #1865 without running it), and this is what that first real attempt revealed.",
+    "recommendation": "This is flagged for human review as a candidate follow-up Issue: verify whether Codex's native spawn_agent/collaboration runtime is expected to honor .codex/agents/<agent>.toml's default_permissions for the resulting sub-thread sandbox, and if so, why the observed turn_context.permission_profile for both codebase-investigator and implementation-worker sub-threads mirrored the root session's policy instead. This is NOT something that was silently converted into a false PASS: AC4 is reported as 'dispatch confirmed via rollout evidence' (agent_type/agent_role correctly threaded through), not as 'agent-local permission-profile enforcement confirmed'."
+  },
+  "tested_commit_sha": "22eb7f03d23607e93f1499b32df3722ec060799b",
+  "codex_binary_sha256": "2e863156ed35ecc5253b1e2f907a9143077b9f7cb51942070c61996471ff6e04"
+}
