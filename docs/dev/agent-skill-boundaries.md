@@ -889,9 +889,10 @@ routing_allowed_fields:
     - status         # ok | failed
     - failure_class  # gh_auth | permission_denied | issue_not_found | schema_invalid | unknown（status: failed 時のみ）
   TEST_VERDICT_MACHINE/v1:
-    - status     # pass | partial | fail
+    - status     # pass | partial | fail（Issue #1856: 通常レビュー判定に対しては non-authoritative advisory。routing-critical ではない）
     - summary    # 統計のみ（raw 出力は参照しない）
-    - branch_behind_main  # impl-review-loop Step 5 の BEHIND reroute 判定で使う routing-critical field
+    # branch_behind_main は Issue #1856（evidence authority cutover, Phase 1）で撤去された。
+    # BEHIND reroute 判定は LOOP_VERDICT_V2.mergeability.merge_state_status のみを参照する。
   LOOP_VERDICT:
     - verdict    # APPROVE | REQUEST_CHANGES
     - status     # ok | failed
@@ -907,8 +908,10 @@ routing_allowed_fields:
 
 ```yaml
 impl_review_loop_v2_routing_boundary:
-  TEST_VERDICT_MACHINE/v1.branch_behind_main:
+  LOOP_VERDICT_V2.mergeability.merge_state_status:
     classification: routing_critical
+    # Issue #1856: BEHIND ルーティングの唯一の判定根拠。branch_behind_main /
+    # TEST_VERDICT_MACHINE/v1 依存は撤去された。
   LOOP_VERDICT_V2.required_auto_actions[].kind:
     classification: routing_critical
   LOOP_VERDICT_V2.required_auto_actions[].executor:
@@ -924,7 +927,7 @@ impl_review_loop_v2_routing_boundary:
       - missing or mismatched expected_head_sha must fail closed before update_branch dispatch
 ```
 
-`required_auto_actions[].kind` は action 種別の分岐点、`executor` / `skill` は data-plane 委譲先の決定、`expected_head_sha` は stale verdict を防ぐ race guard であり、いずれも routing-critical である。`branch_behind_main` は test-runner から Step 5 へ渡る補助信号で、BEHIND 状態の reroute 判断を `TEST_VERDICT_MACHINE/v1` 側から補強する field として扱う。
+`required_auto_actions[].kind` は action 種別の分岐点、`executor` / `skill` は data-plane 委譲先の決定、`expected_head_sha` は stale verdict を防ぐ race guard であり、いずれも routing-critical である。`mergeability.merge_state_status` は BEHIND 判定の唯一の routing-critical field である（Issue #1856: `TEST_VERDICT_MACHINE/v1.branch_behind_main` 依存は撤去、`route_loop_verdict_v2()` は `test_verdict` 引数を持たない）。
 
 ### 一時例外（temporary_exceptions）
 

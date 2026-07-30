@@ -84,10 +84,7 @@ def test_given_v2_update_branch_fixture_when_routed_then_update_branch_path_is_s
     which has skill=implement-issue and is fail-closed per AC4).
     """
     fx = _load_step5_fixture("positive_update_branch.yml")
-    result = route_loop_verdict_v2(
-        fx["loop_verdict"],
-        test_verdict=fx.get("test_verdict"),
-    )
+    result = route_loop_verdict_v2(fx["loop_verdict"])
     assert result.route == fx["expected"]["route"], (
         f"Expected route '{fx['expected']['route']}', got '{result.route}'. errors: {result.errors}"
     )

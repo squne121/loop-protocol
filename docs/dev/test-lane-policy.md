@@ -192,6 +192,11 @@ CI_TEST_PERFORMANCE_DECISION_V1:
     runtime_dependency_smoke: "<10s (isolated 環境構築 + 3 behavioral checks)"
     total_added_per_run: "<15s"
   required_evidence:
+    # classification: historical (Issue #1856) — この decision record は
+    # 記録当時の required_evidence をそのまま保持する。TEST_VERDICT_MACHINE は
+    # 通常レビュー判定における authoritative required evidence ではなくなった
+    # (`.claude/skills/ci-test-performance/SKILL.md` / `references/decision-matrix.md`
+    # / `.claude/skills/pr-review-judge/references/evidence-policy.md` が正本)。
     - TEST_VERDICT_MACHINE
     - CI_CHECK_RUN_SCOPED
   target_ssot_changed: false
@@ -281,6 +286,11 @@ CI_TEST_PERFORMANCE_DECISION_V1:
     python_invocation_policy_check: "<2s (text scan of ~70 governed files)"
     total_added_per_run: "<2s"
   required_evidence:
+    # classification: historical (Issue #1856) — この decision record は
+    # 記録当時の required_evidence をそのまま保持する。TEST_VERDICT_MACHINE は
+    # 通常レビュー判定における authoritative required evidence ではなくなった
+    # (`.claude/skills/ci-test-performance/SKILL.md` / `references/decision-matrix.md`
+    # / `.claude/skills/pr-review-judge/references/evidence-policy.md` が正本)。
     - TEST_VERDICT_MACHINE
     - CI_CHECK_RUN_SCOPED
   target_ssot_changed: false

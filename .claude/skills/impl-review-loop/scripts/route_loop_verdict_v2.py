@@ -7,7 +7,7 @@ network, or subprocess calls are made at module load or function call.
 
 Public API
 ----------
-route_loop_verdict_v2(loop_verdict, test_verdict=None) -> RouteDecision
+route_loop_verdict_v2(loop_verdict) -> RouteDecision
 
 RouteDecision fields
 ---------------------
@@ -259,45 +259,21 @@ def _validate_mergeability_schema(loop_verdict: Mapping[str, Any]) -> str | None
 
 
 # ---------------------------------------------------------------------------
-# Core branch_behind_main / merge_state_status invariant (AC6)
+# merge_state_status-only BEHIND determination (Issue #1856 AC1/AC2)
 # ---------------------------------------------------------------------------
+#
+# Issue #1856: The historical branch_behind_main / test_verdict cross-check
+# (formerly implemented here as _check_behind_invariant) depended on the
+# protected TEST_VERDICT lane. Ordinary-review evidence authority no longer
+# depends on that lane, so BEHIND is now derived solely from
+# loop_verdict.mergeability.merge_state_status. required_auto_actions
+# consistency (BEHIND without an update_branch action, or an update_branch
+# action while not BEHIND) is still fail-closed — see Step 5/6 below.
 
-def _check_behind_invariant(
-    branch_behind_main: Any,
-    merge_state_status: Any,
-) -> tuple[bool, str | None]:
-    """Evaluate AC6 invariant.
 
-    Returns (is_behind: bool, reason_code: str | None).
-    is_behind is True ONLY for (branch_behind_main is True AND merge_state_status == "BEHIND").
-    All other combinations return (False, reason_code) where reason_code explains the mismatch.
-    """
-    # Validate branch_behind_main type
-    if not isinstance(branch_behind_main, bool):
-        if branch_behind_main is not None:
-            return False, "branch_behind_main_not_bool"
-        # None / missing → not behind
-        return False, None
-
-    if merge_state_status not in (*_VALID_MERGE_STATE_STATUS_VALUES, None):
-        # Unknown status string → fail-closed (schema validation upstream
-        # already rejects this for the top-level call path; this guard is
-        # defense-in-depth for direct unit-level calls of this helper)
-        return False, f"merge_state_status_unknown_value:{merge_state_status}"
-
-    if branch_behind_main is True and merge_state_status == "BEHIND":
-        return True, None
-
-    if branch_behind_main is True and merge_state_status != "BEHIND":
-        # Inconsistent: test says behind but merge_state_status disagrees
-        return False, f"branch_behind_true_but_merge_state_status_not_behind:{merge_state_status}"
-
-    if branch_behind_main is False and merge_state_status == "BEHIND":
-        # Inconsistent: merge_state_status says behind but test says not
-        return False, "branch_behind_false_but_merge_state_status_BEHIND"
-
-    # branch_behind_main=False, status != BEHIND → not behind, no error
-    return False, None
+def _is_behind(merge_state_status: Any) -> bool:
+    """Return True iff merge_state_status is exactly the string "BEHIND"."""
+    return merge_state_status == "BEHIND"
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +342,6 @@ def _validate_update_branch_action(
 
 def route_loop_verdict_v2(
     loop_verdict: Mapping[str, Any],
-    test_verdict: Mapping[str, Any] | None = None,
 ) -> RouteDecision:
     """Deterministic, side-effect-free routing for impl-review-loop Step 5.
 
@@ -374,14 +349,19 @@ def route_loop_verdict_v2(
     ----------
     loop_verdict:
         LOOP_VERDICT_V2 dict as emitted by pr-review-judge.
-    test_verdict:
-        Optional TEST_VERDICT_MACHINE/v1 dict.  When supplied, the
-        branch_behind_main field is cross-checked against
-        loop_verdict.mergeability.merge_state_status (AC6 invariant).
 
     Returns
     -------
     RouteDecision
+
+    Note (Issue #1856, AC1)
+    ------------------------
+    This function no longer accepts a ``test_verdict`` argument. BEHIND
+    routing is derived solely from
+    ``loop_verdict["mergeability"]["merge_state_status"] == "BEHIND"``;
+    the historical branch_behind_main cross-check against the protected
+    TEST_VERDICT lane has been removed (evidence authority cutover,
+    Phase 1).
     """
     # ------------------------------------------------------------------
     # Step 0: top-level schema guard (AC7)
@@ -449,37 +429,19 @@ def route_loop_verdict_v2(
         )
 
     # ------------------------------------------------------------------
-    # Step 5: AC6 — branch_behind_main × merge_state_status invariant
+    # Step 5: merge_state_status-only BEHIND determination (AC1/AC2)
     # ------------------------------------------------------------------
 
-    # Blocker 4: merge_state_status=BEHIND requires test_verdict with branch_behind_main key
-    if merge_state_status == "BEHIND":
-        if test_verdict is None:
-            return _fail(
-                "missing_branch_behind_main_for_BEHIND",
-                "merge_state_status is BEHIND but test_verdict is None. "
-                "branch_behind_main is required to validate the BEHIND state.",
-            )
-        if "branch_behind_main" not in test_verdict:
-            return _fail(
-                "missing_branch_behind_main_for_BEHIND",
-                "merge_state_status is BEHIND but test_verdict.branch_behind_main key is absent. "
-                "branch_behind_main is required to validate the BEHIND state.",
-            )
-
-    branch_behind_main: Any = None
-    if test_verdict is not None:
-        branch_behind_main = test_verdict.get("branch_behind_main")
-
-    is_behind, behind_reason = _check_behind_invariant(branch_behind_main, merge_state_status)
-
-    if behind_reason is not None and branch_behind_main is not None:
-        # Only emit a fail-closed when test_verdict was supplied and inconsistent
+    if merge_state_status not in ("BEHIND", "CLEAN", "UNKNOWN", "CONFLICTING",
+                                   "DIRTY", "UNSTABLE", "BLOCKED", "DRAFT",
+                                   "HAS_HOOKS", None):
+        # Unknown status string → fail-closed
         return _fail(
-            f"branch_behind_invariant_violation:{behind_reason}",
-            f"AC6 invariant violated: branch_behind_main={branch_behind_main!r}, "
-            f"merge_state_status={merge_state_status!r}. Reason: {behind_reason}",
+            f"merge_state_status_unknown_value:{merge_state_status}",
+            f"Unknown merge_state_status value: {merge_state_status!r}.",
         )
+
+    is_behind = _is_behind(merge_state_status)
 
     # ------------------------------------------------------------------
     # Step 6: required_auto_actions dispatch
