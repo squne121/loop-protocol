@@ -27,7 +27,18 @@ GitHub issue / PR の更新・コメントは引き続き [github-ops.md](github
 
 ```toml
 approval_policy = "on-request"
-default_permissions = ":workspace"
+default_permissions = "loop-protocol-personal-dev"
+
+[permissions.loop-protocol-personal-dev]
+extends = ":workspace"
+
+[permissions.loop-protocol-personal-dev.network]
+enabled = true
+mode = "full"
+allow_local_binding = false
+
+[permissions.loop-protocol-personal-dev.network.domains]
+"**.github.com" = "allow"
 
 [permissions.loop-protocol-rtk.network]
 enabled = true
@@ -39,11 +50,11 @@ enabled = true
 "uploads.github.com" = "allow"
 ```
 
-- root scope の `default_permissions` は OpenAI 公式 built-in profile `:workspace`（active workspace roots と system temporary directories への read/write）である。この節の network allowlist 差分は `loop-protocol-rtk` という **repository-defined custom profile** に属し、root default には含まれない（Issue #1859）
+- root scope の `default_permissions` は repository-defined custom profile `loop-protocol-personal-dev` である。`extends = ":workspace"`（OpenAI 公式 built-in profile。filesystem read は OS 権限が許す範囲で制限しない、write は active workspace roots と system temporary directories に限定し `.git`/`.agents`/`.codex` は protected metadata として書き込めない）した上で、個人趣味開発向けの broad な development network allowlist（`network.mode = "full"`、`allow_local_binding = false`）を明示的に layer している（owner の `HUMAN_PERMISSION_DECISION_V1`、Issue #1859）。この節の `loop-protocol-rtk` の network allowlist 差分は別の **repository-defined custom profile** に属し、agent-local にのみ選択される
 - `default_permissions` と `[permissions.*]` だけを使い、legacy `sandbox_workspace_write` には依存しない
-- `uploads.github.com` は release asset / upload 系の経路に限定して追加している
+- `uploads.github.com` は release asset / upload 系の経路に限定して `loop-protocol-rtk` へ追加している
 - `loop-protocol-readonly` と `loop-protocol-bootstrap` には追加しない。どちらも upload / release asset の許可を必要としないため、read-only / bootstrap の境界を狭く保つ
-- `loop-protocol-rtk` を root default に戻さない（`:workspace` は GitHub/upload network allowlist を含まない、狭い既定）。custom agent が network allowlist を必要とする場合は `.codex/agents/*.toml` で明示的に `default_permissions = "loop-protocol-rtk"` を選択する
+- `loop-protocol-rtk` を root default にしない。root default である `loop-protocol-personal-dev` の network allowlist は明示的な development domain のみで、`"*"` のような global allowlist や `allow_local_binding = true` は含まない
 
 ### Legacy compatibility note（旧設定との互換注記）
 
@@ -63,14 +74,22 @@ network_access = true
 PR #1849（P0 quarantine）は root scope の `default_permissions` を削除した。Codex CLI 0.146.0 の
 loader は非空の `[permissions.*]` を持つ設定で root default が欠落していると
 `config defines [permissions] profiles but does not set default_permissions` を返して起動を拒否し、
-`codex status` / App Server の `skills/list` reload / 対話 TUI の Skill refresh が失敗する。本 Issue は
-root default を OpenAI 公式 built-in profile `:workspace` として復元し、この回帰を解消する。
+`codex status` / App Server の `skills/list` reload / 対話 TUI の Skill refresh が失敗する。先行 PR
+#1864（本 Issue 初回実装）は root default を built-in `:workspace` として復元したが、敵対的レビュー
+で 4 blocker（`:workspace` の filesystem read 境界の誤説明、isolated-home smoke の project trust
+不在、AC2/AC4 の runtime verification 未実施での follow-up 延期、JS validator の生テキスト regex に
+よる root scope 誤検知見逃し）が指摘された。owner はこれを受け、root default を `:workspace` を
+継承しネットワークを有効化した repository-defined custom profile `loop-protocol-personal-dev` へ変更
+する再改訂を `HUMAN_PERMISSION_DECISION_V1` として確定した（personal hobby development 向けの
+risk posture）。
 
 ### 責務分担
 
-- **root default（`:workspace`）**: active workspace roots と system temporary directories への
-  read/write のみを許可する。GitHub/upload network allowlist（`loop-protocol-rtk`）や
-  `:danger-full-access` を root default にはしない
+- **root default（`loop-protocol-personal-dev`）**: `extends = ":workspace"`（filesystem read は OS
+  権限が許す範囲で制限しない、write は active workspace roots と system temporary directories に
+  限定し、`.git`/`.agents`/`.codex` は protected metadata として write 不可）に加えて、明示的な
+  development domain allowlist（`network.mode = "full"`、`allow_local_binding = false`、global
+  `"*"` は使わない）を持つ。`:danger-full-access` を root default にはしない
 - **agent-local profile（`.codex/agents/*.toml` の `default_permissions`）**: read-only custom agent は
   `loop-protocol-readonly`、write-capable custom agent は `loop-protocol-rtk` を明示宣言し続ける。
   root default の変更はこれらの agent-local 宣言を上書きしない
@@ -81,22 +100,22 @@ root default を OpenAI 公式 built-in profile `:workspace` として復元し�
 ### Rollback（本 Issue の変更を戻す手順）
 
 runtime smoke（`codex status` / App Server `skills/list` / 対話 TUI Skill refresh / custom agent
-runtime smoke）が `:workspace` を root default にした状態で意図しない実効権限を示した場合、以下の
-手順で単一コミットとして戻す:
+runtime smoke）が `loop-protocol-personal-dev` を root default にした状態で owner 承認済みの
+filesystem/network semantics と異なる実効権限を示した場合、以下の手順で単一コミットとして戻す:
 
 1. `git revert <この Issue の commit>` で `.codex/config.toml` の root
-   `default_permissions = ":workspace"` 行、`scripts/check-codex-agents.mjs` /
-   `scripts/check_codex_agent_config.py` の root default assertion、
-   `tests/codex/test_codex_hook_surface_guard.py` /
+   `default_permissions = "loop-protocol-personal-dev"` 行と `[permissions.loop-protocol-personal-dev]`
+   テーブル、`scripts/check-codex-agents.mjs` / `scripts/check_codex_agent_config.py` の root default
+   assertion、`tests/codex/test_codex_hook_surface_guard.py` /
    `tests/codex/test_codex_permission_profile_config.py` の該当テスト、この節を含む
    `docs/dev/agent-runtime-ops.md` の更新を同一コミットで戻す
-2. `node scripts/check-codex-agents.mjs --self-test` と
+2. `pnpm exec node scripts/check-codex-agents.mjs --self-test` と
    `uv run python3 scripts/check_codex_agent_config.py --assert-required-fields --assert-runtime-contract --assert-local-main-branch-guard`
-   が revert 後の状態（root default 不在）でも意図どおりのメッセージで fail する、または PR #1849
-   quarantine 直後の期待値（root default advisory-absent）に戻ったことを確認する
-3. rollback 後に root default が再び欠落した状態へ戻るため、`codex status` は再び
+   が revert 後の状態（root default 不在、または built-in `:workspace` に戻った状態）でも意図どおり
+   のメッセージで fail/pass することを確認する
+3. rollback 後に root default が再び欠落した状態へ戻る場合、`codex status` は再び
    `does not set default_permissions` エラーを返すことを前提として運用者へ周知する
-   （rollback は本 Issue が解消する回帰を再導入する — 一時的な緊急停止としてのみ使う）
+   （root default 不在への rollback は緊急停止としてのみ使う）
 4. agent-local `default_permissions`（`loop-protocol-readonly` / `loop-protocol-rtk`）は本 rollback の
    対象外であり、変更しない
 
@@ -201,7 +220,18 @@ GitHub posting path 自体の正本は `docs/dev/github-ops.md` で、Codex sess
 
 ```toml
 approval_policy = "on-request"
-default_permissions = ":workspace"
+default_permissions = "loop-protocol-personal-dev"
+
+[permissions.loop-protocol-personal-dev]
+extends = ":workspace"
+
+[permissions.loop-protocol-personal-dev.network]
+enabled = true
+mode = "full"
+allow_local_binding = false
+
+[permissions.loop-protocol-personal-dev.network.domains]
+"**.github.com" = "allow"
 
 [permissions.loop-protocol-rtk.network]
 enabled = true
@@ -213,8 +243,11 @@ enabled = true
 "uploads.github.com" = "allow"
 ```
 
-この modern 例では、`default_permissions` と `[permissions.*]` だけを使い、filesystem 境界は広げない。
-root default は built-in `:workspace` であり、network allowlist を含む `loop-protocol-rtk` は agent-local に明示選択する custom profile である（root default とは責務が分かれる、Issue #1859）。
+この modern 例では、`default_permissions` と `[permissions.*]` だけを使い、filesystem 境界は
+`extends = ":workspace"` の意味論から広げない。root default は `:workspace` を継承した
+repository-defined custom profile `loop-protocol-personal-dev` であり、network allowlist を含む
+`loop-protocol-rtk` は別途 agent-local に明示選択する custom profile である（root default とは責務が
+分かれる、Issue #1859）。
 GitHub への issue / PR 更新やコメント投稿は、`docs/dev/github-ops.md` の body-file guidance に従って `rtk gh` へ寄せる。
 
 ### Legacy compatibility note（旧設定との互換注記）
@@ -244,7 +277,7 @@ GitHub への issue / PR 更新、コメント投稿、draft PR 起票は `docs/
 
 ### project-local boundary（プロジェクトローカル境界）
 
-- `.codex/config.toml` の root scope `default_permissions` は built-in profile `:workspace`（active workspace roots + system temporary directories への read/write）を選ぶ。`[permissions.*]` が非空のとき root default が欠落していると Codex loader（0.146.0 時点）が `config defines [permissions] profiles but does not set default_permissions` で拒否する（Issue #1859）
+- `.codex/config.toml` の root scope `default_permissions` は repository-defined custom profile `loop-protocol-personal-dev`（`extends = ":workspace"`: active workspace roots + system temporary directories への write、read は OS 権限が許す範囲、加えて明示的な development network allowlist）を選ぶ。`[permissions.*]` が非空のとき root default が欠落していると Codex loader（0.146.0 時点）が `config defines [permissions] profiles but does not set default_permissions` で拒否する（Issue #1859）
 - root default は `.codex/agents/*.toml` の agent-local `default_permissions`（`loop-protocol-readonly` / `loop-protocol-rtk`）を上書きしない。custom agent は自身の profile を明示宣言し続ける
 - `.codex/rules/default.rules` が command rules を持つ
 - `AGENTS.md` が Codex 向けの project-local instruction surface になる
