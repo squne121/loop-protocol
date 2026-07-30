@@ -184,15 +184,16 @@ gh issue list --search "<file_path> is:open" --state open --json number,title,ur
 
 上記の gh ベース手動チェックに加え、title keyword search だけに依存しない決定論的判定として overlap preflight helper `.claude/skills/create-issue/scripts/check_issue_overlap.py` を使う。
 
-実行例:
+実行例（#1869 fix_delta P0-3: canonical invocation から `--fail-on-unsafe` を除去。全 decision が advisory であるため、shell 側を hard-fail させるフラグを canonical command に含めない）:
 
 ```bash
 uv run --locked python3 .claude/skills/create-issue/scripts/check_issue_overlap.py \
   --repo <owner/repo> --title "<起票予定 title>" \
   --goal "<goal_ref>" --allowed-paths-file <paths.txt> \
-  [--label <l> ...] [--parent-ref <#N> ...] [--depends-on <#N> ...] \
-  --fail-on-unsafe
+  [--label <l> ...] [--parent-ref <#N> ...] [--depends-on <#N> ...]
 ```
+
+`--fail-on-unsafe` フラグ自体はスクリプトに残すが（他の呼び出し元の後方互換性のため）、本 SKILL.md の canonical invocation では使用しない。`set -euo pipefail` 下で本コマンドを実行しても、`overlap_requires_comment` / `ambiguous_requires_human` / `duplicate` の decision でシェルが中断しない。
 
 helper は `ISSUE_OVERLAP_PREFLIGHT_RESULT_V1`（`decision` / `reason_code` / `policy_class` / `source_status` / `candidates[].matched_fields` / `comment_template`）を返す。`decision` 別の対応（#1860 Owner Decision により全 decision advisory。完全一致タイトルの exact dedupe のみ実質的な採否判断に使う）:
 

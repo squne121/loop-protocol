@@ -5,9 +5,9 @@ preflight adapter を subprocess 経由で検証する（#1452、PR #1455 レビ
 live GitHub Issue への参照ではなく `tests/fixtures/overlap/` の固定 fixture
 （body_sha256 付き）で決定論的に検証する。
 
-exit code 契約（Major 2）: 分類に成功した場合は route を問わず exit 0。
-`runtime_error` のみ非 0（exit 1）。route の正本は常に JSON 出力の
-`route` フィールドである。
+exit code 契約（#1869 fix_delta P0-3 で改訂）: route を問わずすべて exit 0。
+`runtime_error` も advisory diagnostic として exit 0 を返す（旧: exit 1）。
+route の正本は常に JSON 出力の `route` フィールドである。
 """
 
 from __future__ import annotations
@@ -43,7 +43,9 @@ ROUTES = {
 }
 
 EXIT_OK = 0
-EXIT_RUNTIME_ERROR = 1
+# #1869 fix_delta P0-3: runtime_error is advisory and must exit 0 like every
+# other closed-set route (it must not abort a `set -euo pipefail` caller).
+EXIT_RUNTIME_ERROR = 0
 
 
 _SPEC = importlib.util.spec_from_file_location("overlap_checker", HELPER)
@@ -1836,3 +1838,44 @@ def test_human_c1_non_supersedable_rejection_reason_remains_routing(tmp_path: Pa
 
     assert payload["route"] == "human_review_required"
     assert payload["human_c1_decisions"]["rejected"][0]["reason"] == "decision_not_c1_non_conflict"
+
+
+# ---------------------------------------------------------------------------
+# #1869 fix_delta P0-3: canonical shell invocation must survive `set -euo
+# pipefail` even when the classification result is `runtime_error`.
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_shell_invocation_continues_under_pipefail_on_runtime_error(
+    tmp_path: Path,
+) -> None:
+    """A malformed --candidates-file forces route=runtime_error. The exact
+    canonical shell shape from implement-issue/SKILL.md Step 2 (capture
+    stdout to a file, then read `route` back out) must not abort a
+    `set -euo pipefail` caller.
+    """
+    bad_candidates = tmp_path / "bad_candidates.json"
+    bad_candidates.write_text("{not valid json", encoding="utf-8")
+    current_file = FIXTURES_DIR / "current_1451_analog.json"
+    current_number = json.loads(current_file.read_text(encoding="utf-8"))["number"]
+    out_file = tmp_path / "overlap_preflight.json"
+
+    script = (
+        "set -euo pipefail\n"
+        f'uv run python3 "{HELPER}" --issue-number {current_number} --dry-run '
+        f'--current-file "{current_file}" --candidates-file "{bad_candidates}" '
+        f'--repo "{DEFAULT_REPO}" > "{out_file}"\n'
+        f'ROUTE=$(uv run python3 -c "import json,sys; print(json.load(sys.stdin)[\'route\'])" < "{out_file}")\n'
+        'echo "ROUTE=$ROUTE"\n'
+        'echo "AFTER_OVERLAP_CHECK_REACHED"\n'
+    )
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "ROUTE=runtime_error" in proc.stdout
+    assert "AFTER_OVERLAP_CHECK_REACHED" in proc.stdout

@@ -101,8 +101,8 @@ LOOP_STATE:
 | `LOOP_VERDICT_V2.verdict: APPROVE` かつ `required_auto_actions` が空でない | 終了しない。required_auto_actions を worker に委譲し、PR review を再実行する |
 | `LOOP_VERDICT_V2.verdict: APPROVE` かつ `merge_ready == false` | 終了しない。`step-5-mergeability-handling.md` の routing に従う（BEHIND 分岐等） |
 | `iteration ≥ max_iterations` | fail-close。`termination_reason: max_iterations` を LOOP_STATE に記録、人間判断を仰ぐ |
-| Step 1-4 のいずれかで `human_review_required: true` を SubAgent が返した | 即停止、人間判断を仰ぐ |
-| `merge_state_status: CONFLICTING / DIRTY / BLOCKED` の繰り返し | CONFLICTING PR Escalation Runbook 参照 |
+| Step 1-4 のいずれかで `human_review_required: true` を SubAgent が返した | #1860 Owner Decision により即停止しない。warning として記録し、iteration 余裕があれば継続する（`step-5-feedback-and-termination.md` の「human_review_required の扱い」参照）。ループを止める human veto は live Issue/PR コメント上の明示的な停止指示、または実 Git conflict／target PR mergeability（`mergeable == CONFLICTING` または `merge_state_status == DIRTY`）に限定する |
+| `mergeability.mergeable == CONFLICTING` または `mergeability.merge_state_status == DIRTY` | CONFLICTING PR Escalation Runbook 参照（`merge_state_status == CONFLICTING` は無効な enum 値であり schema 不正として扱う。`BLOCKED` は required checks/review 未充足であり Git conflict ではないため本 runbook の対象にしない） |
 
 > **重要**: `verdict: APPROVE` 単独では終了しない。`merge_ready == true` かつ `required_auto_actions == []` の両条件が必要。
 
@@ -139,19 +139,19 @@ preparation step で取得した contract snapshot 内の以下の情報を Step
 
 ### Product Spec Check Reference（プロダクト仕様確認の参照, Issue #333）
 
-`checks.product_spec_check` を contract snapshot から読み取り、Step 1 delegation 前に `LOOP_STATE.product_spec_preflight` に正規化して格納する。以下のルールに従う:
+`checks.product_spec_check` を contract snapshot から読み取り、Step 1 delegation 前に `LOOP_STATE.product_spec_preflight` に正規化して格納する。以下のルールに従う（#1869 fix_delta P0-4: `stop_human` / `refresh_contract_snapshot` は advisory warning へ改訂。product-spec snapshot は semantic planning artifact であり、それ自体には停止権限がない）:
 
-> **注意**: `refresh_contract_snapshot` へ route する場合は **route only; no auto-run** — AI が `issue-contract-review` を自動実行してはならない。停止して人間に `issue-contract-review` の再実行を依頼する。
+> **注意**: `refresh_contract_snapshot` は **route only; no auto-run** の warning である（AI が `issue-contract-review` を自動実行することはない）。人間へ「再実行を推奨する」旨を記録するに留め、Step 1 continuation は妨げない。
 
-- `checks.product_spec_check` が snapshot に存在しない場合は stale / incomplete snapshot として `refresh_contract_snapshot` へ route する（route only; no auto-run — 停止して人間に `issue-contract-review` の再実行を依頼する）
-- `applicability == not_applicable && decision == pass` の場合のみ、無関係 Issue として `continue` へ継続
-- `applicability == not_applicable && decision != pass` は inconsistent snapshot として `refresh_contract_snapshot` へ route する（route only; no auto-run）
-- `decision == fail` → fail-closed で停止、`routing_action: stop_human`
-- `decision == human_judgment` → 人間判断へ escalate、`routing_action: stop_human`
+- `checks.product_spec_check` が snapshot に存在しない場合は stale / incomplete snapshot として warning を記録し（`routing_action: refresh_contract_snapshot`）、Step 1 へ継続する
+- `applicability == not_applicable && decision == pass` の場合、無関係 Issue として `continue` へ継続
+- `applicability == not_applicable && decision != pass` は inconsistent snapshot として warning を記録し（`routing_action: refresh_contract_snapshot`）、Step 1 へ継続する
+- `decision == fail` → warning として記録し（`routing_action: stop_human` は advisory 表示のみ）、Step 1 へ継続する。live Issue/PR コメント上の明示的な人間の停止指示がある場合のみ実際に停止する
+- `decision == human_judgment` → 同上（warning として記録し継続。明示的な人間の停止指示がある場合のみ停止）
 - `decision == pass` かつ `applicability == applicable` → 続行、`routing_action: continue`
-- 不正な enum 値 → stale / invalid snapshot として `refresh_contract_snapshot` へ route する（route only; no auto-run）
+- 不正な enum 値 → stale / invalid snapshot として warning を記録し（`routing_action: refresh_contract_snapshot`）、Step 1 へ継続する
 
-**実装例**: `.claude/skills/impl-review-loop/scripts/evaluate_product_spec_gate.py` が mutation-free CLI として `PRODUCT_SPEC_GATE_DECISION_V1` を出力する（routing_action: continue | stop_human | refresh_contract_snapshot）。
+**実装例**: `.claude/skills/impl-review-loop/scripts/evaluate_product_spec_gate.py` が mutation-free CLI として `PRODUCT_SPEC_GATE_DECISION_V1` を出力する（routing_action: continue | stop_human | refresh_contract_snapshot。いずれも advisory であり `continue` 以外も Step 1 continuation を妨げない）。
 
 ## Guardrails（安全策）
 

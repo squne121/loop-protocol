@@ -458,3 +458,75 @@ def test_ac6_preparation_refers_to_capsule_before_redundant_commands():
     assert idx_capsule_doc > idx_capsule_section
     assert "同一 loop 内では `gh issue view` / comments fetch / main `git status` / snapshot 探索を再実行しない" in body
     assert "run_contract_blocker_triage" in body
+
+
+# ---------------------------------------------------------------------------
+# #1869 fix_delta P0-4: fatal_errors / warnings split
+# ---------------------------------------------------------------------------
+
+
+def test_comments_fetch_failure_is_advisory_warning_not_fatal_exit():
+    """Comment fetch failure (gh api non-zero) must land in `warnings`, not
+    `fatal_errors`, and must not force a non-zero exit code."""
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (1, "", "gh: rate limited"),  # issue_comments fetch fails
+        ]
+    )
+
+    with patch.object(mod, "_run_command", side_effect=run_cmd):
+        capsule, artifact, exit_code = mod.build_intake_capsule(958, "squne121/loop-protocol", None)
+
+    assert exit_code == 0
+    assert "comments_fetch_error" in capsule["warnings"]
+    assert "comments_fetch_error" not in capsule["fatal_errors"]
+    assert capsule["fatal_errors"] == []
+    assert artifact["warnings"] == capsule["warnings"]
+
+
+def test_live_issue_not_accessible_is_fatal_exit_1():
+    """gh issue view failure (live Issue not accessible / target identity
+    unresolvable) remains a genuine fatal_errors condition -> exit 1."""
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (1, "", "gh: issue not found"),  # issue_view fails
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+        ]
+    )
+
+    with patch.object(mod, "_run_command", side_effect=run_cmd):
+        capsule, _artifact, exit_code = mod.build_intake_capsule(958, "squne121/loop-protocol", None)
+
+    assert exit_code == 1
+    assert "issue_view_failed" in capsule["fatal_errors"]
+
+
+def test_ensure_contract_snapshot_parse_error_is_advisory_warning(tmp_path):
+    """A malformed --ensure-contract-snapshot-result file is a warning
+    (snapshot fetch/parse failure), not fatal."""
+    bad_file = tmp_path / "bad_snapshot.json"
+    bad_file.write_text("{not valid json", encoding="utf-8")
+
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+        ]
+    )
+
+    with patch.object(mod, "_run_command", side_effect=run_cmd):
+        capsule, _artifact, exit_code = mod.build_intake_capsule(
+            958, "squne121/loop-protocol", str(bad_file)
+        )
+
+    assert exit_code == 0
+    assert "ensure_contract_snapshot_result_parse_error" in capsule["warnings"]
+    assert capsule["fatal_errors"] == []

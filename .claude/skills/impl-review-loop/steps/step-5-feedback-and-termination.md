@@ -10,11 +10,30 @@ Step 2-4 の結果を統合して、ループを次イテレーションに進�
 | `LOOP_VERDICT.verdict: APPROVE` かつ `required_auto_actions` が空でない | `required_auto_action_result_routing` に従って worker 委譲し、処理完了後に PR review を再実行（終了しない） |
 | `LOOP_VERDICT.verdict: APPROVE` かつ `merge_ready == false` | `step-5-mergeability-handling.md` の routing に従う（終了しない） |
 | `LOOP_STATE.iteration >= LOOP_STATE.max_iterations` | `termination_reason: max_iterations` を立て、fail-close で人間判断 |
-| Step 1-2-4 のいずれかで `human_review_required: true` を SubAgent が返した | `termination_reason: human_escalation` を立て、即停止 |
+| Step 1-2-4 のいずれかで `human_review_required: true` を SubAgent が返した | #1860 Owner Decision により即停止しない。warning として evidence に記録し、iteration 余裕があれば継続する（下記「human_review_required の扱い」参照） |
 | Step 2 が `FAIL` または Step 4 が `REQUEST_CHANGES` で iteration 余裕あり | LOOP_STATE.iteration += 1、Step 1 に戻る（fix_delta を渡す）|
 
 > **注意**: `verdict: APPROVE` 単独では `termination_reason: approved` に到達しない。
 > `merge_ready == true` かつ `required_auto_actions == []` の両条件が揃った場合のみ終了する。
+
+## human_review_required の扱い（#1869 fix_delta P0-4）
+
+Step 1-4 の SubAgent が返す `human_review_required: true` は、semantic planning・overlap・contract
+snapshot・body SHA・artifact 異常に起因するものが大半であり、それ自体には停止権限がない
+（#1860 Owner Decision）。以下に再定義する:
+
+- `human_review_required: true` を受け取った場合、`termination_reason: human_escalation` を
+  **自動では立てない**。理由・evidence を warning として LOOP_STATE / 終了報告コメントに記録し、
+  iteration 余裕があれば Step 1 へ戻って継続する。
+- 本ループを停止する human veto は、以下のいずれかを **live Issue または live PR コメント上で
+  直接確認できた場合に限定** する:
+  - current owner による明示的な停止指示（例: PR/Issue コメントでの `REQUEST_CHANGES` や
+    「停止してください」の明示発話）
+  - `docs/dev/secret-policy.md` の Decision Gate 未通過（secret 関連）
+  - `git conflict` / target PR の GitHub mergeability（`mergeable == CONFLICTING` または
+    `merge_state_status == DIRTY`。`step-5-mergeability-handling.md` 参照）
+- 上記に該当しない `human_review_required: true`（scope-rollup missing、contract snapshot
+  invalid、overlap ambiguous 等）は、ループを止める理由にしない。
 
 ## APPROVE 時の終了 gate（三段構成）
 
@@ -37,6 +56,11 @@ APPROVE gate:
 ```
 
 ## required_auto_action_result_routing
+
+**production 正本は `.claude/skills/impl-review-loop/scripts/route_loop_verdict_v2.py`
+（`route_loop_verdict_v2()`）である。** 本セクションの prose テーブルは同関数の契約を
+文書として要約したものであり、契約が乖離した場合はスクリプト側が正本となる（#1869
+fix_delta P0-2）。
 
 `required_auto_actions` は **YAML array of objects** として parse する（string-list 扱いは禁止）。
 
@@ -88,27 +112,42 @@ required_auto_action_result_routing:
 
 ```yaml
 required_auto_actions_schema:
-  type: array-of-objects
+  type: array-of-objects  # exactly matches route_loop_verdict_v2.py
   item_schema:
     kind:
       allowed_values:
         - update_branch
         - update_pr_body_hygiene
         - ensure_closing_keyword
+      rejected_values:
+        - apply_pr_review_fix_delta  # pr-review-judge schema; not accepted here
     executor:
       allowed_values:
         - implementation-worker
-    skill: "<skill name>"
+    skill:
+      # required exact value when kind == update_branch (AC4):
+      #   "implement-issue.update_branch" (WITH subcommand)
+      # "implement-issue"（サブコマンドなし）は fail-closed
+      required_for_update_branch: "implement-issue.update_branch"
     blocking_merge_ready:
-      allowed_values: [true, false]
-    expected_head_sha: "<SHA> (required when kind == update_branch)"
-  unknown_kind_route: human_escalation
-  unknown_executor_route: human_escalation
-  missing_expected_head_sha_for_update_branch: human_escalation
-  blocking_merge_ready_not_true_route: human_escalation
+      required_for_update_branch: true  # must literally be `true`, not just boolean-typed
+    mechanical:
+      required_for_update_branch: true  # #1869 fix_delta P0-2: previously undocumented, router requires this
+    expected_head_sha: "<SHA> (required when kind == update_branch; must equal reviewed_head_sha)"
+  unknown_kind_route: fail_closed
+  unknown_executor_route: fail_closed
+  missing_expected_head_sha_for_update_branch: fail_closed
+  mismatched_expected_head_sha_for_update_branch: fail_closed
+  blocking_merge_ready_not_true_route: fail_closed
+  missing_mechanical_for_update_branch: fail_closed
 ```
 
-`unknown kind` / `unknown executor` / `unknown skill` / `blocking_merge_ready != true` / `update_branch` で `expected_head_sha` 欠落のいずれかに該当する場合は `human_escalation` として停止する。
+`unknown kind` / `unknown executor` / `unknown skill`（`implement-issue`（サブコマンドなし）を含む）/
+`blocking_merge_ready != true` / `mechanical != true` / `update_branch` で `expected_head_sha`
+欠落・不一致のいずれかに該当する場合は `route_loop_verdict_v2.py` が `route: fail_closed` を返す。
+この `fail_closed` は本ループの `termination_reason` を直接決めるものではなく、次の Step 4
+（pr-review-judge）再委譲によって正しい `required_auto_actions` を再取得することを促す safe-default
+である。
 
 ### 処理手順
 
@@ -177,9 +216,15 @@ PUBLISH_LANE_DECISION_V1:
 | `HAS_HOOKS` | `true` | `true` | merge hooks があるが merge 可能 |
 | `UNSTABLE` | `false` | 人間判断 | branch protection テスト失敗の可能性 |
 | `BEHIND` | `false` | — | `step-5-mergeability-handling.md` の BEHIND 分岐参照 |
-| `BLOCKED` | `false` | 人間判断 | branch protection 設定待ち |
-| `DIRTY` / `CONFLICTING` | `false` | — | CONFLICTING PR Escalation Runbook 発動 |
-| `UNKNOWN` | `false` | — | 5 秒待機 × 最大 3 回 retry 後も UNKNOWN なら `human_escalation` |
+| `BLOCKED` | `false` | 人間判断 | branch protection 設定待ち（Git conflict ではない） |
+| `DIRTY`（`merge_state_status`） | `false` | — | conflict hard stop: CONFLICTING PR Escalation Runbook 発動 |
+| `UNKNOWN` | `false` | — | 5 秒待機 × 最大 3 回 retry 後も UNKNOWN なら warning として記録し、最終 merge-ready 判定のみ保留する（`human_escalation` はしない） |
+
+> **注意（#1869 fix_delta P0-1）**: `CONFLICTING` は `mergeable` フィールドの有効値であり、
+> `merge_state_status` の有効値ではない（GitHub の `MergeStateStatus` enum に `CONFLICTING` は
+> 存在しない）。`mergeable == CONFLICTING` は上記とは別に、`mergeability.mergeable` を直接見て
+> hard stop する（`route_loop_verdict_v2.py` 参照）。`merge_state_status == CONFLICTING` という
+> ペイロードは schema 不正として扱う。
 
 `UNSTABLE` は branch protection でのテスト失敗を示す場合があり、自動的に `merge_ready: true` とは見なさない。
 
