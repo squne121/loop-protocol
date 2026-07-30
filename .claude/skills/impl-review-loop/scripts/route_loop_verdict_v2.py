@@ -598,8 +598,11 @@ def extract_latest_loop_verdict_v2(comment_body: str) -> tuple[dict[str, Any] | 
 # CLI wrapper
 #
 # Usage:
-#   uv run python3 route_loop_verdict_v2.py --body-file <comment.txt> \
-#       [--test-verdict-file <test_verdict.json>]
+#   uv run python3 route_loop_verdict_v2.py --body-file <comment.txt>
+#
+# Note (Issue #1856): --test-verdict-file was removed along with the
+# branch_behind_main / TEST_VERDICT cross-check (see route_loop_verdict_v2()
+# docstring). BEHIND routing is derived solely from merge_state_status.
 #
 # Prints a single JSON object to stdout describing the RouteDecision (plus
 # an `extraction_error` field when the LOOP_VERDICT_V2 block could not be
@@ -619,8 +622,6 @@ def _cli_main(argv: list[str] | None = None) -> int:
         description="Extract LOOP_VERDICT_V2 from a PR comment body and route it (Step 5).",
     )
     parser.add_argument("--body-file", required=True, help="Path to file containing the PR comment body text.")
-    parser.add_argument("--test-verdict-file", required=False, default=None,
-                         help="Optional path to a JSON file containing TEST_VERDICT_MACHINE/v1.")
     args = parser.parse_args(argv)
 
     try:
@@ -628,15 +629,6 @@ def _cli_main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         print(json.dumps({"error": f"could not read --body-file: {exc}"}), file=sys.stderr)
         return 2
-
-    test_verdict: dict[str, Any] | None = None
-    if args.test_verdict_file:
-        try:
-            with open(args.test_verdict_file, encoding="utf-8") as fh:
-                test_verdict = json.load(fh)
-        except OSError as exc:
-            print(json.dumps({"error": f"could not read --test-verdict-file: {exc}"}), file=sys.stderr)
-            return 2
 
     loop_verdict, extraction_error = extract_latest_loop_verdict_v2(comment_body)
 
@@ -653,7 +645,7 @@ def _cli_main(argv: list[str] | None = None) -> int:
         print(json.dumps(output))
         return 0
 
-    decision = route_loop_verdict_v2(loop_verdict, test_verdict=test_verdict)
+    decision = route_loop_verdict_v2(loop_verdict)
     output = {
         "route": decision.route,
         "fail_closed": decision.fail_closed,

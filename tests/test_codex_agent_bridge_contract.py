@@ -50,8 +50,12 @@ def test_missing_marker_detected(tmp_path: Path):
     canonical.parent.mkdir(parents=True)
     canonical.write_text("ok", encoding="utf-8")
     surface.parent.mkdir(parents=True)
-    surface.write_text(_bridge_text("../../../.claude/skills/create-issue/SKILL.md").replace("derived/non-canonical ", ""), encoding="utf-8")
-    assert any("derived/non-canonical marker required" in failure for failure in module.validate_bridge_surface(surface))
+    text = _bridge_text("../../../.claude/skills/create-issue/SKILL.md").replace(
+        "derived/non-canonical ", ""
+    )
+    surface.write_text(text, encoding="utf-8")
+    failures = module.validate_bridge_surface(surface)
+    assert any("derived/non-canonical marker required" in failure for failure in failures)
 
 
 def test_missing_imperative_detected(tmp_path: Path):
@@ -60,7 +64,9 @@ def test_missing_imperative_detected(tmp_path: Path):
     canonical.parent.mkdir(parents=True)
     canonical.write_text("ok", encoding="utf-8")
     surface.parent.mkdir(parents=True)
-    text = _bridge_text("../../../.claude/skills/create-issue/SKILL.md").replace("Before executing this skill, read the canonical body at", "Read")
+    text = _bridge_text("../../../.claude/skills/create-issue/SKILL.md").replace(
+        "Before executing this skill, read the canonical body at", "Read"
+    )
     surface.write_text(text, encoding="utf-8")
     assert any("exact imperative required" in failure for failure in module.validate_bridge_surface(surface))
 
@@ -85,8 +91,12 @@ def test_stale_procedure_body_detected(tmp_path: Path):
     canonical.parent.mkdir(parents=True)
     canonical.write_text("ok", encoding="utf-8")
     surface.parent.mkdir(parents=True)
-    surface.write_text(_bridge_text("../../../.claude/skills/create-issue/SKILL.md", extra="\n## Procedure\n- step\n"), encoding="utf-8")
-    assert any("stale procedure body detected" in failure for failure in module.validate_bridge_surface(surface))
+    text = _bridge_text(
+        "../../../.claude/skills/create-issue/SKILL.md", extra="\n## Procedure\n- step\n"
+    )
+    surface.write_text(text, encoding="utf-8")
+    failures = module.validate_bridge_surface(surface)
+    assert any("stale procedure body detected" in failure for failure in failures)
 
 
 def test_body_bloat_detected(tmp_path: Path):
@@ -95,8 +105,12 @@ def test_body_bloat_detected(tmp_path: Path):
     canonical.parent.mkdir(parents=True)
     canonical.write_text("ok", encoding="utf-8")
     surface.parent.mkdir(parents=True)
-    surface.write_text(_bridge_text("../../../.claude/skills/create-issue/SKILL.md", extra="\nExtra line.\n"), encoding="utf-8")
-    assert any("body bloat detected" in failure for failure in module.validate_bridge_surface(surface))
+    text = _bridge_text(
+        "../../../.claude/skills/create-issue/SKILL.md", extra="\nExtra line.\n"
+    )
+    surface.write_text(text, encoding="utf-8")
+    failures = module.validate_bridge_surface(surface)
+    assert any("body bloat detected" in failure for failure in failures)
 
 
 def test_duplicate_target_detected(tmp_path: Path):
@@ -110,7 +124,8 @@ def test_duplicate_target_detected(tmp_path: Path):
     target = "../../../.claude/skills/create-issue/SKILL.md"
     first.write_text(_bridge_text(target), encoding="utf-8")
     second.write_text(_bridge_text(target), encoding="utf-8")
-    assert any("duplicate canonical target" in failure for failure in module.find_duplicate_canonical_targets([first, second]))
+    duplicates = module.find_duplicate_canonical_targets([first, second])
+    assert any("duplicate canonical target" in failure for failure in duplicates)
 
 
 def test_negative_guard_text_present():
