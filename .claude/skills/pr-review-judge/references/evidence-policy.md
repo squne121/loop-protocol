@@ -1,6 +1,6 @@
 # PR Evidence Policy (PR_REVIEW_JUDGE_VC_EVIDENCE_POLICY)
 
-## Authority（Issue #1856, Phase 1: evidence authority cutover）
+## Authority（正本の情報源を定義する。Issue #1856, Phase 1: evidence authority cutover）
 
 通常レビュー（pr-review-judge / impl-review-loop Step 2）の APPROVE/REQUEST_CHANGES 判定は、
 以下の2系列のみを authoritative（正本）として扱う。TEST_VERDICT lane の有無に依存しない。
