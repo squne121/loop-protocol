@@ -657,15 +657,10 @@ def _next_action_route(
         return "request_readiness_check"
 
     normalized_status = contract_snapshot.get("normalized_status")
-    triage_status = (contract_snapshot.get("contract_blocker_triage") or {}).get("status")
-    if normalized_status == "go":
+    if normalized_status in ("go", "missing_go", "stale", "runtime_error"):
         return "proceed_to_step_1"
-    if normalized_status == "missing_go":
-        return "run_contract_blocker_triage" if triage_status == "ok" else "ensure_contract_snapshot"
     if normalized_status == "latest_blocked":
         return "run_contract_blocker_triage"
-    if normalized_status == "stale":
-        return "refresh_contract_snapshot"
     return "human_review_required"
 
 
