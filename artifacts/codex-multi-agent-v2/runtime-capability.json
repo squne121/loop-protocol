@@ -1,0 +1,106 @@
+{
+  "schema": "CODEX_MULTI_AGENT_V2_RUNTIME_CAPABILITY_V1",
+  "generated_at": "2026-07-30T11:45:11Z",
+  "generated_by": "probe_codex_v2_runtime_capability",
+  "overall_status": "partial",
+  "mandatory_probe_failures": [],
+  "codex_cli_version": {
+    "status": "ok",
+    "version": "0.146.0",
+    "raw_output": "codex-cli 0.146.0",
+    "executable": {
+      "executable_basename": "codex",
+      "distribution_kind": "standalone",
+      "target_triple": "x86_64-unknown-linux-musl",
+      "binary_sha256": "2e863156ed35ecc5253b1e2f907a9143077b9f7cb51942070c61996471ff6e04",
+      "is_symlink": true,
+      "shim_detection": "no_shim_detected"
+    }
+  },
+  "v2_config_schema_loadable": true,
+  "v2_config_schema_check": {
+    "config_toml_parse": {
+      "parse_status": "ok_present",
+      "features_table_present": true,
+      "multi_agent_v2_declared": null,
+      "multi_agent_v2_form": "absent"
+    },
+    "cli_feature_flag_probe": {
+      "status": "ok_recognized_but_disabled",
+      "stage": "stable",
+      "enabled": false,
+      "raw_output": null
+    },
+    "config_loader_probe": {
+      "status": "ok",
+      "positive_exit_code": 0,
+      "positive_accepted": true,
+      "unknown_key_rejected": true,
+      "wrong_type_rejected": true,
+      "zero_concurrency_rejected": true,
+      "cases": {
+        "positive": {
+          "outcome": "completed",
+          "exit_code": 0,
+          "accepted": true
+        },
+        "unknown_key_rejected": {
+          "outcome": "completed",
+          "exit_code": 1,
+          "accepted": false
+        },
+        "wrong_type_rejected": {
+          "outcome": "completed",
+          "exit_code": 1,
+          "accepted": false
+        },
+        "zero_concurrency_rejected": {
+          "outcome": "completed",
+          "exit_code": 1,
+          "accepted": false
+        }
+      }
+    }
+  },
+  "cli_feature_recognition": {
+    "probed": true,
+    "reason": null,
+    "method": "cli_help_text_scan",
+    "note": "Static substring scan of `codex --help` / `codex exec --help` output. spawn_agent / agent_type / task_name / fork_turns are internal agent tool-call schema, not top-level CLI flags, so `false` here is expected and does not by itself indicate the capability is unavailable to the running agent.",
+    "tokens": {
+      "spawn_agent_v2_form": false,
+      "agent_type_param": false,
+      "task_name_param": false,
+      "fork_turns_param": false,
+      "nested_delegation": false
+    }
+  },
+  "runtime_exec_probe": {
+    "status": "not_run",
+    "reason": "Live spawn_agent V2 canary requires either a write-capable sandbox/network or a .codex/hooks.json change to observe hook input at the moment of tool invocation; both are out of scope for this read-only probe per Issue #1834's Stop Condition. config-recognition status (v2_config_schema_loadable) is proven independently of this field and must not be conflated with it.",
+    "herdr_tui_canary": "not_implemented_out_of_scope"
+  },
+  "provenance": {
+    "repo_head_sha": "8fd7e5fb0c4cdf02d4c97f69877ceaf9c1b84441",
+    "input_digest_set": {
+      "config_toml_sha256": "dac54868690e0c7005bebffe14de6a407420d12dc35962416c02d8d557e6c580",
+      "hooks_json_sha256": "5752f01c3f9d1803c2925f4b56ef67f3f5010220563fb04c8a128ed7d755c687",
+      "adapter_sha256": "7fa2f9602f0d06b6fa5c2d09558289e2089e6020e8b64a039a751f7f386eaa8a",
+      "probe_script_sha256": "b81848e213756b574156504578d3b0c1c29526427ba748dfe2c37a79c39f5c97"
+    },
+    "hook_wiring": {
+      "status": "ok",
+      "SessionEnd": {
+        "present": true,
+        "recorder_command": true,
+        "timeout_seconds": 3
+      },
+      "SubagentStop": {
+        "present": true,
+        "recorder_command": true,
+        "timeout_seconds": 3
+      },
+      "unexpected_events": []
+    }
+  }
+}
