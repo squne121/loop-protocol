@@ -61,8 +61,10 @@ warn (exit 1) definition:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import importlib.metadata
+import io
 import json
 import os
 import re
@@ -1685,6 +1687,175 @@ def _build_scope_delta_authority_evidence(
     }
 
 
+def consume_trusted_anchor_contract_patch_plan(
+    *,
+    repo: str,
+    issue_number: int,
+    issue: dict,
+    anchor_url: str,
+    anchor_payload: dict,
+    anchor_body: str,
+    contract_patch_plan: dict,
+    callbacks: Optional[dict[str, Any]] = None,
+) -> dict:
+    """Connect an approved patch plan to the controlled transaction lane.
+
+    The planner remains read-only.  This explicit consumer is called only by
+    the opt-in preflight execution path after a trusted directive has produced
+    an existing ``CONTRACT_PATCH_PLAN_V1``.  Its default callbacks use the
+    existing readiness checker and ``edit_issue_txn.py``; tests can inject
+    fixture callbacks without a GitHub mutation.
+    """
+    from scope_signal_delta import run_trusted_anchor_iteration_zero
+
+    callbacks = callbacks or {}
+    temporary_paths: list[Path] = []
+
+    def fetch_current() -> tuple[dict, dict]:
+        injected = callbacks.get("fetch_current")
+        if injected is not None:
+            return injected()
+        current_issue, issue_error = _fetch_issue(repo, issue_number)
+        if current_issue is None:
+            raise RuntimeError(f"issue_readback_failed:{issue_error}")
+        comment_id = anchor_payload.get("id")
+        current_anchor, anchor_error = _fetch_single_comment(repo, int(comment_id))
+        if current_anchor is None:
+            raise RuntimeError(f"anchor_readback_failed:{anchor_error}")
+        current_anchor = dict(current_anchor)
+        current_anchor["html_url"] = anchor_url
+        current_anchor["source_body_sha256"] = f"sha256:{_sha256(current_anchor.get('body', ''))}"
+        return current_issue, current_anchor
+
+    def candidate_readiness(candidate_body: str) -> dict:
+        injected = callbacks.get("candidate_readiness")
+        if injected is not None:
+            return injected(candidate_body)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", encoding="utf-8", delete=False) as handle:
+            handle.write(candidate_body)
+            candidate_path = Path(handle.name)
+        temporary_paths.append(candidate_path)
+        readiness_script = (
+            _SCRIPTS_DIR.parent.parent / "issue-contract-review" / "scripts" / "contract_readiness_check.py"
+        )
+        completed = subprocess.run(
+            [sys.executable, str(readiness_script), "--body-file", str(candidate_path), "--mode", "static"],
+            capture_output=True,
+            text=True,
+            shell=False,
+            timeout=30,
+        )
+        try:
+            readiness = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            return {
+                "status": "input_or_runtime_error",
+                "body_sha256": f"sha256:{_sha256(candidate_body)}",
+                "source_checks": [],
+                "errors": [],
+                "readiness_result_ref": "transaction-local",
+            }
+        if not isinstance(readiness, dict):
+            return {
+                "status": "input_or_runtime_error",
+                "body_sha256": f"sha256:{_sha256(candidate_body)}",
+                "source_checks": [],
+                "errors": [],
+                "readiness_result_ref": "transaction-local",
+            }
+        readiness["readiness_result_ref"] = "transaction-local"
+        return readiness
+
+    def apply_transaction(current_issue: dict, candidate_body: str, readiness: dict) -> dict:
+        injected = callbacks.get("apply_transaction")
+        if injected is not None:
+            return injected(current_issue, candidate_body, readiness)
+        repo_root = _find_repo_root()
+        candidate_path = repo_root / "tmp" / f"issue_{issue_number}_trusted_anchor_candidate.md"
+        input_path = repo_root / "tmp" / f"issue_{issue_number}_trusted_anchor_txn.json"
+        candidate_path.parent.mkdir(parents=True, exist_ok=True)
+        candidate_path.write_text(candidate_body, encoding="utf-8")
+        temporary_paths.extend([candidate_path, input_path])
+        from scope_signal_delta import build_issue_edit_txn_input
+
+        transaction_input = build_issue_edit_txn_input(
+            issue_number=issue_number,
+            repo=repo,
+            previous_body_sha256=f"sha256:{_sha256(current_issue.get('body', ''))}",
+            previous_updated_at=current_issue["updatedAt"],
+            new_body_file=str(candidate_path.relative_to(repo_root)),
+            readiness_result=readiness,
+        )
+        input_path.write_text(json.dumps(transaction_input, ensure_ascii=False), encoding="utf-8")
+        transaction_script = _SCRIPTS_DIR.parent.parent / "edit-issue" / "scripts" / "edit_issue_txn.py"
+        completed = subprocess.run(
+            [sys.executable, str(transaction_script), "--input-file", str(input_path.relative_to(repo_root))],
+            capture_output=True,
+            text=True,
+            shell=False,
+            cwd=str(repo_root),
+            timeout=60,
+        )
+        try:
+            result = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            return {"status": "failed_no_mutation"}
+        return result if isinstance(result, dict) else {"status": "failed_no_mutation"}
+
+    def fresh_checks(current_issue: dict) -> dict:
+        injected = callbacks.get("fresh_checks")
+        if injected is not None:
+            return injected(current_issue)
+        readiness = candidate_readiness(current_issue.get("body", ""))
+        with contextlib.redirect_stdout(io.StringIO()):
+            preflight_result, _ = run_preflight(
+                issue_number=issue_number,
+                repo=repo,
+                anchor_comment_urls=[anchor_url],
+                consume_contract_patch_plan=False,
+            )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", encoding="utf-8", delete=False) as handle:
+            handle.write(current_issue.get("body", ""))
+            review_body_path = Path(handle.name)
+        temporary_paths.append(review_body_path)
+        review_script = _SCRIPTS_DIR.parent.parent / "review-issue" / "scripts" / "check_issue_contract.py"
+        review = subprocess.run(
+            [sys.executable, str(review_script), "--file", str(review_body_path), "--json"],
+            capture_output=True,
+            text=True,
+            shell=False,
+            timeout=30,
+        )
+        return {
+            "preflight": preflight_result.get("status"),
+            "review": "approve" if review.returncode == 0 else "needs_fix" if review.returncode == 1 else "unavailable",
+            "readiness": readiness.get("status"),
+        }
+
+    normalized_anchor = dict(anchor_payload)
+    normalized_anchor["html_url"] = anchor_url
+    normalized_anchor["source_body_sha256"] = f"sha256:{_sha256(anchor_body)}"
+    try:
+        return run_trusted_anchor_iteration_zero(
+            repo=repo,
+            issue_number=issue_number,
+            issue=issue,
+            anchor=normalized_anchor,
+            anchor_body=anchor_body,
+            patch_plan=contract_patch_plan,
+            candidate_readiness=candidate_readiness,
+            fetch_current=fetch_current,
+            apply_transaction=apply_transaction,
+            fresh_checks=fresh_checks,
+        )
+    finally:
+        for path in temporary_paths:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
 def run_preflight(
     issue_number: int,
     repo: str,
@@ -1692,6 +1863,8 @@ def run_preflight(
     fixture_path: Optional[Path] = None,
     known_context: Optional[dict] = None,
     now: Optional[str] = None,
+    consume_contract_patch_plan: bool = False,
+    contract_update_callbacks: Optional[dict[str, Any]] = None,
 ) -> tuple[dict, int]:
     """
     Main preflight logic.
@@ -1712,6 +1885,9 @@ def run_preflight(
     rewrite_constraints: Optional[dict[str, Any]] = None
     planner_input_dict: Optional[dict] = None
     raw_snapshot: Optional[dict] = None
+    anchor_payload_for_consumer: Optional[dict] = None
+    anchor_body_for_consumer: Optional[str] = None
+    anchor_url_for_consumer: Optional[str] = None
 
     # --- Load data (fixture or live gh) ---
     if fixture_path is not None:
@@ -1883,6 +2059,9 @@ def run_preflight(
                 )
 
             anchor_comment_ids.add(str(comment_payload["id"]))
+            anchor_payload_for_consumer = dict(comment_payload)
+            anchor_body_for_consumer = anchor_comment_state["snapshot"]
+            anchor_url_for_consumer = anchor_url
             anchor_comment_feedback = {
                 "url": anchor_comment_state["url"],
                 "preliminary_classification": anchor_comment_state["preliminary_classification"],
@@ -1988,6 +2167,7 @@ def run_preflight(
             script_path=PLANNER_SCRIPT,
             python_executable=sys.executable,
         )
+
         try:
             _cls_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
             _cls_dir.mkdir(parents=True, exist_ok=True)
@@ -2036,6 +2216,29 @@ def run_preflight(
             planner_input=planner_input_dict,
             raw_snapshot=raw_snapshot,
         )
+
+    if consume_contract_patch_plan:
+        sidecar = plan.get("scope_signal_guard_decision_v2")
+        authority = sidecar.get("scope_delta_authority") if isinstance(sidecar, dict) else None
+        patch_plan = authority.get("contract_patch_plan") if isinstance(authority, dict) else None
+        if (
+            isinstance(patch_plan, dict)
+            and anchor_payload_for_consumer is not None
+            and anchor_body_for_consumer is not None
+            and anchor_url_for_consumer is not None
+        ):
+            consumer_result = consume_trusted_anchor_contract_patch_plan(
+                repo=repo,
+                issue_number=issue_number,
+                issue=issue,
+                anchor_url=anchor_url_for_consumer,
+                anchor_payload=anchor_payload_for_consumer,
+                anchor_body=anchor_body_for_consumer,
+                contract_patch_plan=patch_plan,
+                callbacks=contract_update_callbacks,
+            )
+            if consumer_result.get("status") == "blocked":
+                blockers.append(BLOCKER_FAIL_CLOSED)
 
     # --- Extract planner output fields ---
     fail_closed = plan.get("fail_closed", {})
@@ -2651,6 +2854,11 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="Path to fixture JSON (bypasses gh CLI calls).",
     )
+    parser.add_argument(
+        "--consume-contract-patch-plan",
+        action="store_true",
+        help="Execute a trusted CONTRACT_PATCH_PLAN_V1 through edit_issue_txn.py.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -2697,6 +2905,7 @@ def main(argv: list[str] | None = None) -> None:
         repo=args.repo,
         anchor_comment_urls=args.anchor_comment_urls,
         fixture_path=args.fixture,
+        consume_contract_patch_plan=args.consume_contract_patch_plan,
     )
     sys.exit(exit_code)
 

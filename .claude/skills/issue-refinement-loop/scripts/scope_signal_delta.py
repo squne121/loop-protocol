@@ -397,9 +397,7 @@ def compute_scope_signal_delta(payload: dict[str, Any]) -> dict[str, Any]:
     repeated_in_scope_layers = sorted(after_in_scope_values & before_in_scope_values)
 
     added_low_verifiability = [
-        item["value"]
-        for item in after_ac
-        if item["value"] not in before_ac_map and item["is_low_verifiability"]
+        item["value"] for item in after_ac if item["value"] not in before_ac_map and item["is_low_verifiability"]
     ]
 
     signals: list[dict[str, Any]] = []
@@ -653,10 +651,7 @@ def detect_boundary_flags(text: "str | None", *, expands_allowed_paths: bool = F
     (derived from an actual Allowed Paths diff, not text matching).
     """
     haystack = text or ""
-    flags = {
-        name: bool(pattern.search(haystack))
-        for name, pattern in _BOUNDARY_KEYWORD_PATTERNS.items()
-    }
+    flags = {name: bool(pattern.search(haystack)) for name, pattern in _BOUNDARY_KEYWORD_PATTERNS.items()}
     flags["expands_allowed_paths"] = bool(expands_allowed_paths)
     return {key: flags.get(key, False) for key in _BOUNDARY_FLAG_KEYS}
 
@@ -895,9 +890,7 @@ def _iteration_zero_states(**overrides: str) -> dict:
     return states
 
 
-def normalize_trusted_anchor_iteration_zero(
-    *, repo: str, issue_number: int, anchor: dict, source_body: str
-) -> dict:
+def normalize_trusted_anchor_iteration_zero(*, repo: str, issue_number: int, anchor: dict, source_body: str) -> dict:
     """Validate trusted-anchor provenance without requiring a prior snapshot.
 
     This is intentionally a pure, transaction-local bootstrap lane.  It
@@ -981,9 +974,7 @@ def _replace_top_level_section(body: str, section: str, desired: str) -> str:
     return "\n".join([*lines[:start], *replacement, *lines[end:]]).rstrip() + "\n"
 
 
-def build_section_aware_candidate_body(
-    *, body: str, operations: list[dict], source_identity: dict
-) -> dict:
+def build_section_aware_candidate_body(*, body: str, operations: list[dict], source_identity: dict) -> dict:
     """Consume a patch plan into desired H2 section state without fanout.
 
     Operations are deduplicated by their operation identity.  A caller may
@@ -1020,7 +1011,9 @@ def build_section_aware_candidate_body(
         elif text.strip() not in current.splitlines():
             current = "\n".join(part for part in (current, text.strip()) if part).strip()
         desired_sections[section] = current
-        postconditions.append({"section": section, "contains": None if kind == "remove" else text.strip(), "removes": remove_text})
+        postconditions.append(
+            {"section": section, "contains": None if kind == "remove" else text.strip(), "removes": remove_text}
+        )
 
     candidate = body
     for section in sections:
@@ -1036,8 +1029,13 @@ def build_section_aware_candidate_body(
 
 
 def build_issue_edit_txn_input(
-    *, issue_number: int, repo: str, previous_body_sha256: str,
-    previous_updated_at: str, new_body_file: str, readiness_result: dict
+    *,
+    issue_number: int,
+    repo: str,
+    previous_body_sha256: str,
+    previous_updated_at: str,
+    new_body_file: str,
+    readiness_result: dict,
 ) -> dict:
     """Adapt a candidate to the existing controlled transaction input."""
     return {
@@ -1053,8 +1051,16 @@ def build_issue_edit_txn_input(
 
 
 def run_trusted_anchor_iteration_zero(
-    *, repo: str, issue_number: int, issue: dict, anchor: dict, anchor_body: str,
-    patch_plan: dict, candidate_readiness, fetch_current, apply_transaction=None,
+    *,
+    repo: str,
+    issue_number: int,
+    issue: dict,
+    anchor: dict,
+    anchor_body: str,
+    patch_plan: dict,
+    candidate_readiness,
+    fetch_current,
+    apply_transaction=None,
     fresh_checks=None,
 ) -> dict:
     """Execute the bounded, callback-based trusted-anchor path.
@@ -1073,32 +1079,65 @@ def run_trusted_anchor_iteration_zero(
     rebases = 0
     while True:
         candidate = build_section_aware_candidate_body(
-            body=current.get("body", ""), operations=patch_plan.get("operations", []),
+            body=current.get("body", ""),
+            operations=patch_plan.get("operations", []),
             source_identity=normalized["source_identity"],
         )
         if not candidate["changed"]:
-            result = {"status": "no_change", "states": _iteration_zero_states(contract_update="no_change"), "writes": 0, "iterations": 0, **candidate}
+            result = {
+                "status": "no_change",
+                "states": _iteration_zero_states(contract_update="no_change"),
+                "writes": 0,
+                "iterations": 0,
+                **candidate,
+            }
             if fresh_checks is not None:
                 result["fresh_checks"] = fresh_checks(current)
             return result
         readiness = candidate_readiness(candidate["candidate_body"])
         if not isinstance(readiness, dict) or readiness.get("status") != "go":
-            return {"status": "blocked", "states": _iteration_zero_states(contract_update="failed"), "failure": "candidate_readiness_not_go", "writes": 0, "iterations": rebases, **candidate}
+            return {
+                "status": "blocked",
+                "states": _iteration_zero_states(contract_update="failed"),
+                "failure": "candidate_readiness_not_go",
+                "writes": 0,
+                "iterations": rebases,
+                **candidate,
+            }
         fresh_issue, fresh_anchor = fetch_current()
         fresh_anchor_body = fresh_anchor.get("body", anchor_body)
         fresh_normalized = normalize_trusted_anchor_iteration_zero(
             repo=repo, issue_number=issue_number, anchor=fresh_anchor, source_body=fresh_anchor_body
         )
         if not fresh_normalized["accepted"] or fresh_normalized["source_identity"] != normalized["source_identity"]:
-            return {"status": "blocked", "states": _iteration_zero_states(directive_acceptance="rejected", contract_update="failed"), "failure": "anchor_identity_or_trust_changed", "writes": 0, "iterations": rebases}
+            return {
+                "status": "blocked",
+                "states": _iteration_zero_states(directive_acceptance="rejected", contract_update="failed"),
+                "failure": "anchor_identity_or_trust_changed",
+                "writes": 0,
+                "iterations": rebases,
+            }
         if fresh_issue.get("body") != current.get("body"):
             if rebases >= 1:
-                return {"status": "blocked", "states": _iteration_zero_states(contract_update="failed"), "failure": "body_drift_retry_exhausted", "writes": 0, "iterations": rebases}
+                return {
+                    "status": "blocked",
+                    "states": _iteration_zero_states(contract_update="failed"),
+                    "failure": "body_drift_retry_exhausted",
+                    "writes": 0,
+                    "iterations": rebases,
+                }
             current = dict(fresh_issue)
             rebases += 1
             continue
         if apply_transaction is None:
-            return {"status": "ready_for_controlled_mutation", "states": _iteration_zero_states(contract_update="pending"), "writes": 0, "iterations": rebases, "readiness": readiness, **candidate}
+            return {
+                "status": "ready_for_controlled_mutation",
+                "states": _iteration_zero_states(contract_update="pending"),
+                "writes": 0,
+                "iterations": rebases,
+                "readiness": readiness,
+                **candidate,
+            }
         transaction_result = apply_transaction(fresh_issue, candidate["candidate_body"], readiness)
         final_issue, final_anchor = fetch_current()
         final_anchor_body = final_anchor.get("body", anchor_body)
@@ -1106,14 +1145,33 @@ def run_trusted_anchor_iteration_zero(
             repo=repo, issue_number=issue_number, anchor=final_anchor, source_body=final_anchor_body
         )
         if not final_normalized["accepted"] or final_issue.get("body") != candidate["candidate_body"]:
-            return {"status": "blocked", "states": _iteration_zero_states(contract_update="failed"), "failure": "final_readback_postcondition_failed", "writes": 1, "iterations": rebases}
+            return {
+                "status": "blocked",
+                "states": _iteration_zero_states(contract_update="failed"),
+                "failure": "final_readback_postcondition_failed",
+                "writes": 1,
+                "iterations": rebases,
+            }
         if any(
             (item["contains"] is not None and item["contains"] not in final_issue["body"])
             or (item["removes"] and item["removes"] in final_issue["body"])
             for item in candidate["postconditions"]
         ):
-            return {"status": "blocked", "states": _iteration_zero_states(contract_update="failed"), "failure": "section_postcondition_failed", "writes": 1, "iterations": rebases}
-        result = {"status": "applied", "states": _iteration_zero_states(contract_update="applied"), "writes": 1, "iterations": rebases, "transaction_result": transaction_result, **candidate}
+            return {
+                "status": "blocked",
+                "states": _iteration_zero_states(contract_update="failed"),
+                "failure": "section_postcondition_failed",
+                "writes": 1,
+                "iterations": rebases,
+            }
+        result = {
+            "status": "applied",
+            "states": _iteration_zero_states(contract_update="applied"),
+            "writes": 1,
+            "iterations": rebases,
+            "transaction_result": transaction_result,
+            **candidate,
+        }
         if fresh_checks is not None:
             result["fresh_checks"] = fresh_checks(final_issue)
         return result
@@ -1126,9 +1184,7 @@ def _patch_source_evidence_entry(evidence: dict) -> dict:
     # extracted_text_sha256 hashes only the already-extracted directive
     # texts (never the raw comment body, AC14).
     extracted_directives = evidence.get("extracted_directives") or []
-    extracted_text_sha256 = (
-        _sha256("\n".join(extracted_directives)) if extracted_directives else None
-    )
+    extracted_text_sha256 = _sha256("\n".join(extracted_directives)) if extracted_directives else None
     return {
         "source_ref": evidence.get("source_ref") or evidence.get("comment_url"),
         "source_body_sha256": evidence.get("body_sha256"),

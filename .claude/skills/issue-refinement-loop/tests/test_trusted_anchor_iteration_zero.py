@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
+import subprocess
 import sys
 from pathlib import Path
+from unittest import mock
 
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
@@ -12,6 +15,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 sda = importlib.import_module("scope_signal_delta")
 planner = importlib.import_module("plan_refinement_loop")
+preflight = importlib.import_module("run_refinement_preflight")
 
 REPO = "squne121/loop-protocol"
 ISSUE = 1835
@@ -148,6 +152,51 @@ def test_patch_plan_is_consumed_by_builder_and_edit_transaction():
     assert candidate["changed"] is True
     assert txn["schema"] == "ISSUE_EDIT_TXN_INPUT_V1"
     assert txn["readiness_forwarding_payload"]["readiness_result"]["status"] == "go"
+
+
+def test_preflight_consumer_executes_controlled_transaction_and_final_readback(tmp_path):
+    state = {"body": PRE_BODY}
+    transaction_inputs: list[dict] = []
+
+    def fetch_current():
+        return ({"body": state["body"], "updatedAt": "2026-08-01T00:00:00Z"}, _anchor())
+
+    def controlled_transaction(argv, **_kwargs):
+        payload = json.loads((tmp_path / argv[-1]).read_text(encoding="utf-8"))
+        transaction_inputs.append(payload)
+        state["body"] = (tmp_path / payload["new_body_file"]).read_text(encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"status": "ok"}), "")
+
+    with (
+        mock.patch.object(preflight, "_find_repo_root", return_value=tmp_path),
+        mock.patch.object(preflight.subprocess, "run", side_effect=controlled_transaction),
+    ):
+        result = preflight.consume_trusted_anchor_contract_patch_plan(
+            repo=REPO,
+            issue_number=ISSUE,
+            issue={"body": PRE_BODY, "updatedAt": "2026-08-01T00:00:00Z"},
+            anchor_url=ANCHOR_URL,
+            anchor_payload=_anchor(),
+            anchor_body=ANCHOR_BODY,
+            contract_patch_plan=_plan(
+                {
+                    "section": "Acceptance Criteria",
+                    "op": "append",
+                    "text": "- [ ] AC1: controlled path",
+                    "source_evidence_index": 0,
+                }
+            ),
+            callbacks={
+                "fetch_current": fetch_current,
+                "candidate_readiness": _readiness,
+                "fresh_checks": lambda _issue: {"preflight": "pass", "review": "approve", "readiness": "go"},
+            },
+        )
+
+    assert result["status"] == "applied", result
+    assert transaction_inputs[0]["schema"] == "ISSUE_EDIT_TXN_INPUT_V1"
+    assert transaction_inputs[0]["expected_previous_body_sha256"].startswith("sha256:")
+    assert result["fresh_checks"] == {"preflight": "pass", "review": "approve", "readiness": "go"}
 
 
 def test_section_aware_desired_state_replaces_and_removes_contradictions():
