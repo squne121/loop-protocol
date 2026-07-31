@@ -450,7 +450,16 @@ def _run_gh(argv: list[str], timeout: int = GH_API_TIMEOUT) -> tuple[dict | list
 def _fetch_issue(repo: str, issue_number: int) -> tuple[dict | None, str]:
     """Fetch issue data via gh issue view --json."""
     data, err = _run_gh(
-        ["gh", "issue", "view", str(issue_number), "--repo", repo, "--json", "number,title,body,labels,url"]
+        [
+            "gh",
+            "issue",
+            "view",
+            str(issue_number),
+            "--repo",
+            repo,
+            "--json",
+            "number,title,body,labels,url,updatedAt",
+        ]
     )
     return data, err
 

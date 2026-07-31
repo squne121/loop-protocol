@@ -158,8 +158,11 @@ def test_preflight_consumer_executes_controlled_transaction_and_final_readback(t
     state = {"body": PRE_BODY}
     transaction_inputs: list[dict] = []
 
-    def fetch_current():
-        return ({"body": state["body"], "updatedAt": "2026-08-01T00:00:00Z"}, _anchor())
+    def fetch_live_issue(_repo: str, _issue_number: int):
+        return ({"body": state["body"], "updatedAt": "2026-08-01T00:00:00Z"}, "")
+
+    def fetch_live_anchor(_repo: str, _comment_id: int):
+        return ({**_anchor(), "body": ANCHOR_BODY}, "")
 
     def controlled_transaction(argv, **_kwargs):
         payload = json.loads((tmp_path / argv[-1]).read_text(encoding="utf-8"))
@@ -169,12 +172,14 @@ def test_preflight_consumer_executes_controlled_transaction_and_final_readback(t
 
     with (
         mock.patch.object(preflight, "_find_repo_root", return_value=tmp_path),
+        mock.patch.object(preflight, "_fetch_issue", side_effect=fetch_live_issue),
+        mock.patch.object(preflight, "_fetch_single_comment", side_effect=fetch_live_anchor),
         mock.patch.object(preflight.subprocess, "run", side_effect=controlled_transaction),
     ):
         result = preflight.consume_trusted_anchor_contract_patch_plan(
             repo=REPO,
             issue_number=ISSUE,
-            issue={"body": PRE_BODY, "updatedAt": "2026-08-01T00:00:00Z"},
+            issue={"body": PRE_BODY},
             anchor_url=ANCHOR_URL,
             anchor_payload=_anchor(),
             anchor_body=ANCHOR_BODY,
@@ -187,7 +192,6 @@ def test_preflight_consumer_executes_controlled_transaction_and_final_readback(t
                 }
             ),
             callbacks={
-                "fetch_current": fetch_current,
                 "candidate_readiness": _readiness,
                 "fresh_checks": lambda _issue: {"preflight": "pass", "review": "approve", "readiness": "go"},
             },
@@ -197,6 +201,15 @@ def test_preflight_consumer_executes_controlled_transaction_and_final_readback(t
     assert transaction_inputs[0]["schema"] == "ISSUE_EDIT_TXN_INPUT_V1"
     assert transaction_inputs[0]["expected_previous_body_sha256"].startswith("sha256:")
     assert result["fresh_checks"] == {"preflight": "pass", "review": "approve", "readiness": "go"}
+
+
+def test_live_issue_fetch_requests_updated_at_for_transaction_precondition():
+    with mock.patch.object(preflight, "_run_gh", return_value=({"updatedAt": "2026-08-01T00:00:00Z"}, "")) as run_gh:
+        issue, error = preflight._fetch_issue(REPO, ISSUE)
+
+    assert error == ""
+    assert issue["updatedAt"] == "2026-08-01T00:00:00Z"
+    assert "updatedAt" in run_gh.call_args.args[0][-1].split(",")
 
 
 def test_section_aware_desired_state_replaces_and_removes_contradictions():
