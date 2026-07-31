@@ -1485,6 +1485,7 @@ def _build_result(
     rewrite_constraints: Optional[dict[str, Any]],
     artifacts: dict[str, str],
     hashes: dict[str, str],
+    contract_update: Optional[dict[str, Any]] = None,
 ) -> dict:
     """Build a refinement_preflight_result/v1 compliant dict."""
     result = {
@@ -1507,7 +1508,38 @@ def _build_result(
     }
     if rewrite_constraints is not None:
         result["rewrite_constraints"] = rewrite_constraints
+    if contract_update is not None:
+        result["contract_update"] = contract_update
     return result
+
+
+def _bounded_contract_update_handoff(consumer_result: dict[str, Any]) -> dict[str, Any]:
+    """Project the transaction-local consumer result into the existing result.
+
+    This intentionally retains only the phase outcome needed by the parent
+    orchestrator.  Source bodies, candidate bodies, operation identities, and
+    transaction payloads remain local to the controlled phase.
+    """
+    raw_status = consumer_result.get("status")
+    states = consumer_result.get("states")
+    state = states.get("contract_update", {}).get("status") if isinstance(states, dict) else None
+    iterations = consumer_result.get("iterations", 0)
+    if raw_status == "applied" and iterations == 1:
+        status = "rebased"
+    else:
+        status = state if state in {"applied", "no_change", "rebased"} else "failed"
+    fresh = consumer_result.get("fresh_checks")
+    if not isinstance(fresh, dict):
+        fresh = {}
+    return {
+        "status": status,
+        "writes": int(consumer_result.get("writes", 0)) if isinstance(consumer_result.get("writes", 0), int) else 0,
+        "iterations": int(iterations) if isinstance(iterations, int) else 0,
+        "final_readback": "verified" if raw_status in {"applied", "no_change"} else "failed",
+        "fresh_preflight": str(fresh.get("preflight", "unavailable")),
+        "fresh_review": str(fresh.get("review", "unavailable")),
+        "fresh_readiness": str(fresh.get("readiness", "unavailable")),
+    }
 
 
 def _commands_from_plan(plan: dict, issue_number: int, repo: str) -> list[dict]:
@@ -1897,6 +1929,7 @@ def run_preflight(
     anchor_payload_for_consumer: Optional[dict] = None
     anchor_body_for_consumer: Optional[str] = None
     anchor_url_for_consumer: Optional[str] = None
+    contract_update_handoff: Optional[dict[str, Any]] = None
 
     # --- Load data (fixture or live gh) ---
     if fixture_path is not None:
@@ -2246,8 +2279,22 @@ def run_preflight(
                 contract_patch_plan=patch_plan,
                 callbacks=contract_update_callbacks,
             )
-            if consumer_result.get("status") == "blocked":
+            contract_update_handoff = _bounded_contract_update_handoff(consumer_result)
+            if consumer_result.get("status") not in {"applied", "no_change"}:
                 blockers.append(BLOCKER_FAIL_CLOSED)
+        else:
+            # The explicit mutation phase has no safe action without a
+            # planner-produced and provenance-bound patch plan.
+            contract_update_handoff = {
+                "status": "failed",
+                "writes": 0,
+                "iterations": 0,
+                "final_readback": "failed",
+                "fresh_preflight": "unavailable",
+                "fresh_review": "unavailable",
+                "fresh_readiness": "unavailable",
+            }
+            blockers.append(BLOCKER_FAIL_CLOSED)
 
     # --- Extract planner output fields ---
     fail_closed = plan.get("fail_closed", {})
@@ -2418,6 +2465,8 @@ def run_preflight(
         "required_contract_keys": required_contract_keys,
         "rewrite_constraints": rewrite_constraints,
     }
+    if contract_update_handoff is not None:
+        result_core_for_hash["contract_update"] = contract_update_handoff
     result_core_text = json.dumps(result_core_for_hash, sort_keys=True, ensure_ascii=False, allow_nan=False)
 
     hashes = {
@@ -2449,6 +2498,7 @@ def run_preflight(
         rewrite_constraints=rewrite_constraints,
         artifacts=artifacts,
         hashes=hashes,
+        contract_update=contract_update_handoff,
     )
     try:
         _write_artifacts(repo_root, issue_number, raw_snapshot, planner_input_dict, result)

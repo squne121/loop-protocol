@@ -26,6 +26,7 @@ from skill_runtime_command_policy import (
     command_allows_root_no_worktree,
     current_branch,
     is_exact_skill_runtime_anchor_executor_command,
+    is_exact_skill_runtime_contract_update_anchor_executor_command,
     is_exact_skill_runtime_executor_command,
     is_exact_skill_runtime_fixture_executor_command,
     load_registry_entry,
@@ -409,15 +410,30 @@ def _is_symlink_path(path: Path) -> bool:
     return False
 
 
+def _allowed_artifact_roots(project_root: str, issue_number: str, command_id: str = "") -> tuple[Path, ...]:
+    roots = [Path(project_root) / ".claude" / "artifacts" / "issue-refinement-loop" / issue_number]
+    if command_id == "contract_update.run.with_anchor":
+        # The existing edit-issue transaction writes its request metadata
+        # under this exact Issue-scoped directory.  Do not grant the phase a
+        # broader artifacts root or a second Issue's metadata directory.
+        roots.append(Path(project_root) / "artifacts" / issue_number / "issue-metadata")
+    return tuple(roots)
+
+
 def _allowed_artifact_root(project_root: str, issue_number: str) -> Path:
-    return Path(project_root) / ".claude" / "artifacts" / "issue-refinement-loop" / issue_number
+    """Legacy single-root accessor for read-only preflight callers."""
+    return _allowed_artifact_roots(project_root, issue_number)[0]
 
 
-def _is_under_allowed_artifact_root(project_root: str, issue_number: str, rel_path: str) -> bool:
+def _is_under_allowed_artifact_root(
+    project_root: str, issue_number: str, rel_path: str, command_id: str = ""
+) -> bool:
     root = Path(project_root)
     target = (root / rel_path).resolve()
-    allowed_root = _allowed_artifact_root(project_root, issue_number).resolve()
-    return target == allowed_root or target.is_relative_to(allowed_root)
+    return any(
+        target == allowed_root.resolve() or target.is_relative_to(allowed_root.resolve())
+        for allowed_root in _allowed_artifact_roots(project_root, issue_number, command_id)
+    )
 
 
 def _git_status_paths(project_root: str) -> set[str]:
@@ -529,7 +545,19 @@ def _is_real_nonsymlink_dir(project_root: str, rel_dir: str) -> bool:
     return not _is_symlink_path(path)
 
 
-def _expand_new_status_paths(project_root: str, new_raw_paths: set[str]) -> set[str]:
+def _strict_ancestor_of_allowed_artifact_root(
+    project_root: str, issue_number: str, rel_path: str, command_id: str
+) -> bool:
+    candidate = (Path(project_root) / rel_path.rstrip("/")).resolve()
+    return any(
+        candidate != allowed_root.resolve() and allowed_root.resolve().is_relative_to(candidate)
+        for allowed_root in _allowed_artifact_roots(project_root, issue_number, command_id)
+    )
+
+
+def _expand_new_status_paths(
+    project_root: str, new_raw_paths: set[str], issue_number: str = "", command_id: str = ""
+) -> set[str]:
     """Expand any newly-appeared folded-ignored-ancestor entries (see
     `_strict_ancestor_of_race_tolerant_root`) into their real leaf paths so
     that race-tolerant-root exclusion can be applied precisely, instead of
@@ -543,7 +571,10 @@ def _expand_new_status_paths(project_root: str, new_raw_paths: set[str]) -> set[
     """
     expanded: set[str] = set()
     for path in new_raw_paths:
-        if path.endswith("/") and _strict_ancestor_of_race_tolerant_root(path):
+        if path.endswith("/") and (
+            _strict_ancestor_of_race_tolerant_root(path)
+            or _strict_ancestor_of_allowed_artifact_root(project_root, issue_number, path, command_id)
+        ):
             if _is_real_nonsymlink_dir(project_root, path):
                 expanded.update(_expand_folded_ignored_status_dir(project_root, path))
                 continue
@@ -551,15 +582,18 @@ def _expand_new_status_paths(project_root: str, new_raw_paths: set[str]) -> set[
     return expanded
 
 
-def _snapshot_repo_paths(project_root: str, issue_number: str) -> dict[str, tuple[str, int, int]]:
+def _snapshot_repo_paths(
+    project_root: str, issue_number: str, command_id: str = ""
+) -> dict[str, tuple[str, int, int]]:
     root = Path(project_root)
-    allowed_root = _allowed_artifact_root(project_root, issue_number)
+    allowed_roots = _allowed_artifact_roots(project_root, issue_number, command_id)
     peer_roots = _race_tolerant_unattributable_roots(project_root)
     allowed_parent_dirs: set[Path] = set()
-    for parent in allowed_root.parents:
-        allowed_parent_dirs.add(parent)
-        if parent == root:
-            break
+    for allowed_root in allowed_roots:
+        for parent in allowed_root.parents:
+            allowed_parent_dirs.add(parent)
+            if parent == root:
+                break
     # Issue #1409: also skip recording the directory-node entry (its own
     # mtime/size) for every ancestor of each race-tolerant-unattributable
     # root. Without this, a *new* top-level ancestor directory (e.g.
@@ -605,7 +639,7 @@ def _snapshot_repo_paths(project_root: str, issue_number: str) -> dict[str, tupl
                 continue
             if path in peer_roots:
                 continue
-            if path == allowed_root or path.is_relative_to(allowed_root):
+            if any(path == allowed_root or path.is_relative_to(allowed_root) for allowed_root in allowed_roots):
                 continue
             if path in allowed_parent_dirs:
                 continue
@@ -622,15 +656,18 @@ def _snapshot_repo_paths(project_root: str, issue_number: str) -> dict[str, tupl
     return snapshot
 
 
-def _ensure_artifact_path_safe(project_root: str, issue_number: str) -> Path:
-    artifact_root = _allowed_artifact_root(project_root, issue_number)
-    parent = artifact_root.parent
-    for candidate in (Path(project_root) / ".claude", Path(project_root) / ".claude" / "artifacts", parent):
-        if candidate.exists() and _is_symlink_path(candidate):
-            raise RuntimeError("artifact_parent_symlink_not_allowed")
-    if artifact_root.exists() and (_is_symlink_path(artifact_root) or artifact_root.is_symlink()):
-        raise RuntimeError("artifact_root_symlink_not_allowed")
-    return artifact_root
+def _ensure_artifact_path_safe(project_root: str, issue_number: str, command_id: str = "") -> Path:
+    artifact_roots = _allowed_artifact_roots(project_root, issue_number, command_id)
+    for artifact_root in artifact_roots:
+        parent = artifact_root.parent
+        for candidate in (parent, *parent.parents):
+            if candidate == Path(project_root).parent:
+                break
+            if candidate.exists() and _is_symlink_path(candidate):
+                raise RuntimeError("artifact_parent_symlink_not_allowed")
+        if artifact_root.exists() and (_is_symlink_path(artifact_root) or artifact_root.is_symlink()):
+            raise RuntimeError("artifact_root_symlink_not_allowed")
+    return artifact_roots[0]
 
 
 def _safe_path_entries() -> list[str]:
@@ -745,7 +782,7 @@ def _validate_runtime_context(project_root: str, args: argparse.Namespace) -> Pa
             raise RuntimeError("active_issue_mismatch")
         if entry is None:
             raise RuntimeError("active_issue_worktree_missing")
-    return _ensure_artifact_path_safe(project_root, str(args.issue_number))
+    return _ensure_artifact_path_safe(project_root, str(args.issue_number), args.command_id)
 
 
 def _resolve_child_argv(child_argv: Iterable[str]) -> list[str]:
@@ -1157,13 +1194,14 @@ def _find_unauthorized_repo_changes(
     shadow_log_before_kind: str | None = None,
     shadow_log_before_bytes: bytes | None = None,
     shadow_log_before_identity: tuple[int, int, int, int] | None = None,
+    command_id: str = "",
 ) -> str | None:
     # Issue #1830: launch-ledger state is advisory telemetry. Keep its exact
     # paths out of the child-attribution diff, but never turn missing,
     # malformed, mixed, or concurrent ledger state into a routing failure.
     ledger_before_kinds = ledger_before_kinds or {}
 
-    after_snapshot = _snapshot_repo_paths(project_root, issue_number)
+    after_snapshot = _snapshot_repo_paths(project_root, issue_number, command_id)
     after_status = _git_status_paths(project_root)
 
     # Issue #1563 / PR #1572 REQUEST_CHANGES (Blocker 1): the shadow-log
@@ -1218,12 +1256,14 @@ def _find_unauthorized_repo_changes(
     # before applying race-tolerant-root exclusion, so cold-start creation of
     # a race-tolerant subtree under an ignored parent is not misreported as
     # an unauthorized write to the collapsed parent itself.
-    expanded_new_status_paths = _expand_new_status_paths(project_root, new_raw_status_paths)
+    expanded_new_status_paths = _expand_new_status_paths(
+        project_root, new_raw_status_paths, issue_number, command_id
+    )
     safe_ledger_ancestor_dir_rels = _safe_ledger_ancestor_dir_rels(project_root, ledger_ancestor_before_kinds)
     new_status_paths = {
         path
         for path in expanded_new_status_paths
-        if not _is_under_allowed_artifact_root(project_root, issue_number, path)
+        if not _is_under_allowed_artifact_root(project_root, issue_number, path, command_id)
         and not _is_race_tolerant_unattributable_path(path)
         and path not in _LEDGER_TYPED_EXACT_RELS
         and path != _SHADOW_LOG_EXACT_REL
@@ -1338,7 +1378,9 @@ def _parse_artifact_projection(stdout: str) -> list[str]:
     return artifacts
 
 
-def _validate_stdout_artifact_projection(project_root: str, issue_number: str, stdout: str) -> list[str]:
+def _validate_stdout_artifact_projection(
+    project_root: str, issue_number: str, stdout: str, command_id: str = ""
+) -> list[str]:
     failures: list[str] = []
     root_real = os.path.realpath(project_root)
     for raw_path in _parse_artifact_projection(stdout):
@@ -1352,7 +1394,7 @@ def _validate_stdout_artifact_projection(project_root: str, issue_number: str, s
             if os.path.commonpath([root_real, resolved]) == root_real
             else resolved
         )
-        if not _is_under_allowed_artifact_root(project_root, issue_number, rel_path):
+        if not _is_under_allowed_artifact_root(project_root, issue_number, rel_path, command_id):
             failures.append(_repo_relative_path(project_root, resolved))
     return failures
 
@@ -1431,6 +1473,7 @@ def main(argv: list[str] | None = None) -> int:
 
     is_fixture_command = args.command_id == "preflight.run.fixture"
     is_anchor_command = args.command_id == "preflight.run.with_anchor"
+    is_contract_update_command = args.command_id == "contract_update.run.with_anchor"
     if is_fixture_command:
         if not args.fixture:
             print("skill_runtime_exec: --fixture required for preflight.run.fixture", file=sys.stderr)
@@ -1460,16 +1503,16 @@ def main(argv: list[str] | None = None) -> int:
         if not is_exact_skill_runtime_fixture_executor_command(command_text, project_root, project_root):
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
-    elif is_anchor_command:
+    elif is_anchor_command or is_contract_update_command:
         if args.fixture:
             print(
-                "skill_runtime_exec: --fixture is not allowed for preflight.run.with_anchor",
+                "skill_runtime_exec: --fixture is not allowed for anchor runtime commands",
                 file=sys.stderr,
             )
             return 2
         if not args.anchor_comment_url:
             print(
-                "skill_runtime_exec: --anchor-comment-url required for preflight.run.with_anchor",
+                "skill_runtime_exec: --anchor-comment-url required for anchor runtime commands",
                 file=sys.stderr,
             )
             return 2
@@ -1489,7 +1532,14 @@ def main(argv: list[str] | None = None) -> int:
                 args.anchor_comment_url,
             ]
         )
-        if not is_exact_skill_runtime_anchor_executor_command(command_text, project_root, project_root):
+        exact_anchor_command = (
+            is_exact_skill_runtime_anchor_executor_command(command_text, project_root, project_root)
+            if is_anchor_command
+            else is_exact_skill_runtime_contract_update_anchor_executor_command(
+                command_text, project_root, project_root
+            )
+        )
+        if not exact_anchor_command:
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
     else:
@@ -1522,7 +1572,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     _validate_runtime_context(project_root, args)
-    before_snapshot = _snapshot_repo_paths(project_root, str(args.issue_number))
+    before_snapshot = _snapshot_repo_paths(project_root, str(args.issue_number), args.command_id)
     before_status = _git_status_paths(project_root)
     ledger_before_kinds = _ledger_exact_kinds(project_root)
     ledger_ancestor_before_kinds = _ledger_ancestor_kinds(project_root)
@@ -1566,7 +1616,7 @@ def main(argv: list[str] | None = None) -> int:
     render_params: dict[str, object] = {"issue_number": args.issue_number, "repo": args.repo}
     if is_fixture_command:
         render_params["fixture"] = args.fixture
-    if is_anchor_command:
+    if is_anchor_command or is_contract_update_command:
         render_params["anchor_comment_url"] = args.anchor_comment_url
     child_argv = render_command(args.command_id, render_params)
     child_argv = _resolve_child_argv(child_argv)
@@ -1605,6 +1655,7 @@ def main(argv: list[str] | None = None) -> int:
         shadow_log_before_kind,
         shadow_log_before_bytes,
         shadow_log_before_identity,
+        args.command_id,
     )
     if unauthorized_path is not None:
         return _emit_unauthorized_write_failure(args.issue_number, unauthorized_path)
@@ -1613,6 +1664,7 @@ def main(argv: list[str] | None = None) -> int:
         project_root,
         str(args.issue_number),
         result.stdout,
+        args.command_id,
     )
     if artifact_projection_failures:
         return _emit_artifact_projection_failure(args.issue_number, artifact_projection_failures)

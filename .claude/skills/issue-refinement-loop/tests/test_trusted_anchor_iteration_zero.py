@@ -229,6 +229,28 @@ def test_preflight_consumer_executes_controlled_transaction_and_final_readback(t
     assert result["fresh_checks"] == {"preflight": "pass", "review": "approve", "readiness": "go"}
 
 
+def test_bounded_contract_update_handoff_retains_only_parent_routing_fields():
+    handoff = preflight._bounded_contract_update_handoff(
+        {
+            "status": "applied",
+            "states": {"contract_update": {"status": "applied"}},
+            "writes": 1,
+            "iterations": 1,
+            "candidate_body": "must not escape the transaction-local phase",
+            "fresh_checks": {"preflight": "pass", "review": "approve", "readiness": "go"},
+        }
+    )
+    assert handoff == {
+        "status": "rebased",
+        "writes": 1,
+        "iterations": 1,
+        "final_readback": "verified",
+        "fresh_preflight": "pass",
+        "fresh_review": "approve",
+        "fresh_readiness": "go",
+    }
+
+
 def test_live_issue_fetch_requests_updated_at_for_transaction_precondition():
     with mock.patch.object(preflight, "_run_gh", return_value=({"updatedAt": "2026-08-01T00:00:00Z"}, "")) as run_gh:
         issue, error = preflight._fetch_issue(REPO, ISSUE)
@@ -276,6 +298,15 @@ def test_issue_1835_full_post_body_is_built_from_immutable_section_desired_state
     assert EXPECTED_POST_BODY.startswith("## Machine-Readable Contract\n")
     assert "CODEX_DISPATCH_CONTRACT_V1" in EXPECTED_POST_BODY
     assert "#1842" in EXPECTED_POST_BODY
+
+
+def test_issue_1835_full_post_body_and_non_target_contexts():
+    """AC5: the fixture keeps the exact golden body and non-target contexts."""
+    assert "sha256:" + hashlib.sha256(EXPECTED_POST_BODY.encode("utf-8")).hexdigest() == FIXTURE[
+        "expected_post_body_sha256"
+    ]
+    unsafe_sections = {"指定コメントへの直接回答", "指定コメントへの返信案"}
+    assert unsafe_sections.isdisjoint(sda.extract_sections(EXPECTED_POST_BODY))
 
 
 def test_rebases_body_drift_once_and_revalidates_anchor():
