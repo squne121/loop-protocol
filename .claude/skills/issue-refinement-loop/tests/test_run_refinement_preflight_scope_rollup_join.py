@@ -22,6 +22,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 import run_refinement_preflight as wrapper  # noqa: E402
 import plan_refinement_loop as prl  # noqa: E402
+import validate_issue_execution_decision as vied  # noqa: E402
 
 
 VALID_ISSUE_BODY = """\
@@ -200,7 +201,7 @@ def test_run_preflight_joins_persisted_scope_rollup_artifact(tmp_path):
     relation_types = {r["relation_type"] for r in decision["relations"]}
     assert "depends_on" not in relation_types
     assert decision["execution"]["predecessors"] == []
-    assert prl.validate_issue_execution_decision(decision) == []
+    assert vied.validate_issue_execution_decision(decision) == []
 
 
 def test_run_preflight_without_scope_rollup_artifact_defaults_to_selected(tmp_path):

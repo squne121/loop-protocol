@@ -44,7 +44,7 @@ _PUB_SCRIPTS_DIR = (
 if str(_PUB_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_PUB_SCRIPTS_DIR))
 
-import publish_termination_report as _pub
+import isolation_issue_comment_bridge as _pub
 
 
 def _build_request(issue_number, repo, comment_body, marker):

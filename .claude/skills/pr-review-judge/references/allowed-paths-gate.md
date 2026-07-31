@@ -1,5 +1,11 @@
 # ALLOWED_PATHS_GATE_RESULT_V1（pr-review-judge 消費）
 
+Allowed Paths パターンの canonical source は **live linked issue 本文**（review 実行ごとに
+`gh issue view <N> --json body` で取得）である。contract snapshot / capsule に保存された
+コピーは advisory cache に過ぎず、canonical authority ではない。linked issue の本文が
+review 実行後に変わった場合は、snapshot を信用し続けず refetch し、Allowed Paths を
+再評価してから re-review する。
+
 snapshot freshness 用の `base_sha_at_snapshot` と、changed files 算出用の `diff_base_sha` を分離して扱う。
 canonical な判定 input は `audited_paths[]`（`changed_file_records[]` から派生）であり、
 `changed_files[]`（post-image filename のみ）は backward-compatible alias に過ぎない。
@@ -61,8 +67,11 @@ Status 定義:
 
 - `ok`: audited_paths すべて許容
 - `fail_closed`: 逸脱あり（必須 blocker）
-- `stale_snapshot`: snapshot と現状が不一致
-- `indeterminate`: preflight 不足/ head mismatch/ snapshot 不完全/ rename provenance 不足
+- `indeterminate`: preflight 不足/ head mismatch/ rename provenance 不足/ live 本文取得不能
+
+contract snapshot の fingerprint が live 本文と乖離している場合（旧 `stale_snapshot`）は、`status`
+を占有せず `warnings[]`（`stale_snapshot: ...`）に advisory として記録するのみである。単独では
+block しない -- live 本文で Allowed Paths を評価した結果（`ok` / `fail_closed`）が canonical。
 
 ## matcher（要点）
 
@@ -72,11 +81,14 @@ Status 定義:
 
 ## 結果反映
 
-`indeterminate/fail_closed` は merge-blocking として扱い、`REQUEST_CHANGES` 経路。
+`indeterminate`（rename provenance 不足等）/ `fail_closed`（Allowed Paths 逸脱）は
+merge-blocking として扱い、`REQUEST_CHANGES` 経路。fingerprint drift（`warnings[]` の
+`stale_snapshot: ...`）は merge-blocking ではない（advisory。上記 Status 定義参照）。
 
 ## provenance（由来情報）
 
-- `contract_fingerprint.base_sha_at_snapshot`: snapshot freshness 判定専用
+- `contract_fingerprint.base_sha_at_snapshot`: snapshot freshness の **advisory** 記録専用。
+  gate 判定（`ok`/`fail_closed`/`indeterminate`）の canonical authority ではない
 - `diff_base_sha`: changed files 算出専用
 - `base_sha`: `diff_base_sha` の backward-compatible alias
 - `changed_files_source`: `git_diff_name_status_find_renames_z` /
@@ -87,25 +99,19 @@ Status 定義:
   Allowed Paths 判定の canonical input
 - `violations[]`: `file` / `path_role` / `reason` を持つ
 
-## `LOOP_VERDICT_V2.allowed_paths_gate` 必須最小フィールド（Medium 対応）
+## gate 結果の reviewer_verdict への反映（Issue #1873）
 
-```yaml
-LOOP_VERDICT_V2.allowed_paths_gate:
-  required_minimum:
-    - status
-    - changed_files_source
-    - changed_files
-  optional_but_preserved_if_present:
-    - changed_file_records
-    - audited_paths
-    - violations[].path_role
-```
-
-`status` / `changed_files_source` / `changed_files` は消費側 (`impl-review-loop` 等) が
-最低限読む必須フィールドであり、後方互換を壊さず常に出力する。
-`changed_file_records` / `audited_paths` / `violations[].path_role` は rename provenance
-判定の canonical な監査証跡として存在する場合は必ず維持し、値を欠落させたり
-黙って落としたりしてはならない。
+Issue #1873 以降、この gate の結果は `LOOP_VERDICT_V2.allowed_paths_gate` という専用フィールドの
+自己申告としては受け渡さない。pr-reviewer はこの決定論的 script（`git_diff_name_status_find_renames_z` /
+`github_pull_request_files_api_with_previous_filename` 由来の `status` / `changed_files_source` /
+`changed_files` / `audited_paths` / `violations[]`）を自ら実行し、`status` が `ok` 以外
+（`fail_closed` / `indeterminate`）の場合は具体的な違反内容
+（file / path_role / reason）を `reviewer_verdict.blockers[]` にテキストとして記載する。
+`warnings[]`（`stale_snapshot` 等の advisory）は `reviewer_verdict.warnings[]` へ反映してよいが、
+`blockers[]` には反映しない。
+`status == ok` の場合は blocker を追加しない。gate evaluator 自体（matcher、rename provenance、
+`changed_file_records` の構造）は変更しない。この script の正本は pr-review-judge 配下の
+決定論的スクリプト出力のままであり、worker 自己申告（`allowed_paths_compliance`）は canonical にしない。
 
 ## matcher v2 grammar（マッチャ v2 文法）
 

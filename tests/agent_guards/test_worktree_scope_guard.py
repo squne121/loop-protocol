@@ -2459,7 +2459,7 @@ def test_publish_termination_direct_denied_real_hook(tmp_path):
     assert r.returncode == 2, f"direct publish_termination_report.py must be denied; stderr={r.stderr}"
 
 
-def test_publish_termination_executor_allowed_real_hook(tmp_path):
+def test_controlled_skill_mutation_executor_allowed_real_hook(tmp_path):
     """AC5/AC9: controlled_skill_mutation_exec.py with valid argv is allowed by real hook.
 
     The executor command passes the shared policy check and is allowed even when
@@ -2471,17 +2471,17 @@ def test_publish_termination_executor_allowed_real_hook(tmp_path):
     executor_dir.mkdir(parents=True, exist_ok=True)
     executor = executor_dir / "controlled_skill_mutation_exec.py"
     executor.write_text("# stub\n")
-    # Create a plausible input-file in artifacts subtree
-    artifact_dir = repo["root"] / "artifacts" / "1166"
+    # Create a plausible input-file in the issue_body.update artifact subtree
+    artifact_dir = repo["root"] / "artifacts" / "1166" / "issue-metadata" / "issue_body.update"
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    input_file = artifact_dir / "termination_report_input.json"
+    input_file = artifact_dir / "issue_body_input.json"
     input_file.write_text("{}\n")
 
     cmd = (
         "uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py"
-        " --command-id termination_report.publish"
+        " --command-id issue_body.update"
         " --issue-number 1166"
-        " --input-file artifacts/1166/termination_report_input.json"
+        " --input-file artifacts/1166/issue-metadata/issue_body.update/issue_body_input.json"
         " --repo squne121/loop-protocol"
     )
     payload = _bash_payload(cmd, str(repo["root"]))

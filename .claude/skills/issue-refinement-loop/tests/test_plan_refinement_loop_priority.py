@@ -30,6 +30,7 @@ SCRIPT_DIR = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import plan_refinement_loop as prl  # noqa: E402
+import validate_issue_execution_decision as vied  # noqa: E402
 
 
 REQUIRED_SECTIONS_BODY = """
@@ -146,7 +147,7 @@ def test_execution_state_selected_fixture():
     assert decision["execution"]["state"] == "selected"
     assert decision["execution"]["predecessors"] == []
     assert decision["execution"]["defer_reason"] is None
-    assert prl.validate_issue_execution_decision(decision) == []
+    assert vied.validate_issue_execution_decision(decision) == []
 
 
 def test_execution_state_blocked_fixture():
@@ -204,7 +205,7 @@ def test_execution_state_blocked_fixture():
             }
         )
     )
-    assert prl.validate_issue_execution_decision(decision) == []
+    assert vied.validate_issue_execution_decision(decision) == []
 
 
 def test_relations_duplicate_fixture():
@@ -266,7 +267,7 @@ def test_relations_duplicate_fixture():
     relation_types = {r["relation_type"] for r in decision["relations"]}
     assert "duplicate" in relation_types
     assert decision["execution"]["state"] == "duplicate"
-    assert prl.validate_issue_execution_decision(decision) == []
+    assert vied.validate_issue_execution_decision(decision) == []
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +284,7 @@ def test_missing_scope_rollup_artifact_does_not_fail_open_to_selected():
     decision = plan["issue_execution_decision"]
     assert decision["execution"]["state"] != "selected"
     assert decision["completeness"]["issues_complete"] is False
-    assert prl.validate_issue_execution_decision(decision) == []
+    assert vied.validate_issue_execution_decision(decision) == []
 
 
 def test_wrong_schema_version_artifact_does_not_fail_open_to_selected():
@@ -339,7 +340,7 @@ def test_sequential_required_is_not_converted_into_directed_predecessor():
     assert "depends_on" not in relation_types
     assert decision["execution"]["state"] not in ("blocked", "selected", "duplicate")
     assert decision["execution"]["predecessors"] == []
-    assert prl.validate_issue_execution_decision(decision) == []
+    assert vied.validate_issue_execution_decision(decision) == []
 
 
 def test_merge_into_current_pr_is_not_converted_into_issue_duplicate():
@@ -424,15 +425,16 @@ def test_target_body_sha256_is_not_double_hashed():
     assert decision["identity"]["target_body_sha256"] == expected
 
 
-def test_fallback_after_semantic_violation_recomputes_digest():
+def test_stale_collection_digest_is_rejected():
     """
-    P0-3.4 regression: build_issue_execution_decision's caller-side fallback
-    (triggered when validate_issue_execution_decision rejects the derived
-    decision) must recompute collection_digest for its own fallback content,
-    not reuse the pre-violation identity/digest.
+    P0-3.4 regression (#1873: plan_refinement_loop.py no longer
+    self-validates/self-repairs its own issue_execution_decision output --
+    that caller-side fallback was removed along with the Replay Arbitration
+    self-check; downstream consumers like run_refinement_preflight.py now
+    independently validate it). This test directly exercises the canonical
+    validator with a deliberately stale collection_digest to prove it is
+    still rejected.
     """
-    # Directly exercise the validator with a deliberately mismatched digest,
-    # proving that a fallback which failed to recompute it would be caught.
     body_sha = "sha256:" + "f" * 64
     decision = {
         "schema_version": "ISSUE_EXECUTION_DECISION_V1",
@@ -457,5 +459,5 @@ def test_fallback_after_semantic_violation_recomputes_digest():
             "unresolved_references": [1018],
         },
     }
-    violations = prl.validate_issue_execution_decision(decision)
+    violations = vied.validate_issue_execution_decision(decision)
     assert "collection_digest_mismatch" in violations

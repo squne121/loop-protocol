@@ -32,18 +32,6 @@ from typing import Any
 
 import jsonschema as _jsonschema
 
-# Issue #1554 PR #1581 OWNER REQUEST_CHANGES Blocker 2: the producer must run
-# the SAME strict `REVIEWER_BLOCKER_CLAIM_V1` shape validation the consumer
-# (`parent_replay_binding.py`) runs, immediately after building the claim and
-# BEFORE any stdout is written. `parent_replay_binding.py` itself is not
-# modified -- only its `validate_reviewer_blocker_claim()` is imported and
-# reused (Out of Scope: duplicating that logic here).
-_HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
-
-import parent_replay_binding as _prb  # noqa: E402
-
 # ---------------------------------------------------------------------------
 # Schema constants (SSOT for ISSUE_REVIEW_RESULT_COMPACT_V1)
 # ---------------------------------------------------------------------------
@@ -188,20 +176,6 @@ def _strict_json_loads(text: str) -> dict[str, Any]:
 
 def _strict_json_dumps(payload: Any, *, indent: int | None = None) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=indent, allow_nan=False)
-
-
-def _strict_json_dumps_compact(payload: Any) -> str:
-    """Canonical single-line JSON (sorted keys, no whitespace, ASCII-only)
-    -- MUST match `parent_replay_binding.canonical_json_bytes()` byte for
-    byte, since the parent recomputes this digest independently over the
-    normalized claim object (Issue #1532)."""
-    return json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    )
 
 
 def _validate_review_result_schema(raw_result: dict[str, Any]) -> None:
@@ -418,6 +392,13 @@ def compact_review_result(
     artifact_content = artifact_content_str.encode("utf-8")
 
     # Build compact dict (stdout representation)
+    # REVIEWED_BODY_SHA256 (#1873): sha256 of the live Issue body that was
+    # actually reviewed, as reported by the reviewer in REVIEW_ISSUE_RESULT_V1's
+    # `body_sha256` field. This is the same source value used for
+    # `producer_body_sha256` in the full artifact above; exposing it on the
+    # compact stdout lets `decide_next_loop_action.py` / callers detect stale
+    # reviewed-body drift without parsing the full artifact.
+    reviewed_body_sha256 = raw_result.get("body_sha256") or ""
     compact_data = {
         "STATUS": status,
         "VERDICT": verdict,
@@ -427,6 +408,7 @@ def compact_review_result(
         "MUST_READ": "",
         "EVIDENCE": str(artifact_path),
         "ARTIFACT": f"compact_review_result_v1={artifact_path}",
+        "REVIEWED_BODY_SHA256": reviewed_body_sha256,
     }
 
     # Build stdout lines
@@ -438,101 +420,11 @@ def compact_review_result(
         f"BLOCKERS: {compact_data['BLOCKERS']}",
         f"NEXT_ACTION: {compact_data['NEXT_ACTION']}",
         f"MUST_READ: {compact_data['MUST_READ']}",
+        f"REVIEWED_BODY_SHA256: {compact_data['REVIEWED_BODY_SHA256']}",
     ]
     if compact_data["EVIDENCE"]:
         stdout_lines.append(f"EVIDENCE: {compact_data['EVIDENCE']}")
     stdout_lines.append(f"ARTIFACT: {compact_data['ARTIFACT']}")
-
-    # Issue #1532 Blocker 1/3.1: needs-fix appends exactly ONE additional
-    # field -- the bounded, untrusted REVIEWER_BLOCKER_CLAIM_V1 claim. This
-    # SubAgent no longer co-locate-runs reviewer_claim_replay.py and no
-    # longer emits REPLAY_VERDICT/ROUTING/SHOULD_CONSUME/etc: those
-    # semantic (routing) fields are now EXCLUSIVELY parent-computed
-    # (PARENT_REPLAY_* -- see parent_replay_binding.py /
-    # validate_review_compact_output.py). The claim is built here (a
-    # deterministic script), not authored freeform by the SubAgent prompt,
-    # and carries only reviewer_blocker_code/message/line_start/line_end --
-    # no findings/checker_evidence/deterministic_checks can be smuggled in.
-    if verdict == "needs-fix":
-        body_sha256_raw = raw_result.get("body_sha256")
-        body_sha256 = (
-            body_sha256_raw if isinstance(body_sha256_raw, str) and body_sha256_raw else "sha256:" + ("0" * 64)
-        )
-        claim_blockers: list[dict[str, Any]] = []
-        # Issue #1554: prefer the deterministic checker's own
-        # `structured_blockers[].code` over the human-readable
-        # `blocking_issues` prose when `structured_blockers` is non-empty.
-        # This keeps `REVIEWER_BLOCKER_CLAIM_V1.blockers[].reviewer_blocker_code`
-        # aligned with the taxonomy the parent-local replay
-        # (`parent_replay_binding.py`) knows how to back with parent-owned
-        # evidence, instead of a `blocking_issues` prose string that never
-        # normalizes to a registered taxonomy entry_id. `blocking_issues`
-        # remains the fallback ONLY when `structured_blockers` is empty
-        # (schema requires the key but allows an empty array).
-        structured_blockers_list = raw_result.get("structured_blockers") or []
-        if structured_blockers_list:
-            for item in structured_blockers_list:
-                if not isinstance(item, dict):
-                    continue
-                # Issue #1554 PR #1581 OWNER REQUEST_CHANGES Blocker 2: no
-                # implicit `str(...).strip()` conversion of `code` here --
-                # the raw value is passed through unchanged so strict
-                # validation (below) sees exactly what the checker produced
-                # and can fail closed on it (whitespace-only, over-length,
-                # wrong type), rather than this loop silently normalizing or
-                # skipping a bad entry.
-                claim_blockers.append(
-                    {
-                        "reviewer_blocker_code": item.get("code"),
-                        "message": item.get("message"),
-                        "line_start": item.get("line_start"),
-                        "line_end": item.get("line_end"),
-                    }
-                )
-        else:
-            for item in blocking_issues:
-                if isinstance(item, dict):
-                    code_raw = item.get("code")
-                    if code_raw is None:
-                        code_raw = item.get("reviewer_blocker_code")
-                    claim_blockers.append(
-                        {
-                            "reviewer_blocker_code": code_raw,
-                            "message": item.get("message"),
-                            "line_start": item.get("line_start"),
-                            "line_end": item.get("line_end"),
-                        }
-                    )
-                elif isinstance(item, str) and item.strip():
-                    claim_blockers.append(
-                        {
-                            "reviewer_blocker_code": item.strip(),
-                            "message": None,
-                            "line_start": None,
-                            "line_end": None,
-                        }
-                    )
-        reviewer_blocker_claim = {
-            "schema": "REVIEWER_BLOCKER_CLAIM_V1",
-            "body_sha256": body_sha256,
-            "blockers": claim_blockers,
-        }
-        # Issue #1554 PR #1581 OWNER REQUEST_CHANGES Blocker 2: producer-side
-        # strict validation, reusing (never duplicating) the consumer's own
-        # `parent_replay_binding.validate_reviewer_blocker_claim()`. Any
-        # shape violation (empty/over-length code, non-int/non-null line
-        # fields, disallowed/missing keys, oversized blockers array) fails
-        # the WHOLE claim closed as a producer failure -- no per-entry
-        # silent skip, no implicit type coercion, no success envelope.
-        try:
-            _prb.validate_reviewer_blocker_claim(reviewer_blocker_claim)
-        except ValueError as exc:
-            raise ValueError(
-                f"REVIEWER_BLOCKER_CLAIM_V1 producer-side strict validation failed: {exc}"
-            ) from exc
-        claim_line = _strict_json_dumps_compact(reviewer_blocker_claim)
-        compact_data["REVIEWER_BLOCKER_CLAIM"] = claim_line
-        stdout_lines.append(f"REVIEWER_BLOCKER_CLAIM: {claim_line}")
 
     return compact_data, stdout_lines, artifact_path, artifact_content
 

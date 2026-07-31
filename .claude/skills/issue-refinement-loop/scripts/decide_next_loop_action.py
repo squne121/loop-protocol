@@ -9,19 +9,25 @@ then emits the next action to stdout.
 This script is READ-ONLY with respect to loop state — it never mutates the
 state file. All mutation is the orchestrator's responsibility.
 
+#1873 (bounded review loops): this router was reduced to a bounded
+verdict/iteration/max_iterations decision. The Replay Arbitration (Step 2a),
+ISSUE_REFINEMENT_PHASE_STATE_V1 phase-gate, and ISSUE_EXECUTION_DECISION_V1
+self-validation that previously wrapped this router were removed — the
+orchestrator now trusts the reviewer VERDICT directly (see
+`compact_review_result.py` / `issue-reviewer` SubAgent) instead of
+independently re-deriving it via `reviewer_claim_replay.py`.
+
 Input:
   --loop-state-file <path>      Path to LOOP_STATE_V1 JSON file
   --loop-state-json <json>      Inline LOOP_STATE_V1 JSON (alternative to file)
   --review-result-verdict <v>   One of: approve | needs-fix | null  (optional;
                                 when omitted, loop_state.last_verdict is used)
-  --max-iterations <N>          Override max_iterations from state (optional)
-  --phase-state-file <path>     Path to ISSUE_REFINEMENT_PHASE_STATE_V1 JSON (optional)
+  --max-iterations <N>          Override max_iterations from state (default: 3)
 
 Output (stdout, budget < 2000 bytes):
-  STATUS: pass | warn | human_escalation | inconsistent_state | router_error
+  STATUS: pass | warn | human_escalation | inconsistent_state
   NEXT_ACTION: continue_to_step_4 | proceed_to_step_4_5 | human_escalation |
-               terminate | rebuild_phase_state | proceed_with_contract_update
-  COMMANDS: (optional) argv-array invocation hints
+               terminate | proceed_with_contract_update
   BLOCKERS: (optional) blocker codes
 
 Exit codes:
@@ -32,15 +38,21 @@ Exit codes:
 
 Priority: inconsistent_state (3) > human_escalation (2) > warn (1) > pass (0).
 
-Phase gate (evaluated BEFORE schema validation):
-  If --phase-state-file is provided and this router is in forbidden_routers,
-  output ISSUE_REFINEMENT_ROUTER_ERROR_V1 and exit 3.
-
 Verdict resolution:
   When --review-result-verdict is omitted (or passed as "null"/""),
   the router uses loop_state.last_verdict as the single source of truth.
   When both --review-result-verdict and loop_state.last_verdict are non-null
   and differ, the router exits with inconsistent_state (exit 3).
+
+Core decision (verdict / iteration / max_iterations only):
+  VERDICT == approve                                -> terminate(approve)
+  VERDICT == needs-fix and iteration < max_iterations -> continue(rewrite)
+  otherwise (blocked, or iteration >= max_iterations) -> terminate(human_review_required)
+
+scope_signal_guard hard-stop and the #1090/#1323 scope_delta_authority
+non-destructive branch (owned by the ANCHOR_SCOPE_REFRAME_V1 lane, #1869)
+remain intact — they are evaluated with higher priority than the verdict
+routing above and are NOT part of the #1873 simplification scope.
 """
 
 from __future__ import annotations
@@ -51,28 +63,11 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
-# PR #1767 owner review (P0-4/AC12 Scope Delta): decide_next_loop_action.py
-# is a downstream consumer of ISSUE_EXECUTION_DECISION_V1 (via LOOP_STATE_V1)
-# and must call the same canonical semantic validator as every other
-# consumer rather than trusting the schema-validated shape alone. Import
-# failure is fail-closed (validate_loop_state() below refuses to pass a
-# LOOP_STATE carrying issue_execution_decision when the validator is
-# unavailable).
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-try:
-    from validate_issue_execution_decision import (
-        validate_issue_execution_decision as _validate_issue_execution_decision,
-    )
-except ImportError:  # pragma: no cover - defensive fallback
-    _validate_issue_execution_decision = None
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 SCHEMA_VERSION = "loop_state/v1"
-PHASE_STATE_SCHEMA_VERSION = "ISSUE_REFINEMENT_PHASE_STATE_V1"
-ROUTER_SELF_NAME = "decide_next_loop_action.py"
 
 # Verdict constants
 VERDICT_APPROVE = "approve"
@@ -84,7 +79,6 @@ ACTION_CONTINUE_TO_STEP_4 = "continue_to_step_4"
 ACTION_PROCEED_TO_STEP_4_5 = "proceed_to_step_4_5"
 ACTION_HUMAN_ESCALATION = "human_escalation"
 ACTION_TERMINATE = "terminate"
-ACTION_REBUILD_PHASE_STATE = "rebuild_phase_state"
 ACTION_PROCEED_WITH_CONTRACT_UPDATE = "proceed_with_contract_update"
 
 # Status constants
@@ -92,7 +86,6 @@ STATUS_PASS = "pass"
 STATUS_WARN = "warn"
 STATUS_HUMAN_ESCALATION = "human_escalation"
 STATUS_INCONSISTENT_STATE = "inconsistent_state"
-STATUS_ROUTER_ERROR = "router_error"
 
 # Exit codes
 EXIT_PASS = 0
@@ -100,156 +93,41 @@ EXIT_WARN = 1
 EXIT_HUMAN_ESCALATION = 2
 EXIT_INCONSISTENT_STATE = 3
 
+DEFAULT_MAX_ITERATIONS = 3
+
 
 # ---------------------------------------------------------------------------
-# Schema validation
+# Minimal structural validation
 # ---------------------------------------------------------------------------
-
-_SCHEMA_PATH = (
-    Path(__file__).resolve().parent.parent / "schemas" / "loop_state.schema.json"
-)
-
-
-def _load_loop_state_schema() -> Optional[dict[str, Any]]:
-    """Load loop_state.schema.json. Returns None if unavailable."""
-    try:
-        with open(_SCHEMA_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except OSError:
-        return None
 
 
 def validate_loop_state(data: Any) -> tuple[bool, str]:
     """
-    Validate loop state data against loop_state.schema.json.
+    Validate the minimal shape this router depends on.
+
+    #1873: the router no longer validates the full LOOP_STATE_V1 JSON Schema
+    (schemas/loop_state.schema.json was removed along with
+    build_loop_state.py). It only checks the fields it actually reads:
+    `iteration` and `max_iterations` (both optional, must be int if present).
 
     Returns (valid, error_message). Never raises for ordinary failures.
-
-    Fail-close contract:
-    - If jsonschema is not importable → return (False, "jsonschema not available: ...")
-    - If schema file is unreadable → return (False, "Schema file unavailable: ...")
-    Fallback validation paths are intentionally absent.
     """
     if not isinstance(data, dict):
         return False, "loop state must be a JSON object"
 
-    try:
-        import jsonschema
-    except ImportError as exc:
-        return False, f"jsonschema not available: {exc}"
+    iteration = data.get("iteration", 0)
+    if not isinstance(iteration, int) or isinstance(iteration, bool):
+        return False, f"iteration must be an int, got {type(iteration).__name__}"
 
-    schema = _load_loop_state_schema()
-    if schema is None:
-        return False, f"Schema file unavailable: {_SCHEMA_PATH}"
+    max_iterations = data.get("max_iterations", DEFAULT_MAX_ITERATIONS)
+    if not isinstance(max_iterations, int) or isinstance(max_iterations, bool):
+        return False, f"max_iterations must be an int, got {type(max_iterations).__name__}"
 
-    try:
-        jsonschema.validate(instance=data, schema=schema)
-    except jsonschema.ValidationError as e:
-        return False, f"Schema validation failed: {e.message}"
-
-    # PR #1767 owner review (P0-4/AC12 Scope Delta): a schema-valid
-    # issue_execution_decision is not necessarily semantically valid (cycle,
-    # digest mismatch, identity/node inconsistency, etc.). This downstream
-    # consumer calls the same canonical validator as producer/LOOP_STATE
-    # builder/handoff producer rather than trusting the shape alone.
-    issue_execution_decision = data.get("issue_execution_decision")
-    if isinstance(issue_execution_decision, dict):
-        if _validate_issue_execution_decision is None:
-            return False, (
-                "issue_execution_decision present but "
-                "validate_issue_execution_decision module import failed "
-                "(fail-closed)"
-            )
-        violations = _validate_issue_execution_decision(issue_execution_decision)
-        if violations:
-            return False, (
-                "issue_execution_decision semantic validation failed: "
-                + ", ".join(violations)
-            )
+    scope_signal = data.get("scope_signal_guard", {})
+    if scope_signal is not None and not isinstance(scope_signal, dict):
+        return False, "scope_signal_guard must be an object when present"
 
     return True, ""
-
-
-# ---------------------------------------------------------------------------
-# Phase gate (evaluated BEFORE schema validation)
-# ---------------------------------------------------------------------------
-
-
-def _load_phase_state(path: str) -> tuple[Optional[dict[str, Any]], str]:
-    """Load ISSUE_REFINEMENT_PHASE_STATE_V1 from file. Returns (data, error_msg)."""
-    p = Path(path)
-    if not p.exists():
-        return None, f"Phase state file not found: {path}"
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        return None, f"Invalid JSON in phase state file: {e}"
-    if not isinstance(data, dict):
-        return None, "Phase state must be a JSON object"
-    return data, ""
-
-
-def _check_phase_gate(
-    phase_state: dict[str, Any],
-) -> tuple[bool, Optional[dict[str, Any]]]:
-    """
-    Check whether this router (decide_next_loop_action.py) is forbidden in the
-    current phase.
-
-    Returns (allowed: bool, router_error_payload: dict | None).
-    If not allowed, router_error_payload contains the ISSUE_REFINEMENT_ROUTER_ERROR_V1.
-    """
-    schema_version = phase_state.get("schema_version")
-    if schema_version != PHASE_STATE_SCHEMA_VERSION:
-        error = {
-            "schema_version": "ISSUE_REFINEMENT_ROUTER_ERROR_V1",
-            "status": "router_error",
-            "reason_code": "missing_phase_state",
-            "phase": phase_state.get("phase", "unknown"),
-            "attempted_router": ROUTER_SELF_NAME,
-            "allowed_routers": phase_state.get("allowed_routers", []),
-            "forbidden_reason": (
-                f"Phase state schema_version mismatch: expected "
-                f"{PHASE_STATE_SCHEMA_VERSION!r}, got {schema_version!r}"
-            ),
-            "missing_fields": [],
-            "unexpected_fields": [],
-            "next_action": "rebuild_phase_state",
-        }
-        return False, error
-
-    phase = phase_state.get("phase", "unknown")
-    allowed_routers = phase_state.get("allowed_routers", [])
-
-    # B3: Allowlist gate — router must be explicitly in allowed_routers (fail-closed).
-    # If allowed_routers is empty or missing, all routers are blocked.
-    if ROUTER_SELF_NAME not in allowed_routers:
-        error = {
-            "schema_version": "ISSUE_REFINEMENT_ROUTER_ERROR_V1",
-            "status": "router_error",
-            "reason_code": "phase_not_allowed",
-            "phase": phase,
-            "attempted_router": ROUTER_SELF_NAME,
-            "allowed_routers": allowed_routers,
-            "forbidden_reason": (
-                f"Router {ROUTER_SELF_NAME!r} is not in allowed_routers for phase {phase!r}. "
-                f"Allowed routers: {allowed_routers}. "
-                f"Use the appropriate phase router for this phase instead."
-            ),
-            "missing_fields": [],
-            "unexpected_fields": [],
-            "next_action": "rebuild_phase_state",
-        }
-        return False, error
-
-    return True, None
-
-
-def _emit_router_error(error: dict[str, Any]) -> None:
-    """Emit ISSUE_REFINEMENT_ROUTER_ERROR_V1 to stdout."""
-    print(f"STATUS: {STATUS_ROUTER_ERROR}")
-    print(f"NEXT_ACTION: {ACTION_REBUILD_PHASE_STATE}")
-    print(f"ISSUE_REFINEMENT_ROUTER_ERROR_V1: {json.dumps(error, ensure_ascii=False)}")
 
 
 # ---------------------------------------------------------------------------
@@ -267,13 +145,12 @@ def decide_next_action(
     Determine the next action for the refinement loop.
 
     Args:
-        loop_state: Validated LOOP_STATE_V1 dict (read-only).
+        loop_state: Validated LOOP_STATE_V1-shaped dict (read-only).
         review_verdict: "approve" | "needs-fix" | None
         max_iterations_override: If provided, overrides loop_state["max_iterations"].
         scope_signal_guard_decision_v2: Optional SCOPE_SIGNAL_GUARD_DECISION_V2
-            sidecar (#1090/#1323). NOT part of LOOP_STATE_V1 (loop_state.schema.json
-            additionalProperties:false) -- passed as a separate argument, same
-            pattern as phase_state. When
+            sidecar (#1090/#1323). NOT part of LOOP_STATE_V1 — passed as a
+            separate argument, same pattern as before. When
             scope_signal_guard_decision_v2.scope_delta_authority.route.action
             == "contract_update_required" (the SCOPE_DELTA_AUTHORITY_V1 nested
             route emitted by classify_scope_delta_authority() in
@@ -281,14 +158,6 @@ def decide_next_action(
             NEXT_ACTION: proceed_with_contract_update without touching
             termination_reason (loop stays open, Issue contract update
             happens out-of-band, then refinement re-runs).
-
-            NOTE (PR #1332 review fix): the top-level
-            scope_signal_guard_decision_v2["route"] field is a DIFFERENT,
-            pre-existing (#1090) enum (not_triggered / human_judgment_required
-            / invalid_scope_delta_approval / proceed_with_notes) used for the
-            ANCHOR_SCOPE_REFRAME_V1 lane split. It never takes the value
-            "contract_update_required" and must not be conflated with the
-            nested scope_delta_authority.route.action checked here.
 
     Returns:
         (status, next_action, commands, blockers, termination_cause_hint)
@@ -298,17 +167,18 @@ def decide_next_action(
         2. proceed_with_contract_update —
            scope_signal_guard_decision_v2.scope_delta_authority.route.action
            == contract_update_required (#1323, non-destructive branch)
-        3. human_escalation  — max_iterations exceeded or hard stop signal
-        4. routing on verdict
+        3. scope_signal_guard hard stop
+        4. max_iterations exceeded
+        5. routing on verdict (bounded #1873 decision: approve / needs-fix / other)
     """
     iteration: int = loop_state.get("iteration", 0)
     max_iterations: int = (
         max_iterations_override
         if max_iterations_override is not None
-        else loop_state.get("max_iterations", 3)
+        else loop_state.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     )
     termination_reason = loop_state.get("termination_reason")
-    scope_signal = loop_state.get("scope_signal_guard", {})
+    scope_signal = loop_state.get("scope_signal_guard", {}) or {}
     blockers: list[str] = []
     _commands: list[str] = []
 
@@ -344,13 +214,6 @@ def decide_next_action(
     # Non-destructive: termination_reason is left untouched (loop keeps
     # running); this only redirects the immediate next step toward a
     # contract update + refinement re-run instead of human_escalation.
-    #
-    # PR #1332 review fix (P0): read the NESTED
-    # scope_delta_authority.route.action produced by
-    # classify_scope_delta_authority() in scope_signal_delta.py -- NOT the
-    # top-level scope_signal_guard_decision_v2["route"], which is a
-    # different, pre-existing (#1090) enum for the ANCHOR_SCOPE_REFRAME_V1
-    # lane split and never equals "contract_update_required".
     _scope_delta_authority = (
         scope_signal_guard_decision_v2.get("scope_delta_authority")
         if isinstance(scope_signal_guard_decision_v2, dict)
@@ -374,9 +237,6 @@ def decide_next_action(
     if scope_signal.get("triggered") and not scope_signal.get(
         "excluded_by_anchor_reframe", False
     ):
-        # Normalize: orchestrator must use human_judgment_required as termination_cause.
-        # scope_signal_guard.reason_code is NOT a valid termination_cause enum value.
-        # reason_code is preserved in blockers so orchestrator can surface it in blockers_summary.
         reason_code = scope_signal.get("reason_code")
         scope_blockers = ["scope_signal_guard_triggered"]
         if reason_code:
@@ -389,7 +249,7 @@ def decide_next_action(
             "human_judgment_required",
         )
 
-    # --- Priority 2b: max_iterations exceeded ---
+    # --- Priority 4: max_iterations exceeded ---
     if review_verdict == VERDICT_NEEDS_FIX and iteration + 1 >= max_iterations:
         blockers = ["max_iterations_exceeded"]
         return (
@@ -400,7 +260,7 @@ def decide_next_action(
             "max_iterations_exceeded",
         )
 
-    # --- Priority 3: verdict routing ---
+    # --- Priority 5: bounded verdict routing (#1873) ---
     if review_verdict == VERDICT_APPROVE:
         return (
             STATUS_PASS,
@@ -420,7 +280,7 @@ def decide_next_action(
             None,
         )
 
-    # verdict is null or unknown — warn but allow continuation
+    # verdict is null/blocked/unknown — terminate to human review
     blockers = [f"unknown_verdict:{review_verdict}"]
     return (
         STATUS_WARN,
@@ -494,18 +354,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=None,
         metavar="N",
-        help="Override max_iterations from state.",
-    )
-    parser.add_argument(
-        "--phase-state-file",
-        metavar="PATH",
-        default=None,
-        help=(
-            "Path to ISSUE_REFINEMENT_PHASE_STATE_V1 JSON file. "
-            "When provided, phase gate is evaluated BEFORE schema validation. "
-            "If this router is forbidden in the current phase, "
-            "ISSUE_REFINEMENT_ROUTER_ERROR_V1 is emitted and exit 3 is returned."
-        ),
+        help="Override max_iterations from state (default: 3).",
     )
     sig_group = parser.add_mutually_exclusive_group()
     sig_group.add_argument(
@@ -514,9 +363,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help=(
             "Path to a SCOPE_SIGNAL_GUARD_DECISION_V2 JSON sidecar (#1090/#1323). "
-            "NOT part of LOOP_STATE_V1 (loop_state.schema.json additionalProperties:false); "
-            "when route == contract_update_required this router returns "
-            "NEXT_ACTION: proceed_with_contract_update without touching termination_reason."
+            "NOT part of LOOP_STATE_V1; when route == contract_update_required "
+            "this router returns NEXT_ACTION: proceed_with_contract_update "
+            "without touching termination_reason."
         ),
     )
     sig_group.add_argument(
@@ -599,35 +448,6 @@ def _load_loop_state(args: argparse.Namespace) -> tuple[Optional[dict[str, Any]]
 def main(argv: Optional[list[str]] = None) -> None:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
 
-    # current_phase_state is set when --phase-state-file is provided; used in B4.
-    current_phase_state: Optional[dict[str, Any]] = None
-
-    # --- Phase gate (evaluated BEFORE schema validation) ---
-    if args.phase_state_file:
-        phase_state, phase_load_err = _load_phase_state(args.phase_state_file)
-        if phase_load_err or phase_state is None:
-            # Cannot read phase state — treat as missing_phase_state error
-            error = {
-                "schema_version": "ISSUE_REFINEMENT_ROUTER_ERROR_V1",
-                "status": "router_error",
-                "reason_code": "missing_phase_state",
-                "phase": "unknown",
-                "attempted_router": ROUTER_SELF_NAME,
-                "allowed_routers": [],
-                "forbidden_reason": phase_load_err or "Phase state data unavailable",
-                "missing_fields": [],
-                "unexpected_fields": [],
-                "next_action": "rebuild_phase_state",
-            }
-            _emit_router_error(error)
-            sys.exit(EXIT_INCONSISTENT_STATE)
-
-        current_phase_state = phase_state
-        allowed, router_error = _check_phase_gate(phase_state)
-        if not allowed and router_error is not None:
-            _emit_router_error(router_error)
-            sys.exit(EXIT_INCONSISTENT_STATE)
-
     # Load loop state
     loop_state, load_error = _load_loop_state(args)
     if load_error or loop_state is None:
@@ -637,33 +457,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         print(f"BLOCKERS: {msg}")
         sys.exit(EXIT_INCONSISTENT_STATE)
 
-    # Validate schema
+    # Validate minimal shape (#1873: no full JSON Schema dependency)
     valid, error_msg = validate_loop_state(loop_state)
     if not valid:
-        # B4: When --phase-state-file is provided, emit ISSUE_REFINEMENT_ROUTER_ERROR_V1
-        # with reason_code: loop_state_invalid instead of generic inconsistent_state.
-        if args.phase_state_file:
-            missing_fields: list[str] = []
-            # Extract missing field hints from jsonschema error messages
-            if "required property" in error_msg or "required" in error_msg.lower():
-                missing_fields = [error_msg]
-            error = {
-                "schema_version": "ISSUE_REFINEMENT_ROUTER_ERROR_V1",
-                "status": "router_error",
-                "reason_code": "loop_state_invalid",
-                "phase": current_phase_state.get("phase", "unknown") if current_phase_state is not None else "unknown",
-                "attempted_router": ROUTER_SELF_NAME,
-                "allowed_routers": [],
-                "forbidden_reason": f"LOOP_STATE_V1 schema validation failed: {error_msg}",
-                "missing_fields": missing_fields,
-                "unexpected_fields": [],
-                "next_action": "rebuild_phase_state",
-            }
-            _emit_router_error(error)
-        else:
-            print(f"STATUS: {STATUS_INCONSISTENT_STATE}")
-            print(f"NEXT_ACTION: {ACTION_HUMAN_ESCALATION}")
-            print(f"BLOCKERS: {error_msg}")
+        print(f"STATUS: {STATUS_INCONSISTENT_STATE}")
+        print(f"NEXT_ACTION: {ACTION_HUMAN_ESCALATION}")
+        print(f"BLOCKERS: {error_msg}")
         sys.exit(EXIT_INCONSISTENT_STATE)
 
     # Parse CLI verdict (may be absent / "null" / "")

@@ -80,39 +80,30 @@ reviewer が `approve` を返しても、最新の `CONTRACT_REVIEW_RESULT_V1.st
 
 `iteration + 1 >= max_iterations` かつ approve なしの場合は `human_escalation` で停止し、全 iteration 分の blocker summary を終了コメントに添付する。`max_iterations=3` 既定では、3 回目の `needs-fix` で停止する。
 
-### TERMINATION_REPORT_INPUT_V1 の正規化（normalization）
+### termination summary の正規化（normalization、正規化処理、#1873）
 
-- `termination_reason: human_escalation` かつ `termination_cause` omitted / `null` の場合、renderer / publisher は `Cause: none` を出さず `human_judgment_required` を fallback cause として扱う
-- caller が `max_iterations_exceeded` などの valid `termination_cause` を明示した場合は上書きしない
-- canonical key は `blockers_summary`。`blocker_summary` は旧 alias として validation 前に `blockers_summary` へ正規化する
-- `blocker_summary` と `blockers_summary` が両方あり値が異なる場合は fail-closed とする
-- `blocker_summary` が `list[str]` でない場合も fail-closed とする
+#1873: `TERMINATION_REPORT_INPUT_V1` を検証する renderer（`render_termination_report.py`）
+は撤去された。orchestrator は以下のルールに従って plain markdown の termination summary
+を直接組み立てる（構造化 JSON payload の正規化ではなく、markdown 本文の組み立て規則）:
 
-human_escalation の入力例（termination_cause と blockers_summary を明示）:
+- `termination_reason: human_escalation` かつ `termination_cause` が未確定の場合、summary
+  本文に `Cause: none` を出さず `human_judgment_required` を fallback cause として書く
+- `decide_next_loop_action.py` が明示した `TERMINATION_CAUSE`（例: `max_iterations_exceeded`）
+  がある場合はそれを使う（fallback で上書きしない）
+- blockers は summary 本文に箇条書きで列挙する（`decide_next_loop_action.py` の BLOCKERS 行を
+  そのまま反映する）
 
-```json
-{
-  "termination_reason": "human_escalation",
-  "termination_cause": "human_judgment_required",
-  "issue_number": 829,
-  "iteration": 3,
-  "blockers_summary": [
-    "オーナー判断が必要",
-    "スコープの矛盾が未解決"
-  ]
-}
-```
+human_escalation の summary 例（markdown）:
 
-legacy alias 例（旧形式の呼び出し元）:
+```markdown
+## issue-refinement-loop: human_escalation
 
-```json
-{
-  "termination_reason": "human_escalation",
-  "issue_number": 829,
-  "blocker_summary": [
-    "legacy caller payload still uses singular key"
-  ]
-}
+- Cause: human_judgment_required
+- Issue: #829
+- Iteration: 3
+- Blockers:
+  - オーナー判断が必要
+  - スコープの矛盾が未解決
 ```
 
 
@@ -120,59 +111,43 @@ legacy alias 例（旧形式の呼び出し元）:
 
 `scope_signal_guard.triggered=true` かつ `excluded_by_anchor_reframe=false` のとき、orchestrator は以下の規則に従って termination payload を組み立てる。
 
-### Phase-sensitive hard_stop_eligible 前提条件
+### 呼び出しタイミング前提条件（#1873）
 
-termination payload を組み立てる前に、現在の phase が `hard_stop_eligible: true` であることを確認する。
-`hard_stop_eligible` は `ISSUE_REFINEMENT_PHASE_STATE_V1.scope_signal_semantics.hard_stop_eligible` で判定する。
+termination payload を組み立てる前に、orchestrator が `decide_next_loop_action.py` を
+呼ぶタイミングそのものが hard-stop 対象かどうかを決める（#1873 で
+`ISSUE_REFINEMENT_PHASE_STATE_V1` の formal phase-gate は撤去された。判定は
+`references/loop-state.md` の「フロー上の位置」表を参照）。
 
-| phase | hard_stop_eligible | scope_signal_guard.triggered 時の動作 |
+| フロー上の位置 | `decide_next_loop_action.py` を呼ぶか | scope_signal_guard.triggered 時の動作 |
 |---|---|---|
-| `preflight` | **false** | `continue_investigation` — human_escalation にしない |
-| `investigation` | **false** | `continue_investigation` — human_escalation にしない |
-| `review` | **false** | `continue_investigation` — pre-rewrite phase。`decide_next_loop_action.py` を呼ばない |
-| `post_rewrite_check` | **true** | `hard_stop_candidate` → termination payload を組み立てる |
-| `decide_next_action` | **true** | `hard_stop_candidate` → termination payload を組み立てる |
+| `preflight` / `investigation` | 呼ばない | シグナルは investigation/review へ進む合図として扱われるのみ |
+| `review`（pre-rewrite） | 呼ばない | VERDICT に基づき直接ルーティングする |
+| rewrite 後 / next-action 決定時 | 呼ぶ | 無条件で `human_escalation` → termination payload を組み立てる |
 
-`hard_stop_eligible: false` の phase では termination payload を組み立てない。
-`decide_next_loop_action.py` はこれらの phase（`preflight`, `investigation`, `review`）で `forbidden_routers` に含まれるため（allowlist gate により allowed_routers 外として）、phase gate が先に作動して `ISSUE_REFINEMENT_ROUTER_ERROR_V1` を返す（`human_escalation` にならない）。
+`decide_next_loop_action.py` は呼ばれた時点で常に hard-stop 判定を行う（phase 概念を
+持たない）。呼び出しタイミングの制御は orchestrator の責務である。
 
 ### termination_cause 正規化ルール
 
-| フィールド | 使用する値 | 出所 |
+#1873: `render_termination_report.py`（`TERMINATION_REPORT_INPUT_V1` を検証する
+renderer）は撤去された。orchestrator は plain markdown の termination summary を
+直接組み立てて `publish_termination_report.py` に渡す（`--body-file` / stdin）。
+組み立て時に守る正規化ルールは変わらない:
+
+| 項目 | 使用する値 | 出所 |
 |---|---|---|
-| `termination_reason` | `human_escalation` | 固定 |
-| `termination_cause` | `human_judgment_required` | **常に `human_judgment_required` に正規化する** |
-| `blockers_summary` | `["scope_signal_guard_triggered", "scope_signal_guard_reason_code:<reason_code>"]` | `decide_next_loop_action.py` の BLOCKERS 出力 |
+| termination reason（summary 内の見出し等） | `human_escalation` | 固定 |
+| termination cause（summary 本文） | `human_judgment_required` | **常に `human_judgment_required` に正規化する** |
+| blockers 要約 | `scope_signal_guard_triggered` / `scope_signal_guard_reason_code:<reason_code>` | `decide_next_loop_action.py` の BLOCKERS 出力 |
 
-**重要**: `scope_signal_guard.reason_code`（例: `new_allowed_path_layer`、`new_in_scope_area`）は `termination_cause` として使用しない。これらは `VALID_TERMINATION_CAUSES` に属さない diagnostic code であり、`render_termination_report.py` が reject する。
+**重要**: `scope_signal_guard.reason_code`（例: `new_allowed_path_layer`、`new_in_scope_area`）
+は termination cause としてそのまま使用しない（`scope_signal_guard_triggered` という
+raw トリガー名自体も cause ではない）。summary 本文には常に正規化済みの
+`human_judgment_required` を書き、reason_code は blockers 要約側にのみ残す。
 
-`decide_next_loop_action.py` は `scope_signal_guard.triggered=true` のとき `TERMINATION_CAUSE: human_judgment_required` を stdout に出力する。orchestrator はこの値を `termination_cause` として使用する。
-
-### 正しい termination payload 例
-
-```json
-{
-  "termination_reason": "human_escalation",
-  "termination_cause": "human_judgment_required",
-  "issue_number": 907,
-  "iteration": 0,
-  "blockers_summary": [
-    "scope_signal_guard_triggered",
-    "scope_signal_guard_reason_code:new_allowed_path_layer"
-  ]
-}
-```
-
-### 誤った例（fail-closed）
-
-```json
-{
-  "termination_reason": "human_escalation",
-  "termination_cause": "scope_signal_guard_triggered"
-}
-```
-
-上記は `render_termination_report.py` の `_validate_input()` に `Invalid termination_cause` として reject される（#919 修正済み regression test: `test_scope_signal_guard_termination.py::TestAC3`）。
+`decide_next_loop_action.py` は `scope_signal_guard.triggered=true` のとき
+`TERMINATION_CAUSE: human_judgment_required` を stdout に出力する。orchestrator は
+この値を summary の termination cause として使用する。
 
 ## Additional stop rules（追加の停止規則）
 
@@ -275,7 +250,7 @@ LOOP_HANDOFF_RESULT_V1:
 `<!-- LOOP_HANDOFF_RESULT_V1 -->` HTML comment が marker の開始行を示す。  
 fenced YAML ブロックが marker の内容を保持する。
 
-### Schema（スキーマ定義: `schemas/loop_handoff_result_v1.json`）
+### Schema（スキーマ定義。#1873: `schemas/loop_handoff_result_v1.json` の JSON Schema ファイルは撤去済み — 本セクションの YAML 定義が唯一の SSOT）
 
 ```yaml
 LOOP_HANDOFF_RESULT_V1:
@@ -428,119 +403,26 @@ scope / goal / AC への semantic change が検出されたとき、`issue-refin
 各委譲は `auto_fixes.required` エントリとして記録し、`result: applied` かつ `evidence` 完備のものだけが `impl_ready` に貢献する。
 
 
-## Termination Report Render Flow（終了レポート描画フロー, #656 規約）
+## Termination Summary Publish Flow（終了サマリー投稿フロー, #1873）
 
-終了レポートの生成は `render_termination_report.py` が担い、以下のフローに従う。
+#1873（bounded review loops）で `render_termination_report.py`（`TERMINATION_REPORT_INPUT_V1` ->
+`TERMINATION_REPORT_RENDER_RESULT_V1` の renderer/validator パイプライン、attempt/guard/
+dynamic-fence を含む）は撤去された。orchestrator は次の手順で終了時のコメントを投稿する。
 
-### TERMINATION_REPORT_INPUT_V1（入力スキーマ）
+1. orchestrator が `decide_next_loop_action.py` の出力（`STATUS` / `NEXT_ACTION` /
+   `TERMINATION_CAUSE` / `BLOCKERS`）と loop の経緯から、短い plain markdown の summary
+   を直接組み立てる（見出し・termination reason/cause・issue 番号・iteration・
+   blockers の箇条書き程度の最小構成。テンプレート/guard/attempt ロジックは持たない）。
+2. `publish_termination_report.py`（`--issue-number` / `--repo` / `--body-file` または stdin）
+   に summary をそのまま渡す。この script は body の空チェックのみ行い（`empty_body` で
+   fail-closed）、`issue_comment.publish` controlled mutation lane（Issue #1633）経由で
+   投稿する。raw `gh issue comment` を直接呼ぶことはない。
+3. `scope_signal_guard.triggered=true` の termination では、`scope_signal_guard_route` /
+   `missing_approval_field` / `suggested_contract_patch`（#1090 AC6、`scope_signal_guard_
+   decision_v2.scope_delta_approval` 由来）を summary の blockers 箇条書きに含める。
+   `scope_signal_guard_decision_v2` は orchestrator が `plan_refinement_loop.py` の出力
+   からそのまま抽出し、summary 組み立て時に自ら参照する（`decide_next_loop_action.py`
+   への sidecar 引数としての用途とは別に、summary 本文の材料として使う）。
 
-```yaml
-TERMINATION_REPORT_INPUT_V1:
-  termination_reason: approved | human_escalation | superseded_by_decision  # 必須
-  termination_cause: needs_fix_at_iteration_limit | max_iterations_exceeded | human_judgment_required | null  # 任意
-  issue_number: <int>       # 任意
-  iteration: <int>          # 任意
-  blockers_summary: []      # 任意（human_escalation 時に使用）
-```
-
-### TERMINATION_REPORT_RENDER_RESULT_V1（出力スキーマ）
-
-```yaml
-TERMINATION_REPORT_RENDER_RESULT_V1:
-  schema: TERMINATION_REPORT_RENDER_RESULT_V1
-  schema_version: 1
-  publishable: true | false
-  body: <markdown string> | null   # publishable=false のとき null
-  reason_code: null | guard_fail_limit_exceeded | invalid_input | internal_error
-  termination_reason: approved | human_escalation | superseded_by_decision
-  termination_cause: <string> | null
-  attempts: 1 | 2
-  attempts_log:
-    - attempt: 1
-      template: normal
-      guard_pass: true | false
-      errors: []
-    - attempt: 2
-      template: fallback_minimal
-      guard_pass: true | false
-      errors: []
-  generated_at: <ISO-8601>
-```
-
-### Render 試行ルール（dry-run guard 付き）
-
-1. attempt 1: normal template でレポート生成
-2. `prose_boundary_policy` 公開 API（`classify_block` / `iter_markdown_blocks`）で dry-run guard を実行
-3. guard pass → `publishable=true`, `body=<markdown>` を返す
-4. guard fail → attempt 2: fallback minimal template に切り替え
-5. attempt 2 guard pass → `publishable=true`, `body=<markdown>` を返す
-6. attempt 2 guard fail → `publishable=false`, `body=null`, `reason_code="guard_fail_limit_exceeded"` を返す
-
-**最大試行回数は 2 回**。再生成・LLM・ask・network・gh command を呼ばない。
-
-### termination_reason と termination_cause の分離
-
-| フィールド | 値 | 説明 |
-|---|---|---|
-| `termination_reason` | `approved` | reviewer が approve し、contract review status: go を確認した |
-| `termination_reason` | `human_escalation` | 人間の判断が必要 |
-| `termination_reason` | `superseded_by_decision` | 先行決定により Issue が無効化された |
-| `termination_cause` | `needs_fix_at_iteration_limit` | needs-fix がイテレーション上限で停止 |
-| `termination_cause` | `max_iterations_exceeded` | イテレーション数が max_iterations を超えた |
-| `termination_cause` | `human_judgment_required` | human judgment が必要と判定 |
-| `termination_cause` | `null` | 原因なし（approved / superseded 等） |
-
-`needs_fix_at_iteration_limit` / `max_iterations_exceeded` は `termination_cause` として扱う。`termination_reason` に設定してはならない。
-
-### GFM Fence Injection 攻撃への防御策（動的フェンス, dynamic fence）
-
-- `_make_dynamic_fence(content)`: コンテンツ内の最長バッククォート列 + 1 の長さを持つ fence を生成（最小 3）
-- これにより adversarial input（` ``` ` 含む blockers_summary 等）がテンプレート構造を破壊しない
-
-### stderr / stdout 制約
-
-- stdout: machine JSON のみ（`TERMINATION_REPORT_RENDER_RESULT_V1`）
-- stderr: diagnostics のみ（guard fail メッセージ・内部エラー等）
-- `publishable=false` 時でも stderr にも投稿可能 markdown 本文を出力しない
-
-### callsite integration（呼び出し元統合）
-
-本フロー（`render_termination_report.py` の呼び出し）は follow-up Issue に委譲する。
-本 policy セクションは renderer ライブラリの規約として機能し、callsite integration 前でも実効性がある。
-
-
-### scope_signal_guard 停止時の承認欠落情報 missing approval field / suggested contract patch の追記（#1090 AC6）
-
-`scope_signal_guard.triggered=true` かつ `scope_signal_guard_decision_v2.route` が
-`human_judgment_required` である termination は、`scope_signal_guard_reason_code` だけでなく
-以下の追加情報を termination artifact / blockers_summary に含める。
-
-- `missing_approval_field`: `scope_signal_guard_decision_v2.scope_delta_approval.missing_approval_field`
-  （`true` の場合、Scope Delta Approval コメントが未投稿または marker 未検出であることを示す）
-- `suggested_contract_patch`: `scope_signal_guard_decision_v2.scope_delta_approval.suggested_contract_patch`
-  （OWNER/MEMBER/COLLABORATOR に ANCHOR_SCOPE_REFRAME コメント投稿を促す定型文。`status: approved` の場合は `null`）
-
-`route` が `security_risk_gate_required` または `invalid_scope_delta_approval` の場合も同様に
-`route` 値そのものを blockers_summary に転記し、`scope_signal_guard_reason_code` 単独の表示より
-具体的な次アクションが人間に伝わるようにする。
-
-本セクションは policy-only ではなく renderer 実装済みである（#1090 AC6 / PR #1294 review Blocker 3 対応）。
-`render_termination_report.py` は `TERMINATION_REPORT_INPUT_V1` の optional フィールド
-`scope_signal_guard_decision_v2` を受け取り、`normalize_input()` が route（`human_judgment_required` /
-`security_risk_gate_required` / `invalid_scope_delta_approval`）のとき以下の blocker 行を
-`blockers_summary` に追記してから rendering する（regression test:
-`tests/test_scope_signal_guard_lane_split.py::TestTerminationReportIntegration`）。
-
-- `scope_signal_guard_route:<route>`
-- `missing_approval_field:<true|false>`
-- `suggested_contract_patch:<定型文>`（`suggested_contract_patch` が非 null の場合のみ）
-
-orchestrator は termination payload 組み立て時に
-`LOOP_STATE_BUILD_RESULT_V1.scope_signal_guard_decision_v2`
-（`build_loop_state.py` が pass-through する envelope フィールド。`LOOP_STATE_V1` 本体のスキーマは変更しない）
-をそのまま renderer 入力の `scope_signal_guard_decision_v2` に渡せばよい。
-
-`LOOP_STATE_BUILD_RESULT_V1` envelope の consumer 契約: `scope_signal_guard_decision_v2` は
-top-level の additive フィールドであり、envelope consumer は unknown top-level field を
-reject せず無視できること（`additionalProperties: false` の closed schema で envelope を
-検証する consumer を置かないこと）を契約とする。
+markdown 本文には引き続き `` ``` `` を含む blockers 等が構造を破壊しないよう配慮すること
+（動的 fence 生成のような自動防御機構はないため、orchestrator 自身が内容を検証する）。
