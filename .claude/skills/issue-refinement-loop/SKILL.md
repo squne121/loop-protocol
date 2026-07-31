@@ -344,8 +344,8 @@ downstream skill（impl-review-loop・implement-issue・issue-contract-review・
 
 | topic | primary reference |
 |---|---|
-| loop state schema | `schemas/loop_state.schema.json` |
-| loop state field definitions | `references/loop-state.md` |
+| anchor comment schema | `schemas/anchor_comment.schema.json`（Issue #1873: `loop_state.schema.json` から抽出） |
+| loop state field definitions（historical） | `references/loop-state.md` |
 | anchor comment handling | `references/anchor-comment-handling.md` |
 | scope signal guard | `references/scope-signal-guard.md` |
 | AC/VC reflection | `references/ac-vc-reflection.md` |

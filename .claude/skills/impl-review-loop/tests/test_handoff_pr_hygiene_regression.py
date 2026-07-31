@@ -452,15 +452,19 @@ class TestAC5BehindMergeableRequiredAutoActionsUpdateBranch:
         )
 
     def test_step5_mergeability_v2_required_auto_actions_field_used(self):
-        """AC5 after-pass: step-5-mergeability-handling.md が required_auto_actions V2 フィールドを参照すること。
-
-        V1 では recommendations フィールドを使っていた。
-        #637 merge 後は required_auto_actions フィールドを V2 フィールドとして参照する。
+        """AC5 after-pass (superseded by Issue #1873): required_auto_actions is no
+        longer a reviewer-supplied field at all -- route_loop_verdict_v2()
+        synthesizes the update_branch action from live_mergeability. This test
+        now verifies step-5-mergeability-handling.md documents that
+        synthesis contract (route_to_update_branch) rather than pinning the
+        removed V2 reviewer-self-report field name as something to reference.
         """
         body = _read(STEP5_MH)
-        assert "required_auto_actions" in body, (
-            "step-5-mergeability-handling.md must reference required_auto_actions (V2 field). "
-            "V1 recommendations field must not be the primary reference."
+        assert "route_to_update_branch" in body, (
+            "step-5-mergeability-handling.md must document the "
+            "route_to_update_branch synthesis contract (Issue #1873: the "
+            "router synthesizes update_branch from live_mergeability; the "
+            "reviewer no longer supplies required_auto_actions)."
         )
 
     def test_loop_verdict_v2_schema_has_required_auto_actions_field(self):

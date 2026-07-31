@@ -44,7 +44,7 @@ review_subagent（本 agent）は Allowed Paths のパターンを **live な li
 
 - ファイル編集禁止（`disallowedTools: [Edit, Write, MultiEdit]`）
 - Bash 経由のファイル書き込みも禁止（`echo > file` / `sed -i` / `tee` 等）
-- self-authored PR では `gh pr review --approve` / `--request-changes` を使わない（controlled review publisher の `event` は常に `COMMENT` 固定）
+- self-authored PR では `gh pr review --approve` / `--request-changes` を使わない（verdict の投稿は通常の `gh pr comment --body-file` で `event` 相当は常に `COMMENT` 固定。専用 publisher は使用しない）
 - 曖昧な場合は APPROVE せず REQUEST_CHANGES（fail-closed）
 - 確認できない情報を推測で報告しない
 

@@ -152,10 +152,16 @@ def test_ac4_worker_status_permission_blocked_leads_to_human_escalation():
 
 
 def test_ac7_v2_merge_ready_field_used():
-    """AC7: V2 consumer path must use merge_ready field."""
+    """AC7 (superseded by Issue #1873): merge_ready is no longer a reviewer
+    self-report field -- route_loop_verdict_v2() derives the equivalent
+    live-mergeability routing directly. This test now verifies
+    step-5-mergeability-handling.md documents that live_mergeability-based
+    routing rather than pinning the removed reviewer-self-report field name."""
     body = _read(STEP5_MH)
-    assert "merge_ready" in body, (
-        "step-5-mergeability-handling.md must reference merge_ready (V2 field)"
+    assert "live_mergeability" in body, (
+        "step-5-mergeability-handling.md must document live_mergeability-based "
+        "routing (Issue #1873: merge_ready is no longer a reviewer self-report "
+        "field; live mergeability is fetched directly by control-plane)"
     )
 
 
@@ -338,15 +344,22 @@ def test_b3_has_hooks_routes_to_github_merge_ready_true():
 
 
 def test_b4_worker_status_stale_verdict_defined():
-    """B4: worker_status_stale_verdict must be defined with human_escalation route."""
+    """B4 (corrected in PR #1875 conflict resolution): worker_status_stale_verdict
+    must be defined and must route to re-review, not human_escalation --
+    staleness alone is never a human-escalation reason (route_loop_verdict_v2()
+    itself routes a stale reviewed_head_sha to route_stale_head_rereview, and
+    step-5-mergeability-handling.md's UPDATE_BRANCH_RESULT_V1.stale_verdict row
+    routes to re-review; this test previously asserted the two docs'
+    contradictory human_escalation branch)."""
     body = _read(STEP5_FT)
     assert "worker_status_stale_verdict" in body, (
         "step-5-feedback-and-termination.md must define worker_status_stale_verdict"
     )
     idx = body.find("worker_status_stale_verdict")
-    context = body[idx : idx + 200]
-    assert "human_escalation" in context, (
-        "worker_status_stale_verdict must route to human_escalation"
+    route_line = body[idx : idx + 60]
+    assert "route: rereview" in route_line, (
+        f"worker_status_stale_verdict must route to re-review "
+        f"(staleness alone is never a human-escalation reason), got: {route_line!r}"
     )
 
 

@@ -82,8 +82,8 @@ worker_status_result_routing:
   worker_status_permission_blocked:
     route: human_escalation
   worker_status_stale_verdict:
-    route: human_escalation
-    note: "reviewed_head_sha が変わっており verdict が stale"
+    route: rereview
+    note: "reviewed_head_sha が変わっており verdict が stale。人間判断を仰がず Step 4（pr-review-judge）を re-review してから Step 5 を再実行する（step-5-mergeability-handling.md と整合。stale は route_loop_verdict_v2() 自身も route_stale_head_rereview として扱い、human_escalation にはしない）"
   worker_status_forbidden:
     route: human_escalation
     note: "403 Forbidden — 権限確認が必要"
