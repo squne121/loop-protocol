@@ -432,8 +432,9 @@ def test_root_default_misplaced_in_agents_table_is_rejected(tmp_path: Path) -> N
         'default_permissions = "loop-protocol-personal-dev"\n',
         "",
     ).replace(
-        "[agents]\nmax_depth = 1",
-        '[agents]\nmax_depth = 1\ndefault_permissions = "loop-protocol-personal-dev"',
+        "[permissions.loop-protocol-rtk.filesystem]",
+        '[agents]\ndefault_permissions = "loop-protocol-personal-dev"\n\n'
+        "[permissions.loop-protocol-rtk.filesystem]",
     )
     assert 'default_permissions = "loop-protocol-personal-dev"' in mutated
     config_path.write_text(mutated, encoding="utf-8")

@@ -525,8 +525,23 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
 
     deduped_surface_paths = list(dict.fromkeys(all_surface_paths))
     failures.extend(find_duplicate_canonical_targets(deduped_surface_paths))
-    if config.get("agents", {}).get("max_depth") != 1:
-        failures.append(".codex/config.toml: [agents].max_depth must be 1")
+    multi_agent_v2 = config.get("features", {}).get("multi_agent_v2")
+    if not isinstance(multi_agent_v2, dict):
+        failures.append(".codex/config.toml: [features.multi_agent_v2] must be declared")
+    else:
+        if type(multi_agent_v2.get("enabled")) is not bool or multi_agent_v2["enabled"] is not True:
+            failures.append(".codex/config.toml: [features.multi_agent_v2].enabled must be strict boolean true")
+        if (
+            type(multi_agent_v2.get("max_concurrent_threads_per_session")) is not int
+            or multi_agent_v2["max_concurrent_threads_per_session"] != 4
+        ):
+            failures.append(
+                ".codex/config.toml: [features.multi_agent_v2].max_concurrent_threads_per_session "
+                "must be strict integer 4"
+            )
+    agents = config.get("agents", {})
+    if isinstance(agents, dict) and "max_depth" in agents:
+        failures.append(".codex/config.toml: [agents].max_depth must be absent")
     failures.extend(assert_root_default_permissions(config, CONFIG_PATH.read_text(encoding="utf-8")))
 
     if sorted(hooks.keys()) != ["hooks"]:

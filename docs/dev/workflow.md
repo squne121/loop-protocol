@@ -254,7 +254,7 @@ Allowed Paths 違反、実テスト・CI・PR review failure に基づく。
   routing stop にせず、PASS・承認・CI・review・merge readiness の証拠にしない。
 - parallel-safe ledger V2 は別 Issue で再設計し、未実装を通常 workflow の停止理由にしない。
 
-### Multi-Agent V2 の V1 rollback
+### Multi-Agent V2 の V1 rollback（V1 への復帰手順）
 
 Multi-Agent V2 の repository-pinned declaration を V1 に戻す必要がある場合は、
 `.codex/config.toml` の `[features.multi_agent_v2]` で `enabled = false` に戻し、
