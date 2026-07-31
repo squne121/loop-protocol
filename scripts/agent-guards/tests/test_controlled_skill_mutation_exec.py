@@ -1,26 +1,40 @@
 #!/usr/bin/env python3
 """
-Tests for controlled_skill_mutation_exec.py (Issue #1166).
+Tests for controlled_skill_mutation_exec.py generic executor mechanism
+(command_id whitelist / repo binding / issue binding / input-file binding /
+input-JSON field validation / postcondition no-tracked-changes) plus the
+issue_dependency.remove command id (Issue #1632 / #1667).
+
+Issue #1873 removed the legacy termination_report.publish and pr_review.publish
+command ids (and their dedicated marker/readback/module-realpath machinery).
+The generic executor-mechanism tests below therefore exercise the still-live
+issue_comment.publish command id as their representative fixture value instead
+of the retired termination_report.publish -- the mechanism under test
+(command_id whitelist, repo binding, git-remote binding, issue binding,
+input-file binding, input-JSON validation, postcondition) is unchanged by that
+retirement. Success-path / marker-authority / readback coverage for
+issue_comment.publish itself already lives in
+test_controlled_issue_metadata_exec.py (TestIssueCommentPublish) and is not
+duplicated here; the classes below focus on the low-level, command-id-agnostic
+negative fixtures (symlink/hardlink input-file components, malformed input
+JSON, non-digit LOOP_ISSUE_NUMBER, generic postcondition checks) that were
+previously only exercised through the now-retired termination_report.publish
+fixture value.
 
 Tests:
-- AC8:  command_id validation (only termination_report.publish)
+- AC8:  command_id validation (whitelist / unknown command id)
 - AC10: repo validation (only TRUSTED_REPO)
-- AC11: issue binding (LOOP_ISSUE_NUMBER env -- now mandatory)
 - AC12: input-file validation (must be in artifact subtree, no symlinks, no hardlinks)
-- AC13: environment sanitization
-- AC14: postcondition (no tracked changes)
-- AC15: idempotency marker + readback by exec marker
-- AC16: module realpath inspection
-- P0-1/P0-3: _validate_and_resolve_input_file negative fixtures
-- P0-2: input JSON validation
-- P0-5: readback marker
-- P1-4: negative fixture tests
+- AC10: input-file JSON validation (schema + issue_number field cross-check)
+- AC15: LOOP_ISSUE_NUMBER binding (optional-but-matching; non-digit denied)
+- AC14: postcondition (no tracked changes) -- generic unit-level coverage
 """
 
 from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -32,7 +46,7 @@ if str(_GUARDS_DIR) not in sys.path:
     sys.path.insert(0, str(_GUARDS_DIR))
 
 import controlled_skill_mutation_exec as _exec
-from controlled_skill_mutation_policy import TRUSTED_REPO
+from controlled_skill_mutation_policy import TRUSTED_REPO, COMMAND_ID_ISSUE_COMMENT_PUBLISH
 
 
 # =============================================================================
@@ -45,26 +59,19 @@ def tmp_project(tmp_path):
     # Create executor (so PROJECT_ROOT is set correctly via monkeypatching)
     executor_dir = tmp_path / "scripts" / "agent-guards"
     executor_dir.mkdir(parents=True)
-    # Create publisher stubs in issue-refinement-loop
-    pub_dir = tmp_path / ".claude" / "skills" / "issue-refinement-loop" / "scripts"
-    pub_dir.mkdir(parents=True)
-    (pub_dir / "publish_termination_report.py").write_text("# stub\n")
-    (pub_dir / "render_termination_report.py").write_text("# stub\n")
-    # Create prose_boundary_policy at CORRECT path (create-issue/scripts/)
-    create_issue_dir = tmp_path / ".claude" / "skills" / "create-issue" / "scripts"
-    create_issue_dir.mkdir(parents=True)
-    (create_issue_dir / "prose_boundary_policy.py").write_text("# stub\n")
-    # Create artifact subtree
-    artifact_dir = tmp_path / "artifacts" / "1166"
+    # Create the issue_comment.publish input namespace with a valid fixture.
+    artifact_dir = (
+        tmp_path / "artifacts" / "1166" / "issue-metadata" / COMMAND_ID_ISSUE_COMMENT_PUBLISH
+    )
     artifact_dir.mkdir(parents=True)
-    input_file = artifact_dir / "termination_report_input.json"
+    input_file = artifact_dir / "issue_comment_publish_input.json"
     input_file.write_text(json.dumps({
-        "schema": "TERMINATION_REPORT_INPUT_V1",
+        "schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1",
         "issue_number": 1166,
-        "termination_reason": "approved",
+        "comment_body": "status update <!-- marker-1166 -->",
+        "marker": "<!-- marker-1166 -->",
     }))
     # Make a git repo with correct remote so _verify_git_remote_origin passes
-    import subprocess
     subprocess.run(["git", "init", str(tmp_path)], capture_output=True)
     subprocess.run(
         ["git", "-C", str(tmp_path), "remote", "add", "origin",
@@ -74,15 +81,7 @@ def tmp_project(tmp_path):
     return tmp_path
 
 
-# Standard mocks needed for success path tests
-# (_check_module_realpaths runs subprocess probe - so mock it for speed/reliability)
-def _success_patches(func):
-    """Decorator: patch common success path dependencies."""
-    import functools
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        return func(*args, **kwargs)
-    return wrapper
+_INPUT_REL = f"artifacts/1166/issue-metadata/{COMMAND_ID_ISSUE_COMMENT_PUBLISH}/issue_comment_publish_input.json"
 
 
 # =============================================================================
@@ -90,32 +89,17 @@ def _success_patches(func):
 # =============================================================================
 
 class TestCommandIdValidation:
-    def test_valid_command_id(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
-        with patch.object(_exec, "_check_module_realpaths", return_value=[]):
-            with patch.object(_exec, "_invoke_publisher", return_value=(0, "", "")):
-                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
-                    with patch.object(_exec, "_readback_by_marker",
-                                      return_value={
-                                          "comment_id": "c1",
-                                          "comment_url": "https://ex",
-                                          "body_sha256": "abc",
-                                      }):
-                        rc = _exec.main([
-                            "--command-id", "termination_report.publish",
-                            "--issue-number", "1166",
-                            "--input-file", "artifacts/1166/termination_report_input.json",
-                            "--repo", TRUSTED_REPO,
-                        ])
-        assert rc == 0
+    def test_valid_command_id_is_in_whitelist(self):
+        from controlled_skill_mutation_policy import ALL_COMMAND_IDS
+
+        assert COMMAND_ID_ISSUE_COMMENT_PUBLISH in ALL_COMMAND_IDS
 
     def test_unknown_command_id_returns_2(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
         rc = _exec.main([
             "--command-id", "unknown.command",
             "--issue-number", "1166",
-            "--input-file", "artifacts/1166/termination_report_input.json",
+            "--input-file", _INPUT_REL,
             "--repo", TRUSTED_REPO,
         ])
         assert rc == 2
@@ -129,69 +113,10 @@ class TestRepoValidation:
     def test_wrong_repo_returns_2(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
         rc = _exec.main([
-            "--command-id", "termination_report.publish",
+            "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
             "--issue-number", "1166",
-            "--input-file", "artifacts/1166/termination_report_input.json",
+            "--input-file", _INPUT_REL,
             "--repo", "evil-org/hijack-repo",
-        ])
-        assert rc == 2
-
-    def test_correct_repo_passes(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
-        with patch.object(_exec, "_check_module_realpaths", return_value=[]):
-            with patch.object(_exec, "_invoke_publisher", return_value=(0, "", "")):
-                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
-                    with patch.object(_exec, "_readback_by_marker", return_value={"comment_id": "c1"}):
-                        rc = _exec.main([
-                            "--command-id", "termination_report.publish",
-                            "--issue-number", "1166",
-                            "--input-file", "artifacts/1166/termination_report_input.json",
-                            "--repo", TRUSTED_REPO,
-                        ])
-        assert rc == 0
-
-
-# =============================================================================
-# AC11: issue binding
-# =============================================================================
-
-class TestIssueBinding:
-    def test_issue_mismatch_blocked(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "9999")
-        rc = _exec.main([
-            "--command-id", "termination_report.publish",
-            "--issue-number", "1166",
-            "--input-file", "artifacts/1166/termination_report_input.json",
-            "--repo", TRUSTED_REPO,
-        ])
-        assert rc == 2
-
-    def test_issue_match_passes(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
-        with patch.object(_exec, "_check_module_realpaths", return_value=[]):
-            with patch.object(_exec, "_invoke_publisher", return_value=(0, "", "")):
-                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
-                    with patch.object(_exec, "_readback_by_marker", return_value={"comment_id": "c1"}):
-                        rc = _exec.main([
-                            "--command-id", "termination_report.publish",
-                            "--issue-number", "1166",
-                            "--input-file", "artifacts/1166/termination_report_input.json",
-                            "--repo", TRUSTED_REPO,
-                        ])
-        assert rc == 0
-
-    def test_missing_loop_issue_number_returns_2(self, tmp_project, monkeypatch):
-        """LOOP_ISSUE_NUMBER is now mandatory -- missing must deny."""
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.delenv("LOOP_ISSUE_NUMBER", raising=False)
-        rc = _exec.main([
-            "--command-id", "termination_report.publish",
-            "--issue-number", "1166",
-            "--input-file", "artifacts/1166/termination_report_input.json",
-            "--repo", TRUSTED_REPO,
         ])
         assert rc == 2
 
@@ -203,27 +128,26 @@ class TestIssueBinding:
 class TestInputFileValidation:
     def test_file_not_found_returns_2(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
         rc = _exec.main([
-            "--command-id", "termination_report.publish",
+            "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
             "--issue-number", "1166",
-            "--input-file", "artifacts/1166/nonexistent.json",
+            "--input-file",
+            f"artifacts/1166/issue-metadata/{COMMAND_ID_ISSUE_COMMENT_PUBLISH}/nonexistent.json",
             "--repo", TRUSTED_REPO,
         ])
         assert rc == 2
 
     def test_file_outside_artifact_subtree_returns_2(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
-        # Create a file outside the issue artifact subtree
+        # Create a file outside the issue/command-id artifact subtree
         bad_dir = tmp_project / "tmp"
         bad_dir.mkdir(parents=True)
         (bad_dir / "evil.json").write_text(json.dumps({
-            "schema": "TERMINATION_REPORT_INPUT_V1",
+            "schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1",
             "issue_number": 1166,
         }))
         rc = _exec.main([
-            "--command-id", "termination_report.publish",
+            "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
             "--issue-number", "1166",
             "--input-file", "tmp/evil.json",
             "--repo", TRUSTED_REPO,
@@ -232,7 +156,7 @@ class TestInputFileValidation:
 
     def test_validate_and_resolve_input_file_fn_passes_for_valid(self, tmp_project):
         canonical, err = _exec._validate_and_resolve_input_file(
-            "artifacts/1166/termination_report_input.json", 1166, tmp_project
+            _INPUT_REL, 1166, tmp_project, command_id=COMMAND_ID_ISSUE_COMMENT_PUBLISH
         )
         assert err == ""
         assert canonical is not None
@@ -240,201 +164,10 @@ class TestInputFileValidation:
 
     def test_validate_and_resolve_input_file_fn_fails_for_wrong_issue(self, tmp_project):
         canonical, err = _exec._validate_and_resolve_input_file(
-            "artifacts/1166/termination_report_input.json", 9999, tmp_project
+            _INPUT_REL, 9999, tmp_project, command_id=COMMAND_ID_ISSUE_COMMENT_PUBLISH
         )
         assert err != ""
         assert canonical is None
-
-
-# =============================================================================
-# AC13: environment sanitization
-# =============================================================================
-
-class TestEnvSanitization:
-    def test_sanitized_env_removes_pythonpath(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("PYTHONPATH", "/evil/path")
-        env = _exec._build_sanitized_env(tmp_project, 1166)
-        assert "PYTHONPATH" not in env
-
-    def test_sanitized_env_removes_publish_artifact_dir(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("PUBLISH_ARTIFACT_DIR", "/evil/dir")
-        env = _exec._build_sanitized_env(tmp_project, 1166)
-        # After sanitize, PUBLISH_ARTIFACT_DIR is re-set to canonical
-        assert env.get("PUBLISH_ARTIFACT_DIR") != "/evil/dir"
-        # And is set to the canonical artifact dir
-        assert str(tmp_project / "artifacts" / "1166") in env.get("PUBLISH_ARTIFACT_DIR", "")
-
-    def test_sanitized_env_removes_gh_editor(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("GH_EDITOR", "vim")
-        env = _exec._build_sanitized_env(tmp_project, 1166)
-        assert "GH_EDITOR" not in env
-
-    def test_sanitized_env_sets_gh_prompt_disabled(self, tmp_project):
-        env = _exec._build_sanitized_env(tmp_project, 1166)
-        assert env.get("GH_PROMPT_DISABLED") == "1"
-
-    def test_sanitized_env_injects_exec_marker(self, tmp_project):
-        env = _exec._build_sanitized_env(tmp_project, 1166, exec_marker="abc123")
-        assert env.get("CONTROLLED_EXEC_MARKER") == "abc123"
-
-    def test_sanitized_env_no_marker_when_empty(self, tmp_project):
-        env = _exec._build_sanitized_env(tmp_project, 1166, exec_marker="")
-        assert "CONTROLLED_EXEC_MARKER" not in env
-
-
-# =============================================================================
-# AC14: postcondition -- no tracked changes
-# =============================================================================
-
-class TestPostcondition:
-    def test_tracked_changes_cause_failure(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
-        with patch.object(_exec, "_check_module_realpaths", return_value=[]):
-            with patch.object(_exec, "_invoke_publisher", return_value=(0, "", "")):
-                with patch.object(_exec, "_check_no_tracked_changes", return_value=["M :src/main.ts"]):
-                    rc = _exec.main([
-                        "--command-id", "termination_report.publish",
-                        "--issue-number", "1166",
-                        "--input-file", "artifacts/1166/termination_report_input.json",
-                        "--repo", TRUSTED_REPO,
-                    ])
-        assert rc == 1
-
-    def test_no_tracked_changes_succeeds(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
-        with patch.object(_exec, "_check_module_realpaths", return_value=[]):
-            with patch.object(_exec, "_invoke_publisher", return_value=(0, "", "")):
-                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
-                    with patch.object(_exec, "_readback_by_marker", return_value={"comment_id": "c1"}):
-                        rc = _exec.main([
-                            "--command-id", "termination_report.publish",
-                            "--issue-number", "1166",
-                            "--input-file", "artifacts/1166/termination_report_input.json",
-                            "--repo", TRUSTED_REPO,
-                        ])
-        assert rc == 0
-
-
-# =============================================================================
-# AC15: idempotency marker
-# =============================================================================
-
-class TestIdempotency:
-    def test_existing_marker_blocks_republish(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
-        # Write an idempotency marker
-        marker = {
-            "schema": "TERMINATION_REPORT_PUBLISH_MARKER_V1",
-            "comment_id": "c123",
-            "comment_url": "https://github.com/...",
-        }
-        mp = _exec._marker_path(tmp_project, 1166)
-        mp.parent.mkdir(parents=True, exist_ok=True)
-        mp.write_text(json.dumps(marker))
-
-        with patch.object(_exec, "_check_module_realpaths", return_value=[]):
-            rc = _exec.main([
-                "--command-id", "termination_report.publish",
-                "--issue-number", "1166",
-                "--input-file", "artifacts/1166/termination_report_input.json",
-                "--repo", TRUSTED_REPO,
-            ])
-        assert rc == 1  # idempotency block returns 1
-
-    def test_missing_marker_allows_publish(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
-        # No marker file
-        with patch.object(_exec, "_check_module_realpaths", return_value=[]):
-            with patch.object(_exec, "_invoke_publisher", return_value=(0, "", "")):
-                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
-                    with patch.object(_exec, "_readback_by_marker", return_value={"comment_id": "c1"}):
-                        rc = _exec.main([
-                            "--command-id", "termination_report.publish",
-                            "--issue-number", "1166",
-                            "--input-file", "artifacts/1166/termination_report_input.json",
-                            "--repo", TRUSTED_REPO,
-                        ])
-        assert rc == 0
-
-    def test_marker_written_on_success(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
-        with patch.object(_exec, "_check_module_realpaths", return_value=[]):
-            with patch.object(_exec, "_invoke_publisher", return_value=(0, "", "")):
-                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
-                    with patch.object(_exec, "_readback_by_marker",
-                                      return_value={
-                                          "comment_id": "c42",
-                                          "comment_url": "https://u",
-                                          "body_sha256": "sha",
-                                      }):
-                        _exec.main([
-                            "--command-id", "termination_report.publish",
-                            "--issue-number", "1166",
-                            "--input-file", "artifacts/1166/termination_report_input.json",
-                            "--repo", TRUSTED_REPO,
-                        ])
-        mp = _exec._marker_path(tmp_project, 1166)
-        assert mp.exists()
-        data = json.loads(mp.read_text())
-        assert data.get("comment_id") == "c42"
-        assert data.get("schema") == "TERMINATION_REPORT_PUBLISH_MARKER_V1"
-
-    def test_dry_run_does_not_write_marker(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
-        with patch.object(_exec, "_check_module_realpaths", return_value=[]):
-            rc = _exec.main([
-                "--command-id", "termination_report.publish",
-                "--issue-number", "1166",
-                "--input-file", "artifacts/1166/termination_report_input.json",
-                "--repo", TRUSTED_REPO,
-                "--dry-run",
-            ])
-        assert rc == 0
-        mp = _exec._marker_path(tmp_project, 1166)
-        assert not mp.exists()
-
-
-# =============================================================================
-# AC16: module realpath inspection
-# =============================================================================
-
-class TestModuleRealpath:
-    def test_canonical_paths_pass(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        errors = _exec._check_module_realpaths(tmp_project)
-        assert errors == [], f"Unexpected errors: {errors}"
-
-    def test_missing_prose_boundary_fails(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        # Remove prose_boundary_policy.py from correct location
-        prose_path = tmp_project / ".claude" / "skills" / "create-issue" / "scripts" / "prose_boundary_policy.py"
-        prose_path.unlink()
-        errors = _exec._check_module_realpaths(tmp_project)
-        assert any("module_missing" in e and "prose_boundary_policy" in e for e in errors), \
-            f"Expected module_missing error, got: {errors}"
-
-    def test_symlink_outside_project_fails(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        # Create a symlink that points outside project_root
-        outside = tmp_project.parent / "outside_publisher.py"
-        outside.write_text("# evil\n")
-        pub_path = (
-            tmp_project / ".claude" / "skills" / "issue-refinement-loop"
-            / "scripts" / "publish_termination_report.py"
-        )
-        pub_path.unlink()
-        pub_path.symlink_to(outside)
-        errors = _exec._check_module_realpaths(tmp_project)
-        assert any("publish_termination_report" in e or "module_shadowing" in e for e in errors)
 
 
 # =============================================================================
@@ -444,11 +177,9 @@ class TestModuleRealpath:
 class TestInputFileNegativeFixtures:
     def test_absolute_path_denied(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
-        # Pass absolute path -- should be denied at lexical check
-        abs_path = str(tmp_project / "artifacts" / "1166" / "termination_report_input.json")
+        abs_path = str(tmp_project / _INPUT_REL)
         rc = _exec.main([
-            "--command-id", "termination_report.publish",
+            "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
             "--issue-number", "1166",
             "--input-file", abs_path,
             "--repo", TRUSTED_REPO,
@@ -457,40 +188,39 @@ class TestInputFileNegativeFixtures:
 
     def test_dotdot_traversal_denied(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
         rc = _exec.main([
-            "--command-id", "termination_report.publish",
+            "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
             "--issue-number", "1166",
-            "--input-file", "artifacts/1166/../1166/termination_report_input.json",
+            "--input-file",
+            f"artifacts/1166/issue-metadata/{COMMAND_ID_ISSUE_COMMENT_PUBLISH}/../{COMMAND_ID_ISSUE_COMMENT_PUBLISH}/issue_comment_publish_input.json",
             "--repo", TRUSTED_REPO,
         ])
         assert rc == 2
 
     def test_symlink_component_denied(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
         # Create a symlink directory in the path
         link = tmp_project / "artifacts" / "link_to_1166"
         link.symlink_to(tmp_project / "artifacts" / "1166")
         rc = _exec.main([
-            "--command-id", "termination_report.publish",
+            "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
             "--issue-number", "1166",
-            "--input-file", "artifacts/link_to_1166/termination_report_input.json",
+            "--input-file",
+            f"artifacts/link_to_1166/issue-metadata/{COMMAND_ID_ISSUE_COMMENT_PUBLISH}/issue_comment_publish_input.json",
             "--repo", TRUSTED_REPO,
         ])
         assert rc == 2
 
     def test_hardlink_denied(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
-        # Create a hardlink
-        original = tmp_project / "artifacts" / "1166" / "termination_report_input.json"
-        hardlink = tmp_project / "artifacts" / "1166" / "hardlink_input.json"
+        original = tmp_project / _INPUT_REL
+        hardlink = original.parent / "hardlink_input.json"
         os.link(str(original), str(hardlink))
         rc = _exec.main([
-            "--command-id", "termination_report.publish",
+            "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
             "--issue-number", "1166",
-            "--input-file", "artifacts/1166/hardlink_input.json",
+            "--input-file",
+            f"artifacts/1166/issue-metadata/{COMMAND_ID_ISSUE_COMMENT_PUBLISH}/hardlink_input.json",
             "--repo", TRUSTED_REPO,
         ])
         assert rc == 2
@@ -500,170 +230,161 @@ class TestInputFileNegativeFixtures:
 # P0-2: Input JSON validation
 # =============================================================================
 
+def _issue_metadata_dir(tmp_project):
+    return tmp_project / "artifacts" / "1166" / "issue-metadata" / COMMAND_ID_ISSUE_COMMENT_PUBLISH
+
+
 class TestInputJsonValidation:
     def test_missing_issue_number_in_json_denied(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
-        # Override input file content: no issue_number field
-        bad_input = tmp_project / "artifacts" / "1166" / "bad_input.json"
-        bad_input.write_text(json.dumps({"schema": "TERMINATION_REPORT_INPUT_V1"}))
+        bad_input = _issue_metadata_dir(tmp_project) / "bad_input.json"
+        bad_input.write_text(json.dumps({"schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1"}))
         rc = _exec.main([
-            "--command-id", "termination_report.publish",
+            "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
             "--issue-number", "1166",
-            "--input-file", "artifacts/1166/bad_input.json",
+            "--input-file",
+            f"artifacts/1166/issue-metadata/{COMMAND_ID_ISSUE_COMMENT_PUBLISH}/bad_input.json",
             "--repo", TRUSTED_REPO,
         ])
         assert rc == 2
 
     def test_issue_number_mismatch_in_json_denied(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
-        bad_input = tmp_project / "artifacts" / "1166" / "mismatch_input.json"
+        bad_input = _issue_metadata_dir(tmp_project) / "mismatch_input.json"
         bad_input.write_text(json.dumps({
-            "schema": "TERMINATION_REPORT_INPUT_V1",
+            "schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1",
             "issue_number": 9999,
         }))
         rc = _exec.main([
-            "--command-id", "termination_report.publish",
+            "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
             "--issue-number", "1166",
-            "--input-file", "artifacts/1166/mismatch_input.json",
+            "--input-file",
+            f"artifacts/1166/issue-metadata/{COMMAND_ID_ISSUE_COMMENT_PUBLISH}/mismatch_input.json",
             "--repo", TRUSTED_REPO,
         ])
         assert rc == 2
 
     def test_wrong_schema_in_json_denied(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
-        bad_input = tmp_project / "artifacts" / "1166" / "wrong_schema.json"
+        bad_input = _issue_metadata_dir(tmp_project) / "wrong_schema.json"
         bad_input.write_text(json.dumps({
             "schema": "WRONG_SCHEMA_V1",
             "issue_number": 1166,
         }))
         rc = _exec.main([
-            "--command-id", "termination_report.publish",
+            "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
             "--issue-number", "1166",
-            "--input-file", "artifacts/1166/wrong_schema.json",
+            "--input-file",
+            f"artifacts/1166/issue-metadata/{COMMAND_ID_ISSUE_COMMENT_PUBLISH}/wrong_schema.json",
             "--repo", TRUSTED_REPO,
         ])
         assert rc == 2
 
     def test_valid_json_passes_validation(self, tmp_project):
-        canonical = tmp_project / "artifacts" / "1166" / "termination_report_input.json"
-        err = _exec._validate_input_json(canonical, 1166)
+        canonical = tmp_project / _INPUT_REL
+        data, err = _exec._load_and_validate_input_json(canonical, 1166, COMMAND_ID_ISSUE_COMMENT_PUBLISH)
         assert err == ""
+        assert data is not None
 
     def test_missing_issue_number_fails_validation(self, tmp_project):
-        f = tmp_project / "artifacts" / "1166" / "no_issue.json"
-        f.write_text(json.dumps({"schema": "TERMINATION_REPORT_INPUT_V1"}))
-        err = _exec._validate_input_json(f, 1166)
+        f = _issue_metadata_dir(tmp_project) / "no_issue.json"
+        f.write_text(json.dumps({"schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1"}))
+        data, err = _exec._load_and_validate_input_json(f, 1166, COMMAND_ID_ISSUE_COMMENT_PUBLISH)
+        assert data is None
         assert "input_issue_number_missing" in err
 
     def test_issue_mismatch_fails_validation(self, tmp_project):
-        f = tmp_project / "artifacts" / "1166" / "mismatch.json"
-        f.write_text(json.dumps({"schema": "TERMINATION_REPORT_INPUT_V1", "issue_number": 9999}))
-        err = _exec._validate_input_json(f, 1166)
+        f = _issue_metadata_dir(tmp_project) / "mismatch.json"
+        f.write_text(json.dumps({"schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1", "issue_number": 9999}))
+        data, err = _exec._load_and_validate_input_json(f, 1166, COMMAND_ID_ISSUE_COMMENT_PUBLISH)
+        assert data is None
         assert "input_issue_number_mismatch" in err
+
+    def test_non_int_issue_number_fails_validation(self, tmp_project):
+        f = _issue_metadata_dir(tmp_project) / "non_int.json"
+        f.write_text(json.dumps({"schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1", "issue_number": "1166"}))
+        data, err = _exec._load_and_validate_input_json(f, 1166, COMMAND_ID_ISSUE_COMMENT_PUBLISH)
+        assert data is None
+        assert "input_issue_number_not_int" in err
 
 
 # =============================================================================
-# P0-2 / AC11: LOOP_ISSUE_NUMBER binding
+# AC15: LOOP_ISSUE_NUMBER binding (optional-but-matching; Issue #1873 removed
+# the only mandatory-binding command id, termination_report.publish, so a
+# missing env var is now allowed for every remaining command id -- see
+# test_controlled_issue_metadata_exec.py::TestEnvBinding for the
+# missing/matching/mismatching coverage). The non-digit fixture below is not
+# covered elsewhere.
 # =============================================================================
 
 class TestLoopIssueNumberBinding:
-    def test_missing_loop_issue_number_denied(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.delenv("LOOP_ISSUE_NUMBER", raising=False)
-        rc = _exec.main([
-            "--command-id", "termination_report.publish",
-            "--issue-number", "1166",
-            "--input-file", "artifacts/1166/termination_report_input.json",
-            "--repo", TRUSTED_REPO,
-        ])
-        assert rc == 2
-
     def test_non_digit_loop_issue_number_denied(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
         monkeypatch.setenv("LOOP_ISSUE_NUMBER", "not-a-number")
         rc = _exec.main([
-            "--command-id", "termination_report.publish",
+            "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
             "--issue-number", "1166",
-            "--input-file", "artifacts/1166/termination_report_input.json",
+            "--input-file", _INPUT_REL,
             "--repo", TRUSTED_REPO,
         ])
         assert rc == 2
 
+    def test_non_digit_loop_issue_number_denied_unit(self, monkeypatch):
+        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "not-a-number")
+        err = _exec._check_issue_env_binding(COMMAND_ID_ISSUE_COMMENT_PUBLISH, 1166)
+        assert "loop_issue_number_env_not_digit" in err
 
-# =============================================================================
-# P0-5: Readback marker
-# =============================================================================
+    def test_missing_loop_issue_number_allowed(self, tmp_project, monkeypatch):
+        """LOOP_ISSUE_NUMBER is optional for every live command id (Issue #1873
+        removed the only mandatory member, termination_report.publish)."""
+        import hashlib
 
-class TestReadbackMarker:
-    def test_marker_not_found_fails(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
-        with patch.object(_exec, "_check_module_realpaths", return_value=[]):
-            with patch.object(_exec, "_invoke_publisher", return_value=(0, "", "")):
-                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
-                    with patch.object(_exec, "_readback_by_marker",
-                                      return_value={"error": "marker_not_found"}):
+        monkeypatch.delenv("LOOP_ISSUE_NUMBER", raising=False)
+        comment_body = "status update <!-- marker-1166 -->"
+        expected_body_sha256 = hashlib.sha256(comment_body.encode()).hexdigest()
+        with patch.object(_exec, "_find_marker_matches", return_value=([], "")):
+            with patch.object(_exec, "_post_gh_comment", return_value=("https://ex", "c1", "")):
+                with patch.object(_exec, "_readback_by_marker_literal",
+                                   return_value={"comment_id": "c1", "comment_url": "https://ex",
+                                                 "body_sha256": expected_body_sha256}):
+                    with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
                         rc = _exec.main([
-                            "--command-id", "termination_report.publish",
+                            "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
                             "--issue-number", "1166",
-                            "--input-file", "artifacts/1166/termination_report_input.json",
+                            "--input-file", _INPUT_REL,
                             "--repo", TRUSTED_REPO,
                         ])
-        assert rc == 1  # read-back failure
-
-    def test_no_marker_written_on_readback_failure(self, tmp_project, monkeypatch):
-        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1166")
-        with patch.object(_exec, "_check_module_realpaths", return_value=[]):
-            with patch.object(_exec, "_invoke_publisher", return_value=(0, "", "")):
-                with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
-                    with patch.object(_exec, "_readback_by_marker",
-                                      return_value={"error": "marker_not_found"}):
-                        _exec.main([
-                            "--command-id", "termination_report.publish",
-                            "--issue-number", "1166",
-                            "--input-file", "artifacts/1166/termination_report_input.json",
-                            "--repo", TRUSTED_REPO,
-                        ])
-        # Marker file should NOT have been written
-        mp = _exec._marker_path(tmp_project, 1166)
-        assert not mp.exists()
-
-    def test_compute_exec_marker_is_deterministic(self, tmp_project):
-        canonical = tmp_project / "artifacts" / "1166" / "termination_report_input.json"
-        m1 = _exec._compute_exec_marker("termination_report.publish", TRUSTED_REPO, 1166, canonical)
-        m2 = _exec._compute_exec_marker("termination_report.publish", TRUSTED_REPO, 1166, canonical)
-        assert m1 == m2
-        assert len(m1) == 32
-
-    def test_compute_exec_marker_differs_for_different_inputs(self, tmp_project):
-        canonical = tmp_project / "artifacts" / "1166" / "termination_report_input.json"
-        m1 = _exec._compute_exec_marker("termination_report.publish", TRUSTED_REPO, 1166, canonical)
-        m2 = _exec._compute_exec_marker("termination_report.publish", TRUSTED_REPO, 9999, canonical)
-        assert m1 != m2
+        assert rc == 0
 
 
 # =============================================================================
-# P1-4: Postcondition extended
+# P1-4: Postcondition -- no tracked changes (generic, command-id-agnostic
+# unit-level coverage; TestTrackedDiff in test_controlled_issue_metadata_exec.py
+# covers the full main() flow for issue_comment.publish).
 # =============================================================================
 
 class TestPostconditionExtended:
     def test_check_no_tracked_changes_clean_repo(self, tmp_project):
         """In a clean git repo, no violations for artifacts/1166/ files."""
         violations = _exec._check_no_tracked_changes(tmp_project, 1166)
-        # artifacts/1166/ files are untracked but allowed -- other untracked files may exist
-        # We just check it doesn't error
         assert isinstance(violations, list)
 
     def test_artifacts_allowed_prefix_not_flagged(self, tmp_project):
         """Untracked artifacts/1166/ files are not flagged as violations."""
         violations = _exec._check_no_tracked_changes(tmp_project, 1166)
-        # No violation should reference artifacts/1166/
         for v in violations:
             assert "artifacts/1166/" not in v, f"Unexpected violation: {v}"
+
+    def test_command_id_scoped_prefix_isolates_sibling_namespace(self, tmp_project):
+        """Issue #1284 Blocker 6: a write in a sibling command-id namespace
+        must NOT be allowed by a command-id-scoped prefix."""
+        sibling_dir = tmp_project / "artifacts" / "1166" / "issue-metadata" / "issue_body.update"
+        sibling_dir.mkdir(parents=True, exist_ok=True)
+        (sibling_dir / "unexpected.json").write_text("{}")
+        allowed_prefix = f"artifacts/1166/issue-metadata/{COMMAND_ID_ISSUE_COMMENT_PUBLISH}/"
+        violations = _exec._check_no_tracked_changes(tmp_project, 1166, allowed_prefix)
+        assert any("issue_body.update/unexpected.json" in v for v in violations)
 
 
 # =============================================================================

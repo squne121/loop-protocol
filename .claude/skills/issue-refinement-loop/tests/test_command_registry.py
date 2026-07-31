@@ -339,6 +339,50 @@ class TestRegistryEntrySpecs:
     def test_decide_run_entry(self):
         self._assert_entry_complete("decide.run")
 
+    def test_decide_run_argv_accepted_by_decide_script_argparse(self):
+        """Regression for #1873: decide.run's argv flags must all be recognized
+        by decide_next_loop_action.py's actual argparse definition. A dangling
+        flag (e.g. removed --phase-state-file) would make render_command()
+        produce an argv that decide_next_loop_action.py rejects at runtime.
+        """
+        import decide_next_loop_action as decide_mod
+
+        _DUMMY_BY_TYPE = {
+            "repo_relative_file": "dummy.json",
+            "verdict": "approve",
+            "positive_int": "1",
+        }
+
+        entry = reg.REGISTRY["decide.run"]
+        argv_tokens = entry["argv"]
+        placeholders = entry["placeholders"]
+
+        # Map each "--flag" token in argv to its placeholder name by looking
+        # at the "{placeholder_name}" token that immediately follows it.
+        resolved_argv: list[str] = []
+        i = 0
+        while i < len(argv_tokens):
+            tok = argv_tokens[i]
+            if tok.startswith("--"):
+                resolved_argv.append(tok)
+                if i + 1 < len(argv_tokens) and argv_tokens[i + 1].startswith("{"):
+                    placeholder_name = argv_tokens[i + 1].strip("{}")
+                    ph_type = placeholders.get(placeholder_name, {}).get("type")
+                    resolved_argv.append(_DUMMY_BY_TYPE.get(ph_type, "dummy"))
+                    i += 2
+                    continue
+            i += 1
+
+        try:
+            decide_mod._parse_args(resolved_argv)
+        except SystemExit as exc:
+            pytest.fail(
+                "decide_next_loop_action.py's argparse rejected argv derived "
+                f"from command_registry.py's decide.run entry: {resolved_argv} "
+                f"(exit={exc.code}). command_registry.py's placeholders/argv "
+                "are out of sync with decide_next_loop_action.py's CLI."
+            )
+
     def test_mutation_flag_semantics(self):
         """gh.issue.comment is mutation=True; read-only commands are mutation=False."""
         assert reg.REGISTRY["gh.issue.comment"]["mutation"] is True

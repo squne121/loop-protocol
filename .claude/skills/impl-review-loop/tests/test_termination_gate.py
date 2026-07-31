@@ -72,58 +72,14 @@ def test_ac1_approve_alone_not_sufficient_for_termination():
     )
 
 
-def test_ac1_approve_requires_merge_ready_and_empty_required_auto_actions():
-    """AC1: The termination condition must combine verdict, merge_ready, and required_auto_actions."""
-    body = _read(STEP5_FT)
-    # Must have combined condition
-    assert "merge_ready == true" in body, (
-        "step-5-feedback-and-termination.md must require merge_ready == true"
-    )
-    assert "required_auto_actions == []" in body, (
-        "step-5-feedback-and-termination.md must require required_auto_actions == []"
-    )
-
-
 # ---------------------------------------------------------------------------
 # AC2: required_auto_actions == [] required for termination_reason: approved
 # ---------------------------------------------------------------------------
 
 
-def test_ac2_required_auto_actions_empty_is_termination_condition():
-    """AC2: required_auto_actions == [] must be in the termination condition."""
-    body = _read(STEP5_FT)
-    assert "required_auto_actions == []" in body, (
-        "step-5-feedback-and-termination.md must specify required_auto_actions == [] "
-        "as termination condition"
-    )
-
-
-def test_ac2_termination_reason_approved_gate_described():
-    """AC2: termination_reason: approved must be gated on required_auto_actions."""
-    body = _read(STEP5_FT)
-    # The approved exit must be conditional on required_auto_actions == []
-    idx_empty = body.find("required_auto_actions == []")
-    idx_approved = body.find("termination_reason: approved")
-    assert idx_empty != -1, "required_auto_actions == [] must be present"
-    assert idx_approved != -1, "termination_reason: approved must be present"
-    # required_auto_actions == [] must appear in context with the approved condition
-    context_approved = body[max(0, idx_approved - 300) : idx_approved + 300]
-    assert "merge_ready" in context_approved or "required_auto_actions" in context_approved, (
-        "termination_reason: approved must appear near merge_ready/required_auto_actions gate"
-    )
-
-
 # ---------------------------------------------------------------------------
 # AC3: non-empty required_auto_actions routes to worker (not exit)
 # ---------------------------------------------------------------------------
-
-
-def test_ac3_nonempty_required_auto_actions_routes_to_worker():
-    """AC3: non-empty required_auto_actions must route to implementation-worker, not exit."""
-    body = _read(STEP5_FT)
-    assert "required_auto_action_result_routing" in body, (
-        "step-5-feedback-and-termination.md must define required_auto_action_result_routing"
-    )
 
 
 def test_ac3_nonempty_required_auto_actions_does_not_terminate():
@@ -139,26 +95,6 @@ def test_ac3_nonempty_required_auto_actions_does_not_terminate():
 # ---------------------------------------------------------------------------
 # AC4: required_auto_actions remaining → cannot reach termination_reason: approved
 # ---------------------------------------------------------------------------
-
-
-def test_ac4_three_stage_gate_defined():
-    """AC4: APPROVE gate must be three-stage (reviewed_head_sha, required_auto_actions, merge_ready)."""
-    body = _read(STEP5_FT)
-    assert "APPROVE 時の終了 gate" in body or "APPROVE gate" in body, (
-        "step-5-feedback-and-termination.md must define APPROVE gate stages"
-    )
-
-
-def test_ac4_required_auto_actions_gate_before_merge_ready_gate():
-    """AC4: required_auto_actions gate must appear before merge_ready gate in APPROVE flow."""
-    body = _read(STEP5_FT)
-    idx_req = body.find("required_auto_actions gate")
-    idx_merge = body.find("merge_ready gate")
-    assert idx_req != -1, "required_auto_actions gate must be defined"
-    assert idx_merge != -1, "merge_ready gate must be defined"
-    assert idx_req < idx_merge, (
-        "required_auto_actions gate must appear before merge_ready gate in APPROVE flow"
-    )
 
 
 def test_ac4_worker_status_failed_leads_to_human_escalation():
@@ -205,71 +141,9 @@ def test_ac4_worker_status_permission_blocked_leads_to_human_escalation():
 # ---------------------------------------------------------------------------
 
 
-def test_ac5_approve_behind_does_not_terminate():
-    """AC5: APPROVE + BEHIND must not route to termination_reason: approved."""
-    body = _read(STEP5_MH)
-    # Verify the BEHIND row in the routing table does NOT say "approved"
-    # The routing table must show BEHIND → BEHIND 分岐 (not approved)
-    assert "BEHIND" in body, "step-5-mergeability-handling.md must reference BEHIND"
-    # Check that the BEHIND row explicitly says not to set termination_reason: approved
-    assert "termination_reason: approved" in body and "立てない" in body, (
-        "step-5-mergeability-handling.md must explicitly state APPROVE + BEHIND "
-        "does not set termination_reason: approved"
-    )
-
-
-def test_ac5_c5_c6_conflict_resolved():
-    """AC5: The C5 vs C6 conflict must be resolved (routing table has required_auto_actions column)."""
-    body = _read(STEP5_MH)
-    assert "required_auto_actions" in body, (
-        "step-5-mergeability-handling.md must include required_auto_actions in routing table"
-    )
-    assert "C5 vs C6" in body or "C5" in body, (
-        "step-5-mergeability-handling.md must reference C5 vs C6 conflict resolution"
-    )
-
-
 # ---------------------------------------------------------------------------
 # AC6: SKILL.md top-level termination condition unified
 # ---------------------------------------------------------------------------
-
-
-def test_ac6_skill_md_termination_condition_unified():
-    """AC6: SKILL.md must show APPROVE && merge_ready == true && required_auto_actions == []."""
-    body = _read(SKILL_MD)
-    assert "merge_ready == true" in body, (
-        "SKILL.md must include merge_ready == true in termination condition"
-    )
-    assert "required_auto_actions == []" in body, (
-        "SKILL.md must include required_auto_actions == [] in termination condition"
-    )
-
-
-def test_ac6_skill_md_approve_alone_not_sufficient():
-    """AC6: SKILL.md must not show APPROVE alone as sufficient for termination."""
-    body = _read(SKILL_MD)
-    # The loop structure section should NOT show APPROVE → exit without conditions
-    # New loop structure must mention merge_ready and required_auto_actions
-    loop_idx = body.find("## Loop Structure")
-    assert loop_idx != -1, "SKILL.md must have Loop Structure section"
-    loop_section = body[loop_idx : loop_idx + 800]
-    assert "merge_ready" in loop_section or "required_auto_actions" in loop_section, (
-        "SKILL.md Loop Structure must reference merge_ready or required_auto_actions"
-    )
-
-
-def test_ac6_skill_md_termination_table_updated():
-    """AC6: SKILL.md termination table must be updated with new conditions."""
-    body = _read(SKILL_MD)
-    termination_idx = body.find("## 終了条件")
-    assert termination_idx != -1, "SKILL.md must have 終了条件 section"
-    termination_section = body[termination_idx : termination_idx + 800]
-    assert "merge_ready" in termination_section, (
-        "SKILL.md 終了条件 must include merge_ready"
-    )
-    assert "required_auto_actions" in termination_section, (
-        "SKILL.md 終了条件 must include required_auto_actions"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -277,33 +151,17 @@ def test_ac6_skill_md_termination_table_updated():
 # ---------------------------------------------------------------------------
 
 
-def test_ac7_v2_fenced_yaml_parse_specified():
-    """AC7: step-5-mergeability-handling.md must specify LOOP_VERDICT_V2 fenced YAML parse."""
-    body = _read(STEP5_MH)
-    assert "LOOP_VERDICT_V2" in body, (
-        "step-5-mergeability-handling.md must reference LOOP_VERDICT_V2"
-    )
-    assert "fenced YAML" in body or "フェンス付き" in body, (
-        "step-5-mergeability-handling.md must specify fenced YAML only parse"
-    )
-
-
-def test_ac7_v2_no_top_level_mergestatestatus_reference():
-    """AC7: V2 consumer path must not reference top-level mergeStateStatus."""
-    body = _read(STEP5_MH)
-    # The new V2 path should use mergeability.merge_state_status, not top-level mergeStateStatus
-    # The table should still show top-level reference as "参照しない"
-    assert "参照しない" in body or "V2 フィールド" in body, (
-        "step-5-mergeability-handling.md must state V2 consumer does not use "
-        "top-level mergeStateStatus"
-    )
-
-
 def test_ac7_v2_merge_ready_field_used():
-    """AC7: V2 consumer path must use merge_ready field."""
+    """AC7 (superseded by Issue #1873): merge_ready is no longer a reviewer
+    self-report field -- route_loop_verdict_v2() derives the equivalent
+    live-mergeability routing directly. This test now verifies
+    step-5-mergeability-handling.md documents that live_mergeability-based
+    routing rather than pinning the removed reviewer-self-report field name."""
     body = _read(STEP5_MH)
-    assert "merge_ready" in body, (
-        "step-5-mergeability-handling.md must reference merge_ready (V2 field)"
+    assert "live_mergeability" in body, (
+        "step-5-mergeability-handling.md must document live_mergeability-based "
+        "routing (Issue #1873: merge_ready is no longer a reviewer self-report "
+        "field; live mergeability is fetched directly by control-plane)"
     )
 
 
@@ -312,55 +170,9 @@ def test_ac7_v2_merge_ready_field_used():
 # ---------------------------------------------------------------------------
 
 
-def test_ac8_update_pr_body_hygiene_no_verification_rerun():
-    """AC8: update_pr_body_hygiene must not re-run verification."""
-    body = _read(STEP5_FT)
-    idx = body.find("update_pr_body_hygiene")
-    assert idx != -1, "step-5-feedback-and-termination.md must define update_pr_body_hygiene"
-    context = body[idx : idx + 400]
-    assert "verification: false" in context, (
-        "update_pr_body_hygiene must have verification: false (head SHA unchanged)"
-    )
-    assert "pr_review: true" in context, (
-        "update_pr_body_hygiene must have pr_review: true"
-    )
-
-
-def test_ac8_ensure_closing_keyword_no_verification_rerun():
-    """AC8: ensure_closing_keyword must not re-run verification."""
-    body = _read(STEP5_FT)
-    idx = body.find("ensure_closing_keyword")
-    assert idx != -1, "step-5-feedback-and-termination.md must define ensure_closing_keyword"
-    context = body[idx : idx + 400]
-    assert "verification: false" in context, (
-        "ensure_closing_keyword must have verification: false (head SHA unchanged)"
-    )
-    assert "pr_review: true" in context, (
-        "ensure_closing_keyword must have pr_review: true"
-    )
-
-
 # ---------------------------------------------------------------------------
 # AC9: update_branch re-runs verification and pr_review
 # ---------------------------------------------------------------------------
-
-
-def test_ac9_update_branch_reruns_verification_and_pr_review():
-    """AC9: update_branch must re-run both verification and pr_review."""
-    body = _read(STEP5_FT)
-    idx = body.find("update_branch:")
-    assert idx != -1, "step-5-feedback-and-termination.md must define update_branch action"
-    # Look at the routing table entry for update_branch
-    context = body[idx : idx + 400]
-    assert "head_change_expected: true" in context, (
-        "update_branch must have head_change_expected: true"
-    )
-    assert "verification: true" in context, (
-        "update_branch must have verification: true"
-    )
-    assert "pr_review: true" in context, (
-        "update_branch must have pr_review: true"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -466,15 +278,6 @@ def test_ac12_impl_review_loop_result_v1_status_draft_pr_ready():
     )
 
 
-def test_ac12_impl_review_loop_result_v1_merge_ready_true():
-    """AC12: IMPL_REVIEW_LOOP_RESULT_V1 must have merge_ready: true."""
-    body = _read(STEP5_FT)
-    assert "merge_ready: true" in body, (
-        "step-5-feedback-and-termination.md must emit merge_ready: true "
-        "in IMPL_REVIEW_LOOP_RESULT_V1"
-    )
-
-
 def test_ac12_skill_md_emits_draft_pr_ready():
     """AC12: SKILL.md 終了条件 must reference draft_pr_ready emission."""
     body = _read(SKILL_MD)
@@ -486,24 +289,6 @@ def test_ac12_skill_md_emits_draft_pr_ready():
 # ---------------------------------------------------------------------------
 # B1: required_auto_actions schema (object, not string-list)
 # ---------------------------------------------------------------------------
-
-
-def test_b1_required_auto_actions_object_schema_defined():
-    """B1: required_auto_actions must be documented as array-of-objects schema."""
-    body = _read(STEP5_FT)
-    assert "array-of-objects" in body or "array of objects" in body.lower(), (
-        "step-5-feedback-and-termination.md must document required_auto_actions "
-        "as array-of-objects (not string-list)"
-    )
-
-
-def test_b1_required_auto_actions_schema_fields():
-    """B1: schema must document kind, executor, skill, blocking_merge_ready, expected_head_sha fields."""
-    body = _read(STEP5_FT)
-    for field in ("kind", "executor", "blocking_merge_ready", "expected_head_sha"):
-        assert field in body, (
-            f"step-5-feedback-and-termination.md must document '{field}' in schema"
-        )
 
 
 def test_b1_unknown_kind_routes_to_human_escalation():
@@ -532,21 +317,6 @@ def test_b1_missing_expected_head_sha_routes_to_human_escalation():
 # ---------------------------------------------------------------------------
 
 
-def test_b2_first_yaml_block_dependency_forbidden():
-    """B2: parse must not depend on 'first ```yaml block'."""
-    body = _read(STEP5_MH)
-    # The doc must enumerate LOOP_VERDICT_V2 blocks, not just take the first yaml block
-    assert "最初の" not in body or "禁止" in body or "LOOP_VERDICT_V2" in body, (
-        "step-5-mergeability-handling.md must not depend on 'first yaml block'"
-    )
-    # Must enumerate LOOP_VERDICT_V2-containing blocks
-    assert (
-        "LOOP_VERDICT_V2"
-    ) in body and ("列挙" in body or "enumerate" in body.lower() or "全て" in body or "含む" in body), (
-        "step-5-mergeability-handling.md must enumerate LOOP_VERDICT_V2-containing fenced blocks"
-    )
-
-
 def test_b2_malformed_yaml_routes_to_human_escalation():
     """B2: malformed YAML must route to human_escalation."""
     body = _read(STEP5_MH)
@@ -555,61 +325,9 @@ def test_b2_malformed_yaml_routes_to_human_escalation():
     )
 
 
-def test_b2_prose_loop_verdict_v2_ignored():
-    """B2: LOOP_VERDICT_V2 text outside code blocks must be ignored."""
-    body = _read(STEP5_MH)
-    assert "prose" in body or "コードブロック外" in body or "コードブロック" in body, (
-        "step-5-mergeability-handling.md must state prose LOOP_VERDICT_V2 references are ignored"
-    )
-
-
-def test_b2_v1_top_level_fields_ignored_in_v2_path():
-    """B2: V1 top-level mergeStateStatus and recommendations must be ignored in V2 path."""
-    body = _read(STEP5_MH)
-    assert "mergeStateStatus" in body and "参照しない" in body, (
-        "step-5-mergeability-handling.md must explicitly state top-level mergeStateStatus "
-        "is not referenced in V2 consumer path"
-    )
-
-
 # ---------------------------------------------------------------------------
 # B3: draft_pr_ready / github_merge_ready separation + DRAFT/HAS_HOOKS routing
 # ---------------------------------------------------------------------------
-
-
-def test_b3_github_merge_ready_field_defined():
-    """B3: IMPL_REVIEW_LOOP_RESULT_V1 must include github_merge_ready field."""
-    body = _read(STEP5_FT)
-    assert "github_merge_ready" in body, (
-        "step-5-feedback-and-termination.md must define github_merge_ready field"
-    )
-
-
-def test_b3_draft_pr_defined_separately_from_github_merge_ready():
-    """B3: draft_pr_ready and github_merge_ready must be documented as distinct fields."""
-    body = _read(STEP5_FT)
-    assert "draft_pr_ready" in body and "github_merge_ready" in body, (
-        "Both draft_pr_ready and github_merge_ready must be present"
-    )
-    # They must be in proximity (within same section)
-    idx_draft = body.find("draft_pr_ready")
-    idx_github = body.find("github_merge_ready")
-    assert abs(idx_draft - idx_github) < 2000, (
-        "draft_pr_ready and github_merge_ready must be defined in close proximity"
-    )
-
-
-def test_b3_draft_merge_state_routes_to_github_merge_ready_false():
-    """B3: DRAFT merge_state_status must result in github_merge_ready: false."""
-    body = _read(STEP5_FT)
-    assert "DRAFT" in body, (
-        "step-5-feedback-and-termination.md must reference DRAFT merge_state_status"
-    )
-    idx = body.find("DRAFT")
-    context = body[idx : idx + 400]
-    assert "github_merge_ready: false" in context or "false" in context, (
-        "DRAFT merge_state_status must yield github_merge_ready: false"
-    )
 
 
 def test_b3_has_hooks_routes_to_github_merge_ready_true():
@@ -626,15 +344,22 @@ def test_b3_has_hooks_routes_to_github_merge_ready_true():
 
 
 def test_b4_worker_status_stale_verdict_defined():
-    """B4: worker_status_stale_verdict must be defined with human_escalation route."""
+    """B4 (corrected in PR #1875 conflict resolution): worker_status_stale_verdict
+    must be defined and must route to re-review, not human_escalation --
+    staleness alone is never a human-escalation reason (route_loop_verdict_v2()
+    itself routes a stale reviewed_head_sha to route_stale_head_rereview, and
+    step-5-mergeability-handling.md's UPDATE_BRANCH_RESULT_V1.stale_verdict row
+    routes to re-review; this test previously asserted the two docs'
+    contradictory human_escalation branch)."""
     body = _read(STEP5_FT)
     assert "worker_status_stale_verdict" in body, (
         "step-5-feedback-and-termination.md must define worker_status_stale_verdict"
     )
     idx = body.find("worker_status_stale_verdict")
-    context = body[idx : idx + 200]
-    assert "human_escalation" in context, (
-        "worker_status_stale_verdict must route to human_escalation"
+    route_line = body[idx : idx + 60]
+    assert "route: rereview" in route_line, (
+        f"worker_status_stale_verdict must route to re-review "
+        f"(staleness alone is never a human-escalation reason), got: {route_line!r}"
     )
 
 
@@ -711,94 +436,89 @@ if str(_SCRIPTS_DIR) not in _sys.path:
 from route_loop_verdict_v2 import route_loop_verdict_v2  # noqa: E402
 
 
-def _make_loop_verdict(
-    verdict: str,
-    merge_ready: bool,
-    required_auto_actions: list,
-    merge_state_status: str,
-) -> dict:
-    """Build a minimal LOOP_VERDICT_V2 dict from B5 matrix parameters."""
+def _make_reviewer_verdict(verdict: str, blockers: list | None = None) -> dict:
+    """Build a minimal reviewer_verdict dict (Issue #1873 minimal convention)."""
     return {
         "verdict": verdict,
-        "merge_ready": merge_ready,
         "reviewed_head_sha": "abc123def456",
-        "mergeability": {
-            "mergeable": "MERGEABLE",
-            "merge_state_status": merge_state_status,
-        },
-        "required_auto_actions": required_auto_actions,
+        "blockers": blockers or [],
+    }
+
+
+def _make_live_mergeability(merge_state_status: str, mergeable: str = "MERGEABLE") -> dict:
+    """Build a minimal live_mergeability dict as fetched from `gh pr view`."""
+    return {
+        "head_sha": "abc123def456",
+        "mergeable": mergeable,
+        "merge_state_status": merge_state_status,
     }
 
 
 def test_b5_fixture_matrix_approved():
-    """B5: APPROVE + merge_ready=true + [] + CLEAN must route to approved."""
-    lv = _make_loop_verdict("APPROVE", True, [], "CLEAN")
-    result = route_loop_verdict_v2(lv)
+    """B5: APPROVE + no blockers + live CLEAN/MERGEABLE must route to approved."""
+    rv = _make_reviewer_verdict("APPROVE")
+    lm = _make_live_mergeability("CLEAN")
+    result = route_loop_verdict_v2(rv, lm)
     assert result.route == "approved", (
         f"Expected 'approved', got '{result.route}'. errors: {result.errors}"
     )
 
 
 def test_b5_fixture_matrix_update_branch():
-    """B5: APPROVE + merge_ready=false + [update_branch] + BEHIND must route to route_to_update_branch.
+    """B5: APPROVE + live BEHIND must route to route_to_update_branch, with
+    the action synthesized by the router.
 
-    Issue #1856 (AC1): route_loop_verdict_v2 no longer accepts test_verdict;
-    BEHIND is derived solely from merge_state_status.
+    Issue #1856 (evidence authority cutover, Phase 1): BEHIND is derived
+    solely from live_mergeability.merge_state_status; test_verdict (when
+    supplied) is diagnostics-only and does not gate this route.
     """
-    actions = [
-        {
-            "kind": "update_branch",
-            "executor": "implementation-worker",
-            "skill": "implement-issue.update_branch",
-            "blocking_merge_ready": True,
-            "mechanical": True,
-            "expected_head_sha": "abc123def456",
-        }
-    ]
-    lv = _make_loop_verdict("APPROVE", False, actions, "BEHIND")
-    result = route_loop_verdict_v2(lv)
+    rv = _make_reviewer_verdict("APPROVE")
+    lm = _make_live_mergeability("BEHIND")
+    result = route_loop_verdict_v2(rv, lm)
     assert result.route == "route_to_update_branch", (
         f"Expected 'route_to_update_branch', got '{result.route}'. errors: {result.errors}"
     )
+    assert result.selected_action is not None
+    assert dict(result.selected_action)["kind"] == "update_branch"
 
 
 def test_b5_fixture_matrix_unknown_action_human_escalation():
-    """B5: APPROVE + [unknown_action object] + CLEAN must fail-closed (unknown kind)."""
-    actions = [{"kind": "unknown_action"}]
-    lv = _make_loop_verdict("APPROVE", True, actions, "CLEAN")
-    result = route_loop_verdict_v2(lv)
-    assert result.fail_closed is True, (
-        f"Expected fail_closed=True for unknown kind, got route='{result.route}'. errors: {result.errors}"
+    """B5: reviewer verdict HUMAN_REVIEW_REQUIRED must route to human escalation."""
+    rv = _make_reviewer_verdict("HUMAN_REVIEW_REQUIRED", blockers=["ambiguous"])
+    lm = _make_live_mergeability("CLEAN")
+    result = route_loop_verdict_v2(rv, lm)
+    assert result.route == "route_human_escalation", (
+        f"Expected 'route_human_escalation', got '{result.route}'. errors: {result.errors}"
     )
 
 
 def test_b5_fixture_matrix_nonempty_known_action_not_approved():
-    """B5: APPROVE + [update_pr_body_hygiene] + CLEAN must route to route_to_body_only_action (not approved)."""
-    actions = [{"kind": "update_pr_body_hygiene"}]
-    lv = _make_loop_verdict("APPROVE", True, actions, "CLEAN")
-    result = route_loop_verdict_v2(lv)
-    assert result.route == "route_to_body_only_action", (
-        f"Expected 'route_to_body_only_action', got '{result.route}'. errors: {result.errors}"
-    )
+    """B5: APPROVE with non-empty blockers is an inconsistent reviewer result
+    and must fail closed rather than approve."""
+    rv = _make_reviewer_verdict("APPROVE", blockers=["still has a blocker"])
+    lm = _make_live_mergeability("CLEAN")
+    result = route_loop_verdict_v2(rv, lm)
     assert result.route != "approved", (
-        "update_pr_body_hygiene action must not route to approved"
+        "APPROVE with non-empty blockers must not route to approved"
     )
+    assert result.fail_closed is True
 
 
 def test_b5_fixture_matrix_draft_not_github_merge_ready():
-    """B5: APPROVE + [] + DRAFT must not be approved (merge_ready=false with empty actions fails closed)."""
-    lv = _make_loop_verdict("APPROVE", False, [], "DRAFT")
-    result = route_loop_verdict_v2(lv)
+    """B5: APPROVE + live DRAFT must not be approved (human judgment required)."""
+    rv = _make_reviewer_verdict("APPROVE")
+    lm = _make_live_mergeability("DRAFT")
+    result = route_loop_verdict_v2(rv, lm)
     assert result.route != "approved", (
-        f"DRAFT merge_state_status with merge_ready=false must not route to approved. "
-        f"Got '{result.route}'"
+        f"DRAFT merge_state_status must not route to approved. Got '{result.route}'"
     )
 
 
 def test_b5_fixture_matrix_unknown_status_human_escalation():
-    """B5: APPROVE + UNKNOWN merge_state_status must fail-closed (merge_ready=false with empty actions)."""
-    lv = _make_loop_verdict("APPROVE", False, [], "UNKNOWN")
-    result = route_loop_verdict_v2(lv)
+    """B5: APPROVE + live UNKNOWN merge_state_status must not be approved."""
+    rv = _make_reviewer_verdict("APPROVE")
+    lm = _make_live_mergeability("UNKNOWN")
+    result = route_loop_verdict_v2(rv, lm)
     assert result.route != "approved", (
         f"UNKNOWN merge_state_status must not route to approved. Got '{result.route}'"
     )
@@ -806,8 +526,9 @@ def test_b5_fixture_matrix_unknown_status_human_escalation():
 
 def test_b5_fixture_matrix_request_changes_continue_loop():
     """B5: REQUEST_CHANGES must route to continue_loop (next iteration)."""
-    lv = _make_loop_verdict("REQUEST_CHANGES", False, [], "CLEAN")
-    result = route_loop_verdict_v2(lv)
+    rv = _make_reviewer_verdict("REQUEST_CHANGES", blockers=["needs fix"])
+    lm = _make_live_mergeability("CLEAN")
+    result = route_loop_verdict_v2(rv, lm)
     assert result.route == "continue_loop", (
         f"Expected 'continue_loop', got '{result.route}'"
     )

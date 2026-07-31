@@ -5,32 +5,28 @@ controlled_skill_mutation_exec.py
 Single executor for CONTROLLED_SKILL_MUTATION_COMMAND_POLICY entries.
 Invoked by agents via the exact argv form defined in controlled_skill_mutation_policy.py.
 
-Design: Direct script allow for publish_termination_report.py / ensure_contract_snapshot.py
-is denied. Only this executor is allow-listed in settings.json. It handles four
-command ids: termination_report.publish (legacy, Issue #1166), issue_body.update /
-issue_content.update / issue_comment.publish / contract_snapshot.publish (Issue #1284
-issue metadata mutation
-lane). The executor enforces:
+Design: Direct script allow for ensure_contract_snapshot.py is denied. Only this
+executor is allow-listed in settings.json. It handles the issue-metadata mutation
+lane (Issue #1284): issue_body.update / issue_content.update / issue_comment.publish /
+contract_snapshot.publish / test_verdict.publish / issue_scope_snapshot.materialize /
+issue_dependency.remove. The executor enforces:
   - command_id whitelist (ALL_COMMAND_IDS)
   - repo binding (--repo must be TRUSTED_REPO)
   - git remote origin binding (must match TRUSTED_REPO)
-  - issue binding (--issue-number must match LOOP_ISSUE_NUMBER env -- mandatory for
-    termination_report.publish, optional-but-matching for the Issue #1284 command ids)
+  - issue binding (--issue-number must match LOOP_ISSUE_NUMBER env when present)
   - input-file binding (must be in the active issue/command-id artifact subtree,
     no symlinks, no hardlinks)
   - input-file JSON validation (schema + issue_number field cross-check, plus
-    per-command-id field schemas for the Issue #1284 command ids)
+    per-command-id field schemas)
   - gh binary discovery (trusted path only)
-  - environment sanitization (PUBLISH_ARTIFACT_DIR / PYTHONPATH / PYTHONHOME /
-    GH_EDITOR / EDITOR / VISUAL / BROWSER overridden/removed)
-  - module realpath inspection (publisher / renderer / prose_boundary canonical path
-    check for termination_report.publish; ensure_contract_snapshot.py /
-    run_contract_review_once.py / contract_review_result_parser.py canonical path
-    check for contract_snapshot.publish -- missing=deny)
+  - environment sanitization (PYTHONPATH / PYTHONHOME / GH_EDITOR / EDITOR /
+    VISUAL / BROWSER overridden/removed)
+  - module realpath inspection (ensure_contract_snapshot.py / run_contract_review_once.py /
+    contract_review_result_parser.py canonical path check for contract_snapshot.publish --
+    missing=deny)
   - remote-state-is-authority idempotency: local marker files are cache/audit only.
     issue_body.update and issue_comment.publish always readback GitHub before
     declaring success; a local marker never substitutes for a remote check.
-  - exec marker injection (deterministic marker for comment read-back, legacy command)
   - pre-mutation marker precheck for issue_comment.publish (no POST before remote
     marker state is known -- a failed transaction must not leave a side effect)
   - postcondition (git status --porcelain=v1 must show no changes outside the
@@ -67,20 +63,14 @@ _THIS_FILE = Path(__file__).resolve()
 # scripts/agent-guards/ -> scripts/ -> project_root
 PROJECT_ROOT = _THIS_FILE.parent.parent.parent
 
-_PUBLISHER_SCRIPT_REL = ".claude/skills/issue-refinement-loop/scripts/publish_termination_report.py"
-_RENDERER_SCRIPT_REL = ".claude/skills/issue-refinement-loop/scripts/render_termination_report.py"
-_PROSE_BOUNDARY_REL = ".claude/skills/create-issue/scripts/prose_boundary_policy.py"
-
 # -- Import shared policy ------------------------------------------------------
 
 sys.path.insert(0, str(_THIS_FILE.parent))
 from controlled_skill_mutation_policy import (  # noqa: E402
-    COMMAND_ID_PUBLISH,
     COMMAND_ID_ISSUE_BODY_UPDATE,
     COMMAND_ID_ISSUE_CONTENT_UPDATE,
     COMMAND_ID_ISSUE_COMMENT_PUBLISH,
     COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH,
-    COMMAND_ID_PR_REVIEW_PUBLISH,
     COMMAND_ID_TEST_VERDICT_PUBLISH,
     COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
     COMMAND_ID_ISSUE_DEPENDENCY_REMOVE,
@@ -196,47 +186,12 @@ def _verify_git_remote_origin(project_root: Path, trusted_repo: str, env: dict[s
         return f"git_remote_origin_exception: {exc}"
 
 
-# -- Environment sanitization --------------------------------------------------
-
-
-def _build_sanitized_env(project_root: Path, issue_number: int, exec_marker: str = "") -> dict[str, str]:
-    """Build a sanitized environment for the publisher subprocess.
-
-    Removes or overrides env vars that could redirect artifacts, shadow modules,
-    or open interactive editors/browsers.
-    """
-    env = os.environ.copy()
-
-    # Remove env vars that could interfere
-    for key in ENV_SANITIZE_KEYS:
-        env.pop(key, None)
-
-    # Set canonical artifact dir (issue-scoped) so publisher writes to the right place
-    artifact_dir = project_root / "artifacts" / str(issue_number)
-    env["PUBLISH_ARTIFACT_DIR"] = str(artifact_dir)
-
-    # Clear Python path overrides to prevent module shadowing
-    env.pop("PYTHONPATH", None)
-    env.pop("PYTHONHOME", None)
-
-    # Prevent any editor/browser from being opened
-    env["GH_PROMPT_DISABLED"] = "1"
-    env["GH_NO_UPDATE_NOTIFIER"] = "1"
-
-    # Inject exec marker for comment read-back
-    if exec_marker:
-        env["CONTROLLED_EXEC_MARKER"] = exec_marker
-
-    return env
-
-
 # -- Issue #1284 Blocker 5: generic metadata-command env sanitizer -------------
 
 
 def _build_metadata_sanitized_env() -> dict[str, str]:
     """Build a sanitized environment for issue-metadata publisher subprocesses
-    (contract_snapshot.publish). Equivalent boundary to _build_sanitized_env()
-    minus the PUBLISH_ARTIFACT_DIR override, which is legacy-publisher-specific.
+    (contract_snapshot.publish).
     """
     env = os.environ.copy()
     for key in ENV_SANITIZE_KEYS:
@@ -253,9 +208,7 @@ def _build_metadata_sanitized_env() -> dict[str, str]:
 
 def _check_contract_snapshot_module_realpaths(project_root: Path) -> list[str]:
     """Return list of realpath violations for the contract_snapshot.publish
-    publisher module chain. Missing modules are treated as errors (missing=deny),
-    mirroring _check_module_realpaths() for the legacy termination_report.publish
-    command.
+    publisher module chain. Missing modules are treated as errors (missing=deny).
 
     Issue #1459 review Blocker (evaluator_missing_from_module_trust_chain):
     evaluate_product_spec_gate.py is imported by ensure_contract_snapshot.py at
@@ -284,57 +237,6 @@ def _check_contract_snapshot_module_realpaths(project_root: Path) -> list[str]:
     return errors
 
 
-# -- Module realpath inspection ------------------------------------------------
-
-
-def _check_module_realpaths(project_root: Path) -> list[str]:
-    """Return list of realpath violations. Empty list = all OK.
-
-    Checks that publisher / renderer / prose_boundary_policy resolve to canonical
-    paths under project_root. Prevents module shadowing (AC16).
-    Missing modules are treated as errors (missing=deny).
-    """
-    errors = []
-    for rel in (_PUBLISHER_SCRIPT_REL, _RENDERER_SCRIPT_REL, _PROSE_BOUNDARY_REL):
-        canonical = (project_root / rel).resolve()
-        if not canonical.exists():
-            errors.append(f"module_missing: {rel} not found at {canonical}")
-            continue
-        if not str(canonical).startswith(str(project_root)):
-            errors.append(f"module_shadowing: {rel} resolved to {canonical}, expected under {project_root}")
-
-    # Import origin check for prose_boundary_policy via subprocess probe
-    prose_canonical = (project_root / _PROSE_BOUNDARY_REL).resolve()
-    if prose_canonical.exists():
-        try:
-            probe_code = (
-                "import sys; sys.path.insert(0, '" + str(prose_canonical.parent).replace("'", "\\'") + "'); "
-                "import prose_boundary_policy; "
-                "import pathlib; "
-                "print(pathlib.Path(prose_boundary_policy.__file__).resolve())"
-            )
-            probe = subprocess.run(
-                [sys.executable, "-c", probe_code],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                cwd=str(project_root),
-            )
-            if probe.returncode == 0:
-                imported_origin = Path(probe.stdout.strip())
-                if imported_origin != prose_canonical:
-                    errors.append(
-                        f"module_import_origin_mismatch: prose_boundary_policy "
-                        f"imported from {imported_origin}, expected {prose_canonical}"
-                    )
-            else:
-                errors.append(f"module_import_probe_failed: {probe.stderr[:200]}")
-        except Exception as exc:
-            errors.append(f"module_import_probe_error: {exc}")
-
-    return errors
-
-
 # -- Input file validation -----------------------------------------------------
 
 
@@ -351,7 +253,7 @@ def _validate_and_resolve_input_file(
     input_file_str: str,
     issue_number: int,
     project_root: Path,
-    command_id: str = COMMAND_ID_PUBLISH,
+    command_id: str,
 ) -> tuple[Path | None, str]:
     """Validate and resolve the input file path.
 
@@ -362,8 +264,8 @@ def _validate_and_resolve_input_file(
     - Filesystem: reject symlink components (via lstat)
     - Must be a regular file
     - Must not be a hardlink (st_nlink == 1)
-    - Must be under artifacts/{issue_number}/ (legacy termination_report.publish)
-      or artifacts/{issue_number}/issue-metadata/{command_id}/ (Issue #1284 command ids)
+    - Must be under artifacts/{issue_number}/issue-metadata/{command_id}/
+      (Issue #1284 command ids)
     """
     raw = PurePosixPath(input_file_str)
 
@@ -408,10 +310,7 @@ def _validate_and_resolve_input_file(
         return None, f"input_file_hardlink_denied: st_nlink={st.st_nlink}"
 
     # Containment check.
-    if command_id == COMMAND_ID_PUBLISH:
-        artifact_subtree = (project_root / "artifacts" / str(issue_number)).resolve()
-    else:
-        artifact_subtree = _issue_metadata_subtree(project_root, issue_number, command_id)
+    artifact_subtree = _issue_metadata_subtree(project_root, issue_number, command_id)
     try:
         canonical.relative_to(artifact_subtree)
     except ValueError:
@@ -450,12 +349,6 @@ def _load_and_validate_input_json(canonical_input: Path, issue_number: int, comm
         return None, f"input_issue_number_mismatch: {input_issue} != {issue_number}"
 
     return input_data, ""
-
-
-def _validate_input_json(canonical_input: Path, issue_number: int) -> str:
-    """Backward-compatible wrapper for termination_report.publish (AC10 legacy)."""
-    _, err = _load_and_validate_input_json(canonical_input, issue_number, COMMAND_ID_PUBLISH)
-    return err
 
 
 # -- Issue #1284: per-command input field validation ---------------------------
@@ -535,27 +428,6 @@ def _validate_issue_comment_publish_fields(data: dict) -> str:
 
 
 _PR_HEAD_SHA_RE = _re.compile(r"^[0-9a-f]{40}$")
-
-
-# Issue #1539 fix_delta High 2: exact-key schema -- an input JSON with any key
-# outside this set is rejected before any mutation. Applies to the
-# --input-file code path (the --render-body-file code path never accepts an
-# arbitrary dict at all -- see _render_pr_review_publish_request()).
-_PR_REVIEW_PUBLISH_ALLOWED_KEYS = frozenset(
-    {
-        "schema",
-        "issue_number",
-        "repo",
-        "pr_number",
-        "expected_head_sha",
-        "event",
-        "producer_role",
-        "body",
-        "body_sha256",
-        "idempotency_key",
-    }
-)
-_PR_REVIEW_BODY_MAX_BYTES = 60000
 
 # Issue #1647: this transaction is deliberately distinct from the generic
 # issue-comment publisher.  The CLI issue number is the linked Issue; the PR
@@ -705,70 +577,6 @@ def _validate_test_verdict_publish_fields(data: dict, repo: str, issue_number: i
     return ""
 
 
-def _validate_pr_review_publish_fields(
-    data: dict, repo: str, issue_number: int, enforce_issue_pr_match: bool = False
-) -> str:
-    """Issue #1536 AC1/AC2/AC5/AC6: PR_REVIEW_PUBLISH_REQUEST_V1 field validation.
-
-    All checks below run before any GitHub API call (AC2/AC3/AC5 require
-    fail-closed rejection with zero remote side effect for malformed input).
-
-    Issue #1822 fix_delta AC9: `enforce_issue_pr_match` restores the legacy
-    `pr_number == issue_number` binding for the legacy `--input-file` code
-    path ONLY. Render mode (Issue #1822 AC1-AC3) intentionally treats
-    issue_number and pr_number as independent identifiers (e.g. Issue #1688 ->
-    PR #1818) and must call this with `enforce_issue_pr_match=False`.
-    """
-    unknown_keys = set(data.keys()) - _PR_REVIEW_PUBLISH_ALLOWED_KEYS
-    if unknown_keys:
-        return f"pr_review_publish_unknown_fields: {sorted(unknown_keys)}"
-
-    declared_repo = data.get("repo")
-    if declared_repo != repo:
-        return f"pr_review_publish_repo_mismatch: {declared_repo!r} != {repo!r}"
-
-    pr_number = data.get("pr_number")
-    if type(pr_number) is not int or pr_number <= 0:
-        return f"pr_review_publish_pr_number_invalid: {pr_number!r}"
-
-    if enforce_issue_pr_match and pr_number != issue_number:
-        return f"pr_review_publish_pr_number_issue_number_mismatch: {pr_number!r} != {issue_number!r}"
-
-    expected_head_sha = data.get("expected_head_sha")
-    if not isinstance(expected_head_sha, str) or not _PR_HEAD_SHA_RE.match(expected_head_sha):
-        return f"pr_review_publish_expected_head_sha_invalid: {expected_head_sha!r}"
-
-    # AC2: event is fixed to COMMENT. Any alias (approve/-a/-r/APPROVE/
-    # REQUEST_CHANGES/lowercase "comment"/empty/missing) is rejected before
-    # any mutation -- the executor never negotiates event type with the API.
-    if data.get("event") != "COMMENT":
-        return f"pr_review_publish_event_not_comment: {data.get('event')!r}"
-
-    producer_role = data.get("producer_role")
-    if producer_role != "pr-reviewer":
-        return f"pr_review_publish_producer_role_invalid: {producer_role!r}"
-
-    body = data.get("body")
-    if not isinstance(body, str) or not body:
-        return "pr_review_publish_body_invalid"
-    if len(body.encode("utf-8")) > _PR_REVIEW_BODY_MAX_BYTES:
-        return f"pr_review_publish_body_too_large: {len(body.encode('utf-8'))} bytes"
-    body_sha256 = data.get("body_sha256")
-    computed_body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    if body_sha256 != computed_body_sha256:
-        return f"pr_review_publish_body_sha256_mismatch: computed={computed_body_sha256} declared={body_sha256!r}"
-
-    idempotency_key = data.get("idempotency_key")
-    expected_idempotency_key = f"{repo}:{pr_number}:{expected_head_sha}:{body_sha256}"
-    if idempotency_key != expected_idempotency_key:
-        return (
-            f"pr_review_publish_idempotency_key_mismatch: expected="
-            f"{expected_idempotency_key!r} declared={idempotency_key!r}"
-        )
-
-    return ""
-
-
 def _validate_contract_snapshot_publish_fields(data: dict, repo: str) -> str:
     """Issue #1284 Blocker 4: CONTRACT_SNAPSHOT_PUBLISH_INPUT_V1 must bind repo /
     target_issue_body_sha256 / expected_latest_contract_review_status /
@@ -806,9 +614,10 @@ def _validate_issue_scope_snapshot_materialize_fields(data: dict, repo: str) -> 
 def _check_issue_env_binding(command_id: str, issue_number: int) -> str:
     """Return error string, or empty string when binding is satisfied.
 
-    Legacy termination_report.publish: LOOP_ISSUE_NUMBER is mandatory (Issue #1166).
-    New command ids: LOOP_ISSUE_NUMBER is optional; when present it must match
-    --issue-number (Issue #1284 AC15).
+    LOOP_ISSUE_NUMBER is optional for every command id; when present it must
+    match --issue-number (Issue #1284 AC15). ENV_BINDING_MANDATORY_COMMAND_IDS
+    is currently empty (Issue #1873 removed its only member,
+    termination_report.publish) but is kept as an extension point.
     """
     env_issue = os.environ.get("LOOP_ISSUE_NUMBER", "").strip()
     mandatory = command_id in ENV_BINDING_MANDATORY_COMMAND_IDS
@@ -821,90 +630,6 @@ def _check_issue_env_binding(command_id: str, issue_number: int) -> str:
     if int(env_issue) != issue_number:
         return f"issue_number_mismatch: --issue-number {issue_number} != LOOP_ISSUE_NUMBER {env_issue}"
     return ""
-
-
-# -- Idempotency marker --------------------------------------------------------
-
-
-def _marker_path(project_root: Path, issue_number: int) -> Path:
-    return project_root / "artifacts" / str(issue_number) / "termination_report_published.marker.json"
-
-
-def _check_idempotency(project_root: Path, issue_number: int) -> dict | None:
-    """Return existing marker dict if already published, else None."""
-    mp = _marker_path(project_root, issue_number)
-    if mp.exists():
-        try:
-            data = json.loads(mp.read_text())
-            if data.get("comment_id") or data.get("comment_url"):
-                return data
-        except Exception:
-            pass
-    return None
-
-
-def _write_idempotency_marker(
-    project_root: Path,
-    issue_number: int,
-    comment_id: str | None,
-    comment_url: str | None,
-    body_hash: str | None,
-) -> None:
-    """Write idempotency marker after successful publish."""
-    mp = _marker_path(project_root, issue_number)
-    mp.parent.mkdir(parents=True, exist_ok=True)
-    marker = {
-        "schema": "TERMINATION_REPORT_PUBLISH_MARKER_V1",
-        "issue_number": issue_number,
-        "comment_id": comment_id,
-        "comment_url": comment_url,
-        "body_sha256": body_hash,
-        "published_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    }
-    mp.write_text(json.dumps(marker, ensure_ascii=False, indent=2))
-
-
-# -- Exec marker (idempotency read-back by marker) ----------------------------
-
-EXEC_MARKER_PREFIX = "<!-- CONTROLLED_EXEC_MARKER:"
-EXEC_MARKER_SUFFIX = " -->"
-
-
-def _compute_exec_marker(command_id: str, repo: str, issue_number: int, canonical_input: Path) -> str:
-    """Compute deterministic exec marker for comment injection."""
-    input_sha = hashlib.sha256(canonical_input.read_bytes()).hexdigest()
-    marker_src = f"{command_id}:{repo}:{issue_number}:{input_sha}"
-    return hashlib.sha256(marker_src.encode()).hexdigest()[:32]
-
-
-def _readback_by_marker(exec_marker: str, issue_number: int, repo: str, gh_bin: str) -> dict:
-    """Search comments for exec_marker and return comment metadata."""
-    marker_str = f"{EXEC_MARKER_PREFIX}{exec_marker}{EXEC_MARKER_SUFFIX}"
-    try:
-        out = subprocess.run(
-            [gh_bin, "issue", "view", str(issue_number), "--repo", repo, "--json", "comments"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        if out.returncode != 0:
-            return {"error": f"gh_failed_rc_{out.returncode}"}
-        data = json.loads(out.stdout)
-        comments = data.get("comments", [])
-        matches = [c for c in comments if marker_str in c.get("body", "")]
-        if len(matches) == 0:
-            return {"error": "marker_not_found"}
-        if len(matches) > 1:
-            return {"error": f"marker_found_{len(matches)}_times"}
-        c = matches[0]
-        body = c.get("body", "")
-        return {
-            "comment_id": c.get("id", ""),
-            "comment_url": c.get("url", ""),
-            "body_sha256": hashlib.sha256(body.encode()).hexdigest(),
-        }
-    except Exception as exc:
-        return {"error": f"readback_exception:{exc}"}
 
 
 # -- Issue #1284: HTTP error classification (same granularity as
@@ -1138,9 +863,8 @@ def _check_no_tracked_changes(project_root: Path, issue_number: int, allowed_pre
     """Return list of violations (staged, unstaged, untracked source files). Empty = OK (AC14).
 
     Uses git status --porcelain=v1 --untracked-files=all.
-    Allows writes inside allowed_prefix. Defaults to artifacts/{issue_number}/
-    (legacy termination_report.publish write root). Issue #1284 Blocker 6: new
-    command ids pass a command-id-scoped prefix
+    Allows writes inside allowed_prefix. Defaults to artifacts/{issue_number}/.
+    Issue #1284 Blocker 6: command ids pass a command-id-scoped prefix
     (artifacts/{issue_number}/issue-metadata/{command_id}/) so the postcondition
     cannot be satisfied by writes to a sibling command's namespace.
     """
@@ -1174,46 +898,6 @@ def _check_no_tracked_changes(project_root: Path, issue_number: int, allowed_pre
         return [f"git_status_exception: {exc}"]
 
 
-# -- Publisher invocation ------------------------------------------------------
-
-
-def _invoke_publisher(
-    *,
-    project_root: Path,
-    issue_number: int,
-    input_file: str,
-    repo: str,
-    sanitized_env: dict[str, str],
-) -> tuple[int, str, str]:
-    """Invoke publish_termination_report.py and return (returncode, stdout, stderr)."""
-    publisher = project_root / _PUBLISHER_SCRIPT_REL
-    cmd = [
-        sys.executable,
-        str(publisher),
-        "--issue-number",
-        str(issue_number),
-        "--input-file",
-        input_file,
-        "--repo",
-        repo,
-    ]
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            env=sanitized_env,
-            cwd=str(project_root),
-            timeout=60,
-            shell=False,
-        )
-        return proc.returncode, proc.stdout, proc.stderr
-    except subprocess.TimeoutExpired:
-        return -1, "", "publisher_timeout_60s"
-    except Exception as exc:
-        return -2, "", f"publisher_launch_error: {exc}"
-
-
 # -- Main executor -------------------------------------------------------------
 
 
@@ -1229,48 +913,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", required=True, help="GitHub repo slug (owner/repo)")
     parser.add_argument("--json", dest="output_json", action="store_true", help="JSON output")
     parser.add_argument("--dry-run", action="store_true", help="Validate but do not publish")
-    # Issue #1539 fix_delta Blocker 1: pr_review.publish "render mode". A
-    # trusted caller (NOT the pr-reviewer SubAgent, which has no Write/Edit
-    # tool and may not write files via Bash either) supplies the raw verdict
-    # body TEXT via --render-body-file plus the structured verdict metadata as
-    # CLI flags; the executor independently computes body_sha256 /
-    # idempotency_key and hardcodes producer_role="pr-reviewer" / event=
-    # "COMMENT" itself instead of trusting a pre-built, self-hashed JSON.
-    parser.add_argument(
-        "--render-body-file",
-        default=None,
-        help="Relative path to a raw review body TEXT file (artifact subtree, pr_review.publish render mode only)",
-    )
-    # Issue #1822: linked --issue-number and target --pr-number are
-    # independent identifiers (e.g. Issue #1688 -> PR #1818). The artifact
-    # subtree / issue binding always use --issue-number; the GitHub review
-    # target (endpoint, idempotency key) always uses --pr-number.
-    parser.add_argument(
-        "--pr-number", type=int, default=None,
-        help="Target PR number to publish the review against (render mode "
-             "only, independent from --issue-number)",
-    )
-    parser.add_argument(
-        "--verdict",
-        default=None,
-        choices=["APPROVE", "REQUEST_CHANGES", "COMMENT"],
-        help="Declared verdict (render mode only)",
-    )
-    parser.add_argument(
-        "--reviewed-head-sha",
-        default=None,
-        help="Head SHA the reviewer actually inspected (render mode only)",
-    )
-    parser.add_argument(
-        "--expected-head-sha",
-        default=None,
-        help="Head SHA the review must be commit_id-bound to (render mode only)",
-    )
-    parser.add_argument(
-        "--merge-ready",
-        action="store_true",
-        help="Declared merge_ready flag (render mode only; requires --verdict APPROVE)",
-    )
     args = parser.parse_args(argv)
 
     def _fail(
@@ -1332,42 +974,21 @@ def main(argv: list[str] | None = None) -> int:
     if env_err:
         return _fail(env_err)
 
-    # -- Issue #1539 fix_delta Blocker 1: pr_review.publish render mode -------
-    # Mutually exclusive with --input-file. Only pr_review.publish supports it.
-    render_mode = args.render_body_file is not None
-    if render_mode and args.command_id != COMMAND_ID_PR_REVIEW_PUBLISH:
-        return _fail("render_mode_not_supported_for_command_id")
-    if render_mode and args.input_file is not None:
-        return _fail("render_mode_and_input_file_mutually_exclusive")
-    if not render_mode and args.input_file is None:
-        return _fail("missing_input_source: neither --input-file nor --render-body-file given")
+    if args.input_file is None:
+        return _fail("missing_input_source: --input-file is required")
 
-    if render_mode:
-        canonical_input = None
-        input_data, render_err = _render_pr_review_publish_request(args, PROJECT_ROOT)
-        if render_err:
-            return _fail(render_err)
-    else:
-        # -- input-file binding ---------------------------------------------------
-        canonical_input, input_err = _validate_and_resolve_input_file(
-            args.input_file, args.issue_number, PROJECT_ROOT, command_id=args.command_id
-        )
-        if input_err:
-            return _fail(input_err)
+    # -- input-file binding ---------------------------------------------------
+    canonical_input, input_err = _validate_and_resolve_input_file(
+        args.input_file, args.issue_number, PROJECT_ROOT, command_id=args.command_id
+    )
+    if input_err:
+        return _fail(input_err)
 
-        # -- AC10: per-command-id input schema validation ------------------------
-        input_data, json_err = _load_and_validate_input_json(canonical_input, args.issue_number, args.command_id)
-        if json_err:
-            return _fail(json_err)
+    # -- AC10: per-command-id input schema validation ------------------------
+    input_data, json_err = _load_and_validate_input_json(canonical_input, args.issue_number, args.command_id)
+    if json_err:
+        return _fail(json_err)
 
-    # -- AC16: module realpath inspection (legacy publisher path only) ----------
-    if args.command_id == COMMAND_ID_PUBLISH:
-        realpath_errors = _check_module_realpaths(PROJECT_ROOT)
-        if realpath_errors:
-            return _fail("module_shadowing_detected", realpath_errors)
-
-    if args.command_id == COMMAND_ID_PUBLISH:
-        return _run_termination_report_publish(args, canonical_input, gh_bin, _fail, _ok)
     if args.command_id == COMMAND_ID_ISSUE_BODY_UPDATE:
         return _run_issue_body_update(args, input_data, gh_bin, _fail, _ok)
     if args.command_id == COMMAND_ID_ISSUE_CONTENT_UPDATE:
@@ -1378,13 +999,6 @@ def main(argv: list[str] | None = None) -> int:
         return _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok)
     if args.command_id == COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE:
         return _run_issue_scope_snapshot_materialize(args, input_data, gh_bin, _fail, _ok)
-    if args.command_id == COMMAND_ID_PR_REVIEW_PUBLISH:
-        # Issue #1822 fix_delta AC9: the issue_number/pr_number match
-        # requirement is restored for the legacy --input-file code path
-        # ONLY. Render mode keeps them independent (Issue #1822 AC1-AC3).
-        return _run_pr_review_publish(
-            args, input_data, gh_bin, _fail, _ok, enforce_issue_pr_match=not render_mode
-        )
     if args.command_id == COMMAND_ID_TEST_VERDICT_PUBLISH:
         return _run_test_verdict_publish(args, input_data, gh_bin, _fail, _ok)
     if args.command_id == COMMAND_ID_ISSUE_DEPENDENCY_REMOVE:
@@ -1437,93 +1051,6 @@ def _run_issue_scope_snapshot_materialize(args, input_data, gh_bin, _fail, _ok) 
     if changed:
         return _fail("postcondition_tracked_changes_detected", changed, status="failed")
     return _ok({"materializer_result": result})
-
-
-def _run_termination_report_publish(args, canonical_input, gh_bin, _fail, _ok) -> int:
-    # -- AC15: idempotency pre-check ------------------------------------------
-    existing_marker = _check_idempotency(PROJECT_ROOT, args.issue_number)
-    if existing_marker:
-        result = {
-            "schema": RESULT_SCHEMA,
-            "status": "already_published",
-            "command_id": args.command_id,
-            "issue_number": args.issue_number,
-            "comment_id": existing_marker.get("comment_id"),
-            "comment_url": existing_marker.get("comment_url"),
-            "body_sha256": existing_marker.get("body_sha256"),
-            "idempotency_marker_found": True,
-        }
-        if args.output_json:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-        else:
-            print(
-                f"[controlled_skill_mutation_exec] already_published: "
-                f"issue #{args.issue_number} idempotency marker found",
-                file=sys.stderr,
-            )
-        return 1  # idempotency block is not an error, but also not a success
-
-    if args.dry_run:
-        result = {
-            "schema": RESULT_SCHEMA,
-            "status": "dry_run_ok",
-            "command_id": args.command_id,
-            "issue_number": args.issue_number,
-        }
-        if args.output_json:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0
-
-    # -- Compute exec marker --------------------------------------------------
-    exec_marker = _compute_exec_marker(args.command_id, args.repo, args.issue_number, canonical_input)
-
-    # -- AC13: sanitized environment ------------------------------------------
-    sanitized_env = _build_sanitized_env(PROJECT_ROOT, args.issue_number, exec_marker)
-
-    # -- Invoke publisher ------------------------------------------------------
-    rc, stdout, stderr = _invoke_publisher(
-        project_root=PROJECT_ROOT,
-        issue_number=args.issue_number,
-        input_file=str(canonical_input),
-        repo=args.repo,
-        sanitized_env=sanitized_env,
-    )
-
-    if rc != 0:
-        errors = [f"publisher_exit_{rc}", stderr[:500] if stderr else "no_stderr"]
-        return _fail(f"publisher_failed_rc_{rc}", errors, status="failed")
-
-    # -- AC14: postcondition -- no tracked/staged/untracked source file changes
-    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number)
-    if changed:
-        return _fail(
-            "postcondition_tracked_changes_detected",
-            [f"changed: {f}" for f in changed[:20]],
-            status="failed",
-        )
-
-    # -- AC15: comment read-back by exec marker -------------------------------
-    readback = _readback_by_marker(exec_marker, args.issue_number, args.repo, gh_bin)
-    if "error" in readback:
-        return _fail(
-            f"readback_failed: {readback['error']}",
-            status="failed",
-        )
-    comment_id = readback.get("comment_id") or ""
-    comment_url = readback.get("comment_url") or ""
-    body_hash = readback.get("body_sha256") or ""
-
-    # Write idempotency marker only after successful read-back
-    _write_idempotency_marker(PROJECT_ROOT, args.issue_number, comment_id, comment_url, body_hash)
-
-    return _ok(
-        {
-            "comment_id": comment_id,
-            "comment_url": comment_url,
-            "body_sha256": body_hash,
-            "idempotency_marker_written": True,
-        }
-    )
 
 
 def _issue_metadata_marker_path(project_root: Path, issue_number: int, command_id: str, name: str) -> Path:
@@ -1928,8 +1455,7 @@ def _find_marker_matches(marker_literal: str, issue_number: int, repo: str, gh_b
 
 def _readback_by_marker_literal(marker_literal: str, issue_number: int, repo: str, gh_bin: str) -> dict:
     """Search comments for a literal marker string (issue_comment.publish uses
-    caller-provided markers rather than the EXEC_MARKER_PREFIX wrapping used by
-    termination_report.publish)."""
+    caller-provided markers, not an executor-generated wrapper marker)."""
     try:
         out = subprocess.run(
             [gh_bin, "issue", "view", str(issue_number), "--repo", repo, "--json", "comments"],
@@ -1958,16 +1484,16 @@ def _readback_by_marker_literal(marker_literal: str, issue_number: int, repo: st
         return {"error": f"readback_exception:{exc}"}
 
 
-# -- Issue #1536: controlled PR review publisher (pr_review.publish) -----------
-
-PR_REVIEW_MARKER_PREFIX = "<!-- PR_REVIEW_PUBLISH_MARKER:"
-PR_REVIEW_MARKER_SUFFIX = " -->"
+# -- Shared `gh` helpers originally introduced for the controlled PR review
+# -- publisher (pr_review.publish, removed in Issue #1873); retained because
+# -- test_verdict.publish still depends on them for its own PR-head/identity
+# -- readback and marker-position checks.
 
 # Issue #1539 fix_delta Blocker 2: env vars that must never reach the `gh`
-# subprocess for pr_review.publish, beyond the generic ENV_SANITIZE_KEYS
-# (GH_HOST / GH_REPO / GH_CONFIG_DIR / GH_DEBUG / DEBUG can silently redirect
-# `gh` to a different host/config or leak debug output; an inherited parent
-# env is never trusted here).
+# subprocess, beyond the generic ENV_SANITIZE_KEYS (GH_HOST / GH_REPO /
+# GH_CONFIG_DIR / GH_DEBUG / DEBUG can silently redirect `gh` to a different
+# host/config or leak debug output; an inherited parent env is never trusted
+# here).
 _PR_REVIEW_GH_ENV_STRIP_KEYS = frozenset(ENV_SANITIZE_KEYS) | frozenset(
     {
         "GH_HOST",
@@ -1981,19 +1507,15 @@ _PR_REVIEW_GH_ENV_STRIP_KEYS = frozenset(ENV_SANITIZE_KEYS) | frozenset(
 
 def _build_pr_review_gh_env() -> dict[str, str]:
     """Sanitized environment for every `gh` subprocess call made while
-    publishing a PR review. Built fresh (not memoized) so each call gets an
-    independent copy that later mutation cannot cross-contaminate."""
+    publishing a PR review or test verdict. Built fresh (not memoized) so
+    each call gets an independent copy that later mutation cannot
+    cross-contaminate."""
     env = os.environ.copy()
     for key in _PR_REVIEW_GH_ENV_STRIP_KEYS:
         env.pop(key, None)
     env["GH_PROMPT_DISABLED"] = "1"
     env["GH_NO_UPDATE_NOTIFIER"] = "1"
     return env
-
-
-def _pr_review_marker_str(idempotency_key: str) -> str:
-    marker_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:32]
-    return f"{PR_REVIEW_MARKER_PREFIX}{marker_hash}{PR_REVIEW_MARKER_SUFFIX}"
 
 
 def _marker_at_expected_position(body: str, marker_str: str) -> bool:
@@ -2050,538 +1572,6 @@ def _fetch_authenticated_login(gh_bin: str, env: dict[str, str] | None = None) -
         return login, ""
     except Exception as exc:
         return None, f"gh_api_authenticated_user_exception: {exc}"
-
-
-def _find_pr_review_marker_matches(
-    marker_literal: str,
-    pr_number: int,
-    repo: str,
-    gh_bin: str,
-    env: dict[str, str] | None = None,
-) -> tuple[list[dict], str]:
-    """List all remote reviews on the PR whose body embeds marker_literal AT
-    THE EXPECTED TRAILING POSITION (not merely as a substring anywhere in the
-    body -- Issue #1539 fix_delta Blocker 3). Mirrors _find_marker_matches()
-    for issue_comment.publish (Blocker 3 pattern): the caller must know remote
-    marker count/identity BEFORE deciding whether to POST, so a failed
-    transaction never leaves a remote side effect (AC7)."""
-    try:
-        out = subprocess.run(
-            [
-                gh_bin,
-                "api",
-                "--hostname",
-                _TRUSTED_GITHUB_HOST,
-                f"repos/{repo}/pulls/{pr_number}/reviews",
-                "--paginate",
-                "--jq",
-                ".",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            shell=False,
-            env=env,
-        )
-        if out.returncode != 0:
-            return [], _classify_gh_error("gh_api_pr_reviews_list_failed", out.stderr or "")
-        reviews: list[dict] = []
-        for line in out.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            parsed = json.loads(line)
-            if isinstance(parsed, list):
-                reviews.extend(parsed)
-            else:
-                reviews.append(parsed)
-        matches = [r for r in reviews if _marker_at_expected_position(r.get("body") or "", marker_literal)]
-        return matches, ""
-    except Exception as exc:
-        return [], f"pr_review_marker_list_exception: {exc}"
-
-
-def _post_pr_review(
-    pr_number: int,
-    repo: str,
-    commit_id: str,
-    event: str,
-    body: str,
-    gh_bin: str,
-    env: dict[str, str] | None = None,
-) -> tuple[dict | None, str]:
-    """POST a PR review via gh api with JSON stdin (--input -), never via
-    shell-interpolated -f/-F flags, so an arbitrary body (backticks, pipes,
-    `$(...)`, quotes) round-trips byte-for-byte (AC6)."""
-    payload = json.dumps({"commit_id": commit_id, "event": event, "body": body})
-    try:
-        out = subprocess.run(
-            [
-                gh_bin,
-                "api",
-                "--hostname",
-                _TRUSTED_GITHUB_HOST,
-                "--method",
-                "POST",
-                f"repos/{repo}/pulls/{pr_number}/reviews",
-                "--input",
-                "-",
-            ],
-            input=payload,
-            capture_output=True,
-            text=True,
-            timeout=20,
-            shell=False,
-            env=env,
-        )
-        if out.returncode != 0:
-            return None, _classify_gh_error("gh_api_post_review_failed", out.stderr or "")
-        try:
-            return json.loads(out.stdout), ""
-        except Exception as exc:
-            return None, f"gh_api_post_review_response_parse_error: {exc}"
-    except Exception as exc:
-        return None, f"gh_api_post_review_exception: {exc}"
-
-
-def _readback_pr_review(review_id, pr_number: int, repo: str, gh_bin: str, env: dict[str, str] | None = None) -> dict:
-    """Fetch exactly one review by id (not a marker search) for postcondition
-    verification (AC4: state == COMMENTED, commit_id == expected_head_sha)."""
-    try:
-        out = subprocess.run(
-            [gh_bin, "api", "--hostname", _TRUSTED_GITHUB_HOST, f"repos/{repo}/pulls/{pr_number}/reviews/{review_id}"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            shell=False,
-            env=env,
-        )
-        if out.returncode != 0:
-            return {"error": _classify_gh_error("gh_api_pr_review_readback_failed", out.stderr or "")}
-        return {"review": json.loads(out.stdout)}
-    except Exception as exc:
-        return {"error": f"pr_review_readback_exception: {exc}"}
-
-
-def _validate_pr_review_postcondition(
-    review: dict,
-    expected_head_sha: str,
-    marker_str: str,
-    body_sha256: str,
-    authenticated_login: str | None,
-) -> tuple[bool, str, str]:
-    """Shared postcondition validator used by BOTH the fresh-post path and the
-    idempotent-retry path (Issue #1539 fix_delta Blocker 3): state ==
-    COMMENTED, commit_id == expected_head_sha, submitted_at present, marker at
-    the expected trailing position (not a mid-body substring), rendered body
-    hash matches, and (when an authenticated_login is supplied) the review
-    author identity matches. Returns (ok, error_reason, stripped_body_sha256).
-    """
-    if review.get("state") != "COMMENTED":
-        return False, f"postcondition_review_state_mismatch: {review.get('state')!r}", ""
-    if review.get("commit_id") != expected_head_sha:
-        return (
-            False,
-            (f"postcondition_review_commit_id_mismatch: {review.get('commit_id')!r} != {expected_head_sha!r}"),
-            "",
-        )
-    if not review.get("submitted_at"):
-        return False, "postcondition_review_submitted_at_missing", ""
-    body = review.get("body") or ""
-    if not _marker_at_expected_position(body, marker_str):
-        return False, "postcondition_marker_not_at_expected_position", ""
-    # AC6: strip the trailing marker before hashing so the round-tripped
-    # UTF-8 body content (not the executor-appended marker) must hash to
-    # the caller-declared body_sha256.
-    #
-    # Issue #1539 fix_delta: rendered_body is constructed as exactly
-    # f"{raw_body}\n\n{marker_str}\n" -- the only bytes the executor adds
-    # between raw_body and the marker are the fixed 2-char separator "\n\n".
-    # Strip exactly that fixed separator, not an open-ended rstrip, so the
-    # input-side and readback-side hashes apply the identical normalization
-    # rule (i.e. none) to raw_body.
-    marker_idx = body.rfind(marker_str)
-    pre_marker = body[:marker_idx]
-    if pre_marker.endswith("\n\n"):
-        stripped_body = pre_marker[: -len("\n\n")]
-    else:
-        stripped_body = pre_marker
-    stripped_body_sha256 = hashlib.sha256(stripped_body.encode("utf-8")).hexdigest()
-    if stripped_body_sha256 != body_sha256:
-        return (
-            False,
-            (f"postcondition_body_sha256_mismatch: readback={stripped_body_sha256} expected={body_sha256}"),
-            "",
-        )
-    if authenticated_login is not None:
-        actual_login = (review.get("user") or {}).get("login")
-        if actual_login != authenticated_login:
-            return (
-                False,
-                (f"postcondition_review_author_identity_mismatch: {actual_login!r} != {authenticated_login!r}"),
-                "",
-            )
-    return True, "", stripped_body_sha256
-
-
-# -- Issue #1539 fix_delta Blocker 1: pr_review.publish render mode -----------
-# This is the "trusted bridge": a trusted caller (the impl-review-loop
-# control-plane, NOT the sandboxed pr-reviewer SubAgent) provides only a raw
-# body TEXT file plus structured verdict metadata as CLI flags. This function
-# independently computes body_sha256 / idempotency_key, hardcodes
-# producer_role="pr-reviewer" and event="COMMENT" (never read from any input),
-# and cross-checks the body's embedded LOOP_VERDICT_V2 fenced-YAML block
-# against the CLI-declared --verdict/--merge-ready so the two can never
-# silently diverge (High 2: no self-reported hash/schema/producer_role).
-
-_LOOP_VERDICT_V2_BLOCK_RE = _re.compile(r"```ya?ml\s*\n\s*LOOP_VERDICT_V2\s*:\s*\n(?P<block>.*?)```", _re.DOTALL)
-_LOOP_VERDICT_V2_VERDICT_FIELD_RE = _re.compile(r"^\s*verdict\s*:\s*([A-Za-z_]+)\s*$", _re.MULTILINE)
-_LOOP_VERDICT_V2_MERGE_READY_FIELD_RE = _re.compile(
-    r"^\s*merge_ready\s*:\s*(true|false)\s*$", _re.MULTILINE | _re.IGNORECASE
-)
-
-
-def _extract_loop_verdict_v2_fields(body: str) -> tuple[str | None, bool | None, str]:
-    """Extract (verdict, merge_ready, error) from a LOOP_VERDICT_V2 fenced YAML
-    block embedded in body. error is non-empty iff the block, or either
-    required field within it, could not be found."""
-    m = _LOOP_VERDICT_V2_BLOCK_RE.search(body)
-    if not m:
-        return None, None, "pr_review_render_body_missing_loop_verdict_v2_block"
-    block = m.group("block")
-    vm = _LOOP_VERDICT_V2_VERDICT_FIELD_RE.search(block)
-    if not vm:
-        return None, None, "pr_review_render_body_loop_verdict_v2_missing_verdict_field"
-    mm = _LOOP_VERDICT_V2_MERGE_READY_FIELD_RE.search(block)
-    if not mm:
-        return None, None, "pr_review_render_body_loop_verdict_v2_missing_merge_ready_field"
-    return vm.group(1), mm.group(1).lower() == "true", ""
-
-
-def _render_pr_review_publish_request(args, project_root: Path) -> tuple[dict | None, str]:
-    """Build a PR_REVIEW_PUBLISH_REQUEST_V1 dict from render-mode CLI flags,
-    without ever trusting a caller-declared hash, schema, producer_role, or
-    event. Returns (input_data, error)."""
-    if args.verdict is None:
-        return None, "pr_review_render_missing_verdict"
-    if args.reviewed_head_sha is None:
-        return None, "pr_review_render_missing_reviewed_head_sha"
-    if args.expected_head_sha is None:
-        return None, "pr_review_render_missing_expected_head_sha"
-    # Issue #1822 AC1: --pr-number is a mandatory, independent identifier in
-    # render mode. It must be resolvable to a positive int before any POST --
-    # a missing/non-integer/zero-or-negative value is rejected fail-closed
-    # here, never downstream against a live PR.
-    if args.pr_number is None:
-        return None, "pr_review_render_missing_pr_number"
-    if type(args.pr_number) is not int or args.pr_number <= 0:
-        return None, f"pr_review_render_pr_number_invalid: {args.pr_number!r}"
-
-    if not _PR_HEAD_SHA_RE.match(args.expected_head_sha):
-        return None, f"pr_review_render_expected_head_sha_invalid: {args.expected_head_sha!r}"
-    if not _PR_HEAD_SHA_RE.match(args.reviewed_head_sha):
-        return None, f"pr_review_render_reviewed_head_sha_invalid: {args.reviewed_head_sha!r}"
-    # High 2: reviewed_head_sha and expected_head_sha must be semantically
-    # consistent -- the reviewer's own inspection target must be the same
-    # commit the publish transaction will bind to.
-    if args.reviewed_head_sha != args.expected_head_sha:
-        return None, (
-            f"pr_review_render_reviewed_head_sha_mismatch: "
-            f"reviewed={args.reviewed_head_sha!r} expected={args.expected_head_sha!r}"
-        )
-
-    # High 2: merge_ready may only be declared true alongside verdict APPROVE.
-    if args.merge_ready and args.verdict != "APPROVE":
-        return None, (f"pr_review_render_merge_ready_requires_approve: verdict={args.verdict!r}")
-
-    # -- render-body-file path safety: same lexical/symlink/hardlink/subtree
-    # containment checks as --input-file, scoped to the pr_review.publish
-    # artifact subtree.
-    canonical_body_file, path_err = _validate_and_resolve_input_file(
-        args.render_body_file,
-        args.issue_number,
-        project_root,
-        command_id=COMMAND_ID_PR_REVIEW_PUBLISH,
-    )
-    if path_err:
-        return None, f"pr_review_render_body_file_invalid: {path_err}"
-
-    try:
-        raw_bytes = canonical_body_file.read_bytes()
-    except Exception as exc:
-        return None, f"pr_review_render_body_read_error: {exc}"
-
-    if len(raw_bytes) > _PR_REVIEW_BODY_MAX_BYTES:
-        return None, f"pr_review_render_body_too_large: {len(raw_bytes)} bytes"
-    if not raw_bytes:
-        return None, "pr_review_render_body_empty"
-
-    try:
-        body = raw_bytes.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        return None, f"pr_review_render_body_not_utf8: {exc}"
-
-    # High 2: cross-check the body's own embedded LOOP_VERDICT_V2 block against
-    # the CLI-declared verdict/merge_ready so the rendered comment text and the
-    # structured metadata used to build the publish request can never diverge.
-    body_verdict, body_merge_ready, extract_err = _extract_loop_verdict_v2_fields(body)
-    if extract_err:
-        return None, extract_err
-    if body_verdict != args.verdict:
-        return None, (f"pr_review_render_body_verdict_mismatch: body={body_verdict!r} declared={args.verdict!r}")
-    if body_merge_ready != bool(args.merge_ready):
-        return None, (
-            f"pr_review_render_body_merge_ready_mismatch: body={body_merge_ready!r} declared={bool(args.merge_ready)!r}"
-        )
-
-    body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    # Issue #1822 AC3: idempotency key stays keyed on the independent
-    # pr_number (the actual review target), not on issue_number.
-    idempotency_key = f"{args.repo}:{args.pr_number}:{args.expected_head_sha}:{body_sha256}"
-
-    return {
-        "schema": "PR_REVIEW_PUBLISH_REQUEST_V1",
-        "issue_number": args.issue_number,
-        "repo": args.repo,
-        "pr_number": args.pr_number,
-        "expected_head_sha": args.expected_head_sha,
-        "event": "COMMENT",
-        "producer_role": "pr-reviewer",
-        "body": body,
-        "body_sha256": body_sha256,
-        "idempotency_key": idempotency_key,
-    }, ""
-
-
-def _run_pr_review_publish(
-    args, input_data, gh_bin, _fail, _ok, enforce_issue_pr_match: bool = False
-) -> int:
-    field_err = _validate_pr_review_publish_fields(
-        input_data, args.repo, args.issue_number, enforce_issue_pr_match=enforce_issue_pr_match
-    )
-    if field_err:
-        return _fail(field_err)
-
-    pr_number = input_data["pr_number"]
-    expected_head_sha = input_data["expected_head_sha"]
-    raw_body = input_data["body"]
-    body_sha256 = input_data["body_sha256"]
-    idempotency_key = input_data["idempotency_key"]
-    marker_str = _pr_review_marker_str(idempotency_key)
-    rendered_body = f"{raw_body}\n\n{marker_str}\n"
-
-    marker_path = _issue_metadata_marker_path(
-        PROJECT_ROOT, args.issue_number, args.command_id, "pr_review_publish.marker.json"
-    )
-    write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
-
-    if args.dry_run:
-        result = {
-            "schema": RESULT_SCHEMA,
-            "status": "dry_run_ok",
-            "command_id": args.command_id,
-            "issue_number": args.issue_number,
-        }
-        if args.output_json:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0
-
-    gh_env = _build_pr_review_gh_env()
-
-    def _write_marker(review_id, review_url) -> None:
-        marker_path.parent.mkdir(parents=True, exist_ok=True)
-        marker_path.write_text(
-            json.dumps(
-                {
-                    "schema": "PR_REVIEW_PUBLISH_MARKER_V1",
-                    "pr_number": pr_number,
-                    "repo": args.repo,
-                    "idempotency_key": idempotency_key,
-                    "expected_head_sha": expected_head_sha,
-                    "review_id": review_id,
-                    "review_url": review_url,
-                    "published_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
-
-    # -- AC7: pre-mutation idempotency precheck. Remote review list is the
-    # authority; a local marker file never substitutes for it. Runs BEFORE
-    # any POST so a failed/ambiguous transaction never leaves a remote
-    # side effect. _find_pr_review_marker_matches() itself now only returns
-    # reviews where the marker is at the expected trailing position (Blocker 3).
-    matches, list_err = _find_pr_review_marker_matches(marker_str, pr_number, args.repo, gh_bin, env=gh_env)
-    if list_err:
-        return _fail(f"pr_review_marker_precheck_failed: {list_err}", status="failed")
-
-    if len(matches) > 1:
-        return _fail("pr_review_duplicate_marker_conflict_pre_mutation", status="failed")
-
-    if len(matches) == 1:
-        # -- Issue #1539 fix_delta Blocker 3: idempotent-retry hardening. The
-        # previous implementation trusted the LIST entry's state/commit_id and
-        # returned success immediately -- it never re-verified body hash,
-        # marker uniqueness/position, current PR head, author identity, or
-        # tracked-changes postcondition. Retry now runs the SAME postcondition
-        # validator as the fresh-post path against a FRESH single-review GET
-        # (not the list entry), plus a fresh current-head fetch and an
-        # authenticated-identity check.
-        candidate_id = matches[0].get("id")
-        fresh_readback = _readback_pr_review(candidate_id, pr_number, args.repo, gh_bin, env=gh_env)
-        if "error" in fresh_readback:
-            return _fail(
-                f"pr_review_retry_readback_failed: {fresh_readback['error']}",
-                [f"posted_review_id: {candidate_id}"],
-                status="failed",
-            )
-        review = fresh_readback["review"]
-
-        current_head_sha, head_err = _fetch_pr_head_sha(pr_number, args.repo, gh_bin, env=gh_env)
-        if head_err:
-            return _fail(
-                f"pr_review_retry_current_head_fetch_failed: {head_err}",
-                [f"posted_review_id: {candidate_id}"],
-                status="failed",
-            )
-
-        authenticated_login, login_err = _fetch_authenticated_login(gh_bin, env=gh_env)
-        if login_err:
-            return _fail(
-                f"pr_review_retry_authenticated_identity_fetch_failed: {login_err}",
-                [f"posted_review_id: {candidate_id}"],
-                status="failed",
-            )
-
-        ok, post_err, stripped_body_sha256 = _validate_pr_review_postcondition(
-            review, expected_head_sha, marker_str, body_sha256, authenticated_login
-        )
-        if not ok:
-            return _fail(
-                f"pr_review_remote_marker_identity_conflict_pre_mutation: {post_err}",
-                [f"posted_review_id: {candidate_id}"],
-                status="failed",
-            )
-
-        if current_head_sha != expected_head_sha:
-            # The review that already exists is valid for expected_head_sha,
-            # but the PR has moved on since -- do not report success for a
-            # verdict that is no longer current (High 1 TOCTOU symmetry).
-            _write_marker(review.get("id"), review.get("html_url", ""))
-            return _fail(
-                f"published_but_stale: current_head={current_head_sha} expected_head={expected_head_sha}",
-                [f"posted_review_id: {review.get('id')}"],
-                status="published_but_stale",
-            )
-
-        changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
-        if changed:
-            return _fail(
-                "postcondition_tracked_changes_detected",
-                [f"changed: {f}" for f in changed[:20]],
-                status="failed",
-            )
-
-        _write_marker(review.get("id"), review.get("html_url", ""))
-        return _ok(
-            {
-                "status_detail": "already_published",
-                "review_id": review.get("id"),
-                "review_url": review.get("html_url", ""),
-                "commit_id": review.get("commit_id"),
-                "body_sha256": stripped_body_sha256,
-                "idempotency_marker_written": True,
-            }
-        )
-
-    # -- AC3: stale-head precondition. GitHub review must never be created
-    # against a PR head that has moved since the reviewer inspected it.
-    current_head_sha, head_err = _fetch_pr_head_sha(pr_number, args.repo, gh_bin, env=gh_env)
-    if head_err:
-        return _fail(head_err, status="failed")
-    if current_head_sha != expected_head_sha:
-        return _fail(
-            f"stale_review_request: current_head={current_head_sha} expected_head={expected_head_sha}",
-            status="failed",
-        )
-
-    # -- matches == 0 and head is fresh: proceed to post -----------------------
-    post_result, post_err = _post_pr_review(
-        pr_number, args.repo, expected_head_sha, "COMMENT", rendered_body, gh_bin, env=gh_env
-    )
-    if post_err:
-        return _fail(post_err, status="failed")
-
-    review_id = post_result.get("id") if isinstance(post_result, dict) else None
-    if review_id is None:
-        return _fail("pr_review_post_response_missing_id", status="failed")
-
-    # -- AC4: readback -- POST response fields are not trusted on their own;
-    # a fresh GET readback by review id is the postcondition authority.
-    readback = _readback_pr_review(review_id, pr_number, args.repo, gh_bin, env=gh_env)
-    if "error" in readback:
-        return _fail(
-            readback["error"],
-            [f"posted_review_id: {review_id}"],
-            status="failed",
-        )
-    review = readback["review"]
-
-    ok, post_check_err, readback_body_sha256 = _validate_pr_review_postcondition(
-        review, expected_head_sha, marker_str, body_sha256, None
-    )
-    if not ok:
-        return _fail(
-            post_check_err,
-            [f"posted_review_id: {review_id}"],
-            status="failed",
-        )
-
-    # -- AC14 postcondition: no changes outside this command's own write root.
-    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
-    if changed:
-        return _fail(
-            "postcondition_tracked_changes_detected",
-            [f"changed: {f}" for f in changed[:20]],
-            status="failed",
-        )
-
-    # -- Issue #1539 fix_delta High 1: TOCTOU close-out. commit_id binding
-    # proves the review is ATTACHED to expected_head_sha; it is not an atomic
-    # guarantee that expected_head_sha was STILL current PR head at POST time.
-    # Re-fetch current head one more time after the review is durably posted
-    # and postcondition-verified; if it has moved, the review evidence is kept
-    # (a GitHub review cannot be un-posted) but success is NOT reported --
-    # callers must route to a fresh review against the new head.
-    post_publish_head_sha, post_head_err = _fetch_pr_head_sha(pr_number, args.repo, gh_bin, env=gh_env)
-    if post_head_err:
-        _write_marker(review.get("id"), review.get("html_url", ""))
-        return _fail(
-            f"published_but_unverified_current_head: {post_head_err}",
-            [f"posted_review_id: {review_id}"],
-            status="published_but_unverified",
-        )
-    if post_publish_head_sha != expected_head_sha:
-        _write_marker(review.get("id"), review.get("html_url", ""))
-        return _fail(
-            f"published_but_stale: current_head={post_publish_head_sha} expected_head={expected_head_sha}",
-            [f"posted_review_id: {review_id}"],
-            status="published_but_stale",
-        )
-
-    _write_marker(review.get("id"), review.get("html_url", ""))
-
-    return _ok(
-        {
-            "review_id": review.get("id"),
-            "review_url": review.get("html_url", ""),
-            "commit_id": review.get("commit_id"),
-            "state": review.get("state"),
-            "body_sha256": readback_body_sha256,
-            "idempotency_marker_written": True,
-        }
-    )
 
 
 # -- Issue #1647: dedicated receipt-bound TEST_VERDICT publisher ------------
@@ -3293,8 +2283,7 @@ def _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok) -> int:
     if field_err:
         return _fail(field_err)
 
-    # -- Blocker 5: publisher module chain realpath / shadowing check, same
-    # rigor as the legacy termination_report.publish command.
+    # -- Blocker 5: publisher module chain realpath / shadowing check.
     realpath_errors = _check_contract_snapshot_module_realpaths(PROJECT_ROOT)
     if realpath_errors:
         return _fail("module_shadowing_detected", realpath_errors)
@@ -3471,7 +2460,7 @@ def _build_issue_dependency_remove_gh_env() -> dict[str, str]:
     """Sanitized environment for every `gh` subprocess call made while
     removing an issue dependency relationship. Strips the generic
     ENV_SANITIZE_KEYS plus GH_HOST/GH_REPO/GH_CONFIG_DIR/GH_DEBUG/DEBUG,
-    the same boundary already used for pr_review.publish."""
+    the same boundary already used by _build_pr_review_gh_env()."""
     env = os.environ.copy()
     for key in ENV_SANITIZE_KEYS:
         env.pop(key, None)
@@ -3487,9 +2476,9 @@ def _build_issue_dependency_remove_gh_env() -> dict[str, str]:
 def _graphql_call(gh_bin: str, env: dict[str, str], query: str, variables: dict) -> tuple[dict | None, str]:
     """Execute a single fixed-host GraphQL call via `gh api graphql --input -`.
 
-    Never uses shell-interpolated -f/-F flags for the query text (mirrors
-    _post_pr_review's --input - pattern) so query/variables round-trip as an
-    exact JSON POST body. Returns (data, error); data is the `data` object of
+    Never uses shell-interpolated -f/-F flags for the query text (uses
+    `--input -` so query/variables round-trip as an exact JSON POST body).
+    Returns (data, error); data is the `data` object of
     the parsed GraphQL response, or None on any transport/schema/GraphQL
     `errors` failure.
     """

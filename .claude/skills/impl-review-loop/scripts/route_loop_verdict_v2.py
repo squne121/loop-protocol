@@ -1,21 +1,59 @@
 """
 Production consumer module for impl-review-loop Step 5 routing.
 
-Issue #777: Replaces shadow router helpers in test files with this importable
-pure-function consumer.  Import-time side effects are forbidden: no gh, git,
-network, or subprocess calls are made at module load or function call.
+Issue #1873: reviewer self-report of merge_ready / required_auto_actions /
+allowed_paths_gate is no longer a production input. pr-reviewer's minimal
+result convention is verdict / reviewed_head_sha / blockers / warnings only
+(see .claude/skills/pr-review-judge/references/loop-verdict-v2-schema.md and
+references/verdict-output-template.md). Mergeability
+(mergeable, merge_state_status) is read directly from live GitHub PR state
+by the caller and passed in as `live_mergeability`.
+
+Issue #1860 Owner Decision / PR #1871 (#1869): the ONLY hard stop retained by
+this router is a real Git conflict / GitHub non-mergeability, and it is
+evaluated BEFORE any reviewer_verdict dispatch -- a REQUEST_CHANGES or
+HUMAN_REVIEW_REQUIRED verdict does not bypass it. UNKNOWN, BLOCKED, BEHIND,
+UNSTABLE, DRAFT, HAS_HOOKS are never treated as a conflict.
+
+GitHub's actual enums (see GraphQL schema):
+  PullRequest.mergeable        (MergeableState):  CONFLICTING | MERGEABLE | UNKNOWN
+  PullRequest.mergeStateStatus (MergeStateStatus): BEHIND | BLOCKED | CLEAN | DIRTY |
+                                                    DRAFT | HAS_HOOKS | UNKNOWN | UNSTABLE
+
+NOTE: "CONFLICTING" is a valid value of `mergeable` but is NOT a valid value
+of `merge_state_status` (that enum member does not exist on GitHub). A
+live_mergeability payload that sets merge_state_status == "CONFLICTING" is
+therefore malformed input, not a legitimate conflict signal, and is rejected
+as schema_invalid rather than silently treated as a conflict.
+
+Import-time side effects are forbidden: no gh, git, network, or subprocess
+calls are made at module load or function call. Callers are responsible for
+fetching reviewer_verdict (from the pr-reviewer SubAgent's returned result)
+and live_mergeability (from `gh pr view --json headRefOid,mergeable,
+mergeStateStatus`) before calling route_loop_verdict_v2().
 
 Public API
 ----------
-route_loop_verdict_v2(loop_verdict) -> RouteDecision
+route_loop_verdict_v2(reviewer_verdict, live_mergeability) -> RouteDecision
+
+Issue #1870 (#1856): this function does not accept a ``test_verdict``
+argument. BEHIND routing is derived solely from
+``live_mergeability["merge_state_status"] == "BEHIND"``. The protected
+TEST_VERDICT producer/publisher lane established by #1856 is unaffected by
+this module; it simply has no input into ordinary review routing.
 
 RouteDecision fields
 ---------------------
 route:            one of the ROUTE_* constants below
-fail_closed:      True when a missing / unknown / mismatched input forced a
-                  safe-default (non-actionable) outcome
+fail_closed:      True when a missing / unknown / mismatched input, or a
+                  non-conflict mergeability state outside the router's
+                  authority (UNKNOWN / BLOCKED / UNSTABLE / DRAFT), forced a
+                  safe-default (non-actionable, non-escalating) outcome.
+                  Callers must not treat fail_closed as a process failure --
+                  branch on `route` and `reason_code`.
 reason_code:      machine-readable short code explaining the outcome, or None
-selected_action:  the resolved required_auto_actions[] entry (dict) or None
+selected_action:  the resolved auto-action (dict), synthesized by this
+                  router for the update_branch case, or None
 rerun_required:   dict with boolean keys 'verification' and 'pr_review'
 errors:           tuple of human-readable error strings (empty on success)
 """
@@ -34,64 +72,45 @@ from typing import Any, Literal, Mapping
 ROUTE_APPROVED = "approved"
 ROUTE_CONTINUE_LOOP = "continue_loop"
 ROUTE_TO_UPDATE_BRANCH = "route_to_update_branch"
-ROUTE_TO_BODY_ONLY_ACTION = "route_to_body_only_action"
+ROUTE_STALE_HEAD_REREVIEW = "route_stale_head_rereview"
+ROUTE_HUMAN_ESCALATION = "route_human_escalation"
 ROUTE_CONFLICT_HARD_STOP = "conflict_hard_stop"
 ROUTE_FAIL_CLOSED = "fail_closed"
 
 # ---------------------------------------------------------------------------
-# #1860 Owner Decision: the ONLY hard stops are real Git conflicts / GitHub
-# mergeability, never semantic planning / overlap / contract artifacts.
-#
-# GitHub's actual enums (see GraphQL schema):
-#   PullRequest.mergeable        (MergeableState):  CONFLICTING | MERGEABLE | UNKNOWN
-#   PullRequest.mergeStateStatus (MergeStateStatus): BEHIND | BLOCKED | CLEAN | DIRTY |
-#                                                     DRAFT | HAS_HOOKS | UNKNOWN | UNSTABLE
-#
-# NOTE: "CONFLICTING" is a valid value of `mergeable` but is NOT a valid value
-# of `merge_state_status` (that enum member does not exist on GitHub). A
-# LOOP_VERDICT_V2 payload that sets merge_state_status == "CONFLICTING" is
-# therefore malformed input, not a legitimate conflict signal, and must be
-# rejected as schema_invalid rather than silently treated as a conflict.
+# Canonical update_branch action shape (synthesized by this router; no
+# longer accepted as reviewer input per #1873)
 # ---------------------------------------------------------------------------
 
-_VALID_MERGEABLE_VALUES: frozenset[str] = frozenset({
-    "CONFLICTING", "MERGEABLE", "UNKNOWN",
+_UPDATE_BRANCH_EXECUTOR = "implementation-worker"
+_UPDATE_BRANCH_SKILL = "implement-issue.update_branch"
+
+_VALID_VERDICTS: frozenset[str] = frozenset({
+    "APPROVE", "REQUEST_CHANGES", "HUMAN_REVIEW_REQUIRED",
 })
 
-_VALID_MERGE_STATE_STATUS_VALUES: frozenset[str] = frozenset({
-    "BEHIND", "BLOCKED", "CLEAN", "DIRTY", "DRAFT", "HAS_HOOKS", "UNKNOWN", "UNSTABLE",
+_VALID_MERGEABLE: frozenset[str] = frozenset({"MERGEABLE", "CONFLICTING", "UNKNOWN"})
+
+_VALID_MERGE_STATE_STATUS: frozenset[str] = frozenset({
+    "CLEAN", "UNSTABLE", "BEHIND", "DIRTY", "BLOCKED", "UNKNOWN",
+    "DRAFT", "HAS_HOOKS",
 })
 
-# ---------------------------------------------------------------------------
-# Canonical required_auto_actions kind x executor x skill matrix
-# ---------------------------------------------------------------------------
+# merge_state_status values that require deferral to the current-head
+# required-CI / branch-protection evaluator. NOT a conflict, NOT a human
+# escalation (#1860 Owner Decision / PR #1871 P0-3).
+_DEFER_TO_CI_EVALUATOR_STATUSES: frozenset[str] = frozenset({"BLOCKED", "UNSTABLE", "DRAFT"})
 
-# The ONLY valid combination that routes to update_branch:
-_CANONICAL_UPDATE_BRANCH_KIND = "update_branch"
-_CANONICAL_UPDATE_BRANCH_EXECUTOR = "implementation-worker"
-# NOTE: "implement-issue.update_branch" (with subcommand) is required.
-#       "implement-issue" alone (no subcommand) is fail-closed per AC4.
-_CANONICAL_UPDATE_BRANCH_SKILL = "implement-issue.update_branch"
-_CANONICAL_UPDATE_BRANCH_BLOCKING_MERGE_READY = True
-_CANONICAL_UPDATE_BRANCH_MECHANICAL = True
+# merge_state_status values compatible with an approved route.
+_APPROVABLE_STATUSES: frozenset[str] = frozenset({"CLEAN", "HAS_HOOKS"})
 
-# Body-only action kinds (do not change branch HEAD).
-_BODY_ONLY_ACTION_KINDS: frozenset[str] = frozenset({
-    "ensure_closing_keyword",
-    "update_pr_body_hygiene",
-})
-
-# apply_pr_review_fix_delta is pr-review-judge schema; it is NOT accepted here.
-_REJECTED_ACTION_KINDS: frozenset[str] = frozenset({
-    "apply_pr_review_fix_delta",
-})
-
-# The full set of kinds that this consumer knows about:
-_KNOWN_ACTION_KINDS: frozenset[str] = (
-    frozenset({_CANONICAL_UPDATE_BRANCH_KIND})
-    | _BODY_ONLY_ACTION_KINDS
+# Legacy/self-reported fields that are no longer accepted as routing input
+# (Issue #1873). `test_verdict` is included: PR #1870 (#1856) removed it from
+# the public API, and it must not resurface as a reviewer_verdict field.
+_REJECTED_LEGACY_FIELDS: tuple[str, ...] = (
+    "merge_ready", "required_auto_actions", "allowed_paths_gate",
+    "mergeability", "mergeStateStatus", "recommendations", "test_verdict",
 )
-
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +123,8 @@ class RouteDecision:
         "approved",
         "continue_loop",
         "route_to_update_branch",
-        "route_to_body_only_action",
+        "route_stale_head_rereview",
+        "route_human_escalation",
         "conflict_hard_stop",
         "fail_closed",
     ]
@@ -115,7 +135,6 @@ class RouteDecision:
     errors: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        # Wrap mutable dicts in MappingProxyType for immutability (Extra 6)
         if isinstance(self.selected_action, dict):
             object.__setattr__(self, "selected_action", MappingProxyType(self.selected_action))
         if isinstance(self.rerun_required, dict):
@@ -126,134 +145,98 @@ class RouteDecision:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _fail(reason_code: str, *error_msgs: str) -> RouteDecision:
+_NO_RERUN: Mapping[str, bool] = {"verification": False, "pr_review": False}
+
+
+def _decision(
+    route: str,
+    *,
+    fail_closed: bool = False,
+    reason_code: str | None = None,
+    selected_action: dict[str, Any] | None = None,
+    rerun_required: Mapping[str, bool] = _NO_RERUN,
+    errors: tuple[str, ...] = (),
+) -> RouteDecision:
     return RouteDecision(
-        route=ROUTE_FAIL_CLOSED,
+        route=route,
+        fail_closed=fail_closed,
+        reason_code=reason_code,
+        selected_action=selected_action,
+        rerun_required=dict(rerun_required),
+        errors=errors,
+    )
+
+
+def _fail(reason_code: str, *error_msgs: str) -> RouteDecision:
+    return _decision(
+        ROUTE_FAIL_CLOSED,
         fail_closed=True,
         reason_code=reason_code,
-        selected_action=None,
-        rerun_required={"verification": False, "pr_review": False},
         errors=tuple(error_msgs),
     )
 
 
-def _ok_approved() -> RouteDecision:
-    return RouteDecision(
-        route=ROUTE_APPROVED,
-        fail_closed=False,
-        reason_code=None,
-        selected_action=None,
-        rerun_required={"verification": False, "pr_review": False},
-        errors=(),
-    )
-
-
-def _ok_continue() -> RouteDecision:
-    return RouteDecision(
-        route=ROUTE_CONTINUE_LOOP,
-        fail_closed=False,
-        reason_code=None,
-        selected_action=None,
-        rerun_required={"verification": False, "pr_review": False},
-        errors=(),
-    )
-
-
-def _ok_update_branch(action: dict[str, Any]) -> RouteDecision:
-    return RouteDecision(
-        route=ROUTE_TO_UPDATE_BRANCH,
-        fail_closed=False,
-        reason_code=None,
-        selected_action=action,
-        rerun_required={"verification": True, "pr_review": True},
-        errors=(),
-    )
-
-
-def _ok_conflict_hard_stop(reason_code: str) -> RouteDecision:
+def _conflict(reason_code: str) -> RouteDecision:
     """The ONE class of hard stop retained by #1860 Owner Decision: real Git
     conflict / GitHub-reported non-mergeability. This is NOT a fail-closed
     safe-default; it is a deterministic, intentional escalation to the
     CONFLICTING PR Escalation Runbook.
     """
-    return RouteDecision(
-        route=ROUTE_CONFLICT_HARD_STOP,
-        fail_closed=False,
-        reason_code=reason_code,
-        selected_action=None,
-        rerun_required={"verification": False, "pr_review": False},
-        errors=(),
-    )
-
-
-def _ok_body_only(action: dict[str, Any]) -> RouteDecision:
-    return RouteDecision(
-        route=ROUTE_TO_BODY_ONLY_ACTION,
-        fail_closed=False,
-        reason_code=None,
-        selected_action=action,
-        rerun_required={"verification": False, "pr_review": True},
-        errors=(),
-    )
+    return _decision(ROUTE_CONFLICT_HARD_STOP, reason_code=reason_code)
 
 
 # ---------------------------------------------------------------------------
-# AC7: schema validation for required_auto_actions format
+# Schema validation
 # ---------------------------------------------------------------------------
 
-def _validate_required_auto_actions_schema(raw: Any) -> str | None:
-    """Return a reason_code string if schema is invalid, else None.
+def _validate_reviewer_verdict(raw: Any) -> str | None:
+    """Return a reason_code if reviewer_verdict is malformed, else None."""
+    if not isinstance(raw, Mapping):
+        return "schema_invalid_reviewer_verdict_not_mapping"
 
-    Valid: list of dicts (array-of-objects).
-    Invalid:
-      - string-list  e.g. ["update_branch"]
-      - V1 recommendations field (dict with 'recommendations' key)
-      - camelCase top-level mergeStateStatus (signals wrong schema version)
-      - non-list / None
-    """
-    if raw is None:
-        return "schema_invalid_required_auto_actions_null"
+    verdict = raw.get("verdict")
+    if verdict not in _VALID_VERDICTS:
+        return f"schema_invalid_verdict_value:{verdict!r}"
 
-    if isinstance(raw, dict):
-        # Looks like a V1 recommendations object embedded under wrong key
-        return "schema_invalid_required_auto_actions_is_dict"
+    reviewed_head_sha = raw.get("reviewed_head_sha")
+    if not isinstance(reviewed_head_sha, str) or not reviewed_head_sha:
+        return "schema_invalid_reviewed_head_sha_empty_or_missing"
 
-    if not isinstance(raw, list):
-        return "schema_invalid_required_auto_actions_not_list"
+    blockers = raw.get("blockers", [])
+    if not isinstance(blockers, list) or any(not isinstance(b, str) for b in blockers):
+        return "schema_invalid_blockers_not_string_list"
 
-    for item in raw:
-        if isinstance(item, str):
-            # string-list  e.g. ["update_branch"]
-            return "schema_invalid_required_auto_actions_string_list"
-        if not isinstance(item, dict):
-            return "schema_invalid_required_auto_actions_item_not_dict"
+    warnings = raw.get("warnings", [])
+    if not isinstance(warnings, list) or any(not isinstance(w, str) for w in warnings):
+        return "schema_invalid_warnings_not_string_list"
+
+    # Legacy/self-reported authority fields are no longer accepted (#1873).
+    for legacy_key in _REJECTED_LEGACY_FIELDS:
+        if legacy_key in raw:
+            return f"schema_invalid_legacy_field_present:{legacy_key}"
 
     return None
 
 
-def _validate_mergeability_schema(loop_verdict: Mapping[str, Any]) -> str | None:
-    """Return reason_code if mergeability sub-schema is invalid."""
-    # camelCase mergeStateStatus at top level signals wrong schema version
-    if "mergeStateStatus" in loop_verdict:
-        return "schema_invalid_camel_case_mergeStateStatus"
-    # V1 recommendations field signals wrong schema version
-    if "recommendations" in loop_verdict:
-        return "schema_invalid_v1_recommendations_field"
+def _validate_live_mergeability(raw: Any) -> str | None:
+    """Return a reason_code if live_mergeability is malformed, else None."""
+    if not isinstance(raw, Mapping):
+        return "schema_invalid_live_mergeability_not_mapping"
 
-    mergeability = loop_verdict.get("mergeability", {})
-    if not isinstance(mergeability, dict):
-        return None
+    head_sha = raw.get("head_sha")
+    if not isinstance(head_sha, str) or not head_sha:
+        return "schema_invalid_live_head_sha_empty_or_missing"
 
-    mergeable = mergeability.get("mergeable")
-    if mergeable is not None and mergeable not in _VALID_MERGEABLE_VALUES:
-        return f"schema_invalid_mergeable_value:{mergeable}"
+    mergeable = raw.get("mergeable")
+    if mergeable not in _VALID_MERGEABLE:
+        return f"schema_invalid_mergeable_value:{mergeable!r}"
 
-    merge_state_status = mergeability.get("merge_state_status")
-    if merge_state_status is not None and merge_state_status not in _VALID_MERGE_STATE_STATUS_VALUES:
+    merge_state_status = raw.get("merge_state_status")
+    if merge_state_status not in _VALID_MERGE_STATE_STATUS:
         # "CONFLICTING" is a valid `mergeable` value but NOT a valid GitHub
-        # MergeStateStatus enum member (GitHub's real enum has no such value).
-        # A payload that puts it here is malformed, not a legitimate conflict.
-        return f"schema_invalid_merge_state_status_value:{merge_state_status}"
+        # MergeStateStatus enum member. A payload that puts it here is
+        # malformed input, not a legitimate conflict signal.
+        return f"schema_invalid_merge_state_status_value:{merge_state_status!r}"
 
     return None
 
@@ -263,12 +246,10 @@ def _validate_mergeability_schema(loop_verdict: Mapping[str, Any]) -> str | None
 # ---------------------------------------------------------------------------
 #
 # Issue #1856: The historical branch_behind_main / test_verdict cross-check
-# (formerly implemented here as _check_behind_invariant) depended on the
-# protected TEST_VERDICT lane. Ordinary-review evidence authority no longer
-# depends on that lane, so BEHIND is now derived solely from
-# loop_verdict.mergeability.merge_state_status. required_auto_actions
-# consistency (BEHIND without an update_branch action, or an update_branch
-# action while not BEHIND) is still fail-closed — see Step 5/6 below.
+# depended on the protected TEST_VERDICT lane. Ordinary-review evidence
+# authority no longer depends on that lane, so BEHIND is derived solely from
+# live_mergeability["merge_state_status"]. This module accepts no
+# test_verdict input of any kind.
 
 
 def _is_behind(merge_state_status: Any) -> bool:
@@ -277,388 +258,165 @@ def _is_behind(merge_state_status: Any) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# update_branch action validation (AC4 / AC5)
-# ---------------------------------------------------------------------------
-
-def _validate_update_branch_action(
-    action: dict[str, Any],
-    reviewed_head_sha: Any,
-) -> str | None:
-    """Validate a single update_branch action object.
-
-    Returns reason_code if invalid, None if valid.
-    Checks: executor, skill, blocking_merge_ready, mechanical, expected_head_sha.
-    """
-    # executor
-    executor = action.get("executor")
-    if executor is None:
-        return "missing_executor"
-    if executor != _CANONICAL_UPDATE_BRANCH_EXECUTOR:
-        return f"mismatched_executor:{executor}"
-
-    # skill — "implement-issue" without subcommand is fail-closed (AC4)
-    skill = action.get("skill")
-    if skill is None:
-        return "missing_skill"
-    if skill == "implement-issue":
-        # Subcommand-less form is explicitly fail-closed per AC4
-        return "skill_missing_subcommand_implement-issue"
-    if skill != _CANONICAL_UPDATE_BRANCH_SKILL:
-        return f"mismatched_skill:{skill}"
-
-    # blocking_merge_ready
-    blocking_merge_ready = action.get("blocking_merge_ready")
-    if blocking_merge_ready is None:
-        return "missing_blocking_merge_ready"
-    if not isinstance(blocking_merge_ready, bool):
-        return f"blocking_merge_ready_not_bool:{blocking_merge_ready!r}"
-    if blocking_merge_ready is not _CANONICAL_UPDATE_BRANCH_BLOCKING_MERGE_READY:
-        return f"mismatched_blocking_merge_ready:{blocking_merge_ready}"
-
-    # mechanical — required, must be True (Blocker 2)
-    mechanical = action.get("mechanical")
-    if mechanical is None:
-        return "missing_mechanical"
-    if not isinstance(mechanical, bool):
-        return f"mechanical_not_bool:{mechanical!r}"
-    if mechanical is not True:
-        return f"mismatched_mechanical:{mechanical}"
-
-    # expected_head_sha (AC5) — must be non-null and match reviewed_head_sha (Blocker 1)
-    expected_head_sha = action.get("expected_head_sha")
-    if expected_head_sha is None:
-        return "missing_expected_head_sha"
-    if not isinstance(expected_head_sha, str) or not expected_head_sha:
-        return "expected_head_sha_empty_or_not_str"
-    if expected_head_sha != reviewed_head_sha:
-        return "mismatched_expected_head_sha"
-
-    return None
-
-
-# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def route_loop_verdict_v2(
-    loop_verdict: Mapping[str, Any],
+    reviewer_verdict: Mapping[str, Any],
+    live_mergeability: Mapping[str, Any],
 ) -> RouteDecision:
     """Deterministic, side-effect-free routing for impl-review-loop Step 5.
 
     Parameters
     ----------
-    loop_verdict:
-        LOOP_VERDICT_V2 dict as emitted by pr-review-judge.
+    reviewer_verdict:
+        Minimal result convention returned by the pr-reviewer SubAgent:
+        {verdict, reviewed_head_sha, blockers, warnings}.
+    live_mergeability:
+        Live GitHub PR state fetched by the caller:
+        {head_sha, mergeable, merge_state_status}.
 
     Returns
     -------
     RouteDecision
 
-    Note (Issue #1856, AC1)
-    ------------------------
-    This function no longer accepts a ``test_verdict`` argument. BEHIND
-    routing is derived solely from
-    ``loop_verdict["mergeability"]["merge_state_status"] == "BEHIND"``;
-    the historical branch_behind_main cross-check against the protected
-    TEST_VERDICT lane has been removed (evidence authority cutover,
-    Phase 1).
+    Routing priority (Issue #1873 / #1860 Owner Decision / PR #1871)
+    -------------------------------------------------------------------
+    1. Structural validation of both inputs.
+    2. Actual conflict (mergeable == "CONFLICTING" or
+       merge_state_status == "DIRTY") is evaluated BEFORE any reviewer
+       verdict is inspected, and hard-stops regardless of verdict.
+    3. Reviewer verdict dispatch (HUMAN_REVIEW_REQUIRED / REQUEST_CHANGES /
+       APPROVE).
+    4. For APPROVE: blockers must be empty; a stale reviewed_head_sha routes
+       to re-review rather than dispatching any action; otherwise live
+       mergeability determines approved / update_branch / deferred-to-CI /
+       unknown-pending-retry.
+
+    Note (Issue #1856, AC1/AC2)
+    ----------------------------
+    BEHIND routing is derived solely from
+    ``live_mergeability["merge_state_status"] == "BEHIND"``; the historical
+    branch_behind_main cross-check against the protected TEST_VERDICT lane
+    has been removed (evidence authority cutover, Phase 1).
     """
-    # ------------------------------------------------------------------
-    # Step 0: top-level schema guard (AC7)
-    # ------------------------------------------------------------------
-    schema_err = _validate_mergeability_schema(loop_verdict)
-    if schema_err:
-        return _fail(schema_err, f"Top-level schema error: {schema_err}")
+    err = _validate_reviewer_verdict(reviewer_verdict)
+    if err:
+        return _fail(err, f"reviewer_verdict schema error: {err}")
+
+    err = _validate_live_mergeability(live_mergeability)
+    if err:
+        return _fail(err, f"live_mergeability schema error: {err}")
+
+    verdict_str: str = reviewer_verdict["verdict"]
+    reviewed_head_sha: str = reviewer_verdict["reviewed_head_sha"]
+    blockers: list[str] = list(reviewer_verdict.get("blockers", []))
+
+    live_head_sha: str = live_mergeability["head_sha"]
+    mergeable: str = live_mergeability["mergeable"]
+    merge_state_status: str = live_mergeability["merge_state_status"]
 
     # ------------------------------------------------------------------
-    # Step 1: extract primary fields
-    # ------------------------------------------------------------------
-    verdict_str = loop_verdict.get("verdict", "")
-    merge_ready: Any = loop_verdict.get("merge_ready")
-    reviewed_head_sha: Any = loop_verdict.get("reviewed_head_sha")
-    mergeability: Any = loop_verdict.get("mergeability", {})
-
-    if not isinstance(mergeability, dict):
-        mergeability = {}
-
-    merge_state_status: Any = mergeability.get("merge_state_status")
-    mergeable: Any = mergeability.get("mergeable")
-
-    # ------------------------------------------------------------------
-    # Step 1.5: conflict hard stop (#1860 Owner Decision — the ONLY hard
-    # stop retained by this router). Applies regardless of verdict /
-    # required_auto_actions: a real Git conflict or DIRTY merge state must
-    # never be routed past this point.
-    #
-    #   mergeable == "CONFLICTING"        → conflict hard stop
-    #   merge_state_status == "DIRTY"     → conflict hard stop
-    #   mergeable == "UNKNOWN"            → NOT a conflict (caller performs
-    #                                       bounded retry, then warning)
-    #   merge_state_status in {BLOCKED, BEHIND, UNSTABLE, DRAFT, HAS_HOOKS,
-    #   UNKNOWN}                          → NOT a conflict
+    # Priority 2: actual Git conflict, evaluated BEFORE verdict dispatch.
+    # Applies regardless of verdict (#1860 Owner Decision / PR #1871 P0-2):
+    # a CONFLICTING/DIRTY PR must hard-stop even under REQUEST_CHANGES or
+    # HUMAN_REVIEW_REQUIRED.
     # ------------------------------------------------------------------
     if mergeable == "CONFLICTING":
-        return _ok_conflict_hard_stop("conflict_mergeable_CONFLICTING")
+        return _conflict("conflict_mergeable_CONFLICTING")
 
     if merge_state_status == "DIRTY":
-        return _ok_conflict_hard_stop("conflict_merge_state_status_DIRTY")
+        return _conflict("conflict_merge_state_status_DIRTY")
 
     # ------------------------------------------------------------------
-    # Step 2: validate required_auto_actions schema (AC7)
+    # Priority 3: reviewer verdict dispatch.
     # ------------------------------------------------------------------
-    raw_actions = loop_verdict.get("required_auto_actions")
-    schema_err = _validate_required_auto_actions_schema(raw_actions)
-    if schema_err:
-        return _fail(schema_err, f"required_auto_actions schema error: {schema_err}")
+    if verdict_str == "HUMAN_REVIEW_REQUIRED":
+        return _decision(
+            ROUTE_HUMAN_ESCALATION,
+            reason_code="reviewer_human_review_required",
+        )
 
-    required_auto_actions: list[dict[str, Any]] = raw_actions  # type: ignore[assignment]
-
-    # ------------------------------------------------------------------
-    # Step 3: REQUEST_CHANGES → continue loop
-    # ------------------------------------------------------------------
     if verdict_str == "REQUEST_CHANGES":
-        return _ok_continue()
+        return _decision(ROUTE_CONTINUE_LOOP)
 
-    # ------------------------------------------------------------------
-    # Step 4: APPROVE gate entry
-    # ------------------------------------------------------------------
-    if verdict_str != "APPROVE":
+    # verdict_str == "APPROVE" from here on (validated above).
+
+    if blockers:
         return _fail(
-            "verdict_not_approve_or_request_changes",
-            f"Unexpected verdict value: {verdict_str!r}",
+            "approve_with_blockers_inconsistent",
+            "verdict is APPROVE but blockers is non-empty; treat as an "
+            "inconsistent reviewer result rather than routing.",
         )
 
     # ------------------------------------------------------------------
-    # Step 5: merge_state_status-only BEHIND determination (AC1/AC2)
+    # Stale reviewed_head_sha -> re-review at current head, not a hard stop.
+    # No mutation/action is ever dispatched from a stale APPROVE.
     # ------------------------------------------------------------------
-
-    if merge_state_status not in ("BEHIND", "CLEAN", "UNKNOWN", "CONFLICTING",
-                                   "DIRTY", "UNSTABLE", "BLOCKED", "DRAFT",
-                                   "HAS_HOOKS", None):
-        # Unknown status string → fail-closed
-        return _fail(
-            f"merge_state_status_unknown_value:{merge_state_status}",
-            f"Unknown merge_state_status value: {merge_state_status!r}.",
+    if reviewed_head_sha != live_head_sha:
+        return _decision(
+            ROUTE_STALE_HEAD_REREVIEW,
+            reason_code="stale_reviewed_head_sha",
         )
-
-    is_behind = _is_behind(merge_state_status)
 
     # ------------------------------------------------------------------
-    # Step 6: required_auto_actions dispatch
+    # UNKNOWN mergeable/merge_state_status: not a conflict, not a human
+    # escalation. Caller performs a bounded retry, then records a warning
+    # and holds only merge-readiness (not the review outcome) as pending.
     # ------------------------------------------------------------------
-    if not required_auto_actions:
-        # Empty actions list — check merge_ready gate
-        if is_behind:
-            # BEHIND without any action is inconsistent
-            return _fail(
-                "behind_without_update_branch_action",
-                "merge_state_status is BEHIND but required_auto_actions is empty. "
-                "Expected an update_branch action.",
-            )
-        if merge_ready is not True:
-            return _fail(
-                "merge_ready_not_true_with_empty_actions",
-                f"required_auto_actions == [] but merge_ready={merge_ready!r} (expected True).",
-            )
-        return _ok_approved()
-
-    # Non-empty required_auto_actions
-    if len(required_auto_actions) > 1:
-        # Multiple actions — fail-closed (ambiguous dispatch)
+    if mergeable == "UNKNOWN" or merge_state_status == "UNKNOWN":
         return _fail(
-            "multiple_required_auto_actions",
-            f"Only one action supported at a time; got {len(required_auto_actions)} actions.",
+            "mergeability_unknown",
+            f"mergeable={mergeable}, merge_state_status={merge_state_status}: "
+            f"not yet resolved by GitHub; caller should bounded-retry, then "
+            f"record a warning without escalating to a human.",
         )
 
-    action = required_auto_actions[0]
-    kind = action.get("kind")
-
-    # AC7: unknown kind
-    if kind is None:
-        return _fail("missing_kind", "required_auto_actions[0].kind is missing.")
-
-    if kind in _REJECTED_ACTION_KINDS:
-        # apply_pr_review_fix_delta is pr-review-judge schema, not accepted here
-        return _fail(
-            f"rejected_action_kind:{kind}",
-            f"Action kind '{kind}' is not accepted in this routing context "
-            f"(it belongs to the pr-review-judge schema).",
-        )
-
-    if kind not in _KNOWN_ACTION_KINDS:
-        return _fail(
-            f"unknown_kind:{kind}",
-            f"required_auto_actions[0].kind '{kind}' is not in the known set "
-            f"{sorted(_KNOWN_ACTION_KINDS)}.",
-        )
-
-    # Body-only action
-    if kind in _BODY_ONLY_ACTION_KINDS:
-        if is_behind:
-            return _fail(
-                "body_only_action_while_behind",
-                f"Action kind '{kind}' is body-only but merge_state_status is BEHIND. "
-                f"Expected update_branch action first.",
-            )
-        return _ok_body_only(action)
-
-    # update_branch action
-    if kind == _CANONICAL_UPDATE_BRANCH_KIND:
-        # AC6: merge_state_status must be BEHIND
-        if not is_behind:
-            return _fail(
-                "update_branch_without_behind_status",
-                f"Action kind is 'update_branch' but merge_state_status={merge_state_status!r} "
-                f"(must be 'BEHIND'). "
-                f"true + BEHIND is the only combination that routes to update_branch.",
-            )
-
-        # AC4 / AC5: validate full action matrix
-        action_err = _validate_update_branch_action(action, reviewed_head_sha)
-        if action_err:
-            return _fail(
-                f"update_branch_action_invalid:{action_err}",
-                f"update_branch action failed matrix validation: {action_err}. "
-                f"Required: executor=implementation-worker, skill=implement-issue.update_branch, "
-                f"blocking_merge_ready=true, mechanical=true, expected_head_sha=<non-null>.",
-            )
-
-        return _ok_update_branch(action)
-
-    # Should be unreachable given the guards above
-    return _fail(
-        "internal_routing_error",
-        f"Unhandled kind '{kind}' after all guards.",
-    )
-
-
-# ---------------------------------------------------------------------------
-# LOOP_VERDICT_V2 fenced-YAML-block extraction (P0-1 / step-5-mergeability-handling.md)
-#
-# Replaces the shell grep/sed extraction previously documented in
-# step-5-mergeability-handling.md, which only inspected the FIRST fenced
-# ```yaml block in a comment body. This enumerates ALL fenced yaml blocks
-# and selects the one(s) whose parsed content contains a `LOOP_VERDICT_V2`
-# key, taking the last match (most recently appended) as authoritative.
-# ---------------------------------------------------------------------------
-
-import re as _re  # noqa: E402  (kept below dataclass/typing imports intentionally)
-
-_FENCED_YAML_BLOCK_RE = _re.compile(
-    r"```ya?ml\s*\n(.*?)```",
-    _re.DOTALL,
-)
-
-
-def extract_latest_loop_verdict_v2(comment_body: str) -> tuple[dict[str, Any] | None, str | None]:
-    """Enumerate all fenced ```yaml blocks in `comment_body` and return the
-    parsed `LOOP_VERDICT_V2` mapping from the last block that contains it.
-
-    Returns (loop_verdict_dict, error_reason_code). On success,
-    error_reason_code is None. On failure, loop_verdict_dict is None and
-    error_reason_code explains why (no matching block found, or a matching
-    block failed to parse as YAML).
-    """
-    import yaml  # local import: keep module import-time side-effect free
-
-    if not comment_body:
-        return None, "no_comment_body"
-
-    candidate_blocks = _FENCED_YAML_BLOCK_RE.findall(comment_body)
-    if not candidate_blocks:
-        return None, "no_fenced_yaml_block_found"
-
-    last_match: dict[str, Any] | None = None
-    any_parse_error = False
-
-    for block_text in candidate_blocks:
-        if "LOOP_VERDICT_V2" not in block_text:
-            continue
-        try:
-            parsed = yaml.safe_load(block_text)
-        except yaml.YAMLError:
-            any_parse_error = True
-            continue
-        if not isinstance(parsed, dict):
-            continue
-        loop_verdict_v2 = parsed.get("LOOP_VERDICT_V2")
-        if isinstance(loop_verdict_v2, dict):
-            last_match = loop_verdict_v2
-
-    if last_match is not None:
-        return last_match, None
-
-    if any_parse_error:
-        return None, "malformed_yaml_in_loop_verdict_v2_block"
-
-    return None, "no_loop_verdict_v2_key_in_any_fenced_block"
-
-
-# ---------------------------------------------------------------------------
-# CLI wrapper
-#
-# Usage:
-#   uv run python3 route_loop_verdict_v2.py --body-file <comment.txt>
-#
-# Note (Issue #1856): --test-verdict-file was removed along with the
-# branch_behind_main / TEST_VERDICT cross-check (see route_loop_verdict_v2()
-# docstring). BEHIND routing is derived solely from merge_state_status.
-#
-# Prints a single JSON object to stdout describing the RouteDecision (plus
-# an `extraction_error` field when the LOOP_VERDICT_V2 block could not be
-# located/parsed). Exit code is always 0 for a completed, well-formed
-# invocation -- fail_closed / conflict_hard_stop / extraction failures are
-# all *data*, not process failures, and callers must branch on the JSON
-# `route` field rather than on process exit code. Exit code is non-zero
-# only for genuine invocation errors (e.g. --body-file not found).
-# ---------------------------------------------------------------------------
-
-def _cli_main(argv: list[str] | None = None) -> int:
-    import argparse
-    import json
-    import sys
-
-    parser = argparse.ArgumentParser(
-        description="Extract LOOP_VERDICT_V2 from a PR comment body and route it (Step 5).",
-    )
-    parser.add_argument("--body-file", required=True, help="Path to file containing the PR comment body text.")
-    args = parser.parse_args(argv)
-
-    try:
-        comment_body = open(args.body_file, encoding="utf-8").read()
-    except OSError as exc:
-        print(json.dumps({"error": f"could not read --body-file: {exc}"}), file=sys.stderr)
-        return 2
-
-    loop_verdict, extraction_error = extract_latest_loop_verdict_v2(comment_body)
-
-    if loop_verdict is None:
-        output = {
-            "route": ROUTE_FAIL_CLOSED,
-            "fail_closed": True,
-            "reason_code": extraction_error,
-            "selected_action": None,
-            "rerun_required": {"verification": False, "pr_review": False},
-            "errors": [f"LOOP_VERDICT_V2 extraction failed: {extraction_error}"],
-            "extraction_error": extraction_error,
+    # ------------------------------------------------------------------
+    # BEHIND: synthesize the update_branch action. The reviewer no longer
+    # supplies required_auto_actions; this router computes it from live
+    # state per #1873.
+    # ------------------------------------------------------------------
+    if _is_behind(merge_state_status):
+        action = {
+            "kind": "update_branch",
+            "executor": _UPDATE_BRANCH_EXECUTOR,
+            "skill": _UPDATE_BRANCH_SKILL,
+            "mechanical": True,
+            "expected_head_sha": reviewed_head_sha,
         }
-        print(json.dumps(output))
-        return 0
+        return _decision(
+            ROUTE_TO_UPDATE_BRANCH,
+            selected_action=action,
+            rerun_required={"verification": True, "pr_review": True},
+        )
 
-    decision = route_loop_verdict_v2(loop_verdict)
-    output = {
-        "route": decision.route,
-        "fail_closed": decision.fail_closed,
-        "reason_code": decision.reason_code,
-        "selected_action": dict(decision.selected_action) if decision.selected_action is not None else None,
-        "rerun_required": dict(decision.rerun_required),
-        "errors": list(decision.errors),
-        "extraction_error": None,
-    }
-    print(json.dumps(output))
-    return 0
+    # ------------------------------------------------------------------
+    # BLOCKED / UNSTABLE / DRAFT: not a conflict, not a human escalation
+    # (#1860 Owner Decision / PR #1871 P0-3). The router has no CI/branch
+    # protection input, so it defers -- the orchestrator consults the
+    # current-head required-CI / branch-protection evaluator and treats
+    # this as a warning, not a stop condition. DRAFT specifically must
+    # never trigger human escalation on its own: Issue #1873's Delivery
+    # Rule requires the PR to stay Draft pending human final merge.
+    # ------------------------------------------------------------------
+    if merge_state_status in _DEFER_TO_CI_EVALUATOR_STATUSES:
+        return _fail(
+            f"merge_state_status_{merge_state_status.lower()}_not_conflict_defer_to_ci_evaluator",
+            f"merge_state_status={merge_state_status} is not a Git conflict; "
+            f"defer to the current-head required-CI / branch-protection "
+            f"evaluator rather than escalating to a human.",
+        )
 
+    # ------------------------------------------------------------------
+    # Approvable: CLEAN or HAS_HOOKS with MERGEABLE. HAS_HOOKS is not a
+    # conflict and does not block approval.
+    # ------------------------------------------------------------------
+    if merge_state_status in _APPROVABLE_STATUSES and mergeable == "MERGEABLE":
+        return _decision(ROUTE_APPROVED)
 
-if __name__ == "__main__":
-    import sys as _sys
-    _sys.exit(_cli_main())
+    return _fail(
+        "unexpected_mergeability_combination",
+        f"mergeable={mergeable}, merge_state_status={merge_state_status} did not "
+        f"match any known routing branch.",
+    )

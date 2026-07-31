@@ -61,32 +61,29 @@ needs-fix を受け取ったとき:
 [Step 1: Investigation]      → codebase-investigator
 [Step 1b: Web research]      → web-researcher (conditional)
         ↓
-[Step 2: Review]             → issue-reviewer → REVIEW_ISSUE_RESULT_V1
+[Step 2: Review]             → issue-reviewer → ISSUE_REVIEW_RESULT_COMPACT_V1
         ↓
- approve → Step 4.5 → Step 5
- needs-fix → [Step 2a: Replay Arbitration]
-   ├─ deterministic_fail_confirmed:
-   │    iteration += 1 → Step 4
-   ├─ reviewer_claim_unbacked_by_deterministic_checker:
-   │    iteration を消費せず Step 2 に戻る
-   ├─ reviewer_false_positive_suspected:
-   │    → Step 5 (human_escalation)
-   └─ input_or_runtime_error:
-        → Step 5 (human_judgment_required)
+ VERDICT を decide_next_loop_action.py にそのまま渡す（bounded decision, #1873）
+   ├─ approve:
+   │    → Step 4.5 → Step 5
+   ├─ needs-fix かつ iteration < max_iterations:
+   │    iteration += 1 → Step 4（rewrite）
+   └─ needs-fix かつ iteration >= max_iterations（または blocked）:
+        → Step 5 (human_review_required)
 ```
 
-Step 3（adversarial review）と Step 1.5（spec document review）は採用しない。Step 番号は履歴互換のため維持する。
+Step 2a（旧 Replay Arbitration、#1532 V2 契約）は #1873 で撤去された。orchestrator は
+`issue-reviewer` の VERDICT を独立に再計算せず直接信頼する。Step 3（adversarial review）
+と Step 1.5（spec document review）は採用しない。Step 番号は履歴互換のため維持する。
 
 ## LOOP_STATE
 
-ループ状態の機械可読スキーマは `schemas/loop_state.schema.json` を参照する。
-フィールド定義・routing semantics・next action 決定手順は `references/loop-state.md` を参照する。
-next action の決定は `scripts/decide_next_loop_action.py` に委譲する（呼び出し手順は `references/loop-state.md` を参照）。
-
-LOOP_STATE_V1 の構築は `scripts/build_loop_state.py` を使用する。手書き JSON 渡しは禁止。
-`build_loop_state.py` は `REFINEMENT_LOOP_PLAN_V1` と `ISSUE_REVIEW_RESULT_COMPACT_V1` を
-入力として受け取り、スキーマ検証済みの LOOP_STATE_V1 を生成する。
-詳細な builder-first フローは `references/loop-state.md` の「Building LOOP_STATE_V1」セクションを参照する。
+`LOOP_STATE_V1` のフィールド定義・routing semantics・next action 決定手順は
+`references/loop-state.md` を参照する（#1873: `schemas/loop_state.schema.json` の JSON
+Schema ファイルと `build_loop_state.py` builder は撤去済み — orchestrator が planner /
+review の結果から直接組み立てる plain dict である）。next action の決定は
+`scripts/decide_next_loop_action.py` に委譲する（呼び出し手順は `references/loop-state.md`
+を参照）。
 
 routing-critical フィールド（`scope_rollup_decision`、`scope_signal_guard`、`delivery_rollup`、
 `follow_up_materialization`、`superseded_decision`）の定義は `references/loop-state.md` が SSOT。
@@ -156,19 +153,11 @@ planner exit 0 かつ `fail_closed.required == false` かつ `decisions.*.confid
 
 `STATUS: blocked` または `STATUS: environment_failure` の場合は停止し、人間判断へ送る。`investigation_policy` / `web_research_policy` / `scope_signal_guard` / `follow_up_materialization` の判定は planner を SSOT とし、このファイルで prose 再判定しない。
 
-**Phase gate**: preflight 完了後に `ISSUE_REFINEMENT_PHASE_STATE_V1` を生成する。
-`scope_signal_guard.triggered: true` が含まれる場合でも、preflight phase では `hard_stop_eligible: false`
-であるため、`decide_next_loop_action.py` を呼ばない。planner の
-`investigation_policy` / `web_research_policy` に従って Step 1 / Step 1b / Step 2 へ進む。
-
-```bash
-# Phase state 生成（Step 0f 完了後）
-uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/build_refinement_phase_state.py \
-  --phase preflight \
-  --source-kind refinement_preflight_result_v1 \
-  --source-path <refinement_preflight_result_v1 path> \
-  --output-path <phase_state_output_path>
-```
+`scope_signal_guard.triggered: true` が含まれる場合でも、preflight 完了直後は
+`decide_next_loop_action.py` を呼ばない（#1873: `ISSUE_REFINEMENT_PHASE_STATE_V1`
+の formal phase-gate は撤去された。呼び出しタイミングの制御は orchestrator が
+Step 順序に従って行う）。planner の `investigation_policy` / `web_research_policy`
+に従って Step 1 / Step 1b / Step 2 へ進む。
 
 参照:
 
@@ -203,73 +192,35 @@ web-researcher が critical claim にエビデンスを示せず、ハルシネ�
 
 ### Step 2: レビュー (Review)
 
-`issue-reviewer` SubAgent が `review-issue` を実行し、`ISSUE_REVIEW_RESULT_COMPACT_V1` を返す。orchestrator は reviewer の prose を再判定せず、artifact と deterministic checker を使う arbitration step を `needs-fix` と Step 4 の間に挟む。
+`issue-reviewer` SubAgent が `review-issue` を実行し、`ISSUE_REVIEW_RESULT_COMPACT_V1` を返す。
 
 消費側契約 (consumer contract): `ISSUE_REVIEW_RESULT_COMPACT_V1`（正本 (SSOT): `.claude/skills/issue-refinement-loop/scripts/compact_review_result.py`）
 
-**validator-first 順序（Issue #1507 AC23 / #1755 で `review_compact.validate_intermediate_v1` へ統一、routing table より前に評価する）**: orchestrator は approve / needs-fix いずれの経路でも、SubAgent（child）stdout の raw bytes を consume する前に、必ず `emit_parent_review_envelope_v2.py --validate-intermediate`（`review_compact.validate_intermediate_v1`, command_registry.py 登録済み、`--issue-number` 必須引数）へ child の raw stdout bytes をそのまま（re-transcribe せず）渡し、`REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1` を得る。**`validate_review_compact_output.py` の V1 final grammar（command_registry.py 登録名の末尾に `_v2` も `_intermediate_v1` も付かない旧コマンド）を child の raw stdout に対して直接呼んではならない**（V1 final grammar は legacy 経路専用の独立 grammar であり、child intermediate の grammar とは異なる — #1755）。**validator 完了前に `VERDICT` / `NEXT_ACTION` / `ARTIFACT` / `REVIEWER_BLOCKER_CLAIM` を読んではならない。** `validation_status != valid` の場合は routing を `human_judgment_required` に固定する（fail-closed）。validation が `valid` の場合のみ、`normalized_payload` を根拠に以下の routing table を評価する:
+**validator-first 順序（Issue #1507 AC23、routing table より前に評価する）**: orchestrator は approve / needs-fix いずれの経路でも、SubAgent（child）stdout の raw bytes を consume する前に、必ず `validate_review_compact_output.py`（`review_compact.validate`, command_registry.py 登録済み、`--issue-number` 必須引数）へ child の raw stdout bytes をそのまま（re-transcribe せず）渡し、`REVIEW_COMPACT_VALIDATION_RESULT_V1` を得る。**validator 完了前に `VERDICT` / `NEXT_ACTION` / `ARTIFACT` を読んではならない。** `validation_status != valid` の場合は routing を `human_judgment_required` に固定する（fail-closed）。validation が `valid` の場合のみ、`normalized_payload` を根拠に以下の routing table を評価する:
 
 - `VERDICT: approve` → Step 4.5 へ
-- `VERDICT: needs-fix` → Step 2a（parent-local replay integrity binding、`parent_replay_binding.py`）を実行し、orchestrator 自身が計算した `PARENT_REPLAY_VERDICT` / `PARENT_REPLAY_ROUTING` / `PARENT_REPLAY_SHOULD_CONSUME` / `PARENT_REPLAY_BODY_SHA256` の結果のみで Step 4 / Step 2 / human escalation を分岐する（Issue #1532。子 SubAgent が返す `REVIEWER_BLOCKER_CLAIM` は bounded な untrusted claim であり、そのまま routing に使ってはならない。orchestrator は子 worktree の raw `compact_review_result_v1` artifact パスを別途 open/read しない — Issue #1472）
+- `VERDICT: needs-fix` → `decide_next_loop_action.py`（rewrite 後 / next-action 決定時に呼ぶ、下記「LOOP_STATE」参照）へ VERDICT をそのまま渡す（**#1873: 旧 Step 2a Replay Arbitration は撤去された** — orchestrator は VERDICT を独立に再計算せず直接信頼する）
 - full structured data は `EVIDENCE:` / `ARTIFACT:` パスから取得する（main context には返らない、validator 通過後のみ参照可）
 
 anchor comment により stale approval を無効化する場合も、raw snapshot は Step 4 に渡さず、正規化済み `anchor_comment_feedback` だけを渡す。
 
-review 後、phase state を `review` フェーズに更新してから verdict に応じて routing する。
+**重要**: `review` phase（rewrite 前）では `decide_next_loop_action.py` を呼んではならない。
+`review` phase での routing は VERDICT に基づいて直接行う（承認なら次段階へ、要修正なら書き直しへ）:
 
-**重要**: `review` phase は pre-rewrite phase であるため `decide_next_loop_action.py` を呼んではならない。
-`review` phase の `allowed_routers` に `decide_next_loop_action.py` は含まれない（B2 Router Rule）。
-`review` phase での routing は VERDICT に基づいて直接行う:
+- `VERDICT: approve` → Step 4.5 へ（承認）
+- `VERDICT: needs-fix` → Step 4（rewrite、書き直し）へ
 
-- `VERDICT: approve` → phase state を `decide_next_action` に更新してから Step 4.5 へ
-- `VERDICT: needs-fix` → phase state を `rewrite` に更新し、直後に Step 2a replay arbitration を実行してから Step 4 / Step 5 を決める
-
-phase state の更新（Issue #1507 AC24 / #1755 で入力束縛を強化: `--review-validation-result-path` は上記 `review_compact.validate_intermediate_v1` の出力先（`REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1`）を指す。`--phase review` かつ `--source-kind issue_review_result_compact_v1` の組み合わせでのみ、`--review-validation-result-path` と新規必須引数 `--issue-number` の両方が必須。gate は `schema`/`schema_version`/`validation_status`/`envelope_kind`/`violations == []` に加え、`--source-path` の実バイトから再計算した SHA256 と validation result の `input_sha256` の一致、および `normalized_payload.ARTIFACT` の issue 番号セグメントと `--issue-number` の一致を検証する構造的ゲートであり、いずれかに違反すると非ゼロ終了し phase-state を生成しない）:
+`decide_next_loop_action.py` は rewrite 後 / next-action 決定時にのみ呼ぶ:
 
 ```bash
-uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/build_refinement_phase_state.py \
-  --phase review \
-  --source-kind issue_review_result_compact_v1 \
-  --source-path <review_result_path> \
-  --review-validation-result-path <review_compact_intermediate_validation_result_v1 path> \
-  --issue-number <ISSUE_NUMBER> \
-  --output-path <phase_state_output_path>
-```
-
-`decide_next_loop_action.py` は `post_rewrite_check` または `decide_next_action` phase でのみ呼ぶ:
-
-```bash
-# post_rewrite_check または decide_next_action phase のみ
 uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/decide_next_loop_action.py \
   --loop-state-file <loop_state_path> \
-  --review-result-verdict <approve|needs-fix> \
-  --phase-state-file <phase_state_output_path>
+  --review-result-verdict <approve|needs-fix>
 ```
 
-`review` phase では `hard_stop_eligible: false`（pre-rewrite phase）のため、
-`scope_signal_guard.triggered: true` があっても `decide_next_loop_action.py` を呼ばない。
-hard stop 判定は `post_rewrite_check` / `decide_next_action` phase（`hard_stop_eligible: true`）で行う（AC4 / #919 回帰維持）。
-
-#### Step 2a: 親ローカル Replay 整合性束縛（Parent-Local Replay Integrity Binding、Issue #1532）
-
-`VERDICT: needs-fix` の直後に、reviewer blocker が deterministic checker に裏付けられているかを **orchestrator（parent）自身**が `parent_replay_binding.py` で独立に確認する。`issue-reviewer` は `reviewer_claim_replay.py` を実行せず、bounded な `REVIEWER_BLOCKER_CLAIM`（`REVIEWER_BLOCKER_CLAIM_V1`: `body_sha256` + `blockers[].{reviewer_blocker_code,message,line_start,line_end}` のみ）を stdout に返すだけである（Blocker 1/2。V1 の child self-report `REPLAY_VERDICT` 等は producer 契約から廃止された）。
-
-これは **parent-local replay integrity binding** であり、child SubAgent の producer identity・署名・鍵管理・supply-chain provenance を証明する attestation ではない（Safety Claim Matrix 対象外）。
-
-orchestrator は `readiness_result` / `vc_syntax_result` / `vc_preflight_result` / 現在の Issue body raw bytes snapshot / `previous_state`（`reviewer_claim_replay_state_store.py --read`）/ identity（`repository_full_name`/`issue_number`/`refinement_session_id`/`iteration_id`）を自ら取得・保存・readback し（child の raw artifact や `findings`/`checker_evidence`/`deterministic_checks` は一切使用しない）、`parent_replay_binding.py`（`--reviewer-blocker-claim-file` / `--readiness-result-file` / `--current-body-file` / identity 引数）へ渡して `PARENT_REPLAY_BINDING_ARTIFACT_V1` を得る。child claim は `additionalProperties: false` schema で fail-closed 検証され、`deterministic_backed` は parent 自身の evidence のみを根拠とする。`--iteration-id` を渡すため wall-clock 値は生成されない（High-2）。CLI の exact 引数と例は `docs/dev/workflows/issue-refinement-loop-design.md` の「Step 2a」を参照。
-
-consecutive-unbacked state は orchestrator が所有する（`reviewer_claim_replay_state_store.py`、#1515）。
-
-orchestrator は child の raw stdout bytes を、独立コマンド `review_compact.validate_intermediate_v1`（`emit_parent_review_envelope_v2.py --validate-intermediate`、Issue #1541 PR #1557 OWNER REQUEST_CHANGES Blocker 1）へ渡し、strict validation 済みの `envelope_kind`（`approve` / `needs_fix_intermediate`）・`normalized_payload`・`canonical_reviewer_blocker_claim` を得る。手動 `startswith()`/`json.loads()` によるフィールド抽出は禁止する。`needs_fix_intermediate` の場合のみ `canonical_reviewer_blocker_claim` をファイル化し `parent_replay.bind` へ渡す。得られた claim envelope と上記 binding artifact を `emit_parent_review_envelope_v2.py` へ渡し、決定論的に `ISSUE_REVIEW_RESULT_COMPACT_V2`（15 行）を得る -- approve は `review_compact.emit_approve`（binding/body/session/iteration の引数を一切持たず、それらのファイルを開かない）、needs-fix は `review_compact.emit_v2`（Blocker 2 で binding/body を開く前に bounded intermediate を strict 分類する順序に修正済み）を使う。この producer は `PARENT_REPLAY_*` の 6 行を binding artifact からのみ導出し、child claim の digest・binding artifact 自身の digest 自己整合性・identity（repository/issue/session/iteration/body）を独立に照合してから envelope を組み立てるため、旧来の「orchestrator が f-string で 6 行を追記する」手動 assembly（テスト専用 `_assemble_v2_envelope()` 相当）は production 経路から廃止された。得られた envelope は `validate_review_compact_output.py --v2`（`review_compact.validate_v2`、`--binding-artifact-file` 等すべて必須、High-1）で binding artifact の strict schema・digest 再計算・identity/body 照合・envelope 全フィールドの exact 照合を経てから consume する。`PARENT_REPLAY_VERDICT` は `reviewer_claim_replay.py` の `_LEGACY_VERDICT_MAP_V1` と同期した5値 enum。
-
-`validation_status: valid` の場合のみ `reviewer_claim_replay_state_store.py --write-v2`（`state.write-v2`、`--expected-parent-binding-digest` 必須）で `PARENT_REPLAY_NEXT_STATE` を永続化する。state store 自身が `schema`/`schema_version`/`envelope_kind`/`violations == []`/identity を再検証するため、caller が組み立てた偽装 payload では state が更新されない（High-3）。詳細フローは `references/loop-state.md` の「REVIEWER_CLAIM_REPLAY_STATE_V2」を参照。
-
-出力契約（`PARENT_REPLAY_VERDICT` の consume ルーティング）:
-- `deterministic_fail_confirmed` → Step 4 rewrite。`PARENT_REPLAY_SHOULD_CONSUME: true`
-- `checker_artifact_inconsistency` → `fix_checker_artifact` に従い checker artifact を修正後 Step 2 に戻す（iteration 消費なし）
-- `reviewer_claim_unbacked_by_deterministic_checker` → non-blocking downgrade、iteration 消費なしで Step 2 に戻す
-- `reviewer_false_positive_suspected` → 同一 body/lane で 2 回連続 unbacked。`human_escalation` で停止
-- `input_or_runtime_error` → `human_judgment_required` で停止
+`decide_next_loop_action.py` は呼ばれた時点で `scope_signal_guard.triggered: true` を
+常に hard-stop 判定する（呼び出しタイミングの制御が orchestrator 側の責務であり、
+スクリプト自身は phase 概念を持たない。AC4 / #919 回帰維持）。
 
 ### Step 4: 書き換え (Rewrite)
 
@@ -355,43 +306,31 @@ delivery-rollup parent の child materialization gate と、approve 後の follo
 
 終了レポートの GitHub 投稿は `publish_termination_report.py` を経由して行う。
 
-```bash
-# TERMINATION_REPORT_INPUT_V1 JSON を stdin から渡す
-echo '{"termination_reason":"approved","issue_number":42}' | \
-  uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py \
-    --issue-number 42
-```
-
-`human_escalation` の publish では、`termination_cause` omitted / `null` は `human_judgment_required` へ正規化され、`Cause: none` を出さない。caller が明示した valid cause は保持される。canonical key は `blockers_summary`。`blocker_summary` は旧 alias として validation 前に `blockers_summary` へ正規化するが、alias conflict や alias 側の型不正は fail-closed になる。
-
-human_escalation の入力例（termination_cause と blockers_summary を明示）:
+#1873（bounded review loops）: `render_termination_report.py`（`TERMINATION_REPORT_INPUT_V1` を
+検証する renderer）は撤去された。orchestrator は `decide_next_loop_action.py` の出力
+（`STATUS` / `NEXT_ACTION` / `TERMINATION_CAUSE` / `BLOCKERS`）と loop の経緯から短い
+plain markdown の summary を直接組み立て、`--body-file` または stdin で渡す。
 
 ```bash
-echo '{
-  "termination_reason": "human_escalation",
-  "termination_cause": "human_judgment_required",
-  "issue_number": 829,
-  "iteration": 3,
-  "blockers_summary": [
-    "オーナー判断が必要",
-    "スコープの矛盾が未解決"
-  ]
-}' | uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py \
-  --issue-number 829
+# summary.md に組み立て済みの plain markdown を書いてから渡す
+uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py \
+  --issue-number 42 --repo <owner/repo> --body-file summary.md
 ```
+
+`human_escalation` の summary では、termination cause が未確定の場合 `human_judgment_required`
+へ正規化する（詳細は `references/termination-policy.md` の「termination_cause 正規化ルール」）。
 
 `publish_termination_report.py` は以下の責務を持つ:
 
-1. `render_termination_report.py` を `subprocess.run([sys.executable, ...], shell=False, ...)` で呼び出す
-2. stdout JSON の `schema` / `schema_version` / `publishable` / `body` / `reason_code` を検証する
-3. `publishable=true` かつ `body` が非空文字列の場合のみ `gh issue comment --body-file` を呼ぶ
-4. `publishable=false`、renderer 異常、validation 失敗の場合は gh を呼ばず fail-closed で終了し、reason_code / timestamp をローカル artifact に記録する
+1. body が空でないことを確認する（空文字列は `empty_body` で fail-closed）
+2. `issue_comment.publish` controlled mutation lane（Issue #1633）経由で GitHub issue comment を投稿する（raw `gh issue comment` を直接呼ばない）
+3. gh 呼び出しが失敗またはタイムアウトした場合は fail-closed で終了し、reason_code / timestamp をローカル artifact に記録する
 
 詳細な publisher 仕様は `.claude/skills/issue-refinement-loop/scripts/publish_termination_report.py` を参照する。
 
 ## ISSUE_EXECUTION_DECISION_V1 ハンドオフ契約 (#1677)
 
-**現在 production 接続済みの契約**（PR #1767 owner review + Scope Delta 反映後）: `scripts/validate_issue_execution_decision.py` が standalone canonical module（`validate_schema()` / `validate_semantics()` を明示的に分離、schema-first の `validate_issue_execution_decision()`、`project_issue_execution_decision_ref()`、legacy adapter・migration envelope helper）として存在し、`plan_refinement_loop.py`（producer）・`build_loop_state.py`（LOOP_STATE builder）・`render_termination_report.py`（handoff/termination report producer）・`decide_next_loop_action.py`（downstream consumer）が同一モジュールを import して呼び出す。import 失敗は全消費者で fail-closed（silent skip 禁止）。`render_termination_report.py` は `data["issue_execution_decision"]`（full decision）から `issue_execution_decision_ref` を production code が自動生成し、caller 提供の ref を信用しない。
+**現在 production 接続済みの契約**（PR #1767 owner review + Scope Delta 反映後、#1873 でコンシューマ集合を更新）: `scripts/validate_issue_execution_decision.py` が standalone canonical module（`validate_schema()` / `validate_semantics()` を明示的に分離、schema-first の `validate_issue_execution_decision()`、`project_issue_execution_decision_ref()`、legacy adapter・migration envelope helper）として存在し、`run_refinement_preflight.py`（downstream consumer）が同一モジュールを import して呼び出す。`plan_refinement_loop.py` は `build_issue_execution_decision()` の producer だが、自身の出力を自己検証しない（#1873: Replay Arbitration 撤去に伴い内部整合性チェックを削除。downstream consumer が独立に検証する）。import 失敗は fail-closed（silent skip 禁止）。
 
 **未接続（follow-up）**: `REFINEMENT_LOOP_PLAN_V1`/`LOOP_STATE_V1`/`LOOP_HANDOFF_RESULT_V1` の required 化（現状は additive/optional）。genuine な `depends_on`/`duplicate`/`absorb` を GitHub native dependency・明示的 duplicate marker・方向付き Machine-Readable Contract から直接構築する結線（現状は `ISSUE_SCOPE_ROLLUP_PLAN_V2` からの derivation を撤去した保守的な `deferred` fallback のみ）。
 
@@ -405,8 +344,8 @@ downstream skill（impl-review-loop・implement-issue・issue-contract-review・
 
 | topic | primary reference |
 |---|---|
-| loop state schema | `schemas/loop_state.schema.json` |
-| loop state field definitions | `references/loop-state.md` |
+| anchor comment schema | `schemas/anchor_comment.schema.json`（Issue #1873: `loop_state.schema.json` から抽出） |
+| loop state field definitions（historical） | `references/loop-state.md` |
 | anchor comment handling | `references/anchor-comment-handling.md` |
 | scope signal guard | `references/scope-signal-guard.md` |
 | AC/VC reflection | `references/ac-vc-reflection.md` |

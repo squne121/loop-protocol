@@ -1,19 +1,14 @@
 """
 Drift-detection tests: the ISSUE_EXECUTION_DECISION_V1 fragments inlined into
-refinement_loop_plan_v1.json and loop_state.schema.json (#1677) must stay
-structurally identical to the canonical schema owner,
-issue_execution_decision_v1.schema.json (#1675 / PR #1700).
+refinement_loop_plan_v1.json (#1677) must stay structurally identical to the
+canonical schema owner, issue_execution_decision_v1.schema.json (#1675 /
+PR #1700).
 
-Why inline copies instead of a live cross-file $ref: decide_next_loop_action.py
-(outside this Issue's Allowed Paths) calls jsonschema.validate(instance=data,
-schema=schema) against loop_state.schema.json with no RefResolver and only
-catches jsonschema.ValidationError. A literal cross-file "$ref":
-"issue_execution_decision_v1.schema.json#/..." raises
-referencing.exceptions.Unresolvable (NOT a ValidationError) the first time a
-LOOP_STATE_V1 instance actually contains 'issue_execution_decision' -- an
-uncaught production exception outside this Issue's Allowed Paths. These tests
-give the same drift-safety guarantee a $ref would, without that live
-resolution dependency.
+#1873 (bounded review loops): loop_state.schema.json (and its inlined
+IssueExecutionDecisionV1* copy) was removed along with build_loop_state.py --
+decide_next_loop_action.py no longer validates the full LOOP_STATE_V1 JSON
+Schema (see its own module docstring). Only the refinement_loop_plan_v1.json
+inline copy remains in scope for this drift-detection suite.
 """
 
 from __future__ import annotations
@@ -93,25 +88,8 @@ def test_refinement_loop_plan_v1_inline_defs_match_canonical_schema():
     )
 
 
-def test_loop_state_schema_inline_defs_match_canonical_schema():
-    schema = _load(SCHEMAS_DIR / "loop_state.schema.json")
-    assert _extract_local_shape(schema) == _canonical_local_shape(), (
-        "loop_state.schema.json's inlined IssueExecutionDecisionV1* "
-        "definitions have drifted from the canonical "
-        "issue_execution_decision_v1.schema.json (#1675/PR#1700). Regenerate "
-        "the inline copy from the canonical file."
-    )
-
-
 def test_refinement_loop_plan_v1_root_property_wraps_local_definition():
     schema = _load(SCHEMAS_DIR / "refinement_loop_plan_v1.json")
-    assert schema["properties"]["issue_execution_decision"] == {
-        "$ref": "#/definitions/IssueExecutionDecisionV1"
-    }
-
-
-def test_loop_state_schema_root_property_wraps_local_definition():
-    schema = _load(SCHEMAS_DIR / "loop_state.schema.json")
     assert schema["properties"]["issue_execution_decision"] == {
         "$ref": "#/definitions/IssueExecutionDecisionV1"
     }
@@ -202,10 +180,7 @@ def test_format_checker_date_time_support_is_documented_honestly():
 
 def test_local_wrapper_definition_required_and_closed_matches_canonical():
     canonical = _load(CANONICAL_PATH)
-    for schema_path in (
-        SCHEMAS_DIR / "refinement_loop_plan_v1.json",
-        SCHEMAS_DIR / "loop_state.schema.json",
-    ):
+    for schema_path in (SCHEMAS_DIR / "refinement_loop_plan_v1.json",):
         schema = _load(schema_path)
         local_wrapper = schema["definitions"]["IssueExecutionDecisionV1"]
         assert local_wrapper["additionalProperties"] is False
