@@ -254,14 +254,13 @@ Allowed Paths 違反、実テスト・CI・PR review failure に基づく。
   routing stop にせず、PASS・承認・CI・review・merge readiness の証拠にしない。
 - parallel-safe ledger V2 は別 Issue で再設計し、未実装を通常 workflow の停止理由にしない。
 
-### human_escalation 後の Issue 本文変更と contract review 再実行
+### human_escalation 後の Issue 本文変更と contract review 再実行（advisory、#1860 で hard stop から降格）
 
-`human_escalation` で停止した後、Issue 本文を **1 文字でも変更した場合**は prior contract-review result が stale となる。
+`human_escalation` で停止した後、Issue 本文を変更すると `body_sha256` が変化し、prior contract-review result が stale advisory となる（`issue-contract-review` の snapshot idempotency 機構参照）。この staleness 検出自体は上記 Hard gate（`## Issue contract を作業計画の正本として扱う条件` の `### Hard gate`）と同様、blocking authority を持たない advisory diagnostic である（#1860 Owner Decision）。
 
-- prior `CONTRACT_REVIEW_RESULT_V1.status: go` は無効化される
-- `issue-contract-review` を最初から再実行すること
-- stale な prior result を `go` として流用して `impl-review-loop` / `implement-issue` へ handoff してはならない
-- Issue 本文の変更は `body_sha256` の変化として検出される（`issue-contract-review` の snapshot idempotency 機構参照）
+- prior `CONTRACT_REVIEW_RESULT_V1.status: go` の staleness は warning として記録するに留め、それ単独で `impl-review-loop` / `implement-issue` への handoff を禁止しない
+- `issue-contract-review` の再実行は推奨されるが、着手の前提条件（prerequisite）ではない
+- live Issue 本文（Outcome / AC / Allowed Paths / VC / Stop Conditions）が正本であり、stale な contract snapshot の有無にかかわらず、live 本文に基づいて作業を進めてよい
 
 ### branch publish retry の safety stop（publish 再試行の安全停止）
 
