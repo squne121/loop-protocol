@@ -1247,12 +1247,19 @@ def check_c3_ac_checkbox_format(body: str) -> tuple[str, list[str]]:
     return CheckResult.PASS, []
 
 
-def check_c4_vc_commands_present(body: str) -> tuple[str, list[str]]:
+def check_c4_vc_commands_present(body: str, issue_kind: str) -> tuple[str, list[str]]:
     """C4: VC コマンド存在チェック（#993: shared parser ベースに統一）
 
     canonical format: ```bash fenced block 内の $ コマンド行のみを認識。
     inline backtick VC や list-style VC (- `cmd`) は pass にしない。
+
+    issue_kind == "parent"（canonical parent）の場合は existing_issue_readiness_v1
+    profile と同じく `## Verification Commands` を必須セクションとしないため NA を返す
+    （#1867: parent applicability defect の修正）。
     """
+    if issue_kind == "parent":
+        return CheckResult.NA, []
+
     section = extract_section(body, "Verification Commands")
     if not section:
         return CheckResult.FAIL, ["## Verification Commands セクションが存在しないか空"]
@@ -1391,8 +1398,16 @@ def check_c7_required_skills_semantics(body: str) -> tuple[str, list[str]]:
     return CheckResult.PASS, []
 
 
-def check_c8_outcome_concreteness(body: str) -> tuple[str, list[str]]:
-    """C8: Outcome に抽象的パターンが含まれない"""
+def check_c8_outcome_concreteness(body: str, issue_kind: str) -> tuple[str, list[str]]:
+    """C8: Outcome に抽象的パターンが含まれない
+
+    issue_kind == "parent"（canonical parent）の場合は existing_issue_readiness_v1
+    profile と同じく `## Outcome` を必須セクションとしないため NA を返す
+    （#1867: parent applicability defect の修正）。
+    """
+    if issue_kind == "parent":
+        return CheckResult.NA, []
+
     section = extract_section(body, "Outcome")
     if not section:
         return CheckResult.FAIL, ["## Outcome セクションが存在しないか空"]
@@ -2208,7 +2223,7 @@ def run_checks(
     )
 
     # C4
-    checks.C4_vc_commands_present, issues = check_c4_vc_commands_present(body)
+    checks.C4_vc_commands_present, issues = check_c4_vc_commands_present(body, issue_kind)
     result.blocking_issues.extend(issues)
     _append_findings(
         result,
@@ -2277,7 +2292,7 @@ def run_checks(
     )
 
     # C8
-    checks.C8_outcome_concreteness, issues = check_c8_outcome_concreteness(body)
+    checks.C8_outcome_concreteness, issues = check_c8_outcome_concreteness(body, issue_kind)
     result.blocking_issues.extend(issues)
     _append_findings(
         result,

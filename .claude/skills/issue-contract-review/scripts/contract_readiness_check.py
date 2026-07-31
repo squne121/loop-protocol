@@ -1277,11 +1277,23 @@ def main() -> int:
     # Run validate_issue_body (always)
     validate_result = run_validate_issue_body(body)
 
-    # Run baseline_vc_preflight only in execute mode
+    # Run baseline_vc_preflight only in execute mode.
+    # #1867: canonical parent Issue (issue_kind: parent) does not require a
+    # `## Verification Commands` section under existing_issue_readiness_v1,
+    # so baseline_vc_preflight() must be skipped for canonical parent bodies
+    # to avoid a spurious VC001_NO_VERIFICATION_COMMANDS_SECTION extraction
+    # error. implementation / research / unknown kind / malformed MRC /
+    # parse failure / label-only-parent-with-implementation-MRC bodies are
+    # NOT skipped and retain the existing execution behavior.
     preflight_result: Optional[dict] = None
     preflight_exit_code: Optional[int] = None
     if args.mode == "execute":  # preflight-static is static-only; no execution
-        preflight_result, preflight_exit_code = run_baseline_vc_preflight(body)
+        resolution = resolve_existing_issue_validation_profile(body)
+        is_canonical_parent = (
+            resolution.status == "profile" and resolution.canonical_issue_kind == "parent"
+        )
+        if not is_canonical_parent:
+            preflight_result, preflight_exit_code = run_baseline_vc_preflight(body)
 
     result = build_result(body, args.mode, validate_result, preflight_result, preflight_exit_code)
 
