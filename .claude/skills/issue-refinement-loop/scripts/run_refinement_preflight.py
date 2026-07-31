@@ -1904,6 +1904,10 @@ def run_preflight(
             )
             # Propagate to known_context so planner sees anchor_reframe context
             _kc = dict(known_context) if known_context else {}
+            # The iteration-zero consumer must cross-check normalized anchor
+            # evidence against the live repository even though planner input
+            # intentionally omits raw issue URLs.
+            _kc["repo"] = repo
             _kc["anchor_reframe"] = scope_delta_decision["status"] == "approved_by_trusted_anchor"
             _kc["anchor_comment_url"] = anchor_url
             _kc["anchor_comment_hash"] = scope_delta_decision.get("anchor_comment_hash", "")

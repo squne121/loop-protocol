@@ -2510,6 +2510,29 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                     base_issue_body_sha256=issue_body_sha256,
                     expected_repo=_expected_repo_for_issue(issue, known_context),
                 )
+        elif classify_scope_delta_authority is not None and known_context and (
+            "scope_delta_authority_evidence" in known_context
+        ):
+            # Iteration zero has no immutable *previous* body and must not
+            # fabricate one just to enter the legacy delta lane.  Consume the
+            # already-normalized trusted directive through the existing v2
+            # sidecar instead; the router will request a candidate-body
+            # readiness-gated contract update, never implementation go.
+            scope_signal_guard_decision_v2 = {
+                "schema_version": "SCOPE_SIGNAL_GUARD_DECISION_V2",
+                "raw_signal": {"triggered": False, "reason_code": SCOPE_SIGNAL_REASON_NO_SIGNAL},
+                "scope_context": {"path_layer": []},
+                "scope_delta_approval": _base_approval_result(),
+                "security_sensitive": False,
+                "route": SCOPE_ROUTE_NOT_TRIGGERED,
+                "scope_delta_authority": classify_scope_delta_authority(
+                    known_context.get("scope_delta_authority_evidence"),
+                    triggered=True,
+                    target_issue_number=issue_number,
+                    base_issue_body_sha256=issue_body_sha256,
+                    expected_repo=_expected_repo_for_issue(issue, known_context),
+                ),
+            }
 
         # Build output
         plan = {
