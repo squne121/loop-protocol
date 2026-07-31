@@ -74,9 +74,19 @@ def test_classifies_trusted_anchor_without_prior_snapshot():
 
 def test_bootstrap_lane_does_not_use_prepatch_human_judgment_as_go():
     result = sda.run_trusted_anchor_iteration_zero(
-        repo=REPO, issue_number=ISSUE, issue={"body": PRE_BODY}, anchor=_anchor(),
+        repo=REPO,
+        issue_number=ISSUE,
+        issue={"body": PRE_BODY},
+        anchor=_anchor(),
         anchor_body=ANCHOR_BODY,
-        patch_plan=_plan({"section": "Acceptance Criteria", "op": "append", "text": "- [ ] AC1: trusted path", "source_evidence_index": 0}),
+        patch_plan=_plan(
+            {
+                "section": "Acceptance Criteria",
+                "op": "append",
+                "text": "- [ ] AC1: trusted path",
+                "source_evidence_index": 0,
+            }
+        ),
         candidate_readiness=lambda _body: {"status": "human_judgment"},
         fetch_current=_current(PRE_BODY, _anchor()),
     )
@@ -84,20 +94,28 @@ def test_bootstrap_lane_does_not_use_prepatch_human_judgment_as_go():
     assert result["failure"] == "candidate_readiness_not_go"
 
     evidence = {
-        "source_kind": "issue_comment", "comment_url": ANCHOR_URL,
+        "source_kind": "issue_comment",
+        "comment_url": ANCHOR_URL,
         "issue_url": f"https://github.com/{REPO}/issues/{ISSUE}",
-        "author_association": "OWNER", "directive_markers": ["revised ac"],
-        "extracted_directives": ["AC1: trusted path"], "boundary_flags": [],
-        "body_sha256": "sha256:anchor", "comment_id": 5136894634,
-        "source_ref": ANCHOR_URL, "captured_at": "2026-08-01T00:00:00Z",
+        "author_association": "OWNER",
+        "directive_markers": ["revised ac"],
+        "extracted_directives": ["AC1: trusted path"],
+        "boundary_flags": [],
+        "body_sha256": "sha256:anchor",
+        "comment_id": 5136894634,
+        "source_ref": ANCHOR_URL,
+        "captured_at": "2026-08-01T00:00:00Z",
     }
     planner_body = (SKILL_ROOT.parent / "review-issue" / "fixtures" / "pass_issue.md").read_text(encoding="utf-8")
-    plan, _ = planner.plan_refinement_loop({
-        "schema_version": "refinement_loop_planner_input/v1",
-        "issue": {"number": ISSUE, "title": "iteration zero", "body": planner_body, "labels": []},
-        "comments": [], "known_context": {"repo": REPO, "scope_delta_authority_evidence": [evidence]},
-        "now": "2026-08-01T00:00:00+00:00",
-    })
+    plan, _ = planner.plan_refinement_loop(
+        {
+            "schema_version": "refinement_loop_planner_input/v1",
+            "issue": {"number": ISSUE, "title": "iteration zero", "body": planner_body, "labels": []},
+            "comments": [],
+            "known_context": {"repo": REPO, "scope_delta_authority_evidence": [evidence]},
+            "now": "2026-08-01T00:00:00+00:00",
+        }
+    )
     sidecar = plan["scope_signal_guard_decision_v2"]
     assert sidecar["raw_signal"]["triggered"] is False
     assert sidecar["scope_delta_authority"]["route"]["action"] == "contract_update_required"
@@ -109,12 +127,22 @@ def test_patch_plan_is_consumed_by_builder_and_edit_transaction():
     )
     candidate = sda.build_section_aware_candidate_body(
         body=PRE_BODY,
-        operations=[{"section": "Acceptance Criteria", "op": "append", "text": "- [ ] AC1: trusted path", "source_evidence_index": 0}],
+        operations=[
+            {
+                "section": "Acceptance Criteria",
+                "op": "append",
+                "text": "- [ ] AC1: trusted path",
+                "source_evidence_index": 0,
+            }
+        ],
         source_identity=normalized["source_identity"],
     )
     txn = sda.build_issue_edit_txn_input(
-        issue_number=ISSUE, repo=REPO, previous_body_sha256="sha256:before",
-        previous_updated_at="2026-08-01T00:00:00Z", new_body_file="tmp/candidate.md",
+        issue_number=ISSUE,
+        repo=REPO,
+        previous_body_sha256="sha256:before",
+        previous_updated_at="2026-08-01T00:00:00Z",
+        new_body_file="tmp/candidate.md",
         readiness_result=_readiness(candidate["candidate_body"]),
     )
     assert candidate["changed"] is True
@@ -126,7 +154,12 @@ def test_section_aware_desired_state_replaces_and_removes_contradictions():
     candidate = sda.build_section_aware_candidate_body(
         body=PRE_BODY,
         operations=[
-            {"section": "Acceptance Criteria", "text": "- [ ] AC1: desired", "kind": "upsert", "remove_text": "old contradictory"},
+            {
+                "section": "Acceptance Criteria",
+                "text": "- [ ] AC1: desired",
+                "kind": "upsert",
+                "remove_text": "old contradictory",
+            },
             {"section": "Acceptance Criteria", "text": "- [ ] AC1: desired", "kind": "upsert"},
             {"section": "Stop Conditions", "text": "old stop condition", "kind": "remove"},
         ],
@@ -158,9 +191,16 @@ def test_rebases_body_drift_once_and_revalidates_anchor():
         return ({"body": drifted if calls["count"] == 1 else drifted}, _anchor())
 
     result = sda.run_trusted_anchor_iteration_zero(
-        repo=REPO, issue_number=ISSUE, issue={"body": PRE_BODY}, anchor=_anchor(), anchor_body=ANCHOR_BODY,
-        patch_plan=_plan({"section": "Acceptance Criteria", "op": "append", "text": "- [ ] AC1: desired", "source_evidence_index": 0}),
-        candidate_readiness=_readiness, fetch_current=fetch_current,
+        repo=REPO,
+        issue_number=ISSUE,
+        issue={"body": PRE_BODY},
+        anchor=_anchor(),
+        anchor_body=ANCHOR_BODY,
+        patch_plan=_plan(
+            {"section": "Acceptance Criteria", "op": "append", "text": "- [ ] AC1: desired", "source_evidence_index": 0}
+        ),
+        candidate_readiness=_readiness,
+        fetch_current=fetch_current,
     )
     assert result["status"] == "ready_for_controlled_mutation"
     assert result["iterations"] == 1
@@ -180,9 +220,16 @@ def test_keeps_authority_fact_precondition_and_update_states_separate():
 def test_desired_state_replay_is_no_change_without_write_or_iteration():
     body = PRE_BODY.replace("- [ ] old contradictory criterion", "- [ ] AC1: desired")
     result = sda.run_trusted_anchor_iteration_zero(
-        repo=REPO, issue_number=ISSUE, issue={"body": body}, anchor=_anchor(), anchor_body=ANCHOR_BODY,
-        patch_plan=_plan({"section": "Acceptance Criteria", "op": "append", "text": "- [ ] AC1: desired", "source_evidence_index": 0}),
-        candidate_readiness=_readiness, fetch_current=_current(body, _anchor()),
+        repo=REPO,
+        issue_number=ISSUE,
+        issue={"body": body},
+        anchor=_anchor(),
+        anchor_body=ANCHOR_BODY,
+        patch_plan=_plan(
+            {"section": "Acceptance Criteria", "op": "append", "text": "- [ ] AC1: desired", "source_evidence_index": 0}
+        ),
+        candidate_readiness=_readiness,
+        fetch_current=_current(body, _anchor()),
     )
     assert result["status"] == "no_change"
     assert result["writes"] == 0 and result["iterations"] == 0
@@ -194,8 +241,18 @@ def test_fails_closed_only_for_trust_conflict_or_security_boundaries():
     )
     assert rejected["accepted"] is False
     authority = sda.classify_scope_delta_authority(
-        {"source_kind": "issue_comment", "comment_url": ANCHOR_URL, "issue_url": f"https://github.com/{REPO}/issues/{ISSUE}", "author_association": "OWNER", "directive_markers": ["revised ac"], "extracted_directives": ["AC1: desired"], "boundary_flags": ["changes_permission_boundary"]},
-        target_issue_number=ISSUE, expected_repo=REPO, base_issue_body_sha256="sha256:body",
+        {
+            "source_kind": "issue_comment",
+            "comment_url": ANCHOR_URL,
+            "issue_url": f"https://github.com/{REPO}/issues/{ISSUE}",
+            "author_association": "OWNER",
+            "directive_markers": ["revised ac"],
+            "extracted_directives": ["AC1: desired"],
+            "boundary_flags": ["changes_permission_boundary"],
+        },
+        target_issue_number=ISSUE,
+        expected_repo=REPO,
+        base_issue_body_sha256="sha256:body",
     )
     assert authority["route"]["action"] == "human_escalation"
 
@@ -212,10 +269,20 @@ def test_final_readback_verifies_postconditions_and_restarts_fresh_preflight():
         return {"status": "ok"}
 
     result = sda.run_trusted_anchor_iteration_zero(
-        repo=REPO, issue_number=ISSUE, issue={"body": PRE_BODY}, anchor=_anchor(), anchor_body=ANCHOR_BODY,
-        patch_plan=_plan({"section": "Acceptance Criteria", "op": "append", "text": "- [ ] AC1: desired", "source_evidence_index": 0}),
-        candidate_readiness=_readiness, fetch_current=fetch_current, apply_transaction=apply,
-        fresh_checks=lambda current: fresh.append(current["body"]) or {"preflight": "pass", "review": "approve", "readiness": "go"},
+        repo=REPO,
+        issue_number=ISSUE,
+        issue={"body": PRE_BODY},
+        anchor=_anchor(),
+        anchor_body=ANCHOR_BODY,
+        patch_plan=_plan(
+            {"section": "Acceptance Criteria", "op": "append", "text": "- [ ] AC1: desired", "source_evidence_index": 0}
+        ),
+        candidate_readiness=_readiness,
+        fetch_current=fetch_current,
+        apply_transaction=apply,
+        fresh_checks=lambda current: (
+            fresh.append(current["body"]) or {"preflight": "pass", "review": "approve", "readiness": "go"}
+        ),
     )
     assert result["status"] == "applied" and result["writes"] == 1
     assert fresh and result["fresh_checks"]["review"] == "approve"
