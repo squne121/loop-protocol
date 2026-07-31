@@ -35,7 +35,32 @@ ROUTE_APPROVED = "approved"
 ROUTE_CONTINUE_LOOP = "continue_loop"
 ROUTE_TO_UPDATE_BRANCH = "route_to_update_branch"
 ROUTE_TO_BODY_ONLY_ACTION = "route_to_body_only_action"
+ROUTE_CONFLICT_HARD_STOP = "conflict_hard_stop"
 ROUTE_FAIL_CLOSED = "fail_closed"
+
+# ---------------------------------------------------------------------------
+# #1860 Owner Decision: the ONLY hard stops are real Git conflicts / GitHub
+# mergeability, never semantic planning / overlap / contract artifacts.
+#
+# GitHub's actual enums (see GraphQL schema):
+#   PullRequest.mergeable        (MergeableState):  CONFLICTING | MERGEABLE | UNKNOWN
+#   PullRequest.mergeStateStatus (MergeStateStatus): BEHIND | BLOCKED | CLEAN | DIRTY |
+#                                                     DRAFT | HAS_HOOKS | UNKNOWN | UNSTABLE
+#
+# NOTE: "CONFLICTING" is a valid value of `mergeable` but is NOT a valid value
+# of `merge_state_status` (that enum member does not exist on GitHub). A
+# LOOP_VERDICT_V2 payload that sets merge_state_status == "CONFLICTING" is
+# therefore malformed input, not a legitimate conflict signal, and must be
+# rejected as schema_invalid rather than silently treated as a conflict.
+# ---------------------------------------------------------------------------
+
+_VALID_MERGEABLE_VALUES: frozenset[str] = frozenset({
+    "CONFLICTING", "MERGEABLE", "UNKNOWN",
+})
+
+_VALID_MERGE_STATE_STATUS_VALUES: frozenset[str] = frozenset({
+    "BEHIND", "BLOCKED", "CLEAN", "DIRTY", "DRAFT", "HAS_HOOKS", "UNKNOWN", "UNSTABLE",
+})
 
 # ---------------------------------------------------------------------------
 # Canonical required_auto_actions kind x executor x skill matrix
@@ -67,15 +92,6 @@ _KNOWN_ACTION_KINDS: frozenset[str] = (
     | _BODY_ONLY_ACTION_KINDS
 )
 
-# merge_state_status values that block the update_branch path:
-_BEHIND_BLOCKING_STATUSES: frozenset[str] = frozenset({
-    "UNKNOWN",
-    "CONFLICTING",
-    "DIRTY",
-    "UNSTABLE",
-    "BLOCKED",
-    "CLEAN",
-})
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +105,7 @@ class RouteDecision:
         "continue_loop",
         "route_to_update_branch",
         "route_to_body_only_action",
+        "conflict_hard_stop",
         "fail_closed",
     ]
     fail_closed: bool
@@ -153,6 +170,22 @@ def _ok_update_branch(action: dict[str, Any]) -> RouteDecision:
     )
 
 
+def _ok_conflict_hard_stop(reason_code: str) -> RouteDecision:
+    """The ONE class of hard stop retained by #1860 Owner Decision: real Git
+    conflict / GitHub-reported non-mergeability. This is NOT a fail-closed
+    safe-default; it is a deterministic, intentional escalation to the
+    CONFLICTING PR Escalation Runbook.
+    """
+    return RouteDecision(
+        route=ROUTE_CONFLICT_HARD_STOP,
+        fail_closed=False,
+        reason_code=reason_code,
+        selected_action=None,
+        rerun_required={"verification": False, "pr_review": False},
+        errors=(),
+    )
+
+
 def _ok_body_only(action: dict[str, Any]) -> RouteDecision:
     return RouteDecision(
         route=ROUTE_TO_BODY_ONLY_ACTION,
@@ -206,6 +239,22 @@ def _validate_mergeability_schema(loop_verdict: Mapping[str, Any]) -> str | None
     # V1 recommendations field signals wrong schema version
     if "recommendations" in loop_verdict:
         return "schema_invalid_v1_recommendations_field"
+
+    mergeability = loop_verdict.get("mergeability", {})
+    if not isinstance(mergeability, dict):
+        return None
+
+    mergeable = mergeability.get("mergeable")
+    if mergeable is not None and mergeable not in _VALID_MERGEABLE_VALUES:
+        return f"schema_invalid_mergeable_value:{mergeable}"
+
+    merge_state_status = mergeability.get("merge_state_status")
+    if merge_state_status is not None and merge_state_status not in _VALID_MERGE_STATE_STATUS_VALUES:
+        # "CONFLICTING" is a valid `mergeable` value but NOT a valid GitHub
+        # MergeStateStatus enum member (GitHub's real enum has no such value).
+        # A payload that puts it here is malformed, not a legitimate conflict.
+        return f"schema_invalid_merge_state_status_value:{merge_state_status}"
+
     return None
 
 
@@ -333,6 +382,26 @@ def route_loop_verdict_v2(
         mergeability = {}
 
     merge_state_status: Any = mergeability.get("merge_state_status")
+    mergeable: Any = mergeability.get("mergeable")
+
+    # ------------------------------------------------------------------
+    # Step 1.5: conflict hard stop (#1860 Owner Decision — the ONLY hard
+    # stop retained by this router). Applies regardless of verdict /
+    # required_auto_actions: a real Git conflict or DIRTY merge state must
+    # never be routed past this point.
+    #
+    #   mergeable == "CONFLICTING"        → conflict hard stop
+    #   merge_state_status == "DIRTY"     → conflict hard stop
+    #   mergeable == "UNKNOWN"            → NOT a conflict (caller performs
+    #                                       bounded retry, then warning)
+    #   merge_state_status in {BLOCKED, BEHIND, UNSTABLE, DRAFT, HAS_HOOKS,
+    #   UNKNOWN}                          → NOT a conflict
+    # ------------------------------------------------------------------
+    if mergeable == "CONFLICTING":
+        return _ok_conflict_hard_stop("conflict_mergeable_CONFLICTING")
+
+    if merge_state_status == "DIRTY":
+        return _ok_conflict_hard_stop("conflict_merge_state_status_DIRTY")
 
     # ------------------------------------------------------------------
     # Step 2: validate required_auto_actions schema (AC7)
@@ -461,3 +530,135 @@ def route_loop_verdict_v2(
         "internal_routing_error",
         f"Unhandled kind '{kind}' after all guards.",
     )
+
+
+# ---------------------------------------------------------------------------
+# LOOP_VERDICT_V2 fenced-YAML-block extraction (P0-1 / step-5-mergeability-handling.md)
+#
+# Replaces the shell grep/sed extraction previously documented in
+# step-5-mergeability-handling.md, which only inspected the FIRST fenced
+# ```yaml block in a comment body. This enumerates ALL fenced yaml blocks
+# and selects the one(s) whose parsed content contains a `LOOP_VERDICT_V2`
+# key, taking the last match (most recently appended) as authoritative.
+# ---------------------------------------------------------------------------
+
+import re as _re  # noqa: E402  (kept below dataclass/typing imports intentionally)
+
+_FENCED_YAML_BLOCK_RE = _re.compile(
+    r"```ya?ml\s*\n(.*?)```",
+    _re.DOTALL,
+)
+
+
+def extract_latest_loop_verdict_v2(comment_body: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Enumerate all fenced ```yaml blocks in `comment_body` and return the
+    parsed `LOOP_VERDICT_V2` mapping from the last block that contains it.
+
+    Returns (loop_verdict_dict, error_reason_code). On success,
+    error_reason_code is None. On failure, loop_verdict_dict is None and
+    error_reason_code explains why (no matching block found, or a matching
+    block failed to parse as YAML).
+    """
+    import yaml  # local import: keep module import-time side-effect free
+
+    if not comment_body:
+        return None, "no_comment_body"
+
+    candidate_blocks = _FENCED_YAML_BLOCK_RE.findall(comment_body)
+    if not candidate_blocks:
+        return None, "no_fenced_yaml_block_found"
+
+    last_match: dict[str, Any] | None = None
+    any_parse_error = False
+
+    for block_text in candidate_blocks:
+        if "LOOP_VERDICT_V2" not in block_text:
+            continue
+        try:
+            parsed = yaml.safe_load(block_text)
+        except yaml.YAMLError:
+            any_parse_error = True
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        loop_verdict_v2 = parsed.get("LOOP_VERDICT_V2")
+        if isinstance(loop_verdict_v2, dict):
+            last_match = loop_verdict_v2
+
+    if last_match is not None:
+        return last_match, None
+
+    if any_parse_error:
+        return None, "malformed_yaml_in_loop_verdict_v2_block"
+
+    return None, "no_loop_verdict_v2_key_in_any_fenced_block"
+
+
+# ---------------------------------------------------------------------------
+# CLI wrapper
+#
+# Usage:
+#   uv run python3 route_loop_verdict_v2.py --body-file <comment.txt>
+#
+# Note (Issue #1856): --test-verdict-file was removed along with the
+# branch_behind_main / TEST_VERDICT cross-check (see route_loop_verdict_v2()
+# docstring). BEHIND routing is derived solely from merge_state_status.
+#
+# Prints a single JSON object to stdout describing the RouteDecision (plus
+# an `extraction_error` field when the LOOP_VERDICT_V2 block could not be
+# located/parsed). Exit code is always 0 for a completed, well-formed
+# invocation -- fail_closed / conflict_hard_stop / extraction failures are
+# all *data*, not process failures, and callers must branch on the JSON
+# `route` field rather than on process exit code. Exit code is non-zero
+# only for genuine invocation errors (e.g. --body-file not found).
+# ---------------------------------------------------------------------------
+
+def _cli_main(argv: list[str] | None = None) -> int:
+    import argparse
+    import json
+    import sys
+
+    parser = argparse.ArgumentParser(
+        description="Extract LOOP_VERDICT_V2 from a PR comment body and route it (Step 5).",
+    )
+    parser.add_argument("--body-file", required=True, help="Path to file containing the PR comment body text.")
+    args = parser.parse_args(argv)
+
+    try:
+        comment_body = open(args.body_file, encoding="utf-8").read()
+    except OSError as exc:
+        print(json.dumps({"error": f"could not read --body-file: {exc}"}), file=sys.stderr)
+        return 2
+
+    loop_verdict, extraction_error = extract_latest_loop_verdict_v2(comment_body)
+
+    if loop_verdict is None:
+        output = {
+            "route": ROUTE_FAIL_CLOSED,
+            "fail_closed": True,
+            "reason_code": extraction_error,
+            "selected_action": None,
+            "rerun_required": {"verification": False, "pr_review": False},
+            "errors": [f"LOOP_VERDICT_V2 extraction failed: {extraction_error}"],
+            "extraction_error": extraction_error,
+        }
+        print(json.dumps(output))
+        return 0
+
+    decision = route_loop_verdict_v2(loop_verdict)
+    output = {
+        "route": decision.route,
+        "fail_closed": decision.fail_closed,
+        "reason_code": decision.reason_code,
+        "selected_action": dict(decision.selected_action) if decision.selected_action is not None else None,
+        "rerun_required": dict(decision.rerun_required),
+        "errors": list(decision.errors),
+        "extraction_error": None,
+    }
+    print(json.dumps(output))
+    return 0
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    _sys.exit(_cli_main())

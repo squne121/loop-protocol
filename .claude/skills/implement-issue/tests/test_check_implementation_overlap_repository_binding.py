@@ -76,7 +76,7 @@ def test_given_dry_run_without_repo_when_run_then_runtime_error_with_required_me
 
     exit_code, payload = _run_cli(current_number, current_file, candidates_file)
 
-    assert exit_code == 1, payload
+    assert exit_code == 0, payload  # #1869 fix_delta P0-3: runtime_error is advisory, exit 0
     assert payload["route"] == "runtime_error"
     assert "--repo is required for dry-run" in payload["error"]
 
@@ -89,7 +89,7 @@ def test_given_online_without_repo_when_run_then_runtime_error() -> None:
         text=True,
     )
     payload = json.loads(proc.stdout)
-    assert proc.returncode == 1
+    assert proc.returncode == 0  # #1869 fix_delta P0-3: runtime_error is advisory, exit 0
     assert payload["route"] == "runtime_error"
     assert "--repo is required for online fetch" in payload["error"]
 
@@ -220,7 +220,7 @@ def test_given_invalid_repo_format_when_run_then_runtime_error() -> None:
         current_number, current_file, candidates_file, "--repo", "not-a-valid-repo-format"
     )
 
-    assert exit_code == 1, payload
+    assert exit_code == 0, payload  # #1869 fix_delta P0-3: runtime_error is advisory, exit 0
     assert payload["route"] == "runtime_error"
 
 

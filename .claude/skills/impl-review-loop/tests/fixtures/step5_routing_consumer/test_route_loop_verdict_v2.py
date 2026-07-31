@@ -114,6 +114,69 @@ def test_positive_continue_loop():
 
 
 # ---------------------------------------------------------------------------
+# P0-1 (#1869 fix_delta): mergeable × merge_state_status truth table
+# ---------------------------------------------------------------------------
+
+
+def test_positive_conflict_hard_stop_mergeable_conflicting():
+    """mergeable=CONFLICTING -> conflict_hard_stop, regardless of verdict."""
+    fx = _load_fixture("positive_conflict_hard_stop_mergeable.yml")
+    result = route_loop_verdict_v2(fx["loop_verdict"])
+    assert result.route == fx["expected"]["route"], (
+        f"Expected route '{fx['expected']['route']}', got '{result.route}'. errors: {result.errors}"
+    )
+    assert result.fail_closed is fx["expected"]["fail_closed"]
+    assert result.reason_code is not None
+    assert result.reason_code.startswith(fx["expected"]["reason_code_prefix"])
+
+
+def test_positive_conflict_hard_stop_dirty_merge_state_status():
+    """merge_state_status=DIRTY -> conflict_hard_stop, regardless of verdict."""
+    fx = _load_fixture("positive_conflict_hard_stop_dirty.yml")
+    result = route_loop_verdict_v2(fx["loop_verdict"])
+    assert result.route == fx["expected"]["route"], (
+        f"Expected route '{fx['expected']['route']}', got '{result.route}'. errors: {result.errors}"
+    )
+    assert result.fail_closed is fx["expected"]["fail_closed"]
+    assert result.reason_code is not None
+    assert result.reason_code.startswith(fx["expected"]["reason_code_prefix"])
+
+
+def test_negative_merge_state_status_conflicting_is_schema_invalid():
+    """merge_state_status=CONFLICTING is not a valid GitHub MergeStateStatus
+    enum member -> schema_invalid (NOT treated as a conflict signal)."""
+    fx = _load_fixture("negative_merge_state_status_conflicting_is_schema_invalid.yml")
+    result = route_loop_verdict_v2(fx["loop_verdict"])
+    _assert_fail_closed(result, fx["expected"], "negative_merge_state_status_conflicting_is_schema_invalid")
+
+
+def test_positive_non_conflict_blocked_status():
+    """merge_state_status=BLOCKED is not a Git conflict (required checks/review gate only)."""
+    fx = _load_fixture("positive_non_conflict_blocked_status.yml")
+    result = route_loop_verdict_v2(fx["loop_verdict"])
+    assert result.route != "conflict_hard_stop"
+    assert result.route == fx["expected"]["route"]
+    assert result.reason_code is not None
+    assert result.reason_code.startswith(fx["expected"]["reason_code_prefix"])
+
+
+def test_positive_non_conflict_unstable_status():
+    """merge_state_status=UNSTABLE is not a Git conflict."""
+    fx = _load_fixture("positive_non_conflict_unstable_status.yml")
+    result = route_loop_verdict_v2(fx["loop_verdict"])
+    assert result.route == fx["expected"]["route"]
+    assert result.fail_closed is fx["expected"]["fail_closed"]
+
+
+def test_positive_non_conflict_draft_has_hooks_unknown():
+    """merge_state_status=DRAFT and mergeable=UNKNOWN are not Git conflicts."""
+    fx = _load_fixture("positive_non_conflict_draft_has_hooks_unknown.yml")
+    result = route_loop_verdict_v2(fx["loop_verdict"])
+    assert result.route == fx["expected"]["route"]
+    assert result.fail_closed is fx["expected"]["fail_closed"]
+
+
+# ---------------------------------------------------------------------------
 # Negative cases
 # ---------------------------------------------------------------------------
 

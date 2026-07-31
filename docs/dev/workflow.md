@@ -272,9 +272,9 @@ branch publish が hook / approval 境界で止まった場合、agent は manua
 - `branch_mismatch` / `stale_remote_head` / `local_head_mismatch` / `remote_fast_forward_by_same_scope` / `remote_head_scope_contamination` / `allowed_paths_gate_not_ok` / `publish_guard_context_missing` / `publish_guard_context_invalid` のいずれかなら `PUBLISH_SAFETY_STOP_REPORT_V1` を残して停止する
 - strict lane を hook に束縛する場合は `LOOP_PUBLISH_EXPECTED_REMOTE_HEAD` / `LOOP_PUBLISH_CURRENT_REMOTE_HEAD` / `LOOP_PUBLISH_DECLARED_PUBLISH_HEAD` / `LOOP_PUBLISH_VERIFIED_HEAD` / `LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS` / `LOOP_PUBLISH_REMOTE_READBACK_SOURCE` をセットする
 
-### Scope Collision Preflight（スコープ衝突の事前確認）
+### Scope Collision Preflight（スコープ衝突の事前確認、#1860 で advisory 化）
 
-Allowed Paths overlap 単独では hard stop ではない。OPEN な他 Implementation Issue と Allowed Paths が重複する場合は、即停止ではなく Scope Collision Preflight を実施し、以下の class を判定する。
+Allowed Paths overlap 単独では hard stop ではない。OPEN な他 Implementation Issue と Allowed Paths が重複する場合、Scope Collision Preflight で以下の class を判定するが、判定結果自体は着手・実装・PR publication を止めない（#1860: OPEN Issue 全件収集・semantic overlap 判定・Allowed Paths の文字列重複は advisory diagnostic であり blocking authority を持たない）。
 
 - `C0: no collision`
   - Allowed Paths が重複しない。通常どおり着手可。
@@ -286,25 +286,25 @@ Allowed Paths overlap 単独では hard stop ではない。OPEN な他 Implemen
     - 片方の変更がもう片方を不要化しない
     - PR 本文または実装記録に `related_issue` / `overlapping_paths` / `edit_intent` / `non_conflict_reason` を残す
   - 例: fixture 追加のみ、test file への独立 test case 追加、docs の索引・参照追記で heading / policy paragraph / output contract が衝突しないもの。
-  - `C1` は着手可。監査証跡として重複 Issue 番号と benign overlap の理由を必ず残す。
+  - `C1` は着手可。監査証跡として重複 Issue 番号と benign overlap の理由を残すことが望ましい。
 - `C2: ordered overlap`
   - 同じ schema / checker output / 関数境界などを触りうるが、依存順を明示すれば安全に直列化できる。
   - 例: 同じ Python checker への別 rule 追加、同一 schema key set の段階拡張。
-  - `C2` は `Depends on #N` または parent Work Ordering による直列化が必要。
   - `C2a`: predecessor が closed / merged 済みで、依存順が本文または parent に明記されている。着手可。
-  - `C2b`: predecessor が open のまま。`Depends on #N` または parent Work Ordering を記録し、predecessor close まで wait する。
-  - 依存順が未記録なら停止する。
+  - `C2b`: predecessor が open のまま。`Depends on #N` または parent Work Ordering を記録できるが、predecessor close を待たずに着手してもよい（advisory）。
+  - 依存順が未記録の場合も着手を止めない。warning として記録する。
 - `C3: conflicting overlap`
-  - Outcome / AC / schema / ownership が実質的に同じ、または同時実装すると片方が不要になる。
+  - Outcome / AC / schema / ownership が実質的に同じ、または同時実装すると片方が不要になる可能性がある。
   - 例: 同じ bug の別修正、同じ checker rule の別名追加、同じ SSOT policy の競合変更。
-  - `C3` は human escalation で停止し、duplicate / superseded / absorb / split のいずれかを決める。
+  - `C3` は duplicate / superseded / absorb / split の候補として Issue コメントに記録するが、着手を自動停止しない（human escalation は advisory な提案であり hard stop ではない）。
 
-着手を停止するのは以下の場合のみ:
+着手を停止するのは以下の場合のみ（#1860）:
 
-- Hard gate のいずれかを満たさない
-- Scope Collision が `C3`
-- Scope Collision が `C2` で、`Depends on #N` または parent Work Ordering が未記録
-- Scope Collision が `C2b` で、predecessor がまだ open
+- Hard gate 未充足（作業場所、protected paths/secret、破壊的 Git 操作禁止、typecheck/lint/test/build、CI/required checks/branch protection、独立レビュー・最終マージ）
+- current head と対象 peer commit の実際の 3-way Git conflict
+- target PR について GitHub が `mergeable == CONFLICTING` または `merge_state_status == DIRTY` と判定した場合
+
+Scope Collision の class（C0/C1/C2a/C2b/C3）は上記 hard gate とは独立した advisory diagnostic であり、それ単独では着手・実装・PR publication を止めない。
 
 workflow 不具合の修正方針では、自然言語 workaround を先に積むのではなく、以下の順で **決定論的修正** を優先する。
 
