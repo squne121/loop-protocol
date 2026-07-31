@@ -1,7 +1,7 @@
 ---
 design_doc_schema_version: v1
 ssot_classification: derived_design_note
-summary_ja: "この文書は issue-refinement-loop の設計判断・状態遷移・サブエージェント契約・失敗モードと復旧手順を集約した唯一の正本（SSOT）であり、アーキテクチャレビューや契約移行の際に参照する。"
+summary_ja: "この文書は issue-refinement-loop の設計判断・状態遷移・サブエージェント契約・失敗モードと復旧手順を補足する派生設計ノートであり、`docs/dev/workflow.md` 等の正本（`canonical_sources`）を補足するために、アーキテクチャレビューや契約移行の際に参照する（`conflict_rule: canonical_sources_win`）。"
 canonical_sources:
   - docs/dev/workflow.md
   - docs/dev/agent-skill-boundaries.md
@@ -141,9 +141,9 @@ Issue 本文の品質を反復改善する `issue-refinement-loop` の設計判�
 
 ### Step 2: bounded verdict trust（#1873、旧 Step 2a Replay Arbitration を撤去し検証結果を信頼する設計へ変更）
 
-`issue-reviewer` の `needs-fix` / `approve` 判定に対する parent-local replay arbitration（旧 Step 2a、#1532 V2 契約）は撤去された。orchestrator は `issue-reviewer` が返す `ISSUE_REVIEW_RESULT_COMPACT_V1`（`validate_review_compact_output.py` で構文検証済みの STATUS/VERDICT/SUMMARY/BLOCKERS/NEXT_ACTION/MUST_READ/EVIDENCE/ARTIFACT の8フィールド envelope）の VERDICT を、それ以上の独立 replay 再計算なしに直接信頼する。
+`issue-reviewer` の `needs-fix` / `approve` 判定に対する parent-local replay arbitration（旧 Step 2a、#1532 V2 契約）は撤去された。orchestrator は `issue-reviewer` が返す `ISSUE_REVIEW_RESULT_COMPACT_V1`（`validate_review_compact_output.py` で構文検証済みの STATUS/VERDICT/SUMMARY/BLOCKERS/NEXT_ACTION/MUST_READ/EVIDENCE/ARTIFACT/REVIEWED_BODY_SHA256 の9フィールド envelope）の VERDICT を、それ以上の独立 replay 再計算なしに直接信頼する。
 
-- `compact_review_result.py` は approve/needs-fix いずれの envelope も同一の8フィールド形状で emit する（`REVIEWER_BLOCKER_CLAIM` / `REPLAY_*` / `PARENT_REPLAY_*` フィールドは一切付与しない）。
+- `compact_review_result.py` は approve/needs-fix いずれの envelope も同一の9フィールド形状（`REVIEWED_BODY_SHA256` を含む。#1873 で追加された、reviewer が実際にレビューした live Issue 本文の sha256）で emit する（`REVIEWER_BLOCKER_CLAIM` / `REPLAY_*` / `PARENT_REPLAY_*` フィールドは一切付与しない）。
 - `decide_next_loop_action.py` の bounded decision は `verdict` / `iteration` / `max_iterations`（既定 3）のみを入力とする: `approve` → `terminate(approve)`、`needs-fix` かつ `iteration < max_iterations` → `continue(rewrite)`、それ以外（`blocked` または `iteration >= max_iterations`）→ `terminate(human_review_required)`。
 - 撤去された旧コンポーネント: `reviewer_claim_replay.py` / `reviewer_claim_replay_state_store.py` / `parent_replay_binding.py` / `emit_parent_review_envelope_v2.py`、および ISSUE_REFINEMENT_PHASE_STATE_V1 phase-gate（`build_refinement_phase_state.py`）と LOOP_STATE_V1 builder（`build_loop_state.py`）。
 
