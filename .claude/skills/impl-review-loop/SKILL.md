@@ -121,7 +121,7 @@ LOOP_STATE:
 ## Allowed Paths Gate Routing（許可パスゲートのルーティング、Issue #1873）
 
 pr-reviewer が実行する `ALLOWED_PATHS_GATE_RESULT_V1`（決定論的スクリプト、正本は pr-review-judge 配下）の
-`status` は、専用 `LOOP_VERDICT_V2.allowed_paths_gate` フィールドとして自己申告されず、
+`status` は専用フィールドとして `reviewer_verdict` に自己申告されず（`LOOP_VERDICT_V2` は #1873/#1875 で完全撤去済みであり本節が参照する対象は存在しない）、
 `status != ok` の場合は具体的な違反内容が `reviewer_verdict.blockers[]` にテキストとして含まれる
 （`references/allowed-paths-gate.md` 参照）。gate の pattern source は常に **live linked Issue 本文**
 であり、contract snapshot / `expected_contract_fingerprint` は advisory telemetry に過ぎない
@@ -189,6 +189,7 @@ preparation step で取得した contract snapshot 内の以下の情報を Step
 - `docs/dev/github-ops.md` — GitHub 運用ルール（body-file guard / コメントテンプレ）
 - `docs/dev/agent-run-report.md` — run report finalize / posting handoff 規約
 - `docs/dev/agent-retro-index.md` — retro index 更新規約
+- `docs/dev/workflows/impl-review-loop-design.md` — 設計判断・failure mode の詳細（`derived_design_note`。本 entrypoint と矛盾する場合は本 entrypoint が正本、#1876）
 
 ## Loop Policy 参照
 
