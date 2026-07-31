@@ -276,7 +276,7 @@ branch publish が hook / approval 境界で止まった場合、agent は manua
 
 Allowed Paths overlap 単独では hard stop ではない。以下の class 分類は Issue 起票時の `create-issue` 側 preflight（`check_issue_overlap.py`）が使う概念であり、判定結果自体は着手・実装・PR publication を止めない（#1860: OPEN Issue 全件収集・semantic overlap 判定・Allowed Paths の文字列重複は advisory diagnostic であり blocking authority を持たない）。
 
-`implement-issue` / `open-pr` の実装実行時（production path）に他の OPEN Implementation Issue を列挙・readback して同種の class を再判定する処理（旧 Step 2、`check_implementation_overlap.py`）は #1679 により完全に撤去されている。`implement-issue` は target Issue、canonical repository、worktree、実 diff、実 test、target PR、current-head CI、独立 review、human stop だけを実行判断入力とする target-only executor であり、peer OPEN Issue の body・comments・native dependency・GraphQL 全件収集は行わない。
+`implement-issue` / `open-pr` の実装実行時（production path）に他の OPEN Implementation Issue を列挙・readback して同種の class を再判定する処理（旧 Step 2 の候補収集レイヤー）は #1679 により完全に撤去されている。`implement-issue` は target Issue、canonical repository、worktree、実 diff、実 test、target PR、current-head CI、独立 review、human stop だけを実行判断入力とする target-only executor であり、peer OPEN Issue の body・comments・native dependency・GraphQL 全件収集は行わない。
 
 - `C0: no collision`
   - Allowed Paths が重複しない。通常どおり着手可。
