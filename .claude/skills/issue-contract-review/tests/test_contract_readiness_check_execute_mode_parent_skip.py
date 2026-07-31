@@ -95,6 +95,24 @@ Execute-mode skip behaviour only.
 """
 
 
+def _canonical_parent_body_with_vc_section() -> str:
+    """Canonical parent body that opts into a `## Verification Commands`
+    section. PR #1878 P1 review: a parent author who adds VCs must still have
+    them executed and their pass/fail outcome reflected — the skip is only
+    for parents WITHOUT a VC section."""
+    return (
+        _canonical_parent_body()
+        + """
+## Verification Commands
+
+```bash
+# AC1
+$ echo parent-vc-check
+```
+"""
+    )
+
+
 def _implementation_body_without_vc_section() -> str:
     return """## Machine-Readable Contract
 
@@ -184,16 +202,44 @@ class _PreflightSpy:
         )
 
 
+class _FailingPreflightSpy:
+    """Spy simulating a failing VC (body-structure/extraction-error style
+    blocked result, mapped to readiness_status "needs_fix")."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def __call__(self, body: str) -> tuple[dict, int]:
+        self.calls.append(body)
+        return (
+            {
+                "schema": "baseline_vc_preflight/v1",
+                "status": "blocked",
+                "results": [],
+                "errors": [
+                    {
+                        "kind": "extraction_error",
+                        "message": "parent VC failed baseline execution",
+                        "rule": "VC900",
+                    }
+                ],
+            },
+            1,
+        )
+
+
 def _run_execute_mode(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     body: str,
+    spy: "_PreflightSpy | _FailingPreflightSpy | None" = None,
 ) -> tuple[dict, _PreflightSpy]:
     body_file = tmp_path / "body.md"
     body_file.write_text(body, encoding="utf-8")
 
-    spy = _PreflightSpy()
+    if spy is None:
+        spy = _PreflightSpy()
     monkeypatch.setattr(_CRC, "run_baseline_vc_preflight", spy)
     monkeypatch.setattr(
         sys, "argv", ["contract_readiness_check.py", "--body-file", str(body_file), "--mode", "execute"]
@@ -214,9 +260,23 @@ class TestExecuteModeCanonicalParentSkipsPreflight:
     ) -> None:
         result, spy = _run_execute_mode(monkeypatch, tmp_path, capsys, _canonical_parent_body())
         assert spy.calls == [], "run_baseline_vc_preflight() must be skipped for canonical parent bodies"
-        assert not any(
-            source_check["name"] == "baseline_vc_preflight" for source_check in result["source_checks"]
+        # PR #1878 P2 review: a deliberate skip now records an explicit
+        # "not_applicable" baseline_vc_preflight source_checks entry (instead
+        # of the entry being entirely absent) so the skip is machine-readable
+        # and distinguishable from a wiring gap.
+        preflight_entries = [
+            source_check
+            for source_check in result["source_checks"]
+            if source_check["name"] == "baseline_vc_preflight"
+        ]
+        assert len(preflight_entries) == 1, (
+            f"Expected exactly one baseline_vc_preflight source_checks entry "
+            f"for a skipped canonical parent body, got: {preflight_entries}"
         )
+        entry = preflight_entries[0]
+        assert entry["status"] == "not_applicable", entry
+        assert entry["reason_code"] == "canonical_parent_without_verification_commands", entry
+        assert entry["exit_code"] is None, entry
 
     def test_no_vc001_error_for_canonical_parent_body(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -225,6 +285,62 @@ class TestExecuteModeCanonicalParentSkipsPreflight:
         assert not any(
             error.get("rule_id") == "VC001_NO_VERIFICATION_COMMANDS_SECTION" for error in result["errors"]
         ), f"Unexpected VC001 error for canonical parent body: {result['errors']}"
+
+
+class TestExecuteModeCanonicalParentWithVerificationCommandsSection:
+    """PR #1878 P1 review: canonical parent bodies that DO carry a
+    `## Verification Commands` section must still have baseline_vc_preflight()
+    invoked, and the pass/fail outcome must be reflected in build_result()'s
+    output (both invocation count and resulting readiness status)."""
+
+    def test_preflight_invoked_for_parent_with_vc_section(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        result, spy = _run_execute_mode(
+            monkeypatch, tmp_path, capsys, _canonical_parent_body_with_vc_section()
+        )
+        assert len(spy.calls) == 1, (
+            "run_baseline_vc_preflight() must be invoked once for a canonical parent "
+            "body carrying a `## Verification Commands` section"
+        )
+        assert any(
+            source_check["name"] == "baseline_vc_preflight" for source_check in result["source_checks"]
+        )
+
+    def test_passing_vc_yields_go_status_for_parent_with_vc_section(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        passing_spy = _PreflightSpy()
+        result, spy = _run_execute_mode(
+            monkeypatch,
+            tmp_path,
+            capsys,
+            _canonical_parent_body_with_vc_section(),
+            spy=passing_spy,
+        )
+        assert len(spy.calls) == 1
+        assert result["status"] == "go", (
+            f"Expected 'go' status for passing VC on canonical parent body, got: {result}"
+        )
+
+    def test_failing_vc_yields_non_go_status_for_parent_with_vc_section(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        failing_spy = _FailingPreflightSpy()
+        result, spy = _run_execute_mode(
+            monkeypatch,
+            tmp_path,
+            capsys,
+            _canonical_parent_body_with_vc_section(),
+            spy=failing_spy,
+        )
+        assert len(spy.calls) == 1
+        assert result["status"] != "go", (
+            f"Expected non-'go' status for failing VC on canonical parent body, got: {result}"
+        )
+        assert any(
+            source_check["name"] == "baseline_vc_preflight" for source_check in result["source_checks"]
+        )
 
 
 @pytest.mark.parametrize(

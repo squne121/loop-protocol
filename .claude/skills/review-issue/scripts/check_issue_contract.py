@@ -57,7 +57,10 @@ if str(_CREATE_ISSUE_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS))
 
 # #1135: shared, section-bound MRC parser + repo path-policy SSOT
-from mrc_contract_parser import parse_machine_readable_contract  # noqa: E402
+from mrc_contract_parser import (  # noqa: E402
+    REASON_MISSING as _MRC_REASON_MISSING,
+    parse_machine_readable_contract,
+)
 from path_classification import (  # noqa: E402
     extract_allowed_paths as pc_extract_allowed_paths,
     has_code_or_runtime_scope,
@@ -1177,17 +1180,27 @@ def detect_issue_kind(body: str, labels: str = "", title: str = "") -> str:
         return UNKNOWN_ISSUE_KIND_SENTINEL
 
     # 最優先: Machine-Readable Contract の issue_kind フィールド
-    # ```yaml ... contract_schema_version ... issue_kind: <value> ... ``` を探す
-    contract_match = re.search(
-        r'```yaml\s*\n.*?contract_schema_version.*?\n.*?issue_kind:\s*(\S+)',
-        body,
-        re.DOTALL
-    )
-    if contract_match:
-        kind = contract_match.group(1).strip().rstrip('"\'')
+    # #1878 P1 review: independent regex (unbound to the
+    # `## Machine-Readable Contract` section, order-dependent on
+    # contract_schema_version appearing before issue_kind) is replaced by the
+    # shared, section-bound parser (mrc_contract_parser.parse_machine_readable_contract)
+    # so this checker never diverges from validate_issue_body.py / #1135 P0 SSOT.
+    mrc_result = parse_machine_readable_contract(body)
+    if mrc_result.ok:
+        # MRC section present and strictly valid: issue_kind (if any) is
+        # authoritative. Do NOT fall back to labels/title — an MRC section
+        # that omits issue_kind normalizes to UNKNOWN_ISSUE_KIND_SENTINEL via
+        # _normalize("") below, same as an explicit unknown kind value.
+        kind = str(mrc_result.get("issue_kind", "") or "").strip().rstrip('"\'')
         return _normalize(kind)
+    if mrc_result.reason != _MRC_REASON_MISSING:
+        # MRC section exists but is malformed (multiple sections, missing/
+        # multiple YAML fences, YAML syntax error, duplicate key, non-mapping
+        # root). This is NOT a legacy body — label/title fallback MUST NOT be
+        # used (fail-closed per #1878 P1 review).
+        return UNKNOWN_ISSUE_KIND_SENTINEL
 
-    # fallback: labels
+    # fallback (legacy body without an MRC section at all): labels
     if "tracking" in labels or "parent" in labels:
         return _normalize("tracking")
     if "phase/research" in labels or title.startswith("調査:"):
