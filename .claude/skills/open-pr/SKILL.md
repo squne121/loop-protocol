@@ -147,7 +147,7 @@ EXISTING_PR=$(gh pr list --head <branch> --state open --json number,url --jq '.[
 - 既存 PR あり → 重複作成せず、既存 PR URL を返す（必要なら本文 update を提案）
 - 既存 PR なし → 次のステップへ
 
-### 4.5. Canonical Repository Resolution（`gh pr create` 直前の PR mutation target 解決。fail-closed hard gate、Issue #1470）
+### 4.5. Canonical Repository 解決（`gh pr create` 直前の PR mutation target を解決する。fail-closed hard gate、Issue #1470）
 
 `open_pr.py` は既存 PR 検出・dry-run 処理より後、`gh pr create` 呼び出し直前に PR mutation target の `canonical_repository` を解決する（Issue #1470）。peer OPEN Issue の overlap preflight（旧 Issue #1458 / #1851 hard gate）は #1679 により production path から完全に撤去され、この canonical repository resolution はそれとは独立した唯一の fail-closed 安全境界として残る。
 
