@@ -7,7 +7,7 @@ description: ユーザーの要求を Terminal AI Agent が再現可能に作業
 
 ユーザーの要求を分析し、Terminal AI Agent が安全・再現可能に着手できる GitHub Issue を生成するスキル。
 
-## Procedure
+## Procedure（手順）
 
 ### 0. テンプレートを読み込む（Issue Template Guard）
 
@@ -31,7 +31,7 @@ description: ユーザーの要求を Terminal AI Agent が再現可能に作業
 - **タイトル prefix と AC の性質のセルフチェック**: `research` / `調査` を名乗る Issue に `src/` や `tests/` の実装変更が AC として入っていないか確認する。入っている場合は `implementation` / `実装` に切り替えるか、Scope を分割して別 Issue にする
 - 不確実性が残る場合は `phase/research` / `state/needs-human` ラベルの付与要否を先に決める。implementation に昇格できる場合は `docs/dev/workflow.md` の implementation issue canonical contract を正本とし、`実装:` prefix + `phase/implementation` の consumer ready contract に沿って起票する（`state/queued` は deprecated のため付与しない）
 
-#### desired destination handoff guard
+#### desired destination handoff guard（委譲先ガード）
 
 orchestrator（`issue-refinement-loop` / `post-merge-cleanup` 等）から follow-up 候補を受ける場合:
 
@@ -133,15 +133,15 @@ AC は検証可能な記述にし、実装か調査かを自分で確認する�
 - **決定論的判定**: `grep` / `rg` の exit code、`diff` の exit code、`pnpm test` の exit code、`test -f` / `test -d`、ファイルサイズ・行数の数値比較
 - **意味的評価は VC に書かない**: 「コード品質の正当性」「算出値の妥当性」等は PR レビュアーの責務
 
-#### Issue Template Guard（fail-closed）
+#### Issue Template Guard（テンプレート検証、fail-closed）
 
 本文ドラフト完成後、ステップ 0 の必須セクション一覧と照合する。不足セクションがあれば `[Issue Template Guard] Missing sections: <セクション名一覧>` を出力して Issue 生成を中断する。Stop Conditions セクションが空欄・1 項目のみの場合も不完全とみなす。
 
-#### Machine-Readable Contract Guard（fail-closed）
+#### Machine-Readable Contract Guard（契約検証、fail-closed）
 
 `## Machine-Readable Contract` がない、または issue kind ごとの required key が欠ける場合は `[Issue Template Guard] Machine-Readable Contract keys are incomplete` を出力して中断する。
 
-#### Required Skills Guard（fail-closed）
+#### Required Skills Guard（必須スキル検証、fail-closed）
 
 `## Required Skills` を書いた場合、各 bullet を以下の順で分類し、1 つでも違反があれば中断する:
 
@@ -179,31 +179,32 @@ gh issue list --search "<file_path> is:open" --state open --json number,title,ur
   ```
   gh issue view <N> --json body | uv run python3 -c "import json,sys; b=json.load(sys.stdin)['body']; print('found' if '<file_path>' in b else 'not found')"
   ```
-- literal 含有ありで scope 重複あり → 即座に停止し 3 択を提示
-- scope 重複なし → 重複なし旨を人間確認事項に添えて次へ
+- literal 含有ありで scope 重複あり → 3 択（分割/依存明記/統合）を Issue コメントまたは起票時の本文注記として提示した上で起票を継続する（#1860 Owner Decision: declared Allowed Paths の文字列重複は起票停止理由にしない。実 Git conflict は worktree/PR 作成時に別途検出される）
+- scope 重複なし → 重複なし旨を記録して次へ
 
 上記の gh ベース手動チェックに加え、title keyword search だけに依存しない決定論的判定として overlap preflight helper `.claude/skills/create-issue/scripts/check_issue_overlap.py` を使う。
 
-実行例:
+実行例（#1869 fix_delta P0-3: canonical invocation から `--fail-on-unsafe` を除去。全 decision が advisory であるため、shell 側を hard-fail させるフラグを canonical command に含めない）:
 
 ```bash
 uv run --locked python3 .claude/skills/create-issue/scripts/check_issue_overlap.py \
   --repo <owner/repo> --title "<起票予定 title>" \
   --goal "<goal_ref>" --allowed-paths-file <paths.txt> \
-  [--label <l> ...] [--parent-ref <#N> ...] [--depends-on <#N> ...] \
-  --fail-on-unsafe
+  [--label <l> ...] [--parent-ref <#N> ...] [--depends-on <#N> ...]
 ```
 
-helper は `ISSUE_OVERLAP_PREFLIGHT_RESULT_V1`（`decision` / `reason_code` / `policy_class` / `source_status` / `candidates[].matched_fields` / `comment_template`）を返す。`decision` 別の停止条件:
+`--fail-on-unsafe` フラグ自体はスクリプトに残すが（他の呼び出し元の後方互換性のため）、本 SKILL.md の canonical invocation では使用しない。`set -euo pipefail` 下で本コマンドを実行しても、`overlap_requires_comment` / `ambiguous_requires_human` / `duplicate` の decision でシェルが中断しない。
+
+helper は `ISSUE_OVERLAP_PREFLIGHT_RESULT_V1`（`decision` / `reason_code` / `policy_class` / `source_status` / `candidates[].matched_fields` / `comment_template`）を返す。`decision` 別の対応（#1860 Owner Decision により全 decision advisory。完全一致タイトルの exact dedupe のみ実質的な採否判断に使う）:
 
 - `safe_new_issue` → 起票続行。
 - `overlap_requires_comment`（C1/C2a）→ `comment_template` を新規 Issue に記録して起票。
-- `ambiguous_requires_human`（C2b/C3 / source degraded）→ **停止して人間判断**（`--fail-on-unsafe` 時は exit 3）。
-- `duplicate` → 起票中止し既存 Issue へ統合。
+- `ambiguous_requires_human`（C2b/C3 / source degraded）→ warning として記録し起票を継続する。完全一致タイトルの既存 OPEN Issue を実際に発見した場合のみ、それを再利用しリンクする（重複起票を避ける）。
+- `duplicate` → 完全一致または明確な重複と判断できる場合は既存 Issue を再利用しリンクする。断定できない場合は warning として記録し起票を継続する（統合要否は人間へ提案するに留め、起票自体は止めない）。
 
-GitHub source（search / read-back）失敗・partial・saturation は `ambiguous_requires_human` に倒れる（fail-closed。`safe_new_issue` の false green を作らない）。証跡として helper の JSON 出力（`ISSUE_OVERLAP_PREFLIGHT_RESULT_V1`）を Issue comment または PR 本文に残す。
+GitHub source（search / read-back）失敗・partial・saturation は `ambiguous_requires_human` として記録されるが、起票を止めない（#1860 Owner Decision: 検索失敗・saturation は起票停止理由にしない）。証跡として helper の JSON 出力（`ISSUE_OVERLAP_PREFLIGHT_RESULT_V1`）を Issue comment または PR 本文に残す。
 
-本 helper は preflight advisory であり、現時点で `create_issue_txn.py` の mutation hard gate には未配線（hard gate 化は follow-up issue）。child overlap は fixture-only であり #946 の child materialization gate ではない。
+本 helper は preflight advisory であり、`create_issue_txn.py` の mutation hard gate には配線しない。child overlap は fixture-only であり #946 の child materialization gate ではない。
 
 #### 同一 Allowed Paths への複数 Issue 集約ガイドライン（マージコンフリクト回避）
 
@@ -230,7 +231,7 @@ validator が exit 0 を返した後、人間承認なしで即座に `.claude/s
 
 helper は `--title` / `--body-file` / `--label` / `--parent-issue` / `--dependency` を受け取り、labels / sub-issue / dependency の read-back を同一 transaction で実施する。
 
-**post-create ready tuple validation（implementation issue のみ）**:
+**post-create ready tuple validation（起票後の状態検証、implementation issue のみ）**:
 
 `create_issue_txn.py` 実行後、implementation issue の場合は GitHub 上の最終状態を read-back して ready tuple を検証する。pre-create の body 検証と異なり、GitHub に実際に付与された title / labels を確認する。
 
@@ -281,7 +282,7 @@ gh issue comment "$CREATED_ISSUE_NUMBER" --repo "$REPO" \
 
 `create_issue_txn.py` 実行後（および post-create ready tuple validation 通過後）、起票した Issue URL（`issue_url`）を Output として提示する。
 
-### 4a. Delivery-rollup parent の child materialization（`CHILD_MATERIALIZATION_PLAN_V2` 経由）
+### 4a. Delivery-rollup parent の child materialization（子 Issue 生成、`CHILD_MATERIALIZATION_PLAN_V2` 経由）
 
 `delivery-rollup` parent が持つ child issue を起票する場合、`plan_child_materialization.py` が生成した `CHILD_MATERIALIZATION_PLAN_V2` を入口として使う。LLM が parent body 全体を都度読む必要をなくし、トークン消費を抑えるための標準フロー。
 
@@ -331,7 +332,7 @@ uv run --locked python3 .claude/skills/create-issue/scripts/materialize_child_is
 
 設計境界の詳細は `docs/dev/agent-skill-boundaries.md` の「child materialization executor」を参照。
 
-## Output
+## Output（出力）
 
 1. **Issue タイトル**: `<type>(<scope>): <description>` 形式で 1 案を決定（ユーザーへの選択肢提示は不要）
 2. **Issue 本文案**: ステップ 3 の項目を含む完全な本文
@@ -490,7 +491,7 @@ uv run --locked python3 .claude/skills/create-issue/scripts/create_issue_txn.py 
 script 正本経由のみで復旧すること（audit trail・idempotency の保証のため）。
 `gh api` 直接 mutation も同様に禁止する。
 
-## Guardrails
+## Guardrails（安全境界）
 
 - 曖昧な要件を推測で埋めて Issue を確定させない
 - `1 Issue = 1 PR` を超える Scope の Issue を単独で作成しない。黙って広げず、分割案を提示してから人間に確認する
@@ -503,7 +504,7 @@ script 正本経由のみで復旧すること（audit trail・idempotency の�
 - **inline `gh` / `jq` / `grep` / `awk` / heredoc 使用禁止**: anchor preflight での inline bash パイプラインは使用しない
 - **スクリプトは配列形式の `git grep` のみ実行**: `eval` 禁止、入力 anchor は `^[A-Za-z0-9._/: #-]+$` で validation 済み
 
-## Related
+## Related（関連資料）
 
 - [`references/body-authoring.md`](references/body-authoring.md) — 本文編集の共通参照（schema 定義・VC 作成ガイダンス・Anchor Verification・Blocker 検出）
 - `.claude/skills/review-issue/SKILL.md` — Issue 品質レビュー

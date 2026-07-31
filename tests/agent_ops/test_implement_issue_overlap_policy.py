@@ -1,10 +1,11 @@
 """AC1-AC4: `implement-issue` SKILL.md Section 2 が contract-aware overlap
 preflight を正本として routing することを検証するドキュメントテスト（#1452、
-PR #1455 レビュー修正版）。
+PR #1455 レビュー修正版。#1869 で #1860 Owner Decision に沿って advisory へ改訂）。
 
-Section 2 は Allowed Paths の literal 一致だけで人間判断へ停止せず、
+Section 2 は Allowed Paths の literal 一致だけで実装を停止せず、
 `check_implementation_overlap.py` の `IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1`
-route を消費して continue / fail-closed を決定論的に分岐する。
+route を消費して evidence を記録した上で常に継続する（#1860 Owner Decision:
+semantic overlap は advisory diagnostic であり blocking authority を持たない）。
 
 AC1-AC4 は SKILL.md の文言存在確認だけでなく、`check_implementation_overlap.py`
 を実際の subprocess 経路で実行し、記述された route 挙動が実装と一致することを
@@ -165,15 +166,16 @@ def test_given_missing_allowed_paths_when_described_then_candidate_is_excluded_w
     assert "collision classifier" in content
 
 
-def test_given_fail_closed_routes_when_described_then_ambiguous_and_duplicate_route_to_human() -> None:
-    """AC3: `ambiguous_requires_human`（`human_review_required` /
-    `wait_for_predecessor`）と `duplicate` が fail-closed で
-    人間判断へ route されることを示す。実行経路でも missing-field candidate が
-    human_review_required に fail-closed で倒れることを確認する。
+def test_given_advisory_routes_when_described_then_ambiguous_and_duplicate_route_to_warning() -> None:
+    """#1860 Owner Decision (AC3 相当、旧 fail-closed から advisory へ改訂):
+    `ambiguous_requires_human`（`human_review_required` / `wait_for_predecessor`）
+    と `duplicate` は warning として evidence に記録され、実装開始を停止しない
+    ことを示す。実行経路でも missing-field candidate が human_review_required
+    route を返すが、exit code は 0 で継続することを確認する。
     """
     content = _skill_text()
-    assert "fail-closed" in content
-    assert "人間判断へ停止" in content
+    assert "advisory" in content
+    assert "実装開始を止めない" in content or "実装を継続する" in content
     for route in ("wait_for_predecessor", "human_review_required", "duplicate", "runtime_error"):
         assert route in content
 
@@ -186,15 +188,16 @@ def test_given_fail_closed_routes_when_described_then_ambiguous_and_duplicate_ro
     assert exit_code == 0
 
 
-def test_given_candidate_contract_readback_when_described_then_merge_pr_is_not_proposed_before_readback() -> None:
-    """AC4: candidate contract の Outcome/In Scope/Out of Scope/Delivery Rule を
-    readback 前に統合 PR を提案しないことを明記する。実行経路でも同一
-    Allowed Paths だが disjoint な body の candidate（duplicate 候補）が
-    readback 確認を経て初めて duplicate/proceed のいずれかへ倒れることを確認する。
+def test_given_candidate_contract_readback_when_described_then_route_reflects_readback_completeness() -> None:
+    """AC4（#1860 Owner Decision で advisory 化後も維持する部分）: candidate
+    contract の Outcome/In Scope の readback が完了しているかどうかで route
+    （`proceed_with_collision_evidence` か `human_review_required` か）が
+    決まることを明記する。readback が不完全でも実装自体は継続する（warning）。
+    実行経路でも同一 Allowed Paths だが disjoint な body の candidate が
+    readback 確認を経て `proceed_with_collision_evidence` になることを確認する。
     """
     content = _skill_text()
     assert "readback" in content
-    assert "統合 PR を提案してはならない" in content
     for heading in ("Outcome", "In Scope"):
         assert heading in content
     assert "same_path_set" in content
@@ -295,6 +298,8 @@ def test_given_verified_native_successor_when_described_then_evidence_route_is_n
         "current_native_blocking",
         "candidate_native_blocked_by",
         "contract-only/legacy-only",
-        "Not controlled",
     ):
         assert phrase in content
+    # #1860 Owner Decision: open-pr no longer re-requires overlap evidence as a
+    # blocking input; it is advisory telemetry recorded in the PR body only.
+    assert "required input として検証しない" in content

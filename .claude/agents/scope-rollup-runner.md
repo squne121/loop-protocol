@@ -1,6 +1,6 @@
 ---
 name: scope-rollup-runner
-description: impl-review-loop preparation Step 2.5 の scope rollup preflight を決定論的に実行し、ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 marker を stdout に返す専用 SubAgent。read-only 実行のみ許可（GitHub / repo への書き込み禁止）。
+description: 手動 advisory diagnostic として on-demand 起動する scope rollup preflight 専用 SubAgent（#1869 fix_delta P1-1: impl-review-loop の automatic dispatch からは外れている）。ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 marker を stdout に返す。read-only 実行のみ許可（GitHub / repo への書き込み禁止）。
 tools:
   - Read
   - Grep
@@ -19,7 +19,10 @@ permissionMode: auto
 
 ## 目的
 
-`impl-review-loop` preparation の Step 2.5 で呼び出され、`plan_issue_scope_rollup.py` を実行して `ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1` marker を stdout に出力する。
+**#1869 fix_delta P1-1: 本 SubAgent は `impl-review-loop` の automatic dispatch からは外れている。**
+人間または orchestrator が同一 Allowed Paths / 同一 skill family の統合候補を確認したい場合に
+明示的に手動起動する advisory diagnostic として存在する。起動されると `plan_issue_scope_rollup.py`
+を実行して `ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1` marker を stdout に出力する。
 この最終応答は `SubagentStop` hook が `last_assistant_message` から deterministic capture する control-plane artifact でもある。
 
 GitHub への書き込み / repo への書き込みは一切行わない。read-only 実行のみ。

@@ -669,15 +669,28 @@ def build_intake_capsule(
     repo: str = _DEFAULT_REPO,
     ensure_contract_snapshot_result: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], int]:
+    # #1869 fix_delta P0-4: `errors` is split into `fatal_errors` (blocks
+    # intake / forces exit 1 — reserved for live Issue not accessible,
+    # target identity unresolvable, or local worktree state unreadable) and
+    # `warnings` (comment/snapshot/body-fingerprint fetch failures — these
+    # never force a non-zero exit; they are advisory diagnostics only).
     command_log: list[dict[str, Any]] = []
-    errors: list[str] = []
+    fatal_errors: list[str] = []
     warnings: list[str] = []
 
+    # _collect_issue_metadata errors mean the live Issue itself could not be
+    # read (gh_issue_view_failed / gh_issue_view_invalid_json) -- this is a
+    # genuine "live Issue not accessible" fatal condition, not a semantic
+    # planning/artifact issue.
     issue_meta, issue_errors = _collect_issue_metadata(issue_number, repo, command_log)
-    errors.extend(issue_errors)
+    fatal_errors.extend(issue_errors)
 
+    # _collect_repo_state errors mean `git status` itself failed, so worktree
+    # cleanliness/root-checkout cannot be determined at all -- fail closed
+    # (this is the "root checkout / dirty worktree" safety-boundary case,
+    # not a semantic planning/contract artifact case).
     repo_state, repo_errors = _collect_repo_state(command_log)
-    errors.extend(repo_errors)
+    fatal_errors.extend(repo_errors)
 
     if "error" in issue_meta:
         capsule = {
@@ -686,7 +699,8 @@ def build_intake_capsule(
             "generated_at": _now_utc(),
             "issue_number": issue_number,
             "repo": repo,
-            "errors": errors,
+            "fatal_errors": fatal_errors,
+            "errors": fatal_errors,  # backward-compat alias (deprecated)
             "warnings": warnings,
         }
         artifact = {
@@ -712,7 +726,10 @@ def build_intake_capsule(
                 Path(ensure_contract_snapshot_result).read_text(encoding="utf-8")
             )
         except (OSError, json.JSONDecodeError) as exc:
-            errors.append("ensure_contract_snapshot_result_parse_error")
+            # Advisory: snapshot fetch/parse failure is a warning, not fatal
+            # (#1869 fix_delta P0-4 -- contract snapshot artifacts never
+            # block intake).
+            warnings.append("ensure_contract_snapshot_result_parse_error")
             contract_snapshot = {
                 "normalized_status": "runtime_error",
                 "upstream_schema": "none",
@@ -731,7 +748,10 @@ def build_intake_capsule(
         comments, comment_counts, comment_errors = _collect_issue_comments(issue_number, repo, command_log)
         comments_for_digest = comments
         parse_warning_counts.update(comment_counts)
-        errors.extend(comment_errors)
+        # Advisory: comment fetch failure is a warning, not fatal (#1869
+        # fix_delta P0-4 -- comment/snapshot/body fingerprint fetch failures
+        # never force intake to a non-zero exit).
+        warnings.extend(comment_errors)
         contract_snapshot, evidence_complete = _normalize_contract_snapshot_live(
             issue_meta["issue_url"],
             issue_meta["body"],
@@ -761,10 +781,10 @@ def build_intake_capsule(
         "comments_digest": None,
         "commands": command_log,
         "parse_warnings": parse_warning_counts,
-        "evidence_complete": evidence_complete and not errors,
+        "evidence_complete": evidence_complete and not fatal_errors and "comments_fetch_error" not in warnings,
     }
 
-    if not ensure_contract_snapshot_result and "comments_fetch_error" not in errors:
+    if not ensure_contract_snapshot_result and "comments_fetch_error" not in warnings:
         comment_digest_material = json.dumps(
             [
                 {
@@ -782,7 +802,7 @@ def build_intake_capsule(
 
     next_action = {
         "route": _next_action_route(issue_meta["ready_tuple"]["status"], contract_snapshot),
-        "reason_codes": warnings + errors,
+        "reason_codes": warnings + fatal_errors,
     }
 
     capsule = {
@@ -807,7 +827,8 @@ def build_intake_capsule(
         },
         "next_action": next_action,
         "warnings": warnings,
-        "errors": errors,
+        "fatal_errors": fatal_errors,
+        "errors": fatal_errors,  # backward-compat alias (deprecated)
     }
 
     artifact_payload = {
@@ -832,10 +853,14 @@ def build_intake_capsule(
         "agent_runtime": capsule["agent_runtime"],
         "next_action": next_action,
         "warnings": warnings,
-        "errors": errors,
+        "fatal_errors": fatal_errors,
+        "errors": fatal_errors,  # backward-compat alias (deprecated)
     }
 
-    exit_code = 0 if not errors else 1
+    # #1869 fix_delta P0-4: exit code depends ONLY on fatal_errors (live
+    # Issue not accessible / repo state unreadable). Comment/snapshot/body
+    # fingerprint fetch failures live in `warnings` and never force exit 1.
+    exit_code = 0 if not fatal_errors else 1
     return capsule, artifact_payload, exit_code
 
 

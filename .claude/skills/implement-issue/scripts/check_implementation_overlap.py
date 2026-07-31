@@ -43,12 +43,15 @@ normalization）を正本として再利用し、それ自体の scoring / schem
   schema）を検証し、一件でも欠ければ `human_review_required` に倒す
   （Major 5）。
 
-## exit code 契約（AC7 改訂、Major 2）
+## exit code 契約（#1869 fix_delta P0-3: runtime_error も advisory=exit 0）
 
-分類処理が成功した場合（`route` が closed set のいずれかに決定できた場合）は
-**すべての route で exit 0** を返す。route の正本は常に JSON 出力の
-`route` フィールドである（`$?` を継続判定に使わない）。GitHub 取得失敗 /
-JSON・schema 破損時のみ非 0（exit 1、`runtime_error`）を返す。
+**すべての route（`runtime_error` を含む）で exit 0** を返す。route の正本は
+常に JSON 出力の `route` フィールドである（`$?` を継続判定に使わない）。
+GitHub 取得失敗 / JSON・schema 破損は `runtime_error` として evidence に
+記録されるが、advisory diagnostic であり呼び出し側シェルスクリプトの
+`set -euo pipefail` 実行を中断させてはならない（#1860 Owner Decision:
+OPEN Issue 全件収集の失敗は hard stop ではない）。CLI 引数エラー
+（`argparse` の使用方法誤り）のみ argparse 既定の exit 2 のままとする。
 
 | route                            | exit |
 |-----------------------------------|------|
@@ -57,7 +60,7 @@ JSON・schema 破損時のみ非 0（exit 1、`runtime_error`）を返す。
 | wait_for_predecessor（C2b）        | 0    |
 | human_review_required             | 0    |
 | duplicate                         | 0    |
-| runtime_error                     | 1    |
+| runtime_error                     | 0    |
 """
 
 from __future__ import annotations
@@ -142,7 +145,11 @@ ROUTES: frozenset = frozenset(
 # JSON 出力の `route` フィールドが canonical であり、呼び出し側は $? を
 # continue/stop の分岐条件に使ってはならない。
 EXIT_OK = 0
-EXIT_RUNTIME_ERROR = 1
+# #1869 fix_delta P0-3: runtime_error is an advisory diagnostic, not a hard
+# stop. It must not abort a `set -euo pipefail` caller shell script, so it
+# now exits 0 (same as every other closed-set route). The route field in
+# the JSON payload remains the single source of truth for callers.
+EXIT_RUNTIME_ERROR = 0
 
 _HEADING_OVERLAP_THRESHOLD = 0.5
 
