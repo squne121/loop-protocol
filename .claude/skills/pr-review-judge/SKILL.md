@@ -1,6 +1,6 @@
 ---
 name: pr-review-judge
-description: implementation child issue に紐づく PR をレビューし、linked issue の contract と PR diff / 証跡を照合して APPROVE / REQUEST_CHANGES を判定する。verdict の GitHub 投稿は生の `gh pr review` を呼ばず、controlled review publisher（`pr_review.publish` command id、Issue #1536 Option C）へ委譲する。self-authored PR でも常に `event: COMMENT`。
+description: implementation child issue に紐づく PR をレビューし、linked issue の contract と PR diff / 証跡を照合して APPROVE / REQUEST_CHANGES / HUMAN_REVIEW_REQUIRED を判定する。verdict は `verdict` / `reviewed_head_sha` / `blockers` / `warnings` の最小 convention で呼び出し元へ返す（Issue #1873）。verdict コメントの GitHub 投稿は生の `gh pr review` を呼ばず、control-plane が通常の `gh pr comment --body-file` で行う。self-authored PR でも常に `event: COMMENT`。
 ---
 
 # PR Review Judge（PRレビュー判定）
@@ -14,7 +14,7 @@ description: implementation child issue に紐づく PR をレビューし、lin
 
 ### 0) Self-authored PR ガード
 
-`PR author == 実行アカウント` の場合でも、投稿は常に controlled review publisher 経由・`event: COMMENT` 固定（`--approve` / `--request-changes` を意味する event は生成しない）。
+`PR author == 実行アカウント` の場合でも、投稿は常に通常の `gh pr comment --body-file`・`event: COMMENT` 相当固定（`--approve` / `--request-changes` を意味する formal review event は生成しない。専用 semantic publisher は使用しない。詳細は「6) verdict 投稿」参照）。
 
 ### 1) Linked Issue を特定
 
@@ -26,11 +26,20 @@ description: implementation child issue に紐づく PR をレビューし、lin
 
 **Issue #1856（evidence authority cutover, Phase 1）**: `gh pr view --json mergeable,mergeStateStatus` を authoritative source として直接利用する（TEST_VERDICT_MACHINE の有無に依存しない）。BEHIND ルーティングは `merge_state_status == "BEHIND"` のみで判定し、`route_loop_verdict_v2()` は TEST_VERDICT の `branch_behind_main` を参照しない。
 
-判定:
+判定（review criteria 自体は変更しない。Issue #1873 で変わるのは transport のみ）:
 
-- `CONFLICTING` / `DIRTY` / `BLOCKED` / `UNKNOWN(継続)` → `REQUEST_CHANGES`
-- `BEHIND` は衝突 blocker とせず、後続 `required_auto_actions.kind: update_branch` を検討
-- `MERGEABLE` で `CLEAN|UNSTABLE|BEHIND` → 次ステップ
+- `mergeable == CONFLICTING` または `merge_state_status == DIRTY` → actual conflict。reviewer の verdict に
+  関係なく `route_loop_verdict_v2()` が conflict hard stop する（#1860 Owner Decision）。reviewer 自身は
+  この状態でも通常どおり判定してよい（reviewer の verdict は routing の入力の一つに過ぎず、conflict
+  hard stop は live mergeability から独立に決まる）
+- `BLOCKED` / `UNSTABLE` / `DRAFT` / `UNKNOWN` は Git conflict ではなく、reviewer が単独でこれらを理由に
+  `REQUEST_CHANGES` にする必要はない（#1860 Owner Decision / PR #1871 P0-3）。required checks・branch
+  protection の未充足自体は current-head required-CI evaluator（4) 参照）が独立に評価する
+- `BEHIND` は衝突 blocker としない。`BEHIND` の update_branch 対応は reviewer が
+  自己申告せず、control-plane が live mergeability から
+  直接検出して `route_loop_verdict_v2()` で `update_branch` action を合成する（`step-5-mergeability-handling.md` 参照）
+- `MERGEABLE` で `CLEAN`/`HAS_HOOKS`/`UNSTABLE`/`BLOCKED`/`BEHIND` → 次ステップ（PR review 自体の
+  APPROVE/REQUEST_CHANGES 判定は AC/evidence 品質で決める。mergeability だけを理由に判定を変えない）
 
 ### 3) VC 証拠ポリシー（PR_REVIEW_JUDGE_VC_EVIDENCE_POLICY）
 
@@ -131,103 +140,93 @@ provider 呼び出し・fan-out・grounding evidence 検証を含む差分）ま
   一次情報源として使う。
 - 2 名の判定が食い違う場合は `REQUEST_CHANGES` を優先する（fail-closed）。
 - clean-room 制約（raw transcript 非共有）の遵守は verdict コメント内に
-  明記し、`producer_role` / `allowed_paths_gate` ブロックと同様に
-  merge-blocking な監査証跡として扱う。
+  明記し、merge-blocking な監査証跡として扱う。
 
 ### 5) verdict 決定
 
 - blocker あり → `REQUEST_CHANGES`
 - blocker なし → `APPROVE`
 
-`required_auto_actions` を機械的に決定（`mechanical: true` のみ）。
-意味論的不足（`mechanical: false`）は常に `blockers` 側へ残す。
+Issue #1873 以降、機械的に対応可能な不備（`Closes` 不足、PR body hygiene 欠陥等）を
+`required_auto_actions` という専用構造化フィールドで自己申告しない。これらは具体的な内容を
+`blockers[]` に記載した上で `REQUEST_CHANGES` を返す（`references/required-auto-actions.md` 参照）。
+`BEHIND` の update_branch 対応も reviewer が申告せず、control-plane が live mergeability から
+直接検出する。
 
-- `Closes` 不足時は `ensure_closing_keyword`
-- PR body hygiene 欠陥時は `update_pr_body_hygiene`
-- `BEHIND` + `MERGEABLE` 時は `update_branch`
-- `Safety Claim Matrix` と `Schema Consumer Inventory` の欠落は `mechanical: false` の blocker として扱う。
+`Safety Claim Matrix` と `Schema Consumer Inventory` の欠落は blocker として扱う。
 
-`merge_ready` は `verdict == APPROVE` かつ blockers なし かつ required_auto_actions 空 かつ mergeability が CLEAN/UNSTABLE であるときのみ true。
+mergeability（`mergeable` / `merge_state_status`）は verdict に含めない。control-plane が
+`gh pr view` で直接取得し、`route_loop_verdict_v2()` の判定に使う。`verdict == APPROVE` は
+reviewer 側の判定であり、実際にループを終了できるかどうか（旧 `merge_ready` 相当）は
+`route_loop_verdict_v2()` が live mergeability から決定する終端条件である。
 
-- `Draft PR` 自体は blocker ではない。
-ただし `DRAFT` 状態では `merge_ready` が成立していても impl-review-loop は `LOOP_VERDICT_V2.merge_ready` を見て次工程へ進行する。
-merge_ready は impl-review-loop の終端条件。
-
-`required_auto_actions` がある場合は `merge_ready` false。
+- `Draft PR` 自体は blocker ではない。`DRAFT` 状態は `route_loop_verdict_v2()` が
+  `fail_closed`（defer to current-head CI evaluator。人間 escalation は自動で発生しない）として扱い、
+  impl-review-loop はループを終了しない（#1860 Owner Decision / #1873 Delivery Rule: PR は Draft の
+  まま人間の最終マージ判断へ残す設計であり、Draft 自体を human escalation の理由にしない）。
 
 ### 6) verdict 投稿
 
-pr-reviewer（本 SubAgent）は `Edit`/`Write`/`MultiEdit` を持たず、Bash 経由のファイル書き込みも禁止されている（`disallowedTools`）。そのため `PR_REVIEW_PUBLISH_REQUEST_V1` の JSON（`body_sha256` / `idempotency_key` / `producer_role` を含む）を自ら組み立てて `--input-file` に渡すことはできない（Issue #1539 fix_delta Blocker 1）。
+pr-reviewer（本 SubAgent）は `Edit`/`Write`/`MultiEdit` を持たず、Bash 経由のファイル書き込みも禁止されている（`disallowedTools`）。
 
-- pr-reviewer は verdict 本文（`LOOP_VERDICT_V2` フェンス YAML を含む Markdown）と `verdict` / `merge_ready` / `reviewed_head_sha` を構造化出力として **呼び出し元（impl-review-loop control-plane）に返すのみ**。JSON の組み立て・ハッシュ計算・`producer_role` の付与は行わない。
-- 呼び出し元（Write ツールを持つ trusted orchestrator）が、pr-reviewer の返した本文テキストをそのまま `artifacts/<紐づく Issue番号>/issue-metadata/pr_review.publish/<name>.md` に書き込み（本文のみ。ハッシュや schema は含まない）、controlled review publisher を **render mode** で起動する。呼び出しコマンド例:
+- pr-reviewer は verdict 本文（人間可読 Markdown + 最小 YAML ブロック）と `verdict` / `reviewed_head_sha` / `blockers` / `warnings` を構造化出力として **呼び出し元（impl-review-loop control-plane）に返すのみ**。
+- 呼び出し元（Write ツールを持つ trusted orchestrator）が、pr-reviewer の返した本文テキストをそのまま通常の `gh pr comment --body-file` で投稿する（専用 semantic publisher は使用しない）:
 
 ```bash
-uv run --locked python3 scripts/agent-guards/controlled_skill_mutation_exec.py \
-  --command-id pr_review.publish --issue-number <紐づく Issue 番号> \
-  --pr-number <PR番号> --repo <owner>/<repo> \
-  --render-body-file <本文テキストのパス> \
-  --verdict <APPROVE または REQUEST_CHANGES または COMMENT のいずれか> \
-  --reviewed-head-sha <SHA> --expected-head-sha <SHA> \
-  [--merge-ready] --json
+gh pr comment <PR番号> --repo <owner>/<repo> --body-file <本文テキストのパス>
 ```
 
-`--issue-number`（紐づく Issue）と `--pr-number`（レビュー対象の PR）は独立した識別子であり、必ずしも一致しない（例: Issue #1688 に対する PR #1818）。artifact subtree のパス（`artifacts/<Issue番号>/issue-metadata/pr_review.publish/`）は常に `--issue-number` を基準にし、GitHub への投稿先・idempotency key（`repo:pr_number:expected_head_sha:body_sha256`）は常に `--pr-number` を基準にする（Issue #1822）。
-
-- render mode の executor（trusted bridge）は `body_sha256` / `idempotency_key` を自前で再計算し、`producer_role: pr-reviewer` と `event: COMMENT` を自ら固定する（入力からは受け取らない）。本文中の `LOOP_VERDICT_V2.verdict` / `merge_ready` が CLI で宣言した値と一致しない場合は投稿前に fail-closed で拒否する。
-- publisher が `expected_head_sha` を GitHub REST API の `commit_id` へ拘束し、投稿前 stale 検出・投稿後 readback・idempotency marker 判定・投稿後の current-head 再検証（TOCTOU close-out）を行う（詳細: `scripts/agent-guards/controlled_skill_mutation_policy.py` / `_exec.py`）
-- self-authored でも常に `event: COMMENT`（`gh pr review --approve` / `--request-changes` は使わない）
+- 投稿前後に `gh pr view --json headRefOid` で head をリードバックする。投稿後に head が変化していた場合は
+  その投稿を stale note として扱い、fresh review を実行する（Safety Invariants）。
+- self-authored でも常に `event: COMMENT` 相当の通常コメント投稿（`gh pr review --approve` / `--request-changes` は使わない）
 - 生の `gh pr review` を直接呼び出してはならない（root checkout からは `local_main_branch_guard.sh` が `gh_mutation_denied` として拒否する）
-- 従来の `--input-file`（事前構築済み JSON を渡す形）は dry-run/テスト用途として引き続き存在するが、本番の pr-reviewer 経路では使わない。
 
-## Output Contract（出力契約）
+## Output Contract（出力契約、Issue #1873 最小 convention）
 
 最小に必要な fields:
 
-- verdict 値: `verdict: APPROVE | REQUEST_CHANGES`
+- verdict 値: `verdict: APPROVE | REQUEST_CHANGES | HUMAN_REVIEW_REQUIRED`
 - レビュー対象 head: `reviewed_head_sha`
-- merge 可否: `merge_ready`
-- merge 状態: `mergeability.mergeable / merge_state_status`
 - blocker 一覧: `blockers[]`
-- 自動対応一覧: `required_auto_actions[]`（object）
-- 自動修正結果: `auto_fix_applied`
-- follow-up 要求: `follow_up_issue_requests[]`
+- 任意の補足: `warnings[]`
 
-`LOOP_VERDICT_V2` は `snake_case` を厳守し、`recommendations`（camelCase）を出さない。
-
-### required_auto_actions 結果 schema（要点）
-
-- 種別 `kind`: `ensure_closing_keyword` | `update_pr_body_hygiene` | `update_branch`
-- 実行者 `executor`: `implementation-worker`
-- 使用 skill `skill`: `open-pr.update_pr` | `implement-issue.update_branch`
-- `mechanical`: `true` 固定（false の場合は `blockers`）
-- `blocking_merge_ready: true`
-- `expected_head_sha`（`update_branch` の場合のみ必須）
+`merge_ready` / `mergeability` / `required_auto_actions` / `allowed_paths_gate` は出力に含めない
+（新規の同等 schema field も追加しない。AC13）。`recommendations`（camelCase）も出さない。
 
 ### consumer_inventory（消費先一覧）
 
-- `impl-review-loop` が本 `pr-review-judge` の出力を受け取り、`merge_ready` が true かつ blocker が無い場合にループを終了する。
-- `pr-reviewer` は `allowed_paths` / `contract` 監査結果を `LOOP_VERDICT_V2.allowed_paths_gate` として受け渡す。
-- `consumer_inventory` の完全置換は #631/#632 のランタイム挙動完了まで行わない（既存消費者の振る舞いを維持）。
+- `impl-review-loop` が本 `pr-review-judge` の出力（`reviewer_verdict`）を受け取り、
+  control-plane が別途取得した `live_mergeability` と合わせて `route_loop_verdict_v2()` に渡す。
+  `route: approved` の場合にループを終了する。
+- Allowed Paths / contract 監査結果は `LOOP_VERDICT_V2.allowed_paths_gate` という専用フィールド
+  ではなく、`status != ok` の場合に具体的な違反内容を `blockers[]` へ記載する形で受け渡す
+  （`references/allowed-paths-gate.md` 参照）。
 
 ### ALLOWED_PATHS_GATE_RESULT_V1（Allowed Paths 判定結果）
 
 PR review 後に `allowed_paths_review_gate.py` を使って changed files の契約違反を再計算。
+Allowed Paths パターンの canonical source は **live linked issue 本文**（review 実行ごとに `gh issue
+view` で取得）であり、contract snapshot / capsule のコピーは advisory cache に過ぎない。
 snapshot freshness 用の `contract_fingerprint.base_sha_at_snapshot` と、local fallback changed files 算出用の
 `diff_base_sha` は別物として扱う。local fallback の `changed_files_source` は
 `git_diff_current_merge_base_head` で、snapshot base を changed files diff には使わない。
 
-`status` は判定状態として `ok | fail_closed | stale_snapshot | indeterminate` を取る。
+`status` は判定状態として `ok | fail_closed | indeterminate` を取る（fingerprint drift による
+`stale_snapshot` は `status` を占有しない）。
 
-`indeterminate/fail_closed` は merge-blocking 状態として扱う。
+`fail_closed`（path が Allowed Paths 外）と rename provenance を確定できない `indeterminate` は
+merge-blocking 状態として扱う。contract snapshot の fingerprint が live 本文と乖離している場合は
+`warnings[]`（`stale_snapshot: ...`）に advisory として記録するのみで、単独では merge-blocking に
+しない -- live 本文で評価した結果（`ok` / `fail_closed`）が canonical。
 
 changed files source hierarchy は `github_pull_request_files_api_with_previous_filename` を preferred oracle、
 `git_diff_name_status_find_renames_z` を deterministic local fallback とする。
 `gh_pr_diff_name_only` / `git_diff_current_merge_base_head_name_only` は rename provenance では
 insufficient_for_rename_provenance であり、`git_diff_snapshot_base_head` は禁止経路である。
 local fallback は `current_base_sha` と `head_sha` から evaluator 内で `git merge-base` を検証できた場合だけ
-`git_diff_name_status_find_renames_z` を名乗る。`LOOP_VERDICT_V2.allowed_paths_gate` consumer への保証は script output の
-provenance に限り、verdict schema 自体が詳細 provenance を直接 carry するとまでは主張しない。
+`git_diff_name_status_find_renames_z` を名乗る。provenance の保証は script output（`ALLOWED_PATHS_GATE_RESULT_V1`）
+に限り、reviewer_verdict（`blockers[]`/`warnings[]` へのテキスト反映のみ）が詳細 provenance を直接
+carry するとまでは主張しない。
 
 ### リネーム元 provenance（`previous_filename`）監査（Issue #1300）
 
@@ -242,7 +241,7 @@ Allowed Paths 判定対象とする。rename 元・先のどちらかが Allowed
 
 出力上限は `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` を遵守。
 
-`LOOP_VERDICT_V2` の全フィールドは維持。
+最小 convention のフィールド（`verdict` / `reviewed_head_sha` / `blockers` / `warnings`）は全て維持。
 
 ## Reference Loading Map（読取条件）
 
@@ -251,32 +250,30 @@ Allowed Paths 判定対象とする。rename 元・先のどちらかが Allowed
 - `references/ac-evidence-checks.md`: AC coverage、Allowed Paths、runtime evidence、placeholder 判定。
 - `references/schema-consumer-gate.md`: schema_change_applicability と `Schema Consumer Inventory` 判定。
 - `references/safety-claim-gate.md`: safety-sensitive 判定と `Safety Claim Matrix` 要件。
-- `references/loop-verdict-v2-schema.md`: `LOOP_VERDICT_V2` の必須フィールド。
+- `references/loop-verdict-v2-schema.md`: 最小 convention の必須フィールド。
 - `references/allowed-paths-gate.md`: `ALLOWED_PATHS_GATE_RESULT_V1` の再計算手順。
-- `references/required-auto-actions.md`: required_auto_actions の object schema と merge_ready への反映。
+- `references/required-auto-actions.md`: 機械的に対応可能な不備の blockers への反映方針。
 - `references/verdict-output-template.md`: コメントテンプレート。
 - `references/deterministic-gates.md`: G1–G5 の重要 gate。
 
 ## Verdict コメントテンプレート
 
 ````markdown
-## LOOP_VERDICT_V2
+## Verdict: REQUEST_CHANGES
+
+### Mergeability
+- mergeable=<...>, merge_state_status=<...>
+
+### Blockers
+- "<issue summary>"
+
+```yaml
 verdict: REQUEST_CHANGES
 reviewed_head_sha: "<HEAD_SHA>"
-merge_ready: false
-mergeability:
-  mergeable: "<MERGEABLE>"
-  merge_state_status: "<MERGE_STATE_STATUS>"
 blockers:
   - "<issue summary>"
-required_auto_actions:
-  - kind: ensure_closing_keyword
-    executor: implementation-worker
-    skill: open-pr.update_pr
-    blocking_merge_ready: true
-    mechanical: true
-auto_fix_applied: []
-follow_up_issue_requests: []
+warnings: []
+```
 ````
 
 ## Related（関連資料）

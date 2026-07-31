@@ -22,14 +22,14 @@ def test_issue1215_publish_resume_controlled_skill_mutation_allowed(tmp_path):
     guard_dir.mkdir(parents=True, exist_ok=True)
     (guard_dir / "controlled_skill_mutation_exec.py").write_text("print('ok')\n")
 
-    artifact_dir = repo["root"] / "artifacts" / "1215"
+    artifact_dir = repo["root"] / "artifacts" / "1215" / "issue-metadata" / "issue_body.update"
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    (artifact_dir / "termination_report_input.json").write_text("{}\n")
+    (artifact_dir / "issue_body_input.json").write_text("{}\n")
 
     cmd = (
         "uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py"
-        " --command-id termination_report.publish --issue-number 1215"
-        " --input-file artifacts/1215/termination_report_input.json"
+        " --command-id issue_body.update --issue-number 1215"
+        " --input-file artifacts/1215/issue-metadata/issue_body.update/issue_body_input.json"
         " --repo squne121/loop-protocol"
     )
     payload = _bash_payload(cmd, str(repo["worktree"]))

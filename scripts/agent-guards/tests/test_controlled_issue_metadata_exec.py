@@ -206,10 +206,13 @@ class TestEnvBinding:
         err = _exec._check_issue_env_binding(COMMAND_ID_ISSUE_COMMENT_PUBLISH, 1284)
         assert "issue_number_mismatch" in err
 
-    def test_legacy_command_still_mandatory(self, monkeypatch):
-        monkeypatch.delenv("LOOP_ISSUE_NUMBER", raising=False)
-        err = _exec._check_issue_env_binding("termination_report.publish", 1284)
-        assert "loop_issue_number_env_missing" in err
+    def test_env_binding_mandatory_command_ids_is_empty(self):
+        """Issue #1873: termination_report.publish (the only member of
+        ENV_BINDING_MANDATORY_COMMAND_IDS) was removed, so the set is empty
+        and no command id currently requires LOOP_ISSUE_NUMBER."""
+        from controlled_skill_mutation_policy import ENV_BINDING_MANDATORY_COMMAND_IDS
+
+        assert ENV_BINDING_MANDATORY_COMMAND_IDS == frozenset()
 
 
 # =============================================================================

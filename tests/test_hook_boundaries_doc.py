@@ -235,7 +235,6 @@ class TestSettingsManifestAlignment:
 class TestTelemetryHooksClassification:
     TELEMETRY_HOOKS = {
         "session_manifest_coordinator",
-        "save_loop_state_before_compaction",
         "rtk_boundary_shadow_guard",
     }
 

@@ -27,13 +27,13 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _publish_cmd(
-    command_id: str = "termination_report.publish",
+    command_id: str = "issue_body.update",
     issue_number: str = "1166",
     repo: str = "squne121/loop-protocol",
     input_file: str | None = None,
 ) -> str:
     if input_file is None:
-        input_file = f"artifacts/{issue_number}/termination_report_input.json"
+        input_file = f"artifacts/{issue_number}/issue-metadata/{command_id}/issue_body_input.json"
     return (
         "uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py"
         f" --command-id {command_id}"
@@ -113,7 +113,7 @@ class TestAC3ExactExecutorHash:
         cmd = _publish_cmd()
         result = fp.classify(cmd, str(REPO_ROOT), str(REPO_ROOT))
         assert result.classification == fp.CLASS_EXACT_AUTHORIZED
-        assert result.command_id == "termination_report.publish"
+        assert result.command_id == "issue_body.update"
         assert result.policy_hash is not None
         assert len(result.policy_hash) == 16
 
@@ -122,14 +122,14 @@ class TestAC3ExactExecutorHash:
         # appear verbatim in the telemetry payload.
         serialized = repr(telemetry)
         assert cmd not in serialized
-        assert "artifacts/1166/termination_report_input.json" not in serialized
+        assert "artifacts/1166/issue-metadata/issue_body.update/issue_body_input.json" not in serialized
         assert "policy_hash" in telemetry
         assert "command_id" in telemetry
 
         # Secret-like value smuggled via an otherwise-valid-shaped flag value
         # must not leak into telemetry even if the command is misclassified.
         secret_cmd = _publish_cmd(
-            input_file="artifacts/1166/ghp_1234567890ABCDEFsecretvalue.json"
+            input_file="artifacts/1166/issue-metadata/issue_body.update/ghp_1234567890ABCDEFsecretvalue.json"
         )
         secret_result = fp.classify(secret_cmd, str(REPO_ROOT), str(REPO_ROOT))
         secret_serialized = repr(secret_result.to_telemetry_dict())
@@ -149,7 +149,8 @@ class TestAC3ExactExecutorHash:
 
         # Namespace mismatch: input-file does not belong to this issue number.
         namespace_mismatch_cmd = _publish_cmd(
-            issue_number="1166", input_file="artifacts/9999/termination_report_input.json"
+            issue_number="1166",
+            input_file="artifacts/9999/issue-metadata/issue_body.update/issue_body_input.json",
         )
         namespace_result = fp.classify(namespace_mismatch_cmd, str(REPO_ROOT), str(REPO_ROOT))
         assert namespace_result.classification == fp.CLASS_MUTATION_OR_UNKNOWN
@@ -410,25 +411,25 @@ class TestBlocker2InputFilePathTraversal:
         malicious_input_files = [
             # Traversal that escapes the namespace while still matching a
             # naive str.startswith(expected_prefix) check.
-            "artifacts/1166/../../evil.json",
-            "artifacts/1166/../1166/../../etc/passwd",
-            "artifacts/1166/subdir/../../../evil.json",
+            "artifacts/1166/issue-metadata/issue_body.update/../../../evil.json",
+            "artifacts/1166/issue-metadata/issue_body.update/../1166/../../etc/passwd",
+            "artifacts/1166/issue-metadata/issue_body.update/subdir/../../../evil.json",
             # Absolute path.
             "/etc/passwd",
             # Backslash (Windows-style separator smuggling).
-            "artifacts\\1166\\evil.json",
+            "artifacts\\1166\\issue-metadata\\issue_body.update\\evil.json",
             # NUL byte.
-            "artifacts/1166/evil.json\x00.txt",
+            "artifacts/1166/issue-metadata/issue_body.update/evil.json\x00.txt",
             # Leading ./ relative marker.
-            "./artifacts/1166/termination_report_input.json",
+            "./artifacts/1166/issue-metadata/issue_body.update/issue_body_input.json",
             # Bare "." / ".." components.
-            "artifacts/1166/./termination_report_input.json",
-            "artifacts/1166/..",
+            "artifacts/1166/issue-metadata/issue_body.update/./issue_body_input.json",
+            "artifacts/1166/issue-metadata/issue_body.update/..",
             # Stdin marker.
             "-",
             # Nested subdirectory beneath the namespace prefix (not a bare
             # leaf filename).
-            "artifacts/1166/nested/dir/termination_report_input.json",
+            "artifacts/1166/issue-metadata/issue_body.update/nested/dir/issue_body_input.json",
         ]
         for input_file in malicious_input_files:
             cmd = _publish_cmd(input_file=input_file)

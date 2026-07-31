@@ -18,20 +18,18 @@ TERMINATION_MD = Path(__file__).parent.parent / "references" / "termination-poli
 
 
 def test_skill_md_max_iterations_default_is_3():
-    """AC1: SKILL.md の max_iterations 既定値 = 3"""
+    """AC1: SKILL.md の max_iterations 既定値 = 3
+
+    #1873: schemas/loop_state.schema.json was removed along with
+    build_loop_state.py -- decide_next_loop_action.py's own
+    DEFAULT_MAX_ITERATIONS constant (used when loop_state omits
+    max_iterations) is the sole remaining default source; verified by
+    decide_next_loop_action.py's own tests, not a JSON Schema default here.
+    """
     text = SKILL_MD.read_text()
     # Check Inputs section
     assert re.search(r"max_iterations.*既定\s*3", text), \
         "max_iterations default should be 3 in Inputs section"
-    # LOOP_STATE block was moved to schemas/loop_state.schema.json (Issue #795).
-    # Verify that schema file carries the default value.
-    schema_path = SKILL_MD.parent / "schemas" / "loop_state.schema.json"
-    assert schema_path.exists(), "schemas/loop_state.schema.json must exist"
-    import json
-    schema = json.loads(schema_path.read_text())
-    max_iter_prop = schema.get("properties", {}).get("max_iterations", {})
-    assert max_iter_prop.get("default") == 3, \
-        "loop_state.schema.json max_iterations default must be 3"
 
 
 def test_skill_md_loop_iteration_approval_gate_not_required():

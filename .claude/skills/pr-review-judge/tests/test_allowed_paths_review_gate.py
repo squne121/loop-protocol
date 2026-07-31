@@ -275,7 +275,9 @@ class TestAllowedPathsValidation:
         assert result.status == GateStatus.OK.value
 
     @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
-    def test_contract_snapshot_body_sha_change_is_stale(self, mock_get_records):
+    def test_contract_snapshot_body_sha_change_is_advisory_stale_not_blocking(self, mock_get_records):
+        """Issue #1873 / #1860 Owner Decision: fingerprint drift is advisory-only
+        and does not block the gate -- live allowed_paths evaluation is canonical."""
         mock_get_records.return_value = [_record("src/main.ts")]
         expected_fp = make_evaluator(
             contract_body_sha256="old_contract_sha",
@@ -283,11 +285,12 @@ class TestAllowedPathsValidation:
         )
         evaluator = make_evaluator(expected_contract_fingerprint=expected_fp)
         result = evaluator.evaluate()
-        assert result.status == GateStatus.STALE_SNAPSHOT.value
-        mock_get_records.assert_not_called()
+        assert result.status == GateStatus.OK.value
+        assert any("stale_snapshot" in w for w in result.warnings)
+        mock_get_records.assert_called_once()
 
     @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
-    def test_base_sha_at_snapshot_change_is_stale(self, mock_get_records):
+    def test_base_sha_at_snapshot_change_is_advisory_stale_not_blocking(self, mock_get_records):
         mock_get_records.return_value = [_record("src/main.ts")]
         expected_fp = make_evaluator(
             base_sha_at_snapshot="base_at_snapshot",
@@ -298,7 +301,8 @@ class TestAllowedPathsValidation:
             expected_contract_fingerprint=expected_fp,
         )
         result = evaluator.evaluate()
-        assert result.status == GateStatus.STALE_SNAPSHOT.value
+        assert result.status == GateStatus.OK.value
+        assert any("stale_snapshot" in w for w in result.warnings)
 
     @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
     def test_diff_base_sha_does_not_affect_freshness(self, mock_get_records):
@@ -327,22 +331,25 @@ class TestAllowedPathsValidation:
         mock_get_records.assert_not_called()
 
     @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
-    def test_missing_expected_contract_fingerprint_is_indeterminate(self, mock_get_records):
+    def test_missing_expected_contract_fingerprint_is_advisory_not_blocking(self, mock_get_records):
+        """Issue #1873 / #1860 Owner Decision: contract snapshot / fingerprint
+        are advisory telemetry, not a required blocking input for the Allowed
+        Paths gate. Their absence must not indeterminate/block the gate."""
         mock_get_records.return_value = [_record("src/main.ts")]
         evaluator = make_evaluator(expected_contract_fingerprint=None)
         result = evaluator.evaluate()
-        assert result.status == GateStatus.INDETERMINATE.value
-        assert result.reason == "expected_contract_fingerprint_missing (merge-blocking)"
-        mock_get_records.assert_not_called()
+        assert result.status == GateStatus.OK.value
+        assert any("expected_contract_fingerprint_missing" in w for w in result.warnings)
+        mock_get_records.assert_called_once()
 
     @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
-    def test_missing_contract_source_id_is_indeterminate(self, mock_get_records):
+    def test_missing_contract_source_id_is_advisory_not_blocking(self, mock_get_records):
         mock_get_records.return_value = [_record("src/main.ts")]
         evaluator = make_evaluator(contract_source_id="", expected_contract_fingerprint="SELF")
         result = evaluator.evaluate()
-        assert result.status == GateStatus.INDETERMINATE.value
-        assert result.reason == "contract_source_kind/source_id missing (merge-blocking)"
-        mock_get_records.assert_not_called()
+        assert result.status == GateStatus.OK.value
+        assert any("contract_source_kind/source_id_missing" in w for w in result.warnings)
+        mock_get_records.assert_called_once()
 
     @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_file_records")
     def test_invalid_allowed_pattern_is_indeterminate(self, mock_get_records):

@@ -77,7 +77,7 @@
     },
     "anchor_comments": {
       "type": "array",
-      "description": "Pre-validated anchor comment objects (used in --fixture mode). issue_url is required by anchor validation runtime — absence or empty string triggers ANCHOR_NOT_IN_ISSUE blocked. Optional GitHub comment metadata fields (html_url/url/user/author_association/created_at/updated_at) may also be supplied so _build_anchor_comment_state() can normalize a schema-conformant anchor_comment record (loop_state.schema.json#/definitions/anchor_comment) purely from fixture data, without any live gh API call (#1339).",
+      "description": "Pre-validated anchor comment objects (used in --fixture mode). issue_url is required by anchor validation runtime — absence or empty string triggers ANCHOR_NOT_IN_ISSUE blocked. Optional GitHub comment metadata fields (html_url/url/user/author_association/created_at/updated_at) may also be supplied so _build_anchor_comment_state() can normalize a schema-conformant anchor_comment record (anchor_comment.schema.json) purely from fixture data, without any live gh API call (#1339).",
       "items": {
         "type": "object",
         "additionalProperties": false,

@@ -429,30 +429,31 @@ def _canonical_json(obj: Any) -> str:
 # ---------------------------------------------------------------------------
 # ISSUE_EXECUTION_DECISION_V1 (#1677): canonical relation-graph decision.
 #
-# This module is the canonical producer AND the normative semantic validator
-# owner for ISSUE_EXECUTION_DECISION_V1 (schemas/issue_execution_decision_v1.
-# schema.json owns the static/closed shape; validate_issue_execution_decision()
-# below owns the cross-field graph invariants). Other scripts in this skill
-# (run_refinement_preflight.py, build_loop_state.py) import
-# validate_issue_execution_decision from this module rather than
-# re-implementing the invariants, per the #1677 Canonical Contract Freeze.
+# This module is the canonical PRODUCER of ISSUE_EXECUTION_DECISION_V1
+# (schemas/issue_execution_decision_v1.schema.json owns the static/closed
+# shape; validate_issue_execution_decision.py -- the standalone canonical
+# module -- owns the cross-field graph invariants). Other scripts in this
+# skill (run_refinement_preflight.py) import validate_issue_execution_decision
+# from that module rather than re-implementing the invariants, per the #1677
+# Canonical Contract Freeze. #1873: this module no longer self-validates its
+# own output before emitting it (see the build_issue_execution_decision call
+# site below).
 # ---------------------------------------------------------------------------
 
 # PR #1767 owner review (P0-4/AC12 Scope Delta): validate_issue_execution_
-# decision.py is now the standalone canonical module (schema+semantic
-# validator, provenance/migration helpers). plan_refinement_loop.py imports
-# from it rather than defining its own copy, so producer/LOOP_STATE builder/
-# handoff producer/downstream consumer share one authority. Import failure
-# is fail-closed (validate_issue_execution_decision left as None; callers
-# below check for this and refuse to emit an unvalidated decision).
+# decision.py is the standalone canonical module owning the
+# ISSUE_EXECUTION_DECISION_V1 schema-version/downstream-policy constants (and
+# semantic validator, consumed independently by run_refinement_preflight.py).
+# plan_refinement_loop.py imports the shared constants from it rather than
+# defining its own copy. #1873: plan_refinement_loop.py no longer
+# self-validates the decision it builds (see build_issue_execution_decision
+# call site below), so only the constants are imported here.
 try:
     from validate_issue_execution_decision import (
         ISSUE_EXECUTION_DECISION_DOWNSTREAM_POLICY,
         ISSUE_EXECUTION_DECISION_SCHEMA_VERSION,
-        validate_issue_execution_decision,
     )
 except ImportError:  # pragma: no cover - subprocess/CLI fallback path
-    validate_issue_execution_decision = None
     ISSUE_EXECUTION_DECISION_SCHEMA_VERSION = "ISSUE_EXECUTION_DECISION_V1"
     ISSUE_EXECUTION_DECISION_DOWNSTREAM_POLICY = {
         "semantic_reclassification": "forbidden",
@@ -2563,82 +2564,19 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
             plan["scope_signal_guard_decision_v2"] = scope_signal_guard_decision_v2
 
         # #1677: ISSUE_EXECUTION_DECISION_V1 (relation graph, execution state,
-        # downstream_policy). Self-validated via validate_issue_execution_decision
-        # so a malformed derivation never reaches downstream consumers silently.
+        # downstream_policy).
+        #
+        # #1873 (bounded review loops): the self-validation call that used to
+        # sit here (validate_issue_execution_decision() + a re-validated
+        # fallback artifact) was an internal integrity check the orchestrator
+        # ran against its own output before the Replay Arbitration step was
+        # removed. It is no longer required -- downstream consumers
+        # (run_refinement_preflight.py) independently validate
+        # issue_execution_decision via the same canonical
+        # validate_issue_execution_decision module when they consume it.
         issue_execution_decision = build_issue_execution_decision(
             issue_number, issue_body_sha256, generated_at, known_context
         )
-        if validate_issue_execution_decision is None:
-            # #1677 AC12 (PR #1767 owner review, P0-4): a failed import of
-            # the canonical validate_issue_execution_decision module must
-            # fail-closed, not silently skip validation.
-            raise RuntimeError(
-                "validate_issue_execution_decision module import failed; "
-                "refusing to emit an unvalidated issue_execution_decision"
-            )
-        _decision_violations = validate_issue_execution_decision(issue_execution_decision)
-        if _decision_violations:
-            # PR #1767 owner review (P0-3.4): a prior version of this
-            # fallback reused the pre-violation identity/collection_digest
-            # verbatim, so the "self-healed" artifact's digest never matched
-            # its own (now different) nodes/relations/execution/completeness
-            # -- an internally inconsistent artifact. The fallback below
-            # recomputes collection_digest from its own actual content, and
-            # the result is re-validated before being accepted; a producer
-            # bug is never hidden behind an unvalidated "self-repair".
-            _target_body_sha256 = issue_execution_decision["identity"]["target_body_sha256"]
-            _fallback_nodes = [{"issue_number": issue_number, "body_sha256": _target_body_sha256}]
-            _fallback_relations: list[dict[str, Any]] = []
-            _fallback_execution = {
-                "state": "deferred",
-                "target_issue_number": issue_number,
-                "predecessors": [],
-                "defer_reason": (
-                    "issue_execution_decision derivation failed semantic validation: "
-                    + ", ".join(_decision_violations)
-                ),
-            }
-            _fallback_completeness = {
-                "issues_complete": False,
-                "dependencies_complete": False,
-                "unresolved_references": [issue_number],
-            }
-            _fallback_digest = _sha256_prefixed(
-                _canonical_json(
-                    {
-                        "nodes": _fallback_nodes,
-                        "relations": _fallback_relations,
-                        "execution": _fallback_execution,
-                        "completeness": _fallback_completeness,
-                        "downstream_policy": ISSUE_EXECUTION_DECISION_DOWNSTREAM_POLICY,
-                    }
-                )
-            )
-            issue_execution_decision = {
-                "schema_version": ISSUE_EXECUTION_DECISION_SCHEMA_VERSION,
-                "identity": {
-                    "target_issue_number": issue_number,
-                    "target_body_sha256": _target_body_sha256,
-                    "generated_at": generated_at,
-                    "collection_digest": _fallback_digest,
-                },
-                "nodes": _fallback_nodes,
-                "relations": _fallback_relations,
-                "execution": _fallback_execution,
-                "downstream_policy": dict(ISSUE_EXECUTION_DECISION_DOWNSTREAM_POLICY),
-                "completeness": _fallback_completeness,
-            }
-            _fallback_violations = validate_issue_execution_decision(issue_execution_decision)
-            if _fallback_violations:
-                # The fallback itself is not schema/semantically valid (should
-                # not happen given its fixed minimal shape) -- do not emit
-                # any issue_execution_decision at all; propagate as an
-                # internal error so the whole plan fails closed rather than
-                # publishing an inconsistent artifact.
-                raise RuntimeError(
-                    "issue_execution_decision fallback failed re-validation: "
-                    + ", ".join(_fallback_violations)
-                )
         plan["issue_execution_decision"] = issue_execution_decision
 
         return plan, 0

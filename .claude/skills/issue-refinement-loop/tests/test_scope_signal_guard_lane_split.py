@@ -775,71 +775,9 @@ class TestFailClosedSafetyPreserved:
         # the guard evaluation succeeded.
         assert plan["decisions"].get("scope_signal_guard") is None or plan["fail_closed"]["required"]
 
-
-class TestTerminationReportIntegration:
-    """#1090 AC6 (PR #1294 review Blocker 3): the rendered termination report
-    surfaces missing_approval_field and suggested_contract_patch."""
-
-    @pytest.fixture(scope="class")
-    def renderer_module(self):
-        return _load_module("render_termination_report_1090", "render_termination_report.py")
-
-    def test_termination_report_includes_missing_approval_field_and_suggested_patch(
-        self, planner_module, renderer_module
-    ):
-        # End-to-end: planner produces the v2 decision, renderer consumes it.
-        input_data = _base_input(
-            985,
-            _delta_input("- `docs/foo.md`", "- `docs/foo.md`\n- `src/systems/EnemySpawnSystem.ts`"),
-        )
-        plan, exit_code = planner_module.plan_refinement_loop(input_data)
-        assert exit_code == 0
-        decision = plan["scope_signal_guard_decision_v2"]
-        assert decision["route"] == "human_judgment_required"
-
-        result = renderer_module.render(
-            {
-                "termination_reason": "human_escalation",
-                "termination_cause": "human_judgment_required",
-                "issue_number": 985,
-                "iteration": 1,
-                "blockers_summary": [
-                    "scope_signal_guard_triggered",
-                    "scope_signal_guard_reason_code:new_allowed_path_layer",
-                ],
-                "scope_signal_guard_decision_v2": decision,
-            }
-        )
-        assert result["publishable"] is True
-        body = result["body"]
-        assert "scope_signal_guard_route:human_judgment_required" in body
-        assert "missing_approval_field:true" in body
-        assert "ANCHOR_SCOPE_REFRAME" in body  # suggested_contract_patch text
-
-    def test_termination_report_not_polluted_for_proceed_with_notes(self, renderer_module):
-        result = renderer_module.render(
-            {
-                "termination_reason": "human_escalation",
-                "termination_cause": "human_judgment_required",
-                "issue_number": 985,
-                "blockers_summary": ["some_other_blocker"],
-                "scope_signal_guard_decision_v2": {
-                    "route": "proceed_with_notes",
-                    "scope_delta_approval": {
-                        "missing_approval_field": False,
-                        "suggested_contract_patch": None,
-                    },
-                },
-            }
-        )
-        assert result["publishable"] is True
-        assert "scope_signal_guard_route" not in result["body"]
-
-    def test_termination_report_rejects_non_object_decision(self, renderer_module):
-        with pytest.raises(Exception):
-            renderer_module.render(
-                {
-                    "termination_reason": "human_escalation",
-                    "scope_signal_guard_decision_v2": "not-an-object",
-                }
-            )
+# #1873 (bounded review loops): TestTerminationReportIntegration (#1090 AC6)
+# was removed along with render_termination_report.py, which it exercised
+# directly. The planner-side `scope_signal_guard_decision_v2` production
+# tested above this class (plan_issue_scope_rollup.py / scope_signal_delta.py
+# territory, #1869) is unaffected -- only the now-deleted renderer's
+# consumption of that decision was covered here.

@@ -161,6 +161,7 @@ class AllowedPathsGateResult:
     execution_context: Dict[str, Any] = field(default_factory=dict)
     reason: Optional[str] = None
     errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -187,6 +188,7 @@ class AllowedPathsGateResult:
             "execution_context": self.execution_context,
             **({} if self.reason is None else {"reason": self.reason}),
             **({} if not self.errors else {"errors": self.errors}),
+            **({} if not self.warnings else {"warnings": self.warnings}),
         }
 
 
@@ -492,32 +494,39 @@ class AllowedPathsGateEvaluator:
             result.errors.append(result.reason)
             return result
 
+        # contract_source_kind/source_id and expected_contract_fingerprint are
+        # advisory telemetry (Issue #1873 / #1860 Owner Decision): the Allowed
+        # Paths pattern source of truth is the live linked issue body, not the
+        # contract snapshot/fingerprint binding. Their absence is recorded as
+        # a warning and does NOT block the gate -- only an actual Allowed
+        # Paths violation (fail_closed) or unresolved rename provenance
+        # (indeterminate) may block.
         if not self.contract_source_kind or not self.contract_source_id:
-            result.status = GateStatus.INDETERMINATE.value
-            result.reason = "contract_source_kind/source_id missing (merge-blocking)"
-            result.errors.append(result.reason)
-            return result
+            result.warnings.append("contract_source_kind/source_id_missing (advisory)")
 
         if self.expected_contract_fingerprint is None:
-            result.status = GateStatus.INDETERMINATE.value
-            result.reason = "expected_contract_fingerprint_missing (merge-blocking)"
-            result.errors.append(result.reason)
-            return result
+            result.warnings.append("expected_contract_fingerprint_missing (advisory)")
 
         try:
             result.allowed_paths_list = self.canonicalize_allowed_paths()
-            result.contract_fingerprint = self.compute_contract_fingerprint()
+            if self.expected_contract_fingerprint is not None:
+                result.contract_fingerprint = self.compute_contract_fingerprint()
         except Exception as exc:
             result.status = GateStatus.INDETERMINATE.value
             result.reason = f"Failed to compute contract fingerprint: {exc}"
             result.errors.append(result.reason)
             return result
 
-        if self.expected_contract_fingerprint != result.contract_fingerprint:
-            result.status = GateStatus.STALE_SNAPSHOT.value
-            result.reason = "contract fingerprint diverged from snapshot (stale_snapshot, merge-blocking)"
-            result.errors.append(result.reason)
-            return result
+        if (
+            self.expected_contract_fingerprint is not None
+            and self.expected_contract_fingerprint != result.contract_fingerprint
+        ):
+            # Advisory only: fingerprint drift does not block. Re-evaluate
+            # against the live allowed_paths (already canonicalized above)
+            # and record the drift for audit purposes.
+            result.warnings.append(
+                "stale_snapshot: contract fingerprint diverged from live allowed_paths (advisory, non-blocking)"
+            )
 
         try:
             validated_diff_base_sha = self.validate_diff_base_sha()
@@ -554,7 +563,7 @@ class AllowedPathsGateEvaluator:
         # Allowed Paths determination (see audited_paths / build_audited_paths).
         result.changed_files = list(dict.fromkeys(record.path for record in changed_file_records))
         result.changed_files_count = len(result.changed_files)
-        result.allowed_paths_source = "linked_issue_contract_snapshot"
+        result.allowed_paths_source = "live_linked_issue_body"
 
         try:
             result.execution_context = ExecutionContext(
@@ -595,8 +604,8 @@ def main() -> None:
     parser.add_argument("--base-ref", required=True, help="Base branch name (e.g., main)")
     parser.add_argument(
         "--base-sha-at-snapshot",
-        required=True,
-        help="Snapshot freshness binding SHA from the linked issue contract",
+        default="",
+        help="Advisory: snapshot freshness SHA from the linked issue contract (optional, non-canonical)",
     )
     parser.add_argument(
         "--current-base-sha",
@@ -615,14 +624,14 @@ def main() -> None:
         required=True,
         help="JSON array of allowed paths from issue contract",
     )
-    parser.add_argument("--contract-body-sha256", required=True, help="SHA256 of issue contract body")
-    parser.add_argument("--contract-source-kind", required=True, help="Contract source kind")
-    parser.add_argument("--contract-source-id", required=True, help="Contract source identifier")
+    parser.add_argument("--contract-body-sha256", default="", help="Advisory: SHA256 of issue contract body (optional)")
+    parser.add_argument("--contract-source-kind", default=None, help="Advisory: contract source kind (optional)")
+    parser.add_argument("--contract-source-id", default=None, help="Advisory: contract source identifier (optional)")
     parser.add_argument(
         "--expected-contract-fingerprint",
         type=json.loads,
-        required=True,
-        help="JSON object captured at snapshot time"
+        default=None,
+        help="Advisory: JSON object captured at snapshot time (optional; fingerprint drift is non-blocking)"
     )
     parser.add_argument("--issue-number", type=int, default=0, help="Linked issue number")
     parser.add_argument(

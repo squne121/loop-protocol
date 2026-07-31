@@ -1,36 +1,38 @@
 """
 Fixture-driven unit tests for route_loop_verdict_v2 production consumer.
 
-Issue #777: Exercises the positive/negative fixture files in this directory
-against the production consumer module.
-
-Issue #1856 (AC1): route_loop_verdict_v2() no longer accepts a test_verdict
-argument. Fixture files may still carry a legacy `test_verdict` key (kept
-for historical readability / other consumers) but this test module does not
-pass it to the production consumer; BEHIND routing is derived solely from
-loop_verdict.mergeability.merge_state_status.
+Issue #1873: route_loop_verdict_v2 no longer accepts reviewer self-reported
+merge_ready / required_auto_actions / allowed_paths_gate / mergeability.
+Instead it takes reviewer_verdict (verdict, reviewed_head_sha, blockers,
+warnings) and live_mergeability (head_sha, mergeable, merge_state_status)
+as its only two arguments. Issue #1870 (#1856): there is no test_verdict
+parameter at all; BEHIND routing is derived solely from
+live_mergeability.merge_state_status.
 
 Each fixture file defines:
-  - loop_verdict: LOOP_VERDICT_V2 dict
+  - reviewer_verdict: minimal result convention dict
+  - live_mergeability: live GitHub PR state dict
   - expected.route: expected RouteDecision.route value
   - expected.fail_closed: expected RouteDecision.fail_closed value
-  - expected.reason_code_prefix: optional prefix match for RouteDecision.reason_code
+  - expected.reason_code: optional exact match for RouteDecision.reason_code
+  - expected.reason_code_prefix: optional prefix match
+  - expected.selected_action: optional exact dict match for RouteDecision.selected_action
+
+Named tests below (beyond the generic fixture-driven `test_fixture`) exist to
+give the mandatory #1860/#1871/#1873 regression names discoverability and an
+explicit failure message independent of fixture-file bookkeeping.
 """
 
 from __future__ import annotations
 
 import ast
+import inspect
 import sys
 from pathlib import Path
 
 import pytest
 import yaml
 
-# ---------------------------------------------------------------------------
-# Path setup: import production consumer from scripts/
-# ---------------------------------------------------------------------------
-
-# parents[3] = .claude/skills/impl-review-loop (from fixtures/step5_routing_consumer/test_*.py)
 IMPL_REVIEW_LOOP_DIR = Path(__file__).resolve().parents[3]
 SCRIPTS_DIR = IMPL_REVIEW_LOOP_DIR / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
@@ -41,296 +43,273 @@ from route_loop_verdict_v2 import RouteDecision, route_loop_verdict_v2  # noqa: 
 FIXTURE_DIR = Path(__file__).parent
 
 
-def _load_fixture(name: str) -> dict:
-    return yaml.safe_load((FIXTURE_DIR / name).read_text(encoding="utf-8"))
+def _fixture_files() -> list[Path]:
+    return sorted(FIXTURE_DIR.glob("*.yml"))
+
+
+def _load_fixture(path: Path) -> dict:
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def _load_fixture_by_name(name: str) -> dict:
+    return _load_fixture(FIXTURE_DIR / name)
+
+
+@pytest.mark.parametrize("fixture_path", _fixture_files(), ids=lambda p: p.stem)
+def test_fixture(fixture_path: Path):
+    fx = _load_fixture(fixture_path)
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+
+    expected = fx["expected"]
+
+    assert result.route == expected["route"], (
+        f"{fixture_path.name}: expected route '{expected['route']}', "
+        f"got '{result.route}'. errors: {result.errors}"
+    )
+    assert result.fail_closed is expected["fail_closed"], (
+        f"{fixture_path.name}: expected fail_closed={expected['fail_closed']}, "
+        f"got {result.fail_closed}"
+    )
+
+    if "reason_code" in expected:
+        assert result.reason_code == expected["reason_code"], (
+            f"{fixture_path.name}: expected reason_code={expected['reason_code']!r}, "
+            f"got {result.reason_code!r}"
+        )
+
+    if "reason_code_prefix" in expected:
+        prefix = expected["reason_code_prefix"]
+        assert result.reason_code is not None and result.reason_code.startswith(prefix), (
+            f"{fixture_path.name}: expected reason_code to start with {prefix!r}, "
+            f"got {result.reason_code!r}"
+        )
+
+    if "selected_action" in expected:
+        assert result.selected_action is not None
+        assert dict(result.selected_action) == expected["selected_action"], (
+            f"{fixture_path.name}: selected_action mismatch: "
+            f"{dict(result.selected_action)} != {expected['selected_action']}"
+        )
+
+
+def test_at_least_one_positive_and_one_negative_fixture_present():
+    names = [p.stem for p in _fixture_files()]
+    assert any(n.startswith("positive_") for n in names)
+    assert any(n.startswith("negative_") for n in names)
 
 
 # ---------------------------------------------------------------------------
-# Positive cases
+# Issue #1870 (#1856) / #1873: no test_verdict parameter anywhere.
 # ---------------------------------------------------------------------------
 
 
-def test_positive_approved():
-    """positive_approved.yml: APPROVE + CLEAN + empty actions + merge_ready=true → approved."""
-    fx = _load_fixture("positive_approved.yml")
-    result = route_loop_verdict_v2(
-        fx["loop_verdict"],
+def test_router_signature_has_no_test_verdict():
+    """route_loop_verdict_v2 must take exactly reviewer_verdict and
+    live_mergeability -- no test_verdict, no third parameter of any kind."""
+    sig = inspect.signature(route_loop_verdict_v2)
+    param_names = list(sig.parameters.keys())
+    assert param_names == ["reviewer_verdict", "live_mergeability"], (
+        f"Unexpected router signature: {param_names!r}"
     )
-    assert result.route == fx["expected"]["route"], (
-        f"Expected route '{fx['expected']['route']}', got '{result.route}'. errors: {result.errors}"
-    )
-    assert result.fail_closed is fx["expected"]["fail_closed"]
+    assert "test_verdict" not in param_names
 
 
-def test_positive_update_branch():
-    """positive_update_branch.yml: full update_branch matrix → route_to_update_branch."""
-    fx = _load_fixture("positive_update_branch.yml")
-    result = route_loop_verdict_v2(
-        fx["loop_verdict"],
+def test_legacy_reviewer_authority_fields_rejected():
+    """A reviewer_verdict carrying any V1/V2-legacy or test_verdict field
+    must fail closed rather than being silently accepted as routing input."""
+    for legacy_key in ("merge_ready", "required_auto_actions", "allowed_paths_gate",
+                       "mergeability", "mergeStateStatus", "recommendations",
+                       "test_verdict"):
+        reviewer_verdict = {
+            "verdict": "APPROVE",
+            "reviewed_head_sha": "abc123",
+            "blockers": [],
+            legacy_key: "anything",
+        }
+        live_mergeability = {
+            "head_sha": "abc123",
+            "mergeable": "MERGEABLE",
+            "merge_state_status": "CLEAN",
+        }
+        result = route_loop_verdict_v2(reviewer_verdict, live_mergeability)
+        assert result.fail_closed is True, f"legacy field {legacy_key} was not rejected"
+        assert result.reason_code == f"schema_invalid_legacy_field_present:{legacy_key}"
+
+
+# Backward-compatible alias name (kept discoverable under its original name).
+test_no_legacy_v1_fields_accepted_at_all = test_legacy_reviewer_authority_fields_rejected
+
+
+# ---------------------------------------------------------------------------
+# #1860 Owner Decision / PR #1871 (#1869): actual conflict precedes verdict.
+# ---------------------------------------------------------------------------
+
+
+def test_conflict_precedes_request_changes():
+    """A real conflict must hard-stop even when the reviewer verdict is
+    REQUEST_CHANGES -- the conflict check runs before verdict dispatch."""
+    reviewer_verdict = {
+        "verdict": "REQUEST_CHANGES",
+        "reviewed_head_sha": "abc123",
+        "blockers": ["needs more work"],
+    }
+    live_mergeability = {
+        "head_sha": "abc123",
+        "mergeable": "CONFLICTING",
+        "merge_state_status": "DIRTY",
+    }
+    result = route_loop_verdict_v2(reviewer_verdict, live_mergeability)
+    assert result.route == "conflict_hard_stop", (
+        f"expected conflict_hard_stop, got {result.route!r} (errors: {result.errors})"
     )
-    assert result.route == fx["expected"]["route"], (
-        f"Expected route '{fx['expected']['route']}', got '{result.route}'. errors: {result.errors}"
+
+
+def test_conflict_precedes_human_review_required():
+    """A real conflict must hard-stop even when the reviewer verdict is
+    HUMAN_REVIEW_REQUIRED -- the conflict check runs before verdict
+    dispatch."""
+    reviewer_verdict = {
+        "verdict": "HUMAN_REVIEW_REQUIRED",
+        "reviewed_head_sha": "abc123",
+        "blockers": ["ambiguous scope"],
+    }
+    live_mergeability = {
+        "head_sha": "abc123",
+        "mergeable": "MERGEABLE",
+        "merge_state_status": "DIRTY",
+    }
+    result = route_loop_verdict_v2(reviewer_verdict, live_mergeability)
+    assert result.route == "conflict_hard_stop", (
+        f"expected conflict_hard_stop, got {result.route!r} (errors: {result.errors})"
     )
-    assert result.fail_closed is fx["expected"]["fail_closed"]
+
+
+def test_mergeable_conflicting_is_hard_stop():
+    fx = _load_fixture_by_name("negative_conflicting_mergeable.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route == "conflict_hard_stop"
+    assert result.fail_closed is False
+    assert result.reason_code is not None
+    assert result.reason_code.startswith("conflict_mergeable_CONFLICTING")
+
+
+def test_dirty_is_hard_stop():
+    fx = _load_fixture_by_name("negative_dirty_merge_state.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route == "conflict_hard_stop"
+    assert result.fail_closed is False
+    assert result.reason_code is not None
+    assert result.reason_code.startswith("conflict_merge_state_status_DIRTY")
+
+
+def test_merge_state_status_conflicting_is_schema_invalid():
+    """merge_state_status=CONFLICTING is not a valid GitHub MergeStateStatus
+    enum member -> schema_invalid, NOT treated as a conflict signal."""
+    fx = _load_fixture_by_name("negative_merge_state_status_conflicting_schema_invalid.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route == "fail_closed"
+    assert result.route != "conflict_hard_stop"
+    assert result.fail_closed is True
+    assert result.reason_code is not None
+    assert result.reason_code.startswith("schema_invalid_merge_state_status_value")
+
+
+# ---------------------------------------------------------------------------
+# Stale head / BEHIND synthesis.
+# ---------------------------------------------------------------------------
+
+
+def test_stale_approve_routes_to_rereview():
+    fx = _load_fixture_by_name("negative_stale_head.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route == "route_stale_head_rereview"
+    assert result.fail_closed is False
+
+
+def test_behind_synthesizes_update_branch():
+    fx = _load_fixture_by_name("positive_behind.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route == "route_to_update_branch"
+    assert result.fail_closed is False
     assert result.selected_action is not None
     assert result.rerun_required == {"verification": True, "pr_review": True}
 
 
-def test_positive_body_only_ensure_closing_keyword():
-    """positive_body_only_ensure_closing_keyword.yml: ensure_closing_keyword → route_to_body_only_action."""
-    fx = _load_fixture("positive_body_only_ensure_closing_keyword.yml")
-    result = route_loop_verdict_v2(
-        fx["loop_verdict"],
-    )
-    assert result.route == fx["expected"]["route"], (
-        f"Expected route '{fx['expected']['route']}', got '{result.route}'. errors: {result.errors}"
-    )
-    assert result.fail_closed is fx["expected"]["fail_closed"]
-    assert result.rerun_required == {"verification": False, "pr_review": True}
-
-
-def test_positive_body_only_update_pr_body_hygiene():
-    """positive_body_only_update_pr_body_hygiene.yml: update_pr_body_hygiene → route_to_body_only_action."""
-    fx = _load_fixture("positive_body_only_update_pr_body_hygiene.yml")
-    result = route_loop_verdict_v2(
-        fx["loop_verdict"],
-    )
-    assert result.route == fx["expected"]["route"], (
-        f"Expected route '{fx['expected']['route']}', got '{result.route}'. errors: {result.errors}"
-    )
-    assert result.fail_closed is fx["expected"]["fail_closed"]
-
-
-def test_positive_continue_loop():
-    """positive_continue_loop.yml: REQUEST_CHANGES → continue_loop."""
-    fx = _load_fixture("positive_continue_loop.yml")
-    result = route_loop_verdict_v2(
-        fx["loop_verdict"],
-    )
-    assert result.route == fx["expected"]["route"], (
-        f"Expected route '{fx['expected']['route']}', got '{result.route}'"
-    )
-    assert result.fail_closed is fx["expected"]["fail_closed"]
+def test_update_branch_expected_head_sha_matches_reviewed_head():
+    fx = _load_fixture_by_name("positive_update_branch.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.selected_action is not None
+    assert result.selected_action["expected_head_sha"] == fx["reviewer_verdict"]["reviewed_head_sha"]
 
 
 # ---------------------------------------------------------------------------
-# P0-1 (#1869 fix_delta): mergeable × merge_state_status truth table
+# UNKNOWN / BLOCKED / UNSTABLE / DRAFT / HAS_HOOKS: none are conflicts, and
+# none are automatic human escalations (#1860 Owner Decision / PR #1871 P0-3).
 # ---------------------------------------------------------------------------
 
 
-def test_positive_conflict_hard_stop_mergeable_conflicting():
-    """mergeable=CONFLICTING -> conflict_hard_stop, regardless of verdict."""
-    fx = _load_fixture("positive_conflict_hard_stop_mergeable.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
-    assert result.route == fx["expected"]["route"], (
-        f"Expected route '{fx['expected']['route']}', got '{result.route}'. errors: {result.errors}"
-    )
-    assert result.fail_closed is fx["expected"]["fail_closed"]
+def test_unknown_is_not_conflict():
+    for fixture_name in ("negative_unknown_mergeable.yml", "negative_unknown_merge_state_status.yml"):
+        fx = _load_fixture_by_name(fixture_name)
+        result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+        assert result.route not in ("conflict_hard_stop", "route_human_escalation"), (
+            f"{fixture_name}: UNKNOWN must not be treated as a conflict or "
+            f"human escalation, got route={result.route!r}"
+        )
+        assert result.route == "fail_closed"
+        assert result.reason_code == "mergeability_unknown"
+
+
+def test_blocked_is_not_conflict():
+    fx = _load_fixture_by_name("positive_blocked_defer_to_ci.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route not in ("conflict_hard_stop", "route_human_escalation")
+    assert result.route == "fail_closed"
     assert result.reason_code is not None
-    assert result.reason_code.startswith(fx["expected"]["reason_code_prefix"])
+    assert result.reason_code.startswith("merge_state_status_blocked_not_conflict")
 
 
-def test_positive_conflict_hard_stop_dirty_merge_state_status():
-    """merge_state_status=DIRTY -> conflict_hard_stop, regardless of verdict."""
-    fx = _load_fixture("positive_conflict_hard_stop_dirty.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
-    assert result.route == fx["expected"]["route"], (
-        f"Expected route '{fx['expected']['route']}', got '{result.route}'. errors: {result.errors}"
-    )
-    assert result.fail_closed is fx["expected"]["fail_closed"]
+def test_unstable_is_not_conflict():
+    fx = _load_fixture_by_name("positive_unstable_defer_to_ci.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route not in ("conflict_hard_stop", "route_human_escalation")
+    assert result.route == "fail_closed"
     assert result.reason_code is not None
-    assert result.reason_code.startswith(fx["expected"]["reason_code_prefix"])
+    assert result.reason_code.startswith("merge_state_status_unstable_not_conflict")
 
 
-def test_negative_merge_state_status_conflicting_is_schema_invalid():
-    """merge_state_status=CONFLICTING is not a valid GitHub MergeStateStatus
-    enum member -> schema_invalid (NOT treated as a conflict signal)."""
-    fx = _load_fixture("negative_merge_state_status_conflicting_is_schema_invalid.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
-    _assert_fail_closed(result, fx["expected"], "negative_merge_state_status_conflicting_is_schema_invalid")
+def test_draft_is_not_conflict_or_automatic_human_stop():
+    fx = _load_fixture_by_name("positive_draft_defer_to_ci.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route not in ("conflict_hard_stop", "route_human_escalation"), (
+        "DRAFT must never trigger automatic human escalation on its own "
+        "(Issue #1873 Delivery Rule requires the PR to stay Draft pending "
+        "human final merge)"
+    )
+    assert result.route == "fail_closed"
+    assert result.reason_code is not None
+    assert result.reason_code.startswith("merge_state_status_draft_not_conflict")
 
 
-def test_positive_non_conflict_blocked_status():
-    """merge_state_status=BLOCKED is not a Git conflict (required checks/review gate only)."""
-    fx = _load_fixture("positive_non_conflict_blocked_status.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
+def test_has_hooks_is_not_conflict():
+    fx = _load_fixture_by_name("positive_has_hooks_approved.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
     assert result.route != "conflict_hard_stop"
-    assert result.route == fx["expected"]["route"]
-    assert result.reason_code is not None
-    assert result.reason_code.startswith(fx["expected"]["reason_code_prefix"])
-
-
-def test_positive_non_conflict_unstable_status():
-    """merge_state_status=UNSTABLE is not a Git conflict."""
-    fx = _load_fixture("positive_non_conflict_unstable_status.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
-    assert result.route == fx["expected"]["route"]
-    assert result.fail_closed is fx["expected"]["fail_closed"]
-
-
-def test_positive_non_conflict_draft_has_hooks_unknown():
-    """merge_state_status=DRAFT and mergeable=UNKNOWN are not Git conflicts."""
-    fx = _load_fixture("positive_non_conflict_draft_has_hooks_unknown.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
-    assert result.route == fx["expected"]["route"]
-    assert result.fail_closed is fx["expected"]["fail_closed"]
+    assert result.route == "approved"
+    assert result.fail_closed is False
 
 
 # ---------------------------------------------------------------------------
-# Negative cases
+# APPROVE-with-blockers is an inconsistent reviewer result.
 # ---------------------------------------------------------------------------
 
 
-def _assert_fail_closed(result: RouteDecision, expected: dict, fixture_name: str) -> None:
-    """Common assertions for fail-closed cases."""
-    assert result.route == "fail_closed", (
-        f"[{fixture_name}] Expected route 'fail_closed', got '{result.route}'. "
-        f"reason_code: {result.reason_code!r}. errors: {result.errors}"
-    )
-    assert result.fail_closed is True, (
-        f"[{fixture_name}] Expected fail_closed=True, got False"
-    )
-    if "reason_code_prefix" in expected:
-        prefix = expected["reason_code_prefix"]
-        assert result.reason_code is not None and result.reason_code.startswith(prefix), (
-            f"[{fixture_name}] Expected reason_code to start with '{prefix}', "
-            f"got '{result.reason_code}'"
-        )
-    if "reason_code" in expected and expected["reason_code"] is not None:
-        assert result.reason_code == expected["reason_code"], (
-            f"[{fixture_name}] Expected reason_code '{expected['reason_code']}', "
-            f"got '{result.reason_code}'"
-        )
-
-
-def test_negative_wrong_executor():
-    """negative_wrong_executor.yml: wrong executor → fail-closed."""
-    fx = _load_fixture("negative_wrong_executor.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
-    _assert_fail_closed(result, fx["expected"], "negative_wrong_executor")
-
-
-def test_negative_wrong_skill():
-    """negative_wrong_skill.yml: wrong skill value → fail-closed."""
-    fx = _load_fixture("negative_wrong_skill.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
-    _assert_fail_closed(result, fx["expected"], "negative_wrong_skill")
-
-
-def test_negative_skill_no_subcommand():
-    """negative_skill_no_subcommand.yml: skill=implement-issue (no subcommand) → fail-closed (AC4)."""
-    fx = _load_fixture("negative_skill_no_subcommand.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
-    _assert_fail_closed(result, fx["expected"], "negative_skill_no_subcommand")
-
-
-def test_negative_missing_skill():
-    """negative_missing_skill.yml: missing skill field → fail-closed."""
-    fx = _load_fixture("negative_missing_skill.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
-    _assert_fail_closed(result, fx["expected"], "negative_missing_skill")
-
-
-def test_negative_unknown_kind():
-    """negative_unknown_kind.yml: unknown kind → fail-closed."""
-    fx = _load_fixture("negative_unknown_kind.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
-    _assert_fail_closed(result, fx["expected"], "negative_unknown_kind")
-
-
-def test_negative_apply_pr_review_fix_delta():
-    """negative_apply_pr_review_fix_delta.yml: rejected kind → fail-closed."""
-    fx = _load_fixture("negative_apply_pr_review_fix_delta.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
-    _assert_fail_closed(result, fx["expected"], "negative_apply_pr_review_fix_delta")
-
-
-def test_negative_body_only_action_behind():
-    """negative_body_only_action_behind.yml: body-only action while BEHIND → fail-closed."""
-    fx = _load_fixture("negative_body_only_action_behind.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
-    _assert_fail_closed(result, fx["expected"], "negative_body_only_action_behind")
-
-
-def test_negative_multiple_actions():
-    """negative_multiple_actions.yml: multiple required_auto_actions → fail-closed."""
-    fx = _load_fixture("negative_multiple_actions.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
-    _assert_fail_closed(result, fx["expected"], "negative_multiple_actions")
-
-
-# Issue #1856: the historical branch_behind_main / merge_state_status
-# cross-check (negative_branch_behind_true_clean.yml /
-# negative_branch_behind_false_behind.yml, both outside this Issue's
-# Allowed Paths) has been removed together with the test_verdict
-# argument. merge_state_status-only BEHIND/action consistency (AC2) is
-# covered by
-# test_route_loop_verdict_v2_merge_state_status_only.py::test_behind_action_consistency_without_branch_behind_main.
-
-
-def test_negative_string_list_actions():
-    """negative_string_list_actions.yml: required_auto_actions as string-list → schema_invalid (AC7)."""
-    fx = _load_fixture("negative_string_list_actions.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
-    _assert_fail_closed(result, fx["expected"], "negative_string_list_actions")
-
-
-# ---------------------------------------------------------------------------
-# Blocker 1: expected_head_sha mismatch must fail-closed
-# ---------------------------------------------------------------------------
-
-
-def test_negative_expected_head_sha_mismatch():
-    """negative_expected_head_sha_mismatch.yml: expected_head_sha != reviewed_head_sha → fail-closed."""
-    fx = _load_fixture("negative_expected_head_sha_mismatch.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
-    _assert_fail_closed(result, fx["expected"], "negative_expected_head_sha_mismatch")
-
-
-# ---------------------------------------------------------------------------
-# Blocker 2: mechanical is required (must be True)
-# ---------------------------------------------------------------------------
-
-
-def test_negative_missing_mechanical():
-    """negative_missing_mechanical.yml: mechanical field absent → fail-closed."""
-    fx = _load_fixture("negative_missing_mechanical.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
-    _assert_fail_closed(result, fx["expected"], "negative_missing_mechanical")
-
-
-def test_negative_mechanical_false():
-    """negative_mechanical_false.yml: mechanical=false → fail-closed."""
-    fx = _load_fixture("negative_mechanical_false.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
-    _assert_fail_closed(result, fx["expected"], "negative_mechanical_false")
-
-
-# Issue #1856 (AC2): negative_behind_missing_branch_behind_main.yml /
-# negative_behind_branch_behind_main_key_absent.yml have been
-# repurposed for merge_state_status-only BEHIND/action consistency and
-# are now exercised by
-# test_route_loop_verdict_v2_merge_state_status_only.py::test_behind_action_consistency_without_branch_behind_main.
-
-
-# ---------------------------------------------------------------------------
-# Extra 5: REQUEST_CHANGES + malformed required_auto_actions design decision
-# ---------------------------------------------------------------------------
-
-
-def test_negative_request_changes_with_malformed_update_branch_action():
-    """Extra 5: REQUEST_CHANGES verdict skips action validation → continue_loop.
-
-    Design decision: REQUEST_CHANGES routes to continue_loop without inspecting
-    required_auto_actions. Action field validation only runs under APPROVE.
-    """
-    fx = _load_fixture("negative_request_changes_with_malformed_update_branch_action.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
-    assert result.route == fx["expected"]["route"], (
-        f"Expected route '{fx['expected']['route']}', got '{result.route}'. "
-        f"reason_code: {result.reason_code}"
-    )
-    assert result.fail_closed is fx["expected"]["fail_closed"]
+def test_approve_with_blockers_fails_closed():
+    fx = _load_fixture_by_name("negative_approve_with_blockers.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route == "fail_closed"
+    assert result.fail_closed is True
+    assert result.reason_code == "approve_with_blockers_inconsistent"
 
 
 # ---------------------------------------------------------------------------
@@ -341,8 +320,8 @@ def test_negative_request_changes_with_malformed_update_branch_action():
 def test_route_decision_selected_action_is_immutable():
     """Extra 6: selected_action must be MappingProxyType (immutable)."""
     from types import MappingProxyType
-    fx = _load_fixture("positive_update_branch.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
+    fx = _load_fixture_by_name("positive_update_branch.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
     assert result.selected_action is not None
     assert isinstance(result.selected_action, MappingProxyType), (
         f"Expected MappingProxyType, got {type(result.selected_action)}"
@@ -354,8 +333,8 @@ def test_route_decision_selected_action_is_immutable():
 def test_route_decision_rerun_required_is_immutable():
     """Extra 6: rerun_required must be MappingProxyType (immutable)."""
     from types import MappingProxyType
-    fx = _load_fixture("positive_update_branch.yml")
-    result = route_loop_verdict_v2(fx["loop_verdict"])
+    fx = _load_fixture_by_name("positive_update_branch.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
     assert isinstance(result.rerun_required, MappingProxyType), (
         f"Expected MappingProxyType, got {type(result.rerun_required)}"
     )

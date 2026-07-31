@@ -32,7 +32,6 @@ from compact_review_result import (
     _atomic_write,
     compact_review_result,
 )
-from reviewer_claim_replay import analyze
 
 FIXTURES_DIR = SKILLS_ROOT / "fixtures"
 
@@ -178,8 +177,11 @@ def test_compact_review_result_preserves_findings_losslessly(tmp_path):
     assert artifact_json["findings"] == raw_result["findings"]
 
 
-def test_compact_review_result_preserves_structured_blockers_for_replay(tmp_path):
-    """GIVEN blocking structured_blockers WHEN compacted THEN replay can still reconstruct deterministic fail."""
+def test_compact_review_result_preserves_structured_blockers(tmp_path):
+    """GIVEN blocking structured_blockers WHEN compacted THEN the artifact
+    preserves them losslessly (#1873: Replay Arbitration was removed --
+    the artifact is no longer independently re-analyzed by the
+    orchestrator; the reviewer's VERDICT is trusted directly)."""
     raw_result = {
         "schema": "REVIEW_ISSUE_RESULT_V1",
         "schema_version": "review_issue_result/v1",
@@ -248,19 +250,8 @@ def test_compact_review_result_preserves_structured_blockers_for_replay(tmp_path
     artifact_json = json.loads(artifact_path.read_text(encoding="utf-8"))
 
     assert artifact_json["structured_blockers"][0]["code"] == "C4"
-    replay_result, _ = analyze(
-        review_result=artifact_json,
-        readiness_result={
-            "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
-            "body_sha256": "sha256:" + "4" * 64,
-            "errors": []
-        },
-        vc_syntax_result=None,
-        vc_preflight_result=None,
-        previous_state={},
-    )
-    assert replay_result["verdict"] == "deterministic_fail_confirmed"
-    assert replay_result["routing"] == "proceed_to_rewrite"
+    assert artifact_json["structured_blockers"][0]["blocking"] is True
+    assert artifact_json["structured_blockers"][0]["checker_evidence"][0]["rule_id"] == "C4_vc_commands_present"
 
 
 def test_compact_review_result_must_read_always_present_when_empty(tmp_path):

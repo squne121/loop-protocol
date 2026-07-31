@@ -35,14 +35,19 @@ implementation child issue を **実装 → 検証 → PR レビュー** の 3 �
         ↓
 [Step 4: PR Review]       → pr-reviewer SubAgent (pr-review-judge skill)
         ↓
-[Step 5: Judgment]        → LOOP_VERDICT_V2 を解析
+[Step 5: Judgment]        → reviewer_verdict + live_mergeability を route_loop_verdict_v2() で解析
         ↓
-    APPROVE + merge_ready == true + required_auto_actions == [] → 終了（PR は人間がマージ判断）
-    APPROVE + required_auto_actions 残あり → worker 委譲 → PR review 再実行
-    APPROVE + merge_ready == false → mergeability handling（BEHIND 分岐等）
-    REQUEST_CHANGES → Step 1 に戻る（fix_delta を渡す）
+    route: approved → 終了（PR は人間がマージ判断）
+    route: route_to_update_branch → worker 委譲（update_branch）→ 検証・PR review 再実行
+    route: route_stale_head_rereview → 現在 head で PR review 再実行
+    route: continue_loop（REQUEST_CHANGES） → Step 1 に戻る（fix_delta を渡す）
+    route: route_human_escalation（verdict: HUMAN_REVIEW_REQUIRED） → 人間判断を仰ぐ
+    route: conflict_hard_stop（actual conflict のみ） → CONFLICTING PR Escalation Runbook
+    route: fail_closed（schema 不正 / UNKNOWN / BLOCKED / UNSTABLE / DRAFT 等） → warning 記録、次サイクルで再評価（自動 human escalation ではない）
     上限超過 → 人間判断を仰ぐ
 ```
+
+Issue #1873 以降、pr-reviewer は `verdict` / `reviewed_head_sha` / `blockers` / `warnings` の最小 convention のみを返す。`merge_ready` / `required_auto_actions` / `mergeability` / `allowed_paths_gate` / `test_verdict` は reviewer の自己申告として受け取らない。mergeability は control-plane が `gh pr view` で直接取得し、`route_loop_verdict_v2()`（`.claude/skills/impl-review-loop/scripts/route_loop_verdict_v2.py`）の `live_mergeability` 引数として渡す。`update_branch` action は reviewer から受け取らず `route_loop_verdict_v2()` が合成する。Step 1-4 の SubAgent が返す `human_review_required: true`（真偽値の自己申告）自体には停止権限がない（#1860 Owner Decision）。詳細は `step-5-feedback-and-termination.md` の「human_review_required の扱い」を参照。
 
 > Step 3（adversarial review）と Step 1.5（spec document review）は LOOP_PROTOCOL では採用しない（PR #12 / #20 方針）。Step 番号は履歴互換のため 1 → 2 → 4 → 5 のまま保持する。
 
@@ -55,7 +60,7 @@ implementation child issue を **実装 → 検証 → PR レビュー** の 3 �
 3. [Step 2: Verification](steps/step-2-verification.md)
 4. [Step 4: PR Review](steps/step-4-pr-review.md)
 5. [Step 5: 判定・終了・フィードバック循環](steps/step-5-feedback-and-termination.md)
-6. [Step 5: LOOP_VERDICT 自動読み取り（mergeability handling）](steps/step-5-mergeability-handling.md)
+6. [Step 5: LOOP_VERDICT ルーティング（mergeability handling）](steps/step-5-mergeability-handling.md)
 7. [CONFLICTING PR Escalation Runbook](steps/conflicting-pr-escalation-runbook.md)
 8. [Context Protocol / Guardrails](steps/context-protocol-and-guardrails.md)
 
@@ -73,7 +78,7 @@ LOOP_STATE:
   worktree: .claude/worktrees/issue-<番号>-<slug>
   branch: worktree-issue-<番号>-<slug>
   last_step: implementation | verification | pr_review | judgment
-  last_loop_verdict: APPROVE | REQUEST_CHANGES | null
+  last_loop_verdict: APPROVE | REQUEST_CHANGES | HUMAN_REVIEW_REQUIRED | null
   blockers_history: []
   external_research_skip_basis: "<理由 or null>"
   termination_reason: null | approved | max_iterations | human_escalation | intake_gate_failed
@@ -95,39 +100,49 @@ LOOP_STATE:
 
 ## 終了条件
 
-| 条件 | アクション |
+| 条件（`route_loop_verdict_v2()` の `route`） | アクション |
 |---|---|
-| `LOOP_VERDICT_V2.verdict: APPROVE` かつ `merge_ready == true` かつ `required_auto_actions == []` | 終了。`IMPL_REVIEW_LOOP_RESULT_V1.status: draft_pr_ready` かつ `merge_ready: true` を emit。PR は人間がマージ判断 |
-| `LOOP_VERDICT_V2.verdict: APPROVE` かつ `required_auto_actions` が空でない | 終了しない。required_auto_actions を worker に委譲し、PR review を再実行する |
-| `LOOP_VERDICT_V2.verdict: APPROVE` かつ `merge_ready == false` | 終了しない。`step-5-mergeability-handling.md` の routing に従う（BEHIND 分岐等） |
+| `approved`（`verdict: APPROVE` かつ live mergeability が `CLEAN`/`HAS_HOOKS` かつ `blockers == []`） | 終了。`IMPL_REVIEW_LOOP_RESULT_V1.status: draft_pr_ready` を emit。PR は人間がマージ判断 |
+| `route_to_update_branch`（live `merge_state_status == BEHIND`） | 終了しない。合成された `update_branch` action を worker に委譲し、検証・PR review を再実行する |
+| `route_stale_head_rereview`（`reviewed_head_sha` が現在の PR head と不一致） | 終了しない。現在 head で PR review を再実行する |
+| `continue_loop`（`verdict: REQUEST_CHANGES`、actual conflict がない場合） | 終了しない。Step 1 に戻り blockers を fix_delta として渡す |
 | `iteration ≥ max_iterations` | fail-close。`termination_reason: max_iterations` を LOOP_STATE に記録、人間判断を仰ぐ |
-| Step 1-4 のいずれかで `human_review_required: true` を SubAgent が返した | #1860 Owner Decision により即停止しない。warning として記録し、iteration 余裕があれば継続する（`step-5-feedback-and-termination.md` の「human_review_required の扱い」参照）。ループを止める human veto は live Issue/PR コメント上の明示的な停止指示、または実 Git conflict／target PR mergeability（`mergeable == CONFLICTING` または `merge_state_status == DIRTY`）に限定する |
-| `mergeability.mergeable == CONFLICTING` または `mergeability.merge_state_status == DIRTY` | CONFLICTING PR Escalation Runbook 参照（`merge_state_status == CONFLICTING` は無効な enum 値であり schema 不正として扱う。`BLOCKED` は required checks/review 未充足であり Git conflict ではないため本 runbook の対象にしない） |
+| `route_human_escalation`（`verdict: HUMAN_REVIEW_REQUIRED`、actual conflict がない場合） | 即停止、人間判断を仰ぐ |
+| Step 1-4 のいずれかで `human_review_required: true`（真偽値の自己申告）を SubAgent が返した | #1860 Owner Decision により即停止しない。warning として記録し、iteration 余裕があれば継続する（`step-5-feedback-and-termination.md` の「human_review_required の扱い」参照）。ループを止める human veto は live Issue/PR コメント上の明示的な停止指示、または実 Git conflict／target PR mergeability に限定する |
+| `conflict_hard_stop`（`mergeable == CONFLICTING` または `merge_state_status == DIRTY`。**verdict に関係なく最優先で評価**） | CONFLICTING PR Escalation Runbook 参照（`merge_state_status == CONFLICTING` は無効な enum 値であり schema 不正として扱う。`BLOCKED` は required checks/review 未充足であり Git conflict ではないため本 runbook の対象にしない） |
+| `fail_closed`（schema 不正、`APPROVE` かつ `blockers` 非空、mergeability `UNKNOWN`、`BLOCKED`/`UNSTABLE`/`DRAFT`） | `reason_code` を warning として記録。`UNKNOWN` は bounded retry（最大 3 回）後も warning のまま継続。`BLOCKED`/`UNSTABLE`/`DRAFT` は current-head required-CI / branch-protection evaluator の判定に委ね、human escalation にはしない |
 
-> **重要**: `verdict: APPROVE` 単独では終了しない。`merge_ready == true` かつ `required_auto_actions == []` の両条件が必要。
+> **重要**: `verdict: APPROVE` 単独では終了しない。live mergeability が `CLEAN`/`HAS_HOOKS` かつ `blockers == []` の両条件が必要（`route_loop_verdict_v2()` が判定する）。
 
 ## 外部仕様調査の取扱い
 
 外部仕様調査が必要な場合は `gemini-cli-headless-delegation` skill を default 経路として使い、結果を LOOP_STATE の `external_research_skip_basis` に記録する。LOOP_PROTOCOL は internal-only 変更が多い前提のため、デフォルトはスキップで構わない（スキップ時も判定根拠を記録する）。
 
-## Allowed Paths Gate Routing（許可パスゲートのルーティング, LOOP_VERDICT_V2.allowed_paths_gate）
+## Allowed Paths Gate Routing（許可パスゲートのルーティング、Issue #1873）
 
-PR review judge（review_subagent）が生成する `ALLOWED_PATHS_GATE_RESULT_V1` の status に基づいて、以下の routing table に従う。
+pr-reviewer が実行する `ALLOWED_PATHS_GATE_RESULT_V1`（決定論的スクリプト、正本は pr-review-judge 配下）の
+`status` は、専用 `LOOP_VERDICT_V2.allowed_paths_gate` フィールドとして自己申告されず、
+`status != ok` の場合は具体的な違反内容が `reviewer_verdict.blockers[]` にテキストとして含まれる
+（`references/allowed-paths-gate.md` 参照）。gate の pattern source は常に **live linked Issue 本文**
+であり、contract snapshot / `expected_contract_fingerprint` は advisory telemetry に過ぎない
+（欠落・不一致のみを理由に block しない。`allowed-paths-gate.md` 参照）。gate 自体（path が
+Allowed Paths 外か、rename/copy provenance が確定できるか）は hard safety boundary のまま維持する。
 
-**注意**: impl-review-loop は `allowed_paths_gate.status` のみを route し、worker 自己申告（`allowed_paths_compliance`）は canonical にしない。gate evaluator の正本は pr-review-judge 配下の決定論的スクリプト出力。
+gate `status` の値は `ok` / `fail_closed` / `indeterminate` のみ（`stale_snapshot` は `status` を
+占有しない -- contract fingerprint drift は `warnings[]` の advisory annotation としてのみ表れ、
+live 本文で評価した `status` が canonical のまま変わらない。詳細は `references/allowed-paths-gate.md`
+参照）。
 
-| allowed_paths_gate.status | routing | merge-blocking | action |
+| gate `status` | reviewer_verdict への反映 | 結果としての `verdict` | routing |
 |---|---|---|---|
-| `ok` | continue（非 merge-blocking） | false | 次ステップへ |
-| `fail_closed` | REQUEST_CHANGES（merge-blocking） | true | PR レビュー REQUEST_CHANGES、next iteration へ |
-| `stale_snapshot` | REQUEST_CHANGES（merge-blocking） | true | contract snapshot を refresh して PR レビュー再実行 |
-| `indeterminate` | REQUEST_CHANGES（merge-blocking） | true | 人間判断を仰ぐ（head SHA mismatch 等） |
-| result 欠落 | indeterminate 扱い（merge-blocking） | true | 人間判断を仰ぐ |
-| `producer_role != review_subagent` | indeterminate 扱い（merge-blocking） | true | producer role の確認が必要 |
-| allowed_paths_gate ブロック欠落（PR review 本文自体に `allowed_paths_gate` ブロックが存在しない） | indeterminate 扱い（merge-blocking） | true | `check_pr_review_gates.py` G6 が fail を返す。producer_role フィールド欠落と同様、人間判断を仰ぐ（Issue #1776） |
-| malformed（スキーマ不正） | indeterminate 扱い（merge-blocking） | true | 人間判断を仰ぐ |
+| `ok` | blocker を追加しない（fingerprint drift があれば `warnings[]` に advisory 記載） | `APPROVE` 可 | `route_loop_verdict_v2()` の通常判定へ |
+| `fail_closed` | 違反内容を `blockers[]` に記載 | `REQUEST_CHANGES` | `continue_loop`。next iteration で修正 |
+| `indeterminate` | 理由（path が Allowed Paths 外と確定できない等）を `blockers[]` に記載 | `REQUEST_CHANGES` または `HUMAN_REVIEW_REQUIRED` | `continue_loop` または `route_human_escalation` |
+| malformed（スクリプト実行不能） | 実行不能である旨を `blockers[]` に記載 | `HUMAN_REVIEW_REQUIRED` | `route_human_escalation` |
 
-`status: ok` 以外の場合は merge-blocking であり、PR merge 前に人間 approval または contract 再確認が必要。
+`verdict: APPROVE` かつ `blockers` が非空は inconsistent な reviewer 結果として `route_loop_verdict_v2()` が
+`fail_closed`（`approve_with_blockers_inconsistent`）を返す。つまり Allowed Paths 違反が確定した状態のまま
+`APPROVE` を出す reviewer 結果は production 経路で自動的に拒否される。
 
 ## Contract Snapshot 参照ルール
 

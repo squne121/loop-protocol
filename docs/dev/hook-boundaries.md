@@ -462,36 +462,6 @@ hook_boundaries_manifest_v1:
       inner payload スキーマ: schemas/repo_temp_folder_advice_v1.schema.json
       block: false を固定し、tool call を止めずに `tmp/` または `.claude/tmp/` への移行を案内する。
       local_main_branch_guard の classification: blocker は維持し、この hook に deny logic を混在させない。
-
-  - handler_id: save_loop_state_before_compaction
-    event: PreCompact
-    matcher: null
-    command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/save_loop_state_before_compaction.sh"
-    args: []
-    timeout: 30
-    classification: telemetry
-    fail_policy: fail_open
-    script_exit_contract:
-      normal: 0
-      internal_producer_failure: 0
-    claude_event_semantics:
-      event: PreCompact
-      exit_2_effect: blocks_compaction
-      other_nonzero_effect: non_blocking_error_or_stderr_visible
-    stdout_contract: always_empty
-    stderr_contract: diagnostic_on_failure_max_10_lines
-    redaction_contract:
-      no_raw_command: true
-      no_raw_secret_like_value: true
-      no_raw_transcript: true
-      no_manifest_body_on_stdout: true
-    agent_action:
-      on_any: proceed
-    notes: >
-      PreCompact hook。compaction をブロックしてはならない設計（常に exit 0）。
-      save 失敗時は stderr に記録し exit 0 で継続。
-      task blocker にしてはならない（AC2）。
-      hook failure は diagnostic artifact 欠落として記録・報告される（AC10）。
 ```
 
 ## HOOK_COMMAND_REPAIR_HINT_V1（Hook コマンド修復ヒント）
@@ -562,7 +532,6 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 | `session_manifest_coordinator.sh`（Stop） | telemetry | 継続 |
 | `session_manifest_coordinator.sh`（SubagentStop） | telemetry | 継続 |
 | `session_manifest_debounce.mjs` | telemetry | 継続 |
-| `save_loop_state_before_compaction.sh` | telemetry | 継続 |
 
 ---
 
@@ -585,7 +554,6 @@ AC2 対応: 以下の best-effort telemetry フックは作業 blocker にしな
 
 - `session_manifest_coordinator.sh`（Stop / SubagentStop）: 停止時コーディネータ
 - `session_manifest_debounce.mjs`（PostToolUse front gate）: 事前集約ゲート
-- `save_loop_state_before_compaction.sh`（PreCompact）: 圧縮前保存
 - `rtk_boundary_shadow_guard.sh`（PreToolUse）: shadow 記録ガード
 
 これらは全て `fail_policy: fail_open` で設計されており、hook failure 時も exit 0 を返す（AC2）。
@@ -627,7 +595,6 @@ AC10 対応: telemetry hook failure は **task blocker ではない** が、以�
 - `session_manifest_coordinator.sh`: stderr に diagnostic を出力（最大 10 行）し、artifact 欠落を記録
 - `session_manifest_debounce.mjs`: stderr に front gate / flush / producer timeout の machine-readable summary を出力し、artifact 欠落を記録
 - `generate_session_manifest_from_hook.mjs`: downstream producer failure を redacted stderr に出力し、artifact 欠落を記録
-- `save_loop_state_before_compaction.sh`: stderr に保存失敗を出力（最大 10 行）
 - `rtk_boundary_shadow_guard.sh`: JSONL shadow log に記録（log write 失敗時は無言で pass）
 
 PR review・session 終了時に artifact 欠落が検出された場合、follow-up issue として記録・追跡する。
@@ -755,27 +722,23 @@ SESSION_MANIFEST_LEGACY_SCAN_V1:
 
 ---
 
-## 12a. pr_review.publish の位置づけ（Issue #1536）
+## 12a/12b. pr_review.publish（廃止・Issue #1873）
 
-`scripts/agent-guards/controlled_skill_mutation_exec.py` の `CONTROLLED_SKILL_MUTATION_COMMAND_POLICY` に `pr_review.publish` command id を追加した（Option C: controlled review publisher）。`local_main_branch_guard.sh` / `worktree_scope_guard.sh` は既存の `REASON_CONTROLLED_SKILL_MUTATION_EXECUTOR` 判定（`is_controlled_skill_mutation_exec_command()`、`ALL_COMMAND_IDS` メンバーシップに基づく exact command class allow）をそのまま適用するため、この2フック自体の変更は不要だった（`termination_report.publish` / `issue_body.update` / `issue_comment.publish` / `contract_snapshot.publish` と同一の authorization lane）。
+Issue #1536/#1539/#1633 で導入・強化された `pr_review.publish` command id（controlled
+review publisher、Option C）は Issue #1873 でスコープアウトし撤去した。
+`controlled_skill_mutation_exec.py` から render mode（`--render-body-file` /
+`--verdict` / `--reviewed-head-sha` / `--expected-head-sha` / `--merge-ready` /
+`--pr-number`）と `_run_pr_review_publish` 系の専用関数群を削除し、
+`CONTROLLED_SKILL_MUTATION_COMMAND_POLICY` から `pr_review.publish` entry を除去した。
+`scripts/agent-ops/pr_review_marker_archive_exec.py`（この command id 専用の marker
+archive executor）も consumer 消滅に伴い削除した。
 
-`pr_review.publish` は `pr-reviewer` SubAgent（read-only、`gh pr review` / worktree bootstrap を一切行わない）の判定結果（`PR_REVIEW_PUBLISH_REQUEST_V1`）を受け取り、`event: COMMENT` 固定・`commit_id` 拘束・idempotency marker 付きで GitHub PR review を投稿する。生の `gh pr review` 呼び出しは `local_main_branch_guard.sh` で引き続き `gh_mutation_denied` として block される（本 Issue で変更しない）。
-
-Codex 側 `.codex/rules/default.rules` は `gh pr review` を引き続き明示的に forbidden とし（`gh` サブコマンド prefix rule）、かつ `controlled_skill_mutation_exec.py` 自体への allow エントリを持たないため、本変更は Claude-only のまま split-brain を生じない（確認のみ、rule 変更なし）。
-
-**Issue #1633 更新（Codex/Claude parity 解消）**: 上記の「Codex 側は allow エントリを持たない」記述は Issue #1633 時点でもはや正確ではない。`.codex/rules/default.rules` に `uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py` の exact prefix allow エントリを追加し、`.claude/settings.json` の `Bash(uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py *)` と同じ 共有 authorization lane に Codex 側も明示的に乗るようにした（`codex execpolicy check` で `decision: allow` を確認済み）。ランタイム hook 層（`is_controlled_skill_mutation_exec_command()`）は元々 Claude/Codex 共通実装であり split-brain は生じていなかったが、静的 `codex execpolicy` layer には対応する allow ルールが欠けていたため、本 Issue でその欠落を埋めた。
-
-## 12b. pr_review.publish の追加ハードニング（Issue #1539 fix_delta）
-
-OWNER レビュー（PR #1539、squne121）で以下の構造的欠陥が指摘され、修正した:
-
-- **trusted bridge の欠如（Blocker 1）**: `pr-reviewer` SubAgent は `Edit`/`Write`/`MultiEdit` を持たず Bash 経由のファイル書き込みも禁止のため、当初の SKILL 文面が要求していた「`PR_REVIEW_PUBLISH_REQUEST_V1` を自ら組み立てて `--input-file` に渡す」経路は実際には SubAgent に実行不能だった。修正: `controlled_skill_mutation_exec.py` に render mode（`--render-body-file` / `--verdict` / `--reviewed-head-sha` / `--expected-head-sha` / `--merge-ready`）を追加。trusted orchestrator（Write ツールを持つ control-plane）が verdict 本文テキストのみを artifact パスへ書き込み、executor 自身が `body_sha256` / `idempotency_key` を再計算し `producer_role` / `event` を自ら固定する（入力からは受け取らない）。
-- **host/environment binding の欠如（Blocker 2）**: `_verify_git_remote_origin()` が owner/repo の正規表現抽出のみで host/scheme を無視していたため、`https://attacker.example/<owner>/<repo>.git` 等が trusted と誤認され得た。また `GH_HOST`/`GH_REPO`/`GH_CONFIG_DIR`/`GH_DEBUG`/`DEBUG` が sanitize されず、`gh` subprocess へ `env=` が渡っていなかった。修正: `urlsplit` による構造的 host/scheme/port/userinfo 検査（github.com の HTTPS/SSH canonical form のみ許可）と、全 `gh` subprocess への sanitized env（上記5キー除去）+ `--hostname github.com` 明示。
-- **idempotent retry が postcondition を迂回（Blocker 3）**: 既存 marker が1件見つかった retry 経路が `state`/`commit_id` のみ確認して即座に成功を返し、body hash・marker 一意性/位置・現在 PR head・author identity・tracked changes を再検証していなかった。修正: retry も fresh-post と同一の共通 postcondition validator（`_validate_pr_review_postcondition`）を通す。marker 検索も substring match から「末尾に厳密一致」判定に変更。
-- **TOCTOU（High 1）**: commit_id 拘束は「A に結び付ける」保証であって「POST 時点でも A が current head」の atomic precondition ではない。修正: POST/readback 後に current head を再取得し、移動していれば `published_but_stale` として fail-closed（review は残るが成功報告はしない）。
-- **producer provenance の自己申告（High 2）**: `producer_role` が入力 JSON の自己申告フィールドで、schema も exact-key ではなかった。修正: render mode では `producer_role`/`event` を executor が自ら固定（入力に存在しても無視ではなく、そもそも render mode の入力スキーマに含まれない）。`--input-file` 経路も exact-key schema + body size bound を追加。
-
-AC8（実 PreToolUse hook chain）テストは `secret_boundary_guard` / `local_main_branch_guard` / `worktree_scope_guard` / `guard-japanese-prose` / `rtk_boundary_shadow_guard` / `ci_test_performance_advisory` / `root_temporary_residue_advisory` の 7 hook すべてを `.claude/settings.json` 記載順に実行し、aggregate decision（deny/ask が無いこと）を検証する形に拡張した（`.claude/hooks/tests/hookchain_harness.py`）。
+PR review の最終判定コメント投稿は、呼び出し元（orchestrator/main thread）が組み立てた
+Markdown 本文を `gh pr comment --repo <owner/repo> --body-file <file>` で投稿する通常の
+gh 操作に置換された（`.claude/settings.json` の `permissions.allow` には
+`Bash(gh pr comment *)` が既に存在するため、新規の認可ルール追加は不要）。
+生の `gh pr review` 呼び出しは引き続き `local_main_branch_guard.sh` で
+`gh_mutation_denied` として block される（本 Issue で変更しない）。
 
 ## 12c. scope_rollup.run の位置づけ（Issue #1547）
 

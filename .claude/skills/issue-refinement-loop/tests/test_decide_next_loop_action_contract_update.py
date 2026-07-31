@@ -10,7 +10,6 @@ from typing import Any
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = SKILL_ROOT / "scripts"
-SCHEMAS_DIR = SKILL_ROOT / "schemas"
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 
@@ -252,14 +251,33 @@ def test_cli_end_to_end_without_sidecar_regresses_to_existing_escalation():
 # --- termination_reason enum must remain unchanged (Non-Goal / Stop Condition) ---
 
 
-def test_loop_state_schema_termination_reason_enum_unchanged():
-    schema = json.loads((SCHEMAS_DIR / "loop_state.schema.json").read_text(encoding="utf-8"))
-    # termination_reason is validated via LOOP_STATE_V1's own properties;
-    # this test asserts the schema's top-level shape was NOT widened to add
-    # scope_signal_guard_decision_v2 as a validated property (the sidecar is
-    # intentionally passed out-of-band, never through --loop-state-file).
-    assert schema["additionalProperties"] is False
-    assert "scope_signal_guard_decision_v2" not in schema.get("properties", {})
+def test_scope_signal_guard_decision_v2_is_out_of_band_not_loop_state_field():
+    """#1873: schemas/loop_state.schema.json was removed along with
+    build_loop_state.py, so this is no longer a schema-property assertion --
+    it directly asserts that decide_next_action() never reads
+    scope_signal_guard_decision_v2 from loop_state itself (the sidecar is
+    intentionally passed out-of-band via the separate
+    scope_signal_guard_decision_v2 function argument, never through
+    loop_state)."""
+    state = _base_loop_state(
+        scope_signal_guard={
+            "triggered": False,
+            "excluded_by_anchor_reframe": False,
+            "reason_code": None,
+        }
+    )
+    state["scope_signal_guard_decision_v2"] = {"route": "not_triggered"}
+    status, next_action, _commands, _blockers, _hint = router.decide_next_action(
+        loop_state=state,
+        review_verdict="approve",
+        scope_signal_guard_decision_v2=None,
+    )
+    # An unrecognized top-level field embedded in loop_state must not
+    # silently be promoted to routing significance -- approve still routes
+    # normally since decide_next_action() only reads the sidecar from its
+    # own separate argument, never from loop_state.
+    assert next_action == "proceed_to_step_4_5"
+    assert status == "pass"
 
 
 # ---------------------------------------------------------------------------
