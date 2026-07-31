@@ -355,6 +355,7 @@ downstream skill（impl-review-loop・implement-issue・issue-contract-review・
 | planner output contract | `references/refinement-loop-plan-output.md` |
 | scope rollup preflight | `references/scope-rollup-policy.md` |
 | command registry | `scripts/command_registry.py` — `ISSUE_REFINEMENT_COMMAND_REGISTRY_V1` |
+| architecture review / design 判断・failure mode の詳細（`derived_design_note`。本 entrypoint と矛盾する場合は本 entrypoint が正本、#1876） | `docs/dev/workflows/issue-refinement-loop-design.md` |
 
 ## 安全策 (Guardrails)
 
