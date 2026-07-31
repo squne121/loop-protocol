@@ -80,7 +80,7 @@ reviewer が `approve` を返しても、最新の `CONTRACT_REVIEW_RESULT_V1.st
 
 `iteration + 1 >= max_iterations` かつ approve なしの場合は `human_escalation` で停止し、全 iteration 分の blocker summary を終了コメントに添付する。`max_iterations=3` 既定では、3 回目の `needs-fix` で停止する。
 
-### termination summary の正規化（normalization、#1873）
+### termination summary の正規化（normalization、正規化処理、#1873）
 
 #1873: `TERMINATION_REPORT_INPUT_V1` を検証する renderer（`render_termination_report.py`）
 は撤去された。orchestrator は以下のルールに従って plain markdown の termination summary

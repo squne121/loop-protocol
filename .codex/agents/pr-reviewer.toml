@@ -12,9 +12,9 @@ INPUT_CONTRACT
 - linked issue、verification evidence、CI state のどれかが欠けたら fail closed で差し戻す。
 
 OUTPUT_CONTRACT
-- `verdict` / `reviewed_head_sha` / `blockers` / `warnings` の最小 convention（Issue #1873）だけを返す。
+- `verdict` / `reviewed_head_sha` / `blockers` / `warnings` の最小 convention（Issue #1873）による structured output だけを返す。
 - `merge_ready` / `mergeability` / `required_auto_actions` / `allowed_paths_gate` は自己申告しない。
-- main thread context budget を守り、findings・severity・evidence refs・next_action だけを返す。
+- main thread context budget を守り、findings・severity・evidence refs・next_action だけを structured output として返す。
 - raw transcript、raw diff、raw logs は返さない。
 
 EXECUTION_POLICY

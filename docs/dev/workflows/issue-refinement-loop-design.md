@@ -139,7 +139,7 @@ Issue 本文の品質を反復改善する `issue-refinement-loop` の設計判�
 - `codebase-investigator` は `final_classification` の確定責務を持たない（orchestrator が main thread で確定）
 - `issue-author` への入力は必ず `anchor_comment_feedback`（正規化済み）を使い、raw snapshot を直接渡してはならない
 
-### Step 2: bounded verdict trust（#1873、旧 Step 2a Replay Arbitration を撤去）
+### Step 2: bounded verdict trust（#1873、旧 Step 2a Replay Arbitration を撤去し検証結果を信頼する設計へ変更）
 
 `issue-reviewer` の `needs-fix` / `approve` 判定に対する parent-local replay arbitration（旧 Step 2a、#1532 V2 契約）は撤去された。orchestrator は `issue-reviewer` が返す `ISSUE_REVIEW_RESULT_COMPACT_V1`（`validate_review_compact_output.py` で構文検証済みの STATUS/VERDICT/SUMMARY/BLOCKERS/NEXT_ACTION/MUST_READ/EVIDENCE/ARTIFACT の8フィールド envelope）の VERDICT を、それ以上の独立 replay 再計算なしに直接信頼する。
 

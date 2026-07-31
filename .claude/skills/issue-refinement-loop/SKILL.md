@@ -205,10 +205,10 @@ web-researcher が critical claim にエビデンスを示せず、ハルシネ�
 anchor comment により stale approval を無効化する場合も、raw snapshot は Step 4 に渡さず、正規化済み `anchor_comment_feedback` だけを渡す。
 
 **重要**: `review` phase（rewrite 前）では `decide_next_loop_action.py` を呼んではならない。
-`review` phase での routing は VERDICT に基づいて直接行う:
+`review` phase での routing は VERDICT に基づいて直接行う（承認なら次段階へ、要修正なら書き直しへ）:
 
-- `VERDICT: approve` → Step 4.5 へ
-- `VERDICT: needs-fix` → Step 4（rewrite）へ
+- `VERDICT: approve` → Step 4.5 へ（承認）
+- `VERDICT: needs-fix` → Step 4（rewrite、書き直し）へ
 
 `decide_next_loop_action.py` は rewrite 後 / next-action 決定時にのみ呼ぶ:
 

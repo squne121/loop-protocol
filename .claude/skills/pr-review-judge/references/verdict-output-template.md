@@ -1,6 +1,6 @@
 # Verdict コメントテンプレート（要点）
 
-```markdown
+````markdown
 ## Verdict: APPROVE | REQUEST_CHANGES
 
 ### Mergeability
@@ -25,7 +25,7 @@ reviewed_head_sha: <sha>
 blockers: []
 warnings: []
 ```
-```
+````
 
 Allowed Paths 逸脱は専用フィールドではなく `blockers[]` に具体的な違反内容として記載する。
 follow-up Issue 提案は `blockers[]` / `warnings[]` のテキストに含め、専用 schema field は追加しない。
