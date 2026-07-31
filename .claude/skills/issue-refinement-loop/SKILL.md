@@ -119,7 +119,7 @@ root checkout（canonical main root / default branch）から anchor comment を
 
 <!-- policy-example --><!-- 以下は方針の例を示すコメントであり、実行対象のコマンド構文には影響しない -->
 ```bash
-uv run python3 scripts/agent-guards/skill_runtime_exec.py \
+uv run --locked python3 scripts/agent-guards/skill_runtime_exec.py \
   --command-id preflight.run.with_anchor \
   --issue-number <N> \
   --repo <owner/repo> \
@@ -133,7 +133,7 @@ uv run python3 scripts/agent-guards/skill_runtime_exec.py \
 `preflight.run.with_anchor` が trusted contract patch plan を得た後だけ、main control-plane は canonical main root / default branch から次の明示phaseを実行できる。preflight entryの `mutation: false` は変更せず、このphase以外に `--consume-contract-patch-plan` を渡してはならない。
 
 ```bash
-uv run python3 scripts/agent-guards/skill_runtime_exec.py \
+uv run --locked python3 scripts/agent-guards/skill_runtime_exec.py \
   --command-id contract_update.run.with_anchor \
   --issue-number <N> \
   --repo <owner/repo> \
