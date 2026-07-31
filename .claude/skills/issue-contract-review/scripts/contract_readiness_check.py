@@ -54,7 +54,10 @@ _BASELINE_VC_PREFLIGHT_PY = _SCRIPTS_DIR / "baseline_vc_preflight.py"
 _CREATE_ISSUE_SCRIPTS_DIR = _REPO_ROOT / ".claude" / "skills" / "create-issue" / "scripts"
 if str(_CREATE_ISSUE_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS_DIR))
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
 
+from baseline_vc_preflight import extract_verification_commands_section  # noqa: E402
 from mrc_contract_parser import parse_machine_readable_contract  # noqa: E402
 from prose_boundary_policy import HEADING_POLICY  # noqa: E402
 
@@ -1123,8 +1126,18 @@ def build_result(
     validate_result: dict,
     preflight_result: Optional[dict],
     preflight_exit_code: Optional[int],
+    preflight_skip_reason_code: Optional[str] = None,
 ) -> dict:
-    """Build ISSUE_CONTRACT_READINESS_RESULT_V1 from all check results."""
+    """Build ISSUE_CONTRACT_READINESS_RESULT_V1 from all check results.
+
+    preflight_skip_reason_code: when set (and preflight_result is None), a
+    "not_applicable" baseline_vc_preflight entry is recorded in
+    source_checks[] with this reason_code, so a deliberate execute-mode skip
+    (canonical parent body without a `## Verification Commands` section,
+    #1867) is machine-distinguishable from "not run because --mode != execute"
+    (static / preflight-static modes leave source_checks unchanged, i.e. no
+    baseline_vc_preflight entry at all — PR #1878 P2 review).
+    """
     body_sha256 = sha256_of(body)
 
     validate_status = validate_result.get("status", "fail")
@@ -1147,6 +1160,16 @@ def build_result(
                 "schema": "baseline_vc_preflight/v1",
                 "status": preflight_status,
                 "exit_code": preflight_exit_code if preflight_exit_code is not None else -1,
+            }
+        )
+    elif preflight_skip_reason_code is not None:
+        source_checks.append(
+            {
+                "name": "baseline_vc_preflight",
+                "schema": "baseline_vc_preflight/v1",
+                "status": "not_applicable",
+                "reason_code": preflight_skip_reason_code,
+                "exit_code": None,
             }
         )
 
@@ -1277,13 +1300,46 @@ def main() -> int:
     # Run validate_issue_body (always)
     validate_result = run_validate_issue_body(body)
 
-    # Run baseline_vc_preflight only in execute mode
+    # Run baseline_vc_preflight only in execute mode.
+    # #1867: canonical parent Issue (issue_kind: parent) does not require a
+    # `## Verification Commands` section under existing_issue_readiness_v1,
+    # so baseline_vc_preflight() must be skipped for canonical parent bodies
+    # that have no `## Verification Commands` section, to avoid a spurious
+    # VC001_NO_VERIFICATION_COMMANDS_SECTION extraction error. A canonical
+    # parent body that DOES carry a `## Verification Commands` section is not
+    # skipped: if a parent author opts into VCs, those VCs must still be
+    # executed and their pass/fail outcome must be reflected (PR #1878 P1
+    # review). implementation / research / unknown kind / malformed MRC /
+    # parse failure / label-only-parent-with-implementation-MRC bodies are
+    # NOT skipped and retain the existing execution behavior.
     preflight_result: Optional[dict] = None
     preflight_exit_code: Optional[int] = None
+    preflight_skip_reason_code: Optional[str] = None
     if args.mode == "execute":  # preflight-static is static-only; no execution
-        preflight_result, preflight_exit_code = run_baseline_vc_preflight(body)
+        resolution = resolve_existing_issue_validation_profile(body)
+        is_canonical_parent = (
+            resolution.status == "profile" and resolution.canonical_issue_kind == "parent"
+        )
+        parent_has_vc_section = is_canonical_parent and bool(
+            extract_verification_commands_section(body)
+        )
+        skip_preflight = is_canonical_parent and not parent_has_vc_section
+        if not skip_preflight:
+            preflight_result, preflight_exit_code = run_baseline_vc_preflight(body)
+        else:
+            # #1878 P2 review: record a machine-readable "not_applicable"
+            # source_checks entry so a deliberate skip is distinguishable
+            # from missing wiring (see build_result() docstring).
+            preflight_skip_reason_code = "canonical_parent_without_verification_commands"
 
-    result = build_result(body, args.mode, validate_result, preflight_result, preflight_exit_code)
+    result = build_result(
+        body,
+        args.mode,
+        validate_result,
+        preflight_result,
+        preflight_exit_code,
+        preflight_skip_reason_code=preflight_skip_reason_code,
+    )
 
     print(json.dumps(result, indent=2))
 
