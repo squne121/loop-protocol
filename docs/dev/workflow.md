@@ -263,11 +263,12 @@ rollback 後の config を checker が意図どおり判定することを確認
 
 ```bash
 uv run --locked python3 scripts/check_impl_review_loop_codex_dispatch.py \
-  --assert-no-max-depth-setting
+  --assert-project-multi-agent-v1-config
 ```
 
-V1 rollback 状態では `--assert-no-max-depth-setting` は非ゼロ終了が期待値であり、
-Multi-Agent V2 declaration を再有効化するまで PASS と扱わない。
+V1 rollback 状態では `--assert-project-multi-agent-v1-config` が、strict boolean
+`enabled = false` と strict integer `max_depth = 1` の両方を正として PASS する。
+意図的な失敗ではなく、期待する V1 状態への一致を rollback の証拠として扱う。
 
 ### human_escalation 後の Issue 本文変更と contract review 再実行
 

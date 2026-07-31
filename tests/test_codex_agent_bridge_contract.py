@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = REPO_ROOT / "scripts" / "check_codex_agent_config.py"
 spec = importlib.util.spec_from_file_location("check_codex_agent_config", MODULE_PATH)
@@ -185,6 +187,31 @@ def test_scope_rollup_runner_parity_excludes_permission_profile_but_checks_contr
     assert "MUTATION_BOUNDARY:" in result.stdout
 
 
+def test_parity_treats_codex_delegation_prose_as_advisory(tmp_path: Path):
+    repo = _copy_fixture_repo(tmp_path)
+    agent_path = repo / ".codex/agents/issue-author.toml"
+    agent_path.write_text(
+        agent_path.read_text(encoding="utf-8").replace(
+            "Known limitation",
+            "spawn subagents\n\nKnown limitation",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [sys.executable, "scripts/check_claude_codex_agent_parity.py", "--strict"],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "authority: advisory" in result.stdout
+    assert "codex_intent_hint: allowed" in result.stdout
+
+
 def _copy_fixture_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -274,6 +301,41 @@ def test_python_cli_detects_route_surface_mismatch_via_subprocess(tmp_path: Path
 
     assert result.returncode == 1
     assert "runtime_followup_route expected 'create-issue|edit-issue' got 'create-issue'" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("config_text", "diagnostic"),
+    [
+        ('features = "not-a-table"\n', "[features] must be a table"),
+        ("[features.multi_agent_v2\nenabled = true\n", "malformed TOML"),
+    ],
+)
+def test_python_runtime_contract_reports_invalid_config_without_traceback(
+    tmp_path: Path,
+    config_text: str,
+    diagnostic: str,
+):
+    repo = _copy_fixture_repo(tmp_path)
+    (repo / ".codex/config.toml").write_text(config_text, encoding="utf-8")
+
+    result = _run_python_validator(repo, runtime_contract=True)
+
+    assert result.returncode == 1
+    assert diagnostic in result.stdout
+    assert "Traceback" not in result.stdout
+    assert "Traceback" not in result.stderr
+
+
+def test_python_runtime_contract_reports_missing_config_without_traceback(tmp_path: Path):
+    repo = _copy_fixture_repo(tmp_path)
+    (repo / ".codex/config.toml").unlink()
+
+    result = _run_python_validator(repo, runtime_contract=True)
+
+    assert result.returncode == 1
+    assert "TOML file not found" in result.stdout
+    assert "Traceback" not in result.stdout
+    assert "Traceback" not in result.stderr
 
 
 def test_python_cli_detects_missing_passive_session_hook_via_subprocess(tmp_path: Path):

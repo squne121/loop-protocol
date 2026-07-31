@@ -42,13 +42,31 @@ CLAUDE_PERMISSION_LEVEL_MAP = {
     "default": "repo-write",
 }
 
-# Keywords in Codex developer_instructions that indicate nested delegation
+# Keywords in Codex developer_instructions that indicate nested delegation.
+# These are advisory prose hints only; they are not runtime capability or
+# strict-parity authority.
 CODEX_DELEGATION_KEYWORDS = [
     "spawn_agents_on_csv",
     "recursive delegation",
     "child agent spawn",
     "spawn subagents",
 ]
+
+
+def classify_delegation_intent_hint(instructions: str) -> str:
+    """Return an advisory prose hint: allowed, blocked, or unknown."""
+    normalized = instructions.casefold()
+    blocked_phrases = (
+        "do not spawn subagents",
+        "must not spawn subagents",
+        "do not use spawn_agent",
+        "must not use spawn_agent",
+    )
+    if any(phrase in normalized for phrase in blocked_phrases):
+        return "blocked"
+    if any(keyword.casefold() in normalized for keyword in CODEX_DELEGATION_KEYWORDS):
+        return "allowed"
+    return "unknown"
 
 
 class DriftEvidence:
@@ -103,6 +121,8 @@ class AgentParityFacts:
         # True = blocked, False = allowed, None = unknown (no tools key)
         nested_delegation_blocked: bool | None = False,
         nested_delegation_evidence: str = "",
+        delegation_intent_hint: str = "unknown",
+        delegation_intent_evidence: str = "",
         model_declaration: str | None = None,
         reasoning_effort_declaration: str | None = None,
         evidence: list[DriftEvidence] | None = None,
@@ -124,6 +144,8 @@ class AgentParityFacts:
         # Delegation (B5: bool | None)
         self.nested_delegation_blocked: bool | None = nested_delegation_blocked
         self.nested_delegation_evidence = nested_delegation_evidence
+        self.delegation_intent_hint = delegation_intent_hint
+        self.delegation_intent_evidence = delegation_intent_evidence
         # Model config (advisory; not runtime proof)
         self.model_declaration = model_declaration
         self.reasoning_effort_declaration = reasoning_effort_declaration
@@ -394,6 +416,12 @@ def extract_claude_facts(
         facts.nested_delegation_evidence = (
             f"No tools key in frontmatter of {claude_path.name} (unknown)"
         )
+    facts.delegation_intent_hint = (
+        "blocked" if facts.nested_delegation_blocked is True
+        else "allowed" if facts.nested_delegation_blocked is False
+        else "unknown"
+    )
+    facts.delegation_intent_evidence = facts.nested_delegation_evidence
 
     # Model declaration (advisory)
     model = str(fm.get("model", ""))
@@ -426,25 +454,23 @@ def extract_codex_facts(
         declared = extract_runtime_field(instructions, "MUTATION_BOUNDARY")
         facts.mutation_boundary = declared or "unknown"
 
-    # Multi-Agent V2 is enabled at the project level, but nested delegation is
-    # still opt-in per Codex agent.  Therefore legacy max_depth must not be
-    # used as the sole proxy for a particular agent's delegation capability.
+    # Delegation prose is advisory only. It must not become strict parity or
+    # runtime-capability authority.
     try:
         config = read_toml(CODEX_CONFIG_PATH)
-        multi_agent_v2 = config.get("features", {}).get("multi_agent_v2")
+        features = config.get("features", {})
+        multi_agent_v2 = features.get("multi_agent_v2") if isinstance(features, dict) else None
         v2_enabled = (
             isinstance(multi_agent_v2, dict)
             and type(multi_agent_v2.get("enabled")) is bool
             and multi_agent_v2["enabled"] is True
         )
-        allows_nested_delegation = any(
-            keyword in instructions for keyword in CODEX_DELEGATION_KEYWORDS
-        )
+        facts.delegation_intent_hint = classify_delegation_intent_hint(instructions)
         if v2_enabled:
-            facts.nested_delegation_blocked = not allows_nested_delegation
+            facts.nested_delegation_blocked = None
             facts.nested_delegation_evidence = (
-                "[features.multi_agent_v2].enabled=True plus Codex agent metadata "
-                f"delegation_opt_in={allows_nested_delegation}"
+                "[features.multi_agent_v2].enabled=True; delegation capability is not "
+                "proven by developer_instructions"
             )
         else:
             facts.nested_delegation_blocked = None
@@ -456,12 +482,9 @@ def extract_codex_facts(
         facts.nested_delegation_blocked = None
         facts.nested_delegation_evidence = ".codex/config.toml could not be read"
 
-    # B6: Check developer_instructions for delegation-enabling keywords
-    for keyword in CODEX_DELEGATION_KEYWORDS:
-        if keyword in instructions:
-            facts.nested_delegation_evidence += (
-                f"; WARNING: delegation keyword '{keyword}' found in developer_instructions"
-            )
+    facts.delegation_intent_evidence = (
+        "developer_instructions prose heuristic; advisory only, not strict authority"
+    )
 
     # Model declaration (advisory)
     model = str(codex_doc.get("model", ""))
@@ -554,35 +577,6 @@ def compare_parity(
             agent=agent_name,
             expected=x_boundary or "unknown",
             actual=c_boundary or "unknown",
-        ))
-
-    # --- Nested delegation parity (AC4, AC9) ---
-    # B5: Handle None (unknown) — None vs True/False is considered drift
-    c_blocked = claude_facts.nested_delegation_blocked
-    x_blocked = codex_facts.nested_delegation_blocked
-    if c_blocked != x_blocked:
-        claude_text = claude_path.read_text(encoding="utf-8")
-        line = find_line_number(claude_text, "disallowedTools")
-        drifts.append(DriftEvidence(
-            rule_id="NESTED_DELEGATION_001",
-            file=str(claude_path),
-            line=line,
-            launcher="claude",
-            agent=agent_name,
-            expected=f"nested_delegation_blocked={x_blocked}",
-            actual=f"nested_delegation_blocked={c_blocked}",
-        ))
-
-    # B6: Check if Codex delegation keywords were found
-    if codex_facts.nested_delegation_evidence and "delegation keyword" in codex_facts.nested_delegation_evidence:
-        drifts.append(DriftEvidence(
-            rule_id="NESTED_DELEGATION_001",
-            file=str(codex_path),
-            line=0,
-            launcher="codex",
-            agent=agent_name,
-            expected="no delegation keywords in developer_instructions",
-            actual="delegation keyword found in developer_instructions",
         ))
 
     return drifts
@@ -698,9 +692,9 @@ def format_text_report(
     lines.append("NESTED_DELEGATION_REPORT:")
     for dr in delegation_reports:
         lines.append(f"  agent: {dr['agent']}")
-        lines.append(f"    claude: blocked={dr['claude_blocked']} evidence={dr['claude_evidence']}")
-        lines.append(f"    codex: blocked={dr['codex_blocked']} evidence={dr['codex_evidence']}")
-        lines.append(f"    match: {dr['match']}")
+        lines.append("    authority: advisory")
+        lines.append(f"    claude_intent_hint: {dr['claude_intent_hint']} evidence={dr['claude_evidence']}")
+        lines.append(f"    codex_intent_hint: {dr['codex_intent_hint']} evidence={dr['codex_evidence']}")
     lines.append("")
 
     return "\n".join(lines)
@@ -869,11 +863,10 @@ def main(argv: list[str] | None = None) -> int:
         model_reports.append(build_model_report(agent_name, claude_facts, codex_facts))
         delegation_reports.append({
             "agent": agent_name,
-            "claude_blocked": claude_facts.nested_delegation_blocked,
-            "claude_evidence": claude_facts.nested_delegation_evidence,
-            "codex_blocked": codex_facts.nested_delegation_blocked,
-            "codex_evidence": codex_facts.nested_delegation_evidence,
-            "match": claude_facts.nested_delegation_blocked == codex_facts.nested_delegation_blocked,
+            "claude_intent_hint": claude_facts.delegation_intent_hint,
+            "claude_evidence": claude_facts.delegation_intent_evidence,
+            "codex_intent_hint": codex_facts.delegation_intent_hint,
+            "codex_evidence": codex_facts.delegation_intent_evidence,
         })
 
     # --- Determine overall status ---
