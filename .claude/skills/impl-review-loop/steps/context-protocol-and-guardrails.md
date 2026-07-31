@@ -11,7 +11,7 @@
 | SubAgent | 出力契約 | 受け取り方 |
 |---|---|---|
 | `implementation-worker` | `IMPLEMENT_RESULT_V1` YAML | `status` / `pr_url` / `verification` を LOOP_STATE へ |
-| `test-runner` | `TEST_VERDICT_MACHINE v1` マーカー付き PR コメント | `gh pr view --json comments` 経由で抽出 |
+| `test-runner` | `TEST_VERDICT_MACHINE v1` マーカー付き PR コメント（non-authoritative advisory、Issue #1856） | `gh pr view --json comments` 経由で抽出。参考情報として LOOP_STATE に反映してよいが、通常レビューの APPROVE/REQUEST_CHANGES 判定の必須 blocking input としては扱わない（authoritative evidence は `CI_CHECK_RUN_SCOPED` と束縛済み独立実行 Issue VC。`.claude/skills/pr-review-judge/references/evidence-policy.md` 参照） |
 | `pr-reviewer` | `LOOP_VERDICT` YAML（verdict コメント内） | step-5-mergeability-handling.md の抽出手順を使う |
 
 ## 外部仕様調査の判定根拠記録

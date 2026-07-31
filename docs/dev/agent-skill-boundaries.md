@@ -889,9 +889,10 @@ routing_allowed_fields:
     - status         # ok | failed
     - failure_class  # gh_auth | permission_denied | issue_not_found | schema_invalid | unknown（status: failed 時のみ）
   TEST_VERDICT_MACHINE/v1:
-    - status     # pass | partial | fail
+    - status     # pass | partial | fail（Issue #1856: 通常レビュー判定に対しては non-authoritative advisory。routing-critical ではない）
     - summary    # 統計のみ（raw 出力は参照しない）
-    - branch_behind_main  # impl-review-loop Step 5 の BEHIND reroute 判定で使う routing-critical field
+    # branch_behind_main は Issue #1856（evidence authority cutover, Phase 1）で撤去された。
+    # BEHIND reroute 判定は LOOP_VERDICT_V2.mergeability.merge_state_status のみを参照する。
   LOOP_VERDICT:
     - verdict    # APPROVE | REQUEST_CHANGES
     - status     # ok | failed
@@ -919,16 +920,25 @@ impl_review_loop_v2_routing_boundary:
     classification: routing_critical
   live_mergeability.merge_state_status:
     classification: routing_critical
+    # Issue #1856: BEHIND ルーティングの唯一の判定根拠。branch_behind_main /
+    # TEST_VERDICT_MACHINE/v1 依存は撤去された。
   TEST_VERDICT_MACHINE/v1.branch_behind_main:
-    classification: routing_critical
+    classification: non_authoritative_diagnostic
+    # Issue #1856（evidence authority cutover, Phase 1）: この field は
+    # route_loop_verdict_v2() の任意 test_verdict 引数として渡ってもよいが、
+    # routing 判断には一切使われない（診断表示専用）。BEHIND 判定は
+    # live_mergeability.merge_state_status のみで確定する。
   negative_rules:
     - reviewer self-reported merge_ready / required_auto_actions / allowed_paths_gate / mergeability must not be treated as a canonical routing field
     - LOOP_VERDICT.recommendations (V1 wording) must not be treated as a canonical routing field
     - only mergeable == CONFLICTING or merge_state_status in (CONFLICTING, DIRTY) is an actual Git conflict; UNKNOWN / BLOCKED / BEHIND / UNSTABLE / DRAFT / HAS_HOOKS are not conflicts
     - stale reviewed_head_sha (!= live head_sha) must re-review at current head, not fail closed
+    - TEST_VERDICT_MACHINE/v1.branch_behind_main (and test_verdict generally) must not gate or block BEHIND routing; it is diagnostics-only (Issue #1856)
+    - unknown required_auto_actions.kind must fail closed (does not apply post-#1873: required_auto_actions is no longer a reviewer input; the router synthesizes the update_branch action itself)
+    - missing or mismatched expected_head_sha must fail closed before update_branch dispatch
 ```
 
-`live_mergeability.merge_state_status` は BEHIND/CONFLICTING/DIRTY 等の action 分岐点、`reviewer_verdict.reviewed_head_sha` と live `head_sha` の一致確認は stale verdict を防ぐ race guard であり、いずれも routing-critical である。`branch_behind_main` は test-runner から Step 5 へ渡る補助信号で、BEHIND 状態の invariant 検証を `TEST_VERDICT_MACHINE/v1` 側から補強する field として扱う。
+`live_mergeability.merge_state_status` は BEHIND/CONFLICTING/DIRTY 等の action 分岐点、`reviewer_verdict.reviewed_head_sha` と live `head_sha` の一致確認は stale verdict を防ぐ race guard であり、いずれも routing-critical である。`expected_head_sha`（router が合成する `update_branch` action に含める）も同じ race guard の一部として routing-critical である。`TEST_VERDICT_MACHINE/v1.branch_behind_main` は Issue #1856（evidence authority cutover, Phase 1）以降 non-authoritative diagnostic であり、`route_loop_verdict_v2()` の任意 `test_verdict` 引数として受理されても BEHIND 判定・その他いかなる routing 決定にも使われない。BEHIND 判定は `live_mergeability.merge_state_status == "BEHIND"` のみで確定する。
 
 ### 一時例外（temporary_exceptions）
 

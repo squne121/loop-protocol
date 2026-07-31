@@ -48,9 +48,13 @@ from route_loop_verdict_v2 import route_loop_verdict_v2
 decision = route_loop_verdict_v2(
     reviewer_verdict,       # {verdict, reviewed_head_sha, blockers, warnings}
     live_mergeability,      # {head_sha, mergeable, merge_state_status}
-    test_verdict=test_verdict,  # optional: {"branch_behind_main": bool, ...}
+    test_verdict=test_verdict,  # optional: diagnostics-only, never consulted for routing
 )
 ```
+
+Issue #1856（evidence authority cutover, Phase 1）: `test_verdict` を渡す場合でも、その内容
+（`branch_behind_main` を含む）は routing 判断に一切使われない。BEHIND 判定は
+`live_mergeability.merge_state_status == "BEHIND"` のみで確定する。
 
 `decision.route` の値と orchestrator の対応:
 
@@ -59,7 +63,7 @@ decision = route_loop_verdict_v2(
 | `approved` | `APPROVE` かつ mergeable/merge_state_status が `CLEAN`/`HAS_HOOKS` | 終了（approved）。`step-5-feedback-and-termination.md` の残り gate を確認 |
 | `continue_loop` | `REQUEST_CHANGES` | 次イテレーションへ（blockers を fix_delta に） |
 | `route_stale_head_rereview` | `reviewed_head_sha != live head_sha` | Step 4 を現在の head で再委譲し、Step 5 を最初からやり直す |
-| `route_to_update_branch` | `merge_state_status == BEHIND` かつ `branch_behind_main == true` | 下記「BEHIND 分岐 routing」参照 |
+| `route_to_update_branch` | `merge_state_status == BEHIND`（`test_verdict` の有無・内容に関わらず） | 下記「BEHIND 分岐 routing」参照 |
 | `route_human_escalation` | `HUMAN_REVIEW_REQUIRED`、または `BLOCKED`/`UNSTABLE`/`DRAFT` | 人間判断を仰いで停止（`termination_reason: human_escalation`） |
 | `route_conflict_escalation` | `mergeable == CONFLICTING` または `merge_state_status` が `DIRTY`/`CONFLICTING` | CONFLICTING PR Escalation Runbook 発動（actual conflict のみ hard stop） |
 | `fail_closed` | schema 不正、`APPROVE` かつ `blockers` 非空、`mergeability_unknown` 等 | `decision.reason_code` / `decision.errors` を blocker として記録し、`mergeability_unknown` は bounded retry（最大 3 回、5 秒間隔）後に human escalation |

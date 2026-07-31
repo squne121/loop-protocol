@@ -24,9 +24,7 @@ description: implementation child issue に紐づく PR をレビューし、lin
 
 ### 2) Mergeability 取得
 
-優先: TEST_VERDICT_MACHINE のコメント。
-
-見つからない場合のみ `gh pr view --json mergeable,mergeStateStatus` を利用。
+**Issue #1856（evidence authority cutover, Phase 1）**: `gh pr view --json mergeable,mergeStateStatus` を authoritative source として直接利用する（TEST_VERDICT_MACHINE の有無に依存しない）。BEHIND ルーティングは `merge_state_status == "BEHIND"` のみで判定し、`route_loop_verdict_v2()` は TEST_VERDICT の `branch_behind_main` を参照しない。
 
 判定（review criteria 自体は変更しない。Issue #1873 で変わるのは transport のみ）:
 
@@ -38,34 +36,57 @@ description: implementation child issue に紐づく PR をレビューし、lin
 
 ### 3) VC 証拠ポリシー（PR_REVIEW_JUDGE_VC_EVIDENCE_POLICY）
 
-優先順位:
+**Issue #1856（evidence authority cutover, Phase 1）**: authoritative な証拠は以下の2系列のみ。`TEST_VERDICT_MACHINE` は advisory（non-authoritative）に降格した（詳細は `references/evidence-policy.md`）。
 
-1. 最優先は `TEST_VERDICT_MACHINE`
-2. 次点は `CI_CHECK_RUN_SCOPED`
+1. `CI_CHECK_RUN_SCOPED`（current-head, `expected_head_sha` / `check_run_id` 束縛）
+2. exact head SHA + literal command SHA256 に束縛された独立実行 Issue VC
 3. 補助報告は `PR_BODY_SELF_REPORT`（単独では APPROVE 不可）
+4. `TEST_VERDICT_MACHINE`（advisory のみ。APPROVE の必須条件にも REQUEST_CHANGES 回避の根拠にもしない）
 
 - APPROVE 禁止条件
   - `verification_skipped_count > 0`
   - `SKIP:` / `exit 77`
   - `_*_fallback: true` など fallback/偽装成功
-  - TEST_VERDICT head が stale
+  - `CI_CHECK_RUN_SCOPED` head が stale、または missing / skipped / neutral / cancelled / unknown-classification
 
 ### 4) CI 証拠
 
-`ci_verdict_summary.py` を使用（raw `gh pr checks` は原則不使用）。
+**Issue #1856（evidence authority cutover, Phase 1 / AC11・AC12）**: required
+check の存在有無・pass/fail 判定の canonical evaluator は
+`.claude/skills/impl-review-loop/scripts/wait_ci_checks.py`
+（`gh pr checks --required --json` で live required set を取得し、CheckRun /
+StatusContext 双方を評価対象に含め、no-checks/skipped を fail-closed にする）
+であり、pr-review-judge・pr-reviewer-lite・impl-review-loop Step 4 の 3 経路が
+これを共有する。`ci_verdict_summary.py` はこれに加えて log excerpt 抽出・
+artifact 保存等の詳細 provenance 収集を行う拡張レイヤーとして使用する
+（raw `gh pr checks` は原則不使用）。
 
 ```bash
 HEAD_SHA=$(gh pr view <PR番号> --json headRefOid --jq .headRefOid)
+
+# canonical required-CI evaluator（3経路共通）
+uv run --locked python3 .claude/skills/impl-review-loop/scripts/wait_ci_checks.py \
+  --repo <owner>/<repo> --pr <PR番号> --head-sha "$HEAD_SHA" --required \
+  --interval 1 --timeout-seconds 1
+
+# 詳細 provenance（log excerpt / artifact）
 uv run --locked python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary.py --pr <PR番号> --repo <owner>/<repo> --expected-head-sha "$HEAD_SHA"
 ```
 
+`wait_ci_checks.py` の `CI_WAIT_RESULT_V1.status` が `no_checks` / `skipped_only` /
+`failed` / `cancelled` / `pending_timeout` / `head_sha_changed` のいずれかであれば
+fail-closed で `REQUEST_CHANGES` blocker とする。
+
+`ci_verdict_summary.py` の exit code:
+
 - `exit 0`: 補助証拠可
-- `exit 10`: blocker
+- `exit 10`: blocker（required checks が 0 件の場合の `no_required_evidence` を含む。
+  Issue #1856 AC11 により 0 件を `all_pass` として通過させない）
 - `exit 20`: CI 未確定 blocker
 - `exit 30`: stale_head_sha blocker
 - `exit 40`: gh error blocker
 
-`ci_verdict_summary.py` 不可用時は `gh pr checks` fallback を明記した上で停止判断。
+いずれのスクリプトも不可用時は `gh pr checks --required` fallback を明記した上で停止判断。
 
 ### 5) PR Evidence / AC の一致
 

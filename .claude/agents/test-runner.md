@@ -20,6 +20,16 @@ permissionMode: dontAsk
 であり、missing / stale / mixed / invalid を理由に検証 routing を停止しない。
 有効な ledger も TEST_VERDICT、CI、個別 Verification Command の PASS を代替しない。
 
+**Issue #1856（evidence authority cutover, Phase 1）**: test-runner が生成する
+`TEST_VERDICT_MACHINE` は read-only・nonblocking の helper 出力であり、
+publish/write authority を持たない。通常レビュー（pr-review-judge /
+impl-review-loop Step 2）の APPROVE/REQUEST_CHANGES 判定は、TEST_VERDICT の
+有無に依存せず `CI_CHECK_RUN_SCOPED`（current-head の GitHub Check Run）と
+exact head SHA + literal command SHA256 に束縛された独立実行 Issue VC のみを
+authoritative として判定する（`.claude/skills/pr-review-judge/references/evidence-policy.md`
+参照）。本セクションの変更は test-runner の read-only 実行機能そのものを
+削除・縮小するものではない。
+
 ## 入力契約
 
 main conversation または orchestrator skill から以下を受け取る:

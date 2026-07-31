@@ -9,6 +9,13 @@ as separate inputs. Each fixture file defines:
   - reviewer_verdict: minimal result convention dict
   - live_mergeability: live GitHub PR state dict
   - test_verdict: optional TEST_VERDICT_MACHINE/v1 dict or null
+
+Issue #1856 (evidence authority cutover, Phase 1): when a fixture supplies
+`test_verdict`, it is diagnostics-only and is never consulted for routing
+(this module does not special-case it; route_loop_verdict_v2() itself
+ignores its content when computing the route). BEHIND routing is derived
+solely from live_mergeability.merge_state_status.
+
   - expected.route: expected RouteDecision.route value
   - expected.fail_closed: expected RouteDecision.fail_closed value
   - expected.reason_code: optional exact match for RouteDecision.reason_code
@@ -18,6 +25,7 @@ as separate inputs. Each fixture file defines:
 
 from __future__ import annotations
 
+import ast
 import sys
 from pathlib import Path
 
@@ -29,7 +37,7 @@ SCRIPTS_DIR = IMPL_REVIEW_LOOP_DIR / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from route_loop_verdict_v2 import route_loop_verdict_v2  # noqa: E402
+from route_loop_verdict_v2 import RouteDecision, route_loop_verdict_v2  # noqa: E402
 
 FIXTURE_DIR = Path(__file__).parent
 
@@ -107,3 +115,96 @@ def test_no_legacy_v1_fields_accepted_at_all():
         result = route_loop_verdict_v2(reviewer_verdict, live_mergeability)
         assert result.fail_closed is True, f"legacy field {legacy_key} was not rejected"
         assert result.reason_code == f"schema_invalid_legacy_field_present:{legacy_key}"
+
+
+# ---------------------------------------------------------------------------
+# Extra 6: RouteDecision.selected_action and rerun_required are immutable
+# ---------------------------------------------------------------------------
+
+
+def test_route_decision_selected_action_is_immutable():
+    """Extra 6: selected_action must be MappingProxyType (immutable)."""
+    from types import MappingProxyType
+    fx = _load_fixture(FIXTURE_DIR / "positive_update_branch.yml")
+    result = route_loop_verdict_v2(
+        fx["reviewer_verdict"],
+        fx["live_mergeability"],
+        test_verdict=fx.get("test_verdict"),
+    )
+    assert result.selected_action is not None
+    assert isinstance(result.selected_action, MappingProxyType), (
+        f"Expected MappingProxyType, got {type(result.selected_action)}"
+    )
+    with pytest.raises(TypeError):
+        result.selected_action["kind"] = "hacked"  # type: ignore[index]
+
+
+def test_route_decision_rerun_required_is_immutable():
+    """Extra 6: rerun_required must be MappingProxyType (immutable)."""
+    from types import MappingProxyType
+    fx = _load_fixture(FIXTURE_DIR / "positive_update_branch.yml")
+    result = route_loop_verdict_v2(
+        fx["reviewer_verdict"],
+        fx["live_mergeability"],
+        test_verdict=fx.get("test_verdict"),
+    )
+    assert isinstance(result.rerun_required, MappingProxyType), (
+        f"Expected MappingProxyType, got {type(result.rerun_required)}"
+    )
+    with pytest.raises(TypeError):
+        result.rerun_required["verification"] = False  # type: ignore[index]
+
+
+# ---------------------------------------------------------------------------
+# Pure unit tests for AC1 (no subprocess / import side effects)
+# ---------------------------------------------------------------------------
+
+
+def test_module_no_forbidden_imports():
+    """Extra 7 (AST-based): route_loop_verdict_v2.py must not import forbidden modules."""
+    src = SCRIPTS_DIR / "route_loop_verdict_v2.py"
+    tree = ast.parse(src.read_text())
+    forbidden = {"subprocess", "socket", "urllib", "requests", "httpx", "os"}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            else:
+                names = [node.module or ""]
+            for name in names:
+                root = name.split(".")[0]
+                assert root not in forbidden, (
+                    f"Forbidden import in route_loop_verdict_v2.py: {name!r}"
+                )
+
+
+def test_route_decision_is_frozen():
+    """AC2: RouteDecision must be frozen (immutable)."""
+    rd = RouteDecision(
+        route="approved",
+        fail_closed=False,
+        reason_code=None,
+        selected_action=None,
+        rerun_required={"verification": False, "pr_review": False},
+        errors=(),
+    )
+    with pytest.raises((AttributeError, TypeError)):
+        rd.route = "continue_loop"  # type: ignore[misc]
+
+
+def test_route_decision_fields():
+    """AC2: RouteDecision must have all required fields."""
+    rd = RouteDecision(
+        route="approved",
+        fail_closed=False,
+        reason_code=None,
+        selected_action=None,
+        rerun_required={"verification": False, "pr_review": False},
+        errors=(),
+    )
+    assert hasattr(rd, "route")
+    assert hasattr(rd, "fail_closed")
+    assert hasattr(rd, "reason_code")
+    assert hasattr(rd, "rerun_required")
+    assert hasattr(rd, "selected_action")
+    assert hasattr(rd, "errors")

@@ -85,8 +85,11 @@ CI_TEST_PERFORMANCE_DECISION_V1:
   reviewer_gate:
     approve_allowed: true | false
     required_evidence:
-      - TEST_VERDICT_MACHINE            # test-runner による TEST_VERDICT_MACHINE/v1
-      - CI_CHECK_RUN_SCOPED             # GitHub CI check の成功
+      - CI_CHECK_RUN_SCOPED             # GitHub CI check の成功（authoritative、Issue #1856）
+      # TEST_VERDICT_MACHINE は Issue #1856（evidence authority cutover, Phase 1）により
+      # 通常レビュー判定の必須項目から外れ、advisory（任意・non-authoritative）として
+      # 記載してよいが required_evidence には含めない:
+      # - TEST_VERDICT_MACHINE           # advisory のみ。必須証跡ではない
       # ci_change の場合はさらに必要:
       # - ci_runtime_baseline_v1       # baseline との比較（ci_change 時）
     approve_denied_reason: null | "<理由>"

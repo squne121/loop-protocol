@@ -1,9 +1,8 @@
 description: >-
-  merge_state_status=BEHIND, test_verdict supplied but missing the
-  branch_behind_main key -> still routes to update_branch. Issue #1856
-  (evidence authority cutover, Phase 1): test_verdict is diagnostics-only
-  and is never consulted for BEHIND routing; BEHIND is derived solely from
-  live_mergeability.merge_state_status.
+  test_verdict.branch_behind_main=false but live merge_state_status=BEHIND
+  -> still routes to update_branch. Issue #1856 (evidence authority
+  cutover, Phase 1): test_verdict.branch_behind_main is diagnostics-only
+  and cannot override or block the live BEHIND signal.
 reviewer_verdict:
   verdict: APPROVE
   reviewed_head_sha: abc123def456
@@ -13,7 +12,7 @@ live_mergeability:
   mergeable: MERGEABLE
   merge_state_status: BEHIND
 test_verdict:
-  result: pass
+  branch_behind_main: false
 expected:
   route: route_to_update_branch
   fail_closed: false

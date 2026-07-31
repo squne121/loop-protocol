@@ -452,11 +452,16 @@ def test_b5_fixture_matrix_approved():
 
 
 def test_b5_fixture_matrix_update_branch():
-    """B5: APPROVE + live BEHIND + branch_behind_main confirmed must route to
-    route_to_update_branch, with the action synthesized by the router."""
+    """B5: APPROVE + live BEHIND must route to route_to_update_branch, with
+    the action synthesized by the router.
+
+    Issue #1856 (evidence authority cutover, Phase 1): BEHIND is derived
+    solely from live_mergeability.merge_state_status; test_verdict (when
+    supplied) is diagnostics-only and does not gate this route.
+    """
     rv = _make_reviewer_verdict("APPROVE")
     lm = _make_live_mergeability("BEHIND")
-    result = route_loop_verdict_v2(rv, lm, test_verdict={"branch_behind_main": True})
+    result = route_loop_verdict_v2(rv, lm)
     assert result.route == "route_to_update_branch", (
         f"Expected 'route_to_update_branch', got '{result.route}'. errors: {result.errors}"
     )

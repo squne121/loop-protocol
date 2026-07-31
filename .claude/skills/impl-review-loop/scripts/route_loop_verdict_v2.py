@@ -23,6 +23,12 @@ Public API
 route_loop_verdict_v2(reviewer_verdict, live_mergeability, test_verdict=None)
     -> RouteDecision
 
+Issue #1856 (evidence authority cutover, Phase 1): the optional
+``test_verdict`` argument, when supplied, is accepted for schema
+compatibility only. It is diagnostics-only and is never consulted for any
+routing decision. BEHIND routing is derived solely from
+``live_mergeability["merge_state_status"] == "BEHIND"``.
+
 RouteDecision fields
 ---------------------
 route:            one of the ROUTE_* constants below
@@ -204,34 +210,21 @@ def _validate_live_mergeability(raw: Any) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# branch_behind_main / merge_state_status invariant (AC6, preserved from
-# #1869/PR #1871)
+# merge_state_status-only BEHIND determination (Issue #1856 AC1/AC2)
 # ---------------------------------------------------------------------------
+#
+# Issue #1856: The historical branch_behind_main / test_verdict cross-check
+# (formerly implemented here as _check_behind_invariant) depended on the
+# protected TEST_VERDICT lane. Ordinary-review evidence authority no longer
+# depends on that lane, so BEHIND is derived solely from
+# live_mergeability["merge_state_status"]. A caller-supplied test_verdict is
+# accepted (Issue #1873 signature) but is diagnostics-only: it is never
+# consulted here, and its presence/absence/content never changes the route.
 
-def _check_behind_invariant(
-    branch_behind_main: Any,
-    merge_state_status: Any,
-) -> tuple[bool, str | None]:
-    """Evaluate the branch_behind_main x merge_state_status invariant.
 
-    Returns (is_behind, reason_code). is_behind is True only for
-    (branch_behind_main is True AND merge_state_status == "BEHIND").
-    """
-    if not isinstance(branch_behind_main, bool):
-        if branch_behind_main is not None:
-            return False, "branch_behind_main_not_bool"
-        return False, None
-
-    if branch_behind_main is True and merge_state_status == "BEHIND":
-        return True, None
-
-    if branch_behind_main is True and merge_state_status != "BEHIND":
-        return False, f"branch_behind_true_but_merge_state_status_not_behind:{merge_state_status}"
-
-    if branch_behind_main is False and merge_state_status == "BEHIND":
-        return False, "branch_behind_false_but_merge_state_status_BEHIND"
-
-    return False, None
+def _is_behind(merge_state_status: Any) -> bool:
+    """Return True iff merge_state_status is exactly the string "BEHIND"."""
+    return merge_state_status == "BEHIND"
 
 
 # ---------------------------------------------------------------------------
@@ -254,13 +247,21 @@ def route_loop_verdict_v2(
         Live GitHub PR state fetched by the caller:
         {head_sha, mergeable, merge_state_status}.
     test_verdict:
-        Optional TEST_VERDICT_MACHINE/v1 dict. When supplied, its
-        branch_behind_main field is cross-checked against
-        live_mergeability.merge_state_status.
+        Optional TEST_VERDICT_MACHINE/v1 dict, accepted for backward/schema
+        compatibility. It is diagnostics-only (Issue #1856 evidence
+        authority cutover, Phase 1) and is never consulted for routing.
 
     Returns
     -------
     RouteDecision
+
+    Note (Issue #1856, AC1/AC2)
+    ----------------------------
+    BEHIND routing is derived solely from
+    ``live_mergeability["merge_state_status"] == "BEHIND"``; the historical
+    branch_behind_main cross-check against the protected TEST_VERDICT lane
+    has been removed (evidence authority cutover, Phase 1). A supplied
+    ``test_verdict`` never changes the route.
     """
     err = _validate_reviewer_verdict(reviewer_verdict)
     if err:
@@ -312,30 +313,16 @@ def route_loop_verdict_v2(
         )
 
     # ------------------------------------------------------------------
-    # branch_behind_main x merge_state_status invariant (AC6, preserved
-    # from #1869/PR #1871): checked unconditionally whenever test_verdict
-    # is supplied, not only when merge_state_status == BEHIND, so a
-    # test-reported behind state that disagrees with a non-BEHIND live
-    # status is still caught.
-    # ------------------------------------------------------------------
-    if test_verdict is not None and "branch_behind_main" in test_verdict:
-        branch_behind_main = test_verdict.get("branch_behind_main")
-        _is_behind, behind_reason = _check_behind_invariant(branch_behind_main, merge_state_status)
-        if behind_reason is not None and branch_behind_main is not None:
-            return _fail(
-                f"branch_behind_invariant_violation:{behind_reason}",
-                f"branch_behind_main={branch_behind_main!r}, "
-                f"merge_state_status={merge_state_status!r}. Reason: {behind_reason}",
-            )
-
-    # ------------------------------------------------------------------
     # Actual Git conflict: only CONFLICTING/DIRTY are a hard stop.
+    # (Preserved from #1869/PR #1871; independent of test_verdict.)
     # ------------------------------------------------------------------
     if mergeable == "CONFLICTING" or merge_state_status in _CONFLICT_STATUSES:
         return _decision(
             ROUTE_CONFLICT_ESCALATION,
             reason_code=f"actual_conflict:mergeable={mergeable},merge_state_status={merge_state_status}",
         )
+
+    is_behind = _is_behind(merge_state_status)
 
     # ------------------------------------------------------------------
     # UNKNOWN mergeable/merge_state_status: not a conflict, but not yet
@@ -351,22 +338,11 @@ def route_loop_verdict_v2(
     # ------------------------------------------------------------------
     # BEHIND: synthesize the update_branch action. The reviewer no longer
     # supplies required_auto_actions; this router computes it from live
-    # state per #1873.
+    # state per #1873. BEHIND is derived solely from
+    # live_mergeability.merge_state_status (Issue #1856); a supplied
+    # test_verdict is diagnostics-only and never gates this route.
     # ------------------------------------------------------------------
-    if merge_state_status == "BEHIND":
-        if test_verdict is None or "branch_behind_main" not in test_verdict:
-            return _fail(
-                "missing_branch_behind_main_for_BEHIND",
-                "merge_state_status is BEHIND but test_verdict.branch_behind_main "
-                "key is absent.",
-            )
-        if test_verdict.get("branch_behind_main") is not True:
-            return _fail(
-                "behind_status_without_confirmed_branch_behind_main",
-                "merge_state_status is BEHIND but branch_behind_main did not "
-                "confirm the state.",
-            )
-
+    if is_behind:
         action = {
             "kind": "update_branch",
             "executor": _UPDATE_BRANCH_EXECUTOR,

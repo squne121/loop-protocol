@@ -121,7 +121,7 @@ issue-contract-review は `runtime-verification: true` タグを検出した場�
 
 動作検証 AC を実行不可能な環境（外部サービス未起動・権限不足・ネットワーク遮断等）では SKIP を宣言し、実行環境不可として Stop Condition を発火させる。SKIP は「検証をパスしたこと」を意味しない。
 
-### SKIP exit code: 77
+### SKIP exit code: 77（SKIP を宣言する exit code）
 
 VC スクリプトが SKIP を宣言する場合、exit code **77** を返す。
 
@@ -210,6 +210,8 @@ Reason: <判定理由（FAIL/SKIP の場合は必須）>
 - **test-runner**: VC スクリプトを実行し、スクリプトが artifacts/ に出力したログを後続 SubAgent（pr-review-judge）へ引き渡す。exit code・stdout・artifacts ログを統合した結果を `TEST_VERDICT_MACHINE` に乗せる。
 - test-runner は `disallowedTools: Edit, Write, MultiEdit` のため、直接ファイル書き込みはせず、VC スクリプト自身が artifacts/ を書く設計とする（test-runner.md の「読み取り専用スクリプトのみ実行可」例外として `artifacts/` への append を許容するルール更新は #83 で実施）。
 - 証跡の PR 引用は test-runner 結果を受けた implementation-worker または pr-reviewer が PR 本文 `## Runtime Verification Evidence` セクションへ inline 化する（次節参照）。
+
+**Issue #1856（evidence authority cutover, Phase 1）**: `TEST_VERDICT_MACHINE` は動作検証（Runtime Verification）の証跡集約フォーマットとして引き続き使用するが、通常レビュー（pr-review-judge / impl-review-loop Step 2）の APPROVE/REQUEST_CHANGES 判定に対しては non-authoritative（advisory）である。通常レビューの authoritative evidence は `CI_CHECK_RUN_SCOPED` と exact head SHA + literal command SHA256 に束縛された独立実行 Issue VC のみ（`.claude/skills/pr-review-judge/references/evidence-policy.md` 参照）。
 
 ---
 
@@ -409,7 +411,7 @@ Runtime Verification Applicability が `immediate` の PR の本文には以下�
 4. **Evidence**: 主張を裏付ける Verification Command の結果または linked issue の VC との対応
 5. **Follow-up**: `Not controlled` が非空の場合の後続 Issue（必須）
 
-### SAFETY_CLAIMS_V1 machine-readable schema
+### SAFETY_CLAIMS_V1 machine-readable schema（機械可読スキーマ）
 
 PR 本文の Safety Claim Matrix は以下の YAML 形式でも表現できる（`## Safety Claim Matrix` セクション内に埋め込む場合）。自動検証ツールはこの schema を参照して parse する。
 
