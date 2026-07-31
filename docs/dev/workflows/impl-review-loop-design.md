@@ -47,7 +47,7 @@ summary_budget: "<= 1200 chars"
 - `product_spec_preflight` の routing table 設計
 - `external_research_skip_basis` の記録規則
 - PR conflict / dirty / blocked 時の escalation 方針
-- `max_iterations=5` のデフォルト根拠
+- `max_iterations=3` のデフォルト根拠
 
 ## Non-goals
 
@@ -62,7 +62,7 @@ summary_budget: "<= 1200 chars"
 |---|---|
 | 呼び出しトリガー | `/impl-review-loop <N>` / 「Issue ◯◯ をループで実装して」 |
 | 必須入力 | `issue_number` |
-| 任意入力 | `contract_snapshot_url`（省略時は preparation で自動取得）、`max_iterations`（既定 5） |
+| 任意入力 | `contract_snapshot_url`（省略時は preparation で自動取得）、`max_iterations`（既定 3） |
 | 前提条件 | `issue-contract-review` が `status: go` を返していること、`state/needs-human` 非存在 |
 | 完了条件 | `LOOP_VERDICT: APPROVE`（PR は人間がマージ判断） |
 
@@ -105,17 +105,16 @@ summary_budget: "<= 1200 chars"
 - git push / `gh pr create` / `gh pr edit`（open-pr skill 経由）
 - 実際のファイル編集・実装（implementation-worker）
 - pnpm コマンド実行・テスト実行（test-runner）
-- `gh pr review` による GitHub verdict 記録（pr-reviewer）
+- `gh pr comment --body-file` による通常コメントとしての verdict 投稿（control-plane が担う。pr-reviewer 自身は GitHub review submission API を呼ばず、`verdict` / `reviewed_head_sha` / `blockers[]` / `warnings[]` を orchestrator へ返すのみ。Issue #1873）
 
 orchestrator は data-plane 操作を直接行わない。
 
-### max_iterations=5 の設計根拠
+### max_iterations=3 の設計根拠
 
 - 3 イテレーション以内で APPROVE に至るケースが大半
-- 5 を上限とすることで「無限ループ防止」と「genuine な fix cycle 許容」を両立
-- 5 超過は「根本的な contract の問題」として人間判断へ委ねる
-
-> `max_iterations=5` は運用上の安全上限値であり、実測に基づく最適値ではない。無限の review/implementation ループを防ぐための暫定キャップである。運用ログから適切なしきい値が判明した場合は、ワークフロー変更プロセスを通じて値を更新すること。
+- 3 を上限とすることで「無限ループ防止」と「genuine な fix cycle 許容」を両立
+- 3 超過は「根本的な contract の問題」として人間判断へ委ねる
+- 正本: `.claude/skills/impl-review-loop/SKILL.md`（既定値 3）および `.claude/skills/issue-refinement-loop/references/termination-policy.md` の `LOOP_POLICY_V1`
 
 ## State Model
 
@@ -160,7 +159,7 @@ orchestrator は data-plane 操作を直接行わない。
 |---|---|---|---|---|---|---|---|---|---|---|
 | `implementation-worker` | Issue 実装・worktree 管理・PR 起票 | orchestrator（contract_snapshot_url, fix_delta） | orchestrator | `IMPLEMENT_RESULT_V1` | `status`, `pr_url`, `worktree`, `branch`, `verification.*`, `allowed_paths_compliance` | なし | data-plane の実装詳細（orchestrator は読まない） | write（ファイル・git・PR） | `implementation_failed` | `.claude/skills/implement-issue/` |
 | `test-runner` | Verification Commands 実行 | orchestrator（worktree, branch） | orchestrator | `TEST_RESULT_V1` | `status`, `passed`, `failed`, `details[]` | なし | test 実行の内部 stderr 詳細（summary のみ） | read-only（mutation 禁止） | `verification_failed` | `.claude/agents/test-runner.md` |
-| `pr-reviewer` | PR コードレビュー・LOOP_VERDICT 記録 | orchestrator（pr_url） | orchestrator | `LOOP_VERDICT: APPROVE | REQUEST_CHANGES` | `verdict`, `blockers[]`, `reviewed_head_sha`, `follow_up_issue_requests` | なし | review 判断の内部 rationale（verdict のみ読む） | write（`gh pr review` のみ） | `pr_review_failed` | `.claude/skills/pr-review-judge/` |
+| `pr-reviewer` | PR コードレビュー・verdict 判定 | orchestrator（pr_url） | orchestrator | `verdict` / `reviewed_head_sha` / `blockers[]` / `warnings[]`（最小 convention、Issue #1873） | `verdict`, `blockers[]`, `reviewed_head_sha`, `warnings[]` | なし | review 判断の内部 rationale（verdict のみ読む） | read-only（GitHub review submission API は呼ばない。verdict 投稿は control-plane が通常の `gh pr comment --body-file` で行う） | `pr_review_failed` | `.claude/skills/pr-review-judge/` |
 
 ### SubAgent 設計上の注意
 
@@ -174,7 +173,7 @@ orchestrator は data-plane 操作を直接行わない。
 |---|---|---|---|---|
 | `IMPLEMENT_RESULT_V1` | implementation-worker | stdout（memory） | YAML | orchestrator Step 1 後 |
 | `TEST_RESULT_V1` | test-runner | stdout（memory） | YAML | orchestrator Step 2 後 |
-| `LOOP_VERDICT` | pr-reviewer | GitHub PR review + stdout | KEY=VALUE | orchestrator Step 5 |
+| `LOOP_VERDICT` | pr-reviewer（stdout として orchestrator へ返す） | 通常の PR コメント（`gh pr comment --body-file`、control-plane が投稿）+ stdout | KEY=VALUE | orchestrator Step 5 |
 | `LOOP_STATE` (final) | orchestrator | Issue コメント | YAML | human / post-merge-cleanup |
 | PR | implementation-worker (open-pr skill) | GitHub | Pull Request | 人間レビュー |
 
