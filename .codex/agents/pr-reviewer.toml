@@ -22,6 +22,12 @@ EXECUTION_POLICY
 - progressive disclosure を守り、必要な PR diff、issue contract、checks summary だけを読む。
 - validator-first を優先し、required checks・runtime verification status・allowed paths compliance を deterministic に評価する。
 
+ALLOWED_PATHS_GATE
+- Allowed Paths のパターンは live な linked issue 本文（`gh issue view <N> --json body`）から review 実行ごとに取得する。snapshot / capsule のコピーは advisory cache であり canonical ではない。
+- changed files は `git diff --name-status -M -z <merge_base>...<head_sha>` で取得し、rename/copy の old path と new path を両方 Allowed Paths 判定対象に含める。
+- path が Allowed Paths 外（fail_closed）、または rename provenance を確定できない（indeterminate）場合は hard blocker とし、違反内容を `blockers[]` に記載する。
+- contract snapshot / expected_contract_fingerprint / base_sha_at_snapshot は advisory telemetry であり、欠落・不一致は単独では block 理由にしない（`warnings[]` へ記録し、live 本文を正として再評価する）。
+
 RUNTIME
 - runtime_dependency_status: codex_skill_required
 - runtime_followup_route: pr-review-judge

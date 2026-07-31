@@ -22,7 +22,7 @@ warnings:
 `verdict` が `_VALID_VERDICTS`（APPROVE / REQUEST_CHANGES / HUMAN_REVIEW_REQUIRED）以外、
 または `reviewed_head_sha` が空の場合は `route_loop_verdict_v2()` が `fail_closed` を返す
 （`schema_invalid_verdict_value` / `schema_invalid_reviewed_head_sha_empty_or_missing`）。
-`merge_ready` / `mergeability` / `required_auto_actions` / `allowed_paths_gate` を
+`merge_ready` / `mergeability` / `required_auto_actions` / `allowed_paths_gate` / `test_verdict` を
 `reviewer_verdict` に含めてはならない（含まれていた場合 `schema_invalid_legacy_field_present` で fail-closed）。
 
 ## live_mergeability の取得
@@ -40,6 +40,12 @@ mergeable: MERGEABLE | CONFLICTING | UNKNOWN
 merge_state_status: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN | DRAFT | HAS_HOOKS
 ```
 
+> **`mergeable` と `merge_state_status` の分離（#1869 fix_delta P0-1）**: `mergeable` の有効値は
+> `CONFLICTING` / `MERGEABLE` / `UNKNOWN`。`merge_state_status` の有効値は `BEHIND` / `BLOCKED` /
+> `CLEAN` / `DIRTY` / `DRAFT` / `HAS_HOOKS` / `UNKNOWN` / `UNSTABLE`。`merge_state_status ==
+> CONFLICTING` という値は GitHub の実 enum に存在しないため、production router
+> （`route_loop_verdict_v2.py`）はこれを **schema 不正**として扱い、conflict としては扱わない。
+
 ## ルーティング呼び出し
 
 ```python
@@ -48,29 +54,31 @@ from route_loop_verdict_v2 import route_loop_verdict_v2
 decision = route_loop_verdict_v2(
     reviewer_verdict,       # {verdict, reviewed_head_sha, blockers, warnings}
     live_mergeability,      # {head_sha, mergeable, merge_state_status}
-    test_verdict=test_verdict,  # optional: diagnostics-only, never consulted for routing
 )
 ```
 
-Issue #1856（evidence authority cutover, Phase 1）: `test_verdict` を渡す場合でも、その内容
-（`branch_behind_main` を含む）は routing 判断に一切使われない。BEHIND 判定は
-`live_mergeability.merge_state_status == "BEHIND"` のみで確定する。
+Issue #1870（#1856）: `route_loop_verdict_v2()` は `test_verdict` を一切受け付けない（渡すと
+`TypeError`）。BEHIND 判定は `live_mergeability.merge_state_status == "BEHIND"` のみで確定する。
+#1856 が確立した protected TEST_VERDICT producer/publisher lane 自体はこの routing とは独立して
+存続する（ordinary review routing の入力ではなくなっただけ）。
 
 `decision.route` の値と orchestrator の対応:
 
 | `route` | 意味 | 次アクション |
 |---|---|---|
-| `approved` | `APPROVE` かつ mergeable/merge_state_status が `CLEAN`/`HAS_HOOKS` | 終了（approved）。`step-5-feedback-and-termination.md` の残り gate を確認 |
-| `continue_loop` | `REQUEST_CHANGES` | 次イテレーションへ（blockers を fix_delta に） |
-| `route_stale_head_rereview` | `reviewed_head_sha != live head_sha` | Step 4 を現在の head で再委譲し、Step 5 を最初からやり直す |
-| `route_to_update_branch` | `merge_state_status == BEHIND`（`test_verdict` の有無・内容に関わらず） | 下記「BEHIND 分岐 routing」参照 |
-| `route_human_escalation` | `HUMAN_REVIEW_REQUIRED`、または `BLOCKED`/`UNSTABLE`/`DRAFT` | 人間判断を仰いで停止（`termination_reason: human_escalation`） |
-| `route_conflict_escalation` | `mergeable == CONFLICTING` または `merge_state_status` が `DIRTY`/`CONFLICTING` | CONFLICTING PR Escalation Runbook 発動（actual conflict のみ hard stop） |
-| `fail_closed` | schema 不正、`APPROVE` かつ `blockers` 非空、`mergeability_unknown` 等 | `decision.reason_code` / `decision.errors` を blocker として記録し、`mergeability_unknown` は bounded retry（最大 3 回、5 秒間隔）後に human escalation |
+| `approved` | `APPROVE` かつ mergeable/merge_state_status が `MERGEABLE`/`CLEAN` または `MERGEABLE`/`HAS_HOOKS` | 終了（approved）。`step-5-feedback-and-termination.md` の残り gate を確認 |
+| `continue_loop` | `REQUEST_CHANGES`（actual conflict がない場合） | 次イテレーションへ（blockers を fix_delta に） |
+| `route_stale_head_rereview` | `APPROVE` かつ `reviewed_head_sha != live head_sha`（actual conflict がない場合） | Step 4 を現在の head で再委譲し、Step 5 を最初からやり直す |
+| `route_to_update_branch` | `APPROVE` かつ `merge_state_status == BEHIND` | 下記「BEHIND 分岐 routing」参照 |
+| `route_human_escalation` | `HUMAN_REVIEW_REQUIRED`（actual conflict がない場合） | 人間判断を仰いで停止（`termination_reason: human_escalation`）。max iteration 到達や secret/protected-path 等の実 hard gate と合わせて、正当な human stop 理由の一つ |
+| `conflict_hard_stop` | `mergeable == CONFLICTING` または `merge_state_status == DIRTY`（**verdict に関係なく最優先で評価**） | CONFLICTING PR Escalation Runbook 発動（actual conflict のみ hard stop。#1860 Owner Decision） |
+| `fail_closed` | schema 不正、`APPROVE` かつ `blockers` 非空、`mergeability_unknown`、`BLOCKED`/`UNSTABLE`/`DRAFT` | `decision.reason_code` を warning として記録。`mergeability_unknown` は bounded retry（最大 3 回、5 秒間隔）後も `fail_closed` のままなら warning に格下げして継続。`BLOCKED`/`UNSTABLE`/`DRAFT` は current-head required-CI / branch-protection evaluator の判定に委ね、human escalation にはしない |
 
 `UNKNOWN`、`BLOCKED`、`BEHIND`、`UNSTABLE`、`DRAFT`、`HAS_HOOKS` は Git conflict として扱わない
 （Safety Invariants）。actual Git conflict として hard stop するのは `mergeable == CONFLICTING` または
-`merge_state_status` が `DIRTY`/`CONFLICTING` の場合のみ。
+`merge_state_status == DIRTY` の場合のみであり、この判定は reviewer verdict（`REQUEST_CHANGES` /
+`HUMAN_REVIEW_REQUIRED` を含む）より必ず先に評価される。`DRAFT` は Issue #1873 の Delivery Rule が
+Draft PR を要求しているため、単独では human escalation の理由にしない。
 
 ## BEHIND 分岐 routing
 

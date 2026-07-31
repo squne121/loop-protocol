@@ -14,7 +14,7 @@ description: implementation child issue に紐づく PR をレビューし、lin
 
 ### 0) Self-authored PR ガード
 
-`PR author == 実行アカウント` の場合でも、投稿は常に controlled review publisher 経由・`event: COMMENT` 固定（`--approve` / `--request-changes` を意味する event は生成しない）。
+`PR author == 実行アカウント` の場合でも、投稿は常に通常の `gh pr comment --body-file`・`event: COMMENT` 相当固定（`--approve` / `--request-changes` を意味する formal review event は生成しない。専用 semantic publisher は使用しない。詳細は「6) verdict 投稿」参照）。
 
 ### 1) Linked Issue を特定
 
@@ -28,11 +28,18 @@ description: implementation child issue に紐づく PR をレビューし、lin
 
 判定（review criteria 自体は変更しない。Issue #1873 で変わるのは transport のみ）:
 
-- `CONFLICTING` / `DIRTY` / `BLOCKED` / `UNKNOWN(継続)` → `REQUEST_CHANGES`
+- `mergeable == CONFLICTING` または `merge_state_status == DIRTY` → actual conflict。reviewer の verdict に
+  関係なく `route_loop_verdict_v2()` が conflict hard stop する（#1860 Owner Decision）。reviewer 自身は
+  この状態でも通常どおり判定してよい（reviewer の verdict は routing の入力の一つに過ぎず、conflict
+  hard stop は live mergeability から独立に決まる）
+- `BLOCKED` / `UNSTABLE` / `DRAFT` / `UNKNOWN` は Git conflict ではなく、reviewer が単独でこれらを理由に
+  `REQUEST_CHANGES` にする必要はない（#1860 Owner Decision / PR #1871 P0-3）。required checks・branch
+  protection の未充足自体は current-head required-CI evaluator（4) 参照）が独立に評価する
 - `BEHIND` は衝突 blocker としない。`BEHIND` の update_branch 対応は reviewer が
-  `required_auto_actions` として自己申告せず、control-plane が live mergeability から
+  自己申告せず、control-plane が live mergeability から
   直接検出して `route_loop_verdict_v2()` で `update_branch` action を合成する（`step-5-mergeability-handling.md` 参照）
-- `MERGEABLE` で `CLEAN|UNSTABLE|BEHIND` → 次ステップ
+- `MERGEABLE` で `CLEAN`/`HAS_HOOKS`/`UNSTABLE`/`BLOCKED`/`BEHIND` → 次ステップ（PR review 自体の
+  APPROVE/REQUEST_CHANGES 判定は AC/evidence 品質で決める。mergeability だけを理由に判定を変えない）
 
 ### 3) VC 証拠ポリシー（PR_REVIEW_JUDGE_VC_EVIDENCE_POLICY）
 
@@ -133,8 +140,7 @@ provider 呼び出し・fan-out・grounding evidence 検証を含む差分）ま
   一次情報源として使う。
 - 2 名の判定が食い違う場合は `REQUEST_CHANGES` を優先する（fail-closed）。
 - clean-room 制約（raw transcript 非共有）の遵守は verdict コメント内に
-  明記し、`producer_role` / `allowed_paths_gate` ブロックと同様に
-  merge-blocking な監査証跡として扱う。
+  明記し、merge-blocking な監査証跡として扱う。
 
 ### 5) verdict 決定
 
@@ -155,7 +161,9 @@ reviewer 側の判定であり、実際にループを終了できるかどう�
 `route_loop_verdict_v2()` が live mergeability から決定する終端条件である。
 
 - `Draft PR` 自体は blocker ではない。`DRAFT` 状態は `route_loop_verdict_v2()` が
-  `route_human_escalation` として扱い、impl-review-loop はループを終了しない。
+  `fail_closed`（defer to current-head CI evaluator。人間 escalation は自動で発生しない）として扱い、
+  impl-review-loop はループを終了しない（#1860 Owner Decision / #1873 Delivery Rule: PR は Draft の
+  まま人間の最終マージ判断へ残す設計であり、Draft 自体を human escalation の理由にしない）。
 
 ### 6) verdict 投稿
 
@@ -197,21 +205,28 @@ gh pr comment <PR番号> --repo <owner>/<repo> --body-file <本文テキスト�
 ### ALLOWED_PATHS_GATE_RESULT_V1（Allowed Paths 判定結果）
 
 PR review 後に `allowed_paths_review_gate.py` を使って changed files の契約違反を再計算。
+Allowed Paths パターンの canonical source は **live linked issue 本文**（review 実行ごとに `gh issue
+view` で取得）であり、contract snapshot / capsule のコピーは advisory cache に過ぎない。
 snapshot freshness 用の `contract_fingerprint.base_sha_at_snapshot` と、local fallback changed files 算出用の
 `diff_base_sha` は別物として扱う。local fallback の `changed_files_source` は
 `git_diff_current_merge_base_head` で、snapshot base を changed files diff には使わない。
 
-`status` は判定状態として `ok | fail_closed | stale_snapshot | indeterminate` を取る。
+`status` は判定状態として `ok | fail_closed | indeterminate` を取る（fingerprint drift による
+`stale_snapshot` は `status` を占有しない）。
 
-`indeterminate/fail_closed` は merge-blocking 状態として扱う。
+`fail_closed`（path が Allowed Paths 外）と rename provenance を確定できない `indeterminate` は
+merge-blocking 状態として扱う。contract snapshot の fingerprint が live 本文と乖離している場合は
+`warnings[]`（`stale_snapshot: ...`）に advisory として記録するのみで、単独では merge-blocking に
+しない -- live 本文で評価した結果（`ok` / `fail_closed`）が canonical。
 
 changed files source hierarchy は `github_pull_request_files_api_with_previous_filename` を preferred oracle、
 `git_diff_name_status_find_renames_z` を deterministic local fallback とする。
 `gh_pr_diff_name_only` / `git_diff_current_merge_base_head_name_only` は rename provenance では
 insufficient_for_rename_provenance であり、`git_diff_snapshot_base_head` は禁止経路である。
 local fallback は `current_base_sha` と `head_sha` から evaluator 内で `git merge-base` を検証できた場合だけ
-`git_diff_name_status_find_renames_z` を名乗る。`LOOP_VERDICT_V2.allowed_paths_gate` consumer への保証は script output の
-provenance に限り、verdict schema 自体が詳細 provenance を直接 carry するとまでは主張しない。
+`git_diff_name_status_find_renames_z` を名乗る。provenance の保証は script output（`ALLOWED_PATHS_GATE_RESULT_V1`）
+に限り、reviewer_verdict（`blockers[]`/`warnings[]` へのテキスト反映のみ）が詳細 provenance を直接
+carry するとまでは主張しない。
 
 ### リネーム元 provenance（`previous_filename`）監査（Issue #1300）
 

@@ -29,7 +29,7 @@ PR review の失敗など、artifact chain から独立した安全境界に限�
 5. `next_action.route` が `proceed_to_step_1` の場合のみ、capsule に含まれる準備済み情報を用いて Step 1 へ進む。
 6. `next_action.route == ensure_contract_snapshot` の場合のみ `ensure_contract_snapshot` を実行する。
 7. `next_action.route == run_contract_blocker_triage` の場合は `contract_snapshot.contract_blocker_triage` を優先し、raw evidence の再分類や preflight 再実行を行わない。
-8. `next_action.route == refresh_contract_snapshot` の場合は stale 扱いとして停止し、fresh snapshot の再取得へ route する。
+8. `next_action.route == refresh_contract_snapshot` の場合は stale 扱いとして warning を記録し、fresh snapshot の再取得を推奨するに留める（#1869 fix_delta P0-4: 停止しない。Step 1 へ継続する）。
 
 ```bash
 uv run python3 .claude/skills/impl-review-loop/scripts/build_intake_capsule.py \
@@ -57,12 +57,17 @@ IMPL_REVIEW_INTAKE_CAPSULE_V1:
     route: ensure_contract_snapshot | run_contract_blocker_triage | proceed_to_step_1 | request_readiness_check | refresh_contract_snapshot | human_review_required
 ```
 
-### Capsule failure policy（カプセル取得失敗時の方針）
+### Capsule failure policy（カプセル取得失敗時の方針、#1869 fix_delta P0-4）
 
-`build_intake_capsule.py` がエラーを返した場合:
+`build_intake_capsule.py` は出力を `fatal_errors`（live Issue 不在・target identity 不一致・
+`git status` 自体の失敗など、artifact chain から独立した安全境界違反のみ）と `warnings`
+（comment/snapshot/body fingerprint 取得失敗などの semantic/artifact 異常）に分離して返す
+（`errors` は `fatal_errors` と同値の後方互換 alias）。
 
-- `issue_ready_tuple` / `contract_snapshot` は trust-less のまま扱い、既存 Step 0 判定を継続して再実行しない。
-- まず `stdout` の `errors` を確認し、必要なら `intake_gate_failed` 相当として停止。
+- `fatal_errors` が空でない場合（exit code 1）のみ、`intake_gate_failed` 相当として停止する。
+- `warnings` のみが記録されている場合（exit code 0）は停止しない。`issue_ready_tuple` /
+  `contract_snapshot` は trust-less のまま扱い、既存 Step 0 判定を継続して再実行しないが、
+  Step 1 への進行自体は妨げない。
 - `artifact` の `issue_metadata` を参照し、原因を fix できる範囲だけ再収集。
 
 `contract_snapshot.source` は以下を想定し、上位 Step が raw の再取得で同一ロジックを再実行しない:
@@ -263,11 +268,11 @@ where:
 - `$CONTRACT_SNAPSHOT_FILE`: contract snapshot JSON を持つ一時ファイルのパス
 - `$CONTRACT_SNAPSHOT_URL`: contract snapshot comment の GitHub URL（preparation step 1-a / 1-b で検出）
 
-**評価ルール**:
+**評価ルール（#1869 fix_delta P0-4: stop_human / refresh_contract_snapshot は advisory warning）**:
 
 - `routing_action: continue` → Step 1 へ進む
-- `routing_action: stop_human` → 停止。`LOOP_STATE.termination_reason: human_escalation` を記録して人間判断へ送る
-- `routing_action: refresh_contract_snapshot` → stale / incomplete snapshot として停止。`issue-contract-review` 再実行へ route
+- `routing_action: stop_human` → product-spec snapshot は semantic planning artifact であり停止権限を持たない。warning として `LOOP_STATE.product_spec_preflight` に記録し、Step 1 へ進む（live Issue/PR コメント上の明示的な人間の停止指示がある場合のみ実際に停止する）
+- `routing_action: refresh_contract_snapshot` → stale / incomplete snapshot を warning として記録し、Step 1 へ進む（`issue-contract-review` 再実行は route only; no auto-run の推奨に留める）
 
 **LOOP_STATE への記録**:
 
@@ -299,12 +304,19 @@ gh issue view <issue_number> --json title,labels --jq '.title + " | " + (.labels
 
 不一致なら停止し、人間判断を仰ぐ。blocker / dependency の close 状態が primary signal であり、state labels の有無は ready 判定に影響しない。ただし `phase/implementation` は issue kind / workflow routing の前提として維持する（`docs/dev/github-ops.md` 参照）。
 
-## 2.5. scope rollup preflight（`scope-rollup-runner` への委譲による事前確認）
+## 2.5. scope rollup preflight（任意の advisory diagnostic、自動実行なし）
 
-worktree 作成前に scope rollup preflight を実行し、同一 Allowed Paths / 同一 skill family / 同一 parent_issue / 同一 dedupe_key を持つ OPEN Issue / PR の統合候補を確認する。
-preflight は mutation-free（Issue 作成・編集・クローズ禁止）。
+**#1860 Owner Decision（2026-07-30）により、本 Section は production 経路の automatic dispatch から外れた任意 advisory diagnostic である。** worktree 作成・Step 3 以降の進行は本 Section の実行有無・結果と無関係に継続する。scope rollup preflight は、同一 Allowed Paths / 同一 skill family / 同一 parent_issue / 同一 dedupe_key を持つ OPEN Issue / PR の統合候補を人間が確認したい場合に手動で呼び出せる diagnostic として残す（preflight は引き続き mutation-free）。
 
-### 委譲手順
+以下の手順・marker 仕様は、手動で本 diagnostic を呼び出す場合の参照として残すが、runner failure・marker 欠落・marker malformed・saturation・ambiguous 判定のいずれも Step 3 以降を停止する権限を持たない（下記「runner_unavailable / marker 違反の扱い」参照）。
+
+### 手動起動手順（#1869 fix_delta P1-1: automatic dispatch ではない）
+
+**本 Section は impl-review-loop の Step 順序による automatic spawn を含まない。** 人間または
+orchestrator が明示的に本 diagnostic を実行したいと判断した場合にのみ、以下の手順で
+`scope-rollup-runner` SubAgent を手動起動する。impl-review-loop の Step 1〜Step 5 の通常進行は
+本 Section の実行有無と無関係であり、Codex/Claude いずれの実行系も本 Step の一部として
+`scope-rollup-runner` を自動 spawn してはならない。
 
 main conversation は raw `gh issue/pr list` output を直接展開せず、`scope-rollup-runner` SubAgent に委譲する。
 
@@ -317,9 +329,10 @@ SCRIPT_SHA=$(sha256sum .claude/skills/issue-refinement-loop/scripts/plan_issue_s
 REQUESTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 ```
 
-**2. `scope-rollup-runner` を起動する**（`.claude/agents/scope-rollup-runner.md` 定義に従う）:
-
-**Codex custom named agent dispatch**: Codex CLI: spawn the custom agent named scope-rollup-runner for this step; the root thread must not use a generic/default/worker fallback. Codex は `.codex/agents/scope-rollup-runner.toml` を dispatch source とし、Claude source と混在させない。runner は nested delegation を行わず、exact executor 以外の mutation を行わない。
+**2. `scope-rollup-runner` を起動する**（`.claude/agents/scope-rollup-runner.md` 定義に従う。
+manual invocation 時は Codex は `.codex/agents/scope-rollup-runner.toml` を dispatch source とし、
+Claude source と混在させない。runner は nested delegation を行わず、exact executor 以外の
+mutation を行わない）:
 
 以下の入力を渡して起動する:
 
@@ -390,11 +403,11 @@ uv run python3 .claude/skills/impl-review-loop/scripts/parse_scope_rollup_run_re
 
 - `status: ok` → `routing_action: continue`
 - `status: runner_unavailable` → `routing_action: deferred`
-- `status: failed` → `routing_action: stop_human`
-- `status: marker_missing | marker_malformed | marker_ambiguous | rejected` → `routing_action: stop_human`
-- sidecar missing / `capture_mode != subagent_stop_hook` / `capture_status != captured` / `capture_sha256` mismatch / `capture_path` mismatch / `agent_type` mismatch / `invocation_id` mismatch / `capture_source != last_assistant_message` → `routing_action: stop_human`
-- `routing_action: stop_human` は `human_escalation` として扱う（`LOOP_STATE.termination_reason: human_escalation`）
-- `routing_action: deferred` は `LOOP_STATE.scope_rollup_decision.decision: deferred` を許容する（必要に応じて追加で `human_escalation`）
+- `status: failed` → `routing_action: warning_continue`
+- `status: marker_missing | marker_malformed | marker_ambiguous | rejected` → `routing_action: warning_continue`
+- sidecar missing / `capture_mode != subagent_stop_hook` / `capture_status != captured` / `capture_sha256` mismatch / `capture_path` mismatch / `agent_type` mismatch / `invocation_id` mismatch / `capture_source != last_assistant_message` → `routing_action: warning_continue`
+- `routing_action: warning_continue`（旧 `stop_human`）は `LOOP_STATE.scope_rollup_decision` に warning として記録し、Step 3 へ進む（#1860 Owner Decision により scope-rollup の欠落・破損は human escalation を強制しない）
+- `routing_action: deferred` は `LOOP_STATE.scope_rollup_decision.decision: deferred` として記録し、Step 3 へ進む
 - `raw_plan_location_allowed: true` は parser が `result.payload` の `result_sha256` 再計算・`verify_payload()` 検証まで通過したことを意味する（Issue #1547 以降 `raw_plan_location` 自体は常に `null` であり、ファイル読み取りは行われない）
 
 ### marker 検証・採用（ref-based フロー）
@@ -416,25 +429,23 @@ uv run python3 .claude/skills/impl-review-loop/scripts/parse_scope_rollup_run_re
 - `result.payload.candidates` は debug 専用とし、default では main context に全件展開しない（`suggested_actions_summary` を要約として使う）
 - `ISSUE_SCOPE_ROLLUP_DECISION_V2` を記録して次ステップへ進む
 
-### runner_unavailable / marker 違反の扱い
+### runner_unavailable / marker 違反の扱い（#1860 Owner Decision: warning-only）
 
 - marker 検証で `marker_missing / marker_malformed / marker_ambiguous / rejected` が返る場合:
-  - `LOOP_STATE.termination_reason: human_escalation`（`termination_reason` 有効値: `null | approved | max_iterations | human_escalation | intake_gate_failed`）
-  - `LOOP_STATE.scope_rollup_decision.decision: human_review_required`
+  - `LOOP_STATE.scope_rollup_decision.decision: human_review_required` として記録する（advisory な注記であり `termination_reason` は変更しない）
   - `LOOP_STATE.scope_rollup_decision.runner_result.status` に `marker_missing | marker_malformed | marker_ambiguous` を記録し、`reject_reason` に `marker_missing | marker_malformed | marker_ambiguous | ...` を記録する
-  - `LOOP_STATE.scope_rollup_decision.termination_cause` を `scope_rollup_marker_missing` / `scope_rollup_marker_malformed` に保存する
-  - Step 3 へ進めず停止する
+  - Step 3 へ進む（scope-rollup の marker 異常は hard stop ではない）
 
-- runner が `status: runner_unavailable` を返す場合は、`repo`、`invocation_id`、`requested_at`、`generated_at` が文字列型、`current_issue` が整数型（bool / float / string coercion は不可）であることを先に検証する。timestamp は canonical parser で妥当性を確認し、5項目が期待値に一致して `generated_at > requested_at` の場合だけ `decision: deferred` を許容する。runner が未実行のため、`script_blob_sha256`、result payload/hash/verify、capture sidecar は要求しない（必要に応じて `human_escalation`）。
-- `runner_unavailable` であっても identity の不一致、timestamp の不正・stale、または malformed marker は `decision: human_review_required` として停止する。`ok` / `failed` とそれらの capture-sidecar failures は従来どおり `stop_human` semantics を維持する。
-- runner が `status: failed` を返す場合は、`decision: human_review_required` として停止する
+- runner が `status: runner_unavailable` を返す場合は、`repo`、`invocation_id`、`requested_at`、`generated_at` が文字列型、`current_issue` が整数型（bool / float / string coercion は不可）であることを先に検証する。timestamp は canonical parser で妥当性を確認し、5項目が期待値に一致して `generated_at > requested_at` の場合だけ `decision: deferred` として記録する。runner が未実行のため、`script_blob_sha256`、result payload/hash/verify、capture sidecar は要求しない。
+- identity の不一致・timestamp の不正・stale・malformed marker は `decision: human_review_required` として記録するのみで、Step 3 を止めない。
+- runner が `status: failed` を返す場合も `decision: human_review_required` として記録し、Step 3 へ進む。
 
 ### orchestrator の判断ルール（marker 採用後）
 
 marker 採用後、`result.suggested_actions_summary` および必要に応じて `result.raw_plan_location` のファイル内容（debug 時のみ）に基づいて以下の判断を行う:
 
 - `confidence: high` の候補が存在する場合: orchestrator は各候補の `suggested_action` を確認してから次ステップへ進む。
-- `suggested_action: human_review_required` の候補: 即時停止して human review（`termination_reason: human_escalation`）。
+- `suggested_action: human_review_required` の候補: warning として `LOOP_STATE.scope_rollup_decision` に記録し、次ステップへ継続する（#1860 Owner Decision により自動停止しない）。
 - `suggested_action: proceed_with_coordination` の候補: 関連 Issue 番号を `LOOP_STATE.scope_rollup_decision.related_coordination[]` に構造化保存して次ステップへ継続する。
 - `confidence: medium` の候補: LOOP_STATE に記録し、推奨アクションを提示する。
 - `confidence: low` または候補なし: 記録して次ステップへ進む。
@@ -516,7 +527,10 @@ LOOP_STATE:
     routing_action: continue | stop_human | refresh_contract_snapshot
 ```
 
-routing_action が `stop_human` または `refresh_contract_snapshot` の場合は、ループを開始せず人間判断へ escalate する。
+routing_action が `stop_human` または `refresh_contract_snapshot` の場合でも、#1869 fix_delta
+P0-4 により product-spec snapshot 自体は停止権限を持たない。warning として `LOOP_STATE` に
+記録し、ループは開始する（live Issue/PR コメント上の明示的な人間の停止指示がある場合のみ
+実際に escalate する）。
 
 ## 5. 外部仕様調査スキップ判断（任意）
 

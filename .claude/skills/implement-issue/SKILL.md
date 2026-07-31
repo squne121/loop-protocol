@@ -34,11 +34,11 @@ gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json title,body,labels,comments
 - `## Stop Conditions`
 - 最新コメントに `## Contract Snapshot` があり、それと本文が整合している
 
-consumer ready contract（title `実装:` または `implement:`、routing label `phase/implementation`、`state/needs-human` 不在、dependency all closed、最新 `CONTRACT_REVIEW_RESULT_V1 status: go`）が揃っているかも確認する。legacy state label の有無だけを理由に停止してはならない。不一致なら停止して人間判断を仰ぐ。
+consumer ready contract（title `実装:` または `implement:`、routing label `phase/implementation`、dependency all closed）が揃っているかを確認する。legacy state label の有無や `state/needs-human` の付与だけを理由に停止してはならない。最新 `CONTRACT_REVIEW_RESULT_V1 status` は任意の telemetry として記録するのみで、`go` 以外（missing/stale/invalid を含む）でも実装を停止しない（#1860 Owner Decision）。live Issue 本文・Allowed Paths・実テストが正本である。
 
 ### 2. Contract-aware overlap preflight（重複プリフライト、`check_implementation_overlap.py`）
 
-本 Issue の Allowed Paths が他の OPEN implementation Issue と literal 一致するだけでは、実装開始を停止しない（#1452）。Allowed Paths の一致は「マージコンフリクトの可能性」を示すに過ぎず、Outcome / In Scope が意味的に disjoint な candidate（C1/C2a）は証跡を残した上で実装を継続できる。一方、意味的に重複する candidate（C2b/C3/duplicate）や、readback が不完全な candidate は fail-closed で人間判断へ停止する。
+本 Issue の Allowed Paths が他の OPEN implementation Issue と literal 一致するだけでは、実装開始を停止しない（#1452）。Allowed Paths の一致は「マージコンフリクトの可能性」を示すに過ぎず、Outcome / In Scope が意味的に disjoint な candidate（C1/C2a）は証跡を残した上で実装を継続できる。意味的に重複する候補（C2b/C3/duplicate）や readback が不完全な候補についても、以下（#1860 Owner Decision）に従い自動停止はしない: OPEN Issue 全件収集・semantic overlap 判定は advisory diagnostic であり、warning として evidence に記録した上で実装を継続する。当該領域で実際に停止するのは、後述の実 Git conflict または target PR の GitHub mergeability（`CONFLICTING`/`DIRTY`）のみである。
 
 `.claude/skills/create-issue/scripts/check_issue_overlap.py` の pure classifier（`classify_overlap` / `IssueScope` / `SourceStatus` / path normalization）を正本として再利用し、implementation 専用の候補収集レイヤー `.claude/skills/implement-issue/scripts/check_implementation_overlap.py` を実行する:
 
@@ -59,8 +59,10 @@ GitHub GraphQL の `pageInfo.hasNextPage` が `false` になった時点で確�
 `100`（safety cap としては小さすぎる）のままなので、本手順では明示的に
 大きい値（`--limit 2000`）を指定する。呼び出し元が safety cap 自体を
 超える巨大な候補集合に遭遇した場合（`source.saturated: true` /
-`source.complete: false`）は、全件性を証明できないため人間判断へ停止する
-（fail-closed、cap を無制限にはしない）。
+`source.complete: false`）でも、実装開始を停止しない（#1860 Owner
+Decision: OPEN Issue 全件収集の不完全・saturation は advisory diagnostic
+であり hard stop ではない）。`saturated: true` は evidence に warning として
+記録し、Step 3 以降へ進む。
 
 **呼び出し側は `$?`（exit code）を continue/stop の分岐条件に使ってはならない**。分類に成功した場合はどの route でも exit 0 を返す（Major 2、下記参照）。route の正本は常に出力 JSON の `route` フィールドである:
 
@@ -71,32 +73,32 @@ ROUTE=$(uv run python3 -c "import json,sys; print(json.load(sys.stdin)['route'])
 このスクリプトは:
 - `--issue-number` を必須にし、対象 Issue 自身を候補から自己除外する。
 - `phase/implementation` ラベルが付いた OPEN Issue を `gh issue list` で列挙する（`number,title,body,labels,updatedAt,url`）。
-- 全候補の本文から Allowed Paths をローカルで抽出する。`Allowed Paths` 未記載だけが schema error である候補は `ignored_missing_allowed_paths` として evidence に残し、collision classifier の candidate pool には渡さない。number / body / updatedAt / dependency contract の error を併発する候補は従来どおり fail-closed とする。
-- 明示的な取得上限（`--limit`、既定 100）と saturation 検出を持ち、全件性を証明できない場合は fail-closed にする。
+- 全候補の本文から Allowed Paths をローカルで抽出する。`Allowed Paths` 未記載だけが schema error である候補は `ignored_missing_allowed_paths` として evidence に残し、collision classifier の candidate pool には渡さない。number / body / updatedAt / dependency contract の error を併発する候補は `validation_errors` に warning として記録するが、実装開始を止めない（#1860 Owner Decision）。
+- 明示的な取得上限（`--limit`、既定 100）と saturation 検出を持つ。全件性を証明できない場合は `saturated: true` を evidence に記録するが、実装開始を止めない（#1860 Owner Decision）。
 - Machine-Readable Contract の `blocked_by` / `depends_on` / `supersedes`（YAML list、inline/block 両表記）、legacy `Depends on #N` 記法、GitHub native dependency（`blockedBy` / `blocking`）を統合的に解析する。current が参照する predecessor が OPEN candidate 一覧に含まれない場合、オンライン経路では個別に readback して実 state（OPEN/CLOSED）を確認する。predecessor の実 state に基づき C2a（closed、直列化可能）と C2b（open、待機）を分岐する。
 - 収集した comparable candidate JSON だけを `check_issue_overlap.py` の pure collision classifier に渡した上で、候補ごとに `## Outcome` / `## In Scope` を readback し、**構造的シグナル**（AC ID・output schema 名・Machine-Readable Contract の key/value・In Scope 内 edit target（inline-code パス）・goal_ref・supersedes/superseded-by）を主軸に意味的重複を判定する。自然言語類似度（Outcome の token Jaccard）は補助 signal に留め、`proceed_with_collision_evidence` を許可する唯一の根拠にはしない。
 - `Allowed Paths` が同一集合であることは duplicate の十分条件にしない。`same_path_set` に基づく duplicate 候補は readback + 構造シグナルによる確認を経て初めて `duplicate` route を確定し、確認できない場合は C1 と同様に扱う。
-- 全 candidate の number / body / updatedAt / dependency contract schema を検証し、一件でも欠ければ `human_review_required` に倒す（false positive での黙殺を防ぐ）。Allowed Paths 未記載だけは非比較対象として除外するため validation error に含めない。
+- 全 candidate の number / body / updatedAt / dependency contract schema を検証し、一件でも欠ければ `human_review_required` route として evidence に記録する（false positive を静かに握りつぶさないため）。ただしこの route は warning であり、実装開始を停止しない（#1860 Owner Decision）。Allowed Paths 未記載だけは非比較対象として除外するため validation error に含めない。
 - structural collision を `proceed_with_collision_evidence` に残せるのは **verified native successor predicate** を candidate 単位で満たす場合だけである。`policy_class=C2a`、`dependency_relation=successor`、readback complete、nonempty provenance、repository/current/candidate identity、明示方向をすべて evidence に保持し、provenance source は `current_native_blocking` または `candidate_native_blocked_by` の closed set に限定する。
-- contract-only/legacy-only、native と contract/legacy の mixed provenance、identity/direction 不一致、readback incomplete、C2b/predecessor、duplicate、unresolved、source degraded、unsafe mixed set は例外なく fail-closed とする。global `any_collision` bypass や単一 source 名だけによる許可は禁止する。
+- contract-only/legacy-only、native と contract/legacy の mixed provenance、identity/direction 不一致、readback incomplete、C2b/predecessor、duplicate、unresolved、source degraded、unsafe mixed set は `proceed_with_collision_evidence` の verified native successor predicate からは除外し、`human_review_required` / `wait_for_predecessor` / `duplicate` 等の warning route として evidence に記録する（この判定自体は変更しない）。これらの route は #1860 Owner Decision により advisory であり、実装開始を停止する権限を持たない。global `any_collision` bypass や単一 source 名だけによる `proceed_with_collision_evidence` への格上げは禁止する（evidence の正確性は維持する）。
 - `IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1` evidence（`current_issue` / `source` / `candidates`（candidate ごとの `policy_class` / `reasons` / `structural_signals`）/ `ignored_candidates`（`issue_number` と `reason: ignored_missing_allowed_paths`）/ `dependency_resolution` / `validation_errors` / `route` / `decision_inputs_sha256` / `evidence_sha256`）を標準出力に JSON で返す。
 
-#### route / exit code 契約（クローズドセット、Major 2 改訂）
+#### route / exit code 契約（クローズドセット。#1860 Owner Decision により全 route advisory）
 
 | route | 意味 | 本 Section の対応 |
 |---|---|---|
 | `proceed` | C0（重複候補なし） | 実装を継続する |
 | `proceed_with_collision_evidence` | 証明済み C1、または verified native successor predicate を満たす C2a（全候補 readback 完了） | evidence を Issue コメントまたは worktree artifact に記録してから継続する |
-| `wait_for_predecessor` | C2b（open predecessor への依存が検出された） | 人間判断へ停止（predecessor 完了待ち） |
-| `human_review_required` | C3 / ambiguous / readback 不完全 / candidate schema 不備 / dependency 未解決 / source degraded（saturated 等） | 人間判断へ停止 |
-| `duplicate` | readback で確認済みの重複 | 人間判断へ停止（統合 PR を人間に提案） |
-| `runtime_error` | JSON parse 失敗 / schema 違反 / GitHub 取得失敗 | 人間判断へ停止（fail-closed） |
+| `wait_for_predecessor` | C2b（open predecessor への依存が検出された） | evidence に warning として記録し継続する。predecessor が近く closeする見込みが薄いと判断した場合はAIの裁量でIssueコメントに状況を残してよい |
+| `human_review_required` | C3 / ambiguous / readback 不完全 / candidate schema 不備 / dependency 未解決 / source degraded（saturated 等） | evidence に warning として記録し継続する |
+| `duplicate` | readback で確認済みの重複 | evidence に warning として記録し継続する。統合の要否はAIの判断でIssueコメントに提案してよい |
+| `runtime_error` | JSON parse 失敗 / schema 違反 / GitHub 取得失敗 | evidence 取得ができなかった旨を warning として記録し継続する（OPEN Issue全件収集の失敗は hard stop ではない） |
 
-**exit code**: 分類処理が成功した場合（`route` が上記 closed set のいずれかに決定できた場合）は **route を問わずすべて exit 0** を返す。GitHub 取得失敗 / JSON・schema 破損時のみ `runtime_error` として exit 1 を返す。`set -e` を使うシェルでも継続 route（`proceed_with_collision_evidence` / `wait_for_predecessor` / `human_review_required` / `duplicate`）で意図せず停止しない。unknown な verdict / policy_class（`check_issue_overlap.py` の契約違反の兆候）は `runtime_error` に倒される。
+**exit code（#1869 fix_delta P0-3 で改訂）**: **route を問わずすべて exit 0** を返す。`runtime_error`（GitHub 取得失敗 / JSON・schema 破損）も advisory diagnostic であり **exit 0** を返す（旧: exit 1）。`set -euo pipefail` 下で本コマンドを実行しても `runtime_error` でシェルが中断しない。**呼び出し側は `$?` も `route` の値も continue/stop の分岐条件に使わない** — いずれの route・exit code でも Step 3 以降へ進む。unknown な verdict / policy_class（`check_issue_overlap.py` の契約違反の兆候）は `runtime_error` として記録されるのみで、実装は継続する。
 
-- **継続 route（AC2）**: `proceed` と `proceed_with_collision_evidence` は実装を継続する。`proceed_with_collision_evidence` の場合、`IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1` evidence 全体を Issue コメントまたは worktree artifact に記録してから Step 3 へ進む。`open-pr` は同じ evidence digest（`evidence_sha256`）を PR 本文へ転記する。
-- **fail-closed route（AC3）**: `wait_for_predecessor` / `human_review_required` / `duplicate` / `runtime_error` はいずれも実装を開始せず、人間判断へ停止する。route と evidence（またはエラー内容）を人間へ提示する。
-- **candidate readback 前提（AC4）**: `check_implementation_overlap.py` は候補の `## Outcome` / `## In Scope` の readback が完了し、かつ構造的シグナルと自然言語類似度の双方から disjoint であることを確認できて初めて `proceed_with_collision_evidence` を返す。readback が不完全な候補が一件でもある場合、または構造的シグナルもしくは Outcome の意味的重複が検出された候補が一件でもある場合は `human_review_required` に倒す。**candidate contract の Outcome / In Scope / Out of Scope / Delivery Rule を readback する前に統合 PR を提案してはならない。** `Allowed Paths` の同一集合一致（`same_path_set`）だけでは duplicate と確定しない。
+- **全 route 継続（AC1/AC2/AC7）**: `proceed` / `proceed_with_collision_evidence` / `wait_for_predecessor` / `human_review_required` / `duplicate` / `runtime_error` のいずれであっても実装を継続する。`proceed_with_collision_evidence` の場合は `IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1` evidence 全体を、それ以外の route では route 名と reason を、Issue コメントまたは worktree artifact に warning として記録してから Step 3 へ進む。`open-pr` は同じ evidence digest（`evidence_sha256`、存在すれば）を PR 本文へ transcript として転記する（required input ではない）。
+- **advisory route（旧 fail-closed、#1860 Owner Decision）**: `wait_for_predecessor` / `human_review_required` / `duplicate` / `runtime_error` は実装開始を止めない。route と evidence（またはエラー内容）を warning として人間へ提示するに留め、GitHub 上の実 Git conflict・target PR の mergeability（`CONFLICTING`/`DIRTY`）とは独立に扱う。
+- **candidate readback（best-effort）**: `check_implementation_overlap.py` は候補の `## Outcome` / `## In Scope` の readback ができれば、構造的シグナルと自然言語類似度から disjoint であることを確認して `proceed_with_collision_evidence` を返す。readback が不完全、または意味的重複が検出された場合は `human_review_required` として記録するが、これは警告であり実装を止めない。`Allowed Paths` の同一集合一致（`same_path_set`）だけでは duplicate と確定しない。
 - **自己除外（AC6）**: `--issue-number` は必須であり、対象 Issue 自身は候補収集レイヤーによって自動的に自己除外される。自己除外を怠ると同一タイトル・同一 Allowed Paths によって `duplicate` と誤判定される。
 
 #### 候補収集契約 collection contract（#1493、AC1/AC3）
@@ -105,17 +107,16 @@ ROUTE=$(uv run python3 -c "import json,sys; print(json.load(sys.stdin)['route'])
 pagination の全件性を示す collection contract フィールドが additive で
 含まれる: `collection_mode`（`exhaustive_cursor_pagination` 固定）、
 `page_size`、`page_count`、`fetched_count`、`has_next_page`、`complete`、
-`saturated`、`limit`（safety cap）。`open-pr` 側の overlap preflight hard
-gate は、stored evidence と fresh（オンライン再実行）evidence の
-collection contract が完全一致することを検証し、いずれかにこれらの
-フィールドが欠けている場合（collection contract 未対応の legacy evidence）
-は再収集を要求して fail-closed に拒否する。呼び出し元は `--limit` や
-collection contract を上書きできない — 唯一の入力は integrity 確認済み
-stored evidence の `source.limit`（safety cap）である。
+`saturated`、`limit`（safety cap）。`open-pr` 側の overlap preflight は、
+stored evidence と fresh（オンライン再実行）evidence の collection
+contract を比較し、不一致や欠落（collection contract 未対応の legacy
+evidence を含む）を PR 本文に warning として記録するが、PR publication を
+拒否しない（#1860 Owner Decision: overlap evidence の digest・freshness・
+completeness は停止権限を持たない）。
 
-#### PR 作成直前の deterministic drift gate（Major 1）
+#### PR 作成直前の advisory drift チェック（旧 deterministic drift gate、#1860 Owner Decision で advisory 化）
 
-Step 7（push & PR 起票）の直前に、`route` が `proceed_with_collision_evidence` または `wait_for_predecessor` 解除直後だった場合は、`check_implementation_overlap.py` を **再実行**して stale evidence（`updated_at` / `body_sha256` drift）を確認する:
+Step 7（push & PR 起票）の直前に、`route` が `proceed_with_collision_evidence` または `wait_for_predecessor` 解除直後だった場合は、`check_implementation_overlap.py` を任意で再実行し、stale evidence（`updated_at` / `body_sha256` drift）を確認できる:
 
 ```bash
 uv run --locked python3 .claude/skills/implement-issue/scripts/check_implementation_overlap.py \
@@ -125,11 +126,9 @@ uv run --locked python3 .claude/skills/implement-issue/scripts/check_implementat
   > /tmp/overlap_preflight_${ISSUE_NUMBER}_recheck.json
 ```
 
-再実行後の `evidence_sha256`（または各 candidate の `body_sha256` / `updated_at`）が Step 2 実行時の値と異なる場合は drift と判定し、**本 Section を再実行してから Step 3 以降をやり直す**。drift が解消しない、または新たに `wait_for_predecessor` / `human_review_required` / `duplicate` に route が変わった場合は、Step 7 へ進まず（`git push` / `gh pr create` を呼ばず）人間判断へ停止する。これは deterministic gate であり、自然言語での「再確認する」という指示に留めない。
+再実行後の `evidence_sha256`（または各 candidate の `body_sha256` / `updated_at`）が Step 2 実行時の値と異なる場合は drift として PR 本文へ warning を記録するが、Step 7（`git push` / `gh pr create`）を止めない。route が `wait_for_predecessor` / `human_review_required` / `duplicate` へ変化した場合も同様に warning として記録し、実際の停止判断は実 Git conflict または target PR の GitHub mergeability（`CONFLICTING`/`DIRTY`、Step 5 参照）にのみ委ねる。
 
-open-pr 側の validator が `overlap_preflight` evidence を強制検証する変更（`open-pr/scripts/update_pr.py` 等）は、本 Issue（#1452 / PR #1455）の Allowed Paths 外（follow-up 要）。現時点では本 SKILL.md の deterministic drift gate（上記）と、Step 7 で `gh pr create` を直接呼ばないこと（`open-pr` に委譲）が唯一の強制ポイントである。
-
-**Not controlled**: `open-pr` は stored/fresh evidence の digest・collection contract を検証して unsafe publication を拒否する consumer であり、producer の verified native successor predicate を再証明しない。producer predicate の不正な safe evidence、または required overlap evidence を欠く publication は `open-pr` integration test で fail-closed に保つ。
+`open-pr` は overlap evidence の digest・collection contract の一致を required input として検証しない（#1860 Owner Decision）。stored/fresh evidence の差分は PR 本文の warning として記録され、PR publication を拒否する権限を持たない。
 
 `check_issue_overlap.py` 本体の scoring / schema ロジックの変更は本 Section の対象外（#1452 の Out of Scope）。また、本 preflight の continue 判定は OPEN Issue 間の意味的適合性のみを示し、active worktree / dirty path / 進行中 PR との同時編集安全性は証明しない（別 gate、#966 の責務）。
 

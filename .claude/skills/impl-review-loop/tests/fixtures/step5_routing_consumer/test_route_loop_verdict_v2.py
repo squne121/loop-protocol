@@ -5,27 +5,28 @@ Issue #1873: route_loop_verdict_v2 no longer accepts reviewer self-reported
 merge_ready / required_auto_actions / allowed_paths_gate / mergeability.
 Instead it takes reviewer_verdict (verdict, reviewed_head_sha, blockers,
 warnings) and live_mergeability (head_sha, mergeable, merge_state_status)
-as separate inputs. Each fixture file defines:
+as its only two arguments. Issue #1870 (#1856): there is no test_verdict
+parameter at all; BEHIND routing is derived solely from
+live_mergeability.merge_state_status.
+
+Each fixture file defines:
   - reviewer_verdict: minimal result convention dict
   - live_mergeability: live GitHub PR state dict
-  - test_verdict: optional TEST_VERDICT_MACHINE/v1 dict or null
-
-Issue #1856 (evidence authority cutover, Phase 1): when a fixture supplies
-`test_verdict`, it is diagnostics-only and is never consulted for routing
-(this module does not special-case it; route_loop_verdict_v2() itself
-ignores its content when computing the route). BEHIND routing is derived
-solely from live_mergeability.merge_state_status.
-
   - expected.route: expected RouteDecision.route value
   - expected.fail_closed: expected RouteDecision.fail_closed value
   - expected.reason_code: optional exact match for RouteDecision.reason_code
   - expected.reason_code_prefix: optional prefix match
   - expected.selected_action: optional exact dict match for RouteDecision.selected_action
+
+Named tests below (beyond the generic fixture-driven `test_fixture`) exist to
+give the mandatory #1860/#1871/#1873 regression names discoverability and an
+explicit failure message independent of fixture-file bookkeeping.
 """
 
 from __future__ import annotations
 
 import ast
+import inspect
 import sys
 from pathlib import Path
 
@@ -50,14 +51,14 @@ def _load_fixture(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
+def _load_fixture_by_name(name: str) -> dict:
+    return _load_fixture(FIXTURE_DIR / name)
+
+
 @pytest.mark.parametrize("fixture_path", _fixture_files(), ids=lambda p: p.stem)
 def test_fixture(fixture_path: Path):
     fx = _load_fixture(fixture_path)
-    result = route_loop_verdict_v2(
-        fx["reviewer_verdict"],
-        fx["live_mergeability"],
-        test_verdict=fx.get("test_verdict"),
-    )
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
 
     expected = fx["expected"]
 
@@ -97,10 +98,28 @@ def test_at_least_one_positive_and_one_negative_fixture_present():
     assert any(n.startswith("negative_") for n in names)
 
 
-def test_no_legacy_v1_fields_accepted_at_all():
-    """A reviewer_verdict carrying any V1/V2-legacy field must fail closed."""
+# ---------------------------------------------------------------------------
+# Issue #1870 (#1856) / #1873: no test_verdict parameter anywhere.
+# ---------------------------------------------------------------------------
+
+
+def test_router_signature_has_no_test_verdict():
+    """route_loop_verdict_v2 must take exactly reviewer_verdict and
+    live_mergeability -- no test_verdict, no third parameter of any kind."""
+    sig = inspect.signature(route_loop_verdict_v2)
+    param_names = list(sig.parameters.keys())
+    assert param_names == ["reviewer_verdict", "live_mergeability"], (
+        f"Unexpected router signature: {param_names!r}"
+    )
+    assert "test_verdict" not in param_names
+
+
+def test_legacy_reviewer_authority_fields_rejected():
+    """A reviewer_verdict carrying any V1/V2-legacy or test_verdict field
+    must fail closed rather than being silently accepted as routing input."""
     for legacy_key in ("merge_ready", "required_auto_actions", "allowed_paths_gate",
-                       "mergeability", "mergeStateStatus", "recommendations"):
+                       "mergeability", "mergeStateStatus", "recommendations",
+                       "test_verdict"):
         reviewer_verdict = {
             "verdict": "APPROVE",
             "reviewed_head_sha": "abc123",
@@ -117,6 +136,182 @@ def test_no_legacy_v1_fields_accepted_at_all():
         assert result.reason_code == f"schema_invalid_legacy_field_present:{legacy_key}"
 
 
+# Backward-compatible alias name (kept discoverable under its original name).
+test_no_legacy_v1_fields_accepted_at_all = test_legacy_reviewer_authority_fields_rejected
+
+
+# ---------------------------------------------------------------------------
+# #1860 Owner Decision / PR #1871 (#1869): actual conflict precedes verdict.
+# ---------------------------------------------------------------------------
+
+
+def test_conflict_precedes_request_changes():
+    """A real conflict must hard-stop even when the reviewer verdict is
+    REQUEST_CHANGES -- the conflict check runs before verdict dispatch."""
+    reviewer_verdict = {
+        "verdict": "REQUEST_CHANGES",
+        "reviewed_head_sha": "abc123",
+        "blockers": ["needs more work"],
+    }
+    live_mergeability = {
+        "head_sha": "abc123",
+        "mergeable": "CONFLICTING",
+        "merge_state_status": "DIRTY",
+    }
+    result = route_loop_verdict_v2(reviewer_verdict, live_mergeability)
+    assert result.route == "conflict_hard_stop", (
+        f"expected conflict_hard_stop, got {result.route!r} (errors: {result.errors})"
+    )
+
+
+def test_conflict_precedes_human_review_required():
+    """A real conflict must hard-stop even when the reviewer verdict is
+    HUMAN_REVIEW_REQUIRED -- the conflict check runs before verdict
+    dispatch."""
+    reviewer_verdict = {
+        "verdict": "HUMAN_REVIEW_REQUIRED",
+        "reviewed_head_sha": "abc123",
+        "blockers": ["ambiguous scope"],
+    }
+    live_mergeability = {
+        "head_sha": "abc123",
+        "mergeable": "MERGEABLE",
+        "merge_state_status": "DIRTY",
+    }
+    result = route_loop_verdict_v2(reviewer_verdict, live_mergeability)
+    assert result.route == "conflict_hard_stop", (
+        f"expected conflict_hard_stop, got {result.route!r} (errors: {result.errors})"
+    )
+
+
+def test_mergeable_conflicting_is_hard_stop():
+    fx = _load_fixture_by_name("negative_conflicting_mergeable.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route == "conflict_hard_stop"
+    assert result.fail_closed is False
+    assert result.reason_code is not None
+    assert result.reason_code.startswith("conflict_mergeable_CONFLICTING")
+
+
+def test_dirty_is_hard_stop():
+    fx = _load_fixture_by_name("negative_dirty_merge_state.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route == "conflict_hard_stop"
+    assert result.fail_closed is False
+    assert result.reason_code is not None
+    assert result.reason_code.startswith("conflict_merge_state_status_DIRTY")
+
+
+def test_merge_state_status_conflicting_is_schema_invalid():
+    """merge_state_status=CONFLICTING is not a valid GitHub MergeStateStatus
+    enum member -> schema_invalid, NOT treated as a conflict signal."""
+    fx = _load_fixture_by_name("negative_merge_state_status_conflicting_schema_invalid.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route == "fail_closed"
+    assert result.route != "conflict_hard_stop"
+    assert result.fail_closed is True
+    assert result.reason_code is not None
+    assert result.reason_code.startswith("schema_invalid_merge_state_status_value")
+
+
+# ---------------------------------------------------------------------------
+# Stale head / BEHIND synthesis.
+# ---------------------------------------------------------------------------
+
+
+def test_stale_approve_routes_to_rereview():
+    fx = _load_fixture_by_name("negative_stale_head.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route == "route_stale_head_rereview"
+    assert result.fail_closed is False
+
+
+def test_behind_synthesizes_update_branch():
+    fx = _load_fixture_by_name("positive_behind.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route == "route_to_update_branch"
+    assert result.fail_closed is False
+    assert result.selected_action is not None
+    assert result.rerun_required == {"verification": True, "pr_review": True}
+
+
+def test_update_branch_expected_head_sha_matches_reviewed_head():
+    fx = _load_fixture_by_name("positive_update_branch.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.selected_action is not None
+    assert result.selected_action["expected_head_sha"] == fx["reviewer_verdict"]["reviewed_head_sha"]
+
+
+# ---------------------------------------------------------------------------
+# UNKNOWN / BLOCKED / UNSTABLE / DRAFT / HAS_HOOKS: none are conflicts, and
+# none are automatic human escalations (#1860 Owner Decision / PR #1871 P0-3).
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_is_not_conflict():
+    for fixture_name in ("negative_unknown_mergeable.yml", "negative_unknown_merge_state_status.yml"):
+        fx = _load_fixture_by_name(fixture_name)
+        result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+        assert result.route not in ("conflict_hard_stop", "route_human_escalation"), (
+            f"{fixture_name}: UNKNOWN must not be treated as a conflict or "
+            f"human escalation, got route={result.route!r}"
+        )
+        assert result.route == "fail_closed"
+        assert result.reason_code == "mergeability_unknown"
+
+
+def test_blocked_is_not_conflict():
+    fx = _load_fixture_by_name("positive_blocked_defer_to_ci.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route not in ("conflict_hard_stop", "route_human_escalation")
+    assert result.route == "fail_closed"
+    assert result.reason_code is not None
+    assert result.reason_code.startswith("merge_state_status_blocked_not_conflict")
+
+
+def test_unstable_is_not_conflict():
+    fx = _load_fixture_by_name("positive_unstable_defer_to_ci.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route not in ("conflict_hard_stop", "route_human_escalation")
+    assert result.route == "fail_closed"
+    assert result.reason_code is not None
+    assert result.reason_code.startswith("merge_state_status_unstable_not_conflict")
+
+
+def test_draft_is_not_conflict_or_automatic_human_stop():
+    fx = _load_fixture_by_name("positive_draft_defer_to_ci.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route not in ("conflict_hard_stop", "route_human_escalation"), (
+        "DRAFT must never trigger automatic human escalation on its own "
+        "(Issue #1873 Delivery Rule requires the PR to stay Draft pending "
+        "human final merge)"
+    )
+    assert result.route == "fail_closed"
+    assert result.reason_code is not None
+    assert result.reason_code.startswith("merge_state_status_draft_not_conflict")
+
+
+def test_has_hooks_is_not_conflict():
+    fx = _load_fixture_by_name("positive_has_hooks_approved.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route != "conflict_hard_stop"
+    assert result.route == "approved"
+    assert result.fail_closed is False
+
+
+# ---------------------------------------------------------------------------
+# APPROVE-with-blockers is an inconsistent reviewer result.
+# ---------------------------------------------------------------------------
+
+
+def test_approve_with_blockers_fails_closed():
+    fx = _load_fixture_by_name("negative_approve_with_blockers.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route == "fail_closed"
+    assert result.fail_closed is True
+    assert result.reason_code == "approve_with_blockers_inconsistent"
+
+
 # ---------------------------------------------------------------------------
 # Extra 6: RouteDecision.selected_action and rerun_required are immutable
 # ---------------------------------------------------------------------------
@@ -125,12 +320,8 @@ def test_no_legacy_v1_fields_accepted_at_all():
 def test_route_decision_selected_action_is_immutable():
     """Extra 6: selected_action must be MappingProxyType (immutable)."""
     from types import MappingProxyType
-    fx = _load_fixture(FIXTURE_DIR / "positive_update_branch.yml")
-    result = route_loop_verdict_v2(
-        fx["reviewer_verdict"],
-        fx["live_mergeability"],
-        test_verdict=fx.get("test_verdict"),
-    )
+    fx = _load_fixture_by_name("positive_update_branch.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
     assert result.selected_action is not None
     assert isinstance(result.selected_action, MappingProxyType), (
         f"Expected MappingProxyType, got {type(result.selected_action)}"
@@ -142,12 +333,8 @@ def test_route_decision_selected_action_is_immutable():
 def test_route_decision_rerun_required_is_immutable():
     """Extra 6: rerun_required must be MappingProxyType (immutable)."""
     from types import MappingProxyType
-    fx = _load_fixture(FIXTURE_DIR / "positive_update_branch.yml")
-    result = route_loop_verdict_v2(
-        fx["reviewer_verdict"],
-        fx["live_mergeability"],
-        test_verdict=fx.get("test_verdict"),
-    )
+    fx = _load_fixture_by_name("positive_update_branch.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
     assert isinstance(result.rerun_required, MappingProxyType), (
         f"Expected MappingProxyType, got {type(result.rerun_required)}"
     )

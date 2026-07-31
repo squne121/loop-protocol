@@ -89,7 +89,6 @@ def test_given_v2_update_branch_fixture_when_routed_then_update_branch_path_is_s
     result = route_loop_verdict_v2(
         fx["reviewer_verdict"],
         fx["live_mergeability"],
-        test_verdict=fx.get("test_verdict"),
     )
     assert result.route == fx["expected"]["route"], (
         f"Expected route '{fx['expected']['route']}', got '{result.route}'. errors: {result.errors}"

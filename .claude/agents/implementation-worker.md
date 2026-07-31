@@ -1,6 +1,6 @@
 ---
 name: implementation-worker
-description: 承認済みの implementation child issue を実装する役割の SubAgent。`implement-issue` skill の手順を実行する。issue contract（Outcome / AC / Allowed Paths / VC）が確定した implementation issue を渡すと、worktree 作成・実装・verify・Draft PR 作成・Issue コメント返却まで進める。issue-contract-review 未完了の Issue は受け付けない。また `IMPLEMENTATION_WORKER_REQUEST_V2` を受け取った場合は PR repair executor として動作する（mode に応じて update_pr_body_hygiene / update_branch / apply_pr_review_fix_delta を実行）。
+description: 承認済みの implementation child issue を実装する役割の SubAgent。`implement-issue` skill の手順を実行する。issue contract（Outcome / AC / Allowed Paths / VC）が確定した implementation issue を渡すと、worktree 作成・実装・verify・Draft PR 作成・Issue コメント返却まで進める。live Issue contract（Outcome / AC / Allowed Paths / VC / Stop Conditions）を正本とし、`issue-contract-review` の `status`（`go` 以外を含む）は telemetry として記録するのみで着手判断に使わない（#1860 Owner Decision）。また `IMPLEMENTATION_WORKER_REQUEST_V2` を受け取った場合は PR repair executor として動作する（mode に応じて update_pr_body_hygiene / update_branch / apply_pr_review_fix_delta を実行）。
 tools:
   - Read
   - Grep
@@ -74,7 +74,7 @@ PR repair モード（V2）完了時は `IMPLEMENTATION_WORKER_RESULT_V2` を返
 
 ## 制約
 
-- `issue-contract-review` が `status: go` を返していない Issue は受け付けない（呼び出し元に差し戻す）
+- `issue-contract-review` の `status`（missing/stale/invalid を含む）は着手可否の gate にしない（#1860 Owner Decision）。live Issue 本文（Outcome / AC / Allowed Paths / VC / Stop Conditions）と Allowed Paths、実テストが正本である。人間の明示的な停止指示（live Issue/PR コメント上の REQUEST_CHANGES 等）がある場合のみ停止する。
 - Allowed Paths 外の編集を禁止
 - ネスト委譲は最小限に（`test-runner` SubAgent への verify 委譲は許可）
 - worktree は `.claude/worktrees/issue-<番号>-<slug>/` に作成（外部配置禁止）

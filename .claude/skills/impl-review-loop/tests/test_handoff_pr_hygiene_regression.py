@@ -428,7 +428,6 @@ class TestAC5BehindMergeableRequiredAutoActionsUpdateBranch:
         result = route_loop_verdict_v2(
             _REVIEWER_VERDICT_APPROVE,
             _LIVE_MERGEABILITY_BEHIND,
-            test_verdict={"branch_behind_main": True},
         )
         assert result.selected_action is not None
         assert dict(result.selected_action)["kind"] == "update_branch"
@@ -438,7 +437,6 @@ class TestAC5BehindMergeableRequiredAutoActionsUpdateBranch:
         result = route_loop_verdict_v2(
             _REVIEWER_VERDICT_APPROVE,
             _LIVE_MERGEABILITY_BEHIND,
-            test_verdict={"branch_behind_main": True},
         )
         assert result.route != "approved", "BEHIND state must not route to approved"
 
@@ -466,14 +464,23 @@ class TestAC5BehindMergeableRequiredAutoActionsUpdateBranch:
         )
 
     def test_loop_verdict_v2_schema_has_required_auto_actions_field(self):
-        """AC5 after-pass: LOOP_VERDICT_V2 スキーマが required_auto_actions フィールドを含むこと。
-
-        step-5-feedback-and-termination.md に required_auto_actions のスキーマ定義があること。
+        """AC5 after-pass (superseded by Issue #1873): required_auto_actions is no
+        longer a reviewer-supplied schema field -- the router synthesizes the
+        update_branch action from live_mergeability itself. This test now
+        verifies step-5-feedback-and-termination.md documents that synthesis
+        contract (worker_status_result_routing) instead of the removed V2
+        reviewer-self-report field.
         """
         body = _read(STEP5_FT)
-        assert "required_auto_actions" in body, (
-            "step-5-feedback-and-termination.md must define required_auto_actions schema "
-            "(AC5: V2 field from #637)"
+        assert "worker_status_result_routing" in body, (
+            "step-5-feedback-and-termination.md must define worker_status_result_routing "
+            "(Issue #1873: router-synthesized update_branch action routing, "
+            "replacing the removed #637 required_auto_actions reviewer field)"
+        )
+        assert "required_auto_actions" not in body, (
+            "step-5-feedback-and-termination.md must NOT reference required_auto_actions "
+            "as a reviewer-supplied schema field (Issue #1873 removed reviewer self-report "
+            "of actions; the router synthesizes update_branch itself)"
         )
 
 
@@ -544,7 +551,6 @@ def test_before_fail_loop_verdict_v1_behind_allows_premature_termination() -> No
     result = route_loop_verdict_v2(
         v1_verdict,
         _LIVE_MERGEABILITY_BEHIND,
-        test_verdict={"branch_behind_main": False},
     )
     # V1 形式は required_auto_actions が missing (None) → fail-closed
     # → route != "approved" なのでアサーション FAILS → xfail が発火
@@ -743,7 +749,6 @@ def test_behind_mergeable_required_auto_actions_contains_update_branch():
     result = route_loop_verdict_v2(
         _REVIEWER_VERDICT_APPROVE,
         _LIVE_MERGEABILITY_BEHIND,
-        test_verdict={"branch_behind_main": True},
     )
     assert result.selected_action is not None
     assert dict(result.selected_action)["kind"] == "update_branch"
