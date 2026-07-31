@@ -128,7 +128,7 @@ uv run --locked python3 scripts/agent-guards/skill_runtime_exec.py \
 
 `--anchor-comment-url` は `https://github.com/<owner>/<repo>/issues/<N>#issuecomment-<M>` の canonical shape のみを受け付け、`--issue-number` / `--repo` と URL 内の owner/repo/issue 番号が一致しない場合は拒否される（context-binding）。`preflight.run` 自体の argv / placeholders / execution_class はこの sibling profile の追加によって一切変更されない。
 
-#### Step 0g: Trusted contract update（main control-plane only）
+#### Step 0g: trusted contract update（main control-planeを実行する親control-plane限定）
 
 `preflight.run.with_anchor` が trusted contract patch plan を得た後だけ、main control-plane は canonical main root / default branch から次の明示phaseを実行できる。preflight entryの `mutation: false` は変更せず、このphase以外に `--consume-contract-patch-plan` を渡してはならない。
 
