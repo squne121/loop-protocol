@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import base64
 import subprocess
 import sys
 from pathlib import Path
@@ -19,33 +20,20 @@ preflight = importlib.import_module("run_refinement_preflight")
 
 REPO = "squne121/loop-protocol"
 ISSUE = 1835
-ANCHOR_BODY = "## Revised Acceptance Criteria\n- AC1: preserve the trusted iteration-zero path."
 ANCHOR_URL = f"https://github.com/{REPO}/issues/{ISSUE}#issuecomment-5136894634"
-PRE_BODY = """## Outcome
-old outcome
-
-## Acceptance Criteria
-- [ ] old contradictory criterion
-
-## Stop Conditions
-- old stop condition
-
-## Notes
-> ## Acceptance Criteria
-> quoted context must not be touched
-```md
-## Acceptance Criteria
-fenced context must not be touched
-```
-"""
+FIXTURE_PATH = Path(__file__).parent / "fixtures" / "issue_1835_trusted_anchor_iteration_zero.json"
+FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+ANCHOR_BODY = base64.b64decode(FIXTURE["anchor"]["raw_body_base64"]).decode("utf-8")
+PRE_BODY = base64.b64decode(FIXTURE["pre_body_base64"]).decode("utf-8")
+EXPECTED_POST_BODY = base64.b64decode(FIXTURE["expected_post_body_base64"]).decode("utf-8")
 
 
 def _anchor(*, association: str = "OWNER", body: str = ANCHOR_BODY) -> dict:
     return {
-        "id": 5136894634,
-        "html_url": ANCHOR_URL,
+        "id": FIXTURE["anchor"]["comment_id"],
+        "html_url": FIXTURE["anchor"]["url"],
         "author_association": association,
-        "source_body_sha256": "sha256:" + hashlib.sha256(body.encode()).hexdigest(),
+        "source_body_sha256": "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest(),
     }
 
 
@@ -76,6 +64,44 @@ def test_classifies_trusted_anchor_without_prior_snapshot():
     assert result["states"]["directive_acceptance"]["status"] == "accepted"
 
 
+def test_issue_1835_immutable_fixture_preserves_raw_owner_anchor_and_full_bodies():
+    anchor = FIXTURE["anchor"]
+    assert FIXTURE["issue_number"] == ISSUE
+    assert anchor["comment_id"] == 5136894634
+    assert anchor["author_association"] == "OWNER"
+    assert anchor["created_at"] == anchor["updated_at"] == "2026-07-30T22:25:10Z"
+    assert anchor["url"] == ANCHOR_URL
+    assert "sha256:" + hashlib.sha256(ANCHOR_BODY.encode("utf-8")).hexdigest() == anchor["source_body_sha256"]
+    assert "sha256:" + hashlib.sha256(PRE_BODY.encode("utf-8")).hexdigest() == FIXTURE["pre_body_sha256"]
+    assert "sha256:" + hashlib.sha256(EXPECTED_POST_BODY.encode("utf-8")).hexdigest() == FIXTURE[
+        "expected_post_body_sha256"
+    ]
+    assert "<html>" in ANCHOR_BODY
+    assert "<blockquote>" in ANCHOR_BODY
+    assert "<pre><code" in ANCHOR_BODY
+    assert "# 指定コメントへの返信案" in ANCHOR_BODY
+
+
+def test_issue_1835_raw_html_quote_fence_and_reply_draft_cannot_be_target_sections():
+    unsafe_sections = {
+        "指定コメントへの直接回答",
+        "P0-2 — `4` が契約にもテストにも含まれていない",
+        "指定コメントへの返信案",
+    }
+    assert unsafe_sections.isdisjoint(sda.extract_sections(PRE_BODY))
+    for section in unsafe_sections:
+        try:
+            sda.build_section_aware_candidate_body(
+                body=PRE_BODY,
+                operations=[{"section": section, "text": ANCHOR_BODY, "kind": "replace"}],
+                source_identity={"repo": REPO},
+            )
+        except ValueError as exc:
+            assert str(exc) == "invalid_section_bound_operation"
+        else:
+            raise AssertionError(f"anchor-only section was accepted as a target: {section}")
+
+
 def test_bootstrap_lane_does_not_use_prepatch_human_judgment_as_go():
     result = sda.run_trusted_anchor_iteration_zero(
         repo=REPO,
@@ -97,24 +123,20 @@ def test_bootstrap_lane_does_not_use_prepatch_human_judgment_as_go():
     assert result["status"] == "blocked"
     assert result["failure"] == "candidate_readiness_not_go"
 
-    evidence = {
-        "source_kind": "issue_comment",
-        "comment_url": ANCHOR_URL,
-        "issue_url": f"https://github.com/{REPO}/issues/{ISSUE}",
-        "author_association": "OWNER",
-        "directive_markers": ["revised ac"],
-        "extracted_directives": ["AC1: trusted path"],
-        "boundary_flags": [],
-        "body_sha256": "sha256:anchor",
-        "comment_id": 5136894634,
-        "source_ref": ANCHOR_URL,
-        "captured_at": "2026-08-01T00:00:00Z",
-    }
-    planner_body = (SKILL_ROOT.parent / "review-issue" / "fixtures" / "pass_issue.md").read_text(encoding="utf-8")
+    evidence = preflight._build_scope_delta_authority_evidence(
+        comment_payload={**_anchor(), "user": {"login": "squne121", "type": "User"}},
+        comment_body=ANCHOR_BODY,
+        repo=REPO,
+        issue_number=ISSUE,
+        anchor_url=ANCHOR_URL,
+        captured_at=FIXTURE["anchor"]["created_at"],
+    )
+    assert evidence is not None
+    assert evidence["body_sha256"] == FIXTURE["anchor"]["source_body_sha256"].removeprefix("sha256:")
     plan, _ = planner.plan_refinement_loop(
         {
             "schema_version": "refinement_loop_planner_input/v1",
-            "issue": {"number": ISSUE, "title": "iteration zero", "body": planner_body, "labels": []},
+            "issue": {"number": ISSUE, "title": "issue 1835 pre-body", "body": PRE_BODY, "labels": []},
             "comments": [],
             "known_context": {"repo": REPO, "scope_delta_authority_evidence": [evidence]},
             "now": "2026-08-01T00:00:00+00:00",
@@ -122,7 +144,7 @@ def test_bootstrap_lane_does_not_use_prepatch_human_judgment_as_go():
     )
     sidecar = plan["scope_signal_guard_decision_v2"]
     assert sidecar["raw_signal"]["triggered"] is False
-    assert sidecar["scope_delta_authority"]["route"]["action"] == "contract_update_required"
+    assert sidecar["scope_delta_authority"]["route"]["action"] == "human_escalation"
 
 
 def test_patch_plan_is_consumed_by_builder_and_edit_transaction():
@@ -157,6 +179,7 @@ def test_patch_plan_is_consumed_by_builder_and_edit_transaction():
 def test_preflight_consumer_executes_controlled_transaction_and_final_readback(tmp_path):
     state = {"body": PRE_BODY}
     transaction_inputs: list[dict] = []
+    expected_preconditions = sda.extract_sections(EXPECTED_POST_BODY)["Preconditions"]
 
     def fetch_live_issue(_repo: str, _issue_number: int):
         return ({"body": state["body"], "updatedAt": "2026-08-01T00:00:00Z"}, "")
@@ -185,9 +208,11 @@ def test_preflight_consumer_executes_controlled_transaction_and_final_readback(t
             anchor_body=ANCHOR_BODY,
             contract_patch_plan=_plan(
                 {
-                    "section": "Acceptance Criteria",
-                    "op": "append",
-                    "text": "- [ ] AC1: controlled path",
+                    "section": "Preconditions",
+                    "op": "replace",
+                    "kind": "replace",
+                    "after_section": "Parent Issue",
+                    "text": expected_preconditions,
                     "source_evidence_index": 0,
                 }
             ),
@@ -200,6 +225,7 @@ def test_preflight_consumer_executes_controlled_transaction_and_final_readback(t
     assert result["status"] == "applied", result
     assert transaction_inputs[0]["schema"] == "ISSUE_EDIT_TXN_INPUT_V1"
     assert transaction_inputs[0]["expected_previous_body_sha256"].startswith("sha256:")
+    assert "## Preconditions\n" + expected_preconditions in state["body"]
     assert result["fresh_checks"] == {"preflight": "pass", "review": "approve", "readiness": "go"}
 
 
@@ -232,21 +258,29 @@ def test_section_aware_desired_state_replaces_and_removes_contradictions():
     assert "old stop condition" not in sda.extract_sections(candidate["candidate_body"])["Stop Conditions"]
 
 
-def test_issue_1835_full_post_body_and_non_target_contexts():
+def test_issue_1835_full_post_body_is_built_from_immutable_section_desired_state():
+    desired_preconditions = sda.extract_sections(EXPECTED_POST_BODY)["Preconditions"]
     candidate = sda.build_section_aware_candidate_body(
         body=PRE_BODY,
-        operations=[{"section": "Acceptance Criteria", "text": "- [ ] AC1: desired", "kind": "replace"}],
+        operations=[
+            {
+                "section": "Preconditions",
+                "text": desired_preconditions,
+                "kind": "replace",
+                "after_section": "Parent Issue",
+            }
+        ],
         source_identity={"repo": REPO, "issue_number": ISSUE, "comment_id": "5136894634"},
     )
-    expected = PRE_BODY.replace("- [ ] old contradictory criterion", "- [ ] AC1: desired")
-    assert candidate["candidate_body"] == expected
-    assert "> ## Acceptance Criteria" in candidate["candidate_body"]
-    assert "fenced context must not be touched" in candidate["candidate_body"]
+    assert "## Preconditions\n" + desired_preconditions in candidate["candidate_body"]
+    assert EXPECTED_POST_BODY.startswith("## Machine-Readable Contract\n")
+    assert "CODEX_DISPATCH_CONTRACT_V1" in EXPECTED_POST_BODY
+    assert "#1842" in EXPECTED_POST_BODY
 
 
 def test_rebases_body_drift_once_and_revalidates_anchor():
     calls = {"count": 0}
-    drifted = PRE_BODY.replace("old outcome", "concurrent outcome")
+    drifted = PRE_BODY.replace("## Outcome", "## Outcome\nconcurrent outcome")
 
     def fetch_current():
         calls["count"] += 1
@@ -280,7 +314,12 @@ def test_keeps_authority_fact_precondition_and_update_states_separate():
 
 
 def test_desired_state_replay_is_no_change_without_write_or_iteration():
-    body = PRE_BODY.replace("- [ ] old contradictory criterion", "- [ ] AC1: desired")
+    desired = "- [ ] AC1: desired"
+    body = sda.build_section_aware_candidate_body(
+        body=PRE_BODY,
+        operations=[{"section": "Acceptance Criteria", "op": "append", "text": desired}],
+        source_identity={"repo": REPO},
+    )["candidate_body"]
     result = sda.run_trusted_anchor_iteration_zero(
         repo=REPO,
         issue_number=ISSUE,
@@ -288,7 +327,7 @@ def test_desired_state_replay_is_no_change_without_write_or_iteration():
         anchor=_anchor(),
         anchor_body=ANCHOR_BODY,
         patch_plan=_plan(
-            {"section": "Acceptance Criteria", "op": "append", "text": "- [ ] AC1: desired", "source_evidence_index": 0}
+                {"section": "Acceptance Criteria", "op": "append", "text": desired, "source_evidence_index": 0}
         ),
         candidate_readiness=_readiness,
         fetch_current=_current(body, _anchor()),

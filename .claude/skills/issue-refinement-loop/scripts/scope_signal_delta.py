@@ -974,6 +974,41 @@ def _replace_top_level_section(body: str, section: str, desired: str) -> str:
     return "\n".join([*lines[:start], *replacement, *lines[end:]]).rstrip() + "\n"
 
 
+def _insert_top_level_section(body: str, section: str, desired: str, after_section: str | None) -> str:
+    """Insert one missing H2 section at an explicit, top-level anchor."""
+    rendered = f"## {section}\n{desired.strip()}\n"
+    if after_section is None:
+        return body.rstrip() + "\n\n" + rendered
+    lines = body.splitlines()
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    insertion = None
+    for index, line in enumerate(lines):
+        if not in_fence:
+            opener = _parse_fence_opener(line)
+            if opener is not None:
+                fence_char, fence_len = opener
+                in_fence = True
+                continue
+        elif _is_fence_closer(line, fence_char, fence_len):
+            in_fence = False
+            continue
+        if line.lstrip().startswith(">"):
+            continue
+        heading = _parse_heading(line)
+        if insertion is not None and heading is not None:
+            break
+        if heading == after_section:
+            insertion = index + 1
+    if insertion is None:
+        raise ValueError(f"missing_section_insertion_anchor:{after_section}")
+    while insertion < len(lines) and _parse_heading(lines[insertion]) is None:
+        insertion += 1
+    replacement = ["", *rendered.rstrip().splitlines(), ""]
+    return "\n".join([*lines[:insertion], *replacement, *lines[insertion:]]).rstrip() + "\n"
+
+
 def build_section_aware_candidate_body(*, body: str, operations: list[dict], source_identity: dict) -> dict:
     """Consume a patch plan into desired H2 section state without fanout.
 
@@ -990,7 +1025,7 @@ def build_section_aware_candidate_body(*, body: str, operations: list[dict], sou
         section = operation.get("section")
         text = operation.get("text")
         kind = operation.get("kind", "upsert")
-        if section not in sections or not isinstance(text, str) or not text.strip():
+        if not isinstance(section, str) or not isinstance(text, str) or not text.strip():
             raise ValueError("invalid_section_bound_operation")
         if kind not in {"upsert", "replace", "remove"}:
             raise ValueError("invalid_section_operation_kind")
@@ -1000,6 +1035,12 @@ def build_section_aware_candidate_body(*, body: str, operations: list[dict], sou
         if identity in identities:
             continue
         identities.add(identity)
+        if section not in sections:
+            if kind == "remove" or not isinstance(operation.get("after_section"), str):
+                raise ValueError("invalid_section_bound_operation")
+            desired_sections[section] = text.strip()
+            postconditions.append({"section": section, "contains": text.strip(), "removes": None})
+            continue
         current = desired_sections[section]
         remove_text = operation.get("remove_text")
         if isinstance(remove_text, str) and remove_text:
@@ -1019,6 +1060,15 @@ def build_section_aware_candidate_body(*, body: str, operations: list[dict], sou
     for section in sections:
         if desired_sections[section] != sections[section]:
             candidate = _replace_top_level_section(candidate, section, desired_sections[section])
+    for operation in operations:
+        section = operation.get("section")
+        if section not in sections and section in desired_sections:
+            candidate = _insert_top_level_section(
+                candidate,
+                section,
+                desired_sections[section],
+                operation.get("after_section"),
+            )
     return {
         "candidate_body": candidate,
         "changed": candidate != body,
