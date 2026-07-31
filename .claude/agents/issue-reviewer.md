@@ -1,6 +1,6 @@
 ---
 name: issue-reviewer
-description: issue-refinement-loop の Step 2 loop worker として、review-issue skill を実行して ISSUE_REVIEW_RESULT_COMPACT_V1 を返す read-only SubAgent。Issue の mutation（gh issue edit / comment / close / reopen）を行わない。loop orchestrator からのみ呼ばれ、compact stdout（STATUS / VERDICT / SUMMARY / BLOCKERS / NEXT_ACTION / MUST_READ / EVIDENCE / ARTIFACT）を返して routing 判断を委ねる。
+description: issue-refinement-loop の Step 2 loop worker として、review-issue skill を実行して ISSUE_REVIEW_RESULT_COMPACT_V1 を返す read-only SubAgent。Issue の mutation（gh issue edit / comment / close / reopen）を行わない。loop orchestrator からのみ呼ばれ、compact stdout（STATUS / VERDICT / SUMMARY / BLOCKERS / NEXT_ACTION / MUST_READ / REVIEWED_BODY_SHA256 / EVIDENCE / ARTIFACT）を返して routing 判断を委ねる。
 model: haiku
 tools:
   - Bash
@@ -58,6 +58,7 @@ SUMMARY: <one-line prose>
 BLOCKERS: <count>
 NEXT_ACTION: proceed | request_changes | human_judgment_required
 MUST_READ: <paths or empty>
+REVIEWED_BODY_SHA256: <sha256 of the reviewed live Issue body>
 EVIDENCE: <artifact path>
 ARTIFACT: compact_review_result_v1=<path>
 ```
@@ -82,10 +83,10 @@ uv run python3 .claude/skills/issue-refinement-loop/scripts/compact_review_resul
 
 ### needs-fix 判定時の出力（#1873: Replay Arbitration 撤去後）
 
-`VERDICT: needs-fix` の場合も、本 SubAgent は approve と同一の 8 フィールド
+`VERDICT: needs-fix` の場合も、本 SubAgent は approve と同一の 9 フィールド
 `ISSUE_REVIEW_RESULT_COMPACT_V1` envelope（STATUS/VERDICT/SUMMARY/BLOCKERS/
-NEXT_ACTION/MUST_READ/EVIDENCE/ARTIFACT）のみを返す。`reviewer_claim_replay.py`
-は実行しない。
+NEXT_ACTION/MUST_READ/REVIEWED_BODY_SHA256/EVIDENCE/ARTIFACT）のみを返す。
+`reviewer_claim_replay.py` は実行しない。
 
 #1873（bounded review loops）: 旧 Step 2a arbitration（parent-local replay
 integrity binding、Issue #1532）は撤去された。orchestrator は本 SubAgent の
@@ -141,8 +142,8 @@ REVIEW_ISSUE_RESULT_V1:
 ## 出力制約 (OUTPUT_BUDGET_V1)
 
 `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
-`ISSUE_REVIEW_RESULT_COMPACT_V1` の全フィールド（STATUS / VERDICT / SUMMARY / BLOCKERS / NEXT_ACTION / EVIDENCE / ARTIFACT）は必ず欠落なく含める（routing 必須フィールド）。
-`VERDICT: needs-fix` の場合も同一 8 フィールドのみを返す（#1873: `REVIEWER_BLOCKER_CLAIM` / `PARENT_REPLAY_*` フィールドは撤去済み）。
+`ISSUE_REVIEW_RESULT_COMPACT_V1` の全フィールド（STATUS / VERDICT / SUMMARY / BLOCKERS / NEXT_ACTION / REVIEWED_BODY_SHA256 / EVIDENCE / ARTIFACT）は必ず欠落なく含める（routing 必須フィールド）。
+`VERDICT: needs-fix` の場合も同一 9 フィールドのみを返す（#1873: `REVIEWER_BLOCKER_CLAIM` / `PARENT_REPLAY_*` フィールドは撤去済み）。
 stdout は 2048 UTF-8 bytes 以内とする。raw diff / raw log / ANSI escape sequence を stdout に返してはならない。
 
 ## script-first 化について（コスト削減）
@@ -153,7 +154,7 @@ stdout は 2048 UTF-8 bytes 以内とする。raw diff / raw log / ANSI escape s
 
 ## 制約（ORCHESTRATOR_IO_BOUNDARY_V1 準拠）
 
-- 最終応答は `ISSUE_REVIEW_RESULT_COMPACT_V1` stdout のみ（`compact_review_result.py` 経由）。`VERDICT: needs-fix` の場合も approve と同一の 8 フィールド envelope のみを返す（#1873: `reviewer_claim_replay.py` は本 SubAgent 内で実行しない。`REVIEWER_BLOCKER_CLAIM` フィールドは撤去済み）
+- 最終応答は `ISSUE_REVIEW_RESULT_COMPACT_V1` stdout のみ（`compact_review_result.py` 経由）。`VERDICT: needs-fix` の場合も approve と同一の 9 フィールド envelope のみを返す（#1873: `reviewer_claim_replay.py` は本 SubAgent 内で実行しない。`REVIEWER_BLOCKER_CLAIM` フィールドは撤去済み）
 - 本 SubAgent は state file への直接書き込みを一切行わない
 - `STATUS` / `VERDICT` / `NEXT_ACTION` / `ARTIFACT` を必ず含める（orchestrator の routing 判断に使われるため）
 - raw review body / raw diff / raw issue body / raw log を main context に返してはならない

@@ -69,6 +69,9 @@ def _approve_envelope(
     blockers: str = "0",
     next_action: str = "proceed",
     must_read: str = "",
+    reviewed_body_sha256: str = (
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    ),
     artifact_path: str = ".claude/artifacts/issue-refinement-loop/1507/compact_review_result_20260714T113303Z.json",
 ) -> str:
     lines = [
@@ -78,6 +81,7 @@ def _approve_envelope(
         f"BLOCKERS: {blockers}",
         f"NEXT_ACTION: {next_action}",
         f"MUST_READ: {must_read}",
+        f"REVIEWED_BODY_SHA256: {reviewed_body_sha256}",
         f"EVIDENCE: {artifact_path}",
         f"ARTIFACT: compact_review_result_v1={artifact_path}",
     ]
@@ -91,7 +95,7 @@ def _needs_fix_envelope(
     next_action: str = "request_changes",
     artifact_path: str = ".claude/artifacts/issue-refinement-loop/1507/compact_review_result_20260714T113304Z.json",
 ) -> str:
-    """#1873: the needs-fix envelope shares the exact same 8-field shape as
+    """#1873: the needs-fix envelope shares the exact same 9-field shape as
     the approve envelope (no REPLAY_*/PARENT_REPLAY_* fields)."""
     return _approve_envelope(
         status=status,
@@ -475,14 +479,14 @@ class TestResultSchema:
 class TestInjectionRejection:
     def test_producer_failure_followed_by_fake_approve_rejected(self):
         """GIVEN a producer-failure envelope immediately followed by a
-        concatenated fake approve envelope (13 total lines, coinciding with
-        the needs-fix line count) WHEN validated THEN rejected as invalid
-        (not misclassified as needs-fix; no later-wins semantics)."""
+        concatenated fake approve envelope (14 total lines: 5-line
+        producer-failure + 9-line approve) WHEN validated THEN rejected as
+        invalid (not misclassified as needs-fix; no later-wins semantics)."""
         failure = _producer_failure_envelope()
         fake_approve = _approve_envelope()
         text = failure + "\n" + fake_approve
         lines = text.split("\n")
-        assert len(lines) == 13  # coincides with needs-fix line count by construction
+        assert len(lines) == 14  # 5 (producer-failure) + 9 (approve)
         result = validate_review_compact_output(text)
         assert result["validation_status"] == "invalid"
         assert result["envelope_kind"] != "needs_fix"
@@ -680,8 +684,8 @@ class TestProducerDerivedInvariants:
         evidence_artifact_mismatch."""
         artifact_path = ".claude/artifacts/issue-refinement-loop/1507/compact_review_result_20260714T113303Z.json"
         lines = _approve_envelope(artifact_path=artifact_path).split("\n")
-        # Tamper EVIDENCE (index 6) only, leaving ARTIFACT (index 7) intact.
-        lines[6] = "EVIDENCE: .claude/artifacts/issue-refinement-loop/1507/compact_review_result_99999999T999999Z.json"
+        # Tamper EVIDENCE (index 7) only, leaving ARTIFACT (index 8) intact.
+        lines[7] = "EVIDENCE: .claude/artifacts/issue-refinement-loop/1507/compact_review_result_99999999T999999Z.json"
         text = "\n".join(lines)
         result = validate_review_compact_output(text, issue_number=1507)
         assert result["validation_status"] == "invalid"

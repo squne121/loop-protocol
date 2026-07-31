@@ -18,11 +18,15 @@ Envelopes (field ordering SSOT: `compact_review_result.py`):
   REVIEWER_BLOCKER_CLAIM fields at all -- its shape is now IDENTICAL to the
   approve envelope's; only the field VALUES differ.
 
-  - approve / needs-fix envelope (8 lines, exact, shared shape):
+  - approve / needs-fix envelope (9 lines, exact, shared shape):
         STATUS / VERDICT / SUMMARY / BLOCKERS / NEXT_ACTION / MUST_READ /
-        EVIDENCE / ARTIFACT
+        REVIEWED_BODY_SHA256 / EVIDENCE / ARTIFACT
     Classified as "approve" when VERDICT == approve, "needs_fix" when
     VERDICT == needs-fix.
+    `REVIEWED_BODY_SHA256` (#1873) is the sha256 of the live Issue body the
+    reviewer actually reviewed (SSOT: `compact_review_result.py`'s
+    `raw_result["body_sha256"]`), exposed on the compact envelope so callers
+    can detect stale reviewed-body drift without opening the full artifact.
 
   - producer-failure envelope (5 lines, exact):
         STATUS / NEXT_ACTION / REASON_CODE / ARTIFACT / ARTIFACT_SHA256
@@ -93,6 +97,7 @@ APPROVE_FIELDS: list[str] = [
     "BLOCKERS",
     "NEXT_ACTION",
     "MUST_READ",
+    "REVIEWED_BODY_SHA256",
     "EVIDENCE",
     "ARTIFACT",
 ]
@@ -389,6 +394,15 @@ def _common_field_invariants(fields: dict[str, str], envelope_kind: str) -> list
     must_read = fields.get("MUST_READ", "")
     if must_read != "":
         violations.append(_violation("must_read_non_empty_rejected", value=must_read))
+
+    reviewed_body_sha256 = fields.get("REVIEWED_BODY_SHA256", "")
+    if not (
+        _SHA256_PREFIXED_RE.match(reviewed_body_sha256)
+        or _SHA256_PLAIN_RE.match(reviewed_body_sha256)
+    ):
+        violations.append(
+            _violation("reviewed_body_sha256_invalid_format", value=reviewed_body_sha256)
+        )
 
     artifact = fields.get("ARTIFACT", "")
     evidence = fields.get("EVIDENCE", "")

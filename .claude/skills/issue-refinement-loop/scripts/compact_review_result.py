@@ -392,6 +392,13 @@ def compact_review_result(
     artifact_content = artifact_content_str.encode("utf-8")
 
     # Build compact dict (stdout representation)
+    # REVIEWED_BODY_SHA256 (#1873): sha256 of the live Issue body that was
+    # actually reviewed, as reported by the reviewer in REVIEW_ISSUE_RESULT_V1's
+    # `body_sha256` field. This is the same source value used for
+    # `producer_body_sha256` in the full artifact above; exposing it on the
+    # compact stdout lets `decide_next_loop_action.py` / callers detect stale
+    # reviewed-body drift without parsing the full artifact.
+    reviewed_body_sha256 = raw_result.get("body_sha256") or ""
     compact_data = {
         "STATUS": status,
         "VERDICT": verdict,
@@ -401,6 +408,7 @@ def compact_review_result(
         "MUST_READ": "",
         "EVIDENCE": str(artifact_path),
         "ARTIFACT": f"compact_review_result_v1={artifact_path}",
+        "REVIEWED_BODY_SHA256": reviewed_body_sha256,
     }
 
     # Build stdout lines
@@ -412,6 +420,7 @@ def compact_review_result(
         f"BLOCKERS: {compact_data['BLOCKERS']}",
         f"NEXT_ACTION: {compact_data['NEXT_ACTION']}",
         f"MUST_READ: {compact_data['MUST_READ']}",
+        f"REVIEWED_BODY_SHA256: {compact_data['REVIEWED_BODY_SHA256']}",
     ]
     if compact_data["EVIDENCE"]:
         stdout_lines.append(f"EVIDENCE: {compact_data['EVIDENCE']}")

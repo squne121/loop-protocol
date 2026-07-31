@@ -251,7 +251,6 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "--loop-state-file", "{loop_state_file}",
             "--review-result-verdict", "{verdict}",
             "--max-iterations", "{max_iterations}",
-            "--phase-state-file", "{phase_state_file}",
         ],
         "shell": False,
         "cwd_policy": "repo_root",
@@ -263,7 +262,6 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "loop_state_file": {"type": "repo_relative_file", "required": True},
             "verdict": {"type": "verdict", "required": True},
             "max_iterations": {"type": "positive_int", "required": False},
-            "phase_state_file": {"type": "repo_relative_file", "required": False},
         },
     },
     "gh.issue.view": {

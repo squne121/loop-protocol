@@ -154,6 +154,14 @@ Exit codes:
 
 優先順位: `inconsistent_state (3)` > `human_escalation (2)` > `warn (1)` > `pass (0)`。
 
+**TODO（follow-up scope）**: `compact_review_result.py` の compact stdout は
+`REVIEWED_BODY_SHA256`（reviewer が実際にレビューした live Issue body の sha256、
+`ISSUE_REVIEW_RESULT_COMPACT_V1` の 9 番目のフィールド）を出力するようになった
+（#1873）。`decide_next_loop_action.py` は現時点でこの値を stale reviewed-body
+検出には使っていない — 大掛かりな新しい state machine を追加せず、既存の
+`--loop-state-file` / `last_verdict` 比較ロジックに軽く配線する形で、将来の
+follow-up Issue として拾うこと。
+
 ## scope_signal_guard_decision_v2（#1090 サイドカー）
 
 `scope_signal_guard_decision_v2`（#1090, opt-in。`references/scope-signal-guard.md`
