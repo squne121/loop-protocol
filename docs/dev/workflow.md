@@ -272,9 +272,11 @@ branch publish が hook / approval 境界で止まった場合、agent は manua
 - `branch_mismatch` / `stale_remote_head` / `local_head_mismatch` / `remote_fast_forward_by_same_scope` / `remote_head_scope_contamination` / `allowed_paths_gate_not_ok` / `publish_guard_context_missing` / `publish_guard_context_invalid` のいずれかなら `PUBLISH_SAFETY_STOP_REPORT_V1` を残して停止する
 - strict lane を hook に束縛する場合は `LOOP_PUBLISH_EXPECTED_REMOTE_HEAD` / `LOOP_PUBLISH_CURRENT_REMOTE_HEAD` / `LOOP_PUBLISH_DECLARED_PUBLISH_HEAD` / `LOOP_PUBLISH_VERIFIED_HEAD` / `LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS` / `LOOP_PUBLISH_REMOTE_READBACK_SOURCE` をセットする
 
-### Scope Collision Preflight（スコープ衝突の事前確認、#1860 で advisory 化）
+### Scope Collision Preflight（スコープ衝突の事前確認、#1860 で advisory 化、#1679 で implement-issue 実行時の再判定を撤去）
 
-Allowed Paths overlap 単独では hard stop ではない。OPEN な他 Implementation Issue と Allowed Paths が重複する場合、Scope Collision Preflight で以下の class を判定するが、判定結果自体は着手・実装・PR publication を止めない（#1860: OPEN Issue 全件収集・semantic overlap 判定・Allowed Paths の文字列重複は advisory diagnostic であり blocking authority を持たない）。
+Allowed Paths overlap 単独では hard stop ではない。以下の class 分類は Issue 起票時の `create-issue` 側 preflight（`check_issue_overlap.py`）が使う概念であり、判定結果自体は着手・実装・PR publication を止めない（#1860: OPEN Issue 全件収集・semantic overlap 判定・Allowed Paths の文字列重複は advisory diagnostic であり blocking authority を持たない）。
+
+`implement-issue` / `open-pr` の実装実行時（production path）に他の OPEN Implementation Issue を列挙・readback して同種の class を再判定する処理（旧 Step 2、`check_implementation_overlap.py`）は #1679 により完全に撤去されている。`implement-issue` は target Issue、canonical repository、worktree、実 diff、実 test、target PR、current-head CI、独立 review、human stop だけを実行判断入力とする target-only executor であり、peer OPEN Issue の body・comments・native dependency・GraphQL 全件収集は行わない。
 
 - `C0: no collision`
   - Allowed Paths が重複しない。通常どおり着手可。
