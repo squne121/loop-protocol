@@ -1,6 +1,7 @@
 ---
 design_doc_schema_version: v1
 ssot_classification: derived_design_note
+summary_ja: "この文書は impl-review-loop の設計判断・状態遷移・サブエージェント契約・失敗モードと復旧手順を補足する派生設計ノートであり、`docs/dev/workflow.md` 等の正本（`canonical_sources`）を補足するために、アーキテクチャレビューや契約移行の際に参照する（`conflict_rule: canonical_sources_win`）。"
 canonical_sources:
   - docs/dev/workflow.md
   - docs/dev/agent-skill-boundaries.md
@@ -26,7 +27,7 @@ summary_budget: "<= 1200 chars"
 > **derived_design_note**: 本文書は `canonical_sources` に列挙された正本を補足する派生ノートである。
 > 本文書と正本が矛盾する場合、常に正本が勝つ（`conflict_rule: canonical_sources_win`）。
 
-## Status
+## Status（状態）
 
 | フィールド | 値 |
 |---|---|
@@ -35,7 +36,7 @@ summary_budget: "<= 1200 chars"
 | 最終更新 Issue | #422 |
 | 状態 | active |
 
-## Purpose
+## Purpose（目的）
 
 `impl-review-loop` の control-plane / data-plane 境界・`LOOP_STATE` フィールド所有権・PR conflict 時の escalation 方針・`CONTRACT_REVIEW_RESULT_V1` を作業計画正本として扱う根拠を、正本への参照リンクと共に記録する。
 
@@ -56,7 +57,7 @@ summary_budget: "<= 1200 chars"
 - SubAgent 定義全文の複製（SSOT 分裂を招く）
 - SKILL.md 手順全文の複製
 
-## Invocation Contract
+## Invocation Contract（起動契約）
 
 | フィールド | 内容 |
 |---|---|
@@ -73,7 +74,7 @@ summary_budget: "<= 1200 chars"
 - 二重確認による手順冗長化を防ぐため、impl-review-loop 側では contract 内容を再判定しない
 - 正本: `docs/dev/workflow.md` の `## Issue contract を作業計画の正本として扱う条件`
 
-## Workflow Topology
+## Workflow Topology（ワークフロー構成）
 
 ```
 [Preparation: state 初期化・worktree 確認・contract_snapshot 取得]
@@ -116,7 +117,7 @@ orchestrator は data-plane 操作を直接行わない。
 - 3 超過は「根本的な contract の問題」として人間判断へ委ねる
 - 正本: `.claude/skills/impl-review-loop/SKILL.md`（既定値 3）および `.claude/skills/issue-refinement-loop/references/termination-policy.md` の `LOOP_POLICY_V1`
 
-## State Model
+## State Model（状態モデル）
 
 `LOOP_STATE` の完全フィールド定義は `.claude/skills/impl-review-loop/SKILL.md` の `## LOOP_STATE YAML` セクションを参照する。
 
@@ -133,7 +134,7 @@ orchestrator は data-plane 操作を直接行わない。
 | `termination_reason` | orchestrator (Step 5) | 終了時に確定 |
 | `product_spec_preflight` | orchestrator (preparation / Step 1 前) | contract snapshot から正規化・格納 |
 
-### product_spec_preflight routing table
+### product_spec_preflight routing table（ルーティング表）
 
 正本: `.claude/skills/impl-review-loop/SKILL.md` の `## Product Spec Check Reference`
 
@@ -153,7 +154,7 @@ orchestrator は data-plane 操作を直接行わない。
 - スキップ時も判定根拠を `external_research_skip_basis` に記録（null 不可）
 - 外部仕様調査が必要な場合は `gemini-cli-headless-delegation` skill を使い、結果を記録
 
-## SubAgent Contract Matrix
+## SubAgent Contract Matrix（サブエージェント契約表）
 
 | SubAgent | Role | Producer | Consumer | Schema/version | Fields read by orchestrator | Opaque forwarded fields | Must-not-read fields | Mutation owner | Failure class | Verification fixture |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -167,7 +168,7 @@ orchestrator は data-plane 操作を直接行わない。
 - `pr-reviewer` の `verdict: REQUEST_CHANGES` には `blockers[]` が含まれ、orchestrator はこれを `fix_delta` として次 iteration の Step 1 に渡す
 - `test-runner` は Verification Commands の実行専用。impl-review-loop が `baseline_vc_preflight.py` を重複実行しない
 
-## Artifact and Evidence Contract
+## Artifact and Evidence Contract（証跡契約）
 
 | Artifact | 生成者 | 保存先 | 形式 | 消費者 |
 |---|---|---|---|---|
@@ -179,7 +180,7 @@ orchestrator は data-plane 操作を直接行わない。
 
 `decision: not_applicable`（Runtime Verification Applicability）の場合は `artifacts/` 出力不要。`decision: immediate` の場合は証跡を PR 本文に添付する。
 
-## Context Loading Policy
+## Context Loading Policy（文脈読込方針）
 
 本設計書は以下の場面でのみロードする（`loaded_when` / `not_loaded_when` 参照）:
 
@@ -192,7 +193,7 @@ orchestrator は data-plane 操作を直接行わない。
 | normal loop execution | NO | runtime overhead なし。正本 SKILL.md を参照 |
 | routine implementation | NO | 派生ノートのロードは不要 |
 
-### Progressive Disclosure
+### Progressive Disclosure（段階的開示）
 
 本設計書の全文ロードが不要な場合の参照手順:
 
@@ -201,7 +202,7 @@ orchestrator は data-plane 操作を直接行わない。
 3. state field owner のみ → `## State Model` の表を読む
 4. routing table のみ → `## State Model` の `product_spec_preflight routing table` を読む
 
-## Guardrails
+## Guardrails（安全策）
 
 1. **control-plane 専用**: orchestrator は data-plane 操作（git push / `gh pr create` / マージ等）を直接行わない
 2. **LOOP_STATE イテレーション管理**: 各イテレーション完了後に LOOP_STATE を更新し、人間がループの全履歴を読めるようにする
@@ -210,7 +211,7 @@ orchestrator は data-plane 操作を直接行わない。
 5. **adversarial review 不採用**: `LOOP_VERDICT` 判定は pr-review-judge の APPROVE 一本で完結（Step 3 採用しない）
 6. **external_research_skip_basis 記録必須**: スキップ時も null にしない
 
-## Failure Modes and Recovery
+## Failure Modes and Recovery（失敗モードと復旧）
 
 ### Failure Mode 分類表
 
@@ -235,7 +236,7 @@ orchestrator は data-plane 操作を直接行わない。
 - orchestrator が直接 `git rebase` / force push を行うことは禁止
 - rebase 作業は実装担当の SubAgent に委譲する
 
-### Human Escalation Classification
+### Human Escalation Classification（人間エスカレーション分類）
 
 | Class | 条件 | 期待する人間アクション |
 |---|---|---|
@@ -245,20 +246,20 @@ orchestrator は data-plane 操作を直接行わない。
 | D: human_review_required | SubAgent からの escalation | PR / Issue の内容確認 |
 | E: PR conflict | `CONFLICTING / DIRTY / BLOCKED` 継続 | コンフリクト解消 |
 
-## Observability
+## Observability（可観測性）
 
 ### Loop State の人間可読出力
 
 ループ終了後、orchestrator は Issue コメントに `LOOP_STATE` YAML を投稿する。
 
-### Audit Trail
+### Audit Trail（監査証跡）
 
 - `blockers_history[]`: REQUEST_CHANGES の各回で記録した blocker
 - `external_research_skip_basis`: 外部調査スキップの根拠（null 禁止）
 - `termination_reason`: 終了理由（approved / max_iterations / human_escalation）
 - `product_spec_preflight.*`: product spec check の routing 結果
 
-## Verification Plan
+## Verification Plan（検証計画）
 
 本設計書の AC（derived_design_note として）:
 
@@ -270,7 +271,7 @@ orchestrator は data-plane 操作を直接行わない。
 | `rg -n "Producer.*Consumer.*Schema\|Fields read by orchestrator\|Opaque forwarded fields" docs/dev/workflows/impl-review-loop-design.md` | ヒット |
 | `rg -n "\.claude/agents/\|\.claude/skills/" docs/dev/workflows/impl-review-loop-design.md` | 参照リンクヒット |
 
-## Change Management
+## Change Management（変更管理）
 
 本設計書を変更する際のルール:
 
@@ -279,7 +280,7 @@ orchestrator は data-plane 操作を直接行わない。
 3. LOOP_STATE フィールドの追加・削除は `.claude/skills/impl-review-loop/SKILL.md` を先に更新し、本設計書はその後に同期更新する
 4. `loaded_when` / `not_loaded_when` の条件変更は `docs/dev/ssot-registry.md` のエントリも同期更新する
 
-## Authority Map
+## Authority Map（権限マップ）
 
 | Topic | Canonical source | This doc may do | This doc must not do |
 |---|---|---|---|
@@ -292,7 +293,7 @@ orchestrator は data-plane 操作を直接行わない。
 | product_spec_preflight 実装 | `.claude/skills/impl-review-loop/scripts/evaluate_product_spec_gate.py` | routing table の設計意図を説明 | スクリプトロジックを複製 |
 | Issue contract 着手条件 | `docs/dev/workflow.md` の `## Issue contract を作業計画の正本として扱う条件` | 設計根拠へのリンク | 条件を複製 |
 
-## Traceability
+## Traceability（追跡可能性）
 
 実装 Issue および関連 Issue:
 - #392: issue-refinement-loop の deterministic planner/checker script 抽出
