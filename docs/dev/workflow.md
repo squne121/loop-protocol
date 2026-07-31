@@ -254,6 +254,21 @@ Allowed Paths 違反、実テスト・CI・PR review failure に基づく。
   routing stop にせず、PASS・承認・CI・review・merge readiness の証拠にしない。
 - parallel-safe ledger V2 は別 Issue で再設計し、未実装を通常 workflow の停止理由にしない。
 
+### Multi-Agent V2 の V1 rollback
+
+Multi-Agent V2 の repository-pinned declaration を V1 に戻す必要がある場合は、
+`.codex/config.toml` の `[features.multi_agent_v2]` で `enabled = false` に戻し、
+`[agents]` table に `max_depth = 1` を復元する。その後、fresh session で次を再実行し、
+rollback 後の config を checker が意図どおり判定することを確認する。
+
+```bash
+uv run --locked python3 scripts/check_impl_review_loop_codex_dispatch.py \
+  --assert-no-max-depth-setting
+```
+
+V1 rollback 状態では `--assert-no-max-depth-setting` は非ゼロ終了が期待値であり、
+Multi-Agent V2 declaration を再有効化するまで PASS と扱わない。
+
 ### human_escalation 後の Issue 本文変更と contract review 再実行
 
 `human_escalation` で停止した後、Issue 本文を **1 文字でも変更した場合**は prior contract-review result が stale となる。

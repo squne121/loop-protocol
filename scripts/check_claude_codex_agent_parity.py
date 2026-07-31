@@ -426,22 +426,35 @@ def extract_codex_facts(
         declared = extract_runtime_field(instructions, "MUTATION_BOUNDARY")
         facts.mutation_boundary = declared or "unknown"
 
-    # max_depth is only a depth limit.  The scope-rollup runner additionally
-    # requires an explicit session-feature-set disable declaration.
+    # Multi-Agent V2 is enabled at the project level, but nested delegation is
+    # still opt-in per Codex agent.  Therefore legacy max_depth must not be
+    # used as the sole proxy for a particular agent's delegation capability.
     try:
         config = read_toml(CODEX_CONFIG_PATH)
-        max_depth = config.get("agents", {}).get("max_depth")
-        facts.nested_delegation_blocked = max_depth == 1
-        if agent_name == "scope-rollup-runner":
-            facts.nested_delegation_blocked = (
-                max_depth == 1 and "session feature set で disabled" in instructions
-            )
-        facts.nested_delegation_evidence = (
-            f"[agents].max_depth={max_depth} plus session feature-set disable declaration"
+        multi_agent_v2 = config.get("features", {}).get("multi_agent_v2")
+        v2_enabled = (
+            isinstance(multi_agent_v2, dict)
+            and type(multi_agent_v2.get("enabled")) is bool
+            and multi_agent_v2["enabled"] is True
         )
-    except (FileNotFoundError, KeyError):
-        facts.nested_delegation_blocked = False
-        facts.nested_delegation_evidence = ".codex/config.toml not found or missing [agents].max_depth"
+        allows_nested_delegation = any(
+            keyword in instructions for keyword in CODEX_DELEGATION_KEYWORDS
+        )
+        if v2_enabled:
+            facts.nested_delegation_blocked = not allows_nested_delegation
+            facts.nested_delegation_evidence = (
+                "[features.multi_agent_v2].enabled=True plus Codex agent metadata "
+                f"delegation_opt_in={allows_nested_delegation}"
+            )
+        else:
+            facts.nested_delegation_blocked = None
+            facts.nested_delegation_evidence = (
+                "[features.multi_agent_v2].enabled is not strict boolean true; "
+                "Codex nested-delegation state is unknown"
+            )
+    except (FileNotFoundError, OSError, tomllib.TOMLDecodeError):
+        facts.nested_delegation_blocked = None
+        facts.nested_delegation_evidence = ".codex/config.toml could not be read"
 
     # B6: Check developer_instructions for delegation-enabling keywords
     for keyword in CODEX_DELEGATION_KEYWORDS:
