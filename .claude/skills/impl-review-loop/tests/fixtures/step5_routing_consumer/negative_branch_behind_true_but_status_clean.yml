@@ -1,0 +1,16 @@
+description: branch_behind_main=true but merge_state_status=CLEAN -> invariant
+  violation (fail_closed), caught even though CLEAN alone would otherwise approve
+reviewer_verdict:
+  verdict: APPROVE
+  reviewed_head_sha: abc123def456
+  blockers: []
+live_mergeability:
+  head_sha: abc123def456
+  mergeable: MERGEABLE
+  merge_state_status: CLEAN
+test_verdict:
+  branch_behind_main: true
+expected:
+  route: fail_closed
+  fail_closed: true
+  reason_code_prefix: branch_behind_invariant_violation

@@ -241,7 +241,7 @@ raw `gh issue edit` / `gh issue comment` は `gh_mutation_denied` でブロッ�
 |---|---|---|
 | #1154 | root checkout からの `preflight.run` 専用 skill runtime executor | `skill_runtime_exec.py`、`SKILL_RUNTIME_COMMAND_POLICY_V2` |
 | #1165 | producer / compact producer の fail-closed routing（schema mismatch / output budget / termination bypass 阻止） | `compact_review_result.py`、`compact_author_result.py`、`run_refinement_preflight.py` |
-| #1166 | `publish_termination_report.py` の controlled mutation policy（publishable=true 時のみ gh comment） | `publish_termination_report.py`、`render_termination_report.py` |
+| #1166 | `publish_termination_report.py` の controlled mutation policy（issue_comment.publish 経由の gh comment のみ許可） | `publish_termination_report.py` |
 
 ### 責務境界の明文化
 
@@ -903,28 +903,32 @@ routing_allowed_fields:
 
 #### impl-review-loop V2 routing boundary（V2 ルーティング境界）
 
-`impl-review-loop` Step 5 は `LOOP_VERDICT_V2.required_auto_actions` を canonical な routing source として扱う。`LOOP_VERDICT.recommendations` は V1 時代の stale wording であり、現行 consumer path の canonical field として復活させてはならない。
+Issue #1873 以降、`impl-review-loop` Step 5 は pr-reviewer 自己申告の `merge_ready` / `required_auto_actions` / `allowed_paths_gate` / `mergeability` を routing source として使わない。pr-reviewer が返す最小 result convention（`verdict` / `reviewed_head_sha` / `blockers` / `warnings`）と、orchestrator が `gh pr view --json headRefOid,mergeable,mergeStateStatus` で直接取得する live mergeability の 2 系統を `route_loop_verdict_v2()` に個別入力として渡す。`update_branch` action は reviewer から受け取らず、`merge_state_status == BEHIND` を検出した router 自身が合成する。
 
 ```yaml
 impl_review_loop_v2_routing_boundary:
+  reviewer_verdict.verdict:
+    classification: routing_critical
+  reviewer_verdict.reviewed_head_sha:
+    classification: routing_critical
+  reviewer_verdict.blockers:
+    classification: routing_critical
+  live_mergeability.head_sha:
+    classification: routing_critical
+  live_mergeability.mergeable:
+    classification: routing_critical
+  live_mergeability.merge_state_status:
+    classification: routing_critical
   TEST_VERDICT_MACHINE/v1.branch_behind_main:
     classification: routing_critical
-  LOOP_VERDICT_V2.required_auto_actions[].kind:
-    classification: routing_critical
-  LOOP_VERDICT_V2.required_auto_actions[].executor:
-    classification: routing_critical
-  LOOP_VERDICT_V2.required_auto_actions[].skill:
-    classification: routing_critical
-  LOOP_VERDICT_V2.required_auto_actions[].expected_head_sha:
-    classification: routing_critical
-  LOOP_VERDICT_V2:
-    negative_rules:
-      - LOOP_VERDICT.recommendations must not be treated as a canonical routing field
-      - unknown required_auto_actions.kind must fail closed
-      - missing or mismatched expected_head_sha must fail closed before update_branch dispatch
+  negative_rules:
+    - reviewer self-reported merge_ready / required_auto_actions / allowed_paths_gate / mergeability must not be treated as a canonical routing field
+    - LOOP_VERDICT.recommendations (V1 wording) must not be treated as a canonical routing field
+    - only mergeable == CONFLICTING or merge_state_status in (CONFLICTING, DIRTY) is an actual Git conflict; UNKNOWN / BLOCKED / BEHIND / UNSTABLE / DRAFT / HAS_HOOKS are not conflicts
+    - stale reviewed_head_sha (!= live head_sha) must re-review at current head, not fail closed
 ```
 
-`required_auto_actions[].kind` は action 種別の分岐点、`executor` / `skill` は data-plane 委譲先の決定、`expected_head_sha` は stale verdict を防ぐ race guard であり、いずれも routing-critical である。`branch_behind_main` は test-runner から Step 5 へ渡る補助信号で、BEHIND 状態の reroute 判断を `TEST_VERDICT_MACHINE/v1` 側から補強する field として扱う。
+`live_mergeability.merge_state_status` は BEHIND/CONFLICTING/DIRTY 等の action 分岐点、`reviewer_verdict.reviewed_head_sha` と live `head_sha` の一致確認は stale verdict を防ぐ race guard であり、いずれも routing-critical である。`branch_behind_main` は test-runner から Step 5 へ渡る補助信号で、BEHIND 状態の invariant 検証を `TEST_VERDICT_MACHINE/v1` 側から補強する field として扱う。
 
 ### 一時例外（temporary_exceptions）
 
@@ -1358,24 +1362,36 @@ session 記録ツール（EntireCLI 等）を導入・運用する際の Kill Sw
 
 ## CONTROLLED_SKILL_MUTATION_COMMAND_POLICY
 
-（Issue #1166 — hooks: `publish_termination_report` 用 controlled mutation policy。公開系 mutation の境界。）
+（Issue #1166 で導入、Issue #1284/#1632/#1633/#1647 で拡張された、GitHub リモート
+mutation 用 controlled executor lane の境界。Issue #1873 で `termination_report.publish`
+command id と `pr_review.publish` command id を撤去した。）
 
 ### 概要
 
-`publish_termination_report.py` は GitHub に issue comment を投稿するリモートミューテーションを実行する。
-このミューテーションを uncontrolled な直接呼び出しから切り離し、**単一の executor（`controlled_skill_mutation_exec.py`）経由のみ許可**するポリシー。
+`scripts/agent-guards/controlled_skill_mutation_exec.py` は、issue body/comment/content
+の更新・Contract Snapshot 投稿・test verdict 投稿・issue scope snapshot materialize・
+issue dependency 削除など、GitHub へのリモートミューテーションを実行する**唯一の executor**である。
+それぞれの mutation は `command_id` で区別され、**単一の executor 経由のみ許可**される。
 
-直接呼び出し（`python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py`）は worktree_scope_guard および local_main_branch_guard によって deny される。
+現在登録されている command id（`CONTROLLED_SKILL_MUTATION_COMMAND_POLICY` のキー）:
+`issue_body.update` / `issue_content.update` / `issue_comment.publish` /
+`contract_snapshot.publish` / `test_verdict.publish` /
+`issue_scope_snapshot.materialize` / `issue_dependency.remove`。
 
-### ポリシーレジストリ
+これらの command id を直接呼び出す raw `gh issue edit` / `gh issue comment` 等は
+worktree_scope_guard および local_main_branch_guard によって deny される。
+
+### ポリシーレジストリ（例: `issue_comment.publish`）
 
 ```python
-# scripts/agent-guards/controlled_skill_mutation_policy.py
+# scripts/agent-guards/controlled_skill_mutation_policy.py（抜粋・簡略化）
 CONTROLLED_SKILL_MUTATION_COMMAND_POLICY = {
-    "termination_report.publish": {
-        "command_id": "termination_report.publish",
+    "issue_comment.publish": {
+        "command_id": "issue_comment.publish",
         "executor_script": "scripts/agent-guards/controlled_skill_mutation_exec.py",
         "allowed_write_roots": ["artifacts/"],
+        "input_namespace": "artifacts/{issue_number}/issue-metadata/issue_comment.publish/",
+        "input_schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1",
         "github_mutation": {
             "comment_on_issue": True,
             "requires_repo": "squne121/loop-protocol",
@@ -1388,14 +1404,18 @@ CONTROLLED_SKILL_MUTATION_COMMAND_POLICY = {
             "allowed_write_roots": ["artifacts/"],
         },
         "idempotency": {
-            "marker_file_pattern": "artifacts/{issue_number}/termination_report_published.marker.json",
+            "marker_file_pattern": "artifacts/{issue_number}/issue-metadata/issue_comment.publish/issue_comment_publish.marker.json",
             "marker_field": "comment_id",
         },
         "env_sanitize": [
-            "PUBLISH_ARTIFACT_DIR", "PYTHONPATH", "PYTHONHOME",
-            "GH_EDITOR", "EDITOR", "VISUAL", "BROWSER",
+            "PYTHONPATH", "PYTHONHOME", "GH_EDITOR", "EDITOR", "VISUAL", "BROWSER",
+            "GH_HOST", "GH_REPO", "GH_CONFIG_DIR", "GH_DEBUG", "DEBUG",
+            "GH_TOKEN", "GITHUB_TOKEN",
         ],
     },
+    # ... 残り 6 command id は上記末尾セクション（Issue metadata mutation executor lane
+    # 以下）の per-command-id 説明を参照。全 entry の正本は
+    # scripts/agent-guards/controlled_skill_mutation_policy.py。
 }
 ```
 
@@ -1403,9 +1423,9 @@ CONTROLLED_SKILL_MUTATION_COMMAND_POLICY = {
 
 ```bash
 uv run --locked python3 scripts/agent-guards/controlled_skill_mutation_exec.py \
-  --command-id termination_report.publish \
+  --command-id issue_comment.publish \
   --issue-number <int> \
-  --input-file <path_to_TERMINATION_REPORT_INPUT_V1_json> \
+  --input-file artifacts/<int>/issue-metadata/issue_comment.publish/<INPUT>.json \
   --repo squne121/loop-protocol
 ```
 
@@ -1419,24 +1439,21 @@ uv run --locked python3 scripts/agent-guards/controlled_skill_mutation_exec.py \
 
 ### 環境サニタイズ（AC11）
 
-executor は以下の環境変数を除去した上で publisher を呼び出す:
-`PUBLISH_ARTIFACT_DIR`, `PYTHONPATH`, `PYTHONHOME`, `GH_EDITOR`, `EDITOR`, `VISUAL`, `BROWSER`
+executor は各 command id の `env_sanitize` に列挙された環境変数を除去した上で GitHub mutation を実行する
+（共通: `PYTHONPATH`, `PYTHONHOME`, `GH_EDITOR`, `EDITOR`, `VISUAL`, `BROWSER`,
+`GH_HOST`, `GH_REPO`, `GH_CONFIG_DIR`, `GH_DEBUG`, `DEBUG`, `GH_TOKEN`, `GITHUB_TOKEN`）。
 
 ### Idempotency（AC13、冪等性）
 
-`artifacts/{issue_number}/termination_report_published.marker.json` が存在し `comment_id` フィールドを持つ場合、executor は再実行を拒否する（exit 0 + dry-run 出力）。
+各 command id の `idempotency.marker_file_pattern` で定義された local marker file が存在し、
+`idempotency.marker_field` が期待値を持つ場合、executor は再実行を拒否する（exit 0 + dry-run 出力）。
+ただし marker はあくまで local cache/audit であり、成功可否は常に remote GitHub state の
+readback が authority（marker 単体を成功の根拠にしない）。
 
 ### --repo 固定（AC10）
 
-`publish_termination_report.py` は `--repo <owner/repo>` を必須引数として受け取り、
-`gh issue comment ... --repo <owner/repo>` に明示的に渡す。
+executor は `--repo <owner/repo>` を必須引数として受け取り、`gh` 呼び出しに明示的に渡す。
 `GITHUB_REPOSITORY` 環境変数や暗黙の gh デフォルトに依存しない。
-
-### Module realpath 検証（AC16、realpath 一致確認）
-
-executor は `publish_termination_report.py` の `__file__` realpath を検査し、
-`.claude/skills/issue-refinement-loop/scripts/publish_termination_report.py`
-に正規化されることを確認してから実行する。モジュールシャドウイングを防ぐ。
 
 ### settings.json wildcard と hook enforcement（wildcard と hook 強制の適用境界）
 
@@ -1471,8 +1488,7 @@ worktree ではなく Issue #1166 と同じ controlled executor lane から実�
 
 metadata mutation command id の input file は `artifacts/{issue_number}/` 直下ではなく、
 `artifacts/{issue_number}/issue-metadata/{command-id}/` subtree に統一する
-（`termination_report.publish` の legacy namespace `artifacts/{issue_number}/` は
-そのまま維持し、split-brain を避けるため command id ごとに subtree を分離する）。
+（split-brain を避けるため command id ごとに subtree を分離する）。
 
 ### Per-command input schema（AC10、コマンド別入力スキーマ）
 
@@ -1525,10 +1541,10 @@ executor は `ensure_contract_snapshot.py` を
 
 ### env binding（AC15、環境変数との結び付け）
 
-`termination_report.publish`（legacy）は `LOOP_ISSUE_NUMBER` 環境変数が必須のまま。
 metadata mutation command id は `LOOP_ISSUE_NUMBER` が存在しない場合でも `--issue-number` と
 repo binding のみで実行でき、存在する場合のみ `--issue-number` との一致を必須とする
-（`_check_issue_env_binding` が command id ごとに分岐する）。
+（`_check_issue_env_binding` が command id ごとに分岐する。`ENV_BINDING_MANDATORY_COMMAND_IDS`
+は Issue #1873 で唯一のメンバーだった `termination_report.publish` が撤去されたため現在は空）。
 
 ### hook allow（AC5、フックの許可）
 
@@ -1575,8 +1591,10 @@ closed-key チェック・schema 一致・issue_number/repo の呼び出し元�
 
 ### build_isolation_issue_comment_request() / materialize_isolation_issue_comment_request()（親 root 側の producer/consumer 分離、Issue #1639 fix_delta P1-1）
 
-`.claude/skills/issue-refinement-loop/scripts/publish_termination_report.py` の
-2 関数に分離している。
+`.claude/skills/issue-refinement-loop/scripts/isolation_issue_comment_bridge.py` の
+2 関数に分離している（Issue #1873 Tranche 3 で `publish_termination_report.py`
+から独立モジュールへ抽出。`publish_termination_report.py` はこのモジュールを
+import して使う consumer の一つに変わった）。
 
 - `build_isolation_issue_comment_request(*, issue_number, repo, comment_body, marker)`
   — producer。実運用では isolation worktree agent が生成する bounded request
@@ -1631,7 +1649,7 @@ check-then-write の TOCTOU（CWE-363）が成立し得る。
    書き込みを一切行わず fail-closed で reject する（既存の正当な
    dirent を意図せず置換しない、というこのレーンのポリシー）。
 
-テストは `.claude/skills/issue-refinement-loop/tests/test_publish_termination_report.py::TestMaterializerSymlinkSafety`
+テストは `.claude/skills/issue-refinement-loop/tests/test_isolation_issue_comment_bridge.py::TestMaterializerSymlinkSafety`
 に、出力 symlink（target 内容不変を確認）/ namespace directory 自体が
 symlink / 中間 directory が symlink / 出力が hardlink / 出力が
 directory / 出力が FIFO / concurrent replacement 相当 / 失敗時に既存の
@@ -1829,9 +1847,9 @@ schema drift・pre/post TOCTOU・二回目 mutation attempt を fail-closed で
 ### 既存 command id への非破壊性確認（AC1/AC7）
 
 `issue_dependency.remove` の追加は既存 command id
-（`termination_report.publish` / `issue_body.update` /
-`issue_comment.publish` / `contract_snapshot.publish` /
-`pr_review.publish` / `issue_scope_snapshot.materialize`）の
+（`issue_body.update` / `issue_content.update` / `issue_comment.publish` /
+`contract_snapshot.publish` / `test_verdict.publish` /
+`issue_scope_snapshot.materialize`）の
 schema・dispatch・exact argv・postcondition を一切変更しない。
 `scripts/agent-guards/tests/test_controlled_skill_mutation_policy.py::TestIssueDependencyRemoveRegistration`
 が既存 entry の read-only 不変性を確認する。
@@ -2313,65 +2331,12 @@ Codex の Stop / SubagentStop hook（`scripts/session-recording/codex-hook-adapt
 - consumer は `.claude/skills/post-merge-cleanup/scripts/classify-git-state.py`（`--format json` の `temp_residue_classification` field）と `.claude/skills/post-merge-cleanup/SKILL.md`。
 - ownership marker（`temp_residue_owner/v1`、`scripts/agent-ops/temp_residue_marker.py`）は accidental isolation model のみを実装し、authorization model ではない（session id の真正性は保証しない）。
 - denied alias（`.tmp/` `.temp/` `.tmp-*/`）配下は valid marker があっても常に `report_only`。approved roots（`tmp/` `.claude/tmp/`）配下の owned session directory のみ `eligible_for_delete` になり得る。詳細は `docs/dev/repository-folder-policy.md` の Root Class / Marker Effect Matrix を参照。
-## PR Review Marker Archive Lifecycle（`PR_REVIEW_PUBLISH_MARKER_V1` / `PR_REVIEW_MARKER_ARCHIVE_RESULT_V1`）
+## PR Review Marker Archive Lifecycle（廃止・Issue #1873）
 
-（Issue #1602 — merge 済み PR の `pr_review.publish` local marker が後続 preflight を
-`unauthorized_write_path` で不必要に停止させないための、限定 archive lifecycle の責務境界。）
-
-### 責務境界
-
-- `controlled_skill_mutation_exec.py` の `pr_review.publish` が書く
-  `artifacts/<pr>/issue-metadata/pr_review.publish/pr_review_publish.marker.json`
-  （schema `PR_REVIEW_PUBLISH_MARKER_V1`）は **local cache/audit** に過ぎない。
-  mutation の成功可否は常に remote GitHub review readback が authority であり、
-  marker 単体を成功の根拠にしてはならない（既存方針。変更なし）。
-- `scripts/agent-ops/pr_review_marker_archive_exec.py` は、この local marker を
-  repo 外 archive root（`XDG_STATE_HOME` authority、既定 `$HOME/.local/state`）へ
-  **限定的に** 退避してから repo 側 marker を除去する、唯一の executor である。
-  - remote が対象 PR を `MERGED` と判定し（merged-check endpoint、`204`=merged /
-    `404`=unmerged）、かつ marker の `review_id` を primary key として取得した exact
-    review が id/URL/PR URL/state/commit/idempotency-derived body marker のすべてで
-    一致する場合に限り、marker を archive してから除去する。
-  - 除去は `SOURCE_VALIDATED -> ARCHIVE_PREPARED -> ARCHIVE_DURABLE -> SOURCE_REMOVED
-    -> SOURCE_REMOVAL_DURABLE -> COMMITTED` の state machine に従い、`archived` /
-    `already_archived` / `source_retained` / `indeterminate` / `refused` /
-    `environment_blocked` のいずれかを返す（`PR_REVIEW_MARKER_ARCHIVE_RESULT_V1`）。
-    unlink 前の失敗は marker を必ず保持し、unlink 後に postcondition を確認できない
-    場合は `indeterminate` を返して「保持した」とは主張しない。
-- `post-merge-cleanup`（`.claude/skills/post-merge-cleanup/SKILL.md`）は、この
-  executor を **merged PR number と exact marker path を明示して** 呼び出す唯一の
-  consumer であり、`POST_MERGE_CLEANUP_REPORT_V1` に `pr_review_marker_archive`
-  （schema `PR_REVIEW_MARKER_ARCHIVE_RESULT_V1`）result block を追加する。
-- 本 executor は `pr_review.publish` の request/response semantics や idempotency
-  contract を変更しない。`skill_runtime_exec.py` / preflight の generic artifact
-  allowlist・ignore rule も拡張しない（`artifacts/**` を widen する経路として使わない）。
-  任意 path・glob・schema 不明・symlink/hardlink/non-regular file・open や
-  closed-unmerged な PR・remote readback 不一致の marker は無条件で対象外とする。
-
-### PR_REVIEW_MARKER_ARCHIVE_RESULT_V1（要約）
-
-```yaml
-PR_REVIEW_MARKER_ARCHIVE_RESULT_V1:
-  schema: PR_REVIEW_MARKER_ARCHIVE_RESULT_V1
-  status: archived | already_archived | source_retained | indeterminate | refused | environment_blocked
-  reason_code: <bounded enum> | null
-  pr_number: <int>
-  source_relpath: "artifacts/<pr>/issue-metadata/pr_review.publish/pr_review_publish.marker.json"
-  marker_sha256: "sha256:..." | null
-  archive_locator: "<repo>/<pr>/<marker-sha256>.archive.json" | null
-  archive_durable: true | false
-  source_present_after: "true" | "false" | "unknown"
-  source_directory_synced: true | false
-  remote:
-    merged: true | false
-    review_id: <int> | null
-    state: <string> | null
-    commit_id: <string> | null
-  errors: []
-```
-
-routing-critical フィールドは `status` / `reason_code` / `pr_number` /
-`source_relpath` / `archive_durable` / `source_present_after` であり、
-`post-merge-cleanup` は `status` に応じて `unresolved_cleanup_items` へ記録するか
-（`source_retained` / `indeterminate` / `refused` / `environment_blocked`）、
-何もしない（`archived` / `already_archived`）かを判定する。
+（Issue #1602 で導入された `pr_review.publish` local marker の限定 archive lifecycle は、
+Issue #1873 で `pr_review.publish` command id 自体および
+`scripts/agent-ops/pr_review_marker_archive_exec.py` executor が撤去されたため、廃止された。
+`post-merge-cleanup` の該当ステップ（旧 5a）は無効化されている。
+`PR_REVIEW_PUBLISH_MARKER_V1` / `PR_REVIEW_MARKER_ARCHIVE_RESULT_V1` schema は
+`docs/dev/schema-governance.md` の registry からも削除済み。過去に生成された marker file
+が repo 上に残存していても、本 skill lane はもはや参照・処理しない。）

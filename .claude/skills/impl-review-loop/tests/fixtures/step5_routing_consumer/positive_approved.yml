@@ -1,12 +1,12 @@
-description: APPROVE + CLEAN + empty actions + merge_ready=true → approved
-loop_verdict:
+description: APPROVE + matching head + CLEAN/MERGEABLE + no blockers -> approved
+reviewer_verdict:
   verdict: APPROVE
-  merge_ready: true
   reviewed_head_sha: abc123def456
-  mergeability:
-    mergeable: MERGEABLE
-    merge_state_status: CLEAN
-  required_auto_actions: []
+  blockers: []
+live_mergeability:
+  head_sha: abc123def456
+  mergeable: MERGEABLE
+  merge_state_status: CLEAN
 test_verdict: null
 expected:
   route: approved

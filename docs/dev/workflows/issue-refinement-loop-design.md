@@ -139,48 +139,13 @@ Issue 本文の品質を反復改善する `issue-refinement-loop` の設計判�
 - `codebase-investigator` は `final_classification` の確定責務を持たない（orchestrator が main thread で確定）
 - `issue-author` への入力は必ず `anchor_comment_feedback`（正規化済み）を使い、raw snapshot を直接渡してはならない
 
-### Step 2a: 親ローカル replay 整合性束縛 V2（parent-local replay integrity binding、#1532）
+### Step 2: bounded verdict trust（#1873、旧 Step 2a Replay Arbitration を撤去）
 
-`issue-reviewer` の `needs-fix` 判定に対する arbitration（Step 2a）は、child の isolation worktree が返す raw artifact / raw `findings` / `checker_evidence` / `deterministic_checks` を orchestrator が信用しない V2 契約へ移行した。
+`issue-reviewer` の `needs-fix` / `approve` 判定に対する parent-local replay arbitration（旧 Step 2a、#1532 V2 契約）は撤去された。orchestrator は `issue-reviewer` が返す `ISSUE_REVIEW_RESULT_COMPACT_V1`（`validate_review_compact_output.py` で構文検証済みの STATUS/VERDICT/SUMMARY/BLOCKERS/NEXT_ACTION/MUST_READ/EVIDENCE/ARTIFACT の8フィールド envelope）の VERDICT を、それ以上の独立 replay 再計算なしに直接信頼する。
 
-本節が提供するのは **parent-local replay integrity binding** であり、child SubAgent（同一 OS UID プロセス）の producer identity・署名・鍵管理・supply-chain provenance を証明する attestation ではない（Safety Claim Matrix の対象外。この保証範囲の違いを示すため「provenance attestation」という語は使用しない）。
-
-- **review-phase gate の入力（Issue #1755）**: SKILL.md Step 2 の validator-first 順序は child の raw stdout bytes をまず `emit_parent_review_envelope_v2.py --validate-intermediate`（command registry `review_compact.validate_intermediate_v1`）へ通し、`REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1`（schema literal、`schema_version: "1"`、`validation_status`、`envelope_kind` ∈ {`approve`, `needs_fix_intermediate`}、`input_sha256`、`normalized_payload`、`violations`）を得る。`build_refinement_phase_state.py --phase review --source-kind issue_review_result_compact_v1` はこの `REVIEW_COMPACT_INTERMEDIATE_VALIDATION_RESULT_V1` を `--review-validation-result-path` として受け取り、`schema`/`schema_version`/`validation_status`/`envelope_kind`/`violations == []` を検証したうえで、`--source-path`（child raw stdout bytes）の実バイトから再計算した SHA256 と `input_sha256` の一致、および `normalized_payload.ARTIFACT` の issue 番号セグメントと必須引数 `--issue-number` の一致を検証する。旧 `REVIEW_COMPACT_VALIDATION_RESULT_V1`（legacy V1 final grammar の schema literal）は review-phase gate の入力として拒否される。
-- **child の出力**: `issue-reviewer` は `compact_review_result.py` 経由で `ISSUE_REVIEW_RESULT_COMPACT_V1` の needs-fix envelope（STATUS/VERDICT/SUMMARY/BLOCKERS/NEXT_ACTION/MUST_READ/EVIDENCE/ARTIFACT）に加えて、`REVIEWER_BLOCKER_CLAIM_V1`（`{schema, body_sha256, blockers: [...]}`、`reviewer_blocker_code`/`message`/`line_start`/`line_end` のみ）を 1 行返す。`findings` / `checker_evidence` / `deterministic_checks` はこの claim に一切含まれない（含めようとすると `additionalProperties: false` により拒否される）。child は `reviewer_claim_replay.py` を co-locate 実行せず、`REPLAY_VERDICT` 等の routing フィールドを一切返さない。
-- **parent の replay**: orchestrator（parent）は `.claude/skills/issue-refinement-loop/scripts/parent_replay_binding.py` を使い、自ら取得・保存・readback した `readiness_result` / `vc_syntax_result` / `vc_preflight_result` / `previous_state` / 現在の Issue body の raw bytes snapshot / identity（`repository_full_name` / `issue_number` / `refinement_session_id` / `iteration_id`）と、strict schema 検証済みの child `REVIEWER_BLOCKER_CLAIM_V1` を入力として `reviewer_claim_replay.analyze()` を in-process で再実行し、`PARENT_REPLAY_BINDING_ARTIFACT_V1`（`replay_next_state` と `binding_digest` を含む）を生成する。`findings` / `deterministic_checks` は常に空で構築されるため、`deterministic_backed` は parent 自身の readiness/vc-preflight/vc-syntax evidence からのみ導出される。`iteration_id` を `analyze()` に渡すため wall-clock 値は一切生成されない（同一論理入力は常に同一 digest）。child の raw artifact ファイルは一切読まない（#1472 isolation boundary を継承）。
-- **V2 envelope の組み立て（Issue #1541）**: orchestrator は child の claim envelope テキスト（8 行 approve、または `REVIEWER_BLOCKER_CLAIM` を含む 9 行 needs-fix intermediate。この 9 行 grammar は V1/V2 final grammar と別物で、`emit_parent_review_envelope_v2.py` が strict 検証する）と上記 binding artifact を `.claude/skills/issue-refinement-loop/scripts/emit_parent_review_envelope_v2.py`（command registry `review_compact.emit_v2`）へ渡す。この producer は child claim の canonical digest を binding artifact の `input_digests.reviewer_blocker_claim_sha256` と照合し、binding artifact 自身の digest 自己整合性・identity（repository/issue/session/iteration/body）を検証したうえで、`PARENT_REPLAY_VERDICT` / `PARENT_REPLAY_ROUTING` / `PARENT_REPLAY_SHOULD_CONSUME` / `PARENT_REPLAY_BODY_SHA256` / `PARENT_REPLAY_NEXT_STATE`（canonical 1 行 JSON）/ `PARENT_REPLAY_BINDING_DIGEST` の 6 行を binding artifact からのみ決定論的に導出し、UTF-8・LF・末尾 LF ありの完全な `ISSUE_REVIEW_RESULT_COMPACT_V2`（15 行）を stdout に一度だけ出す（成功時のみ・部分出力なし）。routing に使われるのは `PARENT_REPLAY_*` のみであり、V1 の child 自己申告 `REPLAY_VERDICT` 等は producer 契約から廃止された。旧来 orchestrator が f-string で 6 行を手動追記する assembly（テスト専用 `_assemble_v2_envelope()` 相当）は production 経路から廃止されている。
-- **V2 validator**: `validate_review_compact_output_v2()` は独立に供給された `PARENT_REPLAY_BINDING_ARTIFACT_V1`（必須引数、省略不可）を strict schema 検証・digest 再計算・identity/body 照合したうえで、envelope の `PARENT_REPLAY_*` 全フィールドと binding artifact の期待値を exact 照合する。不一致・不正形式・binding artifact 不在は `human_judgment_required` に fail-closed する。
-- **state 永続化**: `reviewer_claim_replay_state_store.py --write-v2` は、`REVIEW_COMPACT_VALIDATION_RESULT_V2` の `schema` / `schema_version` / `envelope_kind` / `violations == []` / `validation_status: valid` / identity をすべて自ら再検証したうえでのみ `PARENT_REPLAY_NEXT_STATE` を永続化する（caller が組み立てた `{"validation_status": "valid", ...}` のみの偽装 payload は拒否される）。
-
-`parent_replay_binding.py` の exact CLI 呼び出し例:
-
-```bash
-uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/parent_replay_binding.py \
-  --reviewer-blocker-claim-file <child stdout の REVIEWER_BLOCKER_CLAIM を保存したファイル> \
-  --readiness-result-file <parent が取得済みの ISSUE_CONTRACT_READINESS_RESULT_V1> \
-  --previous-state-inline '<reviewer_claim_replay_state_store.py --read の結果、または "{}"' \
-  --current-body-file <parent が取得した現在の Issue body raw bytes> \
-  --issue-url <issue url> \
-  --repository-full-name <owner/repo> \
-  --issue-number <N> \
-  --refinement-session-id <session id> \
-  --iteration-id <parent が生成した iteration id>
-```
-
-`emit_parent_review_envelope_v2.py`（Issue #1541、command registry `review_compact.emit_v2`）の exact CLI 呼び出し例:
-
-```bash
-<child stdout（8 行 approve または 9 行 needs-fix intermediate）> | \
-uv run --locked --offline --no-sync python3 .claude/skills/issue-refinement-loop/scripts/emit_parent_review_envelope_v2.py \
-  --issue-number <N> \
-  --binding-artifact-file <上記 parent_replay_binding.py の stdout を保存したファイル> \
-  --repository-full-name <owner/repo> \
-  --refinement-session-id <session id> \
-  --iteration-id <parent が生成した iteration id> \
-  --current-body-file <parent が取得した現在の Issue body raw bytes>
-```
-
-成功時は完全な 15 行 `ISSUE_REVIEW_RESULT_COMPACT_V2` を stdout に一度だけ出す（exit 0）。child intermediate / binding artifact のいずれかが contract-invalid の場合は stdout を空のまま exit 1、runtime/environment error は stdout を空のまま exit 2 とし、stderr に machine-readable diagnostic（`EMIT_PARENT_REVIEW_ENVELOPE_V2_FAILURE`）を出す。approve envelope（8 行）は binding artifact を一切参照せず pass-through validation のみ行う。
+- `compact_review_result.py` は approve/needs-fix いずれの envelope も同一の8フィールド形状で emit する（`REVIEWER_BLOCKER_CLAIM` / `REPLAY_*` / `PARENT_REPLAY_*` フィールドは一切付与しない）。
+- `decide_next_loop_action.py` の bounded decision は `verdict` / `iteration` / `max_iterations`（既定 3）のみを入力とする: `approve` → `terminate(approve)`、`needs-fix` かつ `iteration < max_iterations` → `continue(rewrite)`、それ以外（`blocked` または `iteration >= max_iterations`）→ `terminate(human_review_required)`。
+- 撤去された旧コンポーネント: `reviewer_claim_replay.py` / `reviewer_claim_replay_state_store.py` / `parent_replay_binding.py` / `emit_parent_review_envelope_v2.py`、および ISSUE_REFINEMENT_PHASE_STATE_V1 phase-gate（`build_refinement_phase_state.py`）と LOOP_STATE_V1 builder（`build_loop_state.py`）。
 
 ## Artifact and Evidence Contract（証跡契約）
 

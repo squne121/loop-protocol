@@ -7,10 +7,8 @@ Consumed by both worktree_scope_guard.py and local_main_branch_guard.py
 so the two guards never split-brain on which executor commands are allowed.
 
 This module is SEPARATE from the preflight.run policy (run_refinement_preflight.py).
-Command IDs: termination_report.publish, issue_body.update, issue_comment.publish,
-contract_snapshot.publish
+Command IDs: issue_body.update, issue_comment.publish, contract_snapshot.publish
 
-Issue #1166 (termination_report.publish).
 Issue #1284 extends the same executor lane to issue metadata mutation
 (issue_body.update / issue_comment.publish / contract_snapshot.publish) so that
 these mutations can run from root/default branch without an issue-specific
@@ -28,17 +26,15 @@ import shlex
 
 TRUSTED_REPO = "squne121/loop-protocol"
 EXECUTOR_SCRIPT = "scripts/agent-guards/controlled_skill_mutation_exec.py"
-COMMAND_ID_PUBLISH = "termination_report.publish"
+# Issue #1873: termination_report.publish (COMMAND_ID_PUBLISH) and
+# pr_review.publish (COMMAND_ID_PR_REVIEW_PUBLISH) were removed. The final
+# summary publish and PR review publish flows are replaced by plain
+# `gh issue comment` / `gh pr comment` calls made by the calling orchestrator
+# (already allow-listed in .claude/settings.json permissions.allow).
 COMMAND_ID_ISSUE_BODY_UPDATE = "issue_body.update"
 COMMAND_ID_ISSUE_CONTENT_UPDATE = "issue_content.update"
 COMMAND_ID_ISSUE_COMMENT_PUBLISH = "issue_comment.publish"
 COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH = "contract_snapshot.publish"
-# Issue #1536: controlled review publisher. `--issue-number` is reused as the
-# PR number for this command id (the executor's generic input-file/env
-# binding is issue-number-shaped; a PR number occupies the same GitHub
-# numbering space). The pr_review.publish field validator additionally
-# requires an explicit `pr_number` field and checks it matches.
-COMMAND_ID_PR_REVIEW_PUBLISH = "pr_review.publish"
 COMMAND_ID_TEST_VERDICT_PUBLISH = "test_verdict.publish"
 COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE = "issue_scope_snapshot.materialize"
 
@@ -55,10 +51,10 @@ ISSUE_DEPENDENCY_REMOVE_MAX_BLOCKED_BY_NUMBERS = 500
 # Issue #1633: bounded request schema an isolation worktree agent is allowed
 # to produce for an Issue comment. The isolation worktree agent never invokes
 # `gh` or the controlled executor itself -- it only ever hands back this
-# closed-key dict to the canonical main root parent orchestrator (the
-# materializer in publish_termination_report.py), which validates it,
-# materializes an ISSUE_COMMENT_PUBLISH_INPUT_V1 file from it, and launches
-# controlled_skill_mutation_exec.py --command-id issue_comment.publish.
+# closed-key dict to the canonical main root parent orchestrator, which
+# validates it, materializes an ISSUE_COMMENT_PUBLISH_INPUT_V1 file from it,
+# and launches controlled_skill_mutation_exec.py --command-id
+# issue_comment.publish.
 ISOLATION_ISSUE_COMMENT_REQUEST_SCHEMA = "ISOLATION_ISSUE_COMMENT_REQUEST_V1"
 
 ISOLATION_ISSUE_COMMENT_REQUEST_ALLOWED_KEYS = frozenset(
@@ -215,12 +211,10 @@ ISSUE_METADATA_NAMESPACE_SEGMENT = "issue-metadata"
 # Per-command-id input schema (AC10). Command id ↔ schema mismatch is denied
 # before mutation.
 INPUT_SCHEMA_BY_COMMAND: dict = {
-    COMMAND_ID_PUBLISH: "TERMINATION_REPORT_INPUT_V1",
     COMMAND_ID_ISSUE_BODY_UPDATE: "ISSUE_BODY_UPDATE_INPUT_V1",
     COMMAND_ID_ISSUE_CONTENT_UPDATE: "ISSUE_CONTENT_UPDATE_INPUT_V1",
     COMMAND_ID_ISSUE_COMMENT_PUBLISH: "ISSUE_COMMENT_PUBLISH_INPUT_V1",
     COMMAND_ID_CONTRACT_SNAPSHOT_PUBLISH: "CONTRACT_SNAPSHOT_PUBLISH_INPUT_V1",
-    COMMAND_ID_PR_REVIEW_PUBLISH: "PR_REVIEW_PUBLISH_REQUEST_V1",
     COMMAND_ID_TEST_VERDICT_PUBLISH: "TEST_VERDICT_PUBLISH_INPUT_V1",
     COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE: "ISSUE_SCOPE_SNAPSHOT_MATERIALIZE_INPUT_V1",
     COMMAND_ID_ISSUE_DEPENDENCY_REMOVE: ISSUE_DEPENDENCY_REMOVE_INPUT_SCHEMA,
@@ -232,7 +226,11 @@ ALL_COMMAND_IDS = frozenset(INPUT_SCHEMA_BY_COMMAND)
 # binding. New command ids (Issue #1284 AC15) treat LOOP_ISSUE_NUMBER as
 # optional-but-must-match-if-present, since controlled metadata mutation may run
 # from root without an issue-specific worktree/session env.
-ENV_BINDING_MANDATORY_COMMAND_IDS = frozenset({COMMAND_ID_PUBLISH})
+# Issue #1873: termination_report.publish (the only command id that was ever a
+# member of this set) was removed, so this set is empty. Kept as a frozenset
+# constant (rather than deleted outright) so ENV_BINDING_MANDATORY_COMMAND_IDS
+# remains a stable import name for controlled_skill_mutation_exec.py.
+ENV_BINDING_MANDATORY_COMMAND_IDS = frozenset()
 
 # Environment variables that the executor sanitizes (removes from child env)
 # Issue #1539 fix_delta Blocker 2: GH_HOST / GH_REPO / GH_CONFIG_DIR / GH_DEBUG /
@@ -273,28 +271,6 @@ ENV_SANITIZE_KEYS = [
 #   env_sanitize:         env vars overridden/removed before execution
 #
 CONTROLLED_SKILL_MUTATION_COMMAND_POLICY: dict = {
-    COMMAND_ID_PUBLISH: {
-        "command_id": COMMAND_ID_PUBLISH,
-        "description": "Publish termination report as GitHub issue comment (controlled remote mutation)",
-        "executor_script": EXECUTOR_SCRIPT,
-        "allowed_write_roots": ALLOWED_WRITE_ROOTS,
-        "github_mutation": {
-            "comment_on_issue": True,
-            "requires_repo": TRUSTED_REPO,
-            "requires_explicit_repo_flag": True,
-        },
-        "postcondition": {
-            "no_tracked_source_changes": True,
-            "no_lockfile_changes": True,
-            "no_settings_changes": True,
-            "allowed_write_roots": ALLOWED_WRITE_ROOTS,
-        },
-        "idempotency": {
-            "marker_file_pattern": "artifacts/{issue_number}/termination_report_published.marker.json",
-            "marker_field": "comment_id",
-        },
-        "env_sanitize": ENV_SANITIZE_KEYS,
-    },
     COMMAND_ID_ISSUE_BODY_UPDATE: {
         "command_id": COMMAND_ID_ISSUE_BODY_UPDATE,
         "description": "Update GitHub issue body with stale-write precondition (controlled remote mutation)",
@@ -430,46 +406,6 @@ CONTROLLED_SKILL_MUTATION_COMMAND_POLICY: dict = {
         },
         "env_sanitize": ENV_SANITIZE_KEYS,
     },
-    COMMAND_ID_PR_REVIEW_PUBLISH: {
-        "command_id": COMMAND_ID_PR_REVIEW_PUBLISH,
-        "description": (
-            "Publish a GitHub PR review (event: COMMENT, commit_id-bound, "
-            "idempotent) on behalf of the read-only pr-reviewer SubAgent "
-            "(controlled remote mutation, Issue #1536 Option C)"
-        ),
-        "executor_script": EXECUTOR_SCRIPT,
-        "allowed_write_roots": ALLOWED_WRITE_ROOTS,
-        "input_namespace": (
-            f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{COMMAND_ID_PR_REVIEW_PUBLISH}/"
-        ),
-        "input_schema": INPUT_SCHEMA_BY_COMMAND[COMMAND_ID_PR_REVIEW_PUBLISH],
-        "github_mutation": {
-            "review_on_pull_request": True,
-            "review_event_fixed": "COMMENT",
-            "requires_repo": TRUSTED_REPO,
-            "requires_explicit_repo_flag": True,
-        },
-        "precondition": {
-            "expected_head_sha_must_match_remote_pr_head": True,
-        },
-        "postcondition": {
-            "no_tracked_source_changes": True,
-            "no_lockfile_changes": True,
-            "no_settings_changes": True,
-            "allowed_write_roots": ALLOWED_WRITE_ROOTS,
-            "review_state_must_be_commented": True,
-            "review_commit_id_must_match_expected_head_sha": True,
-            "review_body_sha256_must_match_readback": True,
-        },
-        "idempotency": {
-            "marker_file_pattern": (
-                f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/"
-                f"{COMMAND_ID_PR_REVIEW_PUBLISH}/pr_review_publish.marker.json"
-            ),
-            "marker_field": "idempotency_key",
-        },
-        "env_sanitize": ENV_SANITIZE_KEYS,
-    },
     COMMAND_ID_TEST_VERDICT_PUBLISH: {
         "command_id": COMMAND_ID_TEST_VERDICT_PUBLISH,
         "description": "Publish a receipt-bound TEST_VERDICT comment on a current PR head",
@@ -581,55 +517,17 @@ _EXECUTOR_VALUE_FLAGS: frozenset[str] = frozenset({
     "--issue-number",
     "--input-file",
     "--repo",
-    # Issue #1539 fix_delta Blocker 1: pr_review.publish "render mode" flags.
-    # These let a trusted caller hand the executor the raw verdict fields and
-    # a body TEXT file (no self-declared hash/schema/producer_role) instead of
-    # a pre-built PR_REVIEW_PUBLISH_REQUEST_V1 JSON. The executor computes
-    # body_sha256 / idempotency_key / producer_role / event itself.
-    "--render-body-file",
-    "--verdict",
-    "--reviewed-head-sha",
-    "--expected-head-sha",
-    # Issue #1822 fix_delta AC7: pr_review.publish PR number, distinct from
-    # --issue-number. Command-id/mode-specific grammar (see
-    # _PR_REVIEW_PUBLISH_ONLY_FLAGS below) restricts when this flag may appear.
-    "--pr-number",
 })
 _EXECUTOR_BOOL_FLAGS: frozenset[str] = frozenset({
     "--json",
     "--dry-run",
-    "--merge-ready",
 })
-# Baseline flags required for every invocation. --input-file XOR --render-body-file
-# (plus its companion flags) is enforced separately in _validate_executor_argv
-# because it is a semantic OR, not a flat set-containment requirement.
+# Baseline flags required for every invocation.
 _EXECUTOR_REQUIRED_FLAGS: frozenset[str] = frozenset({
     "--command-id",
     "--issue-number",
+    "--input-file",
     "--repo",
-})
-_EXECUTOR_RENDER_MODE_REQUIRED_FLAGS: frozenset[str] = frozenset({
-    "--render-body-file",
-    "--verdict",
-    "--reviewed-head-sha",
-    "--expected-head-sha",
-    # Issue #1822 fix_delta AC7: render mode for pr_review.publish requires an
-    # explicit --pr-number (checked jointly with --command-id pr_review.publish
-    # in _validate_executor_argv; this set alone only enforces presence).
-    "--pr-number",
-})
-
-# Issue #1822 fix_delta AC7: flags that only pr_review.publish may ever use.
-# Any other command-id that carries one of these flags is rejected outright
-# (render mode itself, --merge-ready, and --pr-number are all pr_review.publish
-# -only surface area).
-_PR_REVIEW_PUBLISH_ONLY_FLAGS: frozenset[str] = frozenset({
-    "--pr-number",
-    "--render-body-file",
-    "--verdict",
-    "--reviewed-head-sha",
-    "--expected-head-sha",
-    "--merge-ready",
 })
 
 # Shell metacharacters that make a command unparseable / compound
@@ -651,7 +549,6 @@ def _validate_executor_argv(args: list[str]) -> bool:
     those are enforced by the executor itself.
     """
     seen: set[str] = set()
-    values: dict[str, str] = {}
     i = 0
     while i < len(args):
         tok = args[i]
@@ -675,7 +572,6 @@ def _validate_executor_argv(args: list[str]) -> bool:
             val = args[i + 1]
             if val.startswith("--"):
                 return False  # value looks like another flag
-            values[tok] = val
             i += 2
             continue
         # Unknown flag
@@ -684,37 +580,6 @@ def _validate_executor_argv(args: list[str]) -> bool:
     # All baseline required flags must be present
     if not _EXECUTOR_REQUIRED_FLAGS.issubset(seen):
         return False
-
-    # Exactly one of --input-file / --render-body-file (Issue #1539 Blocker 1).
-    has_input_file = "--input-file" in seen
-    has_render_mode = "--render-body-file" in seen
-    if has_input_file == has_render_mode:
-        # Neither present, or both present -- ambiguous / not allowed.
-        return False
-    if has_render_mode and not _EXECUTOR_RENDER_MODE_REQUIRED_FLAGS.issubset(seen):
-        return False
-
-    # Issue #1822 fix_delta AC7: --pr-number and the other pr_review.publish
-    # -only flags are gated by --command-id, not merely by input-file vs.
-    # render mode. This closes the gap where any command-id could smuggle
-    # --pr-number / render-mode flags through the executor argv shape.
-    command_id = values.get("--command-id")
-    if command_id == COMMAND_ID_PR_REVIEW_PUBLISH:
-        # render mode requires an explicit --pr-number (already enforced via
-        # _EXECUTOR_RENDER_MODE_REQUIRED_FLAGS.issubset(seen) above, but this
-        # explicit check documents/guards intent even if that set changes).
-        if has_render_mode and "--pr-number" not in seen:
-            return False
-        # input-file mode must NOT carry --pr-number: the PR number for that
-        # mode lives inside the input file's PR_REVIEW_PUBLISH_REQUEST_V1
-        # payload, not on the CLI.
-        if has_input_file and "--pr-number" in seen:
-            return False
-    else:
-        # Any other command-id must not carry pr_review.publish-only flags at
-        # all (--pr-number, render mode flags, --merge-ready).
-        if seen & _PR_REVIEW_PUBLISH_ONLY_FLAGS:
-            return False
 
     return True
 

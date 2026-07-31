@@ -1,20 +1,16 @@
-scenario: negative_behind_branch_behind_main_key_absent
-loop_verdict:
+description: merge_state_status=BEHIND, test_verdict supplied but missing the
+  branch_behind_main key -> fail_closed
+reviewer_verdict:
   verdict: APPROVE
-  merge_ready: false
-  reviewed_head_sha: "abc123def456"
-  mergeability:
-    merge_state_status: BEHIND
-  required_auto_actions:
-    - kind: update_branch
-      executor: implementation-worker
-      skill: implement-issue.update_branch
-      blocking_merge_ready: true
-      mechanical: true
-      expected_head_sha: "abc123def456"
+  reviewed_head_sha: abc123def456
+  blockers: []
+live_mergeability:
+  head_sha: abc123def456
+  mergeable: MERGEABLE
+  merge_state_status: BEHIND
 test_verdict:
   result: pass
 expected:
   route: fail_closed
   fail_closed: true
-  reason_code: "missing_branch_behind_main_for_BEHIND"
+  reason_code: missing_branch_behind_main_for_BEHIND

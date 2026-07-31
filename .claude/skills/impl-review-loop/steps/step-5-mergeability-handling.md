@@ -1,120 +1,93 @@
-# Step 5: LOOP_VERDICT 自動読み取り（Mergeability Handling）
+# Step 5: LOOP_VERDICT ルーティング（Mergeability Handling）
 
-PR コメントに記録された LOOP_VERDICT YAML を読み取る決定論的手順。
+Issue #1873 以降、pr-reviewer SubAgent の返す `reviewer_verdict`（`verdict` / `reviewed_head_sha` /
+`blockers` / `warnings` の最小 convention）と、control-plane が `gh pr view` で直接取得する
+`live_mergeability`（`mergeable` / `merge_state_status`）を突き合わせて次アクションを決定する。
+PR コメントとして投稿された YAML を再パースして判定を再構築することはしない
+（コメント投稿は監査用の記録であり、production 判定の入力ではない）。
 
-## LOOP_VERDICT_V2 フェンス付き YAML の parse 方針
+## reviewer_verdict の取得
 
-本手順は **`LOOP_VERDICT_V2` の fenced YAML ブロックのみを parse する**。
+pr-reviewer SubAgent の Step 4 呼び出し結果から直接受け取る:
 
-V2 consumer path では top-level の `mergeStateStatus` / `recommendations` フィールドを参照しない。
-これらは V1 互換フィールドであり、V2 では以下のフィールドを使用する:
-
-| V1 top-level（参照しない） | V2 フィールド（使用する） |
-|---|---|
-| `mergeStateStatus` | `mergeability.merge_state_status` |
-| `recommendations` | `required_auto_actions` |
-| （なし） | `merge_ready` |
-
-parse 手順:
-1. コメント本文全体から **`LOOP_VERDICT_V2:` キーを含む fenced YAML block（` ```yaml ... ``` `）を全て列挙する**。「最初の ```yaml block」に依存してはならない。
-2. 複数ブロックが存在する場合は最新 review comment の block を採用する。
-3. prose 中（コードブロック外）に `LOOP_VERDICT_V2:` テキストが出現しても無視する。
-4. 対象ブロックが抽出できない場合は LOOP_VERDICT 不正として `human_review_required` で停止する。
-5. malformed YAML（parse エラー）は `human_escalation` として停止する。
-6. top-level の `mergeStateStatus` / `recommendations` フィールド（V1 形式）は V2 consumer path で無視する。
-7. V2 ブロック内の各フィールドを読み取る（以下のフィールド抽出セクション参照）。
-
-## 最新コメント抽出
-
-複数の pr-reviewer 投稿がある場合、**最新の verdict コメントを採用**する:
-
-```bash
-PR_NUMBER=<LOOP_STATE.pr_number>
-
-LATEST_VERDICT_BODY=$(gh pr view "$PR_NUMBER" \
-  --json reviews,comments \
-  --jq '
-    [(.reviews // []), (.comments // [])]
-    | flatten
-    | map(select(.body | contains("LOOP_VERDICT_V2")))
-    | sort_by(.createdAt // .submittedAt)
-    | last
-    | .body
-  ')
+```yaml
+verdict: APPROVE | REQUEST_CHANGES | HUMAN_REVIEW_REQUIRED
+reviewed_head_sha: "<pr-reviewer がレビューした時点の PR head SHA>"
+blockers:
+  - "<具体的な blocker>"
+warnings:
+  - "<任意>"
 ```
 
-reviews と comments を時系列で結合してから最新 1 件を取得することで、`gh pr review` 経由（reviews）と `gh issue comment` 経由（comments）の混在に対応する。
+`verdict` が `_VALID_VERDICTS`（APPROVE / REQUEST_CHANGES / HUMAN_REVIEW_REQUIRED）以外、
+または `reviewed_head_sha` が空の場合は `route_loop_verdict_v2()` が `fail_closed` を返す
+（`schema_invalid_verdict_value` / `schema_invalid_reviewed_head_sha_empty_or_missing`）。
+`merge_ready` / `mergeability` / `required_auto_actions` / `allowed_paths_gate` を
+`reviewer_verdict` に含めてはならない（含まれていた場合 `schema_invalid_legacy_field_present` で fail-closed）。
 
-## YAML フィールド抽出（V2）
-
-`LOOP_VERDICT_V2` の fenced YAML ブロック内から以下のフィールドを抽出する:
-
-```bash
-# fenced YAML ブロック（```yaml ... ```）を抽出
-V2_BLOCK=$(echo "$LATEST_VERDICT_BODY" | \
-  awk '/^```yaml/{found=1; next} /^```/{if(found) exit} found{print}' | \
-  awk '/LOOP_VERDICT_V2:/,0')
-
-VERDICT=$(echo "$V2_BLOCK" | grep -E "^[[:space:]]*verdict:" | head -n1 | sed -E 's/.*verdict:[[:space:]]*//; s/[[:space:]]*$//')
-MERGE_READY=$(echo "$V2_BLOCK" | grep -E "^[[:space:]]*merge_ready:" | head -n1 | sed -E 's/.*merge_ready:[[:space:]]*//; s/[[:space:]]*$//')
-# mergeability.merge_state_status を参照（V2 フィールド）
-MERGE_STATE_STATUS=$(echo "$V2_BLOCK" | grep -E "^[[:space:]]*merge_state_status:" | head -n1 | sed -E 's/.*merge_state_status:[[:space:]]*//; s/[[:space:]]*$//')
-REVIEWED_HEAD_SHA=$(echo "$V2_BLOCK" | grep -E "^[[:space:]]*reviewed_head_sha:" | head -n1 | sed -E 's/.*reviewed_head_sha:[[:space:]]*//; s/[[:space:]]*$//')
-REQUIRED_AUTO_ACTIONS=$(echo "$V2_BLOCK" | grep -E "^[[:space:]]*required_auto_actions:" | head -n1 | sed -E 's/.*required_auto_actions:[[:space:]]*//; s/[[:space:]]*$//')
-```
-
-- 各 `head -n1` でコメント本文全体での最初の出現を採用（重複行記載は禁止だが防御として最初を採る）
-- 値が空 → LOOP_VERDICT 不正として `human_review_required` で停止
-- `REQUIRED_AUTO_ACTIONS` の有効値は `[]` または `[update_branch]` / `[update_pr_body_hygiene]` / `[ensure_closing_keyword]` の組み合わせ。不明な値は `human_escalation` で停止する
-- `MERGE_READY` の有効値は `true` / `false`。それ以外は LOOP_VERDICT 不正として停止する
-
-## reviewed_head_sha 整合確認
-
-`CURRENT_HEAD` として PR の現在の `headRefOid` を取得し、`REVIEWED_HEAD_SHA` と照合する:
+## live_mergeability の取得
 
 ```bash
-CURRENT_HEAD=$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)
+LIVE_MERGEABILITY_JSON=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
+  --json headRefOid,mergeable,mergeStateStatus)
 ```
 
-`REVIEWED_HEAD_SHA` と `CURRENT_HEAD` が一致しない場合（stale LOOP_VERDICT 検出）:
+`route_loop_verdict_v2()` に渡す `live_mergeability` は以下の形にマップする:
 
-- 取得した LOOP_VERDICT は古い head に対するレビューであるため無効とみなし、以降の判定に使用しない
-- `termination_reason` は設定しない（失敗ではなく再評価が必要なケースのため）
-- Step 4（pr-review-judge）を再委譲し、現在の head に対する最新の LOOP_VERDICT を取得する
-- 新しい LOOP_VERDICT が得られた後、改めて Step 5 の判定を最初から実行する。stale な LOOP_VERDICT で BEHIND 分岐その他の判定を継続してはならない
+```yaml
+head_sha: <headRefOid>
+mergeable: MERGEABLE | CONFLICTING | UNKNOWN
+merge_state_status: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN | DRAFT | HAS_HOOKS
+```
 
-## 判定結果の orchestrator 反映
+## ルーティング呼び出し
 
-> **C5 vs C6 競合解消**: 旧テーブルでは `APPROVE + MERGEABLE + CLEAN/UNSTABLE` が即 `終了（approved）` に routing されていたが、
-> `required_auto_actions` が残る場合は終了しない。以下のテーブルは `required_auto_actions` gate を先行させる。
+```python
+from route_loop_verdict_v2 import route_loop_verdict_v2
 
-| verdict | merge_ready | merge_state_status | required_auto_actions | 次アクション |
-|---|---|---|---|---|
-| `APPROVE` | `true` | `CLEAN` | `[]` | **終了（approved）**: `step-5-feedback-and-termination.md` の全 gate pass |
-| `APPROVE` | `true` | `CLEAN` | 空でない | required_auto_actions 処理（`step-5-feedback-and-termination.md` の routing）→ 終了しない |
-| `APPROVE` | `false` | `BEHIND` | 任意 | BEHIND 分岐: 下記「BEHIND 分岐 routing」参照（`termination_reason: approved` は立てない） |
-| `APPROVE` | `false` | `BLOCKED` | 任意 | branch protection 設定待ち。人間判断（`termination_reason: approved` は立てない） |
-| `APPROVE` | `false` | `UNSTABLE` | 任意 | 人間判断（`termination_reason: approved` は立てない） |
-| `REQUEST_CHANGES` | 任意 | 任意 | 任意 | 次イテレーションへ（blockers を fix_delta に） |
-| 任意 | 任意 | `DIRTY` | 任意 | CONFLICTING PR Escalation Runbook 発動 |
-| 任意 | 任意 | `CONFLICTING` | 任意 | CONFLICTING PR Escalation Runbook 発動 |
-| 任意 | 任意 | `UNKNOWN` | 任意 | 5 秒待機 × 最大 3 回 retry、それでも UNKNOWN なら human_escalation |
+decision = route_loop_verdict_v2(
+    reviewer_verdict,       # {verdict, reviewed_head_sha, blockers, warnings}
+    live_mergeability,      # {head_sha, mergeable, merge_state_status}
+    test_verdict=test_verdict,  # optional: {"branch_behind_main": bool, ...}
+)
+```
 
-> **APPROVE + BEHIND の termination_reason**: `APPROVE + merge_ready == false`（BEHIND 含む）の場合、
-> `termination_reason: approved` を設定してはならない。BEHIND 分岐で update_branch が完了し、
-> 再レビューで `merge_ready: true` かつ `required_auto_actions == []` になるまで終了しない。
+`decision.route` の値と orchestrator の対応:
+
+| `route` | 意味 | 次アクション |
+|---|---|---|
+| `approved` | `APPROVE` かつ mergeable/merge_state_status が `CLEAN`/`HAS_HOOKS` | 終了（approved）。`step-5-feedback-and-termination.md` の残り gate を確認 |
+| `continue_loop` | `REQUEST_CHANGES` | 次イテレーションへ（blockers を fix_delta に） |
+| `route_stale_head_rereview` | `reviewed_head_sha != live head_sha` | Step 4 を現在の head で再委譲し、Step 5 を最初からやり直す |
+| `route_to_update_branch` | `merge_state_status == BEHIND` かつ `branch_behind_main == true` | 下記「BEHIND 分岐 routing」参照 |
+| `route_human_escalation` | `HUMAN_REVIEW_REQUIRED`、または `BLOCKED`/`UNSTABLE`/`DRAFT` | 人間判断を仰いで停止（`termination_reason: human_escalation`） |
+| `route_conflict_escalation` | `mergeable == CONFLICTING` または `merge_state_status` が `DIRTY`/`CONFLICTING` | CONFLICTING PR Escalation Runbook 発動（actual conflict のみ hard stop） |
+| `fail_closed` | schema 不正、`APPROVE` かつ `blockers` 非空、`mergeability_unknown` 等 | `decision.reason_code` / `decision.errors` を blocker として記録し、`mergeability_unknown` は bounded retry（最大 3 回、5 秒間隔）後に human escalation |
+
+`UNKNOWN`、`BLOCKED`、`BEHIND`、`UNSTABLE`、`DRAFT`、`HAS_HOOKS` は Git conflict として扱わない
+（Safety Invariants）。actual Git conflict として hard stop するのは `mergeable == CONFLICTING` または
+`merge_state_status` が `DIRTY`/`CONFLICTING` の場合のみ。
 
 ## BEHIND 分岐 routing
 
-`APPROVE + MERGEABLE + BEHIND`（`recommendations: [update_branch]` 含む）の場合:
+`decision.route == "route_to_update_branch"` の場合、`decision.selected_action` に
+`route_loop_verdict_v2()` が合成した action が入っている（reviewer からは受け取らない）:
 
-1. `UPDATE_BRANCH_REQUEST_V1` を組み立てる:
+```yaml
+kind: update_branch
+executor: implementation-worker
+skill: implement-issue.update_branch
+mechanical: true
+expected_head_sha: <reviewed_head_sha>
+```
+
+1. この action から `UPDATE_BRANCH_REQUEST_V1` を組み立てる:
 
    ```yaml
    UPDATE_BRANCH_REQUEST_V1:
      repo: <REPO>
      pr_number: <PR_NUMBER>
-     expected_head_sha: <REVIEWED_HEAD_SHA>
+     expected_head_sha: <selected_action.expected_head_sha>
      update_method: merge_only
      caller: impl-review-loop.step-5
    ```
@@ -126,15 +99,17 @@ CURRENT_HEAD=$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)
 
    | status | 次アクション |
    |---|---|
-   | `ok` | stale 判定 → Step 2（test-runner）→ Step 4（pr-review-judge）→ Step 5 再実行 |
+   | `ok` | Step 2（test-runner）→ Step 4（pr-review-judge）→ Step 5 再実行 |
    | `stale_verdict` | Step 4（pr-review-judge）re-review → Step 5 再実行 |
    | `forbidden` | `termination_reason: human_escalation` を記録して停止 |
    | `validation_failed` | `termination_reason: human_escalation` を記録して停止 |
    | `timeout` | `termination_reason: human_escalation` を記録して停止 |
    | `human_escalation` | 停止して人間判断を仰ぐ |
 
-4. 更新後に `mergeable=CONFLICTING` または `mergeStateStatus=DIRTY` を検出した場合: `CONFLICTING PR Escalation Runbook` を発動する
+4. 更新後に `mergeable=CONFLICTING` または `merge_state_status=DIRTY` を検出した場合: `CONFLICTING PR Escalation Runbook` を発動する
 
 ## 出力
 
-LOOP_VERDICT の解析結果を LOOP_STATE に反映し、Step 5（feedback-and-termination）の判定マトリクスに従って次アクションを決定する。
+`route_loop_verdict_v2()` の `RouteDecision` を LOOP_STATE の代わりに control-plane が in-memory で保持し、
+`step-5-feedback-and-termination.md` の判定マトリクスに従って次アクションを決定する。
+resume/compaction 後は保存された decision を再利用せず、PR head と reviewer 結果を再取得してから再実行する。

@@ -219,7 +219,7 @@ stale verdict（SHA mismatch）による誤更新を防ぐための race guard�
 
 PR 起票時に `IMPLEMENT_RESULT_V1.allowed_paths_compliance: true/false` を報告する。ただしこの self-report は **advisory（参考情報）** であり、canonical な Allowed Paths 判定は review_subagent（pr-review-judge）が `git diff` から独立に再計算する `ALLOWED_PATHS_GATE_RESULT_V1` に基づく。
 
-impl-review-loop はこの worker self-report を canonical 判定に使わない。代わりに `LOOP_VERDICT_V2.allowed_paths_gate` の producer_role が `review_subagent` かつ `worker_report_used_as_canonical: false` であることを確認し、status のみを route する。
+impl-review-loop はこの worker self-report を canonical 判定に使わない。代わりに review_subagent（pr-reviewer）が再計算した `ALLOWED_PATHS_GATE_RESULT_V1.status` を canonical とし、`status != ok` の場合は違反内容が `reviewer_verdict.blockers[]` にテキストとして反映される（Issue #1873。専用 `allowed_paths_gate` schema field は使わない）。
 
 ## 動作検証 AC を含む Issue の追加制約
 

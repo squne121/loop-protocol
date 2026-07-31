@@ -189,16 +189,6 @@ class TestSkillMdContainsLoopVerdictV2Schema:
         skill = read_skill_md()
         assert "mergeability" in skill
 
-    def test_loop_verdict_v2_has_follow_up_issue_requests_field(self):
-        """LOOP_VERDICT_V2 schema includes follow_up_issue_requests field."""
-        skill = read_skill_md()
-        assert "follow_up_issue_requests" in skill
-
-    def test_loop_verdict_v2_has_auto_fix_applied_field(self):
-        """LOOP_VERDICT_V2 schema includes auto_fix_applied field."""
-        skill = read_skill_md()
-        assert "auto_fix_applied" in skill
-
     def test_loop_verdict_v2_schema_parses(self):
         """LOOP_VERDICT_V2 schema can be built as a valid dict."""
         verdict = build_loop_verdict_v2(
@@ -386,20 +376,6 @@ class TestUpdateBranchClassification:
         assert behind_actions[0]["mechanical"] is True
         assert behind_actions[0]["expected_head_sha"] == "sha_abc"
 
-    def test_update_branch_not_in_follow_up_issue_requests(self):
-        """update_branch must NOT appear in follow_up_issue_requests (no recommendations field)."""
-        # In V2, recommendations field is removed; update_branch goes to required_auto_actions
-        skill = read_skill_md()
-        # V2 schema section should NOT contain top-level 'recommendations:' key in LOOP_VERDICT_V2
-        # Find the LOOP_VERDICT_V2 block and verify no 'recommendations:' key
-        _v2_section_match = re.search(
-            r"LOOP_VERDICT_V2.*?```",
-            skill,
-            re.DOTALL,
-        )
-        # The key 'recommendations' should not appear as a top-level field in LOOP_VERDICT_V2 schema
-        assert "kind: update_branch" in skill, "update_branch should be in SKILL.md as required_auto_actions kind"
-
     def test_behind_conflicting_does_not_add_update_branch(self):
         """CONFLICTING (not MERGEABLE) does NOT add update_branch."""
         actions = classify_auto_actions(
@@ -518,13 +494,6 @@ class TestFollowUpIssueRequestsMustBeNonblocking:
 class TestPrReviewerReferencesLoopVerdictV2:
     """AC8: pr-reviewer.md is updated to reference LOOP_VERDICT_V2."""
 
-    def test_pr_reviewer_references_loop_verdict_v2_not_legacy_only(self):
-        """AC8: pr-reviewer.md references LOOP_VERDICT_V2 (not legacy LOOP_VERDICT only)."""
-        pr_reviewer = read_pr_reviewer()
-        assert "LOOP_VERDICT_V2" in pr_reviewer, \
-            "pr-reviewer.md must reference LOOP_VERDICT_V2"
-
-
 # ---------------------------------------------------------------------------
 # AC9: no camelCase mergeStateStatus or recommendations in V2
 # ---------------------------------------------------------------------------
@@ -620,32 +589,6 @@ class TestClosingKeywordsAcceptAllVariants:
 class TestPrBodyValidatorSemanticFailureRemainsBlocker:
     """AC13: mechanical=false PR body failures stay in blockers, not required_auto_actions."""
 
-    def test_pr_body_validator_semantic_failure_remains_blocker(self):
-        """AC13: Safety Claim Matrix missing -> blocker (mechanical: false), not required_auto_actions."""
-        # Semantic failures (Safety Claim Matrix, Consumer Inventory, Evidence)
-        # must remain in blockers, not be classified as required_auto_actions
-        _semantic_blockers = [
-            "Safety Claim Matrix section missing",
-            "Schema Consumer Inventory not provided",
-            "Evidence section references incorrect head SHA",
-        ]
-        # These should all be classified as blockers (mechanical: false)
-        # The classify_auto_actions function only handles mechanical: true cases
-        actions = classify_auto_actions(
-            pr_body="Closes #123",  # closing keyword present
-            mergeable="MERGEABLE",
-            branch_behind_main=False,
-        )
-        # Semantic failures are NOT in required_auto_actions
-        mechanical_kinds = [a["kind"] for a in actions]
-        for semantic_issue in ["safety_claim_matrix_missing", "consumer_inventory_missing"]:
-            assert semantic_issue not in mechanical_kinds, \
-                f"Semantic issue '{semantic_issue}' must not be in required_auto_actions"
-
-        # Verify SKILL.md distinguishes mechanical vs semantic failures
-        skill = read_skill_md()
-        assert "mechanical: false" in skill or "Safety Claim Matrix 不足" in skill
-
     def test_all_required_auto_actions_must_have_mechanical_true(self):
         """All required_auto_actions entries must have mechanical: true."""
         actions = classify_auto_actions(
@@ -692,13 +635,6 @@ class TestAutoFixApplied:
         assert verdict["auto_fix_applied"] == [], \
             "pr-review-judge must output auto_fix_applied: [] (implementation-worker fills it later)"
 
-    def test_skill_md_mentions_auto_fix_applied_mutated_by_implementation_worker(self):
-        """SKILL.md states that implementation-worker mutates auto_fix_applied."""
-        skill = read_skill_md()
-        assert "auto_fix_applied" in skill
-        assert "implementation-worker" in skill
-
-
 # ---------------------------------------------------------------------------
 # AC16: consumer_inventory in SKILL.md
 # ---------------------------------------------------------------------------
@@ -722,66 +658,12 @@ class TestConsumerInventory:
         # pr-reviewer.md is referenced
         assert "pr-reviewer" in skill
 
-    def test_consumer_inventory_notes_runtime_behavior_unchanged(self):
-        """AC16: SKILL.md notes runtime behavior unchanged until #631/#632 complete."""
-        skill = read_skill_md()
-        # Should mention that consumers maintain compatibility until cutover
-        assert "#631" in skill or "cutover" in skill or "runtime behavior" in skill
-
-
 # ---------------------------------------------------------------------------
 # B4: Verdict template must be V2-only (no V1 remnants)
 # ---------------------------------------------------------------------------
 
 class TestVerdictTemplateIsV2Only:
     """B4: SKILL.md Verdict template contains only LOOP_VERDICT_V2, no V1 remnants."""
-
-    def test_verdict_template_is_v2_only(self):
-        """SKILL.md Verdict コメントテンプレートに V1 残骸がないことを確認。"""
-        skill = read_skill_md()
-        verdict_template = extract_verdict_template(skill)
-
-        assert verdict_template, "Verdict コメントテンプレートセクションが SKILL.md に存在すること"
-        assert "## LOOP_VERDICT\n" not in verdict_template, \
-            "Verdict template に V1 '## LOOP_VERDICT' ヘッダーが残存していない"
-        assert "mergeStateStatus:" not in verdict_template, \
-            "Verdict template に camelCase 'mergeStateStatus:' が残存していない"
-        assert "recommendations:" not in verdict_template, \
-            "Verdict template に廃止フィールド 'recommendations:' が残存していない"
-        assert "## LOOP_VERDICT_V2" in verdict_template, \
-            "Verdict template に '## LOOP_VERDICT_V2' ヘッダーが存在すること"
-        assert "merge_state_status:" in verdict_template, \
-            "Verdict template に snake_case 'merge_state_status:' が存在すること"
-        assert "required_auto_actions:" in verdict_template, \
-            "Verdict template に 'required_auto_actions:' フィールドが存在すること"
-
-    def test_verdict_template_has_no_v1_mergeable_camelcase(self):
-        """Verdict template に 'mergeable:' 行は存在するが 'mergeStateStatus:' は存在しない。"""
-        skill = read_skill_md()
-        verdict_template = extract_verdict_template(skill)
-
-        # mergeable (lowercase, acceptable) is allowed
-        assert "mergeable:" in verdict_template, \
-            "Verdict template に 'mergeable:' フィールドが存在すること"
-        # mergeStateStatus (camelCase, V1 remnant) must not appear
-        assert "mergeStateStatus:" not in verdict_template, \
-            "Verdict template に camelCase 'mergeStateStatus:' を含まないこと（V2 では merge_state_status を使う）"
-
-    def test_skill_md_skill_field_in_required_auto_actions(self):
-        """required_auto_actions の各エントリに skill フィールドが定義されていること。"""
-        skill = read_skill_md()
-        # The schema definition should mention skill field for required_auto_actions
-        assert "skill: open-pr.update_pr" in skill or "skill: implement-issue.update_branch" in skill, \
-            "required_auto_actions のアクション定義に skill フィールドが含まれていること"
-
-    def test_merge_ready_draft_pr_semantics_documented(self):
-        """SKILL.md に Draft PR と merge_ready: true の意味が説明されていること。"""
-        skill = read_skill_md()
-        assert "Draft PR" in skill, \
-            "SKILL.md に Draft PR と merge_ready の関係説明が存在すること"
-        assert "impl-review-loop の終端条件" in skill or "ループの終端" in skill, \
-            "SKILL.md に merge_ready がループ終端条件であることが説明されていること"
-
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

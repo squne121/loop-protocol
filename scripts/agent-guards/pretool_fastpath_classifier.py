@@ -306,8 +306,11 @@ def _classify_controlled_skill_mutation(cmd: str, project_root: str) -> Fastpath
                 CLASS_EXACT_SHAPE, command_id=command_id, internal_shape_only=True
             )
     elif issue_number:
-        # Legacy command id (termination_report.publish) has no explicit
-        # input_namespace entry — require the artifacts/{issue_number}/ prefix.
+        # Defensive fallback: every currently-registered command id has an
+        # explicit input_namespace entry (Issue #1873 removed the one legacy
+        # exception, termination_report.publish), but if a future command id
+        # were ever added without one, require at least the
+        # artifacts/{issue_number}/ prefix rather than skipping the check.
         expected_prefix = f"artifacts/{issue_number}/"
         if not _is_safe_namespaced_input_file(input_file, expected_prefix):
             return FastpathClassification(

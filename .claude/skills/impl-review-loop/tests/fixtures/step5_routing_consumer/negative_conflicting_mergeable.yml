@@ -1,0 +1,14 @@
+description: mergeable=CONFLICTING -> route_conflict_escalation (hard stop)
+reviewer_verdict:
+  verdict: APPROVE
+  reviewed_head_sha: abc123def456
+  blockers: []
+live_mergeability:
+  head_sha: abc123def456
+  mergeable: CONFLICTING
+  merge_state_status: DIRTY
+test_verdict: null
+expected:
+  route: route_conflict_escalation
+  fail_closed: false
+  reason_code_prefix: actual_conflict

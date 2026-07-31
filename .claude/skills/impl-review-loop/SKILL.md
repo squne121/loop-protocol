@@ -35,14 +35,17 @@ implementation child issue を **実装 → 検証 → PR レビュー** の 3 �
         ↓
 [Step 4: PR Review]       → pr-reviewer SubAgent (pr-review-judge skill)
         ↓
-[Step 5: Judgment]        → LOOP_VERDICT_V2 を解析
+[Step 5: Judgment]        → reviewer_verdict + live_mergeability を route_loop_verdict_v2() で解析
         ↓
-    APPROVE + merge_ready == true + required_auto_actions == [] → 終了（PR は人間がマージ判断）
-    APPROVE + required_auto_actions 残あり → worker 委譲 → PR review 再実行
-    APPROVE + merge_ready == false → mergeability handling（BEHIND 分岐等）
-    REQUEST_CHANGES → Step 1 に戻る（fix_delta を渡す）
+    route: approved → 終了（PR は人間がマージ判断）
+    route: route_to_update_branch → worker 委譲（update_branch）→ 検証・PR review 再実行
+    route: route_stale_head_rereview → 現在 head で PR review 再実行
+    route: continue_loop（REQUEST_CHANGES） → Step 1 に戻る（fix_delta を渡す）
+    route: route_human_escalation / route_conflict_escalation / fail_closed → 人間判断を仰ぐ
     上限超過 → 人間判断を仰ぐ
 ```
+
+Issue #1873 以降、pr-reviewer は `verdict` / `reviewed_head_sha` / `blockers` / `warnings` の最小 convention のみを返す。`merge_ready` / `required_auto_actions` / `mergeability` / `allowed_paths_gate` は reviewer の自己申告として受け取らない。mergeability は control-plane が `gh pr view` で直接取得し、`route_loop_verdict_v2()`（`.claude/skills/impl-review-loop/scripts/route_loop_verdict_v2.py`）の `live_mergeability` 引数として渡す。`update_branch` action は reviewer から受け取らず `route_loop_verdict_v2()` が合成する。
 
 > Step 3（adversarial review）と Step 1.5（spec document review）は LOOP_PROTOCOL では採用しない（PR #12 / #20 方針）。Step 番号は履歴互換のため 1 → 2 → 4 → 5 のまま保持する。
 
@@ -95,39 +98,41 @@ LOOP_STATE:
 
 ## 終了条件
 
-| 条件 | アクション |
+| 条件（`route_loop_verdict_v2()` の `route`） | アクション |
 |---|---|
-| `LOOP_VERDICT_V2.verdict: APPROVE` かつ `merge_ready == true` かつ `required_auto_actions == []` | 終了。`IMPL_REVIEW_LOOP_RESULT_V1.status: draft_pr_ready` かつ `merge_ready: true` を emit。PR は人間がマージ判断 |
-| `LOOP_VERDICT_V2.verdict: APPROVE` かつ `required_auto_actions` が空でない | 終了しない。required_auto_actions を worker に委譲し、PR review を再実行する |
-| `LOOP_VERDICT_V2.verdict: APPROVE` かつ `merge_ready == false` | 終了しない。`step-5-mergeability-handling.md` の routing に従う（BEHIND 分岐等） |
+| `approved`（`verdict: APPROVE` かつ live mergeability が `CLEAN`/`HAS_HOOKS` かつ `blockers == []`） | 終了。`IMPL_REVIEW_LOOP_RESULT_V1.status: draft_pr_ready` を emit。PR は人間がマージ判断 |
+| `route_to_update_branch`（live `merge_state_status == BEHIND`） | 終了しない。合成された `update_branch` action を worker に委譲し、検証・PR review を再実行する |
+| `route_stale_head_rereview`（`reviewed_head_sha` が現在の PR head と不一致） | 終了しない。現在 head で PR review を再実行する |
+| `continue_loop`（`verdict: REQUEST_CHANGES`） | 終了しない。Step 1 に戻り blockers を fix_delta として渡す |
 | `iteration ≥ max_iterations` | fail-close。`termination_reason: max_iterations` を LOOP_STATE に記録、人間判断を仰ぐ |
-| Step 1-4 のいずれかで `human_review_required: true` を SubAgent が返した | 即停止、人間判断を仰ぐ |
-| `merge_state_status: CONFLICTING / DIRTY / BLOCKED` の繰り返し | CONFLICTING PR Escalation Runbook 参照 |
+| `route_human_escalation`（`verdict: HUMAN_REVIEW_REQUIRED`、または `BLOCKED`/`UNSTABLE`/`DRAFT`） | 即停止、人間判断を仰ぐ |
+| `route_conflict_escalation`（`mergeable: CONFLICTING` または `merge_state_status` が `DIRTY`/`CONFLICTING`） | CONFLICTING PR Escalation Runbook 参照 |
+| `fail_closed`（schema 不正、`APPROVE` かつ `blockers` 非空、mergeability `UNKNOWN` 等） | `reason_code` / `errors` を記録。`UNKNOWN` は bounded retry（最大 3 回）後に人間判断、それ以外は即人間判断 |
 
-> **重要**: `verdict: APPROVE` 単独では終了しない。`merge_ready == true` かつ `required_auto_actions == []` の両条件が必要。
+> **重要**: `verdict: APPROVE` 単独では終了しない。live mergeability が `CLEAN`/`HAS_HOOKS` かつ `blockers == []` の両条件が必要（`route_loop_verdict_v2()` が判定する）。
 
 ## 外部仕様調査の取扱い
 
 外部仕様調査が必要な場合は `gemini-cli-headless-delegation` skill を default 経路として使い、結果を LOOP_STATE の `external_research_skip_basis` に記録する。LOOP_PROTOCOL は internal-only 変更が多い前提のため、デフォルトはスキップで構わない（スキップ時も判定根拠を記録する）。
 
-## Allowed Paths Gate Routing（許可パスゲートのルーティング, LOOP_VERDICT_V2.allowed_paths_gate）
+## Allowed Paths Gate Routing（許可パスゲートのルーティング、Issue #1873）
 
-PR review judge（review_subagent）が生成する `ALLOWED_PATHS_GATE_RESULT_V1` の status に基づいて、以下の routing table に従う。
+pr-reviewer が実行する `ALLOWED_PATHS_GATE_RESULT_V1`（決定論的スクリプト、正本は pr-review-judge 配下）の
+`status` は、専用 `LOOP_VERDICT_V2.allowed_paths_gate` フィールドとして自己申告されず、
+`status != ok` の場合は具体的な違反内容が `reviewer_verdict.blockers[]` にテキストとして含まれる
+（`references/allowed-paths-gate.md` 参照）。
 
-**注意**: impl-review-loop は `allowed_paths_gate.status` のみを route し、worker 自己申告（`allowed_paths_compliance`）は canonical にしない。gate evaluator の正本は pr-review-judge 配下の決定論的スクリプト出力。
-
-| allowed_paths_gate.status | routing | merge-blocking | action |
+| gate `status` | reviewer_verdict への反映 | 結果としての `verdict` | routing |
 |---|---|---|---|
-| `ok` | continue（非 merge-blocking） | false | 次ステップへ |
-| `fail_closed` | REQUEST_CHANGES（merge-blocking） | true | PR レビュー REQUEST_CHANGES、next iteration へ |
-| `stale_snapshot` | REQUEST_CHANGES（merge-blocking） | true | contract snapshot を refresh して PR レビュー再実行 |
-| `indeterminate` | REQUEST_CHANGES（merge-blocking） | true | 人間判断を仰ぐ（head SHA mismatch 等） |
-| result 欠落 | indeterminate 扱い（merge-blocking） | true | 人間判断を仰ぐ |
-| `producer_role != review_subagent` | indeterminate 扱い（merge-blocking） | true | producer role の確認が必要 |
-| allowed_paths_gate ブロック欠落（PR review 本文自体に `allowed_paths_gate` ブロックが存在しない） | indeterminate 扱い（merge-blocking） | true | `check_pr_review_gates.py` G6 が fail を返す。producer_role フィールド欠落と同様、人間判断を仰ぐ（Issue #1776） |
-| malformed（スキーマ不正） | indeterminate 扱い（merge-blocking） | true | 人間判断を仰ぐ |
+| `ok` | blocker を追加しない | `APPROVE` 可 | `route_loop_verdict_v2()` の通常判定へ |
+| `fail_closed` | 違反内容を `blockers[]` に記載 | `REQUEST_CHANGES` | `continue_loop`。next iteration で修正 |
+| `stale_snapshot` | 「contract snapshot が stale」を `blockers[]` に記載 | `REQUEST_CHANGES` | `continue_loop`。snapshot を refresh して PR レビュー再実行 |
+| `indeterminate` | 理由（head SHA mismatch 等）を `blockers[]` に記載 | `REQUEST_CHANGES` または `HUMAN_REVIEW_REQUIRED` | `continue_loop` または `route_human_escalation` |
+| malformed（スクリプト実行不能） | 実行不能である旨を `blockers[]` に記載 | `HUMAN_REVIEW_REQUIRED` | `route_human_escalation` |
 
-`status: ok` 以外の場合は merge-blocking であり、PR merge 前に人間 approval または contract 再確認が必要。
+`verdict: APPROVE` かつ `blockers` が非空は inconsistent な reviewer 結果として `route_loop_verdict_v2()` が
+`fail_closed`（`approve_with_blockers_inconsistent`）を返す。つまり `status != ok` のまま `APPROVE` を出す
+reviewer 結果は production 経路で自動的に拒否される。
 
 ## Contract Snapshot 参照ルール
 

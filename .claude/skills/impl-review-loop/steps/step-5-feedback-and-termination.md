@@ -2,63 +2,55 @@
 
 Step 2-4 の結果を統合して、ループを次イテレーションに進めるか終了するかを判定する。
 
-## 終了条件マトリクス
+## 終了条件マトリクス（Issue #1873、`route_loop_verdict_v2()` の `route` を正本とする）
 
-| 条件 | アクション |
+reviewer_verdict（`verdict`/`reviewed_head_sha`/`blockers`/`warnings`）と live_mergeability
+（`gh pr view` で取得した `mergeable`/`merge_state_status`）を `route_loop_verdict_v2()` に渡し、
+返る `route` で分岐する。詳細な `route` 一覧と判定条件は `step-5-mergeability-handling.md` を参照。
+
+| `route` | アクション |
 |---|---|
-| `LOOP_VERDICT.verdict: APPROVE` かつ `merge_ready == true` かつ `required_auto_actions == []` | `termination_reason: approved` を立て、終了処理へ |
-| `LOOP_VERDICT.verdict: APPROVE` かつ `required_auto_actions` が空でない | `required_auto_action_result_routing` に従って worker 委譲し、処理完了後に PR review を再実行（終了しない） |
-| `LOOP_VERDICT.verdict: APPROVE` かつ `merge_ready == false` | `step-5-mergeability-handling.md` の routing に従う（終了しない） |
-| `LOOP_STATE.iteration >= LOOP_STATE.max_iterations` | `termination_reason: max_iterations` を立て、fail-close で人間判断 |
-| Step 1-2-4 のいずれかで `human_review_required: true` を SubAgent が返した | `termination_reason: human_escalation` を立て、即停止 |
-| Step 2 が `FAIL` または Step 4 が `REQUEST_CHANGES` で iteration 余裕あり | LOOP_STATE.iteration += 1、Step 1 に戻る（fix_delta を渡す）|
+| `approved` | `termination_reason: approved` を立て、終了処理へ |
+| `route_to_update_branch` | 合成された `update_branch` action を worker に委譲し、検証・PR review を再実行（終了しない） |
+| `route_stale_head_rereview` | 現在 head で PR review を再実行（終了しない） |
+| `continue_loop` | LOOP_STATE.iteration += 1、Step 1 に戻る（blockers を fix_delta として渡す） |
+| `route_human_escalation` | `termination_reason: human_escalation` を立て、即停止 |
+| `route_conflict_escalation` | CONFLICTING PR Escalation Runbook 発動 |
+| `fail_closed` | `LOOP_STATE.iteration >= LOOP_STATE.max_iterations` | `termination_reason: max_iterations` を立て、fail-close で人間判断 |
 
 > **注意**: `verdict: APPROVE` 単独では `termination_reason: approved` に到達しない。
-> `merge_ready == true` かつ `required_auto_actions == []` の両条件が揃った場合のみ終了する。
+> `route_loop_verdict_v2()` が live mergeability（`CLEAN`/`HAS_HOOKS` かつ `MERGEABLE`）を確認し、
+> `blockers == []` である場合にのみ `route: approved` を返す。
 
-## APPROVE 時の終了 gate（三段構成）
+## update_branch の処理手順（Issue #1873: reviewer 自己申告を廃止、control-plane が合成）
 
-Step 4 から `verdict: APPROVE` を受け取った場合、以下の順で gate を評価する:
+`route_loop_verdict_v2()` が `route: route_to_update_branch` を返した場合、`decision.selected_action`
+（`kind: update_branch` / `executor: implementation-worker` / `skill: implement-issue.update_branch` /
+`mechanical: true` / `expected_head_sha`）を `implementation-worker` に委譲する。
 
-```
-APPROVE gate:
-  1. reviewed_head_sha 整合確認（step-5-mergeability-handling.md 参照）
-     - 不一致 → Step 4 再実行（stale LOOP_VERDICT 検出）
-  2. required_auto_actions gate:
-     if required_auto_actions != []:
-       → required_auto_action_result_routing で worker 委譲
-       → 処理結果に応じて verification / PR review を再実行
-       → 終了しない（ループ継続）
-  3. merge_ready gate:
-     if merge_ready != true:
-       → step-5-mergeability-handling.md の routing に従う
-       → 終了しない
-  4. 全 gate pass → termination_reason: approved で終了
-```
+1. `selected_action` を `implementation-worker` に委譲する
+2. worker result の `status` で分岐する:
+   - `failed` / `blocked` / `permission_blocked` → `termination_reason: human_escalation` で停止
+   - `ok` → verification と PR review の両方を再実行する（`update_branch` は常に head SHA を変える）
+3. `reviewed_head_sha` が現在 head と不一致の場合、dispatch 前に PR review を再実行する
+4. 再実行後に得られた新しい `reviewer_verdict` / `live_mergeability` で再度 `route_loop_verdict_v2()` を評価する
 
-## required_auto_action_result_routing
+body-only な自動修正（`update_pr_body_hygiene`、`ensure_closing_keyword` 追加等）が必要な場合も、reviewer は
+`required_auto_actions` として自己申告せず、具体的な内容を `blockers[]`/`warnings[]` に記載する。
+control-plane はその記述を読み、`REQUEST_CHANGES` として `continue_loop` 経路で次イテレーションへ回すか、
+機械的に修正可能と判断した場合のみ `implementation-worker` の該当 mode（`ensure_closing_keyword` /
+`update_pr_body_hygiene`）に委譲する。これらの body-only 対応は head SHA を変えないため、`update_branch`
+と異なり verification の再実行は不要で、PR review のみ再実行する。required_auto_actions が非空
+（reviewer が blockers に記載した状態）の間は `route_loop_verdict_v2()` が `approved` を返さない
+（`verdict == APPROVE` かつ `blockers` 非空は `fail_closed` になるため）。
 
-`required_auto_actions` は **YAML array of objects** として parse する（string-list 扱いは禁止）。
+### worker_status_result_routing（`implementation-worker` 結果の routing）
 
-`required_auto_actions` が空でない場合の routing テーブル:
+`implementation-worker` へ `update_branch` action（またはその他の機械的修正）を委譲した結果の `status` は
+以下の table で分岐する:
 
 ```yaml
-required_auto_action_result_routing:
-  update_pr_body_hygiene:
-    head_change_expected: false
-    rerun:
-      verification: false
-      pr_review: true
-  ensure_closing_keyword:
-    head_change_expected: false
-    rerun:
-      verification: false
-      pr_review: true
-  update_branch:
-    head_change_expected: true
-    rerun:
-      verification: true
-      pr_review: true
+worker_status_result_routing:
   worker_status_failed:
     route: human_escalation
   worker_status_blocked:
@@ -78,54 +70,9 @@ required_auto_action_result_routing:
     route: human_escalation
     note: "タイムアウト"
   worker_status_ok_rerun_required_true:
-    route: "rerun verification and pr_review（head 変更有無に依存）"
+    route: "rerun verification and pr_review"
     note: "ok でも rerun_required: true の場合は即終了しない"
 ```
-
-### required_auto_actions_schema（object parse 仕様）
-
-各 action object の必須フィールドと unknown 時の routing:
-
-```yaml
-required_auto_actions_schema:
-  type: array-of-objects
-  item_schema:
-    kind:
-      allowed_values:
-        - update_branch
-        - update_pr_body_hygiene
-        - ensure_closing_keyword
-    executor:
-      allowed_values:
-        - implementation-worker
-    skill: "<skill name>"
-    blocking_merge_ready:
-      allowed_values: [true, false]
-    expected_head_sha: "<SHA> (required when kind == update_branch)"
-  unknown_kind_route: human_escalation
-  unknown_executor_route: human_escalation
-  missing_expected_head_sha_for_update_branch: human_escalation
-  blocking_merge_ready_not_true_route: human_escalation
-```
-
-`unknown kind` / `unknown executor` / `unknown skill` / `blocking_merge_ready != true` / `update_branch` で `expected_head_sha` 欠落のいずれかに該当する場合は `human_escalation` として停止する。
-
-### 処理手順
-
-1. `required_auto_actions` の各 action を `implementation-worker` に委譲する（child-4 / #631 で実装予定の mode を使用）
-2. worker result の `status` で分岐する:
-   - `failed` / `blocked` / `permission_blocked` → `termination_reason: human_escalation` で停止
-   - `ok` → `head_change_expected` に応じて verification / PR review を再実行
-3. body-only actions（`update_pr_body_hygiene` / `ensure_closing_keyword`）は head SHA 不変のため verification は省略し、PR review のみ再実行する
-4. `update_branch` は head SHA が変化するため verification と PR review の両方を再実行する
-5. `reviewed_head_sha` が現在 head と不一致の場合、dispatch 前に PR review を再実行する
-6. 再実行後に得られた新 LOOP_VERDICT で再度 APPROVE gate を評価する
-
-### docs-only mode 制約（child-4 / #631 OPEN 中）
-
-child-4（#631）が OPEN の間、`implementation-worker` への dispatch 実行コードは追加しない。
-本ドキュメントは **docs-only mode** として routing ロジックを記述するにとどめる。
-実際の dispatch は #631 完了後に実装する。
 
 ## branch publish の deterministic retry / safety stop（決定的な再試行と安全停止）
 
@@ -166,40 +113,31 @@ PUBLISH_LANE_DECISION_V1:
   postcondition: "remote branch head == local_head"
 ```
 
-## merge_ready 要件
+## live mergeability の routing 分類（Issue #1873: merge_ready 自己申告を廃止）
 
-`merge_ready: true` は `merge_state_status == CLEAN` の場合のみ認める:
+`merge_ready` は reviewer_verdict の一部として受け取らない。live mergeability
+（`gh pr view` の `mergeable` / `merge_state_status`）から `route_loop_verdict_v2()` が
+直接分類する。分類の詳細と根拠は `route_loop_verdict_v2.py` の `_APPROVABLE_STATUSES` /
+`_HUMAN_JUDGMENT_STATUSES` / `_CONFLICT_STATUSES` を正本とする:
 
-| merge_state_status | merge_ready | github_merge_ready | 備考 |
-|---|---|---|---|
-| `CLEAN` | `true` | `true` | |
-| `DRAFT` | `false` | `false` | Draft PR は人間が ready にする |
-| `HAS_HOOKS` | `true` | `true` | merge hooks があるが merge 可能 |
-| `UNSTABLE` | `false` | 人間判断 | branch protection テスト失敗の可能性 |
-| `BEHIND` | `false` | — | `step-5-mergeability-handling.md` の BEHIND 分岐参照 |
-| `BLOCKED` | `false` | 人間判断 | branch protection 設定待ち |
-| `DIRTY` / `CONFLICTING` | `false` | — | CONFLICTING PR Escalation Runbook 発動 |
-| `UNKNOWN` | `false` | — | 5 秒待機 × 最大 3 回 retry 後も UNKNOWN なら `human_escalation` |
+| merge_state_status | route（`mergeable: MERGEABLE` 前提） | 備考 |
+|---|---|---|
+| `CLEAN` | `approved` | |
+| `HAS_HOOKS` | `approved` | merge hooks があるが merge 可能 |
+| `DRAFT` | `route_human_escalation` | Draft PR は人間が ready にする |
+| `UNSTABLE` | `route_human_escalation` | branch protection テスト失敗の可能性 |
+| `BLOCKED` | `route_human_escalation` | branch protection 設定待ち |
+| `BEHIND` | `route_to_update_branch` | `step-5-mergeability-handling.md` の BEHIND 分岐参照 |
+| `DIRTY` / `CONFLICTING`（または `mergeable: CONFLICTING`） | `route_conflict_escalation` | CONFLICTING PR Escalation Runbook 発動 |
+| `UNKNOWN`（`mergeable` または `merge_state_status`） | `fail_closed`（`mergeability_unknown`） | 5 秒待機 × 最大 3 回 retry 後も UNKNOWN なら `human_escalation` |
 
-`UNSTABLE` は branch protection でのテスト失敗を示す場合があり、自動的に `merge_ready: true` とは見なさない。
+`UNSTABLE` は branch protection でのテスト失敗を示す場合があり、自動的に `approved` とはならない。
 
-### draft_pr_ready と github_merge_ready の区別
+### draft_pr_ready
 
-`IMPL_REVIEW_LOOP_RESULT_V1` では以下の 2 フィールドを分離して記録する:
-
-- `draft_pr_ready: true` = protocol contract が満たされた状態（LOOP_VERDICT が APPROVE かつ全 gate pass）
-- `github_merge_ready: true` = GitHub 側で実際に merge 可能な状態（`merge_state_status` が `CLEAN` または `HAS_HOOKS`）
-
-Draft PR（`merge_state_status == DRAFT`）の場合:
-
-```yaml
-IMPL_REVIEW_LOOP_RESULT_V1:
-  status: draft_pr_ready
-  draft_pr_ready: true
-  github_merge_ready: false  # Draft PR のため
-  github_merge_state_status: DRAFT
-  human_next_action: mark_ready_for_review_or_merge
-```
+`IMPL_REVIEW_LOOP_RESULT_V1.status: draft_pr_ready` はループの終端ステータス（PR を人間マージ判断のまま
+残す）であり、GitHub の Draft PR フラグとは別概念。`route: route_human_escalation`（`merge_state_status: DRAFT`
+を含む）の場合はループを終了せず人間判断を仰ぐ。
 
 ## REQUEST_CHANGES 時の fix_delta 構築
 
@@ -234,7 +172,6 @@ fix_delta:
 #     schema_version: 1
 #     status: draft_pr_ready
 #     termination_reason: approved
-#     merge_ready: true
 #     pr_url: "https://github.com/..."
 #   ```
 #
@@ -268,8 +205,7 @@ gh issue comment <issue_number> --body "## impl-review-loop: 完了 ($(date -u +
 
 - iteration: <最終 iteration 数>
 - verdict: APPROVE
-- merge_ready: true
-- required_auto_actions: []
+- route: approved
 - PR: <PR URL>
 - 次アクション: 人間レビュー → マージ → post-merge-cleanup
 
@@ -277,13 +213,11 @@ gh issue comment <issue_number> --body "## impl-review-loop: 完了 ($(date -u +
 IMPL_REVIEW_LOOP_RESULT_V1:
   schema_version: 1
   status: draft_pr_ready
-  merge_ready: true
   pr_url: \"<PR URL>\"
   head_sha: \"<HEAD SHA>\"
   issue_number: <ISSUE NUMBER>
   termination_reason: approved
   iteration: <最終 iteration 数>
-  required_auto_actions: []
 
 FOLLOW_UP_MATERIALIZATION_RESULT_V1:
   schema_version: 1
@@ -316,7 +250,18 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
 
 ### APPROVE 時の follow-up Issue 自動起票
 
-`LOOP_VERDICT.follow_up_issue_requests` が空でない場合、main thread は APPROVE 確定直後に各リクエストを `issue-author` SubAgent に委譲して `create-issue` 経由で **即時自動起票** する。
+Issue #1873 以降、follow-up Issue 提案は `LOOP_VERDICT.follow_up_issue_requests` という専用構造化フィールドでは
+受け渡さない。pr-reviewer は follow-up 候補を `reviewer_verdict.warnings[]`（non-blocker の場合）または
+`blockers[]`（APPROVE を妨げる場合）のテキストとして記載する。control-plane（main thread）はその
+テキストを読み、以下の優先度で判断する:
+
+- APPROVE を妨げない改善提案として明記されたテキストで、独立した follow-up Issue 化が妥当と main thread が
+  判断したもの → APPROVE 確定後に `issue-author` SubAgent に委譲して `create-issue` 経由で起票する
+- APPROVE 前に materialize が必須と reviewer が明記したもの（`severity: mandatory_follow_up` 相当の記述）
+  → APPROVE 確定**前**に create/reuse する。未 materialize の状態で APPROVE してはならない
+- 単なる観察・記録のみでよいもの → 終了報告コメントの本文に記載するのみで起票しない
+
+新規の構造化 schema field（`follow_up_issue_requests[]` 相当）は追加しない（AC13）。
 
 **mandatory_follow_up の処理タイミング**: `severity: mandatory_follow_up` のリクエストは APPROVE 確定**前**に create/reuse する。未 materialize の状態で APPROVE してはならない。
 
@@ -332,7 +277,7 @@ linked issue の parent が `parent_mode: delivery-rollup` の場合、APPROVE �
    ```
 
 2. `CHILD_MATERIALIZATION_PLAN_V2.children` に `action: create_issue` のエントリがある場合:
-   - 各エントリを `severity: mandatory_follow_up` の `FOLLOW_UP_ISSUE_REQUEST_V1` として `LOOP_VERDICT.follow_up_issue_requests` に追加する
+   - 各エントリを `severity: mandatory_follow_up` の候補として main thread が in-memory で保持する follow-up 候補リストに追加する（`FOLLOW_UP_ISSUE_REQUEST_V1` 形式の値は使うが、reviewer_verdict の schema field としては受け渡さない）
    - dedupe_key は `CHILD_MATERIALIZATION_PLAN_V2.children[*].dedupe_key` を使用する
 
 3. `action: reuse_and_update_parent` のエントリがある場合:
@@ -343,10 +288,13 @@ linked issue の parent が `parent_mode: delivery-rollup` の場合、APPROVE �
 
 スキーマ: `CHILD_MATERIALIZATION_PLAN_V2` の正本は `docs/dev/agent-skill-boundaries.md` を参照。
 
-pr-review-judge が `LOOP_VERDICT` の `follow_up_issue_requests` フィールドに格納した non-blocker NOTE（任意改善提案・観察事項）が起票対象となる。詳細スキーマは `docs/dev/agent-skill-boundaries.md` の `FOLLOW_UP_ISSUE_REQUEST_V1` を参照。
+pr-reviewer が `reviewer_verdict.warnings[]`（non-blocker の改善提案・観察事項）に記載したテキストから
+main thread が follow-up 候補を抽出する場合も、上記と同じ in-memory リストに追加する
+（構造化 field としては受け渡さない。値の形は参考として `docs/dev/agent-skill-boundaries.md` の
+`FOLLOW_UP_ISSUE_REQUEST_V1` を流用してよい）。
 
 ```
-for each req in LOOP_VERDICT.follow_up_issue_requests:
+for each req in <main thread が保持する follow-up 候補リスト>:
   - severity: mandatory_follow_up → APPROVE 前に必ず起票（dedupe_key チェック後）
   - severity: optional_follow_up → APPROVE 後に dedupe_key チェック後、重複なければ起票
   - severity: note_only → 起票せず、終了報告コメントの note_only_observations に記録
@@ -476,8 +424,7 @@ LOOP_STATE:
   iteration: <最終 iteration 数>
   last_step: judgment
   termination_reason: approved | max_iterations | human_escalation
-  merge_ready: true | false | null
-  required_auto_actions: []
+  last_route: approved | continue_loop | route_to_update_branch | route_stale_head_rereview | route_human_escalation | route_conflict_escalation | fail_closed | null
   scope_rollup_decision: <ISSUE_SCOPE_ROLLUP_DECISION_V2>
 ```
 

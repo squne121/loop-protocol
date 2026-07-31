@@ -54,23 +54,20 @@ Step 4 では verdict 判定前に `wait_ci_checks.sh` を使って required che
 
 ## 期待する出力
 
-pr-reviewer は判定結果（verdict 本文 + `verdict`/`merge_ready`/`reviewed_head_sha`）を呼び出し元（control-plane）へ返す。pr-reviewer は Write/Edit を持たず JSON を自ら組み立てられないため、実際の投稿は control-plane が本文を artifact パスへ書き込み、controlled review publisher を render mode （`--render-body-file` / `--verdict` / `--reviewed-head-sha` / `--expected-head-sha`、`pr_review.publish` command id、Issue #1536 Option C / Issue #1539 fix_delta Blocker 1）で起動して委譲する。呼び出し例: `controlled_skill_mutation_exec.py --command-id pr_review.publish --issue-number <紐づく Issue 番号> --pr-number <PR番号> --repo <owner>/<repo> ...`。`--issue-number`（紐づく Issue）と `--pr-number`（レビュー対象の PR）は独立した識別子であり一致しない場合がある（例: Issue #1688 に対する PR #1818、Issue #1822）。pr-reviewer 自身は生の `gh pr review` を呼ばない。publisher が投稿する verdict コメントには `LOOP_VERDICT_V2` fenced YAML を含める。
+pr-reviewer は判定結果（verdict 本文 + `verdict` / `reviewed_head_sha` / `blockers` / `warnings` の最小 convention、Issue #1873）を呼び出し元（control-plane）へ返す。`merge_ready` / `mergeability` / `required_auto_actions` / `allowed_paths_gate` は pr-reviewer の自己申告として受け取らない。mergeability（`mergeable` / `merge_state_status`）は control-plane が `gh pr view --json headRefOid,mergeable,mergeStateStatus` で都度直接取得し、`route_loop_verdict_v2()` の `live_mergeability` 引数として渡す（`step-5-mergeability-handling.md` 参照）。
+
+pr-reviewer は Write/Edit を持たないため、監査用の verdict コメント投稿は control-plane が通常の `gh pr comment --body-file` で行う（専用 semantic publisher は使用しない）。投稿する verdict コメント本文には人間可読の判定根拠（Mergeability / Evidence Check / Blockers / Non-blockers）を書き、以下の最小 YAML ブロックを併記する:
 
 ```yaml
-LOOP_VERDICT_V2:
-  verdict: APPROVE | REQUEST_CHANGES
-  reviewed_head_sha: <SHA>
-  merge_ready: true | false
-  mergeability:
-    mergeable: MERGEABLE | CONFLICTING | UNKNOWN
-    merge_state_status: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
-  blockers: []
-  required_auto_actions: []
-  auto_fix_applied: []
-  follow_up_issue_requests: []
+verdict: APPROVE | REQUEST_CHANGES | HUMAN_REVIEW_REQUIRED
+reviewed_head_sha: <SHA>
+blockers: []
+warnings: []
 ```
 
-LOOP_VERDICT_V2 の解析は `step-5-mergeability-handling.md` を canonical とする。
+投稿前後に `gh pr view --json headRefOid` で head をリードバックし、投稿後に head が変化していた場合は stale note として扱い fresh review を実行する（Safety Invariants）。pr-reviewer 自身は生の `gh pr review` を呼ばない。
+
+`route_loop_verdict_v2()` によるルーティングの詳細は `step-5-mergeability-handling.md` を canonical とする。
 
 ## reviewed_head_sha 整合チェック
 

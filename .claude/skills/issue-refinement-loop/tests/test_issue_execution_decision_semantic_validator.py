@@ -78,7 +78,7 @@ def _valid_decision() -> dict:
 
 
 def test_given_valid_decision_when_validated_then_no_violations():
-    assert prl.validate_issue_execution_decision(_valid_decision()) == []
+    assert vied.validate_issue_execution_decision(_valid_decision()) == []
 
 
 def test_given_selected_state_with_no_predecessors_then_valid():
@@ -91,34 +91,34 @@ def test_given_selected_state_with_no_predecessors_then_valid():
         "defer_reason": None,
     }
     decision["identity"]["collection_digest"] = _recompute_digest(decision)
-    assert prl.validate_issue_execution_decision(decision) == []
+    assert vied.validate_issue_execution_decision(decision) == []
 
 
 def test_self_edge_rejected():
     decision = _valid_decision()
     decision["relations"][0]["target_issue_number"] = 1  # source == target
-    violations = prl.validate_issue_execution_decision(decision)
+    violations = vied.validate_issue_execution_decision(decision)
     assert any("self_edge" in v for v in violations)
 
 
 def test_unknown_endpoint_rejected():
     decision = _valid_decision()
     decision["relations"][0]["target_issue_number"] = 999  # not in nodes
-    violations = prl.validate_issue_execution_decision(decision)
+    violations = vied.validate_issue_execution_decision(decision)
     assert any("unknown_endpoint" in v for v in violations)
 
 
 def test_duplicate_relation_rejected():
     decision = _valid_decision()
     decision["relations"] = decision["relations"] * 2
-    violations = prl.validate_issue_execution_decision(decision)
+    violations = vied.validate_issue_execution_decision(decision)
     assert "duplicate_relation" in violations
 
 
 def test_duplicate_node_rejected():
     decision = _valid_decision()
     decision["nodes"] = decision["nodes"] + [{"issue_number": 2, "body_sha256": SHA}]
-    violations = prl.validate_issue_execution_decision(decision)
+    violations = vied.validate_issue_execution_decision(decision)
     assert "duplicate_node" in violations
 
 
@@ -132,7 +132,7 @@ def test_conflicting_parallel_edge_rejected():
             "evidence": ["conflict"],
         }
     )
-    violations = prl.validate_issue_execution_decision(decision)
+    violations = vied.validate_issue_execution_decision(decision)
     assert any("conflicting_parallel_edge" in v for v in violations)
 
 
@@ -154,21 +154,21 @@ def test_three_node_depends_on_cycle_rejected():
         "predecessors": [2],
         "defer_reason": "cycle",
     }
-    violations = prl.validate_issue_execution_decision(decision)
+    violations = vied.validate_issue_execution_decision(decision)
     assert "depends_on_cycle" in violations
 
 
 def test_predecessors_mismatch_rejected():
     decision = _valid_decision()
     decision["execution"]["predecessors"] = [999]
-    violations = prl.validate_issue_execution_decision(decision)
+    violations = vied.validate_issue_execution_decision(decision)
     assert "predecessors_do_not_match_depends_on_edges" in violations
 
 
 def test_selected_state_with_predecessors_rejected():
     decision = _valid_decision()
     decision["execution"]["state"] = "selected"
-    violations = prl.validate_issue_execution_decision(decision)
+    violations = vied.validate_issue_execution_decision(decision)
     assert "selected_state_with_predecessors" in violations
 
 
@@ -182,14 +182,14 @@ def test_selected_state_with_incomplete_evidence_rejected():
         "defer_reason": None,
     }
     decision["completeness"]["issues_complete"] = False
-    violations = prl.validate_issue_execution_decision(decision)
+    violations = vied.validate_issue_execution_decision(decision)
     assert "selected_state_with_incomplete_evidence" in violations
 
 
 def test_blocked_state_missing_defer_reason_rejected():
     decision = _valid_decision()
     decision["execution"]["defer_reason"] = None
-    violations = prl.validate_issue_execution_decision(decision)
+    violations = vied.validate_issue_execution_decision(decision)
     assert "blocked_state_missing_defer_reason" in violations
 
 
@@ -197,7 +197,7 @@ def test_duplicate_state_without_duplicate_relation_rejected():
     decision = _valid_decision()
     decision["execution"]["state"] = "duplicate"
     decision["relations"][0]["relation_type"] = "coordinates"
-    violations = prl.validate_issue_execution_decision(decision)
+    violations = vied.validate_issue_execution_decision(decision)
     assert "duplicate_state_without_duplicate_relation" in violations
 
 
@@ -212,7 +212,7 @@ def test_unknown_relation_type_rejected():
     """
     decision = _valid_decision()
     decision["relations"][0]["relation_type"] = "absorbs"  # legacy misspelling
-    combined_violations = prl.validate_issue_execution_decision(decision)
+    combined_violations = vied.validate_issue_execution_decision(decision)
     assert combined_violations  # rejected somewhere in the chain
     semantic_violations = vied.validate_semantics(decision)
     assert any(v.startswith("unknown_relation_type") for v in semantic_violations)
@@ -222,7 +222,7 @@ def test_unknown_execution_state_rejected():
     """See test_unknown_relation_type_rejected docstring for the schema-first rationale."""
     decision = _valid_decision()
     decision["execution"]["state"] = "superseded"
-    combined_violations = prl.validate_issue_execution_decision(decision)
+    combined_violations = vied.validate_issue_execution_decision(decision)
     assert combined_violations
     semantic_violations = vied.validate_semantics(decision)
     assert any(v.startswith("unknown_execution_state") for v in semantic_violations)
@@ -231,5 +231,5 @@ def test_unknown_execution_state_rejected():
 def test_nodes_not_sorted_rejected():
     decision = _valid_decision()
     decision["nodes"] = list(reversed(decision["nodes"]))
-    violations = prl.validate_issue_execution_decision(decision)
+    violations = vied.validate_issue_execution_decision(decision)
     assert "nodes_not_sorted" in violations

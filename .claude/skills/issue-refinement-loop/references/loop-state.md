@@ -5,44 +5,19 @@ loaded_when: need to understand LOOP_STATE field semantics or routing decisions
 owner: issue-refinement-loop orchestrator
 moved_from: SKILL.md##LOOP_STATE Summary
 must_not: re-implement routing logic — use decide_next_loop_action.py
-schema: schemas/loop_state.schema.json
-note_ja: このファイルは LOOP_STATE_V1 スキーマのフィールド定義とルーティング意味論を日本語で解説する。
+note_ja: このファイルは LOOP_STATE_V1 のフィールド定義とルーティング意味論を日本語で解説する。
 ---
 
 # LOOP_STATE リファレンス
 
-`LOOP_STATE_V1` スキーマの全フィールド定義とルーティング意味論。
-正本となる機械可読スキーマは `schemas/loop_state.schema.json` である。
+`LOOP_STATE_V1` の全フィールド定義とルーティング意味論。
 
-## LOOP_STATE_V1 の構築
-
-`LOOP_STATE_V1` を planner と review の結果から構築するには `build_loop_state.py` を使う。
-**LOOP_STATE の JSON を手書きしてはならない** — スキーマ検証と provenance を保証するため builder を使うこと。
-
-```bash
-uv run python3 .claude/skills/issue-refinement-loop/scripts/build_loop_state.py \
-  --planner-result-file <REFINEMENT_LOOP_PLAN_V1 path> \
-  --review-result-file <ISSUE_REVIEW_RESULT_COMPACT_V1 path> \
-  --issue-number <N> \
-  --iteration <0-indexed> \
-  [--max-iterations <N>] \
-  [--blockers-history-file <path>] \
-  [--schema-file <path>] \
-  --out <output path>
-```
-
-builder は以下を含む `LOOP_STATE_BUILD_RESULT_V1`（stdout JSON）を出力する。
-- `status`: `ok` | `invalid`
-- `loop_state_path`: 検証済み LOOP_STATE_V1 の書き込み先
-- `loop_state_sha256`: 整合性確認用のコンテンツハッシュ
-- `errors[]`: スキーマ検証エラー（path, message, schema_path）
-- `provenance`: planner/review 入力のハッシュとソースメタデータ
-
-builder の制約:
-- `next_action` を決定しない（それは `decide_next_loop_action.py` の役割）
-- GitHub mutation（`gh` コマンド）を実行しない
-- `iter_errors()` を使い `schemas/loop_state.schema.json` に対して出力を検証する（全エラーを収集）
-- 入力はファイルパスのみ — 生の JSON 文字列は拒否される
+#1873（bounded review loops）: `schemas/loop_state.schema.json` と、それを検証する
+`build_loop_state.py` builder は撤去された。`LOOP_STATE_V1` は orchestrator が
+planner（`plan_refinement_loop.py`）と review（`issue-reviewer` SubAgent）の結果から
+直接組み立てる plain dict であり、`decide_next_loop_action.py` は `iteration` /
+`max_iterations` / `scope_signal_guard`（optional）を含む最小限の構造チェックのみ行う
+（`decide_next_loop_action.validate_loop_state()` 参照）。
 
 ## フィールド一覧
 
@@ -68,20 +43,20 @@ builder の制約:
 | `follow_up_materialization` | object | yes | follow-up issue 候補 |
 | `superseded_decision` | object | yes | 本 Issue が人間判断により supersede された場合の情報 |
 
-## Builder 入力から LOOP_STATE_V1 フィールドへのマッピング
+## orchestrator が LOOP_STATE_V1 を組み立てる際のソース
 
 | LOOP_STATE_V1 field | Source |
 |---|---|
-| `issue_number` | CLI `--issue-number`（planner/review artifact と照合検証） |
-| `iteration` | CLI `--iteration` |
-| `max_iterations` | CLI `--max-iterations`（デフォルト 3） |
+| `issue_number` | 対象 Issue 番号 |
+| `iteration` | orchestrator が管理する現在のイテレーション番号（0-indexed） |
+| `max_iterations` | 既定 3（`decide_next_loop_action.py --max-iterations` で override 可） |
 | `web_research_policy` | `REFINEMENT_LOOP_PLAN_V1.decisions.web_research_policy` |
 | `scope_signal_guard` | `REFINEMENT_LOOP_PLAN_V1.decisions.scope_signal_guard` |
 | `delivery_rollup` | `REFINEMENT_LOOP_PLAN_V1.decisions.delivery_rollup` |
 | `follow_up_materialization` | `REFINEMENT_LOOP_PLAN_V1.decisions.follow_up_materialization` |
 | `last_verdict` | `ISSUE_REVIEW_RESULT_COMPACT_V1.VERDICT` |
-| `blockers_history` | CLI `--blockers-history-file` または空配列 |
-| `termination_reason` | 常に `null`（builder は loop を終了させない） |
+| `blockers_history` | orchestrator が iteration ごとに追記する blocker 要約リスト |
+| `termination_reason` | loop 終了まで `null`（`decide_next_loop_action.py` の判定を受けて orchestrator が設定） |
 
 ## ルーティング意味論
 
@@ -118,27 +93,23 @@ Step 0（イテレーション開始前）で設定される。非 null の場�
 | `excluded_by_anchor_reframe` | シグナルが anchor comment reframe により除外された |
 | `reason_code` | planner からの詳細な理由コード |
 
-`scope_signal_guard.triggered` は **phase-sensitive** である。その意味は現在の
-`ISSUE_REFINEMENT_PHASE_STATE_V1.scope_signal_semantics.triggered_meaning` に依存する。
+`scope_signal_guard.triggered` は **呼び出しタイミングに依存する**。#1873 で
+`ISSUE_REFINEMENT_PHASE_STATE_V1`（`build_refinement_phase_state.py` が生成する
+formal phase-gate）は撤去された — 代わりに orchestrator 自身が SKILL.md の Step
+順序（フロー構造そのもの）に従って `decide_next_loop_action.py` を呼ぶタイミングを
+制御する。
 
-| phase | triggered_meaning | hard_stop_eligible | effect |
-|---|---|---|---|
-| `preflight` | `continue_investigation` | false | preflight 中のシグナル → investigation/review へ進む。`decide_next_loop_action.py` を呼ばない |
-| `investigation` | `continue_investigation` | false | investigation 中のシグナル → 継続。hard stop ではない |
-| `review` | `continue_investigation` | false | rewrite 前 phase。`decide_next_loop_action.py` を呼ばず、VERDICT に基づき直接ルーティングする |
-| `post_rewrite_check` | `hard_stop_candidate` | true | rewrite 後のシグナル → `human_escalation` |
-| `decide_next_action` | `hard_stop_candidate` | true | routing phase 中のシグナル → `human_escalation` |
-| `rewrite` | `ignored` | false | rewrite 中のシグナル → 無視 |
-| `publish` / `terminate` | `ignored` | false | publish/terminate 中のシグナル → 無視 |
+| フロー上の位置 | `decide_next_loop_action.py` を呼ぶか | effect |
+|---|---|---|
+| preflight / investigation | 呼ばない | シグナルは investigation/review へ進む合図として扱われるのみ |
+| review（rewrite 前） | 呼ばない | VERDICT に基づき直接ルーティングする |
+| rewrite 後 / next-action 決定時 | 呼ぶ | `scope_signal_guard.triggered == true` かつ `excluded_by_anchor_reframe == false` の場合、`decide_next_loop_action.py` は無条件で `human_escalation` を返す（`decide_next_action()` Priority 3） |
+| rewrite / publish / terminate 中 | 呼ばない | シグナルは無視される |
 
-**Phase contract**: `LOOP_STATE_V1` は `phase` フィールドを持たない。phase は
-`ISSUE_REFINEMENT_PHASE_STATE_V1`（`build_refinement_phase_state.py` が生成）で別途追跡される。
-
-`triggered == true` かつ `excluded_by_anchor_reframe == false` かつ
-`hard_stop_eligible == true`（つまり phase が `post_rewrite_check` または `decide_next_action`）の場合、
-loop は `human_escalation` で停止する。`review` phase は明示的に hard-stop の対象外であり、
-`decide_next_loop_action.py` を呼ばずに `VERDICT` に基づき直接ルーティングする。シグナルの分類と
-phase-gate ルールについては `references/scope-signal-guard.md` を参照。
+`decide_next_loop_action.py` は呼ばれた時点で常に scope_signal_guard の hard-stop
+判定を行う（呼び出しタイミングを制御するのは orchestrator の責務であり、スクリプト
+自身は phase 概念を持たない）。シグナルの分類ルールについては
+`references/scope-signal-guard.md` を参照。
 
 ### delivery_rollup（配送 rollup）
 
@@ -164,13 +135,15 @@ phase-gate ルールについては `references/scope-signal-guard.md` を参照
 ## 次アクション決定スクリプト（Next Action Script）
 
 現在の LOOP_STATE から次のアクションを計算するには `decide_next_loop_action.py` を使う。
-**Phase gate**: routing が許可されている phase では常に `--phase-state-file` を渡すこと。
-`preflight` と `investigation` の phase では `decide_next_loop_action.py` を呼ばないこと。
+`preflight` と `investigation`、および `review`（rewrite 前）の間は orchestrator が
+`decide_next_loop_action.py` を呼ばないこと（上記の「フロー上の位置」表を参照）。
+#1873 で `--phase-state-file` オプションと ISSUE_REFINEMENT_PHASE_STATE_V1 phase-gate
+は撤去された — タイミング制御は orchestrator（SKILL.md の Step 順序）の責務である。
 
 **Registry id（レジストリID）**: `decide.run` (ISSUE_REFINEMENT_COMMAND_REGISTRY_V1)
 
 ```json
-{"id":"decide.run","argv":["uv","run","python3",".claude/skills/issue-refinement-loop/scripts/decide_next_loop_action.py","--loop-state-file","<path>","--review-result-verdict","<verdict>","--max-iterations","<N>","--phase-state-file","<phase_path>"],"shell":false,"cwd_policy":"repo_root"}
+{"id":"decide.run","argv":["uv","run","python3",".claude/skills/issue-refinement-loop/scripts/decide_next_loop_action.py","--loop-state-file","<path>","--review-result-verdict","<verdict>","--max-iterations","<N>"],"shell":false,"cwd_policy":"repo_root"}
 ```
 
 Exit codes:
@@ -181,99 +154,13 @@ Exit codes:
 
 優先順位: `inconsistent_state (3)` > `human_escalation (2)` > `warn (1)` > `pass (0)`。
 
-## Phase State の生成
+## scope_signal_guard_decision_v2（#1090 サイドカー）
 
-`ISSUE_REFINEMENT_PHASE_STATE_V1` を生成するには `build_refinement_phase_state.py` を使う。
-
-**Registry id（レジストリID）**: `phase_state.build` (ISSUE_REFINEMENT_COMMAND_REGISTRY_V1)
-
-```json
-{"id":"phase_state.build","argv":["uv","run","python3",".claude/skills/issue-refinement-loop/scripts/build_refinement_phase_state.py","--phase","<phase_name>","--source-kind","<kind>","--source-path","<artifact_path>","--output-path","<output_path>"],"shell":false,"cwd_policy":"repo_root"}
-```
-
-生成された `ISSUE_REFINEMENT_PHASE_STATE_V1` は `scope_signal_semantics.hard_stop_eligible` を含み、
-これが現在の phase で `scope_signal_guard.triggered` が hard stop になるかどうかを決定する。
-
-
-## REVIEWER_CLAIM_REPLAY_STATE_V2（Step 2a の連続 unbacked 判定用 state, #1515）
-
-**この state は `LOOP_STATE_V1`（`schemas/loop_state.schema.json`）とは独立した、session-scoped な別 state であり、`LOOP_STATE_V1` へ統合しない（#1504 の比較検討で不採用、#1515 Out of Scope）。**
-
-`issue-reviewer` SubAgent の Step 2a arbitration（`reviewer_claim_replay.py`）が使う consecutive-unbacked state は、呼び出しごとに破棄される isolation worktree ではなく `issue-refinement-loop` orchestrator が所有する。orchestrator は `reviewer_claim_replay_state_store.py`（`.claude/skills/issue-refinement-loop/scripts/`）を唯一の writer として使い、`issue-reviewer` SubAgent は state file への直接書き込みを一切行わない。
-
-### state_contract
-
-```yaml
-state_contract:
-  owner: orchestrator
-  scope: refinement_session
-  identity_key:
-    - repository_full_name
-    - issue_number
-    - refinement_session_id
-    - body_sha256
-    - normalized_kind
-    - reviewer_blocker_code
-  concurrency_policy: single_writer (lock file による検出。O_CREAT|O_EXCL、待機/リトライなし)
-  write_policy: atomic_replace (同一ディレクトリの一時ファイル + fsync + os.replace)
-  symlink_policy: reject（state path・一時ファイル path 双方）
-  corrupt_state_policy: fail_closed（`status: corrupt` を返し黙って fresh state 扱いしない）
-  retention_policy: delete_on_loop_termination
-```
-
-### read → invoke → write フロー
-
-1. **read**（`issue-reviewer` SubAgent 起動前）:
-   ```bash
-   uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/reviewer_claim_replay_state_store.py      --read --state-dir .claude/artifacts/issue-refinement-loop/<issue_number>      --repository-full-name <owner/repo> --issue-number <N> --refinement-session-id <session_id>
-   ```
-   `status: ok` の `state`（`reset_reason` があれば空オブジェクト）を SubAgent の prompt へ `previous_state` として渡す。`status: corrupt` は `human_judgment_required` へ倒す。
-2. **invoke**: `issue-reviewer` SubAgent は `reviewer_claim_replay.py` を実行せず、bounded な `REVIEWER_BLOCKER_CLAIM_V1` claim のみを stdout に返す（Issue #1532 以降。V1 の `--previous-state-inline` co-located 実行はこの経路では使われない — 直接 `analyze()` を呼ぶ pure function としての `--previous-state-inline` CLI 引数自体は後方互換のため残る）。
-3. **write は V2 経路（下記）のみ**: raw child claim から state を直接 `--write` する経路は Issue #1532 で廃止された。`--write`（`--write-v2` を使わない生の CLI）は legacy pure-function 用途のみに残る。
-
-`refinement_session_id` は orchestrator が loop 開始時（Step 0f 相当）に一度だけ生成し、loop 全体（複数 iteration）で使い回す。loop が終了（`approved` / `needs_second_pass` / `human_escalation` いずれか）したら、orchestrator は `.claude/artifacts/issue-refinement-loop/<issue_number>/reviewer_claim_replay_state.json` を削除する（retention_policy: delete_on_loop_termination）。
-
-identity（`repository_full_name`/`issue_number`/`refinement_session_id`/`body_sha256`）のいずれかが不一致の場合、state store は空 state（`reset_reason` 付き）を返す。これはエラーではなく、fresh session として consecutive count を 1 から数え直すための正常系である。
-
-### read → invoke → bind → validate → write-v2 フロー（親ローカル replay 整合性束縛, Issue #1532）
-
-Step 2a の唯一の state 永続化経路は V2 である。read の後、invoke と write の間に以下を挿む（これは producer identity・署名・鍵管理・supply-chain provenance の証明ではない — parent が自ら再計算した replay の整合性束縛にすぎない）:
-
-1. **parent replay**: orchestrator が `parent_replay_binding.py` に自ら取得・保存・readback した `readiness_result` / `vc_syntax_result` / `vc_preflight_result` / `previous_state` / 現在の Issue body raw bytes snapshot / identity と、strict schema 検証済みの child `REVIEWER_BLOCKER_CLAIM_V1` を渡し、`PARENT_REPLAY_BINDING_ARTIFACT_V1`（`replay_next_state` + `binding_digest`）を得る。child の raw artifact ファイルは読まない。`findings`/`checker_evidence`/`deterministic_checks` を含む claim は fail-closed に拒否される。
-2. **V2 envelope 組み立て**: orchestrator が child の claim envelope に `PARENT_REPLAY_VERDICT` / `PARENT_REPLAY_ROUTING` / `PARENT_REPLAY_SHOULD_CONSUME` / `PARENT_REPLAY_BODY_SHA256` / `PARENT_REPLAY_NEXT_STATE`（canonical 1 行 JSON）/ `PARENT_REPLAY_BINDING_DIGEST` の 6 行を追記する。
-3. **V2 validate**: `validate_review_compact_output.py --v2`（`--binding-artifact-file` に step 1 の artifact、`--repository-full-name` / `--refinement-session-id` / `--iteration-id` / `--current-body-file` すべて必須）が binding artifact の strict schema・digest 再計算・identity/body 照合と、envelope の全 `PARENT_REPLAY_*` フィールドを exact 照合する。不一致・binding artifact 不在は `human_judgment_required`。
-4. **write-v2**（`validation_status: valid` の場合のみ）:
-   ```bash
-   uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/reviewer_claim_replay_state_store.py \
-     --write-v2 --state-dir .claude/artifacts/issue-refinement-loop/<issue_number> \
-     --repository-full-name <owner/repo> --issue-number <N> --refinement-session-id <session_id> \
-     --validation-result-v2-inline '<REVIEW_COMPACT_VALIDATION_RESULT_V2 の JSON>' \
-     --expected-parent-binding-digest '<step 1 の binding_digest>'
-   ```
-   `write_state_v2_from_validated_payload()` は `schema == REVIEW_COMPACT_VALIDATION_RESULT_V2` / `schema_version == "2"` / `envelope_kind == needs_fix_v2` / `violations == []` / `validation_status: valid` / identity をすべて自ら再検証したうえでのみ `PARENT_REPLAY_NEXT_STATE` を永続化する。caller が組み立てた `{"validation_status": "valid", ...}` のみの偽装 payload は拒否される（state file を一切更新せず `status: rejected` を返す）。
-
-## scope_signal_guard_decision_v2（build_loop_state.py の envelope pass-through 拡張フィールド, #1090）
-
-`build_loop_state.py` は `plan['scope_signal_guard_decision_v2']`（#1090, opt-in。
-`references/scope-signal-guard.md` 参照）が存在する場合、それをそのまま
-`LOOP_STATE_BUILD_RESULT_V1.scope_signal_guard_decision_v2` として CLI 出力 envelope に含める。
-
-**`LOOP_STATE_V1` 本体（`loop_state.schema.json` で検証される部分）には含めない。**
-`schemas/loop_state.schema.json` は本 Issue の Allowed Paths 外であり、
-`additionalProperties: false` の既存スキーマを変更せずに lane 情報を surfaces する必要があるため、
-`_make_build_result()` が構築する CLI envelope 側にのみ追加する（`LOOP_STATE_BUILD_RESULT_V1` は
-jsonschema 検証対象外）。`build_loop_state()` 関数の戻り値は
-`(loop_state, blocked_reasons, scope_signal_guard_decision_v2)` の 3-tuple になる。
+`scope_signal_guard_decision_v2`（#1090, opt-in。`references/scope-signal-guard.md`
+参照）は `LOOP_STATE_V1` 本体には含めない。`decide_next_loop_action.py` に
+`--scope-signal-guard-decision-v2-file` / `--scope-signal-guard-decision-v2-json`
+として別引数で直接渡す（#1873: `build_loop_state.py` の envelope pass-through 経由では
+なく、orchestrator が `plan_refinement_loop.py` の出力からそのまま抽出して渡す）。
 
 `LOOP_STATE_V1.scope_signal_guard`（`triggered` / `excluded_by_anchor_reframe` / `reason_code`）の
-既存 3 フィールドの意味・値は変更しない。
-
-**envelope consumer 契約（unknown top-level field 許容）**: `LOOP_STATE_BUILD_RESULT_V1` の
-consumer は unknown top-level field を reject せず無視すること。`additionalProperties: false`
-の closed schema で envelope 全体を検証する consumer を置いてはならない（JSON Schema の
-`additionalProperties` は同一 subschema で宣言された property しか認識しないため、
-closed schema は additive 拡張と両立しない）。closed schema 検証が必要な consumer は
-v2 フィールドを読む前に該当 field を projection で取り出すこと。
-また `build_loop_state.py` の CLI stdout / artifact 書き込みは `allow_nan=False` の
-strict JSON で出力する（`NaN` / `Infinity` を含む payload は fail する。#1086 の
-strict JSON policy と整合）。
+既存 3 フィールドの意味・値はこのサイドカーの有無に関わらず変更しない。

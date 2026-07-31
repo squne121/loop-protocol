@@ -2098,7 +2098,8 @@ class TestControlledSkillMutationPolicy:
     """
 
     def test_publish_termination_direct_denied(self, tmp_git_repo: Path):
-        """AC4: direct publish_termination_report.py invocation is denied in local root.
+        """AC4: direct invocation of a non-executor publisher script is denied
+        in local root.
 
         Only the executor (controlled_skill_mutation_exec.py) is allowed.
         Direct script access goes to default:allow but is unknown class, so
@@ -2113,7 +2114,7 @@ class TestControlledSkillMutationPolicy:
         # (not a branch mutation, not compound) — but it must NOT be in the
         # deterministic_checker reason_code path.
         assert result["reason_code"] != REASON_DETERMINISTIC_CHECKER, (
-            "direct publish_termination_report.py must not be allowed as deterministic_checker"
+            "direct publisher script invocation must not be allowed as deterministic_checker"
         )
 
     def test_publish_termination_executor_allowed(self, tmp_git_repo: Path):
@@ -2129,9 +2130,9 @@ class TestControlledSkillMutationPolicy:
 
         cmd = (
             "uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py"
-            " --command-id termination_report.publish"
+            " --command-id issue_body.update"
             " --issue-number 1166"
-            " --input-file artifacts/1166/termination_report_input.json"
+            " --input-file artifacts/1166/issue-metadata/issue_body.update/issue_body_input.json"
             " --repo squne121/loop-protocol"
         )
         result = eval_in_local_root(cmd, str(tmp_git_repo))
@@ -2150,9 +2151,9 @@ class TestControlledSkillMutationPolicy:
 
         cmd = (
             "uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py"
-            " --command-id termination_report.publish"
+            " --command-id issue_body.update"
             " --issue-number 1166"
-            " --input-file artifacts/1166/termination_report_input.json"
+            " --input-file artifacts/1166/issue-metadata/issue_body.update/issue_body_input.json"
             # missing --repo
         )
         result = eval_in_local_root(cmd, str(tmp_git_repo))
@@ -2162,8 +2163,9 @@ class TestControlledSkillMutationPolicy:
         )
 
     def test_publish_termination_shared_policy_reference(self, tmp_git_repo: Path):
-        """AC17: verify local_main_branch_guard references publish_termination_report
-        via the shared controlled_skill_mutation_policy module (not a separate allowlist).
+        """AC17: verify local_main_branch_guard references the controlled skill
+        mutation executor via the shared controlled_skill_mutation_policy module
+        (not a separate allowlist).
         """
         # The guard module must import from controlled_skill_mutation_policy
         import local_main_branch_guard as lmbg

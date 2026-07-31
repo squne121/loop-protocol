@@ -125,11 +125,14 @@ prefix_rule(
 # --- the exact `uv run --locked python3` invocation prefix; extra argv,  ---
 # --- a `bash -lc` wrapper, or invocation from outside a linked issue     ---
 # --- worktree are all denied by the executor's own fail-closed checks.   ---
-# --- controlled skill mutation executor (Issue #1166 / #1284 / #1536 / ---
-# --- #1633): the ONLY authorized path for controlled remote GitHub       ---
-# --- mutation (termination_report.publish / issue_body.update /         ---
-# --- issue_comment.publish / contract_snapshot.publish / pr_review.publish).
-# --- Same shared-authority lane as .claude/settings.json's Claude-side   ---
+# --- controlled skill mutation executor (Issue #1284 / #1633; Issue      ---
+# --- #1873 removed the termination_report.publish and pr_review.publish  ---
+# --- command ids): the ONLY authorized path for controlled remote GitHub ---
+# --- mutation (issue_body.update / issue_content.update /                ---
+# --- issue_comment.publish / contract_snapshot.publish /                 ---
+# --- test_verdict.publish / issue_scope_snapshot.materialize /           ---
+# --- issue_dependency.remove). Same shared-authority lane as              ---
+# --- .claude/settings.json's Claude-side                                 ---
 # --- `Bash(uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py *)`
 # --- allow entry (docs/dev/hook-boundaries.md previously noted this      ---
 # --- Codex rule file had no matching entry -- Issue #1633 closes that    ---
@@ -141,7 +144,7 @@ prefix_rule(
 prefix_rule(
     pattern = ["uv", "run", "python3", "scripts/agent-guards/controlled_skill_mutation_exec.py"],
     decision = "allow",
-    justification = "Issue #1166/#1284/#1536/#1633: the controlled skill mutation executor is the single authorized in-process path for controlled remote GitHub mutation (issue comment/body publish, contract snapshot publish, PR review publish); its own runtime checks (command_id whitelist, repo/env binding, input-file namespace, module realpath, idempotency, postcondition) are the actual enforcement, not this static allow. Mirrors the existing Claude-side settings.json wildcard allow entry for the same executor.",
+    justification = "Issue #1284/#1633/#1873: the controlled skill mutation executor is the single authorized in-process path for controlled remote GitHub mutation (issue comment/body/content publish, contract snapshot publish, test verdict publish, issue scope snapshot materialize, issue dependency remove); its own runtime checks (command_id whitelist, repo/env binding, input-file namespace, module realpath, idempotency, postcondition) are the actual enforcement, not this static allow. Mirrors the existing Claude-side settings.json wildcard allow entry for the same executor.",
     match = [
         "uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py --command-id issue_comment.publish --issue-number 1633 --input-file artifacts/1633/issue-metadata/issue_comment.publish/issue_comment_publish_input.json --repo squne121/loop-protocol",
     ],

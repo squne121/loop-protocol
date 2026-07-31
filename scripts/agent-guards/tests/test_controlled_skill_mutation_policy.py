@@ -5,7 +5,8 @@ Tests for controlled_skill_mutation_policy.py (Issue #1166).
 Tests:
 - AC3:  CONTROLLED_SKILL_MUTATION_COMMAND_POLICY schema
 - AC4:  is_controlled_skill_mutation_exec_command shared function
-- AC8:  only termination_report.publish is in the registry
+- AC8:  only the currently-registered command ids are in the registry
+        (Issue #1873 removed termination_report.publish / pr_review.publish)
 - AC17: single source of truth (policy module, not per-guard allowlists)
 
 AC baseline for contract VC: these tests are expected to PASS after implementation.
@@ -25,12 +26,11 @@ if str(_GUARDS_DIR) not in sys.path:
 
 from controlled_skill_mutation_policy import (  # noqa: E402
     ALLOWED_WRITE_ROOTS,
-    COMMAND_ID_PUBLISH,
+    COMMAND_ID_ISSUE_COMMENT_PUBLISH,
     COMMAND_ID_TEST_VERDICT_PUBLISH,
     COMMAND_ID_ISSUE_CONTENT_UPDATE,
     COMMAND_ID_ISSUE_DEPENDENCY_REMOVE,
     COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
-    COMMAND_ID_PR_REVIEW_PUBLISH,
     CONTROLLED_SKILL_MUTATION_COMMAND_POLICY,
     ENV_SANITIZE_KEYS,
     EXECUTOR_SCRIPT,
@@ -59,10 +59,10 @@ class TestPolicySchema:
         assert isinstance(CONTROLLED_SKILL_MUTATION_COMMAND_POLICY, dict)
 
     def test_registry_has_publish_entry(self):
-        assert COMMAND_ID_PUBLISH in CONTROLLED_SKILL_MUTATION_COMMAND_POLICY
+        assert COMMAND_ID_ISSUE_COMMENT_PUBLISH in CONTROLLED_SKILL_MUTATION_COMMAND_POLICY
 
     def test_publish_entry_has_required_keys(self):
-        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_PUBLISH]
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_COMMENT_PUBLISH]
         required_keys = {
             "command_id",
             "executor_script",
@@ -75,27 +75,27 @@ class TestPolicySchema:
         assert required_keys.issubset(set(entry.keys())), f"Missing keys: {required_keys - set(entry.keys())}"
 
     def test_publish_entry_github_mutation(self):
-        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_PUBLISH]
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_COMMENT_PUBLISH]
         gm = entry["github_mutation"]
         assert gm["comment_on_issue"] is True
         assert gm["requires_repo"] == TRUSTED_REPO
         assert gm["requires_explicit_repo_flag"] is True
 
     def test_publish_entry_postcondition(self):
-        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_PUBLISH]
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_COMMENT_PUBLISH]
         pc = entry["postcondition"]
         assert pc["no_tracked_source_changes"] is True
         assert pc["no_settings_changes"] is True
         assert "artifacts/" in pc["allowed_write_roots"]
 
     def test_publish_entry_idempotency(self):
-        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_PUBLISH]
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_COMMENT_PUBLISH]
         idm = entry["idempotency"]
-        assert "termination_report_published.marker.json" in idm["marker_file_pattern"]
+        assert "issue_comment_publish.marker.json" in idm["marker_file_pattern"]
         assert idm["marker_field"] == "comment_id"
 
     def test_publish_entry_env_sanitize(self):
-        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_PUBLISH]
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_COMMENT_PUBLISH]
         sanitize = entry["env_sanitize"]
         for key in ("PYTHONPATH", "PYTHONHOME", "PUBLISH_ARTIFACT_DIR"):
             assert key in sanitize
@@ -123,7 +123,7 @@ class TestPolicySchema:
 
 
 # =============================================================================
-# AC8: only termination_report.publish is in the registry
+# AC8: only the currently-registered command ids are in the registry
 # =============================================================================
 
 
@@ -133,18 +133,16 @@ class TestRegistryScope:
     def test_only_known_command_ids(self):
         # Issue #1284 extends the shared registry with issue metadata mutation
         # command ids (issue_body.update / issue_content.update /
-        # issue_comment.publish / contract_snapshot.publish). Issue #1536 adds pr_review.publish
-        # (Option C controlled review publisher). Issue #1647 adds the
-        # dedicated receipt-bound TEST_VERDICT publisher. This scope-pin is updated
-        # deliberately as part of each Issue's explicit In Scope registry
-        # extension.
+        # issue_comment.publish / contract_snapshot.publish). Issue #1647 adds
+        # the dedicated receipt-bound TEST_VERDICT publisher. Issue #1873
+        # removes termination_report.publish and pr_review.publish. This
+        # scope-pin is updated deliberately as part of each Issue's explicit
+        # In Scope registry extension/removal.
         known_ids = {
-            COMMAND_ID_PUBLISH,
             "issue_body.update",
             COMMAND_ID_ISSUE_CONTENT_UPDATE,
             "issue_comment.publish",
             "contract_snapshot.publish",
-            "pr_review.publish",
             COMMAND_ID_TEST_VERDICT_PUBLISH,
             COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
             COMMAND_ID_ISSUE_DEPENDENCY_REMOVE,
@@ -337,7 +335,7 @@ class TestSingleSourceOfTruth:
     """AC17: verify no per-guard allowlists duplicate the executor path."""
 
     def test_executor_script_constant_matches_policy(self):
-        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_PUBLISH]
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_COMMENT_PUBLISH]
         assert entry["executor_script"] == EXECUTOR_SCRIPT
 
     def test_is_csm_exec_command_is_callable(self):
@@ -512,7 +510,7 @@ class TestIssueDependencyRemoveRegistration:
     def test_read_only_compatibility_gate_publish_entry_unchanged(self):
         """Adding issue_dependency.remove must not perturb the pre-existing
         termination_report.publish schema/dispatch/postcondition contract."""
-        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_PUBLISH]
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_COMMENT_PUBLISH]
         assert entry["executor_script"] == EXECUTOR_SCRIPT
         assert entry["idempotency"]["marker_field"] == "comment_id"
         assert entry["postcondition"]["no_tracked_source_changes"] is True
@@ -662,88 +660,4 @@ class TestIssueDependencyRemoveInputValidator:
         req["idempotency_key"] = ""
         err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
         assert "idempotency_key_invalid" in err
-
-
-
-# =============================================================================
-# Issue #1822 fix_delta AC7: --pr-number command-id/mode-specific grammar
-# =============================================================================
-
-class TestPrReviewPublishPrNumberGrammar:
-    """AC7: --pr-number is only ever valid for pr_review.publish, and only in
-    render mode (never in legacy --input-file mode, where the PR number lives
-    inside the input file's PR_REVIEW_PUBLISH_REQUEST_V1 payload instead)."""
-
-    def _render_mode_args(self, pr_number=None):
-        args = [
-            "--command-id", COMMAND_ID_PR_REVIEW_PUBLISH,
-            "--issue-number", "1822",
-            "--repo", TRUSTED_REPO,
-            "--render-body-file", "artifacts/1822/body.txt",
-            "--verdict", "APPROVE",
-            "--reviewed-head-sha", "a" * 40,
-            "--expected-head-sha", "a" * 40,
-        ]
-        if pr_number is not None:
-            args += ["--pr-number", str(pr_number)]
-        return args
-
-    def _input_file_mode_args(self, pr_number=None, command_id=COMMAND_ID_PR_REVIEW_PUBLISH):
-        args = [
-            "--command-id", command_id,
-            "--issue-number", "1822",
-            "--repo", TRUSTED_REPO,
-            "--input-file", "artifacts/1822/issue-metadata/pr_review.publish/request.json",
-        ]
-        if pr_number is not None:
-            args += ["--pr-number", str(pr_number)]
-        return args
-
-    # ── Allowed combinations ────────────────────────────────────────────────
-
-    def test_pr_review_publish_render_mode_with_pr_number_allowed(self):
-        assert _validate_executor_argv(self._render_mode_args(pr_number=1825)) is True
-
-    def test_pr_review_publish_input_file_mode_without_pr_number_allowed(self):
-        assert _validate_executor_argv(self._input_file_mode_args()) is True
-
-    # ── Rejected combinations ────────────────────────────────────────────────
-
-    def test_pr_review_publish_render_mode_without_pr_number_denied(self):
-        assert _validate_executor_argv(self._render_mode_args(pr_number=None)) is False
-
-    def test_pr_review_publish_input_file_mode_with_pr_number_denied(self):
-        assert _validate_executor_argv(
-            self._input_file_mode_args(pr_number=1825)
-        ) is False
-
-    def test_other_command_id_input_file_mode_with_pr_number_denied(self):
-        assert _validate_executor_argv(
-            self._input_file_mode_args(
-                pr_number=1825, command_id=COMMAND_ID_PUBLISH
-            )
-        ) is False
-
-    def test_other_command_id_render_mode_flags_denied(self):
-        """Even with --pr-number present (bypassing the render-mode required-flags
-        subset check), a non-pr_review.publish command-id must still be denied
-        because render mode / --pr-number / --merge-ready are pr_review.publish
-        -only surface area."""
-        args = [
-            "--command-id", COMMAND_ID_PUBLISH,
-            "--issue-number", "1822",
-            "--repo", TRUSTED_REPO,
-            "--render-body-file", "artifacts/1822/body.txt",
-            "--verdict", "APPROVE",
-            "--reviewed-head-sha", "a" * 40,
-            "--expected-head-sha", "a" * 40,
-            "--pr-number", "1825",
-        ]
-        assert _validate_executor_argv(args) is False
-
-    def test_other_command_id_merge_ready_denied(self):
-        args = self._input_file_mode_args(command_id=COMMAND_ID_PUBLISH) + [
-            "--merge-ready"
-        ]
-        assert _validate_executor_argv(args) is False
 

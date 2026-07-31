@@ -483,9 +483,10 @@ contract_patch_plan_v1:
 
 `decide_next_loop_action.py` は `scope_signal_guard_decision_v2` を **`--loop-state-file`/`--loop-state-json` とは別の
 sidecar 引数**（`--scope-signal-guard-decision-v2-file` / `--scope-signal-guard-decision-v2-json`）として受け取る。
-`loop_state.schema.json` は `additionalProperties: false` かつ `scope_signal_guard_decision_v2` を `properties` に含まないため
-（`build_loop_state.py` のコメント通り、これは LOOP_STATE_V1 の一部ではなく `LOOP_STATE_BUILD_RESULT_V1` envelope 側のフィールド）、
-本フィールドを `LOOP_STATE_V1` のトップレベル契約に追加することはしない。
+#1873: `schemas/loop_state.schema.json` と `build_loop_state.py` は撤去された。
+`scope_signal_guard_decision_v2` は元々 `LOOP_STATE_V1` 本体のフィールドではなく、
+`decide_next_loop_action.py` へ別引数で渡すサイドカーとしてのみ存在した契約であり、
+この非統合方針は撤去後も変わらない（`LOOP_STATE_V1` のトップレベル契約には追加しない）。
 
 `scope_signal_guard_decision_v2.scope_delta_authority.route.action == contract_update_required`
 （**ネストされた** `SCOPE_DELTA_AUTHORITY_V1` の `route.action` -- トップレベルの

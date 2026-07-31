@@ -80,36 +80,18 @@ uv run python3 .claude/skills/issue-refinement-loop/scripts/compact_review_resul
 
 `update_applied` は常に `false`。本 SubAgent は Issue 本文を変更しない。
 
-### needs-fix 判定時の bounded reviewer claim 出力（Issue #1532 親ローカル replay 整合性束縛）
+### needs-fix 判定時の出力（#1873: Replay Arbitration 撤去後）
 
-`VERDICT: needs-fix` の場合、本 SubAgent は `reviewer_claim_replay.py` を実行しない。Step 2a の arbitration（taxonomy 判定・routing 決定）は完全に orchestrator（parent）の責務であり、本 SubAgent はその入力となる **bounded な reviewer claim** のみを返す。
+`VERDICT: needs-fix` の場合も、本 SubAgent は approve と同一の 8 フィールド
+`ISSUE_REVIEW_RESULT_COMPACT_V1` envelope（STATUS/VERDICT/SUMMARY/BLOCKERS/
+NEXT_ACTION/MUST_READ/EVIDENCE/ARTIFACT）のみを返す。`reviewer_claim_replay.py`
+は実行しない。
 
-`compact_review_result.py` が needs-fix 判定時に stdout へ追記する `REVIEWER_BLOCKER_CLAIM` フィールドは、本 SubAgent が独自に組み立てるものではなく、決定論的スクリプト（`compact_review_result.py`）が機械的に構成する（Issue #1554）: `raw_result.structured_blockers` が非空の場合は structured_blockers の code / message を優先して使用し（code フィールド・message フィールド）、`structured_blockers` が空配列の場合のみ `blocking_issues`（人間可読 prose）へフォールバックする。
-
-```text
-REVIEWER_BLOCKER_CLAIM: {"schema":"REVIEWER_BLOCKER_CLAIM_V1","body_sha256":"sha256:<hex>","blockers":[{"reviewer_blocker_code":"<code>","message":"<msg>|null","line_start":<int>|null,"line_end":<int>|null}]}
-```
-
-`REVIEWER_BLOCKER_CLAIM_V1` は以下のフィールドのみを許可する（`additionalProperties: false` で fail-closed 拒否される）。**`findings` / `checker_evidence` / `deterministic_checks` / readiness 結果を含めてはならない** — Step 2a の deterministic backing 判定は orchestrator が自ら取得した readiness/vc-preflight/vc-syntax evidence のみから導出され、本 SubAgent が「これは決定論的に確定している」と自己申告することはできない（Issue #1532 Blocker 1）。
-
-```yaml
-REVIEWER_BLOCKER_CLAIM_V1:
-  schema: REVIEWER_BLOCKER_CLAIM_V1
-  body_sha256: <sha256>
-  blockers:
-    - reviewer_blocker_code: <string>
-      message: <string|null>
-      line_start: <int|null>
-      line_end: <int|null>
-```
-
-**Provenance boundary（Issue #1532）**: `REVIEWER_BLOCKER_CLAIM` は本 SubAgent が isolation worktree 内で持つ入力から機械的に構成された bounded claim に過ぎない。orchestrator はこの claim を replay の正しさの根拠として直接信用してはならない。orchestrator（parent）は `parent_replay_binding.py` を使い、自ら取得・保存・readback した parent-owned inventory（readiness_result / vc_syntax_result / vc_preflight_result / 現在の Issue body の raw bytes snapshot）と、strict schema 検証済みの本 claim を入力として独立に `reviewer_claim_replay.analyze()` を再実行し、`PARENT_REPLAY_VERDICT` / `PARENT_REPLAY_ROUTING` / `PARENT_REPLAY_SHOULD_CONSUME` / `PARENT_REPLAY_BODY_SHA256` / `PARENT_REPLAY_NEXT_STATE` / `PARENT_REPLAY_BINDING_DIGEST` の 6 フィールドを自ら計算して `ISSUE_REVIEW_RESULT_COMPACT_V2` に追記する。**本 SubAgent 自身が `PARENT_REPLAY_*` を計算・出力することは一切ない**（parent-only fields）。
-
-これは producer identity・署名・鍵管理・supply-chain provenance の証明（attestation）ではない。同一 OS UID の child プロセスに対するそれらの保証は本 Issue の対象外（Safety Claim Matrix 対象外）。
-
-`VERDICT: approve` の場合は `REVIEWER_BLOCKER_CLAIM` フィールドを stdout に含めない。
-
-`REVIEWER_BLOCKER_CLAIM` フィールドも `ISSUE_REVIEW_RESULT_COMPACT_V1` stdout と同一の 2048 UTF-8 byte budget の内側に収める（OUTPUT_BUDGET_V1 参照）。
+#1873（bounded review loops）: 旧 Step 2a arbitration（parent-local replay
+integrity binding、Issue #1532）は撤去された。orchestrator は本 SubAgent の
+`VERDICT` を独立に再計算せず直接信頼する。`REVIEWER_BLOCKER_CLAIM` /
+`PARENT_REPLAY_*` フィールドは stdout に一切含めない（旧契約は producer 契約
+から完全に廃止された）。
 
 ### 内部処理用 REVIEW_ISSUE_RESULT_V1（artifact のみ）
 
@@ -160,7 +142,7 @@ REVIEW_ISSUE_RESULT_V1:
 
 `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
 `ISSUE_REVIEW_RESULT_COMPACT_V1` の全フィールド（STATUS / VERDICT / SUMMARY / BLOCKERS / NEXT_ACTION / EVIDENCE / ARTIFACT）は必ず欠落なく含める（routing 必須フィールド）。
-`VERDICT: needs-fix` の場合は `REVIEWER_BLOCKER_CLAIM` も欠落なく含める（Step 2a の parent replay 入力として必須）。`PARENT_REPLAY_*` フィールドは本 SubAgent が出力するものではなく orchestrator が V2 envelope 組み立て時に追記する。
+`VERDICT: needs-fix` の場合も同一 8 フィールドのみを返す（#1873: `REVIEWER_BLOCKER_CLAIM` / `PARENT_REPLAY_*` フィールドは撤去済み）。
 stdout は 2048 UTF-8 bytes 以内とする。raw diff / raw log / ANSI escape sequence を stdout に返してはならない。
 
 ## script-first 化について（コスト削減）
@@ -171,8 +153,8 @@ stdout は 2048 UTF-8 bytes 以内とする。raw diff / raw log / ANSI escape s
 
 ## 制約（ORCHESTRATOR_IO_BOUNDARY_V1 準拠）
 
-- 最終応答は `ISSUE_REVIEW_RESULT_COMPACT_V1` stdout のみ（`compact_review_result.py` 経由）。`VERDICT: needs-fix` の場合は同一 stdout に `compact_review_result.py` が構成した bounded `REVIEWER_BLOCKER_CLAIM` フィールドを含む(`reviewer_claim_replay.py` は本 SubAgent 内で実行しない)
-- 本 SubAgent は state file への直接書き込みを一切行わない（consecutive-unbacked state は orchestrator が `reviewer_claim_replay_state_store.py` 経由で所有する。Issue #1515）
+- 最終応答は `ISSUE_REVIEW_RESULT_COMPACT_V1` stdout のみ（`compact_review_result.py` 経由）。`VERDICT: needs-fix` の場合も approve と同一の 8 フィールド envelope のみを返す（#1873: `reviewer_claim_replay.py` は本 SubAgent 内で実行しない。`REVIEWER_BLOCKER_CLAIM` フィールドは撤去済み）
+- 本 SubAgent は state file への直接書き込みを一切行わない
 - `STATUS` / `VERDICT` / `NEXT_ACTION` / `ARTIFACT` を必ず含める（orchestrator の routing 判断に使われるため）
 - raw review body / raw diff / raw issue body / raw log を main context に返してはならない
 - full structured data は artifact JSON に保存し、main context には `ARTIFACT:` パスのみ返す

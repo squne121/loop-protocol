@@ -4,8 +4,8 @@ Unit tests for `hookchain_harness.classify_decision` (and the aggregate
 helper), covering the six-value decision vocabulary
 (deny | defer | ask | allow | no_decision | hook_error) with positive and
 negative cases for each value, using only synthetic (returncode, stdout)
-pairs -- no subprocess execution of real hooks (that is covered separately
-by `scripts/agent-ops/tests/test_pr_review_marker_archive_hookchain.py`).
+pairs -- no subprocess execution of real hooks (that is covered separately by
+dedicated real-hook-chain tests, e.g. under `.claude/hooks/tests/`).
 """
 
 from __future__ import annotations

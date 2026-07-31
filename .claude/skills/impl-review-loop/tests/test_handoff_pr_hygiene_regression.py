@@ -117,58 +117,37 @@ def _read(path: Path) -> str:
 # Inline fixtures for LOOP_VERDICT_V2 routing
 # ---------------------------------------------------------------------------
 
-# LOOP_VERDICT_V2 fixture: BEHIND + required_auto_actions に update_branch を含む
-# skill は implement-issue.update_branch (サブコマンド付き) が正規値
-_LOOP_VERDICT_V2_BEHIND = {
+# Issue #1873: reviewer no longer self-reports merge_ready / mergeability /
+# required_auto_actions. route_loop_verdict_v2 takes reviewer_verdict and
+# live_mergeability as separate inputs; update_branch is synthesized by the
+# router itself from live_mergeability, not read from reviewer output.
+
+# reviewer_verdict + live_mergeability pair: BEHIND -> router synthesizes
+# update_branch (skill=implement-issue.update_branch is the canonical value).
+_REVIEWER_VERDICT_APPROVE = {
     "verdict": "APPROVE",
-    "merge_ready": False,
     "reviewed_head_sha": "abc123def456",
-    "mergeability": {
-        "mergeable": "MERGEABLE",
-        "merge_state_status": "BEHIND",
-    },
-    "required_auto_actions": [
-        {
-            "kind": "update_branch",
-            "executor": "implementation-worker",
-            "skill": "implement-issue.update_branch",
-            "blocking_merge_ready": True,
-            "mechanical": True,
-            "expected_head_sha": "abc123def456",
-        }
-    ],
+    "blockers": [],
+}
+_LIVE_MERGEABILITY_BEHIND = {
+    "head_sha": "abc123def456",
+    "mergeable": "MERGEABLE",
+    "merge_state_status": "BEHIND",
 }
 
-# LOOP_VERDICT_V2 fixture: CLEAN + required_auto_actions が空 (終了可能)
-_LOOP_VERDICT_V2_CLEAN_EMPTY_ACTIONS = {
-    "verdict": "APPROVE",
-    "merge_ready": True,
-    "reviewed_head_sha": "abc123def456",
-    "mergeability": {
-        "mergeable": "MERGEABLE",
-        "merge_state_status": "CLEAN",
-    },
-    "required_auto_actions": [],
+# reviewer_verdict + live_mergeability pair: CLEAN + no blockers (終了可能)
+_LIVE_MERGEABILITY_CLEAN = {
+    "head_sha": "abc123def456",
+    "mergeable": "MERGEABLE",
+    "merge_state_status": "CLEAN",
 }
 
-# LOOP_VERDICT_V2 fixture: CLEAN + required_auto_actions に ensure_closing_keyword を含む (終了不可)
-_LOOP_VERDICT_V2_CLEAN_WITH_KEYWORD_ACTION = {
+# reviewer_verdict: APPROVE but with a residual blocker (終了不可 -- inconsistent
+# reviewer result, must fail closed rather than approve)
+_REVIEWER_VERDICT_APPROVE_WITH_BLOCKER = {
     "verdict": "APPROVE",
-    "merge_ready": True,
     "reviewed_head_sha": "abc123def456",
-    "mergeability": {
-        "mergeable": "MERGEABLE",
-        "merge_state_status": "CLEAN",
-    },
-    "required_auto_actions": [
-        {
-            "kind": "ensure_closing_keyword",
-            "executor": "implementation-worker",
-            "skill": "implement-issue",
-            "blocking_merge_ready": False,
-            "expected_head_sha": None,
-        }
-    ],
+    "blockers": ["PR body still needs a Closes keyword"],
 }
 
 
@@ -422,19 +401,20 @@ class TestAC5BehindMergeableRequiredAutoActionsUpdateBranch:
         production consumer に branch_behind_main=True を渡して route_to_update_branch を確認する。
         """
         result = route_loop_verdict_v2(
-            _LOOP_VERDICT_V2_BEHIND,
+            _REVIEWER_VERDICT_APPROVE,
+            _LIVE_MERGEABILITY_BEHIND,
             test_verdict={"branch_behind_main": True},
         )
         assert result.route == "route_to_update_branch", (
             f"BEHIND + MERGEABLE verdict must route to update_branch (not '{result.route}'). "
-            f"errors: {result.errors}. "
-            f"Fixture: {_LOOP_VERDICT_V2_BEHIND}"
+            f"errors: {result.errors}."
         )
 
     def test_behind_not_approved_after_pass(self):
         """AC5 after-pass: BEHIND verdict で termination_reason: approved が立たないこと。"""
         result = route_loop_verdict_v2(
-            _LOOP_VERDICT_V2_BEHIND,
+            _REVIEWER_VERDICT_APPROVE,
+            _LIVE_MERGEABILITY_BEHIND,
             test_verdict={"branch_behind_main": True},
         )
         assert result.route != "approved", (
@@ -443,20 +423,24 @@ class TestAC5BehindMergeableRequiredAutoActionsUpdateBranch:
         )
 
     def test_behind_verdict_required_auto_actions_contains_update_branch(self):
-        """AC5 after-pass: BEHIND fixture の required_auto_actions に update_branch が含まれること。"""
-        actions = _LOOP_VERDICT_V2_BEHIND.get("required_auto_actions", [])
-        assert len(actions) > 0, "BEHIND fixture must have non-empty required_auto_actions"
-        kinds = [a.get("kind") for a in actions if isinstance(a, dict)]
-        assert "update_branch" in kinds, (
-            f"BEHIND fixture required_auto_actions must include update_branch kind. "
-            f"Got kinds: {kinds}"
+        """AC5 after-pass: BEHIND route の selected_action が update_branch kind であること
+        （router が live_mergeability から合成し、reviewer から受け取らない）。"""
+        result = route_loop_verdict_v2(
+            _REVIEWER_VERDICT_APPROVE,
+            _LIVE_MERGEABILITY_BEHIND,
+            test_verdict={"branch_behind_main": True},
         )
+        assert result.selected_action is not None
+        assert dict(result.selected_action)["kind"] == "update_branch"
 
     def test_behind_verdict_merge_ready_false(self):
-        """AC5 after-pass: BEHIND fixture の merge_ready が false であること。"""
-        assert _LOOP_VERDICT_V2_BEHIND["merge_ready"] is False, (
-            "BEHIND fixture must have merge_ready=false"
+        """AC5 after-pass: BEHIND state は route_to_update_branch であり approved ではないこと。"""
+        result = route_loop_verdict_v2(
+            _REVIEWER_VERDICT_APPROVE,
+            _LIVE_MERGEABILITY_BEHIND,
+            test_verdict={"branch_behind_main": True},
         )
+        assert result.route != "approved", "BEHIND state must not route to approved"
 
     def test_step5_mergeability_behind_routing_documented(self):
         """AC5 after-pass: step-5-mergeability-handling.md が BEHIND routing を定義していること。"""
@@ -553,11 +537,15 @@ def test_before_fail_loop_verdict_v1_behind_allows_premature_termination() -> No
         "verdict": "APPROVE",
         "mergeable": "MERGEABLE",
         "merge_state_status": "BEHIND",
-        # V1: required_auto_actions フィールドなし、mergeability ネストなし
+        # V1: reviewed_head_sha/blockers フィールドなし、live mergeability 分離なし
     }
-    # production consumer で required_auto_actions が None → schema_invalid → fail_closed
+    # production consumer で reviewed_head_sha が None → schema_invalid → fail_closed
     # いずれにしても route != "approved" → xfail 発火
-    result = route_loop_verdict_v2(v1_verdict, test_verdict={"branch_behind_main": False})
+    result = route_loop_verdict_v2(
+        v1_verdict,
+        _LIVE_MERGEABILITY_BEHIND,
+        test_verdict={"branch_behind_main": False},
+    )
     # V1 形式は required_auto_actions が missing (None) → fail-closed
     # → route != "approved" なのでアサーション FAILS → xfail が発火
     assert result.route == "approved", (
@@ -598,42 +586,35 @@ class TestAC6RequiredAutoActionsNonEmptyPreventApproval:
     """
 
     def test_nonempty_required_auto_actions_not_approved_after_pass(self):
-        """AC6 after-pass: required_auto_actions が 1 件以上残る状態で approved にならないこと。
+        """AC6 after-pass: reviewer が blockers を残した状態で approved にならないこと。
 
-        before-fail: required_auto_actions を無視して APPROVE のみで終了していた。
-        after-pass: required_auto_actions == [] が終了条件の一部として要求される。
+        Issue #1873 以降 required_auto_actions は reviewer 出力ではなく router が
+        live_mergeability から合成する。reviewer 側の同等シグナルは blockers であり、
+        APPROVE + non-empty blockers は inconsistent な結果として fail_closed になる。
         """
-        result = route_loop_verdict_v2(_LOOP_VERDICT_V2_CLEAN_WITH_KEYWORD_ACTION)
+        result = route_loop_verdict_v2(_REVIEWER_VERDICT_APPROVE_WITH_BLOCKER, _LIVE_MERGEABILITY_CLEAN)
         assert result.route != "approved", (
-            f"required_auto_actions が残る場合は 'approved' route にならないこと。Got: '{result.route}'. "
-            f"APPROVE + merge_ready=true + non-empty required_auto_actions must NOT terminate as approved."
+            f"blockers が残る場合は 'approved' route にならないこと。Got: '{result.route}'. "
+            f"APPROVE + non-empty blockers must NOT terminate as approved."
         )
 
     def test_nonempty_required_auto_actions_routes_to_action_after_pass(self):
-        """AC6 after-pass: required_auto_actions が残る場合は action routing になること。"""
-        result = route_loop_verdict_v2(_LOOP_VERDICT_V2_CLEAN_WITH_KEYWORD_ACTION)
-        assert result.route in ("route_to_body_only_action", "route_to_update_branch"), (
-            f"required_auto_actions が残る場合は action routing になること。Got: '{result.route}'."
+        """AC6 after-pass: APPROVE + non-empty blockers は
+        矛盾検出として fail_closed になること（action routing ではない）。"""
+        result = route_loop_verdict_v2(_REVIEWER_VERDICT_APPROVE_WITH_BLOCKER, _LIVE_MERGEABILITY_CLEAN)
+        assert result.fail_closed is True, (
+            f"APPROVE + non-empty blockers は fail_closed であること。Got: '{result.route}'."
         )
 
     def test_clean_empty_actions_can_be_approved(self):
-        """AC6 after-pass: required_auto_actions=[] かつ merge_ready=true なら approved になること。
+        """AC6 after-pass: blockers=[] かつ live CLEAN/MERGEABLE なら approved になること。
 
-        終了条件の正の検証: APPROVE + merge_ready=true + required_auto_actions=[] → approved。
+        終了条件の正の検証: APPROVE + blockers=[] + CLEAN → approved。
         """
-        result = route_loop_verdict_v2(_LOOP_VERDICT_V2_CLEAN_EMPTY_ACTIONS)
+        result = route_loop_verdict_v2(_REVIEWER_VERDICT_APPROVE, _LIVE_MERGEABILITY_CLEAN)
         assert result.route == "approved", (
-            f"APPROVE + merge_ready=true + required_auto_actions=[] must route to 'approved'. "
-            f"Got: '{result.route}'. errors: {result.errors}. Fixture: {_LOOP_VERDICT_V2_CLEAN_EMPTY_ACTIONS}"
-        )
-
-    def test_step5_feedback_required_auto_actions_gate_before_approved(self):
-        """AC6 after-pass: step-5-feedback-and-termination.md の APPROVE gate が
-        required_auto_actions == [] を条件として含むこと。"""
-        body = _read(STEP5_FT)
-        assert "required_auto_actions == []" in body, (
-            "step-5-feedback-and-termination.md must require required_auto_actions == [] "
-            "as a gate for termination_reason: approved (AC6: #640 regression)"
+            f"APPROVE + blockers=[] + CLEAN must route to 'approved'. "
+            f"Got: '{result.route}'. errors: {result.errors}."
         )
 
     def test_step5_feedback_approve_with_nonempty_actions_does_not_terminate(self):
@@ -645,41 +626,29 @@ class TestAC6RequiredAutoActionsNonEmptyPreventApproval:
             "prevents termination (AC6: #640 regression)"
         )
 
-    def test_skill_md_termination_requires_empty_required_auto_actions(self):
-        """AC6 after-pass: SKILL.md の終了条件が required_auto_actions == [] を含むこと。"""
-        body = _read(SKILL_MD)
-        assert "required_auto_actions == []" in body, (
-            "SKILL.md 終了条件 must include required_auto_actions == [] (AC6: #640 regression)"
-        )
-
     def test_fixture_matrix_ac6_before_fail_scenario_documented(self):
         """AC6: before-fail シナリオの documentation。
 
         APPROVE + merge_ready=true + non-empty required_auto_actions が approved に routing
         されないことを production consumer で直接検証する。
         """
-        # before-fail シナリオを表す fixture
+        # before-fail シナリオを表す fixture（reviewer が blockers を残したまま APPROVE している）
         before_fail_verdict = {
             "verdict": "APPROVE",
-            "merge_ready": True,
             "reviewed_head_sha": "oldsha",
-            "mergeability": {"mergeable": "MERGEABLE", "merge_state_status": "CLEAN"},
-            "required_auto_actions": [
-                {
-                    "kind": "ensure_closing_keyword",
-                    "executor": "implementation-worker",
-                    "skill": "implement-issue",
-                    "blocking_merge_ready": False,
-                    "expected_head_sha": None,
-                }
-            ],
+            "blockers": ["Closes keyword still missing from PR body"],
+        }
+        live_mergeability = {
+            "head_sha": "oldsha",
+            "mergeable": "MERGEABLE",
+            "merge_state_status": "CLEAN",
         }
 
-        result = route_loop_verdict_v2(before_fail_verdict)
+        result = route_loop_verdict_v2(before_fail_verdict, live_mergeability)
 
-        # before-fail シナリオでは approved になっていたが、after-pass では route_to_body_only_action
+        # before-fail シナリオでは approved になっていたが、after-pass では fail_closed
         assert result.route != "approved", (
-            f"[before-fail regression] APPROVE + non-empty required_auto_actions must NOT be 'approved'. "
+            f"[before-fail regression] APPROVE + non-empty blockers must NOT be 'approved'. "
             f"Got: '{result.route}'. This was the pre-#640 bug where APPROVE alone terminated the loop."
         )
 
@@ -730,15 +699,16 @@ def test_closes_keyword_ensure_closing_keyword_in_step5():
 # ---------------------------------------------------------------------------
 
 def test_behind_mergeable_routes_to_update_branch():
-    """AC5 behind_mergeable: BEHIND + MERGEABLE fixture が update_branch に routing されること。
+    """AC5 behind_mergeable: live BEHIND + MERGEABLE が update_branch に routing されること。
 
     TEST_VERDICT_MACHINE:
       version: 1
       result: pass
-      fixture: _LOOP_VERDICT_V2_BEHIND (inline)
+      fixture: _REVIEWER_VERDICT_APPROVE / _LIVE_MERGEABILITY_BEHIND (inline)
     """
     result = route_loop_verdict_v2(
-        _LOOP_VERDICT_V2_BEHIND,
+        _REVIEWER_VERDICT_APPROVE,
+        _LIVE_MERGEABILITY_BEHIND,
         test_verdict={"branch_behind_main": True},
     )
     assert result.route == "route_to_update_branch", (
@@ -748,14 +718,15 @@ def test_behind_mergeable_routes_to_update_branch():
 
 
 def test_behind_mergeable_not_approved():
-    """AC5 behind_mergeable: BEHIND + MERGEABLE verdict で approved にならないこと。
+    """AC5 behind_mergeable: live BEHIND + MERGEABLE で approved にならないこと。
 
     TEST_VERDICT_MACHINE:
       version: 1
       result: pass
     """
     result = route_loop_verdict_v2(
-        _LOOP_VERDICT_V2_BEHIND,
+        _REVIEWER_VERDICT_APPROVE,
+        _LIVE_MERGEABILITY_BEHIND,
         test_verdict={"branch_behind_main": True},
     )
     assert result.route != "approved", (
@@ -764,15 +735,20 @@ def test_behind_mergeable_not_approved():
 
 
 def test_behind_mergeable_required_auto_actions_contains_update_branch():
-    """AC5 behind_mergeable: BEHIND fixture の required_auto_actions に update_branch が含まれること。
+    """AC5 behind_mergeable: BEHIND route の selected_action が update_branch kind であること
+    （router が live_mergeability から合成する）。
 
     TEST_VERDICT_MACHINE:
       version: 1
       result: pass
     """
-    actions = _LOOP_VERDICT_V2_BEHIND.get("required_auto_actions", [])
-    kinds = [a.get("kind") for a in actions if isinstance(a, dict)]
-    assert "update_branch" in kinds
+    result = route_loop_verdict_v2(
+        _REVIEWER_VERDICT_APPROVE,
+        _LIVE_MERGEABILITY_BEHIND,
+        test_verdict={"branch_behind_main": True},
+    )
+    assert result.selected_action is not None
+    assert dict(result.selected_action)["kind"] == "update_branch"
 
 
 class TestAC7TestVerdictMachineMarkerPresent:

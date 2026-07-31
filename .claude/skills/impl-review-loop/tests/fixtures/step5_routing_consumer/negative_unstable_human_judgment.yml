@@ -1,0 +1,14 @@
+description: merge_state_status=UNSTABLE is not a conflict -> route_human_escalation
+reviewer_verdict:
+  verdict: APPROVE
+  reviewed_head_sha: abc123def456
+  blockers: []
+live_mergeability:
+  head_sha: abc123def456
+  mergeable: MERGEABLE
+  merge_state_status: UNSTABLE
+test_verdict: null
+expected:
+  route: route_human_escalation
+  fail_closed: false
+  reason_code: merge_state_status_unstable_requires_human_judgment

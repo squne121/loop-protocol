@@ -82,31 +82,15 @@ def test_step0_orders_scope_rollup_before_hygiene():
     )
 
 
-def test_loop_state_summary_keeps_routing_critical_fields():
+def test_loop_state_summary_references_loop_state_doc():
     """
-    Routing-critical LOOP_STATE fields were moved from SKILL.md to
-    schemas/loop_state.schema.json (Issue #795).
-    Verify they are present in the schema properties and that SKILL.md
-    references both the schema and the loop-state reference doc.
+    #1873: schemas/loop_state.schema.json was removed along with
+    build_loop_state.py (routing-critical LOOP_STATE fields are no longer
+    schema-validated as a standalone JSON Schema). SKILL.md must still
+    reference the loop-state reference doc as the SSOT for LOOP_STATE_V1
+    shape.
     """
-    import json
-    schema_path = SKILL_MD.parent / "schemas" / "loop_state.schema.json"
-    assert schema_path.exists(), "schemas/loop_state.schema.json must exist"
-    schema = json.loads(schema_path.read_text(encoding="utf-8"))
-    props = schema.get("properties", {})
-    for field in [
-        "scope_rollup_decision",
-        "scope_signal_guard",
-        "delivery_rollup",
-        "follow_up_materialization",
-        "superseded_decision",
-    ]:
-        assert field in props, f"Missing routing-critical field in schema: {field}"
-
-    # SKILL.md must reference the schema and loop-state reference
     skill_md = load_skill_md()
-    assert "schemas/loop_state.schema.json" in skill_md, \
-        "SKILL.md must reference schemas/loop_state.schema.json"
     assert "references/loop-state.md" in skill_md, \
         "SKILL.md must reference references/loop-state.md"
 

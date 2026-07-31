@@ -87,25 +87,17 @@ Status 定義:
   Allowed Paths 判定の canonical input
 - `violations[]`: `file` / `path_role` / `reason` を持つ
 
-## `LOOP_VERDICT_V2.allowed_paths_gate` 必須最小フィールド（Medium 対応）
+## gate 結果の reviewer_verdict への反映（Issue #1873）
 
-```yaml
-LOOP_VERDICT_V2.allowed_paths_gate:
-  required_minimum:
-    - status
-    - changed_files_source
-    - changed_files
-  optional_but_preserved_if_present:
-    - changed_file_records
-    - audited_paths
-    - violations[].path_role
-```
-
-`status` / `changed_files_source` / `changed_files` は消費側 (`impl-review-loop` 等) が
-最低限読む必須フィールドであり、後方互換を壊さず常に出力する。
-`changed_file_records` / `audited_paths` / `violations[].path_role` は rename provenance
-判定の canonical な監査証跡として存在する場合は必ず維持し、値を欠落させたり
-黙って落としたりしてはならない。
+Issue #1873 以降、この gate の結果は `LOOP_VERDICT_V2.allowed_paths_gate` という専用フィールドの
+自己申告としては受け渡さない。pr-reviewer はこの決定論的 script（`git_diff_name_status_find_renames_z` /
+`github_pull_request_files_api_with_previous_filename` 由来の `status` / `changed_files_source` /
+`changed_files` / `audited_paths` / `violations[]`）を自ら実行し、`status` が `ok` 以外
+（`fail_closed` / `stale_snapshot` / `indeterminate`）の場合は具体的な違反内容
+（file / path_role / reason）を `reviewer_verdict.blockers[]` にテキストとして記載する。
+`status == ok` の場合は blocker を追加しない。gate evaluator 自体（matcher、rename provenance、
+`changed_file_records` の構造）は変更しない。この script の正本は pr-review-judge 配下の
+決定論的スクリプト出力のままであり、worker 自己申告（`allowed_paths_compliance`）は canonical にしない。
 
 ## matcher v2 grammar（マッチャ v2 文法）
 

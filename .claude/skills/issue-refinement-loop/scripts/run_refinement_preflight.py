@@ -490,8 +490,8 @@ def _fetch_single_comment(repo: str, comment_id: int) -> tuple[dict | None, str]
     return data, err
 
 
-def _load_loop_state_schema() -> dict[str, Any]:
-    schema_path = _SCHEMAS_DIR / "loop_state.schema.json"
+def _load_anchor_comment_schema() -> dict[str, Any]:
+    schema_path = _SCHEMAS_DIR / "anchor_comment.schema.json"
     return json.loads(schema_path.read_text(encoding="utf-8"))
 
 
@@ -678,7 +678,7 @@ def _build_anchor_comment_state(
         "requires_fact_check": False,
     }
 
-    schema = _load_loop_state_schema().get("definitions", {}).get("anchor_comment", {})
+    schema = _load_anchor_comment_schema()
     valid, errors = _validate_with_schema(state, schema)
     if not valid:
         return None, [BLOCKER_ANCHOR_COMMENT_SCHEMA_INVALID, *errors]
