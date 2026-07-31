@@ -128,11 +128,15 @@ pr-reviewer が実行する `ALLOWED_PATHS_GATE_RESULT_V1`（決定論的スク�
 （欠落・不一致のみを理由に block しない。`allowed-paths-gate.md` 参照）。gate 自体（path が
 Allowed Paths 外か、rename/copy provenance が確定できるか）は hard safety boundary のまま維持する。
 
+gate `status` の値は `ok` / `fail_closed` / `indeterminate` のみ（`stale_snapshot` は `status` を
+占有しない -- contract fingerprint drift は `warnings[]` の advisory annotation としてのみ表れ、
+live 本文で評価した `status` が canonical のまま変わらない。詳細は `references/allowed-paths-gate.md`
+参照）。
+
 | gate `status` | reviewer_verdict への反映 | 結果としての `verdict` | routing |
 |---|---|---|---|
-| `ok` | blocker を追加しない | `APPROVE` 可 | `route_loop_verdict_v2()` の通常判定へ |
+| `ok` | blocker を追加しない（fingerprint drift があれば `warnings[]` に advisory 記載） | `APPROVE` 可 | `route_loop_verdict_v2()` の通常判定へ |
 | `fail_closed` | 違反内容を `blockers[]` に記載 | `REQUEST_CHANGES` | `continue_loop`。next iteration で修正 |
-| `stale_snapshot` | advisory: 「contract snapshot が stale」を `warnings[]` に記載（live 本文で再評価済みのため blocker にはしない） | `APPROVE` 可（live 本文の判定次第） | `route_loop_verdict_v2()` の通常判定へ |
 | `indeterminate` | 理由（path が Allowed Paths 外と確定できない等）を `blockers[]` に記載 | `REQUEST_CHANGES` または `HUMAN_REVIEW_REQUIRED` | `continue_loop` または `route_human_escalation` |
 | malformed（スクリプト実行不能） | 実行不能である旨を `blockers[]` に記載 | `HUMAN_REVIEW_REQUIRED` | `route_human_escalation` |
 

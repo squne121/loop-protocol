@@ -1,7 +1,7 @@
 # Verdict コメントテンプレート（要点）
 
 ````markdown
-## Verdict: APPROVE | REQUEST_CHANGES
+## Verdict: APPROVE | REQUEST_CHANGES | HUMAN_REVIEW_REQUIRED
 
 ### Mergeability
 - mergeable=<...>, merge_state_status=<...>

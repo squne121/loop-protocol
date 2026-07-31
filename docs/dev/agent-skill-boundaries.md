@@ -892,9 +892,10 @@ routing_allowed_fields:
     - status     # pass | partial | fail（Issue #1856: 通常レビュー判定に対しては non-authoritative advisory。routing-critical ではない）
     - summary    # 統計のみ（raw 出力は参照しない）
     # branch_behind_main は Issue #1856（evidence authority cutover, Phase 1）で撤去された。
-    # BEHIND reroute 判定は LOOP_VERDICT_V2.mergeability.merge_state_status のみを参照する。
+    # BEHIND reroute 判定は live_mergeability.merge_state_status のみを参照する
+    # （Issue #1873: reviewer 自己申告の mergeability フィールドは routing input ではない）。
   LOOP_VERDICT:
-    - verdict    # APPROVE | REQUEST_CHANGES
+    - verdict    # APPROVE | REQUEST_CHANGES | HUMAN_REVIEW_REQUIRED
     - status     # ok | failed
   IMPLEMENT_RESULT_V1:
     - status     # ok | failed | blocked

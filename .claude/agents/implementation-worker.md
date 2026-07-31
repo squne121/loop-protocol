@@ -103,7 +103,10 @@ IMPLEMENTATION_WORKER_REQUEST_V2:
 # commit_message_policy: "<pattern>" # 例: "fix: <ac_id> <description>"
 ```
 
-### required_auto_actions.kind → worker mode の振り分け表
+### action.kind → worker mode の振り分け表
+
+（Issue #1873: `kind` は reviewer が自己申告する `required_auto_actions` フィールドではなく、
+`route_loop_verdict_v2()` が live mergeability から合成する `selected_action` の一部として渡される。）
 
 | kind | worker mode | 委譲先 |
 |---|---|---|

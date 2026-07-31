@@ -4,7 +4,8 @@ Production consumer module for impl-review-loop Step 5 routing.
 Issue #1873: reviewer self-report of merge_ready / required_auto_actions /
 allowed_paths_gate is no longer a production input. pr-reviewer's minimal
 result convention is verdict / reviewed_head_sha / blockers / warnings only
-(see docs/dev/workflow.md "PR review 内部返却 convention"). Mergeability
+(see .claude/skills/pr-review-judge/references/loop-verdict-v2-schema.md and
+references/verdict-output-template.md). Mergeability
 (mergeable, merge_state_status) is read directly from live GitHub PR state
 by the caller and passed in as `live_mergeability`.
 

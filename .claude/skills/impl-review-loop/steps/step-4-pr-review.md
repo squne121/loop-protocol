@@ -14,7 +14,7 @@ inputs:
   reviewed_head_sha: <現在の HEAD SHA>
 ```
 
-SubAgent 側は `.claude/skills/pr-review-judge/SKILL.md` の手順を実行し、verdict コメントを PR に投稿する。
+SubAgent 側は `.claude/skills/pr-review-judge/SKILL.md` の手順を実行し、verdict 本文と最小 convention フィールドを呼び出し元へ返す（pr-reviewer は Write/Edit を持たないため、実際の PR コメント投稿は control-plane が行う。詳細は「期待する出力」参照）。
 
 ## PR レビュー前の CI 待機ルート
 
@@ -112,7 +112,7 @@ CI_FAILED_LOG_RESULT_V1:
 
 | status | routing |
 |---|---|
-| `ci_failed` | log summary を `LOOP_VERDICT_V2.blockers` に反映 |
+| `ci_failed` | log summary を `reviewer_verdict.blockers[]` に反映 |
 | `ci_passed` | CI pass とみなしログ取得をスキップ |
 | `ci_pending` | wait helper を再実行、または `CI_PENDING` blocker |
 | `no_matching_run` | `CI_LOG_UNAVAILABLE` blocker |
