@@ -292,6 +292,28 @@ def test_given_missing_fork_turns_when_static_contract_runs_then_it_rejects(tmp_
     assert any("fork_turns must be 'none'" in failure for failure in failures)
 
 
+@pytest.mark.parametrize("element", ["Objective", "Live reference", "Bounded scope", "Expected result"])
+def test_given_missing_required_message_element_when_static_contract_runs_then_it_rejects(
+    tmp_path: Path,
+    element: str,
+):
+    block = "\n".join(
+        line
+        for line in _valid_dispatch_block().splitlines()
+        if not line.startswith(f"    {element}:")
+    )
+    _write_dispatch_site(tmp_path, f"{block}\n")
+
+    failures: list[str] = []
+    module.assert_native_v2_dispatch_contract(
+        failures,
+        repo_root=tmp_path,
+        dispatch_sites=DISPATCH_SITES,
+    )
+
+    assert any(f"message must include non-empty '{element}:'" in failure for failure in failures)
+
+
 def test_given_duplicate_dispatch_blocks_when_static_contract_runs_then_it_rejects(tmp_path: Path):
     _write_dispatch_site(tmp_path, _valid_dispatch_block() * 2)
 

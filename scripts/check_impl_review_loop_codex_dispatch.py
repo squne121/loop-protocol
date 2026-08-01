@@ -46,6 +46,12 @@ NATIVE_V2_DISPATCH_BLOCK = re.compile(
     re.MULTILINE,
 )
 TASK_NAME_PATTERN = re.compile(r"^[a-z0-9_]+$")
+MESSAGE_REQUIRED_ELEMENTS = (
+    "Objective",
+    "Live reference",
+    "Bounded scope",
+    "Expected result",
+)
 
 
 def read_toml(path: Path) -> tuple[dict | None, str | None]:
@@ -217,8 +223,15 @@ def assert_native_v2_dispatch_contract(
             )
         if block.get("fork_turns") != "none":
             failures.append(f"{relative_path}: fork_turns must be 'none'")
-        if not block.get("message"):
+        message = block.get("message", "")
+        if not message:
             failures.append(f"{relative_path}: message must be non-empty and self-contained")
+            continue
+        for element in MESSAGE_REQUIRED_ELEMENTS:
+            if re.search(rf"(?m)^{re.escape(element)}:\s*\S", message) is None:
+                failures.append(
+                    f"{relative_path}: message must include non-empty '{element}:'"
+                )
 
 
 def assert_no_scope_rollup_runner_auto_spawn_note(failures: list[str]) -> None:

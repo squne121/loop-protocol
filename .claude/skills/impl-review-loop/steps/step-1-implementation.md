@@ -19,7 +19,7 @@ spawn_agent:
     Expected result: IMPLEMENT_RESULT_V1 with worktree, branch, PR, and verification facts.
 ```
 
-This dispatch block defines static call shape only. It does not prove runtime capability, permission enforcement, or security-boundary verification. Native runtime verification is owned by #1841.
+This dispatch block defines static call shape only. It does not prove runtime capability, permission enforcement, or security-boundary verification. Native runtime verification is owned by #1841. この静的な記述は実行時の能力・権限強制・security boundary を証明しません。
 
 SubAgent 側は `.claude/skills/implement-issue/SKILL.md` を実行し、worktree 作成・実装・検証・PR 起票（`open-pr` skill 経由）まで完了させる。
 
