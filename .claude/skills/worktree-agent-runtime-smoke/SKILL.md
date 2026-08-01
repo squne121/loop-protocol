@@ -40,13 +40,13 @@ Skill preload 判定、context budget 評価、review verdict、merge readiness�
 
 ## Lane 選択
 
-### Lane A: structured smoke（既定）
+### Lane A: structured smoke（既定・非対話ラン）
 
 非対話の fresh process から stream JSON / JSONL event と exit code を取得する。
 TUI screen scraping を使わない。
 
-- Claude Code: `claude -p --output-format stream-json --include-hook-events --no-session-persistence`
-- Codex CLI: `codex exec -C <worktree> --json --ephemeral <prompt>`
+- Claude Code の起動コマンド例: `claude -p --output-format stream-json --include-hook-events --no-session-persistence`
+- Codex CLI の起動コマンド例: `codex exec -C <worktree> --json --ephemeral <prompt>`
 
 詳細は `references/claude-code.md` / `references/codex-cli.md` を参照。
 
@@ -85,12 +85,12 @@ TUI `/status`、Skill picker、approval 画面、subagent UI、context 表示等
 - caller pane、別 agent、別 workspace を変更しない。検証用 pane だけを閉じる（`--keep-pane` 指定時は残す）
 - 新しい schema、digest、receipt、publisher、state store、semantic verdict classifier を追加しない
 
-## Reference Map
+## Reference Map（参照資料の一覧）
 
-- `references/claude-code.md` — Claude Code structured／interactive invocation
-- `references/codex-cli.md` — Codex CLI structured／interactive invocation
-- `references/herdr.md` — herdr pane／agent API の使い分け
-- `references/evidence-hygiene.md` — evidence hygiene と session-log metadata boundary
+- `references/claude-code.md` — Claude Code の structured／interactive invocation 手順を説明する
+- `references/codex-cli.md` — Codex CLI の structured／interactive invocation 手順を説明する
+- `references/herdr.md` — herdr pane／agent API の使い分けを説明する
+- `references/evidence-hygiene.md` — evidence hygiene と session-log metadata boundary の扱いを説明する
 
 ## Related（関連情報）
 
