@@ -107,6 +107,15 @@ try:
 except ImportError:  # pragma: no cover - defensive fallback
     validate_issue_execution_decision = None
 
+try:
+    # #1891: pure analyzer for anchor comment multi-turn segmentation and
+    # candidate extraction. anchor_context.py has no GitHub API client of its
+    # own; it only consumes the already-fetched anchor_comment.snapshot body
+    # that this module builds below (AC8).
+    import anchor_context
+except ImportError:  # pragma: no cover - defensive fallback
+    anchor_context = None
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -154,6 +163,12 @@ BLOCKER_PLANNER_FAIL_CLOSED_PAYLOAD_INVALID = "planner_fail_closed_payload_inval
 BLOCKER_ARTIFACT_PROJECTION_MISMATCH = "ARTIFACT_PROJECTION_MISMATCH"
 BLOCKER_ISSUE_EXECUTION_DECISION_INVALID = "ISSUE_EXECUTION_DECISION_INVALID"
 BLOCKER_ISSUE_EXECUTION_DECISION_VALIDATOR_UNAVAILABLE = "ISSUE_EXECUTION_DECISION_VALIDATOR_UNAVAILABLE"
+# #1891 iteration 2 (PR #1923 OWNER REQUEST_CHANGES): the multi-turn-candidate
+# route and the heavy-mutation gate must actually reach the `blockers` list
+# consumed by `_apply_exit_code_mapping()`, not just live inside
+# `known_context` where the planner never inspects them.
+BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED = "ANCHOR_MULTI_TURN_FAIL_CLOSED"
+BLOCKER_HEAVY_MUTATION_FAIL_CLOSED = "HEAVY_MUTATION_FAIL_CLOSED"
 
 
 def _render_artifact_projection_lines(artifacts: dict[str, str]) -> list[str]:
@@ -1648,6 +1663,102 @@ def _emit_failure_result(
 # payload consumed by _classify_anchor_scope_reframe above).
 # ---------------------------------------------------------------------------
 
+# Heavy mutation categories (#1891 AC6): mutation intents that require an
+# explicit owner-sourced decision before they may proceed. Non-heavy
+# categories continue with a warning instead of a hard stop.
+HEAVY_MUTATION_CATEGORIES = frozenset(
+    {
+        "close",
+        "not_planned",
+        "replacement_issue_creation",
+        "dependency_removal",
+        "parent_child_change",
+    }
+)
+
+
+def _classify_heavy_mutation_gate(
+    *,
+    mutation_category: "str | None",
+    scope_delta_decision: "dict | None",
+) -> dict:
+    """#1891 AC6: fail-closed gate for heavy mutation categories.
+
+    Heavy mutation categories (close / not planned / replacement Issue
+    creation / dependency removal / parent-child relationship change) are
+    blocked unless `scope_delta_decision` reflects an explicit owner-sourced
+    decision (`status == "approved_by_trusted_anchor"` and
+    `anchor_author_association == "OWNER"`). Non-heavy mutation categories
+    (ordinary body improvement / additional investigation / review
+    continuation) are never blocked here -- they continue with a `warn`
+    status, matching the pre-existing advisory-only behavior.
+    """
+    decision = scope_delta_decision or {}
+    owner_explicit = (
+        decision.get("status") == "approved_by_trusted_anchor"
+        and decision.get("anchor_author_association") == "OWNER"
+    )
+    is_heavy = mutation_category in HEAVY_MUTATION_CATEGORIES
+
+    if owner_explicit:
+        return {
+            "mutation_category": mutation_category,
+            "is_heavy_mutation": is_heavy,
+            "status": "allowed",
+            "fail_closed": False,
+            "reason": "owner_explicit_decision_present",
+        }
+
+    if is_heavy:
+        return {
+            "mutation_category": mutation_category,
+            "is_heavy_mutation": True,
+            "status": "blocked",
+            "fail_closed": True,
+            "reason": "heavy_mutation_requires_owner_explicit_decision",
+        }
+
+    return {
+        "mutation_category": mutation_category,
+        "is_heavy_mutation": False,
+        "status": "warn",
+        "fail_closed": False,
+        "reason": "non_heavy_mutation_warning_continue",
+    }
+
+
+def _apply_multi_turn_candidate_route(
+    scope_delta_decision: dict,
+    segments_result: "dict | None",
+    candidates_result: "dict | None",
+) -> dict:
+    """#1891 AC4: route to human judgment when anchor_context.py finds
+    multiple unclassified candidates spread across a genuine multi-turn
+    transcript (>=2 marker-delimited segments).
+
+    This does not fire for an ordinary single-turn review comment that
+    happens to contain several bullet points -- it is scoped to the
+    multi-turn/supersession scenario this Issue targets, so it never
+    auto-selects a single winning candidate and never silently overrides an
+    existing fail-closed decision with a weaker one.
+    """
+    if not isinstance(segments_result, dict) or not isinstance(candidates_result, dict):
+        return scope_delta_decision
+
+    marked_segments = [seg for seg in segments_result.get("segments", []) if seg.get("marker")]
+    candidates = candidates_result.get("candidates", [])
+
+    if len(marked_segments) >= 2 and len(candidates) >= 2:
+        updated = dict(scope_delta_decision)
+        updated["status"] = "fail_closed"
+        updated["reason"] = "multi_turn_anchor_context_requires_human_judgment"
+        updated["anchor_context_candidate_count"] = len(candidates)
+        updated["anchor_context_marked_segment_count"] = len(marked_segments)
+        updated["implementation_go"] = False
+        return updated
+
+    return scope_delta_decision
+
 
 def _build_scope_delta_authority_evidence(
     *,
@@ -1657,6 +1768,8 @@ def _build_scope_delta_authority_evidence(
     issue_number: int,
     anchor_url: str,
     captured_at: str,
+    segments_result: "dict | None" = None,
+    candidates_result: "dict | None" = None,
 ):
     """#1323: build SCOPE_DELTA_AUTHORITY_EVIDENCE_V1 from an anchor comment.
 
@@ -1670,6 +1783,18 @@ def _build_scope_delta_authority_evidence(
     resolve to an issue-comment on `issue_number` in `repo` (AC16). Never
     forwards the raw comment body -- only sha256 + extracted markers /
     directives / boundary flags (AC14).
+
+    #1891 AC4 (iteration 2, PR #1923 OWNER REQUEST_CHANGES): `segments_result`
+    / `candidates_result` are the anchor_context.py pure-analyzer outputs for
+    this same `comment_body`. They are accepted here (instead of only being
+    threaded through a disconnected downstream call) so the multi-turn
+    candidate route is wired at the same call site that builds the scope
+    delta authority evidence, per the Issue's In Scope wiring requirement.
+    They are intentionally NOT added to the returned
+    SCOPE_DELTA_AUTHORITY_EVIDENCE_V1 dict (its schema is `additionalProperties:
+    false`); the caller applies `_apply_multi_turn_candidate_route()` to
+    `scope_delta_decision` immediately after this call using the same
+    `segments_result` / `candidates_result` values.
     """
     try:
         from scope_signal_delta import (
@@ -2227,6 +2352,33 @@ def run_preflight(
             _kc["anchor_comment_hash"] = scope_delta_decision.get("anchor_comment_hash", "")
             _kc["scope_delta_decision"] = scope_delta_decision
 
+            # --- #1891: anchor_context.py pure analyzer (segment + candidates) ---
+            # anchor_context.py has no GitHub API client of its own (AC8); it
+            # only consumes the already-fetched anchor_comment.snapshot body
+            # built above. Computed here -- immediately before the
+            # _build_scope_delta_authority_evidence() call below -- so both
+            # this call and the multi-turn candidate route that follows it
+            # share the same segment/candidate outputs at a single call site
+            # (Issue #1891 In Scope: "_build_scope_delta_authority_evidence()
+            # に anchor_context.py segment + candidates の出力を渡す").
+            _anchor_body_for_context = anchor_comment_state["snapshot"]
+            _segments_result = None
+            _candidates_result = None
+            if anchor_context is not None:
+                _segments_result = anchor_context.segment_body(_anchor_body_for_context)
+                _candidates_result = anchor_context.extract_candidates(_anchor_body_for_context)
+                _kc["source_fetch_complete"] = bool(_anchor_body_for_context)
+                _kc["source_hash_verified"] = _sha256(_anchor_body_for_context) == scope_delta_decision.get(
+                    "anchor_comment_hash"
+                )
+                _kc["source_ranges_covered"] = anchor_context.compute_source_ranges_covered(
+                    _segments_result["segments"], _segments_result["line_count"]
+                )
+            else:  # pragma: no cover - defensive fallback when import fails
+                _kc["source_fetch_complete"] = bool(_anchor_body_for_context)
+                _kc["source_hash_verified"] = False
+                _kc["source_ranges_covered"] = False
+
             # --- #1323: build freeform SCOPE_DELTA_AUTHORITY_EVIDENCE_V1 ---
             # (independent of the structured ANCHOR_SCOPE_REFRAME_V1 payload
             # above, so explicit human-review directives in freeform review
@@ -2239,9 +2391,31 @@ def run_preflight(
                 issue_number=issue_number,
                 anchor_url=anchor_url,
                 captured_at=now or _now_iso(),
+                segments_result=_segments_result,
+                candidates_result=_candidates_result,
             )
             if _scope_delta_authority_evidence is not None:
                 _kc["scope_delta_authority_evidence"] = [_scope_delta_authority_evidence]
+
+            # --- #1891 AC4: route to human judgment on genuine multi-turn
+            # ambiguity, using the same _segments_result / _candidates_result
+            # this call site just fetched and forwarded above. ---
+            _kc["scope_delta_decision"] = _apply_multi_turn_candidate_route(
+                _kc["scope_delta_decision"], _segments_result, _candidates_result
+            )
+
+            # --- #1891 iteration 2 (PR #1923 OWNER REQUEST_CHANGES): the
+            # multi-turn fail_closed route must actually reach `blockers`
+            # (the list `_apply_exit_code_mapping()` consumes), not merely
+            # live inside known_context where the planner never reads it. ---
+            _routed_scope_delta_decision = _kc["scope_delta_decision"]
+            if (
+                isinstance(_routed_scope_delta_decision, dict)
+                and _routed_scope_delta_decision.get("status") == "fail_closed"
+                and _routed_scope_delta_decision.get("reason")
+                == "multi_turn_anchor_context_requires_human_judgment"
+            ):
+                blockers.append(BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED)
 
             known_context = _kc
 
@@ -2262,6 +2436,23 @@ def run_preflight(
     # NOT fed to the planner (the planner always receives the original Issue body).
     # repair_result is included in the preflight output as repair_diagnostics (BLOCKER 1 fix).
     _repair_result = _invoke_repair(issue.get("body", "") or "")
+
+    # --- #1891 AC6: heavy mutation gate ---
+    # Only evaluated when the caller (main thread / orchestrator) has stated
+    # an intended mutation_category in known_context; this never fires for
+    # ordinary body-improvement preflight runs that do not carry one.
+    if known_context and known_context.get("mutation_category"):
+        known_context = dict(known_context)
+        _heavy_mutation_gate = _classify_heavy_mutation_gate(
+            mutation_category=known_context.get("mutation_category"),
+            scope_delta_decision=known_context.get("scope_delta_decision"),
+        )
+        known_context["heavy_mutation_gate"] = _heavy_mutation_gate
+        # #1891 iteration 2 (PR #1923 OWNER REQUEST_CHANGES): the heavy
+        # mutation gate must actually reach `blockers`, not merely live
+        # inside known_context where the planner never reads it.
+        if _heavy_mutation_gate.get("fail_closed") is True:
+            blockers.append(BLOCKER_HEAVY_MUTATION_FAIL_CLOSED)
 
     # --- Invoke planner ---
     known_context = _ensure_scope_signal_delta_input(
