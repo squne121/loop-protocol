@@ -114,7 +114,7 @@ def test_rejects_indirect_package_script_and_composite_action_paths(tmp_path: Pa
     assert any("unresolved interpolation" in error for error in _errors(tmp_path))
 
 
-def test_allows_safe_modes_python_u_and_explanatory_text(tmp_path: Path):
+def test_allows_safe_modes_python_u_and_comment_text(tmp_path: Path):
     _write_repo(
         tmp_path,
         ci_run="""python -u scripts/check.py
@@ -128,7 +128,7 @@ vitest run --update=false""",
     assert errors == [], errors
 
 
-def test_fails_closed_for_dynamic_paths_malformed_yaml_and_structural_wiring(tmp_path: Path):
+def test_fails_closed_for_interpolation_malformed_yaml_and_missing_wiring(tmp_path: Path):
     _write_repo(tmp_path, ci_run="pnpm run ${{ matrix.script }}")
     assert any("unresolved interpolation" in error for error in _errors(tmp_path))
 
