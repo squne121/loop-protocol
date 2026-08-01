@@ -25,6 +25,15 @@ default_permissions = "loop-protocol-personal-dev"
 [features]
 hooks = true
 
+[features.multi_agent_v2]
+enabled = true
+
+# Total active agent threads, including the root thread.
+# Expected peak:
+#   root + implementation-worker + implementation-designer = 3
+# One additional slot is reserved for bounded operational headroom.
+max_concurrent_threads_per_session = 4
+
 [permissions.loop-protocol-personal-dev]
 description = "Personal hobby development profile: built-in workspace filesystem semantics plus broad development network access."
 extends = ":workspace"
@@ -65,9 +74,6 @@ allow_local_binding = false
 # `isProtectedPath()`, which reads the JSON SSOT directly), not via this
 # workspace_roots table. If the JSON's `root_directory` rule set changes,
 # update this table to match.
-
-[agents]
-max_depth = 1
 
 [permissions.loop-protocol-rtk.filesystem]
 ":minimal" = "read"

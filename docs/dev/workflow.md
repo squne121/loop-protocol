@@ -254,6 +254,22 @@ Allowed Paths 違反、実テスト・CI・PR review failure に基づく。
   routing stop にせず、PASS・承認・CI・review・merge readiness の証拠にしない。
 - parallel-safe ledger V2 は別 Issue で再設計し、未実装を通常 workflow の停止理由にしない。
 
+### Multi-Agent V2 の V1 rollback（V1 への復帰手順）
+
+Multi-Agent V2 の repository-pinned declaration を V1 に戻す必要がある場合は、
+`.codex/config.toml` の `[features.multi_agent_v2]` で `enabled = false` に戻し、
+`[agents]` table に `max_depth = 1` を復元する。その後、fresh session で次を再実行し、
+rollback 後の config を checker が意図どおり判定することを確認する。
+
+```bash
+uv run --locked python3 scripts/check_impl_review_loop_codex_dispatch.py \
+  --assert-project-multi-agent-v1-config
+```
+
+V1 rollback 状態では `--assert-project-multi-agent-v1-config` が、strict boolean
+`enabled = false` と strict integer `max_depth = 1` の両方を正として PASS する。
+意図的な失敗ではなく、期待する V1 状態への一致を rollback の証拠として扱う。
+
 ### human_escalation 後の Issue 本文変更と contract review 再実行（advisory、#1860 で hard stop から降格）
 
 `human_escalation` で停止した後、Issue 本文を変更すると `body_sha256` が変化し、prior contract-review result が stale advisory となる（`issue-contract-review` の snapshot idempotency 機構参照）。この staleness 検出自体は上記 Hard gate（`## Issue contract を作業計画の正本として扱う条件` の `### Hard gate`）と同様、blocking authority を持たない advisory diagnostic である（#1860 Owner Decision）。

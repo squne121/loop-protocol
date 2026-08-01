@@ -129,6 +129,20 @@ def read_toml(path: Path) -> dict:
         return tomllib.load(fh)
 
 
+def read_project_config() -> tuple[dict | None, str | None]:
+    """Read .codex/config.toml with deterministic diagnostics for the CLI."""
+    try:
+        return read_toml(CONFIG_PATH), None
+    except FileNotFoundError:
+        return None, ".codex/config.toml: TOML file not found"
+    except PermissionError:
+        return None, ".codex/config.toml: TOML file is not readable"
+    except OSError:
+        return None, ".codex/config.toml: TOML I/O error"
+    except tomllib.TOMLDecodeError:
+        return None, ".codex/config.toml: malformed TOML"
+
+
 # Issue #1859 (re-revision): OpenAI-defined built-in permission profile
 # names. ":danger-full-access" and legacy `sandbox_mode` must never become
 # the root default (see Out of Scope / Stop Conditions). The root default
@@ -337,8 +351,12 @@ def validate_scope_rollup_runtime_contract(expectations: dict) -> list[str]:
     if exclusion != required_exclusion:
         failures.append("scope-rollup-runner: permission exclusion allowlist/reason/expiry/follow-up mismatch")
 
-    config = read_toml(CONFIG_PATH)
-    profile = config.get("permissions", {}).get(SCOPE_ROLLUP_PROFILE)
+    config, config_error = read_project_config()
+    if config_error:
+        return failures + [config_error]
+    assert config is not None
+    permissions = config.get("permissions", {})
+    profile = permissions.get(SCOPE_ROLLUP_PROFILE) if isinstance(permissions, dict) else None
     if not isinstance(profile, dict):
         return failures + [f".codex/config.toml: missing {SCOPE_ROLLUP_PROFILE} profile"]
     filesystem = profile.get("filesystem", {})
@@ -470,7 +488,10 @@ def assert_required_fields(expectations: dict) -> list[str]:
 
 def assert_runtime_contract(expectations: dict) -> list[str]:
     failures: list[str] = []
-    config = read_toml(CONFIG_PATH)
+    config, config_error = read_project_config()
+    if config_error:
+        return [config_error]
+    assert config is not None
     hooks = json.loads(HOOKS_PATH.read_text(encoding="utf-8"))
     all_surface_paths: list[Path] = []
     for agent_name, expected in expectations["required_agents"].items():
@@ -525,8 +546,30 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
 
     deduped_surface_paths = list(dict.fromkeys(all_surface_paths))
     failures.extend(find_duplicate_canonical_targets(deduped_surface_paths))
-    if config.get("agents", {}).get("max_depth") != 1:
-        failures.append(".codex/config.toml: [agents].max_depth must be 1")
+    features = config.get("features", {})
+    if not isinstance(features, dict):
+        failures.append(".codex/config.toml: [features] must be a table")
+        multi_agent_v2 = None
+    else:
+        multi_agent_v2 = features.get("multi_agent_v2")
+    if not isinstance(multi_agent_v2, dict):
+        failures.append(".codex/config.toml: [features.multi_agent_v2] must be declared")
+    else:
+        if type(multi_agent_v2.get("enabled")) is not bool or multi_agent_v2["enabled"] is not True:
+            failures.append(".codex/config.toml: [features.multi_agent_v2].enabled must be strict boolean true")
+        if (
+            type(multi_agent_v2.get("max_concurrent_threads_per_session")) is not int
+            or multi_agent_v2["max_concurrent_threads_per_session"] != 4
+        ):
+            failures.append(
+                ".codex/config.toml: [features.multi_agent_v2].max_concurrent_threads_per_session "
+                "must be strict integer 4"
+            )
+    agents = config.get("agents", {})
+    if not isinstance(agents, dict):
+        failures.append(".codex/config.toml: [agents] must be a table")
+    elif "max_depth" in agents:
+        failures.append(".codex/config.toml: [agents].max_depth must be absent")
     failures.extend(assert_root_default_permissions(config, CONFIG_PATH.read_text(encoding="utf-8")))
 
     if sorted(hooks.keys()) != ["hooks"]:
