@@ -98,9 +98,27 @@ _FENCED_YAML_RE = re.compile(
 _CONTRACT_REVIEW_MARKER = "CONTRACT_REVIEW_RESULT_V1"
 
 
+class SimpleYamlParseError(ValueError):
+    """Raised when the restricted fallback cannot parse a JSON collection."""
+
+
 def _extract_yaml_blocks(body: str) -> list[str]:
     """Extract all fenced yaml/yml block contents from a comment body."""
     return [m.group(1) for m in _FENCED_YAML_RE.finditer(body)]
+
+
+def _parse_fallback_scalar(value: str) -> Any:
+    """Parse the narrow JSON flow-collection subset supported by the fallback."""
+    if value.startswith(("{", "[")):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise SimpleYamlParseError("invalid_json_flow_collection") from exc
+    if (value.startswith('"') and value.endswith('"')) or (
+        value.startswith("'") and value.endswith("'")
+    ):
+        return value[1:-1]
+    return value
 
 
 def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
@@ -110,7 +128,9 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
 
     Preference: yaml.safe_load (PyYAML) — handles nested structures, quoted
     strings, and all standard YAML scalar types correctly.
-    Fallback: custom line-by-line parser (flat + one level of nesting only).
+    Fallback: a restricted indentation-mapping parser.  It deliberately does
+    not implement general YAML syntax; flow collections are accepted only as
+    strict JSON so authoritative snapshot values keep their producer types.
     """
     try:
         import yaml  # noqa: F401 — available in project venv (PyYAML)
@@ -122,53 +142,38 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
         pass
 
     # --- Minimal fallback parser (used only when yaml is unavailable) ---
-    result: dict[str, Any] = {}
-    lines = block.splitlines()
-    current_key: Optional[str] = None
-
-    for line in lines:
+    mapping_lines: list[tuple[int, str, str]] = []
+    for line in block.splitlines():
         stripped = line.rstrip()
         if not stripped or stripped.lstrip().startswith("#"):
             continue
-
+        match = re.match(r'^\s*(\S[^:]*?):\s*(.*)', stripped)
+        if match is None:
+            continue
         indent = len(line) - len(line.lstrip())
+        mapping_lines.append((indent, match.group(1).strip(), match.group(2).strip()))
 
-        if indent == 0:
-            current_key = None
-            m = re.match(r'^(\S[^:]*?):\s*(.*)', stripped)
-            if m:
-                key = m.group(1).strip()
-                val = m.group(2).strip()
-                if val:
-                    if (val.startswith('"') and val.endswith('"')) or (
-                        val.startswith("'") and val.endswith("'")
-                    ):
-                        val = val[1:-1]
-                    result[key] = val
-                else:
-                    result[key] = None
-                    current_key = key
-        elif current_key is not None:
-            if isinstance(result.get(current_key), dict):
-                m = re.match(r'^\s+(\S[^:]*?):\s*(.*)', stripped)
-                if m:
-                    sub_key = m.group(1).strip()
-                    sub_val = m.group(2).strip()
-                    if (sub_val.startswith('"') and sub_val.endswith('"')) or (
-                        sub_val.startswith("'") and sub_val.endswith("'")
-                    ):
-                        sub_val = sub_val[1:-1]
-                    result[current_key][sub_key] = sub_val or None
-            else:
-                m = re.match(r'^\s+(\S[^:]*?):\s*(.*)', stripped)
-                if m:
-                    sub_key = m.group(1).strip()
-                    sub_val = m.group(2).strip()
-                    if (sub_val.startswith('"') and sub_val.endswith('"')) or (
-                        sub_val.startswith("'") and sub_val.endswith("'")
-                    ):
-                        sub_val = sub_val[1:-1]
-                    result[current_key] = {sub_key: sub_val or None}
+    result: dict[str, Any] = {}
+    parents: list[tuple[int, dict[str, Any]]] = [(-1, result)]
+    for index, (indent, key, value) in enumerate(mapping_lines):
+        while indent <= parents[-1][0]:
+            parents.pop()
+        parent = parents[-1][1]
+        if value:
+            parent[key] = _parse_fallback_scalar(value)
+            continue
+
+        has_nested_mapping = (
+            index + 1 < len(mapping_lines)
+            and mapping_lines[index + 1][0] > indent
+        )
+        if not has_nested_mapping:
+            parent[key] = None
+            continue
+
+        nested: dict[str, Any] = {}
+        parent[key] = nested
+        parents.append((indent, nested))
 
     return result
 
@@ -448,7 +453,12 @@ def parse_contract_review_results(
             # Only consider blocks that contain the marker
             if _CONTRACT_REVIEW_MARKER not in raw_block:
                 continue
-            parsed = _parse_simple_yaml_block(raw_block)
+            try:
+                parsed = _parse_simple_yaml_block(raw_block)
+            except SimpleYamlParseError:
+                # A malformed JSON flow collection is never downgraded to a
+                # scalar candidate for an authoritative contract result.
+                continue
             if _is_valid_contract_review_result(parsed, expected_issue_url):
                 inner = parsed[_CONTRACT_REVIEW_MARKER]
                 if not isinstance(inner, dict):

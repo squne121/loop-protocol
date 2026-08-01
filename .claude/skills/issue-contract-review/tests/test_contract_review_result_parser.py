@@ -6,8 +6,12 @@ Unit tests for contract_review_result_parser.py
 
 from __future__ import annotations
 
+import builtins
 import importlib.util
+import json
 from pathlib import Path
+
+import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -30,6 +34,7 @@ _extract_yaml_blocks = _parser_mod._extract_yaml_blocks
 _parse_simple_yaml_block = _parser_mod._parse_simple_yaml_block
 _is_valid_contract_review_result = _parser_mod._is_valid_contract_review_result
 is_fingerprint_ready_go = _parser_mod.is_fingerprint_ready_go
+SimpleYamlParseError = _parser_mod.SimpleYamlParseError
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -144,6 +149,134 @@ class TestSimpleYamlParser:
         inner = result["CONTRACT_REVIEW_RESULT_V1"]
         assert inner["status"] == "go"
         assert inner["generated_by"] == "issue-contract-review"
+
+    def test_fallback_preserves_inline_json_object_as_dict(self, monkeypatch):
+        original_import = builtins.__import__
+
+        def reject_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("forced fallback")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", reject_yaml)
+        fingerprint = {
+            "issue_number": _ISSUE_NUMBER,
+            "contract_source_kind": "issue_comment",
+            "contract_source_id": "1001",
+            "contract_body_sha256": "sha256:" + "a" * 64,
+            "allowed_paths_normalized_sha256": "b" * 64,
+            "base_ref": "main",
+            "base_sha_at_snapshot": "c" * 40,
+        }
+        block = (
+            "CONTRACT_REVIEW_RESULT_V1:\n"
+            "  status: go\n"
+            "  generated_at: 2026-08-01T00:00:00Z\n"
+            "  generated_by: issue-contract-review\n"
+            f"  issue_url: {_ISSUE_URL}\n"
+            f"  body_sha256: {fingerprint['contract_body_sha256']}\n"
+            f"  expected_contract_fingerprint: {json.dumps(fingerprint)}\n"
+        )
+
+        result = _parse_simple_yaml_block(block)
+        inner = result["CONTRACT_REVIEW_RESULT_V1"]
+        assert inner["expected_contract_fingerprint"] == fingerprint
+        assert isinstance(inner["expected_contract_fingerprint"], dict)
+
+    def test_fallback_preserves_issue_1153_fingerprint_shape(self, monkeypatch):
+        original_import = builtins.__import__
+
+        def reject_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("forced fallback")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", reject_yaml)
+        body_sha256 = "sha256:2875f1a5982e327face1b5fdcd3b7d76a89cdd6459b21a1147d7a18d5b31323f"
+        fingerprint = {
+            "issue_number": 1153,
+            "contract_source_kind": "issue_comment",
+            "contract_source_id": "5150877720",
+            "contract_body_sha256": body_sha256,
+            "allowed_paths_normalized_sha256": "31d2385bc36b2d6da2cb66ad745502a3dfe777663191217c79be0ec9dd8bcc6d",
+            "base_ref": "main",
+            "base_sha_at_snapshot": "487f80f2a03de2303288d13f220733ba74567869",
+        }
+        block = (
+            "CONTRACT_REVIEW_RESULT_V1:\n"
+            "  status: go\n"
+            "  generated_at: 2026-08-01T09:42:58Z\n"
+            "  generated_by: issue-contract-review\n"
+            "  issue_url: https://github.com/squne121/loop-protocol/issues/1153\n"
+            f"  body_sha256: {body_sha256}\n"
+            f"  expected_contract_fingerprint: {json.dumps(fingerprint)}\n"
+        )
+
+        result = _parse_simple_yaml_block(block)
+        inner = result["CONTRACT_REVIEW_RESULT_V1"]
+        assert inner["expected_contract_fingerprint"] == fingerprint
+        assert is_fingerprint_ready_go(inner, 5150877720, 1153) is True
+
+    def test_fallback_keeps_json_array_and_existing_scalar_behavior(self, monkeypatch):
+        original_import = builtins.__import__
+
+        def reject_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("forced fallback")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", reject_yaml)
+        result = _parse_simple_yaml_block(
+            "root:\n"
+            "  values: [1,true,null,\"ok\"]\n"
+            "  plain: value { remains plain\n"
+            "  boolean: true\n"
+            "  null_value: null\n"
+            "  integer: 42\n"
+            "  quoted: \"quoted\"\n"
+        )
+
+        inner = result["root"]
+        assert inner["values"] == [1, True, None, "ok"]
+        assert inner["plain"] == "value { remains plain"
+        assert inner["boolean"] == "true"
+        assert inner["null_value"] == "null"
+        assert inner["integer"] == "42"
+        assert inner["quoted"] == "quoted"
+
+    @pytest.mark.parametrize("value", ["{bad}", "[1,]"])
+    def test_fallback_rejects_malformed_json_flow_collections(self, monkeypatch, value):
+        original_import = builtins.__import__
+
+        def reject_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("forced fallback")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", reject_yaml)
+        with pytest.raises(SimpleYamlParseError, match="invalid_json_flow_collection"):
+            _parse_simple_yaml_block(f"root:\n  candidate: {value}\n")
+
+    @pytest.mark.parametrize("value", ["{'key': 'value'}", "(1, 2)", "{1, 2}"])
+    def test_fallback_does_not_accept_python_literals_as_json(self, monkeypatch, value):
+        original_import = builtins.__import__
+
+        def reject_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("forced fallback")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", reject_yaml)
+        if value.startswith("{"):
+            with pytest.raises(SimpleYamlParseError):
+                _parse_simple_yaml_block(f"root:\n  candidate: {value}\n")
+        else:
+            result = _parse_simple_yaml_block(f"root:\n  candidate: {value}\n")
+            assert not isinstance(result["root"]["candidate"], (dict, list, tuple, set))
+
+    def test_fingerprint_string_remains_not_ready(self):
+        inner = {"expected_contract_fingerprint": "{\"issue_number\": 817}"}
+        assert is_fingerprint_ready_go(inner, 1001, _ISSUE_NUMBER) is False
 
 
 # ---------------------------------------------------------------------------
