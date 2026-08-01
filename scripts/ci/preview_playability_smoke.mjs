@@ -86,15 +86,6 @@ async function poll(label, callback, predicate, timeoutMs) {
   )
 }
 
-function parseNumericText(rawValue) {
-  const normalized = `${rawValue ?? ''}`.trim().replace(/[^\d.-]/g, '')
-  if (!normalized) {
-    return 0
-  }
-  const parsed = Number.parseFloat(normalized)
-  return Number.isFinite(parsed) ? parsed : 0
-}
-
 async function captureFailureScreenshot(page, outputPath) {
   try {
     await page.screenshot({ path: outputPath, fullPage: true })
@@ -159,8 +150,14 @@ async function runPlayabilityFlow(page, frame, timeoutMs) {
     timeoutMs,
   )
 
-  const shotsField = frame.locator('[data-field="shots"]')
-  const shotsBefore = parseNumericText(await shotsField.textContent())
+  // Issue #1375 AC2 removed the raw shots telemetry field
+  // (`[data-field="shots"]`) from the combat HUD. Use the weapon readiness
+  // field (`[data-field="combat-hud-weapon"]`, `src/ui/combatHud.ts`) instead:
+  // it transitions "Ready" -> "Recharging" immediately after a shot fires, so
+  // it still gives an observable signal that canvas pointer input reached
+  // gameplay logic.
+  const weaponField = frame.locator('[data-field="combat-hud-weapon"]')
+  const weaponStateBefore = ((await weaponField.textContent()) ?? '').trim()
 
   const canvas = frame.locator('canvas.battle-stage__canvas')
   await canvas.waitFor({ state: 'visible', timeout: timeoutMs })
@@ -173,31 +170,31 @@ async function runPlayabilityFlow(page, frame, timeoutMs) {
   const pointerX = canvasBox.x + Math.min(200, canvasBox.width / 2)
   const pointerY = canvasBox.y + Math.min(160, canvasBox.height / 2)
 
-  let shotsAfter = shotsBefore
+  let weaponStateAfter = weaponStateBefore
   for (let attempt = 0; attempt < 3; attempt += 1) {
     await page.mouse.move(pointerX, pointerY)
     await page.mouse.down({ button: 'left' })
-    shotsAfter = await poll(
-      `shots increased after canvas pointer hold ${attempt + 1}`,
-      async () => parseNumericText(await shotsField.textContent()),
-      (value) => value > shotsBefore,
+    weaponStateAfter = await poll(
+      `weapon state changed after canvas pointer hold ${attempt + 1}`,
+      async () => ((await weaponField.textContent()) ?? '').trim(),
+      (value) => value !== '' && value !== weaponStateBefore,
       2_000,
-    ).catch(() => shotsBefore)
+    ).catch(() => weaponStateBefore)
     await page.mouse.up({ button: 'left' })
-    if (shotsAfter > shotsBefore) {
+    if (weaponStateAfter !== weaponStateBefore) {
       break
     }
   }
 
-  if (shotsAfter <= shotsBefore) {
+  if (weaponStateAfter === weaponStateBefore) {
     throw new Error(
-      `Canvas pointer input did not increase shots HUD value. before=${shotsBefore} after=${shotsAfter}`,
+      `Canvas pointer input did not change combat HUD weapon state. before=${weaponStateBefore} after=${weaponStateAfter}`,
     )
   }
 
   return {
-    shotsBefore,
-    shotsAfter,
+    weaponStateBefore,
+    weaponStateAfter,
     sortieStatus: (await sortieStatus.textContent())?.trim() ?? '',
   }
 }
