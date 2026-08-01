@@ -24,14 +24,23 @@ def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True, env=env)
 
 
-@pytest.fixture()
-def repo_with_worktree(tmp_path: Path) -> tuple[Path, Path]:
+def _build_repo_with_worktree(tmp_path: Path, *, include_runner_script: bool = False) -> tuple[Path, Path]:
     repo = tmp_path / "repo"
     repo.mkdir()
     _git("init", "-b", "main", cwd=repo)
     _git("remote", "add", "origin", "https://github.com/squne121/loop-protocol.git", cwd=repo)
     (repo / "README.md").write_text("seed\n", encoding="utf-8")
     _git("add", "README.md", cwd=repo)
+    if include_runner_script:
+        # Mirror the real repo layout where this runner script is itself
+        # checked out inside linked worktrees under scripts/agent-ops/, so a
+        # fixture-built worktree can exercise --repo-root default resolution
+        # exactly as it happens for a real .claude/worktrees/<slug>/ checkout
+        # (Issue #1887 fix-delta iteration 1).
+        script_dst = repo / "scripts" / "agent-ops" / "run_worktree_agent_runtime_smoke.py"
+        script_dst.parent.mkdir(parents=True, exist_ok=True)
+        script_dst.write_text(SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+        _git("add", str(script_dst.relative_to(repo)), cwd=repo)
     _git("commit", "-m", "seed", cwd=repo)
 
     worktree = repo / ".claude" / "worktrees" / "issue-0000-fixture"
@@ -39,6 +48,19 @@ def repo_with_worktree(tmp_path: Path) -> tuple[Path, Path]:
     _git("branch", "worktree-fixture", cwd=repo)
     _git("worktree", "add", str(worktree), "worktree-fixture", cwd=repo)
     return repo, worktree
+
+
+@pytest.fixture()
+def repo_with_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    return _build_repo_with_worktree(tmp_path)
+
+
+@pytest.fixture()
+def repo_with_worktree_and_script(tmp_path: Path) -> tuple[Path, Path]:
+    """Like ``repo_with_worktree``, but the runner script itself is checked
+    out at scripts/agent-ops/ so the worktree contains a real, physical copy
+    of it (mirroring the real .claude/worktrees/<slug>/ layout)."""
+    return _build_repo_with_worktree(tmp_path, include_runner_script=True)
 
 
 def _write_fake_exe(path: Path, script_body: str) -> None:
@@ -86,6 +108,15 @@ if [ "$1" = "--help" ]; then
   exit 0
 fi
 """
+
+
+FAKE_CLAUDE_SUCCESS_BODY = (
+    "\n"
+    "cat > /dev/null\n"
+    'echo \'{"type":"system","subtype":"init"}\'\n'
+    'echo \'{"type":"result","subtype":"success","marker":"MARKER_TOKEN_WT"}\'\n'
+    "exit 0\n"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +678,49 @@ exit 0
     metadata_text = (out_dir / "session-log-metadata.txt").read_text(encoding="utf-8")
     assert "subagent" in metadata_text
     assert "should not leak" not in metadata_text
+
+
+# ---------------------------------------------------------------------------
+# Fix-delta iteration 1: --repo-root default resolution from inside a linked
+# worktree (Issue #1887 PR #1921 review).
+# ---------------------------------------------------------------------------
+
+
+def test_given_script_checked_out_inside_linked_worktree_when_invoked_without_repo_root_then_not_rejected_as_root(
+    repo_with_worktree_and_script, tmp_path
+):
+    repo, worktree = repo_with_worktree_and_script
+    script_in_worktree = worktree / "scripts" / "agent-ops" / "run_worktree_agent_runtime_smoke.py"
+    assert script_in_worktree.is_file()
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + FAKE_CLAUDE_SUCCESS_BODY)
+    prompt = _prompt_file(tmp_path, "MARKER_TOKEN_WT\n")
+    out_dir = worktree / "artifacts" / "runtime-smoke" / "claude-structured"
+    env = dict(os.environ)
+    path_key = "PATH"
+    env[path_key] = str(fake_bin) + ":" + env[path_key]
+    # Invoke the script's own on-disk copy that lives *inside the worktree*,
+    # from the worktree cwd, without --repo-root -- this is exactly the
+    # real-world invocation pattern for Issue #1887 AC3-AC7.
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script_in_worktree),
+            "--worktree", str(worktree),
+            "--runtime", "claude", "--mode", "structured", "--transport", "direct",
+            "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+            "--timeout-seconds", "30", "--expect-marker", "MARKER_TOKEN_WT",
+        ],
+        cwd=str(worktree),
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert "root checkout rejected" not in result.stderr
+    assert result.returncode == 0, result.stderr
 
 
 # ---------------------------------------------------------------------------

@@ -137,6 +137,34 @@ def _git_toplevel(path: str) -> str | None:
     return os.path.realpath(out.strip())
 
 
+def _default_repo_root() -> str:
+    """Resolve the canonical repository root without assuming this file's own
+    checkout location is the canonical repository root.
+
+    This script is checked out both in the canonical repository and inside
+    linked worktrees under ``.claude/worktrees/<slug>/`` (Issue #1887 AC3-AC7
+    invoke it from within such a worktree). A naive ``__file__``-relative
+    resolution therefore resolves ``repo_root`` to the worktree itself when
+    invoked from inside a worktree, causing ``verify_worktree_identity`` to
+    reject a correctly supplied ``--worktree`` as a "root checkout" (fix-delta
+    iteration 1).
+
+    Linked worktrees share the same ``git rev-parse --git-common-dir`` target
+    as the canonical checkout (the shared ``.git`` directory lives at the
+    canonical repository root, never inside a worktree). Use that to derive
+    the canonical root regardless of which checkout this file happens to live
+    in.
+    """
+    script_dir = str(Path(__file__).resolve().parent)
+    common_dir = _git_common_dir(script_dir)
+    if common_dir is not None:
+        candidate = os.path.dirname(common_dir.rstrip(os.sep))
+        if candidate:
+            return candidate
+    # Fallback: legacy __file__-relative resolution (e.g. git unavailable).
+    return str(Path(__file__).resolve().parent.parent.parent)
+
+
 def verify_worktree_identity(worktree_arg: str, repo_root: str) -> str:
     """Return the resolved, verified worktree realpath, or raise IdentityError."""
     if not worktree_arg:
@@ -530,7 +558,7 @@ def main(argv: list[str] | None = None) -> int:
     run_id = uuid.uuid4().hex[:12]
     errors: list[str] = []
 
-    repo_root = args.repo_root or str(Path(__file__).resolve().parent.parent.parent)
+    repo_root = args.repo_root or _default_repo_root()
 
     try:
         worktree = verify_worktree_identity(args.worktree, repo_root)
