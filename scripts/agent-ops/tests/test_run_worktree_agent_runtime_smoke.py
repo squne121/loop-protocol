@@ -470,6 +470,7 @@ def test_given_agent_state_blocked_when_interactive_lane_runs_then_not_treated_a
     fake_bin.mkdir()
     body = _FAKE_HERDR_BODY.replace('echo \'{"state":"idle"}\'', 'echo \'{"state":"blocked"}\'')
     _write_fake_exe(fake_bin / "herdr", body)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
     prompt = _prompt_file(tmp_path)
     result = _run(
         repo, worktree,
@@ -490,6 +491,7 @@ def test_given_agent_state_unknown_when_interactive_lane_runs_then_not_treated_a
     fake_bin.mkdir()
     body = _FAKE_HERDR_BODY.replace('echo \'{"state":"idle"}\'', 'echo \'{"state":"unknown"}\'')
     _write_fake_exe(fake_bin / "herdr", body)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
     prompt = _prompt_file(tmp_path)
     result = _run(
         repo, worktree,
@@ -513,6 +515,7 @@ def test_given_pane_split_succeeds_when_lane_finishes_then_pane_close_invoked_fo
         'close) exit 0 ;;', f'close) echo "$3" >> "{close_log}"; exit 0 ;;'
     )
     _write_fake_exe(fake_bin / "herdr", body)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
     prompt = _prompt_file(tmp_path)
     result = _run(
         repo, worktree,
@@ -536,6 +539,7 @@ def test_given_keep_pane_flag_when_lane_finishes_then_pane_close_not_invoked(
         'close) exit 0 ;;', f'close) echo "$3" >> "{close_log}"; exit 0 ;;'
     )
     _write_fake_exe(fake_bin / "herdr", body)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
     prompt = _prompt_file(tmp_path)
     result = _run(
         repo, worktree,
