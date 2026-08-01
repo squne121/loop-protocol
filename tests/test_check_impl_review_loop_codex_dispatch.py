@@ -192,7 +192,49 @@ def test_rejects_missing_or_non_strict_v2_enabled_setting(tmp_path: Path, text: 
     assert failures
 
 
-def test_checker_executes_existing_explicit_spawn_note_assertion(tmp_path: Path):
+DISPATCH_SITE = ".claude/skills/impl-review-loop/steps/step-1-implementation.md"
+DISPATCH_SITES = {
+    DISPATCH_SITE: {
+        "task_name": "implementation_i0",
+        "agent_type": "implementation-worker",
+    }
+}
+
+
+def _write_dispatch_site(tmp_path: Path, text: str) -> None:
+    path = tmp_path / DISPATCH_SITE
+    path.parent.mkdir(parents=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _valid_dispatch_block() -> str:
+    return """```yaml
+spawn_agent:
+  task_name: implementation_i0
+  agent_type: implementation-worker
+  fork_turns: none
+  message: |
+    Objective: implement the linked Issue.
+    Live reference: the current linked Issue.
+    Bounded scope: the live Allowed Paths only.
+    Expected result: IMPLEMENT_RESULT_V1.
+```
+"""
+
+
+def test_given_current_repository_when_native_v2_dispatch_contract_runs_then_it_passes():
+    result = subprocess.run(
+        [sys.executable, str(MODULE_PATH), "--assert-native-v2-dispatch-contract"],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_given_current_repository_when_explicit_spawn_alias_runs_then_it_passes(tmp_path: Path):
     config_path = _write_config(
         tmp_path,
         """[features.multi_agent_v2]
@@ -201,10 +243,82 @@ max_concurrent_threads_per_session = 4
 """,
     )
 
-    assert callable(module.assert_explicit_spawn_notes)
     result = _run_checker(config_path, "--assert-explicit-spawn-notes")
-    assert result.returncode == 1
-    assert "missing explicit spawn note" in result.stdout
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("replacement", "diagnostic"),
+    [
+        ("agent_type: test-runner", "agent_type must be 'implementation-worker'"),
+        ("fork_turns: none", "fork_turns must be 'none'"),
+        ("task_name: implementation_i0", "task_name must be 'implementation_i0'"),
+    ],
+)
+def test_given_invalid_dispatch_field_when_static_contract_runs_then_it_rejects(
+    tmp_path: Path,
+    replacement: str,
+    diagnostic: str,
+):
+    block = _valid_dispatch_block()
+    if diagnostic == "fork_turns must be 'none'":
+        block = block.replace(replacement, "fork_turns: all")
+    elif diagnostic == "task_name must be 'implementation_i0'":
+        block = block.replace(replacement, "task_name: implementation-i0")
+    else:
+        block = block.replace("agent_type: implementation-worker", replacement)
+    _write_dispatch_site(tmp_path, block)
+
+    failures: list[str] = []
+    module.assert_native_v2_dispatch_contract(
+        failures,
+        repo_root=tmp_path,
+        dispatch_sites=DISPATCH_SITES,
+    )
+
+    assert any(diagnostic in failure for failure in failures)
+
+
+def test_given_missing_fork_turns_when_static_contract_runs_then_it_rejects(tmp_path: Path):
+    _write_dispatch_site(tmp_path, _valid_dispatch_block().replace("  fork_turns: none\n", ""))
+
+    failures: list[str] = []
+    module.assert_native_v2_dispatch_contract(
+        failures,
+        repo_root=tmp_path,
+        dispatch_sites=DISPATCH_SITES,
+    )
+
+    assert any("fork_turns must be 'none'" in failure for failure in failures)
+
+
+def test_given_duplicate_dispatch_blocks_when_static_contract_runs_then_it_rejects(tmp_path: Path):
+    _write_dispatch_site(tmp_path, _valid_dispatch_block() * 2)
+
+    failures: list[str] = []
+    module.assert_native_v2_dispatch_contract(
+        failures,
+        repo_root=tmp_path,
+        dispatch_sites=DISPATCH_SITES,
+    )
+
+    assert any("expected exactly one V2 dispatch block, found 2" in failure for failure in failures)
+
+
+def test_given_legacy_phrase_only_when_static_contract_runs_then_it_rejects(tmp_path: Path):
+    _write_dispatch_site(
+        tmp_path,
+        "Codex CLI: spawn the custom agent named implementation-worker for this step; the root thread must not.\n",
+    )
+
+    failures: list[str] = []
+    module.assert_native_v2_dispatch_contract(
+        failures,
+        repo_root=tmp_path,
+        dispatch_sites=DISPATCH_SITES,
+    )
+
+    assert any("expected exactly one V2 dispatch block, found 0" in failure for failure in failures)
 
 
 def test_accepts_documented_v1_rollback_config(tmp_path: Path):

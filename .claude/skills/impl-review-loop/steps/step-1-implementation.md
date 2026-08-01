@@ -1,20 +1,25 @@
 # Step 1: Implementation
 
 `implementation-worker` SubAgent に委譲し、`implement-issue` skill の手順を実行させる。
-
-Codex CLI: spawn the custom agent named implementation-worker for this step; the root thread must not edit files, run tests, commit, push, or make the review judgment directly.
+root/main（root thread）は最終 routing と mutation authorization を保持し、明示的に委譲された mechanical executor だけが既存の bounded contract 内で実行する。
 
 ## 委譲呼び出し
 
-Agent ツールで以下を呼ぶ:
+Agent ツールで以下の static call shape を使って起動する:
 
+```yaml
+spawn_agent:
+  task_name: implementation_i0
+  agent_type: implementation-worker
+  fork_turns: none
+  message: |
+    Objective: execute Step 1 implementation through implement-issue.
+    Live reference: LOOP_STATE.issue_number and contract_snapshot_url.
+    Bounded scope: live Issue Allowed Paths and fix_delta only.
+    Expected result: IMPLEMENT_RESULT_V1 with worktree, branch, PR, and verification facts.
 ```
-subagent_type: implementation-worker
-inputs:
-  issue_number: <LOOP_STATE.issue_number>
-  contract_snapshot_url: <LOOP_STATE.contract_snapshot_url>
-  fix_delta: <前イテレーションの blockers_history、初回 iteration では null>
-```
+
+This dispatch block defines static call shape only. It does not prove runtime capability, permission enforcement, or security-boundary verification. Native runtime verification is owned by #1841.
 
 SubAgent 側は `.claude/skills/implement-issue/SKILL.md` を実行し、worktree 作成・実装・検証・PR 起票（`open-pr` skill 経由）まで完了させる。
 

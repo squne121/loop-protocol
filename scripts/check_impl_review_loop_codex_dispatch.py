@@ -18,14 +18,34 @@ CONFIG_PATH = REPO_ROOT / ".codex/config.toml"
 # preparation.md must NOT contain an explicit automatic spawn note for it
 # (see assert_no_scope_rollup_runner_auto_spawn_note below, which inverts
 # the old "must contain" check into a "must not contain" check).
-SPAWN_NOTE_EXPECTATIONS = {
-    ".claude/skills/impl-review-loop/steps/step-1-implementation.md": "implementation-worker",
-    ".claude/skills/impl-review-loop/steps/step-2-verification.md": "test-runner",
-    ".claude/skills/impl-review-loop/steps/step-4-pr-review.md": "pr-reviewer",
-    ".claude/skills/post-merge-cleanup/SKILL.md": "post-merge-cleanup-worker",
+# The static contract intentionally validates documentation call shape only.  It
+# is not evidence that a native runtime can spawn, authorize, or complete an
+# agent task; Issue #1841 owns that runtime verification.
+NATIVE_V2_DISPATCH_SITES = {
+    ".claude/skills/impl-review-loop/steps/step-1-implementation.md": {
+        "task_name": "implementation_i0",
+        "agent_type": "implementation-worker",
+    },
+    ".claude/skills/impl-review-loop/steps/step-2-verification.md": {
+        "task_name": "verification_i0",
+        "agent_type": "test-runner",
+    },
+    ".claude/skills/impl-review-loop/steps/step-4-pr-review.md": {
+        "task_name": "pr_review_i0",
+        "agent_type": "pr-reviewer",
+    },
+    ".claude/skills/post-merge-cleanup/SKILL.md": {
+        "task_name": "post_merge_cleanup_pr1900",
+        "agent_type": "post-merge-cleanup-worker",
+    },
 }
 
 PREPARATION_MD = ".claude/skills/impl-review-loop/steps/preparation.md"
+NATIVE_V2_DISPATCH_BLOCK = re.compile(
+    r"^```yaml\nspawn_agent:\n(?P<arguments>(?: {2,}[^\n]*\n)+?)^```$",
+    re.MULTILINE,
+)
+TASK_NAME_PATTERN = re.compile(r"^[a-z0-9_]+$")
 
 
 def read_toml(path: Path) -> tuple[dict | None, str | None]:
@@ -139,15 +159,66 @@ def assert_no_project_profile_routing(failures: list[str]) -> None:
         failures.append(f".codex/config.toml: missing phrase '{required_phrase}'")
 
 
-def assert_explicit_spawn_notes(failures: list[str]) -> None:
-    for relative_path, agent_name in SPAWN_NOTE_EXPECTATIONS.items():
-        text = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
-        expected_phrase = (
-            f"Codex CLI: spawn the custom agent named {agent_name} for this step; "
-            "the root thread must not"
-        )
-        if expected_phrase not in text:
-            failures.append(f"{relative_path}: missing explicit spawn note for {agent_name}")
+def parse_native_v2_dispatch_blocks(text: str) -> list[dict[str, str]]:
+    """Extract fenced static ``spawn_agent`` call-shape blocks from a document."""
+    blocks: list[dict[str, str]] = []
+    for match in NATIVE_V2_DISPATCH_BLOCK.finditer(text):
+        lines = match.group("arguments").splitlines()
+        fields: dict[str, str] = {}
+        for index, line in enumerate(lines):
+            field_match = re.fullmatch(r"  (task_name|agent_type|fork_turns|message):(?: (.*))?", line)
+            if field_match is None:
+                continue
+            field, value = field_match.groups()
+            if field == "message" and value == "|":
+                message_lines: list[str] = []
+                for message_line in lines[index + 1 :]:
+                    if not message_line.startswith("    "):
+                        break
+                    message_lines.append(message_line[4:])
+                fields[field] = "\n".join(message_lines).strip()
+            else:
+                fields[field] = (value or "").strip()
+        blocks.append(fields)
+    return blocks
+
+
+def assert_native_v2_dispatch_contract(
+    failures: list[str],
+    *,
+    repo_root: Path = REPO_ROOT,
+    dispatch_sites: dict[str, dict[str, str]] = NATIVE_V2_DISPATCH_SITES,
+) -> None:
+    """Validate exactly one self-contained V2 static call shape per canonical site."""
+    for relative_path, expected in dispatch_sites.items():
+        path = repo_root / relative_path
+        try:
+            blocks = parse_native_v2_dispatch_blocks(path.read_text(encoding="utf-8"))
+        except OSError as error:
+            failures.append(f"{relative_path}: cannot read dispatch site ({error.__class__.__name__})")
+            continue
+
+        if len(blocks) != 1:
+            failures.append(
+                f"{relative_path}: expected exactly one V2 dispatch block, found {len(blocks)}"
+            )
+            continue
+
+        block = blocks[0]
+        if block.get("task_name") != expected["task_name"]:
+            failures.append(
+                f"{relative_path}: task_name must be {expected['task_name']!r}"
+            )
+        elif TASK_NAME_PATTERN.fullmatch(block["task_name"]) is None:
+            failures.append(f"{relative_path}: task_name must use lowercase letters, digits, and underscores")
+        if block.get("agent_type") != expected["agent_type"]:
+            failures.append(
+                f"{relative_path}: agent_type must be {expected['agent_type']!r}"
+            )
+        if block.get("fork_turns") != "none":
+            failures.append(f"{relative_path}: fork_turns must be 'none'")
+        if not block.get("message"):
+            failures.append(f"{relative_path}: message must be non-empty and self-contained")
 
 
 def assert_no_scope_rollup_runner_auto_spawn_note(failures: list[str]) -> None:
@@ -174,6 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
     config_assertions.add_argument("--assert-project-multi-agent-v1-config", action="store_true")
     parser.add_argument("--assert-no-max-depth-setting", action="store_true")
     parser.add_argument("--assert-no-project-profile-routing", action="store_true")
+    parser.add_argument("--assert-native-v2-dispatch-contract", action="store_true")
     parser.add_argument("--assert-explicit-spawn-notes", action="store_true")
     parser.add_argument("--assert-no-scope-rollup-runner-auto-spawn-note", action="store_true")
     return parser
@@ -188,6 +260,7 @@ def main() -> int:
             args.assert_project_multi_agent_v1_config,
             args.assert_no_max_depth_setting,
             args.assert_no_project_profile_routing,
+            args.assert_native_v2_dispatch_contract,
             args.assert_explicit_spawn_notes,
             args.assert_no_scope_rollup_runner_auto_spawn_note,
         )
@@ -205,8 +278,8 @@ def main() -> int:
         failures.extend(assert_no_max_depth_setting(args.config_path))
     if args.assert_no_project_profile_routing:
         assert_no_project_profile_routing(failures)
-    if args.assert_explicit_spawn_notes:
-        assert_explicit_spawn_notes(failures)
+    if args.assert_native_v2_dispatch_contract or args.assert_explicit_spawn_notes:
+        assert_native_v2_dispatch_contract(failures)
     if args.assert_no_scope_rollup_runner_auto_spawn_note:
         assert_no_scope_rollup_runner_auto_spawn_note(failures)
 

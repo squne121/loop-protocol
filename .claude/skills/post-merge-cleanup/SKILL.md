@@ -11,14 +11,21 @@ Codex CLI では、このステップ専用の custom agent `post-merge-cleanup-
 
 ## Delegation / 委譲
 
-main thread は以下の手順で SubAgent に委譲する:
+main thread は以下の static call shape で SubAgent に委譲する:
 
-1. `post-merge-cleanup-worker` SubAgent を Agent tool で起動:
-   ```
-   入力:
-     merged_pr_number: <マージした PR 番号>（ステップ 5-6 実行時は必須）
-     linked_issue_number: <linked issue 番号、任意>
-   ```
+```yaml
+spawn_agent:
+  task_name: post_merge_cleanup_pr1900
+  agent_type: post-merge-cleanup-worker
+  fork_turns: none
+  message: |
+    Objective: classify and perform the bounded post-merge cleanup contract.
+    Live reference: merged PR number and optional linked Issue number.
+    Bounded scope: canonical cleanup scripts, the specified worktree, branch, and follow-up candidates.
+    Expected result: POST_MERGE_CLEANUP_REPORT_V1 with cleanup and human-review facts.
+```
+
+1. `post-merge-cleanup-worker` SubAgent を Agent tool で起動する。
 
 2. SubAgent は `POST_MERGE_CLEANUP_REPORT_V1` YAML を返却する
 

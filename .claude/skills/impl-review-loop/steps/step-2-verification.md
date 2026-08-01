@@ -6,17 +6,18 @@ Codex CLI では `test-runner` custom agent を起動し、root thread は file 
 
 ## 委譲呼び出し
 
-Agent ツールで以下を呼ぶ:
+Agent ツールで以下の static call shape を使って起動する:
 
-```
-subagent_type: test-runner
-inputs:
-  issue_number: <LOOP_STATE.issue_number>
-  pr_number: <Step 1 で取得した PR 番号>
-  ac_list: <linked issue の Acceptance Criteria 一覧>
-  verification_commands: <linked issue の Verification Commands>
-  contract_body_sha256: <live Issue body SHA>
-  diff_head_sha: <diff summaryのhead_sha>
+```yaml
+spawn_agent:
+  task_name: verification_i0
+  agent_type: test-runner
+  fork_turns: none
+  message: |
+    Objective: execute the linked Issue Verification Commands as an independent read-only report.
+    Live reference: LOOP_STATE.issue_number, Step 1 PR number, and current contract body SHA.
+    Bounded scope: AC list, literal Verification Commands, and current diff head only.
+    Expected result: a head-bound test-runner report with per-AC PASS, FAIL, or SKIP facts.
 ```
 
 SubAgent 側は `.claude/agents/test-runner.md` の手順を実行し、Verification Commands を実行して結果を **read-only report として呼び出し元へ返す**。test-runner は PR へのコメント投稿を行わない（Issue #1648）。
