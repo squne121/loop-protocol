@@ -25,7 +25,9 @@ from skill_runtime_command_policy import (  # noqa: E402
     SKILL_RUNTIME_EXEC_REL,
     TRUSTED_REPO_SLUG,
     is_exact_skill_runtime_anchor_executor_command,
+    is_exact_skill_runtime_contract_update_anchor_executor_command,
     parse_exact_skill_runtime_anchor_command,
+    parse_exact_skill_runtime_contract_update_anchor_command,
     parse_exact_skill_runtime_command,
 )
 
@@ -41,6 +43,18 @@ def _cmd(
     return (
         f"uv run python3 {SKILL_RUNTIME_EXEC_REL} "
         "--command-id preflight.run.with_anchor "
+        f"--issue-number {issue_number} --repo {repo} --anchor-comment-url {url}"
+    )
+
+
+def _contract_update_cmd(
+    issue_number: str = "981",
+    repo: str = TRUSTED_REPO_SLUG,
+    url: str = _VALID_URL,
+) -> str:
+    return (
+        f"uv run python3 {SKILL_RUNTIME_EXEC_REL} "
+        "--command-id contract_update.run.with_anchor "
         f"--issue-number {issue_number} --repo {repo} --anchor-comment-url {url}"
     )
 
@@ -238,6 +252,35 @@ class TestIsExactSkillRuntimeAnchorExecutorCommand:
     def test_denies_malformed_command(self, tmp_git_repo: Path):
         assert not is_exact_skill_runtime_anchor_executor_command(
             _cmd() + " --extra x", str(tmp_git_repo), str(tmp_git_repo)
+        )
+
+
+class TestContractUpdateAnchorExecutorCommand:
+    def test_allows_only_the_explicit_main_control_plane_phase(self, tmp_git_repo: Path):
+        parsed = parse_exact_skill_runtime_contract_update_anchor_command(
+            _contract_update_cmd(), str(tmp_git_repo)
+        )
+        assert parsed is not None
+        assert parsed.command_id == "contract_update.run.with_anchor"
+        assert is_exact_skill_runtime_contract_update_anchor_executor_command(
+            _contract_update_cmd(), str(tmp_git_repo), str(tmp_git_repo)
+        )
+        # The preflight parser cannot reinterpret the mutation phase.
+        assert parse_exact_skill_runtime_anchor_command(_contract_update_cmd(), str(tmp_git_repo)) is None
+
+    def test_denies_contract_update_from_subdir_or_nondefault_branch(self, tmp_git_repo: Path):
+        subdir = tmp_git_repo / "subdir"
+        subdir.mkdir()
+        assert not is_exact_skill_runtime_contract_update_anchor_executor_command(
+            _contract_update_cmd(), str(subdir), str(tmp_git_repo)
+        )
+        subprocess.run(
+            ["git", "-C", str(tmp_git_repo), "switch", "-c", "topic/contract-update-negative"],
+            check=True,
+            capture_output=True,
+        )
+        assert not is_exact_skill_runtime_contract_update_anchor_executor_command(
+            _contract_update_cmd(), str(tmp_git_repo), str(tmp_git_repo)
         )
 
 

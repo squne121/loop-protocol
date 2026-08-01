@@ -397,9 +397,7 @@ def compute_scope_signal_delta(payload: dict[str, Any]) -> dict[str, Any]:
     repeated_in_scope_layers = sorted(after_in_scope_values & before_in_scope_values)
 
     added_low_verifiability = [
-        item["value"]
-        for item in after_ac
-        if item["value"] not in before_ac_map and item["is_low_verifiability"]
+        item["value"] for item in after_ac if item["value"] not in before_ac_map and item["is_low_verifiability"]
     ]
 
     signals: list[dict[str, Any]] = []
@@ -653,10 +651,7 @@ def detect_boundary_flags(text: "str | None", *, expands_allowed_paths: bool = F
     (derived from an actual Allowed Paths diff, not text matching).
     """
     haystack = text or ""
-    flags = {
-        name: bool(pattern.search(haystack))
-        for name, pattern in _BOUNDARY_KEYWORD_PATTERNS.items()
-    }
+    flags = {name: bool(pattern.search(haystack)) for name, pattern in _BOUNDARY_KEYWORD_PATTERNS.items()}
     flags["expands_allowed_paths"] = bool(expands_allowed_paths)
     return {key: flags.get(key, False) for key in _BOUNDARY_FLAG_KEYS}
 
@@ -830,27 +825,406 @@ _MARKER_TO_CONTRACT_SECTION = {
 
 
 def derive_contract_patch_operations(evidence_list: list) -> list:
-    """Derive contract_patch_plan_v1.operations from evidence directive markers."""
+    """Derive one section-bound operation for each normalized directive.
+
+    ``CONTRACT_PATCH_PLAN_V1`` deliberately retains its existing ``append``
+    wire grammar.  The consumer below turns these entries into transaction-
+    local desired section state; keeping that detail out of the plan avoids a
+    schema migration while preventing the former sections × directives fanout.
+    """
     operations = []
     for index, evidence in enumerate(evidence_list):
         markers = evidence.get("directive_markers") or []
         directives = evidence.get("extracted_directives") or []
         if not markers:
             continue
-        texts = directives if directives else [f"Reflect reviewer directive ({marker})" for marker in markers]
-        for marker in markers:
-            section = _MARKER_TO_CONTRACT_SECTION.get(marker, "Acceptance Criteria")
-            for text in texts:
-                operations.append(
-                    {
-                        "section": section,
-                        "op": "append",
-                        "text": text,
-                        "rationale": f"Directive extracted from trusted review comment ({marker})",
-                        "source_evidence_index": index,
-                    }
+        texts = directives or [f"Reflect reviewer directive ({markers[0]})"]
+        for text in texts:
+            lowered = text.lower()
+            if "allowed path" in lowered:
+                marker = "allowed paths"
+            elif "verification command" in lowered:
+                marker = "verification command"
+            elif "stop condition" in lowered:
+                marker = "stop condition"
+            elif "precondition" in lowered or "前提条件" in text:
+                marker = "precondition"
+            elif "ac" in lowered or "acceptance criteria" in lowered:
+                marker = "revised acceptance criteria"
+            else:
+                marker = next(
+                    (candidate for candidate in markers if candidate in _MARKER_TO_CONTRACT_SECTION),
+                    "revised acceptance criteria",
                 )
+            operations.append(
+                {
+                    "section": _MARKER_TO_CONTRACT_SECTION[marker],
+                    "op": "append",
+                    "text": text,
+                    "rationale": f"Directive extracted from trusted review comment ({marker})",
+                    "source_evidence_index": index,
+                }
+            )
     return operations
+
+
+_ITERATION_ZERO_STATE_VALUES = {
+    "directive_acceptance": {"accepted", "rejected", "unresolved"},
+    "repo_fact_verification": {"verified", "contradicted", "unavailable"},
+    "external_precondition": {"satisfied", "unsatisfied", "unknown"},
+    "contract_update": {"not_needed", "pending", "rebased", "applied", "no_change", "failed"},
+}
+
+
+def _iteration_zero_states(**overrides: str) -> dict:
+    """Return the four independent, transaction-local iteration-zero states."""
+    states = {
+        "directive_acceptance": {"status": "unresolved"},
+        "repo_fact_verification": {"status": "unavailable"},
+        "external_precondition": {"status": "unknown"},
+        "contract_update": {"status": "pending"},
+    }
+    for key, value in overrides.items():
+        if key in _ITERATION_ZERO_STATE_VALUES and value in _ITERATION_ZERO_STATE_VALUES[key]:
+            states[key] = {"status": value}
+    return states
+
+
+def normalize_trusted_anchor_iteration_zero(*, repo: str, issue_number: int, anchor: dict, source_body: str) -> dict:
+    """Validate trusted-anchor provenance without requiring a prior snapshot.
+
+    This is intentionally a pure, transaction-local bootstrap lane.  It
+    consumes the fetched comment metadata, never the caller's interpretation
+    of its raw body, and produces source identity used again immediately
+    before a controlled mutation.
+    """
+    parsed = parse_issue_comment_url(anchor.get("html_url") or anchor.get("comment_url"))
+    association = anchor.get("author_association")
+    source_hash = _sha256(source_body)
+    expected_hash = anchor.get("source_body_sha256") or anchor.get("body_sha256")
+    states = _iteration_zero_states()
+    if (
+        parsed is None
+        or f"{parsed['owner']}/{parsed['repo']}".lower() != repo.lower()
+        or parsed["issue_number"] != issue_number
+        or association not in SCOPE_DELTA_AUTHORITY_TRUSTED_ASSOCIATIONS
+        or not isinstance(anchor.get("id"), (int, str))
+        or str(anchor.get("id")) != parsed["comment_id"]
+        or (expected_hash is not None and expected_hash != source_hash)
+    ):
+        return {
+            "accepted": False,
+            "states": _iteration_zero_states(directive_acceptance="rejected", contract_update="failed"),
+            "failure": "anchor_identity_or_trust_changed",
+        }
+    states = _iteration_zero_states(
+        directive_acceptance="accepted",
+        repo_fact_verification="verified",
+        external_precondition="satisfied",
+        contract_update="pending",
+    )
+    return {
+        "accepted": True,
+        "states": states,
+        "source_identity": {
+            "repo": repo,
+            "issue_number": issue_number,
+            "comment_id": str(anchor["id"]),
+            "source_body_sha256": source_hash,
+            "source_span": {"start_line": 1, "end_line": max(1, len(source_body.splitlines()))},
+        },
+    }
+
+
+def _replace_top_level_section(body: str, section: str, desired: str) -> str:
+    """Replace one H2 section while ignoring headings in fences and quotes."""
+    lines = body.splitlines()
+    start = None
+    end = len(lines)
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    for index, line in enumerate(lines):
+        if not in_fence:
+            opener = _parse_fence_opener(line)
+            if opener is not None:
+                fence_char, fence_len = opener
+                in_fence = True
+                continue
+        else:
+            if _is_fence_closer(line, fence_char, fence_len):
+                in_fence = False
+            continue
+        if line.lstrip().startswith(">"):
+            continue
+        heading = _parse_heading(line)
+        if heading == section and start is None:
+            start = index
+            continue
+        if start is not None and heading is not None:
+            end = index
+            break
+    if start is None:
+        raise ValueError(f"missing_target_section:{section}")
+    replacement = [lines[start]]
+    if desired:
+        replacement.extend(desired.splitlines())
+    if end < len(lines) and (not replacement or replacement[-1] != ""):
+        replacement.append("")
+    return "\n".join([*lines[:start], *replacement, *lines[end:]]).rstrip() + "\n"
+
+
+def _insert_top_level_section(body: str, section: str, desired: str, after_section: str | None) -> str:
+    """Insert one missing H2 section at an explicit, top-level anchor."""
+    rendered = f"## {section}\n{desired.strip()}\n"
+    if after_section is None:
+        return body.rstrip() + "\n\n" + rendered
+    lines = body.splitlines()
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    insertion = None
+    for index, line in enumerate(lines):
+        if not in_fence:
+            opener = _parse_fence_opener(line)
+            if opener is not None:
+                fence_char, fence_len = opener
+                in_fence = True
+                continue
+        elif _is_fence_closer(line, fence_char, fence_len):
+            in_fence = False
+            continue
+        if line.lstrip().startswith(">"):
+            continue
+        heading = _parse_heading(line)
+        if insertion is not None and heading is not None:
+            break
+        if heading == after_section:
+            insertion = index + 1
+    if insertion is None:
+        raise ValueError(f"missing_section_insertion_anchor:{after_section}")
+    while insertion < len(lines) and _parse_heading(lines[insertion]) is None:
+        insertion += 1
+    replacement = ["", *rendered.rstrip().splitlines(), ""]
+    return "\n".join([*lines[:insertion], *replacement, *lines[insertion:]]).rstrip() + "\n"
+
+
+def build_section_aware_candidate_body(*, body: str, operations: list[dict], source_identity: dict) -> dict:
+    """Consume a patch plan into desired H2 section state without fanout.
+
+    Operations are deduplicated by their operation identity.  A caller may
+    supply transaction-local ``kind`` (upsert/replace/remove) and
+    ``remove_text`` fields; these are deliberately not persisted in the
+    existing plan schema.
+    """
+    sections = extract_sections(body)
+    desired_sections = dict(sections)
+    identities: set[str] = set()
+    postconditions: list[dict] = []
+    for operation in operations:
+        section = operation.get("section")
+        text = operation.get("text")
+        kind = operation.get("kind", "upsert")
+        if not isinstance(section, str) or not isinstance(text, str) or not text.strip():
+            raise ValueError("invalid_section_bound_operation")
+        if kind not in {"upsert", "replace", "remove"}:
+            raise ValueError("invalid_section_operation_kind")
+        # Keep the operation identity as canonical transaction-local data,
+        # rather than introducing another digest/artifact format.
+        identity = _canonical_json({"section": section, "kind": kind, "desired": text.strip()})
+        if identity in identities:
+            continue
+        identities.add(identity)
+        if section not in sections:
+            if kind == "remove" or not isinstance(operation.get("after_section"), str):
+                raise ValueError("invalid_section_bound_operation")
+            desired_sections[section] = text.strip()
+            postconditions.append({"section": section, "contains": text.strip(), "removes": None})
+            continue
+        current = desired_sections[section]
+        remove_text = operation.get("remove_text")
+        if isinstance(remove_text, str) and remove_text:
+            current = "\n".join(line for line in current.splitlines() if remove_text not in line)
+        if kind == "remove":
+            current = "\n".join(line for line in current.splitlines() if text.strip() not in line)
+        elif kind == "replace":
+            current = text.strip()
+        elif text.strip() not in current.splitlines():
+            current = "\n".join(part for part in (current, text.strip()) if part).strip()
+        desired_sections[section] = current
+        postconditions.append(
+            {"section": section, "contains": None if kind == "remove" else text.strip(), "removes": remove_text}
+        )
+
+    candidate = body
+    for section in sections:
+        if desired_sections[section] != sections[section]:
+            candidate = _replace_top_level_section(candidate, section, desired_sections[section])
+    for operation in operations:
+        section = operation.get("section")
+        if section not in sections and section in desired_sections:
+            candidate = _insert_top_level_section(
+                candidate,
+                section,
+                desired_sections[section],
+                operation.get("after_section"),
+            )
+    return {
+        "candidate_body": candidate,
+        "changed": candidate != body,
+        "operation_identities": sorted(identities),
+        "source_identity": source_identity,
+        "postconditions": postconditions,
+    }
+
+
+def build_issue_edit_txn_input(
+    *,
+    issue_number: int,
+    repo: str,
+    previous_body_sha256: str,
+    previous_updated_at: str,
+    new_body_file: str,
+    readiness_result: dict,
+) -> dict:
+    """Adapt a candidate to the existing controlled transaction input."""
+    return {
+        "schema": "ISSUE_EDIT_TXN_INPUT_V1",
+        "issue_number": issue_number,
+        "repo": repo,
+        "new_body_file": new_body_file,
+        "expected_previous_body_sha256": previous_body_sha256,
+        "expected_previous_updated_at": previous_updated_at,
+        "readiness_forwarding_payload": {"readiness_result": readiness_result},
+        "comment_mode": {"mode": "skip"},
+    }
+
+
+def run_trusted_anchor_iteration_zero(
+    *,
+    repo: str,
+    issue_number: int,
+    issue: dict,
+    anchor: dict,
+    anchor_body: str,
+    patch_plan: dict,
+    candidate_readiness,
+    fetch_current,
+    apply_transaction=None,
+    fresh_checks=None,
+) -> dict:
+    """Execute the bounded, callback-based trusted-anchor path.
+
+    The callbacks keep GitHub I/O in the existing controlled executor.  A
+    body drift is rebased once; trust/anchor changes and postcondition failure
+    are fail-closed.  This function neither creates durable state nor writes
+    directly to GitHub.
+    """
+    normalized = normalize_trusted_anchor_iteration_zero(
+        repo=repo, issue_number=issue_number, anchor=anchor, source_body=anchor_body
+    )
+    if not normalized["accepted"]:
+        return {"status": "blocked", **normalized, "writes": 0, "iterations": 0}
+    current = dict(issue)
+    rebases = 0
+    while True:
+        candidate = build_section_aware_candidate_body(
+            body=current.get("body", ""),
+            operations=patch_plan.get("operations", []),
+            source_identity=normalized["source_identity"],
+        )
+        if not candidate["changed"]:
+            result = {
+                "status": "no_change",
+                "states": _iteration_zero_states(contract_update="no_change"),
+                "writes": 0,
+                "iterations": 0,
+                **candidate,
+            }
+            if fresh_checks is not None:
+                result["fresh_checks"] = fresh_checks(current)
+            return result
+        readiness = candidate_readiness(candidate["candidate_body"])
+        if not isinstance(readiness, dict) or readiness.get("status") != "go":
+            return {
+                "status": "blocked",
+                "states": _iteration_zero_states(contract_update="failed"),
+                "failure": "candidate_readiness_not_go",
+                "writes": 0,
+                "iterations": rebases,
+                **candidate,
+            }
+        fresh_issue, fresh_anchor = fetch_current()
+        fresh_anchor_body = fresh_anchor.get("body", anchor_body)
+        fresh_normalized = normalize_trusted_anchor_iteration_zero(
+            repo=repo, issue_number=issue_number, anchor=fresh_anchor, source_body=fresh_anchor_body
+        )
+        if not fresh_normalized["accepted"] or fresh_normalized["source_identity"] != normalized["source_identity"]:
+            return {
+                "status": "blocked",
+                "states": _iteration_zero_states(directive_acceptance="rejected", contract_update="failed"),
+                "failure": "anchor_identity_or_trust_changed",
+                "writes": 0,
+                "iterations": rebases,
+            }
+        if fresh_issue.get("body") != current.get("body"):
+            if rebases >= 1:
+                return {
+                    "status": "blocked",
+                    "states": _iteration_zero_states(contract_update="failed"),
+                    "failure": "body_drift_retry_exhausted",
+                    "writes": 0,
+                    "iterations": rebases,
+                }
+            current = dict(fresh_issue)
+            rebases += 1
+            continue
+        if apply_transaction is None:
+            return {
+                "status": "ready_for_controlled_mutation",
+                "states": _iteration_zero_states(contract_update="pending"),
+                "writes": 0,
+                "iterations": rebases,
+                "readiness": readiness,
+                **candidate,
+            }
+        transaction_result = apply_transaction(fresh_issue, candidate["candidate_body"], readiness)
+        final_issue, final_anchor = fetch_current()
+        final_anchor_body = final_anchor.get("body", anchor_body)
+        final_normalized = normalize_trusted_anchor_iteration_zero(
+            repo=repo, issue_number=issue_number, anchor=final_anchor, source_body=final_anchor_body
+        )
+        if not final_normalized["accepted"] or final_issue.get("body") != candidate["candidate_body"]:
+            return {
+                "status": "blocked",
+                "states": _iteration_zero_states(contract_update="failed"),
+                "failure": "final_readback_postcondition_failed",
+                "writes": 1,
+                "iterations": rebases,
+            }
+        if any(
+            (item["contains"] is not None and item["contains"] not in final_issue["body"])
+            or (item["removes"] and item["removes"] in final_issue["body"])
+            for item in candidate["postconditions"]
+        ):
+            return {
+                "status": "blocked",
+                "states": _iteration_zero_states(contract_update="failed"),
+                "failure": "section_postcondition_failed",
+                "writes": 1,
+                "iterations": rebases,
+            }
+        result = {
+            "status": "applied",
+            "states": _iteration_zero_states(contract_update="applied"),
+            "writes": 1,
+            "iterations": rebases,
+            "transaction_result": transaction_result,
+            **candidate,
+        }
+        if fresh_checks is not None:
+            result["fresh_checks"] = fresh_checks(final_issue)
+        return result
 
 
 def _patch_source_evidence_entry(evidence: dict) -> dict:
@@ -860,9 +1234,7 @@ def _patch_source_evidence_entry(evidence: dict) -> dict:
     # extracted_text_sha256 hashes only the already-extracted directive
     # texts (never the raw comment body, AC14).
     extracted_directives = evidence.get("extracted_directives") or []
-    extracted_text_sha256 = (
-        _sha256("\n".join(extracted_directives)) if extracted_directives else None
-    )
+    extracted_text_sha256 = _sha256("\n".join(extracted_directives)) if extracted_directives else None
     return {
         "source_ref": evidence.get("source_ref") or evidence.get("comment_url"),
         "source_body_sha256": evidence.get("body_sha256"),
