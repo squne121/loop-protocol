@@ -20,11 +20,20 @@ AC7: this file itself, with >=4 fixture kinds (869-line real-shaped fixture,
      addition-only, partial-retraction, unmarked-region).
 AC8: anchor_context.py has no GitHub API client of its own -- verified via a
      production subprocess E2E invocation.
+
+Iteration 2 (PR #1923 OWNER REQUEST_CHANGES, CORRECTED_REVIEW): the private
+helpers above only ever mutated `known_context`, which the planner never
+reads, so the multi-turn route / heavy mutation gate never actually stopped
+the loop. `test_run_preflight_subprocess_*` below invoke the real
+`run_refinement_preflight.py` entrypoint as a subprocess (not the private
+function) and assert the wrapper's own `status` / exit code, proving the
+fail-closed wiring reaches `_apply_exit_code_mapping()`.
 """
 
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -404,3 +413,263 @@ def test_anchor_context_subprocess_e2e_no_own_github_api_call():
             timeout=30,
         )
         assert completed.returncode == 2
+
+
+# ---------------------------------------------------------------------------
+# Iteration 2 (PR #1923 CORRECTED_REVIEW): fail_closed / heavy_mutation_gate
+# actually reach `blockers` -> `_apply_exit_code_mapping()` via a real
+# subprocess invocation of run_refinement_preflight.py's own CLI entrypoint
+# (main() -> run_preflight()), not merely the private helper functions.
+# ---------------------------------------------------------------------------
+
+TARGET_SCRIPT = SCRIPTS_DIR / "run_refinement_preflight.py"
+
+_VALID_CONTRACT_BODY = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+parent_issue: "#1"
+```
+
+## Parent Issue
+
+#1
+
+## Parent Goal Ref
+
+- Goal: Test goal
+
+## Current Validated Scope
+
+- scripts/example.py
+
+## Remaining Parent Gaps
+
+- [ ] Nothing remaining
+
+## Outcome
+
+Add `scripts/example.py`.
+
+## In Scope
+
+- scripts/example.py
+
+## Out of Scope
+
+- Unrelated changes
+
+## Acceptance Criteria
+
+- [ ] AC1: Script exists.
+
+## Verification Commands
+
+```bash
+uv run python3 scripts/example.py
+```
+
+## Allowed Paths
+
+- scripts/example.py
+
+## Stop Conditions
+
+- Allowed Paths 外の変更が必要な場合
+
+## Required Skills
+
+なし
+"""
+
+
+def _repo_root_for_test() -> Path:
+    """Mirrors the wrapper's own `_find_repo_root()` so the test can locate
+    (and clean up) the artifact directory the real subprocess run writes
+    to."""
+    current = TARGET_SCRIPT.resolve().parent
+    for _ in range(10):
+        if (current / ".git").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    raise AssertionError("could not locate repo root from TARGET_SCRIPT")
+
+
+def _run_subprocess_fixture(
+    tmp_path: Path,
+    *,
+    issue_number: int,
+    repo: str,
+    fixture: dict,
+    anchor_comment_url: "str | None" = None,
+) -> tuple[dict, int]:
+    """Invoke the real `run_refinement_preflight.py` CLI (not the private
+    Python function) against `fixture`, and return
+    (refinement_preflight_result_v1.json contents, subprocess exit code)."""
+    fixture_path = tmp_path / f"fixture_{issue_number}.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+
+    repo_root = _repo_root_for_test()
+    artifact_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+
+    argv = [
+        sys.executable,
+        str(TARGET_SCRIPT),
+        "--issue-number",
+        str(issue_number),
+        "--repo",
+        repo,
+        "--fixture",
+        str(fixture_path),
+    ]
+    if anchor_comment_url:
+        argv.extend(["--anchor-comment-url", anchor_comment_url])
+
+    try:
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        result_path = artifact_dir / "refinement_preflight_result_v1.json"
+        result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else {}
+    finally:
+        if artifact_dir.exists():
+            shutil.rmtree(artifact_dir, ignore_errors=True)
+
+    return result, completed.returncode
+
+
+_SUBPROC_ISSUE_MULTI_TURN = 99931891
+_SUBPROC_ISSUE_HEAVY_MUTATION_BLOCKED = 99941891
+_SUBPROC_ISSUE_HEAVY_MUTATION_OWNER_APPROVED = 99951891
+_SUBPROC_ISSUE_NON_HEAVY_MUTATION = 99961891
+_SUBPROC_REPO = "testowner/testrepo"
+_SUBPROC_COMMENT_ID = 88891891
+_SUBPROC_ANCHOR_URL = (
+    f"https://github.com/{_SUBPROC_REPO}/issues/{_SUBPROC_ISSUE_MULTI_TURN}"
+    f"#issuecomment-{_SUBPROC_COMMENT_ID}"
+)
+
+
+def _base_fixture(issue_number: int, *, known_context: "dict | None" = None) -> dict:
+    return {
+        "schema_version": "refinement_preflight_input/v1",
+        "issue_number": issue_number,
+        "repo": _SUBPROC_REPO,
+        "now": "2026-01-01T00:00:00+00:00",
+        "issue": {
+            "number": issue_number,
+            "title": "Subprocess fail-closed wiring fixture (#1891 iteration 2)",
+            "body": _VALID_CONTRACT_BODY,
+            "labels": [],
+        },
+        "comments": [],
+        "anchor_comment_urls": [],
+        "known_context": known_context,
+    }
+
+
+def test_run_preflight_subprocess_multi_turn_ambiguity_blocks(tmp_path):
+    """Multiple marker-delimited segments + multiple candidates (the real
+    869-line fixture) must make the real subprocess entrypoint report
+    `status: blocked` / exit code EXIT_BLOCKED -- not merely an in-memory
+    dict field."""
+    fixture = _base_fixture(_SUBPROC_ISSUE_MULTI_TURN)
+    fixture["anchor_comment_urls"] = [_SUBPROC_ANCHOR_URL]
+    fixture["anchor_comments"] = [
+        {
+            "id": _SUBPROC_COMMENT_ID,
+            "body": FIXTURE_869_LINES,
+            "issue_url": f"https://api.github.com/repos/{_SUBPROC_REPO}/issues/{_SUBPROC_ISSUE_MULTI_TURN}",
+            "author_association": "OWNER",
+            "user": {"login": "reviewer", "type": "User"},
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "html_url": _SUBPROC_ANCHOR_URL,
+            "url": f"https://api.github.com/repos/{_SUBPROC_REPO}/issues/comments/{_SUBPROC_COMMENT_ID}",
+        }
+    ]
+
+    result, exit_code = _run_subprocess_fixture(
+        tmp_path,
+        issue_number=_SUBPROC_ISSUE_MULTI_TURN,
+        repo=_SUBPROC_REPO,
+        fixture=fixture,
+        anchor_comment_url=_SUBPROC_ANCHOR_URL,
+    )
+
+    assert exit_code == preflight.EXIT_BLOCKED, (result, exit_code)
+    assert result.get("status") == "blocked", result
+    assert preflight.BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED in result.get("blockers", []), result
+
+
+def test_run_preflight_subprocess_heavy_mutation_without_owner_blocks(tmp_path):
+    """A heavy mutation category (`close`) without owner-sourced evidence must
+    make the real subprocess entrypoint report `status: blocked` / exit code
+    EXIT_BLOCKED."""
+    fixture = _base_fixture(
+        _SUBPROC_ISSUE_HEAVY_MUTATION_BLOCKED,
+        known_context={"mutation_category": "close"},
+    )
+
+    result, exit_code = _run_subprocess_fixture(
+        tmp_path,
+        issue_number=_SUBPROC_ISSUE_HEAVY_MUTATION_BLOCKED,
+        repo=_SUBPROC_REPO,
+        fixture=fixture,
+    )
+
+    assert exit_code == preflight.EXIT_BLOCKED, (result, exit_code)
+    assert result.get("status") == "blocked", result
+    assert preflight.BLOCKER_HEAVY_MUTATION_FAIL_CLOSED in result.get("blockers", []), result
+
+
+def test_run_preflight_subprocess_heavy_mutation_with_owner_approval_not_blocked_by_gate(tmp_path):
+    """Regression: an explicit owner-sourced decision must NOT be blocked by
+    the heavy mutation gate (existing normal-path behavior is preserved)."""
+    fixture = _base_fixture(
+        _SUBPROC_ISSUE_HEAVY_MUTATION_OWNER_APPROVED,
+        known_context={
+            "mutation_category": "close",
+            "scope_delta_decision": {
+                "status": "approved_by_trusted_anchor",
+                "anchor_author_association": "OWNER",
+            },
+        },
+    )
+
+    result, exit_code = _run_subprocess_fixture(
+        tmp_path,
+        issue_number=_SUBPROC_ISSUE_HEAVY_MUTATION_OWNER_APPROVED,
+        repo=_SUBPROC_REPO,
+        fixture=fixture,
+    )
+
+    assert preflight.BLOCKER_HEAVY_MUTATION_FAIL_CLOSED not in result.get("blockers", []), result
+    assert preflight.BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED not in result.get("blockers", []), result
+
+
+def test_run_preflight_subprocess_non_heavy_mutation_not_blocked_by_gate(tmp_path):
+    """Regression: an ordinary body-improvement mutation_category must NOT be
+    blocked by the heavy mutation gate."""
+    fixture = _base_fixture(
+        _SUBPROC_ISSUE_NON_HEAVY_MUTATION,
+        known_context={"mutation_category": "body_improvement"},
+    )
+
+    result, exit_code = _run_subprocess_fixture(
+        tmp_path,
+        issue_number=_SUBPROC_ISSUE_NON_HEAVY_MUTATION,
+        repo=_SUBPROC_REPO,
+        fixture=fixture,
+    )
+
+    assert preflight.BLOCKER_HEAVY_MUTATION_FAIL_CLOSED not in result.get("blockers", []), result
+    assert preflight.BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED not in result.get("blockers", []), result

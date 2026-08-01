@@ -1,5 +1,8 @@
-<!-- anonymized fixture: exported multi-turn conversation transcript, Issue #1891 AC1/AC3/AC7 -->
+<!-- 匿名化した fixture: エクスポート済みの複数ターン会話ログ、Issue #1891 AC1/AC3/AC7 用 -->
 
+この fixture は Issue #1891 の AC1/AC3/AC7 検証用に匿名化した、エクスポート済みの複数ターン会話ログである。以下はマーカー行を含むコードフェンス内の実データで、テストは行数や候補件数を動的に計算する。
+
+```text
 # You Asked
 
 I'm about to implement Issue #9001 ("add background job retry policy").
@@ -867,3 +870,5 @@ Understood -- noted for the record. No action required for this turn.
 
 # You Asked
 
+
+```
