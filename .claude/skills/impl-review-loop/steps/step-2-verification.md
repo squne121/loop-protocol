@@ -6,18 +6,25 @@ Codex CLI では `test-runner` custom agent を起動し、root thread は file 
 
 ## 委譲呼び出し
 
-Agent ツールで以下を呼ぶ:
+Agent ツールで以下の static call shape を使って起動する:
 
+```yaml
+spawn_agent:
+  task_name: verification_i{iteration}
+  agent_type: test-runner
+  fork_turns: none
+  message: |
+    Objective: execute the actual linked Issue Verification Commands as an independent read-only report.
+    Live reference: bind the actual Issue number, PR number, contract body SHA, and diff head SHA.
+    Bounded scope: bind the literal AC list and literal Verification Commands for that exact head only.
+    Expected result: a head-bound test-runner report with per-AC PASS, FAIL, or SKIP facts.
 ```
-subagent_type: test-runner
-inputs:
-  issue_number: <LOOP_STATE.issue_number>
-  pr_number: <Step 1 で取得した PR 番号>
-  ac_list: <linked issue の Acceptance Criteria 一覧>
-  verification_commands: <linked issue の Verification Commands>
-  contract_body_sha256: <live Issue body SHA>
-  diff_head_sha: <diff summaryのhead_sha>
-```
+
+### Materialization rule（実値を具体化する規則）
+
+`task_name` は実行直前に実際の非負 iteration で `verification_i{iteration}` から materialize し、同一 root session 内で既に保存済みの canonical task name を再利用してはならない。`fork_turns: none` のため、root は message に実際の Issue number、PR number、AC 全文、literal Verification Commands 全文、contract body SHA、diff head SHA を値として埋め込む。`LOOP_STATE`、`Step 1 PR number`、`current contract body SHA`、変数名、波括弧・山括弧の placeholder を child message に渡してはならない。この static template 自体を tool call として送信してはならない。
+
+完了の扱いは4 site 共通の [Common Completion Protocol](step-4-pr-review.md#common-completion-protocol) に従う。
 
 SubAgent 側は `.claude/agents/test-runner.md` の手順を実行し、Verification Commands を実行して結果を **read-only report として呼び出し元へ返す**。test-runner は PR へのコメント投稿を行わない（Issue #1648）。
 
