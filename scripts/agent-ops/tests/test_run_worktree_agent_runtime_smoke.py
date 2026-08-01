@@ -550,6 +550,238 @@ def test_given_keep_pane_flag_when_lane_finishes_then_pane_close_not_invoked(
 
 
 # ---------------------------------------------------------------------------
+# Fix-delta iteration 2: Claude Code multi-line prompt paste-collapse stall
+# recovery (Issue #1887 PR #1921 review). ``herdr agent prompt`` can leave a
+# multi-line prompt sitting as an unsubmitted "[Pasted text #N +M lines]"
+# block in Claude Code's input box instead of submitting it, which herdr
+# reports as ``agent_prompt_stalled`` after its own 5000ms post-submission
+# state-change check. The runner must recover deterministically (send an
+# explicit ``enter`` keypress, then re-observe via ``agent wait``) instead of
+# treating the stall as a hard failure or silently downgrading it to SKIP.
+# ---------------------------------------------------------------------------
+
+
+_FAKE_HERDR_STALL_THEN_RECOVER_BODY = """
+case "$1 $2" in
+  "status server")
+    exit 0
+    ;;
+esac
+case "$1" in
+  pane)
+    case "$2" in
+      split) echo '{"pane_id":"pane-xyz"}'; exit 0 ;;
+      close) exit 0 ;;
+    esac
+    ;;
+  agent)
+    case "$2" in
+      start) exit 0 ;;
+      prompt)
+        echo '{"error":{"code":"agent_prompt_stalled","message":"no state change within 5000 ms"}}' 1>&2
+        exit 1
+        ;;
+      send-keys) exit 0 ;;
+      wait) exit 0 ;;
+      get) echo '{"state":"done"}'; exit 0 ;;
+      explain) echo '{"agent":"claude","confidence":"high"}'; exit 0 ;;
+      read) echo "OBSERVED_MARKER pane transcript line"; exit 0 ;;
+    esac
+    ;;
+esac
+exit 0
+"""
+
+
+def test_given_agent_prompt_stalled_when_recovery_send_keys_and_wait_succeed_then_exit0_and_recovery_recorded(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "herdr", _FAKE_HERDR_STALL_THEN_RECOVER_BODY)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    prompt = _prompt_file(tmp_path, "line one\nline two\nOBSERVED_MARKER\n")
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive", "--transport", "herdr",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--expect-marker", "OBSERVED_MARKER",
+        fake_bin_dir=fake_bin,
+        extra_env={"HERDR_ENV": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "prompt_stall_recovered: True" in summary
+
+
+def test_given_agent_prompt_stalled_when_recovery_send_keys_fails_then_exit1_not_skip(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    body = _FAKE_HERDR_STALL_THEN_RECOVER_BODY.replace(
+        "send-keys) exit 0 ;;", "send-keys) exit 1 ;;"
+    )
+    _write_fake_exe(fake_bin / "herdr", body)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    prompt = _prompt_file(tmp_path, "line one\nline two\n")
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive", "--transport", "herdr",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        fake_bin_dir=fake_bin,
+        extra_env={"HERDR_ENV": "1"},
+    )
+    assert result.returncode == 1
+    assert "recovery send-keys failed" in result.stderr
+
+
+def test_given_agent_prompt_stalled_when_recovery_wait_also_stalls_then_exit1_not_skip(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    body = _FAKE_HERDR_STALL_THEN_RECOVER_BODY.replace(
+        "wait) exit 0 ;;", "wait) exit 1 ;;"
+    )
+    _write_fake_exe(fake_bin / "herdr", body)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    prompt = _prompt_file(tmp_path, "line one\nline two\n")
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive", "--transport", "herdr",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        fake_bin_dir=fake_bin,
+        extra_env={"HERDR_ENV": "1"},
+    )
+    assert result.returncode == 1
+    assert "recovery wait failed" in result.stderr
+
+
+def test_given_agent_prompt_stalled_and_recovery_never_observes_state_change_then_exit1_not_false_pass(
+    repo_with_worktree, tmp_path
+):
+    """``herdr agent wait`` matches immediately if the agent is already idle
+    at call time (no observed-change requirement), so a naive
+    prompt->send-keys->wait recovery can report success even when the
+    paste-collapsed prompt was never actually submitted. The runner must
+    poll for a genuine ``state_change_seq`` change before trusting
+    ``agent wait``; a fake herdr whose ``state_change_seq`` never changes
+    (and whose ``agent wait`` would otherwise trivially match) must still
+    surface a hard failure, not a false pass."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    get_call_log = tmp_path / "get_calls.log"
+    body = """
+case "$1 $2" in
+  "status server")
+    exit 0
+    ;;
+esac
+case "$1" in
+  pane)
+    case "$2" in
+      split) echo '{"pane_id":"pane-xyz"}'; exit 0 ;;
+      close) exit 0 ;;
+    esac
+    ;;
+  agent)
+    case "$2" in
+      start) exit 0 ;;
+      prompt)
+        echo '{"error":{"code":"agent_prompt_stalled","message":"no state change within 5000 ms"}}' 1>&2
+        exit 1
+        ;;
+      send-keys) exit 0 ;;
+      wait) exit 0 ;;
+      get)
+        echo "called" >> "%s"
+        echo '{"result":{"agent":{"state_change_seq":42}}}'
+        exit 0
+        ;;
+      explain) echo '{"agent":"claude","confidence":"high"}'; exit 0 ;;
+      read) echo "pane transcript"; exit 0 ;;
+    esac
+    ;;
+esac
+exit 0
+""" % (get_call_log,)
+    _write_fake_exe(fake_bin / "herdr", body)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    prompt = _prompt_file(tmp_path, "line one\nline two\n")
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive", "--transport", "herdr",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        "--timeout-seconds", "3",
+        fake_bin_dir=fake_bin,
+        extra_env={"HERDR_ENV": "1"},
+    )
+    assert result.returncode == 1
+    assert "no observed state change" in result.stderr
+    # ``agent get`` must have been polled (baseline + at least one recheck)
+    # rather than trusting a single, possibly-stale ``agent wait`` match.
+    assert get_call_log.read_text(encoding="utf-8").count("called") >= 2
+
+
+def test_given_agent_prompt_fails_for_non_stall_reason_when_lane_runs_then_no_recovery_attempted(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    send_keys_log = tmp_path / "send_keys.log"
+    body = """
+case "$1 $2" in
+  "status server")
+    exit 0
+    ;;
+esac
+case "$1" in
+  pane)
+    case "$2" in
+      split) echo '{"pane_id":"pane-xyz"}'; exit 0 ;;
+      close) exit 0 ;;
+    esac
+    ;;
+  agent)
+    case "$2" in
+      start) exit 0 ;;
+      prompt)
+        echo '{"error":{"code":"agent_pane_gone","message":"pane no longer exists"}}' 1>&2
+        exit 1
+        ;;
+      send-keys) echo called >> "%s"; exit 0 ;;
+      wait) exit 0 ;;
+      get) echo '{"state":"done"}'; exit 0 ;;
+      explain) echo '{"agent":"claude","confidence":"high"}'; exit 0 ;;
+      read) echo "OBSERVED_MARKER pane transcript line"; exit 0 ;;
+    esac
+    ;;
+esac
+exit 0
+""" % (send_keys_log,)
+    _write_fake_exe(fake_bin / "herdr", body)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    prompt = _prompt_file(tmp_path, "single line prompt\n")
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive", "--transport", "herdr",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        fake_bin_dir=fake_bin,
+        extra_env={"HERDR_ENV": "1"},
+    )
+    assert result.returncode == 1
+    assert "agent_pane_gone" in result.stderr
+    assert not send_keys_log.exists()
+
+
+# ---------------------------------------------------------------------------
 # AC6 / AC7: evidence hygiene, redaction, session-log metadata
 # ---------------------------------------------------------------------------
 

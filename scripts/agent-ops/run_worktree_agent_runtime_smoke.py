@@ -347,6 +347,24 @@ def parse_native_event_count(runtime: str, stdout: str) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _extract_agent_field(raw: str, field: str):
+    """Extract a field from ``herdr agent get`` JSON output, tolerating both
+    the ``{"result": {"agent": {...}}}`` envelope and flatter shapes."""
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    result = payload.get("result")
+    agent_obj = result.get("agent") if isinstance(result, dict) else None
+    if isinstance(agent_obj, dict) and field in agent_obj:
+        return agent_obj[field]
+    if field in payload:
+        return payload[field]
+    return None
+
+
 class HerdrLaneError(Exception):
     def __init__(self, message: str, *, skip: bool = False):
         super().__init__(message)
@@ -375,6 +393,7 @@ def run_interactive_herdr(
         "pane_output_lines": [],
         "agent_explain": None,
         "cleaned_up": False,
+        "prompt_stall_recovered": None,
     }
     try:
         rc, out, err, timed_out = _run(
@@ -420,6 +439,7 @@ def run_interactive_herdr(
         if start_timed_out or start_rc != 0:
             raise HerdrLaneError(f"herdr agent start failed: {_redact(start_err or start_out)}")
 
+        prompt_deadline = time.monotonic() + timeout_seconds
         rc, out, err, timed_out = _run(
             [herdr_bin, "agent", "prompt", agent_name, prompt, "--wait",
              "--timeout", str(int(timeout_seconds * 1000))],
@@ -428,7 +448,82 @@ def run_interactive_herdr(
         if timed_out:
             raise HerdrLaneError("herdr agent prompt timed out")
         if rc != 0:
-            raise HerdrLaneError(f"herdr agent prompt failed: {_redact(err or out)}")
+            if "agent_prompt_stalled" in (err or "") or "agent_prompt_stalled" in (out or ""):
+                # Multi-line prompt text submitted through ``herdr agent
+                # prompt`` can land in Claude Code's terminal input box as a
+                # collapsed "[Pasted text #N +M lines]" block instead of
+                # being submitted: Claude Code's bracketed-paste handling
+                # absorbs the trailing newline that would otherwise act as
+                # the submit keystroke, so the agent lifecycle state never
+                # leaves ``idle`` and herdr's own 5000ms post-submission
+                # state-change check reports ``agent_prompt_stalled``. Codex
+                # CLI does not exhibit this because it auto-submits pasted
+                # multi-line input. Recover deterministically, exactly once,
+                # by sending an explicit ``enter`` keypress to complete the
+                # submission the CLI left pending.
+                #
+                # ``herdr agent wait`` (default ``--until idle,done,blocked``)
+                # matches immediately if the agent is *already* idle at call
+                # time -- it does not require an observed change. Calling it
+                # right after ``send-keys`` therefore races the keystroke and
+                # can report a spurious match before the Enter has actually
+                # been processed, leaving the paste unsubmitted while exit 0
+                # is returned (a false pass). Poll ``agent get`` for a
+                # genuine ``state_change_seq`` change before trusting
+                # ``agent wait``, so recovery only reports success once the
+                # submission provably happened.
+                evidence["prompt_stall_recovered"] = False
+                baseline_rc, baseline_out, _e, _t = _run(
+                    [herdr_bin, "agent", "get", agent_name], timeout=15.0
+                )
+                baseline_seq = (
+                    _extract_agent_field(baseline_out, "state_change_seq")
+                    if baseline_rc == 0 else None
+                )
+
+                remaining = max(1.0, prompt_deadline - time.monotonic())
+                send_rc, send_out, send_err, send_timed_out = _run(
+                    [herdr_bin, "agent", "send-keys", agent_name, "enter"],
+                    timeout=min(20.0, remaining),
+                )
+                if send_timed_out or send_rc != 0:
+                    raise HerdrLaneError(
+                        "herdr agent prompt stalled and recovery send-keys failed: "
+                        f"{_redact(send_err or send_out or err or out)}"
+                    )
+
+                poll_deadline = min(prompt_deadline, time.monotonic() + 15.0)
+                observed_change = baseline_seq is None
+                while not observed_change and time.monotonic() < poll_deadline:
+                    poll_rc, poll_out, _e, _t = _run(
+                        [herdr_bin, "agent", "get", agent_name], timeout=10.0
+                    )
+                    if poll_rc == 0:
+                        seq = _extract_agent_field(poll_out, "state_change_seq")
+                        if seq is not None and seq != baseline_seq:
+                            observed_change = True
+                            break
+                    time.sleep(0.5)
+                if not observed_change:
+                    raise HerdrLaneError(
+                        "herdr agent prompt stalled and recovery send-keys produced "
+                        "no observed state change; prompt remains unsubmitted"
+                    )
+
+                remaining = max(1.0, prompt_deadline - time.monotonic())
+                wait_rc, wait_out, wait_err, wait_timed_out = _run(
+                    [herdr_bin, "agent", "wait", agent_name,
+                     "--timeout", str(int(remaining * 1000))],
+                    timeout=remaining + 20.0,
+                )
+                if wait_timed_out or wait_rc != 0:
+                    raise HerdrLaneError(
+                        "herdr agent prompt stalled and recovery wait failed: "
+                        f"{_redact(wait_err or wait_out or err or out)}"
+                    )
+                evidence["prompt_stall_recovered"] = True
+            else:
+                raise HerdrLaneError(f"herdr agent prompt failed: {_redact(err or out)}")
 
         rc, out, err, timed_out = _run(
             [herdr_bin, "agent", "get", agent_name], timeout=20.0
@@ -670,6 +765,7 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["pane_id"] = evidence.get("pane_id")
             schema_summary["agent_name"] = evidence.get("agent_name")
             schema_summary["final_state"] = evidence.get("final_state")
+            schema_summary["prompt_stall_recovered"] = evidence.get("prompt_stall_recovered")
 
             if evidence.get("final_state") == "blocked":
                 errors.append("agent reached blocked state; evidence captured, not auto-approved")

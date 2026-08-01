@@ -34,6 +34,13 @@ TUI `/status`、Skill picker、approval 画面、subagent UI、context 表示の
 `agent get` の `state` が `blocked` の場合は自動承認せず証跡を取得して停止する。
 `unknown` state を成功として扱わない。
 
+複数行 prompt は入力欄で `[Pasted text #N +M lines]` として折りたたまれ、
+送信用の Enter が paste 終端シーケンスに吸収されて未送信のまま
+`agent_prompt_stalled`（herdr 固定の 5000ms 観測窓）になることがある
+（Claude Code 固有。詳細は `references/herdr.md` の
+`agent_prompt_stalled` 節を参照）。runner はこれを検知した場合のみ
+`send-keys enter` による 1 回限りの回復を行う。
+
 ## 観測できる主な evidence
 
 - structured lane: `type: system/init`、`type: result`、hook lifecycle event の件数
