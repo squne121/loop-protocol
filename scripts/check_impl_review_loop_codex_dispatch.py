@@ -9,6 +9,7 @@ import sys
 import tomllib
 from pathlib import Path
 
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = REPO_ROOT / ".codex/config.toml"
@@ -23,34 +24,103 @@ CONFIG_PATH = REPO_ROOT / ".codex/config.toml"
 # agent task; Issue #1841 owns that runtime verification.
 NATIVE_V2_DISPATCH_SITES = {
     ".claude/skills/impl-review-loop/steps/step-1-implementation.md": {
-        "task_name": "implementation_i0",
+        "task_name_template": "implementation_i{iteration}",
         "agent_type": "implementation-worker",
+        "message_binding_phrases": (
+            "actual Issue number",
+            "full Issue URL",
+            "contract snapshot URL",
+            "actual live Allowed Paths",
+            "serialized fix_delta",
+        ),
     },
     ".claude/skills/impl-review-loop/steps/step-2-verification.md": {
-        "task_name": "verification_i0",
+        "task_name_template": "verification_i{iteration}",
         "agent_type": "test-runner",
+        "message_binding_phrases": (
+            "actual Issue number",
+            "PR number",
+            "contract body SHA",
+            "diff head SHA",
+            "literal AC list",
+            "literal Verification Commands",
+        ),
     },
     ".claude/skills/impl-review-loop/steps/step-4-pr-review.md": {
-        "task_name": "pr_review_i0",
+        "task_name_template": "pr_review_i{iteration}",
         "agent_type": "pr-reviewer",
+        "message_binding_phrases": (
+            "actual PR number",
+            "linked Issue number",
+            "reviewed head SHA",
+            "actual PR diff",
+            "Allowed Paths",
+            "Verification evidence",
+            "required checks",
+        ),
     },
     ".claude/skills/post-merge-cleanup/SKILL.md": {
-        "task_name": "post_merge_cleanup_pr1900",
+        "task_name_template": "post_merge_cleanup_pr{merged_pr_number}_i{attempt}",
         "agent_type": "post-merge-cleanup-worker",
+        "message_binding_phrases": (
+            "actual merged PR number",
+            "linked Issue number",
+            "actual worktree",
+            "actual branch",
+            "canonical cleanup scripts",
+            "follow-up candidates",
+        ),
     },
 }
 
 PREPARATION_MD = ".claude/skills/impl-review-loop/steps/preparation.md"
 NATIVE_V2_DISPATCH_BLOCK = re.compile(
-    r"^```yaml\nspawn_agent:\n(?P<arguments>(?: {2,}[^\n]*\n)+?)^```$",
+    r"^```yaml\n(?P<document>spawn_agent:\n(?:.*\n)*?)^```$",
     re.MULTILINE,
 )
 TASK_NAME_PATTERN = re.compile(r"^[a-z0-9_]+$")
+DISPATCH_ARGUMENT_KEYS = frozenset({"task_name", "agent_type", "fork_turns", "message"})
+DISPATCH_ROOT_KEYS = frozenset({"spawn_agent"})
 MESSAGE_REQUIRED_ELEMENTS = (
     "Objective",
     "Live reference",
     "Bounded scope",
     "Expected result",
+)
+COMPLETION_PROTOCOL_REFERENCE = "Common Completion Protocol"
+UNRESOLVED_MESSAGE_REFERENCES = (
+    "LOOP_STATE",
+    "Step 1 PR number",
+    "current contract body SHA",
+    "current reviewed head SHA",
+)
+
+
+class DuplicateDispatchKeyError(yaml.YAMLError):
+    """Raised when a fenced dispatch document repeats a mapping key."""
+
+
+class StrictDispatchLoader(yaml.SafeLoader):
+    """Safe YAML loader that preserves the runtime's duplicate-key rejection."""
+
+
+def _construct_unique_mapping(
+    loader: StrictDispatchLoader,
+    node: yaml.MappingNode,
+    deep: bool = False,
+) -> dict[object, object]:
+    mapping: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise DuplicateDispatchKeyError(f"duplicate YAML key {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+StrictDispatchLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
 )
 
 
@@ -165,28 +235,54 @@ def assert_no_project_profile_routing(failures: list[str]) -> None:
         failures.append(f".codex/config.toml: missing phrase '{required_phrase}'")
 
 
-def parse_native_v2_dispatch_blocks(text: str) -> list[dict[str, str]]:
-    """Extract fenced static ``spawn_agent`` call-shape blocks from a document."""
-    blocks: list[dict[str, str]] = []
-    for match in NATIVE_V2_DISPATCH_BLOCK.finditer(text):
-        lines = match.group("arguments").splitlines()
-        fields: dict[str, str] = {}
-        for index, line in enumerate(lines):
-            field_match = re.fullmatch(r"  (task_name|agent_type|fork_turns|message):(?: (.*))?", line)
-            if field_match is None:
-                continue
-            field, value = field_match.groups()
-            if field == "message" and value == "|":
-                message_lines: list[str] = []
-                for message_line in lines[index + 1 :]:
-                    if not message_line.startswith("    "):
-                        break
-                    message_lines.append(message_line[4:])
-                fields[field] = "\n".join(message_lines).strip()
-            else:
-                fields[field] = (value or "").strip()
-        blocks.append(fields)
-    return blocks
+def parse_native_v2_dispatch_blocks(text: str) -> tuple[list[dict[str, object]], list[str]]:
+    """Strictly parse fenced ``spawn_agent`` documents without YAML relaxation."""
+    blocks: list[dict[str, object]] = []
+    failures: list[str] = []
+    for block_number, match in enumerate(NATIVE_V2_DISPATCH_BLOCK.finditer(text), start=1):
+        try:
+            document = yaml.load(match.group("document"), Loader=StrictDispatchLoader)
+        except yaml.YAMLError as error:
+            failures.append(f"V2 dispatch block {block_number}: malformed YAML ({error})")
+            continue
+        if type(document) is not dict:
+            failures.append(f"V2 dispatch block {block_number}: document must be a mapping")
+            continue
+        if set(document) != DISPATCH_ROOT_KEYS:
+            failures.append(
+                f"V2 dispatch block {block_number}: root keys must be exactly {sorted(DISPATCH_ROOT_KEYS)!r}"
+            )
+            continue
+        arguments = document["spawn_agent"]
+        if type(arguments) is not dict:
+            failures.append(f"V2 dispatch block {block_number}: spawn_agent must be a mapping")
+            continue
+        if set(arguments) != DISPATCH_ARGUMENT_KEYS:
+            failures.append(
+                f"V2 dispatch block {block_number}: spawn_agent keys must be exactly "
+                f"{sorted(DISPATCH_ARGUMENT_KEYS)!r}"
+            )
+            continue
+        blocks.append(arguments)
+    return blocks, failures
+
+
+def materialize_task_name(template: str, **bindings: int) -> str:
+    """Materialize one documented task-name rule with concrete scalar bindings."""
+    try:
+        task_name = template.format(**bindings)
+    except (KeyError, ValueError) as error:
+        raise ValueError(f"invalid task-name materialization: {error}") from error
+    if TASK_NAME_PATTERN.fullmatch(task_name) is None:
+        raise ValueError("materialized task_name must use lowercase letters, digits, and underscores")
+    return task_name
+
+
+def assert_unique_canonical_task_name(task_name: str, used_task_names: set[str]) -> None:
+    """Reject a canonical task path before a retry attempts to reserve it again."""
+    if task_name in used_task_names:
+        raise ValueError(f"canonical task name already used: {task_name}")
+    used_task_names.add(task_name)
 
 
 def assert_native_v2_dispatch_contract(
@@ -199,10 +295,12 @@ def assert_native_v2_dispatch_contract(
     for relative_path, expected in dispatch_sites.items():
         path = repo_root / relative_path
         try:
-            blocks = parse_native_v2_dispatch_blocks(path.read_text(encoding="utf-8"))
+            blocks, parse_failures = parse_native_v2_dispatch_blocks(path.read_text(encoding="utf-8"))
         except OSError as error:
             failures.append(f"{relative_path}: cannot read dispatch site ({error.__class__.__name__})")
             continue
+
+        failures.extend(f"{relative_path}: {failure}" for failure in parse_failures)
 
         if len(blocks) != 1:
             failures.append(
@@ -211,20 +309,23 @@ def assert_native_v2_dispatch_contract(
             continue
 
         block = blocks[0]
-        if block.get("task_name") != expected["task_name"]:
+        if block["task_name"] != expected["task_name_template"]:
             failures.append(
-                f"{relative_path}: task_name must be {expected['task_name']!r}"
+                f"{relative_path}: task_name must use materialization rule "
+                f"{expected['task_name_template']!r}"
             )
-        elif TASK_NAME_PATTERN.fullmatch(block["task_name"]) is None:
-            failures.append(f"{relative_path}: task_name must use lowercase letters, digits, and underscores")
+        elif not isinstance(block["task_name"], str):
+            failures.append(f"{relative_path}: task_name must be a string")
         if block.get("agent_type") != expected["agent_type"]:
             failures.append(
                 f"{relative_path}: agent_type must be {expected['agent_type']!r}"
             )
-        if block.get("fork_turns") != "none":
+        if type(block["agent_type"]) is not str:
+            failures.append(f"{relative_path}: agent_type must be a string")
+        if block.get("fork_turns") != "none" or type(block["fork_turns"]) is not str:
             failures.append(f"{relative_path}: fork_turns must be 'none'")
         message = block.get("message", "")
-        if not message:
+        if type(message) is not str or not message.strip():
             failures.append(f"{relative_path}: message must be non-empty and self-contained")
             continue
         for element in MESSAGE_REQUIRED_ELEMENTS:
@@ -232,6 +333,21 @@ def assert_native_v2_dispatch_contract(
                 failures.append(
                     f"{relative_path}: message must include non-empty '{element}:'"
                 )
+        for phrase in expected["message_binding_phrases"]:
+            if phrase not in message:
+                failures.append(
+                    f"{relative_path}: message must require concrete binding for '{phrase}'"
+                )
+        for unresolved_reference in UNRESOLVED_MESSAGE_REFERENCES:
+            if unresolved_reference in message:
+                failures.append(
+                    f"{relative_path}: message must not contain unresolved reference "
+                    f"'{unresolved_reference}'"
+                )
+        if COMPLETION_PROTOCOL_REFERENCE not in path.read_text(encoding="utf-8"):
+            failures.append(
+                f"{relative_path}: must reference the common normative completion protocol"
+            )
 
 
 def assert_no_scope_rollup_runner_auto_spawn_note(failures: list[str]) -> None:

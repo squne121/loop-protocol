@@ -195,8 +195,15 @@ def test_rejects_missing_or_non_strict_v2_enabled_setting(tmp_path: Path, text: 
 DISPATCH_SITE = ".claude/skills/impl-review-loop/steps/step-1-implementation.md"
 DISPATCH_SITES = {
     DISPATCH_SITE: {
-        "task_name": "implementation_i0",
+        "task_name_template": "implementation_i{iteration}",
         "agent_type": "implementation-worker",
+        "message_binding_phrases": (
+            "actual Issue number",
+            "full Issue URL",
+            "contract snapshot URL",
+            "actual live Allowed Paths",
+            "serialized fix_delta",
+        ),
     }
 }
 
@@ -210,15 +217,17 @@ def _write_dispatch_site(tmp_path: Path, text: str) -> None:
 def _valid_dispatch_block() -> str:
     return """```yaml
 spawn_agent:
-  task_name: implementation_i0
+  task_name: implementation_i{iteration}
   agent_type: implementation-worker
   fork_turns: none
   message: |
-    Objective: implement the linked Issue.
-    Live reference: the current linked Issue.
-    Bounded scope: the live Allowed Paths only.
-    Expected result: IMPLEMENT_RESULT_V1.
+    Objective: root materializes the actual Issue objective before spawn.
+    Live reference: root binds the actual Issue number, full Issue URL, and contract snapshot URL before spawn.
+    Bounded scope: root binds the actual live Allowed Paths and serialized fix_delta before spawn.
+    Expected result: IMPLEMENT_RESULT_V1 with concrete execution facts.
 ```
+
+See [Common Completion Protocol](#common-completion-protocol).
 """
 
 
@@ -252,7 +261,10 @@ max_concurrent_threads_per_session = 4
     [
         ("agent_type: test-runner", "agent_type must be 'implementation-worker'"),
         ("fork_turns: none", "fork_turns must be 'none'"),
-        ("task_name: implementation_i0", "task_name must be 'implementation_i0'"),
+        (
+            "task_name: implementation_i{iteration}",
+            "task_name must use materialization rule 'implementation_i{iteration}'",
+        ),
     ],
 )
 def test_given_invalid_dispatch_field_when_static_contract_runs_then_it_rejects(
@@ -263,7 +275,7 @@ def test_given_invalid_dispatch_field_when_static_contract_runs_then_it_rejects(
     block = _valid_dispatch_block()
     if diagnostic == "fork_turns must be 'none'":
         block = block.replace(replacement, "fork_turns: all")
-    elif diagnostic == "task_name must be 'implementation_i0'":
+    elif "task_name must use materialization rule" in diagnostic:
         block = block.replace(replacement, "task_name: implementation-i0")
     else:
         block = block.replace("agent_type: implementation-worker", replacement)
@@ -289,7 +301,133 @@ def test_given_missing_fork_turns_when_static_contract_runs_then_it_rejects(tmp_
         dispatch_sites=DISPATCH_SITES,
     )
 
-    assert any("fork_turns must be 'none'" in failure for failure in failures)
+    assert any("spawn_agent keys must be exactly" in failure for failure in failures)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "diagnostic"),
+    [
+        ("  unexpected_field: destructive\n", "spawn_agent keys must be exactly"),
+        (
+            "  task_name: implementation_i{iteration}\n",
+            "malformed YAML (duplicate YAML key 'task_name')",
+        ),
+        ("  bad: [unclosed\n", "malformed YAML"),
+        ("  task_name:\n    nested: implementation_i0\n", "task_name must use materialization rule"),
+        ("  fork_turns: false\n", "fork_turns must be 'none'"),
+    ],
+)
+def test_given_invalid_yaml_shape_when_static_contract_runs_then_it_rejects(
+    tmp_path: Path,
+    mutation: str,
+    diagnostic: str,
+):
+    block = _valid_dispatch_block()
+    if mutation.startswith("  task_name:\n"):
+        block = block.replace("  task_name: implementation_i{iteration}\n", mutation)
+    elif mutation.startswith("  fork_turns:"):
+        block = block.replace("  fork_turns: none\n", mutation)
+    else:
+        block = block.replace("  agent_type: implementation-worker\n", mutation + "  agent_type: implementation-worker\n")
+    _write_dispatch_site(tmp_path, block)
+
+    failures: list[str] = []
+    module.assert_native_v2_dispatch_contract(
+        failures,
+        repo_root=tmp_path,
+        dispatch_sites=DISPATCH_SITES,
+    )
+
+    assert any(diagnostic in failure for failure in failures)
+
+
+def test_given_retry_when_task_name_is_materialized_then_iteration_is_unique():
+    assert module.materialize_task_name("implementation_i{iteration}", iteration=0) == "implementation_i0"
+    assert module.materialize_task_name("implementation_i{iteration}", iteration=1) == "implementation_i1"
+
+
+def test_given_stale_head_review_when_task_name_is_materialized_then_it_uses_next_iteration():
+    assert module.materialize_task_name("pr_review_i{iteration}", iteration=1) == "pr_review_i1"
+
+
+def test_given_cleanup_when_task_name_is_materialized_then_it_binds_actual_pr_number():
+    task_name = module.materialize_task_name(
+        "post_merge_cleanup_pr{merged_pr_number}_i{attempt}",
+        merged_pr_number=1922,
+        attempt=0,
+    )
+    assert task_name == "post_merge_cleanup_pr1922_i0"
+    assert "pr1900" not in task_name
+
+
+def test_given_reused_canonical_path_when_checked_then_it_is_rejected():
+    used_task_names: set[str] = set()
+    module.assert_unique_canonical_task_name("implementation_i0", used_task_names)
+
+    with pytest.raises(ValueError, match="canonical task name already used"):
+        module.assert_unique_canonical_task_name("implementation_i0", used_task_names)
+
+
+def test_given_unresolved_symbolic_reference_when_static_contract_runs_then_it_rejects(
+    tmp_path: Path,
+):
+    _write_dispatch_site(
+        tmp_path,
+        _valid_dispatch_block().replace("actual Issue number", "LOOP_STATE.issue_number"),
+    )
+
+    failures: list[str] = []
+    module.assert_native_v2_dispatch_contract(
+        failures,
+        repo_root=tmp_path,
+        dispatch_sites=DISPATCH_SITES,
+    )
+
+    assert any("concrete binding for 'actual Issue number'" in failure for failure in failures)
+    assert any("unresolved reference 'LOOP_STATE'" in failure for failure in failures)
+
+
+@pytest.mark.parametrize(
+    "required_binding",
+    [
+        "actual Issue number",
+        "PR number",
+        "literal AC list",
+        "literal Verification Commands",
+        "contract body SHA",
+        "diff head SHA",
+    ],
+)
+def test_given_missing_concrete_verification_input_when_static_contract_runs_then_it_rejects(
+    tmp_path: Path,
+    required_binding: str,
+):
+    verification_site = ".claude/skills/impl-review-loop/steps/step-2-verification.md"
+    text = (REPO_ROOT / verification_site).read_text(encoding="utf-8")
+    _write_dispatch_site(tmp_path, text.replace(required_binding, "unresolved input", 1))
+    verification_sites = {
+        DISPATCH_SITE: {
+            "task_name_template": "verification_i{iteration}",
+            "agent_type": "test-runner",
+            "message_binding_phrases": (
+                "actual Issue number",
+                "PR number",
+                "contract body SHA",
+                "diff head SHA",
+                "literal AC list",
+                "literal Verification Commands",
+            ),
+        }
+    }
+
+    failures: list[str] = []
+    module.assert_native_v2_dispatch_contract(
+        failures,
+        repo_root=tmp_path,
+        dispatch_sites=verification_sites,
+    )
+
+    assert any(f"concrete binding for '{required_binding}'" in failure for failure in failures)
 
 
 @pytest.mark.parametrize("element", ["Objective", "Live reference", "Bounded scope", "Expected result"])

@@ -15,15 +15,21 @@ main thread は以下の static call shape で SubAgent に委譲する:
 
 ```yaml
 spawn_agent:
-  task_name: post_merge_cleanup_pr1900
+  task_name: post_merge_cleanup_pr{merged_pr_number}_i{attempt}
   agent_type: post-merge-cleanup-worker
   fork_turns: none
   message: |
-    Objective: classify and perform the bounded post-merge cleanup contract.
-    Live reference: merged PR number and optional linked Issue number.
-    Bounded scope: canonical cleanup scripts, the specified worktree, branch, and follow-up candidates.
+    Objective: classify and perform the bounded post-merge cleanup contract for the actual merged PR.
+    Live reference: bind the actual merged PR number and linked Issue number.
+    Bounded scope: bind the canonical cleanup scripts, actual worktree, actual branch, and follow-up candidates.
     Expected result: POST_MERGE_CLEANUP_REPORT_V1 with cleanup and human-review facts.
 ```
+
+### Materialization rule
+
+`task_name` は実行直前に実際の merged PR number と非負 attempt で `post_merge_cleanup_pr{merged_pr_number}_i{attempt}` から materialize する。たとえば固定の PR 番号を用いず、同一 root session 内で既に保存済みの canonical task name を再利用してはならない。`fork_turns: none` のため、root は message に実際の merged PR number、linked Issue number、worktree path、branch name、canonical cleanup scripts、follow-up candidates を値として埋め込む。`merged PR number` の自然言語参照、変数名、波括弧・山括弧の placeholder を child message に渡してはならない。この static template 自体を tool call として送信してはならない。
+
+完了の扱いは4 site 共通の [Common Completion Protocol](../impl-review-loop/steps/step-4-pr-review.md#common-completion-protocol) に従う。
 
 1. `post-merge-cleanup-worker` SubAgent を Agent tool で起動する。
 

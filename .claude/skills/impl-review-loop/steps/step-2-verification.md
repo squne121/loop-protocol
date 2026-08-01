@@ -10,15 +10,21 @@ Agent ツールで以下の static call shape を使って起動する:
 
 ```yaml
 spawn_agent:
-  task_name: verification_i0
+  task_name: verification_i{iteration}
   agent_type: test-runner
   fork_turns: none
   message: |
-    Objective: execute the linked Issue Verification Commands as an independent read-only report.
-    Live reference: LOOP_STATE.issue_number, Step 1 PR number, and current contract body SHA.
-    Bounded scope: AC list, literal Verification Commands, and current diff head only.
+    Objective: execute the actual linked Issue Verification Commands as an independent read-only report.
+    Live reference: bind the actual Issue number, PR number, contract body SHA, and diff head SHA.
+    Bounded scope: bind the literal AC list and literal Verification Commands for that exact head only.
     Expected result: a head-bound test-runner report with per-AC PASS, FAIL, or SKIP facts.
 ```
+
+### Materialization rule
+
+`task_name` は実行直前に実際の非負 iteration で `verification_i{iteration}` から materialize し、同一 root session 内で既に保存済みの canonical task name を再利用してはならない。`fork_turns: none` のため、root は message に実際の Issue number、PR number、AC 全文、literal Verification Commands 全文、contract body SHA、diff head SHA を値として埋め込む。`LOOP_STATE`、`Step 1 PR number`、`current contract body SHA`、変数名、波括弧・山括弧の placeholder を child message に渡してはならない。この static template 自体を tool call として送信してはならない。
+
+完了の扱いは4 site 共通の [Common Completion Protocol](step-4-pr-review.md#common-completion-protocol) に従う。
 
 SubAgent 側は `.claude/agents/test-runner.md` の手順を実行し、Verification Commands を実行して結果を **read-only report として呼び出し元へ返す**。test-runner は PR へのコメント投稿を行わない（Issue #1648）。
 
