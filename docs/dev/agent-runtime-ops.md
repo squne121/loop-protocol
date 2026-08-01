@@ -539,6 +539,15 @@ authority にならないことを保証する純粋な決定コアである。`
 `secret_boundary_violation`・`forbidden_path`・`public_checkpoint`・`secrets_mode` は
 `PermissionRequest` でも `deny` を維持する。
 
+## Worktree Agent Runtime Smoke（Issue #1887）
+
+Claude Code／Codex CLI の runtime smoke（linked worktree 内での fresh session 起動と observation）は
+`.claude/skills/worktree-agent-runtime-smoke/SKILL.md` に集約する。structured lane（既定、非対話
+`claude -p` / `codex exec --json --ephemeral`）と interactive herdr lane（TUI 固有挙動の観測が必要な
+場合のみ）の 2 lane を持つ。herdr は `mode=interactive` にのみ必須であり、structured lane は herdr 外
+（`transport=direct`）でも実行できる。runner は起動・観測・証跡収集だけを所有し、Codex CLI 側の
+sandbox／permission profile（本文書の Root Default Permission Profile）は変更しない。
+
 ## Cross References（相互参照）
 
 - GitHub 操作の共通規約: [github-ops.md](github-ops.md)

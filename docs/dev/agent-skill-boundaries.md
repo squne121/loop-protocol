@@ -197,6 +197,7 @@ SubAgent（役割）── Skill（作業手順）
 | `ssot-discovery` | `docs/` 配下を SSOT として横断探索する手順 |
 | `gemini-cli-headless-delegation` | Gemini CLI への headless 委譲手順。file evidence の structure (REPO_EVIDENCE_REF_V1) と verification contract が定義されている。検証契約の置き場。 |
 | `nlm-skill` | NotebookLM CLI / MCP 操作（既存導入） |
+| `worktree-agent-runtime-smoke` | linked worktree 内で Claude Code／Codex CLI の fresh runtime を起動し、structured lane（既定）または interactive herdr lane（TUI 固有挙動が必要な場合のみ）で観測する共有 Skill（Issue #1887）。owner: `implementation-worker`／`test-runner`（動作検証 AC を含む Issue の実行者）。trigger: `## Runtime Verification Applicability` が `immediate` で Claude Code／Codex CLI の実 process／TUI 起動証跡が必要な場合。non-trigger: 静的検証のみで AC を満たせる場合、semantic な hook reason 分類・mutation deny 妥当性・context budget 評価を行う場合（本 Skill は runtime 起動・観測・証跡収集だけを所有し、semantic verdict は caller が所有する）。output boundary: `<worktree>/artifacts/runtime-smoke/<run-id>/` の worktree-local untracked evidence（`summary.md`、`native-events.jsonl`、`pane-output.txt`、`agent-detection.json`、`session-log-metadata.txt`）に限定し、raw prompt／raw transcript／reasoning／credential／HOME 絶対パスは保存しない。新しい schema／digest／receipt／publisher／state store は追加しない。 |
 
 ## Repository Folder Policy Change Route（リポジトリフォルダポリシー変更ルート）
 
