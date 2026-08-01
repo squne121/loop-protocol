@@ -38,9 +38,11 @@ FAIL_CLOSED
 - quality gate failed の grounded answer をそのまま採用しない。
 
 NETWORK_ENFORCEMENT_BOUNDARY
-- `network.domains`（`loop-protocol-web-research` profile）は、当該 Codex invocation で managed network proxy が実際に適用されたローカル subprocess egress（`exec_command` 等）に対する domain policy であり、agent が利用可能なすべての外部取得経路を包括的に制御する security boundary として扱わない。
-- モデル内蔵の `web__run` 閲覧経路はこのローカル proxy policy とは別経路である。Codex CLI 0.146.0 の本 repository runtime 検証（`~/.codex/sessions/` の永続化セッションログを一次証拠として検査）では、`web__run` が `network.domains` allowlist 外のドメイン（`example.com`）へ到達できることを確認した。一方、生の `curl`（`exec_command`）はドメインに関係なく承認ポリシーで一律拒否された。
-- Codex CLI 更新時には、managed proxy 適用経路（`exec_command` 系ローカル subprocess egress）と `web__run`（モデル内蔵閲覧経路）の双方を再検証すること。
+- `network.domains`（`loop-protocol-web-research` profile）が実効的な domain policy として機能するのは、`features.network_proxy.enabled = true` により managed network proxy が実際に起動し、当該 Codex invocation の subprocess egress（`exec_command` 等）にその proxy が適用されている場合に限る。本 repository の `.codex/config.toml` で `network_proxy` を有効化している証拠はなく、`features.network_proxy.enabled` の既定値は `false`（OpenAI 公式 config reference: https://developers.openai.com/codex/config-reference ）である。agent が利用可能なすべての外部取得経路を包括的に制御する security boundary として `network.domains` を扱わない。
+- `network.mode = "full"` は HTTP method policy（GET/HEAD/OPTIONS のみでなく全メソッドを許可する設定）であり、domain allowlist 自体を無効化・bypass する設定ではない。「`mode = "full"` のため domain allowlist が無効化された」という説明は誤りであり、この agent instruction では採用しない。
+- モデル内蔵の `web__run` 閲覧経路は、managed proxy 適用対象のローカル subprocess egress（`exec_command` 等）とは別経路であり、`network.domains` の対象外である。両者は独立に検証する必要がある。
+- 本 repository の runtime smoke（Codex CLI 0.146.0、`~/.codex/sessions/` の永続化セッションログを一次証拠として検査）では、`web__run` 経由・`exec_command` 経由の生 `curl` 経由のいずれも、`network.domains` allowlist 外のドメイン（`example.com`）を含め到達を観測した。ただしこの観測のみでは、当該 invocation で managed network proxy が実際に activate / routing されていたかどうかを証明できないため、`network.domains` allowlist が enforcement として機能していたかどうか（domain enforcement の実効性）は inconclusive（未確定）である。「domain allowlist が実効的な enforcement として機能した」という断定はしない。
+- Codex CLI 更新時、または `features.network_proxy.enabled` の設定変更時には、managed proxy 適用経路（`exec_command` 系ローカル subprocess egress、proxy の activation 状態を含む）と `web__run`（モデル内蔵閲覧経路）の双方を再検証すること。
 
 Known limitation
 - hooks と permission profiles は fail-closed local guardrail であり security boundary ではない。parent runtime overrides、untrusted project、unsupported tool paths では保証が弱まる。

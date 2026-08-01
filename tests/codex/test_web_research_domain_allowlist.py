@@ -16,15 +16,27 @@ grep/regex) that:
   `fallback_reason` keys, which remain out of scope for this Issue and are
   owned by Issue #1886 instead.
 
-AC4 (the `NETWORK_ENFORCEMENT_BOUNDARY` heading + `web__run` boundary
-language in `web-researcher.toml`) is verified via a plain substring check
-against the `developer_instructions` TOML string value, per the
-Verification Commands in the Issue contract (`grep -n
-"NETWORK_ENFORCEMENT_BOUNDARY" .codex/agents/web-researcher.toml`).
+AC4 (`NETWORK_ENFORCEMENT_BOUNDARY` content correctness, fix_delta for PR
+#1937 OWNER REQUEST_CHANGES P2-1) is verified semantically, via `tomllib`
+parsing of the isolated `NETWORK_ENFORCEMENT_BOUNDARY` section string, not
+just a heading-only substring/grep check. A heading-only check would let CI
+stay green even if the section body were gutted or made internally
+inconsistent with the runtime smoke it describes. The semantic checks
+verify that the section:
+
+- mentions `web__run` (the model-hosted web browsing route).
+- distinguishes the local subprocess proxy egress route (`exec_command` /
+  subprocess) from the model-hosted `web__run` route as two separate paths.
+- does not describe `network.domains` as a comprehensive security boundary
+  that governs every outbound route the agent can use.
+- does NOT claim that `network.mode = "full"` bypasses / disables the
+  domain allowlist (negative invariant on the corrected P1-1 misstatement
+  from the original PR body).
 """
 
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 
@@ -46,6 +58,18 @@ def _load_config() -> dict:
 def _load_web_researcher_agent() -> dict:
     with WEB_RESEARCHER_TOML.open("rb") as fh:
         return tomllib.load(fh)
+
+
+def _network_enforcement_boundary_section() -> str:
+    """Isolate the `NETWORK_ENFORCEMENT_BOUNDARY` section body from
+    web-researcher.toml's developer_instructions, from the heading up to
+    (but excluding) the next top-level heading (`Known limitation`)."""
+    agent = _load_web_researcher_agent()
+    instructions = agent["developer_instructions"]
+
+    start = instructions.index("NETWORK_ENFORCEMENT_BOUNDARY")
+    end = instructions.index("Known limitation", start)
+    return instructions[start:end]
 
 
 def test_web_research_profile_has_docs_github_domain() -> None:
@@ -101,3 +125,79 @@ def test_web_researcher_output_contract_unchanged() -> None:
             f"{key} must not appear in OUTPUT_CONTRACT; it is owned by "
             "Issue #1886 (provider metadata), out of scope for Issue #1924"
         )
+
+
+def test_network_enforcement_boundary_mentions_web_run() -> None:
+    """GIVEN the NETWORK_ENFORCEMENT_BOUNDARY section
+    WHEN it is isolated from developer_instructions
+    THEN it explicitly names the `web__run` model-hosted web route (AC4,
+    semantic check; a heading-only grep cannot detect this content being
+    silently removed)."""
+    section = _network_enforcement_boundary_section()
+    assert "web__run" in section
+
+
+def test_network_enforcement_boundary_distinguishes_local_proxy_from_model_hosted_web() -> None:
+    """GIVEN the NETWORK_ENFORCEMENT_BOUNDARY section
+    WHEN it is isolated from developer_instructions
+    THEN it names both the local subprocess proxy egress route
+    (`exec_command`) and the model-hosted `web__run` route, and states that
+    they are separate/independent routes (AC4)."""
+    section = _network_enforcement_boundary_section()
+    assert "exec_command" in section
+    assert "web__run" in section
+    separateness_markers = ("別経路", "独立に検証")
+    assert any(marker in section for marker in separateness_markers), (
+        "NETWORK_ENFORCEMENT_BOUNDARY must state that the local subprocess "
+        "proxy egress route and the model-hosted web__run route are "
+        "separate/independent, not just mention both terms in isolation"
+    )
+
+
+def test_network_enforcement_boundary_does_not_treat_domains_as_comprehensive_boundary() -> None:
+    """GIVEN the NETWORK_ENFORCEMENT_BOUNDARY section
+    WHEN it is isolated from developer_instructions
+    THEN it explicitly disclaims `network.domains` as a comprehensive
+    security boundary over every outbound route the agent can use (AC4)."""
+    section = _network_enforcement_boundary_section()
+    assert "network.domains" in section
+    assert "security boundary" in section
+    assert "扱わない" in section
+
+
+def test_network_enforcement_boundary_does_not_claim_mode_full_bypasses_allowlist() -> None:
+    """GIVEN the NETWORK_ENFORCEMENT_BOUNDARY section
+    WHEN it is isolated from developer_instructions
+    THEN it does NOT claim that `network.mode = "full"` bypasses/disables
+    the domain allowlist (negative invariant; PR #1937 OWNER
+    REQUEST_CHANGES P1-1: `mode = "full"` is an HTTP method policy, not a
+    domain allowlist bypass, and this misstatement must not be persisted
+    as agent instruction)."""
+    section = _network_enforcement_boundary_section()
+    # Only flags the *causal, non-negated* claim ("mode=full" CAUSES the
+    # allowlist to be bypassed/disabled). A sentence that quotes that
+    # erroneous claim purely in order to reject it (e.g. "...という説明は
+    # 誤りであり..." / "...ではない") must NOT trip this check, so any match
+    # is discarded if a negation/correction marker appears shortly after it.
+    causal_markers = ("のため", "によって", "により", "から")
+    bypass_markers = ("バイパス", "bypass", "無効化")
+    negation_markers = ("誤り", "ではない", "でない", "しない", "採用しない")
+    forbidden_pattern = re.compile(
+        r"mode\s*=?\s*[\"']?full[\"']?[^\n]{0,40}("
+        + "|".join(causal_markers)
+        + r")[^\n]{0,40}(" + "|".join(bypass_markers) + r")"
+        r"|(" + "|".join(bypass_markers) + r")[^\n]{0,40}("
+        + "|".join(causal_markers) + r")[^\n]{0,40}mode\s*=?\s*[\"']?full[\"']?",
+        re.IGNORECASE,
+    )
+    violation = None
+    for match in forbidden_pattern.finditer(section):
+        lookahead = section[match.end() : match.end() + 30]
+        if any(marker in lookahead for marker in negation_markers):
+            continue
+        violation = match
+        break
+    assert violation is None, (
+        "NETWORK_ENFORCEMENT_BOUNDARY must not claim mode=\"full\" "
+        f"bypasses/disables the domain allowlist; matched: {violation!r}"
+    )
