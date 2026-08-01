@@ -96,11 +96,81 @@ _FENCED_YAML_RE = re.compile(
 )
 
 _CONTRACT_REVIEW_MARKER = "CONTRACT_REVIEW_RESULT_V1"
+_MAX_JSON_FLOW_COLLECTION_CHARS = 16_384
+_MAX_JSON_FLOW_COLLECTION_DEPTH = 32
+
+
+class SimpleYamlParseError(ValueError):
+    """Raised when the restricted fallback cannot parse a JSON collection."""
 
 
 def _extract_yaml_blocks(body: str) -> list[str]:
     """Extract all fenced yaml/yml block contents from a comment body."""
     return [m.group(1) for m in _FENCED_YAML_RE.finditer(body)]
+
+
+def _reject_nonstandard_json_constant(value: str) -> None:
+    """Reject Python's non-standard JSON numeric constants."""
+    raise SimpleYamlParseError(f"nonstandard_json_constant:{value}")
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build an object only when each key appears exactly once."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise SimpleYamlParseError("duplicate_json_object_key")
+        result[key] = value
+    return result
+
+
+def _json_flow_collection_depth(value: str) -> int:
+    """Return flow nesting depth without treating brackets in strings as syntax."""
+    depth = 0
+    maximum = 0
+    in_string = False
+    escaped = False
+    for char in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            depth += 1
+            maximum = max(maximum, depth)
+        elif char in "}]":
+            depth -= 1
+    return maximum
+
+
+def _parse_fallback_scalar(value: str) -> Any:
+    """Parse bounded, strict JSON flow collections in an otherwise scalar fallback."""
+    if value.startswith(("{", "[")):
+        if len(value) > _MAX_JSON_FLOW_COLLECTION_CHARS:
+            raise SimpleYamlParseError("json_flow_collection_too_large")
+        if _json_flow_collection_depth(value) > _MAX_JSON_FLOW_COLLECTION_DEPTH:
+            raise SimpleYamlParseError("json_flow_collection_too_deep")
+        try:
+            return json.loads(
+                value,
+                parse_constant=_reject_nonstandard_json_constant,
+                object_pairs_hook=_reject_duplicate_json_keys,
+            )
+        except SimpleYamlParseError:
+            raise
+        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+            raise SimpleYamlParseError("invalid_json_flow_collection") from exc
+    if (value.startswith('"') and value.endswith('"')) or (
+        value.startswith("'") and value.endswith("'")
+    ):
+        return value[1:-1]
+    return value
 
 
 def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
@@ -110,7 +180,9 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
 
     Preference: yaml.safe_load (PyYAML) — handles nested structures, quoted
     strings, and all standard YAML scalar types correctly.
-    Fallback: custom line-by-line parser (flat + one level of nesting only).
+    Fallback: the legacy flat + one-level indentation mapping parser. It
+    deliberately does not implement general YAML syntax; a scalar value that
+    starts with ``{`` or ``[`` is accepted only as bounded, strict JSON.
     """
     try:
         import yaml  # noqa: F401 — available in project venv (PyYAML)
@@ -123,52 +195,70 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
 
     # --- Minimal fallback parser (used only when yaml is unavailable) ---
     result: dict[str, Any] = {}
-    lines = block.splitlines()
     current_key: Optional[str] = None
+    inside_checks = False
+    current_checks_mapping: Optional[str] = None
 
-    for line in lines:
+    for line in block.splitlines():
         stripped = line.rstrip()
         if not stripped or stripped.lstrip().startswith("#"):
             continue
-
         indent = len(line) - len(line.lstrip())
-
+        match = re.match(r'^\s*(\S[^:]*?):\s*(.*)', stripped)
         if indent == 0:
             current_key = None
-            m = re.match(r'^(\S[^:]*?):\s*(.*)', stripped)
-            if m:
-                key = m.group(1).strip()
-                val = m.group(2).strip()
-                if val:
-                    if (val.startswith('"') and val.endswith('"')) or (
-                        val.startswith("'") and val.endswith("'")
-                    ):
-                        val = val[1:-1]
-                    result[key] = val
-                else:
-                    result[key] = None
-                    current_key = key
-        elif current_key is not None:
-            if isinstance(result.get(current_key), dict):
-                m = re.match(r'^\s+(\S[^:]*?):\s*(.*)', stripped)
-                if m:
-                    sub_key = m.group(1).strip()
-                    sub_val = m.group(2).strip()
-                    if (sub_val.startswith('"') and sub_val.endswith('"')) or (
-                        sub_val.startswith("'") and sub_val.endswith("'")
-                    ):
-                        sub_val = sub_val[1:-1]
-                    result[current_key][sub_key] = sub_val or None
+            inside_checks = False
+            current_checks_mapping = None
+            if match is None:
+                continue
+            key = match.group(1).strip()
+            value = match.group(2).strip()
+            result[key] = _parse_fallback_scalar(value) if value else None
+            if not value:
+                current_key = key
+        elif current_key is not None and match is not None and indent == 2:
+            sub_key = match.group(1).strip()
+            sub_value = match.group(2).strip()
+            if not isinstance(result.get(current_key), dict):
+                result[current_key] = {}
+            inside_checks = current_key == _CONTRACT_REVIEW_MARKER and sub_key == "checks" and not sub_value
+            result[current_key][sub_key] = (
+                {} if inside_checks else _parse_fallback_scalar(sub_value) if sub_value else None
+            )
+            current_checks_mapping = None
+        elif (
+            current_key == _CONTRACT_REVIEW_MARKER
+            and inside_checks
+            and match is not None
+            and indent == 4
+        ):
+            checks = result[current_key].get("checks")
+            if not isinstance(checks, dict):
+                continue
+            sub_key = match.group(1).strip()
+            sub_value = match.group(2).strip()
+            # This is a producer-compatible exception, not general YAML:
+            # ensure_contract_snapshot emits only checks.vc_preflight as a
+            # nested mapping; all other checks values are scalar or JSON flow.
+            if sub_key == "vc_preflight" and not sub_value:
+                checks[sub_key] = {}
+                current_checks_mapping = "checks.vc_preflight"
             else:
-                m = re.match(r'^\s+(\S[^:]*?):\s*(.*)', stripped)
-                if m:
-                    sub_key = m.group(1).strip()
-                    sub_val = m.group(2).strip()
-                    if (sub_val.startswith('"') and sub_val.endswith('"')) or (
-                        sub_val.startswith("'") and sub_val.endswith("'")
-                    ):
-                        sub_val = sub_val[1:-1]
-                    result[current_key] = {sub_key: sub_val or None}
+                checks[sub_key] = _parse_fallback_scalar(sub_value) if sub_value else None
+                current_checks_mapping = None
+        elif (
+            current_key == _CONTRACT_REVIEW_MARKER
+            and current_checks_mapping == "checks.vc_preflight"
+            and match is not None
+            and indent == 6
+        ):
+            checks = result[current_key].get("checks")
+            vc_preflight = checks.get("vc_preflight") if isinstance(checks, dict) else None
+            if not isinstance(vc_preflight, dict):
+                continue
+            sub_key = match.group(1).strip()
+            sub_value = match.group(2).strip()
+            vc_preflight[sub_key] = _parse_fallback_scalar(sub_value) if sub_value else None
 
     return result
 
@@ -448,7 +538,12 @@ def parse_contract_review_results(
             # Only consider blocks that contain the marker
             if _CONTRACT_REVIEW_MARKER not in raw_block:
                 continue
-            parsed = _parse_simple_yaml_block(raw_block)
+            try:
+                parsed = _parse_simple_yaml_block(raw_block)
+            except SimpleYamlParseError:
+                # A malformed JSON flow collection is never downgraded to a
+                # scalar candidate for an authoritative contract result.
+                continue
             if _is_valid_contract_review_result(parsed, expected_issue_url):
                 inner = parsed[_CONTRACT_REVIEW_MARKER]
                 if not isinstance(inner, dict):
