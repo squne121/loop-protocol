@@ -30,6 +30,7 @@ from controlled_skill_mutation_policy import (  # noqa: E402
     COMMAND_ID_TEST_VERDICT_PUBLISH,
     COMMAND_ID_ISSUE_CONTENT_UPDATE,
     COMMAND_ID_ISSUE_DEPENDENCY_REMOVE,
+    COMMAND_ID_ISSUE_RELATIONSHIP_UPDATE,
     COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
     CONTROLLED_SKILL_MUTATION_COMMAND_POLICY,
     ENV_SANITIZE_KEYS,
@@ -39,11 +40,14 @@ from controlled_skill_mutation_policy import (  # noqa: E402
     ISSUE_DEPENDENCY_REMOVE_INPUT_ALLOWED_KEYS,
     ISSUE_DEPENDENCY_REMOVE_INPUT_SCHEMA,
     ISSUE_DEPENDENCY_REMOVE_MAX_BLOCKED_BY_NUMBERS,
+    ISSUE_RELATIONSHIP_UPDATE_INPUT_ALLOWED_KEYS,
+    ISSUE_RELATIONSHIP_UPDATE_INPUT_SCHEMA,
     TRUSTED_REPO,
     _validate_executor_argv,
     is_controlled_skill_mutation_exec_command,
     validate_isolation_issue_comment_request,
     validate_issue_dependency_remove_input,
+    validate_issue_relationship_update_input,
 )
 
 
@@ -135,9 +139,10 @@ class TestRegistryScope:
         # command ids (issue_body.update / issue_content.update /
         # issue_comment.publish / contract_snapshot.publish). Issue #1647 adds
         # the dedicated receipt-bound TEST_VERDICT publisher. Issue #1873
-        # removes termination_report.publish and pr_review.publish. This
-        # scope-pin is updated deliberately as part of each Issue's explicit
-        # In Scope registry extension/removal.
+        # removes termination_report.publish and pr_review.publish. Issue
+        # #1883 adds the native relationship (parent/blockedBy/blocking) sync
+        # command id. This scope-pin is updated deliberately as part of each
+        # Issue's explicit In Scope registry extension/removal.
         known_ids = {
             "issue_body.update",
             COMMAND_ID_ISSUE_CONTENT_UPDATE,
@@ -146,6 +151,7 @@ class TestRegistryScope:
             COMMAND_ID_TEST_VERDICT_PUBLISH,
             COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
             COMMAND_ID_ISSUE_DEPENDENCY_REMOVE,
+            COMMAND_ID_ISSUE_RELATIONSHIP_UPDATE,
         }
         actual_ids = set(CONTROLLED_SKILL_MUTATION_COMMAND_POLICY.keys())
         assert actual_ids == known_ids, f"Unexpected extra entries: {actual_ids - known_ids}"
@@ -661,3 +667,239 @@ class TestIssueDependencyRemoveInputValidator:
         err = validate_issue_dependency_remove_input(req, 1523, "squne121/loop-protocol")
         assert "idempotency_key_invalid" in err
 
+
+
+# =============================================================================
+# AC13 (Issue #1883): issue_relationship.update registration + fixed operation
+# =============================================================================
+
+
+class TestIssueRelationshipUpdateRegistration:
+    """AC13: issue_relationship.update and ISSUE_RELATIONSHIP_UPDATE_INPUT_V1
+    are registered one-to-one as a fixed controlled operation -- the entry
+    carries only closed metadata (no caller-suppliable query/path/hostname/
+    argv fields), and pre-existing command ids are unaffected."""
+
+    def test_command_id_value(self):
+        assert COMMAND_ID_ISSUE_RELATIONSHIP_UPDATE == "issue_relationship.update"
+
+    def test_registry_has_entry(self):
+        assert COMMAND_ID_ISSUE_RELATIONSHIP_UPDATE in CONTROLLED_SKILL_MUTATION_COMMAND_POLICY
+
+    def test_entry_input_schema_is_one_to_one(self):
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_RELATIONSHIP_UPDATE]
+        assert entry["input_schema"] == ISSUE_RELATIONSHIP_UPDATE_INPUT_SCHEMA
+        assert ISSUE_RELATIONSHIP_UPDATE_INPUT_SCHEMA == "ISSUE_RELATIONSHIP_UPDATE_INPUT_V1"
+
+    def test_entry_has_required_keys(self):
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_RELATIONSHIP_UPDATE]
+        required_keys = {
+            "command_id",
+            "executor_script",
+            "allowed_write_roots",
+            "github_mutation",
+            "precondition",
+            "postcondition",
+            "idempotency",
+            "env_sanitize",
+        }
+        assert required_keys.issubset(set(entry.keys())), f"Missing keys: {required_keys - set(entry.keys())}"
+
+    def test_entry_executor_script_is_fixed_shared_executor(self):
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_RELATIONSHIP_UPDATE]
+        # AC13: the caller can only ever invoke the one shared executor script
+        # by --command-id; it never supplies its own script/path.
+        assert entry["executor_script"] == EXECUTOR_SCRIPT
+
+    def test_entry_github_mutation_graphql_only_fixed_host(self):
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_RELATIONSHIP_UPDATE]
+        gm = entry["github_mutation"]
+        assert gm["add_or_remove_sub_issue"] is True
+        assert gm["add_or_remove_blocked_by"] is True
+        assert gm["graphql_only"] is True
+        assert gm["requires_repo"] == TRUSTED_REPO
+        assert gm["fixed_host"] == "github.com"
+
+    def test_entry_precondition_bounds(self):
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_RELATIONSHIP_UPDATE]
+        pc = entry["precondition"]
+        assert pc["expected_before_must_match_all_page_readback"] is True
+        assert pc["ancestor_cycle_must_be_rejected_before_parent_mutation"] is True
+        assert pc["credential_actor_must_be_trusted_and_authorized"] is True
+
+    def test_entry_postcondition_bounds(self):
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_RELATIONSHIP_UPDATE]
+        pc = entry["postcondition"]
+        assert pc["desired_relationship_set_must_match_all_page_readback_for_applied"] is True
+        assert pc["no_tracked_source_changes"] is True
+
+    def test_read_only_compatibility_gate_dependency_remove_unchanged(self):
+        """Adding issue_relationship.update must not perturb the pre-existing
+        issue_dependency.remove schema/dispatch/postcondition contract."""
+        entry = CONTROLLED_SKILL_MUTATION_COMMAND_POLICY[COMMAND_ID_ISSUE_DEPENDENCY_REMOVE]
+        assert entry["input_schema"] == ISSUE_DEPENDENCY_REMOVE_INPUT_SCHEMA
+        assert entry["github_mutation"]["remove_blocked_by"] is True
+
+
+# =============================================================================
+# AC12/AC13 (Issue #1883): ISSUE_RELATIONSHIP_UPDATE_INPUT_V1 closed-schema
+# graph invariant validator
+# =============================================================================
+
+
+class TestIssueRelationshipUpdateInputValidator:
+    """AC12: closed key set, self-parent, self-dependency, duplicate/unsorted/
+    bool-as-int/zero/negative, add/remove overlap, and blocked_by/blocking
+    same-target conflict are all rejected before any mutation is possible.
+    AC13: no caller-suppliable query/path/hostname/argv fields exist on this
+    schema -- only issue numbers, an action enum, and an idempotency key."""
+
+    def _valid_request(self, issue_number=1883, repo="squne121/loop-protocol"):
+        return {
+            "schema": ISSUE_RELATIONSHIP_UPDATE_INPUT_SCHEMA,
+            "issue_number": issue_number,
+            "repo": repo,
+            "expected_before": {"parent": None, "blocked_by": [], "blocking": []},
+            "parent": {"action": "set", "issue_number": 1860},
+            "add_blocked_by": [],
+            "remove_blocked_by": [],
+            "add_blocking": [],
+            "remove_blocking": [],
+            "idempotency_key": "squne121/loop-protocol:1883:relationship:abc",
+        }
+
+    def test_schema_constant_value(self):
+        assert ISSUE_RELATIONSHIP_UPDATE_INPUT_SCHEMA == "ISSUE_RELATIONSHIP_UPDATE_INPUT_V1"
+
+    def test_allowed_keys_are_closed(self):
+        assert ISSUE_RELATIONSHIP_UPDATE_INPUT_ALLOWED_KEYS == frozenset(
+            {
+                "schema",
+                "issue_number",
+                "repo",
+                "expected_before",
+                "parent",
+                "add_blocked_by",
+                "remove_blocked_by",
+                "add_blocking",
+                "remove_blocking",
+                "idempotency_key",
+            }
+        )
+
+    def test_no_query_path_hostname_argv_fields_in_allowed_keys(self):
+        """AC13: static proof that the caller cannot smuggle a GraphQL query,
+        REST path, hostname, or argv override through this schema."""
+        forbidden_substrings = ("query", "path", "host", "argv", "endpoint", "url", "command")
+        for key in ISSUE_RELATIONSHIP_UPDATE_INPUT_ALLOWED_KEYS:
+            for forbidden in forbidden_substrings:
+                assert forbidden not in key.lower(), f"key {key!r} looks like a raw-transport override"
+
+    def test_valid_request_passes(self):
+        req = self._valid_request()
+        err = validate_issue_relationship_update_input(req, 1883, "squne121/loop-protocol")
+        assert err == ""
+
+    def test_not_a_dict_rejected(self):
+        err = validate_issue_relationship_update_input(["not", "a", "dict"], 1883, "squne121/loop-protocol")
+        assert "not_object" in err
+
+    def test_unknown_key_rejected(self):
+        req = self._valid_request()
+        req["extra_field"] = "unexpected"
+        err = validate_issue_relationship_update_input(req, 1883, "squne121/loop-protocol")
+        assert "unknown_fields" in err
+
+    def test_schema_mismatch_rejected(self):
+        req = self._valid_request()
+        req["schema"] = "WRONG_SCHEMA_V1"
+        err = validate_issue_relationship_update_input(req, 1883, "squne121/loop-protocol")
+        assert "schema_mismatch" in err
+
+    def test_issue_number_bool_rejected(self):
+        req = self._valid_request()
+        req["issue_number"] = True
+        err = validate_issue_relationship_update_input(req, 1883, "squne121/loop-protocol")
+        assert "issue_number_mismatch" in err
+
+    def test_repo_untrusted_rejected(self):
+        req = self._valid_request(repo="attacker/evil-repo")
+        err = validate_issue_relationship_update_input(req, 1883, "squne121/loop-protocol")
+        assert "repo_mismatch" in err
+
+    def test_self_parent_rejected(self):
+        req = self._valid_request()
+        req["parent"] = {"action": "set", "issue_number": 1883}
+        err = validate_issue_relationship_update_input(req, 1883, "squne121/loop-protocol")
+        assert "self_parent" in err
+
+    def test_parent_issue_number_present_when_not_set_rejected(self):
+        req = self._valid_request()
+        req["parent"] = {"action": "unchanged", "issue_number": 42}
+        err = validate_issue_relationship_update_input(req, 1883, "squne121/loop-protocol")
+        assert "must_be_null_unless_set" in err
+
+    def test_self_dependency_in_add_blocked_by_rejected(self):
+        req = self._valid_request()
+        req["parent"] = {"action": "unchanged", "issue_number": None}
+        req["add_blocked_by"] = [1883]
+        err = validate_issue_relationship_update_input(req, 1883, "squne121/loop-protocol")
+        assert "self_reference" in err
+
+    def test_bool_as_int_in_add_blocked_by_rejected(self):
+        req = self._valid_request()
+        req["parent"] = {"action": "unchanged", "issue_number": None}
+        req["add_blocked_by"] = [True]
+        err = validate_issue_relationship_update_input(req, 1883, "squne121/loop-protocol")
+        assert "not_all_positive_ints" in err
+
+    def test_zero_and_negative_rejected(self):
+        for bad in (0, -1):
+            req = self._valid_request()
+            req["parent"] = {"action": "unchanged", "issue_number": None}
+            req["add_blocked_by"] = [bad]
+            err = validate_issue_relationship_update_input(req, 1883, "squne121/loop-protocol")
+            assert "not_all_positive_ints" in err
+
+    def test_duplicate_in_set_rejected(self):
+        req = self._valid_request()
+        req["parent"] = {"action": "unchanged", "issue_number": None}
+        req["add_blocked_by"] = [5, 5]
+        err = validate_issue_relationship_update_input(req, 1883, "squne121/loop-protocol")
+        assert "duplicate" in err
+
+    def test_unsorted_set_rejected(self):
+        req = self._valid_request()
+        req["parent"] = {"action": "unchanged", "issue_number": None}
+        req["add_blocked_by"] = [5, 3]
+        err = validate_issue_relationship_update_input(req, 1883, "squne121/loop-protocol")
+        assert "not_sorted" in err
+
+    def test_add_remove_overlap_same_relation_rejected(self):
+        req = self._valid_request()
+        req["parent"] = {"action": "unchanged", "issue_number": None}
+        req["add_blocked_by"] = [5]
+        req["remove_blocked_by"] = [5]
+        err = validate_issue_relationship_update_input(req, 1883, "squne121/loop-protocol")
+        assert "overlap" in err
+
+    def test_blocked_by_blocking_same_target_conflict_rejected(self):
+        req = self._valid_request()
+        req["parent"] = {"action": "unchanged", "issue_number": None}
+        req["add_blocked_by"] = [9]
+        req["add_blocking"] = [9]
+        err = validate_issue_relationship_update_input(req, 1883, "squne121/loop-protocol")
+        assert "same_target_conflict" in err
+
+    def test_expected_before_self_reference_rejected(self):
+        req = self._valid_request()
+        req["parent"] = {"action": "unchanged", "issue_number": None}
+        req["expected_before"] = {"parent": None, "blocked_by": [1883], "blocking": []}
+        err = validate_issue_relationship_update_input(req, 1883, "squne121/loop-protocol")
+        assert "self_reference" in err
+
+    def test_empty_idempotency_key_rejected(self):
+        req = self._valid_request()
+        req["idempotency_key"] = ""
+        err = validate_issue_relationship_update_input(req, 1883, "squne121/loop-protocol")
+        assert "idempotency_key_invalid" in err

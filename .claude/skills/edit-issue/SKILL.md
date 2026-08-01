@@ -73,6 +73,30 @@ dependency_policy:
 }
 ```
 
+### native_relationships（任意、Issue #1883 additive 拡張）
+
+native `parent`／`blockedBy`／`blocking` を同期する場合は `native_relationships` を追加する。
+省略時は pre-#1883 の body/comment-only 挙動と完全に同一。
+
+```json
+{
+  "native_relationships": {
+    "expected_before": {"parent": null, "blocked_by": [], "blocking": []},
+    "parent": {"action": "set", "issue_number": 1860},
+    "add_blocked_by": [],
+    "remove_blocked_by": [],
+    "add_blocking": [],
+    "remove_blocking": []
+  }
+}
+```
+
+- `expected_before` は省略可（省略時は helper 自身の pre-readback 値を採用する）。指定した場合は live 値との完全一致が mutation の前提条件になる（drift があれば mutation を一切実行せず `failed_no_mutation`）
+- `parent.action` は `unchanged`／`set`／`remove` のいずれか。`replace` semantics は提供しない
+- `add_blocked_by`／`remove_blocked_by`／`add_blocking`／`remove_blocking` は明示的な delta 集合として指定する（空集合への全解除も明示的な `remove_*` で表現する）
+- native relationship mutation は title/body content mutation より **先に** 実行され、失敗した場合は content mutation を一切開始しない（AC1/AC2）
+- 自然言語（`Part of #N`、`Related`、コメント等）からは parent／blocked_by／blocking を一切推測しない。structured input（この `native_relationships` フィールド）だけが source of truth
+
 ## 手順
 
 ### 1. candidate body と readiness context を準備する
@@ -92,16 +116,17 @@ uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py \
 helper は以下の固定順序で進む。
 
 1. current issue を readback する
-2. candidate body を load する
-3. stale precondition を確認する
-4. guard を実行する
-5. hygiene autofix を適用する
-6. static readiness check を実行する
-7. `issue_content.update` 用 input file を生成する
-8. title/body を固定 endpoint の単一 PATCH で更新する
-9. title と body の final readback を確認する
-10. 必要な場合だけ `issue_comment.publish` を実行する
-11. bounded result を出力する
+2. （`native_relationships` 指定時）capability preflight → pre-readback → `expected_before` drift 確認 → graph invariant 検証 → `issue_relationship.update` controlled executor で native parent／blockedBy／blocking を同期し、全ページ post-readback を確認する（失敗時は以降の全ステップを実行せず終了する。Issue #1883）
+3. candidate body を load する
+4. stale precondition を確認する
+5. guard を実行する
+6. hygiene autofix を適用する
+7. static readiness check を実行する
+8. `issue_content.update` 用 input file を生成する
+9. title/body を固定 endpoint の単一 PATCH で更新する
+10. title と body の final readback を確認する
+11. 必要な場合だけ `issue_comment.publish` を実行する
+12. bounded result を出力する（`native_relationships` ブロックを含む）
 
 ### 3. 失敗時ルーティング
 
@@ -109,6 +134,8 @@ helper は以下の固定順序で進む。
 - content update 後に title/body final readback が失敗した場合 → `failed_after_mutation`
 - body update 成功後に comment publish が失敗した場合 → `failed_after_mutation`
 - `readiness_forwarding_payload.readiness_result.status` が `human_judgment` または `input_or_runtime_error` → `human_judgment`
+- native relationship の capability preflight 失敗／`expected_before` drift／graph invariant 違反 → `failed_no_mutation`（content mutation は一切実行しない。AC1）
+- native relationship mutation 自体が失敗（部分実行含む）した場合 → `failed_after_mutation`（content mutation は一切実行しない。AC2）
 
 ### 4. 出力
 
@@ -122,3 +149,4 @@ helper stdout は最後の 1 JSON object のみとし、old/new issue body や c
 - `issue_content.update` は title/body だけを固定 endpoint へ一度だけ PATCH し、曖昧な PATCH failure は remote readback で `already_applied` または失敗に分類する。自動再試行・rollback・CAS は行わない
 - executor input は `artifacts/{issue_number}/issue-metadata/{command-id}/` 配下だけに生成する
 - helper は `capture_output=True, text=True, shell=False` で子プロセスを起動し、bounded diagnostics だけを result に残す
+- native relationship mutation は `issue_relationship.update` controlled executor 固定 operation 経由に限定する。caller が任意の GraphQL query／REST path／hostname／argv を渡す経路は存在しない（AC13）

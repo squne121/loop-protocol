@@ -241,6 +241,34 @@ implementation overlap preflight が `human_review_required` に倒れ続ける�
   write-root 外 tracked changes 確認、`GH_TOKEN`/`GITHUB_TOKEN` の環境除去、mutation 直前の
   attempt marker 記録は PR #1667 レビュー fix_delta で追加された安全策である。
 
+## 既存 Issue の native parent／blockedBy／blocking 同期（`issue_relationship.update`、Issue #1883）
+
+`edit-issue` transaction（`edit_issue_txn.py`）が既存 Issue を更新する際、本文の
+`parent_issue`／`Part of`／`Depends on #N` を書き換えても GitHub native
+`parent`／`blockedBy`／`blocking` が自動的に追従する保証はない（#1679 で実際に
+不一致が発生した）。native relationship を変更する場合は、本文更新だけで完了と
+判定せず、`ISSUE_EDIT_TXN_INPUT_V1.native_relationships`（additive、任意）に
+explicit structured な desired state を渡し、`issue_relationship.update`
+controlled executor 経由で native graph を同期・全ページ readback してから
+本文を更新する。
+
+- native relationship 変更は本文 mutation より **先に** 実行する。native
+  mutation が失敗した場合、本文 mutation は一切開始しない。
+- `blocked_by`／`blocking` の変更は常に明示的な `add_*`/`remove_*` 集合で表現
+  する。`replace` semantics は提供しない。destructive な `remove_*` を実行する
+  前に、pre-readback で取得した live state と `expected_before` の完全一致を
+  確認し、drift があれば mutation を一切実行しない。
+- `Related`／`Part of`／URL mention／コメント等の自然言語からは parent／
+  blocked_by／blocking を一切推測しない。structured input のみが source of
+  truth である。
+- 親 Issue と blocked-by Issue は意味が異なるため、自動的に相互変換しない
+  （`native_relationships.parent` と `add_blocked_by`/`add_blocking` は独立
+  したフィールドであり、同一 issue number を両方に同時指定することは graph
+  invariant 違反として拒否される）。
+- 詳細な transaction order・実行系統・スキーマは
+  `docs/dev/agent-skill-boundaries.md#issue_relationshipupdate-による-github-native-関係性parent--blockedby--blockingの同期実行系統issue-1883`
+  を参照する。
+
 ## scripts 集約による permission 削減パターン
 
 オーケストレーション skill（edit-issue / post-merge-cleanup / create-issue）の inline bash は `.py` / `.sh` script に集約し、`subprocess.run([...])` 配列形式 + 外部入力 allowlist validation を必須とする。Bash allowlist は scripts entrypoint パターン（`Bash(uv run python3 .claude/skills/<name>/scripts/*.py *)`）に絞ることで permission prompt を 1 ループあたり 1 回に削減する。

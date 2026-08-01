@@ -1872,6 +1872,144 @@ Contract の `blocked_by` と native `blockedBy` が不一致な場合の判断�
 引き続き `docs/dev/github-ops.md#native-dependency-と-depends-on-n-が不一致の場合`
 に従い human escalation とし、本 executor は自動で本文を書き換えない。
 
+## `issue_relationship.update` による GitHub native 関係性（parent / blockedBy / blocking）同期実行系統（Issue #1883）
+
+`edit_issue_txn.py` の native relationship 拡張（Required Transaction Order）が、
+title/body content mutation より先に呼び出す固定 controlled executor operation。
+`scripts/agent-guards/controlled_skill_mutation_policy.py` /
+`controlled_skill_mutation_exec.py` に追加する。caller（`edit_issue_txn.py`）は
+GraphQL query／REST path／hostname／任意 argv を渡せない -- executor 内部の
+固定クエリ・固定 mutation のみが実行される（AC13）。
+
+### ISSUE_RELATIONSHIP_UPDATE_INPUT_V1（closed-key 入力スキーマ）
+
+```yaml
+type: object
+additionalProperties: false
+required:
+  - schema
+  - issue_number
+  - repo
+  - expected_before
+  - parent
+  - add_blocked_by
+  - remove_blocked_by
+  - add_blocking
+  - remove_blocking
+  - idempotency_key
+properties:
+  schema:
+    const: ISSUE_RELATIONSHIP_UPDATE_INPUT_V1
+  issue_number:
+    type: integer
+  repo:
+    type: string
+  expected_before:
+    type: object
+    additionalProperties: false
+    required: [parent, blocked_by, blocking]
+    properties:
+      parent:
+        type: [integer, "null"]
+      blocked_by:
+        type: array
+        items:
+          type: integer
+      blocking:
+        type: array
+        items:
+          type: integer
+  parent:
+    type: object
+    additionalProperties: false
+    required: [action, issue_number]
+    properties:
+      action:
+        enum: [unchanged, set, remove]
+      issue_number:
+        type: [integer, "null"]
+  add_blocked_by:
+    type: array
+    items:
+      type: integer
+  remove_blocked_by:
+    type: array
+    items:
+      type: integer
+  add_blocking:
+    type: array
+    items:
+      type: integer
+  remove_blocking:
+    type: array
+    items:
+      type: integer
+  idempotency_key:
+    type: string
+```
+
+`validate_issue_relationship_update_input(data, issue_number, repo)`
+（`scripts/agent-guards/controlled_skill_mutation_policy.py`）は純粋関数（GraphQL
+read/mutation を一切行わない）で、次の graph invariant を mutation 前に拒否する
+（Issue #1883 AC12）: 閉じた key 集合、`schema` 完全一致、`issue_number`/`repo`
+の呼び出し元宣言値との一致、self-parent（`parent.issue_number == issue_number`）、
+self-dependency（`issue_number` が `add_*`/`remove_*`/`expected_before` の集合に
+含まれる）、各集合内の重複・非ソート・bool-as-int・zero/negative、`add_*`と`remove_*`
+の同一集合内 overlap、`blocked_by` 系集合と `blocking` 系集合の同一 target 重複、
+`parent.issue_number` と dependency target の重複。祖先サイクル検出（ancestor
+cycle）は live traversal を要するため executor 側
+（`_check_relationship_ancestor_cycle`）でのみ実行する。
+
+`edit_issue_txn.py` は同じ純粋関数を import して executor 呼び出し前に defense-in-depth
+として再検証する（`_validate_relationship_graph_invariants`）。
+
+### Required Transaction Order（executor 内 saga、`_run_issue_relationship_update`）
+
+1. 入力を `validate_issue_relationship_update_input` で再検証する（caller 契約の defense in depth）
+2. 認証済み actor の repository permission を確認する（`admin`/`write`/`maintain` のみ許可。それ以外は `precondition_rejected`）
+3. `parent`（単一ノード）・`blockedBy`（全ページ）・`blocking`（全ページ）を pre-readback する
+4. `expected_before` と pre-readback の完全一致を確認する。不一致は mutation を一切実行せず `precondition_rejected` を返す（destructive remove の drift 検出。AC11）
+5. `parent.action == "set"` かつ現在の parent と異なる場合、祖先チェーンを bounded walk（最大 50 hop）し、`issue_number` 自身または既存サイクルを検出したら mutation 前に拒否する（AC12 ancestor cycle）
+6. 現在値と desired 値が完全一致する場合は mutation を一切呼ばず `no_op` を返す（AC8 idempotent no-op）
+7. `remove_parent` → `set_parent` → `remove_blocked_by` → `add_blocked_by` → `remove_blocking` → `add_blocking` の順で、operation を一件ずつ固定 argv・`shell=False`・sanitized environment・no automatic retry で直列実行する（`addSubIssue(replaceParent:true)`/`removeSubIssue`/`addBlockedBy`/`removeBlockedBy` を `gh api graphql --input -` 経由で呼び出す。GraphQL query/host/mutation 文字列は executor 内蔵の固定文字列のみ）
+8. 一部 operation が失敗しても残りを継続実行せず、直ちに post-readback へ進む（部分実行の観測性を優先し、cascading failure を防ぐ）
+9. `parent`・`blockedBy`（全ページ）・`blocking`（全ページ）を post-readback する（mutation 成否に関わらず必ず実行する。AC9）
+10. 一部 operation が失敗していた場合は `partial` を返し、`before`/`desired`/`after`（fresh readback 値）/`completed_operations`/`pending_operations` を含める（AC9）
+11. 全 operation が成功し、かつ post-readback が desired と完全一致した場合のみ `applied` を返す。不一致の場合は `postcondition_rejected` を返す
+
+`blocking` 方向規約: Issue `T`（transaction subject）が `X` を block する場合、
+GraphQL `AddBlockedByInput`/`RemoveBlockedByInput` は `issueId=X`（block される側）、
+`blockingIssueId=T`（block する側）を用いる。`add_blocking`/`remove_blocking`
+operation は内部的にこの向きで `addBlockedBy`/`removeBlockedBy` を呼び出す
+（`blocked_by` 側とは issueId/blockingIssueId の割り当てが逆になる）。
+
+### `edit_issue_txn.py` 側の呼び出し（`_run_native_relationship_step`）
+
+`ISSUE_EDIT_TXN_INPUT_V1.native_relationships` が非 null の場合、
+`edit_issue_txn.py` は title/body content mutation の前に次を実行する
+（Required Transaction Order Step 1-7、Issue #1883）。
+
+1. `gh` binary の存在と `gh auth status --hostname github.com` の到達性を preflight する（環境 blocker と runtime permission rejection を区別する。AC10。preflight 成功は write permission の証明にはならない）
+2. `parent`/`blockedBy`（先頭ページ 100 件）/`blocking`（先頭ページ 100 件）を read-only snapshot として取得する（`totalCount` 不一致・pagination 未消化は fail closed とし、切り詰められたデータを「完全」として扱わない）
+3. `native_relationships.expected_before` が省略されていれば直前の read-only snapshot を採用し、指定されていれば snapshot と完全一致するかを確認する（不一致は `failed_no_mutation`）
+4. `issue_relationship.update` 用の executor 入力（`ISSUE_RELATIONSHIP_UPDATE_INPUT_V1`）を組み立て、`validate_issue_relationship_update_input` で再検証する
+5. `artifacts/{issue_number}/issue-metadata/issue_relationship.update/` 配下に入力ファイルを書き、controlled executor を起動する
+6. executor の `status` が `no_op`/`applied` の場合のみ content mutation（Step 8 以降）へ進む。それ以外（`precondition_rejected`/`postcondition_rejected`/`partial`/`transport_or_schema_error`）は content mutation を一切開始せず、`mutation_attempted` に応じて `failed_no_mutation`（未着手）または `failed_after_mutation`（部分実行後）を返す（AC1/AC2）
+
+`ISSUE_EDIT_TXN_RESULT_V1.native_relationships` は常に含まれるフィールドであり、
+`native_relationships` が transaction input に含まれない場合、または
+readiness gate／stale precondition 等の relationship gate 到達前の失敗の場合は
+`{"attempted": false, "status": "not_run", ...}` を返す。
+
+### Allowed Paths
+
+- `.claude/skills/edit-issue/scripts/edit_issue_txn.py`
+- `scripts/agent-guards/controlled_skill_mutation_policy.py`
+- `scripts/agent-guards/controlled_skill_mutation_exec.py`
+- `.claude/skills/edit-issue/tests/`
+- `scripts/agent-guards/tests/test_controlled_skill_mutation_policy.py`
+- `scripts/agent-guards/tests/test_controlled_skill_mutation_exec.py`
+
 ## edit-issue 向け transaction helper の契約定義（Issue #1287）
 
 既存 Issue body/comment mutation の consumer contract は `edit_issue_txn.py` に集約する。
@@ -1958,6 +2096,51 @@ properties:
         type: [string, "null"]
       reason:
         type: [string, "null"]
+  native_relationships:
+    # Issue #1883: additive, optional. Omitting the field entirely preserves
+    # pre-#1883 body/comment-only transaction behaviour exactly.
+    type: [object, "null"]
+    additionalProperties: false
+    properties:
+      expected_before:
+        type: [object, "null"]
+        additionalProperties: false
+        properties:
+          parent:
+            type: [integer, "null"]
+          blocked_by:
+            type: array
+            items:
+              type: integer
+          blocking:
+            type: array
+            items:
+              type: integer
+      parent:
+        type: object
+        additionalProperties: false
+        required: [action]
+        properties:
+          action:
+            enum: [unchanged, set, remove]
+          issue_number:
+            type: [integer, "null"]
+      add_blocked_by:
+        type: array
+        items:
+          type: integer
+      remove_blocked_by:
+        type: array
+        items:
+          type: integer
+      add_blocking:
+        type: array
+        items:
+          type: integer
+      remove_blocking:
+        type: array
+        items:
+          type: integer
 ```
 
 - `title_update.required == true` は non-empty の `proposed_title` と `reason` を必須とし、
@@ -2052,10 +2235,51 @@ properties:
           type: string
         message:
           type: string
+  native_relationships:
+    # Issue #1883: additive result block. Always present -- {"status":
+    # "not_run", "attempted": false, ...} when the transaction input omitted
+    # native_relationships or when a pre-relationship-gate failure (readiness
+    # gate / stale content precondition) short-circuited the transaction
+    # before the relationship saga ever ran.
+    type: object
+    additionalProperties: false
+    required:
+      - attempted
+      - status
+      - before
+      - desired
+      - after
+      - completed_operations
+      - pending_operations
+      - errors
+    properties:
+      attempted:
+        type: boolean
+      status:
+        enum: [not_run, no_op, applied, failed_no_mutation, failed_after_mutation]
+      before:
+        type: [object, "null"]
+      desired:
+        type: [object, "null"]
+      after:
+        type: [object, "null"]
+      completed_operations:
+        type: array
+        items:
+          type: string
+      pending_operations:
+        type: array
+        items:
+          type: string
+      errors:
+        type: array
+        items:
+          type: object
 ```
 
 - stdout は exactly one bounded JSON object とし、old/new issue body や raw child stdout/stderr を含めない
-- body/comment mutation authority は `issue_body.update` / `issue_comment.publish` に限定する
+- body/comment mutation authority は `issue_body.update` / `issue_comment.publish` / `issue_relationship.update` に限定する
+- native relationship mutation（parent / blockedBy / blocking）は title/body content mutation より先に実行し、失敗時は content mutation を一切開始しない（Issue #1883 AC1/AC2）
 
 ## Parallel Agent Runtime Safety（並列エージェント実行安全性）
 

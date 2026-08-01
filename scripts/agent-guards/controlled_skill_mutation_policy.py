@@ -43,10 +43,22 @@ COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE = "issue_scope_snapshot.materialize"
 # all-page pre/post readback + node-ID/number/state/set binding.
 COMMAND_ID_ISSUE_DEPENDENCY_REMOVE = "issue_dependency.remove"
 
+# Issue #1883: fixed native relationship (parent / blockedBy / blocking) sync
+# operation. A single controlled fixed operation; caller never supplies raw
+# GraphQL query/REST path/hostname/argv (AC13).
+COMMAND_ID_ISSUE_RELATIONSHIP_UPDATE = "issue_relationship.update"
+
 # Issue #1632: hard safety cap on the size of the `blockedBy` set the
 # executor will ever readback/compare. Not a page-size knob -- pagination
 # itself is fixed at page size 50 (see controlled_skill_mutation_exec.py).
 ISSUE_DEPENDENCY_REMOVE_MAX_BLOCKED_BY_NUMBERS = 500
+
+# Issue #1883: hard safety caps for issue_relationship.update -- bound on any
+# single explicit add/remove set size, and on the total node count the
+# executor will ever readback/compare for blockedBy/blocking (independent of
+# GraphQL page size, which stays fixed at 50; see controlled_skill_mutation_exec.py).
+ISSUE_RELATIONSHIP_UPDATE_MAX_SET_SIZE = 200
+ISSUE_RELATIONSHIP_UPDATE_MAX_TOTAL_NODES = 500
 
 # Issue #1633: bounded request schema an isolation worktree agent is allowed
 # to produce for an Issue comment. The isolation worktree agent never invokes
@@ -201,6 +213,163 @@ def validate_issue_dependency_remove_input(data: object, issue_number: int, repo
     return ""
 
 
+# Issue #1883: ISSUE_RELATIONSHIP_UPDATE_INPUT_V1 -- closed-key bounded input
+# schema for the issue_relationship.update command id. Covers native `parent`
+# (set/remove via addSubIssue(replaceParent:true)/removeSubIssue) and explicit
+# `blocked_by`/`blocking` add/remove sets (addBlockedBy/removeBlockedBy, with
+# direction swapped for `blocking`). `replace` semantics are intentionally not
+# supported -- callers must always express deltas as explicit add_*/remove_*
+# sets, and a destructive remove is only ever executed after the executor's
+# own live pre-readback confirms `expected_before` (see controlled_skill_mutation_exec.py).
+ISSUE_RELATIONSHIP_UPDATE_INPUT_SCHEMA = "ISSUE_RELATIONSHIP_UPDATE_INPUT_V1"
+
+ISSUE_RELATIONSHIP_UPDATE_INPUT_ALLOWED_KEYS = frozenset(
+    {
+        "schema",
+        "issue_number",
+        "repo",
+        "expected_before",
+        "parent",
+        "add_blocked_by",
+        "remove_blocked_by",
+        "add_blocking",
+        "remove_blocking",
+        "idempotency_key",
+    }
+)
+ISSUE_RELATIONSHIP_UPDATE_EXPECTED_BEFORE_KEYS = frozenset({"parent", "blocked_by", "blocking"})
+ISSUE_RELATIONSHIP_UPDATE_PARENT_KEYS = frozenset({"action", "issue_number"})
+ISSUE_RELATIONSHIP_UPDATE_PARENT_ACTIONS = frozenset({"unchanged", "set", "remove"})
+
+
+def _validate_relationship_number_set(value: object, *, field: str) -> str:
+    """Validate a bounded, sorted, deduplicated, strictly-positive-int list.
+
+    Shared shape check for expected_before.blocked_by/blocking and every
+    add_*/remove_* field on ISSUE_RELATIONSHIP_UPDATE_INPUT_V1.
+    """
+    if not isinstance(value, list):
+        return f"{field}_not_list"
+    if len(value) > ISSUE_RELATIONSHIP_UPDATE_MAX_SET_SIZE:
+        return f"{field}_size_cap_exceeded: {len(value)}"
+    if not all(_is_strict_positive_int(n) for n in value):
+        return f"{field}_not_all_positive_ints"
+    if len(set(value)) != len(value):
+        return f"{field}_duplicate"
+    if value != sorted(value):
+        return f"{field}_not_sorted"
+    return ""
+
+
+def validate_issue_relationship_update_input(data: object, issue_number: int, repo: str) -> str:
+    """Validate a bounded ISSUE_RELATIONSHIP_UPDATE_INPUT_V1 dict (Issue #1883).
+
+    Returns "" on success, else a descriptive error string. This is a pure,
+    side-effect-free static bounds check -- it never performs a GraphQL read
+    or mutation. Live readback/drift/ancestor-cycle checks that require
+    network access happen in the executor
+    (controlled_skill_mutation_exec.py::_run_issue_relationship_update),
+    which re-validates via this same function before any mutation attempt
+    (defense in depth).
+
+    Enforces the AC12 graph invariants that are decidable statically: closed
+    key set, exact schema match, issue_number/repo cross-check, self-parent,
+    self-dependency, duplicate/unsorted/bool-as-int/zero/negative entries in
+    any add_*/remove_* or expected_before set, add/remove overlap within the
+    same relation, and the same target issue number appearing in both a
+    blocked_by-related set and a blocking-related set (or as the parent
+    target) simultaneously. Ancestor-cycle and cross-repository detection
+    (which require live traversal or per-item repo tagging this schema does
+    not carry) are out of scope for this pure validator.
+    """
+    if not isinstance(data, dict):
+        return "issue_relationship_update_input_not_object"
+
+    unknown_keys = set(data.keys()) - ISSUE_RELATIONSHIP_UPDATE_INPUT_ALLOWED_KEYS
+    if unknown_keys:
+        return f"issue_relationship_update_input_unknown_fields: {sorted(unknown_keys)}"
+
+    if data.get("schema") != ISSUE_RELATIONSHIP_UPDATE_INPUT_SCHEMA:
+        return f"issue_relationship_update_input_schema_mismatch: {data.get('schema')!r}"
+
+    req_issue_number = data.get("issue_number")
+    if not _is_strict_positive_int(req_issue_number) or req_issue_number != issue_number:
+        return f"issue_relationship_update_input_issue_number_mismatch: {req_issue_number!r} != {issue_number!r}"
+
+    req_repo = data.get("repo")
+    if req_repo != repo:
+        return f"issue_relationship_update_input_repo_mismatch: {req_repo!r} != {repo!r}"
+
+    expected_before = data.get("expected_before")
+    if not isinstance(expected_before, dict):
+        return "issue_relationship_update_input_expected_before_not_object"
+    unknown_eb = set(expected_before.keys()) - ISSUE_RELATIONSHIP_UPDATE_EXPECTED_BEFORE_KEYS
+    if unknown_eb:
+        return f"issue_relationship_update_input_expected_before_unknown_fields: {sorted(unknown_eb)}"
+    eb_parent = expected_before.get("parent")
+    if eb_parent is not None:
+        if not _is_strict_positive_int(eb_parent):
+            return "issue_relationship_update_input_expected_before_parent_invalid"
+        if eb_parent == issue_number:
+            return "issue_relationship_update_input_expected_before_parent_self_reference"
+    for eb_field in ("blocked_by", "blocking"):
+        eb_err = _validate_relationship_number_set(
+            expected_before.get(eb_field), field=f"issue_relationship_update_input_expected_before_{eb_field}"
+        )
+        if eb_err:
+            return eb_err
+        if issue_number in (expected_before.get(eb_field) or []):
+            return f"issue_relationship_update_input_expected_before_{eb_field}_self_reference"
+
+    parent = data.get("parent")
+    if not isinstance(parent, dict):
+        return "issue_relationship_update_input_parent_not_object"
+    unknown_parent = set(parent.keys()) - ISSUE_RELATIONSHIP_UPDATE_PARENT_KEYS
+    if unknown_parent:
+        return f"issue_relationship_update_input_parent_unknown_fields: {sorted(unknown_parent)}"
+    action = parent.get("action")
+    if action not in ISSUE_RELATIONSHIP_UPDATE_PARENT_ACTIONS:
+        return f"issue_relationship_update_input_parent_action_invalid: {action!r}"
+    parent_issue_number = parent.get("issue_number")
+    if action == "set":
+        if not _is_strict_positive_int(parent_issue_number):
+            return "issue_relationship_update_input_parent_set_issue_number_invalid"
+        if parent_issue_number == issue_number:
+            return "issue_relationship_update_input_parent_set_self_parent"
+    elif parent_issue_number is not None:
+        return "issue_relationship_update_input_parent_issue_number_must_be_null_unless_set"
+
+    field_values: dict = {}
+    for rel_field in ("add_blocked_by", "remove_blocked_by", "add_blocking", "remove_blocking"):
+        value = data.get(rel_field)
+        rel_err = _validate_relationship_number_set(value, field=f"issue_relationship_update_input_{rel_field}")
+        if rel_err:
+            return rel_err
+        if issue_number in value:
+            return f"issue_relationship_update_input_{rel_field}_self_reference"
+        field_values[rel_field] = set(value)
+
+    if field_values["add_blocked_by"] & field_values["remove_blocked_by"]:
+        return "issue_relationship_update_input_add_remove_blocked_by_overlap"
+    if field_values["add_blocking"] & field_values["remove_blocking"]:
+        return "issue_relationship_update_input_add_remove_blocking_overlap"
+
+    blocked_by_targets = field_values["add_blocked_by"] | field_values["remove_blocked_by"]
+    blocking_targets = field_values["add_blocking"] | field_values["remove_blocking"]
+    conflict = blocked_by_targets & blocking_targets
+    if conflict:
+        return f"issue_relationship_update_input_blocked_by_blocking_same_target_conflict: {sorted(conflict)}"
+
+    if action == "set" and parent_issue_number in (blocked_by_targets | blocking_targets):
+        return "issue_relationship_update_input_parent_target_conflicts_with_dependency_target"
+
+    idempotency_key = data.get("idempotency_key")
+    if not isinstance(idempotency_key, str) or not idempotency_key:
+        return "issue_relationship_update_input_idempotency_key_invalid"
+
+    return ""
+
+
 # Allowed write roots for all commands (relative to project root)
 ALLOWED_WRITE_ROOTS = ["artifacts/"]
 
@@ -218,6 +387,7 @@ INPUT_SCHEMA_BY_COMMAND: dict = {
     COMMAND_ID_TEST_VERDICT_PUBLISH: "TEST_VERDICT_PUBLISH_INPUT_V1",
     COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE: "ISSUE_SCOPE_SNAPSHOT_MATERIALIZE_INPUT_V1",
     COMMAND_ID_ISSUE_DEPENDENCY_REMOVE: ISSUE_DEPENDENCY_REMOVE_INPUT_SCHEMA,
+    COMMAND_ID_ISSUE_RELATIONSHIP_UPDATE: ISSUE_RELATIONSHIP_UPDATE_INPUT_SCHEMA,
 }
 
 ALL_COMMAND_IDS = frozenset(INPUT_SCHEMA_BY_COMMAND)
@@ -501,6 +671,47 @@ CONTROLLED_SKILL_MUTATION_COMMAND_POLICY: dict = {
                 f"{COMMAND_ID_ISSUE_DEPENDENCY_REMOVE}/issue_dependency_remove.marker.json"
             ),
             "marker_field": "idempotency_key",
+        },
+        "env_sanitize": ENV_SANITIZE_KEYS,
+    },
+    COMMAND_ID_ISSUE_RELATIONSHIP_UPDATE: {
+        "command_id": COMMAND_ID_ISSUE_RELATIONSHIP_UPDATE,
+        "description": (
+            "Synchronize GitHub native parent / blockedBy / blocking relationships "
+            "as an ordered, sequenced, no-automatic-retry saga -- fixed "
+            "addSubIssue(replaceParent:true)/removeSubIssue/addBlockedBy/"
+            "removeBlockedBy mutations, gated by all-page pre/post readback, "
+            "expected_before drift detection, and ancestor-cycle rejection "
+            "(Issue #1883)"
+        ),
+        "executor_script": EXECUTOR_SCRIPT,
+        "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+        "input_namespace": (
+            f"artifacts/{{issue_number}}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{COMMAND_ID_ISSUE_RELATIONSHIP_UPDATE}/"
+        ),
+        "input_schema": INPUT_SCHEMA_BY_COMMAND[COMMAND_ID_ISSUE_RELATIONSHIP_UPDATE],
+        "github_mutation": {
+            "add_or_remove_sub_issue": True,
+            "add_or_remove_blocked_by": True,
+            "requires_repo": TRUSTED_REPO,
+            "requires_explicit_repo_flag": True,
+            "graphql_only": True,
+            "fixed_host": "github.com",
+        },
+        "precondition": {
+            "expected_before_must_match_all_page_readback": True,
+            "ancestor_cycle_must_be_rejected_before_parent_mutation": True,
+            "credential_actor_must_be_trusted_and_authorized": True,
+        },
+        "postcondition": {
+            "no_tracked_source_changes": True,
+            "no_lockfile_changes": True,
+            "no_settings_changes": True,
+            "allowed_write_roots": ALLOWED_WRITE_ROOTS,
+            "desired_relationship_set_must_match_all_page_readback_for_applied": True,
+        },
+        "idempotency": {
+            "identical_desired_state_produces_zero_mutation_calls": True,
         },
         "env_sanitize": ENV_SANITIZE_KEYS,
     },

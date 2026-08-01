@@ -1282,3 +1282,219 @@ class TestIssueDependencyRemoveClosedStatusSetNoFailedValue:
         assert out["status"] == "postcondition_rejected"
         assert out["status"] in self._CLOSED_STATUS_SET
         assert out["status"] != "failed"
+
+
+# =============================================================================
+# Issue #1883: issue_relationship.update (native parent/blockedBy/blocking sync)
+# =============================================================================
+
+
+def _relationship_self_and_parent(self_id, self_number, self_state="OPEN", parent=None):
+    return {
+        "repository": {
+            "issue": {
+                "id": self_id,
+                "number": self_number,
+                "state": self_state,
+                "parent": parent,
+            }
+        }
+    }
+
+
+def _relationship_field_page(self_id, self_number, field, nodes, has_next=False, end_cursor=None):
+    return {
+        "repository": {
+            "issue": {
+                "id": self_id,
+                "number": self_number,
+                field: {
+                    "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor},
+                    "nodes": nodes,
+                },
+            }
+        }
+    }
+
+
+def _rel_node(node_id, number, state="OPEN"):
+    return {"id": node_id, "number": number, "state": state, "repository": {"nameWithOwner": TRUSTED_REPO}}
+
+
+def _relationship_node_lookup(node_id, number, state="OPEN"):
+    return {"repository": {"issue": {"id": node_id, "number": number, "state": state}}}
+
+
+class _FakeArgs:
+    def __init__(self, issue_number=1883, repo=None, dry_run=False):
+        self.command_id = "issue_relationship.update"
+        self.issue_number = issue_number
+        self.repo = repo or TRUSTED_REPO
+        self.dry_run = dry_run
+        self.output_json = True
+
+
+def _relationship_ok_calls(reason):  # pragma: no cover - assertion helper
+    return reason
+
+
+def _run_relationship(monkeypatch, input_data, graphql_side_effect, *, permission="admin"):
+    results: dict = {}
+
+    def _fail(reason, errors=None, status="error", extra=None):
+        results.update({"outcome": "fail", "status": status, "reason": reason, "extra": extra or {}})
+        return 1 if status != "error" else 2
+
+    def _ok(extra):
+        results.update({"outcome": "ok", **extra})
+        return 0
+
+    monkeypatch.setattr(_exec, "_fetch_issue_dependency_remove_actor", lambda *_a, **_k: ("bot", permission, ""))
+    monkeypatch.setattr(_exec, "_check_no_tracked_changes", lambda *_a, **_k: [])
+    with patch.object(_exec, "_graphql_call", side_effect=graphql_side_effect):
+        _exec._run_issue_relationship_update(_FakeArgs(input_data["issue_number"]), input_data, "gh", _fail, _ok)
+    return results
+
+
+def _relationship_input(**overrides):
+    base = {
+        "schema": "ISSUE_RELATIONSHIP_UPDATE_INPUT_V1",
+        "issue_number": 1883,
+        "repo": TRUSTED_REPO,
+        "expected_before": {"parent": None, "blocked_by": [], "blocking": []},
+        "parent": {"action": "unchanged", "issue_number": None},
+        "add_blocked_by": [],
+        "remove_blocked_by": [],
+        "add_blocking": [],
+        "remove_blocking": [],
+        "idempotency_key": "k1",
+    }
+    base.update(overrides)
+    return base
+
+
+class TestIssueRelationshipUpdateIdempotentNoOp:
+    """AC8: current == desired native state produces zero mutation calls."""
+
+    def test_identical_state_produces_no_op_without_mutation_call(self, monkeypatch):
+        input_data = _relationship_input()
+        calls = [
+            (_relationship_self_and_parent("ISELF", 1883, parent=None), ""),  # self+parent
+            (_relationship_field_page("ISELF", 1883, "blockedBy", []), ""),  # blockedBy
+            (_relationship_field_page("ISELF", 1883, "blocking", []), ""),  # blocking
+        ]
+        results = _run_relationship(monkeypatch, input_data, calls)
+        assert results["outcome"] == "ok"
+        assert results["status"] == "no_op"
+        assert results["mutation_attempted"] is False
+
+
+class TestIssueRelationshipUpdateFullPaginationExactSet:
+    """AC4/AC5: exhaustive all-page readback drives exact-set comparison for
+    blockedBy and blocking, order-independent."""
+
+    def test_add_blocked_by_across_two_pages_matches_desired_exact_set(self, monkeypatch):
+        input_data = _relationship_input(
+            expected_before={"parent": None, "blocked_by": [10], "blocking": []},
+            add_blocked_by=[30],
+        )
+        calls = [
+            (_relationship_self_and_parent("ISELF", 1883, parent=None), ""),  # pre self+parent
+            # pre blockedBy (2 pages)
+            (_relationship_field_page(
+                "ISELF", 1883, "blockedBy", [_rel_node("N10", 10)], has_next=True, end_cursor="C1",
+            ), ""),
+            (_relationship_field_page("ISELF", 1883, "blockedBy", [], has_next=False), ""),
+            (_relationship_field_page("ISELF", 1883, "blocking", []), ""),  # pre blocking
+            (_relationship_node_lookup("N30", 30), ""),  # lookup add target
+            ({"addBlockedBy": {"issue": {"id": "ISELF", "number": 1883},
+              "blockingIssue": {"id": "N30", "number": 30}}}, ""),  # mutation
+            (_relationship_self_and_parent("ISELF", 1883, parent=None), ""),  # post self+parent
+            # post blockedBy (2 pages, unsorted order across pages -- exact-set not list-order)
+            (_relationship_field_page(
+                "ISELF", 1883, "blockedBy", [_rel_node("N30", 30)], has_next=True, end_cursor="C2",
+            ), ""),
+            (_relationship_field_page("ISELF", 1883, "blockedBy", [_rel_node("N10", 10)], has_next=False), ""),
+            (_relationship_field_page("ISELF", 1883, "blocking", []), ""),  # post blocking
+        ]
+        results = _run_relationship(monkeypatch, input_data, calls)
+        assert results["outcome"] == "ok"
+        assert results["status"] == "applied"
+        assert sorted(results["after"]["blocked_by"]) == [10, 30]
+
+    def test_add_blocking_matches_desired_exact_set(self, monkeypatch):
+        input_data = _relationship_input(add_blocking=[9])
+        calls = [
+            (_relationship_self_and_parent("ISELF", 1883, parent=None), ""),
+            (_relationship_field_page("ISELF", 1883, "blockedBy", []), ""),
+            (_relationship_field_page("ISELF", 1883, "blocking", []), ""),
+            (_relationship_node_lookup("N9", 9), ""),
+            ({"addBlockedBy": {"issue": {"id": "N9", "number": 9},
+              "blockingIssue": {"id": "ISELF", "number": 1883}}}, ""),
+            (_relationship_self_and_parent("ISELF", 1883, parent=None), ""),
+            (_relationship_field_page("ISELF", 1883, "blockedBy", []), ""),
+            (_relationship_field_page("ISELF", 1883, "blocking", [_rel_node("N9", 9)]), ""),
+        ]
+        results = _run_relationship(monkeypatch, input_data, calls)
+        assert results["outcome"] == "ok"
+        assert results["status"] == "applied"
+        assert results["after"]["blocking"] == [9]
+
+
+class TestIssueRelationshipUpdateAncestorCycle:
+    """AC12: an ancestor cycle (candidate parent's ancestor chain reaches the
+    subject issue) is rejected before any parent mutation."""
+
+    def test_ancestor_cycle_rejected_before_mutation(self, monkeypatch):
+        input_data = _relationship_input(parent={"action": "set", "issue_number": 200})
+        calls = [
+            (_relationship_self_and_parent("ISELF", 1883, parent=None), ""),  # pre self+parent
+            (_relationship_field_page("ISELF", 1883, "blockedBy", []), ""),
+            (_relationship_field_page("ISELF", 1883, "blocking", []), ""),
+            # ancestor walk: 200's parent is 1883 (the subject) -> cycle
+            (_relationship_self_and_parent("I200", 200, parent={"id": "ISELF", "number": 1883, "state": "OPEN"}), ""),
+        ]
+        results = _run_relationship(monkeypatch, input_data, calls)
+        assert results["outcome"] == "fail"
+        assert results["status"] == "precondition_rejected"
+        assert "ancestor_cycle" in results["reason"]
+
+
+class TestIssueRelationshipUpdatePartialFailure:
+    """AC9: a partial mutation reports before/desired/after and completed/
+    pending operations, classified as `partial`."""
+
+    def test_partial_mutation_reports_completed_and_pending(self, monkeypatch):
+        input_data = _relationship_input(add_blocked_by=[1, 2])
+        calls = [
+            (_relationship_self_and_parent("ISELF", 1883, parent=None), ""),
+            (_relationship_field_page("ISELF", 1883, "blockedBy", []), ""),
+            (_relationship_field_page("ISELF", 1883, "blocking", []), ""),
+            (_relationship_node_lookup("N1", 1), ""),
+            ({"addBlockedBy": {"issue": {"id": "ISELF", "number": 1883},
+              "blockingIssue": {"id": "N1", "number": 1}}}, ""),
+            (None, "gh_api_graphql_failed: transient error"),  # second op's node lookup fails
+            (_relationship_self_and_parent("ISELF", 1883, parent=None), ""),  # post self+parent
+            (_relationship_field_page("ISELF", 1883, "blockedBy", [_rel_node("N1", 1)]), ""),
+            (_relationship_field_page("ISELF", 1883, "blocking", []), ""),
+        ]
+        results = _run_relationship(monkeypatch, input_data, calls)
+        assert results["outcome"] == "fail"
+        assert results["status"] == "partial"
+        assert results["extra"]["completed_operations"] == ["add_blocked_by:1"]
+        assert results["extra"]["pending_operations"] == ["add_blocked_by:2"]
+        assert results["extra"]["after"]["blocked_by"] == [1]
+
+
+class TestIssueRelationshipUpdateActorPermission:
+    """Actor with insufficient repository permission is rejected before any
+    relationship read/mutation is attempted."""
+
+    def test_untrusted_permission_rejected_before_any_graphql_call(self, monkeypatch):
+        # Empty side_effect: any _graphql_call invocation would raise
+        # StopIteration and fail this test -- proving zero calls happen.
+        input_data = _relationship_input(add_blocked_by=[5])
+        results = _run_relationship(monkeypatch, input_data, [], permission="read")
+        assert results["outcome"] == "fail"
+        assert results["status"] == "precondition_rejected"
+        assert "credential_actor_not_authorized" in results["reason"]

@@ -74,14 +74,17 @@ from controlled_skill_mutation_policy import (  # noqa: E402
     COMMAND_ID_TEST_VERDICT_PUBLISH,
     COMMAND_ID_ISSUE_SCOPE_SNAPSHOT_MATERIALIZE,
     COMMAND_ID_ISSUE_DEPENDENCY_REMOVE,
+    COMMAND_ID_ISSUE_RELATIONSHIP_UPDATE,
     ALL_COMMAND_IDS,
     INPUT_SCHEMA_BY_COMMAND,
     ENV_BINDING_MANDATORY_COMMAND_IDS,
     ISSUE_METADATA_NAMESPACE_SEGMENT,
     ISSUE_DEPENDENCY_REMOVE_MAX_BLOCKED_BY_NUMBERS,
+    ISSUE_RELATIONSHIP_UPDATE_MAX_TOTAL_NODES,
     TRUSTED_REPO,
     ENV_SANITIZE_KEYS,
     validate_issue_dependency_remove_input,
+    validate_issue_relationship_update_input,
 )
 
 _ENSURE_CONTRACT_SNAPSHOT_REL = ".claude/skills/impl-review-loop/scripts/ensure_contract_snapshot.py"
@@ -1003,6 +1006,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_test_verdict_publish(args, input_data, gh_bin, _fail, _ok)
     if args.command_id == COMMAND_ID_ISSUE_DEPENDENCY_REMOVE:
         return _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok)
+    if args.command_id == COMMAND_ID_ISSUE_RELATIONSHIP_UPDATE:
+        return _run_issue_relationship_update(args, input_data, gh_bin, _fail, _ok)
 
     return _fail(f"unhandled_command_id: {args.command_id!r}")  # pragma: no cover — defensive
 
@@ -3115,6 +3120,669 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
     if marker_write_errors:
         result["marker_write_errors"] = list(marker_write_errors)
     return _ok(result)
+
+
+
+# -- Issue #1883: controlled native relationship (parent / blockedBy /
+# blocking) synchronization (issue_relationship.update) -----------------------
+#
+# Fixed GraphQL host/queries/mutations. No caller-supplied query, host, argv,
+# credential, or response path (AC13). Every read is an exhaustive all-page
+# readback for blockedBy/blocking (pageInfo.hasNextPage must reach false);
+# parent is a single-node read. Mutation happens as an ordered, sequential,
+# no-automatic-retry saga (AC2/AC9/AC12 Required Transaction Order): the
+# executor re-validates the caller-declared graph invariants (defense in
+# depth, same validator as the pure input schema check), re-reads live state
+# as the sole precondition authority (a caller-declared expected_before is
+# never trusted without a fresh comparison), rejects an ancestor cycle before
+# any parent mutation, executes each explicit add/remove operation with a
+# fixed argv, and always performs a full post-readback (regardless of
+# partial failure) so the caller can classify the encountered state.
+
+_RELATIONSHIP_SELF_AND_PARENT_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      id
+      number
+      state
+      parent { id number state }
+    }
+  }
+}
+"""
+
+_RELATIONSHIP_FIELD_QUERY_TEMPLATE = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      id
+      number
+      %FIELD%(first: 50, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id number state repository { nameWithOwner } }
+      }
+    }
+  }
+}
+"""
+
+_ISSUE_NODE_LOOKUP_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) { id number state }
+  }
+}
+"""
+
+_ADD_SUB_ISSUE_MUTATION = """
+mutation($issueId: ID!, $subIssueId: ID!, $clientMutationId: String) {
+  addSubIssue(input: {
+    issueId: $issueId
+    subIssueId: $subIssueId
+    replaceParent: true
+    clientMutationId: $clientMutationId
+  }) {
+    issue { id number }
+    subIssue { id number }
+  }
+}
+"""
+
+_REMOVE_SUB_ISSUE_MUTATION = """
+mutation($issueId: ID!, $subIssueId: ID!, $clientMutationId: String) {
+  removeSubIssue(input: {issueId: $issueId, subIssueId: $subIssueId, clientMutationId: $clientMutationId}) {
+    issue { id number }
+    subIssue { id number }
+  }
+}
+"""
+
+_RELATIONSHIP_ADD_BLOCKED_BY_MUTATION = """
+mutation($issueId: ID!, $blockingIssueId: ID!, $clientMutationId: String) {
+  addBlockedBy(input: {issueId: $issueId, blockingIssueId: $blockingIssueId, clientMutationId: $clientMutationId}) {
+    issue { id number }
+    blockingIssue { id number }
+  }
+}
+"""
+
+_RELATIONSHIP_REMOVE_BLOCKED_BY_MUTATION = """
+mutation($issueId: ID!, $blockingIssueId: ID!, $clientMutationId: String) {
+  removeBlockedBy(input: {issueId: $issueId, blockingIssueId: $blockingIssueId, clientMutationId: $clientMutationId}) {
+    issue { id number }
+    blockingIssue { id number }
+  }
+}
+"""
+
+_RELATIONSHIP_TRUSTED_PERMISSIONS = _ISSUE_DEPENDENCY_REMOVE_TRUSTED_PERMISSIONS
+_RELATIONSHIP_MAX_PAGES = 50
+_RELATIONSHIP_MAX_ANCESTOR_WALK = 50
+
+
+def _relationship_gh_env() -> dict[str, str]:
+    """Sanitized environment, identical boundary to issue_dependency.remove."""
+    return _build_issue_dependency_remove_gh_env()
+
+
+def _relationship_split_repo(repo: str) -> tuple[str, str] | None:
+    owner, sep, name = repo.partition("/")
+    if not sep or not owner or not name:
+        return None
+    return owner, name
+
+
+def _fetch_self_and_parent(
+    number: int, repo: str, gh_bin: str, env: dict[str, str]
+) -> tuple[dict | None, str]:
+    """Single-node readback of {id, number, state, parent}. parent is None
+    when the issue currently has no native parent."""
+    split = _relationship_split_repo(repo)
+    if split is None:
+        return None, "repo_slug_malformed"
+    owner, name = split
+    data, err = _graphql_call(
+        gh_bin, env, _RELATIONSHIP_SELF_AND_PARENT_QUERY, {"owner": owner, "name": name, "number": number}
+    )
+    if err:
+        return None, err
+    repository = data.get("repository")
+    if not isinstance(repository, dict):
+        return None, "graphql_response_missing_repository"
+    issue = repository.get("issue")
+    if not isinstance(issue, dict):
+        return None, "graphql_response_missing_issue"
+    self_id = issue.get("id")
+    self_number = issue.get("number")
+    self_state = issue.get("state")
+    if not isinstance(self_id, str) or not self_id:
+        return None, "graphql_response_self_id_invalid"
+    if self_number != number:
+        return None, "graphql_response_self_number_mismatch"
+    if self_state not in ("OPEN", "CLOSED"):
+        return None, "graphql_response_self_state_invalid"
+    parent_payload = issue.get("parent")
+    parent_info = None
+    if isinstance(parent_payload, dict):
+        p_id = parent_payload.get("id")
+        p_number = parent_payload.get("number")
+        p_state = parent_payload.get("state")
+        if not isinstance(p_id, str) or not p_id:
+            return None, "graphql_response_parent_id_invalid"
+        if type(p_number) is not int or p_number <= 0:
+            return None, "graphql_response_parent_number_invalid"
+        if p_state not in ("OPEN", "CLOSED"):
+            return None, "graphql_response_parent_state_invalid"
+        parent_info = {"id": p_id, "number": p_number, "state": p_state}
+    return {"id": self_id, "number": self_number, "state": self_state, "parent": parent_info}, ""
+
+
+def _fetch_relationship_field_all_pages(
+    number: int, repo: str, gh_bin: str, env: dict[str, str], field: str
+) -> tuple[dict | None, str]:
+    """Exhaustive cursor-paginated readback of Issue.blockedBy or Issue.blocking.
+
+    Fail-closed on the same class of anomalies as
+    _fetch_blocked_by_all_pages: GraphQL errors, missing/malformed response
+    shape, cross-page self-identity drift, non-repo nodes, duplicate node
+    ids/numbers across pages, a non-progressing cursor, and the total node
+    count exceeding ISSUE_RELATIONSHIP_UPDATE_MAX_TOTAL_NODES.
+    """
+    split = _relationship_split_repo(repo)
+    if split is None:
+        return None, "repo_slug_malformed"
+    owner, name = split
+    query = _RELATIONSHIP_FIELD_QUERY_TEMPLATE.replace("%FIELD%", field)
+
+    nodes: list[dict] = []
+    seen_numbers: set[int] = set()
+    seen_ids: set[str] = set()
+    cursor = None
+    page_count = 0
+    self_id = None
+    self_number = None
+
+    while True:
+        variables = {"owner": owner, "name": name, "number": number, "cursor": cursor}
+        data, err = _graphql_call(gh_bin, env, query, variables)
+        if err:
+            return None, err
+        repository = data.get("repository")
+        if not isinstance(repository, dict):
+            return None, "graphql_response_missing_repository"
+        issue = repository.get("issue")
+        if not isinstance(issue, dict):
+            return None, "graphql_response_missing_issue"
+        if self_id is None:
+            self_id = issue.get("id")
+            self_number = issue.get("number")
+            if not isinstance(self_id, str) or not self_id:
+                return None, "graphql_response_self_id_invalid"
+            if self_number != number:
+                return None, "graphql_response_self_number_mismatch"
+        elif issue.get("id") != self_id or issue.get("number") != self_number:
+            return None, "graphql_response_self_identity_drift_mid_pagination"
+
+        field_payload = issue.get(field)
+        if not isinstance(field_payload, dict):
+            return None, f"graphql_response_missing_{field}"
+        page_info = field_payload.get("pageInfo")
+        if not isinstance(page_info, dict):
+            return None, "graphql_response_missing_page_info"
+        page_nodes = field_payload.get("nodes")
+        if not isinstance(page_nodes, list):
+            return None, "graphql_response_missing_nodes"
+
+        page_count += 1
+        if page_count > _RELATIONSHIP_MAX_PAGES:
+            return None, "graphql_pagination_runaway"
+
+        for node in page_nodes:
+            if not isinstance(node, dict):
+                return None, "graphql_response_node_not_object"
+            node_id = node.get("id")
+            node_number = node.get("number")
+            node_state = node.get("state")
+            node_repo = (node.get("repository") or {}).get("nameWithOwner")
+            if not isinstance(node_id, str) or not node_id:
+                return None, "graphql_response_node_id_invalid"
+            if type(node_number) is not int or node_number <= 0:
+                return None, "graphql_response_node_number_invalid"
+            if node_state not in ("OPEN", "CLOSED"):
+                return None, f"graphql_response_node_state_invalid: {node_state!r}"
+            if node_repo != repo:
+                return None, f"graphql_response_node_repo_mismatch: {node_repo!r}"
+            if node_number in seen_numbers or node_id in seen_ids:
+                return None, "graphql_response_duplicate_node_across_pages"
+            seen_numbers.add(node_number)
+            seen_ids.add(node_id)
+            nodes.append({"id": node_id, "number": node_number, "state": node_state})
+            if len(nodes) > ISSUE_RELATIONSHIP_UPDATE_MAX_TOTAL_NODES:
+                return None, "graphql_response_size_cap_exceeded"
+
+        has_next = page_info.get("hasNextPage")
+        end_cursor = page_info.get("endCursor")
+        if not isinstance(has_next, bool):
+            return None, "graphql_response_has_next_page_not_bool"
+        if has_next:
+            if not isinstance(end_cursor, str) or not end_cursor or end_cursor == cursor:
+                return None, "graphql_response_cursor_invalid_or_not_progressing"
+            cursor = end_cursor
+            continue
+        break
+
+    return {"self_id": self_id, "self_number": self_number, "nodes": nodes, "page_count": page_count}, ""
+
+
+def _lookup_relationship_issue_node(
+    number: int, repo: str, gh_bin: str, env: dict[str, str]
+) -> tuple[dict | None, str]:
+    """Resolve {id, number, state} for an arbitrary issue number in `repo`.
+
+    Used to resolve node ids for parent/blocked_by/blocking mutation targets
+    that are not the transaction subject itself.
+    """
+    split = _relationship_split_repo(repo)
+    if split is None:
+        return None, "repo_slug_malformed"
+    owner, name = split
+    data, err = _graphql_call(gh_bin, env, _ISSUE_NODE_LOOKUP_QUERY, {"owner": owner, "name": name, "number": number})
+    if err:
+        return None, err
+    repository = data.get("repository")
+    if not isinstance(repository, dict):
+        return None, "graphql_response_missing_repository"
+    issue = repository.get("issue")
+    if not isinstance(issue, dict):
+        return None, "graphql_response_missing_issue"
+    node_id = issue.get("id")
+    node_number = issue.get("number")
+    node_state = issue.get("state")
+    if not isinstance(node_id, str) or not node_id:
+        return None, "graphql_response_node_id_invalid"
+    if node_number != number:
+        return None, "graphql_response_node_number_mismatch"
+    if node_state not in ("OPEN", "CLOSED"):
+        return None, "graphql_response_node_state_invalid"
+    return {"id": node_id, "number": node_number, "state": node_state}, ""
+
+
+def _check_relationship_ancestor_cycle(
+    candidate_parent_number: int, self_number: int, repo: str, gh_bin: str, env: dict[str, str]
+) -> str:
+    """Walk candidate_parent_number's ancestor chain (bounded) looking for
+    self_number or a repeated node (existing remote cycle). Returns "" if no
+    cycle is found within the bound, else a descriptive error code. AC12."""
+    seen: set[int] = set()
+    current: int | None = candidate_parent_number
+    hops = 0
+    while current is not None:
+        if current == self_number:
+            return "ancestor_cycle_detected"
+        if current in seen:
+            return "ancestor_cycle_detected_in_existing_remote_graph"
+        seen.add(current)
+        hops += 1
+        if hops > _RELATIONSHIP_MAX_ANCESTOR_WALK:
+            return "ancestor_walk_exceeded_bound"
+        info, err = _fetch_self_and_parent(current, repo, gh_bin, env)
+        if err:
+            return f"ancestor_walk_error: {err}"
+        parent = info.get("parent")
+        current = parent["number"] if parent else None
+    return ""
+
+
+def _execute_relationship_operation(
+    op: dict,
+    self_number: int,
+    self_node_id: str,
+    repo: str,
+    gh_bin: str,
+    env: dict[str, str],
+    idempotency_key: str,
+) -> tuple[bool, str]:
+    """Execute one fixed relationship operation via a single fixed-argv
+    GraphQL mutation. No automatic retry. Returns (ok, error)."""
+    kind = op["kind"]
+    target = op["target"]
+    target_info, err = _lookup_relationship_issue_node(target, repo, gh_bin, env)
+    if err:
+        return False, err
+    client_mutation_id = f"{idempotency_key}:{kind}:{target}"
+
+    if kind == "set_parent":
+        data, err = _graphql_call(
+            gh_bin,
+            env,
+            _ADD_SUB_ISSUE_MUTATION,
+            {"issueId": target_info["id"], "subIssueId": self_node_id, "clientMutationId": client_mutation_id},
+        )
+        if err:
+            return False, err
+        payload = data.get("addSubIssue") if isinstance(data, dict) else None
+        if not isinstance(payload, dict):
+            return False, "mutation_response_missing_add_sub_issue_payload"
+        sub_issue = payload.get("subIssue") or {}
+        parent_issue = payload.get("issue") or {}
+        if sub_issue.get("number") != self_number:
+            return False, "mutation_response_sub_issue_identity_mismatch"
+        if parent_issue.get("number") != target:
+            return False, "mutation_response_parent_identity_mismatch"
+        return True, ""
+
+    if kind == "remove_parent":
+        data, err = _graphql_call(
+            gh_bin,
+            env,
+            _REMOVE_SUB_ISSUE_MUTATION,
+            {"issueId": target_info["id"], "subIssueId": self_node_id, "clientMutationId": client_mutation_id},
+        )
+        if err:
+            return False, err
+        payload = data.get("removeSubIssue") if isinstance(data, dict) else None
+        if not isinstance(payload, dict):
+            return False, "mutation_response_missing_remove_sub_issue_payload"
+        return True, ""
+
+    if kind == "add_blocked_by":
+        data, err = _graphql_call(
+            gh_bin,
+            env,
+            _RELATIONSHIP_ADD_BLOCKED_BY_MUTATION,
+            {"issueId": self_node_id, "blockingIssueId": target_info["id"], "clientMutationId": client_mutation_id},
+        )
+        if err:
+            return False, err
+        payload = data.get("addBlockedBy") if isinstance(data, dict) else None
+        if not isinstance(payload, dict):
+            return False, "mutation_response_missing_add_blocked_by_payload"
+        return True, ""
+
+    if kind == "remove_blocked_by":
+        data, err = _graphql_call(
+            gh_bin,
+            env,
+            _RELATIONSHIP_REMOVE_BLOCKED_BY_MUTATION,
+            {"issueId": self_node_id, "blockingIssueId": target_info["id"], "clientMutationId": client_mutation_id},
+        )
+        if err:
+            return False, err
+        payload = data.get("removeBlockedBy") if isinstance(data, dict) else None
+        if not isinstance(payload, dict):
+            return False, "mutation_response_missing_remove_blocked_by_payload"
+        return True, ""
+
+    if kind == "add_blocking":
+        # self (T) blocks target (X): AddBlockedByInput{issueId: X, blockingIssueId: T}
+        data, err = _graphql_call(
+            gh_bin,
+            env,
+            _RELATIONSHIP_ADD_BLOCKED_BY_MUTATION,
+            {"issueId": target_info["id"], "blockingIssueId": self_node_id, "clientMutationId": client_mutation_id},
+        )
+        if err:
+            return False, err
+        payload = data.get("addBlockedBy") if isinstance(data, dict) else None
+        if not isinstance(payload, dict):
+            return False, "mutation_response_missing_add_blocking_payload"
+        return True, ""
+
+    if kind == "remove_blocking":
+        data, err = _graphql_call(
+            gh_bin,
+            env,
+            _RELATIONSHIP_REMOVE_BLOCKED_BY_MUTATION,
+            {"issueId": target_info["id"], "blockingIssueId": self_node_id, "clientMutationId": client_mutation_id},
+        )
+        if err:
+            return False, err
+        payload = data.get("removeBlockedBy") if isinstance(data, dict) else None
+        if not isinstance(payload, dict):
+            return False, "mutation_response_missing_remove_blocking_payload"
+        return True, ""
+
+    return False, f"unknown_operation_kind: {kind}"
+
+
+def _run_issue_relationship_update(args, input_data, gh_bin, _fail, _ok) -> int:
+    # Defense in depth: re-validate the same closed-key/graph-invariant
+    # contract the caller's own construction is expected to satisfy.
+    field_err = validate_issue_relationship_update_input(input_data, args.issue_number, args.repo)
+    if field_err:
+        return _fail(field_err, status="precondition_rejected", extra={"mutation_attempted": False})
+
+    if args.dry_run:
+        return _ok({"status": "dry_run_ok", "mutation_attempted": False})
+
+    env = _relationship_gh_env()
+
+    login, permission, actor_err = _fetch_issue_dependency_remove_actor(gh_bin, env, args.repo)
+    if actor_err:
+        return _fail(actor_err, status="transport_or_schema_error", extra={"mutation_attempted": False})
+    if permission not in _RELATIONSHIP_TRUSTED_PERMISSIONS:
+        return _fail(
+            f"credential_actor_not_authorized: login={login!r} permission={permission!r}",
+            status="precondition_rejected",
+            extra={"mutation_attempted": False},
+        )
+
+    self_info, err = _fetch_self_and_parent(args.issue_number, args.repo, gh_bin, env)
+    if err:
+        return _fail(err, status="transport_or_schema_error", extra={"mutation_attempted": False})
+    blocked_by_state, err = _fetch_relationship_field_all_pages(args.issue_number, args.repo, gh_bin, env, "blockedBy")
+    if err:
+        return _fail(err, status="transport_or_schema_error", extra={"mutation_attempted": False})
+    blocking_state, err = _fetch_relationship_field_all_pages(args.issue_number, args.repo, gh_bin, env, "blocking")
+    if err:
+        return _fail(err, status="transport_or_schema_error", extra={"mutation_attempted": False})
+
+    current_parent_number = self_info["parent"]["number"] if self_info["parent"] else None
+    current_blocked_by = sorted(n["number"] for n in blocked_by_state["nodes"])
+    current_blocking = sorted(n["number"] for n in blocking_state["nodes"])
+    before_snapshot = {"parent": current_parent_number, "blocked_by": current_blocked_by, "blocking": current_blocking}
+
+    expected_before = input_data["expected_before"]
+    expected_before_normalized = {
+        "parent": expected_before.get("parent"),
+        "blocked_by": sorted(expected_before.get("blocked_by", [])),
+        "blocking": sorted(expected_before.get("blocking", [])),
+    }
+    # AC11: destructive remove_* / parent-remove must never execute against
+    # drifted live state -- this comparison is the sole gate, and it always
+    # runs (not only when a destructive operation is requested), since any
+    # add/remove computation depends on knowing the true current set.
+    if expected_before_normalized != before_snapshot:
+        return _fail(
+            "precondition_expected_before_drift",
+            status="precondition_rejected",
+            extra={"mutation_attempted": False, "before": before_snapshot},
+        )
+
+    parent_action = input_data["parent"]
+    add_bb = input_data["add_blocked_by"]
+    rm_bb = input_data["remove_blocked_by"]
+    add_bl = input_data["add_blocking"]
+    rm_bl = input_data["remove_blocking"]
+
+    desired_parent_number = current_parent_number
+    if parent_action["action"] == "set":
+        desired_parent_number = parent_action["issue_number"]
+    elif parent_action["action"] == "remove":
+        desired_parent_number = None
+
+    desired_blocked_by = sorted((set(current_blocked_by) | set(add_bb)) - set(rm_bb))
+    desired_blocking = sorted((set(current_blocking) | set(add_bl)) - set(rm_bl))
+    desired_snapshot = {"parent": desired_parent_number, "blocked_by": desired_blocked_by, "blocking": desired_blocking}
+
+    if parent_action["action"] == "set" and parent_action["issue_number"] != current_parent_number:
+        cycle_err = _check_relationship_ancestor_cycle(
+            parent_action["issue_number"], args.issue_number, args.repo, gh_bin, env
+        )
+        if cycle_err:
+            return _fail(
+                cycle_err,
+                status="precondition_rejected",
+                extra={"mutation_attempted": False, "before": before_snapshot, "desired": desired_snapshot},
+            )
+
+    parent_noop = parent_action["action"] == "unchanged" or desired_parent_number == current_parent_number
+    if parent_noop and not add_bb and not rm_bb and not add_bl and not rm_bl:
+        # AC8: idempotent no-op -- current == desired, zero mutation calls.
+        return _ok(
+            {
+                "status": "no_op",
+                "mutation_attempted": False,
+                "before": before_snapshot,
+                "desired": desired_snapshot,
+                "after": before_snapshot,
+                "completed_operations": [],
+                "pending_operations": [],
+                "actor_login": login,
+                "actor_permission": permission,
+            }
+        )
+
+    write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
+    pre_mutation_changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+    if pre_mutation_changed:
+        return _fail(
+            "precondition_tracked_changes_detected",
+            [f"changed: {f}" for f in pre_mutation_changed[:20]],
+            status="precondition_rejected",
+            extra={"mutation_attempted": False, "before": before_snapshot, "desired": desired_snapshot},
+        )
+
+    operations: list[dict] = []
+    if not parent_noop:
+        if parent_action["action"] == "remove" and current_parent_number is not None:
+            operations.append({"kind": "remove_parent", "target": current_parent_number})
+        elif parent_action["action"] == "set":
+            if current_parent_number is not None:
+                operations.append({"kind": "remove_parent", "target": current_parent_number})
+            operations.append({"kind": "set_parent", "target": desired_parent_number})
+    for n in sorted(rm_bb):
+        operations.append({"kind": "remove_blocked_by", "target": n})
+    for n in sorted(add_bb):
+        operations.append({"kind": "add_blocked_by", "target": n})
+    for n in sorted(rm_bl):
+        operations.append({"kind": "remove_blocking", "target": n})
+    for n in sorted(add_bl):
+        operations.append({"kind": "add_blocking", "target": n})
+
+    all_operation_labels = [f"{op['kind']}:{op['target']}" for op in operations]
+    completed_operations: list[str] = []
+    mutation_attempted = False
+    op_error: str | None = None
+
+    for op in operations:
+        mutation_attempted = True
+        op_ok, op_err = _execute_relationship_operation(
+            op, args.issue_number, self_info["id"], args.repo, gh_bin, env, input_data["idempotency_key"]
+        )
+        if not op_ok:
+            op_error = f"{op['kind']}:{op['target']}:{op_err}"
+            break
+        completed_operations.append(f"{op['kind']}:{op['target']}")
+
+    # A failed-or-never-attempted operation is "pending" -- it is always the
+    # ordered suffix of all_operation_labels following what actually
+    # completed (AC9).
+    pending_operations = all_operation_labels[len(completed_operations):]
+
+    # Always attempt a full post-readback, even after a partial failure, so
+    # the caller can classify observed vs. desired state (AC9).
+    post_self_info, post_self_err = _fetch_self_and_parent(args.issue_number, args.repo, gh_bin, env)
+    post_bb = post_bb_err = None
+    post_bl = post_bl_err = None
+    if not post_self_err:
+        post_bb, post_bb_err = _fetch_relationship_field_all_pages(
+            args.issue_number, args.repo, gh_bin, env, "blockedBy"
+        )
+    if not post_self_err and not post_bb_err:
+        post_bl, post_bl_err = _fetch_relationship_field_all_pages(
+            args.issue_number, args.repo, gh_bin, env, "blocking"
+        )
+
+    if post_self_err or post_bb_err or post_bl_err:
+        return _fail(
+            "post_readback_failed_after_mutation_attempt",
+            [e for e in (post_self_err, post_bb_err, post_bl_err) if e],
+            status="transport_or_schema_error",
+            extra={
+                "mutation_attempted": mutation_attempted,
+                "before": before_snapshot,
+                "desired": desired_snapshot,
+                "completed_operations": completed_operations,
+                "pending_operations": pending_operations,
+            },
+        )
+
+    after_parent_number = post_self_info["parent"]["number"] if post_self_info["parent"] else None
+    after_snapshot = {
+        "parent": after_parent_number,
+        "blocked_by": sorted(n["number"] for n in post_bb["nodes"]),
+        "blocking": sorted(n["number"] for n in post_bl["nodes"]),
+    }
+
+    if op_error is not None:
+        return _fail(
+            op_error,
+            status="partial",
+            extra={
+                "mutation_attempted": True,
+                "before": before_snapshot,
+                "desired": desired_snapshot,
+                "after": after_snapshot,
+                "completed_operations": completed_operations,
+                "pending_operations": pending_operations,
+            },
+        )
+
+    if after_snapshot != desired_snapshot:
+        return _fail(
+            "postcondition_final_state_mismatch",
+            status="postcondition_rejected",
+            extra={
+                "mutation_attempted": True,
+                "before": before_snapshot,
+                "desired": desired_snapshot,
+                "after": after_snapshot,
+                "completed_operations": completed_operations,
+                "pending_operations": pending_operations,
+            },
+        )
+
+    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+    if changed:
+        return _fail(
+            "postcondition_tracked_changes_detected",
+            [f"changed: {f}" for f in changed[:20]],
+            status="postcondition_rejected",
+            extra={
+                "mutation_attempted": True,
+                "before": before_snapshot,
+                "desired": desired_snapshot,
+                "after": after_snapshot,
+                "completed_operations": completed_operations,
+                "pending_operations": pending_operations,
+            },
+        )
+
+    return _ok(
+        {
+            "status": "applied",
+            "mutation_attempted": True,
+            "before": before_snapshot,
+            "desired": desired_snapshot,
+            "after": after_snapshot,
+            "completed_operations": completed_operations,
+            "pending_operations": pending_operations,
+            "actor_login": login,
+            "actor_permission": permission,
+        }
+    )
 
 
 if __name__ == "__main__":

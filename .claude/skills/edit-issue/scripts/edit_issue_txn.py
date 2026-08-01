@@ -31,6 +31,21 @@ READINESS_SCRIPT = (
     REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts" / "contract_readiness_check.py"
 )
 
+# Issue #1883: native relationship (parent / blockedBy / blocking) mutation is
+# a fixed controlled-executor operation (issue_relationship.update). The pure,
+# side-effect-free graph-invariant validator is imported directly (no gh call,
+# no mutation) so this module can reject a malformed desired state before
+# ever writing an executor input file. AGENT_GUARDS_IMPORT_ROOT is resolved
+# from the real on-disk script location (not the mutable REPO_ROOT module
+# attribute tests monkeypatch), since it must always point at the real
+# controlled_skill_mutation_policy.py regardless of test fixture overrides.
+AGENT_GUARDS_IMPORT_ROOT = SCRIPT_PATH.parents[4] / "scripts" / "agent-guards"
+if str(AGENT_GUARDS_IMPORT_ROOT) not in sys.path:
+    sys.path.insert(0, str(AGENT_GUARDS_IMPORT_ROOT))
+from controlled_skill_mutation_policy import (  # noqa: E402
+    validate_issue_relationship_update_input as _validate_relationship_graph_invariants,
+)
+
 INPUT_SCHEMA = "ISSUE_EDIT_TXN_INPUT_V1"
 RESULT_SCHEMA = "ISSUE_EDIT_TXN_RESULT_V1"
 READINESS_ALLOWED = {"go", "needs_fix", "human_judgment", "input_or_runtime_error"}
@@ -46,8 +61,29 @@ TOP_LEVEL_KEYS = frozenset(
         "expected_previous_body_sha256",
         "expected_previous_updated_at",
         "title_update",
+        "native_relationships",
     }
 )
+
+# Issue #1883: ISSUE_EDIT_TXN_INPUT_V1 additive extension. native_relationships
+# is optional -- omitting it entirely preserves the pre-#1883 body/comment-only
+# transaction behaviour exactly (backward compatible).
+NATIVE_RELATIONSHIPS_KEYS = frozenset(
+    {"expected_before", "parent", "add_blocked_by", "remove_blocked_by", "add_blocking", "remove_blocking"}
+)
+NATIVE_EXPECTED_BEFORE_KEYS = frozenset({"parent", "blocked_by", "blocking"})
+NATIVE_PARENT_KEYS = frozenset({"action", "issue_number"})
+NATIVE_PARENT_ACTIONS = frozenset({"unchanged", "set", "remove"})
+DEFAULT_NATIVE_RESULT: dict[str, Any] = {
+    "attempted": False,
+    "status": "not_run",
+    "before": None,
+    "desired": None,
+    "after": None,
+    "completed_operations": [],
+    "pending_operations": [],
+    "errors": [],
+}
 READINESS_KEYS = frozenset({"readiness_result"})
 READINESS_RESULT_REQUIRED_KEYS = frozenset(
     {
@@ -163,6 +199,233 @@ def _validate_input_payload(data: dict[str, Any]) -> None:
             raise ValueError("comment_body_file_invalid")
         if not isinstance(comment_mode.get("marker"), str) or not comment_mode["marker"]:
             raise ValueError("comment_marker_invalid")
+
+    native_relationships = data.get("native_relationships")
+    if native_relationships is not None:
+        if not isinstance(native_relationships, dict):
+            raise ValueError("native_relationships_invalid")
+        _validate_native_relationships_shape(native_relationships)
+
+
+def _validate_native_relationships_shape(data: dict[str, Any]) -> None:
+    """Structural (schema-shape) validation of the ISSUE_EDIT_TXN_INPUT_V1
+    additive native_relationships block. This only checks the closed key set
+    and basic types the caller must supply; the full AC12 graph-invariant
+    check (self-parent, self-dependency, duplicate/unsorted/bool-as-int,
+    conflicting blocked_by/blocking targets) is delegated to
+    _validate_relationship_graph_invariants (imported from
+    controlled_skill_mutation_policy) once the fully-shaped executor payload
+    is assembled in _run_native_relationship_step -- this avoids maintaining
+    two independent copies of the same invariant logic.
+    """
+    _require_closed_keys(data, NATIVE_RELATIONSHIPS_KEYS, "native_relationships")
+
+    expected_before = data.get("expected_before")
+    if expected_before is not None:
+        if not isinstance(expected_before, dict):
+            raise ValueError("native_relationships_expected_before_invalid")
+        _require_closed_keys(expected_before, NATIVE_EXPECTED_BEFORE_KEYS, "native_relationships_expected_before")
+
+    parent = data.get("parent", {"action": "unchanged", "issue_number": None})
+    if not isinstance(parent, dict):
+        raise ValueError("native_relationships_parent_invalid")
+    _require_closed_keys(parent, NATIVE_PARENT_KEYS, "native_relationships_parent")
+    if parent.get("action", "unchanged") not in NATIVE_PARENT_ACTIONS:
+        raise ValueError("native_relationships_parent_action_invalid")
+
+    for field in ("add_blocked_by", "remove_blocked_by", "add_blocking", "remove_blocking"):
+        value = data.get(field, [])
+        if not isinstance(value, list) or not all(isinstance(n, int) and not isinstance(n, bool) for n in value):
+            raise ValueError(f"native_relationships_{field}_invalid")
+
+
+def _relationship_capability_preflight() -> tuple[bool, str]:
+    """Read-only environment preflight for native relationship mutation
+    (AC10). Distinguishes "cannot even attempt this" (environment blocker --
+    binary missing, auth unreachable) from a runtime write-permission
+    rejection (403/404), which is classified later by the controlled
+    executor's own actor-permission check. Success here is never treated as
+    proof of write permission.
+    """
+    gh = shutil.which("gh")
+    if not gh:
+        return False, "gh_binary_not_found"
+    cp = _run_command([gh, "auth", "status", "--hostname", "github.com"])
+    if cp.returncode != 0:
+        return False, "gh_auth_status_unreachable"
+    return True, ""
+
+
+def _fetch_native_relationships(issue_number: int, repo: str) -> tuple[dict[str, Any] | None, str]:
+    """Best-effort read-only snapshot of {parent, blocked_by, blocking} used
+    by this module to determine expected_before (when the caller omits it)
+    and to report a pre-mutation snapshot. Fails closed (returns None) rather
+    than silently reporting truncated data if a single page of 100 does not
+    exhaust blockedBy/blocking -- the authoritative full-pagination readback
+    happens inside the controlled executor (issue_relationship.update).
+    """
+    gh = shutil.which("gh") or "gh"
+    owner, _, name = repo.partition("/")
+    query = (
+        "query($owner:String!,$name:String!,$number:Int!){"
+        "repository(owner:$owner,name:$name){"
+        "issue(number:$number){"
+        "parent{number} "
+        "blockedBy(first:100){pageInfo{hasNextPage} totalCount nodes{number}} "
+        "blocking(first:100){pageInfo{hasNextPage} totalCount nodes{number}}"
+        "}}}"
+    )
+    cp = _run_command(
+        [
+            gh,
+            "api",
+            "graphql",
+            "-f",
+            "query=\n" + query,
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"name={name}",
+            "-F",
+            f"number={issue_number}",
+        ]
+    )
+    if cp.returncode != 0:
+        return None, _bounded(cp.stderr.strip() or cp.stdout.strip())
+    try:
+        payload = json.loads(cp.stdout)
+        issue = payload["data"]["repository"]["issue"]
+        parent = issue.get("parent")
+        parent_number = parent.get("number") if isinstance(parent, dict) else None
+        blocked_by_payload = issue.get("blockedBy") or {}
+        blocking_payload = issue.get("blocking") or {}
+        if (blocked_by_payload.get("pageInfo") or {}).get("hasNextPage"):
+            return None, "blocked_by_pagination_incomplete_for_readonly_snapshot"
+        if (blocking_payload.get("pageInfo") or {}).get("hasNextPage"):
+            return None, "blocking_pagination_incomplete_for_readonly_snapshot"
+        blocked_by = sorted(n["number"] for n in blocked_by_payload.get("nodes", []))
+        blocking = sorted(n["number"] for n in blocking_payload.get("nodes", []))
+        if blocked_by_payload.get("totalCount") not in (None, len(blocked_by)):
+            return None, "blocked_by_total_count_mismatch"
+        if blocking_payload.get("totalCount") not in (None, len(blocking)):
+            return None, "blocking_total_count_mismatch"
+        return {"parent": parent_number, "blocked_by": blocked_by, "blocking": blocking}, ""
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return None, "gh_graphql_non_json_or_missing_fields"
+
+
+def _run_native_relationship_step(state: "TxnState", relationship_input: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    """Execute Required Transaction Order steps 1/2/3/4/5/6/7 (native
+    relationship capability preflight, pre-readback, expected_before drift
+    check, graph invariant validation, and the sequenced mutation+readback
+    saga delegated to the issue_relationship.update controlled executor
+    command). Returns (proceed_to_content, result_block); proceed_to_content
+    is True only for status in {"no_op", "applied"} (AC1/AC2: any other
+    outcome must block the subsequent content mutation).
+    """
+    cap_ok, cap_err = _relationship_capability_preflight()
+    if not cap_ok:
+        return False, {
+            **DEFAULT_NATIVE_RESULT,
+            "status": "failed_no_mutation",
+            "errors": [{"code": "relationship_capability_preflight_failed", "message": cap_err}],
+        }
+
+    live_before, live_err = _fetch_native_relationships(state.issue_number, state.repo)
+    if live_before is None:
+        return False, {
+            **DEFAULT_NATIVE_RESULT,
+            "status": "failed_no_mutation",
+            "errors": [{"code": "relationship_pre_readback_failed", "message": live_err}],
+        }
+
+    expected_before = relationship_input.get("expected_before")
+    if expected_before is None:
+        expected_before_normalized = live_before
+    else:
+        expected_before_normalized = {
+            "parent": expected_before.get("parent"),
+            "blocked_by": sorted(expected_before.get("blocked_by", [])),
+            "blocking": sorted(expected_before.get("blocking", [])),
+        }
+        if expected_before_normalized != live_before:
+            return False, {
+                **DEFAULT_NATIVE_RESULT,
+                "status": "failed_no_mutation",
+                "before": live_before,
+                "errors": [
+                    {
+                        "code": "expected_before_drift_detected",
+                        "message": "native_relationships.expected_before does not match live pre-readback",
+                    }
+                ],
+            }
+
+    parent_action = relationship_input.get("parent") or {"action": "unchanged", "issue_number": None}
+    add_bb = sorted(set(relationship_input.get("add_blocked_by", [])))
+    rm_bb = sorted(set(relationship_input.get("remove_blocked_by", [])))
+    add_bl = sorted(set(relationship_input.get("add_blocking", [])))
+    rm_bl = sorted(set(relationship_input.get("remove_blocking", [])))
+
+    idempotency_key = (
+        f"{state.repo}:{state.issue_number}:relationship:"
+        f"{parent_action.get('action')}:{parent_action.get('issue_number')}:{add_bb}:{rm_bb}:{add_bl}:{rm_bl}"
+    )
+    executor_payload = {
+        "schema": "ISSUE_RELATIONSHIP_UPDATE_INPUT_V1",
+        "issue_number": state.issue_number,
+        "repo": state.repo,
+        "expected_before": expected_before_normalized,
+        "parent": {
+            "action": parent_action.get("action", "unchanged"),
+            "issue_number": parent_action.get("issue_number"),
+        },
+        "add_blocked_by": add_bb,
+        "remove_blocked_by": rm_bb,
+        "add_blocking": add_bl,
+        "remove_blocking": rm_bl,
+        "idempotency_key": idempotency_key,
+    }
+
+    field_err = _validate_relationship_graph_invariants(executor_payload, state.issue_number, state.repo)
+    if field_err:
+        return False, {
+            **DEFAULT_NATIVE_RESULT,
+            "status": "failed_no_mutation",
+            "before": expected_before_normalized,
+            "errors": [{"code": "graph_invariant_violation", "message": field_err}],
+        }
+
+    input_ref = _write_issue_metadata_input(state.issue_number, "issue_relationship.update", executor_payload)
+    state.relationship_input_ref = input_ref
+    cp, result = _invoke_controlled_exec("issue_relationship.update", state.issue_number, state.repo, input_ref)
+    parsed = result or {}
+    exec_status = parsed.get("status")
+    mutation_attempted = bool(parsed.get("mutation_attempted", False))
+
+    if cp.returncode == 0 and exec_status in ("no_op", "applied"):
+        return True, {
+            "attempted": mutation_attempted,
+            "status": exec_status,
+            "before": parsed.get("before", expected_before_normalized),
+            "desired": parsed.get("desired"),
+            "after": parsed.get("after", parsed.get("before", expected_before_normalized)),
+            "completed_operations": parsed.get("completed_operations", []),
+            "pending_operations": parsed.get("pending_operations", []),
+            "errors": [],
+        }
+
+    overall_status = "failed_after_mutation" if mutation_attempted else "failed_no_mutation"
+    return False, {
+        "attempted": mutation_attempted,
+        "status": overall_status,
+        "before": parsed.get("before", expected_before_normalized),
+        "desired": parsed.get("desired"),
+        "after": parsed.get("after"),
+        "completed_operations": parsed.get("completed_operations", []),
+        "pending_operations": parsed.get("pending_operations", []),
+        "errors": [_child_error(cp, "issue_relationship_update_failed")],
+    }
 
 
 def _safe_repo_file(relative_path: str) -> Path:
@@ -285,6 +548,7 @@ def _render_result(
     remote_current_title: str | None = None,
     patch_attempted: bool = False,
     mutation_outcome: str = "not_attempted",
+    native_relationships: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "schema": RESULT_SCHEMA,
@@ -317,6 +581,7 @@ def _render_result(
             "artifact_ref": comment_input_ref,
         },
         "errors": _truncate_errors(errors),
+        "native_relationships": dict(native_relationships) if native_relationships else dict(DEFAULT_NATIVE_RESULT),
     }
 
 
@@ -428,6 +693,7 @@ class TxnState:
     comment_body_sha256: str | None = None
     body_input_ref: str | None = None
     comment_input_ref: str | None = None
+    relationship_input_ref: str | None = None
     errors: list[dict[str, str]] | None = None
 
     def __post_init__(self) -> None:
@@ -556,6 +822,39 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             errors=state.errors,
         )
 
+    # Issue #1883 Required Transaction Order steps 1-7: native relationship
+    # capability preflight, pre-readback, expected_before drift check, graph
+    # invariant validation, sequenced mutation, and full post-readback all
+    # happen here -- strictly before any title/body content mutation is
+    # attempted (AC1/AC2). native_relationships is an additive, optional
+    # ISSUE_EDIT_TXN_INPUT_V1 field; omitting it preserves pre-#1883 behaviour
+    # exactly.
+    relationship_input = input_data.get("native_relationships")
+    rel_result_for_output: dict[str, Any] | None = None
+    if relationship_input is not None:
+        rel_ok, rel_result_for_output = _run_native_relationship_step(state, relationship_input)
+        if not rel_ok:
+            return _render_result(
+                native_relationships=rel_result_for_output,
+                status=rel_result_for_output["status"],
+                issue_number=state.issue_number,
+                repo=state.repo,
+                mutation_started=bool(rel_result_for_output.get("attempted")),
+                body_attempted=False,
+                body_status="not_run",
+                comment_attempted=False,
+                comment_status="not_run",
+                previous_body_sha256=current_sha,
+                requested_new_body_sha256=None,
+                remote_current_body_sha256=current_sha,
+                body_input_ref=None,
+                comment_input_ref=None,
+                comment_id=None,
+                comment_url=None,
+                comment_body_sha256=None,
+                errors=list(state.errors) + list(rel_result_for_output.get("errors", [])),
+            )
+
     new_body = _read_text_file(input_data["new_body_file"])
     body_change_requested = new_body != current_body
     requested_new_sha = _sha256_text(new_body)
@@ -564,6 +863,7 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
     if requested_new_sha == current_sha and requested_title == current_title and comment_mode.get("mode") == "publish":
         if not _run_comment_publish(state, comment_mode):
             return _render_result(
+                native_relationships=rel_result_for_output,
                 status="failed_after_mutation",
                 issue_number=state.issue_number,
                 repo=state.repo,
@@ -584,6 +884,7 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             )
 
         return _render_result(
+                native_relationships=rel_result_for_output,
             status="ok",
             issue_number=state.issue_number,
             repo=state.repo,
@@ -609,6 +910,7 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
         and comment_mode.get("mode", "skip") == "skip"
     ):
         return _render_result(
+                native_relationships=rel_result_for_output,
             status="no_change",
             issue_number=state.issue_number,
             repo=state.repo,
@@ -646,6 +948,7 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             if guard_cp.returncode != 0:
                 state.errors.append(_child_error(guard_cp, "guard_or_readiness_failed_before_mutation"))
                 return _render_result(
+                native_relationships=rel_result_for_output,
                     status="failed_no_mutation", issue_number=state.issue_number, repo=state.repo,
                     mutation_started=False, body_attempted=False, body_status="not_run",
                     comment_attempted=False, comment_status="not_run", previous_body_sha256=current_sha,
@@ -666,6 +969,7 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             if hygiene_cp.returncode not in (0, 1, 2):
                 state.errors.append(_child_error(hygiene_cp, "issue_contract_hygiene_runtime_error"))
                 return _render_result(
+                native_relationships=rel_result_for_output,
                     status="failed_no_mutation", issue_number=state.issue_number, repo=state.repo,
                     mutation_started=False, body_attempted=False, body_status="not_run",
                     comment_attempted=False, comment_status="not_run", previous_body_sha256=current_sha,
@@ -680,6 +984,7 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             if readiness_cp.returncode != 0:
                 state.errors.append(_child_error(readiness_cp, "guard_or_readiness_failed_before_mutation"))
                 return _render_result(
+                native_relationships=rel_result_for_output,
                     status="failed_no_mutation", issue_number=state.issue_number, repo=state.repo,
                     mutation_started=False, body_attempted=False, body_status="not_run",
                     comment_attempted=False, comment_status="not_run", previous_body_sha256=current_sha,
@@ -695,6 +1000,7 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
         state.requested_new_body_sha256 = requested_new_sha
         if requested_new_sha == current_sha and requested_title == current_title:
             return _render_result(
+                native_relationships=rel_result_for_output,
                 status="no_change", issue_number=state.issue_number, repo=state.repo,
                 mutation_started=False, body_attempted=False, body_status="not_run",
                 comment_attempted=False, comment_status="not_run", previous_body_sha256=current_sha,
@@ -734,6 +1040,7 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             if refreshed_sha == requested_new_sha and refreshed_title == requested_title:
                 state.mutation_started = True
                 return _render_result(
+                native_relationships=rel_result_for_output,
                     status="failed_after_mutation",
                     issue_number=state.issue_number,
                     repo=state.repo,
@@ -753,6 +1060,7 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
                     errors=state.errors,
                 )
             return _render_result(
+                native_relationships=rel_result_for_output,
                 status="mutation_outcome_unknown",
                 issue_number=state.issue_number,
                 repo=state.repo,
@@ -790,6 +1098,7 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
         if final_issue is None:
             state.errors.append({"code": "final_readback_failed", "message": final_error})
             return _render_result(
+                native_relationships=rel_result_for_output,
                 status="failed_after_mutation",
                 issue_number=state.issue_number,
                 repo=state.repo,
@@ -823,6 +1132,7 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
                 }
             )
             return _render_result(
+                native_relationships=rel_result_for_output,
                 status="failed_after_mutation",
                 issue_number=state.issue_number,
                 repo=state.repo,
@@ -844,6 +1154,7 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
 
         if comment_mode.get("mode") == "publish" and not _run_comment_publish(state, comment_mode):
             return _render_result(
+                native_relationships=rel_result_for_output,
                 status="failed_after_mutation",
                 issue_number=state.issue_number,
                 repo=state.repo,
@@ -864,6 +1175,7 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             )
 
         return _render_result(
+                native_relationships=rel_result_for_output,
             status="ok",
             issue_number=state.issue_number,
             repo=state.repo,

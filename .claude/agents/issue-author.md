@@ -37,6 +37,13 @@ permissionMode: acceptEdits
 - helper result は `ISSUE_EDIT_TXN_RESULT_V1` を readback し、`status` に応じて
   success / no_change / fail-closed / human judgment へ routing する
 - `title_update.required == true` は v1 scope 外。別 routing に切り分ける
+- 既存 Issue の GitHub native `parent`／`blockedBy`／`blocking` を本文記述と同期させる場合は、
+  `ISSUE_EDIT_TXN_INPUT_V1.native_relationships`（additive、任意）に explicit structured
+  な `expected_before`／`parent.action`／`add_*`／`remove_*` を渡す（Issue #1883）。
+  本文の `Part of #N`／`Related`／コメント等の自然言語から parent／blocked_by／blocking を
+  推測して `native_relationships` を組み立ててはならない -- structured input のみを source of
+  truth とする。native relationship mutation は title/body content mutation より先に実行され、
+  失敗時は content mutation を一切開始しない。
 
 ## readiness_forwarding_payload 契約
 
