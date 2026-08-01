@@ -39,12 +39,29 @@ READINESS_SCRIPT = (
 # from the real on-disk script location (not the mutable REPO_ROOT module
 # attribute tests monkeypatch), since it must always point at the real
 # controlled_skill_mutation_policy.py regardless of test fixture overrides.
+#
+# This import is deliberately deferred (module-level function, not a
+# top-level `from ... import ...`) so that title/body-only edit calls that
+# never touch native_relationships do not depend on
+# scripts/agent-guards/controlled_skill_mutation_policy.py at all. That file
+# lives outside the edit-issue skill boundary and is intentionally excluded
+# from the fake-git-repo copy used by
+# scripts/agent-guards/tests/test_skill_runtime_exec_anchor.py, which only
+# swaps in controlled_skill_mutation_exec.py at that boundary. A top-level
+# import here raised ModuleNotFoundError for every edit_issue_txn.py
+# invocation under that harness, even ones that never use native
+# relationships.
 AGENT_GUARDS_IMPORT_ROOT = SCRIPT_PATH.parents[4] / "scripts" / "agent-guards"
-if str(AGENT_GUARDS_IMPORT_ROOT) not in sys.path:
-    sys.path.insert(0, str(AGENT_GUARDS_IMPORT_ROOT))
-from controlled_skill_mutation_policy import (  # noqa: E402
-    validate_issue_relationship_update_input as _validate_relationship_graph_invariants,
-)
+
+
+def _load_validate_relationship_graph_invariants():
+    if str(AGENT_GUARDS_IMPORT_ROOT) not in sys.path:
+        sys.path.insert(0, str(AGENT_GUARDS_IMPORT_ROOT))
+    from controlled_skill_mutation_policy import (
+        validate_issue_relationship_update_input,
+    )
+
+    return validate_issue_relationship_update_input
 
 INPUT_SCHEMA = "ISSUE_EDIT_TXN_INPUT_V1"
 RESULT_SCHEMA = "ISSUE_EDIT_TXN_RESULT_V1"
@@ -387,6 +404,7 @@ def _run_native_relationship_step(state: "TxnState", relationship_input: dict[st
         "idempotency_key": idempotency_key,
     }
 
+    _validate_relationship_graph_invariants = _load_validate_relationship_graph_invariants()
     field_err = _validate_relationship_graph_invariants(executor_payload, state.issue_number, state.repo)
     if field_err:
         return False, {
