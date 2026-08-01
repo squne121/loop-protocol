@@ -118,6 +118,8 @@ allow_local_binding = false
 [permissions.loop-protocol-web-research.network.domains]
 "github.com" = "allow"
 "api.github.com" = "allow"
+"docs.github.com" = "allow"
+"raw.githubusercontent.com" = "allow"
 "objects.githubusercontent.com" = "allow"
 "**.openai.com" = "allow"
 "**.anthropic.com" = "allow"

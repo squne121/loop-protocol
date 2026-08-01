@@ -37,6 +37,12 @@ FAIL_CLOSED
 - 裏付けが無い claim を supported 扱いしない。
 - quality gate failed の grounded answer をそのまま採用しない。
 
+NETWORK_ENFORCEMENT_BOUNDARY
+- `network.domains`（`loop-protocol-web-research` profile）は、当該 Codex invocation で managed network proxy が実際に適用されたローカル subprocess egress（`exec_command` 等）に対する domain policy であり、agent が利用可能なすべての外部取得経路を包括的に制御する security boundary として扱わない。
+- モデル内蔵の `web__run` 閲覧経路はこのローカル proxy policy とは別経路である。Codex CLI 0.146.0 の本 repository runtime 検証（`~/.codex/sessions/` の永続化セッションログを一次証拠として検査）では、`web__run` が `network.domains` allowlist 外のドメイン（`example.com`）へ到達できることを確認した。一方、生の `curl`（`exec_command`）はドメインに関係なく承認ポリシーで一律拒否された。
+- Codex CLI 更新時には、managed proxy 適用経路（`exec_command` 系ローカル subprocess egress）と `web__run`（モデル内蔵閲覧経路）の双方を再検証すること。
+
 Known limitation
 - hooks と permission profiles は fail-closed local guardrail であり security boundary ではない。parent runtime overrides、untrusted project、unsupported tool paths では保証が弱まる。
+- `openai/codex#16242`（2026-03-30 時点 OPEN）: `codex sandbox` では domain filtering が 403 を返すが、`codex exec` / interactive mode では domain filtering が機能せず 200 OK を返す不整合が報告されている。managed proxy 経由の domain allowlist を万能の security boundary として扱わないこと。
 """
