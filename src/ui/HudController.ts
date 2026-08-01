@@ -311,8 +311,20 @@ export function createHudController(
       // AC1: exactly one of the two HUD roots is the active player-facing
       // surface for the current phase; the other is hidden + inert.
       const isRunning = state.loopPhase === 'running'
+      const legacyResultSurfaceWasVisible =
+        previousIsRunning === undefined ? undefined : !previousIsRunning
       setHudRootVisibility(combatHudRoot, isRunning, previousIsRunning)
-      setHudRootVisibility(legacyResultSurface, !isRunning, previousIsRunning === undefined ? undefined : !previousIsRunning)
+      setHudRootVisibility(legacyResultSurface, !isRunning, legacyResultSurfaceWasVisible)
+      // Issue #1375 PR #1925 owner playtest (P0, iteration 4): reset scroll
+      // position exactly once, on the transition into visible (running ->
+      // result/debrief), so a leftover scroll offset from a previous visit
+      // never hides `.panel--actions` (Return to hangar) below the fold on
+      // first paint. Guarded by the same visibility-change check as
+      // `setHudRootVisibility()` above (AC6: no unconditional per-frame
+      // writes) — only runs when the surface just became visible.
+      if (!isRunning && legacyResultSurfaceWasVisible !== true) {
+        legacyResultSurface.scrollTop = 0
+      }
       previousIsRunning = isRunning
 
       // -----------------------------------------------------------------
