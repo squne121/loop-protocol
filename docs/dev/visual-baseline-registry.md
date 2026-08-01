@@ -257,7 +257,7 @@ capture 内で表示される要素構成が変化し、`running-hud-overlay-leg
 - CI ジョブで `--update-snapshots` 系のフラグを常用しない。意図しない退行をそのまま「正」に
   固定するリスクを避けるため。
 
-### candidate producer・canonicalization・persistence の境界
+### baseline 候補の生成者・正本採用権限・永続化の境界
 
 - **candidate producer** は差分候補 PNG を生成する環境である。pinned Playwright container を
   含む CI artifact、または互換性を確認したローカル環境は candidate を生成してよい。
