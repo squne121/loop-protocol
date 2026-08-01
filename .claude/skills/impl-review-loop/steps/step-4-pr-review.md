@@ -20,7 +20,7 @@ spawn_agent:
 
 SubAgent 側は `.claude/skills/pr-review-judge/SKILL.md` の手順を実行し、verdict 本文と最小 convention フィールドを呼び出し元へ返す（pr-reviewer は Write/Edit を持たないため、実際の PR コメント投稿は control-plane が行う。詳細は「期待する出力」参照）。
 
-## Completion protocol
+## 完了プロトコル（Completion protocol）
 
 1. root は `spawn_agent` の戻り値から canonical `task_name` を保存する。
 2. `wait_agent` は mailbox activity を待つためだけに使う。timeout、steer、途中 mailbox update は成功ではない。
