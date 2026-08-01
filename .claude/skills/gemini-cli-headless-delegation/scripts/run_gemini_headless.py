@@ -2631,6 +2631,61 @@ class AgyInvocationPolicyError(Exception):
     was never supposed to reach `subprocess.run()` in the first place."""
 
 
+# Issue #1928: characters treated as leading whitespace/BOM when locating the
+# first real token of a prompt. Mirrors Python's default str.strip() whitespace
+# set plus the UTF-8 BOM codepoint, since a BOM is not part of str.isspace().
+_AGY_PROMPT_LEADING_STRIP_CHARS = "\ufeff \t\n\r\v\f"
+
+
+def _agy_prompt_has_leading_slash_command(prompt: str) -> bool:
+    """Return True if *prompt*'s first real token begins with ASCII `/` (Issue #1928).
+
+    Structural, position-only check: strips a leading BOM and any leading
+    whitespace, then looks at the first remaining character. This alone
+    captures every reject-class input from the #1918 policy decision --
+    a single leading slash, leading whitespace/BOM before the slash, stacked
+    leading slash commands (`/plan /grill-me ...`), unknown commands, and
+    workspace/global skill-style commands -- because all of them share the
+    same structural shape: the prompt's first real token starts with `/`.
+    No per-command allowlist/denylist is needed. A `/` that appears only
+    mid-prompt (natural-language mention, URL, path, fenced code block) is
+    never at this position and is therefore never rejected.
+    """
+    stripped = prompt.lstrip(_AGY_PROMPT_LEADING_STRIP_CHARS)
+    return stripped.startswith("/")
+
+
+def _reject_agy_prompt_leading_slash_command(prompt: str) -> None:
+    """Fail-closed rejection of AGY headless prompts with a leading slash-command
+    token (Issue #1928, implementing the #1918 policy decision).
+
+    Antigravity CLI (`agy`) print-mode (`-p`) resolves and applies slash
+    commands and skills (added in AGY 1.1.9, confirmed via `agy --help` /
+    `agy changelog` live evidence) -- these can change workspace, session,
+    permissions, active agent, or invoke browser/skill tooling, not just
+    expand text. This wrapper's headless delegation profile contract must
+    not be bypassable by a prompt that resolves to a slash command, so any
+    prompt whose first real token starts with `/` is rejected before this
+    wrapper ever builds or validates an invocation argv -- i.e. before
+    `_build_agy_inner_argv()` / `_validate_agy_invocation_argv()` run and
+    long before `subprocess.run()` could be reached.
+
+    Raises `AgyInvocationPolicyError` on rejection so the caller (`_run_agy()`)
+    routes through the exact same `except AgyInvocationPolicyError` branch in
+    `run_delegation()` that Issue #1807's argv allowlist already uses --
+    reusing the existing `agy_invocation_policy_denied` failure_class rather
+    than adding a new one. The exception message never echoes the prompt
+    text (or any substring of it), matching Issue #1807's existing
+    no-verbatim-content-in-error-surface invariant for this exception class.
+    """
+    if _agy_prompt_has_leading_slash_command(prompt):
+        raise AgyInvocationPolicyError(
+            "agy invocation rejected: prompt's leading token is a slash-command "
+            "(matches ASCII '/' after stripping BOM/whitespace); this headless "
+            "delegation wrapper does not support slash-command execution (Issue #1918/#1928)"
+        )
+
+
 def _build_agy_inner_argv(agy_bin: str, prompt: str, model: str | None = None) -> list[str]:
     """Single canonical builder for the agy invocation argv (Issue #1807).
 
@@ -2892,6 +2947,13 @@ def _run_agy(
     # `AgyInvocationPolicyError` on any violation, which `run_delegation()`
     # classifies into the `agy_invocation_policy_denied` failure_class
     # (distinct from `agy_permission_denied`; see failure-class-taxonomy.md).
+    # Issue #1928: reject prompts whose leading token is a slash-command
+    # *before* any invocation argv is even built, implementing the #1918
+    # policy decision. Must run ahead of _build_agy_inner_argv() so a
+    # rejected prompt never reaches subprocess.run() and never gets a
+    # chance to be classified as anything other than the wrapper's own
+    # fail-closed policy rejection.
+    _reject_agy_prompt_leading_slash_command(prompt)
     command = _build_agy_inner_argv(agy_bin, prompt, selected_model)
     _validate_agy_invocation_argv(command, approved_models=approved_models)
     # Issue #1807 fix_delta Blocker 1: only once validation has actually

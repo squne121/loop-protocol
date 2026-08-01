@@ -425,3 +425,140 @@ def test_bwrap_prefix_uses_only_validated_inner_argv(tmp_path: Path) -> None:
     assert exec_cmd is not None
     expected_inner_argv = rgh._build_agy_inner_argv("agy", "hello world")
     assert exec_cmd == bwrap_prefix + expected_inner_argv
+
+
+# ---------------------------------------------------------------------------
+# Issue #1928 (implementing the #1918 policy decision): AGY headless prompts
+# whose leading token is a slash-command are rejected fail-closed, before
+# any invocation argv is built and long before subprocess.run() could run.
+# ---------------------------------------------------------------------------
+
+_AGY_REJECT_CLASS_PROMPTS: list[tuple[str, str]] = [
+    ("single_leading_slash", "/plan implement X"),
+    ("leading_whitespace_plus_slash", "   /plan implement X"),
+    ("bom_plus_slash", "\ufeff/plan implement X"),
+    ("stacked_leading_slash", "/plan /grill-me implement X"),
+    ("unknown_command", "/unknown command"),
+    ("workspace_skill_style", "/my-skill do the thing"),
+    ("bare_slash_only", "/"),
+    ("newline_then_slash", "\n/plan implement X"),
+]
+
+
+def test_agy_prompt_has_leading_slash_command_detects_reject_class() -> None:
+    """AC1: `_agy_prompt_has_leading_slash_command()` returns True for every
+    reject-class prompt in the #1918 policy decision."""
+    for label, prompt in _AGY_REJECT_CLASS_PROMPTS:
+        assert rgh._agy_prompt_has_leading_slash_command(prompt) is True, label
+
+
+def test_run_agy_rejects_leading_slash_command_variants() -> None:
+    """AC1: `_run_agy()` raises `AgyInvocationPolicyError` -- and never
+    invokes `subprocess.run()` -- for every reject-class prompt (single
+    leading slash, leading whitespace/BOM before the slash, stacked leading
+    slash commands, unknown command, workspace/global skill-style command,
+    a bare `/`, and a leading slash separated by a newline)."""
+    for label, prompt in _AGY_REJECT_CLASS_PROMPTS:
+        captured_cmd: list[Any] = []
+
+        def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+            captured_cmd.extend(cmd)
+            return _make_completed(0, stdout="should not be reached")
+
+        with patch("subprocess.run", side_effect=mock_run):
+            try:
+                rgh._run_agy(prompt, 30)
+                raise AssertionError(f"expected AgyInvocationPolicyError to be raised for: {label}")
+            except rgh.AgyInvocationPolicyError:
+                pass
+
+        assert captured_cmd == [], f"subprocess.run() must not be invoked for reject-class prompt: {label}"
+
+
+_AGY_ALLOW_CLASS_PROMPTS: list[tuple[str, str]] = [
+    ("mid_prompt_slash_mention", "Explain /plan"),
+    ("url_with_slash", "Read https://example.invalid/path"),
+    ("absolute_path_mention", "The path is /tmp/example"),
+    ("fenced_code_block_slash_command", "```\n/permissions\n```\nExplain what this does"),
+    ("ordinary_japanese_prompt", "テストを実行して結果を要約してください"),
+]
+
+
+def test_agy_prompt_has_leading_slash_command_allows_allow_class() -> None:
+    """AC2: `_agy_prompt_has_leading_slash_command()` returns False for every
+    allow-class prompt (slash appears only mid-prompt, in a URL, a path, or a
+    fenced code block; ordinary text)."""
+    for label, prompt in _AGY_ALLOW_CLASS_PROMPTS:
+        assert rgh._agy_prompt_has_leading_slash_command(prompt) is False, label
+
+
+def test_run_agy_allows_non_leading_slash_prompts() -> None:
+    """AC2: `_run_agy()` does not raise `AgyInvocationPolicyError` -- and
+    reaches `subprocess.run()` normally -- for every allow-class prompt."""
+    for label, prompt in _AGY_ALLOW_CLASS_PROMPTS:
+        captured_cmd: list[Any] = []
+
+        def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+            captured_cmd.extend(cmd)
+            return _make_completed(0, stdout="LOOP_AGY_SMOKE_OK")
+
+        with patch("subprocess.run", side_effect=mock_run):
+            completed = rgh._run_agy(prompt, 30)
+
+        assert completed.returncode == 0, label
+        assert captured_cmd == ["agy", "-p", prompt], label
+
+
+def test_run_agy_allows_prompt_with_existing_model_argument_canonical_argv() -> None:
+    """AC2: the new leading-slash check does not interfere with the existing
+    canonical `[-p, <prompt>, --model, <model>]` argv shape (Issue #1807).
+    Exercises `_reject_agy_prompt_leading_slash_command()` composed with
+    `_build_agy_inner_argv()` / `_validate_agy_invocation_argv()` directly
+    (the same sequence `_run_agy()` runs), without going through
+    `_run_agy()`'s isolated-workspace/bwrap materialization, which is
+    orthogonal to this check and covered by its own existing tests."""
+    prompt = "Explain /plan for this repo"
+
+    # Must not raise: the slash is not in the leading-token position.
+    rgh._reject_agy_prompt_leading_slash_command(prompt)
+
+    argv = rgh._build_agy_inner_argv("agy", prompt, "claude-sonnet-4-6")
+    rgh._validate_agy_invocation_argv(argv, approved_models=frozenset({"claude-sonnet-4-6"}))
+    assert argv == ["agy", "-p", prompt, "--model", "claude-sonnet-4-6"]
+
+
+def test_run_delegation_rejects_leading_slash_command_as_invocation_policy_denied() -> None:
+    """AC1/AC3: end-to-end via `run_delegation()` -- a request whose prompt
+    begins with a slash-command is classified into the existing
+    `agy_invocation_policy_denied` failure_class (Issue #1807's class, reused
+    rather than adding a new one), `subprocess.run()` is never invoked, and
+    neither the raw prompt text nor a secret sentinel embedded in it appears
+    anywhere in the result's `stderr` / `warnings` / `failure_reason`."""
+    secret_sentinel = "LOOP_TEST_SECRET_SENTINEL_1928"
+    prompt = f"/plan use token {secret_sentinel} to implement X"
+    request = _agy_request(prompt=prompt)
+
+    captured_cmd: list[Any] = []
+
+    def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        captured_cmd.extend(cmd)
+        return _make_completed(0, stdout="should not be reached")
+
+    with patch("subprocess.run", side_effect=mock_run):
+        result = rgh.run_delegation(request)
+
+    assert captured_cmd == [], "subprocess.run() must not be invoked when the prompt is rejected"
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_invocation_policy_denied"
+    assert result["warnings"][0].startswith("agy_invocation_policy_denied")
+    assert (result["failure_reason"] or "").startswith("agy_invocation_policy_denied")
+
+    surfaces = [
+        result.get("stderr") or "",
+        " ".join(result.get("warnings") or []),
+        result.get("failure_reason") or "",
+        str(result.get("raw_command")),
+    ]
+    for surface in surfaces:
+        assert prompt not in surface
+        assert secret_sentinel not in surface
