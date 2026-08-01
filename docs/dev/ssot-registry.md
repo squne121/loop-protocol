@@ -37,7 +37,7 @@
   path: docs/dev/workflow.md
   title: Execution Planning Policy (canonical SSOT)
   keywords: [execution-planning, issue-execution-decision, semantic-planning, collision-derived, relation-type, downstream-policy, equivalence, consumer-compatibility]
-  description: ISSUE_EXECUTION_DECISION_V1 の正規化済み静的契約を一意に定める実行計画の正本。下流 consumer が意味を再分類しない境界、legacy/V1 digest equivalence migration、open-pr hard gate 維持を規定する。
+  description: ISSUE_EXECUTION_DECISION_V1 の正規化済み静的契約を一意に定める実行計画の正本。下流 consumer が意味を再分類しない境界と legacy/V1 digest equivalence migration を規定する（open-pr の overlap hard gate は #1679 により production path から完全に削除済み。canonical repository 解決の fail-closed hard gate のみが overlap 機能から独立して維持される）。
   sections:
     - "## Execution Planning Policy (canonical SSOT)"
 

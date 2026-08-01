@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""#1851 AC6 / Blocker 2: canonical repository resolution failure must be
-fail-closed (EXIT_BLOCKED, `gh pr create` never invoked), independently of
-`overlap_gate_active`.
-
-`resolve_canonical_repository()` returning `None` previously (incorrectly)
-fell back to the raw requested `repo` with a warning-only continuation. This
-is a distinct safety boundary (Issue #1470 canonical repository binding)
-from the overlap preflight *evidence* advisory policy (#1851 Major 1) and
-must always stop PR publication.
-"""
+"""#1679 AC7: canonical repository resolution failure must be fail-closed
+(EXIT_BLOCKED, `gh pr create` never invoked). This is a distinct safety
+boundary (Issue #1470 canonical repository binding) that is kept after
+peer OPEN Issue overlap preflight is removed from the production path
+(#1679) -- it is independent of overlap preflight and always stops PR
+publication."""
 
 from __future__ import annotations
 
@@ -61,10 +57,7 @@ def _common_monkeypatches(monkeypatch: pytest.MonkeyPatch, linked_issue: int = 1
         },
     )
     monkeypatch.setattr(open_pr, "find_existing_pr", lambda repo, branch: None)
-    monkeypatch.setattr(
-        open_pr, "fetch_current_linked_issue_labels", lambda repo, issue: ([], None)
-    )
-    # AC6: simulate canonical repository resolution failure regardless of
+    # AC7: simulate canonical repository resolution failure regardless of
     # WHY it failed (network error / gh missing / non-2xx response) -- the
     # producer already collapses all of these into `None`.
     monkeypatch.setattr(open_pr, "resolve_canonical_repository", lambda repo: None)
@@ -87,7 +80,7 @@ def _run_main(
 
     def fail_if_gh_pr_create_called(*args, **kwargs):
         create_called["value"] = True
-        raise AssertionError("gh pr create should never be invoked (AC6 fail-closed)")
+        raise AssertionError("gh pr create should never be invoked (AC7 fail-closed)")
 
     try:
         monkeypatch.setattr(open_pr, "create_pr", fail_if_gh_pr_create_called)
@@ -105,34 +98,14 @@ def _run_main(
         Path(body_path).unlink(missing_ok=True)
 
 
-def test_canonical_repo_resolution_failure_blocks_with_overlap_gate_active(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """GIVEN resolve_canonical_repository() returns None WHEN overlap gate is
-    active (--overlap-preflight-required) THEN main() fails closed before
-    gh pr create."""
-    _common_monkeypatches(monkeypatch, linked_issue=1458)
-
-    rc, lines, create_called = _run_main(
-        monkeypatch,
-        1458,
-        ["--overlap-preflight-required"],
-    )
-
-    assert rc == open_pr.EXIT_BLOCKED
-    assert create_called is False
-    assert any(
-        line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_SOURCE_FAILURE}" for line in lines
-    ), lines
-
-
 def test_canonical_repo_resolution_failure_blocks_with_overlap_gate_inactive(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """GIVEN resolve_canonical_repository() returns None WHEN the overlap
-    gate is NOT active (no --overlap-preflight-required, no forcing label)
-    THEN main() still fails closed -- canonical repository resolution is
-    independent of overlap_gate_active (#1851 fix_delta)."""
+    """GIVEN resolve_canonical_repository() returns None WHEN there is no
+    peer OPEN Issue overlap preflight in the production path (#1679) THEN
+    main() still fails closed -- canonical repository resolution / PR
+    mutation target binding (Issue #1470) is an independent fail-closed
+    safety boundary."""
     _common_monkeypatches(monkeypatch, linked_issue=1458)
 
     rc, lines, create_called = _run_main(
@@ -144,5 +117,5 @@ def test_canonical_repo_resolution_failure_blocks_with_overlap_gate_inactive(
     assert rc == open_pr.EXIT_BLOCKED
     assert create_called is False
     assert any(
-        line == f"ERROR={open_pr.E_OVERLAP_PREFLIGHT_SOURCE_FAILURE}" for line in lines
+        line == f"ERROR={open_pr.E_CANONICAL_REPOSITORY_RESOLUTION_FAILED}" for line in lines
     ), lines
