@@ -5,7 +5,7 @@ command whose stderr merely *contained* the substring "timeout" as a real
 timeout. This misclassified fast, correctly-completed pytest baseline
 failures (exit_code=4, "file or directory not found") whose test node-id
 happened to include the word "timeout" (e.g.
-`test_agy_real_subprocess_timeout_classified`) as `VCP_TIMEOUT` /
+`test_agy_timeout_baseline_fixture_missing`) as `VCP_TIMEOUT` /
 `human_judgment`, even though the command finished in milliseconds.
 """
 
@@ -44,7 +44,7 @@ def test_classify_result_pytest_missing_file_with_timeout_in_test_name_not_miscl
     """
     node_id = (
         ".claude/skills/gemini-cli-headless-delegation/tests/"
-        "test_agy_real_subprocess.py::test_agy_real_subprocess_timeout_classified"
+        "test_agy_timeout_baseline_fixture.py::test_agy_timeout_baseline_fixture_missing"
     )
     command = f"uv run --locked pytest {node_id} -q"
     stderr = f"ERROR: file or directory not found: {node_id}"
@@ -85,7 +85,7 @@ def test_classify_result_non_pytest_stderr_containing_timeout_word_not_misclassi
 
 _TIMEOUT_NODE_ID = (
     ".claude/skills/gemini-cli-headless-delegation/tests/"
-    "test_agy_real_subprocess.py::test_agy_real_subprocess_timeout_classified"
+    "test_agy_timeout_baseline_fixture.py::test_agy_timeout_baseline_fixture_missing"
 )
 
 _VC_ONLY_BODY = (
