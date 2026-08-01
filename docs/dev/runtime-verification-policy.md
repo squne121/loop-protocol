@@ -458,6 +458,22 @@ safety_claims:
 
 ---
 
+## 10. worktree-agent-runtime-smoke（Claude Code／Codex CLI の runtime smoke を担う共有 Skill の説明）
+
+Claude Code／Codex CLI の実 process／TUI を起動して runtime verification を行う Issue（例: hook
+lifecycle、session 非永続化、worktree cwd binding の観測が必要な場合）は、`.claude/skills/worktree-agent-runtime-smoke/SKILL.md`
+を経由する。
+
+- **既定は structured lane**（非対話 `claude -p --output-format stream-json` / `codex exec --json --ephemeral`）で、
+  stream JSON／JSONL event と exit code を証跡とする。TUI screen scraping は使わない。
+- **interactive herdr lane** は TUI `/status`、Skill picker、approval 画面、subagent UI 等、structured lane で
+  露出しない状態の観測が必要な場合だけ使用する。herdr 未検出・`HERDR_ENV` 未設定は `mode=interactive` の
+  SKIP（exit 77）とし、structured lane の失敗へ波及させない。人間の使用中 Herdr session には一切相乗り
+  せず、実行のたびに isolated named session を新規生成し、終了時に cleanup 完了（session 消失）を
+  確認できない場合は fail-closed で exit 1 とする（PR #1921 human OWNER fix-delta）。
+- Runner（`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`）は runtime 起動・観測・証跡収集だけを所有し、
+  hook reason の意味分類・mutation deny の妥当性・review verdict 等の semantic 判定は caller が引き続き所有する。
+
 ## 関連ドキュメント
 
 - `docs/dev/session-recording-policy.md` — session 記録 Kill Switch policy（`session_recording_policy/v1` SSOT）。`secrets_mode` 遷移時の session 記録制御・Kill Switch 手順・checkpoint visibility 検証を定める

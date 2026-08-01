@@ -197,6 +197,7 @@ SubAgent（役割）── Skill（作業手順）
 | `ssot-discovery` | `docs/` 配下を SSOT として横断探索する手順 |
 | `gemini-cli-headless-delegation` | Gemini CLI への headless 委譲手順。file evidence の structure (REPO_EVIDENCE_REF_V1) と verification contract が定義されている。検証契約の置き場。 |
 | `nlm-skill` | NotebookLM CLI / MCP 操作（既存導入） |
+| `worktree-agent-runtime-smoke` | linked worktree 内で Claude Code／Codex CLI の fresh runtime を起動し、structured lane（既定）または interactive herdr lane（TUI 固有挙動が必要な場合のみ）で観測する共有 Skill（Issue #1887）。owner: `implementation-worker`／`test-runner`（動作検証 AC を含む Issue の実行者）。trigger: `## Runtime Verification Applicability` が `immediate` で Claude Code／Codex CLI の実 process／TUI 起動証跡が必要な場合。non-trigger: 静的検証のみで AC を満たせる場合、semantic な hook reason 分類・mutation deny 妥当性・context budget 評価を行う場合（本 Skill は runtime 起動・観測・証跡収集だけを所有し、semantic verdict は caller が所有する）。output boundary: `<worktree>/artifacts/runtime-smoke/<run-id>/` の worktree-local untracked evidence は allowlist-only の `summary.md` 1 ファイルに限定し（PR #1921 human OWNER fix-delta）、raw prompt／raw transcript／reasoning／credential／HOME 絶対パスは保存しない。interactive lane は呼び出し元の Herdr session とは分離した isolated named session を毎回新規生成し、終了時に cleanup 完了を確認できない場合は fail-closed で exit 1 とする。新しい schema／digest／receipt／publisher／state store は追加しない。 |
 
 ## Repository Folder Policy Change Route（リポジトリフォルダポリシー変更ルート）
 
@@ -1963,7 +1964,7 @@ cycle）は live traversal を要するため executor 側
 `edit_issue_txn.py` は同じ純粋関数を import して executor 呼び出し前に defense-in-depth
 として再検証する（`_validate_relationship_graph_invariants`）。
 
-### Required Transaction Order（executor 内 saga、`_run_issue_relationship_update`）
+### Required Transaction Order（executor 内 saga の必須実行順序、`_run_issue_relationship_update`）
 
 1. 入力を `validate_issue_relationship_update_input` で再検証する（caller 契約の defense in depth）
 2. 認証済み actor の repository permission を確認する（`admin`/`write`/`maintain` のみ許可。それ以外は `precondition_rejected`）
@@ -2016,7 +2017,7 @@ candidate body が変更を含む場合、guard／hygiene／readiness を実行�
 6. executor の `status` が `no_op`/`applied` の場合のみ content mutation へ進む。それ以外（`precondition_rejected`/`postcondition_rejected`/`partial`/`transport_or_schema_error`）は content mutation を一切開始せず、`mutation_attempted` に応じて `failed_no_mutation`（未着手）または `failed_after_mutation`（部分実行後）を返す（AC1/AC2）。子プロセスが timeout（returncode 124）または non-JSON 出力を返した場合は「mutation なし」と即断せず、独立readback を実行し observed state を desired/before と比較したうえで分類する（PR #1897 P1-5: `applied_with_receipt_loss`/`failed_no_mutation`/`failed_after_mutation`）
 7. Phase B が成功した場合、title/body/updatedAt を再読取し、content-lane の `expected_previous_updated_at` に fresh な値を使う。再読取で title/body の concurrent drift を検出したら `failed_after_mutation` で停止する（PR #1897 P1-7）
 
-**Phase C（`_finalize_native_relationships`、最終 combined readback）**
+**Phase C（`_finalize_native_relationships`。最終段階の combined readback を担う）**
 
 content mutation（または確定した no-op）が完了したら、`issue_relationship.update`
 を zero-delta（`expected_before=desired`、add/remove 空、`parent.action=unchanged`）
@@ -2035,12 +2036,14 @@ readiness gate／stale precondition 等の relationship gate 到達前の失敗�
 
 ### Allowed Paths
 
-- `.claude/skills/edit-issue/scripts/edit_issue_txn.py`
-- `scripts/agent-guards/controlled_skill_mutation_policy.py`
-- `scripts/agent-guards/controlled_skill_mutation_exec.py`
-- `.claude/skills/edit-issue/tests/`
-- `scripts/agent-guards/tests/test_controlled_skill_mutation_policy.py`
-- `scripts/agent-guards/tests/test_controlled_skill_mutation_exec.py`
+本セクションが対象とする編集許可パスは以下の通り。
+
+- `.claude/skills/edit-issue/scripts/edit_issue_txn.py` — transaction 本体
+- `scripts/agent-guards/controlled_skill_mutation_policy.py` — policy 定義
+- `scripts/agent-guards/controlled_skill_mutation_exec.py` — executor 実装
+- `.claude/skills/edit-issue/tests/` — 対応テスト一式
+- `scripts/agent-guards/tests/test_controlled_skill_mutation_policy.py` — policy のテスト
+- `scripts/agent-guards/tests/test_controlled_skill_mutation_exec.py` — executor のテスト
 
 ## edit-issue 向け transaction helper の契約定義（Issue #1287）
 
