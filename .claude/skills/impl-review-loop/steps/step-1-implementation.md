@@ -21,7 +21,7 @@ spawn_agent:
 
 This dispatch block defines static call shape only. It does not prove runtime capability, permission enforcement, or security-boundary verification. Native runtime verification is owned by #1841. この静的な記述は実行時の能力・権限強制・security boundary を証明しません。
 
-### Materialization rule
+### Materialization rule（実値を具体化する規則）
 
 `task_name` は実行直前に実際の非負 iteration で `implementation_i{iteration}` から materialize し、同一 root session 内で既に保存済みの canonical task name を再利用してはならない。`fork_turns: none` のため、root は message に実際の Issue number、完全な Issue URL、contract snapshot URL（指定された場合）、Allowed Paths、serialized `fix_delta` を値として埋め込む。`LOOP_STATE.issue_number`、変数名、`current`、波括弧・山括弧の placeholder を child message に渡してはならない。この static template 自体を tool call として送信してはならない。
 

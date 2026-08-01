@@ -20,7 +20,7 @@ spawn_agent:
     Expected result: a head-bound test-runner report with per-AC PASS, FAIL, or SKIP facts.
 ```
 
-### Materialization rule
+### Materialization rule（実値を具体化する規則）
 
 `task_name` は実行直前に実際の非負 iteration で `verification_i{iteration}` から materialize し、同一 root session 内で既に保存済みの canonical task name を再利用してはならない。`fork_turns: none` のため、root は message に実際の Issue number、PR number、AC 全文、literal Verification Commands 全文、contract body SHA、diff head SHA を値として埋め込む。`LOOP_STATE`、`Step 1 PR number`、`current contract body SHA`、変数名、波括弧・山括弧の placeholder を child message に渡してはならない。この static template 自体を tool call として送信してはならない。
 

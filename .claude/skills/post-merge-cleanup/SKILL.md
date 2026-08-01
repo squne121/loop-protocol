@@ -25,7 +25,7 @@ spawn_agent:
     Expected result: POST_MERGE_CLEANUP_REPORT_V1 with cleanup and human-review facts.
 ```
 
-### Materialization rule
+### Materialization rule（実値を具体化する規則）
 
 `task_name` は実行直前に実際の merged PR number と非負 attempt で `post_merge_cleanup_pr{merged_pr_number}_i{attempt}` から materialize する。たとえば固定の PR 番号を用いず、同一 root session 内で既に保存済みの canonical task name を再利用してはならない。`fork_turns: none` のため、root は message に実際の merged PR number、linked Issue number、worktree path、branch name、canonical cleanup scripts、follow-up candidates を値として埋め込む。`merged PR number` の自然言語参照、変数名、波括弧・山括弧の placeholder を child message に渡してはならない。この static template 自体を tool call として送信してはならない。
 
