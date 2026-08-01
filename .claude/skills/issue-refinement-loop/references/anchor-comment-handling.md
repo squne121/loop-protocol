@@ -137,7 +137,7 @@ planner が受け取るのは normalized decision / hash / provenance のみと�
 
 `anchor_context.py`（`scripts/anchor_context.py`）は、`run_refinement_preflight.py` が生成した既存 snapshot artifact（`anchor_comment.snapshot`）のみを唯一の入力とする pure analyzer である。独自の GitHub API 呼び出しは持たない。
 
-### segment / candidates
+### segment / candidates（分節と候補抽出）
 
 - `segment`: `# you asked` / `# chatgpt response`（大文字小文字・前後空白差を正規化）マーカーで本文を分節し、各セグメントに `speaker: owner | quoted_assistant | unknown` と `start_line` / `end_line` を付与する。マーカーが存在しない区間の `speaker` は常に `unknown`（`owner` への自動昇格はしない）。
 - `candidates`: `segment` の出力から箇条書き・prose directive 候補を `source_span` 付きで抽出する。各候補は `relation: unclassified` を持ち、単一の `final_candidate` を選択するロジックは持たない。セグメント間の意味関係分類（add/replace/retract/confirm/narrow/conditional/explanation/quotation/unknown）は Out of Scope。
@@ -154,6 +154,6 @@ planner が受け取るのは normalized decision / hash / provenance のみと�
 - `source_hash_verified`（bool）: 取得直後に計算した sha256 と `scope_delta_decision.anchor_comment_hash` が一致することを示す
 - `source_ranges_covered`（bool）: `segment` が処理した行範囲の inclusive interval の和集合が `[1, line_count]` と一致することを示す（`anchor_context.compute_source_ranges_covered()` が単純合計ではなく interval merge で判定し、重複区間による過大評価を防ぐ）
 
-### heavy mutation gate（AC6）
+### heavy mutation gate（重大変更ゲート・AC6）
 
 `run_refinement_preflight.py` の `_classify_heavy_mutation_gate()` は、`known_context.mutation_category` が heavy mutation カテゴリ（`close` / `not_planned` / `replacement_issue_creation` / `dependency_removal` / `parent_child_change`）に該当する場合、`scope_delta_decision` が owner 発言由来の明示的決定（`status: approved_by_trusted_anchor` かつ `anchor_author_association: OWNER`）でない限り `status: blocked` / `fail_closed: true` を返す。非 heavy な通常改善・追加調査・review 継続カテゴリは、owner 明示的決定がなくても `status: warn` で継続する。
