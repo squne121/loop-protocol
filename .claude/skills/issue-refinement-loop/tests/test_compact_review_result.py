@@ -390,7 +390,7 @@ def test_compact_review_result_containment_check_rejects_escape(tmp_path):
         repo_root = Path(other_root) / "repo"
         repo_root.mkdir()
         artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
-        with pytest.raises(ValueError, match="escapes base directory"):
+        with pytest.raises(ValueError, match="artifact_dir_not_canonical"):
             compact_review_result(
                 raw_result, artifact_dir=artifact_dir, issue_number=42, repo_root=repo_root
             )
@@ -471,15 +471,29 @@ def test_compact_review_result_cli_rejects_nan_input(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_compact_review_result_rejects_absolute_artifact_dir(tmp_path):
-    """GIVEN absolute artifact_dir WHEN compact_review_result called THEN ValueError raised."""
-    fixture = FIXTURES_DIR / "review_result_approve.json"
-    _raw_result = json.loads(fixture.read_text(encoding="utf-8"))
+def test_compact_review_result_rejects_absolute_artifact_dir_without_repo_root(tmp_path):
+    """The CLI, not a helper, rejects unsafe absolute wire invocations."""
+    import subprocess
 
-    # We test the validator directly
-    from compact_review_result import _validate_artifact_path
-    with pytest.raises(ValueError, match="Absolute"):
-        _validate_artifact_path("/absolute/path/to/artifacts")
+    script = SCRIPTS_DIR / "compact_review_result.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--input-file",
+            str(FIXTURES_DIR / "review_result_approve.json"),
+            "--artifact-dir",
+            str(tmp_path / ".claude/artifacts/issue-refinement-loop"),
+            "--issue-number",
+            "42",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "STATUS: failed" in result.stdout
+    assert str(tmp_path) not in result.stdout
 
 
 def test_compact_review_result_rejects_path_traversal():
@@ -1050,4 +1064,3 @@ def test_check_issue_contract_cli_merge_readiness_mode_missing_args_exits_2(tmp_
         text=True,
     )
     assert result.returncode == 2
-
