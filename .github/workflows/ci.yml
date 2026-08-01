@@ -1184,6 +1184,8 @@ jobs:
         run: uv run --locked python scripts/check_input_command_schema.py
       - name: Check visual artifact pipeline wiring
         run: uv run --locked python scripts/check-visual-artifact-pipeline.py
+      - name: Check required-CI VRT snapshot policy
+        run: uv run --locked python scripts/check-vrt-snapshot-policy.py
       - name: Verify python-test plan paths + lane union
         # Fail-closed plan checks (Issue #1064 review): every plan path exists, and the
         # collected node IDs satisfy  parallel ∪ serial == scope  and  parallel ∩ serial == ∅.

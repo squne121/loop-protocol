@@ -257,6 +257,25 @@ capture 内で表示される要素構成が変化し、`running-hud-overlay-leg
 - CI ジョブで `--update-snapshots` 系のフラグを常用しない。意図しない退行をそのまま「正」に
   固定するリスクを避けるため。
 
+### candidate producer・canonicalization・persistence の境界
+
+- **candidate producer** は差分候補 PNG を生成する環境である。pinned Playwright container を
+  含む CI artifact、または互換性を確認したローカル環境は candidate を生成してよい。
+- **canonicalization authority** は candidate を repository の baseline として採用する人間の
+  判断である。candidate が生成された時点では canonical baseline ではない。
+- **persistence** は、baseline PNG を含む reviewed PR が commit・merge されることを指す。
+  candidate を artifact として保存するだけでは persistence でも canonicalization でもない。
+- required CI は `playwright.config.ts` の `updateSnapshots: 'none'` 解決と
+  `scripts/check-vrt-snapshot-policy.py` により、既知の Playwright/Vitest update mode と
+  `test:vrt:update:e2e` への到達経路を拒否する。validator は `ci.yml`、そこから参照される
+  local composite action、到達した package script だけを構造的に解析し、未解決 interpolation・
+  malformed YAML・validator wiring 欠落を fail-closed とする。
+- `pnpm test:vrt:update:e2e` は local/manual candidate generation 専用の明示入口であり、
+  required CI から直接・間接に実行してはならない。component VRT の update script は #1389 の
+  責務であり、本 policy に含めない。
+- この静的 policy は repository rules、CODEOWNERS、required review、または人間による review
+  実施を強制しない。それらの enforcement は repository 設定と運用契約の責務である。
+
 ### baseline 変更 PR のレビュー checklist（基準画像変更のレビュー項目）
 
 baseline PNG を追加 / 更新する PR のレビューでは、以下を必ず確認する。
