@@ -287,9 +287,9 @@ branch publish が hook / approval 境界で止まった場合、agent は manua
 - `branch_mismatch` / `stale_remote_head` / `local_head_mismatch` / `remote_fast_forward_by_same_scope` / `remote_head_scope_contamination` / `allowed_paths_gate_not_ok` / `publish_guard_context_missing` / `publish_guard_context_invalid` のいずれかなら `PUBLISH_SAFETY_STOP_REPORT_V1` を残して停止する
 - strict lane を hook に束縛する場合は `LOOP_PUBLISH_EXPECTED_REMOTE_HEAD` / `LOOP_PUBLISH_CURRENT_REMOTE_HEAD` / `LOOP_PUBLISH_DECLARED_PUBLISH_HEAD` / `LOOP_PUBLISH_VERIFIED_HEAD` / `LOOP_PUBLISH_ALLOWED_PATHS_GATE_STATUS` / `LOOP_PUBLISH_REMOTE_READBACK_SOURCE` をセットする
 
-### Scope Collision Preflight（スコープ衝突の事前確認、#1860 で advisory 化）
+### Scope Collision Preflight（スコープ衝突の事前確認、#1860 で advisory 化。#1679: implement-issue 側の peer Issue 再判定は撤去済み）
 
-Allowed Paths overlap 単独では hard stop ではない。OPEN な他 Implementation Issue と Allowed Paths が重複する場合、Scope Collision Preflight で以下の class を判定するが、判定結果自体は着手・実装・PR publication を止めない（#1860: OPEN Issue 全件収集・semantic overlap 判定・Allowed Paths の文字列重複は advisory diagnostic であり blocking authority を持たない）。
+Allowed Paths overlap 単独では hard stop ではない。以下の class 分類は Issue 起票時の `create-issue` 側 preflight（`check_issue_overlap.py`）が使う概念であり、判定結果自体は着手・実装・PR publication を止めない（#1860: OPEN Issue 全件収集・semantic overlap 判定・Allowed Paths の文字列重複は advisory diagnostic であり blocking authority を持たない）。`implement-issue` / `open-pr` の実行時に peer OPEN Issue を再列挙・readback して class を再判定する処理（#1679 で撤去）は存在しない。`implement-issue` は target Issue・worktree・実 diff・実 test・target PR・CI・独立 review・human stop のみを判断入力とする target-only executor である。
 
 - `C0: no collision`
   - Allowed Paths が重複しない。通常どおり着手可。
@@ -311,15 +311,13 @@ Allowed Paths overlap 単独では hard stop ではない。OPEN な他 Implemen
 - `C3: conflicting overlap`
   - Outcome / AC / schema / ownership が実質的に同じ、または同時実装すると片方が不要になる可能性がある。
   - 例: 同じ bug の別修正、同じ checker rule の別名追加、同じ SSOT policy の競合変更。
-  - `C3` は duplicate / superseded / absorb / split の候補として Issue コメントに記録するが、着手を自動停止しない（human escalation は advisory な提案であり hard stop ではない）。
+  - `C3` は duplicate / superseded / absorb / split の候補として Issue コメントに記録するが、着手は自動停止しない（human escalation は advisory であり hard stop ではない）。
 
 着手を停止するのは以下の場合のみ（#1860）:
 
 - Hard gate 未充足（作業場所、protected paths/secret、破壊的 Git 操作禁止、typecheck/lint/test/build、CI/required checks/branch protection、独立レビュー・最終マージ）
 - current head と対象 peer commit の実際の 3-way Git conflict
 - target PR について GitHub が `mergeable == CONFLICTING` または `merge_state_status == DIRTY` と判定した場合
-
-Scope Collision の class（C0/C1/C2a/C2b/C3）は上記 hard gate とは独立した advisory diagnostic であり、それ単独では着手・実装・PR publication を止めない。
 
 workflow 不具合の修正方針では、自然言語 workaround を先に積むのではなく、以下の順で **決定論的修正** を優先する。
 
@@ -345,11 +343,11 @@ policy_mapping:
   C3: ambiguous_requires_human
 ```
 
-GitHub full-text search の false positive は候補 Issue body の `## Allowed Paths` read-back で除外する。GitHub source（search / read-back）が失敗・partial・saturation のときは `safe_new_issue` に倒さず `ambiguous_requires_human`（fail-closed）。delivery-rollup parent の child 起票では sibling child 同士の Allowed Paths overlap も検査する（fixture-only。child plan の完全な consume と hard gate は #946 の責務）。
+GitHub full-text search の false positive は候補 Issue body の `## Allowed Paths` read-back で除外する。GitHub source が失敗・partial・saturation のときは `ambiguous_requires_human`（fail-closed）。delivery-rollup parent の child 起票では sibling child 同士の Allowed Paths overlap も検査する（fixture-only、hard gate は #946 の責務）。
 
-本 helper は preflight advisory / evidence producer であり、`create_issue_txn.py` の mutation hard gate ではない（hard gate 配線と #387 scope_collision_check との正規化共有は follow-up）。
+本 helper は preflight advisory / evidence producer であり、`create_issue_txn.py` の mutation hard gate ではない（#387 scope_collision_check との正規化共有は follow-up）。
 
-> Claude Code の plan permission mode（`--permission-mode plan` / `Shift+Tab` / `/plan` で人間が選ぶセッション制御）は人間がセッション単位で選択する UI 制御であり、本ルールの対象外である。plan permission mode の有無は上記着手条件判定に影響しない。
+> Claude Code の plan permission mode（`--permission-mode plan` / `Shift+Tab` / `/plan`）は人間が選ぶセッション単位の UI 制御であり、本ルールの対象外・着手条件判定に影響しない。
 
 ## Human Decision が必要な条件
 
