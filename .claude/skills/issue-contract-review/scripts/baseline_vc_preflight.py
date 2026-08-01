@@ -2903,6 +2903,34 @@ def classify_result(
 
             return "blocked", "regression_gate", "blocked", "Regression gate command failed", "regression_gate"
 
+    # Issue #1892: pytest exit_code==4 (missing test file/node-id) and
+    # exit_code==5 (no tests collected) are checked BEFORE the generic
+    # timeout substring check below, so a fast, correctly-completed
+    # baseline fail is never misclassified as a timeout merely because
+    # the test node-id/path happens to contain the word "timeout" (e.g.
+    # test_agy_real_subprocess_timeout_classified). A real
+    # subprocess.TimeoutExpired always reports exit_code == -1 (see
+    # run_command()), so it can never match exit_code == 4/5 here and
+    # always falls through to the timeout check unaffected.
+    # pytest baseline fail patterns (AC2, AC3)
+    if _is_pytest_invocation(command):
+        combined_lower = f"{stdout}\n{stderr}".lower()
+
+        # pytest exit 4 + file not found → expected_baseline_fail (path/env missing)
+        if exit_code == 4 and re.search(r"error:\s+file or directory not found:", combined_lower):
+            return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
+
+        # B5: pytest exit 5 → vc_no_tests_collected / blocked
+        # exit 5 = no tests collected (-k mismatch, wrong path, etc.) → not a valid baseline VC
+        if exit_code == 5:
+            return (
+                "blocked",
+                "vc_no_tests_collected",
+                "blocked",
+                "pytest collected 0 tests (exit 5); check -k filter or test path",
+                "baseline_fail_expected",
+            )
+
     # timeout check
     if "timeout" in stderr.lower():
         return "blocked", "timeout", "blocked", "Command exceeded timeout", "baseline_fail_expected"
@@ -3041,25 +3069,6 @@ def classify_result(
 
     if "No such file or directory" in stderr and exit_code == -1:
         return "blocked", "env_missing_dep", "blocked", "Command not found", "baseline_fail_expected"
-
-    # pytest baseline fail patterns (AC2, AC3)
-    if _is_pytest_invocation(command):
-        combined_lower = f"{stdout}\n{stderr}".lower()
-
-        # pytest exit 4 + file not found → expected_baseline_fail (path/env missing)
-        if exit_code == 4 and re.search(r"error:\s+file or directory not found:", combined_lower):
-            return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
-
-        # B5: pytest exit 5 → vc_no_tests_collected / blocked
-        # exit 5 = no tests collected (-k mismatch, wrong path, etc.) → not a valid baseline VC
-        if exit_code == 5:
-            return (
-                "blocked",
-                "vc_no_tests_collected",
-                "blocked",
-                "pytest collected 0 tests (exit 5); check -k filter or test path",
-                "baseline_fail_expected",
-            )
 
     # expected baseline fail patterns
     # rg with no match returns 1
