@@ -84,6 +84,35 @@ def test_registry_sibling_profile_preserves_preflight_run():
     }
 
 
+def test_registry_contract_update_phase_is_explicit_and_preflight_remains_read_only():
+    """#1877 AC3: the mutation consumer is a distinct registry command."""
+    entry = reg.REGISTRY["contract_update.run.with_anchor"]
+    assert reg.REGISTRY["preflight.run.with_anchor"]["mutation"] is False
+    assert "--consume-contract-patch-plan" not in reg.REGISTRY["preflight.run.with_anchor"]["argv"]
+    assert entry["mutation"] is True
+    assert entry["main_control_plane_only"] is True
+    assert entry["execution_class"] == "exact_skill_runtime_contract_update_anchor"
+    assert entry["required_cwd"] == "canonical_main_root"
+    assert entry["required_branch"] == "default_branch"
+    assert entry["network_effect"] == "github_read_only"
+    assert entry["allowed_write_roots"] == [
+        ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+        "artifacts/{active_issue}/issue-metadata/",
+    ]
+    assert entry["argv"][-1] == "--consume-contract-patch-plan"
+
+    url = "https://github.com/squne121/loop-protocol/issues/1877#issuecomment-5143816923"
+    assert reg.render_command(
+        "contract_update.run.with_anchor",
+        {"issue_number": 1877, "repo": "squne121/loop-protocol", "anchor_comment_url": url},
+    ) == [
+        "uv", "run", "python3",
+        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+        "--issue-number", "1877", "--repo", "squne121/loop-protocol",
+        "--anchor-comment-url", url, "--consume-contract-patch-plan",
+    ]
+
+
 def test_registry_sibling_profile_renders_argv():
     """render_command() produces the expected 10-token argv for
     preflight.run.with_anchor."""

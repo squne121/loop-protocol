@@ -193,6 +193,39 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
         },
     },
+    # #1877: the mutation phase is deliberately a sibling of the read-only
+    # anchor preflight.  Do not add this flag to preflight.run.with_anchor.
+    "contract_update.run.with_anchor": {
+        "id": "contract_update.run.with_anchor",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--anchor-comment-url", "{anchor_comment_url}",
+            "--consume-contract-patch-plan",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_skill_runtime_contract_update_anchor",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            "artifacts/{active_issue}/issue-metadata/",
+        ],
+        "network_effect": "github_read_only",
+        "stdin_contract": "none",
+        "stdout_contract": "refinement_preflight_result/v1",
+        "timeout_seconds": 120,
+        "mutation": True,
+        "main_control_plane_only": True,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
+        },
+    },
     # Issue #1547: scope_rollup.run exact command -- bound directly to
     # scripts/agent-guards/run_scope_rollup_preflight.py (NOT the
     # issue-refinement-loop skill_runtime_exec.py executor, which is

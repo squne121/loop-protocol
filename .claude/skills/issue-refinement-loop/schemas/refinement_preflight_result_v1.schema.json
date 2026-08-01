@@ -271,6 +271,43 @@
         "type": "string"
       }
     },
+    "contract_update": {
+      "type": "object",
+      "description": "Optional bounded handoff emitted only by contract_update.run.with_anchor. It contains no Issue body or raw anchor text.",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "writes",
+        "iterations",
+        "final_readback",
+        "fresh_preflight",
+        "fresh_review",
+        "fresh_readiness"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["applied", "no_change", "rebased", "failed"]
+        },
+        "writes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "iterations": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "final_readback": {
+          "type": "string",
+          "enum": ["verified", "failed"]
+        },
+        "fresh_preflight": {"type": "string"},
+        "fresh_review": {"type": "string"},
+        "fresh_readiness": {"type": "string"}
+      }
+    },
     "artifacts": {
       "type": "object",
       "description": "Paths to artifact files written by this wrapper.",
