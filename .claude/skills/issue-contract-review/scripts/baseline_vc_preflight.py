@@ -2931,8 +2931,14 @@ def classify_result(
                 "baseline_fail_expected",
             )
 
-    # timeout check
-    if "timeout" in stderr.lower():
+    # timeout check (Issue #1892: exact canonical runner sentinel only.
+    # run_command() sets stderr to the literal string "timeout" and
+    # exit_code to -1 exclusively on subprocess.TimeoutExpired; matching on
+    # a stderr substring ("timeout" in stderr.lower()) previously caused
+    # any non-timeout command whose stderr merely contained the word
+    # "timeout" (e.g. a pytest node-id or error message referencing a
+    # timeout test) to be misclassified as a real timeout.
+    if exit_code == -1 and stderr.strip() == "timeout":
         return "blocked", "timeout", "blocked", "Command exceeded timeout", "baseline_fail_expected"
 
     # exit_code = 0 で回帰ゲート以外

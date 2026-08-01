@@ -293,7 +293,7 @@ def test_ac4_current_head_mode_timeout_stays_blocked():
     classification, category, decision, fix_hint, scope_class = classify_result(
         exit_code=-1,
         stdout="",
-        stderr="Command exceeded timeout after 90s",
+        stderr="timeout",
         command="rg -q hello tracked.txt",
         evidence_mode="current-head",
         static_policy_passed=True,
