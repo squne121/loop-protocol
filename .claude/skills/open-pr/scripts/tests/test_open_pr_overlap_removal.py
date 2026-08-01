@@ -19,6 +19,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import open_pr
+import validate_pr_body
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "pr_body"
@@ -124,3 +125,40 @@ def test_phase_implementation_label_does_not_trigger_overlap_gate(monkeypatch: p
         assert label_fetch_called["value"] is False
     finally:
         Path(body_path).unlink(missing_ok=True)
+
+
+HISTORICAL_OVERLAP_BYPASS_VOCABULARY = (
+    "\n\n## Overlap Preflight 自動判定結果の補足説明\n\n"
+    "overlap preflight が兄弟 Issue との `C3 parent_child_collision` を検出し "
+    "`route: human_review_required` を返したが、本 PR は overlap gate を経由せず "
+    "`gh pr create` を直接実行して起票する（バイパス判断）。\n"
+)
+
+
+def test_historical_overlap_c2a_c3_bypass_vocabulary_does_not_trigger_publication_block():
+    """Issue #1679 In Scope 9: a PR body that still contains historical
+    overlap/C2a/C3/bypass vocabulary (as used by the now-removed
+    OVERLAP_GATE_BYPASS_V1 hard gate, Issue #1776) no longer produces any
+    overlap-specific publication block. `validate_pr_body()` no longer has
+    an `_validate_overlap_gate_bypass` check at all, so this vocabulary is
+    inert prose with no gate consequence.
+    """
+    base_body = load_fixture("valid_not_schema_change.md")
+    body_with_legacy_vocabulary = base_body + HISTORICAL_OVERLAP_BYPASS_VOCABULARY
+
+    result = validate_pr_body.validate_pr_body(
+        body_with_legacy_vocabulary,
+        changed_paths=["src/example.ts"],
+        linked_issue=330,
+    )
+
+    assert result.status == "pass", (
+        f"expected legacy overlap/C2a/C3/bypass vocabulary to be inert, got errors: {result.errors}"
+    )
+    overlap_rule_ids = {
+        error.rule_id
+        for error in result.errors
+        if "OVERLAP" in error.rule_id.upper() or error.rule_id == "LP059"
+    }
+    assert not overlap_rule_ids, f"unexpected overlap-specific rule triggered: {overlap_rule_ids}"
+    assert not hasattr(validate_pr_body, "_validate_overlap_gate_bypass")

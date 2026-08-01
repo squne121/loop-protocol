@@ -44,10 +44,20 @@ target Issue、canonical repository、worktree、実 diff、実 test、target PR
 current-head CI、独立 review、human stop だけを実行判断入力とする
 target-only executor である。peer OPEN Issue の body・comments・native
 dependency は読み取らず、`gh issue list` / GraphQL による OPEN Issue 全件収集も
-行わない。実際に停止する条件は、Step 4（Verification Commands）の失敗、
-または target PR の GitHub mergeability（`mergeable == CONFLICTING` または
-`mergeStateStatus == DIRTY`。`UNKNOWN` / `BLOCKED` / `BEHIND` / `UNSTABLE` は
-競合として扱わない）のみである。
+行わない。
+
+overlap／collision 由来で扱える停止理由は、実際の Git conflict
+（target PR の GitHub mergeability が `mergeable == CONFLICTING` または
+`mergeStateStatus == DIRTY` の場合。`UNKNOWN` / `BLOCKED` / `BEHIND` /
+`UNSTABLE` は競合として扱わない）のみに限定される。これは overlap
+preflight 撤去に伴う限定であり、他の既存 hard gate を無効化するものでは
+ない。Allowed Paths、canonical repository resolution／mutation target
+binding、CI・required checks・branch protection、独立 review
+（`pr-review-judge`）、human stop（Issue/PR コメント上の明示的な停止指示）、
+Step 4（Verification Commands）の失敗、root checkout／detached HEAD／dirty
+worktree、protected paths、secret、destructive Git operation、publish
+approval、test・lint・typecheck・build は、overlap 撤去とは独立した
+既存 hard gate として維持され、いずれも実装停止理由になり得る。
 
 ### 2. Worktree / Branch 作成手順
 

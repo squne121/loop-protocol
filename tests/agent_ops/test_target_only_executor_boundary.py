@@ -11,6 +11,16 @@ AC1・AC2・AC9 は Runtime Verification Applicability の `decision: immediate`
 起動される argv を記録・検証する（静的 grep ではなく実際の起動有無を確認）。
 fake `gh` executable を PATH に配置できない実行環境では SKIP（exit 77）と
 する。
+
+証明範囲の精確化（#1679 Major 1）: `open-pr`（`open_pr.py`）は独立した
+Python エントリポイントを持つため、本ファイルの AC1/AC2 テストは実際の
+subprocess 起動を fake `gh` で観測する runtime behavior test として成立する。
+一方 `implement-issue` は SKILL.md に記述された手順であり、独立した
+決定論的 command execution boundary（薄い executor）を持たないため、
+`implement-issue` 側の AC1/AC2 は checker（`check_implementation_overlap.py`）
+の削除確認と `tests/agent_ops/test_implement_issue_overlap_policy.py` の
+repository-wide static token inventory（forbidden overlap token の不在確認）
+によって証明する。両者を合わせて AC1/AC2 の証明範囲とする。
 """
 
 from __future__ import annotations
