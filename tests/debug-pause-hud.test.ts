@@ -4,11 +4,30 @@
  * tests/debug-pause-hud.test.ts
  *
  * Tests for HUD pause/resume affordance (AC1, AC4, AC6).
+ *
+ * Scope Delta (Issue #1375): this file predates #1375 and encoded the OLD
+ * (buggy) pause button contract -- a visible label fixed to "Pause" but an
+ * `aria-label` that swapped to "Resume simulation" while paused, i.e. the
+ * visible label and the accessible name disagreed. Issue #1375's AC3
+ * explicitly requires fixing this mismatch ("Pause は可視ラベルと
+ * accessible name が一致し aria-pressed が状態を表す"), which this exact
+ * control implements (`src/ui/HudController.ts` / `src/ui/combatHud.ts`).
+ * Per the "test outside Allowed Paths は拡張対応" policy (extend, don't
+ * silently break/delete a pre-existing test that encodes now-superseded
+ * behavior), this file is added to Issue #1375's Allowed Paths via Scope
+ * Delta and updated to assert the corrected contract instead. The
+ * `pause-status` live region assertions are removed: AC6 makes Assist the
+ * sole `role="status"` live region in the combat HUD (Hull/Kills/Elapsed/
+ * Weapon/Pause update in place, not inside a live region) -- pause state is
+ * now conveyed solely via `aria-pressed` on the Pause button itself.
  */
 import { describe, expect, it, vi } from 'vitest'
 import { createHudController } from '../src/ui/HudController'
 import { createInitialGameState, defaultSimulationConfig } from '../src/state'
 import { startSortie } from '../src/systems/SortieSystem'
+
+/** Matches `defaultSimulationConfig.fixedDeltaMs` (production fixed timestep). */
+const PROD_FIXED_DELTA_MS = defaultSimulationConfig.fixedDeltaMs
 
 function makeContainer(): HTMLElement {
   const div = document.createElement('div')
@@ -18,13 +37,8 @@ function makeContainer(): HTMLElement {
 
 function makeActions(overrides: Partial<Parameters<typeof createHudController>[1]> = {}) {
   return {
-    onStartSortie: vi.fn(),
     onClaimReward: vi.fn(),
     onNextSortie: vi.fn(),
-    onQuickSave: vi.fn(),
-    onQuickLoad: vi.fn(),
-    onReset: vi.fn(),
-    canQuickLoad: vi.fn(() => false),
     onTogglePause: vi.fn(),
     ...overrides,
   }
@@ -37,27 +51,29 @@ describe('HUD pause/resume affordance — AC1', () => {
     const hud = createHudController(container, actions)
     const state = createInitialGameState()
 
-    hud.render(state, false)
+    hud.render(state, false, PROD_FIXED_DELTA_MS)
 
     const btn = container.querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')
     expect(btn).not.toBeNull()
     expect(btn!.textContent).toBe('Pause')
   })
 
-  it('GIVEN HUD rendered WHEN paused THEN aria-pressed is "true" and aria-label is "Resume simulation"', () => {
+  it('GIVEN HUD rendered WHEN paused THEN aria-pressed is "true" and the visible label / accessible name both stay "Pause" (AC3: no mismatch)', () => {
     const container = makeContainer()
     const actions = makeActions()
     const hud = createHudController(container, actions)
     const state = createInitialGameState()
 
-    hud.render(state, true)
+    hud.render(state, true, PROD_FIXED_DELTA_MS)
 
     const btn = container.querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')
     expect(btn).not.toBeNull()
-    // Button textContent is fixed to 'Pause'; state is conveyed via aria-pressed (AC16)
+    // AC3: visible label is fixed to 'Pause' regardless of paused state.
     expect(btn!.textContent).toBe('Pause')
     expect(btn!.getAttribute('aria-pressed')).toBe('true')
-    expect(btn!.getAttribute('aria-label')).toBe('Resume simulation')
+    // AC3: no aria-label override -- the accessible name IS the visible
+    // label ('Pause'), so it never disagrees with what's on screen.
+    expect(btn!.hasAttribute('aria-label')).toBe(false)
   })
 
   it('GIVEN HUD rendered in running phase WHEN pause button clicked THEN onTogglePause is called', () => {
@@ -68,7 +84,7 @@ describe('HUD pause/resume affordance — AC1', () => {
     const state = createInitialGameState()
     // Pause button is only enabled during running phase (BLOCKER 1 fix)
     startSortie(state, defaultSimulationConfig.fixedDeltaMs)
-    hud.render(state, false)
+    hud.render(state, false, PROD_FIXED_DELTA_MS)
 
     container.querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')!.click()
 
@@ -83,13 +99,13 @@ describe('HUD pause feedback — AC6 (no debug metadata in normal UI)', () => {
     const hud = createHudController(container, actions)
     const state = createInitialGameState()
 
-    hud.render(state, true)
+    hud.render(state, true, PROD_FIXED_DELTA_MS)
 
     const btn = container.querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')!
-    // AC6: button textContent is fixed 'Pause'; pause state conveyed via aria-pressed (AC16)
+    // AC3/AC6: button textContent (and accessible name) is fixed 'Pause';
+    // pause state conveyed via aria-pressed only.
     expect(btn.textContent).toBe('Pause')
-    // aria-label describes the current action for screen readers
-    expect(btn.getAttribute('aria-label')).toBe('Resume simulation')
+    expect(btn.hasAttribute('aria-label')).toBe(false)
     // No exact HP/HULL numbers in the pause button
     expect(btn.textContent).not.toMatch(/\d+\/\d+/)
     // No LoopPhase string exposed in button
@@ -98,32 +114,35 @@ describe('HUD pause feedback — AC6 (no debug metadata in normal UI)', () => {
 })
 
 describe('HUD render continues during pause — AC4', () => {
-  it('GIVEN paused state WHEN render called THEN HUD fields still update', () => {
+  it('GIVEN paused running state WHEN render called THEN the combat HUD assist status field still updates', () => {
     const container = makeContainer()
     const actions = makeActions()
     const hud = createHudController(container, actions)
     const state = createInitialGameState()
-    state.telemetry.status = 'Paused'
+    startSortie(state, defaultSimulationConfig.fixedDeltaMs)
 
-    hud.render(state, true)
+    hud.render(state, true, PROD_FIXED_DELTA_MS)
 
-    const statusEl = container.querySelector<HTMLElement>('[data-field="status"]')
-    expect(statusEl?.textContent).toBe('Paused')
+    // AC1/AC4: the running-only combat HUD keeps rendering while paused
+    // (rendering and HUD continue regardless of pause state). The default
+    // ally has no assigned target yet, so assist status reports that.
+    const assistStatusEl = container.querySelector<HTMLElement>('[data-field="combat-hud-assist-status"]')
+    expect(assistStatusEl?.textContent).toBe('No target to assist.')
   })
 })
 
 // ---------------------------------------------------------------------------
-// AC16: aria-pressed and pause live region
+// AC16: aria-pressed represents pause state
 // ---------------------------------------------------------------------------
 
-describe('HUD aria-pressed and pause live region — AC16', () => {
+describe('HUD aria-pressed — AC16', () => {
   it('GIVEN not paused WHEN rendered THEN aria-pressed is "false"', () => {
     const container = makeContainer()
     const actions = makeActions()
     const hud = createHudController(container, actions)
     const state = createInitialGameState()
 
-    hud.render(state, false)
+    hud.render(state, false, PROD_FIXED_DELTA_MS)
 
     const btn = container.querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')!
     expect(btn.getAttribute('aria-pressed')).toBe('false')
@@ -135,35 +154,9 @@ describe('HUD aria-pressed and pause live region — AC16', () => {
     const hud = createHudController(container, actions)
     const state = createInitialGameState()
 
-    hud.render(state, true)
+    hud.render(state, true, PROD_FIXED_DELTA_MS)
 
     const btn = container.querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')!
     expect(btn.getAttribute('aria-pressed')).toBe('true')
-  })
-
-  it('GIVEN paused WHEN rendered THEN pause-status live region shows "Paused"', () => {
-    const container = makeContainer()
-    const actions = makeActions()
-    const hud = createHudController(container, actions)
-    const state = createInitialGameState()
-
-    hud.render(state, true)
-
-    const pauseStatus = container.querySelector<HTMLElement>('[data-field="pause-status"]')
-    expect(pauseStatus).not.toBeNull()
-    expect(pauseStatus!.textContent).toBe('Paused')
-    expect(pauseStatus!.getAttribute('role')).toBe('status')
-  })
-
-  it('GIVEN not paused WHEN rendered THEN pause-status live region is empty', () => {
-    const container = makeContainer()
-    const actions = makeActions()
-    const hud = createHudController(container, actions)
-    const state = createInitialGameState()
-
-    hud.render(state, false)
-
-    const pauseStatus = container.querySelector<HTMLElement>('[data-field="pause-status"]')
-    expect(pauseStatus?.textContent).toBe('')
   })
 })

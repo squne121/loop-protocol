@@ -191,9 +191,51 @@ button:focus-visible {
   pointer-events: none;
 }
 
-.battle-hud-layer > .panel {
+.battle-hud-layer > .panel,
+.battle-hud-layer .legacy-result-surface > .panel {
   inline-size: min(320px, calc(100% - 16px));
   max-inline-size: 100%;
+}
+
+/* Combat HUD (Issue #1375): the single compact running-only player-facing
+ * surface (Hull / Kills / Elapsed / Weapon / Assist / Pause). Kept narrow
+ * and self-contained so it never covers the Canvas battle-stage and both
+ * Assist allies and Pause stay visible together at 1280x720 (AC7). */
+.combat-hud {
+  display: grid;
+  gap: 10px;
+  inline-size: min(240px, calc(100% - 16px));
+  max-inline-size: 100%;
+}
+
+.combat-hud[hidden] {
+  display: none;
+}
+
+.combat-hud .stat-grid {
+  gap: 8px;
+}
+
+.combat-hud .stat-grid dd {
+  font-size: 1.1rem;
+}
+
+/* Temporary result/debrief compatibility surface (Issue #1375, removed by
+ * #1376). Behaves like the pre-#1375 single-column HUD stack it replaces:
+ * a grid of `.panel` rows, right-aligned, matching `.battle-hud-layer`'s
+ * own grid so both HUD roots occupy the same layout track. */
+.legacy-result-surface {
+  display: grid;
+  gap: 12px;
+  justify-items: end;
+}
+
+/* Same UA-stylesheet-override concern as .phase-screen-panel[hidden] above:
+ * the `display: grid` rule directly above has higher specificity/origin
+ * than the UA stylesheet's `[hidden] { display: none }` and must be
+ * restated here explicitly. */
+.legacy-result-surface[hidden] {
+  display: none;
 }
 
 .command-rail {

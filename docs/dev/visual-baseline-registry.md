@@ -96,7 +96,7 @@ registry は推測ではなく現行テスト実体に基づいて分類する�
 | id | kind | maturity | artifact/test | spec | fixed contract | mutable elements | tolerance | update condition | invalidated_by |
 |---|---|---|---|---|---|---|---|---|---|
 | timeout-overlay | screenshot-baseline | frozen | `tests/e2e/__screenshots__/m2-combat-mvp.spec.ts/m2-timeout-overlay-baseline.png`（`m2-combat-mvp.spec.ts` の timeout overlay baseline test） | #732 / #681 / #747 | timeout は defeat ではない中立終了表示であること・背景 tint・可読性・整数段階表示 | 色味 / 最終配置は UI 再設計で変更可 | `maxDiffPixels: 1`（理由: CI Chromium + 固定 viewport 1280x720 + 決定論的 E2E モード前提でのみ妥当） | 意図した視覚仕様変更を人間がレビューし承認した場合のみ（§4 checklist 経由） | #727（HUD/layout 再設計） |
-| running-hud | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/m2-combat-mvp.spec.ts/m2-running-hud-baseline.png`（`m2-combat-mvp.spec.ts` の running HUD baseline test、`[data-field="sortie-status"]` 単一 field、118x66px） | #681 / #726 / #727 / #1370 / #1375 / #1377 / #1380 | running HUD が描画されること・HULL/HP の小数露出がないこと・桁溢れがないこと | 色味 / 詳細配置 / right rail 依存は再設計まで可変 | `maxDiffPixelRatio: 0.08`（PR #1721 review fix で実コードに合わせて修正。理由: legacy-current・単一 field の小capture。#727 再設計時に再評価する） | #727 再開時または #1370 / #1375 / #1377 / #1380 系の overlay rollout 進行時に破棄 / 再分類可 | #727 / #1370 / #1375 / #1377 / #1380（HUD/layout 再設計と overlay rollout） |
+| running-hud | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/m2-combat-mvp.spec.ts/m2-running-hud-baseline.png`（`m2-combat-mvp.spec.ts` の running HUD baseline test。Issue #1375 で capture root を `[data-field="sortie-status"]` 単一 field から `[data-combat-hud]` パネル全体に変更し、Hull/Kills/Elapsed/Weapon/Assist status の各 field は mask 済み） | #681 / #726 / #727 / #1370 / #1375 / #1377 / #1380 | running HUD が描画されること・HULL/HP の小数露出がないこと・桁溢れがないこと・combat HUD が Hull/Kills/Elapsed/Weapon/Assist/Pause のみで構成されること（#1375 AC2） | 色味 / 詳細配置 / right rail 依存は再設計まで可変 | `maxDiffPixels: 150`（Issue #1375 で `maxDiffPixelRatio: 0.08` から変更。理由: capture root を単一 field から複数 field を含むパネル全体へ拡張したため、絶対ピクセル数の許容差に統一した。masked field 以外のパネル chrome/ラベルのみを比較） | #727 再開時または #1370 / #1375 / #1377 / #1380 系の overlay rollout 進行時に破棄 / 再分類可 | #727 / #1370 / #1375 / #1377 / #1380（HUD/layout 再設計と overlay rollout） |
 | running-hud-overlay-legacy-current | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-running-hud-overlay.png`（`tests/e2e/visual-overlay.spec.ts` の `[data-battle-ui-root]` DOM overlay baseline test） | #1386 / #1380 / #1370 / #1374 | `[data-battle-ui-root]` DOM overlay 全体（HUD 各 field を含む）が描画されること。`running-hud`（`m2-combat-mvp.spec.ts` の単一 field baseline）とは別の独立した baseline であり、両者は衝突しない | 色味 / 詳細配置 / right rail・command-rail 依存は再設計まで可変。将来の overlay 再設計で `frozen` 化するまでは legacy-current のまま | `maxDiffPixels: 100`（絶対ピクセル数。理由: capture root が canvas mask を含み全体の過半を占めるため `maxDiffPixelRatio` は不採用。非mask領域のfont-rasterizationノイズに対しこのworktree環境で複数回実測し PASS した最小幅に margin を加えた値。`tests/e2e/visual.freeze.css` で capture root 配下の font-family を generic family（`sans-serif`）に固定し、host font fallback chain 依存を除去済み） | §4 の `maturity transition` を満たした時点で `legacy-current -> frozen`（#1375/#1376/#1377 マージ後） | #1375 / #1376 / #1377 / #1380（overlay UI 実装マージで破棄・再生成対象） |
 | defeat-overlay | pixel-contract | predicate-only | `getImageData` smoke（`m2-combat-mvp.spec.ts` の defeat overlay 赤支配ピクセル検証 / AC8） | #681 / #732 | defeat overlay が赤系・終端状態として識別可能であること | exact pixels は未固定。最終 layout / 色味は未確定 | N/A（screenshot baseline ではない） | predicate（赤支配）が壊れた場合のみテスト側を調整 | #727 |
 | hp-label | predicate-only | predicate-only | HP label bounds smoke（`m2-combat-mvp.spec.ts` の HP label bounding box 検証 / AC5） | #726 / #727 | HP label が viewport 外 / NaN 表示にならない・bounds 内・可読であること | 最終 UI 表現 / 配置は未固定 | N/A（screenshot baseline ではない） | predicate（bounds / 可読）が壊れた場合のみテスト側を調整 | #727 |
@@ -247,6 +247,36 @@ capture 内で表示される要素構成が変化し、`running-hud-overlay-leg
   runner, Chromium, Playwright config 既定 viewport, `tests/e2e/visual.freeze.css` の generic
   `sans-serif` 固定込み, run id `30265197189`）で生成された画像そのものである。以降の CI 再実行
   （同一コミット・同一 runner image 前提）でこの baseline との一致が期待される。
+
+### running-hud / running-hud-overlay-legacy-current の #1375 baseline 更新（明示）
+
+Issue #1375（running 用 combat HUD を battle-stage 内 overlay に再配置する）は AC1/AC2 の
+要求どおり、`data-combat-hud`（running のみ表示）と `data-legacy-result-surface`（running
+以外で表示）の 2 ルート構成へ `HudController` を再設計した。この実装により running phase の
+HUD 構成要素（Hull/Kills/Elapsed/Weapon/Assist/Pause のみの compact panel）が変化し、
+以下 2 件の既存 baseline との間に許容差を超える差分が生じた。
+
+- **running-hud**（`m2-running-hud-baseline.png`）: capture root を `[data-field="sortie-status"]`
+  単一 field から `[data-combat-hud]` パネル全体へ変更（旧 field は running 中に非表示となる
+  legacy surface 側へ移動したため）。volatile な数値/status field は mask 済み。
+- **running-hud-overlay-legacy-current**（`vrt-running-hud-overlay.png`）: `[data-battle-ui-root]`
+  capture 内の running-time HUD 構成要素が変化（旧: Hull/Shots/Cooldown/Sortie/Wingmates/Pilot
+  updates/Pause の複数 panel、新: compact combat HUD 単一 panel）。
+
+- **判断根拠**: いずれの差分も意図しない退行ではなく、AC1/AC2 が明示的に要求する仕様変更
+  （running 中の HUD を単一の compact player-facing surface に絞り込む）の意図した副作用で
+  ある（§4 checklist の「意図した仕様変更か退行固定化かの判断」に基づく確認）。
+- **evidence**: PR（`worktree-issue-1375-combat-hud-overlay`）。ローカル worktree 環境
+  （Linux, Playwright chromium, `tests/e2e/visual.freeze.css` の generic `sans-serif` 固定込み）
+  で `playwright test --update-snapshots` により baseline を再生成した。#1374 の前例
+  （本ファイル上記セクション）で観測された CI runner とのフォント fallback 差に起因する
+  追加 diff が本 PR でも再発する場合は、CI 実行結果の `test-results` artifact から
+  `*-actual.png` を取得し、それを最終 baseline として採用する同じ運用に従う。
+- **maturity**: 変更なし（`running-hud` は `legacy-current`、`running-hud-overlay-legacy-current`
+  も `legacy-current` のまま）。`frozen` 化条件（#1376/#1377 マージ後）は本更新の対象外。
+- **tolerance**: `running-hud` は `maxDiffPixelRatio: 0.08` から `maxDiffPixels: 150` へ変更
+  （capture root が単一 field から複数 field を含むパネルへ拡張されたため）。
+  `running-hud-overlay-legacy-current` の `maxDiffPixels: 100` は変更なし。
 
 ## 4. baseline update policy（更新ポリシー）
 

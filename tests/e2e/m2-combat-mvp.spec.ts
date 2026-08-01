@@ -249,6 +249,91 @@ test('GIVEN canvas pointer held WHEN ticks elapse THEN projectile appears', asyn
   await page.mouse.up()
 })
 
+// ---------------------------------------------------------------------------
+// AC5 (Issue #1375): non-interactive overlay pointer-through, and
+// Assist/Pause clicks do not leak into Canvas combat actions.
+// runtime-verification: true -- Playwright chromium headless
+// ---------------------------------------------------------------------------
+
+test('GIVEN a non-interactive overlay coordinate WHEN a real pointerdown is held THEN it passes through to the Canvas and projectiles/shots increase (AC5)', async ({
+  page,
+}) => {
+  // GIVEN the DOM overlay (`[data-battle-ui-root]`) sits directly over the
+  // Canvas with `pointer-events: none` everywhere except
+  // `[data-battle-interactive="true"]` descendants (src/style.css).
+  // WHEN a real 'pointerdown' is dispatched at a non-interactive overlay
+  // coordinate (not over Assist/Pause) and held
+  // THEN the browser's own hit-testing passes it through to the Canvas
+  // beneath, exactly like a direct Canvas pointerdown -- firing a shot.
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 3000, intervals: [50] },
+    )
+    .toBe('running')
+
+  const canvas = page.locator('canvas.battle-stage__canvas')
+  const box = await canvas.boundingBox()
+  expect(box).not.toBeNull()
+
+  // A point clearly away from the combat HUD panel (top-right stack), so
+  // this coordinate is guaranteed non-interactive overlay territory.
+  const targetX = box!.x + box!.width * 0.2
+  const targetY = box!.y + box!.height * 0.8
+
+  const before = await getGameState(page)
+
+  await page.mouse.move(targetX, targetY)
+  // Real DOM pointerdown (Playwright's mouse.down() dispatches a genuine
+  // 'pointerdown' + 'mousedown' pair, not a synthetic click) held to fire.
+  await page.mouse.down({ button: 'left' })
+
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.projectiles.length
+      },
+      { timeout: 3000, intervals: [50] },
+    )
+    .toBeGreaterThan(before.projectiles.length)
+
+  await page.mouse.up()
+})
+
+test('GIVEN combat HUD Assist / Pause buttons WHEN clicked THEN no Canvas pointerdown combat action occurs (AC5)', async ({
+  page,
+}) => {
+  // GIVEN Assist allies / Pause are `data-battle-interactive="true"` and
+  // opt back into `pointer-events: auto` over the otherwise pass-through
+  // overlay (src/style.css)
+  // WHEN they are clicked
+  // THEN no projectile is fired -- clicking a HUD control must never leak
+  // into a Canvas firing action, even though both surfaces are stacked.
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 3000, intervals: [50] },
+    )
+    .toBe('running')
+
+  const before = await getGameState(page)
+
+  await page.locator('[data-action="assist-player"]').click()
+  await page.locator('[data-action="toggle-pause"]').click()
+  // Resume so the rest of the suite (if run after this) is not left paused.
+  await page.locator('[data-action="toggle-pause"]').click()
+
+  const after = await getGameState(page)
+  expect(after.projectiles.length).toBe(before.projectiles.length)
+})
+
 test('GIVEN enemy exists WHEN projectile hits THEN enemy hp decreases or enemy defeated', async ({
   page,
 }) => {
@@ -591,12 +676,14 @@ test('GIVEN 1HP player fixture WHEN defeat THEN HUD sortie-status shows Defeat',
   })
 })
 
-test('GIVEN sortie running WHEN HUD rendered THEN sortie-status shows In Progress', async ({
+test('GIVEN sortie running WHEN HUD rendered THEN the combat HUD (data-combat-hud) is the visible player-facing surface, not the legacy Mission-status panel (AC1, Issue #1375)', async ({
   page,
 }) => {
   // GIVEN the sortie is in running state
   // WHEN the HUD is rendered
-  // THEN data-field="sortie-status" must be "In Progress" (AC4, AC10)
+  // THEN data-combat-hud is visible and populated (AC1, AC2, AC4), and the
+  // legacy result/debrief surface (which used to show "In Progress" via
+  // data-field="sortie-status") is hidden/inert during running.
   await expect
     .poll(
       async () => {
@@ -607,7 +694,9 @@ test('GIVEN sortie running WHEN HUD rendered THEN sortie-status shows In Progres
     )
     .toBe('running')
 
-  await expect(page.locator('[data-field="sortie-status"]')).toHaveText('In Progress', {
+  await expect(page.locator('[data-combat-hud]')).toBeVisible({ timeout: 3000 })
+  await expect(page.locator('[data-legacy-result-surface]')).toBeHidden({ timeout: 3000 })
+  await expect(page.locator('[data-field="combat-hud-weapon"]')).toHaveText(/Ready|Recharging/, {
     timeout: 3000,
   })
 })
@@ -701,12 +790,16 @@ test('GIVEN short sortie fixture WHEN timeout overlay baseline then Canvas scree
   )
 })
 
-test('GIVEN sortie running WHEN running HUD baseline then HUD screenshot matches', async ({
+test('GIVEN sortie running WHEN running HUD baseline then combat HUD panel screenshot matches (Issue #1375: registry running-hud row target moved from sortie-status to data-combat-hud)', async ({
   page,
 }) => {
   // GIVEN the sortie is in running state
   // WHEN the HUD is rendered
-  // THEN the status locator screenshot should match the running HUD baseline
+  // THEN the combat HUD panel (data-combat-hud, running-only surface since
+  // Issue #1375) screenshot should match the running HUD baseline. The
+  // volatile numeric/status fields are masked -- this baseline captures
+  // panel layout/labels/chrome, not live combat values (same masking
+  // approach as tests/e2e/phase-screens.spec.ts's running-minimal-hud).
   await expect
     .poll(
       async () => {
@@ -717,31 +810,20 @@ test('GIVEN sortie running WHEN running HUD baseline then HUD screenshot matches
     )
     .toBe('running')
 
-  await expect(page.locator('[data-field="sortie-status"]')).toHaveText('In Progress', {
-    timeout: 3000,
-  })
+  await expect(page.locator('[data-combat-hud]')).toBeVisible({ timeout: 3000 })
 
-  await page.addStyleTag({
-    content: `[data-field="sortie-status"] {
-      display: block;
-      width: 118px;
-      height: 66px;
-      line-height: 66px;
-      text-align: center;
-      white-space: nowrap;
-      box-sizing: border-box;
-      overflow: hidden;
-      font-family: monospace;
-      font-size: 18px;
-      font-weight: 600;
-    }`,
-  })
-
-  await expect(page.locator('[data-field="sortie-status"]')).toHaveScreenshot(
+  await expect(page.locator('[data-combat-hud]')).toHaveScreenshot(
     'm2-running-hud-baseline.png',
     {
       animations: 'disabled',
-      maxDiffPixelRatio: 0.08,
+      maxDiffPixels: 150,
+      mask: [
+        page.locator('[data-field="combat-hud-hull"]'),
+        page.locator('[data-field="combat-hud-kills"]'),
+        page.locator('[data-field="combat-hud-elapsed"]'),
+        page.locator('[data-field="combat-hud-weapon"]'),
+        page.locator('[data-field="combat-hud-assist-status"]'),
+      ],
     },
   )
 })

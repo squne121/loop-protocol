@@ -397,6 +397,17 @@ const renderer = canvas ? createCanvasRenderer(canvas) : null
 const productPause = createProductPauseState()
 const inputState = createInputState()
 
+/**
+ * Fixed simulation timestep currently driving `state.sortie.elapsedTicks`
+ * (Issue #1375, AC4). Runtime-local (not part of `GameState.sortie` — Out
+ * of Scope) so the combat HUD's Elapsed timer can be derived as
+ * `elapsedTicks * activeFixedDeltaMs` instead of `elapsedTicks / 60` or
+ * wall-clock time. Defaults to the production simulation config and is
+ * overridden only by a deterministic 'running' visual scenario fixture
+ * (`applyVisualScenarioFixture()` below), never by ordinary gameplay.
+ */
+let activeFixedDeltaMs = defaultSimulationConfig.fixedDeltaMs
+
 // Issue #1282: M4 minimal upgrade catalog only has a single definition
 // (weapon_power_plus_1). HUD upgrade purchase surface targets it directly;
 // a definitionId selector is out of scope here (single-item catalog).
@@ -594,6 +605,9 @@ const phaseScreens = battleScreenLayer ? createPhaseScreenController(battleScree
     if (!started) {
       return
     }
+    // AC4: combat HUD Elapsed timer uses the production simulation timestep
+    // for an ordinary (non-fixture) sortie.
+    activeFixedDeltaMs = defaultSimulationConfig.fixedDeltaMs
     setHudFeedback('Sortie started.', 'Preparation controls are now locked until result.')
   },
   onSave() {
@@ -636,7 +650,7 @@ const phaseScreens = battleScreenLayer ? createPhaseScreenController(battleScree
       },
       renderHud() {
         syncBattleOverlayLayout()
-        hud?.render(state, productPause.isPaused)
+        hud?.render(state, productPause.isPaused, activeFixedDeltaMs)
         phaseScreens?.render(state, buildUpgradeView())
       },
     })
@@ -882,6 +896,10 @@ function applyVisualScenarioFixture(fixture: VisualScenarioFixture): void {
   state.progress.weaponPower = fixture.progress.weaponPower
   state.telemetry.status = fixture.telemetry.status
   state.telemetry.lastCommandSummary = fixture.telemetry.summary
+  // AC4/AC8: the fixture's fixedDeltaMs becomes the combat HUD's Elapsed
+  // timer authority for this scenario (elapsedTicks * activeFixedDeltaMs),
+  // overriding the production defaultSimulationConfig.fixedDeltaMs value.
+  activeFixedDeltaMs = fixture.sortie.fixedDeltaMs
 
   if (fixture.sortie.status === 'timeout') {
     state.sortie = {
@@ -1042,7 +1060,7 @@ function frame(now: number): void {
 
   // AC4: render and HUD continue regardless of pause state
   syncBattleOverlayLayout()
-  hud.render(state, productPause.isPaused)
+  hud.render(state, productPause.isPaused, activeFixedDeltaMs)
   phaseScreens?.render(state, buildUpgradeView())
   renderer.render(state)
   window.requestAnimationFrame(frame)
@@ -1092,6 +1110,7 @@ function maybeAutoStartRuntime(): void {
 
   if (state.loopPhase === 'preparation' && state.sortie.status === 'idle') {
     startSortie(state, defaultSimulationConfig.fixedDeltaMs)
+    activeFixedDeltaMs = defaultSimulationConfig.fixedDeltaMs
   }
 }
 

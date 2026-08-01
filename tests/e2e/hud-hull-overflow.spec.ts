@@ -27,7 +27,10 @@ import { test, expect, type Page } from '@playwright/test'
  */
 async function injectHullText(page: Page, text: string): Promise<void> {
   await page.evaluate((hullText) => {
-    const hpEl = document.querySelector<HTMLElement>('[data-field="hp"]')
+    // Scope Delta (Issue #1375): the Hull field moved from
+    // `[data-field="hp"]` (all phases) to `[data-field="combat-hud-hull"]`
+    // inside the running-only `data-combat-hud` root.
+    const hpEl = document.querySelector<HTMLElement>('[data-field="combat-hud-hull"]')
     if (hpEl) {
       hpEl.textContent = hullText
     }
@@ -135,8 +138,8 @@ test.describe('hud overflow: stat-grid dd does not overflow in any viewport', ()
 
         // Navigate to app
         await page.goto('/')
-        // Wait for HUD to be rendered (data-field="hp" must be present)
-        await page.waitForSelector('[data-field="hp"]', { timeout: 10_000 })
+        // Wait for HUD to be rendered (data-field="combat-hud-hull" must be present)
+        await page.waitForSelector('[data-field="combat-hud-hull"]', { timeout: 10_000 })
 
         // Inject large hull text (AC2a)
         await injectHullText(page, hullText)

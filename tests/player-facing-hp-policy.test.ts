@@ -154,53 +154,50 @@ describe('player-facing HP/HULL policy — AC7: formatCombatNumber integer bucke
 describe('player-facing HP/HULL policy — AC8: HUD Hull display with fractional hp', () => {
   let container: HTMLElement
 
+  // Scope Delta (Issue #1375): the Hull field moved from
+  // `[data-field="hp"]` (all phases) to `[data-field="combat-hud-hull"]`
+  // inside the running-only `data-combat-hud` root
+  // (`src/ui/combatHud.ts` / `src/ui/HudController.ts`). This file predates
+  // #1375 and is extended here (not silently broken) to target the new
+  // field id and render in the 'running' phase so the combat HUD root is
+  // the active (non-hidden) surface -- the Math.ceil fractional-hp display
+  // policy under test is unchanged.
+
   beforeEach(() => {
     container = document.createElement('div')
   })
 
   it('GIVEN player.hp = 0.5 maxHp = 8 WHEN HUD rendered THEN Hull shows "1/8" not "<1/8"', () => {
     const hud = createHudController(container, {
-      onStartSortie: vi.fn(),
       onClaimReward: vi.fn(),
       onNextSortie: vi.fn(),
-      onQuickSave: vi.fn(),
-      onQuickLoad: vi.fn(),
-      onReset: vi.fn(),
-      canQuickLoad: vi.fn(() => true),
+      onTogglePause: vi.fn(),
     })
-    hud.render(createState({ hp: 0.5, maxHp: 8 }))
-    const hpField = container.querySelector('[data-field="hp"]')
-    expect(hpField?.textContent).toBe('1/8')
+    hud.render(createState({ hp: 0.5, maxHp: 8, loopPhase: 'running' }), false, 1000 / 60)
+    const hullField = container.querySelector('[data-field="combat-hud-hull"]')
+    expect(hullField?.textContent).toBe('1/8')
   })
 
   it('GIVEN player.hp = 0.001 maxHp = 10 WHEN HUD rendered THEN Hull shows "1/10"', () => {
     const hud = createHudController(container, {
-      onStartSortie: vi.fn(),
       onClaimReward: vi.fn(),
       onNextSortie: vi.fn(),
-      onQuickSave: vi.fn(),
-      onQuickLoad: vi.fn(),
-      onReset: vi.fn(),
-      canQuickLoad: vi.fn(() => true),
+      onTogglePause: vi.fn(),
     })
-    hud.render(createState({ hp: 0.001, maxHp: 10 }))
-    const hpField = container.querySelector('[data-field="hp"]')
-    expect(hpField?.textContent).toBe('1/10')
+    hud.render(createState({ hp: 0.001, maxHp: 10, loopPhase: 'running' }), false, 1000 / 60)
+    const hullField = container.querySelector('[data-field="combat-hud-hull"]')
+    expect(hullField?.textContent).toBe('1/10')
   })
 
   it('GIVEN player.hp = 0 (defeated) maxHp = 8 WHEN HUD rendered THEN Hull shows "0/8"', () => {
     const hud = createHudController(container, {
-      onStartSortie: vi.fn(),
       onClaimReward: vi.fn(),
       onNextSortie: vi.fn(),
-      onQuickSave: vi.fn(),
-      onQuickLoad: vi.fn(),
-      onReset: vi.fn(),
-      canQuickLoad: vi.fn(() => true),
+      onTogglePause: vi.fn(),
     })
-    hud.render(createState({ hp: 0, maxHp: 8 }))
-    const hpField = container.querySelector('[data-field="hp"]')
-    expect(hpField?.textContent).toBe('0/8')
+    hud.render(createState({ hp: 0, maxHp: 8, loopPhase: 'running' }), false, 1000 / 60)
+    const hullField = container.querySelector('[data-field="combat-hud-hull"]')
+    expect(hullField?.textContent).toBe('0/8')
   })
 })
 
