@@ -15,10 +15,12 @@ function renderShell() {
     <div class="app-shell">
       <section class="battle-stage">
         <div class="battle-stage__header"></div>
-        <canvas class="battle-stage__canvas"></canvas>
-        <div class="battle-ui-layer" data-battle-ui-root>
-          <div class="battle-hud-layer" data-battle-layer="hud"></div>
-          <div class="battle-screen-layer" data-battle-layer="screen"></div>
+        <div class="battle-stage__viewport">
+          <canvas class="battle-stage__canvas"></canvas>
+          <div class="battle-ui-layer" data-battle-ui-root>
+            <div class="battle-hud-layer" data-battle-layer="hud"></div>
+            <div class="battle-screen-layer" data-battle-layer="screen"></div>
+          </div>
         </div>
       </section>
       <aside class="command-rail" aria-label="Command rail">

@@ -9,11 +9,15 @@ export interface BattleOverlayElements {
 
 export function resolveBattleOverlayElements(root: ParentNode): BattleOverlayElements | null {
   const battleStage = root.querySelector<HTMLElement>('.battle-stage')
-  const canvas = battleStage?.querySelector<HTMLCanvasElement>(':scope > .battle-stage__canvas') ?? null
+  // Issue #1375 PR #1925 review (P0-1): canvas + overlay layers live inside
+  // `.battle-stage__viewport` now, not directly under `.battle-stage` (which
+  // also contains `.battle-stage__header`) — see `src/main.ts` app shell
+  // markup comment for why the containing block was split.
+  const viewport = battleStage?.querySelector<HTMLElement>(':scope > .battle-stage__viewport') ?? null
+  const canvas = viewport?.querySelector<HTMLCanvasElement>(':scope > .battle-stage__canvas') ?? null
   const commandRail = root.querySelector<HTMLElement>('.command-rail')
   const uiLayer =
-    battleStage?.querySelector<HTMLElement>(':scope > .battle-ui-layer[data-battle-ui-root]') ??
-    null
+    viewport?.querySelector<HTMLElement>(':scope > .battle-ui-layer[data-battle-ui-root]') ?? null
   const hudLayer =
     uiLayer?.querySelector<HTMLElement>(':scope > .battle-hud-layer[data-battle-layer="hud"]') ??
     null

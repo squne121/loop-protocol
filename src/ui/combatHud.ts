@@ -66,7 +66,11 @@ export function getCombatHudAssistStatusCopy(state: GameState): string {
  */
 export function formatCombatHudElapsedLabel(elapsedTicks: number, activeFixedDeltaMs: number): string {
   const elapsedSeconds = (elapsedTicks * activeFixedDeltaMs) / 1000
-  return `${elapsedSeconds.toFixed(1)}s`
+  // Issue #1375 body + PR #1925 review (P1-2): the Issue's own worked
+  // example is "elapsedTicks: 900, fixedDeltaMs: 16 -> 14.4 s" (space
+  // before the unit) — match that exactly rather than the no-space `14.4s`
+  // this previously rendered.
+  return `${elapsedSeconds.toFixed(1)} s`
 }
 
 /**
@@ -108,7 +112,7 @@ export function buildCombatHudViewModel(
  * the legacy result/debrief surface and owns phase routing / visibility.
  */
 export const COMBAT_HUD_MARKUP = `
-  <section class="panel combat-hud" data-combat-hud hidden inert>
+  <section class="combat-hud" data-combat-hud hidden inert>
     <p class="eyebrow">Combat</p>
     <dl class="stat-grid">
       <div><dt>Hull</dt><dd data-field="combat-hud-hull"></dd></div>

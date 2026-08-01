@@ -250,15 +250,85 @@ describe('HudController: data-combat-hud (running only, Issue #1375)', () => {
     expect(combatHudRoot(container).querySelector('[data-field="combat-hud-kills"]')?.textContent).toBe('1')
   })
 
-  it('GIVEN elapsedTicks: 900 and activeFixedDeltaMs: 16 WHEN render called THEN combat-hud-elapsed reads 14.4s, not /60 or wall-clock derived (AC4)', () => {
+  it('GIVEN elapsedTicks: 900 and activeFixedDeltaMs: 16 WHEN render called THEN combat-hud-elapsed reads 14.4 s, not /60 or wall-clock derived (AC4)', () => {
     const state = createState('running')
     state.sortie = { status: 'running', elapsedTicks: 900, targetTicks: 3600, result: null }
 
     hudController.render(state, false, 16)
 
     const elapsedField = combatHudRoot(container).querySelector('[data-field="combat-hud-elapsed"]')
-    expect(elapsedField?.textContent).toBe('14.4s')
+    expect(elapsedField?.textContent).toBe('14.4 s')
     expect(elapsedField?.hasAttribute('data-visual-mask')).toBe(false)
+  })
+
+  it('GIVEN the same view model WHEN render is called twice THEN combat HUD text nodes are not reassigned on the second render (AC6, Issue #1375 PR #1925 review P1-1)', () => {
+    const state = createState('running')
+    state.sortie = { status: 'running', elapsedTicks: 900, targetTicks: 3600, result: null }
+
+    hudController.render(state, false, 16)
+
+    const observer = new MutationObserver(() => {})
+    observer.observe(combatHudRoot(container), {
+      characterData: true,
+      childList: true,
+      subtree: true,
+    })
+
+    // Same state object, same isPaused, same activeFixedDeltaMs -> identical
+    // view model on the second render.
+    hudController.render(state, false, 16)
+
+    // MutationObserver callbacks are microtask-queued; `takeRecords()`
+    // synchronously drains the pending queue so this assertion does not
+    // depend on the callback having flushed yet.
+    const observed = observer.takeRecords().map((mutation) => mutation.type)
+    observer.disconnect()
+    expect(observed).toEqual([])
+  })
+
+  it('GIVEN only the Assist status changes WHEN render is called THEN only combat-hud-assist-status is patched, not Hull/Kills/Elapsed/Weapon (AC6, Issue #1375 PR #1925 review P1-1)', () => {
+    const state = createState('running')
+    state.allies = [createDefaultAllyState(1)]
+    state.enemies = [
+      { id: 1, definitionId: 'enemy-basic', hp: 5, maxHp: 5, x: 0, y: 0, radius: 12, speedPxPerSec: 60, contactDamage: 1, defeated: false, defeatedAtTick: null, faction: 'enemy', role: 'enemy_chaser', behaviorState: 'move_to_engage', targetingPolicy: 'focus_player', targetEntityId: null },
+    ]
+
+    hudController.render(state, false, PROD_FIXED_DELTA_MS)
+
+    const root = combatHudRoot(container)
+    const observer = new MutationObserver(() => {})
+    observer.observe(root, { characterData: true, childList: true, subtree: true })
+
+    // Only the assist-relevant state changes; Hull/Kills/Elapsed/Weapon
+    // inputs are unchanged.
+    state.commandIntentRuntime.activeIntent = 'assist_player'
+    hudController.render(state, false, PROD_FIXED_DELTA_MS)
+
+    // MutationObserver callbacks are microtask-queued; `takeRecords()`
+    // synchronously drains the pending queue so this assertion does not
+    // depend on the callback having flushed yet.
+    const mutations = observer.takeRecords()
+    observer.disconnect()
+
+    const changedNodes = mutations
+      .map((mutation) =>
+        mutation.target.nodeType === Node.TEXT_NODE
+          ? mutation.target.parentElement
+          : (mutation.target as Element),
+      )
+      .filter((node): node is Element => node !== null)
+
+    const changedFields = new Set(
+      changedNodes
+        .map((node) => node.closest('[data-field]')?.getAttribute('data-field'))
+        .filter((field): field is string => field !== null && field !== undefined),
+    )
+
+    expect(changedFields.has('combat-hud-assist-status')).toBe(true)
+    expect(changedFields.has('combat-hud-hull')).toBe(false)
+    expect(changedFields.has('combat-hud-kills')).toBe(false)
+    expect(changedFields.has('combat-hud-elapsed')).toBe(false)
+    expect(changedFields.has('combat-hud-weapon')).toBe(false)
   })
 
   it('GIVEN weaponCooldownMs 0 WHEN render called THEN combat-hud-weapon shows Ready, never the raw millisecond value (AC2)', () => {
@@ -406,13 +476,13 @@ describe('HudController: data-combat-hud (running only, Issue #1375)', () => {
 })
 
 describe('combatHud.ts: buildCombatHudViewModel / getCombatHudAssistStatusCopy (Issue #1375)', () => {
-  it('GIVEN elapsedTicks 900 and activeFixedDeltaMs 16 WHEN buildCombatHudViewModel is called THEN elapsedLabel is 14.4s (AC4, AC8 fixture parity)', () => {
+  it('GIVEN elapsedTicks 900 and activeFixedDeltaMs 16 WHEN buildCombatHudViewModel is called THEN elapsedLabel is 14.4 s (AC4, AC8 fixture parity)', () => {
     const state = createState('running')
     state.sortie = { status: 'running', elapsedTicks: 900, targetTicks: 3600, result: null }
 
     const view = buildCombatHudViewModel(state, false, 16)
 
-    expect(view.elapsedLabel).toBe('14.4s')
+    expect(view.elapsedLabel).toBe('14.4 s')
   })
 
   it('GIVEN non-running phase WHEN getCombatHudAssistStatusCopy is called THEN it reports available during sortie', () => {

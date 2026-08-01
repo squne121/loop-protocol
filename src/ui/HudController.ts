@@ -1,6 +1,6 @@
 import type { GameState } from '../state'
 import type { UpgradePurchaseFailureReason } from '../systems/UpgradeSystem'
-import { buildCombatHudViewModel, COMBAT_HUD_MARKUP } from './combatHud'
+import { buildCombatHudViewModel, COMBAT_HUD_MARKUP, type CombatHudViewModel } from './combatHud'
 
 /**
  * Running-time HUD (Issue #1375): `HudController` now owns two DOM roots
@@ -148,13 +148,40 @@ function getOutcomeCopy(state: GameState): string {
 }
 
 /**
+ * Writes `next` into `node.textContent` only when it differs from `previous`
+ * (AC6, Issue #1375 PR #1925 review P1-1: `render()` previously reassigned
+ * `textContent` unconditionally every frame even when the value had not
+ * changed, which is unnecessary DOM churn / style recalculation). Returns
+ * `next` so callers can thread it straight into the "previous" snapshot for
+ * the following frame.
+ */
+function patchText(node: HTMLElement, previous: string | undefined, next: string): string {
+  if (previous !== next) {
+    node.textContent = next
+  }
+  return next
+}
+
+/**
  * Sets `hidden` and `inert` together (AC1) so a HUD root is excluded from
  * the accessibility tree and the keyboard tab order when it is not the
  * active surface for the current phase — mirrors
  * `phaseScreens.ts`'s `setPhaseScreenVisibility()` (same non-negotiable
  * pair: `pointer-events: none` alone cannot exclude keyboard focus).
  */
-function setHudRootVisibility(element: HTMLElement, visible: boolean): void {
+function setHudRootVisibility(
+  element: HTMLElement,
+  visible: boolean,
+  previousVisible: boolean | undefined,
+): void {
+  // Issue #1375 PR #1925 review (P1-1): skip re-setting hidden/inert/
+  // aria-hidden when the phase-driven visible/hidden state has not changed
+  // since the last render — this attribute set previously ran every frame
+  // even while the HUD stayed in the same phase.
+  if (previousVisible === visible) {
+    return
+  }
+
   element.hidden = !visible
   if (visible) {
     element.removeAttribute('inert')
@@ -268,39 +295,53 @@ export function createHudController(
   const confirmResultButton = queryAction(legacyResultSurface, 'confirm-result')
   const nextSortieButton = queryAction(legacyResultSurface, 'next-sortie')
 
+  // AC3: the Pause button's visible label is a fixed constant, so it only
+  // needs to be set once at construction time (Issue #1375 PR #1925 review
+  // P1-1) rather than reassigned every render().
+  togglePauseButton.textContent = 'Pause'
+
+  // Issue #1375 PR #1925 review (P1-1): previous-frame snapshots so
+  // render() can skip DOM writes for unchanged values (AC6). `null` means
+  // "no previous render yet" so the first render always writes every field.
+  let previousIsRunning: boolean | undefined
+  let previousCombatHudViewModel: CombatHudViewModel | null = null
+
   return {
     render(state, isPaused, activeFixedDeltaMs) {
       // AC1: exactly one of the two HUD roots is the active player-facing
       // surface for the current phase; the other is hidden + inert.
       const isRunning = state.loopPhase === 'running'
-      setHudRootVisibility(combatHudRoot, isRunning)
-      setHudRootVisibility(legacyResultSurface, !isRunning)
+      setHudRootVisibility(combatHudRoot, isRunning, previousIsRunning)
+      setHudRootVisibility(legacyResultSurface, !isRunning, previousIsRunning === undefined ? undefined : !previousIsRunning)
+      previousIsRunning = isRunning
 
       // -----------------------------------------------------------------
       // Combat HUD (data-combat-hud, running only) — AC2, AC3, AC4, AC6
       // -----------------------------------------------------------------
       const combatHudViewModel = buildCombatHudViewModel(state, isPaused, activeFixedDeltaMs)
+      const previous = previousCombatHudViewModel
 
-      combatHudHull.textContent = combatHudViewModel.hullLabel
-      combatHudKills.textContent = `${combatHudViewModel.kills}`
+      patchText(combatHudHull, previous?.hullLabel, combatHudViewModel.hullLabel)
+      patchText(combatHudKills, previous ? `${previous.kills}` : undefined, `${combatHudViewModel.kills}`)
       // AC4: derived from elapsedTicks * activeFixedDeltaMs — never masked
       // for VRT (Timer / Volatile Text Policy: this IS the display
       // authority, unlike the legacy elapsedTicks/60 approximation below).
-      combatHudElapsed.textContent = combatHudViewModel.elapsedLabel
+      patchText(combatHudElapsed, previous?.elapsedLabel, combatHudViewModel.elapsedLabel)
       combatHudElapsed.removeAttribute('data-visual-mask')
-      combatHudWeapon.textContent = combatHudViewModel.weaponLabel
+      patchText(combatHudWeapon, previous?.weaponLabel, combatHudViewModel.weaponLabel)
 
       assistPlayerButton.disabled = combatHudViewModel.assistDisabled
       // AC6: Assist is the sole live-region field in the combat HUD; Hull /
       // Kills / Elapsed / Weapon are updated in place, not inside a
       // role="status" region.
-      combatHudAssistStatus.textContent = combatHudViewModel.assistStatus
+      patchText(combatHudAssistStatus, previous?.assistStatus, combatHudViewModel.assistStatus)
 
-      // AC3: visible label is fixed ("Pause"); aria-pressed represents the
-      // toggle state instead of swapping the accessible name.
-      togglePauseButton.textContent = 'Pause'
+      // AC3: aria-pressed represents the toggle state (visible label stays
+      // fixed, see the one-time assignment above).
       togglePauseButton.setAttribute('aria-pressed', combatHudViewModel.paused ? 'true' : 'false')
       togglePauseButton.disabled = combatHudViewModel.pauseDisabled
+
+      previousCombatHudViewModel = combatHudViewModel
 
       // -----------------------------------------------------------------
       // Legacy result/debrief compatibility surface — hidden during

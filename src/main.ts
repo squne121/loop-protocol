@@ -325,11 +325,22 @@ if (app) {
         </div>
         <p class="battle-stage__copy">WASD to reposition. Hold pointer down to pressure the firing lane.</p>
       </div>
-      <canvas class="battle-stage__canvas" aria-label="Battle arena" tabindex="0"></canvas>
-      <!-- Interactive HUD descendants opt in via data-battle-interactive="true". -->
-      <div class="battle-ui-layer" data-battle-ui-root>
-        <div class="battle-hud-layer" data-battle-layer="hud"></div>
-        <div class="battle-screen-layer" data-battle-layer="screen" hidden inert></div>
+      <!--
+        Issue #1375 PR #1925 review (owner playtest, P0-1): the HUD overlay's
+        containing block must be the Canvas viewport only, never the whole
+        battle-stage (which also contains battle-stage__header). Previously
+        .battle-ui-layer was a direct sibling of .battle-stage__header under
+        .battle-stage's position: relative, so its inset: 0 absolute
+        positioning covered the header too. .battle-stage__viewport is the
+        sole positioned ancestor for canvas + overlay layers now.
+      -->
+      <div class="battle-stage__viewport">
+        <canvas class="battle-stage__canvas" aria-label="Battle arena" tabindex="0"></canvas>
+        <!-- Interactive HUD descendants opt in via data-battle-interactive="true". -->
+        <div class="battle-ui-layer" data-battle-ui-root>
+          <div class="battle-hud-layer" data-battle-layer="hud"></div>
+          <div class="battle-screen-layer" data-battle-layer="screen" hidden inert></div>
+        </div>
       </div>
     </section>
     <aside class="command-rail" aria-label="Command rail"></aside>

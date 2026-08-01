@@ -297,7 +297,7 @@ test('GIVEN a DOM overlay positioned over the Canvas WHEN captured with the same
 // (predicate-only DOM check — no committed baseline PNG required).
 // ---------------------------------------------------------------------------
 
-test('GIVEN the running-hud fixture (elapsedTicks: 900, fixedDeltaMs: 16) WHEN the combat HUD renders THEN combat-hud-elapsed reads 14.4s, matching CombatHudViewModel.elapsedLabel (AC4, AC8)', async ({
+test('GIVEN the running-hud fixture (elapsedTicks: 900, fixedDeltaMs: 16) WHEN the combat HUD renders THEN combat-hud-elapsed reads 14.4 s, matching CombatHudViewModel.elapsedLabel (AC4, AC8)', async ({
   page,
 }) => {
   await installVisualScenario(page, RUNNING_FIXTURE)
@@ -306,5 +306,5 @@ test('GIVEN the running-hud fixture (elapsedTicks: 900, fixedDeltaMs: 16) WHEN t
   const elapsedText = await page.locator('[data-field="combat-hud-elapsed"]').textContent()
   const observed: Pick<CombatHudViewModel, 'elapsedLabel'> = { elapsedLabel: elapsedText ?? '' }
 
-  expect(observed.elapsedLabel).toBe('14.4s')
+  expect(observed.elapsedLabel).toBe('14.4 s')
 })

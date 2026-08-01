@@ -295,6 +295,57 @@ HUD 構成要素（Hull/Kills/Elapsed/Weapon/Assist/Pause のみの compact pane
   `phase-screens.spec.ts` の既存 baseline であり、本 Issue の AC1/AC2 実装による
   combat HUD 再配置に伴う周辺レイアウト・フォント差分の再取得として扱う）。
 
+### running-hud 系 baseline の PR #1925 review 対応更新（明示）
+
+PR #1925（Issue #1375）は owner の実機プレイテスト（Windows/Chrome, viewport 1437x1365,
+devicePixelRatio 約 0.667）を受けた REQUEST_CHANGES で、combat HUD が Canvas ではなく
+`battle-stage` 全体（header 含む）を containing block としていた defect（P0-1）と、それに
+連動する二重 clipping boundary（P0-2）を修正した。この修正で以下の構造変更が入った。
+
+- `src/main.ts`: `.battle-stage` 直下に `.battle-stage__header` と並列だった
+  `.battle-stage__canvas` / `.battle-ui-layer` を、新設した `.battle-stage__viewport`
+  （header の構造的な兄弟要素）の内側に移動した。
+- `src/style.css`: `.battle-stage__viewport { position: relative; overflow: hidden }` を
+  HUD overlay の唯一の containing block / clip boundary にし、`.battle-stage` 自身は
+  `width: fit-content; max-width: min(960px, 100%)` で実際に描画される Canvas 幅（
+  `src/main.ts` の `resizeArena()` が `state.arena.width` を 960px 上限でクランプしている）
+  に一致するよう縮小した。これにより `[data-battle-ui-root]` / `[data-combat-hud]` の
+  capture 領域が、従来の「grid column いっぱいに引き伸ばされた矩形（例: 1230x606）」から
+  「実際の Canvas 矩形に一致する矩形（例: 900x507）」へ変化した。
+
+この結果、以下の既存 baseline との間に許容差を超える差分が生じた。
+
+- `running-hud`（`m2-running-hud-baseline.png`）
+- `running-hud-overlay-legacy-current`（`vrt-running-hud-overlay.png`）
+- `title-menu` / `load-menu-empty` / `load-menu-available` / `load-menu-failure` /
+  `preparation-default` / `preparation-upgrade-available` / `running-minimal-hud`
+  （`phase-screens.spec.ts`、いずれも `[data-battle-ui-root]` capture）
+- `m2-timeout-overlay-baseline.png`（`canvas.battle-stage__canvas` 単体 capture。
+  `maxDiffPixels: 1` という極めて狭い許容差のため、Canvas 自体のビットマップ内容は
+  不変だが、`.battle-stage`/`.battle-stage__viewport` の再構成に伴うサブピクセル単位の
+  layout 差が診断された）
+
+- **判断根拠**: いずれの差分も意図しない退行ではなく、owner レビューが要求した P0-1/P0-2
+  の修正（HUD の containing block を Canvas viewport に正しく一致させる）の意図した副作用
+  である（§4 checklist の「意図した仕様変更か退行固定化かの判断」に基づく確認）。修正前は
+  `[data-battle-ui-root]` の capture 領域が実際の Canvas よりも大きい矩形になっており、
+  この不一致自体が owner の報告した「HUD が Canvas ではなく battle-stage 全体を基準に配置
+  される」defect の根本原因だった。
+- **evidence**: worktree `issue-1375-combat-hud-overlay`。ローカル環境（Linux, Playwright
+  chromium, `tests/e2e/visual.freeze.css` の generic `sans-serif` 固定込み）で
+  `playwright test tests/e2e/phase-screens.spec.ts tests/e2e/visual-overlay.spec.ts
+  tests/e2e/m2-combat-mvp.spec.ts --update-snapshots` により baseline を再生成した。
+  #1374 / #1375 の前例（本ファイル上記セクション）で観測された CI runner とのフォント
+  fallback 差に起因する追加差分が本 PR の CI 実行でも再発する可能性があるため、CI 実行
+  結果の `test-results` artifact から該当する `*-actual.png` を取得し、それを最終
+  baseline として採用する運用を維持する（このローカル再生成は暫定コミットであり、CI
+  実行結果による最終採用は control-plane が別途行う）。
+- **maturity**: 変更なし（対象はすべて既存 `legacy-current` / `provisional` のまま）。
+- **tolerance**: 変更なし（既存 `maxDiffPixels` 設定を維持）。
+- **environment fingerprint**: 本更新はローカル worktree 環境で生成した暫定 baseline
+  であり、CI 実行環境（GitHub Actions ubuntu runner）で再取得した `*-actual.png` への
+  差し替えが必要になる可能性がある（#1374 / #1375 の前例と同じ運用）。
+
 ## 4. baseline update policy（更新ポリシー）
 
 ### 自動更新の禁止

@@ -127,6 +127,15 @@ const HULL_VALUES = [
 // Tests
 // ---------------------------------------------------------------------------
 
+// Issue #1375 PR #1925 review (owner playtest, P0-3): the AC7 desktop
+// resolutions from the Issue body were never covered by an automated
+// viewport matrix. Added alongside the existing AC2 overflow matrix.
+const GEOMETRY_VIEWPORTS = [
+  ...VIEWPORTS,
+  { width: 1366, height: 768, label: '1366x768' },
+  { width: 1920, height: 1080, label: '1920x1080' },
+]
+
 test.describe('hud overflow: stat-grid dd does not overflow in any viewport', () => {
   for (const vp of VIEWPORTS) {
     for (const hullText of HULL_VALUES) {
@@ -167,4 +176,133 @@ test.describe('hud overflow: stat-grid dd does not overflow in any viewport', ()
       })
     }
   }
+})
+
+// ---------------------------------------------------------------------------
+// AC7 (Issue #1375 PR #1925 review, owner playtest, P0-3): the combat HUD's
+// bounding box must stay inside the Canvas viewport (not the header) with a
+// 16px safe margin, never overlap the header rect, and both Assist allies
+// and Pause must stay in the viewport together, across desktop resolutions.
+// ---------------------------------------------------------------------------
+
+const HUD_SAFE_MARGIN_PX = 16
+
+interface Rect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+function rectsIntersect(a: Rect, b: Rect): boolean {
+  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y
+}
+
+/** Asserts `inner` is fully contained within `outer` expanded by `margin` on every side. */
+function assertWithinSafeMargin(inner: Rect, outer: Rect, margin: number, label: string): void {
+  expect(inner.x, `${label}: left edge inside safe margin`).toBeGreaterThanOrEqual(outer.x - margin)
+  expect(inner.y, `${label}: top edge inside safe margin`).toBeGreaterThanOrEqual(outer.y - margin)
+  expect(inner.x + inner.width, `${label}: right edge inside safe margin`).toBeLessThanOrEqual(
+    outer.x + outer.width + margin,
+  )
+  expect(inner.y + inner.height, `${label}: bottom edge inside safe margin`).toBeLessThanOrEqual(
+    outer.y + outer.height + margin,
+  )
+}
+
+async function assertHudGeometry(page: Page, label: string): Promise<void> {
+  const hud = page.locator('[data-combat-hud]')
+  const canvas = page.locator('canvas.battle-stage__canvas')
+  const header = page.locator('.battle-stage__header')
+
+  await expect(hud).toBeVisible()
+
+  const hudBox = await hud.boundingBox()
+  const canvasBox = await canvas.boundingBox()
+  const headerBox = await header.boundingBox()
+
+  expect(hudBox, `${label}: combat HUD must have a bounding box`).not.toBeNull()
+  expect(canvasBox, `${label}: canvas must have a bounding box`).not.toBeNull()
+  expect(headerBox, `${label}: header must have a bounding box`).not.toBeNull()
+
+  if (!hudBox || !canvasBox || !headerBox) {
+    return
+  }
+
+  // HUD is within the Canvas viewport (16px safe margin), not the header
+  // (P0-1: the HUD's containing block is `.battle-stage__viewport`, whose
+  // bounds match the canvas).
+  assertWithinSafeMargin(hudBox, canvasBox, HUD_SAFE_MARGIN_PX, `${label} HUD-in-canvas`)
+
+  // HUD and header never overlap as rectangles.
+  expect(
+    rectsIntersect(hudBox, headerBox),
+    `${label}: HUD box ${JSON.stringify(hudBox)} must not intersect header box ${JSON.stringify(headerBox)}`,
+  ).toBe(false)
+
+  // Assist allies and Pause both stay in the viewport together.
+  await expect(page.getByRole('button', { name: 'Assist allies' })).toBeInViewport()
+  await expect(page.getByRole('button', { name: 'Pause' })).toBeInViewport()
+
+  // HUD element itself has no internal overflow (neither axis).
+  const overflow = await hud.evaluate((el) => ({
+    scrollWidth: el.scrollWidth,
+    clientWidth: el.clientWidth,
+    scrollHeight: el.scrollHeight,
+    clientHeight: el.clientHeight,
+  }))
+  expect(overflow.scrollWidth, `${label}: HUD scrollWidth <= clientWidth`).toBeLessThanOrEqual(
+    overflow.clientWidth,
+  )
+  expect(overflow.scrollHeight, `${label}: HUD scrollHeight <= clientHeight`).toBeLessThanOrEqual(
+    overflow.clientHeight,
+  )
+}
+
+test.describe('hud geometry: combat HUD stays inside the Canvas viewport (AC7)', () => {
+  for (const vp of GEOMETRY_VIEWPORTS) {
+    test(`viewport=${vp.label}: HUD is within canvas bounds, never overlaps header, Assist+Pause in viewport, no internal overflow`, async ({
+      page,
+    }) => {
+      await page.setViewportSize({ width: vp.width, height: vp.height })
+      await page.goto('/')
+      await page.waitForSelector('[data-combat-hud]', { timeout: 10_000 })
+
+      await assertHudGeometry(page, vp.label)
+    })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Regression case for the owner's actual playtest report: Windows/Chrome,
+// viewport 1437x1365, devicePixelRatio ~= 0.667 (effectively a wider/taller
+// *logical* viewport than the physical display, e.g. OS display scaling
+// below 100%). Playwright cannot emulate OS-level zoom directly, but
+// `deviceScaleFactor` is the closest supported lever and can only be set at
+// browser-context creation, so this test opens its own context rather than
+// reusing the default `page` fixture.
+// ---------------------------------------------------------------------------
+
+test.describe('hud geometry: low-DPR regression (owner playtest report)', () => {
+  test('viewport=1437x1365 deviceScaleFactor=0.667 (approx): HUD stays within canvas bounds', async ({
+    browser,
+  }) => {
+    const context = await browser.newContext({
+      viewport: { width: 1437, height: 1365 },
+      // Chromium requires deviceScaleFactor > 0; 0.667 approximates the
+      // owner's report of an effectively higher-resolution logical viewport
+      // than the physical display (DPR below 1).
+      deviceScaleFactor: 0.667,
+    })
+    const page = await context.newPage()
+
+    try {
+      await page.goto('/')
+      await page.waitForSelector('[data-combat-hud]', { timeout: 10_000 })
+
+      await assertHudGeometry(page, 'DPR~0.667 1437x1365')
+    } finally {
+      await context.close()
+    }
+  })
 })

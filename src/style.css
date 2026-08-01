@@ -95,7 +95,33 @@ button:focus-visible {
   position: relative;
   isolation: isolate;
   border-radius: 28px;
-  overflow: hidden;
+  /* Issue #1375 PR #1925 review (owner playtest, P0-1 follow-through):
+   * `CanvasRenderer.render()` (src/render/CanvasRenderer.ts, out of this
+   * Issue's Allowed Paths) always sets `canvas.style.width/height` to a
+   * fixed px size derived from `state.arena` (capped well below typical
+   * desktop viewport widths by `resizeArena()`'s legacy sidebar math in
+   * `src/main.ts`), which permanently overrides this stylesheet's
+   * `.battle-stage__canvas { width: 100% }` rule. The Canvas therefore
+   * never actually fills a full-width grid column — a stretched
+   * `.battle-stage`/`.battle-stage__viewport` box left a large empty region
+   * to the right of the real Canvas pixels, and the HUD (right-aligned
+   * within that stretched box) rendered far outside the Canvas's true
+   * bounds. Shrinking `.battle-stage` to its content's width keeps the
+   * whole panel (header + viewport) sized to what the Canvas actually
+   * renders, so `justify-items: end` HUD placement lands at the Canvas's
+   * real right edge instead of the grid column's. */
+  width: fit-content;
+  /* The header's own flex row (title block + copy paragraph) has an
+   * unconstrained max-content width that can exceed the Canvas's fixed
+   * pixel width (`resizeArena()` in src/main.ts caps `state.arena.width` at
+   * 960 — kept in sync with that constant here), which previously let the
+   * header force `.battle-stage` (and therefore `.battle-stage__viewport`,
+   * the HUD's containing block) wider than the actual Canvas at large
+   * viewports even after switching to `width: fit-content` above. Capping
+   * at the same 960px ceiling forces the header's flex children to shrink
+   * (and its copy paragraph to wrap) instead of dictating a wider panel
+   * than the Canvas actually renders. */
+  max-width: min(960px, 100%);
 }
 
 .battle-stage__header {
@@ -105,6 +131,24 @@ button:focus-visible {
   align-items: end;
   padding: 18px 22px;
   border-bottom: 1px solid var(--line);
+  /* Issue #1375 PR #1925 review (P0-1): `.battle-stage` no longer clips its
+   * own box (that moved to `.battle-stage__viewport` below), so the header's
+   * top corners must restate the shared 28px radius themselves. */
+  border-radius: 28px 28px 0 0;
+}
+
+/* Issue #1375 PR #1925 review (P0-1): the sole positioned + clipped ancestor
+ * for the Canvas and its overlay layers. Previously `.battle-stage` itself
+ * was both the positioned ancestor AND the clip boundary for
+ * `.battle-ui-layer`'s `inset: 0`, which made the header part of the HUD's
+ * containing block (the reported "HUD anchored to battle-stage, not
+ * Canvas" defect). Splitting header and viewport into structural siblings
+ * makes the Canvas bounds the only possible containing block, independent
+ * of header height (fonts/locale/zoom-proof, no magic `top` offset). */
+.battle-stage__viewport {
+  position: relative;
+  overflow: hidden;
+  border-radius: 0 0 28px 28px;
 }
 
 .battle-stage__copy,
@@ -144,6 +188,16 @@ button:focus-visible {
   align-content: start;
   gap: 12px;
   padding: 16px;
+  /* Issue #1375 PR #1925 review (P0-2): this layer must not be the primary
+   * scroll boundary for the compact combat HUD in the normal desktop
+   * layout — combined with `.battle-stage__viewport { overflow: hidden }`
+   * above, a second `overflow-y: auto` boundary here produced the reported
+   * "content clipped inside an inner frame" look. The compact `.combat-hud`
+   * (P1-3) is sized/lightened to fit the Canvas viewport without needing
+   * scroll during the running phase; `overflow-y: auto` is kept only as a
+   * last-resort safety net (e.g. the `.legacy-result-surface` compatibility
+   * panels, pre-existing before #1375) and must not be relied on to make
+   * running-phase HUD content fit. */
   overflow-y: auto;
   overscroll-behavior: contain;
 }
@@ -197,15 +251,28 @@ button:focus-visible {
   max-inline-size: 100%;
 }
 
-/* Combat HUD (Issue #1375): the single compact running-only player-facing
- * surface (Hull / Kills / Elapsed / Weapon / Assist / Pause). Kept narrow
- * and self-contained so it never covers the Canvas battle-stage and both
- * Assist allies and Pause stay visible together at 1280x720 (AC7). */
+/* Combat HUD (Issue #1375, redesigned Issue #1375 PR #1925 review P1-3): the
+ * single compact running-only player-facing surface (Hull / Kills / Elapsed /
+ * Weapon / Assist / Pause). Kept narrow and self-contained so it never
+ * covers the Canvas battle-stage and both Assist allies and Pause stay
+ * visible together at 1280x720 (AC7).
+ *
+ * Deliberately does NOT reuse `.panel` (owner playtest feedback: the combat
+ * HUD read as a second independent menu panel floating over gameplay, not a
+ * lightweight status readout). Own chrome here is intentionally lighter than
+ * `.panel`'s `--shadow` (0 24px 80px) / `blur(16px)` / 22px radius / 20px
+ * padding — a slim, edge-anchored status cluster instead of a full card. */
 .combat-hud {
   display: grid;
-  gap: 10px;
-  inline-size: min(240px, calc(100% - 16px));
+  gap: 8px;
+  inline-size: min(220px, calc(100% - 16px));
   max-inline-size: 100%;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: rgba(10, 18, 31, 0.72);
+  backdrop-filter: blur(6px);
+  box-shadow: 0 8px 24px rgba(1, 8, 18, 0.35);
 }
 
 .combat-hud[hidden] {
@@ -213,11 +280,44 @@ button:focus-visible {
 }
 
 .combat-hud .stat-grid {
-  gap: 8px;
+  gap: 6px;
+}
+
+.combat-hud .stat-grid div {
+  padding: 8px 10px;
+  border-radius: 12px;
+}
+
+.combat-hud .stat-grid dt {
+  margin-bottom: 4px;
 }
 
 .combat-hud .stat-grid dd {
-  font-size: 1.1rem;
+  font-size: 1.05rem;
+}
+
+/* P0-2 (owner playtest): on short viewports, shrink internal spacing before
+ * ever falling back to scrolling — compact HUD content must keep fitting the
+ * Canvas viewport at common laptop heights instead of relying on
+ * `.battle-hud-layer`'s scroll fallback. */
+@media (max-height: 620px) {
+  .battle-hud-layer {
+    padding: 10px;
+    gap: 8px;
+  }
+
+  .combat-hud {
+    gap: 6px;
+    padding: 10px 12px;
+  }
+
+  .combat-hud .stat-grid {
+    gap: 4px;
+  }
+
+  .combat-hud .eyebrow {
+    margin-bottom: 4px;
+  }
 }
 
 /* Temporary result/debrief compatibility surface (Issue #1375, removed by
