@@ -2632,8 +2632,12 @@ class AgyInvocationPolicyError(Exception):
 
 
 # Issue #1928: characters treated as leading whitespace/BOM when locating the
-# first real token of a prompt. Mirrors Python's default str.strip() whitespace
-# set plus the UTF-8 BOM codepoint, since a BOM is not part of str.isspace().
+# first real token of a prompt. This is the ASCII whitespace subset (space,
+# tab, newline, carriage return, vertical tab, form feed) plus the UTF-8 BOM
+# codepoint -- not the full Unicode whitespace set str.isspace() recognizes
+# (e.g. U+00A0 NBSP, U+2003 EM SPACE are intentionally not stripped here; the
+# #1918 policy decision's reject-class test cases only exercise ASCII
+# whitespace, a bare BOM, and newline before the leading slash).
 _AGY_PROMPT_LEADING_STRIP_CHARS = "\ufeff \t\n\r\v\f"
 
 
