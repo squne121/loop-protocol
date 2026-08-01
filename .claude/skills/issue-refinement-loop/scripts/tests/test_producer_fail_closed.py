@@ -172,13 +172,11 @@ def test_review_compact_invalid_verdict_emits_failure_artifact(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_review_compact_output_budget_violation_is_machine_readable(tmp_path):
-    """AC3: when stdout would exceed 2048 bytes, emit machine-readable failure envelope.
-
-    B3: success compact_review_result_*.json must NOT exist after budget violation.
-    """
-    # Use a long relative artifact_dir path so EVIDENCE + ARTIFACT lines exceed 2048 bytes total.
-    # Each component ≤ 200 chars stays within Linux 255-char per-component limit.
+def test_review_compact_noncanonical_relative_artifact_dir_fails_closed(tmp_path):
+    """A no-root producer invocation rejects an arbitrary relative destination."""
+    # This was formerly accepted to induce a synthetic output-budget failure.
+    # It instead fixed a producer/validator split-brain by allowing a wire
+    # reference outside the validator's canonical lexical namespace.
     long_artifact_dir = (
         Path("x" * 200)
         / ("y" * 200)
@@ -186,7 +184,7 @@ def test_review_compact_output_budget_violation_is_machine_readable(tmp_path):
         / ("w" * 200)
         / ("v" * 200)
     )
-    # Provide valid input so we get past schema validation to the budget check
+    # Valid input proves rejection happens at the producer path boundary.
     valid_input = json.dumps(_minimal_valid_review_result())
 
     result = subprocess.run(
@@ -201,20 +199,22 @@ def test_review_compact_output_budget_violation_is_machine_readable(tmp_path):
         cwd=tmp_path,
     )
     assert result.returncode != 0, (
-        f"Budget violation should exit non-zero. stdout={result.stdout!r}"
+        f"Noncanonical path should exit non-zero. stdout={result.stdout!r}"
     )
     _assert_failure_envelope(result.stdout)
-    assert "REASON_CODE: output_budget_violation" in result.stdout, (
-        f"REASON_CODE must be output_budget_violation. stdout={result.stdout!r}"
+    assert "REASON_CODE: schema_mismatch" in result.stdout, (
+        f"REASON_CODE must be schema_mismatch. stdout={result.stdout!r}"
     )
-    # The original verbose output (VERDICT, SUMMARY, etc.) must NOT be in stdout
+    # The original verbose output must never be emitted as a validator-invalid
+    # success envelope.
     assert "VERDICT:" not in result.stdout, (
         "Original verbose output must not appear in budget-violated stdout"
     )
     assert "SUMMARY:" not in result.stdout, (
         "Original verbose output must not appear in budget-violated stdout"
     )
-    # The failure artifact must exist and contain sha256/byte_count/bounded_preview
+    # The failure artifact stays in the canonical subtree, not under the
+    # attacker-controlled relative destination.
     artifact_ref = [
         line for line in result.stdout.splitlines()
         if line.startswith("ARTIFACT: producer_failure_v1=")
@@ -223,19 +223,8 @@ def test_review_compact_output_budget_violation_is_machine_readable(tmp_path):
     artifact_path = tmp_path / artifact_ref[0].split("=", 1)[1]
     assert artifact_path.exists(), f"Failure artifact not found: {artifact_path}"
     artifact_data = json.loads(artifact_path.read_text(encoding="utf-8"))
-    assert artifact_data.get("reason_code") == "output_budget_violation"
-    assert "byte_count" in artifact_data, "Artifact must contain byte_count"
-    assert "output_sha256" in artifact_data, "Artifact must contain output_sha256"
-    assert "bounded_preview" in artifact_data, "Artifact must contain bounded_preview"
-    assert isinstance(artifact_data["byte_count"], int) and artifact_data["byte_count"] > 2048
-
-    # B3: no success compact artifact should remain after budget violation
-    if (tmp_path / long_artifact_dir).exists():
-        success_artifacts = list((tmp_path / long_artifact_dir).rglob("compact_review_result_*.json"))
-        assert len(success_artifacts) == 0, (
-            f"B3: success compact artifact must NOT be written on budget violation. "
-            f"Found: {success_artifacts}"
-        )
+    assert artifact_data.get("reason_code") == "schema_mismatch"
+    assert not (tmp_path / long_artifact_dir).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +561,7 @@ def test_canonical_artifact_path_in_failure_artifact(tmp_path):
     assert (repo_root / wire_ref).exists()
 
     # Negative: --repo-root omitted + absolute --artifact-dir → fail closed
+    # with a canonical failure artifact rooted at the current working tree.
     arbitrary_dir = tmp_path / "arbitrary"
     result2 = subprocess.run(
         [
@@ -582,8 +572,9 @@ def test_canonical_artifact_path_in_failure_artifact(tmp_path):
         input=invalid_input,
         capture_output=True,
         text=True,
+        cwd=tmp_path,
     )
     assert result2.returncode != 0, f"Invalid input should fail. stdout={result2.stdout!r}"
-    assert "ARTIFACT: producer_failure_v1=<write_failed>" in result2.stdout
+    assert expected_wire_dir in result2.stdout
     assert str(repo_root) not in result2.stdout
     assert str(arbitrary_dir) not in result2.stdout
